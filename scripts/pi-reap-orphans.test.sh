@@ -47,6 +47,10 @@
 #   --list                   O17  (read-only: no lock, no log, no signal)
 #   lock held                O18  (exit 3)
 #   log unwritable (armed)   O19  (exit 3)
+#   log gate vs identity abort O19c (the log gate runs BEFORE the identity pass's
+#                                  fail-closed paths, so an identity abort on a
+#                                  fresh state dir is LOGGED, not a bare shell
+#                                  redirection error on stderr)
 #   flags / env validation   O20  (--help, unknown arg, bad numbers)
 #   verbose vs summary       O21  (non-verbose still reports exact counts)
 #   real reproduction        R1   (--repro only)
@@ -228,7 +232,7 @@ RUN_LOG=""
 RUN_KILL=""
 # Identity walk for the F11 fixtures; empty => the shim's STABLE default.
 RUN_IDENT_SEQ=""
-# Snapshot-B identity TABLE override (#1863 F12); empty => the shim synthesizes a
+# Identity-pass TABLE override (#1863 F12); empty => the shim synthesizes a
 # STABLE identity for every pid in the fixture sequence.
 RUN_IDENT_TABLE=""
 run_reaper() {
@@ -594,6 +598,40 @@ out="$(FAKE_PS_SEQ="$A:$B" FAKE_PS_COUNTER="$T/o19b.counter" FAKE_LSOF_TABLE="$L
 assert_rc "$rc" 3 "O19b an unwritable log on a DRY-RUN pass also aborts with exit 3 (not a silent inert pass)"
 assert_contains "$out" "REAP_ORPHAN_LOG unwritable" "O19b ... naming the log"
 
+# O19c — the log gate must run BEFORE the identity pass's fail-closed paths
+# (#1863 cycle-5 A5-1). The identity pass logs its abort; if it ran before the
+# state dir existed, the append would fail AND bash would print a raw
+# redirection error to stderr, so a launchd run (no StandardErrorPath) would
+# abort with NO record — the installed-but-inert shape the gate exists to
+# prevent. On a fresh state dir the abort must (a) exit 3, (b) land in the log,
+# and (c) emit NO shell redirection error.
+cat >"$T/bin/ps-identfail" <<'SHIM'
+#!/usr/bin/env bash
+# Fails ONLY the identity-table call shape; snapshot enumeration succeeds.
+for a in "$@"; do
+    case "$a" in
+        'pid=,lstart=') exit 1 ;;
+    esac
+done
+cat "${FAKE_PS_TABLE:-/dev/null}" 2>/dev/null
+exit 0
+SHIM
+chmod +x "$T/bin/ps-identfail"
+printf '%s\n' "$(ps_row_line 1 0 0 '0:10.00' '01:00:00' /sbin/launchd)" \
+              "$(ps_row_line $ORPH 1 "$MY_UID" '0:00.50' '00:05:00' /bin/sh-spin)" >"$T/o19c.ps"
+: >"$T/o19c.lsof"
+assert_nofile "$T/o19c.state" "O19c precondition: the state dir does NOT exist before the pass"
+rc=0
+out="$(FAKE_PS_TABLE="$T/o19c.ps" FAKE_LSOF_TABLE="$T/o19c.lsof" \
+       PS_BIN="$T/bin/ps-identfail" LSOF_BIN="$T/bin/lsof" KILL_BIN="$T/bin/kill" \
+       REAP_ORPHAN_STATE_DIR="$T/o19c.state" REAP_ORPHAN_LOG="$T/o19c.state/log" \
+       reap_invoke --dry-run --min-elapsed-seconds 1 --sample-seconds 0 2>&1)" || rc=$?
+assert_rc "$rc" 3 "O19c an identity-pass failure on a fresh state dir exits 3"
+assert_contains "$out" "FAIL-CLOSED abort" "O19c ... reporting the abort"
+assert_absent "$out" "No such file or directory" "O19c ... with NO raw shell redirection error on stderr"
+assert_file "$T/o19c.state/log" "O19c the abort is recorded: the log exists"
+assert_contains "$(cat "$T/o19c.state/log")" "FAIL-CLOSED abort" "O19c ... and carries the abort line"
+
 # ── O20: flags and env validation ──────────────────────────────────────
 echo "— O20/O21: flags, env validation, and honest reporting —"
 reap_invoke --help >/dev/null 2>&1; assert_rc "$?" 0 "--help exits 0"
@@ -709,7 +747,7 @@ L27="$(lsof_fixture ls27 "$ORPH:$DEADCWD27")"
 rmdir "$DEADCWD27"
 IDENT_S="Wed Oct 15 10:04:03 2025"
 IDENT_C="Wed Oct 15 11:22:44 2025"
-# Snapshot-B identity table fixture (#1863 F12): one `pid identity` line.
+# Identity-pass table fixture (#1863 F12): one `pid identity` line.
 ident_table() { # <name> <pid> <identity>
     printf '%s %s\n' "$2" "$3" >"$T/$1.ident"
     printf '%s' "$T/$1.ident"
@@ -754,7 +792,7 @@ assert_absent "$(kills o27c)" "-KILL" "O27c ... but a pid that changed before es
 assert_contains "$OUT" "identity-changed" "O27c ... and the escalation preserve is reported"
 assert_eq "$(grep -cE '^ +[0-9]+ +reapable$' <<<"$OUT")" "0" "O27c the histogram carries no reapable row for the downgraded candidate (F13)"
 
-# O27d: a pid with NO recorded snapshot-B identity is not a licence to signal.
+# O27d: a pid with NO recorded identity-pass entry is not a licence to signal.
 # The table is NON-EMPTY (pid 1 only) so a global probe remains valid while the
 # orphan is genuinely absent from it.
 RUN_IDENT_TABLE="$(ident_table o27d 1 "$IDENT_S")"

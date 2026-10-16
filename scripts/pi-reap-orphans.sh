@@ -561,8 +561,11 @@ ps_identity_normalize() {
     ' "$1"
 }
 
-# identity_from_snapshot <normalized-map> <pid> -> the snapshot-B identity (""
-# when the pid is absent, which the caller treats as identity-unknown)
+# identity_from_snapshot <normalized-map> <pid> -> the identity recorded by the
+# identity pass run immediately after snapshot B ("" when the pid is absent,
+# which the caller treats as identity-unknown). NOT the identity held IN
+# snapshot B: a pid reused between snapshot B and the identity pass is recorded
+# under the REPLACEMENT's identity (#1863 C1).
 identity_from_snapshot() {
     awk -F'\t' -v p="$2" '$1 == p { print $2; exit }' "$1" 2>/dev/null
 }
@@ -889,6 +892,26 @@ run() {
 
     CWD_ROOTS_LIST="$(cwd_roots)"
 
+    # Establish the state dir and validate the log BEFORE the first pass that can
+    # call log(): snapshots A/B and the identity pass all log on their fail-closed
+    # paths, and a `log()` append into a missing dir fails AND prints a raw shell
+    # redirection error to stderr — so an abort there would leave the installed
+    # job failing closed with NO record (the installed-but-inert shape #1862
+    # exists to eliminate). `--list` is a read-only diagnostic: it must create
+    # neither the state dir nor the log, so it is excluded here and exits after
+    # snapshot B below.
+    if [ "$LIST_ONLY" != 1 ]; then
+        mkdir -p "$STATE_DIR" 2>/dev/null || true
+        # Gate BOTH modes: the DEPLOYED mode is dry-run (the plist ships
+        # REAP_ORPHAN_DRY_RUN=1) and it promises the report lands in the log. An
+        # ungated dry-run exited 0 with no log line when the path was unwritable —
+        # the installed-but-inert state #1862 exists to eliminate.
+        if ! : >>"$REAP_ORPHAN_LOG" 2>/dev/null; then
+            echo "FAIL-CLOSED abort: REAP_ORPHAN_LOG unwritable ($REAP_ORPHAN_LOG) (exit 3)" >&2
+            exit 3
+        fi
+    fi
+
     # Snapshot A, sample window, snapshot B: the cpu-time delta is the whole
     # point of taking two.
     if ! ps_load "$PS_A"; then
@@ -927,11 +950,12 @@ run() {
     fi
 
     # F12: capture the START IDENTITY of every process IMMEDIATELY after snapshot
-    # B — before mkdir/the log gate/lock_acquire, and before the lsof pass — so
-    # the binding spans identity-pass -> signal (including the up-to-60 s lsof
-    # pass). Running it before the lock/log gates keeps the uncovered
-    # snapshot-B -> identity-pass gap to the smallest two `ps` passes allow; that
-    # residual sub-second window is documented in the header (#1863 C1).
+    # B — before lock_acquire and the lsof pass — so the binding spans
+    # identity-pass -> signal (including the up-to-60 s lsof pass). The log gate
+    # above already ran, so an identity-pass abort is guaranteed to reach the log.
+    # Running it before the lock keeps the uncovered snapshot-B -> identity-pass
+    # gap to the smallest two `ps` passes allow; that residual sub-second window
+    # is documented in the header (#1863 C1).
     if ! ps_identity_load "$IDENT_RAW"; then
         echo "FAIL-CLOSED abort: ps identity enumeration failed, timed out, or returned an empty table (exit 3)" >&2
         log "FAIL-CLOSED abort: ps identity snapshot failed/empty (exit 3)"
@@ -944,15 +968,6 @@ run() {
         exit 3
     fi
 
-    mkdir -p "$STATE_DIR" 2>/dev/null || true
-    # Gate BOTH modes: the DEPLOYED mode is dry-run (the plist ships
-    # REAP_ORPHAN_DRY_RUN=1) and it promises the report lands in the log. An
-    # ungated dry-run exited 0 with no log line when the path was unwritable —
-    # the installed-but-inert state #1862 exists to eliminate.
-    if ! : >>"$REAP_ORPHAN_LOG" 2>/dev/null; then
-        echo "FAIL-CLOSED abort: REAP_ORPHAN_LOG unwritable ($REAP_ORPHAN_LOG) (exit 3)" >&2
-        exit 3
-    fi
     if ! lock_acquire; then
         echo "FAIL-CLOSED abort: lock held ($LOCK_DIR) (exit 3)" >&2
         exit 3
