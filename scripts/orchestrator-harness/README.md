@@ -227,12 +227,35 @@ the fact: the PR body names the comment it was signed against.
 | `gh` (authenticated) | all queue + PR operations | needs push access to the target repo |
 | `pi` on `PATH` | the worker runtime (`pi -p --provider deepseek --model deepseek-v4-flash`) | provider/model are literals in `lane.sh`/`merge-one.sh`/`fix-one.sh` — change them there |
 | `uv` | `lane.sh` runs `uv sync --extra embeddings --extra parity` in each worktree | tortoise-specific; `refresh-candidates.sh`'s SCOUT venv is repo-aware since agent-infra#1736 (skipped when there is no `pyproject.toml`; the extras are read from that project) |
-| `~/.pi/agent/scripts/record-review.sh` | writes the HMAC-signed review marker the `ai-review-gate` check verifies | shipped by `agent-infra`; **gate mode only** — a repo that does not require the gate consumes no such marker, so `merge-one.sh` does not mint one there |
+| `python3` | `orch-loop.sh`'s required-check classifier and `fix-one.sh`'s failing-check list | absent, the classifier returns an empty verdict, no case arm matches, and **every PR is skipped in silence** |
+| `~/.pi/agent/scripts/record-review.sh` | writes the HMAC-signed review marker the `ai-review-gate` check verifies | shipped by `agent-infra`; **gate mode only** — a repo that does not require the gate consumes no such marker, so `merge-one.sh` does not mint one there. A cell's `start` provisions it when the cell has none — see below |
 | **`AI_REVIEW_GATE_KEY`** | the merge authority — env var, or `~/.pi/agent/.ai-review-gate-key` | **this harness cannot merge a gate-mode repo without it.** Treat as a secret; never commit it |
 | the target repo's branch protection | the REQUIRED-check list and the merge authority are read from it at runtime (agent-infra#1764) | `gh api repos/$OR/branches/main/protection/required_status_checks`. `REQ=…` in the cell env / `keys.env` overrides the read. Unreadable → `FALLBACK_REQ` (non-empty, fail-closed). Requires admin read on the repo, else the fallback applies every cycle and nothing merges |
 | `REVIEW_GATE` (optional) | names the check that IS the merge authority — the repo's gate | defaults to `ai-review-gate`; set it only for a repo whose gate has another name. It is read from the environment, so an ambient/`keys.env` value takes effect: **an override that changes the merge authority away from what the repo's own declaration gives is logged** as `⚠️ … CHANGES the merge authority`, naming the consequence. On a rail repo a flip to `gate` authority means a RAW merge (no head-bound evidence), so treat that line as an error, not noise |
 | a collision pre-flight tool | `refresh-candidates.sh` refuses overlapping dispatches | resolved **per repo** (agent-infra#1736): the target repo's own `tools/collision_preflight.py`, else a tortoise checkout (`TORTOISE_REPO`, or its legacy `TORTOISE` alias). The tool requires **Python >= 3.12** and refuses an older interpreter with exit 3 and no verdict, so the selected interpreter (scout venv, or a bare `python3` when there is no `pyproject.toml`) is version-gated: `--check` and the refresh both refuse a too-old one (permanent `rc=3`) instead of queueing nothing in silence. `SCOUT_PY` pins the interpreter, like `SCOUT_UV` pins `uv`. Put `TORTOISE_REPO` in `keys.env` — the controller session re-sources it, while an ambient-only export does not reach a pre-existing tmux server |
 | `.worktrees/` gitignored in the target repo | worktrees are created under it | `git check-ignore .worktrees` |
+
+**`cloud-cell-supervisor.sh check` vouches only for what it actually probes, and refuses to certify
+a cell missing any of them: `tmux`, an authenticated `gh`, `git`, `python3`, `pi`, a cloned repo
+with the worker scripts in `$O`, and — since agent-infra#1717 — a non-empty, executable
+`~/.pi/agent/scripts/record-review.sh` with its `lib/diff-normalize.py` sibling.** The rest of the
+table is *not* a refusal by name: a missing `AI_REVIEW_GATE_KEY` is a **warning** — a keyless cell
+still runs a controller and is still a **MERGE ACTOR** (`gh pr merge --auto` does not go through the
+key; see the ⛔ measured note at the top of `cloud-cell-supervisor.sh`), it just cannot complete a
+*signed* merge in a gate-mode repo. The `.worktrees/` gitignore is not probed at all, and
+`tools/collision_preflight.py` is not a dependency `check` refuses on by that name: the only by-name
+read in `cloud-cell-supervisor.sh` itself is `repo_vendors_tool()`, which uses it solely to decide
+whether an operator's `TORTOISE_REPO` is relevant. The refusal is indirect but real — the #1736
+dispatch-provisioning probe (`refresh-candidates.sh --check`, which `cmd_check` runs) reads that same
+literal path and refuses a repo that resolves no copy of it — so `check` does refuse that cell in
+effect.
+Its verdict is the literal line `CELL CAN RUN A CONTROLLER`, so a dependency that is absent must
+fail *there* — a cell that is blessed and then discovers the gap mid-review pays for the discovery:
+`git`, `python3`, `pi` and `~/.pi/agent/scripts/record-review.sh` are fatal, `uv` warns (as it does
+in `install.sh`) — but the #1736 dispatch probe (`refresh-candidates.sh --check`, which `cmd_check`
+runs) refuses a `pyproject.toml` repo whose scout venv has to be built while `uv` does not resolve on
+`PATH`, so `uv` is fatal in effect there. And `start` provisions the record step from this checkout
+when the cell has none (agent-infra#1717).
 
 **Single-host assumption.** Everything is local: tmux sessions, worktrees, logs, the key.
 There is no scheduler, no queue service, no shared database. Two boxes running this against
@@ -685,9 +708,15 @@ These are kept as a record because each one is a *failure mode of the design*, n
 | **a hung worker held a concurrency slot for 9 hours** | `pi -p` has no timeout and the caps count **tmux sessions**, so a hung reviewer (or a runaway `find /` it spawned) permanently reduced merge throughput while the queue looked busy — three slots were dead weight overnight on 2026-10-12 | portable `run_agent()` wall-clock limit (bash `wait` + watchdog subshell, since macOS ships no `timeout`) plus a `reap_stale_workers()` sweep that kills any worker silent for `STALE_MIN` minutes |
 | **only `ai-review-gate` and `python-ci-gate` failures had a remediation path** | a PR red on any *other* required check (`docs`, `test-isolation`, `license-surface`, `legal-e2e`, `pricing-artifact`) was merely logged, so it sat red forever with **no worker at all**. Observed: #8278 carried two new `docs`-lint findings (MD056, an unescaped `\|` in a table row; MD046, fence style — fixed in `f15923b`) and #8193 a new `MD018` finding — both with zero workers for hours. ⛔ **And the name list was itself a tortoise constant (#1764):** on agent-infra a red `pipeline-compliance` matched none of those five, so the fix reappeared there | those checks now route to `fix-one.sh` too — but the arm is now **derived from the repo's own required set** (#1764), so a red required check routes on *any* repo (agent-infra's `pipeline-compliance` included) — capped and parkable like every other fix loop; and `fix-one.sh` fetches the failing check's **log** into the prompt, because it previously only ever read a reviewer comment — for a CI failure there may be no comment at all. ⚠️ **Known residual (agent-infra#1703):** that fetch reads the workflow RUN's `--log-failed` and `tail -80`, so a multi-failed-job run can hand the fixer the wrong job's log; tracked, not fixed here. |
 
+### 7.4b Defects found in the agent-infra#1700 review (fixed here)
+
+| Defect | Impact | Fix |
+|---|---|---|
+| **`cmd_check` never tested `record-review.sh`, and neither cell script provisioned it (agent-infra#1717)** | `merge-one.sh` executes `$HOME/.pi/agent/scripts/record-review.sh` to mint the signed marker, and a fresh cell has no such file. `cmd_check` printed `CELL CAN RUN A CONTROLLER` anyway (a false PASS on the only question that verdict answers), the cell ran a full fresh-context review — up to `REVIEW_TIMEOUT` = 1800 s, **paid** — and only then hit 127. The pre-fix `exit 3` left no terminal state at all — nothing was recorded and nothing was parked: it returns from the `CLEAN*)` arm, and the `*)` arm that writes the fixer marker is reached only for a non-CLEAN verdict, so the marker was never written on this path either way: the next cycle saw an unmarked `FAILED:ai-review-gate` and spawned another review, **one paid review per cycle, forever** | `cmd_check` probes the runtime dependencies the loop actually invokes — `git`, `python3`, `pi` (`uv` warns, matching `install.sh`) and the recorder path it reads from `$CELL_HOME` — and refuses to print the verdict without them; `start` provisions the recorder from the checkout. The record step is also checked **before** the paid review in `merge-one.sh`, and any of its failures (absent, empty, non-executable, non-regular-file, non-zero rc, an `rc=0` record that posted **no signed marker** into the PR body, or a CLEAN verdict that named no comment) writes the controller's own terminal `state/parked-<PR>` marker at the reviewed head plus a `state/parkreason-<PR>` naming why — and the worker itself refuses to re-review a head it has already parked, so the `chain-<N>`/`fix-<one.sh>` paths that never consult the controller cannot re-pay either. The controller's own park sites (`orch-loop.sh`, conflict/fix/CI caps) write the same `parkreason-<PR>` pair through `park_ctrl()`, so a **controller** park at a moved head never leaves the previous head's reason behind for the exit-5 refusal to misreport. ⚠️ **Residual:** `merge-one.sh`'s own rail cap writes `state/parked-<PR>` directly and no `parkreason-<PR>`; that site `exit 0`s before the exit-5 refusal can print a reason, so it cannot itself misreport — but a human reading `state/parkreason-<PR>` beside a newer marker still can. A later push changes the head and re-arms the PR by construction |
+
 ### 7.5 Still open, deliberately not fixed here
 
-> **Seven entries that were here are now FIXED** and have been removed from this list: the
+> **Eight entries that were here are now FIXED**; all but two have been removed from this list: the
 > fail-open reaper when the PR listing fails (agent-infra#1705, tortoise#8519), `checked.txt`
 > written before the pre-flight verdict (agent-infra#1716, tortoise#8515), the returning INT/TERM
 > trap in `orch-loop.sh` and `merge-one.sh` (agent-infra#1715, tortoise#8516), the controller's
@@ -695,7 +724,12 @@ These are kept as a record because each one is a *failure mode of the design*, n
 > `orch-loop.sh` (agent-infra#1714, tortoise#8518), this directory being older than its source
 > (agent-infra#1712 — see the provenance note at the top of this file), and
 > `cloud-cell-bringup.sh` deleting the pushed gh token only on the success branch
-> (agent-infra#1718 — fixed in this branch, independent of the #1712 port).
+> (agent-infra#1718 — fixed in this branch, independent of the #1712 port), and
+> `cmd_check` never testing `record-review.sh` (agent-infra#1717 — fixed in this branch; see §7.4b).
+>
+> The two that keep a bullet below do so as the *record* of the failure mode, not as open defects:
+> agent-infra#1705 (the fail-open reaper) and agent-infra#1712 (this directory's provenance pin) —
+> both closed.
 
 - **`can_spawn()` gates on load only, so the memory ceiling does not cover the five controller spawn
   sites** (agent-infra#1732). Lane dispatch is bounded by swap and available memory; the five spawn
@@ -759,10 +793,6 @@ These are kept as a record because each one is a *failure mode of the design*, n
 - **A keys.env with a top-level `exit` disables the supervisor silently (agent-infra#1713).** The
   file is sourced in the supervisor's own shell, so `exit`/`exec` ends the script: `start` returns 0
   having created no session.
-- **`cmd_check` never tests `record-review.sh` (agent-infra#1717).** `merge-one.sh` calls it at
-  `$HOME/.pi/agent/scripts/record-review.sh` and neither cell script provisions it, so a fresh cell
-  prints "CELL CAN RUN A CONTROLLER", runs a full paid first review, then 127s **before** any parked
-  marker is written — one fresh review per cycle, forever, with no terminal state.
 - **`ci_runner_gate.sh` is versioned here but wired to nothing (agent-infra#1719).** No
   `templates/launchd/` job renders it and `pi-bootstrap/setup.sh`'s farm lists omit it, so this box
   still executes a hand-made duplicate at `~/.pi/agent/scripts/` — a fix here never reaches the copy
@@ -831,6 +861,7 @@ algorithmic advantage. The claim worth evaluating is *utilisation*, not *efficie
 | `test-crossbox.sh` | drives the real `merge-one.sh` claim acquire + trap release with `gh` stubbed. Not part of the loop |
 | `refresh-scout.test.sh` | the agent-infra#1736 contract: repo-aware scout provisioning, per-repo tool resolution, and the permanent/transient refresh split. Not part of the loop |
 | `check-port-drift.sh` | gates the tortoise-side removal: fails if the tortoise harness moved past the pinned sync point (`port-provenance.txt`). Not part of the loop |
+| `cloud-cell-record-dep.test.sh` | #1717: drives `cloud-cell-supervisor.sh check/start` and `merge-one.sh` against a stubbed toolchain — the recorder is a checked, provisioned dependency, and a record failure parks. Registered in `scripts/run-bash-shards.sh`, so both CI lanes run it |
 
 **Manual utility:** `adopt-fix.sh` — run `fix-one.sh` against a specific PR by hand.
 
@@ -851,7 +882,7 @@ O="${O:-$HOME/orchestrator}"
 ```
 
 The shipped copies are **not** byte-identical to the ones running on the original box: they are
-those copies **plus every §7.4 fix**. `install.sh` compares the scripts it invokes — the nine loop
+those copies **plus every §7.4 fix** (and the §7.4b ones). `install.sh` compares the scripts it invokes — the nine loop
 scripts in §9 plus the manual `adopt-fix.sh` — against the running copies at `$O` and warns loudly
 on drift, because the daemon executes `$O/<script>` — a fix that only lands in this directory is not
 in effect. That set is the one `install.sh`'s drift loop lists; `selftest.sh` is shipped but not

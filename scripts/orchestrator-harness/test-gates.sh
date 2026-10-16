@@ -755,18 +755,28 @@ fi
 # (m) BOTH orch-loop park refreshes are driven (review round 3: they were only grep-pinned, so
 # the stale-park re-spawn loop could silently return). Extract each 4-line block by its unique
 # PARKED message and drive it with a STALE older-head park at the cap: the new head must land.
+# agent-infra#1730 moved each of these park writes into orch-loop.sh's park_ctrl helper (marker and
+# reason in ONE write, so a reason can never outlive the head it describes). The 4-line window is
+# therefore no longer self-contained: it calls park_ctrl, which is defined ~500 lines higher up. The
+# extractor must carry the SHIPPED helper, and refuse LOUDLY when it cannot — a helper that failed to
+# extract would leave the park unrefreshed and look like the defect this check exists to catch.
 _drive_park() { # <anchor-regex> <label>
-  awk -v anc="$1" 'index($0, anc) > 0 { print prev; print; if ((getline c) > 0) print c; if ((getline d) > 0) print d; exit } { prev=$0 }' "$ORCH" > "$TMP/parkblk.sh"
-  if [ -s "$TMP/parkblk.sh" ] && bash -n "$TMP/parkblk.sh" 2>/dev/null; then
+  awk '/^park_ctrl\(\)/ { f=1 } f { print; if ($0 == "}") exit }' "$ORCH" > "$TMP/parkblk.sh"
+  awk -v anc="$1" 'index($0, anc) > 0 { print prev; print; if ((getline c) > 0) print c; if ((getline d) > 0) print d; exit } { prev=$0 }' "$ORCH" >> "$TMP/parkblk.sh"
+  if [ -s "$TMP/parkblk.sh" ] && grep -q '^park_ctrl()' "$TMP/parkblk.sh" && bash -n "$TMP/parkblk.sh" 2>/dev/null; then
     mkdir -p "$TMP/pkO/state"; printf '%s\n' aaaa1111 > "$TMP/pkO/state/parked-2317"
-    ( PR=2317; HEAD_N=bbbb2222; NFC=3; NFC2=3; V='FAILED:docs'; LOG="$TMP/pkO/park.log"; O="$TMP/pkO"
+    ( PR=2317; HEAD_N=bbbb2222; NFC=3; NFC2=3; V='FAILED:docs'; LOG="$TMP/pkO/park.log"; O="$TMP/pkO"; MAX_FIX_TRIES=3
+      # MAX_FIX_TRIES is not a free variable here: orch-loop.sh sets it at the top of the script
+      # (`MAX_FIX_TRIES="${MAX_FIX_TRIES:-3}"`), and #1730's park reason quotes it. The block is
+      # extracted in isolation, so the harness supplies the same default production has — without
+      # it the reason is an unbound variable under `set -u` and the park write never runs.
       # shellcheck disable=SC1090
       . "$TMP/parkblk.sh" ) >/dev/null 2>&1
     _pk="$(cat "$TMP/pkO/state/parked-2317" 2>/dev/null)"
     [ "$_pk" = "bbbb2222" ] && { echo "  ✅ $2: the park is REFRESHED to the new head (a stale older-head park cannot block it)"; PASS=$((PASS+1)); } \
       || { echo "  ❌ $2: parked=[$_pk] (expected bbbb2222) — the stale-park re-spawn loop is back"; FAIL=$((FAIL+1)); }
   else
-    echo "  ❌ $2: could not extract the park block"; FAIL=$((FAIL+1))
+    echo "  ❌ $2: could not extract the park block (or orch-loop.sh's park_ctrl helper)"; FAIL=$((FAIL+1))
   fi
 }
 _drive_park 'PARKED (still CONFLICTING after' 'CONFLICTING-arm park refresh'

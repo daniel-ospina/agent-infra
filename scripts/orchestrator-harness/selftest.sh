@@ -1399,7 +1399,25 @@ git -C "$HFIX" branch -M main
 git -C "$HFIX" update-ref refs/remotes/origin/main "$(git -C "$HFIX" rev-parse HEAD)"
 
 git init -q "$TMP/cellrepo"
+# #1717: cmd_check now refuses a cell with no record-review.sh, so every fixture that reaches the
+# dependency probe needs one. These cases die at validate_scope() first, so the stub is for the
+# shapes that do not.
+mkdir -p "$TMP/cellhome/.pi/agent/scripts"
+printf '#!/bin/bash\nexit 0\n' > "$TMP/cellhome/.pi/agent/scripts/record-review.sh"
+chmod +x "$TMP/cellhome/.pi/agent/scripts/record-review.sh"
+# #1717: the recorder's declared sibling, so a fixture that reaches cmd_check is not refused on it.
+mkdir -p "$TMP/cellhome/.pi/agent/scripts/lib"
+printf '#!/usr/bin/env python3\n' > "$TMP/cellhome/.pi/agent/scripts/lib/diff-normalize.py"
 STUB_TM="$TMP/stub-tm"; mkdir -p "$STUB_TM"
+# #1717: cmd_check now probes git/python3/pi as runtime dependencies. On the ubuntu CI runner `pi` is
+# not installed (install.sh's own pi gate is skipped there by this suite's platform gate), so a
+# fixture that reaches the probe must stub it instead of leaning on the host PATH — otherwise the
+# suite reddens on the runner only (the #1348/#1369 lane-split class).
+# ⛔ Stub the GAPS ONLY — stubbing a tool the fixture itself needs SHADOWS the real one, and the
+# provenance gate then reads the stub: `git -C "$HARNESS_REPO" rev-parse` returns EMPTY, the harness
+# classifies as `unknown`, and cmd_check refuses with "Cannot-verify is never a pass" — so every
+# case below would assert against a DRIFT refusal instead of the verdict under test.
+for c in pi git python3; do command -v "$c" >/dev/null 2>&1 || { printf '#!/bin/bash\nexit 0\n' > "$STUB_TM/$c"; chmod +x "$STUB_TM/$c"; }; done
 cat > "$STUB_TM/tmux" <<'STUB'
 #!/bin/bash
 case "$1" in
@@ -1528,6 +1546,22 @@ cp "$HERE"/*.sh "$TMP/tm/harness/"
 # must model a repo that can be pre-flighted: a repo carrying its own tools/collision_preflight.py.
 # Without it `start` dies in cmd_check and no session command is ever recorded.
 mkdir -p "$TMP/tm/repo/tools"; : > "$TMP/tm/repo/tools/collision_preflight.py"
+# #1717: the recorder must be deliverable two ways — pre-existing in the cell's HOME, and (the
+# provision path) as the canonical copy one directory up from the harness. Both are placed so no
+# check below depends on the order the others ran in; the provision path itself is covered by
+# cloud-cell-record-dep.test.sh.
+mkdir -p "$TMP/tm/home/.pi/agent/scripts"
+printf '#!/bin/bash\nexit 0\n' > "$TMP/tm/home/.pi/agent/scripts/record-review.sh"
+chmod +x "$TMP/tm/home/.pi/agent/scripts/record-review.sh"
+printf '#!/bin/bash\nexit 0\n' > "$TMP/tm/record-review.sh"
+chmod +x "$TMP/tm/record-review.sh"
+# #1717: cmd_check refuses a cell whose recorder lacks its declared sibling lib/diff-normalize.py.
+mkdir -p "$TMP/tm/home/.pi/agent/scripts/lib"
+printf '#!/usr/bin/env python3\n' > "$TMP/tm/home/.pi/agent/scripts/lib/diff-normalize.py"
+# …and the runtime-dependency probe needs `pi` (absent on the ubuntu CI runner). Stub the GAPS ONLY,
+# for the reason spelled out at $STUB_TM above: a `git` stub empties the provenance gate's rev-parse
+# and turns a current harness into an unverifiable one.
+for c in pi git python3; do command -v "$c" >/dev/null 2>&1 || { printf '#!/bin/bash\nexit 0\n' > "$TM/$c"; chmod +x "$TM/$c"; }; done
 cat > "$TM/tmux" <<'STUB'
 #!/bin/bash
 case "$1" in
@@ -1643,6 +1677,13 @@ cp "$HERE"/*.sh "$KC/harness/"; cp "$HERE"/*.sh "$KC/o/"
 # Same fixture requirement as §16e: cmd_check also judges DISPATCH PROVISIONING (#1736), so the
 # repo must carry a pre-flight tool or the key verdicts below are never reached.
 mkdir -p "$KC/repo/tools"; : > "$KC/repo/tools/collision_preflight.py"
+# #1717: cmd_check refuses a cell without the record step, and every check in 16f drives cmd_check.
+mkdir -p "$KC/home/.pi/agent/scripts"
+printf '#!/bin/bash\nexit 0\n' > "$KC/home/.pi/agent/scripts/record-review.sh"
+chmod +x "$KC/home/.pi/agent/scripts/record-review.sh"
+# #1717: the recorder's declared sibling must sit beside it, or cmd_check refuses the cell.
+mkdir -p "$KC/home/.pi/agent/scripts/lib"
+printf '#!/usr/bin/env python3\n' > "$KC/home/.pi/agent/scripts/lib/diff-normalize.py"
 printf 'AI_REVIEW_GATE_KEY=FILEKEY\n' > "$KC/home/keys.env"; : > "$KC/home/keys-empty.env"
 kc_check() {  # $1 = ENV_FILE, $2 = extra env assignment for the supervisor's own shell ('' = none)
   if [ -n "$2" ]; then
