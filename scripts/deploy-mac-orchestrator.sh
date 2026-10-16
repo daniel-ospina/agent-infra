@@ -152,7 +152,19 @@ else
   fi
   [ -n "$PIDS" ] && kill $PIDS 2>/dev/null || true
   for _ in $(seq 1 15); do sleep 1; [ -z "$(controller_pids)" ] && break; done
-  [ -n "$(controller_pids)" ] && { kill -9 $(controller_pids) 2>/dev/null || true; sleep 2; }
+  # -9 the SAME pids we TERMed, re-checked alive — the rule the lock branch above already follows by
+  # reusing $OLDPID. Re-reading the population here would signal whatever appeared in the window
+  # instead: this file measures that a transient `bash $O/orch-loop.sh` (a peer fixture launching the
+  # real path) can appear inside the scope and exit at once, and signalling it is the failure this
+  # branch exists to avoid. The COUNT was asserted above; this keeps the TARGETS the ones asserted.
+  _stopped=""
+  for _p in $PIDS; do
+    if kill -0 "$_p" 2>/dev/null; then kill -9 "$_p" 2>/dev/null || true; _stopped="$_stopped $_p"; fi
+  done
+  if [ -n "$_stopped" ]; then
+    log "fallback: TERM did not clear the scoped controller within 15s — KILLed the captured pid(s) only:$_stopped"
+    sleep 2
+  fi
 fi
 rm -f "$O/.orch.lock"
 log "controller stopped"
