@@ -20,6 +20,32 @@
 #                               ref's value, so the test offers a REAL other claim's sha (not a random
 #                               one, which would pass with no fencing at all)
 #
+# ISSUE-KEYED CLAIMS (agent-infra#1850) — the sections prefixed `I`. An issue has no head sha, so
+# the PR key cannot express it and the whole registry was bypassed for ISSUE dispatch; two boxes
+# pointed at the same repo both read CLEAN and both dispatched the same issue. The properties these
+# tests pin, and the specific way each one is RED before the change:
+#   I1  TWO BOXES, SAME **UN-PUSHED** ISSUE — A claims, B's pre-flight read must NOT be CLEAN. ⛔ No
+#       branch and no PR is pushed anywhere in this section: the defect is invisible-to-git work, so
+#       a test that only passes after a push does not test it. On the pre-change claims.sh
+#       `claim_issue_preflight` does not exist at all, so this section fails with rc=127.
+#   I2  the CAS, not just the read — B must LOSE the acquire (rc=1, told who holds it)
+#   I3  DISJOINT FROM THE PR KEY — a PR claim for the SAME NUMBER must neither block nor be blocked
+#   I4  an expired issue claim is free; the reclaim is a CAS and the loser's FENCED release cannot
+#       delete the winner's — `CLAIM_TTL` expiry and fencing hold for the issue key
+#   I5  the RELEASE path does not ERROR under `set -u` — `claim_release` with three arguments raised
+#       `$4: unbound variable` (a release that errors leaves the claim held to the lease), and
+#       `claim_issue_release` with two arguments raised `$3:`; both must reach the documented
+#       refusal instead. This is the incidental defect the #1850 verification found.
+#   I6  claim_issue_status reports the lease; an UNREADABLE lease reads as LIVE; a claim ref whose
+#       lease cannot be read is never stolen and never reported CLEAN by the pre-flight
+#   I7  an abandoned claim DECAYS — claim_prune reaps the expired issue ref (the release path for a
+#       box that died mid-lane)
+#   I8  an UNREACHABLE registry is INCOMPLETE (rc=2), never CLEAN — a registry outage must not
+#       become a duplicate dispatch
+#   I9  the RELEASE RECORD (the handover of the pushed commit, from the acquiring process to the one
+#       that releases): it refuses an empty commit, releases fenced through the record, is a no-op
+#       when the record is missing, and an EMPTY record can never delete a PEER's claim
+#
 # ORDER MATTERS: every step that changes the holder must finish before the next step captures
 # the ref sha, or the later assertions compare against a claim that no longer exists.
 #
@@ -39,7 +65,10 @@
 # "up-to-date", and the suite passed anyway. Set the nonce to a constant today and P1b goes RED.
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CLAIMS_SH="$HERE/claims.sh"
+# ⛔ OVERRIDABLE, because the non-vacuity claim in this file is only worth what it can be SHOWN to
+# be: `CLAIMS_SH=<a copy of the pre-change claims.sh> bash test-claims.sh` must FAIL the `I`
+# sections, and it cannot if the path is hardcoded. See the header of section I1.
+CLAIMS_SH="${CLAIMS_SH:-$HERE/claims.sh}"
 REPO_ROOT="$(cd "$HERE/../.." && pwd)"
 ORIGIN_URL="$(git -C "$REPO_ROOT" remote get-url origin)"
 [ -f "$CLAIMS_SH" ] || { echo "❌ missing $CLAIMS_SH"; exit 2; }
@@ -61,7 +90,7 @@ cleanup_boxes() { rm -rf "$A" "$B" "$SNAP" 2>/dev/null; }
 # and TERM as well as EXIT (P3.2, 2026-10-14 adversarial review).
 cleanup_remote() {
   local ref cur
-  for ref in "${REF:-}" "${OTHER_REF:-}"; do
+  for ref in "${REF:-}" "${OTHER_REF:-}" "${ISSUE_REF:-}" "${PRNUM_REF:-}"; do
     [ -n "$ref" ] || continue
     cur="$(git -C "$A" ls-remote origin "$ref" 2>/dev/null | awk '{print $1}')"
     [ -n "$cur" ] && git -C "$A" push -q --force-with-lease="$ref:$cur" origin ":$ref" 2>/dev/null
@@ -77,6 +106,15 @@ trap 'exit 143' TERM
 # two boxes: without it both carry the same host+pid owner, so "B lost the race" is not evidence.
 runA() { ( cd "$A" && export CLAIM_OWNER_ID=boxA && . "$CLAIMS_SH" && "$@" ); }
 runB() { ( cd "$B" && export CLAIM_OWNER_ID=boxB && . "$CLAIMS_SH" && "$@" ); }
+
+# cleanup_ref for the ISSUE ref, so the I sections cannot leak an issue claim onto live origin even
+# if the suite aborts mid-way (the EXIT trap covers the variables it can see; these are belt-and-braces
+# for a Ctrl-C between sections).
+cleanup_issue_ref() {
+  local cur; cur="$(git -C "$A" ls-remote origin "$ISSUE_REF" | awk '{print $1}')"
+  [ -n "$cur" ] && git -C "$A" push -q --force-with-lease="$ISSUE_REF:$cur" origin ":$ISSUE_REF" 2>/dev/null
+  return 0
+}
 
 # A pass-through for the `_git` failure seams below. ⛔ NOT a plain `git`-with-a-positional-args
 # wrapper: the fleet's checkout guard statically classifies an unresolved git VERB (a positional
@@ -110,6 +148,11 @@ REF="refs/claims/$PR-${SHA:0:12}"
 # ref's — the property the old random-sha test could not exercise (P3.1).
 OTHER_SHA=1111111111111111111111111111111111111111
 OTHER_REF="refs/claims/$PR-${OTHER_SHA:0:12}"
+# The ISSUE-keyed refs (agent-infra#1850). `ISSUE` is a throwaway number with no real work behind it.
+ISSUE=999888
+ISSUE_REF="refs/claims/issue-$ISSUE"
+# A PR-keyed claim for the SAME NUMBER, to prove the two keyings cannot collide (I3).
+PRNUM_REF="refs/claims/$ISSUE-${SHA:0:12}"
 PASS=0; FAIL=0
 ck() { # ck <label> <expected-regex> <actual>
   # ⛔ here-string, not a pipe: `printf … | grep -q` lets grep exit at its first match while the
@@ -517,6 +560,226 @@ for L in 0 -5; do
   else echo "  ❌ the lease_until=$L claim was STOLEN or the seed failed ($stillL vs seed '$EL')"; FAIL=$((FAIL+1)); fi
 done
 cleanup_ref
+
+echo
+echo "=== I1. TWO BOXES, ONE ISSUE, **NOTHING PUSHED**: the second box must NOT read CLEAN (#1850) ==="
+# ⛔ THIS IS THE DEFECT TEST. A peer's work is invisible to git from the moment it starts until it
+# first pushes a branch, opens a PR or is assigned — and nothing assigns on dispatch — so the
+# pre-flight's surfaces (branches, worktrees, PRs, assignee) all say CLEAN for the WHOLE working
+# period of the lane. The claim is the only artifact that exists in that window, so the test creates
+# NO branch, NO PR and NO push of anything but the claim ref itself.
+#
+# NON-VACUITY, MEASURED: on the pre-change claims.sh `claim_issue_preflight` does not exist, so the
+# command substitution below returns rc=127 with an empty reason and `ck` fails. Reproduce with:
+#     git show <pre-change-rev>:scripts/orchestrator-harness/claims.sh > /tmp/old-claims.sh
+#     CLAIMS_SH=/tmp/old-claims.sh bash test-claims.sh     # I1..I8 go RED
+cleanup_issue_ref
+claim_before="$(git -C "$A" ls-remote origin "$ISSUE_REF" | wc -l | tr -d ' ')"
+[ "$claim_before" = "0" ] && { echo "  ✅ no issue claim exists yet (nothing pushed)"; PASS=$((PASS+1)); } \
+                         || { echo "  ❌ a stale issue claim is present on origin"; FAIL=$((FAIL+1)); }
+outA=$(runA claim_issue_acquire "$A" "$ISSUE"); rcA=$?
+echo "  A claim_issue_acquire rc=$rcA :: $outA"
+ck "A claimed the ISSUE (rc=0)" "^0$" "$rcA"
+ck "the issue claim lives in the ISSUE namespace (refs/claims/issue-<N>)" "refs/claims/issue-$ISSUE" "$outA"
+# ⛔ A's OWN commit, captured NOW (A's acquire ran in a subshell, so CLAIM_COMMIT is gone). It is
+# what the stale-release assertion in I4 fences on: the commit A really pushed, not a random sha.
+A_ISSUE_SHA=$(git -C "$A" ls-remote origin "$ISSUE_REF" | awk '{print $1}')
+# Read it from the REMOTE, not from a local ref: a claim only exists for the peer if it is on origin.
+remote_issue_sha=$(git -C "$A" ls-remote origin "$ISSUE_REF" | awk '{print $1}')
+[ -n "$remote_issue_sha" ] && { echo "  ✅ the issue claim is on origin ($remote_issue_sha)"; PASS=$((PASS+1)); } \
+                           || { echo "  ❌ the issue claim was not pushed"; FAIL=$((FAIL+1)); }
+outB=$(runB claim_issue_preflight "$ISSUE"); rcB=$?
+echo "  B pre-flight registry read rc=$rcB :: $outB"
+ck "B's pre-flight does NOT read CLEAN (rc=1)" "^1$" "$rcB"
+ck "B is told WHO holds the issue" "held by" "$outB"
+ck "B names A as the holder" 'boxA' "$outB"
+
+# I2. A read is not a lock: the acquire must actually LOSE, or two boxes both read CLEAN and both
+# claim (a claim ref keyed per box would do exactly that).
+outB2=$(runB claim_issue_acquire "$B" "$ISSUE"); rcB2=$?
+echo "  B claim_issue_acquire rc=$rcB2 :: $outB2"
+ck "B LOST the issue CAS (rc=1)" "^1$" "$rcB2"
+ck "B's loss names the holder" "held by" "$outB2"
+out_st=$(runA claim_issue_status "$A" "$ISSUE"); rc_st=$?
+ck "claim_issue_status returns the lease" "^[^	]*	[0-9]\+$" "$out_st"
+
+# I3. DISJOINT KEYINGS: a PR claim for the SAME NUMBER must neither block the issue claim nor be
+# blocked by it. (`<PR>-<sha12>` vs `issue-<N>` — the `issue-` prefix is what makes this true.)
+cleanup_pref() { local c; c="$(git -C "$A" ls-remote origin "$PRNUM_REF" | awk '{print $1}')"; [ -n "$c" ] && git -C "$A" push -q --force-with-lease="$PRNUM_REF:$c" origin ":$PRNUM_REF" 2>/dev/null; return 0; }
+cleanup_pref
+outP=$(runB claim_acquire "$B" "$ISSUE" "$SHA" 600); rcP=$?
+echo "  a PR-keyed claim for the same number: $PRNUM_REF rc=$rcP :: $outP"
+ck "a PR claim for the same NUMBER is its own ref and is acquired" "^0$" "$rcP"
+ck "...and it is NOT the issue ref" "refs/claims/$ISSUE-${SHA:0:12}" "$outP"
+outB3=$(runB claim_issue_preflight "$ISSUE"); rcB3=$?
+echo "  B pre-flight while BOTH keys exist rc=$rcB3 :: $outB3"
+ck "a live PR claim on the same number does not make the issue ref unreadable" "^1$" "$rcB3"
+ck "...and the pre-flight still reports A's ISSUE claim (not the PR one)" 'boxA' "$outB3"
+cleanup_pref
+
+# I4. TTL + FENCING FOR THE ISSUE KEY. A holds it; the lease expires; B reclaims (a CAS, not a
+# blind force); A's fenced release with the commit it pushed MUST be refused — a stale holder
+# cannot delete a winner's claim.
+cleanup_issue_ref
+outI=$(runA claim_issue_acquire "$A" "$ISSUE" 8); rcI=$?
+echo "  A claim ttl=8 rc=$rcI :: $outI"
+ck "A reclaimed the issue ref (previous holder's lease expired)" "^0$" "$rcI"
+AOWN="$(printf '%s' "$outI" | sed -n 's/.*owner=\([^ ]*\).*/\1/p')"
+echo "  ...sleeping 9s for the issue lease to expire..."
+sleep 9
+outR=$(runB claim_issue_acquire "$B" "$ISSUE" 600); rcR=$?
+echo "  B reclaim after expiry rc=$rcR :: $outR"
+ck "an EXPIRED issue claim is reclaimed by B" "^0$" "$rcR"
+ck "the reclaim names A as the previous owner" "$AOWN" "$outR"
+BOWN_SHA=$(git -C "$A" ls-remote origin "$ISSUE_REF" | awk '{print $1}')
+# A releases with the commit A ACTUALLY pushed (captured in I1): a real stale sha, so the fence is
+# exercised rather than a nonsense value that any delete-detection would also refuse.
+outRel=$(runA claim_issue_release "$A" "$ISSUE" "$A_ISSUE_SHA"); rcRel=$?
+echo "  A (stale) release rc=$rcRel :: $outRel"
+ck "a STALE holder's issue release is refused" "refused" "$outRel"
+still_issue=$(git -C "$A" ls-remote origin "$ISSUE_REF" | awk '{print $1}')
+if [ -n "$BOWN_SHA" ] && [ "$still_issue" = "$BOWN_SHA" ]; then
+  echo "  ✅ the winner's issue claim survived the stale release"; PASS=$((PASS+1))
+else echo "  ❌ the stale release deleted/changed the winner's claim ($still_issue vs $BOWN_SHA)"; FAIL=$((FAIL+1)); fi
+# The FENCED release FROM THE REAL HOLDER still works (the fence must not be a blanket refusal).
+outR2=$(runB claim_issue_release "$B" "$ISSUE" "$BOWN_SHA"); rcR2=$?
+echo "  B (the winner) release rc=$rcR2 :: $outR2"
+ck "the winning holder CAN release its own issue claim" "released" "$outR2"
+gone_issue=$(git -C "$A" ls-remote origin "$ISSUE_REF" | awk '{print $1}')
+[ -z "$gone_issue" ] && { echo "  ✅ the issue ref is gone from origin"; PASS=$((PASS+1)); } \
+                      || { echo "  ❌ the issue ref is still present"; FAIL=$((FAIL+1)); }
+
+# I5. THE RELEASE PATH MUST NOT ERROR UNDER `set -u` — the incidental defect found while verifying
+# #1850: `claim_release` with THREE arguments raised `line 260: $4: unbound variable` on the release
+# path (the direct `git push origin :refs/...` worked instead). A release that ERRORS leaves the
+# claim held until its lease runs out — and for the issue key that is a FREE issue no box will
+# dispatch for up to CLAIM_ISSUE_TTL. RED pre-fix: the output carries `unbound variable`, not the
+# documented refusal, and the assertion below fails on the message.
+outRel3=$( ( cd "$A" && . "$CLAIMS_SH" && claim_release "$A" "$PR" "$SHA" ) 2>&1 ); rcRel3=$?
+echo "  claim_release with 3 args (no own commit) rc=$rcRel3 :: $outRel3"
+ck "claim_release with 3 args REFUSES (rc=1)" "^1$" "$rcRel3"
+ck "...and reaches the documented refusal" "no claim commit to fence on" "$outRel3"
+case "$outRel3" in
+  *"unbound variable"*) echo "  ❌ the release path still aborts under set -u ($outRel3)"; FAIL=$((FAIL+1)) ;;
+  *) echo "  ✅ the release path does not abort under set -u"; PASS=$((PASS+1)) ;;
+esac
+outIR2=$( ( cd "$A" && . "$CLAIMS_SH" && claim_issue_release "$A" "$ISSUE" ) 2>&1 ); rcIR2=$?
+echo "  claim_issue_release with 2 args rc=$rcIR2 :: $outIR2"
+ck "claim_issue_release with 2 args REFUSES (rc=1)" "^1$" "$rcIR2"
+ck "...with the same documented refusal" "no claim commit to fence on" "$outIR2"
+case "$outIR2" in
+  *"unbound variable"*) echo "  ❌ claim_issue_release aborts under set -u ($outIR2)"; FAIL=$((FAIL+1)) ;;
+  *) echo "  ✅ claim_issue_release does not abort under set -u"; PASS=$((PASS+1)) ;;
+esac
+
+# I6. AN UNREADABLE LEASE IS LIVE, NOT FREE (and never CLEAN). The same polarity as claim_acquire
+# and orch-loop's claim_live: `lease_until=0` means "a claim EXISTS whose lease this reader cannot
+# parse". Reading it as free would let a peer steal a live claim.
+seed_issue_lease() { # <lease-string> -> prints the commit it pushed
+  local c
+  c="$( cd "$A" && . "$CLAIMS_SH" && _claim_commit foreignbox "$1" )"
+  ( cd "$A" && . "$CLAIMS_SH" && _git push -q origin "$c:$ISSUE_REF" ) || return 1
+  echo "$c"
+}
+cleanup_issue_ref
+E0="$(seed_issue_lease 0)"; echo "  seeded an issue claim with lease_until=0: $E0"
+outU=$(runB claim_issue_preflight "$ISSUE"); rcU=$?
+echo "  pre-flight rc=$rcU :: $outU"
+ck "an UNREADABLE issue lease reads as LIVE (rc=1)" "^1$" "$rcU"
+ck "...and says so" "lease unreadable" "$outU"
+outU2=$(runB claim_issue_acquire "$B" "$ISSUE"); rcU2=$?
+ck "an UNREADABLE issue lease is NOT stolen (acquire rc=1)" "^1$" "$rcU2"
+stillU=$(git -C "$A" ls-remote origin "$ISSUE_REF" | awk '{print $1}')
+if [ -n "$E0" ] && [ "$stillU" = "$E0" ]; then
+  echo "  ✅ the unreadable-lease issue claim was NOT stolen"; PASS=$((PASS+1))
+else echo "  ❌ the unreadable-lease issue claim was STOLEN ($stillU vs $E0)"; FAIL=$((FAIL+1)); fi
+
+# I7. THE DECAY PATH. A box that dies mid-lane never releases, so `claim_prune` is the recovery —
+# and for an issue claim that is up to CLAIM_ISSUE_TTL of a free issue nobody may dispatch. The
+# seeded commit is already expired (a 5s lease minted in the past), so the prune must reap it.
+# ⚠️ This sweeps the DEFAULT claim namespace (the controller does exactly this hourly); it deletes
+# only EXPIRED refs, and the suite's other refs are live, so nothing owned is touched.
+cleanup_issue_ref
+EP="$( cd "$A" && . "$CLAIMS_SH" && _claim_commit expiredbox $(( $(date +%s) - 5 )) )"
+( cd "$A" && . "$CLAIMS_SH" && _git push -q origin "$EP:$ISSUE_REF" )
+beforeP="$(git -C "$A" ls-remote origin "$ISSUE_REF" | awk '{print $1}')"
+( cd "$A" && . "$CLAIMS_SH" && claim_prune ) >/dev/null 2>&1
+afterP="$(git -C "$A" ls-remote origin "$ISSUE_REF" | awk '{print $1}')"
+if [ -n "$beforeP" ] && [ -z "$afterP" ]; then
+  echo "  ✅ claim_prune reaps an EXPIRED issue claim (the abandon path decays)"; PASS=$((PASS+1))
+else echo "  ❌ claim_prune left the expired issue claim behind ($beforeP -> ${afterP:-<gone>})"; FAIL=$((FAIL+1)); fi
+
+# I9. THE RELEASE-RECORD CONVENTION (claims.sh). The claim is taken by orch-loop.sh and released by
+# a DIFFERENT process (chain-merge.sh's trap, or dispatch-merge.sh on the path that never spawns a
+# chain), so the commit that was pushed is handed over in a file. One writer convention and one
+# reader implementation live together in claims.sh; these pin both, plus the two ways the handover
+# can go wrong: an EMPTY record (must delete nothing — an unfenced delete would remove a PEER's
+# claim) and a MISSING record (nothing to do, rc=1).
+cleanup_issue_ref
+SR="$A/state-i9"; mkdir -p "$SR"
+# (1) an empty commit is REFUSED, and writes no file at all
+( cd "$A" && . "$CLAIMS_SH" && claim_issue_record "$SR" "$ISSUE" "" ) >/dev/null 2>&1; rcEmpty=$?
+[ "$rcEmpty" = "1" ] && [ ! -e "$SR/state/issueclaim-$ISSUE" ] \
+  && { echo "  ✅ claim_issue_record REFUSES an empty commit (writes nothing)"; PASS=$((PASS+1)); } \
+  || { echo "  ❌ claim_issue_record accepted an empty commit (rc=$rcEmpty, file=$([ -e "$SR/state/issueclaim-$ISSUE" ] && echo present || echo absent))"; FAIL=$((FAIL+1)); }
+# (2) the real path: acquire, record, release through the record
+outA=$(runA claim_issue_acquire "$A" "$ISSUE" 600); rcA=$?
+A_SHA="$(git -C "$A" ls-remote origin "$ISSUE_REF" | awk '{print $1}')"
+ck "I9: A acquires the issue to be released through the record" "^0$" "$rcA"
+( cd "$A" && . "$CLAIMS_SH" && claim_issue_record "$SR" "$ISSUE" "$A_SHA" ) >/dev/null 2>&1; rcRec=$?
+[ "$rcRec" = "0" ] && [ -s "$SR/state/issueclaim-$ISSUE" ] \
+  && { echo "  ✅ claim_issue_record writes the commit (rc=0)"; PASS=$((PASS+1)); } \
+  || { echo "  ❌ claim_issue_record did not write the record (rc=$rcRec)"; FAIL=$((FAIL+1)); }
+outRec=$( ( cd "$A" && . "$CLAIMS_SH" && claim_issue_release_record "$SR" "$A" "$ISSUE" ) ); rcRec2=$?
+ck "I9: claim_issue_release_record releases the claim (fenced)" "released" "$outRec"
+[ "$rcRec2" = "0" ] && { echo "  ✅ ...and reports success (rc=0)"; PASS=$((PASS+1)); } \
+                    || { echo "  ❌ ...reported rc=$rcRec2"; FAIL=$((FAIL+1)); }
+gone_rec="$(git -C "$A" ls-remote origin "$ISSUE_REF" | awk '{print $1}')"
+[ -z "$gone_rec" ] && [ ! -e "$SR/state/issueclaim-$ISSUE" ] \
+  && { echo "  ✅ the ref AND the record are both gone"; PASS=$((PASS+1)); } \
+  || { echo "  ❌ ref='$gone_rec' record=$([ -e "$SR/state/issueclaim-$ISSUE" ] && echo present || echo absent)"; FAIL=$((FAIL+1)); }
+# (3) a MISSING record: nothing to do, rc=1, and NO push (a release with no fence must never happen)
+( cd "$A" && . "$CLAIMS_SH" && claim_issue_release_record "$SR" "$A" "$ISSUE" ) >/dev/null 2>&1; rcNo=$?
+[ "$rcNo" = "1" ] && { echo "  ✅ a missing record is a no-op (rc=1)"; PASS=$((PASS+1)); } \
+                    || { echo "  ❌ a missing record returned rc=$rcNo (want 1)"; FAIL=$((FAIL+1)); }
+# (4) an EMPTY record must not delete a PEER's claim — the unfenced-delete failure
+cleanup_issue_ref
+outB9=$(runB claim_issue_acquire "$B" "$ISSUE" 600); rcB9=$?
+PEER_SHA="$(git -C "$A" ls-remote origin "$ISSUE_REF" | awk '{print $1}')"
+ck "I9: B holds the issue for the empty-record case" "^0$" "$rcB9"
+: > "$SR/state/issueclaim-$ISSUE"
+( cd "$A" && . "$CLAIMS_SH" && claim_issue_release_record "$SR" "$A" "$ISSUE" ) >/dev/null 2>&1
+survived="$(git -C "$A" ls-remote origin "$ISSUE_REF" | awk '{print $1}')"
+[ -n "$PEER_SHA" ] && [ "$survived" = "$PEER_SHA" ] \
+  && { echo "  ✅ an EMPTY record cannot delete a peer's claim"; PASS=$((PASS+1)); } \
+  || { echo "  ❌ an empty record deleted/changed the peer's claim (${survived:-<gone>} vs $PEER_SHA)"; FAIL=$((FAIL+1)); }
+[ ! -e "$SR/state/issueclaim-$ISSUE" ] && { echo "  ✅ the empty record is still consumed"; PASS=$((PASS+1)); } \
+                                       || { echo "  ❌ the empty record was left behind"; FAIL=$((FAIL+1)); }
+cleanup_issue_ref
+
+# I8. AN UNREADABLE REGISTRY IS INCOMPLETE, NEVER CLEAN. The read must distinguish "the ref does not
+# exist" (ls-remote exits 0, empty) from "the remote could not be consulted" (non-zero) — collapsing
+# the two reads an OUTAGE as "nobody holds it", which is the false CLEAN this gate exists to remove.
+# Driven through the real function, with CLAIM_REPO pointed at a directory that is not a
+# repository: `git -C <that> ls-remote` exits non-zero, which is exactly what an unreachable remote
+# produces. ⛔ NOT a `_git() { git … "$@"; }` seam — an unresolved git VERB is the shape the checkout
+# guard fails closed on (`unverifiable-verb`), and it would refuse to run this suite at all (the
+# note above `_git_delegate` records that defect).
+unreachable_preflight() {
+  ( cd "$A" && CLAIM_REPO="$A/no-such-repo-$$" && . "$CLAIMS_SH" && claim_issue_preflight "$ISSUE" )
+}
+outX=$(unreachable_preflight); rcX=$?
+echo "  unreachable registry rc=$rcX :: $outX"
+ck "an UNREACHABLE registry is INCOMPLETE (rc=2), never CLEAN" "^2$" "$rcX"
+ck "...and the reason says so" "UNREADABLE" "$outX"
+# And the other direction: the SAME function on the SAME issue with a reachable registry and no
+# claim must read CLEAN — otherwise the fail-closed check above could pass by always refusing.
+cleanup_issue_ref
+outY=$(runB claim_issue_preflight "$ISSUE"); rcY=$?
+echo "  reachable registry, no claim rc=$rcY :: $outY"
+ck "a reachable registry with NO claim reads CLEAN (rc=0)" "^0$" "$rcY"
+ck "...and names the issue" "no claim on #$ISSUE" "$outY"
+cleanup_issue_ref
 
 echo
 echo "=== cleanup ==="
