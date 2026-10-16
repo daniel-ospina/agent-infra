@@ -3,7 +3,7 @@ import { isToolCallEventType } from "@earendil-works/pi-coding-agent";
 import { execSync } from "node:child_process";
 import { relative, resolve, isAbsolute, join, dirname, basename, extname } from "node:path";
 import { createHash } from "node:crypto";
-import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, realpathSync, statSync, lstatSync, readlinkSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, realpathSync, statSync, lstatSync, readlinkSync, openSync, closeSync, writeSync, renameSync } from "node:fs";
 import { homedir } from "node:os";
 import { register } from "../shared/health.js";
 import { appendJsonl } from "../shared/audit-log.js";
@@ -310,7 +310,15 @@ export function bridgeRoots(): string[] {
   const bridge = readBridge();
   if (!bridge || bridge.status !== "PASS") return [];
   const roots = new Set<string>();
-  for (const vf of bridge.verified_files) {
+  // readBridge() guarantees `verified_files` is an ARRAY; this guards the
+  // per-entry SHAPE. An entry that is not an object with a string path (a
+  // hand-edited/corrupt bridge) used to throw here, rejecting the
+  // session_start handler — so bridge recovery AND the init reset block were
+  // skipped and the gate wedged on spurious blocks until the file was cleared
+  // (the same "a verified change cannot be committed" symptom this PR fixes).
+  // The merge path already guards this exact shape; mirror it here.
+  for (const vf of (Array.isArray(bridge.verified_files) ? bridge.verified_files : [])) {
+    if (!vf || typeof vf.path !== "string") continue;
     const parsed = parseCompoundKey(vf.path);
     if (parsed) roots.add(parsed.root);
   }
@@ -333,7 +341,8 @@ function recoveryOnlyRoot(root: string): string {
   if (picked === null) return root;
   console.log(
     `[verification-gate] ↔ #3255: no verified entries for ${normalizeWorktreeRoot(root)}; ` +
-      `adopting ${picked} (same repo, has verified entries) as the git-op root`,
+      `recovering entries recorded for ${picked} (same repo) — the git-op root is NOT adopted: ` +
+      `the command's own cwd stays authoritative, and a root mismatch is diagnosed separately`,
   );
   return picked;
 }
@@ -357,6 +366,83 @@ function diagnoseRootMismatch(root: string): void {
       `${siblings.join(", ")} (same repo). Those are different trees, so hashes cannot be compared — ` +
       `re-run the op from the verified tree (cd into it) or re-dispatch verification for ${norm} (#3255).`,
   );
+}
+
+// ── #1225/#1573 P0: the bridge is a SHARED, MULTI-ROOT registry ──────────
+// `writeBridge` used to publish a whole-file SNAPSHOT of the writer's own
+// registry, so any concurrent lane's write erased every other root's entries
+// (#1225 measured three consecutive silent losses). A parent's verified entries
+// were then gone before its task child read them, and the child blocked a
+// change that had already been verified — the P0 this fix closes. Writers now
+// MERGE by compound key and publish with an atomic rename (a reader never sees
+// a torn file). Concurrent writers serialize on an O_EXCL pidfile lock; the
+// holder holds for <1 ms, and a lock timeout degrades to an unlocked merge,
+// which is fail-closed (a lost merge means re-verification, never an allow).
+const BRIDGE_LOCK_WAIT_MS = 500;
+const BRIDGE_LOCK_STALE_MS = 10_000;
+
+export function acquireBridgeLock(): (() => void) | null {
+  const lockFile = `${bridgePath()}.lock`;
+  const deadline = Date.now() + BRIDGE_LOCK_WAIT_MS;
+  for (;;) {
+    // The deadline is checked at the TOP of EVERY iteration, so no branch can
+    // spin past it. A persistent EEXIST whose target is not a readable lock
+    // file (a directory, a dangling symlink, an unreadable path) used to hit
+    // `catch { continue }` below — skipping the only deadline check and
+    // busy-looping forever at ~100% CPU inside the tool_call hook that called
+    // writeBridge, instead of the bounded degrade the constants claim.
+    if (Date.now() >= deadline) return null; // degrade unlocked; merge is fail-closed
+    try {
+      const fd = openSync(lockFile, "wx", 0o600);
+      writeSync(fd, String(process.pid));
+      closeSync(fd);
+      return () => {
+        try {
+          // ownership check before unlink — a stale-reclaim cycle must not
+          // delete a lock a THIRD process now holds. `isFile()` first: reading
+          // a non-regular path (a FIFO/socket) would block forever.
+          if (lstatSync(lockFile).isFile() && readFileSync(lockFile, "utf-8").trim() === String(process.pid)) {
+            unlinkSync(lockFile);
+          }
+        } catch { /* already released */ }
+      };
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code !== "EEXIST") return null; // read-only dir — degrade unlocked
+      // Stale-lock self-heal: dead holder PID, or age past the threshold. The
+      // lock is read ONLY after an `isFile()` check: a FIFO/socket/device at
+      // this path BLOCKS inside open(2) on read, and a synchronous block cannot
+      // be bounded by the deadline at the top of the loop — it would wedge the
+      // tool_call hook that called writeBridge, forever. `lstatSync` does not
+      // block, so every non-regular shape is handled as "not a lock we can
+      // take" rather than read.
+      let holderText: string | null = null;
+      try {
+        holderText = lstatSync(lockFile).isFile() ? readFileSync(lockFile, "utf-8").trim() : null;
+      } catch { holderText = null; }
+      if (holderText === null) {
+        // Not a regular lock file (directory / FIFO / socket / dangling
+        // symlink) or it vanished between the two calls. Reclaim it and retry;
+        // if it exists and cannot be removed it is not a lock we can ever
+        // take, so degrade unlocked NOW rather than spinning (a synchronous
+        // spin here wedges the hook too). The deadline at the top of the loop
+        // bounds every remaining path.
+        try { unlinkSync(lockFile); continue; } catch { /* not removable / already gone */ }
+        if (!existsSync(lockFile)) continue; // vanished between open and read — retry
+        return null; // exists but is not a removable regular lock — degrade unlocked
+      }
+      let stale = false;
+      const holder = Number(holderText);
+      if (Number.isInteger(holder) && holder > 0) {
+        try { process.kill(holder, 0); } catch { stale = true; } // ESRCH — holder is dead
+      } else {
+        stale = true; // empty/garbage lock (e.g. the legacy 0-byte file)
+      }
+      if (!stale) stale = Date.now() - statSync(lockFile).mtimeMs > BRIDGE_LOCK_STALE_MS;
+      if (stale) { try { unlinkSync(lockFile); } catch { /* raced */ } continue; }
+      const spinUntil = Date.now() + 10;
+      while (Date.now() < spinUntil) { /* brief spin — holders are sub-ms */ }
+    }
+  }
 }
 
 function writeBridge(projectRoot: string, files: string[]): void {
@@ -391,12 +477,65 @@ function writeBridge(projectRoot: string, files: string[]): void {
       console.error("[verification-gate] bridge write skipped — no files could be hashed");
       return;
     }
-    const payload = {
-      status: "PASS",
-      verified_files: verifiedFiles,
-      timestamp: new Date().toISOString(),
-    };
-    writeFileSync(bridgePath(), JSON.stringify(payload), { mode: 0o600 });
+    // #1225/#1573: MERGE into the shared registry — never overwrite it. The
+    // writer's OWN keys win (a re-verification updates in place); every
+    // foreign-root entry is preserved, so a concurrent lane cannot silently
+    // erase another root's verification. Preservation is security-neutral:
+    // recovery registers an entry only when its STORED hash still matches the
+    // file on disk under the committing root (match-or-drop, #190), so a
+    // preserved entry that no longer matches is inert (fail-closed). Entries
+    // whose root no longer exists, or whose file was deleted under a live
+    // root, are dropped — bounding the file to live worktrees and live files.
+    const release = acquireBridgeLock();
+    try {
+      const merged = new Map<string, VerifiedFile>();
+      const existing = readBridge();
+      if (existing && existing.status === "PASS" && Array.isArray(existing.verified_files)) {
+        const rootAlive = new Map<string, boolean>();
+        for (const vf of existing.verified_files) {
+          if (!vf || typeof vf.path !== "string" || typeof vf.hash !== "string") continue;
+          const parsed = parseCompoundKey(vf.path);
+          if (parsed) {
+            let alive = rootAlive.get(parsed.root);
+            if (alive === undefined) { alive = existsSync(parsed.root); rootAlive.set(parsed.root, alive); }
+            if (!alive) continue; // dead worktree — prune
+            // Prune files that no longer exist under a LIVE root. A merge never
+            // rewrites the file down to the writer's own registry the way the
+            // old snapshot did, so nothing else would ever remove these — they
+            // would accumulate without bound in the machine-global bridge, and
+            // every git op whose mtime changed re-parses and scans every entry.
+            // Presence must be tested WITHOUT following the link: the gate's
+            // own #1092 file rule hashes a symlink's LINK bytes and needs no
+            // existing target, so a verified DANGLING symlink is legitimate.
+            // `existsSync` follows the link, reads such a symlink as absent,
+            // and would prune the entry — re-creating the #1225/#1573 loss on
+            // the next foreign write, for the #1092 path class.
+            let present = false;
+            try { lstatSync(resolve(parsed.root, parsed.path)); present = true; } catch { present = false; }
+            if (!present) continue;
+          }
+          merged.set(vf.path, vf);
+        }
+      }
+      for (const vf of verifiedFiles) merged.set(vf.path, vf); // writer's own keys win
+      const payload = {
+        status: "PASS",
+        verified_files: Array.from(merged.values()),
+        timestamp: new Date().toISOString(),
+      };
+      // Atomic publish: a concurrent reader sees either the old file or the new
+      // one, never a truncated JSON body (which would read as no bridge).
+      const tmp = `${bridgePath()}.tmp-${process.pid}-${Date.now()}`;
+      try {
+        writeFileSync(tmp, JSON.stringify(payload), { mode: 0o600 });
+        renameSync(tmp, bridgePath());
+      } catch (e) {
+        try { unlinkSync(tmp); } catch { /* nothing to clean */ }
+        throw e;
+      }
+    } finally {
+      if (release) release();
+    }
   } catch (e) {
     console.error("[verification-gate] bridge write failed:", (e as Error).message);
   }
@@ -406,7 +545,18 @@ function readBridge(): { status: string; verified_files: VerifiedFile[] } | null
   try {
     if (!existsSync(bridgePath())) return null;
     const raw = readFileSync(bridgePath(), "utf-8");
-    return JSON.parse(raw);
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") return null;
+    // Normalise the SHAPE at the one read boundary, so NO consumer has to
+    // defend against a hand-edited/corrupt bridge. A non-array
+    // `verified_files` used to make `for (const vf of ...)` throw inside the
+    // session_start handler, skipping bridge recovery AND the init reset block
+    // and wedging the gate on spurious blocks until the file was cleared —
+    // the same "a verified change cannot be committed" symptom this PR fixes.
+    // Entries that are not objects with a string path are skipped by each
+    // consumer; this only guarantees the CONTAINER is iterable.
+    if (!Array.isArray(parsed.verified_files)) parsed.verified_files = [];
+    return parsed;
   } catch {
     return null;
   }
@@ -453,7 +603,7 @@ function recoverBridgeForRoot(normRoot: string): number {
   for (const vf of bridge.verified_files) {
     try {
       const parsed = parseCompoundKey(vf.path);
-      if (!parsed || parsed.root !== normRoot) continue; // foreign root — inert
+      if (!parsed || parsed.root !== normRoot) continue; // foreign root — inert (#37/#190 root isolation)
       // #190 review: containment — an out-of-root rel (../) is inert against
       // the block check (git names are repo-relative) but hashFile would read
       // outside the root; drop such keys before hashing.

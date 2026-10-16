@@ -53,6 +53,17 @@
 #  16. A FAILED MERGE FAILS LOUD: the exit status is checked, gh's stderr is
 #      surfaced, and a head-bound RETRACTION is posted so the success marker is
 #      never left standing over an unmerged PR (B1 lost #3754/#3755 to it).
+#  16b. AND A FAILED *READ* IS NOT A FAILED MERGE (#1298): the exit status is a
+#      statement about the SEND, and a lost answer to a MUTATION is ambiguous BY
+#      DEFINITION about whether the mutation ran. A non-zero 'gh pr merge' whose
+#      response read timed out over a PR GitHub ALREADY MERGED was reported as
+#      "the merge did NOT happen", with a DURABLE retraction posted over a MERGED
+#      PR (tortoise #4413). Both merge arms now read the PR's state through ONE
+#      door and answer with THREE outcomes — merged / not_merged / unreadable —
+#      where "unreadable" is never rendered as either claim: `[merge_unreadable]`
+#      marks the undeterminable case and NO retraction is posted, while a genuine
+#      unmerged state still retracts (now resting on the artifact, not the status).
+#      §70-§74 pin all three outcomes, including that only the LAST poll decides.
 #  17. A DRAFT IS REFUSED EARLY: gh refuses to merge a draft and commit-workflow
 #      opens drafts, so the rail refuses before any CI work, by name.
 #  18. THE RE-RUN BOUND IS DERIVED PER SHARD (#1167): no global constant. The
@@ -255,6 +266,11 @@ case "$key" in
       jprev="$x"
     done
     if [ "$want_draft" = 1 ] && [ "$want_head" = 0 ]; then
+      # #1750: a DRAFT READ THAT FAILS needs its own seam, because the defect is exactly a
+      # failed read rendered as a value — with no way to fail this probe, no scenario could
+      # drive the fail-open it produced. The diagnostic goes to stderr so the refusal's
+      # diagnostic-quoting arm is exercised on a REAL rail run, not only in the unit suite.
+      [ -f "$SCEN/draft-fail" ] && { printf 'gh: could not read the pull request\n' >&2; exit 1; }
       [ -f "$SCEN/draft" ] && { cat "$SCEN/draft"; exit 0; }
       printf 'false\n'; exit 0
     fi
@@ -278,6 +294,22 @@ case "$key" in
       # the `pr merge` handler below only when the merge actually happens, so a
       # scenario can model a `gh pr merge` that exits 0 while the PR stays OPEN
       # (a queued `--auto`) by setting `merge-noop` instead.
+      # #1298: a STATE READ THAT FAILS needs its own seam, because the defect is exactly
+      # a failed read rendered as a value — with no way to fail this read, no scenario
+      # could drive the false "did NOT happen" the non-zero arm produced. The diagnostic
+      # goes to stderr so the undeterminable branch's diagnostic-quoting arm is exercised
+      # on a REAL rail run, not only through §75's direct-drive probe.
+      [ -f "$SCEN/merge-state-unreadable" ] && { printf 'gh: could not read the pull request\n' >&2; exit 1; }
+      # `merge-state-fail-after N` — the read SUCCEEDS for the first N attempts and fails
+      # afterwards, so "only the LAST attempt's observation decides the verdict" is
+      # expressible (a readable OPEN followed by an unreadable attempt is UNREADABLE, not
+      # not_merged — the state at the END is what the verdict is about).
+      if [ -f "$SCEN/merge-state-fail-after" ]; then
+        n=$(( $(cat "$SCEN/merge-state-read-count" 2>/dev/null || echo 0) + 1 ))
+        printf '%s' "$n" > "$SCEN/merge-state-read-count"
+        [ "$n" -le "$(cat "$SCEN/merge-state-fail-after")" ] \
+          || { printf 'gh: could not read the pull request\n' >&2; exit 1; }
+      fi
       if [ -f "$SCEN/merged" ]; then
         printf 'MERGED\t2026-09-23T00:00:00Z\n'
       else
@@ -490,6 +522,16 @@ case "$key" in
     fi
     exit 0 ;;
   "pr merge")
+    # ── #1298: THE MERGE THAT HAPPENED AND WHOSE RESPONSE WAS LOST. GitHub PROCESSED
+    # the merge (so the PR is MERGED and a landed commit exists) while the CLIENT's
+    # response read timed out — the exact tortoise #4413 shape. `merged` is touched even
+    # though the command exits non-zero, because the two facts are INDEPENDENT: the exit
+    # status describes the SEND, the PR's state describes the ARTIFACT.
+    if [ -f "$SCEN/merge-lost-response" ]; then
+      cat "$SCEN/merge-lost-response" >&2
+      touch "$SCEN/merged"
+      exit 1
+    fi
     if [ -f "$SCEN/fail-merge" ]; then
       cat "$SCEN/fail-merge" >&2
       exit 1
@@ -800,7 +842,7 @@ new_scen() {
 
 run_admin() {
   SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" \
-    ADMIN_MERGE_POLL_INTERVAL=0 ADMIN_MERGE_HEAD_READ_SLEEP=0 \
+    ADMIN_MERGE_POLL_INTERVAL=0 ADMIN_MERGE_HEAD_READ_SLEEP=0 ADMIN_MERGE_VERIFY_POLL=0 \
     bash "$ADM" "$@" >"$TMP/out" 2>"$TMP/err"
   return $?
 }
@@ -813,7 +855,7 @@ run_admin() {
 # assert on the rail's own output use this.
 run_admin_here() {
   SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" \
-    ADMIN_MERGE_POLL_INTERVAL=0 ADMIN_MERGE_HEAD_READ_SLEEP=0 \
+    ADMIN_MERGE_POLL_INTERVAL=0 ADMIN_MERGE_HEAD_READ_SLEEP=0 ADMIN_MERGE_VERIFY_POLL=0 \
     bash "$ADM" "$@" >"$SCEN/out" 2>"$SCEN/err"
   return $?
 }
@@ -2599,6 +2641,100 @@ grep -q "could not READ the head" "$SCEN/err" && pass "the §4 read is reported 
   || pass "no evidence comment posted"
 grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted" || pass "no merge attempted"
 
+# ── 13f/13g. the DRAFT PROBE fails OPEN, and the fix is on the other side (#1750) ──
+# ⛔ THE SAME ROOT AS §13b-§13e, FAILING THE OTHER WAY. `resolve_draft` had the identical bare-read
+# shape, and #1690's fix was fail-CLOSED (a failed head read produced a false REFUSAL). #1750 is
+# fail-OPEN: a failed `isDraft` read returned "" and `[ "" = "true" ]` read that as "not a
+# draft", so the rail PROCEEDED past the early refusal this probe exists to make — spending the
+# whole CI window and posting the head-bound evidence marker on a PR that could not merge.
+#
+# ⛔ THE DISCRIMINATOR IS THE GH CALL LEDGER, NOT PROSE (§13b's round-4 lesson, MEASURED there:
+# renaming one log line left §13b/§13c/§13d green while the rail demonstrably still proceeded).
+# The draft probe is the LAST `gh` call a correct rail makes: everything after §0 issues another
+# call (the lane listing), so a rail that PROCEEDED leaves a DIFFERENT last line. A missing or
+# empty ledger returns 1, which at the inverted `&& pass || fail` site below is the FAIL arm —
+# the safe direction — unlike the `&& fail || pass` sites §13b/§13c/§13d use.
+draft_probe_was_last_call() {
+  local last
+  last="$(tail -n 1 "$SCEN/calls" 2>/dev/null)"
+  case "$last" in *isDraft*) return 0 ;; esac
+  return 1
+}
+
+# ── 13f. a DRAFT PROBE that FAILS is UNREADABLE, never "not a draft" (#1750) ──
+# The fixture is otherwise-CLEAN past the probe, so a reverted rail has a path all the way to the
+# merge: a bare exit-code assertion would then be satisfied by a refusal the mutation did not
+# cause (§13b's round-3 finding), which is why the ledger and comment/merge assertions carry the
+# weight here.
+echo "== 13f. a draft probe that FAILS is UNREADABLE, never 'not a draft' (#1750) =="
+new_scen draftprobeunread
+HEAD_DF2="6666000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_DF2" > "$SCEN/head"
+printf 'x\n' > "$SCEN/draft-fail"          # the isDraft read FAILS (its own seam)
+lane_fail "$HEAD_DF2" 7011 > "$SCEN/runs-$HEAD_DF2"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-7011"
+main_red_n main6666 7012 3 'tests/test_other.py::test_red_on_main' > "$SCEN/runs-main"
+run_admin_here 42 --main-runs 3
+rc=$?
+[ "$rc" -ne 0 ] && pass "exit non-zero ($rc) when the draft probe fails" \
+  || fail "expected a non-zero exit, got 0 — an UNREADABLE draft probe reached the merge path"
+grep -qF '[draft_unreadable]' "$SCEN/err" && pass "the refusal carries the machine-readable tag" \
+  || fail "expected [draft_unreadable] on the refusal line, got: $(head -c 200 "$SCEN/err")"
+grep -q "could not READ the isDraft flag" "$SCEN/err" && pass "the refusal says the READ failed" \
+  || fail "expected the unreadable-draft refusal on stderr"
+# ⛔ THE SPEECH-ACT NEGATIVE: this refusal must NOT be the genuine-draft one. It is not a claim
+# about the PR, and its remedy (retry the rail) is not the draft's.
+grep -q "is a DRAFT, and gh refuses to merge a draft" "$SCEN/err" \
+  && fail "the rail claimed the PR IS A DRAFT on a run where it could not READ the flag — the two speech acts are conflated" \
+  || pass "an unreadable probe never claims the PR is a draft"
+draft_probe_was_last_call \
+  && pass "the draft probe was the rail's LAST call — it did not proceed" \
+  || fail "the rail PROCEEDED past the unreadable draft probe (another gh call follows it) — this is #1750's fail-open"
+[ -f "$SCEN/comment" ] && fail "no evidence may be posted when the draft probe could not answer" \
+  || pass "no evidence comment posted"
+grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted" || pass "no merge attempted"
+
+# ── 13g. a DRAFT PROBE that SUCCEEDS with a NON-BOOLEAN is unreadable too (#1750) ──
+# ⛔ THE HALF A FIX THAT ONLY CHECKS THE EXIT STATUS MISSES. A read that exits 0 with a value
+# that is not exactly `true`/`false` is exactly as unusable as one that fails, because
+# `[ "$x" = "true" ]` reads EVERY such value as "not a draft". §13f's fixture makes `rc`
+# non-zero, so it can never reach the value check at all — the same gap §13d closed for the
+# head read (MEASURED there: reverting the shape fix left §13b green).
+#
+# ⛔ THE FIXTURE IS MULTI-LINE ON PURPOSE, AND THE FIRST VERSION WAS NOT (#1750 review,
+# MEASURED). It used a single non-boolean (`yes`), which a PER-LINE boolean check ALSO rejects
+# — so the scenario would have stayed green against a regression to a per-line test, the exact
+# property §13d exists to pin for the head. A first line that IS a valid boolean plus a junk
+# second line is only rejected by a WHOLE-VALUE check: `printf 'yes\n' | grep -qxE 'true|false'`
+# rejects, while `printf 'true\nJUNK\n'` is ACCEPTED by a per-line check and rejected by the
+# `case`. The plain non-boolean shapes (`yes`, `TRUE`, empty) are pinned in the unit suite; this
+# scenario pins the whole-value property at the rail level.
+echo "== 13g. a draft probe that SUCCEEDS with a NON-BOOLEAN is unreadable too (#1750) =="
+new_scen draftprobenonbool
+HEAD_DG="7777000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_DG" > "$SCEN/head"
+# gh exits 0 with a valid boolean AND a junk line: accepted by a per-LINE check, rejected only
+# by a whole-value one.
+printf 'true\nJUNK\n' > "$SCEN/draft"
+lane_fail "$HEAD_DG" 7021 > "$SCEN/runs-$HEAD_DG"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-7021"
+main_red_n main7777 7022 3 'tests/test_other.py::test_red_on_main' > "$SCEN/runs-main"
+run_admin_here 42 --main-runs 3
+rc=$?
+[ "$rc" -ne 0 ] && pass "exit non-zero ($rc) when the draft probe returns a non-boolean" \
+  || fail "expected a non-zero exit, got 0 — a NON-BOOLEAN draft value was read as 'not a draft'"
+grep -qF '[draft_unreadable]' "$SCEN/err" && pass "the refusal carries the machine-readable tag" \
+  || fail "expected [draft_unreadable] for a non-boolean value"
+grep -q "is a DRAFT, and gh refuses to merge a draft" "$SCEN/err" \
+  && fail "a non-boolean value was rendered as the claim that the PR IS A DRAFT" \
+  || pass "a non-boolean value never becomes a draft claim"
+draft_probe_was_last_call \
+  && pass "the draft probe was the rail's LAST call — the non-boolean value did not become a permission" \
+  || fail "the rail PROCEEDED on a NON-BOOLEAN draft value — the whole-value check is missing"
+[ -f "$SCEN/comment" ] && fail "no evidence may be posted for a non-boolean draft value" \
+  || pass "no evidence comment posted"
+grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted" || pass "no merge attempted"
+
 # ── 14. a FAILED main-side input is not an EMPTY one (review P2, #3756) ──
 # The decision's baseline is TWO files (rates + signatures). The signature table
 # was added by the swap, and a failure to extract it must BLOCK — reading it as
@@ -3940,6 +4076,14 @@ grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted on a draft" 
 grep -q "run list" "$SCEN/calls" \
   && fail "the draft check must run BEFORE any CI work" \
   || pass "the refusal is EARLY (no CI run was even listed)"
+# ⛔ THE TAG'S NEGATIVE (#1750, the twin of §13's). `[draft_unreadable]` is only a discriminator
+# if the GENUINE draft refusal does NOT carry it — otherwise `grep -F '[draft_unreadable]'`
+# cannot tell "the instrument could not answer" from "this PR is a draft". Adding it to the
+# genuine-draft refusal leaves every unit test green (the head-read twin was MEASURED to behave
+# this way in #1690), so the discriminating property needs its own assertion.
+grep -qF '[draft_unreadable]' "$TMP/err" \
+  && fail "a GENUINE DRAFT carried the [draft_unreadable] tag — the two refusals are no longer distinguishable by machine" \
+  || pass "the genuine-draft refusal carries no [draft_unreadable] tag"
 
 # ── 37. THE TWO WAITS, the DERIVED ceiling, and attribution that does not
 #        narrow the refusal (B4 / B5 / B7 / B1) ───────────────────────────
@@ -4743,7 +4887,8 @@ echo "== 43. a leading zero is refused (the octal/decimal split) =="
 # the live pacing divergence (accounted as 8 by arithmetic, slept as 10).
 for spec in "ADMIN_MERGE_RERUN_FLOOR|0700" \
             "ADMIN_MERGE_RERUN_TIMEOUT_FALLBACK|03900" "ADMIN_MERGE_POLL_INTERVAL|010" \
-            "ADMIN_MERGE_HEAD_ATTEMPTS|08" "ADMIN_MERGE_HEAD_READ_SLEEP|010"; do
+            "ADMIN_MERGE_HEAD_ATTEMPTS|08" "ADMIN_MERGE_HEAD_READ_SLEEP|010" \
+            "ADMIN_MERGE_VERIFY_ATTEMPTS|08"; do
   knob="${spec%%|*}"; val="${spec#*|}"
   new_scen "leading-zero-$knob"
   env "$knob=$val" bash "$ADM" --print-bounds >"$TMP/out" 2>"$TMP/err"
@@ -8763,6 +8908,414 @@ fi
 printf '%s' "$success_line" | grep -qF -e "--repo acme/widgets" \
   && pass "#7504: the fallback remediation carries the --repo the run was given" \
   || fail "#7504: the fallback remediation dropped --repo (round-2 fix lost): $success_line"
+
+# ── 1298. A MERGE WHOSE RESPONSE READ FAILED IS NOT "DID NOT HAPPEN" ─────────
+# `gh pr merge` exited non-zero because the RESPONSE was lost (a network timeout)
+# while GitHub had ALREADY merged the PR — the exact shape measured on tortoise
+# #4413. The pre-fix non-zero arm read the exit status as a fact about the
+# REPOSITORY, asserted "the merge did NOT happen", and posted a DURABLE retraction
+# over a MERGED PR.
+#
+# §70/§72/§74 carry the assertions that go RED on a rail whose non-zero arm does not
+# re-read; §71 and §73 are the no-regression controls — a genuine refusal must still
+# retract, and the zero-exit arm must still separate the three outcomes — and each has
+# its OWN mutation that reddens it. The full 41-assertion mutation matrix, measured on
+# a copy of the rail per row, is in §75's header. §75 drives the READ directly, because
+# the whole-rail scenarios cannot express the malformed SHAPES.
+NOTHAPPEN='the merge of PR #42 did NOT happen'
+
+echo "== 70. #1298: a merge whose response read TIMED OUT is not reported as 'did NOT happen' =="
+new_scen merge-lost-response
+HEAD_1298A="1298129812981298129812981298129812981298"
+printf '%s\n' "$HEAD_1298A" > "$SCEN/head"
+NRX='tests/test_rail.py::test_response_lost'
+NRY='tests/test_rail.py::test_known_on_main'
+lane_fail "$HEAD_1298A" 9701 > "$SCEN/runs-$HEAD_1298A"
+log_failed "$NRX" > "$SCEN/log-9701"
+{ lane_fail main9702 9702; lane_fail main9703 9703; lane_fail main9704 9704; } > "$SCEN/runs-main"
+log_failed "$NRY" > "$SCEN/log-9702"
+log_failed "$NRX" > "$SCEN/log-9703"
+log_failed "$NRX" > "$SCEN/log-9704"
+# THE SHAPE UNDER TEST: the merge ran; the ANSWER to it was lost.
+printf 'Post "https://api.github.com/graphql": read tcp 192.168.100.2:51949->140.82.112.5:443: read: operation timed out\n' > "$SCEN/merge-lost-response"
+export ADMIN_MERGE_VERIFY_ATTEMPTS=1
+run_admin_here 42 --main-runs 3
+rc=$?
+[ "$rc" -eq 0 ] \
+  && pass "a merge whose response was lost still exits 0 — the merge DID happen" \
+  || fail "the rail failed a merge the API reports as MERGED (exit $rc)"
+grep -qF "$NOTHAPPEN" "$SCEN/err" \
+  && fail "the rail asserted the merge did NOT happen on a MERGED PR — the #1298 defect" \
+  || pass "the rail does NOT assert the merge did not happen"
+grep -qF '[merge_response_lost]' "$SCEN/out" \
+  && pass "the lost response is machine-distinguishable ([merge_response_lost])" \
+  || fail "the lost response carries no machine-readable marker"
+grep -q 'the merge DID happen' "$SCEN/out" \
+  && pass "  …and the run says what it established (the merge DID happen)" \
+  || fail "  …but the run does not state what it established"
+grep -qF 'operation timed out' "$SCEN/err" \
+  && pass "  …and gh's own timeout text is surfaced, not discarded" \
+  || fail "  …but the read's own words were discarded"
+grep -q 'at landedfeed000000000000000000000000000000' "$SCEN/out" \
+  && pass "  …and the LANDED commit is re-read from the API and printed" \
+  || fail "  …but the landed commit was not printed (the artifact was not resolved)"
+if [ -f "$SCEN/comment-2" ] && grep -q 'admin-merge-retraction:' "$SCEN/comment-2"; then
+  fail "a RETRACTION was posted over a MERGED PR — durable, and the exact harm of #1298"
+else
+  pass "NO retraction is posted over a MERGED PR"
+fi
+
+echo "== 71. #1298 control: a merge that really did NOT happen still retracts, on the ARTIFACT =="
+new_scen merge-refused-artifact
+HEAD_1298B="1298129812981298129812981298129812981299"
+printf '%s\n' "$HEAD_1298B" > "$SCEN/head"
+lane_fail "$HEAD_1298B" 9711 > "$SCEN/runs-$HEAD_1298B"
+log_failed "$NRX" > "$SCEN/log-9711"
+{ lane_fail main9712 9712; lane_fail main9713 9713; lane_fail main9714 9714; } > "$SCEN/runs-main"
+log_failed "$NRY" > "$SCEN/log-9712"
+log_failed "$NRX" > "$SCEN/log-9713"
+log_failed "$NRX" > "$SCEN/log-9714"
+printf 'gh: Pull Request is still a draft\n' > "$SCEN/fail-merge"
+export ADMIN_MERGE_VERIFY_ATTEMPTS=1
+run_admin_here 42 --main-runs 3
+rc=$?
+[ "$rc" -ne 0 ] \
+  && pass "a refused merge still exits non-zero" \
+  || fail "a refused merge returned 0"
+grep -qF "$NOTHAPPEN" "$SCEN/err" \
+  && pass "  …and the refusal still says the merge did NOT happen" \
+  || fail "  …but the refusal lost its loudness"
+grep -q 'state=OPEN' "$SCEN/err" \
+  && pass "  …resting on the ARTIFACT (state=OPEN), not on the exit status alone" \
+  || fail "  …but the refusal does not cite the artifact it rests on"
+[ -f "$SCEN/comment-2" ] && grep -q 'admin-merge-retraction:' "$SCEN/comment-2" \
+  && pass "  …and the evidence marker is retracted, as before" \
+  || fail "  …but the evidence marker was left standing over an unmerged PR"
+
+echo "== 72. #1298: an UNREADABLE state is 'could not determine', not 'did NOT happen' =="
+new_scen merge-state-unreadable
+HEAD_1298C="1298129812981298129812981298129812981300"
+printf '%s\n' "$HEAD_1298C" > "$SCEN/head"
+lane_fail "$HEAD_1298C" 9721 > "$SCEN/runs-$HEAD_1298C"
+log_failed "$NRX" > "$SCEN/log-9721"
+{ lane_fail main9722 9722; lane_fail main9723 9723; lane_fail main9724 9724; } > "$SCEN/runs-main"
+log_failed "$NRY" > "$SCEN/log-9722"
+log_failed "$NRX" > "$SCEN/log-9723"
+log_failed "$NRX" > "$SCEN/log-9724"
+printf 'Post "https://api.github.com/graphql": read tcp 10.0.0.1:1->140.82.112.5:443: read: operation timed out\n' > "$SCEN/fail-merge"
+# THE SHAPE UNDER TEST: the merge response AND the state read both fail.
+touch "$SCEN/merge-state-unreadable"
+export ADMIN_MERGE_VERIFY_ATTEMPTS=2
+run_admin_here 42 --main-runs 3
+rc=$?
+[ "$rc" -ne 0 ] \
+  && pass "an undeterminable outcome exits non-zero" \
+  || fail "an undeterminable outcome exited 0"
+grep -qF '[merge_unreadable]' "$SCEN/err" \
+  && pass "  …with a machine-readable marker ([merge_unreadable])" \
+  || fail "  …but the undeterminable case carries no machine-readable marker"
+grep -qF "$NOTHAPPEN" "$SCEN/err" \
+  && fail "  …but it ALSO rendered the failed read as 'the merge did not happen' (the #1298 shape)" \
+  || pass "  …and does NOT claim the merge did not happen"
+grep -qF 'PR #42 is NOT merged' "$SCEN/err" \
+  && fail "  …but it rendered the failed read as 'PR #42 is NOT merged'" \
+  || pass "  …and does not claim the PR is unmerged"
+grep -q 'NOT a claim' "$SCEN/err" \
+  && pass "  …and says plainly that it makes no claim about the PR" \
+  || fail "  …but does not state that it makes no claim about the PR"
+grep -qF 'could not read the pull request' "$SCEN/err" \
+  && pass "  …and quotes the read's own diagnostic" \
+  || fail "  …but the read's diagnostic was discarded"
+if [ -f "$SCEN/comment-2" ] && grep -q 'admin-merge-retraction:' "$SCEN/comment-2"; then
+  fail "  …but a RETRACTION was posted over an UNKNOWN state"
+else
+  pass "  …and NO retraction is posted over an unknown state"
+fi
+
+echo "== 73. #1298: exit 0 with an UNREADABLE state is 'could not determine', not 'not merged' =="
+new_scen merge-confirmed-state-unreadable
+HEAD_1298D="1298129812981298129812981298129812981301"
+printf '%s\n' "$HEAD_1298D" > "$SCEN/head"
+lane_fail "$HEAD_1298D" 9731 > "$SCEN/runs-$HEAD_1298D"
+log_failed "$NRX" > "$SCEN/log-9731"
+{ lane_fail main9732 9732; lane_fail main9733 9733; lane_fail main9734 9734; } > "$SCEN/runs-main"
+log_failed "$NRY" > "$SCEN/log-9732"
+log_failed "$NRX" > "$SCEN/log-9733"
+log_failed "$NRX" > "$SCEN/log-9734"
+# The merge command SUCCEEDS (so `merged` is set by the fake) and the ARTIFACT read
+# still cannot answer: the exit status is not the artifact in this direction either.
+touch "$SCEN/merge-state-unreadable"
+export ADMIN_MERGE_VERIFY_ATTEMPTS=1
+run_admin_here 42 --main-runs 3
+rc=$?
+[ "$rc" -ne 0 ] \
+  && pass "exit 0 with an unreadable artifact is not reported as a merge" \
+  || fail "the rail claimed a merge it never observed"
+grep -qF '[merge_unreadable]' "$SCEN/err" \
+  && pass "  …and it carries the machine-readable marker too" \
+  || fail "  …but the zero-exit undeterminable case carries no marker"
+grep -qF 'PR #42 is NOT merged' "$SCEN/err" \
+  && fail "  …but it rendered the failed READ as 'PR #42 is NOT merged'" \
+  || pass "  …and does not claim the PR is unmerged"
+if [ -f "$SCEN/comment-2" ] && grep -q 'admin-merge-retraction:' "$SCEN/comment-2"; then
+  fail "  …but a RETRACTION was posted over an UNKNOWN state"
+else
+  pass "  …and NO retraction is posted over an unknown state"
+fi
+
+echo "== 74. #1298: only the LAST read decides — OPEN then unreadable is UNDETERMINABLE =="
+new_scen merge-state-late-fail
+HEAD_1298E="1298129812981298129812981298129812981302"
+printf '%s\n' "$HEAD_1298E" > "$SCEN/head"
+lane_fail "$HEAD_1298E" 9741 > "$SCEN/runs-$HEAD_1298E"
+log_failed "$NRX" > "$SCEN/log-9741"
+{ lane_fail main9742 9742; lane_fail main9743 9743; lane_fail main9744 9744; } > "$SCEN/runs-main"
+log_failed "$NRY" > "$SCEN/log-9742"
+log_failed "$NRX" > "$SCEN/log-9743"
+log_failed "$NRX" > "$SCEN/log-9744"
+printf 'gh: Pull Request is still a draft\n' > "$SCEN/fail-merge"
+# Attempt 1 reads OPEN; attempts 2+ fail. The state at the END is unknown, and an
+# earlier observation cannot stand in for it — otherwise a merge that landed during
+# the poll would be retracted on the strength of a stale read.
+printf '1\n' > "$SCEN/merge-state-fail-after"
+export ADMIN_MERGE_VERIFY_ATTEMPTS=2
+run_admin_here 42 --main-runs 3
+rc=$?
+[ "$rc" -ne 0 ] && pass "a stale OPEN followed by an unreadable read is not a merge" \
+  || fail "the rail reported a merge from a stale-OPEN poll"
+grep -qF '[merge_unreadable]' "$SCEN/err" \
+  && pass "  …the verdict comes from the LAST attempt, so it is UNDETERMINABLE" \
+  || fail "  …but the verdict rested on an earlier attempt that the poll superseded"
+grep -qF "$NOTHAPPEN" "$SCEN/err" \
+  && fail "  …but it claimed the merge did not happen from a superseded observation" \
+  || pass "  …and it does not claim the merge did not happen"
+if [ -f "$SCEN/comment-2" ] && grep -q 'admin-merge-retraction:' "$SCEN/comment-2"; then
+  fail "  …but a RETRACTION was posted over an UNKNOWN state"
+else
+  pass "  …and NO retraction is posted over an unknown state"
+fi
+unset ADMIN_MERGE_VERIFY_ATTEMPTS
+
+# ── 75. THE MERGE-ARTIFACT READ VALIDATES THE WHOLE VALUE, AND ITS ANSWER IS AN
+#      ALLOW-LIST (#1298) ────────────────────────────────────────────────────────
+# §70-§74 drive the WHOLE rail, so they can only express what the hermetic `gh` can
+# serve: a non-zero exit, or a well-formed `<state>\t<mergedAt>`. That leaves the
+# SHAPE guards — the multi-line test, the double-separator test, the missing-separator
+# test, the exit-status test, the byte-level NUL test and the size ceiling — UNEXERCISED:
+# deleting them leaves §70-§74 green (measured: the `shape`, `nul-blind` and `size-unbound`
+# mutations redden only assertions that live here). This section loads the rail's FUNCTION
+# DEFINITIONS and calls the read directly, so every declared shape has an assertion that
+# goes RED when its guard is removed or answered wrongly.
+#
+# MUTATION EVIDENCE — each row is a one-line change applied to a COPY of the rail
+# (never the working tree; driver kept beside the logs), run against every assertion
+# of §70-§75:
+#   nonzero    the non-zero arm's re-read removed    15 fail: §70×6 §72×6 §74×3
+#   noretrat   the non-zero arm's not_merged gate shut 3 fail: §71×3
+#   zeroexit   the zero-exit retraction gate reverted  3 fail: §73×3
+#   shape      the whole-value/exit-status/NUL/size tests reverted 6 fail: §75×6
+#   allowlist  the final verdict reverted to a DENY-LIST 23 fail: §72×6 §73×3 §74×3 §75×11
+#   nul-blind  the byte-level NUL test removed         1 fail: §75×1
+#   diag-stale the deciding attempt's EMPTY stderr overwritten by an earlier one 1 fail: §75×1
+#   size-unbound the 4 KiB ceiling removed             1 fail: §75×1
+#   diag-last  the last-non-blank line reverted to `tail -n 1`  1 fail: §75×1
+# EVERY section is reddened by at least one row, and NO row reddens all of them: the
+# assertions are load-bearing and targeted rather than a blanket count.
+echo "== 75. #1298: the merge-artifact read validates the whole value (allow-list, not deny-list) =="
+# The rail's definitions with the `main "$@"` entrypoint stripped. §44 created this
+# loader; REUSE it rather than carrying a second copy of the `sed '$d'` assumption
+# (the rail's entry-point guard comment names that exact constraint) — and create it
+# only when §44 did not run, which is the case for a harness that drives §70-§75 alone.
+: "${BELT_DEFS:=$TMP/belt-defs.sh}"
+[ -f "$BELT_DEFS" ] || sed '$d' "$ADM" > "$BELT_DEFS"
+POLL_PROBE="$TMP/poll-probe.sh"
+cat > "$POLL_PROBE" <<'POLLEOF'
+set -uo pipefail
+. "$BELT_DEFS"
+sleep() { :; }             # the subject is the READ, not the pacing between attempts
+repo_args=()
+POLL_GH() {                # the read's only dependency: ONE gh call per attempt
+  local n r e
+  n=$(( $(cat "$POLL_CNT" 2>/dev/null || echo 0) + 1 ))
+  printf '%s' "$n" > "$POLL_CNT"
+  if [ -n "${POLL_SEQ:-}" ]; then       # per-attempt: line N of three sibling files
+    printf '%s' "$(sed -n "${n}p" "$POLL_SEQ.raw")"
+    e="$(sed -n "${n}p" "$POLL_SEQ.err")"
+    [ -n "$e" ] && printf '%s\n' "$e" >&2
+    r="$(sed -n "${n}p" "$POLL_SEQ.rc")"
+    return "${r:-0}"
+  fi
+  if [ -n "${POLL_RAW_FILE:-}" ]; then cat "$POLL_RAW_FILE"; fi   # raw BYTES, NULs included
+  [ -n "${POLL_RAW:-}" ] && printf '%s' "$POLL_RAW"
+  [ -n "${POLL_ERR:-}" ] && printf '%s\n' "$POLL_ERR" >&2
+  return "${POLL_RC:-0}"
+}
+poll_merge_artifact 42
+calls="$(cat "$POLL_CNT" 2>/dev/null)"
+printf 'verdict=%s|state=%s|merged_at=%s|attempts=%s|calls=%s|diag=%s\n' \
+  "${MERGE_ART_VERDICT-<unset>}" "${MERGE_ART_STATE-<unset>}" "${MERGE_ART_MERGED_AT-<unset>}" \
+  "${MERGE_ART_ATTEMPTS-<unset>}" "${calls:-0}" "${MERGE_ART_DIAG-}"
+POLLEOF
+# poll_run — the ONE driver. <label> <attempts> <seq-prefix> <rawfile> <raw> <rc> <err>
+poll_run() {
+  local label="$1" attempts="$2" seq="$3" rawfile="$4" raw="$5" rc="$6" err="$7"
+  local cnt="$TMP/poll-calls-$label" line
+  : > "$cnt"
+  env BELT_DEFS="$BELT_DEFS" POLL_CNT="$cnt" POLL_SEQ="$seq" POLL_RAW_FILE="$rawfile" \
+      POLL_RAW="$raw" POLL_RC="$rc" POLL_ERR="$err" \
+      ADMIN_MERGE_GH=POLL_GH ADMIN_MERGE_VERIFY_ATTEMPTS="$attempts" \
+      bash "$POLL_PROBE" > "$TMP/poll-out" 2>"$TMP/poll-err"
+  line="$(cat "$TMP/poll-out")"
+  POLL_VERDICT="${line#verdict=}"; POLL_VERDICT="${POLL_VERDICT%%|*}"
+  POLL_STATE="${line#*state=}";   POLL_STATE="${POLL_STATE%%|*}"
+  POLL_AT="${line#*merged_at=}";  POLL_AT="${POLL_AT%%|*}"
+  POLL_ATTEMPTS="${line#*attempts=}"; POLL_ATTEMPTS="${POLL_ATTEMPTS%%|*}"
+  POLL_CALLS="${line#*calls=}";   POLL_CALLS="${POLL_CALLS%%|*}"
+  POLL_DIAG="${line#*diag=}"
+}
+poll_shape() { poll_run "$1" "${4:-1}" "" "" "$2" "$3" "${5:-}"; }
+# The same, but the answer is served from a FILE, so a byte a bash variable cannot
+# carry (a NUL) can be produced. This is the ONLY way to express that shape.
+poll_file_shape() { poll_run "$1" 1 "" "$2" "" "$3" "${4:-}"; }
+# The same, with a DIFFERENT answer per attempt (line N of "$TMP/seq-<label>.{raw,err,rc}",
+# written by the call site), so "only the last attempt decides" is exercised directly.
+poll_seq_shape() { poll_run "$1" "$2" "$TMP/seq-$1" "" "" "" ""; }
+# expect_poll <label> <want-verdict> <want-state> <what the shape proves>
+# `calls=1` is asserted as well, deliberately: without it a shape assertion can pass
+# because NO read happened at all (the pre-initialised unreadable globals), which is the
+# vacuous form of exactly the defect this section exists to pin.
+expect_poll() {
+  if [ "$POLL_VERDICT" = "$2" ] && [ "$POLL_STATE" = "$3" ] && [ "$POLL_CALLS" = 1 ]; then
+    pass "(shape) $4 → verdict=$2 state=$3 after 1 read"
+  else
+    fail "(shape) $4 → verdict=$POLL_VERDICT state=$POLL_STATE calls=$POLL_CALLS (want $2/$3 after 1 read)"
+  fi
+}
+
+poll_shape ok-merged "$(printf 'MERGED\t2026-09-23T00:00:00Z')" 0
+if [ "$POLL_VERDICT" = merged ] && [ "$POLL_AT" = "2026-09-23T00:00:00Z" ] && [ "$POLL_CALLS" = 1 ]; then
+  pass "(shape) a well-formed MERGED read is read as merged, with its mergedAt, after ONE call"
+else
+  fail "(shape) MERGED read → verdict=$POLL_VERDICT at=$POLL_AT calls=$POLL_CALLS"
+fi
+poll_shape ok-open "$(printf 'OPEN\t-')" 0
+expect_poll ok-open not_merged OPEN "a well-formed OPEN read"
+poll_shape ok-closed "$(printf 'CLOSED\t-')" 0
+expect_poll ok-closed not_merged CLOSED "a well-formed CLOSED read"
+
+# ⛔ EACH MALFORMED SHAPE IS ITS OWN ASSERTION, and each depends on a NAMED guard:
+# the four PROJECTION guards and the NUL test are deletion-sensitive (the `shape` mutation
+# below reddens exactly those five), while the three STATE-TOKEN assertions are sensitive to
+# the guard's ANSWER rather than to its presence — removing the inner `*)` arm is
+# unobservable because the function's pre-initialised sentinels, and the final verdict case,
+# already answer `unreadable`; the `allowlist` mutation (which flips that answer to
+# `not_merged`) is what reddens them. Both directions are load-bearing; neither is claimed
+# beyond that.
+poll_shape no-separator "MERGED" 0
+expect_poll no-separator unreadable '<unreadable>' "a bare MERGED with NO separator (the ANY-SEPARATOR trap)"
+poll_shape two-separators "$(printf 'MERGED\tx\ty')" 0
+expect_poll two-separators unreadable '<unreadable>' "TWO separators (not the one-line projection)"
+poll_shape multiline "$(printf 'MERGED\t2026-01-01T00:00:00Z\nOPEN\t-')" 0
+expect_poll multiline unreadable '<unreadable>' "a MULTI-LINE answer (the ANY-FIRST-LINE trap)"
+poll_shape empty-state "$(printf '\t-')" 0
+expect_poll empty-state unreadable '<unreadable>' "an EMPTY state token (the absence of an answer, not a state named '')"
+poll_shape undocumented "$(printf 'PENDING\t-')" 0
+expect_poll undocumented unreadable '<unreadable>' "an UNDOCUMENTED state token — the allow-list, not 'anything that is not MERGED'"
+poll_shape lowercase "$(printf 'merged\t-')" 0
+expect_poll lowercase unreadable '<unreadable>' "a lowercase state token"
+poll_shape nonzero-plausible "$(printf 'MERGED\t2026-01-01T00:00:00Z')" 1 1 "gh: read: operation timed out"
+expect_poll nonzero-plausible unreadable '<unreadable>' "a NON-ZERO exit carrying a plausible stdout (a failed read is not a value)"
+# …and the FAILED read was a READ: an unreadable verdict must not mean "no read ran".
+[ "$POLL_CALLS" = 1 ] \
+  && pass "(shape) the malformed read WAS attempted (calls=1), so 'unreadable' is about a read that happened" \
+  || fail "(shape) the unreadable verdict came from $POLL_CALLS read(s)"
+# …and the diagnostic travels on its own channel rather than being discarded.
+grep -qF 'operation timed out' <<<"$POLL_DIAG" \
+  && pass "(shape) the read's own stderr is captured into the diagnostic" \
+  || fail "(shape) the read's stderr was discarded (diag=[$POLL_DIAG])"
+
+# A readable non-MERGED answer polls the WHOLE bound (the merge may still be landing),
+# so the bound is exercised rather than the first attempt short-circuiting the loop.
+poll_shape open-two "$(printf 'OPEN\t-')" 0 2
+if [ "$POLL_VERDICT" = not_merged ] && [ "$POLL_CALLS" = 2 ] && [ "$POLL_ATTEMPTS" = 2 ]; then
+  pass "(shape) a readable non-MERGED answer polls the full bound (2 attempts, 2 calls)"
+else
+  fail "(shape) OPEN with a bound of 2 → verdict=$POLL_VERDICT calls=$POLL_CALLS attempts=$POLL_ATTEMPTS"
+fi
+
+# ⛔ A NUL CANNOT TRAVEL IN A BASH VARIABLE, so this shape needs a FILE: no `${VAR}` and no
+# `$(...)` can carry one — which is exactly the gap the read's byte-level test closes. The
+# fixture's byte count is asserted too, so the case cannot pass vacuously by losing the byte
+# it is about (9 = MER + NUL + GED + TAB + 1).
+printf 'MER\000GED\t-' > "$TMP/nul-state"
+[ "$(wc -c < "$TMP/nul-state" | tr -d ' ')" = 9 ] \
+  && pass "(shape) the NUL fixture really carries 9 bytes (MER + NUL + GED + TAB + '-')" \
+  || fail "(shape) the NUL fixture lost its NUL ($(wc -c < "$TMP/nul-state") bytes)"
+poll_file_shape nul-in-state "$TMP/nul-state" 0
+expect_poll nul-in-state unreadable '<unreadable>' "a NUL byte inside the state token (bash deletes it in \$(...), silently)"
+
+# ⛔ THE DIAGNOSTIC MUST BELONG TO THE ATTEMPT THAT DECIDED. Attempt 1 fails with a
+# transient-looking timeout; attempt 2 — the one that DECIDES — answers with an unusable
+# value and writes NOTHING to stderr. The read must report NO diagnostic rather than
+# attempt 1's text: attributing a timeout to a shape failure names the wrong cause, and the
+# two have different remedies (re-run vs. look at the producer).
+seqp="$TMP/seq-diag-decides"
+printf '%s\n' "$(printf 'PENDING\t-')" '' > "$seqp.raw"
+printf '%s\n' 'first-attempt-boom: read: operation timed out' '' > "$seqp.err"
+printf '%s\n' 0 0 > "$seqp.rc"
+poll_seq_shape diag-decides 2
+if [ "$POLL_VERDICT" = unreadable ] && [ "$POLL_CALLS" = 2 ] && [ -z "$POLL_DIAG" ]; then
+  pass "(shape) the deciding attempt's EMPTY stderr is reported as NO diagnostic, not attempt 1's timeout"
+else
+  fail "(shape) diag-decides → verdict=$POLL_VERDICT calls=$POLL_CALLS diag=[$POLL_DIAG]"
+fi
+
+# ⛔ THE LAST *NON-BLANK* LINE IS THE DIAGNOSTIC. A multiline error that ENDS IN A BLANK LINE
+# makes a bare `tail -n 1` return the EMPTY string, so a real message is reported as "no
+# diagnostic" — the absence of a captured message read as the absence of the message.
+# The argument deliberately carries real newlines, so the trailing blank line reaches fd 2.
+poll_shape diag-blank-line "$(printf 'PENDING\t-')" 0 1 $'boom: read timed out\n\n'
+expect_poll diag-blank-line unreadable '<unreadable>' "a stderr whose message ends in a blank line"
+[ "$POLL_DIAG" = 'boom: read timed out' ] \
+  && pass "(shape) …and its message survives the blank line, rather than being reported as none" \
+  || fail "(shape) a stderr ending in a blank line lost its message (diag=[$POLL_DIAG])"
+
+# ⛔ THE VALUE IS BOUNDED BEFORE THE EXPANSIONS. The two parameter expansions that follow
+# (`${observed%%$'\t'*}` / `${observed#*$'\t'}`) are O(n²) in the value's length, so a large
+# body made the rail HANG instead of answering it (measured: 80 KB ≈ 7 s and ≈ 18 s for those
+# two expansions, 160 KB ≈ 25 s and ≈ 58 s). The ceiling is asserted by its own byte count,
+# so the case cannot pass vacuously on a fixture that never got big.
+#
+# ⛔ WHAT THIS DOES NOT PIN, stated rather than implied: the ORDERING (ceiling before the
+# expansions) is not observable through a VERDICT. This fixture is the shape that is read
+# WRONGLY when unbounded (one tab, a huge mergedAt ⇒ `merged`), which pins the ceiling's
+# presence and its effect; a HANG-shaped fixture would answer `unreadable` either way, only
+# slowly, so pinning the ordering would take a wall-clock bound — flaky, and not asserted.
+{ printf 'MERGED\t'; head -c 8000 /dev/zero | tr '\0' 'x'; } > "$TMP/huge-answer"
+[ "$(wc -c < "$TMP/huge-answer" | tr -d ' ')" -gt 4096 ] \
+  && pass "(shape) the oversized fixture really exceeds the 4 KiB ceiling ($(wc -c < "$TMP/huge-answer" | tr -d ' ') bytes)" \
+  || fail "(shape) the oversized fixture is only $(wc -c < "$TMP/huge-answer") bytes"
+poll_file_shape huge-value "$TMP/huge-answer" 0
+expect_poll huge-value unreadable '<unreadable>' "a read past the 4 KiB ceiling (bounded, not hung)"
+
+# ⛔ A LEADING-ZERO BOUND MUST NOT REPORT AN ARTIFACT NOBODY READ (#1690's symptom,
+# one arithmetic site over). The refusal is asserted by NAME and by CALLS=0: the
+# defect was never that the rail refused — it was that it refused while PRINTING an
+# attempt count and a '[merge_unreadable] — could NOT be READ' claim for zero reads.
+poll_shape knob-leading-zero "$(printf 'MERGED\t2026-01-01T00:00:00Z')" 0 08
+if [ "$POLL_VERDICT" = unreadable ] && [ "$POLL_CALLS" = 0 ] && [ "$POLL_ATTEMPTS" = 0 ] \
+   && grep -qF 'refusing a bad merge-artifact knob' "$TMP/poll-err"; then
+  pass "(shape) a LEADING-ZERO bound is refused BY NAME with ZERO reads (not 'could not read' after 0 reads)"
+else
+  fail "(shape) ADMIN_MERGE_VERIFY_ATTEMPTS=08 → verdict=$POLL_VERDICT calls=$POLL_CALLS; stderr: $(head -1 "$TMP/poll-err")"
+fi
+poll_shape knob-nonpositive "$(printf 'MERGED\t2026-01-01T00:00:00Z')" 0 0
+if [ "$POLL_VERDICT" = unreadable ] && [ "$POLL_CALLS" = 0 ] && [ "$POLL_ATTEMPTS" = 0 ] \
+   && grep -qF 'refusing a bad merge-artifact knob' "$TMP/poll-err"; then
+  pass "(shape) a ZERO bound is refused BY NAME rather than silently attempting a different budget"
+else
+  fail "(shape) ADMIN_MERGE_VERIFY_ATTEMPTS=0 → verdict=$POLL_VERDICT calls=$POLL_CALLS"
+fi
 
 # ── 63. #1358 — A NEWLINE IN A WORKFLOW NAME CANNOT FORGE A CERTIFICATE ──
 # Adversarial cycle 1 (2026-09-23) reproduced this as a FAIL-OPEN. A workflow
