@@ -818,26 +818,32 @@ ck "...and a NON-NUMERIC reading is ANNOUNCED too — the predicates call it unr
 # harness suites are deliberately NOT in the shard list — README §suites records both as "Not part of
 # the loop" (they drive the claim CAS against a live origin from throwaway clones, i.e. they need a
 # network remote): test-claims.sh and test-crossbox.sh. Any OTHER unwired suite turns this red.
-# ⛔ AND THE POPULATION IS ENUMERATED BY BOTH GLOBS (review round 2, P2). A `*.test.sh`-only glob
-# cannot see `test-claims.sh`/`test-crossbox.sh` at all, so the previous EQUALITY reported green while
-# its own sentence ("the only unwired suite is this one") was FALSE on the tree it ran on — a false
-# PASS in the one guard whose job is to notice an unwired suite.
+# ⛔ MEMBERSHIP IS READ FROM WHAT THE RUNNER EXECUTES, NOT FROM ITS TEXT (review round 3, P2 —
+# REPRODUCED). A `grep` of the shard list is satisfied by a COMMENTED-OUT `run_shard` line, which
+# executes nothing: with this suite's entry commented out, the previous check stayed GREEN while
+# `run-bash-shards.sh --list` printed zero entries for the file. `--list` is the runner's own oracle
+# — the same one the lane reads — so membership is asserted against its output.
+# ⛔ AND THE POPULATION IS ENUMERATED BY NAME, WITH ITS LIMIT STATED (review round 3, P2). The previous
+# globs (`*.test.sh`, then `test-*.sh`) could not see `selftest.sh`, which IS a wired suite — so an
+# UN-wired suite named that way would go unreported while this check claimed to speak for the
+# population. The population below is the three naming conventions this directory actually uses:
+# `*.test.sh`, `test-*.sh` and `selftest.sh`. STATED LIMIT: a suite named NONE of those is outside
+# this check's population, exactly as the `pi`-census above states its own limit.
 SHARDS="$(cd "$HERE/.." && pwd)/run-bash-shards.sh"
-# ...and THIS suite's own entry is asserted first: the population check below is executed by the very
-# suite it speaks about, so a run that reaches here proves the entry is present. (The lane reads
-# `run-bash-shards.sh --list`; this is the run-time half.)
-grep -q 'spawn-gate.test.sh' "$SHARDS"; rc=$?
-ck "this suite IS listed in run-bash-shards.sh — its checks run in CI, not only on a local invocation" $rc
+# The runner's own answer. A failed or empty `--list` makes every assertion below fail (fail-closed).
+LIST="$(bash "$SHARDS" --list 2>/dev/null)"
+printf '%s\n' "$LIST" | grep -qx 'scripts/orchestrator-harness/spawn-gate.test.sh'; rc=$?
+ck "this suite IS EXECUTED by run-bash-shards.sh (--list), not merely named in its text" $rc
 unwired=""
-for f in "$HERE"/*.test.sh "$HERE"/test-*.sh; do
+for f in "$HERE"/*.test.sh "$HERE"/test-*.sh "$HERE"/selftest.sh; do
   [ -f "$f" ] || continue
   b="$(basename "$f")"
-  grep -q "$b" "$SHARDS" 2>/dev/null || unwired="$unwired $b"
+  printf '%s\n' "$LIST" | grep -q "/$b\$" || unwired="$unwired $b"
 done
 unwired="${unwired# }"
 [ "$unwired" = "test-claims.sh test-crossbox.sh" ]; rc=$?
 [ "$rc" -eq 0 ] || echo "      unwired suites: [${unwired:-<none>}]"
-ck "the orchestrator-harness suites NOT wired into run-bash-shards.sh are exactly the two documented non-loop ones [$unwired]" $rc
+ck "the orchestrator-harness suites NOT executed by run-bash-shards.sh are exactly the two documented non-loop ones [$unwired]" $rc
 
 echo
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
