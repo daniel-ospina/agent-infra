@@ -454,6 +454,13 @@ wk_case() {
   fi
   [ "$route" = amb ] && amb="$K_AMB"
   sess="ai1711-$kind-$route-$server"
+  # agent-infra#1761: `start` now reads the CONTROLLER (the lock holder and this cell's own
+  # orch-loop.sh processes), not just the tmux session, and refuses when one is already live. The
+  # fixture's controller is a 4s stub that the tmux double leaves running after the arm's assertion
+  # completes, so without reaping it the NEXT arm's `start` (correctly) refuses and every later arm
+  # reddens for a fixture reason rather than the key-delivery rule it means to test.
+  pkill -f "$W/harness/orch-loop\.sh" 2>/dev/null || true
+  for i in $(seq 1 40); do pgrep -f "$W/harness/orch-loop\.sh" >/dev/null 2>&1 || break; sleep 0.25; done
   env AI_REVIEW_GATE_KEY="$amb" PATH="$W/bin:$bin:$PATH" AI1711_STATE="$st" AI1711_SOCK="$sock" \
       CELL_HOME="$W/cellhome" HOME="$W/cellhome" ENV_FILE="$envf" \
       SESSION="$sess" O="$W/o" REPO="$W/repo" HARNESS="$W/harness" HARNESS_REPO="$AI" HARNESS_FETCH=0 SCOPE=own \
@@ -1382,6 +1389,105 @@ esac
 cellcheck 0
 [ "$CC_RC" -eq 0 ] && ok "check: passes again once repo-authority.sh is present" \
                    || bad "check: still refuses with the worker restored (rc=$CC_RC)"
+
+# ── (l) one owner per controller (agent-infra#1761) ───────────────────────────────────────────────
+# The cell's controller answer must come from the harness's own AUTHORITY (the pid $O/.orch.lock
+# names) and this cell's own orch-loop.sh processes — never from `tmux has-session` alone. Measured
+# the failure this pins: a controller running outside the `orch` session (a leftover harness copy —
+# #1761 contradiction 4) read STOPPED while it was merging, and `start` would launch a second one.
+# ⛔ And the read must EXCLUDE descendants: orch-loop.sh spawns short-lived CHILDREN whose command
+# line also matches (measured `93150 53696 … orch-loop.sh`), so a naive count reports a duplicate
+# that is not there.
+say_case "one owner per controller: the read is authoritative, scope-named, and descendant-aware (#1761)"
+L="$T/own"; mkdir -p "$L/home" "$L/o" "$L/bin"
+# The stub answers TERM (a bash waiting on a foreground child defers the trap to the child's exit),
+# and spawns ONE short-lived CHILD whose command line also matches — the measured false-positive
+# shape. The child's life is bounded because a real child exits on the lock; an eternal child would
+# model a process the harness never has.
+cat > "$L/o/orch-loop.sh" <<'STUB'
+#!/bin/bash
+trap 'exit 0' TERM INT
+if [ "${STUB_CHILD:-0}" = 1 ]; then sleep 2; exit 0; fi
+STUB_CHILD=1 bash "$0" &
+while :; do sleep 1; done
+STUB
+chmod +x "$L/o/orch-loop.sh"
+# A tmux double: no session unless the marker exists, and `new-session` RECORDS that it was called,
+# so "start refused before creating a session" is asserted rather than assumed.
+cat > "$L/bin/tmux" <<SH
+#!/bin/bash
+case "\${1:-}" in
+  has-session) [ -f "$L/tmuxup" ] && exit 0; exit 1 ;;
+  new-session) : > "$L/tmuxup"; exit 0 ;;
+  *) exit 0 ;;
+esac
+SH
+chmod +x "$L/bin/tmux"
+own_sup() { # <sub>
+  PATH="$L/bin:$PATH" CELL_HOME="$L/home" ENV_FILE="$L/keys.env" SESSION="ai1761-$$" \
+    O="$L/o" REPO="$L/repo" OR="daniel-ospina/agent-infra" SCOPE=own HARNESS="" \
+    bash "$SUP" "$1" 2>&1
+}
+AI1761_PIDS=""
+rm -f "$L/tmuxup" "$L/o/.orch.lock"
+bash "$L/o/orch-loop.sh" & ROOT=$!
+AI1761_PIDS="$ROOT"
+printf '%s\n' "$ROOT" > "$L/o/.orch.lock"
+sleep 0.6
+CHILD="$(pgrep -P "$ROOT" 2>/dev/null | head -1)"
+[ -n "$CHILD" ] && { AI1761_PIDS="$AI1761_PIDS $CHILD"; ok "fixture: the controller stub spawned a matching CHILD (pid $CHILD)"; } \
+                 || bad "fixture: the controller stub spawned no child — the exclusion cannot be exercised"
+# The read names the OWNER and its SCOPE — the #1761 verification read, not a session probe.
+OUT="$(own_sup status)"
+case "$OUT" in
+  *"controller: RUNNING"*"pid $ROOT"*) ok "status: names the controller OWNER (pid $ROOT) from the lock" ;;
+  *) bad "status: did not name the lock owner (pid $ROOT) — $OUT" ;;
+esac
+case "$OUT" in
+  *"scope=own"*"repo=daniel-ospina/agent-infra"*) ok "status: names the scope and repo the controller owns" ;;
+  *) bad "status: does not name scope/repo — $OUT" ;;
+esac
+[ -n "$CHILD" ] && { case "$OUT" in
+  *"pid $ROOT $CHILD"*|*"pid $CHILD"*) bad "status: reported the controller's CHILD as a second controller" ;;
+  *) ok "status: EXCLUDED the controller's child (a descendant is not a duplicate)" ;;
+esac; }
+# Non-vacuity: the exclusion is doing work only if a naive read DOES see two.
+NAIVE="$(pgrep -cf "$L/o/orch-loop.sh" 2>/dev/null || true)"
+[ "${NAIVE:-0}" -ge 2 ] && ok "fixture: a naive pgrep count sees $NAIVE (the exclusion is non-vacuous)" \
+                      || bad "fixture: the naive count is ${NAIVE:-0} — the exclusion proves nothing"
+# THE #1761 MECHANISM: a launcher removes the lock while the controller lives. The read must NOT
+# fall back to STOPPED, and `start` must not launch a second controller.
+rm -f "$L/o/.orch.lock"
+OUT="$(own_sup status)"
+case "$OUT" in
+  *"controller: RUNNING"*"pid $ROOT"*) ok "status: still RUNNING after the lock was REMOVED (a launcher cannot hide the owner)" ;;
+  *) bad "status: reported STOPPED while a controller ran without a lock — $OUT" ;;
+esac
+OUT="$(own_sup start)"
+case "$OUT" in
+  *"already running"*) ok "start: REFUSED while a controller owns this state dir" ;;
+  *) bad "start: did NOT refuse a live controller: $OUT" ;;
+esac
+[ -f "$L/tmuxup" ] && bad "start: created a session despite a live controller" \
+                   || ok "start: no second session was created"
+# The child (a worker-shape transient) must be gone before `stop` asserts the state dir is clear.
+for i in $(seq 1 40); do [ -n "$CHILD" ] && kill -0 "$CHILD" 2>/dev/null || break; sleep 0.25; done
+OUT="$(own_sup stop)"
+case "$OUT" in
+  *"not running"*) bad "stop: reported 'not running' over a live controller (no false STOPPED)" ;;
+  *"released lock"*) ok "stop: signalled the live controller and released the lock" ;;
+  *) bad "stop: did not complete: $OUT" ;;
+esac
+sleep 0.5
+kill -0 "$ROOT" 2>/dev/null && bad "stop: the controller SURVIVED stop (a lock left for a live owner is #1761's duplicate)" \
+                            || ok "stop: the controller is gone"
+[ -e "$L/o/.orch.lock" ] && bad "stop: left the lock behind" || ok "stop: the lock was released only after the owner died"
+OUT="$(own_sup status)"
+case "$OUT" in
+  *"controller: STOPPED"*) ok "status: STOPPED once the owner is genuinely gone" ;;
+  *) bad "status: still reports a controller after stop — $OUT" ;;
+esac
+trap 'ai1711_cleanup; [ -n "${AI1761_PIDS:-}" ] && kill -9 $AI1761_PIDS 2>/dev/null; rm -rf "$T"' EXIT
 
 echo
 echo "── Summary ───────────────────────────────────────────────────────"
