@@ -204,11 +204,19 @@ def _fake_cmux_path(tmp_path, screen_text):
     screen = tmp_path / "screen.txt"
     screen.write_text(screen_text)
     cmux = bindir / "cmux"
+    # ⛔ THE `--lines 10` ARM IS LOAD-BEARING (fix-lane review, 2026-10-16). The PRE-FIX
+    # orch-send.sh probed the pane with `read-screen --lines 10` and reported CONSUMED when
+    # it matched `Working|Steering|queued message`. Without an arm for that window the fake
+    # falls through to the footer catch-all (the repo path), the old heuristic can never
+    # match, and a prefix test fails pre-fix for the WRONG reason — it never reaches the
+    # false-PASS branch it exists to pin. Serving the pane for `--lines 10` reproduces the
+    # measured #1187 shape: turn STARTED, tail ABSENT, old code says CONSUMED (exit 0).
     cmux.write_text(textwrap.dedent('''\
         #!/usr/bin/env bash
         args="$*"
         case "$args" in
           *read-screen*"--lines 200"*) cat "${FAKE_SCREEN_FILE:-/dev/null}" ;;
+          *read-screen*"--lines 10"*) cat "${FAKE_SCREEN_FILE:-/dev/null}" ;;
           *read-screen*) echo "/Users/test/Documents/GitHub/agent-infra" ;;
           *send*) echo "OK surface:1 workspace:1" ;;
           *"workspace list"*) echo '{"workspaces":[]}' ;;
@@ -229,7 +237,9 @@ def _run_orch_send(bindir, screen, message):
 
 
 def test_orch_send_reports_consumed_only_when_the_tail_is_verified(tmp_path):
-    bindir, screen = _fake_cmux_path(tmp_path, f"{LONG}\n")
+    # Same started-turn line as the prefix test: the difference between the two cases must
+    # be the TAIL, never the turn signal (which is present in both).
+    bindir, screen = _fake_cmux_path(tmp_path, f"Working... (turn started)\n{LONG}\n")
     r = _run_orch_send(bindir, screen, LONG)
     assert r.returncode == 0, r.stdout + r.stderr
     assert "CONSUMED" in r.stdout
@@ -237,8 +247,15 @@ def test_orch_send_reports_consumed_only_when_the_tail_is_verified(tmp_path):
 
 
 def test_orch_send_does_not_report_ok_over_a_prefix(tmp_path):
-    """The measured #1187 shape: the head arrived, the tail did not, `cmux` said OK."""
-    bindir, screen = _fake_cmux_path(tmp_path, LONG[: len(LONG) // 3] + "\n")
+    """The measured #1187 shape: the head arrived, the tail did not, `cmux` said OK.
+
+    The pane carries a started-turn line (`Working`) as well as the prefix — that is what
+    made the pre-fix path a FALSE PASS rather than a refusal: `Working` is the signal the
+    old consumption check grepped for, and a truncated prefix starts a turn, so "a turn has
+    started" was satisfied while the tail was gone. A prefix with NO turn line would have
+    been refused by the OLD code too, so it would pin nothing about the fix.
+    """
+    bindir, screen = _fake_cmux_path(tmp_path, "Working... (turn started)\n" + LONG[: len(LONG) // 3] + "\n")
     r = _run_orch_send(bindir, screen, LONG)
     assert r.returncode == 6, r.stdout + r.stderr
     assert "NOT VERIFIED" in r.stdout
