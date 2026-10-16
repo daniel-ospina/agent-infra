@@ -95,6 +95,14 @@
 #                                                  pass resolves the body (the inner shell removes
 #                                                  the level-0 escapes) and re-runs the same two
 #                                                  matchers on it, never a weaker third predicate
+#       a producer NESTED IN A CAPTURE with a pipe   `grep -f <(grep -v x f | head) f | grep -q p`,
+#        of its own                                 `grep -f $(grep -v x f | head -1) f | grep -q p`
+#                                                  — the inner writer owns the pipe, so it
+#                                                  overwrote the enclosing writer state and the
+#                                                  outer writer pipe was never evaluated;
+#                                                  that state is now SAVED ON CAPTURE ENTRY and
+#                                                  RESTORED ON ITS CLOSER (a subshell `( … )` is
+#                                                  not restored: it passes its stdout on)
 #     They were CLEAN before #864 as well (no `grep` producer was recognised at all), so none was a
 #     regression; the widening closes them. The class stays open-ended in exactly the way the
 #     wrapper allowlist below is (#1645) — a spelling nobody has thought of is still a false CLEAN.
@@ -105,11 +113,12 @@
 #     completed by construction, so any OTHER wrapper is a false CLEAN. Adding a member is a
 #     one-line change in GREPRE (both matchers) plus the prefix set in is_grep_cmd, plus a pin in
 #     tests/sigpipe-grep/run.sh; nothing else about the guard is wrapper-specific.
-#   · ADDING A PRODUCER WORD IS NOT A ONE-LINE CHANGE — IT TAKES THREE. WRITERRE (read by
-#     raw_idiom), the character ladder in writer_at (scan_idiom), and a pin in
-#     tests/sigpipe-grep/run.sh. A word added to only one of the two matchers is a producer the
-#     other cannot see — a false CLEAN, the failure this guard exists to prevent. The by-path
-#     fixtures in tests/sigpipe-grep/run.sh 13a pin the class that this gap produced.
+#   · ADDING A PRODUCER WORD IS NOT A ONE-LINE CHANGE — IT TAKES TWO PLACES AND A PIN. WRITERRE
+#     (read by raw_idiom AND by the quoted-body pass, which names it rather than repeating the
+#     word list) and the character ladder in writer_at (scan_idiom). A word added to only one of
+#     the two is a producer the other cannot see — a false CLEAN, the failure this guard exists to
+#     prevent. The by-path fixtures in tests/sigpipe-grep/run.sh 13a pin the class that this gap
+#     produced.
 #   · TWO-STAGE PRODUCERS ARE OUT OF SCOPE. A writer piped through an intermediary (`cat`, `tee`,
 #     `sort`) and then into a quiet grep does eventually kill the writer, because the intermediary
 #     dies when grep exits — but the writer is piped into the INTERMEDIARY, not into grep, and this
@@ -1132,6 +1141,7 @@ HITS="$(
       # for it rather than choosing which failure to accept.
       function scan_idiom(s,   i, c, q, ansi, esc, w, active, g, br, pd, ad, bt, d, inside) {
         q = ""; ansi = 0; esc = 0; active = 0; br = 0; pd = 0; ad = 0; bt = 0
+        delete SA; delete SAd
         # Nothing to find on a line with no pipe at all, and this is the common case for the
         # many-writers pathology (`echo ` repeated): without it every writer drove a walk.
         if (index(s, "|") == 0) return 0
@@ -1159,22 +1169,36 @@ HITS="$(
           # the substitution was merely an ARGUMENT of the writer, lost a pipe that was never
           # captured. CS[d] marks the depth at which the output is captured; AD is the depth of the
           # writer that owns the pipe, and the closer only clears a writer inside the capture.
-          if (c == "$" && CH[i + 1] == "(") { pd++; CS[pd] = 1; i++; continue }
+          #
+          # The writer state is SAVED ON ENTRY and RESTORED ON EXIT, not merely masked: a writer
+          # INSIDE the capture overwrites `active`/`ad` (a single pair of globals), so a pipe inside
+          # the capture is judged against the INNER writer — the enclosing writer OWNERSHIP of the
+          # pipe is gone by the time the capture closes, and its real pipe is never evaluated:
+          #     grep -f <(grep -v x f | head) f | grep -q p      # rc 141, reported CLEAN before this
+          #     grep -f $(grep -v x f | head -1) f | grep -q p  # rc 141, reported CLEAN before this
+          # `ad >= pd` cleared the INNER writer correctly, but that is not enough, because the
+          # INNER pipe had already reset `active` to 0 and the OUTER writer was never re-seated.
+          # The stack re-seats it, so the outer writer is still holding the pipe at the outer `|`
+          # (CS[pd] distinguishes a capture — restore — from a subshell `( … )`, which passes its
+          # stdout on and therefore keeps the inner writer as the owner of it).
+          if (c == "$" && CH[i + 1] == "(") {
+            pd++; CS[pd] = 1; SA[pd] = active; SAd[pd] = ad; i++; continue
+          }
           if (c == "<" && CH[i + 1] == "(") {
             # `<(` is INPUT redirection: it feeds one ARGUMENT and does NOT move the stdout of the
             # command it belongs to off the pipe. Clearing the writer here lost `grep -f <(cat
             # list) f | grep -q p`, a measured 141 reported CLEAN (#864 review). `CS[pd]` still marks
             # the depth as captured, so a writer INSIDE the substitution is cleared at its closer.
-            pd++; CS[pd] = 1; i++; continue
+            pd++; CS[pd] = 1; SA[pd] = active; SAd[pd] = ad; i++; continue
           }
           if (c == "`") {
-            if (bt == 0) { pd++; CS[pd] = 1; bt = 1 }
-            else { if (ad >= pd) active = 0; pd--; bt = 0 }
+            if (bt == 0) { pd++; CS[pd] = 1; SA[pd] = active; SAd[pd] = ad; bt = 1 }
+            else { active = SA[pd]; ad = SAd[pd]; pd--; bt = 0 }
             continue
           }
           if (c == "(") { pd++; CS[pd] = 0; continue }
           if (c == ")") {
-            if (pd > 0) { if (CS[pd] && ad >= pd) active = 0; pd-- }
+            if (pd > 0) { if (CS[pd]) { active = SA[pd]; ad = SAd[pd] }; pd-- }
             else active = 0
             continue
           }
@@ -1190,9 +1214,10 @@ HITS="$(
           if (c == "&" && CH[i + 1] == "&") { active = 0; i++; continue }
           if (c == "&" && CH[i - 1] != ">") { active = 0; continue }
           # `>` after a digit is an fd redirection and keeps stdout on the pipe; a bare `>`
-          # redirects stdout away, and a process substitution takes it off the pipe too.
+          # redirects stdout away. A process substitution is handled ABOVE (`<(` is input
+          # redirection and does NOT take stdout off the pipe), so there is no second `<(` test
+          # here — the only one that existed was unreachable and stated the opposite rule.
           if (c == ">" && CH[i - 1] !~ /[0-9]/) { active = 0; continue }
-          if (c == "<" && CH[i + 1] == "(") { active = 0; continue }
           if (c == "|") {
             if (CH[i + 1] == "|") { active = 0; i++; continue }
             # A pipe INSIDE a capture (`$( … )`, `<( … )`, backticks) belongs to the nested command,
@@ -1275,14 +1300,14 @@ HITS="$(
           # is the coarse approximation body_quiet makes too, and the matchers still decide.
           nb = body
           gsub(/\\/, "", nb)
-          if (index(nb, "|") > 0 && nb ~ /(printf|echo|grep)[ \t]/) body_enqueue(nb)
+          if (index(nb, "|") > 0 && nb ~ WRITERRE "[ \t]") body_enqueue(nb)
           # The wrapper whose BODY is the producer and whose stdout is piped straight on:
           # `env -S "grep -vE x|y f" | grep -q needle`. Only the FIRST command of a resolved
           # body can be the wrapper command, so the test is anchored at its start.
           j = end + 1
           while (j <= CHN && (CH[j] == " " || CH[j] == "\t")) j++
           if (j <= CHN && CH[j] == "|" && CH[j + 1] != "|") {
-            if (nb ~ "^[ \t]*" GREPRE "(printf|echo|grep)([ \t]|$)") {
+            if (nb ~ "^[ \t]*" GREPRE WRITERRE "([ \t]|$)") {
               g = is_grep_cmd(j + 1)
               if (g == -1 || (g && has_quiet(g))) return 1
             }

@@ -2020,11 +2020,12 @@ echo "13. NON-BUILTIN PRODUCER — a grep upstream (#864)"
 # never reports the match.
 #
 # WHAT EACH SUB-SECTION PINS (they are not interchangeable):
-#   13a  DETECTION — the EIGHTEEN fixtures below. NON-VACUOUS: all eighteen are reported CLEAN
-#        by #841's guard — the PRE-change guard, which is `git show origin/main:scripts/check-no-sigpipe-grep.sh`
-#        (NOT `HEAD`, which by the time you read this is the widened guard and reports all eighteen
-#        as hits at rc 1) — so this whole block fails before the widening. Verified 2026: the
-#        pre-change guard exits 0 on all eighteen, the head guard exits 1 naming all eighteen.
+#   13a  DETECTION — the TWENTY-THREE fixtures below. NON-VACUOUS: all twenty-three are reported
+#        CLEAN by #841's guard — the PRE-change guard, which is `git show origin/main:scripts/check-no-sigpipe-grep.sh`
+#        (NOT `HEAD`, which by the time you read this is the widened guard and reports all
+#        twenty-three as hits at rc 1) — so this whole block fails before the widening. Verified
+#        2026: the pre-change guard exits 0 on all twenty-three, the head guard exits 1 naming all
+#        twenty-three.
 #   13b  OVER-BLOCK CONTROL — the safe forms. Expected to PASS on the old guard AND the new
 #        one; it does not detect the widening, it detects an over-broad version of it.
 #   13c  NON-VACUITY — no guard is invoked at all; it pins the CLASS (the idiom really does
@@ -2070,6 +2071,20 @@ printf '%s\n' '#!/usr/bin/env bash' 'grep -f <(cat list | head -2) f | grep -q b
 # line 1, and CLEAN on the pre-change guard.
 printf '%s\n' '#!/usr/bin/env bash' 'eval "grep -vE \"x|y\" f | grep -q needle"' > "$E/scripts/evalbody.sh"
 printf '%s\n' '#!/usr/bin/env bash' 'env -S "grep -vE x|y f" | grep -q needle'    > "$E/scripts/envsbody.sh"
+# The NESTED-WRITER conjunction: the enclosing writer state is a single pair of globals, so a
+# writer INSIDE a capture overwrote it and a pipe inside the capture was judged against the INNER
+# writer — the enclosing writer ownership was gone by the time the capture closed and its real
+# pipe was never evaluated, so the line was CLEAN at rc 141 (#864 review). The enclosing state is
+# now saved and restored across the capture. The wrapper-body spellings carry the same shape
+# inside a body, so the quoted-body pass hands it back to the same matcher and the fix applies
+# there too. All five are CLEAN on the pre-change guard; the process-substitution and printf
+# forms measured rc 141 under `pipefail` on a >64 KiB payload with the match on line 1 (13c
+# measures the underlying idiom), and `sh -c` is the same shape for a shell that has `<(`.
+printf '%s\n' '#!/usr/bin/env bash' 'grep -f <(grep -v x f | head) f | grep -q bar'        > "$E/scripts/nestedsubst.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'grep -f $(grep -v x f | head -1) f | grep -q bar'     > "$E/scripts/nestedcmdsubst.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'grep -f <(printf x | head) f | grep -q bar'           > "$E/scripts/nestedprintf.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'eval "grep -f <(grep -v x f | head) f | grep -q bar"' > "$E/scripts/evalnest.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'sh -c "grep -f <(grep -v x f | head) f | grep -q bar"' > "$E/scripts/shcnest.sh"
 rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
 if [ "$rc" -eq 1 ] && grep -q 'plain\.sh' "$OUT" && grep -q 'staged\.sh' "$OUT" \
    && grep -q 'aliased\.sh' "$OUT" && grep -q 'prefixed\.sh' "$OUT" \
@@ -2079,8 +2094,11 @@ if [ "$rc" -eq 1 ] && grep -q 'plain\.sh' "$OUT" && grep -q 'staged\.sh' "$OUT" 
    && grep -q 'substbypath\.sh' "$OUT" && grep -q 'wrapopt\.sh' "$OUT" \
    && grep -q 'quotedword\.sh' "$OUT" && grep -q 'escapedword\.sh' "$OUT" \
    && grep -q 'varpath\.sh' "$OUT" && grep -q 'procsubst\.sh' "$OUT" \
-   && grep -q 'evalbody\.sh' "$OUT" && grep -q 'envsbody\.sh' "$OUT"; then
-  pass "a grep producer piped into a quiet grep is DETECTED (bare, intermediary, by path, wrapper-prefixed, env prefix, a data pipe in the producer argument, continuation, substitution, a producer inside a wrapper body, and the by-path / wrapper-option / quoted-word / escaped-word / variable-rooted / process-substitution conjunctions)"
+   && grep -q 'evalbody\.sh' "$OUT" && grep -q 'envsbody\.sh' "$OUT" \
+   && grep -q 'nestedsubst\.sh' "$OUT" && grep -q 'nestedcmdsubst\.sh' "$OUT" \
+   && grep -q 'nestedprintf\.sh' "$OUT" && grep -q 'evalnest\.sh' "$OUT" \
+   && grep -q 'shcnest\.sh' "$OUT"; then
+  pass "a grep producer piped into a quiet grep is DETECTED (bare, intermediary, by path, wrapper-prefixed, env prefix, a data pipe in the producer argument, continuation, substitution, a producer inside a wrapper body, a nested writer inside a capture, and the by-path / wrapper-option / quoted-word / escaped-word / variable-rooted / process-substitution conjunctions)"
 else
   fail "a grep producer was reported CLEAN (exit $rc) — #864 regression:"
   sed -n '1,20p' "$OUT"
