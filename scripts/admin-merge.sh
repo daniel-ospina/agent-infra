@@ -356,7 +356,7 @@
 #                        non-code ones that carry no shard (measured: tortoise main
 #                        carried 2 distinct executed job names in a 10-run window and
 #                        3 in a 20-run one, none named `test*`, where 40 runs wide
-#                        carried 17). So N is not a bound on what one pass reads or on
+#                        carried 36 distinct names, 17 of them `test*`). So N is not a bound on what one pass reads or on
 #                        the call budget: a widened pass reads its whole listing (at
 #                        most 200 lane runs per side, one Jobs-API call each), and the
 #                        posted evidence says when the reference came from a wider

@@ -6644,10 +6644,11 @@ grep -q "yielded NO EXECUTED job" "$SCEN/err" \
 # code-lane run at all. MEASURED on tortoise main (`--any-workflow`, the rail's
 # default `--main-runs 10`): 2 distinct executed job names in the 10-run window
 # and 3 in the widened 20, NONE `test*`; the SAME listing 40 runs wide carried 36
-# distinct names, 17 of them `test*`. So the code lane was one doubling away and
-# the instrument stopped short of it. Here the `test` shards sit at LISTING
-# POSITION 5 (the fixture's 5th `runs-main` line), one doubling past a window whose
-# every run already finished measuring.
+# distinct names, 17 of them `test*`. So the code lane was TWO doublings past the
+# requested window and the instrument stopped short of it (the fixture runs the rail
+# with `--main-runs 2`, so the widths are 2 → 4 → 8 and only 8 reaches position 5).
+# Here the `test` shards sit at LISTING POSITION 5 (the fixture's 5th `runs-main`
+# line), two doublings past a window whose every run already finished measuring.
 new_scen vacuousfamilyspend
 printf '%s\n' "$HEAD_VP" > "$SCEN/head"
 lane_pass "$HEAD_VP" 9221 > "$SCEN/runs-$HEAD_VP"
@@ -6667,8 +6668,8 @@ run_admin_here 42 --main-runs 2 >/dev/null 2>&1
 rc=$?
 [ "$rc" -eq 0 ] && pass "a window of measured NON-FAMILY runs no longer starves the reference — it widens to the family (exit 0)" \
   || fail "expected exit 0, got $rc — the widening still failed to reach the family, so the reference stayed empty (#7734)"
-grep -q -- "--limit 4" "$SCEN/calls" \
-  && pass "…because the listing WIDENED past the requested window (--limit 2 → --limit 4)" \
+grep -q -- "--limit 8" "$SCEN/calls" \
+  && pass "…because the listing WIDENED past the requested window (--limit 2 → 4 → 8)" \
   || fail "the reference was not reached by widening: $(grep -o -- '--limit [0-9]*' "$SCEN/calls" | sort -u | tr '\n' ' ')"
 grep -q "NONE is named 'test\*'" "$SCEN/err" \
   && fail "the family mismatch was refused although the widened window carries the shards" \
