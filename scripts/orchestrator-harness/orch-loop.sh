@@ -450,7 +450,18 @@ res_line() {
   # which is how the gate's absence stayed invisible in the logs — #1702)
   swapfree=""; swaptotal=""
   if _sw="$(swap_usage_mb)"; then swapfree="${_sw%% *}M"; swaptotal="${_sw##* }M"; fi
-  dline="$(df -g /System/Volumes/Data 2>/dev/null | awk 'NR==2{printf "%dG free/%d%% used",$4,$5}')"
+  # Disk: PORTABLE, and it must name the volume that ACTUALLY FILLS (#1765). The probe this replaces
+  # hardcoded BOTH halves to macOS — the path `/System/Volumes/Data` and the `-g` (GiB) flag — so on a
+  # Linux cell it printed nothing and every cycle logged `disk(?)`, which is how a filesystem reached
+  # 100% with the resource line reading healthy. MEASURED on pi-lane-1, twice: `/dev/root 32G, 30G
+  # used, 0 avail` with `disk(?)` in the log right up to it (2026-10-15), and again 2026-10-16 05:13Z
+  # when the controller died writing its own log (`echo: write error: No space left on device`).
+  # `df -Pk` is POSIX and its 4th column is 1KiB blocks on BOTH platforms, so the figure printed is
+  # MEBIBYTES. The path is $REPO — the filesystem the checkout lives on is the one being filled, and
+  # on macOS that resolves to the same data volume the old literal named, so this is equivalent there
+  # and correct on a cell. An unreadable probe still prints `?` rather than a fabricated number: this
+  # line is ADVISORY (the enforcing gate is spawn-gate.sh's disk gate), so unknown must read unknown.
+  dline="$(df -Pk "${REPO:-/}" 2>/dev/null | awk 'NR==2 && $4 ~ /^[0-9]+$/ {printf "%dM free/%s used", int($4/1024), $5}')"
   procs="$(ps -Ao pid= 2>/dev/null | wc -l | tr -d ' ')"
   runnable="$(ps -Ao stat= 2>/dev/null | grep -c '^R')"
   # the macOS service sinks that have burned this box before, and kernel_task (thermal/I-O)

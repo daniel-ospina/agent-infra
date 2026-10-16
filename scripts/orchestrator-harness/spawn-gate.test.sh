@@ -260,7 +260,10 @@ chmod +x "$TMP/bin/pi"
 drive() { # drive <load> <label> <max-load>
   local load="$1" label="${2:-test agent}" max="${3:-10}"
   : > "$PI_LOG"
-  PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" O="$TMP/O" bash -c '
+  # DISK_MIN_FREE_MB=1 so these LOAD checks cannot be decided by this host's free space — the disk
+  # gate runs first now (that ordering is itself pinned below), so on a genuinely full CI box the
+  # load-refusal assertions would otherwise come back 77 and read as a load-gate regression.
+  PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" O="$TMP/O" DISK_MIN_FREE_MB=1 bash -c '
     . "$1"
     LOAD="$2"; MAX_LOAD="$3"; LOG="$4"; PROMPT="$5"; LABEL="$6"
     load1() { printf "%s" "$LOAD"; }
@@ -398,6 +401,22 @@ ck "fix-one.sh --argv (CONTROLLER) on a refused load exits 75 and REFUNDS fixcou
 { [ ! -s "$PI_LOG" ] && [ ! -s "$MERGE_LOG" ]; }; rc=$?
 ck "a refused fixer starts no agent and does NOT re-run the merge chain" $rc
 
+# ... and the DISK refusal through the SAME caller (#1765). 77, refunded the same way — and, the
+# point of the arm, it must NAME the disk gate. The two refusals demand OPPOSITE remedies (wait for
+# the load to fall vs reclaim space), so a disk refusal reported as a load refusal sends an operator
+# to wait for an event that cannot arrive.
+fix_argv; printf '2\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/fix-7.log"
+( cd "$RREPO" && O="$RO" MAX_LOAD=999999999 DISK_MIN_FREE_MB=9999999 DISK_GATE_PATH="$RREPO" \
+    PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+    bash "$HERE/fix-one.sh" --argv "$RIG/argv7" ) >/dev/null 2>&1; drc=$?
+dgot="$(cat "$RO/state/fixcount-7" 2>/dev/null)"
+{ [ "$drc" -eq 77 ] && [ "$dgot" = "1" ]; }; rc=$?
+ck "fix-one.sh --argv on a DISK refusal exits 77 and REFUNDS the attempt (rc=$drc, fixcount=${dgot:-<gone>})" $rc
+grep -q 'fixer NOT started (disk gate' "$RO/logs/fix-7.log"; rc=$?
+ck "fix-one.sh NAMES the disk gate on a disk refusal (not the load gate)" $rc
+{ [ ! -s "$PI_LOG" ] && [ ! -s "$MERGE_LOG" ]; }; rc=$?
+ck "a disk-refused fixer starts no agent and does NOT re-run the merge chain" $rc
+
 # ... and the MANUAL path must refund NOTHING: it never incremented the counter, so refunding would
 # hand the controller a free attempt and the count would drift down forever.
 printf '2\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"
@@ -453,6 +472,16 @@ ck "adopt-fix.sh exits with the FIXER's status (75 on a load refusal), not echo'
     bash "$HERE/adopt-fix.sh" "$RREPO" "daniel-ospina/agent-infra" 7 adoptbranch ) >/dev/null 2>&1; arc0=$?
 { [ "$arc0" -eq 0 ] && grep -q PI_RAN "$PI_LOG"; }; rc=$?
 ck "adopt-fix.sh reports 0 when the fixer RAN and succeeded (got $arc0) — not a constant" $rc
+# The DISK arm of the same wrapper: 77 must PROPAGATE too, and be named. A 75-only mapping would
+# report a full filesystem as "wait for the load to fall" — a remedy that cannot ever work.
+printf '3\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/adopt-7.log"
+( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=9999999 DISK_GATE_PATH="$RREPO" \
+    PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+    bash "$HERE/adopt-fix.sh" "$RREPO" "daniel-ospina/agent-infra" 7 adoptbranch ) >/dev/null 2>&1; arc2=$?
+[ "$arc2" -eq 77 ]; rc=$?
+ck "adopt-fix.sh propagates the DISK refusal 77 (got $arc2) — not normalised to a load refusal" $rc
+grep -q 'DISK gate' "$RO/logs/adopt-7.log"; rc=$?
+ck "adopt-fix.sh names the DISK gate on a disk refusal" $rc
 
 : > "$MERGE_LOG"
 
@@ -464,8 +493,163 @@ ck "adopt-fix.sh reports 0 when the fixer RAN and succeeded (got $arc0) — not 
     bash "$HERE/lane.sh" 9999 work daniel-ospina/agent-infra ) >/dev/null 2>&1; lrc=$?
 { [ "$lrc" -eq 75 ] && [ ! -s "$PI_LOG" ] && [ -s "$RO/logs/prompt-9999.txt" ]; }; rc=$?
 ck "lane.sh on a refused load exits 75, writes the prompt, and NEVER spawns (rc=$lrc)" $rc
+# The DISK arm: 77 propagates out of lane.sh, and the refusal line NAMES the disk gate. lane.sh is
+# what opens a PR, so a lane refused here consumed nothing — but an operator told "load gate" would
+# re-dispatch into the same full filesystem for ever.
+: > "$PI_LOG"; : > "$RO/logs/lane-9999.log"
+( cd "$RREPO" && O="$RO" MAX_LOAD=999999999 DISK_MIN_FREE_MB=9999999 DISK_GATE_PATH="$RREPO" \
+    PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" \
+    bash "$HERE/lane.sh" 9999 work daniel-ospina/agent-infra ) >/dev/null 2>&1; lrc2=$?
+[ "$lrc2" -eq 77 ]; rc=$?
+ck "lane.sh on a DISK refusal exits 77 (got $lrc2) — not reported as a load refusal" $rc
+grep -q 'DISK gate refused' "$RO/logs/lane-9999.log"; rc=$?
+ck "lane.sh NAMES the disk gate on a disk refusal" $rc
 
-# ── 11) a suite nothing RUNS is not a gate ──────────────────────────────────────
+# ── 11) the DISK gate (#1765) ─────────────────────────────────────────────
+# The measured incident: pi-lane-1 hit 100% twice — 2026-10-15 (`/dev/root 32G, 30G used, 0 avail`,
+# every git op failing) and 2026-10-16 05:13Z, when the controller died writing its own log
+# (`orch-loop.sh: echo: write error: No space left on device`). The gate's job is to refuse to START
+# an agent on a filesystem that cannot run one: `pi` has no disk limit of its own, so this is the
+# last point at which the consumption can still be stopped.
+#
+# ⛔ NO SEAM IS STUBBED BELOW. `disk_free_mb` is the shipped `df -Pk` probe and DISK_GATE_PATH /
+# DISK_MIN_FREE_MB / DISK_WARN_FREE_MB are the shipped env overrides, so every check drives the real
+# predicate against a real filesystem. A stubbed probe would prove only that a branch exists.
+drive_disk() { # drive_disk <path> <floor-mb> [<warn-mb>]
+  local path="$1" floor="$2" warn="${3:-}"
+  : > "$PI_LOG"
+  # MAX_LOAD=999999999 so these DISK checks cannot be decided by this host's 1-min load: `drive_disk`
+  # does NOT stub `load1` (the disk gate is the subject and it runs first), so without this the
+  # section would go red on a busy box — and its own POSITIVE CONTROL with it. A test that fails for
+  # a reason unrelated to its subject is worse than no test: it teaches the reader to ignore red.
+  PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" O="$TMP/O" MAX_LOAD=999999999 \
+  DISK_GATE_PATH="$path" DISK_MIN_FREE_MB="$floor" DISK_WARN_FREE_MB="$warn" \
+  bash -c '
+    . "$1"
+    LOG="$2"; PROMPT="$3"
+    run_agent 1 "$LOG" "$PROMPT" "disk gate test" >/dev/null 2>&1
+    rc=$?
+    printf "rc=%s started=%s" "$rc" "$AGENT_STARTED"
+  ' _ "$GATE" "$LOG" "$PROMPT"
+}
+
+# POSITIVE CONTROL, FIRST — the file's own rule. On a tree with no disk probe at all the "refused"
+# assertions below would ALL pass for the wrong reason, so the probe must be shown to answer first.
+free_now="$(bash -c '. "$1"; disk_free_mb "$2"' _ "$GATE" "$TMP")"
+case "$free_now" in ''|*[!0-9]*) rc=1 ;; *) [ "$free_now" -gt 0 ]; rc=$? ;; esac
+ck "POSITIVE CONTROL: disk_free_mb reports a real free-MB integer for an existing path (${free_now:-<empty>}MB)" $rc
+# ... and it must report NOTHING for a path it cannot read, rather than 0 — 0 is a CLAIM that the
+# disk is full, and the fail-open case further down is vacuous unless "unreadable" really is empty.
+nofree="$(bash -c '. "$1"; disk_free_mb "$2"' _ "$GATE" "$TMP/no-such-path-$$")"
+[ -z "$nofree" ]; rc=$?
+ck "... and reports NOTHING (not 0) for an unreadable path — 0 would be a claim the disk is full" $rc
+
+# The polarity, in one place. Unreadable FAILS OPEN (#1702's documented posture: a broken probe must
+# not stop the box for ever); a readable reading below the floor FAILS CLOSED.
+pol="$(bash -c '. "$1"; DISK_MIN_FREE_MB=9999
+  disk_ok ""    && a=allow || a=refuse
+  disk_ok 9998  && b=allow || b=refuse
+  disk_ok 9999  && c=allow || c=refuse
+  disk_ok abc   && d=allow || d=refuse
+  printf "%s %s %s %s" "$a" "$b" "$c" "$d"' _ "$GATE")"
+[ "$pol" = "allow refuse allow allow" ]; rc=$?
+ck "disk_ok: unreadable ALLOWS, one below the floor REFUSES, AT the floor allows, garbage ALLOWS ($pol)" $rc
+
+# A 0 floor is a NO-OP GATE: `[ "$mb" -ge 0 ]` is true for every reading, so it could never refuse.
+zf="$(DISK_MIN_FREE_MB=0 bash -c '. "$1"; printf "%s" "$DISK_MIN_FREE_MB"' _ "$GATE")"
+[ "$zf" = "1024" ]; rc=$?
+ck "a 0 floor is REPAIRED, not honoured — a gate that can never refuse is not a gate (got '$zf')" $rc
+# A warn band BELOW the floor can never fire (the refusal wins first), which would silently degrade
+# "warn before it is full" into "no warning at all".
+wb="$(DISK_MIN_FREE_MB=500 DISK_WARN_FREE_MB=1 bash -c '. "$1"; printf "%s" "$DISK_WARN_FREE_MB"' _ "$GATE")"
+[ "$wb" = "1000" ]; rc=$?
+ck "a warn band below the floor is repaired to STRICTLY above it (got '$wb')" $rc
+# ⛔ AND THE REPAIR IS PINNED BY BEHAVIOUR, NOT BY THAT VARIABLE (review round 1, P1). `>= floor` was
+# the original repair, and with `warn == floor` the interval [floor, warn) is EMPTY — the refusal
+# fires on `mb < floor`, the warning on `mb < warn`, so a repaired-to-the-floor band could never
+# warn, i.e. the repair shipped the exact failure it existed to prevent while the value-only check
+# above stayed green. Drive the SHIPPED predicate AT the floor: the gate must allow it AND warn.
+band="$(DISK_MIN_FREE_MB=100 DISK_WARN_FREE_MB=1 bash -c '
+  . "$1"
+  disk_ok 100  && a=allow   || a=refuse
+  disk_low 100 && b=warn    || b=nowarn
+  disk_low 99  && c=warn    || c=nowarn
+  printf "%s %s %s warn=%s" "$a" "$b" "$c" "$DISK_WARN_FREE_MB"' _ "$GATE")"
+[ "$band" = "allow warn warn warn=200" ]; rc=$?
+ck "AT the floor the gate ALLOWS and still WARNS — an empty band is not a warning ($band)" $rc
+# ⛔ A DISK REFUSAL MUST OUTRANK A LOAD REFUSAL (review round 1, P1). With the load gate first, a
+# saturated box with a full filesystem reported ONLY the load refusal — sending the operator to wait
+# for load to fall, a remedy that cannot free a filesystem. Both are true at once, so the
+# un-clearable one has to be the one reported. Driven: MAX_LOAD=0 AND an unreachable floor.
+: > "$LOG"; : > "$PI_LOG"
+res="$(PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" O="$TMP/O" MAX_LOAD=0 \
+  DISK_GATE_PATH="$TMP" DISK_MIN_FREE_MB=9999999 bash -c '
+    . "$1"
+    LOG="$2"; PROMPT="$3"
+    run_agent 1 "$LOG" "$PROMPT" "both gates refuse" >/dev/null 2>&1
+    printf "rc=%s started=%s" "$?" "$AGENT_STARTED"' _ "$GATE" "$LOG" "$PROMPT")"
+[ "$res" = "rc=77 started=0" ]; rc=$?
+ck "a DISK refusal outranks a simultaneous LOAD refusal — the un-clearable one is reported ($res)" $rc
+grep -q 'load-gate' "$LOG"; rc=$?
+[ "$rc" -ne 0 ]; rc=$?
+ck "...and the load refusal is NOT the only thing logged in that case" $rc
+
+# POSITIVE CONTROL for the drives below: with a floor this filesystem meets, the agent RUNS.
+: > "$LOG"; : > "$PI_LOG"
+res="$(drive_disk "$TMP" 1 4)"
+[ "$res" = "rc=0 started=1" ]; rc=$?
+ck "POSITIVE CONTROL: above the floor the agent RUNS ($res)" $rc
+grep -q PI_RAN "$PI_LOG"; rc=$?
+ck "the model was actually invoked when the disk gate allowed it" $rc
+
+# The refusal itself, driven against the real probe with a floor this filesystem cannot meet.
+: > "$LOG"; : > "$PI_LOG"
+rows_w0=0; [ -s "$TMP/O/state/walltime.tsv" ] && rows_w0="$(wc -l < "$TMP/O/state/walltime.tsv" | tr -d ' ')"
+res="$(drive_disk "$TMP" 9999999)"
+[ "$res" = "rc=77 started=0" ]; rc=$?
+ck "run_agent below the disk floor returns AGENT_DISK_REFUSED and sets AGENT_STARTED=0 ($res)" $rc
+[ ! -s "$PI_LOG" ]; rc=$?
+ck "no model was invoked on a disk refusal (proven live by the control above)" $rc
+# The refusal must NAME the gate, the MEASURED reading and the floor: an operator reading the log has
+# to be able to tell a disk refusal from a load refusal, because the two demand opposite responses.
+grep -q 'disk-gate.*REFUSED.*MB free on .*disk_min_free_mb=9999999' "$LOG"; rc=$?
+ck "the refusal line names the gate, the measured free space and the floor" $rc
+# 77, not 75: a load refusal clears when the box quietens; a disk refusal never clears on its own.
+grep -q 'load-gate' "$LOG"; rc=$?
+[ "$rc" -ne 0 ]; rc=$?
+ck "a disk refusal is NOT reported as a load refusal (the remedies are opposite)" $rc
+# No walltime row on a refusal (no agent ran) — the #1709 series must not gain a fabricated zero.
+rows_w1=0; [ -s "$TMP/O/state/walltime.tsv" ] && rows_w1="$(wc -l < "$TMP/O/state/walltime.tsv" | tr -d ' ')"
+[ "$rows_w1" = "$rows_w0" ]; rc=$?
+ck "a disk refusal appends NO walltime row ($rows_w1 vs $rows_w0 before)" $rc
+# ... but it DOES append a disk row: unlike walltime, "the disk was below the floor" IS the
+# measurement, and a series that records only refusals cannot answer "how close did we get".
+row="$(tail -1 "$TMP/O/state/disk.tsv" 2>/dev/null)"
+f4="$(printf '%s' "$row" | cut -f4)"; f5="$(printf '%s' "$row" | cut -f5)"
+nf="$(printf '%s' "$row" | awk -F'\t' '{print NF}')"
+case "$f4" in ''|*[!0-9]*) rc=1 ;; *) rc=0 ;; esac
+[ "$rc" -eq 0 ] && [ "$nf" = "5" ] && [ "$f5" = "$TMP" ]; rc=$?
+ck "a refusal records the MEASURED reading + path in disk.tsv (nf=$nf, free='${f4:-<none>}', path='${f5:-<none>}')" $rc
+
+# The WARN band: inside it the agent STILL STARTS — the warning is the point, not a second refusal.
+: > "$LOG"; : > "$PI_LOG"
+res="$(drive_disk "$TMP" 1 9999999)"
+[ "$res" = "rc=0 started=1" ]; rc=$?
+ck "inside the warning band the agent STILL STARTS ($res) — a warning is not a refusal" $rc
+grep -q 'disk-gate.*WARN.*warn band 9999999MB' "$LOG"; rc=$?
+ck "and it WARNS loudly, naming the reading and the band — a device that fills SILENTLY is the defect" $rc
+
+# The UNREADABLE probe, driven end to end: the floor is unreachable but `df` cannot answer, so the
+# gate must fail OPEN (otherwise one bad probe would stop every lane for ever) — and it must SAY SO,
+# because silent fail-open is how a typo'd DISK_GATE_PATH disarms the gate invisibly.
+: > "$LOG"; : > "$PI_LOG"
+res="$(drive_disk "$TMP/no-such-path-$$" 9999999)"
+[ "$res" = "rc=0 started=1" ]; rc=$?
+ck "an UNREADABLE probe fails OPEN — an unanswerable probe is not evidence of a full disk ($res)" $rc
+grep -q 'disk-gate.*WARN.*could not read free space' "$LOG"; rc=$?
+ck "...and an unreadable probe is ANNOUNCED, so a misconfigured path is not silently permissive" $rc
+
+# ── 12) a suite nothing RUNS is not a gate ──────────────────────────────────────
 # This file is not yet a registered CI shard: scripts/run-bash-shards.sh is held by concurrent lanes
 # (PR #1769/#1730), so the entry cannot be added from here. The problem is SILENCE — a suite that is
 # present but unwired gets forgotten. So the residual is asserted as an EQUALITY: exactly one

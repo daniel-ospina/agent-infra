@@ -38,9 +38,10 @@
 # the canonical one plus the gate. A port that silently regresses the receiving tree is not a port.
 set -u
 
-# `is_num` is shared by every numeric coercion below AND by orch-loop.sh (which sources this file
-# before its own threshold coercions). It lives here because the ceiling is derived at SOURCE time,
-# below, and a guard that runs after the arithmetic it protects is not a guard (#1702).
+# `is_num` is shared by every numeric coercion below AND by orch-loop.sh's own coercions (which are
+# a SEPARATE copy: orch-loop.sh does NOT source this file — see the header). It lives here because the
+# ceiling is derived at SOURCE time, below, and a guard that runs after the arithmetic it protects is
+# not a guard (#1702).
 #
 # ⛔ LEADING ZEROS ARE REJECTED — but NOT for the reason an earlier version of this comment gave
 # (corrected, review round 2026-10-15). `[ 5 -lt 08 ]` does **not** error: `[`'s numeric comparison
@@ -100,6 +101,80 @@ MAX_LOAD="${MAX_LOAD:-$(( 10#$_NCPU * 10 ))}"
 is_limit "${MAX_LOAD:-}" || MAX_LOAD=$(( 10#$_NCPU * 10 ))
 is_limit "${MAX_LOAD:-}" || MAX_LOAD=40
 
+# ── the disk gate (agent-infra#1765) ─────────────────────────────────────────────
+# A cell whose filesystem fills is not a warning, and it is not self-correcting: MEASURED twice on
+# pi-lane-1 — 2026-10-15 (`/dev/root 32G, 30G used, 0 avail`; every git op failed, even
+# `echo x > /tmp/f` returned `I/O error: No space left on device`) and again 2026-10-16 05:13Z, when
+# the controller died writing its own log (`orch-loop.sh: echo: write error: No space left on
+# device`). The controller never saw either coming, because its resource probe was macOS-only and
+# printed `disk(?)` at 100% used (#1765).
+#
+# This is the DISPATCH-PATH half of that fix, and it lives here rather than in orch-loop.sh because
+# this file is the ONE agent invocation the ported callers use: `pi` has no internal disk limit, so
+# the only place the consumption can still be stopped is immediately BEFORE the spawn. Refusing here
+# costs a re-dispatch; not refusing costs the venv half-built (`uv sync` dying on `os error 28`), or
+# a review that dies mid-write — burning a lease and a MAX_FIX_TRIES attempt for an agent that could
+# never have finished.
+#
+# ⛔ THE POLARITY IS MIXED ON PURPOSE, it is not the load gate's, and it DIVERGES from the tree's
+# other disk floor. `cloud-cell-supervisor.sh`'s `cmd_check_disk` fails CLOSED on an unreadable `df`
+# ("cannot-verify is never a pass") because it is a PRE-START check: refusing to start a cell costs
+# nothing. This gate runs in a LIVE dispatch path, where failing closed on an unreadable probe would
+# stop every lane on the box for ever — so an UNREADABLE reading fails OPEN, matching the posture
+# #1702 documents for the load and swap probes, and a READABLE reading below the floor fails CLOSED.
+# The divergence is deliberate and stated, not an accident; the unreadable case is also logged LOUDLY
+# (see run_agent) so a misconfigured probe is visible rather than silently permissive.
+#
+# The reading is MEBIBYTES, and the probe is POSIX. `df -g /System/Volumes/Data` is macOS-only in
+# both its flag and its path — its empty result on Linux is literally how this stayed invisible.
+# Scope of the guards below: they repair a DEFAULT or an out-of-range value at SOURCE time. They are
+# not a defence against an operator who deliberately exports DISK_MIN_FREE_MB=1 (a legal, tiny floor)
+# or who re-assigns the variable AFTER sourcing this file; they defend the shipped callers, which set
+# neither.
+DISK_MIN_FREE_MB="${DISK_MIN_FREE_MB:-1024}"
+is_limit "${DISK_MIN_FREE_MB:-}" || DISK_MIN_FREE_MB=1024
+# A 0 floor would make `[ "$mb" -ge 0 ]` true for every reading — a gate that can never refuse,
+# i.e. the no-op gate this whole file is written against. Same shape as the `_NCPU` zero guard above.
+[ "${DISK_MIN_FREE_MB:-0}" -ge 1 ] || DISK_MIN_FREE_MB=1024
+# The WARNING BAND — a device that fills SILENTLY is the defect, so the cell says so while it can
+# still act. 4x the floor is `cloud-cell-supervisor.sh`'s `check` warning band; that file's
+# UNATTENDED prune trigger is narrower (2x, `cmd_start`), and the two are not interchangeable.
+DISK_WARN_FREE_MB="${DISK_WARN_FREE_MB:-$(( 10#$DISK_MIN_FREE_MB * 4 ))}"
+is_limit "${DISK_WARN_FREE_MB:-}" || DISK_WARN_FREE_MB=$(( 10#$DISK_MIN_FREE_MB * 4 ))
+# ⛔ THE BAND MUST BE NON-EMPTY, AND `>= floor` IS NOT ENOUGH (review round 1, P1). The refusal fires
+# on `mb < floor` and the warning on `mb < warn`, so `warn == floor` leaves the interval
+# [floor, warn) EMPTY: the warn can never fire, and a repair intended to guarantee a warning would
+# ship exactly "no warning" — the failure it exists to prevent. The band must be strictly above the
+# floor, so an out-of-range value is doubled rather than clamped to the floor.
+[ "${DISK_WARN_FREE_MB:-0}" -gt "$DISK_MIN_FREE_MB" ] || DISK_WARN_FREE_MB=$(( 10#$DISK_MIN_FREE_MB * 2 ))
+
+# Free MEBIBYTES on the filesystem holding <path>, or EMPTY when the probe cannot answer.
+# The path is the ARGUMENT because the volume that fills is the one the checkout lives on, not a
+# hardcoded label (#1765). `df -Pk` is POSIX and its 4th column is 1KiB blocks on both platforms, so
+# the conversion is `/1024` — and the column is VALIDATED (`$4 ~ /^[0-9]+$/`) rather than trusted: a
+# locale- or column-shifted `df` would otherwise hand back a string that `[ -lt ]` errors on, and an
+# errored comparison is not a measurement.
+disk_free_mb() { # disk_free_mb <path>
+  df -Pk "${1:-.}" 2>/dev/null | awk 'NR==2 && $4 ~ /^[0-9]+$/ {print int($4 / 1024)}'
+}
+
+# disk_ok <free-mb> — the ONE disk predicate, and the gate's polarity in one place.
+# An empty or NON-NUMERIC reading is unreadable, not zero: it returns ALLOWED (the documented
+# fail-open). A readable reading is compared against the floor.
+disk_ok() { # disk_ok <free-mb>
+  local mb="${1:-}"
+  case "$mb" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$mb" -ge "$DISK_MIN_FREE_MB" ]
+}
+
+# disk_low <free-mb> — inside the warning band (and therefore still ALLOWED). Same unreadable
+# polarity as disk_ok: a reading we cannot take is not evidence that the disk is low.
+disk_low() { # disk_low <free-mb>
+  local mb="${1:-}"
+  case "$mb" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$mb" -lt "$DISK_WARN_FREE_MB" ]
+}
+
 # 1-min load average, integer. Empty when the probe fails (see can_spawn).
 # THE FIELD DIFFERS: /proc field 1 IS the 1-min load, while macOS `sysctl vm.loadavg` prints
 # `{ 1.70 1.90 2.00 }`, so field 2 is. One shared awk would therefore read the wrong field on one of
@@ -148,6 +223,11 @@ can_spawn() { [ "${1:-0}" -lt "$MAX_LOAD" ]; }
 # refusal would authorise a fixer for a review that never happened, burn a MAX_FIX_TRIES attempt and
 # eventually park the PR (the same failure class as agent-infra#1716).
 AGENT_LOAD_REFUSED=75
+# The disk gate's refusal code, and it is a SEPARATE code on purpose: the remedies are opposite. A
+# load refusal clears when the box quietens and the controller re-dispatches next cycle; a disk
+# refusal will NEVER clear on its own, so a caller (or an operator reading a lane log) that treats
+# the two as one waits for an event that cannot happen.
+AGENT_DISK_REFUSED=77
 # Authoritative "an agent ran" flag, set by run_agent() itself. `rc == AGENT_LOAD_REFUSED` alone is
 # ambiguous: `pi` shares the 0–255 exit-status namespace, so a pi that exited 75 for its own reason
 # would be read as a load refusal — and a caller that acts on that (fix-one.sh skips its merge-chain
@@ -157,6 +237,45 @@ AGENT_STARTED=0
 run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   local t="$1" log="$2" prompt="$3" label="${4:-agent}" pid w rc l start elapsed
   AGENT_STARTED=0
+  # ── the disk gate (#1765). Read FRESH immediately before the spawn, for the load gate's reason plus
+  # one of its own: a lane can sit waiting for a claim for 90 minutes, and the filesystem it will
+  # fill is not the one that was measured when it was dispatched.
+  #
+  # ⛔ THIS GATE RUNS BEFORE THE LOAD GATE, AND THAT ORDER IS LOAD-BEARING (review round 1, P1). With
+  # the load gate first, a saturated box with a full filesystem reports ONLY the load refusal, and the
+  # operator is told to wait for an event that cannot arrive — which is the very failure the
+  # caller-side naming exists to remove. A disk refusal never clears on its own; a load refusal does.
+  # Both are true at once, so the un-clearable one has to be the one reported.
+  #
+  # DISK_GATE_PATH names the volume; the default is the caller's cwd, which for both ported callers
+  # is the worktree the agent will run in — exactly where `uv sync` writes its venv and where the
+  # ENOSPC of 2026-10-15 landed. On a cell the harness's own `$O` and the worktree share /dev/root,
+  # so one reading covers both; the override exists for a box that splits them.
+  local dfree dpath
+  dpath="${DISK_GATE_PATH:-$PWD}"
+  dfree="$(disk_free_mb "$dpath")"
+  # DURABLE, and written for ALLOWED runs too — a series that only records refusals cannot answer
+  # "how close did we get", which is the question that would have caught either incident early.
+  # Same append-only shape as walltime.tsv; a refusal writes a row here (unlike walltime, where a
+  # refusal would fabricate a zero-duration sample) because "the disk was below the floor" IS the
+  # measurement. tab-separated: epoch, kind, tag, free MB, path.
+  if [ -n "${O:-}" ]; then
+    mkdir -p "$O/state" 2>/dev/null || true
+    printf '%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "${KIND:-agent}" "${TAG:-}" "${dfree:-?}" "$dpath" \
+      >> "$O/state/disk.tsv" 2>/dev/null || true
+  fi
+  # ⛔ AN UNREADABLE PROBE IS ANNOUNCED (review round 1, P2). The fail-open above is deliberate, but
+  # silent fail-open is how a typo'd DISK_GATE_PATH — or a missing `df` — disarms the gate invisibly.
+  # The reading is not a refusal, so this is a WARN; the distinction matters, because the agent is
+  # still allowed to start.
+  if [ -z "$dfree" ]; then
+    echo "[disk-gate] WARN $label: could not read free space on $dpath — the disk floor CANNOT be enforced for this spawn. Check DISK_GATE_PATH, PATH and that 'df' works. Failing OPEN by design." >> "$log"
+  elif ! disk_ok "$dfree"; then
+    echo "[disk-gate] REFUSED $label: only ${dfree}MB free on $dpath < disk_min_free_mb=$DISK_MIN_FREE_MB — no agent was started, so nothing was consumed; reclaim with 'cloud-cell-supervisor.sh prune' (--caches, and --scratch for /tmp) and the controller re-dispatches" >> "$log"
+    return "$AGENT_DISK_REFUSED"
+  elif disk_low "$dfree"; then
+    echo "[disk-gate] WARN $label: only ${dfree}MB free on $dpath (floor ${DISK_MIN_FREE_MB}MB, warn band ${DISK_WARN_FREE_MB}MB) — a full disk is what breaks a cell first; reclaim with 'cloud-cell-supervisor.sh prune' before it fills" >> "$log"
+  fi
   l="$(load1)"
   if ! can_spawn "$l"; then
     echo "[load-gate] REFUSED $label: load=$l >= max_load=$MAX_LOAD — no agent started; the controller re-dispatches when load falls, and nothing was consumed" >> "$log"

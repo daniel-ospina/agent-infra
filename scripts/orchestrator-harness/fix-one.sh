@@ -175,6 +175,9 @@ Apply a fix for EVERY finding (P3 notes: address or record explicitly). Requirem
 FINAL MESSAGE (<=15 lines): which findings you fixed, files changed, exact test commands + pass/fail counts, and any finding you deliberately did not fix with the reason.
 EOF
 run_agent "${FIX_TIMEOUT:-2400}" "$L.log" "$L-fixer.txt" "fixer for PR #$PR"
+# ⛔ THE GATE'S OWN CODE, captured immediately. It is the ONLY thing that distinguishes the two
+# refusals below, and `$?` read after any later command would be that command's status (§7.4).
+ar=$?
 # ⛔ AGENT_STARTED (set by run_agent) is the authority, NOT the exit code: `pi` shares the 0–255
 # status namespace, so a pi that exited 75 for its own reason must not be read as a load refusal —
 # that would silently skip the merge-chain re-run below (#1720 advisory).
@@ -182,7 +185,18 @@ if [ "$AGENT_STARTED" = "0" ]; then
   # Nothing was fixed, so re-running the merge chain would be a fresh-context review of an
   # unchanged head — pure cost on an already-overloaded box, and the re-review would be refused by
   # the same gate anyway. Exit and let the controller's next cycle re-dispatch.
-  echo "[fix $PR] fixer NOT started (load gate) — merge chain NOT re-run" >> "$L.log"
+  #
+  # ⛔ WHICH GATE REFUSED DECIDES THE REMEDY, and the two are OPPOSITE (#1765). A load refusal
+  # clears when the box quietens and the controller re-dispatches next cycle; a DISK refusal never
+  # clears on its own — no amount of waiting frees a filesystem. Naming a disk refusal "load gate"
+  # sends the operator to wait for an event that cannot fix it, which is the instrument false
+  # positive this file's callers exist to avoid.
+  if [ "$ar" = "$AGENT_DISK_REFUSED" ]; then
+    why="disk gate: the filesystem is below DISK_MIN_FREE_MB — reclaim space (cloud-cell-supervisor.sh prune); this will NOT clear by waiting"
+  else
+    why="load gate: re-dispatched when 1-min load falls below MAX_LOAD"
+  fi
+  echo "[fix $PR] fixer NOT started ($why) — merge chain NOT re-run" >> "$L.log"
   if [ "${CTRL:-0}" = "1" ]; then
     # ⛔ REFUND, AND ONLY ON THE CONTROLLER PATH. orch-loop.sh books the attempt (fixcount+1) when
     # it CREATES the session, which is UPSTREAM of the gate inside run_agent(); this worker is the
@@ -198,11 +212,13 @@ if [ "$AGENT_STARTED" = "0" ]; then
       is_num "$NF" || NF=0
       if [ "$NF" -gt 0 ]; then
         echo $((NF - 1)) > "$CF"
-        echo "[fix $PR] load refusal is not an attempt — fixcount refunded $NF -> $((NF - 1))" >> "$L.log"
+        echo "[fix $PR] a gate refusal is not an attempt — fixcount refunded $NF -> $((NF - 1))" >> "$L.log"
       fi
     fi
   fi
-  exit "$AGENT_LOAD_REFUSED"
+  # Exit with the gate's OWN code, not a normalised 75: the caller (adopt-fix.sh, an operator) reads
+  # it to choose the remedy, and 77 is the only thing that says "this one will not clear by waiting".
+  exit "$ar"
 fi
 echo "[fix $PR] fixer done $(date) — re-running merge chain" >> "$L.log"
 # Release BEFORE the merge chain. If the fixer pushed, merge-one.sh claims the NEW head. If it did
