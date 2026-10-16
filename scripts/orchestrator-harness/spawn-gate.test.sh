@@ -47,12 +47,15 @@ done
 NX="$TMP/nogate"; mkdir -p "$NX/O/logs"
 cp "$HERE/lane.sh" "$HERE/fix-one.sh" "$NX/"
 out="$( ( cd "$NX" && O="$NX/O" bash "$NX/lane.sh" 9999 work daniel-ospina/agent-infra ) 2>&1 )"; nrc=$?
-{ [ "$nrc" -eq 78 ] && printf '%s' "$out" | grep -q 'FATAL'; }; rc=$?
+# A here-string, NOT `printf | grep -q`: `grep -q` exits on first match, `printf` takes SIGPIPE, and
+# under `pipefail` the pipeline returns 141 — so the idiom reads as "no match" ON A MATCH, which is
+# precisely the false negative this check exists to catch (scripts/check-no-sigpipe-grep.sh, #841).
+{ [ "$nrc" -eq 78 ] && grep -q 'FATAL' <<<"$out"; }; rc=$?
 ck "lane.sh truly REFUSES (exit 78 + FATAL) with no helper beside it — driven, not grepped (rc=$nrc)" $rc
 # fix-one.sh takes FOUR positional args, and PR must be numeric or it bails at its FIRST guard
 # (exit 1) and never reaches the source line — which would make this check pass for the wrong reason.
 out="$( ( cd "$NX" && O="$NX/O" bash "$NX/fix-one.sh" "$NX" daniel-ospina/agent-infra 7 work ) 2>&1 )"; nrc=$?
-{ [ "$nrc" -eq 78 ] && printf '%s' "$out" | grep -q 'FATAL'; }; rc=$?
+{ [ "$nrc" -eq 78 ] && grep -q 'FATAL' <<<"$out"; }; rc=$?
 ck "fix-one.sh truly REFUSES (exit 78 + FATAL) with no helper beside it — driven, not grepped (rc=$nrc)" $rc
 
 # ⛔ SOURCED AFTER `export PATH`. spawn-gate.sh resolves `_NCPU` at SOURCE time through
