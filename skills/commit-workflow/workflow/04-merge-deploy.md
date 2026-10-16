@@ -78,21 +78,32 @@ Merge is gated by AI review, not human approval. The merge proceeds when ALL of:
    survives unrelated merges to main. When either side cannot be read the gate
    refuses with `base_unverifiable` instead — fail-closed, and re-record clears it. A
    head move (fix commits, merge of main) does NOT by itself invalidate the review —
-   the review is of the DIFF, and the record/marker carry a signed `diff=` bound to it
-   (tortoise#2982). Decide by the ARTIFACT, not by the sha:
+   the review is of the ARTIFACT, not the sha, and the record/marker carry a signed
+   `diff=` bound to it (tortoise#2982). Decide by the ARTIFACT — not by the sha, and not
+   by "the rendered patch moved" (a base-only move re-renders it):
    `~/.pi/agent/scripts/record-review.sh --print-diff-hash <PR> <owner/repo>` prints
-   the PR's live three-dot digest the same way the gate computes it — compare it with
-   the `diff=` on the recorded marker (or `diff_sha256` in the record).
-   **Unchanged → no review is owed.** The `ai-review-gate` accepts the stale-sha marker
-   because its signed `diff=` equals the live diff (rule (b)), and the
-   review-enforcer's carry arm mirrors that, so the verdict stands and the ceremony
-   stays green with NO new review cycle. Re-anchoring the record to the current head is
+   `<status>\t<sha256>` for the PR's live normalized three-dot diff, the same digest the
+   gate computes — compare it with the `diff=` on the recorded marker (or `diff_sha256`
+   in the record), then:
+   **Same digest → the verdict STANDS; no review is owed.** The `ai-review-gate` accepts
+   the stale-sha marker because its signed `diff=` equals the live diff (rule (b)), and the
+   review-enforcer's carry arm mirrors that for the merge command, so the ceremony stays
+   green with NO new review cycle. Re-anchoring the record to the current head is
    OPTIONAL and mechanical — `~/.pi/agent/scripts/record-review.sh <PR>
-   <reviewed-head-sha> <verdict> <owner/repo>` names the sha the review was taken at,
+   <recorded-head-sha> <verdict> <owner/repo>` names the sha the review was taken at,
    and the carry-forward arm re-binds it to the CURRENT head (a carry needs no
    `--evidence`). Do NOT re-run the reviewers: the bytes they certified are unchanged.
-   **Changed (fix commits, or a base merge that touched a reviewed file) → a fresh
-   review IS owed.** Re-run the
+   **Digest changed, but the LANE's commits did not → the verdict can still STAND.** This
+   is the base-only-move class a `git merge origin/<default>` produces when main touched a
+   file the PR also touched: the rendered patch moved, the lane's contribution did not.
+   The lane-dimension carry (#6072/#6213/#4823) re-records the verdict at the current head
+   when it can prove the head's tree is a clean merge of the reviewed tree with its base
+   parent — run the same command with the recorded head. That arm CANNOT fire after a
+   `git rebase` (the head was rewritten, so the recorded head is no longer an ancestor) —
+   after a rebase, a changed digest is the fresh-review case below. Both carries are
+   REFUSED (exit 3) when the target head is MEASURABLY RED (#1575 clause E): re-run the
+   failing checks, then re-record.
+   **The LANE's own content changed (fix commits) → a fresh review IS owed.** Re-run the
    review appropriate to the tier (the `code-review` skill at
    standard/complex; the micro flow at micro) on the new head, then re-record
    at the SAME verdict —
@@ -124,11 +135,12 @@ Merge is gated by AI review, not human approval. The merge proceeds when ALL of:
    A moved head is NOT by itself a stale record: the `ai-review-gate` required check
    verifies the signature and accepts the record at the head sha OR at an UNCHANGED
    reviewed diff (the signed `diff=`, tortoise#2982), and the review-enforcer's carry arm
-   mirrors that for the merge command. So a base-only move (`gh pr update-branch`, a
-   rebase, an unrelated merge of main) keeps the ceremony green WITHOUT a new review
-   cycle. NEVER re-record a DIFF THAT CHANGED without a fresh review: there the
-   carry-forward arm refuses (exit 3), and the ceremony correctly stays red until the
-   new bytes are genuinely reviewed.
+   mirrors that for the merge command. So a base-only move (`gh pr update-branch`, `git
+   merge origin/<default>`, an unrelated merge of main) keeps the ceremony green WITHOUT a
+   new review cycle — or is carried through the lane arm above when the render moved. NEVER
+   re-record CHANGED LANE CONTENT without a fresh review: there no carry arm can prove the
+   artifact unchanged, the carry refuses (exit 3), and the ceremony correctly stays red
+   until the new bytes are genuinely reviewed.
 
 **Human escalation (only for):** P0 findings requiring an architectural or security decision —
 irreversible operations, data loss, security breach — and only after the code-review fixer loop
@@ -297,17 +309,20 @@ git fetch origin "$DEFAULT_BRANCH" --quiet   # refresh the tracking ref FIRST �
 git -c commit.gpgsign=false rebase "origin/$DEFAULT_BRANCH"   # or: git merge origin/$DEFAULT_BRANCH per condition 5
 # RE-RUN the affected pre-flight regression tests here
 git push --force-with-lease
-# The head sha moved. Decide by the DIFF, not the sha (condition 6):
+# The head sha moved. Decide by the ARTIFACT, not the sha (condition 6):
 #   record-review.sh --print-diff-hash <PR_NUMBER> <owner/repo>  → compare with the
 #   recorded marker's diff=.  UNCHANGED (the normal rebase outcome — the rebase
 #   re-rendered the same change): the verdict STANDS. The ai-review-gate's rule (b)
 #   accepts the stale-sha marker and the review-enforcer's carry arm mirrors it, so
 #   NO re-review is owed. Re-anchor the record only if you want it on the new head:
-#   record-review.sh <PR_NUMBER> <reviewed-sha> <verdict> <owner/repo> — the
+#   record-review.sh <PR_NUMBER> <recorded-sha> <verdict> <owner/repo> — the
 #   carry-forward arm re-binds it (a carry needs no --evidence). Do NOT re-run the
-#   reviewers.  CHANGED (fix commits — bytes the reviewer never saw): run the
-#   `code-review` skill at the new head (fresh review; it auto-records on clean
-#   convergence) — the carry refuses (exit 3) exactly then.
+#   reviewers.  CHANGED: this rebase REWROTE the head, so the lane-dimension arm cannot
+#   fire — the new bytes need a review: run the `code-review` skill at the new head
+#   (fresh review; it auto-records on clean convergence); the carry refuses (exit 3)
+#   exactly then. (If you MERGED main instead of rebasing and only the base moved,
+#   condition 6's lane arm can still carry the verdict.) A carry onto a measurably RED
+#   head is refused (#1575 clause E) — re-run the failing checks before re-recording.
 # Code-bearing PRs: also dispatch a fresh [VGATE] at the new head (condition 3) —
 # the rebase changed the verified files' hashes (docs-only sets are shape-exempt).
 # Then re-arm:
