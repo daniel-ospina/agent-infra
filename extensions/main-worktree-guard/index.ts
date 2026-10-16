@@ -1511,37 +1511,128 @@ const _WT_EXPANDED_SCRIPT_REASON =
   "path literally (e.g. `bash ./tools/your-script.sh`) so its contents can be " +
   "read and verified";
 
-/** #1228 — the runtime-EXPANDED script token `text` would run, or null. The
- *  script walk can only verify a path it can read AS SPELLED; an expanded one
- *  names a file the SHELL resolves at run time, so the walk silently skipped
- *  it. Covers the interpreter operand and `./`/`/` direct execution via
- *  `extractScriptPath`, plus the `~/…` / `sub/…` command-position shapes it
- *  misses. Used by the direct arms AND by the indirection wrappers
- *  (interpreter `-c` payloads, `eval` payloads, nested scripts) so one rule
- *  governs every place the walk would otherwise have to guess. */
-function _wtExpandedScriptToken(text: string): string | null {
+/** #1228 — split `text` into shell command segments at the separators that
+ *  START a new command, ignoring separators inside quotes/escapes. A script
+ *  invocation is not always at position 0 (`true && bash ./undo*.sh`,
+ *  `if true; then bash ./undo*.sh; fi`); the position-0 arms missed it and the
+ *  discard ran ungated (review cycle-2 P0). `|` is split only as `||` so an
+ *  extglob `@(a|b)` is not cut in half. */
+function _wtCommandSegments(text: string): string[] {
+  const s = String(text ?? "");
+  const out: string[] = [];
+  let cur = "";
+  let quote: string | null = null;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (quote) { if (ch === quote) quote = null; cur += ch; continue; }
+    if (ch === "\\") { cur += ch + (s[i + 1] ?? ""); i++; continue; }
+    if (ch === "'" || ch === '"') { quote = ch; cur += ch; continue; }
+    if (ch === ";" || ch === "&" || ch === "\n") { out.push(cur); cur = ""; continue; }
+    if (ch === "|" && s[i + 1] === "|") { out.push(cur); cur = ""; i++; continue; }
+    cur += ch;
+  }
+  out.push(cur);
+  return out.filter((seg) => seg.trim() !== "");
+}
+
+/** #1228 — the runtime-EXPANDED file a process substitution hands to an
+ *  interpreter (`bash <(cat ./undo*.sh)`), or null. `<(...)` is an interpreter
+ *  OPERAND that produces the script at runtime, so an expanded path inside it is
+ *  the same unreadable-script hole (review cycle-2 P1). */
+function _wtProcessSubExpansion(text: string): string | null {
+  for (const m of String(text ?? "").matchAll(/[<>]\(([^()]*)\)/g)) {
+    const inner = m[1].trim();
+    // Only a process substitution that FEEDS A FILE to the interpreter — the
+    // `<(cat <path>)` / `<(<producer>)` shape. A `<(…)` used as an ARGUMENT
+    // (`diff <(a) <(b)`, `<(git -C "$repo" worktree list)`) is not a script
+    // source and must not be refused (review cycle-2, false-blocked B8i).
+    if (/^(?:cat|bat|tac|head|tail)\b/.test(inner) && _wtPathNeedsExpansion(inner)) return inner;
+  }
+  return null;
+}
+
+/** #1228 — the runtime-EXPANDED file a `$(cat …)` / `` `cat …` `` payload reads
+ *  as its program source, or null. The STATIC form is handled elsewhere (read
+ *  and probed); the expanded form names a file the shell chooses at runtime and
+ *  must fail closed (review cycle-2 P0). */
+function _wtCatOfExpandedPath(text: string): string | null {
+  const m = /^\$\(\s*(?:cat|bat)\s+([^\s)$]+)\s*\)$|^`cat\s+([^`]+)`$/.exec(String(text ?? "").trim());
+  const p = m?.[1] ?? m?.[2];
+  return p && _wtPathNeedsExpansion(p) ? p : null;
+}
+
+/** #1228 — the runtime-EXPANDED script token a SINGLE command segment would run,
+ *  or null. The script walk can only verify a path it can read AS SPELLED; an
+ *  expanded one names a file the SHELL resolves at run time. Covers the
+ *  interpreter operand and direct execution via `extractScriptPath`, the
+ *  `~/…` / `sub/…` command-position shapes it misses, and extglob. */
+function _wtExpandedScriptTokenIn(text: string): string | null {
+  // A directly-executed path candidate. Fragments carrying control operators
+  // are `case` patterns and operator debris, not commands — `case "$x" in
+  // /tmp/*|/private/tmp/*) …` made every script that contains such a pattern
+  // false-block (review cycle-2, B12a/B8i). An extglob operator keeps the word
+  // a candidate even though it carries `(`/`)`.
+  const directish = (w: string): boolean =>
+    (w.includes("/") || w.startsWith("~")) && (!/[|&;()<>]/.test(w) || /[?*+@!]\(/.test(w));
+  const unq = (w: string): string => w.replace(/^["']|["']$/g, "");
   const sp = extractScriptPath(text);
-  if (sp && _wtPathNeedsExpansion(sp)) return sp;
-  const first = String(text).trim().split(/\s+/)[0] ?? "";
-  const pathLike = (w: string): boolean => w.includes("/") || w.startsWith("~");
-  if (pathLike(first) && _wtPathNeedsExpansion(first)) return first;
-  // EXTGROUP (`shopt -s extglob`, or `bash -O extglob -c …`) parses `?(…)` /
-  // `*(…)` / `+(…)` / `@(…)` / `!(…)` as ONE pathname pattern — `bash -O
-  // extglob -c 'bash ./undo@(-glob|).sh'` really runs the file — but the
-  // tokenizer splits the word at `(`, so `extractScriptPath` above only sees
-  // the truncated prefix. Scan the RAW words for a path-like token carrying an
-  // extglob operator and fail closed. A BARE `(`/`)` (a legal filename) is not
-  // flagged; only the operator form is.
-  //
-  // ONLY when this text is actually a SCRIPT EXECUTION — an interpreter operand
-  // (`sp` non-null, even truncated at `(`) or a path-like directly-executed
-  // first word. Scanning every word made `git add src/@(a|b).ts` and
-  // `curl -s '…a?b=*(c)'` refuse as `script-indirection` with a script-discard
-  // reason although no script runs (review cycle-1 P2).
-  if (sp !== null || pathLike(first)) {
-    for (const w of String(text).trim().split(/\s+/)) {
-      if (pathLike(w) && /[?*+@!]\(/.test(w)) return w;
+  const words = String(text).trim().split(/\s+/);
+  const first = words[0] ?? "";
+  const unqFirst = unq(first);
+  const spUnq = sp === null ? null : unq(sp);
+  // A leading `NAME=value` is an ASSIGNMENT, not a command — its value is not a
+  // script path, and `WT_PATH="$MAIN_REPO/.worktrees/$BRANCH"` (and the value
+  // side of `S='cat ./undo*.sh | bash'`) false-blocked the sanctioned recovery
+  // helper once the segment scan reached it (review cycle-2). `extractScriptPath`
+  // still resolves `FOO=bar bash ./x*.sh` because it skips env prefixes itself.
+  const assignmentFirst = /^[A-Za-z_][A-Za-z0-9_]*=/.test(first);
+  // Is the first word a shell/spawner (so `sp` is its OPERAND)? Duplicates the
+  // classifier's word sets on purpose: a MISSING name only narrows this arm, it
+  // cannot open a bypass — the `extractScriptPath` result is still checked.
+  const firstIsShellLike = /^(?:bash|sh|zsh|dash|ksh|ash|mksh|oksh|fish|csh|tcsh|source|env|nice|nohup|command|sudo|doas|setsid|stdbuf|time|timeout|exec|ionice|busybox|xargs|find|eval)$/.test(
+    unqFirst.replace(/^.*\//, ""),
+  );
+  if (sp && _wtPathNeedsExpansion(sp)) {
+    // Interpreter operand (`bash ./undo*.sh`, `sudo bash …`), or a bare path
+    // that IS the first word (direct execution, `./undo*.sh`).
+    if (firstIsShellLike || unqFirst === spUnq) return sp;
+  }
+  // EXTGROUP (`shopt -s extglob`, or `bash -O extglob -c …`) truncates the
+  // operand at `(`, so `extractScriptPath` returns a PREFIX and
+  // `_wtPathNeedsExpansion(prefix)` is false on its own. Scan the raw words for
+  // the full extglob token, but ONLY in a script position: an interpreter
+  // operand, or a directly-executed word that is not a `case` pattern (those
+  // end in `)`).
+  if (sp !== null && spUnq !== null) {
+    for (const w of words) {
+      if (unq(w).startsWith(spUnq) && /[?*+@!]\(/.test(w) && (firstIsShellLike || !w.endsWith(")"))) return w;
     }
+  }
+  if (!assignmentFirst && directish(first) && _wtPathNeedsExpansion(first)) return first;
+  // EXTGROUP on a directly-executed word (`./undo@(-g|).sh`) — only a word that
+  // IS the command, never an argument (`git add src/@(a|b).ts`), and never a
+  // `case` pattern, which ends in `)`.
+  if (!assignmentFirst && directish(first)) {
+    for (const w of words) {
+      if (directish(w) && /[?*+@!]\(/.test(w) && !w.endsWith(")")) return w;
+    }
+  }
+  return null;
+}
+
+/** #1228 — the runtime-EXPANDED script token `text` would run, or null. Applied
+ *  to the whole text AND to every command segment, so a script invocation at a
+ *  later position (`true && bash ./undo*.sh`, `if true; then bash …; fi`) is
+ *  found too — plus the `$(cat <expanded>)` and `<(cat <expanded>)` forms. */
+function _wtExpandedScriptToken(text: string): string | null {
+  const s = String(text ?? "");
+  const checks = [
+    s,
+    ..._wtCommandSegments(s).map((seg) => seg.replace(/^\s*(?:then|do|else|elif|if|while|until|for|fi)\b/, "")),
+  ];
+  for (const t of checks) {
+    const hit = _wtExpandedScriptTokenIn(t) ?? _wtCatOfExpandedPath(t) ?? _wtProcessSubExpansion(t);
+    if (hit) return hit;
   }
   return null;
 }
@@ -1583,11 +1674,11 @@ function _wtExpandedProducerReason(tok: string): string {
 
 /** #1228 — the runtime-EXPANDED script shape `text` would run, or null: the
  *  direct operand (`bash ./undo*.sh`), a piped producer the shell expands
- *  (`cat ./undo*.sh | bash`), or either of those one level inside an
- *  interpreter `-c` payload or an `eval` payload — bounded depth 3, matching
- *  the script walk. The expanded path was reachable at every position
- *  (command, payload, nested script), so one predicate decides them all and
- *  the verdict cannot depend on WHERE it is written. */
+ *  (`cat ./undo*.sh | bash`), or either of those inside an interpreter `-c`
+ *  payload or an `eval` payload — depth-bounded at 6, and FAILING CLOSED at the
+ *  bound. The expanded path was reachable at every position (command, payload,
+ *  nested script), so one predicate decides them all and the verdict cannot
+ *  depend on WHERE it is written. */
 type _WtExpandedHit = { kind: "direct" | "producer"; token: string };
 function _wtExpandedScriptShape(text: string, depth = 0): _WtExpandedHit | null {
   const s = String(text ?? "");
@@ -1595,7 +1686,13 @@ function _wtExpandedScriptShape(text: string, depth = 0): _WtExpandedHit | null 
   if (direct) return { kind: "direct", token: direct };
   const producer = _wtExpandedPipedProducer(s);
   if (producer) return { kind: "producer", token: producer };
-  if (depth >= 3) return null;
+  if (depth >= 6) {
+    // At the cap an unresolved nested shell shape must not be assumed safe: a
+    // `-c`-inside-`-c` chain can hide the same expanded path arbitrarily deep
+    // (the old depth-3 cap let a 4-deep chain through — review cycle-2 P1).
+    // Six levels is far past any real command; refusing here is fail-closed.
+    return { kind: "direct", token: s.slice(0, 60) };
+  }
   const payloads: string[] = wtShellInlinePayloads(s).map((p) => p.text);
   for (const m of s.matchAll(/\beval\s+(\$)?(['"])([\s\S]*?)\2|\beval\s+(\S+)/g)) {
     payloads.push(m[1] ? ansiTranslate(m[3] ?? m[4] ?? "") : (m[3] ?? m[4] ?? ""));
@@ -1644,7 +1741,15 @@ function _worktreeDiscardBlock(command: string): string | null {
   // script walk runs; the walk itself decides readable-vs-expanded.
   const _firstWord = String(command).trim().split(/\s+/)[0] ?? "";
   const _pathLikeWord = _firstWord.includes("/") || _firstWord.startsWith("~");
-  if (!/\bgit\b/.test(command) && !_scriptPath && !pipesToShell && !_pathLikeWord && !/['"\\$`]/.test(command)) return null;
+  // #1228: an expanded SCRIPT invocation can also sit AFTER a separator
+  // (`true && bash ./undo*.sh`, `if true; then bash …; fi`) — the bail below
+  // only ever looked at the first word and swallowed those whole (review
+  // cycle-2 P0). Bail only when the command mentions no path AND no shell
+  // interpreter, so those shapes reach the segment scan. The shell names mirror
+  // `classify-git.mjs`'s SHELL_INTERPRETERS; a MISSING name here would only
+  // re-open the bail, so the list stays complete.
+  const _pathOrShell = /[\/~]|\b(?:bash|sh|zsh|dash|ksh|ash|mksh|oksh|source)\b/.test(command);
+  if (!/\bgit\b/.test(command) && !_scriptPath && !pipesToShell && !_pathLikeWord && !_pathOrShell && !/['"\\$`]/.test(command)) return null;
   let direct: ReturnType<typeof extractWorkingTreeDiscards> = [];
   try { direct = extractWorkingTreeDiscards(command) ?? []; } catch { return null; }
   const sessionCwd = resolve(process.cwd());
@@ -1846,14 +1951,30 @@ function _worktreeDiscardBlock(command: string): string | null {
     const bare = payload.replace(/^["']|["']$/g, "");
     const vm = /^\$(\w+)$|^\$\{(\w+)\}$/.exec(bare);
     const name = vm?.[1] ?? vm?.[2];
+    // #1228: the payload-level expansion check runs FIRST — before the opaque
+    // (`$`/backtick) branch, which `continue`s — so the `$(cat <expanded>)` and
+    // `<(…)` forms are refused rather than skipped (review cycle-2 P0).
+    const expEval = _expRefusal(payload);
+    if (expEval) return expEval;
     if (name) {
       const am = new RegExp(`(?:^|[;&\\s])${name}=("[^"]*"|'[^']*'|\\S+)`).exec(String(command));
       const val = am ? String(am[1]).replace(/^["']|["']$/g, "") : null;
       if (val) {
-        // #1228: a resolved `eval` value that is itself an expanded script
-        // shape is the same unreadable producer.
+        // #1228: a resolved `eval` value can itself be an expanded script shape
+        // (`P='cat ./undo*.sh | bash'; eval "$P"`), or can NAME a readable
+        // script file whose body runs one (`W=./outer.sh; eval "bash $W"`) — the
+        // `-c` arm resolves both; mirror it here.
         const expVal = _expRefusal(val);
         if (expVal) return expVal;
+        try {
+          const real = realpathSync(resolve(execCwd, val));
+          if (statSync(real).isFile() && statSync(real).size <= 64 * 1024) {
+            const vContent = readFileSync(real, "utf8");
+            const expFile = _expRefusal(vContent);
+            if (expFile) return expFile;
+            sets.push({ discs: extractWorkingTreeDiscards(vContent) ?? [], baseCwd: execCwd, writeCwd: execCwd, script: val });
+          }
+        } catch { /* not a readable file — the payload arms below still apply */ }
       }
       if (val && !/[$`]/.test(val)) {
         sets.push({ discs: extractWorkingTreeDiscards(val) ?? [], baseCwd: execCwd, writeCwd: execCwd, script: null });
@@ -1868,18 +1989,11 @@ function _worktreeDiscardBlock(command: string): string | null {
       }
       continue;
     }
-    // #1228: an EXPANDED script path in an `eval` payload (`eval 'bash
-    // ./undo*.sh'`) — or a piped producer the shell expands (`eval 'cat
-    // ./undo*.sh | bash'`) — is the same unreadable-script hole; the payload
-    // names no discard verb of its own, so the verb-keyed arm below would skip
-    // it.
-    const expEval = _expRefusal(payload);
-    if (expEval) return expEval;
     // #1228: the payload can name a readable script FILE whose OWN body runs an
-    // expanded path (`eval 'bash ./outer-glob.sh'`). The payload-text check
-    // above cannot see inside it and `_MENTIONS_DISCARD_VERB` is false for a
-    // bare invocation, so read the file and apply the nested-script rule — the
-    // same arm the `-c` payload and the seed walk use.
+    // expanded path (`eval 'bash ./outer-glob.sh'`). Its discards are pushed AND
+    // the payload's OWN discards are still extracted below — an earlier cut
+    // `continue`d here, which skipped `eval 'bash ./clean.sh; git checkout --
+    // dirty.txt'` entirely and was a fail-open REGRESSION (review cycle-2 P0).
     try {
       const sp = extractScriptPath(payload);
       if (sp && !/[$`]/.test(sp)) {
@@ -1887,7 +2001,6 @@ function _worktreeDiscardBlock(command: string): string | null {
         const expFile = _expRefusal(eContent);
         if (expFile) return expFile;
         sets.push({ discs: extractWorkingTreeDiscards(eContent) ?? [], baseCwd: execCwd, writeCwd: execCwd, script: sp });
-        continue;
       }
     } catch { /* missing/unreadable — the verb test below still applies */ }
     if (!_MENTIONS_DISCARD_VERB(payload)) continue;

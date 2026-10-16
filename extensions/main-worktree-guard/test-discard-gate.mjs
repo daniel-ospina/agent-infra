@@ -1059,6 +1059,11 @@ async function partB() {
     // path (the payload-text check cannot see inside the named file).
     const outerGlobPayload = join(wt, "outer-glob-payload-1228.sh");
     write(outerGlobPayload, "bash ./undo-1228*.sh\n");
+    // A script body with an ASSIGNMENT and a `case` pattern — the segment scan
+    // must not read those as commands (B12a caught exactly this on the
+    // sanctioned helper).
+    const casePatternExp = join(wt, "case-pattern-1228.sh");
+    write(casePatternExp, 'X="${Y:-/tmp/z}"\ncase "$X" in\n  /tmp/*|/private/tmp/*) echo hi ;;\nesac\n');
     const blockReason1228 = (r) => String(r?.reason ?? "");
     const exp1228 = [
       ["control: literal `bash ./undo-1228.sh`", "bash ./undo-1228.sh", /#709/],
@@ -1098,6 +1103,18 @@ async function partB() {
       ["variable-resolved `eval` payload `P='cat ./undo-1228*.sh | bash'; eval \"$P\"`", "P='cat ./undo-1228*.sh | bash'; eval \"$P\"", /piped producer/],
       ["nested script named by a `-c` payload (`bash -c 'bash ./outer-glob-payload-1228.sh'`)", "bash -c 'bash ./outer-glob-payload-1228.sh'", /not statically resolvable/],
       ["nested script named by an `eval` payload (`eval 'bash ./outer-glob-payload-1228.sh'`)", "eval 'bash ./outer-glob-payload-1228.sh'", /not statically resolvable/],
+      // #1228 review cycle 2 — a script invocation after a SEPARATOR is still
+      // the interpreter-operand position; the position-0 arms missed it and the
+      // discard ran ungated.
+      ["prefixed `&&` `true && bash ./undo-1228*.sh`", "true && bash ./undo-1228*.sh", /not statically resolvable/],
+      ["prefixed `;` `true; bash ./undo-1228*.sh`", "true; bash ./undo-1228*.sh", /not statically resolvable/],
+      ["prefixed `then` `if true; then bash ./undo-1228*.sh; fi`", "if true; then bash ./undo-1228*.sh; fi", /not statically resolvable/],
+      ["prefixed inside `-c` payload `bash -c 'true; bash ./undo-1228*.sh'`", "bash -c 'true; bash ./undo-1228*.sh'", /not statically resolvable/],
+      ["`$(cat glob)` `-c` payload `bash -c \"$(cat ./undo-1228*.sh)\"`", "bash -c \"$(cat ./undo-1228*.sh)\"", /not statically resolvable/],
+      ["`$(cat glob)` `eval` payload `eval \"$(cat ./undo-1228*.sh)\"`", "eval \"$(cat ./undo-1228*.sh)\"", /not statically resolvable/],
+      ["process substitution `bash <(cat ./undo-1228*.sh)`", "bash <(cat ./undo-1228*.sh)", /not statically resolvable/],
+      ["depth-2 `-c` chain `bash -c \"bash -c 'bash ./undo-1228*.sh'\"`", "bash -c \"bash -c 'bash ./undo-1228*.sh'\"", /not statically resolvable/],
+      ["`eval` `$VAR` names a nested script `W=./outer-pipe-1228.sh; eval \"bash $W\"`", "W=./outer-pipe-1228.sh; eval \"bash $W\"", /not statically resolvable/],
     ];
     for (const [why, cmd, reasonRe] of exp1228) {
       write(join(wt, "dirty.txt"), "MUTANT\n");
@@ -1148,8 +1165,14 @@ async function partB() {
     write(join(wt, "dirty.txt"), "MUTANT\n");
     expectTrue("B13: `grep -n 'foo*' file | bash` BLOCKED (documented producer-token over-block)",
       blocked(await bash("grep -n 'foo*' file | bash", wt)), "was allowed");
+    // Regression control (review cycle-2): a script body carrying an ASSIGNMENT
+    // and a `case` pattern must be ALLOWED — the new command-segment scan read
+    // both as commands and false-blocked the SANCTIONED recovery helper (B12a).
+    write(join(wt, "dirty.txt"), "MUTANT\n");
+    expectTrue("B13: a script body with an assignment + `case` pattern is ALLOWED (no discard)",
+      allowed(await bash("bash ./case-pattern-1228.sh", wt)), "was blocked");
     execSync("git checkout -- dirty.txt", { cwd: wt, stdio: "ignore" });
-    for (const f of [undoExp, undoExpGlob, undoExpHome, undoExpSub, undoCleanGlob, outerExp, outerPipeExp, producerExp, outerBarePipeExp, outerGlobPayload]) rmSync(f, { force: true });
+    for (const f of [undoExp, undoExpGlob, undoExpHome, undoExpSub, undoCleanGlob, outerExp, outerPipeExp, producerExp, outerBarePipeExp, outerGlobPayload, casePatternExp]) rmSync(f, { force: true });
 
     // ── B11: escape hatches unchanged ──
     write(join(wt, "dirty.txt"), "MUTANT\n");
