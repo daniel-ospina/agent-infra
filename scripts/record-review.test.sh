@@ -14,6 +14,15 @@
 #                    (the current-head path used to record unconditionally);
 #                    fresh repo-less `clean` is refused, and the legacy key
 #                    still serves the verdicts the gate does not cover.
+#   #633 §14      → a re-record on an already-marker'd body re-runs the head's
+#                    NEWEST completed-RED gate check run (singular, id-for-id
+#                    with the rerun POST — the recency/livelock guards in
+#                    record-review.sh decide it), so the stale red rollup row
+#                    is replaced by a fresh attempt; the rerun is gated on the
+#                    SIGNED marker, the check-runs read is a GET, and the stub
+#                    models the transport so a `-f`-as-POST regression reddens
+#                    the suite; fail-soft when nothing to re-run / the API
+#                    refuses.
 
 set -euo pipefail
 
@@ -66,12 +75,38 @@ SHA="$(printf 'a%.0s' $(seq 1 40))" # 40×a — matches the stub's head answer
 #   labels  (--jq '.[].name')     → ${STUB_LABELS:-} lines, or the per-issue
 #                                   file ${STUB_LABELS_DIR}/<issue-num> when it
 #                                   exists; exit 1 when STUB_LABELS_FAIL=1
-#   PATCH (-X PATCH … --input -)  → swallow stdin
+#   check-runs (no --jq → RAW envelope) → {"check_runs": ${STUB_CHECK_RUNS:-[]}}
+#                                   (the #633 remediation jq's it itself; exit 1
+#                                   when STUB_CHECK_RUNS_FAIL=1). A --jq-bearing
+#                                   check-runs call is the #1575 clause (E) TSV arm.
+#                                   The stub also models the TRANSPORT: a
+#                                   /check-runs call carrying -f/-F without
+#                                   `-X GET` exits 1 (real gh → POST → 404).
+#   PATCH (-X PATCH … --input -)  → swallow stdin; exit 1 when STUB_PATCH_FAIL=1
+#   rerun (-X POST … /rerun)      → 201; exit 1 when STUB_RERUN_FAIL=1
 mkdir -p "$T/bin"
 cat > "$T/bin/gh" <<'STUB'
 #!/usr/bin/env bash
 echo "$*" >> "${GH_STUB_LOG:?}"
-if [ "$1" = "api" ] && [ "$2" = "-X" ]; then
+if [ "$1" = "api" ] && [ "$2" = "-X" ] \
+   && { grep -qF -- "/rerun" <<<"$*" || grep -qF -- "-X PATCH" <<<"$*"; }; then
+    # PATCH body / job rerun POST. #633: fail either on demand so the fail-soft
+    # and no-marker pins are real. A /rerun POST pipes NO stdin, so the read is
+    # skipped for it — consuming stdin unconditionally would clobber the PATCH
+    # capture with an empty body and, on an inherited terminal, block forever.
+    # ⛔ NOT every `-X` call: `gh api -X GET <url> -f …` is a READ (the #633
+    # check-runs transport) and must fall through to the routing below. Gating
+    # this branch on `$2 = -X` alone mis-routed it here, where it swallowed the
+    # capture file with an empty stdin read — which silently BLANKED the recorded
+    # marker and made every diff= assertion fail. The branch now names its two
+    # mutating callers (PATCH, /rerun) instead of assuming `-X` means write.
+    if grep -qF -- "/rerun" <<<"$*"; then
+        if [ "${STUB_RERUN_FAIL:-0}" = "1" ]; then exit 1; fi
+        exit 0
+    fi
+    if grep -qF -- "-X PATCH" <<<"$*"; then
+        if [ "${STUB_PATCH_FAIL:-0}" = "1" ]; then exit 1; fi
+    fi
     # PATCH body — capture stdin to whichever sink the test asked for, else swallow.
     # STUB_CAPTURE (#2982, the diff-binding sink) is checked FIRST so precedence is
     # deterministic; GH_STUB_PATCH_BODY is retained as a fallback because main's
@@ -89,6 +124,25 @@ if [ "$1" = "api" ] && [ "$2" = "-X" ]; then
     exit 0
 fi
 if [ "$1" = "api" ]; then
+    # #633 review finding 2: model the TRANSPORT, not just the URL. Real `gh api`
+    # switches to POST as soon as ANY `-f`/`-F` parameter is added, and
+    # `GET /commits/{ref}/check-runs` is GET-only — so a parameterized call with
+    # no explicit `-X GET` answers `404 Not Found`. The original stub matched the
+    # URL alone and answered 200 to a request that cannot succeed in production,
+    # so it certified the very defect (#633 finding 1) it was meant to catch.
+    # A regression to `-f`-without-`-X GET` now reddens the suite (pinned by
+    # §14.12). The correct forms are the query string (repo convention) or
+    # `-X GET -f …`.
+    case "$*" in
+        *check-runs*)
+            case "$*" in
+                *" -f "*|*" -F "*)
+                    case "$*" in
+                        *"-X GET"*) : ;;
+                        *) exit 1 ;;
+                    esac ;;
+            esac ;;
+    esac
     # #2982: the reviewed-diff fetch. Placed FIRST — the request carries no
     # --jq, so it would otherwise fall through to the generic body answer.
     if grep -qF -- "application/vnd.github.v3.diff" <<<"$*"; then
@@ -121,6 +175,16 @@ if [ "$1" = "api" ]; then
     if grep -qF -- "base.sha,.head.sha" <<<"$*"; then
         [ "${STUB_LOCAL_META_FAIL:-0}" = "1" ] && exit 1
         printf '%s\t%s\t%s\n' "${STUB_LOCAL_BASE:-}" "${STUB_LOCAL_HEAD:-}" "${STUB_LOCAL_BASE_REF:-main}"
+        exit 0
+    fi
+    # #633: the stale-gate-run read. The remediation reads the RAW check-runs
+    # ENVELOPE and jq's it itself (no --jq in argv), unlike #1575 clause (E)
+    # below, which asks gh to emit TSV rows. Distinguished by the missing
+    # --jq. STUB_CHECK_RUNS is the JSON array; STUB_CHECK_RUNS_FAIL=1 pins the
+    # transport-failure path (a loud warning, never "nothing to remediate").
+    if grep -qF -- "check-runs" <<<"$*" && ! grep -qF -- "--jq" <<<"$*"; then
+        [ "${STUB_CHECK_RUNS_FAIL:-0}" = "1" ] && exit 1
+        printf '{"check_runs": %s}' "${STUB_CHECK_RUNS:-[]}"
         exit 0
     fi
     # #1575 clause (E): the target head's check-runs. STUB_CHECKS_ROWS carries the TSV
@@ -562,7 +626,11 @@ STUB_BODY="Fixes https://GITHUB.com/Daniel-Ospina/Agent-Infra/issues/424316" run
 unset STUB_LABELS_DIR STUB_LABELS
 rm -rf "$T/labels"
 
-# 8.10 clean verdict: ZERO extra gh calls (no labels query in the log).
+# 8.10 clean verdict: no gh LABELS call (#513/#568). The clean path now makes
+#      exactly ONE other gh call — the bounded `commits/<sha>/check-runs` GET
+#      the #633 stale-run remediation reads — so the claim is scoped to the
+#      labels query, which is what this pin greps for. The pre-fix comment
+#      ("ZERO extra gh calls") stopped being true with #633; corrected here.
 run_record "daniel-ospina/agent-infra" 424315
 if grep -q "labels" "$LOG"; then
     bad "clean verdict adds no gh labels call"
@@ -2593,8 +2661,8 @@ done
 # `issues? remain` alone), so each must be pinned by a vector or a later edit can
 # drop its alternative with no red test — the false-pin failure 13g2's backslash
 # arm just suffered. Both forms of the test-review marker are pinned: the literal
-# un-substituted `N` template (skills/test-review/SKILL.md:433) and the
-# digit-substituted one.
+# un-substituted `N` template (`⚠️ Test review capped at 10 cycles — N issues remain:`
+# in skills/test-review/SKILL.md) and the digit-substituted one.
 rm -f "$(Q2 424766)"
 EV_REF="comment:42476601" run_record_ev 424766 \
     STUB_EVIDENCE_BODY="⚠️ Test review capped at 10 cycles — N issues remain:
@@ -2712,6 +2780,317 @@ printf 'set -u\nT=%q\nSUMMARY_PRINTED=1\n%s\n%s\nexit 3\n' \
     "$T/probe-tmp2" "$_TRAP_BLOCK" "$_TRAP_LINE" > "$T/probe-ok.sh"
 _probe_rc=0; bash "$T/probe-ok.sh" >/dev/null 2>&1 || _probe_rc=$?
 assert_eq "$_probe_rc" "3" "13o2 T17 positive control: a run that reached its summary passes its exit status through"
+
+# ══ §14 #633 stale gate-run remediation ═══════════════════════════════
+# Renumbered from the branch's §9: main owns §9 for the #980 argv guard.
+# A same-sha re-record used to be a silent no-op (marker already in the body →
+# no PATCH → no `edited` event → no fresh gate run), so the documented remedy
+# "re-run record-review.sh to retry" did nothing. These vectors pin the
+# rerun, its recency/livelock guards, the SIGNED-marker gate, the GET transport
+# of the check-runs read, and fail-soft on every failure stage.
+run_record_633() { # <pr> <sha> <check-runs-json> [extra record args…]
+    local pr="$1" sha="$2" cruns="$3"; shift 3
+    local rcfile="$T/rc633" errfile="$T/err633" cap="$T/cap633"
+    : > "$LOG"; : > "$cap"; rm -f "$errfile"
+    (
+        export HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG"
+        export STUB_BODY="${STUB_BODY:-PR body}"
+        export STUB_CAPTURE="$cap"
+        export STUB_EVIDENCE_PR="$pr" STUB_EVIDENCE_REPO="daniel-ospina/agent-infra"
+        export STUB_CHECK_RUNS="$cruns"
+        export STUB_CHECK_RUNS_FAIL="${STUB_CHECK_RUNS_FAIL:-0}"
+        export STUB_RERUN_FAIL="${STUB_RERUN_FAIL:-0}"
+        export STUB_PATCH_FAIL="${STUB_PATCH_FAIL:-0}"
+        # Review finding 3: an UNSIGNED marker (no key) must not fire the rerun.
+        # The runner passes the caller's gate key through so a vector can unset
+        # it (the suite exports a deterministic key at the top).
+        export AI_REVIEW_GATE_KEY="${AI_REVIEW_GATE_KEY-}"
+        # The check-name override is passed through for the same reason.
+        export AI_REVIEW_GATE_CHECK_NAME="${AI_REVIEW_GATE_CHECK_NAME-}"
+        [ -n "${STUB_HEAD_SHA:-}" ] && export STUB_HEAD_SHA
+        rc=0
+        bash "$RECORD" "$pr" "$sha" clean "daniel-ospina/agent-infra" "$@" $EV_ARGS 2>"$errfile" || rc=$?
+        printf '%s' "$rc" > "$rcfile"
+    ) 2>/dev/null || true
+    RECORD_RC="$(cat "$rcfile" 2>/dev/null || echo 99)"
+    RECORD_ERR="$(cat "$errfile" 2>/dev/null || true)"
+    RECORD_CAP633="$(cat "$cap" 2>/dev/null || true)"
+}
+
+# The "marker already present" state is PRODUCED, not hand-built: run once on a
+# marker-less body and hand the recorder's own posted body back. Hand-writing the
+# marker would drift from the diff=/sig= contract the script actually posts.
+seed_marker_body() { # <pr> → echoes the body the recorder posts (marker included)
+    local pr="$1" cap="$T/seedcap"
+    : > "$cap"
+    (
+        export HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$T/seedgh.log"
+        export STUB_BODY="seeded body" STUB_CAPTURE="$cap"
+        export STUB_EVIDENCE_PR="$pr" STUB_EVIDENCE_REPO="daniel-ospina/agent-infra"
+        export STUB_CHECK_RUNS="[]"
+        bash "$RECORD" "$pr" "$SHA" clean "daniel-ospina/agent-infra" $EV_ARGS >/dev/null 2>&1 || true
+    )
+    jq -r '.body' "$cap" 2>/dev/null
+}
+
+echo "── 14. #633 stale gate-run remediation ──────────────────────────"
+# 14.1 Re-record on an already-marker'd body: the body is left untouched (no
+#     PATCH — no body spam), but the completed-FAILURE gate job on the head MUST
+#     be re-run so the stale red rollup row is replaced by a fresh attempt.
+#     RED pre-fix: the idempotency guard made a same-sha re-record do nothing.
+SEED_BODY="$(seed_marker_body 424320)"
+if [ -n "$SEED_BODY" ]; then ok "14.0 the seed run posted a marker-bearing body (prerequisite)"; else bad "14.0 the seed run posted a marker-bearing body (prerequisite)"; fi
+STUB_BODY="$SEED_BODY" run_record_633 424320 "$SHA" \
+    '[{"name":"ai-review-gate","status":"completed","conclusion":"failure","id":777}]'
+if grep -qF -- "actions/jobs/777/rerun" "$LOG"; then
+    ok "14.1 re-record re-runs the stale FAILURE gate job (no more silent no-op)"
+else
+    bad "14.1 re-record re-runs the stale FAILURE gate job (log: $(cat "$LOG"))"
+fi
+if grep -qF -- "-X PATCH" "$LOG"; then
+    bad "14.1 re-record leaves the marker'd body untouched (no PATCH)"
+else
+    ok "14.1 re-record leaves the marker'd body untouched (no PATCH)"
+fi
+if grep -qF -- "commits/$SHA/check-runs" "$LOG"; then
+    ok "14.1 remediation queries the RECORDED head's check runs"
+else
+    bad "14.1 remediation queries the RECORDED head's check runs (log: $(cat "$LOG"))"
+fi
+# 14.1b THE TRANSPORT PIN: the check-runs read must be a GET. Real gh switches
+#     to POST the moment a -f/-F parameter is added, and this endpoint is
+#     GET-only, so `-f` without `-X GET` 404s — the exact defect this fix
+#     addresses (a dead rerun behind a false "gh/API failure" warning).
+if grep -E 'commits/.*/check-runs' "$LOG" | grep -q -- ' -f '; then
+    if grep -E 'commits/.*/check-runs' "$LOG" | grep -q -- '-X GET'; then
+        ok "14.1b the check-runs read is an explicit GET (transport)"
+    else
+        bad "14.1b the check-runs read adds -f with NO -X GET → real gh POSTs → 404 (log: $(cat "$LOG"))"
+    fi
+else
+    ok "14.1b the check-runs read carries its parameters in the query string (transport)"
+fi
+
+# 14.2 Fresh record (marker absent) with a stale FAILURE on the head: posts the
+#     marker AND re-runs the failed gate job in the same call.
+STUB_BODY="PR body" run_record_633 424321 "$SHA" \
+    '[{"name":"ai-review-gate","status":"completed","conclusion":"failure","id":778}]'
+grep -qF -- "-X PATCH" "$LOG" && ok "14.2 fresh record still posts the marker" || bad "14.2 fresh record posts the marker (log: $(cat "$LOG"))"
+grep -qF -- "actions/jobs/778/rerun" "$LOG" && ok "14.2 fresh record also re-runs the stale FAILURE job" || bad "14.2 fresh record re-runs the stale FAILURE job (log: $(cat "$LOG"))"
+
+# 14.3 Nothing failed on the head → no rerun (no needless Actions runs), marker
+#     still posted.
+STUB_BODY="PR body" run_record_633 424322 "$SHA" '[]'
+if grep -qF -- "actions/jobs/" "$LOG"; then
+    bad "14.3 no rerun when nothing failed (log: $(cat "$LOG"))"
+else
+    ok "14.3 no rerun when nothing failed"
+fi
+grep -qF -- "-X PATCH" "$LOG" && ok "14.3 marker still posted" || bad "14.3 marker still posted"
+
+# 14.4 A failed run of a DIFFERENT check name is never re-run (name filter) —
+#     and the zero-match case fires the loud rename hint: a wrong
+#     AI_REVIEW_GATE_CHECK_NAME must not read as "nothing to remediate".
+STUB_BODY="PR body" run_record_633 424323 "$SHA" \
+    '[{"name":"other-gate","status":"completed","conclusion":"failure","id":779}]'
+if grep -qF -- "actions/jobs/" "$LOG"; then
+    bad "14.4 foreign check name not re-run (log: $(cat "$LOG"))"
+else
+    ok "14.4 foreign check name not re-run"
+fi
+assert_contains "$RECORD_ERR" "no check run named 'ai-review-gate'" "14.4 zero-match fires the loud rename hint"
+
+# 14.5 Rerun API refusal → fail-soft: record saved, exit 0, loud warning.
+STUB_BODY="PR body" STUB_RERUN_FAIL=1 run_record_633 424324 "$SHA" \
+    '[{"name":"ai-review-gate","status":"completed","conclusion":"failure","id":780}]'
+[ "$RECORD_RC" = "0" ] && ok "14.5 rerun refusal fails soft (rc 0, record saved)" || bad "14.5 rerun refusal fails soft (rc=$RECORD_RC, err=$RECORD_ERR)"
+[ -f "$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424324.json" ] && ok "14.5 record written despite rerun refusal" || bad "14.5 record written despite rerun refusal"
+assert_contains "$RECORD_ERR" "could not re-run stale" "14.5 refusal warns on stderr"
+
+# 14.6 Recency guard: a newer SUCCESS for the gate name already satisfies the
+#     required check, so the older FAILURE must NOT trigger a rerun (no churn
+#     on every re-record of an already-green head).
+STUB_BODY="PR body" run_record_633 424325 "$SHA" \
+    '[{"name":"ai-review-gate","status":"completed","conclusion":"failure","id":100},{"name":"ai-review-gate","status":"completed","conclusion":"success","id":200}]'
+if grep -qF -- "actions/jobs/" "$LOG"; then
+    bad "14.6 newer SUCCESS suppresses the rerun (log: $(cat "$LOG"))"
+else
+    ok "14.6 newer SUCCESS suppresses the rerun"
+fi
+
+# 14.7 --force-stale is never remediated: a deliberately stale sha's gate state
+#     is unresolvable by design, and a rerun in the PR's per-PR concurrency
+#     group could cancel the REAL head's in-flight gate run. No check-runs
+#     query, no rerun — the record still saves.
+STALE_SHA="$(printf 'b%.0s' $(seq 1 40))"
+STUB_BODY="PR body" run_record_633 424326 "$STALE_SHA" \
+    '[{"name":"ai-review-gate","status":"completed","conclusion":"failure","id":300}]' --force-stale
+[ "$RECORD_RC" = "0" ] && ok "14.7 force-stale record still saves (rc 0)" || bad "14.7 force-stale record still saves (rc=$RECORD_RC)"
+if grep -qF -- "/check-runs" "$LOG" || grep -qF -- "actions/jobs/" "$LOG"; then
+    bad "14.7 force-stale skips the stale-run remediation (log: $(cat "$LOG"))"
+else
+    ok "14.7 force-stale skips the stale-run remediation"
+fi
+
+# 14.8 check-runs query failure (gh/API error): warns LOUDLY on stderr and skips
+#     the rerun — a transient API failure must never read as "no red run" (the
+#     #405 silent-no-op class, one level down). Record still saves, exit 0.
+STUB_BODY="PR body" STUB_CHECK_RUNS_FAIL=1 run_record_633 424327 "$SHA" \
+    '[{"name":"ai-review-gate","status":"completed","conclusion":"failure","id":400}]'
+[ "$RECORD_RC" = "0" ] && ok "14.8 check-runs query failure fails soft (rc 0)" || bad "14.8 check-runs query failure fails soft (rc=$RECORD_RC, err=$RECORD_ERR)"
+[ -f "$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424327.json" ] && ok "14.8 record written despite query failure" || bad "14.8 record written despite query failure"
+assert_contains "$RECORD_ERR" "could not read check runs" "14.8 query failure warns loudly on stderr"
+if grep -qF -- "actions/jobs/" "$LOG"; then
+    bad "14.8 no rerun on query failure (log: $(cat "$LOG"))"
+else
+    ok "14.8 no rerun on query failure"
+fi
+
+# 14.9 Livelock guard: when the NEWEST run for the gate name is queued/
+#     in_progress (a rerun the remediation fired, or the `edited` run a fresh
+#     PATCH just started), the OLDER completed red run is NOT re-run — a second
+#     job would cancel the in-flight fresh run via the PR's concurrency group.
+STUB_BODY="PR body" run_record_633 424328 "$SHA" \
+    '[{"name":"ai-review-gate","status":"completed","conclusion":"failure","id":100},{"name":"ai-review-gate","status":"in_progress","conclusion":null,"id":900}]'
+if grep -qF -- "actions/jobs/" "$LOG"; then
+    bad "14.9 in-flight gate run suppresses the rerun (log: $(cat "$LOG"))"
+else
+    ok "14.9 in-flight gate run suppresses the rerun"
+fi
+
+# 14.10 No SIGNED marker in the body (PATCH failure) → remediation MUST NOT fire:
+#      a rerun of a marker-less body re-evaluates to a guaranteed red. Record
+#      still saves (best-effort).
+STUB_BODY="PR body — no review evidence yet" STUB_PATCH_FAIL=1 run_record_633 424329 "$SHA" \
+    '[{"name":"ai-review-gate","status":"completed","conclusion":"failure","id":500}]'
+[ "$RECORD_RC" = "0" ] && ok "14.10 PATCH failure still saves the record (rc 0)" || bad "14.10 PATCH failure saves record (rc=$RECORD_RC, err=$RECORD_ERR)"
+[ -f "$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424329.json" ] && ok "14.10 record written despite PATCH failure" || bad "14.10 record written despite PATCH failure"
+assert_contains "$RECORD_ERR" "could not post review evidence" "14.10 PATCH failure notes on stderr"
+if grep -qF -- "actions/jobs/" "$LOG"; then
+    bad "14.10 no rerun without a posted marker (log: $(cat "$LOG"))"
+else
+    ok "14.10 no rerun without a posted marker"
+fi
+
+# 14.11 gh-200 whose payload fails the LOCAL jq stage (shape drift, broken jq):
+#      the parse failure warns loudly and skips — record saved, rc 0, no rerun.
+STUB_BODY="PR body" run_record_633 424330 "$SHA" '{"check_runs": [BROKEN'
+[ "$RECORD_RC" = "0" ] && ok "14.11 unparseable payload fails soft (rc 0)" || bad "14.11 unparseable payload fails soft (rc=$RECORD_RC, err=$RECORD_ERR)"
+[ -f "$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424330.json" ] && ok "14.11 record written despite parse failure" || bad "14.11 record written despite parse failure"
+assert_contains "$RECORD_ERR" "could not parse the check-runs payload" "14.11 parse failure warns loudly on stderr"
+if grep -qF -- "actions/jobs/" "$LOG"; then
+    bad "14.11 no rerun on parse failure (log: $(cat "$LOG"))"
+else
+    ok "14.11 no rerun on parse failure"
+fi
+
+# 14.12 THE STUB'S OWN FIDELITY (review finding 2). The stub must model the
+#       TRANSPORT, not just the URL: a /check-runs call carrying -f/-F without
+#       `-X GET` is a POST and real gh/GitHub 404s it. Without this the suite
+#       answers 200 to a request that cannot succeed in production and certifies
+#       a dead call (it did exactly that for the branch's original `-f` read).
+TLOG="$T/transport.log"; : > "$TLOG"
+if GH_STUB_LOG="$TLOG" STUB_CHECK_RUNS='[]' "$T/bin/gh" api "repos/x/y/commits/$SHA/check-runs" -f check_name=ai-review-gate -f per_page=100 >/dev/null 2>&1; then
+    bad "14.12 the stub 404s a parameterized check-runs call without -X GET (it did not — the suite would be blind again)"
+else
+    ok "14.12 the stub 404s a parameterized check-runs call without -X GET (transport modeled)"
+fi
+if GH_STUB_LOG="$TLOG" STUB_CHECK_RUNS='[]' "$T/bin/gh" api "repos/x/y/commits/$SHA/check-runs?check_name=ai-review-gate&per_page=100" >/dev/null 2>&1; then
+    ok "14.12b the stub serves the query-string form (the fix's transport)"
+else
+    bad "14.12b the stub serves the query-string form"
+fi
+if GH_STUB_LOG="$TLOG" STUB_CHECK_RUNS='[]' "$T/bin/gh" api "repos/x/y/commits/$SHA/check-runs" -X GET -f check_name=ai-review-gate >/dev/null 2>&1; then
+    ok "14.12c the stub serves the explicit -X GET form"
+else
+    bad "14.12c the stub serves the explicit -X GET form"
+fi
+# 14.12d the RECORDER's actual argv order (`-X GET` BEFORE the URL) must be a
+#       READ, not the stub's PATCH/rerun capture branch. That branch keyed on
+#       `$2 = -X` alone, so the check-runs read fell into it, consumed an empty
+#       stdin into STUB_CAPTURE, and BLANKED the recorded marker — every diff=
+#       assertion failed while the check-runs pins still passed. RED pre-fix:
+#       the call returns empty stdout (the capture branch prints nothing).
+TLOG="$T/transport.log"
+GOT_14_12D="$(GH_STUB_LOG="$TLOG" STUB_CHECK_RUNS='[{"name":"x"}]' "$T/bin/gh" api -X GET "repos/x/y/commits/$SHA/check-runs" -f check_name=x -f per_page=100 </dev/null 2>/dev/null)"
+assert_contains "$GOT_14_12D" '"check_runs"' "14.12d the stub treats the recorder's -X GET (before the URL) as a READ"
+
+# 14.13 THE SIGNED-MARKER GATE (review finding 3). With NO gate key the recorder
+#       posts an UNSIGNED marker, which the gate is guaranteed to reject — so a
+#       rerun against it is pure churn. The predicate must therefore key on the
+#       SIGNED form (sig=…), not on the marker text. RED pre-fix: MARKER_PRESENT
+#       was set from a text-only grep, so the unsigned body re-ran the job.
+UNSIGNED_BODY="$(printf '%s' "$SEED_BODY" | sed 's/ sig=[0-9a-f]\{64\}$//')"
+if [ "$UNSIGNED_BODY" != "$SEED_BODY" ] && ! grep -q ' sig=' <<<"$UNSIGNED_BODY"; then
+    ok "14.13 the unsigned-marker fixture dropped the signature (prerequisite)"
+else
+    bad "14.13 the unsigned-marker fixture dropped the signature (prerequisite)"
+fi
+STUB_BODY="$UNSIGNED_BODY" AI_REVIEW_GATE_KEY="" run_record_633 424331 "$SHA" \
+    '[{"name":"ai-review-gate","status":"completed","conclusion":"failure","id":601}]'
+assert_contains "$RECORD_ERR" "AI_REVIEW_GATE_KEY not configured" "14.13 an unkeyed run posts an unsigned marker (prerequisite)"
+if grep -qF -- "actions/jobs/601/rerun" "$LOG"; then
+    bad "14.13 an UNSIGNED marker does not fire the rerun (guaranteed-red churn) (log: $(cat "$LOG"))"
+else
+    ok "14.13 an UNSIGNED marker does not fire the rerun (guaranteed-red churn)"
+fi
+
+# 14.14 THE ALLOW-LIST POLARITY (review finding 1). The repo mandate (AGENTS.md
+#       §"Reading verification state" step 4, implemented by target_head_red in
+#       this same file) is: only success/neutral/skipped are green and
+#       cancelled/stale are non-red; EVERY OTHER conclusion is RED — including
+#       one GitHub has not documented and a null one. A CLOSED red-list
+#       (failure/cancelled/timed_out/action_required) read an unrecognised or
+#       null conclusion as "not red AND not suspicious": no rerun and no
+#       warning — the silent no-op #633 exists to close. RED pre-fix: `notice`
+#       and `null` both left NEWEST_RED_ID empty with nothing on stderr.
+STUB_BODY="PR body" run_record_633 424332 "$SHA" \
+    '[{"name":"ai-review-gate","status":"completed","conclusion":"notice","id":610}]'
+if grep -qF -- "actions/jobs/610/rerun" "$LOG"; then
+    ok "14.14 an UNDOCUMENTED conclusion (notice) is RED and re-runs the job"
+else
+    bad "14.14 an undocumented conclusion was silently treated as non-red (log: $(cat "$LOG"); err=$RECORD_ERR)"
+fi
+# 14.14b a NULL conclusion on a completed run is RED too (the #1353 fail-open,
+#       one level down) — and must warn/remediate, never read as nothing-to-do.
+STUB_BODY="PR body" run_record_633 424333 "$SHA" \
+    '[{"name":"ai-review-gate","status":"completed","conclusion":null,"id":611}]'
+grep -qF -- "actions/jobs/611/rerun" "$LOG" && ok "14.14b a NULL conclusion on the newest completed run is RED" || bad "14.14b a null conclusion was silently treated as non-red (log: $(cat "$LOG"))"
+# 14.14c the named NON-RED conclusions stay non-red — no churn. `cancelled` is
+#        non-red per the repo rule (the pre-fix closed list had it RED).
+STUB_BODY="PR body" run_record_633 424334 "$SHA" \
+    '[{"name":"ai-review-gate","status":"completed","conclusion":"cancelled","id":612}]'
+if grep -qF -- "actions/jobs/" "$LOG"; then
+    bad "14.14c cancelled is non-red — no rerun (log: $(cat "$LOG"))"
+else
+    ok "14.14c cancelled is non-red — no rerun"
+fi
+# 14.14d an unrecognised STATUS with a NULL conclusion is RED (in-flight is the
+#        named set only) — the same decision target_head_red makes.
+STUB_BODY="PR body" run_record_633 424335 "$SHA" \
+    '[{"name":"ai-review-gate","status":"something_new","conclusion":null,"id":613}]'
+grep -qF -- "actions/jobs/613/rerun" "$LOG" && ok "14.14d an unknown status with a NULL conclusion is RED" || bad "14.14d an unknown status read as pending/non-red (log: $(cat "$LOG"))"
+
+# 14.15 THE CHECK-NAME OVERRIDE (review finding 2). A check-run NAME is an
+#       arbitrary string; interior whitespace is MEANINGFUL and must survive the
+#       override read. `tr -d '[:space:]'` (copied from the HMAC-key read)
+#       deleted it, so the documented AI_REVIEW_GATE_CHECK_NAME override silently
+#       mismatched any renamed check containing a space (`python-ci / test` is a
+#       real name on this fleet): server filter matched nothing, local name
+#       filter matched nothing, remediation never fired. RED pre-fix: GATE_CHECK
+#       became `python-ci/test`. Only leading/trailing padding is still trimmed.
+STUB_BODY="PR body" AI_REVIEW_GATE_CHECK_NAME="  python-ci / test  " run_record_633 424336 "$SHA" \
+    '[{"name":"python-ci / test","status":"completed","conclusion":"failure","id":614}]'
+if grep -qF -- "actions/jobs/614/rerun" "$LOG"; then
+    ok "14.15 an override with interior whitespace is preserved and re-runs the job"
+else
+    bad "14.15 interior whitespace in AI_REVIEW_GATE_CHECK_NAME was mangled (log: $(cat "$LOG"); err=$RECORD_ERR)"
+fi
+if grep -qF -- "check_name=python-ci / test" "$LOG"; then
+    ok "14.15 padding trimmed, interior whitespace intact in the query"
+else
+    bad "14.15 check-name normalization mangled the name (log: $(cat "$LOG"))"
+fi
 
 
 echo ""

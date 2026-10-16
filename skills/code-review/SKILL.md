@@ -277,9 +277,9 @@ test-review <test-file> --surface-map "<extract from plan doc>" [--journey-map "
 
 `test-review` handles the full cycle:
 - **Phase 0 — Research Intake:** Researches testing patterns for the surfaces under test
-- **Phase 1 — Review:** 4 parallel fresh sub-agents (correctness, coverage+surface, journey-alignment, test-quality)
+- **Phase 1 — Review:** 2 merged fresh sub-agents (A correctness + discriminating power; B coverage/surface/journey), plus C (e2e + reproducibility) when e2e surfaces are touched
 - **Phase 2-4 — Fix + Re-review Loop:** Surgical fixes, fresh re-review, to test-review's own convergence rule (fingerprint-stall; 10-cycle safety cap — see test-review §Phase 4)
-- **Exit:** Clean (all reviewers return NO ISSUES FOUND) or capped with documented remaining issues
+- **Exit:** Clean (Reviewer A's combined verdict is `REVIEWER A VERDICT: CLEAN` — both its ordered passes clean — Reviewer B's combined verdict is `REVIEWER B VERDICT: CLEAN` — every part it ran clean — and Reviewer C, when dispatched, returns `NO ISSUES FOUND`) or capped with documented remaining issues
 
 **If `test-review` returns capped:** flag the remaining issues as P1 with `check_type: test-quality-gap`. Include them in the review output.
 
@@ -431,6 +431,117 @@ The overlap signal feeds commit-workflow merge condition 5 (`04-merge-deploy.md`
 is detected, the merge step refreshes the branch against main and re-runs the affected regression
 tests before merging — the safety net for cross-PR breakage without blocking on the signal itself.
 
+
+### Step 0.10 — Process-Weight Check (advisory by default; P1 only on the two A-category triggers)
+
+Run this when the diff **ADDS MACHINERY** rather than changing behaviour: a new guard/checker
+script, a new test file, a new assertion family, a new config surface, or a new CI job. It answers
+ONE question — **is this the least machinery that makes the behaviour genuinely trustworthy, or is
+it accumulation?**
+
+This is **not** an anti-test step. "This adds too many tests" is NOT a valid finding: a test that
+proves a behaviour is product work. The judgement is about machinery *around* behaviour.
+
+**The canonical owner of the admission question is `AGENTS.md` §Product Over Process (hard rule),
+implemented as Gate 0 in `skills/issue-workflow/SKILL.md`.** Those two decide the CATEGORY (A/B),
+and therefore what may block a merge; this step decides only the MEASUREMENT — what the machinery
+costs, what it duplicates, and whether a cheaper seam already owns the invariant. When they
+disagree, the A/B rule wins. This step does not create a second severity taxonomy.
+
+**Measure first — raw size is the wrong number.** This repo is prose-heavy, so a 1,300-line file
+can be ~690 code lines and 629 comment/docstring lines. Count non-blank lines that are neither
+comments nor docstrings, then take three measurements:
+
+1. **Code size** — code lines added, and what family it joins (an existing guard's code lines).
+2. **CI cost** — is the new test registered in the repo's own **test-shard/surface registry**, and
+   what is its *measured* duration? The registry is repo-specific **and per test kind**, so name
+   the one you read: tortoise — `config/ci-surfaces.yml`; agent-infra — `scripts/run-bash-shards.sh`
+   for `.sh` shards (its list IS the shard surface; pinned by `scripts/check-ci-lane-parity.sh`),
+   and `.github/workflows/ci.yml` for the rest — the `test` job's concrete `.py` target list, the
+   `verify` job's `npx tsx <.test.ts>` registrations. A `.py`/`.test.ts` file is **not** in the
+   shard list, so a no-match there says nothing about whether it is registered. If the repo has
+   none (eldato, premise-labs), **say so and drop this measurement — never read "no output" as
+   "not registered".**
+   `rg -n "<new_test_file>" <the repo's registry>`
+3. **Duplication** — does machinery ALREADY own this invariant? Search the repo's own
+   guard/assertion trees and **name the trees you searched**: agent-infra — `scripts/`,
+   `extensions/`, `tests/`; tortoise — `tools/`, `.github/scripts/`. A path that does not exist
+   makes `rg` exit 2 and print nothing — that is an **unavailable search, not "no duplicate"**.
+   `rg -l "<the invariant's key symbol>" <the repo's guard trees> | sort`
+   Then check whether the new file even *names* what it overlaps. Zero mentions is a finding.
+
+**The two P1 triggers — only these block** (both are category **A** under `AGENTS.md` §Product Over
+Process: each can produce a false PASS or a bypass):
+
+1. **A DUPLICATE OWNER exists.** Another guard/checker already asserts the same invariant,
+   especially when the new one does not name it. Cite the existing file **and its clause id**.
+   If you cannot name both, it is not a duplicate.
+2. **An anti-accumulation clause already fires.** RUN the existing guards this diff touches and
+   report their exit codes verbatim. If one goes red *because of the new machinery* — not because
+   of a missing re-cut — that clause IS this project's recorded decision not to accumulate, and
+   the diff is re-litigating a decision. Report it as such.
+
+**The one advisory trigger — reported, never blocking.** Added CI wall-clock is **friction**, which
+`AGENTS.md` §Product Over Process classifies as category **B** (*"Fail-closed / over-block —
+something right is refused"*), and *"a B item … is still only a note — never routed, never
+planned"*, so it can never hold a merge:
+
+3. **It lands on the binding constraint.** The machinery adds wall-clock to the critical CI path
+   (a shard's `max`, or a gate every merge waits on). **Report** the measured delta, and compare it
+   to the repo's CI-duration *guideline* if it declares one — this repo does not gate on one: owner
+   ruling **#6792** demoted `GUIDELINE_CI_MIN` out of the verdict precisely because *"a slow suite
+   is a reason to improve the suite, not a verdict"* (`scripts/objective.py`). Emit it as
+   `severity: P2, advisory: true` — the shape Step 0.9 gives `cross-pr-overlap`. CI cost is a real
+   cost, and the author decides.
+
+> **OVERRIDES:** the common practice of gating a merge on CI wall-clock — a CI-duration figure is
+> context, never a verdict (owner ruling #6792, 2026-09-30; `AGENTS.md` §Product Over Process: an
+> over-block of a correct change is category B).
+
+**Otherwise: advisory only.** Report the ratio and the measurements; the author decides. Never
+block on a lopsided ratio by itself.
+
+**What a GOOD finding cites (all three):**
+- The failure it prevents, **pointing at it having happened** (incident, red run, lost merge).
+  If there is no such failure, say so — that is a removal candidate, not a bug.
+- Whether deleting it tomorrow would harm the **product** or only the **process**.
+- The concrete overlap / complexity / CI number.
+
+**What a BAD finding looks like — do not write these:**
+- "This PR adds 2,000 lines of tests." (size alone is not a finding)
+- "We should not add more guards." (a stance, not an argument)
+- "CI is slow, so skip the test." Removed verification that prevents a real observed failure is
+  not simplification — it is removing a guard rail.
+
+**A lopsided ratio is a SMELL pointing at a missing seam, not a verdict.** When you report one,
+name the seam that would make the behaviour trustworthy **by construction** — a single authoritative
+source, a generated mirror, or a shared helper beats a second checker re-deriving the same
+invariant. That seam is usually the real fix; the second checker is the symptom.
+
+**Output when triggered:**
+
+```
+ISSUE:
+  check_type: process-weight
+  severity: P1   # only for the two A-category triggers; otherwise P2, advisory: true
+  location: <the file/clause the finding is about — the duplicate owner, or the new file>
+  description: <the duplicate owner, or the firing clause, or the measured CI delta>
+  measurement: code_lines=<n> (of total=<n>); ci_surface=<name> measured=<s>s; overlap=<file + clause id>
+  suggestion: <the seam — or "fold into <existing file> and delete <new file>">
+```
+
+**Worked example (the case this step was written from, 2026-10-04).** A PR adding a
+"required-set sync" guard (+3,484/-8) measured: **1,886 code lines** added to an existing guard
+family of **2,619** (+72%, i.e. near-doubling a heavy family); `test_required_set_sync.py`
+measured **19.0s** on the `core` surface; and it **overlapped an existing owner** —
+`tools/mergify_config_guard.py`, whose `_settings_contexts()` already read `.github/settings.yml`
+branch-protection, i.e. the exact surface the new guard's docstring claimed "nothing read". It named
+that file **zero** times. Running the existing guard on the merged tree returned
+`STATIC RESULT: DIVERGED (exit 1)` — clause (viii)/I11, whose stated purpose is *"Any OTHER reader
+[of the declaration home] is the bug I11 exists to catch"* — and that command runs in
+`python-ci.yml`, so the tree was RED. Note the shape of the correct conclusion: the guard's
+**purpose passed the test** (a real recorded incident — a prior surface split silently dropped nine
+checks), and the finding was about **duplication and size**, not about the guard being unnecessary.
 
 ### Step 1 — Eligibility Check
 

@@ -266,7 +266,8 @@ property; this guard is the pattern to copy, not a substitute for it.
     (the reviewed value — asserted independently, see the `#1227` note below) +
     a geometry check that `300000 − reserveTokens` equals the fleet regime floor
     the instruments band on (READ from `scripts/fleet-cost-report.sh` and
-    `scripts/watch-truncation.sh`, never restated in the guard), **anchored** on
+    `scripts/watch-truncation.sh` via each instrument's `--print-regime-floor`,
+    never restated in the guard), **anchored** on
     every deepseek-served `contextWindow` EQUALLING `300000`: the models check
     above is only an upper bound (`≤ CLAMP`), so without that anchor a window
     *below* the ceiling left the real trigger at `window − reserve` while the
@@ -312,18 +313,30 @@ property; this guard is the pattern to copy, not a substitute for it.
     preserves the 283616 trigger while inflating the summarization cap to
     `0.8 × 716384` — the reserve-inflation workaround the recorded owner
     directive on #1227 forbids.
-  - **Fleet regime floor unreadable, ambiguous, or inconsistent → BLOCK
-    (exit 2)**: if the guard cannot read exactly one floor value from EACH of
-    `scripts/fleet-cost-report.sh` and `scripts/watch-truncation.sh`, or the two
-    disagree, it refuses rather than picks — and it also refuses when the
-    watcher's band is empty or inverted (`floor >= ceiling`), which would certify
-    a floor no record can reach. A bare source-order pick would let a second
-    statement the label anchor also matches (a re-labelled band, a duplicated
-    boundary) read as an instrument disagreement, which points the reader at the
-    wrong root cause; an *unlabelled* `if N <= tb <` line cannot match the
-    label-anchored pattern at all. The numeric capture is bounded to 15 digits,
-    so an unrepresentable literal cannot slip past the coherence comparison as
-    a bash integer-comparison error. The **same exit-2 class** covers a
+  - **Fleet regime floor unreadable by execution, or inconsistent → BLOCK
+    (exit 2)** (#1342): the guard asks EACH instrument for its floor by
+    executing `<instrument> --print-regime-floor` (with `FLEET_REGIME_TB`
+    unset), mirroring `patch-pi-retry.sh --cap`; a non-zero exit, an empty
+    answer, a non-integer answer, or a digit literal too long for bash's int64
+    arithmetic (`-ge` on such a value errors, which an `if` reads as a coherent
+    band) is fail-closed, and the two floors must agree. The unset is what makes
+    this leg certify the **committed default**, deliberately blind to the
+    operator's ambient `FLEET_REGIME_TB`: the guard must not be moved off the
+    committed floor by the environment it runs in. It does **not** constrain a
+    report the weekly driver runs **with** the override — that run still bands at
+    the override while the guard certifies the committed default; because the
+    override is a documented "tests + tuning" seam, that divergence is by design
+    rather than a false PASS this leg prevents. (Without the unset the guard
+    would instead read the ambient value, disagree with the watcher, and
+    false-BLOCK.) The watcher's owner-facing bucket LABEL is not an anchor — a
+    correct relabel no longer blocks the pre-committed rollback. The watcher OWNS
+    its band and refuses to print a floor when the band is empty or inverted
+    (`floor >= ceiling`), when a band constant is not a plain integer or is
+    outside the representable range, or when the 1M-drift floor lies strictly
+    inside the current bucket (`floor < drift < ceiling`, which would attribute
+    records at/above the drift floor to the current clamp regime) — any of which
+    would certify a floor no record can reach or mis-triage the records it can.
+    The **same exit-2 class** covers a
     `models.json` in which no deepseek-served entry is recognised — a geometry
     anchor with nothing to assert must not read green. This class is **not**
     covered by `COST_CLAMP_OVERRIDE=1`.
@@ -377,17 +390,17 @@ property; this guard is the pattern to copy, not a substitute for it.
   (#1316).** Since the guard asserts both `CLAMP − reserveTokens ==` the floor
   the two instruments band on **and** `reserveTokens ==` the reviewed 16384,
   a 1M revert updates, in one commit: `contextWindow` in `models.json`, the
-  guard's `CLAMP`, and the floor literal in **both** instruments —
+  guard's `CLAMP`, and the floor in **both** instruments —
   `scripts/fleet-cost-report.sh` (`FLEET_REGIME_TB:-<n>`) and
-  `scripts/watch-truncation.sh`'s clamp-bucket boundary. `settings.json`'s
+  `scripts/watch-truncation.sh`'s `REGIME_TB_FLOOR` band constant (with its
+  `REGIME_TB_ERA_CEIL` bound). `settings.json`'s
   `reserveTokens` **stays at the reviewed 16384**: the 1M geometry only needs
   the window, the guard clamp, and the two floors to move, and moving the
   reserve is exactly the inflation the `#1227` directive forbids. If the
   reserve ever legitimately moves, the guard's `REVIEWED_RESERVE` must be
-  updated in the same commit. The guard's `"300K-clamp"` label anchor must
-  also move with the bucket label (or stay if the label stays) — an unlabelled
-  or re-labelled bucket makes the floor unreadable and the guard refuses
-  (exit 2). Flipping only `CLAMP` trips a **settings-class** block that
+  updated in the same commit. The guard reads both floors by execution
+  (#1342), so the watcher's bucket LABEL is display text and needs no
+  coordination with the guard. Flipping only `CLAMP` trips a **settings-class** block that
   `COST_CLAMP_OVERRIDE=1` does **not** silence — it covers the `models.json`
   clamp block only — so the guard must be green *before* the revert commit.
   `watch-truncation.sh`'s printed procedure states the same list.

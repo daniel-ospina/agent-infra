@@ -150,6 +150,8 @@ If new information mid-research reveals misclassification: restart from domain d
 | **Chaotic × Any** | 0 | 0 | Post-action review | Skip | Skip |
 | **Disorder × Any** | 1–2 landscape | Decompose→probes | Per-domain | Skip until resolved | Skip until resolved |
 
+**Rate-limit bound on parallel probes/queries.** Where a probe set or landscape sweep is executed as **concurrent external search calls** (rather than as analysis), it inherits the `research` skill's Step 3 concurrency rule: rung 1 carries up to 5 queries in one call (a longer set is split into further ≤5-query calls, still **at most 2 in flight**); rung 2 (`web_search`) runs **at most 2 concurrently** and retries a 429 serially, with the `attempted / returned` counts reported. The word *parallel* in this table is a design property of the probe set — never a licence to fan out search calls past that bound (agent-infra#1779).
+
 ### Verification Definitions
 
 | Term | Definition |
@@ -200,7 +202,7 @@ Snowden's core insight: *"We don't see things we don't expect to see."* A single
 
 For Complex × Standard+ tasks:
 
-1. **Dispatch 2–3 independent research sub-agents** to assess the same problem from different lenses (user-centric, systems-centric, outlier-seeking).
+1. **Dispatch 2–3 independent research sub-agents** to assess the same problem from different lenses (user-centric, systems-centric, outlier-seeking). **Each obeys the `research` skill's Step 3 concurrency bound** — the group shares ONE aggregate budget of **at most 2 concurrent external search calls** (stagger them, or run sequentially), never 2 per agent, or the fan-out re-creates the measured 429 partial batch at the group level. Carry `attempted / returned` counts so a truncated batch cannot read as a complete evidence set (agent-infra#1779).
 2. **Each researches independently** — no cross-talk. Each produces its own findings.
 3. **Map agreements and disagreements.** Where all agree → high-confidence. Where they diverge → that's where the interesting information lives.
 4. **Treat outliers as signal.** The agent that sees something the others don't is not wrong — it has a perspective the others lack.
@@ -288,6 +290,7 @@ Protocol compliance self-audit:
 ☐ Domain classified before research (with rationale)
 ☐ Domain classification challenged (Standard+)
 ☐ Query budget respected per Tier-Domain table
+☐ Query counts stated (`attempted / returned`) — a partial batch is reported, never hidden
 ☐ Adversarial queries included (per task-type modifier)
 ☐ Theory-first query run (Complex / Complicated×Complex)
 ☐ Distributed sensing run (Complex × Standard+)
