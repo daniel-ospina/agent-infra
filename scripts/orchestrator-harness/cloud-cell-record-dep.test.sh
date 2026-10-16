@@ -122,19 +122,25 @@ mkdir -p "$CELL_REPO/tools"; printf '#!/usr/bin/env python3\n' > "$CELL_REPO/too
 # no network and no reference to the operator's checkout. HARNESS_REPO is a fixture path (set in
 # cell_check/cell_start) precisely so no probe can reach the real one.
 git -C "$CELL_REPO" init -q
-# ⛔ `commit.gpgsign=false` is not decoration: a host with `commit.gpgsign = true` in its global
-# config makes this commit die (`gpg failed to sign the data`), the `update-ref` below then fails
-# (`HEAD: not a valid SHA1`), `classify_harness` reads `unknown`, and EVERY `cell_check` is refused —
-# the whole suite reddens on a dev box while staying green on CI, the mirror of the #1348/#1369
-# runner-only class this fixture exists to close. Measured: 78 passed / 17 failed under a
-# `gpgsign = true` global config before this line. Every other fixture in this repo
-# (`ai_init_repo`/`make_ai_repo`, selftest's `$HFIX`) sets it for the same reason.
-git -C "$CELL_REPO" -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q --allow-empty -m base
+# ⛔ HOST-CONFIG-PROOF, not `-c commit.gpgsign=false` alone. A global `commit.gpgsign = true` **or** a
+# global `core.hooksPath` pointing at a hook that fails (or any `init.templateDir` injecting one) makes
+# these commits die, the `update-ref` below then fails (`HEAD: not a valid SHA1`), `classify_harness`
+# reads `unknown`, and EVERY `cell_check` is refused — the whole suite reddens on a dev box while
+# staying green on CI, the mirror of the #1348/#1369 runner-only class this fixture exists to close.
+# Measured on this fixture: 78 passed / 17 failed under a `gpgsign = true` global config AND under a
+# `core.hooksPath` global config, 95/0 after. Neutralising the HOST config (rather than one key at a
+# time) closes the class; the fixture's identity travels in `-c`, so nothing else is lost.
+env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+  git -C "$CELL_REPO" -c user.email=t@t -c user.name=t commit -q --allow-empty -m base
 cp "$HERE"/*.sh "$CELL_HARNESS/"
-git -C "$CELL_HARNESS" init -q
-git -C "$CELL_HARNESS" add -A
-git -C "$CELL_HARNESS" -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q -m "fixture harness"
-git -C "$CELL_HARNESS" update-ref refs/remotes/origin/main HEAD
+env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+  git -C "$CELL_HARNESS" init -q
+env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+  git -C "$CELL_HARNESS" add -A
+env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+  git -C "$CELL_HARNESS" -c user.email=t@t -c user.name=t commit -q -m "fixture harness"
+env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+  git -C "$CELL_HARNESS" update-ref refs/remotes/origin/main HEAD
 # `cmd_check` asserts the workers are in $O; production gets them from `start`'s seed of $HARNESS.
 cp "$HERE"/*.sh "$CELL_O/"
 mkstubs "$CELL_STUBS"

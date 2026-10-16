@@ -232,9 +232,11 @@ table is *not* a refusal by name: a missing `AI_REVIEW_GATE_KEY` is a **warning*
 still runs a controller and is still a **MERGE ACTOR** (`gh pr merge --auto` does not go through the
 key; see the ⛔ measured note at the top of `cloud-cell-supervisor.sh`), it just cannot complete a
 *signed* merge in a gate-mode repo. The `.worktrees/` gitignore is not probed at all, and
-`tools/collision_preflight.py` is not probed *by name* — but the #1736 dispatch-provisioning probe
-(`refresh-candidates.sh --check`) refuses a repo that resolves no copy of it, so `check` does refuse
-that cell in effect.
+`tools/collision_preflight.py` is not a dependency `check` refuses on: the only by-name read is
+`repo_vendors_tool()`, which uses it solely to decide whether an operator's `TORTOISE_REPO` is
+relevant. The refusal comes from the #1736 dispatch-provisioning probe
+(`refresh-candidates.sh --check`), which refuses a repo that resolves no copy of it — so `check` does
+refuse that cell in effect.
 Its verdict is the literal line `CELL CAN RUN A CONTROLLER`, so a dependency that is absent must
 fail *there* — a cell that is blessed and then discovers the gap mid-review pays for the discovery:
 `git`, `python3`, `pi` and `~/.pi/agent/scripts/record-review.sh` are fatal, `uv` warns (as it does
