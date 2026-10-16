@@ -23,5 +23,13 @@ rc=$?
 # HERE, in the log the operator reads for this chain — the reviewer's own line is inside
 # merge-$PR.log, and on a box with no controller running nothing else would ever re-dispatch it.
 echo "[chain $N] merge-one rc=$rc $(date)" >> "$LOG"
-[ "$rc" = "75" ] && echo "[chain $N] reviewer NOT started (load gate) — re-run this chain (or let the controller re-dispatch it) when 1-min load is below MAX_LOAD" >> "$LOG"
+if [ "$rc" = "75" ]; then
+  echo "[chain $N] reviewer NOT started (load gate) — re-run this chain (or let the controller re-dispatch it) when 1-min load is below MAX_LOAD" >> "$LOG"
+fi
 echo "[chain $N] done $(date)" >> "$LOG"
+# ⛔ EXIT WITH merge-one.sh's STATUS (#1720 review). This script used to end on the `echo …done…`
+# above, so `$?` was the STATUS OF `echo` — always 0. Every caller that tests the chain
+# (`chain-merge.sh … && next`) therefore took the SUCCESS branch on a refused reviewer (75), a
+# crashed chain (1) and a successful chain alike, and the log said the opposite of the code. Same
+# defect fixed in adopt-fix.sh; this script's trailing reporting `echo` is what got it wrong here.
+exit "$rc"

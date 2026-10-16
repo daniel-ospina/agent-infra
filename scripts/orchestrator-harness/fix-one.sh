@@ -192,7 +192,10 @@ if [ "$AGENT_STARTED" = "0" ]; then
     CF="$O/state/fixcount-$PR"
     if [ -f "$CF" ]; then
       NF="$(cat "$CF" 2>/dev/null || echo 0)"
-      case "$NF" in ''|*[!0-9]*) NF=0 ;; esac
+      # `is_num`, not a hand-rolled `case`: the predicate is already in scope (spawn-gate.sh defines
+      # it, and this script uses it for its own tunables), and a second, weaker copy is exactly how
+      # `08` grew an octal read in the first place.
+      is_num "$NF" || NF=0
       if [ "$NF" -gt 0 ]; then
         echo $((NF - 1)) > "$CF"
         echo "[fix $PR] load refusal is not an attempt — fixcount refunded $NF -> $((NF - 1))" >> "$L.log"

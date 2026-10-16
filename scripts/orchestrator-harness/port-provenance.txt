@@ -54,15 +54,48 @@
 #                            refused fixer REFUNDS the attempt the controller booked (or three
 #                            refusals park a PR no fixer ever touched).
 #   adopt-fix.sh chain-merge.sh  #8521 — propagate / name the refusal code.
-#   Tests: spawn-gate.test.sh — 27 checks, of which 25 go RED on the pre-port tree (recorded).
-#   Two deliberate DEPARTURES from the tortoise original, both named in-file: the helper is sourced
-#   AFTER the caller's PATH export (tortoise sources it before, which pins _NCPU=4 / MAX_LOAD=40 at
-#   source time on every cell — #1702), and run_agent() keeps agent-infra's #1709 wall-time telemetry
-#   (`elapsed=`, walltime.tsv) which the tortoise copy never had.
+#   Tests: spawn-gate.test.sh — 42 checks, 40 of which go RED on the pre-port tree (measured; the 2
+#   survivors are the port-independent POSITIVE CONTROL and the CI-wiring equality).
+#   FOUR deliberate DEPARTURES from the tortoise original, all named in-file:
+#     D1 the helper is sourced AFTER the caller's PATH export (tortoise sources it before, which pins
+#        _NCPU=4 / MAX_LOAD=40 at source time on every cell — #1702).
+#     D2 run_agent() keeps agent-infra's #1709 wall-time telemetry (`elapsed=`, walltime.tsv) which
+#        the tortoise copy never had — so this is a MERGE, not a copy.
+#     D3 the ceiling coercion is HARDENED past the tortoise original, which carries only
+#        `is_num _NCPU || _NCPU=4` and `is_num MAX_LOAD || MAX_LOAD=$(( _NCPU * 10 ))`. That pair has
+#        two live defects this port does not inherit: a 0-valued core probe yields MAX_LOAD=0, and
+#        `[ "$l" -lt 0 ]` is ALWAYS FALSE — the gate closes FOREVER and the box dispatches nothing;
+#        and a 19-digit MAX_LOAD (or a 19-digit hw.ncpu) passes is_num, ERRORS every `[ -lt ]` — and
+#        an errored test is false, so the gate OPENS. Added: the `[ _NCPU -ge 1 ] || _NCPU=4` guard
+#        (orch-loop.sh/install.sh carry it), `10#` base-10 so leading zeros are not read as octal,
+#        and `is_limit` (is_num AND at most 9 digits) with a LITERAL-40 final fallback — a magnitude
+#        guard that re-derives from the same _NCPU is a no-op in the case it exists for. fix-one.sh's
+#        refund also uses the imported is_num rather than a second, weaker inline `case`.
+#     D4 `chain-merge.sh` ends with `exit "$rc"`, which the tortoise original does NOT have — its
+#        last command is a reporting `echo`, so `$?` is echo's 0 on a refused reviewer (75) and on a
+#        crashed chain (1) alike. The port ADDS the exit; adopt-fix.sh already had it.
 #
 # ── DROPPED: canonical is already ahead ─────────────────────────────────────────────────────────
 #   #8518 allow-list polarity — canonical has it byte-equivalent at orch-loop.sh:770-832 and
 #   fix-one.sh:148-160, so ef59f6d6f's classifier hunk is DROP-SUPERSEDED.
+#
+# ── NOTED, NOT FIXED: this port's own blast radius, and two pre-existing defects ───────────────
+#   scripts/cloud-cell-supervisor.sh:251 — `cmd_check`'s required-worker manifest does not list
+#     spawn-gate.sh, which lane.sh/fix-one.sh now HARD-REQUIRE (they `exit 78` without it). So a
+#     stale/empty $O passes `check` and then every lane and fixer refuses to run: the checker reports
+#     "CELL CAN RUN A CONTROLLER" over a cell that cannot. CATEGORY A (a false PASS) and caused by
+#     THIS change, but the file is held by PR #1769/#1730 — FILED as a follow-up issue rather than
+#     fixed here. install.sh's DRIFTED list is the other half of the same gap (also held).
+#   selftest.sh:866 — the "ONE PREDICATE, EVERY SHIPPED COPY — AND NO LENIENT FIFTH" guard enumerates
+#     the is_num copies and asserts a count; spawn-gate.sh is a new copy it does not enumerate, so
+#     the guard now undercounts silently (it still passes). Needs the new file added to its list.
+#     Held by #1769/#1730.
+#   The watchdog subshell in every run_agent() copy (`( sleep $t; kill … ) &` then `kill $w`) ORPHANS
+#     its `sleep` on the success path — up to 40 minutes of a parked process per agent run, in all
+#     FOUR copies (three here, one being ported from tortoise). PRE-EXISTING and NOT introduced by
+#     this port; the correct fix is a mechanism change to the wall-limit contract (kill the process
+#     group, or track and kill the sleep's own pid), which is its own review. NOTE, not filed: the
+#     honest consequence is a few idle processes, which does not clear category-B admission.
 #
 # ⛔ ── NOT YET PORTED — BLOCKED BY CONCURRENT LANES, not by judgement ───────────────────────────
 # `merge-one.sh`, `orch-loop.sh`, `install.sh`, `README.md`, `selftest.sh` and
@@ -89,9 +122,14 @@
 #   selftest.sh   §15 extracts run_agent() from merge-one.sh. Once that port lands it must be
 #                 repointed at spawn-gate.sh, or the wall-limit check silently stops covering the
 #                 shipped helper while still reporting green.
+# ⛔ ── NOT DONE, AND NOT BLOCKED: no lane holds these files ────────────────────────────────────
 #   refresh-candidates.sh + merged-not-closed.sh  #8469/#8565/#8629/#8645 — the SECOND pass of this
-#                 reconciliation (`.prio`, landed.txt, the answered-pass budget, RETRY_MAX) — plus
-#                 `run-bash-shards.sh` to run its suite.
+#     reconciliation (`.prio`, landed.txt, the answered-pass budget, RETRY_MAX). NOTHING holds these
+#     two files, so this is scope this pass did not reach — not a refusal. Of the 8 post-pin commits,
+#     1 is ported here (#8521, minus merge-one.sh), 3 are blocked on held files (#8518's
+#     orch-loop/selftest half, #8589 and #8612, both merge-one.sh) and 4 touch ONLY these free files
+#     (#8560, #8625, #8645, and #8468's non-install.sh half). `run-bash-shards.sh` — to run its
+#     suite — IS held, so this half is blocked at the CI wiring even once it is written.
 # The pin's own note "NOT ported, deliberately: tortoise's open branch fix/8468-closure-linkage …
 # `merged-not-closed.sh`" is now STALE: that branch merged as 9b249f418 and merged-not-closed.sh is
 # on tortoise main, so it is queued for porting above rather than excluded.
