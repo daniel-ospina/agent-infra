@@ -116,7 +116,7 @@ Blocks `git commit` unless every file the commit records has been verified by a 
 - [ ] `workflow/02-commit-pr.md` — staging, commit message, draft PR, tier fallback classification
 - [ ] `workflow/03-code-review.md` — code review gate, fix loop, NVIDIA pattern scan, tier scaling
 - [ ] `workflow/04-merge-deploy.md` — merge, edge function deploy, migration safety verification
-- [ ] `workflow/05-cleanup.md` — branch cleanup, worktree teardown, documentation update
+- [ ] `workflow/05-cleanup.md` — branch cleanup, worktree teardown, post-merge documentation & memory verification (read-only)
 
 ## What fails if you skip
 
@@ -127,6 +127,6 @@ Blocks `git commit` unless every file the commit records has been verified by a 
 | `workflow/02` | No issue link in commit message. Draft PR not created. Tier misclassified — complex migrations get micro treatment (code review skipped). |
 | `workflow/03` | Code review entirely skipped. P0 bugs in PR diff undetected. No fix loop runs. Standard+Complex projects ship unreviewed. |
 | `workflow/04` | Merge fails because branch not ready. Edge functions not deployed to Supabase. Migration safety checks skipped. |
-| `workflow/05` | Stale branches accumulate on remote. Worktrees not cleaned up — disk space leaks. Design docs not synced to repo mirror. |
+| `workflow/05` | Stale branches accumulate on remote. Worktrees not cleaned up — disk space leaks. Design docs not synced to repo mirror. A doc/memory update attempted at Step 4 lands in the SHARED HUB (Step 3.8 has already torn the worktree down) — blocked by main-worktree-guard, or destructive/PR-polluting if it is not (#648). |
 ---
 > Continue following the workflow as mandated by this skill. Do not skip steps.

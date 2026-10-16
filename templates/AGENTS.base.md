@@ -323,6 +323,24 @@ Read the RUNS, on the EXACT sha, newest attempt per check:
 
 A per-name rollup answers *"has main EVER been red?"* — almost always yes — not *"is main green now?"*. **This false red has already produced a wrong "main is red" conclusion that stalled work on a green main** — the defect is `tortoise#4877`, and the instruction-file divergence it exposed is `agent-infra#1399`.
 
+- **⛔ A MEASUREMENT ARTIFACT IS NOT A STATE — never take a destructive action from a FIRST-MATCH
+  reading.** This has now happened **three times on healthy systems**, each caught only because the
+  read was re-measured before acting: (1) a compaction **summary** — a cache of a past read, not a
+  measurement — nearly got a *healthy* Tortoise graph rebuilt; (2) `pgrep -f '[o]rch-loop\.sh' |
+  head -1` produced "**6 controllers for 3 cells**" and nearly got healthy controllers killed (the
+  identical bug had **already** been fixed once in `deploy-mac-orchestrator.sh`); (3) the first
+  `pgrep` match kept returning a **stale `tmux new-session` client** that lingered ~35 min carrying
+  an *old* `MAX_LANES`, making a correctly-configured controller read as misconfigured. In all three
+  the datum was real and the **inference** was wrong — which is why the rule is about the read, not
+  the number. Before ANY kill / reap / rebuild / prune / reset / relabel: enumerate **every** match
+  with its `ppid` **and** `cmdline` (a harness controller is a **3-deep chain** — `tmux client →
+  bash -c → orch-loop.sh` — and the DEEPEST process is the controller), prefer the tool's **own
+  status verb** over your own count, state **what would be lost if the reading is stale**, and
+  re-measure **at the moment of action**. **A failure that repeats inside one short window is the
+  signature of an artifact, not a durable state** — and an over-read symptom plus a
+  plausible-sounding remedy is exactly how an agent talks a human into a destructive action on a
+  healthy system.
+
 ## Sub-agent Dispatch
 
 Use Pi's `task` tool for all sub-agent work. Sub-agents have isolated context → construct their prompts with exactly what they need.
