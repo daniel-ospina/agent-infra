@@ -44,14 +44,33 @@ cleanup() {
 trap cleanup EXIT
 
 # ── Step 1: Find latest backup ─────────────────────────────────────
+# “The newest backup” means the newest directory that actually HOLDS an RDB. A directory
+# without dump.rdb is not a backup: a run interrupted before the copy (or before its
+# manifest) leaves an empty `backups/<timestamp>/`, and selecting by mtime alone made this
+# smoke test FAIL with “No dump.rdb” over a GOOD older backup that was still on disk — so
+# one failed backup disabled the verification of the last good one (#907).
+#
+# scripts/daily-backup.sh now removes such a directory itself; this independent guard is
+# the second half, so an interruption that skips that cleanup (SIGKILL, power loss) cannot
+# re-create the false FAIL.
+newest_backup_dir() {
+    local root="$1" d
+    [ -d "$root" ] || return 1
+    while IFS= read -r d; do
+        if [ -f "$d/dump.rdb" ]; then
+            printf '%s\n' "$d"
+            return 0
+        fi
+    done < <(ls -1dt "$root"/*/ 2>/dev/null)
+    return 1
+}
+
 if [ -z "$BACKUP_ROOT" ]; then
     # Try local first, then off-box
-    if [ -d "$REPO_ROOT/backups" ] && [ -n "$(ls -1dt "$REPO_ROOT/backups"/*/ 2>/dev/null | head -1)" ]; then
-        BACKUP_DIR=$(ls -1dt "$REPO_ROOT/backups"/*/ | head -1)
-    elif [ -d "$HOME/backups/tortoise" ] && [ -n "$(ls -1dt "$HOME/backups/tortoise"/*/ 2>/dev/null | head -1)" ]; then
-        BACKUP_DIR=$(ls -1dt "$HOME/backups/tortoise"/*/ | head -1)
-    else
-        echo -e "${RED}FAIL${NC}: No backups found in $REPO_ROOT/backups/ or $HOME/backups/tortoise/"
+    BACKUP_DIR="$(newest_backup_dir "$REPO_ROOT/backups" || newest_backup_dir "$HOME/backups/tortoise" || true)"
+    if [ -z "$BACKUP_DIR" ]; then
+        echo -e "${RED}FAIL${NC}: No restorable backup found in $REPO_ROOT/backups/ or $HOME/backups/tortoise/"
+        echo -e "        (a directory without dump.rdb is not a backup — see #907)"
         exit 1
     fi
 else

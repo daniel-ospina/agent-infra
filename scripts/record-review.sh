@@ -43,10 +43,21 @@
 #   <a GitHub URL>          any of the three, pasted (…/pull/N#issuecomment-ID,
 #                           #discussion_rID, #pullrequestreview-ID)
 # The script then VERIFIES it: it must exist, belong to THIS PR, POSTDATE the
-# recorded head's commit, and NOT assert an UNRESOLVED outcome — NOT-CLEAN, or
-# the review skills' own exit markers ("Auto-fix stalled/failed/reached … cap",
-# "N issues remain", "requires human attention/input"). Anything it
-# cannot verify — including an unreachable API — REFUSES (exit 3). Until
+# recorded head's commit, and NOT assert an UNRESOLVED outcome. THREE ARMS, and
+# the split between them is the whole contract:
+#   (1)  the review skills' own exit markers — Auto-fix stalled/failed/reached/
+#        aborted/converged/stuck, "N issues remain", "requires human
+#        attention/input/review", "test review capped", [ADVERSARIAL-BOUND].
+#        UNCONDITIONAL.
+#   (1b) a DECLARED negative outcome — an `Outcome: not-clean` line, or a
+#        "Review — NOT CLEAN" header. UNCONDITIONAL, and checked BEFORE (2) so a
+#        body cannot declare both and be accepted.
+#   (2)  the loose `not…clean` substring. It is prose, so it fires ONLY when the
+#        artifact states no explicit `Outcome:` field: a review that describes
+#        fail-closed code legitimately contains these words (tortoise#8866).
+#        NOTE: no review-skill template emits an `Outcome:` field — it is an
+#        ad-hoc convention, so its absence is the normal case.
+# Anything it cannot verify — including an unreachable API — REFUSES (exit 3). Until
 # tortoise#7391 this script asked that question on NO path: passing the PR's current
 # head recorded unconditionally, so the most natural invocation there is
 # ("record this PR at its current head") minted a validly-signed, head-bound
@@ -552,12 +563,85 @@ verify_review_evidence() { # <ref> <head_sha> -> 0 = verified
   # a lane whose review ABORTED could name its own Step-8 comment and mint clean.
   # An unresolved-exit prefix that this list does not name is a fail-open, so
   # extend it from fixer-loop.md, never from memory.
-  if grep -qiE 'not[[:space:]_-]*clean|auto-fix[[:space:]]+(stalled|failed|reached|aborted|converged|stuck)|require[s]?[[:space:]]+human[[:space:]]+(attention|input|review)|unresolved[[:space:]]+issues?|[0-9]+[[:space:]]+issues?[[:space:]]+remain|test[[:space:]]+review[[:space:]]+capped|\[ADVERSARIAL-BOUND\]' <<<"$body"; then
-    echo "   $kind $id asserts an UNRESOLVED outcome (NOT-CLEAN, or a stalled/failed/cap/human-input exit) — it is evidence the review did not conclude clean." >&2
+  # ⛔ THREE ARMS, AND THE SPLIT IS SECURITY-RELEVANT (1b below is unconditional too).
+  #
+  # (1) STRUCTURAL ABORT MARKERS — always veto, unconditionally. These are the review skills' own
+  #     Step-8 exit prefixes (fixer-loop.md §"PR comment prefix"). A lane whose review ABORTED emits
+  #     one of them, so vetoing them unconditionally is what keeps the tortoise#3549 hole closed: a
+  #     lane cannot mint `clean` by naming its own aborted Step-8 comment, whether or not that
+  #     comment also claims an outcome.
+  #
+  # (2) THE LOOSE `not…clean` ARM — only when the artifact states NO explicit outcome. It is a
+  #     substring search over prose, and prose about code reviews legitimately contains the phrase
+  #     mid-sentence, while a review of fail-closed code necessarily uses words like "failed" and
+  #     "unresolved". Measured 2026-10-17 (agent-infra#1964) on tortoise#8866: a genuine CLEAN review
+  #     whose body opens `**Outcome: CLEAN — no blocking issues found.**` was REFUSED (rc=3) because
+  #     a later sentence contained that phrase, parking a reviewed PR with a false "evidence could
+  #     not be verified" diagnosis.
+  #
+  #     So when the artifact states an explicit `Outcome:` field, that field IS its claim about the
+  #     outcome and arm (2) is skipped; arm (1) still applies. Without an `Outcome:` field nothing
+  #     changes — the loose arm runs exactly as before, so this cannot widen the fail-open.
+  if grep -qiE 'auto-fix[[:space:]]+(stalled|failed|reached|aborted|converged|stuck)|require[s]?[[:space:]]+human[[:space:]]+(attention|input|review)|unresolved[[:space:]]+issues?|[0-9]+[[:space:]]+issues?[[:space:]]+remain|test[[:space:]]+review[[:space:]]+capped|\[ADVERSARIAL-BOUND\]' <<<"$body"; then
+    echo "   $kind $id asserts an UNRESOLVED outcome (a stalled/failed/cap/human-input exit) — it is evidence the review did not conclude clean." >&2
     return 1
+  fi
+  # (1b) DECLARED NEGATIVE OUTCOMES — always veto, and BEFORE the `Outcome:` suppression. Without
+  #      this arm the suppression hands back the tortoise#3549 shape (§13f) for the price of one
+  #      pasted line: a body that declares BOTH a clean outcome and a NOT-CLEAN outcome was accepted
+  #      (found in review of this change, both orderings reproduced). It vetoes DECLARATIONS only —
+  #      an `Outcome: not clean` line, or a `Review — NOT CLEAN` header — so prose that merely
+  #      discusses cleanliness (the tortoise#8866 false refusal this change exists to fix) still
+  #      passes. Arm 2 is the only arm the `Outcome: clean` field may suppress.
+  if grep -qiE '(^|[*[:space:]])outcome:[[:space:]]*[*[:space:]]*(not|non|no)[[:space:]_-]*clean|(^|[[:space:]>*-])review[[:space:]]*[—–-][[:space:]]*not[[:space:]_-]*clean' <<<"$body"; then
+    echo "   $kind $id DECLARES a non-clean outcome (an explicit Outcome: not-clean, or a 'Review — NOT CLEAN' header) — it is evidence the review did not conclude clean." >&2
+    return 1
+  fi
+  if ! grep -qiE '(^|[*[:space:]])outcome:[[:space:]]*(clean|\*\*clean)' <<<"$body"; then
+    if grep -qiE 'not[[:space:]_-]*clean' <<<"$body"; then
+      echo "   $kind $id asserts an UNRESOLVED outcome (NOT-CLEAN, and states no explicit Outcome:) — it is evidence the review did not conclude clean." >&2
+      return 1
+    fi
   fi
   printf '%s %s on %s#%s, created %s, postdates head %s\n' "$kind" "$id" "$REPO" "$PR" "$created" "${head:0:12}"
   return 0
+}
+
+# ── #1709 rec 7 — the record's IDENTITY, for idempotent same-head writes ──
+# `record-review.sh` runs at-least-once (a duplicate execution is possible under
+# crashes, pauses and cross-box dispatch), so its side effects must be idempotent:
+# running it twice for the SAME head must produce the SAME artifact, not a second
+# one. The PR-body MARKER already satisfies this — it is a function of
+# (pr, verdict, sha, diff, repo) and the append is guarded by a whole-string
+# `grep -qF` — but the RECORD FILE did not: every run re-stamped `reviewed_at`
+# from the wall clock and rewrote the file, so a duplicate execution MUTATED the
+# attestation. That is corruption, not waste: `reviewed_at` is the audit trail's
+# only join from a merge-gate pass to the review dispatch that authorised it
+# (extensions/review-enforcer logMergeGateDecision), and the mint time of a
+# reviewed head must not move because a paused worker resumed.
+#
+# The idempotency KEY is the head sha — the same content-addressing #1709 rec 1
+# applies to claims. Two records are the SAME attestation when their deterministic
+# identity matches: pr, head_sha, the diff/merge-base bindings, the evidence ref,
+# the verdict and the repo. The VOLATILE fields — `reviewed_at`, and the carry
+# provenance (`mint`, `carried_from`, `carried_at`) — are NOT identity: they are
+# what the duplicate would churn, and stripping them from BOTH sides lets a
+# carry and a fresh mint at the same head compare equal (a duplicate of either
+# is a no-op, which is exactly right: the head is already recorded).
+#
+# This is deliberately EXACT-string comparison over the canonicalized single-line
+# JSON, not a jq/python parse: the record is written by ONE printf with a fixed
+# field order, and a second parser here would be a second definition of the
+# record's shape. A malformed or foreign file simply fails to match, and the
+# write proceeds as before (fail-open on the GUARD, never on a safety property —
+# this only decides whether to rewrite an already-correct file).
+record_identity() { # <record-file> -> the record with its volatile fields removed
+  sed -E \
+    -e 's/,"reviewed_at":"[^"]*"//' \
+    -e 's/"mint":"[^"]*",//' \
+    -e 's/"carried_from":"[^"]*",//' \
+    -e 's/"carried_at":"[^"]*",//' \
+    "$1"
 }
 
 # ── main (guarded — executable when run, inert when sourced for tests) ────
@@ -2131,7 +2215,25 @@ else
   printf '{"pr":%d,"head_sha":"%s",%s%s%s%s"verdict":"%s","reviewed_at":"%s"}\n' \
     "$PR" "$SHA" "$MB_FIELD" "$DIFF_FIELD" "$MINT_FIELDS" "$EVIDENCE_FIELD" "$VERDICT" "$REVIEWED_AT" > "$TMP"
 fi
-mv "$TMP" "$FILE"
+# ── IDEMPOTENT SAME-HEAD WRITE (#1709 rec 7) ─────────────────────────────
+# The record this run would write is already on disk with the SAME deterministic
+# identity (record_identity, above), so a duplicate execution is a NO-OP: do not
+# rewrite it. This is what keeps `reviewed_at` — the audit trail's only join to
+# the authorising dispatch — stable across a duplicate, and it makes the second
+# execution's result BYTE-IDENTICAL to the first's rather than merely equivalent.
+# The legacy-migration and evidence-post blocks below still run: they are already
+# idempotent, and skipping them would only make a duplicate STRAND the legacy key
+# (the failure this whole block exists to avoid) — the record file is the one
+# side effect that was not idempotent. ⛔ The no-op arm skips ONLY the write: the two
+# blocks below are UNCONDITIONAL and still run, which is what keeps a duplicate from
+# STRANDING the legacy key. That half is pinned by record-review.test.sh §15.8 (a
+# same-head duplicate with a legacy key present must still remove it).
+if [ -f "$FILE" ] && [ "$(record_identity "$FILE")" = "$(record_identity "$TMP")" ]; then
+  rm -f "$TMP"
+  echo "#1709 rec 7 idempotent: $REPO#$PR already records verdict=$VERDICT at head ${SHA:0:12}… with the same binding — record NOT rewritten (reviewed_at preserved)" >&2
+else
+  mv "$TMP" "$FILE"
+fi
 # Migration (#426): a legacy <pr>.json that belongs to THIS repo is
 # superseded by the qualified file — remove it so stale number-keyed copies
 # can't collide later. Discriminate "no repo field at all" from "unparseable":

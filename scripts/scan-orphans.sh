@@ -123,7 +123,12 @@ if [ -f "$RECORD_FILE" ]; then
             # Canonicalize both sides: macOS /var → /private/var symlink; the
             # porcelain prints realpaths while the record may hold the /var form.
             WT_CANON="$(cd "$DIR" 2>/dev/null && pwd -P || echo "$DIR")"
-            git worktree list --porcelain 2>/dev/null | grep -qF "worktree $WT_CANON" && IS_WT=true
+            # Capture, then classify in the SHELL — never `… | grep -qF`, whose false
+            # negative under `pipefail` would make a REGISTERED worktree look
+            # unregistered on the destructive --apply path (#864).
+            case "$(git worktree list --porcelain 2>/dev/null || true)" in
+                *"worktree $WT_CANON"*) IS_WT=true ;;
+            esac
         fi
         DIRTY_B=0
         if [ "$IS_WT" = true ]; then

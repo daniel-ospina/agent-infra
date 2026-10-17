@@ -20,9 +20,23 @@
 #           report the review scratch that accumulates under /tmp. --scratch[=DAYS] also deletes
 #           scratch checkouts older than DAYS. A full disk is what breaks a cell FIRST.
 #
+# ── THE QUEUE TARGET IS THE CHECKOUT (agent-infra#1901) ──────────────────────────────────────────
+# `REPO` (a path) and `OR` (an owner/repo) used to be two independent facts that nothing compared, so
+# a cell could stand in one repo and dispatch against another. Measured on `pi-cell-2`: an
+# agent-infra checkout whose queue was tortoise — the pre-flight tool could not run there, every
+# candidate came back unqueryable, and 2,641 refresh passes judged nothing while the capacity line
+# read `lanes=0/16` (the box EMPTY, not full). `OR` is now DERIVED from `git -C "$REPO" remote
+# get-url origin`; an explicit `OR` is an override that must MATCH that remote; and a pair that
+# cannot be read is never blessed (cannot-verify is not a pass). `start`/`check` REFUSE with both
+# values, the remote, and the repo the machine needs; `status` prints the pair on one line.
+# ⛔ The refresh loop's own retry/starvation behaviour is #1729 and is NOT changed here.
+#
 # Prereqs on the cell (see cloud-cell-bringup.sh --check):
 #   HOME writable · repo cloned · gh authenticated with push · provider key valid
+#   + git/python3/pi on PATH, ~/.pi/agent/scripts/record-review.sh ('start' provisions it)
 #   + the merge authority key (AI_REVIEW_GATE_KEY) if this cell is to MERGE.
+# 'check' refuses to certify a cell missing any of the above: each one, absent, turns a loop step
+# into a silent no-op or an unbounded paid retry (#1717).
 #
 # ⛔ MEASURED 2026-10-13 — A CELL WITHOUT THE MERGE KEY IS **NOT** MERGE-INERT.
 # An earlier draft of this file claimed a keyless cell was a safe "producer cell"
@@ -89,12 +103,35 @@ O="${O:-$CELL_HOME/orchestrator}"
 # in a follow-up tortoise PR (agent-infra#1700 / tortoise#8432), so it is no longer a valid default
 # here. An unresolvable path fails loudly in cmd_check, never silently.
 HARNESS="${HARNESS:-}"
+# The record step (#1717). merge-one.sh EXECUTES this path to mint the signed marker that
+# ai-review-gate verifies, so it is a hard dependency of the ONLY merge path — but a fresh cell does
+# not have it (the file ships in the agent-infra checkout, not in the target repo). Two functions,
+# not two variables, because $ENV_FILE is sourced later in this file and may repoint $CELL_HOME: the
+# consumers must resolve it at call time. NO environment override — a knob that points the record
+# step at another file is a way to defeat the gate, not a configuration.
+recorder_path() { printf '%s\n' "$CELL_HOME/.pi/agent/scripts/record-review.sh"; }
+recorder_src()  { printf '%s\n' "$HARNESS/../record-review.sh"; }
+# The recorder's DECLARED SIBLING (#1362/#1717). record-review.sh resolves its diff normalizer from
+# its OWN directory (`$(dirname "${BASH_SOURCE[0]}")/lib/diff-normalize.py`), so the two must be
+# provisioned together, preserving the relative position — exactly as pi-bootstrap/setup.sh's lib
+# farm pins it. Without it the recorder degrades to the RAW pre-#1362 digest (no false accept, but
+# every base-only `gh pr update-branch` refuses carry-forward and buys a FRESH PAID review), which is
+# the same paid-loop class as the missing recorder itself. Resolved from the harness checkout.
+recorder_lib_path() { printf '%s\n' "$(dirname "$(recorder_path)")/lib/diff-normalize.py"; }
+recorder_lib_src()  { printf '%s\n' "$HARNESS/../lib/diff-normalize.py"; }
 SESSION="${SESSION:-orch}"
-# OR is interpolated into the session command string, so it is defaulted here — the guard below reads
-# it with `${!v}` under `set -u`, which errors on an unset name, and the string must not depend on
-# the guard running first. `${OR:-…}` keeps today's default. (The merge key is NOT interpolated — a
-# secret in an argv string is visible to ps/tmux; see the session command below.)
-OR="${OR:-daniel-ospina/tortoise}"
+# OR (the queue's owner/repo) is interpolated into the session command string, so it must always be
+# DEFINED — the guard below reads it with `${!v}` under `set -u`, which errors on an unset name.
+# ⛔ It is deliberately NOT defaulted to a repo any more (agent-infra#1901). A default here is a
+# SECOND fact that nothing compares to the checkout, and that is the measured defect: the cell stood
+# in an agent-infra tree, defaulted the queue to tortoise, and judged nothing for 2,641 passes. The
+# effective value is RESOLVED after $ENV_FILE is sourced (see the queue-target section below), so a
+# keys.env `OR=` — including an empty one — is read as the operator wrote it, not as a default.
+# ⛔ `${OR:-}` and NOT `OR=""`: this script's own assignment runs AFTER the environment is inherited,
+# so a bare reset would DISCARD the very value the section below has to validate (measured here —
+# `OR=daniel-ospina/tortoise` in the environment read as "not declared", which would have made every
+# explicit-override refusal vacuous). It sets OR DEFINED, which is all `set -u` needs.
+OR="${OR:-}"
 
 # ── the SECOND tmux boundary (agent-infra#1711) ─────────────────────────────────────────────────
 # A tmux session is served from the SERVER's environment, so the controller's shell does NOT reach
@@ -223,6 +260,160 @@ source_env_file
 # gh auth" and the cell started, and then every gh call in the session failed.
 export HOME="$CELL_HOME"
 LOCK="$O/.orch.lock"
+
+# ── the QUEUE's repo and the CHECKOUT are ONE fact (agent-infra#1901) ────────────────────────────
+# MEASURED 2026-10-15 on `pi-cell-2`: harness pin `a4a1249794e7` standing in an AGENT-INFRA checkout
+# (`git -C $REPO remote get-url origin` → https://github.com/daniel-ospina/agent-infra.git) while the
+# controller's queue was TORTOISE, because `$OR` defaulted to `daniel-ospina/tortoise` and nothing
+# ever compared the two. The controller then named tortoise PRs from an agent-infra tree; the
+# candidate pre-flight is a Python/uv tool that must run INSIDE the target repo, so it was skipped and
+# every candidate came back unqueryable:
+#
+#   [refresh] no pyproject.toml in … — not a uv/Python project; skipping the scout venv step
+#   [refresh] ?#5109 COLLISION is DEGRADED (the pre-flight could not query every surface)
+#   [refresh] ABORT: none of the 6 candidate(s) the pre-flight ran produced a usable verdict
+#
+# …2,641 times, while the capacity line read `lanes=0/16 load=0/80` — the box EMPTY, not full — and
+# `[dispatch] backlog empty` on every pass. The parked PRs were unreachable by this path, not merely
+# unworked, and every observable except the work itself was green.
+#
+# So $OR is not a default any more: it is DERIVED from the checkout's `origin` remote — the one fact
+# the machine actually has — and an explicit $OR ($ENV_FILE or the environment) is an OVERRIDE that
+# must MATCH it, never a second independent fact. A pair that cannot be READ is not blessed either:
+# cannot-verify is never a pass in this file, and the whole failure mode above was a cell that ran
+# happily on a queue it could not query. `start`/`check` REFUSE on any of those states; `status`
+# reports the pair (it is the verb an operator runs to find out the pair is wrong).
+#
+# ⛔ NOT fixed here, deliberately: the refresh loop's own retry/starvation behaviour (#1729). Making
+# the mismatch impossible is this change; making the retry loop smarter is that one.
+
+# owner/repo out of a git remote URL. Takes the shapes a clone actually records —
+#   https://github.com/<owner>/<repo>.git · http://github.com/<owner>/<repo>.git ·
+#   ssh://git@github.com/<owner>/<repo>.git · git@github.com:<owner>/<repo>.git
+#                                                         (and any of them without `.git`)
+# …and REFUSES everything else, INCLUDING a bare local path: a filesystem remote does not name a repo
+# on a git host, so deriving a queue target from it would be an invention, not a read. The SCHEME is an
+# allow-list for the same reason (see the review catch below).
+# ⛔ The accepted charset is deliberately narrow. The value is interpolated into the tmux session
+# command string, so `safe_argv` must be true of it BY CONSTRUCTION rather than by a later check that
+# could be refactored away.
+queue_repo_from_url() {
+  local url="${1:-}" host path owner name
+  case "$url" in
+    https://*|http://*|ssh://*)
+      # scheme URL: host[:port]/<path>. `${url#*://*/}` removes the SHORTEST prefix ending in `:///`
+      # (the leading slash of the path), so it yields the path for every scheme form.
+      # ⛔ The scheme is an ALLOW-LIST, not `*"://"*` (review catch): a filesystem/foreign scheme
+      # names no repo on a git HOST, and the form `git clone file://localhost/<owner>/<repo>` — a
+      # REAL clone — records `file://localhost/<owner>/<repo>` as origin, which passed every other
+      # check here and was DERIVED into a queue target: a local path read as a host/repo pair, i.e.
+      # an invention, and it failed OPEN in a gate whose whole contract is fail-closed.
+      path="${url#*://*/}"
+      [ "$path" != "$url" ] || return 1                   # no slash after the host: nothing to parse
+      host="${url#*://}"; host="${host%%/*}"; host="${host#*@}"; host="${host%%:*}"
+      ;;
+    *@*:*)
+      # scp-like: [user@]host:<path>. ⛔ The part before the `:` must be a HOST, so it may not carry
+      # a `/`: a LOCAL PATH can contain both `@` and `:` (`/home/u@srv:o/r.git`) and was otherwise
+      # read as a host/repo pair that nothing said was one — the same invention as the scheme case.
+      case "${url%%:*}" in */*) return 1 ;; esac
+      host="${url%%:*}"; host="${host#*@}"
+      path="${url#*:}"
+      ;;
+    *) return 1 ;;
+  esac
+  [ -n "$host" ] || return 1
+  path="${path#/}"; path="${path%/}"; path="${path%.git}"
+  case "$path" in */*) ;; *) return 1 ;; esac                 # `<owner>/<repo>`, not `repo`
+  owner="${path%%/*}"; name="${path#*/}"
+  case "$owner" in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac
+  case "$name"  in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac     # also rejects a 3-segment path
+  printf '%s/%s\n' "$owner" "$name"
+}
+
+QUEUE_REMOTE=""      # the origin URL we READ from the checkout (empty = nothing to read)
+QUEUE_DERIVED=""     # owner/repo parsed out of it (empty = underivable)
+QUEUE_REPO=""        # the EFFECTIVE queue target the controller session will receive
+QUEUE_DECLARED=""    # what the operator/keys.env asked for (empty = not declared)
+QUEUE_STATE=""       # derived|explicit = usable · mismatch|invalid|unreadable|underivable = refuse
+
+# Read the pair. NEVER dies: `status` must still answer when the pair cannot be read — it is the verb
+# an operator runs to discover that it cannot — and every other verb keeps its own preconditions. The
+# verbs that cannot do their job call assert_queue_target() below.
+resolve_queue_target() {
+  QUEUE_DECLARED="${OR:-}"
+  QUEUE_REMOTE="$(git -C "$REPO" remote get-url origin 2>/dev/null)"
+  QUEUE_DERIVED=""
+  [ -n "$QUEUE_REMOTE" ] && QUEUE_DERIVED="$(queue_repo_from_url "$QUEUE_REMOTE")"
+  if [ -z "$QUEUE_REMOTE" ]; then
+    QUEUE_REPO="$QUEUE_DECLARED"; QUEUE_STATE="unreadable"; return 1
+  fi
+  if [ -z "$QUEUE_DERIVED" ]; then
+    QUEUE_REPO="$QUEUE_DECLARED"; QUEUE_STATE="underivable"; return 1
+  fi
+  if [ -z "$QUEUE_DECLARED" ]; then
+    QUEUE_REPO="$QUEUE_DERIVED"; QUEUE_STATE="derived"; return 0
+  fi
+  # An EXPLICIT override is held to the same `<owner>/<repo>` shape the derivation guarantees, so a
+  # typo cannot become a queue target that no `gh --repo` call can resolve.
+  case "$QUEUE_DECLARED" in
+    */*/*)             QUEUE_STATE="invalid" ;;
+    *[!A-Za-z0-9._/-]*) QUEUE_STATE="invalid" ;;
+    */*)               QUEUE_STATE="" ;;
+    *)                 QUEUE_STATE="invalid" ;;
+  esac
+  if [ -n "$QUEUE_STATE" ]; then QUEUE_REPO="$QUEUE_DECLARED"; return 1; fi
+  QUEUE_REPO="$QUEUE_DECLARED"
+  [ "$QUEUE_DECLARED" = "$QUEUE_DERIVED" ] && { QUEUE_STATE="explicit"; return 0; }
+  QUEUE_STATE="mismatch"
+  return 1
+}
+resolve_queue_target || true
+# The session command string interpolates this, so it must be the RESOLVED value — not the raw $OR a
+# keys.env happened to carry, and not a default.
+OR="$QUEUE_REPO"
+
+# The named REFUSAL, in the shape `apply` uses when it declines because a controller is running — not
+# a warning. A wrong pair must not be a cell that starts and looks healthy; it must be a cell that
+# does not start, with an error naming BOTH values, the remote that was read, and the repo this
+# machine needs so provisioning is unambiguous.
+assert_queue_target() {
+  case "$QUEUE_STATE" in
+    derived|explicit) return 0 ;;
+  esac
+  local needs="the queue's repo is READ from \$REPO's 'origin' remote, so $REPO MUST BE a checkout of the repo whose pull requests this cell is supposed to work — 'git -C $REPO remote get-url origin' => <host>/<owner>/<repo>.git"
+  case "$QUEUE_STATE" in
+    mismatch)
+      die "the QUEUE and the CHECKOUT name DIFFERENT repos: the queue targets '$QUEUE_DECLARED' (OR) but $REPO is a checkout of '$QUEUE_DERIVED' (origin $QUEUE_REMOTE). A controller on this pair dispatches $QUEUE_DECLARED PRs from a $QUEUE_DERIVED tree: its candidate pre-flight cannot run there, every candidate comes back unqueryable, and the queue never advances while every other observable reads green (agent-infra#1901). Fix ONE of them — $needs — or remove the OR line from $ENV_FILE so it derives from the checkout, which would target $QUEUE_DERIVED."
+      ;;
+    invalid)
+      die "OR='$QUEUE_DECLARED' is not an <owner>/<repo> (want e.g. daniel-ospina/tortoise) — a queue target must name a repo on a git host, and a typo here is a cell that dispatches nothing. $needs."
+      ;;
+    unreadable)
+      die "cannot read the QUEUE this cell would target: 'git -C $REPO remote get-url origin' returned no URL${QUEUE_DECLARED:+, so OR='$QUEUE_DECLARED' cannot be verified against the checkout}. Starting anyway is the measured agent-infra#1901 failure — the controller runs, reports lanes and a loaded queue, and judges nothing. $needs."
+      ;;
+    underivable)
+      die "cannot derive the QUEUE from $REPO's origin remote '$QUEUE_REMOTE' — it does not name <owner>/<repo> in an accepted form (https://, http://, ssh://, or scp-like git@host:owner/repo.git), so there is no repo on a git host to target. $needs."
+      ;;
+    *)
+      die "cannot determine the QUEUE this cell would target (state '${QUEUE_STATE:-unknown}') — refusing to run a controller that cannot judge the queue it names. $needs."
+      ;;
+  esac
+}
+
+# The one-line answer `status` prints: is this cell pointed at what it is standing in?
+queue_state_text() {
+  case "$QUEUE_STATE" in
+    derived)     printf 'ok — derived from the checkout' ;;
+    explicit)    printf 'ok — OR matches the checkout' ;;
+    mismatch)    printf 'MISMATCH — start/check refuse (agent-infra#1901)' ;;
+    unreadable)  printf 'UNREADABLE — the checkout has no origin remote; start/check refuse' ;;
+    underivable) printf 'UNDERIVABLE — origin is not https/http/ssh/scp-like naming <owner>/<repo>; start/check refuse' ;;
+    invalid)     printf 'INVALID — OR is not <owner>/<repo>; start/check refuse' ;;
+    *)           printf 'unknown' ;;
+  esac
+}
+
 # Does the ENV FILE itself carry a NON-EMPTY merge key? cmd_check must judge what the SESSION will
 # see, not what this shell holds: the session re-sources $ENV_FILE (so a keys.env key reaches it)
 # while an ambient-only export does not (tmux serves a session from the server's environment).
@@ -699,6 +890,26 @@ cmd_check() {
   fi
   [ -f "$HARNESS/orch-loop.sh" ] || die "$HARNESS/orch-loop.sh missing"
   command -v tmux >/dev/null 2>&1 || die "tmux missing (the lanes depend on it)"
+  # ⛔ RUNTIME DEPENDENCIES, not just the binaries this block already named (#1717). Each one is
+  # INVOKED by the loop, and each one absent turns a step into a silent no-op or an unbounded paid
+  # retry — so a cell missing one must not be certified:
+  #   git     → worktree/fetch/push in fix-one.sh, dispatch-merge.sh, adopt-fix.sh. Nothing else
+  #             tests it: the `-d $REPO/.git` check below passes on a box with no git at all.
+  #   python3 → orch-loop.sh's check classifier and fix-one.sh's FAILING_CHECKS. Absent, the
+  #             classifier's $V is EMPTY, NO case arm matches, and every PR is skipped in silence —
+  #             a dead sweep that is indistinguishable from a quiet queue.
+  #   pi      → the worker runtime (lane.sh, fix-one.sh, merge-one.sh). Absent, every review and
+  #             every fixer fails 127 and the cell produces nothing.
+  # All three are fatal HERE because a cell invokes each directly (above). Parity with install.sh is
+  # true for `pi` only: install.sh's fatal gate is `for bin in tmux gh pi` (install.sh:84), and it
+  # never probes git or python3. The requirement is this script's own, not a mirrored one.
+  local dep
+  for dep in git python3 pi; do
+    command -v "$dep" >/dev/null 2>&1 || die "$dep missing on PATH — the loop invokes it (harness README §3)"
+  done
+  # uv is the ONE non-fatal dependency (its absence only stops a lane syncing its worktree venv),
+  # and install.sh warns rather than dying for it — so the two surfaces agree.
+  command -v uv >/dev/null 2>&1 || say "warn: uv missing — lane.sh cannot sync a worktree venv, so in-lane tests will fail (non-fatal, as in install.sh)"
   gh auth status >/dev/null 2>&1 || die "gh not authenticated — run cloud-cell-bringup.sh --check"
   [ -d "$REPO/.git" ] || [ -f "$REPO/.git" ] || die "no git repo at $REPO"
   # ⛔ A LINKED WORKTREE HAS A `.git` FILE, NOT A DIRECTORY (agent-infra#1745). The old `-d` test
@@ -707,6 +918,15 @@ cmd_check() {
   # harness from a worktree. `rev-parse --git-dir` is the real question; ask it instead.
   git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1 \
     || die "$REPO is not a git checkout (no .git directory or linked-worktree .git file)"
+  # ── the QUEUE's repo is the CHECKOUT's remote (agent-infra#1901) ────────────────────────────
+  # BEFORE the dispatch-provisioning probe: that probe runs INSIDE $REPO with this $OR, so a pair
+  # naming two different repos makes the probe answer about a repo the cell is not standing in —
+  # which is exactly how the measured cell passed every gate and then judged nothing. `check` is the
+  # question "can this cell run a controller?", so it must REFUSE what `start` refuses; a verdict of
+  # YES here while `start` dies on the same config is a FALSE PASS on that question (same rule as
+  # validate_scope).
+  assert_queue_target
+  say "ok: queue $QUEUE_REPO == checkout $REPO (origin $QUEUE_REMOTE) — $QUEUE_STATE"
   cmd_check_disk
   mkdir -p "$O/logs" "$O/state" || die "cannot create state dir $O"
   # orch-loop.sh spawns its workers as `bash '$O/<script>'` (fix-one.sh, merge-one.sh, …), NOT
@@ -767,6 +987,41 @@ cmd_check() {
       say "      Fix: put TORTOISE_REPO=<a tortoise checkout> in $ENV_FILE, or vendor tools/collision_preflight.py into the repo."
     fi
   fi
+  # ⛔ THE RECORD STEP IS A HARD DEPENDENCY OF THE ONLY MERGE PATH (#1717). merge-one.sh mints the
+  # signed marker ai-review-gate verifies by RUNNING this file, and neither cell script used to
+  # check or provision it. The pre-fix failure: cmd_check printed "CELL CAN RUN A CONTROLLER", the
+  # cell ran a full fresh-context review (up to REVIEW_TIMEOUT = 1800 s, PAID), record-review.sh
+  # then returned 127, and merge-one.sh exited BEFORE writing a parked marker — so the next cycle
+  # saw an unmarked FAILED:ai-review-gate and spawned another review. One paid review per cycle,
+  # forever, with no terminal state. Refuse the certification instead.
+  # Judge the path the CONSUMER uses: the session forces HOME=$CELL_HOME after sourcing keys.env.
+  # Presence + executability are NOT enough: the file must be a non-empty REGULAR file. `[ -x ]` is
+  # true for a directory (`merge-one.sh` then buys the paid review and fails 126), and an EMPTY file
+  # is executable too — bash runs a shebang-less empty script and it exits 0, minting no marker. So
+  # an empty recorder would be certified, the gate would never go green, nothing would be parked,
+  # and the loop would re-pay for a fresh review every cycle: the same #1717 loop, one input over.
+  # The sibling check below already reasons about the zero-byte shape; judge the recorder the same way.
+  local rec; rec="$(recorder_path)"
+  if [ ! -e "$rec" ]; then
+    die "record-review.sh MISSING at $rec — it is the only merge path, so every review would be re-paid for and never recorded. 'start' provisions it from $(recorder_src), or: cp '$(recorder_src)' '$rec' && chmod +x '$rec'"
+  elif [ ! -f "$rec" ]; then
+    die "record-review.sh at $rec is NOT A REGULAR FILE — merge-one.sh runs it directly, so a directory (or any other non-regular file) fails (126) AFTER a paid review. Remove it and re-run 'start', or: rm -rf '$rec' && cp '$(recorder_src)' '$rec' && chmod +x '$rec'"
+  elif [ ! -s "$rec" ]; then
+    die "record-review.sh at $rec is EMPTY (0 bytes) — an empty file is executable and exits 0 WITHOUT minting the signed marker, so the gate could never go green, nothing would be parked, and the loop would re-pay for a fresh review every cycle. Re-provision it: 'start', or: cp '$(recorder_src)' '$rec' && chmod +x '$rec'"
+  elif [ ! -x "$rec" ]; then
+    die "record-review.sh at $rec is NOT EXECUTABLE — merge-one.sh runs it directly, so the record step would fail (126) AFTER a paid review. Fix: chmod +x '$rec'"
+  fi
+  # The recorder's OWN runtime dependency (#1362/#1717): it resolves lib/diff-normalize.py from its
+  # sibling directory. Absent, the recorder still runs — but it takes the RAW pre-#1362 digest arm
+  # (`⚠️ #1362` warning in its output), the marker's diff_sha256 stops matching what the consumer
+  # computes live, and EVERY base-only head move (`gh pr update-branch`) refuses carry-forward and
+  # buys a fresh PAID review. Certifying a cell in that state is the same false PASS this block
+  # exists to remove, one step down the cost ladder. Judge it beside the recorder it belongs to.
+  local reclib; reclib="$(recorder_lib_path)"
+  if [ ! -f "$reclib" ] || [ ! -s "$reclib" ]; then
+    die "diff-normalize.py MISSING (or not a regular file, or empty) at $reclib — record-review.sh resolves it as its own sibling, and without it every base-only update re-pays for a fresh review. 'start' provisions it from $(recorder_lib_src), or: mkdir -p '$(dirname "$reclib")' && cp '$(recorder_lib_src)' '$reclib' && chmod +x '$reclib'"
+  fi
+  say "ok: record step present and executable ($rec, with $(recorder_lib_path))"
 
   # Judge the key by what the SESSION will receive, not by what this shell happens to hold: the key
   # FILE is authoritative, and a key in $ENV_FILE reaches the session because the session re-sources
@@ -825,6 +1080,23 @@ cmd_start() {
   # Refuse a bad SCOPE before anything starts or is written (validate_scope is also the first thing
   # cmd_check does below — this call is what keeps the refusal ahead of the $O seed).
   validate_scope
+  # Every value below is interpolated into the session command string, so every one must be
+  # metacharacter-free — refuse loudly here rather than let tmux's sh -c parse it. Empty values
+  # are skipped (cmd_check reports an unresolvable HARNESS with its own message).
+  # ⛔ Ahead of both the queue-target gate and the `has-session` return: this is the INJECTION guard,
+  # and its refusal is the one that must win for a value that reaches a shell string.
+  local v
+  for v in O REPO CELL_HOME ENV_FILE HARNESS OR HARNESS_REPO HARNESS_PIN_DIR HARNESS_PIN_FILE; do
+    [ -n "${!v}" ] || continue
+    safe_argv "${!v}" || die "\$$v must not contain a quote or shell metacharacter: ${!v}"
+  done
+  # ── the QUEUE's repo is the CHECKOUT's remote (agent-infra#1901) ─────────────────────────────
+  # A cell whose queue and checkout name different repos must not start at all, and the `has-session`
+  # branch below is NOT a licence to bless it: on the measured cell a controller was ALREADY RUNNING,
+  # so `start` would have returned rc=0 "already running" — the one answer an operator must never get
+  # for a pair that is wrong. Placed here, ahead of the return and of every write below, so nothing
+  # is seeded and no session is created on a refusal.
+  assert_queue_target
   # Guard BEFORE seeding. $O is the controller's working copy and `start` on a live cell would
   # otherwise replace the worker scripts its next spawn executes (and race a half-copied script).
   # Nothing is started or written on this path, so a bad value below cannot hurt it.
@@ -832,14 +1104,6 @@ cmd_start() {
     say "already running (tmux session '$SESSION') — use: status | logs | stop"
     return 0
   fi
-  # Every value below is interpolated into the session command string, so every one must be
-  # metacharacter-free — refuse loudly here rather than let tmux's sh -c parse it. Empty values
-  # are skipped (cmd_check reports an unresolvable HARNESS with its own message).
-  local v
-  for v in O REPO CELL_HOME ENV_FILE HARNESS OR HARNESS_REPO HARNESS_PIN_DIR HARNESS_PIN_FILE; do
-    [ -n "${!v}" ] || continue
-    safe_argv "${!v}" || die "\$$v must not contain a quote or shell metacharacter: ${!v}"
-  done
   # ── the harness this cell will run, fixed BEFORE anything is seeded (agent-infra#1745) ────────
   # `start` is the one command that applies the proper harness: fetch, pin to $HARNESS_REF in a
   # detached worktree, seed, record. A cell therefore cannot be started on a stale or hand-copied
@@ -874,6 +1138,42 @@ cmd_start() {
   # set when the shell started, and an unreplaced-but-unsafe derived path would otherwise reach the
   # tmux command string unguarded.
   safe_argv "$HARNESS" || die "\$HARNESS must not contain a quote or shell metacharacter: $HARNESS"
+  # Provision the record step (#1717). The seed itself is main's `seed_and_stamp` above (#1745), so
+  # only the recorder is added here: a hard dependency of the ONLY merge path, and absent on a fresh
+  # cell. Provisioned when ABSENT OR EMPTY (never merely because an `-e` test failed), so an
+  # operator's complete newer copy is never clobbered — while a partial/zero-byte one cannot persist
+  # across restarts. NEVER overwritten by whatever a keys.env points at. Resolved AFTER harness_apply:
+  # recorder_src() follows $HARNESS, which harness_apply may have repointed at the pinned worktree.
+  local rec rsrc rlib rlibsrc rtmp ltmp
+  rec="$(recorder_path)"; rsrc="$(recorder_src)"
+  rlib="$(recorder_lib_path)"; rlibsrc="$(recorder_lib_src)"
+  # `[ ! -s ]`, not `[ ! -e ]`: a ZERO-BYTE recorder (a copy killed mid-write, or a full disk) is
+  # the same fault as an absent one and must not survive a retry — it is worse than absent, because
+  # it exits 0 without minting a marker, so nothing is parked and the loop re-pays (#1717).
+  if [ ! -s "$rec" ]; then
+    [ -e "$rec" ] && [ ! -f "$rec" ] && die "$rec exists but is not a regular file — remove it, then re-run 'start'"
+    mkdir -p "$(dirname "$rec")" || die "cannot create $(dirname "$rec")"
+    # Atomic: write a sibling tmp then rename into place, so a concurrent reader can never observe a
+    # half-written recorder (the same reason pi-bootstrap/setup.sh farms its libs to a tmp + mv).
+    rtmp="${rec}.tmp.$$"
+    cp -p "$rsrc" "$rtmp" 2>/dev/null || { rm -f "$rtmp"; die "record-review.sh missing at $rec and cannot provision it from $rsrc — the harness checkout must be a full agent-infra checkout"; }
+    chmod +x "$rtmp" || { rm -f "$rtmp"; die "cannot make $rec executable"; }
+    mv -f "$rtmp" "$rec" || { rm -f "$rtmp"; die "cannot install the provisioned recorder at $rec"; }
+    say "provisioned record step: $rsrc -> $rec"
+  fi
+  # …and its declared sibling, ALWAYS (not only when the recorder was absent): an operator's older
+  # recorder copy can sit beside a missing lib, and cmd_check below refuses that cell. Preserve the
+  # relative position (scripts/record-review.sh <-> scripts/lib/diff-normalize.py) and refresh only
+  # when ABSENT, so a newer operator copy is never clobbered — same rule as the recorder above.
+  if [ ! -f "$rlib" ] || [ ! -s "$rlib" ]; then
+    [ -e "$rlib" ] && [ ! -f "$rlib" ] && die "$rlib exists but is not a regular file — remove it, then re-run 'start'"
+    mkdir -p "$(dirname "$rlib")" || die "cannot create $(dirname "$rlib")"
+    ltmp="${rlib}.tmp.$$"
+    cp -p "$rlibsrc" "$ltmp" 2>/dev/null || { rm -f "$ltmp"; die "diff-normalize.py missing at $rlib and cannot provision it from $rlibsrc — the harness checkout must be a full agent-infra checkout"; }
+    chmod +x "$ltmp" || { rm -f "$ltmp"; die "cannot make $rlib executable"; }
+    mv -f "$ltmp" "$rlib" || { rm -f "$ltmp"; die "cannot install the provisioned normalizer at $rlib"; }
+    say "provisioned record-step library: $rlibsrc -> $rlib"
+  fi
   # The key verdict must NOT be swallowed on the only path that starts a cell: an operator who
   # exported the key ambiently (or left an empty assignment in keys.env) would otherwise get a
   # keyless cell with no signal. Run the check once, fail loudly, and surface its output on stderr.
@@ -957,6 +1257,10 @@ cmd_status() {
   if tmux has-session -t "$SESSION" 2>/dev/null; then say "controller: RUNNING (tmux '$SESSION')"
   else say "controller: STOPPED"; fi
   say "state dir: $O"
+  # agent-infra#1901: does this cell stand where it is pointed? ONE line — the repo the queue targets,
+  # the checkout it is standing in, and the remote that fact was read from. Reported, never refused:
+  # `status` is the verb an operator runs to DISCOVER that the pair is wrong.
+  say "queue: ${QUEUE_REPO:-<unknown>} @ $REPO — origin ${QUEUE_REMOTE:-<none>} [$(queue_state_text)]"
   # agent-infra#1745: the answer to "which commit is this cell running?", from the record `start`
   # wrote. Printed even when the controller is stopped — a stale cell is a stale cell.
   if [ -f "$STAMP" ]; then

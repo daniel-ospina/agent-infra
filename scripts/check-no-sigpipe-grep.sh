@@ -40,12 +40,228 @@
 #
 # SCOPE — WHAT THIS GUARD DOES NOT COVER (deliberate)
 # ---------------------------------------------------
-# It matches the BUILTIN writers `printf`/`echo` only, because that is the set where the
-# fix is mechanical and universal. The same false negative is reachable with ANY producer
-# (`git … | grep -q`, `docker … | grep -q`, a function's output) — see the data-loss sites
-# fixed in `scripts/stale-worktrees.sh`/`scripts/cleanup-worktree.sh` (#863) and the
-# follow-up issue for broadening this guard. Do not read a green run as "no SIGPIPE risk
-# exists anywhere"; read it as "the builtin-writer idiom is gone".
+# It matches the builtin writers `printf`/`echo`, PLUS a `grep` as producer, because those are
+# the sets where a recognised producer word is unambiguous in the TEXT. The `grep` producer was
+# added by #864: the failure mechanism is `pipefail` + the quiet grep's early exit, NOT the
+# identity of the writer, and `grep -vxF … | grep -q …` is a real gate site (`lane_has_test_shard`
+# in the rail, and the test-teardown check) that #841's builtin-only predicate could not see. The
+# same false negative is reachable with ANY producer (`git … | grep -q`, `docker … | grep -q`, a
+# function's output) — see the data-loss sites fixed in
+# `scripts/stale-worktrees.sh`/`scripts/cleanup-worktree.sh` (#863). Do not read a green run as
+# "no SIGPIPE risk exists anywhere"; read it as "the recognised producer idioms are gone".
+# Broadening the recognised producer set further is #864's open design question: ANY other
+# producer is a false CLEAN until it is listed here.
+#
+#     PRODUCER-SIDE OVER-BLOCK, ACCEPTED AND PINNED (tests/sigpipe-grep/run.sh 13d). A producer
+#     that writes NOTHING, or writes only once it has read everything (`grep -q`, `grep -c`),
+#     cannot itself take the signal, so flagging it is a SHAPE flag and not a live false negative.
+#     It is still flagged: the pipeline cannot carry that producer's status either, no live
+#     occurrence of the shape exists on this tree, and writing a "does this producer write?"
+#     model into a TEXT matcher is the unbounded direction #1645 documents round after round.
+#     Over-block is friction and is visible; a missed producer is a silent false CLEAN.
+#
+#     PRODUCER-SIDE OVER-BLOCK FROM THE SUBSTRING CLASS, ALSO EXTENDED BY #864. raw_idiom is
+#     deliberately not anchored (see its own note below), so the WORD `grep` anywhere before a
+#     pipe counts as a producer: `ls a/grep | grep -q x`, `sed -n "/grep/p" f | grep -q x` and
+#     `git log --grep=x | grep -q y` are all flagged although the producer is not grep. Reproduced
+#     on fixtures (no live occurrence exists on this tree — the guard runs clean), and all are
+#     recoverable through the exceptions file; the alternative (anchoring raw_idiom) regressed
+#     quoted/escaped/backticked writers from flagged to CLEAN.
+#
+#     PRODUCER-SIDE OVER-BLOCK FROM THE QUOTED-BODY CLASS (#864). The quoted-body pass reads any
+#     quoted region whose resolution begins with a producer word and which is piped straight on
+#     as a wrapper body (`env -S "printf x" | grep -q p`), because a text matcher cannot tell a
+#     wrapper body from an ordinary string argument: `foo "grep -vE a|b f" | grep -q c` is
+#     flagged although foo is the producer. Same polarity as the substring class — over-block is
+#     friction and visible, a missed producer is a silent false CLEAN — and no live occurrence of
+#     the shape exists on this tree (the guard runs clean).
+#
+#     PRODUCER-SIDE OVER-BLOCK FROM THE DATA-REGION CLASS (#864) — A HEREDOC BODY, AND THE
+#     INTERIOR LINE OF A MULTI-LINE QUOTED STRING. The scan is LINE-oriented, so a line that is
+#     the DATA of a heredoc (`cat <<'EOF'` … a producer piped into a quiet grep … `EOF`) or the
+#     middle of a single-quoted string spanning lines is read as if it were a command, and the
+#     idiom on it is flagged although the shell never runs that line. Measured: a `heredoc.sh`
+#     whose second line is `grep foo bar | grep -q baz` between `cat <<'EOF'` and `EOF`, and a
+#     `multiquote.sh` with the same line inside a three-line single-quoted string, are both
+#     FLAGGED at rc 1 here while `git show origin/main:scripts/check-no-sigpipe-grep.sh`
+#     returns 0 on both (no `grep` producer was recognised at all before #864). This is an
+#     OVER-BLOCK, not a false CLEAN, in the SAME polarity as the classes above: closing it
+#     needs cross-line quote/heredoc state in a per-line matcher, which is a new scanner, not a
+#     widening — so it is DECLARED, pinned in tests/sigpipe-grep/run.sh 13d, and recoverable
+#     through scripts/sigpipe-grep-exceptions.txt (which carries no live line). No live
+#     occurrence of the shape exists on this tree (the whole-repo run is rc 0).
+#
+#     PRODUCER-SIDE OVER-BLOCK FROM THE `|&`-IN-DATA FAMILY (#864). The `|&` operator is read as
+#     a real pipe even when it is DATA: a one-line quoted string (`echo "run cmd |& grep -q p"`,
+#     and its single-quoted spelling), a trailing comment, a here-string (`grep -q p <<<"a |& grep
+#     -q b"`), and the DATA-REGION shapes when the break carries `|&` rather than `|` (a heredoc
+#     body, the interior line of a multi-line quoted string or assignment). A LINE-oriented text
+#     matcher cannot tell the operator from the data, exactly as it cannot for `|` — SAME polarity
+#     as the classes above (over-block, visible, recoverable through the exceptions file) and no
+#     live occurrence of the shape exists on this tree (the whole-repo run is rc 0). Each is
+#     FLAGGED here and CLEAN at the pre-change guard `39e65457`, which recognised no `grep`
+#     producer at all.
+#
+#     PRODUCER SPELLINGS THAT REACH THE SAME FALSE CLEAN, AND ARE NOW CLOSED. Each of these needed
+#     the SAME conjunction — a producer word the token walk had to resolve AND a `|` inside the
+#     producer's own argument that defeats raw_idiom's `[^|]*` bridge — and each was measured at rc
+#     141 under `pipefail` on a >64 KiB payload whose match is on line 1, against 0 for the
+#     capture-then-classify form. All are pinned in tests/sigpipe-grep/run.sh 13a:
+#       a wrapper whose OPTION precedes the word   `env -i grep`, `command -p grep`,
+#                                                  `stdbuf -oL grep`, `sudo -E grep`
+#                                                  (the option belongs to the WRAPPER — the same
+#                                                  test keeps `foo -e echo` unflagged)
+#       a QUOTED or ESCAPED producer word           `"grep" -E "a|b" f | grep -q p`, `\grep …`
+#       a $-rooted path                             `$HOME/bin/grep -E "a|b" f | grep -q p`
+#       a PROCESS SUBSTITUTION in its argument       `grep -f <(cat list | head -2) f | grep -q p`
+#       a MULTI-TOKEN WRAPPER PREFIX                 `env -u FOO -i grep …`, `env -u FOO -- grep …`,
+#                                                  `stdbuf -i0 -o0 grep …` — a ONE-token lookback
+#                                                  lands on the wrapper SEPARATED ARGUMENT or on
+#                                                  an earlier option and never reaches the wrapper;
+#                                                  the walk now crosses every token of the simple
+#                                                  command up to a statement separator (so a
+#                                                  producer in the PREVIOUS command cannot vouch
+#                                                  for this one)
+#       a producer WORD split by quoting or      `gre''p -E "a|b" f | grep -q p`,
+#        escaping                                   `g\rep …`, `"gr"ep …`, `gr"ep" …`,
+#                                                  `gre$'p' …`, `grep$'' …`, `ech''o …` —
+#                                                  the producer word was matched by a fixed
+#                                                  character ladder, which can only see a
+#                                                  CONTIGUOUS spelling; the word is now assembled
+#                                                  one literal character at a time with quoting and
+#                                                  escaping removed — and the same for the two
+#                                                  builtins, not only for `grep`
+#       a `${…}`, `$(…)` or backtick region inside     `env -u $(echo a;b) -i grep …`,
+#        a wrapper OPTION ARGUMENT                   `env -u ${x:-a;b} -i grep …` — a separator
+#                                                  inside a SUBSTITUTION belongs to the
+#                                                  substitution, not to the simple command; the
+#                                                  region is opaque to the wrapper walk
+#       a QUOTED or ESCAPED WRAPPER WORD             `"command" -p grep …`, `\command -p grep …`,
+#                                                  `"env" -i grep …`, and the dollar-quoted
+#                                                  spellings `$'env' …`, `$"env" …`, `en$'v' …` —
+#                                                  the wrapper walk read RAW text, so the quoting
+#                                                  never matched the WRAPWORDS list
+#       a brace, parenthesis, or QUOTED or           `env -u "x(y" -- grep …`, `env -u x} -- grep
+#        ESCAPED SEPARATOR inside a wrapper           …`, a wrapper option argument holding a
+#        OPTION ARGUMENT                             quoted or escaped `;`/`&`/`|` — the walk
+#                                                  broke on `(`/`)`/`{`/`}` and on RAW separators;
+#                                                  only a REAL statement separator may end it now,
+#                                                  which is what the guard quote map (QI) is for
+#       a locale-quoted WRAPPER around the           `… | $"command" -p grep -q p` — the consumer
+#        CONSUMER                                    token walk read only the `$'…'` spelling
+#       an UNQUOTED BRACED VARIABLE among its         `/usr/bin/grep -E "a|b" ${y} f | grep -q p` —
+#        arguments                                   `${y}` opens no `{ …; }` group, so its `}`
+#                                                  landed in the group-depth-0 branch and CLEARED
+#                                                  the writer; parameter expansions are counted
+#                                                  (`pb`) so the two braces match each other
+#       a `}` that closes NEITHER a group NOR a      `grep -E "a|b" shard{1,2}.txt | grep -q p`,
+#        parameter                                    `grep -E "a|b" f{,} | grep -q p`,
+#                                                  `grep -E "a|b" } f | grep -q p` — bash treats
+#                                                  that `}` as an ordinary word character; it is
+#                                                  now left ACTIVE rather than clearing the
+#                                                  writer (over-block, not a false clean)
+#       a producer INSIDE a WRAPPER BODY            `eval "grep -vE \"x|y\" f | grep -q needle"`,
+#                                                  `env -S "grep -vE x|y f" | grep -q needle` —
+#                                                  and its SINGLE-quoted spelling
+#                                                  `env -S 'grep -E "a|b" f' | grep -q needle` —
+#                                                  the producer own argument carries the data
+#                                                  pipe, so BOTH matchers miss it; the QUOTED-BODY
+#                                                  pass resolves the body (the inner shell removes
+#                                                  the level-0 escapes) and re-runs the same two
+#                                                  matchers on it, never a weaker third predicate
+#       a producer NESTED IN A CAPTURE with a pipe   `grep -f <(grep -v x f | head) f | grep -q p`,
+#        of its own                                 `grep -f $(grep -v x f | head -1) f | grep -q p`
+#                                                  — the inner writer owns the pipe, so it
+#                                                  overwrote the enclosing writer state and the
+#                                                  outer writer pipe was never evaluated;
+#                                                  that state is now SAVED ON CAPTURE ENTRY and
+#                                                  RESTORED ON ITS CLOSER (a subshell `( … )` is
+#                                                  not restored: it passes its stdout on)
+#       an ANSI-C SPELLED WORD, ON ANY        `prin$'\164'f …` (the producer), `ech$'\157' …`,
+#        SIDE OF THE PIPE — CLOSED BY ONE       `gre$'\x70' …`, `gre$'\x{70}' …` (bash's
+#        LINE-WIDE DECODE, NOT BY A PER-SITE     brace-hex form), `ec$'\150'"o" …`,
+#        SPELLING LIST                           `$'\147rep' -E …`, `Ech$'\u006f' …`,
+#                                                `$'\x65nv' -i grep …` (the WRAPPER word),
+#                                                and `printf x | gre$'\x70' -q p` (the CONSUMER
+#                                                word) — four review rounds each found the next
+#                                                spelling of this ONE conjunction, and each fix
+#                                                was local to where the last one was measured.
+#                                                The closure is structural instead: ansi_decode
+#                                                rewrites the whole line ONCE into the characters
+#                                                the shell will run, and the SAME two matchers run
+#                                                on that text as well as on the raw line (never a
+#                                                third, weaker predicate). Spelling enumeration
+#                                                is unbounded by construction; after decoding
+#                                                there is no spelling left to enumerate.
+#                                                THE DECODED SPAN IS EMITTED AS A QUOTED WORD,
+#                                                and that is load-bearing: a shell expansion
+#                                                yields ONE word whose characters are DATA, never
+#                                                syntax. Emitting the value bare made the `|` in a
+#                                                `$'a\x7cb'` argument read as a real PIPELINE, so
+#                                                a spanned data pipe in the producer's own
+#                                                argument — a shape the per-site revision DID
+#                                                flag — went CLEAN. The escape rules are the ones
+#                                                bash 3.2.57 actually applies: a malformed
+#                                                brace-hex (`\x{}`, `\x{ZZ}`, an unterminated
+#                                                `\x{`) is EMPTY, and an escape the C table does
+#                                                not know KEEPS ITS BACKSLASH (`\q`, `\;`, `\8`),
+#                                                where dropping it manufactured live punctuation
+#                                                out of data. TWO PLACES THE DECODE ITSELF COULD
+#                                                SWALLOW A PRODUCER, both closed and pinned: a
+#                                                brace-hex scan must STOP AT THE SPAN CLOSING QUOTE
+#                                                (an unterminated `\x{` ran on to the next `}` on
+#                                                the line, taking the quote and the PIPE with it,
+#                                                so the line decoded to a fraction of itself), and
+#                                                the decode must run at EVERY ENTRY POINT, not
+#                                                only on the top-level line, because a span inside
+#                                                a quoted wrapper BODY is decoded by the INNER
+#                                                shell and not by the outer one (the level-0
+#                                                backslash removal no longer reaches inside a
+#                                                span either).
+#       a `<(` in a wrapper OPTION ARGUMENT          `env -u <(echo a;b) -i grep …` — the quote map
+#                                                  (QI) knew `${…}`, `$(…)` and backticks but not
+#                                                  the process-substitution opener, so a separator
+#                                                  inside it ended the wrapper walk
+#       a SPLIT word for the `printf -v` CARVE-OUT   `gre''p -v …` (a `grep` PRODUCER, flagged) and
+#        (a defect this lane introduced and fixed)    `print''f -v …` (still the carve-out, not
+#                                                  flagged) — the carve-out keyed on the RAW WORD
+#                                                  WIDTH, and an assembled word of the same raw
+#                                                  width matched it, so the split `grep -v`
+#                                                  producer was dropped; it now keys on the
+#                                                  ASSEMBLED WORD (`word == "printf"`), which is
+#                                                  what the carve-out means
+#       the `|&` PIPE OPERATOR (stderr into the      `grep -E "a|b" f |& grep -q p`,
+#        pipe — `cmd 2>&1 | grep`)                   `printf x |& grep -q p`, `echo x |& grep -q p` —
+#                                                  the `&` belongs to the OPERATOR, not to a
+#                                                  backgrounding `&`, and an unquoted `&` is a
+#                                                  separator to the token walk, so `is_grep_cmd`
+#                                                  was handed a `&` token and rejected it: the
+#                                                  consumer word was never read, and the line was
+#                                                  CLEAN at rc 141 under `pipefail` (#864 review
+#                                                  F1). `raw_idiom` could not bridge it either
+#                                                  (`[^|]*[|][ \t]*` cannot cross the `&`). All
+#                                                  three call sites now step over the `&` before
+#                                                  reading the consumer, and 13a pins the form.
+#
+#     ONE DIVERGENCE THE DECODE INTRODUCES, DECLARED: bash 3.2 has no `\u`/`\U` escapes, so on such
+#     a shell `Ech$'\u006f'` is the literal characters and NOT `echo`, while the decode reads it as
+#     echo and flags the line. That is an over-block (visible friction, recoverable through the
+#     exceptions file) in the SAME polarity as the accepted over-blocks above; on bash 4+ the
+#     decode and the shell agree, and the flag is a real detection. `\x{…}` brace-hex IS supported
+#     by bash 3.2 (measured on 3.2.57), so it is a detection, not a divergence.
+#
+#     AND ONE OVER-BLOCK CONSEQUENCE OF THE DECODE, DECLARED AND PINNED (13d): a `grep` that is an
+#     ARGUMENT to another command is flagged when the argument is spelled with an ANSI-C escape
+#     (`foo $'\x67rep' -e "a|b" f | grep -q p`), because the decode makes the plain word visible
+#     and the walk cannot tell an argument from a command word — the SAME declared class as
+#     `ls a/grep | grep -q x`, with the same polarity: the pipeline carries the OTHER command's
+#     output, so the flag is friction, not a live false negative. No live occurrence on this tree
+#     (the whole-repo run is rc 0), and it is recoverable through the exceptions file.
+#     They were CLEAN before #864 as well (no `grep` producer was recognised at all), so none was a
+#     regression; the widening closes them. The class stays open-ended in exactly the way the
+#     wrapper allowlist below is (#1645) — a spelling nobody has thought of is still a false CLEAN.
+#     The closed list is pinned in tests/sigpipe-grep/run.sh 13a (13a2, 13a3, 13a4 and 13a5 assert the
+#     ANSI-C decode separately, so a decoder regression names itself).
 #
 #   · WRAPPERS ARE AN ALLOWLIST, AND THAT IS THE OPEN-ENDED PART (#1645). A command that execs
 #     into grep is seen through — `env`, `nice`, `command`, `time`, `sudo`, `stdbuf`, `exec`,
@@ -53,6 +269,12 @@
 #     completed by construction, so any OTHER wrapper is a false CLEAN. Adding a member is a
 #     one-line change in GREPRE (both matchers) plus the prefix set in is_grep_cmd, plus a pin in
 #     tests/sigpipe-grep/run.sh; nothing else about the guard is wrapper-specific.
+#   · ADDING A PRODUCER WORD IS NOT A ONE-LINE CHANGE — IT TAKES TWO PLACES AND A PIN. WRITERRE
+#     (read by raw_idiom AND by the quoted-body pass, which names it rather than repeating the
+#     word list) and the character ladder in writer_at (scan_idiom). A word added to only one of
+#     the two is a producer the other cannot see — a false CLEAN, the failure this guard exists to
+#     prevent. The by-path fixtures in tests/sigpipe-grep/run.sh 13a pin the class that this gap
+#     produced.
 #   · TWO-STAGE PRODUCERS ARE OUT OF SCOPE. A writer piped through an intermediary (`cat`, `tee`,
 #     `sort`) and then into a quiet grep does eventually kill the writer, because the intermediary
 #     dies when grep exits — but the writer is piped into the INTERMEDIARY, not into grep, and this
@@ -66,7 +288,9 @@
 #     position in which the flag is a substitution, carries no quiet flag in the TEXT. With the
 #     variable unset the command reads all its input; with it set to a quiet flag the writer dies.
 #     A static reader cannot decide that, and treating every unresolvable option token as a
-#     candidate would trade this narrow miss for a wide false block. Recorded, not closed.
+#     candidate would trade this narrow miss for a wide false block. Recorded, not closed. The
+#     same holds for a COMMAND WORD computed by a substitution (`… | $(printf grep) -q p`) or held
+#     in a variable — resolving it means RUNNING it, which is not a text predicate.
 #
 # WHAT IS SCANNED, AND WHERE THIS GUARD HAS TO RUN
 # ------------------------------------------------
@@ -511,7 +735,28 @@ HITS="$(
         # optional path. `printf x | LC_ALL=C grep -q p` IS the idiom (measured rc 141), and both
         # matchers previously reported it clean because neither admitted a prefix. Defined ONCE so
         # the two matchers cannot drift apart on which forms they recognise.
-        GREPRE = "(([A-Za-z0-9._~+-]*/)*([A-Za-z_][A-Za-z0-9_]*=[^ \t]*|env|nice|command|time|sudo|stdbuf|exec|eval|nohup|setsid|timeout|busybox|sh|bash|dash|zsh|ksh)[ \t]+)*([A-Za-z0-9._~+-]*/)*"
+        # The WRAPPER words — a command that EXECS INTO the next one and passes stdin/stdout
+        # through. Named ONCE because two checks need the same list: the consumer prefix grammar
+        # (GREPRE, immediately below) and the producer prefix grammar in writer_at (an option
+        # before the command word belongs to the WRAPPER, not to some other command — without
+        # that test `env -i grep`, `command -p grep`, `stdbuf -oL grep` and `nice --adjustment=5
+        # grep` were reported CLEAN at rc 141; #864 review).
+        WRAPWORDS = "env|nice|command|time|sudo|stdbuf|exec|eval|nohup|setsid|timeout|busybox|sh|bash|dash|zsh|ksh"
+        GREPRE = "(([A-Za-z0-9._~+-]*/)*([A-Za-z_][A-Za-z0-9_]*=[^ \t]*|" WRAPWORDS ")[ \t]+)*([A-Za-z0-9._~+-]*/)*"
+        # The PRODUCER words whose stdout, piped into a quiet grep, is the class this guard
+        # bans. `grep` joined the set in #864: the mechanism is `pipefail` plus the early
+        # exit of a quiet grep, so a `grep` upstream takes the signal exactly as the builtin
+        # writers do.
+        # ⛔ THE PRODUCER SET LIVES IN TWO PLACES AND BOTH MUST CHANGE TOGETHER —
+        #     this regex (read by raw_idiom only) and the character ladder in writer_at().
+        #     writer_at is hand-written because substr() per index made the walk quadratic
+        #     (27 s for a 1 MB line), and a WORD here with no branch there is a producer that
+        #     scan_idiom — the authoritative walk — cannot see, i.e. exactly the false CLEAN
+        #     the union of the two matchers exists to eliminate. Unlike GREPRE (single use),
+        #     WRITERRE cannot be single-sourced at an acceptable cost.
+        # NOTE: this program is a SINGLE-QUOTED shell word, so an apostrophe in any of these
+        # comment lines would terminate it and break the whole script — keep them apostrophe-free.
+        WRITERRE = "(printf|echo|grep)"
       }
       # The QUOTED BODY of a shell-out wrapper is a command in its own right and inherits the
       # wrapper stdin: `printf x | sh -c "grep -q p"` and `printf x | eval "grep -q p"` both pipe
@@ -628,6 +873,7 @@ HITS="$(
           if (q == 0) {
             if (c == " " || c == "\t") break
             if (c == "$" && CH[i + 1] == "\047") { q = 3; i += 2; continue }
+            if (c == "$" && CH[i + 1] == "\"") { q = 2; i += 2; continue }
             if (c == "\047") { q = 1; i++; continue }
             if (c == "\"") { q = 2; i++; continue }
             if (c == "\\") { i++; if (i <= CHN) { tokchar(CH[i]); if (tk < 400) { TOK = TOK CH[i]; tk++ }; i++ } ; continue }
@@ -780,7 +1026,10 @@ HITS="$(
         off = 0
         while (off < length(s)) {
           rest = substr(s, off + 1)
-          if (!match(rest, "(printf|echo)[^|]*[|][ \t]*" GREPRE "grep[ \t]+"))
+          # `[&]?` is the `|&` pipe operator (`2>&1 |`): the `&` is part of the pipe, not a
+          # backgrounding separator, so the GREPRE consumer follows it. Without this the `&`
+          # broke the bridge and the form was CLEAN at rc 141 (#864 review F1).
+          if (!match(rest, WRITERRE "[^|]*[|][&]?[ \t]*" GREPRE "grep[ \t]+"))
             return 0
           pos = off + RSTART
           # An offset, not a slice: the walk is bounded by the grep COMMAND it is reading, never by
@@ -944,7 +1193,7 @@ HITS="$(
         q = ""; ansi = 0; esc = 0
         for (i = start; i <= CHN; i++) {
           c = CH[i]
-          if (esc) { esc = 0; continue }
+          if (esc) { esc = 0; w = writer_at(s, i); if (w && scan_from(i + w)) return 1; continue }
           if (q != "") {
             if ((q == "\"" || ansi) && c == "\\") { esc = 1; continue }
             if (c == q) { q = ""; ansi = 0 }
@@ -959,38 +1208,276 @@ HITS="$(
           if (c == "<" && CH[i + 1] == "(") return 0
           if (c == "|") {
             if (CH[i + 1] == "|") return 0
-            g = is_grep_cmd(i + 1)
+            # `|&` folds stderr into the pipe (`2>&1 |`), so the consumer begins after the `&`.
+            # `is_grep_cmd` rejects a leading `&` token (an unquoted `&` is a separator), so the
+            # walk must step over it or the whole consumer is never read (#864 review F1).
+            g = (CH[i + 1] == "&") ? is_grep_cmd(i + 2) : is_grep_cmd(i + 1)
             return (g == -1 || (g && has_quiet(g))) ? 1 : 0
           }
         }
         return 0
       }
-      # Is there a writer word at `i`, and how long is it? A writer is a `printf`/`echo` at a command
-      # boundary whose next character ends the word; `printf -v NAME` writes to a shell variable, not
-      # to stdout, so it cannot SIGPIPE, and a writer that is an ARGUMENT to another command is not a
-      # writer either (in `grep -e echo -e "a|b" f | grep -q p` the pipeline carries grep output).
-      function writer_at(s, i,   prev, nxt, w, j, k, tokn) {
-        w = 0
-        # Character comparisons against the pre-split array: `substr(s, i, 6)` per index over a long
-        # line is O(n) PER CALL in this awk and made the walk quadratic (27 s for a 1 MB line).
-        if (CH[i] == "e") {
-          if (CH[i + 1] == "c" && CH[i + 2] == "h" && CH[i + 3] == "o") w = 4
-        } else if (CH[i] == "p") {
-          if (CH[i + 1] == "r" && CH[i + 2] == "i" && CH[i + 3] == "n" && CH[i + 4] == "t" && CH[i + 5] == "f") w = 6
+      # Is there a writer word at `i`, and how long is it? A writer is a `printf`/`echo`/`grep` at a
+      # command boundary whose next character ends the word; `printf -v NAME` writes to a shell
+      # variable, not to stdout, so it cannot SIGPIPE, and a writer that is an ARGUMENT to another
+      # command is not a writer either (in `foo -e echo -e "a|b" f | grep -q p` the pipeline
+      # carries foo output, and the `echo` is an option argument, not a command).
+      # KEEP IN STEP WITH WRITERRE (see the note at its definition): the assembly below is the
+      # only producer list scan_idiom consults.
+      # The numeric value of the digits in `s` in `base`: the ANSI-C escape decoder below needs it
+      # and this awk has no strtonum.
+      function numval(s, base,   i, c, d, v) {
+        v = 0
+        for (i = 1; i <= length(s); i++) {
+          c = tolower(substr(s, i, 1))
+          d = index("0123456789abcdef", c) - 1
+          if (d < 0 || d >= base) break
+          v = v * base + d
         }
-        if (w == 0) return 0
+        return v
+      }
+      # The character the C escape letter `ch` stands for, so a dollar-single-quoted span is
+      # decoded the way the shell decodes it (`\n` is a newline, `\t` a tab). An unknown escape is
+      # itself.
+      function ctrl_char(ch) {
+        if (ch == "a") return sprintf("%c", 7)
+        if (ch == "b") return sprintf("%c", 8)
+        if (ch == "e" || ch == "E") return sprintf("%c", 27)
+        if (ch == "f") return sprintf("%c", 12)
+        if (ch == "n") return sprintf("%c", 10)
+        if (ch == "r") return sprintf("%c", 13)
+        if (ch == "t") return sprintf("%c", 9)
+        if (ch == "v") return sprintf("%c", 11)
+        if (ch == "?") return "?"
+        if (ch == "\\") return "\\"
+        if (ch == "\047") return "\047"
+        if (ch == "\"") return "\""
+        # "" for an escape the C table does not know, so the caller can KEEP THE BACKSLASH the way
+        # the shell does (see the escape rules in ansi_decode).
+        return ""
+      }
+      # ── ansi_decode(s): the line with every live dollar-single-quoted span (a `$` followed by a
+      # `\047`) replaced by the characters the shell will actually see. THIS IS THE ONE SEAM FOR THE
+      # WHOLE ANSI-C SPELLING FAMILY.
+      # --------------------------------------------------------------------------------------------
+      # Four review rounds each found another spelling of the same conjunction and each fix was
+      # local to where the last one was measured: the OCTAL escaped producer word (prin, `\164`,
+      # f), then the escaped WRAPPER word, then the escaped CONSUMER word (printf x | gre, `\x70`,
+      # -q p) and `\x{70}` (a bash brace-hex form the two-digit form does not cover) — every one of
+      # them CLEAN at rc 141. Enumerating spellings is unbounded by construction (the SCOPE header
+      # says so); decoding the line ONCE and running the SAME two matchers on the result is bounded,
+      # and it closes all three sides together, because after decoding there is no spelling left to
+      # enumerate — the text IS what the shell runs.
+      #
+      # The decode is TEXTUAL and only fires where ANSI-C quoting is LIVE: inside a single-quoted
+      # span it is literal, and inside a DOUBLE-quoted span bash does not treat the `$` `\047` form
+      # as ANSI-C at all, so both are copied verbatim. An escape that does not parse follows BASH,
+      # which is NOT the verbatim rule: an escape the C table does not know keeps its backslash, and
+      # a malformed brace-hex yields NOTHING (both measured on 3.2.57). And the span is re-emitted as
+      # a QUOTED WORD — see the emission note below, which is what keeps a data metacharacter from
+      # being re-read as syntax.
+      #
+      # KNOWN DIVERGENCE, DECLARED: bash 3.2 has no `\u`/`\U` (it leaves the escape as literal
+      # characters), so decoding one flags a word like Ech + `\u006f` on such a shell although the
+      # shell would not run echo. That is an OVER-BLOCK (visible friction, recoverable through the
+      # exceptions file), and it is the same polarity as every other accepted over-block here.
+      function ansi_decode(s,   i, n, out, c, c2, q, st, hb, hs, mx, word, qv, ch, bad, k) {
+        if (index(s, "$\047") == 0) return s
+        n = length(s); out = ""; q = 0
+        for (i = 1; i <= n; i++) {
+          c = substr(s, i, 1)
+          if (q == 1) { out = out c; if (c == "\047") q = 0; continue }
+          if (q == 2) {
+            out = out c
+            if (c == "\\") { i++; if (i <= n) out = out substr(s, i, 1) }
+            else if (c == "\"") q = 0
+            continue
+          }
+          if (c == "\047") { q = 1; out = out c; continue }
+          if (c == "\"") { q = 2; out = out c; continue }
+          if (c == "\\") { out = out c; i++; if (i <= n) out = out substr(s, i, 1); continue }
+          if (c != "$" || substr(s, i + 1, 1) != "\047") { out = out c; continue }
+          i += 2; word = ""
+          while (i <= n) {
+            c = substr(s, i, 1)
+            if (c == "\047") break
+            if (c != "\\") { word = word c; i++; continue }
+            st = i
+            i++
+            if (i > n) { word = word "\\"; break }
+            c = substr(s, i, 1)
+            if (c == "x" && substr(s, i + 1, 1) == "{") {
+              # A BRACE-hex escape is consumed WHOLE, brace included, and a malformed one yields
+              # NOTHING — measured on bash 3.2.57: `\x{70}` is p, while `\x{}`, `\x{ZZ}` and an
+              # unterminated `\x{` are all EMPTY. Copying those verbatim is what hid
+              # `print` + `\x{}` + `f` (which IS printf) from this guard (#864 review).
+              i += 2; hb = ""; bad = 0
+              # The brace scan STOPS AT THE SPAN CLOSING QUOTE: a `}` may never come, and running
+              # past the quote swallowed the REST OF THE LINE — the pipe included — so
+              # `print$'\x{'f '%s' "$T" | grep -q bar` decoded to `print` and reported CLEAN at
+              # rc 141 (#864 review). An unterminated brace-hex yields NOTHING, as bash does.
+              while (i <= n && substr(s, i, 1) != "}" && substr(s, i, 1) != "\047") {
+                if (bad || substr(s, i, 1) !~ /[0-9A-Fa-f]/) bad = 1
+                else hb = hb substr(s, i, 1)
+                i++
+              }
+              if (i <= n && substr(s, i, 1) == "}") {
+                i++
+                if (!bad && hb != "") word = word sprintf("%c", numval(hb, 16))
+              }
+              continue
+            }
+            if (c == "x" || c == "u" || c == "U") {
+              mx = (c == "x") ? 2 : ((c == "u") ? 4 : 8)
+              i++; hs = ""
+              while (i <= n && length(hs) < mx && substr(s, i, 1) ~ /[0-9A-Fa-f]/) { hs = hs substr(s, i, 1); i++ }
+              if (hs == "") word = word "\\" c
+              else word = word sprintf("%c", numval(hs, 16))
+              continue
+            }
+            if (c ~ /[0-7]/) {
+              hs = ""
+              while (i <= n && length(hs) < 3 && substr(s, i, 1) ~ /[0-7]/) { hs = hs substr(s, i, 1); i++ }
+              word = word sprintf("%c", numval(hs, 8))
+              continue
+            }
+            # An escape the C table does not know KEEPS ITS BACKSLASH: bash 3.2 leaves `\q`, `\;`,
+            # `\8`, `$` preceded by a backslash, all as the two characters. Dropping the backslash
+            # manufactured a live `;`/`&`/`|` out of a data character (#864 review).
+            ch = ctrl_char(c)
+            if (ch == "") word = word "\\" c
+            else word = word ch
+            i++
+          }
+          # EMIT THE SPAN AS A QUOTED WORD, NOT AS BARE TEXT. The shell expansion yields ONE
+          # WORD; its characters are data and are never re-parsed as syntax. Emitting them bare
+          # made an argument whose value is a pipe read as a real PIPELINE by the matchers —
+          # so a gre + escape producer with a brace-hex or octal pipe in its own argument, which
+          # the previous revision flagged, went CLEAN (#864 review). Quoting restores the word
+          # boundary the shell has, which is also what makes this decode usable on the WRAPPER and
+          # CONSUMER sides.
+          qv = ""
+          for (k = 1; k <= length(word); k++) {
+            c2 = substr(word, k, 1)
+            if (c2 == "\047") qv = qv "\047\\\047\047"
+            else qv = qv c2
+          }
+          out = out "\047" qv "\047"
+        }
+        return out
+      }
+      function writer_at(s, i,   prev, nxt, w, j, k, tokn, p, q, pw, ph, pto, ok, word, c, n) {
+        w = 0
+        # The command word is ASSEMBLED one literal character at a time with shell quoting and
+        # escaping REMOVED, so a producer whose LETTERS are separated by quote runs or backslashes
+        # (a doubled apostrophe pair inside the word, a backslash escape, a split double-quoted
+        # span, a dollar-single-quoted span) is the same command as its contiguous spelling. A fixed
+        # character ladder could only see the contiguous form, and BOTH matchers were blind to the
+        # split ones — every one of them CLEAN at rc 141 (#864 review). The first-character test
+        # keeps this O(1) for the common case; the assembly is bounded by the longest producer word.
+        if (CH[i] != "e" && CH[i] != "p" && CH[i] != "g") return 0
+        word = ""; j = i; n = 0
+        while (j <= CHN && n < 7) {
+          c = CH[j]
+          # An ANSI-C span is SKIPPED here, not decoded: the whole line is decoded ONCE by
+          # ansi_decode() and the same matchers are run on the result, which is what closes the
+          # spelling family on the PRODUCER side, the WRAPPER side and the CONSUMER side at once
+          # (see the note at that function). This walk then sees the plain characters the shell
+          # will run.
+          if (c == "$" && (CH[j + 1] == "\047" || CH[j + 1] == "\"")) { j += 2; continue }
+          if (c == "\\") { j++; if (j > CHN) break; c = CH[j] }
+          else if (c == "\047" || c == "\"") { j++; continue }
+          else if (c ~ /[ \t;&|()<>`{}]/) break
+          word = word c; j++; n++
+        }
+        # A `grep` is a PRODUCER for this predicate (#864): the mechanism is `pipefail` plus the
+        # downstream quiet grep early exit, so a grep upstream takes the signal exactly as a
+        # builtin writer does. No quietness model: a producer that writes nothing is flagged as a
+        # SHAPE, which is the documented over-block (see the SCOPE header).
+        if (word != "echo" && word != "printf" && word != "grep") return 0
+        w = j - i
         # A backtick starts a command substitution, so a writer right after one is a writer.
         prev = (i == 1) ? " " : CH[i - 1]
-        if (prev !~ /[ \t;&|({`]/) return 0
+        # A PATH-PREFIXED command word is the SAME command, and the producer side must accept
+        # the path the consumer side already accepts (GREPRE carries ([A-Za-z0-9._~+-]*/)*):
+        # without this, `/usr/bin/grep -E "a|b" f | grep -q p` was seen by NEITHER matcher —
+        # raw_idiom cannot cross the quoted pipe, and scan_idiom rejected the path — and that
+        # shape is a measured false CLEAN at rc 141 (#864 review). The walk runs only when the
+        # word is preceded by `/`, so the common case pays nothing.
+        if (prev == "/") {
+          p = i - 1
+          while (p >= 1 && CH[p] == "/") {
+            q = p - 1
+            while (q >= 1 && CH[q] ~ /[A-Za-z0-9._~+{}$-]/) q--
+            p = q
+          }
+          prev = (p < 1) ? " " : CH[p]
+        }
+        # A QUOTED or ESCAPED command word is the same command (the shell removes the quoting), and
+        # `raw_idiom` was deliberately left unanchored to keep exactly these spellings flagged — but
+        # a data pipe inside the producer argument defeats that matcher, so scan_idiom has to see
+        # them too, or the two blind spots meet: both were CLEAN at rc 141 (#864 review).
+        if (prev !~ /[ \t;&|({`"\\\047]/) return 0
         nxt = CH[i + w]
-        if (nxt != "" && nxt !~ /[ \t]/) return 0
-        if (w == 6 && substr(s, i + w, 10) ~ /^[ \t]+-v/) return 0
+        # A quote or a backslash DIRECTLY after the word is its own quoting (the `"grep"` spelling),
+        # not the start of another word: `grepx` must stay rejected, `grep"` must not.
+        if (nxt != "" && nxt !~ /[ \t"\047\\]/) return 0
+        if (w != 0 && word == "printf" && substr(s, i + w, 10) ~ /^[ \t]+-v/) return 0
         j = i - 1
         while (j >= 1 && (CH[j] == " " || CH[j] == "\t")) j--
         k = j
         while (k >= 1 && CH[k] !~ /[ \t;&|({]/) k--
         tokn = substr(s, k + 1, j - k)
-        if (tokn ~ /^-/) return 0
+        if (tokn ~ /^-/) {
+          # The preceding token is an OPTION — but an option belongs to the command BEFORE it, and a
+          # WRAPPER option does not stop the word being a command: in `env -i grep` the option
+          # belongs to env, and `grep` is the operand whose stdout owns the pipe. The case this test
+          # exists for is a writer that is an OPTION ARGUMENT of another command (`foo -e echo -e
+          # …`), and there no wrapper precedes the option, so it stays rejected.
+          #
+          # Walk back over EVERY token of the simple command — options, the SEPARATED ARGUMENT of an
+          # option (`env -u FOO -i grep`, `stdbuf -i0 -o0 grep`) and `--` — and accept the word if ANY
+          # of them names a wrapper. One token back is not enough: it lands on the separated argument
+          # (`FOO`) or on an earlier option (`-i0`), the wrapper is never reached, and the line was
+          # reported CLEAN at rc 141 (#864 review). The walk stops at a statement separator, so a
+          # producer in the PREVIOUS command cannot vouch for this one.
+          pw = k - 1
+          ok = 0
+          while (pw >= 1) {
+            while (pw >= 1 && (CH[pw] == " " || CH[pw] == "\t")) pw--
+            if (pw < 1) break
+            ph = pw
+            # A token boundary is ` \t;&|` and NOTHING else — but only an UNQUOTED one counts.
+            # `(`, `)`, `{` and `}` are ORDINARY CHARACTERS inside a quoted word (unquoted they are
+            # shell metacharacters, which is why the walk never needed them as boundaries), and a
+            # quoted or escaped `;`/`&`/`|` is DATA, not a statement separator: breaking on them
+            # ended the walk before the wrapper was reached (`env -u "x(y" -- grep …`,
+            # `env -u x} -- grep …`, and a quoted or escaped separator in the option argument) —
+            # reported CLEAN at rc 141 (#864
+            # review). QI marks quoted/escaped positions; only a real statement separator stops the
+            # walk, so a producer in the PREVIOUS command cannot vouch for this one.
+            while (ph >= 1 && (QI[ph] || CH[ph] !~ /[ \t;&|]/)) ph--
+            pto = substr(s, ph + 1, pw - ph)
+            # A QUOTED or ESCAPED wrapper word (`"env" -i grep`, `\env -i grep`), and the
+            # ANSI-C or locale dollar-quoted spellings of it, is still that command, and
+            # this walk reads RAW text, so its quoting is stripped before the match — the same
+            # allowance `writer_at` already makes for the producer word itself. Comparing the
+            # quoted forms against the WRAPWORDS list failed and reported CLEAN at rc 141
+            # (#864 review).
+            gsub(/[$"\\\047]/, "", pto)
+            sub(/.*\//, "", pto)
+            if (pto ~ "^(" WRAPWORDS ")$") { ok = 1; break }
+            if (ph < 1 || CH[ph] ~ /[;&|]/) break
+            pw = ph - 1
+          }
+          if (!ok) return 0
+        }
+        # A QUOTE-CLOSED word carries its own quoting: report the length
+        # INCLUDING the closing quote, so the caller restarts OUTSIDE it. Restarting ON the closing
+        # quote mis-pairs the rest of the line — `"grep" -E "a|b" f | grep -q p` reopened a quote at
+        # the closing one, re-paired `"a|b"` as unquoted, and charged the DATA pipe to the writer,
+        # reporting CLEAN at rc 141 (#864 review).
+        if ((prev == "\"" || prev == "\047") && nxt == prev) return w + 1
         return w
       }
       # Try EVERY writer at a command boundary — a line may hold more than one shell invocation,
@@ -1003,23 +1490,40 @@ HITS="$(
       # — and that is the ONLY reason a per-line scan budget existed. A budget can be spent two
       # ways, scan less (a false clean) or refuse a verdict, so removing the rescan removes the need
       # for it rather than choosing which failure to accept.
-      function scan_idiom(s,   i, c, q, ansi, esc, w, active, g, br, pd, ad, bt) {
-        q = ""; ansi = 0; esc = 0; active = 0; br = 0; pd = 0; ad = 0; bt = 0
+      function scan_idiom(s,   i, c, q, ansi, esc, w, active, g, br, pb, pd, ad, bt, d, inside) {
+        q = ""; ansi = 0; esc = 0; active = 0; br = 0; pb = 0; pd = 0; ad = 0; bt = 0
+        delete SA; delete SAd
         # Nothing to find on a line with no pipe at all, and this is the common case for the
         # many-writers pathology (`echo ` repeated): without it every writer drove a walk.
         if (index(s, "|") == 0) return 0
         for (i = 1; i <= CHN; i++) {
           c = CH[i]
-          if (esc) { esc = 0; continue }
+          # An ESCAPED command word is still that command (`\grep` runs grep), so the word after a
+          # backslash is tested too — otherwise `\grep -E "a|b" f | grep -q p` is CLEAN while the
+          # unescaped form is flagged (#864 review).
+          if (esc) { esc = 0; w = writer_at(s, i); if (w && scan_from(i + w)) return 1; continue }
           if (q != "") {
             # A writer inside the quoted region: scan it in its OWN quoting context (see scan_from).
             w = writer_at(s, i)
             if (w && scan_from(i + w)) return 1
+            # ...and keep it as the active writer for the ENCLOSING context too. A wrapper BODY is a
+            # quoted region holding the command whose stdout owns the outer pipe, and the apostrophes
+            # in this comment had to be removed because the awk program is ONE SHELL WORD: an
+            # apostrophe anywhere in it ends the quoting and breaks the whole script. Restarting at
+            # the body closing quote re-opened quoting, so the outer pipe was never charged and the
+            # line was CLEAN at rc 141 (#864 review).
+            if (w) { active = 1; ad = pd }
             if ((q == "\"" || ansi) && c == "\\") { esc = 1; continue }
             if (c == q) { q = ""; ansi = 0 }
             continue
           }
-          if (c == "$" && CH[i + 1] == "\047") { q = "\047"; ansi = 1; i++; continue }
+          if (c == "$" && CH[i + 1] == "\047") {
+            # The word can OPEN with the ANSI-C span (a `$` `\047` pair, so the escape is BEFORE
+            # the first letter), so test it at the dollar: this branch is about to consume both characters and enter the quoted region,
+            # which would leave the escape the word depends on BEHIND the entry point.
+            w = writer_at(s, i); if (w && scan_from(i + w)) return 1
+            q = "\047"; ansi = 1; i++; continue
+          }
           if (c == "\\") { esc = 1; continue }
           if (c == "\"" || c == "\047") { q = c; ansi = 0; continue }
           # GROUPING. A `( ... )` SUBSHELL passes its stdout on, so a writer inside it keeps the
@@ -1029,42 +1533,92 @@ HITS="$(
           # the substitution was merely an ARGUMENT of the writer, lost a pipe that was never
           # captured. CS[d] marks the depth at which the output is captured; AD is the depth of the
           # writer that owns the pipe, and the closer only clears a writer inside the capture.
-          if (c == "$" && CH[i + 1] == "(") { pd++; CS[pd] = 1; i++; continue }
-          if (c == "<" && CH[i + 1] == "(") { pd++; CS[pd] = 1; active = 0; i++; continue }
+          #
+          # The writer state is SAVED ON ENTRY and RESTORED ON EXIT, not merely masked: a writer
+          # INSIDE the capture overwrites `active`/`ad` (a single pair of globals), so a pipe inside
+          # the capture is judged against the INNER writer — the enclosing writer OWNERSHIP of the
+          # pipe is gone by the time the capture closes, and its real pipe is never evaluated:
+          #     grep -f <(grep -v x f | head) f | grep -q p      # rc 141, reported CLEAN before this
+          #     grep -f $(grep -v x f | head -1) f | grep -q p  # rc 141, reported CLEAN before this
+          # `ad >= pd` cleared the INNER writer correctly, but that is not enough, because the
+          # INNER pipe had already reset `active` to 0 and the OUTER writer was never re-seated.
+          # The stack re-seats it, so the outer writer is still holding the pipe at the outer `|`
+          # (CS[pd] distinguishes a capture — restore — from a subshell `( … )`, which passes its
+          # stdout on and therefore keeps the inner writer as the owner of it).
+          if (c == "$" && CH[i + 1] == "(") {
+            pd++; CS[pd] = 1; SA[pd] = active; SAd[pd] = ad; i++; continue
+          }
+          if (c == "<" && CH[i + 1] == "(") {
+            # `<(` is INPUT redirection: it feeds one ARGUMENT and does NOT move the stdout of the
+            # command it belongs to off the pipe. Clearing the writer here lost `grep -f <(cat
+            # list) f | grep -q p`, a measured 141 reported CLEAN (#864 review). `CS[pd]` still marks
+            # the depth as captured, so a writer INSIDE the substitution is cleared at its closer.
+            pd++; CS[pd] = 1; SA[pd] = active; SAd[pd] = ad; i++; continue
+          }
           if (c == "`") {
-            if (bt == 0) { pd++; CS[pd] = 1; bt = 1 }
-            else { if (ad >= pd) active = 0; pd--; bt = 0 }
+            if (bt == 0) { pd++; CS[pd] = 1; SA[pd] = active; SAd[pd] = ad; bt = 1 }
+            else { active = SA[pd]; ad = SAd[pd]; pd--; bt = 0 }
             continue
           }
           if (c == "(") { pd++; CS[pd] = 0; continue }
           if (c == ")") {
-            if (pd > 0) { if (CS[pd] && ad >= pd) active = 0; pd-- }
+            if (pd > 0) { if (CS[pd]) { active = SA[pd]; ad = SAd[pd] }; pd-- }
             else active = 0
             continue
           }
           # `{ ...; }` groups: a `;` inside the group does not take the writer off the pipe, and the
-          # closing brace does not either — the GROUP stdout is the pipe. A `}` with no group open
-          # is conservative and clears the writer. `${x}` does not open one: its `{` follows a `$`,
-          # not a command boundary.
-          if (c == "{") { if (i == 1 || CH[i - 1] ~ /[ \t;&|(]/) br++; continue }
-          if (c == "}") { if (br > 0) br--; else active = 0; continue }
+          # closing brace does not either — the GROUP stdout is the pipe. `${x}` is NOT a group: its
+          # `{` follows a `$`, so it opens none — and its `}` must close none either, or it lands in
+          # the `br == 0` branch and CLEARS THE WRITER: `/usr/bin/grep -E "a|b" ${y} f | grep -q p`
+          # was reported CLEAN at rc 141 by an unquoted braced variable among the producer arguments
+          # (#864 review). PB counts parameter expansions, so the two braces are matched to each
+          # other.
+          if (c == "{") {
+            if (i > 1 && CH[i - 1] == "$") pb++
+            else if (i == 1 || CH[i - 1] ~ /[ \t;&|(]/) br++
+            continue
+          }
+          if (c == "}") {
+            # A `}` that closes neither a counted `{ …; }` group nor a counted `${…}` parameter is
+            # not a group close at all: bash treats it as an ORDINARY WORD CHARACTER there (brace
+            # expansion `f{1,2}.txt`, `f{,}`, an argument that is a bare `}`, and a second `}` after
+            # `${y}`). Clearing the writer on it took the producer off the pipe and reported CLEAN
+            # at rc 141 (#864 review). It now stays conservative in the OTHER direction: an
+            # unmatched `}` leaves the writer ACTIVE, which can only over-block.
+            if (pb > 0) pb--
+            else if (br > 0) br--
+            continue
+          }
           if (c == ";") { if (br == 0) active = 0; continue }
           # `&&` ends the command; a bare `&` backgrounds the writer, so its stdout is not this
           # pipe. `2>&1` is NOT that case: there the `&` is preceded by `>`.
           if (c == "&" && CH[i + 1] == "&") { active = 0; i++; continue }
           if (c == "&" && CH[i - 1] != ">") { active = 0; continue }
           # `>` after a digit is an fd redirection and keeps stdout on the pipe; a bare `>`
-          # redirects stdout away, and a process substitution takes it off the pipe too.
+          # redirects stdout away. A process substitution is handled ABOVE (`<(` is input
+          # redirection and does NOT take stdout off the pipe), so there is no second `<(` test
+          # here — the only one that existed was unreachable and stated the opposite rule.
           if (c == ">" && CH[i - 1] !~ /[0-9]/) { active = 0; continue }
-          if (c == "<" && CH[i + 1] == "(") { active = 0; continue }
           if (c == "|") {
             if (CH[i + 1] == "|") { active = 0; i++; continue }
+            # A pipe INSIDE a capture (`$( … )`, `<( … )`, backticks) belongs to the nested command,
+            # not to a writer outside it: `grep -f <(cat list | head -2) f | grep -q p` charged the
+            # INNER pipe to the outer grep, so the real pipe was never owned and the line was
+            # reported CLEAN at rc 141 (#864 review).
+            if (active) {
+              inside = 0
+              for (d = ad + 1; d <= pd; d++) if (CS[d]) { inside = 1; break }
+              if (inside) continue
+            }
             # The FIRST unquoted pipe after a writer takes its stdout. If the command that reads it
             # is not a quiet grep, nothing further along the line belongs to this writer:
             # `printf ... | sed ... | grep -q` is two stages down, not the adjacent-writer idiom
             # this guard defines, and charging a later pipe to it would be a false block.
             if (active) {
-              g = is_grep_cmd(i + 1)
+              # `|&` — the `&` is part of the pipe operator, so the consumer token starts after
+              # it; `is_grep_cmd` rejects a leading `&` (an unquoted separator), which left the
+              # consumer unread and the line CLEAN at rc 141 (#864 review F1).
+              g = (CH[i + 1] == "&") ? is_grep_cmd(i + 2) : is_grep_cmd(i + 1)
               # -1 is the body sentinel from a shell-out wrapper: the quiet grep is the BODY, so
               # there is no flag index to walk (`printf x | sh -c "grep -q p"`).
               if (g == -1) return 1
@@ -1078,15 +1632,173 @@ HITS="$(
         }
         return 0
       }
-      function is_idiom(s) {
+      # THE WRAPPER-BODY PRODUCER (the fourth declared class in 13a).
+      # -------------------------------------------------------------
+      # The two matchers above BOTH miss the same conjunction: a `grep` producer whose own
+      # argument carries a literal `|`, inside a quoted body. raw_idiom cannot cross that data
+      # pipe with its `[^|]*` bridge, and scan_from abandons at the first pipe it meets because
+      # the level-0 backslash that escapes the inner quote is read as a level-1 escape, so the
+      # data pipe looks like a real break:
+      #     eval "grep -vE \"x|y\" f | grep -q needle"      # rc 141, reported CLEAN before this
+      #     env -S "grep -vE x|y f" | grep -q needle        # rc 141, reported CLEAN before this
+      # A body is a shell program in its own right, so the pass below RE-READS each quoted
+      # region the way the inner shell will. The inner shell removes the level-0 escape
+      # backslashes before it parses, so those are removed here too, and the resolved body is
+      # fed BACK THROUGH the two matchers above - it is not re-decided by a third, weaker
+      # predicate. That is what keeps this from over-blocking: a plain string that merely
+      # MENTIONS a pipe and a grep (an echo of a message, a `--status` option) is not an idiom,
+      # and the full matchers say so.
+      #
+      # The worklist is ITERATIVE, never recursive: a body can itself contain a body (an eval
+      # inside an eval), and recursing into `matchers` would clobber the global CH that the
+      # outer walk is mid-way through. `is_idiom` therefore drives a queue, and each entry is
+      # analysed only after the previous one has finished with CH.
+      #
+      # Only a body carrying BOTH a pipe and a producer word can hold the self-contained idiom,
+      # so the cheap filter keeps the queue (and the O(body count) re-scan) off the common
+      # clean line. The other shape - the body is the PRODUCER and the wrapper stdout is piped
+      # straight on - is decided directly on the line, with no queue entry.
+      function body_enqueue(b,   QK) {
+        # A quoted body often repeats (`"$a"` and `"$a"` on one line); the queue only needs
+        # the distinct strings, so skip a body already queued.
+        for (QK = 1; QK <= QN; QK++) if (QB[QK] == b) return
+        QN++; QB[QN] = b
+      }
+      function bodies_of(s,   i, c, q, ansi, beg, end, body, nb, j, k, g) {
+        for (i = 1; i <= CHN; i++) {
+          c = CH[i]
+          if (q == "") {
+            if (c == "$" && CH[i + 1] == "\047") { q = "\047"; ansi = 1; i++; beg = i + 1; continue }
+            if (c == "\"" || c == "\047") { q = c; ansi = 0; beg = i + 1; continue }
+            continue
+          }
+          # The quote flavours resolve escapes differently: a backslash escapes the next
+          # character inside double quotes and inside an ANSI-C dollar-single form, and is literal inside
+          # a plain single-quoted body.
+          if ((q == "\"" || ansi) && c == "\\") { i++; continue }
+          if (c != q) continue
+          end = i
+          body = substr(s, beg, end - beg)
+          q = ""; ansi = 0
+          # The inner shell has already removed the level-0 backslashes here, and dropping them ALL
+          # is the coarse approximation body_quiet makes too — EXCEPT inside an ANSI-C span, whose
+          # backslashes are escapes the INNER shell decodes: stripping them turned `gre$'\x70'` into
+          # `gre$'x70'` and a producer inside a wrapper BODY went CLEAN (#864 review). Those spans
+          # are copied through untouched.
+          nb = ""; j = 1
+          while (j <= length(body)) {
+            c = substr(body, j, 1)
+            if (c == "$" && substr(body, j + 1, 1) == "\047") {
+              k = j + 2
+              while (k <= length(body) && substr(body, k, 1) != "\047") k++
+              nb = nb substr(body, j, k - j + 1)
+              j = k + 1
+              continue
+            }
+            if (c != "\\") nb = nb c
+            j++
+          }
+          if (index(nb, "|") > 0 && nb ~ WRITERRE "[ \t]") body_enqueue(nb)
+          # The wrapper whose BODY is the producer and whose stdout is piped straight on:
+          # `env -S "grep -vE x|y f" | grep -q needle`. Only the FIRST command of a resolved
+          # body can be the wrapper command, so the test is anchored at its start.
+          j = end + 1
+          while (j <= CHN && (CH[j] == " " || CH[j] == "\t")) j++
+          if (j <= CHN && CH[j] == "|" && CH[j + 1] != "|") {
+            if (nb ~ "^[ \t]*" GREPRE WRITERRE "([ \t]|$)") {
+              # `|&` carries the `&` in the operator, so the consumer token starts after it.
+              g = (CH[j + 1] == "&") ? is_grep_cmd(j + 2) : is_grep_cmd(j + 1)
+              if (g == -1 || (g && has_quiet(g))) return 1
+            }
+          }
+        }
+        return 0
+      }
+      # The two original matchers in one place; also rebuilds CH for the body walk of the caller.
+      function matchers(s,   i, qq, sdd, btt, d) {
+        # THE DECODE LIVES HERE, not at the top-level caller, so EVERY entry point gets it: the raw
+        # line, a wrapper BODY, and a body nested in a body. Putting it only at the top level left a
+        # span inside a quoted wrapper body reported CLEAN, where the INNER shell decodes it and the
+        # outer one does not — a regression against the per-site revision (#864 review).
+        # The decoded text goes through THESE SAME matchers, never a third predicate, and the
+        # recursion is depth-1 because the emitted text carries no live ANSI-C span.
+        d = ansi_decode(s)
+        if (d != s && matchers(d)) return 1
         # The line is split into characters ONCE per logical line and the walks read CH: in this awk
         # `substr(s, i, 1)` is O(n) PER CALL, so a character walk built on it is quadratic in the
         # line length (measured: an 800 KB token took 24 s, a 1 MB option list 28 s).
+        # Nothing to find on a line with NO pipe at all, and this is the common case for the
+        # many-producers pathology: `raw_idiom` bridges `[^|]*[|]` from EVERY producer word and
+        # rescans the rest of the line looking for the `|` that is not there, so the cost is
+        # quadratic in the line length. `grep` appears far more often in shell text than printf or
+        # echo, so widening WRITERRE extended a latent hazard into a reachable one (measured on the
+        # order of tens of seconds for a ~256 KB single-line fixture on a loaded box, against under
+        # half a second through this fast path). THE FAST PATH COVERS ONLY A LINE WITH NO PIPE AT
+        # ALL: a line that DOES carry a pipe and holds many producer words is still superlinear
+        # (measured 3-32 s at ~78 KB and 22-52 s at ~234 KB across runs, wall time varying with
+        # fleet load). That residual is a STATED LIMIT, not closed, and it does not occur in the
+        # scanned corpus (the whole-repo run is rc 0 over 116 files in ~5 s).
+        if (index(s, "|") == 0) return 0
         CHN = length(s); delete CH; split(s, CH, "")
+        # QI[p] = 1 when index p is a quote character, lies INSIDE a quoted region, or is a
+        # character an unquoted backslash escapes. The wrapper walk reads RAW text and must not
+        # treat a quoted or escaped `;`/`&`/`|` as a statement separator: with a quoted separator
+        # in a wrapper option argument the walk stopped at that separator, never reached the
+        # wrapper, and the line was
+        # reported CLEAN at rc 141 (#864 review). One O(n) pass here replaces a quote scan per walk.
+        delete QI
+        qq = 0; sdd = 0; btt = 0
+        for (i = 1; i <= CHN; i++) {
+          if (btt) { QI[i] = 1; if (CH[i] == "`") btt = 0; continue }
+          if (sdd > 0) {
+            # Inside a `${…}`, `$(…)` or backtick region: the whole substitution is opaque to the
+            # wrapper walk, because a separator there belongs to the substitution, not to the
+            # simple command. `env -u $(echo a;b) -i grep …` and `env -u ${x:-a;b} -i grep …`
+            # were CLEAN at rc 141 (#864 review). The depth is a single counter over both brace
+            # and paren nesting — an approximation, and one that errs toward marking MORE as
+            # opaque (over-block), never toward letting a real separator through.
+            QI[i] = 1
+            if (CH[i] == "$" && (CH[i + 1] == "(" || CH[i + 1] == "{")) { i++; QI[i] = 1; sdd++; continue }
+            if (CH[i] == "(" || CH[i] == "{") sdd++
+            else if (CH[i] == ")" || CH[i] == "}") sdd--
+            continue
+          }
+          if (qq == 0) {
+            if (CH[i] == "`") { QI[i] = 1; btt = 1; continue }
+            if (CH[i] == "$" && CH[i + 1] == "{") { QI[i] = 1; i++; QI[i] = 1; sdd = 1; continue }
+            if (CH[i] == "$" && CH[i + 1] == "(") { QI[i] = 1; i++; QI[i] = 1; sdd = 1; continue }
+            if (CH[i] == "<" && CH[i + 1] == "(") { QI[i] = 1; i++; QI[i] = 1; sdd = 1; continue }
+            if (CH[i] == "\\") { QI[i] = 1; if (i < CHN) { i++; QI[i] = 1 }; continue }
+            if (CH[i] == "$" && CH[i + 1] == "\047") { QI[i] = 1; i++; QI[i] = 1; qq = 3; continue }
+            if (CH[i] == "$" && CH[i + 1] == "\"") { QI[i] = 1; i++; QI[i] = 1; qq = 2; continue }
+            if (CH[i] == "\047") { QI[i] = 1; qq = 1; continue }
+            if (CH[i] == "\"") { QI[i] = 1; qq = 2; continue }
+          } else {
+            QI[i] = 1
+            if ((qq == 1 || qq == 3) && CH[i] == "\047") qq = 0
+            else if (qq == 2 && CH[i] == "\"") qq = 0
+            else if ((qq == 2 || qq == 3) && CH[i] == "\\") { if (i < CHN) { i++; QI[i] = 1 } }
+          }
+        }
         # The LINE is kept as a global too, because a wrapper body must be read WHOLE from it (TOK is
         # capped) - see body_text.
         CURLINE = s
-        return raw_idiom(s) || scan_idiom(s)
+        return (raw_idiom(s) || scan_idiom(s))
+      }
+      function is_idiom(s,   k) {
+        delete QB; QN = 0
+        if (matchers(s)) return 1
+        if (bodies_of(s)) return 1
+        # Drain the queue breadth-first. Every enqueued body is strictly shorter than the line
+        # that produced it, so the loop terminates; CH is rebuilt per entry and never clobbered
+        # mid-walk because no entry is analysed from inside the walk of another entry.
+        k = 1
+        while (k <= QN) {
+          if (matchers(QB[k])) return 1
+          if (bodies_of(QB[k])) return 1
+          k++
+        }
+        return 0
       }
       # a pure comment or blank line is documentation: it cannot execute, so it is skipped
       # (otherwise a script that merely DOCUMENTS the anti-pattern fails the build).
@@ -1095,13 +1807,25 @@ HITS="$(
         raw = $0
         if (start == 0) start = NR
         # join a continuation: an explicit trailing backslash AND a pipeline broken after a
-        # bare `|` (both are legal bash line breaks). THE TWO JOINS DIFFER: the shell deletes a
-        # backslash-newline with NOTHING at all (`gr\<newline>ep` is the single word `grep`), while a
-        # bare `|` is a real pipe the next line continues. Joining both with a space split `grep`
-        # into `gr ep` and reported the body clean.
+        # bare `|` or a `|&` (all are legal bash line breaks). THE JOINS DIFFER: the shell deletes
+        # a backslash-newline with NOTHING at all (`gr\<newline>ep` is the single word `grep`),
+        # while a bare `|` or `|&` is a real pipe the next line continues. Joining a backslash with
+        # a space split `grep` into `gr ep` and reported the body clean. `|&` must be joined with
+        # the `&` KEPT: it is part of the operator itself (`| pipeline BAR_AND newline_list
+        # pipeline`, bash parse.y), and dropping it either loses the pipe or leaves a bare `&` that
+        # the token walk reads as backgrounding. Without this arm `printf x |&` newline `grep -q p`
+        # is a silent false CLEAN while the backslash spelling is flagged.
         if (raw ~ /\\[ \t]*$/) {
           sub(/\\[ \t]*$/, "", raw)
           buf = buf raw
+          next
+        }
+        if (raw ~ /\|&[ \t]*$/) {
+          # `match`+`substr`, not `sub`: a `&` in a `sub` replacement means the matched TEXT, so
+          # `sub(/\|&[ \t]*$/, "|&", raw)` emits `||&`. Keep the `&` literally.
+          match(raw, /\|&[ \t]*$/)
+          raw = substr(raw, 1, RSTART - 1) "|&"
+          buf = buf raw " "
           next
         }
         if (raw ~ /\|[ \t]*$/) {
@@ -1249,18 +1973,23 @@ if [ -n "$warns" ]; then
 fi
 
 if [ -n "$fails" ]; then
-  echo "❌ SIGPIPE false-negative idiom (printf/echo piped into a quiet grep under pipefail) — #841:" >&2
+  echo "❌ SIGPIPE false-negative idiom (a recognised producer piped into a quiet grep under pipefail) — #841/#864:" >&2
   printf '%s' "$fails" >&2
   printf '%s\n' "$HITS" | sed '/^$/d' | sed 's/^/     /' >&2
   echo "" >&2
-  echo "Fix: invert to a here-string, e.g." >&2
+  echo "Fix: drop the pipe. A builtin writer inverts to a here-string; any other producer" >&2
+  echo "(e.g. a non-quiet grep) CAPTURES first and tests in the shell — a case needs no pipe:" >&2
   echo "  BAD   printf '%s' \"\$TEXT\" piped into grep -q 'PATTERN'" >&2
   echo "  GOOD  grep -q 'PATTERN' <<<\"\$TEXT\"" >&2
-  echo "(bash-only; every flag still applies. See the header of this script for the windows of failure," >&2
-  echo " and for the POSIX-sh variant that .husky/ hooks need.)" >&2
+  echo "  BAD   grep -vxF -f list f piped into grep -q '[^[:space:]]'" >&2
+  echo "  GOOD  out=\"\$(grep -vxF -f list f || true)\"; case \"\$out\" in *[![:space:]]*) … ;; esac" >&2
+  echo 'If the producer itself is quiet or counts (grep -q, grep -c) it writes nothing to the' >&2
+  echo "pipe at all — the PIPE is the bug: drop it and test the source directly, do not capture it." >&2
+  echo "(bash-only for the here-string form; every grep flag still applies. See the header of this" >&2
+  echo " script for the windows of failure and for the POSIX-sh variant that .husky/ hooks need.)" >&2
   exit 1
 fi
 
-echo "✅ no builtin-writer SIGPIPE false-negative idiom in ${SCAN_DIRS[*]} (scanned $FILE_COUNT file(s) under $ROOT)"
-echo "   NOTE: scope is printf/echo only — any other producer piped into a quiet grep has the same failure mode."
+echo "✅ no recognised-producer SIGPIPE false-negative idiom in ${SCAN_DIRS[*]} (scanned $FILE_COUNT file(s) under $ROOT)"
+echo "   NOTE: producers recognised are printf|echo|grep — any OTHER producer piped into a quiet grep has the same failure mode (#864)."
 exit 0

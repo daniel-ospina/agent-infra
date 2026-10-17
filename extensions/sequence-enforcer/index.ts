@@ -147,6 +147,14 @@ interface SkillState {
   stepIndex: number;
   stepStartedAt: number;
   reviewers: Map<number, number>; // dispatched reviewer count per step
+  // #1662 review: run_ids whose terminal `task_collect` has already been
+  // counted as a reviewer completion. `task_collect` is idempotent — the same
+  // terminal run can be reaped repeatedly — so without this a repeated collect
+  // decrements the count a second time and advances the verifier step with
+  // fewer real verdicts than were dispatched. Per-skill (not per-step): a run
+  // belongs to exactly one dispatch, and a duplicate must stay ignored even
+  // after the step advances.
+  countedCollects: Set<string>;
 }
 
 const stepCache = new Map<string, Step[] | null>();
@@ -1380,7 +1388,7 @@ export function gateGuidance(step: Step, mode: Mode = "gate"): string {
   const tools = allow.join(", ");
   if (gate === "verifier" || gate === "ai_review") {
     return `→ Allowed tools: ${tools}
-→ To proceed: dispatch a task sub-agent to review this stage, or read the sub-skill SKILL.md`;
+→ To proceed: dispatch a task sub-agent to review this stage, then observe/reap a background lane with task_status/task_collect, or read the sub-skill SKILL.md`;
   }
   if (gate === "human_approval" || gate === "human_review") {
     return `→ Allowed tools: ${tools}
@@ -1413,8 +1421,17 @@ export function getExpectedToolsForStep(step: Step): { allow: string[]; block: R
   }
   // verifier (also matches legacy "ai_review"): only task/subagent during review
   // loop_enforcer always allowed — the gate must never block its own escape hatch (#7470)
+  //
+  // #1662: `task_status` / `task_collect` are part of the SAME reviewer flow as
+  // `task`/`subagent` — a `task({ background: true })` dispatch returns at
+  // DISPATCH and its verdict lands on the terminal `task_collect` (the tool_result
+  // handler advances the step there). Blocking the reap tools at the very step
+  // that requires their verdict is a deadlock: the dispatch is allowed, the step
+  // cannot advance on the returns-early notice, and the only tools that could
+  // reap the lane are refused. Allow them here so the advertised
+  // dispatch → status → collect → REVIEW path is reachable in gate/strict mode.
   if (gate === "verifier" || gate === "ai_review") {
-    return { allow: ["task", "subagent", "read", "loop_enforcer"], block: [/.*/] };
+    return { allow: ["task", "subagent", "task_status", "task_collect", "read", "loop_enforcer"], block: [/.*/] };
   }
   // human_approval (also matches legacy "human_review"): only read/search/fetch during approval
   if (gate === "human_approval" || gate === "human_review") {
@@ -1636,7 +1653,7 @@ function parkCheckpoint(skill: SkillState, reason: string): void {
 
 export function _pushSkillForTest(path: string, steps: Step[], stepIndex = 0): void {
   if (process.env.NODE_ENV !== "test") return;
-  skillStack.push({ path, steps, stepIndex, stepStartedAt: Date.now(), reviewers: new Map() });
+  skillStack.push({ path, steps, stepIndex, stepStartedAt: Date.now(), reviewers: new Map(), countedCollects: new Set() });
 }
 
 export function _stackForTest(): SkillState[] {
@@ -1872,7 +1889,7 @@ export default function (pi: ExtensionAPI) {
     }
 
     // Push new skill onto stack (replace if top was completed & popped above)
-    skillStack.push({ path, steps, stepIndex: 0, stepStartedAt: Date.now(), reviewers: new Map() });
+    skillStack.push({ path, steps, stepIndex: 0, stepStartedAt: Date.now(), reviewers: new Map(), countedCollects: new Set() });
     // #357 (Task 3) F2: lazily warn when a skill activates with checkpoint
     // steps that will fail-closed (missing token_phase) — diagnose, don't let
     // the hard-block be the only signal. Fires at activation (stack/stepCache
@@ -2210,10 +2227,43 @@ function tokenStateLabel(reason: string): string {
     const targetSkill = gateOwner ?? top;
 
     // Count dispatched reviewers for verifier gate
+    //
+    // #1662: a `task({ background: true })` dispatch produces its tool_result at
+    // DISPATCH time (the returns-early notice), so decrementing here would
+    // advance the verifier step before ANY reviewer verdict exists — the parent
+    // is promoted while its reviewers are still running. Count the reviewer
+    // completion where it actually lands: the terminal `task_collect` result.
+    // A non-terminal collect (still running) and the background dispatch notice
+    // both leave the count untouched, so the step cannot advance until the
+    // verdict is reaped.
+    const verifierDetails = (event as { details?: { background?: boolean; terminal?: boolean; run_id?: string } }).details;
+    // #1662 review: the pre-spawn refusal / halted-chain / invalid-session-id
+    // results are built BEFORE the background branch, so they carry NO
+    // `details.background` — a refused `task({ background: true })` would then
+    // read as a *blocking* completion and decrement the verifier count,
+    // advancing the step with zero verdicts. Read the tool INPUT too (the same
+    // dual signal `verification-gate` uses), so every background result —
+    // dispatched, refused, or halted — is recognised as background.
+    const verifierInput = (event as { input?: { background?: boolean } }).input;
+    const isTerminalCollect =
+      event.toolName === "task_collect" && verifierDetails?.terminal === true;
+    const isBackgroundDispatch =
+      verifierDetails?.background === true || verifierInput?.background === true;
+    // #1662 review: every `task_collect` result carries the `run_id` it reaped
+    // (`details: view`). Dedupe terminal collects by that id so re-collecting
+    // the same finished lane cannot decrement the reviewer count twice and
+    // advance the verifier step with fewer verdicts than were dispatched.
+    const collectRunId =
+      typeof verifierDetails?.run_id === "string" ? verifierDetails.run_id : "";
     if (
       step.gate === "verifier" &&
-      (event.toolName === "task" || event.toolName === "subagent")
+      (isTerminalCollect ||
+        ((event.toolName === "task" || event.toolName === "subagent") && !isBackgroundDispatch))
     ) {
+      if (isTerminalCollect && collectRunId) {
+        if (targetSkill.countedCollects.has(collectRunId)) return undefined; // already counted — never advance twice
+        targetSkill.countedCollects.add(collectRunId);
+      }
       const current = targetSkill.reviewers.get(targetSkill.stepIndex) || 0;
       if (current > 0) {
         const count = current - 1;

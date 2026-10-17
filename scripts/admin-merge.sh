@@ -1395,6 +1395,19 @@ merge_art_knobs_ok() {
     && ! counter_exceeds_max "$VERIFY_ATTEMPTS" "$TIMING_KNOB_MAX"
 }
 
+# refuse_bad_merge_art_attempts_override <value> -> 1 (having said why) when the
+# SINGLE-SHOT override is unusable. The override is a CALLER's
+# arithmetic bound on the one door, so it gets the knob's own three refusals, named —
+# rather than the silent substitution that would reproduce #1690's defaulting.
+refuse_bad_merge_art_attempts_override() {
+  say_err "admin-merge: ✗ refusing a bad merge-artifact attempts override ('${1:-}')"
+  say_err "   — the single-shot pre-check's bound must be a POSITIVE integer without a leading"
+  say_err "   zero (max ${TIMING_KNOB_MAX}): a leading zero is octal to the loop's arithmetic, a"
+  say_err "   non-positive value attempts no read, and a larger one is a bound the arithmetic"
+  say_err "   cannot hold. Fix the caller — this is not defaulted."
+  return 1
+}
+
 # refuse_bad_merge_art_knobs -> 1 (having said why) when the bound is unusable.
 refuse_bad_merge_art_knobs() {
   say_err "admin-merge: ✗ refusing a bad merge-artifact knob (ADMIN_MERGE_VERIFY_ATTEMPTS='${VERIFY_ATTEMPTS}')"
@@ -1684,12 +1697,29 @@ require_draft() {
 #   MERGE_ART_STATE      the observed state, or `<unreadable>`
 #   MERGE_ART_MERGED_AT  the observed mergedAt, or `<unreadable>`
 #   MERGE_ART_ATTEMPTS   the bound actually used (formatted into the callers' messages), or
-#                        `0` on the one path that reads nothing: a refused knob
+#                        `0` on the two paths that read nothing: a refused knob, or a
+#                        rejected attempts override (`return 1` on both)
 #   MERGE_ART_DIAG       the DECIDING (last) attempt's last NON-BLANK stderr line (one
 #                        bounded line), empty when that attempt wrote none — never an
 #                        earlier attempt's text
-poll_merge_artifact() {
-  local pr="$1"
+poll_merge_artifact() { # <pr> [attempts-override]
+  # ⛔ THE OPTIONAL SECOND ARG IS #1709 rec 7's SINGLE-SHOT PRE-CHECK, and it is an
+  # override ON THIS DOOR rather than a second state reader. The pre-check asks "is this
+  # PR ALREADY merged?" — a SNAPSHOT, where the two in-rail callers ask "did the merge I
+  # just issued land?" — a bounded WAIT. Running the WAIT at the top of every merge would
+  # idle 6 attempts × 2s on every healthy (unmerged) PR, so the pre-check needs ONE shot;
+  # the polarity, the projection and the three-outcome contract must nevertheless stay
+  # ONE implementation, which is why the override lives here and not in a copy. ABSENT
+  # (`''`) is the optional-arg contract and keeps the configured window — both in-rail
+  # callers pass no override. A PRESENT value is a CALLER's arithmetic bound, so it is
+  # REFUSED BY NAME unless it is a validated positive integer within TIMING_KNOB_MAX
+  # (refuse_bad_merge_art_attempts_override) — never silently defaulted. Defaulting is
+  # #1690's failure one arm over: a present-but-unvalidated override would have `… 08`
+  # quietly poll the configured window, and `… 1000000000` — one past TIMING_KNOB_MAX —
+  # become a bound the loop's arithmetic cannot hold, the very symptom this block exists to
+  # prevent. A caller's typo must be LOUD, not silently substituted.
+  # (Pinned by tests/admin-merge/run.sh's `override-probe` block.)
+  local pr="$1" attempts_override="${2:-}"
   MERGE_ART_VERDICT="unreadable"
   MERGE_ART_STATE="<unreadable>"
   MERGE_ART_MERGED_AT="<unreadable>"
@@ -1701,6 +1731,23 @@ poll_merge_artifact() {
   MERGE_ART_ATTEMPTS="0"
   MERGE_ART_DIAG=""
   local attempts="$VERIFY_ATTEMPTS"
+  # ⛔ ABSENT keeps the window (optional arg); PRESENT is VALIDATED, NOT DEFAULTED. The
+  # three refusals below are the same three the knob itself is refused for, so no path can
+  # put an arithmetic bound in here that `merge_art_knobs_ok` would have rejected had it
+  # been the knob. `return 1` here is the same shape as the knob refusal below: the globals
+  # are already set (MERGE_ART_ATTEMPTS is the TRUE `0`, i.e. zero reads ran), so no caller
+  # can hit an unbound-variable abort under `set -u` and the count they report is true. The
+  # refusal is distinguished from a failed read by the STATUS, not by the verdict — the
+  # step-0a caller checks it, so a caller typo is never re-narrated as an unreadable read.
+  if [ -n "$attempts_override" ]; then
+    if counter_has_leading_zero "$attempts_override" \
+       || ! counter_is_positive "$attempts_override" \
+       || counter_exceeds_max "$attempts_override" "$TIMING_KNOB_MAX"; then
+      refuse_bad_merge_art_attempts_override "$attempts_override"
+      return 1
+    fi
+    attempts="$attempts_override"
+  fi
   # ⛔ THE KNOB IS VALIDATED, NOT DEFAULTED, AND THE INVARIANT TRAVELS WITH THE FUNCTION.
   # The pre-refactor inline `case …) attempts=6` DEFAULTED (silently substituting a
   # different budget for a typo) and — measured — a leading-zero value reached this
@@ -2473,10 +2520,24 @@ lane_shard_set() {
 # workflow LIFECYCLE job? A family whose every member is bookkeeping measured no
 # test, so certifying on it is certifying on nothing (cycle-2 P1).
 lane_has_test_shard() {
-  local f="$1"
+  local f="$1" remaining=""
   [ -s "$f" ] || return 1
   printf '%s\n' "$LANE_LIFECYCLE_JOBS" > "$TMP/lane-lifecycle.txt"
-  grep -vxF -f "$TMP/lane-lifecycle.txt" "$f" | grep -q '[^[:space:]]'
+  # NO PIPE. A quiet grep downstream of any still-writing producer is the SIGPIPE
+  # class of #864, not only the builtin-writer form of #841: grep exits at its FIRST
+  # match, the upstream grep takes SIGPIPE (141), and under `pipefail` that status
+  # wins — so this function returns NON-ZERO for a set that HAS a non-lifecycle name,
+  # and the caller at the lane-parity check reads non-zero as "only lifecycle jobs"
+  # and returns 2, refusing the merge: a FALSE BLOCK (fail-closed), pinned by
+  # tests/admin-merge/run.sh "a parity family of ONLY lifecycle jobs → BLOCK".
+  # Capture first, then classify in the SHELL: a `case` needs no second process at
+  # all — there is no pipe to lose a status to, which is the same remedy the
+  # head/verdict resolvers above use.
+  remaining="$(grep -vxF -f "$TMP/lane-lifecycle.txt" "$f" || true)"
+  case "$remaining" in
+    *[![:space:]]*) return 0 ;;
+  esac
+  return 1
 }
 
 # ── #6928: A SHARD THE DIFF SELECTOR *DECLINED* IS NOT A COVERAGE GAP ─────
@@ -5262,6 +5323,62 @@ main() {
   # is `mktemp`-generated and read from the file-scope `READ_ERRTMP` at TRAP TIME, so it follows
   # the file the reads actually created instead of naming a predictable path (#1750 review).
   trap 'rm -rf "${TMP:-}"; rm -f "${READ_ERRTMP:-}"' EXIT
+
+  # ── 0a. ALREADY MERGED ⇒ BENIGN NO-OP (#1709 rec 7) ──────────────────────
+  # The rail runs at-least-once: a crash, a pause that resumes, or a second box
+  # sweeping the same PR can execute this SAME merge twice. A duplicate that lands
+  # on a PR another execution already merged must be a no-op, not a second write
+  # and not a confusing failure. Before this guard it was neither benign nor clear:
+  # the rail ran its WHOLE CI parity analysis, posted a SECOND head-bound evidence
+  # comment, then `gh pr merge` exited non-zero (the PR is already merged) and the
+  # lost-response arm rendered that as "the response was lost" — a network-incident
+  # narrative for an entirely ordinary duplicate.
+  #
+  # ⛔ ONE SHOT, THROUGH THE ONE DOOR. The state read goes through
+  # `poll_merge_artifact` (the same projection, the same MERGED/OPEN/CLOSED
+  # allow-list, the same unreadable-vs-value discipline the post-merge arms use)
+  # with an attempts override of 1 — this is a SNAPSHOT question ("is it already
+  # merged?"), not the bounded WAIT the other two callers ask. A second reader here
+  # would be a second definition of "merged", which is exactly the drift #1298
+  # closed.
+  #
+  # ⛔ UNREADABLE IS NOT A REFUSAL, and the direction is deliberate. This guard
+  # removes WASTE; it is not a safety gate, and nothing is skipped by proceeding:
+  # if the state cannot be read we fall through to the rail exactly as it behaved
+  # before this block, and the post-merge artifact read still governs the outcome.
+  # Refusing here would block every legitimate merge on a transient GitHub blip —
+  # a false block, the other failure direction — for no safety gain. The residual is
+  # declared rather than implied: a duplicate whose PRE-check read fails can still
+  # post its second evidence comment. It cannot corrupt state.
+  # ⛔ A REFUSED OVERRIDE IS A CALLER ERROR, NOT A READ FAILURE, so it is not folded into
+  # the unreadable arm below: that arm prints "could not READ the state of PR #…", which for
+  # a refusal would name the wrong cause (a GitHub blip) for a caller's bad bound, and would
+  # attribute a claim about reality to a read that never ran. `poll_merge_artifact` returns
+  # NON-ZERO exactly on a refusal, so the status separates the two cases here. Both of the
+  # door's refusals are excluded TODAY — the knob by `validate_timing_knobs` at startup, the
+  # override by this call's literal `1` — so the arm below is DEFENSIVE rather than live: it
+  # exists so that a future caller passing a COMPUTED override cannot have a bad bound
+  # re-narrated as a GitHub read failure.
+  # shellcheck disable=SC2086
+  if ! poll_merge_artifact "$PR" 1; then
+    say_err "admin-merge: ✗ the already-merged pre-check could not run — its attempts override was REFUSED (above)."
+    say_err "   This is a CALLER error, not a read failure: refusing rather than reading the artifact with an unvalidated bound."
+    exit 2
+  fi
+  if [ "$MERGE_ART_VERDICT" = "merged" ]; then
+    info "admin-merge: ✅ PR #$PR is ALREADY MERGED (state=MERGED, mergedAt=$MERGE_ART_MERGED_AT) — duplicate execution is a NO-OP: no CI work, no evidence comment, no merge attempt"
+    exit 0
+  fi
+  if [ "$MERGE_ART_VERDICT" = "unreadable" ]; then
+    say_err "admin-merge: ⚠️  [merged_precheck_unreadable] — could not READ the state of PR #$PR, so this run does NOT know whether it is already merged."
+    say_err "   This is NOT a claim about the PR. Proceeding with the rail (the pre-#1709 behaviour): if the PR turns out to be"
+    say_err "   already merged, a duplicate evidence comment may be posted — the post-merge state read still governs the outcome."
+    if [ -n "${MERGE_ART_DIAG:-}" ]; then
+      say_err "   the state read reported: ${MERGE_ART_DIAG}"
+    else
+      say_err "   the state read wrote no non-blank message."
+    fi
+  fi
 
   local head
   # shellcheck disable=SC2086
