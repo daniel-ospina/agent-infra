@@ -419,6 +419,36 @@ reap_stale_workers() {
 }
 
 heartbeat() { date +%s > "$O/heartbeat"; }
+
+# ── THE POOL'S READ STATE, BESIDE THE BACKLOG (agent-infra#1931) ───────────────────────────────
+# ⛔ `backlog=0` ALONE IS THE READING THAT LET A CELL IDLE ALL EVENING WHILE HEALTHY. A refresh whose
+# pool listing FAILED leaves candidates.txt empty, and an empty file is byte-identical to a fleet
+# with nothing to do — measured 2026-10-17: 131 consecutive passes refused for an unreadable pool and
+# dispatched nothing, and every cycle line said `backlog=0`. refresh-candidates.sh records what its
+# last pool READ saw, and this prints it beside the backlog in the SAME vocabulary the refresh uses
+# (EMPTY / READ(n) / PARTIAL(<labels>) / UNREADABLE — one vocabulary, not a second one):
+#   EMPTY      the pool was read and is genuinely empty — the only answer that may mean "no work".
+#   READ(n)    the pool was read and listed n candidate(s).
+#   PARTIAL(x) some priority tiers could not be read (x) — a subset, never a complete pool.
+#   UNREADABLE the pool could not be read at all: the fleet is BLIND, which is not "nothing to do".
+# The age of the reading is part of the token, so a value frozen by a dead refresh cannot pass as a
+# fresh one (this is a STATE RECORD, and a state record with no age is a stale flag waiting to be
+# read as current). UNKNOWN means no pass has EVER recorded a read — never EMPTY, because the absence
+# of a measurement is not a measurement of emptiness. A torn or hand-edited file prints the state it
+# does carry, with no invented age.
+queue_state_token() {  # -> EMPTY(12s) / READ(7)(3m) / PARTIAL(P0-blocker)(2m) / UNREADABLE(9m) / UNKNOWN
+  local tok="" at="" now age
+  { read -r tok at < "$O/state/queue-state"; } 2>/dev/null || true
+  case "${tok:-}" in
+    EMPTY|UNREADABLE|READ\(*\)|PARTIAL\(*\)) ;;
+    *) printf 'UNKNOWN'; return 0 ;;
+  esac
+  is_num "${at:-}" || { printf '%s' "$tok"; return 0; }
+  now="$(date +%s)"; age=$(( now - at )); [ "$age" -lt 0 ] && age=0
+  if   [ "$age" -lt 90 ];   then printf '%s(%ss)' "$tok" "$age"
+  elif [ "$age" -lt 5400 ]; then printf '%s(%sm)' "$tok" "$(( age / 60 ))"
+  else                            printf '%s(%sh)' "$tok" "$(( age / 3600 ))"; fi
+}
 # Exact session-name test. `tmux has-session -t <name>` prefix-matches, so a guard for PR #82
 # would report "in flight" because `fix-820` exists — starving #82 while that worker lives.
 sess() { tmux ls -F '#{session_name}' 2>/dev/null | grep -qx "$1"; }
@@ -776,7 +806,7 @@ while true; do
   res_line   # MEASURE every resource; decide nothing from it
   reap_stale_workers
   L="$(load1)"
-  echo "=== $(date) load=$L lanes=$(tmux ls 2>/dev/null | grep -c '^lane-') backlog=$(wc -l < "$O/candidates.txt" | tr -d ' ') ===" >> "$LOG"
+  echo "=== $(date) load=$L lanes=$(tmux ls 2>/dev/null | grep -c '^lane-') backlog=$(wc -l < "$O/candidates.txt" | tr -d ' ') queue=$(queue_state_token) ===" >> "$LOG"
 
   # ---- 1) merge sweep (this box's open PRs) -------------------------------
   # scope: when the repo has >10 open PRs, help drain EVERYONE's (broad); otherwise just this box's.
@@ -1434,7 +1464,12 @@ PY
     if [ -s "$O/.batch" ]; then
       echo "[dispatch] load=$L lanes=$LANES -> $(tr '\n' ' ' < "$O/.batch")" >> "$LOG"
       bash "$O/dispatch-merge.sh" "$REPO" "$OR" $(tr '\n' ' ' < "$O/.batch") >> "$LOG" 2>&1
-    else echo "[dispatch] backlog empty" >> "$LOG"; fi
+    # ⛔ "backlog empty" IS A CLAIM, NOT A NEUTRAL FACT (agent-infra#1931). On its own it reads as
+    # "the fleet has nothing to do", but the SAME line is printed when the refresh could not read the
+    # pool at all — that is how a blind box idled all evening looking healthy. The state travels with
+    # it, in the refresh's own vocabulary: `queue=EMPTY` is the only form that means "no work";
+    # `queue=UNREADABLE`/`PARTIAL(..)` means "the last pool read did not establish an empty pool".
+    else echo "[dispatch] backlog empty queue=$(queue_state_token)" >> "$LOG"; fi
   else
     echo "[dispatch] skipped ($GATE_WHY) lanes=$LANES workers=$WORKERS" >> "$LOG"
   fi

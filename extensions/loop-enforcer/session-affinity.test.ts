@@ -160,6 +160,13 @@ saveSessionFile();
 // Case: valid session file
 const testDir = join("/tmp", `loop-session-test-${randomUUID()}`);
 mkdirSync(testDir, { recursive: true });
+// Self-sufficient, not order-coupled: this suite writes the REAL
+// `~/.pi/agent/slack-session.json`, so it must create the directory itself.
+// Relying on an earlier suite in the same CI step (ci-main's
+// `extensions/auto-sync.test.ts`, whose `acquireRepoLock` happens to mkdir
+// `~/.pi/agent/locks`) made the suite's greenness depend on step ordering —
+// with a pristine HOME it died `ENOENT ... /$HOME/.pi/agent/slack-session.json`.
+mkdirSync(join(homedir(), ".pi", "agent"), { recursive: true });
 
 // Override SESSION_FILE for testing — we can't because it's const,
 // but we can test by writing a real file temporarily.
