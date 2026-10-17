@@ -174,9 +174,14 @@ processes in tmux sessions, so a killed worker cannot take the controller down w
                                      → wait for ai-review-gate SUCCESS → gh pr merge --squash
                             ISSUES  → touch state/needsfix-<PR>-<head>   ← hands off to the fixer path
                         rail mode (the repo does NOT require the gate — e.g. agent-infra):
-                        1. `scripts/admin-merge.sh <PR>` — the repo's own rail, which posts its own
-                           head-bound evidence and merges. No reviewer is run and `gh pr merge` is
-                           NEVER called: it would land on the required checks alone, bypassing the rail.
+                        1. a head-bound review RECORD already in the store at this head → straight to
+                           the rail (the normal case: the lane's own review pass recorded one)
+                        2. otherwise the review path above RUNS FIRST (agent-infra#1825): the rail is
+                           no longer an excuse to skip the review, because `pipeline-compliance`
+                           check (c) — this repo's only required check — accepts nothing but that
+                           record. Then → `scripts/admin-merge.sh <PR>`, the repo's own rail, which
+                           posts its own head-bound evidence and merges. `gh pr merge` is NEVER
+                           called here: it would land on the required checks alone, bypassing the rail.
                            Refused 3x at one head → PARK that head.
                         ▼
         fix-<PR>   → fix-one.sh  : materialises a worktree for the branch (including foreign
@@ -190,7 +195,7 @@ processes in tmux sessions, so a killed worker cannot take the controller down w
 |---|---|---|---|
 | `lane-<N>` | `lane.sh` | `.worktrees/tm-<N>` on `feat/<N>-tm` | implement issue #N → commit → push → open PR |
 | `chain-<N>` | `chain-merge.sh` | — | wait for the lane's PR, then delegate to `merge-one.sh` |
-| `merge-<PR>` | `merge-one.sh` | — | **repo-authority-dependent**: gate mode = fresh review → signed record → wait green → squash-merge; rail mode = the repo's own `scripts/admin-merge.sh` |
+| `merge-<PR>` | `merge-one.sh` | — | **repo-authority-dependent**: gate mode = fresh review → signed record → wait green → squash-merge; rail mode = (a head-bound record already at the head, else the same fresh review → signed record first) → the repo's own `scripts/admin-merge.sh` (#1825) |
 | `fix-<PR>` | `fix-one.sh` | the PR's worktree | repair findings **or a failing required check**, push, re-run the merge chain |
 
 ### State files (`$O/`)
