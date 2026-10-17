@@ -297,6 +297,29 @@ assert_eq "$hubdirty" "0" "hub CLEAN after symlink salvage"
 git -C "$REPO" worktree remove --force "$REPO/.worktrees/feat/salvage-symlink" 2>/dev/null || true
 git -C "$REPO" branch -q -D feat/salvage-symlink 2>/dev/null || true
 
+# ── 7c. #1919: salvage must NOT eat a worktree nested in the hub ────────────
+# git reports a nested registered worktree as ONE untracked directory
+# (`?? nested-wt/`). The old capture would `cp -Rf` the LIVE worktree into the
+# salvage branch and the hub cleanup would then `rm -rf` it out of the hub —
+# destroying a working tree whose uncommitted work nothing else preserved. So
+# salvage skips it (and any directory CONTAINING one) and still captures the
+# genuine dirt beside it.
+git -C "$REPO" worktree add -q "$REPO/nested-wt" -b nested-wt-br HEAD
+echo "nested-wip" > "$REPO/nested-wt/nested-only.txt"   # uncommitted work INSIDE the worktree
+echo "genuine-wip" > "$REPO/genuine-untracked.txt"      # real hub dirt beside it
+out="$(bash "$HELPER" salvage feat/salvage-nested "$REPO" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 0 "salvage succeeds with a nested registered worktree present"
+assert_contains "$out" "registered worktree (not hub dirt): nested-wt/" "…and names the worktree it left alone"
+wt_s2="$REPO/.worktrees/feat/salvage-nested"
+[ -f "$REPO/nested-wt/nested-only.txt" ] && ok "the nested worktree's uncommitted file SURVIVED" || bad "NESTED WORKTREE DESTROYED by salvage"
+git -C "$REPO" worktree list --porcelain | grep -q "$REPO/nested-wt" && ok "…and it is still a registered worktree" || bad "worktree record lost"
+grep -q "genuine-wip" "$wt_s2/genuine-untracked.txt" 2>/dev/null && ok "the genuine untracked file WAS captured on the branch" || bad "genuine dirt not captured"
+assert_contains "$(git -C "$REPO" status --porcelain)" "?? nested-wt/" "…and the hub's only remaining entry is the worktree itself"
+git -C "$REPO" worktree remove --force "$REPO/nested-wt" 2>/dev/null || true
+git -C "$REPO" branch -q -D nested-wt-br 2>/dev/null || true
+git -C "$REPO" worktree remove --force "$wt_s2" 2>/dev/null || true
+git -C "$REPO" branch -q -D feat/salvage-nested 2>/dev/null || true
+
 # ── 8. refresh (#1309): clean-but-stale hub → advance the hub to its upstream ─
 # The state with no SANCTIONED path: a CLEAN hub whose local main has DIVERGED
 # from origin/main (a merely behind hub is already covered by the M4-sanctioned

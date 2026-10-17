@@ -252,9 +252,65 @@ _salvage_captured() {
 }
 
 # ── SALVAGE MODE (#435) ─────────────────────────────────────────────────────
+
+# #1919 — the REGISTERED WORKTREES of the hub (canonical, newline-joined).
+# `git worktree list` prints the MAIN worktree first and its path IS the hub, so
+# it is dropped: the hub is an ancestor of everything and would exclude all dirt.
+registered_worktrees() {
+  local rec cand raw out=""
+  # Command substitution + here-string, deliberately NOT `< <(...)`: the guard's
+  # script surface treats a process substitution carrying git as UNVERIFIABLE and
+  # refuses the whole file, which would close this sanctioned recovery helper.
+  raw="$(git -C "$MAIN_REPO" worktree list --porcelain 2>/dev/null | sed -n 's/^worktree //p' | tail -n +2)"
+  while IFS= read -r rec; do
+    [[ -z "$rec" ]] && continue
+    cand="$( (cd "$rec" 2>/dev/null && pwd -P) )" || continue
+    out="${out}${cand}"$'\n'
+  done <<<"$raw"
+  printf '%s' "$out"
+}
+
+# #1919 — is this hub-relative path a REGISTERED WORKTREE, or a directory that
+# CONTAINS one? Both are refused as salvage material: git lists a nested worktree
+# as one untracked directory, so salvage would `cp -Rf` the LIVE worktree into
+# the salvage branch and then `rm -rf` it out of the hub — destroying a working
+# tree whose uncommitted work nothing else preserved. A path INSIDE a worktree is
+# NOT skipped (an unlinked worktree's files are ordinary hub content, and #1410's
+# repair path must keep working).
+contains_registered_worktree() { # $1=hub-relative path  $2=registered_worktrees output
+  local rel="$1" registered="$2" cand rec
+  [[ -z "$rel" || -z "$registered" ]] && return 1
+  cand="$( (cd "$MAIN_REPO" 2>/dev/null && cd "$rel" 2>/dev/null && pwd -P) )" || return 1
+  while IFS= read -r rec; do
+    [[ -z "$rec" ]] && continue
+    [[ "$rec" == "$cand" || "$rec" == "$cand"/* ]] && return 0
+  done <<<"$registered"
+  return 1
+}
+
+# #1919 — the same rule for a porcelain LIST (salvage's final cleanliness test):
+# drop the `?? ` entries that are / contain a registered worktree, keep every
+# other line. stdin=porcelain, $1=registered_worktrees output.
+filter_registered_worktree_lines() { # $1=registered_worktrees output ; stdin=porcelain
+  local registered="$1" line rel
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    case "$line" in
+      '?? '*)
+        rel="${line#?? }"
+        rel="${rel%\"}"; rel="${rel#\"}"; rel="${rel%/}"
+        if contains_registered_worktree "$rel" "$registered"; then continue; fi
+        printf '%s\n' "$line" ;;
+      *) printf '%s\n' "$line" ;;
+    esac
+  done
+}
+
 salvage() {
-  local hub_branch porcelain clean_rel
+  local hub_branch porcelain clean_rel registered
   hub_branch="$(git -C "$MAIN_REPO" branch --show-current 2>/dev/null || echo "detached")"
+  # #1919 — resolved ONCE, before anything is captured.
+  registered="$(registered_worktrees)"
   # RAW porcelain (-z + quotepath=false): paths arrive verbatim, NUL-terminated
   # — no C-style/octal escaping, so non-ASCII (café) and spaced paths are safe.
   # tr NUL->newline for line parsing; records are always "XY <path>" (char 2 is
@@ -285,7 +341,7 @@ salvage() {
   # SALVAGE_INCLUDE_JUNK=1 captures everything.
   local junk_re='(^|/)(\.playwright-mcp|\.wrangler|__pycache__)(/|$)|(\.pyc|\.tmp|\.bak|~)$|(^|/)\.DS_Store$|(^|/)srv\.pid$'
 
-  local captured=0 deleted=0 skipped_junk=0 staged_only=0
+  local captured=0 deleted=0 skipped_junk=0 staged_only=0 skipped_worktree=0
   local rel xy rest line
   declare -a STAGED_PATHS=()
   # #854: the set the capture pass ACTUALLY preserved on the branch. The cleanup
@@ -299,6 +355,15 @@ salvage() {
     xy="${line:0:2}"
     rest="${line:3}"
     [[ -z "$rest" ]] && continue
+
+    # #1919 — a registered worktree is git's own state, never hub dirt: `cp -Rf`
+    # of a nested worktree (then the hub-side `rm -rf`) would destroy a LIVE
+    # working tree whose uncommitted work nothing else preserved.
+    if contains_registered_worktree "$rest" "$registered"; then
+      echo "   ⏭  registered worktree (not hub dirt): $rest"
+      skipped_worktree=$((skipped_worktree + 1))
+      continue
+    fi
 
     case "$xy" in
       "??")
@@ -387,7 +452,7 @@ salvage() {
     fi
   done <<< "$porcelain"
 
-  echo "hub-worktree: salvage: captured $captured path(s), $deleted deletion(s), $skipped_junk junk skipped."
+  echo "hub-worktree: salvage: captured $captured path(s), $deleted deletion(s), $skipped_junk junk skipped, $skipped_worktree registered worktree(s) left alone."
 
   # ── WT capture commit + push (worktree-local + own-branch = guard-exempt) ─
   # Delegated to the internal sub-script (direct-exec, no interpreter word in
@@ -464,6 +529,12 @@ salvage() {
             UNCLEANED_PATHS+=("$rest"); uncleaned=$((uncleaned + 1)); continue
             ;;
         esac
+        # #1919 — never remove a registered worktree (or a directory containing
+        # one): it was NOT captured above, so removing it would destroy the only
+        # copy of that working tree.
+        if contains_registered_worktree "$rest" "$registered"; then
+          echo "   ⏭  registered worktree (not removed): $rest"; continue
+        fi
         rm -rf "$MAIN_REPO/$rest"
         REMOVED_PATHS+=("$rest"); removed=$((removed + 1))
         ;;
@@ -514,12 +585,16 @@ salvage() {
   # ── Staged-only dirt: index still holds the staged blob — M4 blocks git
   # reset, so a human terminal `git -C "$MAIN_REPO" reset` is required (rare:
   # staging happened before the disorder). Warn loudly with the path list.
-  local remaining
+  local remaining remaining_dirt
   remaining="$(git -C "$MAIN_REPO" status --porcelain=v1 2>/dev/null || true)"
-  if [[ -n "$remaining" ]]; then
+  # #1919 — a registered worktree left in place is NOT "not yet clean": git owns
+  # that entry, no hub commit can capture it, and it is deliberately not removed
+  # above. Everything else on this list is still reported exactly as before.
+  remaining_dirt="$(printf '%s\n' "$remaining" | filter_registered_worktree_lines "$registered")"
+  if [[ -n "$remaining_dirt" ]]; then
     echo ""
     echo "⚠️  hub-worktree: salvage: the hub is NOT yet fully clean — remaining:" >&2
-    printf '%s\n' "$remaining" | sed 's/^/     /' >&2
+    printf '%s\n' "$remaining_dirt" | sed 's/^/     /' >&2
     if (( uncleaned > 0 )); then
       echo "   The $uncleaned path(s) marked NOT reverted/removed above were left" >&2
       echo "   UNTOUCHED on purpose (#854): the capture pass did not preserve them," >&2
