@@ -355,7 +355,15 @@ fi
 # runs the FARMED copy through the shared launcher with an explicit --repo, and
 # install-launchd.sh's broken-target guard refuses the whole install when the
 # farmed script is absent.
-fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-reap-worktrees.sh pi-reap-worktrees-launchd.py cleanup-stale-branches.sh ci_runner_gate.sh ask-owner.py beta-progress.py cadence-nudge.sh cadence-timer.sh child-check.py cloud-cell-quiesce.sh deploy-crossbox.sh deploy-mac-orchestrator.sh goal-state.py lane-actions.py lane-guard.py lane-read.py lane-scan-fallback.sh lane-watchdog.py lane-wip.py live-workspaces-publisher.py merge-queue.py objective.py orch-send.sh orchestrator-heartbeat.sh orphan-reap.py pr-doctor.py probe-one.py publish-live-workspaces.py queue-dispatch.py safe-send.sh seed-goal-map.py tree-cpu.py turn-classify.py turn-end.py unblock-lane.sh undelivered-answers.py)
+# #1863 × #1552 merge resolution: BOTH intents kept. `origin/main` added the five versioned
+# PRODUCERS #1552 restored to this farm (lane-actions.py, lane-watchdog.py, objective.py,
+# cadence-nudge.sh, publish-live-workspaces.py); this branch adds `pi-reap-orphans.sh`, the
+# reaper #1862 found dead and #1863 revives (its launchd job at
+# templates/launchd/com.eldato.pi-reap-orphans.plist execs the FARMED copy, asserted by
+# `scripts/install-launchd.test.sh`). Neither set is dropped: the array is the union of both.
+# `check_fleet_srcs_farmed` in pi-bootstrap/tests/test-setup-no-nesting.sh covers every
+# declared entry including the reaper; `check_producer_farm_declared` covers main's five.
+fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-reap-orphans.sh pi-reap-worktrees.sh pi-reap-worktrees-launchd.py cleanup-stale-branches.sh ci_runner_gate.sh ask-owner.py beta-progress.py cadence-nudge.sh cadence-timer.sh child-check.py cloud-cell-quiesce.sh deploy-crossbox.sh deploy-mac-orchestrator.sh goal-state.py lane-actions.py lane-guard.py lane-read.py lane-scan-fallback.sh lane-watchdog.py lane-wip.py live-workspaces-publisher.py merge-queue.py objective.py orch-send.sh orchestrator-heartbeat.sh orphan-reap.py pr-doctor.py probe-one.py publish-live-workspaces.py queue-dispatch.py safe-send.sh seed-goal-map.py tree-cpu.py turn-classify.py turn-end.py unblock-lane.sh undelivered-answers.py)
 mkdir -p "$DEST/scripts"
 fleet_copied=0
 for base in "${fleet_srcs[@]}"; do
