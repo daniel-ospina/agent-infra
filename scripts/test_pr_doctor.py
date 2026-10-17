@@ -239,9 +239,10 @@ def test_fix_and_review_budgets_are_separate(monkeypatch):
 
 def test_failed_lane_read_names_the_blindness(monkeypatch, capsys):
     """⛔ AND IT REFUSES (#1872 review round 3). A blind lane roster is the THIRD blind read in
-    this file, and the two above it both end in rc 2; leaving this one at 0 made the stated
-    invariant -- "`0` is reserved for readable, nothing to do" -- false 33 lines below it, with
-    work already classified and nothing dispatched.
+    this file, and the other two both end in rc 2; leaving this one at 0 made the stated invariant --
+    "`0` is reserved for readable, nothing to do" -- false at the end of the pass, with work already
+    classified and nothing dispatched. (No distance is claimed here: the invariant's comment moved
+    twice while these rounds ran, and a count of lines between two comments rots on the next edit.)
     """
     logs = []
     monkeypatch.setattr(pr, "load_state", lambda: {})

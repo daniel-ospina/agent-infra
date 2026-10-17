@@ -275,8 +275,8 @@ except Exception:
     print("")
 PYAGE
 }
-# R8-- the per-class tokens NAME their PRs, so the old 150-char cut severed exactly the part
-# that makes them readable. #1872 lengthened the segment twice: the label is now
+# The per-class tokens NAME their PRs, so the old 150-char cut severed exactly the part that makes
+# them readable. #1872 lengthened the segment twice: the label is now
 # `QUEUE(state; pr-doctor dispatches): ` (so the counts cannot be mistaken for an instruction the
 # automatic dispatcher already owns) and `running` is named like every other class.
 #
@@ -299,10 +299,15 @@ PYAGE
 obj=$(sed -n '2p' "$STATE/objective.last" 2>/dev/null | cut -c1-900)
 
 # ── RES: the system-resource segment, on its OWN line (objective.last line 3) ──────────
-# Its own line because the objective line is ALREADY past the length it is read with (the
-# `cut -c1-900` above), so appending this would cut it off mid-token -- the same truncation the
-# paragraph above describes, from the other side. (`fix-ci` is not rendered in that segment at
-# all -- it appears as `IN-PROGRESS: fixing <check>=<n>` -- so nothing here depends on it.)
+# Its own line for TWO reasons, and NEITHER of them is a length claim about the objective line
+# (#1872 review round 17: an earlier version of this comment said that line was "ALREADY past the
+# length it is read with", which a 4-PR fixture refutes -- it measures ~300 chars against a 900
+# cut). (1) Appending it would put the CURRENT resource numbers BEHIND everything the objective
+# segment can grow into, and the tail is what a cut reaches first -- so #1872 moved it OUT of that
+# line rather than arguing about widths. (2) Its own line can be refreshed EVERY BEAT without
+# re-deciding the verdict (see the cache paragraph below, which is the reason that actually bit).
+# (`fix-ci` is not rendered in the objective segment at all -- it appears as
+# `IN-PROGRESS: fixing <check>=<n>` -- so nothing here depends on it.)
 # It is NOT truncated: the line is short and every field is load-bearing.
 # ⛔ FRESH EVERY BEAT, NEVER FROM THE CACHE. Reading line 3 of `objective.last` inherited that
 # file's 900 s TTL: two beats 7m33s apart printed BYTE-IDENTICAL values, including `runq=79`

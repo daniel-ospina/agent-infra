@@ -397,7 +397,8 @@ def idle_lanes() -> tuple[list[dict], str]:
     # `json.loads` succeeding was treated as "readable" -- so `{"error": "rate limit"}`, `{}` and
     # `{"idle": null}` all came back as a GOOD, EMPTY roster: `lanes=0, status=""`, which then took
     # the readable-roster path ("no idle lanes -- nothing dispatched this pass") and exited 0,
-    # bypassing the refusal four lines below in `main()` BECAUSE IT FIRES ONLY ON `lane_err`. That is
+    # bypassing `main()`'s `if lane_err:` refusal BECAUSE THAT FIRES ONLY ON A NON-EMPTY STATUS --
+    # and this function had just returned `""`, i.e. a GOOD read. That is
     # the exact false PASS this function's docstring forbids, and the same shape round 4 fixed in
     # `open_prs()` ("a NON-LIST ROOT is a failed read too"). `rc` is not compared here at all
     # (`lane-actions.py` documents empty stdout as the caller's fail-closed detector), so the PAYLOAD
