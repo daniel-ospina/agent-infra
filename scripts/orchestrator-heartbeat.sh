@@ -349,7 +349,12 @@ except Exception:
 now=int(time.time())
 for r in rows:
     v=r["verdict"]
-    if v in ("WORKING",): act+=1
+    # ⛔ UNATTRIBUTED-WORKING IS PROVEN CPU PROGRESS (#1867): lane-status.py only mints it when a pi
+    # in the lane OWN directory advanced CPU, so a lane carrying it is active -- not the old read of
+    # neither-active-nor-waiting-child. It is absent from NURT/WEAK on purpose: it prescribes no
+    # action, so it must not alert. Counting it keeps N_ACT truthful -- the same misreporting class
+    # as the measured active=0 while 12 of 14 lanes were writing.
+    if v in ("WORKING", "UNATTRIBUTED-WORKING"): act+=1
     elif v in ("WAITING-CHILD",): wait+=1
     if v in NURT:
         c=r.get("child") or {}
