@@ -529,6 +529,37 @@ the band in which the spawn sites hold back (`16`–`99` is now permitted, where
 Closing that needs `can_spawn()` to consult memory as well, which changes the one-line shape its
 self-test extracts from the shipped file; tracked as agent-infra#1732 rather than half-done here.
 
+⚠️ **The account's CONCURRENCY cap is a shared FLEET resource — the ceiling on parallelism is
+neither CPU, RAM nor disk.** Every limit in the table above bounds *this box*: load, lanes, swap,
+memory. None of them bounds the account. GitHub's **secondary** limit is a **concurrency** limit
+(documented at no more than 100 requests in flight, **shared across REST and GraphQL**), and
+`GET /rate_limit` **cannot see it** — it reports the primary budget only, and a refusal may carry
+no `retry-after` at all. So a healthy `graphql.remaining` next to a refused call is the documented
+blind spot, not a contradiction, and **it is not evidence that the fleet is healthy**. Measured
+2026-10-17: five boxes' controllers plus hand-dispatched workers, each issuing `gh` calls with
+nothing coordinating them, refused on every GraphQL call while the counter read `used: 541` of
+5000 (agent-infra#1910, superseding the point-budget framing of agent-infra#1762).
+
+The defence is a **fleet-wide courtesy gate in the `gh` shim** (`scripts/gh-shim/gh`), which is why
+it is not a harness variable: it applies to every `gh` call a pi session makes, not only to the
+controller's. It bounds concurrent `gh` processes per machine, spaces call starts, and on a
+rate-limit refusal writes a **shared cooldown** so the next call waits instead of walking into the
+same burst — one refusal-and-wait per burst rather than one per lane.
+
+| Var (shim env) | Default | Why |
+|---|---|---|
+| `AGENT_GH_GATE_MAX_INFLIGHT` | `2` | concurrent `gh` processes **per machine**. The account ceiling is 100 *shared across all machines*, so a per-machine cap must be well under it — 2 leaves room for ~50 boxes. Raising it multiplies across the fleet, not just here |
+| `AGENT_GH_GATE_INTERVAL_MS` | `250` | minimum ms between call **starts**. Adds latency by design (~50 sweep calls ≈ 12 s). `0` trades the burst protection for throughput |
+| `AGENT_GH_GATE_MAX_ATTEMPTS` | `3` | total attempts on a rate-limit refusal, including the first |
+| `AGENT_GH_GATE_RETRY_BASE` | `60` | seconds to wait when a refusal carries **no** `retry-after` (GitHub's own guidance is "at least one minute"). Floor 1 s: an immediate identical retry cannot succeed by construction |
+| `AGENT_GH_GATE_RETRY_MAX` | `900` | ceiling on any single wait, including a server-supplied `retry-after` |
+| `AGENT_GH_GATE_DIR` | `~/.pi/agent/gh-gate` | the per-machine gate state (`slots/`, `cooldown.*`). One *user's* count — two users on one box do not share it |
+
+⛔ **`MAX_LANES` is not the lever for this.** Adding lanes adds `gh` callers, and a lane that
+blocks on the gate is a lane that is not producing. The only true capacity increase is a separate
+rate-limit pool — GitHub App **installation** tokens have their own budget (5,000/h per
+installation) — and that is a decision, not a tuning change.
+
 **Swap, not lanes, is what actually throttles this box.** Observed at 15 concurrent workers:
 `swap_free=588M` → dispatch correctly refused. Raising `MAX_LANES` alone buys nothing on the box
 this was measured on (the original 8 GB host — the current one is 32 GB);
