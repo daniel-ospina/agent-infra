@@ -254,14 +254,19 @@ def gql_commit_checks(sha):
                         "-f", "owner=daniel-ospina", "-f", "name=tortoise"],
                        capture_output=True, text=True, timeout=90)
     global GH_LAST_ERROR
+    # ⛔ APPEND, NEVER REPLACE: this fallback runs BECAUSE the REST read already failed, and the
+    # REST cause is the actionable one ("rate limit exceeded" says wait; a 404 on the fallback
+    # says debug the fallback). Replacing it left only the second transport's error in the
+    # dispatcher's cause line (#1872 review round 4).
+    _prev = (GH_LAST_ERROR + " | ") if GH_LAST_ERROR else ""
     if r.returncode != 0:
-        GH_LAST_ERROR = "graphql fallback rc=%s %s" % (r.returncode, (r.stderr or "")[:180])
+        GH_LAST_ERROR = _prev + "graphql fallback rc=%s %s" % (r.returncode, (r.stderr or "")[:180])
         return None
     try:
         nodes = (json.loads(r.stdout)["data"]["repository"]["object"]
                  ["statusCheckRollup"]["contexts"]["nodes"])
     except Exception:
-        GH_LAST_ERROR = "graphql fallback returned no rollup: " + (r.stdout or "")[:180]
+        GH_LAST_ERROR = _prev + "graphql fallback returned no rollup: " + (r.stdout or "")[:180]
         return None
     out = []
     for n in nodes:
@@ -758,6 +763,12 @@ def classify_pr(pr, cr, att_clean):
     # 3. resolve-conflict -- GitHub says DIRTY. A rebase CHANGES THE HEAD, so it is right even
     #    while checks are still running (they all re-run anyway) -- which is why it sits ABOVE
     #    the `running` arm below.
+    #    ⛔ AND IT CANNOT FIRE FOR AN ATTESTED PR: arm 1 returns first, so a green+attested head
+    #    that has since gone DIRTY reads `call-rail`, whose brief says the rail would take it --
+    #    while the rail refuses a conflicted PR. Pre-existing, and DELIBERATELY left alone here
+    #    (the edge is pinned by `test_knows_the_one_edge_the_strict_order_creates` as "PINNED, NOT
+    #    ENDORSED", so fixing it changes the arm spec). Tracked in #1936; two reviewers rated it
+    #    P1, so it should land before this ordering is trusted.
     if (pr.get("mergeStateStatus") or "") == "DIRTY":
         return "resolve-conflict"
     # 4. running -- THE HEAD IS STILL EXECUTING, and nothing can be decided about it yet.
@@ -1043,13 +1054,6 @@ def build(prev=None):
                 if _cnt:
                     seg += " IN-PROGRESS: fixing " + " ".join(
                         f"{n}={c}" for n, c in sorted(_cnt.items(), key=lambda kv: (-kv[1], kv[0])))
-            if q.get("surface"):
-                # An OVERLAY, not a sixth bucket: it does not break the partition, because a
-                # surface change can also need work. It names the one action only the USER may
-                # take -- AND the PRs, because `surface=2` alone tells the owner nothing he can
-                # act on (a gate whose output is "2 things need you" is a stall with a receipt).
-                _sprs = " ".join(f"#{n}" for n in (q.get("surface_prs") or []) if n)
-                seg += f" | ASK-USER: surface={q['surface']}" + (f": {_sprs}" if _sprs else "")
             parts.append(f"waiting={q['nondraft']} prs: {q['nondraft']} nondraft")
         else:
             # `classes` is None when ANY PR's checks were unreadable, so no partition is printed.
@@ -1069,6 +1073,16 @@ def build(prev=None):
             # A ZERO FROM A BLIND READ IS NOT A CLEARANCE. Kept from the deleted pair: the
             # fail-closed job belongs to whatever token stands where the zeros used to.
             parts.append(f"queue_read=BLIND({_u}/{q['nondraft']} unread) -- the QUEUE counts are NOT a clearance")
+        # ⛔ THE OWNER'S LIST IS NOT THE TAIL EITHER (#1872 review round 4). `ASK-USER` names the
+        # PRs because `surface=2` alone tells the owner nothing he can act on (a gate whose output
+        # is "2 things need you" is a stall with a receipt) -- and it used to sit at the END of the
+        # queue segment, so a deep queue severed the NUMBERS and left the bare count it was added
+        # to replace (MEASURED: 60 non-draft PRs with a 20-PR overlay loses all 20 names inside the
+        # nudge's cut). An OVERLAY, not a sixth bucket: it does not break the partition, because a
+        # surface change can also need work.
+        if q.get("surface"):
+            _sprs = " ".join(f"#{n}" for n in (q.get("surface_prs") or []) if n)
+            parts.append(f"ASK-USER: surface={q['surface']}" + (f": {_sprs}" if _sprs else ""))
         if q.get("classes"):
             parts.append(f"| QUEUE(state; pr-doctor dispatches): {seg}")
         # ⛔ `blocked` IS DELETED AS A TOKEN, AND SO IS ITS CAVEAT. Do not re-add either.
@@ -1092,8 +1106,10 @@ def build(prev=None):
         verdict = "GH-RATE-LIMITED"  # NOT a property of the tree: the fleet cannot read
     elif mstate == "RED":
         verdict = "FIX-MAIN"         # main is RED. The beat prints failing_required=<check>
-                                      # beside this; the WORK is fixing that check (there is no
-                                      # `DO:` token any more -- the segment is state, #1872).
+                                      # beside this; the WORK is fixing that check. There is no
+                                      # `DO:` token for the PR CLASSES any more (that segment is
+                                      # state, #1872) -- the RES band still emits its own
+                                      # `| DO: <band>`, which is this file's dispatch gate.
     elif q is None or mstate == "UNKNOWN":
         verdict = "UNKNOWN"          # never extrapolate from an unreadable surface
     # The verdict is about the QUEUE. `crit_max` is deliberately NOT a term here: CI time is

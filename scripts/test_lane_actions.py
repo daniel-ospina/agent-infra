@@ -908,9 +908,10 @@ class TestActionVocabulary:
         assert "docs" not in self.o.fix_ci_reasons(cr)
 
     def test_a_check_still_in_flight_is_running_not_fix_ci(self):
-        """MEASURED LIVE, #8825 (2026-10-16). `pricing-artifact` was mid-run, every other gate
-        green-or-ai-review-gate, and the beat printed it in the fix-ci bucket -- i.e. it told a
-        lane to go FIX code under a suite that was still executing. Waiting is the action: none."""
+        """MEASURED LIVE, #8825 (2026-10-16). `pricing-artifact` was mid-run, `ai-review-gate`
+        red, `python-ci-gate` not yet created, and the beat printed it in the fix-ci bucket -- i.e.
+        it told a lane to go FIX code under a suite that was still executing. Waiting is the
+        action: none."""
         cr = self._cr(red=["ai-review-gate"], absent=["python-ci-gate"],
                       flight=["pricing-artifact"])
         assert self.o.classify_pr(self._pr(), cr, False) == "running"

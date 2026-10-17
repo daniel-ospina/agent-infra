@@ -288,12 +288,22 @@ def test_the_FAIL_CLOSED_caveat_precedes_the_counts_it_qualifies(tmp_path, monke
     counts are NOT a clearance. That holds only while `queue_read=BLIND` is emitted BEFORE the
     `QUEUE(` segment, so the ordering is pinned here instead of being described in a comment
     nobody can enforce.
+
+    The same argument covers `ASK-USER` (#1872 review round 4): it names the surface PRs because
+    the count alone is not actionable, so a deep queue must not be able to sever the names and
+    leave the bare count the overlay was added to replace.
     """
-    prs = json.dumps([_pr(n, "UNKNOWN") for n in range(1, 15)])
+    prs = json.dumps([dict(_pr(n, "UNKNOWN"),
+                           files=[{"path": "tortoise/sdk.py"}] if n % 3 == 0 else [])
+                      for n in range(1, 15)])
     install(monkeypatch, pr_list=_Result(0, prs))
     line = objective.build()
     assert "queue_read=BLIND" in line and "| QUEUE(state;" in line, line
     assert line.index("queue_read=BLIND") < line.index("| QUEUE(state;"), line
+    # ...and the OWNER'S list is protected the same way: it cannot be the token a deep queue
+    # severs. MEASURED before this: 60 non-draft PRs with a 20-PR overlay lost all 20 names.
+    assert "ASK-USER: surface=" in line, line
+    assert line.index("ASK-USER: surface=") < line.index("| QUEUE(state;"), line
 
 
 def test_a_resolved_mergeability_read_manufactures_no_unknown_bucket(monkeypatch):

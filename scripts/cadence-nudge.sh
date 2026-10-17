@@ -276,23 +276,22 @@ except Exception:
 PYAGE
 }
 # R8-- the per-class tokens NAME their PRs, so the old 150-char cut severed exactly the part
-# that makes them readable (it is how `fix-ci=` was already being truncated). #1872 lengthened
-# the segment twice: the label is now `QUEUE(state; pr-doctor dispatches): ` (so the counts
-# cannot be mistaken for an instruction the automatic dispatcher already owns) and `running` is
-# named like every other class.
+# that makes them readable. #1872 lengthened the segment twice: the label is now
+# `QUEUE(state; pr-doctor dispatches): ` (so the counts cannot be mistaken for an instruction the
+# automatic dispatcher already owns) and `running` is named like every other class.
 #
-# ⛔ THE BOUND IS NOT A MEASURED WORST CASE, AND SHOULD NOT BE WRITTEN AS ONE. Three review
-# rounds argued about the number (628 -> 675/799 -> 860) because the length is a function of
-# digits x named PRs x per-entry gate names x the ASK-USER overlay x the STUCK escalation; a
-# "worst case" line is therefore a claim about the FLEET, not about the format, and it goes
-# stale the first time the queue grows. What 900 IS:
-#   * measured long enough for the shapes this fleet reaches (40 non-draft PRs, every class
-#     populated, the BLIND caveat, a 20-PR ASK-USER overlay, 5-digit PR numbers, a STUCK
-#     escalation: 860), and
-#   * structurally safe to truncate, because the one token that must SURVIVE a cut is no longer
-#     at the tail: `queue_read=BLIND(...)` is emitted BEFORE the queue segment (objective.py,
-#     pinned by a test), so any truncation lands in the CI INDICATORS only.
-# Never move the caveat back to the tail; re-measure before lowering this number.
+# ⛔ THIS IS A TRUNCATION POINT, NOT A WORST CASE, AND NO NUMBER BELONGS HERE. Four review rounds
+# argued about one (628 -> 675/799 -> 860 -> 900) and every value was falsified by the next
+# measurement, because the length is a function of DIGITS x NAMED PRs x per-entry gate names x the
+# overlay x the STUCK escalation: any figure is a claim about the FLEET, not about the format, and
+# it goes stale the first time the queue grows. What is true, and does not go stale:
+#   * what a cut CAN sever: the tail of the queue segment and then the CI indicators;
+#   * what a cut CANNOT sever, because of where it is emitted (`objective.py`, pinned by
+#     `test_the_FAIL_CLOSED_caveat_precedes_the_counts_it_qualifies`): `queue_read=BLIND(...)` --
+#     the token that says the counts are NOT a clearance -- and `ASK-USER: surface=N: #...`, the
+#     owner's actionable list. Both precede the queue segment; neither may move back to the tail.
+# 900 is simply "long enough for the shapes measured so far". Re-measure before lowering it, and
+# never treat it as a guarantee about any shape.
 obj=$(sed -n '2p' "$STATE/objective.last" 2>/dev/null | cut -c1-900)
 
 # ── RES: the system-resource segment, on its OWN line (objective.last line 3) ──────────

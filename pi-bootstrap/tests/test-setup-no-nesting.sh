@@ -259,6 +259,18 @@ check_fleet_srcs_farmed() {
  farm copies in array order, and only the driver-first order makes an interrupted farm FAIL LOUDLY\
  (the driver's import seam); the reverse order is silent (#1872)"
   fi
+  # ⛔ AND ABSENCE IS NOT A PASS (#1872 review round 4). The order assertion above is vacuous when
+  # either index is 0, and the producer gate that catches a missing `objective.py` says nothing
+  # about a missing `pr-doctor.py`: mutation-measured, deleting `pr-doctor.py` from `fleet_srcs`
+  # left this whole suite GREEN. That is the direction the PR calls silent — `~/.pi/agent/scripts/`
+  # would keep an OLD driver beside a NEW classifier forever, with every gate green.
+  for entry in pr-doctor.py objective.py; do
+    case " $line " in
+      *" $entry "*) ;;
+      *) fail "$label: fleet_srcs no longer declares '$entry' — the PAIR of driver/classifier\
+ is undelivered, and its drift is exactly what the import seam refuses at runtime (#1872)" ;;
+    esac
+  done
 }
 
 # #1552 — PRODUCER COMPLETENESS, the half `check_fleet_srcs_farmed` cannot do. That function pins

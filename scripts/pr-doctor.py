@@ -13,14 +13,15 @@ so every CI failure -- which is a NORMAL step of merging -- became a line in a r
 So this closes the loop. Each pass, for every open non-draft PR, it asks `objective.py` -- the
 fleet's ONE classifier -- what the PR needs, and DISPATCHES that work:
 
-    call-rail        all required checks green + clean attestation at the current head, and the
-                     rail itself would take it -> dispatch: call the rail
+    call-rail        the SIX gated required checks green (`ai-review-gate` is diff-bound and
+                     clears by recording, so it is not one of them) + clean attestation at the
+                     current head, and the rail itself would take it -> dispatch: call the rail
     blocked-by-rail  ...the same, but a gate `admin-merge.sh` enforces is refusing it
                      (`flip-gate`/`drift-guard`/`provenance`) -> dispatch: repair that gate
     rerun-checks     a required check never ran at this head (absence is not green)
                      -> dispatch: re-trigger the workflows
     resolve-conflict GitHub says DIRTY -> dispatch: rebase on main, then record + rail
-    record-review    everything green, no clean attestation at this head
+    record-review    the six gated checks green, no clean attestation at this head
                      -> dispatch: review, record, rail -- in ONE run
     fix-ci           a required check is RED -> dispatch: FIX it, then re-review, then rail
     running          the head is still EXECUTING -> skip (next pass). NOT only "a required
@@ -119,11 +120,11 @@ CLASSIFIER = _objective()
 # ⛔ THE SEAM IS ASSERTED, NOT ASSUMED (#1872). This file and `objective.py` are farmed into
 # `~/.pi/agent/scripts/` as TWO INDIVIDUAL files (`pi-bootstrap/setup.sh` `fleet_srcs`), and that
 # farm SKIPS a source that is missing (`[ -f "$f" ] || continue`) -- so a newer pr-doctor.py can
-# sit beside an older objective.py. Without this check the import still succeeds, every PR then
-# fails INSIDE the per-PR swallow below -- seven swallowed `AttributeError`s, and (once round 2
-# made an all-blind pass REFUSE rather than exit 0) a generic refusal that names no symbol. The
-# seam's value is now the DIAGNOSIS: it says which symbol is stale, in one line, before anything
-# runs.
+# sit beside an older objective.py. Without this check the import still succeeds and the failure
+# surfaces only per PR, one swallowed `AttributeError` at a time, AFTER the queue was read. The
+# seam's value is that it fires BEFORE any read or dispatch, and names EVERY stale symbol in one
+# line -- with a stale sibling and no seam, the same fact takes one log line per PR to assemble
+# (and the all-blind refusal further down then reports it without saying which symbol is old).
 _SEAM = ("classify_one", "touches_surface", "CLASS_ORDER", "REQUIRED", "RAIL_GATES", "GH_BIN")
 _missing = [n for n in _SEAM if not hasattr(CLASSIFIER, n)]
 if _missing:
@@ -317,6 +318,12 @@ def open_prs() -> list[dict]:
     # comment above forbids, one line below it.
     if not (out or "").strip():
         parsed = False
+    # ⛔ AND A NON-LIST ROOT IS A FAILED READ TOO (#1872 review round 4). `json.loads("{}")`
+    # succeeds, so a wrapper/shim that prints a valid empty OBJECT produced `prs = {}` -- falsy,
+    # so `main()` printed "no open non-draft PRs" and exited 0. This file's own `GH` comment
+    # describes the fleet box routing through a shim, which is exactly how that happens.
+    if not isinstance(prs, list):
+        prs, parsed = [], False
     if rc != 0 or not parsed:
         OPEN_PRS_ERROR = "rc=%s %s" % (rc, (err or "").strip()[:200]
                                         or ("empty stdout" if rc == 0 else "(no stderr)"))
@@ -604,9 +611,16 @@ def main() -> int:
 
     prs = open_prs()
     # ⛔ AN UNREADABLE QUEUE IS NOT AN EMPTY ONE, AND THE TWO MUST NOT SHARE AN EXIT CODE. A
-    # blind read that returns 0 is indistinguishable to the launcher from a clean pass -- the
-    # exact shape the classifier half is now fail-closed against, so the queue half cannot be
-    # allowed to stay fail-open.
+    # blind read that returns 0 is indistinguishable from a clean pass, and the classifier half is
+    # already fail-closed against that shape.
+    #
+    # ⚠️ WHAT ACTUALLY CARRIES THE SIGNAL TODAY, STATED HONESTLY: this pass's automated caller
+    # (`scripts/heartbeat-loop.sh`) launches it DETACHED and never reads the exit status, so the
+    # `REFUSING: ...` LOG LINE is the signal an operator can see, and rc=2 is for a human or a
+    # future launcher. That is #1933, filed separately: the launcher's own failure branch is
+    # unreachable (`rc=0` hardcoded above its own test). The three refusals below (this one, the
+    # all-checks-blind one, and the lane-roster one) all exit 2 so that the day a consumer exists,
+    # it needs no change here -- and so a direct `--dry-run` by a lane fails loudly today.
     if OPEN_PRS_ERROR:
         log("REFUSING: the open-PR read FAILED (%s) -- nothing dispatched" % OPEN_PRS_ERROR[:160])
         return 2
@@ -622,6 +636,9 @@ def main() -> int:
     skipped = {}
     causes = []          # WHY a read was blind, captured AT the failure, not after the loop
     for p in prs:
+        # The cause slot is scoped per PR: `per_pr_checks()` resets it, but a classifier that
+        # raises BEFORE that call would otherwise report the previous PR's error (#1872 r4).
+        setattr(CLASSIFIER, "GH_LAST_ERROR", "")
         try:
             k, why, cr = classify(p)
         except Exception as e:
@@ -631,7 +648,11 @@ def main() -> int:
             # timeout produced "dispatched 0" with no skipped-unreadable token at all.
             log("#%s classify failed: %s" % (p["number"], e))
             skipped["unreadable"] = skipped.get("unreadable", 0) + 1
-            _c = (getattr(CLASSIFIER, "GH_LAST_ERROR", "") or str(e)).strip()
+            # The EXCEPTION is the specific cause; a slot value can only be a PREVIOUS read's
+            # (this one raised before `per_pr_checks` reset it), so it is a suffix, never a
+            # substitute (#1872 review round 4).
+            _gh = (getattr(CLASSIFIER, "GH_LAST_ERROR", "") or "").strip()
+            _c = str(e) + ((" | " + _gh) if _gh and _gh not in str(e) else "")
             if _c:
                 causes.append(_c[:200])
             continue
@@ -714,10 +735,11 @@ def main() -> int:
     lanes, lane_err = idle_lanes()
     if lane_err:
         # NOT the same as "no idle lanes". Say which one it is -- and REFUSE, because "`0` is
-        # reserved for readable, nothing to do" (see the two refusals above) and a blind roster
-        # with work already classified is the third instance of the same fail-open (#1872 review
-        # round 3, raised independently by two reviewers). The branch below stays `return 0`: that
-        # one IS a successful read with nothing to dispatch to.
+        # reserved for readable, nothing to do" (see the two refusals above, and the note there
+        # about the exit code being for a future consumer, #1933) and a blind roster with work
+        # already classified is the third instance of the same fail-open (#1872 review round 3,
+        # raised independently by two reviewers). The branch below stays `return 0`: that one IS a
+        # successful read with nothing to dispatch to.
         log("LANE READ FAILED -- cannot dispatch this pass: %s" % lane_err)
         return 2
     if budgets["total"] and not lanes:

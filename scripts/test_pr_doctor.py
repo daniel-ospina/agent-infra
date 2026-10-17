@@ -552,6 +552,18 @@ def test_open_prs_separates_an_empty_queue_from_a_failed_read(monkeypatch):
     assert pr.open_prs() == [] and "rc=127" in (pr.OPEN_PRS_ERROR or "")
 
 
+def test_a_nonlist_body_is_a_failed_read_not_an_empty_queue(monkeypatch):
+    """⛔ `json.loads("{}")` SUCCEEDS (#1872 review round 4).
+
+    A shim that prints a valid empty OBJECT therefore became `prs = {}` — falsy, so `main()`
+    printed "no open non-draft PRs" and exited 0: the same reassuring line this file's `GH`
+    constant records as having masked two dead runs. Shape-guarded like every other read here.
+    """
+    monkeypatch.setattr(pr, "log", lambda msg: None)
+    monkeypatch.setattr(pr, "sh_err", lambda cmd: ("{}", "", 0))
+    assert pr.open_prs() == [] and pr.OPEN_PRS_ERROR is not None
+
+
 # ── 6. the deploy seam: an OLD sibling `objective.py` must refuse, not run blind ─────────
 
 def test_a_stale_sibling_objective_refuses_at_import(tmp_path):
