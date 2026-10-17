@@ -81,8 +81,9 @@ doc_status: draft
 > `fix/8468-closure-linkage` branch rewrote this directory (severity-ordered pool, a `.prio`-keyed
 > P0 bypass of the merge-priority gate, `merged-not-closed.sh`, a `Closes`-not-`Refs` lane brief).
 > It has since MERGED (9b249f418). `merged-not-closed.sh` is ported here (third pass, 2026-10-16);
-> the `Closes`-not-`Refs` lane brief, the `.prio` P0 bypass and the `orch-loop.sh` merge-priority
-> override are **not** — every remaining file is tracked in `port-provenance.txt`.
+> the `Closes`-not-`Refs` lane brief was **NOT** ported (tracked as agent-infra#1902), and neither
+> were the `.prio` P0 bypass or the `orch-loop.sh` merge-priority override — every remaining item is
+> listed under "STILL NOT RECONCILED" in `port-provenance.txt`.
 > **The tortoise copy is still required and must not be deleted yet.**
 >
 > ⚠️ **This port is faithful EXCEPT for a declared set of fail-open / false-PASS fixes.** These are
@@ -915,10 +916,12 @@ These are kept as a record because each one is a *failure mode of the design*, n
   commits merged on tortoise `main` after the copy was taken (2026-10-13 10:50Z, `eda7df136`); all
   seven are ported here, listed in the provenance note at the top. `port-provenance.txt` pins every
   file's tortoise blob hash at that sync point and `check-port-drift.sh` fails if the tortoise tree
-  moves again. ⚠️ Its pin was STALE from 2026-10-13 to 2026-10-16 — it sat at `e20de606b`, an
-  ancestor of the prose `ported_through`, so the check reported already-ported files (e.g.
-  `spawn-gate.sh`) as drift. Re-pinned in the third pass; `port-provenance.txt` records the
-  residuals that are still unported and why **the tortoise copy must not be deleted yet**.
+  moves again. ⚠️ Its pin was STALE from 2026-10-13 to 2026-10-16: it sat at `e20de606b` and was
+  **never advanced** past the tortoise commits that followed it, so the check compared the tortoise
+  tree against a sync point OLDER than work this tree already carried and reported that work as
+  drift (e.g. `spawn-gate.sh`, flagged "in tortoise but not in the pinned sync point" while main
+  carried it via #1807). Re-pinned in the third pass; `port-provenance.txt` records the residuals
+  that are still unported and why **the tortoise copy must not be deleted yet**.
 - **A keys.env with a top-level `exit` disables the supervisor silently (agent-infra#1713).** The
   file is sourced in the supervisor's own shell, so `exit`/`exec` ends the script: `start` returns 0
   having created no session.
