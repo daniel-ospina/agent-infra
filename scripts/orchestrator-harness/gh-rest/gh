@@ -183,6 +183,8 @@ case "$SUB" in
   exit 0 ;;
 
 "pr checks")
+  # The table output is not modelled — without --json the caller wants gh's formatting.
+  [ -n "$JSON_F" ] || delegate
   honour
   [ -n "$REPO" ] && [[ "$NUM" =~ ^[0-9]+$ ]] || delegate
   sha="$("$REAL_GH" api "repos/$REPO/pulls/$NUM" --jq .head.sha 2>/dev/null)"

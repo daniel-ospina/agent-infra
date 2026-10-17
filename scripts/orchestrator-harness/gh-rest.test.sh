@@ -99,6 +99,12 @@ out="$(run pr checks 8833 --repo o/r --json name,state 2>&1)"
 ck "pr checks includes LEGACY commit statuses (else a protection context is never green)" \
    "$(printf '%s' "$out" | json_eq 'any(x["name"]=="vercel/deploy" for x in d)')"
 
+# ── D2. pr checks WITHOUT --json delegates (the table is not modelled) ──────────────────────────
+: >"$TMP/log"
+out="$(run pr checks 8833 --repo o/r 2>&1)"
+ck "pr checks without --json DELEGATES (table output is not modelled)" \
+   "$(stublog | grep -q 'pr checks 8833 --repo o/r' && echo 0 || echo 1)"
+
 # ── E. pr list --head must reach the API (chain-merge.sh:44 — else the WRONG PR is merged) ───────
 : >"$TMP/log"
 run pr list --repo o/r --state open --head BR --json number --jq '.[0].number' >/dev/null 2>&1
