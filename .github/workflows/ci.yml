@@ -255,7 +255,13 @@ jobs:
         # blindness flag and on the objective cache's freshness were pinned by suites
         # CI could not execute. A suite the repo does not RUN is a suite it does not
         # HAVE — naming them is the half of the landing that makes the other half count.
-        run: python3.12 -m pytest scripts/test_parallel_work_check.py tests/test_ci_exemption.py tests/test_ci_exemption_producer.py scripts/test_lane_status.py scripts/test_lane_actions.py scripts/test_lane_watchdog.py scripts/test_admin_merge_head.py scripts/test_objective.py scripts/test_turn_classify_state.py scripts/test_pr_doctor.py -x --timeout=60 -q
+        # #1876 — `scripts/test_queue_dispatch.py` pins the defect that stopped the dispatcher
+        # feeding the fleet: `sh()` merged stderr into stdout, so lane-status.py's DEGRADED
+        # notice landed inside the roster JSON and every affected pass ABORTED. Named here (and
+        # byte-identically in ci-main.yml's python-ci caller) for the #1552 reason: a suite the
+        # repo does not RUN is a suite it does not HAVE, and the failure this one guards is
+        # live dispatch, which no other suite in this list touches.
+        run: python3.12 -m pytest scripts/test_parallel_work_check.py tests/test_ci_exemption.py tests/test_ci_exemption_producer.py scripts/test_lane_status.py scripts/test_lane_actions.py scripts/test_lane_watchdog.py scripts/test_admin_merge_head.py scripts/test_objective.py scripts/test_turn_classify_state.py scripts/test_pr_doctor.py scripts/test_queue_dispatch.py -x --timeout=60 -q
 
   verify:
     # #1349 — the pytest half MOVED to the `test` job above, so that the PR lane
