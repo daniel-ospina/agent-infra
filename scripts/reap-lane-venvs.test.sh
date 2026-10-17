@@ -44,6 +44,9 @@ HARNESS="$HERE/orchestrator-harness"
 SUP="$HERE/cloud-cell-supervisor.sh"
 GATE="$HARNESS/spawn-gate.sh"
 SETUP="$HERE/../pi-bootstrap/setup.sh"
+# The declared-surface registry: a liveness/retention bound in a NEW script is invisible to the
+# reverse scan until it is registered, and `verify`'s #1068 step goes red on the PR that adds it.
+REGISTRY="$HERE/../extensions/shared/heartbeat-progress-edges.ts"
 
 PASS=0
 FAIL=0
@@ -414,6 +417,13 @@ if grep -qF 'reap-lane-venvs.sh' "$SETUP"; then
   ok "pi-bootstrap/setup.sh farms the reaper (a cell resolves it at ~/.pi/agent/scripts)"
 else
   bad "the reaper is not farmed — a cell could not find it"
+fi
+# The age floor is a retention bound, so the #1068 declared-surface gate requires it in the
+# registry — and the registry's own reverse scan is what caught its absence (#1932 CI).
+if grep -qF 'name: "REAP_VENV_MIN_AGE_SECONDS"' "$REGISTRY"; then
+  ok "the GC age floor is registered in the declared-surface registry (#1068), not just declared"
+else
+  bad "REAP_VENV_MIN_AGE_SECONDS is not in extensions/shared/heartbeat-progress-edges.ts"
 fi
 
 echo "── G. the uv download cache is untouchable ──────────────────────────────────────────"

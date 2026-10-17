@@ -72,6 +72,16 @@ makes the whole pass unsound, **exit 3 with nothing removed**. "No tmux server" 
 so on every report. It exists for hosts with neither `lsof` nor `/proc`; it is not a
 default.
 
+## The age floor is a declared surface, not a private default
+
+`REAP_VENV_MIN_AGE_SECONDS` (1800 s) is a **retention** bound, so the #1068
+declared-surface gate (`extensions/shared/heartbeat-progress-edges.ts`, reverse scan)
+requires it in the registry — a new script that declares a liveness/retention bound
+without registering it leaves the bound invisible to the audit that exists to notice
+exactly that. It is registered there (axis `retention`, with the same shape as
+`REAP_WT_LOCK_STALE_SECONDS`) and the suite pins both halves: the declaration in this
+script and the registration that makes it auditable.
+
 ## Two entry points, and why both
 
 | path | who calls it | what it proves |
