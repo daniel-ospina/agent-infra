@@ -371,7 +371,7 @@ def test_materialise_preserves_a_dangling_directory_and_uses_a_fresh_path(monkey
     assert (repo / ".worktrees" / "prd-1" / ".git").exists()
     (pathlib.Path(wt) / "wip.txt").write_text("uncommitted work\n")
     shutil.rmtree(repo / ".git" / "worktrees" / "prd-1")   # record gone, directory stays
-    assert not pr._live_worktree(wt)                        # the trap the old check fell into
+    assert pr._live_worktree(wt) is False               # the trap the old check fell into
     wt2, err = pr.materialise_worktree(_prb(1, head, "feat/x"))
     assert err == "" and wt2 != wt and wt2.endswith("prd-1-d")
     assert (pathlib.Path(wt) / "wip.txt").read_text() == "uncommitted work\n", \
@@ -426,6 +426,73 @@ def test_materialise_moves_a_behind_local_branch_to_the_pr_head(monkeypatch, tmp
     assert err == "" and wt
     assert subprocess.run(["git", "-C", wt, "rev-parse", "HEAD"], capture_output=True,
                           text=True).stdout.strip() == head
+
+
+def test_materialise_refuses_when_liveness_cannot_be_determined(monkeypatch, tmp_path):
+    """An unanswerable liveness probe must NOT select reuse: `True` (the old "assume live" rule)
+    would run `_ensure_head` -> `reset --hard` against whatever `git -C <path>` resolves to."""
+    repo, g = _git_repo(tmp_path)
+    g("checkout", "-q", "-b", "feat/x")
+    (repo / "x.txt").write_text("x\n")
+    g("add", "x.txt")
+    g("commit", "-qm", "x")
+    head = g("rev-parse", "HEAD").stdout.strip()
+    g("checkout", "-q", "main")
+    main_before = g("rev-parse", "HEAD").stdout.strip()
+    _wire_repo(monkeypatch, repo)
+    path = repo / ".worktrees" / "prd-1"
+    path.mkdir(parents=True)
+    real = pr.sh_err
+
+    def fake(argv, timeout=180, cwd=None):
+        if "--show-toplevel" in argv:
+            return "", "timed out", -1                 # UNKNOWN, not "not a worktree"
+        return real(argv, timeout=timeout, cwd=cwd)
+
+    monkeypatch.setattr(pr, "sh_err", fake)
+    wt, err = pr.materialise_worktree(_prb(1, head, "feat/x"))
+    assert wt == "" and "cannot determine" in err
+    assert g("rev-parse", "refs/heads/main").stdout.strip() == main_before, \
+        "an unanswerable probe must not reset anything"
+
+
+def test_ensure_head_refuses_to_reset_when_cleanliness_is_unknown(monkeypatch, tmp_path):
+    """`status --porcelain` failing with empty stdout used to read as CLEAN and reset --hard."""
+    repo, g = _git_repo(tmp_path)
+    g("branch", "feat/x")
+    head1 = g("rev-parse", "HEAD").stdout.strip()
+    _wire_repo(monkeypatch, repo)
+    wt, _ = pr.materialise_worktree(_prb(1, head1, "feat/x"))
+    real = pr.sh_err
+
+    def fake(argv, timeout=180, cwd=None):
+        if "status" in argv and "--porcelain" in argv:
+            return "", "fatal: probe failed", 1       # cannot determine cleanliness
+        return real(argv, timeout=timeout, cwd=cwd)
+
+    monkeypatch.setattr(pr, "sh_err", fake)
+    err = pr._ensure_head(wt, "feat/x", "0" * 40)
+    assert "cannot determine" in err
+    assert subprocess.run(["git", "-C", wt, "rev-parse", "HEAD"], capture_output=True,
+                          text=True).stdout.strip() == head1, \
+        "a worktree whose cleanliness is unknown must never be reset"
+
+
+def test_materialise_clears_a_stranded_detached_record(monkeypatch, tmp_path):
+    """A fork-PR worktree is DETACHED, so `worktree list --porcelain` has no `branch` line. Its
+    stranded record must still be cleared, or `worktree add <prd-n>` fails for ever."""
+    import shutil
+    repo, g = _git_repo(tmp_path)
+    head = g("rev-parse", "HEAD").stdout.strip()
+    g("branch", "feat/x")
+    _wire_repo(monkeypatch, repo)
+    path = repo / ".worktrees" / "prd-1"
+    g("worktree", "add", "--detach", str(path), head)
+    shutil.rmtree(path)
+    assert any(os.path.realpath(p) == os.path.realpath(str(path)) for p, _ in pr._worktrees()), \
+        "a detached worktree must appear in _worktrees() with an empty ref"
+    wt, err = pr.materialise_worktree(_prb(1, head, "feat/x"))
+    assert err == "" and wt == str(path)
 
 
 def test_materialise_worktree_clears_a_stranded_record(monkeypatch, tmp_path):

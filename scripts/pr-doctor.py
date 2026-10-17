@@ -362,9 +362,15 @@ def materialise_worktree(pr: dict) -> tuple[str, str]:
         if not os.path.exists(p) and (p in ours or b == "refs/heads/%s" % branch):
             _drop_worktree_record(p)
 
-    # Reuse any candidate that is already a live worktree.
+    # Reuse any candidate that is already a live worktree. UNKNOWN is NOT reuse: `True` would run
+    # `_ensure_head` -> `reset --hard` against whatever `git -C <path>` resolves to, which for a
+    # non-worktree inside the main checkout is the MAIN repo (the very trap this PR fixes).
     for cand in candidates:
-        if _live_worktree(cand):
+        live = _live_worktree(cand)
+        if live is None:
+            return "", ("cannot determine whether %s is a worktree (git probe failed) -- refusing "
+                        "to reuse or delete it; inspect it" % cand)
+        if live:
             err = _ensure_head(cand, branch, head)
             return (cand, "") if not err else ("", err)
 
@@ -417,20 +423,26 @@ def _git(args, timeout=120):
     return sh_err(["git", "-C", REPO_DIR] + list(args), timeout=timeout)
 
 
-def _live_worktree(path: str) -> bool:
-    """True only when git proves <path> IS the root of a worktree.
+def _live_worktree(path: str):
+    """True iff git proves <path> IS the root of a worktree; False iff it proves it is not; None if
+    the probe could not answer.
 
     ⛔ NOT `--is-inside-work-tree`: `WORKTREE_ROOT` lives INSIDE the main checkout, so every
     `.worktrees/prd-<n>` directory -- even an empty one -- answers `true` to that probe, and
     `rev-parse HEAD` then reads the MAIN repo's HEAD. Acting on that would reset the main
     checkout (`reset --hard` moves the branch pointer). The `--show-toplevel` comparison is the
-    worktree-ROOT test. A probe that cannot answer (rc < 0) returns True -- UNKNOWN is never a
-    licence to delete.
+    worktree-ROOT test.
+
+    UNKNOWN (rc < 0) returns None, and the caller must REFUSE: treating it as live selects the
+    reuse/reset branch (destructive against the main checkout); treating it as dead enters the
+    delete branch. Neither is safe, so an unanswerable probe is its own outcome.
     """
     out, _, rc = sh_err(["git", "-C", path, "rev-parse", "--show-toplevel"], timeout=30)
     if rc < 0:
-        return True
-    return rc == 0 and os.path.realpath((out or "").strip()) == os.path.realpath(path)
+        return None
+    if rc != 0:
+        return False
+    return os.path.realpath((out or "").strip()) == os.path.realpath(path)
 
 
 def _disposable_dangling(path: str) -> bool:
@@ -449,7 +461,12 @@ def _ensure_head(path: str, branch: str, head: str) -> str:
     _, _, have = sh_err(["git", "-C", path, "cat-file", "-e", "%s^{commit}" % head], timeout=30)
     if have != 0:
         sh_err(["git", "-C", path, "fetch", "origin", branch, "--quiet"], timeout=300)
-    dirty, _, _ = sh_err(["git", "-C", path, "status", "--porcelain"], timeout=60)
+    # ⛔ An unanswerable cleanliness probe is NOT "clean": `dirty` is empty on rc != 0, so the
+    # old `if dirty.strip()` fell through to `reset --hard` and destroyed uncommitted work.
+    dirty, _, drc = sh_err(["git", "-C", path, "status", "--porcelain"], timeout=60)
+    if drc != 0:
+        return ("cannot determine whether worktree %s is clean (git status rc=%s) -- refusing to "
+                "reset it; inspect and clean it" % (path, drc))
     if (dirty or "").strip():
         return ("worktree %s is at a different head and has uncommitted changes -- "
                 "refusing to reset it; inspect and clean it" % path)
@@ -460,16 +477,26 @@ def _ensure_head(path: str, branch: str, head: str) -> str:
 
 
 def _worktrees() -> list[tuple[str, str]]:
-    """[(path, branch-ref)] from `git worktree list --porcelain`; [] if it cannot be read."""
+    """[(path, branch-ref)] from `git worktree list --porcelain`; [] if it cannot be read.
+
+    A DETACHED worktree (the fork-PR path creates one) has no `branch ` line; its ref is "". It
+    must still be listed, or a stranded detached record at one of our paths can never be cleared
+    and `worktree add` fails with "missing but already registered" for ever.
+    """
     out, _, rc = _git(["worktree", "list", "--porcelain"], timeout=60)
     if rc != 0:
         return []
-    rows, cur = [], ""
+    rows, cur, ref = [], None, ""
     for line in (out or "").splitlines():
         if line.startswith("worktree "):
-            cur = line[len("worktree "):]
+            if cur is not None:
+                rows.append((cur, ref))
+            cur, ref = line[len("worktree "):], ""
         elif line.startswith("branch "):
-            rows.append((cur, line[len("branch "):].strip()))
+            ref = line[len("branch "):].strip()
+        # `detached` / `bare` leave ref="" -- still a record we may need to clear.
+    if cur is not None:
+        rows.append((cur, ref))
     return rows
 
 
