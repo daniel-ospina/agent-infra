@@ -410,7 +410,13 @@ def test_a_running_pr_is_never_dispatched(monkeypatch):
 
 
 def test_an_unreadable_pr_is_never_dispatched(monkeypatch):
-    """`None` (the checks could not be READ) must never become work -- it is not `fix-ci`."""
+    """`None` (the checks could not be READ) must never become work -- it is not `fix-ci`.
+
+    ⛔ AND A PASS IN WHICH *NOTHING* WAS LEGIBLE IS NOT A CLEAN PASS (#1872 review round 2):
+    it exits 2, exactly like an unreadable QUEUE, because "dispatched 0, exit 0" is
+    indistinguishable to the launcher from "readable, nothing to do" -- the dead drain this
+    file's import seam calls the worst outcome it can produce.
+    """
     logs = []
     monkeypatch.setattr(pr, "load_state", lambda: {})
     monkeypatch.setattr(pr, "open_prs", lambda: [_pr(1)])
@@ -420,8 +426,24 @@ def test_an_unreadable_pr_is_never_dispatched(monkeypatch):
     monkeypatch.setattr(pr, "dispatch",
                         lambda *a, **k: pytest.fail("an unreadable PR must not be dispatched"))
     monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--dry-run"])
+    assert pr.main() == 2
+    assert any("1 PR(s) had UNREADABLE checks" in m for m in logs), logs
+    assert any("REFUSING" in m for m in logs), logs
+
+
+def test_a_partly_blind_pass_is_reported_but_not_refused(monkeypatch):
+    """One blind PR out of two is a SKIP, not a refusal: the legible half must still be worked."""
+    logs = []
+    monkeypatch.setattr(pr, "load_state", lambda: {})
+    monkeypatch.setattr(pr, "open_prs", lambda: [_pr(1), _pr(2)])
+    monkeypatch.setattr(pr, "classify",
+                        lambda p: (None, None, None) if p["number"] == 1 else ("running", None, []))
+    monkeypatch.setattr(pr, "idle_lanes", lambda: ([_lane(1)], ""))
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--dry-run"])
     assert pr.main() == 0
-    assert any("skipped-unreadable=1" in m for m in logs), logs
+    assert any("UNREADABLE" in m for m in logs), logs
+
 
 
 def test_a_surface_pr_is_escalated_to_the_owner_not_landed(monkeypatch):

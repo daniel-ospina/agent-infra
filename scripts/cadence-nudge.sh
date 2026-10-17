@@ -279,10 +279,16 @@ PYAGE
 # that makes them readable (it is how `fix-ci=` was already being truncated). #1872 lengthened
 # the segment twice: the label is now `QUEUE(state; pr-doctor dispatches): ` (so the counts
 # cannot be mistaken for an instruction the automatic dispatcher already owns) and `running` is
-# named like every other class. MEASURED worst case -- 14 non-draft PRs with every class
-# populated, the BLIND caveat and the CI indicators: 628 chars. 700 keeps it whole; a line that
-# approaches this bound again needs the number RE-MEASURED, not raised blindly.
-obj=$(sed -n '2p' "$STATE/objective.last" 2>/dev/null | cut -c1-700)
+# named like every other class. MEASURED 2026-10-16 (review round 2, corrected -- round 1 quoted
+# 628 from a shape that predated the ASK-USER overlay and understated every reachable case):
+#   * 14 non-draft PRs, every class populated, BLIND caveat, ASK-USER naming all 14 ... 675 chars
+#   * the same with a rail-gate outage naming a gate on 3 `blocked-by-rail` entries ..... 532
+#   * 40 non-draft PRs, every class populated, ASK-USER naming 20 ...................... 799
+# 820 keeps all three whole. ⛔ THE LOAD-BEARING TOKEN IS NO LONGER AT THE TAIL: the fail-closed
+# `queue_read=BLIND(...)` caveat is emitted BEFORE the queue segment (objective.py), so a longer
+# queue can only ever cut the CI INDICATORS -- never the caveat. Re-measure before changing this
+# number; do not raise it blindly, and never move the caveat back to the tail.
+obj=$(sed -n '2p' "$STATE/objective.last" 2>/dev/null | cut -c1-820)
 
 # ── RES: the system-resource segment, on its OWN line (objective.last line 3) ──────────
 # Its own line because the objective line is ALREADY past the 150 chars it is read with, so

@@ -165,8 +165,15 @@ GH_LAST_ERROR = ""
 # covers a path that no longer carries the risk. ~/bin/gh is a real binary outside the protected
 # tree; a box without it (CI, Linux) falls back to PATH, which is what it has always effectively
 # used there.
+# ⛔ `isfile` AND `access` — `os.access(p, os.X_OK)` is TRUE FOR A DIRECTORY, so the executable
+# test alone would adopt `~/bin/gh` even if it were a directory and then raise PermissionError on
+# the first read (reviewer E, #1872 review round 2). The remaining residual is honest: a stale
+# `~/bin/gh` that exists and runs but predates a flag this file uses (`--slurp`) would still win
+# over PATH. It is recorded here rather than probed, because a capability probe costs a
+# subprocess per process start for a case no reader of this file has ever been the cause of.
 GH_BIN = (os.environ.get("OBJECTIVE_GH")
-          or next((p for p in (os.path.expanduser("~/bin/gh"),) if os.access(p, os.X_OK)), None)
+          or next((p for p in (os.path.expanduser("~/bin/gh"),)
+                   if os.path.isfile(p) and os.access(p, os.X_OK)), None)
           or "gh")
 
 
@@ -188,6 +195,11 @@ def gh(*args, paginate=False):
     try:
         d = json.loads(r.stdout)
     except Exception:
+        # ⛔ A BODY WE CANNOT PARSE IS A FAILURE WITH A CAUSE (#1872 review round 2): returning a
+        # bare None here left `GH_LAST_ERROR` at its previous value, so the dispatcher's new
+        # "why were the checks unreadable" line printed "(no gh error recorded)" -- or, worse,
+        # a PREVIOUS read's error, naming the wrong cause for the right symptom.
+        GH_LAST_ERROR = "unparseable gh api body: " + (r.stdout or "")[:200]
         return None
     if paginate and isinstance(d, list):
         flat = []
@@ -241,12 +253,15 @@ def gql_commit_checks(sha):
     r = subprocess.run([GH_BIN, "api", "graphql", "-f", f"query={q}",
                         "-f", "owner=daniel-ospina", "-f", "name=tortoise"],
                        capture_output=True, text=True, timeout=90)
+    global GH_LAST_ERROR
     if r.returncode != 0:
+        GH_LAST_ERROR = "graphql fallback rc=%s %s" % (r.returncode, (r.stderr or "")[:180])
         return None
     try:
         nodes = (json.loads(r.stdout)["data"]["repository"]["object"]
                  ["statusCheckRollup"]["contexts"]["nodes"])
     except Exception:
+        GH_LAST_ERROR = "graphql fallback returned no rollup: " + (r.stdout or "")[:180]
         return None
     out = []
     for n in nodes:
@@ -475,7 +490,11 @@ def _gh_retry(argv, attempts=3, timeout=120):
 
 SURFACE_PATHS = ("tortoise/sdk.py", "tortoise/tool_registry.py",
                  "config/surface-manifest.yml")
-# The owner-designed ACTION vocabulary (2026-10-10), cheapest-and-highest-payoff FIRST.
+# The owner-designed class vocabulary (2026-10-10): the ACTION classes in
+# cheapest-and-highest-payoff FIRST, plus `running`, which is a first-match STATE and never an
+# action. Reading this tuple as a class->action map is what sent lanes to "fix" a suite that was
+# still executing (#1872); every consumer must special-case `running` (both do: pr-doctor skips
+# it, pr-loop returns `wait`).
 # `call-rail` first: it is the win -- all 7 required green AND a clean attestation at
 # the current head, i.e. `bash scripts/admin-merge.sh <PR>` lands it with zero code work.
 # `rerun-checks` and `resolve-conflict` sit ABOVE `record-review` because a missing check
@@ -596,6 +615,8 @@ def per_pr_checks(sha):
     `#7924` before anyone checked the rail. `filter=all` MUST be a QUERY STRING -- as form
     fields (`-f filter=all`) it silently returns a PARTIAL set, which is how this was missed.
     """
+    global GH_LAST_ERROR
+    GH_LAST_ERROR = ""          # the cause this pass reports must belong to THIS read
     cr = gh(f"repos/{REPO}/commits/{sha}/check-runs?per_page=100&filter=all", paginate=True)
     return cr if cr is not None else gql_commit_checks(sha)
 
@@ -1024,11 +1045,17 @@ def build(prev=None):
                 # act on (a gate whose output is "2 things need you" is a stall with a receipt).
                 _sprs = " ".join(f"#{n}" for n in (q.get("surface_prs") or []) if n)
                 seg += f" | ASK-USER: surface={q['surface']}" + (f": {_sprs}" if _sprs else "")
-            parts.append(f"waiting={q['nondraft']} prs: {q['nondraft']} nondraft "
-                         f"| QUEUE(state; pr-doctor dispatches): {seg}")
+            parts.append(f"waiting={q['nondraft']} prs: {q['nondraft']} nondraft")
         else:
             # `classes` is None when ANY PR's checks were unreadable, so no partition is printed.
             parts.append(f"waiting={q['nondraft']}")
+        # ⛔ THE CAVEAT IS EMITTED BEFORE WHAT IT QUALIFIES (#1872 review round 2). This line is
+        # read with a fixed `cut` by `cadence-nudge.sh`, so a fail-closed caveat sitting in the
+        # TAIL is the first thing a long queue loses -- and losing it turns a blind read into a
+        # clearance, which is the exact fail-open this token exists to prevent. Both reviewers
+        # independently measured truncation of this very sentence in shapes the fleet reaches
+        # (a rail-gate outage names a gate on every `blocked-by-rail` entry; the `ASK-USER`
+        # overlay names every surface PR).
         _u = q.get("unknown") or 0
         _blind = _u > 0 and 2 * _u >= max(1, q["nondraft"])
         if _u:
@@ -1037,6 +1064,8 @@ def build(prev=None):
             # A ZERO FROM A BLIND READ IS NOT A CLEARANCE. Kept from the deleted pair: the
             # fail-closed job belongs to whatever token stands where the zeros used to.
             parts.append(f"queue_read=BLIND({_u}/{q['nondraft']} unread) -- the QUEUE counts are NOT a clearance")
+        if q.get("classes"):
+            parts.append(f"| QUEUE(state; pr-doctor dispatches): {seg}")
         # ⛔ `blocked` IS DELETED AS A TOKEN, AND SO IS ITS CAVEAT. Do not re-add either.
         # Anything that needs a sentence of apology to be read correctly is the wrong vocabulary.
         # The per-class tokens above say what the queue LOOKS LIKE and who acts on it; they do
@@ -1057,8 +1086,9 @@ def build(prev=None):
     if GH_BLOCKED == "RATE-LIMITED":
         verdict = "GH-RATE-LIMITED"  # NOT a property of the tree: the fleet cannot read
     elif mstate == "RED":
-        verdict = "FIX-MAIN"         # main is RED -- DO: fix main's failing required check
-                                      # (the beat prints failing_required=<check> right beside this)
+        verdict = "FIX-MAIN"         # main is RED. The beat prints failing_required=<check>
+                                      # beside this; the WORK is fixing that check (there is no
+                                      # `DO:` token any more -- the segment is state, #1872).
     elif q is None or mstate == "UNKNOWN":
         verdict = "UNKNOWN"          # never extrapolate from an unreadable surface
     # The verdict is about the QUEUE. `crit_max` is deliberately NOT a term here: CI time is
@@ -1483,9 +1513,10 @@ def main():
     except Exception as e:                      # never break the heartbeat
         line = f"OBJECTIVE VERDICT=UNKNOWN error={str(e)[:60]}"
     # `RES:` GOES ON ITS OWN LINE. `cadence-nudge.sh` reads the objective line with a
-    # `cut -c1-700` (MEASURED 2026-10-16: a fully populated 14-PR line is 628 chars), so
-    # APPENDING this segment would push the tail of the `QUEUE:` segment -- the CI indicators,
-    # and `queue_read=BLIND` before them -- off the end.
+    # `cut -c1-820` (MEASURED 2026-10-16: 675 chars for 14 PRs with the ASK-USER overlay, 799
+    # for 40 PRs with 20 named), so APPENDING this segment would push the tail -- the CI
+    # indicators -- off the end. The fail-closed `queue_read=BLIND` caveat is emitted BEFORE the
+    # queue segment, so truncation can never drop it.
     try:
         res = res_line()
     except Exception as e:

@@ -89,6 +89,13 @@ REPO_DIR = os.path.join(HOME, "Documents", "GitHub", "tortoise")
 # printing a plausible "no open PRs" line. ~/bin/gh is a real Mach-O binary outside the
 # protected tree. The shim is the admin-merge GUARD (#984); this job only READS, so it does
 # not need the guard. Landing still goes through the rail, in a lane.
+#
+# ⛔ ONE RESOLVER, NOT TWO (#1872 review round 2). This was a hardcoded path with no existence
+# check and no fallback, while the `objective.py` this file now IMPORTS resolves the binary env ->
+# ~/bin/gh -> PATH. Nothing in the repo PROVISIONS ~/bin/gh, so on a second cell, a fresh install
+# or after a `~/bin` cleanup the driver would refuse every pass (rc=2, "the open-PR read FAILED")
+# while the classifier it imported could have read GitHub fine. Taking the classifier's answer is
+# what makes the queue read and the check-run read incapable of disagreeing about the binary.
 GH = os.path.join(HOME, "bin", "gh")
 
 # ⛔ THE CLASSIFIER IS NOT OURS TO OWN (#1872). `objective.py` owns the class vocabulary, the
@@ -105,6 +112,10 @@ def _objective():
 
 
 CLASSIFIER = _objective()
+# The ONE resolver: the queue read (below) and the check-run read (the classifier's) must never
+# disagree about which `gh` they are, and the classifier is the half that knows how to degrade to
+# PATH on a box with no `~/bin/gh`. See the comment at the `GH` constant above.
+
 
 # ⛔ THE SEAM IS ASSERTED, NOT ASSUMED (#1872). This file and `objective.py` are farmed into
 # `~/.pi/agent/scripts/` as TWO INDIVIDUAL files (`pi-bootstrap/setup.sh` `fleet_srcs`), and that
@@ -112,13 +123,16 @@ CLASSIFIER = _objective()
 # sit beside an older objective.py. Without this check the import still succeeds, every PR then
 # fails INSIDE the per-PR swallow below, and the pass ends `dispatched 0` with exit 0 -- a dead
 # drain that reports success, which is the worst outcome this file can produce.
-_SEAM = ("classify_one", "touches_surface", "CLASS_ORDER", "REQUIRED", "RAIL_GATES")
+_SEAM = ("classify_one", "touches_surface", "CLASS_ORDER", "REQUIRED", "RAIL_GATES", "GH_BIN")
 _missing = [n for n in _SEAM if not hasattr(CLASSIFIER, n)]
 if _missing:
     raise SystemExit(
         "pr-doctor: %s is missing %s -- it is an older copy than this driver expects. "
         "Refusing to run rather than report an empty dispatch as success."
         % (getattr(CLASSIFIER, "__file__", "objective.py"), ", ".join(_missing)))
+
+# Taken AFTER the seam check, so the diagnostic above is the one a stale sibling produces.
+GH = CLASSIFIER.GH_BIN
 
 # Guards
 COOLDOWN_S = 45 * 60          # do not re-dispatch the same PR inside this window
@@ -296,8 +310,15 @@ def open_prs() -> list[dict]:
         prs = json.loads(out or "[]")
     except Exception:
         prs, parsed = [], False
+    # ⛔ AN EMPTY BODY ON rc=0 IS A FAILED READ, NOT AN EMPTY QUEUE (#1872 review round 2).
+    # `gh pr list --json` never legitimately prints nothing, so `out or "[]"` was manufacturing
+    # the reassuring `[]` for a wrapper/shim that swallowed stdout -- the exact failure the
+    # comment above forbids, one line below it.
+    if not (out or "").strip():
+        parsed = False
     if rc != 0 or not parsed:
-        OPEN_PRS_ERROR = "rc=%s %s" % (rc, (err or "").strip()[:200] or "(no stderr)")
+        OPEN_PRS_ERROR = "rc=%s %s" % (rc, (err or "").strip()[:200]
+                                        or ("empty stdout" if rc == 0 else "(no stderr)"))
         log("GITHUB READ FAILED (%s) | PATH=%s"
             % (OPEN_PRS_ERROR, os.environ.get("PATH", "")[:120]))
     return prs
@@ -601,7 +622,12 @@ def main() -> int:
         try:
             k, why, cr = classify(p)
         except Exception as e:
+            # ⛔ A RAISED CLASSIFICATION IS A BLIND READ, AND IT IS COUNTED AS ONE (#1872 review
+            # round 2). This used to log and `continue`, which left the pass summary empty and
+            # the exit code 0 -- so a bad `OBJECTIVE_GH` (subprocess FileNotFoundError) or a
+            # timeout produced "dispatched 0" with no skipped-unreadable token at all.
             log("#%s classify failed: %s" % (p["number"], e))
+            skipped["unreadable"] = skipped.get("unreadable", 0) + 1
             continue
         # ⛔ A MISS IS NEVER WORK. `None` means the checks could not be READ; rendering that as
         # any action (especially `fix-ci`) manufactures a queue out of a blind read.
@@ -634,6 +660,15 @@ def main() -> int:
         log("%d PR(s) had UNREADABLE checks -- the cause: %s"
             % (skipped["unreadable"],
                (getattr(CLASSIFIER, "GH_LAST_ERROR", "") or "(no gh error recorded)").strip()[:240]))
+    # ⛔ A COMPLETELY BLIND PASS IS NOT A CLEAN ONE (#1872 review round 2). The queue half returns
+    # 2 when it cannot read the PR list; the check-run half kept exiting 0 when NO PR was legible,
+    # so the asymmetry the two-line fix above exists to remove survived one function later -- and
+    # this is precisely the "dead drain that reports success" the import seam calls the worst
+    # outcome this file can produce. `0` is reserved for "readable, nothing to do".
+    if not classified and skipped.get("unreadable") == len(prs):
+        log("REFUSING: not ONE of the %d open PR(s) had readable checks -- nothing dispatched"
+            % len(prs))
+        return 2
 
     # Cheapest-and-highest-payoff FIRST: a landable PR costs one rail call, a repair costs lane-
     # hours. ⛔ THIS IS THIS FILE'S OWN POLICY, NOT `objective.CLASS_ORDER` -- the two differ
