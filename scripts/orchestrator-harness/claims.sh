@@ -84,7 +84,10 @@ esac
 # defaults (orch-loop.sh's LANE_TIMEOUT is orch-loop.sh's own variable and is NOT readable here):
 #
 #   lane (LANE_TIMEOUT)            2400s   (~40 min — spawn-gate.sh's wall clock)
-#   chain-merge.sh waits for the PR 5400s  (90 x 60s)
+#   chain-merge.sh waits for the PR 5400s  (90 x 60s) — it exits AT ONCE when the lane recorded a
+#                                           capacity refusal, releasing this claim within a poll
+#                                           interval (agent-infra#1909), so the ceiling below is a
+#                                           ceiling and no longer the normal cost of a refused lane
 #   merge-one.sh review+merge      ~3000s  (REVIEW_TIMEOUT + the 1200s bound)
 #                                 ------  =======
 #                                 10800s  (3 h)

@@ -56,11 +56,17 @@ issue (open, labelled P0/P1/P2, unassigned)
   │
   ├─ lane.sh (lane-<N>)      pi -p in the worktree: implement → commit → push → open PR. The PR
   │                           body's `Closes #<N>` keyword (or `Refs #<N>` for partial work) is
-  │                           what closes the issue.
+  │                           what closes the issue. A gate refusal starts no agent and writes
+  │                           `state/capacity-refused-<N>` (`<epoch>\t<yield_until>\t<load|disk>`).
   │
   ├─ chain-merge.sh (chain-<N>)
   │                           polls up to 90 min for a PR on the branch, then runs merge-one.sh
-  │                           IN THIS SESSION and exits with merge-one.sh's status.
+  │                           IN THIS SESSION and exits with merge-one.sh's status. ⛔ It exits AT
+  │                           ONCE — with the gate's code (75 load / 77 disk), releasing the
+  │                           cross-box issue claim through its EXIT trap — when `lane.sh` recorded
+  │                           a capacity refusal for THIS dispatch, because no PR can ever appear:
+  │                           waiting would hold `refs/claims/issue-<N>` and make the issue
+  │                           ineligible on every other box (agent-infra#1909, R8).
   │
   ├─ merge-one.sh            (runs under whichever session spawned it: chain-<N>, merge-<PR>, or
   │     1. resolve the head SHA            fix-<PR>)
@@ -107,8 +113,8 @@ adds the **reads**, the **writes / emits** and the failure surface.
 | `orch-loop.sh` | launchd (or `nohup`) | candidates.txt, dispatched.txt, checked.txt, `gh` PR state | heartbeat, `.orch.lock`, `.batch`, `state/{claims-snapshot,last-open-n,sweep-etag,sweep-stamp,sweep-defer-until,parked-*,fixcount-*,rerun-*,argv-*}`, `.refresh.lock`/`.refresh-blocked`, log | a cycle that cannot list PRs must not read as "empty" — a FAILED listing is logged and the sweep is skipped, never treated as CLEAN |
 | `refresh-candidates.sh` | orch-loop (backgrounded) | `gh` issues, `.open_iss`, `.pr_brs` | candidates.txt (+`.pool`), checked.txt, **rewrites dispatched.txt (the reaper)**, the scout worktree | must never PREPEND; the backlog is FIFO so a later P0 joins at the BACK (bounded: refresh runs only while backlog < 6). A permanent provisioning failure exits 3 and writes `$O/.refresh-blocked` |
 | `dispatch-merge.sh` | orch-loop (argv issue ids) | argv issue ids, `git worktree list` | worktree, `lane-*` + `chain-*` tmux sessions | refuses non-numeric issue ids; a failed `worktree add` skips rather than half-dispatching |
-| `lane.sh` | dispatch-merge (tmux) | issue body + comments | the worktree/branch/PR, `logs/prompt-<N>.txt`, walltime row (via `run_agent`) | the implementer; runs with local review gates bypassed because the PARENT owns the gate. Hard-requires `spawn-gate.sh` (exit 78 without it) |
-| `chain-merge.sh` | dispatch-merge (tmux) | the lane's PR | merge-one run; exits with merge-one's status | waits (≤90 min) for the PR to exist before running the chain |
+| `lane.sh` | dispatch-merge (tmux) | issue body + comments | the worktree/branch/PR, `logs/prompt-<N>.txt`, `state/capacity-refused-<N>` (only on a gate refusal), walltime row (via `run_agent`) | the implementer; runs with local review gates bypassed because the PARENT owns the gate. Hard-requires `spawn-gate.sh` (exit 78 without it) |
+| `chain-merge.sh` | dispatch-merge (tmux) | the lane's PR, `state/capacity-refused-<N>` (epoch-bounded to ITS dispatch) | merge-one run; exits with merge-one's status, or with the gate's code (75/77) on a capacity refusal — releasing the issue claim either way | waits (≤90 min) for the PR to exist before running the chain. A refusal record newer than this chain's start ends the wait immediately instead (agent-infra#1909) |
 | `merge-one.sh` | chain-merge, orch-loop, fix-one | PR diff + head, `repo-authority.sh`, `claims.sh` | review comment, PR body marker, claim ref, `state/{mergeclaim-*,needsfix-*,parked-*,merged-*.done,railcount-*}`, walltime row | refuses to run at all if `repo-authority.sh` is missing or stale (fail-closed); the reviewer emits `CLEAN <url>` / `ISSUES <n>`, and **any non-CLEAN outcome (including a failed/timed-out reviewer) writes `needsfix-<PR>-<head>`** |
 | `fix-one.sh` | orch-loop (tmux) | the reviewer's comment, `state/needsfix-*`, the failing check's log | a new commit on the branch, `state/fixbail-<PR>-<head>` (cross-box refusal), a **decrement** of `state/fixcount-<PR>` on load refusal, a fixer walltime row | the controller books the `MAX_FIX_TRIES` attempt at spawn; fix-one refunds it when no agent ran and re-runs merge-one on success |
 | `repo-authority.sh` | **sourced** by orch-loop, merge-one | this repo's required status checks | the merge contract: `REQ`, `REQ_SOURCE`, `merge_authority` (gate/rail/unknown) | **fail-closed** — an unreadable, un-normalisable, or unrepresentable check set refuses rather than guessing |
@@ -117,7 +123,7 @@ adds the **reads**, the **writes / emits** and the failure surface.
 | `install.sh` | a human | env, `launchd.plist.template` | the plist | prints the load command; does **not** start the loop. Warns on drift between the repo copy and `$O` for the scripts the daemon runs |
 | `selftest.sh` | a human / CI | the shipped scripts | pass/fail | offline; drives the shipped code rather than grepping it |
 | `check-port-drift.sh` | a human | `port-provenance.txt`, tortoise ref | pass/fail | gates the tortoise-side removal. **Compares against a PIN, so a stale pin reports work that has moved (see §6.4)** |
-| `test-claims.sh` / `test-crossbox.sh` / `test-gates.sh` / `spawn-gate.test.sh` / `refresh-scout.test.sh` / `sweep-quota.test.sh` | a human / CI | — | pass/fail | each pins one regression contract. `test-claims.sh` cannot prove cross-box atomicity on one machine |
+| `test-claims.sh` / `test-crossbox.sh` / `test-gates.sh` / `spawn-gate.test.sh` / `refresh-scout.test.sh` / `sweep-quota.test.sh` / `capacity-transfer.test.sh` | a human / CI | — | pass/fail | each pins one regression contract. `test-claims.sh` cannot prove cross-box atomicity on one machine. `capacity-transfer.test.sh` drives the shipped `lane.sh`/`chain-merge.sh` and releases a REAL claim against a LOCAL bare repo |
 
 **Manual utility:** `adopt-fix.sh` — materialises a worktree for a foreign branch and runs
 `fix-one.sh` against a specific PR by hand; exits with the fixer's status.
@@ -153,6 +159,7 @@ applying and the PR becomes eligible again.
 | `dispatched.txt` (`$O/`) | `orch-loop.sh` (append) | **reaped by `refresh-candidates.sh`** — an entry is removed when the issue is still open, no PR branch matches it, and no `lane-<N>` is live (agent-infra#1705 / tortoise#8519) | issues already dispatched |
 | `checked.txt` (`$O/`) | `refresh-candidates.sh` (on the terminal CLEAN verdict only) | dropped for a reaped issue, so pre-flight re-queues it | issues already pre-flighted |
 | `state/claims-snapshot` | `orch-loop.sh` (one `claim_snapshot` per cycle) | rewritten each cycle | all live claims, so `claim_live()` pays no per-PR network call |
+| `state/capacity-refused-<N>` | `lane.sh` (gate refusal only; cleared when a lane actually runs) | **read** by `chain-merge.sh` (field 1 vs its own start) and `orch-loop.sh`'s `capacity_yield_live()` (field 2 vs now) | one line, `<refused_epoch>\t<yield_until>\t<load|disk>`. The transfer decision: the chain stops waiting and releases the claim, and the controller leaves the issue UNCONSUMED for a peer until the yield expires (agent-infra#1909, R8) |
 | `state/walltime.tsv` | `spawn-gate.sh`'s `run_agent` (lane, fix-one) **and** `merge-one.sh`'s own `run_agent` | never — **append-only** | one row per agent invocation: epoch, kind, tag, cap, elapsed, rc. The per-PR logs are truncated on rerun, so this is the only durable series |
 | `state/last-open-n` | `orch-loop.sh` | rewritten on each SUCCESSFUL open-PR count | the last good count; reused when a later count fails, so a failure never reads as 0 |
 | `heartbeat` (`$O/`) | `orch-loop.sh` | overwritten each cycle | liveness: age > a few cycles means the controller is stuck or dead |
@@ -242,6 +249,7 @@ are indistinguishable in the log. `mp_reason`'s own comment records the measured
 | queue not moving | `$O/logs/orch-loop.log` tail, then `$O/heartbeat` | controller dead or stuck; heartbeat age says which. Check `launchctl list \| grep orchestrator` — it may never have been launched by launchd at all |
 | nothing dispatching | the `[dispatch] skipped (…)` line | a named gate: see §5. If it says `merge-priority`, more than `MERGE_PRIORITY_AT` PRs are open with at least one worker in flight |
 | a worker produces nothing | `$O/state/walltime.tsv` (`rc`, `elapsed` vs `cap`) | hit the cap. Then find WHAT it was doing — the per-run log is truncated on rerun, so use `~/.pi/agent/audit/audit.jsonl`, which records every `tool_call` |
+| an issue is open, free and NOT dispatching, while a box sits idle | `[dispatch] #N yielded to peers` in `$O/logs/orch-loop.log`, then `state/capacity-refused-<N>` | this box refused it at a gate and is standing down for the yield window, so a PEER is expected to claim it (`claim_issue_preflight` reads CLEAN once `refs/claims/issue-<N>` is released). If no box takes it, the yield has expired and the item is an ordinary candidate again — check the peer's `[dispatch]` line |
 | PR red forever with no worker | `state/parked-<PR>` + `state/fixcount-<PR>` | parked at the attempt cap. The park stores a head, so a push re-arms it |
 | issue never picked up | `grep <n> dispatched.txt` and `grep <n> checked.txt` | either still blacklisted (the reaper clears `dispatched.txt` once the issue has no PR and no live lane) or it never passed pre-flight (`$O/.refresh-blocked`, or a COLLISION) |
 | two boxes on the same PR | `git ls-remote origin 'refs/claims/*'` | the claim should prevent it; if a claim is present with a dead owner it expires by lease |

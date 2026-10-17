@@ -528,6 +528,44 @@ fix_slots() { # <unowned_prs>
   if [ "${1:-0}" -gt "$MERGE_PRIORITY_AT" ]; then echo $(( 10#${MAX_FIX:-3} + 2 )); else echo "${MAX_FIX:-3}"; fi
 }
 
+# ── CAPACITY TRANSFER (agent-infra#1909, R8) ────────────────────────────────
+# `lane.sh` writes `state/capacity-refused-<N>` when the spawn gate refuses an issue for capacity.
+# Format: `<refused_epoch>\t<yield_until>\t<gate>` — the writer in lane.sh is the ONE definition.
+#
+# WHY THIS BOX MUST STAND DOWN, NOT JUST RELEASE. `chain-merge.sh` releasing the cross-box claim is
+# what makes the issue ELIGIBLE on a peer; it is not what makes the peer WIN it. The claim is an
+# atomic CAS, and this box is the one that just took it — so on the very next cycle a saturated
+# box can re-win the CAS against a healthy peer and be refused again, indefinitely, and the peer
+# never gets the issue. The yield is the missing half: while it is live, this box skips the issue
+# and leaves it UNCONSUMED (no `dispatched.txt` row, no claim), so it stays a candidate here AND a
+# free issue for every peer. When the yield expires — or the box quietens and this box is again the
+# fastest to claim it — the ordinary path resumes.
+#
+# ⛔ FAIL-OPEN, AND IT MUST BE. A missing, empty, garbled, or wrong-shaped record is NOT a yield:
+# treating an unreadable file as one would suppress dispatch — the fleet-side idleness R8 exists to
+# remove, reintroduced by a corrupt byte. Absent evidence means "dispatch normally".
+# Sets CAPACITY_YIELD_WHY for the caller's log line (empty when it returns 1).
+CAPACITY_YIELD_WHY=""
+capacity_yield_live() { # <issue> -> 0 = this box yielded it (skip, do not consume), 1 = dispatch
+  local n="${1:-}" f ep until gate now
+  CAPACITY_YIELD_WHY=""
+  case "$n" in ''|*[!0-9]*) return 1 ;; esac
+  f="$O/state/capacity-refused-$n"
+  [ -r "$f" ] || return 1
+  read -r ep until gate < "$f" 2>/dev/null || return 1
+  case "${ep:-}" in ''|*[!0-9]*) return 1 ;; esac
+  case "${until:-}" in ''|*[!0-9]*) return 1 ;; esac
+  [ "${#until}" -le 18 ] || return 1
+  now="$(date +%s)"
+  [ "$now" -lt "$until" ] || return 1
+  # ⛔ THE EPOCH IS BOUNDED TOO, for the same reason the await side bounds it: a record whose
+  # `until` is far in the future but whose `refused_epoch` is nonsense is not evidence of a live
+  # yield, and `until - ep` is the window the writer used. Accept only a coherent pair.
+  [ "$until" -gt "$ep" ] || return 1
+  CAPACITY_YIELD_WHY="gate=${gate:-?} until=$until ($(( until - now ))s left)"
+  return 0
+}
+
 # ── rate-limit-aware conditional listing (agent-infra#1762) ─────────────────────
 # The sweep re-listed every open PR every cycle and then read each one twice more, all over
 # GraphQL. That budget is 5,000 POINTS/hr per USER and is shared by every cell, lane and box acting
@@ -1395,6 +1433,15 @@ PY
     while read -r ISS; do
       [ -z "${ISS:-}" ] && continue
       grep -qx "$ISS" "$O/dispatched.txt" 2>/dev/null && continue
+      # ── CAPACITY TRANSFER (agent-infra#1909): a refused item is a PEER's to take ─────────────
+      # `continue` WITHOUT touching `dispatched.txt` or claiming the ref: the issue stays in
+      # `candidates.txt` (so this box may take it once the yield expires) and stays unowned in the
+      # shared registry (so every peer may claim it NOW). Consuming the item's turn here would be
+      # the `parked-*` failure R8 names, on a per-machine capacity signal.
+      if capacity_yield_live "$ISS"; then
+        echo "[dispatch] #$ISS yielded to peers — this box refused it for capacity and is standing down until the yield expires (${CAPACITY_YIELD_WHY})" >> "$LOG"
+        continue
+      fi
       # ── CLAIM THE ISSUE ACROSS BOXES BEFORE IT ENTERS THE BATCH (agent-infra#1850) ──────────
       # `refresh-candidates.sh` certifies an issue CLEAN by reading the registry, but a
       # certification is NOT a lock: it runs BEFORE the claim, so two boxes can both read CLEAN and
