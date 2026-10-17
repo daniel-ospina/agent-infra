@@ -376,7 +376,7 @@ check_harness_pin() {
     local recorded=""
     [ -f "$HARNESS_PIN_FILE" ] && recorded="$(head -1 "$HARNESS_PIN_FILE" 2>/dev/null)"
     if [ -z "$recorded" ]; then
-      ok "no harness pin recorded yet ($HARNESS_PIN_FILE) — 'start' applies one from $HARNESS_REPO_DESC"
+      ok "no harness pin recorded yet ($HARNESS_PIN_FILE) — 'start' applies one from ${HARNESS_REPO:-this checkout}"
       return 0
     fi
     if [ ! -d "$recorded" ] || [ ! -f "$recorded/orch-loop.sh" ]; then

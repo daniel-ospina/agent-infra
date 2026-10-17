@@ -389,6 +389,26 @@ F="$(registry_dir "$K/home")/daniel-ospina-agent-infra"
 grep -qx 'state=running' "$F" 2>/dev/null && ok "start (cell): the record is marked running" \
                                          || bad "start (cell): the record was left in the 'starting' state"
 
+# A FRESH cell (no pin recorded yet) must be reported as such, NOT refused: `start` is what applies
+# the pin. This arm exists because the other cell cases all carry a pin, so the "nothing recorded"
+# branch was unreached — and it carried an unbound variable that only a fresh cell could hit.
+FRESH="$T/fresh"; mk_bin "$FRESH/bin" cell; mk_clone "$FRESH/repo" "daniel-ospina/agent-infra"
+mkdir -p "$FRESH/home" "$FRESH/O" "$FRESH/scripts" "$FRESH/scripts/orchestrator-harness"
+printf 'DEEPSEEK_API_KEY=sk-test\n' > "$FRESH/home/keys.env"
+cp "$BRINGUP" "$FRESH/scripts/orchestrator-bringup.sh"; cp -r "$HERE/lib" "$FRESH/scripts/lib"
+cp "$K/bin/cloud-cell-supervisor-stub.sh" "$FRESH/scripts/cloud-cell-supervisor.sh"
+OUT="$(env -i HOME="$FRESH/home" XDG_STATE_HOME="$FRESH/home/.local/state" \
+  PATH="$FRESH/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" CELL_HOME="$FRESH/home" \
+  REPO="$FRESH/repo" O="$FRESH/O" HARNESS_PIN_DIR="$FRESH/home/harness" \
+  HARNESS_PIN_FILE="$FRESH/home/.harness-path" HARNESS_REPO="$FRESH/repo" \
+  bash "$FRESH/scripts/orchestrator-bringup.sh" check 2>&1)"; RC=$?
+[ "$RC" = 0 ] && ok "check (cell): a fresh cell with NO harness pin is reported, not refused ('start' applies one)" \
+             || bad "check (cell): a fresh cell was refused — rc=$RC $OUT"
+case "$OUT" in
+  *"no harness pin recorded yet"*) ok "check (cell): says the pin is not recorded yet" ;;
+  *) bad "check (cell): does not name the missing pin — $OUT" ;;
+esac
+
 # Now a SECOND start for the same repo must be refused on the record's own evidence.
 OUT="$(env -i HOME="$K/home" XDG_STATE_HOME="$K/home/.local/state" \
   PATH="$K/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" CELL_HOME="$K/home" \
