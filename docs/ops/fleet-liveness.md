@@ -629,10 +629,11 @@ progress — counted as **active** by `orchestrator-heartbeat.sh`, which deliber
 it (it prescribes nothing) nor, before this change, counted it at all.
 
 The suites that pin it: `python3 -m pytest scripts/test_lane_status.py scripts/test_lane_actions.py`.
-Measured non-vacuity, on both baselines: **10 of the 13 added pytest legs fail on `origin/main`**
-(pre-feature), and **3 fail on this change's own reviewed head `7e13f91d2`** — the veto's reach over
-`CHILD-STUCK`, a fresh writer that NAMES a co-located lane, and the table's verdict width (two of them
-are in both sets). Two legs pass on every baseline by design: the control
+Measured non-vacuity, on both baselines: **13 of the 16 added pytest legs fail on `origin/main`**
+(pre-feature), and **5 fail on this change's own reviewed head `7e13f91d2`** — the veto's reach over
+`CHILD-STUCK`, a fresh writer that NAMES a co-located lane, a writer that names nobody, the v3
+session-envelope parse, and the table's verdict width (four of the five are also in the first set).
+Two legs pass on every baseline by design: the control
 `test_a_stale_binding_with_no_live_writer_stays_verified`, and
 `test_the_cpu_veto_is_consulted_at_the_decision_not_only_in_a_comment`, which replaces a
-source-substring assertion with a behavioural one over behaviour this round did not change.
+source-substring assertion with a behavioural one over behaviour no round changed.

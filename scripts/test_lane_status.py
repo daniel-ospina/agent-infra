@@ -1125,3 +1125,70 @@ def test_the_human_table_fits_the_longest_verdict(L):
     assert len(longest) <= L.VERDICT_COL, (
         "verdict %r is %d chars but the table formats the VERDICT column at %d -- every column to "
         "its right shifts" % (longest, len(longest), L.VERDICT_COL))
+
+
+# ── the veto has no hole inside the child block (#1867 re-review) ────────────────────────────
+# The abandoned-child branch sits INSIDE the child block but emits the DISPATCHABLE family, so a
+# veto placed only below the child block left `DONE-IDLE` reachable with proven CPU progress -- and
+# `queue-dispatch.py` reads this verdict directly, so `lane-actions`' own veto is not a backstop.
+
+def test_an_abandoned_child_cannot_mint_an_idle_verdict_under_unattributed_progress(L):
+    """⛔ AN IDLE RETURN IS AN IDLE RETURN, WHEREVER IT SITS. Same inputs, only `cpu_any` differs:
+    the control is the completed-turn-with-abandoned-record verdict, the test is the same lane with
+    proven progress in its own directory -- which must not be dispatchable."""
+    kw = dict(stale=48000, grew=False, spinner=False, last_kind="assistant",
+              child={"age": 99999, "abandoned": True}, child_stale=500, child_grew=None,
+              child_activity_age=None, tool_inflight=None, last_stop="stop", has_sid=True)
+    assert L.classify(**kw) == L.DONE_IDLE, "control: an abandoned record + a completed turn"
+    assert L.classify(cpu_any=True, **kw) == L.UNATTRIBUTED_WORKING, \
+        "proven CPU progress must not leave a dispatchable DONE-IDLE reachable"
+
+
+def test_a_writer_that_names_nobody_is_still_an_unexplained_writer(L, monkeypatch, tmp_path):
+    """⛔ THE EXCLUSION MUST NOT READ A NAME THAT IS NOT THERE (#1867 re-review). `names_label` was a
+    bare-substring match, so `"none of it"` matched the label `Other One` (via `one`) and
+    `"recompile the tests"` matched `2c Pack compile` (via `compile`) -- and in this direction that
+    is a FAIL-OPEN: the stale binding stays verified and the lane can be published `DONE-IDLE`.
+    The registry is POPULATED here on purpose: with `registry() == []` the exclusion is never even
+    consulted, which is how the first leg missed this."""
+    import json as _json
+    import time as _time
+    assert L.names_label("none of it", "Other One") is False
+    assert L.names_label("recompile the tests", "2c Pack compile") is False
+    assert L.names_label("Other One: land the queue cleanup", "Other One") is True
+    old = tmp_path / "88888888-8888-8888-8888-888888888888.jsonl"
+    old.write_text("{}\n")
+    os.utime(str(old), (_time.time() - 4000, _time.time() - 4000))
+    sib = tmp_path / "99999999-9999-9999-9999-999999999999.jsonl"
+    sib.write_text(_json.dumps({"type": "message",
+                                "message": {"role": "user",
+                                            "content": [{"type": "text",
+                                                         "text": "none of it"}]}}) + "\n")
+    monkeypatch.setattr(L, "sh", lambda *a, **k:
+                        "cd -- '/x' ; exec pi --session' '88888888-8888-8888-8888-888888888888'")
+    monkeypatch.setattr(L, "_recorded_session", lambda ws: None)
+    monkeypatch.setattr(L, "session_file", lambda sid: str(old))
+    monkeypatch.setattr(L, "_content_session", lambda label, cf: None)
+    monkeypatch.setattr(L, "registry", lambda: [("This Lane", "WS", ""), ("Other One", "WS2", "")])
+    sid, verified = L.resolve_session_ex("WS")
+    assert sid == "88888888-8888-8888-8888-888888888888"
+    assert verified is False, (
+        "a writer whose message names NO lane must not be excluded just because one token happens "
+        "to appear inside another word")
+
+
+def test_first_user_message_reads_the_v3_session_envelope(L, tmp_path):
+    """⛔ THE IDENTITY SIGNAL WAS DEAD ON REAL DATA (2026-10-17, measured 0 of 45 files). pi writes
+    `{"type":"message","message":{"role":"user","content":[…]}}` (session-format v3); the parser
+    accepted only a TOP-LEVEL `type`/`role` of `user`, so `_first_user_message` returned "" for every
+    real writer -- and a label matcher fed "" answers False, silently, which left BOTH
+    `_content_session`'s recovery and the sibling exclusion inert. The legacy shapes stay supported
+    (control)."""
+    v3 = tmp_path / "aaaa.jsonl"
+    v3.write_text('{"type":"session","version":3}\n' +
+                  '{"type":"message","message":{"role":"user","content":'
+                  '[{"type":"text","text":"Other One: land the queue"}]}}\n')
+    assert "Other One" in L._first_user_message(str(v3))
+    legacy = tmp_path / "bbbb.jsonl"
+    legacy.write_text('{"type":"user","content":"Other One: legacy shape"}\n')
+    assert "Other One" in L._first_user_message(str(legacy))

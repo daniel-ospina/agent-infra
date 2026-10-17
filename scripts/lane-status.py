@@ -883,16 +883,19 @@ def resolve_session_ex(ws):
         # exception is the block directly above: an UNEXPLAINED fresh writer in the same directory
         # (`_live_sibling_session`) means the bound id is not corroborated, so the read abstains.
         # Everything this rule protects still holds: a lane waiting on a long child writes nothing
-        # while the child runs, and the child's transcript lives in `TASK_SD` (not here) or, when it
-        # shares this dir, a co-located LANE's writer is NAMED and excluded. The exception's
-        # failure direction is report-only -- never a dispatch, never a relaunch. Stating it here
-        # because a silent narrowing of a ⛔ rule is how the rule later reads as an accident.
+        # while the child runs, and a writer that NAMES another lane is excluded (`names_label`) --
+        # deliberately NOT assuming where a child's own transcript lives (`find_child_session` reads
+        # BOTH `TASK_SD` and, as a fallback, this same cwd-keyed tree, so "the child is never here"
+        # would be false). The exception's failure direction is report-only -- never a dispatch,
+        # never a relaunch. Stating it here because a silent narrowing of a ⛔ rule is how the rule
+        # later reads as an accident.
         # The PANE is authoritative about which
         # session it is running, and a lane waiting on a long child writes NOTHING for as long as
         # the child runs -- that is the shape this whole file exists to classify correctly. So
         # "the file has not been written for an hour" must NOT be read as "this is not the live
         # session"; only the ABSENCE of any id (cmux unread, and nothing corroborates the
-        # recorded one) leaves the id unverified.
+        # recorded one), or an UNEXPLAINED fresh writer in this same directory (#1867), leaves the id
+        # unverified.
         return chosen, True
     # No id came from the pane: the recorded id is a recovery hint, and it is only VERIFIED if
     # something corroborates it -- a write recent enough to be the live session. This is the path
@@ -953,7 +956,16 @@ def _first_user_message(path):
                     continue
                 if not isinstance(o, dict):
                     continue
-                if o.get("type") != "user" and o.get("role") != "user":
+                # ⛔ THE v3 ENVELOPE TOO, NOT ONLY THE LEGACY SHAPES (2026-10-17). MEASURED: 0 of 45
+                # real session files under ~/.pi/agent/sessions yielded a message -- pi writes
+                # `{"type":"message","message":{"role":"user","content":[...]}}` (session-format
+                # v3) and this only accepted a TOP-LEVEL `type`/`role` of `user`, so the identity
+                # signal this fleet calls "the technique match-lanes.py uses" answered "" for every
+                # real writer. Both consumers depend on it -- `_content_session`'s recovery and
+                # `_live_sibling_session`'s exclusion -- and a matcher fed "" answers False, silently.
+                msg = o.get("message") if isinstance(o.get("message"), dict) else {}
+                if o.get("type") != "user" and o.get("role") != "user" \
+                        and msg.get("role") != "user":
                     continue
                 c = o.get("content")
                 if c is None and isinstance(o.get("message"), dict):
@@ -983,7 +995,15 @@ def names_label(text, label):
         return False
     need = max(1, (len(toks) + 1) // 2)
     low = str(text).lower()
-    return sum(1 for t in toks if t in low) >= need
+    # ⛔ WORD BOUNDARIES, NOT BARE SUBSTRINGS (2026-10-17). A bare `t in low` matched "one" inside
+    # "none" and "compile" inside "recompile", so a writer that names NOBODY read as a KNOWN lane --
+    # and in `_live_sibling_session` that direction is a FAIL-OPEN: the stale binding stays verified
+    # and the lane can be published `DONE-IDLE`, i.e. dispatched. MEASURED: names_label("none of it",
+    # "Other One") and names_label("recompile the tests", "2c Pack compile") were both True.
+    # `\b<token>\b` keeps the fleet's real message shapes ("Other One: ...", "Test substrate: ...")
+    # and drops the accidental ones; `_content_session` wants the same strictness (a wrong pick there
+    # is a wrong session id, which is a dispatch).
+    return sum(1 for t in toks if re.search(r"\b" + re.escape(t) + r"\b", low)) >= need
 
 
 def _content_session(label, stale_file):
@@ -1585,7 +1605,10 @@ def classify(stale, grew, spinner, last_kind, child, child_stale, child_grew,
         # ⛔ AND A LANE HOLDING NO EVENTS YET IS NOT AUTOMATICALLY A FRESH ONE (#1867). With proven
         # progress in its own directory it is working (or its child is), so the dispatchable verdict
         # below must not be minted for it. `UNATTRIBUTED-WORKING` is neither dispatched nor unblocked.
-        if cpu_any:
+        # TAKE `has_sid` WITH IT: `cpu_any` describes a PROCESS, so it can only settle a lane whose
+        # identity resolved -- `UNBOUND` is an identity abstention (and it is in the heartbeat's
+        # NURT set), so the veto must not swallow it.
+        if cpu_any and has_sid:
             return UNATTRIBUTED_WORKING
         return _idle_verdict(spinner) if has_sid else UNBOUND
     if grew:
@@ -1665,7 +1688,14 @@ def classify(stale, grew, spinner, last_kind, child, child_stale, child_grew,
         # this, keeping abandoned records would resurrect the "a call from days ago makes a
         # healthy lane read CHILD-STUCK forever" failure the old discard was written to stop.
         if child.get("abandoned") and last_kind == "assistant" and last_stop == "stop":
-            return _idle_verdict(spinner)
+            # ⛔ AN IDLE RETURN IS AN IDLE RETURN, WHEREVER IT SITS (#1867 re-review). This branch is
+            # INSIDE the child block, but it emits the DISPATCHABLE family -- so the `cpu_any` veto
+            # has to be asked here too, or the veto has a hole at exactly the shape the label exists
+            # for (a task child alive for hours with a fresh transcript, plus a second pi in the same
+            # directory). MEASURED 2026-10-17: with the veto only below the child block, this input
+            # returned `DONE-IDLE` with `cpu_any=True` -- and `queue-dispatch.py` reads this verdict
+            # directly, so `lane-actions`' own veto cannot be relied on to catch it.
+            return UNATTRIBUTED_WORKING if cpu_any else _idle_verdict(spinner)
         if child_grew:
             return WAITING                      # parent idle, child healthy — correct
         if child_stale is not None:
