@@ -90,7 +90,66 @@
 set -uo pipefail
 
 CELL_HOME="${CELL_HOME:-/tmp/cell-home}"
-REPO="${REPO:-/tmp/cell}"
+# ── $REPO: REQUIRED, OR DERIVED — NEVER A PATH THIS SCRIPT INVENTS (#1974) ─────────────────────
+# WHY. This defaulted to `/tmp/cell`, which does not exist on ANY box — not on the cells it runs on,
+# not on a laptop. The first verb that reads the checkout then failed with `no git repo at /tmp/cell`,
+# a message that names the script's own placeholder as if it were the operator's mistake and never
+# says what TO set. It is the twin of refresh-candidates.sh's `/Users/danielospina/…` default: both
+# are a target repo INVENTED by a script whose whole job is to be pointed at one, and the failure
+# both produce is the same — no pre-flight, no backlog, a controller that reports RUNNING with
+# `lanes: 0` forever.
+# ⛔ SO: the environment first (`keys.env` is sourced below and is where a cell declares it), then a
+# DERIVATION that has to prove itself — `$TORTOISE_REPO`/`$TORTOISE` (this harness's established
+# names for a tortoise checkout), then the current directory. Each candidate must BE a git checkout,
+# and when an `OR` is declared it must be the SAME repo `OR` names: the queue-vs-checkout guard
+# (#1901) exists because a cell standing in one repo while dispatching another judges nothing, and a
+# derivation is the same fact, so it is held to the same rule. A DECLARED `$REPO` is never silently
+# replaced: if it does not exist or is not a checkout, that is the refusal, naming the path.
+# Failing all of that: ONE actionable line (see assert_repo), never a guess. `stop`/`status` do not
+# require it — they are the verbs an operator runs to DISCOVER a misconfiguration.
+REPO="${REPO:-}"
+REPO_SRC=""     # how $REPO was resolved, for the log line and for the refusal
+REPO_WHY=""     # non-empty exactly when it could not be resolved
+repo_slug() {   # <checkout> -> 'owner/name' from its origin remote, or empty
+  local url
+  url="$(git -C "$1" remote get-url origin 2>/dev/null)" || return 1
+  [ -n "$url" ] || return 1
+  url="${url%.git}"
+  case "$url" in *://*) url="${url#*://}" ;; esac
+  url="${url#*@}"
+  url="${url/:/\/}"
+  printf '%s\n' "$url" | awk -F/ 'NF>=3 { print $(NF-1) "/" $NF }'
+}
+resolve_repo() {   # sets REPO/REPO_SRC, or REPO_WHY and returns 1. NEVER dies (see `status`)
+  local cand slug want="${OR:-}"
+  REPO_WHY=""
+  if [ -n "$REPO" ]; then
+    REPO_SRC="\$REPO (environment)"
+    if [ ! -d "$REPO" ]; then
+      REPO_WHY="REPO=$REPO does not exist on this box"; return 1
+    fi
+    if [ ! -e "$REPO/.git" ]; then
+      REPO_WHY="REPO=$REPO is not a git checkout (no .git directory or linked-worktree .git file)"; return 1
+    fi
+    return 0
+  fi
+  for cand in "${TORTOISE_REPO:-}" "${TORTOISE:-}" "$PWD"; do
+    [ -n "$cand" ] && [ -d "$cand" ] && [ -e "$cand/.git" ] || continue
+    # ⛔ THE SLUG TEST ONLY WHEN `OR` IS DECLARED, because here `OR` is normally DERIVED from the
+    # checkout (that is the #1901 rule) — demanding agreement with a value this very script will
+    # derive from the answer would be circular. A declared `OR` is an operator's assertion and the
+    # derivation must not contradict it; `assert_queue_target` still re-checks the pair afterwards.
+    if [ -n "$want" ]; then
+      slug="$(repo_slug "$cand")"
+      [ "$slug" = "$want" ] || continue
+    fi
+    REPO="$(cd "$cand" && pwd -P)"
+    REPO_SRC="derived from $cand"
+    return 0
+  done
+  REPO_WHY="no target checkout could be DERIVED either: nothing sets REPO, and none of TORTOISE_REPO='${TORTOISE_REPO:-}', TORTOISE='${TORTOISE:-}' or the current directory is a git checkout${want:+ whose origin is $want}"
+  return 1
+}
 ENV_FILE="${ENV_FILE:-$CELL_HOME/keys.env}"
 O="${O:-$CELL_HOME/orchestrator}"
 # The harness is a SIBLING of this script inside agent-infra (scripts/orchestrator-harness/),
@@ -261,6 +320,13 @@ source_env_file
 export HOME="$CELL_HOME"
 LOCK="$O/.orch.lock"
 
+# ── $REPO is resolved HERE: after $ENV_FILE (the file a cell declares it in) and BEFORE the QUEUE is
+# read out of its `origin` remote — the queue target is DERIVED from the checkout (#1901), so the
+# checkout has to be answered first. NEVER dies: `status` and `stop` are the verbs an operator runs to
+# discover that it cannot be resolved, exactly like resolve_queue_target below. The verbs that cannot
+# do their job without a checkout call assert_repo().
+resolve_repo || true
+
 # ── the QUEUE's repo and the CHECKOUT are ONE fact (agent-infra#1901) ────────────────────────────
 # MEASURED 2026-10-15 on `pi-cell-2`: harness pin `a4a1249794e7` standing in an AGENT-INFRA checkout
 # (`git -C $REPO remote get-url origin` → https://github.com/daniel-ospina/agent-infra.git) while the
@@ -377,6 +443,13 @@ OR="$QUEUE_REPO"
 # a warning. A wrong pair must not be a cell that starts and looks healthy; it must be a cell that
 # does not start, with an error naming BOTH values, the remote that was read, and the repo this
 # machine needs so provisioning is unambiguous.
+# $REPO must be a real checkout for every verb that reads it. ONE line, both remedies, because the
+# operator's next action is all this message is for — there is no fourth thing to check.
+assert_repo() {
+  [ -z "$REPO_WHY" ] && return 0
+  die "cannot resolve the target checkout: $REPO_WHY. Fix: put REPO=<path to the checkout of the repository this cell works> in $ENV_FILE, then re-run (\`status\` needs no checkout)."
+}
+
 assert_queue_target() {
   case "$QUEUE_STATE" in
     derived|explicit) return 0 ;;
@@ -911,11 +984,15 @@ cmd_check() {
   # and install.sh warns rather than dying for it — so the two surfaces agree.
   command -v uv >/dev/null 2>&1 || say "warn: uv missing — lane.sh cannot sync a worktree venv, so in-lane tests will fail (non-fatal, as in install.sh)"
   gh auth status >/dev/null 2>&1 || die "gh not authenticated — run cloud-cell-bringup.sh --check"
-  [ -d "$REPO/.git" ] || [ -f "$REPO/.git" ] || die "no git repo at $REPO"
-  # ⛔ A LINKED WORKTREE HAS A `.git` FILE, NOT A DIRECTORY (agent-infra#1745). The old `-d` test
-  # refused a worktree with "FATAL: no git repo at <path>" even though every git command in it works
-  # — a false block that forced operators to keep a full clone around for `REPO` while running the
-  # harness from a worktree. `rev-parse --git-dir` is the real question; ask it instead.
+  # ⛔ THE CHECKOUT PRECONDITION IS JUDGED ONCE, by resolve_repo() at LOAD (§$REPO above): a declared
+  # path that does not exist, or a box where nothing can be derived, refuses with ONE line naming the
+  # value the operator has to set. The old arm here said "no git repo at /tmp/cell" — naming this
+  # script's own invented placeholder as though it were the operator's mistake (#1974).
+  assert_repo
+  # ⛔ A LINKED WORKTREE HAS A `.git` FILE, NOT A DIRECTORY (agent-infra#1745). A `-d` test would
+  # refuse a worktree even though every git command in it works — a false block that forced operators
+  # to keep a full clone around for `REPO` while running the harness from a worktree. `rev-parse
+  # --git-dir` is the real question; ask it here, because "has a .git entry" is not "git can use it".
   git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1 \
     || die "$REPO is not a git checkout (no .git directory or linked-worktree .git file)"
   # ── the QUEUE's repo is the CHECKOUT's remote (agent-infra#1901) ────────────────────────────
@@ -1080,6 +1157,10 @@ cmd_start() {
   # Refuse a bad SCOPE before anything starts or is written (validate_scope is also the first thing
   # cmd_check does below — this call is what keeps the refusal ahead of the $O seed).
   validate_scope
+  # ... and the same for the checkout, for the same reason: `start` writes workers into $O, pins the
+  # harness and creates the session, so an unresolvable $REPO must refuse BEFORE any of that rather
+  # than surface later as a controller standing nowhere (#1974).
+  assert_repo
   # Every value below is interpolated into the session command string, so every one must be
   # metacharacter-free — refuse loudly here rather than let tmux's sh -c parse it. Empty values
   # are skipped (cmd_check reports an unresolvable HARNESS with its own message).

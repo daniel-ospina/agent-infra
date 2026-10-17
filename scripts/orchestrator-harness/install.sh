@@ -14,8 +14,51 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 O="${O:-$HOME/orchestrator}"
-REPO="${REPO:-/Users/danielospina/Documents/GitHub/tortoise}"
 OR="${OR:-daniel-ospina/tortoise}"
+# ⛔ $REPO: REQUIRED, OR DERIVED -- NEVER A PATH THIS SCRIPT INVENTS (agent-infra#1974). It used to
+# default to `/Users/danielospina/Documents/GitHub/tortoise`, and the plist this script renders carries
+# whatever it resolved -- so the wrong value is not merely a bad default for this run, it is BAKED
+# INTO the installed job and inherited by every REPO-less start of it. Same rule as the loop and the
+# supervisor: the environment first, then a derivation that must prove its origin remote names $OR
+# (the repo whose issues the loop dispatches), never a personal path and never one that does not
+# exist. One actionable line when it cannot be resolved; nothing is written outside ~/Library first.
+REPO="${REPO:-}"
+REPO_SRC=""
+repo_slug() {   # <checkout> -> 'owner/name' from its origin remote, or empty
+  local url
+  url="$(git -C "$1" remote get-url origin 2>/dev/null)" || return 1
+  [ -n "$url" ] || return 1
+  url="${url%.git}"
+  case "$url" in *://*) url="${url#*://}" ;; esac
+  url="${url#*@}"
+  url="${url/:/\/}"
+  printf '%s\n' "$url" | awk -F/ 'NF>=3 { print $(NF-1) "/" $NF }'
+}
+resolve_repo() {   # sets REPO/REPO_SRC; sets REPO_WHY and returns 1 when it cannot be resolved
+  local cand slug
+  REPO_WHY=""
+  if [ -n "$REPO" ]; then
+    REPO_SRC="\$REPO (environment)"
+    if [ ! -d "$REPO" ]; then REPO_WHY="REPO=$REPO does not exist on this machine"; return 1; fi
+    if [ ! -e "$REPO/.git" ]; then REPO_WHY="REPO=$REPO is not a git checkout (no .git)"; return 1; fi
+    return 0
+  fi
+  for cand in "${TORTOISE_REPO:-}" "${TORTOISE:-}" "$PWD"; do
+    [ -n "$cand" ] && [ -d "$cand" ] && [ -e "$cand/.git" ] || continue
+    slug="$(repo_slug "$cand")"
+    [ "$slug" = "$OR" ] || continue
+    REPO="$(cd "$cand" && pwd -P)"
+    REPO_SRC="derived from the origin remote of $cand"
+    return 0
+  done
+  REPO_WHY="nothing sets REPO, and none of TORTOISE_REPO='${TORTOISE_REPO:-}', TORTOISE='${TORTOISE:-}' or the current directory is a checkout whose origin is $OR"
+  return 1
+}
+if ! resolve_repo; then
+  echo "install.sh: FATAL cannot resolve the target checkout: $REPO_WHY" >&2
+  echo "install.sh: FIX: REPO=<path to a git checkout of $OR> ./install.sh   (or export REPO=...)" >&2
+  exit 1
+fi
 
 # sanity ceiling only; the swap/RAM gates below are the real constraint.
 # Portable core count, IDENTICAL to orch-loop.sh's line. install.sh itself refuses to run off macOS

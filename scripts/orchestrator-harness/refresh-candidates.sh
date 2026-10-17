@@ -15,7 +15,80 @@
 # so a cell is never STARTED in that state (cloud-cell-supervisor.sh `check` calls it).
 set -u
 OR="${OR:-daniel-ospina/tortoise}"
-REPO="${REPO:-/Users/danielospina/Documents/GitHub/tortoise}"
+# ── exit codes: TWO failure kinds, because the caller must act on them differently ────────────
+# `&` in orch-loop.sh discarded this script's status, so a bare non-zero was invisible. orch-loop
+# now reads the code: TRANSIENT is retried next cycle (a network/tool hiccup — retrying is
+# correct); NOT_PROVISIONABLE stops the retry loop and is surfaced loudly, because retrying cannot
+# help. Keep these in sync with orch-loop.sh's `-eq 3` handler.
+# ⛔ DECLARED HERE, ABOVE THE $REPO PRECONDITION, because that precondition is judged at LOAD time
+# and refuses with NOT_PROVISIONABLE: a constant that only existed further down would make the first
+# refusal in the file read as a magic `3`.
+EXIT_TRANSIENT=1
+EXIT_NOT_PROVISIONABLE=3
+# ── $REPO: REQUIRED, OR DERIVED — NEVER A PATH THAT HAPPENS TO EXIST ON ONE DEVELOPER'S MAC ────
+# WHY (agent-infra#1974). This defaulted to `/Users/danielospina/Documents/GitHub/tortoise`. That
+# path exists on exactly one laptop: on every cmux cloud cell it is ABSENT, and an absent target is
+# the failure this whole file is written against — the refresh finds no scout worktree, no venv, no
+# pre-flight tool, and the controller reports RUNNING with `lanes: 0` forever. It is the same class
+# as the hardcoded tortoise `uv sync` spec #1736 removed, and the reason install.sh's `__REPO__`
+# template exists at all: the target repo is a DEPLOYMENT FACT, not a constant this script owns.
+# ⛔ SO IT IS RESOLVED, NOT ASSUMED, AND A DECLARED VALUE IS NEVER SILENTLY REPLACED. Two sources,
+# in order — the environment (`keys.env` is sourced by the controller's session, so a cell always
+# delivers it), then a DERIVATION that has to prove itself:
+#   1. `$REPO` as given. If it does not EXIST or is not a git checkout, that is a refusal naming the
+#      path — never a fallback to some other checkout, because quietly dispatching a different
+#      repo's issues is the measured #1764/#1901 class (a controller repointed at tortoise
+#      dispatched agent-infra issues).
+#   2. `$TORTOISE_REPO` / `$TORTOISE` (this harness's established names for a tortoise checkout),
+#      then the current directory — each accepted ONLY when its `origin` remote names exactly `$OR`.
+#      The slug check is what makes the derivation a proof rather than a guess: this script
+#      dispatches `$OR`'s issues, so a checkout of some other repo cannot stand in for it.
+# Failing both, ONE actionable line and exit 3 (a retry cannot fix a missing checkout) — the same
+# precondition verdict the gh probe below uses, so the caller has one vocabulary for it. The
+# identical rule lives in cloud-cell-supervisor.sh and orch-loop.sh/install.sh (standalone files,
+# copied into `$O`, so the block is deliberately repeated rather than hidden behind a lib the
+# seeding step would have to remember).
+REPO="${REPO:-}"
+REPO_SRC=""
+repo_slug() {   # <checkout> -> 'owner/name' from its origin remote, or empty
+  local url
+  url="$(git -C "$1" remote get-url origin 2>/dev/null)" || return 1
+  [ -n "$url" ] || return 1
+  url="${url%.git}"
+  case "$url" in *://*) url="${url#*://}" ;; esac   # scheme and host prefix
+  url="${url#*@}"                                     # user@ (present or not)
+  url="${url/:/\/}"                                   # scp-like host:owner/name
+  printf '%s\n' "$url" | awk -F/ 'NF>=3 { print $(NF-1) "/" $NF }'
+}
+resolve_repo() {   # sets REPO/REPO_SRC; sets REPO_WHY and returns 1 when it cannot be resolved
+  local cand slug
+  REPO_WHY=""
+  if [ -n "$REPO" ]; then
+    REPO_SRC="\$REPO (environment)"
+    if [ ! -d "$REPO" ]; then
+      REPO_WHY="REPO=$REPO does not exist on this box"; return 1
+    fi
+    if [ ! -e "$REPO/.git" ]; then
+      REPO_WHY="REPO=$REPO is not a git checkout (no .git directory or linked-worktree .git file)"; return 1
+    fi
+    return 0
+  fi
+  for cand in "${TORTOISE_REPO:-}" "${TORTOISE:-}" "$PWD"; do
+    [ -n "$cand" ] && [ -d "$cand" ] && [ -e "$cand/.git" ] || continue
+    slug="$(repo_slug "$cand")"
+    [ "$slug" = "$OR" ] || continue
+    REPO="$(cd "$cand" && pwd -P)"
+    REPO_SRC="derived from the origin remote of $cand"
+    return 0
+  done
+  REPO_WHY="no target checkout could be DERIVED either: nothing sets REPO, and none of TORTOISE_REPO='${TORTOISE_REPO:-}', TORTOISE='${TORTOISE:-}' or the current directory is a checkout whose origin is $OR"
+  return 1
+}
+resolve_repo || {
+  echo "[refresh] NOT PROVISIONABLE: $REPO_WHY — this script dispatches $OR's issues and cannot guess which checkout that is (#1974)"
+  echo "[refresh]   fix: set REPO=<path to a git checkout of $OR> in keys.env (the controller session sources it) or export REPO before running, then re-run"
+  exit "${EXIT_NOT_PROVISIONABLE:-3}"
+}
 SC="$REPO/.worktrees/dispatch-scout"
 
 # ── A USABLE $HOME IS A PRECONDITION OF THE PRE-FLIGHT, NOT A PER-CANDIDATE RESULT ─────────────
@@ -92,14 +165,6 @@ export PATH="$PATH:/opt/homebrew/bin:/usr/local/bin"
 # Both the `--check` probe and the run resolve through this SAME variable, so a check can never
 # disagree with what the refresh would actually execute.
 UV="${SCOUT_UV:-uv}"
-
-# ── exit codes: TWO failure kinds, because the caller must act on them differently ────────────
-# `&` in orch-loop.sh discarded this script's status, so a bare non-zero was invisible. orch-loop
-# now reads the code: TRANSIENT is retried next cycle (a network/tool hiccup — retrying is
-# correct); NOT_PROVISIONABLE stops the retry loop and is surfaced loudly, because retrying cannot
-# help. Keep these in sync with orch-loop.sh's `-eq 3` handler.
-EXIT_TRANSIENT=1
-EXIT_NOT_PROVISIONABLE=3
 
 # ── the interpreter minimum, from the TOOL (agent-infra#1748 review) ──────────────────────────
 # The collision pre-flight is stdlib-only, which is why a repo with no `pyproject.toml` needs no venv
@@ -369,7 +434,11 @@ cmd_check() {
   # checks call `gh auth status` UNSCOPED, so a stale UNRELATED host refuses a cell whose target host
   # is fine. scripts/cloud-cell-supervisor.sh and scripts/cloud-cell-bringup.sh are owned by another
   # lane; the run-path probe below is host-scoped, so this one is not.
-  [ -d "$REPO" ] || { echo "[refresh] check: FAIL repo not found at $REPO"; return "$EXIT_TRANSIENT"; }
+  # ⛔ NO `[ -d "$REPO" ]` ARM HERE ANY MORE (#1974). It tested the same thing resolve_repo()
+  # refused on at LOAD time, so it could only ever be dead — and a dead fail-closed arm reads as a
+  # live one to the next reader, which is how a guard gets deleted as redundant by someone who
+  # believes a different layer still holds it. The precondition is judged ONCE, in one place, with
+  # one message; `--check` inherits the verdict rather than re-deriving it.
   tool_dir="$REPO"; [ -d "$SC" ] && tool_dir="$SC"
   if ! resolve_preflight; then
     echo "[refresh] check: no tools/collision_preflight.py in $tool_dir and no tortoise checkout resolved (TORTOISE_REPO='${TORTOISE_REPO:-}', TORTOISE='${TORTOISE:-}')"
@@ -377,7 +446,7 @@ cmd_check() {
     echo "[refresh]   fix: set TORTOISE_REPO=<a tortoise checkout> (e.g. in keys.env), or vendor tools/collision_preflight.py into the repo"
     return "$EXIT_NOT_PROVISIONABLE"
   fi
-  echo "[refresh] check: repo=$REPO"
+  echo "[refresh] check: repo=$REPO ($REPO_SRC)"
   echo "[refresh] check: pre-flight tool=$PREFLIGHT"
   # ── the CROSS-BOX CLAIM REGISTRY, judged LOCALLY (agent-infra#1850 review, 2026-10-16) ──────
   # The refresh refuses every issue when `$O/claims.sh` exists but predates the issue-claim reader,
@@ -820,6 +889,57 @@ while read -r N; do
   # ⛔ ANCHORED, because the report echoes the candidate's own `title:` line: an unanchored search for
   # this phrase would let an ISSUE TITLE set the flag and silently drop a genuine CLEAN (#1853 review).
   grep -qE '^ *ALSO INCOMPLETE: ' <<<"$PRE" && degraded=1
+  # ── THE HOLDER ARM IS ANSWERED BY THE CLAIM REGISTRY, NOT BY A LOCAL BOARD (agent-infra#1935) ──
+  # ⛔ THE MEASURED DEFECT. On a cmux cloud cell the pre-flight answers `VERDICT: INCOMPLETE (exit 2)
+  # — 1 surface(s) could not be queried (issue assignee/holder)` for EVERY candidate, whatever the
+  # issue: its holder arm reads the local fleet board (`tortoise/tools/fleet_state.py`), whose
+  # liveness comes from `cmux sessions list` — a store the guest CLI on a cell does not serve (it
+  # answers `unknown resource scope "sessions"`), and whose WRITER, the retired cmux dispatcher, has
+  # never run on a cell. The board therefore reports its own `liveness-unmeasured` orphan, and every
+  # candidate is refused. `candidates.txt` stays empty and the controller reports RUNNING with
+  # `lanes: 0` for as long as the cell exists — the merge-only shape #1736 exists to remove, arriving
+  # through the one arm #1736 did not touch. THE REFUSAL IS NOT WRONG ON ITS OWN TERMS (an unmeasured
+  # pid is not a dead owner, #8175); what is wrong is asking a LOCAL, dispatcher-maintained artifact
+  # a FLEET-WIDE question when the fleet already publishes the answer (#1935's fix direction 1).
+  #
+  # ⛔ SO THE SUBSTITUTION IS NARROW, NAMED, AND EXPLICITLY NOT A PERMISSION SLIP:
+  #   * ONLY when the sentinel's OWN surface list is exactly `issue assignee/holder`. One other
+  #     unqueryable surface (landed, open PRs, branches, worktrees) and this block does nothing —
+  #     those surfaces are what make a CLEAN mean something, and none of them is substitutable.
+  #   * ONLY when the verdict is INCOMPLETE with no `ALSO INCOMPLETE` marker (a degraded answer)
+  #     and the list is READABLE. An unparseable line leaves the verdict as it was: cannot-determine
+  #     is never promoted, and this block cannot fire on a CLEAN/COLLISION/LANDED.
+  #   * The holder question then goes to `claim_issue_verdict` in the CLEAN arm below — the SAME
+  #     cross-box registry and the SAME reader the pass already trusts for its blocking claim. So a
+  #     peer box's claim still blocks as COLLISION, an unreadable registry still yields INCOMPLETE,
+  #     and only an explicit `0` queues. This arm adds no new source of truth and no new verdict: it
+  #     REMOVES an unanswerable surface so the authoritative one can answer.
+  #   * And the atomic claim at DISPATCH (orch-loop.sh `claim_issue_acquire`, a CAS on
+  #     `refs/claims/issue-<N>`) re-asks the question at the moment it matters: a holder that appears
+  #     between this read and that CAS is refused there, not duplicated here. The refresh is an
+  #     advisory filter; the claim is the gate.
+  # Measured on the cell this was written on: the pre-flight returned INCOMPLETE/holder for 6 of 6
+  # candidates while `claim_issue_preflight` answered `no claim on #<N>` (rc 0) for the same six —
+  # i.e. the authoritative registry was readable and said CLEAN the whole time.
+  # ⛔ AND A REGISTRY THAT IS NOT EVEN INSTALLED IS NOT A SUBSTITUTE (2026-10-17 review). The CLEAN
+  # arm's absent-registry branch is a documented fallthrough for a registry-less box, and it is
+  # correct for a REAL CLEAN — the pre-flight itself answered. Here BOTH holder sources would be
+  # missing, so promoting to CLEAN would queue on nothing at all: the substitution requires the
+  # registry to be PRESENT, and says which half is missing when it is not, rather than falling
+  # through to the fallthrough.
+  V_NOTE=""
+  if [ "$V" = "INCOMPLETE" ] && [ "$degraded" -eq 0 ]; then
+    UNANSWERED="$(printf '%s\n' "$PRE" | sed -nE 's/^VERDICT: INCOMPLETE.*could not be queried \(([^)]*)\).*/\1/p' | head -1)"
+    if [ "$UNANSWERED" = "issue assignee/holder" ]; then
+      if [ -f "$O/claims.sh" ]; then
+        echo "[refresh] #$N: the pre-flight's ONLY unqueryable surface is the holder read (its local fleet board cannot measure lane liveness on this box) — the CROSS-BOX CLAIM REGISTRY is that question's authority, so it is asked below; a peer's claim still blocks, and the dispatch claim CAS re-asks atomically (agent-infra#1935)"
+        V=CLEAN
+        V_NOTE=" (holder read: cross-box claim registry, #1935 — the pre-flight's board arm is unqueryable here)"
+      else
+        echo "[refresh] ?#$N INCOMPLETE — its holder surface cannot be answered (the local fleet board cannot measure lane liveness here) AND there is no claim registry at $O/claims.sh to answer it instead, so the pre-flight's fail-closed reading stands (agent-infra#1935)"
+      fi
+    fi
+  fi
   case "$V" in
     CLEAN)
       # ⛔ A CLEAN that ALSO says INCOMPLETE is the DEGRADED answer, not a verdict — the tool could
@@ -877,7 +997,7 @@ while read -r N; do
             fi
             usable=$((usable + 1))
             QUEUED=$((QUEUED + 1))
-            echo "[refresh] +#$N CLEAN -> backlog" ;;
+            echo "[refresh] +#$N CLEAN -> backlog${V_NOTE:-}" ;;
           1) # a live claim: a peer owns it. Leave it UNCHECKED so the next pass re-attempts it —
              # a claim is a window, not a verdict (the peer's work lands).
              # ⛔ AND IT IS USABLE — it is a COLLISION, which is one of the three verdicts the caller

@@ -3,16 +3,57 @@
 # Fast, non-blocking cycle: heartbeat -> merge sweep -> capacity-gated dispatch -> background refresh.
 set -u
 OR="${OR:-daniel-ospina/tortoise}"
-# ⛔ THE OLD DEFAULT POINTED AT A PATH THAT DOES NOT EXIST ON THIS BOX
-# (/Users/home/eldato/tortoise). Under the shipped launchd job this is only a FALLBACK --
-# install.sh renders its own REPO into the plist via __REPO__, and that value overrides this one.
-# It still matters for every REPO-less run (manual starts, the runbook, a re-install without env),
-# and there a missing path is indistinguishable from "nothing to do" -- the same class as the
-# gh-shim failure (#8246). Corrected, and made to fail LOUD rather than run against a path with
-# nothing in it. (Corrected after a fresh-context verifier showed the original comment misstated
-# the mechanism -- see the review on this PR.)
-REPO="${REPO:-/Users/danielospina/Documents/GitHub/tortoise}"
-if [ ! -d "$REPO" ]; then echo "orch-loop: FATAL REPO=$REPO does not exist" >&2; exit 78; fi
+# ⛔ $REPO: REQUIRED, OR DERIVED -- NEVER A PATH INVENTED BY THIS SCRIPT (agent-infra#1974).
+# Under the shipped launchd job this is only a FALLBACK -- install.sh renders its own REPO into the
+# plist via __REPO__ and the controller session passes REPO=... explicitly -- but it matters for
+# every REPO-less run (manual starts, the runbook, a re-install without env), and there a wrong
+# default is indistinguishable from "nothing to do": the floor pointed at
+# `/Users/home/eldato/tortoise`, then at `/Users/danielospina/Documents/GitHub/tortoise` -- a path
+# that exists on exactly one laptop and on NO cmux cloud cell. A loud exit on a path nobody can have
+# is still a cell that dispatches nothing (the #8246 class). So: the environment first, then a
+# DERIVATION that has to prove itself -- $TORTOISE_REPO/$TORTOISE, then the current directory, each
+# accepted only when its origin remote names exactly $OR, because this loop dispatches $OR's issues
+# and a checkout of another repo standing in for it is the measured #1764/#1901 class. A DECLARED
+# $REPO is never silently replaced: a path that does not exist is the refusal, naming it.
+# Same block as refresh-candidates.sh and cloud-cell-supervisor.sh (standalone files, seeded
+# independently into $O, so it is repeated rather than hidden behind a lib).
+REPO="${REPO:-}"
+REPO_SRC=""
+repo_slug() {   # <checkout> -> 'owner/name' from its origin remote, or empty
+  local url
+  url="$(git -C "$1" remote get-url origin 2>/dev/null)" || return 1
+  [ -n "$url" ] || return 1
+  url="${url%.git}"
+  case "$url" in *://*) url="${url#*://}" ;; esac
+  url="${url#*@}"
+  url="${url/:/\/}"
+  printf '%s\n' "$url" | awk -F/ 'NF>=3 { print $(NF-1) "/" $NF }'
+}
+resolve_repo() {   # sets REPO/REPO_SRC; sets REPO_WHY and returns 1 when it cannot be resolved
+  local cand slug
+  REPO_WHY=""
+  if [ -n "$REPO" ]; then
+    REPO_SRC="\$REPO (environment)"
+    if [ ! -d "$REPO" ]; then REPO_WHY="REPO=$REPO does not exist on this box"; return 1; fi
+    if [ ! -e "$REPO/.git" ]; then REPO_WHY="REPO=$REPO is not a git checkout (no .git)"; return 1; fi
+    return 0
+  fi
+  for cand in "${TORTOISE_REPO:-}" "${TORTOISE:-}" "$PWD"; do
+    [ -n "$cand" ] && [ -d "$cand" ] && [ -e "$cand/.git" ] || continue
+    slug="$(repo_slug "$cand")"
+    [ "$slug" = "$OR" ] || continue
+    REPO="$(cd "$cand" && pwd -P)"
+    REPO_SRC="derived from the origin remote of $cand"
+    return 0
+  done
+  REPO_WHY="nothing sets REPO, and none of TORTOISE_REPO='${TORTOISE_REPO:-}', TORTOISE='${TORTOISE:-}' or the current directory is a checkout whose origin is $OR"
+  return 1
+}
+if ! resolve_repo; then
+  echo "orch-loop: FATAL cannot resolve the target checkout: $REPO_WHY" >&2
+  echo "orch-loop: FIX: set REPO=<path to a git checkout of $OR> (keys.env, or the launching session), then re-run" >&2
+  exit 78
+fi
 O="${O:-$HOME/orchestrator}"
 export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
 export AGENT_SKIP_REVIEW_GATE=1 ELDATO_SKIP_VGATE=1

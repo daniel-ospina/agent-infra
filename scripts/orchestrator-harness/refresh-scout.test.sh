@@ -797,9 +797,15 @@ rf "$D" check TORTOISE_REPO="$D/tort"
 echo; echo "── a pass that judged NOTHING does not report an empty backlog ──"
 mk_case no-usable-verdict
 mkdir -p "$D/repo/.worktrees/dispatch-scout/tools"
+# ⛔ THE TRIGGER IS `issue landed`, NOT `issue assignee/holder` (agent-infra#1935). The holder arm is
+# now SUBSTITUTABLE — when it is the ONLY unqueryable surface the pass asks the cross-box claim
+# registry instead of refusing (see 1k below), so a holder-only INCOMPLETE no longer means "judged
+# nothing" on a box that has a registry. This case is about the AGGREGATE assertion (a pass that
+# produced no usable verdict must not print a healthy empty backlog), so it uses a surface that has
+# no substitute: if `landed` cannot be read, nothing about #42 is known and the refusal must stand.
 cat > "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py" <<'PY'
 #!/usr/bin/env python3
-print("VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be queried (issue assignee/holder)")
+print("VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be queried (issue landed)")
 raise SystemExit(2)
 PY
 chmod +x "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
@@ -1025,6 +1031,119 @@ esac
 case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
   *42*) ok "title quotes the marker: the genuinely-CLEAN candidate IS queued" ;;
   *) bad "title quotes the marker: the CLEAN was dropped — candidates='$(cat "$D/o/candidates.txt" 2>/dev/null)'" ;;
+esac
+
+# ── 1l) THE HOLDER ARM IS ANSWERED BY THE CLAIM REGISTRY (agent-infra#1935) ─────────────────────
+# THE MEASURED DEFECT. On a cmux cloud cell the pre-flight's holder surface reads the LOCAL fleet
+# board, whose liveness comes from `cmux sessions list` (a store the guest CLI does not serve) and
+# from a registry only the RETIRED cmux dispatcher ever wrote. So EVERY candidate came back
+# `VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be queried (issue assignee/holder)`, the
+# pass aborted "judged NOTHING", `candidates.txt` stayed empty, and the controller reported RUNNING
+# with `lanes: 0` for as long as the box existed. The refusal was correct on its own terms; asking a
+# LOCAL artifact a FLEET-WIDE question is not. The fleet's authoritative holder answer is the
+# cross-box claim registry (`refs/claims/issue-<N>`) — so when the holder read is the ONLY surface
+# that could not be answered, THAT is asked, and only an explicit "no claim" queues. Every case
+# below is the discrimininating half of a pair: the substitution must fire on exactly one shape.
+echo; echo "── a holder-only INCOMPLETE is answered by the cross-box claim registry ──"
+mk_case holder-only-incomplete
+mkdir -p "$D/repo/.worktrees/dispatch-scout/tools"
+cat > "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py" <<'PY'
+#!/usr/bin/env python3
+print("VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be queried (issue assignee/holder)")
+raise SystemExit(2)
+PY
+chmod +x "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+printf '#!/bin/bash\ncase "$*" in *"--label P0-blocker"*) printf "0 42\\n" ;; esac\nexit 0\n' > "$D/bin/gh"
+chmod +x "$D/bin/gh"
+rf "$D" refresh
+[ "$RC" -eq 0 ] && ok "holder-only INCOMPLETE: the pass is not aborted (rc=0)" \
+               || bad "holder-only INCOMPLETE: rc=$RC (want 0 — the registry answers the holder question) — output: $OUT"
+case "$OUT" in
+  *"ONLY unqueryable surface is the holder read"*) ok "holder-only INCOMPLETE: the substitution is NAMED, not silent" ;;
+  *) bad "holder-only INCOMPLETE: the substitution is not reported — output: $OUT" ;;
+esac
+case "$OUT" in
+  *"CROSS-BOX CLAIM REGISTRY"*) ok "holder-only INCOMPLETE: the log names the authority that replaced the board" ;;
+  *) bad "holder-only INCOMPLETE: the substitute source is not named — output: $OUT" ;;
+esac
+case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
+  *42*) ok "holder-only INCOMPLETE: the candidate with NO claim is queued" ;;
+  *) bad "holder-only INCOMPLETE: nothing queued — candidates='$(cat "$D/o/candidates.txt" 2>/dev/null)'" ;;
+esac
+# (b) …and a LIVE peer claim still blocks. This is the half that makes the substitution safe: the
+# registry is not a rubber stamp, it is the same gate the CLEAN arm already consults.
+mk_case holder-only-incomplete-claimed
+mkdir -p "$D/repo/.worktrees/dispatch-scout/tools"
+cat > "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py" <<'PY'
+#!/usr/bin/env python3
+print("VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be queried (issue assignee/holder)")
+raise SystemExit(2)
+PY
+chmod +x "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+printf '#!/bin/bash\ncase "$*" in *"--label P0-blocker"*) printf "0 42\\n" ;; esac\nexit 0\n' > "$D/bin/gh"
+chmod +x "$D/bin/gh"
+echo 99 > "$D/o/candidates.txt"
+if mk_issue_claim "$D" 42 600; then
+  rf "$D" refresh
+  case "$OUT" in
+    *"COLLISION (cross-box issue claim)"*) ok "holder-only INCOMPLETE + a live peer claim: reported as COLLISION" ;;
+    *) bad "holder-only INCOMPLETE + a live peer claim: the claim was not honoured — output: $OUT" ;;
+  esac
+  case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
+    *42*) bad "holder-only INCOMPLETE + a live peer claim: QUEUED a claimed issue — duplicate dispatch" ;;
+    *99*) ok "holder-only INCOMPLETE + a live peer claim: not queued (seed 99 intact)" ;;
+    *) bad "holder-only INCOMPLETE + a live peer claim: the backlog was clobbered" ;;
+  esac
+else
+  bad "holder-only INCOMPLETE + a live peer claim: could not mint the peer claim in the sandbox"
+fi
+# (c) A SECOND unqueryable surface cancels the substitution. `landed` is not substitutable, and a
+# run that could not read the issue's own state proves nothing about the issue.
+mk_case holder-plus-other-incomplete
+mkdir -p "$D/repo/.worktrees/dispatch-scout/tools"
+cat > "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py" <<'PY'
+#!/usr/bin/env python3
+print("VERDICT: INCOMPLETE (exit 2) — 2 surface(s) could not be queried (issue landed, issue assignee/holder)")
+raise SystemExit(2)
+PY
+chmod +x "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+printf '#!/bin/bash\ncase "$*" in *"--label P0-blocker"*) printf "0 42\\n" ;; esac\nexit 0\n' > "$D/bin/gh"
+chmod +x "$D/bin/gh"
+echo 99 > "$D/o/candidates.txt"
+rf "$D" refresh
+[ "$RC" -eq 1 ] && ok "holder + a second unqueryable surface: still aborts TRANSIENT (rc=1)" \
+               || bad "holder + a second unqueryable surface: rc=$RC (want 1) — output: $OUT"
+case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
+  *42*) bad "holder + a second unqueryable surface: QUEUED on partial evidence" ;;
+  *99*) ok "holder + a second unqueryable surface: not queued (seed 99 intact)" ;;
+  *) bad "holder + a second unqueryable surface: the backlog was clobbered" ;;
+esac
+# (d) NO registry at all: the substitution must NOT fire. Both holder sources would be missing, and
+# the CLEAN arm's documented absent-registry fallthrough exists for a REAL CLEAN — a pre-flight that
+# answered. Queuing here would be a decision made on nothing.
+mk_case holder-only-incomplete-no-registry
+rm -f "$D/o/claims.sh"
+mkdir -p "$D/repo/.worktrees/dispatch-scout/tools"
+cat > "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py" <<'PY'
+#!/usr/bin/env python3
+print("VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be queried (issue assignee/holder)")
+raise SystemExit(2)
+PY
+chmod +x "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+printf '#!/bin/bash\ncase "$*" in *"--label P0-blocker"*) printf "0 42\\n" ;; esac\nexit 0\n' > "$D/bin/gh"
+chmod +x "$D/bin/gh"
+echo 99 > "$D/o/candidates.txt"
+rf "$D" refresh
+[ "$RC" -eq 1 ] && ok "holder-only INCOMPLETE + NO registry: aborts TRANSIENT (rc=1)" \
+               || bad "holder-only INCOMPLETE + NO registry: rc=$RC (want 1) — output: $OUT"
+case "$OUT" in
+  *"there is no claim registry at"*) ok "holder-only INCOMPLETE + NO registry: the missing half is NAMED" ;;
+  *) bad "holder-only INCOMPLETE + NO registry: the refusal does not say what is missing — output: $OUT" ;;
+esac
+case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
+  *42*) bad "holder-only INCOMPLETE + NO registry: queued with NO holder source at all" ;;
+  *99*) ok "holder-only INCOMPLETE + NO registry: not queued (seed 99 intact)" ;;
+  *) bad "holder-only INCOMPLETE + NO registry: the backlog was clobbered" ;;
 esac
 
 # ── 2) the tool is resolved PER REPO: the repo's OWN copy wins, run from the scout with --repo . ─
@@ -1741,6 +1860,77 @@ if [ -s "$DM" ] && grep -q 'release_issue_claim_unspawned' "$DM"; then
 else
   bad "dispatch-merge: could not extract the chain-failure branch (or it no longer releases)"
 fi
+
+# ── $REPO IS REQUIRED, OR DERIVED — NEVER A PATH THAT HAPPENS TO EXIST (agent-infra#1974) ───────
+# Three defaults in this harness pointed at a target checkout nothing could be: the refresh at
+# `/Users/danielospina/Documents/GitHub/tortoise` and the supervisor at `/tmp/cell` (the loop and the
+# installer shared the first). On every cmux cloud cell that is a checkout that does not exist, and
+# the failure it produces is the one this whole file is written against — no pre-flight, no backlog,
+# a controller reporting RUNNING with `lanes: 0`. The rule now: the environment first, then a
+# derivation that must PROVE its origin remote names $OR, then ONE actionable line.
+echo; echo "── the target checkout is required, or derived — never invented ──"
+# (a) a declared path that does not exist REFUSES, and says so — it must never fall back to another
+# checkout, because dispatching another repo's issues is the measured #1764/#1901 class.
+mk_case repo-declared-missing
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+printf '#!/bin/bash\nexit 0\n' > "$D/bin/gh"; chmod +x "$D/bin/gh"
+rf "$D" check REPO="$D/does-not-exist"
+[ "$RC" -eq 3 ] && ok "repo declared but missing: rc=3 (NOT PROVISIONABLE — a retry cannot fix it)" \
+               || bad "repo declared but missing: rc=$RC (want 3) — output: $OUT"
+case "$OUT" in
+  *"REPO=$D/does-not-exist does not exist"*) ok "repo declared but missing: the refusal names the path" ;;
+  *) bad "repo declared but missing: the path is not named — output: $OUT" ;;
+esac
+case "$OUT" in
+  *"fix: set REPO="*) ok "repo declared but missing: the ONE line names the fix" ;;
+  *) bad "repo declared but missing: no actionable line — output: $OUT" ;;
+esac
+# (b) NOTHING declared: derived from a checkout whose origin IS $OR (here: $TORTOISE_REPO).
+mk_case repo-derived
+mk_tool "$D/tort/tools/collision_preflight.py"
+# A REAL checkout whose origin remote names $OR — the derivation reads the URL, so this is the fact
+# it has to find. `git init` only: no network, and the tool copy above is what `--check` resolves.
+git init -q "$D/tort"
+git -C "$D/tort" remote add origin "https://github.com/daniel-ospina/tortoise.git"
+echo 99 > "$D/o/candidates.txt"
+rf "$D" check REPO= TORTOISE_REPO="$D/tort"
+[ "$RC" -eq 0 ] && ok "repo not declared: derived from TORTOISE_REPO's origin (rc=0)" \
+               || bad "repo not declared: rc=$RC — the derivation did not find $D/tort — output: $OUT"
+case "$OUT" in
+  *"repo=$D/tort"*|*"repo=$(cd "$D/tort" && pwd -P)"*) ok "repo not declared: --check reports the DERIVED checkout" ;;
+  *) bad "repo not declared: the derived checkout is not reported — output: $OUT" ;;
+esac
+# (c) a derivation that does NOT name $OR is refused: a checkout of another repo cannot stand in.
+mk_case repo-derived-wrong-repo
+mk_tool "$D/tort/tools/collision_preflight.py"
+git init -q "$D/tort"
+git -C "$D/tort" remote add origin "https://github.com/daniel-ospina/agent-infra.git"
+rf "$D" check REPO= TORTOISE_REPO="$D/tort"
+[ "$RC" -eq 3 ] && ok "repo derived to the WRONG repo: refused (rc=3) — a checkout of another repo cannot stand in" \
+               || bad "repo derived to the WRONG repo: rc=$RC (want 3) — output: $OUT"
+case "$OUT" in
+  *"whose origin is daniel-ospina/tortoise"*) ok "repo derived to the WRONG repo: the refusal names the origin it required" ;;
+  *) bad "repo derived to the WRONG repo: the refusal is not specific — output: $OUT" ;;
+esac
+# (d) nothing declared and nothing derivable: ONE line, NOT a guess (and never the old personal path).
+mk_case repo-underivable
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+printf '#!/bin/bash\nexit 0\n' > "$D/bin/gh"; chmod +x "$D/bin/gh"
+OUT="$(env -u TORTOISE_REPO -u TORTOISE -u SCOUT_UV -u CELL_HOME -u SCOUT_PY \
+        HOME="$D/home" PATH="$D/bin:$PATH" REPO= O="$D/o" OR=daniel-ospina/tortoise \
+        bash -c 'cd "$1" && shift && bash "$0" "$@"' "$REFRESH" "$D/home" check 2>&1)"; RC=$?
+[ "$RC" -eq 3 ] && ok "repo underivable: rc=3 (refused, not guessed)" \
+               || bad "repo underivable: rc=$RC (want 3) — output: $OUT"
+# ⛔ ASSERT THE SOURCE, NOT THE OUTPUT, for the two literals — an output-substring test is
+# UNDISCRIMINATING here: the sandbox's own PATH carries `/tmp/cell-home/…`, so `*"/tmp/cell"*` matched
+# the test harness's environment rather than the shipped default it was looking for. The old defaults
+# are literals in these files; grep for them where they would live.
+for _f in refresh-candidates.sh orch-loop.sh install.sh ../cloud-cell-supervisor.sh; do
+  case "$(grep -n 'REPO:-[^}]*}' "$HERE/$_f" 2>/dev/null)" in
+    *"Documents/GitHub"*|*"REPO:-/tmp/cell}"*|*"REPO:-/tmp/cell "*) bad "shipped default in $_f still points at a path no other box has" ;;
+    *) ok "no invented / personal \$REPO default remains in $_f" ;;
+  esac
+done
 
 echo
 echo "── Summary ───────────────────────────────────────────────────────"
