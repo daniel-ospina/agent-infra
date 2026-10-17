@@ -12,20 +12,30 @@ INSIDE the JSON byte stream: `json.loads` raised `Extra data: line 928 column 1 
 anything. Measured on the box: 259 `ABORT — LANE ROSTER` lines against 284 completed
 passes, i.e. ~48% of passes aborting. That is why the dispatcher stopped feeding the fleet.
 
-WHAT IS PINNED HERE, and which way each one fails on the PRE-fix file:
+WHAT IS PINNED HERE. The cases are one of two kinds, and the header used to claim the
+first kind for all of them -- which is the same "the artifact asserts something it does not
+verify" defect this PR is about (found by the fresh-context reader of this very diff):
 
-  * a READABLE stdout is still parsed when a warning arrives on stderr -- this is the
-    regression test: on the pre-fix file `lanes()` raises `LaneReadError: ... Extra data`
-    (and the direct `sh()` test cannot even unpack its 2-tuple return).
-  * stderr is NOT swallowed while being kept out of the parse -- a DEGRADED notice must
-    still be LOUD, so it is re-emitted on this process's stderr.
-  * a stderr-ONLY line can never become a queue item -- on the pre-fix file that warning WAS
-    returned as the item, i.e. a fail-open on the value that decides what a live lane is
-    told to do.
-  * the fail-closed gate is NOT opened by the fix: a timed-out, failed, empty, non-JSON or
-    DEGRADED-roster read STILL raises, for both reads.
-  * the ONE merged read the issue keeps (the cmux send path, whose subject is prose) is made
-    at its own call site, explicitly.
+  REGRESSION PINS -- they FAIL on the pre-fix `(rc, stdout + stderr)` file:
+    * `test_sh_returns_stdout_and_stderr_separately`, `test_sh_timeout_puts_the_reason_on_stderr_and_leaves_stdout_empty`
+    * `test_a_degraded_notice_does_not_break_a_readable_roster`, `test_the_degraded_notice_is_still_loud`
+    * `test_a_stderr_only_line_is_never_a_queue_item`,
+      `test_the_item_is_the_first_stdout_line_with_stderr_noise_present`
+    * `test_a_failed_roster_read_falls_back_to_stdout_for_its_reason[   \\n]` and
+      `test_a_failed_queue_read_falls_back_to_stdout_when_stderr_is_blank`
+    * `test_a_send_verdict_on_stderr_is_ambiguous_not_a_failed_start` (the helpers are new;
+      pre-fix the rc=4 branch read `out` with no merge at all)
+
+  GATE-PRESERVATION CONTROLS -- they pass on BOTH files BY DESIGN, because the fix must not
+open the fail-closed gate: `test_an_unreadable_roster_still_aborts` (all 5 params),
+`test_a_degraded_roster_aborts_even_with_the_notice_on_stderr`,
+`test_a_timed_out_roster_still_aborts`,
+`test_a_timed_out_roster_does_not_blame_lane_status_for_our_own_sentinel`,
+`test_a_still_empty_queue_reads_as_empty_not_as_an_error`,
+`test_a_failed_queue_read_quotes_stderr`,
+`test_a_failed_roster_read_falls_back_to_stdout_for_its_reason[]` (the empty-stderr control),
+`test_the_send_path_still_sees_stderr`. A reader who trims "redundant" tests here would trim
+THE LOAD-BEARING ONES -- that is why the split is written down.
 
 Run:  python3 -m pytest scripts/test_queue_dispatch.py -q
       python3 scripts/test_queue_dispatch.py         # same, via the pytest runner this file imports
@@ -172,11 +182,46 @@ def test_a_degraded_roster_aborts_even_with_the_notice_on_stderr(tmp_path, monke
     assert "DEGRADED" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("stderr", ["", "   \n"])
+def test_a_failed_roster_read_falls_back_to_stdout_for_its_reason(tmp_path, monkeypatch,
+                                                               stderr):
+    """rc != 0 with the failure text on STDOUT and a BLANK (whitespace-only) stderr.
+
+    The fallback must be on the STRIPPED text: `err or out` selects a whitespace-only stderr
+    because `" \\n"` is truthy, strips it to `""`, and reports `(no output)` while stdout held
+    the reason. That is the same defect class this whole fix removes — a failed read that
+    cannot say WHY it failed — so the reason must survive either stream shape.
+
+    PRE-fix this raises `LaneReadError: ... (no output)` and the match fails; the empty-stderr
+    case is the control that already passed, kept so the pair pins the stripping, not the
+    fallback's existence.
+    """
+    _lane_status(tmp_path, monkeypatch,
+                 stdout="lane-status: REFUSING — the roster is EMPTY\n", stderr=stderr, rc=3)
+    with pytest.raises(qd.LaneReadError, match="roster is EMPTY"):
+        qd.lanes(scan_timeout=30)
+
+
 def test_a_timed_out_roster_still_aborts(tmp_path, monkeypatch):
     """The 600s bound's whole purpose: a killed scan is UNKNOWN, never an empty fleet."""
     _lane_status(tmp_path, monkeypatch, stdout=_ONE_LANE, sleep=5)
     with pytest.raises(qd.LaneReadError, match="TIMED OUT"):
         qd.lanes(scan_timeout=0.3)
+
+
+def test_a_timed_out_roster_does_not_blame_lane_status_for_our_own_sentinel(
+        tmp_path, monkeypatch, capsys):
+    """On a kill, `sh()` returns THIS FILE'S own `"(timeout)"` on the stderr channel -- not
+    lane-status output. Re-emitting it unconditionally printed
+    `queue-dispatch: lane-status stderr: (timeout)`, attributing our own timeout to the peer
+    in the one log line an operator reads when a dispatch pass aborts.
+
+    The abort still happens and still says TIMED OUT; only the misattributed echo is gone.
+    """
+    _lane_status(tmp_path, monkeypatch, stdout=_ONE_LANE, sleep=5)
+    with pytest.raises(qd.LaneReadError, match="TIMED OUT"):
+        qd.lanes(scan_timeout=0.3)
+    assert "lane-status stderr" not in capsys.readouterr().err
 
 
 # ── 3. the queue read: the same rule one function down ─────────────────────────────────────
@@ -217,11 +262,23 @@ def test_a_failed_queue_read_quotes_stderr(tmp_path, monkeypatch):
         qd.claim_next("lane-a", "LANDABLE.tsv")
 
 
+def test_a_failed_queue_read_falls_back_to_stdout_when_stderr_is_blank(tmp_path, monkeypatch):
+    """The same stripped-text fallback as `lanes()`: a blank-but-non-empty stderr
+    (`" \\n"` is truthy) must not turn a real stdout reason into `(no output)`.
+
+    PRE-fix this raises `QueueReadError: ... (no output)` and the match fails.
+    """
+    _claim(tmp_path, monkeypatch,
+           stdout="claim.py: a missing queue is UNKNOWN, not empty\n", stderr=" \n", rc=2)
+    with pytest.raises(qd.QueueReadError, match="missing queue is UNKNOWN"):
+        qd.claim_next("lane-a", "LANDABLE.tsv")
+
+
 # ── 4. the one merged read the issue KEEPS, made at its own call site ──────────────────────
 
 def test_the_send_path_still_sees_stderr(tmp_path, monkeypatch, capsys):
     """`safe-send.sh`'s subject is PROSE, not structure, so its stderr is still quotable at
-    the two send call sites. This pins the explicit merge: a split-only `sh()` with no merge
+    the send call sites. This pins the explicit merge: a split-only `sh()` with no merge
     here would print `CONTINUE-FAILED lane-a rc=5` with an EMPTY reason, which is how a
     version-check failure hid behind a composer story before (2026-10-01).
     """
@@ -235,6 +292,35 @@ def test_the_send_path_still_sees_stderr(tmp_path, monkeypatch, capsys):
     rc = qd.send_continue("lane-a", "ws-a", dry=False)
     assert rc == 5
     assert "FATAL" in capsys.readouterr().out
+
+
+def test_a_send_verdict_on_stderr_is_ambiguous_not_a_failed_start():
+    """⛔ THE CLAIM-KEEPING DECISION AT `main()`'s SEND SITE, decided from EITHER stream.
+
+    `rc == 4` means two very different things and the difference is a WORD:
+      * `sent-but-not-consumed` -> AMBIGUOUS: bytes were written, no turn confirmed, the text
+        may be sitting in the composer. The claim is KEPT so the next tick cannot send a
+        SECOND item on top of it.
+      * no such word -> FAILED-TO-START: a version-check exit that never sent anything, so the
+        claim is RELEASED.
+
+    If the send site read stdout alone (the pre-fix state, and the state a "cleanup" that
+    drops the merge would restore), a verdict arriving on stderr would be classified
+    FAILED-TO-START: the claim released and the next tick stacking a second instruction into
+    the same composer. This test drives that decision with the verdict on STDERR ONLY.
+    """
+    assert qd.interpret_send(4, "", "sent-but-not-consumed\n")[0] == "AMBIGUOUS"
+    assert qd.interpret_send(4, "", "python3.12 missing -- version check failed\n")[0] == \
+        "FAILED-TO-START"
+    # control: the same words on the stream the pre-fix code did read
+    assert qd.interpret_send(4, "sent-but-not-consumed\n", "")[0] == "AMBIGUOUS"
+    # byte order is stdout-then-stderr, matching the old `p.stdout + p.stderr`
+    assert qd.send_text("a", "b") == "ab"
+    assert qd.send_text("", "b") == "b"
+    # and the other verdicts are unchanged by the extraction
+    for rc, expected in ((0, "SENT"), (3, "BUSY"), (5, "FAILED"), (None, "FAILED")):
+        assert qd.interpret_send(rc, "", "")[0] == expected, rc
+        assert qd.interpret_send(rc, "", "")[0] in qd.SEND_KINDS
 
 
 if __name__ == "__main__":

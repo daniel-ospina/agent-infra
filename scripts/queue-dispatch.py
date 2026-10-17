@@ -398,7 +398,12 @@ def lanes(scan_timeout=None):
     # (`lane-status.py:545`); splitting the streams must not silence the alarm the split
     # exists to protect. It is re-emitted on OUR stderr, so this process's own stdout
     # remains a clean summary a caller can read, and the abort reasons below quote it.
-    if err.strip():
+    # ⛔ AND ONLY WHEN `rc IS NOT None`: on a kill, `err` is THIS FILE'S OWN `"(timeout)"`
+    # sentinel, not lane-status output, so echoing it here printed
+    # `queue-dispatch: lane-status stderr: (timeout)` — attributing our own timeout to the
+    # peer, in the one log line an operator reads when dispatch aborts. `claim_next()` has no
+    # such echo; the abort reason below already says TIMED OUT in full.
+    if rc is not None and err.strip():
         sys.stderr.write(
             "queue-dispatch: lane-status stderr: " + err.strip()[:2000] + "\n")
     if rc is None:
@@ -409,9 +414,12 @@ def lanes(scan_timeout=None):
         # The failure text is on stderr (that is where lane-status.py writes it), so quote
         # stderr first and fall back to stdout — never `out + err`, which is the merge this
         # whole fix removes.
-        raise LaneReadError(
-            f"lane-status.py exited rc={rc}: "
-            f"{((err or out) or '').strip()[:200] or '(no output)'}")
+        # ⛔ THE FALLBACK IS ON THE *STRIPPED* TEXT, not on the raw string: `err or out` picks
+        # a whitespace-only stderr ("" is falsy, " \n" is TRUTHY), strips it to "" and then
+        # reports `(no output)` while a perfectly good reason sat on stdout. An abort that
+        # cannot say WHY a read failed is the same defect class as one that reported success.
+        _detail = err.strip() or out.strip() or "(no output)"
+        raise LaneReadError(f"lane-status.py exited rc={rc}: {_detail[:200]}")
     if not out.strip().startswith("["):
         raise LaneReadError(
             f"lane-status.py produced non-JSON output on STDOUT (rc={rc}): "
@@ -534,9 +542,11 @@ def claim_next(lane_id: str, queue_file: str):
     if rc is None:
         raise QueueReadError(f"claim.py TIMED OUT reading {queue_file} (rc=None) -- UNKNOWN, not empty")
     if rc != 0:
+        # The same stripped-text fallback as `lanes()`: a blank-but-non-empty stderr must not
+        # hide the reason claim.py put on stdout.
+        _detail = err.strip() or out.strip() or "(no output)"
         raise QueueReadError(
-            f"claim.py exited rc={rc} reading {queue_file}: "
-            f"{((err or out) or '').strip()[:160] or '(no output)'}")
+            f"claim.py exited rc={rc} reading {queue_file}: {_detail[:160]}")
     # ⛔ THE ITEM IS READ FROM STDOUT ONLY (#1876). `claim.py`'s warnings go to stderr, and the
     # old merged read turned a stderr-ONLY line into a QUEUE ITEM -- a fail-open on the one
     # value that decides what a live lane is told to do. A stderr-only write is now what it
@@ -622,6 +632,52 @@ def classify_last_turn(row):
     return None, {"jevic_failed_after": 3, **last}
 
 
+def send_text(out, err):
+    """The PROSE a send verdict is read from: stdout FIRST, then stderr, merged explicitly.
+
+    ⛔ THE ONE PLACE THE STREAMS ARE ALLOWED TO MERGE (#1876), and it is a DIFFERENT SUBJECT
+    from every read that parses structure. `safe-send.sh` / `cmux_dispatch.py` report a
+    verdict in words -- `sent-but-not-consumed`, `not consumed`, a FATAL line -- and those
+    words are what the caller matches; a diagnostic on either stream must still be quotable.
+    Byte order is stdout-then-stderr, which is exactly the old `(p.stdout or "") +
+    (p.stderr or "")`, so no new boundary hazard is introduced.
+
+    NOTHING THAT PARSES JSON/TSV MAY CALL THIS. `lanes()` and `claim_next()` read `out` alone.
+    """
+    return (out or "") + (err or "")
+
+
+SEND_KINDS = ("SENT", "BUSY", "AMBIGUOUS", "FAILED-TO-START", "FAILED")
+
+
+def interpret_send(rc, out, err):
+    """→ `(kind, text)` for one send attempt. kind is one of `SEND_KINDS`; text is the merged prose.
+
+    ⛔ WHY THIS IS A FUNCTION AND NOT FIVE BRANCHES INLINE IN `main()`. The `rc == 4` branch
+    is the difference between KEEPING and RELEASING a claim on a send that may already be
+    sitting in a lane's composer: "sent-but-not-consumed" is AMBIGUOUS (bytes written, no
+    turn confirmed -- keep the claim so the next tick cannot stack a second item on top),
+    while an rc=4 with no such word is a version-check failure that never sent anything
+    (release it). If the stderr merge were dropped at that call site, the verdict word would
+    vanish, an ambiguous send would be classified FAILED-TO-START, the claim would be
+    released and the next tick would send a SECOND item into the same composer -- the exact
+    harm the claim retention exists to prevent, and nothing else in CI would go red.
+    Extracting the decision lets a test drive it with a verdict that arrives ONLY on stderr.
+
+    Side effects stay with the caller: this function only DECIDES.
+    """
+    text = send_text(out, err)
+    if rc == 0:
+        return "SENT", text
+    if rc == 3:
+        return "BUSY", text
+    if rc == 4:
+        # AMBIGUOUS only when the OUTPUT says so. MEASURED 2026-10-01: a python-3.9
+        # version-check exit also surfaced as rc=4 with NO send ever attempted.
+        return ("AMBIGUOUS" if "consum" in text else "FAILED-TO-START"), text
+    return "FAILED", text
+
+
 def send_continue(lane, ws, dry=True):
     """The CONTINUE for a false-idle lane: it stopped with work left. The text is
     turn-classify.py's own NO_PAUSE_NUDGE — the fleet already knows this message —
@@ -658,7 +714,7 @@ def send_continue(lane, ws, dry=True):
     # caller matches. So a diagnostic that lands on safe-send's stderr must still be quotable.
     # The default stays split: narrowing this merge to the two send call sites is what keeps a
     # stray line out of every JSON parse in this file.
-    out = out + err
+    out = send_text(out, err)
     if rc == 0:
         print(f"  CONTINUED {lane} (stopped_with_work_left — resume your own WIP)")
         mark_sent(lane)
@@ -985,31 +1041,26 @@ def main():
         # the fleet sat at 18 idle. Raising the budget does NOT relax the guard: it lets the
         # existing gate ANSWER instead of timing out, so a real refusal still refuses.
         rc, out, err = sh(["bash", SAFE_SEND, ws, lane, brief], timeout=900)
-        # MERGED AT THIS CALL SITE, EXPLICITLY -- the second and last place it is wanted. The
-        # `rc == 4` branch below reads the word "consum" out of this text to tell an ambiguous
-        # send from a version-check failure; a prose verdict on either stream must count.
-        out = out + err
-        if rc == 0:
+        # MERGED INSIDE `interpret_send()` -- the second and last place it is wanted, and now
+        # the only place the rc==4 decision can read a verdict from EITHER stream. The `rc == 4`
+        # branch below turns on the word "consum" to tell an ambiguous send (claim KEPT: the
+        # text may be sitting in the composer) from a version-check failure (claim RELEASED).
+        # `test_a_send_verdict_on_stderr_is_ambiguous_not_a_failed_start` drives that decision
+        # with a verdict that arrives ONLY on stderr, so dropping this merge cannot go
+        # unnoticed (it would release a claim over a possibly-sent item and stack a second).
+        kind, out = interpret_send(rc, out, err)
+        if kind == "SENT":
             print(f"  SENT {lane} <- {item}")
             mark_sent(lane)
             acted += 1
-        elif rc == 3:
+        elif kind == "BUSY":
             # The lane is BUSY, or its state is UNKNOWN (which is NOT idle). Nothing was
             # delivered and nothing should be burned: release the claim so the item stays on
             # the queue, and do not start a cooldown, so the next tick retries it. This is
             # the gate working, not a failure.
             sh(["python3", CLAIM, "free", lane, item.split()[1] if len(item.split()) > 1 else item], timeout=60)
             print(f"  BUSY {lane}: safe-send refused (no positive no-WIP evidence); claim released, will retry")
-        elif rc == 4:
-            # AMBIGUOUS only when the OUTPUT says so. MEASURED 2026-10-01: a python-3.9
-            # version-check exit also surfaced as rc=4 with NO send ever attempted, and
-            # this branch's boilerplate hid the actual error text behind "a human must
-            # inspect the composer". Print the output ALWAYS; the composer story is only
-            # real when 'not consumed' appears in it.
-            if "consum" not in (out or ""):
-                sh(["python3", CLAIM, "free", lane, item.split()[1] if len(item.split()) > 1 else item], timeout=60)
-                print(f"  FAILED-TO-START {lane} <- {item}: rc=4 but no send happened: {out.strip()[:90]} (claim released)")
-                continue
+        elif kind == "AMBIGUOUS":
             # cmux_dispatch reports 'sent-but-not-consumed' — the bytes WERE
             # written but no turn was confirmed, so the text may be sitting in the composer.
             # Do NOT release the claim and do NOT blind-retry: a second send would stack
@@ -1018,6 +1069,15 @@ def main():
             # DIFFERENT item while the first may still be pending, and say so loudly.
             print(f"  AMBIGUOUS {lane} <- {item}: rc=4 sent-but-not-consumed. Claim KEPT, no retry. "
                   f"A human must inspect {lane}'s composer and release the claim deliberately.")
+        elif kind == "FAILED-TO-START":
+            # rc=4 (AMBIGUOUS only when the output says so — the decision is made by
+            # `interpret_send()`). MEASURED 2026-10-01: a python-3.9 version-check exit also
+            # surfaced as rc=4 with NO send ever attempted, and this branch's boilerplate hid
+            # the actual error text behind "a human must inspect the composer". Nothing was
+            # sent, so the claim is released.
+            sh(["python3", CLAIM, "free", lane, item.split()[1] if len(item.split()) > 1 else item], timeout=60)
+            print(f"  FAILED-TO-START {lane} <- {item}: rc={rc} but no send happened: {out.strip()[:90]} (claim released)")
+            continue
         else:
             # A claim without a delivery silently wastes one item of work, so give it back.
             sh(["python3", CLAIM, "free", lane, item.split()[1] if len(item.split()) > 1 else item], timeout=60)
