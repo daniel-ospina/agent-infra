@@ -467,6 +467,11 @@ SURFACE_PATHS = ("tortoise/sdk.py", "tortoise/tool_registry.py",
 # the current head, i.e. `bash scripts/admin-merge.sh <PR>` lands it with zero code work.
 # `rerun-checks` and `resolve-conflict` sit ABOVE `record-review` because a missing check
 # tells you NOTHING and a rebase CHANGES THE HEAD, staling any attestation.
+# ⛔ AND `resolve-conflict` SITS ABOVE EVERY ARM IN `classify_pr` -- including `call-rail`,
+# which is why that one arm order is a refinement of this tuple rather than a transcription of
+# it. A `DIRTY` head is not landable at ANY evidence quality, and a rebase stales the
+# attestation, so the class must name the REBASE (see the arm-0 note). This tuple orders the
+# REPORTING/dispatch priority; it is not a licence for `call-rail` to claim a PR the rail refuses.
 CLASS_ORDER = ("call-rail", "blocked-by-rail", "rerun-checks", "resolve-conflict",
                "record-review", "fix-ci")
 # ⛔ RAIL_GATES MUST TRACK `scripts/admin-merge.sh` -- AND `call-rail` MEANS "THE RAIL WILL
@@ -644,7 +649,11 @@ def touches_surface(p):
 
 
 def classify_pr(pr, cr, att_clean):
-    """The ONE action class for a non-draft PR, FIRST MATCH in CLASS_ORDER, or None if unread.
+    """The ONE action class for a non-draft PR, FIRST MATCH in a stated order, or None if unread.
+
+    The order below is CLASS_ORDER with ONE refinement: `resolve-conflict` is checked FIRST,
+    ahead of `call-rail`, because a `DIRTY` head cannot be landed at ANY evidence quality --
+    see arm 0.
 
     Pure on purpose: `cr` is a check-run list ALREADY READ and `att_clean` the attestation
     verdict, so the classification is testable without touching GitHub. `None` (a miss) is
@@ -668,6 +677,25 @@ def classify_pr(pr, cr, att_clean):
     # head" -- and the head-bound attestation FILE states that authoritatively, so the check-run
     # is only a stale PROXY for `ai-review-gate` and never for the other six.
     nongreen_x = [n for n in nongreen if n != "ai-review-gate"]
+    # 0. resolve-conflict -- GitHub says DIRTY, so THE RAIL WILL REFUSE THIS HEAD whatever the
+    #    checks say, and the work is a REBASE.
+    # ⛔ THIS ARM MUST PRECEDE `call-rail`. It did not, and the resulting class was a lie the
+    #    dispatcher then repeated to a lane: a fully green, CURRENTLY ATTESTED PR whose base had
+    #    moved (head untouched, so nothing stale) read `call-rail`, and the brief for that class
+    #    tells a lane "MERGE #N -- nothing else is needed ... Everything is done except the last
+    #    step" -- while `scripts/admin-merge.sh` refuses exactly that PR (`CONFLICTED`).
+    #    MEASURED 2026-10-16 against this predicate: `DIRTY + 7 green + attested -> call-rail`
+    #    with `rail_block_reason -> None`, because `rail_block_reason` reads CHECKS ONLY and
+    #    cannot see mergeability. It is a NORMAL live shape, not a corner: an attested green PR
+    #    goes DIRTY when its base advances without touching its head -- so no lane was ever told
+    #    to rebase, and the PR sat until something else noticed.
+    #    A rebase CHANGES THE HEAD and stales the attestation, which is the same reason
+    #    `resolve-conflict` already sat above `record-review`. Only a literal `DIRTY` counts:
+    #    `mergeStateStatus` is computed LAZILY and reads UNKNOWN fleet-wide while it recomputes,
+    #    and treating an UNREAD state as a conflict would send every PR to a needless rebase --
+    #    absence is not evidence (see `rail_block_reason`).
+    if (pr.get("mergeStateStatus") or "") == "DIRTY":
+        return "resolve-conflict"
     # 1. call-rail -- every required check EXCEPT `ai-review-gate` is green AND a clean
     #    attestation exists at the CURRENT head AND the RAIL ITSELF would take it. The last
     #    clause was missing: an attested PR the rail refuses is a NAMED defect, not "not ready".
@@ -677,10 +705,7 @@ def classify_pr(pr, cr, att_clean):
     #    `sigpipe-guard` being red cannot reach here: they are not in REQUIRED).
     if not req_seen:
         return "rerun-checks"
-    # 3. resolve-conflict -- GitHub says DIRTY.
-    if (pr.get("mergeStateStatus") or "") == "DIRTY":
-        return "resolve-conflict"
-    # 4. record-review -- every required check EXCEPT `ai-review-gate` is green and there is NO
+    # 3. record-review -- every required check EXCEPT `ai-review-gate` is green and there is NO
     #    current clean attestation at this head. This is the LEGITIMATE case, and it is the exact
     #    complement of arm 1: the ONLY difference between landing a PR and re-recording it is
     #    whether the attestation at THIS head exists, which is why the file -- not the check-run
@@ -688,7 +713,7 @@ def classify_pr(pr, cr, att_clean):
     #    green gate at an old head is evidence about that head, not this one.)
     if not nongreen_x and not att_clean:
         return "record-review"
-    # 5. fix-ci -- any OTHER required check non-green: real code work.
+    # 4. fix-ci -- any OTHER required check non-green: real code work.
     return "fix-ci"
 
 

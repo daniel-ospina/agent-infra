@@ -772,16 +772,38 @@ class TestActionVocabulary:
             == "record-review"
 
     def test_dirty_is_resolve_conflict(self):
-        """A conflicted PR whose checks are not all green -- the normal case."""
+        """A conflicted PR whose checks are not all green -- the normal case, and it stays
+        `resolve-conflict` rather than being read as CI work: the rebase re-runs them anyway."""
         cr = self._cr(red=["python-ci-gate"])
         assert self.o.classify_pr(self._pr(ms="DIRTY"), cr, False) == "resolve-conflict"
+        assert self.o.classify_pr(self._pr(ms="DIRTY"), self._cr(absent=self.REQ), False) \
+            == "resolve-conflict"
 
-    def test_knows_the_one_edge_the_strict_order_creates(self):
-        """PINNED, NOT ENDORSED: `call-rail` is FIRST in CLASS_ORDER, so a PR that is BOTH
-        fully green+attested AND `DIRTY` classifies `call-rail` -- which the rail would then
-        REFUSE on the conflict. The spec fixes the order, so the order is implemented exactly
-        as written; this test exists so the edge is visible rather than discovered in the field."""
-        assert self.o.classify_pr(self._pr(ms="DIRTY"), self._cr(), True) == "call-rail"
+    def test_dirty_green_and_attested_is_resolve_conflict_never_call_rail(self):
+        """⛔ THE DIRECT SHAPE OF #1936, AND `call-rail` MEANS THE RAIL WILL ACCEPT IT.
+
+        Fully green + CURRENTLY attested + `mergeStateStatus=DIRTY` -- an attested green PR
+        whose base moved without touching its head. This is a NORMAL live shape, and it used
+        to classify `call-rail`: a class whose brief tells a lane "MERGE #N -- nothing else is
+        needed" while `scripts/admin-merge.sh` refuses that very PR (`CONFLICTED`), so NO lane
+        was ever told to rebase and the PR sat. `rail_block_reason` reads checks only and
+        returns None here, so the mergeability term has to enter the DECISION, which is why
+        the DIRTY arm sits above arm 1.
+
+        `resolve-conflict`, not `blocked-by-rail`: no rail GATE is proven non-green (the
+        `why` a `blocked-by-rail` token carries would be empty), and the work is a rebase --
+        which is exactly what `scripts/pr-loop.py::decide` says for this class."""
+        k = self.o.classify_pr(self._pr(ms="DIRTY"), self._cr(), True)
+        assert k != "call-rail", k
+        assert k == "resolve-conflict", k
+
+    def test_an_unread_merge_state_is_never_a_conflict(self):
+        """`mergeStateStatus` is computed LAZILY and reads UNKNOWN fleet-wide while GitHub
+        recomputes (measured 2026-10-01: 75 of 82 non-draft PRs). Only a literal DIRTY may
+        move a PR into `resolve-conflict` -- treating an UNREAD state as a conflict would send
+        every PR on the board to a needless rebase, and a rebase stales its attestation."""
+        assert self.o.classify_pr(self._pr(ms="UNKNOWN"), self._cr(), True) == "call-rail"
+        assert self.o.classify_pr(self._pr(ms=""), self._cr(), True) == "call-rail"
 
     def test_non_required_reds_change_nothing(self):
         """`drive`/`sigpipe-guard` are red on main BY DESIGN -- never a bucket."""
