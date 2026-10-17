@@ -393,7 +393,7 @@ secret into a world-readable plist, and launchd inherits no shell environment �
 
 | Var | Value | Why |
 |---|---|---|
-| `MAX_LOAD` | `cores*8` (100 on a 10-core box; sanity ceiling) | dispatch stops above this 1-min load |
+| `MAX_LOAD` | `cores*8` (80 on a 10-core box; sanity ceiling) | dispatch stops above this 1-min load |
 | `MAX_LANES` | `4` | concurrent implementation lanes |
 | `MAX_REVIEW` | `4` | concurrent `merge-<PR>` reviewers |
 | `MERGE_PRIORITY_AT` | `25` | above this many **unowned** open PRs (nothing currently working them — no `fix-`/`merge-` session, no live cross-box claim, no unconsumed `needsfix-*` marker), **merging takes priority**: dispatch of new lanes stops (unless none are running) and reviewer **and fixer** headroom rises to `MAX_REVIEW+2` / `MAX_FIX+2`. It was `10` against the TOTAL open count, which capped the fleet on a healthy queue (measured 2026-10-16: `lanes=1` of 32, 59-86% CPU idle, on a cell logging `merge-priority (20 open PRs — draining)` with 17 of those 20 already `BEHIND`/`DIRTY`) |
