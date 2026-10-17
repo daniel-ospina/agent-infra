@@ -420,6 +420,50 @@ not-checked-out-anywhere semantics:
    marker (the documented prompt contract); the CAP stays active under the
    marker (D3 — the marker never re-enables hub writes).
 
+### A REGISTERED worktree is not hub dirt (#1919)
+
+A lane ran `git worktree add 8779-optA` with a **relative** path, so a
+registered worktree landed *inside* the repo root. git reports it as an
+untracked directory (`?? 8779-optA/`), so the hub read **DIRTY** — and M4 then
+refused **every verb that could fix it**: `worktree move` is not on the recovery
+allowlist, `prune` cannot remove a LIVE worktree, and the sanctioned
+checkout/pull does not delete an untracked directory. A gate closed against its
+own repair; every push in the session was blocked while it held, including
+pushes unrelated to the directory.
+
+Two changes, one on each side of the state's lifetime:
+
+1. **The dirty computation excludes registered worktrees.** `readHubDisorder`
+   (`classify-git.mjs` → `porcelainWithoutRegisteredWorktrees`) drops a
+   `?? ` entry only when it resolves to a path `git worktree list --porcelain`
+   reports as a **linked** worktree of this repo. git owns that path and no hub
+   `add`/`commit` can ever capture it, so it is not dirt. `hub-worktree.sh`
+   `salvage` applies the same rule — it used to `cp -Rf` the live worktree into
+   the salvage branch and then `rm -rf` it out of the hub, destroying a working
+   tree whose uncommitted work nothing else preserved.
+2. **The state is refused at creation.** A `git worktree add|move` whose
+   resolved target lands inside a git checkout **and is not ignored there** is
+   blocked (`nestedWorktreeTargetReason`). The fleet's own layout,
+   `<hub>/.worktrees/<name>`, is gitignored and keeps working —
+   `hub-worktree.sh <branch>` is named as the sanctioned route.
+
+**What is NOT weakened** (both directions are pinned in
+`test-nested-worktree.mjs`, `hub-state-check.test.sh`, `hub-worktree.test.sh`):
+
+- a genuine untracked file still makes the hub dirty and still triggers the M4
+  block;
+- a tracked modification still does (only `?? ` entries are ever excluded);
+- `worktree move` is still **not** a sanctioned recovery op, so a hub that is
+  dirty for any OTHER reason still cannot be talked into relocating a worktree;
+- when `git worktree list` cannot answer, NOTHING is excluded — the hub reads
+  dirty exactly as before (an exclusion that cannot be verified must never turn
+  a dirty hub into a PASS).
+
+Documented residual: an untracked *container* directory that holds a worktree
+**and** other content is reported by git as one collapsed entry (`?? parent/`),
+which is not itself a registered worktree — it still counts as dirt. The
+creation refusal is what keeps that shape from being born.
+
 ### The clean-hub sync allowance is EFFECT-shaped, not verb-shaped (#1144)
 
 When the hub is **clean and on its baseline branch**, the destructive-git block

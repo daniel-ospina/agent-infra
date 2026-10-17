@@ -782,6 +782,61 @@ assert_not_contains "$out" "hub discipline holds" "…not a PASS that depends on
 rm -f "$WBAD/.git"
 printf 'gitdir: %s\n' "$HW/.git/worktrees/wtbad1410" > "$WBAD/.git"
 
+# ── 11. #1919: a worktree nested INSIDE the repo root is not hub dirt ────────
+# A lane ran `git worktree add 8779-optA` with a RELATIVE path, so a registered
+# worktree landed inside the repo root. git reports it as an untracked directory,
+# so the hub read DIRTY — and the M4 hub-state gate then refused every verb that
+# could move it out, while this check told the operator to run `salvage`, which
+# would have copied the LIVE worktree into a branch and then `rm -rf`'d it out of
+# the hub. A registered worktree is git's own state: not dirt.
+# The SAFETY half is asserted too — a genuine untracked file and a tracked
+# modification must still make the hub dirty (only `?? ` entries that ARE
+# registered worktrees are ever excluded).
+echo ""
+echo "== #1919: a registered worktree nested inside the repo root =="
+HN="$FIX/hub1919"
+git init -q -b main "$HN"
+git -C "$HN" config user.email t@t
+git -C "$HN" config user.name t
+printf '.DS_Store\n' > "$HN/.gitignore"   # deliberately does NOT ignore the nested path
+touch "$HN/a.txt"
+git -C "$HN" add .
+git -C "$HN" commit -qm init
+hn_bare="$FIX/hub1919-origin.git"
+git init -q --bare -b main "$hn_bare"
+git -C "$HN" remote add upstream "$hn_bare"
+git -C "$HN" push -qu upstream main
+
+git -C "$HN" worktree add -q "$HN/8779-optA" -b 8779-optA HEAD
+assert_contains "$(git -C "$HN" status --porcelain)" "?? 8779-optA/" \
+  "fixture: git reports the nested worktree as an untracked directory (the false positive's source)"
+out="$(bash "$CHECK" --repo "$HN" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 0 "…and the check still PASSes (a registered worktree is not dirt)"
+assert_contains "$out" "PASS  $HN" "…printing PASS for the nested-worktree hub"
+assert_not_contains "$out" "HUB_DISORDER" "…and no disorder token"
+assert_not_contains "$out" "salvage" "…and no salvage advice (it would destroy the worktree)"
+
+# SAFETY HALF 1: a genuine untracked file still fails, and it is the ONLY entry counted.
+printf 'wip\n' > "$HN/genuine-untracked.txt"
+out="$(bash "$CHECK" --repo "$HN" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "nested worktree + a genuine untracked file → exit 1"
+assert_contains "$out" "HUB_DISORDER=dirty" "…HUB_DISORDER=dirty"
+assert_contains "$out" "porcelain=1" "…counting ONLY the genuine entry, not the worktree"
+rm -f "$HN/genuine-untracked.txt"
+
+# SAFETY HALF 2: tracked dirt counts too — only `?? ` entries are ever excluded.
+printf 'v2\n' >> "$HN/a.txt"
+out="$(bash "$CHECK" --repo "$HN" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "nested worktree + a tracked modification → exit 1"
+assert_contains "$out" "HUB_DISORDER=dirty" "…tracked dirt still fails"
+git -C "$HN" checkout -q -- a.txt
+
+# The fix touched no git state: the worktree is still registered and usable.
+assert_contains "$(git -C "$HN" worktree list --porcelain)" "$HN/8779-optA" \
+  "the nested worktree is still registered (the check changed no git state)"
+out="$(bash "$CHECK" --repo "$HN" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 0 "…and the hub PASSes again once the genuine dirt is gone"
+
 echo ""
 echo "hub-state-check.test.sh: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1

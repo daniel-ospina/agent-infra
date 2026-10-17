@@ -169,6 +169,12 @@ let readHubDisorder: (cwd: string, opts?: { skipWorktree?: boolean }) => { disor
 let evaluateHubGateWithTargets: (command: string, currentBranch: string | null, sessionCwd?: string, checkedOutBranches?: Set<string> | null) => { verdict: "non-git" | "allowed" | "recovery" | "block"; reason?: string; exempted?: boolean } = () => ({ verdict: "non-git" });
 let commandExecutionCwd: (command: string, sessionCwd?: string) => string | null = () => null;
 let resolveTargetTopLevel: (targetPath: string, cwd?: string) => string | null = () => null;
+// #1919: refuse a `git worktree add|move` whose target would land INSIDE a git
+// checkout where git does not ignore it — the state that leaves the hub reading
+// DIRTY forever while M4 refuses every verb that could move the worktree out.
+// Fail-safe default: inert (null) — a failed import must never false-block a
+// legitimate worktree creation.
+let nestedWorktreeTargetViolation: (command: string, sessionCwd?: string) => string | null = () => null;
 // #618/#621: TARGET-aware checkout classification (the shared mechanism both
 // hub-write issues consume). Fail-safe defaults: inert (null/[]) so a failed
 // import NEVER false-blocks — the write gates degrade to today's behavior.
@@ -292,6 +298,11 @@ try {
   if (typeof _m5.wtShellInlinePayloads === "function") wtShellInlinePayloads = _m5.wtShellInlinePayloads;
   if (typeof _m5.joinContinuations === "function") joinContinuations = _m5.joinContinuations;
   if (typeof _m5.ansiTranslate === "function") ansiTranslate = _m5.ansiTranslate;
+  // #1919: read from the namespace for the same reason as #709/#627 above — the
+  // destructuring target list is pinned by test-module-load.mjs Part A.
+  if (typeof _m5.nestedWorktreeTargetViolation === "function") {
+    nestedWorktreeTargetViolation = _m5.nestedWorktreeTargetViolation;
+  }
   hubNewFileVolumeVerdict = _hubNewFileVolumeVerdict;
   HUB_NEW_FILE_WARN_BUDGET = _HUB_NEW_FILE_WARN_BUDGET;
   HUB_NEW_FILE_BLOCK_CAP = _HUB_NEW_FILE_BLOCK_CAP;
@@ -548,6 +559,26 @@ function _hubState(): { disorder: string | null; branch: string | null } {
     return readHubDisorder(resolve(process.cwd()));
   } catch {
     return { disorder: null, branch: null }; // degrade — never false-block
+  }
+}
+
+// #1919 — refuse a `git worktree add|move` whose target lands INSIDE a git
+// checkout where git does not ignore it. The state such a worktree creates is
+// born CLEAN and then reads DIRTY forever: git reports the nested worktree as an
+// untracked directory, M4 freezes every git op, `worktree move` is off the
+// recovery allowlist, and `prune` cannot remove a LIVE worktree — a gate closed
+// against its own repair (the issue's measured refusal). Curing the hubs that
+// already carry the state is `porcelainWithoutRegisteredWorktrees`; this refuses
+// to create new ones. Independent of the hub's OWN state (a clean hub creates it
+// just as well), and like M4 it stays active under the TTL marker — a stranded
+// lane may recover, it may not manufacture the deadlock. The cheap pre-filter
+// keeps every other bash command off the parse.
+function _nestedWorktreeBlock(command: string): string | null {
+  try {
+    if (!command.includes("worktree")) return null;
+    return nestedWorktreeTargetViolation(command, resolve(process.cwd()));
+  } catch {
+    return null; // degrade — never false-block on classifier failure
   }
 }
 
@@ -2745,6 +2776,8 @@ export default function (pi: ExtensionAPI) {
         const execCwd = commandExecutionCwd(command, process.cwd()) ?? undefined;
         const backdoor = _backdoorBlock(command, execCwd);
         if (backdoor) return { block: true, reason: backdoor };
+        const nestedWt = _nestedWorktreeBlock(command);
+        if (nestedWt) return { block: true, reason: nestedWt };
         const st = _hubState();
         // #618/#621: the tracked bash-write gate runs for EVERY non-hatched bash
         // command, resolving each write TARGET's checkout (review fold-in on the
