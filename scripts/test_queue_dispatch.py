@@ -28,7 +28,7 @@ WHAT IS PINNED HERE, and which way each one fails on the PRE-fix file:
     at its own call site, explicitly.
 
 Run:  python3 -m pytest scripts/test_queue_dispatch.py -q
-      python3 scripts/test_queue_dispatch.py          # same tests, no pytest needed
+      python3 scripts/test_queue_dispatch.py         # same, via the pytest runner this file imports
 """
 from __future__ import annotations
 
