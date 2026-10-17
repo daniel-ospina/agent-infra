@@ -100,15 +100,27 @@ fourth state and no silent absence: this table is what makes "deployed" checkabl
 `--verify` is the gate. It fails on:
 
 - no loop, or a `loop.pid` whose pid is **not** `fleet-schedule --loop` (a recycled pid must not
-  read as a running scheduler);
-- a tick older than `max(3 × tick, 300 s)` (the process exists but is not passing);
+  read as a running scheduler — and `--start` REPLACES such a pid rather than reporting it);
+- a tick older than `max(3 × tick, 300 s)` while **no job is running** (the process exists but is
+  not passing). A job that is running announces itself in `state/busy/<label>.json` with an
+  expiring deadline, so a job the templates budget 1800 s for is reported `BUSY`, not `stale` —
+  and the exemption ends with that deadline, so a job killed at its ceiling cannot mask a wedge;
 - a job that is declared and runnable here but has **never run**;
+- a job whose calendar can **never** come due again (no occurrence found within the search window
+  — a `Month`/`Day` calendar searches 400 days, including the entries of a multi-entry
+  `StartCalendarInterval` array);
+- an **empty** declarations dir: a schedule with ZERO jobs is refused (exit 1), never certified as
+  `0 job(s) live`;
 - a job **overdue** by more than `max(2 × its interval, 3 × tick)` (the loop is alive and is not
   running it — e.g. its lock is held by a hung run);
-- a template with no schedule at all, an unknown placeholder, a target **under
-  `<home>/.pi/agent/`** that does not resolve (an incomplete farm), or a label that is in
-  `RETIRED` while its template still exists. A target missing **anywhere else** — a tortoise
-  checkout without its `.venv` — is a named `SKIP`, not a failure.
+- a template with no schedule at all, an unknown placeholder, a `Label` that is not a safe file
+  name (it names that job's stamp, lock and default log, so only letters, digits, `.`, `_` and `-`
+  are accepted), a target **under `<home>/.pi/agent/`** that does not resolve (an incomplete
+  farm), or a label that is in `RETIRED` while its template still exists. A target missing
+  **anywhere else** — a tortoise checkout without its `.venv` — is a named `SKIP`, not a failure.
+  On macOS the whole gate is the delegate's: `install-launchd.sh --status` must exit **0** AND
+  print no `NOT INSTALLED`/`DRIFTED`/`not loaded` line (`--verify` reads its exit status too, so
+  a delegate failure with unfamiliar wording is not certified green).
 
 A `SKIP` is reported and counted, not fatal: no tortoise checkout is a legitimate per-machine
 absence, and refusing the whole layer over it would block a cell that runs every other job. The
@@ -121,13 +133,15 @@ for a named reason`.
 python3 scripts/fleet-schedule.py --install   # converge, run the due jobs NOW, start the loop, verify
 python3 scripts/fleet-schedule.py --status    # the table above
 python3 scripts/fleet-schedule.py --verify    # exit 1 on any arm above
-python3 scripts/fleet-schedule.py --start     # idempotent; clears the OFF switch
-python3 scripts/fleet-schedule.py --stop      # OFF switch + SIGTERM
+python3 scripts/fleet-schedule.py --start     # idempotent; clears the OFF switch, replaces a recycled pid
+python3 scripts/fleet-schedule.py --stop      # OFF switch + SIGTERM (creates the state dir if needed)
 ```
 
 `FLEET_SCHEDULE_TICK` (60 s), `FLEET_SCHEDULE_JOB_TIMEOUT` (1800 s), `FLEET_SCHEDULE_STATE`,
 `TEMPLATES_DIR`, `INFRA_ROOT` override the defaults. A killed job is stamped `rc=124` and logged —
-a hung job must never wedge the loop.
+a hung job must never wedge the loop. One malformed declaration cannot stop the loop either: it is
+reported by name and the pass continues with the rest of the set (`--install`/`--verify` refuse,
+which is where a broken set must be caught).
 
 Exit codes: `0` ok · `1` a broken job set or a schedule that did not verify · **`3` no job
 declarations found** (nothing to read and no remembered pointer). 3 is distinct on purpose: the
