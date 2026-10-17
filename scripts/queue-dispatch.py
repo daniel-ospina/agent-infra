@@ -203,15 +203,44 @@ NEEDS_A_QUESTION = set()
 
 
 def sh(cmd, timeout=90):
+    """Run a command and return `(rc, stdout, stderr)` — ⛔ THE STREAMS STAY APART.
+
+    THE MERGE THAT STOPPED THE DISPATCHER (#1876). This helper used to return
+    `(rc, stdout + stderr)`, and `lanes()` handed that concatenation to `json.loads`.
+    `lane-status.py` writes its `DEGRADED` notice to STDERR on purpose -- its
+    `if LIVE_READABLE is False:` branch in `lanes()`, whose own comment reads "stderr, so stdout
+    stays a parseable fleet read for callers that inspect LIVE_READABLE" (⛔ NAMED, NOT NUMBERED,
+    per this file's rule: the line number a first revision cited had already rotted) -- so the
+    moment the cmux roster read degraded, the notice landed INSIDE the JSON byte stream:
+    `json.loads` raised `Extra data: line N column 1`, `LaneReadError` was raised, and the
+    pass ABORTED without dispatching anything. MEASURED: 259 `ABORT — LANE ROSTER` lines
+    against 284 completed passes (~48% of passes), top reasons `output unparseable: Extra
+    data: line 928 column 1 (char 276xx)` — and that fixed offset IS the end of the JSON,
+    i.e. the line the stderr notice began at.
+
+    BOTH HALVES WERE RIGHT ON THEIR OWN, which is why neither was the bug: writing DEGRADED
+    to stderr is correct (it must be loud), and the fail-closed `LaneReadError` is correct (an
+    unreadable roster must never read as an empty fleet). The ONLY defect is that a READABLE
+    stdout was thrown away because an unrelated line had been glued to it.
+
+    SO: a caller that parses structured output reads `out` and NOTHING ELSE. A caller that
+    genuinely wants a merged read (the cmux send path, whose subject is prose that
+    `safe-send.sh` already folds its own child's stderr into) merges AT ITS OWN CALL SITE,
+    explicitly — never by default here.
+
+    `errors="replace"` STAYS, and it is a different concern from the stream split: it is about
+    INVALID BYTES, not about which stream they arrived on. The cmux send path returns bytes
+    that are not valid UTF-8 (0x80 at position 104, 2026-10-08), and a strict decode raised
+    UnicodeDecodeError out of this function and killed the dispatcher mid-pass.
+
+    ON A TIMEOUT THE REASON GOES TO `err`, and `out` is EMPTY: a killed read has no output,
+    and a caller that reads only stdout must not be able to mistake the kill for a result.
+    """
     try:
-        # errors="replace" is REQUIRED, not cosmetic: the cmux send path returns bytes that are
-        # not valid UTF-8 (measured 0x80 at position 104, 2026-10-08), and a strict decode raised
-        # UnicodeDecodeError out of this function and killed queue-dispatch.py mid-dispatch.
-        # It only changes how an INVALID byte is rendered; a good result is untouched.
         p = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=timeout)
-        return p.returncode, (p.stdout or "") + (p.stderr or "")
+        return p.returncode, (p.stdout or ""), (p.stderr or "")
     except subprocess.TimeoutExpired:
-        return None, "(timeout)"
+        return None, "", "(timeout)"
 
 
 def protected(lane: str) -> bool:
@@ -355,7 +384,7 @@ def lanes(scan_timeout=None):
 
     FAIL-CLOSED. A failed, timed-out, truncated or EMPTY read raises `LaneReadError`; it is
     NEVER returned as an empty list. MEASURED 2026-10-13 (the P0 this fixes): `sh()` returns
-    `(None, "(timeout)")` on `TimeoutExpired`, the old code turned that into `return []`, and
+    `(None, "", "(timeout)")` on `TimeoutExpired`, the old code turned that into `return []`, and
     the pass then printed `lanes READ : 0 / dispatchable: 0 / dispatched 0` and EXITED 0 --
     byte-identical to a healthy empty fleet, while 17 lanes sat idle. `main()` aborts with
     exit 3 (the same polarity `lane-status.py:1670` already uses for an empty roster).
@@ -371,17 +400,41 @@ def lanes(scan_timeout=None):
         _tmo = float(SCAN_TIMEOUT_DEFAULT)
     if not (_tmo > 0) or _tmo == float("inf"):
         _tmo = float(SCAN_TIMEOUT_DEFAULT)
-    rc, out = sh(cmd, timeout=_tmo)
+    rc, out, err = sh(cmd, timeout=_tmo)
+    # ⛔ STDERR IS NEVER PARSED — AND NEVER SWALLOWED EITHER. `lane-status.py` puts its
+    # DEGRADED / REFUSING notices on stderr precisely so stdout stays parseable (its
+    # `if LIVE_READABLE is False:` branch: "stderr, so stdout stays a parseable fleet read for
+    # callers that inspect LIVE_READABLE" — named, not numbered); splitting the streams must
+    # not silence the alarm the split exists to protect. It is re-emitted on OUR stderr, so this
+    # process's own stdout remains a clean summary a caller can read, and the abort reasons
+    # below quote it.
+    # ⛔ AND ONLY WHEN `rc IS NOT None`: on a kill, `err` is THIS FILE'S OWN `"(timeout)"`
+    # sentinel, not lane-status output, so echoing it here printed
+    # `queue-dispatch: lane-status stderr: (timeout)` — attributing our own timeout to the
+    # peer, in the one log line an operator reads when dispatch aborts. `claim_next()` has no
+    # such echo; the abort reason below already says TIMED OUT in full.
+    if rc is not None and err.strip():
+        sys.stderr.write(
+            "queue-dispatch: lane-status stderr: " + err.strip()[:2000] + "\n")
     if rc is None:
         raise LaneReadError(
             f"lane-status.py TIMED OUT after {_tmo}s (rc=None) -- the scan was killed, "
             f"so the roster is UNKNOWN, not empty")
     if rc != 0:
-        raise LaneReadError(
-            f"lane-status.py exited rc={rc}: {(out or '').strip()[:200] or '(no output)'}")
+        # The failure text is on stderr (that is where lane-status.py writes it), so quote
+        # stderr first and fall back to stdout — never `out + err`, which is the merge this
+        # whole fix removes.
+        # ⛔ THE FALLBACK IS ON THE *STRIPPED* TEXT, not on the raw string: `err or out` picks
+        # a whitespace-only stderr ("" is falsy, " \n" is TRUTHY), strips it to "" and then
+        # reports `(no output)` while a perfectly good reason sat on stdout. An abort that
+        # cannot say WHY a read failed is the same defect class as one that reported success.
+        _detail = err.strip() or out.strip() or "(no output)"
+        raise LaneReadError(f"lane-status.py exited rc={rc}: {_detail[:200]}")
     if not out.strip().startswith("["):
         raise LaneReadError(
-            f"lane-status.py produced non-JSON output (rc={rc}): {(out or '').strip()[:200]}")
+            f"lane-status.py produced non-JSON output on STDOUT (rc={rc}): "
+            f"{(out or '').strip()[:200] or '(no stdout)'}"
+            + (f" [stderr: {err.strip()[:200]}]" if err.strip() else ""))
     try:
         rows = json.loads(out)
     except Exception as exc:                                     # noqa: BLE001
@@ -474,7 +527,7 @@ class QueueReadError(RuntimeError):
 
     The SAME polarity as `LaneReadError`, one function down: `claim.py` exits 2 for an
     unreadable/missing queue (`claim.py:70-76`, "a missing queue is UNKNOWN, not empty"), and
-    `sh()` returns `(None, "(timeout)")` on a kill. Collapsing those to `None` made `main()`
+    `sh()` returns `(None, "", "(timeout)")` on a kill. Collapsing those to `None` made `main()`
     print `SKIP <lane>: <queue> has nothing left` and exit 0 -- a failed read spent as an empty
     queue, which is the very defect this file was fixed for. The function's own docstring
     states the violated rule: "An empty result from a queue you did not read is not evidence
@@ -495,14 +548,26 @@ def claim_next(lane_id: str, queue_file: str):
     READ and genuinely answered NONE. A read that failed raises `QueueReadError`.
     """
     path = os.path.join(STATE, queue_file)
-    rc, out = sh(["python3", CLAIM, "next", lane_id, "--queue", path], timeout=60)
+    rc, out, err = sh(["python3", CLAIM, "next", lane_id, "--queue", path], timeout=60)
     if rc is None:
         raise QueueReadError(f"claim.py TIMED OUT reading {queue_file} (rc=None) -- UNKNOWN, not empty")
     if rc != 0:
+        # The same stripped-text fallback as `lanes()`: a blank-but-non-empty stderr must not
+        # hide the reason claim.py put on stdout.
+        _detail = err.strip() or out.strip() or "(no output)"
         raise QueueReadError(
-            f"claim.py exited rc={rc} reading {queue_file}: {(out or '').strip()[:160] or '(no output)'}")
+            f"claim.py exited rc={rc} reading {queue_file}: {_detail[:160]}")
+    # ⛔ THE ITEM IS READ FROM STDOUT ONLY (#1876). `claim.py`'s warnings go to stderr, and the
+    # old merged read turned a stderr-ONLY line into a QUEUE ITEM -- a fail-open on the one
+    # value that decides what a live lane is told to do. A stderr-only write is now what it
+    # is: no stdout, therefore an UNREAD queue, therefore `QueueReadError`.
     if not out.strip():
-        raise QueueReadError(f"claim.py produced no output reading {queue_file} (rc=0) -- UNKNOWN, not empty")
+        raise QueueReadError(
+            f"claim.py produced no output on STDOUT reading {queue_file} (rc=0) -- UNKNOWN, not empty"
+            + (f" [stderr: {err.strip()[:160]}]" if err.strip() else ""))
+    if err.strip():
+        # Not parsed, not swallowed: the diagnostic is loud, one line, and attributable.
+        sys.stderr.write(f"queue-dispatch: claim.py stderr: {err.strip()[:500]}\n")
     first = out.strip().splitlines()[0].strip()
     if not first or first.upper().startswith("NONE"):
         return None, path          # READ, and genuinely empty
@@ -577,6 +642,52 @@ def classify_last_turn(row):
     return None, {"jevic_failed_after": 3, **last}
 
 
+def send_text(out, err):
+    """The PROSE a send verdict is read from: stdout FIRST, then stderr, merged explicitly.
+
+    ⛔ THE ONE PLACE THE STREAMS ARE ALLOWED TO MERGE (#1876), and it is a DIFFERENT SUBJECT
+    from every read that parses structure. `safe-send.sh` / `cmux_dispatch.py` report a
+    verdict in words -- `sent-but-not-consumed`, `not consumed`, a FATAL line -- and those
+    words are what the caller matches; a diagnostic on either stream must still be quotable.
+    Byte order is stdout-then-stderr, which is exactly the old `(p.stdout or "") +
+    (p.stderr or "")`, so no new boundary hazard is introduced.
+
+    NOTHING THAT PARSES JSON/TSV MAY CALL THIS. `lanes()` and `claim_next()` read `out` alone.
+    """
+    return (out or "") + (err or "")
+
+
+SEND_KINDS = ("SENT", "BUSY", "AMBIGUOUS", "FAILED-TO-START", "FAILED")
+
+
+def interpret_send(rc, out, err):
+    """→ `(kind, text)` for one send attempt. kind is one of `SEND_KINDS`; text is the merged prose.
+
+    ⛔ WHY THIS IS A FUNCTION AND NOT FIVE BRANCHES INLINE IN `main()`. The `rc == 4` branch
+    is the difference between KEEPING and RELEASING a claim on a send that may already be
+    sitting in a lane's composer: "sent-but-not-consumed" is AMBIGUOUS (bytes written, no
+    turn confirmed -- keep the claim so the next tick cannot stack a second item on top),
+    while an rc=4 with no such word is a version-check failure that never sent anything
+    (release it). If the stderr merge were dropped at that call site, the verdict word would
+    vanish, an ambiguous send would be classified FAILED-TO-START, the claim would be
+    released and the next tick would send a SECOND item into the same composer -- the exact
+    harm the claim retention exists to prevent, and nothing else in CI would go red.
+    Extracting the decision lets a test drive it with a verdict that arrives ONLY on stderr.
+
+    Side effects stay with the caller: this function only DECIDES.
+    """
+    text = send_text(out, err)
+    if rc == 0:
+        return "SENT", text
+    if rc == 3:
+        return "BUSY", text
+    if rc == 4:
+        # AMBIGUOUS only when the OUTPUT says so. MEASURED 2026-10-01: a python-3.9
+        # version-check exit also surfaced as rc=4 with NO send ever attempted.
+        return ("AMBIGUOUS" if "consum" in text else "FAILED-TO-START"), text
+    return "FAILED", text
+
+
 def send_continue(lane, ws, dry=True):
     """The CONTINUE for a false-idle lane: it stopped with work left. The text is
     turn-classify.py's own NO_PAUSE_NUDGE — the fleet already knows this message —
@@ -606,7 +717,14 @@ def send_continue(lane, ws, dry=True):
     # silently belonged to the dry branch and was unreachable; every `--apply` pass then died
     # with `UnboundLocalError: rc` -- the dispatcher crashed on EVERY cycle for 20 minutes and
     # fed nobody while the fleet sat idle. A no-op in a dry run must not be a crash in apply.
-    rc, out = sh(["bash", SAFE_SEND, ws, lane, brief], timeout=900)
+    rc, out, err = sh(["bash", SAFE_SEND, ws, lane, brief], timeout=900)
+    # ⛔ MERGED HERE, AT THIS CALL SITE, EXPLICITLY (#1876 item 2) -- and only here. The send
+    # path's subject is PROSE, not structure: `safe-send.sh` already folds its own child's
+    # stderr into the lines it prints, and its verdict words ("not consumed") are what the
+    # caller matches. So a diagnostic that lands on safe-send's stderr must still be quotable.
+    # The default stays split: narrowing this merge to the two send call sites is what keeps a
+    # stray line out of every JSON parse in this file.
+    out = send_text(out, err)
     if rc == 0:
         print(f"  CONTINUED {lane} (stopped_with_work_left — resume your own WIP)")
         mark_sent(lane)
@@ -933,28 +1051,27 @@ def main():
         # (5&9 MCP and SDK surface, 8 Hosted reliability) were lost to this in one pass while
         # the fleet sat at 18 idle. Raising the budget does NOT relax the guard: it lets the
         # existing gate ANSWER instead of timing out, so a real refusal still refuses.
-        rc, out = sh(["bash", SAFE_SEND, ws, lane, brief], timeout=900)
-        if rc == 0:
+        rc, out, err = sh(["bash", SAFE_SEND, ws, lane, brief], timeout=900)
+        # MERGED INSIDE `interpret_send()` -- the second and last place it is wanted, and now
+        # the only place the rc==4 decision can read a verdict from EITHER stream. The `rc == 4`
+        # branch below turns on the word "consum" to tell an ambiguous send (claim KEPT: the
+        # text may be sitting in the composer) from a version-check failure (claim RELEASED).
+        # `test_a_send_verdict_on_stderr_is_ambiguous_not_a_failed_start` drives that decision
+        # with a verdict that arrives ONLY on stderr, so dropping this merge cannot go
+        # unnoticed (it would release a claim over a possibly-sent item and stack a second).
+        kind, out = interpret_send(rc, out, err)
+        if kind == "SENT":
             print(f"  SENT {lane} <- {item}")
             mark_sent(lane)
             acted += 1
-        elif rc == 3:
+        elif kind == "BUSY":
             # The lane is BUSY, or its state is UNKNOWN (which is NOT idle). Nothing was
             # delivered and nothing should be burned: release the claim so the item stays on
             # the queue, and do not start a cooldown, so the next tick retries it. This is
             # the gate working, not a failure.
             sh(["python3", CLAIM, "free", lane, item.split()[1] if len(item.split()) > 1 else item], timeout=60)
             print(f"  BUSY {lane}: safe-send refused (no positive no-WIP evidence); claim released, will retry")
-        elif rc == 4:
-            # AMBIGUOUS only when the OUTPUT says so. MEASURED 2026-10-01: a python-3.9
-            # version-check exit also surfaced as rc=4 with NO send ever attempted, and
-            # this branch's boilerplate hid the actual error text behind "a human must
-            # inspect the composer". Print the output ALWAYS; the composer story is only
-            # real when 'not consumed' appears in it.
-            if "consum" not in (out or ""):
-                sh(["python3", CLAIM, "free", lane, item.split()[1] if len(item.split()) > 1 else item], timeout=60)
-                print(f"  FAILED-TO-START {lane} <- {item}: rc=4 but no send happened: {out.strip()[:90]} (claim released)")
-                continue
+        elif kind == "AMBIGUOUS":
             # cmux_dispatch reports 'sent-but-not-consumed' — the bytes WERE
             # written but no turn was confirmed, so the text may be sitting in the composer.
             # Do NOT release the claim and do NOT blind-retry: a second send would stack
@@ -963,6 +1080,15 @@ def main():
             # DIFFERENT item while the first may still be pending, and say so loudly.
             print(f"  AMBIGUOUS {lane} <- {item}: rc=4 sent-but-not-consumed. Claim KEPT, no retry. "
                   f"A human must inspect {lane}'s composer and release the claim deliberately.")
+        elif kind == "FAILED-TO-START":
+            # rc=4 (AMBIGUOUS only when the output says so — the decision is made by
+            # `interpret_send()`). MEASURED 2026-10-01: a python-3.9 version-check exit also
+            # surfaced as rc=4 with NO send ever attempted, and this branch's boilerplate hid
+            # the actual error text behind "a human must inspect the composer". Nothing was
+            # sent, so the claim is released.
+            sh(["python3", CLAIM, "free", lane, item.split()[1] if len(item.split()) > 1 else item], timeout=60)
+            print(f"  FAILED-TO-START {lane} <- {item}: rc={rc} but no send happened: {out.strip()[:90]} (claim released)")
+            continue
         else:
             # A claim without a delivery silently wastes one item of work, so give it back.
             sh(["python3", CLAIM, "free", lane, item.split()[1] if len(item.split()) > 1 else item], timeout=60)
