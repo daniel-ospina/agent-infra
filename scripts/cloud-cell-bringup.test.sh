@@ -55,9 +55,28 @@ skip() { SKIP=$((SKIP + 1)); echo "  ⏭ SKIPPED — $1"; }
 say_case() { echo; echo "── $1 ──"; }
 
 T="$(mktemp -d "${TMPDIR:-/tmp}/cloud-cell-1718.XXXXXX")"
+# The scheduled layer (agent-infra#1864) runs the declarations it is pointed at, so it is pointed at
+# a HERMETIC fixture here: without TEMPLATES_DIR the shipped templates would run the REAL reapers
+# (pi-reap-idle.sh is armed with REAP_DRY_RUN=0) against this host, which is not a test. The loop is
+# stopped on the way out — a detached loop outlives the suite otherwise and keeps ticking at a
+# deleted directory.
+export TEMPLATES_DIR="$T/schedule-templates"
+mkdir -p "$TEMPLATES_DIR"
+printf '# fixture: nothing retired\n' > "$TEMPLATES_DIR/RETIRED"
+cat > "$TEMPLATES_DIR/com.test.bringup-schedule.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.test.bringup-schedule</string>
+    <key>ProgramArguments</key>
+    <array><string>/bin/sh</string><string>-c</string><string>echo ran >> "$T/schedule-marker"</string></array>
+    <key>StartInterval</key><integer>3600</integer>
+</dict>
+</plist>
+PLIST
 # `chmod -R u+w` first: one case makes a parent directory unwritable to force `rm -f` to fail, and
 # the suite must still be able to clean up after itself.
-trap 'chmod -R u+w "$T" 2>/dev/null; rm -rf "$T"' EXIT
+trap 'HOME="$T/home" CELL_HOME="$T/home" TEMPLATES_DIR="$T/schedule-templates" python3 "$HERE/fleet-schedule.py" --stop >/dev/null 2>&1; chmod -R u+w "$T" 2>/dev/null; rm -rf "$T"' EXIT
 
 if [ -f "$BRINGUP" ]; then ok "shipped script present: cloud-cell-bringup.sh"
 else bad "missing $BRINGUP"; echo; echo "  PASS=$PASS FAIL=$FAIL"; exit 1; fi
@@ -170,6 +189,69 @@ case "$BR_OUT" in
 esac
 [ ! -e "$TOK" ] && ok "the token is removed on the second run too" \
                 || bad "token file SURVIVED the second clean run"
+
+# ── 2c) the SCHEDULED layer (#1864): a cell that comes up has jobs that RUN ──────────────────────
+# The measured defect was a whole layer that never reached the cells (10 plists, 0 live) and no
+# instrument that said so. The acceptance is therefore a RUN, not a loaded unit or a present file:
+# a stamp with an rc plus a fresh log line, produced by the job itself.
+say_case "the scheduled layer is installed AND proven by a run (#1864)"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+# Make the fixture job DUE again: it already ran on the earlier clean runs and its interval is an
+# hour, so without clearing the stamp this case would assert on a job that had nothing to do — and
+# pass for the wrong reason. (A never-run job is due immediately, which is the same path a fresh
+# cell takes.)
+rm -f "$T/schedule-marker" \
+      "$T/home/.pi/agent/state/fleet-schedule/jobs/com.test.bringup-schedule.json"
+br ok normal --check
+[ "$BR_RC" -eq 0 ] && ok "bring-up still exits 0 with the scheduled layer" \
+                   || bad "bring-up FAILED on the scheduled layer (rc=$BR_RC): $BR_OUT"
+case "$BR_OUT" in
+  *"scheduled layer live: SCHEDULE VERIFIED"*) ok "it reports the scheduler's own verified verdict" ;;
+  *) bad "no verified schedule verdict in the bring-up output — output: $BR_OUT" ;;
+esac
+[ -f "$T/schedule-marker" ] && ok "the declared job actually RAN during bring-up (its own marker exists)" \
+                            || bad "no job ran — 'scheduled' would be believed, not proven"
+log="$T/home/.pi/agent/state/fleet-schedule/logs/com.test.bringup-schedule.log"
+grep -q 'fleet-schedule run com.test.bringup-schedule start' "$log" 2>/dev/null \
+  && ok "the run left a fresh log line at $log" || bad "no run log line at $log"
+[ ! -e "$TOK" ] && ok "the token is still removed on this path" || bad "token SURVIVED the scheduled-layer run"
+
+# ── 2d) a scheduled layer that cannot be honoured REFUSES the cell ──────────────────────────────
+# A "CELL READY" over a cell with no reaping/liveness/canary is the false PASS this whole script
+# exists to remove, so a broken declaration must be fatal. The broken job's target does not exist —
+# the same rule install-launchd.sh applies to a plist ("a dead job must never be installed").
+say_case "a broken job declaration refuses the cell (no false CELL READY)"
+BROKENDIR="$T/schedule-broken"
+mkdir -p "$BROKENDIR"
+printf '# fixture: nothing retired\n' > "$BROKENDIR/RETIRED"
+cat > "$BROKENDIR/com.test.broken.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.test.broken</string>
+    <key>ProgramArguments</key>
+    <array><string>/bin/sh</string><string>{{HOME}}/.pi/agent/scripts/cell-bringup-1864-missing.sh</string></array>
+    <key>StartInterval</key><integer>3600</integer>
+</dict>
+</plist>
+PLIST
+printf '%s\n' "$TOK_BODY" > "$TOK"
+BR_OUT="$(PATH="$STUB:$PATH" \
+          CELL_HOME="$T/home" WORKDIR="$T/cell" ENV_FILE="$T/keys.env" \
+          GH_TOKEN_FILE="$TOK" CURL_STUB_MODE=normal TEMPLATES_DIR="$BROKENDIR" \
+          REPO_SLUG="daniel-ospina/tortoise" \
+          bash "$BRINGUP" --check 2>&1)"
+BR_RC=$?
+[ "$BR_RC" -ne 0 ] && ok "bring-up exits non-zero ($BR_RC) on an unhonourable job set" \
+                   || bad "bring-up returned 0 over a job set it could not schedule"
+case "$BR_OUT" in
+  *"broken target"*) ok "the failure names the broken target" ;;
+  *) bad "the failure is not diagnosable — output: $BR_OUT" ;;
+esac
+case "$BR_OUT" in
+  *"CELL READY"*) bad "CLAIMED readiness with no working scheduled layer" ;;
+  *) ok "never claims CELL READY with a broken schedule" ;;
+esac
 
 # ── 3) an abort BEFORE check_gh is reached — the window the pre-fix code left open ───────────────
 # The removal used to live INSIDE check_gh, and there was no trap, so a failure in check_tools or
