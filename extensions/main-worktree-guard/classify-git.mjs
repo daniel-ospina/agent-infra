@@ -5169,10 +5169,37 @@ const WORKTREE_LOCAL_VERBS = new Set([
   "merge", "rebase", "cherry-pick", "revert", "clean", "apply", "am", "pull",
 ]);
 
-function _mainProtectionReason(inv, ...notes) {
+/** #1125 — name the checkout the M4 block is ABOUT, and echo the RESOLVED
+ *  condition that tripped it. `"the shared main checkout"` is ambiguous on a
+ *  machine carrying several checkouts: it sent two agents to the WRONG
+ *  repository for ~40 minutes and produced a destructive-command request
+ *  against a healthy repo, because the disorder was in a DIFFERENT checkout
+ *  the message never named (the correct diagnosis was 5 dirty files in the
+ *  session's own checkout). One read must be enough to tell WHICH checkout and
+ *  WHY. Empty when no context was supplied — the 2-arg `evaluateHubGate`
+ *  test surface has no resolved checkout to name.
+ * @param {{path?: string|null, disorder?: string|null, branch?: string|null, dirtyPaths?: number}|null} [hubContext]
+ * @returns {string[]}
+ */
+function _m4CheckoutLines(hubContext) {
+  const path = hubContext?.path;
+  if (!path) return [];
+  const bits = [];
+  if (hubContext.disorder === "off_main" || hubContext.disorder === "both") {
+    bits.push(`off-main: ${hubContext.branch ?? "<detached>"}`);
+  }
+  if (hubContext.disorder === "dirty" || hubContext.disorder === "both") {
+    const n = hubContext.dirtyPaths;
+    bits.push(`dirty: ${typeof n === "number" ? n : "?"} path(s)`);
+  }
+  return [`   Checkout: ${path}${bits.length > 0 ? ` (${bits.join(", ")})` : ""}`];
+}
+
+function _mainProtectionReason(inv, hubContext, ...notes) {
   const note = notes.join(" "); // round-21 (P2): variadic — 7 call sites pass TWO literals
   return [
     `⛔ Hub-state gate (M4): the shared main checkout is OFF-MAIN or DIRTY (#1484).`,
+    ..._m4CheckoutLines(hubContext),
     `   Blocked: \`git ${inv.verb} ${inv.args.join(" ")}\``,
     `   ${note}`,
     `   → Terminal recovery: cd <repo> && git checkout main && git pull --ff-only`,
@@ -5477,9 +5504,10 @@ function _recoveryCheckoutVerifiable(gitDir, branch, inv) {
 
 /** Shared block-reason for the recovery-checkout hardening (#397) — loud +
  * actionable (fail loudly, never move the wrong branch). */
-function _recoveryCheckoutBlockReason(inv, branch) {
+function _recoveryCheckoutBlockReason(inv, branch, hubContext = null) {
   return [
     `⛔ Hub-state gate (M4): the shared main checkout is OFF-MAIN or DIRTY (#1484).`,
+    ..._m4CheckoutLines(hubContext),
     `   Blocked: \`git ${inv.verb} ${branch}\` — no branch "${branch}" exists in the target`,
     `   repo (no refs/heads/${branch}, no unique remote-tracking DWIM source; a tag named`,
     `   "${branch}" would check out DETACHED, not the branch).`,
@@ -5691,7 +5719,7 @@ function _unverifiableGitContent(command, execCwd = process.cwd()) {
  * force-create (-B/-C/--force-create) with a positional target is `git branch
  * -f` in disguise — a SHARED-ref move, not worktree-local (`branch -f` and
  * `update-ref` are already blocked). Returns a block reason or null. */
-function _worktreeCheckoutBlock(inv, target, currentBranch) {
+function _worktreeCheckoutBlock(inv, target, currentBranch, hubContext = null) {
   const args = inv.args || [];
   const pos = args.filter((x) => !x.startsWith("-"));
   // Round-21 (final gate P1): attached short-option args (`-Cmain` ≡ `-C
@@ -5701,17 +5729,17 @@ function _worktreeCheckoutBlock(inv, target, currentBranch) {
   // bare `-B`/`-C` is malformed anyway — blocking is harmless).
   const hasForceMove = args.some((x) => x === "-B" || x === "-C" || x === "--force-create" || x.startsWith("--force-create=") || /^-[BC][^-]/.test(x));
   if (hasForceMove) {
-    return _mainProtectionReason(inv,
+    return _mainProtectionReason(inv, hubContext,
       `force-create checkout/switch moves a SHARED branch ref (≡ git branch -f) — not worktree-local.`);
   }
   if (pos.length >= 1 && (pos[0] === "main" || pos[0] === "master") &&
       currentBranch !== "main" && currentBranch !== "master") {
-    return _mainProtectionReason(inv,
+    return _mainProtectionReason(inv, hubContext,
       `checkout/switch of the hub's protected branch "${pos[0]}" from a worktree while the hub`,
       `is off-main — the wt would take it and its commits/pushes would mutate it.`);
   }
   if (target.worktreeBranch === "main" || target.worktreeBranch === "master") {
-    return _mainProtectionReason(inv,
+    return _mainProtectionReason(inv, hubContext,
       `The worktree is checked out on the hub's protected branch "${target.worktreeBranch}" —`,
       `its mutations would advance the shared main ref.`);
   }
@@ -5734,8 +5762,12 @@ function _worktreeCheckoutBlock(inv, target, currentBranch) {
  * @param {string|null} currentBranch — hub's checked-out branch (push carve-out)
  * @param {string} [sessionCwd] — session root; the worktree MAP is derived here
  *   (M4 only fires when session cwd IS the hub).
+ * @param {Set<string>|null} [checkedOutBranches]
+ * @param {{path?: string|null, disorder?: string|null, branch?: string|null, dirtyPaths?: number}|null} [hubContext]
+ *   — the resolved disordered checkout, so every block reason can NAME it
+ *   (#1125). Omitted/absent → no `Checkout:` line (2-arg callers unchanged).
  */
-export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = process.cwd(), checkedOutBranches = null) {
+export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = process.cwd(), checkedOutBranches = null, hubContext = null) {
   const invocations = allGitInvocations(command);
   // Round-5/6 (second-model P1): eval / $( ) / backtick / alias / function
   // command substitution is an UNVERIFIABLE one-token shell construct — the
@@ -5748,6 +5780,7 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
       verdict: "block",
       reason: [
         `⛔ Hub-state gate (M4): the shared main checkout is OFF-MAIN or DIRTY (#1484).`,
+        ..._m4CheckoutLines(hubContext),
         `   Blocked: command substitution / eval / alias indirection with git content — the`,
         `   substituted invocation cannot be verified per-invocation (fail-closed).`,
         `   → Terminal recovery: cd <repo> && git checkout main && git pull --ff-only`,
@@ -5765,6 +5798,7 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
         verdict: "block", exempted: false,
         reason: [
           `⛔ Hub-state gate (M4): the shared main checkout is OFF-MAIN or DIRTY (#1484).`,
+          ..._m4CheckoutLines(hubContext),
           `   Blocked: unverifiable \$VAR command expansion (multiword git value) —`,
           `   the expanded invocation cannot be classified per-invocation (fail-closed).`,
           `   → Terminal recovery: cd <repo> && git checkout main && git pull --ff-only`,
@@ -5795,7 +5829,7 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
           if (!_recoveryCheckoutVerifiable(target.gitDir, pos[0], inv)) {
             return {
               verdict: "block", exempted: false,
-              reason: _recoveryCheckoutBlockReason(inv, pos[0]),
+              reason: _recoveryCheckoutBlockReason(inv, pos[0], hubContext),
             };
           }
           // Main-protection guards the SESSION hub's protected branch. A
@@ -5809,7 +5843,7 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
               target.worktreeBranch !== "main" && target.worktreeBranch !== "master") {
             return {
               verdict: "block", exempted: false, // audit must NOT log blocked ops (round-4)
-              reason: _mainProtectionReason(inv,
+              reason: _mainProtectionReason(inv, hubContext,
                 `Worktree checkout of the hub's protected branch "${pos[0]}" while the hub is`,
                 `off-main — the wt would take "${pos[0]}" and its commits/pushes would mutate it.`),
             };
@@ -5846,7 +5880,7 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
               _pushRemoteIsSessionHub(inv, target, sessionCwd)) {
             return {
               verdict: "block", exempted: false,
-              reason: _mainProtectionReason(inv,
+              reason: _mainProtectionReason(inv, hubContext,
                 `push/fetch from a foreign worktree targeting the SESSION HUB via a local`,
                 `path — not isolated (the hub's own refs are at stake).`),
             };
@@ -5862,7 +5896,7 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
                 !_recoveryCheckoutVerifiable(target.gitDir, pos[0], inv)) {
               return {
                 verdict: "block", exempted: false,
-                reason: _recoveryCheckoutBlockReason(inv, pos[0]),
+                reason: _recoveryCheckoutBlockReason(inv, pos[0], hubContext),
               };
             }
           }
@@ -5877,7 +5911,7 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
             if (x.includes(":") && (_refspecDst(x) === "main" || _refspecDst(x) === "master")) {
               return {
                 verdict: "block", exempted: false,
-                reason: _mainProtectionReason(inv,
+                reason: _mainProtectionReason(inv, hubContext,
                   `pull/fetch refspec dst writes the hub's protected branch — not isolated.`),
               };
             }
@@ -5889,7 +5923,7 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
         // applies to NON-main force-create targets (`checkout -B feat/other`
         // moved refs/heads/feat/other — probe) and to the SCRIPT surface.
         if (inv.verb === "checkout" || inv.verb === "switch") {
-          const cb = _worktreeCheckoutBlock(inv, target, currentBranch);
+          const cb = _worktreeCheckoutBlock(inv, target, currentBranch, hubContext);
           if (cb) return { verdict: "block", exempted: false, reason: cb };
         }
         // Main-protection (round-3 P1): a worktree on the hub's protected branch
@@ -5897,7 +5931,7 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
         if (target.worktreeBranch === "main" || target.worktreeBranch === "master") {
           return {
             verdict: "block", exempted: false, // audit must NOT log blocked ops (round-3/4)
-            reason: _mainProtectionReason(inv,
+            reason: _mainProtectionReason(inv, hubContext,
               `The worktree is checked out on the hub's protected branch "${target.worktreeBranch}" —`,
               `its mutations would advance the shared main ref.`),
           };
@@ -5911,7 +5945,7 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
           if (pos.length >= 1 && (pos[0] === "main" || pos[0] === "master")) {
             return {
               verdict: "block", exempted: false,
-              reason: _mainProtectionReason(inv,
+              reason: _mainProtectionReason(inv, hubContext,
                 `Worktree checkout targeting the hub's protected branch "${pos[0]}" while the hub`,
                 `is off-main — the wt would take "${pos[0]}" and its commits/pushes would mutate it.`),
             };
@@ -5924,7 +5958,7 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
           if (inv.verb === "symbolic-ref") {
             return {
               verdict: "block", exempted: false,
-              reason: _mainProtectionReason(inv,
+              reason: _mainProtectionReason(inv, hubContext,
                 `symbolic-ref from a worktree target rewrites a shared ref — not isolated.`),
             };
           }
@@ -5935,7 +5969,7 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
           if (wv === "block") {
             return {
               verdict: "block", exempted: false, // audit must NOT log blocked ops as exemptions (round-3)
-              reason: _mainProtectionReason(inv,
+              reason: _mainProtectionReason(inv, hubContext,
                 `Shared-ref/remote/unknown mutation from a worktree target — worktrees share`,
                 `the hub's ref namespace. Sanctioned: git push origin <the worktree's branch>.`),
             };
@@ -5961,6 +5995,7 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
         verdict: "block",
         reason: [
           `⛔ Hub-state gate (M4): the shared main checkout is OFF-MAIN or DIRTY (#1484).`,
+          ..._m4CheckoutLines(hubContext),
           `   Blocked: \`git ${inv.verb} ${inv.args.join(" ")}\``,
           `   Sanctioned recovery ops only: git checkout main|master, git pull`,
           `   --ff-only, git fetch, git status, git log, git worktree`,
@@ -5987,7 +6022,7 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
         if (target.foreignWorktree && _pushRemoteIsSessionHub(inv, target, sessionCwd)) {
           return {
             verdict: "block", exempted: false,
-            reason: _mainProtectionReason(inv,
+            reason: _mainProtectionReason(inv, hubContext,
               `push from a foreign worktree targeting the SESSION HUB via a local`,
               `path — not isolated (the hub's own refs are at stake).`),
           };
@@ -5999,7 +6034,7 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
           if (target.worktreeBranch === "main" || target.worktreeBranch === "master") {
             return {
               verdict: "block", exempted: false,
-              reason: _mainProtectionReason(inv,
+              reason: _mainProtectionReason(inv, hubContext,
                 `push from a worktree on the hub's protected branch "${target.worktreeBranch}" —`,
                 `would advance the shared main ref.`),
             };
@@ -6007,7 +6042,7 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
           if (isHubRecoveryInvocation(inv.verb, inv.args, target.worktreeBranch) === "block") {
             return {
               verdict: "block", exempted: false,
-              reason: _mainProtectionReason(inv,
+              reason: _mainProtectionReason(inv, hubContext,
                 `push from a worktree target of a branch other than the worktree's own — not isolated.`),
             };
           }
@@ -6028,7 +6063,7 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
       if (target && target.isWorktree && !target.foreignWorktree) {
         return {
           verdict: "block", exempted: false,
-          reason: _mainProtectionReason(inv,
+          reason: _mainProtectionReason(inv, hubContext,
             `symbolic-ref from a worktree target rewrites a shared ref — not isolated.`),
         };
       }
@@ -8275,7 +8310,7 @@ export function readHubDisorder(cwd, { skipWorktree = true } = {}) {
     // test is STRUCTURAL (gitdir vs commondir realpaths) — the old
     // path-substring test misread a main checkout whose own path contains a
     // `worktrees` segment as a worktree and silently skipped its disorder.
-    if (gitCheckoutIsLinkedWorktree(cwd)) return { disorder: null, branch: null };
+    if (gitCheckoutIsLinkedWorktree(cwd)) return { disorder: null, branch: null, path: null, dirtyPaths: 0 };
     const branch = execSync("git branch --show-current", {
       encoding: "utf-8", cwd, timeout: 5000,
     }).trim() || null;
@@ -8284,11 +8319,27 @@ export function readHubDisorder(cwd, { skipWorktree = true } = {}) {
     }).trim();
     const onMain = branch === "main" || branch === "master";
     const dirty = porcelain.length > 0;
-    if (onMain && !dirty) return { disorder: null, branch };
+    // #1125 — the block message must be able to NAME the checkout and echo the
+    // RESOLVED condition. `"the shared main checkout"` alone was ambiguous
+    // across several checkouts and sent readers to the wrong repository; a
+    // block reason that cannot name its own subject is a misdiagnosis waiting
+    // to happen. Additive fields, so existing `.disorder`/`.branch` callers are
+    // unaffected; both probes are best-effort (a failure only drops the
+    // context line, never the verdict). Computed ONLY when disordered — a
+    // clean main checkout never produces an M4 block, so the hot path keeps its
+    // existing two probes.
+    if (onMain && !dirty) return { disorder: null, branch, path: null, dirtyPaths: 0 };
+    let path = null;
+    try {
+      path = resolve(execSync("git rev-parse --show-toplevel", {
+        encoding: "utf-8", cwd, timeout: 5000,
+      }).trim());
+    } catch { /* context line dropped — the gate still decides */ }
+    const dirtyPaths = dirty ? porcelain.split("\n").filter((l) => l.length > 0).length : 0;
     const disorder = !onMain && dirty ? "both" : onMain ? "dirty" : "off_main";
-    return { disorder, branch };
+    return { disorder, branch, path, dirtyPaths };
   } catch {
-    return { disorder: null, branch: null }; // degrade — never false-block on git errors
+    return { disorder: null, branch: null, path: null, dirtyPaths: 0 }; // degrade — never false-block on git errors
   }
 }
 
