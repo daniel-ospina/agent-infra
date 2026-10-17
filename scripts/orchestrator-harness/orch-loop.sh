@@ -19,6 +19,24 @@ export AGENT_SKIP_REVIEW_GATE=1 ELDATO_SKIP_VGATE=1
 
 MAX_FIX="${MAX_FIX:-3}"
 MAX_FIX_TRIES="${MAX_FIX_TRIES:-3}"
+# ⛔ ONE COUNTER CANNOT BE BOTH BOUNDS, SO THE FIXER CAP IS TWO BOUNDS (agent-infra#1848).
+# A per-PR counter parks a revision that never had an attempt (the measured defect: #8370/#8443 had
+# `fixcount=3` from an old head and were parked at the new head with ZERO attempts there). A
+# PER-REVISION counter alone installs the opposite defect, and the reviewer reproduced it: the only
+# actor that changes a PR's head in this harness is the FIXER ITSELF (`fix-one.sh` commits and
+# pushes; the controller books the attempt at spawn), so `[ "$NFC" -ge "$MAX_FIX_TRIES" ]` can only
+# fire after N attempts with NO intervening commit — a fixer that keeps pushing re-arms its own cap
+# every cycle and never parks, re-opening the failure the terminal park exists to prevent (an
+# unfixable PR "burned a full fresh-context review every cycle, forever").
+# So: a per-REVISION budget (MAX_FIX_TRIES) for fairness to a head produced by something other than
+# the fixer (a rebase, a main integration, a human push), AND a CUMULATIVE per-PR budget of
+# 2 x MAX_FIX_TRIES that a self-pushing fixer cannot outrun. Park when EITHER is exhausted; the log
+# and the park reason name WHICH one fired, with numbers.
+# ⛔ THE CUMULATIVE CAP IS DERIVED, NOT A KNOB. Every other limit here is plist-supplied and carries
+# an `is_limit` guard plus a documented default (selftest pins the coercion count and README §4's
+# values); a 15th knob would need its own guard, its own pin and its own row to be trusted, and the
+# bound that matters operationally is "two revisions' worth" RELATIVE to MAX_FIX_TRIES anyway. `mt`
+# is re-guarded where it is read (fixcap_hit) so the product is always numeric.
 # ⛔ MAX_LOAD IS A SANITY CEILING, NOT A THROUGHPUT TARGET -- and 16 was too tight for this box.
 # Measured 2026-10-13 over 3940 log lines of the live harness: 103 were
 # `[dispatch] skipped (load=N>=max_load=16)` and 96 were merge-priority. The gate DID open when
@@ -354,6 +372,85 @@ refund_bailed_fixer() {
   return 0
 }
 
+# ── the fixer cap: TWO bounds, one per-revision and one cumulative per PR (agent-infra#1848) ─────
+#
+# STATE, and why the head is BESIDE the counter rather than IN its filename:
+#   state/fixcount-<PR>       attempts booked at the CURRENT revision (bare integer)
+#   state/fixcount-head-<PR>  the head that counter belongs to
+#   state/fixtotal-<PR>       attempts FOLDED IN from superseded revisions (cumulative)
+# `state/fixcount-<PR>` must stay a BARE INTEGER whose path does not depend on a head: `fix-one.sh`
+# reads and writes it on its load-refusal REFUND path, which runs at process exit where its own
+# `gh pr view` head may have FAILED (empty) — a head it cannot name is a head it cannot put in a
+# path. Keeping the filename bare keeps every INCREMENT site and the whole refund UNCHANGED. Growth
+# stays bounded by construction (three per-PR files, never one per sha, so no prune pass).
+#
+# WHY A HEAD CHANGE FOLDS INSTEAD OF DISCARDING: discarding is what made the fixer's own push spend
+# a fresh budget forever. Folding carries the spent attempts into `fixtotal-<PR>`, which no head
+# change resets, so the cumulative bound stays terminal. Folding also makes the two refund paths
+# correct WITHOUT touching `fix-one.sh`: a refund decrements `fixcount-<PR>`, and every arm folds
+# AFTER its refund, so a refunded attempt is never counted against the cumulative budget either.
+# A race between two boxes folding the SAME revision can only OVER-count (both read prior+cur and
+# write the sum), which parks EARLIER — never later — so it cannot make the bound unbounded.
+#
+# An UNKNOWN head never folds or resets. `HEAD_N` is empty whenever `gh pr view` fails, and "we
+# could not read the head" is not evidence that it changed; resetting there would hand out a free
+# attempt on every transient API failure, while the pre-existing arms already refuse to PARK on an
+# unknown head for the mirror-image reason.
+fixcount_sync() { # <pr> <head>
+  local pr="$1" head="${2:-}" cf hf tf prev cur prior
+  [ -n "$head" ] || return 0
+  cf="$O/state/fixcount-$pr"; hf="$O/state/fixcount-head-$pr"; tf="$O/state/fixtotal-$pr"
+  prev="$(cat "$hf" 2>/dev/null || true)"
+  [ "$prev" = "$head" ] && return 0
+  cur="$(cat "$cf" 2>/dev/null || echo 0)"; is_num "$cur" || cur=0
+  prior="$(cat "$tf" 2>/dev/null || echo 0)"; is_num "$prior" || prior=0
+  # FOLD, never discard: this is the whole difference between a cap and a re-arming counter.
+  [ "$cur" -gt 0 ] && echo $(( prior + cur )) > "$tf"
+  # Cleared (not rewritten) so no arithmetic touches its digits — the leading-zero class every
+  # other arithmetic site here has to guard cannot reach this one.
+  rm -f "$cf"
+  printf '%s\n' "$head" > "$hf"
+  return 0
+}
+
+# fixcap_hit <pr> <head> — print the bound(s) that have FIRED for this PR, empty when none has.
+# One predicate for all three arms, and it NAMES the bound with its numbers, so a park is diagnosable
+# from `state/parkreason-<PR>` and the log instead of being an unexplained "at cap". Both bounds can
+# be true at once and both are then reported: the cumulative one is the one a human needs to see when
+# a fixer has been outrunning the per-revision budget by committing.
+# Returns 0 always — callers test `[ -n "$FBOUND" ]` (a non-zero return here would be read as a
+# failed command by any future `set -e` caller).
+fixcap_hit() { # <pr> <head>
+  local pr="$1" head="${2:-}" cur prior total mt mtot r=""
+  cur="$(cat "$O/state/fixcount-$pr" 2>/dev/null || echo 0)"; is_num "$cur" || cur=0
+  prior="$(cat "$O/state/fixtotal-$pr" 2>/dev/null || echo 0)"; is_num "$prior" || prior=0
+  total=$(( prior + cur ))
+  mt="${MAX_FIX_TRIES:-3}"; is_limit "$mt" || mt=3
+  # The cumulative cap is 2 x the per-revision budget (see the derivation note at the top): one full
+  # revision's fair attempt after a push, then a human. Non-numeric MAX_FIX_TRIES cannot reach here
+  # un-coerced (the startup guard runs first); `mt` is re-guarded so the product is always numeric.
+  mtot=$(( mt * 2 ))
+  [ "$cur" -ge "$mt" ] && r="per-revision bound: $cur/$mt attempts at head=${head:-?}"
+  [ "$total" -ge "$mtot" ] && r="${r:+$r; }cumulative bound: $total/$mtot attempts across revisions"
+  printf '%s' "$r"
+  return 0
+}
+
+# ⛔ `launchctl unload` REMOVES THE JOB, NOT THE PROCESS — AND THAT IS WHY THIS LOCK EXISTS.
+# The safe-looking way to adopt a new harness onto a live box is
+#     launchctl unload <plist>            # "stopped"
+#     cp <harness>/*.sh "$O"/           # deploy
+#     launchctl load -w <plist>           # restart
+# and it is wrong twice over: (a) the orphaned controller keeps running and `bash` reads a script
+# it is already executing INCREMENTALLY, so overwriting those files mid-script is undefined
+# behaviour; (b) the freshly loaded job starts a SECOND controller that can never take this lock,
+# so it logs `already running` and exits every cycle while the orphan drives the queue. The box then
+# LOOKS stopped (`launchctl list` shows nothing) while a stale process is still sweeping, reviewing
+# and merging. The safe stop is to TERM the pid the controller recorded in this lock (never
+# `pkill -f`: prompts are passed as argv, so a pattern can match prompt text and kill an unrelated
+# worker). Measured 2026-10-16 while adopting a new harness onto a live box. The docs correction
+# belongs in README §6 / ARCHITECTURE (held by another lane); orch-loop.sh carries this note because
+# this is where the trap actually bites.
 # single-instance lock (atomic: noclobber create fails if the file exists)
 LOCKF="$O/.orch.lock"
 acq() { ( set -o noclobber; echo $$ > "$LOCKF" ) 2>/dev/null; }
@@ -1161,16 +1258,20 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
         if [ "${MSTAT:-}" = "CONFLICTING" ]; then
           # A bailed fixer must not have consumed an attempt here (P2, second review round).
           refund_bailed_fixer "$PR" "${HEAD_N:-}" 0
+          # Two bounds (agent-infra#1848): fold a superseded revision's attempts into the per-PR
+          # total, then park if EITHER the per-revision or the cumulative bound has fired.
+          fixcount_sync "$PR" "${HEAD_N:-}"
           CF="$O/state/fixcount-$PR"; NFC="$(cat "$CF" 2>/dev/null || echo 0)"
           is_num "$NFC" || NFC=0
-          if [ "$NFC" -ge "${MAX_FIX_TRIES:-3}" ]; then
+          FBOUND="$(fixcap_hit "$PR" "${HEAD_N:-}")"
+          if [ -n "$FBOUND" ]; then
             # Unconditional park write (review P1, round 1, same class as merge-one's rail park):
             # a park left by a previous head must be REFRESHED or the new head never parks. The log
             # line stays novel-only (evaluated BEFORE the write) so the log does not repeat.
             if [ "$(cat "$O/state/parked-$PR" 2>/dev/null)" != "${HEAD_N:-}" ]; then
-              echo "#$PR PARKED (still CONFLICTING after $NFC fixes)" >>"$LOG"
+              echo "#$PR PARKED (still CONFLICTING; $FBOUND)" >>"$LOG"
             fi
-            park_ctrl "$PR" "${HEAD_N:-}" "still CONFLICTING after $NFC fixes (MAX_FIX_TRIES=$MAX_FIX_TRIES) -- a push re-arms it, or: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+            park_ctrl "$PR" "${HEAD_N:-}" "still CONFLICTING; $FBOUND. A push funds a NEW revision's budget but not the per-PR budget -- a human must decide, or: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/fixcount-$PR' '$O/state/fixcount-head-$PR' '$O/state/fixtotal-$PR'"
           elif claim_live "$PR" "${HEAD_N:-}" || sess "fix-$PR" || sess "merge-$PR"; then
             : # a worker is already rebasing it
           elif [ "$(tmux ls 2>/dev/null | grep -c '^fix-')" -lt "$MF" ] && can_spawn; then
@@ -1278,12 +1379,17 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
           if claim_live "$PR" "${HEAD_N:-}" || sess "fix-$PR" || sess "merge-$PR"; then
             : # this PR already has a worker in flight
           else
+            # Same rule as the other two arms: two bounds, and `fixcap_hit` names whichever fired.
+            fixcount_sync "$PR" "${HEAD_N:-}"
             FIXN="$O/state/fixcount-$PR"; NF="$(cat "$FIXN" 2>/dev/null || echo 0)"
             is_num "$NF" || NF=0
+            FBOUND="$(fixcap_hit "$PR" "${HEAD_N:-}")"
             # a reviewer already reported real issues AT THIS HEAD -> fix them and re-run the chain.
             # otherwise the gate is probably just missing evidence -> re-record (fresh review).
+            # A fired bound also blocks the SPAWN: without `-z "$FBOUND"` a cumulative park with
+            # NF below the per-revision cap would fall into this branch and spawn a fixer forever.
             if [ -n "${HEAD_N:-}" ] && [ -f "$O/state/needsfix-$PR-$HEAD_N" ] \
-               && [ "$NF" -lt "${MAX_FIX_TRIES:-3}" ] \
+               && [ -z "$FBOUND" ] \
                && can_spawn \
                && [ "$(tmux ls 2>/dev/null | grep -c '^fix-')" -lt "$MF" ]; then
               # Spawn FIRST, bookkeep only on success: recording the attempt before the spawn
@@ -1299,11 +1405,11 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
               else
                 echo "#$PR fixer spawn FAILED (attempt not consumed, marker kept)" >>"$LOG"
               fi
-            elif [ "$NF" -ge "${MAX_FIX_TRIES:-3}" ] && [ -f "$O/state/needsfix-$PR-$HEAD_N" ]; then
+            elif [ -n "$FBOUND" ] && [ -f "$O/state/needsfix-$PR-$HEAD_N" ]; then
               # Terminal state. Without this the cap just falls through to the re-record branch
               # every cycle: an unfixable PR would burn a full fresh-context review forever.
-              park_ctrl "$PR" "${HEAD_N:-}" "still needs fixes after $NF attempts at head=${HEAD_N:-?} (MAX_FIX_TRIES=$MAX_FIX_TRIES) -- a human must decide; a push re-arms it, or: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
-              echo "#$PR PARKED after $NF fixes at head=${HEAD_N:-?} — needs a human" >>"$LOG"
+              park_ctrl "$PR" "${HEAD_N:-}" "$FBOUND. A push funds a NEW revision's budget but not the per-PR budget -- a human must decide, or: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/fixcount-$PR' '$O/state/fixcount-head-$PR' '$O/state/fixtotal-$PR'"
+              echo "#$PR PARKED after $NF fixes at head=${HEAD_N:-?} ($FBOUND) — needs a human" >>"$LOG"
             elif [ "$(tmux ls 2>/dev/null | grep -c '^merge-')" -lt "$MR" ] && can_spawn; then
               printf '%s\n' "$REPO" "$OR" "$PR" "$BR" > "$O/state/argv-$PR"
               # Same carried contract as the GREEN rail spawn above (review P2, round 1), and the
@@ -1331,15 +1437,19 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
           # A bailed fixer must not have consumed an attempt here. This arm never deleted a findings
           # marker, so restore is 0 (P2, second review round).
           refund_bailed_fixer "$PR" "${HEAD_N:-}" 0
+          # Same two bounds as the other arms: fold a superseded revision into the per-PR total,
+          # then let the ONE predicate name whichever bound fired.
+          fixcount_sync "$PR" "${HEAD_N:-}"
           NFC2="$(cat "$O/state/fixcount-$PR" 2>/dev/null || echo 0)"
           is_num "$NFC2" || NFC2=0
-          if [ "$NFC2" -ge "${MAX_FIX_TRIES:-3}" ]; then
+          FBOUND="$(fixcap_hit "$PR" "${HEAD_N:-}")"
+          if [ -n "$FBOUND" ]; then
             # Unconditional park write (review P1, round 1, same class as merge-one's rail park).
             # The log line stays novel-only (evaluated BEFORE the write) so the log does not repeat.
             if [ "$(cat "$O/state/parked-$PR" 2>/dev/null)" != "${HEAD_N:-}" ]; then
-              echo "#$PR PARKED (CI still red after $NFC2 fixes: $V)" >>"$LOG"
+              echo "#$PR PARKED (CI still red; $FBOUND: $V)" >>"$LOG"
             fi
-            park_ctrl "$PR" "${HEAD_N:-}" "CI still red after $NFC2 fixes: $V -- a push re-arms it, or: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+            park_ctrl "$PR" "${HEAD_N:-}" "CI still red ($V); $FBOUND. A push funds a NEW revision's budget but not the per-PR budget -- a human must decide, or: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/fixcount-$PR' '$O/state/fixcount-head-$PR' '$O/state/fixtotal-$PR'"
           elif claim_live "$PR" "${HEAD_N:-}" || sess "fix-$PR" || sess "merge-$PR"; then
             : # a worker is already on it
           elif [ "$(tmux ls 2>/dev/null | grep -c '^fix-')" -lt "$MF" ] && can_spawn; then
