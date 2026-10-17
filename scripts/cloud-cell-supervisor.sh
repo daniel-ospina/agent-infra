@@ -518,7 +518,9 @@ linked_worktree_of() {
 # values an operator cannot plausibly set, while `HARNESS_PIN_DIR=$CELL_HOME` (or $HOME, or $O) drove
 # `rm -rf` over the cell home — keys.env, the gate key, the orchestrator state dir. Require a POSITIVE
 # allow instead: never an ancestor of anything this cell needs, and if it exists it must be a linked
-# worktree of $HARNESS_REPO, an empty directory, or a pin ROOT holding only hex-named pin dirs.
+# worktree of $HARNESS_REPO, an empty directory, a pin ROOT holding only hex-named pin dirs, or a root
+# whose only other entries are OS droppings (`​.DS_Store` / `._*` REGULAR files — one Finder visit to the
+# default root must not brick the cell; a hidden DIRECTORY or a dangling symlink is still refused).
 #
 # Is $1 a NAME `apply` could have produced for a pin directory? `apply` names each pin by the hex of
 # the commit it pins to (`cut -c1-12` below), but the LENGTH is a MOVING CONVENTION, not a property
@@ -610,9 +612,14 @@ pin_path_real() {
 # OWN pin as foreign and the guard becomes a false block.
 pin_root_conformance() {
   local dir="${1:-}" p listing entries=0 harmless=0 dir_real p_real
-  PIN_ROOT_BAD=""
+  PIN_ROOT_BAD=""; PIN_ROOT_REMEDY=""
+  # ⛔ THE REMEDY IS CARRIED PER CAUSE, like the reason. One shared footer is how the guard came to
+  # tell an operator "Remove it by hand if you are sure it holds nothing" for a root that CONTAINS the
+  # cell home — i.e. it advised deleting keys.env and the orchestrator state, the very action the
+  # denial exists to prevent (review round 5, measured against the shipped script).
+  local remedy_dedicated='Point HARNESS_PIN_DIR at a dedicated worktree path (default $CELL_HOME/harness).'
   case "$dir" in
-    ""|"/"|".") PIN_ROOT_BAD="is '$dir'"; return 1 ;;
+    ""|"/"|".") PIN_ROOT_BAD="is '$dir'"; PIN_ROOT_REMEDY="$remedy_dedicated"; return 1 ;;
   esac
   # A root that CONTAINS anything this cell needs cannot be reclaimed, and every sibling verb refuses
   # it — so `check` must refuse it too, not certify a cell whose own `apply`/`start`/`prune` die here.
@@ -622,11 +629,11 @@ pin_root_conformance() {
   for p in "$CELL_HOME" "$HOME" "$O" "$REPO" "$HARNESS_REPO" "$(dirname "$ENV_FILE")"; do
     [ -n "$p" ] || continue
     p_real="$(pin_path_real "$p")" || p_real="$p"
-    case "$p_real" in "$dir_real"|"$dir_real"/*) PIN_ROOT_BAD="CONTAINS $p, which this cell needs"; return 1 ;; esac
+    case "$p_real" in "$dir_real"|"$dir_real"/*) PIN_ROOT_BAD="CONTAINS $p, which this cell needs"; PIN_ROOT_REMEDY="$remedy_dedicated"; return 1 ;; esac
   done
   [ -e "$dir" ] || [ -L "$dir" ] || return 0               # nothing there: nothing to refuse
   linked_worktree_of "$HARNESS_REPO" "$dir" && return 0    # the legacy flat pin (root IS one worktree)
-  [ -d "$dir" ] || { PIN_ROOT_BAD="$dir is not a directory"; return 1; }
+  [ -d "$dir" ] || { PIN_ROOT_BAD="is not a directory"; PIN_ROOT_REMEDY="Remove that entry, or point HARNESS_PIN_DIR at a directory."; return 1; }
   listing="$(ls -A "$dir" 2>/dev/null)" || return 2         # ⛔ a failed read is NOT an empty read
   [ -n "$listing" ] || return 0                             # genuinely empty (`ls -A` drops . and ..)
   while IFS= read -r p; do
@@ -649,6 +656,7 @@ pin_root_conformance() {
     entries=$((entries + 1))
     if [ ! -d "$dir/$p" ] || ! pin_name_ok "$p"; then
       PIN_ROOT_BAD="holds '$p', which is not a pin directory"
+      PIN_ROOT_REMEDY="Remove that entry by hand if you are sure it holds nothing."
       return 1
     fi
   done <<<"$listing"
@@ -721,7 +729,7 @@ cmd_check_pin_dir() {
        fi
        die "HARNESS_PIN_DIR='$HARNESS_PIN_DIR' cannot be READ (permission denied or an I/O error), so whether it is a pin root is UNKNOWN — and cannot-verify is never a pass. Fix its permissions, or point HARNESS_PIN_DIR at a readable path, then re-run: $0 check   (agent-infra#1852)" ;;
   esac
-  die "HARNESS_PIN_DIR='$HARNESS_PIN_DIR' $PIN_ROOT_BAD — 'apply' AND 'start' both refuse here, so this cell can neither be updated nor started. Quarantine it (move it aside; do not delete a directory you cannot account for) and re-run: $0 apply   (agent-infra#1852)"
+  die "HARNESS_PIN_DIR='$HARNESS_PIN_DIR' $PIN_ROOT_BAD — 'apply' AND 'start' both refuse here, so this cell can neither be updated nor started. $PIN_ROOT_REMEDY Then re-run: $0 apply   (agent-infra#1852)"
 }
 
 # The delete-side caller, used by `harness_apply` and `cmd_prune`.
@@ -735,7 +743,7 @@ assert_pin_dir_safe() {
        fi
        die "refusing to rm -rf HARNESS_PIN_DIR='$dir': it cannot be READ (permission denied or an I/O error), so whether it is a pin root is UNKNOWN — and cannot-verify is not a pass here either." ;;
   esac
-  die "refusing to rm -rf HARNESS_PIN_DIR='$dir': it $PIN_ROOT_BAD. Remove it by hand if you are sure it holds nothing."
+  die "refusing to rm -rf HARNESS_PIN_DIR='$dir': it $PIN_ROOT_BAD. $PIN_ROOT_REMEDY"
 }
 
 # Pin the cell's harness to $HARNESS_REF in a detached worktree and record where it is. Idempotent:

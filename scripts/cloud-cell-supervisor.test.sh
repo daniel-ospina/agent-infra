@@ -1638,6 +1638,31 @@ case "$QQ_OUT" in
   *"CONTAINS"*) ok "check names the containment (same reason apply/start give)" ;;
   *) bad "check's containment refusal does not say CONTAINS — $QQ_OUT" ;;
 esac
+# ⛔ THE REMEDY MUST MATCH THE CAUSE. The merged footer told the operator to "Remove it by hand if you
+# are sure it holds nothing" for a root that CONTAINS the cell home — i.e. it prescribed deleting
+# keys.env and the orchestrator state, the exact action the denial exists to prevent (review round 5,
+# measured against the shipped script). Pinned on BOTH callers: check (here) and the delete side below.
+case "$QQ_OUT" in
+  *"dedicated worktree path"*) ok "check's containment refusal prescribes the right remedy" ;;
+  *) bad "check's containment refusal does not say to use a dedicated pin root — $QQ_OUT" ;;
+esac
+case "$QQ_OUT" in
+  *"Remove it by hand"*) bad "check's containment refusal tells the operator to DELETE the cell home — $QQ_OUT" ;;
+  *) ok "check's containment refusal never advises deleting the cell home" ;;
+esac
+SA_OUT="$(PATH="$Q/bin:$PATH" CELL_HOME="$Q/home" ENV_FILE="$Q/keys.env" SESSION="ai1852-sa-$$" \
+          O="$Q/o" REPO="$Q/repo" HARNESS="$QH" HARNESS_REPO="$AI" HARNESS_FETCH=0 HARNESS_REF="$QREF" \
+          HARNESS_PIN_DIR="$Q/home" HARNESS_PIN_FILE="$Q/home/.harness-path" bash "$SUP" apply 2>&1)"; SA_RC=$?
+[ "$SA_RC" -ne 0 ] && ok "apply REFUSES a pin root over the cell home (delete side)" \
+                   || bad "apply accepted HARNESS_PIN_DIR=\$CELL_HOME — it would rm -rf the cell home: $SA_OUT"
+case "$SA_OUT" in
+  *"dedicated worktree path"*) ok "the delete-side refusal prescribes the right remedy" ;;
+  *) bad "the delete-side refusal does not say to use a dedicated pin root — $SA_OUT" ;;
+esac
+case "$SA_OUT" in
+  *"Remove it by hand"*) bad "the delete-side refusal tells the operator to DELETE the cell home — $SA_OUT" ;;
+  *) ok "the delete-side refusal never advises deleting the cell home" ;;
+esac
 HC="$T/pinhidden"; mkdir -p "$HC/.hidden-pin"
 qcheck_pin "$HC"
 [ "$QQ_RC" -ne 0 ] && ok "check REFUSES a root whose ONLY entry is a hidden DIRECTORY (a glob would skip it)" \
@@ -1739,29 +1764,33 @@ rm -rf "$Q/pin/notes"
 # (a concurrent `apply`/`prune`) has "retry in a moment". The reason is carried out in PIN_ROOT_BAD
 # the way rc 1's is.
 # ⛔ The vanish state is provoked DETERMINISTICALLY with a stub `ls` that names an entry which does not
-# exist — no race, no flake. ⛔ Mutation caught: dropping the PIN_ROOT_BAD assignment on that return
-# makes the message fall back to "cannot be READ …" and reddens both arms of this case.
+# exist — no race, no flake. The stub is on PATH for the SOURCE too (hermetic: sourcing runs
+# `cmd_status`, whose tmux probes must not reach the operator's default server), and it FORWARDS to the
+# real `ls` until a marker file exists, so sourcing sees ordinary listings. ⛔ Mutation caught:
+# dropping the PIN_ROOT_BAD assignment on that return makes the message fall back to "cannot be
+# READ …" and reddens both arms of this case.
 say_case "a vanished-mid-read pin root is NOT reported as 'cannot be READ' (#1852)"
 VQ="$T/vanishmid"; mkdir -p "$VQ/pin" "$VQ/bin"
-printf '#!/bin/sh\necho ghost\n' > "$VQ/bin/ls"; chmod +x "$VQ/bin/ls"
+printf '#!/bin/sh\nif [ -f "%s" ]; then echo ghost; else exec /bin/ls "$@"; fi\n' "$VQ/active" > "$VQ/bin/ls"
+chmod +x "$VQ/bin/ls"
+: > "$VQ/active"
 VBAD="$(
   set -- status
-  export CELL_HOME="$VQ/cell" ENV_FILE="$VQ/none.env" O="$VQ/o" REPO="$VQ/repo" \
+  export PATH="$VQ/bin:$PATH" CELL_HOME="$VQ/cell" ENV_FILE="$VQ/none.env" O="$VQ/o" REPO="$VQ/repo" \
          HARNESS_PIN_DIR="$VQ/pin" HARNESS_PIN_FILE="$VQ/hp"
   . "$SUP" >/dev/null 2>&1
-  export PATH="$VQ/bin:$PATH"
   pin_root_conformance "$VQ/pin"; echo "rc=$?"; echo "bad=$PIN_ROOT_BAD"
 )"
 case "$VBAD" in *"rc=2"*) ok "the vanish state is rc 2 (cannot verify), not a pass" ;; *) bad "pin_root_conformance did not answer 2 for a vanished entry — $VBAD" ;; esac
 case "$VBAD" in *"vanished"*) ok "the reason names the vanish, not a read failure" ;; *) bad "the rc-2 reason does not name the vanish — $VBAD" ;; esac
 VQ_OUT="$(
   set -- status
-  export CELL_HOME="$VQ/cell" ENV_FILE="$VQ/none.env" O="$VQ/o" REPO="$VQ/repo" \
+  export PATH="$VQ/bin:$PATH" CELL_HOME="$VQ/cell" ENV_FILE="$VQ/none.env" O="$VQ/o" REPO="$VQ/repo" \
          HARNESS_PIN_DIR="$VQ/pin" HARNESS_PIN_FILE="$VQ/hp"
   . "$SUP" >/dev/null 2>&1
-  export PATH="$VQ/bin:$PATH"
   cmd_check_pin_dir 2>&1
 )"; VQ_RC=$?
+rm -f "$VQ/active"
 [ "$VQ_RC" -ne 0 ] && ok "check REFUSES a vanished-mid-read root" || bad "check certified a root whose entries vanished mid-read — $VQ_OUT"
 case "$VQ_OUT" in
   *"vanished"*) ok "check's message names the vanish" ;;
