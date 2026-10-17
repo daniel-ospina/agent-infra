@@ -128,6 +128,7 @@ run_shard scripts/install-launchd.test.sh                                  # #30
 run_shard scripts/pi-reap-idle.test.sh                                     # #469 session reaper (fake PS/KILL/DATE shims)
 run_shard scripts/pi-task-session-prune.test.sh                            # #783 retention sweep (dry-run default)
 run_shard scripts/pi-reap-worktrees.test.sh                                # #1095 worktree reaper gates
+run_shard scripts/worktree-disk-probe.test.sh                              # #1851 apparent-vs-real disk measurement (df used delta, per machine)
 run_shard scripts/cleanup-stale-branches.test.sh                          # #1787 local-branch reaper gates (the squash-merge-aware three gates, dry-run default)
 run_shard scripts/scratch-worktree.test.sh                                 # #1141 scratch-checkout helper
 run_shard scripts/daily-backup.test.sh                                     # #907 the backup target is RESOLVED from the port it publishes and PROVEN to answer before any state exists; the LOAD_GATE_FORCE path runs; an incomplete backup dir is removed

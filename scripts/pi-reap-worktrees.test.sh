@@ -50,7 +50,9 @@
 #   status timeout          A6   (fail-closed PRESERVE, dry and armed)
 #   pass budget             A7   (deferred + armed overrun removes nothing)
 #   gh pagination limit     A8   (default 30 would be a false PASS; ONE call)
-#   no disk-savings claim   A9   (du NEVER invoked; claim family absent)
+#   no disk-savings claim   A9   (du NEVER invoked; claim family absent; and the #1851
+#                                correction — no falsified hardlink mechanism, the measured
+#                                CoW/hardlink/real regimes named, the per-machine probe cited)
 #   --list is read-only     A10
 #   git failure             A11  (exit 3 + log artifact)
 #   removal refusal         A12  (REMOVE-FAILED + FAILED=1, dir kept)
@@ -843,6 +845,20 @@ assert_contains "$OUT" "no byte-savings figure is reported" "A9 disk honesty lin
 assert_contains "$OUT" "FILE COUNT" "A9 the real win (file count) is named"
 assert_absent "$OUT" "GB saved" "A9 no invented byte saving"
 assert_absent "$OUT" "bytes freed" "A9 no invented 'bytes freed' claim"
+# #1851 — the mechanism the honesty line names must be the MEASURED one. The falsified universal
+# claim (the venvs are hardlinked to the uv cache, so du over-reports) is pinned ABSENT from the
+# script; the doc keeps it for PROVENANCE and is pinned as FALSIFIED-by-marker instead. The line
+# must name the measured mechanism and point at the per-machine measurement.
+assert_absent "$(cat "$REAPER")" "hardlinked to the uv cache" \
+  "A9 the falsified mechanism claim is gone from the script"
+# The doc keeps the old sentence for PROVENANCE, so it is pinned as FALSIFIED-by-marker and as
+# carrying the measured mechanism — an absence check there would only reward deleting the record.
+assert_contains "$(cat "$SCRIPT_DIR/../docs/scoping/2026-09-15-issue-1095-worktree-reaper.md")" \
+  "FALSIFIED 2026-10-16 (#1851)" "A9 the corrected doc marks the falsified claim as falsified"
+assert_contains "$(cat "$SCRIPT_DIR/../docs/scoping/2026-09-15-issue-1095-worktree-reaper.md")" \
+  "clonefile" "A9 the corrected doc carries the measured CoW mechanism"
+assert_contains "$OUT" "clonefile" "A9 the measured CoW mechanism is named on the honesty line"
+assert_contains "$OUT" "worktree-disk-probe.sh" "A9 the honesty line points at the per-machine measurement"
 
 # ── A10: --list is read-only ───────────────────────────────────────────
 ENV=A10; REPO="$(mk_repo $ENV)"; add_named_wt "$REPO" "$ENV-l" feat/a10-l >/dev/null

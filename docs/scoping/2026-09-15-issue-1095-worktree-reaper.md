@@ -6,7 +6,7 @@ doc_status: draft
 subjects.team: organisation-design-team
 created: 2026-09-15
 aboutSubjects: git-worktrees, disk-reclamation, organisation-design-team
-aboutObjects: agent-infra, issue-1095, pi-reap-worktrees.sh, pi-reap-worktrees.test.sh
+aboutObjects: agent-infra, issue-1095, issue-1851, pi-reap-worktrees.sh, pi-reap-worktrees.test.sh, worktree-disk-probe.sh
 ---
 
 # Scoping — #1095: worktree reaper + retention policy
@@ -166,11 +166,53 @@ Re-running after any pass is a no-op by construction: removed worktrees leave th
 
 **Exit codes** (cycle-2 change): `0` pass completed with nothing failed, `2` usage, `3` fail-closed abort (nothing trusted), `4` pass completed but ≥1 removal failed. `4` exists so a launchd/cron wrapper cannot read a refused removal as a clean run — the `FAILED=` footer alone is not a machine-readable contract. Deferrals stay `0`: they are the budget working, and the next pass re-classifies them.
 
-### 3.5 Disk-savings honesty
+### 3.5 Disk-savings honesty — CORRECTED 2026-10-16 (#1851): the mechanism is per-machine
 
-The issue mandates stating this plainly, so both the script's report and this doc do:
+This section previously asserted:
 
-> **Per-worktree `.venv`s are hardlinked to the uv cache, so `du` over-reports them (measured: 84 GB `du` delta vs 22 GB actually freed).** The reaper therefore **does not report and does not claim any byte saving** — it never calls `du`. The real, deliverable win is **file count**: 2,363,772 files → the count actually walked by `find`/`grep`/`rg` in the working tree is the amplification that produced the 10–18-minute searches.
+> ⛔ **FALSIFIED 2026-10-16 (#1851) — kept only for provenance.** The sentence below names a hardlink
+> mechanism as the universal cause of the `du` gap; it is not universal, and the number is an observation
+> rather than a property of worktrees. The measured model follows it.
+>
+> Per-worktree `.venv`s are hardlinked to the uv cache, so `du` over-reports them (measured: 84 GB `du` delta vs 22 GB actually freed). The reaper therefore **does not report and does not claim any byte saving** — it never calls `du`. The real, deliverable win is **file count**: 2,363,772 files → the count actually walked by `find`/`grep`/`rg` in the working tree is the amplification that produced the 10–18-minute searches.
+
+The **number** is a real observation. The **mechanism** is falsified, and the distinction is the whole point: the apparent→real gap is a **sharing** property of the filesystem, so it is **per-machine** — and the machines that filled are the ones where the sharing does **not** happen. The reaper still **does not report and does not claim any byte saving** (a `du` figure is an upper bound whose error is machine-specific and unmeasured). What changed is the *reason*, which is now measured rather than asserted.
+
+Three regimes, measured 2026-10-16:
+
+| Regime | Detected by | Measurement |
+|---|---|---|
+| APFS CoW (`clonefile`), cache on the SAME volume | `nlink = 1` everywhere, small `df` delta | isolated sparse APFS image, `uv 0.12.3`: one venv `du` 22.0 MB vs `df` used **+0.6 MB**; a `--link-mode=hardlink` control produced `nlink = 2`, proving the flag is honoured and the default is genuinely not a hardlink |
+| hardlinks into the uv cache | `nlink > 1` | Linux cell, `uv sync --extra embeddings --extra parity`: `du -sm` on the venv 5,704 MB vs **186 MB** actually released (30x) |
+| neither (Linux/overlayfs, a cache on another mount, `--link-mode=copy`) | `nlink = 1` and a `df` delta ≈ `du` | cmux cell `pi-lane-1`, 75 worktrees: `du -sm` sum 5,647 MiB vs a `df -B1` used delta of **5,899,853,824 B** — ratio **1.004** |
+
+Consequences now recorded, and binding on this doc and the script:
+
+1. **`du` is not the instrument for "what does removing this free".** It is valid on regime 3 and wrong by 30x on regime 2 — and it is **non-monotonic in what you remove**: on a hardlink estate, deleting the *cache* frees ~3.5 GB and breaks every venv linking it, while deleting the venv frees 186 MB. A reaper that ranks candidates by `du` picks the wrong target. Ranking must be by real `df` delta (or link count).
+2. **"Make the venv smaller" is the wrong lever** — on APFS it reclaims ~1 MB/worktree, and on every regime it re-opens `tortoise#2985` (a non-canonical venv silently ran keyword-only retrieval; `require_hybrid_retrieval()` fails closed without the extras). The per-worktree venv keeps carrying `--extra embeddings --extra parity`.
+3. **The honest column is `df` `used`, not `avail`.** `avail` drifts with concurrent writes (measured ~1 MB/s on the busy cmux cell, 0.3 % of a 5.9 GB measurement) while `used` moved monotonically by exactly the freed bytes. `spawn-gate.sh`'s `disk_free_mb` floor and `orch-loop.sh`'s disk probe read `avail` — correct for a FLOOR, wrong for a MEASUREMENT. That split is deliberate, not an inconsistency.
+4. **The portable win is file count**, as before — the amplification that produced the 10–18-minute repo-wide searches.
+
+**The one-command per-machine measurement (#1851):**
+
+```bash
+# regime + an apparent upper bound. Deletes nothing.
+bash scripts/worktree-disk-probe.sh --dir <repo>/.worktrees
+
+# the ground truth: real bytes released, measured on THIS machine.
+bash scripts/worktree-disk-probe.sh --repo <repo> \
+     --measure-removal <a pi-reap-worktrees.sh --dry-run reclaimable row> --yes
+```
+
+The second form measures the `df -Pk` `used` delta across ONE `git worktree remove` (**no** `--force`, so git's own refusal is the second gate and branch refs survive) and reports **both** the apparent (`du -sk`) and the real figures plus their ratio — never one of them. It is not a reaper: it removes at most the one path the caller names, and the caller takes that path from a reaper **dry-run** row the reaper already classified reclaimable — this script deliberately does not re-implement the clean/reachable/unreferenced gates (#1393 is why a wrong removal is the expensive failure here).
+
+**Scope decisions this closes (the issue's three open questions):**
+
+| # | Decision | Why |
+|---|---|---|
+| 1 | The reaper keeps renouncing byte claims; the **probe** measures | A per-pass `df` delta on a shared box has no attribution (`used` moves for other writers too, ~1 MB/s measured) and a headline number invites false precision. One instrument, one job: the reaper reclaims, the probe measures. |
+| 2 | The per-machine disk **budget** stays observability (the #1765 floor), not a dispatch gate | #1765 already added the free-space floor to `spawn-gate.sh`; a budget *gate* is a separate behaviour with its own false-block surface and is outside this issue's measurement target. |
+| 3 | No multi-repo / multi-machine owner is created here | The probe takes `--dir`/`--repo` and is therefore repo- and machine-agnostic — the measurement half of that gap. Ownership and arming are #1678 (inert enforcer) and #1759 (one owner per controller); this issue does not restate them. |
 
 ### 3.6 Removal mechanics
 
@@ -246,6 +288,8 @@ Real git (not a shim) is used for every git probe: the gates *are* git semantics
 
 - `scripts/pi-reap-worktrees.sh` (new) — the reaper.
 - `scripts/pi-reap-worktrees.test.sh` (new) — hermetic suite (**216 assertions, all green**; see §9 for the count's history); registered in `.github/workflows/ci-main.yml` alongside `pi-reap-idle.test.sh` (post-merge main-push family — `ci.yml` has no per-PR shell-script block). `ci-main.yml` is a **content-locked** workflow, so `scripts/workflow-lock.json` is re-hashed in the same change (`node scripts/check-workflow-lock.mjs --update-lock`); the lock gate fails closed otherwise, which is exactly how this omission was caught by `ci / unit-test` on the PR rather than merged.
+- `scripts/worktree-disk-probe.sh` (new, #1851) — the one-command per-machine apparent-vs-real measurement (§3.5). Non-destructive by default; `--measure-removal` measures the `df` `used` delta across one `git worktree remove` and reports both instruments. Farmed to `~/.pi/agent/scripts/` (`fleet_srcs`) so a cell can run it where the estate lives.
+- `scripts/worktree-disk-probe.test.sh` (new, #1851) — hermetic suite (64 assertions) over `DF_BIN`/`DU_BIN` seams, plus one real-`df`/`du` end-to-end leg so the seam cannot hide a broken live path; registered in the ONE bash-shard list (`scripts/run-bash-shards.sh`, #1369), which both the PR and main lanes run.
 - **Repo-selection contract:** `--repo PATH` (default `$PWD`), mirroring `stale-worktrees.sh`. `git worktree list` is per-repo, so the reaper **never** walks outside the named repo, and the main-checkout exclusion resolves from that repo's `--git-common-dir`.
 - No existing caller changes. `stale-worktrees.sh` / `cleanup-worktree.sh` / `hub-worktree.sh` / `checkout_guard.sh` are untouched.
 - **Adjacent finding (not absorbed):** `scripts/rg` search tooling still walks `.worktrees/*/node_modules` (#1069, already open).
@@ -259,7 +303,7 @@ Real git (not a shim) is used for every git probe: the gates *are* git semantics
 2. Dry-run is the default; removal requires `--apply`.
 3. Idempotent; safe while a session works in a worktree (argv + cwd live-reference gates, `dirty` gate, `self-checkout` guard, lock).
 4. Test fixture per gate fail path: **dirty, detached-unreachable, live reference (argv and cwd), open PR, too-recent** — plus **unmerged-named-branch** (the `refs=branch-retained` removal path), ignored-artifact, gh-unavailable, no-GitHub-remote, status-timeout, lock, budget, prunable, idempotence.
-5. No disk-savings claim; file-count framed honestly.
+5. No disk-savings claim; file-count framed honestly — and the mechanism named is the **measured** one, carried by `scripts/worktree-disk-probe.sh` (§3.5, corrected for #1851).
 6. Bounded: no recursive walk; per-probe timeout; global budget covering classification **and** removal.
 7. `main` checkout and the reaper's own checkout are never candidates.
 8. **Stated deviation from the issue's literal gate list:** the binding gate is *commits survive*, not *merged*. An **unmerged named-branch** worktree is removable (branch ref retained — the measured 48-row class). `merged` is reported, not binding. Derivation in §2; both the `refs=merged` path and the branch-retained path are covered by tests.
@@ -270,7 +314,7 @@ Real git (not a shim) is used for every git probe: the gates *are* git semantics
 
 - **Arming a launchd job** to run the reaper periodically is **deliberately not done here**: this ships the reaper (classification + dry-run + `--apply`) with no scheduled execution. Arming is a separate, reversible, dated step with a named owner (the operator), mirroring the `pi-task-session-prune` precedent (shipped DRY-RUN; arming is a separate manual step). *Re-check mechanism:* a follow-up issue tracks arming-or-not with the operator as owner; the reaper is not left with a "defer until X" and no owner.
 - **Creation-time ownership / session-exit self-reclaim (frame F5).** Considered in problem-diverge and **not absorbed**: recording an owner at `git worktree add` time plus a `pi` session-exit hook would bound sprawl continuously rather than daily, and carries little of the risk that dominates this doc. Out of scope for #1095 because (a) it cannot reclaim any of the existing 407 worktrees — the measured problem is *already-accumulated* sprawl — and (b) it requires touching the session-exit path, a materially larger blast radius. Filed as a follow-up rather than silently dropped.
-- **Byte-accurate disk accounting** — cannot be delivered honestly (§3.5). Not attempted.
+- **Byte-accurate disk accounting in the reaper** — deliberately not attempted (§3.5): a per-pass `df` delta on a shared host has no attribution, so the reaper keeps renouncing byte claims. The per-machine real figure is delivered instead by `scripts/worktree-disk-probe.sh` (#1851), on the machine that removes.
 - **A per-site `mktemp` for the probe output files** (enumeration / `ps` / `lsof` / `gh` / `status` / `remove`). The cycle-2 work moved the *watchdog* scratch into one per-pass directory (the hot path), which is where nearly all the fork cost was; the remaining `mktemp` calls are one per probe *site* (≈6 per pass) and each site has its own distinct failure handling. Converting them is a real further saving on a loaded host but touches five correct fail-closed paths, so it is **not** done in this change. If the reaper's CI runtime becomes a problem, that is the measured next step.
 - **A timeout primitive that does not fork at all** (bash-3.2-safe `read -t` on a held-open FIFO, plus a done-sentinel written by a wrapper). Would cut per-probe forks further. Rejected for this change: rewriting the timeout engine that the A6/A7 tests pin, late in the cycle, on a host too loaded to iterate on, is exactly how a safety gate acquires a false negative.
 
