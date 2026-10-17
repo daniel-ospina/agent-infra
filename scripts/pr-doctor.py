@@ -440,8 +440,17 @@ def _untrusted(text, limit: int = 78) -> str:
     """
     out = " ".join(str(text or "").replace("\r", " ").replace("\n", " ").split())
     out = "".join(ch for ch in out if ch.isprintable() and ch not in "\u00ab\u00bb")
-    for m in _MARKERS:
-        out = out.replace(m, "")
+    # ⛔ STRIP TO A FIXPOINT (circle of removal, #1872 review round 8). One ordered pass can
+    # REBUILD a marker out of characters this function removes: ``D`O:`` -> strip the backtick ->
+    # `DO:` (and `DO:` had already been checked, so it survives), likewise ``D**O:``, ``D```O:``
+    # and ``I`DLE->``. MEASURED through the real function before this fix: all four rendered the
+    # fleet's own token. Each pass strictly shortens the string, so this terminates.
+    while True:
+        before = out
+        for m in _MARKERS:
+            out = out.replace(m, "")
+        if out == before:
+            break
     out = " ".join(out.split()).strip()
     if limit and len(out) > limit:
         out = out[:limit].rstrip()
