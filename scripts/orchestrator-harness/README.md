@@ -1242,8 +1242,11 @@ off macOS (it renders a launchd plist) — the portability that matters is `orch
    the count: `auto`
    (default — the rule above), `own` (own-only even above the threshold), `broad` (broad even below
    it); any other value is fatal, so a typo cannot silently pick a scope. In a multi-box fleet
-   ⚠️ **Retained pending measurement (#1908)** — claims are at-least-once, not mutual exclusion, so this partition is still the only provable cross-box barrier. It does strand work nobody owns; that is accepted until a claim is *demonstrated* to exclude. (exactly one box takes `broad` and the rest pin `SCOPE=own`) (measured 2026-10-13: an unpinned
-   fresh cell logged `[scope] open=14 -> BROAD` and auto-armed #8425/#8420 within ~25s).
+   **exactly one box takes `broad` and the rest pin `SCOPE=own`** (measured 2026-10-13: a freshly
+   started cell logged `[scope] open=14 -> BROAD` and auto-armed #8425/#8420 within ~25s).
+   ⚠️ **This pin is RETAINED, not retired (#1908).** Claims are at-least-once, not mutual
+   exclusion, so `own` remains the only *provable* barrier against a second box draining the
+   shared queue. Retire it only once a claim is demonstrated to exclude under concurrency.
    ⛔ **This is a partition, not coordination.** Ownership is still inferred from *local*
    branches/worktrees, which are invisible across boxes, so two `own`-pinned boxes can still race
    the same PR (§7.2b, tortoise#5052) — the pin must not be mistaken for a claim registry.
