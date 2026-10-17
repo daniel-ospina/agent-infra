@@ -110,6 +110,143 @@ doc_status: draft
 
 ---
 
+## 0. Requirements and intended behaviour
+
+> **Status.** Owner-stated requirements, recorded 2026-10-16 after this harness was found **dormant
+> while a superseded dispatcher was live** on the same box. This section is the authority for *what
+> the system is for*; §2 and [`ARCHITECTURE.md`](./ARCHITECTURE.md) describe how the current code
+> meets it (and §0.3 where it does not).
+
+### 0.1 The fleet
+
+One orchestrator per machine, each focused on **one repo**. Other repos may be open on the box; the
+orchestrator and its heartbeat dispatch to exactly one.
+
+| machine | repo |
+|---|---|
+| new laptop | `daniel-ospina/tortoise` |
+| girlfriend's laptop | `daniel-ospina/tortoise` |
+| cmux cloud cell 1 | `daniel-ospina/tortoise` |
+| cmux cloud cell 2 | `daniel-ospina/agent-infra` |
+| cmux cloud cell 3 | `daniel-ospina/tortoise` |
+
+⚠️ **This table is the intended mapping, not a measured one.** Measured 2026-10-17 it does not hold: cell-2 holds *both* checkouts and ran tortoise merges all evening, and **cell-3 has no tortoise checkout at all**. The mapping must be **verified by the box** — agent-infra#1901.
+
+A **second controller on one box is harmless, not forbidden**: it exits immediately on the
+single-instance lock. No mechanism is needed for it.
+
+### 0.2 What the system must do
+
+| # | requirement |
+|---|---|
+| **R1** | A heartbeat checks capacity every cycle — cpu, ram, swap, **disk** — and dispatches only when there is capacity. |
+| **R2** | It works **un-owned PRs first**: fix them, or run the merge path, to get them merged. |
+| **R3** | Only when no un-owned PRs remain does it take the next un-owned **issue**, in label order: **P0 → P1 → P2 → P3 → oldest with no P label**. |
+| **R4** | "Un-owned" is decided by **cross-machine coordination**, because several machines work the same repo. |
+| **R5** | **There is no blocked item.** Anything stuck is either fixed automatically or becomes a **user question** (the AGENTS.md question protocol). The same applies to issues. ⚠️ **Sequence:** while the question gate is unbuilt, `parked-*` remains the de-facto terminal state — **fix the question gate first** (agent-infra#1903), then retire the park. |
+| **R6** | The drain threshold is `MERGE_PRIORITY_AT` — **default 25 open PRs**, tunable per box. |
+| **R7** | One repo per orchestrator; the harness is single-repo by construction (`OR`). |
+| **R8** | **Capacity transfer:** when a machine refuses an item for *capacity*, the item remains eligible for **another** machine. Without this, per-machine correctness becomes fleet-wide starvation (agent-infra#1909). |
+
+### 0.3 Where the current code does not meet them
+
+| req | gap |
+|---|---|
+| R3 | the dispatch pool queries **P0, P1, P2 only**. `P3-polish` exists and is never dispatched; the unlabeled-oldest tier is not implemented, and **no `P4` label exists** in the target repo. |
+| R5 | `parked-<PR>` / `parkreason-<PR>` are **terminal** at `MAX_FIX_TRIES` (3), and `scripts/ask-owner.py` is referenced **zero times** by `orch-loop.sh` / `merge-one.sh` — the escalation path is unbuilt. |
+| R2 | the sweep is state-driven (check status); ownership *is* consulted via `claim_live`, but it is not itself the selection criterion. |
+| R1 | disk is enforced in `spawn-gate.sh` for **spawning**, but the controller's own writes (heartbeat, `state/*`) are unguarded — a full disk kills the loop silently (measured 2026-10-16). The gate is also **source-only**: a caller that does not source `spawn-gate.sh` is invisible to it (agent-infra#1884). |
+
+Each gap above is tracked in an issue, and **each of those issues carries the obligation to update this section when it is delivered**: R3 → the ladder, R5 → **#1903**, R1 → **#1884**, §0.1 → **#1901**, §0.5 `SCOPE` → **#1908**, R8 → **#1909**.
+
+### 0.4 Cross-machine coordination — guaranteed, and not
+
+Guaranteed: a claim is an **atomic CAS in the shared repo** — `refs/claims/<PR>-<head-sha12>` for
+reviews, `issue-<N>` for dispatches. The lease is **data, not liveness**, so a dead box's claim
+expires; every release/reclaim is fenced with `--force-with-lease`; each box reads a snapshot
+refreshed in one fetch per cycle.
+
+**Not** guaranteed: exactly-once execution. The promise is **at-least-once with idempotent side
+effects**, and that promise is **not uniform across operations** — the distinction decides whether a
+duplicate is merely wasteful or destructive:
+
+| operation | a duplicate means | verdict |
+|---|---|---|
+| **dispatch** (opening a lane for an issue) | a wasted worker; the side effect is idempotent per issue | tolerable |
+| **landing** (merging a PR) | a **second landing attempt against a moved head** — the reviewed diff is no longer the diff being merged | **not tolerable**; the head-bound record is why |
+
+A claim *reduces* duplicate work; it does not prove mutual exclusion. Any design that assumes "a claim
+means it runs once" is wrong (research: agent-infra#1709).
+
+### 0.5 Inventory — required, additive, legacy
+
+**Required** (implements a requirement): `orch-loop.sh` (R1, R2, R6) · `refresh-candidates.sh` (R3) ·
+`dispatch-merge.sh`, `lane.sh`, `chain-merge.sh`, `merge-one.sh`, `fix-one.sh` (R2, R5) ·
+`claims.sh` (R4) · `spawn-gate.sh` (R1).
+
+**Additive — kept. Not owner-required, but load-bearing for correctness:**
+
+| component | why it stays |
+|---|---|
+| `repo-authority.sh` | the per-repo merge contract; without it tortoise's required-check names are enforced on every other repo |
+| `record-review.sh` + HMAC marker + `ai-review-gate` | the gate-mode repo requires a signed review artifact in the PR body |
+| `admin-merge.sh` / `atomic-land.sh` | the only safe landing path for a behind head and for `--admin` |
+| `selftest.sh` + the `*.test.sh` contracts | each pins one mechanism and is RED on the pre-fix tree; they caught real defects in contributed fixes |
+| `check-port-drift.sh` + `port-provenance.txt` | gates removal of the tortoise-side copy |
+| `check-deployed-drift.sh` | answers "which harness commit is this box running?" |
+| `report.sh`, the wall-time series, the `[res]` line | cheap measurement — it is how the reviewer stall rate was found |
+| `install.sh` + `launchd.plist.template` | renders config, refuses out-of-range values, and prints (never runs) the start command |
+| `nonblocking-dispatch.sh` | removes the blocking-caller problem |
+
+**Retired pending measurement — do NOT act on yet:**
+
+| component | why it waits |
+|---|---|
+| **the `SCOPE=own` partition** ("exactly one BROAD box, others OWN") | It was introduced because ownership was **unknowable**, and it does strand work nobody owns — but §0.4 says claims are **at-least-once, not mutual exclusion**, so pinning a box to `own` is still the only barrier that *provably* stops a second box draining the shared queue. Retire it only once a claim is **demonstrated** to exclude under concurrency. (agent-infra#1850 is **closed**; the measurement is the obligation.) — **agent-infra#1908** |
+
+**Legacy — retired, must not run:**
+
+| component | why retired |
+|---|---|
+| `parked-*` / `parkreason-*` as a terminal state | to be replaced by the ask-user escalation (R5) |
+| swarm-era coordination jobs — `coordinator`, `swarm-watchdog`, `agent-implementer`, `agent-strategist`, `team-strategist`, `pipeline-ingest` | superseded by this harness; two dispatch systems on one box double-dispatch. The swarm repo's `origin/main` has had **no commits since 2026-09-18** (checked against the remote, not a local checkout — a local one here was 283 commits behind) |
+| the `content-inspiration` job | its entry point was an uncommitted file; the `.mjs` pipeline survives on its branch |
+| `retired/` (6 scripts) | earlier iterations, kept for the record only |
+
+### 0.6 Activation is part of the design, not an afterthought
+
+Having the right code and **running** the right code are different problems. `install.sh` renders
+the plist and deliberately does not start anything, and nothing parks the legacy jobs. Until an
+`activate.sh` declares the intended running set, "which system is this box running?" has no single
+answer — measured 2026-10-16: this harness was **dormant** while six swarm-era dispatchers fired
+every 120 s.
+
+### 0.7 The load ceiling
+
+`MAX_LOAD` is where a box stops adding work. It is **derived, not fixed**: `cores × 8`, overridable
+per box (`MAX_LOAD` in the plist or `keys.env`), with a hard fallback of **32** when the core probe
+is unusable.
+
+> ⚠️ **Landing order.** This rule is implemented by PR **#1907** (`×10 → ×8`). Until that merges, the
+> shipped code still derives `cores × 10`, and the gate table further down this file still says so.
+> Land **#1907 before this document**, or land them together.
+
+| cores | ceiling |
+|---|---|
+| 4 | 32 ← also the fallback when `_NCPU` cannot be probed |
+| 8 | 64 |
+| 10 | 80 |
+
+**Why ×8.** The previous default was `cores × 10` (8 → 80, 10 → 100), which corresponds to the
+highest load observed as tolerable on a 10-core box. ×8 keeps a deliberate margin *below* what was
+seen to work: on a machine that is also somebody's laptop, load is a symptom of contention rather
+than a target to reach. A dedicated box can raise it with the override; the derived value stays
+conservative by design.
+
+> `MAX_LOAD` and `MERGE_PRIORITY_AT` are different gates and are often confused: `MAX_LOAD` is about
+> the box's capacity, `MERGE_PRIORITY_AT` (default **25**) is about the PR queue — above it the loop
+> drains instead of opening new work, regardless of how idle the box is.
+
 ## 1. Why it exists
 
 The repo's normal path is one agent, one issue, one PR, human-paced. On a box that is left
@@ -344,6 +481,10 @@ export SCOPE=own                         # drain scope: auto (default) | own | b
                                          # A fleet runs ONE broad box; the rest pin own (section 5).
                                          # install.sh renders this into the plist (launchd
                                          # inherits no shell env) and refuses a bad value.
+                                         # ⚠️ Retained, NOT retired: claims are at-least-once, not
+                                         # mutual exclusion, so `own` is still the only barrier that
+                                         # provably stops a second box draining the shared queue.
+                                         # Retirement waits on a demonstrated exclusion — #1908.
 
 # 3. Render + install the launchd agent (does NOT load it). Invoke it BY PATH, from that same
 #    repo root: install.sh resolves `launchd.plist.template` from ITS OWN directory, so
@@ -532,8 +673,11 @@ off macOS (it renders a launchd plist) — the portability that matters is `orch
    the count: `auto`
    (default — the rule above), `own` (own-only even above the threshold), `broad` (broad even below
    it); any other value is fatal, so a typo cannot silently pick a scope. In a multi-box fleet
-   exactly one box takes `broad` and the rest pin `SCOPE=own` (measured 2026-10-13: an unpinned
-   fresh cell logged `[scope] open=14 -> BROAD` and auto-armed #8425/#8420 within ~25s).
+   **exactly one box takes `broad` and the rest pin `SCOPE=own`** (measured 2026-10-13: a freshly
+   started cell logged `[scope] open=14 -> BROAD` and auto-armed #8425/#8420 within ~25s).
+   ⚠️ **This pin is RETAINED, not retired (#1908).** Claims are at-least-once, not mutual
+   exclusion, so `own` remains the only *provable* barrier against a second box draining the
+   shared queue. Retire it only once a claim is demonstrated to exclude under concurrency.
    ⛔ **This is a partition, not coordination.** Ownership is still inferred from *local*
    branches/worktrees, which are invisible across boxes, so two `own`-pinned boxes can still race
    the same PR (§7.2b, tortoise#5052) — the pin must not be mistaken for a claim registry.
@@ -751,7 +895,8 @@ live under `refs/claims-tmp/*`, **not** the pruned `refs/claims-cache/*` namespa
 purpose** — if the claim store is unreachable the harness proceeds and logs it — because
 agent-infra#1709's headline finding is that duplicate execution is unavoidable and the side effects
 must be idempotent per head, so failing closed would stall the whole fleet on one transient error.
-`SCOPE=own` (§5, item 3) remains a useful partition but is no longer the only cross-box barrier.
+`SCOPE=own` (§5, item 3) remains a useful partition but is no longer the only cross-box barrier —
+and it is **retained** until a claim is demonstrated to exclude under concurrency (§0.5, #1908).
 
 ### 7.2c ISSUE dispatch was the uncovered window — **FIXED in agent-infra#1850**
 
