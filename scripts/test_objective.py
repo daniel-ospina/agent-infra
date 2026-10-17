@@ -342,3 +342,81 @@ def test_a_stale_sample_does_not_manufacture_a_growth_verdict(monkeypatch):
     _stub_reads(monkeypatch, waiting=21, crit_max=12.0)
     line = objective.build(prev=(12, 7200.0))
     assert "VERDICT=ADVANCING" in line, line
+
+
+# --- THE PER-CLASS SEGMENT IS **STATE**, NOT A SECOND DISPATCH LIST (#1872) ---------------
+# The beat printed `DO: call-rail=1: #8795 (STUCK 3 beats — land or say why)` while `pr-doctor`
+# was running its own pass over the SAME PRs -- two copies of one decision, and the fleet follows
+# the instruction instead of the chain (measured 2026-10-16: the PR landed by hand). The counts
+# stay, as STATE, and a MONITOR keeps the two things only it can supply: main's health, the
+# objective's direction, and the one human gate (`ASK-USER`).
+
+def _stub_queue(monkeypatch, tmp_path, *, nondraft=4, classes=None, by_class=None,
+                surface=0, unknown=0, surface_prs=None):
+    monkeypatch.setattr(objective, "STATE", str(tmp_path))
+    monkeypatch.setattr(objective, "STUCK_FILE", str(tmp_path / "call-rail-stuck.json"))
+    monkeypatch.setattr(objective, "main_sha", lambda: SHA)
+    monkeypatch.setattr(objective, "main_health", lambda sha: ("GREEN", []))
+    monkeypatch.setattr(objective, "ci_critical_path", lambda: (5.0, "test (a)", 6.0))
+    monkeypatch.setattr(objective, "queue", lambda: {
+        "open": nondraft, "drafts": 0, "nondraft": nondraft, "dirty": 0, "unstable": 0,
+        "unknown": unknown, "classes": classes, "by_class": by_class or {},
+        "surface": surface, "surface_prs": surface_prs or []})
+
+
+def test_the_queue_segment_is_labelled_state_and_not_an_instruction(monkeypatch, tmp_path):
+    """The label IS the fix: `DO:` named work an automatic chain was already doing."""
+    from collections import Counter
+    _stub_queue(monkeypatch, tmp_path,
+                classes=Counter({"call-rail": 1, "record-review": 2, "running": 1}),
+                by_class={"call-rail": [(8795, None)],
+                          "record-review": [(8801, None), (8802, None)],
+                          "running": [(8806, None)]},
+                surface=1, surface_prs=[9001])
+    line = objective.build()
+    assert "| QUEUE(state; pr-doctor dispatches): " in line, line
+    assert "DO: " not in line, line                       # the instruction token is GONE
+    # ...the counts and their objects are still REPORTED -- as state
+    assert "call-rail=1: #8795" in line, line
+    assert "record-review=2: #8801 #8802" in line, line
+    # `running` is NAMED, not just counted (#1872 review): a check-run can stay non-completed
+    # indefinitely, so a bare `running=2` would let a wedged PR hide behind a number
+    assert "running=1: #8806" in line, line
+    # ...and the one thing only a human can take still reaches the owner -- WITH its objects
+    assert "ASK-USER: surface=1: #9001" in line, line
+
+
+def test_a_stuck_landable_pr_is_reported_as_a_fact_about_the_dispatcher(monkeypatch, tmp_path):
+    """The escalation must not be a second order. What the monitor can add is that a landable PR
+    has been landable for N beats and the chain has still not landed it."""
+    from collections import Counter
+    _stub_queue(monkeypatch, tmp_path, classes=Counter({"call-rail": 1}),
+                by_class={"call-rail": [(8795, None)]})
+    objective.build()                                     # beat 1: not stuck yet
+    line = objective.build()                              # beat 2: one full beat of waiting
+    assert "STUCK 2 beats" in line, line
+    assert "pr-doctor has not landed it" in line, line
+    assert "land or say why" not in line, line            # NOT an order
+
+
+def test_REGRESSING_still_reaches_the_owner_with_the_new_segment(monkeypatch, tmp_path):
+    """The MONITOR half must survive the change: direction over the window is why the token is
+    worth waking a human for, and it must not be collateral damage of renaming a label."""
+    from collections import Counter
+    _stub_queue(monkeypatch, tmp_path, nondraft=21, classes=Counter({"fix-ci": 3}),
+                by_class={"fix-ci": [(9, "docs"), (8, "docs"), (7, "python-ci-gate")]})
+    line = objective.build(prev=(12, 120.0))
+    assert "VERDICT=REGRESSING" in line, line
+    assert "| QUEUE(state; pr-doctor dispatches): " in line, line
+    assert "IN-PROGRESS: fixing docs=2 python-ci-gate=1" in line, line
+
+
+def test_a_missing_class_is_not_printed_as_a_zero(monkeypatch, tmp_path):
+    """An absent token is honest; a printed zero is a claim. The state segment keeps that rule."""
+    from collections import Counter
+    _stub_queue(monkeypatch, tmp_path, classes=Counter({"fix-ci": 1, "running": 2}),
+                by_class={"fix-ci": [(9, "docs")], "running": [(8, None), (7, None)]})
+    line = objective.build()
+    assert "call-rail=0" not in line, line
+    assert "record-review=0" not in line, line
+    assert "running=2" in line, line

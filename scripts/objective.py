@@ -468,7 +468,19 @@ SURFACE_PATHS = ("tortoise/sdk.py", "tortoise/tool_registry.py",
 # `rerun-checks` and `resolve-conflict` sit ABOVE `record-review` because a missing check
 # tells you NOTHING and a rebase CHANGES THE HEAD, staling any attestation.
 CLASS_ORDER = ("call-rail", "blocked-by-rail", "rerun-checks", "resolve-conflict",
-               "record-review", "fix-ci")
+               "record-review", "running", "fix-ci")
+# ⛔ `running` IS A CLASS, NOT A GAP (#1872). A required check that is still IN FLIGHT is not
+# work: the PR needs nothing but time. It has its own class because the alternative -- folding
+# it into `fix-ci`, which this file did until 2026-10-16 -- told the fleet to go FIX a suite
+# that was still executing. MEASURED live: #8825's `pricing-artifact` was mid-run, and the DO
+# list named it as fix work.
+#
+# ⛔ AND THERE IS EXACTLY ONE CLASSIFIER. `pr-doctor.py`, the dispatcher, reads THIS file's
+# `classify_one()`; it used to carry a second predicate under its own names (ready / failing /
+# unreviewed / no-checks / running), sharing no code. MEASURED 2026-10-16 over the 11 live
+# non-draft PRs: the two DISAGREED ON 4 (36%) -- #8825 (`fix-ci` vs `running`), and #8806 /
+# #8822 / #8824 (`fix-ci` vs `unreviewed`). Same queue, same question, two answers. The beat
+# may report the counts and the dispatcher acts on them, but they must come from one predicate.
 # ⛔ RAIL_GATES MUST TRACK `scripts/admin-merge.sh` -- AND `call-rail` MEANS "THE RAIL WILL
 # ACCEPT IT", NOTHING WEAKER. The rail refuses on MORE than the 7 branch-protection contexts.
 # MEASURED 2026-10-10: `call-rail=1: #7924 (STUCK 3 beats)` sent a lane to call a rail that
@@ -502,7 +514,12 @@ NOT_REQUIRED_CHECKS = ("agent-infra-ci / lint",)
 # So these classes name their PRs. `fix-ci` deliberately does NOT (it is often 6+ PRs and would
 # swamp the line with the one class that needs no triage to act on).
 NAMED_CLASSES = ("call-rail", "blocked-by-rail", "record-review", "resolve-conflict",
-                 "rerun-checks")
+                 "rerun-checks", "running")
+# ⛔ `running` IS NAMED TOO (#1872). It is the one class whose action is "wait", and a check-run
+# can stay non-`completed` indefinitely (a `queued` job starved of runners is MEASURED behaviour
+# in this fleet). A bare `running=2` names no object, so a wedged PR would be invisible to every
+# reader -- and `rollup_checks` has no age bound by design (a slow shard is not a stuck one).
+# Naming the PRs is what lets a human see WHICH one is not moving.
 STUCK_FILE = os.path.join(STATE, "call-rail-stuck.json")
 
 
@@ -533,10 +550,17 @@ def _stuck_bump(prs):
 
 
 def _class_token(name, count, prs=None, stuck=None):
-    """`call-rail=3: #7960 #7924 #7920 (STUCK 3 beats — land or say why)`.
+    """`call-rail=3: #7960 #7924 #7920 (STUCK 3 beats — pr-doctor has not landed it)`.
 
     The count is the priority signal and the numbers are the WORK. Escalation uses the
     longest-waiting PR, so one old stuck PR alarms even beside a freshly-arrived one.
+
+    ⛔ THE ESCALATION STATES A FACT; IT DOES NOT GIVE AN ORDER (#1872). It used to end
+    "— land or say why", which is an instruction to whoever reads the beat -- and the work it
+    named was already `pr-doctor`'s, so the line was a second copy of a decision the chain was
+    executing. What a MONITOR can add is the thing the dispatcher cannot see: that a landable PR
+    has been landable for N beats and the chain has still not landed it. That is a state, and it
+    is the alarm worth waking a human for.
     """
     tok = f"{name}={count}"
     if prs and name in NAMED_CLASSES:
@@ -544,7 +568,7 @@ def _class_token(name, count, prs=None, stuck=None):
     if name == "call-rail" and prs and stuck:
         n = max(stuck.get(str(p), 0) for p, _w in prs)
         if n >= 2:
-            tok += f" (STUCK {n} beats — land or say why)"
+            tok += f" (STUCK {n} beats — pr-doctor has not landed it)"
     return tok
 
 
@@ -656,7 +680,14 @@ def classify_pr(pr, cr, att_clean):
     red, flight = rollup_checks(cr)
     seen = {c.get("name") for c in cr if c.get("name")}
     req_seen = [n for n in REQUIRED if n in seen]
-    nongreen = [n for n in REQUIRED if n in red or n in flight or n not in seen]
+    # `ai-review-gate` is DIFF-BOUND (arm 1), so it is not a gate this predicate WAITS on: its
+    # truth is the head-bound attestation file, never its check-run. Everything below is about
+    # the other six.
+    gated = [n for n in REQUIRED if n != "ai-review-gate"]
+    gated_absent = [n for n in gated if n not in seen]
+    gated_red = [n for n in gated if n in red]
+    gated_flight = [n for n in gated if n in flight]
+    nongreen = [n for n in gated if n in red or n in flight or n not in seen]
     # ⛔ `ai-review-gate` IS DIFF-BOUND, SO IT MUST NOT GATE `call-rail`. It goes RED BY
     # CONSTRUCTION on any PR whose record was written AFTER its last run -- MEASURED 2026-10-10:
     # red on 8 of 11 open PRs, INCLUDING #7960, which already carried a CURRENT CLEAN
@@ -667,92 +698,149 @@ def classify_pr(pr, cr, att_clean):
     # attestation). The gate's real condition is SEMANTIC -- "a clean review is recorded at this
     # head" -- and the head-bound attestation FILE states that authoritatively, so the check-run
     # is only a stale PROXY for `ai-review-gate` and never for the other six.
-    nongreen_x = [n for n in nongreen if n != "ai-review-gate"]
     # 1. call-rail -- every required check EXCEPT `ai-review-gate` is green AND a clean
     #    attestation exists at the CURRENT head AND the RAIL ITSELF would take it. The last
     #    clause was missing: an attested PR the rail refuses is a NAMED defect, not "not ready".
-    if not nongreen_x and att_clean:
+    #    ⛔ THIS ARM STAYS FIRST, so a LANDABLE PR is never delayed by a running check elsewhere
+    #    (see arm 4): the cheapest landing on the board must not queue behind a non-gating job.
+    if not nongreen and att_clean:
         return "blocked-by-rail" if rail_block_reason(red, flight, seen) else "call-rail"
     # 2. rerun-checks -- NO required check EVER ran at this head (`drive`/`drift-guard`/
     #    `sigpipe-guard` being red cannot reach here: they are not in REQUIRED).
     if not req_seen:
         return "rerun-checks"
-    # 3. resolve-conflict -- GitHub says DIRTY.
+    # 3. resolve-conflict -- GitHub says DIRTY. A rebase CHANGES THE HEAD, so it is right even
+    #    while checks are still running (they all re-run anyway) -- which is why it sits ABOVE
+    #    the `running` arm below.
     if (pr.get("mergeStateStatus") or "") == "DIRTY":
         return "resolve-conflict"
-    # 4. record-review -- every required check EXCEPT `ai-review-gate` is green and there is NO
+    # 4. running -- THE HEAD IS STILL EXECUTING, and nothing can be decided about it yet.
+    #    ⛔ THE SIGNAL IS NOT ONLY "a REQUIRED check is in flight". MEASURED 2026-10-16:
+    #    `python-ci-gate` is ABSENT while its child jobs run (`test (a)`, `test-slow (a)`, ...) --
+    #    the gate job is created only AFTER the matrix finishes. So the absence of a required
+    #    gate while ANY check at this head is in flight means "not reported yet", not "never
+    #    ran": #8806 / #8824 / #8825 / #8827 were exactly that, and both old readers sent them
+    #    to work (the beat: `fix-ci`, go repair the code; the dispatcher's fork: `running` on one
+    #    and `unreviewed` on two -- go review it).
+    #    ⛔ BUT A RED REQUIRED CHECK IS STILL WORK, even beside a running unrelated job: waiting
+    #    on a lint/typecheck job to finish before repairing a genuinely failing gate would only
+    #    delay the fix (#8708). So the arm covers flight-or-not-yet-reported, NEVER red -- the
+    #    `not gated_red` term is load-bearing and was MISSING in the first cut of this change:
+    #    `docs` RED while `python-ci-gate` is still absent is the DOMINANT live shape (a fast
+    #    required context fails long before the matrix finishes), so without it every such PR
+    #    was reported `running` for the rest of the suite and no lane ever repaired it.
+    if (gated_flight or (gated_absent and flight)) and not gated_red:
+        return "running"
+    # 5. record-review -- every required check EXCEPT `ai-review-gate` is green and there is NO
     #    current clean attestation at this head. This is the LEGITIMATE case, and it is the exact
     #    complement of arm 1: the ONLY difference between landing a PR and re-recording it is
     #    whether the attestation at THIS head exists, which is why the file -- not the check-run
     #    -- decides. (An all-green `ai-review-gate` with a SUPERSEDED record lands here too: a
     #    green gate at an old head is evidence about that head, not this one.)
-    if not nongreen_x and not att_clean:
+    if not nongreen and not att_clean:
         return "record-review"
-    # 5. fix-ci -- any OTHER required check non-green: real code work.
+    # 6. rerun-checks -- SOME required check never ran at this head while others COMPLETED, and
+    #    the head is not executing (arm 4). Absence is not green, and it is not a failure to FIX:
+    #    the job that was never created has to be STARTED. MEASURED #8822: `python-ci-gate`
+    #    absent (its job never got created) with `drift-guard` red and NOTHING in flight -- the
+    #    arms above made that `fix-ci` (send a lane to repair code), and the dispatcher's fork
+    #    called it review-only (`unreviewed`). Both were wrong: re-trigger the check first.
+    if gated_absent and not gated_red:
+        return "rerun-checks"
+    # 7. fix-ci -- a required check is RED: real code work.
     return "fix-ci"
 
 
 def fix_ci_reasons(cr):
-    """The REQUIRED check names that are non-green, sorted -- the IN-PROGRESS work list.
+    """The REQUIRED check names that are RED, sorted -- the IN-PROGRESS work list.
 
     ⛔ ONLY THE 7 BRANCH-PROTECTION CONTEXTS MAY APPEAR. This list once carried every red job
     name, so it read `python-ci-gate=11 test (b)=4 test (g)=3 test-slow (a)=3 ... drive` -- job
     names that are all inside the ONE required context `python-ci-gate`, plus non-required
     checks (`drive`, `manifest-integrity`, `agent-infra-ci / lint`). That over-reported the work
-    and sent lanes at jobs that gate nothing. NOW: a red, in-flight, or NEVER-RAN required
-    check counts (absence is not green here -- a check that never ran IS the `rerun-checks`
-    work), `ai-review-gate` is excluded (it has its own action), and SELF_DEFEATING_CHECKS are
-    excluded explicitly.
+    and sent lanes at jobs that gate nothing. NOW: only RED required checks count;
+    `ai-review-gate` is excluded (it has its own action), and NOT_REQUIRED_CHECKS explicitly.
+
+    ⛔ AND RED IS NOW THE ONLY QUALIFIER (#1872). This used to count a check that was in flight
+    or NEVER RAN as work to fix -- true while `fix-ci` was the catch-all, false since `running`
+    and the partial-absence `rerun-checks` arm took those cases. Listing them here would tell a
+    lane to FIX a suite that is still executing, or one that was never started.
     """
-    red, flight = rollup_checks(cr)
-    seen = {c.get("name") for c in cr if c.get("name")}
+    red, _flight = rollup_checks(cr)
     return sorted(n for n in REQUIRED
-                  if (n in red or n in flight or n not in seen)
-                  and n != "ai-review-gate" and n not in NOT_REQUIRED_CHECKS)
+                  if n in red and n != "ai-review-gate"
+                  and n not in NOT_REQUIRED_CHECKS)
+
+
+def classify_one(p):
+    """(class, why, cr) for ONE non-draft PR -- THE SINGLE CLASSIFIER, one read of the evidence.
+
+    Both readers go through here: `classify_queue()` below (the beat's per-class counts) and
+    `scripts/pr-doctor.py` (the dispatcher's plan). Same predicate, same check-run read, same
+    attestation read -- so their answers cannot disagree (#1872: the beat and the dispatcher
+    differed on 4 of 11 live PRs while both looked correct).
+
+    ⛔ WHAT THIS GUARANTEES, AND WHAT IT DOES NOT. It guarantees ONE PREDICATE over ONE KIND OF
+    EVIDENCE. It does NOT make two processes see one snapshot: the beat reads its queue through
+    a 900s cache (`--max-age`) while the dispatcher reads every pass, and the dispatcher lists
+    PRs with a smaller page limit. So a disagreement can only come from the INPUT (a different
+    moment, or a PR beyond a page limit) -- never from two different rules, which is the defect
+    this seam removes.
+
+    Returns `cr` too, because a dispatcher's brief needs the evidence beside the class and a
+    second read of it would be a second truth. `why` is the reason rendered beside a class that
+    names its object (`blocked-by-rail`'s refusing gate, `fix-ci`'s red checks), else None.
+    """
+    head = p.get("headRefOid") or ""
+    cr = per_pr_checks(head)
+    k = classify_pr(p, cr, attestation_clean(p.get("number"), head))
+    why = None
+    if cr and k == "blocked-by-rail":
+        _red, _fl = rollup_checks(cr)
+        why = rail_block_reason(_red, _fl, {c.get("name") for c in cr if c.get("name")})
+    elif cr and k == "fix-ci":
+        # ⛔ FILTERED BY `REQUIRED` -- THE BUCKET COUNTS ONLY THE 7 BRANCH-PROTECTION CONTEXTS.
+        # It previously counted EVERY red job name, so the list carried
+        # `test (b)`/`test (g)`/`test-slow (a)`-class job names (all inside the ONE required
+        # context `python-ci-gate`), plus `drive` and `manifest-integrity`, which are NOT
+        # required and never gate a merge. Measured 2026-10-11: the list ran to
+        # `python-ci-gate=11 test (b)=4 test (g)=3 test-slow (a)=3 ... drive` -- an inflated
+        # count over checks no lane has to fix, which is how the bucket both over-reported work
+        # and sent lanes at non-gating jobs.
+        why = ",".join(fix_ci_reasons(cr)) or "?"
+    return k, why, cr
 
 
 def classify_queue(non):
-    """(Counter of CLASS_ORDER, surface_count) or (None, surface) when ANY PR was unreadable.
+    """(Counter of CLASS_ORDER, surface_count, by_class, surface_prs), or (None, n, {}, []) when
+    ANY PR was unreadable.
 
-    FIRST MATCH makes the five buckets a PARTITION of `nondraft`, asserted here rather than
-    assumed: the token is omitted entirely when the sum does not reconcile, because a partial
-    sum that still LOOKS like a partition is worse than no token at all.
+    FIRST MATCH makes the buckets a PARTITION of `nondraft`, asserted here rather than assumed:
+    the token is omitted entirely when the sum does not reconcile, because a partial sum that
+    still LOOKS like a partition is worse than no token at all.
+
+    `surface_prs` names the PRs behind `ASK-USER: surface=N` -- a gate whose output is "N things
+    need you" without naming them is a stall with a receipt (#1872 review finding).
     """
     classes, surface, unread = defaultdict(int), 0, 0
     by_class = defaultdict(list)
+    surface_prs = []
     for p in non:
-        head = p.get("headRefOid") or ""
-        cr = per_pr_checks(head)
-        k = classify_pr(p, cr, attestation_clean(p.get("number"), head))
+        k, why, _cr = classify_one(p)
         if k is None:
             unread += 1
         else:
             classes[k] += 1
-            why = None
-            if k == "blocked-by-rail" and cr:
-                _red, _fl = rollup_checks(cr)
-                why = rail_block_reason(_red, _fl,
-                                        {c.get("name") for c in cr if c.get("name")})
-            elif k == "fix-ci" and cr:
-                # ⛔ FILTERED BY `REQUIRED` -- THE BUCKET COUNTS ONLY THE 7 BRANCH-PROTECTION
-                # CONTEXTS. It previously counted EVERY red job name, so the list carried
-                # `test (b)`/`test (g)`/`test-slow (a)`-class job names (all inside the ONE
-                # required context `python-ci-gate`), plus `drive` and `manifest-integrity`,
-                # which are NOT required and never gate a merge. Measured 2026-10-11: the list
-                # ran to `python-ci-gate=11 test (b)=4 test (g)=3 test-slow (a)=3 ... drive` --
-                # an inflated count over checks no lane has to fix, which is how the bucket both
-                # over-reported work and sent lanes at non-gating jobs.
-                # A required check that is RED, IN FLIGHT, or NEVER RAN all count: absence is
-                # not green here (a check that never ran is exactly the `rerun-checks` work).
-                why = ",".join(fix_ci_reasons(cr)) or "?"
             by_class[k].append((p["number"], why))
         if touches_surface(p):
             surface += 1
+            surface_prs.append(p.get("number"))
     if unread or sum(classes[k] for k in CLASS_ORDER) != len(non):
-        return None, surface, {}      # PARTITION INVARIANT -- omit rather than mislead
+        # PARTITION INVARIANT -- omit rather than mislead
+        return None, surface, {}, sorted(surface_prs)
     for k in by_class:
         by_class[k].sort()
-    return classes, surface, dict(by_class)
+    return classes, surface, dict(by_class), sorted(surface_prs)
 
 
 def queue():
@@ -783,11 +871,12 @@ def queue():
     # answer this instrument can give (same fail-open class as GH_BLOCKED, #6142).
     _KNOWN = {"BLOCKED", "DIRTY", "UNSTABLE", "CLEAN", "BEHIND", "HAS_HOOKS"}
     unknown = sum(c for k, c in ms.items() if k not in _KNOWN)
-    classes, surface, by_class = classify_queue(non)
+    classes, surface, by_class, surface_prs = classify_queue(non)
     return {"open": len(prs), "drafts": len(prs) - len(non), "nondraft": len(non),
             "dirty": ms.get("DIRTY", 0),
             "unstable": ms.get("UNSTABLE", 0), "unknown": unknown,
-            "classes": classes, "by_class": by_class, "surface": surface}
+            "classes": classes, "by_class": by_class, "surface": surface,
+            "surface_prs": surface_prs}
 
 
 def _previous_sample():
@@ -856,23 +945,33 @@ def build(prev=None):
         # diagnostics -- they are the useful breakdown of a queue -- but they no longer
         # masquerade as the queue itself.
         parts.append(f"open={q['open']} drafts={q['drafts']} nondraft={q['nondraft']}")
-        # ── THE ACTION VOCABULARY, in place of `blocked` (owner-designed, 2026-10-10) ──
-        # The deleted token counted `mergeStateStatus=BLOCKED`, which GitHub emits for SEVERAL
-        # unrelated conditions, so it needed a sentence of apology ("counter(not a work count)")
-        # to say so -- and A VOCABULARY THAT NEEDS AN APOLOGY IS THE WRONG VOCABULARY.
-        # MEASURED 2026-10-10 on 10 non-draft PRs: 8 read BLOCKED and 2 DIRTY, and of the 8,
-        # FOUR had `ai-review-gate` as their ONLY red -- i.e. RECORD IT, zero code work -- and
-        # ONE had never run a required check at all. The word was concealing the CHEAPEST
-        # LANDINGS on the board. Every token below names an ACTION, never a state, and zero
-        # tokens are OMITTED: an absent token is honest, a printed zero is a claim.
+        # ── THE PER-CLASS SEGMENT: **STATE**, NOT A SECOND DISPATCH LIST (#1872) ──────────
+        # These are the owner-designed action tokens (2026-10-10) -- they replaced `blocked`,
+        # which counted `mergeStateStatus=BLOCKED` and needed a sentence of apology ("counter,
+        # not a work count") to be read correctly: A VOCABULARY THAT NEEDS AN APOLOGY IS THE
+        # WRONG VOCABULARY. MEASURED 2026-10-10 on 10 non-draft PRs: 8 read BLOCKED and 2
+        # DIRTY, and of the 8, FOUR had `ai-review-gate` as their ONLY red -- i.e. RECORD IT,
+        # zero code work -- and ONE had never run a required check at all.
+        # ⛔ BUT THEY ARE NOT AN INSTRUCTION, and the label says so. `pr-doctor.py` -- the
+        # background dispatcher -- already CLASSIFIES AND ACTS on every one of these classes,
+        # from the SAME classifier (`classify_one()`), at the machine's configured capacity.
+        # The segment used to print as `DO:`, i.e. a second, uncoordinated copy of a decision an
+        # automatic chain was already executing; measured 2026-10-16 a beat printed
+        # `DO: call-rail=1: #8795 (STUCK 3 beats -- land or say why)` while pr-doctor was
+        # running its own pass over the same PRs, and the PR then landed BY HAND (`2d52ecc7`).
+        # A monitor's job here is to MEASURE AND REPORT: the queue's depth and shape, main's
+        # health, and the one thing only a human can take (`ASK-USER`). It never tells the
+        # fleet to do work the chain owns; a state token that LOOKS like an order is how a lane
+        # gets sent to duplicate live work. Zero tokens are OMITTED: an absent token is honest,
+        # a printed zero is a claim.
         # `waiting` is unchanged and load-bearing -- it is the queue depth the verdict compares
         # against `TARGET_PRS`.
-        _do = q.get("classes")
-        if _do:
+        _qcls = q.get("classes")
+        if _qcls:
             _bc = q.get("by_class") or {}
             _stuck = _stuck_bump([n for n, _w in (_bc.get("call-rail") or [])])
-            seg = " ".join(_class_token(k, _do[k], _bc.get(k), _stuck)
-                           for k in CLASS_ORDER if _do.get(k) and k != "fix-ci")
+            seg = " ".join(_class_token(k, _qcls[k], _bc.get(k), _stuck)
+                           for k in CLASS_ORDER if _qcls.get(k) and k != "fix-ci")
             # ── IN-PROGRESS: A FIXABLE CI FAILURE IS PROGRESS, NOT BLOCKAGE ──────────────
             # Owner, verbatim: "whenever our tests discover something that needs fixing before
             # running CI again, you label it as blocked instead of doing the work that is
@@ -883,7 +982,7 @@ def build(prev=None):
             # next step is "fix the failing test" HAS AN OWNER AND AN ACTION; it is MOVING.
             # Only ASK-USER and a genuine external wait are ever "not moving".
             # Each entry names WHICH check failed AND how many PRs, so a lane knows what to open.
-            if _do.get("fix-ci"):
+            if _qcls.get("fix-ci"):
                 _cnt = defaultdict(int)
                 for _num, _why in (_bc.get("fix-ci") or []):
                     for _nm in (_why or "?").split(","):
@@ -894,9 +993,13 @@ def build(prev=None):
                         f"{n}={c}" for n, c in sorted(_cnt.items(), key=lambda kv: (-kv[1], kv[0])))
             if q.get("surface"):
                 # An OVERLAY, not a sixth bucket: it does not break the partition, because a
-                # surface change can also need work. It names the one action only the USER may take.
-                seg += f" | ASK-USER: surface={q['surface']}"
-            parts.append(f"waiting={q['nondraft']} prs: {q['nondraft']} nondraft | DO: {seg}")
+                # surface change can also need work. It names the one action only the USER may
+                # take -- AND the PRs, because `surface=2` alone tells the owner nothing he can
+                # act on (a gate whose output is "2 things need you" is a stall with a receipt).
+                _sprs = " ".join(f"#{n}" for n in (q.get("surface_prs") or []) if n)
+                seg += f" | ASK-USER: surface={q['surface']}" + (f": {_sprs}" if _sprs else "")
+            parts.append(f"waiting={q['nondraft']} prs: {q['nondraft']} nondraft "
+                         f"| QUEUE(state; pr-doctor dispatches): {seg}")
         else:
             # `classes` is None when ANY PR's checks were unreadable, so no partition is printed.
             parts.append(f"waiting={q['nondraft']}")
@@ -907,10 +1010,11 @@ def build(prev=None):
         if _blind:
             # A ZERO FROM A BLIND READ IS NOT A CLEARANCE. Kept from the deleted pair: the
             # fail-closed job belongs to whatever token stands where the zeros used to.
-            parts.append(f"queue_read=BLIND({_u}/{q['nondraft']} unread) -- the DO: counts are NOT a clearance")
+            parts.append(f"queue_read=BLIND({_u}/{q['nondraft']} unread) -- the QUEUE counts are NOT a clearance")
         # ⛔ `blocked` IS DELETED AS A TOKEN, AND SO IS ITS CAVEAT. Do not re-add either.
-        # Anything that needs a sentence of apology to be read correctly is the wrong vocabulary;
-        # the ACTION tokens above say what to DO, which is what the beat exists to convey.
+        # Anything that needs a sentence of apology to be read correctly is the wrong vocabulary.
+        # The per-class tokens above say what the queue LOOKS LIKE and who acts on it; they do
+        # not instruct, because `pr-doctor` is already doing exactly that work.
         waiting = q["nondraft"]
     else:
         parts.append("queue=UNREADABLE")
@@ -1352,9 +1456,10 @@ def main():
         line = build(_previous_sample())
     except Exception as e:                      # never break the heartbeat
         line = f"OBJECTIVE VERDICT=UNKNOWN error={str(e)[:60]}"
-    # `RES:` GOES ON ITS OWN LINE. The objective line is already past the 150 chars
-    # `cadence-nudge.sh` reads it with (`cut -c1-150`), so APPENDING this segment would push
-    # `DO: fix-ci=` off the end -- which is how `fix-ci=` is being truncated today.
+    # `RES:` GOES ON ITS OWN LINE. `cadence-nudge.sh` reads the objective line with a
+    # `cut -c1-700` (MEASURED 2026-10-16: a fully populated 14-PR line is 628 chars), so
+    # APPENDING this segment would push the tail of the `QUEUE:` segment -- the CI indicators,
+    # and `queue_read=BLIND` before them -- off the end.
     try:
         res = res_line()
     except Exception as e:

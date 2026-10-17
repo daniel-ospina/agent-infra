@@ -275,10 +275,14 @@ except Exception:
     print("")
 PYAGE
 }
-# R8-- the DO: tokens now NAME their PRs, so the old 150-char cut severed exactly the part
-# that makes them actionable (it is how `fix-ci=` was already being truncated). Raised to
-# cover the whole DO segment; the RES: line is separate and needs no cut.
-obj=$(sed -n '2p' "$STATE/objective.last" 2>/dev/null | cut -c1-400)
+# R8-- the per-class tokens NAME their PRs, so the old 150-char cut severed exactly the part
+# that makes them readable (it is how `fix-ci=` was already being truncated). #1872 lengthened
+# the segment twice: the label is now `QUEUE(state; pr-doctor dispatches): ` (so the counts
+# cannot be mistaken for an instruction the automatic dispatcher already owns) and `running` is
+# named like every other class. MEASURED worst case -- 14 non-draft PRs with every class
+# populated, the BLIND caveat and the CI indicators: 628 chars. 700 keeps it whole; a line that
+# approaches this bound again needs the number RE-MEASURED, not raised blindly.
+obj=$(sed -n '2p' "$STATE/objective.last" 2>/dev/null | cut -c1-700)
 
 # ── RES: the system-resource segment, on its OWN line (objective.last line 3) ──────────
 # Its own line because the objective line is ALREADY past the 150 chars it is read with, so

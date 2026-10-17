@@ -743,15 +743,23 @@ class TestActionVocabulary:
             value = getattr(self.o, name)
             assert not value.startswith(state), f"{name} points at production: {value}"
 
-    def _cr(self, red=(), absent=(), extra_red=()):
-        """A check-run list for the 7 required contexts, plus optional never-required reds."""
+    def _cr(self, red=(), absent=(), extra_red=(), flight=()):
+        """A check-run list for the 7 required contexts, plus optional never-required reds.
+
+        `flight` builds IN-FLIGHT attempts (`status=in_progress`), which is a different fact from
+        green, red, and absent -- and the one the classifier used to get wrong (#1872). A flight
+        name that is NOT a required context becomes its own check-run, because that is the live
+        shape: `python-ci-gate` is ABSENT while its child jobs run.
+        """
         out, i = [], 0
         for n in self.REQ:
             if n in absent:
                 continue
             i += 1
-            out.append({"id": i, "name": n, "status": "completed",
-                        "conclusion": "failure" if n in red else "success",
+            out.append({"id": i, "name": n,
+                        "status": "in_progress" if n in flight else "completed",
+                        "conclusion": None if n in flight else (
+                            "failure" if n in red else "success"),
                         "app": {"slug": "actions"}, "details_url": self.DU})
         for n in self.o.RAIL_GATES:            # the rail's own gates ride along, GREEN
             i += 1
@@ -760,6 +768,12 @@ class TestActionVocabulary:
         for j, n in enumerate(extra_red):
             out.append({"id": 900 + j, "name": n, "status": "completed",
                         "conclusion": "failure", "app": {"slug": "actions"},
+                        "details_url": self.DU})
+        for j, n in enumerate([x for x in flight if x not in self.REQ]):
+            # A NON-required check in flight is its own check-run -- the live shape is
+            # `python-ci-gate` ABSENT while its child jobs (`test (a)`, ...) run.
+            out.append({"id": 950 + j, "name": n, "status": "in_progress",
+                        "conclusion": None, "app": {"slug": "actions"},
                         "details_url": self.DU})
         return out
 
@@ -862,9 +876,74 @@ class TestActionVocabulary:
         for banned in ("drive", "agent-infra-ci / lint", "test (b)", "manifest-integrity"):
             assert banned not in got, banned
 
-    def test_a_required_check_that_never_ran_is_work(self):
-        """Absence is not green here: a required check that never ran IS the rerun-checks work."""
-        assert "docs" in self.o.fix_ci_reasons(self._cr(absent=["docs"]))
+    def test_a_required_check_that_never_ran_is_rerun_work_NOT_fix_ci_work(self):
+        """Absence is not green, and it is not a FAILURE to repair either.
+
+        A required check that never ran has to be STARTED, so the PR is `rerun-checks`. It used
+        to be counted in `fix_ci_reasons` as well -- while `fix-ci` was the catch-all -- which
+        told a lane to FIX a check that had never executed. Since the partial-absence arm gives
+        it its own class (#1872), the reasons list is RED ONLY.
+        """
+        cr = self._cr(absent=["docs"])
+        assert self.o.classify_pr(self._pr(), cr, False) == "rerun-checks"
+        assert "docs" not in self.o.fix_ci_reasons(cr)
+
+    def test_a_check_still_in_flight_is_running_not_fix_ci(self):
+        """MEASURED LIVE, #8825 (2026-10-16). `pricing-artifact` was mid-run, every other gate
+        green-or-ai-review-gate, and the beat printed it in the fix-ci bucket -- i.e. it told a
+        lane to go FIX code under a suite that was still executing. Waiting is the action: none."""
+        cr = self._cr(red=["ai-review-gate"], absent=["python-ci-gate"],
+                      flight=["pricing-artifact"])
+        assert self.o.classify_pr(self._pr(), cr, False) == "running"
+        # ...and it is not a reason list for anyone's dispatch either
+        assert self.o.fix_ci_reasons(cr) == []
+
+    def test_a_RED_fast_gate_is_work_even_beside_a_running_job(self):
+        """⛔ THE DOMINANT LIVE SHAPE, AND A DEFECT IN THE FIRST CUT OF #1872 (found in review).
+
+        `docs`/`legal-e2e`/`test-isolation`/`license-surface` fail long before the matrix
+        finishes, so "a required check is RED while `python-ci-gate` is not yet created" is the
+        NORMAL state of a PR with a failing fast gate. The `running` arm covers flight-or-
+        not-yet-reported ONLY; without `not gated_red` every such PR read `running` for the rest
+        of the suite and no lane ever repaired it."""
+        cr = self._cr(red=["docs"], absent=["python-ci-gate"],
+                      flight=["agent-infra-ci / lint"])
+        assert self.o.classify_pr(self._pr(), cr, False) == "fix-ci"
+        assert self.o.fix_ci_reasons(cr) == ["docs"]
+        # the same red beside a REQUIRED check in flight is still work
+        cr2 = self._cr(red=["docs"], flight=["python-ci-gate"])
+        assert self.o.classify_pr(self._pr(), cr2, False) == "fix-ci"
+
+    def test_a_partially_absent_head_with_nothing_in_flight_is_rerun_checks(self):
+        """MEASURED LIVE, #8822 (2026-10-16). `python-ci-gate` was absent -- its gate job never
+        got created -- while `drift-guard` was red, and NOTHING was still running. The two old
+        arms sent this to `fix-ci` (the beat) and to `unreviewed` (the dispatcher's fork):
+        re-triggering the missing job is the work, and it comes BEFORE any review."""
+        cr = self._cr(red=["ai-review-gate"], absent=["python-ci-gate"])
+        assert self.o.classify_pr(self._pr(), cr, False) == "rerun-checks"
+
+    def test_the_four_live_disagreements_are_now_one_answer(self):
+        """THE MEASUREMENT THIS CHANGE EXISTS FOR. On 2026-10-16, over the 11 open non-draft PRs,
+        the beat's classifier and the dispatcher's fork disagreed on FOUR, while both looked
+        correct. The shapes below are the actual evidence read at that moment (#8825, #8806,
+        #8822, #8824); each is one PR, and each must now have exactly ONE answer."""
+        cases = {
+            # a red diff-bound gate + a suite still in flight
+            "#8806": self._cr(red=["ai-review-gate"], absent=["python-ci-gate"],
+                              flight=["test (a)", "test-slow (a)"]),
+            # a red diff-bound gate + a rail gate red + the gate job never created
+            "#8822": self._cr(red=["ai-review-gate"], absent=["python-ci-gate"],
+                              extra_red=["drift-guard"]),
+            # a red diff-bound gate + fourteen jobs in flight
+            "#8824": self._cr(red=["ai-review-gate"], absent=["python-ci-gate"],
+                              flight=["test (%s)" % c for c in "abcdefghi"]),
+            # a red diff-bound gate + a required check mid-run
+            "#8825": self._cr(red=["ai-review-gate"], absent=["python-ci-gate"],
+                              flight=["pricing-artifact"]),
+        }
+        got = {n: self.o.classify_pr(self._pr(), cr, False) for n, cr in cases.items()}
+        assert got == {"#8806": "running", "#8822": "rerun-checks",
+                       "#8824": "running", "#8825": "running"}, got
 
     def test_ai_review_gate_has_its_own_action_not_a_fix_ci_entry(self):
         assert "ai-review-gate" not in self.o.fix_ci_reasons(self._cr(red=["ai-review-gate"]))
@@ -889,6 +968,8 @@ class TestActionVocabulary:
         for ms in ("BLOCKED", "DIRTY", "UNSTABLE", "CLEAN"):
             for cr in (self._cr(), self._cr(red=["ai-review-gate"]),
                        self._cr(red=["python-ci-gate"]), self._cr(absent=self.REQ),
+                       self._cr(absent=["python-ci-gate"]),
+                       self._cr(red=["ai-review-gate"], flight=["docs"]),
                        self._cr(extra_red=["drive"])):
                 for att in (True, False):
                     got = self.o.classify_pr(self._pr(ms=ms), cr, att)
@@ -1067,7 +1148,14 @@ class TestResourceBands:
 
     def test_call_rail_names_its_prs_and_escalates(self):
         """A token that names an action but not its object is a report, not an instruction.
-        And a token that repeats verbatim teaches the reader to skip it."""
+        And a token that repeats verbatim teaches the reader to skip it.
+
+        ⛔ AND THE ESCALATION MUST STATE A FACT, NOT GIVE AN ORDER (#1872). It used to read
+        "— land or say why", which is an instruction -- and it named work the automatic chain
+        (`pr-doctor`) was already doing, so the beat was a second copy of a decision already
+        made. What the monitor alone can see is that a LANDABLE PR has been landable for N
+        beats and the chain still has not landed it.
+        """
         import os
         f = self.o.STUCK_FILE
         try:
@@ -1078,7 +1166,9 @@ class TestResourceBands:
                 if beat == 1:
                     assert "STUCK" not in tok
                 else:
-                    assert f"STUCK {beat} beats" in tok and "land or say why" in tok
+                    assert f"STUCK {beat} beats" in tok
+                    assert "pr-doctor has not landed it" in tok
+                    assert "land or say why" not in tok      # state, never an order
         finally:
             if os.path.exists(f):
                 os.remove(f)
@@ -1106,10 +1196,17 @@ class TestResourceBands:
         assert "fix-ci=" not in line        # the state-shaped token is gone
 
     def test_fix_ci_bucket_still_partitions(self):
-        """The bucket is renamed in DISPLAY, not in the partition -- counts still sum."""
+        """The bucket is renamed in DISPLAY, not in the partition -- counts still sum.
+
+        `running` is a SEVENTH class (#1872): a required check in flight is neither work nor a
+        gap, and folding it into `fix-ci` (as this file did until 2026-10-16) told the fleet to
+        fix a suite that was still executing. Every class must still be exactly one per PR.
+        """
         assert "fix-ci" in self.o.CLASS_ORDER
+        assert "running" in self.o.CLASS_ORDER
         assert set(self.o.CLASS_ORDER) == {"call-rail", "blocked-by-rail", "rerun-checks",
-                                           "resolve-conflict", "record-review", "fix-ci"}
+                                           "resolve-conflict", "record-review", "running",
+                                           "fix-ci"}
 
     def test_a_MISSING_rail_gate_is_not_a_block(self):
         """THE #8009 PHANTOM. `blocked-by-rail(drift-guard)` was reported while that head

@@ -10,19 +10,31 @@ so every CI failure -- which is a NORMAL step of merging -- became a line in a r
      it as blocked instead of doing the work that is needed and continuing with the merge
      process (having to fix things is a natural part of the CI process)" -- owner, 2026-10-10
 
-So this closes the loop. Each pass, for every open non-draft PR, it classifies the PR from
-BRANCH-PROTECTION REALITY (never from a queue row) and DISPATCHES the work:
+So this closes the loop. Each pass, for every open non-draft PR, it asks `objective.py` -- the
+fleet's ONE classifier -- what the PR needs, and DISPATCHES that work:
 
-    ready        all required checks green + clean attestation at the current head
-                 -> dispatch: call the rail
-    no-checks    no required check has EVER run at this head
-                 -> dispatch: re-trigger the workflows
-    failing      a required check failed
-                 -> dispatch: FIX it, then re-review, then rail -- in ONE run
-    unreviewed   ai-review-gate is the only red and there is no attestation
-                 -> dispatch: review, record, rail -- in ONE run
-    running      a required check is still in flight -> skip (next pass)
-    surface      the diff touches the SDK/MCP surface -> raise a USER QUESTION
+    call-rail        all required checks green + clean attestation at the current head, and the
+                     rail itself would take it -> dispatch: call the rail
+    blocked-by-rail  ...the same, but a gate `admin-merge.sh` enforces is refusing it
+                     (`flip-gate`/`drift-guard`/`provenance`) -> dispatch: repair that gate
+    rerun-checks     a required check never ran at this head (absence is not green)
+                     -> dispatch: re-trigger the workflows
+    resolve-conflict GitHub says DIRTY -> dispatch: rebase on main, then record + rail
+    record-review    everything green, no clean attestation at this head
+                     -> dispatch: review, record, rail -- in ONE run
+    fix-ci           a required check is RED -> dispatch: FIX it, then re-review, then rail
+    running          a required check is still in flight -> skip (next pass)
+    (None)           the checks could not be READ -> skip, and say so: a miss is never work
+
+⛔ THOSE CLASSES ARE NOT THIS FILE'S. They are `objective.classify_one()`'s (#1872), the same
+function that produces the beat's per-class counts. This file used to carry a SECOND predicate
+under its own vocabulary (ready / failing / unreviewed / no-checks / running), sharing no code
+with the monitor: MEASURED on the live fleet 2026-10-16, the two DISAGREED on 4 of 11 open
+non-draft PRs (36%), and on 5 of 12 in a later pass (41%) -- one beat said `fix-ci` (go repair
+the code) while the chain said `running` (wait) or `unreviewed` (review it) about the SAME PR.
+Two readers of one queue cannot be allowed to disagree about what to do with it,
+so the classifier lives in ONE place and both consumers call it. The reasons a class was chosen
+come from it too, so a brief renders the same evidence the beat counted.
 
 THE FIVE HARD RULES (each one earned the hard way today):
   1. THE FIX AND THE RAIL CALL GO IN THE SAME BRIEF. The gap between "review recorded" and
@@ -44,6 +56,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import plistlib
@@ -54,15 +67,15 @@ import time
 from datetime import datetime, timezone
 
 HOME = os.path.expanduser("~")
+HERE = os.path.dirname(os.path.realpath(__file__))
 STATE_DIR = os.path.join(HOME, ".pi", "agent", "state")
 STATE = os.path.join(STATE_DIR, "pr-doctor.json")
 LOG = os.path.join(STATE_DIR, "pr-doctor.log")
-REVIEWS = os.path.join(HOME, ".pi", "agent", "reviews")
 SCRIPTS = os.path.join(HOME, ".pi", "agent", "scripts")
 
 REPO = "daniel-ospina/tortoise"
 REPO_DIR = os.path.join(HOME, "Documents", "GitHub", "tortoise")
-REPO_SLUG = "daniel-ospina-tortoise"
+
 
 # ⛔ USE THE REAL gh BINARY, NOT THE `gh` ON PATH. On this box `~/.pi/agent/shims/gh` is a
 # SYMLINK into ~/Documents (agent-infra/scripts/gh-shim/gh). macOS TCC protects ~/Documents
@@ -73,17 +86,38 @@ REPO_SLUG = "daniel-ospina-tortoise"
 # not need the guard. Landing still goes through the rail, in a lane.
 GH = os.path.join(HOME, "bin", "gh")
 
-# The 7 contexts that gate a merge (branch protection). NOTHING else counts as a blocker.
-REQUIRED = ("pricing-artifact", "docs", "test-isolation", "license-surface",
-            "legal-e2e", "python-ci-gate", "ai-review-gate")
-GATE = "ai-review-gate"
-GREEN = {"success", "neutral", "skipped"}
-NONRED = {"cancelled", "stale"}
+# ⛔ THE CLASSIFIER IS NOT OURS TO OWN (#1872). `objective.py` owns the class vocabulary, the
+# check-run read, the attestation read and the predicate; this file owns the DISPATCH. Loading
+# it from beside this file (rather than copying a predicate, or importing a second copy of the
+# required-context set) is what makes the beat's counts and this job's plan the same answer to
+# the same question.
+def _objective():
+    spec = importlib.util.spec_from_file_location(
+        "pr_doctor_objective", os.path.join(HERE, "objective.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)          # the `__main__` guard keeps this side-effect free
+    return mod
+
+
+CLASSIFIER = _objective()
+
+# ⛔ THE SEAM IS ASSERTED, NOT ASSUMED (#1872). This file and `objective.py` are farmed into
+# `~/.pi/agent/scripts/` as TWO INDIVIDUAL files (`pi-bootstrap/setup.sh` `fleet_srcs`), and that
+# farm SKIPS a source that is missing (`[ -f "$f" ] || continue`) -- so a newer pr-doctor.py can
+# sit beside an older objective.py. Without this check the import still succeeds, every PR then
+# fails INSIDE the per-PR swallow below, and the pass ends `dispatched 0` with exit 0 -- a dead
+# drain that reports success, which is the worst outcome this file can produce.
+_SEAM = ("classify_one", "touches_surface", "CLASS_ORDER", "REQUIRED", "RAIL_GATES")
+_missing = [n for n in _SEAM if not hasattr(CLASSIFIER, n)]
+if _missing:
+    raise SystemExit(
+        "pr-doctor: %s is missing %s -- it is an older copy than this driver expects. "
+        "Refusing to run rather than report an empty dispatch as success."
+        % (getattr(CLASSIFIER, "__file__", "objective.py"), ", ".join(_missing)))
 
 # Guards
 COOLDOWN_S = 45 * 60          # do not re-dispatch the same PR inside this window
 STALE_DISPATCH_S = 90 * 60    # a dispatch with no state change this old is retryable
-SURFACE_FILES = ("tool_registry.py", "sdk.py", "surface-manifest")
 MAX_LANE_ATTEMPTS = 3     # a refused dispatch tries the next idle lane, bounded
 
 # ── CAPACITY: the machine's own thresholds, never a private literal ─────────────────────
@@ -101,11 +135,20 @@ ORCH_PLIST = os.path.join(HOME, "Library", "LaunchAgents", "com.eldato.orchestra
 DEFAULT_MAX_FIX = 3
 DEFAULT_MAX_REVIEW = 4
 
-# A dispatch draws on the budget of the work it starts. `failing` needs code/CI repair (MAX_FIX);
-# `no-checks` re-triggers the workflows and then runs the review+merge chain, so it is fix work;
-# `unreviewed` is review work (MAX_REVIEW); `ready` is the terminal merge of an already-reviewed
-# PR, so it rides the review chain. `running` never dispatches.
-ACTION_CLASS = {"failing": "fix", "no-checks": "fix", "unreviewed": "review", "ready": "review"}
+# A dispatch draws on the budget of the work it starts. `fix-ci` needs code/CI repair (MAX_FIX);
+# `rerun-checks` re-triggers the workflows and then runs the review+merge chain, so it is fix
+# work; `resolve-conflict` and `blocked-by-rail` are repairs (MAX_FIX); `record-review` is review
+# work (MAX_REVIEW); `call-rail` is the terminal merge of an already-reviewed PR, so it rides the
+# review chain. `running` never dispatches.
+ACTION_CLASS = {"fix-ci": "fix", "rerun-checks": "fix", "resolve-conflict": "fix",
+                "blocked-by-rail": "fix", "record-review": "review", "call-rail": "review",
+                # ⛔ THE PRE-#1872 VOCABULARY, KEPT FOR THE STATE FILE ONLY. `~/.pi/agent/state/
+                # pr-doctor.json` still holds rows written by the old classifier; the pass below
+                # reads them for `STALE_DISPATCH_S` (90 min) after deploy. Without these keys an
+                # unknown class falls back to "fix", so a live review dispatch would silently
+                # over-charge the fix budget and under-charge the review one.
+                "failing": "fix", "no-checks": "fix",
+                "ready": "review", "unreviewed": "review"}
 
 # ⛔ `tools/cmux_dispatch.py` REQUIRES PYTHON >= 3.12 and REFUSES to run under the system
 # `python3` (3.9.6 on this box) -- it exits 0 with a one-line complaint, so a caller that only
@@ -240,72 +283,35 @@ def open_prs() -> list[dict]:
     return prs
 
 
-def rollup(number: int) -> tuple[dict, list[str], list[str], list[str]]:
-    """(per-context newest attempt, failing, running, absent).
+# ⛔ THERE IS NO SECOND CLASSIFIER HERE (#1872). This file used to read each PR's checks a
+# second way -- `gh pr view --json statusCheckRollup` -- and judge them with its own predicate
+# under its own vocabulary (ready / failing / unreviewed / no-checks / running). Two problems,
+# one root: a second reader of the same evidence.
+#
+#   * `objective.per_pr_checks()` reads the REST check-run surface with `filter=all` and groups
+#     by (app, workflow, job), newest attempt by `id` -- and its own docstring records why the
+#     GraphQL rollup is NOT trusted for this (#8009: an ABSENT gate read as a FAILING one,
+#     because the rollup had not returned the green attempt that existed).
+#   * the two predicates diverged on live data: 4 of 11 non-draft PRs got a different answer
+#     here than from the beat (measured 2026-10-16).
+#
+# So the read AND the predicate both live in `objective.py`, behind `classify_one()`, and the
+# fleet has exactly one of each.
 
-    Newest attempt per context by check-run `id` -- GitHub keeps EVERY re-run, and a re-run
-    ADDS a red, it does not clear one. `started_at` is nullable so it is not the key.
+def evaluate(pr: dict) -> tuple:
+    """(class, why, cr) for ONE PR -- `objective.classify_one()`, never a copy (#1872).
+
+    `class` is one of objective's CLASS_ORDER, or None when the checks could not be read. `why`
+    names what the class is about (the refusing rail gate, the red required checks); `cr` is the
+    evidence it was decided on, so a brief never has to read the world a second time.
     """
-    raw = sh([GH, "pr", "view", str(number), "--repo", REPO, "--json", "statusCheckRollup"])
-    try:
-        det = json.loads(raw or "{}")
-    except Exception:
-        det = {}
-    newest: dict[str, dict] = {}
-    for c in det.get("statusCheckRollup") or []:
-        name = c.get("name") or c.get("context") or "?"
-        if name not in REQUIRED:
-            continue
-        cid = c.get("databaseId") or c.get("id") or 0
-        prev = newest.get(name)
-        if prev is None or cid > (prev.get("databaseId") or prev.get("id") or 0):
-            newest[name] = c
-    failing, running, absent = [], [], []
-    for ctx in REQUIRED:
-        c = newest.get(ctx)
-        if c is None:
-            absent.append(ctx)
-            continue
-        status = (c.get("status") or "").lower()
-        concl = (c.get("conclusion") or "").lower()
-        if status and status != "completed":
-            running.append(ctx)
-        elif concl in GREEN or concl in NONRED:
-            pass
-        else:
-            failing.append(ctx)
-    return newest, failing, running, absent
+    return CLASSIFIER.classify_one(pr)
 
 
-def attestation(number: int, head: str):
-    path = os.path.join(REVIEWS, "%s-%d.json" % (REPO_SLUG, number))
-    if not os.path.exists(path):
-        return None
-    try:
-        with open(path) as f:
-            rec = json.load(f)
-    except Exception:
-        return None
-    if rec.get("head_sha") != head:
-        return None                      # stale: bound to an older head, worth nothing
-    if rec.get("verdict") != "clean":
-        return None
-    return rec
-
-
-def classify(pr: dict) -> str:
-    """One action per PR. First match wins, so no PR can hide in an overlap."""
-    _, failing, running, absent = rollup(pr["number"])
-    if running:
-        return "running"                                  # not ours to act on yet
-    if absent and not failing:
-        return "no-checks"                                # CI never triggered
-    if not failing:
-        return "ready" if attestation(pr["number"], pr["headRefOid"]) else "unreviewed"
-    others = [c for c in failing if c != GATE]
-    if not others and not attestation(pr["number"], pr["headRefOid"]):
-        return "unreviewed"                               # only the diff-bound gate is red
-    return "failing"
+# The dispatcher's old name for the same question. Kept as the seam the suite and `main()` use,
+# so a future reader cannot reintroduce a second predicate under a different name without this
+# call site changing with it.
+classify = evaluate
 
 
 # ---------------------------------------------------------------------------
@@ -346,11 +352,16 @@ def idle_lanes() -> tuple[list[dict], str]:
 # 3. THE BRIEF — fix -> review -> record -> rail, ONE RUN, no gap
 # ---------------------------------------------------------------------------
 
-def brief(pr: dict, action: str) -> str:
+def brief(pr: dict, action: str, why: str | None = None, cr=None) -> str:
+    """The order text for ONE PR. `action`/`why`/`cr` come from `evaluate()` -- the SAME
+    classification and the SAME evidence the beat counts (#1872), so a brief cannot describe a
+    PR differently from the line the fleet read."""
     n = pr["number"]
     head = pr["headRefOid"]
     title = pr["title"][:80]
-    _, failing, _, absent = rollup(n)
+    req = list(CLASSIFIER.REQUIRED)
+    seen = {c.get("name") for c in (cr or []) if c.get("name")}
+    absent = [c for c in req if c not in seen]
 
     common = """
 ## The loop — do all of it in ONE run, never stop in between
@@ -370,12 +381,12 @@ def brief(pr: dict, action: str) -> str:
    `BLOCKED` / `UNSTABLE` merge states on a ready PR are NORMAL and are not reasons to hold.
 """.format(n=n)
 
-    if action == "ready":
+    if action == "call-rail":
         return """# MERGE #{n} — nothing else is needed
 
 **#{n}** {title}
 Head `{head}`. All required checks are green and a `clean` attestation is already recorded at
-this head. **Everything is done except the last step.**
+this head, and the rail's own gates would take it. **Everything is done except the last step.**
 
 ```
 scripts/admin-merge.sh {n}
@@ -386,12 +397,27 @@ scripts/admin-merge.sh {n}
 Report: `merged`, or the rail's exact refusal text.
 """.format(n=n, title=title, head=head[:12])
 
-    if action == "no-checks":
-        return """# #{n} — ITS CI NEVER RAN. Start it, then merge it.
+    if action == "blocked-by-rail":
+        return """# #{n} — THE RAIL REFUSES IT ON `{why}`. REPAIR THAT, THEN MERGE.
 
 **#{n}** {title}
-Head `{head}`. **No required check has ever run at this head** -- these are absent, not failing
-and not pending: {absent}
+Head `{head}`. Every required check this predicate waits on is green and a `clean` attestation
+is recorded at this head — so this is **not "not ready"**: it is a NAMED defect in a gate
+`scripts/admin-merge.sh` enforces (`{why}`).
+
+1. Read the failing `{why}` gate on this head (its own check-run / attestation log).
+2. Repair the CAUSE — do not re-record your way past it; a re-recorded head does not open a
+   gate that is judging the tree.
+3. Then run the loop below.
+{common}""".format(n=n, title=title, head=head[:12], why=why or "?", common=common)
+
+    if action == "rerun-checks":
+        return """# #{n} — REQUIRED CHECK(S) NEVER RAN. Start them, then merge it.
+
+**#{n}** {title}
+Head `{head}`. **These required checks never ran at this head** -- absent, not failing and not
+pending: {absent}
+(Nothing is in flight, so this is not a wait: the job that was never created has to be STARTED.)
 
 **A missing check is not a green check, and no amount of waiting will clear it.** So:
 1. Re-trigger the required workflows for this head (workflow re-run / an empty commit if the
@@ -401,7 +427,30 @@ and not pending: {absent}
 3. Then run the loop below.
 {common}""".format(n=n, title=title, head=head[:12], absent=", ".join(absent), common=common)
 
-    if action == "failing":
+    if action == "resolve-conflict":
+        return """# #{n} — CONFLICTED WITH MAIN. Rebase, then merge it.
+
+**#{n}** {title}
+Head `{head}`. GitHub reports this PR **DIRTY** (a real conflict, not a failing gate).
+**A rebase CHANGES THE HEAD, so any attestation recorded before it is worth nothing -- record
+again at the new head.**
+
+1. Rebase on `origin/main` and resolve the conflict properly (never force a resolution you did
+   not verify).
+2. Then run the loop below — review, record at the NEW head, rail.
+{common}""".format(n=n, title=title, head=head[:12], common=common)
+
+    if action == "record-review":
+        return """# REVIEW #{n}, THEN MERGE IT — one run
+
+**#{n}** {title}
+Head `{head}`. Every required check this predicate waits on is green and there is **no
+attestation at this head**. `ai-review-gate` itself is not the blocker and must not be argued
+with: it is DIFF-BOUND and clears only when a clean review is RECORDED.
+**No code work is needed** -- this is a review away from being merged.
+{common}""".format(n=n, title=title, head=head[:12], common=common)
+
+    if action == "fix-ci":
         return """# FIX #{n}, THEN MERGE IT — fixing is a normal step, not a blocker
 
 **#{n}** {title}
@@ -417,15 +466,7 @@ next step of merging. Do the work:
    load-dependent class (#5049) -- say so and retry rather than changing code that is not broken.**
 3. Fix, push, and let the checks re-run.
 4. **Then carry straight on into the loop below -- do not report back and wait.**
-{common}""".format(n=n, title=title, head=head[:12], failing=", ".join(failing), common=common)
-
-    if action == "unreviewed":
-        return """# REVIEW #{n}, THEN MERGE IT — one run
-
-**#{n}** {title}
-Head `{head}`. `ai-review-gate` is the only red and there is **no attestation at this head**.
-**No code work is needed** -- this is a review away from being merged.
-{common}""".format(n=n, title=title, head=head[:12], common=common)
+{common}""".format(n=n, title=title, head=head[:12], failing=why or "?", common=common)
 
     return ""
 
@@ -527,14 +568,41 @@ def main() -> int:
 
     # classify everything first, then dispatch highest-value first
     classified = []
+    skipped = {}
     for p in prs:
         try:
-            classified.append((p, classify(p)))
+            k, why, cr = classify(p)
         except Exception as e:
             log("#%s classify failed: %s" % (p["number"], e))
+            continue
+        # ⛔ A MISS IS NEVER WORK. `None` means the checks could not be READ; rendering that as
+        # any action (especially `fix-ci`) manufactures a queue out of a blind read.
+        if k is None:
+            skipped["unreadable"] = skipped.get("unreadable", 0) + 1
+            continue
+        # A required check is still IN FLIGHT: nothing to do this pass. It is a class, not a gap
+        # (#1872) -- and `objective.py`'s arm is deliberately BROADER than the old predicate here:
+        # it also covers a required gate that has NOT YET REPORTED (`python-ci-gate` is absent
+        # while its matrix children run) and it yields to a RED required check, which IS work.
+        if k == "running":
+            skipped["running"] = skipped.get("running", 0) + 1
+            continue
+        # ⛔ THE ONLY HUMAN GATE. A diff that touches the SDK/MCP surface may not be landed by an
+        # automatic chain: the surface is a contract, and changing it needs the owner's approval
+        # first. `objective.py` already computes this overlay for the beat's `ASK-USER:` count;
+        # the dispatcher reads the SAME predicate instead of carrying its own file list.
+        if CLASSIFIER.touches_surface(p):
+            log("ASK-USER #%s (%s) -- the diff touches the SDK/MCP surface; a human decides"
+                % (p["number"], k))
+            skipped["surface"] = skipped.get("surface", 0) + 1
+            continue
+        classified.append((p, k, why, cr))
 
-    ranked = {"ready": 0, "no-checks": 1, "unreviewed": 2, "failing": 3, "running": 9}
-    classified.sort(key=lambda t: ranked.get(t[1], 8))
+    # Cheapest-and-highest-payoff FIRST, the same order `objective.CLASS_ORDER` uses: a landable
+    # PR costs one rail call, a repair costs a lane-hours. `running` is absent by construction.
+    ranked = {"call-rail": 0, "rerun-checks": 1, "record-review": 2,
+              "resolve-conflict": 3, "blocked-by-rail": 4, "fix-ci": 5}
+    classified.sort(key=lambda t: (ranked.get(t[1], 8), t[0]["number"]))
 
     # ⛔ THE CAP COMES FROM THE MACHINE, NOT FROM THIS SOURCE. `capacity()` reads MAX_FIX /
     # MAX_REVIEW from the environment or the orchestrator plist that `install.sh` renders (the
@@ -543,10 +611,12 @@ def main() -> int:
     budgets = pass_budgets(st, cap, args.max)
 
     counts: dict[str, int] = {}
-    for _, a in classified:
+    for _, a, _w, _cr in classified:
         counts[a] = counts.get(a, 0) + 1
+    for a, c in skipped.items():
+        counts["skipped-" + a] = c
     log("pass: %d open PRs :: %s (capacity fix=%d review=%d, inflight=%d, budget fix=%d review=%d total=%d)" %
-        (len(classified), " ".join("%s=%d" % kv for kv in sorted(counts.items())),
+        (len(prs), " ".join("%s=%d" % kv for kv in sorted(counts.items())),
          cap["max_fix"], cap["max_review"], budgets["used"],
          budgets["fix"], budgets["review"], budgets["total"]))
 
@@ -561,9 +631,7 @@ def main() -> int:
 
     dispatched = 0
     spent = {"fix": 0, "review": 0}
-    for p, action in classified:
-        if action in ("running",):
-            continue
+    for p, action, why, cr in classified:
         if dispatched >= budgets["total"]:
             break
         cls = ACTION_CLASS.get(action, "fix")
@@ -577,7 +645,7 @@ def main() -> int:
         if not lanes:
             break
         lane = lanes.pop(0)
-        text = brief(p, action)
+        text = brief(p, action, why, cr)
         if not text:
             continue
         # ⛔ A REFUSAL IS NOT A DEAD END. The dispatcher refuses for two reasons: a genuine

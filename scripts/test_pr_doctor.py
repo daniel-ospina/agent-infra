@@ -142,8 +142,8 @@ def test_orch_plist_path_is_pinned_to_install_sh_label():
 
 def test_inflight_consumes_its_own_class_budget():
     now = 1_000_000.0
-    st = {"1": {"action": "failing", "at_epoch": now},
-          "2": {"action": "unreviewed", "at_epoch": now},
+    st = {"1": {"action": "fix-ci", "at_epoch": now},
+          "2": {"action": "record-review", "at_epoch": now},
           "_meta": {}}
     b = pr.pass_budgets(st, {"max_fix": 16, "max_review": 12}, now_epoch=now)
     assert (b["fix"], b["review"], b["total"]) == (15, 11, 26)
@@ -151,7 +151,7 @@ def test_inflight_consumes_its_own_class_budget():
 
 def test_a_stale_dispatch_stops_consuming_budget():
     now = 1_000_000.0
-    st = {"1": {"action": "failing", "at_epoch": now - pr.STALE_DISPATCH_S - 1}}
+    st = {"1": {"action": "fix-ci", "at_epoch": now - pr.STALE_DISPATCH_S - 1}}
     b = pr.pass_budgets(st, {"max_fix": 16, "max_review": 12}, now_epoch=now)
     assert b["total"] == 28
 
@@ -164,12 +164,17 @@ def test_max_override_is_a_hard_ceiling():
 # ── 3. the end-to-end dispatch cap is the configured one, not 4 ───────────────────────────
 
 def _drive(monkeypatch, *, prs, action, cap_env, lanes=40):
-    """Run one dry pass with a stubbed world and return the dispatch labels it emitted."""
+    """Run one dry pass with a stubbed world and return the dispatch labels it emitted.
+
+    `action` is the CLASS `objective.classify_one()` would return (the dispatcher no longer has
+    a vocabulary of its own, #1872), or a callable PR -> class.
+    """
     sent = []
     monkeypatch.setattr(pr, "load_state", lambda: {})
     monkeypatch.setattr(pr, "open_prs", lambda: list(prs))
-    monkeypatch.setattr(pr, "classify", lambda p: action(p) if callable(action) else action)
-    monkeypatch.setattr(pr, "brief", lambda p, a: "brief-%s" % p["number"])
+    monkeypatch.setattr(pr, "classify",
+                        lambda p: (action(p) if callable(action) else action, "why", []))
+    monkeypatch.setattr(pr, "brief", lambda p, a, w=None, cr=None: "brief-%s" % p["number"])
     monkeypatch.setattr(pr, "idle_lanes", lambda: ([_lane(i) for i in range(lanes)], ""))
     monkeypatch.setattr(pr, "log", lambda msg: None)
     monkeypatch.setattr(pr, "dispatch", lambda ws, label, text, dry: sent.append(label) or True)
@@ -187,16 +192,16 @@ def test_configured_capacity_reaches_the_dispatch_cap(monkeypatch):
     passes after.
     """
     sent = _drive(monkeypatch, prs=[_pr(n) for n in range(1, 11)],
-                  action="failing", cap_env=(16, 12))
+                  action="fix-ci", cap_env=(16, 12))
     assert len(sent) == 10
 
 
 def test_fix_and_review_budgets_are_separate(monkeypatch):
     """The box distinguishes fix from review; pr-doctor must not collapse them into one cap."""
     prs = [_pr(n) for n in range(1, 11)]
-    # 1..5 failing (fix), 6..10 unreviewed (review); ranked order puts unreviewed before failing.
+    # 1..5 fix, 6..10 review; ranked order puts review work before fix work.
     def classify(p):
-        return "failing" if p["number"] <= 5 else "unreviewed"
+        return "fix-ci" if p["number"] <= 5 else "record-review"
     sent = _drive(monkeypatch, prs=prs, action=classify, cap_env=(2, 3))
     # 2 fix + 3 review = 5, even though 10 PRs are ready for work and 40 lanes are idle.
     assert len(sent) == 5
@@ -211,7 +216,7 @@ def test_failed_lane_read_names_the_blindness(monkeypatch, capsys):
     logs = []
     monkeypatch.setattr(pr, "load_state", lambda: {})
     monkeypatch.setattr(pr, "open_prs", lambda: [_pr(1)])
-    monkeypatch.setattr(pr, "classify", lambda p: "failing")
+    monkeypatch.setattr(pr, "classify", lambda p: ("fix-ci", "why", []))
     monkeypatch.setattr(pr, "idle_lanes",
                         lambda: ([], "lane-actions read failed rc=1: connection refused"))
     monkeypatch.setattr(pr, "log", logs.append)
@@ -224,3 +229,234 @@ def test_failed_lane_read_names_the_blindness(monkeypatch, capsys):
     assert "connection refused" in joined
     # and it must NOT be reported as "there was nothing to do"
     assert "nothing dispatched this pass" not in joined
+
+
+# ── 5. ONE classifier: the beat and the dispatcher cannot disagree (#1872) ────────────────
+# The defect this section pins, measured on the live fleet 2026-10-16: `objective.py` (the beat's
+# per-class counts) and `pr-doctor.py` (the dispatcher's plan) each carried their OWN predicate
+# over the SAME PR set, sharing no code. They DISAGREED on 4 of 11 open non-draft PRs (36%), and
+# on 5 of 12 (41%) in a later pass -- one reader saying `fix-ci` (go repair the code) while the
+# other said `running` (wait) or `unreviewed` (review it) about the SAME PR. Same queue, same
+# question, two answers -- so the classifier lives in objective.py and the dispatcher calls it.
+# The rows marked `#NNNN` below reproduce the check-run SHAPES recorded for those PRs; what is
+# asserted is the CLASS, not which rollup a PR happened to hold at any one minute.
+
+def _cr(*, red=(), absent=(), flight=(), extra_red=()):
+    """A check-run list in the REST shape `objective.per_pr_checks()` returns.
+
+    `flight` names become `status=in_progress` attempts; a name outside the required set becomes
+    its own check-run, which is the live shape (`python-ci-gate` absent while its children run).
+    """
+    du = "https://github.com/o/r/actions/runs/1/job/2"
+    out, i = [], 0
+    for n in pr.CLASSIFIER.REQUIRED:
+        if n in absent:
+            continue
+        i += 1
+        out.append({"id": i, "name": n,
+                    "status": "in_progress" if n in flight else "completed",
+                    "conclusion": None if n in flight else (
+                        "failure" if n in red else "success"),
+                    "app": {"slug": "actions"}, "details_url": du})
+    for n in pr.CLASSIFIER.RAIL_GATES:
+        i += 1
+        out.append({"id": i, "name": n, "status": "completed", "conclusion": "success",
+                    "app": {"slug": "actions"}, "details_url": du})
+    for j, n in enumerate(extra_red):
+        out.append({"id": 900 + j, "name": n, "status": "completed",
+                    "conclusion": "failure", "app": {"slug": "actions"}, "details_url": du})
+    for j, n in enumerate([x for x in flight if x not in pr.CLASSIFIER.REQUIRED]):
+        out.append({"id": 950 + j, "name": n, "status": "in_progress", "conclusion": None,
+                    "app": {"slug": "actions"}, "details_url": du})
+    return out
+
+
+# name -> (check-runs, attestation_clean, mergeStateStatus, the ONE expected class)
+# The five `#NNNN` rows are the live disagreements, in the shape each PR actually carried.
+_SHAPES = {
+    "#8806": (_cr(red=["ai-review-gate"], absent=["python-ci-gate"],
+                  flight=["test (a)", "test-slow (a)"]), False, "BLOCKED", "running"),
+    # recorded with NOTHING in flight: the gate job was never created, so it must be re-triggered
+    "#8822": (_cr(red=["ai-review-gate"], absent=["python-ci-gate"], extra_red=["drift-guard"]),
+              False, "BLOCKED", "rerun-checks"),
+    "#8824": (_cr(red=["ai-review-gate"], absent=["python-ci-gate"],
+                  flight=["test (%s)" % c for c in "abcdefghi"]), False, "BLOCKED", "running"),
+    "#8825": (_cr(red=["ai-review-gate"], absent=["python-ci-gate"],
+                  flight=["pricing-artifact"]), False, "BLOCKED", "running"),
+    # ...and the shapes that DO need a lane, so the assertion is not "everything is running".
+    "ready": (_cr(red=["ai-review-gate"]), True, "BLOCKED", "call-rail"),
+    "review": (_cr(red=["ai-review-gate"]), False, "BLOCKED", "record-review"),
+    "red": (_cr(red=["python-ci-gate"]), False, "BLOCKED", "fix-ci"),
+    "conflict": (_cr(red=["python-ci-gate"]), False, "DIRTY", "resolve-conflict"),
+    "nothing-ran": (_cr(absent=pr.CLASSIFIER.REQUIRED), False, "BLOCKED", "rerun-checks"),
+}
+
+
+def _pr_set(monkeypatch, shapes=None):
+    """The PR dicts, with BOTH readers pointed at the same evidence through objective's seams."""
+    shapes = shapes or _SHAPES
+    heads = {name: "%040x" % (i + 1) for i, name in enumerate(shapes)}
+    numbers = {name: 8800 + i for i, name in enumerate(shapes)}
+    by_head = {heads[name]: shapes[name][0] for name in shapes}
+    att = {numbers[name]: shapes[name][1] for name in shapes}
+    monkeypatch.setattr(pr.CLASSIFIER, "per_pr_checks", lambda sha: by_head.get(sha))
+    monkeypatch.setattr(pr.CLASSIFIER, "attestation_clean", lambda num, sha: att[num])
+    return [{"number": numbers[name], "isDraft": False, "mergeStateStatus": shapes[name][2],
+             "headRefOid": heads[name], "title": name, "files": []} for name in shapes], shapes
+
+
+def test_the_beat_counts_equal_the_dispatchers_classification(monkeypatch):
+    """THE ACCEPTANCE TEST (#1872). One PR set, one evidence read, ONE answer.
+
+    `objective.classify_queue()` produces the beat's per-class counts; `pr-doctor.classify()`
+    produces the dispatch plan. They are asserted to be the same multiset over the same PRs --
+    which is what makes them one instrument rather than two that happen to agree today.
+    """
+    non, shapes = _pr_set(monkeypatch)
+    classes, surface, by_class, surface_prs = pr.CLASSIFIER.classify_queue(non)
+    assert classes is not None, "the partition must reconcile over a fully-readable set"
+    # 1. the multiset is identical -- the property the issue asks for
+    assert sorted(pr.classify(p)[0] for p in non) == sorted(
+        k for k, c in classes.items() for _ in range(c)), (dict(classes), by_class)
+    # 2. every PR lands in its expected class -- so the matrix is not vacuous
+    want = {p["number"]: shapes[p["title"]][3] for p in non}
+    got = {p["number"]: pr.classify(p)[0] for p in non}
+    assert got == want, got
+    # 3. and the beat's per-PR bucket agrees with the plan, PR by PR (not merely in total)
+    by_number = {p["number"]: p for p in non}
+    for klass, rows in by_class.items():
+        for num, _why in rows:
+            assert pr.classify(by_number[num])[0] == klass, (klass, num)
+    # the PRs that USED to disagree: each now has ONE answer, and it is the one the evidence
+    # supports -- wait when the suite is running, re-trigger when the gate job was never created
+    for name in ("#8806", "#8824", "#8825"):
+        p = [x for x in non if x["title"] == name][0]
+        assert pr.classify(p)[0] == "running", name
+    p = [x for x in non if x["title"] == "#8822"][0]
+    assert pr.classify(p)[0] == "rerun-checks"
+    # the surface overlay names the PRs it counts -- an owner gate that prints only a NUMBER
+    # tells the person it gates nothing they can act on
+    assert surface == len(surface_prs)
+
+
+def test_a_red_required_check_is_still_work_beside_a_running_job(monkeypatch):
+    """⛔ THE BROADENING MUST NOT SWALLOW REAL WORK (#8708), AND THIS WAS A REAL DEFECT IN THE
+    FIRST CUT OF THIS CHANGE (found in review, reproduced here).
+
+    `python-ci-gate` is absent while its children run, so "absence + something in flight" means
+    "not reported yet" -- `running`. But a REQUIRED check that is genuinely RED is work NOW: a
+    FAST required context (`docs`, `legal-e2e`, `test-isolation`, `license-surface`) fails long
+    before the matrix finishes, so red-beside-an-absent-gate is the DOMINANT live shape. Without
+    the `not gated_red` term every such PR was `running` for the rest of the suite and no lane
+    ever repaired it.
+    """
+    non, _shapes = _pr_set(monkeypatch, {
+        # the shape that was masked: a RED fast gate, the gate job not created, lint running
+        "red-plus-absent-plus-running": (
+            _cr(red=["docs"], absent=["python-ci-gate"], flight=["agent-infra-ci / lint"]),
+            False, "BLOCKED", "fix-ci"),
+        # ...and the same red beside a REQUIRED check in flight is still work
+        "red-plus-required-flight": (_cr(red=["docs"], flight=["python-ci-gate"]),
+                                     False, "BLOCKED", "fix-ci"),
+        # no red: this is genuinely a wait
+        "absent-plus-running": (_cr(red=["ai-review-gate"], absent=["python-ci-gate"],
+                                    flight=["agent-infra-ci / lint"]),
+                                False, "BLOCKED", "running"),
+        # no red, nothing running: the job was never created, so start it
+        "absent-nothing-running": (_cr(red=["ai-review-gate"], absent=["python-ci-gate"]),
+                                   False, "BLOCKED", "rerun-checks"),
+    })
+    assert {p["title"]: pr.classify(p)[0] for p in non} == {
+        "red-plus-absent-plus-running": "fix-ci",
+        "red-plus-required-flight": "fix-ci",
+        "absent-plus-running": "running",
+        "absent-nothing-running": "rerun-checks",
+    }
+
+
+def test_the_dispatcher_carries_no_predicate_and_no_class_vocabulary_of_its_own():
+    """STRUCTURAL: a second classifier cannot come back without this failing.
+
+    The old file had `def rollup()`, `def classify()` with its own arms, its own `REQUIRED` tuple
+    and its own GraphQL read. Any of those returning is the #1872 defect returning.
+    """
+    src = (_REPO / "scripts" / "pr-doctor.py").read_text()
+    for banned in ("def rollup(", "def classify(", "REQUIRED = ", "GATE = ",
+                   "SURFACE_FILES = "):
+        assert banned not in src, banned
+    # the vocabulary itself is objective's, referenced through the loaded module
+    assert pr.CLASSIFIER.CLASS_ORDER and "call-rail" in pr.CLASSIFIER.CLASS_ORDER
+    # and the module pr-doctor loaded IS the repo's objective.py
+    assert pathlib.Path(pr.CLASSIFIER.__file__).resolve() == (_REPO / "scripts" / "objective.py").resolve()
+
+
+def test_a_running_pr_is_never_dispatched(monkeypatch):
+    """`running` is a class, and its action is NONE -- not a rail call, not a review."""
+    logs = []
+    monkeypatch.setattr(pr, "load_state", lambda: {})
+    monkeypatch.setattr(pr, "open_prs", lambda: [_pr(1), _pr(2)])
+    monkeypatch.setattr(pr, "classify",
+                        lambda p: ("running", None, []) if p["number"] == 1
+                        else ("call-rail", None, []))
+    monkeypatch.setattr(pr, "idle_lanes", lambda: ([_lane(1)], ""))
+    monkeypatch.setattr(pr, "brief", lambda p, a, w=None, cr=None: "brief-%s" % p["number"])
+    monkeypatch.setattr(pr, "log", logs.append)
+    sent = []
+    monkeypatch.setattr(pr, "dispatch", lambda ws, label, text, dry: sent.append(label) or True)
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--dry-run"])
+    assert pr.main() == 0
+    assert sent == ["prd-2"], sent                       # the running PR got NO order
+    assert any("skipped-running=1" in m for m in logs), logs
+
+
+def test_an_unreadable_pr_is_never_dispatched(monkeypatch):
+    """`None` (the checks could not be READ) must never become work -- it is not `fix-ci`."""
+    logs = []
+    monkeypatch.setattr(pr, "load_state", lambda: {})
+    monkeypatch.setattr(pr, "open_prs", lambda: [_pr(1)])
+    monkeypatch.setattr(pr, "classify", lambda p: (None, None, None))
+    monkeypatch.setattr(pr, "idle_lanes", lambda: ([_lane(1)], ""))
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(pr, "dispatch",
+                        lambda *a, **k: pytest.fail("an unreadable PR must not be dispatched"))
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--dry-run"])
+    assert pr.main() == 0
+    assert any("skipped-unreadable=1" in m for m in logs), logs
+
+
+def test_a_surface_pr_is_escalated_to_the_owner_not_landed(monkeypatch):
+    """The docstring has always claimed a `surface` outcome; the predicate never existed here.
+
+    `objective.touches_surface()` is the fleet's version of it (the beat's `ASK-USER: surface=N`),
+    and the dispatcher may not land a diff that changes the SDK/MCP contract on its own.
+    """
+    logs = []
+    surface = dict(_pr(1), files=[{"path": "tortoise/sdk.py"}])
+    monkeypatch.setattr(pr, "load_state", lambda: {})
+    monkeypatch.setattr(pr, "open_prs", lambda: [surface])
+    monkeypatch.setattr(pr, "classify", lambda p: ("call-rail", None, []))
+    monkeypatch.setattr(pr, "idle_lanes", lambda: ([_lane(1)], ""))
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(pr, "dispatch",
+                        lambda *a, **k: pytest.fail("a surface change needs the OWNER, not a lane"))
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--dry-run"])
+    assert pr.main() == 0
+    assert any(m.startswith("ASK-USER #1") for m in logs), logs
+
+
+def test_the_new_arms_render_a_brief_that_names_the_work(monkeypatch):
+    """A dispatcher brief may not be generic: it must name what the classifier found."""
+    ready = dict(_pr(1))
+    blocked = pr.brief(ready, "blocked-by-rail", "drift-guard", _cr())
+    assert "drift-guard" in blocked and "admin-merge" in blocked
+    fix = pr.brief(ready, "fix-ci", "python-ci-gate,docs", _cr(red=["python-ci-gate"]))
+    assert "python-ci-gate,docs" in fix and "debug-workflow" in fix
+    rerun = pr.brief(ready, "rerun-checks", None, _cr(absent=["docs"]))
+    assert "docs" in rerun and "Re-trigger" in rerun
+    conflict = pr.brief(ready, "resolve-conflict", None, _cr())
+    assert "DIRTY" in conflict and "rebase" in conflict.lower()
+    # every class the dispatcher can act on has a brief, and `running` deliberately has none
+    for klass in ("call-rail", "blocked-by-rail", "rerun-checks", "resolve-conflict",
+                  "record-review", "fix-ci"):
+        assert pr.brief(ready, klass, "why", _cr())
+    assert pr.brief(ready, "running", None, _cr()) == ""

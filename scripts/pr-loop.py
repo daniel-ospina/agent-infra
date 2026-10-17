@@ -90,6 +90,11 @@ def lane_live(lane):
 
 def decide(klass, why):
     """(action, detail). A FIX ALWAYS CARRIES THE RAIL IT IS FOR (hard requirement 1)."""
+    if klass == "running":
+        # A required check is still IN FLIGHT (#1872): no lane, no dispatch, no "ask the user".
+        # Without this arm the class falls through to the `ask-user` default below and a lane
+        # that is merely WAITING is reported as an owner decision.
+        return "wait", None
     if klass == "call-rail":
         return "rail", None
     if klass == "rerun-checks":
@@ -138,6 +143,8 @@ def main():
     for klass in o.CLASS_ORDER:
         for num, why in by_class.get(klass) or []:
             action, detail = decide(klass, why)
+            if action == "wait":                 # in flight: nothing to dispatch, nothing to ask
+                continue
             if num in lanes:                    # HARD REQUIREMENT 2: idempotent
                 log(f"SKIP #{num} ({klass}) -- lane {lanes[num]['lane']} already working it")
                 continue
