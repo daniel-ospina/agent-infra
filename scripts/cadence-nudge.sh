@@ -142,10 +142,10 @@ _rec(){ sed -n "s/^$1=//p" "$STATE/lane-recap.last" 2>/dev/null | head -1; }
 # ONCE. Sourcing is defensive: a partially-deployed script set must not break the FLOOR, and a
 # missing helper can only ever SUPPRESS the act clause (the caller tests for the function), never
 # publish an unverified number.
-if [ -f "$SCRIPTS/beat-pair.sh" ]; then
-  . "$SCRIPTS/beat-pair.sh"
+if [ -f "$SCRIPTS/lib/beat-pair.sh" ]; then
+  . "$SCRIPTS/lib/beat-pair.sh"
 else
-  echo "cadence-nudge: $SCRIPTS/beat-pair.sh is MISSING -- the recap/beat pair cannot be verified;" \
+  echo "cadence-nudge: $SCRIPTS/lib/beat-pair.sh is MISSING -- the recap/beat pair cannot be verified;" \
        "the act clause will be suppressed (fail closed) until it is deployed" >&2
 fi
 # Initialised OUTSIDE the branch: the nudge is the one sender that must never fail under `set -u`,
@@ -194,10 +194,24 @@ if [ -f "$STATE/lane-recap.last" ]; then
     # A fresh mtime is NOT enough: verify the beat belongs to the recap on disk before publishing
     # it. On a torn or unverifiable pair the clause is dropped and the older clauses stand -- the
     # `actfull=0` degradation this file already relies on, never a number we cannot vouch for.
-    # `command -v` first: a missing helper (partial deploy) must SUPPRESS, not error out.
-    if command -v beat_pair_ok >/dev/null 2>&1 && beat_pair_ok "$STATE"; then
+    _bp_ok=0; _bp_why=""
+    if ! command -v beat_pair_ok >/dev/null 2>&1; then
+      _bp_why="beat_pair_ok unavailable -- $SCRIPTS/lib/beat-pair.sh not sourced (partial deploy?)"
+    elif _bp_why=$(beat_pair_ok "$STATE" 2>&1); then
+      _bp_ok=1; _bp_why=""
+    fi
+    if [ "$_bp_ok" = 1 ]; then
       act=$(sed -n 's/^act=//p' "$B" | head -1 | cut -c1-420)
       actfull=$(sed -n 's/^actfull=//p' "$B" | head -1)
+    else
+      # ⛔ A SUPPRESSION MUST BE RECORDED, OR IT IS INVISIBLE (#1897 review). The driver is
+      # `cadence-timer.sh`, which runs this script as `( … ) >/dev/null 2>&1 &` -- so
+      # beat_pair_ok's stderr and the MISSING-helper warning above are BOTH DISCARDED. Without this
+      # line a PERMANENT suppression (e.g. beat-pair.sh absent from the lib farm, which is exactly how
+      # this guard first shipped) is indistinguishable from a healthy beat: same message, no clause,
+      # nothing anywhere saying so. The log is where an operator actually looks.
+      printf '%s NUDGE-SUPPRESSED recap/beat pair not verifiable: %s -- act clause withheld\n' \
+        "$(date '+%m-%d %H:%M:%S')" "$_bp_why" >> "$LOG"
     fi
   fi
   case "$actfull" in 1) actfull=1 ;; *) actfull=0 ;; esac

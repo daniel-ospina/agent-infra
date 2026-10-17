@@ -1474,15 +1474,36 @@ def write_pair(out_path, md, beat, words_read, beat_path=None):
     """
     if beat_path is None:
         beat_path = BEAT_PATH
+    # ⛔ WRITE THE BYTES WE HASH (and only publish a beat a reader can actually verify).
+    # (a) The digest below is over `md.encode("utf-8")`, so the file must hold exactly those bytes.
+    #     Writing in TEXT mode would use the interpreter's locale encoding; under any deployment whose
+    #     default encoding is not UTF-8, writer and reader would disagree on the digest for any
+    #     non-ASCII recap -- and `render_md` always emits an em dash -- so EVERY pair would fail
+    #     closed forever with both suites still green. Pin the encoding rather than assume it.
+    # (b) The reader hashes `$STATE/NEEDS-ACTION.md`, a FIXED path, while the beat path is fixed too.
+    #     So a run with `--out <elsewhere>` would overwrite the canonical beat with one bound to a
+    #     file no reader reads -- publishing a beat that can only ever be suppressed, and DISCARDING a
+    #     verifiable one. Refuse to write the beat in that case, loudly: the clause is then withheld
+    #     for the right reason, instead of for an unverifiable one nobody can see.
+    md_bytes = md.encode("utf-8")
+    md_sha = hashlib.sha256(md_bytes).hexdigest()[:MD_SHA_LEN]
+    # (b) The reader hashes `$STATE/NEEDS-ACTION.md` -- a FIXED path -- while the beat path is fixed
+    #     too. A run with `--out <elsewhere>` therefore produces a beat bound to a file no reader
+    #     reads, and overwrites the canonical beat while doing it. That is a LATENT inconsistency (no
+    #     caller passes `--out` today), so it is REPORTED rather than silently absorbed: the run's
+    #     clause will read as torn and be withheld, and this line is the only place that says why.
+    if os.path.abspath(out_path) != os.path.abspath(OUT_PATH):
+        sys.stderr.write("lane-actions: --out %s is not %s; every reader hashes %s, so this run's "
+                         "beat will read as TORN and the act clause will be withheld.\n"
+                         % (out_path, OUT_PATH, OUT_PATH))
     try:
         tmp = out_path + ".tmp"
-        with open(tmp, "w") as fh:
-            fh.write(md)
+        with open(tmp, "wb") as fh:
+            fh.write(md_bytes)
         os.replace(tmp, out_path)              # atomic: a reader never sees a half-written file
     except OSError as e:
         sys.stderr.write("lane-actions: cannot write %s: %s\n" % (out_path, e))
         return 3
-    md_sha = hashlib.sha256(md.encode("utf-8")).hexdigest()[:MD_SHA_LEN]
     try:
         tmp = beat_path + ".tmp"
         with open(tmp, "w") as fh:

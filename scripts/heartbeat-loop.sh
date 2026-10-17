@@ -54,6 +54,11 @@ export CMUXTERM_CLI_RESPONSE_TIMEOUT_SEC="${CMUXTERM_CLI_RESPONSE_TIMEOUT_SEC:-6
 STATE="$HOME/.pi/agent/state"
 SCRIPTS="$HOME/.pi/agent/scripts"
 LOG="$STATE/orchestrator-heartbeat.log"
+# The recap/beat PAIR rule (_mdsha + beat_pair_ok), shared with cadence-nudge.sh so the rule exists
+# ONCE rather than once per reader. This script is a READER of the sidecar (it logs the act clause),
+# so it is subject to the same rule. Sourced defensively: a partial deploy must not break the loop,
+# and a missing helper can only ever SUPPRESS the logged clause, never assert one.
+if [ -f "$SCRIPTS/lib/beat-pair.sh" ]; then . "$SCRIPTS/lib/beat-pair.sh"; fi
 PIDFILE="$STATE/heartbeat-loop.pid"
 INTERVAL=120          # fallback sleep ONLY -- the real cadence is TARGET-driven (see below).
 # ⛔ CADENCE IS BOUNDED BY DESIGN (2026-10-03, owner requirement: "needs to be every 5-9min max").
@@ -313,8 +318,17 @@ while :; do
   if [ -s "$SNAP" ] && [ -z "$(find "$SNAP" -maxdepth 0 -mmin +15 2>/dev/null)" ]; then
     run_bounded "$(slack)" "lane-actions.py" "$STATE/lane-actions.log" \
       /usr/bin/python3 "$SCRIPTS/lane-actions.py" --stdin "$SNAP"; _arc=$?
-    printf '%s LANE-ACTION rc=%s :: %s\n' "$(date '+%m-%d %H:%M:%S')" "$_arc" \
-      "$(sed -n 's/^act=//p' "$STATE/NEEDS-ACTION.beat" 2>/dev/null | head -1 | cut -c1-220)" >> "$LOG"
+    # ⛔ THE SAME PAIR RULE AS cadence-nudge.sh (#1897). This is a READER of the sidecar, so it must
+    # not record an `act=` that the recap on disk does not corroborate: `rc=4` printed beside a stale
+    # act reads as "the classifier ran and produced this list", when the truth is that the beat is
+    # one tick behind the recap it is standing next to. The rule is only in force where it is
+    # CALLED, so it is called here too -- and the withheld case SAYS so, because a blank would read
+    # as "no clause" rather than "unverifiable".
+    _arc_act="(act clause withheld -- recap/beat pair not verifiable)"
+    if command -v beat_pair_ok >/dev/null 2>&1 && beat_pair_ok "$STATE" >/dev/null 2>&1; then
+      _arc_act=$(sed -n 's/^act=//p' "$STATE/NEEDS-ACTION.beat" 2>/dev/null | head -1 | cut -c1-220)
+    fi
+    printf '%s LANE-ACTION rc=%s :: %s\n' "$(date '+%m-%d %H:%M:%S')" "$_arc" "$_arc_act" >> "$LOG"
   else
     # THE TICK DIES AT ITS BOUND ON A LOADED BOX, SO THERE WAS NEVER A FRESH SNAPSHOT AND THIS
     # BRANCH RAN ON EVERY PASS. The classifier skipped FOREVER while the beat republished the same
