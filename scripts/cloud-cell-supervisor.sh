@@ -292,16 +292,54 @@ _controller_ps_awk='
 _controller_pids_path() { # <primary-path> <extra-path-or-empty>
   ps -eo pid=,ppid=,command= 2>/dev/null | awk -v a="$1" -v h="$2" "$_controller_ps_awk"
 }
-# The pid $O/.orch.lock names, when it is alive and is an orch-loop.sh process. Its PATH is not
-# checked: the lock is per-$O and only this cell's controller writes it, so a live orch-loop.sh at
-# that pid IS this cell's owner whatever path it was launched from (the leftover-copy case).
+# proc_start_epoch <pid> — when the process began, from `ps -o etime=`, whose [[dd-]hh:]mm:ss shape is
+# the SAME on BSD and GNU ps (unlike etimes/lstart, which are not). rc 1 when it cannot be read.
+_proc_start_epoch() {
+  local p="${1:-}" e d h m s r
+  case "$p" in ''|*[!0-9]*) return 1 ;; esac
+  e="$(ps -o etime= -p "$p" 2>/dev/null | tr -d '[:space:]')" || return 1
+  [ -n "$e" ] || return 1
+  d=0
+  case "$e" in *-*) d="${e%%-*}"; r="${e#*-}" ;; *) r="$e" ;; esac
+  case "$d" in ''|*[!0-9]*) return 1 ;; esac
+  case "$r" in
+    *:*:*) h="${r%%:*}"; r="${r#*:}"; m="${r%%:*}"; s="${r##*:}" ;;
+    *:*)   h=0;                 m="${r%%:*}"; s="${r##*:}" ;;
+    *) return 1 ;;
+  esac
+  case "$h$m$s" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s\n' "$(( $(date +%s) - (d * 86400 + h * 3600 + m * 60 + s) ))"
+}
+
+# The pid $O/.orch.lock names, when it is alive and IS an orch-loop.sh INVOCATION.
+#
+# ⛔ ITS PATH IS NOT CHECKED — the lock is per-$O and the leftover-copy case must still be stoppable —
+# BUT ITS SHAPE AND ITS AGE ARE, and both are load-bearing:
+#   * SHAPE: argv must be `<shell> <.../orch-loop.sh>`. Matching the string anywhere in the command
+#     line is how a `tmux` client, a `bash -c` launcher or an editor picks up the pattern (the same
+#     measured false positive the scoped reads above exist to avoid).
+#   * AGE: the lock is data on disk and outlives a `kill -9`/OOM/reboot. If the OS RECYCLED that pid
+#     to a peer lane's controller — the exact shape of the processes this box runs — then the pid is
+#     alive, its argv matches, and `stop` would TERM/KILL another repo's controller. A controller
+#     always writes $LOCK after it starts, so a process that BEGAN after the lock was written cannot
+#     be its owner. Unprovable age (a `ps`/`date` that cannot answer) is treated as NOT ours: an
+#     unasserted target is not ours to kill, and `seen_controller_pids` still reports it.
 lock_controller_pid() {
-  local p c
+  local p c t lt ps
   p="$(tr -dc '0-9' 2>/dev/null < "$LOCK")"
   [ -n "$p" ] || return 0
   kill -0 "$p" 2>/dev/null || return 0
   c="$(ps -o command= -p "$p" 2>/dev/null)" || return 0
-  case "$c" in *orch-loop.sh*) printf '%s\n' "$p" ;; esac
+  # shellcheck disable=SC2086
+  set -- $c
+  [ "$#" -ge 2 ] || return 0
+  case "${1##*/}" in bash|sh|dash|zsh) ;; *) return 0 ;; esac
+  case "${2##*/}" in orch-loop.sh) ;; *) return 0 ;; esac
+  lt="$(date -r "$LOCK" +%s 2>/dev/null)" || return 0
+  ps="$(_proc_start_epoch "$p" 2>/dev/null)" || return 0
+  [ -n "$lt" ] && [ -n "$ps" ] || return 0
+  [ "$ps" -le "$((lt + 5))" ] || return 0
+  printf '%s\n' "$p"
 }
 # Controllers this cell may SIGNAL: the lock owner, plus any process running THIS state dir's own
 # orch-loop.sh (a launcher that removed the lock). Never a $HARNESS-path match: that path is shared
@@ -1320,6 +1358,19 @@ cmd_stop() {
       # unasserted target.
       live="$(seen_controller_pids)"
       [ -z "$live" ] || die "a controller is running outside session '$SESSION' (pid $(_pids_join "$live")) and does not hold $LOCK — refusing to report 'stopped'; stop it by hand"
+      # Nothing of ours is running, but $LOCK is data on disk and outlives a kill/OOM/reboot. A lock
+      # naming a DEAD pid is left behind by exactly that, and the harness's own `acq()` then reads
+      # `kill -0` → gone → removes it, so it is only noise — but a lock naming a RECYCLED pid makes
+      # `acq()` see a live process and exit 0 SILENTLY: the next start does nothing, and no surface
+      # says why. Release the provably-dead case here and say so; a lock whose pid is alive but is
+      # not an owner is reported above and never removed (we cannot prove it is not a controller we
+      # simply cannot see).
+      if [ -f "$LOCK" ]; then
+        local lp; lp="$(tr -dc '0-9' 2>/dev/null < "$LOCK")"
+        if [ -n "$lp" ] && ! kill -0 "$lp" 2>/dev/null; then
+          rm -f "$LOCK" && say "released a stale lock $LOCK (its owner pid $lp is gone)"
+        fi
+      fi
       say "not running"
       return 0
     fi

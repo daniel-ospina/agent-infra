@@ -99,6 +99,12 @@ case "$(uname -s)" in
   *)      unknown "unsupported platform $(uname -s) — this entry point knows launchd (Darwin) and the tmux cell (Linux)" ;;
 esac
 
+# ⛔ `O` from the ENVIRONMENT, captured BEFORE the platform default below. The config file's `O=` may
+# only fill a value NOBODY set: capturing it after the default makes the provenance test always true,
+# so the arm is dead and this surface reads a state dir the controller never uses
+# (cloud-cell-supervisor.sh DOES honour `O=` in keys.env) — two surfaces disagreeing about which
+# directory holds the lock is the #1745 class, and it was found in review of #1856.
+O_ENV="${O:-}"
 CELL_HOME="${CELL_HOME:-/tmp/cell-home}"
 if [ "$PLATFORM" = "cell" ]; then
   # The cell's own home. `cloud-cell-bringup.sh` documents why it is not /home/ubuntu (which does not
@@ -150,10 +156,10 @@ load_config_file() {
   local v
   if [ -z "${REPO:-}" ]; then v="$(env_file_value REPO "$ENV_FILE")"; [ -n "$v" ] && { REPO="$v"; REPO_SRC="config file $ENV_FILE"; }; fi
   if [ -z "${OR:-}" ];   then v="$(env_file_value OR   "$ENV_FILE")"; [ -n "$v" ] && { OR="$v";   OR_SRC="config file $ENV_FILE"; }; fi
-  if [ -z "${O_FROM_ENV:-}" ]; then v="$(env_file_value O "$ENV_FILE")"; [ -n "$v" ] && O="$v"; fi
+  if [ -z "${O_ENV:-}" ]; then v="$(env_file_value O "$ENV_FILE")"; [ -n "$v" ] && { O="$v"; O_SRC="config file $ENV_FILE"; }; fi
   return 0
 }
-O_FROM_ENV="$O"   # set before load_config_file: the platform default is a fallback, not an override
+O_SRC="${O_ENV:+env}"; [ -n "$O_SRC" ] || O_SRC="platform default"
 O_DEFAULT="$O"
 load_config_file
 
@@ -261,7 +267,7 @@ EOF
   fi
   case "$n" in
     0) unknown "no local checkout${want:+ of $want} found on this machine (looked at: $(reseed_candidates | tr '\n' ' ' | sed 's/ *$//')) — clone it first, or pass REPO=<path>" ;;
-    1) :: ;;
+    1) : ;;   # exactly one checkout: nothing to decide (NOT `::`, which is a command and errors)
     *)
       # Two checkouts of the same repo is not a decision this script may make: they can be at
       # different commits, and picking one silently is how a box ends up running the wrong tree.
@@ -485,6 +491,11 @@ check_registry() {
     live)
       if [ "$st" = "starting" ] && [ "$pid" = "$$" ]; then
         ok "registry: this process is starting $SLUG_REPO"
+      elif [ "$st" = "foreign-process" ]; then
+        # Alive, but not an orch-loop.sh, and not provably a reused pid (the wall-clock re-check in
+        # registry_verdict already reclaimed that case). Refuse — and name the file, because the
+        # remedy here is a human decision, not a `stop` (there is nothing of ours to stop).
+        refuse "the registry record for $SLUG_REPO names pid $pid, which is alive but is NOT an orch-loop.sh (a pid may have been reused) — if you know the old controller is gone, remove $f; refusing to start a possible duplicate"
       elif [ "$ro" = "$O" ]; then
         ok "registry: $SLUG_REPO is held by pid $pid at this state dir ($st)"
       else
@@ -494,7 +505,12 @@ check_registry() {
       fi
       ;;
     stale)
-      ok "registry: a stale entry for $SLUG_REPO (pid $pid is gone) — 'start' reclaims it"
+      # Name WHICH staleness: a dead pid and a pid reused by an unrelated process are the same
+      # verdict and different stories, and the operator has to be able to tell them apart.
+      case "$st" in
+        pid-reused) ok "registry: a stale entry for $SLUG_REPO — pid $pid is alive but was REUSED by an unrelated process (it began after the record was written) — 'start' reclaims it" ;;
+        *)          ok "registry: a stale entry for $SLUG_REPO (pid $pid is gone, $st) — 'start' reclaims it" ;;
+      esac
       ;;
     *)
       # A record we cannot parse might be naming a live controller we cannot read. Reclaiming it would
@@ -559,6 +575,9 @@ registry_claim_or_refuse() { # <file>
   set -- $verdict; kind="${1:-}"; pid="${2:-}"; ro="${3:-}"; st="${4:-}"
   case "$kind" in
     live)
+      if [ "$st" = "foreign-process" ]; then
+        refuse "the registry record for $SLUG_REPO names pid $pid, which is alive but is NOT an orch-loop.sh (a pid may have been reused) — if you know the old controller is gone, remove $f; refusing to start a possible duplicate"
+      fi
       if [ "$ro" = "$O" ]; then
         # Same state dir: the platform verb's own read is the authority, and it reports "already
         # running" — but say which process, because that is the question an operator is asking.
@@ -568,7 +587,10 @@ registry_claim_or_refuse() { # <file>
       ;;
     stale)
       # Say which happened. A silent reclaim teaches nobody that the box had a crashed controller.
-      warn "reclaiming a STALE registry entry for $SLUG_REPO (pid $pid is gone, O=$ro) — it is not blocking this start"
+      case "$st" in
+        pid-reused) warn "reclaiming a STALE registry entry for $SLUG_REPO (pid $pid was REUSED by an unrelated process, O=$ro) — it is not blocking this start" ;;
+        *)          warn "reclaiming a STALE registry entry for $SLUG_REPO (pid $pid is gone, O=$ro) — it is not blocking this start" ;;
+      esac
       ;;
     unreadable)
       unknown "the registry record $f cannot be read ($st) — it may name a live controller for $SLUG_REPO; refusing to start a possible duplicate"
@@ -598,7 +620,11 @@ start_cell() {
   # cost (apply is idempotent and reports "unchanged"). Done explicitly so a pin failure is reported
   # as a pin failure rather than as a controller that exited immediately.
   if ! bash "$SUPERVISOR" apply; then
-    refuse "the harness could not be pinned to $HARNESS_REF in $HARNESS_REPO (see the apply output above) — no controller was started"
+    # ⛔ `${VAR:-…}`, never `$VAR`: neither is assigned here (the ref is the supervisor's own config),
+    # and under `set -u` an unset expansion inside the argument kills the shell BEFORE the refusal
+    # prints — the failure mode where the refusal the whole file promises is replaced by a bash error
+    # and the real cause (apply failed) is never stated. Measured by review of #1856.
+    refuse "the harness could not be pinned to ${HARNESS_REF:-the configured ref} in ${HARNESS_REPO:-this checkout} (see the apply output above) — no controller was started"
   fi
   if ! bash "$SUPERVISOR" start; then
     refuse "cloud-cell-supervisor.sh start failed (see its output above) — no registry entry was recorded"

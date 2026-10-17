@@ -1748,6 +1748,60 @@ case "$OUT" in
   *"controller: STOPPED"*) ok "status: STOPPED once the owner is genuinely gone" ;;
   *) bad "status: still reports a controller after stop — $OUT" ;;
 esac
+# ── §(m) A STALE LOCK NAMING A PEER CONTROLLER MUST NEVER BE SIGNALLED ─────────────────────────
+# $LOCK is data on disk and outlives a `kill -9`, an OOM or a reboot. If the OS RECYCLES that pid to
+# a peer lane's controller — the exact argv shape every controller on this box has — then the pid is
+# alive, its command line contains `orch-loop.sh`, and a substring read makes it the owner. `stop`
+# then TERMs and KILLs another repo's controller. Measured as a P0 in review of #1856: `stop` killed
+# a peer controller from a stale lock alone.
+say_case "a STALE lock naming a PEER controller is reported, never signalled, and its dead-pid form is released (#1856 review)"
+P="$T/peer"; mkdir -p "$P/home" "$P/o" "$P/peer" "$P/bin"
+git init -q "$P/repo" 2>/dev/null || bad "fixture: cannot git init $P/repo"
+git -C "$P/repo" remote add origin https://github.com/daniel-ospina/agent-infra.git 2>/dev/null \
+  || bad "fixture: cannot set the peer checkout's origin"
+cat > "$P/bin/tmux" <<SH
+#!/bin/bash
+case "\${1:-}" in has-session) exit 1 ;; new-session) exit 0 ;; *) exit 0 ;; esac
+SH
+chmod +x "$P/bin/tmux"
+# A PEER controller: its own state dir, its own orch-loop.sh — a different repo's controller.
+cat > "$P/peer/orch-loop.sh" <<'STUB'
+#!/bin/bash
+trap 'exit 0' TERM INT
+while :; do sleep 1; done
+STUB
+chmod +x "$P/peer/orch-loop.sh"
+bash "$P/peer/orch-loop.sh" & PEER=$!
+AI1761_PIDS="${AI1761_PIDS:-} $PEER"
+# The stale lock: backdated, so the peer demonstrably began AFTER it was written.
+printf '%s\n' "$PEER" > "$P/o/.orch.lock"
+touch -t "$(date -v-5M +%Y%m%d%H%M.%S 2>/dev/null || date -d '-5 minutes' +%Y%m%d%H%M.%S)" "$P/o/.orch.lock"
+own_peer() { # <sub>
+  PATH="$P/bin:$PATH" CELL_HOME="$P/home" ENV_FILE="$P/keys.env" SESSION="ai1856-$$" \
+    O="$P/o" REPO="$P/repo" OR="daniel-ospina/agent-infra" SCOPE=own HARNESS="" \
+    bash "$SUP" "$1" 2>&1
+}
+OUT="$(own_peer status)"
+case "$OUT" in
+  *"pid $PEER"*) bad "status: reported the PEER controller (pid $PEER) as this state dir's owner — $OUT" ;;
+  *) ok "status: did not adopt the peer controller named by the stale lock" ;;
+esac
+OUT="$(own_peer stop)"
+kill -0 "$PEER" 2>/dev/null && ok "stop: the PEER controller SURVIVED a stale lock naming it (nothing unasserted was signalled)" \
+                            || bad "stop: KILLED the peer controller from a stale lock — the peer is not ours to signal"
+[ -e "$P/o/.orch.lock" ] && ok "stop: left the lock in place (a pid we cannot prove dead is not ours to release)" \
+                          || bad "stop: released a lock whose named pid is alive"
+# The provably-DEAD form: the same lock with a pid that is gone is noise the harness's acq() clears,
+# but a recycled pid makes acq() see a live process and exit 0 SILENTLY — so `stop` says so.
+kill -9 "$PEER" 2>/dev/null; sleep 0.3
+printf '999999\n' > "$P/o/.orch.lock"
+OUT="$(own_peer stop)"
+case "$OUT" in
+  *"released a stale lock"*) ok "stop: released a stale lock whose owner pid is provably gone, and said so" ;;
+  *) bad "stop: left a dead-pid lock behind without explaining it — $OUT" ;;
+esac
+[ -e "$P/o/.orch.lock" ] && bad "stop: the dead-pid lock is still there" || ok "stop: the stale lock is gone"
+
 trap 'ai1711_cleanup; [ -n "${AI1761_PIDS:-}" ] && kill -9 $AI1761_PIDS 2>/dev/null; rm -rf "$T"' EXIT
 
 echo

@@ -109,13 +109,33 @@ and mtime, and a warning when it is empty.
 | same-repo duplicate refused, naming the pid | `lib/orchestrator-registry.sh` `registry_verdict` + `check_registry` | `§1` (and `§7` on the cell path) |
 | different repo allowed on one machine | `check_registry` | `§1` second direction |
 | stale record reclaimed + reported | `registry_claim_or_refuse` | `§2`, `§7` |
-| foreign pid never signalled | `registry_pid_is_controller` | `§3` |
+| a **reused** pid is reclaimed, not a permanent refusal | `proc_start_epoch` + `registry_verdict` | `§3b` |
+| foreign pid refused with the record to remove, never signalled | `registry_pid_is_controller` | `§3` |
 | repo path from another machine refused, naming it | `cmd_check` arm 1 | `§4` |
 | `--reseed` preserves secrets + state | `cmd_reseed` | `§4b` |
 | dispatch read published | `cmd_status` | `§6` |
 | the controller is found where it actually runs (harness path, not `$O`) | `local_controller_pids` | `§6b` |
+| the config file's `O=` is honoured; an explicit env `O` still wins | `O_ENV` provenance | `§6c` |
+| a failing delegated verb refuses in one line (never dies on `set -u`) | `start_cell` / `start_mac` | `§7b` |
+| a stale lock naming a **peer** controller is never signalled; a dead-pid lock is released | `lock_controller_pid` + `cmd_stop` | supervisor suite `§(m)` |
 
 Registered in `scripts/run-bash-shards.sh`, so **both** CI lanes run the suite by construction.
+
+## Review findings (fresh-context reviewer over the whole change)
+
+Seven, all verified against the source before applying; every one is pinned by an arm that reddens on
+the pre-fix code (`BRINGUP=`/`SUP=` pointed at `HEAD` in a scratch worktree: 10 and 5 red
+respectively).
+
+| # | Finding | Disposition |
+|---|---|---|
+| P0 | `lock_controller_pid` matched `*orch-loop.sh*` as a SUBSTRING, so a stale `$O/.orch.lock` naming a pid the OS recycled to a **peer lane's controller** made `stop` TERM/KILL another repo's controller — reproduced, peer killed | **fixed**: argv must be `<shell> …/orch-loop.sh` AND the process must not have begun after the lock was written (`proc_start_epoch`); the supervisor suite's `§(m)` reddens on the pre-fix code |
+| P1 | the `apply`-failure refusal expanded `$HARNESS_REF`/`$HARNESS_REPO`, which this script never assigns — under `set -u` the shell died before the refusal printed, so a live controller's refusal reached the operator as `unbound variable` | **fixed** (`${VAR:-…}`), `§7b` |
+| P1 | a record whose pid was **recycled** was a permanent false refusal (nothing revalidated it — the #8175 class) | **fixed** (wall-clock re-check), `§3b` |
+| P1 | `§3`'s "the foreign process was NOT signalled" ran only `check`, which has no signalling path — an assertion that cannot fail | **fixed**: the real property moved to the supervisor's `§(m)`, which drives `stop` |
+| P2 | `registry_slug` joined `owner-repo` with `-`, which BOTH parts may contain: `premise-labs/agent-infra` and `premise/labs-agent-infra` shared one record | **fixed** → `owner~repo` |
+| P2 | the config file's `O=` was captured AFTER the platform default, so the arm was dead — `check` read a state dir the controller never uses | **fixed** (`O_ENV` before defaulting), `§6c` |
+| P2 | no arm drove a FAILING `start`, which is why the P1 above was green | **fixed** (`§7b`, cell + mac) |
 
 ## Validation (live cell)
 

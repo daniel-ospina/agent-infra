@@ -172,7 +172,7 @@ A_PID="$(start_controller "$A/O")"; sleep 0.4
 # ⛔ The record names a DIFFERENT state dir from the one this `check` runs with: that is the measured
 # duplicate (two $O dirs on one machine running the same repo), and it is the case a state-dir-scoped
 # read cannot see. A record naming THIS $O is the "already running" case, asserted separately below.
-write_registry "$A/home" "daniel-ospina-tortoise" "daniel-ospina/tortoise" "$A/O-other" "$A_PID" running
+write_registry "$A/home" "daniel-ospina~tortoise" "daniel-ospina/tortoise" "$A/O-other" "$A_PID" running
 
 bringup "$A/home" "$A/bin" "$A/harness" REPO="$A/repo" O="$A/O" ENV_FILE="$A/home/keys.env"
 case "$OUT" in
@@ -189,7 +189,7 @@ esac
 # The OTHER shape of a live record — one naming THIS state dir — is not a duplicate and must be
 # reported as "already running" rather than refused: a refusal there would make `check` fail on a
 # machine that is working exactly as intended.
-write_registry "$A/home" "daniel-ospina-tortoise" "daniel-ospina/tortoise" "$A/O" "$A_PID" running
+write_registry "$A/home" "daniel-ospina~tortoise" "daniel-ospina/tortoise" "$A/O" "$A_PID" running
 bringup "$A/home" "$A/bin" "$A/harness" REPO="$A/repo" O="$A/O" ENV_FILE="$A/home/keys.env"
 [ "$RC" = 0 ] && ok "check: a controller recorded for THIS state dir is 'already running', not a duplicate" \
              || bad "check refused a record that names its own state dir — rc=$RC $OUT"
@@ -209,7 +209,7 @@ case "$OUT" in
   *"ALREADY RUNNING"*) bad "check reported the tortoise controller as a duplicate of the agent-infra repo" ;;
   *) ok "check: the other repo's controller is not reported as a duplicate" ;;
 esac
-grep -q "repo=daniel-ospina/tortoise" "$(registry_dir "$A/home")/daniel-ospina-tortoise" 2>/dev/null \
+grep -q "repo=daniel-ospina/tortoise" "$(registry_dir "$A/home")/daniel-ospina~tortoise" 2>/dev/null \
   && ok "the other repo's registry record is untouched" \
   || bad "the other repo's registry record was modified by a run for a different repo"
 
@@ -217,7 +217,7 @@ grep -q "repo=daniel-ospina/tortoise" "$(registry_dir "$A/home")/daniel-ospina-t
 say_case "§2 a stale registry entry is RECLAIMED (not a block), and the reclaim is reported"
 C="$T/c"; mk_bin "$C/bin" mac; mk_harness "$C/harness" 0; mk_clone "$C/repo" "daniel-ospina/agent-infra"
 mkdir -p "$C/home"
-write_registry "$C/home" "daniel-ospina-agent-infra" "daniel-ospina/agent-infra" "$C/O" 999999 running
+write_registry "$C/home" "daniel-ospina~agent-infra" "daniel-ospina/agent-infra" "$C/O" 999999 running
 bringup "$C/home" "$C/bin" "$C/harness" REPO="$C/repo" O="$C/O" ENV_FILE="$C/home/keys.env"
 case "$OUT" in
   *stale*|*STALE*) ok "check: a dead pid is reported as stale, not as a block" ;;
@@ -231,16 +231,45 @@ say_case "§3 a live pid that is NOT an orch-loop.sh is reported as foreign — 
 D="$T/d"; mk_bin "$D/bin" mac; mk_harness "$D/harness" 0; mk_clone "$D/repo" "daniel-ospina/agent-infra"
 mkdir -p "$D/home"
 sleep 300 & FOREIGN=$!
+disown "$FOREIGN" 2>/dev/null || true   # keep the suite's output free of a "Killed" job notice
 CONTROLLER_PIDS="$CONTROLLER_PIDS $FOREIGN"
-write_registry "$D/home" "daniel-ospina-agent-infra" "daniel-ospina/agent-infra" "$D/O-other" "$FOREIGN" running
+write_registry "$D/home" "daniel-ospina~agent-infra" "daniel-ospina/agent-infra" "$D/O-other" "$FOREIGN" running
 bringup "$D/home" "$D/bin" "$D/harness" REPO="$D/repo" O="$D/O" ENV_FILE="$D/home/keys.env"
 case "$OUT" in
-  *"ALREADY RUNNING"*) ok "check: a live-but-unreadable owner is a refusal, never a pass" ;;
-  *) bad "check passed while a live-but-foreign pid holds the record — $OUT" ;;
+  *"is NOT an orch-loop.sh"*) ok "check: a live-but-foreign owner is a refusal that names the pid and the record to remove, never a pass" ;;
+  *) bad "check passed (or refused vaguely) while a live-but-foreign pid holds the record — $OUT" ;;
 esac
+[ "$RC" = "1" ] && ok "check: foreign owner is rc=1 (a refusal), not rc=2 or 0" \
+                 || bad "check: foreign owner returned rc=$RC, expected 1"
 kill -0 "$FOREIGN" 2>/dev/null && ok "the foreign process was NOT signalled (it is not ours to kill)" \
                                || bad "the foreign process was killed by the bringup"
 kill -9 "$FOREIGN" 2>/dev/null
+
+# ── §3b A REUSED PID IS RECLAIMED, NOT REFUSED FOREVER ──────────────────────────────────────────
+# Same read as §3 (alive + not an orch-loop.sh) under a different fact: the record was written a
+# minute BEFORE that process began, so the process cannot be the controller the record names. Without
+# this the record is a permanent false refusal — a pid recycled after a reboot blocks every future
+# start, and the only way through is a human hand-editing the registry (the #8175 class, measured).
+say_case "§3b a record whose pid was REUSED by an unrelated process is reclaimed (self-healing), not a permanent refusal"
+R="$T/reused"; mk_bin "$R/bin" mac; mk_harness "$R/harness" 0; mk_clone "$R/repo" "daniel-ospina/agent-infra"
+mkdir -p "$R/home"
+sleep 300 & REUSED=$!
+disown "$REUSED" 2>/dev/null || true   # keep the suite's output free of a "Killed" job notice
+CONTROLLER_PIDS="$CONTROLLER_PIDS $REUSED"
+mkdir -p "$(registry_dir "$R/home")"
+printf 'repo=%s\nO=%s\npid=%s\nstarted=%s\nstate=%s\n' "daniel-ospina/agent-infra" "$R/O-other" "$REUSED" \
+  "$(( $(date +%s) - 60 ))" running > "$(registry_dir "$R/home")/daniel-ospina~agent-infra"
+bringup "$R/home" "$R/bin" "$R/harness" REPO="$R/repo" O="$R/O" ENV_FILE="$R/home/keys.env"
+case "$OUT" in
+  *REUSED*) : ;;
+  *) bad "a pid that began AFTER the record was written was not identified as reused — $OUT" ;;
+esac
+case "$OUT" in
+  *"ALREADY RUNNING"*) bad "a REUSED pid still blocks the start forever — $OUT" ;;
+  *"BRINGUP CHECK OK"*) ok "check: a reused pid is reported as reused and does not block" ;;
+  *) bad "check neither passed nor explained the reused pid — $OUT" ;;
+esac
+kill -9 "$REUSED" 2>/dev/null
 
 # ── §4 the measured cell defect: a repo path that does not exist here ───────────────────────────
 say_case "§4 a configured repo path that does not exist on THIS machine is a refusal naming it"
@@ -280,7 +309,7 @@ mkdir -p "$E/O/state" && printf 'kept\n' > "$E/O/state/keepme"
 printf '%s\n' 4242 > "$E/O/.orch.lock"
 printf 'one\ntwo\n' > "$E/O/candidates.txt"
 mkdir -p "$E/home/.local/state/orchestrator"
-printf 'repo=x\nO=y\npid=999998\nstarted=1\nstate=running\n' > "$E/home/.local/state/orchestrator/daniel-ospina-tortoise"
+printf 'repo=x\nO=y\npid=999998\nstarted=1\nstate=running\n' > "$E/home/.local/state/orchestrator/daniel-ospina~tortoise"
 BRINGUP_ARGS=--reseed bringup "$E/home" "$E/bin" "$E/harness" REPO="$E/repo" O="$E/O" ENV_FILE="$E/home/keys.env"
 [ "$RC" = 0 ] && ok "--reseed: rc=0 on a repairable config" || bad "--reseed: rc=$RC — $OUT"
 grep -qx "REPO=$E/repo" "$E/home/keys.env" \
@@ -364,6 +393,28 @@ case "$OUT" in
 esac
 kill -9 "$M_PID" 2>/dev/null
 
+# ── §6c THE CONFIG FILE'S `O=` IS HONOURED, NOT SILENTLY IGNORED ────────────────────────────────
+# `cloud-cell-supervisor.sh` sources the same file, so `O=` in it moves the LOCK, the candidates and
+# the state dir. If this surface captures its provenance AFTER applying the platform default, the
+# config arm is dead and `check`/`status`/the registry all read a directory the controller never
+# touches — two surfaces disagreeing about where the lock is, which is the #1745 class. Found in
+# review of #1856; the arm asserts the state dir the config file names is the one reported.
+OQ="$T/oq"; mk_bin "$OQ/bin" mac; mk_harness "$OQ/harness" 0; mk_clone "$OQ/repo" "daniel-ospina/agent-infra"
+mkdir -p "$OQ/home" "$OQ/config-O"
+printf 'REPO=%s\nO=%s\nDEEPSEEK_API_KEY=sk-test\n' "$OQ/repo" "$OQ/config-O" > "$OQ/home/keys.env"
+bringup "$OQ/home" "$OQ/bin" "$OQ/harness" ENV_FILE="$OQ/home/keys.env"
+case "$OUT" in
+  *"state=$OQ/config-O"*) ok "config: the config file's O= is the state dir this surface reads (not the platform default)" ;;
+  *) bad "config: the config file's O= was IGNORED — $OUT" ;;
+esac
+# …and an EXPLICIT environment O still WINS: the config file is a fallback, never an override.
+bringup "$OQ/home" "$OQ/bin" "$OQ/harness" REPO="$OQ/repo" O="$OQ/env-O" ENV_FILE="$OQ/home/keys.env"
+case "$OUT" in
+  *"state=$OQ/env-O"*) ok "config: an explicit O in the environment OVERRIDES the config file" ;;
+  *"state=$OQ/config-O"*) bad "config: the config file overrode an explicit environment O" ;;
+  *) bad "config: neither the env O nor the config O was used — $OUT" ;;
+esac
+
 # ── §7 the cell path ───────────────────────────────────────────────────────────────────────────
 say_case "§7 the cell path: apply -> start via the supervisor, pid read from ITS status verb"
 K="$T/k"; mk_bin "$K/bin" cell; mk_clone "$K/repo" "daniel-ospina/agent-infra"; mkdir -p "$K/home"
@@ -400,13 +451,67 @@ grep -qx apply "$K/sup/called" 2>/dev/null && ok "start (cell): called 'apply' b
                                           || bad "start (cell): did not call the supervisor's apply"
 grep -qx start "$K/sup/called" 2>/dev/null && ok "start (cell): called the supervisor's 'start'" \
                                           || bad "start (cell): did not call the supervisor's start"
-F="$(registry_dir "$K/home")/daniel-ospina-agent-infra"
+F="$(registry_dir "$K/home")/daniel-ospina~agent-infra"
 [ -f "$F" ] && ok "start (cell): a registry record was written" || bad "start (cell): no registry record"
 [ "$(sed -n 's/^pid=//p' "$F" 2>/dev/null)" = 4242 ] \
   && ok "start (cell): the recorded pid is the one the platform's status verb named (4242)" \
   || bad "start (cell): recorded pid is '$(sed -n 's/^pid=//p' "$F" 2>/dev/null)', want 4242"
 grep -qx 'state=running' "$F" 2>/dev/null && ok "start (cell): the record is marked running" \
                                          || bad "start (cell): the record was left in the 'starting' state"
+
+# ── §7b A FAILING DELEGATED VERB MUST REFUSE IN ONE LINE, NOT DIE ON A BASH ERROR ───────────────
+# The apply-failure refusal expanded two variables this script never assigns. Under `set -u` that
+# kills the shell BEFORE the refusal prints, so the operator sees `HARNESS_REF: unbound variable`
+# instead of the one actionable line the contract promises — and the cause (a live controller that
+# apply refused to replace) is never stated. Review of #1856 found it; every `start` arm before this
+# one succeeded, so nothing could see it.
+FAILED="$T/failed"; mk_bin "$FAILED/bin" cell; mk_clone "$FAILED/repo" "daniel-ospina/agent-infra"
+mkdir -p "$FAILED/home" "$FAILED/O" "$FAILED/scripts" "$FAILED/scripts/orchestrator-harness"
+printf 'DEEPSEEK_API_KEY=sk-test\n' > "$FAILED/home/keys.env"
+cp "$BRINGUP" "$FAILED/scripts/orchestrator-bringup.sh"; cp -r "$HERE/lib" "$FAILED/scripts/lib"
+cat > "$FAILED/scripts/cloud-cell-supervisor.sh" <<'STUB'
+#!/bin/bash
+case "$1" in
+  apply) echo "FATAL: a controller is RUNNING (pid 999) and apply would replace the harness tree under it" >&2; exit 1 ;;
+  *) exit 0 ;;
+esac
+STUB
+OUT="$(env -i HOME="$FAILED/home" XDG_STATE_HOME="$FAILED/home/.local/state" \
+  PATH="$FAILED/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" CELL_HOME="$FAILED/home" \
+  REPO="$FAILED/repo" O="$FAILED/O" HARNESS_PIN_DIR="$FAILED/home/harness" \
+  HARNESS_PIN_FILE="$FAILED/home/.harness-path" \
+  bash "$FAILED/scripts/orchestrator-bringup.sh" start 2>&1)"; RC=$?
+[ "$RC" = 1 ] && ok "start (cell): a failed 'apply' is rc=1 (a refusal)" \
+              || bad "start (cell): a failed apply returned rc=$RC, want 1 — $OUT"
+case "$OUT" in
+  *unbound*) bad "start (cell): the refusal DIED on an unset variable instead of printing — $OUT" ;;
+  *"REFUSED:"*"no controller was started"*) ok "start (cell): the apply failure prints ONE actionable refusal line" ;;
+  *) bad "start (cell): the apply failure printed no usable refusal — $OUT" ;;
+esac
+[ -f "$FAILED/home/.local/state/orchestrator/daniel-ospina~agent-infra" ] \
+  && bad "start (cell): a failed start left a phantom registry owner" \
+  || ok "start (cell): a failed start left no registry entry behind"
+
+# The mac arm of the same contract: install.sh is the delegated renderer, and its failure is a refusal.
+FAILEDM="$T/failedm"; mk_bin "$FAILEDM/bin" mac; mk_clone "$FAILEDM/repo" "daniel-ospina/agent-infra"
+mkdir -p "$FAILEDM/home" "$FAILEDM/O" "$FAILEDM/harness"
+cat > "$FAILEDM/harness/check-deployed-drift.sh" <<'STUB'
+#!/bin/bash
+echo "MATCH: deployed harness at $O == the repo"; exit 0
+STUB
+cat > "$FAILEDM/harness/install.sh" <<'STUB'
+#!/bin/bash
+echo "plutil: the rendered plist is invalid" >&2; exit 1
+STUB
+chmod +x "$FAILEDM/harness/install.sh" "$FAILEDM/harness/check-deployed-drift.sh"
+BRINGUP_ARGS=start bringup "$FAILEDM/home" "$FAILEDM/bin" "$FAILEDM/harness" \
+  REPO="$FAILEDM/repo" O="$FAILEDM/O" ENV_FILE="$FAILEDM/home/keys.env"
+[ "$RC" = 1 ] && ok "start (mac): a failed install.sh is rc=1 (a refusal)" \
+              || bad "start (mac): a failed install.sh returned rc=$RC, want 1 — $OUT"
+case "$OUT" in
+  *"install.sh failed"*) ok "start (mac): the install.sh failure is reported as such" ;;
+  *) bad "start (mac): the install.sh failure was not reported — $OUT" ;;
+esac
 
 # A FRESH cell (no pin recorded yet) must be reported as such, NOT refused: `start` is what applies
 # the pin. This arm exists because the other cell cases all carry a pin, so the "nothing recorded"
@@ -452,7 +557,7 @@ printf '#!/bin/bash\n' > "$L/pin/aaaaaaaaaaaa/scripts/orchestrator-harness/orch-
 printf 'DEEPSEEK_API_KEY=sk-test\n' > "$L/home/keys.env"
 L_PID="$(start_controller "$L/O1")"; sleep 0.4
 printf '%s\n' "$L/pin/aaaaaaaaaaaa/scripts/orchestrator-harness" > "$L/home/.harness-path"
-write_registry "$L/home" "daniel-ospina-agent-infra" "daniel-ospina/agent-infra" "$L/O1" "$L_PID" running
+write_registry "$L/home" "daniel-ospina~agent-infra" "daniel-ospina/agent-infra" "$L/O1" "$L_PID" running
 mkdir -p "$L/scripts"; cp "$BRINGUP" "$L/scripts/orchestrator-bringup.sh"; cp -r "$HERE/lib" "$L/scripts/lib"
 cp "$K/bin/cloud-cell-supervisor-stub.sh" "$L/scripts/cloud-cell-supervisor.sh"
 OUT="$(env -i HOME="$L/home" XDG_STATE_HOME="$L/home/.local/state" \

@@ -65,7 +65,11 @@ registry_slug() {
   case "$r" in
     ./*|*/./*) return 1 ;;
   esac
-  printf '%s\n' "${r%%/*}-${r#*/}"
+  # `owner~repo`, NOT `owner-repo`: BOTH parts may contain `-`, so `premise-labs/agent-infra` and
+  # `premise/labs-agent-infra` collapse to one file — which refuses the second repo as a duplicate of
+  # the first (the false-refusal direction the owner's second half forbids) and lets `stop` for one
+  # release the other's record. `~` cannot appear in either part (the charset check above).
+  printf '%s~%s\n' "${r%%/*}" "${r#*/}"
 }
 
 # registry_file <owner/repo> — the record path for a repo (no creation, no validation of the owner).
@@ -140,6 +144,28 @@ registry_get() {
   return 0
 }
 
+# proc_start_epoch <pid> — the wall-clock epoch the process began, or rc 1 when it cannot be read.
+# `ps -o etime=` exists on both BSD and GNU ps (unlike etimes/lstart date parsing), and the format
+# `[[dd-]hh:]mm:ss` parses the same way on both. Used ONLY to tell a REAL controller from a pid that
+# was reused by an unrelated process — without it, a reuse turns the record into a permanent false
+# refusal: the pid is alive, it is not an orch-loop.sh, and no revalidation ever re-examines it.
+proc_start_epoch() {
+  local p="${1:-}" e d h m s r
+  case "$p" in ''|*[!0-9]*) return 1 ;; esac
+  e="$(ps -o etime= -p "$p" 2>/dev/null | tr -d '[:space:]')" || return 1
+  [ -n "$e" ] || return 1
+  d=0
+  case "$e" in *-*) d="${e%%-*}"; r="${e#*-}" ;; *) r="$e" ;; esac
+  case "$d" in ''|*[!0-9]*) return 1 ;; esac
+  case "$r" in
+    *:*:*) h="${r%%:*}"; r="${r#*:}"; m="${r%%:*}"; s="${r##*:}" ;;
+    *:*)   h=0;                 m="${r%%:*}"; s="${r##*:}" ;;
+    *) return 1 ;;
+  esac
+  case "$h$m$s" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s\n' "$(( $(date +%s) - (d * 86400 + h * 3600 + m * 60 + s) ))"
+}
+
 # registry_pid_is_controller <pid> — 0 only for a live process whose invocation IS an orch-loop.sh.
 # The same predicate cloud-cell-supervisor.sh uses (match the INVOCATION, not the string): a caller
 # whose command line merely MENTIONS the path is not a controller, and treating it as one would make
@@ -188,9 +214,22 @@ registry_verdict() {
   if registry_pid_is_controller "$pid"; then
     printf 'live %s %s %s\n' "$pid" "${o:--}" "$st"; return 0
   fi
-  # Alive, but NOT this machine's controller: report it as live-and-foreign so the caller refuses
-  # rather than reclaims (never signals, never forgets). A pid reused by an unrelated process is the
-  # likeliest way to get here, and refusing costs one line where forgetting costs a duplicate.
+  # Alive, but NOT this machine's controller — two very different situations share that read, and the
+  # difference decides whether the caller must refuse or may reclaim:
+  #   * a pid REUSED by an unrelated process (a busy box, or a reboot that recycles low pids). The
+  #     record describes a controller that is gone; the live pid merely inherited its number. This is
+  #     self-healing: the process began AFTER the record was written, so it cannot be the process the
+  #     record names.
+  #   * anything else — we cannot tell. Reported live-and-foreign so the caller REFUSES rather than
+  #     reclaims (never signals, never forgets).
+  local rec_started pstart
+  rec_started="$(registry_get "$f" started)"
+  pstart="$(proc_start_epoch "$pid" 2>/dev/null)" || pstart=""
+  case "$rec_started" in ''|*[!0-9]*) rec_started="" ;; esac
+  if [ -n "$pstart" ] && [ -n "$rec_started" ] && [ "$pstart" -gt "$((rec_started + 1))" ]; then
+    printf 'stale %s %s pid-reused\n' "$pid" "${o:--}"
+    return 0
+  fi
   printf 'live %s %s foreign-process\n' "$pid" "${o:--}"
 }
 
