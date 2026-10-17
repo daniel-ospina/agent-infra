@@ -94,7 +94,7 @@ doc_status: draft
 > | `orch-loop.sh` guards **every** limit with `is_limit` (digits **and** at most nine of them) before its first arithmetic read — `MAX_LANES`, `MAX_REVIEW`, `MERGE_PRIORITY_AT`, `MAX_FIX`, `MAX_FIX_TRIES`, `BATCH`, `CYC`, `STALE_MIN`, `SWEEP_MAX_AGE`, `SWEEP_MIN_REMAIN` (and `MAX_LOAD`/`MIN_SWAP_FREE`/`MIN_MEM_FREE_MB`, which had `is_num`: the first two are plist-supplied gates that `[` would ERR on at or above 2**63, the last is plist-supplied too, so all three moved to `is_limit`) | two failure modes, both fail-**OPEN**: `[ -ge ]` on a non-number is FALSE and FALSE in the gate chain ALLOWS, so `MAX_LANES=4x` dropped the lane cap, `MERGE_PRIORITY_AT=notanum` removed the drain-before-dispatch gate, `BATCH=abc` dispatched the whole backlog in one cycle, and `MAX_FIX_TRIES=abc` let fixer attempt 10 run past a cap of 3. `[` also ERRORS at or above 2**63, so an absurd-but-numeric limit opened them the same way. `is_num` itself stays unbounded for an **epoch mtime** (already 10 digits), but `_NCPU` is now `is_limit` too: its source is the host (`sysctl`/`nproc`), not the plist, so an absurd-but-numeric probe reached `$(( 10#$_NCPU * 10 ))` and WRAPPED — 99999999999999999999 to 3875820019684212726, 19 digits but still BELOW 2**63-1, so `[ -ge ]` does NOT ERROR: it simply never binds and the gate OPENS **silently** (the earlier wording said `[ -ge ]` ERRORS here — corrected, fifth review round 2026-10-14) — and 2**63 to exactly 0, which `is_limit` ACCEPTS because install.sh allows 0 for every limit but CYC (`[ "$L" -ge 0 ]` is always true, so the gate CLOSES and the box dispatches nothing). `install.sh` now mirrors the loop's guard (`is_limit` + the `_NCPU >= 1` probe guard + the two MAX_LOAD guards) because install.sh is what substitutes `__MAX_LOAD__` into the live plist — the wrap survived there on the real production path |
 > | `orch-loop.sh` reads base 10 where it read base 8 | `$((MAX_REVIEW + 2))` read `030` as **octal** (26, not 30) and `$((STALE_MIN * 60))` did the same. `MERGE_PRIORITY_AT` already normalised with `10#` |
 > | `install.sh` refuses a non-integer, an out-of-range value, or a value carrying a `__TOKEN__` | `MAX_LANES=4x` was written into the live launchd plist and `install.sh` exited 0, so the plist lied about the ceiling; and the sed rules run in order, so `OR=__MAX_LANES__` rendered as `4` — exit 0, valid XML, and the daemon then ran `gh --repo 4` |
-> | `install.sh` renders to a temp file and `mv`s it into place, and asserts no `__…__` survived | the redirect truncates `$PLIST` **before** `sed` runs, so rejecting after writing straight to it left the live plist empty or poisoned — and §9's next step (`launchctl unload && load`) then failed, so a rejected re-install destroyed a working daemon config. `plutil -lint` cannot see a substitution that did not take |
+> | `install.sh` renders to a temp file and `mv`s it into place, and asserts no `__…__` survived | the redirect truncates `$PLIST` **before** `sed` runs, so rejecting after writing straight to it left the live plist empty or poisoned — and §9's then-step (`launchctl unload && load`) then failed, so a rejected re-install destroyed a working daemon config. `plutil -lint` cannot see a substitution that did not take |
 > | `install.sh` creates the plist's directory (`mkdir -p "$(dirname "$PLIST")"`) | an agent-infra addition, not a lost tortoise line: a sandboxed or first-time `HOME` has no `Library/LaunchAgents` and the redirect then died |
 > | `selftest.sh` pins the documented default of every host-independent limit, drives the swap gate with real swap (`SWTOTAL` != 0) **and** a non-default ceiling, drives `install.sh` instead of grepping it, and extracts the coercion lines to RUN them | the default-agreement check could not see both files drifting **together**; `SWTOTAL=0` short-circuits the swap gate before the comparison; a source-text pin survives the guard being disabled (`if false && grep …`); and a fixture that re-implements the pattern in the test asserts nothing about the shipped code |
 > | `orch-loop.sh` moves the sweep's PR **listing** to a conditional REST call (`gh api --paginate -i` + `If-None-Match`, ETag in `state/sweep-etag`, age floor `SWEEP_MAX_AGE`) and takes its rate-limit signal from the **response headers** (`x-ratelimit-remaining`/`-reset`/`Retry-After`) rather than `/rate_limit`; the `# BEGIN sweep-quota` helper block (`sweep_fail_kind`/`sweep_defer_until`) and the new `sweep-quota.test.sh` are agent-infra-only (and the ported `selftest.sh` gains the section that runs it, with its coercion-count pin) | a `304` is not charged to the primary rate limit, so the listing is free, and the `/rate_limit` counter was measured reporting `graphql 4933/5000` while **every** GraphQL call failed — a cell that cannot list PRs cannot merge and read as idle-but-fine (agent-infra#1762). tortoise still carries the polling sweep, so a faithful port must not delete this block as "unported work": port it or keep it |
@@ -421,8 +421,21 @@ export SCOPE=own                         # drain scope: auto (default) | own | b
 #    `cd ~/orchestrator && ./install.sh` dies with "missing template" — step 1 copies only *.sh.
 bash scripts/orchestrator-harness/install.sh
 
-# 4. Start it when you mean to
-launchctl load -w ~/Library/LaunchAgents/com.eldato.orchestrator-loop.plist
+# 4. Start it when you mean to — and have the start PROVEN, not assumed.
+#    install.sh --start renders, then `launchctl enable` → `bootout` → `bootstrap` (falling back to
+#    the legacy `load` if bootstrap fails), then verifies the label has a PID **and** that
+#    ~/orchestrator/heartbeat advanced. It exits non-zero with one actionable line if either fails.
+#
+#    Two tunables, both optional: `START_TIMEOUT` (seconds to wait for that pid+heartbeat, default
+#    30) and `LC_HB_STALE` (how old the heartbeat may be before a LOADED job counts as "not
+#    cycling", default `2*CYC + 300` — derived from this cell's cycle, because a fixed bound fails a
+#    healthy CYC=900 cell). A validation run (no flag) touches no launchd state at all.
+#
+#    ⛔ NEVER `launchctl load -w` / `unload -w` here: `-w` writes a PERSISTENT Disabled override
+#    (`man launchctl`), so an unload/load pair whose bootstrap fails leaves the controller
+#    removed AND disabled, silently. Measured 2026-10-17: 48 min of dead dispatch, then 19 more
+#    (agent-infra#1975).
+bash scripts/orchestrator-harness/install.sh --start
 ```
 
 Step 3 also records **which harness commit this box runs** in `$O/.agent-infra-stamp.json`
@@ -434,10 +447,19 @@ passing, which is the intended fail-closed behaviour and not an install failure.
 # liveness / stop
 cat ~/orchestrator/heartbeat                 # epoch seconds, should be < ~5 min old
 tmux ls                                      # lane-*, chain-*, merge-*, fix-*
-launchctl unload -w ~/Library/LaunchAgents/com.eldato.orchestrator-loop.plist
 ```
 
-`install.sh --uninstall` unloads the agent and removes the plist.
+`install.sh --uninstall` removes the agent (`launchctl bootout`), **reads the domain back**, and only then
+deletes the plist — if the label still has a pid it exits non-zero instead of printing ✅. It writes **no**
+persistent Disabled override, so a later `--start` is a plain start rather than a start that has to
+fight a sticky disable first.
+
+Every mutating path (`--start`, `--restart`, `--uninstall`) first checks two things, and refuses with
+one line rather than acting if either fails: **`$HOME` must be the real home** (a sandboxed `$HOME`
+acts in the real user's domain — agent-infra#446; tests opt in with `ELDATO_ALLOW_TEST_HOME=1` plus a
+`launchctl` stub on PATH), and **a job already loaded under this label must be loaded from this
+plist** — `launchctl bootout <domain> <path>` resolves the removal by the LABEL it reads out of that
+plist (measured), so without that check a sandboxed run would remove the production controller.
 
 Run the offline self-test first — it needs no network, tmux server or git writes. **Every check
 exercises the shipped script** (it extracts the real classifier, `sess()`, the claim block and the
@@ -674,7 +696,11 @@ clear about what is and is not enforced:
 
 The ritual, in order — the point is that **no uncommitted work is lost**:
 
-1. `launchctl unload -w …` — so it does not restart on boot.
+1. `bash scripts/orchestrator-harness/install.sh --uninstall` (from the checkout; the installer is not in
+   `$O`, whose copies are the loop's own scripts) — `bootout` + remove the plist, so it does not restart
+   on boot and no persistent Disabled override is written (which is what `unload -w` did; agent-infra#1975).
+   It READS the domain back afterwards and fails if the job is still loaded, so step 2 cannot be undone
+   by a launchd that quietly kept the job.
 2. `pkill -f orch-loop.sh`, then `rm -f $O/.orch.lock`.
 3. Freeze workers: `tmux kill-server` (or kill sessions individually) and check for strays.
 4. Capture every dirty worktree: `git -C <wt> diff HEAD > $O/wip/<name>.patch`, plus a
@@ -1308,13 +1334,19 @@ environment block, rendered by `install.sh` from these defaults, and that enviro
 script's own**. A job already loaded with `MAX_LOAD=16` keeps `16` no matter what `orch-loop.sh` now
 defaults to. `install.sh` overwrites the plist *file* but does not reload an already-loaded job, and
 `launchctl load -w` on a job that is already loaded does not reliably re-read it. So for a limits
-change: re-run `./install.sh`, then `launchctl unload -w <plist> && launchctl load -w <plist>` — or
-reboot, which is the only thing that reliably re-reads it — before trusting the new value.
+change: re-run `bash scripts/orchestrator-harness/install.sh --restart` — it re-renders, `bootout`s,
+`bootstrap`s and then verifies pid + heartbeat. (Plain `… install.sh --start` also reloads, but ONLY when
+the rendered plist actually differs, so a validation run cannot disturb a healthy controller. A plain
+`… install.sh` never touches a loaded job at all; it warns instead when the plist changed under a
+running controller.)
 
-⚠️ **And `launchctl unload` touches nothing when the controller was not started by launchd.** On this
+⚠️ **And `launchctl bootout` touches nothing when the controller was not started by launchd.** On this
 box the loop runs as `nohup … orch-loop.sh` from a session — `launchctl list | grep orchestrator` is
-empty even though the plist exists — so the unload/load pair is a no-op and the old process keeps the
-old limits: the operator believes a limits change took effect when it did not. Check with
+empty even though the plist exists — so a bootout/bootstrap pair is a no-op *for that process* and the
+old controller keeps the old limits: the operator believes a limits change took effect when it did not.
+`install.sh --start`/`--restart` therefore **refuses** to start while a live pid outside launchd holds
+`~/orchestrator/.orch.lock` (launchd's copy would exit at once on that lock and `KeepAlive` would
+relaunch it forever) and tells you to stop it first. Check with
 `launchctl list` before trusting the pair, and stop a session-started controller with
 `pkill -f orch-loop.sh` (§6) rather than with `launchctl`.
 

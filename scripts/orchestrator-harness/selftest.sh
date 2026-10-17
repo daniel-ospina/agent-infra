@@ -45,6 +45,11 @@ on_darwin() { [ "${PLATFORM:-}" = "Darwin" ]; }
 # need the real resolution build their own PATH explicitly (§17 daemon-PATH, §6c) and are unaffected.
 GSTUB="$TMP/stub-bin"; mkdir -p "$GSTUB"
 printf '#!/bin/bash\n[ -n "${GH_HOME_RECORD:-}" ] && printf "%%s\\n" "$HOME" >> "$GH_HOME_RECORD"\nexit 0\n' > "$GSTUB/gh"; chmod +x "$GSTUB/gh"
+# ⛔ AND A `launchctl` STUB. install.sh READS the domain on every run (the closing banner) and
+# `--uninstall` removes the job — against the REAL launchd, from a sandbox $HOME whose rendered plist
+# carries the PRODUCTION label. Measured 2026-10-17: that removal resolves by label, so this self-test
+# booted the live controller out. Nothing here may reach the real launchd; exit 1 means "not loaded".
+printf '#!/bin/bash\nexit 1\n' > "$GSTUB/launchctl"; chmod +x "$GSTUB/launchctl"
 PATH="$GSTUB:$PATH"; export PATH
 echo "==> offline self-test ($HERE)"
 
@@ -1506,8 +1511,10 @@ for bad in 'o space' "o'q" 'o"q' 'o`q' 'o$q' 'o;q' 'o|q' 'o&q'; do
 done
 
 # --uninstall renders nothing, so an unrelated SCOPE typo must not block it: the operator removing
-# a misbehaving daemon is exactly who must not be stopped by it.
-( HOME="$SB" SCOPE=banana bash "$INST" --uninstall >/dev/null 2>&1 ); rc=$?
+# a misbehaving daemon is exactly who must not be stopped by it. ELDATO_ALLOW_TEST_HOME=1 is the #446
+# opt-in — this $HOME is a sandbox, so install.sh would otherwise (correctly) refuse to touch launchd;
+# with it, the `launchctl` stub above stands in for the real domain.
+( HOME="$SB" ELDATO_ALLOW_TEST_HOME=1 SCOPE=banana bash "$INST" --uninstall >/dev/null 2>&1 ); rc=$?
 [ "$rc" -eq 0 ] && rc=0 || { rc=1; echo "      install.sh --uninstall was blocked by SCOPE=banana"; }
 ck "install.sh --uninstall is not blocked by an invalid SCOPE" $rc
 
