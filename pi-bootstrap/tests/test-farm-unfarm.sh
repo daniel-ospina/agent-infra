@@ -126,7 +126,7 @@ LAYOUT = {
     "fleet_srcs": "scripts",
     "merge_gate_srcs": "scripts",
     "lane_root_srcs": "scripts",
-    "lane_srcs": "scripts/lane",
+    "lane_srcs": "scripts",      # FARM_LAYOUT: src scripts/lane, DEST scripts (flat)
     "lib_srcs": "scripts/lib",
     "fleet_tools": "scripts/fleet",   # source tools/fleet, DEST scripts/fleet
 }
@@ -283,6 +283,49 @@ elif ! grep -q 'NOTHING was removed' <<<"$out"; then
   fail "(c2) the refusal did not say nothing was removed ($out)"
 else
   ok "(c2) a set with one unremovable entry removes NOTHING (validated before the first rm)"
+fi
+
+# A target that provably cannot be unlinked (read-only parent directory) must be refused by
+# VALIDATION, before the first removal — otherwise the removal would fail in pass 2 after
+# earlier entries were already deleted (a half-applied retirement).
+if [ "$(id -u)" = "0" ]; then
+  ok "(c2) skipped the read-only-parent case: running as root, where write permission is not enforced"
+else
+  RO="$TMP/readonly-parent"
+  mkdir -p "$RO/dest/scripts/locked"
+  printf 'removable\n' > "$RO/dest/scripts/a.sh"
+  printf 'stuck\n'     > "$RO/dest/scripts/locked/b.sh"
+  printf 'scripts/a.sh\nscripts/locked/b.sh\n' > "$RO/manifest.txt"
+  chmod 555 "$RO/dest/scripts/locked"
+  out="$(farm_unfarm "$RO/dest" "$RO/manifest.txt" '' 2>&1)"; rc=$?
+  chmod 755 "$RO/dest/scripts/locked"
+  if [ "$rc" -eq 0 ]; then
+    fail "(c2) a read-only parent was not refused (rc=0)"
+  elif [ ! -f "$RO/dest/scripts/a.sh" ]; then
+    fail "(c2) a removal failed AFTER earlier entries were deleted (half-applied: $out)"
+  elif ! grep -q 'not writable' <<<"$out"; then
+    fail "(c2) the read-only parent was not named as the reason ($out)"
+  else
+    ok "(c2) a read-only parent is refused by validation, so nothing was removed"
+  fi
+
+  # ...and the SYMLINK variant: unlinking a link needs write permission on its parent just as
+  # a regular file does, so a link in a read-only directory must be refused by VALIDATION too
+  # (otherwise it passes pass 1 and fails at the `rm`, after earlier entries are gone).
+  ln -s "$RO/outside-target" "$RO/dest/scripts/locked/lnk"
+  printf 'scripts/a.sh\nscripts/locked/lnk\n' > "$RO/manifest-link.txt"
+  chmod 555 "$RO/dest/scripts/locked"
+  out="$(farm_unfarm "$RO/dest" "$RO/manifest-link.txt" '' 2>&1)"; rc=$?
+  chmod 755 "$RO/dest/scripts/locked"
+  if [ "$rc" -eq 0 ]; then
+    fail "(c2) a symlink in a read-only parent was not refused (rc=0)"
+  elif [ ! -f "$RO/dest/scripts/a.sh" ]; then
+    fail "(c2) a SYMLINK removal failed after earlier entries were deleted (half-applied: $out)"
+  elif ! grep -q 'not writable' <<<"$out"; then
+    fail "(c2) the symlink's read-only parent was not named as the reason ($out)"
+  else
+    ok "(c2) a symlink in a read-only parent is refused by validation, so nothing was removed"
+  fi
 fi
 
 # ===========================================================================
@@ -697,6 +740,25 @@ elif [ -e "$TMP/nolib-home/.pi/agent/scripts" ]; then
   fail "(h) cell-install MUTATED the cell before refusing a checkout with no UNFARM leg"
 else
   ok "(h) a checkout with no UNFARM leg is refused before anything is written"
+fi
+
+# A PRESENT-but-EMPTY checkout-hygiene farm must be refused by the cell too. It emits zero
+# rows, MIN_FARM_FILES is satisfied by the other ~50 files, and nothing else counts the leg —
+# so without this the cell installs an EMPTY leg and certifies it (a false PASS). setup.sh
+# refuses the same shape; the two installers must agree, or a Linux cell is the blind one.
+mv "$COPY/scripts/checkout-hygiene" "$TMP/hyg-save"
+mkdir -p "$COPY/scripts/checkout-hygiene"
+out="$(CELL_HOME="$TMP/empty-hyg-home" INFRA_ROOT="$COPY" bash "$CELL_INSTALL" --install 2>&1)"; rc=$?
+rmdir "$COPY/scripts/checkout-hygiene"
+mv "$TMP/hyg-save" "$COPY/scripts/checkout-hygiene"
+if [ "$rc" -eq 0 ]; then
+  fail "(h) cell-install accepted a checkout whose checkout-hygiene farm is EMPTY (it would install and certify an empty leg)"
+elif ! grep -q 'would install as EMPTY' <<<"$out"; then
+  fail "(h) the empty farm leg was refused for the wrong reason: $(head -1 <<<"$out")"
+elif [ -e "$TMP/empty-hyg-home/.pi/agent/scripts" ]; then
+  fail "(h) the cell was mutated before the empty-farm refusal"
+else
+  ok "(h) an EMPTY checkout-hygiene farm is refused by the cell before anything is installed"
 fi
 
 # An EXPLICIT INFRA_ROOT that is not a checkout must not be replaced SILENTLY by a different

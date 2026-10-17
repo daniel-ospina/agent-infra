@@ -213,6 +213,20 @@ farm_removal_problem() {
         done <<<"${declared:-}"
     fi
 
+    # REMOVABILITY, as far as it can be known up front. Validation is what makes the set
+    # all-or-nothing, so a target this run provably cannot unlink (a read-only parent
+    # directory — a read-only mount, a locked-down farm subdir) must be refused HERE, before
+    # any entry is removed, rather than discovered by a failing `rm` after others are gone.
+    # What cannot be known in advance (an immutable flag, a permission change mid-run) is
+    # handled by stopping at the first failed removal and reporting the exact partial state.
+    # ...and it applies to a SYMLINK as well: unlinking a link needs write permission on its
+    # parent just as a regular file does. Carving symlinks out here let a link in a read-only
+    # directory pass validation and fail at the `rm`, after earlier entries were removed.
+    if [ ! -w "$(dirname -- "$path")" ]; then
+        printf 'its parent directory is not writable, so it cannot be removed'
+        return 1
+    fi
+
     if [ -L "$path" ]; then
         return 0   # a farm symlink is a farm artifact: rm -f removes the LINK, not its target
     elif [ -d "$path" ]; then
@@ -235,7 +249,13 @@ farm_removal_problem() {
 # entries one to six already gone: that is a half-applied retirement — a state nobody
 # reviewed — and in setup.sh it also aborts the run before launchd convergence, so the
 # box keeps a plist whose target the partial deletion just removed. Same rule as a
-# contradiction (which is checked first): nothing is deleted unless the whole set can be.
+# contradiction (which is checked first).
+#
+# Everything validation CAN know is decided before the first `rm`: path legality, parent
+# containment, same-file identity, target type, and removability (a read-only parent). What
+# it cannot know in advance — a permission change mid-run, an immutable flag, a read-only
+# mount appearing under it — is handled by STOPPING at the first failed removal and printing
+# the exact partial state (HALF-APPLIED: which entry) instead of continuing to delete.
 farm_unfarm() {
     local dest="$1" manifest="$2" declared="${3:-}"
     local entries conflicts rel path problem
@@ -255,7 +275,12 @@ farm_unfarm() {
         *) while IFS= read -r rel; do
                [ -n "$rel" ] || continue
                printf 'ERROR: %s is declared RETIRED but a farm array still declares it — the copy leg re-creates it, so the UNFARM leg removed NOTHING.\n' "$rel" >&2
-               printf '       Remove it from every farm array in pi-bootstrap/setup.sh in the SAME commit.\n' >&2
+               printf '       The two lists disagree about the SAME name; exactly one of them is stale:\n' >&2
+               printf '        (1) the retirement is intended: remove the name from every farm array in\n' >&2
+               printf '            pi-bootstrap/setup.sh in the SAME commit;\n' >&2
+               printf '        (2) the retirement entry is the mistake: delete its line from\n' >&2
+               printf '            pi-bootstrap/farm-retired.txt — the name stays farmed.\n' >&2
+               printf '       Do not do both blindly: (1) retires it everywhere, (2) keeps it everywhere.\n' >&2
            done <<<"$conflicts"
            return 1 ;;
     esac
@@ -288,16 +313,28 @@ farm_unfarm() {
         path="$dest/$rel"
         [ -e "$path" ] || [ -L "$path" ] || continue
         if ! problem="$(farm_removal_problem "$dest" "$rel" "$declared")"; then
+            # STOP, for the same reason as a failed `rm` below: the set is already known to be
+            # un-appliable, so continuing would delete MORE after that was established.
             printf 'ERROR: %s changed while retiring and cannot be removed — %s\n' "$rel" "$problem" >&2
-            rc=1
-            continue
+            printf '    unfarm: HALF-APPLIED — %d removed, then %s became unremovable; the remaining\n' "$removed" "$rel" >&2
+            printf '           entries were NOT attempted (the target changed between validation and\n' >&2
+            printf '           removal). Re-run after fixing it: absent entries are skipped.\n' >&2
+            return 1
         fi
         if rm -f -- "$path"; then
             printf '    unfarm: REMOVED %s (retired — it is no longer farmed)\n' "$rel"
             removed=$((removed + 1))
         else
+            # STOP, do not continue: carrying on would delete MORE while the set is already
+            # known to be un-appliable, and the caller reports this run as failed either way.
+            # Say exactly what happened rather than a bare count.
             printf 'ERROR: could not remove %s\n' "$path" >&2
-            rc=1
+            printf '    unfarm: HALF-APPLIED — %d removed, then %s could NOT be removed; the remaining\n' "$removed" "$rel" >&2
+            printf '           entries were NOT attempted. The set was validated first, so this is a\n' >&2
+            printf '           change between validation and removal (permissions, read-only mount,\n' >&2
+            printf '           immutable flag): fix it and re-run — the already-removed entries are\n' >&2
+            printf '           absent, so the re-run continues from the first one still present.\n' >&2
+            return 1
         fi
     done <<<"$entries"
 

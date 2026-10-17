@@ -677,8 +677,9 @@ fi
 if ! farm_unfarm "$DEST" "$BOOTSTRAP_DIR/farm-retired.txt" "$farm_declared_rel"; then
   echo "ERROR: the UNFARM leg failed (see above) — a retirement the farm cannot apply is NOT applied." >&2
   echo "       Everything below this point did NOT run: launchd convergence, the shell-profile wiring," >&2
-  echo "       the TORTOISE_HOME probe. NOTHING was deleted: the whole set is validated before the" >&2
-  echo "       first removal, so a refusal cannot leave a half-applied retirement behind." >&2
+  echo "       the TORTOISE_HOME probe. The whole retirement set is validated before the first" >&2
+  echo "       removal, so a REFUSED set deleted nothing; if a removal itself failed, the message" >&2
+  echo "       above says exactly which entry was removed and which was not (HALF-APPLIED)." >&2
   echo "       Remedy: fix or remove the path(s) named above, then re-run ./sync.sh." >&2
   exit 1
 fi

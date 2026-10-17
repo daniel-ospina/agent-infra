@@ -329,11 +329,21 @@ hyg_rel = m.group(1)
 hyg_dir = os.path.normpath(os.path.join(os.path.dirname(setup_path), "..", hyg_rel))
 if not os.path.isdir(hyg_dir):
     sys.exit("FATAL: %s is not a directory — the checkout-hygiene farm is missing" % hyg_dir)
+hyg_rows = 0
 for base in sorted(os.listdir(hyg_dir)):
     if base.endswith(".plist") or ".test." in base:
         continue
     if os.path.isfile(os.path.join(hyg_dir, base)):
         print("\t".join((hyg_rel, "scripts/checkout-hygiene", base)))
+        hyg_rows += 1
+if hyg_rows == 0:
+    # A PRESENT but EMPTY farm directory delivers less than the leg declares, and MIN_FARM_FILES
+    # is satisfied by the other farms — so this would install an empty leg and certify it
+    # (a false PASS). setup.sh refuses the same shape; the two must agree.
+    sys.exit(
+        "FATAL: %s holds no farmable file — the checkout-hygiene farm would install as EMPTY, "
+        "so this checkout is incomplete (nothing was installed)" % hyg_dir
+    )
 PY
 }
 
@@ -469,7 +479,7 @@ install_unfarm() {
   # The snapshot check catches the "dropped from a farm array without being declared"
   # direction, which no set comparison can see (the name is then in neither list).
   if ! farm_check_declared_shrink "$DEST" "$INFRA_ROOT/pi-bootstrap/farm-retired.txt" "$FARM_DECLARED_REL"; then
-    die "the farm retirement check failed (see above) — either a name farmed by a previous install is now neither farmed nor retired (it would be ORPHANED on this cell: declare it in pi-bootstrap/farm-retired.txt), or the retirement list could not be read"
+    die "the farm retirement check failed (see above). Two causes are possible and the remedies are OPPOSITE: (a) a name farmed by a previous install is now neither farmed nor retired — it would be ORPHANED on this cell, so declare it in pi-bootstrap/farm-retired.txt; or (b) this checkout is OLDER than the layer already installed here — then do NOT declare it, install from the newer checkout (declaring it would delete an artifact the repo still ships and wedge every later --install on the contradiction check); or (c) the retirement list could not be read"
   fi
   if ! farm_unfarm "$DEST" "$INFRA_ROOT/pi-bootstrap/farm-retired.txt" "$FARM_DECLARED_REL"; then
     die "the UNFARM leg failed (see above) — a retirement the farm cannot apply is NOT applied"
