@@ -358,8 +358,10 @@ def test_materialise_worktree_creates_then_reuses_at_the_head(monkeypatch, tmp_p
     assert (wt2, err2) == (wt, "")
 
 
-def test_materialise_worktree_clears_a_dangling_directory(monkeypatch, tmp_path):
-    """A directory whose record was removed keeps a `.git` file but git refuses to operate in it."""
+def test_materialise_preserves_a_dangling_directory_and_uses_a_fresh_path(monkeypatch, tmp_path):
+    """A directory whose record was removed may hold a previous worker's files. It is NOT deleted:
+    the PR is materialised at a `-d` fallback path and the directory is left for inspection.
+    """
     import shutil
     repo, g = _git_repo(tmp_path)
     g("branch", "feat/x")
@@ -367,11 +369,63 @@ def test_materialise_worktree_clears_a_dangling_directory(monkeypatch, tmp_path)
     _wire_repo(monkeypatch, repo)
     wt, _ = pr.materialise_worktree(_prb(1, head, "feat/x"))
     assert (repo / ".worktrees" / "prd-1" / ".git").exists()
+    (pathlib.Path(wt) / "wip.txt").write_text("uncommitted work\n")
     shutil.rmtree(repo / ".git" / "worktrees" / "prd-1")   # record gone, directory stays
     assert not pr._live_worktree(wt)                        # the trap the old check fell into
     wt2, err = pr.materialise_worktree(_prb(1, head, "feat/x"))
-    assert err == "" and wt2 == wt
+    assert err == "" and wt2 != wt and wt2.endswith("prd-1-d")
+    assert (pathlib.Path(wt) / "wip.txt").read_text() == "uncommitted work\n", \
+        "a directory that may hold work must never be deleted"
     assert pr._live_worktree(wt2)
+    # a second call reuses the fallback path rather than adding yet another
+    assert pr.materialise_worktree(_prb(1, head, "feat/x")) == (wt2, "")
+
+
+def test_an_empty_dir_inside_the_main_checkout_is_not_a_live_worktree(monkeypatch, tmp_path):
+    """⛔ `git rev-parse --is-inside-work-tree` is true for ANY directory inside the repo, so an
+    EMPTY `.worktrees/prd-<n>` used to be reported LIVE; `rev-parse HEAD` then read the MAIN
+    checkout, and a stale-head branch moved the MAIN branch pointer with `reset --hard`.
+    """
+    repo, g = _git_repo(tmp_path)
+    g("checkout", "-q", "-b", "feat/x")
+    (repo / "x.txt").write_text("x\n")
+    g("add", "x.txt")
+    g("commit", "-qm", "x")
+    head = g("rev-parse", "HEAD").stdout.strip()
+    g("checkout", "-q", "main")
+    main_before = g("rev-parse", "HEAD").stdout.strip()
+    assert head != main_before
+    _wire_repo(monkeypatch, repo)
+    path = repo / ".worktrees" / "prd-1"
+    path.mkdir(parents=True)                 # empty dir, no .git -- the false-live trap
+    assert pr._live_worktree(str(path)) is False, \
+        "an empty directory inside the main checkout is not a worktree ROOT"
+    wt, err = pr.materialise_worktree(_prb(1, head, "feat/x"))
+    assert err == "" and wt == str(path)
+    assert g("rev-parse", "refs/heads/main").stdout.strip() == main_before, \
+        "the main checkout's branch pointer must not move"
+    assert subprocess.run(["git", "-C", wt, "rev-parse", "--show-toplevel"],
+                          capture_output=True, text=True).stdout.strip() == str(path)
+    assert subprocess.run(["git", "-C", wt, "rev-parse", "HEAD"],
+                          capture_output=True, text=True).stdout.strip() == head
+
+
+def test_materialise_moves_a_behind_local_branch_to_the_pr_head(monkeypatch, tmp_path):
+    """A local `feat/x` that lags the PR head must not be trusted: the fresh worktree is verified
+    and moved to the PR head, so a fixer pushes on top of the right commit."""
+    repo, g = _git_repo(tmp_path)
+    g("checkout", "-q", "-b", "feat/x")
+    (repo / "x.txt").write_text("x\n")
+    g("add", "x.txt")
+    g("commit", "-qm", "x")
+    head = g("rev-parse", "HEAD").stdout.strip()
+    g("checkout", "-q", "main")
+    g("branch", "-f", "feat/x", "main")          # local branch BEHIND the PR head
+    _wire_repo(monkeypatch, repo)
+    wt, err = pr.materialise_worktree(_prb(1, head, "feat/x"))
+    assert err == "" and wt
+    assert subprocess.run(["git", "-C", wt, "rev-parse", "HEAD"], capture_output=True,
+                          text=True).stdout.strip() == head
 
 
 def test_materialise_worktree_clears_a_stranded_record(monkeypatch, tmp_path):

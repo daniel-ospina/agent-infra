@@ -117,10 +117,11 @@ WORKTREE_ROOT = os.path.join(REPO_DIR, ".worktrees")
 SPAWN_TIMEOUT_S = 2400        # wall-clock cap handed to the background worker
 # `nonblocking-dispatch.sh` backgrounds `run_agent()` and returns 0 the moment the worker is
 # launched, so a GATE REFUSAL (AGENT_DISK_REFUSED=77 / AGENT_LOAD_REFUSED=75) only lands in
-# `$O/bg/<name>.rc`. A refusal is written in milliseconds (the gate is the first thing run_agent
-# does) and consumed nothing, so dispatch() gives it a short window to land before recording a
-# dispatch. A running worker holds the .rc file for minutes, so this never waits on real work.
-REFUSAL_WINDOW_S = 2.0
+# `$O/bg/<name>.rc`. A refusal is written within milliseconds (the gate is the first thing
+# run_agent does) and consumed nothing, so dispatch() gives it a brief window to land before
+# recording a dispatch. A launched worker writes NO `.rc` until it exits, so a normal dispatch
+# pays only the window and then proceeds.
+REFUSAL_WINDOW_S = 1.0
 
 # A dispatch draws on the budget of the work it starts. `failing` needs code/CI repair (MAX_FIX);
 # `no-checks` re-triggers the workflows and then runs the review+merge chain, so it is fix work;
@@ -332,51 +333,57 @@ def materialise_worktree(pr: dict) -> tuple[str, str]:
     """Ensure a git worktree for the PR's branch at the PR's head; return (path, "") or ("", why).
 
     The worker must be ON the PR's branch at the PR's CURRENT head so a fixer pushes the right
-    commit. Two facts drive the shape:
+    commit. Three facts drive the shape:
 
-      * `git worktree list` is the LIVENESS authority, never a directory's `.git` file. That file
-        survives the worktree record being removed and leaves a directory git refuses to operate
-        in (`fatal: not a git repository`); trusting it makes `nonblocking-dispatch.sh` launch a
-        worker that cannot run a single git command.
-      * FAIL-CLOSED, NEVER DESTRUCTIVE. A reused worktree whose head moved is fast-forwarded to
-        the PR head ONLY when it is clean; a DIRTY one is refused, never reset, because resetting
-        would discard a previous worker's uncommitted work. Stranded records are cleared only for
-        OUR `prd-<n>` path or for a worktree whose directory is already GONE, so a live lane
-        worktree on the same branch is never touched.
+      * `git worktree list` / the worktree-ROOT test is the liveness authority, never a
+        directory's `.git` file (which survives the record being removed) and never
+        `--is-inside-work-tree` (which is true for ANY directory inside the main checkout).
+      * FAIL-CLOSED, NEVER DESTRUCTIVE. A reused worktree whose head moved is reset to the PR head
+        ONLY when it is clean; a DIRTY one is refused, never reset. A dangling directory is never
+        deleted unless it holds nothing but a `.git` pointer -- a directory that may contain a
+        previous worker's uncommitted work is left for inspection.
+      * Only records whose directory is already GONE are cleared, so a live worktree can never be
+        removed here. A dangling directory that holds anything is LEFT ALONE and the PR is
+        materialised at a `-d` fallback path, so a previous worker's files survive.
     """
     branch = pr["headRefName"]
     head = pr["headRefOid"]
+    # Two paths are ours for this PR: `prd-<n>`, and `prd-<n>-d` as a fallback when `prd-<n>` is
+    # occupied by a dangling directory we must NOT delete (it may hold a previous worker's work).
     path = os.path.join(WORKTREE_ROOT, "prd-%d" % pr["number"])
+    candidates = [path, path + "-d"]
 
-    if _live_worktree(path):
-        out, _, rc = sh_err(["git", "-C", path, "rev-parse", "HEAD"], timeout=30)
-        if rc == 0 and (out or "").strip() == head:
-            return path, ""                       # already materialised at the right head
-        _, _, have = sh_err(["git", "-C", path, "cat-file", "-e", "%s^{commit}" % head], timeout=30)
-        if have != 0:
-            sh_err(["git", "-C", path, "fetch", "origin", branch, "--quiet"], timeout=300)
-        dirty, _, _ = sh_err(["git", "-C", path, "status", "--porcelain"], timeout=60)
-        if (dirty or "").strip():
-            return "", ("worktree %s is at a different head and has uncommitted changes -- "
-                        "refusing to reset it; inspect and clean it" % path)
-        _, err, rc = sh_err(["git", "-C", path, "reset", "--hard", head], timeout=120)
-        if rc != 0:
-            return "", "worktree %s reset to %s failed rc=%s: %s" % (
-                path, head[:12], rc, (err or "").strip()[:160])
-        return path, ""
-
-    # Not a live worktree at OUR path. Clear a stranded record or a dangling non-worktree there --
-    # it is in our own `prd-<n>` namespace, so this can never touch a lane's worktree.
-    if os.path.exists(path) or any(p == path for p, _ in _worktrees()):
-        _drop_worktree_record(path)
-        if os.path.exists(path):
-            log("materialise: removing a dangling non-worktree at %s" % path)
-            shutil.rmtree(path, ignore_errors=True)
-    # A stranded record for this branch ELSEWHERE (its directory already gone) also blocks
-    # `worktree add` with "already checked out for ever". Clear ONLY records whose dir is gone.
+    # A record whose directory is GONE blocks `worktree add` for ever -- "already checked out" for
+    # our branch, "missing but already registered" for our own path. Clear ONLY those: stranded
+    # records at our two candidate paths (exclusively ours), or for OUR branch anywhere. A record
+    # whose directory still exists is never dropped here, so a live worktree is never removed.
+    ours = set(candidates)
     for p, b in _worktrees():
-        if b == "refs/heads/%s" % branch and not _live_worktree(p):
+        if not os.path.exists(p) and (p in ours or b == "refs/heads/%s" % branch):
             _drop_worktree_record(p)
+
+    # Reuse any candidate that is already a live worktree.
+    for cand in candidates:
+        if _live_worktree(cand):
+            err = _ensure_head(cand, branch, head)
+            return (cand, "") if not err else ("", err)
+
+    # Materialise at the first candidate that is absent, or holds nothing but a dangling `.git`
+    # pointer (disposable). A directory that might contain work is left alone for inspection.
+    path = ""
+    for cand in candidates:
+        if not os.path.exists(cand):
+            path = cand
+            break
+        if _disposable_dangling(cand):
+            log("materialise: clearing a dangling non-worktree at %s" % cand)
+            shutil.rmtree(cand, ignore_errors=True)
+            path = cand
+            break
+    if not path:
+        return "", ("%s and %s both exist but neither is a live worktree, and neither is "
+                    "disposable -- refusing to delete either; inspect and clean"
+                    % (candidates[0], candidates[1]))
 
     _, _, rc = sh_err(["git", "-C", REPO_DIR, "rev-parse", "--verify", "-q",
                        "refs/heads/%s" % branch], timeout=60)
@@ -401,7 +408,9 @@ def materialise_worktree(pr: dict) -> tuple[str, str]:
         return "", "worktree add failed rc=%s: %s" % (rc, (err or "").strip()[:200] or "(no stderr)")
     if not _live_worktree(path):
         return "", "worktree add reported success but %s is not a live worktree" % path
-    return path, ""
+    # A local branch can be BEHIND the PR head; verify and move it, but never over dirty work.
+    err = _ensure_head(path, branch, head)
+    return (path, "") if not err else ("", err)
 
 
 def _git(args, timeout=120):
@@ -409,9 +418,45 @@ def _git(args, timeout=120):
 
 
 def _live_worktree(path: str) -> bool:
-    """True only when git can actually operate in <path> (a `.git` file alone is not enough)."""
-    _, _, rc = sh_err(["git", "-C", path, "rev-parse", "--is-inside-work-tree"], timeout=30)
-    return rc == 0
+    """True only when git proves <path> IS the root of a worktree.
+
+    ⛔ NOT `--is-inside-work-tree`: `WORKTREE_ROOT` lives INSIDE the main checkout, so every
+    `.worktrees/prd-<n>` directory -- even an empty one -- answers `true` to that probe, and
+    `rev-parse HEAD` then reads the MAIN repo's HEAD. Acting on that would reset the main
+    checkout (`reset --hard` moves the branch pointer). The `--show-toplevel` comparison is the
+    worktree-ROOT test. A probe that cannot answer (rc < 0) returns True -- UNKNOWN is never a
+    licence to delete.
+    """
+    out, _, rc = sh_err(["git", "-C", path, "rev-parse", "--show-toplevel"], timeout=30)
+    if rc < 0:
+        return True
+    return rc == 0 and os.path.realpath((out or "").strip()) == os.path.realpath(path)
+
+
+def _disposable_dangling(path: str) -> bool:
+    """A directory we own that is not a worktree and holds nothing but a dangling `.git` pointer."""
+    try:
+        return set(os.listdir(path)) <= {".git"}
+    except OSError:
+        return False
+
+
+def _ensure_head(path: str, branch: str, head: str) -> str:
+    """Move <path> to <head>; "" on success, else why. NEVER resets a DIRTY worktree."""
+    out, _, rc = sh_err(["git", "-C", path, "rev-parse", "HEAD"], timeout=30)
+    if rc == 0 and (out or "").strip() == head:
+        return ""
+    _, _, have = sh_err(["git", "-C", path, "cat-file", "-e", "%s^{commit}" % head], timeout=30)
+    if have != 0:
+        sh_err(["git", "-C", path, "fetch", "origin", branch, "--quiet"], timeout=300)
+    dirty, _, _ = sh_err(["git", "-C", path, "status", "--porcelain"], timeout=60)
+    if (dirty or "").strip():
+        return ("worktree %s is at a different head and has uncommitted changes -- "
+                "refusing to reset it; inspect and clean it" % path)
+    _, err, rc = sh_err(["git", "-C", path, "reset", "--hard", head], timeout=120)
+    if rc != 0:
+        return "worktree %s reset to %s failed rc=%s: %s" % (path, head[:12], rc, (err or "").strip()[:160])
+    return ""
 
 
 def _worktrees() -> list[tuple[str, str]]:
@@ -573,12 +618,14 @@ def dispatch(pr: dict, action: str, text: str, dry: bool) -> tuple[bool, str]:
                 with open(rc_file) as fh:
                     code = int(fh.read().strip())
             except Exception:
-                code = None
+                # A PARTIAL write is not a verdict: keep polling rather than conclude success.
+                time.sleep(0.05)
+                continue
             if code in (75, 77):
                 log("spawn %s: gate REFUSED rc=%s -- no agent started, nothing consumed" % (name, code))
                 return False, "gate refused rc=%s" % code
             break
-        time.sleep(0.1)
+        time.sleep(0.05)
     log("spawn %s -> %s: %s" % (name, wt, detail[:120] or "launched"))
     return True, detail
 
