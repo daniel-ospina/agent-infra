@@ -783,8 +783,11 @@ reap. The decisions that are not obvious:
   all** exits transient (rc=1) — so an unreadable registry that queues nothing is a red run, not a
   quiet one; **3 NOT PROVISIONABLE** (the registry is present but
   predates the issue key — an `$O/claims.sh` with no `claim_issue_*` functions, i.e. the drift
-  `install.sh` reports) refuses the issue the same way, and both 2 and 3 also earn a
-  `.refresh-blocked` marker so a persistent condition is visible rather than a silent no-queue. This
+  `install.sh` reports) refuses the issue the same way, and rc=3 also earns a **`.refresh-blocked`**
+  marker (the provisioning channel: `orch-loop.sh` stops retrying and `status` names the reason), so a
+  persistent condition is visible rather than a silent no-queue. rc=2 does **not** write that marker —
+  it is transient by construction, so the pass exits 1 and the cycle is logged `FAILED rc=1` and
+  retried; the marker would make a network blip look like a broken cell. This
   is the opposite polarity from the PR claim's fail-open, and it was applied to **every** exit, not
   just the obvious one: an unrecognised status is treated as INCOMPLETE, so no future code path can
   widen the CLEAN arm by accident. The one limit is stated rather than hidden — a box where
@@ -810,7 +813,7 @@ reviewers of one PR at once. Measured (reproduce with the base commit of this PR
 ```bash
 T=$(mktemp -d); cp scripts/orchestrator-harness/*.sh "$T/"
 git show <rev>:scripts/orchestrator-harness/claims.sh > "$T/claims.sh"
-CLAIMS_SH="$T/claims.sh" bash scripts/orchestrator-harness/test-claims.sh   # 63 passed, 42 failed
+CLAIMS_SH="$T/claims.sh" bash scripts/orchestrator-harness/test-claims.sh   # 65 passed, 44 failed
 ```
 
 `refresh-scout.test.sh` drives the **shipped** refresh step and the **shipped** dispatch block against
@@ -822,7 +825,7 @@ counts cover the whole #1850 change — the feature and this fix round — not t
 cp scripts/orchestrator-harness/*.sh "$T/"
 for f in claims refresh-candidates orch-loop chain-merge dispatch-merge; do
   git show <rev>:scripts/orchestrator-harness/$f.sh > "$T/$f.sh"; done
-( cd "$T" && bash ./refresh-scout.test.sh )                                  # PASS=72 FAIL=66
+( cd "$T" && bash ./refresh-scout.test.sh )                                  # PASS=72 FAIL=67
 ```
 
 Three further defects in the same family are fixed and pinned with it, all fail-**open** directions:
@@ -894,10 +897,13 @@ These are kept as a record because each one is a *failure mode of the design*, n
 
 ### 7.4c Defects found in the agent-infra#1850 review (fixed here)
 
-All five are fail-**open** in a gate whose whole purpose is to refuse: each one certifies a busy or
-unverifiable issue as free, or lets a release run without its fence. Pinned by `test-claims.sh`
-(I10, I9(5)) and `refresh-scout.test.sh` §8(g) (unrecognised status), §9(iii) (stale-registry
-dispatch) and §10 (fenced + generation-guarded release).
+All but one are fail-**open** in a gate whose whole purpose is to refuse: each certifies a busy or
+unverifiable issue as free, hands it to a second box, or lets a release run without its fence. Pinned
+by `test-claims.sh` (I10, I9(5), I9(7)) and `refresh-scout.test.sh` §8(g) (unrecognised status),
+§9(iii) (stale-registry dispatch), §10 (fenced + generation-guarded release, and the CAPTURE that
+wires it) and §11 (the chain-failure branch). The last two were found in the second (adversarial)
+review cycle, precisely by asking what each new assertion would do if the line it protects were
+deleted.
 
 | Defect | Impact | Fix |
 |---|---|---|
@@ -906,6 +912,8 @@ dispatch) and §10 (fenced + generation-guarded release).
 | **the release record was read when the trap FIRED, not when the claim was taken** | the record file is keyed on the **issue**, so a box that re-acquires after its lease lapses overwrites it. The older chain's trap then fenced on the *new* commit — which **is** the ref tip — and deleted the live holder's claim, freeing a busy issue for a peer: the exact duplicate the key exists to prevent | `chain-merge.sh` captures the commit at chain start (`claim_issue_record_commit`) and `claim_issue_release_record` refuses on a generation mismatch, naming it and leaving the newer record intact |
 | **a registry too old to take a claim still dispatched** | `refresh-candidates.sh` refused every issue on such a box (`rc=3`) while `orch-loop.sh` acquired anyway, found no `claim_issue_acquire`, and **dispatched unclaimed** — the fail-open half of the same condition, and the collision on two boxes | present-but-stale is now split from genuinely-absent: the loop refuses the dispatch and names the fix; only a **missing** `claims.sh` (pre-registry box) falls through, loudly |
 | **release failures were silent** (`>/dev/null 2>&1 && echo`) | a refused or failed release left the claim held for its whole lease (3 h of a free issue) with nothing in the log to say so — and `CLAIM_RESULT` was lost because the helper ran in a subshell | the helper `declare -f`s the function, sources `claims.sh` into the **current** shell, passes the captured commit, and logs the reason on every failure branch |
+| **the chain-failure arm released a claim whose LANE was still running** | the lane is spawned *before* the chain in the same loop body, so "no chain will ever run" was true while "nothing is running" was **not**: the release declared an issue this box was actively implementing free, a peer claimed it and duplicated the work, and this box still opened a PR nothing would merge | stop the lane first (exact session match) and release only once it is confirmed gone; if it cannot be stopped, **keep** the claim — the lease expiring it is the safe direction |
+| **`CLAIM_COMMIT` was a per-CYCLE global** (not fail-open — state hygiene) | `claims.sh` reset it only when sourced, so an acquire that failed *before* any push (`rc=2`: unreadable ref, unfetchable claim) left the **previous** issue's commit in it. `orch-loop.sh`'s "rc=2 with a claim commit → record it and try a fenced release" then wrote a handover record for an issue this box never claimed, consumed it, and logged a release that never happened — the fence keeps the registry safe, but the *log* is what an operator reads | cleared at the top of `_claim_acquire_at`, so the value always means "what THIS attempt may have pushed" |
 
 ### 7.5 Still open, deliberately not fixed here
 

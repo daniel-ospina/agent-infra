@@ -1474,6 +1474,22 @@ if [ -s "$T/release.sh" ] && grep -q 'claim_issue_release' "$T/release.sh"; then
                                || bad "chain-merge: the older chain deleted the newer generation's claim (${gen_left:-<gone>} vs $newer)"
     [ -e "$RL3/o/state/issueclaim-42" ] && ok "chain-merge: the newer generation's record is left for ITS own release" \
                                         || bad "chain-merge: the generation-refused release consumed the newer generation's record"
+    # ⛔ THE CAPTURE IS WIRED, NOT JUST THE GUARD (cycle-2 adversarial review). Every case above
+    # INJECTS CHAIN_CLAIM_COMMIT, so deleting chain-merge.sh's capture line would leave them all GREEN
+    # while the guard went INERT in production: the trap would pass an empty expectation, so the
+    # release would fence on the record's CURRENT value — the live holder's own commit, which IS the
+    # ref tip — and delete it. Drive the SHIPPED capture statement itself, with the record present.
+    cap_line="$(sed -n '/^CHAIN_CLAIM_COMMIT=/p' "$HERE/chain-merge.sh" | head -1)"
+    if [ -z "$cap_line" ]; then
+      bad "chain-merge: the generation CAPTURE is GONE from the shipped script — the guard would be inert in production"
+    else
+      cap_val="$( cd / && O="$RL3/o" N=42 REPO="$RL3/repo" CLAIM_REPO="$RL3/repo"
+                  eval "$cap_line" >/dev/null 2>&1
+                  printf '%s' "${CHAIN_CLAIM_COMMIT:-}" )"
+      [ "$cap_val" = "$newer" ] \
+        && ok "chain-merge: the shipped capture reads THIS box's recorded generation (the guard is WIRED)" \
+        || bad "chain-merge: the shipped capture returned '${cap_val:-<empty>}' (want $newer) — the generation guard is inert in production"
+    fi
 else
     bad "chain-merge: could not extract release_issue_claim from the shipped script"
 fi
@@ -1523,6 +1539,43 @@ if [ -s "$T/unspawned.sh" ] && grep -q 'claim_issue_release_record' "$T/unspawne
                          || bad "dispatch-merge: an empty record deleted or changed the claim (${keep:-<gone>} vs $peer2)"
 else
   bad "dispatch-merge: could not extract release_issue_claim_unspawned from the shipped script"
+fi
+
+# ⛔ THE CHAIN-FAILURE BRANCH MUST NOT RELEASE A LANE THAT IS STILL RUNNING (cycle-2 adversarial
+# review). The lane is spawned BEFORE the chain in the same loop body, so "no chain will ever run" is
+# true while "nothing is running" is not: releasing there declares an issue this box is ACTIVELY
+# implementing free, a peer claims it and duplicates the work, and this box still opens a PR nothing
+# will merge. The branch must stop the lane first and release only once it is confirmed gone (if it
+# cannot be stopped, KEEP the claim — the lease expiring it is the safe direction). The shipped
+# branch is extracted and driven with a stubbed `tmux`, once for each outcome.
+DM="$T/dm-branch.sh"
+sed -n '/if tmux new-session -d -s "chain-/,/^  fi$/p' "$HERE/dispatch-merge.sh" > "$DM"
+if [ -s "$DM" ] && grep -q 'release_issue_claim_unspawned' "$DM"; then
+  ok "dispatch-merge: the chain-failure branch is extractable from the shipped script"
+  # <lane alive> <kill succeeds> -> how many times the release ran
+  run_branch() {
+    ( N=42; O="$T/dm/o"; REPO="$T/dm/repo"; OR="owner/repo"; BR="feat/42-x"
+      LANE_ALIVE="$1"; KILLABLE="$2"; released=0
+      tmux() {
+        case "${1:-}" in
+          new-session) return 1 ;;                                  # the chain cannot start
+          ls) [ "$LANE_ALIVE" = 1 ] && printf 'lane-42\n'; return 0 ;;
+          kill-session) [ "$KILLABLE" = 1 ] && { LANE_ALIVE=0; return 0; }; return 1 ;;
+          *) return 0 ;;
+        esac
+      }
+      release_issue_claim_unspawned() { released=$(( released + 1 )); }
+      . "$DM" >/dev/null 2>&1
+      printf '%s' "$released" )
+  }
+  [ "$(run_branch 1 1)" = "1" ] \
+    && ok "dispatch-merge: a chain that cannot start releases the claim AFTER stopping its lane" \
+    || bad "dispatch-merge: the stopped-lane path did not release exactly once (got '$(run_branch 1 1)')"
+  [ "$(run_branch 1 0)" = "0" ] \
+    && ok "dispatch-merge: a chain that cannot start KEEPS the claim while its lane is still alive" \
+    || bad "dispatch-merge: released the claim while lane-42 was STILL RUNNING — a peer would duplicate the work"
+else
+  bad "dispatch-merge: could not extract the chain-failure branch (or it no longer releases)"
 fi
 
 echo

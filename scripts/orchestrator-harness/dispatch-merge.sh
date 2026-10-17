@@ -75,8 +75,23 @@ for N in "$@"; do
   if tmux new-session -d -s "chain-$N" "bash '$O/chain-merge.sh' '$REPO' '$OR' $N '$BR'" 2>/dev/null; then
     echo "        chain-$N (review->record->merge)"
   else
-    echo "#$N: chain-$N could NOT be started — no chain will ever run; releasing the issue claim"
-    release_issue_claim_unspawned "$N"
+    # ⛔ THE LANE IS ALREADY RUNNING (the spawn two lines up) — so "no chain will ever run" is true
+    # while "nothing is running" is NOT, and releasing here would declare an issue this box is
+    # ACTIVELY IMPLEMENTING free: a peer claims it, duplicates the work, and this box still opens a PR
+    # that nothing will merge (cycle-2 adversarial review). Reachable without any peer — a leftover
+    # `chain-$N` session name, since nothing reaps `chain-*` — and the claim then comes back to the
+    # pool on its lease. So STOP THE LANE FIRST and release only once it is confirmed gone; if it
+    # cannot be stopped, KEEP the claim: the lease expiring it is the safe direction.
+    echo "#$N: chain-$N could NOT be started — stopping lane-$N (its PR would never be merged)"
+    if tmux ls -F '#{session_name}' 2>/dev/null | grep -qx "lane-$N"; then
+      tmux kill-session -t "lane-$N" 2>/dev/null || true
+    fi
+    if tmux ls -F '#{session_name}' 2>/dev/null | grep -qx "lane-$N"; then
+      echo "#$N: ⚠️ lane-$N is still alive — KEEPING the issue claim (releasing it would let a peer duplicate this work); it expires with the lease"
+    else
+      echo "#$N: lane-$N stopped — releasing the issue claim"
+      release_issue_claim_unspawned "$N"
+    fi
   fi
   sleep 30   # stagger uv sync
 done

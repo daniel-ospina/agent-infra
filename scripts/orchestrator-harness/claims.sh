@@ -258,6 +258,15 @@ _claim_acquire_at() {
 
   CLAIM_REF="$ref"
   CLAIM_OWNER="$(claim_owner)"
+  # ⛔ CLEAR IT AT ENTRY, NOT ONLY AT SOURCE TIME (cycle-2 adversarial review). `CLAIM_COMMIT` is a
+  # GLOBAL that this file resets only when it is SOURCED — once per controller cycle — so an acquire
+  # that fails BEFORE any push (rc=2: the ref is unreadable, the existing claim cannot be fetched)
+  # left the PREVIOUS issue's commit in it. orch-loop.sh's "rc=2 with a claim commit → write the
+  # handover record and try a fenced release" then wrote a record for an issue this attempt never
+  # claimed and consumed it. The registry itself is safe (`--force-with-lease` refuses a ref that
+  # moved) but the state written and the log line were about the wrong issue. Cleared here, the value
+  # always means "the commit THIS attempt may have pushed".
+  CLAIM_COMMIT=""
   now="$(date +%s)"; until=$(( now + ttl ))
   commit="$(_claim_commit "$CLAIM_OWNER" "$until")"
   if [ -z "$commit" ]; then CLAIM_RESULT="could not build claim commit"; echo "$CLAIM_RESULT"; return 2; fi

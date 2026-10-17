@@ -152,8 +152,26 @@ _git_delegate() { # <git-args...> — dispatch the VERB literally so the guard c
 # a namespaced ref would stop exercising `refs/claims/issue-<N>` and `refs/claims/<pr>-<sha12>`
 # themselves. Override for a reproducible run: `PR=… ISSUE=… bash test-claims.sh`.
 PR="${PR:-$(( (RANDOM << 15 | RANDOM) % 900000 + 100000 ))}"
+# ⛔ THE ISSUE KEY IS A BARE NUMBER, SO IT MUST BE UNCLAIMED WHEN THE RUN STARTS (cycle-2 adversarial
+# review). Every other key here also carries a fixed sha12 that no live claim can match; `issue-<N>`
+# is the one ref whose identity is the number ALONE — and the teardown FORCE-DELETES it. If a repo's
+# issue numbers ever reached this band, teardown would delete a live box's claim, and a peer reading
+# the registry afterwards would see that issue as free. Re-roll until the number is unclaimed at
+# start, so only THIS run can ever have created it. A caller-supplied ISSUE (the reproducible-run
+# path) is honoured as-is.
+if [ -n "${ISSUE:-}" ]; then ISSUE_SET=1; else ISSUE_SET=0; fi
 ISSUE="${ISSUE:-$(( (RANDOM << 15 | RANDOM) % 900000 + 100000 ))}"
 [ "$ISSUE" = "$PR" ] && ISSUE=$(( ISSUE + 1 ))
+if [ "$ISSUE_SET" -eq 0 ]; then
+  _tries=0
+  while [ "$_tries" -lt 10 ] && [ -n "$(git -C "$A" ls-remote origin "refs/claims/issue-$ISSUE" 2>/dev/null)" ]; do
+    ISSUE=$(( (RANDOM << 15 | RANDOM) % 900000 + 100000 )); _tries=$(( _tries + 1 ))
+  done
+  if [ -n "$(git -C "$A" ls-remote origin "refs/claims/issue-$ISSUE" 2>/dev/null)" ]; then
+    echo "❌ could not find an UNCLAIMED issue number in 10 rolls (#$ISSUE is claimed on origin) — refusing to run, a teardown would delete a live claim"
+    exit 2
+  fi
+fi
 SHA=deadbeefcafebabe0123456789abcdef01234567
 REF="refs/claims/$PR-${SHA:0:12}"
 # A SECOND real claim, so the fencing test can offer a caller a genuine commit sha that is not this
@@ -796,6 +814,35 @@ ck "I9: claim_issue_record_commit returns the recorded generation" "^$GEN_NEW$" 
 [ "$rcOwn" = "0" ] \
   && { echo "  ✅ the capture does NOT block the holder's OWN release"; PASS=$((PASS+1)); } \
   || { echo "  ❌ the holder could not release its own claim (rc=$rcOwn)"; FAIL=$((FAIL+1)); }
+cleanup_issue_ref
+
+# (7) ⛔ `CLAIM_COMMIT` MUST NOT CARRY A PREVIOUS ISSUE'S COMMIT INTO A FAILED ATTEMPT (cycle-2
+# adversarial review). It is a GLOBAL that claims.sh resets only when it is SOURCED — once per
+# controller cycle — so an acquire that fails BEFORE any push (rc=2: the ref is unreadable) used to
+# leave the PREVIOUS issue's commit in it. orch-loop.sh's "rc=2 with a claim commit → write the
+# handover record and try a fenced release" then wrote a record for an issue this attempt never
+# claimed, consumed it, and logged a release that never happened. The fence keeps the registry safe,
+# so this is state hygiene rather than a fail-open — but the log is what an operator reads.
+PROBE_ISSUE=$(( ISSUE + 77 ))
+PROBE_REF="refs/claims/issue-$PROBE_ISSUE"
+probe_out=$( ( cd "$A" && export CLAIM_OWNER_ID=boxA && . "$CLAIMS_SH"
+               claim_issue_acquire 0 "$PROBE_ISSUE" 600 >/dev/null 2>&1; r1=$?
+               CLAIM_REPO="$A/definitely-not-a-repo"
+               claim_issue_acquire 0 "$PROBE_ISSUE" 600 >/dev/null 2>&1; r2=$?
+               printf '%s|%s|%s' "$r1" "$r2" "${CLAIM_COMMIT:-}" ) )
+probe_rc1="${probe_out%%|*}"; probe_rest="${probe_out#*|}"
+probe_rc2="${probe_rest%%|*}"; probe_commit="${probe_rest#*|}"
+ck "I9: the precondition acquire succeeded" "^0$" "$probe_rc1"
+ck "I9: an acquire against an UNREADABLE registry returns rc=2" "^2$" "$probe_rc2"
+[ -z "$probe_commit" ] \
+  && { echo "  ✅ a failed acquire leaves CLAIM_COMMIT EMPTY (no previous issue's commit)"; PASS=$((PASS+1)); } \
+  || { echo "  ❌ a failed acquire carried a STALE CLAIM_COMMIT ($probe_commit) — orch-loop would write a release record for an issue this box never claimed"; FAIL=$((FAIL+1)); }
+# the probe created a real ref on the shared origin — remove it (fenced, so it can only be ours)
+probe_cur="$(git -C "$A" ls-remote origin "$PROBE_REF" | awk '{print $1}')"
+[ -n "$probe_cur" ] && git -C "$A" push -q --force-with-lease="$PROBE_REF:$probe_cur" origin ":$PROBE_REF" 2>/dev/null
+probe_left="$(git -C "$A" ls-remote origin "$PROBE_REF" | wc -l | tr -d ' ')"
+[ "$probe_left" = "0" ] && { echo "  ✅ the probe ref is removed from origin"; PASS=$((PASS+1)); } \
+                           || { echo "  ❌ the probe ref leaked ($PROBE_REF)"; FAIL=$((FAIL+1)); }
 cleanup_issue_ref
 
 echo
