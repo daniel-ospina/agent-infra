@@ -332,18 +332,24 @@ def lanes(scan_timeout=None):
     `--only` (see `main()` for why the second, subset read was removed). Issuing only the
     fleet-wide read matters for a reason beyond this file's own cost: `lane-status.py`'s
     snapshot cache is a SINGLE FILE `~/.pi/agent/state/lane-status.cache` keyed on `--only`
-    (read at `lane-status.py:1646-1651`, written at `:1927-1928`), so a `--only` call from here
+    (read and written by `lane-status.py`'s own cache helpers -- NAMED, not numbered: the line
+    numbers that used to be here had already rotted), so a `--only` call from here
     OVERWRITES the fleet-wide snapshot under the `[null]` key. The next fleet-wide consumer
     then MISSES and re-runs a full ~250-300s scan -- which is exactly what `lane-actions.py`
-    does in its invoke path (`lane-actions.py:1425-1443`), and therefore what `pr-doctor`
-    pays (`pr-doctor.py:238`). By never issuing `--only`, this tool can no longer evict that
+    does in its invoke path (its `--json` read of the fleet snapshot), and therefore what
+    `pr-doctor` pays (its `lane-actions.py --json` call). ⛔ NAMED, NOT NUMBERED (`#1872` review
+    rounds 10-11): `pr-doctor.py`'s number was already stale when it was read; `lane-actions.py`'s
+    range was CORRECT on `origin/main` and moved by the +3 net lines this branch added. The reason to
+    name the sites anyway is that the next edit either side rots a number again -- not that every
+    number replaced here was wrong. By never issuing `--only`, this tool can no longer evict that
     snapshot. (⛔ NOT `lane-status.last.json`: that file is the heartbeat's `tee` copy
     (`orchestrator-heartbeat.sh:291-292`) and no `--only` call touches it. An earlier
     revision of this docstring named it; that was wrong, corrected here.)
 
     PARTIAL READS ARE REFUSED TOO. `lane-status.py` marks every row `degraded` when the cmux
-    registry read failed (`lane-status.py:1906`, `degraded=(LIVE_READABLE is False)`), and such
-    a roster is the hand-written TSV alone -- every live-only lane INVISIBLE. It is non-empty
+    registry read failed (the `degraded=(LIVE_READABLE is False)` construct in `lane-status.py` --
+    named, not numbered, per the NAMED-NOT-NUMBERED rule stated above), and such a roster is the
+    hand-written TSV alone -- every live-only lane INVISIBLE. It is non-empty
     and rc=0, so it would otherwise read as a complete, healthy fleet; `lane-actions.py`
     already refuses exactly this payload (`_refuse_if_degraded`), and so do we.
 
@@ -834,7 +840,8 @@ def main():
     # removed here for two reasons, both measured:
     #
     #   1. IT WAS THE THING THAT DESTROYED THE SHARED CACHE. `lane-status.py` keeps ONE
-    #      snapshot file keyed on `--only` (`lane-status.py:1646`, written at `:1927-1928`),
+    #      snapshot file keyed on `--only` (its own cache read/write helpers -- named, not
+    #      numbered: the line numbers that used to be here had rotted),
     #      so this caller's subset read OVERWROTE the fleet-wide snapshot the tick had just
     #      paid for. Every later consumer in the pass (notably `lane-actions.py`, and through
     #      it `pr-doctor`) then MISSED and re-ran the full ~250-300s fleet scan -- and this

@@ -363,6 +363,13 @@ fi
 # `cloud-cell-quiesce.sh` through a variable-held prefix, so it is in no array and a fresh farm gets the
 # consumer without it (the quiesce then falls back to `supervisor: <none found>`) — #1938 owns whether
 # it is delivered or stays cell-only.
+#
+# ⛔ ONE CONSTRAINT HERE IS NOT DERIVED AND MUST BE STATED: `pr-doctor.py` is listed BEFORE
+# `objective.py` (#1872). The driver imports the classifier by path and `SystemExit`s when it finds
+# an older copy, so the copy leg running in ARRAY ORDER means an interruption between the two leaves
+# a NEW driver beside an OLD classifier — which refuses loudly — instead of the reverse window (NEW
+# beat, OLD driver), which is SILENT because the assertion lives in the driver. The gate pins the
+# order and the presence of both (mutation-verified: reversing them, or deleting either, fails).
 # They farm FLAT for the same reason as the rest of this list (the layer resolves siblings as
 # `$SCRIPTS/<name>` at $DEST/scripts/).
 # `lane-watchdog.py`'s ONLY caller is `heartbeat-loop.sh`, and `heartbeat-loop.sh` is itself withheld

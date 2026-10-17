@@ -245,6 +245,49 @@ check_fleet_srcs_farmed() {
     [ "$declared" -gt 0 ] \
       || fail "$label: fleet_srcs declared ZERO entries — array empty or unreadable, and 0/0 must never read as clean"
   fi
+  # ⛔ ORDER MATTERS FOR ONE PAIR (#1872). The farm copies in ARRAY ORDER and `[ -f "$f" ] || continue`
+  # skips a missing source, so a farm interrupted between these two files leaves a partial pair —
+  # and only ONE direction of that pair is safe: a NEW `pr-doctor.py` beside an OLD `objective.py`
+  # is refused at import by the driver's seam (loud), while a NEW beat beside an OLD driver is
+  # silent, because the assertion lives in the driver. The array is otherwise unordered, so a
+  # future "let's sort this list" edit would restore the silent window with the suite still green.
+  # This turns that comment into a gate.
+  local idx_driver=0 idx_classifier=0 i=0
+  for entry in $line; do
+    i=$((i+1))
+    [ "$entry" = "pr-doctor.py" ] && idx_driver=$i
+    [ "$entry" = "objective.py" ] && idx_classifier=$i
+  done
+  if [ "$idx_driver" -gt 0 ] && [ "$idx_classifier" -gt 0 ] && [ "$idx_driver" -gt "$idx_classifier" ]; then
+    fail "$label: fleet_srcs lists objective.py ($idx_classifier) BEFORE pr-doctor.py ($idx_driver) — the\
+ farm copies in array order, and only the driver-first order makes an interrupted farm FAIL LOUDLY\
+ (the driver's import seam); the reverse order is silent (#1872)"
+  fi
+  # ⛔ AND ABSENCE IS NOT A PASS (#1872 review round 4). The order assertion above is VACUOUS when
+  # either index is 0, so the pair needs a presence half too — but be honest about WHICH gate is
+  # load-bearing here (#1872 review round 13 re-measured this on the merged tree): since #1899 the
+  # DERIVED population gate in this same file already fails a deleted `pr-doctor.py`
+  # (`producer(s) exec'd by a farmed consumer and DELIVERED BY NOTHING: pr-doctor.py`), because both
+  # files are exec'd by farmed consumers. So the unique value of THIS block is the ORDER assertion,
+  # which the derived gate does not check; the presence loop below is defence-in-depth for the pair,
+  # and it stays because it names the consequence (a NEW beat beside an OLD driver is SILENT) rather
+  # than a generic "undelivered producer". (Before the merge this suite was GREEN on that deletion —
+  # that measurement is what motivated the block, and #1899 has since closed the same hole from the
+  # other direction.)
+  #
+  # ⛔ AND USE THE SHARED READER, NOT A HAND-WRITTEN MATCH (#1872). `farm_array_entries` returns ONE
+  # ENTRY PER LINE (`tr -s ' ' '\n'`), so a `case " $line " in *" $entry "*` test never matches — it
+  # reported BOTH files absent while the array declared both, and the reversal run was green only
+  # because that assertion is vacuous when either index is 0. `farm_declares` is the whole-word
+  # membership idiom the rest of this file uses (a plain `grep -F` is satisfied by `pr-doctor.py.old`),
+  # and it REQUIRES the explicit root: its signature is `<array> <entry> [repo-root]` and the body
+  # reads `"$3"`, so a two-argument call is an unbound variable under this file's `set -u` (measured:
+  # BOTH files were reported absent while the array declared both).
+  for entry in pr-doctor.py objective.py; do
+    farm_declares fleet_srcs "$entry" "$ROOT" \
+      || fail "$label: fleet_srcs no longer declares '$entry' — the PAIR of driver/classifier\
+ is undelivered, and its drift is exactly what the import seam refuses at runtime (#1872)"
+  done
 }
 
 # ---------------------------------------------------------------------------------------------
