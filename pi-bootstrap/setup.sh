@@ -309,9 +309,16 @@ fi
 # box rebuilt from this file got every farmed CONSUMER without the PRODUCER it executes. FIVE of the
 # seven now join THIS array (`lane-actions.py`, `lane-watchdog.py`, `objective.py`, `cadence-nudge.sh`,
 # `publish-live-workspaces.py`). FOUR are exec'd by a caller THIS array already farms:
-#   * `lane-actions.py`  <- pr-doctor.py:238, lane-scan-fallback.sh:98 (both farmed; also
-#                           heartbeat-loop.sh:315, withheld — see below)
-#   * `objective.py`     <- cadence-nudge.sh:256,400 and orchestrator-heartbeat.sh:224 (both farmed),
+# ⛔ CALL SITES ARE NAMED, NOT NUMBERED (#1872 review round 9). These pointers used to carry line
+# numbers (`pr-doctor.py:238`, `cadence-nudge.sh:256,400`, `heartbeat-loop.sh:315`) and EVERY ONE of
+# them was stale -- each insertion in a producer moves them, and this branch's own +18 lines in
+# `cadence-nudge.sh` shifted its call sites (the `--res` read, the `TARGET_PRS` sed, the
+# `--gate-clause` read) away from the numbers on this line. A pointer whose job is co-deployment must
+# be findable with `rg`, not with a count that rots.
+#   * `lane-actions.py`  <- pr-doctor.py (the roster read) and lane-scan-fallback.sh (both farmed;
+#                           also heartbeat-loop.sh, withheld — see below)
+#   * `objective.py`     <- cadence-nudge.sh (the `--res`, `TARGET_PRS` and `--gate-clause` reads) and
+#                           orchestrator-heartbeat.sh (both farmed),
 #                           plus lane-scan-fallback.sh step 0 (`objective.last`), AND
 #                           pr-doctor.py — WHICH IMPORTS IT (#1872): the dispatcher loads the
 #                           sibling `objective.py` by path and SystemExits if the classifier is
@@ -321,10 +328,11 @@ fi
 #                           classifier and the driver refuses loudly — the reverse
 #                           window (NEW beat, OLD driver) would be silent, because the assertion
 #                           lives in the driver.
-#   * `cadence-nudge.sh` <- cadence-timer.sh:60 (the single cadence driver, farmed)
-#   * `publish-live-workspaces.py` <- live-workspaces-publisher.py:31 (farmed)
+#   * `cadence-nudge.sh` <- cadence-timer.sh (the single cadence driver, farmed)
+#   * `publish-live-workspaces.py` <- live-workspaces-publisher.py (farmed)
 # The FIFTH, `lane-watchdog.py`, is NOT needed by a farmed caller today: its ONLY caller is
-# `heartbeat-loop.sh:348,350`, and `heartbeat-loop.sh` is itself withheld pending #1553 (below). It is
+# `heartbeat-loop.sh` (two invocations), and `heartbeat-loop.sh` is itself withheld pending #1553
+# (below). It is
 # farmed NOW so #1553's landing cannot yield a fresh farm whose caller is present and whose producer
 # is absent.
 # They farm FLAT for the same reason as the rest of this list (the layer resolves siblings as

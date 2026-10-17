@@ -787,9 +787,12 @@ def classify_pr(pr, cr, att_clean):
     #    `python-ci-gate` is ABSENT while its child jobs run (`test (a)`, `test-slow (a)`, ...) --
     #    the gate job is created only AFTER the matrix finishes. So the absence of a required
     #    gate while ANY check at this head is in flight means "not reported yet", not "never
-    #    ran": #8806 / #8824 / #8825 / #8827 were exactly that, and both old readers sent them
-    #    to work (the beat: `fix-ci`, go repair the code; the dispatcher's fork: `running` on one
-    #    and `unreviewed` on two -- go review it).
+    #    ran": #8825, #8806 and #8824 were exactly that. The BEAT called all three `fix-ci` (go
+    #    repair the code); the dispatcher's fork called #8825 `running` and the other two
+    #    `unreviewed` (go review it) -- so on #8825 the two readers disagreed about whether to
+    #    work at all. The series is enumerated once, in the file header (4 of 11: #8825 plus
+    #    #8806/#8822/#8824); these three are the ones this arm answers, and #8822 is the
+    #    nothing-in-flight shape arm 6 answers instead.
     #    ⛔ BUT A RED REQUIRED CHECK IS STILL WORK, even beside a running unrelated job: waiting
     #    on a lint/typecheck job to finish before repairing a genuinely failing gate would only
     #    delay the fix (#8708). So the arm covers flight-or-not-yet-reported, NEVER red -- the

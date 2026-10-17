@@ -36,17 +36,22 @@ def _clean_module_state(monkeypatch):
 
     `open_prs()` WRITES the module global `OPEN_PRS_ERROR`, and `main()` reads it before anything
     else (`if OPEN_PRS_ERROR: ... return 2`). A test that drives `open_prs()` into a failure leaves
-    that global truthy -- `monkeypatch` cannot undo a plain module assignment -- so every LATER test
-    in the same process that calls `main()` takes the queue-refusal branch instead of the branch it
-    was written for. MEASURED: running the open-PR-failure test before the partly-blind tests makes
-    them fail with `assert 2 == 0`; the file green in its own order only because that test happens to
-    sit 140 lines below them. Worse, it makes the round-5 saturation test pass for the WRONG REASON
-    (the queue refusal, not the unreadable refusal it exists to pin).
+    that global truthy, so every LATER test in the same process that calls `main()` takes the
+    queue-refusal branch instead of the branch it was written for. MEASURED: running the
+    open-PR-failure test before the partly-blind tests makes them fail with `assert 2 == 0`; the file
+    is green in its own order only because that test sits further down. Worse, it makes the round-5
+    saturation test pass for the WRONG REASON (the queue refusal, not the unreadable refusal it
+    exists to pin).
+
+    ⛔ HOW IT IS FIXED, STATED CORRECTLY (#1872 review round 9). `monkeypatch.setattr(obj, name, v)`
+    records the PRE-TEST value and restores it on undo, so a test body that assigns the global
+    DIRECTLY is still restored -- verified: a fixture whose only act is the setup `setattr` restores
+    `None` after the body writes `"dirty"`. The SETUP line below is therefore the whole fix; a
+    teardown reset would be redundant, and claiming that "monkeypatch cannot undo a plain module
+    assignment" would teach the next fixture a rule that is not true.
 
     Same class of leak as `objective.GH_BLOCKED`: reset the state each test depends on, in one place.
     """
-    monkeypatch.setattr(pr, "OPEN_PRS_ERROR", None, raising=False)
-    yield
     monkeypatch.setattr(pr, "OPEN_PRS_ERROR", None, raising=False)
 
 
