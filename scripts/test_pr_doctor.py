@@ -863,6 +863,25 @@ def test_a_symlink_to_another_worktree_is_not_live(monkeypatch, tmp_path):
                           capture_output=True, text=True).stdout.strip() == "b2"
 
 
+def test_materialise_does_not_materialise_through_a_symlink_to_an_empty_dir(monkeypatch, tmp_path):
+    """A symlink to an EMPTY dir looks disposable (`listdir` follows it) but `rmtree` refuses it,
+    and `worktree add` would then follow the symlink and create the worktree in the TARGET."""
+    repo, g = _git_repo(tmp_path)
+    head = g("rev-parse", "HEAD").stdout.strip()
+    g("branch", "b1")
+    _wire_repo(monkeypatch, repo)
+    target = tmp_path / "emptydir"
+    target.mkdir()
+    (repo / ".worktrees").mkdir()
+    link = repo / ".worktrees" / "prd-1"
+    link.symlink_to(target)
+    assert pr._disposable_dangling(str(link)) is False
+    wt, err = pr.materialise_worktree(_prb(1, head, "b1"))
+    assert err == "" and wt.endswith("prd-1-d")
+    assert link.is_symlink(), "the symlink must be left alone"
+    assert list(target.iterdir()) == [], "the symlink target must not receive a worktree"
+
+
 def test_materialise_fork_pr_ignores_a_colliding_local_branch(monkeypatch, tmp_path):
     """A fork PR's headRefName can equal a local branch (e.g. a fork of `main`); it must be
     materialised DETACHED at refs/pull/<n>/head and must not touch that local branch."""

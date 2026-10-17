@@ -519,9 +519,9 @@ write_provenance() {
   # payloadSha256 <C1>`; `report.sh` then headlined `[current]` for a box not running that commit,
   # and only the new check-deployed-drift.sh's blob comparison caught it. The mismatch is now a
   # FIELD, so the record itself cannot be read as "this commit describes these bytes".
-  # ⛔ Compare the WHOLE shipped surface, NOT the 11-name `DRIFTED` subset. `DRIFTED` names only the
+  # ⛔ Compare the WHOLE shipped surface, NOT the 12-name `DRIFTED` subset. `DRIFTED` names only the
   # scripts the DAEMON executes; a shipped `*.sh` outside that list (`check-port-drift.sh`,
-  # `check-deployed-drift.sh`, `selftest.sh`, `nonblocking-dispatch.sh`, every `test-*.sh`) could
+  # `check-deployed-drift.sh`, `selftest.sh`, every `test-*.sh`) could
   # differ while this field still said `true` — so the record read "this commit describes these bytes"
   # about a `$O` the new check returns DRIFT/1 for. Reproduced in review: a byte appended to
   # `$O/check-port-drift.sh` gave `deployedMatchesSource: true` and no `report.sh` warning over a

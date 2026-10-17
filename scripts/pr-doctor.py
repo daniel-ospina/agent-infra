@@ -490,8 +490,12 @@ def _disposable_dangling(path: str) -> bool:
     """A directory we own that holds NOTHING, or only a dangling `.git` pointer FILE.
 
     ⛔ A `.git` DIRECTORY is a repository's object store, not a worktree pointer; deleting it can
-    destroy recoverable commits, so it is never disposable.
+    destroy recoverable commits, so it is never disposable. A SYMLINK is never disposable either:
+    `os.listdir` follows it (so an empty target looks empty) while `shutil.rmtree` refuses it, and
+    `git worktree add` would then follow the symlink and materialise the worktree in the TARGET.
     """
+    if os.path.islink(path):
+        return False
     try:
         entries = os.listdir(path)
     except OSError:
