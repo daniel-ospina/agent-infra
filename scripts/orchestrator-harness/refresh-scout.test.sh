@@ -1372,6 +1372,16 @@ case "$(tr '\n' ' ' < "$D/o/checked.txt" 2>/dev/null)" in
   *42*) bad "claim-unreachable: #42 was blacklisted on an unreadable registry" ;;
   *) ok "claim-unreachable: #42 is left unchecked, so an outage does not consume an issue" ;;
 esac
+# ⛔ A PASS THE REGISTRY ANSWERED NOTHING FOR IS NOT A HEALTHY PASS (2026-10-16 review). The per-issue
+# lines scroll away and `lanes: 0` + `backlog=0` is exactly what a quiet box looks like, so an
+# unreadable registry used to be indistinguishable from "no work available". The pass must exit
+# TRANSIENT, and it must say the registry (not the pool) was the reason.
+[ "$RC" = "1" ] && ok "claim-unreachable: the pass exits TRANSIENT (1), not 0 — an outage is not 'no work'" \
+               || bad "claim-unreachable: rc=$RC — a pass that queued nothing on an unreadable registry read as healthy"
+case "$OUT" in
+  *"of 1 pre-flighted issues INCOMPLETE"*) ok "claim-unreachable: the aggregate names how many the registry could not answer for" ;;
+  *) bad "claim-unreachable: no aggregate INCOMPLETE line — output: $OUT" ;;
+esac
 
 # (c) The registry is NOT INSTALLED: the documented FALLBACK. The candidate IS queued (a missing FILE
 #     is not an unreachable registry — refusing here would make the box merge-only), and the box says
@@ -1379,7 +1389,12 @@ esac
 mk_case claim-absent
 mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
 mk_gh_one_issue "$D"
-rf "$D" refresh CLAIMS_SH="$D/no-registry-here.sh"
+# A genuinely MISSING file — not a bogus path in the environment. `CLAIMS_SH` was a test seam that
+# three production callers had begun to honour, which let an ambient value disable the gate in one
+# of them and not the others; the path is `$O/claims.sh` everywhere now, so the absence is staged by
+# removing the file (2026-10-16 review).
+rm -f "$D/o/claims.sh"
+rf "$D" refresh
 case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
   *42*) ok "claim-absent: a candidate is still queued (the fallback is not a false block)" ;;
   *) bad "claim-absent: nothing was queued — candidates='$(cat "$D/o/candidates.txt" 2>/dev/null)'" ;;
@@ -1410,6 +1425,37 @@ case "$OUT" in
   *"predates the issue-claim reader"*) ok "claim-stale-registry: the refusal NAMES the stale registry" ;;
   *) bad "claim-stale-registry: the reason is not named — output: $OUT" ;;
 esac
+# ⛔ AND IT IS A PROVISIONING FAILURE, NOT A PER-ISSUE ONE (2026-10-16 review). A stale $O/claims.sh is
+# LOCAL and PERMANENT, so answering INCOMPLETE per issue queues nothing FOREVER while the cell still
+# reports RUNNING — the "looks alive and can only merge" defect this script has been fixed for twice
+# (#1748, #1736). rc=3 is what orch-loop.sh turns into `.refresh-blocked` (stop retrying, name it).
+[ "$RC" = "3" ] && ok "claim-stale-registry: the pass exits NOT-PROVISIONABLE (3) so the cell is not read as healthy" \
+                 || bad "claim-stale-registry: rc=$RC — a permanent local drift exited 0 and would be retried forever"
+case "$OUT" in
+  *"NOT PROVISIONABLE"*) ok "claim-stale-registry: the permanent drift is reported on the provisioning channel" ;;
+  *) bad "claim-stale-registry: no NOT PROVISIONABLE line — output: $OUT" ;;
+esac
+
+# (g) ⛔ AN UNRECOGNISED VERDICT CODE IS NOT A LICENCE TO DISPATCH (2026-10-16 review). The CLEAN arm
+#     was `case 1) … 2) … *) CLEAN`, so ANY other code — 127 from a missing function, or whatever a
+#     foreign/newer/older registry returns — was read as CLEAN and QUEUED the issue: fail-OPEN in the
+#     one place the block declares it never fails open. Only an explicit 0 may queue.
+#     The stub is a sourceable registry whose reader answers 7, the shape a future/foreign copy has.
+mk_case claim-unrecognised
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_gh_one_issue "$D"
+printf '# a registry whose verdict code this caller does not know\nclaim_issue_preflight() { return 7; }\n' > "$D/o/claims.sh"
+rf "$D" refresh
+case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
+  *42*) bad "claim-unrecognised: #42 was QUEUED on an unrecognised verdict code — fail-OPEN" ;;
+  *) ok "claim-unrecognised: an unrecognised verdict code queues NOTHING (INCOMPLETE, never CLEAN)" ;;
+esac
+case "$OUT" in
+  *"UNRECOGNISED verdict"*) ok "claim-unrecognised: the reason names the unrecognised code" ;;
+  *) bad "claim-unrecognised: the unrecognised verdict is not named — output: $OUT" ;;
+esac
+[ "$RC" = "1" ] && ok "claim-unrecognised: the pass exits TRANSIENT so it is not read as 'no work'" \
+                 || bad "claim-unrecognised: rc=$RC (want 1)"
 
 # (f) And the CLEAN path still works WITH the registry installed and NO claim: the gate must not be a
 #     blanket refusal. (Case 2 above already covers this shape, but it now runs with a real origin and
@@ -1482,6 +1528,24 @@ if [ -s "$T/dispatchblock.sh" ] && grep -q 'claim_issue_acquire' "$T/dispatchblo
   esac
   [ ! -e "$DB2/o/state/issueclaim-42" ] && ok "orch-loop dispatch: no release record was written for a refused claim" \
                                         || bad "orch-loop dispatch: a release record exists for a claim this box never took"
+  # (iii) ⛔ A REGISTRY TOO OLD TO TAKE A CLAIM MUST NOT DISPATCH UNCLAIMED (2026-10-16 review). The
+  #       pre-flight refuses every issue on such a box (case (e): rc=3 NOT PROVISIONABLE), so
+  #       dispatching here is the fail-open half of that same condition — an issue a peer may already
+  #       own goes out with no claim at all, while the box's own reader calls the registry unusable.
+  DB3="$T/db-stale"; mkdir -p "$DB3/o/state" "$DB3/repo"
+  git init -q --bare "$DB3/origin.git"; git init -q "$DB3/repo"
+  git -C "$DB3/repo" remote add origin "$DB3/origin.git"
+  printf '# a registry that predates the issue key: sourceable, no claim_issue_* functions\nCLAIM_TTL=1800\n' > "$DB3/o/claims.sh"
+  printf '42\n' > "$DB3/o/candidates.txt"; : > "$DB3/o/dispatched.txt"
+  db "$DB3"
+  case "$(tr '\n' ' ' < "$DB3/o/.batch" 2>/dev/null)" in
+    *42*) bad "orch-loop dispatch: a STALE registry dispatched the issue UNCLAIMED (fail-open)" ;;
+    *) ok "orch-loop dispatch: a stale registry stops the dispatch (no claim is possible on this box)" ;;
+  esac
+  case "$(cat "$DB3/log" 2>/dev/null)" in
+    *"predates the issue key"*) ok "orch-loop dispatch: the stale registry is NAMED in the log, with the fix" ;;
+    *) bad "orch-loop dispatch: the stale-registry stop is not explained — log: $(cat "$DB3/log" 2>/dev/null)" ;;
+  esac
 else
   bad "orch-loop: could not extract the dispatch block carrying claim_issue_acquire"
 fi
@@ -1543,6 +1607,53 @@ if [ -s "$T/release.sh" ] && grep -q 'claim_issue_release' "$T/release.sh"; then
     after_stale="$(git -C "$RL2/repo" ls-remote origin refs/claims/issue-42 | awk '{print $1}')"
     [ "$after_stale" = "$peerc" ] && ok "chain-merge: a STALE holder cannot delete the WINNER's issue claim (fenced)" \
                                    || bad "chain-merge: the fenced release deleted a peer's claim (${after_stale:-<gone>} vs $peerc)"
+    # ⛔ GENERATION GUARD (2026-10-16 review). The handover record is keyed on the ISSUE, so the SAME
+    # box can become the holder again while this chain is still alive (its lease lapsed; the chain is
+    # still waiting on a PR) — and the re-acquire OVERWRITES the record with the new commit. A trap
+    # that read the file when it FIRED would then fence on that NEWER commit, which IS the ref tip, so
+    # the OLD chain would delete the claim of the chain that legitimately holds it and a peer would
+    # read the issue as free: the duplicate this registry exists to prevent, and a fail-OPEN.
+    # The chain captured ITS OWN commit at start; the mismatch must refuse the release AND leave the
+    # newer generation's record alone (that chain still has to release its own claim).
+    RL3="$T/rl-generation"; mkdir -p "$RL3/o/state" "$RL3/repo"
+    git init -q --bare "$RL3/origin.git"; git init -q "$RL3/repo"
+    git -C "$RL3/repo" remote add origin "$RL3/origin.git"
+    cp "$HERE/claims.sh" "$RL3/o/claims.sh"
+    older="$( cd "$RL3/repo" || exit 1
+              CLAIM_REPO="$RL3/repo"; CLAIM_OWNER_ID=selfbox; export CLAIM_REPO CLAIM_OWNER_ID
+              . "$HERE/claims.sh"
+              _claim_commit selfbox "$(( $(date +%s) - 60 ))" )"
+    newer="$( cd "$RL3/repo" || exit 1
+              CLAIM_REPO="$RL3/repo"; CLAIM_OWNER_ID=selfbox; export CLAIM_REPO CLAIM_OWNER_ID
+              . "$HERE/claims.sh"
+              _claim_commit selfbox "$(( $(date +%s) + 600 ))" )"
+    [ -n "$older" ] && [ -n "$newer" ] || bad "chain-merge: could not mint both generations for the guard case"
+    git -C "$RL3/repo" push -q origin "$newer:refs/claims/issue-42"
+    printf '%s\n' "$newer" > "$RL3/o/state/issueclaim-42"
+    ( O="$RL3/o"; LOG="$RL3/o/log"; N=42; REPO="$RL3/repo"; CLAIM_REPO="$RL3/repo"
+      CHAIN_CLAIM_COMMIT="$older"; export O LOG N REPO CLAIM_REPO CHAIN_CLAIM_COMMIT
+      . "$RL3/o/claims.sh"; . "$T/release.sh"; release_issue_claim ) >/dev/null 2>&1
+    gen_left="$(git -C "$RL3/repo" ls-remote origin refs/claims/issue-42 | awk '{print $1}')"
+    [ "$gen_left" = "$newer" ] && ok "chain-merge: an OLDER chain cannot release the NEWER generation's claim (generation guard)" \
+                               || bad "chain-merge: the older chain deleted the newer generation's claim (${gen_left:-<gone>} vs $newer)"
+    [ -e "$RL3/o/state/issueclaim-42" ] && ok "chain-merge: the newer generation's record is left for ITS own release" \
+                                        || bad "chain-merge: the generation-refused release consumed the newer generation's record"
+    # ⛔ THE CAPTURE IS WIRED, NOT JUST THE GUARD (cycle-2 adversarial review). Every case above
+    # INJECTS CHAIN_CLAIM_COMMIT, so deleting chain-merge.sh's capture line would leave them all GREEN
+    # while the guard went INERT in production: the trap would pass an empty expectation, so the
+    # release would fence on the record's CURRENT value — the live holder's own commit, which IS the
+    # ref tip — and delete it. Drive the SHIPPED capture statement itself, with the record present.
+    cap_line="$(sed -n '/^CHAIN_CLAIM_COMMIT=/p' "$HERE/chain-merge.sh" | head -1)"
+    if [ -z "$cap_line" ]; then
+      bad "chain-merge: the generation CAPTURE is GONE from the shipped script — the guard would be inert in production"
+    else
+      cap_val="$( cd / && O="$RL3/o" N=42 REPO="$RL3/repo" CLAIM_REPO="$RL3/repo"
+                  eval "$cap_line" >/dev/null 2>&1
+                  printf '%s' "${CHAIN_CLAIM_COMMIT:-}" )"
+      [ "$cap_val" = "$newer" ] \
+        && ok "chain-merge: the shipped capture reads THIS box's recorded generation (the guard is WIRED)" \
+        || bad "chain-merge: the shipped capture returned '${cap_val:-<empty>}' (want $newer) — the generation guard is inert in production"
+    fi
 else
     bad "chain-merge: could not extract release_issue_claim from the shipped script"
 fi
@@ -1592,6 +1703,43 @@ if [ -s "$T/unspawned.sh" ] && grep -q 'claim_issue_release_record' "$T/unspawne
                          || bad "dispatch-merge: an empty record deleted or changed the claim (${keep:-<gone>} vs $peer2)"
 else
   bad "dispatch-merge: could not extract release_issue_claim_unspawned from the shipped script"
+fi
+
+# ⛔ THE CHAIN-FAILURE BRANCH MUST NOT RELEASE A LANE THAT IS STILL RUNNING (cycle-2 adversarial
+# review). The lane is spawned BEFORE the chain in the same loop body, so "no chain will ever run" is
+# true while "nothing is running" is not: releasing there declares an issue this box is ACTIVELY
+# implementing free, a peer claims it and duplicates the work, and this box still opens a PR nothing
+# will merge. The branch must stop the lane first and release only once it is confirmed gone (if it
+# cannot be stopped, KEEP the claim — the lease expiring it is the safe direction). The shipped
+# branch is extracted and driven with a stubbed `tmux`, once for each outcome.
+DM="$T/dm-branch.sh"
+sed -n '/if tmux new-session -d -s "chain-/,/^  fi$/p' "$HERE/dispatch-merge.sh" > "$DM"
+if [ -s "$DM" ] && grep -q 'release_issue_claim_unspawned' "$DM"; then
+  ok "dispatch-merge: the chain-failure branch is extractable from the shipped script"
+  # <lane alive> <kill succeeds> -> how many times the release ran
+  run_branch() {
+    ( N=42; O="$T/dm/o"; REPO="$T/dm/repo"; OR="owner/repo"; BR="feat/42-x"
+      LANE_ALIVE="$1"; KILLABLE="$2"; released=0
+      tmux() {
+        case "${1:-}" in
+          new-session) return 1 ;;                                  # the chain cannot start
+          ls) [ "$LANE_ALIVE" = 1 ] && printf 'lane-42\n'; return 0 ;;
+          kill-session) [ "$KILLABLE" = 1 ] && { LANE_ALIVE=0; return 0; }; return 1 ;;
+          *) return 0 ;;
+        esac
+      }
+      release_issue_claim_unspawned() { released=$(( released + 1 )); }
+      . "$DM" >/dev/null 2>&1
+      printf '%s' "$released" )
+  }
+  [ "$(run_branch 1 1)" = "1" ] \
+    && ok "dispatch-merge: a chain that cannot start releases the claim AFTER stopping its lane" \
+    || bad "dispatch-merge: the stopped-lane path did not release exactly once (got '$(run_branch 1 1)')"
+  [ "$(run_branch 1 0)" = "0" ] \
+    && ok "dispatch-merge: a chain that cannot start KEEPS the claim while its lane is still alive" \
+    || bad "dispatch-merge: released the claim while lane-42 was STILL RUNNING — a peer would duplicate the work"
+else
+  bad "dispatch-merge: could not extract the chain-failure branch (or it no longer releases)"
 fi
 
 echo

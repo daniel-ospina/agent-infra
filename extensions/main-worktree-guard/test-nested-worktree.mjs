@@ -92,6 +92,13 @@ try {
   expect("A2: …but it is NOT hub dirt (readHubDisorder)", readHubDisorder(hub).disorder, null);
   expect("A2: …and the porcelain filter drops exactly that entry",
     porcelainWithoutRegisteredWorktrees(rawPorcelain, hub).trim(), "");
+  // A2b (#1125 × #1919): the M4 context line's `dirtyPaths` count must read the
+  // SAME filtered set the verdict reads. Counted from the raw porcelain it would
+  // report "dirty: 1 path(s)" for a path the gate has just decided is NOT dirt
+  // — a reason line contradicting its own verdict, and the exact misdiagnosis
+  // class #1125 exists to remove.
+  expect("A2b: …and dirtyPaths does not count the worktree (no disorder)",
+    readHubDisorder(hub).dirtyPaths, 0);
 
   // A3: THE SAFETY HALF — a genuine untracked file still makes the hub dirty,
   // and the filter keeps it.
@@ -100,6 +107,11 @@ try {
   expect("A3: nested worktree + genuine untracked → DIRTY", readHubDisorder(hub).disorder, "dirty");
   expect("A3: …the filter keeps the genuine entry and drops only the worktree",
     porcelainWithoutRegisteredWorktrees(withGenuine, hub).trim(), "?? genuine-untracked.txt");
+  // A3b: ONE dirty path, not two. The nested worktree is in `git status
+  // --porcelain-v1` but is not dirt, so the count the operator sees names only
+  // the genuine entry — which is what they must act on.
+  expect("A3b: …and dirtyPaths counts ONLY the genuine entry, not the worktree",
+    readHubDisorder(hub).dirtyPaths, 1);
   rmSync(join(hub, "genuine-untracked.txt"));
 
   // A4: …and so does TRACKED dirt. Only `?? ` entries are ever excluded, so a
@@ -109,6 +121,8 @@ try {
   expect("A4: nested worktree + tracked modification → DIRTY", readHubDisorder(hub).disorder, "dirty");
   expect("A4: …the filter leaves tracked entries alone",
     porcelainWithoutRegisteredWorktrees(withTracked, hub).trim(), "M a.txt");
+  expect("A4b: …and dirtyPaths counts the tracked entry only",
+    readHubDisorder(hub).dirtyPaths, 1);
   gg("checkout -- a.txt", hub);
 
   // A5: the M4 verdict, both directions, for the verb the issue was refused on.

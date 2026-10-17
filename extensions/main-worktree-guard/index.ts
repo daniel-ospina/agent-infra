@@ -165,8 +165,8 @@ let wtShellWords: (s: string) => string[] = (s) => String(s).split(/\s+/);
 // #1484 M4 hub-state gate + script-backdoor closure. Fail-safe defaults: every
 // decision degrades to inactive/allow so a failed import NEVER false-blocks
 // (the git commands were allow-listed before M4; the guard stays permissive).
-let readHubDisorder: (cwd: string, opts?: { skipWorktree?: boolean }) => { disorder: string | null; branch: string | null } = () => ({ disorder: null, branch: null });
-let evaluateHubGateWithTargets: (command: string, currentBranch: string | null, sessionCwd?: string, checkedOutBranches?: Set<string> | null) => { verdict: "non-git" | "allowed" | "recovery" | "block"; reason?: string; exempted?: boolean } = () => ({ verdict: "non-git" });
+let readHubDisorder: (cwd: string, opts?: { skipWorktree?: boolean }) => { disorder: string | null; branch: string | null; path: string | null; dirtyPaths: number } = () => ({ disorder: null, branch: null, path: null, dirtyPaths: 0 });
+let evaluateHubGateWithTargets: (command: string, currentBranch: string | null, sessionCwd?: string, checkedOutBranches?: Set<string> | null, hubContext?: { disorder: string | null; branch: string | null; path: string | null; dirtyPaths: number } | null) => { verdict: "non-git" | "allowed" | "recovery" | "block"; reason?: string; exempted?: boolean } = () => ({ verdict: "non-git" });
 let commandExecutionCwd: (command: string, sessionCwd?: string) => string | null = () => null;
 let resolveTargetTopLevel: (targetPath: string, cwd?: string) => string | null = () => null;
 // #1919: refuse a `git worktree add|move` whose target would land INSIDE a git
@@ -554,11 +554,11 @@ function _coordinatedDeleteBlock(branchNames: string[]): { block: true; reason: 
 // sessions are exempt (D5 — isolated by construction). Agent-infra is NOT
 // exempt: the #99 carve-out is removed (#615) — its main checkout gets the
 // same M4 discipline as every other hub.
-function _hubState(): { disorder: string | null; branch: string | null } {
+function _hubState(): { disorder: string | null; branch: string | null; path: string | null; dirtyPaths: number } {
   try {
     return readHubDisorder(resolve(process.cwd()));
   } catch {
-    return { disorder: null, branch: null }; // degrade — never false-block
+    return { disorder: null, branch: null, path: null, dirtyPaths: 0 }; // degrade — never false-block
   }
 }
 
@@ -580,6 +580,22 @@ function _nestedWorktreeBlock(command: string): string | null {
   } catch {
     return null; // degrade — never false-block on classifier failure
   }
+}
+
+/** #1125 — the M4 WRITE/EDIT block must NAME the checkout and echo the resolved
+ *  condition, exactly as the bash-route block does (classify-git
+ *  `_m4CheckoutLines`). `"the shared main checkout"` is ambiguous across a
+ *  machine carrying several checkouts; unnamed, it sent two agents to the wrong
+ *  repository for ~40 minutes and produced a destructive-command request
+ *  against a healthy repo. Returns null when the path could not be resolved
+ *  (the message stays as it was — no fabricated context). */
+function _m4CheckoutLine(st: { disorder: string | null; branch: string | null; path: string | null; dirtyPaths: number }): string | null {
+  if (!st.path) return null;
+  const bits: string[] = [];
+  if (st.disorder === "off_main" || st.disorder === "both") bits.push(`off-main: ${st.branch ?? "<detached>"}`);
+  if (st.disorder === "dirty" || st.disorder === "both") bits.push(`dirty: ${st.dirtyPaths} path(s)`);
+  return `   Checkout: ${st.path}${bits.length > 0 ? ` (${bits.join(", ")})` : ""}`;
+
 }
 
 // #436 (B carve-out): collision-free NEW-FILE write allowance in a disordered
@@ -1357,7 +1373,11 @@ function _catFileRevertStateBlock(
   scriptDir: string | null,
 ): string | null {
   // No redirect ⇒ nothing is written. This is the read-only `git show HEAD:x`
-  // and the `git show HEAD:x > /dev/null` cases: no loss is possible.
+  // and the `git show HEAD:x > /dev/null` cases: no loss is possible. #1125 —
+  // this arm is also why a read-only probe whose pathspec is a shell variable
+  // (`git cat-file -e "origin/$BRANCH:$f"`) is allowed instead of fail-closed
+  // on the unresolvable source: the hint has no LANDING SITE, so there is no
+  // discard. The decision is ordered by EFFECT, not by the pathspec's spelling.
   if (writeTargetsRel.length === 0) return null;
 
   const vars = _wtCommandVars(command);
@@ -2042,6 +2062,24 @@ function _worktreeDiscardBlock(command: string): string | null {
       // predicate probes. The script's own directory is passed as a candidate
       // checkout (a script's redirect may be anchored to a name the script
       // computes at runtime).
+      //
+      // #1125 — and the state predicate is what makes the check EFFECT-ORDERED:
+      // a `cat-file-revert` HINT is a discard ONLY when the reproduced committed
+      // content LANDS on a path (the form's whole model is `git show HEAD:x >
+      // x`). With NO write target in the command/script there is nowhere for the
+      // content to land, so the hint cannot be a revert whatever its pathspec
+      // spells — and a read-only probe (`git cat-file -e "origin/$BRANCH:$f"`,
+      // `git show "$ref:$f"`) is exactly that shape. `_catFileRevertStateBlock`
+      // answers that FIRST (`writeTargetsRel.length === 0 → null`), so the
+      // fail-closed arm on an unresolvable pathspec no longer refuses a command
+      // with no discard effect at all: the sanctioned read-only triage tool
+      // `scripts/stale-main-triage.sh` could not be RUN by an agent on the dirty
+      // hub it diagnoses, and the fleet-durability sweep's per-file `git
+      // cat-file -e` loop was blocked in three repos (2026-09-17 evidence on
+      // #1125). That is not a relaxation — whenever the command DOES carry a
+      // write surface the state predicate still runs and still fails closed,
+      // so `git show HEAD:$f > $f` keeps blocking, as does a resolvable hint
+      // landing on its own path.
       if (d.form === "cat-file-revert") {
         let scriptDir: string | null = null;
         if (set.script !== null && !/[$`]/.test(set.script)) {
@@ -2823,7 +2861,7 @@ export default function (pi: ExtensionAPI) {
             }
           } catch { /* empty set → only the hub's current branch protects */ }
           if (st.branch) checkedOutNames.add(st.branch);
-          const gate = evaluateHubGateWithTargets(command, st.branch, resolve(process.cwd()), checkedOutNames);
+          const gate = evaluateHubGateWithTargets(command, st.branch, resolve(process.cwd()), checkedOutNames, st);
           if (gate.exempted) {
             // #347 code-review: audit worktree exemptions — a deliberate gate
             // relaxation must be observable (the 2026-08-18 incident was a
@@ -2879,6 +2917,7 @@ export default function (pi: ExtensionAPI) {
         // active TTL marker cannot write into the hub.
         const targetPath = (event.input as { path?: string }).path ?? "";
         const st = _hubState();
+        const ctxLine = _m4CheckoutLine(st);
         if (st.disorder) {
           const targetTop = resolveTargetTopLevel(targetPath);
           const mainTop = _mainTopLevel();
@@ -2903,6 +2942,7 @@ export default function (pi: ExtensionAPI) {
                   block: true,
                   reason: [
                     `⛔ New-file write blocked — new-file cap exhausted in a disordered hub (#628).`,
+                    ...(ctxLine ? [ctxLine] : []),
                     `   This session has created ${newFileCount - 1} new files directly in the`,
                     `   shared main checkout while it is OFF-MAIN or DIRTY (cap ${HUB_NEW_FILE_BLOCK_CAP}).`,
                     `   New files are additive (they cannot collide with a sibling's uncommitted`,
@@ -2920,6 +2960,7 @@ export default function (pi: ExtensionAPI) {
               block: true,
               reason: [
                 `⛔ File edits blocked — the shared main checkout is OFF-MAIN or DIRTY (#1484).`,
+                ...(ctxLine ? [ctxLine] : []),
                 `   The hub's only legal states are main+clean. Non-recovery edits are`,
                 `   blocked even under the TTL marker (D3).`,
                 `   → Recover first: cd <repo> && git checkout main && git pull --ff-only`,
