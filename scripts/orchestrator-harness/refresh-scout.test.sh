@@ -1643,17 +1643,28 @@ if [ -s "$T/release.sh" ] && grep -q 'claim_issue_release' "$T/release.sh"; then
     # while the guard went INERT in production: the trap would pass an empty expectation, so the
     # release would fence on the record's CURRENT value — the live holder's own commit, which IS the
     # ref tip — and delete it. Drive the SHIPPED capture statement itself, with the record present.
-    cap_line="$(sed -n '/^CHAIN_CLAIM_COMMIT=/p' "$HERE/chain-merge.sh" | head -1)"
-    if [ -z "$cap_line" ]; then
-      bad "chain-merge: the generation CAPTURE is GONE from the shipped script — the guard would be inert in production"
+    # ⛔ THE WIRING NOW LIVES IN THE SPAWNER, NOT IN chain-merge.sh (adversarial review): the chain
+    # must NOT read the record itself, because a manual re-run starts after a possible re-acquire and
+    # would capture a generation it never took. So the assertion moved to `dispatch-merge.sh`'s spawn
+    # line — the one place that is milliseconds after the write — and chain-merge must simply inherit.
+    gen_line="$(sed -n '/^  chain_gen=/p' "$HERE/dispatch-merge.sh" | head -1)"
+    spawn_line="$(sed -n '/CHAIN_CLAIM_COMMIT=.\$chain_gen./p' "$HERE/dispatch-merge.sh" | head -1)"
+    if [ -z "$gen_line" ] || [ -z "$spawn_line" ]; then
+      bad "dispatch-merge: the generation INJECTION is GONE from the chain spawn — every chain would start with no generation and never release (or, worse, a future edit reintroduces reading the record)"
     else
       cap_val="$( cd / && O="$RL3/o" N=42 REPO="$RL3/repo" CLAIM_REPO="$RL3/repo"
-                  eval "$cap_line" >/dev/null 2>&1
-                  printf '%s' "${CHAIN_CLAIM_COMMIT:-}" )"
+                  eval "$gen_line" >/dev/null 2>&1
+                  printf '%s' "${chain_gen:-}" )"
       [ "$cap_val" = "$newer" ] \
-        && ok "chain-merge: the shipped capture reads THIS box's recorded generation (the guard is WIRED)" \
-        || bad "chain-merge: the shipped capture returned '${cap_val:-<empty>}' (want $newer) — the generation guard is inert in production"
+        && ok "dispatch-merge: the spawn READS the record this dispatch wrote (the guard is WIRED)" \
+        || bad "dispatch-merge: the spawn read '${cap_val:-<empty>}' (want $newer) — the generation guard is inert in production"
     fi
+    # ...and chain-merge must NOT re-derive it from the record. Assert the shipped line is the
+    # inherit-only form: if someone puts the file read back, a stale re-run captures a generation it
+    # never took and deletes the newer holder's claim (reproduced).
+    grep -qx 'CHAIN_CLAIM_COMMIT="${CHAIN_CLAIM_COMMIT:-}"' "$HERE/chain-merge.sh" \
+      && ok "chain-merge: the generation is INHERITED, never read from the shared record (a manual re-run gets none and refuses)" \
+      || bad "chain-merge: the generation is being re-derived from the record — a re-run after a re-acquire would capture a generation it never took"
     # ⛔ NO CAPTURED GENERATION → REFUSE THE RELEASE (acceptance-review finding). The capture is empty
     # when the handover record did not exist at chain start (orch-loop.sh's `claim_issue_record`
     # failed — the loop logs that this chain cannot fence its release) or when `$O/claims.sh` predates
@@ -1739,6 +1750,7 @@ if [ -s "$DM" ] && grep -q 'release_issue_claim_unspawned' "$DM"; then
   run_branch() {
     ( N=42; O="$T/dm/o"; REPO="$T/dm/repo"; OR="owner/repo"; BR="feat/42-x"
       LANE_ALIVE="$1"; KILLABLE="$2"; released=0
+      chain_gen=""   # the spawner sets this; the extracted branch only USES it
       tmux() {
         case "${1:-}" in
           new-session) return 1 ;;                                  # the chain cannot start
