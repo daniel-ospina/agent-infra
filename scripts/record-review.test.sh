@@ -2656,6 +2656,71 @@ assert_eq "$RECORD_RC" "0" "13m2 the clean template (issues FOUND then FIXED) st
 R13M2="$(cat "$(Q2 424746)" 2>/dev/null || true)"
 assert_contains "$R13M2" '"evidence":"comment:42474601"' "13m2 the clean review artifact is what the record names"
 
+  # 13n — THE PRECISION GUARD (agent-infra#1964). The loose `not...clean` arm is a substring search
+  # over PROSE, and prose about a review legitimately contains the phrase mid-sentence while a review
+  # of fail-closed code necessarily uses words like "failed"/"unresolved". Measured on tortoise#8866:
+  # a genuine CLEAN review whose body opens `**Outcome: CLEAN**` was REFUSED (rc 3) because a later
+  # sentence contained the phrase, parking a reviewed PR with a false "evidence could not be
+  # verified" diagnosis. When the artifact states an explicit `Outcome:`, that field IS its claim
+  # about the outcome, so the loose arm must not override it.
+  rm -f "$(Q2 424747)"
+  EV_REF="comment:42474701" run_record_ev 424747 STUB_EVIDENCE_BODY="### Code review
+
+**Outcome: CLEAN — no blocking issues found.**
+
+#### What I verified positively
+
+**The resolver keeps its fail-closed shape.** Both refusal paths land on the pre-existing handler,
+and an unresolved entity name is raised only from the recorder — this is not clean-up code, it is
+the guard itself.
+
+One test failed on origin/main and passes here."
+  assert_eq "$RECORD_RC" "0" "13n an explicit Outcome: CLEAN outranks prose mentioning not-clean/failed (rc 0)"
+  R13N="$(cat "$(Q2 424747)" 2>/dev/null || true)"
+  assert_contains "$R13N" '"evidence":"comment:42474701"' "13n the clean artifact is what the record names"
+
+  # 13n2 — THE EXPLOIT GUARD for 13n. Splitting the arms must NOT let a comment claim an outcome and
+  # still be an ABORTED review: the structural exit markers veto unconditionally, which is what keeps
+  # the tortoise#3549 hole closed.
+  rm -f "$(Q2 424748)"
+  EV_REF="comment:42474801" run_record_ev 424748 STUB_EVIDENCE_BODY="**Outcome: CLEAN — no blocking issues found.**
+
+⚠️ Auto-fix stalled after 3 cycles — 2 issues require human attention"
+  assert_eq "$RECORD_RC" "3" "13n2 Outcome: CLEAN does NOT override a structural abort marker (rc 3)"
+  [ ! -f "$(Q2 424748)" ] && ok "13n2 no record minted from an aborted review that also claims clean" || bad "13n2 minted a record from an aborted review"
+
+  # 13n3 — BACK-COMPAT. With NO `Outcome:` field nothing changes: the loose arm still refuses, so the
+  # precision fix cannot widen the fail-open for artifacts written in the older style.
+  rm -f "$(Q2 424749)"
+  EV_REF="comment:42474901" run_record_ev 424749 STUB_EVIDENCE_BODY="## Review — NOT CLEAN
+
+3 blocking issues remain."
+  assert_eq "$RECORD_RC" "3" "13n3 with no Outcome field the loose NOT-CLEAN arm still refuses (rc 3)"
+  [ ! -f "$(Q2 424749)" ] && ok "13n3 no record minted from a NOT-CLEAN artifact with no Outcome field" || bad "13n3 minted a record from a NOT-CLEAN artifact"
+
+  # 13n4 — THE MIXED-DECLARATION GUARD (found in review of this change). The `Outcome:` suppression
+  # makes arm 2 skippable, so a body declaring BOTH a clean and a NOT-CLEAN outcome would be
+  # accepted — the tortoise#3549 shape (§13f) for the price of one pasted line. Arm 1b vetoes
+  # DECLARATIONS unconditionally, in both orderings.
+  rm -f "$(Q2 424795)"
+  EV_REF="comment:42479501" run_record_ev 424795 STUB_EVIDENCE_BODY="**Outcome: CLEAN — no blocking issues found.**
+
+## Review — NOT CLEAN
+
+2 blockers found."
+  assert_eq "$RECORD_RC" "3" "13n4 Outcome: CLEAN does NOT suppress a DECLARED NOT-CLEAN header (rc 3)"
+  [ ! -f "$(Q2 424795)" ] && ok "13n4 no record minted from a body declaring both outcomes" || bad "13n4 minted a record declaring both outcomes"
+
+  # 13n5 — the same exploit in the OPPOSITE order (the declaration BEFORE the clean line).
+  rm -f "$(Q2 424796)"
+  EV_REF="comment:42479601" run_record_ev 424796 STUB_EVIDENCE_BODY="## Review — NOT CLEAN
+
+3 blocking issues remain.
+
+**Outcome: CLEAN** (copied from the template)"
+  assert_eq "$RECORD_RC" "3" "13n5 the declaration is caught in either order (rc 3)"
+  [ ! -f "$(Q2 424796)" ] && ok "13n5 no record minted regardless of the two lines' order" || bad "13n5 minted a record with the declaration first"
+
 # 13m3 — a SECOND unresolved-exit vocabulary the widened veto must cover: the
 # plan-review skill's block marker is "Requires Human Input", which the earlier
 # "require … human attention" pattern did NOT match (found in cycle 3 by reading
@@ -2907,8 +2972,11 @@ fi
 #     to POST the moment a -f/-F parameter is added, and this endpoint is
 #     GET-only, so `-f` without `-X GET` 404s — the exact defect this fix
 #     addresses (a dead rerun behind a false "gh/API failure" warning).
-if grep -E 'commits/.*/check-runs' "$LOG" | grep -q -- ' -f '; then
-    if grep -E 'commits/.*/check-runs' "$LOG" | grep -q -- '-X GET'; then
+#     NO PIPE INTO THE QUIET GREP: capture first, then classify the capture (#864). The piped
+#     form's upstream grep takes SIGPIPE when the quiet grep exits at its first match, and
+#     `pipefail` turns that 141 into a false "parameter absent" here.
+if grep -q -- ' -f ' <<<"$(grep -E 'commits/.*/check-runs' "$LOG" || true)"; then
+    if grep -q -- '-X GET' <<<"$(grep -E 'commits/.*/check-runs' "$LOG" || true)"; then
         ok "14.1b the check-runs read is an explicit GET (transport)"
     else
         bad "14.1b the check-runs read adds -f with NO -X GET → real gh POSTs → 404 (log: $(cat "$LOG"))"

@@ -419,6 +419,36 @@ reap_stale_workers() {
 }
 
 heartbeat() { date +%s > "$O/heartbeat"; }
+
+# ── THE POOL'S READ STATE, BESIDE THE BACKLOG (agent-infra#1931) ───────────────────────────────
+# ⛔ `backlog=0` ALONE IS THE READING THAT LET A CELL IDLE ALL EVENING WHILE HEALTHY. A refresh whose
+# pool listing FAILED leaves candidates.txt empty, and an empty file is byte-identical to a fleet
+# with nothing to do — measured 2026-10-17: 131 consecutive passes refused for an unreadable pool and
+# dispatched nothing, and every cycle line said `backlog=0`. refresh-candidates.sh records what its
+# last pool READ saw, and this prints it beside the backlog in the SAME vocabulary the refresh uses
+# (EMPTY / READ(n) / PARTIAL(<labels>) / UNREADABLE — one vocabulary, not a second one):
+#   EMPTY      the pool was read and is genuinely empty — the only answer that may mean "no work".
+#   READ(n)    the pool was read and listed n candidate(s).
+#   PARTIAL(x) some priority tiers could not be read (x) — a subset, never a complete pool.
+#   UNREADABLE the pool could not be read at all: the fleet is BLIND, which is not "nothing to do".
+# The age of the reading is part of the token, so a value frozen by a dead refresh cannot pass as a
+# fresh one (this is a STATE RECORD, and a state record with no age is a stale flag waiting to be
+# read as current). UNKNOWN means no pass has EVER recorded a read — never EMPTY, because the absence
+# of a measurement is not a measurement of emptiness. A torn or hand-edited file prints the state it
+# does carry, with no invented age.
+queue_state_token() {  # -> EMPTY(12s) / READ(7)(3m) / PARTIAL(P0-blocker)(2m) / UNREADABLE(9m) / UNKNOWN
+  local tok="" at="" now age
+  { read -r tok at < "$O/state/queue-state"; } 2>/dev/null || true
+  case "${tok:-}" in
+    EMPTY|UNREADABLE|READ\(*\)|PARTIAL\(*\)) ;;
+    *) printf 'UNKNOWN'; return 0 ;;
+  esac
+  is_num "${at:-}" || { printf '%s' "$tok"; return 0; }
+  now="$(date +%s)"; age=$(( now - at )); [ "$age" -lt 0 ] && age=0
+  if   [ "$age" -lt 90 ];   then printf '%s(%ss)' "$tok" "$age"
+  elif [ "$age" -lt 5400 ]; then printf '%s(%sm)' "$tok" "$(( age / 60 ))"
+  else                            printf '%s(%sh)' "$tok" "$(( age / 3600 ))"; fi
+}
 # Exact session-name test. `tmux has-session -t <name>` prefix-matches, so a guard for PR #82
 # would report "in flight" because `fix-820` exists — starving #82 while that worker lives.
 sess() { tmux ls -F '#{session_name}' 2>/dev/null | grep -qx "$1"; }
@@ -776,7 +806,7 @@ while true; do
   res_line   # MEASURE every resource; decide nothing from it
   reap_stale_workers
   L="$(load1)"
-  echo "=== $(date) load=$L lanes=$(tmux ls 2>/dev/null | grep -c '^lane-') backlog=$(wc -l < "$O/candidates.txt" | tr -d ' ') ===" >> "$LOG"
+  echo "=== $(date) load=$L lanes=$(tmux ls 2>/dev/null | grep -c '^lane-') backlog=$(wc -l < "$O/candidates.txt" | tr -d ' ') queue=$(queue_state_token) ===" >> "$LOG"
 
   # ---- 1) merge sweep (this box's open PRs) -------------------------------
   # scope: when the repo has >10 open PRs, help drain EVERYONE's (broad); otherwise just this box's.
@@ -1395,12 +1425,86 @@ PY
     while read -r ISS; do
       [ -z "${ISS:-}" ] && continue
       grep -qx "$ISS" "$O/dispatched.txt" 2>/dev/null && continue
+      # ── CLAIM THE ISSUE ACROSS BOXES BEFORE IT ENTERS THE BATCH (agent-infra#1850) ──────────
+      # `refresh-candidates.sh` certifies an issue CLEAN by reading the registry, but a
+      # certification is NOT a lock: it runs BEFORE the claim, so two boxes can both read CLEAN and
+      # both arrive here. The claim IS the lock — pushing a root commit to `refs/claims/issue-<N>`
+      # is an atomic CAS, so exactly one box wins and the loser is told which owner holds it.
+      #
+      # ⛔ CLAIMED HERE, NOT IN dispatch-merge.sh, so the bookkeeping stays honest: a REFUSED issue
+      # is not appended to `dispatched.txt` and not put in `.batch`, so it stays in `candidates.txt`
+      # and is simply re-attempted next cycle — no blacklist for the reaper to undo, and no lane, no
+      # worktree and no chain spawned for work another box already owns.
+      #
+      # ⛔ BOTH REFUSALS STOP THE DISPATCH — INCLUDING THE INFRA ONE (rc=2). claims.sh fails OPEN on
+      # an unreachable remote for a PR claim, because refusing there costs one merge; here the safe
+      # reading is the opposite: an UNREADABLE registry is not evidence of freedom, and dispatching
+      # on it is the exact duplicate this issue exists to remove.
+      # ⛔ ITS BLAST RADIUS IS THE FLEET, NOT THIS BOX — DO NOT SOFTEN THE REFUSAL ON THE ASSUMPTION
+      # THAT `gh` IS DOWN TOO (2026-10-16 review). This comment used to assert "the same outage fails
+      # the pre-flight's `gh` surfaces, so the cell is already stalled"; that is FALSE, and the
+      # regression case for it (`claim-unreachable`) disproves it with a WORKING gh stub: the
+      # registry read is `git ls-remote` — a GIT transport — while the pre-flight tool and the whole
+      # merge path use the `gh` REST API. A git-only failure (credentials, a ruleset, a transport
+      # block) therefore refuses every issue on EVERY box pointed at this repo, so nothing is queued
+      # and nothing is dispatched, while merges keep working. That is the intended direction (a
+      # registry outage must never become a duplicate dispatch), but it is a fleet-wide stop on
+      # dispatch and it must be visible: refresh-candidates.sh reports it in aggregate and exits
+      # non-zero, so the controller never reads it as "no work available".
+      #
+      # ⚠️ NO KILL-SWITCH. An ambient env var that turns this off is the "disable a gate by ambient
+      # env" shape (a bypass), so the ONLY fallback is a registry that is genuinely NOT PROVISIONED
+      # (no file at all), and it says so in the log every time it is used. ⛔ A registry that EXISTS
+      # but is too old to take a claim is NOT that case (2026-10-16 review): it is local drift on
+      # THIS box, and dispatching unclaimed while this same box's pre-flight refuses every issue as
+      # INCOMPLETE is a fail-open that can duplicate a peer's work — so it stops the dispatch, names
+      # the fix, and `refresh-candidates.sh --check` refuses the cell up front. Pre-flight and
+      # dispatch now take the SAME polarity on the same condition.
+      if [ -f "$O/claims.sh" ] && declare -f claim_issue_acquire >/dev/null 2>&1; then
+        if claim_issue_acquire "" "$ISS"; then
+          # The commit this box pushed, for the FENCED release. Written only on a successful acquire,
+          # so a refusal can never leave a release path pointing at someone else's claim.
+          claim_issue_record "$O" "$ISS" "${CLAIM_COMMIT:-}" \
+            || echo "[dispatch] ⚠️ #$ISS: could not record the claim commit — chain-merge.sh cannot FENCE the release (the claim will run to its lease)" >> "$LOG"
+        else
+          acq_rc=$?
+          # ⛔ rc=2 WITH A COMMIT IN HAND IS A RELEASE PATH, NOT JUST A REFUSAL (2026-10-16 review).
+          # claims.sh sets CLAIM_COMMIT on the create/reclaim paths whose push MAY have landed and
+          # only the read-back failed — its own comment says the caller can attempt a FENCED release,
+          # and merge-one.sh already does exactly that for the same condition. Discarding it here
+          # orphaned a claim THIS BOX created for the whole lease, with every peer reading the issue
+          # as taken: the abandoned-claim class this change exists to close.
+          if [ "$acq_rc" = "2" ] && [ -n "${CLAIM_COMMIT:-}" ]; then
+            claim_issue_record "$O" "$ISS" "$CLAIM_COMMIT" 2>/dev/null
+            if claim_issue_release_record "$O" "$REPO" "$ISS" "$CLAIM_COMMIT" >/dev/null 2>&1; then
+              echo "[dispatch] #$ISS NOT dispatched (claim infra error) — the claim commit this box may have pushed WAS released (fenced on $CLAIM_COMMIT)" >> "$LOG"
+            else
+              echo "[dispatch] #$ISS NOT dispatched — ${CLAIM_RESULT:-issue claim refused}; the possibly-created claim could NOT be released — it will expire with its lease" >> "$LOG"
+            fi
+          else
+            echo "[dispatch] #$ISS NOT dispatched — ${CLAIM_RESULT:-issue claim refused}" >> "$LOG"
+          fi
+          continue
+        fi
+      elif [ -f "$O/claims.sh" ]; then
+        # PRESENT BUT STALE — see the polarity note above. The box would have to dispatch unclaimed,
+        # which is the fail-open this branch now refuses.
+        echo "[dispatch] #$ISS NOT dispatched — \$O/claims.sh predates the issue key (no claim_issue_acquire), so this box cannot take the claim; fix: cp scripts/orchestrator-harness/*.sh ~/orchestrator/" >> "$LOG"
+        continue
+      else
+        echo "[dispatch] ⚠️ #$ISS: no claim registry at \$O/claims.sh — dispatching WITHOUT a cross-box claim (seed it: cp scripts/orchestrator-harness/*.sh ~/orchestrator/)" >> "$LOG"
+      fi
       echo "$ISS" >> "$O/.batch"; echo "$ISS" >> "$O/dispatched.txt"; K=$((K+1)); [ "$K" -ge "$BATCH" ] && break
     done < "$O/candidates.txt"
     if [ -s "$O/.batch" ]; then
       echo "[dispatch] load=$L lanes=$LANES -> $(tr '\n' ' ' < "$O/.batch")" >> "$LOG"
       bash "$O/dispatch-merge.sh" "$REPO" "$OR" $(tr '\n' ' ' < "$O/.batch") >> "$LOG" 2>&1
-    else echo "[dispatch] backlog empty" >> "$LOG"; fi
+    # ⛔ "backlog empty" IS A CLAIM, NOT A NEUTRAL FACT (agent-infra#1931). On its own it reads as
+    # "the fleet has nothing to do", but the SAME line is printed when the refresh could not read the
+    # pool at all — that is how a blind box idled all evening looking healthy. The state travels with
+    # it, in the refresh's own vocabulary: `queue=EMPTY` is the only form that means "no work";
+    # `queue=UNREADABLE`/`PARTIAL(..)` means "the last pool read did not establish an empty pool".
+    else echo "[dispatch] backlog empty queue=$(queue_state_token)" >> "$LOG"; fi
   else
     echo "[dispatch] skipped ($GATE_WHY) lanes=$LANES workers=$WORKERS" >> "$LOG"
   fi
@@ -1422,11 +1526,26 @@ PY
       # Capture rc: 3 is refresh-candidates.sh's NOT_PROVISIONABLE code — permanent, so retrying
       # cannot help; record it and stop re-spawning. Any OTHER non-zero is transient (network, a
       # failed listing) and IS retried next cycle.
+      # ⛔ BOUND THE EVIDENCE TO THIS RUN. $LOG is append-only and never rotated, so a bare
+      # `grep NOT PROVISIONABLE "$LOG"` would quote a PREVIOUS cycle's refusal as this block's
+      # "verbatim" reason — presenting a cause that no longer fired (#1853 review).
+      # The mark is a LINE index, and the `echo` above has just terminated any partial tail.
+      log_mark="$(awk 'END{print NR}' "$LOG" 2>/dev/null)"; [ -n "$log_mark" ] || log_mark=0
       ( bash "$O/refresh-candidates.sh" 6 >> "$LOG" 2>&1; rc=$?
         rm -rf "$O/.refresh.lock"
         if [ "$rc" -eq 3 ]; then
           echo "[refresh] BLOCKED (permanent): this repo cannot be provisioned for dispatch — see the reason above. Not retrying (agent-infra#1736); fix it, then delete $O/.refresh-blocked" >> "$LOG"
-          echo "MERGE-ONLY: this repo cannot be provisioned for dispatch (agent-infra#1736) — no implementation lane will be dispatched until this is fixed. Reason and evidence: $LOG (search 'NOT PROVISIONABLE'). Fix: put TORTOISE_REPO=<a tortoise checkout> in keys.env (the controller session re-sources it; an ambient export does not reach a pre-existing tmux server), or vendor tools/collision_preflight.py into the repo — then delete this file and re-run 'check'." > "$O/.refresh-blocked"
+          # The reason is quoted from the refresh's OWN refusal, not restated here: a marker that
+          # hardcodes one remedy is a FALSE remedy for the other causes the same rc=3 now covers
+          # (no pre-flight tool, an unauthenticated gh in an unusable HOME, an interpreter older
+          # than the tool's minimum). Only the refresh knows which one fired.
+          {
+            echo "MERGE-ONLY: dispatch provisioning is BLOCKED — no implementation lane will be dispatched until this is fixed."
+            echo "Reason and evidence (the refresh's own refusal, verbatim):"
+            tail -n +"$((log_mark + 1))" "$LOG" 2>/dev/null | grep 'NOT PROVISIONABLE' | tail -3 | sed 's/^/  /'
+            echo "Those lines name the failing link; the knobs are TORTOISE_REPO=<a tortoise checkout> in keys.env (the controller session re-sources it; an ambient export does not reach a pre-existing tmux server), a vendored tools/collision_preflight.py in the repo, SCOUT_PY=<a Python >= 3.12>, or a writable, gh-authenticated HOME."
+            echo "After fixing it, delete this file. The refresh re-writes it, with the current reason, if the cause persists."
+          } > "$O/.refresh-blocked"
         elif [ "$rc" -ne 0 ]; then
           echo "[refresh] FAILED rc=$rc (transient — retried next cycle)" >> "$LOG"
         fi ) &

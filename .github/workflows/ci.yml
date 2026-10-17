@@ -255,7 +255,7 @@ jobs:
         # blindness flag and on the objective cache's freshness were pinned by suites
         # CI could not execute. A suite the repo does not RUN is a suite it does not
         # HAVE — naming them is the half of the landing that makes the other half count.
-        run: python3.12 -m pytest scripts/test_parallel_work_check.py tests/test_ci_exemption.py tests/test_ci_exemption_producer.py scripts/test_lane_status.py scripts/test_lane_actions.py scripts/test_lane_watchdog.py scripts/test_admin_merge_head.py scripts/test_objective.py scripts/test_turn_classify_state.py -x --timeout=60 -q
+        run: python3.12 -m pytest scripts/test_parallel_work_check.py tests/test_ci_exemption.py tests/test_ci_exemption_producer.py scripts/test_lane_status.py scripts/test_lane_actions.py scripts/test_lane_watchdog.py scripts/test_admin_merge_head.py scripts/test_objective.py scripts/test_turn_classify_state.py scripts/test_pr_doctor.py -x --timeout=60 -q
 
   verify:
     # #1349 — the pytest half MOVED to the `test` job above, so that the PR lane
@@ -322,6 +322,35 @@ jobs:
         # catch it. python3 + bash only; its own step so one
         # verdict cannot suppress the other (same rule as every suite here).
         run: python3.12 tools/fleet/lane_liveness.test.py
+      - name: Successor-preflight suite (#1317, zero-dep)
+        # #1317 — a successor lane was dispatched to a unit whose predecessor was
+        # live and mid-review, on a state assertion ("out of context") nobody had
+        # read from an artifact. `tools/fleet/successor_preflight.py` proves the
+        # predecessor GONE before a dispatch is written, and appends the proof to
+        # the dispatch file. Zero-dep by construction: a standalone script that
+        # drives the tool as a subprocess against temp fixtures with hermetic
+        # pgrep/lsof/cmux/ps/date shims, and reuses the #1178 predicate
+        # (lane_liveness.verdict_for) rather than re-deriving liveness. Its own
+        # step, and it carries a RED control: nine mutations of the shipped file
+        # (drop the live-process check / the live-lane check / the recent-cmux
+        # check, turn an unreadable store or process read into GONE, drop the
+        # realpath normalisation, ignore the cmux recency window, match cmux rows
+        # without their cwd, call every lane dead) must each turn their paired
+        # leg RED. Unwired in CI a suite is inert by never running, so this is
+        # how the preflight is actually executed on every PR.
+        # VISIBLE, not merge-blocking: `pipeline-compliance` is the repo's only
+        # required check (#646), and there is NO post-merge backstop for this
+        # suite today — ci-main.yml's script-validate job runs bash shards only
+        # (no python3.12 step), so a red here is a signal, not a block (the
+        # successor reuses lane_liveness.verdict_for, whose library IS exercised
+        # post-merge by the reaper's own suite).
+        run: python3.12 tools/fleet/successor_preflight.test.py
+      - name: Successor-preflight mutation evidence (#1317, zero-dep)
+        # The suite above is only a pin if it can FAIL. A mutation whose paired
+        # leg still passes is reported as a suite failure. Its own step, not a
+        # second command in the step above — sequencing would suppress one
+        # verdict when the other fails (the same rule as every suite here).
+        run: python3.12 tools/fleet/successor_preflight.test.py --red-control
       - name: Sequence-enforcer suite (incl. joint checker→enforcer test)
         run: npx tsx extensions/sequence-enforcer/sequence-enforcer.test.ts
       - name: Kill-switch / session-escape suite (#1419)
@@ -407,6 +436,16 @@ jobs:
         # The blocking backstop is ci-main.yml's extension-tests job, same
         # split as sequence-enforcer above.
         run: npx tsx extensions/loop-enforcer/tier-config-parity.test.ts
+      - name: Loop-enforcer termination layers (#847 — L3 stall predicates)
+        # Zero-dep: the suite's only import is `./termination.ts`, which has no
+        # imports at all — no `node:` modules, no packages — so it MUST run
+        # here, in the job that performs no `npm ci`. Before #847 this suite
+        # was wired NOWHERE —
+        # the inverted L3 fingerprint predicate was invisible to CI, and its one
+        # vacuous fixture passed through the plateau branch. The anti-vacuity
+        # pins (direction, superset recurrence, threshold boundary, window
+        # position) are worth nothing if nothing runs them.
+        run: npx tsx extensions/loop-enforcer/termination.test.ts
       - name: Shipped-default failover coverage pin (#715)
         # VISIBLE but NOT merge-blocking here: the repo's only required status
         # check is `pipeline-compliance`. The BLOCKING backstop is the
@@ -465,6 +504,21 @@ jobs:
         # check, #646); the BLOCKING backstop is the post-merge ci-main.yml
         # `extensions/shared/*.test.ts` glob, which picks this file up too.
         run: npx tsx extensions/shared/load-scale-contract.test.ts
+      - name: Task-run record + retention suite (#1662, zero-dep)
+        # #1662 — extensions/shared/task-runs.ts imports `node:*` ONLY, so its
+        # suite runs in THIS job (the job that performs no `npm ci`), like the
+        # loop-enforcer and load-scale suites around it. VISIBLE, not
+        # merge-blocking: `pipeline-compliance` is the repo's only required
+        # check (#646), so the BLOCKING backstop remains the post-merge
+        # ci-main.yml `extensions/shared/*.test.ts` glob. Its own step on
+        # purpose — a `&&` chain would let one suite's failure suppress the
+        # other's verdict — and NOT appended to the `test-command` accumulator
+        # above, which check-pi-pin-lockstep.mjs (guard (j)) pins byte-exactly.
+        # What this step buys is that the durable-run-record contract (atomic
+        # writes, path gate, retention dry-run, collect idempotence) FAILS
+        # where the author can see it before merge, instead of only after it
+        # (#1250: a suite wired only into ci-main.yml runs post-merge).
+        run: npx tsx extensions/shared/task-runs.test.ts
       - name: main-worktree-guard module-LOAD regression (#744)
         # The guard's bash-git classifier lost its LATER bindings SILENTLY in
         # every session from #697 until #744 (five rename-destructuring targets

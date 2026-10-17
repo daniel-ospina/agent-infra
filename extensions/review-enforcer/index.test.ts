@@ -46,6 +46,7 @@ import {
   parseDiffHashHelperOutput,
   _setPrDiffHashOverride,
   hasAdminMergeFlag,
+  withoutMandatedRailPath,
   isGhPrMergeCommand,
   isAdminMergeCommand,
   mergeVerbInText,
@@ -1534,6 +1535,107 @@ testAsync("task dispatches are audited per-event and the count survives across g
         equal(dispatchLines[0].dispatch_count, 1);
         equal(dispatchLines[1].dispatch_count, 2);
         equal(dispatchLines[0].extension, "review-enforcer");
+      } finally {
+        process.env.PI_MODE = prevMode;
+      }
+    });
+  });
+});
+
+testAsync("#1662: a background dispatch is not counted until its terminal task_collect", async () => {
+  await withTempHome(async () => {
+    await withMarkerIsolated(async () => {
+      const prevMode = process.env.PI_MODE;
+      process.env.PI_MODE = "print";
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      try {
+        await fire("session_start");
+
+        const blocked = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+        ok(blocked && blocked.block === true, "blocked without dispatches");
+
+        // A `task({ background: true })` result fires at DISPATCH — the reviewer
+        // is still running, so it must not satisfy the dispatch gate.
+        await fire("tool_result", { toolName: "task", details: { background: true, status: "running" } });
+        const stillBlocked = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+        ok(stillBlocked && stillBlocked.block === true, "a background dispatch must NOT count as a completed reviewer");
+
+        // A not-finished collect is still not a verdict.
+        await fire("tool_result", { toolName: "task_collect", details: { terminal: false } });
+        const b2 = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+        ok(b2 && b2.block === true, "a not-finished collect must NOT count");
+
+        // The terminal collect is the reviewer's completion — now it counts.
+        await fire("tool_result", { toolName: "task_collect", details: { terminal: true, status: "done" } });
+        const allowed = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+        equal(allowed, undefined, "the terminal collect satisfies the ≥1-dispatch gate");
+      } finally {
+        process.env.PI_MODE = prevMode;
+      }
+    });
+  });
+});
+
+testAsync("#1662 review: re-collecting the SAME terminal task_collect is counted once", async () => {
+  await withTempHome(async () => {
+    await withMarkerIsolated(async () => {
+      const prevMode = process.env.PI_MODE;
+      process.env.PI_MODE = "print";
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      try {
+        await fire("session_start");
+
+        // A background dispatch returns at DISPATCH — not counted.
+        await fire("tool_result", { toolName: "task", details: { background: true, status: "running" } });
+
+        // The verdict is reaped — counted once.
+        await fire("tool_result", { toolName: "task_collect", details: { terminal: true, status: "done", run_id: "RUN-A" } });
+
+        // The SAME finished lane is re-collected (`task_collect` is idempotent).
+        await fire("tool_result", { toolName: "task_collect", details: { terminal: true, status: "done", run_id: "RUN-A" } });
+
+        // The durable per-event audit count must not be inflated by the repeat.
+        const dispatchLines = readAuditLines(auditLogPath()).filter((l) => l.event === "review_dispatch");
+        equal(dispatchLines.length, 1, "the same run is counted exactly once");
+        equal(dispatchLines[0].dispatch_count, 1, "the running total reflects one real dispatch");
+      } finally {
+        process.env.PI_MODE = prevMode;
+      }
+    });
+  });
+});
+
+testAsync("#1662 review: a refused background dispatch is not counted as a completed reviewer", async () => {
+  await withTempHome(async () => {
+    await withMarkerIsolated(async () => {
+      const prevMode = process.env.PI_MODE;
+      process.env.PI_MODE = "print";
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      try {
+        await fire("session_start");
+
+        const blocked = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+        ok(blocked && blocked.block === true, "blocked without dispatches");
+
+        // A pre-spawn refusal (`cwd` names a file) is built BEFORE the
+        // background branch: its details carry `status: "invalid-cwd"` but no
+        // `details.background`. Only the tool INPUT is marked background, and a
+        // refusal spawned no child — it must not satisfy the ≥1-dispatch gate
+        // (#1662 review).
+        await fire("tool_result", {
+          toolName: "task",
+          input: { background: true, cwd: "package.json" },
+          details: { model: "m", provider: "p", status: "invalid-cwd", retryable: false, error: "bad cwd" },
+        });
+
+        const stillBlocked = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+        ok(stillBlocked && stillBlocked.block === true, "a refused background dispatch must NOT satisfy the dispatch gate");
+
+        const dispatchLines = readAuditLines(auditLogPath()).filter((l) => l.event === "review_dispatch");
+        equal(dispatchLines.length, 0, "a refused background dispatch must not enter the review_dispatch audit trail");
       } finally {
         process.env.PI_MODE = prevMode;
       }
@@ -5625,6 +5727,141 @@ testAsync("#1776: the #1775 command is ALLOWED once the session has dispatched (
       equal(res, undefined, "…and the command is NOT blocked (the false positive #1776 removed)");
       ok(String(ev.input.command).startsWith("export PATH="),
         "…with the argv layer on PATH, which is what decides the admin-merge question for it");
+    } finally {
+      _setRunGhOverride(null);
+      if (prevShim === undefined) delete process.env.AGENT_GH_SHIM; else process.env.AGENT_GH_SHIM = prevShim;
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+    }
+  });
+});
+
+// ── #1203 — the mandated rail is not a merge, and its path is not a flag ─────
+// `scripts/admin-merge.sh` is the route this gate's OWN refusal tells a caller to
+// take, and its FILENAME spells `admin` (rule 2's construct-plus-`admin` read) and
+// `merge`. So a command that merely INVOKES the rail was read as an admin merge and
+// refused for carrying no resolvable PR number — including both spellings the issue
+// reports verbatim. The literal `bash scripts/admin-merge.sh 3891` was never gated,
+// so the old behaviour was an inconsistency between two spellings of one COMPLIANT
+// route, not a control.
+section("#1203 — the mandated rail's own path is neutralized before the scan");
+
+const RAIL = "$AGENT_INFRA_PATH/scripts/admin-merge.sh";
+
+test("#1203: withoutMandatedRailPath replaces the basename, preserves LENGTH, and is boundary-tight", () => {
+  const cmd = `for pr in 3891; do bash ${RAIL} $pr; done`;
+  const out = withoutMandatedRailPath(cmd);
+  equal(out.length, cmd.length,
+    "LENGTH-preserving: `isAdminMergeCommand` slices the ORIGINAL command with scanTokens' offsets");
+  ok(!/admin-merge\.sh/.test(out), "the mandated basename is gone");
+  ok(!/admin|merge/i.test(out), "…so neither trigger word survives");
+  ok(out.includes("$AGENT_INFRA_PATH/scripts/railscriptname"),
+    "the path prefix and its shell construct are left in place");
+  equal(withoutMandatedRailPath(out), out, "idempotent");
+  // Boundary-tight: a LOOKALIKE path is a different file and must not be exempted.
+  equal(withoutMandatedRailPath("bash scripts/admin-merge.sh.bak 1"),
+    "bash scripts/admin-merge.sh.bak 1", "`.sh.bak` is untouched");
+  equal(withoutMandatedRailPath("bash scripts/my-admin-merge.sh 1"),
+    "bash scripts/my-admin-merge.sh 1", "a differently-named script is untouched");
+});
+
+test("#1203: the rail invocation is NOT gate-relevant in every spelling a lane writes", () => {
+  for (const cmd of [
+    `bash ${RAIL} 3891`,
+    `bash ${RAIL} 3891 --squash`,
+    // The issue's two verbatim repros: alone with a lane-resolved path, and in a loop.
+    `for pr in 3891; do bash ${RAIL} $pr; done`,
+    // …and the sibling the same defect produces: the rail in a call that ALSO carries
+    // another `gh` command, whose bare `gh` word armed the construct fallback.
+    `gh run list --limit 1; bash ${RAIL} 3891`,
+    "bash scripts/admin-merge.sh 3891", // the literal spelling was never gated
+    "bash /abs/agent-infra/scripts/admin-merge.sh 3891",
+    // The one catch this DELIBERATELY drops, named rather than left to be re-found:
+    // `--admin` handed to the RAIL as an ARGUMENT. The old read caught it only because
+    // the path spelled `merge` — the LITERAL spelling had the SAME predicate values
+    // and was never gated — and the rail accepts and drops that flag
+    // (`admin-merge.sh:5193`), adding `--admin` itself with the head-bound evidence
+    // this gate exists to require.
+    `bash ${RAIL} 999 --admin`,
+    "bash scripts/admin-merge.sh 999 --admin",
+  ]) {
+    ok(!isGitOp(cmd), `not gate-relevant: ${cmd}`);
+    ok(!isAdminMergeCommand(cmd), `…and not an admin merge: ${cmd}`);
+  }
+  equal(isGitOp(`bash ${RAIL} 999 --admin`), isGitOp("bash scripts/admin-merge.sh 999 --admin"),
+    "…and the `$`-path and literal spellings now AGREE (the literal one was never gated)");
+});
+
+test("#1203: a REAL merge in the same call is still refused — the fix removes a false signal, not a catch", () => {
+  // Each arm pairs a rail invocation with a merge the gate must still see. The arms
+  // with the rail BEFORE the verb are what pin the length-preserving property: a
+  // substitution that shortened the path would shift the post-`merge` offset and stop
+  // reading the `$`-bearing flag slot (a fail-open manufactured by the fix itself).
+  for (const cmd of [
+    `bash ${RAIL} 1; gh pr merge 999 --admin`,
+    `${RAIL} 1 && V=--admin; gh pr merge 999 $V`,
+    `for pr in 1; do bash ${RAIL} $pr; done; gh pr merge 999 $'--admin'`,
+    `bash ${RAIL} 1; gh pr m$'erge' 999 $V`,
+    `bash ${RAIL} 1; gh pr merge 999 $V`,
+    `bash ${RAIL} 1; gh pr merge 999 x$V`,
+    `gh pr merge 999 $V; bash ${RAIL} 1`,
+  ]) {
+    ok(isGitOp(cmd), `gate-relevant: ${cmd}`);
+    ok(isAdminMergeCommand(cmd), `…and read as an admin merge: ${cmd}`);
+  }
+  equal(extractMergePrNumber(`bash ${RAIL} 1; gh pr merge 999 $V`), 999,
+    "…with the PR still resolved from the ORIGINAL text, not the neutralized text");
+});
+
+testAsync("#1203: the reported repro is ALLOWED end-to-end (loop, and beside another gh call)", async () => {
+  await withTempHome(async () => {
+    const prevShim = process.env.AGENT_GH_SHIM;
+    const prevMode = process.env.PI_MODE;
+    delete process.env.AGENT_GH_SHIM; // the argv layer IS installed (default posture)
+    process.env.PI_MODE = "print";
+    // A failing gh probe: if the admin gate ran at all, its head lookup would fail and
+    // it would BLOCK. Reaching `undefined` therefore means it did NOT run.
+    _setRunGhOverride(() => { throw ghError("gh: could not resolve host github.com"); });
+    try {
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      await fire("session_start");
+      for (const cmd of [
+        `for pr in 3891; do bash ${RAIL} $pr; done`,
+        `gh run list --limit 1; bash ${RAIL} 3891`,
+      ]) {
+        const ev = { toolName: "bash", input: { command: cmd } };
+        const res = await fire("tool_call", ev);
+        equal(res, undefined, `not refused: ${cmd}`);
+        ok(String(ev.input.command).startsWith("export PATH="),
+          "…with the argv layer still injected (the handler ran, then declined)");
+      }
+      ok(!tempAuditLines().some((l) => l.event === "merge_gate_block"),
+        "…and no admin-merge block is audited for either");
+    } finally {
+      _setRunGhOverride(null);
+      if (prevShim === undefined) delete process.env.AGENT_GH_SHIM; else process.env.AGENT_GH_SHIM = prevShim;
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+    }
+  });
+});
+
+testAsync("#1203: a real admin merge BESIDE a rail invocation is still refused end-to-end", async () => {
+  await withTempHome(async () => {
+    const prevShim = process.env.AGENT_GH_SHIM;
+    const prevMode = process.env.PI_MODE;
+    delete process.env.AGENT_GH_SHIM; // the argv layer IS installed
+    process.env.PI_MODE = "print";
+    _setRunGhOverride(adminGh("4".repeat(40), [])); // a real head, NO evidence comment
+    try {
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      await fire("session_start");
+      const cmd = `bash ${RAIL} 1; gh pr merge 999 --admin`;
+      const res = await fire("tool_call", { toolName: "bash", input: { command: cmd } });
+      ok(res && res.block === true, "still BLOCKED");
+      ok(tempAuditLines().some(
+        (l) => l.event === "merge_gate_block" && l.reason === "admin_merge_no_evidence"),
+        "…by the EVIDENCE gate, by its durable audit tag");
     } finally {
       _setRunGhOverride(null);
       if (prevShim === undefined) delete process.env.AGENT_GH_SHIM; else process.env.AGENT_GH_SHIM = prevShim;

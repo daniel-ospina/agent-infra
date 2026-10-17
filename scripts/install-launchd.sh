@@ -342,7 +342,10 @@ retired_labels() {
 }
 
 is_retired() { # $1 = label → 0 when it is listed in RETIRED
-    retired_labels | grep -qxF -- "$1"
+    # Capture, then grep a here-string — never `retired_labels | grep -q`: under
+    # `pipefail` the label producer takes SIGPIPE when `grep` exits at its first match,
+    # and a false negative here installs a RETIRED launchd job (#864).
+    grep -qxF -- "$1" <<<"$(retired_labels || true)"
 }
 
 retire_job() { # $1 = label; unload + remove when installed (silent when gone)
