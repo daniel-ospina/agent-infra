@@ -1070,6 +1070,74 @@ async function partB() {
     delete process.env.PI_SESSION_ID;
     expectTrue("B11d: removing the marker re-arms M5",
       blocked(await bash("git checkout -- dirty.txt", wt)), "was allowed");
+
+    // ── B13 (#1125): a `cat-file-revert` HINT with NO write surface is NOT a
+    // discard — the sanctioned read-only triage tool must be RUNNABLE ──
+    //
+    // The form models "committed content reproduced onto its own path"
+    // (`git show HEAD:x > x`); the handler intersects the hint with the
+    // command's bash write targets for exactly that reason. With NO write
+    // target there is nowhere for the content to land. The fail-closed arm on
+    // an UNRESOLVABLE pathspec ran BEFORE that intersection, so a purely
+    // read-only probe whose path is a loop variable was refused:
+    // `scripts/stale-main-triage.sh` (the sanctioned diagnosis tool) could not
+    // be run by an agent, and the 2026-09-17 fleet-durability sweep hit the
+    // same construct in three repos. The negative controls below are the pins
+    // that this is an ordering fix, NOT a relaxation of the discard gate.
+    //
+    // The triage tool, driven on the DIRTY hub state it exists to diagnose
+    // (M4 is active there too — its git surface is read-only, so it must pass
+    // BOTH gates).
+    write(join(hub, "dirty.txt"), "MUTANT-HUB\n");
+    const triage = join(HERE, "..", "..", "scripts", "stale-main-triage.sh");
+    const triageRun = await bash(`bash "${triage}" --repo "${hub}"`, hub);
+    expectTrue("B13a (#1125): the sanctioned read-only triage tool RUNS on a dirty hub (was: `the target pathspec is not statically resolvable`)",
+      allowed(triageRun), `reason=${JSON.stringify(triageRun?.reason ?? "").slice(0, 240)}`);
+    // The sweep's shape: a per-file read-only existence probe inside a loop.
+    expectTrue("B13b (#1125): a `for`-loop `git cat-file -e \"origin/$ref:$f\"` probe (no write surface) is ALLOWED",
+      allowed(await bash(`for f in clean.txt; do git cat-file -e "origin/main:$f" || echo "not in origin"; done`, wt)),
+      "was blocked — a read-only existence probe is not a discard");
+    // Negative control 1: the SAME invocation WITH a landing redirect is still a
+    // real revert and must stay blocked (the loop variable makes the hint
+    // unresolvable, so this exercises the fail-closed arm the fix narrowed).
+    write(join(wt, "dirty.txt"), "MUTANT\n");
+    expectTrue("B13c (control): `for f in …; do git cat-file -e \"HEAD:$f\" > \"$f\"; done` is STILL BLOCKED (a write surface exists)",
+      blocked(await bash(`for f in dirty.txt; do git cat-file -e "HEAD:$f" > "$f"; done`, wt)),
+      "was allowed — the committed content lands on a write target");
+    // Negative control 2: a RESOLVABLE hint that lands on its own path is
+    // unchanged (`git show HEAD:x > x` — the form's core case).
+    expectTrue("B13d (control): a resolvable hint that lands on its own path (`git show HEAD:dirty.txt > dirty.txt`) is STILL BLOCKED",
+      blocked(await bash("git show HEAD:dirty.txt > dirty.txt", wt)),
+      "was allowed — the discard gate was relaxed");
+    // Negative control 3: a resolvable hint with NO write surface stays allowed
+    // (unchanged pre-existing behaviour — the fix only aligns the unresolvable
+    // case with it).
+    expectTrue("B13e (control): a resolvable hint with no write surface (`git cat-file -e HEAD:dirty.txt`) stays ALLOWED",
+      allowed(await bash("git cat-file -e HEAD:dirty.txt", wt)),
+      "was blocked — the fix over-tightened");
+
+    // ── B14 (#1125): the M4 block NAMES the disordered checkout + condition ──
+    // `"the shared main checkout"` was ambiguous across a machine with several
+    // checkouts: it sent two agents to the wrong repository for ~40 minutes and
+    // produced a destructive-command request against a healthy repo, because
+    // the disorder was in a DIFFERENT (unnamed) checkout. The hub is DIRTY
+    // right now (B13a), on main → the block must print `off-main`/`dirty` with
+    // the ABSOLUTE path, on BOTH the bash route and the write/edit route.
+    const bashMsg = (await bash("git commit -m x", hub))?.reason ?? "";
+    expectTrue("B14a: the bash-route M4 block NAMES the checkout and its resolved condition",
+      bashMsg.includes(`   Checkout: ${hub} (`) && bashMsg.includes("dirty: 1 path(s)"),
+      `reason=${JSON.stringify(bashMsg).slice(0, 260)}`);
+    process.chdir(hub);
+    let writeBlock;
+    try { writeBlock = await toolCall({ toolName: "write", input: { path: join(hub, "clean.txt") } }, undefined); }
+    finally { process.chdir(prevCwd); }
+    const writeMsg = writeBlock?.reason ?? "";
+    expectTrue("B14b: the write/edit-route M4 block NAMES the checkout too (same ambiguity, same fix)",
+      !!writeBlock?.block && writeMsg.includes(`   Checkout: ${hub} (`) && writeMsg.includes("dirty: 1 path(s)"),
+      `reason=${JSON.stringify(writeMsg).slice(0, 260)}`);
+
+    execSync("git checkout -q -- dirty.txt", { cwd: wt, stdio: "ignore" });
+    execSync("git checkout -q -- dirty.txt && git clean -qfd", { cwd: hub, stdio: "ignore" });
   } catch (e) {
     expectTrue("B: part B ran without throwing", false, String(e?.message ?? e).slice(0, 240));
   } finally {
