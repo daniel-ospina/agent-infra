@@ -60,7 +60,7 @@ ck "fix-one.sh truly REFUSES (exit 78 + FATAL) with no helper beside it — driv
 
 # ⛔ SOURCED AFTER `export PATH`. spawn-gate.sh resolves `_NCPU` at SOURCE time through
 # sysctl/nproc/getconf, so a caller that sources it above its PATH export pins _NCPU=4 and
-# MAX_LOAD=40 on every cell — the #1702 failure the portable probe exists to prevent.
+# MAX_LOAD=32 on every cell — the #1702 failure the portable probe exists to prevent.
 for f in lane.sh fix-one.sh; do
   src="$(grep -n 'spawn-gate.sh"' "$HERE/$f" | head -1 | cut -d: -f1)"
   pexp="$(grep -n '^export PATH=' "$HERE/$f" | head -1 | cut -d: -f1)"
@@ -180,7 +180,7 @@ for bad in "08" "abc" "" "9223372036854775807" " 5"; do
   ck "MAX_LOAD='$bad' is coerced to a usable integer (got '${got:-<empty>}')" $rc
 done
 # ... and the derived default uses the PORTABLE probe, not `|| echo 4` (which pinned every Linux
-# cell to 4 cores / MAX_LOAD=40, #1702).
+# cell to 4 cores / MAX_LOAD=32, #1702).
 want_ncpu="$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
 got="$(env -u MAX_LOAD bash -c '. "$1"; printf "%s" "$MAX_LOAD"' _ "$GATE" 2>/dev/null)"
 [ "$got" = "$(( 10#$want_ncpu * 10 ))" ]; rc=$?

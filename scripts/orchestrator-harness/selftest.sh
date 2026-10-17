@@ -2265,7 +2265,7 @@ grep -q 'nproc 2>/dev/null' "$INST" && rc=0 || rc=1
 ck "install.sh derives _NCPU portably too (its MAX_LOAD must match the loop's on any host)" $rc
 # ⛔ AND install.sh MUST CARRY THE SAME GUARD (P3, third review round, 2026-10-14). orch-loop.sh
 # coerces `_NCPU` on the line above its only read; install.sh had NO is_num at all, so a `sysctl`
-# that SUCCEEDS while printing garbage (or empty) made `$(( 10#$_NCPU * 10 ))` a syntax error that
+# that SUCCEEDS while printing garbage (or empty) made `$(( 10#$_NCPU * 8 ))` a syntax error that
 # ABORTS the installer mid-run under `set -euo pipefail` — instead of falling back to 4 as the loop
 # does. Extract the shipped lines and DRIVE them with a sysctl stub: a missing guard is a hard
 # failure, not a cosmetic difference from the loop. Red on the pre-fix install.sh.
@@ -2278,32 +2278,32 @@ sed -n '/^_NCPU=/,/^is_limit "${MAX_LOAD:-}"/p' "$INST" > "$TMP/ncpu-inst.sh"
 if need "$TMP/ncpu-inst.sh" "install.sh's _NCPU + MAX_LOAD lines are extracted"; then
   { echo 'set -euo pipefail'; echo 'sysctl() { echo garbage; }'; cat "$TMP/ncpu-inst.sh"; printf 'printf "%%s" "$MAX_LOAD"'; } > "$TMP/ncpu-drive.sh"
   _nout="$(bash "$TMP/ncpu-drive.sh" 2>&1)"; _nrc=$?
-  [ "$_nrc" -eq 0 ] && [ "$_nout" = "40" ] && rc=0 || { rc=1; echo "      install.sh _NCPU guard -> rc=$_nrc out='$_nout'"; }
+  [ "$_nrc" -eq 0 ] && [ "$_nout" = "32" ] && rc=0 || { rc=1; echo "      install.sh _NCPU guard -> rc=$_nrc out='$_nout'"; }
   ck "install.sh falls back to 4 cores when sysctl succeeds but prints garbage (no arithmetic abort)" $rc
   # Non-vacuity: the stub really is the value being consulted, and a good one is still honoured.
   { echo 'set -euo pipefail'; echo 'sysctl() { echo 12; }'; cat "$TMP/ncpu-inst.sh"; printf 'printf "%%s" "$MAX_LOAD"'; } > "$TMP/ncpu-drive2.sh"
   _nout2="$(bash "$TMP/ncpu-drive2.sh" 2>&1)"
-  [ "$_nout2" = "120" ] && rc=0 || { rc=1; echo "      a GOOD sysctl=12 gave '$_nout2', expected 120"; }
-  ck "install.sh still derives MAX_LOAD from a good _NCPU (12 cores -> 120)" $rc
+  [ "$_nout2" = "96" ] && rc=0 || { rc=1; echo "      a GOOD sysctl=12 gave '$_nout2', expected 96"; }
+  ck "install.sh still derives MAX_LOAD from a good _NCPU (12 cores -> 96)" $rc
   # ⛔ THE PRODUCTION PATH'S OWN WRAP (P3, fifth review round, 2026-10-14). install.sh substitutes
   # __MAX_LOAD__ into the LIVE plist, so an absurd-but-numeric `_NCPU` here — not in the loop — was
   # the one that actually wrote `MAX_LOAD=0` into a running box. 2**63 * 10 wraps to exactly 0 and
   # every guard accepts 0, so this is RED on the pre-fix install.sh (which had is_num only).
   { echo 'set -euo pipefail'; echo 'sysctl() { echo 9223372036854775808; }'; cat "$TMP/ncpu-inst.sh"; printf 'printf "%%s" "$MAX_LOAD"'; } > "$TMP/ncpu-drive3.sh"
   _nout3="$(bash "$TMP/ncpu-drive3.sh" 2>&1)"
-  [ "$_nout3" = "40" ] && rc=0 || { rc=1; echo "      install.sh _NCPU=2**63 -> plist MAX_LOAD='$_nout3', expected 40 (not 0)"; }
+  [ "$_nout3" = "32" ] && rc=0 || { rc=1; echo "      install.sh _NCPU=2**63 -> plist MAX_LOAD='$_nout3', expected 32 (not 0)"; }
   ck "install.sh bounds an absurd _NCPU so the plist cannot get MAX_LOAD=0 (would dispatch nothing)" $rc
   # A 0-valued probe is a failed probe: the same guard as the loop's.
   { echo 'set -euo pipefail'; echo 'sysctl() { echo 0; }'; cat "$TMP/ncpu-inst.sh"; printf 'printf "%%s" "$MAX_LOAD"'; } > "$TMP/ncpu-drive4.sh"
   _nout4="$(bash "$TMP/ncpu-drive4.sh" 2>&1)"
-  [ "$_nout4" = "40" ] && rc=0 || { rc=1; echo "      install.sh _NCPU=0 -> plist MAX_LOAD='$_nout4', expected 40 (not 0)"; }
-  ck "install.sh treats a 0-valued _NCPU probe as a failed probe (MAX_LOAD=40, not 0)" $rc
+  [ "$_nout4" = "32" ] && rc=0 || { rc=1; echo "      install.sh _NCPU=0 -> plist MAX_LOAD='$_nout4', expected 32 (not 0)"; }
+  ck "install.sh treats a 0-valued _NCPU probe as a failed probe (MAX_LOAD=32, not 0)" $rc
   # The other wrap a MAX_LOAD-only guard cannot see: a 9-digit probe is IN range, but its product is
   # 10 digits and never binds. Only the true-default fallback catches it.
   { echo 'set -euo pipefail'; echo 'sysctl() { echo 999999999; }'; cat "$TMP/ncpu-inst.sh"; printf 'printf "%%s" "$MAX_LOAD"'; } > "$TMP/ncpu-drive5.sh"
   _nout5="$(bash "$TMP/ncpu-drive5.sh" 2>&1)"
-  [ "$_nout5" = "40" ] && rc=0 || { rc=1; echo "      install.sh _NCPU=999999999 -> plist MAX_LOAD='$_nout5', expected 40"; }
-  ck "install.sh falls back to 40 for a product that outgrows the 9-digit bound" $rc
+  [ "$_nout5" = "32" ] && rc=0 || { rc=1; echo "      install.sh _NCPU=999999999 -> plist MAX_LOAD='$_nout5', expected 32"; }
+  ck "install.sh falls back to 32 for a product that outgrows the 9-digit bound" $rc
   # ⛔ A DELIBERATE plist MAX_LOAD=0 MUST STILL BE ACCEPTED (keep the `0) : ;;` arm): the loop's
   # second guard bounds the DERIVATION, never a value that passes is_limit. Non-vacuity for the fix.
   { echo 'set -euo pipefail'; echo 'sysctl() { echo 12; }'; cat "$TMP/ncpu-inst.sh"; printf 'printf "%%s" "$MAX_LOAD"'; } > "$TMP/ncpu-drive6.sh"
@@ -2355,7 +2355,7 @@ ck "the shipped CYC floor is extracted too (CYC=0 cannot be driven without it)" 
 nlim() { ( _NCPU=10; MAX_LOAD="$1"; MAX_LANES="$2"; MERGE_PRIORITY_AT="$3"; BATCH="$4"; CYC="${5:-abc}"
            MAX_REVIEW=; MAX_FIX=; MAX_FIX_TRIES=; STALE_MIN=
            eval "$NGRD"; printf 'load=%s lanes=%s mpa=%s batch=%s cyc=%s review=%s fix=%s fixtries=%s stale=%s' "$MAX_LOAD" "$MAX_LANES" "$MERGE_PRIORITY_AT" "$BATCH" "$CYC" "$MAX_REVIEW" "$MAX_FIX" "$MAX_FIX_TRIES" "$STALE_MIN" ); }
-[ "$(nlim abc abc notanum two)" = "load=100 lanes=4 mpa=25 batch=2 cyc=240 review=4 fix=3 fixtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim abc abc notanum two)'"; }
+[ "$(nlim abc abc notanum two)" = "load=80 lanes=4 mpa=25 batch=2 cyc=240 review=4 fix=3 fixtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim abc abc notanum two)'"; }
 ck "non-numeric plist limits are coerced to their defaults, not left to fail OPEN" $rc
 [ "$(nlim 30 6 20 5)" = "load=30 lanes=6 mpa=20 batch=5 cyc=240 review=4 fix=3 fixtries=3 stale=40" ] && rc=0 || rc=1
 ck "numeric plist limits survive the coercion unchanged" $rc
@@ -2363,37 +2363,37 @@ ck "numeric plist limits survive the coercion unchanged" $rc
 # prints "integer expression expected" and exits 2, which under `set -e` aborts the gate chain -- or,
 # read as false, OPENS it. `is_limit` bounds the digits, so this must coerce exactly as a typo does.
 # Review found MAX_LOAD was still is_num while the README claimed otherwise: this is that gap, driven.
-[ "$(nlim 99999999999999999999 6 20 5)" = "load=100 lanes=6 mpa=20 batch=5 cyc=240 review=4 fix=3 fixtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim 99999999999999999999 6 20 5)'"; }
+[ "$(nlim 99999999999999999999 6 20 5)" = "load=80 lanes=6 mpa=20 batch=5 cyc=240 review=4 fix=3 fixtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim 99999999999999999999 6 20 5)'"; }
 ck "an absurd-but-numeric MAX_LOAD (>= 2**63) is coerced, not left to error the gate chain" $rc
 # ⛔ THE DERIVATION, not just the coercion (P3, fourth review round, 2026-10-14). Every fixture above
-# passes MAX_LOAD EXPLICITLY, so nothing drove the fallback `is_limit … || MAX_LOAD=$(( 10#$_NCPU * 10 ))`
+# passes MAX_LOAD EXPLICITLY, so nothing drove the fallback `is_limit … || MAX_LOAD=$(( 10#$_NCPU * 8 ))`
 # — which re-derived from the SAME unbounded `_NCPU` and could therefore leave an out-of-range value
 # in place. Extract the shipped `_NCPU` guard + derivation + coercion and DRIVE it with an absurd
 # probe, whose magnitude WRAPS (it does not abort), so the range guard cannot see it downstream.
 # The block always carries the two is_* DEFINITIONS, so a non-empty extraction proves nothing; the
-# `a sane _NCPU still derives MAX_LOAD=cores*10` assertion below IS the non-vacuity guard (it can
+# `a sane _NCPU still derives MAX_LOAD=cores*8` assertion below IS the non-vacuity guard (it can
 # only pass if the derivation line was evaluated).
 { grep -F 'is_num() {' "$LOOP"; grep -F 'is_limit() {' "$LOOP"; sed -n '/^is_limit "\${_NCPU:-}"/,/^[[:space:]]*is_limit "\${MAX_LOAD:-}"/p' "$LOOP"; } > "$TMP/maxb.sh"
 if need "$TMP/maxb.sh" "the shipped _NCPU guard + MAX_LOAD derivation are extracted"; then
   MAXB="$(cat "$TMP/maxb.sh")"
   maxload_probe() { ( _NCPU="$1"; MAX_LOAD="$2"; eval "$MAXB"; printf '%s' "$MAX_LOAD" ); }
-  [ "$(maxload_probe 12 '')" = "120" ] && rc=0 || { rc=1; echo "      _NCPU=12 -> '$(maxload_probe 12 '')', expected 120"; }
-  ck "a sane _NCPU still derives MAX_LOAD=cores*10 through the shipped block" $rc
+  [ "$(maxload_probe 12 '')" = "96" ] && rc=0 || { rc=1; echo "      _NCPU=12 -> '$(maxload_probe 12 '')', expected 96"; }
+  ck "a sane _NCPU still derives MAX_LOAD=cores*8 through the shipped block" $rc
   # A 0-valued probe is a FAILED probe: `10 * 0` = 0 passes is_limit and `[ "$L" -ge 0 ]` is always
   # true, so the load gate closes forever. The `_NCPU >= 1` guard converts it to the default.
-  [ "$(maxload_probe 0 '')" = "40" ] && rc=0 || { rc=1; echo "      _NCPU=0 -> '$(maxload_probe 0 '')', expected 40 (not 0)"; }
-  ck "a 0-valued _NCPU probe is treated as failed (MAX_LOAD=40, not a gate that never opens)" $rc
-  [ "$(maxload_probe 99999999999999999999 '')" = "40" ] && rc=0 || { rc=1; echo "      _NCPU=1e20 -> '$(maxload_probe 99999999999999999999 '')', expected 40"; }
-  ck "an absurd _NCPU (>= 2**63) falls back to 40, not a 19-digit load gate that never binds" $rc
+  [ "$(maxload_probe 0 '')" = "32" ] && rc=0 || { rc=1; echo "      _NCPU=0 -> '$(maxload_probe 0 '')', expected 32 (not 0)"; }
+  ck "a 0-valued _NCPU probe is treated as failed (MAX_LOAD=32, not a gate that never opens)" $rc
+  [ "$(maxload_probe 99999999999999999999 '')" = "32" ] && rc=0 || { rc=1; echo "      _NCPU=1e20 -> '$(maxload_probe 99999999999999999999 '')', expected 32"; }
+  ck "an absurd _NCPU (>= 2**63) falls back to 32, not a 19-digit load gate that never binds" $rc
   # The other wrap, and the one a MAX_LOAD-only guard CANNOT catch: 2**63 * 10 wraps to 0, and
   # `is_limit 0` is TRUE (install.sh allows 0 for every limit but CYC), so `[ "$L" -ge 0 ]` is always
   # true and the controller dispatches nothing, forever. Only bounding the PROBE closes it.
-  [ "$(maxload_probe 9223372036854775808 '')" = "40" ] && rc=0 || { rc=1; echo "      _NCPU=2**63 -> '$(maxload_probe 9223372036854775808 '')', expected 40"; }
-  ck "an _NCPU that wraps the product to 0 (which passes is_limit) is bounded to 40" $rc
+  [ "$(maxload_probe 9223372036854775808 '')" = "32" ] && rc=0 || { rc=1; echo "      _NCPU=2**63 -> '$(maxload_probe 9223372036854775808 '')', expected 32"; }
+  ck "an _NCPU that wraps the product to 0 (which passes is_limit) is bounded to 32" $rc
   # A 9-digit _NCPU is in range, but its product is 10 digits and still under 2**63 — `[ -ge ]` does
   # not error, it just never binds, so ONLY the true-default fallback catches it.
-  [ "$(maxload_probe 999999999 '')" = "40" ] && rc=0 || { rc=1; echo "      _NCPU=999999999 -> '$(maxload_probe 999999999 '')', expected 40"; }
-  ck "a product that outgrows the 9-digit bound falls back to 40, not a gate that never binds" $rc
+  [ "$(maxload_probe 999999999 '')" = "32" ] && rc=0 || { rc=1; echo "      _NCPU=999999999 -> '$(maxload_probe 999999999 '')', expected 32"; }
+  ck "a product that outgrows the 9-digit bound falls back to 32, not a gate that never binds" $rc
   [ "$(maxload_probe 99999999999999999999 30)" = "30" ] && rc=0 || { rc=1; echo "      absurd _NCPU + MAX_LOAD=30 -> '$(maxload_probe 99999999999999999999 30)'"; }
   ck "a valid plist MAX_LOAD survives even an absurd _NCPU (the derivation is bounded, not the value)" $rc
 fi
@@ -2406,7 +2406,7 @@ fi
 # `is_num`, so tightening the predicate coerces every leading-zero limit to its default — this drives
 # that, and it is RED on the lax predicate. (`nlim 08 09 030 05` covers 2-digit, 3-digit and the
 # single `0`-followed-by-digit forms.)
-[ "$(nlim 08 09 030 05)" = "load=100 lanes=4 mpa=25 batch=2 cyc=240 review=4 fix=3 fixtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim 08 09 030 05)'"; }
+[ "$(nlim 08 09 030 05)" = "load=80 lanes=4 mpa=25 batch=2 cyc=240 review=4 fix=3 fixtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim 08 09 030 05)'"; }
 ck "leading-zero limits (08/09/030/05) are coerced to defaults, not read as octal" $rc
 # ⛔ CYC=0 — the FOURTH failure mode, and the one every guard above lets through: `0` is a valid
 # integer and a valid is_limit, so it survives the coercion and the loop then runs `sleep 0` per
@@ -2441,9 +2441,9 @@ ck "the shipped is_num() rejects leading zeros and non-numbers, accepts 0 and re
 # makes it a false red -- the very "rc set but not asserted" defect this file warns about.
 rc=0
 for _f in "$LOOP" "$INST"; do
-  grep -qF 'MAX_LOAD="${MAX_LOAD:-$(( 10#$_NCPU * 10 ))}"' "$_f" || { rc=1; echo "      $_f does not default MAX_LOAD to cores*10"; }
+  grep -qF 'MAX_LOAD="${MAX_LOAD:-$(( 10#$_NCPU * 8 ))}"' "$_f" || { rc=1; echo "      $_f does not default MAX_LOAD to cores*8"; }
 done
-ck "both files default MAX_LOAD to the cores*10 formula (it cannot drift in both together)" $rc
+ck "both files default MAX_LOAD to the cores*8 formula (it cannot drift in both together)" $rc
 # ⛔ The leading-zero trap, again: MERGE_PRIORITY_AT is normalised with `10#` for the scope decision
 # but review_slots read MAX_REVIEW through $(( )) -- `030` returned 26, not 30.
 grep -qF '10#${MAX_REVIEW:-4} + 2' "$LOOP" && rc=0 || rc=1

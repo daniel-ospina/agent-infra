@@ -21,21 +21,21 @@ OR="${OR:-daniel-ospina/tortoise}"
 # Portable core count, IDENTICAL to orch-loop.sh's line. install.sh itself refuses to run off macOS
 # (it renders a launchd plist), but selftest §7 EVALUATES this assignment on whatever host runs the
 # suite and compares it with the loop's — so on a Linux host a divergence here would resolve
-# MAX_LOAD=40 against the loop's cores*10 and fail a check for a difference with no runtime effect.
+# MAX_LOAD=32 against the loop's cores*8 and fail a check for a difference with no runtime effect.
 # sysctl -n hw.ncpu is a macOS-only key and sysctl is absent from a minimal Linux userland
-# (debian:stable-slim ships no procps): in the LOOP that silently pinned _NCPU=4, MAX_LOAD=40 (#1702).
+# (debian:stable-slim ships no procps): in the LOOP that silently pinned _NCPU=4, MAX_LOAD=32 (#1702).
 _NCPU="$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
 # ⛔ THE GUARD, NOT JUST THE LINE (P3, third review round, 2026-10-14). The comment above calls this
 # assignment "IDENTICAL to orch-loop.sh's line" — the LINE was, the PROTECTION was not: orch-loop.sh
 # coerces `_NCPU` with `is_num` on the line before its only read, and install.sh had NO is_num at all.
-# `sysctl` can SUCCEED while printing an empty or garbage value, and `$(( 10#$_NCPU * 10 ))` is then a
+# `sysctl` can SUCCEED while printing an empty or garbage value, and `$(( 10#$_NCPU * 8 ))` is then a
 # syntax error that ABORTS the installer mid-run under `set -euo pipefail` — instead of falling back
 # to 4 exactly as the loop does. Same predicate as every shipped copy (leading zeros are read as
 # octal by `$(( ))`, so `08` must be rejected too).
 is_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; 0) return 0 ;; 0*) return 1 ;; *) return 0 ;; esac; }
 # ⛔ A DIGIT STRING IS NOT ENOUGH FOR `_NCPU` — IT MUST BE A MAGNITUDE (P3, fifth review round,
-# 2026-10-14). `is_num` accepts a 19-digit probe, and `$(( 10#$_NCPU * 10 ))` then WRAPS instead of
-# erroring: 9223372036854775808 (2**63) * 10 is exactly 0, which every downstream guard accepts
+# 2026-10-14). `is_num` accepts a 19-digit probe, and `$(( 10#$_NCPU * 8 ))` then WRAPS instead of
+# erroring: 9223372036854775808 (2**63) * 8 is exactly 0, which every downstream guard accepts
 # (`0` is a legal plist limit), so the rendered plist carries `MAX_LOAD=0` and the loop's
 # `[ "$L" -ge 0 ]` is always true — the box dispatches NOTHING, silently and indefinitely. This was
 # already closed in orch-loop.sh; install.sh runs the IDENTICAL derivation but had only `is_num`, so
@@ -45,12 +45,12 @@ is_limit() { is_num "${1:-}" && [ "${#1}" -le 9 ]; }
 is_limit "${_NCPU:-}"   || _NCPU=4
 # A 0-valued probe is a FAILED probe, not "no cores": the identical line is in orch-loop.sh.
 [ "${_NCPU:-0}" -ge 1 ] || _NCPU=4
-MAX_LOAD="${MAX_LOAD:-$(( 10#$_NCPU * 10 ))}"
+MAX_LOAD="${MAX_LOAD:-$(( 10#$_NCPU * 8 ))}"
 # The same two guards the loop applies, for the same reason: the first fallback re-derives from the
 # SAME `_NCPU`, so it cannot repair an out-of-range PRODUCT (a 9-digit probe yields a 10-digit value
 # that `[ -ge ]` never binds); only a true default does. `is_limit` must NOT reject `0` — it also
 # validates plist limits where 0 is legal (see the `0) : ;;` arm below).
-is_limit "${MAX_LOAD:-}" || MAX_LOAD=$(( 10#$_NCPU * 10 )); is_limit "${MAX_LOAD:-}" || MAX_LOAD=40
+is_limit "${MAX_LOAD:-}" || MAX_LOAD=$(( 10#$_NCPU * 8 )); is_limit "${MAX_LOAD:-}" || MAX_LOAD=32
 MAX_LANES="${MAX_LANES:-4}"
 MAX_REVIEW="${MAX_REVIEW:-4}"
 MERGE_PRIORITY_AT="${MERGE_PRIORITY_AT:-25}"

@@ -48,7 +48,7 @@ case "${T:-}" in ''|*[!0-9]*) echo "nonblocking-dispatch.sh: timeout '$T' is not
 O="${O:-$HOME/orchestrator}"; D="$O/bg"; mkdir -p "$D" "$O/state"
 # ⛔ PATH FIRST, then source — this part IS lane.sh/fix-one.sh's rule. spawn-gate.sh derives `_NCPU`
 # at SOURCE time (sysctl/nproc/getconf), so sourcing it under a cell's pre-export PATH pins
-# `_NCPU=4` / `MAX_LOAD=40` for every cell (agent-infra#1702). The two siblings carry the same ⛔.
+# `_NCPU=4` / `MAX_LOAD=32` for every cell (agent-infra#1702). The two siblings carry the same ⛔.
 export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
 # The RESOLUTION, though, mirrors merge-one.sh's repo-authority.sh — NOT lane.sh/fix-one.sh, which
 # source only `$SELF/spawn-gate.sh` and never consult `$O`. Prefer the daemon's copy at `$O`, fall
