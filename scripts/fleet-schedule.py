@@ -43,11 +43,13 @@ WHAT IT DOES
     tick stamp for the loop itself, so "scheduled" is checkable rather than believed,
   * `--status` prints the per-machine truth: every declared job, its cadence, its last run and
     its last rc — or the reason it does not run on this machine, NAMED (never silently absent),
-  * `--verify` FAILS when the loop is dead, its tick is stale, a job could not be scheduled, or a
-    job is overdue with no run. A skipped job is reported as SKIP (with its reason) rather than
-    failing: a Mac-free dependency (a tortoise venv, a swarm root) is a legitimate per-machine
-    absence, and refusing to certify the whole layer over it would block a cell that can run
-    every other job.
+  * `--verify` FAILS when the loop is dead, its tick is stale, a job could not be scheduled, a
+    job is overdue with no run, the declarations are EMPTY (zero jobs is a false PASS, not a clean
+    run), or a job's calendar can never come due again. A skipped job is reported as SKIP (with its
+    reason) rather than failing: a Mac-free dependency (a tortoise venv, a swarm root) is a
+    legitimate per-machine absence, and refusing to certify the whole layer over it would block a
+    cell that can run every other job. A job that is RUNNING explains a stale tick (state/busy/,
+    bounded by the job's own ceiling) instead of being mistaken for a wedged loop.
 
 ⛔ NOT A SECOND SCHEDULER ON macOS. On Darwin every subcommand delegates to
 `scripts/install-launchd.sh`, which is unchanged. The loop exists only where launchd does not.
@@ -298,6 +300,16 @@ def load_jobs() -> list:
 
         label = data.get("Label") or label_from_file
         job = Job(label, [], {}, None, None, "", "")
+        # ⛔ A Label is a PATH COMPONENT here (stamp, lock, default log), so it is validated BEFORE
+        # it is used as one. launchd accepts any string; this runtime cannot: `../x` writes the
+        # stamp/log outside the state dir, and a label containing `/` makes `os.open` of the lock
+        # path raise — which, with no per-job containment, used to terminate the WHOLE loop on the
+        # next tick. Refuse the declaration instead, by name.
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", label):
+            job.error = (
+                "Label %r is not a safe file name — only letters, digits, '.', '_' and '-' are "
+                "accepted (the label names this job's stamp, lock and default log)" % label
+            )
         if label in retired:
             raise ScheduleError(
                 "%s is in RETIRED but a template still exists — remove one or the other"
@@ -396,6 +408,15 @@ def load_jobs() -> list:
                     job.skip = "target absent on this machine: %s" % arg
                 break
         jobs.append(job)
+    # ⛔ ZERO JOBS IS A FAILURE, not a clean run. A templates dir that EXISTS but holds no
+    # *.plist (a sparse checkout, a stale TEMPLATES_DIR pointer, a dir that only has RETIRED)
+    # used to verify green — "SCHEDULE VERIFIED — 0 job(s) live" — which is exactly the false
+    # PASS this file exists to close: the cell is certified while running none of its jobs.
+    if not jobs:
+        raise ScheduleError(
+            "no *.plist job declarations in %s — a schedule with ZERO jobs is the gap this "
+            "runtime closes (#1864), so it is refused rather than certified" % TEMPLATES_DIR
+        )
     return jobs
 
 
@@ -437,6 +458,67 @@ def tick_age():
         return time.time() - os.path.getmtime(os.path.join(STATE, "tick"))
     except OSError:
         return None
+
+
+# ────────────────────────────────────────────────────── the busy heartbeat (long-job honesty)
+# The loop is single-threaded and a pass may legitimately last for JOB_TIMEOUT (a job the plists
+# budget 1800s for). Without a marker, `--verify` cannot tell "one long job is running" from "the
+# loop is wedged", and it refused the first — the same condition its OVERDUE arm explicitly
+# excuses ("a 6-hour job 1 hour late is the loop simply being busy"). So a job announces itself
+# while it runs, with a DEADLINE, and the exemption is bounded by that deadline: a job that
+# crashed hard (SIGKILL, so no finally) stops excusing the tick moments after its ceiling.
+def busy_path(label):
+    return os.path.join(STATE, "busy", label + ".json")
+
+
+def mark_busy(label, started):
+    """Announce that this job is running, with an expiring deadline. Best-effort: a job must run
+    even if the marker cannot be written, and an unwritable marker simply means no exemption."""
+    try:
+        os.makedirs(os.path.join(STATE, "busy"), exist_ok=True)
+        with open(busy_path(label), "w") as fh:
+            json.dump(
+                {
+                    "label": label,
+                    "started": started,
+                    "pid": os.getpid(),
+                    # subprocess.run kills the child at JOB_TIMEOUT, so no pass can outlive this.
+                    "deadline": started + float(JOB_TIMEOUT) + 3 * float(TICK or 0),
+                },
+                fh,
+            )
+    except OSError:
+        pass
+
+
+def clear_busy(label):
+    try:
+        os.unlink(busy_path(label))
+    except OSError:
+        pass
+
+
+def busy_jobs(now):
+    """[(label, started)] for jobs whose announced run has NOT passed its deadline."""
+    live = []
+    directory = os.path.join(STATE, "busy")
+    try:
+        names = sorted(os.listdir(directory))
+    except OSError:
+        return live
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(directory, name)) as fh:
+                entry = json.load(fh)
+            deadline = float(entry["deadline"])
+            started = float(entry.get("started") or 0)
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+        if now <= deadline:
+            live.append((entry.get("label") or name[: -len(".json")], started))
+    return live
 
 
 def mark_tick():
@@ -500,7 +582,13 @@ def next_occurrence(calendar, after):
     # A Weekday/Hour/Minute calendar recurs within a week; a Day (or Month) one can be up to a year
     # away, and a window that is too small would read as "never due" — a job silently unscheduled,
     # which is this file's whole subject.
-    window = 400 if ("Month" in calendar or "Day" in calendar) else 8
+    # ⛔ The KEYS must be read from the UNION of an `_all` array's entries, not from the wrapper
+    # dict: a multi-entry StartCalendarInterval is stored as `{"_all": [...]}`, so testing the
+    # wrapper for "Month"/"Day" saw neither and searched only 8 days — an annual entry was then
+    # never found, `next_occurrence` returned None, and the job was reported live while being
+    # permanently unschedulable.
+    keys = set().union(*calendar["_all"]) if "_all" in calendar else set(calendar)
+    window = 400 if ("Month" in keys or "Day" in keys) else 8
     for _ in range(window * 24 * 60):
         if calendar_matches(calendar, start):
             return start.timestamp()
@@ -584,6 +672,7 @@ def run_job(job):
         log("SKIP %s: already running (lock held)" % job.label)
         return None
     started = time.time()
+    mark_busy(job.label, started)
     log_path = job.log_path()
     try:
         os.makedirs(os.path.dirname(log_path), exist_ok=True)
@@ -638,6 +727,7 @@ def run_job(job):
         log("ERROR %s could not be executed (%s)" % (job.label, exc))
     finally:
         write_stamp(job.label, started, rc, time.time() - started)
+        clear_busy(job.label)
         try:
             os.unlink(lock)
         except OSError:
@@ -668,7 +758,10 @@ def cmd_loop():
     os.makedirs(STATE, exist_ok=True)
     pidfile = os.path.join(STATE, "loop.pid")
     theirs = loop_pid()
-    if theirs and theirs != os.getpid():
+    # ⛔ `pid_is_our_loop`, NOT a bare pid. A pidfile holding a RECYCLED pid (any live process —
+    # what a killed loop leaves behind) used to make every new instance log "already running" and
+    # exit BEFORE writing its own pidfile, so the state never self-healed while that pid lived.
+    if theirs and theirs != os.getpid() and pid_is_our_loop(theirs):
         log("loop: already running (pid %d) — this instance exits" % theirs)
         return 0
     with open(pidfile, "w") as fh:
@@ -701,14 +794,25 @@ def cmd_loop():
             jobs = load_jobs()
         except ScheduleError as exc:
             log("ERROR: cannot read the job declarations (%s) — keeping the previous set" % exc)
+        # ⛔ The tick is stamped at the START of the pass, not after it: the pass is
+        # single-threaded, so an end-of-pass stamp makes the tick's age equal the duration of the
+        # job currently executing — and a job allowed to run for JOB_TIMEOUT (1800s by default,
+        # 300s from the shipped templates onward) would then read as "the process exists but is
+        # not passing" WHILE it is doing exactly what it was told.
+        mark_tick()
         if jobs:
             now = time.time()
             for job in jobs:
                 if job.error or job.skip:
                     continue
                 if is_due(job, read_stamp(job.label), now):
-                    run_job(job)
-        mark_tick()
+                    # ⛔ ONE BROKEN DECLARATION MUST NOT STOP THE SET. Anything run_job raises
+                    # (a bad log path, an unusable lock dir) used to escape here and terminate
+                    # the loop, leaving every other job unscheduled until a human restarts it.
+                    try:
+                        run_job(job)
+                    except Exception as exc:  # noqa: BLE001 — a loop must outlive one job
+                        log("ERROR %s could not be run (%s: %s) — continuing with the set" % (job.label, type(exc).__name__, exc))
         time.sleep(max(5, TICK))
     try:
         os.unlink(pidfile)
@@ -733,12 +837,18 @@ def spawn_loop():
         )
     # Wait (boundedly) for the loop to stamp its first tick, so "started" is not a claim about a
     # pid that died on line one.
-    for _ in range(30):
+    # ⛔ The poll matches the COMMENT above: a pid whose command line is the loop AND a stamped
+    # first tick. Polling only the command line returned as soon as the child existed — before
+    # mark_tick() — so `--install` verified immediately afterwards and failed a HEALTHY install on
+    # "the loop has never ticked" whenever any job was due in that first pass.
+    # ⛔ And a failed poll returns None, never `loop_pid()`: that fallback handed back whatever pid
+    # the pidfile held (a recycled pid) and reported it as the loop that had just started.
+    for _ in range(50):
         time.sleep(0.2)
         pid = loop_pid()
-        if pid and pid_is_our_loop(pid):
+        if pid and pid_is_our_loop(pid) and tick_age() is not None:
             return pid
-    return loop_pid()
+    return None
 
 
 # ──────────────────────────────────────────────────────────────── reporting
@@ -824,7 +934,23 @@ def cmd_verify():
     if age is None:
         failures.append("the loop has never ticked (no %s/tick)" % STATE)
     elif age > stale_after:
-        failures.append("the loop tick is %.0fs old (stale after %ds) — the process exists but is not passing" % (age, stale_after))
+        # A LONG JOB IS NOT A WEDGE. The loop is single-threaded and a pass may last JOB_TIMEOUT,
+        # so a job that is RUNNING announces itself (state/busy/<label>.json) with an expiring
+        # deadline; while one is live the old tick is explained, not failed. Past that deadline
+        # the exemption is gone, so a job killed hard cannot mask a wedged loop forever.
+        busy = busy_jobs(now)
+        if busy:
+            print(
+                "  BUSY   the loop is running %s (%s so far) — the %s tick age is a long job, "
+                "not a wedge"
+                % (
+                    ", ".join(label for label, _ in busy),
+                    human_secs(now - min(started for _, started in busy)),
+                    human_secs(age),
+                )
+            )
+        else:
+            failures.append("the loop tick is %.0fs old (stale after %ds) — the process exists but is not passing" % (age, stale_after))
 
     ran = 0
     skipped = []
@@ -844,6 +970,15 @@ def cmd_verify():
             continue
         ran += 1
         due = due_at(job, stamp, now)
+        if due is None:
+            # A calendar that never matches again is a job that is scheduled and can never run.
+            # Silence here certified such a job as live, which is the same false PASS as a job
+            # that never ran at all.
+            failures.append(
+                "%s: its calendar never becomes due again (no occurrence within the search "
+                "window) — the job is declared and can never run" % job.label
+            )
+            continue
         overdue = (now - due) if due is not None else 0
         # LATE BY MORE THAN A COUPLE OF ITS OWN INTERVALS *and* by more than a few ticks. Both
         # halves matter: a 5-minute job 10 minutes late is a miss, while a 6-hour job 1 hour late
@@ -952,6 +1087,10 @@ def cmd_start():
 
 
 def cmd_stop():
+    # ⛔ The state dir may not exist yet (a machine that never ran the schedule). `--stop` is the
+    # ONE mode that skips the "no declarations" exits, so it must be able to create its own OFF
+    # switch — it used to die with FileNotFoundError instead of switching anything off.
+    os.makedirs(STATE, exist_ok=True)
     open(os.path.join(STATE, "OFF"), "a").close()
     pid = loop_pid()
     if not pid:
@@ -993,7 +1132,17 @@ def cmd_darwin(mode):
         ]
         for line in bad:
             print("  FAIL   %s" % line.strip(), file=sys.stderr)
-        if bad:
+        # ⛔ THE DELEGATE'S EXIT STATUS IS THE SECOND HALF OF THE GATE, not an implementation
+        # detail: the substring scan catches only three wordings, so any OTHER failure of
+        # install-launchd.sh --status (a missing template dir, an unset HOME, a syntax death)
+        # was certified as "SCHEDULE VERIFIED" on macOS — a false PASS over a broken installer.
+        if out.returncode != 0:
+            print(
+                "  FAIL   install-launchd.sh --status exited %d — the delegate that owns the "
+                "launchd job set did not report a clean status" % out.returncode,
+                file=sys.stderr,
+            )
+        if bad or out.returncode != 0:
             print(
                 "SCHEDULE NOT VERIFIED — %d launchd job(s) not installed/loaded/in sync above"
                 % len(bad),
