@@ -544,6 +544,20 @@ jobs:
         # step (the post-merge `extensions/*/test*.mjs` glob in ci-main.yml is
         # not PR-triggered); perf-parity with the #744 step above.
         run: node extensions/main-worktree-guard/test-discard-gate.mjs
+      - name: main-worktree-guard nested-worktree hub gate (#1919)
+        # `git worktree add 8779-optA` (a RELATIVE path) puts a registered
+        # worktree INSIDE the repo root; git reports it as an untracked
+        # directory, so the hub read DIRTY forever and the M4 hub-state gate
+        # refused every verb that could move it out (a gate closed against its
+        # own repair). This suite pins BOTH halves: a registered worktree is not
+        # hub dirt, AND a genuine untracked file / tracked modification still is
+        # — plus the creation refusal for an unignored target inside a checkout.
+        # Behavioral: loads the REAL index.ts through module-load-hooks.mjs and
+        # drives the tool_call handler against a hermetic hub. Zero-dep
+        # (`node:*` + the `git` binary), no `npm ci`, ~3s. Its own step (the
+        # post-merge `extensions/*/test*.mjs` glob in ci-main.yml is not
+        # PR-triggered).
+        run: node extensions/main-worktree-guard/test-nested-worktree.mjs
       - name: task-cwd-guard shared-main spawn-cwd gate (#1240)
         # A `task` dispatch with no explicit `cwd` inherits the PARENT's cwd
         # (#1071), so ~124 dispatches/hour on the tortoise hub landed in a
