@@ -1,0 +1,288 @@
+#!/usr/bin/env bash
+# gh-rest — a PATH shim that routes the harness's hot gh paths through the REST API.
+#
+# WHY THIS EXISTS (#1959). Measured 2026-10-17: GitHub refused EVERY GraphQL call — including the
+# trivial `{viewer{login}}` — with `graphql_rate_limit`, while the REST budget answered normally
+# (core 3307/5000) and `gh api repos/.../pulls/8833` returned full data. A five-minute window with
+# every harness process KILLED did not clear it, so it is not a burst we can wait out.
+#
+# That single asymmetry disabled both halves of the harness, and neither failure named the cause:
+#
+#   * `fleet_state.py build` reads its board with `gh pr list` (GraphQL) =>
+#     "the GitHub board could not be read" => board stale => claim gate INCOMPLETE => DISPATCH STOPPED.
+#   * the sweep's PR listing is REST and succeeds, but its per-PR reads are `gh pr view` /
+#     `gh pr checks` (GraphQL) => NOCHECKS => fail-closed => NO PR COULD MERGE.
+#
+# DESIGN — AN ADAPTER, NOT A FORK. No harness file is edited, so every cell stays on one harness
+# version (the convergence property this repo exists to protect) while the API surface becomes a
+# deployment concern.
+#
+# THE ONE RULE THAT KEEPS IT SAFE: a flag or filter this adapter does not model DELEGATES the whole
+# call to the real gh. It never drops a flag and answers anyway. Dropping one is not a slow answer,
+# it is a WRONG answer, and every severity of defect found in review of the first draft was that same
+# bug in a different command:
+#   * `pr list --head` dropped => `chain-merge.sh` polls for "the branch's PR", gets the newest open
+#     PR instead, and merges an UNRELATED PR (and records the review marker against it);
+#   * `issue list --label` dropped => `refresh-candidates.sh`'s three severity queries return the same
+#     unfiltered list, so every issue is tier 0 and the P0-before-P2 ordering (#8465) is inverted;
+#   * `pr comment` printing nothing => `merge-one.sh` cannot extract the evidence URL and PARKS every
+#     reviewed PR with a false "posted no comment" diagnosis.
+#
+# SAFETY DETAILS. Failures propagate as failures: `--jq` errors exit non-zero instead of looking like
+# "no rows". `pr merge` requires the API's own `merged: true` before reporting success (a 200 whose
+# body says otherwise is a failure). `pr merge --auto` is a GraphQL-only mutation, so it delegates and
+# fails loudly rather than pretending to have armed.
+#
+# INSTALL. install.sh copies this to $O/gh-rest/gh and puts that directory first on the daemon PATH.
+# Verified by gh-rest.test.sh against a stub gh — no network, no credentials.
+set -uo pipefail
+
+# ── resolve the REAL gh, never this file ──────────────────────────────────────────────────────────
+# `command -v gh` inside a shim named gh finds the shim again — an infinite exec loop. Walk PATH and
+# skip any candidate that is this file (by device+inode, so symlinks and relative entries are safe).
+SELF="${BASH_SOURCE[0]}"
+SELF_REAL="$(cd "$(dirname "$SELF")" 2>/dev/null && pwd)/$(basename "$SELF")"
+REAL_GH="${GH_REST_REAL_GH:-}"
+if [ -z "$REAL_GH" ]; then
+  IFS=: read -r -a _dirs <<<"${PATH:-/usr/bin:/bin}"
+  for _d in "${_dirs[@]}"; do
+    [ -n "$_d" ] || continue
+    _c="$_d/gh"
+    [ -x "$_c" ] || continue
+    [ "$_c" -ef "$SELF_REAL" ] && continue
+    REAL_GH="$_c"; break
+  done
+fi
+[ -n "$REAL_GH" ] && [ -x "$REAL_GH" ] || {
+  echo "gh-rest: cannot locate the real gh (set GH_REST_REAL_GH)" >&2; exit 127; }
+
+ORIG=("$@")
+delegate() { exec "$REAL_GH" "${ORIG[@]}"; }
+die() { echo "gh-rest: $*" >&2; exit 1; }
+# A projection/filter failure must NOT look like an empty result ("" and rc 0 is indistinguishable
+# from "no rows" to every caller in this harness).
+emit() { jq -r "${JQ:-.}" 2>/dev/null || die "projection failed (--jq '${JQ:-.}')"; }
+
+[ $# -ge 2 ] || delegate
+SUB="$1 $2"
+
+# ── argument parser ──────────────────────────────────────────────────────────────────────────────
+# Positionals start at $3: $1 is the group (`pr`), $2 the action (`view`), $3 the PR number.
+REPO=""; JSON_F=""; JQ=""; STATE=""; LIMIT=""; METHOD=""; AUTO=0; SHA=""; BODY=""
+LABELS=""; HEADF=""; BASEF=""; DELBR=0; UNSUPPORTED=""
+POS=()
+parse() {
+  local i=3 a
+  while [ "$i" -le "$#" ]; do
+    a="${!i}"
+    case "$a" in
+      --repo)                i=$((i+1)); REPO="${!i}" ;;
+      --repo=*)              REPO="${a#--repo=}" ;;
+      --json)                i=$((i+1)); JSON_F="${!i}" ;;
+      --json=*)              JSON_F="${a#--json=}" ;;
+      --jq)                  i=$((i+1)); JQ="${!i}" ;;
+      --jq=*)                JQ="${a#--jq=}" ;;
+      --state)               i=$((i+1)); STATE="${!i}" ;;
+      --state=*)             STATE="${a#--state=}" ;;
+      --limit)               i=$((i+1)); LIMIT="${!i}" ;;
+      --limit=*)             LIMIT="${a#--limit=}" ;;
+      --head)                i=$((i+1)); HEADF="${!i}" ;;
+      --head=*)              HEADF="${a#--head=}" ;;
+      --base)                i=$((i+1)); BASEF="${!i}" ;;
+      --base=*)              BASEF="${a#--base=}" ;;
+      --label)               i=$((i+1)); LABELS="${LABELS}${LABELS:+,}${!i}" ;;
+      --label=*)             LABELS="${LABELS}${LABELS:+,}${a#--label=}" ;;
+      --squash)              METHOD="squash" ;;
+      --merge)               METHOD="merge" ;;
+      --rebase)              METHOD="rebase" ;;
+      --delete-branch)       DELBR=1 ;;
+      --auto)                AUTO=1 ;;
+      --match-head-commit)   i=$((i+1)); SHA="${!i}" ;;
+      --match-head-commit=*) SHA="${a#--match-head-commit=}" ;;
+      --body)                i=$((i+1)); BODY="${!i}" ;;
+      --body=*)              BODY="${a#--body=}" ;;
+      --body-file)           i=$((i+1)); BODY="$(cat "${!i}" 2>/dev/null)" ;;
+      --body-file=*)         BODY="$(cat "${a#--body-file=}" 2>/dev/null)" ;;
+      --)                    ;;
+      # ⛔ ANY OTHER FLAG IS UNMODELLED. Remember it and delegate — silently dropping a filter turns
+      # a narrow query into an unbounded one, which is how the wrong PR gets merged.
+      -*)                    UNSUPPORTED="${UNSUPPORTED:-$a}" ;;
+      *)                     POS+=("v:$a") ;;
+    esac
+    i=$((i+1))
+  done
+  local out=() p
+  for p in "${POS[@]+"${POS[@]}"}"; do out+=("${p#v:}"); done
+  POS=("${out[@]+"${out[@]}"}")
+}
+parse "$@"
+NUM="${POS[0]:-}"
+# Every handler calls this first: an unmodelled flag means "not my call to make".
+honour() { [ -z "$UNSUPPORTED" ] || delegate; }
+
+# REST pull/issue -> the vocabulary `gh --json` uses. Callers compare against OPEN/MERGED and
+# MERGEABLE, so an unmapped value is a silent logic error, not a cosmetic one.
+PROJECT='
+import sys, json
+fields=[f for f in (sys.argv[1] or "").split(",") if f]
+kind=sys.argv[2]
+try: limit=int(sys.argv[3])
+except Exception: limit=30
+def st(o):
+    if o.get("merged_at") or o.get("merged"): return "MERGED"
+    return {"open":"OPEN","closed":"CLOSED"}.get((o.get("state") or "").lower(), (o.get("state") or "").upper())
+def mg(o):
+    ms=(o.get("mergeable_state") or "")
+    if ms in ("clean","unstable","has_hooks","blocked","behind"): return "MERGEABLE"
+    m=o.get("mergeable")
+    return "MERGEABLE" if m is True else ("CONFLICTING" if m is False else "UNKNOWN")
+M={"number":lambda o:o.get("number"),"title":lambda o:o.get("title"),"body":lambda o:o.get("body"),
+   "state":st,"url":lambda o:o.get("html_url"),
+   "headRefName":lambda o:(o.get("head") or {}).get("ref"),
+   "baseRefName":lambda o:(o.get("base") or {}).get("ref"),
+   "headRefOid":lambda o:(o.get("head") or {}).get("sha"),
+   "isDraft":lambda o:bool(o.get("draft")),
+   "mergeable":mg,"mergeStateStatus":lambda o:(o.get("mergeable_state") or "").upper(),
+   "createdAt":lambda o:o.get("created_at"),"updatedAt":lambda o:o.get("updated_at"),
+   "author":lambda o:{"login":(o.get("user") or {}).get("login")},
+   "labels":lambda o:[{"name":l.get("name")} for l in (o.get("labels") or [])],
+   "assignees":lambda o:[{"login":a.get("login")} for a in (o.get("assignees") or [])],
+   "comments":lambda o:o.get("comments"),
+   "reviewDecision":lambda o:None}
+d=json.load(sys.stdin)
+single=not isinstance(d,list)
+rows=d if isinstance(d,list) else [d]
+if kind=="issue":
+    # REST /issues INCLUDES pull requests; an unfiltered list makes PRs look dispatchable.
+    rows=[o for o in rows if "pull_request" not in o]
+if isinstance(d,list) and limit>0: rows=rows[:limit]
+out=[{f:(M.get(f) or (lambda _:None))(o) for f in fields} for o in rows]
+print(json.dumps(out[0] if (single and out) else out))
+'
+
+case "$SUB" in
+
+"pr view"|"issue view")
+  # Plain-text rendering is NOT modelled — without --json the caller wants gh's formatting.
+  # `comments` is an ARRAY of comment objects in gh, but an integer count in the REST object, so it
+  # must be fetched separately rather than passed through (a count silently breaks `.comments[].body`).
+  [ -n "$JSON_F" ] || delegate
+  honour
+  [ -n "$REPO" ] && [[ "$NUM" =~ ^[0-9]+$ ]] || delegate
+  kind=pull; base="repos/$REPO/pulls/$NUM"
+  [ "$SUB" = "issue view" ] && { kind=issue; base="repos/$REPO/issues/$NUM"; }
+  raw="$("$REAL_GH" api "$base" 2>&1)" || die "$raw"
+  case ",$JSON_F," in
+    *,comments,*)
+      cs="$("$REAL_GH" api --paginate "repos/$REPO/issues/$NUM/comments?per_page=100" 2>&1 \
+           | jq -s '[.[][] | {body:.body, author:{login:(.user.login)}, createdAt:.created_at}]')" || die "$cs"
+      raw="$(printf '%s' "$raw" | python3 -c 'import sys,json; d=json.load(sys.stdin); d["comments"]=json.loads(sys.argv[1]); print(json.dumps(d))' "$cs")" || die "comment merge failed"
+      ;;
+  esac
+  printf '%s' "$raw" | python3 -c "$PROJECT" "$JSON_F" "$kind" 0 | emit || exit 1
+  exit 0 ;;
+
+"pr checks")
+  # The table output is not modelled — without --json the caller wants gh's formatting.
+  [ -n "$JSON_F" ] || delegate
+  honour
+  [ -n "$REPO" ] && [[ "$NUM" =~ ^[0-9]+$ ]] || delegate
+  sha="$("$REAL_GH" api "repos/$REPO/pulls/$NUM" --jq .head.sha 2>/dev/null)"
+  [ -n "$sha" ] || die "cannot resolve head sha for #$NUM"
+  # `--paginate` emits CONCATENATED arrays; json.load would fail "Extra data" and yield nothing.
+  runs="$("$REAL_GH" api --paginate "repos/$REPO/commits/$sha/check-runs?per_page=100" 2>&1 \
+        | jq -s '{check_runs: ([.[].check_runs[]] // [])}')" || die "$runs"
+  # gh's statusCheckRollup also carries LEGACY COMMIT STATUSES (StatusContext), which live on a
+  # different endpoint. Omitting them would leave a protection context permanently "missing", so a
+  # PR could never read green. Union both.
+  sts="$("$REAL_GH" api "repos/$REPO/commits/$sha/status" 2>&1 || echo '{}')"
+  R="$runs" S="$sts" python3 -c '
+import os, json
+def load(k, key):
+    try: return (json.loads(os.environ.get(k) or "{}") or {}).get(key) or []
+    except Exception: return []
+runs=load("R","check_runs"); stat=load("S","statuses")
+out=[]
+for c in runs:
+    st=(c.get("status") or "").lower(); cc=(c.get("conclusion") or "").lower()
+    # gh reports the conclusion once a run completes, otherwise the live status.
+    out.append({"name":c.get("name"),"state":(cc if st=="completed" else st) or "pending",
+                "workflow":((c.get("app") or {}).get("slug") or ""),"link":c.get("details_url"),
+                "status":st,"conclusion":cc})
+for s in stat:
+    out.append({"name":s.get("context"),"state":(s.get("state") or "").lower() or "pending",
+                "workflow":(s.get("creator") or {}).get("login") or "","link":s.get("target_url"),
+                "status":"","conclusion":""})
+print(json.dumps(out))' | emit || exit 1
+  exit 0 ;;
+
+"pr list")
+  honour
+  [ -n "$REPO" ] || delegate
+  q="state=${STATE:-open}&per_page=100"
+  # REST wants head=OWNER:BRANCH; gh accepts a bare branch, so qualify it from --repo.
+  if [ -n "$HEADF" ]; then
+    case "$HEADF" in *:*) q="$q&head=$HEADF" ;; *) q="$q&head=${REPO%%/*}:$HEADF" ;; esac
+  fi
+  [ -n "$BASEF" ]  && q="$q&base=$BASEF"
+  [ -n "$LABELS" ] && q="$q&labels=$LABELS"
+  raw="$("$REAL_GH" api --paginate "repos/$REPO/pulls?$q" 2>&1 | jq -s 'add // []')" || die "$raw"
+  printf '%s' "$raw" | python3 -c "$PROJECT" "${JSON_F:-number,title,state}" pull "${LIMIT:-30}" | emit || exit 1
+  exit 0 ;;
+
+"issue list")
+  honour
+  [ -n "$REPO" ] || delegate
+  q="state=${STATE:-open}&per_page=100"
+  [ -n "$LABELS" ] && q="$q&labels=$LABELS"
+  raw="$("$REAL_GH" api --paginate "repos/$REPO/issues?$q" 2>&1 | jq -s 'add // []')" || die "$raw"
+  printf '%s' "$raw" | python3 -c "$PROJECT" "${JSON_F:-number,title,state}" issue "${LIMIT:-30}" | emit || exit 1
+  exit 0 ;;
+
+"pr ready")
+  honour
+  [ -n "$REPO" ] && [[ "$NUM" =~ ^[0-9]+$ ]] || delegate
+  "$REAL_GH" api -X POST "repos/$REPO/pulls/$NUM/ready_for_review" >/dev/null \
+    || die "ready_for_review failed for #$NUM"
+  echo "✓ Pull request #$NUM is marked as \"ready for review\""
+  exit 0 ;;
+
+"pr merge")
+  # ⛔ Delegate when the method is not explicit: real gh derives it from the repo's allowed merge
+  # methods (and errors rather than guessing). Defaulting to a merge commit would change semantics.
+  [ -n "$METHOD" ] || delegate
+  [ "$AUTO" = "1" ] && delegate          # GraphQL-only mutation
+  honour
+  [ -n "$REPO" ] && [[ "$NUM" =~ ^[0-9]+$ ]] || delegate
+  body=( -X PUT "repos/$REPO/pulls/$NUM/merge" -f "merge_method=$METHOD" )
+  [ -n "$SHA" ] && body+=( -f "sha=$SHA" )
+  out="$("$REAL_GH" api "${body[@]}" 2>&1)" || die "$out"
+  # A 200 is NOT a merge: the body carries the verdict. Reporting success on rc alone marks a PR
+  # merged in $O/state and drops it from the sweep forever while it is still open.
+  printf '%s' "$out" | python3 -c '
+import sys, json
+d=json.load(sys.stdin)
+if d.get("merged") is not True:
+    sys.stderr.write("gh-rest: merge not performed — %s\n" % (d.get("message") or "merged=false")); raise SystemExit(1)
+print("✓ Merged #%s (%s)" % (str(d.get("sha",""))[:7], d.get("message","merged")))' || exit 1
+  [ "$DELBR" = "1" ] && "$REAL_GH" api -X DELETE "repos/$REPO/git/refs/heads/$SHA" >/dev/null 2>&1 || true
+  exit 0 ;;
+
+"pr comment")
+  honour
+  [ -n "$REPO" ] && [[ "$NUM" =~ ^[0-9]+$ ]] || delegate
+  [ -n "$BODY" ] || delegate
+  # ⛔ PRINT THE URL. `merge-one.sh` requires the reviewer to echo the comment URL as its evidence
+  # artifact; swallowing it makes every reviewed PR park with a false "posted no comment" diagnosis.
+  out="$("$REAL_GH" api -X POST "repos/$REPO/issues/$NUM/comments" -f "body=$BODY" 2>&1)" \
+    || die "$out"
+  printf '%s' "$out" | python3 -c 'import sys,json
+d=json.load(sys.stdin); u=d.get("html_url") or ""
+if not u: sys.stderr.write("gh-rest: comment posted but the API returned no html_url\n"); raise SystemExit(1)
+print(u)' || exit 1
+  exit 0 ;;
+
+esac
+
+# Untranslated (api, run, repo, label, pr diff, pr update-branch, …): verbatim to the real gh.
+delegate

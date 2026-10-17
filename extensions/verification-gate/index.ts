@@ -4589,6 +4589,21 @@ export default function (pi: ExtensionAPI) {
     if (!isVerifier) return undefined;
     lastVerifierNote = null; // #1660: the disposition always reflects the LATEST verifier dispatch (a stale zero-merge note must not outlive the dispatch that supersedes it)
 
+    // #1662 — a `task({ background: true })` dispatch returns a RETURNS-EARLY
+    // notice AT DISPATCH, not a verifier verdict. Its content is deliberately
+    // unparseable, so feeding it to the #5724 fail-open below would mark the
+    // prompt's files verified BEFORE any verifier ran — a deterministic gate
+    // defeat reachable from a legitimately advertised parameter. The real
+    // verdict arrives later via `task_collect`, which this handler cannot
+    // consume (that result carries a run_id, not the original prompt). So a
+    // background [VGATE] dispatch is not a verdict at all: ignore it and leave
+    // the gate BLOCKED (fail-closed) until a verifier actually reports.
+    const bgDetails = event.details as { background?: boolean } | undefined;
+    if (bgDetails?.background === true || input.background === true) {
+      console.warn("[verification-gate] ⚠️ Ignoring a returns-early background `task` result — a background [VGATE] dispatch cannot satisfy the gate (#1662); the gate stays BLOCKED until a verifier verdict is delivered.");
+      return undefined;
+    }
+
     // Extract JSON from content
     const content = event.content;
     if (!content || content.length === 0) {

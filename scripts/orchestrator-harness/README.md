@@ -198,6 +198,7 @@ processes in tmux sessions, so a killed worker cannot take the controller down w
 | File | Meaning |
 |---|---|
 | `heartbeat` | epoch seconds, rewritten every cycle — the liveness probe |
+| `state/queue-state` | what the last pool READ saw, with the epoch of the read — `EMPTY`, `READ(<n>)`, `PARTIAL(<tiers>)` or `UNREADABLE`. `orch-loop.sh` prints it in the cycle line as `queue=$(queue_state_token)`, so a refresh that could not read the pool (`queue=UNREADABLE`) is never mistaken for a fleet with nothing to do (`queue=EMPTY`); an absent file reads `UNKNOWN`, never `EMPTY` (agent-infra#1931) |
 | `.orch.lock` | atomic single-instance lock (noclobber create); stale locks are reclaimed |
 | `candidates.txt` | the dispatch backlog: issue numbers that passed collision pre-flight |
 | `dispatched.txt` | issues already handed to a lane — **pruned** when the issue is still open, no PR branch matches it and no `lane-<N>` is live (see §7.1) |
@@ -304,6 +305,75 @@ when the cell has none (agent-infra#1717).
 There is no scheduler, no queue service, no shared database. Two boxes running this against
 the same repo work fine *because* GitHub is the coordination medium — but they will duplicate
 work unless they coordinate (see §5, "broad mode").
+
+### GitHub API surface — the REST adapter (`gh-rest`)
+
+The harness reaches GitHub through `gh`, whose hot paths (`pr view`, `pr checks`, `pr list`,
+`issue list`) are **GraphQL**. GraphQL has its own secondary limit, and when GitHub refuses it the
+failure is silent rather than loud: measured 2026-10-17, every GraphQL call returned
+`graphql_rate_limit` (even `{viewer{login}}`) while the primary quota still read `4511/5000` and the
+REST endpoints answered normally. A five-minute window with **every harness process killed** did not
+clear it.
+
+That one asymmetry stopped both halves of the harness, and neither log line named the cause:
+
+| Capability | Broken call | Symptom |
+|---|---|---|
+| dispatch | `fleet_state.py` board read (`gh pr list`) | *"the GitHub board could not be read"* → board stale → claim gate `INCOMPLETE` → backlog 0 |
+| merging | sweep per-PR reads (`gh pr view`, `gh pr checks`) | `NOCHECKS` → fail-closed → **no PR could merge** (19 mergeable PRs, hours) |
+
+`gh-rest/gh` is a PATH shim that supplies the REST equivalents for exactly those shapes and
+**delegates everything else verbatim** — including `gh api`, which is already REST:
+
+| Translated | REST endpoint |
+|---|---|
+| `pr view --json …` | `GET /repos/{o}/{r}/pulls/{n}` |
+| `pr checks --json …` | `GET /repos/{o}/{r}/commits/{sha}/check-runs` |
+| `pr list --json …` | `GET /repos/{o}/{r}/pulls?state=…` |
+| `issue list` / `issue view --json …` | `GET /repos/{o}/{r}/issues…` (PRs filtered out) |
+| `pr ready` | `POST …/pulls/{n}/ready_for_review` |
+| `pr merge` (incl. `--match-head-commit`) | `PUT …/pulls/{n}/merge` |
+| `pr comment --body` | `POST …/issues/{n}/comments` |
+
+**Design: an adapter, not a fork.** No harness file changes, so every cell stays on one harness
+version — the convergence property this repo exists to protect — while the API surface becomes a
+deployment concern. `install.sh` copies the shim to `$O/gh-rest/gh` and puts that directory **first**
+on the daemon `PATH`, so controller, lanes, chains and merge workers all inherit it.
+
+**Two deliberate refusals.** `pr merge --auto` is a GraphQL-only mutation (REST cannot express
+auto-merge), so it is *delegated* — it fails loudly while GraphQL is refused rather than pretending
+to have armed. And nothing is guessed: a failed REST call exits non-zero with the API's own message
+instead of returning an empty result that would read as "nothing to do".
+
+**The rule that keeps it honest:** a flag or filter the adapter does not model **delegates the whole
+call** to the real `gh`. It never drops a flag and answers anyway — dropping one is not a slow answer,
+it is a *wrong* one. Review of the first draft found that same bug at three severities, each of which
+would have caused the failure the adapter exists to prevent:
+
+| Dropped | Consequence |
+|---|---|
+| `pr list --head` | `chain-merge.sh` polls for "the branch's PR", gets the newest open PR, **merges an unrelated PR** and records the review marker against it |
+| `issue list --label` | the three severity queries return the same unfiltered list, so every issue is tier 0 and P0-before-P2 ordering inverts (#8465) |
+| `pr comment` output | `merge-one.sh` cannot extract the evidence URL and **parks every reviewed PR** with a false diagnosis |
+
+**Verify it** (offline; drives a stub `gh`, needs no credentials, 28 assertions):
+
+```bash
+bash gh-rest.test.sh
+```
+
+The invocations in the suite are **copied from the callers** (`chain-merge.sh`, `refresh-candidates.sh`,
+`fix-one.sh`, `merge-one.sh`), not invented — the first draft asserted shapes nobody used and shipped
+two P0s green. They pin: `--paginate` returning concatenated arrays; positionals starting at `$3`;
+a handler that falls through printing twice; REST's `open`/`true` vs gh's `OPEN`/`MERGEABLE`; REST
+`/issues` including PRs; `--limit`; legacy commit statuses (a protection context that is not a check
+run); a 200 whose body says `merged: false`; and a failing `--jq` exiting non-zero instead of looking
+like "no rows".
+
+**Known gap (tracked separately):** the install stamp and `check-deployed-drift.sh` fold their payload
+over `$O/*.sh` only, so this adapter — like `launchd.plist.template` — is outside the deployed-bytes
+record. Adding it in one place alone makes every healthy deployment read as drift, so it needs the
+stamp, the drift checker and the selftest moved together.
 
 ---
 
@@ -672,6 +742,7 @@ is re-dispatched on the next sweep, with `claim_live()` freeing the dead owner's
 [scope] open=24 -> BROAD (auto)             ← or (pinned SCOPE=own) / (pinned SCOPE=broad)
 [cap] load=7/100 lanes=4/4 mem_avail=11761M/512M swap_free=588M/600M   ← every gate names its ceiling
 [dispatch] load=7 lanes=4 -> 4429 4489
+[refresh] queue=READ(7) — every priority tier was READ; 7 candidate(s) listed (agent-infra#1931)
 [refresh] +#4508 CLEAN -> backlog
 #8219 FAILED:ai-review-gate          ← per-PR verdict for the required checks
 #8192 fixer attempt 1                ← routed to a fixer, not a re-record
@@ -679,6 +750,19 @@ is re-dispatched on the next sweep, with `claim_live()` freeing the dead owner's
 [cap] load=104/100 lanes=4/4 mem_avail=11890M/512M swap_free=588M/600M
 [dispatch] skipped (load=104>=max_load=100)   ← and WHY, naming the binding gate
 ```
+
+⛔ **`backlog=0` alone is never a clearance** (agent-infra#1931). The cycle line carries the pool's
+READ state beside it, and `EMPTY` is the only form that means "no work":
+
+```text
+=== <date> load=2 lanes=0 backlog=0 queue=UNREADABLE(3m) ===     ← BLIND: the last pool read FAILED
+=== <date> load=2 lanes=0 backlog=0 queue=PARTIAL(P0-blocker)(3m) ===  ← a SUBSET, not a pool
+=== <date> load=2 lanes=0 backlog=0 queue=EMPTY(12s) ===          ← read successfully, genuinely empty
+[dispatch] backlog empty queue=UNREADABLE(3m)                    ← the claim carries the state too
+```
+
+The age is part of the token on purpose: a value frozen by a refresh that stopped writing cannot pass
+as a fresh reading. `UNKNOWN` means no pass has EVER recorded a read — it is not `EMPTY`.
 
 ---
 
@@ -769,7 +853,7 @@ agent-infra#1709's headline finding is that duplicate execution is unavoidable a
 must be idempotent per head, so failing closed would stall the whole fleet on one transient error.
 `SCOPE=own` (§5, item 3) remains a useful partition but is no longer the only cross-box barrier.
 
-### 7.2c ISSUE dispatch was the uncovered window — **FIXED in agent-infra#1850**
+### 7.2d ISSUE dispatch was the uncovered window — **FIXED in agent-infra#1850**
 
 `refs/claims/<PR>-<head-sha12>` is **content-addressed on a head sha**, so it cannot express an
 issue at all: `claim_ref <pr> <sha>` has no sha to address, `claim_live()` returns 1 on an empty
@@ -805,29 +889,106 @@ reap. The decisions that are not obvious:
   which is sized (`CLAIM_ISSUE_TTL`, default 3 h) to cover lane + chain — releasing early is the
   normal path, so the lease only runs its full length when the box is gone.
 - **The pre-flight now CONSULTS it, and fails CLOSED.** `refresh-candidates.sh` calls
-  `claim_issue_preflight` after a clean tool verdict: a live claim is a **COLLISION** (left
-  unchecked, so a window is re-attempted when it closes), an **unreadable** registry is
-  **INCOMPLETE** and is never queued, and a registry that **cannot answer** (an older `$O/claims.sh`
-  with no issue functions — the drift `install.sh` reports) is INCOMPLETE too. This is the opposite
-  polarity from the PR claim's fail-open, on purpose: refusing a merge on a network blip costs one
-  merge, while certifying a free issue costs duplicated work on two boxes. The one limit is stated
-  rather than hidden — a box where `claims.sh` is **not installed** falls through to the
-  pre-registry behaviour **loudly**; `install.sh` seeds `$O/claims.sh`, and making a missing file
-  refuse would turn such a box merge-only, a bigger and less reversible failure.
+  `claim_issue_preflight` after a clean tool verdict and branches on its **exit code**, never on
+  output text: **0 CLEAN** (no claim, or the only claim expired) queues the issue; **1 COLLISION**
+  (a live claim, or a lease that cannot be parsed — a lease nobody can read is treated as live) is
+  left unchecked, so the window is re-attempted when it closes; **2 INCOMPLETE** (the registry could
+  not be READ — `git ls-remote` failed, or the local clock is unreadable) is never queued and counts
+  toward the run's aggregate `INCOMPLETE=n` line, and a pass that produced **no usable verdict at
+  all** exits transient (rc=1) — so an unreadable registry that queues nothing is a red run, not a
+  quiet one; **3 NOT PROVISIONABLE** (the registry is present but
+  predates the issue key — an `$O/claims.sh` with no `claim_issue_*` functions, i.e. the drift
+  `install.sh` reports) refuses the issue the same way, and rc=3 also earns a **`.refresh-blocked`**
+  marker (the provisioning channel: `orch-loop.sh` stops retrying and `status` names the reason), so a
+  persistent condition is visible rather than a silent no-queue. rc=2 does **not** write that marker —
+  it is transient by construction, so the pass exits 1 and the cycle is logged `FAILED rc=1` and
+  retried; the marker would make a network blip look like a broken cell. This
+  is the opposite polarity from the PR claim's fail-open, and it was applied to **every** exit, not
+  just the obvious one: an unrecognised status is treated as INCOMPLETE, so no future code path can
+  widen the CLEAN arm by accident. The one limit is stated rather than hidden — a box where
+  `claims.sh` is **not installed at all** falls through to the pre-registry behaviour **loudly**,
+  because making a missing file refuse would turn such a box merge-only, a bigger and less
+  reversible failure. (The file reaches `$O` by `cp -p "$H"/*.sh "$O"/` in
+  `scripts/deploy-crossbox.sh` — `install.sh` itself only diffs and reports drift; it does not copy.)
 
 Two incidental defects are fixed with it: `claim_release` read its third/fourth arguments **bare**
 under `set -u`, so a caller with no commit to fence on aborted with
 `line 260: $4: unbound variable` instead of taking the documented refusal — a release that **errors**
 leaves the claim held for the whole lease (3 h of a free issue, for the issue key).
 
-`test-claims.sh` (I1–I9) pins the issue key against live origin from two throwaway clones, including
-the **non-vacuity case for this defect**: A claims an issue with **no branch, no PR and no push of
-anything but the claim ref**, and B's pre-flight read must not be CLEAN — a test that only passes
-after a push does not test it. Measured: 35 of those assertions fail on the pre-change
-`claims.sh` (`CLAIMS_SH=<old copy> bash test-claims.sh`). `refresh-scout.test.sh` drives the
-**shipped** refresh step and the **shipped** dispatch block against a real local origin for the
-collision, unreachable, absent and stale-registry verdicts, plus the fenced release on the chain's
-exit path (14 assertions fail on the pre-change scripts).
+`test-claims.sh` (I1–I10) pins the issue key against live origin from two scratch repositories (each
+`git init` + `remote add origin <bare repo>` — **not** clones), including the **non-vacuity case for
+this defect**: A claims an issue with **no branch, no PR and no push of anything but the claim ref**,
+and B's pre-flight read must not be CLEAN — a test that only passes after a push does not test it.
+Its keys are random per run (`PR`/`ISSUE` overridable), because two concurrent runs of the suite used
+to collide on one fixed pair of refs in the **production** `refs/claims` namespace and delete each
+other's refs mid-CAS — a green suite then reported 15–19 false failures, and the fleet runs several
+reviewers of one PR at once. Measured (reproduce with the base commit of this PR as `<rev>`):
+
+```bash
+T=$(mktemp -d); cp scripts/orchestrator-harness/*.sh "$T/"
+git show <rev>:scripts/orchestrator-harness/claims.sh > "$T/claims.sh"
+CLAIMS_SH="$T/claims.sh" bash scripts/orchestrator-harness/test-claims.sh   # 65 passed, 44 failed
+```
+
+`refresh-scout.test.sh` drives the **shipped** refresh step and the **shipped** dispatch block against
+a real local origin for the collision, unreachable, absent, stale-registry and unrecognised-status
+verdicts, plus the fenced release on the chain's exit path and the generation guard. Measured (the
+counts cover the whole #1850 change — the feature and this fix round — not the fix alone):
+
+```bash
+cp scripts/orchestrator-harness/*.sh "$T/"
+for f in claims refresh-candidates orch-loop chain-merge dispatch-merge; do
+  git show <rev>:scripts/orchestrator-harness/$f.sh > "$T/$f.sh"; done
+( cd "$T" && bash ./refresh-scout.test.sh )                                  # PASS=72 FAIL=67
+```
+
+Three further defects in the same family are fixed and pinned with it, all fail-**open** directions:
+
+- **The pre-flight's clock is guarded.** `date +%s` is a *second* input to the same decision, and if
+it cannot be read the old comparison `[ "$now" -le "$until" ]` was neither true nor an error the
+code handled — bash prints `integer expression expected` and the test is FALSE, so the reader fell
+through to CLEAN. An unreadable clock is now rc=2 INCOMPLETE, alongside an unreadable registry.
+- **The release record is generation-guarded.** A chain captures the commit it pushed when it becomes
+the holder; the record file is keyed on the **issue**, so if the same box re-acquires after its lease
+lapses, a newer generation overwrites it. A release that read the file when its trap fired would
+fence on the new commit — which **is** the ref tip — delete the live holder's claim and free a busy
+issue for a peer. The captured generation is compared and a mismatch **refuses** the release (naming
+it), leaving the newer record for its own release. ⚠️ The guard is deliberately **inert on the
+no-chain path** in `dispatch-merge.sh`: that release runs seconds after the record was written, so
+the record *is* that dispatch's generation — there is no older holder to refuse, and the fence is the
+record's value. It earns its keep in `chain-merge.sh`, whose trap can fire hours later, after the same
+box has re-acquired and overwritten the record.
+- **The lease polarity has ONE implementation** (`_lease_unparseable` / `_lease_is_live`) shared by
+`claim_acquire`, `claim_issue_preflight` and `claim_prune` — three copies of the same comparison, and
+"a lease that cannot be read is live" is exactly the predicate they must not answer differently.
+(`orch-loop.sh`'s `claim_live` keeps a fourth deliberately: it reads the local SNAPSHOT rather than a
+ref and `selftest.sh` extracts it standalone, so it cannot share an in-process helper.)
+
+### 7.2d A refresh that cannot READ the pool reported an empty queue — **FIXED in agent-infra#1931**
+
+`backlog=0` was the same line whether the pool had been read and was empty or the pool listing had
+**failed**. Measured 2026-10-17: a cell refused on **131 consecutive passes** (its abort was correct)
+and dispatched nothing while 15 PRs were open; on every one of those cycles the controller's line
+read `backlog=0`, which is what a fleet with nothing to do also reads. The abort named the tiers in
+prose, but nothing carried a *state* an operator or an instrument could key on, and a **partial**
+read was reported with the identical sentence as a total one.
+
+**Fix:** the pool read is now ONE of four named outcomes, in one vocabulary: `EMPTY` (every tier was
+read and listed nothing — the only answer that may mean "no work"), `READ(<n>)` (every tier read,
+n candidates), `PARTIAL(<tiers>)` (some tiers could not be read, so the survivors are a subset and
+nothing is queued from it — #1736's rule, kept), and `UNREADABLE` (no tier could be read: the fleet
+is blind). The state is persisted to `state/queue-state` with the epoch of the read, and
+`orch-loop.sh` prints it as `queue=$(queue_state_token)` in the per-cycle heartbeat line and beside
+`[dispatch] backlog empty`, with the age of the reading (a frozen value cannot pass as a fresh one).
+An absent or unparseable record prints `UNKNOWN`, never `EMPTY`. The refusal polarity is unchanged
+and still fail-closed: a failed read exits TRANSIENT, never a green "nothing to do".
+
+⚠️ **Deliberately NOT fixed here** — this is the *reporting contract*, not the transport, and not the
+provisioning verdict: the fleet's shared gh backoff for GitHub's secondary (concurrency) limit is
+agent-infra#1910, and a refresh whose resolved tool directory is behind `origin/main` still says so
+only through its own existing refusals (issue #1931's directions 1 and 3, which this change does not
+touch). A pass that cannot read the pool now says `queue=UNREADABLE` while it refuses.
 
 ### 7.3 The harness is unversioned (this directory is the remedy)
 
@@ -873,6 +1034,26 @@ These are kept as a record because each one is a *failure mode of the design*, n
 | Defect | Impact | Fix |
 |---|---|---|
 | **`cmd_check` never tested `record-review.sh`, and neither cell script provisioned it (agent-infra#1717)** | `merge-one.sh` executes `$HOME/.pi/agent/scripts/record-review.sh` to mint the signed marker, and a fresh cell has no such file. `cmd_check` printed `CELL CAN RUN A CONTROLLER` anyway (a false PASS on the only question that verdict answers), the cell ran a full fresh-context review — up to `REVIEW_TIMEOUT` = 1800 s, **paid** — and only then hit 127. The pre-fix `exit 3` left no terminal state at all — nothing was recorded and nothing was parked: it returns from the `CLEAN*)` arm, and the `*)` arm that writes the fixer marker is reached only for a non-CLEAN verdict, so the marker was never written on this path either way: the next cycle saw an unmarked `FAILED:ai-review-gate` and spawned another review, **one paid review per cycle, forever** | `cmd_check` probes the runtime dependencies the loop actually invokes — `git`, `python3`, `pi` (`uv` warns, matching `install.sh`) and the recorder path it reads from `$CELL_HOME` — and refuses to print the verdict without them; `start` provisions the recorder from the checkout. The record step is also checked **before** the paid review in `merge-one.sh`, and any of its failures (absent, empty, non-executable, non-regular-file, non-zero rc, an `rc=0` record that posted **no signed marker** into the PR body, or a CLEAN verdict that named no comment) writes the controller's own terminal `state/parked-<PR>` marker at the reviewed head plus a `state/parkreason-<PR>` naming why — and the worker itself refuses to re-review a head it has already parked, so the `chain-<N>`/`fix-<one.sh>` paths that never consult the controller cannot re-pay either. The controller's own park sites (`orch-loop.sh`, conflict/fix/CI caps) write the same `parkreason-<PR>` pair through `park_ctrl()`, so a **controller** park at a moved head never leaves the previous head's reason behind for the exit-5 refusal to misreport. ⚠️ **Residual:** `merge-one.sh`'s own rail cap writes `state/parked-<PR>` directly and no `parkreason-<PR>`; that site `exit 0`s before the exit-5 refusal can print a reason, so it cannot itself misreport — but a human reading `state/parkreason-<PR>` beside a newer marker still can. A later push changes the head and re-arms the PR by construction |
+
+### 7.4c Defects found in the agent-infra#1850 review (fixed here)
+
+All but one are fail-**open** in a gate whose whole purpose is to refuse: each certifies a busy or
+unverifiable issue as free, hands it to a second box, or lets a release run without its fence. Pinned
+by `test-claims.sh` (I10, I9(5), I9(7)) and `refresh-scout.test.sh` §8(g) (unrecognised status),
+§9(iii) (stale-registry dispatch), §10 (fenced + generation-guarded release, and the CAPTURE that
+wires it) and §11 (the chain-failure branch). The last two were found in the second (adversarial)
+review cycle, precisely by asking what each new assertion would do if the line it protects were
+deleted.
+
+| Defect | Impact | Fix |
+|---|---|---|
+| **the CLEAN arm was a wildcard** (`case $rc in 0) queue;; 1) COLLISION;; *) INCOMPLETE`) | the intended set is {0,1,2}; `*)` silently absorbed everything else, so a **stale** registry (`rc=3`) and an unexecutable `claims.sh` (`rc=127`) both queued the issue — the pre-flight asking its question and then ignoring a "cannot answer" | explicit `0` / `1` / `2`+`*` / `3` arms; anything unrecognised is INCOMPLETE, so no future status widens CLEAN by default |
+| **`claim_issue_preflight`'s clock was unguarded** | `date +%s` is a *second* input to the same decision — the `ls-remote` read that proves "no claim ref exists" does not need it, but the lease comparison does. On an unreadable clock `[ "$now" -le "$until" ]` is FALSE (bash prints `integer expression expected`), so a **held** claim's reader fell through to `return 0` — a **false CLEAN** in the one direction the gate exists to prevent | a non-numeric/empty `now` is rc=2 INCOMPLETE, alongside an unreadable registry |
+| **the release record was read when the trap FIRED, not when the claim was taken** | the record file is keyed on the **issue**, so a box that re-acquires after its lease lapses overwrites it. The older chain's trap then fenced on the *new* commit — which **is** the ref tip — and deleted the live holder's claim, freeing a busy issue for a peer: the exact duplicate the key exists to prevent | `chain-merge.sh` captures the commit at chain start (`claim_issue_record_commit`) and `claim_issue_release_record` refuses on a generation mismatch, naming it and leaving the newer record intact |
+| **a registry too old to take a claim still dispatched** | `refresh-candidates.sh` refused every issue on such a box (`rc=3`) while `orch-loop.sh` acquired anyway, found no `claim_issue_acquire`, and **dispatched unclaimed** — the fail-open half of the same condition, and the collision on two boxes | present-but-stale is now split from genuinely-absent: the loop refuses the dispatch and names the fix; only a **missing** `claims.sh` (pre-registry box) falls through, loudly |
+| **release failures were silent** (`>/dev/null 2>&1 && echo`) | a refused or failed release left the claim held for its whole lease (3 h of a free issue) with nothing in the log to say so — and `CLAIM_RESULT` was lost because the helper ran in a subshell | the helper `declare -f`s the function, sources `claims.sh` into the **current** shell, passes the captured commit, and logs the reason on every failure branch |
+| **the chain-failure arm released a claim whose LANE was still running** | the lane is spawned *before* the chain in the same loop body, so "no chain will ever run" was true while "nothing is running" was **not**: the release declared an issue this box was actively implementing free, a peer claimed it and duplicated the work, and this box still opened a PR nothing would merge | stop the lane first (exact session match) and release only once it is confirmed gone; if it cannot be stopped, **keep** the claim — the lease expiring it is the safe direction |
+| **`CLAIM_COMMIT` was a per-CYCLE global** (not fail-open — state hygiene) | `claims.sh` reset it only when sourced, so an acquire that failed *before* any push (`rc=2`: unreadable ref, unfetchable claim) left the **previous** issue's commit in it. `orch-loop.sh`'s "rc=2 with a claim commit → record it and try a fenced release" then wrote a handover record for an issue this box never claimed, consumed it, and logged a release that never happened — the fence keeps the registry safe, but the *log* is what an operator reads | cleared at the top of `_claim_acquire_at`, so the value always means "what THIS attempt may have pushed" |
 
 ### 7.5 Still open, deliberately not fixed here
 
@@ -1007,7 +1188,7 @@ algorithmic advantage. The claim worth evaluating is *utilisation*, not *efficie
 | Script | Role |
 |---|---|
 | `orch-loop.sh` | the controller: merge sweep → capacity-gated dispatch → backlog refresh |
-| `claims.sh` | cross-box claim registry: `refs/claims/<PR>-<head-sha12>` CAS, lease-as-data, `--force-with-lease` fencing. Sourced by `orch-loop.sh`, `merge-one.sh` and `fix-one.sh` |
+| `claims.sh` | cross-box claim registry: `refs/claims/<PR>-<head-sha12>` for PRs and `refs/claims/issue-<N>` for issues (agent-infra#1850), same CAS, lease-as-data and `--force-with-lease` fencing. Sourced by `orch-loop.sh`, `refresh-candidates.sh`, `chain-merge.sh`, `dispatch-merge.sh`, `merge-one.sh` and `fix-one.sh` |
 | `repo-authority.sh` | **the per-repo merge contract** (agent-infra#1764): reads THIS repo's required status checks and derives whether the review gate applies to it, so the controller no longer enforces tortoise's check names on every repo. Fail-closed — an unreadable or unrepresentable set refuses. Sourced by `orch-loop.sh` and `merge-one.sh` |
 | `dispatch-merge.sh` | creates the worktree and starts the `lane-*` + `chain-*` pair for an issue |
 | `lane.sh` | the implementation worker (prompt template included) |
@@ -1017,9 +1198,9 @@ algorithmic advantage. The claim worth evaluating is *utilisation*, not *efficie
 | `refresh-candidates.sh` | pre-flights issues (collision check) into the backlog |
 | `selftest.sh` | offline checks; each one drives the shipped code. Not part of the loop |
 | `test-gates.sh` | the `mp_reason` dispatch-gate rule table, extracted from the shipped `orch-loop.sh`. Not part of the loop |
-| `test-claims.sh` | the claim CAS against live origin from two throwaway clones. Not the cross-box proof (one machine), but red on a defeated CAS. Not part of the loop |
+| `test-claims.sh` | the PR **and issue** claim CAS against live origin from two scratch repos (`git init` + `remote add`, not clones; random keys per run so concurrent runs cannot collide). Not the cross-box proof (one machine), but red on a defeated CAS. Not part of the loop |
 | `test-crossbox.sh` | drives the real `merge-one.sh` claim acquire + trap release with `gh` stubbed. Not part of the loop |
-| `refresh-scout.test.sh` | the agent-infra#1736 contract: repo-aware scout provisioning, per-repo tool resolution, and the permanent/transient refresh split. Not part of the loop |
+| `refresh-scout.test.sh` | the agent-infra#1736 contract — repo-aware scout provisioning, per-repo tool resolution, the permanent/transient refresh split — plus the agent-infra#1850 issue-claim pre-flight verdict table (CLEAN/COLLISION/INCOMPLETE/NOT PROVISIONABLE/unrecognised), the dispatch-side claim, and the fenced + generation-guarded release. Not part of the loop |
 | `check-port-drift.sh` | gates the tortoise-side removal: fails if the tortoise harness moved past the pinned sync point (`port-provenance.txt`). Not part of the loop |
 | `cloud-cell-record-dep.test.sh` | #1717: drives `cloud-cell-supervisor.sh check/start` and `merge-one.sh` against a stubbed toolchain — the recorder is a checked, provisioned dependency, and a record failure parks. Registered in `scripts/run-bash-shards.sh`, so both CI lanes run it |
 | `check-deployed-drift.sh` | answers whether the DEPLOYED `$O` matches the repo: the recorded commit against the live ref (`merge-base --is-ancestor`, never a commit count), the recorded payload hash against the deployed bytes, and every repo-shipped `*.sh` blob against its `$O` copy. Exit 0 match / 1 drift / **2 UNKNOWN — never a pass** (agent-infra#1745). Not part of the loop |
@@ -1074,7 +1255,7 @@ O="${O:-$HOME/orchestrator}"
 ```
 
 The shipped copies are **not** byte-identical to the ones running on the original box: they are
-those copies **plus every §7.4 fix** (and the §7.4b ones). `install.sh` compares the scripts it invokes — the nine loop
+those copies **plus every §7.4 fix** (and the §7.4b and §7.4c ones). `install.sh` compares the scripts it invokes — the nine loop
 scripts in §9 plus the manual `adopt-fix.sh` — against the running copies at `$O` and warns loudly
 on drift, because the daemon executes `$O/<script>` — a fix that only lands in this directory is not
 in effect. That set is the one `install.sh`'s drift loop lists; `selftest.sh` is shipped but not
@@ -1119,6 +1300,9 @@ agent-infra#1736.
    `agent-infra/scripts/orchestrator-harness/` (agent-infra#1700).
 2. Should the two boxes coordinate through an explicit claim registry instead of branch-name
    heuristics? tortoise#5052 already proposes "an authoritative, expiring claim registry" —
-   §7.1 is the same problem seen from the dispatcher's side.
+   §7.1 is the same problem seen from the dispatcher's side. **Partly answered 2026-10-15/16:**
+   both keys now exist (`refs/claims/<PR>-<head-sha12>` for merges, `refs/claims/issue-<N>` for
+   dispatch — §7.2b/§7.2d). What is still open is **coverage, not mechanism**: every path that can
+   take work must remember to acquire, and an issue claim is still no proof of life.
 3. Is a `~/`-rooted bash harness the right shape at all, or should this fold into the fleet
    rail's cmux workspaces (agent-infra#1683)?
