@@ -608,14 +608,21 @@ touch "$O/checked.txt" "$O/candidates.txt"
 # and that whole priority tier silently disappears into a "healthy" backlog, the #8465 priority
 # inversion this sort exists to prevent (#1853 review). The sentinel is a real file write from the
 # pipeline's subshell, so the parent sees it.
-rm -f "$O/.pool-err"
+# ⛔ EACH QUERY RECORDS WHICH WAY IT WENT, not only when it failed. `.pool-read` gets the tier
+# that ANSWERED (even with zero rows), `.pool-err` the tier that did not — so UNREADABLE (nothing
+# answered) is a fact the parent can check rather than an inference from an empty error file, and
+# PARTIAL can NAME the tiers that were read instead of only the ones that failed.
+rm -f "$O/.pool-err" "$O/.pool-read"
 {
-  gh issue list --repo "$OR" --state open --limit 300 --label P0-blocker --json number,assignees,title \
-    --jq '.[]|select((.assignees|length)==0)|select(.title|test("^(epic|lane|OWNER DECISION|decision|analysis|investigation)";"i")|not)|"0 \(.number)"' 2>>"$O/.pool-err" || echo "P0-blocker" >> "$O/.pool-err"
-  gh issue list --repo "$OR" --state open --limit 200 --label P1-severe --json number,assignees,title \
-    --jq '.[]|select((.assignees|length)==0)|select(.title|test("^(epic|OWNER DECISION)";"i")|not)|"1 \(.number)"' 2>>"$O/.pool-err" || echo "P1-severe" >> "$O/.pool-err"
-  gh issue list --repo "$OR" --state open --limit 200 --label P2-moderate --json number,assignees,title \
-    --jq '.[]|select((.assignees|length)==0)|select(.title|test("^(epic|OWNER DECISION)";"i")|not)|"2 \(.number)"' 2>>"$O/.pool-err" || echo "P2-moderate" >> "$O/.pool-err"
+  if gh issue list --repo "$OR" --state open --limit 300 --label P0-blocker --json number,assignees,title \
+    --jq '.[]|select((.assignees|length)==0)|select(.title|test("^(epic|lane|OWNER DECISION|decision|analysis|investigation)";"i")|not)|"0 \(.number)"' 2>>"$O/.pool-err"; then echo "P0-blocker" >> "$O/.pool-read"
+  else echo "P0-blocker" >> "$O/.pool-err"; fi
+  if gh issue list --repo "$OR" --state open --limit 200 --label P1-severe --json number,assignees,title \
+    --jq '.[]|select((.assignees|length)==0)|select(.title|test("^(epic|OWNER DECISION)";"i")|not)|"1 \(.number)"' 2>>"$O/.pool-err"; then echo "P1-severe" >> "$O/.pool-read"
+  else echo "P1-severe" >> "$O/.pool-err"; fi
+  if gh issue list --repo "$OR" --state open --limit 200 --label P2-moderate --json number,assignees,title \
+    --jq '.[]|select((.assignees|length)==0)|select(.title|test("^(epic|OWNER DECISION)";"i")|not)|"2 \(.number)"' 2>>"$O/.pool-err"; then echo "P2-moderate" >> "$O/.pool-read"
+  else echo "P2-moderate" >> "$O/.pool-err"; fi
 } | sort -k1,1n -k2,2n | awk '!seen[$2]++ {print $2}' > "$O/.pool"
 # ⛔ AN UNWRITTEN POOL IS NOT AN EMPTY ONE, and the test for it is the redirect's STATUS, not the
 # FILE's existence: a `.pool` left behind by an earlier run satisfied a `[ -f ]` test while THIS run's
@@ -626,20 +633,93 @@ rm -f "$O/.pool-err"
 # turns the extracted pipeline into a syntax error and reddens the #8465 severity-ordering check —
 # which would then stop covering the very ordering the pool depends on.
 pool_rc=$?
+
+# ── THE POOL'S READ STATE: EMPTY, PARTIAL or UNREADABLE (agent-infra#1931) ────────────────────
+# ⛔ A LAYER THAT CANNOT SEE MUST NOT REPORT AN EMPTY QUEUE. Measured 2026-10-17: a cell whose pool
+# listing failed refused correctly on 131 consecutive passes and dispatched nothing while 15 PRs sat
+# open — and `backlog=0` in the controller's cycle line was indistinguishable from a fleet with
+# nothing to do. So the read's outcome is now a NAMED state, in ONE vocabulary, and `EMPTY` is
+# reserved for the only answer that may ever mean "no work":
+#   EMPTY         every priority tier was READ, and the pool listed no dispatchable issue.
+#   READ(<n>)     every priority tier was read, and n candidate(s) were listed. A non-empty pool is
+#                 never labelled EMPTY; it is a third, plainly-different readable answer.
+#   PARTIAL(<t>)  some tiers were read and <t> were NOT — the survivors are a SUBSET, never a
+#                 complete pool, so nothing is queued from it (#1736).
+#   UNREADABLE    NO tier could be read. The fleet is BLIND to the backlog, and that is not "nothing
+#                 to do" — it is the state this whole change exists to make visible.
+# The state is persisted WITH the epoch of the read, so the controller's heartbeat line can carry it
+# (orch-loop.sh's queue_state_token prints it together with its age, so a frozen value cannot pass
+# as a fresh one). It is the READ's state, not the backlog's: it stays true even when a later step of
+# this pass refuses, and it never overrides the fail-closed refusals below.
+QUEUE_STATE_FILE="$O/state/queue-state"
+queue_state_write() {  # <STATE> — record what THIS pass learned about the pool, for the heartbeat
+  mkdir -p "$O/state" 2>/dev/null
+  if ! printf '%s %s\n' "$1" "$(date +%s)" > "$QUEUE_STATE_FILE" 2>/dev/null; then
+    # NOT fatal on purpose: this is the REPORTING contract, not the gate. The pass still refuses or
+    # queues exactly as before; what is lost is the heartbeat's copy of the state, and it says so
+    # rather than leaving a previous pass's reading standing in for this one.
+    echo "[refresh] WARN: cannot record the pool read state into $QUEUE_STATE_FILE — the heartbeat will not carry whether this pass could SEE the pool (agent-infra#1931)"
+  fi
+}
+# Which of the three tiers answered. A tier that recorded NEITHER outcome did not answer, so it
+# counts as FAILED: a read whose outcome cannot be proven is not a read (fail-closed).
+POOL_READ=""; POOL_FAILED=""
+for _tier in P0-blocker P1-severe P2-moderate; do
+  if grep -qx "$_tier" "$O/.pool-read" 2>/dev/null; then POOL_READ="$POOL_READ $_tier"
+  else POOL_FAILED="$POOL_FAILED $_tier"; fi
+done
+POOL_READ="${POOL_READ# }"; POOL_FAILED="${POOL_FAILED# }"
+
 if [ "$pool_rc" -ne 0 ]; then
+  # The listing ran but could not be CAPTURED, so this pass has no pool it can trust — blind, not empty.
+  queue_state_write "UNREADABLE"
+  echo "[refresh] queue=UNREADABLE — the pool listing could not be CAPTURED into $O (rc=$pool_rc), so this pass is blind to the backlog; that is not \"nothing to do\" (agent-infra#1931)"
   echo "[refresh] ABORT: cannot write the candidate pool into $O — the pool this pass would read is not the one it just listed"
   exit "$EXIT_TRANSIENT"
 fi
 
 # ⛔ AN UNREADABLE POOL IS NOT AN EMPTY ONE. TRANSIENT on purpose: the failure says nothing about
 # WHICH host would come back, and a marker only a human can clear must not be latched on a guess.
-if [ -s "$O/.pool-err" ]; then
-  echo "[refresh] ABORT: the candidate pool listing FAILED for $(grep -oE 'P[012]-[a-z]+' "$O/.pool-err" | tr '\n' ' ')— a partial pool is not a backlog (#1736)"
+# The state is written and printed BEFORE the abort, so the refusal and the heartbeat agree.
+if [ -n "$POOL_FAILED" ]; then
+  if [ -n "$POOL_READ" ]; then
+    # The argument names the tiers that could NOT be read, comma-joined (no spaces: the token is one
+    # field in a log line a human and a grep both read).
+    POOL_STATE="PARTIAL($(printf '%s' "$POOL_FAILED" | tr ' ' ','))"
+    queue_state_write "$POOL_STATE"
+    echo "[refresh] queue=$POOL_STATE — the pool listing could not be read for $POOL_FAILED (read: $POOL_READ), so the survivors are a SUBSET, not a complete pool, and nothing is queued from it (#1736, agent-infra#1931)"
+    # The refusal says which of the two shapes it is: a partial pool, or no pool at all.
+    echo "[refresh] ABORT: the candidate pool listing FAILED for $POOL_FAILED — a partial pool is not a backlog (#1736)"
+  else
+    POOL_STATE="UNREADABLE"
+    queue_state_write "$POOL_STATE"
+    echo "[refresh] queue=$POOL_STATE — NO priority tier could be read ($POOL_FAILED FAILED), so the fleet is BLIND to the backlog; \"no candidates\" here is NOT \"nothing to do\" (agent-infra#1931)"
+    echo "[refresh] ABORT: the candidate pool listing FAILED for $POOL_FAILED — no tier could be read, so there is NO pool to dispatch from (#1736)"
+  fi
   sed -n '1,6p' "$O/.pool-err" | sed 's/^/[refresh]   /'
-  rm -f "$O/.pool-err"
+  rm -f "$O/.pool-err" "$O/.pool-read"
   exit "$EXIT_TRANSIENT"
 fi
-rm -f "$O/.pool-err"
+rm -f "$O/.pool-err" "$O/.pool-read"
+# Every tier was read, so EMPTY is now an admissible answer — and the ONLY one that may say "no work".
+POOL_ROWS="$(wc -l < "$O/.pool" 2>/dev/null | tr -d ' ')"
+case "${POOL_ROWS:-}" in
+  ''|*[!0-9]*)
+    # The pool was just written at rc 0, so an unreadable row count means the file is gone or was
+    # replaced under us. UNKNOWN is not empty: refuse rather than report a backlog nobody counted.
+    queue_state_write "UNREADABLE"
+    echo "[refresh] queue=UNREADABLE — the pool was written but its row count could NOT be read, so this pass cannot say what it listed; that is not \"nothing to do\" (agent-infra#1931)"
+    echo "[refresh] ABORT: cannot count the candidate pool at $O/.pool — refusing to report a backlog this pass did not measure (#1736)"
+    exit "$EXIT_TRANSIENT" ;;
+esac
+if [ "$POOL_ROWS" -eq 0 ]; then
+  POOL_STATE="EMPTY"
+  echo "[refresh] queue=$POOL_STATE — every priority tier was READ and listed no dispatchable issue: this pass can SEE the pool, and it is genuinely empty (agent-infra#1931)"
+else
+  POOL_STATE="READ($POOL_ROWS)"
+  echo "[refresh] queue=$POOL_STATE — every priority tier was READ; $POOL_ROWS candidate(s) listed (agent-infra#1931)"
+fi
+queue_state_write "$POOL_STATE"
 
 n=0
 # `usable` counts the verdicts the pre-flight produced that the caller can act on: CLEAN, COLLISION,

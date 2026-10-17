@@ -433,6 +433,39 @@ async function main() {
     await fire("session_start", {});
   });
 
+  test("scenario 8c (#1662): a returns-early BACKGROUND `[VGATE]` dispatch must not fail-open the gate", async () => {
+    const repo = join(TEST_ROOT, "repo");
+    git(repo, "reset -q");
+    await fire("session_start", {});
+    writeFileSync(join(repo, "fileBG.txt"), "bg1\n");
+    git(repo, "add fileBG.txt");
+    const prompt = `[VGATE] verify files: fileBG.txt. Classification: UI. Project root: ${repo}`;
+    // Block first — establishes lastBlockedCwd/lastBlockedFiles (what the
+    // prompt-merge fail-open would consume).
+    const blocked = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m 'bg0'", cwd: repo },
+    });
+    ok(blocked && blocked.block === true, "must be blocked before any verifier verdict");
+    // The EXACT shape `task({ background: true })` emits for a [VGATE] prompt:
+    // a returns-early notice that is unparseable BY DESIGN, carrying the
+    // background marker on the input and on the result details. Pre-fix this
+    // fell into the #5724 unparseable fail-open and marked fileBG.txt verified
+    // before any verifier ran — a deterministic gate defeat.
+    await fire("tool_result", {
+      toolName: "task",
+      input: { prompt, background: true },
+      details: { background: true, status: "running" },
+      content: [{ type: "text", text: "🚀 Background sub-agent dispatched (returns-early).\nrun_id: 11111111-1111-4111-8111-111111111111" }],
+    });
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m 'bg1'", cwd: repo },
+    });
+    ok(res && res.block === true, "a background dispatch notice must NOT verify files — the gate stays BLOCKED until a real verdict");
+    await fire("session_start", {});
+  });
+
   test("scenario 8b (#561 review r4): unparseable arm single-fire — 3 strikes + post-latch dispatch → exactly ONE audit", async () => {
     const repo = join(TEST_ROOT, "repo");
     git(repo, "reset -q");
