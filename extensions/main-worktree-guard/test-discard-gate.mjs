@@ -793,25 +793,56 @@ async function partB() {
     expectTrue("B12a: #1139 — the sanctioned recovery helper is ALLOWED from a hub-rooted session (M5 exempts it, as M4 does)",
       allowed(sanctionedRun), `reason=${JSON.stringify(sanctionedRun?.reason ?? "").slice(0, 300)}`);
 
-    // The SAME content at the SAME relpath in a DIFFERENT checkout must still
-    // block: the anchor is the guard's own checkout, never a relpath match and
-    // never the invoking cwd. Driven from the hermetic WORKTREE so M4 (which
-    // early-returns for worktree sessions) cannot be the gate that fires — the
-    // block has to be M5's.
+    // The SAME content at the SAME relpath in a DIFFERENT checkout must still be
+    // GATED: the anchor is the guard's own checkout, never a relpath match and
+    // never the invoking cwd. Driven from the hermetic WORKTREE so the gate that
+    // fires has to be M5's.
+    //
+    // #1060 CHANGED THE SHAPE OF THIS PIN, and the change IS the point. The
+    // helper's salvage redirect is `git show "HEAD:$rest" > "$MAIN_REPO/$rest"`:
+    // `$rest` (the source) and `$MAIN_REPO` (the target's anchor, computed by
+    // the script at runtime from `git rev-parse --git-common-dir`) are BOTH
+    // statically unresolvable. #1139 left that to the generic
+    // unresolvable-pathspec rule, which failed CLOSED — so a COPY was refused
+    // even on a provably pristine fixture. That is precisely the #940 class
+    // (a legitimate `$var` pathspec refused on a clean checkout), so #1060's
+    // state predicate necessarily changes it. The PROPERTY this test exists for
+    // — a copy in another checkout is not exempt — is asserted directly instead
+    // of as a side effect of the fail-closed text: a copy in a checkout that
+    // CARRIES tracked dirt BLOCKS; on a pristine fixture there is nothing to
+    // destroy and it is allowed. Both halves are pinned, so neither the
+    // exemption nor the gate can drift unnoticed.
     mkdirSync(join(hub, "scripts", "checkout-hygiene"), { recursive: true });
     const copyPath = join(hub, "scripts", "checkout-hygiene", "hub-worktree.sh");
     write(copyPath, readFileSync(sanctionedRecovery, "utf8"));
-    const copyRun = await bash(`bash "${copyPath}"`, wt);
-    expectTrue("B12b: #1139 — the same content at the same relpath in another checkout is STILL BLOCKED (path-keyed, not content-keyed)",
-      blocked(copyRun) && /Working-tree discard blocked/.test(copyRun?.reason ?? "") &&
-      /not statically resolvable/.test(copyRun?.reason ?? ""),
-      `reason=${JSON.stringify(copyRun?.reason ?? "").slice(0, 300)}`);
+    // (a) PRISTINE fixture (B12-pre2 pinned the hub CLEAN) → the copy is not
+    // exempt, but with nothing to destroy the state predicate allows it.
+    const copyPristine = await bash(`bash "${copyPath}"`, wt);
+    expectTrue("B12b: #1139+#1060 — a copy in another checkout is NOT exempt, but a PRISTINE fixture has nothing to lose, so it is ALLOWED (state, not text)",
+      allowed(copyPristine), `reason=${JSON.stringify(copyPristine?.reason ?? "").slice(0, 300)}`);
+    // (b) The #1139 threat itself: a copy in a checkout that CARRIES TRACKED
+    // DIRT must block. `wt2` is the linked worktree the fixture already left
+    // dirty, and it is agent-WRITABLE — exactly the copy #1139 refuses to
+    // exempt. Run from `wt` (clean), so nothing about the session's own tree
+    // can be the reason.
+    mkdirSync(join(wt2, "scripts", "checkout-hygiene"), { recursive: true });
+    const copyDirtyPath = join(wt2, "scripts", "checkout-hygiene", "hub-worktree.sh");
+    write(copyDirtyPath, readFileSync(sanctionedRecovery, "utf8"));
+    const copyDirty = await bash(`bash "${copyDirtyPath}"`, wt);
+    expectTrue("B12b2: #1139 — the same copy in a DIRTY checkout (wt2, agent-writable) is STILL BLOCKED: the exemption is path-keyed, and the gate is state-keyed",
+      blocked(copyDirty) && /#709/.test(copyDirty?.reason ?? "") && /cat-file-revert/.test(copyDirty?.reason ?? ""),
+      `reason=${JSON.stringify(copyDirty?.reason ?? "").slice(0, 300)}`);
+    rmSync(copyDirtyPath, { force: true });
 
-    // The second half of #1139: the fail-closed arm above must not tell the
-    // operator the checkout is dirty (it provably is not — B12-pre2) and must
-    // not hand them the bypass hatch as the remedy for a target it could not
-    // even locate.
-    const unverifiableMsg = copyRun?.reason ?? "";
+    // #1060 — the FAIL-CLOSED TEXT assertions move to a producer that still
+    // reaches that arm (#940's fix removed the `cat-file-revert` route to it,
+    // because for THAT form the pathspec is the read-only SOURCE and the
+    // redirect is the destruction). `git checkout -- "$FILE"` is the arm's
+    // canonical producer: the pathspec names what is destroyed and it is not
+    // statically resolvable, so the arm must still fail closed. The message
+    // contract itself is unchanged, and it is asserted here rather than only in
+    // B10a so the four properties below keep a live producer.
+    const unverifiableMsg = (await bash('git checkout -- "$FILE"', wt))?.reason ?? "";
     expectTrue("B12c: the fail-closed message does NOT claim uncommitted changes exist",
       /NOT a claim that the checkout is dirty/.test(unverifiableMsg) &&
       !/carries\s+uncommitted changes/.test(unverifiableMsg) &&
@@ -1039,6 +1070,74 @@ async function partB() {
     delete process.env.PI_SESSION_ID;
     expectTrue("B11d: removing the marker re-arms M5",
       blocked(await bash("git checkout -- dirty.txt", wt)), "was allowed");
+
+    // ── B13 (#1125): a `cat-file-revert` HINT with NO write surface is NOT a
+    // discard — the sanctioned read-only triage tool must be RUNNABLE ──
+    //
+    // The form models "committed content reproduced onto its own path"
+    // (`git show HEAD:x > x`); the handler intersects the hint with the
+    // command's bash write targets for exactly that reason. With NO write
+    // target there is nowhere for the content to land. The fail-closed arm on
+    // an UNRESOLVABLE pathspec ran BEFORE that intersection, so a purely
+    // read-only probe whose path is a loop variable was refused:
+    // `scripts/stale-main-triage.sh` (the sanctioned diagnosis tool) could not
+    // be run by an agent, and the 2026-09-17 fleet-durability sweep hit the
+    // same construct in three repos. The negative controls below are the pins
+    // that this is an ordering fix, NOT a relaxation of the discard gate.
+    //
+    // The triage tool, driven on the DIRTY hub state it exists to diagnose
+    // (M4 is active there too — its git surface is read-only, so it must pass
+    // BOTH gates).
+    write(join(hub, "dirty.txt"), "MUTANT-HUB\n");
+    const triage = join(HERE, "..", "..", "scripts", "stale-main-triage.sh");
+    const triageRun = await bash(`bash "${triage}" --repo "${hub}"`, hub);
+    expectTrue("B13a (#1125): the sanctioned read-only triage tool RUNS on a dirty hub (was: `the target pathspec is not statically resolvable`)",
+      allowed(triageRun), `reason=${JSON.stringify(triageRun?.reason ?? "").slice(0, 240)}`);
+    // The sweep's shape: a per-file read-only existence probe inside a loop.
+    expectTrue("B13b (#1125): a `for`-loop `git cat-file -e \"origin/$ref:$f\"` probe (no write surface) is ALLOWED",
+      allowed(await bash(`for f in clean.txt; do git cat-file -e "origin/main:$f" || echo "not in origin"; done`, wt)),
+      "was blocked — a read-only existence probe is not a discard");
+    // Negative control 1: the SAME invocation WITH a landing redirect is still a
+    // real revert and must stay blocked (the loop variable makes the hint
+    // unresolvable, so this exercises the fail-closed arm the fix narrowed).
+    write(join(wt, "dirty.txt"), "MUTANT\n");
+    expectTrue("B13c (control): `for f in …; do git cat-file -e \"HEAD:$f\" > \"$f\"; done` is STILL BLOCKED (a write surface exists)",
+      blocked(await bash(`for f in dirty.txt; do git cat-file -e "HEAD:$f" > "$f"; done`, wt)),
+      "was allowed — the committed content lands on a write target");
+    // Negative control 2: a RESOLVABLE hint that lands on its own path is
+    // unchanged (`git show HEAD:x > x` — the form's core case).
+    expectTrue("B13d (control): a resolvable hint that lands on its own path (`git show HEAD:dirty.txt > dirty.txt`) is STILL BLOCKED",
+      blocked(await bash("git show HEAD:dirty.txt > dirty.txt", wt)),
+      "was allowed — the discard gate was relaxed");
+    // Negative control 3: a resolvable hint with NO write surface stays allowed
+    // (unchanged pre-existing behaviour — the fix only aligns the unresolvable
+    // case with it).
+    expectTrue("B13e (control): a resolvable hint with no write surface (`git cat-file -e HEAD:dirty.txt`) stays ALLOWED",
+      allowed(await bash("git cat-file -e HEAD:dirty.txt", wt)),
+      "was blocked — the fix over-tightened");
+
+    // ── B14 (#1125): the M4 block NAMES the disordered checkout + condition ──
+    // `"the shared main checkout"` was ambiguous across a machine with several
+    // checkouts: it sent two agents to the wrong repository for ~40 minutes and
+    // produced a destructive-command request against a healthy repo, because
+    // the disorder was in a DIFFERENT (unnamed) checkout. The hub is DIRTY
+    // right now (B13a), on main → the block must print `off-main`/`dirty` with
+    // the ABSOLUTE path, on BOTH the bash route and the write/edit route.
+    const bashMsg = (await bash("git commit -m x", hub))?.reason ?? "";
+    expectTrue("B14a: the bash-route M4 block NAMES the checkout and its resolved condition",
+      bashMsg.includes(`   Checkout: ${hub} (`) && bashMsg.includes("dirty: 1 path(s)"),
+      `reason=${JSON.stringify(bashMsg).slice(0, 260)}`);
+    process.chdir(hub);
+    let writeBlock;
+    try { writeBlock = await toolCall({ toolName: "write", input: { path: join(hub, "clean.txt") } }, undefined); }
+    finally { process.chdir(prevCwd); }
+    const writeMsg = writeBlock?.reason ?? "";
+    expectTrue("B14b: the write/edit-route M4 block NAMES the checkout too (same ambiguity, same fix)",
+      !!writeBlock?.block && writeMsg.includes(`   Checkout: ${hub} (`) && writeMsg.includes("dirty: 1 path(s)"),
+      `reason=${JSON.stringify(writeMsg).slice(0, 260)}`);
+
+    execSync("git checkout -q -- dirty.txt", { cwd: wt, stdio: "ignore" });
+    execSync("git checkout -q -- dirty.txt && git clean -qfd", { cwd: hub, stdio: "ignore" });
   } catch (e) {
     expectTrue("B: part B ran without throwing", false, String(e?.message ?? e).slice(0, 240));
   } finally {
@@ -1090,24 +1189,41 @@ async function partC() {
     const handlers = new Map();
     mod.default({ on(n, fn) { if (!handlers.has(n)) handlers.set(n, []); handlers.get(n).push(fn); } });
     const inertToolCall = handlers.get("tool_call")?.[0];
-    // The framework checkout is the SESSION cwd for both arms; the command is
-    // the sanctioned helper's own path. Only the loaded guard differs.
+    // The framework checkout owns the SANCTIONED path; the SESSION cwd is a
+    // HERMETIC repo that carries tracked dirt, and both arms are driven from
+    // there. #1060 made the session cwd's dirt load-bearing: the M5 arm is now
+    // decided on state, so a fixture that sat in the (clean, in CI) framework
+    // checkout made C1's expectation depend on whether whoever ran the suite
+    // happened to have uncommitted edits — which is precisely how the arm was
+    // decided anyway, and which CI caught. The hermetic dirty cwd makes the
+    // pair deterministic AND stronger: the ONLY difference between C1 and C2 is
+    // the loaded guard, the command is identical, and the candidate checkout
+    // holds real tracked dirt the discard would destroy.
     const frameworkCheckout = realpathSync(join(HERE, "..", ".."));
     const sanctioned = join(frameworkCheckout, "scripts", "checkout-hygiene", "hub-worktree.sh");
     const cmd = `bash "${sanctioned}"`;
-    process.chdir(frameworkCheckout);
+    const cHub = join(tmpc, "c-hub");
+    execSync(`git init -q -b main "${cHub}"`, { cwd: tmpc, stdio: "ignore" });
+    execSync("git config user.email t@t && git config user.name t", { cwd: cHub, stdio: "ignore" });
+    writeFileSync(join(cHub, "wip.txt"), "v1\n");
+    execSync("git add -A && git commit -qm init", { cwd: cHub, stdio: "ignore" });
+    writeFileSync(join(cHub, "wip.txt"), "MUTANT\n"); // tracked dirt
+    process.chdir(cHub);
     expectTrue("C0: the fixture guard loads with its non-M5 machinery intact (the anchor is the only difference)",
       !warnings.some((w) => /DISABLED/.test(w)), `warnings=${JSON.stringify(warnings).slice(0, 240)}`);
     const inert = await inertToolCall?.({ toolName: "bash", input: { command: cmd } }, undefined);
-    expectTrue("C1 (#1139 T6): an anchor carrying NO listed script FAILS CLOSED (the exemption is inert, not fail-open)",
-      !!inert && inert.block === true,
+    expectTrue("C1 (#1139 T6): an anchor carrying NO listed script keeps the discard GATED — with tracked dirt in the candidate checkout that is a BLOCK (the exemption is inert, never fail-open)",
+      !!inert && inert.block === true && /#709/.test(inert.reason ?? "") && /cat-file-revert/.test(inert.reason ?? ""),
       `handler returned ${JSON.stringify(inert)?.slice(0, 240)}`);
     // Control: the SAME command, SAME cwd, through the anchor-CORRECT guard.
+    // The exemption drops the harvested set, so the discard arm has nothing to
+    // decide even though the candidate checkout is dirty — which is what makes
+    // C1 a test of the ANCHOR and not of the dirt.
     const real = await import(pathToFileURL(INDEX_TS).href);
     const rh = new Map();
     real.default({ on(n, fn) { if (!rh.has(n)) rh.set(n, []); rh.get(n).push(fn); } });
     const anchored = await rh.get("tool_call")[0]({ toolName: "bash", input: { command: cmd } }, undefined);
-    expectTrue("C2 control: the SAME command through the anchor-CORRECT guard is ALLOWED",
+    expectTrue("C2 control: the SAME command through the anchor-CORRECT guard is ALLOWED (the exemption fires on a dirty candidate)",
       anchored === undefined || anchored === null,
       `handler returned ${JSON.stringify(anchored)?.slice(0, 240)}`);
   } catch (e) {
@@ -1120,6 +1236,249 @@ async function partC() {
 }
 
 await partC();
+
+// ────────────────────────────────────────────────────────────────────────
+// Part D (#1060) — the `cat-file-revert` arm is decided on STATE.
+//
+// The arm used to intersect the SOURCE pathspec (`HEAD:<path>`) with the
+// command's bash write targets by EXACT STRING EQUALITY of two independently
+// anchored templates. Measured on `origin/main` (`3262a25c`, and on `41efece`
+// where the issue was filed), with `dirty.txt` tracked and modified in the hub:
+//
+//     MAIN_REPO=<hub>; git -C "$MAIN_REPO" show HEAD:dirty.txt > "$MAIN_REPO/dirty.txt"
+//
+// is ALLOWED. The two spellings of the ONE path do not compare equal, so the arm
+// `continue`d; the redirect reverts TRACKED, MODIFIED hub content that was never
+// a git object and has no other copy — unrecoverable loss. The same template
+// weakness in the other direction is #940's friction: a `$var` pathspec
+// (`HEAD:"$x"`) matches no literal target either, but the generic
+// unresolvable-pathspec rule catches it and fails CLOSED, refusing a read-only
+// `git show` on a provably pristine checkout.
+//
+// D1–D3 pin the closure. D4–D6 pin the #940 shapes (allowed on a pristine
+// fixture, blocked where tracked dirt is reachable). D7 is the negative-control
+// surface. D8 pins the second reachability gap the issue names in the same code
+// path: M4's disorder early-return used to return BEFORE M5 ever evaluated, so
+// on a disordered hub the `HEAD:"$x" > "$x"` self-overwrite was allowed and
+// nothing else could decide it.
+// ────────────────────────────────────────────────────────────────────────
+async function partD() {
+  if (typeof stripTypeScriptTypes !== "function" ||
+      (typeof register !== "function" && typeof registerHooks !== "function")) {
+    skipped("D: real index.ts load", `node ${process.versions.node} lacks module.stripTypeScriptTypes`);
+    return;
+  }
+  const hooks = await import(new URL("./module-load-hooks.mjs", import.meta.url).href);
+  if (typeof registerHooks === "function") registerHooks({ resolve: hooks.resolve, load: hooks.load });
+  else register(new URL("./module-load-hooks.mjs", import.meta.url), import.meta.url);
+  process.removeAllListeners("warning");
+  const realWarn = console.warn;
+  console.warn = () => {};
+  let mod;
+  try { mod = await import(pathToFileURL(INDEX_TS).href); } finally { console.warn = realWarn; }
+  const handlers = new Map();
+  mod.default({ on(n, fn) { if (!handlers.has(n)) handlers.set(n, []); handlers.get(n).push(fn); } });
+  const toolCall = handlers.get("tool_call")?.[0];
+  if (typeof toolCall !== "function") { expectTrue("D0: factory registered a tool_call handler", false, "none"); return; }
+
+  const tmpd = realpathSync(mkdtempSync(join(tmpdir(), "discard-1060-")));
+  const hub = join(tmpd, "hub");
+  const wt = join(tmpd, "wt");
+  const wt2 = join(tmpd, "wt2");
+  const home = join(tmpd, "home");
+  const prevCwd = process.cwd();
+  const savedEnv = [...HATCH_VARS, "HOME", "PI_SESSION_ID", "SKILL_ENFORCER_DISABLED"]
+    .map((v) => [v, process.env[v]]);
+  const sh = (cmd, cwd) => execSync(cmd, { cwd, stdio: "ignore" });
+  const gg = (args, cwd) => execSync(`git ${args}`, { cwd, stdio: "ignore" });
+  try {
+    sh(`git init -q -b main "${hub}"`, tmpd);
+    gg("config user.email t@t && git config user.name t", hub);
+    writeFileSync(join(hub, "clean.txt"), "v1\n");
+    writeFileSync(join(hub, "dirty.txt"), "v1\n");
+    gg("add -A && git commit -qm init", hub);
+    gg(`worktree add -q -b feat "${wt}"`, hub);
+    gg(`worktree add -q -b feat2 "${wt2}"`, hub);
+    mkdirSync(join(home, ".pi", "agent"), { recursive: true });
+    for (const v of HATCH_VARS) delete process.env[v];
+    process.env.HOME = home;
+    delete process.env.PI_SESSION_ID;
+    process.env.SKILL_ENFORCER_DISABLED = "1";
+
+    const bash = async (command, cwd) => {
+      process.chdir(cwd);
+      try { return await toolCall({ toolName: "bash", input: { command } }, undefined); }
+      finally { process.chdir(prevCwd); }
+    };
+    const allowed = (r) => r === undefined || r === null;
+    const blocked = (r) => !!r && r.block === true;
+    const reason = (r) => String(r?.reason ?? "");
+    const hubDirty = () => writeFileSync(join(hub, "dirty.txt"), "MUTANT-HUB\n");
+    const hubClean = () => { gg("checkout -q -- dirty.txt", hub); };
+    const setScript = join(tmpd, "argscript-1060.sh");
+    writeFileSync(setScript, '#!/bin/sh\nf="$1"\ngit show HEAD:"$f" > "$f"\n');
+    const sanctionedD = realpathSync(join(HERE, "..", "..", "scripts", "checkout-hygiene", "hub-worktree.sh"));
+
+    // ── D1: the fail-open itself, in BOTH session geometries ──
+    // The issue measured it from a tracked-dirty hub; the worktree-rooted
+    // geometry is the one a `pi -p` child actually runs in, and it is closed by
+    // resolving a same-command `NAME=<literal>` assignment in the write target
+    // (`$MAIN_REPO` here) instead of comparing templates.
+    const X4 = `MAIN_REPO=${hub}; git -C "$MAIN_REPO" show HEAD:dirty.txt > "$MAIN_REPO/dirty.txt"`;
+    hubDirty();
+    const x4Hub = await bash(X4, hub);
+    expectTrue("D1a (#1060): a self-overwrite of TRACKED-DIRTY hub content via `-C \"$MAIN_REPO\"` is BLOCKED from a hub-rooted session",
+      blocked(x4Hub) && /#709/.test(reason(x4Hub)) && /cat-file-revert/.test(reason(x4Hub)),
+      `reason=${JSON.stringify(reason(x4Hub)).slice(0, 240)}`);
+    const x4Wt = await bash(X4, wt);
+    expectTrue("D1b (#1060): … and BLOCKED from a WORKTREE-rooted session (the same-command `$MAIN_REPO` is resolved before the probe)",
+      blocked(x4Wt) && /#709/.test(reason(x4Wt)), `reason=${JSON.stringify(reason(x4Wt)).slice(0, 240)}`);
+    expectTrue("D1c: the block names the checkout that actually carries the dirt (the HUB), not the session's own clean worktree",
+      /Checkout: .*\/hub\b/.test(reason(x4Wt)), `reason=${JSON.stringify(reason(x4Wt)).slice(0, 240)}`);
+    // The converse: no new block when nothing is at stake. A pristine hub must
+    // ALLOW the shape — a fail-closed-on-text arm would block it, and that is
+    // exactly how #940's friction was produced.
+    hubClean();
+    expectTrue("D2: on a PRISTINE hub the same command is ALLOWED (the fix must not become a blanket block)",
+      allowed(await bash(X4, hub)), "was blocked");
+
+    // ── D3: the same-command variable in the session's own tree ──
+    writeFileSync(join(wt, "dirty.txt"), "MUTANT-WT\n");
+    const x6 = await bash('F=dirty.txt; git show HEAD:dirty.txt > "$F"', wt);
+    expectTrue("D3: `F=dirty.txt; git show HEAD:dirty.txt > \"$F\"` on a dirty tree is BLOCKED (the target is not the literal spelling)",
+      blocked(x6) && /#709/.test(reason(x6)), `reason=${JSON.stringify(reason(x6)).slice(0, 240)}`);
+    writeFileSync(join(wt, "dirty.txt"), "v1\n");
+
+    // ── D4: the four #940 shapes on a PRISTINE hub — all ALLOWED ──
+    // F1 is the framework's own recovery helper (exempt by #1139's sanctioned
+    // list, which is checked BEFORE the discard walk and is deliberately NOT
+    // affected by this change: the helper exists to revert the hub's tracked
+    // dirt after capturing it, so blocking it on a dirty hub would break the
+    // recovery path #1139 re-opened).
+    hubClean();
+    const f1 = await bash(`bash "${sanctionedD}"`, hub);
+    expectTrue("D4a (#940 F1): the sanctioned recovery helper is ALLOWED on a pristine hub",
+      allowed(f1), `reason=${JSON.stringify(reason(f1)).slice(0, 200)}`);
+    const f2 = await bash(`bash -n ${setScript}`, hub);
+    expectTrue("D4b (#940 F2): `bash -n <script>` (a pure syntax check) is ALLOWED on a pristine hub",
+      allowed(f2), `reason=${JSON.stringify(reason(f2)).slice(0, 200)}`);
+    const f3 = await bash(`x=dirty.txt; git show HEAD:"$x" > /tmp/1060-d4-f3.txt`, hub);
+    expectTrue("D4c (#940 F3): `git show HEAD:\"$x\" > /tmp/…` is ALLOWED on a pristine hub",
+      allowed(f3), `reason=${JSON.stringify(reason(f3)).slice(0, 200)}`);
+    const f4 = await bash(`bash ${setScript} dirty.txt`, hub);
+    expectTrue("D4d (#940 F4): an arg-taking script with a `$var` pathspec is ALLOWED on a pristine hub",
+      allowed(f4), `reason=${JSON.stringify(reason(f4)).slice(0, 200)}`);
+
+    // ── D5: …and BLOCKED when the checkout the command runs in is dirty ──
+    // The question is about STATE, so on a tracked-dirty checkout the three
+    // non-sanctioned shapes keep failing CLOSED (they did before this change
+    // too — no new blocks on a dirty tree).
+    hubDirty();
+    expectTrue("D5a (#940 F2): `bash -n <script>` is BLOCKED on a tracked-dirty hub",
+      blocked(await bash(`bash -n ${setScript}`, hub)), "was allowed");
+    expectTrue("D5b (#940 F3): `git show HEAD:\"$x\" > /tmp/…` is BLOCKED on a tracked-dirty hub",
+      blocked(await bash(`x=dirty.txt; git show HEAD:"$x" > /tmp/1060-d5-f3.txt`, hub)), "was allowed");
+    expectTrue("D5c (#940 F4): the `$var` reader is BLOCKED on a tracked-dirty hub",
+      blocked(await bash(`bash ${setScript} dirty.txt`, hub)), "was allowed");
+    expectTrue("D5d (#940 F1): the SANCTIONED helper stays ALLOWED on a dirty hub — #1139's exemption is deliberate and precedes the walk",
+      allowed(await bash(`bash "${sanctionedD}"`, hub)), "was blocked — the recovery path #1139 re-opened");
+
+    // ── D7: negative controls — nothing that blocks today may start to allow ──
+    // (Run on the same tracked-dirty hub, so each row is a live discard.)
+    for (const [why, cmd, cwd] of [
+      ["literal self-overwrite", "git show HEAD:dirty.txt > dirty.txt", wt],
+      ["index-source self-overwrite", "git show :dirty.txt > dirty.txt", wt],
+      ["plain path restore", "git checkout -- dirty.txt", wt],
+      ["tree-source path restore", "git checkout HEAD -- dirty.txt", wt],
+      ["bare restore", "git restore dirty.txt", wt],
+      ["worktree-wide checkout", "git checkout -- .", wt],
+    ]) {
+      writeFileSync(join(wt, "dirty.txt"), "MUTANT-WT\n");
+      const r = await bash(cmd, cwd);
+      expectTrue(`D7: negative control — \`${why}\` still BLOCKED`, blocked(r), JSON.stringify(r)?.slice(0, 160));
+      writeFileSync(join(wt, "dirty.txt"), "v1\n");
+    }
+    // The ALLOW half: a bare read and a `/dev/null` sink destroy nothing, and
+    // untracked-only dirt is not tracked loss. These are the rows that catch an
+    // over-broad rewrite of this arm.
+    const allowRows = [
+      ["bare read (`git show HEAD:dirty.txt`, no redirect)", "git show HEAD:dirty.txt", wt],
+      // The pure-read half of the #940 friction: an unresolvable SOURCE with no
+      // redirect destroys nothing, so it must not reach the fail-closed arm.
+      ["bare read with a `$var` source (`git show HEAD:\"$x\"`)", 'x=dirty.txt; git show HEAD:"$x"', wt],
+      ["`/dev/null` sink", "git show HEAD:dirty.txt > /dev/null", wt],
+    ];
+    for (const [why, cmd, cwd] of allowRows) {
+      writeFileSync(join(wt, "dirty.txt"), "MUTANT-WT\n");
+      hubDirty();
+      const r = await bash(cmd, cwd);
+      expectTrue(`D7: negative control — \`${why}\` ALLOWED (nothing is discarded)`, allowed(r),
+        `blocked: ${JSON.stringify(reason(r)).slice(0, 160)}`);
+      writeFileSync(join(wt, "dirty.txt"), "v1\n");
+      hubClean();
+    }
+    // The outside-checkout sink is the arm's DECLARED FAIL-CLOSED COST, on BOTH
+    // sides of the state line — pinned so it is a recorded choice and not an
+    // accident. `git show HEAD:dirty.txt > /tmp/out` provably discards nothing,
+    // but the predicate asks whether a candidate checkout is pristine rather
+    // than proving the target is elsewhere (the issue's criterion 2 states
+    // exactly this: the #940 shapes are ALLOWED on a pristine hub and BLOCKED on
+    // a tracked-dirty one). Over-blocking is the direction this arm deliberately
+    // errs in: one wrong ALLOW here is unrecoverable, one wrong BLOCK costs a
+    // retry. A relaxant that scopes the `writeCwd` probe away when every target
+    // is statically outside every checkout would restore the allow — that is the
+    // documented trade, not a bug to "fix" silently.
+    hubClean();
+    expectTrue("D7: outside-checkout sink on a PRISTINE tree ALLOWED (the cost is state-conditional, not constant)",
+      allowed(await bash(`git show HEAD:dirty.txt > ${tmpd}/1060-d7-clean.txt`, hub)), "was blocked");
+    hubDirty();
+    expectTrue("D7: outside-checkout sink on a TRACKED-DIRTY tree BLOCKED (declared fail-closed cost, criterion 2)",
+      blocked(await bash(`git show HEAD:dirty.txt > ${tmpd}/1060-d7-dirty.txt`, hub)), "was allowed");
+    // Untracked-only dirt in a candidate checkout is NOT tracked loss — the arm
+    // must not degrade into "any dirt anywhere blocks".
+    writeFileSync(join(hub, "scratch-untracked-1060.txt"), "wip\n");
+    hubClean(); // tracked content restored — only the untracked file is left
+    expectTrue("D7: untracked-only dirt in the hub → the X4 shape is ALLOWED (no tracked loss)",
+      allowed(await bash(X4, wt)), "was blocked");
+    rmSync(join(hub, "scratch-untracked-1060.txt"), { force: true });
+
+    // ── D8: M4's disorder early-return must not shadow M5 ──
+    // The issue names this as a second reachability gap in the same region, to
+    // be assessed with the fix rather than separately. Measured before the fix
+    // on a DISORDERED hub from a hub-rooted session, this command was ALLOWED:
+    // M4 returned (the "recovery/allowed, non-push" early return) before M5 ran,
+    // `_hubBashTrackedWrite` cannot see a `$x` redirect, and `git show` is
+    // read-only by classification — so nothing decided it. The hub's own tracked
+    // dirt is exactly what it destroys.
+    hubDirty();
+    const shadow = await bash('x=dirty.txt; git show HEAD:"$x" > "$x"', hub);
+    expectTrue("D8 (#1060): on a DISORDERED hub the `HEAD:\"$x\" > \"$x\"` self-overwrite is BLOCKED (M4 no longer shadows M5)",
+      blocked(shadow) && /#709/.test(reason(shadow)), `reason=${JSON.stringify(reason(shadow)).slice(0, 240)}`);
+
+    // ── D9: the reason names the REDIRECT, never the source ──
+    // `git show HEAD:clean.txt > <target>` discards the TARGET; a message that
+    // names the source is the misattribution class #1139 removed from this very
+    // function. The target here is spelled through TWO variables, so only the
+    // state predicate (not the tracked-write gate) can own the decision.
+    hubDirty();
+    const cross = await bash(`M=${hub}; T=dirty.txt; git -C "$M" show HEAD:clean.txt > "$M/$T"`, wt);
+    expectTrue("D9 (#1060): the block for a cross-path revert names the REDIRECT target (`dirty.txt`), not the source (`clean.txt`)",
+      blocked(cross) && /#709/.test(reason(cross)) &&
+      /Target: dirty\.txt/.test(reason(cross)) && !/Target: clean\.txt/.test(reason(cross)),
+      `reason=${JSON.stringify(reason(cross)).slice(0, 300)}`);
+    hubClean();
+  } catch (e) {
+    expectTrue("D: part D ran without throwing", false, String(e?.message ?? e).slice(0, 240));
+  } finally {
+    process.chdir(prevCwd);
+    for (const [v, val] of savedEnv) { if (val === undefined) delete process.env[v]; else process.env[v] = val; }
+    try { execSync(`git worktree remove --force "${wt}"`, { cwd: hub, stdio: "ignore" }); } catch { /* best-effort */ }
+    try { execSync(`git worktree remove --force "${wt2}"`, { cwd: hub, stdio: "ignore" }); } catch { /* best-effort */ }
+    try { rmSync(tmpd, { recursive: true, force: true }); } catch { /* best-effort */ }
+  }
+}
+
+await partD();
 
 console.log(`\n${fail === 0 ? "✅" : "❌"} test-discard-gate: ${pass} passed, ${fail} failed, ${skip} skipped`);
 process.exit(fail === 0 ? 0 : 1);

@@ -63,6 +63,7 @@ Usage:
 """
 import argparse
 import glob
+import hashlib
 import importlib.util
 import json
 import os
@@ -80,6 +81,10 @@ LV_PATH = os.path.join(STATE, "lane-verdict.py")
 REG_PATH = os.path.join(STATE, "lane-registry.tsv")
 OUT_PATH = os.path.join(STATE, "NEEDS-ACTION.md")
 BEAT_PATH = os.path.join(STATE, "NEEDS-ACTION.beat")
+# Length of the recap digest the beat carries. 12 hex chars is 48 bits: the digest only has to
+# distinguish one tick's recap from the PREVIOUS tick's, and the pair it guards is replaced every
+# ~10 minutes on one machine -- it is not a security boundary.
+MD_SHA_LEN = 12
 
 
 def display_path(p):
@@ -170,9 +175,12 @@ def _refuse_if_degraded(rows, where):
     `lane-actions.py --stdin "$SNAP"`, and `lane-scan-fallback.sh` is a second `--stdin` caller.
     ⚠️ CORRECTED 2026-10-13: this named `queue-dispatch` as the invoke-path consumer, which is
     FALSE — `queue-dispatch.py` never references `lane-actions.py` at all (it drives
-    `lane-status.py` / `lane-guard.py`). The real invoke-path consumer is `pr-doctor.py:238`
-    (`lane-actions.py --json`). Both paths are guarded; the tests that pin them live in
-    test_lane_actions.py."""
+    `lane-status.py` / `lane-guard.py`). The real invoke-path consumer is `pr-doctor.py`
+    (the one `lane-actions.py --json` call, found with `rg -n 'lane-actions' scripts/pr-doctor.py`).
+    ⛔ NAMED, NOT NUMBERED (#1872 review round 10): the line number that used to be here was already
+    wrong on `origin/main` by the time anyone read it, and it is not the call today -- a number in a
+    co-deployment pointer rots the moment either file is edited. Both paths are guarded; the tests
+    that pin them live in test_lane_actions.py."""
     if any(r.get("degraded") for r in rows if isinstance(r, dict)):
         raise SystemExit(DEGRADED_MSG + " (%s)" % where)
 
@@ -1450,6 +1458,65 @@ def load_snapshot(args, LS=None):
     return rows, age, time.time()
 
 
+def write_pair(out_path, md, beat, words_read, beat_path=None):
+    """Publish the recap and its sidecar as a BOUND pair; return the process exit code.
+
+    ⛔ THE TWO FILES ARE SEPARATE ATOMIC WRITES, SO THEY MUST NOT BE ALLOWED TO DIVERGE SILENTLY
+    (#7957 H3). A failure between them leaves a FRESH recap beside a STALE beat -- two numbers, one
+    tick -- and the beat is the half the floor actually reads, so the reader would publish the
+    PREVIOUS tick's action list as this tick's. `md=` binds them: it is the digest of the recap THIS
+    beat was rendered from, so a reader can tell a current pair from a torn one instead of trusting
+    the sidecar's own mtime. ABSENCE IS NOT A PASS -- a beat written before this key existed cannot
+    be verified, so the reader suppresses it rather than publishing a number it cannot vouch for.
+
+    0  both halves published and bound
+    3  the RECAP could not be written: NOTHING was published, so the previous pair still stands and
+       is still consistent -- that is why this is not the torn case.
+    4  the recap WAS published and the beat was NOT: the pair is TORN RIGHT NOW. Never 0 -- a caller
+       reading 0 would report a successful tick whose two halves describe different states.
+    """
+    if beat_path is None:
+        beat_path = BEAT_PATH
+    # ⛔ WRITE THE BYTES WE HASH (and only publish a beat a reader can actually verify).
+    # (a) The digest below is over `md.encode("utf-8")`, so the file must hold exactly those bytes.
+    #     Writing in TEXT mode would use the interpreter's locale encoding; under any deployment whose
+    #     default encoding is not UTF-8, writer and reader would disagree on the digest for any
+    #     non-ASCII recap -- and `render_md` always emits an em dash -- so EVERY pair would fail
+    #     closed forever with both suites still green. Pin the encoding rather than assume it.
+    md_bytes = md.encode("utf-8")
+    md_sha = hashlib.sha256(md_bytes).hexdigest()[:MD_SHA_LEN]
+    # (b) The reader hashes `$STATE/NEEDS-ACTION.md` -- a FIXED path -- while the beat path is fixed
+    #     too. A run with `--out <elsewhere>` therefore produces a beat bound to a file no reader
+    #     reads, and overwrites the canonical beat while doing it. That is a LATENT inconsistency (no
+    #     caller passes `--out` today), so it is REPORTED rather than silently absorbed: the run's
+    #     clause will read as torn and be withheld, and this line is the only place that says why.
+    if os.path.abspath(out_path) != os.path.abspath(OUT_PATH):
+        sys.stderr.write("lane-actions: --out %s is not %s; every reader hashes %s, so this run's "
+                         "beat will read as TORN and the act clause will be withheld.\n"
+                         % (out_path, OUT_PATH, OUT_PATH))
+    try:
+        tmp = out_path + ".tmp"
+        with open(tmp, "wb") as fh:
+            fh.write(md_bytes)
+        os.replace(tmp, out_path)              # atomic: a reader never sees a half-written file
+    except OSError as e:
+        sys.stderr.write("lane-actions: cannot write %s: %s\n" % (out_path, e))
+        return 3
+    try:
+        tmp = beat_path + ".tmp"
+        with open(tmp, "w") as fh:
+            fh.write("act=%s\nactfull=%d\nmd=%s\n" % (beat.replace("\n", " "),
+                                                      1 if words_read else 0,
+                                                      md_sha))
+        os.replace(tmp, beat_path)
+    except OSError as e:
+        sys.stderr.write("lane-actions: cannot write %s: %s\n" % (beat_path, e))
+        sys.stderr.write("lane-actions: the recap/beat pair is TORN -- %s was updated and the beat "
+                         "was NOT; a reader must treat the beat as stale.\n" % display_path(out_path))
+        return 4
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--stdin", metavar="FILE", default=None,
@@ -1471,27 +1538,23 @@ def main():
 
     res = build(rows, LS, LV, use_jev=not a.no_jev, ref=ref)
     md = render_md(res, snap_age, "lane-status.py")
-    try:
-        tmp = a.out + ".tmp"
-        with open(tmp, "w") as fh:
-            fh.write(md)
-        os.replace(tmp, a.out)                 # atomic: a reader never sees a half-written file
-    except OSError as e:
-        sys.stderr.write("lane-actions: cannot write %s: %s\n" % (a.out, e))
-        return 3
-    beat = render_beat(res, display_path(a.out))
-    # The tick reads this sidecar rather than parsing stdout: the beat clause is ONE line with no
+    # The tick reads the sidecar rather than parsing stdout: the beat clause is ONE line with no
     # quoting hazards, and `actfull` is what lets the floor know whether the classifier words layer
     # was actually read -- so a Jev outage degrades to the previous beat instead of publishing an
-    # empty action list as if the fleet were clean.
-    try:
-        tmp = BEAT_PATH + ".tmp"
-        with open(tmp, "w") as fh:
-            fh.write("act=%s\nactfull=%d\n" % (beat.replace("\n", " "),
-                                                1 if res["words_read"] else 0))
-        os.replace(tmp, BEAT_PATH)
-    except OSError as e:
-        sys.stderr.write("lane-actions: cannot write %s: %s\n" % (BEAT_PATH, e))
+    # empty action list as if the fleet were clean. write_pair owns the pair's coherence.
+    beat = render_beat(res, display_path(a.out))
+    rc = write_pair(a.out, md, beat, res["words_read"])
+    # ⛔ KEEP THE EARLY RETURN — EMPTY STDOUT **IS** THE CALLER'S FAIL-CLOSED DETECTOR (#1897 review).
+    # A review raised the coupling as a P3: "a read API must not be gated on a write". Measured, the
+    # coupling is load-bearing. `pr-doctor.py`'s gate is `if not (out or "").strip()` — it does NOT
+    # compare rc — so rc 3/4 has to produce NO document, or the doctor parses a torn tick as a good
+    # read and dispatches lanes off it. Printing before `return rc` and leaving the direction to "the
+    # caller checks rc" would be a claim about a guard that does not exist: measured, rc=4 with a
+    # document in stdout is read as a GOOD READ. Decoupling is therefore a change to pr-doctor (gate
+    # on rc first, with its own proof), NOT a change here — and not worth trading the fail-closed
+    # direction for a tidier read API on the exact path this branch exists to contain.
+    if rc:
+        return rc
     if a.json:
         print(json.dumps({
             "beat": beat, "jev": res["meta"], "jev_down": res["jev_down"],

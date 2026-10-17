@@ -1,0 +1,75 @@
+# pi-bootstrap/farm-retired.txt — the UNFARM leg's declared retirements (#1924).
+#
+# WHY THIS FILE EXISTS
+# -------------------
+# The farm in pi-bootstrap/setup.sh is COPY-ONLY: `cp -f` writes every name a farm
+# array lists, and does nothing at all to a name that is not listed. A file that
+# left the repo — or a name that left `fleet_srcs` — is skipped in silence by
+# `[ -f "$f" ] || continue`, so the copy already deployed on every box stays there,
+# executable, in the very directory the fleet launches from ($DEST/scripts/, per
+# heartbeat-loop.sh). The repo then says the tool is retired while the machines keep
+# running it, and nothing reports the divergence: install-launchd's broken-target
+# check only sees a plist whose target is MISSING, and check-deployed-drift.sh
+# compares $O harness *.sh only.
+#
+# THREE EDITS, ONE COMMIT
+# -----------------------
+# Retiring a farmed script is deliberately three edits:
+#   1. remove the name from every farm array in setup.sh (fleet_srcs, merge_gate_srcs,
+#      lib_srcs, fleet_tools, or the checkout-hygiene glob),
+#   2. declare its deployed path HERE, and
+#   3. if a plist still targets it, add that label to templates/launchd/RETIRED.
+# A name in BOTH lists is a contradiction: the copy leg re-creates it, so the unfarm
+# leg refuses to remove it and exits non-zero (loud, never a silent no-op). Doing only
+# step 1 — the natural mistake — is caught on the NEXT sync: the box recorded what it
+# installed last time ($DEST/state/farm-declared.txt) and fails loudly on a name that
+# is now neither farmed nor retired. Skipping step 3 does not undo the removal, but
+# every later sync then FAILS at the launchd step on a broken target, so it cannot go
+# unnoticed — pi-bootstrap/tests/test-farm-unfarm.sh checks the pairing at merge time.
+#
+# DECLARED, NEVER INFERRED FROM ABSENCE
+# -------------------------------------
+# An entry is a decision recorded in review. It is NOT "anything in $DEST/scripts that
+# the repo no longer has": absence cannot distinguish "retired" from "the farm file
+# failed to land" (the #1931 blindness class), so inferring removals from absence would
+# delete working scripts on a box whose checkout was incomplete.
+#
+# FORMAT
+# ------
+# One path per line, relative to ~/.pi/agent, beginning with `scripts/`. Blank lines
+# and `#` comments are ignored. An entry may name a file in a farm subdirectory
+# (`scripts/lib/…`, `scripts/fleet/…`, `scripts/checkout-hygiene/…`). The unfarm leg
+# REFUSES an absolute path, a `..` component, a glob (`* ? [ ]`), a shell metacharacter,
+# a path containing whitespace, a DIRECTORY (never `rm -rf`), and a path whose parent
+# directory resolves to anything other than the directory the entry names (so a
+# symlinked farm subdirectory cannot redirect a removal). It also refuses an entry that
+# resolves to the SAME FILE as a still-farmed artifact — a case-only or hardlink alias,
+# which a string comparison cannot see and a case-insensitive volume (macOS) will happily
+# match — see pi-bootstrap/lib/farm-retire.sh.
+#
+# WHAT AN ENTRY REMOVES — the one thing to be sure about
+# ------------------------------------------------------
+# Whatever is at that path, with NO content check. If a box happened to have its own
+# file on a path the farm later retires, that file is removed and the run reports it as
+# retired. That is the accepted cost of "declared, never inferred": the alternative (a
+# recorded hash per farmed file) needs per-box state that can itself drift, and it still
+# cannot say "retired on purpose". Before adding an entry, check that the name was
+# actually farmed (`git log -S'<name>' -- pi-bootstrap/setup.sh`).
+#
+# WHAT AN UNFARM DOES NOT DO
+# --------------------------
+# It removes the farmed ARTIFACT only. It does not touch runtime STATE
+# (state/<name>.lock, state/<name>.log — and the snapshot it keeps,
+# state/farm-declared.txt) — deleting a lock or a log is not a retirement and is not
+# recoverable — and it does not unload a launchd job: that is edit 3 above.
+#
+# ENTRIES
+# -------
+# `check-second-model.sh` was farmed by `merge_gate_srcs=(record-review.sh
+# check-second-model.sh)` (af15cec52, 2026-09-11) and then deleted from the repo with the
+# whole second-model subsystem (cc99afa09, #980, 2026-09-13). Removing it from the array
+# stopped delivery twice over — the repo copy was gone, so `[ -f "$f" ] || continue` skipped
+# it — and every box that ran setup.sh in that window kept an executable copy of a gate that
+# no longer exists. It has no plist (never launchd-invoked) and nothing in the repo executes
+# it, so it is declared here as the leg's first real retirement.
+scripts/check-second-model.sh

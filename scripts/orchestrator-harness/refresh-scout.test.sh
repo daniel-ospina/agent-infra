@@ -85,7 +85,8 @@ rf() {
   local dir="$1" mode="$2"; shift 2
   local args=(6); [ "$mode" = check ] && args=(--check)
   local paths="${RF_PATH:-$dir/bin:$PATH}"
-  OUT="$(env -u TORTOISE_REPO -u TORTOISE -u SCOUT_UV \
+  OUT="$(env -u TORTOISE_REPO -u TORTOISE -u SCOUT_UV -u GH_HOST -u CELL_HOME -u SCOUT_PY \
+          -u SCOUT_UV_EXTRAS -u GH_CONFIG_DIR \
           HOME="$dir/home" PATH="$paths" REPO="$dir/repo" O="$dir/o" "$@" \
           bash "$REFRESH" "${args[@]}" 2>&1)"
   RC=$?
@@ -131,6 +132,106 @@ esac
 echo "collision-preflight: requires Python >= 3.12 (got 3.9) — run it as \`uv run python tools/collision_preflight.py\`" >&2
 exit 3
 SH
+  chmod +x "$1"
+}
+# mk_home_tool <path> — a pre-flight stand-in that answers CLEAN and RECORDS the HOME it ran under
+# ($HOMELOG). "Which home did the pre-flight actually see?" is a property of the environment, and a
+# suite that only inspects the script's own text cannot answer it.
+mk_home_tool() {
+  mkdir -p "$(dirname "$1")"
+  cat > "$1" <<'PY'
+#!/usr/bin/env python3
+import os
+if os.environ.get("HOMELOG"):
+    with open(os.environ["HOMELOG"], "a") as fh:
+        fh.write("%s\n" % os.environ.get("HOME", ""))
+print("VERDICT: CLEAN")
+PY
+  chmod +x "$1"
+}
+# mk_gh_noauth <case-dir> — a `gh` that answers the pool queries but is NOT authenticated. The
+# gh-backed ISSUE/PR surfaces DECIDE a verdict; the git-read branches/worktrees are BLOCKING (a ref
+# naming the issue forces a COLLISION) and the local-branch terminal lookup is itself a gh call that
+# fails closed — so an unauthenticated gh is the environment the live cells actually had
+# (measured 2026-10-16: `gh auth status` fails under HOME=/home/ubuntu and succeeds under
+# HOME=/tmp/cell-home, on the same cell).
+mk_gh_noauth() {
+  cat > "$1/bin/gh" <<'SH'
+#!/bin/bash
+case "$1 $2" in
+  "auth status") echo "To get started with GitHub CLI, please run: gh auth login" >&2; exit 1 ;;
+  "auth token") echo "no oauth token found for github.com" >&2; exit 1 ;;
+esac
+case "$*" in *"--label P0-blocker"*) printf '0 42\n' ;; esac
+exit 0
+SH
+  chmod +x "$1/bin/gh"
+}
+# mk_gh_stale_token <case-dir> — a gh with a STORED-BUT-UNVALIDATABLE credential: `auth status`
+# exits 1 with the REAL output gh 2.97.0 prints behind a dead proxy (measured: `HTTPS_PROXY=
+# http://127.0.0.1:1 gh auth status --hostname github.com` → "The token in ~/.config/gh/hosts.yml is
+# invalid."), while `auth token` — an OFFLINE lookup of the stored credential — succeeds, and the API
+# call fails with the SAME transport error (no HTTP status). This is the TRANSIENT case: the prose is
+# exactly what a rejected credential prints, so a text-match discriminator cannot tell them apart —
+# only the API's own answer can, and an unreachable API answers with no status at all.
+mk_gh_stale_token() {
+  cat > "$1/bin/gh" <<'SH'
+#!/bin/bash
+case "$1 $2" in
+  "auth status")
+    cat >&2 <<'EOM'
+  X Failed to log in to github.com account nobody (~/.config/gh/hosts.yml)
+  - Active account: true
+  - The token in ~/.config/gh/hosts.yml is invalid.
+EOM
+    exit 1 ;;
+  "auth token") exit 0 ;; # OFFLINE lookup succeeds: a credential IS stored
+  api\ *) echo 'Get "https://api.github.com/rate_limit": proxyconnect tcp: dial tcp 127.0.0.1:1: connect: connection refused' >&2; exit 1 ;;
+esac
+case "$*" in *"--label P0-blocker"*) printf '0 42\n' ;; esac
+exit 0
+SH
+  chmod +x "$1/bin/gh"
+}
+# mk_gh_rejected <case-dir> — a gh with a STORED-BUT-REJECTED credential: `auth status` exits 1 with
+# the SAME prose a dead proxy prints (so a prose matcher cannot tell them apart), `auth token` — an
+# OFFLINE lookup — SUCCEEDS, and the ONLY thing separating it from an outage is the API's own answer:
+# `gh api … rate_limit` prints `gh: Bad credentials (HTTP 401)` and exits 1 (measured on gh 2.97.0).
+# A rejected credential is permanent — a retry cannot change it — so it MUST latch the marker rather
+# than stay a silent transient, which is how a cell stays MERGE-ONLY while reporting RUNNING (#1736).
+mk_gh_rejected() {
+  cat > "$1/bin/gh" <<'SH'
+#!/bin/bash
+case "$1 $2" in
+  "auth status")
+    cat >&2 <<'EOM'
+  X Failed to log in to github.com account nobody (~/.config/gh/hosts.yml)
+  - Active account: true
+  - The token in ~/.config/gh/hosts.yml is invalid.
+EOM
+    exit 1 ;;
+  "auth token") exit 0 ;; # OFFLINE lookup succeeds: a credential IS stored
+  api\ *) echo 'gh: Bad credentials (HTTP 401)' >&2; exit 1 ;;
+esac
+case "$*" in *"--label P0-blocker"*) printf '0 42\n' ;; esac
+exit 0
+SH
+  chmod +x "$1/bin/gh"
+}
+# mk_degraded_tool <path> — what the REAL pre-flight answers when its gh surfaces are unreadable:
+# `VERDICT: COLLISION` (measured on the cells — a LANDED issue came back as a COLLISION under
+# HOME=/home/ubuntu). The caller cannot tell that apart from a real collision, which is the whole
+# reason an unreadable environment has to be refused BEFORE the tool is asked. Records argv.
+mk_degraded_tool() {
+  mkdir -p "$(dirname "$1")"
+  cat > "$1" <<'PY'
+#!/usr/bin/env python3
+import os, sys
+if os.environ.get("TOOL_LOG"):
+    with open(os.environ["TOOL_LOG"], "a") as fh:
+        fh.write("%s|%s\n" % (os.getcwd(), " ".join(sys.argv[1:])))
+print("VERDICT: COLLISION")
+PY
   chmod +x "$1"
 }
 
@@ -180,6 +281,9 @@ esac
 mk_case old-python-run
 mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
 mk_old_python "$D/bin/oldpy"
+# Seed a sentinel so "nothing queued" is DISCRIMINATING — an empty file cannot distinguish "nothing
+# was queued" from "the backlog was clobbered" (the pattern used by the LANDED case below).
+echo 99 > "$D/o/candidates.txt"
 rf "$D" refresh SCOUT_PY="$D/bin/oldpy"
 [ "$RC" -eq 3 ] && ok "old interpreter (run): rc=3 (PERMANENT — a marker, not a silent 0)" \
                || bad "old interpreter (run): rc=$RC (want 3) — output: $OUT"
@@ -187,8 +291,11 @@ case "$OUT" in
   *"NOT PROVISIONABLE"*) ok "old interpreter (run): the refusal is LOUD and named" ;;
   *) bad "old interpreter (run): no NOT PROVISIONABLE verdict — output: $OUT" ;;
 esac
-[ ! -s "$D/o/candidates.txt" ] && ok "old interpreter (run): nothing is queued" \
-                              || bad "old interpreter (run): queued candidates — $(cat "$D/o/candidates.txt" 2>/dev/null)"
+case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
+  *42*) bad "old interpreter (run): queued candidates — $(cat "$D/o/candidates.txt" 2>/dev/null)" ;;
+  *99*) ok "old interpreter (run): nothing is queued (seed 99 intact, #42 absent)" ;;
+  *) bad "old interpreter (run): the backlog was clobbered — candidates='$(cat "$D/o/candidates.txt" 2>/dev/null)'" ;;
+esac
 
 # ── 1c) a pre-flight that REFUSES TO RUN is PERMANENT, not a per-issue "no verdict" (#1748 P1) ──
 # The tool's EXIT_USAGE (3) reports an unusable environment with NO `VERDICT` line. Absorbing that
@@ -209,6 +316,8 @@ case "$*" in *"--label P0-blocker"*) printf '0 42\n' ;; esac
 exit 0
 SH
 chmod +x "$D/bin/gh"
+# Seed a sentinel so "nothing queued" is DISCRIMINATING (see the LANDED case below).
+echo 99 > "$D/o/candidates.txt"
 rf "$D" refresh
 [ "$RC" -eq 3 ] && ok "pre-flight exits 3 (no VERDICT): the refresh is PERMANENT rc=3, not a silent 0" \
                || bad "pre-flight exits 3: rc=$RC (want 3) — output: $OUT"
@@ -216,8 +325,707 @@ case "$OUT" in
   *"NOT PROVISIONABLE"*) ok "pre-flight exits 3: the refusal is LOUD and named" ;;
   *) bad "pre-flight exits 3: no NOT PROVISIONABLE verdict — output: $OUT" ;;
 esac
-[ ! -s "$D/o/candidates.txt" ] && ok "pre-flight exits 3: nothing is queued" \
-                              || bad "pre-flight exits 3: queued candidates — $(cat "$D/o/candidates.txt" 2>/dev/null)"
+case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
+  *42*) bad "pre-flight exits 3: queued candidates — $(cat "$D/o/candidates.txt" 2>/dev/null)" ;;
+  *99*) ok "pre-flight exits 3: nothing is queued (seed 99 intact, #42 absent)" ;;
+  *) bad "pre-flight exits 3: the backlog was clobbered — candidates='$(cat "$D/o/candidates.txt" 2>/dev/null)'" ;;
+esac
+
+# ── 1d) THE PRE-FLIGHT'S ENVIRONMENT IS A PRECONDITION, NOT A PER-CANDIDATE RESULT ─────────────
+# The measured defect (2026-10-16, live cells). `cloud-cell-bringup.sh` documents friction #1
+# (`cmux vm exec` runs as user `cmux` with HOME=/home/ubuntu, which is NOT created on the image) and
+# repairs it IN ITS OWN PROCESS — a repair that cannot cross a process boundary, in a cell whose
+# controller is not always started by bring-up. The refresh is what actually runs the pre-flight, so
+# the repair belongs here too. Two failures are pinned below, each of which the pre-fix script
+# absorbs silently:
+#   (1) an UNUSABLE HOME  -> gh is unauthenticated there ($HOME/.config/gh), so the tool answers from
+#                            partial evidence: measured on the cells, `VERDICT: COLLISION` ("a peer
+#                            owns it") for an issue whose true verdict was `LANDED`. A collision is
+#                            an ordinary answer, so the cell logs 309 collisions, ZERO clean verdicts,
+#                            an empty backlog and `lanes: 0` — for ever, while reporting RUNNING.
+#   (2) gh NOT AUTHENTICATED -> the same degradation, one layer in.
+# Both cases fail on the PRE-FIX code for the right reason: it runs the tool anyway and reports an
+# empty backlog as a healthy result.
+echo; echo "── an unusable HOME is repaired by the refresh itself (the pre-flight's real precondition) ──"
+mk_case home-unusable
+mk_home_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+printf '#!/bin/bash\ncase "$*" in *"--label P0-blocker"*) printf "0 42\\n" ;; esac\nexit 0\n' > "$D/bin/gh"
+chmod +x "$D/bin/gh"
+rf "$D" refresh HOME="$D/no-such-home" CELL_HOME="$D/cellhome" HOMELOG="$D/homelog"
+[ "$RC" -eq 0 ] && ok "unusable HOME: the refresh still proceeds (rc=0)" \
+                || bad "unusable HOME: rc=$RC — output: $OUT"
+case "$OUT" in
+  *"is not a writable directory"*) ok "unusable HOME: the substitution is NAMED, not silent" ;;
+  *) bad "unusable HOME: no substitution reported — output: $OUT" ;;
+esac
+[ -d "$D/cellhome" ] && ok "unusable HOME: the cell home was created (self-heal)" \
+                     || bad "unusable HOME: the cell home was never created"
+[ "$(cat "$D/homelog" 2>/dev/null)" = "$D/cellhome" ] \
+  && ok "unusable HOME: the pre-flight RAN under the writable home (HOME=$D/cellhome)" \
+  || bad "unusable HOME: the pre-flight ran under '$(cat "$D/homelog" 2>/dev/null)' — a verdict from an unusable HOME is the defect"
+
+# The other direction, so the repair cannot silently move a HOME that works: a writable HOME is used
+# VERBATIM and no substitution is reported.
+echo; echo "── a writable HOME is used verbatim (the repair is a no-op on a normal box) ──"
+mk_case home-ok
+mk_home_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+printf '#!/bin/bash\ncase "$*" in *"--label P0-blocker"*) printf "0 42\\n" ;; esac\nexit 0\n' > "$D/bin/gh"
+chmod +x "$D/bin/gh"
+rf "$D" refresh HOMELOG="$D/homelog"
+[ "$(cat "$D/homelog" 2>/dev/null)" = "$D/home" ] \
+  && ok "writable HOME: the caller's HOME reached the tool unchanged" \
+  || bad "writable HOME: the tool saw '$(cat "$D/homelog" 2>/dev/null)' instead of $D/home"
+case "$OUT" in
+  *"is not a writable directory"*) bad "writable HOME: a working HOME was reported as unusable" ;;
+  *) ok "writable HOME: no substitution line" ;;
+esac
+
+echo; echo "── an unauthenticated gh REFUSES the pass instead of degrading every candidate ──"
+mk_case gh-noauth
+mk_degraded_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_gh_noauth "$D"
+# Seed a sentinel so "nothing queued" is DISCRIMINATING (see the LANDED case below).
+echo 99 > "$D/o/candidates.txt"
+rf "$D" refresh TOOL_LOG="$D/tool-log"
+# The MEASURED symptom is not a crash: an unreadable environment makes every candidate read as
+# "a peer owns it", which is an ordinary answer. Pre-fix this case exits 0 having queued nothing and
+# having logged a COLLISION for #42 — indistinguishable from a busy queue on a healthy cell.
+case "$OUT" in
+  *"collision — a peer owns it"*) bad "gh unauthenticated: a DEGRADED collision was reported as a real verdict" ;;
+  *) ok "gh unauthenticated: no degraded collision is passed off as a real verdict" ;;
+esac
+[ "$RC" -eq 3 ] && ok "gh unauthenticated: rc=3 (PERMANENT — a marker, not a silent 0)" \
+               || bad "gh unauthenticated: rc=$RC (want 3) — output: $OUT"
+case "$OUT" in
+  *"NOT PROVISIONABLE"*) ok "gh unauthenticated: the refusal is LOUD and named" ;;
+  *) bad "gh unauthenticated: no NOT PROVISIONABLE verdict — output: $OUT" ;;
+esac
+case "$OUT" in
+  *"HOME=$D/home"*) ok "gh unauthenticated: the refusal names the HOME the pre-flight would use" ;;
+  *) bad "gh unauthenticated: the refusal does not name HOME — output: $OUT" ;;
+esac
+[ ! -e "$D/tool-log" ] && ok "gh unauthenticated: refused BEFORE spending on the pre-flight" \
+                       || bad "gh unauthenticated: the pre-flight ran anyway — $(cat "$D/tool-log" 2>/dev/null)"
+case "$OUT" in
+  *"checked "*"backlog now"*) bad "gh unauthenticated: still reported a healthy empty backlog" ;;
+  *) ok "gh unauthenticated: no \"checked N; backlog now 0\" over an unjudged pool" ;;
+esac
+case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
+  *42*) bad "gh unauthenticated: queued candidates — $(cat "$D/o/candidates.txt" 2>/dev/null)" ;;
+  *99*) ok "gh unauthenticated: nothing is queued (seed 99 intact, #42 absent)" ;;
+  *) bad "gh unauthenticated: the backlog was clobbered — candidates='$(cat "$D/o/candidates.txt" 2>/dev/null)'" ;;
+esac
+
+# ── the host is READ from gh, never hardcoded ───────────────────────────────────────
+# The pre-flight hands gh a host-LESS repo slug, so gh chooses the host, and the ONLY faithful probe
+# is one that names none either. A stub is exactly the right instrument here: this one resolves the
+# host the way gh does (GH_HOST, else the ONE configured host, else github.com — measured on gh
+# 2.97.0) from the case's own hosts.yml, and refuses any call that names a different one. So the case
+# fails the moment the script assumes a host: with a GHES-only config the pre-fix `--hostname
+# github.com` finds no credential and latches the PERMANENT marker on an environment that can dispatch
+# perfectly well (#1853 review). Reported already once: a `--json hosts`-derived host named the WRONG
+# host for a two-GHES config and for a GHES config with GH_TOKEN set.
+echo; echo "── the probe lets gh choose the host, rather than assuming github.com ──"
+mk_case ghes-host
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mkdir -p "$D/home/.config/gh"
+printf 'ghe.example.com:\n    oauth_token: x\n    user: n\n' > "$D/home/.config/gh/hosts.yml"
+cat > "$D/bin/gh" <<'SH'
+#!/bin/bash
+printf '%s\n' "$*" >> "$GH_LOG"
+# This stub's own model of gh's default host: GH_HOST, else the ONE configured host, else github.com.
+CFG="${GH_CONFIG_DIR:-$HOME/.config/gh}/hosts.yml"
+HOST="${GH_HOST:-}"
+if [ -z "$HOST" ]; then
+  n=$(grep -cE '^[^[:space:]#][^:]*:' "$CFG" 2>/dev/null || true)
+  if [ "${n:-0}" = 1 ]; then HOST=$(grep -E '^[^[:space:]#][^:]*:' "$CFG" | head -1 | tr -d ':')
+  else HOST=github.com; fi
+fi
+# A call that NAMES a host must name the one gh resolves. (The shipped script must name none at all;
+# this arm exists so the pre-fix `--hostname github.com` is refused here rather than silently accepted.)
+case "$*" in
+  *"--hostname "*) named="${*##*--hostname }"; named="${named%% *}"
+    if [ "$named" != "$HOST" ]; then printf 'no oauth token found for %s\n' "$named" >&2; exit 1; fi ;;
+esac
+# Only the configured enterprise host is authenticated in this case.
+[ "$HOST" = github.com ] && { printf 'no oauth token found for github.com\n' >&2; exit 1; }
+printf '{"resources":{}}\n'
+exit 0
+SH
+chmod +x "$D/bin/gh"
+rf "$D" refresh GH_LOG="$D/gh-log"
+[ "$RC" -eq 0 ] && ok "GHES host: a cell gh is configured for an enterprise host is NOT refused" \
+               || bad "GHES host: rc=$RC (want 0) — the probe assumed a host — output: $OUT"
+grep -q -- '--hostname' "$D/gh-log" 2>/dev/null \
+  && bad "GHES host: the probe NAMED a host — gh must choose it — '$(tr '\n' ' ' < "$D/gh-log" 2>/dev/null)'" \
+  || ok "GHES host: no host is named — gh resolves it, so the probe cannot disagree with the pre-flight"
+grep -q 'auth token' "$D/gh-log" 2>/dev/null \
+  && ok "GHES host: the credential question is asked of gh" \
+  || bad "GHES host: gh was never asked for a credential — '$(tr '\n' ' ' < "$D/gh-log" 2>/dev/null)'"
+
+# ── an unreadable pool listing is NOT an empty backlog ───────────────────────────────────────────
+# Each pool query records its OWN failure, so the abort fires whether the pool came out empty or NOT.
+# The partial case below is the one a mere emptiness test misses: one tier's query fails while another
+# returns rows, leaving a non-empty pool that silently drops a whole priority tier — the #8465
+# priority inversion. Both shapes must abort LOUDLY and TRANSIENTLY: nothing here knows which host
+# would come back, and a marker only a human can clear must not be latched on a guess (#1853 review).
+echo; echo "── an unreadable pool listing is not an empty backlog ──"
+mk_case pool-unreadable
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+cat > "$D/bin/gh" <<'SH'
+#!/bin/bash
+case "$*" in
+  "auth token"*) exit 0 ;; # a credential IS stored
+  "issue list"*) echo 'gh: could not resolve host: ghe.example.com' >&2; exit 1 ;;
+esac
+printf '{"resources":{}}\n'
+exit 0
+SH
+chmod +x "$D/bin/gh"
+rf "$D" refresh
+[ "$RC" -eq 1 ] && ok "unreadable pool: rc=1 (TRANSIENT — the ambiguous case never latches the permanent marker)" \
+               || bad "unreadable pool: rc=$RC (want 1) — output: $OUT"
+case "$OUT" in
+  *"candidate pool listing FAILED"*) ok "unreadable pool: the abort is LOUD and says the listing failed" ;;
+  *) bad "unreadable pool: no refusal — output: $OUT" ;;
+esac
+case "$OUT" in
+  *"P0-blocker"*) ok "unreadable pool: the abort names WHICH tier could not be read" ;;
+  *) bad "unreadable pool: the abort does not name the tier — output: $OUT" ;;
+esac
+case "$OUT" in
+  *"checked 0; backlog now"*) bad "unreadable pool: still reported a healthy empty backlog" ;;
+  *) ok "unreadable pool: no \"checked N; backlog now 0\" over an unreadable pool" ;;
+esac
+
+# The PARTIAL shape: `.pool` is NON-EMPTY, so an emptiness test cannot see it.
+echo; echo "── a PARTIALLY read pool is not a backlog (one tier failed, another returned rows) ──"
+mk_case pool-partial
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+cat > "$D/bin/gh" <<'SH'
+#!/bin/bash
+case "$*" in
+  "auth token"*) exit 0 ;;
+  "issue list"*)
+    case "$*" in
+      *"--label P0-blocker"*) echo 'gh: jq: error (at <stdin>:1): cannot index string' >&2; exit 1 ;;
+      *"--label P1-severe"*) printf '1 4242\n' ;;
+    esac
+    exit 0 ;;
+esac
+printf '{"resources":{}}\n'
+exit 0
+SH
+chmod +x "$D/bin/gh"
+rf "$D" refresh
+[ "$RC" -eq 1 ] && ok "partial pool: rc=1 (TRANSIENT — a missing tier is not a short backlog)" \
+               || bad "partial pool: rc=$RC (want 1) — output: $OUT"
+case "$OUT" in
+  *"P0-blocker"*) ok "partial pool: the abort names the tier that failed" ;;
+  *) bad "partial pool: the abort does not name the failing tier — output: $OUT" ;;
+esac
+case "$OUT" in
+  *"backlog now 1"*|*"+#4242"*) bad "partial pool: acted on a pool it could not read — output: $OUT" ;;
+  *) ok "partial pool: the readable tier's issue is NOT queued as if the pool were complete" ;;
+esac
+
+# ── THE POOL'S READ STATE: EMPTY, PARTIAL and UNREADABLE are three DIFFERENT readings ────────
+# agent-infra#1931. The refusals above were already correct, but the LOG could not tell them apart:
+# a cell whose pool listing failed refused on 131 consecutive passes and dispatched nothing while 15
+# PRs sat open, and every cycle line still read `backlog=0` — the same line a fleet with nothing to
+# do prints. A layer that cannot see must not report an empty queue, so each outcome is now a NAMED
+# state, persisted (with the epoch of the read) for the controller's heartbeat line.
+# ⛔ NOT ONE of these assertions can pass on the pre-fix script: there is no `queue=` token anywhere
+# in its output, it persists no state file, and it reports a PARTIAL read with the identical sentence
+# it uses for a TOTAL one — i.e. the distinction these tests exist for does not exist there.
+echo; echo "── the pool read state: EMPTY vs PARTIAL vs UNREADABLE, and never EMPTY by accident ──"
+
+# (a) NO tier could be read -> UNREADABLE, and explicitly NOT EMPTY.
+mk_case state-unreadable
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+cat > "$D/bin/gh" <<'SH'
+#!/bin/bash
+case "$*" in
+  "auth token"*) exit 0 ;;
+  "issue list"*) echo 'gh: API rate limit exceeded' >&2; exit 1 ;;
+esac
+printf '{"resources":{}}\n'
+exit 0
+SH
+chmod +x "$D/bin/gh"
+rf "$D" refresh
+[ "$RC" -eq 1 ] && ok "state/unreadable: refused TRANSIENT (rc=1) — a failed read is never a green 'nothing to do'" \
+               || bad "state/unreadable: rc=$RC (want 1) — output: $OUT"
+case "$OUT" in
+  *"queue=UNREADABLE"*) ok "state/unreadable: the output SAYS queue=UNREADABLE" ;;
+  *) bad "state/unreadable: the output never names the state — output: $OUT" ;;
+esac
+case "$OUT" in
+  *"queue=EMPTY"*) bad "state/unreadable: a read that FAILED was reported as EMPTY — output: $OUT" ;;
+  *) ok "state/unreadable: a failed read is NOT collapsed into EMPTY" ;;
+esac
+case "$(head -1 "$D/o/state/queue-state" 2>/dev/null)" in
+  "UNREADABLE "*) ok "state/unreadable: the state is persisted for the heartbeat (state/queue-state)" ;;
+  *) bad "state/unreadable: no state persisted — '$(head -1 "$D/o/state/queue-state" 2>/dev/null)'" ;;
+esac
+
+# (b) SOME tiers read, others not -> PARTIAL, naming what could not be read. It is a SUBSET, so it is
+#     NOT the same reading as (a), and it still queues nothing.
+mk_case state-partial
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+cat > "$D/bin/gh" <<'SH'
+#!/bin/bash
+case "$*" in
+  "auth token"*) exit 0 ;;
+  "issue list"*)
+    case "$*" in
+      *"--label P0-blocker"*) echo 'gh: server error' >&2; exit 1 ;;
+      *"--label P1-severe"*) printf '1 4242\n' ;;
+    esac
+    exit 0 ;;
+esac
+printf '{"resources":{}}\n'
+exit 0
+SH
+chmod +x "$D/bin/gh"
+rf "$D" refresh
+[ "$RC" -eq 1 ] && ok "state/partial: refused TRANSIENT (rc=1)" || bad "state/partial: rc=$RC (want 1) — output: $OUT"
+case "$OUT" in
+  *"queue=PARTIAL(P0-blocker)"*) ok "state/partial: the output names the state AND the tiers it could not read" ;;
+  *) bad "state/partial: the state does not name the unread tiers — output: $OUT" ;;
+esac
+case "$OUT" in
+  *"queue=UNREADABLE"*) bad "state/partial: a PARTIAL read was reported as UNREADABLE — the two are different readings" ;;
+  *) ok "state/partial: PARTIAL is not collapsed into UNREADABLE" ;;
+esac
+case "$(head -1 "$D/o/state/queue-state" 2>/dev/null)" in
+  "PARTIAL(P0-blocker) "*) ok "state/partial: the persisted state names the unread tiers too" ;;
+  *) bad "state/partial: persisted '$(head -1 "$D/o/state/queue-state" 2>/dev/null)' (want PARTIAL(P0-blocker) <epoch>)" ;;
+esac
+case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
+  *4242*) bad "state/partial: queued a survivor of a partial read as if the pool were complete" ;;
+  *) ok "state/partial: a partial read still queues NOTHING (#1736's rule, kept)" ;;
+esac
+
+# (c) EVERY tier read and genuinely empty -> EMPTY. This is the only answer that may mean "no work",
+#     and it must still report the empty backlog (a successful empty read IS an empty backlog).
+mk_case state-empty
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+rf "$D" refresh     # the default gh stub answers every listing with nothing
+[ "$RC" -eq 0 ] && ok "state/empty: a successful empty read succeeds (rc=0)" \
+               || bad "state/empty: rc=$RC (want 0) — output: $OUT"
+case "$OUT" in
+  *"queue=EMPTY"*) ok "state/empty: a read that succeeded and listed nothing says queue=EMPTY" ;;
+  *) bad "state/empty: EMPTY is never named — output: $OUT" ;;
+esac
+case "$OUT" in
+  *"checked 0; backlog now 0"*) ok "state/empty: EMPTY may report an empty backlog (it measured one)" ;;
+  *) bad "state/empty: the successful empty read lost its backlog report — output: $OUT" ;;
+esac
+case "$(head -1 "$D/o/state/queue-state" 2>/dev/null)" in
+  "EMPTY "*) ok "state/empty: the persisted state is EMPTY" ;;
+  *) bad "state/empty: persisted '$(head -1 "$D/o/state/queue-state" 2>/dev/null)'" ;;
+esac
+
+# (d) EVERY tier read and NON-empty -> READ(n). A third readable answer, so a non-empty pool can never
+#     be labelled EMPTY by a later code path that only tests emptiness.
+mk_case state-read
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+cat > "$D/bin/gh" <<'SH'
+#!/bin/bash
+case "$*" in
+  "auth token"*) exit 0 ;;
+  "issue list"*)
+    case "$*" in *"--label P1-severe"*) printf '1 4242\n' ;; esac
+    exit 0 ;;
+esac
+printf '{"resources":{}}\n'
+exit 0
+SH
+chmod +x "$D/bin/gh"
+rf "$D" refresh
+[ "$RC" -eq 0 ] && ok "state/read: a fully readable pool succeeds (rc=0)" || bad "state/read: rc=$RC (want 0) — output: $OUT"
+case "$OUT" in
+  *"queue=READ(1)"*) ok "state/read: a readable NON-empty pool is READ(n), not EMPTY" ;;
+  *) bad "state/read: the readable non-empty pool is not named READ(n) — output: $OUT" ;;
+esac
+case "$OUT" in
+  *"queue=EMPTY"*) bad "state/read: a non-empty pool was labelled EMPTY" ;;
+  *) ok "state/read: a non-empty pool is never EMPTY" ;;
+esac
+
+# (e) THE HEARTBEAT CARRIES IT. The controller is where a human reads a cell's queue, so the cycle
+#     line must carry the state — and the state must be READ BACK, with the age of the reading, by ONE
+#     reader (a second vocabulary for the same fact is the defect this issue names). The shipped
+#     reader is extracted and driven; a re-implementation would pass on a broken copy too.
+echo; echo "── the heartbeat line carries the state (orch-loop.sh) ──"
+awk '/^is_num\(\) \{/{print; exit}' "$LOOP" > "$T/isnum.sh"
+awk '/^queue_state_token\(\) \{/{f=1} f{print} f&&/^}$/{exit}' "$LOOP" > "$T/qstate.sh"
+if [ -s "$T/qstate.sh" ] && [ -s "$T/isnum.sh" ]; then
+  ok "orch-loop: the pool-state reader is extractable from the shipped loop"
+  QD="$T/qstate"; mkdir -p "$QD/state"
+  # qs — the SHIPPED reader, over a state dir the case writes; no re-implementation of the format.
+  qs() { ( O="$QD"; . "$T/isnum.sh"; . "$T/qstate.sh"; queue_state_token ); }
+  rm -f "$QD/state/queue-state"
+  [ "$(qs)" = "UNKNOWN" ] && ok "heartbeat: no recorded read is UNKNOWN — never EMPTY (absence is not a measurement of emptiness)" \
+                          || bad "heartbeat: an absent state file read as '$(qs)' (want UNKNOWN)"
+  for want in UNREADABLE "PARTIAL(P0-blocker)" EMPTY "READ(7)"; do
+    printf '%s %s\n' "$want" "$(date +%s)" > "$QD/state/queue-state"
+    case "$(qs)" in
+      "$want""("*) ok "heartbeat: a recorded $want is carried, with the age of the reading" ;;
+      *) bad "heartbeat: $want read as '$(qs)'" ;;
+    esac
+  done
+  # A torn / foreign / hand-edited file must not be printed as a state: an unparseable record is
+  # UNKNOWN, not evidence of an empty queue.
+  printf 'garbage here\n' > "$QD/state/queue-state"
+  [ "$(qs)" = "UNKNOWN" ] && ok "heartbeat: a torn/foreign state file is UNKNOWN, never a fabricated reading" \
+                          || bad "heartbeat: a garbage state file read as '$(qs)'"
+else
+  bad "orch-loop: could not extract queue_state_token (or is_num) from the shipped loop"
+fi
+# The two lines a human actually reads beside `backlog=`: the per-cycle heartbeat line, and the
+# 'backlog empty' claim that used to read as "nothing to do" even when the pool was unreadable.
+grep -q 'backlog=\$(wc -l.*queue=\$(queue_state_token)' "$LOOP" \
+  && ok "orch-loop: the per-cycle heartbeat line carries the state beside the backlog" \
+  || bad "orch-loop: the cycle line does not carry the pool state"
+grep -q '\[dispatch\] backlog empty queue=\$(queue_state_token)' "$LOOP" \
+  && ok "orch-loop: the 'backlog empty' claim carries the state, so blindness cannot read as stillness" \
+  || bad "orch-loop: 'backlog empty' is still printed without the state"
+
+# ── an unwritable state dir REFUSES, it is not absorbed ───────────────────────────────────────
+# `mkdir -p "$O"` was unchecked and every write below it was too, so a non-directory `$O` finished with
+# `checked 0; backlog now` at rc 0 having persisted NOTHING: no marker for orch-loop, no candidates, a
+# cell RUNNING with `lanes: 0`. That is the merge-only shape this change exists to remove, so it must
+# refuse loudly rather than report a healthy empty queue (#1853 review).
+echo; echo "── an unwritable state dir is refused, not absorbed ──"
+mk_case unwritable-o
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+printf '#' > "$D/state-file" # a REGULAR FILE where $O must be a directory
+OUT="$(env -u GH_HOST -u CELL_HOME HOME="$D/home" PATH="$D/bin:$PATH" REPO="$D/repo" \
+        O="$D/state-file" bash "$REFRESH" 2>&1)"; RC=$?
+[ "$RC" -eq 1 ] && ok "unwritable \$O: rc=1 (TRANSIENT — loud, and no permanent marker)" \
+               || bad "unwritable \$O: rc=$RC (want 1) — output: $OUT"
+case "$OUT" in
+  *"cannot create the state directory"*) ok "unwritable \$O: the abort names the state directory" ;;
+  *) bad "unwritable \$O: no refusal — output: $OUT" ;;
+esac
+case "$OUT" in
+  *"checked 0; backlog now"*) bad "unwritable \$O: still reported a healthy empty backlog" ;;
+  *) ok "unwritable \$O: no \"checked N; backlog now 0\" over a state dir that was never written" ;;
+esac
+
+# The shape a FILE-existence test cannot see: `mkdir -p` SUCCEEDS on an existing read-only directory,
+# and a STALE `.pool` from the previous run then satisfies `[ -f "$O/.pool" ]` — so the pass read the
+# stale pool, reported `checked N; backlog now M` at rc 0, and persisted nothing (the writes to
+# checked.txt / candidates.txt failed silently). Only a WRITE can tell a writable dir from a present
+# one (#1853 review).
+echo; echo "── a READ-ONLY state dir with a stale pool is refused, not reported as a backlog ──"
+mk_case readonly-o
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+printf '#!/bin/bash\ncase "$*" in *"--label P0-blocker"*) printf "0 77\\n" ;; esac\nexit 0\n' > "$D/bin/gh"
+chmod +x "$D/bin/gh"
+RF_PATH="$D/bin:$PATH" rf "$D" refresh               # a first, healthy run, so the stale state is real
+printf '99\n' > "$D/o/.pool"                         # a STALE pool the next run must not inherit
+chmod -R a-w "$D/o"
+rf "$D" refresh
+chmod -R u+w "$D/o" 2>/dev/null || true              # so the case's temp dir can be cleaned up
+[ "$RC" -eq 1 ] && ok "read-only \$O: rc=1 (TRANSIENT — loud, and no permanent marker)" \
+               || bad "read-only \$O: rc=$RC (want 1) — output: $OUT"
+case "$OUT" in
+  *"not WRITABLE"*) ok "read-only \$O: the abort says the state dir is not writable" ;;
+  *) bad "read-only \$O: no refusal — output: $OUT" ;;
+esac
+case "$OUT" in
+  *"backlog now 1"*|*"+#99"*) bad "read-only \$O: read the STALE pool as this run's backlog — output: $OUT" ;;
+  *) ok "read-only \$O: the stale pool is not reported as this run's backlog" ;;
+esac
+
+# ── a CLEAN issue is not SUPPRESSED when its queue entry cannot be written ────────────────────
+# `checked.txt` is the permanent suppression — reclaimed only for numbers that reached
+# `dispatched.txt` — so writing it before the queue entry made a failed queue append an unrecoverable
+# loss: the issue is never pre-flighted again, is never queued, and the pass still logs
+# `+#N CLEAN -> backlog` and exits 0. Measured with `candidates.txt` unwritable: two consecutive
+# passes reported success and the pre-flight ran once, ever (#1853 review). Every state write is now
+# checked, and the recoverable one lands FIRST.
+echo; echo "── a CLEAN issue is not suppressed when it was never queued ──"
+mk_case queue-unwritable
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+printf '#!/bin/bash\ncase "$*" in *"--label P0-blocker"*) printf "0 42\\n" ;; esac\nexit 0\n' > "$D/bin/gh"
+chmod +x "$D/bin/gh"
+mkdir -p "$D/o/candidates.txt" # a DIRECTORY where the queue file must be
+rf "$D" refresh
+[ "$RC" -eq 1 ] && ok "queue unwritable: rc=1 (TRANSIENT — loud, and no permanent marker)" \
+               || bad "queue unwritable: rc=$RC (want 1) — output: $OUT"
+case "$OUT" in
+  *"cannot queue #42"*) ok "queue unwritable: the abort names the write that failed AND the issue" ;;
+  *) bad "queue unwritable: no refusal — output: $OUT" ;;
+esac
+case "$OUT" in
+  *"+#42"*) bad "queue unwritable: logged a queue entry that never landed" ;;
+  *) ok "queue unwritable: no \"+#42 CLEAN -> backlog\" over an issue it did not queue" ;;
+esac
+if grep -qx 42 "$D/o/checked.txt" 2>/dev/null; then
+  bad "queue unwritable: #42 was SUPPRESSED although it was never queued — it can never be dispatched again"
+else
+  ok "queue unwritable: #42 is NOT suppressed, so the next pass retries it"
+fi
+
+# `--check` is deliberately NOT where the gh precondition is judged. cloud-cell-supervisor.sh's
+# cmd_check and cloud-cell-bringup.sh's check_gh (which its check_dispatch calls) each ALREADY run
+# `gh auth status` themselves (under $CELL_HOME), and orchestrator-harness's selftest pins exactly
+# one `gh auth status` call under `$CELL_HOME` for each of them — so a second `gh auth status` from
+# here would redden an owned suite AND ask the question in the wrong layer: those
+# checks run in the OPERATOR's shell, while the pre-flight inherits the HOME of whatever process
+# actually started the controller. The run path is the enforcement point. This case pins that
+# `--check` did not quietly acquire a second gh call or a new refusal.
+echo; echo "── --check keeps its own verdict (the gh precondition belongs to the RUN path) ──"
+mk_case gh-noauth-check
+mk_tool "$D/tort/tools/collision_preflight.py"
+mk_gh_noauth "$D"
+rf "$D" check TORTOISE_REPO="$D/tort"
+[ "$RC" -eq 0 ] && ok "--check: still answers its own question (rc=0) — the gh precondition is the run path's" \
+               || bad "--check: rc=$RC — the operator-side gate must not acquire a second gh probe (selftest pins one gh call each)"
+
+# ── 1e) ASSERT THE PROPERTY: A PASS THAT JUDGED NOTHING MUST SAY SO ──────────────────────────────
+# `checked N; backlog now 0` over a non-empty pool is the reading the fleet has been stuck in — it
+# looks like a healthy empty queue, and each `?no verdict` line is a per-candidate MASK of one
+# environment failure. The assertion is the TRANSIENT code on purpose: a permanent environment
+# failure has already refused above with the reason, so reaching here is a per-cycle anomaly that
+# the next cycle should retry (orch-loop.sh logs `FAILED rc=1`). The second half of the case is the
+# false-block guard: an EMPTY pool is a legitimate answer and must still exit 0.
+echo; echo "── a pass that judged NOTHING does not report an empty backlog ──"
+mk_case no-usable-verdict
+mkdir -p "$D/repo/.worktrees/dispatch-scout/tools"
+cat > "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py" <<'PY'
+#!/usr/bin/env python3
+print("VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be queried (issue assignee/holder)")
+raise SystemExit(2)
+PY
+chmod +x "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+printf '#!/bin/bash\ncase "$*" in *"--label P0-blocker"*) printf "0 42\\n" ;; esac\nexit 0\n' > "$D/bin/gh"
+chmod +x "$D/bin/gh"
+# Seed a sentinel so "nothing queued" is DISCRIMINATING (see the LANDED case below).
+echo 99 > "$D/o/candidates.txt"
+rf "$D" refresh
+[ "$RC" -ne 0 ] && ok "no usable verdict: the pass is NOT reported as success (rc=$RC)" \
+               || bad "no usable verdict: rc=0 — an unjudged pool was reported as a healthy empty backlog"
+case "$OUT" in
+  *"judged NOTHING"*) ok "no usable verdict: the abort names what happened" ;;
+  *) bad "no usable verdict: no explanation of the pass — output: $OUT" ;;
+esac
+case "$OUT" in
+  *"checked "*"backlog now"*) bad "no usable verdict: still printed \"checked N; backlog now 0\"" ;;
+  *) ok "no usable verdict: the false empty-backlog report is suppressed" ;;
+esac
+case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
+  *42*) bad "no usable verdict: queued candidates — $(cat "$D/o/candidates.txt" 2>/dev/null)" ;;
+  *99*) ok "no usable verdict: nothing is queued (seed 99 intact, #42 absent)" ;;
+  *) bad "no usable verdict: the backlog was clobbered — candidates='$(cat "$D/o/candidates.txt" 2>/dev/null)'" ;;
+esac
+# ...and the same script with an EMPTY pool must still exit 0 (the assertion is not a blanket refusal).
+printf '#!/bin/bash\nexit 0\n' > "$D/bin/gh"
+chmod +x "$D/bin/gh"
+rf "$D" refresh
+[ "$RC" -eq 0 ] && ok "no usable verdict: an EMPTY pool still exits 0 (no false block)" \
+               || bad "no usable verdict: false block on an empty pool — rc=$RC — output: $OUT"
+
+# ── 1f) LANDED IS A USABLE VERDICT (agent-infra#1853 review P1) ─────────────────────────────────
+# The tool's fourth verdict is `VERDICT: LANDED (exit 4)` — an issue closed between the pool listing
+# and the pre-flight. The parser matched only CLEAN|COLLISION, so a LANDED fell into the `*)` arm, was
+# not counted by `usable`, and a pass of LANDEDs then tripped the "judged NOTHING" abort (rc=1). A
+# LANDED is terminal and real, so it must count as a usable verdict — while never being queued.
+mk_case landed-usable
+mkdir -p "$D/repo/.worktrees/dispatch-scout/tools"
+cat > "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py" <<'PY'
+#!/usr/bin/env python3
+print("VERDICT: LANDED (exit 4) — the issue's own state is CLOSED")
+raise SystemExit(4)
+PY
+chmod +x "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+printf '#!/bin/bash\ncase "$*" in *"--label P0-blocker"*) printf "0 42\\n" ;; esac\nexit 0\n' > "$D/bin/gh"
+chmod +x "$D/bin/gh"
+# A sentinel makes the "not queued" assertion DISCRIMINATING: an empty candidates.txt is equally
+# consistent with "nothing was queued" and "the backlog was clobbered", and it is empty on the
+# pre-fix revision too. Seeding 99 proves #42 was neither added nor the file rewritten away.
+echo 99 > "$D/o/candidates.txt"
+rf "$D" refresh
+[ "$RC" -eq 0 ] && ok "LANDED: a pass of LANDEDs exits 0 (not the rc=1 abort)" \
+               || bad "LANDED: rc=$RC (want 0 — LANDED must count as usable) — output: $OUT"
+case "$OUT" in
+  *"judged NOTHING"*) bad "LANDED: the abort fired on a usable LANDED verdict" ;;
+  *) ok "LANDED: no \"judged NOTHING\" abort" ;;
+esac
+case "$OUT" in
+  *"LANDED"*) ok "LANDED: the verdict is reported" ;;
+  *) bad "LANDED: the verdict was not reported — output: $OUT" ;;
+esac
+case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
+  *42*) bad "LANDED: a landed issue was queued (it must not enter candidates.txt)" ;;
+  *99*) ok "LANDED: a landed issue is NOT queued (seed 99 intact, #42 absent)" ;;
+  *) bad "LANDED: the backlog was clobbered — candidates='$(cat "$D/o/candidates.txt" 2>/dev/null)'" ;;
+esac
+
+# ── 1g) A DEGRADED COLLISION IS NOT A VERDICT (agent-infra#1853 review P2, #1328) ───────────────
+# Measured on the live cells: an issue whose true verdict was LANDED came back as
+# `VERDICT: COLLISION ... ALSO INCOMPLETE: 3 surface(s) could not be queried`. Counting that as usable
+# would let a broken environment report a healthy `checked N; backlog now 0` — the exact reading this
+# gate exists to refuse. Degraded collisions must NOT count, so the pass must abort (rc=1) instead.
+mk_case degraded-collision
+mkdir -p "$D/repo/.worktrees/dispatch-scout/tools"
+cat > "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py" <<'PY'
+#!/usr/bin/env python3
+print("VERDICT: COLLISION (exit 1) — the pre-flight could not name a holder")
+print("  ALSO INCOMPLETE: 3 surface(s) could not be queried")
+raise SystemExit(1)
+PY
+chmod +x "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+printf '#!/bin/bash\ncase "$*" in *"--label P0-blocker"*) printf "0 42\\n" ;; esac\nexit 0\n' > "$D/bin/gh"
+chmod +x "$D/bin/gh"
+# A sentinel makes the "nothing queued" assertion DISCRIMINATING (see the LANDED case): an empty
+# file cannot distinguish "the degraded answer was not queued" from "the backlog was clobbered".
+echo 99 > "$D/o/candidates.txt"
+rf "$D" refresh
+[ "$RC" -eq 1 ] && ok "degraded COLLISION: the pass aborts TRANSIENT (rc=1) instead of passing" \
+               || bad "degraded COLLISION: rc=$RC (want 1) — output: $OUT"
+case "$OUT" in
+  *"checked "*"backlog now"*) bad "degraded COLLISION: still reported a healthy empty backlog" ;;
+  *) ok "degraded COLLISION: no \"checked N; backlog now 0\" over a degraded answer" ;;
+esac
+case "$OUT" in
+  *"DEGRADED"*) ok "degraded COLLISION: the degradation is NAMED" ;;
+  *) bad "degraded COLLISION: the degradation is not reported — output: $OUT" ;;
+esac
+case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
+  *42*) bad "degraded COLLISION: queued candidates — $(cat "$D/o/candidates.txt" 2>/dev/null)" ;;
+  *99*) ok "degraded COLLISION: nothing is queued (seed 99 intact, #42 absent)" ;;
+  *) bad "degraded COLLISION: the backlog was clobbered — candidates='$(cat "$D/o/candidates.txt" 2>/dev/null)'" ;;
+esac
+
+# ── 1h) A NETWORK FAULT IS TRANSIENT, NOT PERMANENT (agent-infra#1853 review P1) ────────────────
+# The discriminator is the PRESENCE OF A STORED CREDENTIAL, not gh's prose. MEASURED on gh 2.97.0
+# behind a dead proxy (`HTTPS_PROXY=http://127.0.0.1:1`): a PURE transport fault still prints "The
+# token in ~/.config/gh/hosts.yml is invalid.", so any text match on `invalid` classes an outage as
+# a credential failure — while `gh auth token` (an OFFLINE lookup of the stored credential) succeeds.
+# The stub below reproduces that exact prose, so this case FAILS on any text-matching discriminator.
+mk_case gh-stale-token
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_gh_stale_token "$D"
+rf "$D" refresh
+[ "$RC" -eq 1 ] && ok "stale token: rc=1 (TRANSIENT — not the permanent 3)" \
+               || bad "stale token: rc=$RC (want 1) — output: $OUT"
+case "$OUT" in
+  *"TRANSIENT"*) ok "stale token: reported TRANSIENT (a stored credential is not a missing one)" ;;
+  *) bad "stale token: no TRANSIENT verdict — output: $OUT" ;;
+esac
+case "$OUT" in
+  *"NOT PROVISIONABLE"*) bad "stale token: the outage-shaped prose was called NOT PROVISIONABLE" ;;
+  *) ok "stale token: not reported as NOT PROVISIONABLE" ;;
+esac
+
+# The other arm: NO credential is STORED (both `auth status` and the offline `auth token` fail) —
+# the broken-HOME defect (#1328), which retrying cannot fix, so it is PERMANENT (rc=3).
+mk_case gh-no-stored-token
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_gh_noauth "$D"
+rf "$D" refresh
+[ "$RC" -eq 3 ] && ok "no stored credential: rc=3 (PERMANENT — retrying cannot conjure one)" \
+               || bad "no stored credential: rc=$RC (want 3) — output: $OUT"
+case "$OUT" in
+  *"NOT PROVISIONABLE"*) ok "no stored credential: the refusal is LOUD and named" ;;
+  *) bad "no stored credential: no NOT PROVISIONABLE verdict — output: $OUT" ;;
+esac
+
+# ── 1i) A STORED-BUT-REJECTED CREDENTIAL IS PERMANENT (agent-infra#1853 review P1) ──────────────
+# The most common real credential failure: a stale/revoked token is STORED (`auth token` succeeds)
+# but the API REJECTS it (HTTP 401). Returning TRANSIENT for ever leaves no marker and no escalation
+# while the cell reports RUNNING with `lanes: 0` — the exact #1328/#1736 shape this PR removes. The
+# API layer is the only signal that separates a rejected credential from an unreachable one
+# (measured on gh 2.97.0: a bogus stored token prints `gh: Bad credentials (HTTP 401)`; a dead proxy
+# prints no HTTP status at all).
+mk_case gh-rejected
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_gh_rejected "$D"
+rf "$D" refresh
+[ "$RC" -eq 3 ] && ok "rejected credential: rc=3 (PERMANENT — a retry cannot change a 401)" \
+               || bad "rejected credential: rc=$RC (want 3) — output: $OUT"
+case "$OUT" in
+  *"NOT PROVISIONABLE"*) ok "rejected credential: the refusal is LOUD and named" ;;
+  *) bad "rejected credential: no NOT PROVISIONABLE verdict — output: $OUT" ;;
+esac
+case "$OUT" in
+  *"HTTP 401"*) ok "rejected credential: the refusal names the 401 (the discriminating signal)" ;;
+  *) bad "rejected credential: the refusal does not name the 401 — output: $OUT" ;;
+esac
+
+# ── 1j) A CLEAN THAT IS DEGRADED IS NOT A VERDICT (agent-infra#1853 review P2) ──────────────────
+# The canonical producer never pairs `ALSO INCOMPLETE` with CLEAN, but `resolve_preflight` prefers
+# the repo's OWN copy — so a VENDORED producer could, and a degraded CLEAN counted as usable would
+# let a broken environment queue an issue it could not actually judge. The guard must drop it.
+# ⛔ The report echoes the candidate's own `title:` line, so the marker match must be ANCHORED: an
+# unanchored search would let an issue TITLE containing the phrase set the flag. Pinned by case 1k.
+mk_case clean-degraded
+mkdir -p "$D/repo/.worktrees/dispatch-scout/tools"
+cat > "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py" <<'PY'
+#!/usr/bin/env python3
+print("VERDICT: CLEAN (exit 0) — the pre-flight could not query every surface")
+print("  ALSO INCOMPLETE: 3 surface(s) could not be queried")
+raise SystemExit(0)
+PY
+chmod +x "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+printf '#!/bin/bash\ncase "$*" in *"--label P0-blocker"*) printf "0 42\\n" ;; esac\nexit 0\n' > "$D/bin/gh"
+chmod +x "$D/bin/gh"
+# A sentinel makes "nothing queued" DISCRIMINATING: an empty file cannot distinguish "the degraded
+# CLEAN was not queued" from "the backlog was clobbered".
+echo 99 > "$D/o/candidates.txt"
+rf "$D" refresh
+[ "$RC" -eq 1 ] && ok "CLEAN is DEGRADED: the pass aborts TRANSIENT (rc=1) — no usable verdict" \
+               || bad "CLEAN is DEGRADED: rc=$RC (want 1) — output: $OUT"
+case "$OUT" in
+  *"CLEAN is DEGRADED"*) ok "CLEAN is DEGRADED: the degradation is NAMED" ;;
+  *) bad "CLEAN is DEGRADED: the degradation is not reported — output: $OUT" ;;
+esac
+case "$OUT" in
+  *"checked "*"backlog now"*) bad "CLEAN is DEGRADED: still reported a healthy backlog" ;;
+  *) ok "CLEAN is DEGRADED: no \"checked N; backlog now M\" over a degraded CLEAN" ;;
+esac
+case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
+  *42*) bad "CLEAN is DEGRADED: the degraded CLEAN was queued — $(cat "$D/o/candidates.txt" 2>/dev/null)" ;;
+  *99*) ok "CLEAN is DEGRADED: not queued (seed 99 intact, #42 absent from candidates.txt)" ;;
+  *) bad "CLEAN is DEGRADED: the backlog was clobbered — candidates='$(cat "$D/o/candidates.txt" 2>/dev/null)'" ;;
+esac
+case "$(tr '\n' ' ' < "$D/o/checked.txt" 2>/dev/null)" in
+  *42*) bad "CLEAN is DEGRADED: the degraded CLEAN was written to checked.txt (blacklisted)" ;;
+  *) ok "CLEAN is DEGRADED: not written to checked.txt (left unchecked for the next pass)" ;;
+esac
+
+# ── 1k) A TITLE THAT QUOTES THE MARKER DOES NOT DEGRADE A CLEAN (agent-infra#1853 review P2) ─────
+# The anchor on the `ALSO INCOMPLETE` match is LOAD-BEARING, not stylistic: the pre-flight report
+# echoes the candidate's own `title:` line, so an unanchored search would let an ISSUE TITLE that
+# contains the phrase set the degraded flag and silently drop a genuine CLEAN. This case FAILS on
+# the unanchored form (`grep -q 'ALSO INCOMPLETE'`): the issue is left unchecked and never queued.
+mk_case title-quotes-marker
+mkdir -p "$D/repo/.worktrees/dispatch-scout/tools"
+cat > "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py" <<'PY'
+#!/usr/bin/env python3
+print("title: fix the ALSO INCOMPLETE: reporting path")
+print("VERDICT: CLEAN")
+raise SystemExit(0)
+PY
+chmod +x "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+printf '#!/bin/bash\ncase "$*" in *"--label P0-blocker"*) printf "0 42\\n" ;; esac\nexit 0\n' > "$D/bin/gh"
+chmod +x "$D/bin/gh"
+rf "$D" refresh
+[ "$RC" -eq 0 ] && ok "title quotes the marker: rc=0 (no \"judged NOTHING\" abort over a genuine CLEAN)" \
+               || bad "title quotes the marker: rc=$RC (want 0) — output: $OUT"
+case "$OUT" in
+  *"DEGRADED"*) bad "title quotes the marker: a TITLE set the degraded flag — output: $OUT" ;;
+  *) ok "title quotes the marker: the CLEAN is NOT read as DEGRADED" ;;
+esac
+case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
+  *42*) ok "title quotes the marker: the genuinely-CLEAN candidate IS queued" ;;
+  *) bad "title quotes the marker: the CLEAN was dropped — candidates='$(cat "$D/o/candidates.txt" 2>/dev/null)'" ;;
+esac
 
 # ── 2) the tool is resolved PER REPO: the repo's OWN copy wins, run from the scout with --repo . ─
 # Structural, not textual: the stub tool records its cwd and argv, and the candidate it cleared must
@@ -273,6 +1081,9 @@ rf "$D" check TORTOISE="$D/tort"
 # rc=3 is the PERMANENT code orch-loop.sh keys on; a transient failure would be 1. The reason must
 # be the missing tool, NOT the old, misleading "uv sync failed".
 mk_case no-tool
+# A sentinel makes "nothing queued" DISCRIMINATING (see the LANDED case): an empty file cannot
+# distinguish "nothing was queued" from "the backlog was clobbered".
+echo 99 > "$D/o/candidates.txt"
 rf "$D" refresh TORTOISE_REPO=
 [ "$RC" -eq 3 ] && ok "no tool anywhere: rc=3 (PERMANENT — not the transient code)" \
                || bad "no tool anywhere: rc=$RC (want 3) — output: $OUT"
@@ -284,11 +1095,11 @@ case "$OUT" in
   *"uv sync failed"*) bad "no tool anywhere: misreported as a uv failure" ;;
   *) ok "no tool anywhere: not misreported as a uv/environment failure" ;;
 esac
-if [ -s "$D/o/candidates.txt" ]; then
-  bad "no tool anywhere: candidates were queued — $(cat "$D/o/candidates.txt")"
-else
-  ok "no tool anywhere: nothing is queued (never a silent empty backlog)"
-fi
+case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
+  *42*) bad "no tool anywhere: candidates were queued — $(cat "$D/o/candidates.txt" 2>/dev/null)" ;;
+  *99*) ok "no tool anywhere: nothing is queued (seed 99 intact, #42 absent)" ;;
+  *) bad "no tool anywhere: the backlog was clobbered — candidates='$(cat "$D/o/candidates.txt" 2>/dev/null)'" ;;
+esac
 
 # ── 4) a REAL pyproject + a failing uv sync is TRANSIENT (rc=1), loud, and not swallowed ────────
 # The other half of the distinction: an environment failure is NOT the not-applicable case.
@@ -471,6 +1282,23 @@ if [ -s "$T/refreshblock.sh" ] && grep -q 'refresh-candidates.sh' "$T/refreshblo
   after="$(wc -c < "$BL2/invoked" | tr -d ' ')"
   [ "$before" != "$after" ] && ok "orch-loop: a transient failure IS retried next cycle" \
                             || bad "orch-loop: a transient failure was not retried"
+  # (c) BOUND THE MARKER'S EVIDENCE TO THE CURRENT RUN (agent-infra#1853 review P2). $LOG is
+  # append-only and never rotated, so a bare `grep 'NOT PROVISIONABLE' "$LOG"` would quote a
+  # PREVIOUS cycle's refusal as this run's reason — presenting a cause that no longer fired. The
+  # marker must quote the CURRENT run's line only. Stubs write NOTHING to the log on the pre-fix
+  # code, so the evidence region is empty and only `[ -s marker ]` is ever asserted; the stale seed
+  # below makes the bound TESTABLE — on the unbounded grep it appears in the marker.
+  BL3="$T/block3"; mkdir -p "$BL3"; : > "$BL3/candidates.txt"
+  printf '[refresh] NOT PROVISIONABLE: STALE PREVIOUS CYCLE REFUSAL\n' > "$BL3/log"
+  printf '#!/bin/bash\necho "[refresh] NOT PROVISIONABLE: CURRENT CYCLE REFUSAL" >> "%s/log"\nexit 3\n' "$BL3" > "$BL3/refresh-candidates.sh"
+  chmod +x "$BL3/refresh-candidates.sh"
+  O="$BL3" LOG="$BL3/log" bash "$T/refreshblock.sh" >/dev/null 2>&1
+  grep -q 'CURRENT CYCLE REFUSAL' "$BL3/.refresh-blocked" 2>/dev/null \
+    && ok "orch-loop: the marker quotes the CURRENT run's refusal" \
+    || bad "orch-loop: the marker does not quote the current refusal — $(cat "$BL3/.refresh-blocked" 2>/dev/null)"
+  grep -q 'STALE PREVIOUS CYCLE REFUSAL' "$BL3/.refresh-blocked" 2>/dev/null \
+    && bad "orch-loop: the marker quoted a PREVIOUS cycle's refusal as this run's reason" \
+    || ok "orch-loop: a previous cycle's refusal is NOT presented as this run's reason"
 else
   bad "orch-loop: could not extract the refresh block"
 fi
@@ -514,6 +1342,16 @@ case "$(tr '\n' ' ' < "$D/o/checked.txt" 2>/dev/null)" in
   *42*) bad "claim-collision: #42 was BLACKLISTED — a transient claim must be re-attempted, not suppressed" ;;
   *) ok "claim-collision: #42 is left UNCHECKED for the next pass" ;;
 esac
+# ⛔ AND the pass must still SUCCEED. A claim collision is a COLLISION — one of the three verdicts the
+# `usable` contract counts — so an all-claim-held pool must not be read as "judged NOTHING". Without
+# this the cell logged `FAILED rc=1` every cycle in exactly the cross-box-collision state this check
+# exists for, while having printed a verdict per candidate (#1853 review).
+[ "$RC" -eq 0 ] && ok "claim-collision: the pass SUCCEEDS (rc=0 — a claim collision is a usable verdict)" \
+               || bad "claim-collision: rc=$RC (want 0) — a pool of peer-held issues was reported as judging NOTHING — output: $OUT"
+case "$OUT" in
+  *"judged NOTHING"*) bad "claim-collision: the pass aborted as if it had no verdict — output: $OUT" ;;
+  *) ok "claim-collision: no \"judged NOTHING\" abort over a pool of peer-held issues" ;;
+esac
 
 # (b) The registry is UNREACHABLE (origin removed): INCOMPLETE — never CLEAN. A registry outage must
 #     not become a duplicate dispatch, so nothing is queued and nothing is blacklisted either.
@@ -534,6 +1372,16 @@ case "$(tr '\n' ' ' < "$D/o/checked.txt" 2>/dev/null)" in
   *42*) bad "claim-unreachable: #42 was blacklisted on an unreadable registry" ;;
   *) ok "claim-unreachable: #42 is left unchecked, so an outage does not consume an issue" ;;
 esac
+# ⛔ A PASS THE REGISTRY ANSWERED NOTHING FOR IS NOT A HEALTHY PASS (2026-10-16 review). The per-issue
+# lines scroll away and `lanes: 0` + `backlog=0` is exactly what a quiet box looks like, so an
+# unreadable registry used to be indistinguishable from "no work available". The pass must exit
+# TRANSIENT, and it must say the registry (not the pool) was the reason.
+[ "$RC" = "1" ] && ok "claim-unreachable: the pass exits TRANSIENT (1), not 0 — an outage is not 'no work'" \
+               || bad "claim-unreachable: rc=$RC — a pass that queued nothing on an unreadable registry read as healthy"
+case "$OUT" in
+  *"of 1 pre-flighted issues INCOMPLETE"*) ok "claim-unreachable: the aggregate names how many the registry could not answer for" ;;
+  *) bad "claim-unreachable: no aggregate INCOMPLETE line — output: $OUT" ;;
+esac
 
 # (c) The registry is NOT INSTALLED: the documented FALLBACK. The candidate IS queued (a missing FILE
 #     is not an unreachable registry — refusing here would make the box merge-only), and the box says
@@ -541,7 +1389,12 @@ esac
 mk_case claim-absent
 mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
 mk_gh_one_issue "$D"
-rf "$D" refresh CLAIMS_SH="$D/no-registry-here.sh"
+# A genuinely MISSING file — not a bogus path in the environment. `CLAIMS_SH` was a test seam that
+# three production callers had begun to honour, which let an ambient value disable the gate in one
+# of them and not the others; the path is `$O/claims.sh` everywhere now, so the absence is staged by
+# removing the file (2026-10-16 review).
+rm -f "$D/o/claims.sh"
+rf "$D" refresh
 case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
   *42*) ok "claim-absent: a candidate is still queued (the fallback is not a false block)" ;;
   *) bad "claim-absent: nothing was queued — candidates='$(cat "$D/o/candidates.txt" 2>/dev/null)'" ;;
@@ -572,6 +1425,37 @@ case "$OUT" in
   *"predates the issue-claim reader"*) ok "claim-stale-registry: the refusal NAMES the stale registry" ;;
   *) bad "claim-stale-registry: the reason is not named — output: $OUT" ;;
 esac
+# ⛔ AND IT IS A PROVISIONING FAILURE, NOT A PER-ISSUE ONE (2026-10-16 review). A stale $O/claims.sh is
+# LOCAL and PERMANENT, so answering INCOMPLETE per issue queues nothing FOREVER while the cell still
+# reports RUNNING — the "looks alive and can only merge" defect this script has been fixed for twice
+# (#1748, #1736). rc=3 is what orch-loop.sh turns into `.refresh-blocked` (stop retrying, name it).
+[ "$RC" = "3" ] && ok "claim-stale-registry: the pass exits NOT-PROVISIONABLE (3) so the cell is not read as healthy" \
+                 || bad "claim-stale-registry: rc=$RC — a permanent local drift exited 0 and would be retried forever"
+case "$OUT" in
+  *"NOT PROVISIONABLE"*) ok "claim-stale-registry: the permanent drift is reported on the provisioning channel" ;;
+  *) bad "claim-stale-registry: no NOT PROVISIONABLE line — output: $OUT" ;;
+esac
+
+# (g) ⛔ AN UNRECOGNISED VERDICT CODE IS NOT A LICENCE TO DISPATCH (2026-10-16 review). The CLEAN arm
+#     was `case 1) … 2) … *) CLEAN`, so ANY other code — 127 from a missing function, or whatever a
+#     foreign/newer/older registry returns — was read as CLEAN and QUEUED the issue: fail-OPEN in the
+#     one place the block declares it never fails open. Only an explicit 0 may queue.
+#     The stub is a sourceable registry whose reader answers 7, the shape a future/foreign copy has.
+mk_case claim-unrecognised
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_gh_one_issue "$D"
+printf '# a registry whose verdict code this caller does not know\nclaim_issue_preflight() { return 7; }\n' > "$D/o/claims.sh"
+rf "$D" refresh
+case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
+  *42*) bad "claim-unrecognised: #42 was QUEUED on an unrecognised verdict code — fail-OPEN" ;;
+  *) ok "claim-unrecognised: an unrecognised verdict code queues NOTHING (INCOMPLETE, never CLEAN)" ;;
+esac
+case "$OUT" in
+  *"UNRECOGNISED verdict"*) ok "claim-unrecognised: the reason names the unrecognised code" ;;
+  *) bad "claim-unrecognised: the unrecognised verdict is not named — output: $OUT" ;;
+esac
+[ "$RC" = "1" ] && ok "claim-unrecognised: the pass exits TRANSIENT so it is not read as 'no work'" \
+                 || bad "claim-unrecognised: rc=$RC (want 1)"
 
 # (f) And the CLEAN path still works WITH the registry installed and NO claim: the gate must not be a
 #     blanket refusal. (Case 2 above already covers this shape, but it now runs with a real origin and
@@ -644,6 +1528,24 @@ if [ -s "$T/dispatchblock.sh" ] && grep -q 'claim_issue_acquire' "$T/dispatchblo
   esac
   [ ! -e "$DB2/o/state/issueclaim-42" ] && ok "orch-loop dispatch: no release record was written for a refused claim" \
                                         || bad "orch-loop dispatch: a release record exists for a claim this box never took"
+  # (iii) ⛔ A REGISTRY TOO OLD TO TAKE A CLAIM MUST NOT DISPATCH UNCLAIMED (2026-10-16 review). The
+  #       pre-flight refuses every issue on such a box (case (e): rc=3 NOT PROVISIONABLE), so
+  #       dispatching here is the fail-open half of that same condition — an issue a peer may already
+  #       own goes out with no claim at all, while the box's own reader calls the registry unusable.
+  DB3="$T/db-stale"; mkdir -p "$DB3/o/state" "$DB3/repo"
+  git init -q --bare "$DB3/origin.git"; git init -q "$DB3/repo"
+  git -C "$DB3/repo" remote add origin "$DB3/origin.git"
+  printf '# a registry that predates the issue key: sourceable, no claim_issue_* functions\nCLAIM_TTL=1800\n' > "$DB3/o/claims.sh"
+  printf '42\n' > "$DB3/o/candidates.txt"; : > "$DB3/o/dispatched.txt"
+  db "$DB3"
+  case "$(tr '\n' ' ' < "$DB3/o/.batch" 2>/dev/null)" in
+    *42*) bad "orch-loop dispatch: a STALE registry dispatched the issue UNCLAIMED (fail-open)" ;;
+    *) ok "orch-loop dispatch: a stale registry stops the dispatch (no claim is possible on this box)" ;;
+  esac
+  case "$(cat "$DB3/log" 2>/dev/null)" in
+    *"predates the issue key"*) ok "orch-loop dispatch: the stale registry is NAMED in the log, with the fix" ;;
+    *) bad "orch-loop dispatch: the stale-registry stop is not explained — log: $(cat "$DB3/log" 2>/dev/null)" ;;
+  esac
 else
   bad "orch-loop: could not extract the dispatch block carrying claim_issue_acquire"
 fi
@@ -705,6 +1607,53 @@ if [ -s "$T/release.sh" ] && grep -q 'claim_issue_release' "$T/release.sh"; then
     after_stale="$(git -C "$RL2/repo" ls-remote origin refs/claims/issue-42 | awk '{print $1}')"
     [ "$after_stale" = "$peerc" ] && ok "chain-merge: a STALE holder cannot delete the WINNER's issue claim (fenced)" \
                                    || bad "chain-merge: the fenced release deleted a peer's claim (${after_stale:-<gone>} vs $peerc)"
+    # ⛔ GENERATION GUARD (2026-10-16 review). The handover record is keyed on the ISSUE, so the SAME
+    # box can become the holder again while this chain is still alive (its lease lapsed; the chain is
+    # still waiting on a PR) — and the re-acquire OVERWRITES the record with the new commit. A trap
+    # that read the file when it FIRED would then fence on that NEWER commit, which IS the ref tip, so
+    # the OLD chain would delete the claim of the chain that legitimately holds it and a peer would
+    # read the issue as free: the duplicate this registry exists to prevent, and a fail-OPEN.
+    # The chain captured ITS OWN commit at start; the mismatch must refuse the release AND leave the
+    # newer generation's record alone (that chain still has to release its own claim).
+    RL3="$T/rl-generation"; mkdir -p "$RL3/o/state" "$RL3/repo"
+    git init -q --bare "$RL3/origin.git"; git init -q "$RL3/repo"
+    git -C "$RL3/repo" remote add origin "$RL3/origin.git"
+    cp "$HERE/claims.sh" "$RL3/o/claims.sh"
+    older="$( cd "$RL3/repo" || exit 1
+              CLAIM_REPO="$RL3/repo"; CLAIM_OWNER_ID=selfbox; export CLAIM_REPO CLAIM_OWNER_ID
+              . "$HERE/claims.sh"
+              _claim_commit selfbox "$(( $(date +%s) - 60 ))" )"
+    newer="$( cd "$RL3/repo" || exit 1
+              CLAIM_REPO="$RL3/repo"; CLAIM_OWNER_ID=selfbox; export CLAIM_REPO CLAIM_OWNER_ID
+              . "$HERE/claims.sh"
+              _claim_commit selfbox "$(( $(date +%s) + 600 ))" )"
+    [ -n "$older" ] && [ -n "$newer" ] || bad "chain-merge: could not mint both generations for the guard case"
+    git -C "$RL3/repo" push -q origin "$newer:refs/claims/issue-42"
+    printf '%s\n' "$newer" > "$RL3/o/state/issueclaim-42"
+    ( O="$RL3/o"; LOG="$RL3/o/log"; N=42; REPO="$RL3/repo"; CLAIM_REPO="$RL3/repo"
+      CHAIN_CLAIM_COMMIT="$older"; export O LOG N REPO CLAIM_REPO CHAIN_CLAIM_COMMIT
+      . "$RL3/o/claims.sh"; . "$T/release.sh"; release_issue_claim ) >/dev/null 2>&1
+    gen_left="$(git -C "$RL3/repo" ls-remote origin refs/claims/issue-42 | awk '{print $1}')"
+    [ "$gen_left" = "$newer" ] && ok "chain-merge: an OLDER chain cannot release the NEWER generation's claim (generation guard)" \
+                               || bad "chain-merge: the older chain deleted the newer generation's claim (${gen_left:-<gone>} vs $newer)"
+    [ -e "$RL3/o/state/issueclaim-42" ] && ok "chain-merge: the newer generation's record is left for ITS own release" \
+                                        || bad "chain-merge: the generation-refused release consumed the newer generation's record"
+    # ⛔ THE CAPTURE IS WIRED, NOT JUST THE GUARD (cycle-2 adversarial review). Every case above
+    # INJECTS CHAIN_CLAIM_COMMIT, so deleting chain-merge.sh's capture line would leave them all GREEN
+    # while the guard went INERT in production: the trap would pass an empty expectation, so the
+    # release would fence on the record's CURRENT value — the live holder's own commit, which IS the
+    # ref tip — and delete it. Drive the SHIPPED capture statement itself, with the record present.
+    cap_line="$(sed -n '/^CHAIN_CLAIM_COMMIT=/p' "$HERE/chain-merge.sh" | head -1)"
+    if [ -z "$cap_line" ]; then
+      bad "chain-merge: the generation CAPTURE is GONE from the shipped script — the guard would be inert in production"
+    else
+      cap_val="$( cd / && O="$RL3/o" N=42 REPO="$RL3/repo" CLAIM_REPO="$RL3/repo"
+                  eval "$cap_line" >/dev/null 2>&1
+                  printf '%s' "${CHAIN_CLAIM_COMMIT:-}" )"
+      [ "$cap_val" = "$newer" ] \
+        && ok "chain-merge: the shipped capture reads THIS box's recorded generation (the guard is WIRED)" \
+        || bad "chain-merge: the shipped capture returned '${cap_val:-<empty>}' (want $newer) — the generation guard is inert in production"
+    fi
 else
     bad "chain-merge: could not extract release_issue_claim from the shipped script"
 fi
@@ -754,6 +1703,43 @@ if [ -s "$T/unspawned.sh" ] && grep -q 'claim_issue_release_record' "$T/unspawne
                          || bad "dispatch-merge: an empty record deleted or changed the claim (${keep:-<gone>} vs $peer2)"
 else
   bad "dispatch-merge: could not extract release_issue_claim_unspawned from the shipped script"
+fi
+
+# ⛔ THE CHAIN-FAILURE BRANCH MUST NOT RELEASE A LANE THAT IS STILL RUNNING (cycle-2 adversarial
+# review). The lane is spawned BEFORE the chain in the same loop body, so "no chain will ever run" is
+# true while "nothing is running" is not: releasing there declares an issue this box is ACTIVELY
+# implementing free, a peer claims it and duplicates the work, and this box still opens a PR nothing
+# will merge. The branch must stop the lane first and release only once it is confirmed gone (if it
+# cannot be stopped, KEEP the claim — the lease expiring it is the safe direction). The shipped
+# branch is extracted and driven with a stubbed `tmux`, once for each outcome.
+DM="$T/dm-branch.sh"
+sed -n '/if tmux new-session -d -s "chain-/,/^  fi$/p' "$HERE/dispatch-merge.sh" > "$DM"
+if [ -s "$DM" ] && grep -q 'release_issue_claim_unspawned' "$DM"; then
+  ok "dispatch-merge: the chain-failure branch is extractable from the shipped script"
+  # <lane alive> <kill succeeds> -> how many times the release ran
+  run_branch() {
+    ( N=42; O="$T/dm/o"; REPO="$T/dm/repo"; OR="owner/repo"; BR="feat/42-x"
+      LANE_ALIVE="$1"; KILLABLE="$2"; released=0
+      tmux() {
+        case "${1:-}" in
+          new-session) return 1 ;;                                  # the chain cannot start
+          ls) [ "$LANE_ALIVE" = 1 ] && printf 'lane-42\n'; return 0 ;;
+          kill-session) [ "$KILLABLE" = 1 ] && { LANE_ALIVE=0; return 0; }; return 1 ;;
+          *) return 0 ;;
+        esac
+      }
+      release_issue_claim_unspawned() { released=$(( released + 1 )); }
+      . "$DM" >/dev/null 2>&1
+      printf '%s' "$released" )
+  }
+  [ "$(run_branch 1 1)" = "1" ] \
+    && ok "dispatch-merge: a chain that cannot start releases the claim AFTER stopping its lane" \
+    || bad "dispatch-merge: the stopped-lane path did not release exactly once (got '$(run_branch 1 1)')"
+  [ "$(run_branch 1 0)" = "0" ] \
+    && ok "dispatch-merge: a chain that cannot start KEEPS the claim while its lane is still alive" \
+    || bad "dispatch-merge: released the claim while lane-42 was STILL RUNNING — a peer would duplicate the work"
+else
+  bad "dispatch-merge: could not extract the chain-failure branch (or it no longer releases)"
 fi
 
 echo
