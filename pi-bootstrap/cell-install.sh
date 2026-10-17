@@ -842,8 +842,11 @@ verify_layer() {
         esac
       done <<<"$retired_list"
       # The success line is only true when nothing above failed: an operator reading the log
-      # must never see "verified … absent" next to a FAIL about the same leg.
-      if [ "$retired_present" -eq 0 ] && [ "$conflict_rc" -eq 0 ]; then
+      # must never see "verified … absent" next to a FAIL about the same leg. `declared_ok` is
+      # part of that: a truncated declared set makes the contradiction check vacuous (every
+      # still-farmed retired name is invisible), so its clean answer proves nothing — and
+      # `retired_n` would count entries read from a list the run could not fully build from.
+      if [ "$retired_present" -eq 0 ] && [ "$conflict_rc" -eq 0 ] && [ "$declared_ok" = 1 ]; then
         say "verified $retired_n declared retirement(s) absent from the cell"
       fi
 
