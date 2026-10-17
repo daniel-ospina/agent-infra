@@ -1632,6 +1632,39 @@ case "$Q_OUT" in
   *) bad "status's mismatch line does not name both sides — $Q_OUT" ;;
 esac
 
+# (10) A DERIVED $REPO IS VALIDATED BEFORE IT REACHES THE TMUX COMMAND STRING (#1935 review).
+# `cmd_start` runs its metacharacter guard BEFORE `assert_repo` derives the checkout (`start` calls
+# `cmd_check`, which is where the derivation happens) — and that guard SKIPS an empty value. So a
+# derived path was the one interpolated value that reached `new-session "… REPO='$REPO' …"`
+# unvalidated: a checkout directory whose name carries a quote closes the quote and the remainder is
+# parsed as shell. The fix mirrors the `$HARNESS` re-check that exists for exactly this class (a value
+# that CHANGES after the guard). Driven through the shipped `check`, because that is the path a real
+# `start` takes.
+say_case "a DERIVED REPO is validated before it reaches the tmux command string (#1935)"
+D3="$T/derived"; mkdir -p "D3/o" "D3/st" "$D3/we'ird"
+ai_init_repo "$D3/we'ird"
+D3_OUT=''; D3_RC=0
+D3_OUT="$(env -u REPO -u OR Q_STATE="$D3/st" PATH="$Q/bin:$PATH" CELL_HOME="$Q/home" ENV_FILE="$Q/keys.env" \
+         SESSION="ai1935-$$" O="$D3/o" WORKDIR="$D3/we'ird" HARNESS="$Q/harness" HARNESS_REPO="$AI" \
+         HARNESS_FETCH=0 HARNESS_REF="$Q_REF" bash "$SUP" check 2>&1)"; D3_RC=$?
+[ "$D3_RC" -ne 0 ] && ok "check REFUSED a DERIVED checkout path carrying a quote" \
+                   || bad "check ACCEPTED a derived REPO carrying a quote — it would be interpolated into the tmux command string: $D3_OUT"
+case "$D3_OUT" in
+  *"must not contain a quote or shell metacharacter"*) ok "the refusal names the metacharacter guard (not an unrelated failure)" ;;
+  *) bad "check refused for an UNRELATED reason, so the derived-REPO guard is unproven: $D3_OUT" ;;
+esac
+# …and the control: the SAME shape with a safe directory name DERIVES and proceeds, so the arm above
+# proves the guard rather than "a WORKDIR-derived repo never works".
+mkdir -p "$D3/fine" "$D3/st2"; ai_init_repo "$D3/fine"
+D4_OUT=''; D4_RC=0
+D4_OUT="$(env -u REPO -u OR Q_STATE="$D3/st2" PATH="$Q/bin:$PATH" CELL_HOME="$Q/home" ENV_FILE="$Q/keys.env" \
+         SESSION="ai1935b-$$" O="$D3/o2" WORKDIR="$D3/fine" HARNESS="$Q/harness" HARNESS_REPO="$AI" \
+         HARNESS_FETCH=0 HARNESS_REF="$Q_REF" bash "$SUP" check 2>&1)"; D4_RC=$?
+case "$D4_OUT" in
+  *"REPO was not set — using $D3/fine"*) ok "the control case DERIVES a quote-free checkout (the guard is not a general refusal)" ;;
+  *) bad "a quote-free derived checkout was NOT adopted, so the arm above proves nothing — $D4_OUT" ;;
+esac
+
 echo
 echo "── Summary ───────────────────────────────────────────────────────"
 echo "  PASS=$PASS FAIL=$FAIL"
