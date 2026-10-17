@@ -606,7 +606,10 @@ pin_path_real() {
 # ⛔ The enumeration is `ls -A`, not a `"$dir"/*` glob: a glob skips HIDDEN entries and dangling
 # symlinks, so a root whose only entry was `.DS_Store` read as EMPTY-AND-SAFE on the check side while
 # the delete side refused the same root — the same false pass, one branch over. `ls -A` sees every
-# entry, and each one must be a hex-named directory.
+# entry, and each one must be a hex-named directory — EXCEPT an OS-droppings regular file
+# (`.DS_Store` / `._*`), which is skipped: refusing it bricked all four verbs after a single Finder
+# visit to the default root on the operators' macOS server (see the header above, which states the
+# whole allow-list; this line is the one it is easiest to contradict by accident).
 # ⛔ Deliberately NOT a per-entry `git worktree list` path comparison: on macOS a `$TMPDIR`-derived
 # path carries a `//` that git normalizes in its listing output, so a literal comparison reports our
 # OWN pin as foreign and the guard becomes a false block.
@@ -1410,7 +1413,8 @@ cmd_prune() {
     # settable, and without this `prune` — which `cmd_start` calls UNATTENDED — `rm -rf`s every
     # subdirectory of a misconfigured root: `HARNESS_PIN_DIR=$CELL_HOME` deleted the cell home and its
     # state dir BEFORE the guard in `harness_apply` could fire. `assert_pin_dir_safe` refuses any root
-    # that is not an empty dir, a linked worktree, or a pin root of hex-named directories.
+    # that is not an empty dir, a linked worktree, or a pin root of hex-named directories (plus a root
+    # whose only other entries are `.DS_Store`/`._*` regular files — see its header for the allow-list).
     assert_pin_dir_safe "$HARNESS_PIN_DIR"
     if linked_worktree_of "$HARNESS_REPO" "$HARNESS_PIN_DIR"; then
       # The legacy FLAT PIN: the root IS the live worktree, so `"$HARNESS_PIN_DIR"/*/` would enumerate

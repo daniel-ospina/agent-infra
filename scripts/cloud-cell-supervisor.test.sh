@@ -1764,9 +1764,10 @@ rm -rf "$Q/pin/notes"
 # (a concurrent `apply`/`prune`) has "retry in a moment". The reason is carried out in PIN_ROOT_BAD
 # the way rc 1's is.
 # ⛔ The vanish state is provoked DETERMINISTICALLY with a stub `ls` that names an entry which does not
-# exist — no race, no flake. The stub is on PATH for the SOURCE too (hermetic: sourcing runs
-# `cmd_status`, whose tmux probes must not reach the operator's default server), and it FORWARDS to the
-# real `ls` until a marker file exists, so sourcing sees ordinary listings. ⛔ Mutation caught:
+# exist — no race, no flake. BOTH stubs are on PATH for the SOURCE too ($VQ/bin supplies the fake
+# `ls`, $Q/bin the `tmux` stub): sourcing runs `cmd_status`, whose tmux probes must not reach the
+# operator's default server. The `ls` stub FORWARDS to the real `ls` until a marker file exists, so
+# sourcing sees ordinary listings. ⛔ Mutation caught:
 # dropping the PIN_ROOT_BAD assignment on that return makes the message fall back to "cannot be
 # READ …" and reddens both arms of this case.
 say_case "a vanished-mid-read pin root is NOT reported as 'cannot be READ' (#1852)"
@@ -1776,7 +1777,7 @@ chmod +x "$VQ/bin/ls"
 : > "$VQ/active"
 VBAD="$(
   set -- status
-  export PATH="$VQ/bin:$PATH" CELL_HOME="$VQ/cell" ENV_FILE="$VQ/none.env" O="$VQ/o" REPO="$VQ/repo" \
+  export PATH="$VQ/bin:$Q/bin:$PATH" CELL_HOME="$VQ/cell" ENV_FILE="$VQ/none.env" O="$VQ/o" REPO="$VQ/repo" \
          HARNESS_PIN_DIR="$VQ/pin" HARNESS_PIN_FILE="$VQ/hp"
   . "$SUP" >/dev/null 2>&1
   pin_root_conformance "$VQ/pin"; echo "rc=$?"; echo "bad=$PIN_ROOT_BAD"
@@ -1785,7 +1786,7 @@ case "$VBAD" in *"rc=2"*) ok "the vanish state is rc 2 (cannot verify), not a pa
 case "$VBAD" in *"vanished"*) ok "the reason names the vanish, not a read failure" ;; *) bad "the rc-2 reason does not name the vanish — $VBAD" ;; esac
 VQ_OUT="$(
   set -- status
-  export PATH="$VQ/bin:$PATH" CELL_HOME="$VQ/cell" ENV_FILE="$VQ/none.env" O="$VQ/o" REPO="$VQ/repo" \
+  export PATH="$VQ/bin:$Q/bin:$PATH" CELL_HOME="$VQ/cell" ENV_FILE="$VQ/none.env" O="$VQ/o" REPO="$VQ/repo" \
          HARNESS_PIN_DIR="$VQ/pin" HARNESS_PIN_FILE="$VQ/hp"
   . "$SUP" >/dev/null 2>&1
   cmd_check_pin_dir 2>&1
