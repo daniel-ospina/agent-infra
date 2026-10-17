@@ -40,7 +40,7 @@ export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
 # Fail LOUD if the helper is missing: an unsourced helper leaves `run_agent` undefined, and that must
 # never degrade into "the fixer ran" — see README §9 on syncing $O.
 # ⛔ SOURCED AFTER THE PATH EXPORT: spawn-gate.sh derives `_NCPU` at SOURCE time, so sourcing it
-# under the pre-export PATH pins _NCPU=4 / MAX_LOAD=40 for every cell (the #1702 failure).
+# under the pre-export PATH pins _NCPU=4 / MAX_LOAD=32 for every cell (the #1702 failure).
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$SELF/spawn-gate.sh" || { echo "[fix $PR] FATAL: $SELF/spawn-gate.sh missing — refusing to run an ungated fixer" >&2; exit 78; }
 export AGENT_SKIP_REVIEW_GATE=1 ELDATO_SKIP_VGATE=1 AGENT_ALLOW_MAIN_EDITS=1 ELDATO_ALLOW_MAIN_EDITS=1

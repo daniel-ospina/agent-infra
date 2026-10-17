@@ -31,7 +31,7 @@ MAX_FIX_TRIES="${MAX_FIX_TRIES:-3}"
 # Derive the ceiling from the core count so it scales, and keep the env override.
 # sysctl -n hw.ncpu is macOS-only: on a Linux cell sysctl may be absent entirely (Debian's procps
 # does not ship it any more — verified in debian:stable-slim) and hw.ncpu is a macOS key regardless,
-# so the fallback silently pinned _NCPU=4 for EVERY cell and MAX_LOAD=40 with it (#1702).
+# so the fallback silently pinned _NCPU=4 for EVERY cell and MAX_LOAD=32 with it (#1702).
 # ⛔ LEADING ZEROS ARE NOT NUMBERS HERE (P2, second review round, 2026-10-14). `''|*[!0-9]*`
 # ACCEPTED `08`, and `$(( ))` parses base 0 (a leading 0 means OCTAL; `08`/`09` are not octal).
 # On /bin/bash 3.2.57 — what the launchd plist invokes — the failed arithmetic ASSIGNMENT aborts
@@ -65,7 +65,7 @@ _NCPU="$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || getconf _NPROCESS
 # slips past is_num and then aborts the gate chain — the same fail-open this block exists to close.
 # ⛔ `_NCPU` GETS THE SAME BOUND (P3, fourth review round, 2026-10-14), and the failure it prevents
 # is NOT the plist's: `_NCPU` is an OS probe (`sysctl`/`nproc`), so an absurd-but-numeric value
-# reaches `$(( 10#$_NCPU * 10 ))` and the magnitude WRAPS instead of erroring — and each wrapped
+# reaches `$(( 10#$_NCPU * 8 ))` and the magnitude WRAPS instead of erroring — and each wrapped
 # outcome is individually a VALID number, so no downstream guard can see it. Measured on
 # /bin/bash 3.2.57: 99999999999999999999 * 10 wraps to 3875820019684212726, and -- CORRECTED, fifth
 # review round 2026-10-14: that is 19 digits but still BELOW 2**63-1, so `[ -ge ]` does NOT error.
@@ -85,8 +85,8 @@ is_limit "${_NCPU:-}"    || _NCPU=4
 # `[ "$L" -ge 0 ]` is always true, so the load gate CLOSES and the box dispatches nothing, forever.
 # install.sh carries the identical line (P3, fifth review round, 2026-10-14).
 [ "${_NCPU:-0}" -ge 1 ] || _NCPU=4
-MAX_LOAD="${MAX_LOAD:-$(( 10#$_NCPU * 10 ))}"
-is_limit "${MAX_LOAD:-}" || MAX_LOAD=$(( 10#$_NCPU * 10 )); is_limit "${MAX_LOAD:-}" || MAX_LOAD=40
+MAX_LOAD="${MAX_LOAD:-$(( 10#$_NCPU * 8 ))}"
+is_limit "${MAX_LOAD:-}" || MAX_LOAD=$(( 10#$_NCPU * 8 )); is_limit "${MAX_LOAD:-}" || MAX_LOAD=32
 MAX_LANES="${MAX_LANES:-4}"
 MAX_REVIEW="${MAX_REVIEW:-4}"   # keep in sync with install.sh's default and README §4
 # Above this many UNOWNED open PRs (open PRs nothing is currently working — pr_owned() below),

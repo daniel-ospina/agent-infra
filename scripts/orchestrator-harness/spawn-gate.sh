@@ -66,7 +66,7 @@ is_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; 0) return 0 ;; 0*) return 1
 #
 # The core count is derived PORTABLY. `sysctl -n hw.ncpu` is macOS-only: on a Linux cell sysctl may
 # be absent entirely (Debian's procps does not ship it any more) and `hw.ncpu` is a macOS key
-# regardless, so the old `|| echo 4` silently pinned _NCPU=4 and MAX_LOAD=40 for EVERY cell (#1702).
+# regardless, so the old `|| echo 4` silently pinned _NCPU=4 and MAX_LOAD=32 for EVERY cell (#1702).
 _NCPU="$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
 # `is_limit` = is_num AND at most 9 digits. It must NOT reject 0: install.sh validates plist limits
 # through it, where 0 is legal, and `MAX_LOAD=0` deliberately means "spawn nothing" (`[ 0 -lt 0 ]`
@@ -74,7 +74,7 @@ _NCPU="$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || getconf _NPROCESS
 is_limit() { is_num "${1:-}" && [ "${#1}" -le 9 ]; }
 # ⛔ `_NCPU` IS GUARDED BY `is_limit`, NOT `is_num`, AND THE REASON IS A WRAP — not a bad comparison
 # (P1, review round 2026-10-15). A 19-digit-but-below-2^63 probe does NOT error anywhere: it reaches
-# `$(( 10#$_NCPU * 10 ))`, WRAPS, and yields a small, plausible ceiling that every later guard then
+# `$(( 10#$_NCPU * 8 ))`, WRAPS, and yields a small, plausible ceiling that every later guard then
 # ACCEPTS. Measured before this fix: a probe of 1844674407470955161 gave MAX_LOAD=999999994 on a
 # 10-core box — the gate is INERT and every worker launches onto a saturated machine, silently. The
 # other wrap direction is the permanent stop: 2^63 wraps to 0, `is_limit 0` is true, and
@@ -95,13 +95,13 @@ is_limit "${_NCPU:-}"   || _NCPU=4
 # orch-loop.sh:85 and install.sh:47 carry the identical line.
 [ "${_NCPU:-0}" -ge 1 ] || _NCPU=4
 # `10#` forces base 10 so a value with a leading zero is not re-read as octal.
-MAX_LOAD="${MAX_LOAD:-$(( 10#$_NCPU * 10 ))}"
+MAX_LOAD="${MAX_LOAD:-$(( 10#$_NCPU * 8 ))}"
 # ⛔ THE FALLBACK MUST BE A TRUE DEFAULT, NOT A RE-DERIVATION. A magnitude guard that falls back to
 # `_NCPU * 10` is a NO-OP in the case it exists for: an out-of-range value that came FROM the core
 # probe re-derives to the same garbage. The first guard repairs a 10-digit MAX_LOAD derived from a
 # 9-digit `_NCPU`; only the literal 40 is genuinely out of range, so it is the final fallback.
-is_limit "${MAX_LOAD:-}" || MAX_LOAD=$(( 10#$_NCPU * 10 ))
-is_limit "${MAX_LOAD:-}" || MAX_LOAD=40
+is_limit "${MAX_LOAD:-}" || MAX_LOAD=$(( 10#$_NCPU * 8 ))
+is_limit "${MAX_LOAD:-}" || MAX_LOAD=32
 
 # ── the disk gate (agent-infra#1765) ─────────────────────────────────────────────
 # A cell whose filesystem fills is not a warning, and it is not self-correcting: MEASURED twice on

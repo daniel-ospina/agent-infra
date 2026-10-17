@@ -12,7 +12,7 @@ export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
 # degrade into "the agent ran" or "the review failed" — see README §9 on syncing $O.
 # ⛔ SOURCED AFTER THE PATH EXPORT, not before it (a deliberate departure from the tortoise
 # original): spawn-gate.sh derives `_NCPU` at SOURCE time via `sysctl`/`nproc`/`getconf`, so sourcing
-# it under the pre-export PATH pins `_NCPU=4` and MAX_LOAD=40 for every cell — the exact #1702
+# it under the pre-export PATH pins `_NCPU=4` and MAX_LOAD=32 for every cell — the exact #1702
 # failure the portable probe exists to prevent.
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$SELF/spawn-gate.sh" || { echo "[lane $N] FATAL: $SELF/spawn-gate.sh missing — refusing to start an ungated agent" >&2; exit 78; }

@@ -76,7 +76,7 @@
 #   invocation that omits `--no-session`, or one whose name AND flags are both assembled at runtime.
 #   FIVE deliberate DEPARTURES from the tortoise original, all named in-file:
 #     D1 the helper is sourced AFTER the caller's PATH export (tortoise sources it before, which pins
-#        _NCPU=4 / MAX_LOAD=40 at source time on every cell — #1702).
+#        _NCPU=4 / MAX_LOAD=32 at source time on every cell — #1702).
 #     D2 run_agent() keeps agent-infra's #1709 wall-time telemetry (`elapsed=`, walltime.tsv) which
 #        the tortoise copy never had — so this is a MERGE, not a copy.
 #     D3 the ceiling coercion is HARDENED past the tortoise original, which carries only
@@ -90,7 +90,7 @@
 #        guard that re-derives from the same _NCPU is a no-op in the case it exists for. fix-one.sh's
 #        refund also uses the imported is_num rather than a second, weaker inline `case`.
 #        ⛔ AND `_NCPU` MUST BE GUARDED BY `is_limit`, NOT `is_num` (P1, round 2). An absurd-but-
-#        numeric 19-digit core probe does not ERROR anywhere: it reaches `$(( 10#$_NCPU * 10 ))`,
+#        numeric 19-digit core probe does not ERROR anywhere: it reaches `$(( 10#$_NCPU * 8 ))`,
 #        WRAPS, and yields a small, in-range ceiling that every later guard ACCEPTS. Measured:
 #        hw.ncpu=1844674407470955161 -> MAX_LOAD=999999994 on a 10-core box, i.e. the gate is INERT
 #        and every worker launches onto a saturated machine, silently. `is_num` there would REGRESS a
