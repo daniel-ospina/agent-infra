@@ -138,6 +138,12 @@ env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
 # below failing and the cell repo with no commit while every assertion still passed.
 env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
   git -C "$CELL_REPO" -c user.email=t@t -c user.name=t commit -q --allow-empty -m base
+# ⛔ agent-infra#1901: the queue's repo is DERIVED from $REPO's `origin` remote, and a pair that
+# cannot be READ is refused — so the fixture checkout must carry one, or every `cell_check` below is
+# decided by the queue refusal instead of the recorder probe it names. `acme/widget` is the OR
+# `cell_start` already passes, so the derived and the override paths see the SAME queue.
+env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+  git -C "$CELL_REPO" remote add origin https://github.com/acme/widget.git
 cp "$HERE"/*.sh "$CELL_HARNESS/"
 env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
   git -C "$CELL_HARNESS" init -q
@@ -161,7 +167,11 @@ mkdir -p "$(dirname "$RECORDER_LIB")"
 printf '#!/usr/bin/env python3\n' > "$RECORDER_LIB"; chmod +x "$RECORDER_LIB"
 
 cell_check() { # cell_check — drive the SHIPPED `check` under the fixture's stub PATH
-  env -u SCOPE -u AI_REVIEW_GATE_KEY \
+  # ⛔ `-u OR` is agent-infra#1901's hermeticity requirement, not an aesthetic: `OR` is now a
+  # VALIDATED input (the queue's repo, derived from the fixture checkout's remote unless declared),
+  # so a developer's ambient OR would be held against this fixture's `acme/widget` remote and every
+  # arm below would be decided by the queue refusal instead of the recorder probe it names.
+  env -u OR -u SCOPE -u AI_REVIEW_GATE_KEY \
     PATH="$CELL_STUBS" HOME="$CELL_HOME" CELL_HOME="$CELL_HOME" REPO="$CELL_REPO" \
     O="$CELL_O" HARNESS="$CELL_HARNESS" ENV_FILE="$CELL/absent.env" \
     HARNESS_REPO="$CELL_HARNESS" HARNESS_REF=origin/main HARNESS_FETCH=0 \
