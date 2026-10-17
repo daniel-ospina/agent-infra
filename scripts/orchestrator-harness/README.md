@@ -189,9 +189,9 @@ assumes "a claim means it runs once" is wrong (research: agent-infra#1709).
 
 | component | why retired |
 |---|---|
-| the `SCOPE=own` partition ("exactly one BROAD box, others OWN") | introduced because ownership was **unknowable**; claims now answer it, and `own` **strands** work that nobody owns |
+| the `SCOPE=own` partition ("exactly one BROAD box, others OWN") | introduced because ownership was **unknowable**; claims now answer it, and `own` **strands** work that nobody owns. §4 and §5 below are updated to mark it legacy; the claim registry is the cross-box barrier now |
 | `parked-*` / `parkreason-*` as a terminal state | to be replaced by the ask-user escalation (R5) |
-| swarm-era coordination jobs — `coordinator`, `swarm-watchdog`, `agent-implementer`, `agent-strategist`, `team-strategist`, `pipeline-ingest` | superseded by this harness; two dispatch systems on one box double-dispatch. The swarm repo has had **no commits since 2026-08-11** |
+| swarm-era coordination jobs — `coordinator`, `swarm-watchdog`, `agent-implementer`, `agent-strategist`, `team-strategist`, `pipeline-ingest` | superseded by this harness; two dispatch systems on one box double-dispatch. The swarm repo's `origin/main` has had **no commits since 2026-09-18** (checked against the remote, not a local checkout — a local one here was 283 commits behind) |
 | the `content-inspiration` job | its entry point was an uncommitted file; the `.mjs` pipeline survives on its branch |
 | `retired/` (6 scripts) | earlier iterations, kept for the record only |
 
@@ -205,7 +205,11 @@ every 120 s.
 
 ### 0.7 The load ceiling
 
-`MAX_LOAD` is where a box stops adding work. It is **derived, not fixed**: `cores × 8`, overridable
+`MAX_LOAD` is where a box stops adding work. It is **derived, not fixed**: `cores × 8`
+
+> ⚠️ **Landing order.** This rule is implemented by PR **#1907** (`×10 → ×8`). Until that merges, the
+> shipped code still derives `cores × 10` and the table below describes the *intended* state, not the
+> current one. Land **#1907 before this document**, or land them together., overridable
 per box (`MAX_LOAD` in the plist or `keys.env`), with a hard fallback of **32** when the core probe
 is unusable.
 
@@ -454,10 +458,10 @@ mkdir -p ~/orchestrator/logs ~/orchestrator/state ~/orchestrator/wip
 export OR=daniel-ospina/tortoise         # owner/repo
 export REPO=$HOME/eldato/tortoise        # the local main checkout
 export O=$HOME/orchestrator              # the harness state directory
-export SCOPE=own                         # drain scope: auto (default) | own | broad.
-                                         # A fleet runs ONE broad box; the rest pin own (section 5).
-                                         # install.sh renders this into the plist (launchd
-                                         # inherits no shell env) and refuses a bad value.
+# SCOPE: LEGACY (§0.5) — superseded by the claim registry. LEAVE IT UNSET (`auto`); pinning `own`
+# strands work nobody owns. install.sh renders it into the plist (launchd inherits no shell env) and
+# refuses a bad value, so `auto` is the only value this box should carry.
+# export SCOPE=own                       # drain scope: auto (default) | own | broad. (pre-claims)
 
 # 3. Render + install the launchd agent (does NOT load it). Invoke it BY PATH, from that same
 #    repo root: install.sh resolves `launchd.plist.template` from ITS OWN directory, so
@@ -646,7 +650,7 @@ off macOS (it renders a launchd plist) — the portability that matters is `orch
    the count: `auto`
    (default — the rule above), `own` (own-only even above the threshold), `broad` (broad even below
    it); any other value is fatal, so a typo cannot silently pick a scope. In a multi-box fleet
-   exactly one box takes `broad` and the rest pin `SCOPE=own` (measured 2026-10-13: an unpinned
+   ⚠️ **LEGACY, §0.5** — the partition below is superseded by the claim registry; do NOT pin `SCOPE=own`, it strands un-owned work. (Historical: exactly one box took `broad` and the rest pinned `SCOPE=own`) (measured 2026-10-13: an unpinned
    fresh cell logged `[scope] open=14 -> BROAD` and auto-armed #8425/#8420 within ~25s).
    ⛔ **This is a partition, not coordination.** Ownership is still inferred from *local*
    branches/worktrees, which are invisible across boxes, so two `own`-pinned boxes can still race
@@ -851,7 +855,8 @@ live under `refs/claims-tmp/*`, **not** the pruned `refs/claims-cache/*` namespa
 purpose** — if the claim store is unreachable the harness proceeds and logs it — because
 agent-infra#1709's headline finding is that duplicate execution is unavoidable and the side effects
 must be idempotent per head, so failing closed would stall the whole fleet on one transient error.
-`SCOPE=own` (§5, item 3) remains a useful partition but is no longer the only cross-box barrier.
+`SCOPE=own` (§5, item 3) is **LEGACY (§0.5)** — the claim registry is the cross-box barrier now,
+and `own` strands work that nobody owns.
 
 ### 7.2c ISSUE dispatch was the uncovered window — **FIXED in agent-infra#1850**
 
