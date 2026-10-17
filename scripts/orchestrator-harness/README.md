@@ -146,7 +146,9 @@ without a human in the loop:
   free and cell-3 at 0.04 load, and **47 P0/P1 issues went untouched with ~20 vCPU idle on the same
   account**; the gap was filled by hand with six manually-created dispatch lanes. The transfer
   mechanism is in §7.2d — and it is deliberately **not** built on load average: the signal is the
-  gate's own refusal (whatever actually bound: load, lanes, swap, memory or disk), because load is a
+  worker gate's own refusal, whatever it bound on (that gate binds on **load or disk**; the
+  lanes/swap/memory terms belong to the controller's separate gate, which refuses before any claim is
+  taken), because load is a
   symptom of contention rather than a measure of capacity (`docs/ops/load-policy.md`), and a
   capacity gate a caller can skip is not a gate (agent-infra#1884).
 
@@ -997,7 +999,7 @@ already holding):
 | part | where | what it does |
 |---|---|---|
 | the **record** | `lane.sh` writes `state/capacity-refused-<N>`, one line: `<refused_epoch>\t<yield_until>\t<load\|disk>` | the refusal becomes durable and readable. Cleared when a lane actually runs, so a stale record cannot outlive its dispatch |
-| the **release** | `chain-merge.sh` reads field 1 and exits **at once** with the gate's own code (75 load / 77 disk) | the EXIT trap does the FENCED release it already did — so peers see CLEAN within one poll interval instead of after 90 minutes. Field 1 ≥ this chain's start is what makes it per-dispatch: a record from an earlier run cannot end a LIVE lane's wait, which would let a peer open a second lane for the same issue |
+| the **release** | `chain-merge.sh` reads field 1 and exits **at once** with the gate's own code (75 load / 77 disk) | the EXIT trap does the FENCED release it already did — so peers see CLEAN within one poll interval instead of after 90 minutes. Field 1 is what makes it per-dispatch: a record from an earlier run cannot end a LIVE lane's wait, which would let a peer open a second lane for the same issue — and the bound needs ORDERING SLACK, because `dispatch-merge.sh` spawns the LANE first: the record is written ~4 ms after the lane's fork while the chain reads its start ~8-15 ms after its own, so the record is normally a fraction of a second to a second OLDER than `CHAIN_START`. A bare `epoch >= CHAIN_START` therefore discards real refusals whenever a second boundary falls between the two, which is precisely when the box is loaded enough to refuse. `CAPACITY_REFUSAL_GRACE_SECS` (default 60) supplies the slack, capped by the record's OWN yield window (`until - epoch`), so it still cannot admit a record older than the stand-down it declares |
 | the **stand-down** | `orch-loop.sh`'s `capacity_yield_live()` reads field 2 and the dispatch loop `continue`s before the claim | releasing the claim makes the issue *eligible* on a peer; it does not make the peer *win* the CAS. While the yield is live this box leaves the issue **unconsumed** (no `dispatched.txt` row, no claim ref), so it stays a candidate here *and* free for every peer; when the yield expires the ordinary path resumes |
 
 **Decisions worth not re-litigating.**
@@ -1005,21 +1007,53 @@ already holding):
 - **The signal is the gate's own refusal, not load average.** Whatever actually bound is named
   (`load` or `disk` — opposite remedies), and the transfer is driven by the refusal event. Load is a
   symptom of contention rather than a measure of capacity (`docs/ops/load-policy.md`), which is also
-  why a lowering of `MAX_LOAD` (#1907) could not have moved a single item.
+  why a lowering of `MAX_LOAD` (#1907) could not have moved a single item. ⚠️ NOTE what the record
+  can carry: the WORKER gate binds on **load or disk** only (`spawn-gate.sh`), so those are the only
+  two values field 3 can ever hold; the lanes/swap/memory terms belong to the CONTROLLER's own gate,
+  which refuses *before* any claim is taken and therefore writes no record at all (§1 above).
+- **The yield is gate-independent, deliberately.** `load` clears when the box quietens and `disk`
+  never does, but both produce the same `CAPACITY_YIELD_SECS` stand-down: the field names the remedy
+  for whoever reads the record, and it must not shorten the transfer window (a disk refusal is not
+  evidence that a peer is free *now*). Residual, named rather than hidden: a box whose disk is full
+  re-attempts each candidate once the yield expires, because the controller's gate has no disk term
+  to stop it earlier — bounded by the yield (900 s), not parked for ever.
 - **The controller-level gate needs nothing.** It refuses *before* any claim is taken, so nothing is
   held and nothing consumes the item's turn; the transfer machinery exists only for the worker-level
   refusal, where an issue has already been claimed and a chain is waiting for it.
-- **Every reader fails OPEN.** A missing, empty, garbled, incoherent or wrong-shaped record is **not**
-  a refusal: treating one as a refusal would suppress dispatch, which is the fleet-wide idleness R8
-  removes, re-introduced by a corrupt byte. Only a coherent pair (`epoch < until`, epoch newer than
-  the reader's own start) is evidence.
+- **Every reader fails OPEN — and the two readers do NOT check the same thing.** A missing, empty,
+  garbled, non-numeric or wrong-shaped record is **not** a refusal in either reader: treating one as
+  a refusal would suppress dispatch, which is the fleet-wide idleness R8 removes, re-introduced by a
+  corrupt byte. Past that, each consumes the fields it needs and no others:
+  - `chain-merge.sh` uses **field 1** (numeric, and inside this dispatch's window: `epoch` at or after
+    this chain's start minus the ordering slack, and not older than the record's own yield window).
+    It reports **field 3** as the exit code (75 load / 77 disk) and maps an unrecognised value to
+    `load`, because the refusal itself is already proven by field 1 and refusing to end the wait over
+    one corrupt byte is the behaviour this section forbids. It never reads field 2: an incoherent
+    yield window must not make a proven refusal unreadable.
+  - `orch-loop.sh`'s `capacity_yield_live()` uses **fields 1 and 2 together**, and only a COHERENT pair
+    (`epoch < until`, `until` in the future) is a yield; an incoherent one is not, because it would
+    park the item.
 - **`CAPACITY_YIELD_SECS` (default 900) is clamped to 1..86400 and `0` is REFUSED**, not honoured:
   a zero-length yield would silently restore the defect while looking configured.
+- **A rejected record is now VISIBLE.** `chain-merge.sh` logs, once per run, when a record is present
+  but not admitted as this dispatch's. Before that it was indistinguishable from a lane that had
+  simply not opened its PR yet — a discarded refusal cost the whole 90-minute wait and read as an
+  ordinary timeout.
+- **`[dispatch] backlog empty` no longer lies when the backlog was YIELDED.** A cycle in which every
+  candidate sits inside its yield window leaves `.batch` empty; the line now carries `yields=<n>` and
+  says in words that this is not "the fleet has nothing to do". With no yields the line is byte-for-
+  byte the #1931 shape, so nothing that parses it changes.
 
 `capacity-transfer.test.sh` drives the shipped `lane.sh` and `chain-merge.sh` and extracts
-`capacity_yield_live()` from the live controller, with a **local bare repo** as the shared origin so
-the released claim is a real fenced push: 31 assertions, of which **19 fail on the pre-change tree**
-(3 pass — the ones that assert a refusal *didn't* happen). Residuals, named rather than hidden: the
+`capacity_yield_live()` and `backlog_summary_line()` from the live controller, with a **local bare
+repo** as the shared origin so
+the released claim is a real fenced push: 42 assertions, of which **25 fail on the pre-change tree**
+(5 pass — the ones that assert a refusal *didn't* happen). The suite's `pi`/`gh`/`df` stubs are
+**exported bash functions**, not files on PATH: both tested scripts re-prepend absolute dirs
+(`/opt/homebrew/bin:/usr/local/bin`), so a PATH stub loses to the machine's real binary — measured on
+the writing runner, where `/usr/local/bin/pi` beat the stub, and on any macOS deployment box, where
+`/opt/homebrew/bin/gh` would have made `gh pr list` a real authenticated call from a suite that
+promises no network. Residuals, named rather than hidden: the
 review/fix path's load refusal (`merge-one.sh` returning 75) is re-dispatched by the sweep and is
 **not** transferred, because it is work on an existing PR rather than an un-owned queue item; and
 the stand-down is per **issue**, so a box at capacity still holds no view of *which* peer is idle —

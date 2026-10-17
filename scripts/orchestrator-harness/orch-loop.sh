@@ -449,6 +449,20 @@ queue_state_token() {  # -> EMPTY(12s) / READ(7)(3m) / PARTIAL(P0-blocker)(2m) /
   elif [ "$age" -lt 5400 ]; then printf '%s(%sm)' "$tok" "$(( age / 60 ))"
   else                            printf '%s(%sh)' "$tok" "$(( age / 3600 ))"; fi
 }
+# ⛔ THE "backlog empty" LINE IS A CLAIM, AND #1931 ALREADY TAUGHT IT TO CARRY THE QUEUE STATE.
+# The capacity transfer (agent-infra#1909) added a SECOND way for `.batch` to end up empty while the
+# backlog is full: every remaining candidate was YIELDED to peers. The old line then printed
+# `backlog empty queue=READ(3)` — self-contradictory on the one line an operator reads to answer "is
+# there work?" — and stayed that way for as long as the yield (up to 24h at the clamp). The yields are
+# therefore counted and named, and an operator can tell "nothing to do" from "everything is a peer's
+# to take". A function because the claim must be testable without driving a whole cycle.
+backlog_summary_line() { # <queue-token> <yields-this-cycle> -> the log text (no trailing newline)
+  if [ "${2:-0}" -gt 0 ] 2>/dev/null; then
+    printf 'backlog empty queue=%s yields=%s — every remaining candidate was yielded to peers for capacity, so this is NOT "the fleet has nothing to do" (they stay free for other boxes until their yield expires)' "$1" "$2"
+  else
+    printf 'backlog empty queue=%s' "$1"
+  fi
+}
 # Exact session-name test. `tmux has-session -t <name>` prefix-matches, so a guard for PR #82
 # would report "in flight" because `fix-820` exists — starving #82 while that worker lives.
 sess() { tmux ls -F '#{session_name}' 2>/dev/null | grep -qx "$1"; }
@@ -1459,7 +1473,7 @@ PY
   elif [ "$MEMAVAIL_MB" -le "$MIN_MEM_FREE_MB" ]; then GATE_WHY="mem_avail=${MEMAVAIL_MB}M<=min_mem_free_mb=${MIN_MEM_FREE_MB}M"
   fi
   if [ -z "$GATE_WHY" ]; then
-    : > "$O/.batch"; K=0
+    : > "$O/.batch"; K=0; Y=0
     while read -r ISS; do
       [ -z "${ISS:-}" ] && continue
       grep -qx "$ISS" "$O/dispatched.txt" 2>/dev/null && continue
@@ -1469,6 +1483,7 @@ PY
       # shared registry (so every peer may claim it NOW). Consuming the item's turn here would be
       # the `parked-*` failure R8 names, on a per-machine capacity signal.
       if capacity_yield_live "$ISS"; then
+        Y=$((Y+1))
         echo "[dispatch] #$ISS yielded to peers — this box refused it for capacity and is standing down until the yield expires (${CAPACITY_YIELD_WHY})" >> "$LOG"
         continue
       fi
@@ -1551,7 +1566,9 @@ PY
     # pool at all — that is how a blind box idled all evening looking healthy. The state travels with
     # it, in the refresh's own vocabulary: `queue=EMPTY` is the only form that means "no work";
     # `queue=UNREADABLE`/`PARTIAL(..)` means "the last pool read did not establish an empty pool".
-    else echo "[dispatch] backlog empty queue=$(queue_state_token)" >> "$LOG"; fi
+    # And since #1909 a third reading is possible — every candidate YIELDED to a peer — so the line
+    # carries `yields=<n>` and says so in words (see backlog_summary_line).
+    else echo "[dispatch] $(backlog_summary_line "$(queue_state_token)" "${Y:-0}")" >> "$LOG"; fi
   else
     echo "[dispatch] skipped ($GATE_WHY) lanes=$LANES workers=$WORKERS" >> "$LOG"
   fi

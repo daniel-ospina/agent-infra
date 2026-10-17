@@ -26,10 +26,20 @@
 #   refuses and NOTHING is written to `$O/state`.
 #
 # HOW THESE ARE WRITTEN. Every check drives the SHIPPED script it names — `lane.sh`,
-# `chain-merge.sh`, and `capacity_yield_live()` extracted from the live `orch-loop.sh` (never
-# re-implemented: a copy would pass on the broken tree too). `pi`, `df` and `gh` are stubs, so the
-# suite is hermetic: no network, no model, and a LOCAL bare repo stands in for the shared origin, so
-# §2's claim release is a real fenced push and not a mock.
+# `chain-merge.sh`, and `capacity_yield_live()` / `backlog_summary_line()` extracted from the live
+# `orch-loop.sh` (never re-implemented: a copy would pass on the broken tree too). `pi`, `df` and `gh`
+# are stubbed, so the suite is hermetic: no network, no model, and a LOCAL bare repo stands in for the
+# shared origin, so §2's claim release is a real fenced push and not a mock.
+#
+# ⛔ THE STUBS ARE EXPORTED FUNCTIONS, NOT FILES ON PATH (round-1 review, P2). `lane.sh` and
+# `chain-merge.sh` both begin with `export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH`, which puts
+# two ABSOLUTE dirs AHEAD of any PATH this suite supplies — so a PATH-ordered stub loses to the
+# machine's real binary. Measured while writing §1c: the `pi` stub was dead on this very runner
+# (`/usr/local/bin/pi` exists) and a live agent ran for 98 s. The same hole was open for `gh` on any
+# macOS deployment box (`/opt/homebrew/bin/gh` is the standard install, and the prepend exists
+# BECAUSE that is where the deployed `gh` lives) — a real, authenticated `gh pr list` from a suite
+# whose header promises "no network". An exported bash function is resolved before any PATH lookup,
+# and the markers below prove it answered (a stub that silently did not is the false green).
 #
 # ⛔ `rc=$?` IS CAPTURED IMMEDIATELY AFTER EVERY TESTED COMMAND — never inline inside a `ck`
 # argument, where a `$(…)` substituion would silently supply the status of `cat` instead.
@@ -57,11 +67,11 @@ cat > "$TMP/bin/pi" <<STUB
 echo "RAN \$*" >> "$PI_LOG"
 exit 0
 STUB
-# `df` reports ~0 MiB free in the 4th column (1 KiB blocks), so the disk gate is refused
-# deterministically on ANY filesystem — the suite must not depend on how full the runner's /tmp is.
-# It lives in its OWN directory and is only prepended for the DISK case: putting it on PATH globally
-# would make every other case a disk refusal too (which is how the first draft of this file passed
-# its epoch checks while silently testing the wrong gate).
+# `df` reports ~0 MiB free in the 4th column (1 KiB blocks) when STUB_DISK_FULL=1, so the disk gate
+# is refused deterministically on ANY filesystem — the suite must not depend on how full the runner's
+# /tmp is — and delegates to the REAL `df` otherwise (the load cases need a real reading). It is
+# switched per CASE by the variable, not by PATH, because the scripts under test re-prepend absolute
+# dirs (see the header): a PATH-ordered `df` only wins by luck of the runner's prefix layout.
 mkdir -p "$TMP/dbin"
 cat > "$TMP/dbin/df" <<'STUB'
 #!/usr/bin/env bash
@@ -76,6 +86,25 @@ STUB
 chmod +x "$TMP/bin/pi" "$TMP/dbin/df" "$TMP/bin/gh"
 PATH="$TMP/bin:$PATH"; export PATH
 
+# The AUTHORITATIVE stubs: exported functions (see the header). Each records that it answered, so a
+# stub the tested script never resolved cannot pass as "stubbed".
+GH_FUNC_MARK="$TMP/gh-func.mark"; DF_FUNC_MARK="$TMP/df-func.mark"; GH_LOG="$TMP/gh-calls.log"
+: > "$GH_LOG"
+# BOTH paths are exported: the tested scripts run under `set -u`, so a function referencing a
+# non-exported variable ACROSS an exec boundary aborts with `unbound variable` — which reads as "the
+# chain failed" and is the wrong reason for a red check.
+export GH_FUNC_MARK DF_FUNC_MARK GH_LOG STUB_DISK_FULL
+gh() { printf '%s\n' "$*" >> "$GH_LOG"; printf 'used\n' > "$GH_FUNC_MARK"; return 0; }
+df() {
+  printf 'used\n' > "$DF_FUNC_MARK"
+  if [ "${STUB_DISK_FULL:-0}" = "1" ]; then
+    printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/stub 1000 999 1 100%% /\n'
+    return 0
+  fi
+  command df "$@"   # `command` bypasses this function: the real reading, by absolute resolution
+}
+export -f gh df 2>/dev/null || true
+
 # run_bounded <seconds> <command…> — runs a command under a watchdog and exposes BOUNDED_RC /
 # BOUNDED_OUT. Needed because the PRE-CHANGE `chain-merge.sh` waits 90 x 60 s; without a bound this
 # suite would hang instead of reporting the regression. 124 = it outlived the bound.
@@ -84,14 +113,19 @@ run_bounded() {
   local outp="$TMP/bounded.$$.out" pid i
   "$@" > "$outp" 2>&1 &
   pid=$!
-  i=0
+  wait_bounded "$pid" "$lim"
+  BOUNDED_OUT="$(cat "$outp" 2>/dev/null)"; rm -f "$outp"
+}
+# wait_bounded <pid> <seconds> — the watchdog on its own, for a background command that must be
+# STARTED before the test does something else (the production race in §2a2).
+wait_bounded() {
+  local pid="$1" lim="$2" i=0
   while kill -0 "$pid" 2>/dev/null && [ "$i" -lt "$lim" ]; do sleep 1; i=$((i+1)); done
   if kill -0 "$pid" 2>/dev/null; then
     kill -9 "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; BOUNDED_RC=124
   else
     wait "$pid" 2>/dev/null; BOUNDED_RC=$?
   fi
-  BOUNDED_OUT="$(cat "$outp" 2>/dev/null)"; rm -f "$outp"
 }
 
 # ═══ §1 THE WRITER — `lane.sh` records the refusal, with the yield and the gate that fired ═══════
@@ -123,13 +157,18 @@ ck "the lane log states the transfer (an operator can see the release is coming)
 
 # The DISK gate reports itself as 'disk': the two refusals have opposite remedies, so a record that
 # said 'load' on a full filesystem would send the operator to wait for an event that cannot arrive.
-( cd "$TMP" && O="$O" MAX_LOAD=999999 DISK_MIN_FREE_MB=500 DISK_GATE_PATH="$TMP" PATH="$TMP/dbin:$PATH" \
+rm -f "$DF_FUNC_MARK"
+( cd "$TMP" && O="$O" MAX_LOAD=999999 DISK_MIN_FREE_MB=500 DISK_GATE_PATH="$TMP" STUB_DISK_FULL=1 \
     CAPACITY_YIELD_SECS=$LANE_YIELD bash "$LANE" 8 feat/8-tm daniel-ospina/agent-infra ) > "$TMP/lane8.out" 2>&1
 l8rc=$?
 dgate=""
 [ -f "$O/state/capacity-refused-8" ] && { read -r _d1 _d2 dgate < "$O/state/capacity-refused-8"; }
 { [ "$l8rc" -eq 77 ] && [ "${dgate:-}" = "disk" ]; }; rc=$?
 ck "a DISK refusal (exit 77) records gate='disk' (rc=$l8rc, gate='${dgate:-<none>}')" $rc
+# The disk reading must be the STUB's, not whatever `df` the box happens to have (the failure mode
+# this override exists for: a PATH stub silently losing to /opt/homebrew or /usr/local).
+{ [ -s "$DF_FUNC_MARK" ]; }; rc=$?
+ck "  …and the exported df stub answered (not a real filesystem reading — a PATH stub loses to the scripts' PATH prepend)" $rc
 
 # A lane that DOES run supersedes an old refusal: otherwise a later chain for the same issue could
 # read the stale record. (The epoch bound already protects it; this keeps the state dir clean.)
@@ -196,24 +235,50 @@ acquire_claim() { # <issue> -> records the issue claim this "box" just pushed, f
 }
 claim_refs() { git -C "$TMP/remote.git" for-each-ref --format='%(refname)' 2>/dev/null; }
 
-# 2a — a FRESH refusal (this dispatch) ends the wait at once and the trap releases the claim.
+# 2a — THE PRODUCTION ORDER, and the reason it is not the obvious one. `dispatch-merge.sh` spawns the
+# LANE first and the CHAIN second, so the record is written BEFORE the chain reads its own start: the
+# lane's refusal path is ~4 ms while the chain reaches `date +%s` ~8-15 ms after its fork. A record one
+# second OLDER than the chain's start is therefore a NORMAL refusal — under load it is the common
+# case — and a bare `epoch >= CHAIN_START` discards it and waits the whole timeout while holding the
+# claim (round-1 review P1: silent, total, and exactly R8's defect for that dispatch).
 acquire_claim 11
 [ -n "$(claim_refs)" ]; rc=$?
 ck "§2 setup: the issue claim exists on the remote before the chain runs" $rc
-NOW="$(date +%s)"
-printf '%s\t%s\t%s\n' "$NOW" "$(( NOW + 900 ))" "load" > "$O/state/capacity-refused-11"
+NOW="$(date +%s)"; EP=$(( NOW - 1 ))
+printf '%s\t%s\t%s\n' "$EP" "$(( EP + 900 ))" "load" > "$O/state/capacity-refused-11"
 run_bounded 20 env O="$O" CHAIN_POLLS=6 CHAIN_POLL_SECS=5 PATH="$PATH" \
   bash "$CHAIN" "$TMP/box" daniel-ospina/agent-infra 11 feat/11-tm
 crc="$BOUNDED_RC"
 [ "$crc" -eq 75 ]; rc=$?
-ck "a fresh refusal exits the chain with the gate code 75 (got $crc) — not after 6x5s of waiting" $rc
+ck "a refusal written 1s BEFORE the chain's start is still this dispatch's — exit 75 (got $crc; a bare epoch bound answers 124 here)" $rc
 { [ -z "$(claim_refs)" ]; }; rc=$?
 ck "…and the FENCED release really deleted refs/claims/issue-11 from the remote" $rc
 grep -q 'capacity transfer' <<<"$(cat "$O/logs/chain-11.log" 2>/dev/null)"; rc=$?
 ck "the chain log names the transfer, so the release is attributable" $rc
 
+# 2a2 — the OTHER half of the race: the chain is already alive when the lane writes the refusal. This
+# is the sequence the suite never exercised, and the one an operator actually sees.
+acquire_claim 15
+[ -n "$(claim_refs)" ]; rc=$?
+ck "§2a2 setup: issue 15 is claimed before the chain starts" $rc
+rm -f "$O/state/capacity-refused-15"
+( env O="$O" CHAIN_POLLS=6 CHAIN_POLL_SECS=5 PATH="$PATH" \
+    bash "$CHAIN" "$TMP/box" daniel-ospina/agent-infra 15 feat/15-tm ) > /dev/null 2>&1 &
+cpid=$!
+sleep 1   # the chain has read CHAIN_START; the lane's refusal is now strictly NEWER than it
+LIVE_EP="$(date +%s)"
+printf '%s\t%s\t%s\n' "$LIVE_EP" "$(( LIVE_EP + 900 ))" "load" > "$O/state/capacity-refused-15"
+wait_bounded "$cpid" 20
+c15="$BOUNDED_RC"
+[ "$c15" -eq 75 ]; rc=$?
+ck "a refusal written while the chain is ALREADY waiting ends it with 75 (got $c15)" $rc
+{ [ -z "$(claim_refs)" ]; }; rc=$?
+ck "  …and issue 15's claim is released, so a peer can take it" $rc
+
 # 2b — a STALE record from an EARLIER run must NOT end a live lane's wait. Releasing here would let a
 # peer open a second lane for an issue that is still being worked: duplicate work, R4's failure.
+# The slack that makes 2a safe is bounded by the record's OWN yield window, so a record that is older
+# than its own stand-down is still rejected — and now SAYS SO, instead of looking like a slow lane.
 STALE="$(date +%s)"; STALE_EP=$(( STALE - 3600 ))
 printf '%s\t%s\t%s\n' "$STALE_EP" "$(( STALE + 3600 ))" "load" > "$O/state/capacity-refused-12"
 BEFORE_S="$(date +%s)"
@@ -224,6 +289,18 @@ c12="$BOUNDED_RC"; ELAPSED=$(( $(date +%s) - BEFORE_S ))
 ck "a STALE refusal record does not end the wait (rc=$c12 after ${ELAPSED}s; the epoch bound holds)" $rc
 grep -q 'no PR appeared' <<<"$(cat "$O/logs/chain-12.log" 2>/dev/null)"; rc=$?
 ck "  …the log reports the ordinary timeout, not a transfer" $rc
+grep -q 'NOT admitted as this dispatch' <<<"$(cat "$O/logs/chain-12.log" 2>/dev/null)"; rc=$?
+ck "  …and names the discarded record, so a rejected refusal is not mistaken for a slow lane (the silent miss)" $rc
+
+# 2b2 — the slack is bounded by the RECORD's window, not by the knob: a record whose own stand-down is
+# 60s and whose epoch is 900s old is not this dispatch's even though 60s of slack is configured.
+OLD_EP=$(( $(date +%s) - 900 ))
+printf '%s\t%s\t%s\n' "$OLD_EP" "$(( OLD_EP + 60 ))" "load" > "$O/state/capacity-refused-16"
+run_bounded 20 env O="$O" CHAIN_POLLS=2 CHAIN_POLL_SECS=1 PATH="$PATH" \
+  bash "$CHAIN" "$TMP/box" daniel-ospina/agent-infra 16 feat/16-tm
+c16="$BOUNDED_RC"
+[ "$c16" -eq 1 ]; rc=$?
+ck "a record older than ITS OWN yield window is not admitted, whatever the slack (rc=$c16)" $rc
 
 # 2c — fail-open: an UNREADABLE record is not evidence of a refusal.
 printf 'not-a-number\tsoon\tload\n' > "$O/state/capacity-refused-13"
@@ -294,14 +371,65 @@ grep -q 'CAPACITY_YIELD_SECS' "$LANE"; rc=$?
 ck "the yield length is a named tunable, validated before it is used" $rc
 { grep -q 'capacity_yield_live "\$ISS"' "$ORCH"; }; rc=$?
 ck "the controller CALLS the predicate in its dispatch loop (a defined-but-unused guard is inert)" $rc
-# The skip must not consume the item: assert the call site is a bare `continue` before the bookkeeping
-# append, i.e. the yield block appears BETWEEN the dispatched.txt skip and the claim.
-YL_LINE="$(grep -n 'capacity_yield_live "\$ISS"' "$ORCH" | cut -d: -f1)"
-DISP_LINE="$(grep -n 'grep -qx "\$ISS" "\$O/dispatched.txt"' "$ORCH" | cut -d: -f1)"
-BATCH_LINE="$(grep -n 'echo "\$ISS" >> "\$O/.batch"' "$ORCH" | cut -d: -f1)"
-{ [ -n "$YL_LINE" ] && [ -n "$DISP_LINE" ] && [ -n "$BATCH_LINE" ] \
-  && [ "$YL_LINE" -gt "$DISP_LINE" ] && [ "$YL_LINE" -lt "$BATCH_LINE" ]; }; rc=$?
-ck "the yield check sits BEFORE the claim/bookkeeping, so a yielded item is never consumed" $rc
+# ⛔ THE SKIP MUST NOT CONSUME THE ITEM — and the CLAIM is the write that consumes it, not `.batch`.
+# The first version of this check compared the yield line against the `dispatched.txt` skip and the
+# `.batch` append only; the claim (`claim_issue_acquire`) sits BETWEEN them, so a regression that
+# moved the yield block after the claim (claim TAKEN, then `continue`) stayed green while the box held
+# `refs/claims/issue-<N>` for an issue it will never dispatch — the fleet-wide idleness R8 removes
+# (round-1 review P2). The assertion is a function so it can be proved non-vacuous below.
+yield_before_claim() { # <file> -> 0 iff the yield call is after the dispatched.txt skip and BEFORE the claim
+  local f="$1" yl disp claim
+  yl="$(grep -n 'capacity_yield_live "\$ISS"' "$f" | head -1 | cut -d: -f1)"
+  disp="$(grep -n 'grep -qx "\$ISS" "\$O/dispatched.txt"' "$f" | head -1 | cut -d: -f1)"
+  claim="$(grep -n 'claim_issue_acquire "" "\$ISS"' "$f" | head -1 | cut -d: -f1)"
+  [ -n "$yl" ] && [ -n "$disp" ] && [ -n "$claim" ] && [ "$yl" -gt "$disp" ] && [ "$yl" -lt "$claim" ]
+}
+yield_before_claim "$ORCH"; rc=$?
+ck "the yield check sits BEFORE the claim (not merely before .batch), so a yielded item is never consumed" $rc
+# NON-VACUITY: the same assertion must FAIL on a controller where the yield block was moved AFTER the
+# claim — the harmful shape. Built from the LIVE script (block location computed, never hardcoded), so
+# this control keeps working when the controller is edited.
+MUT="$TMP/orch-yield-after-claim.sh"
+YL_START="$(grep -n 'if capacity_yield_live "\$ISS"' "$ORCH" | head -1 | cut -d: -f1)"
+YL_END="$(awk -v s="$YL_START" 'NR>=s && /^      fi$/ {print NR; exit}' "$ORCH")"
+CLAIM_AT="$(grep -n 'claim_issue_acquire "" "\$ISS"' "$ORCH" | head -1 | cut -d: -f1)"
+if [ -n "$YL_START" ] && [ -n "$YL_END" ] && [ -n "$CLAIM_AT" ]; then
+  awk -v s="$YL_START" -v e="$YL_END" -v c="$CLAIM_AT" '
+    NR>=s && NR<=e { blk = blk $0 "\n"; next }
+    { print; if (NR==c) printf "%s", blk }
+  ' "$ORCH" > "$MUT"
+  yield_before_claim "$MUT"; mrc=$?
+  { [ "$mrc" -ne 0 ]; }; rc=$?
+  ck "non-vacuity: the SAME assertion FAILS on a controller whose yield block sits after the claim ($MUT)" $rc
+else
+  echo "  ❌ non-vacuity control could not be built (yield block at ${YL_START:-?}..${YL_END:-?}, claim at ${CLAIM_AT:-?})"
+  FAIL=$((FAIL+1))
+fi
+
+# ═══ §5 THE CYCLE'S OWN SENTENCE — "backlog empty" must not be printed when the backlog was
+# YIELDED (round-1 review P3). A cycle in which every candidate is inside its yield window leaves
+# `.batch` empty, so the controller printed `backlog empty queue=READ(3)` — self-contradictory on the
+# one line an operator reads to answer "is there work?", and reachable on any loaded box for as long
+# as the yield lasts. The claim lives in one extractable function so it is asserted, not grepped.
+echo
+echo "=== §5 the empty-batch sentence tells the truth when the candidates were yielded ==="
+BL="$(ex backlog_summary_line)"
+{ [ -n "$BL" ] && [ "$(printf '%s' "$BL" | wc -l | tr -d ' ')" -ge 3 ]; }; rc=$?
+ck "backlog_summary_line() is present in the shipped orch-loop.sh (extraction non-empty)" $rc
+if [ -z "$BL" ]; then
+  echo "  ⚠️ skipping the behavioural checks — there is no function to drive"
+else
+  eval "$BL"
+  ZERO="$(backlog_summary_line 'READ(3)' 0)"
+  [ "$ZERO" = 'backlog empty queue=READ(3)' ]; rc=$?
+  ck "with no yields the line is UNCHANGED ('$ZERO') — the #1931 shape other suites pin stays intact" $rc
+  SOME="$(backlog_summary_line 'READ(3)' 4)"
+  { grep -q 'yields=4' <<<"$SOME" && grep -q 'NOT "the fleet has nothing to do"' <<<"$SOME"; }; rc=$?
+  ck "with yields the line names them and retracts the emptiness claim ('$SOME')" $rc
+  # …and the counter is wired: the yield branch must INCREMENT it, or the sentence can only ever say 0.
+  { grep -q 'Y=\$((Y+1))' "$ORCH" && grep -q 'backlog_summary_line "\$(queue_state_token)" "\${Y:-0}"' "$ORCH"; }; rc=$?
+  ck "  …and the dispatch loop counts yields into that line (a sentence nobody can make say 'yields=1' is inert)" $rc
+fi
 
 echo
 echo "───────────────────────────────────────"

@@ -689,7 +689,12 @@ fi
 grep -q 'backlog=\$(wc -l.*queue=\$(queue_state_token)' "$LOOP" \
   && ok "orch-loop: the per-cycle heartbeat line carries the state beside the backlog" \
   || bad "orch-loop: the cycle line does not carry the pool state"
-grep -q '\[dispatch\] backlog empty queue=\$(queue_state_token)' "$LOOP" \
+# The claim moved into `backlog_summary_line()` when the capacity transfer (#1909) added a SECOND way
+# for `.batch` to be empty while the backlog is full — every candidate YIELDED to a peer. It still
+# carries the state (the token is the function's first argument); the yields case is asserted
+# BEHAVIOURALLY, by extracting the function, in capacity-transfer.test.sh §5.
+grep -q 'backlog_summary_line "\$(queue_state_token)"' "$LOOP" \
+  && grep -q 'backlog empty queue=%s' "$LOOP" \
   && ok "orch-loop: the 'backlog empty' claim carries the state, so blindness cannot read as stillness" \
   || bad "orch-loop: 'backlog empty' is still printed without the state"
 

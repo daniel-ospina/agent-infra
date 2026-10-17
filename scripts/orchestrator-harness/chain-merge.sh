@@ -26,6 +26,27 @@ CHAIN_POLL_SECS="${CHAIN_POLL_SECS:-60}"
 chk_pos_int "$CHAIN_POLLS" || { echo "[chain $N] WARN: CHAIN_POLLS='$CHAIN_POLLS' is not a positive integer — using 90" >> "$LOG"; CHAIN_POLLS=90; }
 chk_pos_int "$CHAIN_POLL_SECS" || { echo "[chain $N] WARN: CHAIN_POLL_SECS='$CHAIN_POLL_SECS' is not a positive integer — using 60" >> "$LOG"; CHAIN_POLL_SECS=60; }
 
+# ── ORDERING SLACK around the per-dispatch epoch bound (agent-infra#1909, round-1 review P1) ────
+# ⛔ A BARE `refused_epoch >= CHAIN_START` DISCARDS REAL REFUSALS. `dispatch-merge.sh` spawns the
+# LANE first and the CHAIN second, and the lane writes the record a few ms after ITS spawn while this
+# chain reads `CHAIN_START` after its own — so the record is normally written BEFORE this chain reads
+# its start, and the two agree only when both land in the same second. Measured: the lane's whole
+# refusal path is ~4 ms and this chain reaches `date +%s` ~8-15 ms after its fork, so a second boundary
+# falls between them a few percent of the time when idle — and a refusal only happens when the box is
+# at capacity, which is exactly when a fork can stall past a second. The failure was SILENT and total:
+# the chain logged the ordinary `no PR appeared` timeout and held `refs/claims/issue-<N>` for the whole
+# 90 minutes — R8's defect, intact, for that dispatch.
+#
+# The slack is bounded by the RECORD'S OWN yield window (`until - epoch`), so it still cannot admit a
+# record from an EARLIER dispatch: the refusing box stands down for exactly that window
+# (`orch-loop.sh`'s `capacity_yield_live()`), so it cannot re-dispatch the same issue inside it, and a
+# record older than its own window is not this dispatch's. 0 restores the strict comparison.
+CAPACITY_REFUSAL_GRACE_SECS="${CAPACITY_REFUSAL_GRACE_SECS:-60}"
+case "$CAPACITY_REFUSAL_GRACE_SECS" in ''|*[!0-9]*)
+  echo "[chain $N] WARN: CAPACITY_REFUSAL_GRACE_SECS='$CAPACITY_REFUSAL_GRACE_SECS' is not a whole number of seconds — using 60" >> "$LOG"
+  CAPACITY_REFUSAL_GRACE_SECS=60 ;;
+esac
+
 # ── CAPACITY TRANSFER: end a wait that can never succeed (agent-infra#1909) ──────────────────
 # `lane.sh` writes `state/capacity-refused-<N>` the moment the spawn gate refuses, and the format is
 # `<refused_epoch>\t<yield_until>\t<gate>` (see the writer there; it is the ONE definition).
@@ -42,7 +63,7 @@ chk_pos_int "$CHAIN_POLL_SECS" || { echo "[chain $N] WARN: CHAIN_POLL_SECS='$CHA
 # still working, and a peer would then open a second lane for the same issue. `refused_epoch >=
 # CHAIN_START` (same clock, same box) admits only a refusal from this very dispatch.
 cap_refusal_gate() { # -> prints `load|disk` and returns 0 iff THIS dispatch was capacity-refused
-  local f="$O/state/capacity-refused-${N:-}" ep until gate
+  local f="$O/state/capacity-refused-${N:-}" ep until gate grace win
   [ -n "${N:-}" ] || return 1
   case "${N:-}" in *[!0-9]*) return 1 ;; esac
   [ -r "$f" ] || return 1
@@ -50,8 +71,22 @@ cap_refusal_gate() { # -> prints `load|disk` and returns 0 iff THIS dispatch was
   case "${ep:-}" in ''|*[!0-9]*) return 1 ;; esac
   case "${until:-}" in ''|*[!0-9]*) return 1 ;; esac
   [ "${#ep}" -le 18 ] || return 1
-  [ "$ep" -ge "$CHAIN_START" ] || return 1
-  case "${gate:-}" in load|disk) printf '%s' "$gate" ;; *) printf 'load' ;; esac
+  [ "${#until}" -le 18 ] || return 1
+  # The slack is the RECORD's own stand-down window, capped by the operator knob — see above. An
+  # incoherent pair (`until <= ep`) buys no slack at all: it is still evidence that a refusal happened
+  # (field 1 is what this reader consumes), but it must not widen the admission window.
+  win=$(( until - ep ))
+  [ "$win" -lt 0 ] && win=0
+  grace="$CAPACITY_REFUSAL_GRACE_SECS"
+  [ "$grace" -gt "$win" ] && grace="$win"
+  [ "$ep" -ge "$(( CHAIN_START - grace ))" ] || return 1
+  # Field 3 is the REMEDY this chain reports to whoever reads the exit code (75 load / 77 disk), not a
+  # gate: an unrecognised value is reported as `load` because the refusal itself is already proven by
+  # fields 1-2, and refusing to end the wait over one corrupt byte is the fleet-wide idleness R8
+  # removes. Field 2 is deliberately NOT consulted here — the yield window is the controller's
+  # business (`capacity_yield_live`), and an incoherent window must not make a proven refusal
+  # unreadable. README §7.2d states exactly this per-reader split.
+  case "${gate:-}" in disk) printf 'disk' ;; *) printf 'load' ;; esac
   return 0
 }
 
@@ -126,6 +161,13 @@ for i in $(seq 1 "$CHAIN_POLLS"); do
     esac
     echo "[chain $N] capacity transfer: lane-$N was refused at the $_cap_gate gate, so no PR can appear — exiting now instead of after ${CHAIN_POLLS} x ${CHAIN_POLL_SECS}s. The EXIT trap releases refs/claims/issue-$N, so a peer with capacity can claim it; this box stands down via state/capacity-refused-$N for the record's yield window (agent-infra#1909)" >> "$LOG"
     exit "$_cap_rc"
+  fi
+  # ⛔ A PRESENT-BUT-REJECTED RECORD IS THE ONLY MISS THIS MECHANISM CAN PRODUCE, and it used to be
+  # indistinguishable from a lane that simply has not opened its PR yet: the chain logged the ordinary
+  # timeout and the operator had no way to tell a discarded refusal from a slow lane. Say it once (the
+  # loop runs up to CHAIN_POLLS times; one line is signal, ninety are noise).
+  if [ "$i" = "1" ] && [ -r "$O/state/capacity-refused-$N" ]; then
+    echo "[chain $N] capacity record state/capacity-refused-$N is present but was NOT admitted as this dispatch's (epoch older than this chain's start by more than the ${CAPACITY_REFUSAL_GRACE_SECS}s slack and older than its own yield window, unreadable, or malformed) — waiting as before. If this recurs, the lane is refusing with a record this chain cannot attribute; nothing was released (agent-infra#1909)" >> "$LOG"
   fi
   PR="$(gh pr list --repo "$OR" --state open --head "$BR" --json number --jq '.[0].number' 2>/dev/null)"
   [ -n "$PR" ] && [ "$PR" != "null" ] && break
