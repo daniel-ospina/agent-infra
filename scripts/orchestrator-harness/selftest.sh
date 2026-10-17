@@ -18,6 +18,11 @@ ck() { # ck <name> <0|1>
 }
 LOOP="$HERE/orch-loop.sh"; MERGE="$HERE/merge-one.sh"; INST="$HERE/install.sh"; REFRESH="$HERE/refresh-candidates.sh"
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+# ⛔ HERMETIC (agent-infra#1901): `OR` is now a VALIDATED INPUT — the queue's repo, derived from the
+# fixture checkout's `origin` remote unless declared — so a developer's ambient OR would be held
+# against every fixture remote below and turn unrelated cases red (measured: 13 such arms). Cases
+# that care about OR set it EXPLICITLY on the command line.
+unset OR
 # A missing extraction must FAIL, not warn: if the shipped script lacks the code under test the
 # dependent checks would pass on an empty file — the exact vacuity this file was rewritten to fix.
 need() { if [ -s "$1" ]; then return 0; else ck "$2" 1; return 1; fi; }
@@ -1547,6 +1552,11 @@ TM="$TMP/tm/bin"; mkdir -p "$TM" "$TMP/tm/home" "$TMP/tm/harness"
 # verifies the repo with `git -C "$REPO" rev-parse --git-dir`, so an empty `.git` dir is refused
 # before any session command can be recorded.
 git init -q "$TMP/tm/repo"
+# ⛔ agent-infra#1901: the queue's repo is DERIVED from $REPO's `origin` remote, and a pair that
+# cannot be READ is refused (cannot-verify is never a pass) — so a fixture checkout must carry one,
+# or every case below is decided by the queue refusal instead of the forwarding/injection guard it
+# names. `acme/widget` matches the OR the injection arms already pass.
+git -C "$TMP/tm/repo" remote add origin https://github.com/acme/widget.git
 cp "$HERE"/*.sh "$TMP/tm/harness/"
 # The supervisor's `check` now also judges DISPATCH PROVISIONING (agent-infra#1736), so the fixture
 # must model a repo that can be pre-flighted: a repo carrying its own tools/collision_preflight.py.
@@ -1679,6 +1689,10 @@ KC="$TMP/kc"; mkdir -p "$KC/home" "$KC/o" "$KC/harness"
 # `-d`-only test false-blocked it. An empty `.git` directory is not a git checkout, so the fixture
 # must be one or every case below dies at the repo gate before reaching the key verdicts.
 git init -q "$KC/repo"
+# ⛔ agent-infra#1901: `cmd_check` derives the queue's repo from $REPO's `origin` remote and refuses a
+# pair it cannot READ, so the fixture checkout needs one — otherwise every key verdict below is
+# decided by the queue refusal rather than by the key probe it names.
+git -C "$KC/repo" remote add origin https://github.com/acme/widget.git
 cp "$HERE"/*.sh "$KC/harness/"; cp "$HERE"/*.sh "$KC/o/"
 # Same fixture requirement as §16e: cmd_check also judges DISPATCH PROVISIONING (#1736), so the
 # repo must carry a pre-flight tool or the key verdicts below are never reached.
