@@ -342,10 +342,10 @@ fi
 # TWO of them are read FAIL-SILENTLY and are therefore invisible when absent — `state/lane-confirm.py`
 # (a non-zero exit is read as "screened, not stalled"; see the filed #1797) and
 # `state/lane-triage.py` (`2>/dev/null || log "NOTE triage unavailable"`). The third,
-# `state/queues/claim.py`, is NOT in that class: its read fails LOUDLY — `claim_next()` raises
-# `QueueReadError` and the caller prints `READ-FAILED <lane>: … withholding this lane (NOT read as
-# empty)` — while its RELEASE paths (`free`/`done`) do ignore their result. None of the three is in
-# any farm list.
+# `state/queues/claim.py`, LOST ITS ONLY CONSUMER when the lane-table dispatcher was retired
+# (agent-infra#1874): it was read loudly by `queue-dispatch.py` (`claim_next()` → `QueueReadError`),
+# and nothing reads it now. Its RELEASE paths (`free`/`done`) always ignored their result. None of the
+# three is in any farm list.
 # ⛔ Keep this assignment on ONE line: `scripts/ci_runner_gate.test.sh` reads it with
 # `sed -n 's/^fleet_srcs=(\(.*\))$/\1/p'`, so a wrapped array reads as EMPTY and that gate's
 # membership assertion goes RED. (Loud, not silent — do not describe it as vacuous.)
@@ -355,7 +355,7 @@ fi
 # runs the FARMED copy through the shared launcher with an explicit --repo, and
 # install-launchd.sh's broken-target guard refuses the whole install when the
 # farmed script is absent.
-fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-reap-worktrees.sh pi-reap-worktrees-launchd.py cleanup-stale-branches.sh ci_runner_gate.sh ask-owner.py beta-progress.py cadence-nudge.sh cadence-timer.sh child-check.py cloud-cell-quiesce.sh deploy-crossbox.sh deploy-mac-orchestrator.sh goal-state.py lane-actions.py lane-guard.py lane-read.py lane-scan-fallback.sh lane-watchdog.py lane-wip.py live-workspaces-publisher.py merge-queue.py objective.py orch-send.sh orchestrator-heartbeat.sh orphan-reap.py pr-doctor.py probe-one.py publish-live-workspaces.py queue-dispatch.py safe-send.sh seed-goal-map.py tree-cpu.py turn-classify.py turn-end.py unblock-lane.sh undelivered-answers.py)
+fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-reap-worktrees.sh pi-reap-worktrees-launchd.py cleanup-stale-branches.sh ci_runner_gate.sh ask-owner.py beta-progress.py cadence-nudge.sh cadence-timer.sh child-check.py cloud-cell-quiesce.sh deploy-crossbox.sh deploy-mac-orchestrator.sh goal-state.py lane-actions.py lane-guard.py lane-read.py lane-scan-fallback.sh lane-watchdog.py lane-wip.py live-workspaces-publisher.py merge-queue.py objective.py orch-send.sh orchestrator-heartbeat.sh orphan-reap.py pr-doctor.py probe-one.py publish-live-workspaces.py safe-send.sh seed-goal-map.py tree-cpu.py turn-classify.py turn-end.py unblock-lane.sh undelivered-answers.py)
 mkdir -p "$DEST/scripts"
 fleet_copied=0
 for base in "${fleet_srcs[@]}"; do
