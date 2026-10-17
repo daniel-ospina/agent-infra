@@ -156,6 +156,19 @@ def _note_gh_failure(text, surface, transport=True):
 
 GH_LAST_ERROR = ""
 
+# ⛔ THE BINARY IS RESOLVED, NOT TAKEN FROM PATH ALONE (#1872, reviewer E). `pr-doctor.py`
+# records the incident at its own `GH` constant: on the fleet box `~/.pi/agent/shims/gh` is a
+# symlink into ~/Documents, macOS TCC refuses to execute it (rc=126) under launchd, and the job
+# then printed a plausible "no open PRs" for two straight runs while doing NOTHING. That
+# protection used to hold only for pr-doctor's OWN reads; since the check-run read moved here,
+# this file performs the load-bearing read, so the same resolution must hold here or the guard
+# covers a path that no longer carries the risk. ~/bin/gh is a real binary outside the protected
+# tree; a box without it (CI, Linux) falls back to PATH, which is what it has always effectively
+# used there.
+GH_BIN = (os.environ.get("OBJECTIVE_GH")
+          or next((p for p in (os.path.expanduser("~/bin/gh"),) if os.access(p, os.X_OK)), None)
+          or "gh")
+
 
 def gh(*args, paginate=False):
     """A REST read. Records WHY it failed, but never declares the fleet blind by itself.
@@ -167,7 +180,7 @@ def gh(*args, paginate=False):
     red was fully visible.
     """
     global GH_LAST_ERROR
-    cmd = ["gh", "api"] + (["--paginate", "--slurp"] if paginate else []) + list(args)
+    cmd = [GH_BIN, "api"] + (["--paginate", "--slurp"] if paginate else []) + list(args)
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
     if r.returncode != 0:
         GH_LAST_ERROR = (r.stdout or "") + (r.stderr or "")
@@ -225,7 +238,7 @@ def gql_commit_checks(sha):
     repository, and it must not be allowed to stop the fleet when the other transport is up.
     """
     q = GQL_CHECKS % sha
-    r = subprocess.run(["gh", "api", "graphql", "-f", f"query={q}",
+    r = subprocess.run([GH_BIN, "api", "graphql", "-f", f"query={q}",
                         "-f", "owner=daniel-ospina", "-f", "name=tortoise"],
                        capture_output=True, text=True, timeout=90)
     if r.returncode != 0:
@@ -705,9 +718,18 @@ def classify_pr(pr, cr, att_clean):
     #    (see arm 4): the cheapest landing on the board must not queue behind a non-gating job.
     if not nongreen and att_clean:
         return "blocked-by-rail" if rail_block_reason(red, flight, seen) else "call-rail"
-    # 2. rerun-checks -- NO required check EVER ran at this head (`drive`/`drift-guard`/
-    #    `sigpipe-guard` being red cannot reach here: they are not in REQUIRED).
-    if not req_seen:
+    # 2. rerun-checks -- NO required check has REPORTED at this head, and nothing is executing.
+    #    ⛔ `and not flight` IS LOAD-BEARING (#1872 review). Without it this arm SHADOWED arm 4
+    #    for the exact shape arm 4 was written for: a fresh head where no required context has
+    #    reported yet while other checks are already running -- which is the NORMAL first state
+    #    of a push, because `python-ci-gate` (and `docs`, `legal-e2e`) are created seconds after
+    #    the children. `req_seen` empty means "not reported yet" as often as "never ran", and
+    #    the two need OPPOSITE actions: wait, versus START the workflow. Worse, the dispatcher's
+    #    `rerun-checks` brief asserts "(Nothing is in flight ...)" and tells the lane to push an
+    #    empty commit -- so the shadowed arm sent it to churn a 20-second-old head, wasting
+    #    runner capacity and staling the attestation. `drive`/`drift-guard`/`sigpipe-guard`
+    #    being red cannot reach here: they are not in REQUIRED.
+    if not req_seen and not flight:
         return "rerun-checks"
     # 3. resolve-conflict -- GitHub says DIRTY. A rebase CHANGES THE HEAD, so it is right even
     #    while checks are still running (they all re-run anyway) -- which is why it sits ABOVE
@@ -844,7 +866,7 @@ def classify_queue(non):
 
 
 def queue():
-    r = _gh_retry(["gh", "pr", "list", "--repo", REPO, "--state", "open",
+    r = _gh_retry([GH_BIN, "pr", "list", "--repo", REPO, "--state", "open",
                    "--limit", "400", "--json",
                    "number,isDraft,mergeable,mergeStateStatus,headRefOid,files"])
     if r.returncode != 0:
@@ -981,7 +1003,11 @@ def build(prev=None):
             # the system did the work -- 25 PRs sat while every beat printed a count. A PR whose
             # next step is "fix the failing test" HAS AN OWNER AND AN ACTION; it is MOVING.
             # Only ASK-USER and a genuine external wait are ever "not moving".
-            # Each entry names WHICH check failed AND how many PRs, so a lane knows what to open.
+            # Each entry names WHICH check failed and how many PRs, so the QUEUE's SHAPE is
+            # legible and a routine repair can be read as MOVING -- not so a lane learns what to
+            # open: the repair is pr-doctor's, dispatched from this same classifier, and the
+            # instruction-shaped rationale this line used to carry is exactly what the header
+            # above this block removed.
             if _qcls.get("fix-ci"):
                 _cnt = defaultdict(int)
                 for _num, _why in (_bc.get("fix-ci") or []):

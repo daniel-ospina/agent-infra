@@ -806,6 +806,25 @@ class TestActionVocabulary:
         assert self.o.classify_pr(self._pr(), self._cr(absent=self.REQ), False) \
             == "rerun-checks"
 
+    def test_NOTHING_reported_yet_while_checks_RUN_is_running_not_rerun(self):
+        """⛔ ARM 2 MUST CONCEDE TO ARM 4 (#1872 review -- a real defect found in review).
+
+        A fresh head where NO required context has reported yet while other checks are already
+        in flight is the NORMAL first state of a push (`python-ci-gate`, `docs` and `legal-e2e`
+        are created seconds after the children). `not req_seen` cannot tell "not reported yet"
+        from "never ran", and the two need OPPOSITE actions: wait, versus START the workflow.
+
+        Before the fix arm 2 fired first and this shape read `rerun-checks`; the dispatcher's
+        brief for that class asserts "(Nothing is in flight ...)" and tells the lane to push an
+        empty commit -- so a 20-second-old head was churned, wasting runner capacity and staling
+        every attestation.
+        """
+        cr = self._cr(absent=self.REQ, flight=["test (a)"])
+        assert self.o.classify_pr(self._pr(), cr, False) == "running"
+        # ...and once NOTHING is in flight, the same absence is still the re-trigger work
+        assert self.o.classify_pr(self._pr(), self._cr(absent=self.REQ), False) \
+            == "rerun-checks"
+
     def test_green_with_attestation_is_call_rail_without_is_record_review(self):
         assert self.o.classify_pr(self._pr(), self._cr(), True) == "call-rail"
         assert self.o.classify_pr(self._pr(), self._cr(), False) == "record-review"

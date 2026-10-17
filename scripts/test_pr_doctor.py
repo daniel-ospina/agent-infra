@@ -460,3 +460,56 @@ def test_the_new_arms_render_a_brief_that_names_the_work(monkeypatch):
                   "record-review", "fix-ci"):
         assert pr.brief(ready, klass, "why", _cr())
     assert pr.brief(ready, "running", None, _cr()) == ""
+
+
+# ── 5. an unreadable queue is NOT an empty one: the exit codes differ ────────────────────
+
+def test_a_failed_pr_read_refuses_with_its_own_exit_code(monkeypatch):
+    """⛔ A BLIND READ MUST NOT EXIT 0 (#1872 review, reviewer E).
+
+    The classifier half is fail-closed (an unreadable check-run read is `None`, never work).
+    The QUEUE half folded both facts into one line and one exit code -- "no open non-draft PRs
+    (or GitHub read failed)" -- so a failed `gh pr list` was indistinguishable to the launcher
+    from a clean, empty pass.
+    """
+    logs = []
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(pr, "OPEN_PRS_ERROR", "rc=126 Operation not permitted")
+    monkeypatch.setattr(pr, "open_prs", lambda: [])
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--dry-run"])
+    assert pr.main() == 2
+    joined = "\n".join(logs)
+    assert "REFUSING" in joined and "Operation not permitted" in joined
+    # ...and the honest empty queue stays a clean pass
+    monkeypatch.setattr(pr, "OPEN_PRS_ERROR", None)
+    assert pr.main() == 0
+
+
+def test_open_prs_separates_an_empty_queue_from_a_failed_read(monkeypatch):
+    """`open_prs()` must report WHY, because `[]` is also the legitimate empty answer."""
+    monkeypatch.setattr(pr, "log", lambda msg: None)
+    monkeypatch.setattr(pr, "sh_err", lambda cmd: ("[]", "", 0))
+    assert pr.open_prs() == [] and pr.OPEN_PRS_ERROR is None
+    monkeypatch.setattr(pr, "sh_err", lambda cmd: ("", "gh: not found", 127))
+    assert pr.open_prs() == [] and "rc=127" in (pr.OPEN_PRS_ERROR or "")
+
+
+# ── 6. the deploy seam: an OLD sibling `objective.py` must refuse, not run blind ─────────
+
+def test_a_stale_sibling_objective_refuses_at_import(tmp_path):
+    """⛔ PINNED BECAUSE IT WAS NOT (#1872 review, reviewer E).
+
+    The two files are farmed SEPARATELY (`pi-bootstrap/setup.sh` `fleet_srcs`), so a partial farm
+    can leave this driver beside an older classifier. The driver asserts its seam at import;
+    without a test, an edit that dropped the assert would pass the whole suite while the fleet
+    silently dispatched from a classifier the beat never produced. Reproduction, not inspection.
+    """
+    import shutil
+    import subprocess
+    shutil.copy(pathlib.Path(__file__).with_name("pr-doctor.py"), tmp_path / "pr-doctor.py")
+    (tmp_path / "objective.py").write_text("REQUIRED = ()\n")   # an old copy: no classify_one
+    r = subprocess.run([sys.executable, str(tmp_path / "pr-doctor.py"), "--status"],
+                       capture_output=True, text=True, cwd=str(tmp_path), timeout=60)
+    assert r.returncode != 0, "a stale sibling must NOT run: it would dispatch blind"
+    assert "classify_one" in (r.stdout + r.stderr)
+

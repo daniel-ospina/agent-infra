@@ -23,7 +23,12 @@ fleet's ONE classifier -- what the PR needs, and DISPATCHES that work:
     record-review    everything green, no clean attestation at this head
                      -> dispatch: review, record, rail -- in ONE run
     fix-ci           a required check is RED -> dispatch: FIX it, then re-review, then rail
-    running          a required check is still in flight -> skip (next pass)
+    running          the head is still EXECUTING -> skip (next pass). NOT only "a required
+                     check is in flight": a required gate that has NOT YET REPORTED counts when
+                     ANY check at the head is in flight (`python-ci-gate` is created only after
+                     its matrix children run), and a RED required check is never `running` --
+                     it is work. Reading this row as "only a mid-run required check" is how a
+                     correct `running` gets "fixed" back into `fix-ci`.
     (None)           the checks could not be READ -> skip, and say so: a miss is never work
 
 ⛔ THOSE CLASSES ARE NOT THIS FILE'S. They are `objective.classify_one()`'s (#1872), the same
@@ -267,19 +272,34 @@ def sh_err(args, timeout=180, cwd=None):
 # 1. READ THE WORLD — from GitHub, never from a queue row
 # ---------------------------------------------------------------------------
 
+# Why the last PR-list read failed, or None. Module-level because `[]` is ALSO the
+# legitimate answer for an empty queue -- the old `if not prs` could not tell the two apart.
+OPEN_PRS_ERROR = None
+
+
 def open_prs() -> list[dict]:
+    """The open-PR list, and WHY it failed -- kept out of band, never folded into "[]".
+
+    ⛔ A FAILED READ MUST NEVER BE REPORTED AS "no open PRs". That is how this job ran twice
+    under launchd doing NOTHING while printing a plausible, reassuring line -- the same silent-
+    failure class this whole file exists to remove. It is also why the failure is a MODULE
+    GLOBAL rather than `if not prs`: an empty list is the legitimate answer for an empty queue,
+    and the old test could not tell the two apart (it logged GITHUB READ FAILED on a healthy
+    repo with nothing open, and exited 0 on a genuine read failure).
+    """
+    global OPEN_PRS_ERROR
+    OPEN_PRS_ERROR = None
     out, err, rc = sh_err([GH, "pr", "list", "--repo", REPO, "--state", "open", "--limit", "60",
                            "--json", "number,title,isDraft,mergeStateStatus,headRefOid,headRefName,files"])
+    parsed = True
     try:
         prs = json.loads(out or "[]")
     except Exception:
-        prs = []
-    if not prs:
-        # ⛔ A FAILED READ MUST NEVER BE REPORTED AS "no open PRs". That is how this job ran
-        # twice under launchd doing NOTHING while printing a plausible, reassuring line --
-        # the same silent-failure class this whole file exists to remove.
-        log("GITHUB READ FAILED (rc=%s): %s | PATH=%s" %
-            (rc, (err or "").strip()[:220] or "(empty stderr)", os.environ.get("PATH", "")[:120]))
+        prs, parsed = [], False
+    if rc != 0 or not parsed:
+        OPEN_PRS_ERROR = "rc=%s %s" % (rc, (err or "").strip()[:200] or "(no stderr)")
+        log("GITHUB READ FAILED (%s) | PATH=%s"
+            % (OPEN_PRS_ERROR, os.environ.get("PATH", "")[:120]))
     return prs
 
 
@@ -559,11 +579,19 @@ def main() -> int:
                                                 v.get("at")))
         return 0
 
-    prs = [p for p in open_prs() if not p.get("isDraft")]
+    prs = open_prs()
+    # ⛔ AN UNREADABLE QUEUE IS NOT AN EMPTY ONE, AND THE TWO MUST NOT SHARE AN EXIT CODE. A
+    # blind read that returns 0 is indistinguishable to the launcher from a clean pass -- the
+    # exact shape the classifier half is now fail-closed against, so the queue half cannot be
+    # allowed to stay fail-open.
+    if OPEN_PRS_ERROR:
+        log("REFUSING: the open-PR read FAILED (%s) -- nothing dispatched" % OPEN_PRS_ERROR[:160])
+        return 2
+    prs = [p for p in prs if not p.get("isDraft")]
     if args.only:
         prs = [p for p in prs if p["number"] == args.only]
     if not prs:
-        log("no open non-draft PRs (or GitHub read failed)")
+        log("no open non-draft PRs")
         return 0
 
     # classify everything first, then dispatch highest-value first
@@ -598,8 +626,22 @@ def main() -> int:
             continue
         classified.append((p, k, why, cr))
 
-    # Cheapest-and-highest-payoff FIRST, the same order `objective.CLASS_ORDER` uses: a landable
-    # PR costs one rail call, a repair costs a lane-hours. `running` is absent by construction.
+    # ⛔ A BLIND CHECK-RUN READ MUST SAY WHY (#1872, reviewer E). `objective` records the last
+    # `gh` failure in `GH_LAST_ERROR`; a pass that skipped PRs as unreadable and printed only
+    # "dispatched 0" left the operator with a bare number and no cause -- the reassuring-line
+    # failure mode this file's `GH` constant was written against.
+    if skipped.get("unreadable"):
+        log("%d PR(s) had UNREADABLE checks -- the cause: %s"
+            % (skipped["unreadable"],
+               (getattr(CLASSIFIER, "GH_LAST_ERROR", "") or "(no gh error recorded)").strip()[:240]))
+
+    # Cheapest-and-highest-payoff FIRST: a landable PR costs one rail call, a repair costs lane-
+    # hours. ⛔ THIS IS THIS FILE'S OWN POLICY, NOT `objective.CLASS_ORDER` -- the two differ
+    # deliberately: CLASS_ORDER puts `blocked-by-rail` SECOND (the beat reports it as the cheapest
+    # landing) and `resolve-conflict` ABOVE `record-review` (a rebase stales an attestation),
+    # while dispatch ranks review work above both, because review and rail are what this pass can
+    # actually spend a budget on. Writing "the same order" here was wrong in a way that would
+    # send a reader tuning the wrong list. `running` is absent by construction (skipped above).
     ranked = {"call-rail": 0, "rerun-checks": 1, "record-review": 2,
               "resolve-conflict": 3, "blocked-by-rail": 4, "fix-ci": 5}
     classified.sort(key=lambda t: (ranked.get(t[1], 8), t[0]["number"]))
