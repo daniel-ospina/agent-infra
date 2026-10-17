@@ -335,8 +335,11 @@ def lanes(scan_timeout=None):
     (read at `lane-status.py:1646-1651`, written at `:1927-1928`), so a `--only` call from here
     OVERWRITES the fleet-wide snapshot under the `[null]` key. The next fleet-wide consumer
     then MISSES and re-runs a full ~250-300s scan -- which is exactly what `lane-actions.py`
-    does in its invoke path (`lane-actions.py:1425-1443`), and therefore what `pr-doctor`
-    pays (`pr-doctor.py:238`). By never issuing `--only`, this tool can no longer evict that
+    does in its invoke path (its `--json` read of the fleet snapshot), and therefore what
+    `pr-doctor` pays (its `lane-actions.py --json` call). ⛔ NAMED, NOT NUMBERED (`#1872` review
+    round 10): the line numbers that used to be here had already rotted, and a number in a
+    co-deployment pointer rots again on the next edit either side. By never issuing `--only`, this
+    tool can no longer evict that
     snapshot. (⛔ NOT `lane-status.last.json`: that file is the heartbeat's `tee` copy
     (`orchestrator-heartbeat.sh:291-292`) and no `--only` call touches it. An earlier
     revision of this docstring named it; that was wrong, corrected here.)

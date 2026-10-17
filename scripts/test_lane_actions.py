@@ -1474,3 +1474,58 @@ def test_a_mechanical_label_is_offerable_without_a_confidence():
     table and the child record. They carry no `conf`, and requiring one was a reproduced crash."""
     assert LA.offerable("DEAD", None) is True
     assert LA.offerable("CHILD-OVERDUE", None) is True
+
+
+# ── THE THIRD CONSUMER OF THE SAME CLASS VOCABULARY (#1872 review round 10) ─────────────────
+# `pr-loop.py` reads `objective.CLASS_ORDER` and turns each class into an ACTION. `objective.py`
+# and `pr-doctor.py` gained a `running` class; without an arm here the class fell through to the
+# `ask-user` default below and a lane that is merely WAITING was reported as an owner decision.
+# A pure `decide()` is testable without cmux, so it is tested rather than trusted.
+
+def _prloop():
+    return load("pr_loop", os.path.join(HERE, "pr-loop.py"))
+
+
+def test_every_objective_class_maps_to_a_real_action_and_running_WAITS():
+    """⛔ A CLASS WITH NO ARM IS NOT A NO-OP — it becomes `ask-user` (an owner decision)."""
+    loop = _prloop()
+    o = _objective_mod()
+    actions = {"wait", "rail", "rerun", "fix", "review", "ask-user"}
+    for klass in o.CLASS_ORDER:
+        action, _detail = loop.decide(klass, "why")
+        assert action in actions, (klass, action)
+        # the ONLY classes that may become `ask-user` are the ones with no arm at all; every
+        # class the classifier can emit must have one.
+        assert action != "ask-user", (
+            f"{klass} has no arm in pr-loop.decide() -- it would be reported to the owner as a "
+            "human decision")
+    assert loop.decide("running", None) == ("wait", None)
+
+
+def test_a_waiting_pr_is_never_dispatched_or_asked_about(monkeypatch, capsys):
+    """⛔ `wait` MUST SHORT-CIRCUIT BEFORE THE DISPATCH (and before the idempotence log, which is
+    about work in flight rather than about a lane that is merely executing)."""
+    loop = _prloop()
+    o = _objective_mod()
+    out = []
+    monkeypatch.setattr(loop, "load_lanes", lambda: {})
+    monkeypatch.setattr(loop, "save_lanes", lambda lanes: None)
+    monkeypatch.setattr(loop, "log", out.append)
+    monkeypatch.setattr(loop, "lane_live", lambda lane: True)
+    monkeypatch.setattr(loop, "decide", loop.decide)
+    monkeypatch.setattr(loop, "argparse", loop.argparse)
+    monkeypatch.setattr(loop, "_objective", lambda: type("O", (), {
+        "CLASS_ORDER": o.CLASS_ORDER,
+        "resources": staticmethod(lambda: {}),
+        "res_action": staticmethod(lambda r: "dispatch-one"),
+        "queue": staticmethod(lambda: {"nondraft": 1, "classes": {"running": 1},
+                                       "by_class": {"running": [(4242, None)]}}),
+    })())
+    monkeypatch.setattr(sys, "argv", ["pr-loop.py"])
+    assert loop.main() == 0
+    joined = "\n".join(out)
+    assert "4242" not in joined, joined
+    assert "ASK-USER" not in joined, joined
+    # a LINE PREFIX, not a substring: `ACT`/`DRY` appear inside ordinary words, and a test that
+    # forbids them anywhere would fail the first time a log line mentions one.
+    assert not [ln for ln in joined.splitlines() if ln.startswith(("DRY ", "ACT "))], joined
