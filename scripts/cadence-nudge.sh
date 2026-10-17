@@ -281,11 +281,14 @@ PYAGE
 # automatic dispatcher already owns) and `running` is named like every other class.
 #
 # ⛔ THIS IS A TRUNCATION POINT, NOT A WORST CASE, AND NO NUMBER BELONGS HERE. The width was raised
-# four times during the #1872 review (628 -> 675/799 -> 860 -> 900) and every value was falsified by
-# the next measurement, because the length is a function of DIGITS x NAMED PRs x per-entry gate names
-# x the overlay x the STUCK escalation: any figure is a claim about the FLEET, not about the format,
-# and it goes stale the first time the queue grows. (Do not restate the round COUNT anywhere -- the
-# number of rounds is itself that kind of claim, and it has already drifted between three files.)
+# three times on this branch alone -- 400 -> 700 -> 820 -> 900, each value REPRODUCIBLE rather than
+# remembered (`git log -G'cut -c1-[0-9]+' --oneline -- scripts/cadence-nudge.sh` lists exactly the
+# commits that changed it) -- and every one was falsified by the next measurement, because the length
+# is a function of DIGITS x NAMED PRs x per-entry gate names x the overlay x the STUCK escalation: any
+# figure is a claim about the FLEET, not about the format, and it goes stale the first time the queue
+# grows. (An earlier version of this comment listed intermediate widths measured in a WORKING TREE
+# and never committed, so no reader could reproduce them; that is why the series above is cited with
+# the command that finds it rather than as bare figures.)
 # What is true, and does not go stale:
 #   * what a cut CAN sever: the tail of the queue segment and then the CI indicators;
 #   * what a cut CANNOT sever, because of where it is emitted (`objective.py`, pinned by

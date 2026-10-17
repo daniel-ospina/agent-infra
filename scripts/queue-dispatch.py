@@ -347,8 +347,9 @@ def lanes(scan_timeout=None):
     revision of this docstring named it; that was wrong, corrected here.)
 
     PARTIAL READS ARE REFUSED TOO. `lane-status.py` marks every row `degraded` when the cmux
-    registry read failed (`lane-status.py:1906`, `degraded=(LIVE_READABLE is False)`), and such
-    a roster is the hand-written TSV alone -- every live-only lane INVISIBLE. It is non-empty
+    registry read failed (the `degraded=(LIVE_READABLE is False)` construct in `lane-status.py` --
+    named, not numbered, per the NAMED-NOT-NUMBERED rule stated above), and such a roster is the
+    hand-written TSV alone -- every live-only lane INVISIBLE. It is non-empty
     and rc=0, so it would otherwise read as a complete, healthy fleet; `lane-actions.py`
     already refuses exactly this payload (`_refuse_if_degraded`), and so do we.
 

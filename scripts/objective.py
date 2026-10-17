@@ -1730,11 +1730,15 @@ def main():
         line = build(_previous_sample())
     except Exception as e:                      # never break the heartbeat
         line = f"OBJECTIVE VERDICT=UNKNOWN error={str(e)[:60]}"
-    # `RES:` GOES ON ITS OWN LINE. `cadence-nudge.sh` reads the objective line with a
-    # `cut -c1-900` (its comment states what that covers, and why a "worst case" number is not
-    # worth claiming), so APPENDING this segment would push the tail -- the CI indicators -- off
-    # the end. The fail-closed `queue_read=BLIND` caveat is emitted BEFORE the queue segment, so
-    # truncation can never drop it.
+    # `RES:` GOES ON ITS OWN LINE -- and NOT because the objective line is too long for the cut
+    # (#1872 review round 18: that sentence was false the moment the cut reached 900, and MEASURED
+    # an objective line is ~300 chars; the sibling comment in `cadence-nudge.sh` says the same).
+    # Two reasons that do hold: (1) appending it puts the LIVE resource numbers behind everything
+    # the objective segment can grow into, and the tail is what a cut reaches first -- so the fix is
+    # to move them out, not to argue about widths; (2) `cadence-nudge.sh` must refresh it EVERY beat
+    # without re-deciding the verdict, which is what its own cache paragraph records. The
+    # fail-closed `queue_read=BLIND` caveat is emitted BEFORE the queue segment, so truncation can
+    # never drop it either way.
     try:
         res = res_line()
     except Exception as e:
