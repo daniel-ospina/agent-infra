@@ -262,3 +262,10 @@ fi
 # re-run the full chain at the new head
 bash "$O/merge-one.sh" "$REPO" "$OR" "$PR" "$BR" >> "$L.log" 2>&1
 echo "[fix $PR] end $(date)" >> "$L.log"
+# ── and the fixer's `.venv` goes with it (agent-infra#1932) ─────────────────────────────────────────
+# LAST, deliberately: the re-review above is dispatched from this same worktree, so reaping before it
+# would make the reviewer re-sync. merge-one's reviewer has no venv of its own (it runs in the main
+# checkout and its prompt says testing is unavailable to it), so nothing needs this env after this
+# point. The reaper re-probes for a live holder first, so a lane still working in $WT keeps its env.
+# Best-effort and loud: a failed reap logs, and never changes this worker's exit status.
+reap_lane_venv "$WT" "fix $PR" >> "$L.log" 2>&1
