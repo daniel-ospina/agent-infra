@@ -740,6 +740,56 @@ def test_a_gitdir_file_pointing_at_another_worktree_is_not_live(monkeypatch, tmp
                           capture_output=True, text=True).stdout.strip() == "b2"
 
 
+def test_materialise_refuses_a_reset_that_would_overwrite_an_ignored_file(monkeypatch, tmp_path):
+    """`reset --hard` overwrites an IGNORED untracked file whose path the PR head tracks; git
+    gives no warning for ignored files, so the guard must include them."""
+    repo, g = _git_repo(tmp_path)
+    (repo / ".gitignore").write_text("secret.txt\n")
+    g("add", ".gitignore")
+    g("commit", "-qm", "ignore secret")
+    head1 = g("rev-parse", "HEAD").stdout.strip()
+    g("branch", "feat/x")
+    _wire_repo(monkeypatch, repo)
+    wt, _ = pr.materialise_worktree(_prb(1, head1, "feat/x"))
+
+    def gw(*a):
+        return subprocess.run(["git", "-C", wt] + list(a), check=True,
+                              capture_output=True, text=True)
+
+    (pathlib.Path(wt) / "secret.txt").write_text("tracked at head2\n")
+    gw("add", "-f", "secret.txt")
+    gw("commit", "-qm", "track secret")
+    head2 = gw("rev-parse", "HEAD").stdout.strip()
+    gw("reset", "--hard", head1)                     # secret.txt gone; now ignored-untracked
+    (pathlib.Path(wt) / "secret.txt").write_text("PRECIOUS IGNORED\n")
+    wt2, err = pr.materialise_worktree(_prb(1, head2, "feat/x"))
+    assert wt2 == "" and "untracked" in err
+    assert (pathlib.Path(wt) / "secret.txt").read_text() == "PRECIOUS IGNORED\n"
+
+
+def test_materialise_refuses_a_branch_switch_that_would_overwrite_an_ignored_file(monkeypatch, tmp_path):
+    """`checkout <branch>` silently overwrites an ignored untracked file too; the switch must be
+    refused before it runs."""
+    repo, g = _git_repo(tmp_path)
+    (repo / ".gitignore").write_text("secret.txt\n")
+    g("add", ".gitignore")
+    g("commit", "-qm", "ignore secret")
+    base = g("rev-parse", "HEAD").stdout.strip()
+    g("checkout", "-q", "-b", "feat/x")
+    (repo / "secret.txt").write_text("tracked at head\n")
+    g("add", "-f", "secret.txt")
+    g("commit", "-qm", "track secret")
+    head = g("rev-parse", "HEAD").stdout.strip()
+    g("checkout", "-q", "main")
+    _wire_repo(monkeypatch, repo)
+    path = repo / ".worktrees" / "prd-1"
+    g("worktree", "add", "--detach", str(path), base)
+    (path / "secret.txt").write_text("PRECIOUS IGNORED\n")   # ignored, not tracked at base
+    wt, err = pr.materialise_worktree(_prb(1, head, "feat/x"))
+    assert wt == "" and "untracked" in err
+    assert (path / "secret.txt").read_text() == "PRECIOUS IGNORED\n"
+
+
 def test_materialise_worktree_clears_a_stranded_record(monkeypatch, tmp_path):
     """Directory gone but the record remains: `worktree add` refuses until the record is cleared."""
     import shutil

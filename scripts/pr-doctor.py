@@ -526,6 +526,15 @@ def _ensure_branch(path: str, branch: str) -> str:
             return "worktree %s is on foreign branch %s and could not be detached: %s" % (
                 path, cur, (err or "").strip()[:160])
         return ""
+    # `checkout <branch>` changes the tree; git protects non-ignored untracked files but SILENTLY
+    # OVERWRITES ignored ones (verified), so probe the target branch for both.
+    clobber = _untracked_clobber(path, branch)
+    if clobber is None:
+        return ("cannot determine whether switching worktree %s to %s would overwrite untracked "
+                "files -- refusing; inspect it" % (path, branch))
+    if clobber:
+        return ("worktree %s has untracked file(s) that %s would overwrite (%s) -- refusing to "
+                "switch it; move or remove them" % (path, branch, ", ".join(clobber[:3])))
     _, err, xrc = sh_err(["git", "-C", path, "checkout", branch], timeout=180)
     if xrc != 0:
         return "worktree %s could not be switched to %s: %s" % (
@@ -534,18 +543,25 @@ def _ensure_branch(path: str, branch: str) -> str:
 
 
 def _untracked_clobber(path: str, head: str):
-    """Untracked paths that a `reset --hard <head>` would overwrite/delete, or None if UNKNOWN.
+    """UNTRACKED or IGNORED paths that a `reset --hard <head>` (or a `checkout <head>` of the
+    tree) would overwrite/delete, or None if UNKNOWN.
 
-    `reset --hard` leaves NON-colliding untracked files alone, but DELETES one that occupies a
-    path the target tree tracks (verified). Guarding on tracked changes only would lose such a
-    file; guarding on the full `status` (every scratch file) is a false block. This checks the
-    exact set.
+    `reset --hard`/`checkout` leave NON-colliding untracked files alone, but DELETE one that
+    occupies a path the target tree tracks -- INCLUDING an IGNORED one, which git overwrites
+    silently (verified). Guarding on tracked changes only would lose such a file; guarding on
+    every scratch file is a false block. This checks the exact set, ignored files included
+    (`--ignored=matching` lists an ignored directory as one `!! dir/` entry, so this stays cheap).
     """
     out, _, rc = sh_err(["git", "-C", path, "status", "--porcelain", "-z",
-                         "--untracked-files=all"], timeout=60)
+                         "--ignored=matching", "--untracked-files=all"], timeout=60)
     if rc != 0:
         return None
-    untracked = [f[3:] for f in (out or "").split("\0") if f.startswith("?? ")]
+    untracked = []
+    for f in (out or "").split("\0"):
+        if f.startswith("?? "):
+            untracked.append(f[3:])
+        elif f.startswith("!! "):
+            untracked.append(f[3:].rstrip("/"))
     if not untracked:
         return []
     tree, _, trc = sh_err(["git", "-C", path, "ls-tree", "-r", "--name-only", "-z", head], timeout=60)
