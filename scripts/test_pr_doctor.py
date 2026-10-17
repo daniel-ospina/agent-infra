@@ -563,6 +563,120 @@ def test_materialise_never_deletes_a_dot_git_directory(monkeypatch, tmp_path):
     assert (path / ".git" / "objects" / "someobj").read_text() == "precious\n"
 
 
+def test_a_symlink_alias_of_the_main_checkout_is_not_a_live_worktree(monkeypatch, tmp_path):
+    """`--show-toplevel` resolves the symlink to the repo, so toplevel == realpath(path); only the
+    git-dir/common-dir identity check rejects it -- without it, checkout/reset hits MAIN."""
+    repo, g = _git_repo(tmp_path)
+    g("checkout", "-q", "-b", "feat/x")
+    (repo / "x.txt").write_text("x\n")
+    g("add", "x.txt")
+    g("commit", "-qm", "x")
+    head = g("rev-parse", "HEAD").stdout.strip()
+    g("checkout", "-q", "main")
+    main_before = g("rev-parse", "refs/heads/main").stdout.strip()
+    _wire_repo(monkeypatch, repo)
+    (repo / ".worktrees").mkdir()
+    link = repo / ".worktrees" / "prd-1"
+    link.symlink_to(repo)
+    assert pr._live_worktree(str(link)) is False, "a symlink alias of the main checkout is not a worktree"
+    wt, err = pr.materialise_worktree(_prb(1, head, "feat/x"))
+    assert g("rev-parse", "refs/heads/main").stdout.strip() == main_before, \
+        "the main checkout must never be checked out or reset"
+    assert err == "" and wt.endswith("prd-1-d")   # the symlink is preserved, `-d` is used
+
+
+def test_a_gitdir_file_pointing_at_main_is_not_a_live_worktree(monkeypatch, tmp_path):
+    """A `.git` FILE that points at the main git dir satisfies toplevel == path but is the MAIN
+    repository; the git-dir/common-dir identity check must reject it."""
+    repo, g = _git_repo(tmp_path)
+    g("checkout", "-q", "-b", "feat/x")
+    (repo / "x.txt").write_text("x\n")
+    g("add", "x.txt")
+    g("commit", "-qm", "x")
+    head = g("rev-parse", "HEAD").stdout.strip()
+    g("checkout", "-q", "main")
+    main_before = g("rev-parse", "refs/heads/main").stdout.strip()
+    _wire_repo(monkeypatch, repo)
+    path = repo / ".worktrees" / "prd-1"
+    path.mkdir(parents=True)
+    (path / ".git").write_text("gitdir: %s\n" % (repo / ".git"))
+    (path / "f.txt").write_text("ghost\n")
+    assert pr._live_worktree(str(path)) is False
+    wt, err = pr.materialise_worktree(_prb(1, head, "feat/x"))
+    assert g("rev-parse", "refs/heads/main").stdout.strip() == main_before
+    assert err == "" and wt.endswith("prd-1-d")
+
+
+def test_materialise_detaches_a_fork_worktree_from_a_foreign_branch(monkeypatch, tmp_path):
+    """A fork PR has no local branch, so a reused worktree must be DETACHED -- never left on a
+    foreign local branch, whose pointer `_ensure_head` would otherwise move."""
+    repo, g = _git_repo(tmp_path)
+    head = g("rev-parse", "HEAD").stdout.strip()
+    _wire_repo(monkeypatch, repo)
+    path = repo / ".worktrees" / "prd-1"
+    g("worktree", "add", "--detach", str(path), head)
+
+    def gw(*a):
+        return subprocess.run(["git", "-C", str(path)] + list(a), check=True,
+                              capture_output=True, text=True)
+
+    gw("checkout", "-q", "-b", "unrelated")
+    gw("commit", "--allow-empty", "-qm", "c2")
+    foreign_before = g("rev-parse", "refs/heads/unrelated").stdout.strip()
+    wt, err = pr.materialise_worktree(_prb(1, head, "no-such-branch"))
+    assert err == "" and wt == str(path)
+    assert g("rev-parse", "refs/heads/unrelated").stdout.strip() == foreign_before, \
+        "a foreign branch must not be moved by the reset"
+    assert gw("rev-parse", "HEAD").stdout.strip() == head
+
+
+def test_materialise_resets_over_non_colliding_untracked_scratch(monkeypatch, tmp_path):
+    """A leftover untracked scratch file must NOT block a reset the way `reset --hard` (which
+    leaves non-colliding untracked files alone) would not be harmed by."""
+    repo, g = _git_repo(tmp_path)
+    g("branch", "feat/x")
+    head1 = g("rev-parse", "HEAD").stdout.strip()
+    _wire_repo(monkeypatch, repo)
+    wt, _ = pr.materialise_worktree(_prb(1, head1, "feat/x"))
+
+    def gw(*a):
+        return subprocess.run(["git", "-C", wt] + list(a), check=True,
+                              capture_output=True, text=True)
+
+    gw("commit", "--allow-empty", "-qm", "second")
+    head2 = gw("rev-parse", "HEAD").stdout.strip()
+    gw("checkout", "-q", "--detach", head1)
+    (pathlib.Path(wt) / "scratch.txt").write_text("scratch\n")
+    wt2, err = pr.materialise_worktree(_prb(1, head2, "feat/x"))
+    assert err == "" and wt2 == wt
+    assert gw("rev-parse", "HEAD").stdout.strip() == head2
+    assert (pathlib.Path(wt) / "scratch.txt").read_text() == "scratch\n"
+
+
+def test_materialise_refuses_a_reset_that_would_overwrite_untracked_files(monkeypatch, tmp_path):
+    """`reset --hard` DELETES an untracked file that collides with a path the PR head tracks."""
+    repo, g = _git_repo(tmp_path)
+    g("branch", "feat/x")
+    head1 = g("rev-parse", "HEAD").stdout.strip()
+    _wire_repo(monkeypatch, repo)
+    wt, _ = pr.materialise_worktree(_prb(1, head1, "feat/x"))
+
+    def gw(*a):
+        return subprocess.run(["git", "-C", wt] + list(a), check=True,
+                              capture_output=True, text=True)
+
+    (pathlib.Path(wt) / "new.txt").write_text("committed at head2\n")
+    gw("add", "new.txt")
+    gw("commit", "-qm", "add new.txt")
+    head2 = gw("rev-parse", "HEAD").stdout.strip()
+    gw("reset", "--hard", head1)                    # new.txt removed (was tracked)
+    (pathlib.Path(wt) / "new.txt").write_text("untracked precious\n")   # now untracked
+    assert gw("symbolic-ref", "--short", "HEAD").stdout.strip() == "feat/x"
+    wt2, err = pr.materialise_worktree(_prb(1, head2, "feat/x"))
+    assert wt2 == "" and "untracked" in err
+    assert (pathlib.Path(wt) / "new.txt").read_text() == "untracked precious\n"
+
+
 def test_materialise_worktree_clears_a_stranded_record(monkeypatch, tmp_path):
     """Directory gone but the record remains: `worktree add` refuses until the record is cleared."""
     import shutil

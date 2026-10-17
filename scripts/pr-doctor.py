@@ -424,25 +424,41 @@ def _git(args, timeout=120):
 
 
 def _live_worktree(path: str):
-    """True iff git proves <path> IS the root of a worktree; False iff it proves it is not; None if
-    the probe could not answer.
+    """True iff git proves <path> is a DISTINCT worktree rooted at <path>; False if it proves not;
+    None if a probe could not answer.
 
-    ⛔ NOT `--is-inside-work-tree`: `WORKTREE_ROOT` lives INSIDE the main checkout, so every
-    `.worktrees/prd-<n>` directory -- even an empty one -- answers `true` to that probe, and
-    `rev-parse HEAD` then reads the MAIN repo's HEAD. Acting on that would reset the main
-    checkout (`reset --hard` moves the branch pointer). The `--show-toplevel` comparison is the
-    worktree-ROOT test.
+    Two checks, because `--show-toplevel == path` alone is not proof:
+      * toplevel must equal realpath(path) -- rejects a subdirectory of the main checkout; and
+      * the worktree's git dir must DIFFER from its common git dir (a linked worktree has
+        `<repo>/.git/worktrees/<name>` vs `<repo>/.git`). A SYMLINK to the main checkout, or a
+        `.git` FILE pointing at the main git dir, both satisfy the toplevel check but have the
+        two EQUAL -- and acting on them resets the MAIN checkout.
 
-    UNKNOWN (rc < 0) returns None, and the caller must REFUSE: treating it as live selects the
+    UNKNOWN (rc < 0) returns None, and the caller REFUSES: treating it as live selects the
     reuse/reset branch (destructive against the main checkout); treating it as dead enters the
-    delete branch. Neither is safe, so an unanswerable probe is its own outcome.
+    delete branch. Neither is safe.
     """
-    out, _, rc = sh_err(["git", "-C", path, "rev-parse", "--show-toplevel"], timeout=30)
+    out, _, rc = sh_err(["git", "-C", path, "rev-parse", "--show-toplevel",
+                         "--absolute-git-dir"], timeout=30)
     if rc < 0:
         return None
     if rc != 0:
         return False
-    return os.path.realpath((out or "").strip()) == os.path.realpath(path)
+    lines = (out or "").splitlines()
+    if len(lines) < 2:
+        return False
+    if os.path.realpath(lines[0].strip()) != os.path.realpath(path):
+        return False
+    gd = os.path.realpath(lines[1].strip())
+    cd, _, crc = sh_err(["git", "-C", path, "rev-parse", "--git-common-dir"], timeout=30)
+    if crc < 0:
+        return None
+    if crc != 0:
+        return False
+    cdp = (cd or "").strip()
+    if not os.path.isabs(cdp):
+        cdp = os.path.join(path, cdp)
+    return gd != os.path.realpath(cdp)
 
 
 def _disposable_dangling(path: str) -> bool:
@@ -463,21 +479,23 @@ def _disposable_dangling(path: str) -> bool:
 
 
 def _ensure_branch(path: str, branch: str) -> str:
-    """Ensure a live worktree is attached to the PR branch; "" on success, else why.
+    """Ensure a reused worktree is attached to the PR branch (or DETACHED for a fork PR); "" on
+    success, else why.
 
-    The reuse path used to reset whatever HEAD it found, so a worktree left on ANOTHER branch (or
-    detached) was silently reused and the worker's `git push` landed on the wrong branch or a
-    stale one. When the PR branch exists locally the worktree MUST be attached to it. A worktree
-    with TRACKED modifications is refused (checkout could carry them); untracked scratch is left
-    alone because it neither blocks checkout nor is destroyed by `reset --hard`. A fork worktree
-    has no local branch and stays detached.
+    The reuse path used to reset whatever HEAD it found, so a worktree left on another branch (or
+    detached) was silently reused and the worker's `git push` landed on the wrong branch. When the
+    PR branch exists locally the worktree must be attached to it; when it does NOT (a fork PR)
+    the worktree must be DETACHED -- never left on a foreign local branch, whose pointer
+    `_ensure_head` would otherwise move. A worktree with TRACKED modifications is refused
+    (checkout could carry them); untracked scratch neither blocks checkout nor is destroyed by
+    `reset --hard`, so it is left alone.
     """
-    _, _, exists = _git(["rev-parse", "--verify", "-q", "refs/heads/%s" % branch], timeout=60)
-    if exists != 0:
-        return ""                                 # fork PR: detached is expected
     out, _, rc = sh_err(["git", "-C", path, "symbolic-ref", "--short", "HEAD"], timeout=30)
-    if rc == 0 and (out or "").strip() == branch:
+    cur = (out or "").strip()
+    detached = rc != 0
+    if not detached and cur == branch:
         return ""
+    _, _, exists = _git(["rev-parse", "--verify", "-q", "refs/heads/%s" % branch], timeout=60)
     dirty, _, drc = sh_err(["git", "-C", path, "status", "--porcelain",
                             "--untracked-files=no"], timeout=60)
     if drc != 0:
@@ -486,11 +504,41 @@ def _ensure_branch(path: str, branch: str) -> str:
     if (dirty or "").strip():
         return ("worktree %s is on a different branch/HEAD and has uncommitted tracked changes -- "
                 "refusing to switch it to %s; inspect and clean it" % (path, branch))
-    _, err, rc = sh_err(["git", "-C", path, "checkout", branch], timeout=180)
-    if rc != 0:
+    if exists != 0:
+        if detached:
+            return ""                              # fork PR: already detached
+        _, err, xrc = sh_err(["git", "-C", path, "checkout", "--detach"], timeout=180)
+        if xrc != 0:
+            return "worktree %s is on foreign branch %s and could not be detached: %s" % (
+                path, cur, (err or "").strip()[:160])
+        return ""
+    _, err, xrc = sh_err(["git", "-C", path, "checkout", branch], timeout=180)
+    if xrc != 0:
         return "worktree %s could not be switched to %s: %s" % (
             path, branch, (err or "").strip()[:160])
     return ""
+
+
+def _untracked_clobber(path: str, head: str):
+    """Untracked paths that a `reset --hard <head>` would overwrite/delete, or None if UNKNOWN.
+
+    `reset --hard` leaves NON-colliding untracked files alone, but DELETES one that occupies a
+    path the target tree tracks (verified). Guarding on tracked changes only would lose such a
+    file; guarding on the full `status` (every scratch file) is a false block. This checks the
+    exact set.
+    """
+    out, _, rc = sh_err(["git", "-C", path, "status", "--porcelain", "-z",
+                         "--untracked-files=all"], timeout=60)
+    if rc != 0:
+        return None
+    untracked = [f[3:] for f in (out or "").split("\0") if f.startswith("?? ")]
+    if not untracked:
+        return []
+    tree, _, trc = sh_err(["git", "-C", path, "ls-tree", "-r", "--name-only", "-z", head], timeout=60)
+    if trc != 0:
+        return None
+    tracked = set((tree or "").split("\0"))
+    return sorted(u for u in untracked if u in tracked)
 
 
 def _ensure_head(path: str, branch: str, head: str) -> str:
@@ -503,13 +551,21 @@ def _ensure_head(path: str, branch: str, head: str) -> str:
         sh_err(["git", "-C", path, "fetch", "origin", branch, "--quiet"], timeout=300)
     # ⛔ An unanswerable cleanliness probe is NOT "clean": `dirty` is empty on rc != 0, so the
     # old `if dirty.strip()` fell through to `reset --hard` and destroyed uncommitted work.
-    dirty, _, drc = sh_err(["git", "-C", path, "status", "--porcelain"], timeout=60)
+    dirty, _, drc = sh_err(["git", "-C", path, "status", "--porcelain",
+                            "--untracked-files=no"], timeout=60)
     if drc != 0:
         return ("cannot determine whether worktree %s is clean (git status rc=%s) -- refusing to "
                 "reset it; inspect and clean it" % (path, drc))
     if (dirty or "").strip():
-        return ("worktree %s is at a different head and has uncommitted changes -- "
+        return ("worktree %s is at a different head and has uncommitted tracked changes -- "
                 "refusing to reset it; inspect and clean it" % path)
+    clobber = _untracked_clobber(path, head)
+    if clobber is None:
+        return ("cannot determine whether resetting worktree %s would overwrite untracked files "
+                "-- refusing; inspect it" % path)
+    if clobber:
+        return ("worktree %s has untracked file(s) that the PR head would overwrite (%s) -- "
+                "refusing to reset it; move or remove them" % (path, ", ".join(clobber[:3])))
     _, err, rc = sh_err(["git", "-C", path, "reset", "--hard", head], timeout=120)
     if rc != 0:
         return "worktree %s reset to %s failed rc=%s: %s" % (path, head[:12], rc, (err or "").strip()[:160])
