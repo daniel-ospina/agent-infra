@@ -375,8 +375,12 @@ printf 'scripts/fleet\n' > "$SAFE/dir.txt"
 out="$(farm_unfarm "$SAFE/dest" "$SAFE/dir.txt" '' 2>&1)"; rc=$?
 if [ "$rc" -eq 0 ] || [ ! -d "$SAFE/dest/scripts/fleet" ]; then
   fail "(d) a DIRECTORY target was not refused (rc=$rc): $out"
+elif ! grep -q 'DIRECTORY' <<<"$out"; then
+  # ...by MESSAGE: the "not a regular file" backstop refuses a directory too, so an rc-only
+  # assertion cannot tell the directory guard from its fallback (i.e. cannot notice it removed).
+  fail "(d) the directory was refused by the wrong branch — the DIRECTORY guard is not load-bearing: $out"
 else
-  ok "(d) directory target refused, directory intact"
+  ok "(d) directory target refused (named as a DIRECTORY), directory intact"
 fi
 
 # a symlink is a farm artifact: unlink the LINK, never touch its target
@@ -408,6 +412,24 @@ elif ! grep -q 'SAME FILE' <<<"$out"; then
   fail "(d) the same-file refusal was not named ($out)"
 else
   ok "(d) a hardlink alias of a still-farmed artifact is refused (SAME FILE)"
+fi
+
+# A DANGLING symlink is the realistic #1924 shape (the repo file left, the deployed farm link
+# points nowhere) and it is the case that discriminates the `-L` carve-outs: without them the
+# "not a regular file" backstop refuses it and the artifact survives forever. The existing
+# case links to an EXISTING target, where `-f` follows the link and the assertion passes
+# either way — so this one asserts the REMOVAL, not just the outcome.
+ln -s "$TMP/nowhere-at-all" "$SAFE/dest/scripts/dangling.sh"
+printf 'scripts/dangling.sh\n' > "$SAFE/dangling.txt"
+out="$(farm_unfarm "$SAFE/dest" "$SAFE/dangling.txt" '' 2>&1)"; rc=$?
+if [ "$rc" -ne 0 ]; then
+  fail "(d) a DANGLING farm symlink was refused instead of unlinked (rc=$rc): $out"
+elif [ -L "$SAFE/dest/scripts/dangling.sh" ] || [ -e "$SAFE/dest/scripts/dangling.sh" ]; then
+  fail "(d) a DANGLING farm symlink was not removed"
+elif ! grep -q 'REMOVED scripts/dangling.sh' <<<"$out"; then
+  fail "(d) the dangling symlink removal was not reported: $out"
+else
+  ok "(d) a dangling farm symlink is unlinked and reported"
 fi
 
 # a symlinked PARENT directory cannot be used to reach outside the farm

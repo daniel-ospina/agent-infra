@@ -777,7 +777,7 @@ shipped_content_matches() {
 }
 
 verify_layer() {
-  local rows src_rel dest_rel base src dst farm_n=0
+  local rows src_rel dest_rel base src dst farm_n=0 farm_bad=0
   rows="$(read_farm_set)" || { fail "the declared farm set could not be re-read from setup.sh"; return 0; }
   while IFS=$'\t' read -r src_rel dest_rel base; do
     [ -n "${base:-}" ] || continue
@@ -785,15 +785,22 @@ verify_layer() {
     src="$INFRA_ROOT/$src_rel/$base"
     dst="$DEST/$dest_rel/$base"
     if [ ! -f "$dst" ]; then
+      farm_bad=1
       fail "farmed script MISSING: $dest_rel/$base"
     elif ! cmp -s "$src" "$dst"; then
+      farm_bad=1
       fail "farmed script DIFFERS from the checkout: $dest_rel/$base (a stale or hand-edited copy)"
     fi
   done <<<"$rows"
   if [ "$farm_n" -lt "$MIN_FARM_FILES" ]; then
+    farm_bad=1
     fail "the declared farm set re-read as only $farm_n file(s) (floor: $MIN_FARM_FILES) — verify would be checking a truncated list"
   fi
-  say "verified $farm_n declared farm file(s) against the checkout"
+  # A success line must not appear in a log whose own verdict is FAIL: a reader who greps for
+  # "verified N farm file(s)" would otherwise take a failed leg as clean.
+  if [ "$farm_bad" -eq 0 ]; then
+    say "verified $farm_n declared farm file(s) against the checkout"
+  fi
 
   # ── the UNFARM leg (#1924) ────────────────────────────────────────────────
   # A declared retirement must be GONE from this cell, and the two lists must not
@@ -836,7 +843,7 @@ verify_layer() {
       done <<<"$retired_list"
       # The success line is only true when nothing above failed: an operator reading the log
       # must never see "verified … absent" next to a FAIL about the same leg.
-      if [ "$retired_present" -eq 0 ]; then
+      if [ "$retired_present" -eq 0 ] && [ "$conflict_rc" -eq 0 ]; then
         say "verified $retired_n declared retirement(s) absent from the cell"
       fi
 
