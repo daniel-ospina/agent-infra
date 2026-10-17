@@ -35,6 +35,28 @@
 #      marker file appears), not on an empty job set: every fixture dir ships at least one job
 #      that must be PRESENT and one that must be ABSENT/SKIPPED.
 #
+# The FRESH-CONTEXT REVIEW of PR #1927 asked for these, each a false PASS or a false FAIL in the
+# shipped runtime (every one of them FAILS against the pre-fix scheduler, measured):
+#  10. THE DARWIN PATH IS DRIVEN, NOT GREPPED. The module is executed with sys.platform pinched to
+#      'darwin' against a fake install-launchd.sh that records its argv and exits 1 with a wording
+#      the `--verify` substring scan does not know — so the delegate's EXIT STATUS is pinned, and a
+#      neutered delegation (`return 0`) fails here instead of passing a grep over the docstring.
+#  11. A Label IS A PATH COMPONENT. `com.test/slash` and `../../escaped` are refused BY NAME (not a
+#      traceback), nothing is written outside the state dir, and ONE malformed plist dropped into a
+#      running loop does not stop the loop or the other jobs.
+#  12. ZERO JOBS IS NOT A PASS. A templates dir that exists but holds no *.plist is refused by
+#      --install and --verify, and starts no loop (it used to print "SCHEDULE VERIFIED — 0 job(s)").
+#  13. A RECYCLED PID IS NOT THE LOOP. --start replaces a live foreign pid in loop.pid, prints the
+#      pid it actually started, and leaves a real loop running (it used to print the foreign pid
+#      and exit 0 with no loop at all).
+#  14. --install DOES NOT RACE THE FIRST TICK. A job whose interval is 1s and whose body takes 2s
+#      makes the loop due again the instant it starts; --install must still exit 0.
+#  15. A LONG JOB IS BUSY, NOT A WEDGE — and the exemption EXPIRES: a stale tick with a live busy
+#      marker passes, the same tick fails once the marker's deadline has passed.
+#  16. AN ANNUAL CALENDAR KEEPS A NEXT OCCURRENCE. A multi-entry StartCalendarInterval with
+#      Month/Day is not `next=-` forever, and a calendar that can never match (Feb 31) FAILS.
+#  17. --stop WORKS WHERE THE SCHEDULE NEVER RAN: it creates its own OFF switch (no traceback).
+#
 # Run:  bash scripts/fleet-schedule.test.sh
 set -uo pipefail
 
@@ -462,11 +484,269 @@ out="$(cd / && env -u TEMPLATES_DIR -u INFRA_ROOT -u AGENT_INFRA_PATH \
   || bad "expected rc=3 for missing declarations, got $rc: $out"
 
 # ── 10. macOS delegates (never a second scheduler) ──────────────────────────────────────────
-case_ "10. the launchd backend is delegated to, not reimplemented"
-grep -q 'install-launchd.sh' "$SCHED" && ok "the Darwin path delegates to scripts/install-launchd.sh" \
-  || bad "the Darwin path does not delegate — a second macOS scheduler would drift"
-grep -q 'cmd_darwin' "$SCHED" && ok "the Darwin branch exists behind a platform check" \
-  || bad "no Darwin branch"
+case_ "10. the launchd backend is delegated to, driven through the Darwin branch"
+# ⛔ BEHAVIOUR, NOT A GREP. The previous version asserted `grep -q 'install-launchd.sh' "$SCHED"`
+# and `grep -q 'cmd_darwin' "$SCHED"` — both satisfied by the module DOCSTRING and by
+# `def cmd_darwin` alone, so neutering the delegation (`return 0`) left the suite green. Here the
+# shipped module is executed with sys.platform pinched to 'darwin' against a FAKE installer that
+# records how it was called and fails with a wording the --verify substring scan does NOT know
+# (`template dir not found`), which is also the false PASS a delegate's exit status closes.
+DARWIN_ROOT="$T/darwin-root"
+DELEGATE_RECORD="$T/delegate.record"
+mkdir -p "$DARWIN_ROOT/scripts" "$DARWIN_ROOT/templates/launchd"
+printf '# fixture\n' > "$DARWIN_ROOT/templates/launchd/RETIRED"
+cat > "$DARWIN_ROOT/scripts/install-launchd.sh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "${1:-<no args>}" >> "$DELEGATE_RECORD"
+echo "ERROR: template dir not found: /nonexistent" >&2
+exit 1
+SH
+chmod +x "$DARWIN_ROOT/scripts/install-launchd.sh"
+# Runs the SHIPPED runtime as macOS would: sys.platform is the only thing faked, and the module's
+# own `if __name__ == "__main__"` exit path is taken so the rc is the real one.
+darwin_run() { # darwin_run <mode> → prints output, returns the runtime's rc
+  : > "$DELEGATE_RECORD"
+  DELEGATE_RECORD="$DELEGATE_RECORD" INFRA_ROOT="$DARWIN_ROOT" python3 - "$SCHED" "$1" 2>&1 <<'PY'
+import sys
+sys.platform = "darwin"
+path, mode = sys.argv[1], sys.argv[2]
+sys.argv = [path, mode]
+exec(compile(open(path).read(), path, "exec"), {"__name__": "__main__", "__file__": path})
+PY
+}
+out="$(darwin_run --verify)"; rc=$?
+[ "$rc" -eq 1 ] && ok "--verify FAILS when the delegate it delegates to fails (its rc is read)" \
+  || bad "a failing install-launchd.sh --status was certified VERIFIED on macOS (rc=$rc): $out"
+grep -q 'SCHEDULE NOT VERIFIED' <<<"$out" && ok "the Darwin failure names the verdict" \
+  || bad "no NOT VERIFIED verdict on Darwin: $out"
+grep -q '^--status$' "$DELEGATE_RECORD" && ok "--verify asks install-launchd.sh --status (delegated, not reimplemented)" \
+  || bad "--verify did not delegate --status: $(cat "$DELEGATE_RECORD" 2>/dev/null)"
+out="$(darwin_run --status)"; rc=$?
+[ "$rc" -eq 1 ] && grep -q '^--status$' "$DELEGATE_RECORD" \
+  && ok "--status delegates to install-launchd.sh and propagates its rc" \
+  || bad "--status did not delegate/propagate (rc=$rc): $out"
+out="$(darwin_run --install)"; rc=$?
+[ "$rc" -eq 1 ] && grep -q '^<no args>$' "$DELEGATE_RECORD" \
+  && ok "--install delegates to install-launchd.sh with NO arguments and propagates its rc" \
+  || bad "--install did not delegate (rc=$rc): $out ($(cat "$DELEGATE_RECORD" 2>/dev/null))"
+out="$(darwin_run --loop)"; rc=$?
+[ "$rc" -eq 2 ] && grep -q 'Linux runtime' <<<"$out" \
+  && ok "--loop REFUSES on macOS (a second scheduler is what drifting looks like)" \
+  || bad "--loop was accepted on macOS (rc=$rc): $out"
+out="$(darwin_run --stop)"; rc=$?
+[ "$rc" -eq 0 ] && grep -q -- '--uninstall' <<<"$out" \
+  && ok "--stop points at install-launchd.sh --uninstall instead of inventing a stop" \
+  || bad "--stop did not name the launchd uninstall path (rc=$rc): $out"
+
+# ── 11. a Label is a PATH COMPONENT, so it is validated before it is used as one ─────────────
+case_ "11. a Label that is not a safe file name is refused, and cannot escape the state dir"
+LABELDIR="$FIX/bad-label"; mkdir -p "$LABELDIR"; cp "$GOOD/RETIRED" "$LABELDIR/RETIRED"
+cat > "$T/slashlabel.spec" <<PY
+PLIST = {
+    "Label": "com.test/slash",
+    "ProgramArguments": ["/bin/sh", "-c", "echo slash >> '$MARK.slash'"],
+    "StartInterval": 2,
+}
+PY
+cat > "$T/escape-label.spec" <<PY
+PLIST = {
+    "Label": "../../escaped",
+    "ProgramArguments": ["/bin/sh", "-c", "echo escaped >> '$MARK.escaped'"],
+    "StartInterval": 2,
+}
+PY
+mkplist "$LABELDIR" com.test.echo "$T/echo.spec"
+mkplist "$LABELDIR" com.test.slash "$T/slashlabel.spec"
+mkplist "$LABELDIR" com.test.escape "$T/escape-label.spec"
+state_reset "$LABELDIR"
+out="$(run "$LABELDIR" --install)"; rc=$?
+[ "$rc" -eq 1 ] && ok "--install refuses a Label that is not a safe file name (rc=1)" \
+  || bad "an unsafe Label was accepted (rc=$rc): $out"
+grep -q 'not a safe file name' <<<"$out" && ok "both unsafe Labels are named as such" \
+  || bad "the refusal does not name the Label rule: $out"
+grep -q 'Traceback' <<<"$out" && bad "the refusal is a traceback, not a diagnosis: $out" \
+  || ok "the refusal is a diagnosis, not a traceback"
+[ ! -e "$T/escaped.json" ] && [ ! -e "$T/escaped.lock" ] && [ ! -e "$T/escaped.log" ] \
+  && ok "nothing was written OUTSIDE the state dir by the traversal Label" \
+  || bad "a Label escaped the state dir (stamp/lock/log written under $T)"
+[ ! -f "$FLEET_SCHEDULE_STATE/loop.pid" ] && ok "no loop was started over the broken job set" \
+  || bad "a loop was started on a set it could not read in full"
+# 11b. and ONE bad declaration must not stop a RUNNING loop (dropped in while it runs)
+SWAP="$FIX/label-sweep"; mkdir -p "$SWAP"; cp "$GOOD/RETIRED" "$SWAP/RETIRED"
+mkplist "$SWAP" com.test.echo "$T/echo.spec"
+state_reset "$SWAP"; run "$SWAP" --install >/dev/null 2>&1
+loop_pid_11b="$(cat "$FLEET_SCHEDULE_STATE/loop.pid" 2>/dev/null)"
+mkplist "$SWAP" com.test.slash "$T/slashlabel.spec"
+before="$(grep -c 'ran-' "$MARK" 2>/dev/null || echo 0)"
+run_again=0
+for _ in $(seq 1 12); do
+  sleep 1
+  after="$(grep -c 'ran-' "$MARK" 2>/dev/null || echo 0)"
+  [ "$after" -gt "$before" ] && { run_again=1; break; }
+done
+[ "$run_again" -eq 1 ] && ok "the loop kept RUNNING the good job after the bad plist appeared" \
+  || bad "a single malformed declaration stopped the whole loop (other jobs no longer run)"
+kill -0 "$loop_pid_11b" 2>/dev/null && ok "the loop process survived the malformed declaration" \
+  || bad "the loop process died on a malformed declaration"
+run "$SWAP" --stop >/dev/null 2>&1
+
+# ── 12. an EMPTY declarations dir is a FALSE PASS, not a clean run ──────────────────────────
+case_ "12. a schedule with ZERO jobs is refused instead of certified"
+EMPTY="$FIX/empty"; mkdir -p "$EMPTY"; printf '# no retired labels\n' > "$EMPTY/RETIRED"
+state_reset "$EMPTY"
+out="$(run "$EMPTY" --install)"; rc=$?
+[ "$rc" -eq 1 ] && ok "--install refuses an EMPTY job set (rc=1)" \
+  || bad "an empty job set was accepted (rc=$rc): $out"
+grep -q 'ZERO jobs' <<<"$out" && ok "the refusal says the set is empty (not that everything is fine)" \
+  || bad "the refusal is not diagnosable: $out"
+grep -q 'SCHEDULE VERIFIED' <<<"$out" && bad "an EMPTY schedule printed SCHEDULE VERIFIED: $out" \
+  || ok "nothing was certified over zero jobs"
+out="$(run "$EMPTY" --verify)"; rc=$?
+[ "$rc" -eq 1 ] && ok "--verify also refuses the empty set" || bad "--verify passed an empty set (rc=$rc)"
+[ ! -f "$FLEET_SCHEDULE_STATE/loop.pid" ] && ok "no loop was started over an empty set" \
+  || bad "a loop was started over an empty set"
+
+# ── 13. a recycled pid must not fake a running loop (--start used to print one and exit 0) ────
+case_ "13. --start replaces a recycled pid in loop.pid instead of reporting it as the loop"
+state_reset "$GOOD"
+sleep 60 & recycled=$!; echo "$recycled" >> "$T/pids"
+printf '%s\n' "$recycled" > "$FLEET_SCHEDULE_STATE/loop.pid"
+out="$(run "$GOOD" --start)"; rc=$?
+[ "$rc" -eq 0 ] && ok "--start exits 0" || bad "--start failed over a recycled pid (rc=$rc): $out"
+newpid="$(cat "$FLEET_SCHEDULE_STATE/loop.pid" 2>/dev/null)"
+[ -n "$newpid" ] && [ "$newpid" != "$recycled" ] \
+  && ok "loop.pid now names a DIFFERENT pid than the recycled one" \
+  || bad "loop.pid still holds the recycled pid ($newpid == $recycled)"
+if grep -q -- '--loop' "/proc/$newpid/cmdline" 2>/dev/null; then
+  ok "the pid it printed really is fleet-schedule.py --loop"
+else
+  skip "no /proc/<pid>/cmdline on this platform"
+fi
+[ -f "$FLEET_SCHEDULE_STATE/tick" ] && ok "a real loop stamped a tick" \
+  || bad "no tick: the 'loop started' message was a claim about a foreign pid"
+kill -0 "$newpid" 2>/dev/null && ok "the started loop is alive" || bad "the loop it reported is not alive"
+run "$GOOD" --stop >/dev/null 2>&1
+kill "$recycled" 2>/dev/null
+
+# ── 14. --install must not race the loop's first tick ──────────────────────────────────────
+case_ "14. --install verifies a HEALTHY install whose loop is still in its first pass"
+RACE="$FIX/race"; mkdir -p "$RACE"; cp "$GOOD/RETIRED" "$RACE/RETIRED"
+cat > "$T/race.spec" <<PY
+PLIST = {
+    "Label": "com.test.race",
+    "ProgramArguments": ["/bin/sh", "-c", "sleep 2; echo race >> '$MARK.race'"],
+    "StartInterval": 1,
+}
+PY
+mkplist "$RACE" com.test.race "$T/race.spec"
+state_reset "$RACE"
+out="$(run "$RACE" --install)"; rc=$?
+[ "$rc" -eq 0 ] && ok "--install exits 0 (the loop was due again the moment it started)" \
+  || bad "--install failed a healthy install because the loop had not ticked yet (rc=$rc): $out"
+grep -q 'never ticked' <<<"$out" && bad "verify raced the loop's first tick: $out" \
+  || ok "verify did not race the first tick"
+[ -f "$MARK.race" ] && ok "the short-interval job actually ran (the fixture is not vacuous)" \
+  || bad "the fixture job never ran — the case proves nothing"
+run "$RACE" --stop >/dev/null 2>&1
+
+# ── 15. a long job is BUSY, not a wedge — and the exemption EXPIRES ─────────────────────────
+case_ "15. a stale tick is explained by a running job, and only until its deadline"
+state_reset "$GOOD"; run "$GOOD" --install >/dev/null 2>&1
+run "$GOOD" --stop >/dev/null 2>&1
+rm -f "$FLEET_SCHEDULE_STATE/OFF"
+# A stand-in whose COMMAND LINE is the loop (so the pid arm passes) — the real loop is stopped, so
+# nothing can re-stamp the tick and the staleness is deterministic, not a race.
+bash -c 'exec -a "fleet-schedule.py --loop" sleep 120' & fakepid=$!; echo "$fakepid" >> "$T/pids"
+printf '%s\n' "$fakepid" > "$FLEET_SCHEDULE_STATE/loop.pid"
+busy_marker() { # busy_marker <deadline-offset-seconds>
+  python3 - "$FLEET_SCHEDULE_STATE" "$1" <<'PY'
+import json, os, sys, time
+state, offset = sys.argv[1], float(sys.argv[2])
+tick = os.path.join(state, "tick")
+old = time.time() - 100000
+if os.path.exists(tick):
+    os.utime(tick, (old, old))
+else:
+    open(tick, "w").write("0\n")
+    os.utime(tick, (old, old))
+os.makedirs(os.path.join(state, "busy"), exist_ok=True)
+now = time.time()
+json.dump(
+    {"label": "com.test.echo", "started": now - 900, "pid": os.getpid(),
+     "deadline": now + offset},
+    open(os.path.join(state, "busy", "com.test.echo.json"), "w"),
+)
+PY
+}
+busy_marker +900
+out="$(run "$GOOD" --verify)"; rc=$?
+[ "$rc" -eq 0 ] && ok "a stale tick WITH a live busy job passes --verify (a long job is not a wedge)" \
+  || bad "a long-running job failed --verify as a stale loop (rc=$rc): $out"
+grep -q 'BUSY' <<<"$out" && ok "the verdict names the job that is running" \
+  || bad "the busy job is not named in the verdict: $out"
+busy_marker -60
+out="$(run "$GOOD" --verify)"; rc=$?
+[ "$rc" -eq 1 ] && ok "once the deadline EXPIRES the same tick fails --verify (the exemption is bounded)" \
+  || bad "an expired busy marker still excused a stale tick (rc=$rc): $out"
+grep -q 'tick is .*old' <<<"$out" && ok "the expired case names the stale tick" \
+  || bad "the expired case does not name the stale tick: $out"
+kill "$fakepid" 2>/dev/null
+
+# ── 16. an annual (multi-entry) calendar must keep a NEXT occurrence ───────────────────────
+case_ "16. a multi-entry StartCalendarInterval with Month/Day is scheduled, not silently never"
+CAL="$FIX/calendar"; mkdir -p "$CAL"; cp "$GOOD/RETIRED" "$CAL/RETIRED"
+cat > "$T/annual.spec" <<PY
+PLIST = {
+    "Label": "com.test.annual",
+    "ProgramArguments": ["/bin/sh", "-c", "echo annual >> '$MARK.annual'"],
+    "StartCalendarInterval": [
+        {"Month": 12, "Day": 25, "Hour": 3, "Minute": 0},
+        {"Month": 6, "Day": 1, "Hour": 3, "Minute": 0},
+    ],
+}
+PY
+mkplist "$CAL" com.test.annual "$T/annual.spec"
+state_reset "$CAL"
+run "$CAL" --install >/dev/null 2>&1
+out="$(run "$CAL" --status)"
+grep -qE 'com.test.annual .*next=-' <<<"$out" && bad "the annual job reads 'next=-': its calendar can never come due again" \
+  || ok "the annual job has a NEXT occurrence (the _all entries' keys are read)"
+[ -f "$MARK.annual" ] && ok "the annual job ran once (never-run) — the fixture is not vacuous" \
+  || bad "the annual fixture never ran"
+run "$CAL" --stop >/dev/null 2>&1
+# 16b: a calendar that matches NOTHING (Feb 31) must FAIL --verify, not read as healthy
+NEVER="$FIX/never-due"; mkdir -p "$NEVER"; cp "$GOOD/RETIRED" "$NEVER/RETIRED"
+cat > "$T/never.spec" <<PY
+PLIST = {
+    "Label": "com.test.neverdue",
+    "ProgramArguments": ["/bin/sh", "-c", "echo never >> '$MARK.never'"],
+    "StartCalendarInterval": {"Month": 2, "Day": 31, "Hour": 3, "Minute": 0},
+}
+PY
+mkplist "$NEVER" com.test.neverdue "$T/never.spec"
+state_reset "$NEVER"
+run "$NEVER" --install >/dev/null 2>&1
+[ -f "$MARK.never" ] && ok "the never-due job ran once first (never-run shortcut)" \
+  || bad "the never-due fixture never ran — the case is vacuous"
+out="$(run "$NEVER" --verify)"; rc=$?
+[ "$rc" -eq 1 ] && ok "a job whose calendar never matches again FAILS --verify" \
+  || bad "a job that can never run again was certified healthy (rc=$rc): $out"
+grep -q 'can never run' <<<"$out" && ok "the failure says the job can never run again" \
+  || bad "the failure is not diagnosable: $out"
+run "$NEVER" --stop >/dev/null 2>&1
+
+# ── 17. --stop must create its own OFF switch on a machine that never ran ───────────────────
+case_ "17. --stop works where the schedule never ran (no state dir yet)"
+NOSSTATE="$T/never-installed"
+rm -rf "$NOSSTATE"
+out="$(cd / && env -u TEMPLATES_DIR -u INFRA_ROOT -u AGENT_INFRA_PATH \
+       HOME="$T/barehome" CELL_HOME="$T/barehome" FLEET_SCHEDULE_STATE="$NOSSTATE" \
+       python3 "$SCHED" --stop 2>&1)"; rc=$?
+[ "$rc" -eq 0 ] && ok "--stop exits 0 with no state dir" || bad "--stop failed with no state dir (rc=$rc): $out"
+grep -q 'Traceback' <<<"$out" && bad "--stop raised a traceback: $out" || ok "no traceback"
+[ -f "$NOSSTATE/OFF" ] && ok "the OFF switch was created (the decision is recorded)" \
+  || bad "no OFF switch was written"
+
 
 echo
 echo "───────────────────────────────────────────────────────────────"
