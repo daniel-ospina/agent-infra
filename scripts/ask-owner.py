@@ -6,16 +6,24 @@ The queue is the `owner-decision` label. This script decides whether a question
 EARNED that label, and if not, posts back exactly what is missing.
 
 Design rules (deliberate):
-  * ONE Jev call. No regex, no parsing, no string matching.
+  * ONE Jev call. The STRUCTURAL marks only — no judge is asked to grade prose.
   * Jev is decision-only: it cannot return a value outside the schema below,
     so the schema IS the rubric and the gate cannot drift.
-  * The declaration (skills/sources) is a FIELD, not prose — mechanical is
-    honest there. Everything else is judgement, so it goes to Jev.
-  * A bounce is a TEMPLATE keyed to a fixed choice. Templates cannot be vague,
-    so a bounce can never loop.
+  * Fields and DECLARED SHAPES are mechanical; judgement is Jev's. The
+    declaration is a field. The two LANGUAGE marks are declared shapes (bare
+    paths, unexplained ticket references, unexplained identifiers, sentence
+    length) — see THE LANGUAGE MARKS ARE MECHANICAL below for why they are no
+    longer sent to Jev at all.
+  * A bounce is a TEMPLATE keyed to a fixed choice, plus the exact occurrences
+    the mechanical marks counted. Templates cannot be vague, so a bounce can
+    never loop; naming the occurrence means a lane never has to guess which
+    axis to fix.
 
 Usage:
     python3 ask-owner.py <owner/repo> <issue-number> [--dry-run]
+    python3 ask-owner.py --scan [--dry-run]
+    python3 ask-owner.py --score-file <path> [--repeat N]   # offline; no labels,
+                                             # no comments, no gh calls
 
 Exit: 0 = passed and labelled · 1 = bounced (posted back to the lane) ·
       2 = could not check (no key / network) — NOT a pass.
@@ -23,6 +31,7 @@ Exit: 0 = passed and labelled · 1 = bounced (posted back to the lane) ·
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -47,9 +56,10 @@ JEV_MODEL = "jev-1.13.0"          # pin: thresholds must not shift under us
 #                                                   decision?" instead of
 #                                                   saying what was checked)
 #   has_context           0.74 - 0.82         never below ~0.70
-#   jargon_free           0.78 - 0.84         0.07 - 0.12  (the three
-#                                                   owner-approved briefs)
-#   understandable        0.75 - 0.85         0.36
+#   jargon_free           (MECHANICAL since agent-infra#1903 — see THE LANGUAGE
+#   understandable         MARKS ARE MECHANICAL below; the Jev bands that used to
+#                          sit here are quoted there, because they are the reason
+#                          the two marks are no longer Jev's to grade)
 #
 # The three owner-approved briefs scored jargon_free 0.07 / 0.12 / 0.07 — which
 # is why the language marks cannot sit at 0.80 with the structural ones: at 0.80
@@ -68,36 +78,37 @@ JEV_MODEL = "jev-1.13.0"          # pin: thresholds must not shift under us
 THRESHOLD = 0.80                  # structural marks: has_options, has_analysis,
                                   # has_recommendation, contradiction_test
 THRESHOLD_LANGUAGE = 0.70         # has_context
-# ── the two JARGON marks get their own, LOWER bar ────────────────────────────
-# Owner's instruction, 2026-09-26: the jargon calibration is "a bit too strict".
-# The recorded basis for the language bar was ONE question ("Measured on one
-# question: jargon_free 0.53 -> …"), and `jargon_free` has a measured FLOOR
-# EFFECT: a rewrite that removed every internal term moved it 0.07 -> 0.09, and
-# `prose_only()` exists because scoring the declaration line pushed the mark
-# "toward unpassable — a bounce the lane could never fix". A mark whose ceiling
-# sits near its threshold decides bounces by itself.
+# ── the bar the two LANGUAGE marks are scored against ────────────────────────
+# `has_context` keeps 0.70: the owner's own reply on #5425 named BOTH problems —
+# "too much jargon, NOT ENOUGH CONTEXT" — so loosening the context bar would
+# contradict his feedback.
 #
-# Split, not a blanket cut: `has_context` KEEPS 0.70, because the owner's own
-# reply on #5425 named BOTH problems — "to. much jargon, NOT ENOUGH CONTEXT" —
-# so loosening the context bar would contradict his feedback.
-#
-# ⚠️ NOW CALIBRATED FROM A DISTRIBUTION (2026-09-26, lane 2a). 23 scored variants
-# across 17 rewrites, 160-1,270 words, scored locally through `jev()` (~$0.0004
-# per run, no issue spam). Measured band for `jargon_free`: **0.58-0.63** — i.e.
-# the 0.60 step below sat ON the band and passed only sometimes.
-#
-# ⛔ And the band is where it is FOR A STRUCTURAL REASON. **Every added item costs
-# ~0.05 of `jargon_free`**, while the marks this gate *requires*
+# ⛔ 0.55 IS NOW A BAR OVER MECHANICAL SCORES, NOT OVER JEV'S (agent-infra#1903).
+# The Jev history is kept because it is the evidence for the move: 23 scored
+# variants across 17 rewrites scored `jargon_free` in a **0.58-0.63** band, every
+# added item cost ~0.05 of it, and the marks the gate REQUIRES
 # (has_options / has_analysis / has_recommendation / contradiction_test) never
-# fell below 0.89. So **satisfying the structural marks is what makes the
-# language mark fail** — there is no rewrite that fixes it, only a threshold
-# beneath the band. 0.55 clears the measured floor; the structural bar (0.80) is
-# unchanged and still gates.
+# fell below 0.89 — so satisfying the structural marks is what made the language
+# mark fail. #5489 records that.
 #
-# Root of the contradiction: #5489 (lane 2a's evidence is commented there).
+# #1903 recorded the other failure mode, on ONE question and ELEVEN gate runs:
+# eight substantial rewrites of the same question scored jargon_free 0.48-0.58
+# and understandable 0.43-0.59 — and the ONLY language PASS was the most
+# TECHNICAL draft (0.56, still carrying `eval`, bare issue numbers and internal
+# vocabulary), while the drafts written for a non-developer scored LOWER (0.48,
+# 0.51). A mark whose signal is anti-correlated with its own definition cannot be
+# recalibrated (moving a bar does not reverse a signal); it is replaced by what
+# its own definition can actually be checked against. That is the block below.
+#
+# Scales differ, so the number is not comparable across the two estimators:
+# * `jargon_free`      1.0 - 0.25 x (unexplained references)  → 2 references fail
+# * `understandable`   1.0 - (avg words/sentence - 30) / 50   → avg > 52.5 fails
 THRESHOLD_JARGON = 0.55
 LANGUAGE_MARKS = {"has_context", "jargon_free", "understandable"}
-JARGON_MARKS = {"jargon_free", "understandable"}
+MECHANICAL_MARKS = {"jargon_free", "understandable"}
+# Kept as the name the rest of the file and its callers use; the two marks in it
+# are no longer Jev's, but they still share one bar and one bounce template.
+JARGON_MARKS = MECHANICAL_MARKS
 
 
 def threshold_for(mark):
@@ -108,8 +119,10 @@ def threshold_for(mark):
     return THRESHOLD
 
 # ---------------------------------------------------------------------------
-# THE RUBRIC. These are the only questions Jev can answer. Seven nouls and one
-# choice. Add or drop one and the gate changes shape — nothing else does.
+# THE RUBRIC. Five nouls are Jev's; two are MECHANICAL (below). Seven marks and
+# one choice, i.e. the gate's SHAPE is unchanged by agent-infra#1903 — what
+# changed is WHO grades the two language marks. Add or drop a mark and the gate
+# changes shape; nothing else does.
 # ---------------------------------------------------------------------------
 QUESTIONS = {
     "has_context": {
@@ -140,31 +153,212 @@ QUESTIONS = {
             "or state explicitly that no recorded decision applies?"
         ),
     },
-    "jargon_free": {
-        "type": "noul",
-        "instructions": (
-            "Is it free of internal shorthand that a reader outside this lane "
-            "would not know?\n"
-            "IMPORTANT — these do NOT count as jargon:\n"
-            "  * the names of products and components themselves (e.g. 'the "
-            "bridge', 'Tortoise', 'the dashboard'), because the reader already "
-            "uses those words;\n"
-            "  * ordinary technical vocabulary a non-developer product owner "
-            "would still know from context (e.g. 'backup', 'schedule', "
-            "'version', 'copy').\n"
-            "DO count: codenames for internal mechanisms, ticket-only "
-            "abbreviations, bare identifiers, and terms the team invented and "
-            "uses without explaining."
-        ),
-    },
-    "understandable": {
-        "type": "noul",
-        "instructions": (
-            "Could a non-developer product owner understand what is being "
-            "asked and what the options mean?"
-        ),
-    },
+    # `jargon_free` and `understandable` USED to live here. They are computed by
+    # `language_marks()` below instead — see THE LANGUAGE MARKS ARE MECHANICAL.
 }
+
+# ═══════════════════════════════════════════════════════════════════════════
+# THE LANGUAGE MARKS ARE MECHANICAL (agent-infra#1903)
+#
+# Owner ruling, 2026-10-17: "measure the gate's variance (score the SAME text
+# twice — a null pair), then either recalibrate or replace the mark with a
+# mechanical check (bare paths / unexplained ticket refs / unexplained
+# identifiers)."
+#
+# MEASURED DEFECT this answers (agent-infra#1903, eleven gate runs on ONE
+# question, 2026-10-17). Eight substantial rewrites of the same question scored
+# `jargon_free` 0.48-0.58 and `understandable` 0.43-0.59 against a 0.55 bar, and
+# the ONLY language PASS in the set was the MOST TECHNICAL draft (0.56 — it still
+# carried `eval`, bare issue numbers, "lineage", "reconcile", "superseded"),
+# while the drafts written for a non-developer scored LOWER (0.48 and 0.51). The
+# signal was anti-correlated with the property the mark names, so every honest
+# simplification moved a lane BACKWARDS.
+#
+# ⛔ THE NULL PAIR WAS NOT RUNNABLE HERE, AND THAT IS WHY THIS IS THE MECHANICAL
+# PATH. Running it needs a JEV_API_KEY (paid calls) and a live `jev()`; the
+# replacement below needs neither — which is the point. A mark computed from the
+# text by plain code has EXACTLY ZERO run-to-run variance by construction, so the
+# null pair is not a sample to be drawn, it is a property to be asserted:
+# `test_ask_owner.py::test_null_pair_spread_is_zero` scores the same text 20
+# times and asserts the marks are identical. For the Jev-graded marks the
+# variance question is still open, and `--score-file --repeat N` now draws it
+# offline (no issue comments, no labels) on a box that has a key.
+#
+# What replaced them — the properties the OLD mark's own definition named, made
+# checkable instead of guessed:
+#
+#   jargon_free       bare file paths, ticket references with no sentence
+#                     explaining them, single-token identifiers (`eval`) used
+#                     without explanation.
+#   understandable    sentence length: the mechanical half of readability. It
+#                     cannot judge whether the CONTENT is comprehensible; it
+#                     detects the shape that most often makes it not.
+#
+# Neither mark can invert: both are monotone in the defect they count, so adding
+# jargon or adding words to a sentence can only LOWER the score. That is the
+# property the old mark lacked and the reason it could not be recalibrated — a
+# threshold cannot reverse a signal.
+#
+# Declared shape, declared residual: an "explained" reference is decided by a
+# gloss cue inside a window around it (below). This is a heuristic, and the gate
+# is honest about that rather than pretending a judge was needed — the bounce
+# NAMES every occurrence it counted, so a lane fixes the text instead of reading
+# this file to guess what the score meant.
+# ═══════════════════════════════════════════════════════════════════════════
+
+# A reference is a path, a ticket number, or a single-token code span. Fenced
+# blocks are dropped first (they are code, not prose) and code spans are blanked
+# before the path/ticket scan, so `` `scripts/ask-owner.py` `` counts ONCE.
+_FENCE = re.compile(r"^```.*?^```", re.M | re.S)
+# A URL in prose is a CITATION, not internal shorthand — the reader can open it,
+# and the declaration's `refs=` field is where sources belong. Blanked so
+# `https://example.com/docs/page.md` is not counted as a bare path.
+_URL = re.compile(r"https?://\S+")
+_CODE_SPAN = re.compile(r"`([^`\n]+)`")
+_PATH = re.compile(
+    r"(?<![\w/])~?(?:[\w.-]+/)+[\w.-]+\."
+    r"(?:py|sh|cjs|mjs|js|ts|tsx|md|json|ya?ml|toml|plist|txt|cfg|ini)\b"
+)
+# `#1234`, `agent-infra#1903`, `tortoise#8519` — a bare number or a repo-prefixed
+# one. NOT a markdown heading (`# 1234` has a space), and not inside a word.
+_TICKET = re.compile(r"(?<![\w/#])(?:[A-Za-z][\w.-]*)?#\d+\b")
+
+# A gloss is the phrase doing the explaining. English puts it AFTER the thing it
+# explains ("scripts/ask-owner.py, the gate that…", "#1903 (the PR where…)") or
+# immediately BEFORE it ("the gate `eval`…", "one ticket, agent-infra#1903,…").
+# The window is deliberately TIGHT — punctuation plus a gloss phrase, adjacent —
+# so an incidental "test" or "issue" twelve words later cannot launder a bare
+# reference. A false PASS is the one direction this heuristic must not drift.
+_NUMBER_NOUN = (
+    r"(?:file|script|gate|check|issue|ticket|row|function|module|command|doc"
+    r"|document|PR|pull request|label|flag|mark|test|suite|rule|table|path|line"
+    r"|patch|branch|commit)"
+)
+_GAP = r"[\s)\].,;:\u2014\u2013-]{0,3}"
+_GLOSS_AFTER = re.compile(
+    r"^" + _GAP + r"(?:[(\[\u2014\u2013]|which\b|that is\b|i\.e\.|means\b"
+    r"|called\b|named\b"
+    r"|(?:the|a|an|one|this|that)\s+" + _NUMBER_NOUN + r"\b)",
+    re.I,
+)
+_GLOSS_BEFORE = re.compile(
+    r"(?:[(\[\u2014\u2013]|(?:the|a|an|one|this|that|its)\s+"
+    + _NUMBER_NOUN + r")\W{0,3}$",
+    re.I,
+)
+_GLOSS_WINDOW = 60                 # characters either side, not words
+
+STEP_PER_REFERENCE = 0.25          # 2 unexplained references fail the 0.55 bar
+AVG_SENTENCE_COMFORT = 30.0        # words/sentence at which the score is 1.0
+AVG_SENTENCE_SPAN = 50.0           # words/sentence at which the score reaches 0.0
+
+
+def _sentences(text):
+    """Prose sentences, one per list item or line.
+
+    A bullet is a sentence, not a fragment of the previous one: splitting only on
+    `[.!?]` would weld an options list into one 200-word sentence and fail a
+    question that is perfectly readable. Headings and blank lines are skipped.
+    """
+    out = []
+    for line in text.splitlines():
+        if line.lstrip().startswith("#"):
+            continue                      # a heading is not a prose sentence
+        line = line.strip().lstrip("-*+> ").strip()
+        if not line:
+            continue
+        for s in re.split(r"(?<=[.!?])\s+", line):
+            if s.strip():
+                out.append(s.strip())
+    return out
+
+
+def _explained(text, start, end):
+    """Is a gloss phrase adjacent to this reference (tight window, either side)?"""
+    before = text[max(0, start - _GLOSS_WINDOW):start]
+    after = text[end:end + _GLOSS_WINDOW]
+    return bool(_GLOSS_BEFORE.search(before)) or bool(_GLOSS_AFTER.search(after))
+
+
+def unexplained_references(text):
+    """[(kind, token)] in document order — every reference with no gloss near it.
+
+    `text` is the PROSE (the declaration line is already stripped by
+    `prose_only`), so the `refs=...` field the protocol forces every question to
+    carry is never counted — the same reason `prose_only()` exists.
+    """
+    body = _FENCE.sub(lambda m: " " * len(m.group(0)), text)
+    body = _URL.sub(lambda m: " " * len(m.group(0)), body)
+    found = []
+    blanked = list(body)
+    for m in _CODE_SPAN.finditer(body):
+        token = m.group(1).strip()
+        # A path or ticket INSIDE backticks is the path/ticket rule's business
+        # (one count, its own gloss window) — so that span is left in the flat
+        # text and counted there. Anything else in backticks that is a single
+        # token with a letter in it is a bare identifier (`eval`, `MAX_LANES`);
+        # multi-word spans are quoted commands or output, not identifiers.
+        is_ref = bool(_TICKET.fullmatch(token) or _PATH.fullmatch(token))
+        if not is_ref:
+            for i in range(m.start(), m.end()):
+                blanked[i] = " "
+            if (token and len(token) <= 60 and not re.search(r"\s", token)
+                    and re.search(r"[A-Za-z]", token)
+                    and not _explained(text, m.start(), m.end())):
+                found.append((m.start(), "bare identifier", token))
+    flat = "".join(blanked)
+    for kind, rx in (("bare file path", _PATH), ("bare issue number", _TICKET)):
+        for m in rx.finditer(flat):
+            if not _explained(text, m.start(), m.end()):
+                found.append((m.start(), kind, m.group(0)))
+    found.sort(key=lambda t: t[0])
+    return [(kind, token) for _, kind, token in found]
+
+
+def jargon_free_score(text):
+    """1.0 minus 0.25 per unexplained reference — monotone, so jargon can only
+    lower it. (kind, token) findings are returned for the bounce message."""
+    refs = unexplained_references(text)
+    return max(0.0, 1.0 - STEP_PER_REFERENCE * len(refs)), refs
+
+
+def understandable_score(text):
+    """Average words per sentence, mapped so the 0.55 bar fails above ~52 words.
+
+    Monotone in sentence length: padding a sentence can only lower it. Returns
+    the longest sentence too, so a bounce can quote the shape it counted.
+    """
+    sents = _sentences(text)
+    if not sents:
+        return 1.0, []
+    avg = sum(len(s.split()) for s in sents) / len(sents)
+    score = max(0.0, 1.0 - max(0.0, avg - AVG_SENTENCE_COMFORT) / AVG_SENTENCE_SPAN)
+    findings = []
+    if score < THRESHOLD_JARGON:
+        longest = max(sents, key=lambda s: len(s.split()))
+        n = len(longest.split())
+        findings.append(
+            f"average sentence length {avg:.0f} words (longest {n}): {longest[:160]}"
+            + ("…" if len(longest) > 160 else ""))
+    return score, findings
+
+
+def language_marks(text):
+    """The two language marks, computed from the text. No Jev, no network, no cost.
+
+    Same answer every time it is called on the same text — which is the property
+    the null pair in agent-infra#1903 was looking for and the old Jev-graded mark
+    could not promise.
+    """
+    prose = prose_only(text)
+    jf, jf_findings = jargon_free_score(prose)
+    un, un_findings = understandable_score(prose)
+    answers = {
+        "jargon_free": {"type": "noul", "noul": jf},
+        "understandable": {"type": "noul", "noul": un},
+    }
+    return answers, {"jargon_free": (jf, jf_findings),
+                     "understandable": (un, un_findings)}
 
 # Which template answers which failed check. The problem is DERIVED from the
 # failing nouls in plain code — never asked as a separate Jev question, because
@@ -489,6 +683,22 @@ def verdict(answers):
 REPOS = ["daniel-ospina/tortoise", "daniel-ospina/premise-labs",
          "daniel-ospina/agent-infra"]
 
+# ── R5 DEPENDS ON THIS GATE (agent-infra#1905, owner ruling 2026-10-17) ─────────
+# #1905's R5 says *"there is no blocked item: anything stuck is either fixed
+# automatically or becomes a user question"*. That RETIRES `parked-*` as a
+# terminal state, which leaves THIS gate as the only terminal path a stuck item
+# has. The dependency is mechanical, not stylistic: while the gate could not pass
+# an honest question — the 2026-10-17 defect (agent-infra#1903) in which every
+# plain rewrite bounced and the densest draft passed — a stuck item would have
+# been *refused by the gate and then left with no terminal state at all*, which is
+# worse than `parked-*`: a park is a record a controller can see, silence is not.
+#
+# So, until #1905 lands:
+#   * `parked-*` stays the RECORDED terminal state for anything this gate
+#     refuses — the fallback must be visible, never silence;
+#   * the two language marks are MECHANICAL (see THE LANGUAGE MARKS ARE
+#     MECHANICAL), so a refusal is reproducible and names what failed. A lane can
+#     act on the bounce instead of rewriting into a mark that rewards density.
 BOUNCE_LABEL = "question-bounced"
 # The OTHER half of the handshake. `question-bounced` stops the gate repeating
 # itself; `owner-answered` stops it repeating ITSELF — and it is the reason this
@@ -952,12 +1162,87 @@ def scan(dry):
     return rc
 
 
+def _bounce_detail(mech_findings, failures):
+    """Name the exact occurrences a mechanical mark counted.
+
+    The old bounce said only "internal shorthand", so a lane had to read this
+    file to discover which axis (and, from 2026-10-17, which direction) the gate
+    meant — measured on agent-infra#1553: eight rewrites, each fixing the wrong
+    thing. The occurrences ARE the feedback: they are printed here, and they are
+    the only thing the mark counted.
+    """
+    lines = []
+    if "jargon_free" in failures:
+        for kind, token in mech_findings.get("jargon_free", (0, []))[1]:
+            lines.append(f"- `{token}` — {kind}, with no sentence explaining it. "
+                         f"Say what it is in words, or drop it.")
+    if "understandable" in failures:
+        for finding in mech_findings.get("understandable", (0, []))[1]:
+            lines.append(f"- {finding}. Split it into shorter sentences.")
+    if not lines:
+        return ""
+    return "\n\n**Counted (this is the whole list — nothing else was measured):**\n" + \
+        "\n".join(lines)
+
+
+def score_text(text, repeat=1):
+    """Offline scoring: no gh, no labels, no comments. Prints the marks.
+
+    WHY IT EXISTS (agent-infra#1903). The only way to score a draft used to be to
+    POST it to the PR as a `RESEARCH:` comment and run the gate — the issue's own
+    measurement left seven question comments on one PR as a side effect of
+    calibrating. `--score-file` is the offline path, and `--repeat N` is the NULL
+    PAIR the owner ruling asks for: the same text scored N times, with the spread
+    per mark printed. The mechanical marks are expected to show 0.00 spread by
+    construction; a non-zero spread on a Jev mark is the variance that made the
+    old language bar unusable.
+    """
+    try:
+        with open(text, errors="replace") as fh:
+            raw = fh.read()
+    except OSError as e:
+        print(f"could not read {text}: {e}")
+        return 2
+    prose = prose_only(raw)
+    runs = []
+    for _ in range(max(1, repeat)):
+        ans, findings = language_marks(prose)
+        result = jev(prose)
+        if result is not None:
+            ans.update({k: v for k, v in (result.get("answers") or {}).items()})
+        runs.append(ans)
+        for name, a in ans.items():
+            print(f"  {name:22} {a.get('noul')}")
+        for name, (score, why) in findings.items():
+            if score < threshold_for(name):
+                print(f"    {name}: " + "; ".join(str(w) for w in why))
+    if len(runs) > 1:
+        print(f"null pair over {len(runs)} runs (spread = max - min):")
+        for name in sorted({k for r in runs for k in r}):
+            vals = [r[name]["noul"] for r in runs if name in r]
+            if not vals:
+                continue
+            print(f"  {name:22} min={min(vals):.3f} max={max(vals):.3f} "
+                  f"spread={max(vals) - min(vals):.3f}")
+    return 0
+
+
 def main(argv):
     if len(argv) < 1:
         print(__doc__)
         return 2
     if argv[0] == "--scan":
         return scan("--dry-run" in argv)
+    if argv[0] == "--score-file":
+        # Offline path: a file, never an issue. See `score_text` for why.
+        if len(argv) < 2 or argv[1].startswith("--"):
+            print("--score-file needs a path")
+            return 2
+        rep = 1
+        if "--repeat" in argv:
+            i = argv.index("--repeat")
+            rep = int(argv[i + 1]) if i + 1 < len(argv) and argv[i + 1].isdigit() else 1
+        return score_text(argv[1], rep)
     repo, number = argv[0], int(argv[1])
     dry = "--dry-run" in argv
     skip_decl = "--skip-declaration" in argv  # calibration only
@@ -988,22 +1273,36 @@ def main(argv):
             body = NO_RESEARCH + BOUNCE_TAIL
             sh(["gh", "issue", "comment", str(number), "--repo", repo,
                 "--body", body])
+            # ⛔ A BOUNCE IS NOT A QUEUED QUESTION. Removing `owner-decision` is what
+            # makes the pair readable: agent-infra#1553 carried BOTH
+            # `owner-decision` (from a pass) and `question-bounced` (from later
+            # bounces), so no reader — the owner, the heartbeat, or a lane picking
+            # the PR up — could tell whether the question was live or returned
+            # (agent-infra#1903). The bounce is authoritative; the pass re-adds the
+            # queue label. `--remove-label` on an absent label is a no-op.
             sh(["gh", "issue", "edit", str(number), "--repo", repo,
-                "--add-label", BOUNCE_LABEL])
+                "--add-label", BOUNCE_LABEL, "--remove-label", "owner-decision"])
         print(f"BOUNCE ({decl}) → {repo}#{number}")
         return 1
 
-    # STEP 2 — the judgement (Jev, one call, typed).
+    # STEP 2 — the judgement. ONE Jev call for the five STRUCTURAL marks; the two
+    # language marks are computed here, from the text (agent-infra#1903).
     result = jev(prose_only(text))
     if result is None:
         return 2
     answers = result.get("answers", {})
+    mech, mech_findings = language_marks(text)
+    answers.update(mech)
     failures, problem = verdict(answers)
 
     print(f"cost_usd={result.get('usage',{}).get('cost_usd')}")
     for name, ans in answers.items():
         if ans.get("type") == "noul":
-            print(f"  {name:22} {ans.get('noul')}")
+            bar = "" if answers[name].get("noul", 0) >= threshold_for(name) else "  <-- below bar"
+            print(f"  {name:22} {ans.get('noul')}{bar}")
+    for name, (score, why) in mech_findings.items():
+        if score < threshold_for(name):
+            print(f"    {name}: " + "; ".join(str(w) for w in why))
     # ⛔ NAME THE FAILING MARK, NOT THE TEMPLATE — AND PRINT THE BAR BESIDE IT.
     # `jargon_free` and `understandable` share one bounce template ("jargon"), so
     # printing the template as the primary problem says "jargon" even when
@@ -1042,14 +1341,18 @@ def main(argv):
     if body is None:
         body = ("Sent back: the question did not clear these checks — "
                 + ", ".join(failures) + ".")
+    body += _bounce_detail(mech_findings, failures)
     body += BOUNCE_TAIL
     if not dry:
         sh(["gh", "issue", "comment", str(number), "--repo", repo,
             "--body", body])
         # Mark it, or the 5-minute scan repeats itself forever. The lane removes
-        # this label to be re-checked; that is the entire handshake.
+        # this label to be re-checked; that is the entire handshake. As in STEP 1,
+        # the bounce takes the question OUT of the queue: a bounced question is not
+        # in the owner's queue, and leaving `owner-decision` on makes the artifact
+        # unreadable (agent-infra#1903, agent-infra#1553).
         sh(["gh", "issue", "edit", str(number), "--repo", repo,
-            "--add-label", BOUNCE_LABEL])
+            "--add-label", BOUNCE_LABEL, "--remove-label", "owner-decision"])
     print(f"BOUNCE (primary={worst}"
           + (f"; failing: {fails}" if failures else "")
           + f"; template={problem}) → {repo}#{number}")
