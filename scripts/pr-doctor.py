@@ -371,7 +371,7 @@ def materialise_worktree(pr: dict) -> tuple[str, str]:
             return "", ("cannot determine whether %s is a worktree (git probe failed) -- refusing "
                         "to reuse or delete it; inspect it" % cand)
         if live:
-            err = _ensure_head(cand, branch, head)
+            err = _ensure_branch(cand, branch) or _ensure_head(cand, branch, head)
             return (cand, "") if not err else ("", err)
 
     # Materialise at the first candidate that is absent, or holds nothing but a dangling `.git`
@@ -415,7 +415,7 @@ def materialise_worktree(pr: dict) -> tuple[str, str]:
     if not _live_worktree(path):
         return "", "worktree add reported success but %s is not a live worktree" % path
     # A local branch can be BEHIND the PR head; verify and move it, but never over dirty work.
-    err = _ensure_head(path, branch, head)
+    err = _ensure_branch(path, branch) or _ensure_head(path, branch, head)
     return (path, "") if not err else ("", err)
 
 
@@ -446,11 +446,51 @@ def _live_worktree(path: str):
 
 
 def _disposable_dangling(path: str) -> bool:
-    """A directory we own that is not a worktree and holds nothing but a dangling `.git` pointer."""
+    """A directory we own that holds NOTHING, or only a dangling `.git` pointer FILE.
+
+    ⛔ A `.git` DIRECTORY is a repository's object store, not a worktree pointer; deleting it can
+    destroy recoverable commits, so it is never disposable.
+    """
     try:
-        return set(os.listdir(path)) <= {".git"}
+        entries = os.listdir(path)
     except OSError:
         return False
+    if not entries:
+        return True
+    if set(entries) != {".git"}:
+        return False
+    return os.path.isfile(os.path.join(path, ".git"))
+
+
+def _ensure_branch(path: str, branch: str) -> str:
+    """Ensure a live worktree is attached to the PR branch; "" on success, else why.
+
+    The reuse path used to reset whatever HEAD it found, so a worktree left on ANOTHER branch (or
+    detached) was silently reused and the worker's `git push` landed on the wrong branch or a
+    stale one. When the PR branch exists locally the worktree MUST be attached to it. A worktree
+    with TRACKED modifications is refused (checkout could carry them); untracked scratch is left
+    alone because it neither blocks checkout nor is destroyed by `reset --hard`. A fork worktree
+    has no local branch and stays detached.
+    """
+    _, _, exists = _git(["rev-parse", "--verify", "-q", "refs/heads/%s" % branch], timeout=60)
+    if exists != 0:
+        return ""                                 # fork PR: detached is expected
+    out, _, rc = sh_err(["git", "-C", path, "symbolic-ref", "--short", "HEAD"], timeout=30)
+    if rc == 0 and (out or "").strip() == branch:
+        return ""
+    dirty, _, drc = sh_err(["git", "-C", path, "status", "--porcelain",
+                            "--untracked-files=no"], timeout=60)
+    if drc != 0:
+        return ("cannot determine whether worktree %s is clean (git status rc=%s) -- refusing to "
+                "switch branch; inspect and clean it" % (path, drc))
+    if (dirty or "").strip():
+        return ("worktree %s is on a different branch/HEAD and has uncommitted tracked changes -- "
+                "refusing to switch it to %s; inspect and clean it" % (path, branch))
+    _, err, rc = sh_err(["git", "-C", path, "checkout", branch], timeout=180)
+    if rc != 0:
+        return "worktree %s could not be switched to %s: %s" % (
+            path, branch, (err or "").strip()[:160])
+    return ""
 
 
 def _ensure_head(path: str, branch: str, head: str) -> str:
@@ -501,8 +541,15 @@ def _worktrees() -> list[tuple[str, str]]:
 
 
 def _drop_worktree_record(path: str) -> None:
-    """Targeted removal of one record. NEVER a bare `git worktree prune` (#1141)."""
-    _git(["worktree", "remove", "--force", path], timeout=120)
+    """Targeted removal of one record. NEVER a bare `git worktree prune` (#1141).
+
+    DOUBLE `--force`: a single force does NOT remove a LOCKED record, so a locked stranded record
+    would survive and `worktree add` would fail with "missing but locked" for ever.
+    """
+    _, err, rc = _git(["worktree", "remove", "--force", "--force", path], timeout=120)
+    if rc != 0:
+        log("worktree remove of stranded record %s failed rc=%s: %s"
+            % (path, rc, (err or "").strip()[:160]))
 
 
 # ---------------------------------------------------------------------------

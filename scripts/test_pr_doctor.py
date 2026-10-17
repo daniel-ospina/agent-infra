@@ -495,6 +495,74 @@ def test_materialise_clears_a_stranded_detached_record(monkeypatch, tmp_path):
     assert err == "" and wt == str(path)
 
 
+def test_materialise_reuses_only_a_worktree_on_the_pr_branch(monkeypatch, tmp_path):
+    """A live worktree left on ANOTHER branch must not be silently reset: the worker's push would
+    land on the wrong branch. It is switched back to the PR branch (or refused when dirty)."""
+    repo, g = _git_repo(tmp_path)
+    g("branch", "feat/x")
+    head1 = g("rev-parse", "HEAD").stdout.strip()
+    _wire_repo(monkeypatch, repo)
+    wt, _ = pr.materialise_worktree(_prb(1, head1, "feat/x"))
+
+    def gw(*a):
+        return subprocess.run(["git", "-C", wt] + list(a), check=True,
+                              capture_output=True, text=True)
+
+    gw("checkout", "-q", "-b", "some-other-branch")
+    wt2, err = pr.materialise_worktree(_prb(1, head1, "feat/x"))
+    assert err == "" and wt2 == wt
+    assert gw("symbolic-ref", "--short", "HEAD").stdout.strip() == "feat/x"
+
+
+def test_materialise_refuses_to_switch_a_dirty_worktree_to_the_pr_branch(monkeypatch, tmp_path):
+    repo, g = _git_repo(tmp_path)
+    g("branch", "feat/x")
+    head1 = g("rev-parse", "HEAD").stdout.strip()
+    _wire_repo(monkeypatch, repo)
+    wt, _ = pr.materialise_worktree(_prb(1, head1, "feat/x"))
+
+    def gw(*a):
+        return subprocess.run(["git", "-C", wt] + list(a), check=True,
+                              capture_output=True, text=True)
+
+    gw("checkout", "-q", "-b", "some-other-branch")
+    (pathlib.Path(wt) / "f.txt").write_text("tracked change\n")
+    wt2, err = pr.materialise_worktree(_prb(1, head1, "feat/x"))
+    assert wt2 == "" and "uncommitted" in err
+    assert (pathlib.Path(wt) / "f.txt").read_text() == "tracked change\n"
+
+
+def test_materialise_clears_a_locked_stranded_record(monkeypatch, tmp_path):
+    """A single `--force` does not remove a LOCKED record; without a double force the record
+    survives and `worktree add` fails on every pass."""
+    import shutil
+    repo, g = _git_repo(tmp_path)
+    head = g("rev-parse", "HEAD").stdout.strip()
+    g("branch", "feat/x")
+    _wire_repo(monkeypatch, repo)
+    path = repo / ".worktrees" / "prd-1"
+    g("worktree", "add", "--detach", str(path), head)
+    g("worktree", "lock", str(path))
+    shutil.rmtree(path)
+    wt, err = pr.materialise_worktree(_prb(1, head, "feat/x"))
+    assert err == "" and wt == str(path)
+
+
+def test_materialise_never_deletes_a_dot_git_directory(monkeypatch, tmp_path):
+    """A `.git` DIRECTORY is a repository's object store, not a dangling worktree pointer."""
+    repo, g = _git_repo(tmp_path)
+    head = g("rev-parse", "HEAD").stdout.strip()
+    g("branch", "feat/x")
+    _wire_repo(monkeypatch, repo)
+    path = repo / ".worktrees" / "prd-1"
+    (path / ".git" / "objects").mkdir(parents=True)
+    (path / ".git" / "objects" / "someobj").write_text("precious\n")
+    assert pr._disposable_dangling(str(path)) is False
+    wt, err = pr.materialise_worktree(_prb(1, head, "feat/x"))
+    assert err == "" and wt.endswith("prd-1-d"), "a `.git` directory must not be deleted"
+    assert (path / ".git" / "objects" / "someobj").read_text() == "precious\n"
+
+
 def test_materialise_worktree_clears_a_stranded_record(monkeypatch, tmp_path):
     """Directory gone but the record remains: `worktree add` refuses until the record is cleared."""
     import shutil
@@ -542,10 +610,11 @@ def test_materialise_worktree_refuses_to_reset_a_dirty_stale_worktree(monkeypatc
     gw("commit", "--allow-empty", "-qm", "second")
     head2 = gw("rev-parse", "HEAD").stdout.strip()
     gw("checkout", "--detach", head1)
-    (pathlib.Path(wt) / "wip.txt").write_text("uncommitted\n")
+    (pathlib.Path(wt) / "f.txt").write_text("uncommitted change\n")   # a TRACKED modification
     wt2, err = pr.materialise_worktree(_prb(1, head2, "feat/x"))
     assert wt2 == "" and "uncommitted" in err
-    assert (pathlib.Path(wt) / "wip.txt").exists(), "a dirty worktree must never be reset"
+    assert (pathlib.Path(wt) / "f.txt").read_text() == "uncommitted change\n", \
+        "a dirty worktree must never be reset"
 
 
 # ── 4. the lane-table feeding is RETIRED, not merely unused ───────────────────────────────
