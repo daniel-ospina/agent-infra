@@ -840,7 +840,10 @@ def _queue_read_is_blind(unknown, nondraft):
 
     THE ONE DEFINITION, shared by the re-sample that tries to settle the read and by the
     report that finally declares it blind -- so the retry can never stop on a queue the line
-    then calls readable, or keep re-reading a queue it is about to call blind. A read is blind
+    then calls readable, or keep re-reading a queue it is about to call blind. `pr-loop.py`
+    consumes it TOO and does not dispatch on it (#1918): the beat only PRINTS the
+    qualification, while the dispatcher ACTS, so a third copy of this threshold would let a
+    blind classification become lane actions with no caveat at all. A read is blind
     when ANY PR is unread and at least half of them are: one unread PR in a 20-PR queue does
     not invalidate the DO list, and an unread queue of one does.
 
