@@ -1670,3 +1670,53 @@ def test_the_agent_ran_marker_is_still_written_after_the_wait():
 
 def gate_lines():
     return (_HARNESS / "spawn-gate.sh").read_text().splitlines()
+
+
+# ── 7. the two P3s the fix above accepted as residual ─────────────────────────────────────
+# Both were reported by the fresh-context review that preceded the fix commit and recorded there as
+# "accepted for now". They are false statements to a fixer (a push that cannot happen) and a false
+# PASS on the pass log ("would spawn" when the worktree is what blocks), so they are fixed here and
+# pinned. Each test FAILS on `eb23fa183`.
+
+def test_the_brief_never_tells_a_fork_fixer_to_push(monkeypatch):
+    """A fork PR's head is `refs/pull/<n>/head` -- READ-ONLY here; there is no branch to push.
+
+    The brief said "Fix, push" to every PR. On a fork PR that cannot succeed: the head branch lives
+    in the contributor's fork, so the commits have nowhere to go, and a worktree left holding
+    commits no ref holds makes `_ensure_head` refuse that PR for ever afterwards. A base-repo PR
+    gets the explicit refspec, which is the form that works from an ATTACHED *or* a DETACHED tree.
+    """
+    monkeypatch.setattr(pr, "rollup", lambda n: ({}, [], [], []))
+    fork = _pr(7)
+    fork["isCrossRepository"] = True
+    text = pr.brief(fork, "failing")
+    assert "THERE IS NO BRANCH HERE TO PUSH" in text
+    assert "git push origin HEAD:" not in text, "a fork fixer was given a push it cannot perform"
+    assert "refs/pull/7/head" in text
+    base = pr.brief(_pr(8), "failing")
+    assert "git push origin HEAD:refs/heads/fix/branch-8" in base
+
+
+def test_dry_run_reports_the_worktree_refusal(monkeypatch, tmp_path):
+    """`--dry-run` must not promise a spawn that the WORKTREE would refuse.
+
+    It returned before `materialise_worktree()`, so it reported "would spawn" precisely when the
+    worktree was what would block (the P1 that made a lane-held branch a deadlock). It now walks the
+    same decision tree READ-ONLY: nothing is created, fetched, checked out or reset.
+    """
+    repo, g = _git_repo(tmp_path)
+    g("branch", "feat/x")
+    head = g("rev-parse", "HEAD").stdout.strip()
+    _wire_repo(monkeypatch, repo)
+    monkeypatch.setattr(pr, "STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
+    for name in ("prd-5", "prd-5-d"):          # both candidates occupied, neither disposable
+        (repo / ".worktrees" / name).mkdir(parents=True)
+        (repo / ".worktrees" / name / "precious.txt").write_text("work\n")
+    ok, detail, record = pr.dispatch(_prb(5, head, "feat/x"), "failing", "brief", dry=True)
+    assert ok is False, "a dry run claimed it would spawn although both candidate paths are blocked"
+    assert "unusable" in detail
+    assert record is False
+    # read-only: nothing was created, deleted or registered
+    assert (repo / ".worktrees" / "prd-5" / "precious.txt").read_text() == "work\n"
+    assert "prd-5" not in g("worktree", "list", "--porcelain").stdout

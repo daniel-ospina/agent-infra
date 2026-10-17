@@ -415,7 +415,7 @@ class _Refusal(str):
         return self
 
 
-def materialise_worktree(pr: dict) -> tuple[str, str]:
+def materialise_worktree(pr: dict, dry: bool = False) -> tuple[str, str]:
     """Ensure a git worktree for the PR's branch at the PR's head; return (path, "") or ("", why).
 
     The worker must be ON the PR's branch at the PR's CURRENT head so a fixer pushes the right
@@ -434,6 +434,10 @@ def materialise_worktree(pr: dict) -> tuple[str, str]:
       * A base-repo PR whose branch is ALREADY CHECKED OUT somewhere is ADOPTED at that worktree,
         not refused: git will not check one branch out twice, and the case is the normal one -- a
         PR a lane produced has its branch in that lane's own worktree.
+
+    `dry=True` walks the SAME decision tree and returns the worktree it would use WITHOUT creating,
+    fetching, checking out or resetting anything -- `--dry-run` used to return before this call and
+    so reported "would spawn" precisely when the worktree was what would block.
     """
     branch = pr["headRefName"]
     head = pr["headRefOid"]
@@ -454,7 +458,8 @@ def materialise_worktree(pr: dict) -> tuple[str, str]:
     ours = set(candidates)
     for p, b in _worktrees():
         if not os.path.exists(p) and (p in ours or b == "refs/heads/%s" % branch):
-            _drop_worktree_record(p)
+            if not dry:
+                _drop_worktree_record(p)
 
     # ADOPT A WORKTREE THE BRANCH IS ALREADY CHECKED OUT IN. A PR a lane produced has its branch
     # checked out in THAT LANE'S worktree (`git worktree list` on the box: `.worktrees/fix-1529
@@ -482,7 +487,7 @@ def materialise_worktree(pr: dict) -> tuple[str, str]:
             if not live:
                 continue      # exists but is not a worktree: not ours to adopt; `add` will report
             log("materialise: adopting %s, already on %s (the lane's own worktree)" % (p, branch))
-            err = _ensure_head(p, branch, head, fetch_ref)
+            err = _ensure_head(p, branch, head, fetch_ref, dry=dry)
             return (p, "") if not err else ("", err)
 
     # Reuse any candidate that is already a live worktree. UNKNOWN is NOT reuse: `True` would run
@@ -494,8 +499,8 @@ def materialise_worktree(pr: dict) -> tuple[str, str]:
             return "", ("cannot determine whether %s is a worktree (git probe failed) -- refusing "
                         "to reuse or delete it; inspect it" % cand)
         if live:
-            err = (_ensure_branch(cand, branch, fork)
-                   or _ensure_head(cand, branch, head, fetch_ref))
+            err = (_ensure_branch(cand, branch, fork, dry=dry)
+                   or _ensure_head(cand, branch, head, fetch_ref, dry=dry))
             return (cand, "") if not err else ("", err)
 
     # Materialise at the first candidate that is absent, or holds nothing but a dangling `.git`
@@ -510,8 +515,9 @@ def materialise_worktree(pr: dict) -> tuple[str, str]:
             path = cand
             break
         if _disposable_dangling(cand):
-            log("materialise: clearing a dangling non-worktree at %s" % cand)
-            shutil.rmtree(cand, ignore_errors=True)
+            if not dry:
+                log("materialise: clearing a dangling non-worktree at %s" % cand)
+                shutil.rmtree(cand, ignore_errors=True)
             path = cand
             break
     if not path:
@@ -524,6 +530,8 @@ def materialise_worktree(pr: dict) -> tuple[str, str]:
     # fork discriminator (GitHub's `isCrossRepository` is). Only a base-repo PR checks out a named
     # branch; a fork PR is materialised DETACHED at refs/pull/<n>/head.
     if fork:
+        if dry:
+            return path, ""     # a real run would fetch refs/pull/<n>/head and add the worktree
         ref = "refs/pull/%d/head" % pr["number"]
         _, ferr, frc = _git(["fetch", "origin", ref, "--quiet"], timeout=300)
         if frc != 0:
@@ -536,11 +544,16 @@ def materialise_worktree(pr: dict) -> tuple[str, str]:
         if rc == 0:
             argv = ["worktree", "add", path, branch]
         else:
+            if dry:
+                return path, ""   # a real run would fetch origin/<branch> and create the branch
             _, ferr, frc = _git(["fetch", "origin", branch, "--quiet"], timeout=300)
             if frc != 0:
                 return "", "cannot materialise %s: origin/%s could not be fetched (%s)" % (
                     branch, branch, (ferr or "").strip()[:160])
             argv = ["worktree", "add", path, "-b", branch, "origin/%s" % branch]
+    if dry:
+        log("materialise: DRY-RUN would run `git %s`" % " ".join(argv))
+        return path, ""
     _, err, rc = _git(argv, timeout=300)
     if rc != 0:
         return "", "worktree add failed rc=%s: %s" % (rc, (err or "").strip()[:200] or "(no stderr)")
@@ -630,7 +643,7 @@ def _disposable_dangling(path: str) -> bool:
     return os.path.isfile(os.path.join(path, ".git"))
 
 
-def _ensure_branch(path: str, branch: str, fork: bool = False) -> str:
+def _ensure_branch(path: str, branch: str, fork: bool = False, dry: bool = False) -> str:
     """Ensure a reused worktree is on the PR branch (base-repo PR) or DETACHED (fork PR); "" on
     success, else why.
 
@@ -647,6 +660,8 @@ def _ensure_branch(path: str, branch: str, fork: bool = False) -> str:
     if fork:
         if detached:
             return ""
+        if dry:
+            return ""            # a real run would `checkout --detach`; a dry run touches nothing
         # Detaching keeps the tree, so no file is touched and the foreign branch keeps its commits.
         _, err, xrc = sh_err(["git", "-C", path, "checkout", "--detach"], timeout=180)
         if xrc != 0:
@@ -684,6 +699,8 @@ def _ensure_branch(path: str, branch: str, fork: bool = False) -> str:
         return _Refusal("worktree %s has untracked file(s) that %s would overwrite (%s) -- "
                         "refusing to switch it; move or remove them"
                         % (path, branch, ", ".join(clobber[:3])), persistent=True)
+    if dry:
+        return ""                # a real run would `checkout`; a dry run touches nothing
     _, err, xrc = sh_err(["git", "-C", path, "checkout", branch], timeout=180)
     if xrc != 0:
         return "worktree %s could not be switched to %s: %s" % (
@@ -730,13 +747,15 @@ def _untracked_clobber(path: str, head: str):
     return sorted(u for u in untracked if _conflicts(u))
 
 
-def _ensure_head(path: str, branch: str, head: str, fetch_ref: str = "") -> str:
+def _ensure_head(path: str, branch: str, head: str, fetch_ref: str = "", dry: bool = False) -> str:
     """Move <path> to <head>; "" on success, else why. NEVER resets a DIRTY worktree."""
     out, _, rc = sh_err(["git", "-C", path, "rev-parse", "HEAD"], timeout=30)
     if rc == 0 and (out or "").strip() == head:
         return ""
     _, _, have = sh_err(["git", "-C", path, "cat-file", "-e", "%s^{commit}" % head], timeout=30)
     if have != 0:
+        if dry:
+            return ""        # a real run would fetch `fetch_ref`/`branch` first -- nothing to prove
         # A fork PR's head lives at refs/pull/<n>/head, NOT origin/<branch> (which does not exist
         # for a fork). Fetching the WRONG ref leaves the object absent and every later probe fails
         # with a misleading error, so fetch the right one and name a persistent absence clearly.
@@ -789,6 +808,8 @@ def _ensure_head(path: str, branch: str, head: str, fetch_ref: str = "") -> str:
             return _Refusal("worktree %s is detached and has %d commit(s) held by no branch -- "
                             "refusing to reset it and orphan them; create a branch or inspect it"
                             % (path, n_ahead), persistent=True)
+    if dry:
+        return ""                    # a real run would `reset --hard`; a dry run touches nothing
     _, err, rc = sh_err(["git", "-C", path, "reset", "--hard", head], timeout=120)
     if rc != 0:
         return "worktree %s reset to %s failed rc=%s: %s" % (path, head[:12], rc, (err or "").strip()[:160])
@@ -841,6 +862,31 @@ def brief(pr: dict, action: str) -> str:
     title = pr["title"][:80]
     _, failing, _, absent = rollup(n)
 
+    # ⛔ A FORK PR HAS NO BRANCH HERE TO PUSH AT ALL, AND THE BRIEF USED TO SAY "push". Its head is
+    # `refs/pull/<n>/head`, which is READ-ONLY from this repo: the head branch lives in the
+    # contributor's fork and is not a branch here, so a push from the fork worktree has nowhere to
+    # go. The fixer's commits stay unpublishable, and `_ensure_head` then refuses that worktree for
+    # ever (commits no branch holds) -- a silent dead end for the PR. So the fork contract states
+    # the truth and asks for the patch instead. A base-repo PR gets the explicit refspec, which is
+    # the form that works from an ATTACHED *or* a DETACHED worktree (the fork path is detached, and
+    # an adopted lane worktree may be detached too).
+    if pr.get("isCrossRepository"):
+        push = """## THIS IS A FORK PR — THERE IS NO BRANCH HERE TO PUSH
+Your worktree is **DETACHED** at `refs/pull/{n}/head`, which is READ-ONLY from this repo: the head
+branch lives in the contributor's fork and is not a branch here. So do NOT push and do NOT create a
+branch -- the commits would have nowhere to go, and a committed-but-unpushable worktree makes every
+later pass refuse this PR. Instead: make the change, verify it, and put the exact patch
+(`git diff`) plus your reasoning in your FINAL MESSAGE for a maintainer to apply. Report
+`patch ready` (or the blocker), NOT `fixed`.
+""".format(n=n)
+    else:
+        push = """## PUSHING — works from an ATTACHED or a DETACHED worktree
+```
+git push origin HEAD:refs/heads/{branch}
+```
+Use that explicit refspec, never a bare `git push`.
+""".format(branch=pr["headRefName"])
+
     common = """
 ## The loop — do all of it in ONE run, never stop in between
 1. Resolve what this PR needs (below).
@@ -857,7 +903,7 @@ def brief(pr: dict, action: str) -> str:
 ⛔ If a check fails AFTER your fix: fix it again and continue. **Fixing is the normal path, not a blocker.**
 ⛔ `ai-review-gate=failure` is EXPECTED on a fresh PR and clears only by recording.
    `BLOCKED` / `UNSTABLE` merge states on a ready PR are NORMAL and are not reasons to hold.
-""".format(n=n)
+{push}""".format(n=n, push=push)
 
     if action == "ready":
         return """# MERGE #{n} — nothing else is needed
@@ -904,7 +950,8 @@ next step of merging. Do the work:
 2. Invoke the **`debug-workflow`** skill and root-cause it. **Do not guess at a fix.**
    **If the failure is a timeout that passes on retry at an unchanged commit, it is the
    load-dependent class (#5049) -- say so and retry rather than changing code that is not broken.**
-3. Fix, push, and let the checks re-run.
+3. Fix it, then get the change back onto the PR (see PUSHING / the fork note below) and let the
+   checks re-run.
 4. **Then carry straight on into the loop below -- do not report back and wait.**
 {common}""".format(n=n, title=title, head=head[:12], failing=", ".join(failing), common=common)
 
@@ -1147,8 +1194,21 @@ def dispatch(pr: dict, action: str, text: str, dry: bool) -> tuple[bool, str, bo
     n = pr["number"]
     name = "prd-%d" % n
     if dry:
-        log("DRY-RUN would spawn %s in a fresh worktree for %s (%d bytes)"
-            % (name, pr["headRefName"], len(text)))
+        # ⛔ A DRY RUN THAT SKIPS THE WORKTREE LIES ABOUT THE ONE STEP THAT BLOCKS. It used to
+        # return here, so it reported "would spawn" precisely when the worktree was what would
+        # refuse. Walk the SAME tree READ-ONLY: nothing is created, fetched, checked out or reset.
+        wt, werr = materialise_worktree(pr, dry=True)
+        if not wt:
+            log("DRY-RUN %s would NOT spawn: %s" % (name, werr[:160]))
+            return False, werr, False
+        live = worker_live(name)
+        if live is not False:
+            log("DRY-RUN %s would NOT spawn: %s"
+                % (name, "worker still running" if live else "worker liveness unreadable"))
+            return (False, "worker %s is %s -- one worker per PR"
+                    % (name, "still running" if live else "of unknown liveness"), False)
+        log("DRY-RUN would spawn %s in %s for %s (%d bytes)"
+            % (name, wt, pr["headRefName"], len(text)))
         return True, "dry-run", False
     # ⛔ ONE WORKER PER PR, EVEN ACROSS A HEAD CHANGE. main()'s cooldown is keyed on the head, so a
     # worker that PUSHES re-arms dispatch while it is still running -- and the worker name and its
