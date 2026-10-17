@@ -229,20 +229,27 @@ _TICKET = re.compile(r"(?<![\w/#])(?:[A-Za-z][\w.-]*)?#\d+\b")
 # The window is deliberately TIGHT — punctuation plus a gloss phrase, adjacent —
 # so an incidental "test" or "issue" twelve words later cannot launder a bare
 # reference. A false PASS is the one direction this heuristic must not drift.
+# ⛔ PUNCTUATION IS NOT A GLOSS. A bare `(`, `[` or em dash used to satisfy the
+# AFTER-pattern on its own, so wrapping each reference in a bracket laundered the
+# whole question: measured on this suite's own V3 draft, `reconciled (#1553) and
+# re-run (`eval`)` scored jargon_free 1.0 — against 0.25 for the identical text
+# without brackets, i.e. the drain the mark exists to close, reopened by two
+# keystrokes. Brackets and dashes are GAP characters (an opening for a gloss
+# phrase, since the phrase follows them); only a real noun phrase explains.
 _NUMBER_NOUN = (
     r"(?:file|script|gate|check|issue|ticket|row|function|module|command|doc"
     r"|document|PR|pull request|label|flag|mark|test|suite|rule|table|path|line"
     r"|patch|branch|commit)"
 )
-_GAP = r"[\s)\].,;:\u2014\u2013-]{0,3}"
+_GAP = r"[\s)\].,;:\u2014\u2013(\[-]{0,3}"
 _GLOSS_AFTER = re.compile(
-    r"^" + _GAP + r"(?:[(\[\u2014\u2013]|which\b|that is\b|i\.e\.|means\b"
+    r"^" + _GAP + r"(?:which\b|that is\b|i\.e\.|means\b"
     r"|called\b|named\b"
     r"|(?:the|a|an|one|this|that)\s+" + _NUMBER_NOUN + r"\b)",
     re.I,
 )
 _GLOSS_BEFORE = re.compile(
-    r"(?:[(\[\u2014\u2013]|(?:the|a|an|one|this|that|its)\s+"
+    r"(?:(?:the|a|an|one|this|that|its)\s+"
     + _NUMBER_NOUN + r")\W{0,3}$",
     re.I,
 )
@@ -795,7 +802,8 @@ def _iso(e):
 
 
 def owner_answered_at(repo, n):
-    """When the owner last took a question OUT of the queue, or None.
+    """When the owner last took a question OUT of the queue. `""` = not answered,
+    `None` = the read FAILED (UNKNOWN — never "no answer").
 
     The signal is the label removal, because nothing else survives: every actor on
     this box authenticates as `daniel-ospina`, so a comment's AUTHOR cannot tell the
@@ -803,15 +811,36 @@ def owner_answered_at(repo, n):
     timeline records the removal as an `unlabeled` event, and it is the one action
     the owner actually performs. ONE api call per candidate, and the candidate set
     is tiny (only issues carrying a declaring comment).
+
+    ⛔ THE GATE ITSELF NOW WRITES THAT EVENT, so a removal is an answer only when it
+    is NEWER than the newest `labeled question-bounced` event. A bounce removes
+    `owner-decision` in the SAME api call that adds `question-bounced` (STEP 1 and
+    STEP 2), so its removal is never newer than that label event and cannot be read
+    back as an owner answer. Without this filter the gate fabricated an answer to the
+    question it had just bounced: the next tick reported `ANSWERED`, stamped
+    `owner-answered`+`answer-delivered` (a permanent skip) and cleared
+    `question-bounced`, so the question could never be re-scored — measured on the
+    pre-fix module, one bounce + one tick = a settled question nobody answered.
+    A genuine answer posted AFTER a bounce still counts, because its removal is
+    newer than the bounce event.
     """
     rc, raw, _ = sh_status([
         "gh", "api", f"repos/{repo}/issues/{n}/timeline", "--paginate", "--jq",
-        '[.[] | select(.event=="unlabeled" and .label.name=="owner-decision") '
-        '| .created_at] | last // ""',
+        '.[] | select((.event=="unlabeled" and .label.name=="owner-decision") '
+        'or (.event=="labeled" and .label.name=="' + BOUNCE_LABEL + '")) '
+        r'| "\(.event)\t\(.created_at)"',
     ])
     if rc != 0:
         return None
-    return _iso(raw.strip().splitlines()[-1]) if raw.strip() else None
+    removed, bounced = [], []
+    for line in raw.strip().splitlines():
+        ev, _, at = line.partition("\t")
+        if not at.strip():
+            continue
+        (removed if ev.strip() == "unlabeled" else bounced).append(at.strip())
+    newest_bounce = max(bounced) if bounced else ""
+    answers = [at for at in removed if at > newest_bounce]
+    return _iso(max(answers)) if answers else ""
 
 
 def newest_decl_at(repo, n):
@@ -1079,8 +1108,23 @@ def scan(dry):
         for n in sorted(answered):
             if (repo, n) in seen:
                 continue
+            # RE-ASK THE ISSUE'S OWN TIMELINE, not the repo-wide event feed.
+            # The feed cannot tell an owner removal from the gate's own bounce
+            # removal (both are `unlabeled owner-decision`); the per-issue read
+            # can, because it also sees the `labeled question-bounced` event the
+            # bounce wrote in the same call (see `owner_answered_at`). Skipping a
+            # candidate here loses nothing: the repo-wide event still exists, so
+            # the next tick re-finds it.
+            ua = owner_answered_at(repo, n)
+            if ua is None:
+                scan_failed += 1
+                print(f"  SCAN FAILED (answer event) for {repo}#{n} — "
+                      f"answer set is UNKNOWN for it")
+                continue
+            if not ua:
+                continue
             nd = newest_decl_at(repo, n)
-            if not (nd and _iso(answered[n]) >= nd):
+            if not (nd and ua >= nd):
                 continue
             # Honour the idempotency marker. Pass 1 cannot see these issues (they
             # carry answer-delivered, so its filter skips them), which means an
@@ -1089,7 +1133,7 @@ def scan(dry):
             # already-delivered: silence is the safe failure mode for a re-notify.
             if has_label(repo, n, DELIVERED_LABEL) is not False:
                 continue
-            ev_ans[(repo, n)] = _iso(answered[n])
+            ev_ans[(repo, n)] = ua
             extra.append((repo, n))
         print(f"  {repo}: {len(answered)} answer-event(s), "
               f"{len(extra)} not already a candidate")
@@ -1196,6 +1240,21 @@ def score_text(text, repeat=1):
     per mark printed. The mechanical marks are expected to show 0.00 spread by
     construction; a non-zero spread on a Jev mark is the variance that made the
     old language bar unusable.
+
+    EXIT CODE IS THE GATE'S VERDICT, not "it ran" (#1911 review, P2): 0 = every
+    mark clears its bar · 1 = this draft WOULD BOUNCE · 2 = could not check (no key /
+    network), which is NOT a pass. It used to return 0 on every path, so a run that
+    printed "this is NOT a pass" and a run that named a failing mark both exited
+    green — the empty/UNKNOWN-read-as-success shape this file exists to refuse. A
+    mechanical failure is definitive even when Jev is unreachable (that mark is
+    computed from the text), so 1 outranks 2.
+
+    ⛔ ONE STRIP, like the live gate: `language_marks` strips the declaration
+    itself, so the raw text goes in here. Pre-stripping scored `prose_only(raw)`,
+    i.e. the gate's text stripped TWICE, which disagrees with the gate whenever the
+    question quotes a `RESEARCH:` line in its prose (a lane quoting the NO_RESEARCH
+    template does exactly that) — an instrument that measures a text the gate never
+    sees.
     """
     try:
         with open(text, errors="replace") as fh:
@@ -1204,18 +1263,25 @@ def score_text(text, repeat=1):
         print(f"could not read {text}: {e}")
         return 2
     prose = prose_only(raw)
-    runs = []
+    runs, failed, unchecked = [], False, False
     for _ in range(max(1, repeat)):
-        ans, findings = language_marks(prose)
+        ans, findings = language_marks(raw)
         result = jev(prose)
         if result is not None:
             ans.update({k: v for k, v in (result.get("answers") or {}).items()})
+        else:
+            unchecked = True
         runs.append(ans)
         for name, a in ans.items():
             print(f"  {name:22} {a.get('noul')}")
         for name, (score, why) in findings.items():
             if score < threshold_for(name):
                 print(f"    {name}: " + "; ".join(str(w) for w in why))
+        fails, _ = verdict(ans)
+        failed = bool(fails)
+        if fails:
+            print("  failing (score<bar)    " + ", ".join(
+                f"{n} {ans[n].get('noul')}<{threshold_for(n)}" for n in fails))
     if len(runs) > 1:
         print(f"null pair over {len(runs)} runs (spread = max - min):")
         for name in sorted({k for r in runs for k in r}):
@@ -1224,6 +1290,13 @@ def score_text(text, repeat=1):
                 continue
             print(f"  {name:22} min={min(vals):.3f} max={max(vals):.3f} "
                   f"spread={max(vals) - min(vals):.3f}")
+    if failed:
+        print("VERDICT: this draft would BOUNCE.")
+        return 1
+    if unchecked:
+        print("VERDICT: could not check (this is NOT a pass).")
+        return 2
+    print("VERDICT: this draft would PASS.")
     return 0
 
 

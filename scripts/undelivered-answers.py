@@ -70,7 +70,8 @@ def declaration_count(repo, n):
 
 
 def unlabeled_event_count(repo, n):
-    """Count `unlabeled owner-decision` events ACROSS ALL PAGES.
+    """Count `unlabeled owner-decision` events ACROSS ALL PAGES, EXCLUDING the
+    gate's own bounce removal.
 
     ⛔ The timeline endpoint returns the **FIRST page** by default, so a bare
     call shows the OLDEST events and silently misses the most recent ones — which
@@ -83,16 +84,33 @@ def unlabeled_event_count(repo, n):
     so `|length` emits one number PER PAGE and the caller cannot sum them (it
     would fall into the `None`/UNVERIFIED branch and silently disarm this check).
     Emitting one line per matching event and counting lines is pagination-safe.
+
+    ⛔ THE GATE WRITES THIS EVENT TOO (agent-infra#1903): a bounce removes
+    `owner-decision` in the same call that adds `question-bounced`. Counting that
+    removal as an answer makes this diagnostic report a bounced, unanswered
+    question as "conditions satisfied — PENDING (clean)", i.e. an answer that does
+    not exist. Count only removals NEWER than the newest `labeled
+    question-bounced` event, the same rule as ask-owner.py::owner_answered_at.
     """
     rc, out, _ = sh(["gh", "api",
                      "repos/%s/issues/%d/timeline?per_page=100" % (repo, n),
                      "--paginate",
                      "--jq",
-                     '.[]|select(.event=="unlabeled" and .label.name=="%s")|.created_at'
-                     % QUEUE])
+                     '.[]|select((.event=="unlabeled" and .label.name=="%s") '
+                     'or (.event=="labeled" and .label.name=="%s"))'
+                     r'|"\(.event)\t\(.created_at)"' % (QUEUE, BOUNCED)])
     if rc != 0:
         return None
-    return len([ln for ln in out.splitlines() if ln.strip()])
+    removed, bounced = [], []
+    for ln in out.splitlines():
+        if not ln.strip():
+            continue
+        ev, _, at = ln.partition("\t")
+        if not at.strip():
+            continue
+        (removed if ev.strip() == "unlabeled" else bounced).append(at.strip())
+    newest_bounce = max(bounced) if bounced else ""
+    return len([at for at in removed if at > newest_bounce])
 
 
 def diagnose(repo, issue):

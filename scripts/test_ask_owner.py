@@ -270,6 +270,9 @@ def test_score_file_repeat_reports_a_zero_spread(monkeypatch, tmp_path):
     Pre-fix: the only way to score a draft was to post it as a `RESEARCH:` comment and
     run the gate against the issue — one PR carried seven question comments as a side
     effect of calibrating (agent-infra#1903).
+
+    The exit code is the draft's VERDICT (v3 bounces), not "it ran" — see
+    `test_score_file_exits_one_for_a_draft_the_gate_would_bounce`.
     """
     p = tmp_path / "draft.md"
     p.write_text(V3)
@@ -283,10 +286,218 @@ def test_score_file_repeat_reports_a_zero_spread(monkeypatch, tmp_path):
     with redirect_stdout(out):
         rc = ao.main(["--score-file", str(p), "--repeat", "3"])
     text = out.getvalue()
-    assert rc == 0, text
+    assert rc == 1, text
     assert "null pair over 3 runs" in text, text
     assert "jargon_free" in text and "spread=0.000" in text, text
     assert rec.calls == [], rec.calls          # nothing was posted anywhere
+
+
+# ── the gate's own bounce must not be read back as an owner answer ─────────────
+
+def _stub_timeline(monkeypatch, events):
+    """Stub the TRANSPORT only: return the rows a real `gh api .../timeline` emits.
+
+    `owner_answered_at` still runs its real parse on them, so the exclusion under
+    test is the one the gate actually applies. `events` = [(event, label, at)],
+    oldest first.
+    """
+    rows = "\n".join(f"{ev}\t{at}" for ev, _label, at in events)
+
+    def sh_status(args, timeout=None):
+        call = " ".join(str(a) for a in args)
+        if "timeline" in call:
+            return (0, rows, "")
+        if "/comments" in call or "issue view" in call:
+            return (0, "2026-10-17T10:00:00Z", "")   # the declaration
+        return (0, "", "")
+
+    monkeypatch.setattr(ao, "sh_status", sh_status)
+
+
+def _timeline_gate(monkeypatch, events, text=V3):
+    """Run `main` against the FAKE issue timeline `events` (see `_stub_timeline`)."""
+    _stub_timeline(monkeypatch, events)
+    rec = _Recorder()
+    monkeypatch.setattr(ao, "sh", rec)
+    monkeypatch.setattr(ao, "fetch_question", lambda repo, n: text)
+    monkeypatch.setattr(ao, "jev", lambda state: {
+        "answers": {m: {"type": "noul", "noul": 0.99} for m in ao.QUESTIONS},
+        "usage": {"cost_usd": 0.0},
+    })
+    out = io.StringIO()
+    with redirect_stdout(out):
+        rc = ao.main(["daniel-ospina/agent-infra", "1553"])
+    return rc, rec, out.getvalue()
+
+
+def test_a_bounce_is_not_read_back_as_an_owner_answer(monkeypatch):
+    """The bounce removes `owner-decision`; that removal must not BE the answer.
+
+    Pre-fix (measured on the pre-fix module): a bounce writes `--remove-label
+    owner-decision` in the same call as `question-bounced`, `owner_answered_at` read
+    that `unlabeled` event as the owner's reply, and the NEXT tick printed `ANSWERED`,
+    stamped `owner-answered,answer-delivered` (a permanent skip) and cleared
+    `question-bounced` — a question the gate had just bounced became a settled
+    question nobody answered, and the lane was told a ruling existed.
+    """
+    # What the timeline looks like one tick AFTER the gate bounced the question:
+    # declaration 10:00, the gate's own bounce 10:05 (label added + queue label
+    # removed in ONE api call, hence the same timestamp), no human action at all.
+    events = [
+        ("labeled", "owner-decision", "2026-10-17T09:00:00Z"),
+        ("unlabeled", "owner-decision", "2026-10-17T10:05:00Z"),
+        ("labeled", "question-bounced", "2026-10-17T10:05:00Z"),
+    ]
+    _stub_timeline(monkeypatch, events)
+    assert ao.owner_answered_at("daniel-ospina/agent-infra", 1553) == "", \
+        "the gate's own bounce removal must not read as an owner answer"
+    rc, rec, out = _timeline_gate(monkeypatch, events)
+    assert "ANSWERED" not in out, out
+    assert rc == 1, out                       # still BOUNCED, not settled
+    assert not [c for c in rec.find("edit") if "answer-delivered" in " ".join(c)], rec.calls
+
+
+def test_an_answer_after_a_bounce_is_still_delivered(monkeypatch):
+    """The exclusion must not swallow a REAL answer: a removal newer than the bounce."""
+    events = [
+        ("unlabeled", "owner-decision", "2026-10-17T10:05:00Z"),   # the gate's bounce
+        ("labeled", "question-bounced", "2026-10-17T10:05:00Z"),
+        ("unlabeled", "owner-decision", "2026-10-17T11:30:00Z"),   # the owner, later
+    ]
+    _stub_timeline(monkeypatch, events)
+    assert ao.owner_answered_at("daniel-ospina/agent-infra", 1553) == "2026-10-17T11:30:00"
+    rc, rec, out = _timeline_gate(monkeypatch, events)
+    assert "ANSWERED" in out, out
+    assert rc == 0, out
+    assert [c for c in rec.find("edit") if "answer-delivered" in " ".join(c)], rec.calls
+
+
+# ── punctuation is not a gloss ────────────────────────────────────────────────
+
+def test_bracketing_a_reference_does_not_launder_it():
+    """A bare `(`, `[` or em dash is not an explanation.
+
+    Pre-fix: those punctuation marks satisfied the AFTER-gloss pattern on their own,
+    so wrapping each reference laundered the text — measured on this suite's own V3
+    draft, `reconciled (#1553) and re-run (`eval`)` scored jargon_free 1.0 against
+    0.25 for the identical text unbracketed. Two keystrokes defeated the mark whose
+    whole job is that a lane SIMPLIFIES instead of decorating.
+    """
+    for wrapped in (
+        "The rows were reconciled (#1553) and re-run (`eval`). See (agent-infra#1903).",
+        "The rows were reconciled [#1553] and re-run [`eval`]. See [agent-infra#1903].",
+        "The rows were reconciled — #1553 — and re-run — `eval`. See — agent-infra#1903.",
+    ):
+        score, findings = ao.jargon_free_score(wrapped)
+        counted = [tok for _, tok in findings]
+        assert score < BAR, (wrapped, score)
+        assert "#1553" in counted and "eval" in counted, (wrapped, counted)
+
+
+def test_a_bracketed_explanation_still_counts_as_explained():
+    """The same brackets OPEN a real gloss — "#1903 (the PR where …)" is explained.
+
+    This is the half that makes the fix above a tightening and not a blanket ban: the
+    reader who writes what the thing is still passes.
+    """
+    for text in (
+        "See #1903 (the PR where eight rewrites were scored).",
+        "See #1903 [the pull request where eight rewrites were scored].",
+        "See #1903 — the ticket where eight rewrites were scored.",
+        "It was measured on the script scripts/ask-owner.py, the script that scores.",
+    ):
+        score, findings = ao.jargon_free_score(text)
+        assert findings == [], (text, findings)
+        assert score == 1.0, (text, score)
+
+
+# ── `--score-file` exits with the VERDICT, not "it ran" ──────────────────────
+
+def test_score_file_exits_one_for_a_draft_the_gate_would_bounce(monkeypatch, tmp_path):
+    """The offline pre-flight must not exit 0 for a draft that bounces.
+
+    Pre-fix it returned 0 on every path, so `--score-file` — advertised as the
+    replacement for "post it to the PR and run the gate" — told a lane (or a CI step
+    branching on the exit code) that a failing draft was fine.
+    """
+    p = tmp_path / "draft.md"
+    p.write_text(V3)
+    monkeypatch.setattr(ao, "jev", lambda state: {
+        "answers": {m: {"type": "noul", "noul": 0.99} for m in ao.QUESTIONS},
+        "usage": {"cost_usd": 0.0},
+    })
+    out = io.StringIO()
+    with redirect_stdout(out):
+        rc = ao.main(["--score-file", str(p)])
+    assert rc == 1, out.getvalue()
+    assert "would BOUNCE" in out.getvalue(), out.getvalue()
+
+
+def test_score_file_exits_two_when_it_cannot_check(monkeypatch, tmp_path):
+    """No Jev key = NOT a pass (exit 2), even when the mechanical marks clear.
+
+    Pre-fix the run printed "this is NOT a pass" and then returned 0 — the
+    empty/UNKNOWN-read-as-green failure this file is built to refuse.
+    """
+    p = tmp_path / "draft.md"
+    p.write_text(V9)
+    monkeypatch.setattr(ao, "jev", lambda state: None)
+    out = io.StringIO()
+    with redirect_stdout(out):
+        rc = ao.main(["--score-file", str(p)])
+    assert rc == 2, out.getvalue()
+    assert "could not check" in out.getvalue(), out.getvalue()
+
+
+def test_score_file_exits_zero_for_a_draft_that_passes(monkeypatch, tmp_path):
+    """The pass path is unchanged: a clean draft with Jev reachable exits 0."""
+    p = tmp_path / "draft.md"
+    p.write_text(V9)
+    monkeypatch.setattr(ao, "jev", lambda state: {
+        "answers": {m: {"type": "noul", "noul": 0.99} for m in ao.QUESTIONS},
+        "usage": {"cost_usd": 0.0},
+    })
+    out = io.StringIO()
+    with redirect_stdout(out):
+        rc = ao.main(["--score-file", str(p)])
+    assert rc == 0, out.getvalue()
+
+
+# ── the offline instrument scores the same TEXT the gate sees ─────────────────
+
+def test_score_file_scores_the_same_text_as_the_gate(monkeypatch, tmp_path):
+    """One strip, not two: `--score-file` must score the text the gate scores.
+
+    Pre-fix `score_text` stripped the declaration and `language_marks` stripped it
+    again, so a question whose PROSE quotes a `RESEARCH:` line (exactly what a lane
+    does when it quotes the NO_RESEARCH template back) was scored with that line
+    removed — a reference the gate counts disappeared in the offline run, including
+    the null-pair run the owner ruling asks for.
+    """
+    # A second "RESEARCH:" line inside the prose: the declaration strip removes only
+    # the FIRST one, so the quoted one must still be visible to the mark — and it
+    # carries a reference that appears NOWHERE else, so its presence/absence in the
+    # offline output is the whole signal (a token already in the text would make this
+    # assertion pass either way).
+    text = V9 + "\nRESEARCH: see agent-infra#1903 for the measurement.\n"
+    live, _ = ao.language_marks(text)
+    p = tmp_path / "draft.md"
+    p.write_text(text)
+    monkeypatch.setattr(ao, "jev", lambda state: {
+        "answers": {m: {"type": "noul", "noul": 0.99} for m in ao.QUESTIONS},
+        "usage": {"cost_usd": 0.0},
+    })
+    out = io.StringIO()
+    with redirect_stdout(out):
+        ao.main(["--score-file", str(p)])
+    printed = out.getvalue()
+    expected = [tok for _, tok in ao.language_marks(text)[1]["jargon_free"][1]]
+    assert "agent-infra#1903" in expected, expected   # counted LIVE (one strip)
+    live_score = live["jargon_free"]["noul"]
+    assert live_score < 1.0, live
+    offline = [ln for ln in printed.splitlines() if ln.strip().startswith("jargon_free")]
+    assert offline, printed
+    assert float(offline[0].split()[-1]) == live_score, (offline, live_score, printed)
 
 
 def test_a_url_is_not_internal_shorthand():
