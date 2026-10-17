@@ -421,8 +421,16 @@ export SCOPE=own                         # drain scope: auto (default) | own | b
 #    `cd ~/orchestrator && ./install.sh` dies with "missing template" — step 1 copies only *.sh.
 bash scripts/orchestrator-harness/install.sh
 
-# 4. Start it when you mean to
-launchctl load -w ~/Library/LaunchAgents/com.eldato.orchestrator-loop.plist
+# 4. Start it when you mean to — and have the start PROVEN, not assumed.
+#    install.sh --start renders, then `launchctl enable` → `bootout` → `bootstrap` (falling back to
+#    the legacy `load` if bootstrap fails), then verifies the label has a PID **and** that
+#    ~/orchestrator/heartbeat advanced. It exits non-zero with one actionable line if either fails.
+#
+#    ⛔ NEVER `launchctl load -w` / `unload -w` here: `-w` writes a PERSISTENT Disabled override
+#    (`man launchctl`), so an unload/load pair whose bootstrap fails leaves the controller
+#    removed AND disabled, silently. Measured 2026-10-17: 48 min of dead dispatch, then 19 more
+#    (agent-infra#1975).
+bash scripts/orchestrator-harness/install.sh --start
 ```
 
 Step 3 also records **which harness commit this box runs** in `$O/.agent-infra-stamp.json`
@@ -434,10 +442,11 @@ passing, which is the intended fail-closed behaviour and not an install failure.
 # liveness / stop
 cat ~/orchestrator/heartbeat                 # epoch seconds, should be < ~5 min old
 tmux ls                                      # lane-*, chain-*, merge-*, fix-*
-launchctl unload -w ~/Library/LaunchAgents/com.eldato.orchestrator-loop.plist
 ```
 
-`install.sh --uninstall` unloads the agent and removes the plist.
+`install.sh --uninstall` removes the agent (`launchctl bootout`) and deletes the plist. It writes **no**
+persistent Disabled override, so a later `--start` is a plain start rather than a start that has to
+fight a sticky disable first.
 
 Run the offline self-test first — it needs no network, tmux server or git writes. **Every check
 exercises the shipped script** (it extracts the real classifier, `sess()`, the claim block and the
@@ -674,7 +683,8 @@ clear about what is and is not enforced:
 
 The ritual, in order — the point is that **no uncommitted work is lost**:
 
-1. `launchctl unload -w …` — so it does not restart on boot.
+1. `./install.sh --uninstall` — `bootout` + remove the plist, so it does not restart on boot and no
+   persistent Disabled override is written (which is what `unload -w` did; agent-infra#1975).
 2. `pkill -f orch-loop.sh`, then `rm -f $O/.orch.lock`.
 3. Freeze workers: `tmux kill-server` (or kill sessions individually) and check for strays.
 4. Capture every dirty worktree: `git -C <wt> diff HEAD > $O/wip/<name>.patch`, plus a
@@ -1308,13 +1318,18 @@ environment block, rendered by `install.sh` from these defaults, and that enviro
 script's own**. A job already loaded with `MAX_LOAD=16` keeps `16` no matter what `orch-loop.sh` now
 defaults to. `install.sh` overwrites the plist *file* but does not reload an already-loaded job, and
 `launchctl load -w` on a job that is already loaded does not reliably re-read it. So for a limits
-change: re-run `./install.sh`, then `launchctl unload -w <plist> && launchctl load -w <plist>` — or
-reboot, which is the only thing that reliably re-reads it — before trusting the new value.
+change: re-run `./install.sh --restart` — it re-renders, `bootout`s, `bootstrap`s and then verifies
+pid + heartbeat. (Plain `./install.sh --start` also reloads, but ONLY when the rendered plist actually
+differs, so a validation run cannot disturb a healthy controller. A plain `./install.sh` never touches
+a loaded job at all; it warns instead when the plist changed under a running controller.)
 
-⚠️ **And `launchctl unload` touches nothing when the controller was not started by launchd.** On this
+⚠️ **And `launchctl bootout` touches nothing when the controller was not started by launchd.** On this
 box the loop runs as `nohup … orch-loop.sh` from a session — `launchctl list | grep orchestrator` is
-empty even though the plist exists — so the unload/load pair is a no-op and the old process keeps the
-old limits: the operator believes a limits change took effect when it did not. Check with
+empty even though the plist exists — so a bootout/bootstrap pair is a no-op *for that process* and the
+old controller keeps the old limits: the operator believes a limits change took effect when it did not.
+`install.sh --start`/`--restart` therefore **refuses** to start while a live pid outside launchd holds
+`~/orchestrator/.orch.lock` (launchd's copy would exit at once on that lock and `KeepAlive` would
+relaunch it forever) and tells you to stop it first. Check with
 `launchctl list` before trusting the pair, and stop a session-started controller with
 `pkill -f orch-loop.sh` (§6) rather than with `launchctl`.
 
