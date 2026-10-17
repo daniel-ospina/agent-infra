@@ -4,8 +4,9 @@
 WHY THIS FILE EXISTS (the measured defect, not a hypothesis). `sh()` in
 `scripts/queue-dispatch.py` returned `(rc, stdout + stderr)`, and `lanes()` fed that
 concatenation to `json.loads`. `lane-status.py` writes its `DEGRADED` notice to STDERR on
-purpose (`lane-status.py:545`: "so stdout stays a parseable fleet read for callers that
-inspect LIVE_READABLE"), so the moment the cmux roster read degraded, the notice landed
+purpose (its `if LIVE_READABLE is False:` branch: "stderr, so stdout stays a parseable fleet
+read for callers that inspect LIVE_READABLE" — named, not numbered), so the moment the cmux
+roster read degraded, the notice landed
 INSIDE the JSON byte stream: `json.loads` raised `Extra data: line 928 column 1 (char
 276xx)` -- the fixed offset being the end of the JSON, where the stderr line began --
 `LaneReadError` was raised, and the whole dispatch pass ABORTED without dispatching

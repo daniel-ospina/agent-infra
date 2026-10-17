@@ -207,8 +207,10 @@ def sh(cmd, timeout=90):
 
     THE MERGE THAT STOPPED THE DISPATCHER (#1876). This helper used to return
     `(rc, stdout + stderr)`, and `lanes()` handed that concatenation to `json.loads`.
-    `lane-status.py` writes its `DEGRADED` notice to STDERR on purpose (`lane-status.py:545`:
-    "so stdout stays a parseable fleet read for callers that inspect LIVE_READABLE"), so the
+    `lane-status.py` writes its `DEGRADED` notice to STDERR on purpose -- its
+    `if LIVE_READABLE is False:` branch in `lanes()`, whose own comment reads "stderr, so stdout
+    stays a parseable fleet read for callers that inspect LIVE_READABLE" (⛔ NAMED, NOT NUMBERED,
+    per this file's rule: the line number a first revision cited had already rotted) -- so the
     moment the cmux roster read degraded, the notice landed INSIDE the JSON byte stream:
     `json.loads` raised `Extra data: line N column 1`, `LaneReadError` was raised, and the
     pass ABORTED without dispatching anything. MEASURED: 259 `ABORT — LANE ROSTER` lines
@@ -400,10 +402,12 @@ def lanes(scan_timeout=None):
         _tmo = float(SCAN_TIMEOUT_DEFAULT)
     rc, out, err = sh(cmd, timeout=_tmo)
     # ⛔ STDERR IS NEVER PARSED — AND NEVER SWALLOWED EITHER. `lane-status.py` puts its
-    # DEGRADED / REFUSING notices on stderr precisely so stdout stays parseable
-    # (`lane-status.py:545`); splitting the streams must not silence the alarm the split
-    # exists to protect. It is re-emitted on OUR stderr, so this process's own stdout
-    # remains a clean summary a caller can read, and the abort reasons below quote it.
+    # DEGRADED / REFUSING notices on stderr precisely so stdout stays parseable (its
+    # `if LIVE_READABLE is False:` branch: "stderr, so stdout stays a parseable fleet read for
+    # callers that inspect LIVE_READABLE" — named, not numbered); splitting the streams must
+    # not silence the alarm the split exists to protect. It is re-emitted on OUR stderr, so this
+    # process's own stdout remains a clean summary a caller can read, and the abort reasons
+    # below quote it.
     # ⛔ AND ONLY WHEN `rc IS NOT None`: on a kill, `err` is THIS FILE'S OWN `"(timeout)"`
     # sentinel, not lane-status output, so echoing it here printed
     # `queue-dispatch: lane-status stderr: (timeout)` — attributing our own timeout to the
