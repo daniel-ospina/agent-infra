@@ -49,6 +49,12 @@ chmod +x "$REAL"
 # which is the real one — the tests would then read live GitHub state instead of
 # the fixture (and silently pass for the wrong reason).
 export AGENT_GH_REAL="$REAL"
+# The fleet courtesy gate (#1910) runs on EVERY call the shim makes, so the suite gets its
+# own state dir (never the operator's `~/.pi/agent/gh-gate`) and no spacing: the pacing
+# ARMS in §13 set both knobs themselves, with real timings. Everything else exercises the
+# gate's transparent path, which must not add latency to the assertions above.
+export AGENT_GH_GATE_DIR="$TMP/gate"
+export AGENT_GH_GATE_INTERVAL_MS=0
 
 export SCEN=""
 new_scen() {
@@ -627,6 +633,226 @@ bash "$SHIM" ship-it 123 >/dev/null 2>"$TMP/err"; rc=$?
 [ "$rc" -eq 0 ] && grep -q "^ship-it 123$" "$SCEN/calls" \
   && pass "STATED LIMIT (declared, not closed): an alias-shaped argv passes through to gh" \
   || fail "the alias pass-through changed shape — revisit the declared limit"
+
+# ── 13. THE FLEET COURTESY GATE (#1910) ─────────────────────────────────────
+# The account's SECONDARY limit is a CONCURRENCY limit shared across every machine, and
+# `GET /rate_limit` reports only the primary budget — so a healthy `graphql.remaining`
+# beside a refused call is the documented blind spot, not a contradiction. These arms
+# pin the four mechanisms by their observable behaviour, with real timings:
+#   13(a) at most MAX_INFLIGHT gh processes per machine,
+#   13(b) a minimum interval between call STARTS,
+#   13(c) `retry-after` is honoured (and the retry is never immediate),
+#   13(d) with no `retry-after`, the wait is the documented >=60 s,
+#   13(e) a burst of N lanes produces ONE refusal-and-wait, not N failures (the AC),
+#   13(f) the gate never asks `rate_limit` how healthy the account is,
+#   13(g) a non-rate-limit 403 is NOT retried (a mutating command must not run twice).
+echo "== 13. the fleet courtesy gate: bounded concurrency, spacing, 403/429 handling (#1910) =="
+
+# A hermetic gate state per arm: never the operator's ~/.pi/agent/gh-gate.
+gate_dir() { local d="$TMP/gate-$1"; rm -rf "$d"; mkdir -p "$d"; printf '%s' "$d"; }
+
+# (a) BOUNDED CONCURRENCY. The fake gh holds a marker file for 0.4 s so overlap is
+#     measurable; a sampler records the highest count seen. 4 lanes, cap 2 → 2, never 4.
+GDIR="$(gate_dir conc)"; GACTIVE="$TMP/gate-conc-active"; rm -rf "$GACTIVE"; mkdir -p "$GACTIVE"
+GREAL="$TMP/gate-real-conc"
+cat > "$GREAL" <<'GHEOF'
+#!/usr/bin/env bash
+: > "$GACTIVE/$$"
+sleep 0.4
+rm -f "$GACTIVE/$$"
+exit 0
+GHEOF
+chmod +x "$GREAL"
+(
+  maxc=0; i=0
+  while [ "$i" -lt 60 ]; do
+    n=$(ls "$GACTIVE" 2>/dev/null | wc -l)
+    [ "$n" -gt "$maxc" ] && maxc="$n"
+    printf '%s' "$maxc" > "$TMP/gate-conc-max"
+    sleep 0.05; i=$(( i + 1 ))
+  done
+) &
+sampler=$!
+gpids=""
+for _lane in 1 2 3 4; do
+  GACTIVE="$GACTIVE" AGENT_GH_REAL="$GREAL" AGENT_GH_GATE_DIR="$GDIR" \
+    AGENT_GH_GATE_MAX_INFLIGHT=2 AGENT_GH_GATE_INTERVAL_MS=0 \
+    bash "$SHIM" api user >/dev/null 2>&1 &
+  gpids="$gpids $!"
+done
+for p in $gpids; do wait "$p"; done
+kill "$sampler" 2>/dev/null; wait "$sampler" 2>/dev/null
+maxc="$(cat "$TMP/gate-conc-max" 2>/dev/null || echo 0)"
+[ "${maxc:-0}" -le 2 ] && [ "${maxc:-0}" -ge 1 ] \
+  && pass "4 parallel lanes with MAX_INFLIGHT=2 → at most 2 gh processes in flight (saw $maxc)" \
+  || fail "the concurrency bound did not hold: saw $maxc in flight with a cap of 2"
+[ -z "$(ls "$GDIR/slots" 2>/dev/null | head -1)" ] \
+  && pass "  …and every slot was released (no leak to wedge the next lane)" \
+  || fail "  …but slots were left behind: $(ls "$GDIR/slots")"
+
+# (b) SPACING. Three calls, interval 1 s (a whole second on purpose: the assertion then
+#     holds whatever the clock's granularity, and `date +%s` is portable to macOS).
+GDIR="$(gate_dir spacing)"; GTIMES="$TMP/gate-times"; : > "$GTIMES"
+GREAL="$TMP/gate-real-time"
+cat > "$GREAL" <<'GHEOF'
+#!/usr/bin/env bash
+date +%s >> "$GTIMES"
+exit 0
+GHEOF
+chmod +x "$GREAL"
+for _lane in 1 2 3; do
+  GTIMES="$GTIMES" AGENT_GH_REAL="$GREAL" AGENT_GH_GATE_DIR="$GDIR" AGENT_GH_GATE_INTERVAL_MS=1000 \
+    bash "$SHIM" api user >/dev/null 2>&1
+done
+spacing_ok=1
+prev=""
+while read -r t; do
+  [ -z "$prev" ] && { prev="$t"; continue; }
+  [ $(( t - prev )) -ge 1 ] || spacing_ok=0
+  prev="$t"
+done < "$GTIMES"
+[ "$spacing_ok" -eq 1 ] && [ "$(wc -l < "$GTIMES")" -ge 3 ] \
+  && pass "3 sequential calls at INTERVAL_MS=1000 → every gap is a full second (serialised)" \
+  || fail "the minimum interval was not enforced: starts were $(tr '\n' ' ' < "$GTIMES")"
+
+# (c) `retry-after` IS HONOURED, and the retry is NEVER immediate. The fake refuses once,
+#     asks for 1 s, then succeeds. The gap between the two attempts must be ~1 s — an
+#     immediate identical retry is the `3/3 attempts, identical` loop #1762 recorded.
+GDIR="$(gate_dir retryafter)"; GTIMES="$TMP/gate-429-times"; GCOUNT="$TMP/gate-429-count"
+: > "$GTIMES"; rm -f "$GCOUNT"
+GREAL="$TMP/gate-real-429"
+cat > "$GREAL" <<'GHEOF'
+#!/usr/bin/env bash
+n=$(cat "$GCOUNT" 2>/dev/null || echo 0); n=$(( n + 1 )); printf '%s' "$n" > "$GCOUNT"
+date +%s >> "$GTIMES"
+if [ "$n" -eq 1 ]; then
+  echo "HTTP 403: API rate limit already exceeded for user ID 12345. (retry-after: 1) (https://api.github.com/graphql)" >&2
+  exit 1
+fi
+echo "attempt $n"
+exit 0
+GHEOF
+chmod +x "$GREAL"
+AGENT_GH_REAL="$GREAL" AGENT_GH_GATE_DIR="$GDIR" AGENT_GH_GATE_INTERVAL_MS=0 \
+  GCOUNT="$GCOUNT" GTIMES="$GTIMES" \
+  bash "$SHIM" api graphql -f query=x >"$TMP/gate-429-out" 2>"$TMP/gate-429-err"; rc=$?
+att1=$(sed -n '1p' "$GTIMES"); att2=$(sed -n '2p' "$GTIMES")
+if [ "$rc" -eq 0 ] && [ "$(cat "$GCOUNT")" -eq 2 ] && [ -n "$att2" ] \
+   && [ $(( att2 - att1 )) -ge 1 ]; then
+  pass "403 + \`retry-after: 1\` → retried once after the required wait (${att1}→${att2}), then succeeded"
+else
+  fail "the 403 retry did not honour \`retry-after\` (rc=$rc attempts=$(cat "$GCOUNT" 2>/dev/null) starts='$(tr '\n' ' ' < "$GTIMES")')"
+fi
+grep -q 'waiting 1s' "$TMP/gate-429-err" \
+  && pass "  …and it announced the wait (a silent 60 s sleep is indistinguishable from a hang)" \
+  || fail "  …but the wait was not announced: $(head -2 "$TMP/gate-429-err" | tr '\n' ' ')"
+grep -q 'attempt 2' "$TMP/gate-429-out" \
+  && pass "  …and stdout of the retried attempt is what the caller sees" \
+  || fail "  …but the retried attempt's stdout was lost: $(cat "$TMP/gate-429-out")"
+
+# (d) NO `retry-after` → the documented >=60 s, not an immediate retry. A 60 s sleep cannot
+#     be waited out in a suite, so this pins the ANNOUNCED wait (the number the gate would
+#     sleep) by intercepting the call after the announcement: the shim is stopped while it
+#     sleeps, and the announcement is what is asserted.
+GDIR="$(gate_dir noretryafter)"; GCOUNT="$TMP/gate-60-count"; rm -f "$GCOUNT"
+GREAL="$TMP/gate-real-60"
+cat > "$GREAL" <<'GHEOF'
+#!/usr/bin/env bash
+n=$(cat "$GCOUNT" 2>/dev/null || echo 0); n=$(( n + 1 )); printf '%s' "$n" > "$GCOUNT"
+echo "API rate limit exceeded for user ID 12345." >&2
+exit 1
+GHEOF
+chmod +x "$GREAL"
+AGENT_GH_REAL="$GREAL" AGENT_GH_GATE_DIR="$GDIR" AGENT_GH_GATE_INTERVAL_MS=0 \
+  GCOUNT="$GCOUNT" \
+  bash "$SHIM" api graphql -f query=x >/dev/null 2>"$TMP/gate-60-err" &
+slow=$!
+sleep 3
+kill "$slow" 2>/dev/null
+for _child in $(pgrep -P "$slow" 2>/dev/null); do kill "$_child" 2>/dev/null; done
+wait "$slow" 2>/dev/null
+grep -q 'waiting 60s' "$TMP/gate-60-err" \
+  && pass "no \`retry-after\` → waits 60 s (GitHub's own guidance), never an immediate retry" \
+  || fail "the no-header wait is not the documented 60 s: $(head -2 "$TMP/gate-60-err" | tr '\n' ' ')"
+[ "$(cat "$GCOUNT" 2>/dev/null || echo 0)" -eq 1 ] \
+  && pass "  …and no second attempt was issued inside the first 3 s (it was waiting, not retrying)" \
+  || fail "  …but a second attempt was issued before the wait elapsed"
+
+# (e) THE ACCEPTANCE: a burst of N lanes produces ONE refusal-and-wait, not N failures.
+#     Window: a rate-limit refusal for the first 1.2 s (wide enough that a loaded box still
+#     lands the first call inside it), then success. 5 lanes, cap 1. The refusal must be
+#     taken by exactly ONE lane; the shared cooldown (2 s here, longer than the window) is
+#     what holds the other four back, and they must all end at rc=0.
+GDIR="$(gate_dir burst)"; GLIMIT="$TMP/gate-limit"; GREF="$TMP/gate-refusals"
+: > "$GLIMIT"; : > "$GREF"
+GREAL="$TMP/gate-real-burst"
+cat > "$GREAL" <<'GHEOF'
+#!/usr/bin/env bash
+if [ -e "$GLIMIT" ]; then
+  echo R >> "$GREF"
+  echo "API rate limit already exceeded for user ID 12345. (retry-after: 2)" >&2
+  exit 1
+fi
+sleep 0.05
+exit 0
+GHEOF
+chmod +x "$GREAL"
+( sleep 1.2; rm -f "$GLIMIT" ) &
+window=$!
+gpids=""
+for _lane in 1 2 3 4 5; do
+  GLIMIT="$GLIMIT" GREF="$GREF" AGENT_GH_REAL="$GREAL" AGENT_GH_GATE_DIR="$GDIR" \
+    AGENT_GH_GATE_MAX_INFLIGHT=1 AGENT_GH_GATE_INTERVAL_MS=0 \
+    bash "$SHIM" api user >/dev/null 2>>"$TMP/gate-burst-err" &
+  gpids="$gpids $!"
+done
+burst_rcs=""
+for p in $gpids; do wait "$p"; burst_rcs="$burst_rcs $?"; done
+wait "$window" 2>/dev/null
+refusals=$(grep -c . "$GREF" 2>/dev/null || true)
+case "$burst_rcs" in
+  *[!0\ ]*) all_ok=0 ;;
+  *) all_ok=1 ;;
+esac
+[ "${refusals:-0}" -eq 1 ] \
+  && pass "5 parallel lanes hitting ONE refusal window → exactly 1 refusal (not 5)" \
+  || fail "the burst was not absorbed by the shared cooldown: $refusals refusal(s), expected 1"
+[ "$all_ok" -eq 1 ] \
+  && pass "  …and all 5 lanes finished rc=0 (one refusal-and-wait, no lane failed)" \
+  || fail "  …but some lanes failed: rc list '$burst_rcs'"
+
+# (f) THE GATE's HEALTH SIGNAL IS ITS OWN IN-FLIGHT COUNT. `GET /rate_limit` reports only
+#     the primary budget, so asking it would be exactly the #1762 mistake. Pin that no
+#     executed line of the shim references the ENDPOINT (header prose may; the code may
+#     not). The pattern excludes the gate's own `rate_limited` helper, which is this file's
+#     own function name and says nothing about the API.
+rl_refs=$(grep -v '^[[:space:]]*#' "$SHIM" | grep -cE 'rate_limit([^a-z_]|$)' || true)
+[ "${rl_refs:-1}" -eq 0 ] \
+  && pass "no executed line consults \`rate_limit\` — the gate's own slot count is the signal" \
+  || fail "the shim's CODE now reads rate_limit ($rl_refs reference(s)) — it cannot see the secondary limit"
+
+# (g) A NON-rate-limit 403 IS NOT RETRIED. A permissions failure is not a burst, and
+#     retrying a mutating command would run it twice.
+GDIR="$(gate_dir perm403)"; GCOUNT="$TMP/gate-403-count"; rm -f "$GCOUNT"
+GREAL="$TMP/gate-real-403"
+cat > "$GREAL" <<'GHEOF'
+#!/usr/bin/env bash
+n=$(cat "$GCOUNT" 2>/dev/null || echo 0); n=$(( n + 1 )); printf '%s' "$n" > "$GCOUNT"
+echo "HTTP 403: Resource not accessible by integration (https://api.github.com/x)" >&2
+exit 1
+GHEOF
+chmod +x "$GREAL"
+AGENT_GH_REAL="$GREAL" AGENT_GH_GATE_DIR="$GDIR" AGENT_GH_GATE_INTERVAL_MS=0 \
+  GCOUNT="$GCOUNT" \
+  bash "$SHIM" pr create --title x --body y >/dev/null 2>"$TMP/gate-403-err"; rc=$?
+if [ "$rc" -ne 0 ] && [ "$(cat "$GCOUNT")" -eq 1 ]; then
+  pass "a permissions 403 → refused, forwarded, and NOT retried (1 attempt, rc=$rc)"
+else
+  fail "a permissions 403 was retried or swallowed (rc=$rc attempts=$(cat "$GCOUNT" 2>/dev/null))"
+fi
+grep -q 'Resource not accessible' "$TMP/gate-403-err" \
+  && pass "  …and gh's own message still reaches the caller" \
+  || fail "  …but the real error text was lost"
 
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks gh-shim test(s) failed"
