@@ -2825,10 +2825,16 @@ export default function (pi: ExtensionAPI) {
     // ── State ──────────────────────────────────────
     let extensionEnabled = true;
     let dispatchCount = 0;
+    // #1662 review: run_ids whose terminal `task_collect` already counted as a
+    // reviewer dispatch. `task_collect` is idempotent (the same terminal run
+    // can be reaped repeatedly), so without this a repeated collect inflates
+    // the ≥1-dispatch count and the durable `review_dispatch` audit total.
+    const countedCollectRuns = new Set<string>();
 
     // ── session_start ──────────────────────────────
     pi.on("session_start", async (_event, _ctx) => {
       dispatchCount = 0;
+      countedCollectRuns.clear();
 
       // Warn about env vars that never reach Node.js from bash export
       // (these have no effect — tier is read from marker file, skip gate from escape hatch)
@@ -2885,6 +2891,7 @@ export default function (pi: ExtensionAPI) {
     // ── session_shutdown ───────────────────────────
     pi.on("session_shutdown", async (_event, _ctx) => {
       dispatchCount = 0;
+      countedCollectRuns.clear();
       // Clear marker file to prevent persistent state leakage across sessions
       try {
         if (fs.existsSync(ISSUE_COMPLEXITY_FILE)) {
@@ -3154,7 +3161,24 @@ export default function (pi: ExtensionAPI) {
       // docs-only micro change reviewed via the `subagent` tool must not
       // false-block post-flip (micro relies on this counter as its only gate;
       // VGATE is shape-exempt and code review is skipped at micro).
-      if (event.toolName !== "task" && event.toolName !== "subagent") return undefined;
+      // #1662: a `task({ background: true })` dispatch returns at DISPATCH, not
+      // completion — counting it would satisfy the ≥1-dispatch gate while the
+      // reviewer is still running (a fail-open on the git-op gate). Count the
+      // reviewer when its verdict is actually reaped: the terminal
+      // `task_collect`. The returns-early notice and a not-finished collect are
+      // both ignored.
+      const reviewDetails = (event as { details?: { background?: boolean; terminal?: boolean; run_id?: string } }).details;
+      // #1662 review: the pre-spawn refusal / halted-chain / invalid-session-id
+      // results are built BEFORE the background branch, so they carry NO
+      // `details.background` — a refused `task({ background: true })` would then
+      // fall through and `dispatchCount++`, satisfying the ≥1-dispatch gate for a
+      // child that was never created. Read the tool INPUT too (the same dual
+      // signal `verification-gate` uses), so every background result —
+      // dispatched, refused, or halted — is recognised as background.
+      const reviewInput = (event as { input?: { background?: boolean } }).input;
+      const isTerminalCollect =
+        event.toolName === "task_collect" && reviewDetails?.terminal === true;
+      if (event.toolName !== "task_collect" && event.toolName !== "subagent" && event.toolName !== "task") return undefined;
       // #285 P2: task sub-agents never count dispatches — review DISPATCH is
       // parent-enforced (#825), and their own in-band [VGATE] dispatches must
       // not be counted/audited as review dispatches. (Today they never reach
@@ -3162,6 +3186,20 @@ export default function (pi: ExtensionAPI) {
       // this early return is what keeps the noise out.)
       if (isTaskSubAgent()) return undefined;
       if (!extensionEnabled) return undefined;
+      if (event.toolName === "task_collect" && !isTerminalCollect) return undefined;
+      if (reviewDetails?.background === true || reviewInput?.background === true) return undefined;
+      // #1662 review: `task_collect` is idempotent — every result carries the
+      // `run_id` it reaped (`details: view`). Count each run's verdict once, so
+      // re-collecting a finished lane cannot inflate the dispatch total (and
+      // the durable review_dispatch audit count) past the real dispatches.
+      if (isTerminalCollect) {
+        const collectRunId =
+          typeof reviewDetails?.run_id === "string" ? reviewDetails.run_id : "";
+        if (collectRunId) {
+          if (countedCollectRuns.has(collectRunId)) return undefined;
+          countedCollectRuns.add(collectRunId);
+        }
+      }
 
       dispatchCount++;
       console.log(

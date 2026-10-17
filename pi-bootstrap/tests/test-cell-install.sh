@@ -568,6 +568,11 @@ EMPTY_EXT="$TMP/empty-ext-checkout"
 mkdir -p "$EMPTY_EXT/extensions" "$EMPTY_EXT/pi-bootstrap/pi-config"
 for d in scripts skills templates tools manifest.json; do ln -s "$ROOT/$d" "$EMPTY_EXT/$d"; done
 ln -s "$ROOT/pi-bootstrap/setup.sh" "$EMPTY_EXT/pi-bootstrap/setup.sh"
+# #1924: the UNFARM leg lives beside setup.sh ($INFRA_ROOT/pi-bootstrap/lib/farm-retire.sh)
+# and reads its declared retirements from $INFRA_ROOT/pi-bootstrap/farm-retired.txt, so a
+# checkout-shaped fixture has to carry both — a real checkout does.
+ln -s "$ROOT/pi-bootstrap/lib" "$EMPTY_EXT/pi-bootstrap/lib"
+ln -s "$ROOT/pi-bootstrap/farm-retired.txt" "$EMPTY_EXT/pi-bootstrap/farm-retired.txt"
 cp -R "$ROOT/pi-bootstrap/pi-config/." "$EMPTY_EXT/pi-bootstrap/pi-config/"
 for d in "$ROOT"/extensions/*; do
   b="$(basename "$d")"; [ "$b" = review-enforcer ] && continue
@@ -684,6 +689,8 @@ FAKE_CFG="$TMP/no-settings-checkout"
 mkdir -p "$FAKE_CFG/pi-bootstrap/pi-config"
 for d in scripts extensions skills templates tools manifest.json; do ln -s "$ROOT/$d" "$FAKE_CFG/$d"; done
 ln -s "$ROOT/pi-bootstrap/setup.sh" "$FAKE_CFG/pi-bootstrap/setup.sh"
+ln -s "$ROOT/pi-bootstrap/lib" "$FAKE_CFG/pi-bootstrap/lib"                 # #1924 the UNFARM leg
+ln -s "$ROOT/pi-bootstrap/farm-retired.txt" "$FAKE_CFG/pi-bootstrap/farm-retired.txt"   # #1924 its declaration
 cp -R "$ROOT/pi-bootstrap/pi-config/." "$FAKE_CFG/pi-bootstrap/pi-config/"
 rm -f "$FAKE_CFG/pi-bootstrap/pi-config/settings.json"   # ONLY settings.json: the five loop sources are present
 out="$(CELL_HOME="$TMP/nosettings-home" INFRA_ROOT="$FAKE_CFG" PATH="$FAKEBIN:$PATH" bash "$INSTALLER" --install 2>&1)"
@@ -793,12 +800,17 @@ hdr "run 7: a silently SHRUNK farm parse is refused, never verified clean"
 # the wrong ')', a renamed array) installs FEWER files and then verifies clean against its own
 # truncated reading — the instrument agreeing with itself. The floor is what makes it loud.
 FAKE="$TMP/fake-infra"
-mkdir -p "$FAKE/pi-bootstrap" "$FAKE/scripts/checkout-hygiene" "$FAKE/extensions"
+mkdir -p "$FAKE/pi-bootstrap/lib" "$FAKE/scripts/checkout-hygiene" "$FAKE/extensions"
 {
   echo '#!/bin/bash'
   echo 'fleet_srcs=(record-review.sh)'
   echo 'scripts_dir="$INFRA_ROOT/scripts/checkout-hygiene"'
 } > "$FAKE/pi-bootstrap/setup.sh"
+# A checkout only counts if it carries the UNFARM leg (#1924). Without these two files the
+# resolver correctly declines $FAKE and falls back to this repo — so the case would install
+# the REAL farm and prove nothing about the floor.
+cp "$ROOT/pi-bootstrap/lib/farm-retire.sh" "$FAKE/pi-bootstrap/lib/farm-retire.sh"
+printf '# no retirements\n' > "$FAKE/pi-bootstrap/farm-retired.txt"
 cp "$ROOT/scripts/record-review.sh" "$FAKE/scripts/record-review.sh"
 echo "# stub" > "$FAKE/scripts/checkout-hygiene/hub-state-check.sh"
 cp "$MANIFEST" "$FAKE/manifest.json"
@@ -821,6 +833,8 @@ SKHOME="$TMP/skills-checkout-home"
 mkdir -p "$SK/pi-bootstrap/pi-config" "$SK/extensions" "$SK/skills"
 for d in scripts templates tools manifest.json; do ln -s "$ROOT/$d" "$SK/$d"; done
 ln -s "$ROOT/pi-bootstrap/setup.sh" "$SK/pi-bootstrap/setup.sh"
+ln -s "$ROOT/pi-bootstrap/lib" "$SK/pi-bootstrap/lib"                 # #1924 the UNFARM leg
+ln -s "$ROOT/pi-bootstrap/farm-retired.txt" "$SK/pi-bootstrap/farm-retired.txt"   # #1924 its declaration
 cp -R "$ROOT/pi-bootstrap/pi-config/." "$SK/pi-bootstrap/pi-config/"
 for d in "$ROOT"/extensions/*; do b="$(basename "$d")"; ln -s "$d" "$SK/extensions/$b"; done
 cp -R "$ROOT/skills/." "$SK/skills/"
