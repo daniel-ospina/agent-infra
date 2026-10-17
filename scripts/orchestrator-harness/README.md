@@ -608,6 +608,10 @@ off macOS (it renders a launchd plist) — the portability that matters is `orch
    ⛔ **This is a partition, not coordination.** Ownership is still inferred from *local*
    branches/worktrees, which are invisible across boxes, so two `own`-pinned boxes can still race
    the same PR (§7.2b, tortoise#5052) — the pin must not be mistaken for a claim registry.
+   ⛔ **And it is not the cross-box barrier for any operation.** It selects PR branches by naming
+   convention, which every box shares; what excludes a concurrent holder is the claim registry, now
+   measured per operation in **§7.2d** (agent-infra#1908). That measurement retires the pin's
+   *safety* role for dispatch and review and keeps an exclusion requirement on the landing row.
 4. **Drafts are deliberately excluded** from the sweep — a peer's draft PR is not yours to
    merge. The cost is that a *peer's* draft stalls until they ready it. Our **own** lanes' drafts do
    not: the sweep selects drafts whose branch matches the harness's own patterns (`*-tm`, `*-cap`,
@@ -822,7 +826,8 @@ live under `refs/claims-tmp/*`, **not** the pruned `refs/claims-cache/*` namespa
 purpose** — if the claim store is unreachable the harness proceeds and logs it — because
 agent-infra#1709's headline finding is that duplicate execution is unavoidable and the side effects
 must be idempotent per head, so failing closed would stall the whole fleet on one transient error.
-`SCOPE=own` (§5, item 3) remains a useful partition but is no longer the only cross-box barrier.
+`SCOPE=own` (§5, item 3) remains a useful partition but is no longer the only cross-box barrier —
+and §7.2d measures what the barrier actually covers, per operation.
 
 ### 7.2d ISSUE dispatch was the uncovered window — **FIXED in agent-infra#1850**
 
@@ -936,7 +941,70 @@ box has re-acquired and overwritten the record.
 (`orch-loop.sh`'s `claim_live` keeps a fourth deliberately: it reads the local SNAPSHOT rather than a
 ref and `selftest.sh` extracts it standalone, so it cannot share an in-process helper.)
 
-### 7.2d A refresh that cannot READ the pool reported an empty queue — **FIXED in agent-infra#1931**
+### 7.2d Does a claim EXCLUDE? — **MEASURED, per operation** (agent-infra#1908)
+
+agent-infra#1908 held the retirement of the `SCOPE=own` partition **conditional**: retire it only
+once a claim is *demonstrated* to exclude a concurrent holder, and only for the operations that
+tolerate at-least-once. A registry that exists is not that demonstration — #1850 landed the **code**,
+and a claim had never been observed refusing anything under real contention. `claim-exclusion.test.sh`
+is the measurement, and this section is its recorded output. **This table is copied from that suite**;
+if a row changes polarity the suite goes red and names the row, so it cannot go stale silently.
+
+```bash
+./claim-exclusion.test.sh                 # hermetic: a throwaway bare origin, the CI form
+./claim-exclusion.test.sh --origin live   # THIS checkout's origin, in a $$-scoped namespace
+```
+
+**What it actually does, and its limit.** It releases **N independent processes** (default 6) at a
+barrier against a **real `git receive-pack`**, each presenting as a different box through
+`CLAIM_OWNER_ID`, so the CAS is genuinely raced rather than replayed sequentially. Each racer waits
+`n × 3 ms` after the barrier: released in the same microsecond, every push contends for the same
+`<ref>.lock` and the losers are refused by **git's ref lock** before they ever reach the CAS —
+measured by forcing the create push and still getting exactly one winner, which would have let a
+defeated CAS report EXCLUDES. Two boxes are never that synchronised, so the stagger measures the case
+the CAS has to handle. **Non-vacuity, measured:** with the stagger in place, pointing `CLAIMS_SH` at
+a copy of `claims.sh` whose create push is forced (`push -q --force`) reddens **M2** with
+`2 winners in one lap`, while the shipped `claims.sh` is 15/15 green — so the suite discriminates a
+defeated CAS from an exclusive one. **Limit, stated:** the default origin is a bare
+repo in the sandbox, so this measures ref-update atomicity, not the network. `--origin live` closes
+that gap on demand (it leaves no claim ref and no probe branch behind — the trap deletes both).
+
+| operation | claim key | duplicate behaviour MEASURED | tolerates at-least-once? |
+|---|---|---|---|
+| **dispatch** (start a fixer/reviewer) | `refs/claims/issue-<N>` | 3/3 laps × 6 racers: **exactly one** winner per lap; every loser gets rc=1 and is told *who* holds it (`held by box2:1529071 until …`) | **yes** — side effects are idempotent |
+| **review / record evidence** | `refs/claims/<PR>-<sha12>` | 3/3 laps × 6 racers: **exactly one** winner; loser refused | **yes** — the cost of a duplicate is a duplicate comment |
+| **landing: the same head** | `refs/claims/<PR>-<sha12>` | the same CAS as review; the second worker exits **before** it reviews or merges (`merge-one.sh`, `CROSS_RC=1`) | **only for that head** |
+| **landing: the PR moved to a new head** | `<PR>-<sha12>` — **a different key** | **both acquire.** Measured: an issue/PR claim is content-addressed on the HEAD, so two heads of ONE PR are two distinct CASes and the claim cannot express *"this PR"* | **NO — see below** |
+| **fencing** (release / stale write) | the ref's **value** | a loser's release is refused (rc=1, ref unchanged); a **fast-forwardable** push leased on a stale base is refused — by the lease, not by non-fast-forward | n/a — a fence, not a claim |
+
+**So, per operation:**
+
+- **Dispatch and review are retired from the `SCOPE=own` question.** The measurement shows the claim
+excludes, on both keys, under real concurrency — and `SCOPE=own` was **never** what excluded them:
+it selects which *PR branches* this box's **sweep** looks at (`*-tm`, `*-cap`, `fix/*`), by a naming
+convention every box shares, so two `own`-pinned boxes select the same PRs. The code has said so
+since the pin was added (§5 item 3, "a partition, not coordination"); the measurement now says the
+claim covers those two classes without it.
+- **Landing is NOT retired, and must not be.** The claim is per-head. Two boxes at two heads of one
+PR hold **two live claims** and both proceed toward a merge of the same PR. `SCOPE=own` does not
+cover that either (it is a selection filter, and the PR is in both boxes' selection), so this row
+keeps an **exclusion requirement that nothing in the harness currently satisfies**. Naming the row
+that justifies keeping it is the whole point: *landing: the PR moved to a new head*
+(**agent-infra#1952** carries the decision: add a per-PR exclusion, or exempt the row explicitly).
+- **What the merge path does have, and what it does not.** `merge-one.sh` re-reads `LIVE_HEAD` before
+merging and requires a **signed marker for that live head**, so the merged content is at least the
+head some reviewer signed. It does **not** pin `gh pr merge` to a sha, so the guard is a read, not a
+fence, and the window between the two is real. ⛔ **That last sentence is read from the code, not
+measured** — exercising `gh pr merge` on a moved head needs GitHub, so it is not claimed as a
+measured merge outcome here.
+
+**For §0.3/§0.4/§0.5 when they land.** Those sections (the requirements and the keep/legacy
+inventory, agent-infra#1905) are not on `main` yet, so this section — not them — is the source of
+record for the measurement today. §0.4's "at-least-once with idempotent side effects" is accurate for
+the **dispatch** and **review** rows and **not** for the landing row; §0.5's `SCOPE=own` row may move
+from *retired* to *retired, see measurement* for the first two and must not for the third.
+
+### 7.2e A refresh that cannot READ the pool reported an empty queue — **FIXED in agent-infra#1931**
 
 `backlog=0` was the same line whether the pool had been read and was empty or the pool listing had
 **failed**. Measured 2026-10-17: a cell refused on **131 consecutive passes** (its abort was correct)
@@ -1170,6 +1238,8 @@ algorithmic advantage. The claim worth evaluating is *utilisation*, not *efficie
 | `selftest.sh` | offline checks; each one drives the shipped code. Not part of the loop |
 | `test-gates.sh` | the `mp_reason` dispatch-gate rule table, extracted from the shipped `orch-loop.sh`. Not part of the loop |
 | `test-claims.sh` | the PR **and issue** claim CAS against live origin from two scratch repos (`git init` + `remote add`, not clones; random keys per run so concurrent runs cannot collide). Not the cross-box proof (one machine), but red on a defeated CAS. Not part of the loop |
+| `claim-exclusion.test.sh` | **the measurement:** N processes released at a barrier against a real (bare) origin, per operation class, answering *does a duplicate holder get refused*. Prints the table §7.2d records; hermetic, a CI shard |
+| `gh-rest.test.sh` | the `gh` REST adapter's argv-to-argv **TRANSLATION**, offline against a stub `gh`: `pr list --head` must not widen to the newest open PR and `pr comment` must print a URL (both shipped green once, as P0s, when nothing asserted them). Hermetic, a CI shard |
 | `test-crossbox.sh` | drives the real `merge-one.sh` claim acquire + trap release with `gh` stubbed. Not part of the loop |
 | `refresh-scout.test.sh` | the agent-infra#1736 contract — repo-aware scout provisioning, per-repo tool resolution, the permanent/transient refresh split — plus the agent-infra#1850 issue-claim pre-flight verdict table (CLEAN/COLLISION/INCOMPLETE/NOT PROVISIONABLE/unrecognised), the dispatch-side claim, and the fenced + generation-guarded release. Not part of the loop |
 | `check-port-drift.sh` | gates the tortoise-side removal: fails if the tortoise harness moved past the pinned sync point (`port-provenance.txt`). Not part of the loop |
