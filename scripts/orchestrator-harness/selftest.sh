@@ -499,11 +499,16 @@ fi
 awk '/^# ── THE LISTINGS RUN ON THE REST BUCKET/{f=1} f{print} f&&/^fi$/{c++; if(c==2) exit}' "$REFRESH" > "$TMP/acq.sh"
 if need "$TMP/acq.sh" "the listing capture (with its REST helper) is extracted from the shipped refresh-candidates.sh"; then
   A="$TMP/acq"; mkdir -p "$A/fail" "$A/ok"
+  # ⛔ THE STUB ANSWERS IN `gh api -i` SHAPE, because that is what the shipped helper reads. It parses
+  # the response HEADERS (the `Link` header decides whether the collection ended) and only accepts an
+  # EMPTY body when the status line says 204 — a bare `exit 0` would look like a 200 with no body,
+  # which is refused on purpose (a vanished body is not "no rows": it would write an EMPTY `.pr_brs`).
+  # So "a successful empty listing" is `200` + `[]`, which is exactly what GitHub returns.
   cat > "$A/gh" <<'SH'
 #!/bin/bash
 case "${GH_MODE:-}" in
   fail) echo 'gh: could not reach api.github.com' >&2; exit 1 ;;
-  ok)   exit 0 ;;
+  ok)   printf 'HTTP/2.0 200 OK\r\ncontent-type: application/json\r\n\r\n[]\n' ;;
 esac
 SH
   chmod +x "$A/gh"

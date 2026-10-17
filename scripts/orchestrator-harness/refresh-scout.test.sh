@@ -1793,24 +1793,34 @@ else
   bad "dispatch-merge: could not extract the chain-failure branch (or it no longer releases)"
 fi
 
-# ── 12) THE LISTINGS DRAW ON THE REST BUCKET, so a starved GraphQL bucket cannot empty the
-#        backlog — and a failed REST listing must FAIL, not write a short one (#1962) ────
+# ── 12) THE LISTINGS DRAW ON THE REST BUCKET, so a starved GraphQL bucket no longer starves the
+#        READ — and a failed REST listing must FAIL, not write a short one (#1962) ────────
 # THE MEASURED DEFECT. On all three cloud cells, for hours: `gh issue list` / `gh pr list` (GraphQL)
 # answered `GraphQL: API rate limit already exceeded for user ID 81560491.` — one account, four boxes,
 # one bucket — so every priority tier FAILED, the pass aborted UNREADABLE, and `candidates.txt` stayed
-# at 0 lines. The cells could not dispatch because the READ that feeds dispatch had no budget.
-# REST is a SEPARATE bucket, so the same box can list while GraphQL is exhausted. (a) proves that;
-# (b) proves the other half — when REST fails too, the pass must FAIL rather than hand the reaper an
-# empty `.open_iss`/`.pr_brs` or a pool that silently drops a tier.
-echo; echo "── the listings use the REST bucket: a starved GraphQL bucket no longer stops dispatch ──"
+# at 0 lines. REST is a SEPARATE bucket, so the same box can list while GraphQL is exhausted. (a)
+# proves that; (b) proves the other half — when REST fails too, the pass must FAIL rather than hand the
+# reaper an empty `.open_iss`/`.pr_brs` or a pool that silently drops a tier.
+# ⛔ WHAT IT DOES **NOT** PROVE, stated because an earlier draft of this heading overclaimed it: the
+# per-candidate PRE-FLIGHT (`tools/collision_preflight.py`) still reads `gh issue view` / `gh pr list`
+# and is fail-closed, so on a box where GraphQL is refused this change turns "the pool could not be
+# READ" into "the pool was read and the pre-flight could not CERTIFY" — a named, later failure, NOT
+# dispatch. Restoring dispatch there needs the `gh-rest` adapter on PATH (#1959/#1962), which is not
+# deployed on the cells. A heading that said "no longer stops dispatch" would assert, in prose, the
+# exact claim the shipped script's own comment (refresh-candidates.sh, the "WHAT THIS DOES NOT FIX"
+# block) exists to deny — and no test would go red for it, because prose is not behaviour.
+echo; echo "── the listings use the REST bucket: a starved GraphQL bucket no longer starves the READ ──"
 
-# (0) THE HELPER'S OWN REFUSALS ARE DRIVEN, NOT ASSUMED. `rest_list` carries five fail-closed guards
-#     — an unmodelled flag, a flag with no value, a non-numeric limit, an unknown listing kind, and a
-#     page that vanished while the LINK header still advertised a next page. Every one is category A
-#     (each prevents a WRONG answer being read as an empty one) and NONE is reachable from the five
-#     call sites, so a test that only drove the call sites would never execute them. The SHIPPED
-#     helper is extracted and called directly; `run_bounded` turns "it hangs" into a failure instead
-#     of wedging the suite (the pre-fix form spun for ever on a flag with no value — measured).
+# (0) THE HELPER'S OWN REFUSALS AND ITS PAGINATION ARE DRIVEN, NOT ASSUMED. `rest_list` carries five
+#     fail-closed guards — an unmodelled flag, a flag with no value, a non-numeric limit, an unknown
+#     listing kind, and a page that is SHORT or EMPTY while the LINK header still advertises a next
+#     page. Every one is category A (each prevents a WRONG answer being read as a complete one) and
+#     NONE is reachable from the five call sites, so a test that only drove the call sites would never
+#     execute them. The SHIPPED helper is extracted and called directly; `run_bounded` turns "it
+#     hangs" into a failure instead of wedging the suite (the pre-fix form spun for ever on a flag
+#     with no value — measured). The last case is the MULTI-PAGE SUCCESS path: ten full pages, whose
+#     page files are only concatenated in order if they are zero-padded (`p010` sorts before `p2`
+#     otherwise), so the ordering claim is measured rather than asserted.
 echo; echo "── the REST helper's own refusals ──"
 run_bounded() {  # <seconds> <cmd...> — 124 means it did not finish
   local secs="$1"; shift
@@ -1848,6 +1858,13 @@ OR=acme/widget
 rest_list "$@"
 RS
   drv() { run_bounded 5 bash "$T/rr.sh" "$T/rest.sh" "$@"; }
+  # ⛔ drv_out — the same call WITHOUT the bound, because `run_bounded` swallows stdout by design (it
+  # exists to bound a call that might never finish). Every assertion that READS the rows must use
+  # this one: asserting on a file the bound never wrote is a vacuous pass (measured while writing
+  # this block — the multi-page case "passed" at 0 rows for exactly that reason). These cases are
+  # deterministic (the stub always answers), so no bound is needed; the risk they cover is a wrong
+  # ANSWER, not a hang.
+  drv_out() { bash "$T/rr.sh" "$T/rest.sh" "$@"; }
   PATH="$HD:$PATH"; export PATH
   drv issues --repo acme/widget --json number > /dev/null 2>"$HD/err"; rc=$?
   [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ] && ok "rest_list refuses an UNMODELLED flag (rc=$rc, no hang) — a dropped filter is a wrong answer" \
@@ -1861,12 +1878,82 @@ RS
   drv widgets > /dev/null 2>"$HD/err"; rc=$?
   [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ] && ok "rest_list refuses an UNKNOWN listing kind (rc=$rc)" \
                   || bad "rest_list accepted an unknown listing kind (rc=$rc)"
-  drv issues --repo acme/widget --limit 500 --jq '.[].number' > "$HD/out" 2>"$HD/err"; rc=$?
+  drv_out issues --repo acme/widget --limit 500 --jq '.[].number' > "$HD/out" 2>"$HD/err"; rc=$?
   [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ] && ok "rest_list REFUSES a vanished page (LINK still advertises a next page, body has none)" \
                   || bad "rest_list read a vanished page as the end of the collection (rc=$rc) — a truncated listing at rc 0"
   PATH="${PATH#$HD:}"; export PATH
   [ ! -s "$HD/out" ] && ok "rest_list emits NO rows for a refused listing (nothing for a caller to mistake for an answer)" \
                      || bad "rest_list emitted rows while refusing: $(head -2 "$HD/out" | tr '\n' ' ')"
+
+  # ── a SHORT page that still advertises a next page is a stripped page, not the end ─────────────
+  # GitHub returns exactly per_page rows on every page but the last, so 40 rows + `rel="next"` is the
+  # shape a filtering intermediary produces. Read as a complete listing it returns a SHORT `.pr_brs`
+  # at rc 0, which makes `has_pr` false for issues that DO have a PR (#1705) — the same hazard as an
+  # empty one, just quieter.
+  HD2="$T/restcase-short"; mkdir -p "$HD2"
+  cat > "$HD2/gh" <<'SH'
+#!/bin/bash
+printf 'HTTP/2.0 200 OK\r\nLink: <x?page=2>; rel="next"\r\n\r\n'
+jq -n '[range(40)|{number:.}]'
+SH
+  chmod +x "$HD2/gh"
+  PATH="$HD2:$PATH"; export PATH
+  drv_out issues --repo acme/widget --limit 500 --jq '.[].number' > "$HD2/out" 2>"$HD2/err"; rc=$?
+  PATH="${PATH#$HD2:}"; export PATH
+  [ "$rc" -ne 0 ] && ok "rest_list REFUSES a SHORT page that still advertises a next page (rc=$rc) — a stripped page is not a complete listing" \
+                  || bad "rest_list returned a SHORT page at rc 0 — a truncated listing (rows=$(wc -l < "$HD2/out"))"
+  [ ! -s "$HD2/out" ] && ok "the short-page refusal emits NO rows either" \
+                      || bad "the short-page refusal still emitted $(wc -l < "$HD2/out") row(s)"
+
+  # ── an EMPTY body on a 200 is a vanished body, not 'no rows' ────────────────────────────────
+  # Real `gh api -i` answers an empty collection with headers + `[]`. Only 204/304 may carry no body,
+  # so a 200 with nothing after the headers must be refused: read as 'no rows' it writes an EMPTY
+  # `.pr_brs` at rc 0 — the #1705 trigger the reaper's absence-vs-empty rule exists to shut.
+  HD3="$T/restcase-empty"; mkdir -p "$HD3"
+  printf '#!/bin/bash\nprintf "HTTP/2.0 200 OK\\r\\ncontent-type: application/json\\r\\n\\r\\n"\n' > "$HD3/gh"
+  chmod +x "$HD3/gh"
+  PATH="$HD3:$PATH"; export PATH
+  drv_out pulls --repo acme/widget --limit 10 --jq '.[]|.head.ref' > "$HD3/out" 2>"$HD3/err"; rc=$?
+  PATH="${PATH#$HD3:}"; export PATH
+  [ "$rc" -ne 0 ] && ok "rest_list REFUSES a 200 with an EMPTY body (rc=$rc) — 'no content' is 204, not an empty 200" \
+                  || bad "rest_list read a 200 with an empty body as 0 rows (rc=$rc) — that writes an empty .pr_brs"
+  # …and the legitimate no-content shape is still a valid empty answer
+  HD4="$T/restcase-204"; mkdir -p "$HD4"
+  printf '#!/bin/bash\nprintf "HTTP/2.0 204 No Content\\r\\n\\r\\n"\n' > "$HD4/gh"
+  chmod +x "$HD4/gh"
+  PATH="$HD4:$PATH"; export PATH
+  drv_out pulls --repo acme/widget --limit 10 --jq '.[]|.head.ref' > "$HD4/out" 2>"$HD4/err"; rc=$?
+  PATH="${PATH#$HD4:}"; export PATH
+  [ "$rc" -eq 0 ] && [ ! -s "$HD4/out" ] && ok "rest_list accepts a 204 as a real empty answer (rc=0, no rows)" \
+                                      || bad "rest_list did not accept a 204 (rc=$rc, out=$(wc -l < "$HD4/out") rows)"
+
+  # ── THE MULTI-PAGE SUCCESS PATH, in order ──────────────────────────────────────────────────
+  # Ten full pages. The page files are concatenated by a GLOB, so this only comes back in order if
+  # they are ZERO-PADDED — plain `p*.json` sorts `p10` BEFORE `p2`, and `.[0:$limit]` would then
+  # truncate rows from the wrong pages. The numbers are page-continuous, so a mis-ordered
+  # concatenation is visible in the sequence, not just in the count.
+  HD5="$T/restcase-pages"; mkdir -p "$HD5"
+  cat > "$HD5/gh" <<'SH'
+#!/bin/bash
+pg="$(printf '%s' "$*" | sed -n 's/.*&page=\([0-9]*\).*/\1/p')"
+[ -n "$pg" ] || pg=1
+if [ "$pg" -lt 10 ]; then nxt="Link: <x?page=$((pg+1))>; rel=\"next\"\r\n"; else nxt=""; fi
+printf "HTTP/2.0 200 OK\r\n$nxt\r\n"
+jq -n --argjson p "$pg" '[range(100)|{number: (($p-1)*100 + .)}]'
+SH
+  chmod +x "$HD5/gh"
+  PATH="$HD5:$PATH"; export PATH
+  drv_out issues --repo acme/widget --limit 1000 --jq '.[].number' > "$HD5/out" 2>"$HD5/err"; rc=$?
+  PATH="${PATH#$HD5:}"; export PATH
+  [ "$rc" -eq 0 ] && [ "$(wc -l < "$HD5/out")" -eq 1000 ] && ok "rest_list reads 10 pages and returns all 1000 rows (rc=0)" \
+                  || bad "multi-page read: rc=$rc, rows=$(wc -l < "$HD5/out") (want 1000) — $(head -2 "$HD5/err" | tr '\n' ' ')"
+  [ "$(head -1 "$HD5/out")" = "0" ] && [ "$(tail -1 "$HD5/out")" = "999" ] && ok "the pages are concatenated IN ORDER (first=0, last=999)" \
+                  || bad "page order is wrong: first='$(head -1 "$HD5/out")' last='$(tail -1 "$HD5/out")' (want 0 and 999) — a plain p*.json glob sorts p010 before p2"
+  # sorted -n -c: 0 when the file is already numerically ascending; uniq -d catches a duplicate page.
+  sort -n -c "$HD5/out" 2>/dev/null; mono=$?
+  dup="$(sort -n "$HD5/out" | uniq -d | head -1)"
+  [ "$mono" -eq 0 ] && [ -z "$dup" ] && ok "the 1000 rows are strictly monotonic (no page duplicated, dropped or reordered)" \
+                                     || bad "rows are not monotonic across pages (sorted-check=$mono, first dup='$dup')"
 else
   bad "the REST helper could not be extracted from refresh-candidates.sh — the refusals are untested"
 fi

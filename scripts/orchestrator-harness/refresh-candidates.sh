@@ -379,6 +379,18 @@ cmd_check() {
   fi
   echo "[refresh] check: repo=$REPO"
   echo "[refresh] check: pre-flight tool=$PREFLIGHT"
+  # ⛔ jq IS A PREREQUISITE OF THE LISTING READ (#1962 review). The listings run on the REST bucket and
+  # `rest_list` assembles and projects pages with jq; without it the helper REFUSES rather than answer
+  # from a partial read, so every pass would report `queue=UNREADABLE` and the cell would be MERGE-ONLY
+  # — the exact shape this check exists to refuse. Probed BEFORE "CHECK OK", because a verdict printed
+  # after the certification is not a verdict, and `cloud-cell-bringup.sh` refuses to start a cell on
+  # NOT PROVISIONABLE. install.sh probes jq on a new box for the same reason.
+  command -v jq >/dev/null 2>&1 \
+    || { echo "[refresh] check: FAIL 'jq' is not runnable, and every listing is assembled with it"
+         echo "[refresh] NOT PROVISIONABLE: the REST listings cannot be read without jq, so a cell on this box would report queue=UNREADABLE and MERGE ONLY (#1962)"
+         echo "[refresh]   fix: install jq (apt-get install -y jq), or put it on PATH"
+         return "$EXIT_NOT_PROVISIONABLE"; }
+  echo "[refresh] check: jq=$(command -v jq)"
   # ── the CROSS-BOX CLAIM REGISTRY, judged LOCALLY (agent-infra#1850 review, 2026-10-16) ──────
   # The refresh refuses every issue when `$O/claims.sh` exists but predates the issue-claim reader,
   # and that state is permanent and local — so a cell in it queues NOTHING forever. Catching it HERE
@@ -641,7 +653,7 @@ rest_fail() {
 #   `[refresh]` tag (they both re-prefix what they collect, so a helper-side tag doubles it).
 rest_list() {
   local kind="${1:-}"; [ $# -gt 0 ] && shift
-  local repo="$OR" state="open" limit=30 label="" prog='.' ep q page=1 pages n tmp pf
+  local repo="$OR" state="open" limit=30 label="" prog='.' ep q page=1 pages n tmp pf status more
   if [ -z "$kind" ]; then
     echo "REST: rest_list needs a listing kind (issues|pulls)" >&2; return 1
   fi
@@ -708,16 +720,38 @@ rest_list() {
       array) n="$(jq 'length' < "$pf.json" 2>/dev/null)" ;;
       *)     n="" ;;   # `null` has length 0 — an array TYPE is required, not a numeric length
     esac
-    # A 0-byte 200 is "no rows" only where the reaper's "the answer is none" can legitimately come
-    # from; anything else must answer with an array.
-    if [ -z "$n" ] && [ ! -s "$pf.json" ] && [ "$page" -eq 1 ]; then n=0; fi
+    # ⛔ THE STATUS LINE DECIDES WHETHER AN EMPTY BODY IS AN ANSWER. Real `gh api -i` answers an
+    # empty collection with headers + `[]`; a 0-byte body on a 200 is a body that VANISHED in transit,
+    # and reading it as "no rows" writes an EMPTY `.pr_brs` at rc 0 — the #1705 trigger this block
+    # exists to shut (an empty branch list makes `has_pr` false for every issue). Only 204/304 carry
+    # no body by definition, so only they may be read as an empty answer.
+    status="$(awk 'NR==1{print $2}' "$pf.raw" 2>/dev/null)"
+    if [ -z "$n" ] && [ ! -s "$pf.json" ]; then
+      case "$status" in
+        204|304) n=0 ;;
+      esac
+    fi
     case "$n" in
       ''|*[!0-9]*)
-        echo "REST: the $kind listing page $page did not answer with a JSON array — refusing to read it as an empty page" >&2
+        if [ ! -s "$pf.json" ]; then
+          echo "REST: the $kind listing page $page answered HTTP ${status:-?} with an EMPTY body — a 0-byte body is 'no rows' only when the status says 204; refusing to read it as an empty listing" >&2
+        else
+          echo "REST: the $kind listing page $page did not answer with a JSON array — refusing to read it as an empty page" >&2
+        fi
         rm -rf "$tmp"; return 1 ;;
     esac
     if [ "$n" -eq 0 ] && [ "${more:-0}" -ge 1 ]; then
       echo "REST: the $kind listing page $page answered with 0 rows although the LINK header still advertises a next page — a vanished page is not the end of the collection" >&2
+      rm -rf "$tmp"; return 1
+    fi
+    # ⛔ A SHORT PAGE THAT STILL ADVERTISES A NEXT PAGE IS NOT THE END OF THE COLLECTION EITHER. GitHub
+    # returns exactly `per_page` rows on every page but the last, so `rel="next"` together with FEWER
+    # rows means the page was filtered or stripped — and returning it at rc 0 is a truncated listing: a
+    # short `.pr_brs` un-blacklists issues that already have a PR (#1705). Gated on `page < pages` so a
+    # caller who only asked for one page (`--limit 10`) is not refused over a next page it never wanted
+    # — that case is settled by the limit, not by the collection's length.
+    if [ "${more:-0}" -ge 1 ] && [ "$n" -lt 100 ] && [ "$page" -lt "$pages" ]; then
+      echo "REST: the $kind listing page $page returned only $n rows although the LINK header advertises a next page — a short page is not a complete listing" >&2
       rm -rf "$tmp"; return 1
     fi
     if [ "$n" -lt 100 ] || [ "$page" -ge "$pages" ]; then break; fi   # short page, or the limit is reached
@@ -727,8 +761,10 @@ rest_list() {
   # reaper, which then un-blacklists an issue that has no PR of its own — the duplicate-lane defect of
   # #1705 from the other side. Dropped here ONCE FOR THIS FILE (the gh-rest adapter drops the same
   # rows, `gh-rest/gh:156`; that twin is why BOTH surfaces must be changed together if the rule ever
-  # moves). The limit cuts the RAW rows, so a tier's `--limit` is a raw-row total, and the projected
-  # total is smaller by however many pull requests were among them.
+  # moves). ⛔ THE LIMIT BOUNDS THE PROJECTED ROWS, NOT THE RAW ONES: PRs are dropped FIRST, so a
+  # tier's `--limit` counts issues — which also means a run can return exactly `--limit` rows while
+  # more issues exist beyond the last page read. (An earlier version of this comment claimed the
+  # limit cut the raw rows; the twin adapter agrees with the CODE — `gh-rest/gh:157-158` filters,)
   jq -r -s --arg kind "$kind" --argjson limit "$limit" \
      'add // [] | (if $kind == "issues" then map(select(has("pull_request") | not)) else . end) | .[0:$limit] | '"$prog" \
      "$tmp"/p*.json
