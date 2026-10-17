@@ -11,6 +11,7 @@ Run: /usr/bin/python3 scripts/test_lane_actions.py
 """
 import importlib.util
 import atexit
+import hashlib
 import json
 import os
 import shutil
@@ -621,6 +622,66 @@ def main():
     check("the selector degrades to the SAME RULE against an older deployed sibling",
           LA.told_but_silent_via(_WithoutFn) is LA.told_but_silent
           and LA.told_but_silent_via(object()) is LA.told_but_silent)
+
+    print("The recap/beat pair is BOUND, not merely written twice (#7957 H3)")
+    # The defect: `.md` and `.beat` are two independent atomic writes, so a failure between them
+    # left a FRESH recap beside a STALE beat -- two numbers, one tick -- and the beat is the half
+    # the floor reads. The fix binds them with `md=<digest of the recap this beat was rendered
+    # from>` and exits NON-ZERO on a tear so no caller can read a torn tick as a success.
+    _pd = os.path.join(_STATE_SCRATCH, "pair")
+    os.makedirs(_pd, exist_ok=True)
+
+    def _pair(tag):
+        return (os.path.join(_pd, "recap-%s.md" % tag),
+                os.path.join(_pd, "recap-%s.beat" % tag))
+
+    # 1. Both halves published, and the beat NAMES the recap it was rendered from.
+    mp, bp = _pair("a")
+    rc = LA.write_pair(mp, "# recap A\n", "DO: X", True, beat_path=bp)
+    beat_txt = open(bp).read()
+    want = hashlib.sha256(b"# recap A\n").hexdigest()[:LA.MD_SHA_LEN]
+    check("write_pair publishes both halves (rc 0)", rc == 0, rc)
+    check("the beat carries md=<digest of the recap>", "md=%s\n" % want in beat_txt, beat_txt)
+    check("actfull reflects words_read=True", "actfull=1\n" in beat_txt, beat_txt)
+    check("the digest length is the pinned MD_SHA_LEN", len(want) == LA.MD_SHA_LEN == 12, want)
+
+    # 2. The digest BINDS CONTENT -- not a constant, not the mtime.
+    mp2, bp2 = _pair("b")
+    LA.write_pair(mp2, "# recap B\n", "DO: X", True, beat_path=bp2)
+    check("a different recap yields a different digest (the binding is content)",
+          open(bp2).read() != beat_txt, open(bp2).read())
+
+    # 3. TORN: the beat cannot be written -> rc 4, NEVER 0. The recap IS published, which is
+    #    precisely why the pair is torn, and the stale beat is left as the evidence.
+    mp3, bp3 = _pair("c")
+    with open(mp3, "w") as fh:
+        fh.write("# OLD recap\n")
+    with open(bp3, "w") as fh:
+        fh.write("act=OLD\nactfull=1\nmd=deadbeefdead\n")
+    rc = LA.write_pair(mp3, "# NEW recap\n", "DO: NEW", True,
+                       beat_path=os.path.join(_pd, "no-such-dir", "x.beat"))
+    check("a beat-write failure returns 4, never 0 (the pair is TORN)", rc == 4, rc)
+    check("...the RECAP was published, which is exactly why it is torn",
+          "NEW recap" in open(mp3).read(), open(mp3).read())
+    check("...and the beat keeps the OLD digest, so a reader can TELL it is stale",
+          open(bp3).read() == "act=OLD\nactfull=1\nmd=deadbeefdead\n", open(bp3).read())
+
+    # 4. NOT torn: the recap cannot be written -> rc 3, and the beat is left ALONE so the
+    #    published pair stays consistent (a beat written first would tear it the other way).
+    mp4, bp4 = _pair("d")
+    with open(bp4, "w") as fh:
+        fh.write("act=KEEP\nactfull=1\nmd=keepkeepkeep\n")
+    rc = LA.write_pair(os.path.join(_pd, "no-such-dir", "y.md"), "# nunca\n", "DO: N", True,
+                       beat_path=bp4)
+    check("a recap-write failure returns 3", rc == 3, rc)
+    check("...and the beat is UNTOUCHED, so the published pair remains consistent",
+          open(bp4).read() == "act=KEEP\nactfull=1\nmd=keepkeepkeep\n", open(bp4).read())
+
+    # 5. The Jev-outage degradation is carried through the binding.
+    mp5, bp5 = _pair("e")
+    LA.write_pair(mp5, "# recap E\n", "DO: E", False, beat_path=bp5)
+    check("actfull=0 when the words layer was NOT read",
+          "actfull=0\n" in open(bp5).read(), open(bp5).read())
 
     print("")
     if FAILS:
