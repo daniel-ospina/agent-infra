@@ -1578,7 +1578,7 @@ if [ -s "$T/release.sh" ] && grep -q 'claim_issue_release' "$T/release.sh"; then
     # sourced first because the record/fence convention (`claim_issue_release_record`) lives THERE,
     # not in this function — one implementation, one writer convention (see its comment).
     ( O="$RL1/o"; LOG="$RL1/o/log"; N=42; REPO="$RL1/repo"; CLAIM_REPO="$RL1/repo"
-      export O LOG N REPO CLAIM_REPO
+      CHAIN_CLAIM_COMMIT="$own"; export O LOG N REPO CLAIM_REPO CHAIN_CLAIM_COMMIT
       . "$RL1/o/claims.sh"; . "$T/release.sh"; release_issue_claim ) >/dev/null 2>&1
     rl_left="$(git -C "$RL1/repo" ls-remote origin 'refs/claims/*' | wc -l | tr -d ' ')"
     [ "$rl_left" = "0" ] && ok "chain-merge: the issue claim IS released on the exit path" \
@@ -1602,7 +1602,7 @@ if [ -s "$T/release.sh" ] && grep -q 'claim_issue_release' "$T/release.sh"; then
     git -C "$RL2/repo" push -q origin "$peerc:refs/claims/issue-42"
     printf '%s\n' "$stale" > "$RL2/o/state/issueclaim-42"
     ( O="$RL2/o"; LOG="$RL2/o/log"; N=42; REPO="$RL2/repo"; CLAIM_REPO="$RL2/repo"
-      export O LOG N REPO CLAIM_REPO
+      CHAIN_CLAIM_COMMIT="$stale"; export O LOG N REPO CLAIM_REPO CHAIN_CLAIM_COMMIT
       . "$RL2/o/claims.sh"; . "$T/release.sh"; release_issue_claim ) >/dev/null 2>&1
     after_stale="$(git -C "$RL2/repo" ls-remote origin refs/claims/issue-42 | awk '{print $1}')"
     [ "$after_stale" = "$peerc" ] && ok "chain-merge: a STALE holder cannot delete the WINNER's issue claim (fenced)" \
@@ -1654,6 +1654,25 @@ if [ -s "$T/release.sh" ] && grep -q 'claim_issue_release' "$T/release.sh"; then
         && ok "chain-merge: the shipped capture reads THIS box's recorded generation (the guard is WIRED)" \
         || bad "chain-merge: the shipped capture returned '${cap_val:-<empty>}' (want $newer) — the generation guard is inert in production"
     fi
+    # ⛔ NO CAPTURED GENERATION → REFUSE THE RELEASE (acceptance-review finding). The capture is empty
+    # when the handover record did not exist at chain start (orch-loop.sh's `claim_issue_record`
+    # failed — the loop logs that this chain cannot fence its release) or when `$O/claims.sh` predates
+    # the reader. Treating an EMPTY expectation as "read the record now" is right for
+    # dispatch-merge.sh, whose release runs milliseconds after the write; it is WRONG here, where the
+    # trap can fire hours later: the record then holds whatever generation is current — the newer
+    # holder's OWN commit, which IS the ref tip — so the stale chain would delete a live claim.
+    # Refusing costs one lease; deleting the wrong claim duplicates work on two boxes.
+    ( O="$RL3/o"; LOG="$RL3/o/log"; N=42; REPO="$RL3/repo"; CLAIM_REPO="$RL3/repo"; CHAIN_CLAIM_COMMIT=""
+      export O LOG N REPO CLAIM_REPO CHAIN_CLAIM_COMMIT
+      . "$RL3/o/claims.sh"; . "$T/release.sh"; release_issue_claim ) >/dev/null 2>&1
+    empty_left="$(git -C "$RL3/repo" ls-remote origin refs/claims/issue-42 | awk '{print $1}')"
+    [ "$empty_left" = "$newer" ] \
+      && ok "chain-merge: with NO captured generation the release is REFUSED (a stale chain cannot delete a newer claim)" \
+      || bad "chain-merge: it released on an EMPTY captured generation (${empty_left:-<gone>} vs $newer)"
+    case "$(cat "$RL3/o/log" 2>/dev/null)" in
+      *"no captured claim generation"*) ok "chain-merge: ...and the no-generation refusal is NAMED in the log" ;;
+      *) bad "chain-merge: the no-generation refusal is silent — log: $(cat "$RL3/o/log" 2>/dev/null)" ;;
+    esac
 else
     bad "chain-merge: could not extract release_issue_claim from the shipped script"
 fi

@@ -897,7 +897,7 @@ reviewers of one PR at once. Measured (reproduce with the base commit of this PR
 ```bash
 T=$(mktemp -d); cp scripts/orchestrator-harness/*.sh "$T/"
 git show <rev>:scripts/orchestrator-harness/claims.sh > "$T/claims.sh"
-CLAIMS_SH="$T/claims.sh" bash scripts/orchestrator-harness/test-claims.sh   # 65 passed, 44 failed
+CLAIMS_SH="$T/claims.sh" bash scripts/orchestrator-harness/test-claims.sh   # 65 passed, 45 failed
 ```
 
 `refresh-scout.test.sh` drives the **shipped** refresh step and the **shipped** dispatch block against
@@ -1009,10 +1009,10 @@ These are kept as a record because each one is a *failure mode of the design*, n
 All but one are fail-**open** in a gate whose whole purpose is to refuse: each certifies a busy or
 unverifiable issue as free, hands it to a second box, or lets a release run without its fence. Pinned
 by `test-claims.sh` (I10, I9(5), I9(7)) and `refresh-scout.test.sh` §8(g) (unrecognised status),
-§9(iii) (stale-registry dispatch), §10 (fenced + generation-guarded release, and the CAPTURE that
-wires it) and §11 (the chain-failure branch). The last two were found in the second (adversarial)
-review cycle, precisely by asking what each new assertion would do if the line it protects were
-deleted.
+§9(iii) (stale-registry dispatch), §10 (fenced + generation-guarded release, the CAPTURE that wires
+it, and the no-generation refusal) and §11 (the chain-failure branch). The last three were found in
+the later review cycles, precisely by asking what each new assertion would do if the line it protects
+were deleted.
 
 | Defect | Impact | Fix |
 |---|---|---|
@@ -1022,6 +1022,7 @@ deleted.
 | **a registry too old to take a claim still dispatched** | `refresh-candidates.sh` refused every issue on such a box (`rc=3`) while `orch-loop.sh` acquired anyway, found no `claim_issue_acquire`, and **dispatched unclaimed** — the fail-open half of the same condition, and the collision on two boxes | present-but-stale is now split from genuinely-absent: the loop refuses the dispatch and names the fix; only a **missing** `claims.sh` (pre-registry box) falls through, loudly |
 | **release failures were silent** (`>/dev/null 2>&1 && echo`) | a refused or failed release left the claim held for its whole lease (3 h of a free issue) with nothing in the log to say so — and `CLAIM_RESULT` was lost because the helper ran in a subshell | the helper `declare -f`s the function, sources `claims.sh` into the **current** shell, passes the captured commit, and logs the reason on every failure branch |
 | **the chain-failure arm released a claim whose LANE was still running** | the lane is spawned *before* the chain in the same loop body, so "no chain will ever run" was true while "nothing is running" was **not**: the release declared an issue this box was actively implementing free, a peer claimed it and duplicated the work, and this box still opened a PR nothing would merge | stop the lane first (exact session match) and release only once it is confirmed gone; if it cannot be stopped, **keep** the claim — the lease expiring it is the safe direction |
+| **a chain with NO captured generation still released** | the capture is empty when the handover record was absent at chain start (`orch-loop.sh`'s `claim_issue_record` failed) or `$O/claims.sh` predates the reader. `claim_issue_release_record` treats an empty expectation as "read the record now" — right for `dispatch-merge.sh`, whose release is milliseconds after the write, but WRONG for a trap that can fire **hours** later: the record then holds the newer holder's own commit, which **is** the ref tip, so the stale chain deleted a live claim | `chain-merge.sh` refuses the release when it has no captured generation, names the reason and lets the lease reap it (one lease lost vs duplicated work on two boxes) |
 | **`CLAIM_COMMIT` was a per-CYCLE global** (not fail-open — state hygiene) | `claims.sh` reset it only when sourced, so an acquire that failed *before* any push (`rc=2`: unreadable ref, unfetchable claim) left the **previous** issue's commit in it. `orch-loop.sh`'s "rc=2 with a claim commit → record it and try a fenced release" then wrote a handover record for an issue this box never claimed, consumed it, and logged a release that never happened — the fence keeps the registry safe, but the *log* is what an operator reads | cleared at the top of `_claim_acquire_at`, so the value always means "what THIS attempt may have pushed" |
 
 ### 7.5 Still open, deliberately not fixed here

@@ -156,22 +156,26 @@ PR="${PR:-$(( (RANDOM << 15 | RANDOM) % 900000 + 100000 ))}"
 # review). Every other key here also carries a fixed sha12 that no live claim can match; `issue-<N>`
 # is the one ref whose identity is the number ALONE — and the teardown FORCE-DELETES it. If a repo's
 # issue numbers ever reached this band, teardown would delete a live box's claim, and a peer reading
-# the registry afterwards would see that issue as free. Re-roll until the number is unclaimed at
-# start, so only THIS run can ever have created it. A caller-supplied ISSUE (the reproducible-run
-# path) is honoured as-is.
-if [ -n "${ISSUE:-}" ]; then ISSUE_SET=1; else ISSUE_SET=0; fi
-ISSUE="${ISSUE:-$(( (RANDOM << 15 | RANDOM) % 900000 + 100000 ))}"
-[ "$ISSUE" = "$PR" ] && ISSUE=$(( ISSUE + 1 ))
-if [ "$ISSUE_SET" -eq 0 ]; then
-  _tries=0
-  while [ "$_tries" -lt 10 ] && [ -n "$(git -C "$A" ls-remote origin "refs/claims/issue-$ISSUE" 2>/dev/null)" ]; do
-    ISSUE=$(( (RANDOM << 15 | RANDOM) % 900000 + 100000 )); _tries=$(( _tries + 1 ))
+# the registry afterwards would see that issue as free. ONE implementation of the choice, used for
+# EVERY bare `issue-<N>` key this suite creates (the main key and the I9 probe — the probe originally
+# picked `ISSUE + 77` unchecked, which reintroduced exactly this defect).
+unclaimed_issue_number() { # -> a number whose refs/claims/issue-<N> does not exist on origin (rc=1 if none)
+  local n tries=0
+  while [ "$tries" -lt 10 ]; do
+    n=$(( (RANDOM << 15 | RANDOM) % 900000 + 100000 ))
+    [ -z "$(git -C "$A" ls-remote origin "refs/claims/issue-$n" 2>/dev/null)" ] && { printf '%s' "$n"; return 0; }
+    tries=$(( tries + 1 ))
   done
-  if [ -n "$(git -C "$A" ls-remote origin "refs/claims/issue-$ISSUE" 2>/dev/null)" ]; then
-    echo "❌ could not find an UNCLAIMED issue number in 10 rolls (#$ISSUE is claimed on origin) — refusing to run, a teardown would delete a live claim"
+  return 1
+}
+if [ -n "${ISSUE:-}" ]; then ISSUE_SET=1; else ISSUE_SET=0; fi
+if [ "$ISSUE_SET" -eq 0 ]; then
+  ISSUE="$(unclaimed_issue_number)" || {
+    echo "❌ could not find an UNCLAIMED issue number in 10 rolls — refusing to run, a teardown would delete a live claim"
     exit 2
-  fi
+  }
 fi
+[ "$ISSUE" = "${PR:-}" ] && ISSUE=$(( ISSUE + 1 ))
 SHA=deadbeefcafebabe0123456789abcdef01234567
 REF="refs/claims/$PR-${SHA:0:12}"
 # A SECOND real claim, so the fencing test can offer a caller a genuine commit sha that is not this
@@ -823,25 +827,44 @@ cleanup_issue_ref
 # handover record and try a fenced release" then wrote a record for an issue this attempt never
 # claimed, consumed it, and logged a release that never happened. The fence keeps the registry safe,
 # so this is state hygiene rather than a fail-open — but the log is what an operator reads.
-PROBE_ISSUE=$(( ISSUE + 77 ))
+PROBE_ISSUE="$(unclaimed_issue_number)" || {
+  echo "❌ could not find an UNCLAIMED number for the I9 probe — refusing to run"
+  exit 2
+}
+[ "$PROBE_ISSUE" = "$ISSUE" ] && PROBE_ISSUE=$(( PROBE_ISSUE + 1 ))
 PROBE_REF="refs/claims/issue-$PROBE_ISSUE"
+# The probe's OWN commit, read from origin IMMEDIATELY after its successful acquire — that is the
+# only ref this suite may delete for the probe. The teardown below fences on it, NEVER on whatever
+# tip happens to be there (a lease on the observed value is not an ownership check: $A is wired to
+# the LIVE origin, so "delete whatever is there" can destroy a peer's claim).
 probe_out=$( ( cd "$A" && export CLAIM_OWNER_ID=boxA && . "$CLAIMS_SH"
                claim_issue_acquire 0 "$PROBE_ISSUE" 600 >/dev/null 2>&1; r1=$?
+               own="$(git ls-remote origin "refs/claims/issue-$PROBE_ISSUE" 2>/dev/null | awk '{print $1}')"
                CLAIM_REPO="$A/definitely-not-a-repo"
                claim_issue_acquire 0 "$PROBE_ISSUE" 600 >/dev/null 2>&1; r2=$?
-               printf '%s|%s|%s' "$r1" "$r2" "${CLAIM_COMMIT:-}" ) )
+               printf '%s|%s|%s|%s' "$r1" "$r2" "${CLAIM_COMMIT:-}" "$own" ) )
 probe_rc1="${probe_out%%|*}"; probe_rest="${probe_out#*|}"
-probe_rc2="${probe_rest%%|*}"; probe_commit="${probe_rest#*|}"
+probe_rc2="${probe_rest%%|*}"; probe_rest2="${probe_rest#*|}"
+probe_commit="${probe_rest2%%|*}"; probe_own="${probe_rest2#*|}"
 ck "I9: the precondition acquire succeeded" "^0$" "$probe_rc1"
 ck "I9: an acquire against an UNREADABLE registry returns rc=2" "^2$" "$probe_rc2"
 [ -z "$probe_commit" ] \
   && { echo "  ✅ a failed acquire leaves CLAIM_COMMIT EMPTY (no previous issue's commit)"; PASS=$((PASS+1)); } \
   || { echo "  ❌ a failed acquire carried a STALE CLAIM_COMMIT ($probe_commit) — orch-loop would write a release record for an issue this box never claimed"; FAIL=$((FAIL+1)); }
-# the probe created a real ref on the shared origin — remove it (fenced, so it can only be ours)
-probe_cur="$(git -C "$A" ls-remote origin "$PROBE_REF" | awk '{print $1}')"
-[ -n "$probe_cur" ] && git -C "$A" push -q --force-with-lease="$PROBE_REF:$probe_cur" origin ":$PROBE_REF" 2>/dev/null
+# remove ONLY our own probe ref: the lease is the commit THIS run pushed, so a peer's claim at that
+# number (which cannot exist, the key was chosen unclaimed — but a race could) survives untouched.
+if [ -z "$probe_own" ]; then
+  echo "  ❌ the probe's own claim commit is unknown — refusing to delete anything at $PROBE_REF"
+  FAIL=$((FAIL+1))
+else
+  probe_now="$(git -C "$A" ls-remote origin "$PROBE_REF" | awk '{print $1}')"
+  [ "$probe_now" = "$probe_own" ] \
+    && { git -C "$A" push -q --force-with-lease="$PROBE_REF:$probe_own" origin ":$PROBE_REF" 2>/dev/null
+         echo "  ✅ the probe ref is removed from origin (fenced on OUR commit)"; PASS=$((PASS+1)); } \
+    || { echo "  ⚠️ the probe ref moved (${probe_now:-<gone>} != $probe_own) — leaving it alone"; PASS=$((PASS+1)); }
+fi
 probe_left="$(git -C "$A" ls-remote origin "$PROBE_REF" | wc -l | tr -d ' ')"
-[ "$probe_left" = "0" ] && { echo "  ✅ the probe ref is removed from origin"; PASS=$((PASS+1)); } \
+[ "$probe_left" = "0" ] && { echo "  ✅ the probe ref is gone"; PASS=$((PASS+1)); } \
                            || { echo "  ❌ the probe ref leaked ($PROBE_REF)"; FAIL=$((FAIL+1)); }
 cleanup_issue_ref
 

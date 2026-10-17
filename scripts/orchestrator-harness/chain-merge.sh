@@ -52,6 +52,19 @@ release_issue_claim() {
     echo "[chain $N] ⚠️ $csh predates the issue-claim RELEASE (no claim_issue_release_record) — the claim is NOT released; fix: cp scripts/orchestrator-harness/*.sh ~/orchestrator/" >> "$LOG"
     return 0
   fi
+  # ⛔ NO CAPTURED GENERATION → DO NOT RELEASE (acceptance-review finding). The capture at chain start
+  # is empty exactly when the handover record did not exist yet (the `claim_issue_record` in
+  # orch-loop.sh failed — the loop logs that this chain cannot fence the release) or when `$O/claims.sh`
+  # predates the reader. `claim_issue_release_record` treats an EMPTY expectation as "read the record
+  # now", which is right for dispatch-merge.sh (its release is milliseconds after the write) but wrong
+  # HERE: a chain that fires hours later would then fence on whatever generation the record holds —
+  # the newer holder's own commit, which IS the ref tip — and delete a live claim. Refusing costs this
+  # box one lease; deleting the wrong claim duplicates work on two boxes, so this is the fail-closed
+  # side of the same asymmetry as the pre-flight. Loud, and the lease still reaps it.
+  if [ -z "${CHAIN_CLAIM_COMMIT:-}" ]; then
+    echo "[chain $N] ⚠️ no captured claim generation (the handover record was absent at chain start) — NOT releasing refs/claims/issue-$N: a stale chain must never delete a NEWER claim. It runs to its lease (CLAIM_ISSUE_TTL=${CLAIM_ISSUE_TTL:-10800}s)." >> "$LOG"
+    return 0
+  fi
   if out="$(claim_issue_release_record "$O" "$REPO" "$N" "${CHAIN_CLAIM_COMMIT:-}")"; then
     echo "[chain $N] released refs/claims/issue-$N" >> "$LOG"
   else
