@@ -2367,6 +2367,18 @@ Neither is part of the loop.
 `do-merge.sh`, `refix.sh`, `sweep.sh`, `watch-one.sh`. These are earlier iterations of the
 same idea and are no longer invoked; they are included for the record, not for use.
 
+**Retired from the heartbeat, kept here for the record:** `retired/queue-dispatch.py` — the
+lane-table dispatcher the beat ran until 2026-10-17 (agent-infra#1874, the retirement half of
+#1890). It fed work only to lanes that already existed and were DONE-IDLE, so it could not start
+work that had no lane; `pr-doctor.py` replaced it and is now the beat's only dispatch entry point.
+⚠️ BUT ITS SPAWN PATH IS NOT SWITCHED ON YET. Read that precisely: `nonblocking-dispatch.sh` IS
+in this tree (§2 above, ported in #1835) and is CALLED BY NOTHING; PR #1894 / #1890 is what points
+`pr-doctor` at it. Until it lands, `pr-doctor` still gates on its `idle_lanes()` roster, so this
+retirement is a NARROWING — one dispatch path instead of two — not the spawning fleet, and the
+incapacity above ("could not start work that had no lane") is fixed by #1894, not here.
+⛔ It is wired to nothing and farmed by nothing — re-arming it would restore a SECOND dispatch
+path, which is the divergence #1890 exists to remove.
+
 ### Which harness commit is this box running? (agent-infra#1745)
 
 On the deployed laptop box the question had **no answer**: the daemon executes `$O/<script>` and

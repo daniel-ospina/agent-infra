@@ -349,8 +349,10 @@ check_fleet_srcs_farmed() {
 #   F7  python pathlib   Path(SCRIPTS|SCRIPT_DIR|HERE|STATE|STATE_DIR) / "<n>" (8 modules under scripts/
 #       already `import pathlib`) — a division expression, not a call, so F4's regex cannot see it
 #   F8  bash state       "$STATE/<p>"  "${STATE}/<p>"  "$STATE_DIR/<p>" — the state class's F1
-#       (heartbeat-loop.sh:415 runs `$STATE/queues/refresh-queues.py`, with STATE set at :54). It needs its
-#       OWN form, not an F1 alternative, because the class must come out `state:`; the sub-path is KEPT
+#       (its last LIVE instance was the beat's `$STATE/queues/refresh-queues.py`, retired with the
+#       lane-table dispatcher by #1874; the form stays because the class can reappear in any farmed
+#       consumer, and the forms-probe below proves the extractor synthetically, not from a live site).
+#       It needs its OWN form, not an F1 alternative, because the class must come out `state:`; the sub-path is KEPT
 #       (the F5 residual), so `queues/<n>` and a flat `<n>` never collapse into one entry
 #   F6  foreign absolute a `/Users|/home/.../<dir>/<n>.py|sh` that is NOT the agent dir: a consumer exec'ing
 #       a file from ANOTHER checkout — `session-postmortem.sh:27` (eldato's `scripts/`) and
@@ -397,7 +399,10 @@ check_fleet_srcs_farmed() {
 # owns it, and an UNNAMED one FAILS, so a new `state/` exec site cannot enter silently.
 # `lane-verdict.py` had no owner anywhere until this derivation found it: `lane-actions.py:80,1530`
 # loads it as the verdict-key loader and silently degrades to `RULE` without it.
-LANE_PRODUCERS_STATE_RESIDUAL="claim.py:#1567 lane-confirm.py:#1797 lane-triage.py:#1553 lane-verdict.py:#1552 queues/refresh-queues.py:#1567"
+# #1874 retired `claim.py`'s and `queues/refresh-queues.py`'s only consumers (the lane-table
+# dispatcher and the beat's refresh step), so both LEFT this class in the same landing: an entry here
+# for a producer nobody execs is STALE, and the stale check below FAILS on it.
+LANE_PRODUCERS_STATE_RESIDUAL="lane-confirm.py:#1797 lane-triage.py:#1553 lane-verdict.py:#1552"
 # ⚠️ THE `foreign/` CLASS — a producer a farmed consumer execs from ANOTHER checkout by absolute
 # path. Delivered by that repo's own process, never by this farm, and absent from every box that
 # lacks the checkout — so it is DISCLOSED with an owner and an undisclosed one FAILS. Measured
@@ -480,17 +485,29 @@ script:ask-owner.py script:beta-progress.py script:disk-reaper.sh script:cadence
 script:goal-state.py script:heartbeat-loop.sh script:lane-actions.py script:lane-guard.py
 script:lane-scan-fallback.sh script:lane-status.py script:lane-watchdog.py script:merge-queue.py
 script:objective.py script:orchestrator-heartbeat.sh script:pi-reap-worktrees.sh script:pr-doctor.py
-script:publish-live-workspaces.py script:queue-dispatch.py script:queue_verdicts.py script:safe-send.sh
+script:publish-live-workspaces.py
 script:session-postmortem.sh
 script:turn-classify.py script:turn-end.py script:undelivered-answers.py script:watch-truncation.sh
 lib:beat-pair.sh lib:bounded.sh lib:diff-normalize.py lib:pid-identity.sh lib:transcript-patterns.sh
-state:claim.py state:lane-confirm.py state:lane-triage.py state:lane-verdict.py
-state:queues/refresh-queues.py
+state:lane-confirm.py state:lane-triage.py state:lane-verdict.py
 foreign:cmux_dispatch.py"
 # `lib:transcript-patterns.sh` joined on 2026-10-17 (#1921) and `foreign:postmortem.sh` LEFT in the
 # same landing, which is the derivation doing its job: the exec site did not vanish, it CHANGED KIND —
 # the consumer now execs a sibling that `lib_srcs` farms, and the old foreign reference is gone. A
-# REMOVED entry is normally the "exec site was lost" signal; here it was verified against the CODE
+# agent-infra#1874 (the lane-table dispatcher's retirement) removed FIVE entries in one landing, and
+# each was verified against the CODE rather than accepted from the diff — the pin's own warning:
+#   * `script:queue-dispatch.py` — the file MOVED to `scripts/orchestrator-harness/retired/`; it is
+#     farmed by nothing and executed by nothing, so it is no longer a producer this farm owes.
+#   * `script:queue_verdicts.py` — farmed only as that dispatcher's BY-PATH import (#1937, which
+#     landed while the dispatcher was live). It moved beside the dispatcher into `retired/`, so the
+#     exec site left live code with it; a farm entry for it left `fleet_srcs` in the same commit.
+#   * `state:claim.py` and `state:queues/refresh-queues.py` — their only consumers were that
+#     dispatcher's `claim_next()` and the `refresh-queues.py` step in `heartbeat-loop.sh`, both
+#     removed in the same landing. The queue FILES stay on disk for the record; nothing reads them.
+#   * `script:safe-send.sh` — `safe-send.sh` itself still exists and is still farmed; it LOST its only
+#     live invoker (the dispatcher), so no farmed consumer EXECS it any more. It is manual-only now,
+#     which is why it leaves the producer population while its farm entry stays.
+# A REMOVED entry is normally the "exec site was lost" signal; here it was verified against the CODE
 # (`grep -n 'postmortem.sh' scripts/session-postmortem.sh` finds only the `POSTMORTEM_SH` override and
 # the sibling default), not against the pin.
 
@@ -1261,8 +1278,11 @@ LANE_PRODUCERS_FOREIGN_RESIDUAL="$_FOREIGN_SAVED"
 # THE REPORT LINES ARE PART OF THE GATE. A SUMMARY that adds up differently, an `ok:` printed beside a
 # FAIL, or inverted ADDED/REMOVED labels are all ways the instrument lies while still exiting correctly —
 # none of the probes above looks at them.
+# The disclosed member of this probe population is `state:lane-confirm.py` (#1797): it has to be a name
+# its disclosure list ACTUALLY carries, and it stopped being `state:claim.py` when #1874 retired that
+# file's only consumer and the entry left `LANE_PRODUCERS_STATE_RESIDUAL` with it.
 DUP_MSG="$(producer_probe_msg check_producer_farm_declared "dispo-probe-report" \
-  "state:claim.py script:heartbeat-loop.sh script:undelivered-demo.py")"
+  "state:lane-confirm.py script:heartbeat-loop.sh script:undelivered-demo.py")"
 case "$DUP_MSG" in
   *"SUMMARY: dispo-probe-report 3 derived producer(s) = 0 delivered + 2 disclosed with an owning issue + 1 undelivered-and-undisclosed"*)
     echo "ok: the SUMMARY tallies delivered + disclosed + undelivered against the population (3 = 0 + 2 + 1)" ;;
