@@ -52,6 +52,19 @@
 #      read-back rather than a re-copy. A cell that cannot receive the layer is REFUSED rather
 #      than certified: a green `CELL READY` over an unguarded cell is the false PASS this whole
 #      script exists to remove.
+#
+#  (6) THE SCHEDULED LAYER NEVER REACHED THE CELLS AT ALL (agent-infra#1864).  Every recurring job
+#      is declared once, as a launchd plist under templates/launchd/, and delivered by
+#      scripts/install-launchd.sh — which needs launchd. Measured 2026-10-16 across the fleet:
+#      scheduled jobs 24 on the Mac and 0 on each of the three cells; reap scripts 4 / 0 / 0 / 0;
+#      heartbeat running / DEAD / DEAD / DEAD. So a cell ran lanes with no idle-session reaping,
+#      no worktree reaping, no lane-liveness report and no canary — and, since the only instrument
+#      that would have said so was itself one of the missing jobs, nothing announced it.
+#      FIX: check_schedule() below, running scripts/fleet-schedule.py — a portable runtime that
+#      reads the SAME plists (no hand-ported second copy) and, because a cell has no crontab
+#      binary and no systemd user bus, runs them from a supervised in-session loop. It is part of
+#      THIS documented path, so a fresh cell gets it; and it ends by verifying from the per-job
+#      run stamps, so "scheduled" is asserted from a run rather than from a loaded unit.
 
 set -uo pipefail
 
@@ -88,6 +101,9 @@ SWAP_SWAPPINESS="${SWAP_SWAPPINESS:-30}"
 # The privilege seam. Word-split ON PURPOSE: `sudo -n` is TWO argv entries. Empty = run as we are
 # (the suite's seam); `false` is how a case reproduces a cell that cannot escalate.
 SWAP_SUDO="${SWAP_SUDO-sudo -n}"
+# The checkout the operational + scheduled layers are installed from. Resolved by
+# check_operational_layer (under set -u, so it is declared here rather than implied).
+CELL_INFRA_ROOT=""
 
 say()  { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*"; }
 die()  { say "FATAL: $*" >&2; exit 1; }
@@ -614,6 +630,10 @@ check_operational_layer() {
   else
     ok "merge gate NOT degraded — the argv-level gh shim is installed, enabled and verified (#984)"
   fi
+  # Published for check_schedule() below: the scheduled layer's DECLARATIONS are read from this
+  # checkout (templates/launchd), exactly as launchd's installer reads them from
+  # $AGENT_INFRA_PATH on the Mac — one source of truth, never a hand-ported second list.
+  CELL_INFRA_ROOT="$root"
   # A cell is Linux. Say which one, because the layer's own selection is surface-aware (no
   # cmux desktop app, no launchd) and a reviewer reading a cell log should see the surface.
   if [ -r /etc/os-release ]; then
@@ -1343,6 +1363,49 @@ check_controller_service() {
   ok "controller supervised — eldato-orchestrator.service is enabled and active (Restart=always: a dead controller comes back without a human; stop it with 'cloud-cell-supervisor.sh stop')"
 }
 
+# ── the SCHEDULED layer (agent-infra#1864) ────────────────────────────────────────────────────
+# WHY, in one line: the repo declares every recurring job ONCE as a launchd plist and delivered it
+# with a launchd-only installer, so the cells — which are Linux and have no launchd — received NONE
+# of the ten jobs. Measured 2026-10-16: scheduled jobs 24 (Mac) / 0 / 0 / 0 (cells), reap scripts 4
+# / 0 / 0 / 0, heartbeat running / DEAD / DEAD / DEAD. Nothing announced it, because a schedule that
+# is absent looks exactly like a schedule with nothing to do.
+#
+# The mechanism is decided ONCE, in scripts/fleet-schedule.py: a supervised in-session loop that
+# reads the SAME plists. It is not cron and not systemd timers because a cmux cloud cell has
+# neither available: `command -v crontab` → absent, and `systemctl --user status` → "Failed to
+# connect to bus: No medium found" (systemd is pid 1 in SYSTEM mode, with no user bus). A crontab
+# entry or an enabled user timer there would be installed-and-inert, which is exactly the false
+# PASS this issue is about.
+#
+# FATAL, like check_operational_layer above and for the same reason: nothing else installs this.
+# `--install` converges the loop, RUNS the due jobs now, and reads the result back from the per-job
+# stamps — so "scheduled" is asserted from a run (a fresh log line and an rc), never from the
+# presence of a file or a loaded unit.
+check_schedule() {
+  local sched="$CELL_HOME/.pi/agent/scripts/fleet-schedule.py" root="${CELL_INFRA_ROOT:-}" out rc=0
+  # The FARMED copy, not the checkout's: it is what the loop will execute on every tick, and
+  # cell-install.sh has just byte-verified it against the checkout. A checkout copy here would
+  # certify one file while a different one runs.
+  if [ ! -f "$sched" ]; then
+    die "the scheduled layer is MISSING: $sched does not exist, so no reap job, no liveness report and no canary would ever run on this cell (agent-infra#1864). The operational layer above was supposed to install it — re-run:  CELL_HOME=$CELL_HOME INFRA_ROOT=$root bash $root/pi-bootstrap/cell-install.sh --install"
+  fi
+  if [ -z "$root" ]; then
+    die "cannot locate the agent-infra checkout the job declarations come from (templates/launchd) — without it this cell has NO scheduled layer (#1864)"
+  fi
+  # The job declarations are the checkout's (one source of truth, like $AGENT_INFRA_PATH on the
+  # Mac). INFRA_ROOT is passed explicitly so the farmed script does not have to guess.
+  out="$(HOME="$CELL_HOME" CELL_HOME="$CELL_HOME" INFRA_ROOT="$root" python3 "$sched" --install 2>&1)" || rc=$?
+  printf '%s\n' "$out" | sed 's/^/    /'
+  if [ "$rc" -ne 0 ]; then
+    die "the scheduled layer FAILED to install or verify (rc=$rc) — this cell would run with no reaping, no liveness detection and no canary, and NOTHING else installs them (#1864). Fix the failure above."
+  fi
+  # The verdict line is the proof: it counts the jobs that actually RAN on this machine and names
+  # the ones that cannot run here. Burying it in the indented block would make "deployed" a claim.
+  local verdict; verdict="$(printf '%s\n' "$out" | grep -E '^SCHEDULE VERIFIED' | head -1)"
+  [ -n "$verdict" ] || die "the scheduler printed no SCHEDULE VERIFIED verdict — refusing to report a cell ready on an unverified schedule (#1864)"
+  ok "scheduled layer live: $verdict"
+}
+
 main() {
   export HOME_ORIG="${HOME:-}"
   say "cloud-cell bringup — mode=$MODE uid=$(id -u)"
@@ -1375,6 +1438,7 @@ main() {
       # Measuring it earlier would probe an empty set on a first bring-up and certify a layer that
       # had not been installed yet (#2100 review).
       check_provider_layer
+      check_schedule
       check_caches
       # Before the reaper's install step: a cell that cannot get swap must be refused EARLY, not
       # after the scheduler work — and the reading is what the operator needs from the refusal.
@@ -1390,7 +1454,7 @@ main() {
       # too, so the banner is never printed while a registered secret is still there.
       remove_secrets \
         || die "a secret file could not be removed — refusing to report readiness; delete it by hand before using this VM"
-      say "CELL READY — all links verified (home, tools, network, provider, gh auth, push, clone, dispatch pre-flight, operational layer, caches reported, swap active, harness activation scheduled)"
+      say "CELL READY — all links verified (home, tools, network, provider, gh auth, push, clone, dispatch pre-flight, operational layer, scheduled layer, caches reported, swap active, harness activation scheduled)"
       ;;
     *)
       say "unknown mode: $MODE (use --check)"; exit 2 ;;
