@@ -236,21 +236,30 @@ _TICKET = re.compile(r"(?<![\w/#])(?:[A-Za-z][\w.-]*)?#\d+\b")
 # without brackets, i.e. the drain the mark exists to close, reopened by two
 # keystrokes. Brackets and dashes are GAP characters (an opening for a gloss
 # phrase, since the phrase follows them); only a real noun phrase explains.
+# ⚠️ …AND A REAL NOUN PHRASE IS NOT ONLY THE 19 WORDS BELOW. The first version
+# demanded `the|a|an|one|this|that` IMMEDIATELY followed by an allow-listed noun,
+# so "#1553 — the database check" and "`eval` — our scoring script" were COUNTED
+# (measured 0.50, below the 0.55 bar) — a well-explained question bounced, which is
+# the #1903 symptom this whole mark exists to end. The determiner set now includes
+# possessives and up to two words may sit between it and the head noun, so
+# "the database check" / "our scoring script" / "the superseded rows check"
+# explain. What still does NOT explain is punctuation alone or a bracket holding
+# only a token — `(#1553)`, `[`eval`]` — because there is no noun phrase there.
 _NUMBER_NOUN = (
     r"(?:file|script|gate|check|issue|ticket|row|function|module|command|doc"
     r"|document|PR|pull request|label|flag|mark|test|suite|rule|table|path|line"
     r"|patch|branch|commit)"
 )
+_DET = r"(?:the|a|an|one|this|that|its|our|their|my|your)"
+_NP = _DET + r"\s+(?:[\w.'\u2019-]+\s+){0,2}" + _NUMBER_NOUN + r"\b"
 _GAP = r"[\s)\].,;:\u2014\u2013(\[-]{0,3}"
 _GLOSS_AFTER = re.compile(
     r"^" + _GAP + r"(?:which\b|that is\b|i\.e\.|means\b"
-    r"|called\b|named\b"
-    r"|(?:the|a|an|one|this|that)\s+" + _NUMBER_NOUN + r"\b)",
+    r"|called\b|named\b|" + _NP + r")",
     re.I,
 )
 _GLOSS_BEFORE = re.compile(
-    r"(?:(?:the|a|an|one|this|that|its)\s+"
-    + _NUMBER_NOUN + r")\W{0,3}$",
+    r"(?:" + _NP + r")\W{0,3}$",
     re.I,
 )
 _GLOSS_WINDOW = 60                 # characters either side, not words
@@ -812,35 +821,43 @@ def owner_answered_at(repo, n):
     the owner actually performs. ONE api call per candidate, and the candidate set
     is tiny (only issues carrying a declaring comment).
 
-    ⛔ THE GATE ITSELF NOW WRITES THAT EVENT, so a removal is an answer only when it
-    is NEWER than the newest `labeled question-bounced` event. A bounce removes
-    `owner-decision` in the SAME api call that adds `question-bounced` (STEP 1 and
-    STEP 2), so its removal is never newer than that label event and cannot be read
-    back as an owner answer. Without this filter the gate fabricated an answer to the
-    question it had just bounced: the next tick reported `ANSWERED`, stamped
-    `owner-answered`+`answer-delivered` (a permanent skip) and cleared
-    `question-bounced`, so the question could never be re-scored — measured on the
-    pre-fix module, one bounce + one tick = a settled question nobody answered.
-    A genuine answer posted AFTER a bounce still counts, because its removal is
-    newer than the bounce event.
+    ⛔ THE GATE ITSELF WRITES THAT EVENT. A bounce removes `owner-decision` (STEP 1
+    and STEP 2) so the artifact stops reading as "live and returned at once"
+    (#1553). That makes the removal AMBIGUOUS, and any ordering test is unsound:
+    timestamp comparisons break on a bounce whose `--add-label question-bounced`
+    was a NO-OP (the label was already there, so no `labeled` event is written and
+    the removal looks newest), and on two events sharing one second. The invariant
+    that does hold is the LABEL STATE: a bounced question is not in the owner's
+    queue, so a removal while `question-bounced` is present is not an answer.
+    Measured on the ordering rule: the legacy both-labels state (#1553's actual
+    state) + one gate bounce was read as ANSWERED, stamped
+    `owner-answered,answer-delivered` (a permanent skip) and cleared
+    `question-bounced` — a question the gate had just bounced became a settled
+    question nobody answered.
+
+    ⚠️ DECLARED GAP (agent-infra#1969): because a bounce removes the queue label,
+    an owner who answers a BOUNCED question leaves no removal to observe, so that
+    answer is not detected by this signal — the question is re-scored instead. Pre-
+    #1903 the label stayed on and that path worked. Closing it needs a signal the
+    gate never writes (the bounce comment is identifiable by `BOUNCE_TAIL`, so a
+    newer non-template comment is the candidate); it is NOT closed here, and it is
+    not claimed to be.
     """
     rc, raw, _ = sh_status([
         "gh", "api", f"repos/{repo}/issues/{n}/timeline", "--paginate", "--jq",
-        '.[] | select((.event=="unlabeled" and .label.name=="owner-decision") '
-        'or (.event=="labeled" and .label.name=="' + BOUNCE_LABEL + '")) '
-        r'| "\(.event)\t\(.created_at)"',
+        '[.[] | select(.event=="unlabeled" and .label.name=="owner-decision") '
+        '| .created_at] | last // ""',
     ])
     if rc != 0:
         return None
-    removed, bounced = [], []
-    for line in raw.strip().splitlines():
-        ev, _, at = line.partition("\t")
-        if not at.strip():
-            continue
-        (removed if ev.strip() == "unlabeled" else bounced).append(at.strip())
-    newest_bounce = max(bounced) if bounced else ""
-    answers = [at for at in removed if at > newest_bounce]
-    return _iso(max(answers)) if answers else ""
+    if not raw.strip():
+        return ""
+    bounced = has_label(repo, n, BOUNCE_LABEL)
+    if bounced is None:
+        return None                       # UNKNOWN, never "no answer"
+    if bounced:
+        return ""                        # the gate's own bounce, or a removed-then-bounced question
+    return _iso(raw.strip().splitlines()[-1])
 
 
 def newest_decl_at(repo, n):
@@ -1108,17 +1125,17 @@ def scan(dry):
         for n in sorted(answered):
             if (repo, n) in seen:
                 continue
-            # RE-ASK THE ISSUE'S OWN TIMELINE, not the repo-wide event feed.
+            # RE-ASK THE ISSUE'S OWN STATE, not the repo-wide event feed.
             # The feed cannot tell an owner removal from the gate's own bounce
             # removal (both are `unlabeled owner-decision`); the per-issue read
-            # can, because it also sees the `labeled question-bounced` event the
-            # bounce wrote in the same call (see `owner_answered_at`). Skipping a
-            # candidate here loses nothing: the repo-wide event still exists, so
-            # the next tick re-finds it.
+            # can, because it also sees the `question-bounced` label the bounce
+            # writes (see `owner_answered_at`). Skipping a candidate here loses
+            # nothing: the repo-wide event still exists, so the next tick
+            # re-finds it. `None` is UNKNOWN — never deliver or fabricate on it.
             ua = owner_answered_at(repo, n)
             if ua is None:
                 scan_failed += 1
-                print(f"  SCAN FAILED (answer event) for {repo}#{n} — "
+                print(f"  SCAN FAILED (answer state) for {repo}#{n} — "
                       f"answer set is UNKNOWN for it")
                 continue
             if not ua:
@@ -1153,7 +1170,18 @@ def scan(dry):
         # as "not answered", which re-queues a question the owner has ALREADY
         # answered — the worst outcome available. Measured 2026-09-27: exactly that
         # turned tortoise#4155 into a BOUNCE minutes after it was found answered.
-        ua = ev_ans.get((repo, n)) or owner_answered_at(repo, n)
+        # So: use the event pass's verdict when it has one, and when we DO have to
+        # read, an unreadable answer state is UNKNOWN — never re-score on it.
+        # (Plain `or` laundered that `None` into "not answered"; #1911 review.)
+        if (repo, n) in ev_ans:
+            ua = ev_ans[(repo, n)]
+        else:
+            ua = owner_answered_at(repo, n)
+            if ua is None:
+                scan_failed += 1
+                print(f"  SCAN FAILED (answer state) for {repo}#{n} — "
+                      f"answer set is UNKNOWN; not re-scoring it")
+                continue
         nd = newest_decl_at(repo, n)
         if ua and nd and ua >= nd:
             routes = lane_workspaces(repo, n)
@@ -1268,7 +1296,16 @@ def score_text(text, repeat=1):
         ans, findings = language_marks(raw)
         result = jev(prose)
         if result is not None:
-            ans.update({k: v for k, v in (result.get("answers") or {}).items()})
+            got = result.get("answers") or {}
+            ans.update({k: v for k, v in got.items()})
+            # A 200 with a PARTIAL body is not a check: `verdict()` only scores the
+            # marks that are PRESENT, so an absent structural mark is silently
+            # skipped and the draft reads PASS (#1911 review). Absence is UNKNOWN.
+            missing = [m for m in QUESTIONS if m not in got]
+            if missing:
+                print("  jev returned no answer for " + ", ".join(missing)
+                      + " — those marks were NOT evaluated")
+                unchecked = True
         else:
             unchecked = True
         runs.append(ans)
@@ -1278,7 +1315,7 @@ def score_text(text, repeat=1):
             if score < threshold_for(name):
                 print(f"    {name}: " + "; ".join(str(w) for w in why))
         fails, _ = verdict(ans)
-        failed = bool(fails)
+        failed = failed or bool(fails)
         if fails:
             print("  failing (score<bar)    " + ", ".join(
                 f"{n} {ans[n].get('noul')}<{threshold_for(n)}" for n in fails))
@@ -1330,6 +1367,13 @@ def main(argv):
     # exists, not bounced over the wording of a question that is already settled.
     if not dry:
         ua = owner_answered_at(repo, number)
+        if ua is None:
+            # A failed read is UNKNOWN, never "not answered": scoring it could
+            # bounce a question the owner has already answered, and (since
+            # agent-infra#1903) the bounce would then remove the queue label.
+            print(f"could not read the answer state for {repo}#{number} — "
+                  f"UNKNOWN, this is NOT \"unanswered\". Nothing was scored; re-run.")
+            return 2
         if ua and ua >= (newest_decl_at(repo, number) or ""):
             # BOTH labels: this path has told the lane too, so the scan must not
             # notify it a second time. DELIVERED_LABEL is the skip predicate.
@@ -1364,6 +1408,16 @@ def main(argv):
     if result is None:
         return 2
     answers = result.get("answers", {})
+    # ⛔ A PARTIAL Jev BODY IS NOT A CHECK. `verdict()` only scores the marks that are
+    # PRESENT, so a 200 carrying none (or some) of the five structural marks used to
+    # sail through as PASS while those marks were never evaluated — the same
+    # empty-read-as-success shape this file exists to refuse (#1911 review). The two
+    # language marks are computed below, so they are always present.
+    missing = [m for m in QUESTIONS if m not in answers]
+    if missing:
+        print(f"jev returned no answer for {', '.join(missing)} — cannot check "
+              f"(this is NOT a pass)")
+        return 2
     mech, mech_findings = language_marks(text)
     answers.update(mech)
     failures, problem = verdict(answers)

@@ -15,12 +15,16 @@ identifiers / sentence length). These tests pin the properties that make it usab
     which is the measurement agent-infra#1903 asked for and the old mark could not give;
   * the bounce NAMES the occurrence it counted, so a lane fixes the text instead of
     guessing which axis the score meant;
-  * a bounce takes the question out of the owner's queue, so an artifact can no longer
-    read `owner-decision` + `question-bounced` at the same time.
+  * a bounce takes the question out of the owner's queue, and the gate's own removal
+    is NEVER read back as an owner answer (the label state, not event ordering, is
+    the invariant — see `owner_answered_at`).
 
-Each test below fails on the pre-fix module: `language_marks` did not exist (the two
-marks were Jev's `QUESTIONS` entries), `QUESTIONS` listed them, and a bounce did not
-remove `owner-decision`.
+The pre-fix baseline is stated per test, not as one claim for the file: the 17 tests
+from 8f7c4b78 were measured against `main`'s module (16 failed, 1 passed — the
+pass-path guard), and the tests added or changed by the #1911 review fixes were
+measured against `2f98c3ac4`'s module (9 changed, 7 failed there; the two that pass
+are the anti-over-fix guards, by design — a bracketed EXPLANATION must still count,
+and a passing draft must still exit 0).
 """
 import importlib.util
 import io
@@ -294,29 +298,40 @@ def test_score_file_repeat_reports_a_zero_spread(monkeypatch, tmp_path):
 
 # ── the gate's own bounce must not be read back as an owner answer ─────────────
 
-def _stub_timeline(monkeypatch, events):
-    """Stub the TRANSPORT only: return the rows a real `gh api .../timeline` emits.
+def _stub_timeline(monkeypatch, events, labels=None, rc=0):
+    """Stub the TRANSPORT only: the rows a real `gh api .../timeline` emits.
 
-    `owner_answered_at` still runs its real parse on them, so the exclusion under
-    test is the one the gate actually applies. `events` = [(event, label, at)],
-    oldest first.
+    `owner_answered_at` still runs its real parse and its real label read on these,
+    so the exclusion under test is the one the gate actually applies. `events` =
+    [(event, label, at)], oldest first; the LABEL STATE `has_label` sees is derived
+    from them (last event wins) unless `labels` overrides it — that is what a real
+    issue looks like after those events.
     """
-    rows = "\n".join(f"{ev}\t{at}" for ev, _label, at in events)
+    removed = [at for ev, label, at in events
+               if ev == "unlabeled" and label == "owner-decision"]
+    newest_removal = max(removed) if removed else ""
+    state = set()
+    for ev, label, _at in events:
+        (state.add if ev == "labeled" else state.discard)(label)
+    if labels is not None:
+        state = set(labels)
 
     def sh_status(args, timeout=None):
         call = " ".join(str(a) for a in args)
         if "timeline" in call:
-            return (0, rows, "")
-        if "/comments" in call or "issue view" in call:
+            return (rc, newest_removal, "")
+        if "labels" in call:
+            return (0, ",".join(sorted(state)), "")
+        if "comments" in call:
             return (0, "2026-10-17T10:00:00Z", "")   # the declaration
         return (0, "", "")
 
     monkeypatch.setattr(ao, "sh_status", sh_status)
 
 
-def _timeline_gate(monkeypatch, events, text=V3):
+def _timeline_gate(monkeypatch, events, text=V3, labels=None, rc=0):
     """Run `main` against the FAKE issue timeline `events` (see `_stub_timeline`)."""
-    _stub_timeline(monkeypatch, events)
+    _stub_timeline(monkeypatch, events, labels=labels, rc=rc)
     rec = _Recorder()
     monkeypatch.setattr(ao, "sh", rec)
     monkeypatch.setattr(ao, "fetch_question", lambda repo, n: text)
@@ -326,8 +341,8 @@ def _timeline_gate(monkeypatch, events, text=V3):
     })
     out = io.StringIO()
     with redirect_stdout(out):
-        rc = ao.main(["daniel-ospina/agent-infra", "1553"])
-    return rc, rec, out.getvalue()
+        rc2 = ao.main(["daniel-ospina/agent-infra", "1553"])
+    return rc2, rec, out.getvalue()
 
 
 def test_a_bounce_is_not_read_back_as_an_owner_answer(monkeypatch):
@@ -340,9 +355,8 @@ def test_a_bounce_is_not_read_back_as_an_owner_answer(monkeypatch):
     `question-bounced` — a question the gate had just bounced became a settled
     question nobody answered, and the lane was told a ruling existed.
     """
-    # What the timeline looks like one tick AFTER the gate bounced the question:
-    # declaration 10:00, the gate's own bounce 10:05 (label added + queue label
-    # removed in ONE api call, hence the same timestamp), no human action at all.
+    # One tick AFTER the gate bounced the question: declaration 10:00, the gate's
+    # own bounce 10:05 (label added + queue label removed), no human action at all.
     events = [
         ("labeled", "owner-decision", "2026-10-17T09:00:00Z"),
         ("unlabeled", "owner-decision", "2026-10-17T10:05:00Z"),
@@ -357,12 +371,33 @@ def test_a_bounce_is_not_read_back_as_an_owner_answer(monkeypatch):
     assert not [c for c in rec.find("edit") if "answer-delivered" in " ".join(c)], rec.calls
 
 
-def test_an_answer_after_a_bounce_is_still_delivered(monkeypatch):
-    """The exclusion must not swallow a REAL answer: a removal newer than the bounce."""
+def test_a_bounce_whose_label_add_was_a_noop_is_still_not_an_answer(monkeypatch):
+    """`question-bounced` ALREADY on the issue: the add writes no `labeled` event.
+
+    agent-infra#1553's real state was both labels at once (a pass re-added
+    `owner-decision` while `question-bounced` was still there). A bounce then adds a
+    label that is already present — NO `labeled` event — and removes
+    `owner-decision`, so any "newer than the newest bounce event" ordering rule reads
+    the gate's own removal as the newest event and calls it an answer. The label
+    STATE is the invariant that holds; the ordering is not.
+    """
     events = [
-        ("unlabeled", "owner-decision", "2026-10-17T10:05:00Z"),   # the gate's bounce
-        ("labeled", "question-bounced", "2026-10-17T10:05:00Z"),
-        ("unlabeled", "owner-decision", "2026-10-17T11:30:00Z"),   # the owner, later
+        ("labeled", "owner-decision", "2026-10-17T09:00:00Z"),
+        ("labeled", "question-bounced", "2026-10-17T09:30:00Z"),   # already there
+        ("unlabeled", "owner-decision", "2026-10-17T10:00:01Z"),   # the gate's bounce
+    ]
+    _stub_timeline(monkeypatch, events)
+    assert ao.owner_answered_at("daniel-ospina/agent-infra", 1553) == ""
+    rc, rec, out = _timeline_gate(monkeypatch, events)
+    assert "ANSWERED" not in out, out
+    assert not [c for c in rec.find("edit") if "answer-delivered" in " ".join(c)], rec.calls
+
+
+def test_a_removal_on_a_live_question_is_still_an_answer(monkeypatch):
+    """The exclusion must not swallow the normal answer: a live question's removal."""
+    events = [
+        ("labeled", "owner-decision", "2026-10-17T09:00:00Z"),
+        ("unlabeled", "owner-decision", "2026-10-17T11:30:00Z"),   # the owner
     ]
     _stub_timeline(monkeypatch, events)
     assert ao.owner_answered_at("daniel-ospina/agent-infra", 1553) == "2026-10-17T11:30:00"
@@ -370,6 +405,22 @@ def test_an_answer_after_a_bounce_is_still_delivered(monkeypatch):
     assert "ANSWERED" in out, out
     assert rc == 0, out
     assert [c for c in rec.find("edit") if "answer-delivered" in " ".join(c)], rec.calls
+
+
+def test_an_unreadable_answer_state_is_unknown_not_unanswered(monkeypatch):
+    """A failed timeline read must NOT become a bounce.
+
+    Pre-fix (`f3496a12`): `ua = owner_answered_at(...)` was tested for truthiness, so
+    `None` (read FAILED) took the same branch as "no removal" — the answered question
+    was re-scored, bounced, and the bounce then removed its queue label. The file's
+    own comment beside that call names this the worst outcome available.
+    """
+    events = [("unlabeled", "owner-decision", "2026-10-17T10:30:00Z")]   # a real answer
+    rc, rec, out = _timeline_gate(monkeypatch, events, rc=1)
+    assert rc == 2, out                        # UNKNOWN, not a bounty
+    assert "UNKNOWN" in out and "NOT" in out, out
+    assert "BOUNCE" not in out, out
+    assert not rec.find("issue", "comment"), rec.calls
 
 
 # ── punctuation is not a gloss ────────────────────────────────────────────────
@@ -409,6 +460,35 @@ def test_a_bracketed_explanation_still_counts_as_explained():
         score, findings = ao.jargon_free_score(text)
         assert findings == [], (text, findings)
         assert score == 1.0, (text, score)
+
+
+def test_a_real_noun_phrase_explains_even_unlisted_or_possessive():
+    """"the database check", "our scoring script" — real glosses, not jargon.
+
+    The first version of the tightening demanded `the|a|an|one|this|that` immediately
+    followed by one of 19 allow-listed nouns, so these were COUNTED (0.50, under the
+    0.55 bar): a well-explained question bounced — exactly the #1903 symptom ("a check
+    that is supposed to send badly written questions back is rejecting well written
+    ones"). The bracket-only laundering this commit closes is still closed; see
+    `test_bracketing_a_reference_does_not_launder_it`.
+    """
+    for text in (
+        "See #1553 — the database check — and `eval` — the scoring check.",
+        "See #1553 (the database check) and `eval` (the scoring check).",
+        "See #1553 — our database check — and `eval` — our scoring script.",
+    ):
+        score, findings = ao.jargon_free_score(text)
+        assert findings == [], (text, findings)
+        assert score == 1.0, (text, score)
+
+
+def test_brackets_holding_only_a_token_do_not_explain():
+    """The complement: `(#1553)` has no words, so it cannot be a gloss."""
+    score, findings = ao.jargon_free_score(
+        "See (#1553) and (`eval`) for it, plus [agent-infra#1903].")
+    counted = [tok for _, tok in findings]
+    assert score < BAR, score
+    assert "#1553" in counted and "eval" in counted, counted
 
 
 # ── `--score-file` exits with the VERDICT, not "it ran" ──────────────────────
@@ -461,6 +541,64 @@ def test_score_file_exits_zero_for_a_draft_that_passes(monkeypatch, tmp_path):
     with redirect_stdout(out):
         rc = ao.main(["--score-file", str(p)])
     assert rc == 0, out.getvalue()
+
+
+def test_score_file_repeat_fails_if_ANY_run_fails(monkeypatch, tmp_path):
+    """`--repeat N` is the NULL PAIR, so its runs legitimately disagree.
+
+    Pre-fix: `failed` was overwritten each run, so a draft that failed on run 1 and
+    passed on run 3 (sticky `unchecked` was already right, `failed` was not) printed
+    "would PASS" and exited 0 — a self-contradicting report, and the false-PASS
+    direction the docstring says must never drift. `--repeat` is not a corner here:
+    a single live Jev call is a coin flip exactly when its runs disagree.
+    """
+    p = tmp_path / "draft.md"
+    p.write_text(V9)
+    scores = iter([0.1, 0.99, 0.99])          # run 1 fails every structural mark
+
+    def jev(state):
+        v = next(scores, 0.99)
+        return {"answers": {m: {"type": "noul", "noul": v} for m in ao.QUESTIONS},
+                "usage": {"cost_usd": 0.0}}
+
+    monkeypatch.setattr(ao, "jev", jev)
+    out = io.StringIO()
+    with redirect_stdout(out):
+        rc = ao.main(["--score-file", str(p), "--repeat", "3"])
+    assert rc == 1, out.getvalue()
+    assert "would BOUNCE" in out.getvalue(), out.getvalue()
+
+
+def test_a_partial_jev_body_is_not_a_pass(monkeypatch, tmp_path):
+    """HTTP 200 with SOME (or none) of the five structural marks is UNKNOWN.
+
+    Pre-fix: `verdict()` only scores the marks PRESENT, so a partial body sailed
+    through with "would PASS" (and the live gate did the same) while five of the
+    seven marks were never evaluated — absence read as success.
+    """
+    p = tmp_path / "draft.md"
+    p.write_text(V9)
+    monkeypatch.setattr(ao, "jev", lambda state: {
+        "answers": {"has_context": {"type": "noul", "noul": 0.99}},   # 1 of 5
+        "usage": {"cost_usd": 0.0},
+    })
+    out = io.StringIO()
+    with redirect_stdout(out):
+        rc = ao.main(["--score-file", str(p)])
+    assert rc == 2, out.getvalue()
+    assert "has_options" in out.getvalue(), out.getvalue()
+
+    # …and the LIVE gate refuses it too, instead of labelling the question PASS.
+    rec = _Recorder()
+    monkeypatch.setattr(ao, "sh", rec)
+    monkeypatch.setattr(ao, "sh_status", lambda args, timeout=None: (0, "", ""))
+    monkeypatch.setattr(ao, "fetch_question", lambda repo, n: V9)
+    out = io.StringIO()
+    with redirect_stdout(out):
+        rc = ao.main(["daniel-ospina/agent-infra", "1903"])
+    assert rc == 2, out.getvalue()
+    assert "cannot check" in out.getvalue(), out.getvalue()
+    assert not [c for c in rec.find("edit") if "owner-decision" in " ".join(c)], rec.calls
 
 
 # ── the offline instrument scores the same TEXT the gate sees ─────────────────
