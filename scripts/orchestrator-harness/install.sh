@@ -51,7 +51,30 @@ MAX_LOAD="${MAX_LOAD:-$(( 10#$_NCPU * 10 ))}"
 # that `[ -ge ]` never binds); only a true default does. `is_limit` must NOT reject `0` — it also
 # validates plist limits where 0 is legal (see the `0) : ;;` arm below).
 is_limit "${MAX_LOAD:-}" || MAX_LOAD=$(( 10#$_NCPU * 10 )); is_limit "${MAX_LOAD:-}" || MAX_LOAD=40
-MAX_LANES="${MAX_LANES:-4}"
+# ⛔ CAPACITY GATES DISPATCH, NOT A LANE COUNT (owner ruling, 2026-10-17): "dispatch should be gated
+# on capacity, not on number of lanes. max lanes 8 is too low. that needs to be configured to 2.5x
+# the number of CPUs". Both numbers in play here were LANE COUNTS, neither derived from cores: the
+# shipped default was a FLAT 4, and the box where this was measured had its plist pinned at 8 —
+# `[cap] load=79/100 lanes=9/8 … [dispatch] skipped (lanes=9>=max_lanes=8)` — 21 points of load
+# headroom and comfortable swap/memory, so the fleet sat idle while capacity was available, and
+# dispatch was refused because 9 lanes >= 8. A 4-core box got the same 4 that the HARDWARE should
+# have decided. Same rule as MAX_LOAD above, same `_NCPU` probe, same guards (see the block above).
+# A box only picks the derived default up on a fresh render: the live plist PINS the number.
+# Integer division, so it FLOORS: 10 cores -> 25, 4 -> 10, 3 -> 7. An EXPLICIT MAX_LANES (env /
+# plist / keys.env) still WINS and is never recomputed HERE — refusing or replacing an operator's pin
+# is the loop's decision, not the renderer's. The pin reaches the controller through $ENV_FILE, and
+# cloud-cell-supervisor.sh:1198 records why it has to: the tmux SERVER supplies a new session's
+# environment, so an exported ceiling is silently dropped and would revert to its default.
+MAX_LANES="${MAX_LANES:-$(( 10#$_NCPU * 5 / 2 ))}"
+# ⛔ BOUND THE DERIVATION, NOT A PINNED VALUE — and only the derivation CAN be out of range here:
+# `_NCPU` is `is_limit`-bounded to nine digits, and `* 5 / 2` carries that to TEN (999999999 ->
+# 2499999997), which the range check below would then refuse while blaming MAX_LANES for a probe
+# that is not its fault. `MAX_LOAD` above is bounded for the identical reason. An explicit value is
+# never silently replaced: a non-number, a leading zero or a value over nine digits still reaches
+# the range loop below and is REFUSED there, because a value this installer accepts must be the
+# value the loop uses. The one explicit value this CAN touch is one identical to the derivation —
+# the same absurd probe-derived number — so bounding that is the repair, not a substitution.
+if [ "$MAX_LANES" = "$(( 10#$_NCPU * 5 / 2 ))" ]; then is_limit "$MAX_LANES" || MAX_LANES=10; fi
 MAX_REVIEW="${MAX_REVIEW:-4}"
 MERGE_PRIORITY_AT="${MERGE_PRIORITY_AT:-25}"
 MAX_FIX="${MAX_FIX:-3}"
@@ -397,8 +420,8 @@ done
 # uses. 5s, not 240, so a deliberately small cycle is not silently replaced.
 [ "$CYC" -ge 5 ] || die "CYC=$CYC is below the 5s floor — a zero (or near-zero) cycle re-hits the GitHub API with no delay"
 # Each value is substituted by its OWN sed rule and the rules run IN ORDER, so a value carrying a
-# LATER token is rewritten by that later rule: `OR=__MAX_LANES__` rendered as `4` — exit 0, plutil OK,
-# and the daemon then ran `gh --repo 4`. Refusing it at the input also means the post-render assertion
+# LATER token is rewritten by that later rule: `OR=__MAX_LANES__` rendered as the default (then a
+# literal `4`; 2.5x cores now) — exit 0, plutil OK, and the daemon then ran `gh --repo 4`. Refusing it at the input also means the post-render assertion
 # below can only fire on a genuinely unrendered TEMPLATE token, never on a value that merely looks
 # like one (a legal `O=/tmp/__DATA__host` used to be refused with a diagnostic naming the wrong cause).
 for _v in "$O" "$REPO" "$OR" "$SCOPE" "$HOME" "$DAEMON_PATH"; do
@@ -661,7 +684,7 @@ cat <<EOF
   harness   $O
   provenance  $STAMP   (which harness commit this box runs — agent-infra#1745)
   repo      $REPO   ($OR)
-  limits    lanes=$MAX_LANES review=$MAX_REVIEW fix=$MAX_FIX fix_tries=$MAX_FIX_TRIES
+  limits    lanes=$MAX_LANES (2.5x $_NCPU cores unless pinned) review=$MAX_REVIEW fix=$MAX_FIX fix_tries=$MAX_FIX_TRIES
             max_load=$MAX_LOAD min_swap_free=${MIN_SWAP_FREE}M min_mem_free_mb=${MIN_MEM_FREE_MB}M batch=$BATCH cycle=${CYC}s
             merge_priority_at=${MERGE_PRIORITY_AT} UNOWNED open PRs
 
