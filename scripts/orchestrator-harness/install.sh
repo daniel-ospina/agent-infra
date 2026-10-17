@@ -301,12 +301,57 @@ fi
 for f in "$HERE"/*.sh; do
   bash -n "$f" || die "syntax error in $(basename "$f")"
 done
+# the gh REST adapter is a bin shim, not a *.sh — check it explicitly (#1959)
+[ -f "$HERE/gh-rest/gh" ] && { bash -n "$HERE/gh-rest/gh" || die "syntax error in gh-rest/gh"; }
 ok "all shipped scripts parse"
 
 # ── state dir ────────────────────────────────────────────────────────────────────
 mkdir -p "$O/logs" "$O/state" "$O/wip"
 touch "$O/candidates.txt" "$O/dispatched.txt" "$O/checked.txt"
 ok "state dir $O"
+
+# ── gh REST adapter (#1959) ─────────────────────────────────────────────────────
+# Installed FIRST on the daemon PATH so every gh call the harness makes can be served over REST when
+# GraphQL is refused. Measured 2026-10-17: a GraphQL refusal stopped BOTH halves of the harness —
+# fleet_state.py could not read its board (dispatch logged "no verdict" and an empty backlog) and the
+# sweep's per-PR reads returned nothing (NO PR could merge) — while the REST budget answered normally
+# the entire time. See gh-rest/gh for the translation table and the fidelity notes.
+if [ -f "$HERE/gh-rest/gh" ]; then
+  mkdir -p "$O/gh-rest" || die "cannot create $O/gh-rest"
+  if [ -f "$O/gh-rest/gh" ] && ! diff -q "$HERE/gh-rest/gh" "$O/gh-rest/gh" >/dev/null 2>&1; then
+    warn "replacing a DIFFERENT $O/gh-rest/gh — the installed adapter was stale"
+  fi
+  cp "$HERE/gh-rest/gh" "$O/gh-rest/gh" || die "cannot install $O/gh-rest/gh"
+  chmod +x "$O/gh-rest/gh"               || die "cannot chmod $O/gh-rest/gh"
+  # ⛔ Route the PATH entry through add_dir, NOT a bare assignment: add_dir applies the TCC guard
+  # (a physical path under ~/Documents is EPERM for launchd) that no install-time probe can see.
+  add_dir "$O/gh-rest"
+  case ":$DAEMON_PATH:" in
+    *":$O/gh-rest:"*)
+      # MOVE it to the front — the shim must win over the real gh.
+      _np=""; IFS=: read -r -a _parts <<<"$DAEMON_PATH"
+      for _p in "${_parts[@]}"; do [ "$_p" = "$O/gh-rest" ] && continue; _np="${_np:+$_np:}$_p"; done
+      DAEMON_PATH="$O/gh-rest${_np:+:$_np}"
+      # ⛔ The shim resolves the REAL gh by walking PATH past itself. If the real binary's directory
+      # were dropped, the shim finds nothing and every gh call exits 127 — the empty-queue idle this
+      # block exists to prevent, now caused by the fix. Refuse rather than install that.
+      _real=""
+      IFS=: read -r -a _parts2 <<<"$DAEMON_PATH"
+      for _p in "${_parts2[@]}"; do
+        [ "$_p" = "$O/gh-rest" ] && continue
+        [ -x "$_p/gh" ] && { _real="$_p/gh"; break; }
+      done
+      [ -n "$_real" ] || die "no real gh behind the adapter on the daemon PATH — every gh call would exit 127"
+      # The PATH rendered into the plist must be the PATH we PROVED runs gh (the false-green guard).
+      PATH="$DAEMON_PATH" gh --version >/dev/null 2>&1 \
+        || die "the final daemon PATH cannot run gh (adapter=$O/gh-rest/gh real=$_real)"
+      ok "gh REST adapter -> $O/gh-rest (first on the daemon PATH; real gh at $_real)"
+      ;;
+    *) warn "add_dir refused $O/gh-rest (TCC: unreadable path) — the daemon will use GraphQL only" ;;
+  esac
+else
+  warn "gh-rest/gh missing from the shipped set — the daemon will reach GitHub over GraphQL only"
+fi
 
 # ── render plist ─────────────────────────────────────────────────────────────────
 echo "==> rendering $PLIST"
@@ -415,14 +460,14 @@ ok "plist valid"
 # missing AGENT_DISK_REFUSED, which under `set -u` aborts a refusal before its refund (the callers
 # are tolerant of that now, but surviving a stale helper silently is not the same as DETECTING it).
 DRIFTED=""
-for f in orch-loop.sh claims.sh repo-authority.sh spawn-gate.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh; do
+for f in orch-loop.sh claims.sh repo-authority.sh spawn-gate.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh gh-rest/gh; do
   [ -f "$O/$f" ] || { DRIFTED="$DRIFTED $f(missing)"; continue; }
   diff -q "$HERE/$f" "$O/$f" >/dev/null 2>&1 || DRIFTED="$DRIFTED $f"
 done
 if [ -n "$DRIFTED" ]; then
   warn "the running copy at \$O differs from the shipped copy:$DRIFTED"
   warn "  the daemon executes \$O/<script> — sync them or the fixes here are not in effect:"
-  warn "  cp '$HERE'/*.sh '$O'/";
+  warn "  cp '$HERE'/*.sh '$O'/ && mkdir -p '$O/gh-rest' && cp '$HERE'/gh-rest/gh '$O/gh-rest/'";
 fi
 
 # ── harness provenance (agent-infra#1745) ────────────────────────────────────────
@@ -477,6 +522,13 @@ prov_payload_hash() {
     (
       cd "$O" || exit 3
       for f in *.sh; do [ -f "$f" ] || continue; $PROV_SHA "$f" || exit 3; done
+      # ⛔ gh-rest/gh is NOT folded in here. The payload digest and check-deployed-drift.sh
+      # compute it over the shell files in $O; adding a non-shell file in one place alone
+      # makes every HEALTHY deployment read as drift. Covering the adapter, and
+      # launchd.plist.template which has the same gap, needs the stamp, the drift checker
+      # and selftest changed together. Tracked separately; do not half-fix it here.
+      # ⛔ NEVER put an open paren in a comment nested in command substitution — bash
+      # counts it as syntax and swallows the rest of the file looking for the match.
     ) | $PROV_SHA | awk '{print $1}' )" || return 1
   [ -n "$out" ] || return 1
   printf '%s' "$out"

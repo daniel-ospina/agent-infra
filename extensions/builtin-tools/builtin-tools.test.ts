@@ -32,7 +32,8 @@ import { ok, equal, deepEqual } from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { spawn, execSync } from "node:child_process";
 import { treeKill } from "../shared/tree-kill.js";
-import { readFileSync, renameSync, existsSync, writeFileSync, rmSync, mkdirSync, chmodSync, mkdtempSync, realpathSync } from "node:fs";
+import { readFileSync, renameSync, existsSync, writeFileSync, rmSync, mkdirSync, chmodSync, mkdtempSync, realpathSync, utimesSync, statSync } from "node:fs";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import {
@@ -51,6 +52,20 @@ import {
   scanStderrForUsage,
 } from "./index.js";
 import { readLatchState, setExhausted, familyOf, familyLegs } from "../shared/provider-failover.js";
+// #1662 — background dispatch + status/collect seam.
+import { startBackgroundTask, evaluateTaskRunStatus, collectTaskRun, getHeartbeatTimeoutMs, formatCollectedRunHead, buildBackgroundDispatchResult } from "./index.js";
+import {
+  mintRunId,
+  resolveTaskRunsRoot,
+  readRunRecord,
+  writeRunRecord,
+  runRecordPath,
+  safeRunId,
+  runLogPath,
+  pidAlive,
+  SETTLE_GRACE_MS,
+  DEFAULT_TASK_RUNS_ROOT,
+} from "../shared/task-runs.js";
 import type { ExhaustionMarker, LegRef } from "../shared/provider-failover.js";
 import { dirname, join, resolve } from "node:path";
 
@@ -7560,7 +7575,928 @@ test("#1508 — the registered tool_result handler turns a failed child into isE
   equal(h({ toolName: "task", isError: true, details: { exitCode: 1 } }), undefined, "an already-errored result is left alone");
   equal(h({ toolName: "task", isError: false, details: undefined }), undefined, "no details → nothing to prove, stays a success");
   equal(h({ toolName: "task", isError: false, details: { status: "ok" } }), undefined, "a status this hook does not know as a failure stays a success");
+  // #1662 review: `task_collect` reaps a terminal background lane under its own
+  // details shape (`status` done|failed|cut + snake_case `exit_code`), so a
+  // failure/cut lane must not slip back through as isError:false.
+  deepEqual(h({ toolName: "task_collect", isError: false, details: { terminal: true, status: "failed", exit_code: null } }), { isError: true }, "a collected failed lane is an error");
+  deepEqual(h({ toolName: "task_collect", isError: false, details: { terminal: true, status: "cut", exit_code: 0 } }), { isError: true }, "a collected cut lane (exit 0) is an error");
+  deepEqual(h({ toolName: "task_collect", isError: false, details: { terminal: true, status: "done", exit_code: 1 } }), { isError: true }, "a nonzero exit is an error");
+  equal(h({ toolName: "task_collect", isError: false, details: { terminal: true, status: "done", exit_code: 0 } }), undefined, "a clean collect stays a success");
+  equal(h({ toolName: "task_collect", isError: false, details: { terminal: false, status: "alive" } }), undefined, "a not-finished notice is not an error");
 });
+
+// ═══════════════════════════════════════════════════════════
+// #1662 — background task dispatch (returns-early) + status/collect
+// ═══════════════════════════════════════════════════════════
+section("#1662 — task-runs registry (shared/task-runs.ts)");
+
+test("#1662: safeRunId rejects path-escape shapes and accepts a uuid", () => {
+  ok(safeRunId(mintRunId()) !== null, "a minted uuid is a safe segment");
+  equal(safeRunId("../escape"), null, "a `..` segment is refused");
+  equal(safeRunId("/etc/passwd"), null, "an absolute path is refused");
+  equal(safeRunId("a/b"), null, "a slash is refused");
+  equal(safeRunId(""), null, "empty is refused");
+  equal(safeRunId(undefined), null, "non-string is refused");
+});
+
+test("#1662: run records round-trip atomically; a corrupt record reads as ABSENT", () => {
+  const dir = mkdtempSync(join(tmpdir(), "t1662-runs-"));
+  try {
+    const id = mintRunId();
+    const rec = {
+      run_id: id,
+      pid: 4242,
+      pgid: 4242,
+      log_path: runLogPath(dir, id),
+      started_at: 123,
+      model: "deepseek-v4-flash",
+      provider: "deepseek",
+      cwd: dir,
+      nonce: "abc123",
+      status: "running" as const,
+    };
+    const w = writeRunRecord(dir, rec as any);
+    ok(w.ok, `write succeeds: ${w.error ?? ""}`);
+    deepEqual(readRunRecord(dir, id), rec, "exact round-trip");
+    // Corrupt on disk → null, never a confident terminal state.
+    writeFileSync(join(dir, `${id}.json`), "{not json", "utf-8");
+    equal(readRunRecord(dir, id), null, "corrupt record reads as absent");
+    equal(readRunRecord(dir, "does-not-exist"), null, "missing record reads as absent");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("#1662: pidAlive is true for this process, false for a dead/invalid pid", () => {
+  equal(pidAlive(process.pid), true, "our own pid is alive");
+  equal(pidAlive(999_999_999), false, "an out-of-range pid is dead");
+  equal(pidAlive(null), false, "null is dead");
+  equal(pidAlive(1), false, "pid 1 is never probed (never signal init/PID 1)");
+});
+
+test("#1662: resolveTaskRunsRoot honours TASK_RUNS_ROOT, else the ~/.pi default", () => {
+  equal(resolveTaskRunsRoot({}), DEFAULT_TASK_RUNS_ROOT, "default is ~/.pi/agent/task-runs");
+  equal(resolveTaskRunsRoot({ TASK_RUNS_ROOT: "/tmp/x" }), "/tmp/x", "env override wins");
+  equal(resolveTaskRunsRoot({ TASK_RUNS_ROOT: "~/sub" }), join(process.env.HOME ?? "", "sub"), "tilde expands");
+});
+
+test("#1662: getHeartbeatTimeoutMs mirrors the shipped 30-min T declaration", () => {
+  withEnv({ TASK_HEARTBEAT_TIMEOUT_MS: undefined }, () => {
+    equal(getHeartbeatTimeoutMs(), 1_800_000, "default T is 30 min");
+  });
+  withEnv({ TASK_HEARTBEAT_TIMEOUT_MS: "1000" }, () => {
+    equal(getHeartbeatTimeoutMs(), 60_000, "T is clamped to the 60s floor");
+  });
+  // The source pin (this file, above) requires the DECLARATION to stay a single
+  // `const HEARTBEAT_TIMEOUT_MS = Math.max(...)`; the getter must not duplicate it.
+  const occurrences = source.match(/^[ \t]*const\s+HEARTBEAT_TIMEOUT_MS\s*=/gm) ?? [];
+  equal(occurrences.length, 1, "the T declaration still occurs exactly once");
+});
+
+section("#1662 — task_status derivation (markers, never %CPU)");
+
+// A record whose pid is OUR pid (alive) and whose log holds a fresh, nonce-signed
+// marker stream. `utimesSync` lets the wedged twin make the log stale.
+function seedRunningRun(
+  dir: string,
+  opts: {
+    nonce?: string | null;
+    markers?: string;
+    logAgeMs?: number;
+    /** started_at is pushed back this far so `age_ms` can exceed a bound. */
+    ageMs?: number;
+    /** the resolved stream-stall bound persisted on the record (S). */
+    streamStallMs?: number;
+    /** override the probed pid (a dead pid simulates a lost parent/child). */
+    pid?: number | null;
+  } = {},
+) {
+  const id = mintRunId();
+  const log = runLogPath(dir, id);
+  const nonce = opts.nonce === undefined ? "testnonce" : opts.nonce;
+  const nm = nonce ? ` nonce=${nonce}` : "";
+  writeFileSync(
+    log,
+    opts.markers ??
+      `[task-heartbeat] ready${nm}\n[task-heartbeat] turn_start${nm} 1\n[task-heartbeat] tool_start${nm} t1 bash\n[task-heartbeat] tick${nm} tools=1 turn=1 stream_age_ms=1000 tool_age_max_ms=2000 saw_msg=0 saw_tool=1\n`,
+    "utf-8",
+  );
+  if (opts.logAgeMs) {
+    const t = new Date(Date.now() - opts.logAgeMs);
+    utimesSync(log, t, t);
+  }
+  const rec = {
+    run_id: id,
+    pid: opts.pid === undefined ? process.pid : opts.pid,
+    pgid: opts.pid === undefined ? process.pid : opts.pid,
+    log_path: log,
+    started_at: Date.now() - (opts.ageMs ?? 0),
+    model: "deepseek-v4-flash",
+    provider: "deepseek",
+    cwd: dir,
+    nonce,
+    ...(opts.streamStallMs !== undefined ? { stream_stall_ms: opts.streamStallMs } : {}),
+    status: "running" as const,
+  };
+  writeRunRecord(dir, rec as any);
+  return { id, rec };
+}
+
+test("#1662: a live pid with fresh nonce-signed markers reads ALIVE", () => {
+  const dir = mkdtempSync(join(tmpdir(), "t1662-alive-"));
+  try {
+    withEnv({ TASK_HEARTBEAT_TIMEOUT_MS: undefined }, () => {
+      const { id } = seedRunningRun(dir);
+      const v = evaluateTaskRunStatus(id, dir);
+      equal(v.status, "alive", `got ${v.status}: ${v.note ?? ""}`);
+      equal(v.alive, true, "alive flag");
+      equal(v.terminal, false, "not terminal");
+      equal(v.heartbeat?.tools_in_flight, 1, "marker state is surfaced");
+      equal(v.review_gate, "parent-required", "the review gate is a parent step");
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("#1662: ALIVE is not derived from %CPU — a quiet-but-live marker stream stays alive (the 0%-CPU footgun)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "t1662-cpu-"));
+  try {
+    withEnv({ TASK_HEARTBEAT_TIMEOUT_MS: undefined }, () => {
+      // A lane mid long tool call: fresh markers, no completed progress — the
+      // slow-tool shape that reads 0 % CPU. The status seam must NOT call it wedged.
+      const { id } = seedRunningRun(dir, {
+        markers: `[task-heartbeat] tool_start nonce=testnonce t1 bash\n[task-heartbeat] tick nonce=testnonce tools=1 turn=1 stream_age_ms=60000 tool_age_max_ms=120000 saw_msg=0 saw_tool=1\n`,
+      });
+      equal(evaluateTaskRunStatus(id, dir).status, "alive", "a quiet-but-marking lane is alive");
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("#1662: an in-flight tool past the DEFAULT bound but under the dispatch's stream_stall_ms stays ALIVE", () => {
+  const dir = mkdtempSync(join(tmpdir(), "t1662-s-override-"));
+  try {
+    withEnv({ TASK_HEARTBEAT_TIMEOUT_MS: undefined, TASK_STREAM_STALL_MS: undefined, TASK_CPU_STALL_MS: undefined }, () => {
+      // 21.7 min of IN-FLIGHT TOOL SILENCE — `stream_age_ms` is 21.7 min too, so
+      // the effective stream age really does exceed the 20-min DEFAULT (a
+      // hardcoded comparison says wedged) while staying under the 60-min bound
+      // this lane was dispatched with. `tool_updates=1 cpu_advanced=1
+      // cpu_stall_ms=2000000` is the no-progress evidence clause 1 requires, so
+      // this fixture reaches the `streamStallMs` comparison — without them
+      // `inFlightProgress` returns "unknown" and the lane stays `alive` under
+      // ANY bound, so the test could not fail for the reason it names (#1662
+      // review: the pre-fix fixture carried neither field).
+      const { id } = seedRunningRun(dir, {
+        streamStallMs: 3_600_000,
+        markers: `[task-heartbeat] tool_start nonce=testnonce t1 bash\n[task-heartbeat] tick nonce=testnonce tools=1 turn=1 stream_age_ms=1300000 tool_age_max_ms=1300000 saw_msg=0 saw_tool=1 tool_updates=1 cpu_advanced=1 cpu_stall_ms=2000000\n`,
+      });
+      const v = evaluateTaskRunStatus(id, dir);
+      equal(v.status, "alive", `a raised dispatch bound must be honoured (got ${v.status}: ${v.note ?? ""})`);
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("#1662: without a persisted bound the env TASK_STREAM_STALL_MS is the fallback (not the constant)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "t1662-s-env-"));
+  // The same 21.7-min no-progress-silence fixture as the raised-bound test:
+  // under the 20-min DEFAULT it is wedged, under a 60-min env bound it is alive,
+  // so running BOTH passes proves the fallback reads the env rather than a
+  // constant that would make both results identical (#1662 review).
+  const markers = `[task-heartbeat] tool_start nonce=testnonce t1 bash\n[task-heartbeat] tick nonce=testnonce tools=1 turn=1 stream_age_ms=1300000 tool_age_max_ms=1300000 saw_msg=0 saw_tool=1 tool_updates=1 cpu_advanced=1 cpu_stall_ms=2000000\n`;
+  try {
+    withEnv({ TASK_HEARTBEAT_TIMEOUT_MS: undefined, TASK_CPU_STALL_MS: undefined, TASK_STREAM_STALL_MS: "3600000" }, () => {
+      const { id } = seedRunningRun(dir, { markers });
+      equal(evaluateTaskRunStatus(id, dir).status, "alive", "env bound honoured when the record has none");
+    });
+    withEnv({ TASK_HEARTBEAT_TIMEOUT_MS: undefined, TASK_CPU_STALL_MS: undefined, TASK_STREAM_STALL_MS: undefined }, () => {
+      const { id } = seedRunningRun(dir, { markers });
+      const v = evaluateTaskRunStatus(id, dir);
+      equal(v.status, "wedged", `without the env bound the 20-min default applies (got ${v.status}: ${v.note ?? ""})`);
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("#1662: a no-progress in-flight tool past the persisted bound reads WEDGED (watchdog parity, negative twin)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "t1662-s-wedge-"));
+  try {
+    withEnv({ TASK_HEARTBEAT_TIMEOUT_MS: undefined, TASK_CPU_STALL_MS: undefined }, () => {
+      // Genuine no-progress evidence: the tool has never streamed an update
+      // (`tool_updates=0`) and its CPU has not advanced past the 30-min bound
+      // (`cpu_stall_ms` > DEFAULT_CPU_STALL_MS with `cpu_advanced=1`). That is
+      // precisely the shape the watchdog's `tool-dead` clause cuts at S, so
+      // `wedged` is correct here.
+      const { id } = seedRunningRun(dir, {
+        streamStallMs: 60_000,
+        markers: `[task-heartbeat] tool_start nonce=testnonce t1 bash\n[task-heartbeat] tick nonce=testnonce tools=1 turn=1 stream_age_ms=1000 tool_age_max_ms=120000 saw_msg=0 saw_tool=1 tool_updates=0 cpu_advanced=1 cpu_stall_ms=2000000\n`,
+      });
+      equal(evaluateTaskRunStatus(id, dir).status, "wedged", "no-progress past the persisted bound ⇒ wedged");
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("#1662: an in-flight tool past the persisted bound but still PROGRESSING stays ALIVE (watchdog parity — the false-wedge bug)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "t1662-s-progress-"));
+  try {
+    withEnv({ TASK_HEARTBEAT_TIMEOUT_MS: undefined, TASK_CPU_STALL_MS: undefined }, () => {
+      // Same age as the negative twin, but the tool HAS streamed an update and
+      // its CPU is advancing: the watchdog's in-flight clauses require
+      // `inFlightProgress === "no-progress"`, so it stays alive until the 4h
+      // tool-stall age backstop. Pre-fix `task_status` compared the raw tool
+      // AGE against S and declared this healthy lane `wedged` — a false
+      // re-dispatch signal on exactly the long-producing-tool shape this mode
+      // exists to serve.
+      const { id } = seedRunningRun(dir, {
+        streamStallMs: 60_000,
+        markers: `[task-heartbeat] tool_start nonce=testnonce t1 bash\n[task-heartbeat] tick nonce=testnonce tools=1 turn=1 stream_age_ms=1000 tool_age_max_ms=120000 saw_msg=0 saw_tool=1 tool_updates=1 cpu_advanced=1 cpu_stall_ms=0\n`,
+      });
+      const v = evaluateTaskRunStatus(id, dir);
+      equal(v.status, "alive", `a progressing tool must not read wedged (got ${v.status}: ${v.note ?? ""})`);
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("#1662: an in-flight tool over the tool-stall age backstop reads WEDGED even while progressing (clause 2)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "t1662-toolstall-"));
+  try {
+    withEnv({ TASK_HEARTBEAT_TIMEOUT_MS: undefined, TASK_CPU_STALL_MS: undefined, TASK_TOOL_STALL_MS: undefined, TASK_HARD_CAP_MS: undefined }, () => {
+      // Clause 2 is the age backstop the watchdog applies REGARDLESS of progress
+      // evidence: a runaway tool that streams forever is still bounded. Seed an
+      // age past `getToolStallMs()` (2/3 of the 6h cap) with progressing CPU —
+      // `wedged` must fire on the age, not only on no-progress.
+      const { id } = seedRunningRun(dir, {
+        markers: `[task-heartbeat] tool_start nonce=testnonce t1 bash\n[task-heartbeat] tick nonce=testnonce tools=1 turn=1 stream_age_ms=1000 tool_age_max_ms=${Math.floor(getToolStallMs() + 60_000)} saw_msg=0 saw_tool=1 tool_updates=1 cpu_advanced=1 cpu_stall_ms=0\n`,
+      });
+      equal(evaluateTaskRunStatus(id, dir).status, "wedged", "over the tool-stall age backstop ⇒ wedged");
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("#1662: a FRESH log with no heartbeat markers stays ALIVE (TASK_HEARTBEAT_DISABLE shape)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "t1662-nomarker-fresh-"));
+  try {
+    withEnv({ TASK_HEARTBEAT_TIMEOUT_MS: undefined }, () => {
+      // Emitter off: the child writes ordinary stdout, no markers. The run is
+      // older than the 60s first-output bound, but the LOG is fresh — the old
+      // `markers === 0` clause called this wedged with a false "no activity" note.
+      const { id } = seedRunningRun(dir, { markers: "plain stdout line, no markers\n", ageMs: 120_000 });
+      const v = evaluateTaskRunStatus(id, dir);
+      equal(v.heartbeat?.markers, 0, "no marker in the tail");
+      equal(v.status, "alive", `a fresh no-marker log is not wedged (got ${v.status}: ${v.note ?? ""})`);
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("#1662: a STALE log with no markers reads WEDGED (the no-output shape)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "t1662-nomarker-stale-"));
+  try {
+    withEnv({ TASK_HEARTBEAT_TIMEOUT_MS: undefined }, () => {
+      const { id } = seedRunningRun(dir, { markers: "plain stdout line, no markers\n", ageMs: 3_700_000, logAgeMs: 3_700_000 });
+      equal(evaluateTaskRunStatus(id, dir).status, "wedged", "no output at all past the bound ⇒ wedged");
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("#1662: a no-marker log past the 60s first-output bound but WITHIN the freshness window reads WEDGED (the noMarkerYet clause)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "t1662-nomarker-midband-"));
+  try {
+    withEnv({ TASK_HEARTBEAT_TIMEOUT_MS: undefined, TASK_HEARTBEAT_INTERVAL_MS: undefined }, () => {
+      // 5 min log age lies STRICTLY between getFirstOutputTimeoutMs() (60s) and
+      // getHeartbeatFreshWindowMs() (max(2×T, 2×tick), default 60 min), so
+      // `staleLog` is FALSE. `noMarkerYet` is therefore the SOLE clause that can
+      // produce `wedged` here — delete it and this test flips to `alive` (the
+      // stale twin above never proves the clause because staleLog short-circuits
+      // the OR) (#1662 review).
+      const { id } = seedRunningRun(dir, { markers: "plain stdout line, no markers\n", ageMs: 600_000, logAgeMs: 300_000 });
+      const v = evaluateTaskRunStatus(id, dir);
+      equal(v.heartbeat?.markers, 0, "no marker in the tail");
+      equal(v.status, "wedged", `got ${v.status}: ${v.note ?? ""}`);
+      equal(v.alive, true, "the pid is still alive — wedged ≠ dead");
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("#1662: a stale log (markers stopped) with a live pid reads WEDGED", () => {
+  const dir = mkdtempSync(join(tmpdir(), "t1662-wedged-"));
+  try {
+    withEnv({ TASK_HEARTBEAT_TIMEOUT_MS: undefined }, () => {
+      const { id } = seedRunningRun(dir, { logAgeMs: 7_200_000 }); // 2h stale > 60-min window
+      const v = evaluateTaskRunStatus(id, dir);
+      equal(v.status, "wedged", `got ${v.status}: ${v.note ?? ""}`);
+      equal(v.alive, true, "the pid is still alive — wedged ≠ dead");
+      equal(v.review_gate, "parent-required", "review gate still a parent step");
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("#1662: a nonce MISMATCH is not a life sign (foreign writer on the child's fd 2)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "t1662-nonce-"));
+  try {
+    withEnv({ TASK_HEARTBEAT_TIMEOUT_MS: undefined }, () => {
+      const { id } = seedRunningRun(dir, {
+        nonce: "expected",
+        markers: `[task-heartbeat] tool_start nonce=forged t1 bash\n[task-heartbeat] tick nonce=forged tools=1 turn=1 stream_age_ms=1 tool_age_max_ms=1 saw_msg=0 saw_tool=1\n`,
+      });
+      const v = evaluateTaskRunStatus(id, dir);
+      equal(v.heartbeat?.markers, 0, "a forged nonce is refused");
+      // With no valid markers and a fresh log, a young run is not yet wedged.
+      ok(v.status === "alive" || v.status === "wedged", `status is a live-state verdict, got ${v.status}`);
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("#1662: a null-nonce record parses NO markers — the nonce fails CLOSED", () => {
+  const dir = mkdtempSync(join(tmpdir(), "t1662-nonce-null-"));
+  try {
+    withEnv({ TASK_HEARTBEAT_TIMEOUT_MS: undefined }, () => {
+      // Pre-fix `rec.nonce ?? undefined` meant an UNAUTHENTICATED parse: these
+      // unsigned markers would count, letting a foreign writer on the child's
+      // fd 2 forge life signs. Fail-closed is `rec.nonce ?? ""`, which matches
+      // no marker (no marker carries an empty nonce) (#1662 review).
+      const { id } = seedRunningRun(dir, {
+        nonce: null,
+        markers: `[task-heartbeat] tool_start t1 bash\n[task-heartbeat] tick tools=1 turn=1 stream_age_ms=1 tool_age_max_ms=1 saw_msg=0 saw_tool=1\n`,
+      });
+      const v = evaluateTaskRunStatus(id, dir);
+      equal(v.heartbeat?.markers, 0, "a null nonce authenticates nothing");
+      // With no valid markers and a fresh log, a young run is a live-state verdict.
+      ok(v.status === "alive" || v.status === "wedged", `status is a live-state verdict, got ${v.status}`);
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("#1662: a running record whose process is gone reads GONE, never the terminal-success label done", () => {
+  const dir = mkdtempSync(join(tmpdir(), "t1662-gone-"));
+  try {
+    withEnv({ TASK_HEARTBEAT_TIMEOUT_MS: undefined }, () => {
+      // The parent died mid-run: the child pid is gone but the record is still
+      // `running`. `done` is the terminal-SUCCESS vocabulary; a poller keyed on
+      // `status === "done"` must not read this as success (#1662 review).
+      const { id } = seedRunningRun(dir, { pid: 999_999_999, logAgeMs: SETTLE_GRACE_MS + 60_000 });
+      const v = evaluateTaskRunStatus(id, dir);
+      equal(v.alive, false, "the process is gone");
+      equal(v.terminal, false, "not terminal until task_collect salvages it");
+      equal(v.status, "gone", `a settle-lost lane must not read as done (got ${v.status}: ${v.note ?? ""})`);
+      // collect still finalizes it fail-closed once the settle grace has expired.
+      equal(collectTaskRun(id, dir).status, "failed", "collect fails it closed");
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("#1662: an unknown run_id reads UNKNOWN (never a crash, never a confident terminal)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "t1662-unknown-"));
+  try {
+    const v = evaluateTaskRunStatus("not-a-real-run", dir);
+    equal(v.status, "unknown", "unknown run");
+    equal(v.terminal, false, "not terminal");
+    equal(collectTaskRun("not-a-real-run", dir).terminal, false, "collect agrees");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+section("#1662 — task_collect");
+
+test("#1662: collect returns the final message + exit once terminal, and a not-finished notice while running", () => {
+  const dir = mkdtempSync(join(tmpdir(), "t1662-collect-"));
+  try {
+    withEnv({ TASK_HEARTBEAT_TIMEOUT_MS: undefined }, () => {
+      const { id } = seedRunningRun(dir);
+      const running = collectTaskRun(id, dir);
+      equal(running.terminal, false, "a running lane is not collectable");
+      equal(running.content, null, "no content while running");
+      ok(String(running.note).includes("not finished"), `not-finished note: ${running.note}`);
+
+      const done = { ...seedRunningRun(dir).rec, status: "done" as const, exit_code: 0, final_content: [{ type: "text", text: "FINAL-42" }], final_details: { model: "m", provider: "p" }, settled_at: Date.now() };
+      writeRunRecord(dir, done as any);
+      const got = collectTaskRun(done.run_id, dir);
+      equal(got.terminal, true, "terminal");
+      equal(got.status, "done", "status");
+      equal(got.exit_code, 0, "exit code");
+      equal(got.content?.[0]?.text, "FINAL-42", "final message");
+      equal(got.review_gate, "parent-required", "review gate is a parent step");
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("#1662: a running record whose process is gone is FINALIZED by collect once the settle grace has expired (no infinite 'not finished')", () => {
+  const dir = mkdtempSync(join(tmpdir(), "t1662-salvage-"));
+  try {
+    withEnv({ TASK_HEARTBEAT_TIMEOUT_MS: undefined }, () => {
+      // The parent died mid-run: the child pid is gone but its terminal record
+      // was never written. The documented poll loop must still terminate — but
+      // only AFTER the settle grace (a gone pid alone may be a settle in flight).
+      const { id } = seedRunningRun(dir, { pid: 999_999_999, logAgeMs: SETTLE_GRACE_MS + 60_000 });
+      const got = collectTaskRun(id, dir);
+      equal(got.terminal, true, "collect terminates instead of looping forever");
+      equal(got.status, "failed", "a settle that cannot be proven is fail-closed, never success");
+      equal(got.reason, "settle-lost", "the lost-settle reason is named");
+      ok(String(got.note).includes("process is gone"), `salvage note: ${got.note}`);
+      equal((got.details as any)?.log_path, runLogPath(dir, id), "the capture log is handed back for partials");
+      equal(got.review_gate, "parent-required", "review obligation still rides on the salvage");
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("#1662: a gone pid with a settle still possibly PENDING is not finalized — no permanent false failure in the exit→settle window", () => {
+  const dir = mkdtempSync(join(tmpdir(), "t1662-settle-pending-"));
+  try {
+    withEnv({ TASK_HEARTBEAT_TIMEOUT_MS: undefined }, () => {
+      // The child exits before its parent's fire-and-forget settle lands (the
+      // exit-without-close shape holds the pipes up to the exit grace). During
+      // that window the pid is gone but the terminal record is IN FLIGHT.
+      // Pre-fix `!view.alive` alone finalized this as a terminal `failed`/
+      // `settle-lost` with `content: null` — and a terminal verdict is never
+      // re-polled, so a successful lane was permanently reported failed and the
+      // #208 resume contract re-dispatched it.
+      const fresh = seedRunningRun(dir, { pid: 999_999_999 });
+      const pending = collectTaskRun(fresh.id, dir);
+      equal(pending.terminal, false, "a settle still inside its grace is NOT terminal");
+      equal(pending.status, "gone", "it reads the non-terminal `gone` so the loop re-polls");
+      ok(pending.reason === undefined, "no settle-lost reason while the settle may still land");
+      // Negative twin: once the grace has demonstrably expired the SAME shape is
+      // salvaged fail-closed, so the assertion above is not vacuous.
+      const stale = seedRunningRun(dir, { pid: 999_999_999, logAgeMs: SETTLE_GRACE_MS + 60_000 });
+      const salvaged = collectTaskRun(stale.id, dir);
+      equal(salvaged.terminal, true, "past the grace the salvage terminates the loop");
+      equal(salvaged.status, "failed", "and it is fail-closed");
+      equal(salvaged.reason, "settle-lost", "named");
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("#1662: a recycled pid does not strand collect — a stale LIVE record is still salvaged", () => {
+  const dir = mkdtempSync(join(tmpdir(), "t1662-recycled-pid-"));
+  try {
+    withEnv({ TASK_HEARTBEAT_TIMEOUT_MS: undefined }, () => {
+      // `pidAlive` is a bare existence probe: a dead child's RECYCLED pid reads
+      // alive, so gating the settle-lost salvage on `!view.alive` alone let
+      // task_collect return "not finished" forever (the parent that would have
+      // persisted the terminal record is gone). `seedRunningRun` defaults pid to
+      // process.pid (guaranteed alive) with a 2h-stale log — the recycled-pid
+      // shape. The age backstop task_status already applies must also terminate
+      // the collect loop, fail-closed (#1662 review).
+      const { id } = seedRunningRun(dir, { logAgeMs: 7_200_000 });
+      const v = evaluateTaskRunStatus(id, dir);
+      equal(v.alive, true, "the probed pid is alive (recycled or wedged)");
+      equal(v.status, "wedged", "the stale log already reads wedged");
+      const got = collectTaskRun(id, dir);
+      equal(got.terminal, true, "collect terminates instead of looping forever on a recycled pid");
+      equal(got.status, "failed", "a settle that cannot be proven is fail-closed, never success");
+      equal(got.reason, "settle-lost", "the lost-settle reason is named");
+      ok(String(got.note).includes("freshness window"), `stale-live salvage note: ${got.note}`);
+      equal((got.details as any)?.log_path, runLogPath(dir, id), "the capture log is handed back for partials");
+      equal(got.review_gate, "parent-required", "review obligation still rides on the salvage");
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("#1662: a run that SETTLES between collect's snapshot and its fresh read is returned as terminal — never a permanent false failure", () => {
+  const dir = mkdtempSync(join(tmpdir(), "t1662-collect-race-"));
+  // The two record reads inside `collectTaskRun` (the snapshot, then the fresh
+  // read inside `evaluateTaskRunStatus`) are adjacent but not atomic: the
+  // parent's fire-and-forget settle can land between them. Model it by letting
+  // the FIRST read see the on-disk `running` record and every later read see a
+  // settled `done` record. On the pre-fix code the fresh terminal view was
+  // ignored and the run was finalized `failed`/`settle-lost` with `content:
+  // null` — a terminal verdict, so the reaping loop never re-polled and the
+  // persisted success was lost (#1662 review).
+  const require2 = createRequire(import.meta.url);
+  const realFs = require2("node:fs") as any;
+  const origReadFileSync = realFs.readFileSync;
+  try {
+    withEnv({ TASK_HEARTBEAT_TIMEOUT_MS: undefined }, () => {
+      const { id, rec } = seedRunningRun(dir, { pid: 999_999_999 }); // process is gone
+      const recordPath = runRecordPath(dir, id);
+      const settled = {
+        ...rec,
+        status: "done",
+        exit_code: 0,
+        final_content: [{ type: "text", text: "SUCCESS-PAYLOAD-42" }],
+        final_details: { model: "deepseek-v4-flash", provider: "deepseek" },
+        settled_at: Date.now(),
+      };
+      let reads = 0;
+      realFs.readFileSync = (...a: any[]) => {
+        if (typeof a[0] === "string" && a[0] === recordPath) {
+          reads += 1;
+          if (reads >= 2) return JSON.stringify(settled);
+        }
+        return origReadFileSync(...a);
+      };
+      const got = collectTaskRun(id, dir);
+      realFs.readFileSync = origReadFileSync;
+      ok(reads >= 2, `the race was exercised (record reads: ${reads})`);
+      equal(got.terminal, true, "the settled run reaches a terminal verdict");
+      equal(got.status, "done", `a settled success must NOT be re-reported as failed (got ${got.status}: ${got.reason ?? ""})`);
+      equal(got.reason, undefined, "no settle-lost reason on a settled record");
+      equal(got.content?.[0]?.text, "SUCCESS-PAYLOAD-42", "the persisted final payload is handed back, not dropped");
+      // The #208 resume contract re-dispatches a failed lane; a false failure
+      // duplicates work for a lane that actually succeeded.
+      equal((got.details as any)?.provider, "deepseek", "the fresh final details are surfaced");
+    });
+  } finally {
+    realFs.readFileSync = origReadFileSync;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("#1662: a done lane with no recorded exit code is NOT rendered as signal death", () => {
+  const done: any = { run_id: "r1", status: "done", terminal: true, exit_code: null, review_gate: "parent-required" };
+  const head = formatCollectedRunHead(done);
+  ok(!head.includes("signal"), `a done lane must not claim signal death: ${head}`);
+  equal(head.includes("(exit"), false, "no exit annotation when the code was not recorded");
+  equal(formatCollectedRunHead({ ...done, exit_code: undefined }).includes("(exit"), false, "undefined exit_code omits the annotation");
+  // The failure/cut shapes keep the annotation; a known code is surfaced.
+  ok(formatCollectedRunHead({ ...done, status: "cut", exit_code: null }).includes("(exit signal)"), "a null-exit cut still reads signal");
+  ok(formatCollectedRunHead({ ...done, status: "failed", exit_code: 1 }).includes("(exit 1)"), "a numeric failure exit is surfaced");
+  ok(formatCollectedRunHead({ ...done, status: "done", exit_code: 0 }).includes("(exit 0)"), "a known zero exit is surfaced");
+});
+
+section("#1662 — startBackgroundTask (returns-early, E2E through the real spawn)");
+
+const FAKE_PI_BG_SHIM = `#!/bin/sh
+NONCE="${'${TASK_HEARTBEAT_NONCE:-}'}"
+m() { echo "[task-heartbeat] $1" >&2; }
+m "ready nonce=$NONCE"
+m "turn_start nonce=$NONCE 1"
+m "tool_start nonce=$NONCE t1 bash"
+echo "BG-PARTIAL"
+m "tick nonce=$NONCE tools=1 turn=1 stream_age_ms=0 tool_age_max_ms=0 saw_msg=0 saw_tool=1"
+sleep 4
+m "tool_end nonce=$NONCE t1"
+echo "BG-FINAL-MESSAGE"
+m "session_end nonce=$NONCE"
+exit 0
+`;
+
+testAsync("#1662 E2E: background dispatch RETURNS EARLY, task_status sees it alive, task_collect reaps the final message", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "t1662-bg-"));
+  const shimDir = join(dir, "bin");
+  mkdirSync(shimDir, { recursive: true });
+  writeFileSync(join(shimDir, "pi"), FAKE_PI_BG_SHIM, { mode: 0o755 });
+  const savedPath = process.env.PATH ?? "";
+  const savedArgv1 = process.argv[1];
+  const savedRunsRoot = process.env.TASK_RUNS_ROOT;
+  const savedSessionRoot = process.env.TASK_SESSION_ROOT;
+  const savedLedger = process.env.DISPATCH_LEDGER;
+  try {
+    process.env.PATH = `${shimDir}:${savedPath}`;
+    process.env.TASK_RUNS_ROOT = dir;
+    process.env.TASK_SESSION_ROOT = join(dir, "sessions");
+    process.env.DISPATCH_LEDGER = "0";
+    process.argv[1] = undefined as unknown as string;
+    // A REAL dispatch nonce shared by the record and the child's marker stream,
+    // so the markers in the capture log authenticate. Without it (null) the
+    // pre-fix parser fell back to UNAUTHENTICATED and the alive verdict was a
+    // fail-open (#1662 review).
+    const nonce = "e2enonce";
+    const env: Record<string, string | undefined> = { ...process.env, PATH: process.env.PATH, TASK_HEARTBEAT_NONCE: nonce };
+    const runId = mintRunId();
+
+    // (1) RETURNS EARLY: the child sleeps 2s, but this must return in well under that.
+    const t0 = Date.now();
+    const handle = startBackgroundTask({
+      model: "deepseek-v4-flash",
+      provider: "deepseek",
+      env,
+      args: ["-p", "--no-session", "background me"],
+      runId,
+      runsRoot: dir,
+      nonce,
+    });
+    const elapsed = Date.now() - t0;
+    ok(elapsed < 3000, `returns early (took ${elapsed}ms while the child sleeps 4000ms)`);
+    equal(handle.run_id, runId, "run id echoed");
+    ok(typeof handle.pid === "number" && handle.pid > 1, `pid captured synchronously (${handle.pid})`);
+    ok(typeof handle.pgid === "number" && handle.pgid > 1, `pgid captured (${handle.pgid})`);
+    equal(handle.pgid, handle.pid, "TASK_DETACHED setsid ⇒ the child is its own group leader (pgid === pid)");
+    equal(handle.review_gate, "parent-required", "the dispatch handle itself carries the parent review obligation");
+
+    // (2) STATUS: alive while the child runs (heartbeats/markers, not %CPU).
+    const alive = evaluateTaskRunStatus(runId, dir);
+    equal(alive.alive, true, "the child pid is alive");
+    equal(alive.status, "alive", `a running lane reads alive (got ${alive.status}: ${alive.note ?? ""})`);
+    equal(alive.review_gate, "parent-required", "review gate is a parent step");
+
+    // (3) COLLECT: poll until terminal (the child exits after ~4s).
+    let view = collectTaskRun(runId, dir);
+    const deadline = Date.now() + 30_000;
+    while (!view.terminal && Date.now() < deadline) {
+      await sleep(200);
+      view = collectTaskRun(runId, dir);
+    }
+    equal(view.terminal, true, `run reached terminal (status=${view.status})`);
+    equal(view.status, "done", `clean exit ⇒ done, got ${view.status} [${view.reason ?? ""}]`);
+    ok(String(view.content?.[0]?.text).includes("BG-FINAL-MESSAGE"), `final message collected: ${JSON.stringify(view.content)}`);
+    equal(view.review_gate, "parent-required", "collect still carries the parent review obligation");
+    equal(handle.record_persisted, true, "a successful dispatch reports the record was persisted");
+    // The success composer omits an exit code (it is not a signal death), so a
+    // clean lane must not be reaped as `(exit signal)` (#1662 review).
+    equal(view.exit_code, null, "a clean lane records no exit code — null, not signal death");
+    ok(!formatCollectedRunHead(view).includes("signal"), `a done lane must not render as signal death: ${formatCollectedRunHead(view)}`);
+
+    // (4) The capture log is owner-only 0600 — it holds the child's raw output.
+    ok(existsSync(handle.log_path), "capture log exists");
+    equal(statSync(handle.log_path).mode & 0o777, 0o600, "capture log is not group/world-readable");
+  } finally {
+    process.env.PATH = savedPath;
+    process.argv[1] = savedArgv1;
+    if (savedRunsRoot === undefined) delete process.env.TASK_RUNS_ROOT; else process.env.TASK_RUNS_ROOT = savedRunsRoot;
+    if (savedSessionRoot === undefined) delete process.env.TASK_SESSION_ROOT; else process.env.TASK_SESSION_ROOT = savedSessionRoot;
+    if (savedLedger === undefined) delete process.env.DISPATCH_LEDGER; else process.env.DISPATCH_LEDGER = savedLedger;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("#1662: task-runs retention is DRY-RUN by default (recorded decision) and deletes only when ARMED", () => {
+  const dir = mkdtempSync(join(tmpdir(), "t1662-prune-"));
+  const savedRunsRoot = process.env.TASK_RUNS_ROOT;
+  const savedMaxAge = process.env.TASK_RUNS_MAX_AGE_DAYS;
+  const savedDryRun = process.env.TASK_RUNS_PRUNE_DRY_RUN;
+  const savedPrune = process.env.TASK_RUNS_PRUNE;
+  try {
+    process.env.TASK_RUNS_ROOT = dir;
+    process.env.TASK_RUNS_MAX_AGE_DAYS = "7";
+    delete process.env.TASK_RUNS_PRUNE;
+    // An old terminal run (record + capture log), nine days back.
+    const oldId = mintRunId();
+    const oldLog = runLogPath(dir, oldId);
+    const oldRec = runRecordPath(dir, oldId);
+    writeFileSync(oldLog, "old", "utf-8");
+    writeRunRecord(dir, {
+      run_id: oldId, pid: 999_999_999, pgid: null, log_path: oldLog, started_at: 1,
+      model: "m", provider: "p", cwd: dir, nonce: null, status: "done",
+    } as any);
+    const back = new Date(Date.now() - 9 * 24 * 3600 * 1000);
+    utimesSync(oldLog, back, back);
+    utimesSync(oldRec, back, back);
+
+    // An unspawnable target refuses synchronously. The sweep runs BEFORE the new
+    // record is written, so this proves the dispatch-path wiring without a child.
+    const notADir = join(dir, "not-a-dir");
+    writeFileSync(notADir, "x");
+    const dispatch = () => startBackgroundTask({
+      model: "deepseek-v4-flash",
+      provider: "deepseek",
+      env: { ...process.env },
+      args: ["-p", "--no-session", "x"],
+      cwd: notADir,
+      runId: mintRunId(),
+      runsRoot: dir,
+      nonce: null,
+    });
+
+    // (1) UNARMED: the recorded retention decision is dry-run by default — an
+    // unarmed sweep must not delete a settled run's record (which carries the
+    // composed final message). Pre-fix this deleted, so this assertion is the
+    // non-vacuous pin (#1662 review).
+    delete process.env.TASK_RUNS_PRUNE_DRY_RUN;
+    dispatch();
+    equal(existsSync(oldRec), true, "UNARMED dispatch must NOT delete the age-expired record (dry-run by default)");
+    equal(existsSync(oldLog), true, "UNARMED dispatch must NOT delete the capture log");
+
+    // (2) ARMED: TASK_RUNS_PRUNE_DRY_RUN=0 is the explicit, owned arming step.
+    process.env.TASK_RUNS_PRUNE_DRY_RUN = "0";
+    dispatch();
+    equal(existsSync(oldRec), false, "the ARMED dispatch prunes the age-expired record");
+    equal(existsSync(oldLog), false, "the ARMED dispatch prunes the age-expired capture log");
+  } finally {
+    if (savedRunsRoot === undefined) delete process.env.TASK_RUNS_ROOT; else process.env.TASK_RUNS_ROOT = savedRunsRoot;
+    if (savedMaxAge === undefined) delete process.env.TASK_RUNS_MAX_AGE_DAYS; else process.env.TASK_RUNS_MAX_AGE_DAYS = savedMaxAge;
+    if (savedDryRun === undefined) delete process.env.TASK_RUNS_PRUNE_DRY_RUN; else process.env.TASK_RUNS_PRUNE_DRY_RUN = savedDryRun;
+    if (savedPrune === undefined) delete process.env.TASK_RUNS_PRUNE; else process.env.TASK_RUNS_PRUNE = savedPrune;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+testAsync("#1662: a SETTLE-time record persist failure is REPORTED loudly, never swallowed", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "t1662-settlefail-"));
+  const shimDir = join(dir, "bin");
+  mkdirSync(shimDir, { recursive: true });
+  // A child that settles immediately, so the fire-and-forget `.then` runs soon.
+  writeFileSync(join(shimDir, "pi"), "#!/bin/sh\necho SETTLED-OK\nexit 0\n", { mode: 0o755 });
+  const savedPath = process.env.PATH ?? "";
+  const savedArgv1 = process.argv[1];
+  const savedRunsRoot = process.env.TASK_RUNS_ROOT;
+  const savedSessionRoot = process.env.TASK_SESSION_ROOT;
+  const savedLedger = process.env.DISPATCH_LEDGER;
+  const savedPrune = process.env.TASK_RUNS_PRUNE;
+  const require2 = createRequire(import.meta.url);
+  const realFs = require2("node:fs") as any;
+  const origWriteFileSync = realFs.writeFileSync;
+  const origConsoleError = console.error;
+  const errs: string[] = [];
+  const runId = mintRunId();
+  try {
+    process.env.PATH = `${shimDir}:${savedPath}`;
+    process.env.TASK_RUNS_ROOT = dir;
+    process.env.TASK_RUNS_PRUNE = "0"; // keep the retention sweep out of this test
+    process.env.TASK_SESSION_ROOT = join(dir, "sessions");
+    process.env.DISPATCH_LEDGER = "0";
+    process.argv[1] = undefined as unknown as string;
+    console.error = (...a: any[]) => { errs.push(a.map(String).join(" ")); };
+
+    const handle = startBackgroundTask({
+      model: "deepseek-v4-flash",
+      provider: "deepseek",
+      env: { ...process.env },
+      args: ["-p", "--no-session", "settle me"],
+      runId,
+      runsRoot: dir,
+      nonce: null,
+    });
+    equal(handle.record_persisted, true, "the dispatch-time record was persisted");
+
+    // Fail ONLY the terminal settle write (the record carrying status "done").
+    // `writeRunRecord` reports failure solely via its return value and logs
+    // nothing itself, so a handler that ignores it swallows the failure: the
+    // record stays `running` and a settled success is reaped as a permanent
+    // `failed`/`settle-lost` with `content: null` (#1662 review P1).
+    realFs.writeFileSync = (...a: any[]) => {
+      if (typeof a[1] === "string" && a[1].includes('"status": "done"')) {
+        throw new Error("ENOSPC: simulated settle persist failure");
+      }
+      return origWriteFileSync(...a);
+    };
+
+    const deadline = Date.now() + 20_000;
+    while (Date.now() < deadline && !errs.some((l) => /SETTLE record persist failed/.test(l))) {
+      await sleep(100);
+    }
+    realFs.writeFileSync = origWriteFileSync;
+
+    ok(
+      errs.some((l) => /SETTLE record persist failed/.test(l)),
+      `the settle persist failure must be REPORTED (captured: ${JSON.stringify(errs.slice(-3))})`,
+    );
+    equal(
+      readRunRecord(dir, runId)?.status,
+      "running",
+      "the record stays `running` — exactly why a silent swallow reaps a settled success as a failure",
+    );
+  } finally {
+    realFs.writeFileSync = origWriteFileSync;
+    console.error = origConsoleError;
+    process.env.PATH = savedPath;
+    process.argv[1] = savedArgv1;
+    if (savedRunsRoot === undefined) delete process.env.TASK_RUNS_ROOT; else process.env.TASK_RUNS_ROOT = savedRunsRoot;
+    if (savedSessionRoot === undefined) delete process.env.TASK_SESSION_ROOT; else process.env.TASK_SESSION_ROOT = savedSessionRoot;
+    if (savedLedger === undefined) delete process.env.DISPATCH_LEDGER; else process.env.DISPATCH_LEDGER = savedLedger;
+    if (savedPrune === undefined) delete process.env.TASK_RUNS_PRUNE; else process.env.TASK_RUNS_PRUNE = savedPrune;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("#1662: a failed record persist is SURFACED in the handle, never swallowed", () => {
+  const base = mkdtempSync(join(tmpdir(), "t1662-persistfail-"));
+  try {
+    // An unwritable runs root (a file, not a directory) AND a target that is a
+    // file, so spawnSubAgent refuses synchronously without spawning a child.
+    const notADir = join(base, "not-a-dir");
+    writeFileSync(notADir, "x");
+    const handle = startBackgroundTask({
+      model: "deepseek-v4-flash",
+      provider: "deepseek",
+      env: { ...process.env },
+      args: ["-p", "--no-session", "x"],
+      cwd: notADir,
+      runId: mintRunId(),
+      runsRoot: join(notADir, "child"),
+      nonce: null,
+    });
+    equal(handle.record_persisted, false, "persist failure is reported to the caller");
+    equal(handle.log_path, "", "no capture log when the root could not be created");
+    // The pre-spawn refusal is carried, so the result is a refusal — not a
+    // success-shaped "dispatched" (#1662 review).
+    ok(handle.refusal, "the pre-spawn refusal is captured on the handle");
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("#1662: a pre-spawn refusal is reported as a REFUSAL in background mode, never a successful dispatch", () => {
+  const base = mkdtempSync(join(tmpdir(), "t1662-bg-refusal-"));
+  try {
+    // `spawnSubAgent` refuses an unspawnable cwd synchronously, BEFORE the
+    // `new Promise` executor — so `onSpawn` never fires and `pid` stays null.
+    // The background branch used to render that as "🚀 Background sub-agent
+    // dispatched" with `details.status: "running"`, which the `tool_result`
+    // hook does not treat as a failure: a deterministic refusal became an
+    // apparent live lane (#1662 review).
+    const notADir = join(base, "not-a-dir");
+    writeFileSync(notADir, "x");
+    const handle = startBackgroundTask({
+      model: "deepseek-v4-flash",
+      provider: "deepseek",
+      env: { ...process.env },
+      args: ["-p", "--no-session", "x"],
+      cwd: notADir,
+      runId: mintRunId(),
+      runsRoot: base,
+      nonce: null,
+    });
+    equal(handle.pid, null, "no child was spawned");
+    ok(handle.refusal, "the refusal rides on the handle");
+    const res = buildBackgroundDispatchResult(handle);
+    equal((res.details as any).status, "invalid-cwd", "the result is the refusal status — in FAILED_TASK_STATUS, so the hook flips isError");
+    equal((res.details as any).retryable, false, "a cwd refusal is not retryable");
+    // #1662 review: the refusal is built BEFORE the background branch and carried
+    // no `background` marker, so `review-enforcer` counted it as a completed
+    // reviewer and `sequence-enforcer` decremented the verifier count on it — a
+    // gate advanced by a child that never existed. The marker must ride the
+    // refusal payload.
+    equal((res.details as any).background, true, "a refused background dispatch still carries the background marker");
+    ok(String(res.content[0].text).includes("refused"), `the refusal is stated: ${res.content[0].text}`);
+    equal(String(res.content[0].text).includes("🚀"), false, "a refused dispatch must not render a success rocket");
+    equal(String(res.content[0].text).includes("dispatched"), false, "a refused dispatch must not claim a dispatch");
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+section("#1662 — tool surface");
+
+{
+  const names: string[] = [];
+  (builtinTools as any)({ on: () => {}, registerTool: (def: any) => { names.push(def?.name); } });
+  test("#1662: task declares `background`; task_status and task_collect are registered", () => {
+    ok(names.includes("task_status"), `task_status registered (got: ${names.join(",")})`);
+    ok(names.includes("task_collect"), `task_collect registered (got: ${names.join(",")})`);
+    ok(/background:\s*Type\.Optional\(/.test(source), "the task tool schema declares an optional background param");
+    ok(source.includes('name: "task_status"') && source.includes('name: "task_collect"'), "both new tools are named in source");
+    // The review-gate constraint must be explicit in the code comment.
+    ok(source.includes("REVIEW GATE IS A PARENT STEP"), "the code states the review gate is a parent step (#825)");
+    // #1662 review: the stated rationale was FALSE — task children DO have the
+    // `task` tool (the same file says so for VGATE). The correct mechanism is
+    // the forced `AGENT_SKIP_REVIEW_GATE=1`, and the false claim must not return.
+    equal(source.includes("has no `task` tool"), false, "the false 'no task tool' rationale is gone");
+    ok(source.includes("AGENT_SKIP_REVIEW_GATE=1 FORCED"), "the review-gate rationale names the forced skip flag");
+  });
+
+  test("#1662: the dispatch result carries snake_case review_gate, matching task_status/task_collect", () => {
+    const res = buildBackgroundDispatchResult({
+      run_id: "run-123",
+      pid: 42,
+      pgid: 42,
+      log_path: "/tmp/run-123.log",
+      started_at: 1,
+      record_persisted: true,
+      review_gate: "parent-required",
+      refusal: null,
+    });
+    equal((res.details as any).review_gate, "parent-required", "the consumer-facing field is review_gate");
+    equal((res.details as any).reviewGate, undefined, "the camelCase spelling must not return");
+    ok(String(res.content[0].text).includes("run-123"), "the run id is rendered");
+    const unpersisted = buildBackgroundDispatchResult({
+      run_id: "r2",
+      pid: null,
+      pgid: null,
+      log_path: "",
+      started_at: 1,
+      record_persisted: false,
+      review_gate: "parent-required",
+      refusal: null,
+    });
+    ok(String(unpersisted.content[0].text).includes("NOT persisted"), "a failed persist is surfaced in the text");
+    // The module must never reintroduce the camelCase field on the dispatch result.
+    equal(/\breviewGate\s*:/.test(source), false, "no camelCase reviewGate field remains in the module");
+    ok(source.includes("review_gate: handle.review_gate"), "the dispatch details read the handle's review_gate");
+  });
+}
 
   for (const t of asyncTests) await t();
   console.log(`\n=== Results: ${passed} passed, ${failed} failed ===`);
