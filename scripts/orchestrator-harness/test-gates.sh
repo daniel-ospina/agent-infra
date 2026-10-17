@@ -280,8 +280,27 @@ fi
 # from one neutered to `if false` (the refusal echo stays in the file either way) — that is the
 # inert-enforcer class this repo treats as category A. So the rail branch is EXTRACTED and DRIVEN
 # with the rail absent: it must exit 6 (a refusal), not fall through to the rest of the script.
+# The extraction starts at record_at_head() (#1825): rail mode now asks whether this head already
+# carries a head-bound review record BEFORE it may run the rail, so that helper — and rail_attempt,
+# which took over the retry/park/invoke block — are part of the driven region. Starting at the
+# `if [ "$MERGE_AUTHORITY" = "rail" ]` line would leave both undefined, every drive would fall
+# through the evidence test with a `command not found`, and the rail would never be invoked.
 { grep -m1 '^is_num() {' "$MERGE"; grep -m1 '^is_limit() {' "$MERGE"
-  awk '/^if \[ "\$MERGE_AUTHORITY" = "rail" \]; then/{f=1} f&&/^# ── 1\) fresh-context review/{f=0} f' "$MERGE"; } > "$TMP/railbranch.sh"
+  awk '/^record_at_head\(\) \{/{f=1} f&&/^# ── 1\) fresh-context review/{f=0} f' "$MERGE"; } > "$TMP/railbranch.sh"
+# #1825 — the merge-store fixture. Rail mode only HANDS OFF to the rail when the head already
+# carries a head-bound record; otherwise it mints the evidence first. So every drive that expects
+# a rail INVOCATION must present one — seeded in a throwaway HOME, never in the real store — and a
+# drive that expects NO invocation must present none. `seed_record <home> <pr> <head>` writes the
+# repo-qualified record exactly as record-review.sh names it.
+seed_record() {
+  mkdir -p "$1/.pi/agent/reviews"
+  printf '{"pr":%s,"head_sha":"%s","verdict":"clean","repo":"daniel-ospina/agent-infra","reviewed_at":"2026-10-17T00:00:00Z"}\n' \
+    "$2" "$3" > "$1/.pi/agent/reviews/daniel-ospina-agent-infra-$2.json"
+}
+# ONE record per PR fits the store (the filename is repo-qualified), so each drive that expects
+# evidence seeds the head IT is about — immediately above the drive, so a drive cannot silently
+# run against another drive's head.
+SEED_HOME="$TMP/seedhome"; mkdir -p "$SEED_HOME"
 if [ -s "$TMP/railbranch.sh" ] && grep -q 'refusing to fall back to a raw gh pr merge' "$TMP/railbranch.sh"; then
   mkdir -p "$TMP/railrepo" "$TMP/railO/state"
   ( MERGE_AUTHORITY=rail; REPO="$TMP/railrepo"; PR=1764; OR=daniel-ospina/agent-infra; \
@@ -318,9 +337,10 @@ fi
 mkdir -p "$TMP/railrepo/scripts" "$TMP/railO/state"
 printf '#!/bin/bash\nexit 1\n' > "$TMP/railrepo/scripts/admin-merge.sh"   # a rail that REFUSES
 chmod +x "$TMP/railrepo/scripts/admin-merge.sh"
+seed_record "$SEED_HOME" 1764 bbbb2222
 printf '%s %s\n' bbbb2222 3 > "$TMP/railO/state/railcount-1764"
 printf '%s\n' aaaa1111  > "$TMP/railO/state/parked-1764"                  # a STALE park, older head
-( MERGE_AUTHORITY=rail; REPO="$TMP/railrepo"; PR=1764; OR=daniel-ospina/agent-infra; \
+( HOME="$SEED_HOME"; MERGE_AUTHORITY=rail; REPO="$TMP/railrepo"; PR=1764; OR=daniel-ospina/agent-infra; \
   L="$TMP/railO/merge.log"; O="$TMP/railO"; HEAD=bbbb2222; \
   . "$TMP/railbranch.sh" ) >/dev/null 2>&1; prc=$?
 _parked="$(cat "$TMP/railO/state/parked-1764" 2>/dev/null)"
@@ -353,8 +373,9 @@ printf '%s\n' "$*" >> "${GH_SPY:?gh-spy invoked without GH_SPY}"
 exit 0
 GHSPY
 chmod +x "$TMP/ghspy/gh"
+seed_record "$SEED_HOME" 1764 cccc3333
 : > "$TMP/railO/gh-spy.txt"
-( PATH="$TMP/ghspy:$PATH"; export GH_SPY="$TMP/railO/gh-spy.txt"; MERGE_AUTHORITY=rail; REPO="$TMP/railrepo"; PR=1764; OR=daniel-ospina/agent-infra; \
+( HOME="$SEED_HOME"; PATH="$TMP/ghspy:$PATH"; export GH_SPY="$TMP/railO/gh-spy.txt"; MERGE_AUTHORITY=rail; REPO="$TMP/railrepo"; PR=1764; OR=daniel-ospina/agent-infra; \
   L="$TMP/railO/merge.log"; O="$TMP/railO"; HEAD=cccc3333; \
   . "$TMP/railbranch.sh" ) >/dev/null 2>&1; src2=$?
 [ ! -s "$TMP/railO/gh-spy.txt" ] \
@@ -374,8 +395,9 @@ esac
 # same head, the merge marker must be ABSENT. A mutant that swallows the rail's exit status
 # (`} || true; then`) stayed green without this.
 rm -f "$TMP/railO/state/merged-1764.done" "$TMP/railO/state/railcount-1764"
+seed_record "$SEED_HOME" 1764 dddd4444
 printf '#!/bin/bash\nexit 1\n' > "$TMP/railrepo/scripts/admin-merge.sh"; chmod +x "$TMP/railrepo/scripts/admin-merge.sh"
-( MERGE_AUTHORITY=rail; REPO="$TMP/railrepo"; PR=1764; OR=daniel-ospina/agent-infra; \
+( HOME="$SEED_HOME"; MERGE_AUTHORITY=rail; REPO="$TMP/railrepo"; PR=1764; OR=daniel-ospina/agent-infra; \
   L="$TMP/railO/merge.log"; O="$TMP/railO"; HEAD=dddd4444; \
   . "$TMP/railbranch.sh" ) >/dev/null 2>&1
 [ ! -f "$TMP/railO/state/merged-1764.done" ] \
@@ -406,6 +428,45 @@ done
   && { echo "  ✅ an EMPTY head REFUSES (exit 7) instead of running an un-keyed, never-parking retry loop"; PASS=$((PASS+1)); } \
   || { echo "  ❌ an empty head exited $ehrc (want 7, log-hit=$_hits) — the cap is unreachable without a head, so the rail is re-run every cycle"; FAIL=$((FAIL+1)); }
 
+# (g3-1825) RAIL MODE WITHOUT EVIDENCE MUST NOT MERGE — the #1825 companion, BEHAVIOURAL.
+# `pipeline-compliance` check (c) — this repo's ONLY required check — accepts nothing but a
+# head-bound review record, so a rail-mode merge of a head with no record leaves the required
+# check unsatisfiable forever: "the binding must land together with re-enabling evidence minting
+# in rail mode, or pipeline-compliance becomes unsatisfiable on this repo" (issue #1825, owner
+# comment). The drive presents a rail that SUCCEEDS and a store with NO record at this head: the
+# worker must NOT invoke the rail. It falls through to the review path, where the missing recorder
+# parks the head (exit 3) instead of paying for a review whose record step cannot sign.
+cat > "$TMP/railrepo/scripts/admin-merge.sh" <<RAILSTUB
+#!/bin/bash
+printf '%s\n' "\$PWD" "\$*" > "$TMP/railO/rail-argv.txt"
+exit 0
+RAILSTUB
+chmod +x "$TMP/railrepo/scripts/admin-merge.sh"
+rm -f "$TMP/railO/rail-argv.txt" "$TMP/railO/state/merged-1764.done" "$TMP/railO/state/railcount-1764" \
+      "$TMP/railO/state/parked-1764" "$TMP/railO/state/parkreason-1764"
+NOEV_HOME="$TMP/noevhome"; mkdir -p "$NOEV_HOME"
+( HOME="$NOEV_HOME"; MERGE_AUTHORITY=rail; REPO="$TMP/railrepo"; PR=1764; OR=daniel-ospina/agent-infra; \
+  L="$TMP/railO/merge.log"; O="$TMP/railO"; HEAD=1111eeee; \
+  . "$TMP/railbranch.sh" ) >/dev/null 2>&1; noevrc=$?
+if [ "$noevrc" = "3" ] && [ ! -f "$TMP/railO/rail-argv.txt" ] && [ ! -f "$TMP/railO/state/merged-1764.done" ]; then
+  echo "  ✅ #1825: rail mode with NO head-bound record does NOT run the rail — it falls through to mint the evidence (parks at the missing recorder, exit 3)"
+  PASS=$((PASS+1))
+else
+  echo "  ❌ #1825: rail mode ran the rail (or merged) with NO head-bound record — rc=$noevrc rail-invoked=$([ -f "$TMP/railO/rail-argv.txt" ] && echo yes || echo no) merged=$([ -f "$TMP/railO/state/merged-1764.done" ] && echo yes || echo no). check (c) would be unsatisfiable on this repo and the merge would land unreviewed."
+  FAIL=$((FAIL+1))
+fi
+# ...and the CONTROL for it: the SAME drive with a record at the head DOES invoke the rail. Without
+# this pair a `record_at_head` that always returned 1 would satisfy the assertion above while
+# breaking rail mode entirely (no agent-infra PR could ever drain — the #1764 deadlock).
+rm -f "$TMP/railO/rail-argv.txt" "$TMP/railO/state/merged-1764.done" "$TMP/railO/state/railcount-1764"
+seed_record "$SEED_HOME" 1764 bbbb2222
+( HOME="$SEED_HOME"; MERGE_AUTHORITY=rail; REPO="$TMP/railrepo"; PR=1764; OR=daniel-ospina/agent-infra; \
+  L="$TMP/railO/merge.log"; O="$TMP/railO"; HEAD=bbbb2222; \
+  . "$TMP/railbranch.sh" ) >/dev/null 2>&1; evrc=$?
+[ "$evrc" = "0" ] && [ -f "$TMP/railO/rail-argv.txt" ] && [ -f "$TMP/railO/state/merged-1764.done" ] \
+  && { echo "  ✅ #1825 control: with a head-bound record present, rail mode DOES run the rail (the fast path is intact)"; PASS=$((PASS+1)); } \
+  || { echo "  ❌ #1825 control: rail mode did not run the rail WITH a record at the head (rc=$evrc) — the evidence test is inert and no rail PR could drain"; FAIL=$((FAIL+1)); }
+
 # (g3) the count is HEAD-KEYED, so a count file from a DIFFERENT head must NOT block the new head
 # (review round 7, P2): without the reset the worker sees the old head's count at the cap and PARKS
 # the new head without ever running the rail — the stale-park deadlock of round 1, one layer down.
@@ -416,9 +477,10 @@ exit 0
 RAILSTUB
 chmod +x "$TMP/railrepo/scripts/admin-merge.sh"
 rm -f "$TMP/railO/state/merged-1764.done" "$TMP/railO/rail-argv.txt"
+seed_record "$SEED_HOME" 1764 eeee5555
 printf '%s %s\n' aaaa1111 3 > "$TMP/railO/state/railcount-1764"    # an OLDER head, already AT the cap
 printf '%s\n' aaaa1111 > "$TMP/railO/state/parked-1764"
-( MERGE_AUTHORITY=rail; REPO="$TMP/railrepo"; PR=1764; OR=daniel-ospina/agent-infra; \
+( HOME="$SEED_HOME"; MERGE_AUTHORITY=rail; REPO="$TMP/railrepo"; PR=1764; OR=daniel-ospina/agent-infra; \
   L="$TMP/railO/merge.log"; O="$TMP/railO"; HEAD=eeee5555; \
   . "$TMP/railbranch.sh" ) >/dev/null 2>&1; nhrc=$?
 [ "$nhrc" = "0" ] && [ -f "$TMP/railO/state/merged-1764.done" ] \
@@ -429,9 +491,10 @@ printf '%s\n' aaaa1111 > "$TMP/railO/state/parked-1764"
 # cap: `[ 3 -ge 99999999999999999999 ]` errors FALSE on bash 3.2 (the shipped /bin/bash), so
 # without the coercion the park never lands and the rail is re-run every cycle — the API burn the
 # cap exists to close.
+seed_record "$SEED_HOME" 1764 aaaa1111
 printf '%s %s\n' aaaa1111 3 > "$TMP/railO/state/railcount-1764"
 printf '%s\n' zzzz9999 > "$TMP/railO/state/parked-1764"
-( MERGE_AUTHORITY=rail; REPO="$TMP/railrepo"; PR=1764; OR=daniel-ospina/agent-infra; RAIL_TRIES=99999999999999999999; \
+( HOME="$SEED_HOME"; MERGE_AUTHORITY=rail; REPO="$TMP/railrepo"; PR=1764; OR=daniel-ospina/agent-infra; RAIL_TRIES=99999999999999999999; \
   L="$TMP/railO/merge.log"; O="$TMP/railO"; HEAD=aaaa1111; \
   . "$TMP/railbranch.sh" ) >/dev/null 2>&1
 [ "$(cat "$TMP/railO/state/parked-1764" 2>/dev/null)" = "aaaa1111" ] \
@@ -440,7 +503,7 @@ printf '%s\n' zzzz9999 > "$TMP/railO/state/parked-1764"
 # …and a CORRUPT count is re-sanitised rather than propagated into the arithmetic.
 printf '%s %s\n' aaaa1111 99999999999999999999 > "$TMP/railO/state/railcount-1764"
 rm -f "$TMP/railO/state/parked-1764"
-( MERGE_AUTHORITY=rail; REPO="$TMP/railrepo"; PR=1764; OR=daniel-ospina/agent-infra; \
+( HOME="$SEED_HOME"; MERGE_AUTHORITY=rail; REPO="$TMP/railrepo"; PR=1764; OR=daniel-ospina/agent-infra; \
   L="$TMP/railO/merge.log"; O="$TMP/railO"; HEAD=aaaa1111; \
   . "$TMP/railbranch.sh" ) >/dev/null 2>&1
 _cnt2="$(awk '{print $2}' "$TMP/railO/state/railcount-1764" 2>/dev/null)"
