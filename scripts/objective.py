@@ -745,8 +745,19 @@ def classify_pr(pr, cr, att_clean):
     #    clause was missing: an attested PR the rail refuses is a NAMED defect, not "not ready".
     #    ⛔ THIS ARM STAYS FIRST, so a LANDABLE PR is never delayed by a running check elsewhere
     #    (see arm 4): the cheapest landing on the board must not queue behind a non-gating job.
+    #    ⛔ A RAIL GATE *IN FLIGHT* IS NOT A DEFECT TO REPAIR (#1872 review round 7).
+    #    `rail_block_reason` deliberately accepts a gate that is in flight as well as one that is
+    #    red -- but the two are opposite instructions. `blocked-by-rail` becomes the brief "THE RAIL
+    #    REFUSES IT ON <gate>. REPAIR THAT, THEN MERGE." MEASURED: all six required contexts green,
+    #    attestation clean, `drift-guard` merely `in_progress` -> `blocked-by-rail(drift-guard)`, so
+    #    a lane was dispatched to repair a gate that had not concluded. That is the same harm arm 4
+    #    exists to remove ("a check in flight is not work", 3h burned on #7924), so an
+    #    in-flight rail gate reads `running` and a RED one still reads `blocked-by-rail`.
     if not nongreen and att_clean:
-        return "blocked-by-rail" if rail_block_reason(red, flight, seen) else "call-rail"
+        _rail = rail_block_reason(red, flight, seen)
+        if _rail:
+            return "blocked-by-rail" if _rail in red else "running"
+        return "call-rail"
     # 2. rerun-checks -- NO required check has REPORTED at this head, and nothing is executing.
     #    ⛔ `and not flight` IS LOAD-BEARING (#1872 review). Without it this arm SHADOWED arm 4
     #    for the exact shape arm 4 was written for: a fresh head where no required context has

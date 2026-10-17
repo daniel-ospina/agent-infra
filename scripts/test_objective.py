@@ -101,6 +101,23 @@ def _isolate_stuck_ledger(tmp_path, monkeypatch):
     monkeypatch.setattr(objective, "STUCK_FILE", str(tmp_path / "call-rail-stuck.json"))
 
 
+def test_the_fixture_redirects_the_state_dir_and_the_stuck_ledger():
+    """⛔ THE REDIRECT MUST BE IN FORCE, NOT MERELY WRITTEN (#1872 review round 7).
+
+    The autouse fixture above only prevents the ledger wipe while it EXISTS. A test that pins the
+    redirect is what makes DELETING it fail: `test_lane_actions.py` pins the identical seam
+    (`test_the_suite_never_points_at_the_production_state_dir`) for its own module, and this file
+    had none -- so the fix could be removed with all 25 tests still green while every run resumed
+    rewriting `~/.pi/agent/state/call-rail-stuck.json` to `{}` and silently suppressing `call-rail`'s
+    one escalation. Verified by hand: deleting the two `monkeypatch.setattr` lines left 25 passed and
+    the real ledger at `{}`.
+    """
+    prod = str(pathlib.Path.home() / ".pi" / "agent" / "state")
+    for name in ("STATE", "STUCK_FILE"):
+        value = getattr(objective, name)
+        assert not value.startswith(prod), f"{name} points at production: {value}"
+
+
 # --- DIRECTION 2: a healthy read must NOT flag -----------------------------------------
 
 def test_healthy_read_does_not_flag(monkeypatch):
