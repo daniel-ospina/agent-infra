@@ -203,6 +203,28 @@ the plist and deliberately does not start anything, and nothing parks the legacy
 answer — measured 2026-10-16: this harness was **dormant** while six swarm-era dispatchers fired
 every 120 s.
 
+### 0.7 The load ceiling
+
+`MAX_LOAD` is where a box stops adding work. It is **derived, not fixed**: `cores × 8`, overridable
+per box (`MAX_LOAD` in the plist or `keys.env`), with a hard fallback of **32** when the core probe
+is unusable.
+
+| cores | ceiling |
+|---|---|
+| 4 | 32 ← also the fallback when `_NCPU` cannot be probed |
+| 8 | 64 |
+| 10 | 80 |
+
+**Why ×8.** The previous default was `cores × 10` (8 → 80, 10 → 100), which corresponds to the
+highest load observed as tolerable on a 10-core box. ×8 keeps a deliberate margin *below* what was
+seen to work: on a machine that is also somebody's laptop, load is a symptom of contention rather
+than a target to reach. A dedicated box can raise it with the override; the derived value stays
+conservative by design.
+
+> `MAX_LOAD` and `MERGE_PRIORITY_AT` are different gates and are often confused: `MAX_LOAD` is about
+> the box's capacity, `MERGE_PRIORITY_AT` (default **25**) is about the PR queue — above it the loop
+> drains instead of opening new work, regardless of how idle the box is.
+
 ## 1. Why it exists
 
 The repo's normal path is one agent, one issue, one PR, human-paced. On a box that is left
