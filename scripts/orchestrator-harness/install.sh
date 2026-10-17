@@ -460,7 +460,7 @@ ok "plist valid"
 # missing AGENT_DISK_REFUSED, which under `set -u` aborts a refusal before its refund (the callers
 # are tolerant of that now, but surviving a stale helper silently is not the same as DETECTING it).
 DRIFTED=""
-for f in orch-loop.sh claims.sh repo-authority.sh spawn-gate.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh gh-rest/gh; do
+for f in orch-loop.sh claims.sh repo-authority.sh spawn-gate.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh nonblocking-dispatch.sh gh-rest/gh; do
   [ -f "$O/$f" ] || { DRIFTED="$DRIFTED $f(missing)"; continue; }
   diff -q "$HERE/$f" "$O/$f" >/dev/null 2>&1 || DRIFTED="$DRIFTED $f"
 done
@@ -571,9 +571,9 @@ write_provenance() {
   # payloadSha256 <C1>`; `report.sh` then headlined `[current]` for a box not running that commit,
   # and only the new check-deployed-drift.sh's blob comparison caught it. The mismatch is now a
   # FIELD, so the record itself cannot be read as "this commit describes these bytes".
-  # ⛔ Compare the WHOLE shipped surface, NOT the 11-name `DRIFTED` subset. `DRIFTED` names only the
+  # ⛔ Compare the WHOLE shipped surface, NOT the 12-name `DRIFTED` subset. `DRIFTED` names only the
   # scripts the DAEMON executes; a shipped `*.sh` outside that list (`check-port-drift.sh`,
-  # `check-deployed-drift.sh`, `selftest.sh`, `nonblocking-dispatch.sh`, every `test-*.sh`) could
+  # `check-deployed-drift.sh`, `selftest.sh`, every `test-*.sh`) could
   # differ while this field still said `true` — so the record read "this commit describes these bytes"
   # about a `$O` the new check returns DRIFT/1 for. Reproduced in review: a byte appended to
   # `$O/check-port-drift.sh` gave `deployedMatchesSource: true` and no `report.sh` warning over a

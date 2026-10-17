@@ -462,7 +462,8 @@ while :; do
   # WHY IT LIVES HERE: this pass already reads every open PR (step 1) and already owns the
   # dispatch machinery -- pr-doctor is the ACTION half of a measurement this loop was already
   # making. It drives every open PR toward `merged`: fix a failing check -> re-review -> record
-  # -> call the rail, dispatching each PR to an idle lane. Before it existed, `waiting` went
+  # -> call the rail, spawning a background worker in the PR's own git worktree via
+  # `nonblocking-dispatch.sh` (load/disk-gated in `spawn-gate.sh`). Before it existed, `waiting` went
   # 10 -> 25 in one day while the fleet worked hard, because a failing requirable check was
   # REPORTED as a blocker instead of being repaired.
   #
