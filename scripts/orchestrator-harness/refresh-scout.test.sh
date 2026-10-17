@@ -1874,8 +1874,14 @@ RS
   [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ] && ok "rest_list refuses an UNMODELLED flag (rc=$rc, no hang) — a dropped filter is a wrong answer" \
                   || bad "rest_list accepted/dropped an unmodelled flag (rc=$rc)"
   drv issues --repo acme/widget --limit > /dev/null 2>"$HD/err"; rc=$?
-  [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ] && ok "rest_list refuses a flag with NO VALUE instead of spinning for ever (rc=$rc)" \
-                  || bad "rest_list did not refuse a value-less flag (rc=$rc; 124 = it hung)"
+  # ⛔ THE MESSAGE, NOT THE STATUS. Under this driver's `set -u` the UNGUARDED form also exits non-zero
+  # (`$2: unbound variable` — measured), so an rc-only assertion stays green with the guard deleted,
+  # while a caller that does NOT run `set -u` spins for ever (measured: still running after 6 s). The
+  # guard's own words are the only thing that separates "the helper refused" from "the shell aborted".
+  grep -q "listing flag '--limit' needs a value" "$HD/err" 2>/dev/null && noval=1 || noval=0
+  [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ] && [ "$noval" -eq 1 ] \
+    && ok "rest_list refuses a flag with NO VALUE AT THE GUARD (rc=$rc, 'needs a value') instead of spinning for ever" \
+    || bad "rest_list did not refuse a value-less flag at the guard (rc=$rc; 124 = it hung; message='$(head -1 "$HD/err")')"
   drv issues --repo acme/widget --limit abc > /dev/null 2>"$HD/err"; rc=$?
   # ⛔ THE MESSAGE, NOT JUST THE STATUS: without the guard the helper pages and then dies inside the
   # final `jq --argjson limit abc` (measured rc=2, "invalid JSON text passed to --argjson") — a
@@ -1941,8 +1947,12 @@ SH
   PATH="$HD2:$PATH"; export PATH
   drv_out issues --repo acme/widget --limit 500 --jq '.[].number' > "$HD2/out" 2>"$HD2/err"; rc=$?
   PATH="${PATH#$HD2:}"; export PATH
-  [ "$rc" -ne 0 ] && ok "rest_list REFUSES a SHORT page that still advertises a next page (rc=$rc) — a stripped page is not a complete listing" \
-                  || bad "rest_list returned a SHORT page at rc 0 — a truncated listing (rows=$(wc -l < "$HD2/out"))"
+  # ⛔ BY MESSAGE, like the vanish cases: a stub that simply FAILS also yields rc≠0, and that false
+  # PASS was measured (a broken stub answered nothing and both this and the empty-body case went green).
+  grep -q 'a short page is not a complete listing' "$HD2/err" 2>/dev/null && short_msg=1 || short_msg=0
+  [ "$rc" -ne 0 ] && [ "$short_msg" -eq 1 ] \
+    && ok "rest_list REFUSES a SHORT page that still advertises a next page (rc=$rc, 'not a complete listing')" \
+    || bad "rest_list did not refuse a short page at the guard (rc=$rc, message='$(head -1 "$HD2/err")', rows=$(wc -l < "$HD2/out"))"
   [ ! -s "$HD2/out" ] && ok "the short-page refusal emits NO rows either" \
                       || bad "the short-page refusal still emitted $(wc -l < "$HD2/out") row(s)"
 
@@ -1956,8 +1966,10 @@ SH
   PATH="$HD3:$PATH"; export PATH
   drv_out pulls --repo acme/widget --limit 10 --jq '.[]|.head.ref' > "$HD3/out" 2>"$HD3/err"; rc=$?
   PATH="${PATH#$HD3:}"; export PATH
-  [ "$rc" -ne 0 ] && ok "rest_list REFUSES a 200 with an EMPTY body (rc=$rc) — 'no content' is 204, not an empty 200" \
-                  || bad "rest_list read a 200 with an empty body as 0 rows (rc=$rc) — that writes an empty .pr_brs"
+  grep -q 'with an EMPTY body' "$HD3/err" 2>/dev/null && empty_msg=1 || empty_msg=0
+  [ "$rc" -ne 0 ] && [ "$empty_msg" -eq 1 ] \
+    && ok "rest_list REFUSES a 200 with an EMPTY body (rc=$rc, 'EMPTY body') — 'no content' is 204, not an empty 200" \
+    || bad "rest_list did not refuse a bodyless 200 at the guard (rc=$rc, message='$(head -1 "$HD3/err")') — that writes an empty .pr_brs"
   # …and the legitimate no-content shape is still a valid empty answer
   HD4="$T/restcase-204"; mkdir -p "$HD4"
   printf '#!/bin/bash\nprintf "HTTP/2.0 204 No Content\\r\\n\\r\\n"\n' > "$HD4/gh"
@@ -1967,6 +1979,50 @@ SH
   PATH="${PATH#$HD4:}"; export PATH
   [ "$rc" -eq 0 ] && [ ! -s "$HD4/out" ] && ok "rest_list accepts a 204 as a real empty answer (rc=0, no rows)" \
                                       || bad "rest_list did not accept a 204 (rc=$rc, out=$(wc -l < "$HD4/out") rows)"
+
+  # ── A 403 IS NOT NECESSARILY A RATE LIMIT (rest_fail has three branches; the whole-script case
+  #    only ever reaches the rate-limit one, because its stub says "rate limit"). Deleting the
+  #    permission branch would silently collapse two different diagnoses into the generic message,
+  #    and the suite would stay green — measured.
+  HD403="$T/restcase-403"; mkdir -p "$HD403"
+  printf '#!/bin/bash\necho "gh: Resource not accessible by integration (HTTP 403)" >&2\nexit 1\n' > "$HD403/gh"
+  chmod +x "$HD403/gh"
+  PATH="$HD403:$PATH"; export PATH
+  drv_out issues --repo acme/widget --limit 10 > /dev/null 2>"$HD403/err"; rc=$?
+  PATH="${PATH#$HD403:}"; export PATH
+  grep -q 'HTTP 403 with no rate-limit wording' "$HD403/err" 2>/dev/null && perm_msg=1 || perm_msg=0
+  [ "$rc" -ne 0 ] && [ "$perm_msg" -eq 1 ] \
+    && ok "rest_fail names a PERMISSION 403 as such, and does not call it a rate limit" \
+    || bad "rest_fail mis-diagnosed a permission 403: '$(head -1 "$HD403/err")'"
+  HD404="$T/restcase-generic"; mkdir -p "$HD404"
+  printf '#!/bin/bash\necho "gh: something else went wrong" >&2\nexit 1\n' > "$HD404/gh"
+  chmod +x "$HD404/gh"
+  PATH="$HD404:$PATH"; export PATH
+  drv_out issues --repo acme/widget --limit 10 > /dev/null 2>"$HD404/err"; rc=$?
+  PATH="${PATH#$HD404:}"; export PATH
+  grep -q 'listing FAILED (page 1)' "$HD404/err" 2>/dev/null && gen_msg=1 || gen_msg=0
+  [ "$rc" -ne 0 ] && [ "$gen_msg" -eq 1 ] \
+    && ok "rest_fail falls back to the generic PAGE-naming refusal for anything else" \
+    || bad "rest_fail did not fall back to the generic refusal: '$(head -1 "$HD404/err")'"
+
+  # ── THE `page < pages` EXEMPTION IS THE DECIDING BRANCH for a small limit ────────────────────
+  # A one-page caller (`--limit 10`) that gets 40 rows and a `rel="next"` must NOT be refused: the
+  # next page is one it never asked for. Without the exemption the short-page guard would refuse every
+  # small-limit listing on a busy repo; nothing else in this block exercises that branch (the 40-row
+  # case above asks for 500, so it refuses on the short-page rule regardless).
+  HD10="$T/restcase-limit10"; mkdir -p "$HD10"
+  cat > "$HD10/gh" <<'SH'
+#!/bin/bash
+printf 'HTTP/2.0 200 OK\r\nLink: <x?page=2>; rel="next"\r\n\r\n'
+jq -n '[range(40)|{number:.}]'
+SH
+  chmod +x "$HD10/gh"
+  PATH="$HD10:$PATH"; export PATH
+  drv_out issues --repo acme/widget --limit 10 --jq '.[].number' > "$HD10/out" 2>"$HD10/err"; rc=$?
+  PATH="${PATH#$HD10:}"; export PATH
+  [ "$rc" -eq 0 ] && [ "$(wc -l < "$HD10/out")" -eq 10 ] \
+    && ok "a --limit 10 caller is NOT refused over a next page it never asked for (rc=0, 10 rows)" \
+    || bad "the page<pages exemption is broken: rc=$rc, rows=$(wc -l < "$HD10/out") — $(head -1 "$HD10/err")"
 
   # ── THE MULTI-PAGE SUCCESS PATH, in order ──────────────────────────────────────────────────
   # Ten full pages. The page files are concatenated by a GLOB, so this only comes back in order if
