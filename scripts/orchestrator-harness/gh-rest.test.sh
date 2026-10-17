@@ -30,7 +30,7 @@ case "$*" in *"--jq .head.sha"*) printf '%s' '75c0353907f016cf71661d8a6b11f61bf4
 case "$*" in *"--auto"*) printf 'STUB: delegated auto-merge'; exit 0 ;; esac
 # POST /comments (pr comment) and GET /comments (pr view --json comments) share a path — split on method.
 case "$*" in *"-X POST"*"/comments"*) printf '{"id":7,"html_url":"https://github.com/o/r/pull/8833#issuecomment-7"}'; exit 0 ;; esac
-path="$(printf '%s\n' "$@" | grep -E '^repos/' | head -1)"
+path="$(printf '%s\n' "$@" | grep -m1 -E '^repos/')"
 case "$path" in
   *"/pulls/9001/merge"*)  printf '{"merged":false,"message":"Pull Request is not mergeable"}'; exit 0 ;;
   *"/merge"*)             printf '{"sha":"abc1234def","merged":true,"message":"Pull Request successfully merged"}'; exit 0 ;;
@@ -55,6 +55,10 @@ chmod +x "$TMP/stub-gh"
 run() { STUB_LOG="$TMP/log" GH_REST_REAL_GH="$TMP/stub-gh" bash "$SHIM" "$@"; }
 stublog() { cat "$TMP/log" 2>/dev/null; }
 json_eq() { python3 -c "import json,sys; d=json.load(sys.stdin); print(0 if $1 else 1)" 2>/dev/null || echo 1; }
+# ⛔ No `producer | grep -q`: a quiet grep writes nothing into the pipe, so the PIPE (not the content)
+# decides the test. Here-string instead — see scripts/check-no-sigpipe-grep.sh.
+has() { grep -q -- "$1" <<<"$2"; }
+haslog() { grep -q -- "$1" <<<"$(stublog)"; }
 
 echo "gh-rest adapter (#1959) — assertions copied from real callers"
 
@@ -77,7 +81,7 @@ ck "mergeable false -> CONFLICTING (REST mergeable_state=dirty)" \
 : >"$TMP/log"
 out="$(run pr view 8833 --repo o/r --comments 2>&1)"
 ck "pr view without --json DELEGATES (fix-one.sh:155 reads the raw comment dump)" \
-   "$(stublog | grep -q 'pr view 8833 --repo o/r --comments' && echo 0 || echo 1)"
+   "$(haslog 'pr view 8833 --repo o/r --comments' && echo 0 || echo 1)"
 
 # ── C. pr view --json comments returns an ARRAY (REST gives a count) ─────────────────────────────
 out="$(run pr view 8833 --repo o/r --json comments 2>&1)"
@@ -94,7 +98,7 @@ ck "pr checks: in-flight -> status" \
    "$(printf '%s' "$out" | json_eq 'any(x["name"]=="changes" and x["state"]=="in_progress" for x in d)')"
 out="$(run pr checks 8833 --repo o/r --json name,link --jq '.[]|select(.name=="python-ci-gate")|.link' 2>&1)"
 ck "pr checks --json name,link surfaces details_url (fix-one.sh:150 derives the run id)" \
-   "$(printf '%s' "$out" | grep -q 'runs/12345' && echo 0 || echo 1)"
+   "$(has 'runs/12345' \"$out\" && echo 0 || echo 1)"
 out="$(run pr checks 8833 --repo o/r --json name,state 2>&1)"
 ck "pr checks includes LEGACY commit statuses (else a protection context is never green)" \
    "$(printf '%s' "$out" | json_eq 'any(x["name"]=="vercel/deploy" for x in d)')"
@@ -103,25 +107,25 @@ ck "pr checks includes LEGACY commit statuses (else a protection context is neve
 : >"$TMP/log"
 out="$(run pr checks 8833 --repo o/r 2>&1)"
 ck "pr checks without --json DELEGATES (table output is not modelled)" \
-   "$(stublog | grep -q 'pr checks 8833 --repo o/r' && echo 0 || echo 1)"
+   "$(haslog 'pr checks 8833 --repo o/r' && echo 0 || echo 1)"
 
 # ── E. pr list --head must reach the API (chain-merge.sh:44 — else the WRONG PR is merged) ───────
 : >"$TMP/log"
 run pr list --repo o/r --state open --head BR --json number --jq '.[0].number' >/dev/null 2>&1
 ck "pr list --head reaches the API as head=OWNER:BRANCH (P0: else an unrelated PR is merged)" \
-   "$(stublog | grep -q 'head=o:BR' && echo 0 || echo 1)"
+   "$(haslog 'head=o:BR' && echo 0 || echo 1)"
 
 # ── F. issue list --label must reach the API (refresh-candidates.sh severity tiers) ─────────────
 : >"$TMP/log"
 run issue list --repo o/r --state open --limit 300 --label P0-blocker --json number >/dev/null 2>&1
 ck "issue list --label reaches the API as labels= (else P0/P1/P2 ordering inverts)" \
-   "$(stublog | grep -q 'labels=P0-blocker' && echo 0 || echo 1)"
+   "$(haslog 'labels=P0-blocker' && echo 0 || echo 1)"
 
 # ── G. an UNMODELLED flag delegates instead of being dropped (the root-cause rule) ──────────────
 : >"$TMP/log"
 out="$(run pr list --repo o/r --search 'flaky' --json number 2>&1)"
 ck "unmodelled flag (--search) DELEGATES rather than serving an unfiltered answer" \
-   "$(stublog | grep -q -- '--search' && echo 0 || echo 1)"
+   "$(haslog '--search' && echo 0 || echo 1)"
 
 # ── H. limits / filtering ────────────────────────────────────────────────────────────────────────
 ck "pr list honours --limit" "$(run pr list --repo o/r --limit 2 --json number 2>&1 | json_eq 'len(d)==2')"
@@ -133,27 +137,27 @@ ck "issue view maps state" "$(run issue view 8491 --repo o/r --json number,state
 printf 'review body\n' >"$TMP/rev.md"
 out="$(run pr comment 8833 --repo o/r --body-file "$TMP/rev.md" 2>&1)"
 ck "pr comment PRINTS the comment URL (P0: else every reviewed PR parks)" \
-   "$(printf '%s' "$out" | grep -q 'issuecomment-7' && echo 0 || echo 1)"
+   "$(has 'issuecomment-7' \"$out\" && echo 0 || echo 1)"
 
 # ── J. mutating calls ────────────────────────────────────────────────────────────────────────────
 : >"$TMP/log"
 run pr merge 8833 --repo o/r --squash --match-head-commit 75c0353 >/dev/null 2>&1
-ck "pr merge --squash -> PUT merge_method=squash" "$(stublog | grep -q 'merge_method=squash' && echo 0 || echo 1)"
-ck "pr merge passes --match-head-commit as sha" "$(stublog | grep -q 'sha=75c0353' && echo 0 || echo 1)"
+ck "pr merge --squash -> PUT merge_method=squash" "$(haslog 'merge_method=squash' && echo 0 || echo 1)"
+ck "pr merge passes --match-head-commit as sha" "$(haslog 'sha=75c0353' && echo 0 || echo 1)"
 : >"$TMP/log"
 run pr merge 9001 --repo o/r --squash >/dev/null 2>&1; rc=$?
 ck "pr merge with body merged:false FAILS (a 200 is not a merge)" "$([ "$rc" -ne 0 ] && echo 0 || echo 1)"
 : >"$TMP/log"
 run pr merge 8833 --repo o/r --auto >/dev/null 2>&1
-ck "pr merge --auto delegates (GraphQL-only mutation)" "$(stublog | grep -q -- '--auto' && echo 0 || echo 1)"
+ck "pr merge --auto delegates (GraphQL-only mutation)" "$(haslog '--auto' && echo 0 || echo 1)"
 ck "pr merge --auto issues NO merge PUT" "$(stublog | grep -q '/merge' && echo 1 || echo 0)"
 : >"$TMP/log"
 run pr merge 8833 --repo o/r >/dev/null 2>&1
 ck "pr merge with NO method delegates (gh derives it from repo settings)" \
-   "$(stublog | grep -q 'pr merge 8833' && echo 0 || echo 1)"
+   "$(haslog 'pr merge 8833' && echo 0 || echo 1)"
 : >"$TMP/log"
 run pr ready 8833 --repo o/r >/dev/null 2>&1
-ck "pr ready -> REST ready_for_review" "$(stublog | grep -q 'ready_for_review' && echo 0 || echo 1)"
+ck "pr ready -> REST ready_for_review" "$(haslog 'ready_for_review' && echo 0 || echo 1)"
 
 # ── K. failures stay loud ────────────────────────────────────────────────────────────────────────
 ck "a failing --jq exits NON-ZERO (empty+0 is indistinguishable from 'no rows')" \
@@ -161,7 +165,7 @@ ck "a failing --jq exits NON-ZERO (empty+0 is indistinguishable from 'no rows')"
 : >"$TMP/log"
 run api repos/o/r --jq .name >/dev/null 2>&1
 ck "untranslated command delegates verbatim (gh api is already REST)" \
-   "$(stublog | grep -q 'api repos/o/r' && echo 0 || echo 1)"
+   "$(haslog 'api repos/o/r' && echo 0 || echo 1)"
 
 echo
 printf 'gh-rest: %d passed, %d failed\n' "$pass" "$fail"
