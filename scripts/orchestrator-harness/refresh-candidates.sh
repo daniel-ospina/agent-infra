@@ -17,6 +17,67 @@ set -u
 OR="${OR:-daniel-ospina/tortoise}"
 REPO="${REPO:-/Users/danielospina/Documents/GitHub/tortoise}"
 SC="$REPO/.worktrees/dispatch-scout"
+
+# ── A USABLE $HOME IS A PRECONDITION OF THE PRE-FLIGHT, NOT A PER-CANDIDATE RESULT ─────────────
+# WHY THIS LIVES HERE AND NOT ONLY IN cloud-cell-bringup.sh. Bring-up already names this as friction
+# #1 (`cmux vm exec` runs as user `cmux` with HOME=/home/ubuntu, which is NOT created on the image,
+# so anything that writes $HOME dies) and repairs it — inside its OWN process. A repair in bring-up's
+# process cannot cross a process boundary, and the controller is not always started by bring-up: the
+# REFRESH is what actually runs the pre-flight, and nothing made its environment usable.
+#
+# MEASURED 2026-10-16 on the live cmux cells — the SAME tool, the same cwd, the same issue, with
+# ONLY $HOME differing (issue #1328, daniel-ospina/agent-infra):
+#   HOME=/home/ubuntu   -> VERDICT: COLLISION (exit 1) — "a peer owns it, retry next pass"
+#                          ... ALSO INCOMPLETE: 3 surface(s) could not be queried
+#   HOME=/tmp/cell-home -> VERDICT: LANDED (exit 4) — the authoritative answer
+# gh keeps its credentials in $HOME/.config/gh, so under the image's HOME every gh surface of the
+# pre-flight fails (`gh auth status` there answers "not logged in"). The danger is not that the tool
+# refuses: a COLLISION is a perfectly ordinary answer to the caller, so a broken environment does not
+# read as breakage — it reads as a busy queue. Measured the same day: the cell whose keys.env
+# carries NO `HOME=` logged 309 collisions and ZERO clean verdicts, its `candidates.txt` stayed
+# empty and orch-loop reported RUNNING with `lanes: 0`; the ONLY cell queueing candidates was the
+# one whose keys.env carries an operator's HAND-WRITTEN `HOME=`/`UV_CACHE_DIR=`. That is the
+# fix-that-never-ran shape.
+#
+# WRITABLE is the definition of usable HERE, and it is the harness's own precondition, not a choice
+# made in this function: cloud-cell-supervisor.sh and cloud-cell-bringup.sh both die on a non-writable
+# home, and `$O` defaults to `$HOME/orchestrator`, which this script writes. The repair is a NO-OP
+# wherever $HOME is already a writable directory (every laptop, and every cell whose controller the
+# supervisor started); a home that is absent, not a directory, or not writable is off-spec for this
+# harness and is replaced.
+CELL_HOME="${CELL_HOME:-/tmp/cell-home}"
+usable_home() { [ -n "${1:-}" ] && [ -d "$1" ] && [ -w "$1" ]; }
+# $1 = --create. Runs at LOAD, before anything else: the interpreter probe, uv's cache and the
+# pre-flight all resolve through $HOME. TWO candidates — the caller's $HOME, then $CELL_HOME (the
+# home bring-up provisions and the credentials live in) — and only an ABSOLUTE, existing, writable
+# directory is eligible. Only $CELL_HOME is ever created, and the repo, the scout worktree and the
+# venv are never touched (which is what `--check`'s read-only promise is about);
+# cloud-cell-bringup.sh's --check path creates the same home. $O's parent is deliberately NOT a
+# candidate: it is the same directory on a real cell, and on a hand-run with $O pointed elsewhere it
+# would silently adopt a home that holds no credentials.
+resolve_home() {
+  local create="${1:-}" cand old="${HOME:-<unset>}"
+  for cand in "${HOME:-}" "$CELL_HOME"; do
+    [ -n "$cand" ] || continue
+    case "$cand" in /*) ;; *) continue ;; esac
+    if [ "$cand" = "$CELL_HOME" ] && [ "$create" = --create ] && ! usable_home "$cand"; then
+      mkdir -p "$cand" 2>/dev/null || true
+    fi
+    usable_home "$cand" || continue
+    [ "$cand" = "$old" ] && return 0
+    HOME="$cand"; export HOME
+    # uv's cache default is $HOME/.cache/uv, which is why an unusable HOME makes `uv sync` die on
+    # its cache before it can fail on anything real. Point it at the same writable home; an
+    # explicit operator value is kept.
+    : "${UV_CACHE_DIR:=$cand/.cache/uv}"; export UV_CACHE_DIR
+    echo "[refresh] HOME=$old is not a writable directory — using HOME=$HOME UV_CACHE_DIR=$UV_CACHE_DIR (cloud-cell-bringup.sh friction #1)"
+    return 0
+  done
+  return 1
+}
+resolve_home --create \
+  || echo "[refresh] WARN: neither \$HOME ('${HOME:-<unset>}') nor CELL_HOME ('$CELL_HOME') is a writable directory — the pre-flight's gh surfaces will be unreadable and its verdicts degraded"
+
 O="${O:-$HOME/orchestrator}"
 # ⛔ APPEND, never PREPEND. These two directories are where launchd's minimal environment finds the
 # harness's tools, so they must stay on PATH — but hard-prepending them silently OUTRANKED the
@@ -139,6 +200,92 @@ resolve_preflight() {   # sets PREFLIGHT to the resolved tool path; returns 1 if
   return 1
 }
 
+# ── gh must be able to AUTHENTICATE, or the pre-flight's verdicts are degraded fiction ─────────
+# WHY. The surfaces of tools/collision_preflight.py that DECIDE a verdict — issue metadata, open PRs,
+# the assignee/holder surfaces — are gh-backed. The three it reads from git (local branches, remote
+# branches, local worktrees) are NOT a substitute: all three are BLOCKING — a ref naming the issue
+# forces a COLLISION — and the local-branch surface's terminal lookup is itself a gh call whose
+# failure deliberately KEEPS the ref blocking (fail-closed). With an unauthenticated gh the tool does
+# NOT refuse — it answers from whatever it can still read, which is
+# how a LANDED issue came back as a COLLISION (measured 2026-10-16, #1328: `VERDICT: COLLISION ...
+# ALSO INCOMPLETE: 3 surface(s) could not be queried` under HOME=/home/ubuntu, `VERDICT: LANDED`
+# under HOME=/tmp/cell-home). The caller cannot tell that answer apart from a real collision, so an
+# environment failure becomes "a peer owns it, retry next pass" on every candidate, forever. This
+# check turns it back into ONE named provisioning failure.
+# ⛔ PERMANENT (3) IS RESERVED FOR A CONDITION A RETRY CANNOT CHANGE — no `gh` on PATH, no credential
+# stored for the host, or a credential the API has REJECTED with a 401. Everything else is TRANSIENT
+# (1), so a network/API fault cannot latch the permanent `.refresh-blocked` marker that only a human
+# can clear (#1853 review).
+# `gh auth token` also recognises GH_TOKEN/GITHUB_TOKEN, so a token-in-env cell is not false-blocked.
+# ⛔ ASK gh WHICH HOST IT WILL USE — DO NOT MODEL IT. The pre-flight's own calls pass a host-LESS
+# repo slug (`--repo .`, whose remote host `_remote_slug` strips), so the host is gh's choice — and
+# gh's rule (`GH_HOST`, else the ONE configured host, else github.com) CANNOT be reproduced from its
+# JSON view. `gh auth status --json hosts` reports the KNOWN hosts, which ADD a github.com entry
+# synthesised from GH_TOKEN/GITHUB_TOKEN, and it cannot show a configured github.com whose token an
+# env token shadows: the two are byte-identical there. Every attempt to derive the host from that
+# JSON named the WRONG host in some configuration — a two-GHES config (gh uses github.com, the JSON
+# suggests the enterprise host, so the probe reported TRANSIENT for ever and never named the real
+# cause) and a GHES config with GH_TOKEN set (gh uses the enterprise host, the JSON suggests
+# github.com, so a bad credential LATCHED the permanent marker naming the wrong host) — both measured
+# against gh 2.97.0 (#1853 review). So NO host is named here at all: `gh auth token` and `gh api`
+# resolve it exactly as the pre-flight's own calls do. Neither touches any OTHER host, so an unrelated
+# host's problem cannot change the answer (an UNSCOPED `gh auth status` would — it validates them all).
+
+# 0 = the environment the pre-flight runs in can authenticate; 1 = TRANSIENT; 3 = PERMANENT.
+gh_probe_env() {
+  local terr err
+  if ! command -v gh >/dev/null 2>&1; then
+    echo "[refresh] NOT PROVISIONABLE: gh is not on PATH — the verdict-deciding surfaces of the collision pre-flight are gh-backed, so no candidate can be judged and a cell on this repo could only MERGE (#1736)"
+    return "$EXIT_NOT_PROVISIONABLE"
+  fi
+  # ⛔ DISCRIMINATE ON THE CREDENTIAL'S PRESENCE, NEVER ON gh's PROSE. Presence and validation have to
+  # be TWO questions, because no single hosted call answers both without naming a host. `gh auth
+  # status` cannot tell a transport fault from a rejected credential — measured on gh 2.97.0: behind a
+  # DEAD PROXY a pure network fault prints exactly the same "The token in ~/.config/gh/hosts.yml is
+  # invalid." as a revoked one — so any text match on "invalid"/"expired"/"authenticat" classifies an
+  # outage as a credential failure and latches the permanent marker a human must clear (#1853 review).
+  # PRESENCE is `gh auth token`: an OFFLINE lookup of the stored credential (hosts.yml / the keyring),
+  # so its exit status is cause-independent. ⛔ ITS STDOUT IS THE TOKEN — it is discarded below and the
+  # captured stream is STDERR ONLY (`2>&1 >/dev/null`), so no token can reach the log.
+  if ! terr="$(gh auth token 2>&1 >/dev/null)"; then
+    echo "[refresh] NOT PROVISIONABLE: gh has no credential STORED for the host it is configured for, in the environment the pre-flight runs in (HOME=$HOME) — its issue/PR surfaces cannot be read, so the pre-flight would answer from partial evidence and read every candidate as a collision (#1736)"
+    printf '%s\n' "$terr" | sed -n '1,4p' | sed 's/^/[refresh]   /'
+    echo "[refresh]   fix: authenticate gh in THIS home (gh auth login --with-token <token>), or point HOME at the home that already holds the credentials; set GH_HOST to name a host other than the one gh is configured for, then re-run"
+    return "$EXIT_NOT_PROVISIONABLE"
+  fi
+  # VALIDATION is the same call the pre-flight's gh-backed surfaces make, with no host named. A
+  # credential that is STORED and DOES answer is usable, so this is also where the probe can SUCCEED.
+  err="$(gh api rate_limit 2>&1)" && return 0
+  # A credential IS stored, but the call did not answer. Is it REJECTED, or merely UNREACHABLE? Only
+  # the API can say, and only a 401 is unambiguous. A 403 is deliberately NOT used: `/rate_limit` is
+  # exempt from the PRIMARY rate limit, but a 403 still has several meanings — an SSO/SAML
+  # enforcement, a missing scope, an IP-allowlist block, a suspended account, or a SECONDARY rate
+  # limit — so a permanent denial and a transient throttle are indistinguishable there (and a
+  # transport failure carries no HTTP status at all). The ambiguous middle is
+  # returned TRANSIENT on purpose: a wrong TRANSIENT costs a loud rc=1 retry, while a wrong PERMANENT
+  # stops dispatch until a human clears the marker. MEASURED on gh 2.97.0: a bogus stored token ->
+  # `gh: Bad credentials (HTTP 401)`; a dead proxy -> `proxyconnect tcp: … connection refused` with no
+  # status.
+  # ⚠️ DECLARED RESIDUAL: a credential that GitHub rejects with a 403 is therefore retried
+  # indefinitely (loudly, via `FAILED rc=1`) and never writes the permanent marker.
+  if grep -q 'HTTP 401' <<<"$err"; then
+    echo "[refresh] NOT PROVISIONABLE: the gh credential STORED for the host gh is configured for is REJECTED by GitHub (HTTP 401) in the environment the pre-flight runs in (HOME=$HOME) — a retry cannot fix it, and every candidate would be read as a collision (#1736)"
+    printf '%s\n' "$err" | sed -n '1,4p' | sed 's/^/[refresh]   /'
+    echo "[refresh]   fix: re-authenticate gh in THIS home (gh auth login --with-token <token>), then re-run"
+    return "$EXIT_NOT_PROVISIONABLE"
+  fi
+  echo "[refresh] TRANSIENT: a gh credential is stored for the host gh is configured for but the API did not answer with a 401 in the environment the pre-flight runs in (HOME=$HOME) — treating it as an outage rather than a rejected credential, so this is retried next cycle instead of latching the permanent MERGE-ONLY marker (#1736)"
+  printf '%s\n' "$err" | sed -n '1,4p' | sed 's/^/[refresh]   /'
+  return "$EXIT_TRANSIENT"
+}
+
+gh_env_verdict() {
+  # The probe covers the host the pre-flight's own host-LESS calls resolve. The harness's POOL
+  # LISTING is a different call — it names `$OR` directly — and it is guarded where it runs: an
+  # unreadable listing must not be read as an empty one (see `.pool` in cmd_run).
+  gh_probe_env
+}
+
 # ── the cross-box ISSUE claim: a BLOCKING pre-flight surface (agent-infra#1850) ────────────────
 # The pre-flight tool (`tools/collision_preflight.py`) enumerates its own surfaces out of immutable
 # history — open PRs, branches, worktrees, the assignee — and `git worktree list`/local branches are
@@ -190,6 +337,21 @@ issue_claim_verdict() { # <issue> -> 0 CLEAN / 1 COLLISION / 2 INCOMPLETE; the r
 # ── --check: the read-only provisioning verdict ───────────────────────────────────────────────
 cmd_check() {
   local scout tool_dir
+  # ⛔ The gh precondition is DELIBERATELY NOT judged here. `--check` is what
+  # cloud-cell-supervisor.sh's cmd_check and cloud-cell-bringup.sh's check_dispatch run, and each of
+  # those already performs ONE `gh auth status` itself — the supervisor's in cmd_check, the bringup's
+  # in check_gh, which bringup's own `--check` arm runs immediately before check_dispatch (both are
+  # listed in its main()). orchestrator-harness's selftest pins exactly one such call under
+  # `$CELL_HOME` for each of them, so a second `gh auth status` from here would redden an
+  # owned suite. More importantly it is the WRONG LAYER:
+  # those checks run in the
+  # operator's shell with HOME=$CELL_HOME forced, while the pre-flight inherits the HOME of the
+  # process that actually runs it — which is the divergence this whole change exists for, and which
+  # no operator-side check can see. The run path below is the one that judges it.
+  # ⚠️ DECLARED RESIDUAL (pre-existing, and outside this change's scope): those two operator-side
+  # checks call `gh auth status` UNSCOPED, so a stale UNRELATED host refuses a cell whose target host
+  # is fine. scripts/cloud-cell-supervisor.sh and scripts/cloud-cell-bringup.sh are owned by another
+  # lane; the run-path probe below is host-scoped, so this one is not.
   [ -d "$REPO" ] || { echo "[refresh] check: FAIL repo not found at $REPO"; return "$EXIT_TRANSIENT"; }
   tool_dir="$REPO"; [ -d "$SC" ] && tool_dir="$SC"
   if ! resolve_preflight; then
@@ -236,7 +398,28 @@ cmd_check() {
 }
 
 if [ "$MODE" = check ]; then cmd_check; exit $?; fi
-mkdir -p "$O"
+# ⛔ AN UNWRITABLE STATE DIR REFUSES — it does not get absorbed. Every write below was unchecked, so a
+# state dir that cannot be WRITTEN let the run finish with `checked 0; backlog now` at rc 0 having
+# persisted NOTHING: no marker for orch-loop, no candidates, and the cell sits RUNNING with `lanes: 0`
+# — the merge-only shape this change exists to remove (#1853 review).
+mkdir -p "$O" || { echo "[refresh] ABORT: cannot create the state directory $O"; exit "$EXIT_TRANSIENT"; }
+# ⛔ WRITABLE, NOT MERELY PRESENT — `mkdir -p` SUCCEEDS on an existing read-only or root-owned
+# directory, where every write below fails. Those failures are invisible in exactly the way that
+# matters: a STALE `.pool` left by an earlier run satisfies a test on the FILE, the loop reads that
+# stale pool, and the pass reports `checked N; backlog now M` at rc 0 having persisted nothing. A probe
+# write at entry makes it ONE named refusal instead (#1853 review). The probe covers a state dir that
+# was ALREADY unwritable at entry; the state writes below are each checked in their own right, so a
+# write failure that only BEGINS mid-run (a disk that fills afterwards) is refused at THAT write
+# rather than absorbed. What remains unhandled is narrower: a line left PARTIALLY written by an
+# interrupted write is not rolled back.
+if ! ( : > "$O/.write-probe" ) 2>/dev/null; then
+  echo "[refresh] ABORT: $O is not WRITABLE — the pass could not persist its backlog (#1736)"
+  exit "$EXIT_TRANSIENT"
+fi
+rm -f "$O/.write-probe"
+# The same environment precondition on the RUN path — and before the scout is provisioned, so a cell
+# that cannot read GitHub refuses in a second instead of after minutes of network work.
+gh_env_verdict || exit $?
 
 # The scout is a dedicated throwaway worktree used only to run the collision pre-flight.
 # Provision it on first use: an earlier version just `cd`-ed into it, so on a fresh box the
@@ -347,6 +530,10 @@ if ! gh pr list --repo "$OR" --state all --limit 500 --json headRefName --jq '.[
   rm -f "$O/.pr_brs"
   echo "[refresh] WARN: PR listing FAILED — reaping pass will be skipped (an unreadable listing is not an empty one)"
 fi
+# ⛔ The reap pass REWRITES state (`dispatched.txt`, `checked.txt`) and its status used to be
+# discarded, so a failure there left a half-written blacklist or a stale suppression and the pass
+# carried on reporting success. Its status is read IMMEDIATELY below — and the invocation line stays
+# exactly `python3 - "$O" <<'PY'` because selftest.sh extracts the heredoc body by anchoring on it.
 python3 - "$O" <<'PY'
 import os, re, subprocess, sys
 O = sys.argv[1]
@@ -394,6 +581,11 @@ if reaped:
             fh.write("\n".join(kept) + ("\n" if kept else ""))
     print("[reap] un-blacklisted (open, no PR, no live lane): %s" % " ".join(sorted(reaped, key=int)))
 PY
+reap_rc=$?
+if [ "$reap_rc" -ne 0 ]; then
+  echo "[refresh] ABORT: the reap pass failed — refusing to carry on over a half-rewritten blacklist (#1736)"
+  exit "$EXIT_TRANSIENT"
+fi
 for f in "$O/.open_iss" "$O/.pr_brs"; do rm -f "$f"; done
 
 touch "$O/checked.txt" "$O/candidates.txt"
@@ -407,16 +599,139 @@ touch "$O/checked.txt" "$O/candidates.txt"
 # and every worker the harness ran was a P2 (#8465). The tier is a RANK, not a label.
 # Dedupe on the NUMBER, keeping the lowest tier: the sort already put an issue's best tier first, so
 # `!seen[$2]++` drops the later, weaker duplicate rather than letting one issue occupy two slots.
+# ⛔ EACH QUERY RECORDS ITS OWN FAILURE, so a partial listing is detected too. Depending on the
+# pipeline's status cannot work — the group reports only its LAST command's, and `pipefail` would not
+# fix it — and a re-read of the listing is NOT the same question: this pipeline's queries carry
+# `--label` and a `--jq`, so a failure confined to those succeeds on a plain re-read. Measured: a
+# broken `--jq` fails the pool query while `gh issue list … --json number` still exits 0, and one
+# failing tier with another returning rows leaves `.pool` NON-EMPTY — so an emptiness test never fires
+# and that whole priority tier silently disappears into a "healthy" backlog, the #8465 priority
+# inversion this sort exists to prevent (#1853 review). The sentinel is a real file write from the
+# pipeline's subshell, so the parent sees it.
+# ⛔ EACH QUERY RECORDS WHICH WAY IT WENT, not only when it failed. `.pool-read` gets the tier
+# that ANSWERED (even with zero rows), `.pool-err` the tier that did not — so UNREADABLE (nothing
+# answered) is a fact the parent can check rather than an inference from an empty error file, and
+# PARTIAL can NAME the tiers that were read instead of only the ones that failed.
+rm -f "$O/.pool-err" "$O/.pool-read"
 {
-  gh issue list --repo "$OR" --state open --limit 300 --label P0-blocker --json number,assignees,title \
-    --jq '.[]|select((.assignees|length)==0)|select(.title|test("^(epic|lane|OWNER DECISION|decision|analysis|investigation)";"i")|not)|"0 \(.number)"' 2>/dev/null
-  gh issue list --repo "$OR" --state open --limit 200 --label P1-severe --json number,assignees,title \
-    --jq '.[]|select((.assignees|length)==0)|select(.title|test("^(epic|OWNER DECISION)";"i")|not)|"1 \(.number)"' 2>/dev/null
-  gh issue list --repo "$OR" --state open --limit 200 --label P2-moderate --json number,assignees,title \
-    --jq '.[]|select((.assignees|length)==0)|select(.title|test("^(epic|OWNER DECISION)";"i")|not)|"2 \(.number)"' 2>/dev/null
+  if gh issue list --repo "$OR" --state open --limit 300 --label P0-blocker --json number,assignees,title \
+    --jq '.[]|select((.assignees|length)==0)|select(.title|test("^(epic|lane|OWNER DECISION|decision|analysis|investigation)";"i")|not)|"0 \(.number)"' 2>>"$O/.pool-err"; then echo "P0-blocker" >> "$O/.pool-read"
+  else echo "P0-blocker" >> "$O/.pool-err"; fi
+  if gh issue list --repo "$OR" --state open --limit 200 --label P1-severe --json number,assignees,title \
+    --jq '.[]|select((.assignees|length)==0)|select(.title|test("^(epic|OWNER DECISION)";"i")|not)|"1 \(.number)"' 2>>"$O/.pool-err"; then echo "P1-severe" >> "$O/.pool-read"
+  else echo "P1-severe" >> "$O/.pool-err"; fi
+  if gh issue list --repo "$OR" --state open --limit 200 --label P2-moderate --json number,assignees,title \
+    --jq '.[]|select((.assignees|length)==0)|select(.title|test("^(epic|OWNER DECISION)";"i")|not)|"2 \(.number)"' 2>>"$O/.pool-err"; then echo "P2-moderate" >> "$O/.pool-read"
+  else echo "P2-moderate" >> "$O/.pool-err"; fi
 } | sort -k1,1n -k2,2n | awk '!seen[$2]++ {print $2}' > "$O/.pool"
+# ⛔ AN UNWRITTEN POOL IS NOT AN EMPTY ONE, and the test for it is the redirect's STATUS, not the
+# FILE's existence: a `.pool` left behind by an earlier run satisfied a `[ -f ]` test while THIS run's
+# redirect failed, and the stale pool was then read as the backlog of a run that persisted nothing —
+# `checked N; backlog now M` at rc 0 (#1853 review). The status is read IMMEDIATELY, with no `$(...)`
+# in between, and this is its OWN statement on purpose: selftest.sh extracts the line above VERBATIM
+# (`grep -E '^\} \| sort '` + a sed that strips a trailing ` > "$O/.pool"`), so a suffix on that line
+# turns the extracted pipeline into a syntax error and reddens the #8465 severity-ordering check —
+# which would then stop covering the very ordering the pool depends on.
+pool_rc=$?
+
+# ── THE POOL'S READ STATE: EMPTY, PARTIAL or UNREADABLE (agent-infra#1931) ────────────────────
+# ⛔ A LAYER THAT CANNOT SEE MUST NOT REPORT AN EMPTY QUEUE. Measured 2026-10-17: a cell whose pool
+# listing failed refused correctly on 131 consecutive passes and dispatched nothing while 15 PRs sat
+# open — and `backlog=0` in the controller's cycle line was indistinguishable from a fleet with
+# nothing to do. So the read's outcome is now a NAMED state, in ONE vocabulary, and `EMPTY` is
+# reserved for the only answer that may ever mean "no work":
+#   EMPTY         every priority tier was READ, and the pool listed no dispatchable issue.
+#   READ(<n>)     every priority tier was read, and n candidate(s) were listed. A non-empty pool is
+#                 never labelled EMPTY; it is a third, plainly-different readable answer.
+#   PARTIAL(<t>)  some tiers were read and <t> were NOT — the survivors are a SUBSET, never a
+#                 complete pool, so nothing is queued from it (#1736).
+#   UNREADABLE    NO tier could be read. The fleet is BLIND to the backlog, and that is not "nothing
+#                 to do" — it is the state this whole change exists to make visible.
+# The state is persisted WITH the epoch of the read, so the controller's heartbeat line can carry it
+# (orch-loop.sh's queue_state_token prints it together with its age, so a frozen value cannot pass
+# as a fresh one). It is the READ's state, not the backlog's: it stays true even when a later step of
+# this pass refuses, and it never overrides the fail-closed refusals below.
+QUEUE_STATE_FILE="$O/state/queue-state"
+queue_state_write() {  # <STATE> — record what THIS pass learned about the pool, for the heartbeat
+  mkdir -p "$O/state" 2>/dev/null
+  if ! printf '%s %s\n' "$1" "$(date +%s)" > "$QUEUE_STATE_FILE" 2>/dev/null; then
+    # NOT fatal on purpose: this is the REPORTING contract, not the gate. The pass still refuses or
+    # queues exactly as before; what is lost is the heartbeat's copy of the state, and it says so
+    # rather than leaving a previous pass's reading standing in for this one.
+    echo "[refresh] WARN: cannot record the pool read state into $QUEUE_STATE_FILE — the heartbeat will not carry whether this pass could SEE the pool (agent-infra#1931)"
+  fi
+}
+# Which of the three tiers answered. A tier that recorded NEITHER outcome did not answer, so it
+# counts as FAILED: a read whose outcome cannot be proven is not a read (fail-closed).
+POOL_READ=""; POOL_FAILED=""
+for _tier in P0-blocker P1-severe P2-moderate; do
+  if grep -qx "$_tier" "$O/.pool-read" 2>/dev/null; then POOL_READ="$POOL_READ $_tier"
+  else POOL_FAILED="$POOL_FAILED $_tier"; fi
+done
+POOL_READ="${POOL_READ# }"; POOL_FAILED="${POOL_FAILED# }"
+
+if [ "$pool_rc" -ne 0 ]; then
+  # The listing ran but could not be CAPTURED, so this pass has no pool it can trust — blind, not empty.
+  queue_state_write "UNREADABLE"
+  echo "[refresh] queue=UNREADABLE — the pool listing could not be CAPTURED into $O (rc=$pool_rc), so this pass is blind to the backlog; that is not \"nothing to do\" (agent-infra#1931)"
+  echo "[refresh] ABORT: cannot write the candidate pool into $O — the pool this pass would read is not the one it just listed"
+  exit "$EXIT_TRANSIENT"
+fi
+
+# ⛔ AN UNREADABLE POOL IS NOT AN EMPTY ONE. TRANSIENT on purpose: the failure says nothing about
+# WHICH host would come back, and a marker only a human can clear must not be latched on a guess.
+# The state is written and printed BEFORE the abort, so the refusal and the heartbeat agree.
+if [ -n "$POOL_FAILED" ]; then
+  if [ -n "$POOL_READ" ]; then
+    # The argument names the tiers that could NOT be read, comma-joined (no spaces: the token is one
+    # field in a log line a human and a grep both read).
+    POOL_STATE="PARTIAL($(printf '%s' "$POOL_FAILED" | tr ' ' ','))"
+    queue_state_write "$POOL_STATE"
+    echo "[refresh] queue=$POOL_STATE — the pool listing could not be read for $POOL_FAILED (read: $POOL_READ), so the survivors are a SUBSET, not a complete pool, and nothing is queued from it (#1736, agent-infra#1931)"
+    # The refusal says which of the two shapes it is: a partial pool, or no pool at all.
+    echo "[refresh] ABORT: the candidate pool listing FAILED for $POOL_FAILED — a partial pool is not a backlog (#1736)"
+  else
+    POOL_STATE="UNREADABLE"
+    queue_state_write "$POOL_STATE"
+    echo "[refresh] queue=$POOL_STATE — NO priority tier could be read ($POOL_FAILED FAILED), so the fleet is BLIND to the backlog; \"no candidates\" here is NOT \"nothing to do\" (agent-infra#1931)"
+    echo "[refresh] ABORT: the candidate pool listing FAILED for $POOL_FAILED — no tier could be read, so there is NO pool to dispatch from (#1736)"
+  fi
+  sed -n '1,6p' "$O/.pool-err" | sed 's/^/[refresh]   /'
+  rm -f "$O/.pool-err" "$O/.pool-read"
+  exit "$EXIT_TRANSIENT"
+fi
+rm -f "$O/.pool-err" "$O/.pool-read"
+# Every tier was read, so EMPTY is now an admissible answer — and the ONLY one that may say "no work".
+POOL_ROWS="$(wc -l < "$O/.pool" 2>/dev/null | tr -d ' ')"
+case "${POOL_ROWS:-}" in
+  ''|*[!0-9]*)
+    # The pool was just written at rc 0, so an unreadable row count means the file is gone or was
+    # replaced under us. UNKNOWN is not empty: refuse rather than report a backlog nobody counted.
+    queue_state_write "UNREADABLE"
+    echo "[refresh] queue=UNREADABLE — the pool was written but its row count could NOT be read, so this pass cannot say what it listed; that is not \"nothing to do\" (agent-infra#1931)"
+    echo "[refresh] ABORT: cannot count the candidate pool at $O/.pool — refusing to report a backlog this pass did not measure (#1736)"
+    exit "$EXIT_TRANSIENT" ;;
+esac
+if [ "$POOL_ROWS" -eq 0 ]; then
+  POOL_STATE="EMPTY"
+  echo "[refresh] queue=$POOL_STATE — every priority tier was READ and listed no dispatchable issue: this pass can SEE the pool, and it is genuinely empty (agent-infra#1931)"
+else
+  POOL_STATE="READ($POOL_ROWS)"
+  echo "[refresh] queue=$POOL_STATE — every priority tier was READ; $POOL_ROWS candidate(s) listed (agent-infra#1931)"
+fi
+queue_state_write "$POOL_STATE"
 
 n=0
+# `usable` counts the verdicts the pre-flight produced that the caller can act on: CLEAN, COLLISION,
+# and LANDED. NOT counted: an INCOMPLETE run, a DEGRADED `COLLISION ... ALSO INCOMPLETE` (the tool
+# answering from partial evidence — the broken-environment fingerprint this gate exists to catch),
+# and a run that emitted no VERDICT at all. See the property assertion after the loop.
+usable=0
+# `judged` counts the candidates the pre-flight ACTUALLY RAN — `n` counts the slots the loop
+# ATTEMPTED, because it is incremented before the LIMIT break. The abort and the final report use
+# `judged`, so neither over-states the pass by one (#1853 review).
+judged=0
+degraded=0
 while read -r N; do
   [ -z "${N:-}" ] && continue
   grep -qx "$N" "$O/checked.txt" 2>/dev/null && continue
@@ -430,6 +745,7 @@ while read -r N; do
   # work lands). checked.txt is therefore written ONLY on the verdict that terminates the issue —
   # CLEAN, which is queued. Everything else is left unchecked, so the next pass re-attempts it.
   # (agent-infra#1716)
+  judged=$((judged + 1))
   PRE="$("$PY" "$PREFLIGHT" "$N" --repo . 2>&1)"; PRE_RC=$?
   # ⛔ A tool that REFUSED TO RUN is a PROVISIONING failure, not a per-issue "no verdict". The
   # pre-flight's EXIT_USAGE (3) is how it reports an unusable environment — most importantly its
@@ -450,40 +766,132 @@ while read -r N; do
     echo "[refresh]   fix: make the interpreter runnable (the tool requires Python >= $MIN_PY_MAJOR.$MIN_PY_MINOR) or set SCOUT_PY=<a Python >= $MIN_PY_MAJOR.$MIN_PY_MINOR>"
     exit "${EXIT_NOT_PROVISIONABLE:-3}"
   fi
-  V="$(printf '%s\n' "$PRE" | grep -E '^VERDICT' | head -1 | sed -E 's/.*VERDICT: (CLEAN|COLLISION).*/\1/')"
+  V="$(printf '%s\n' "$PRE" | grep -E '^VERDICT' | head -1 | sed -E 's/.*VERDICT: (CLEAN|COLLISION|LANDED|INCOMPLETE).*/\1/')"
+  # A DEGRADED answer is not a verdict — for ANY non-landed verdict. The canonical producer prints the
+  # `ALSO INCOMPLETE:` marker beside a COLLISION or a LANDED answer (an INCOMPLETE verdict IS the
+  # degraded reading and prints "N surface(s) could not be queried" with no marker), and
+  # `resolve_preflight` prefers the repo's OWN copy, so a VENDORED producer could pair it with CLEAN and
+  # reproduce the healthy-looking reading this pass exists to refuse (#1853 review). LANDED is exempt:
+  # the producer's contract makes a terminal signal decisive over an incomplete one.
+  degraded=0
+  # ⛔ ANCHORED, because the report echoes the candidate's own `title:` line: an unanchored search for
+  # this phrase would let an ISSUE TITLE set the flag and silently drop a genuine CLEAN (#1853 review).
+  grep -qE '^ *ALSO INCOMPLETE: ' <<<"$PRE" && degraded=1
   case "$V" in
     CLEAN)
-      # ── the cross-box ISSUE claim is a BLOCKING surface (agent-infra#1850) ───────────────────
-      # The tool above reads only immutable history and per-machine git state, so it reports CLEAN
-      # for an issue a PEER started ten seconds ago and has not pushed yet. Read the registry
-      # before certifying: an issue claim is a claim on the WORK, and it exists before the first
-      # push. `$CLAIMS_SH` may be unset here (the loop body is extracted and driven on its own by
-      # the regression suite), hence `${CLAIMS_SH:-$O/claims.sh}` rather than a bare expansion.
-      ICR=0
-      if [ -f "${CLAIMS_SH:-$O/claims.sh}" ]; then
-        # `cmd; rc=$?` rather than `if cmd; then …; else rc=$?; fi` — one shape, no reliance on the
-        # condition's status surviving into the else branch.
-        issue_claim_verdict "$N"; ICR=$?
+      # ⛔ A CLEAN that ALSO says INCOMPLETE is the DEGRADED answer, not a verdict — the tool could
+      # not read every surface and would have used the conservative verdict had it been able to.
+      # Measured 2026-10-16 (#1328): an issue whose true verdict was LANDED came back degraded.
+      # Counting a degraded answer as usable would let a broken environment report a healthy
+      # `checked N; backlog now 0` — the reading this pass exists to refuse (#1853 review).
+      # A DEGRADED pre-flight short-circuits BEFORE the claim read: the verdict is not trustworthy,
+      # so the issue is left unchecked and is neither queued nor certified either way.
+      if [ "$degraded" -eq 1 ]; then
+        echo "[refresh] ?#$N CLEAN is DEGRADED (the pre-flight could not query every surface) — not counted as a verdict, left unchecked for the next pass"
       else
-        echo "[refresh] ⚠️ #$N: no claim registry at ${CLAIMS_SH:-$O/claims.sh} — the cross-box issue-claim check is OFF on this box (install.sh seeds claims.sh into \$O)"
-      fi
-      case "$ICR" in
-        1) # a live claim: a peer owns it. Leave it UNCHECKED so the next pass re-attempts it —
-           # a claim is a window, not a verdict (the peer's work lands).
-           echo "[refresh] =#$N COLLISION (cross-box issue claim) — $CLAIM_RESULT; retried next pass" ;;
-        2) # unreadable registry: INCOMPLETE, never CLEAN. Also left unchecked, so the issue is
-           # re-attempted rather than lost, and NOT queued, so nothing is dispatched on a guess.
-           echo "[refresh] ?#$N INCOMPLETE — $CLAIM_RESULT; not queued, retried next pass" ;;
-        *) echo "$N" >> "$O/checked.txt"
-           echo "$N" >> "$O/candidates.txt"
-           echo "[refresh] +#$N CLEAN -> backlog" ;;
-      esac ;;
+        # ── the cross-box ISSUE claim is a BLOCKING surface (agent-infra#1850) ───────────────────
+        # The tool above reads only immutable history and per-machine git state, so it reports CLEAN
+        # for an issue a PEER started ten seconds ago and has not pushed yet. Read the registry
+        # before certifying: an issue claim is a claim on the WORK, and it exists before the first
+        # push. `$CLAIMS_SH` may be unset here (the loop body is extracted and driven on its own by
+        # the regression suite), hence `${CLAIMS_SH:-$O/claims.sh}` rather than a bare expansion.
+        ICR=0
+        if [ -f "${CLAIMS_SH:-$O/claims.sh}" ]; then
+          # `cmd; rc=$?` rather than `if cmd; then …; else rc=$?; fi` — one shape, no reliance on the
+          # condition's status surviving into the else branch.
+          issue_claim_verdict "$N"; ICR=$?
+        else
+          echo "[refresh] ⚠️ #$N: no claim registry at ${CLAIMS_SH:-$O/claims.sh} — the cross-box issue-claim check is OFF on this box (install.sh seeds claims.sh into \$O)"
+        fi
+        case "$ICR" in
+          1) # a live claim: a peer owns it. Leave it UNCHECKED so the next pass re-attempts it —
+             # a claim is a window, not a verdict (the peer's work lands).
+             # ⛔ AND IT IS USABLE — it is a COLLISION, which is one of the three verdicts the caller
+             # can act on. Without this the pool property-assertion below reads an ALL-claim-held pool
+             # as "judged NOTHING" and aborts rc=1 every cycle, in exactly the cross-box-collision
+             # state this check exists for, while the pass has already printed a verdict per candidate
+             # (#1853 review). ICR=2 (INCOMPLETE) stays uncounted — that is not a verdict.
+             usable=$((usable + 1))
+             echo "[refresh] =#$N COLLISION (cross-box issue claim) — $CLAIM_RESULT; retried next pass" ;;
+          2) # unreadable registry: INCOMPLETE, never CLEAN. Also left unchecked, so the issue is
+             # re-attempted rather than lost, and NOT queued, so nothing is dispatched on a guess.
+             echo "[refresh] ?#$N INCOMPLETE — $CLAIM_RESULT; not queued, retried next pass" ;;
+          *)
+            # ⛔ EVERY STATE WRITE IS CHECKED, AND THE PERMANENT ONE GOES LAST. `checked.txt` is what
+            # makes an issue invisible to LATER passes — it is reclaimed only for numbers that reached
+            # `dispatched.txt` — so writing it BEFORE the queue entry made a failed append to
+            # `candidates.txt` an unrecoverable loss: the issue is never pre-flighted again, never
+            # queued, and the pass still logged `+#N CLEAN -> backlog` and exited 0. Measured (#1853
+            # review): with `candidates.txt` unwritable, the pre-flight ran ONCE, ever, and two
+            # consecutive passes reported success. The recoverable write lands FIRST, so a failure
+            # there leaves the issue retryable; the log line and `usable` follow BOTH writes, so
+            # neither can overstate the queue. (Inlined rather than a helper: selftest.sh extracts
+            # this loop body and runs it standalone, so anything it calls must live inside the
+            # extraction.)
+            if ! printf '%s\n' "$N" >> "$O/candidates.txt"; then
+              echo "[refresh] ABORT: cannot queue #$N into $O/candidates.txt — this pass would report a backlog it did not persist (#1736)"
+              exit "${EXIT_TRANSIENT:-1}"
+            fi
+            if ! printf '%s\n' "$N" >> "$O/checked.txt"; then
+              echo "[refresh] ABORT: cannot record #$N as checked in $O/checked.txt (#1736)"
+              exit "${EXIT_TRANSIENT:-1}"
+            fi
+            usable=$((usable + 1))
+            echo "[refresh] +#$N CLEAN -> backlog" ;;
+        esac
+      fi ;;
     COLLISION)
-      echo "[refresh] =#$N collision — a peer owns it, retried next pass" ;;
+      # ⛔ A COLLISION that ALSO says INCOMPLETE is the DEGRADED answer, not a verdict: the tool
+      # could not read every surface and defaulted to the conservative one. Measured 2026-10-16
+      # (#1328): an issue whose true verdict was LANDED came back as `VERDICT: COLLISION ... ALSO
+      # INCOMPLETE: 3 surface(s) could not be queried`. Counting it as usable would let a broken
+      # environment report a healthy `checked N; backlog now 0` — the reading this pass exists to
+      # refuse (#1853 review).
+      if [ "$degraded" -eq 1 ]; then
+        echo "[refresh] ?#$N COLLISION is DEGRADED (the pre-flight could not query every surface) — not counted as a verdict, left unchecked for the next pass"
+      else
+        usable=$((usable + 1))
+        echo "[refresh] =#$N collision — a peer owns it, retried next pass"
+      fi ;;
+    LANDED)
+      # Terminal and REAL: the issue was closed between the pool listing and the pre-flight, so it
+      # has left the pool by itself. Counted as a usable verdict — otherwise a pass of LANDEDs is
+      # reported as "judged NOTHING" — but never queued and never written to checked.txt (#1853
+      # review; the canonical consumer's LANDED arm).
+      # (canonical arm: tortoise operations/orchestrator-harness/refresh-candidates.sh:266-274, #8560/#8625 —
+      # this copy deliberately does NOT carry its landed.txt / answered-pass budget; that half is
+      # port-provenance.txt:208, NOT DONE).
+      usable=$((usable + 1))
+      echo "[refresh] ~#$N LANDED — already resolved, not queued" ;;
+    INCOMPLETE)
+      echo "[refresh] ?#$N INCOMPLETE from the pre-flight (it could not query every surface) — not a verdict, left unchecked for the next pass" ;;
     *)
       echo "[refresh] ?#$N no verdict from the pre-flight — left unchecked for the next pass" ;;
   esac
 done < "$O/.pool"
+# ⛔ WHAT THIS DOES NOT COVER: the stall that leaves a HEALTHY-LOOKING NON-EMPTY backlog. A
+# persistently-colliding issue consumes the whole window while `checked N; backlog now M` still
+# prints and M > 0 — `COLLISION` counts as usable, so that class is invisible here. It is
+# agent-infra#1729 and stays OPEN.
+# ⛔ ... and a MIXED pass: ONE usable verdict masks any number of `?no verdict` / DEGRADED candidates,
+# so `checked N; backlog now M` can still be printed over candidates the pre-flight could not judge.
+# An abort on any degraded candidate would be worse — it would discard a pass that DID find a CLEAN
+# candidate — so this limit is declared, not closed.
+# This assertion covers the ALL-candidates-unjudged empty-backlog reading only.
+# ⛔ ASSERT THE PROPERTY, NOT THE PLUMBING. "checked N; backlog now 0" over a non-empty pool is the
+# reading the fleet has been stuck in: it looks like a healthy empty queue, and each `?no verdict`
+# line is a per-candidate MASK of one environment failure (measured 2026-10-16: two cells whose
+# keys.env carried no HOME logged 98 and 113 of them, and both had an empty backlog). If the
+# pre-flight produced no usable verdict for ANY candidate, this pass judged nothing and must say so
+# rather than report an empty backlog as a result.
+# The TRANSIENT code, deliberately: the gh precondition above already refused PERMANENTLY (rc=3,
+# with the reason) when the environment could not authenticate, so no-usable-verdict from a passing
+# environment is a per-cycle anomaly (a network fault, a rate limit) that the next cycle should
+# retry — loudly, via orch-loop.sh's `FAILED rc=1` line, not silently.
+if [ "$judged" -gt 0 ] && [ "$usable" -eq 0 ]; then
+  echo "[refresh] ABORT: none of the $judged candidate(s) the pre-flight ran produced a usable verdict (CLEAN, COLLISION or LANDED) — this pass judged NOTHING, so an empty backlog would be a false report (agent-infra#1736). Retrying next cycle."
+  exit "$EXIT_TRANSIENT"
+fi
 # Dedupe WITHOUT re-sorting. orch-loop.sh consumes this file top-down and dispatches the first
 # BATCH entries, so its ORDER IS the dispatch priority. `sort -n -u` re-ordered the ENTIRE backlog
 # by issue number, which is what put 238 P2s ahead of 20 P0s (#8465) — the same defect as the pool
@@ -504,5 +912,15 @@ done < "$O/.pool"
 # trade: `mv` swaps the inode, so the target's mode is replaced by the temp's umask-derived one,
 # whereas the old `sort -o` preserved it. The file holds only public issue numbers and its mode is
 # never set deliberately, so 644 is not a property anything depends on.
-awk '!seen[$0]++' "$O/candidates.txt" > "$O/.cand" && mv "$O/.cand" "$O/candidates.txt"
-echo "[refresh] checked $n; backlog now $(wc -l < "$O/candidates.txt" | tr -d ' ') issues"
+# ⛔ The final rewrite is CHECKED too: `&&` only stopped the `mv`, so a failed rewrite left the OLD
+# `candidates.txt` in place and the line below then reported a backlog count from a file THIS pass
+# never produced — the same absorbed-write shape as the queue append above (#1853 review).
+awk '!seen[$0]++' "$O/candidates.txt" > "$O/.cand" || {
+  echo "[refresh] ABORT: cannot rewrite the deduped backlog into $O/.cand (#1736)"
+  exit "$EXIT_TRANSIENT"
+}
+mv "$O/.cand" "$O/candidates.txt" || {
+  echo "[refresh] ABORT: cannot replace $O/candidates.txt with the deduped backlog (#1736)"
+  exit "$EXIT_TRANSIENT"
+}
+echo "[refresh] checked $judged; backlog now $(wc -l < "$O/candidates.txt" | tr -d ' ') issues"

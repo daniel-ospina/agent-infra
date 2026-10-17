@@ -12,6 +12,10 @@ doc_status: draft
 
 # Orchestrator harness
 
+> **Component reference:** [`ARCHITECTURE.md`](./ARCHITECTURE.md) — per-script I/O and failure
+> surface, the state-file lifecycle, the gate constants, triage and invariants. This file remains
+> the authority for provenance, install, merge policy and measured results.
+
 > **What this is.** A self-contained, single-host harness that turns one laptop into an
 > autonomous delivery lane: it sweeps the open PR queue, dispatches GitHub issues into
 > isolated worktrees as autonomous `pi` lanes, runs a fresh-context review → signed-record
@@ -194,6 +198,7 @@ processes in tmux sessions, so a killed worker cannot take the controller down w
 | File | Meaning |
 |---|---|
 | `heartbeat` | epoch seconds, rewritten every cycle — the liveness probe |
+| `state/queue-state` | what the last pool READ saw, with the epoch of the read — `EMPTY`, `READ(<n>)`, `PARTIAL(<tiers>)` or `UNREADABLE`. `orch-loop.sh` prints it in the cycle line as `queue=$(queue_state_token)`, so a refresh that could not read the pool (`queue=UNREADABLE`) is never mistaken for a fleet with nothing to do (`queue=EMPTY`); an absent file reads `UNKNOWN`, never `EMPTY` (agent-infra#1931) |
 | `.orch.lock` | atomic single-instance lock (noclobber create); stale locks are reclaimed |
 | `candidates.txt` | the dispatch backlog: issue numbers that passed collision pre-flight |
 | `dispatched.txt` | issues already handed to a lane — **pruned** when the issue is still open, no PR branch matches it and no `lane-<N>` is live (see §7.1) |
@@ -300,6 +305,75 @@ when the cell has none (agent-infra#1717).
 There is no scheduler, no queue service, no shared database. Two boxes running this against
 the same repo work fine *because* GitHub is the coordination medium — but they will duplicate
 work unless they coordinate (see §5, "broad mode").
+
+### GitHub API surface — the REST adapter (`gh-rest`)
+
+The harness reaches GitHub through `gh`, whose hot paths (`pr view`, `pr checks`, `pr list`,
+`issue list`) are **GraphQL**. GraphQL has its own secondary limit, and when GitHub refuses it the
+failure is silent rather than loud: measured 2026-10-17, every GraphQL call returned
+`graphql_rate_limit` (even `{viewer{login}}`) while the primary quota still read `4511/5000` and the
+REST endpoints answered normally. A five-minute window with **every harness process killed** did not
+clear it.
+
+That one asymmetry stopped both halves of the harness, and neither log line named the cause:
+
+| Capability | Broken call | Symptom |
+|---|---|---|
+| dispatch | `fleet_state.py` board read (`gh pr list`) | *"the GitHub board could not be read"* → board stale → claim gate `INCOMPLETE` → backlog 0 |
+| merging | sweep per-PR reads (`gh pr view`, `gh pr checks`) | `NOCHECKS` → fail-closed → **no PR could merge** (19 mergeable PRs, hours) |
+
+`gh-rest/gh` is a PATH shim that supplies the REST equivalents for exactly those shapes and
+**delegates everything else verbatim** — including `gh api`, which is already REST:
+
+| Translated | REST endpoint |
+|---|---|
+| `pr view --json …` | `GET /repos/{o}/{r}/pulls/{n}` |
+| `pr checks --json …` | `GET /repos/{o}/{r}/commits/{sha}/check-runs` |
+| `pr list --json …` | `GET /repos/{o}/{r}/pulls?state=…` |
+| `issue list` / `issue view --json …` | `GET /repos/{o}/{r}/issues…` (PRs filtered out) |
+| `pr ready` | `POST …/pulls/{n}/ready_for_review` |
+| `pr merge` (incl. `--match-head-commit`) | `PUT …/pulls/{n}/merge` |
+| `pr comment --body` | `POST …/issues/{n}/comments` |
+
+**Design: an adapter, not a fork.** No harness file changes, so every cell stays on one harness
+version — the convergence property this repo exists to protect — while the API surface becomes a
+deployment concern. `install.sh` copies the shim to `$O/gh-rest/gh` and puts that directory **first**
+on the daemon `PATH`, so controller, lanes, chains and merge workers all inherit it.
+
+**Two deliberate refusals.** `pr merge --auto` is a GraphQL-only mutation (REST cannot express
+auto-merge), so it is *delegated* — it fails loudly while GraphQL is refused rather than pretending
+to have armed. And nothing is guessed: a failed REST call exits non-zero with the API's own message
+instead of returning an empty result that would read as "nothing to do".
+
+**The rule that keeps it honest:** a flag or filter the adapter does not model **delegates the whole
+call** to the real `gh`. It never drops a flag and answers anyway — dropping one is not a slow answer,
+it is a *wrong* one. Review of the first draft found that same bug at three severities, each of which
+would have caused the failure the adapter exists to prevent:
+
+| Dropped | Consequence |
+|---|---|
+| `pr list --head` | `chain-merge.sh` polls for "the branch's PR", gets the newest open PR, **merges an unrelated PR** and records the review marker against it |
+| `issue list --label` | the three severity queries return the same unfiltered list, so every issue is tier 0 and P0-before-P2 ordering inverts (#8465) |
+| `pr comment` output | `merge-one.sh` cannot extract the evidence URL and **parks every reviewed PR** with a false diagnosis |
+
+**Verify it** (offline; drives a stub `gh`, needs no credentials, 28 assertions):
+
+```bash
+bash gh-rest.test.sh
+```
+
+The invocations in the suite are **copied from the callers** (`chain-merge.sh`, `refresh-candidates.sh`,
+`fix-one.sh`, `merge-one.sh`), not invented — the first draft asserted shapes nobody used and shipped
+two P0s green. They pin: `--paginate` returning concatenated arrays; positionals starting at `$3`;
+a handler that falls through printing twice; REST's `open`/`true` vs gh's `OPEN`/`MERGEABLE`; REST
+`/issues` including PRs; `--limit`; legacy commit statuses (a protection context that is not a check
+run); a 200 whose body says `merged: false`; and a failing `--jq` exiting non-zero instead of looking
+like "no rows".
+
+**Known gap (tracked separately):** the install stamp and `check-deployed-drift.sh` fold their payload
+over `$O/*.sh` only, so this adapter — like `launchd.plist.template` — is outside the deployed-bytes
+record. Adding it in one place alone makes every healthy deployment read as drift, so it needs the
+stamp, the drift checker and the selftest moved together.
 
 ---
 
@@ -637,6 +711,7 @@ is re-dispatched on the next sweep, with `claim_live()` freeing the dead owner's
 [scope] open=24 -> BROAD (auto)             ← or (pinned SCOPE=own) / (pinned SCOPE=broad)
 [cap] load=7/100 lanes=4/4 mem_avail=11761M/512M swap_free=588M/600M   ← every gate names its ceiling
 [dispatch] load=7 lanes=4 -> 4429 4489
+[refresh] queue=READ(7) — every priority tier was READ; 7 candidate(s) listed (agent-infra#1931)
 [refresh] +#4508 CLEAN -> backlog
 #8219 FAILED:ai-review-gate          ← per-PR verdict for the required checks
 #8192 fixer attempt 1                ← routed to a fixer, not a re-record
@@ -644,6 +719,19 @@ is re-dispatched on the next sweep, with `claim_live()` freeing the dead owner's
 [cap] load=104/100 lanes=4/4 mem_avail=11890M/512M swap_free=588M/600M
 [dispatch] skipped (load=104>=max_load=100)   ← and WHY, naming the binding gate
 ```
+
+⛔ **`backlog=0` alone is never a clearance** (agent-infra#1931). The cycle line carries the pool's
+READ state beside it, and `EMPTY` is the only form that means "no work":
+
+```text
+=== <date> load=2 lanes=0 backlog=0 queue=UNREADABLE(3m) ===     ← BLIND: the last pool read FAILED
+=== <date> load=2 lanes=0 backlog=0 queue=PARTIAL(P0-blocker)(3m) ===  ← a SUBSET, not a pool
+=== <date> load=2 lanes=0 backlog=0 queue=EMPTY(12s) ===          ← read successfully, genuinely empty
+[dispatch] backlog empty queue=UNREADABLE(3m)                    ← the claim carries the state too
+```
+
+The age is part of the token on purpose: a value frozen by a refresh that stopped writing cannot pass
+as a fresh reading. `UNKNOWN` means no pass has EVER recorded a read — it is not `EMPTY`.
 
 ---
 
@@ -793,6 +881,31 @@ after a push does not test it. Measured: 35 of those assertions fail on the pre-
 **shipped** refresh step and the **shipped** dispatch block against a real local origin for the
 collision, unreachable, absent and stale-registry verdicts, plus the fenced release on the chain's
 exit path (14 assertions fail on the pre-change scripts).
+
+### 7.2d A refresh that cannot READ the pool reported an empty queue — **FIXED in agent-infra#1931**
+
+`backlog=0` was the same line whether the pool had been read and was empty or the pool listing had
+**failed**. Measured 2026-10-17: a cell refused on **131 consecutive passes** (its abort was correct)
+and dispatched nothing while 15 PRs were open; on every one of those cycles the controller's line
+read `backlog=0`, which is what a fleet with nothing to do also reads. The abort named the tiers in
+prose, but nothing carried a *state* an operator or an instrument could key on, and a **partial**
+read was reported with the identical sentence as a total one.
+
+**Fix:** the pool read is now ONE of four named outcomes, in one vocabulary: `EMPTY` (every tier was
+read and listed nothing — the only answer that may mean "no work"), `READ(<n>)` (every tier read,
+n candidates), `PARTIAL(<tiers>)` (some tiers could not be read, so the survivors are a subset and
+nothing is queued from it — #1736's rule, kept), and `UNREADABLE` (no tier could be read: the fleet
+is blind). The state is persisted to `state/queue-state` with the epoch of the read, and
+`orch-loop.sh` prints it as `queue=$(queue_state_token)` in the per-cycle heartbeat line and beside
+`[dispatch] backlog empty`, with the age of the reading (a frozen value cannot pass as a fresh one).
+An absent or unparseable record prints `UNKNOWN`, never `EMPTY`. The refusal polarity is unchanged
+and still fail-closed: a failed read exits TRANSIENT, never a green "nothing to do".
+
+⚠️ **Deliberately NOT fixed here** — this is the *reporting contract*, not the transport, and not the
+provisioning verdict: the fleet's shared gh backoff for GitHub's secondary (concurrency) limit is
+agent-infra#1910, and a refresh whose resolved tool directory is behind `origin/main` still says so
+only through its own existing refusals (issue #1931's directions 1 and 3, which this change does not
+touch). A pass that cannot read the pool now says `queue=UNREADABLE` while it refuses.
 
 ### 7.3 The harness is unversioned (this directory is the remedy)
 

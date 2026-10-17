@@ -1541,6 +1541,107 @@ testAsync("task dispatches are audited per-event and the count survives across g
   });
 });
 
+testAsync("#1662: a background dispatch is not counted until its terminal task_collect", async () => {
+  await withTempHome(async () => {
+    await withMarkerIsolated(async () => {
+      const prevMode = process.env.PI_MODE;
+      process.env.PI_MODE = "print";
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      try {
+        await fire("session_start");
+
+        const blocked = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+        ok(blocked && blocked.block === true, "blocked without dispatches");
+
+        // A `task({ background: true })` result fires at DISPATCH — the reviewer
+        // is still running, so it must not satisfy the dispatch gate.
+        await fire("tool_result", { toolName: "task", details: { background: true, status: "running" } });
+        const stillBlocked = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+        ok(stillBlocked && stillBlocked.block === true, "a background dispatch must NOT count as a completed reviewer");
+
+        // A not-finished collect is still not a verdict.
+        await fire("tool_result", { toolName: "task_collect", details: { terminal: false } });
+        const b2 = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+        ok(b2 && b2.block === true, "a not-finished collect must NOT count");
+
+        // The terminal collect is the reviewer's completion — now it counts.
+        await fire("tool_result", { toolName: "task_collect", details: { terminal: true, status: "done" } });
+        const allowed = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+        equal(allowed, undefined, "the terminal collect satisfies the ≥1-dispatch gate");
+      } finally {
+        process.env.PI_MODE = prevMode;
+      }
+    });
+  });
+});
+
+testAsync("#1662 review: re-collecting the SAME terminal task_collect is counted once", async () => {
+  await withTempHome(async () => {
+    await withMarkerIsolated(async () => {
+      const prevMode = process.env.PI_MODE;
+      process.env.PI_MODE = "print";
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      try {
+        await fire("session_start");
+
+        // A background dispatch returns at DISPATCH — not counted.
+        await fire("tool_result", { toolName: "task", details: { background: true, status: "running" } });
+
+        // The verdict is reaped — counted once.
+        await fire("tool_result", { toolName: "task_collect", details: { terminal: true, status: "done", run_id: "RUN-A" } });
+
+        // The SAME finished lane is re-collected (`task_collect` is idempotent).
+        await fire("tool_result", { toolName: "task_collect", details: { terminal: true, status: "done", run_id: "RUN-A" } });
+
+        // The durable per-event audit count must not be inflated by the repeat.
+        const dispatchLines = readAuditLines(auditLogPath()).filter((l) => l.event === "review_dispatch");
+        equal(dispatchLines.length, 1, "the same run is counted exactly once");
+        equal(dispatchLines[0].dispatch_count, 1, "the running total reflects one real dispatch");
+      } finally {
+        process.env.PI_MODE = prevMode;
+      }
+    });
+  });
+});
+
+testAsync("#1662 review: a refused background dispatch is not counted as a completed reviewer", async () => {
+  await withTempHome(async () => {
+    await withMarkerIsolated(async () => {
+      const prevMode = process.env.PI_MODE;
+      process.env.PI_MODE = "print";
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      try {
+        await fire("session_start");
+
+        const blocked = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+        ok(blocked && blocked.block === true, "blocked without dispatches");
+
+        // A pre-spawn refusal (`cwd` names a file) is built BEFORE the
+        // background branch: its details carry `status: "invalid-cwd"` but no
+        // `details.background`. Only the tool INPUT is marked background, and a
+        // refusal spawned no child — it must not satisfy the ≥1-dispatch gate
+        // (#1662 review).
+        await fire("tool_result", {
+          toolName: "task",
+          input: { background: true, cwd: "package.json" },
+          details: { model: "m", provider: "p", status: "invalid-cwd", retryable: false, error: "bad cwd" },
+        });
+
+        const stillBlocked = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+        ok(stillBlocked && stillBlocked.block === true, "a refused background dispatch must NOT satisfy the dispatch gate");
+
+        const dispatchLines = readAuditLines(auditLogPath()).filter((l) => l.event === "review_dispatch");
+        equal(dispatchLines.length, 0, "a refused background dispatch must not enter the review_dispatch audit trail");
+      } finally {
+        process.env.PI_MODE = prevMode;
+      }
+    });
+  });
+});
+
 testAsync("gh pr merge with no review record → blocked AND merge_gate_block audited with PR", async () => {
   await withTempHome(async () => {
     const prevMode = process.env.PI_MODE;

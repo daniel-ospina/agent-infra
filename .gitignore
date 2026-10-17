@@ -10,6 +10,11 @@ __pycache__/
 # worktrees (parallel agent isolation)
 .worktrees/
 
+# #907 — scripts/daily-backup.sh writes RDB snapshots of the fleet's graph here. An RDB dump
+# is a data artifact, never source: leaving it unignored puts it one `git add` from being
+# committed into a public repo.
+backups/
+
 # hub hygiene (#338): transient e2e artifacts + husky runtime —
 # these kept the M4 hub gate permanently active from the hub cwd
 # rift-debug e2e nested clone (temp-dir origin)

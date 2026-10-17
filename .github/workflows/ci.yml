@@ -255,7 +255,7 @@ jobs:
         # blindness flag and on the objective cache's freshness were pinned by suites
         # CI could not execute. A suite the repo does not RUN is a suite it does not
         # HAVE — naming them is the half of the landing that makes the other half count.
-        run: python3.12 -m pytest scripts/test_parallel_work_check.py tests/test_ci_exemption.py tests/test_ci_exemption_producer.py scripts/test_lane_status.py scripts/test_lane_actions.py scripts/test_lane_watchdog.py scripts/test_admin_merge_head.py scripts/test_objective.py scripts/test_turn_classify_state.py -x --timeout=60 -q
+        run: python3.12 -m pytest scripts/test_parallel_work_check.py tests/test_ci_exemption.py tests/test_ci_exemption_producer.py scripts/test_lane_status.py scripts/test_lane_actions.py scripts/test_lane_watchdog.py scripts/test_admin_merge_head.py scripts/test_objective.py scripts/test_turn_classify_state.py scripts/test_pr_doctor.py -x --timeout=60 -q
 
   verify:
     # #1349 — the pytest half MOVED to the `test` job above, so that the PR lane
@@ -436,6 +436,16 @@ jobs:
         # The blocking backstop is ci-main.yml's extension-tests job, same
         # split as sequence-enforcer above.
         run: npx tsx extensions/loop-enforcer/tier-config-parity.test.ts
+      - name: Loop-enforcer termination layers (#847 — L3 stall predicates)
+        # Zero-dep: the suite's only import is `./termination.ts`, which has no
+        # imports at all — no `node:` modules, no packages — so it MUST run
+        # here, in the job that performs no `npm ci`. Before #847 this suite
+        # was wired NOWHERE —
+        # the inverted L3 fingerprint predicate was invisible to CI, and its one
+        # vacuous fixture passed through the plateau branch. The anti-vacuity
+        # pins (direction, superset recurrence, threshold boundary, window
+        # position) are worth nothing if nothing runs them.
+        run: npx tsx extensions/loop-enforcer/termination.test.ts
       - name: Shipped-default failover coverage pin (#715)
         # VISIBLE but NOT merge-blocking here: the repo's only required status
         # check is `pipeline-compliance`. The BLOCKING backstop is the
@@ -494,6 +504,21 @@ jobs:
         # check, #646); the BLOCKING backstop is the post-merge ci-main.yml
         # `extensions/shared/*.test.ts` glob, which picks this file up too.
         run: npx tsx extensions/shared/load-scale-contract.test.ts
+      - name: Task-run record + retention suite (#1662, zero-dep)
+        # #1662 — extensions/shared/task-runs.ts imports `node:*` ONLY, so its
+        # suite runs in THIS job (the job that performs no `npm ci`), like the
+        # loop-enforcer and load-scale suites around it. VISIBLE, not
+        # merge-blocking: `pipeline-compliance` is the repo's only required
+        # check (#646), so the BLOCKING backstop remains the post-merge
+        # ci-main.yml `extensions/shared/*.test.ts` glob. Its own step on
+        # purpose — a `&&` chain would let one suite's failure suppress the
+        # other's verdict — and NOT appended to the `test-command` accumulator
+        # above, which check-pi-pin-lockstep.mjs (guard (j)) pins byte-exactly.
+        # What this step buys is that the durable-run-record contract (atomic
+        # writes, path gate, retention dry-run, collect idempotence) FAILS
+        # where the author can see it before merge, instead of only after it
+        # (#1250: a suite wired only into ci-main.yml runs post-merge).
+        run: npx tsx extensions/shared/task-runs.test.ts
       - name: main-worktree-guard module-LOAD regression (#744)
         # The guard's bash-git classifier lost its LATER bindings SILENTLY in
         # every session from #697 until #744 (five rename-destructuring targets
