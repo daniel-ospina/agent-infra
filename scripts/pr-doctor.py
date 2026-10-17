@@ -409,7 +409,7 @@ def idle_lanes() -> tuple[list[dict], str]:
 _MARKERS = ("\u26d4", "IDLE->", "DO:", "**", "```", "\u0060")
 
 
-def _untrusted(text) -> str:
+def _untrusted(text, limit: int = 78) -> str:
     """A GitHub-authored string, rendered so it cannot be read as the fleet's own instruction.
 
     ⛔ THE TITLE IS DATA, NOT PART OF THE ORDER (#1872 review round 5, security). A PR title is
@@ -420,14 +420,20 @@ def _untrusted(text) -> str:
 
     So: drop newlines/control characters (a title is ONE line, and a newline is how a quotation
     becomes a separate order), backticks/code fences and the fleet's own markers, collapse
-    whitespace, and wrap the result in guillemets so it can only be read as a quotation. Nothing is
-    truncated here -- the caller bounds the length.
+    whitespace, TRUNCATE THE INNER TEXT (`limit`), and only then wrap it in guillemets so it can only
+    be read as a quotation.
+
+    ⛔ TRUNCATE INSIDE, NEVER AFTER (#1872 review round 6). The first version wrapped and let the
+    caller slice `[:80]`, so any title longer than 78 characters lost its CLOSING guillemet -- the
+    entire control -- and was cut mid-word. The caller's bounds now bound the inner text.
     """
     out = " ".join(str(text or "").replace("\r", " ").replace("\n", " ").split())
     for m in _MARKERS:
         out = out.replace(m, "")
-    out = "".join(ch for ch in out if ch.isprintable())
-    return "\u00ab" + out.strip() + "\u00bb"
+    out = "".join(ch for ch in out if ch.isprintable()).strip()
+    if limit and len(out) > limit:
+        out = out[:limit].rstrip()
+    return "\u00ab" + out + "\u00bb"
 
 
 def brief(pr: dict, action: str, why: str | None = None, cr=None) -> str:
@@ -436,7 +442,7 @@ def brief(pr: dict, action: str, why: str | None = None, cr=None) -> str:
     PR differently from the line the fleet read."""
     n = pr["number"]
     head = pr["headRefOid"]
-    title = _untrusted(pr.get("title"))[:80]
+    title = _untrusted(pr.get("title"), limit=78)
     req = list(CLASSIFIER.REQUIRED)
     seen = {c.get("name") for c in (cr or []) if c.get("name")}
     absent = [c for c in req if c not in seen]

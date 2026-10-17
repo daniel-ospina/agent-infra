@@ -840,11 +840,11 @@ def classify_one(p):
     differed on 4 of 11 live PRs while both looked correct).
 
     ⛔ WHAT THIS GUARANTEES, AND WHAT IT DOES NOT. It guarantees ONE PREDICATE over ONE KIND OF
-    EVIDENCE. It does NOT make two processes see one snapshot: the beat reads its queue through
-    a 900s cache (`--max-age`) while the dispatcher reads every pass, and the dispatcher lists
-    PRs with a smaller page limit. So a disagreement can only come from the INPUT (a different
-    moment, or a PR beyond a page limit) -- never from two different rules, which is the defect
-    this seam removes.
+    EVIDENCE. It does NOT make two processes see one snapshot: the beat serves a cached line up to
+    `VERDICT_SERVE_MAX_S` (120 s) old -- `--max-age` cannot exceed that -- while the dispatcher reads
+    every pass, and the dispatcher lists PRs with a smaller page limit. So a disagreement can only
+    come from the INPUT (a different moment, or a PR beyond a page limit) -- never from two
+    different rules, which is the defect this seam removes.
 
     Returns `cr` too, because a dispatcher's brief needs the evidence beside the class and a
     second read of it would be a second truth. `why` is the reason rendered beside a class that
@@ -1544,7 +1544,9 @@ def main():
         res = f"RES: UNKNOWN error={str(e)[:60]} | DO: UNKNOWN"
     # ⛔ A FAILED READ MUST NOT BE CACHED (2026-10-03).
     # The cache is mtime-keyed and holds ONE line, so it cannot tell a good read from a failed
-    # one -- and a failure therefore inherits the FULL 900s window. MEASURED: at 16:59 a
+    # one -- and a failure therefore inherits the FULL serve window (900 s when this was measured;
+    # `VERDICT_SERVE_MAX_S` clamps it to 120 s today, which does not make the guard unnecessary --
+    # two minutes of a blind line is still a blackout). MEASURED: at 16:59 a
     # transient GitHub 5xx (its own "No server is currently available", REST 4/5, GraphQL 5/5,
     # rate limits 5000/5000) wrote `main=UNKNOWN@? gh=UNREADABLE(queue) queue=UNREADABLE` into
     # this cache, and every heartbeat tick until 17:14:53 served it -- while a FORCED read at
