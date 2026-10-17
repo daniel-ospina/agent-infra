@@ -110,6 +110,99 @@ doc_status: draft
 
 ---
 
+## 0. Requirements and intended behaviour
+
+> **Status.** Owner-stated requirements, recorded 2026-10-16 after this harness was found **dormant
+> while a superseded dispatcher was live** on the same box. This section is the authority for *what
+> the system is for*; §2 and [`ARCHITECTURE.md`](./ARCHITECTURE.md) describe how the current code
+> meets it (and §0.3 where it does not).
+
+### 0.1 The fleet
+
+One orchestrator per machine, each focused on **one repo**. Other repos may be open on the box; the
+orchestrator and its heartbeat dispatch to exactly one.
+
+| machine | repo |
+|---|---|
+| new laptop | `daniel-ospina/tortoise` |
+| girlfriend's laptop | `daniel-ospina/tortoise` |
+| cmux cloud cell 1 | `daniel-ospina/tortoise` |
+| cmux cloud cell 2 | `daniel-ospina/agent-infra` |
+| cmux cloud cell 3 | `daniel-ospina/tortoise` |
+
+A **second controller on one box is harmless, not forbidden**: it exits immediately on the
+single-instance lock. No mechanism is needed for it.
+
+### 0.2 What the system must do
+
+| # | requirement |
+|---|---|
+| **R1** | A heartbeat checks capacity every cycle — cpu, ram, swap, **disk** — and dispatches only when there is capacity. |
+| **R2** | It works **un-owned PRs first**: fix them, or run the merge path, to get them merged. |
+| **R3** | Only when no un-owned PRs remain does it take the next un-owned **issue**, in label order: **P0 → P1 → P2 → P3 → P4 → oldest with no P label**. |
+| **R4** | "Un-owned" is decided by **cross-machine coordination**, because several machines work the same repo. |
+| **R5** | **There is no blocked item.** Anything stuck is either fixed automatically or becomes a **user question** (the AGENTS.md question protocol). The same applies to issues. |
+| **R6** | The drain threshold is `MERGE_PRIORITY_AT` — **default 25 open PRs**, tunable per box. |
+| **R7** | One repo per orchestrator; the harness is single-repo by construction (`OR`). |
+
+### 0.3 Where the current code does not meet them
+
+| req | gap |
+|---|---|
+| R3 | the dispatch pool queries **P0, P1, P2 only**. `P3-polish` exists and is never dispatched; the unlabeled-oldest tier is not implemented, and **no `P4` label exists** in the target repo. |
+| R5 | `parked-<PR>` / `parkreason-<PR>` are **terminal** at `MAX_FIX_TRIES` (3), and `scripts/ask-owner.py` is referenced **zero times** by `orch-loop.sh` / `merge-one.sh` — the escalation path is unbuilt. |
+| R2 | the sweep is state-driven (check status); ownership *is* consulted via `claim_live`, but it is not itself the selection criterion. |
+| R1 | disk is enforced in `spawn-gate.sh` for **spawning**, but the controller's own writes (heartbeat, `state/*`) are unguarded — a full disk kills the loop silently (measured 2026-10-16). |
+
+### 0.4 Cross-machine coordination — guaranteed, and not
+
+Guaranteed: a claim is an **atomic CAS in the shared repo** — `refs/claims/<PR>-<head-sha12>` for
+reviews, `issue-<N>` for dispatches. The lease is **data, not liveness**, so a dead box's claim
+expires; every release/reclaim is fenced with `--force-with-lease`; each box reads a snapshot
+refreshed in one fetch per cycle.
+
+**Not** guaranteed: exactly-once execution. The promise is **at-least-once with idempotent side
+effects**. A claim *reduces* duplicate work; it does not prove mutual exclusion. Any design that
+assumes "a claim means it runs once" is wrong (research: agent-infra#1709).
+
+### 0.5 Inventory — required, additive, legacy
+
+**Required** (implements a requirement): `orch-loop.sh` (R1, R2, R6) · `refresh-candidates.sh` (R3) ·
+`dispatch-merge.sh`, `lane.sh`, `chain-merge.sh`, `merge-one.sh`, `fix-one.sh` (R2, R5) ·
+`claims.sh` (R4) · `spawn-gate.sh` (R1).
+
+**Additive — kept. Not owner-required, but load-bearing for correctness:**
+
+| component | why it stays |
+|---|---|
+| `repo-authority.sh` | the per-repo merge contract; without it tortoise's required-check names are enforced on every other repo |
+| `record-review.sh` + HMAC marker + `ai-review-gate` | the gate-mode repo requires a signed review artifact in the PR body |
+| `admin-merge.sh` / `atomic-land.sh` | the only safe landing path for a behind head and for `--admin` |
+| `selftest.sh` + the `*.test.sh` contracts | each pins one mechanism and is RED on the pre-fix tree; they caught real defects in contributed fixes |
+| `check-port-drift.sh` + `port-provenance.txt` | gates removal of the tortoise-side copy |
+| `check-deployed-drift.sh` | answers "which harness commit is this box running?" |
+| `report.sh`, the wall-time series, the `[res]` line | cheap measurement — it is how the reviewer stall rate was found |
+| `install.sh` + `launchd.plist.template` | renders config, refuses out-of-range values, and prints (never runs) the start command |
+| `nonblocking-dispatch.sh` | removes the blocking-caller problem |
+
+**Legacy — retired, must not run:**
+
+| component | why retired |
+|---|---|
+| the `SCOPE=own` partition ("exactly one BROAD box, others OWN") | introduced because ownership was **unknowable**; claims now answer it, and `own` **strands** work that nobody owns |
+| `parked-*` / `parkreason-*` as a terminal state | to be replaced by the ask-user escalation (R5) |
+| swarm-era coordination jobs — `coordinator`, `swarm-watchdog`, `agent-implementer`, `agent-strategist`, `team-strategist`, `pipeline-ingest` | superseded by this harness; two dispatch systems on one box double-dispatch. The swarm repo has had **no commits since 2026-08-11** |
+| the `content-inspiration` job | its entry point was an uncommitted file; the `.mjs` pipeline survives on its branch |
+| `retired/` (6 scripts) | earlier iterations, kept for the record only |
+
+### 0.6 Activation is part of the design, not an afterthought
+
+Having the right code and **running** the right code are different problems. `install.sh` renders
+the plist and deliberately does not start anything, and nothing parks the legacy jobs. Until an
+`activate.sh` declares the intended running set, "which system is this box running?" has no single
+answer — measured 2026-10-16: this harness was **dormant** while six swarm-era dispatchers fired
+every 120 s.
+
 ## 1. Why it exists
 
 The repo's normal path is one agent, one issue, one PR, human-paced. On a box that is left
