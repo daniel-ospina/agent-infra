@@ -965,7 +965,14 @@ async function main() {
   await test("the SDK is imported for TYPES only — the module loads with zero node_modules", () => {
     ok(!/^\s*import\s+(?!type\b)[^;\n]*@earendil-works/m.test(SOURCE), "a runtime SDK import would break the bare-checkout suite");
     ok(SOURCE.includes('import type { ExtensionAPI, ToolCallEventResult } from "@earendil-works/pi-coding-agent"'));
-    ok(/function isToolCallEventType\(/.test(SOURCE), "the inlined predicate is load-bearing");
+    // #1330 — the predicate is no longer inlined HERE. It has one home
+    // (shared/tool-call-event.ts) and is pinned against the real export by
+    // extensions/verification-gate/tool-call-event-parity.test.ts; a private copy
+    // in this file would drift under a pi upgrade with every gate still reporting
+    // `✅ Loaded`. shared/tool-call-event.test.ts asserts this import repo-wide.
+    ok(SOURCE.includes('import { isToolCallEventType } from "./shared/tool-call-event.js"'),
+      "the shared predicate import must be present (it replaces the #1321 inline)");
+    ok(!/function isToolCallEventType\(/.test(SOURCE), "the predicate must not be re-inlined here (#1330)");
   });
   await test("no gate key is built from SKILLS_PREFIX any more (only the display fallback)", () => {
     const hits = SOURCE.match(/SKILLS_PREFIX\}\$\{/g) ?? [];

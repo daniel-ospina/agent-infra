@@ -48,6 +48,17 @@ import { existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync, unl
 import { resolve, join, dirname } from "node:path";
 import { isIP } from "node:net"; // #383 (Task 3, P3-1 FINAL mechanical): true IPv6 mirror — zero-dep builtin
 import { isPrintMode, isPrintModeEnv } from "../shared/print-mode.js";
+// #357 (Task 1) introduced the inline; #1330 gave it ONE home and a pin.
+// pi's extension loader resolves the runtime package from its own bundled module
+// table, but this suite runs in CI with ZERO node_modules (zero-dep route), so
+// the value import was replaced by a copy. The copy now lives in
+// shared/tool-call-event.ts and is asserted against the real export on a matrix
+// of event shapes by extensions/verification-gate/tool-call-event-parity.test.ts
+// (SDK-bearing) — an
+// un-pinned private copy here would silently return `false` for every event
+// after a pi upgrade, leaving the checkpoint gate inert while the extension
+// reported itself loaded.
+import { isToolCallEventType } from "../shared/tool-call-event.js";
 // #1419: the kill switch has ONE home. It used to be defined here and
 // referenced-but-never-imported in loop-enforcer, where every write raised
 // `ReferenceError` into a swallowed catch — the documented escape was inert.
@@ -66,9 +77,12 @@ import {
 //   (pi-node v22.23.2-darwin-arm64 @earendil-works/pi-coding-agent). Drift guard:
 //   if a pi upgrade changes this predicate, catch it in Task 13's audit window
 //   (the only place the dep IS available) — the suite exercises only this copy.
-function isToolCallEventType(toolName: string, event: unknown): boolean {
-  return (event as { toolName?: unknown })?.toolName === toolName;
-}
+//
+// #1330 moved the copy to ../shared/tool-call-event.ts (single home, imported
+// above) and replaced the "catch it in an audit window" hope with a real pin:
+// extensions/verification-gate/tool-call-event-parity.test.ts imports the REAL
+// export and fails when
+// this predicate no longer agrees with it.
 
 // Dual-support: check AGENT_* first, then ELDATO_* (Phase 1 — #7549)
 function _getEnv(name: string): string | undefined {

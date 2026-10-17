@@ -160,7 +160,15 @@ below gets a test.
   spelling-proof. The manifest is a stated scope boundary; residual, follow-up.
 - **Drift pin for the inlined `isToolCallEventType`.** It becomes a second copy (this module +
   `sequence-enforcer`); #966's precedent puts parity pins in SDK-bearing suites. Filed with
-  the DRY extraction rather than absorbed here.
+  the DRY extraction rather than absorbed here. **CLOSED by #1330:** the copy now has ONE
+  home (`extensions/shared/tool-call-event.ts`, imported by `skill-enforcer.ts`,
+  `sequence-enforcer/index.ts` and both test-side SDK stubs), pinned against the real export
+  by the SDK-bearing `extensions/verification-gate/tool-call-event-parity.test.ts` (per-PR
+  `ci.yml` job `pi-sdk-parity` + the post-merge leg) and by the zero-dep
+  `extensions/shared/tool-call-event.test.ts` (semantics + the single-home scan). Building
+  the pin found a divergence the inline had introduced: the copies read `event?.toolName`
+  where upstream reads `event.toolName`, so a malformed event returned `false` instead of
+  throwing — the parity suite compares thrown-ness for exactly that reason.
 
 - `SKILL_ENFORCER_DISABLED` / `ALLOW_MAIN_EDITS` — deliberate bypass env, unchanged.
 - `extensions/skill-registry.ts` (#1323, needs a decision) — untouched.
@@ -176,7 +184,7 @@ below gets a test.
   the *shape* half, and `canonicalSkillName` no longer returns on it alone.
 - **DRY:** the inline `isToolCallEventType` becomes a second copy (sequence-enforcer already
   inlines one). Extracting a shared zero-dep helper touches a third extension; filed as a
-  follow-up rather than absorbed.
+  follow-up rather than absorbed. **CLOSED by #1330** — see the residual entry above.
 
 ### Integration Surface Map
 
