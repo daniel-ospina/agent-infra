@@ -225,6 +225,28 @@ farm_unfarm() {
             continue
         fi
 
+        # SAME-FILE GUARD. The contradiction check above compares STRINGS; `rm` resolves the
+        # name through the FILESYSTEM, and those differ in two ways that delete a live file:
+        #   * case-insensitive volume (macOS APFS/HFS+ — the primary target of setup.sh):
+        #     `scripts/Record-Review.sh` and `scripts/record-review.sh` are ONE file, so an
+        #     entry differing only in case passes the string check and removes the still-farmed
+        #     artifact — on every sync, since the copy leg re-creates it;
+        #   * a hardlink alias reaches the same inode on ANY filesystem.
+        # So compare identity, not spelling. Only for a non-symlink target: unlinking a
+        # symlink never harms the file it points at, so a farm link to another farmed script
+        # is a legitimate retirement rather than a false block.
+        if [ ! -L "$path" ]; then
+            local drel
+            while IFS= read -r drel; do
+                [ -n "$drel" ] || continue
+                if [ "$path" -ef "$dest/$drel" ]; then
+                    printf 'ERROR: %s is the SAME FILE as the still-farmed %s (a case-only or hardlink alias) — refusing to remove a farmed artifact\n' "$rel" "$drel" >&2
+                    rc=1
+                    continue 2
+                fi
+            done <<<"${declared:-}"
+        fi
+
         if [ -L "$path" ]; then
             :   # a farm symlink is a farm artifact: rm -f removes the LINK, not its target
         elif [ -d "$path" ]; then
@@ -275,7 +297,15 @@ farm_check_declared_shrink() {
         [ -n "$prev" ] || continue
         farm_rel_listed "$prev" "$declared" && continue     # still farmed
         farm_rel_listed "$prev" "$entries" && continue      # retired on purpose
-        printf 'ERROR: %s was farmed on this box by a previous run, and is now NEITHER farmed NOR retired.\n' "$prev" >&2
+        # NOTHING DEPLOYED HERE = NOTHING TO ORPHAN. The snapshot records what the previous
+        # run DECLARED, and a declaration is appended before the copy leg decides whether the
+        # file exists (`[ -f "$f" ] || continue`; a MISSING lib leg only warns), so a box
+        # whose checkout was incomplete has snapshot entries with no artifact behind them —
+        # the #1931 "farm file failed to land" class this list must never confuse with a
+        # retirement. Reporting those would block every later sync over a file that is not on
+        # disk, and its prescribed remedy (declare it retired) would remove nothing.
+        [ -e "$dest/$prev" ] || [ -L "$dest/$prev" ] || continue
+        printf 'ERROR: %s was DECLARED and INSTALLED here by a previous run, and is now NEITHER farmed NOR retired.\n' "$prev" >&2
         printf '       A name dropped from a farm array stays installed forever unless it is declared:\n' >&2
         printf '       add its deployed path to pi-bootstrap/farm-retired.txt in the same commit.\n' >&2
         rc=1

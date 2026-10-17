@@ -42,8 +42,10 @@
 # REFUSES an absolute path, a `..` component, a glob (`* ? [ ]`), a shell metacharacter,
 # a path containing whitespace, a DIRECTORY (never `rm -rf`), and a path whose parent
 # directory resolves to anything other than the directory the entry names (so a
-# symlinked farm subdirectory cannot redirect a removal) — see
-# pi-bootstrap/lib/farm-retire.sh.
+# symlinked farm subdirectory cannot redirect a removal). It also refuses an entry that
+# resolves to the SAME FILE as a still-farmed artifact — a case-only or hardlink alias,
+# which a string comparison cannot see and a case-insensitive volume (macOS) will happily
+# match — see pi-bootstrap/lib/farm-retire.sh.
 #
 # WHAT AN ENTRY REMOVES — the one thing to be sure about
 # ------------------------------------------------------

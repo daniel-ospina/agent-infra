@@ -320,6 +320,25 @@ else
   ok "(d) symlink unlinked, target untouched"
 fi
 
+# A HARDLINK ALIAS to a still-farmed artifact is refused on SAME-FILE identity. The string
+# contradiction check cannot see it, and on a case-insensitive volume (macOS APFS/HFS+, where
+# setup.sh runs) `scripts/Record-Review.sh` and `scripts/record-review.sh` are one file — so
+# this case stands in for every "different spelling, same artifact" alias.
+ALIAS="$TMP/alias"
+mkdir -p "$ALIAS/dest/scripts"
+printf 'farmed\n' > "$ALIAS/dest/scripts/keep.sh"
+ln "$ALIAS/dest/scripts/keep.sh" "$ALIAS/dest/scripts/keep-alias.sh" 2>/dev/null \
+  || fail "(d) could not create the hardlink fixture"
+printf 'scripts/keep-alias.sh\n' > "$ALIAS/alias.txt"
+out="$(farm_unfarm "$ALIAS/dest" "$ALIAS/alias.txt" $'scripts/keep.sh\n' 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] || [ ! -f "$ALIAS/dest/scripts/keep.sh" ]; then
+  fail "(d) a HARDLINK/case alias of a still-farmed artifact was removed (rc=$rc): $out"
+elif ! grep -q 'SAME FILE' <<<"$out"; then
+  fail "(d) the same-file refusal was not named ($out)"
+else
+  ok "(d) a hardlink alias of a still-farmed artifact is refused (SAME FILE)"
+fi
+
 # a symlinked PARENT directory cannot be used to reach outside the farm
 ln -s "$SAFE/outside-dir" "$SAFE/dest/scripts/escape"
 printf 'scripts/escape/f.sh\n' > "$SAFE/escape.txt"
@@ -387,6 +406,8 @@ fi
 # comparison can see.
 SNAP="$TMP/snap"
 mkdir -p "$SNAP/dest/scripts"
+printf 'a\n' > "$SNAP/dest/scripts/a.sh"
+printf 'b\n' > "$SNAP/dest/scripts/b.sh"   # deployed: an orphan is a file that EXISTS here
 printf 'scripts/a.sh\nscripts/b.sh\n' > "$SNAP/manifest.txt"
 : > "$SNAP/manifest-empty.txt"
 farm_record_declared "$SNAP/dest" $'scripts/a.sh\nscripts/b.sh\n' >/dev/null 2>&1
@@ -403,6 +424,21 @@ out="$(farm_check_declared_shrink "$SNAP/dest" "$SNAP/manifest-empty.txt" $'scri
 out="$(farm_check_declared_shrink "$SNAP/dest" "$SNAP/manifest.txt" $'scripts/a.sh\n' 2>&1)"; rc=$?
 # b.sh is retired now, so it is not an orphan — a retirement must not read as a shrink
 [ "$rc" -eq 0 ] && ok "(e) a RETIRED name is not reported as an orphan" || fail "(e) a declared retirement read as a shrink ($out)"
+
+# A DECLARED-BUT-NEVER-INSTALLED path is not an orphan either. The snapshot records what a
+# previous run DECLARED (appended before the copy leg decides the file exists), so a box whose
+# checkout was incomplete has entries with nothing behind them. Reporting those would block
+# every later sync over a file that is not on disk, and the prescribed remedy (declare it
+# retired) would remove nothing.
+rm -f "$SNAP/dest/scripts/b.sh"
+out="$(farm_check_declared_shrink "$SNAP/dest" "$SNAP/manifest-empty.txt" $'scripts/a.sh\n' 2>&1)"; rc=$?
+if [ "$rc" -ne 0 ]; then
+  fail "(e) a path with NOTHING DEPLOYED was reported as an orphan and would block the sync: $out"
+elif grep -q 'ORPHAN\|NEITHER' <<<"$out"; then
+  fail "(e) an undeployed path produced orphan wording: $out"
+else
+  ok "(e) a declared-but-never-installed path is not an orphan"
+fi
 
 # ===========================================================================
 hdr "(f) the repo's own declaration: no intersection, no live plist, valid entries"
@@ -572,6 +608,30 @@ if CELL_HOME="$CELL_HOME" INFRA_ROOT="$COPY" bash "$CELL_INSTALL" --install >> "
 else
   fail "(h) cell --install did not repair the stale retired artifact (see $LOG)"
 fi
+# --- the two DIRECTIONS of a snapshot mismatch advise different things -----------------
+# The cell's layer is OLDER than its checkout: a newly farmed file was never installed here.
+# The remedy is --install. A message prescribing "declare it retired" would be wrong, and
+# following it puts a name in the retirement list that the farm still declares — after which
+# every --install refuses (the contradiction path). This pins both the advice and the remedy.
+printf 'probe\n' > "$COPY/scripts/new-probe.sh"
+set_fleet_srcs add new-probe.sh || fail "(h) could not add a farmed file to the COPY"
+out="$(CELL_HOME="$CELL_HOME" INFRA_ROOT="$COPY" bash "$CELL_INSTALL" --verify 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ]; then
+  fail "(h) --verify passed although the checkout declares a file the cell never installed"
+elif ! grep -q 'NOT installed here: scripts/new-probe.sh' <<<"$out"; then
+  fail "(h) the older-layer direction was not reported as 'not installed here': $(grep -m1 'DIFFERS\|not this checkout' <<<"$out")"
+elif grep -q 'must ALSO be declared' <<<"$out"; then
+  fail "(h) the older-layer direction was reported as a RETIREMENT (following that advice makes --install refuse forever)"
+else
+  ok "(h) an older cell layer is reported as 'not installed here' + 're-run --install', not as a retirement"
+fi
+if CELL_HOME="$CELL_HOME" INFRA_ROOT="$COPY" bash "$CELL_INSTALL" --install >> "$LOG" 2>&1 \
+   && CELL_HOME="$CELL_HOME" INFRA_ROOT="$COPY" bash "$CELL_INSTALL" --verify >> "$LOG" 2>&1; then
+  ok "(h) --install is the remedy for an older layer: the snapshot re-records and --verify passes"
+else
+  fail "(h) --install did not resolve an older-layer snapshot mismatch (see $LOG)"
+fi
+
 # a checkout without the UNFARM leg must be refused BEFORE anything is copied (a cell
 # half-installed by a resolver that accepted an incomplete tree is #1723's state)
 NOLIB="$TMP/nolib-checkout"
@@ -592,6 +652,20 @@ elif [ -e "$TMP/nolib-home/.pi/agent/scripts" ]; then
   fail "(h) cell-install MUTATED the cell before refusing a checkout with no UNFARM leg"
 else
   ok "(h) a checkout with no UNFARM leg is refused before anything is written"
+fi
+
+# An EXPLICIT INFRA_ROOT that is not a checkout must not be replaced SILENTLY by a different
+# one: the farm arrays would then be paired with a checkout (and, since #1924, a retirement
+# list) the operator never named. The run still falls through to a complete checkout — that is
+# the ambient default — but it says so where the swap happens.
+out="$(env -u HARNESS AGENT_INFRA_PATH="$COPY" CELL_HOME="$TMP/warn-home" INFRA_ROOT="$NOLIB" \
+        bash "$NOLIB/pi-bootstrap/cell-install.sh" --install 2>&1)"; rc=$?
+if [ "$rc" -ne 0 ]; then
+  fail "(h) the run with an invalid INFRA_ROOT and a valid fallback failed instead of falling back (rc=$rc): $(head -2 <<<"$out")"
+elif ! grep -q 'refused (INFRA_ROOT is not a checkout' <<<"$out"; then
+  fail "(h) an invalid INFRA_ROOT was replaced by another checkout in SILENCE"
+else
+  ok "(h) an invalid INFRA_ROOT is named as refused before the fallback is used"
 fi
 
 # ===========================================================================

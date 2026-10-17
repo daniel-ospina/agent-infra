@@ -212,7 +212,7 @@ is_infra_checkout() {
 }
 
 resolve_infra_root() {
-  local cand
+  local cand explicit=1
   # Order matters: an explicit INFRA_ROOT wins, then the checkout this script itself was
   # shipped in — the script IS a file inside that checkout, so whoever put it there already
   # chose what runs; a writer at that path could replace this script outright.
@@ -222,6 +222,16 @@ resolve_infra_root() {
       (cd "$cand" && pwd)
       return 0
     fi
+    # An explicitly NAMED checkout that is not one must not be replaced in silence: the next
+    # candidate wins and its farm arrays are then paired with a DIFFERENT checkout than the
+    # operator named (and, since #1924, with that other checkout's retirement list — a
+    # removal rule nobody wrote down). The resolved root is also printed in the banner, but a
+    # swap has to be visible where it happens. Only INFRA_ROOT is reported: `$SELF_DIR/..` is
+    # the ambient default and the ownership branch below already reports what it refuses.
+    if [ "$explicit" = 1 ] && [ -n "${INFRA_ROOT:-}" ]; then
+      printf '  refused (INFRA_ROOT is not a checkout — needs pi-bootstrap/setup.sh, manifest.json, pi-bootstrap/lib/farm-retire.sh and pi-bootstrap/farm-retired.txt): %s\n' "$cand" >&2
+    fi
+    explicit=0
   done
   # The AMBIENT candidates must additionally be owned by the user running this script. The
   # cell's HOME is a fixed path under a world-writable /tmp (/tmp/cell-home), so a
@@ -422,11 +432,10 @@ load_farm_retire() {
 # one kind of value from both callers.
 FARM_DECLARED_REL=""
 read_declared_farm_rel_paths() {   # $1 = rows, as emitted by read_farm_set
-  local rows="$1" src_rel dest_rel base rows_n=0 paths_n=0
+  local rows="$1" src_rel dest_rel base
   FARM_DECLARED_REL=""
   while IFS=$'\t' read -r src_rel dest_rel base; do
     [ -n "${base:-}" ] || continue
-    rows_n=$((rows_n + 1))
     case "$dest_rel" in
       scripts)   FARM_DECLARED_REL+="scripts/$base"$'\n' ;;
       scripts/*) FARM_DECLARED_REL+="$dest_rel/$base"$'\n' ;;
@@ -441,12 +450,13 @@ read_declared_farm_rel_paths() {   # $1 = rows, as emitted by read_farm_set
          return 1 ;;
     esac
   done <<<"$rows"
-  paths_n="$(printf '%s' "$FARM_DECLARED_REL" | grep -c . || true)"
-  if [ "$paths_n" -ne "$rows_n" ]; then
-    printf 'FATAL: the declared path set parsed to %s of %s farm row(s) — refusing to run a retirement check against a TRUNCATED set\n' \
-           "$paths_n" "$rows_n" >&2
-    return 1
-  fi
+  # NO "parsed N of M" GUARD HERE, deliberately. The loop appends exactly one line per row
+  # and returns 1 on the only row shape it cannot express (a destination outside scripts/),
+  # so a count comparison would be computed twice from the same loop and could never fire —
+  # an inert gate that reads as protection. Truncation of the DECLARED SET is caught where it
+  # can be seen: install_farms/verify_layer's MIN_FARM_FILES floor on what is installed, and
+  # the snapshot comparison below (a truncated declaration no longer equals the set the last
+  # install recorded).
   return 0
 }
 
@@ -817,11 +827,33 @@ verify_layer() {
       if [ ! -f "$snap" ]; then
         fail "the UNFARM leg never recorded a farm declaration snapshot ($snap_rel) — this cell's layer predates #1924 or the unfarm leg did not run; re-run --install"
       else
-        want_out="$(printf '%s' "$FARM_DECLARED_REL" | LC_ALL=C sort -u)"
-        if [ "$(LC_ALL=C sort -u "$snap" | grep -v '^$' || true)" != "$want_out" ]; then
-          fail "the farm declaration snapshot ($snap_rel) DIFFERS from the checkout's declared set — a farmed name was dropped from a farm array without being declared retired (the deployed copy is still installed and would be orphaned); re-run --install after declaring it"
-        else
+        # The snapshot can differ in TWO directions, and they need different advice. Telling an
+        # operator "declare it retired" when the CELL's layer is merely older is not just wrong:
+        # following it puts a name in the retirement list that the farm still declares, and every
+        # later --install then refuses. `--install` is the remedy in both directions — it re-farms
+        # what this checkout declares and applies whatever retirement the list holds.
+        local uninstalled='' gone='' p snap_sorted msg
+        snap_sorted="$(LC_ALL=C sort -u "$snap" | grep -v '^$' || true)"
+        want_out="$(printf '%s' "$FARM_DECLARED_REL")"     # already newline-terminated
+        while IFS= read -r p; do
+          [ -n "$p" ] || continue
+          farm_rel_listed "$p" "$snap_sorted" || uninstalled="$uninstalled $p"
+        done <<<"$want_out"
+        while IFS= read -r p; do
+          [ -n "$p" ] || continue
+          farm_rel_listed "$p" "$want_out" || gone="$gone $p"
+        done <<<"$snap_sorted"
+        if [ -z "$uninstalled" ] && [ -z "$gone" ]; then
           say "verified the farm declaration snapshot against the checkout's declared set"
+        else
+          msg="the farm declaration snapshot ($snap_rel) is not this checkout's declared set — re-run --install."
+          if [ -n "$uninstalled" ]; then
+            msg="$msg Declared by this checkout but NOT installed here:$uninstalled."
+          fi
+          if [ -n "$gone" ]; then
+            msg="$msg Recorded by the last install but no longer farmed:$gone — if that was a retirement it must ALSO be declared in pi-bootstrap/farm-retired.txt (otherwise --install refuses to orphan it); if it was not, --install re-records the set."
+          fi
+          fail "$msg"
         fi
       fi
     else
