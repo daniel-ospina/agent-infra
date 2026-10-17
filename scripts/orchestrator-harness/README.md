@@ -135,6 +135,20 @@ without a human in the loop:
 - **Self-healing:** a PR whose reviewer reports real findings is routed to a *fixer*, fixed,
   and re-reviewed — rather than being left red forever (this is the bug that stranded ~15
   PRs before it was fixed; see §7).
+- **A capacity pool, not only an isolation boundary.** The five machines are not five independent
+  single-host harnesses that happen to share a repo; they are **one pool of capacity** over one
+  queue. So a per-machine capacity decision must never become a fleet-wide one: when a box refuses
+  an item because *it* is full, the item stays **eligible on every other box**. That is the
+  requirement this document calls **R8** (agent-infra#1909), and it is not automatic — the refusal
+  used to hold the cross-box issue claim for 90 minutes while the chain waited for a PR no agent
+  could open, so one load spike made the issue ineligible on all five boxes at once. Measured
+  2026-10-17: the Mac refused at load 98-180 (correctly) while cell-2 sat at 0.29 load with 14.5 GB
+  free and cell-3 at 0.04 load, and **47 P0/P1 issues went untouched with ~20 vCPU idle on the same
+  account**; the gap was filled by hand with six manually-created dispatch lanes. The transfer
+  mechanism is in §7.2d — and it is deliberately **not** built on load average: the signal is the
+  gate's own refusal (whatever actually bound: load, lanes, swap, memory or disk), because load is a
+  symptom of contention rather than a measure of capacity (`docs/ops/load-policy.md`), and a
+  capacity gate a caller can skip is not a gate (agent-infra#1884).
 
 It deliberately does **not** use the `task` sub-agent tool. Workers are separate `pi -p`
 processes in tmux sessions, so a killed worker cannot take the controller down with it.
@@ -855,7 +869,8 @@ reap. The decisions that are not obvious:
   refused issue is then not written to `dispatched.txt` and not put in `.batch`, so it stays in
   `candidates.txt` and is re-attempted next cycle — no blacklist for the reaper to undo, and no
   worktree, lane or chain spawned for work another box owns. **Re-leased by `chain-merge.sh` on
-  every exit path** (clean merge, failed merge, and the 90-minute "no PR appeared" timeout) through
+  every exit path** (clean merge, failed merge, the 90-minute "no PR appeared" timeout, and — see
+  §7.2d — a capacity refusal, where it exits at once rather than waiting) through
   a trap, fenced on the commit this box pushed; a box that dies mid-lane leaves it to the lease,
   which is sized (`CLAIM_ISSUE_TTL`, default 3 h) to cover lane + chain — releasing early is the
   normal path, so the lease only runs its full length when the box is gone.
@@ -960,6 +975,57 @@ provisioning verdict: the fleet's shared gh backoff for GitHub's secondary (conc
 agent-infra#1910, and a refresh whose resolved tool directory is behind `origin/main` still says so
 only through its own existing refusals (issue #1931's directions 1 and 3, which this change does not
 touch). A pass that cannot read the pool now says `queue=UNREADABLE` while it refuses.
+
+### 7.2d A capacity refusal consumed the item's turn — FIXED in agent-infra#1909
+
+**The defect.** R1 (a box dispatches only when it has capacity) worked exactly as designed on
+2026-10-17 and that is why the queue stalled: the Mac refused at load 98→180 while cell-2 sat at
+0.29 load with 14.5 GB free and cell-3 at 0.04. Nothing turned a refusal into "another box may take
+this", because the refusal's consequences were invisible and **long-lived**:
+
+1. `lane.sh`'s gate refused, so no agent ran and no PR could ever appear.
+2. `chain-merge.sh` then waited its full **90 minutes** for that PR — holding `refs/claims/issue-<N>`
+   the whole time, because releasing it is its EXIT trap's job.
+3. Every peer's `claim_issue_preflight` reads a live claim as **COLLISION**, so ONE box's capacity
+   decision made the issue ineligible on **all five** boxes for 90 minutes (up to `CLAIM_ISSUE_TTL`,
+   3 h, if the chain were killed). That is the `parked-*` failure R8 forbids, arrived at by a
+   different route: the item's turn was consumed by a machine that did no work.
+4. Nothing stopped the refusing box from re-winning the claim next cycle and being refused again —
+   starving the peers it had just yielded to.
+
+**The mechanism**, three parts and no new network traffic (it rides the claim the refusal was
+already holding):
+
+| part | where | what it does |
+|---|---|---|
+| the **record** | `lane.sh` writes `state/capacity-refused-<N>`, one line: `<refused_epoch>\t<yield_until>\t<load\|disk>` | the refusal becomes durable and readable. Cleared when a lane actually runs, so a stale record cannot outlive its dispatch |
+| the **release** | `chain-merge.sh` reads field 1 and exits **at once** with the gate's own code (75 load / 77 disk) | the EXIT trap does the FENCED release it already did — so peers see CLEAN within one poll interval instead of after 90 minutes. Field 1 ≥ this chain's start is what makes it per-dispatch: a record from an earlier run cannot end a LIVE lane's wait, which would let a peer open a second lane for the same issue |
+| the **stand-down** | `orch-loop.sh`'s `capacity_yield_live()` reads field 2 and the dispatch loop `continue`s before the claim | releasing the claim makes the issue *eligible* on a peer; it does not make the peer *win* the CAS. While the yield is live this box leaves the issue **unconsumed** (no `dispatched.txt` row, no claim ref), so it stays a candidate here *and* free for every peer; when the yield expires the ordinary path resumes |
+
+**Decisions worth not re-litigating.**
+
+- **The signal is the gate's own refusal, not load average.** Whatever actually bound is named
+  (`load` or `disk` — opposite remedies), and the transfer is driven by the refusal event. Load is a
+  symptom of contention rather than a measure of capacity (`docs/ops/load-policy.md`), which is also
+  why a lowering of `MAX_LOAD` (#1907) could not have moved a single item.
+- **The controller-level gate needs nothing.** It refuses *before* any claim is taken, so nothing is
+  held and nothing consumes the item's turn; the transfer machinery exists only for the worker-level
+  refusal, where an issue has already been claimed and a chain is waiting for it.
+- **Every reader fails OPEN.** A missing, empty, garbled, incoherent or wrong-shaped record is **not**
+  a refusal: treating one as a refusal would suppress dispatch, which is the fleet-wide idleness R8
+  removes, re-introduced by a corrupt byte. Only a coherent pair (`epoch < until`, epoch newer than
+  the reader's own start) is evidence.
+- **`CAPACITY_YIELD_SECS` (default 900) is clamped to 1..86400 and `0` is REFUSED**, not honoured:
+  a zero-length yield would silently restore the defect while looking configured.
+
+`capacity-transfer.test.sh` drives the shipped `lane.sh` and `chain-merge.sh` and extracts
+`capacity_yield_live()` from the live controller, with a **local bare repo** as the shared origin so
+the released claim is a real fenced push: 31 assertions, of which **19 fail on the pre-change tree**
+(3 pass — the ones that assert a refusal *didn't* happen). Residuals, named rather than hidden: the
+review/fix path's load refusal (`merge-one.sh` returning 75) is re-dispatched by the sweep and is
+**not** transferred, because it is work on an existing PR rather than an un-owned queue item; and
+the stand-down is per **issue**, so a box at capacity still holds no view of *which* peer is idle —
+peers take refused work by the ordinary severity-ordered pool, not by being told to.
 
 ### 7.3 The harness is unversioned (this directory is the remedy)
 
