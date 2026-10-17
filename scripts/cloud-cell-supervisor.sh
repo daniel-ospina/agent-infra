@@ -212,6 +212,13 @@ publish_worker_env() {
     return 0
   fi
   list="$(printf '%s' "$list" | tr '\n' ' ')"
+  # ⛔ A listed name is STRIPPED from the new session when the creating client lacks it
+  # (`update-environment` is a "these come from the client" list, not an allow-list) — the same
+  # deliberate rule the `AI_REVIEW_GATE_KEY` unset above relies on. So `$ENV_FILE` (or this shell) is
+  # the authoritative source for every name here: a value living ONLY in the tmux server is not a
+  # supported configuration — the issue's `tmux set-environment -g` workaround reads its value FROM
+  # `keys.env`, so the `start` shell (which sources it) holds it and no strip can fire. A name with no
+  # value anywhere is the dead state #1852's residual records; `check` does not yet refuse it.
   for n in $WORKER_ENV_NAMES; do
     case " $list " in *" $n "*) ;; *) list="$list $n" ;; esac
   done
@@ -568,6 +575,10 @@ pin_root_conformance() {
   [ -n "$listing" ] || return 0                             # genuinely empty (`ls -A` drops . and ..)
   while IFS= read -r p; do
     [ -n "$p" ] || continue
+    # A sibling verb can mutate the root between `ls -A` and this test. An entry that VANISHED is not
+    # a nonconformity (it would name a directory that no longer exists); a dangling symlink still is
+    # (`-L` true, `-d` false → refused), which is the property `ls -A` exists for.
+    [ -e "$dir/$p" ] || [ -L "$dir/$p" ] || continue
     entries=$((entries + 1))
     if [ ! -d "$dir/$p" ] || ! pin_name_ok "$p"; then
       PIN_ROOT_BAD="holds '$p', which is not a pin directory"
@@ -589,6 +600,11 @@ pin_root_conformance() {
 # $HARNESS_REPO cannot turn a legitimate `check` into a false block.
 # ⛔ This cannot reintroduce the per-entry path-comparison false block named above: it asks whether a
 # NAME resolves in the repo and never compares a path, so a `$TMPDIR`-spelled pin still answers yes.
+# ⛔ ACCEPTED RESIDUAL (the fail-closed direction): a pin whose commit object is gone (its detached
+# worktree was removed by an `rm_cache` fallback and a later `gc` collected the object) can never be
+# reclaimed — the sweep is not an authority for a name it cannot resolve. The `say` line in cmd_prune
+# makes it visible rather than silent; the alternative (delete on an unprovable name) is the
+# silent-destruction class this file refuses.
 pin_entry_owned() {
   local n="${1:-}"
   pin_name_ok "$n" || return 1
@@ -640,6 +656,14 @@ harness_apply() {
   want="$(git -C "$HARNESS_REPO" rev-parse --verify --quiet "$HARNESS_REF^{commit}" 2>/dev/null)"
   [ -n "$want" ] || die "cannot resolve $HARNESS_REF in $HARNESS_REPO$( [ "$fetch_failed" = 1 ] && printf ' after a failed git fetch — check the network' ) — cannot pin a harness to verify against"
   [ "$fetch_failed" = 1 ] && say "warn: git fetch failed in $HARNESS_REPO — cannot refresh $HARNESS_REF; using the local ref"
+  # ⛔ THE CONFORMANCE GUARD RUNS ON EVERY PATH, INCLUDING THE NO-OP ONE. It used to sit inside the
+  # re-pin `else` below, so `apply` on a cell whose harness was already at the ref returned 0
+  # ("unchanged") without ever asking whether the pin root conforms — while `check`, `start` and
+  # `prune` all refused it, and `check`'s message asserted that `apply` refused too. Same false PASS
+  # class as #1852, on the verb whose job is "put the proper harness on this cell". The guard asks
+  # about `$HARNESS_PIN_DIR` (the root), never about `$HARNESS`, so the documented "an operator's
+  # /tmp/harness-main is never disturbed" behaviour is untouched.
+  assert_pin_dir_safe "$HARNESS_PIN_DIR"
   cur="$(harness_commit)"
   # A DIRTY tree at the ref is NOT `unchanged`: its commit does not describe its bytes, and seeding it
   # records the ref over hand-edited worker code. A tree whose cleanliness cannot be VERIFIED is
@@ -656,11 +680,11 @@ harness_apply() {
     # cell with NO harness at all, and the operator's only clue is a controller that will not start.
     # The previous pin now survives until `prune` reclaims it.
     dir="$HARNESS_PIN_DIR/$(printf '%s' "$want" | cut -c1-12)"
-    # ⛔ The BASE is validated, not the per-commit child. Passing the child made the deny-list compare
-    # the wrong way round — `HARNESS_PIN_DIR=$CELL_HOME` would put the child BELOW the cell home, so
-    # "does this path contain the cell home" was false and the guard that exists to stop `rm -rf` over
-    # the cell home silently stopped firing. The child is strictly under a validated root by construction.
-    assert_pin_dir_safe "$HARNESS_PIN_DIR"
+    # ⛔ The BASE is validated (the call is HOISTED above, so it covers the no-op path too), not the
+    # per-commit child. Passing the child made the deny-list compare the wrong way round —
+    # `HARNESS_PIN_DIR=$CELL_HOME` would put the child BELOW the cell home, so "does this path contain
+    # the cell home" was false and the guard that exists to stop `rm -rf` over the cell home silently
+    # stopped firing. The child is strictly under a validated root by construction.
     # ⛔ No bare `git worktree prune`. It has no path filter and deregisters EVERY record whose working
     # directory is missing, unrelated siblings included — and for a DETACHED worktree the admin HEAD is
     # the commit's last durable handle, so a later `gc` collects it (#1141; this repo forbids the call).
@@ -1311,10 +1335,17 @@ cmd_prune() {
         # unresolved $HARNESS_REPO or a git failure) both SKIP the reclaim. Reconciling the two
         # directions: the delete side refuses on an unknown, and `check` never consults this test, so
         # an unresolved $HARNESS_REPO cannot turn a legitimate `check` into a false block.
-        if ! pin_entry_owned "$(basename "$d")"; then
-          say "prune: NOT reclaiming $d — its name does not resolve to a commit in ${HARNESS_REPO:-<unresolved>}, so it is not provably a pin of ours"
-          continue
-        fi
+        pin_entry_owned "$(basename "$d")"
+        # ⛔ Branch the DIAGNOSIS on the return value: 1 and 2 both skip the reclaim, but they mean
+        # different things, and telling an operator "does not resolve to a commit" when the repo could
+        # not be consulted at all is this file's own "instrument that cannot answer its own question".
+        case "$?" in
+          0) ;;
+          2) say "prune: NOT reclaiming $d — cannot VERIFY it is a pin: HARNESS_REPO is unresolved or not a git checkout. Fix HARNESS_REPO, then re-run '$0 prune'"
+             continue ;;
+          *) say "prune: NOT reclaiming $d — its name does not resolve to a commit in ${HARNESS_REPO:-<unresolved>}, so it is not provably a pin of ours"
+             continue ;;
+        esac
         say "prune: reclaiming superseded harness pin $d"
         # Deregister as well as delete. A bare `git worktree prune` is banned (#1141), so the removal
         # must be PATH-SCOPED — but a removal that only `rm -rf`'d left a phantom `worktree list`

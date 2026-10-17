@@ -1468,7 +1468,9 @@ pinunit() { # $1 = candidate name; exits 99 if the shipped predicate is absent
   local n="$1"
   (
     set -- status
-    export CELL_HOME="$Q/pinunit/home" ENV_FILE="$Q/pinunit/none.env" O="$Q/pinunit/o" \
+    # ⛔ `$Q/bin` on PATH: sourcing runs `cmd_status`, which probes tmux. Without the stub it reaches
+    # the OPERATOR's default tmux server (the §12 comment claims the stub answers; make that true).
+    export PATH="$Q/bin:$PATH" CELL_HOME="$Q/pinunit/home" ENV_FILE="$Q/pinunit/none.env" O="$Q/pinunit/o" \
            REPO="$Q/pinunit/repo" HARNESS_PIN_DIR="$Q/pinunit/pin" HARNESS_PIN_FILE="$Q/pinunit/hp"
     . "$SUP" >/dev/null 2>&1
     type -t pin_name_ok >/dev/null 2>&1 || exit 99
@@ -1563,15 +1565,22 @@ PD_OUT="$(CELL_HOME="$PD/home" ENV_FILE="$PD/keys.env" SESSION="ai1852-pd-$$" O=
 # restoring the swallow makes this arm certify an unreadable root. `chmod 000` denies READDIR (so the
 # read fails) while `-d`/`-e` still answer, which is the exact shape.
 say_case "check REFUSES an UNREADABLE pin root instead of reading it as empty (#1852)"
-chmod 000 "$Q/pin"
-qcheck
-[ "$QQ_RC" -ne 0 ] && ok "check REFUSED an unreadable pin root (EACCES is not 'empty')" \
-                   || bad "check CERTIFIED an unreadable pin root — cannot-verify read as empty: $QQ_OUT"
-case "$QQ_OUT" in
-  *"cannot be READ"*) ok "check names the cannot-verify state (a READ failure), not a missing pin" ;;
-  *) bad "check's refusal does not name the unreadable state — $QQ_OUT" ;;
-esac
-chmod 755 "$Q/pin"
+# ⛔ The premise is `chmod` denying READDIR, which is a NON-ROOT property (root's CAP_DAC_* bypass
+# it), so as root these arms would false-RED a product bug that does not exist. Skip loudly there;
+# CI and the normal cell are non-root, which is where they run.
+if [ "$(id -u)" -eq 0 ]; then
+  echo "  ⏭ SKIP: running as root — chmod does not deny READDIR, so the EACCES premise is unavailable"
+else
+  chmod 000 "$Q/pin"
+  qcheck
+  [ "$QQ_RC" -ne 0 ] && ok "check REFUSED an unreadable pin root (EACCES is not 'empty')" \
+                     || bad "check CERTIFIED an unreadable pin root — cannot-verify read as empty: $QQ_OUT"
+  case "$QQ_OUT" in
+    *"cannot be READ"*) ok "check names the cannot-verify state (a READ failure), not a missing pin" ;;
+    *) bad "check's refusal does not name the unreadable state — $QQ_OUT" ;;
+  esac
+  chmod 755 "$Q/pin"
+fi
 qcheck
 [ "$QQ_RC" -eq 0 ] && ok "check passes again once the pin root is readable (the refusal is not sticky)" \
                    || bad "check still refuses a readable pin root (rc=$QQ_RC) — $QQ_OUT"
@@ -1583,23 +1592,27 @@ qcheck
 # the discriminator is the refusal. (The swallowing is genuinely destructive when `ls` itself is
 # absent or errors: the glob then still expands and the sweep proceeds with no read at all.)
 say_case "prune REFUSES an unreadable pin root — the delete side never reclaims blind (#1852)"
-IU="$T/unreadprune"; IUN="$(pinsha "$AI" 12)"
-mkdir -p "$IU/home" "$IU/pin/$IUN/scripts/orchestrator-harness"
-printf 'x\n' > "$IU/pin/$IUN/marker"
-printf '%s\n' "$IU/otherpin/scripts/orchestrator-harness" > "$IU/home/.harness-path"
-chmod 300 "$IU/pin"
-IU_OUT="$(CELL_HOME="$IU/home" ENV_FILE="$IU/keys.env" SESSION="ai1852-iu-$$" O="$IU/o" REPO="$IU/repo" \
-          HARNESS_REPO="$AI" HARNESS_FETCH=0 HARNESS="$IU/not-a-repo" \
-          HARNESS_PIN_DIR="$IU/pin" HARNESS_PIN_FILE="$IU/home/.harness-path" bash "$SUP" prune --caches 2>&1)"; IU_RC=$?
-[ "$IU_RC" -ne 0 ] && ok "prune REFUSED an unreadable pin root (delete side fails closed)" \
-                   || bad "prune accepted an unreadable pin root — $IU_OUT"
-case "$IU_OUT" in
-  *"cannot be READ"*) ok "prune names the cannot-verify state on the delete side" ;;
-  *) bad "prune's refusal does not name the unreadable state — $IU_OUT" ;;
-esac
-chmod 755 "$IU/pin"
-[ -d "$IU/pin/$IUN" ] && ok "nothing was deleted from a root prune could not read (the refusal preceded every rm -rf)" \
-                      || bad "prune DELETED from a root it could not read — SILENT DESTRUCTION"
+if [ "$(id -u)" -eq 0 ]; then
+  echo "  ⏭ SKIP: running as root — chmod does not deny READDIR, so the delete-side EACCES premise is unavailable"
+else
+  IU="$T/unreadprune"; IUN="$(pinsha "$AI" 12)"
+  mkdir -p "$IU/home" "$IU/pin/$IUN/scripts/orchestrator-harness"
+  printf 'x\n' > "$IU/pin/$IUN/marker"
+  printf '%s\n' "$IU/otherpin/scripts/orchestrator-harness" > "$IU/home/.harness-path"
+  chmod 300 "$IU/pin"
+  IU_OUT="$(CELL_HOME="$IU/home" ENV_FILE="$IU/keys.env" SESSION="ai1852-iu-$$" O="$IU/o" REPO="$IU/repo" \
+            HARNESS_REPO="$AI" HARNESS_FETCH=0 HARNESS="$IU/not-a-repo" \
+            HARNESS_PIN_DIR="$IU/pin" HARNESS_PIN_FILE="$IU/home/.harness-path" bash "$SUP" prune --caches 2>&1)"; IU_RC=$?
+  [ "$IU_RC" -ne 0 ] && ok "prune REFUSED an unreadable pin root (delete side fails closed)" \
+                     || bad "prune accepted an unreadable pin root — $IU_OUT"
+  case "$IU_OUT" in
+    *"cannot be READ"*) ok "prune names the cannot-verify state on the delete side" ;;
+    *) bad "prune's refusal does not name the unreadable state — $IU_OUT" ;;
+  esac
+  chmod 755 "$IU/pin"
+  [ -d "$IU/pin/$IUN" ] && ok "nothing was deleted from a root prune could not read (the refusal preceded every rm -rf)" \
+                        || bad "prune DELETED from a root it could not read — SILENT DESTRUCTION"
+fi
 
 # (i-g) `cmd_check_pin_dir` asked a WEAKER question than `assert_pin_dir_safe` in two more branches:
 # (1) no containment deny-list, so `HARNESS_PIN_DIR=$CELL_HOME` holding only hex dirs was certified by
@@ -1634,7 +1647,9 @@ pp_run() { # $1 = HARNESS_REPO value, $2 = function, $3.. = args
   local -a pargs=("$@")          # ⛔ capture BEFORE `set -- status`: sourcing resets $@
   (
     set -- status
-    export CELL_HOME="$T/pp/home" ENV_FILE="$T/pp/none.env" O="$T/pp/o" REPO="$T/pp/repo" \
+    # ⛔ `$Q/bin` on PATH for the same reason as `pinunit`: the source runs `cmd_status`, whose tmux
+    # probes must hit the stub, never the operator's default server.
+    export PATH="$Q/bin:$PATH" CELL_HOME="$T/pp/home" ENV_FILE="$T/pp/none.env" O="$T/pp/o" REPO="$T/pp/repo" \
            HARNESS_PIN_DIR="$Q/pin" HARNESS_PIN_FILE="$T/pp/hp" HARNESS_REPO="$repo"
     . "$SUP" >/dev/null 2>&1
     type -t "$fn" >/dev/null 2>&1 || exit 99
@@ -1649,7 +1664,7 @@ pp_run "$AI" pin_root_conformance "$Q/pin"; PPRC=$?
 # state a box with no checkout anywhere reaches.
 (
   set -- status
-  export CELL_HOME="$T/pp/home" ENV_FILE="$T/pp/none.env" O="$T/pp/o" REPO="$T/pp/repo" \
+  export PATH="$Q/bin:$PATH" CELL_HOME="$T/pp/home" ENV_FILE="$T/pp/none.env" O="$T/pp/o" REPO="$T/pp/repo" \
          HARNESS_PIN_DIR="$Q/pin" HARNESS_PIN_FILE="$T/pp/hp" HARNESS_REPO="$AI"
   . "$SUP" >/dev/null 2>&1
   HARNESS_REPO=""
@@ -1669,6 +1684,32 @@ PG_OUT="$(CELL_HOME="$PG/home" ENV_FILE="$PG/keys.env" SESSION="ai1852-pg-$$" O=
 [ "$PG_RC" -eq 0 ] && ok "prune does not crash when it cannot verify a pin name" || bad "prune exited $PG_RC on a non-repo HARNESS_REPO — $PG_OUT"
 [ -d "$PG/pin/$PGN" ] && ok "prune did NOT reclaim a pin it could not verify (delete side fails closed on a non-repo HARNESS_REPO)" \
                       || bad "prune reclaimed blind against a non-repo HARNESS_REPO — SILENT DESTRUCTION"
+# The DIAGNOSIS must match the non-answer: "cannot VERIFY" (2) is not "does not resolve to a commit"
+# (1). A single message for both is this file's own "instrument that cannot answer its own question".
+case "$PG_OUT" in
+  *"cannot VERIFY"*) ok "prune names the cannot-verify cause, not a non-resolution it could not observe" ;;
+  *"does not resolve to a commit"*) bad "prune reports a non-resolution when HARNESS_REPO could not be consulted at all — $PG_OUT" ;;
+  *) bad "prune's skip message does not name the cannot-verify cause — $PG_OUT" ;;
+esac
+
+# (i-i) ⛔ ALL FOUR VERBS ASK THE CONFORMANCE QUESTION — INCLUDING `apply`'s NO-OP PATH. A fresh review
+# found `assert_pin_dir_safe` sitting inside `harness_apply`'s re-pin `else`, so `apply` on a cell whose
+# harness was ALREADY at the ref printed "unchanged" and exited 0 while `check`/`start`/`prune` all
+# refused the same pin root — and `check`'s own message asserts that `apply` refuses. The guard is
+# hoisted above the branch. ⛔ Mutation caught: moving it back inside the `else` reddens this arm (the
+# fixture harness is clean and at the ref, so the no-op path is taken).
+say_case "apply refuses a non-conforming pin root even when the harness is UNCHANGED (#1852)"
+mkdir -p "$Q/pin/notes"
+QA_OUT="$(PATH="$Q/bin:$PATH" CELL_HOME="$Q/home" ENV_FILE="$Q/keys.env" SESSION="ai1852-qa-$$" \
+          O="$Q/o" REPO="$Q/repo" HARNESS="$QH" HARNESS_REPO="$AI" HARNESS_FETCH=0 HARNESS_REF="$QREF" \
+          HARNESS_PIN_DIR="$Q/pin" HARNESS_PIN_FILE="$Q/home/.harness-path" bash "$SUP" apply 2>&1)"; QA_RC=$?
+[ "$QA_RC" -ne 0 ] && ok "apply REFUSED a non-conforming pin root on its no-op path" \
+                   || bad "apply certified a cell check/start/prune refuse — the no-op path skipped the guard: $QA_OUT"
+case "$QA_OUT" in
+  *"holds 'notes'"*) ok "apply names the offending entry (the shared predicate's reason)" ;;
+  *) bad "apply's refusal does not name the entry — $QA_OUT" ;;
+esac
+rm -rf "$Q/pin/notes"
 
 echo
 echo "── Summary ───────────────────────────────────────────────────────"
