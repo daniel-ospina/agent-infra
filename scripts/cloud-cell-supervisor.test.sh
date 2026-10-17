@@ -35,7 +35,10 @@
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SUP="$HERE/cloud-cell-supervisor.sh"
+# SUP may be OVERRIDDEN so the suite can be run against another copy of the supervisor — that is how
+# a new refusal is shown to be NON-VACUOUS (run the suite against the PRE-fix script and watch the new
+# arms, and only the new arms, go red). Default is the shipped script.
+SUP="${SUP:-$HERE/cloud-cell-supervisor.sh}"
 BRINGUP="$HERE/cloud-cell-bringup.sh"
 
 PASS=0; FAIL=0
@@ -43,6 +46,13 @@ ok()  { PASS=$((PASS + 1)); echo "  ✅ $1"; }
 bad() { FAIL=$((FAIL + 1)); echo "  ❌ $1"; }
 
 T="$(mktemp -d "${TMPDIR:-/tmp}/cloud-cell-test.XXXXXX")"
+# ⛔ HERMETIC means the CALLER's environment must not decide a fixture. agent-infra#1901 makes `OR`
+# (the queue's owner/repo) a VALIDATED INPUT — derived from the checkout unless declared — so an
+# ambient `OR` in a developer's shell would be judged against every fixture checkout (which carries a
+# tortoise remote) and turn unrelated arms red. (Measured: an ambient `OR=daniel-ospina/agent-infra`
+# reddened 46 arms of §7–§11 that have nothing to do with the queue.) `TORTOISE_REPO`/`TORTOISE` are
+# cleared for the same reason: §8's arms set them EXPLICITLY per call, so only those cases see them.
+unset OR TORTOISE_REPO TORTOISE
 # §7's optional real-tmux half starts private servers (`tmux -L <socket>`); they are killed here so
 # no server survives the suite. The stub half needs no cleanup beyond $T.
 AI1711_SOCKS=""
@@ -73,6 +83,11 @@ ai_init_repo() {
   git -C "$1" config user.name test
   git -C "$1" config commit.gpgsign false
   git -C "$1" commit -q --allow-empty -m base
+  # ⛔ agent-infra#1901: the queue's repo is DERIVED from the checkout's `origin` remote, and a pair
+  # that cannot be READ is refused — so a fixture checkout must carry one. Tortoise is the repo this
+  # default used to be hard-coded to, so every fixture keeps the queue target it had before the
+  # derivation existed (no fixture's behaviour changes; only where the value comes from does).
+  git -C "$1" remote add origin https://github.com/daniel-ospina/tortoise.git
 }
 ai_worktree() { git -C "$AI" worktree add -q --detach "$1" origin/main; }
 make_ai_repo() {
@@ -1425,6 +1440,240 @@ esac
 cellcheck 0
 [ "$CC_RC" -eq 0 ] && ok "check: passes again once repo-authority.sh is present" \
                    || bad "check: still refuses with the worker restored (rc=$CC_RC)"
+
+# ── 12) THE QUEUE TARGET IS THE CHECKOUT (agent-infra#1901) ─────────────────────────────────────
+# MEASURED 2026-10-15 on `pi-cell-2`, harness pin `a4a1249794e7`:
+#
+#     git -C /tmp/cell-ai remote get-url origin   ->  https://github.com/daniel-ospina/agent-infra.git
+#     ls /tmp/cell-ai/pyproject.toml              ->  absent
+#
+# …while the controller's queue was TORTOISE (`OR` defaulted to `daniel-ospina/tortoise`), so a cell
+# standing in an agent-infra tree named tortoise PRs. The candidate pre-flight is a Python/uv tool
+# that must run INSIDE the target repo, so it was skipped and every candidate came back unqueryable:
+# 2,641 `ABORT: none of the 6 candidate(s) … produced a usable verdict` lines in an 11,245-line log
+# while the capacity line read `lanes=0/16 load=0/80` — the box EMPTY, not full. Nothing in the
+# output said the pair was wrong, and the parked PRs were unreachable by that path.
+#
+# `REPO` (a path) and `OR` (an owner/repo) were two independent facts that nothing compared. These
+# arms pin the three results of making them ONE fact: `OR` is DERIVED from the checkout's origin; an
+# explicit `OR` is an override that must MATCH it; and a pair that cannot be READ is refused rather
+# than blessed. Every refusal is asserted to name BOTH values (and the remote it read), because a
+# refusal that does not say which repo the machine needs is not a provisioning instruction.
+say_case "the queue target IS the checkout's remote (agent-infra#1901)"
+Q="$T/queue"; mkdir -p "$Q/home" "$Q/bin"
+QH="$Q/harness"
+ai_worktree "$Q/harness"
+for f in orch-loop.sh claims.sh repo-authority.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh adopt-fix.sh; do : > "$Q/harness/$f"; done
+# The provisioning probe must answer rc=0 here: this section is about the PAIR, not about dispatch.
+# It echoes the OR it was handed, so a probe run against the wrong queue could not pass silently.
+cat > "$Q/harness/refresh-candidates.sh" <<'SH'
+#!/bin/bash
+echo "[refresh] check: stub probe REPO=${REPO:-} OR=${OR:-}"
+exit 0
+SH
+chmod +x "$Q/harness/refresh-candidates.sh"
+# #1717: `start` provisions the record step from the harness checkout and `cmd_check` refuses a cell
+# without it (and its declared sibling), one directory up from the harness.
+printf '#!/bin/bash\nexit 0\n' > "$Q/record-review.sh"; chmod +x "$Q/record-review.sh"
+mkdir -p "$Q/lib"; printf '#!/usr/bin/env python3\n' > "$Q/lib/diff-normalize.py"
+git -C "$Q/harness" add -A
+git -C "$Q/harness" commit -q -m "section 12 fixture harness"
+Q_REF="$(git -C "$Q/harness" rev-parse HEAD)"
+printf '#!/bin/bash\nexit 0\n' > "$Q/bin/gh"; chmod +x "$Q/bin/gh"
+stub_missing "$Q/bin" pi
+# A tmux double: `has-session` is false until `new-session` records one, and the session COMMAND is
+# kept so the suite can assert WHICH queue the controller was actually handed — the delivery half.
+cat > "$Q/bin/tmux" <<'SH'
+#!/bin/bash
+S="${Q_STATE:?}"
+printf '%s\n' "$*" >> "$S/argv"
+case "${1:-}" in
+  has-session) [ -f "$S/up" ] && exit 0; exit 1 ;;
+  new-session)
+    sess=""; cmd=""
+    while [ $# -gt 0 ]; do case "$1" in -d) shift ;; -s) sess="$2"; shift 2 ;; -c) shift 2 ;; *) cmd="$1"; shift ;; esac; done
+    : > "$S/up"; printf '%s\n' "$cmd" > "$S/cmd"
+    exit 0 ;;
+  ls) exit 0 ;;
+  *) exit 0 ;;
+esac
+SH
+chmod +x "$Q/bin/tmux"
+# Three checkouts: the two repos from the measured pair, and one with NO origin (cannot-verify).
+ai_init_repo "$Q/tortoise-repo"
+git -C "$Q/tortoise-repo" remote set-url origin https://github.com/daniel-ospina/tortoise.git
+ai_init_repo "$Q/agent-repo"
+git -C "$Q/agent-repo" remote set-url origin https://github.com/daniel-ospina/agent-infra.git
+ai_init_repo "$Q/no-origin-repo"
+git -C "$Q/no-origin-repo" remote remove origin
+
+Q_OUT=''; Q_RC=0
+qsup() { # <verb> <repo> <state dir> [VAR=value …]  ($OR is cleared unless the case sets it)
+  local sub="$1" repo="$2" st="$3"; shift 3
+  rm -rf "$st"; mkdir -p "$st"
+  Q_OUT="$(env -u OR "$@" Q_STATE="$st" PATH="$Q/bin:$PATH" CELL_HOME="$Q/home" ENV_FILE="$Q/keys.env" \
+           SESSION="ai1901-$$" O="$st/o" REPO="$repo" HARNESS="$Q/harness" HARNESS_REPO="$AI" \
+           HARNESS_FETCH=0 HARNESS_REF="$Q_REF" bash "$SUP" "$sub" 2>&1)"
+  Q_RC=$?
+}
+
+# (1) A MATCHED pair starts: with no OR, the queue is DERIVED from the checkout's own remote.
+qsup start "$Q/tortoise-repo" "$Q/st-derived"
+[ "$Q_RC" -eq 0 ] && ok "start PROCEEDS when OR is unset and the queue derives from the checkout's origin" \
+                  || bad "start FALSE-BLOCKED a matched pair (rc=$Q_RC): $Q_OUT"
+case "$Q_OUT" in
+  *"controller started"*) ok "start: the matched pair reached the launch" ;;
+  *) bad "start: never reached the launch for a matched pair — $Q_OUT" ;;
+esac
+# …and the DERIVED value is what the controller session receives, not the raw/absent $OR.
+grep -qF "OR='daniel-ospina/tortoise'" "$Q/st-derived/cmd" 2>/dev/null \
+  && ok "start: the session was handed the DERIVED queue (OR=daniel-ospina/tortoise)" \
+  || bad "start: the session command does not carry the derived queue — $(cat "$Q/st-derived/cmd" 2>/dev/null)"
+
+# (2) The OVERRIDE path: an explicit OR EQUAL to the remote is accepted.
+qsup start "$Q/tortoise-repo" "$Q/st-explicit" OR=daniel-ospina/tortoise
+[ "$Q_RC" -eq 0 ] && ok "start ACCEPTS an explicit OR that equals the checkout's remote (the override path)" \
+                  || bad "start refused an explicit OR that MATCHES the remote — a false block: $Q_OUT"
+
+# (3) A MISMATCH refuses, naming BOTH values, the remote it read, and the repo the machine needs.
+qsup start "$Q/agent-repo" "$Q/st-mismatch" OR=daniel-ospina/tortoise
+[ "$Q_RC" -ne 0 ] && ok "start REFUSES the measured pair (queue=tortoise standing in an agent-infra checkout)" \
+                  || bad "start returned 0 for the measured mismatched pair — the cell would run and judge nothing"
+case "$Q_OUT" in
+  *"daniel-ospina/tortoise"*) ok "the refusal names the QUEUE repo" ;;
+  *) bad "the refusal does not name the queue — $Q_OUT" ;;
+esac
+case "$Q_OUT" in
+  *"daniel-ospina/agent-infra"*) ok "the refusal names the CHECKOUT's repo" ;;
+  *) bad "the refusal does not name the checkout's repo — $Q_OUT" ;;
+esac
+case "$Q_OUT" in
+  *"https://github.com/daniel-ospina/agent-infra.git"*) ok "the refusal names the REMOTE it read" ;;
+  *) bad "the refusal does not name the remote — $Q_OUT" ;;
+esac
+case "$Q_OUT" in
+  *"MUST BE a checkout"*) ok "the refusal says which repo the machine NEEDS (provisioning is unambiguous)" ;;
+  *) bad "the refusal does not say what must exist — $Q_OUT" ;;
+esac
+case "$Q_OUT" in
+  *"controller started"*) bad "start CLAIMED success on a mismatched pair" ;;
+  *) ok "start never claims 'controller started' on a mismatched pair" ;;
+esac
+# The refusal must land BEFORE anything is written or launched: no seeded $O, no session.
+{ [ ! -e "$Q/st-mismatch/o" ] && [ ! -e "$Q/st-mismatch/up" ]; } \
+  && ok "the refusal happens BEFORE any write: nothing seeded, no session created" \
+  || bad "a mismatched cell wrote state / created a session before refusing"
+
+# (4) THE TORTOISE DEFAULT IS GONE. With no OR, an agent-infra checkout targets the AGENT-INFRA
+# queue — the queue follows the checkout instead of a hard-coded default. (On the pre-fix script this
+# arm reddens: the session is handed OR='daniel-ospina/tortoise'.)
+qsup start "$Q/agent-repo" "$Q/st-follows"
+[ "$Q_RC" -eq 0 ] && ok "with no OR, a matched pair still starts (no default to mismatch against)" \
+                  || bad "start refused an agent-infra checkout with no OR — $Q_OUT"
+grep -qF "OR='daniel-ospina/agent-infra'" "$Q/st-follows/cmd" 2>/dev/null \
+  && ok "the queue FOLLOWS the checkout: an agent-infra tree gets the agent-infra queue, not tortoise" \
+  || bad "the session was not handed the checkout's own repo — $(cat "$Q/st-follows/cmd" 2>/dev/null)"
+
+# (5) A pair that cannot be READ is refused: cannot-verify is never a pass in this file.
+qsup start "$Q/no-origin-repo" "$Q/st-noremote"
+[ "$Q_RC" -ne 0 ] && ok "start REFUSES a checkout with no origin remote (the queue cannot be read)" \
+                  || bad "start accepted a checkout whose queue cannot be read — $Q_OUT"
+case "$Q_OUT" in
+  *"cannot read the QUEUE"*) ok "the unreadable-pair refusal names what could not be read" ;;
+  *) bad "the unreadable-pair refusal is not explained — $Q_OUT" ;;
+esac
+# An explicit OR does not rescue it: an override that cannot be verified against a remote is unproven.
+qsup start "$Q/no-origin-repo" "$Q/st-noremote2" OR=daniel-ospina/tortoise
+[ "$Q_RC" -ne 0 ] && ok "an explicit OR cannot substitute for a remote it cannot be verified against" \
+                  || bad "start accepted an unverifiable explicit OR — $Q_OUT"
+
+# (6) A malformed OR is refused (a typo must not become a queue target no `gh --repo` can resolve).
+qsup start "$Q/tortoise-repo" "$Q/st-invalid" OR=tortoise
+[ "$Q_RC" -ne 0 ] && ok "start REFUSES an OR that is not <owner>/<repo>" \
+                  || bad "start accepted OR=tortoise — $Q_OUT"
+
+# (7) The parser covers the shapes a clone actually records: scp-like origin derives the same queue.
+git -C "$Q/tortoise-repo" remote set-url origin git@github.com:daniel-ospina/tortoise.git
+qsup start "$Q/tortoise-repo" "$Q/st-scp"
+[ "$Q_RC" -eq 0 ] && ok "a scp-style origin (git@host:owner/repo.git) derives the same queue" \
+                  || bad "start rejected a scp-style origin — $Q_OUT"
+git -C "$Q/tortoise-repo" remote set-url origin https://github.com/daniel-ospina/tortoise.git
+
+# (7b) The SCHEME is an allow-list, and a scp-like URL's pre-colon part must be a HOST. Both were
+# fail-OPEN holes a reviewer reproduced: `git clone file://localhost/<path>` RECORDS
+# `file://localhost/<owner>/<repo>` as origin, which passed every other check here and derived a queue
+# target from a LOCAL PATH; and a local path may carry both `@` and `:` (`/home/u@srv:o/r.git`), which
+# the scp-like branch read as host/repo. Deriving a host/repo pair that nothing said was one is exactly
+# the "invention, not a read" this gate exists to refuse. (Both arms redden on the pre-fix script:
+# with no derivation there is no refusal at all, so `start` returns 0.)
+git -C "$Q/tortoise-repo" remote set-url origin file://localhost/daniel-ospina/tortoise.git
+qsup start "$Q/tortoise-repo" "$Q/st-file-scheme"
+[ "$Q_RC" -ne 0 ] && ok "start REFUSES a file:// origin (a filesystem remote names no repo on a git host)" \
+                  || bad "start derived a queue from a file:// remote — a local path read as a host/repo pair: $Q_OUT"
+case "$Q_OUT" in
+  *"cannot derive the QUEUE"*) ok "the file:// refusal names the underivable queue" ;;
+  *) bad "the file:// refusal is not explained — $Q_OUT" ;;
+esac
+case "$Q_OUT" in
+  *"https://, http://, ssh://"*) ok "the underivable refusal lists the accepted scheme forms (an operator can act on it)" ;;
+  *) bad "the underivable refusal does not say which forms are accepted — $Q_OUT" ;;
+esac
+git -C "$Q/tortoise-repo" remote set-url origin /home/u@srv:daniel-ospina/tortoise.git
+qsup start "$Q/tortoise-repo" "$Q/st-local-path"
+[ "$Q_RC" -ne 0 ] && ok "start REFUSES a local path that carries both @ and : (it is not a host/repo pair)" \
+                  || bad "start read a local path as host/repo (scp-like branch) — $Q_OUT"
+# …while the accepted shapes still derive: an ssh:// URL with an explicit port, and an http:// URL.
+git -C "$Q/tortoise-repo" remote set-url origin ssh://git@github.com:22/daniel-ospina/tortoise.git
+qsup start "$Q/tortoise-repo" "$Q/st-ssh-port"
+[ "$Q_RC" -eq 0 ] && ok "an ssh:// origin with an explicit port derives the same queue" \
+                  || bad "start rejected ssh://git@github.com:22/… — $Q_OUT"
+git -C "$Q/tortoise-repo" remote set-url origin http://github.com/daniel-ospina/tortoise.git
+qsup start "$Q/tortoise-repo" "$Q/st-http"
+[ "$Q_RC" -eq 0 ] && ok "an http:// origin derives the same queue" \
+                  || bad "start rejected an http:// origin — $Q_OUT"
+git -C "$Q/tortoise-repo" remote set-url origin https://github.com/daniel-ospina/tortoise.git
+
+# (8) `check` refuses the same pair `start` refuses — a preflight that says YES where `start` dies is
+# a FALSE PASS on exactly the question its verdict answers.
+qsup check "$Q/agent-repo" "$Q/st-check" OR=daniel-ospina/tortoise
+[ "$Q_RC" -ne 0 ] && ok "check REFUSES the mismatch too (no green preflight for a cell that cannot start)" \
+                  || bad "check certified the mismatched pair — $Q_OUT"
+# ⛔ The reason must be the QUEUE gate, not some unrelated precondition: pre-fix `cmd_check` dies
+# earlier ("worker scripts missing from $O" in the §12 fixture), so a bare rc assertion also passed on
+# the PRE-FIX script and would stay green if `assert_queue_target` were deleted from cmd_check.
+# Name the refusal, so the arm proves the gate and reddens on the pre-fix script.
+case "$Q_OUT" in
+  *"DIFFERENT repos"*) ok "check's refusal IS the queue gate (both verbs assert the same pair)" ;;
+  *) bad "check refused for an UNRELATED reason, so the queue gate in cmd_check is unproven: $Q_OUT" ;;
+esac
+case "$Q_OUT" in
+  *"daniel-ospina/agent-infra"*) ok "check's refusal names the CHECKOUT's repo too" ;;
+  *) bad "check's refusal does not name the checkout's repo — $Q_OUT" ;;
+esac
+case "$Q_OUT" in
+  *"CELL CAN RUN A CONTROLLER"*) bad "check printed the CELL CAN RUN banner for a mismatched pair" ;;
+  *) ok "check: no CELL CAN RUN banner on a mismatched pair" ;;
+esac
+
+# (9) `status` answers "is this cell pointed at what it is standing in?" on ONE line, and REPORTS a
+# mismatch rather than refusing: it is the verb an operator runs to discover the pair is wrong.
+qsup status "$Q/tortoise-repo" "$Q/st-status-ok"
+[ "$Q_RC" -eq 0 ] && ok "status: a matched pair reports (rc=0)" \
+                  || bad "status returned $Q_RC for a matched pair — $Q_OUT"
+[ "$(printf '%s\n' "$Q_OUT" | grep -cF "queue: daniel-ospina/tortoise @ $Q/tortoise-repo")" = 1 ] \
+  && ok "status: prints the pair on ONE line (the repo the queue targets, next to the checkout path)" \
+  || bad "status does not print the queue/checkout pair on one line — $Q_OUT"
+case "$Q_OUT" in
+  *"[ok — derived from the checkout]"*) ok "status: names the pair as derived from the checkout" ;;
+  *) bad "status does not say the pair is matched — $Q_OUT" ;;
+esac
+qsup status "$Q/agent-repo" "$Q/st-status-bad" OR=daniel-ospina/tortoise
+[ "$Q_RC" -eq 0 ] && ok "status: a MISMATCH is reported, not refused (it must stay answerable)" \
+                  || bad "status exited $Q_RC on a mismatch — the operator loses the diagnostic"
+case "$Q_OUT" in
+  *"queue: daniel-ospina/tortoise @ $Q/agent-repo"*"MISMATCH"*) ok "status: the mismatch line carries both values and the verdict" ;;
+  *) bad "status's mismatch line does not name both sides — $Q_OUT" ;;
+esac
 
 echo
 echo "── Summary ───────────────────────────────────────────────────────"
