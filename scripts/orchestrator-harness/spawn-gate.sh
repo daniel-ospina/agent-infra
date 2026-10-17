@@ -1,28 +1,27 @@
 #!/usr/bin/env bash
 # spawn-gate.sh — the harness's load gate, and the ONE `pi` invocation of the ported callers.
 #
-# SOURCED (never executed) by the two worker launch paths this port routes through it: `lane.sh`
-# and `fix-one.sh` (`adopt-fix.sh` reaches it by calling fix-one.sh).
+# SOURCED (never executed) by the three worker launch paths this port routes through it: `lane.sh`,
+# `fix-one.sh` and `merge-one.sh` (`adopt-fix.sh` reaches it by calling fix-one.sh).
 #
 # ⛔ WHAT THIS FILE DOES NOT YET COVER — the header must not imply otherwise, because a comment
 # claiming a guard that does not exist reads exactly like one that does. On the current tree:
-#   * `merge-one.sh` still carries its OWN copy of `run_agent()` with NO gate. That is the
-#     `chain-<N>` first-review path for every own-lane PR — and the one path the controller
-#     deliberately stands down for, because the chain holds the claim — plus fix-one.sh's
-#     re-review. #1769 MERGED on 2026-10-16 without closing it; it is held by the still-open
-#     #1730 / #1812, so it is BLOCKED, not declined — and it is UNGATED today, which means the disk
-#     gate below does NOT reach it.
 #   * `orch-loop.sh` does NOT source this file: it defines its own `is_num`/`is_limit`/`can_spawn`
 #     and gates its four DECISION sites with them. Folding those into this file is a separate
 #     change with its own review.
 #   * `install.sh` renders MAX_LOAD into the plist; it does not source this file.
-#   ⇒ in THIS DIRECTORY the shipped `pi -p` invokers are exactly {merge-one.sh, spawn-gate.sh}, and
+#   ⇒ in THIS DIRECTORY the shipped `pi -p` invokers are exactly {spawn-gate.sh}, and
 #     while `scripts/` as a whole also contains {cloud-cell-bringup.sh, retired/refix.sh,
-#     retired/watch-one.sh}. spawn-gate.test.sh asserts BOTH sets as EQUALITIES — a fourth launch
+#     retired/watch-one.sh}. spawn-gate.test.sh asserts BOTH sets as EQUALITIES — a new launch
 #     path added tomorrow fails that suite loudly instead of drifting in ungated — because a
 #     directory-scoped census silently says nothing about the tree outside it. (cloud-cell-bringup.sh
 #     is a 120 s provider reachability probe, not a lane dispatch, and is NOT load-gated: a named,
 #     asserted residual.)
+#
+# ⛔ `merge-one.sh` WAS the last ungated caller and is no longer one: it sources this file and its
+# private `run_agent()` copy was deleted (ported 2026-10-16, tortoise #8589 + #8521). This block used
+# to name it as a standing residual; that claim became FALSE the moment the port landed, and
+# spawn-gate.test.sh's census (now `[spawn-gate.sh]`) contradicted this file's own header.
 #
 # Why this file exists (agent-infra#1720): the gate used to be a one-liner inside orch-loop.sh plus
 # a copy-pasted `run_agent()` in three workers, and only the controller's decision sites consulted

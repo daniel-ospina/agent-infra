@@ -17,6 +17,7 @@ ck() { # ck <name> <0|1>
   else printf '  \033[31mFAIL\033[0m  %s\n' "$1"; fail=$((fail+1)); fi
 }
 LOOP="$HERE/orch-loop.sh"; MERGE="$HERE/merge-one.sh"; INST="$HERE/install.sh"; REFRESH="$HERE/refresh-candidates.sh"
+GATE="$HERE/spawn-gate.sh"   # the ONE load gate and the ONE `pi` invocation (agent-infra#1720)
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 # A missing extraction must FAIL, not warn: if the shipped script lacks the code under test the
 # dependent checks would pass on an empty file — the exact vacuity this file was rewritten to fix.
@@ -294,7 +295,7 @@ fi
 
 # ── 4) the shipped claim block refuses a second owner ────────────────────────────
 # Extracted from merge-one.sh and executed, so this pins the real lock, not a copy of the idiom.
-sed -n '/^CLAIM="\$O\/state\/mergeclaim-\$PR.lock"/,/^trap .rm -f "\$CLAIM".*$/p' "$MERGE" > "$TMP/claim.sh"
+{ sed -n '/^review_cleanup() {/,/^}/p' "$MERGE"; sed -n '/^CLAIM="\$O\/state\/mergeclaim-\$PR.lock"/,/^trap .rm -f "\$CLAIM".*$/p' "$MERGE"; } > "$TMP/claim.sh"
 mkdir -p "$TMP/O/state"
 if need "$TMP/claim.sh" "the claim block is extracted from the shipped merge-one.sh"; then
 # The claim block logs to "$L.log", so assert on the log, not on stdout.
@@ -1141,14 +1142,23 @@ if need "$TMP/reapw.sh" "reap_stale_workers() and its file_mtime_epoch() helper 
   ck "the reaper resolves the pane pid with an exact target" $rc
   unset -f tmux kill
 fi
-# the agent invocation is wall-clock bounded, portably (macOS has no timeout/gtimeout)
-sed -n '/^run_agent() {/,/^}/p' "$MERGE" > "$TMP/runagent.sh"
-if need "$TMP/runagent.sh" "run_agent() is extracted from the shipped merge-one.sh"; then
+# the agent invocation is wall-clock bounded, portably (macOS has no timeout/gtimeout). It lives in
+# the shared helper since agent-infra#1720 (merge-one.sh hosts no private copy — spawn-gate.test.sh
+# asserts that); the gate itself is driven by the checks further down.
+sed -n '/^run_agent() {/,/^}/p' "$GATE" > "$TMP/runagent.sh"
+if need "$TMP/runagent.sh" "run_agent() is extracted from the shipped spawn-gate.sh"; then
   # NOTE: the heredoc must EXPAND $TMP (unquoted) while leaving the runtime substitutions for the
   # script itself. A quoted heredoc left the source path literal, so run_agent never got defined and
   # the check passed on "command not found" — the exact vacuity this file exists to prevent.
+  # `load1` is held at 0 so a genuinely loaded box cannot make this check pass for the wrong reason:
+  # it asserts the WATCHDOG, and a gate refusal would otherwise look like a kill. The real gate
+  # (sourced from $GATE) still runs — only its reading is controlled. `O` is pointed at a temp state
+  # dir so the helper's walltime.tsv write does not touch the operator's real $O.
   cat > "$TMP/ra.sh" <<SH
 pi() { sleep 60; }
+. "$GATE"
+load1() { echo 0; }
+O="$TMP/ra-o"; mkdir -p "\$O/state"
 . "$TMP/runagent.sh"
 start=\$(date +%s); run_agent 2 "$TMP/ra.log" /dev/null; rc=\$?; end=\$(date +%s)
 echo "\$((end-start)) \$rc"
@@ -2602,7 +2612,7 @@ if need "$TMP/lockblock.sh" "the lock+trap block is extracted from the shipped o
 
   # The same defect on merge-one.sh's per-PR claim (§5.1b): a TERM must not free the claim while
   # the worker keeps reviewing/merging, which let a second worker spawn for the same head.
-  sed -n '/^CLAIM="\$O\/state\/mergeclaim-\$PR.lock"/,/^trap .rm -f "\$CLAIM".*$/p' "$MERGE" > "$TMP/claimtrap.sh"
+  { sed -n '/^review_cleanup() {/,/^}/p' "$MERGE"; sed -n '/^CLAIM="\$O\/state\/mergeclaim-\$PR.lock"/,/^trap .rm -f "\$CLAIM".*$/p' "$MERGE"; } > "$TMP/claimtrap.sh"
   if need "$TMP/claimtrap.sh" "the claim+trap block is extracted from the shipped merge-one.sh"; then
     { echo 'set -u'; echo "O='$LK'"; echo 'PR=9191'; echo "L='$LK/claim'"; cat "$TMP/claimtrap.sh"; echo 'while :; do sleep 0.2; done'; } > "$LK/mdrive.sh"
     bash -n "$LK/mdrive.sh" && rc=0 || rc=1
@@ -3022,8 +3032,13 @@ done
 printf '#!/bin/bash\nprintf "%%s\\n" ".venv/bin/python" >> "%s"\nexit 0\n' "$NB/trip" > "$NB/repo/.venv/bin/python"
 chmod +x "$NB/repo/.venv/bin/python"
 # Extracts a script's FIRST prompt heredoc verbatim: the opening `cat > ... <<EOF`, the body, `EOF`.
+# The redirect is OPTIONAL (`cat (>.+)?<<EOF`): since the #8484 port, merge-one.sh's prompt lives in
+# `reviewer_prompt()` whose CALLER supplies the redirect (`reviewer_prompt > "$L-reviewer.txt"`), so
+# its heredoc opens with a bare `cat <<EOF`. Matching only the redirected form made this extractor
+# return an EMPTY snippet for merge-one.sh — which would have silently reduced the no-search check to
+# a skip, i.e. a guard that cannot fire while still reporting green.
 nb_extract() { # nb_extract <script> <out-file>
-  awk '/^cat > .*<<EOF$/{f=1; print; next} f&&/^EOF$/{print; exit} f{print}' "$1" > "$2"
+  awk '/^cat (>.+)?<<EOF$/{f=1; print; next} f&&/^EOF$/{print; exit} f{print}' "$1" > "$2"
 }
 nb_ticks_escaped() { # nb_ticks_escaped <script> -> 0 iff EVERY backtick in its heredoc is escaped
   nb_extract "$1" "$NB/snip.sh"
@@ -3039,7 +3054,11 @@ nb_expand() { # nb_expand <script>
   ( set +u; cd "$NB/repo"; PATH="$NB/bin:$PATH"
     O="$NB/o"; REPO="$NB/repo"; OR="owner/repo"; PR=7; BR="chore/x"; N=7; L="$NB/log"
     WT="$NB/repo/.worktrees/wt"; KIND=x; TAG=x
-    . "$NB/snip.sh" ) >/dev/null 2>&1
+    . "$NB/snip.sh" ) >"$NB/expand.out" 2>/dev/null
+  # A snippet whose `cat` carries its OWN redirect writes $NB/log-reviewer.txt itself (lane.sh and
+  # fix-one.sh do). merge-one.sh's does NOT — its redirect is on the caller — so the expansion lands
+  # on STDOUT; capture it as the same artifact rather than greping a file the snippet never wrote.
+  [ -s "$NB/log-reviewer.txt" ] || cp "$NB/expand.out" "$NB/log-reviewer.txt" 2>/dev/null
 }
 if nb_expand "$MERGE"; then
   { grep -qF 'NEVER run' "$NB/log-reviewer.txt" && grep -qF '`UNVERIFIED`' "$NB/log-reviewer.txt" \
@@ -3094,6 +3113,200 @@ ck "non-vacuity: the tripwire FIRES on a bare \`git\` span (the class that passe
 sed 's/\\`-maxdepth\\`/`-maxdepth`/' "$MERGE" > "$NB/mut-merge.sh"
 nb_ticks_escaped "$NB/mut-merge.sh" && rc=1 || rc=0
 ck "non-vacuity: the name-blind check FIRES on a bare \`-maxdepth\` that no stub can intercept" $rc
+
+# ── 22) the reviewer is CONTAINED in its own checkout, and a ref move is LOUD (#8484) ─────────
+# PORTED from tortoise `operations/orchestrator-harness/selftest.sh` §21 (10563490a, #8484 / PR
+# #8589). The verdict-dispatch and prompt halves are adapted from tortoise's
+# `tests/test_orchestrator_harness.py` (#8612/#8602) — agent-infra has no pytest harness for this
+# directory, which `port-provenance.txt` records as a residual.
+#
+# #8484: the fresh-context reviewer was run with cwd = the SHARED checkout, with the main-edits
+# hatch OPEN and VGATE skipped, so "do not touch the main checkout" was a prompt aimed at a model
+# with shell access. A reviewer that mutated the tree it was reading, committed, merged origin/main
+# and PUSHED — unprompted — is the observed failure. These checks read the SHIPPED script and DRIVE
+# the SHIPPED helpers against a real throwaway repo, so they are RED on the pre-fix copy rather
+# than re-implementing the fix here.
+rc=0
+grep -qE '^export [^#]*AGENT_ALLOW_MAIN_EDITS' "$MERGE" && rc=1 || rc=0
+ck "merge-one.sh does NOT open the main-edits hatch for its reviewer" $rc
+grep -q 'cd "\$SANDBOX"' "$MERGE" && rc=0 || rc=1
+ck "the reviewer's cwd is the sandbox (cd \"\$SANDBOX\")" $rc
+grep -qE '^ *cd \$REPO && git fetch' "$MERGE" && rc=1 || rc=0
+ck "the reviewer prompt no longer sends the reviewer into the shared checkout" $rc
+# A bare `git worktree prune` in the EXIT trap is the banned shape (agent-infra
+# docs/ops/load-policy.md:491): it deregisters EVERY record whose directory is not stat-able at that
+# instant, so it can orphan an unrelated sibling lane's checkout. Match CODE only — the comments
+# above legitimately name it.
+grep -vE '^[[:space:]]*#' "$MERGE" | grep -q 'worktree prune' && rc=1 || rc=0
+ck "merge-one.sh runs NO repo-wide 'git worktree prune' (targeted deregistration instead)" $rc
+grep -q 'drop_sandbox_record' "$MERGE" && rc=0 || rc=1
+ck "merge-one.sh deregisters its sandbox's OWN worktree record by name" $rc
+grep -q 'refs/pull/\$PR/head' "$MERGE" && rc=0 || rc=1
+ck "merge-one.sh fetches the PR head ref (a fork PR's head is not on origin)" $rc
+
+sed -n '/^sandbox_record() {/,/^}/p;/^drop_sandbox_record() {/,/^}/p;/^review_sandbox() {/,/^}/p;/^review_cleanup() {/,/^}/p;/^ref_shas() {/,/^}/p;/^mover_of() {/,/^}/p;/^verdict_kind() {/,/^}/p;/^apply_verdict_marker() {/,/^}/p' "$MERGE" > "$TMP/rfuncs.sh"
+if need "$TMP/rfuncs.sh" "the review-sandbox helpers are extracted from the shipped merge-one.sh"; then
+  SB="$TMP/src"; mkdir -p "$SB"
+  git -C "$SB" init -q
+  git -C "$SB" config user.email sb@test; git -C "$SB" config user.name sb
+  echo one > "$SB/f"; git -C "$SB" add f; git -C "$SB" -c commit.gpgsign=false commit -qm one
+  git -C "$SB" branch -q feat/x
+  SHA="$(git -C "$SB" rev-parse refs/heads/feat/x)"
+  OUT="$TMP/out"
+  {
+    echo 'set -u'
+    echo "O='$OUT'"; echo "REPO='$SB'"; echo 'PR=9191'
+    cat "$TMP/rfuncs.sh"
+    echo 'SANDBOX="$(review_sandbox '"$SHA"')"; echo "SANDBOX=$SANDBOX"'
+    echo '[ -n "$SANDBOX" ] || exit 1'
+    echo 'cd "$SANDBOX" || exit 1'
+    echo 'echo "DETACHED=$(git rev-parse --abbrev-ref HEAD)"'
+    echo 'echo mutant > f'
+    echo 'git add f && git -c commit.gpgsign=false commit -qm mutant'
+    echo 'echo "SRC_TIP=$(git -C "$REPO" rev-parse refs/heads/feat/x)"'
+    echo 'echo "SRC_FILE=$(cat "$REPO/f")"'
+    echo 'echo "PRE=$(ref_shas feat/x)"'
+    echo 'echo two > "$REPO/g"; git -C "$REPO" add g; git -C "$REPO" -c commit.gpgsign=false commit -qm two'
+    echo 'git -C "$REPO" update-ref refs/heads/feat/x HEAD'
+    echo 'echo "POST=$(ref_shas feat/x)"'
+    echo 'review_cleanup'
+    echo 'echo "GONE=$([ -d "$SANDBOX" ] && echo no || echo yes)"'
+  } > "$TMP/sbdrive.sh"
+  bash -n "$TMP/sbdrive.sh" && rc=0 || rc=1
+  ck "the review-sandbox driver parses" $rc
+  sbout="$(bash "$TMP/sbdrive.sh" 2>&1)"
+  sbp="$(printf '%s' "$sbout" | grep -a '^SANDBOX=' | cut -d= -f2-)"
+  case "$sbp" in "" | "$SB"/*) rc=1;; *) rc=0;; esac
+  ck "the reviewer's checkout is created OUTSIDE the reviewed repo" $rc
+  case "$sbout" in *'DETACHED=HEAD'*) rc=0;; *) rc=1;; esac
+  ck "the reviewer's checkout is DETACHED — a commit there cannot move a branch" $rc
+  case "$sbout" in *"SRC_TIP=$SHA"*) rc=0;; *) rc=1; echo "      got: $(printf '%s' "$sbout" | grep -a SRC_TIP)";; esac
+  ck "a commit made in the sandbox does NOT move the reviewed branch" $rc
+  case "$sbout" in *'SRC_FILE=one'*) rc=0;; *) rc=1;; esac
+  ck "a mutation written in the sandbox does NOT reach the reviewed tree" $rc
+  sbpre="$(printf '%s' "$sbout" | grep -a '^PRE=' | cut -d= -f2-)"
+  sbpost="$(printf '%s' "$sbout" | grep -a '^POST=' | cut -d= -f2-)"
+  [ -n "$sbpre" ] && [ "$sbpre" != "$sbpost" ] && rc=0 || { rc=1; echo "      pre='$sbpre' post='$sbpost'"; }
+  ck "ref_shas reports an unrequested ref move (the detector is not vacuous)" $rc
+  case "$sbout" in *'GONE=yes'*) rc=0;; *) rc=1;; esac
+  ck "review_cleanup removes the reviewer's checkout (no mutant is left behind)" $rc
+  [ "$(git -C "$SB" worktree list 2>/dev/null | wc -l | tr -d ' ')" = "1" ] && rc=0 || rc=1
+  ck "review_cleanup leaves no worktree admin entry in the reviewed repo" $rc
+
+  # ── a RECORD WHOSE TREE IS GONE must not brick this head forever (#8589 review) ──
+  # Drive the SHIPPED review_sandbox through the exact state its own comment anticipates: a damaged
+  # tree makes `worktree remove` refuse, the `rm -rf` fallback removes the directory, and the
+  # registration survives. Without the targeted drop the second call gets
+  # "fatal: '<dir>' is a missing but already registered worktree" and prints nothing — merge-one.sh
+  # then exits 6, which writes no needsfix marker, so the head is re-dispatched forever and can
+  # never be reviewed. This is ALSO the witness for drop_sandbox_record's basename alternative: an
+  # `$O` spelled differently from the path git records (macOS /var -> /private/var) only recovers
+  # when that alternative matches.
+  S2O="$TMP/out2"
+  {
+    echo 'set -u'
+    echo "O='$S2O'"; echo "REPO='$SB'"; echo 'PR=9192'
+    cat "$TMP/rfuncs.sh"
+    echo 'A="$(review_sandbox '"$SHA"')"'
+    echo '[ -n "$A" ] || { echo FIRST_FAILED; exit 1; }'
+    echo 'rm -f "$A/.git"'          # damaged in place: remove refuses, the directory is still there
+    echo 'B="$(review_sandbox '"$SHA"')"'
+    echo 'echo "B=$B"'
+    echo '[ -n "$B" ] || { echo SECOND_FAILED; exit 1; }'
+    echo 'echo "BDET=$(git -C "$B" rev-parse --abbrev-ref HEAD)"'
+    echo 'rm -rf "$B"'              # the directory is simply gone; the record is not
+    echo 'C="$(review_sandbox '"$SHA"')"'
+    echo 'echo "C=$C"'
+    echo '[ -n "$C" ] || { echo THIRD_FAILED; exit 1; }'
+    echo 'SANDBOX="$C"; review_cleanup'
+    echo 'echo "CGONE=$([ -d "$C" ] && echo no || echo yes)"'
+    echo 'echo "CRECORDS=$(git -C "$REPO" worktree list | wc -l | tr -d " ")"'
+  } > "$TMP/sbdrive2.sh"
+  bash -n "$TMP/sbdrive2.sh" && rc=0 || rc=1
+  ck "the dangling-record recovery driver parses" $rc
+  sbout2="$(bash "$TMP/sbdrive2.sh" 2>&1)"
+  case "$sbout2" in *SECOND_FAILED*|*THIRD_FAILED*) rc=1; echo "      $(printf '%s' "$sbout2" | tr '\n' ' ')";; *) rc=0;; esac
+  ck "review_sandbox recovers from a registration whose tree is gone (the head is not bricked)" $rc
+  case "$sbout2" in *'BDET=HEAD'*) rc=0;; *) rc=1;; esac
+  ck "the recovered sandbox is a real detached checkout, not a reused tree" $rc
+  case "$sbout2" in *'CGONE=yes'*'CRECORDS=1'*) rc=0;; *) rc=1; echo "      got: $(printf '%s' "$sbout2" | grep -aE 'CGONE|CRECORDS' | tr '\n' ' ')";; esac
+  ck "the recovered sandbox is cleaned up with its record (nothing left behind)" $rc
+
+  # ── the cleanup is TARGETED: a sibling lane's record survives even when its directory is not
+  # stat-able — exactly the harm of the banned repo-wide prune, which deregisters every such record.
+  SIB="$TMP/sibling"; rm -rf "$SIB"
+  git -C "$SB" worktree add --detach "$SIB" "$SHA" >/dev/null 2>&1
+  rm -rf "$SIB"   # unmounted volume / permission blip: the directory is not stat-able
+  {
+    echo 'set -u'
+    echo "O='$TMP/out3'"; echo "REPO='$SB'"; echo 'PR=9193'
+    cat "$TMP/rfuncs.sh"
+    echo 'S="$(review_sandbox '"$SHA"')"'
+    echo '[ -n "$S" ] || exit 1'
+    echo 'SANDBOX="$S"; review_cleanup'
+  } > "$TMP/sbtarget.sh"
+  bash "$TMP/sbtarget.sh" >/dev/null 2>&1
+  [ -d "$SB/.git/worktrees/sibling" ] && rc=0 || { rc=1; echo "      a sibling record was deregistered"; }
+  ck "review_cleanup leaves a sibling worktree record alone (no repo-wide prune)" $rc
+  rm -rf "$TMP/sibling"
+
+  # ── the mover the ref-move detector names is the field that ACTUALLY moved (#8589 review) ──
+  # A reviewer that pushes moves `refs/remotes/origin/<br>` but NOT `refs/heads/<br>`; the old
+  # local-first pick therefore logged the UNCHANGED, already-reviewed head.
+  got="$(bash -c ". '$TMP/rfuncs.sh'; mover_of 'aaa bbb' 'aaa ccc' feat/x")"
+  [ "$got" = "refs/remotes/origin/feat/x ccc" ] && rc=0 || { rc=1; echo "      got '$got'"; }
+  ck "a remote-only move is attributed to the NEW remote tip, not the unchanged local tip" $rc
+  got="$(bash -c ". '$TMP/rfuncs.sh'; mover_of 'aaa bbb' 'ddd bbb' feat/x")"
+  [ "$got" = "refs/heads/feat/x ddd" ] && rc=0 || { rc=1; echo "      got '$got'"; }
+  ck "a local move is attributed to the new local tip" $rc
+
+  # ── 21e) a verdict-LESS run must authorise NO fixer (#8612 / agent-infra#1741) ──
+  # The pre-fix copy shared ONE `*)` arm with a real `ISSUES` verdict, so a pure stall wrote
+  # `needsfix-<PR>-<head>` — the ONLY thing that authorises a fixer — spent a MAX_FIX_TRIES attempt
+  # and could park the PR with the reviewer's findings never addressed.
+  VO="$TMP/vdispatch"; mkdir -p "$VO/state"
+  {
+    echo 'set -u'
+    echo "O='$VO'"
+    echo 'PR=55'
+    cat "$TMP/rfuncs.sh"
+    echo 'printf "K_none=%s\n" "$(verdict_kind "")"'
+    echo 'printf "K_issues=%s\n" "$(verdict_kind "ISSUES 3")"'
+    echo 'printf "K_clean=%s\n" "$(verdict_kind "CLEAN https://x/1")"'
+    echo 'apply_verdict_marker none HD >/dev/null'
+    echo 'printf "M_none=%s\n" "$([ -e "'"$VO"'/state/needsfix-55-HD" ] && echo yes || echo no)"'
+    echo 'apply_verdict_marker issues HD >/dev/null'
+    echo 'printf "M_issues=%s\n" "$([ -e "'"$VO"'/state/needsfix-55-HD" ] && echo yes || echo no)"'
+  } > "$TMP/vdrive.sh"
+  bash -n "$TMP/vdrive.sh" && rc=0 || rc=1
+  ck "the verdict-dispatch driver parses" $rc
+  vout="$(bash "$TMP/vdrive.sh" 2>&1)"
+  case "$vout" in *'K_none=none'*'K_issues=issues'*'K_clean=clean'*'M_none=no'*'M_issues=yes'*) rc=0;;
+    *) rc=1; echo "      got: $(printf '%s' "$vout" | tr '\n' ' ')";; esac
+  ck "verdict_kind splits clean/issues/none and ONLY a real ISSUES verdict writes a needsfix marker" $rc
+  grep -qF 'case "$(verdict_kind "$LAST")" in' "$MERGE" && rc=0 || rc=1
+  ck "the shipped dispatch classifies through verdict_kind (not an inline case)" $rc
+  grep -qF 'apply_verdict_marker issues "$HEAD"' "$MERGE" && rc=0 || rc=1
+  ck "a real ISSUES verdict authorises a fixer via apply_verdict_marker" $rc
+  grep -qF 'NOT CLEAN or reviewer failed' "$MERGE" && rc=1 || rc=0
+  ck "the pre-#8612 arm that ran a stall and an ISSUES verdict through ONE branch is gone" $rc
+
+  # ── 21f) the reviewer prompt must forbid the venv hunt (#8602) ──
+  # A disposable sandbox has no .venv; the pre-fix prompt told the reviewer to `uv sync` one, so it
+  # searched the filesystem and 35% of reviewer runs ended at the 1800s cap with NO verdict.
+  sed -n '/^reviewer_prompt() {/,/^}/p' "$MERGE" > "$TMP/rprompt.sh"
+  if need "$TMP/rprompt.sh" "reviewer_prompt() is extracted from the shipped merge-one.sh"; then
+    rp="$(OR=acme/widget PR=7 BR=feat/x REPO=/tmp/repo bash -c "set -u; . '$TMP/rprompt.sh'; reviewer_prompt" 2>&1)"
+    case "$rp" in *'DO NOT RUN THE TEST SUITE'*) rc=0;; *) rc=1;; esac
+    ck "the shipped reviewer prompt forbids provisioning/executing tests in the sandbox" $rc
+    case "$rp" in *'DETACHED'*) rc=0;; *) rc=1;; esac
+    ck "the shipped reviewer prompt tells the reviewer its checkout is detached" $rc
+    case "$rp" in *'refused, not merely discouraged'*) rc=0;; *) rc=1;; esac
+    ck "the shipped reviewer prompt says the shared-checkout write is REFUSED" $rc
+    case "$rp" in *'TORTOISE_TEST_CARVE_OUT'*) rc=1;; *) rc=0;; esac
+    ck "the venv-hunt instruction is gone from the shipped prompt (#8602)" $rc
+  fi
+fi
 
 echo
 # ── platform-gate self-check (NON-VACUITY) ──────────────────────────────────────
