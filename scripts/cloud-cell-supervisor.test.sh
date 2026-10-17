@@ -321,8 +321,9 @@ cat > "$W/harness/merge-one.sh" <<EOF
 #!/bin/bash
 k="\${AI_REVIEW_GATE_KEY:-}"
 if [ -z "\$k" ] && [ -f "\$HOME/.pi/agent/.ai-review-gate-key" ]; then k="\$(cat "\$HOME/.pi/agent/.ai-review-gate-key")"; fi
-printf '%s' "\$k" | tr -d '[:space:]' > '$W/worker-key'
+printf '%s' "\${DEEPSEEK_API_KEY:-}" > '$W/worker-prov'
 printf 'HOME=%s\\nO=%s\\n' "\${HOME:-}" "\${O:-}" > '$W/worker-env'
+printf '%s' "\$k" | tr -d '[:space:]' > '$W/worker-key'
 EOF
 chmod +x "$W/harness/orch-loop.sh" "$W/harness/merge-one.sh"
 # ⛔ COMMIT the fixture harness. The provenance gate now REFUSES a dirty harness tree (§9's dirty
@@ -369,7 +370,7 @@ case "$sub" in
     exit 0 ;;
   new-session)
     if no_server; then
-      for v in PATH HOME O AI_REVIEW_GATE_KEY AI1711_STATE; do
+      for v in PATH HOME O AI_REVIEW_GATE_KEY DEEPSEEK_API_KEY AI1711_STATE; do
         declare -p "$v" 2>/dev/null || printf 'unset %s\n' "$v"
       done > "$S/server-env"
       # Seed a representative slice of tmux's own compiled-in default list, so the suite can tell an
@@ -411,9 +412,9 @@ else
   echo "  ⏭ SKIP: no tmux on this host — §7 asserts against the double only"
 fi
 
-K_ENV="KEY-ENV-$$"; K_FILE="KEY-FILE-$$"; K_AMB="KEY-AMBIENT-$$"
-printf 'AI_REVIEW_GATE_KEY=%s\n' "$K_ENV" > "$W/keys-env.env"
-printf '# deliberately carries no key\n' > "$W/keys-file.env"
+K_ENV="KEY-ENV-$$"; K_FILE="KEY-FILE-$$"; K_AMB="KEY-AMBIENT-$$"; K_PROV="KEY-PROV-$$"
+printf 'AI_REVIEW_GATE_KEY=%s\nDEEPSEEK_API_KEY=%s\n' "$K_ENV" "$K_PROV" > "$W/keys-env.env"
+printf '# deliberately carries no merge key\nDEEPSEEK_API_KEY=%s\n' "$K_PROV" > "$W/keys-file.env"
 printf '%s\n' "$K_FILE" > "$W/cellhome/.pi/agent/.ai-review-gate-key"
 
 # wk_case <kind:stub|real> <route:env|file|amb> <server:pre|cold>
@@ -430,7 +431,7 @@ wk_case() {
   local kind="$1" route="$2" server="$3" bin st="" sock="" envf sess rc=0 i got want tag amb=""
   tag="$kind/$route/$server"
   bin="$W/$([ "$kind" = real ] && echo realbin || echo stub)"
-  rm -f "$W/worker-key" "$W/worker-env"
+  rm -f "$W/worker-key" "$W/worker-env" "$W/worker-prov"
   if [ "$kind" = real ]; then
     sock="ai1711-$$-$route-$server"; AI1711_SOCKS="$AI1711_SOCKS $sock"
     if [ "$server" = pre ]; then
@@ -479,6 +480,16 @@ wk_case() {
   grep -q "^O=$W/o$" "$W/worker-env" 2>/dev/null \
     && ok "$tag: the worker's \$O is the controller's (no split state dir)" \
     || bad "$tag: worker \$O was not $W/o — $(tr '\n' ' ' < "$W/worker-env" 2>/dev/null)"
+  # agent-infra#1852: the provider runtime credential is the second half of the same delivery. A cell
+  # whose WORKER_ENV_NAMES omits DEEPSEEK_API_KEY still MERGES (the rail needs no agent) while EVERY
+  # review and fixer dies `No API key found for deepseek`, so merge-<PR> ends verdict:<none> forever
+  # and the cell reports RUNNING. ⛔ This is the assertion a reverted WORKER_ENV_NAMES reddens on the
+  # pre-existing-server arms: the operator's server holds no provider value, so only publication can
+  # carry it across the second tmux boundary.
+  gotp="$(cat "$W/worker-prov" 2>/dev/null || true)"
+  [ "$gotp" = "$K_PROV" ] \
+    && ok "$tag: the WORKER received DEEPSEEK_API_KEY (the runtime credential)" \
+    || bad "$tag: the worker's DEEPSEEK_API_KEY was '${gotp:-<none>}' (want $K_PROV) — a dropped provider name leaves every review/fixer dead 'No API key found for deepseek' while the cell reports RUNNING"
   # The NAMES are published (the mechanism) — but ONLY when there was a server to publish into. A
   # cold start must not lose the option, and must not die trying: the server it creates inherits the
   # same names from this shell (the delivery assertion above is what proves that).
@@ -506,14 +517,16 @@ wk_case() {
   # the operator-visible output everywhere — labelled separately, because the real half inspects no
   # argv and must not print a claim about one.
   if [ "$kind" = stub ]; then
-    if grep -qF "$K_ENV" "$st/argv" 2>/dev/null || grep -qF "$K_AMB" "$st/argv" 2>/dev/null; then
+    if grep -qF "$K_ENV" "$st/argv" 2>/dev/null || grep -qF "$K_AMB" "$st/argv" 2>/dev/null \
+       || grep -qF "$K_PROV" "$st/argv" 2>/dev/null; then
       bad "$tag: the secret VALUE reached a tmux argv"
     else
       ok "$tag: the secret VALUE is on no tmux argv (every call the double saw)"
     fi
   fi
   if grep -qF "$K_ENV" "$W/start.$kind.$route.$server.out" 2>/dev/null \
-     || grep -qF "$K_AMB" "$W/start.$kind.$route.$server.out" 2>/dev/null; then
+     || grep -qF "$K_AMB" "$W/start.$kind.$route.$server.out" 2>/dev/null \
+     || grep -qF "$K_PROV" "$W/start.$kind.$route.$server.out" 2>/dev/null; then
     bad "$tag: the secret VALUE reached operator-visible output"
   else
     ok "$tag: the secret VALUE is not in the operator-visible output"
@@ -1382,6 +1395,124 @@ esac
 cellcheck 0
 [ "$CC_RC" -eq 0 ] && ok "check: passes again once repo-authority.sh is present" \
                    || bad "check: still refuses with the worker restored (rc=$CC_RC)"
+
+# ── 12) PIN-DIR CONFORMANCE and the worker PROVIDER KEY (agent-infra#1852) ────────────────────────
+# Two measured false PASSes of the same shape: a green verdict over a cell that cannot work.
+#
+# (i) PIN DIR. Three cells had been seeded by a revision that named pin directories with an
+# 8-character short sha. The guard required EXACTLY 12, so ONE such directory made `apply` AND `start`
+# both refuse ("Remove it by hand if you are sure it holds nothing") while `check` printed every ok
+# line and "CELL CAN RUN A CONTROLLER" — zero capacity behind a green verdict. `pin_name_ok` now
+# accepts any unambiguous git abbreviation (7..40 hex chars) and `check` asks the conformance question
+# itself, so it can no longer certify a cell its own sibling verbs refuse.
+#
+# (ii) PROVIDER KEY is pinned by §7's extended update-environment model (DEEPSEEK_API_KEY).
+#
+# The fixture below is self-contained so the arms do not depend on the accumulated state of §9's
+# `$P` (whose pin root already holds other revisions' entries).
+say_case "pin-dir conformance: check refuses a non-pin entry and accepts an 8-hex pin (#1852)"
+Q="$T/pincheck"; mkdir -p "$Q/home/.pi/agent/scripts/lib" "$Q/o" "$Q/bin" "$Q/pin"
+ai_init_repo "$Q/repo"
+ai_worktree "$Q/harness"
+QH="$Q/harness/scripts/orchestrator-harness"
+# Mirror the shipped required-worker set in $O — a fixture missing one dies in cmd_check before the
+# pin question is reached, which would make the PASS arm prove the wrong thing.
+for f in orch-loop.sh claims.sh repo-authority.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh; do
+  : > "$Q/o/$f"
+done
+printf '#!/bin/bash\nexit 0\n' > "$Q/bin/gh"; chmod +x "$Q/bin/gh"
+# `check` only READS tmux: has-session false (no controller), everything else a no-op.
+cat > "$Q/bin/tmux" <<'SH'
+#!/bin/bash
+case "${1:-}" in has-session) exit 1 ;; *) exit 0 ;; esac
+SH
+chmod +x "$Q/bin/tmux"
+# The record step ($CELL_HOME) and its declared sibling must BOTH be present, or cmd_check refuses
+# on the recorder before it reaches the pin arm (#1717).
+printf '#!/bin/bash\nexit 0\n' > "$Q/home/.pi/agent/scripts/record-review.sh"
+chmod +x "$Q/home/.pi/agent/scripts/record-review.sh"
+printf '#!/usr/bin/env python3\n' > "$Q/home/.pi/agent/scripts/lib/diff-normalize.py"
+printf '#!/bin/bash\nexit 0\n' > "$Q/record-review.sh"; chmod +x "$Q/record-review.sh"
+mkdir -p "$Q/lib"; printf '#!/usr/bin/env python3\n' > "$Q/lib/diff-normalize.py"
+# GAPS ONLY (see stub_missing): git/python3 stay REAL — the provenance gate reads their output.
+stub_missing "$Q/bin" pi
+# The harness worktree comes STRAIGHT from `ai_worktree` (clean, at origin/main), so pin HARNESS_REF
+# to its own commit: a fixture that edited the tree without committing would redden as DIRTY, not as
+# the pin state under test.
+QREF="$(git -C "$Q/harness" rev-parse HEAD)"
+QQ_OUT=''; QQ_RC=0
+qcheck() {
+  QQ_OUT="$(PATH="$Q/bin:$PATH" CELL_HOME="$Q/home" ENV_FILE="$Q/keys.env" SESSION="ai1852-$$" \
+            O="$Q/o" REPO="$Q/repo" HARNESS="$QH" HARNESS_REPO="$AI" HARNESS_FETCH=0 HARNESS_REF="$QREF" \
+            HARNESS_PIN_DIR="$Q/pin" HARNESS_PIN_FILE="$Q/home/.harness-path" bash "$SUP" check 2>&1)"
+  QQ_RC=$?
+}
+
+# (i-a) `pin_name_ok` BOUNDARIES, called on the SHIPPED function — not a re-implementation. Sourcing
+# with the `status` verb runs the dispatcher harmlessly (nothing is started or written; the tmux stub
+# only answers has-session) and defines every function. ENV_FILE points at a nonexistent path, so no
+# operator file is sourced. ⛔ Mutation caught: narrowing pin_name_ok back to exactly 12 reddens the
+# 8-hex accept arm; deleting the function reddens the existence check below.
+pinunit() { # $1 = candidate name; exits 99 if the shipped predicate is absent
+  local n="$1"
+  (
+    set -- status
+    export CELL_HOME="$Q/pinunit/home" ENV_FILE="$Q/pinunit/none.env" O="$Q/pinunit/o" \
+           REPO="$Q/pinunit/repo" HARNESS_PIN_DIR="$Q/pinunit/pin" HARNESS_PIN_FILE="$Q/pinunit/hp"
+    . "$SUP" >/dev/null 2>&1
+    type -t pin_name_ok >/dev/null 2>&1 || exit 99
+    pin_name_ok "$n"
+  )
+}
+pinunit 8ffc2bc3; PU_RC=$?
+[ "$PU_RC" != 99 ] && ok "pin_name_ok is defined by the shipped script (the unit arm can run)" \
+                   || bad "pin_name_ok is NOT defined by $SUP — the unit arm cannot test it"
+if [ "$PU_RC" != 99 ]; then
+  for n in 8ffc2bc3 1ef8abb5d181 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; do
+    pinunit "$n" && ok "pin_name_ok ACCEPTS '$n' (a valid 7..40-hex git abbreviation)" \
+                 || bad "pin_name_ok refused '$n' — an 8-hex pin is the exact case that bricked three cells"
+  done
+  for n in 8ffc2b aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa notes aa_bbbb aa-bbbb ''; do
+    pinunit "$n" && bad "pin_name_ok ACCEPTED '$n' — an operator's non-pin entry would be blessed" \
+                 || ok "pin_name_ok REFUSES '$n'"
+  done
+else
+  bad "pin_name_ok boundary arms SKIPPED — the predicate is absent"
+fi
+
+# (i-b) `check` must REFUSE a pin root holding a non-conforming entry. Before the fix, `check` asked
+# every OTHER question while `apply`/`start` died on this one — the false pass. ⛔ Mutation caught:
+# removing the cmd_check_pin_dir call reddens this arm (check would certify a cell whose apply/start
+# both refuse).
+mkdir -p "$Q/pin/notes"
+qcheck
+[ "$QQ_RC" -ne 0 ] && ok "check REFUSES a pin root holding 'notes' (the non-conforming entry)" \
+                   || bad "check CERTIFIED a cell whose apply/start refuse — the false pass is back: $QQ_OUT"
+case "$QQ_OUT" in
+  *"holds 'notes'"*) ok "check: names the offending entry ('notes'), not just 'pin'" ;;
+  *) bad "check: the refusal does not name the offending entry — $QQ_OUT" ;;
+esac
+case "$QQ_OUT" in
+  *"'apply' AND 'start' both refuse"*) ok "check: says apply/start also refuse here (the shared verdict)" ;;
+  *) bad "check: the refusal does not mention apply/start refusing too — $QQ_OUT" ;;
+esac
+case "$QQ_OUT" in
+  *"CELL CAN RUN"*) bad "check: printed the CELL CAN RUN banner despite the non-pin entry" ;;
+  *) ok "check: no CELL CAN RUN banner on the non-conforming pin root" ;;
+esac
+
+# (i-c) THE POSITIVE ARM — the exact measured case. An 8-hex pin directory must NOT refuse, and check
+# must reach the banner. With the old exactly-12 guard this either refused (once check asked) or was
+# never asked (the bug); both directions are pinned by (i-b)+(i-c).
+rm -rf "$Q/pin/notes"
+mkdir -p "$Q/pin/8ffc2bc3"
+qcheck
+[ "$QQ_RC" -eq 0 ] && ok "check PASSES with an 8-hex pin dir in the root (the measured bricking case)" \
+                   || bad "check FALSE-BLOCKED an 8-hex pin dir — the fix regressed: $QQ_OUT"
+case "$QQ_OUT" in
+  *"CELL CAN RUN A CONTROLLER"*) ok "check: reaches the CELL CAN RUN banner with an 8-hex pin" ;;
+  *) bad "check: no CELL CAN RUN banner with an 8-hex pin — $QQ_OUT" ;;
+esac
 
 echo
 echo "── Summary ───────────────────────────────────────────────────────"

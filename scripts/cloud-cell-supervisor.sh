@@ -139,7 +139,15 @@ OR="${OR:-daniel-ospina/tortoise}"
 #   O                  — the worker's log/state dir. A worker defaulting `$HOME/orchestrator` splits
 #                        the per-PR claim file from the controller's, which is how one head gets two
 #                        concurrent reviewers
-WORKER_ENV_NAMES="AI_REVIEW_GATE_KEY HOME O"
+#   DEEPSEEK_API_KEY   — the WORKER RUNTIME's credential (agent-infra#1852). Measured 2026-10-16 on
+#                        all three cells: without this name a cell still MERGES (the rail needs no
+#                        agent) while EVERY review and fixer dies `No API key found for deepseek`, so
+#                        `merge-<PR>` ends `verdict: <none>` forever. That cell reports RUNNING,
+#                        burns its whole dispatch capacity, and can never review, fix or dispatch —
+#                        the same false "CELL CAN RUN A CONTROLLER" this script already guards for a
+#                        stale `$O`. The controller sources keys.env, so its env carries the value
+#                        and a worker it creates can inherit it; nothing is written to a file.
+WORKER_ENV_NAMES="AI_REVIEW_GATE_KEY HOME O DEEPSEEK_API_KEY"
 
 say() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*"; }
 die() { say "FATAL: $*" >&2; exit 1; }
@@ -498,6 +506,40 @@ linked_worktree_of() {
 # `rm -rf` over the cell home — keys.env, the gate key, the orchestrator state dir. Require a POSITIVE
 # allow instead: never an ancestor of anything this cell needs, and if it exists it must be a linked
 # worktree of $HARNESS_REPO, an empty directory, or a pin ROOT holding only 12-hex-char pin dirs.
+# Is $1 a name `apply` could have produced for a pin directory? `apply` truncates the commit to 12
+# hex (the `cut -c1-12` below), but that is a MOVING CONVENTION, not a property of a commit id: git's
+# own abbreviation length varies with repo size, and a revision of this script that used
+# `git rev-parse --short` produced 8-character names. Measured 2026-10-16: three cells had been seeded
+# by such a revision, and ONE 8-character directory made `apply` AND `start` both refuse ("Remove it
+# by hand") while `check` still certified the cell — zero capacity behind a green verdict. So accept
+# any unambiguous git abbreviation (7..40 hex chars) and leave the INTENT — "only pin directories" —
+# intact: an operator's `notes/` or `backup-2026/` is still refused, because it is not hex.
+pin_name_ok() {
+  local n="${1:-}"
+  case "$n" in
+    ???????*) ;;                   # at least 7 characters — git's minimum abbreviation
+    *) return 1 ;;
+  esac
+  case "$n" in *[!0-9a-f]*) return 1 ;; esac   # hex only
+  [ "${#n}" -le 40 ] || return 1               # at most a full sha
+  return 0
+}
+
+# The pin-root CONFORMANCE question, split out from the `rm -rf` safety question below so `check` can
+# ask it without borrowing a message about deleting a directory it never deletes.
+cmd_check_pin_dir() {
+  local dir="$HARNESS_PIN_DIR" p bad=""
+  [ -e "$dir" ] || [ -L "$dir" ] || return 0
+  linked_worktree_of "$HARNESS_REPO" "$dir" && return 0
+  [ -d "$dir" ] || die "HARNESS_PIN_DIR='$dir' exists and is not a directory — 'apply' and 'start' will both refuse"
+  [ -z "$(ls -A "$dir" 2>/dev/null)" ] && return 0
+  for p in "$dir"/*; do
+    [ -e "$p" ] || continue
+    if [ ! -d "$p" ] || ! pin_name_ok "$(basename "$p")"; then bad="$(basename "$p")"; break; fi
+  done
+  [ -z "$bad" ] || die "HARNESS_PIN_DIR='$dir' holds '$bad', which is not a pin directory — 'apply' AND 'start' both refuse here, so this cell can neither be updated nor started. Quarantine it (move it aside; do not delete a directory you cannot account for) and re-run: $0 apply   (agent-infra#1852)"
+}
+
 assert_pin_dir_safe() {
   local dir="$1" p entries ok
   case "$dir" in ""|"/"|".") die "refusing to use HARNESS_PIN_DIR='$dir' as a worktree path";; esac
@@ -520,10 +562,7 @@ assert_pin_dir_safe() {
       [ -e "$p" ] || continue
       entries=$((entries + 1))
       [ -d "$p" ] || { ok=0; break; }
-      case "$(basename "$p")" in
-        ????????????) case "$(basename "$p")" in *[!0-9a-f]*) ok=0 ;; esac ;;
-        *) ok=0 ;;
-      esac
+      pin_name_ok "$(basename "$p")" || ok=0
       [ "$ok" = 1 ] || break
     done
     [ "$ok" = 1 ] && [ "$entries" -gt 0 ] && return 0
@@ -717,6 +756,12 @@ cmd_check() {
     die "harness not found at $HARNESS (clone the repo first)"
   fi
   [ -f "$HARNESS/orch-loop.sh" ] || die "$HARNESS/orch-loop.sh missing"
+  # ⛔ `check`'s verdict IS "this cell can run a controller", and `apply`/`start` both refuse on a
+  # non-conforming pin root. Asking every OTHER question in this function while skipping this one is
+  # a FALSE PASS on exactly the question the verdict answers — measured 2026-10-16: `check` printed
+  # every ok line and "CELL CAN RUN A CONTROLLER" on cells whose `apply` and `start` both died on an
+  # 8-character pin directory (agent-infra#1852).
+  cmd_check_pin_dir
   command -v tmux >/dev/null 2>&1 || die "tmux missing (the lanes depend on it)"
   # ⛔ RUNTIME DEPENDENCIES, not just the binaries this block already named (#1717). Each one is
   # INVOKED by the loop, and each one absent turns a step into a silent no-op or an unbounded paid
