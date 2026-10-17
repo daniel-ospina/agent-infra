@@ -570,9 +570,10 @@ def test_the_blind_token_precedes_the_list_it_qualifies(monkeypatch):
     """ORDERING IS SEMANTICS to a truncating reader (#1869 acceptance 3, hardened).
 
     The token that says "these counts are NOT a clearance" used to be appended AFTER the class list
-    segment, and the fleet brief cuts this line at 400 chars (`cadence-nudge.sh`:
-    `cut -c1-400`) -- so a growing DO list pushed the only qualifier past the cut and left the
-    reader with a bare action list. Pinned on position, not on presence.
+    segment, and the fleet brief cuts this line (`cadence-nudge.sh`: `cut -c1-900`, raised from 400
+    in #1872) -- so a growing class list pushed the only qualifier past the cut and left the reader
+    with a bare action list. Pinned on POSITION, not on presence: the assertion below is about where
+    the qualifier sits, and the width is only the budget that position has to fit in.
     """
     install(monkeypatch, pr_list=[_Result(0, _blind_prs(14))])
     line = objective.build()

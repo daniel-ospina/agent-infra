@@ -263,11 +263,17 @@ check_fleet_srcs_farmed() {
  farm copies in array order, and only the driver-first order makes an interrupted farm FAIL LOUDLY\
  (the driver's import seam); the reverse order is silent (#1872)"
   fi
-  # ⛔ AND ABSENCE IS NOT A PASS (#1872 review round 4). The order assertion above is vacuous when
-  # either index is 0, and the producer gate that catches a missing `objective.py` says nothing
-  # about a missing `pr-doctor.py`: mutation-measured, deleting `pr-doctor.py` from `fleet_srcs`
-  # left this whole suite GREEN. That is the direction the PR calls silent — `~/.pi/agent/scripts/`
-  # would keep an OLD driver beside a NEW classifier forever, with every gate green.
+  # ⛔ AND ABSENCE IS NOT A PASS (#1872 review round 4). The order assertion above is VACUOUS when
+  # either index is 0, so the pair needs a presence half too — but be honest about WHICH gate is
+  # load-bearing here (#1872 review round 13 re-measured this on the merged tree): since #1899 the
+  # DERIVED population gate in this same file already fails a deleted `pr-doctor.py`
+  # (`producer(s) exec'd by a farmed consumer and DELIVERED BY NOTHING: pr-doctor.py`), because both
+  # files are exec'd by farmed consumers. So the unique value of THIS block is the ORDER assertion,
+  # which the derived gate does not check; the presence loop below is defence-in-depth for the pair,
+  # and it stays because it names the consequence (a NEW beat beside an OLD driver is SILENT) rather
+  # than a generic "undelivered producer". (Before the merge this suite was GREEN on that deletion —
+  # that measurement is what motivated the block, and #1899 has since closed the same hole from the
+  # other direction.)
   #
   # ⛔ AND USE THE SHARED READER, NOT A HAND-WRITTEN MATCH (#1872). `farm_array_entries` returns ONE
   # ENTRY PER LINE (`tr -s ' ' '\n'`), so a `case " $line " in *" $entry "*` test never matches — it
