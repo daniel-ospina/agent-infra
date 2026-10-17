@@ -51,8 +51,15 @@ export CMUXTERM_CLI_RESPONSE_TIMEOUT_SEC="${CMUXTERM_CLI_RESPONSE_TIMEOUT_SEC:-6
 # — that is an owner decision (it relaxes the socket from "only processes started
 # inside cmux" to "any process by this user"), filed as an issue, not taken here.
 
-STATE="$HOME/.pi/agent/state"
-SCRIPTS="$HOME/.pi/agent/scripts"
+# The deployed layout, and the ONE override both roots share. Production launches set nothing
+# and get `$HOME/.pi/agent` exactly as before. The override exists because #1933 requires the
+# failure branch to be PROVEN REACHABLE by running a real pass, and a test that had to write
+# into the live state directory (or that could only run on a box where it is safe to) would
+# either corrupt the fleet's state or test nothing. It is a root, not a switch: every path
+# below still derives from it, so a scratch instance is a layout, not a parallel mechanism.
+PI_AGENT_DIR="${HEARTBEAT_PI_AGENT_DIR:-$HOME/.pi/agent}"
+STATE="$PI_AGENT_DIR/state"
+SCRIPTS="$PI_AGENT_DIR/scripts"
 LOG="$STATE/orchestrator-heartbeat.log"
 # The recap/beat PAIR rule (_mdsha + beat_pair_ok), shared with cadence-nudge.sh so the rule exists
 # ONCE rather than once per reader. This script is a READER of the sidecar (it logs the act clause),
@@ -142,6 +149,66 @@ run_bounded() {
   return "$rc"
 }
 
+# mtime_of <file> -- POSIX-portable mtime in epoch seconds, 0 when the file is absent. GNU FIRST,
+# and that order is the whole point: on Linux `stat -f %m FILE` is FILESYSTEM information, so it
+# FAILS (rc 1) while still writing its report to STDOUT -- which the `||` chain then captures along
+# with the GNU answer, poisoning the arithmetic. MEASURED on the Linux runner: every pass DIED at
+# the objective-freshness line with `syntax error in expression (error token is ": \"/tmp/…")`,
+# -- the arithmetic error is fatal to a non-interactive bash (exit 1; the next line never ran), so
+# the loop could not run off this laptop at all -- and said nothing about it. BSD `stat` rejects
+# `-c` outright, so trying GNU first costs the mac nothing.
+mtime_of() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0; }
+
+# ── #1933: A DETACHED CHILD'S EXIT STATUS, DRAINED ON THE PASS AFTER IT ────────────────
+# ⛔ THE LAUNCHES BELOW ARE NON-BLOCKING ON PURPOSE (a pass must not wait on a full dispatch
+# cycle), so a child's rc is NOT available to the pass that launches it. It used to be
+# INVENTED instead: a literal `rc=0` sat immediately above the only branch that reported a
+# dispatch failure, so that branch was unreachable BY CONSTRUCTION and every pass logged a
+# healthy launch whatever the child did -- an enforcer whose condition can never fire, the
+# same class this file already documents twice above (#1933). It matters concretely for
+# `pr-doctor`: #1872 gives it a REFUSAL path (exit 2 on an unreadable queue) -- a refusal the
+# launcher cannot see is, operationally, still a silent zero. The label therefore never has to
+# be trusted over the number: today `pr-doctor.py` on main still has NO non-zero return, so a
+# `PR-DOCTOR REFUSED rc=1` is a crash and `rc=137/143` is a kill, and the rc printed IS the
+# fact while the word is only the vocabulary #1933 asked for.
+#
+# So the child writes its OWN rc to a sidecar FROM INSIDE the subshell -- the only place where
+# `$?` is still the child's status -- and this helper drains it on the NEXT pass. That is a
+# reporting delay of one tick, which is the price of not blocking; it is not silence.
+#   * a clean run (0) leaves NOTHING behind: the sidecar is REMOVED once read, so a failure
+#     seen once cannot be re-reported on every pass thereafter;
+#   * a sidecar that holds something that is not a number is NAMED as unreadable rather than
+#     read as a success (`[ "$rc" -ne 0 ]` on garbage would error, and an error read as
+#     "not a failure" is the same defect in a different coat).
+#   * no sidecar at all = nothing to report (first pass after deployment, or the loop was
+#     restarted): absence is not a pass, it is an absence, and it writes no line.
+# ⛔ THE TAIL MUST COME FROM THE CHILD'S OWN STDERR FILE, NOT FROM $STERR. `$STERR` is the SHARED
+# sink (`>>`) for every step of every pass, and the drain runs a whole pass later -- so `tail -1
+# "$STERR"` is "whoever wrote last", which is routinely a LATER step, not this failure's cause.
+# A diagnosis line that names the wrong component is worse than a bare rc: it sends the reader to
+# the wrong file. Each detached child therefore owns `<child>.stderr`, truncated at launch.
+# report_detached_rc <log-prefix> <rc-sidecar> <child-stderr>
+report_detached_rc() {
+  local label="$1" rcfile="$2" errfile="$3" rc=""
+  [ -f "$rcfile" ] || return 0
+  # `read` returns 1 on a final line WITHOUT a trailing newline **and still sets rc**, so the
+  # `|| rc=""` form discarded the very value it had just read (measured: `143` with no newline ->
+  # rc=[] -> "UNREADABLE", and the failure is gone). `|| true` keeps it.
+  read -r rc < "$rcfile" 2>/dev/null || true
+  case "$rc" in
+    ''|*[!0-9]*)
+      printf '%s %s UNREADABLE (sidecar %s held "%s") -- no failure is claimed, none is denied\n' \
+        "$(date '+%m-%d %H:%M:%S')" "$label" "$rcfile" "$rc" >> "$LOG" ;;
+    0) : ;;
+    *)
+      printf '%s %s rc=%s :: %s\n' "$(date '+%m-%d %H:%M:%S')" "$label" "$rc" \
+        "$(tail -1 "$errfile" 2>/dev/null | cut -c1-200)" >> "$LOG" ;;
+  esac
+  # UNLINK LAST: removing it first meant a crash or an unwritable log between the two lost the
+  # report entirely, while the file that held it was already gone.
+  rm -f "$rcfile"
+}
+
 if [ -z "${LOOP_DETACHED:-}" ]; then
   if [ -f "$PIDFILE" ]; then
     old=$(cat "$PIDFILE" 2>/dev/null)
@@ -158,7 +225,16 @@ fi
 # launchd is not involved, but a detached process still inherits the environment it
 # was started with, which may be a cmux pane's interactive shell. Pin the two
 # variables everything downstream actually needs rather than trusting that.
-export HOME="/Users/danielospina"
+# ⛔ A PIN IS A REPAIR, NOT AN OVERRIDE (#1933). It is applied only when the directory it names
+# EXISTS. Unconditionally, it also silently turned the whole loop into a no-op on any box that is
+# not this laptop: `cd "$HOME" || exit 0` below went to a path that does not exist and exited 0
+# having written NOTHING to the log -- the exact silent-green shape this file documents twice
+# above. MEASURED (`HOME=$tmp LOOP_DETACHED=1 bash scripts/heartbeat-loop.sh` on a box without
+# /Users/danielospina): rc=0, heartbeat log absent. And `STATE`/`SCRIPTS` are derived from the
+# CALLER's HOME above, so pinning HOME afterwards left the two disagreeing: state written under
+# one home, cwd changed to another. Guarded, a box that HAS the pin gets it unchanged, and a box
+# that does not gets its own HOME -- consistent with the state and scripts paths.
+if [ -d /Users/danielospina ]; then export HOME="/Users/danielospina"; fi
 # `~/.pi/agent/shims` is where `gh` lives on this box (a symlink to the agent-infra
 # gh-shim). It was MISSING from the first version of this PATH, and the very first
 # tick logged "NOTE ask-owner scan produced nothing usable" — the gate was silently
@@ -262,7 +338,7 @@ while :; do
   # ⛔ Do NOT make this live-per-read and do NOT delete the TTL gate. The `blind=` guard in objective.py
   # (which refuses to cache a FAILED read) is CORRECT and must stay.
   _obj_file="$STATE/objective.last"
-  _obj_age=$(( $(date +%s) - $(stat -f %m "$_obj_file" 2>/dev/null || stat -c %Y "$_obj_file" 2>/dev/null || echo 0) ))
+  _obj_age=$(( $(date +%s) - $(mtime_of "$_obj_file") ))
   if [ ! -f "$_obj_file" ] || [ "$_obj_age" -gt 900 ]; then
     # SYNCHRONOUS + BOUNDED (2026-10-10, #7871). A DETACHED refresh only bounds the NEXT read --
     # this pass's readers would still see the stale value, which is exactly the "not bounding it"
@@ -275,7 +351,7 @@ while :; do
     run_bounded 90 "objective-refresh" "$LOG" /usr/bin/python3 "$SCRIPTS/objective.py"
     printf '%s OBJECTIVE refresh DONE (cache_age now %ss)\n' \
       "$(date '+%m-%d %H:%M:%S')" \
-      "$(( $(date +%s) - $(stat -f %m "$_obj_file" 2>/dev/null || echo 0) ))" >> "$LOG"
+      "$(( $(date +%s) - $(mtime_of "$_obj_file") ))" >> "$LOG"
   fi
 
   run_bounded "$(( TARGET - IN_PASS_RESERVE ))" "orchestrator-heartbeat.sh" /dev/null \
@@ -433,6 +509,16 @@ while :; do
   # BEFORE the send and RELEASES it if the send does not land, so concurrent or out-of-band runs
   # cannot double-feed a lane. It is bounded by its OWN lock (stale after 20 min) rather than by
   # the pass, and TARGET -- the owner's 5-9 min cadence -- is left exactly as it was.
+  # ── #1933: DRAIN THE LAST DETACHED RUN'S EXIT STATUS ─────────────────────────────────
+  # Placed HERE, ahead of both launches and OUTSIDE both disarm checks, for two reasons: a
+  # pending failure must be reported even on a pass where the child is disarmed or skipped by a
+  # held lock (otherwise the only pass that reports it is one that also runs it), and the line
+  # must precede this pass's launch line, so the log reads "last run failed, this run launched"
+  # rather than the reverse. Both labels are the log PREFIX, so the queued-dispatch line keeps
+  # the exact `QUEUE-DISPATCH FAILED rc=N :: …` vocabulary the rest of this file refers to.
+  report_detached_rc "QUEUE-DISPATCH FAILED" "$STATE/queue-dispatch.rc" "$STATE/queue-dispatch.stderr"
+  report_detached_rc "PR-DOCTOR REFUSED"      "$STATE/pr-doctor.rc"      "$STATE/pr-doctor.stderr"
+
   if [ -d "$STATE/queue-dispatch.lock" ] && \
      [ -z "$(find "$STATE/queue-dispatch.lock" -maxdepth 0 -mmin +20 2>/dev/null)" ]; then
     printf '%s DISPATCH-STEP skipped: a detached dispatcher is still running (lock held)\n' \
@@ -440,8 +526,18 @@ while :; do
   else
     rmdir "$STATE/queue-dispatch.lock" 2>/dev/null
     if mkdir "$STATE/queue-dispatch.lock" 2>/dev/null; then
-      ( nohup /usr/bin/python3 "$SCRIPTS/queue-dispatch.py" --apply \
-          >>"$STATE/queue-dispatch.log" 2>>"$STERR"
+      ( # The child's OWN stderr file, truncated here so the drained tail is this run's --
+        # inherited "whoever wrote last" in the shared $STERR names the wrong component.
+        : > "$STATE/queue-dispatch.stderr"
+        nohup /usr/bin/python3 "$SCRIPTS/queue-dispatch.py" --apply \
+          >>"$STATE/queue-dispatch.log" 2>>"$STATE/queue-dispatch.stderr"
+        # #1933 -- the rc must be written from INSIDE the subshell (the only place `$?` is
+        # still the child's), and BEFORE the lock is released: the next pass drains this file.
+        # WRITE-THEN-RENAME, so a drain landing inside the write sees either nothing (deferred to
+        # the next pass) or a complete value -- never an empty file it could delete.
+        _rc=$?
+        printf '%s\n' "$_rc" > "$STATE/queue-dispatch.rc.tmp" &&
+          mv -f "$STATE/queue-dispatch.rc.tmp" "$STATE/queue-dispatch.rc"
         rmdir "$STATE/queue-dispatch.lock" 2>/dev/null ) &
       printf '%s DISPATCH-STEP launched detached (not bounded by the pass; ~280-390s)\n' \
         "$(date '+%m-%d %H:%M:%S')" >> "$LOG"
@@ -479,8 +575,15 @@ while :; do
     else
       rmdir "$STATE/pr-doctor.lock" 2>/dev/null
       if mkdir "$STATE/pr-doctor.lock" 2>/dev/null; then
-        ( nohup /usr/bin/python3 "$SCRIPTS/pr-doctor.py" \
-            >>"$STATE/pr-doctor.log" 2>>"$STERR"
+        ( # Own stderr file -- see the dispatcher's twin above for why the shared $STERR cannot
+          # be the tail of a report drained a pass later.
+          : > "$STATE/pr-doctor.stderr"
+          nohup /usr/bin/python3 "$SCRIPTS/pr-doctor.py" \
+            >>"$STATE/pr-doctor.log" 2>>"$STATE/pr-doctor.stderr"
+          # #1933 -- see the dispatcher's twin above: the rc is captured here or nowhere.
+          _rc=$?
+          printf '%s\n' "$_rc" > "$STATE/pr-doctor.rc.tmp" &&
+            mv -f "$STATE/pr-doctor.rc.tmp" "$STATE/pr-doctor.rc"
           rmdir "$STATE/pr-doctor.lock" 2>/dev/null ) &
         printf '%s PR-DOCTOR launched detached (drives open PRs toward merged)\n' \
           "$(date '+%m-%d %H:%M:%S')" >> "$LOG"
@@ -490,13 +593,17 @@ while :; do
       fi
     fi
   fi
-  rc=0
-  if [ "$rc" -ne 0 ]; then
-    printf '%s QUEUE-DISPATCH FAILED rc=%s :: %s\n' "$(date '+%m-%d %H:%M:%S')" "$rc" \
-      "$(tail -1 "$STERR" 2>/dev/null | cut -c1-200)" >> "$LOG"
-  fi
+  # ⛔ THE `rc=0` BRANCH THAT USED TO SIT HERE IS DELETED, NOT MOVED (#1933). It read a literal
+  # `0` and then tested it, so `QUEUE-DISPATCH FAILED` could never print; both detached children
+  # now write their own rc to a sidecar and are reported by `report_detached_rc` above. The
+  # branch was not the defect -- reporting a status nobody captured was -- so the fix is at the
+  # capture, and the dead shape must not linger to be "fixed" into a green a second time.
   EL=$(elapsed); SLP=$(( TARGET - EL )); [ "$SLP" -lt 5 ] && SLP=5
   printf '%s PASS done in %ss (target %ss) sleeping %ss\n' \
     "$(date '+%m-%d %H:%M:%S')" "$EL" "$TARGET" "$SLP" >> "$LOG"
+  # #1933 -- ONE-PASS MODE, for the suite that has to PROVE the failure branch is reachable
+  # (a branch that is merely present is the defect). It runs one real pass and exits; it changes
+  # nothing about a normal run, and it cannot skip a step: the seam is after the pass, not in it.
+  if [ -n "${HEARTBEAT_PASS_ONCE:-}" ]; then exit 0; fi
   sleep "$SLP"
 done
