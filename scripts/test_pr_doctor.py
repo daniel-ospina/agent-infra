@@ -466,6 +466,8 @@ def test_ensure_head_refuses_to_reset_when_cleanliness_is_unknown(monkeypatch, t
     real = pr.sh_err
 
     def fake(argv, timeout=180, cwd=None):
+        if "cat-file" in argv:
+            return "", "", 0                          # the PR head object IS present
         if "status" in argv and "--porcelain" in argv:
             return "", "fatal: probe failed", 1       # cannot determine cleanliness
         return real(argv, timeout=timeout, cwd=cwd)
@@ -623,7 +625,9 @@ def test_materialise_detaches_a_fork_worktree_from_a_foreign_branch(monkeypatch,
     gw("checkout", "-q", "-b", "unrelated")
     gw("commit", "--allow-empty", "-qm", "c2")
     foreign_before = g("rev-parse", "refs/heads/unrelated").stdout.strip()
-    wt, err = pr.materialise_worktree(_prb(1, head, "no-such-branch"))
+    p = _prb(1, head, "no-such-branch")
+    p["isCrossRepository"] = True                    # a fork PR: no local branch to attach to
+    wt, err = pr.materialise_worktree(p)
     assert err == "" and wt == str(path)
     assert g("rev-parse", "refs/heads/unrelated").stdout.strip() == foreign_before, \
         "a foreign branch must not be moved by the reset"
@@ -836,6 +840,94 @@ def test_materialise_refuses_to_orphan_commits_on_a_detached_head(monkeypatch, t
     assert wt2 == "" and "orphan" in err
     assert gw("rev-parse", "HEAD").stdout.strip() == head2
     assert (pathlib.Path(wt) / "only-here.txt").exists()
+
+
+def test_a_symlink_to_another_worktree_is_not_live(monkeypatch, tmp_path):
+    """A symlink at a candidate path pointing at ANOTHER worktree resolves to a registered path,
+    so only an explicit `islink` rejection stops the branch hijack."""
+    repo, g = _git_repo(tmp_path)
+    head = g("rev-parse", "HEAD").stdout.strip()
+    g("branch", "b1")
+    g("branch", "b2")
+    wt2 = repo / ".worktrees" / "wt2"
+    g("worktree", "add", str(wt2), "b2")
+    _wire_repo(monkeypatch, repo)
+    link = repo / ".worktrees" / "prd-1"
+    link.symlink_to(wt2)
+    assert pr._live_worktree(str(link)) is False
+    b2_before = g("rev-parse", "refs/heads/b2").stdout.strip()
+    wt, err = pr.materialise_worktree(_prb(1, head, "b1"))
+    assert err == "" and wt.endswith("prd-1-d")
+    assert g("rev-parse", "refs/heads/b2").stdout.strip() == b2_before
+    assert subprocess.run(["git", "-C", str(wt2), "symbolic-ref", "--short", "HEAD"],
+                          capture_output=True, text=True).stdout.strip() == "b2"
+
+
+def test_materialise_fork_pr_ignores_a_colliding_local_branch(monkeypatch, tmp_path):
+    """A fork PR's headRefName can equal a local branch (e.g. a fork of `main`); it must be
+    materialised DETACHED at refs/pull/<n>/head and must not touch that local branch."""
+    repo, g = _git_repo(tmp_path)
+    g("branch", "develop")                           # a colliding local branch
+    g("checkout", "-q", "-b", "fork-tmp")
+    (repo / "fork.txt").write_text("fork\n")
+    g("add", "fork.txt")
+    g("commit", "-qm", "fork commit")
+    forkhead = g("rev-parse", "HEAD").stdout.strip()
+    g("checkout", "-q", "main")
+    g("update-ref", "refs/pull/9/head", forkhead)
+    g("remote", "add", "origin", str(repo))
+    _wire_repo(monkeypatch, repo)
+    develop_before = g("rev-parse", "refs/heads/develop").stdout.strip()
+    p = _prb(9, forkhead, "develop")
+    p["isCrossRepository"] = True
+    wt, err = pr.materialise_worktree(p)
+    assert err == "" and wt.endswith("prd-9")
+    assert subprocess.run(["git", "-C", wt, "rev-parse", "HEAD"],
+                          capture_output=True, text=True).stdout.strip() == forkhead
+    assert subprocess.run(["git", "-C", wt, "symbolic-ref", "-q", "--short", "HEAD"],
+                          capture_output=True, text=True).returncode != 0, "a fork worktree is detached"
+    assert g("rev-parse", "refs/heads/develop").stdout.strip() == develop_before
+
+
+def test_materialise_reuse_of_a_fork_worktree_fetches_the_pr_ref(monkeypatch, tmp_path):
+    """A fork's new head exists only at refs/pull/<n>/head; reuse must fetch THAT ref, not
+    origin/<branch> (which does not exist for a fork)."""
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True, capture_output=True)
+    repo, g = _git_repo(tmp_path)
+    g("remote", "add", "origin", str(origin))
+    g("push", "-q", "origin", "main")
+    fork = tmp_path / "fork"
+    subprocess.run(["git", "clone", "-q", str(origin), str(fork)], check=True, capture_output=True)
+
+    def fg(*a):
+        return subprocess.run(["git", "-C", str(fork)] + list(a), check=True,
+                              capture_output=True, text=True)
+
+    fg("config", "user.email", "t@t")
+    fg("config", "user.name", "t")
+    (fork / "f1.txt").write_text("f1\n")
+    fg("add", "f1.txt")
+    fg("commit", "-qm", "f1")
+    h1 = fg("rev-parse", "HEAD").stdout.strip()
+    fg("push", "-q", "--force", "origin", "HEAD:refs/pull/7/head")
+    _wire_repo(monkeypatch, repo)
+    p1 = _prb(7, h1, "forkbranch")
+    p1["isCrossRepository"] = True
+    wt, err = pr.materialise_worktree(p1)          # h1 is absent locally -> must be fetched
+    assert err == "" and wt.endswith("prd-7")
+
+    (fork / "f2.txt").write_text("f2\n")
+    fg("add", "f2.txt")
+    fg("commit", "-qm", "f2")
+    h2 = fg("rev-parse", "HEAD").stdout.strip()
+    fg("push", "-q", "--force", "origin", "HEAD:refs/pull/7/head")
+    p2 = _prb(7, h2, "forkbranch")
+    p2["isCrossRepository"] = True
+    wt2, err2 = pr.materialise_worktree(p2)        # h2 is absent locally -> reuse must fetch
+    assert err2 == "" and wt2 == wt
+    assert subprocess.run(["git", "-C", wt, "rev-parse", "HEAD"],
+                          capture_output=True, text=True).stdout.strip() == h2
 
 
 def test_materialise_worktree_clears_a_stranded_record(monkeypatch, tmp_path):

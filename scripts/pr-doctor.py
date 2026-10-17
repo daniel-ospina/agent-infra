@@ -243,7 +243,7 @@ def sh_err(args, timeout=180, cwd=None):
 
 def open_prs() -> list[dict]:
     out, err, rc = sh_err([GH, "pr", "list", "--repo", REPO, "--state", "open", "--limit", "60",
-                           "--json", "number,title,isDraft,mergeStateStatus,headRefOid,headRefName,files"])
+                           "--json", "number,title,isDraft,mergeStateStatus,headRefOid,headRefName,isCrossRepository,files"])
     try:
         prs = json.loads(out or "[]")
     except Exception:
@@ -348,6 +348,11 @@ def materialise_worktree(pr: dict) -> tuple[str, str]:
     """
     branch = pr["headRefName"]
     head = pr["headRefOid"]
+    # A fork PR's headRefName can COLLIDE with a base-repo branch (e.g. a fork of `main`), so branch
+    # existence is NOT the fork discriminator -- GitHub's `isCrossRepository` is. A fork's head is
+    # published in the base repo at refs/pull/<n>/head; a base PR is its own branch.
+    fork = bool(pr.get("isCrossRepository"))
+    fetch_ref = "refs/pull/%d/head" % pr["number"] if fork else ""
     # Two paths are ours for this PR: `prd-<n>`, and `prd-<n>-d` as a fallback when `prd-<n>` is
     # occupied by a dangling directory we must NOT delete (it may hold a previous worker's work).
     path = os.path.join(WORKTREE_ROOT, "prd-%d" % pr["number"])
@@ -371,7 +376,8 @@ def materialise_worktree(pr: dict) -> tuple[str, str]:
             return "", ("cannot determine whether %s is a worktree (git probe failed) -- refusing "
                         "to reuse or delete it; inspect it" % cand)
         if live:
-            err = _ensure_branch(cand, branch) or _ensure_head(cand, branch, head)
+            err = (_ensure_branch(cand, branch, fork)
+                   or _ensure_head(cand, branch, head, fetch_ref))
             return (cand, "") if not err else ("", err)
 
     # Materialise at the first candidate that is absent, or holds nothing but a dangling `.git`
@@ -391,31 +397,34 @@ def materialise_worktree(pr: dict) -> tuple[str, str]:
                     "disposable -- refusing to delete either; inspect and clean"
                     % (candidates[0], candidates[1]))
 
-    _, _, rc = sh_err(["git", "-C", REPO_DIR, "rev-parse", "--verify", "-q",
-                       "refs/heads/%s" % branch], timeout=60)
-    if rc == 0:
-        argv = ["worktree", "add", path, branch]
+    # A fork PR's headRefName can COLLIDE with a local branch, so branch existence is NOT the
+    # fork discriminator (GitHub's `isCrossRepository` is). Only a base-repo PR checks out a named
+    # branch; a fork PR is materialised DETACHED at refs/pull/<n>/head.
+    if fork:
+        ref = "refs/pull/%d/head" % pr["number"]
+        _, ferr, frc = _git(["fetch", "origin", ref, "--quiet"], timeout=300)
+        if frc != 0:
+            return "", "cannot materialise fork PR %d: %s could not be fetched (%s)" % (
+                pr["number"], ref, (ferr or "").strip()[:160])
+        argv = ["worktree", "add", "--detach", path, "FETCH_HEAD"]
     else:
-        _, _, frc = _git(["fetch", "origin", branch, "--quiet"], timeout=300)
-        if frc == 0:
-            argv = ["worktree", "add", path, "-b", branch, "origin/%s" % branch]
+        _, _, rc = sh_err(["git", "-C", REPO_DIR, "rev-parse", "--verify", "-q",
+                           "refs/heads/%s" % branch], timeout=60)
+        if rc == 0:
+            argv = ["worktree", "add", path, branch]
         else:
-            # A fork PR: its head is published in the BASE repo at refs/pull/<n>/head. Detached,
-            # because there is no branch in origin to push to -- the worker can review and merge,
-            # and a push is refused loudly rather than silently landing nowhere.
-            ref = "refs/pull/%d/head" % pr["number"]
-            _, ferr, frc = _git(["fetch", "origin", ref, "--quiet"], timeout=300)
+            _, ferr, frc = _git(["fetch", "origin", branch, "--quiet"], timeout=300)
             if frc != 0:
-                return "", "cannot materialise %s: neither origin/%s nor %s could be fetched (%s)" % (
-                    branch, branch, ref, (ferr or "").strip()[:160])
-            argv = ["worktree", "add", "--detach", path, "FETCH_HEAD"]
+                return "", "cannot materialise %s: origin/%s could not be fetched (%s)" % (
+                    branch, branch, (ferr or "").strip()[:160])
+            argv = ["worktree", "add", path, "-b", branch, "origin/%s" % branch]
     _, err, rc = _git(argv, timeout=300)
     if rc != 0:
         return "", "worktree add failed rc=%s: %s" % (rc, (err or "").strip()[:200] or "(no stderr)")
     if not _live_worktree(path):
         return "", "worktree add reported success but %s is not a live worktree" % path
     # A local branch can be BEHIND the PR head; verify and move it, but never over dirty work.
-    err = _ensure_branch(path, branch) or _ensure_head(path, branch, head)
+    err = _ensure_branch(path, branch, fork) or _ensure_head(path, branch, head, fetch_ref)
     return (path, "") if not err else ("", err)
 
 
@@ -438,6 +447,8 @@ def _live_worktree(path: str):
     reuse/reset branch (destructive against the main checkout); treating it as dead enters the
     delete branch. Neither is safe.
     """
+    if os.path.islink(path):
+        return False        # a symlink is an alias to somewhere else -- never a worktree we own
     out, _, rc = sh_err(["git", "-C", path, "rev-parse", "--show-toplevel",
                          "--absolute-git-dir"], timeout=30)
     if rc < 0:
@@ -492,24 +503,31 @@ def _disposable_dangling(path: str) -> bool:
     return os.path.isfile(os.path.join(path, ".git"))
 
 
-def _ensure_branch(path: str, branch: str) -> str:
-    """Ensure a reused worktree is attached to the PR branch (or DETACHED for a fork PR); "" on
+def _ensure_branch(path: str, branch: str, fork: bool = False) -> str:
+    """Ensure a reused worktree is on the PR branch (base-repo PR) or DETACHED (fork PR); "" on
     success, else why.
 
     The reuse path used to reset whatever HEAD it found, so a worktree left on another branch (or
-    detached) was silently reused and the worker's `git push` landed on the wrong branch. When the
-    PR branch exists locally the worktree must be attached to it; when it does NOT (a fork PR)
-    the worktree must be DETACHED -- never left on a foreign local branch, whose pointer
-    `_ensure_head` would otherwise move. A worktree with TRACKED modifications is refused
-    (checkout could carry them); untracked scratch neither blocks checkout nor is destroyed by
-    `reset --hard`, so it is left alone.
+    detached) was silently reused and the worker's `git push` landed on the wrong branch. `fork`
+    comes from GitHub's `isCrossRepository`, NOT from branch-name existence -- a fork's headRefName
+    can collide with a local branch (e.g. a fork of `main`). A base-repo worktree is attached to
+    its branch; a fork worktree is detached. Work that moving HEAD would lose (tracked changes,
+    orphaned detached commits, colliding untracked/ignored files) is refused.
     """
     out, _, rc = sh_err(["git", "-C", path, "symbolic-ref", "--short", "HEAD"], timeout=30)
     cur = (out or "").strip()
     detached = rc != 0
+    if fork:
+        if detached:
+            return ""
+        # Detaching keeps the tree, so no file is touched and the foreign branch keeps its commits.
+        _, err, xrc = sh_err(["git", "-C", path, "checkout", "--detach"], timeout=180)
+        if xrc != 0:
+            return "worktree %s is on foreign branch %s and could not be detached: %s" % (
+                path, cur, (err or "").strip()[:160])
+        return ""
     if not detached and cur == branch:
         return ""
-    _, _, exists = _git(["rev-parse", "--verify", "-q", "refs/heads/%s" % branch], timeout=60)
     dirty, _, drc = sh_err(["git", "-C", path, "status", "--porcelain",
                             "--untracked-files=no"], timeout=60)
     if drc != 0:
@@ -518,17 +536,8 @@ def _ensure_branch(path: str, branch: str) -> str:
     if (dirty or "").strip():
         return ("worktree %s is on a different branch/HEAD and has uncommitted tracked changes -- "
                 "refusing to switch it to %s; inspect and clean it" % (path, branch))
-    if exists != 0:
-        if detached:
-            return ""                              # fork PR: already detached
-        _, err, xrc = sh_err(["git", "-C", path, "checkout", "--detach"], timeout=180)
-        if xrc != 0:
-            return "worktree %s is on foreign branch %s and could not be detached: %s" % (
-                path, cur, (err or "").strip()[:160])
-        return ""
-    # Moving HEAD off a DETACHED commit that no ref holds would orphan it (the checkout below
-    # does exactly that), so refuse first.
     if detached:
+        # Moving off a DETACHED commit no ref holds would orphan it.
         holders, _, hrc = sh_err(["git", "-C", path, "for-each-ref", "--contains", "HEAD",
                                   "--format=%(refname)", "refs/heads", "refs/remotes"], timeout=60)
         if hrc != 0:
@@ -591,14 +600,21 @@ def _untracked_clobber(path: str, head: str):
     return sorted(u for u in untracked if _conflicts(u))
 
 
-def _ensure_head(path: str, branch: str, head: str) -> str:
+def _ensure_head(path: str, branch: str, head: str, fetch_ref: str = "") -> str:
     """Move <path> to <head>; "" on success, else why. NEVER resets a DIRTY worktree."""
     out, _, rc = sh_err(["git", "-C", path, "rev-parse", "HEAD"], timeout=30)
     if rc == 0 and (out or "").strip() == head:
         return ""
     _, _, have = sh_err(["git", "-C", path, "cat-file", "-e", "%s^{commit}" % head], timeout=30)
     if have != 0:
-        sh_err(["git", "-C", path, "fetch", "origin", branch, "--quiet"], timeout=300)
+        # A fork PR's head lives at refs/pull/<n>/head, NOT origin/<branch> (which does not exist
+        # for a fork). Fetching the WRONG ref leaves the object absent and every later probe fails
+        # with a misleading error, so fetch the right one and name a persistent absence clearly.
+        sh_err(["git", "-C", path, "fetch", "origin", fetch_ref or branch, "--quiet"], timeout=300)
+        _, _, have = sh_err(["git", "-C", path, "cat-file", "-e", "%s^{commit}" % head], timeout=30)
+        if have != 0:
+            return ("PR head %s is not present locally and could not be fetched -- refusing to "
+                    "reset worktree %s" % (head[:12], path))
     # ⛔ An unanswerable cleanliness probe is NOT "clean": `dirty` is empty on rc != 0, so the
     # old `if dirty.strip()` fell through to `reset --hard` and destroyed uncommitted work.
     dirty, _, drc = sh_err(["git", "-C", path, "status", "--porcelain",
