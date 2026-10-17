@@ -35,10 +35,14 @@ hours of looking at lanes instead of at the tree.
 
 LEAN BY DESIGN, and it follows the house pattern the other line-producers use
 (`merge-queue.py`, `beta-progress.py`): print ONE final line, self-cache so the
-heartbeat can call it every tick for free, never raise. It reads; it does not
-act. Nothing dispatches from here.
+heartbeat can call it every tick CHEAPLY, never raise. "Cheap" is not "free" on
+one path: a recompute that lands inside GitHub's lazy `mergeStateStatus` window
+re-reads a few times before it will call the queue blind (#1869), which spends
+up to `QUEUE_BLIND_BUDGET_S` of the beat's own 90 s refresh bound -- and a
+refresh killed at that bound writes NO line at all. It reads; it does not act.
+Nothing dispatches from here.
 
-TWO MEASUREMENT TRAPS THIS SCRIPT EXISTS TO AVOID, both hit for real:
+THREE MEASUREMENT TRAPS THIS SCRIPT EXISTS TO AVOID, all hit for real:
   1. A run's `createdAt -> updatedAt` INCLUDES QUEUE WAIT. It read 44.3 min and
      was reported as "CI is 44 minutes" -- the real execution median was 5.7 min
      and the true critical path was 11.6-17.3 min. CI time here is JOB wall time.
@@ -47,13 +51,18 @@ TWO MEASUREMENT TRAPS THIS SCRIPT EXISTS TO AVOID, both hit for real:
      and take the NEWEST BY `id`, then judge by POLARITY -- anything not in the
      green/non-red sets is RED, including conclusions GitHub has not documented.
      A missing check is NOT a green check.
+  3. A LAZILY-COMPUTED answer is not a failed read -- it is a read taken too
+     early. `mergeStateStatus` reads UNKNOWN for the WHOLE queue while GitHub
+     recomputes it, with no error anywhere, so ONE sample can be blind on a
+     perfectly healthy API: the queue read is re-sampled before blindness is
+     declared, and a queue that never settles is still reported BLIND (#1869).
 
 Usage:  objective.py [--json] [--max-age 240]
 Output: OBJECTIVE VERDICT=... prs_waiting=N ... main=RED|GREEN|UNKNOWN@sha ...
 """
 from __future__ import annotations
 import json, os, re, subprocess, sys, time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 
 REPO = "daniel-ospina/tortoise"
@@ -463,6 +472,31 @@ def ci_critical_path(runs=15, min_jobs=8):
     return newest[0], newest[1], newest[0]
 
 
+def _sleep(seconds):
+    """Sleep, behind ONE indirection, so the blind-resample backoff is provable in a test
+    without spending the wall clock (and without brushing CI's per-test `--timeout`, #1869).
+
+    ⚠️ This DELIBERATELY departs from the repo's other suites, which patch the module's own
+    `time` (`test_lane_watchdog.py`, `test_lane_status.py`: `setattr(mod.time, "sleep", ...)`).
+    `objective.time` IS the stdlib module object, so that convention patches it PROCESS-WIDE for
+    the duration of the test; this module is also copied into `~/.pi/agent/scripts` and run by a
+    live loop, so its wait is worth one explicit, local seam instead.
+    """
+    time.sleep(seconds)
+
+
+def _monotonic():
+    """Monotonic seconds, behind ONE indirection, so the re-sample DEADLINE is testable too.
+
+    An attempt count alone does not bound a re-sample loop: the READ can be slow (a full
+    recompute costs ~12 s measured, and one hung `gh` costs up to its own 120 s timeout), so a
+    fixed ladder of sleeps on top of a slow read is bounded by nothing the beat can honour
+    (`run_bounded 90`). The loop therefore checks a wall-clock deadline as well -- and a
+    deadline is only honest if it can be tested without waiting for it.
+    """
+    return time.monotonic()
+
+
 def _gh_retry(argv, attempts=3, timeout=120):
     """A transient 5xx from GitHub is NOT fleet blindness.
 
@@ -489,7 +523,7 @@ def _gh_retry(argv, attempts=3, timeout=120):
             "timed out", "timeout", "503", "504", "try again", "temporarily unavailable"))
         if not transient or i == attempts - 1:
             return last
-        time.sleep(2 * (i + 1))
+        _sleep(2 * (i + 1))
     return last
 
 
@@ -933,39 +967,163 @@ def classify_queue(non):
     return classes, surface, dict(by_class), sorted(surface_prs)
 
 
+# ⛔ AN UNREAD STATE MUST NEVER PRINT AS A ZERO. `mergeStateStatus` is computed LAZILY by
+# GitHub and reads UNKNOWN for the WHOLE repo while it recomputes -- measured 2026-10-01:
+# 75 of 82 open non-draft PRs read UNKNOWN at 11:47Z, and the SAME three PRs read BLOCKED
+# from BOTH `gh pr view` and `gh pr list` two minutes later once the recompute finished
+# (so it is a transient blind spot, not a wrong field -- the REST list endpoint returns
+# null here and is no better). Counting only BLOCKED/DIRTY/UNSTABLE silently DROPS those,
+# so a blind read printed ZEROS for both: a FALSE ALL-CLEAR, the one wrong
+# answer this instrument can give (same fail-open class as GH_BLOCKED, #6142).
+# The inverse is the state that means GitHub ANSWERED; everything else -- `UNKNOWN`, a null,
+# an absent field, a value GitHub has not documented -- is UNREAD and is counted as such.
+KNOWN_MERGE_STATES = frozenset({"BLOCKED", "DIRTY", "UNSTABLE", "CLEAN", "BEHIND", "HAS_HOOKS"})
+
+# ⛔ A LAZILY-COMPUTED FIELD IS A READ TAKEN TOO EARLY -- NOT A FAILED READ (#1869).
+# `mergeStateStatus` is recomputed whenever the base or head moves, and while it recomputes it
+# reads UNKNOWN for the WHOLE queue: measured again 2026-10-16, one beat at 13:34 printed
+# `queue_read=BLIND(14/14 unread)` and the SAME read minutes later returned
+# `{BLOCKED: 8, DIRTY: 5, UNSTABLE: 1}`. `_gh_retry` cannot see this: the read SUCCEEDED, and
+# only the ANSWER was not ready -- so the SAME query is re-run here, a bounded number of times
+# with a short backoff, and only a queue still unread after EVERY attempt is reported BLIND.
+#
+# ⛔ RE-RUN THE SAME QUERY -- DO NOT ADD A SECOND READER. `mergeable`/`mergeStateStatus` also
+# come back null on the REST list endpoint, and a per-PR `gh pr view` was the fallback that
+# produced good values during the incident -- but a fallback reader is a DIFFERENT reader, and
+# publishing one sample from it beside fourteen from `gh pr list` is how two differently-wrong
+# reads get reported as one measurement. Sample the same query again.
+#
+# BUDGET, and why it is small: the beat's refresh is bounded at 90 s (`heartbeat-loop.sh`,
+# `run_bounded 90 objective-refresh`) and a full recompute already costs ~12 s (~513 graphql
+# calls, one per PR/check-suite). Each re-read is ONE list query plus a few seconds of waiting,
+# and `classify_queue` runs ONCE after the loop, so a re-sample never repeats the per-PR storm.
+# A recompute window longer than this budget is genuinely not settled FOR THIS BEAT; BLIND is
+# then the truthful answer (and, until #1916, a BLIND line IS still cached -- `main()`'s guard
+# does not know the token, so it can be served from `objective.last` for up to 900 s. Do not read
+# that as "the next beat re-samples": the next RECOMPUTE does).
+QUEUE_BLIND_ATTEMPTS = 4                      # 1 fresh read + 3 re-reads
+QUEUE_BLIND_BACKOFF_S = (2, 5, 10)            # ~17 s of waiting, all attempts together
+QUEUE_BLIND_BUDGET_S = 20                     # WALL-CLOCK bound on re-sampling, from read 1:
+                                              # a slow first read spends the budget it would
+                                              # otherwise spend on waiting
+
+
+def _mergeable_unknown(ms):
+    """How many non-draft PRs came back with an UNREAD lazy merge state (`ms` = Counter)."""
+    return sum(c for k, c in ms.items() if k not in KNOWN_MERGE_STATES)
+
+
+def _queue_read_is_blind(unknown, nondraft):
+    """True iff the lazily-computed merge state is unread for MOST of the queue.
+
+    THE ONE DEFINITION, shared by the re-sample that tries to settle the read and by the
+    report that finally declares it blind -- so the retry can never stop on a queue the line
+    then calls readable, or keep re-reading a queue it is about to call blind. A read is blind
+    when ANY PR is unread and at least half of them are: one unread PR in a 20-PR queue does
+    not invalidate the DO list, and an unread queue of one does.
+
+    The predicate itself is UNCHANGED from the pre-#1869 report (`_u > 0 and
+    2 * _u >= max(1, nondraft)`). What changed is that the read is now SAMPLED AGAIN before
+    that verdict is given, instead of being declared blind on the first sample.
+    """
+    return unknown > 0 and 2 * unknown >= max(1, nondraft)
+
+
 def queue():
-    r = _gh_retry([GH_BIN, "pr", "list", "--repo", REPO, "--state", "open",
-                   "--limit", "400", "--json",
-                   "number,isDraft,mergeable,mergeStateStatus,headRefOid,files"])
-    if r.returncode != 0:
-        _note_gh_failure((r.stdout or "") + (r.stderr or ""), "queue")
-        return None
-    try:
-        prs = json.loads(r.stdout)
-    except Exception:
-        # The transport WORKED and the answer was unreadable. That is not fleet blindness,
-        # so `transport=False` -- and the queue still reports itself UNREADABLE locally.
-        _note_gh_failure(f"unparseable queue response: {r.stdout[:400]}", "queue",
-                         transport=False)
-        return None
-    non = [p for p in prs if not p["isDraft"]]
-    from collections import Counter
-    ms = Counter(p.get("mergeStateStatus") or "?" for p in non)
-    # ⛔ AN UNREAD STATE MUST NEVER PRINT AS A ZERO. `mergeStateStatus` is computed LAZILY by
-    # GitHub and reads UNKNOWN for the WHOLE repo while it recomputes -- measured 2026-10-01:
-    # 75 of 82 open non-draft PRs read UNKNOWN at 11:47Z, and the SAME three PRs read BLOCKED
-    # from BOTH `gh pr view` and `gh pr list` two minutes later once the recompute finished
-    # (so it is a transient blind spot, not a wrong field -- the REST list endpoint returns
-    # null here and is no better). Counting only BLOCKED/DIRTY/UNSTABLE silently DROPS those,
-    # so a blind read printed ZEROS for both: a FALSE ALL-CLEAR, the one wrong
-    # answer this instrument can give (same fail-open class as GH_BLOCKED, #6142).
-    _KNOWN = {"BLOCKED", "DIRTY", "UNSTABLE", "CLEAN", "BEHIND", "HAS_HOOKS"}
-    unknown = sum(c for k, c in ms.items() if k not in _KNOWN)
+    """The open PR queue, re-sampled while its LAZY merge state is unread (see above)."""
+    argv = ["gh", "pr", "list", "--repo", REPO, "--state", "open",
+            "--limit", "400", "--json",
+            "number,isDraft,mergeable,mergeStateStatus,headRefOid,files"]
+    sample = None
+    reads = 0
+    resample_failed = 0
+    deadline = _monotonic() + QUEUE_BLIND_BUDGET_S     # measured from the FIRST read
+    for attempt in range(QUEUE_BLIND_ATTEMPTS):
+        remaining = deadline - _monotonic()
+        if attempt and remaining <= 0:
+            break          # the beat's budget for re-reading is spent: BLIND is then truthful
+        # ⛔ A RE-SAMPLE MUST NOT NEST A SECOND RETRY POLICY. The FIRST read keeps `_gh_retry`'s
+        # transport resilience (the whole tick depends on it), but a re-read is a retry ALREADY:
+        # `attempts=1` with the REMAINING budget as its timeout is what makes the wall-clock
+        # bound real -- otherwise the worst case is 4 samples x 3 transport attempts x its own
+        # 120 s timeout, which is a kill, and a killed refresh writes NO line at all.
+        # ⛔ AND A TIMEOUT RAISES -- it does not return `returncode != 0`. `subprocess.run(...)`
+        # raises `TimeoutExpired`, which is exactly the failure the short re-read timeout makes
+        # most likely. Uncaught, it escapes `queue()`, `build()` and the held sample with it, and
+        # every count, the DO list and the BLIND token are replaced by a bare `error=` line --
+        # strictly worse than not re-reading. So the call AND the payload derivation are inside
+        # the same absorb-and-keep-sample path as a failed transport.
+        surface = "queue" if not attempt else "queue-resample"
+        try:
+            r = (_gh_retry(argv) if not attempt
+                 else _gh_retry(argv, attempts=1, timeout=max(1.0, remaining)))
+            if r.returncode != 0:
+                raise RuntimeError((r.stdout or "") + (r.stderr or ""))
+            prs = json.loads(r.stdout)
+            if not isinstance(prs, list):
+                raise ValueError(f"queue payload is not a list: {str(prs)[:200]}")
+            non = [p for p in prs if not p["isDraft"]]
+        except Exception as e:
+            # A FAILED RE-SAMPLE MUST NOT THROW AWAY A SAMPLE WE ALREADY HOLD. The first read
+            # ANSWERED, so `queue=UNREADABLE` would discard `open`/`nondraft`/the DO list to
+            # report a fact that is strictly less informed. `transport=False` on a PARSE failure
+            # (the transport worked, we mangled the answer -- not blindness), and the surface
+            # differs on a re-sample: `"queue-resample"` is deliberately NOT one of
+            # BLINDING_SURFACES, because the queue WAS read -- a transient failure of a RE-read
+            # must not declare the fleet blind, rewrite the verdict to RATE-LIMITED, or suppress
+            # the cache, all of which is worse than not having re-read.
+            transport = isinstance(e, (RuntimeError, subprocess.TimeoutExpired))
+            _note_gh_failure(f"queue read failed: {e}", surface, transport=transport)
+            if sample is None:
+                return None
+            resample_failed += 1
+            break
+        reads += 1
+        ms = Counter(p.get("mergeStateStatus") or "?" for p in non)
+        unknown = _mergeable_unknown(ms)
+        blind_now = _queue_read_is_blind(unknown, len(non))
+        # KEEP THE MOST RESOLVED SAMPLE, NOT THE LAST ONE. A later sample can land inside a
+        # SECOND recompute window (the queue keeps moving while we wait) and would otherwise
+        # clobber a better reading with a worse one. Ties go to the later sample, which is the
+        # fresher queue. Each sample is kept WHOLE -- counts, classes and list never mix.
+        # ⛔ A READABLE ANSWER WINS -- UNLESS IT IS EMPTY. `blind and smaller` is the degenerate
+        # shape (14 blind PRs, then an empty list = "0 unread" = a CLEARED queue of zero, and
+        # `waiting < TARGET_PRS` would read AT-TARGET): that is the false all-clear this
+        # instrument exists to refuse, manufactured by the retry itself. But `readable and
+        # smaller` is the ORDINARY event of a PR landing during the wait -- 14 blind, then 13
+        # fully readable -- and rejecting it would report BLIND with the blind sample's DO list
+        # while a complete answer was in hand: exactly the harm this retry exists to remove.
+        # ⛔ AND A SAMPLE THAT GAINED PRs IS ACCEPTED EVEN WITH MORE UNREAD ONES: a degraded
+        # first answer that under-counts (3 of 14) must not survive as the final measurement, or
+        # the same false all-clear arrives from the other direction (`waiting=3` => AT-TARGET).
+        accepted = (sample is None
+                    or len(non) > len(sample["non"])
+                    or (not blind_now and non)
+                    or (unknown <= sample["unknown"] and len(non) >= len(sample["non"])))
+        if accepted:
+            sample = {"prs": prs, "non": non, "ms": ms, "unknown": unknown}
+        if accepted and not blind_now:
+            break
+        if attempt == QUEUE_BLIND_ATTEMPTS - 1:
+            break
+        _sleep(min(QUEUE_BLIND_BACKOFF_S[min(attempt, len(QUEUE_BLIND_BACKOFF_S) - 1)],
+                   max(0.0, deadline - _monotonic())))
+    prs, non, ms = sample["prs"], sample["non"], sample["ms"]
+    unknown = sample["unknown"]
     classes, surface, by_class, surface_prs = classify_queue(non)
+    blind = _queue_read_is_blind(unknown, len(non))
     return {"open": len(prs), "drafts": len(prs) - len(non), "nondraft": len(non),
-            "dirty": ms.get("DIRTY", 0),
-            "unstable": ms.get("UNSTABLE", 0), "unknown": unknown,
+            # ⛔ None, NOT 0, WHEN THE STATE WAS UNREAD -- `ms.get("DIRTY", 0)` is the exact
+            # "an unread value must never render as a zero" shape this file forbids. No consumer
+            # reads these two today; making them honest is what stops the next one inheriting a
+            # false zero.
+            "dirty": None if blind else ms.get("DIRTY", 0),
+            "unstable": None if blind else ms.get("UNSTABLE", 0), "unknown": unknown,
+            "mergeable_reads": reads, "resample_failed": resample_failed,
             "classes": classes, "by_class": by_class, "surface": surface,
+            # ⛔ THE OWNER'S LIST SURVIVES THE REFUSAL (#1872): `classify_queue()` returns it in
+            # both directions, because "N things need you" without naming them is a stall with a
+            # receipt.
             "surface_prs": surface_prs}
 
 
@@ -1035,13 +1193,47 @@ def build(prev=None):
         # diagnostics -- they are the useful breakdown of a queue -- but they no longer
         # masquerade as the queue itself.
         parts.append(f"open={q['open']} drafts={q['drafts']} nondraft={q['nondraft']}")
+        # ── THE QUALIFIER GOES FIRST: `queue_read` AND THE OWNER'S LIST PRECEDE THE COUNTS ──
+        # ⛔ THE QUALIFIER MUST PRECEDE WHAT IT QUALIFIES (#1869, #1872 review rounds 2 and 4).
+        # This line is read with a fixed `cut` by `cadence-nudge.sh` (now `cut -c1-900`), so a
+        # fail-closed caveat sitting in the TAIL is the first thing a long queue loses -- and
+        # losing it turns a blind read into a clearance, which is the exact fail-open this token
+        # exists to prevent. The same is true of `ASK-USER`: `surface=2` alone tells the owner
+        # nothing he can act on, and sitting at the END of the queue segment meant a deep queue
+        # severed the NUMBERS while leaving the bare count it was added to replace (MEASURED: 60
+        # non-draft PRs with a 20-PR overlay loses all 20 names inside the nudge's cut).
+        # To a truncating reader, ORDERING IS SEMANTICS.
+        _u = q.get("unknown") or 0
+        _blind = _queue_read_is_blind(_u, q["nondraft"])
+        # THE RE-SAMPLE IS NOT SILENT -- neither when it WORKED nor when it failed. A queue that
+        # needed a second sample WAS transiently blind (#1869), and saying so is the only way that
+        # frequency can be measured; a re-sample that FAILED (timeout, 5xx, garbage) is a different
+        # fact again, and it is the datum the backoff budget has to be calibrated from.
+        _reads = q.get("mergeable_reads") or 1
+        # ⛔ HOW MANY SAMPLES IT TOOK IS PART OF *BOTH* ANSWERS, NOT ONLY THE SUCCESSFUL ONE.
+        # "BLIND after 1 read" and "BLIND after 4" are different facts, and `QUEUE_BLIND_BUDGET_S`
+        # can only be calibrated from the second: on the settling path the count is the datum, and
+        # on the never-settling path it is the only datum there is.
+        _rsf = " resample=FAILED" if q.get("resample_failed") else ""
+        if _u:
+            parts.append(f"mergeable_state_unknown={_u}")
+        if _blind:
+            # A ZERO FROM A BLIND READ IS NOT A CLEARANCE. Kept from the deleted pair: the
+            # fail-closed job belongs to whatever token stands where the zeros used to.
+            parts.append(f"queue_read=BLIND({_u}/{q['nondraft']} unread, samples={_reads}){_rsf}"
+                         " -- the QUEUE counts are NOT a clearance")
+        elif _reads > 1 or _rsf:
+            parts.append(f"queue_read=SETTLED(samples={_reads}){_rsf}")
+        if q.get("surface"):
+            _sprs = " ".join(f"#{n}" for n in (q.get("surface_prs") or []) if n)
+            parts.append(f"ASK-USER: surface={q['surface']}" + (f": {_sprs}" if _sprs else ""))
         # ── THE PER-CLASS SEGMENT: **STATE**, NOT A SECOND DISPATCH LIST (#1872) ──────────
         # These are the owner-designed action tokens (2026-10-10) -- they replaced `blocked`,
         # which counted `mergeStateStatus=BLOCKED` and needed a sentence of apology ("counter,
         # not a work count") to be read correctly: A VOCABULARY THAT NEEDS AN APOLOGY IS THE
-        # WRONG VOCABULARY. MEASURED 2026-10-10 on 10 non-draft PRs: 8 read BLOCKED and 2
-        # DIRTY, and of the 8, FOUR had `ai-review-gate` as their ONLY red -- i.e. RECORD IT,
-        # zero code work -- and ONE had never run a required check at all.
+        # WRONG VOCABULARY. MEASURED 2026-10-10 on 10 non-draft PRs: 8 read BLOCKED and 2 DIRTY,
+        # and of the 8, FOUR had `ai-review-gate` as their ONLY red -- i.e. RECORD IT, zero code
+        # work -- and ONE had never run a required check at all.
         # ⛔ BUT THEY ARE NOT AN INSTRUCTION, and the label says so. `pr-doctor.py` -- the
         # background dispatcher -- already CLASSIFIES AND ACTS on every one of these classes,
         # from the SAME classifier (`classify_one()`), at the machine's configured capacity.
@@ -1086,36 +1278,10 @@ def build(prev=None):
                     seg += " IN-PROGRESS: fixing " + " ".join(
                         f"{n}={c}" for n, c in sorted(_cnt.items(), key=lambda kv: (-kv[1], kv[0])))
             parts.append(f"waiting={q['nondraft']} prs: {q['nondraft']} nondraft")
+            parts.append(f"| QUEUE(state; pr-doctor dispatches): {seg}")
         else:
             # `classes` is None when ANY PR's checks were unreadable, so no partition is printed.
             parts.append(f"waiting={q['nondraft']}")
-        # ⛔ THE CAVEAT IS EMITTED BEFORE WHAT IT QUALIFIES (#1872 review round 2). This line is
-        # read with a fixed `cut` by `cadence-nudge.sh`, so a fail-closed caveat sitting in the
-        # TAIL is the first thing a long queue loses -- and losing it turns a blind read into a
-        # clearance, which is the exact fail-open this token exists to prevent. Both reviewers
-        # independently measured truncation of this very sentence in shapes the fleet reaches
-        # (a rail-gate outage names a gate on every `blocked-by-rail` entry; the `ASK-USER`
-        # overlay names every surface PR).
-        _u = q.get("unknown") or 0
-        _blind = _u > 0 and 2 * _u >= max(1, q["nondraft"])
-        if _u:
-            parts.append(f"mergeable_state_unknown={_u}")
-        if _blind:
-            # A ZERO FROM A BLIND READ IS NOT A CLEARANCE. Kept from the deleted pair: the
-            # fail-closed job belongs to whatever token stands where the zeros used to.
-            parts.append(f"queue_read=BLIND({_u}/{q['nondraft']} unread) -- the QUEUE counts are NOT a clearance")
-        # ⛔ THE OWNER'S LIST IS NOT THE TAIL EITHER (#1872 review round 4). `ASK-USER` names the
-        # PRs because `surface=2` alone tells the owner nothing he can act on (a gate whose output
-        # is "2 things need you" is a stall with a receipt) -- and it used to sit at the END of the
-        # queue segment, so a deep queue severed the NUMBERS and left the bare count it was added
-        # to replace (MEASURED: 60 non-draft PRs with a 20-PR overlay loses all 20 names inside the
-        # nudge's cut). An OVERLAY, not a sixth bucket: it does not break the partition, because a
-        # surface change can also need work.
-        if q.get("surface"):
-            _sprs = " ".join(f"#{n}" for n in (q.get("surface_prs") or []) if n)
-            parts.append(f"ASK-USER: surface={q['surface']}" + (f": {_sprs}" if _sprs else ""))
-        if q.get("classes"):
-            parts.append(f"| QUEUE(state; pr-doctor dispatches): {seg}")
         # ⛔ `blocked` IS DELETED AS A TOKEN, AND SO IS ITS CAVEAT. Do not re-add either.
         # Anything that needs a sentence of apology to be read correctly is the wrong vocabulary.
         # The per-class tokens above say what the queue LOOKS LIKE and who acts on it; they do
