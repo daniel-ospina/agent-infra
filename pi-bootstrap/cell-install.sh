@@ -374,6 +374,64 @@ install_farms() {
   say "scripts farm: $n file(s) installed (declared by pi-bootstrap/setup.sh)"
 }
 
+# ── 1b. the UNFARM leg (#1924) ───────────────────────────────────────────────
+# Every copy leg above is COPY-ONLY: `cp`/`install_file` writes the names the farm
+# DECLARES and does nothing at all to a name it does not declare. So a script that left
+# the repo — or a name that left a farm array — keeps its deployed copy on the cell,
+# executable, while the repo says it is retired. Nothing reported it: install-launchd's
+# broken-target check only sees a plist whose target is MISSING, and
+# check-deployed-drift.sh compares $O harness *.sh only.
+#
+# The retirement is DECLARED in pi-bootstrap/farm-retired.txt — never inferred from
+# absence, because a cell whose checkout was incomplete would otherwise read as a
+# retirement and lose scripts that are still shipped — and it is applied by the SAME
+# code the laptop runs (pi-bootstrap/lib/farm-retire.sh). A laptop-only fix would leave
+# every cell executing the retired artifact, which is precisely the divergence this leg
+# closes.
+#
+# The retirement list and its implementation are read from $INFRA_ROOT — the checkout the
+# LAYER is installed from, which is also where read_farm_set() reads the farm arrays — and
+# never from $SELF_DIR. This script can be run against a different checkout
+# (`INFRA_ROOT=<path>` exists for exactly that), and pairing one checkout's farm arrays
+# with another checkout's retirement list would be a removal rule nobody wrote down.
+load_farm_retire() {
+  local lib="$INFRA_ROOT/pi-bootstrap/lib/farm-retire.sh"
+  if [ ! -f "$lib" ]; then
+    printf 'the farm UNFARM leg is missing from the checkout being installed (%s)\n' "$lib" >&2
+    return 1
+  fi
+  # shellcheck source=lib/farm-retire.sh
+  . "$lib"
+}
+
+# FARM_DECLARED_REL — the paths the farm DECLARES, relative to $DEST
+# (`scripts/<name>` and the farm subdirectories), newline-separated. This is the set the
+# retirement list is checked against: a name in BOTH is a contradiction (the copy leg
+# re-creates it), not a removal. Same shape setup.sh records, so farm-retire.sh takes
+# one kind of value from both callers.
+FARM_DECLARED_REL=""
+read_declared_farm_rel_paths() {   # $1 = rows, as emitted by read_farm_set
+  local rows="$1" src_rel dest_rel base
+  FARM_DECLARED_REL=""
+  while IFS=$'\t' read -r src_rel dest_rel base; do
+    [ -n "${base:-}" ] || continue
+    case "$dest_rel" in
+      scripts)   FARM_DECLARED_REL+="scripts/$base"$'\n' ;;
+      scripts/*) FARM_DECLARED_REL+="$dest_rel/$base"$'\n' ;;
+    esac
+  done <<<"$rows"
+}
+
+install_unfarm() {
+  local rows
+  rows="$(read_farm_set)" || die "the declared farm set could not be read from setup.sh (see above)"
+  load_farm_retire || die "the UNFARM leg cannot run — a retirement would not reach this cell, and certifying it anyway is the #1924 gap"
+  read_declared_farm_rel_paths "$rows"
+  if ! farm_unfarm "$DEST" "$INFRA_ROOT/pi-bootstrap/farm-retired.txt" "$FARM_DECLARED_REL"; then
+    die "the UNFARM leg failed (see above) — a retirement the farm cannot apply is NOT applied"
+  fi
+}
+
 # ── 2. extensions ────────────────────────────────────────────────────────────
 denied_extension() {
   local base="$1" d
@@ -681,6 +739,40 @@ verify_layer() {
   fi
   say "verified $farm_n declared farm file(s) against the checkout"
 
+  # ── the UNFARM leg (#1924) ────────────────────────────────────────────────
+  # A declared retirement must be GONE from this cell, and the two lists must not
+  # intersect. Without this read-back the certificate said "layer verified" about a cell
+  # that still executes a script the repo declares retired — the exact false PASS the
+  # leg exists to close, and the reason the cell half cannot be skipped: a laptop-only
+  # unfarm leaves every cell behind.
+  if load_farm_retire; then
+    local retired_list="" retired_rel conflict_out="" conflict_rc=0 retired_n=0
+    if retired_list="$(farm_retired_entries "$INFRA_ROOT/pi-bootstrap/farm-retired.txt")"; then
+      read_declared_farm_rel_paths "$rows"
+      conflict_out="$(farm_retired_conflicts "$INFRA_ROOT/pi-bootstrap/farm-retired.txt" "$FARM_DECLARED_REL")" || conflict_rc=$?
+      case "$conflict_rc" in
+        0) ;;
+        2) fail "the retirement list pi-bootstrap/farm-retired.txt could not be read — verify cannot vouch that any declared retirement was applied (an unreadable list removes nothing)" ;;
+        *) while IFS= read -r retired_rel; do
+             [ -n "$retired_rel" ] || continue
+             fail "RETIREMENT CONTRADICTION: $retired_rel is declared RETIRED but a farm array still declares it — the copy leg re-creates it, so the retirement can never be applied"
+           done <<<"$conflict_out" ;;
+      esac
+      while IFS= read -r retired_rel; do
+        [ -n "$retired_rel" ] || continue
+        retired_n=$((retired_n + 1))
+        if [ -e "$DEST/$retired_rel" ] || [ -L "$DEST/$retired_rel" ]; then
+          fail "RETIRED ARTIFACT STILL PRESENT: $retired_rel — the repo declares it retired and this cell would keep executing it (#1924); re-run --install, or remove it by hand if the checkout is the stale side"
+        fi
+      done <<<"$retired_list"
+      say "verified $retired_n declared retirement(s) absent from the cell"
+    else
+      fail "the retirement list pi-bootstrap/farm-retired.txt could not be read — nothing could be vouched for on the UNFARM leg"
+    fi
+  else
+    fail "pi-bootstrap/lib/farm-retire.sh is missing from the checkout — the UNFARM leg cannot be verified, so a retired farm script on this cell would go unreported"
+  fi
+
   local rec="$DEST/scripts/record-review.sh"
   if [ ! -s "$rec" ] || [ ! -x "$rec" ]; then
     fail "record-review.sh is missing, empty or not executable at $rec — merge-one.sh runs it directly, so every review would be re-paid for and never recorded (#1717)"
@@ -877,6 +969,7 @@ main() {
   if [ "$MODE" = "--install" ]; then
     mkdir -p "$DEST" || die "cannot create $DEST"
     install_farms
+    install_unfarm
     install_extensions
     install_extension_deps
     install_skills
