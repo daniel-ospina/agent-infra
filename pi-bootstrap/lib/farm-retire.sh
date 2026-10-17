@@ -59,6 +59,7 @@
 farm_retire_entry_problem() {
     local rel="$1" comp
     case "$rel" in
+        scripts)   printf 'names the farm root itself, not a farmed artifact: %s' "$rel"; return 1 ;;
         scripts/*) ;;
         *) printf 'must start with scripts/ (got: %s)' "$rel"; return 1 ;;
     esac
@@ -81,12 +82,37 @@ farm_retire_entry_problem() {
             -*)      printf 'has a component beginning with "-": %s' "$rel"; return 1 ;;
         esac
     done
-    # `scripts/` alone is the farm's root, not an artifact.
-    if [ "$rel" = "scripts" ]; then
-        printf 'names the farm root itself, not a farmed artifact: %s' "$rel"
-        return 1
-    fi
     return 0
+}
+
+# farm_artifact_state <dest-root> <rel> — print EXACTLY one of:
+#   present       the path exists (or is a symlink)
+#   absent        it does not exist AND its location was readable, so "already retired" is a
+#                 verifiable answer
+#   indeterminate it could not be decided: a component of the path exists but is not
+#                 searchable (mode 000, a parent owned by another user, an ACL, root-squash on
+#                 NFS). `[ -e path ]` answers FALSE for THIS case exactly as it does for
+#                 absence, so a caller that reads "not -e" as "gone" reports a retirement that
+#                 was never applied — and `--verify` then certifies the cell. That is the
+#                 #1924 failure with a green tick on it, so the three states must never be
+#                 collapsed into two.
+farm_artifact_state() {
+    local dest="$1" rel="$2" cur comp
+    local IFS=/
+    cur="$dest"
+    for comp in $rel; do
+        if [ -e "$cur/$comp" ] || [ -L "$cur/$comp" ]; then
+            cur="$cur/$comp"
+            continue
+        fi
+        if [ -x "$cur" ]; then
+            printf 'absent\n'
+        else
+            printf 'indeterminate\n'
+        fi
+        return 0
+    done
+    printf 'present\n'
 }
 
 # farm_retired_entries <manifest> — print the declared retirements, one per line,
@@ -168,10 +194,12 @@ farm_removal_problem() {
     local dest="$1" rel="$2" declared="${3:-}"
     local path="$dest/$2" rel_dir parent resolved_dest expected drel
 
-    if [ ! -e "$path" ] && [ ! -L "$path" ]; then
-        printf 'nothing is installed at that path'
-        return 1
-    fi
+    case "$(farm_artifact_state "$dest" "$rel")" in
+        present) : ;;
+        absent)  printf 'nothing is installed at that path'; return 1 ;;
+        *)       printf 'its location cannot be read (a directory on its path is not searchable), so it can be neither verified nor removed'
+                 return 1 ;;
+    esac
 
     # CONTAINMENT — the parent must resolve to EXACTLY the directory the relative path
     # names, not merely to somewhere inside $DEST. "Inside $DEST" would let a symlinked
@@ -288,8 +316,7 @@ farm_unfarm() {
     # PASS 1 — validate every entry. Nothing is removed here.
     while IFS= read -r rel; do
         [ -n "$rel" ] || continue
-        path="$dest/$rel"
-        if [ ! -e "$path" ] && [ ! -L "$path" ]; then
+        if [ "$(farm_artifact_state "$dest" "$rel")" = absent ]; then
             absent=$((absent + 1))      # already applied (or never landed): idempotent, not a problem
             continue
         fi
@@ -311,7 +338,7 @@ farm_unfarm() {
     while IFS= read -r rel; do
         [ -n "$rel" ] || continue
         path="$dest/$rel"
-        [ -e "$path" ] || [ -L "$path" ] || continue
+        [ "$(farm_artifact_state "$dest" "$rel")" = absent ] && continue
         if ! problem="$(farm_removal_problem "$dest" "$rel" "$declared")"; then
             # STOP, for the same reason as a failed `rm` below: the set is already known to be
             # un-appliable, so continuing would delete MORE after that was established.
@@ -376,7 +403,15 @@ farm_check_declared_shrink() {
         # the #1931 "farm file failed to land" class this list must never confuse with a
         # retirement. Reporting those would block every later sync over a file that is not on
         # disk, and its prescribed remedy (declare it retired) would remove nothing.
-        [ -e "$dest/$prev" ] || [ -L "$dest/$prev" ] || continue
+        case "$(farm_artifact_state "$dest" "$prev")" in
+            absent) continue ;;      # nothing deployed = nothing to orphan
+            indeterminate)
+                printf 'ERROR: cannot tell whether %s is still installed — a directory on its path is\n' "$prev" >&2
+                printf '       not searchable, so "not installed" is not a verifiable answer. Refusing to\n' >&2
+                printf '       guess: a guess here either blocks the sync or orphans a live artifact.\n' >&2
+                rc=1
+                continue ;;
+        esac
         printf 'ERROR: %s was DECLARED and INSTALLED here by a previous run, and is now NEITHER farmed NOR retired.\n' "$prev" >&2
         printf '       TWO causes are possible, with OPPOSITE remedies — pick the right one:\n' >&2
         printf '        (1) the name really LEFT the farm: add its deployed path to\n' >&2

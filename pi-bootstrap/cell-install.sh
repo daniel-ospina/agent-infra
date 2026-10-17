@@ -816,14 +816,28 @@ verify_layer() {
              fail "RETIREMENT CONTRADICTION: $retired_rel is declared RETIRED but a farm array still declares it — the copy leg re-creates it, so the retirement can never be applied"
            done <<<"$conflict_out" ;;
       esac
+      local retired_present=0
       while IFS= read -r retired_rel; do
         [ -n "$retired_rel" ] || continue
         retired_n=$((retired_n + 1))
-        if [ -e "$DEST/$retired_rel" ] || [ -L "$DEST/$retired_rel" ]; then
-          fail "RETIRED ARTIFACT STILL PRESENT: $retired_rel — the repo declares it retired and this cell would keep executing it (#1924); re-run --install, or remove it by hand if the checkout is the stale side"
-        fi
+        # THREE states, never two (#1924): `[ -e ]` answers false both for "absent" and for
+        # "cannot be read", and reading the second as the first certifies a cell that is
+        # still executing the retired artifact.
+        case "$(farm_artifact_state "$DEST" "$retired_rel")" in
+          present)
+            retired_present=$((retired_present + 1))
+            fail "RETIRED ARTIFACT STILL PRESENT: $retired_rel — the repo declares it retired and this cell would keep executing it (#1924); re-run --install, or remove it by hand if the checkout is the stale side" ;;
+          absent) : ;;
+          *)
+            retired_present=$((retired_present + 1))
+            fail "CANNOT VERIFY the retired artifact $retired_rel is absent — a directory on its path is not searchable, so 'absent' is not a verifiable answer; fix the permissions and re-run --verify" ;;
+        esac
       done <<<"$retired_list"
-      say "verified $retired_n declared retirement(s) absent from the cell"
+      # The success line is only true when nothing above failed: an operator reading the log
+      # must never see "verified … absent" next to a FAIL about the same leg.
+      if [ "$retired_present" -eq 0 ]; then
+        say "verified $retired_n declared retirement(s) absent from the cell"
+      fi
 
       # ...and that the leg RAN against THIS declaration. With an empty retirement list the
       # loop above is vacuous — it cannot distinguish "nothing to retire" from "the leg never

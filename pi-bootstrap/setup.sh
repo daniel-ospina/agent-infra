@@ -669,9 +669,10 @@ if ! farm_check_declared_shrink "$DEST" "$BOOTSTRAP_DIR/farm-retired.txt" "$farm
   echo "       previous run is now neither farmed nor retired (it would be ORPHANED), or the" >&2
   echo "       retirement list could not be read. Everything below this point" >&2
   echo "       did NOT run: launchd convergence, the shell-profile wiring, the TORTOISE_HOME probe." >&2
-  echo "       The copy legs above completed (nothing was deleted), but this is NOT proof the farm" >&2
-  echo "       is current: an OLDER checkout declares fewer names than this box already has. Decide" >&2
-  echo "       which cause it is — the two remedies are opposite (see above)." >&2
+  echo "       The retirement leg has not run, so IT deleted nothing (the earlier legacy-path cleanup" >&2
+  echo "       may have removed a deprecated directory). This is NOT proof the farm is current: an" >&2
+  echo "       OLDER checkout declares fewer names than this box already has. Decide which cause it" >&2
+  echo "       is — the two remedies are opposite (see above)." >&2
   exit 1
 fi
 if ! farm_unfarm "$DEST" "$BOOTSTRAP_DIR/farm-retired.txt" "$farm_declared_rel"; then

@@ -352,8 +352,15 @@ refused_entry 'scripts/../outside.sh'
 refused_entry 'extensions/vision-interceptor'
 refused_entry 'scripts/a b.sh'
 refused_entry 'scripts/a	b.sh'
-refused_entry 'scripts'
 refused_entry 'scripts/'
+printf 'scripts\n' > "$SAFE/root.txt"
+if farm_retired_entries "$SAFE/root.txt" > "$SAFE/root.out" 2> "$SAFE/root.err"; then
+  fail "(d) the farm root itself was accepted as a retirement entry"
+elif ! grep -q 'farm root itself' "$SAFE/root.err"; then
+  fail "(d) 'scripts' was refused by an unrelated branch — the farm-root guard is unreachable: $(cat "$SAFE/root.err")"
+else
+  ok "(d) refused: scripts (named as the farm root)"
+fi
 refused_entry 'scripts/$(id).sh'
 refused_entry 'scripts/;rm -rf x'
 if [ -f "$SAFE/dest/scripts/canary.sh" ] && [ -f "$SAFE/outside.sh" ]; then
@@ -462,6 +469,44 @@ else
     fail "(e) a refused (unreadable) run removed something"
   else
     ok "(e) unreadable list is an error, nothing removed"
+  fi
+fi
+
+# `[ -e ]` answers FALSE for "cannot be read" exactly as it does for "absent", so an artifact
+# under a directory that is not searchable (mode 000, another user's, an ACL, NFS root-squash)
+# read as ALREADY RETIRED: rc 0, "0 removed", and `--verify` certified the cell while the
+# retired script was still deployed. The three states must stay three.
+if [ "$(id -u)" = "0" ]; then
+  ok "(e) skipped the unreadable-location pins: running as root, where directory permissions are not enforced"
+else
+  HID="$TMP/hidden"
+  mkdir -p "$HID/dest/scripts/legacy"
+  printf 'stale dispatcher\n' > "$HID/dest/scripts/legacy/old.sh"
+  printf 'scripts/legacy/old.sh\n' > "$HID/manifest.txt"
+  chmod 000 "$HID/dest/scripts/legacy"
+  out="$(farm_unfarm "$HID/dest" "$HID/manifest.txt" '' 2>&1)"; rc=$?
+  chmod 755 "$HID/dest/scripts/legacy"
+  if [ "$rc" -eq 0 ]; then
+    fail "(e) a retirement under an UNREADABLE directory exited 0 ('already absent') while the artifact was still there: $out"
+  elif ! grep -q 'cannot be read' <<<"$out"; then
+    fail "(e) the unreadable location was not named as the reason ($out)"
+  elif grep -q 'already absent' <<<"$out"; then
+    fail "(e) an unreadable location was counted as 'already absent' (indistinguishable from a real retirement): $out"
+  else
+    ok "(e) an unreadable location is a refusal, not 'already absent'"
+  fi
+  # ...and the shrink check must not read it as "nothing deployed, nothing to orphan".
+  : > "$HID/empty.txt"
+  farm_record_declared "$HID/dest" $'scripts/legacy/old.sh\nscripts/other.sh\n' >/dev/null 2>&1
+  chmod 000 "$HID/dest/scripts/legacy"
+  out="$(farm_check_declared_shrink "$HID/dest" "$HID/empty.txt" $'scripts/other.sh\n' 2>&1)"; rc=$?
+  chmod 755 "$HID/dest/scripts/legacy"
+  if [ "$rc" -eq 0 ]; then
+    fail "(e) the shrink check treated an unreadable location as 'not installed' and stayed green"
+  elif ! grep -q 'cannot tell whether' <<<"$out"; then
+    fail "(e) the shrink check did not say the answer was unknowable ($out)"
+  else
+    ok "(e) the shrink check refuses to guess when the location cannot be read"
   fi
 fi
 
@@ -660,10 +705,13 @@ fi
 # a stale copy left behind on an existing cell must be REFUSED by --verify (a cell is
 # certified by reading the artifact back, never by trusting the installer's own output)
 printf 'stale retired dispatcher\n' > "$CELL_DEST/scripts/$RETIRED_NAME"
-if CELL_HOME="$CELL_HOME" INFRA_ROOT="$COPY" bash "$CELL_INSTALL" --verify >> "$LOG" 2>&1; then
+out="$(CELL_HOME="$CELL_HOME" INFRA_ROOT="$COPY" bash "$CELL_INSTALL" --verify 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ]; then
   fail "(h) cell --verify CERTIFIED a cell that still carries a retired artifact (the false PASS)"
+elif grep -q 'declared retirement(s) absent from the cell' <<<"$out"; then
+  fail "(h) cell --verify printed 'verified … absent' for the leg it just FAILED (its report contradicts its verdict)"
 else
-  ok "(h) cell --verify refuses a cell that still carries the retired artifact"
+  ok "(h) cell --verify refuses a cell carrying the retired artifact, and does not claim it verified it"
 fi
 if CELL_HOME="$CELL_HOME" INFRA_ROOT="$COPY" bash "$CELL_INSTALL" --install >> "$LOG" 2>&1 \
    && [ ! -e "$CELL_DEST/scripts/$RETIRED_NAME" ] \
