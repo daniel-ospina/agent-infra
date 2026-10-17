@@ -138,6 +138,16 @@ fi
 # match. Inserting `continue=` between `alerts=` and `wip=` would have silently folded three fields
 # into `alerts`. A per-line extractor cannot have that failure mode and needs no format migration.
 _rec(){ sed -n "s/^$1=//p" "$STATE/lane-recap.last" 2>/dev/null | head -1; }
+# The recap/beat PAIR rule (_mdsha + beat_pair_ok), shared with heartbeat-loop.sh so the rule exists
+# ONCE. Sourcing is defensive: a partially-deployed script set must not break the FLOOR, and a
+# missing helper can only ever SUPPRESS the act clause (the caller tests for the function), never
+# publish an unverified number.
+if [ -f "$SCRIPTS/lib/beat-pair.sh" ]; then
+  . "$SCRIPTS/lib/beat-pair.sh"
+else
+  echo "cadence-nudge: $SCRIPTS/lib/beat-pair.sh is MISSING -- the recap/beat pair cannot be verified;" \
+       "the act clause will be suppressed (fail closed) until it is deployed" >&2
+fi
 # Initialised OUTSIDE the branch: the nudge is the one sender that must never fail under `set -u`,
 # so a missing recap must leave these defined (empty) rather than unbound.
 act=""; actfull=0
@@ -181,8 +191,34 @@ if [ -f "$STATE/lane-recap.last" ]; then
   act=""; actfull=0
   B="$STATE/NEEDS-ACTION.beat"
   if [ -s "$B" ] && [ -z "$(find "$B" -maxdepth 0 -mmin +20 2>/dev/null)" ]; then
-    act=$(sed -n 's/^act=//p' "$B" | head -1 | cut -c1-420)
-    actfull=$(sed -n 's/^actfull=//p' "$B" | head -1)
+    # A fresh mtime is NOT enough: verify the beat belongs to the recap on disk before publishing
+    # it. On a torn or unverifiable pair the clause is dropped and the older clauses stand -- the
+    # `actfull=0` degradation this file already relies on, never a number we cannot vouch for.
+    # ⛔ THE VERIFY-AND-READ IS ONE CALL FROM THE SHARED LIB, NOT TWO STEPS HERE (#1897 review, P2).
+    # Written out by hand it could be INVERTED -- and an inverted guard still matches every string a
+    # text-based wiring test looks for, which is exactly how this shipped past a green suite.
+    _bp_ok=0; _bp_why=""
+    if ! command -v beat_clause_verified >/dev/null 2>&1; then
+      _bp_why="beat_clause_verified unavailable -- $SCRIPTS/lib/beat-pair.sh not sourced (partial deploy?)"
+    elif act=$(beat_clause_verified "$STATE" 420); then
+      _bp_ok=1
+      actfull=$(sed -n 's/^actfull=//p' "$B" | head -1)
+    else
+      # The REASON is re-derived for the log line only; nothing is published on either branch, so a
+      # pair that healed between the two reads costs a misleading log word, never a clause.
+      _bp_why=$(beat_pair_ok "$STATE" 2>&1)
+      [ -n "$_bp_why" ] || _bp_why="pair not verifiable, no reason reported"
+    fi
+    if [ "$_bp_ok" != 1 ]; then
+      # ⛔ A SUPPRESSION MUST BE RECORDED, OR IT IS INVISIBLE (#1897 review). The driver is
+      # `cadence-timer.sh`, which runs this script as `( … ) >/dev/null 2>&1 &` -- so
+      # beat_pair_ok's stderr and the MISSING-helper warning above are BOTH DISCARDED. Without this
+      # line a PERMANENT suppression (e.g. beat-pair.sh absent from the lib farm, which is exactly how
+      # this guard first shipped) is indistinguishable from a healthy beat: same message, no clause,
+      # nothing anywhere saying so. The log is where an operator actually looks.
+      printf '%s NUDGE-SUPPRESSED recap/beat pair not verifiable: %s -- act clause withheld\n' \
+        "$(date '+%m-%d %H:%M:%S')" "$_bp_why" >> "$LOG"
+    fi
   fi
   case "$actfull" in 1) actfull=1 ;; *) actfull=0 ;; esac
   # ⛔ IS THIS THE ENRICHED RECAP OR THE EARLY FALLBACK? (2026-10-05) The tick writes the recap

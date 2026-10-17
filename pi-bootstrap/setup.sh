@@ -390,14 +390,22 @@ echo "    scripts fleet farm: $fleet_copied copied (fleet cadence, #373 + runner
 # record-review.sh WITHOUT diff-normalize.py degrades the producer to the raw
 # pre-#1362 digest — no false accept, but every base-only update goes back to
 # refusing carry-forward. Farm them together.
-lib_srcs=(pid-identity.sh diff-normalize.py)
+# #1897 H3 adds a THIRD sibling: the floor (`cadence-nudge.sh`) and the fleet
+# heartbeat (`heartbeat-loop.sh`) both have to decide whether the recap/beat pair
+# they are about to publish/read is VERIFIABLE, and both must decide it the same
+# way — a second copy of the rule is how the two drift apart. They share
+# `scripts/lib/beat-pair.sh` (same sibling-resolution contract as above: the
+# scripts resolve it as `$(dirname "${BASH_SOURCE[0]}")/lib/beat-pair.sh`). A
+# missing lib makes the guard FAIL CLOSED: the pair is treated as unverifiable
+# and the act clause is withheld, with a logged reason — never a silent pass.
+lib_srcs=(pid-identity.sh diff-normalize.py beat-pair.sh)
 mkdir -p "$DEST/scripts/lib"
 lib_copied=0
 lib_failed=0
 for base in "${lib_srcs[@]}"; do
   f="$INFRA_ROOT/scripts/lib/$base"
   if [ ! -f "$f" ]; then
-    echo "    scripts lib farm: MISSING $f — a declared sibling did not land, so the producer will fall back to the RAW digest" >&2
+    echo "    scripts lib farm: MISSING $f — a declared sibling did not land, so its consumers cannot verify what it provides" >&2
     lib_failed=$((lib_failed+1))
     continue
   fi
@@ -422,9 +430,9 @@ for base in "${lib_srcs[@]}"; do
   fi
 done
 if [ "$lib_failed" -gt 0 ]; then
-  echo "    scripts lib farm: $lib_copied copied, $lib_failed FAILED/MISSING (pid-identity.sh + diff-normalize.py, #1178)" >&2
+  echo "    scripts lib farm: $lib_copied copied, $lib_failed FAILED/MISSING (pid-identity.sh + diff-normalize.py + beat-pair.sh, #1178/#1362)" >&2
 else
-  echo "    scripts lib farm: $lib_copied copied (pid-identity.sh + diff-normalize.py, #1178)"
+  echo "    scripts lib farm: $lib_copied copied (pid-identity.sh + diff-normalize.py + beat-pair.sh, #1178/#1362)"
 fi
 
 # Fleet-tools farm (#1178 unit 3): the scheduled lane-liveness report
