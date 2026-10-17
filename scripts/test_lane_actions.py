@@ -1417,10 +1417,14 @@ def test_proven_cpu_progress_outranks_an_unconfirmed_binding():
 
 
 def test_the_cpu_veto_is_consulted_at_the_decision_not_only_in_a_comment():
-    """⛔ WIRING PIN, DELIBERATELY A SOURCE ASSERTION. `build()`'s bucket loop routes a STEP-2 verdict
-    to `quiet` -- so a Step-2 verdict that must be SEEN has to be exempted there, and that one-line
-    exemption is the difference between `UNATTRIBUTED-WORKING` being reported and being silently
-    dropped. The behaviour either side is covered above; this pins the call site."""
-    src = open(os.path.join(HERE, "lane-actions.py"), encoding="utf-8").read()
-    assert 'and c.get("action") != "report":' in src, \
-        "the quiet route must exempt a report-only Step-2 verdict (otherwise it is never seen)"
+    """⛔ WIRING, ASSERTED THROUGH `build()` -- NOT THROUGH THE SOURCE TEXT. The bucket loop routes a
+    STEP-2 verdict to `quiet`, so a Step-2 verdict that must be SEEN has to be exempted there, and
+    that exemption is the difference between `UNATTRIBUTED-WORKING` being reported and being
+    silently dropped. A source-substring assertion (the first version of this leg) survived the
+    routing being removed whenever the same text remained anywhere in the file -- a comment
+    included -- and went red on any reformat, so it pinned spelling, not behaviour (#1867 review)."""
+    res = LA.build([row(lane="ua2", cpu=None, cpu_any=True, stale_s=48840, verdict="DONE-IDLE")],
+                   FakeLS(files={"sid-1": "/x/s.jsonl"}), None, use_jev=False, live={"WS-1"})
+    assert [c["lane"] for c in res["report"]] == ["ua2"], \
+        "a report-only Step-2 verdict must be REPORTED, not routed to quiet (%r)" % (res,)
+    assert "ua2" not in {c["lane"] for c in res["quiet"]}

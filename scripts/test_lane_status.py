@@ -1058,3 +1058,70 @@ def test_a_stale_binding_with_no_live_writer_stays_verified(L, monkeypatch, tmp_
     monkeypatch.setattr(L, "_content_session", lambda label, cf: None)
     sid, verified = L.resolve_session_ex("WS")
     assert sid == "44444444-4444-4444-4444-444444444444" and verified is True
+
+
+# ── the veto's REACH: it may only veto the idle family (#1867 review) ─────────────────────────
+# `cpu_any` says SOME pi in the lane's directory consumed CPU -- never WHICH one. A CHILD-STUCK
+# verdict is a diagnosis of the CHILD, and `lane-actions` routes CHILD-STUCK to the UNBLOCK list.
+# Ranking the veto above the child branches (its first placement) withdrew that unblock on exactly
+# the shape the label was written for: a child spinning under a stalled parent.
+
+def test_unattributed_progress_does_not_mask_a_stuck_child(L):
+    """⛔ THE VETO VETOES IDLE, NOT CHILD EVIDENCE. Control and test differ ONLY in `cpu_any`, so
+    this fails on the pre-fix ordering (which returned `UNATTRIBUTED-WORKING` for the second
+    assertion) and passes once the veto sits below the child branches."""
+    kw = dict(stale=5000, grew=False, spinner=True, last_kind="tool", child={"age": 4000},
+              child_stale=4000, child_grew=None, child_activity_age=4000,
+              tool_inflight=None, last_stop="toolUse", has_sid=True)
+    assert L.classify(**kw) == L.CHILD_STUCK, "control: a quiet child under a stopped parent"
+    assert L.classify(cpu_any=True, **kw) == L.CHILD_STUCK, \
+        "unattributed progress must not withdraw the child-stuck unblock"
+    # ...and the veto still bites where it is aimed: the idle family, not the child diagnosis.
+    idle = dict(stale=48000, grew=False, spinner=False, last_kind="assistant", child=None,
+                child_stale=None, child_grew=None, child_activity_age=None, tool_inflight=None,
+                last_stop="stop", has_sid=True)
+    assert L.classify(cpu_any=True, **idle) == L.UNATTRIBUTED_WORKING
+
+
+def test_a_fresh_writer_that_names_another_lane_does_not_unverify_this_binding(L, monkeypatch,
+                                                                             tmp_path):
+    """⛔ A SHARED SESSIONS DIR IS NOT AN UNEXPLAINED WRITER (#1867 review). The sessions dir is
+    keyed by the mangled cwd, and this file's own census records nine lanes sharing one cwd. Without
+    the label exclusion, every quiet lane in such a directory returned `verified=False` on every
+    read while a co-located lane wrote -- permanently `UNVERIFIED-SESSION`, report-only, so a free
+    lane could never be offered work AND its DEAD/WEDGED/CHILD-STUCK diagnosis was withdrawn. The
+    control is `test_a_stale_binding_with_a_freshly_written_sibling_is_unverified`: a writer nobody
+    can name still abstains."""
+    import json as _json
+    import time as _time
+    old = tmp_path / "66666666-6666-6666-6666-666666666666.jsonl"
+    old.write_text("{}\n")
+    os.utime(str(old), (_time.time() - 4000, _time.time() - 4000))      # quiet > 30m
+    sib = tmp_path / "77777777-7777-7777-7777-777777777777.jsonl"
+    sib.write_text(_json.dumps({"type": "user",
+                                "message": {"role": "user",
+                                            "content": "Other One: land the queue cleanup"}}) + "\n")
+    monkeypatch.setattr(L, "sh", lambda *a, **k:
+                        "cd -- '/x' ; exec pi --session' '66666666-6666-6666-6666-666666666666'")
+    monkeypatch.setattr(L, "_recorded_session", lambda ws: None)
+    monkeypatch.setattr(L, "session_file", lambda sid: str(old))
+    monkeypatch.setattr(L, "_content_session", lambda label, cf: None)   # the label match missed
+    monkeypatch.setattr(L, "registry", lambda: [("This Lane", "WS", ""), ("Other One", "WS2", "")])
+    sid, verified = L.resolve_session_ex("WS")
+    assert sid == "66666666-6666-6666-6666-666666666666"
+    assert verified is True, (
+        "a fresh writer whose first user message NAMES a co-located lane is that lane working -- "
+        "not an unexplained writer, so this binding stays confirmed")
+
+
+def test_the_human_table_fits_the_longest_verdict(L):
+    """⛔ THE OPERATOR'S PRIMARY ARTIFACT IS A FIXED-WIDTH TABLE (#1867 review). The VERDICT column
+    was 14 wide while `UNATTRIBUTED-WORKING` -- the newest, most safety-critical label -- is 20, so
+    every row in that table shifted its SELF/UI/INBOUND/CHILD columns. The column width is a module
+    constant so this can be asserted WITHOUT pinning a format string's spelling."""
+    printed = (L.WORKING, L.WAITING, L.WIP_IDLE, L.DONE_IDLE, L.WEDGED, L.EMPTY, L.UNKNOWN,
+               L.UNBOUND, L.UNATTRIBUTED_WORKING, L.CHILD_STUCK, L.WAITING_OVERDUE, L.LONG_TOOL)
+    longest = max(printed, key=len)
+    assert len(longest) <= L.VERDICT_COL, (
+        "verdict %r is %d chars but the table formats the VERDICT column at %d -- every column to "
+        "its right shifts" % (longest, len(longest), L.VERDICT_COL))

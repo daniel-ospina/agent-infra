@@ -589,25 +589,50 @@ exercised by a leg rather than assumed — including the two shapes that must ab
 ## 10. `idle` must pass through Step 2, and a stale binding is never verified (#1867)
 
 §9's rule — *liveness must be proven from an artifact, not from a record* — has a second surface: the
-**lane classifier** (`scripts/lane-status.py` → `scripts/lane-actions.py`), which produces the `IDLE`
-list the beat and the dispatcher act on. Measured 2026-10-16 20:47Z: a lane whose `ps -o time`
-advanced **+4.93s over 25s** (pane showing an active spinner, transcript mtime current) was published
-as `DONE-READY — no session write for 13h34m`, and the beat prescribed *"hand each the next unheld
+**lane classifier** (`scripts/lane-status.py` → `scripts/lane-actions.py`), whose verdicts and
+`NEEDS-ACTION.md` lists the beat, `queue-dispatch.py` and a human act on. Measured 2026-10-16 20:47Z: a
+lane whose `ps -o time` advanced **+4.93s over 25s** (pane showing an active spinner, transcript mtime
+current) was published as `DONE_READY` (the words-layer label, over the mechanical
+`DONE-IDLE — no session write for 13h34m`), and the beat prescribed *"hand each the next unheld
 item"* — into a lane at 85% context, mid-turn. Two independent causes, both of them **a record
 standing in for a proof**:
 
+**Scope, stated so this section is not read as closing more than it does.** It covers the
+`lane-status.py` verdict and the `lane-actions.py` lists. It does **not** cover the beat's `CAPACITY`
+clause, which `orchestrator-heartbeat.sh` takes from `lane-triage.py` (a `$HOME/.pi/agent/state/` tool,
+not a repo file), nor `queue-dispatch.py`'s own `DONE-IDLE` gate: both read
+`lane-status.py --json` **directly** and neither was changed here, so a false-capacity line from
+either path is not closed by this section.
+
 | # | cause | rule now enforced |
 |---|---|---|
-| **a** | `lane_cpu_busy()` answers only with **exactly one lane ↔ exactly one pid**. A `task` **child is a second pi in the lane's own cwd**, so every lane waiting on a child got `None` from Step 2 — and `None` is *unread*, not *parked*. Step 2 was then skipped, and the verdict was taken from the transcript mtime alone. | `lane_cpu_progress()` answers the weaker question — *did a pi in this lane's own directory consume CPU?* — and returns **only `True` or `None`, never `False`** ("no pid I could see moved" is not "parked"). In a one-lane directory the work counted is this lane's or its child's. It yields `UNATTRIBUTED-WORKING`: **reported, never dispatched, never unblocked**. Deliberately not `WORKING`, which would short-circuit a real `WEDGED`/`CHILD-STUCK` on a child spinning under a stalled parent. |
-| **b** | the pane's resume record was **stale**. `resolve_session_ex()` treated a pane-provided id as authoritative even when the bound file had been quiet for 13h while *another* session file in the same directory was written in the same minute — a hand relaunch (`pi --session <id>`) leaves cmux carrying the old id. | a quiet bound file **plus a fresh sibling writer in the same directory** is an *unconfirmed* binding: `verified=False`, which makes the consumer abstain (`UNVERIFIED-SESSION`) — never `idle`, never `dead`. |
+| **a** | `lane_cpu_busy()` answers only with **exactly one lane ↔ exactly one pid**. A `task` **child is a second pi in the lane's own cwd**, so every lane waiting on a child got `None` from Step 2 — and `None` is *unread*, not *parked*. Step 2 was then skipped, and the verdict was taken from the transcript mtime alone. | `lane_cpu_progress()` answers the weaker question — *did a pi in this lane's own directory consume CPU?* — and returns **only `True` or `None`, never `False`** ("no pid I could see moved" is not "parked"). In a one-lane directory the work counted is this lane's or its child's. It yields `UNATTRIBUTED-WORKING`: **reported, never dispatched, never unblocked**. Deliberately not `WORKING`, which would short-circuit a real `WEDGED`/`CHILD-STUCK` on a child spinning under a stalled parent. It vetoes **only the idle family**: it is asked *below* the child branches (a `cpu_any` read cannot say WHICH pi burned the CPU, so it may not overrule a diagnosis of the child) and *above* every idle proxy. |
+| **b** | the pane's resume record was **stale**. `resolve_session_ex()` treated a pane-provided id as authoritative even when the bound file had been quiet for 13h while *another* session file in the same directory was written in the same minute — a hand relaunch (`pi --session <id>`) leaves cmux carrying the old id. | a quiet bound file **plus a fresh sibling writer in the same directory that names no other registered lane** is an *unconfirmed* binding: `verified=False`, which makes the consumer abstain (`UNVERIFIED-SESSION`) — never `idle`, never `dead`. A writer whose first user message NAMES a co-located lane is that lane working, not evidence about this one, so a shared sessions dir (the measured nine-lanes-one-cwd case) does not go permanently `UNVERIFIED-SESSION`; a writer nobody can name still does. |
 
-**Ordering.** `lane-actions.classify_row()` asks Step 2 **before** the Step-0 identity abstentions:
-proven CPU progress is evidence about the **lane**, not about which session file the pane was
-launched with, so it settles the question the binding was going to answer — and it can only move a
-lane *out* of every action list.
+**Ordering — the two halves rank differently, and that is the rule.** Only the **strict** `cpu` read
+(exactly one lane ↔ exactly one pid) is asked *before* the Step-0 identity abstentions: it names the
+lane's own pi, so it is evidence about the **lane**, not about which session file the pane was
+launched with, and it settles the question the binding was going to answer. The **weaker** `cpu_any`
+read ranks *below* identity, existence and child evidence — it cannot say WHICH pi advanced, so
+ranking it higher would short-circuit a real `CHILD-STUCK`/`WAITING-CHILD` (a lost unblock, and one
+this change reproduced before the ordering was fixed) — and it vetoes only the **idle family**.
+Consequence, stated so it is not mistaken for a gap: on the measured lane (stale binding **and**
+unattributed progress) `lane-actions` publishes `UNVERIFIED-SESSION`, not `UNATTRIBUTED-WORKING`;
+both are report-only, and neither dispatches nor unblocks. Every one of these rankings can only move
+a lane *out* of an action list.
 
 **Polarity.** Both answers fail toward `UNKNOWN`/report-only. Positive progress can only *suppress* an
-offer of work; it never invents one, and it never prescribes a relaunch.
+offer of work; it never invents one, and it never prescribes a relaunch. `UNATTRIBUTED-WORKING` is
+printed by `lane-status.py` (the human table's VERDICT column is sized for its 20 characters),
+carried in `--json`, listed in `lane-actions`' **report** section, and — since it *is* proven CPU
+progress — counted as **active** by `orchestrator-heartbeat.sh`, which deliberately neither alerts on
+it (it prescribes nothing) nor, before this change, counted it at all.
 
-The suites that pin it: `python3 -m pytest scripts/test_lane_status.py scripts/test_lane_actions.py`
-(the nine legs added with the fix fail on the pre-change files).
+The suites that pin it: `python3 -m pytest scripts/test_lane_status.py scripts/test_lane_actions.py`.
+Measured non-vacuity, on both baselines: **10 of the 13 added pytest legs fail on `origin/main`**
+(pre-feature), and **3 fail on this change's own reviewed head `7e13f91d2`** — the veto's reach over
+`CHILD-STUCK`, a fresh writer that NAMES a co-located lane, and the table's verdict width (two of them
+are in both sets). Two legs pass on every baseline by design: the control
+`test_a_stale_binding_with_no_live_writer_stays_verified`, and
+`test_the_cpu_veto_is_consulted_at_the_decision_not_only_in_a_comment`, which replaces a
+source-substring assertion with a behavioural one over behaviour this round did not change.

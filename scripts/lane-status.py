@@ -158,6 +158,11 @@ WAITING_INBOUND = "RECENT-INBOUND"
 # for a child that is spinning under a wedged parent. This label only vetoes the IDLE family.
 UNATTRIBUTED_WORKING = "UNATTRIBUTED-WORKING"
 
+# Width of the human table's VERDICT column. ⛔ A FIXED WIDTH MUST FIT THE LONGEST VERDICT THIS
+# TOOL CAN PRINT, or every row below it shifts and the operator's primary artifact misaligns on
+# exactly the newest verdict. `UNATTRIBUTED-WORKING` (20) is the longest; pinned by a test.
+VERDICT_COL = 20
+
 
 def inbound_discounts_idle(verdict, inbound_age, stale_s=None):
     """Does a recent INBOUND event discount this verdict -- i.e. "do not call this idle"?
@@ -853,7 +858,8 @@ def resolve_session_ex(ws):
     # technique match-lanes.py uses to disambiguate a shared sessions directory.
     cf = session_file(chosen)
     if cf and (time.time() - os.path.getmtime(cf)) > 1800:
-        label = next((l for l, w, _ in registry() if w == ws), "")
+        reg = registry()
+        label = next((l for l, w, _ in reg if w == ws), "")
         alt = _content_session(label, cf)
         if alt:
             return os.path.basename(alt)[:-len(".jsonl")].split("_")[-1], True
@@ -869,10 +875,19 @@ def resolve_session_ex(ws):
         #
         # The polarity is the fleet's: an unexplained fresh writer in this lane's directory means the
         # binding is NOT confirmed, so ABSTAIN. Never `idle` from it, never `dead` from it.
-        if _live_sibling_session(cf):
+        others = [l for l, w, _ in reg if (w or "").upper() != (ws or "").upper()]
+        if _live_sibling_session(cf, others):
             return chosen, False
     if had_pane or not expect_live:
-        # ⛔ A QUIET SESSION IS NOT AN UNCONFIRMED ONE. The PANE is authoritative about which
+        # ⛔ A QUIET SESSION IS NOT AN UNCONFIRMED ONE -- WITH ONE NARROW, NAMED EXCEPTION. The
+        # exception is the block directly above: an UNEXPLAINED fresh writer in the same directory
+        # (`_live_sibling_session`) means the bound id is not corroborated, so the read abstains.
+        # Everything this rule protects still holds: a lane waiting on a long child writes nothing
+        # while the child runs, and the child's transcript lives in `TASK_SD` (not here) or, when it
+        # shares this dir, a co-located LANE's writer is NAMED and excluded. The exception's
+        # failure direction is report-only -- never a dispatch, never a relaunch. Stating it here
+        # because a silent narrowing of a ⛔ rule is how the rule later reads as an accident.
+        # The PANE is authoritative about which
         # session it is running, and a lane waiting on a long child writes NOTHING for as long as
         # the child runs -- that is the shape this whole file exists to classify correctly. So
         # "the file has not been written for an hour" must NOT be read as "this is not the live
@@ -885,13 +900,20 @@ def resolve_session_ex(ws):
     return chosen, bool(cf) and (time.time() - os.path.getmtime(cf)) <= SESSION_VERIFY_S
 
 
-def _live_sibling_session(bound_file):
-    """A newer session file in the same lane directory that is being written RIGHT NOW.
+def _live_sibling_session(bound_file, exclude_labels=()):
+    """A newer session file in the same lane directory that is being written RIGHT NOW, whose
+    first user message names NO OTHER registered lane.
 
     Nothing more is claimed. It is a statement about the DIRECTORY, not about a lane: the sessions
     dir is a mangling of the cwd, so a fresh sibling may belong to another lane that shares this
-    cwd. That ambiguity is exactly why this feeds an ABSTENTION (`verified=False`) instead of a
-    repair -- resolving it to an id would be a guess, and a guess here is a dispatch.
+    cwd. That ambiguity is why this feeds an ABSTENTION (`verified=False`) instead of a repair --
+    resolving it to an id would be a guess, and a guess here is a dispatch -- and why a writer that
+    NAMES a co-located lane (`exclude_labels`) is excluded outright: that is a KNOWN lane working,
+    which is not evidence about this one (#1867, 2026-10-17). Without that exclusion every quiet
+    lane in a shared dir went permanently `UNVERIFIED-SESSION` while a sibling wrote -- the fleet's
+    own census records nine lanes on one cwd -- which withdraws the DEAD/WEDGED/CHILD-STUCK
+    diagnosis of a healthy lane AND makes a genuinely free one unofferable. A writer nobody can
+    name is still exactly the shape this rule is for.
 
     The window is `SESSION_VERIFY_S`, the file's own already-stated bound for "recent enough to be
     the live session". A lane inside a long tool call writes nothing to its OWN file for minutes,
@@ -912,8 +934,11 @@ def _live_sibling_session(bound_file):
             mt = os.path.getmtime(f)
         except OSError:
             continue
-        if mt > base and (now - mt) <= SESSION_VERIFY_S:
-            return f
+        if not (mt > base and (now - mt) <= SESSION_VERIFY_S):
+            continue
+        if any(names_label(_first_user_message(f), l) for l in exclude_labels):
+            continue                    # a KNOWN co-located lane's writer -> explained, not evidence
+        return f
     return None
 
 
@@ -942,6 +967,25 @@ def _first_user_message(path):
     return ""
 
 
+def names_label(text, label):
+    """Does `text` NAME `label`? The fleet's identity signal, in ONE place.
+
+    ⛔ ONE MATCHER, TWO CALLERS (2026-10-17). `_content_session` asks it of a candidate session
+    file's first user message; `_live_sibling_session` asks it of a fresh writer to tell a KNOWN
+    sibling lane (explained) from an unexplained one. Two copies of a fuzzy token match would be
+    two definitions of "this file is that lane" -- and the rule this replaces drifted on exactly
+    that.
+    """
+    stop = {"and", "the", "of", "for", "core", "keys", "lane"}
+    toks = [t for t in re.split(r"[^a-z0-9]+", (label or "").lower())
+            if len(t) > 2 and t not in stop]
+    if not toks or not text:
+        return False
+    need = max(1, (len(toks) + 1) // 2)
+    low = str(text).lower()
+    return sum(1 for t in toks if t in low) >= need
+
+
 def _content_session(label, stale_file):
     """Newest session file in the lane's dir whose first user message names the lane.
 
@@ -951,11 +995,6 @@ def _content_session(label, stale_file):
     d = os.path.dirname(stale_file or "")
     if not (label and os.path.isdir(d)):
         return None
-    stop = {"and", "the", "of", "for", "core", "keys", "lane"}
-    toks = [t for t in re.split(r"[^a-z0-9]+", label.lower()) if len(t) > 2 and t not in stop]
-    if not toks:
-        return None
-    need = max(1, (len(toks) + 1) // 2)
     try:
         base = os.path.getmtime(stale_file)
     except OSError:
@@ -969,8 +1008,8 @@ def _content_session(label, stale_file):
             continue
         if mt <= base or mt < cutoff:
             continue
-        txt = _first_user_message(f).lower()
-        if txt and sum(1 for t in toks if t in txt) >= need and mt > bmt:
+        txt = _first_user_message(f)
+        if txt and names_label(txt, label) and mt > bmt:
             best, bmt = f, mt
     return best
 
@@ -1519,15 +1558,6 @@ def classify(stale, grew, spinner, last_kind, child, child_stale, child_grew,
     # so a False here changes nothing and only a PROVEN True short-circuits.
     if cpu_busy:
         return WORKING
-    # ⛔ STEP 2 SAW PROGRESS BUT COULD NOT NAME THE PID (#1867). This is the multi-pid case a `task`
-    # child creates (see `lane_cpu_progress`). It is checked HERE, with Step 2, because it is the
-    # same evidence at lower resolution -- and it must be checked BEFORE every proxy below, since
-    # each of them (quiet transcript, stale screen, no child record) reads "nothing is happening"
-    # for a lane that is demonstrably consuming CPU. Returning a NON-idle verdict is the whole
-    # point: `DONE-IDLE` is an instruction to dispatch, and `UNATTRIBUTED-WORKING` is neither
-    # dispatchable nor an action.
-    if cpu_any:
-        return UNATTRIBUTED_WORKING
     if last_kind is None:
         # No session binding (or no records) -- which is NOT the same as the
         # pane having no session. Reported as unattributable, not as absent.
@@ -1551,6 +1581,12 @@ def classify(stale, grew, spinner, last_kind, child, child_stale, child_grew,
         # definite-value class as the four sites `_idle_verdict()` covers; found by review, not by
         # the tests. Measured: `classify(stale=None, grew=False, spinner=None, last_kind=None,
         # has_sid=True)` -> `DONE-IDLE` before, -> `UNKNOWN` after.
+        #
+        # ⛔ AND A LANE HOLDING NO EVENTS YET IS NOT AUTOMATICALLY A FRESH ONE (#1867). With proven
+        # progress in its own directory it is working (or its child is), so the dispatchable verdict
+        # below must not be minted for it. `UNATTRIBUTED-WORKING` is neither dispatched nor unblocked.
+        if cpu_any:
+            return UNATTRIBUTED_WORKING
         return _idle_verdict(spinner) if has_sid else UNBOUND
     if grew:
         return WORKING
@@ -1660,6 +1696,22 @@ def classify(stale, grew, spinner, last_kind, child, child_stale, child_grew,
         if child["age"] is not None and child["age"] > OVERDUE_S:
             return WAITING_OVERDUE              # past the watchdog's own bound
         return WAITING
+    # ⛔ STEP 2 SAW PROGRESS BUT COULD NOT NAME THE PID (#1867) -- the multi-pid case a `task` child
+    # creates (see `lane_cpu_progress`). WHERE THIS SITS IS THE RULE:
+    #   · BELOW the child branches, because `CHILD-STUCK`/`CHILD-OVERDUE`/`WAITING-CHILD` are
+    #     diagnoses of the CHILD, and `cpu_any` cannot say WHICH pi consumed the CPU. Ranking it
+    #     above them would short-circuit a real CHILD-STUCK -- the verdict `lane-actions` routes to
+    #     the UNBLOCK list -- on exactly the shape the label exists for: a child spinning under a
+    #     stalled parent. MEASURED on this reproduction 2026-10-17: with the veto at the top,
+    #     `CHILD-STUCK` became `UNATTRIBUTED-WORKING`, i.e. a lost unblock.
+    #   · ABOVE the idle family (`_idle_verdict`, `WEDGED if spinner else DONE_IDLE`, `WIP-IDLE`),
+    #     because that is the branch the measured false capacity went through: every idle proxy
+    #     (quiet transcript, stale screen, no child record) reads "nothing is happening" for a lane
+    #     demonstrably consuming CPU, and a `DONE-IDLE` is an instruction to DISPATCH.
+    # It can only ever move a lane OUT of an action list: `UNATTRIBUTED-WORKING` is not in
+    # `ACTION_VERDICTS`, so nothing dispatches and nothing unblocks on it.
+    if cpu_any:
+        return UNATTRIBUTED_WORKING
     if stale is not None and stale > 600:
         # ── a COMPLETED turn is IDLE, never a wedge ──────────────────────────
         # The pane retains its last frame, spinner glyph included, so a static
@@ -2065,8 +2117,9 @@ def main():
              LONG_TOOL: 5, WAITING: 6, DONE_IDLE: 7, UNATTRIBUTED_WORKING: 7, WORKING: 8,
              UNKNOWN: 9}
     out.sort(key=lambda r: order.get(r["verdict"], 9))
-    print(f"{'LANE':<26} {'VERDICT':<14} {'SELF':>7} {'UI':<8} {'INBOUND':>10}  CHILD / LAST")
-    print("-" * 106)
+    print(f"{'LANE':<26} {'VERDICT':<{VERDICT_COL}} {'SELF':>7} {'UI':<8} {'INBOUND':>10}  "
+          "CHILD / LAST")
+    print("-" * (106 + VERDICT_COL - 14))
     for r in out:
         st = "-" if r["stale_s"] is None else (
             f"{r['stale_s']//3600}h{(r['stale_s']%3600)//60:02d}m" if r["stale_s"] >= 3600
@@ -2111,9 +2164,9 @@ def main():
             _sub = f"inbound={_sa//60}m{_sa%60:02d}s"
         else:
             _sub = f"inbound={_sa}s"
-        print(f"{r['lane']:<26} {r['verdict']:<14} {st:>7} {ui:<8} {_sub:>10}  {extra}")
+        print(f"{r['lane']:<26} {r['verdict']:<{VERDICT_COL}} {st:>7} {ui:<8} {_sub:>10}  {extra}")
         for line in r["recent"]:
-            print(f"{'':<26} {'':<12} {'':>7} {'':<8}   · {line}")
+            print(f"{'':<26} {'':<{VERDICT_COL - 2}} {'':>7} {'':<8}   · {line}")
     print()
     print("  " + " · ".join(f"{k}={v}" for k, v in sorted(Counter(
         r["verdict"] for r in out).items())))
