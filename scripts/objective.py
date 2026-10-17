@@ -790,6 +790,24 @@ def queue():
             "classes": classes, "by_class": by_class, "surface": surface}
 
 
+def _queue_read_is_blind(q):
+    """True iff the merge-state read behind `q` is blind enough that its CLASSES are not a
+    clearance.
+
+    ONE definition, every consumer (#1918). The beat QUALIFIES its DO: counts with this
+    (`queue_read=BLIND(...) -- the DO: counts are NOT a clearance`) and `pr-loop.py` HOLDS
+    instead of dispatching on it, because a count that is merely qualified when it is printed
+    becomes an action with no caveat at all once something else consumes the same object.
+
+    A MAJORITY-blind read is the threshold: `mergeStateStatus` is computed lazily and reads
+    UNKNOWN for the whole repo while GitHub recomputes (75 of 82 measured 2026-10-01), so a
+    few stragglers are ordinary and do not void the classification. Anything at or above half
+    is a queue GitHub never reported, and a zero from it is not a clearance.
+    """
+    unknown = (q or {}).get("unknown") or 0
+    return unknown > 0 and 2 * unknown >= max(1, (q or {}).get("nondraft") or 0)
+
+
 def _previous_sample():
     """(nondraft, age_seconds) from the last MEASURED line in the cache, or None.
 
@@ -901,10 +919,12 @@ def build(prev=None):
             # `classes` is None when ANY PR's checks were unreadable, so no partition is printed.
             parts.append(f"waiting={q['nondraft']}")
         _u = q.get("unknown") or 0
-        _blind = _u > 0 and 2 * _u >= max(1, q["nondraft"])
         if _u:
             parts.append(f"mergeable_state_unknown={_u}")
-        if _blind:
+        # The predicate is `_queue_read_is_blind`, NOT a local expression: `pr-loop.py` refuses
+        # to dispatch on the same one, so a change to "how blind is blind" can only be made in
+        # the one place both consumers read (#1918).
+        if _queue_read_is_blind(q):
             # A ZERO FROM A BLIND READ IS NOT A CLEARANCE. Kept from the deleted pair: the
             # fail-closed job belongs to whatever token stands where the zeros used to.
             parts.append(f"queue_read=BLIND({_u}/{q['nondraft']} unread) -- the DO: counts are NOT a clearance")

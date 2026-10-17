@@ -22,6 +22,9 @@ HARD REQUIREMENTS (each is a guard below, not a good intention):
   4. LOGGED. Which PR, which action, which lane -- so the next beat shows WORK DISPATCHED
      rather than a count of stuck things.
   5. RESPECTS THE BOX. `DO: hold|RECLAIM|UNKNOWN` dispatches nothing, however long the queue.
+  6. NEVER DISPATCHES FROM A BLIND QUEUE. `queue()` returns classes even when the merge-state
+     read was blind; the beat qualifies that with "NOT a clearance" and this file, which ACTS,
+     holds on the SAME predicate (`objective._queue_read_is_blind`) (#1918).
 
 Default is `--dry-run`: it prints exactly what it would do. `--act` performs the dispatches.
 """
@@ -133,6 +136,23 @@ def main():
 
     by_class = q.get("by_class") or {}
     log(f"band={band} cap={cap} active={len(lanes)} nondraft={q['nondraft']}")
+
+    # ⛔ THE COUNTS ARE REAL; THE CLASSIFICATION IS NOT. `queue()` returns classes even when the
+    # merge-state read was blind, so the guard above does not fire (it only fires when a per-PR
+    # CHECK-RUN read failed and `classes` is None). The beat QUALIFIES such a queue with
+    # "NOT a clearance"; this file ACTS on it, and its own rule is "a miss must never become an
+    # action" -- so a blind queue dispatches nothing (#1918).
+    #
+    # The predicate is `objective._queue_read_is_blind`, the SAME one the beat prints, NOT a
+    # second definition of "blind": two thresholds would drift and the dispatcher would decide
+    # on a classification its own report calls untrustworthy.
+    if o._queue_read_is_blind(q):
+        _unknown = q.get("unknown") or 0
+        log(f"HOLD -- queue_read=BLIND({_unknown}/{q['nondraft']} mergeable_state unread): "
+            f"nondraft={q['nondraft']} is measurable but the classes above it are NOT a clearance "
+            f"-- dispatching nothing (a miss must never become an action)")
+        save_lanes(lanes)
+        return 0
 
     dispatched = 0
     for klass in o.CLASS_ORDER:
