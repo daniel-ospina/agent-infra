@@ -48,6 +48,9 @@
 #      A permanent suppression must leave something in the log. (It did not before this review, which
 #      is how a guard file missing from the farm shipped green.)
 #
+#   8. THE SECOND READER — `heartbeat-loop.sh` makes the same ONE call, and the shared call refuses
+#      a torn pair at the function level (behaviourally, not by grep).
+#
 # Run: bash tests/beat-pair/run.sh
 set -uo pipefail
 
@@ -59,6 +62,12 @@ PAIR_LIB="$ROOT/scripts/lib/beat-pair.sh"
 checks=0; failures=0
 pass(){ checks=$((checks + 1)); echo "  ok   $1"; }
 fail(){ checks=$((checks + 1)); failures=$((failures + 1)); echo "  FAIL $1"; }
+# ⛔ A SUBSTRING TEST THAT IS NOT THE SIGPIPE IDIOM. This file cites
+# `scripts/check-no-sigpipe-grep.sh` (#841) two lines below, so it must not use `printf … | grep -q`
+# itself. `tests/` is not in that guard's scan path, so the idiom would be latent rather than
+# caught -- and the direction matters here: on a WITHHOLDING assertion a fired SIGPIPE race would
+# take the `else` branch and report PASS. A `case` glob has no upstream writer to race with.
+has(){ case "$1" in *"$2"*) return 0 ;; *) return 1 ;; esac; }
 
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 
@@ -197,7 +206,7 @@ seeded_beat "$h" "$(_mdsha "$h/.pi/agent/state/NEEDS-ACTION.md")"
 out="$(floor_run "$h")"
 if [ -z "$out" ]; then
   fail "the floor produced NO message on a healthy pair -- it exited before sending, so every withholding assertion below would be VACUOUS (stderr: $(floor_err "$h"))"
-elif printf '%s' "$out" | grep -q "$TAG"; then
+elif has "$out" "$TAG"; then
   pass "a VERIFIED pair is DELIVERED (the act clause reaches the message)"
 else
   fail "a verified pair was NOT delivered — the floor lost the clause on a healthy pair (got: ${out:0:200})"
@@ -209,7 +218,7 @@ seeded_beat "$h" "deadbeefdead"
 out="$(floor_run "$h")"
 if [ -z "$out" ]; then
   fail "the floor produced NO message on the torn case — a silently-exiting floor cannot demonstrate withholding (stderr: $(floor_err "$h"))"
-elif printf '%s' "$out" | grep -q "$TAG"; then
+elif has "$out" "$TAG"; then
   fail "a TORN pair was DELIVERED — the previous tick's clause was published as current"
 else
   pass "a TORN pair is WITHHELD (the clause never reaches the message)"
@@ -225,7 +234,7 @@ h="$TMP/nomd2"; floor_home "$h" "# recap" OMIT
 out="$(floor_run "$h")"
 if [ -z "$out" ]; then
   fail "the floor produced NO message on the md=-less case (stderr: $(floor_err "$h"))"
-elif printf '%s' "$out" | grep -q "$TAG"; then
+elif has "$out" "$TAG"; then
   fail "a beat with NO md= was delivered end to end (absence read as a pass)"
 else
   pass "a beat with NO md= is WITHHELD end to end (absence is not a pass)"
@@ -239,7 +248,7 @@ seeded_beat "$h" "$(_mdsha "$h/.pi/agent/state/NEEDS-ACTION.md")"
 out="$(floor_run "$h")"
 if [ -z "$out" ]; then
   fail "the floor produced NO message with the helper ABSENT — a missing lib must not stop the floor (stderr: $(floor_err "$h"))"
-elif printf '%s' "$out" | grep -q "$TAG"; then
+elif has "$out" "$TAG"; then
   fail "the clause was delivered with the helper ABSENT (an unverifiable pair was published)"
 else
   pass "the helper absent => WITHHELD, and the floor still produced a message"
@@ -261,6 +270,46 @@ if [ -f "$SETUP" ]; then
   fi
 else
   fail "$SETUP not found — cannot verify the farm"
+fi
+
+echo ""
+# 8. THE SECOND READER, AND THE SHARED CALL IT MUST USE (#1897 review, P2).
+#    `heartbeat-loop.sh` LOGS the clause rather than publishing it, and its guard used to be a
+#    hand-rolled "verify, then read" -- invertible, and untested, because section 6 drives only the
+#    floor. Both readers now make ONE call into the lib, so the invertible form does not exist; the
+#    behavioural assertions below prove that call actually refuses.
+echo "8. the second reader, and the one shared call both readers make (#1897 review)"
+mkdir -p "$TMP/bcv"
+mkpair "$TMP/bcv" "# recap" auto
+out="$(beat_clause_verified "$TMP/bcv" 420)"; rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "DO: X" ]; then
+  pass "beat_clause_verified RETURNS the clause on a verified pair (rc 0)"
+else
+  fail "beat_clause_verified gave rc=$rc out='$out' on a VERIFIED pair (expected rc=0, 'DO: X')"
+fi
+printf 'changed after the beat was written' > "$TMP/bcv/NEEDS-ACTION.md"
+out="$(beat_clause_verified "$TMP/bcv" 420)"; rc=$?
+if [ "$rc" -ne 0 ] && [ -z "$out" ]; then
+  pass "...and returns NOTHING with rc != 0 on a TORN pair (the guard cannot be bypassed by a caller)"
+else
+  fail "beat_clause_verified published '$out' (rc=$rc) on a TORN pair — a reader could store a stale clause"
+fi
+HB="$ROOT/scripts/heartbeat-loop.sh"
+if [ ! -f "$HB" ]; then
+  fail "scripts/heartbeat-loop.sh not found — the second reader is unpinned"
+else
+  hb_n="$(sed 's/#.*//' "$HB" | grep -c 'beat_clause_verified' || true)"
+  if [ "${hb_n:-0}" -ge 1 ]; then
+    pass "heartbeat-loop.sh CALLS beat_clause_verified (not a hand-rolled verify-then-read)"
+  else
+    fail "heartbeat-loop.sh does not call beat_clause_verified — its guard is hand-rolled and invertible, and nothing else exercises it"
+  fi
+  hb_priv="$(sed 's/#.*//' "$HB" | grep -c 's/\^act=//p' || true)"
+  if [ "${hb_priv:-0}" -eq 0 ]; then
+    pass "...and it has no PRIVATE read of act= (the shared call is the only path to the clause)"
+  else
+    fail "heartbeat-loop.sh reads the beat with its own sed — that read bypasses the shared guard"
+  fi
 fi
 
 echo ""

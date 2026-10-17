@@ -194,16 +194,22 @@ if [ -f "$STATE/lane-recap.last" ]; then
     # A fresh mtime is NOT enough: verify the beat belongs to the recap on disk before publishing
     # it. On a torn or unverifiable pair the clause is dropped and the older clauses stand -- the
     # `actfull=0` degradation this file already relies on, never a number we cannot vouch for.
+    # ⛔ THE VERIFY-AND-READ IS ONE CALL FROM THE SHARED LIB, NOT TWO STEPS HERE (#1897 review, P2).
+    # Written out by hand it could be INVERTED -- and an inverted guard still matches every string a
+    # text-based wiring test looks for, which is exactly how this shipped past a green suite.
     _bp_ok=0; _bp_why=""
-    if ! command -v beat_pair_ok >/dev/null 2>&1; then
-      _bp_why="beat_pair_ok unavailable -- $SCRIPTS/lib/beat-pair.sh not sourced (partial deploy?)"
-    elif _bp_why=$(beat_pair_ok "$STATE" 2>&1); then
-      _bp_ok=1; _bp_why=""
-    fi
-    if [ "$_bp_ok" = 1 ]; then
-      act=$(sed -n 's/^act=//p' "$B" | head -1 | cut -c1-420)
+    if ! command -v beat_clause_verified >/dev/null 2>&1; then
+      _bp_why="beat_clause_verified unavailable -- $SCRIPTS/lib/beat-pair.sh not sourced (partial deploy?)"
+    elif act=$(beat_clause_verified "$STATE" 420); then
+      _bp_ok=1
       actfull=$(sed -n 's/^actfull=//p' "$B" | head -1)
     else
+      # The REASON is re-derived for the log line only; nothing is published on either branch, so a
+      # pair that healed between the two reads costs a misleading log word, never a clause.
+      _bp_why=$(beat_pair_ok "$STATE" 2>&1)
+      [ -n "$_bp_why" ] || _bp_why="pair not verifiable, no reason reported"
+    fi
+    if [ "$_bp_ok" != 1 ]; then
       # ⛔ A SUPPRESSION MUST BE RECORDED, OR IT IS INVISIBLE (#1897 review). The driver is
       # `cadence-timer.sh`, which runs this script as `( … ) >/dev/null 2>&1 &` -- so
       # beat_pair_ok's stderr and the MISSING-helper warning above are BOTH DISCARDED. Without this

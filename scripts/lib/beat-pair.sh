@@ -10,7 +10,9 @@
 #   failed. So the beat carries `md=<sha256(recap)[:12]>` -- the digest of the recap it was rendered
 #   from -- and every reader compares it against the recap actually on disk.
 #   Two readers need this rule (cadence-nudge.sh, which PUBLISHES the clause, and heartbeat-loop.sh,
-#   which logs it). A rule implemented twice is how one contract becomes two, so it lives here.
+#   which logs it). A rule implemented twice is how one contract becomes two, so it lives here -- and
+#   each reader calls `beat_clause_verified` rather than repeating "verify, then read": that
+#   repetition is what let the guard be inverted with the tests still green (#1897 review, P2).
 #
 # ABSENCE IS NOT A PASS.
 #   A beat written before `md=` existed cannot be verified. It is SUPPRESSED, never trusted: an
@@ -47,4 +49,15 @@ beat_pair_ok(){
     echo "beat_pair_ok: recap/beat pair is TORN (beat md=$bmd, recap md=$amd)" >&2; return 1
   fi
   return 0
+}
+
+# beat_clause_verified <state_dir> [<max_chars>] -- the act clause, but ONLY if the pair verifies.
+# stdout: the clause and rc 0 when it verifies; NOTHING (rc 1) otherwise, with beat_pair_ok's reason
+# on stderr. Readers call THIS instead of doing "verify, then read" by hand: the hand-rolled form can
+# be INVERTED, and an inverted guard still matches every string a text-based wiring test looks for
+# (#1897 review, P2 -- the check stayed green with the guard deleted). One call cannot be inverted.
+beat_clause_verified(){
+  local st="$1" cap="${2:-420}"
+  beat_pair_ok "$st" || return 1
+  sed -n 's/^act=//p' "$st/NEEDS-ACTION.beat" 2>/dev/null | head -1 | cut -c"1-$cap"
 }

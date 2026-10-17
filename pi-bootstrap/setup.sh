@@ -430,9 +430,9 @@ for base in "${lib_srcs[@]}"; do
   fi
 done
 if [ "$lib_failed" -gt 0 ]; then
-  echo "    scripts lib farm: $lib_copied copied, $lib_failed FAILED/MISSING (pid-identity.sh + diff-normalize.py, #1178)" >&2
+  echo "    scripts lib farm: $lib_copied copied, $lib_failed FAILED/MISSING (pid-identity.sh + diff-normalize.py + beat-pair.sh, #1178/#1362)" >&2
 else
-  echo "    scripts lib farm: $lib_copied copied (pid-identity.sh + diff-normalize.py, #1178)"
+  echo "    scripts lib farm: $lib_copied copied (pid-identity.sh + diff-normalize.py + beat-pair.sh, #1178/#1362)"
 fi
 
 # Fleet-tools farm (#1178 unit 3): the scheduled lane-liveness report

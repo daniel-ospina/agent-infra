@@ -1480,11 +1480,6 @@ def write_pair(out_path, md, beat, words_read, beat_path=None):
     #     default encoding is not UTF-8, writer and reader would disagree on the digest for any
     #     non-ASCII recap -- and `render_md` always emits an em dash -- so EVERY pair would fail
     #     closed forever with both suites still green. Pin the encoding rather than assume it.
-    # (b) The reader hashes `$STATE/NEEDS-ACTION.md`, a FIXED path, while the beat path is fixed too.
-    #     So a run with `--out <elsewhere>` would overwrite the canonical beat with one bound to a
-    #     file no reader reads -- publishing a beat that can only ever be suppressed, and DISCARDING a
-    #     verifiable one. Refuse to write the beat in that case, loudly: the clause is then withheld
-    #     for the right reason, instead of for an unverifiable one nobody can see.
     md_bytes = md.encode("utf-8")
     md_sha = hashlib.sha256(md_bytes).hexdigest()[:MD_SHA_LEN]
     # (b) The reader hashes `$STATE/NEEDS-ACTION.md` -- a FIXED path -- while the beat path is fixed
@@ -1546,6 +1541,15 @@ def main():
     # empty action list as if the fleet were clean. write_pair owns the pair's coherence.
     beat = render_beat(res, display_path(a.out))
     rc = write_pair(a.out, md, beat, res["words_read"])
+    # ⛔ KEEP THE EARLY RETURN — EMPTY STDOUT **IS** THE CALLER'S FAIL-CLOSED DETECTOR (#1897 review).
+    # A review raised the coupling as a P3: "a read API must not be gated on a write". Measured, the
+    # coupling is load-bearing. `pr-doctor.py`'s gate is `if not (out or "").strip()` — it does NOT
+    # compare rc — so rc 3/4 has to produce NO document, or the doctor parses a torn tick as a good
+    # read and dispatches lanes off it. Printing before `return rc` and leaving the direction to "the
+    # caller checks rc" would be a claim about a guard that does not exist: measured, rc=4 with a
+    # document in stdout is read as a GOOD READ. Decoupling is therefore a change to pr-doctor (gate
+    # on rc first, with its own proof), NOT a change here — and not worth trading the fail-closed
+    # direction for a tidier read API on the exact path this branch exists to contain.
     if rc:
         return rc
     if a.json:

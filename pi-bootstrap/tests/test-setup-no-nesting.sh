@@ -752,8 +752,28 @@ check_fleet_tools_farmed "run1"
 check_fleet_health_promotion "run1"
 grep -q "scripts merge-gate farm: 1 copied (record-review.sh, #562)" "$RUNS_LOG" \
   || fail "run 1 did not report the merge-gate scripts farm copy (#562)"
-grep -q "scripts lib farm: 2 copied (pid-identity.sh + diff-normalize.py, #1178)" "$RUNS_LOG" \
-  || fail "run 1 did not report the shared-library farm copies (#1178/#1362)"
+# ⛔ DERIVED FROM `lib_srcs`, NOT HARD-CODED (#1897). This used to pin the literal string `2 copied
+# (pid-identity.sh + diff-normalize.py)` — so adding a legitimate THIRD lib (beat-pair.sh, the
+# recap/beat rule both readers share) turned a correct farm into a CI red. Read the expected count and
+# names FROM the array, so the assertion fails for the reason it exists (a sibling that landed
+# undeclared, or a summary that lies about what was farmed) instead of on every addition.
+lib_decl="$(sed -n 's/^lib_srcs=(\(.*\))$/\1/p' "$ROOT/pi-bootstrap/setup.sh")"
+lib_n="$(printf '%s\n' "$lib_decl" | wc -w | tr -d ' ')"
+if [ -z "${lib_n:-}" ] || [ "$lib_n" -eq 0 ]; then
+  fail "run 1: could not read the lib_srcs array from setup.sh — the lib-farm assertion cannot be derived"
+else
+  lib_line="$(grep -m1 'scripts lib farm: [0-9][0-9]* copied' "$RUNS_LOG")"
+  case "$lib_line" in
+    *"scripts lib farm: $lib_n copied"*) ;;
+    *) fail "run 1 did not report the shared-library farm copies (expected $lib_n copied, #1178/#1362): ${lib_line:-<no lib-farm line at all>}" ;;
+  esac
+  for lib_base in $lib_decl; do
+    case "$lib_line" in
+      *"$lib_base"*) ;;
+      *) fail "run 1: the lib-farm summary does not NAME the declared lib '$lib_base' — a summary that omits a lib it farmed misreports the farm (#1897)" ;;
+    esac
+  done
+fi
 grep -q "scripts/fleet farm: 4 copied (lane-liveness + fleet-health + map-sessions, #1178)" "$RUNS_LOG" \
   || fail "run 1 did not report the fleet-tools farm copy (4 files, #1178)"
 check_tools_dir_clean "run1-final"

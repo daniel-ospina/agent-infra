@@ -325,8 +325,12 @@ while :; do
     # CALLED, so it is called here too -- and the withheld case SAYS so, because a blank would read
     # as "no clause" rather than "unverifiable".
     _arc_act="(act clause withheld -- recap/beat pair not verifiable)"
-    if command -v beat_pair_ok >/dev/null 2>&1 && beat_pair_ok "$STATE" >/dev/null 2>&1; then
-      _arc_act=$(sed -n 's/^act=//p' "$STATE/NEEDS-ACTION.beat" 2>/dev/null | head -1 | cut -c1-220)
+    # ⛔ ONE CALL INTO THE SHARED LIB, NOT A HAND-ROLLED verify-then-read (#1897 review, P2). The
+    # hand-rolled form can be INVERTED, and an inverted guard still matches every string a
+    # text-based wiring test greps for -- which is how this branch shipped past a green suite while
+    # the same rule was tested end to end in the other reader.
+    if command -v beat_clause_verified >/dev/null 2>&1; then
+      _arc_act_v=$(beat_clause_verified "$STATE" 220) && _arc_act="$_arc_act_v"
     fi
     printf '%s LANE-ACTION rc=%s :: %s\n' "$(date '+%m-%d %H:%M:%S')" "$_arc" "$_arc_act" >> "$LOG"
   else
