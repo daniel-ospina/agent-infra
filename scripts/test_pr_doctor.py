@@ -790,6 +790,54 @@ def test_materialise_refuses_a_branch_switch_that_would_overwrite_an_ignored_fil
     assert (path / "secret.txt").read_text() == "PRECIOUS IGNORED\n"
 
 
+def test_materialise_refuses_to_rewind_a_worktree_ahead_of_the_pr_head(monkeypatch, tmp_path):
+    """A CLEAN worktree can hold LOCAL COMMITS the PR head does not (unpushed worker work);
+    `reset --hard` would rewind the branch and orphan them."""
+    repo, g = _git_repo(tmp_path)
+    g("branch", "feat/x")
+    head1 = g("rev-parse", "HEAD").stdout.strip()
+    _wire_repo(monkeypatch, repo)
+    wt, _ = pr.materialise_worktree(_prb(1, head1, "feat/x"))
+
+    def gw(*a):
+        return subprocess.run(["git", "-C", wt] + list(a), check=True,
+                              capture_output=True, text=True)
+
+    (pathlib.Path(wt) / "worker.txt").write_text("worker work\n")
+    gw("add", "worker.txt")
+    gw("commit", "-qm", "local worker commit")
+    head2 = gw("rev-parse", "HEAD").stdout.strip()
+    assert head2 != head1
+    wt2, err = pr.materialise_worktree(_prb(1, head1, "feat/x"))   # PR head is still the OLD one
+    assert wt2 == "" and "commit" in err
+    assert gw("rev-parse", "HEAD").stdout.strip() == head2, "the local commit must not be orphaned"
+    assert (pathlib.Path(wt) / "worker.txt").exists()
+
+
+def test_materialise_refuses_to_orphan_commits_on_a_detached_head(monkeypatch, tmp_path):
+    """A detached HEAD whose commit no branch holds must not be switched away from -- the
+    checkout in `_ensure_branch` would orphan it."""
+    repo, g = _git_repo(tmp_path)
+    g("branch", "feat/x")
+    head1 = g("rev-parse", "HEAD").stdout.strip()
+    _wire_repo(monkeypatch, repo)
+    wt, _ = pr.materialise_worktree(_prb(1, head1, "feat/x"))
+
+    def gw(*a):
+        return subprocess.run(["git", "-C", wt] + list(a), check=True,
+                              capture_output=True, text=True)
+
+    gw("checkout", "-q", "--detach")
+    (pathlib.Path(wt) / "only-here.txt").write_text("x\n")
+    gw("add", "only-here.txt")
+    gw("commit", "-qm", "detached only")
+    head2 = gw("rev-parse", "HEAD").stdout.strip()
+    wt2, err = pr.materialise_worktree(_prb(1, head1, "feat/x"))
+    assert wt2 == "" and "orphan" in err
+    assert gw("rev-parse", "HEAD").stdout.strip() == head2
+    assert (pathlib.Path(wt) / "only-here.txt").exists()
+
+
 def test_materialise_worktree_clears_a_stranded_record(monkeypatch, tmp_path):
     """Directory gone but the record remains: `worktree add` refuses until the record is cleared."""
     import shutil

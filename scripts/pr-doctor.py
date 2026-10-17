@@ -526,6 +526,16 @@ def _ensure_branch(path: str, branch: str) -> str:
             return "worktree %s is on foreign branch %s and could not be detached: %s" % (
                 path, cur, (err or "").strip()[:160])
         return ""
+    # Moving HEAD off a DETACHED commit that no ref holds would orphan it (the checkout below
+    # does exactly that), so refuse first.
+    if detached:
+        holders, _, hrc = sh_err(["git", "-C", path, "for-each-ref", "--contains", "HEAD",
+                                  "--format=%(refname)", "refs/heads", "refs/remotes"], timeout=60)
+        if hrc != 0:
+            return "cannot determine which refs hold worktree %s commits -- refusing to switch it" % path
+        if not (holders or "").strip():
+            return ("worktree %s is detached with commit(s) held by no branch -- refusing to switch "
+                    "it and orphan them; create a branch or inspect it" % path)
     # `checkout <branch>` changes the tree; git protects non-ignored untracked files but SILENTLY
     # OVERWRITES ignored ones (verified), so probe the target branch for both.
     clobber = _untracked_clobber(path, branch)
@@ -606,6 +616,31 @@ def _ensure_head(path: str, branch: str, head: str) -> str:
     if clobber:
         return ("worktree %s has untracked file(s) that the PR head would overwrite (%s) -- "
                 "refusing to reset it; move or remove them" % (path, ", ".join(clobber[:3])))
+    # ⛔ A CLEAN worktree can still hold LOCAL COMMITS the PR head does not (a worker committed but
+    # had not pushed, or the state row went stale). `reset --hard` would rewind the branch and
+    # ORPHAN them. Only a fast-forward (HEAD an ancestor of head) may reset.
+    ahead, _, arc = sh_err(["git", "-C", path, "rev-list", "--count", "%s..HEAD" % head], timeout=60)
+    if arc != 0:
+        return ("cannot determine whether worktree %s has commits the PR head does not "
+                "(git rev-list rc=%s) -- refusing to reset it; inspect it" % (path, arc))
+    try:
+        n_ahead = int((ahead or "0").strip() or "0")
+    except ValueError:
+        return "cannot parse the commit count for worktree %s -- refusing to reset it" % path
+    if n_ahead > 0:
+        cur, _, curc = sh_err(["git", "-C", path, "symbolic-ref", "--short", "-q", "HEAD"], timeout=30)
+        if curc == 0:
+            return ("worktree %s is on %s and has %d commit(s) not on the PR head -- refusing to "
+                    "reset it and orphan them; push or inspect the worktree"
+                    % (path, (cur or "").strip(), n_ahead))
+        # Detached: safe only when some OTHER ref still holds the commits.
+        holders, _, hrc = sh_err(["git", "-C", path, "for-each-ref", "--contains", "HEAD",
+                                  "--format=%(refname)", "refs/heads", "refs/remotes"], timeout=60)
+        if hrc != 0:
+            return "cannot determine which refs hold worktree %s commits -- refusing to reset it" % path
+        if not (holders or "").strip():
+            return ("worktree %s is detached and has %d commit(s) held by no branch -- refusing to "
+                    "reset it and orphan them; create a branch or inspect it" % (path, n_ahead))
     _, err, rc = sh_err(["git", "-C", path, "reset", "--hard", head], timeout=120)
     if rc != 0:
         return "worktree %s reset to %s failed rc=%s: %s" % (path, head[:12], rc, (err or "").strip()[:160])
