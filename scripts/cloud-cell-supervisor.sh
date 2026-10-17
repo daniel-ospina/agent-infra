@@ -213,17 +213,21 @@ publish_worker_env() {
   fi
   list="$(printf '%s' "$list" | tr '\n' ' ')"
   # ⛔ A listed name is STRIPPED from the new session when the creating client lacks it
-  # (`update-environment` is a "these come from the client" list, not an allow-list) — the same
-  # deliberate rule the `AI_REVIEW_GATE_KEY` unset above relies on. So `$ENV_FILE` (or this shell) is
-  # the authoritative source for every name here: a value living ONLY in the tmux server is not a
-  # supported configuration — the issue's `tmux set-environment -g` workaround reads its value FROM
-  # `keys.env`, so the `start` shell (which sources it) holds it and no strip can fire. A name with no
-  # value anywhere is the dead state #1852's residual records; `check` does not yet refuse it.
+  # (`update-environment` is a "these come from the client" list, not an allow-list). Which source is
+  # authoritative is therefore PER NAME, and the exception is load-bearing: `$ENV_FILE` is
+  # authoritative for every name here, and THIS SHELL is authoritative only for the names
+  # `cmd_start` does not drop (`HOME`, `O`, `DEEPSEEK_API_KEY`). `AI_REVIEW_GATE_KEY` is the
+  # exception — `cmd_start`'s `unset` (which runs BEFORE this call) drops it from this shell unless
+  # `$ENV_FILE` carries it, deliberately, so an ambient export cannot shadow the key file and
+  # falsify `cmd_check`'s verdict. A value living ONLY in the tmux server is not a supported
+  # configuration: the issue's `tmux set-environment -g` workaround reads its value FROM `keys.env`,
+  # so the `start` shell (which sources it) holds it and no strip can fire. A name with no value
+  # anywhere is the dead state #1852's residual records; `check` does not yet refuse it.
   for n in $WORKER_ENV_NAMES; do
     case " $list " in *" $n "*) ;; *) list="$list $n" ;; esac
   done
   tmux set-option -g update-environment "$list" \
-    || die "cannot publish tmux update-environment ('$WORKER_ENV_NAMES') — every merge worker would run keyless"
+    || die "cannot publish tmux update-environment ('$WORKER_ENV_NAMES') — every review and fixer would run with no provider credential and every merge worker keyless"
 }
 
 # ── $ENV_FILE is SOURCED, so a top-level `exit`/`exec` in it ended THIS SCRIPT (agent-infra#1713) ──
@@ -538,6 +542,33 @@ pin_name_ok() {
   return 0
 }
 
+# The PHYSICAL form of a path, resolved even when the path does not exist YET (a missing tail is
+# appended lexically, so `$CELL_HOME/harness` answers before the first `apply` creates it).
+# ⛔ Why this exists: a raw string compare of paths is defeated by SPELLING. Measured in review round
+# 3 — `HARNESS_PIN_DIR=$CELL_HOME` was refused, the SAME directory written `$CELL_HOME/` (one trailing
+# slash) CONFORMED, and `$CELL_HOME/../cell` conformed too: the containment deny-list is the only
+# guard against `rm -rf` over the cell home, so one operator-typed slash disarmed it. On macOS the
+# mirror-image problem is a `$TMPDIR`-derived `//` making two spellings of one directory disagree —
+# `pwd -P` collapses both, and `..`/symlinks with them.
+pin_path_real() {
+  local d="${1:-}" tail=""
+  [ -n "$d" ] || return 1
+  while [ ! -d "$d" ]; do
+    if [ "$d" = "/" ] || [ "$d" = "." ] || [ -z "$d" ]; then return 1; fi
+    tail="/$(basename "$d")$tail"
+    d="$(dirname "$d")"
+  done
+  # ⛔ A FAILED `cd` must not yield an EMPTY answer: an empty `$dir_real` turns the deny-list pattern
+  # `"$dir_real"/*` into `/*`, which matches EVERY absolute path — so an unreadable root refused for
+  # the wrong reason ("CONTAINS …") instead of naming the read failure. `$d` must be a directory AND
+  # `pwd -P` must return an absolute path, or this returns 1 and the caller falls back to the spelled
+  # path (which is already refused at the `ls` step).
+  local phys
+  phys="$(cd "$d" 2>/dev/null && pwd -P)" || return 1
+  case "$phys" in /?*) ;; *) return 1 ;; esac
+  printf '%s%s\n' "$phys" "$tail"
+}
+
 # The pin-root CONFORMANCE question, asked ONCE — the answer `check`, `apply`, `start` and `prune`
 # must all agree on. `check`'s verdict is "this cell can run a controller", and every sibling verb
 # refuses a non-conforming root, so a `check` that skips this question certifies a cell its own verbs
@@ -557,16 +588,20 @@ pin_name_ok() {
 # path carries a `//` that git normalizes in its listing output, so a literal comparison reports our
 # OWN pin as foreign and the guard becomes a false block.
 pin_root_conformance() {
-  local dir="${1:-}" p listing entries=0
+  local dir="${1:-}" p listing entries=0 harmless=0 dir_real p_real
   PIN_ROOT_BAD=""
   case "$dir" in
     ""|"/"|".") PIN_ROOT_BAD="is '$dir'"; return 1 ;;
   esac
   # A root that CONTAINS anything this cell needs cannot be reclaimed, and every sibling verb refuses
   # it — so `check` must refuse it too, not certify a cell whose own `apply`/`start`/`prune` die here.
+  # ⛔ Compare PHYSICAL paths (`pin_path_real`), never the spelled ones: `$CELL_HOME/` and
+  # `$CELL_HOME/../cell` are the same directory and must get the same answer.
+  dir_real="$(pin_path_real "$dir")" || dir_real="$dir"   # unreadable root: the `ls` below refuses it
   for p in "$CELL_HOME" "$HOME" "$O" "$REPO" "$HARNESS_REPO" "$(dirname "$ENV_FILE")"; do
     [ -n "$p" ] || continue
-    case "$p" in "$dir"|"$dir"/*) PIN_ROOT_BAD="CONTAINS $p, which this cell needs"; return 1 ;; esac
+    p_real="$(pin_path_real "$p")" || p_real="$p"
+    case "$p_real" in "$dir_real"|"$dir_real"/*) PIN_ROOT_BAD="CONTAINS $p, which this cell needs"; return 1 ;; esac
   done
   [ -e "$dir" ] || [ -L "$dir" ] || return 0               # nothing there: nothing to refuse
   linked_worktree_of "$HARNESS_REPO" "$dir" && return 0    # the legacy flat pin (root IS one worktree)
@@ -579,6 +614,17 @@ pin_root_conformance() {
     # a nonconformity (it would name a directory that no longer exists); a dangling symlink still is
     # (`-L` true, `-d` false → refused), which is the property `ls -A` exists for.
     [ -e "$dir/$p" ] || [ -L "$dir/$p" ] || continue
+    # ⛔ An OS droppings FILE is not an operator's directory, and refusing the root for one bricked all
+    # four verbs: a single Finder visit to the pin root creates `.DS_Store` (`._<name>` appears beside
+    # a file copied from HFS+), which is what the operators' macOS server does to `$CELL_HOME/harness`.
+    # Measured in review round 3: `check`, `apply`, `start` AND `prune` all refused, and the diagnose
+    # line sent the operator looking for a pin directory that was not there. ONLY regular, non-symlink
+    # files with these exact names are skipped — a hidden DIRECTORY, a dangling symlink or any other
+    # entry is still refused, which is the false pass `ls -A` exists to catch. `harmless` keeps such a
+    # root from reaching the cannot-verify branch below: there is nothing of ours in it to protect.
+    case "$p" in
+      .DS_Store|._*) if [ -f "$dir/$p" ] && [ ! -L "$dir/$p" ]; then harmless=1; continue; fi ;;
+    esac
     entries=$((entries + 1))
     if [ ! -d "$dir/$p" ] || ! pin_name_ok "$p"; then
       PIN_ROOT_BAD="holds '$p', which is not a pin directory"
@@ -586,7 +632,12 @@ pin_root_conformance() {
     fi
   done <<<"$listing"
   [ "$entries" -gt 0 ] && return 0
-  return 2    # listed non-empty yet enumerated nothing: cannot verify
+  [ "$harmless" = 1 ] && return 0                          # only OS droppings: nothing of ours to protect
+  # ⛔ rc 2 is TWO states and the callers must not describe one of them as the other: `ls -A` failed
+  # (permission/IO), or it succeeded and every entry vanished under a concurrent `apply`/`prune`. The
+  # remedy differs, so the reason is carried out the way rc 1's is.
+  PIN_ROOT_BAD="was listed as non-empty but every entry vanished while it was read (a concurrent 'apply' or 'prune'?) — nothing to inspect"
+  return 2
 }
 
 # The AUTHORITY TO DELETE one harness pin. `pin_name_ok` is a SPELLING test and cannot tell a pin from
@@ -606,12 +657,34 @@ pin_root_conformance() {
 # makes it visible rather than silent; the alternative (delete on an unprovable name) is the
 # silent-destruction class this file refuses.
 pin_entry_owned() {
-  local n="${1:-}"
+  local n="${1:-}" out
+  PIN_OWNED_ERR=""
   pin_name_ok "$n" || return 1
   [ -n "$HARNESS_REPO" ] || return 2
   git -C "$HARNESS_REPO" rev-parse --git-dir >/dev/null 2>&1 || return 2
-  git -C "$HARNESS_REPO" cat-file -e "${n}^{commit}" 2>/dev/null && return 0
-  return 1
+  if out="$(git -C "$HARNESS_REPO" cat-file -e "${n}^{commit}" 2>&1)"; then
+    return 0
+  fi
+  # ⛔ A CLEAN ABSENCE is rc 1 ("not a commit of ours"); anything else is rc 2. The first version
+  # collapsed every failure into 1, so an object store that could not be READ — EACCES on a loose
+  # object, a corrupt pack, a partial-clone lazy fetch that cannot reach its remote — printed the
+  # affirmative "does not resolve to a commit". That is the instrument that cannot answer its own
+  # question, and it also reported a legitimately-blocked reclaim as "not a pin" (review round 3,
+  # reproduced: `error: unable to open …: Permission denied` was discarded by a `2>/dev/null`).
+  # Both values still SKIP the reclaim — only the diagnosis differs.
+  # ⛔ A DIAGNOSTIC is checked FIRST, because git prints BOTH lines when it cannot READ an object:
+  # `error: unable to open …/objects/f0: Permission denied` followed by `fatal: Not a valid object
+  # name …`. Matching the absence phrase alone would therefore classify the read failure as a clean
+  # absence — the exact bug this split exists to remove.
+  case "$out" in
+    *"error:"*|*"unable to open"*|*"Permission denied"*|*"corrupt"*|*"fatal: unable to"*|*"failed to"*)
+      PIN_OWNED_ERR="$out"; return 2 ;;
+  esac
+  case "$out" in
+    *"Not a valid object name"*|*"Could not find"*|*"not a valid commit name"*|*"bad object"*|*"Invalid object name"*) return 1 ;;
+  esac
+  PIN_OWNED_ERR="$out"
+  return 2
 }
 
 # The check-side caller: the SAME conformance question, with a message about the cell being unusable
@@ -621,7 +694,11 @@ cmd_check_pin_dir() {
   pin_root_conformance "$HARNESS_PIN_DIR"; rc=$?
   case "$rc" in
     0) return 0 ;;
-    2) die "HARNESS_PIN_DIR='$HARNESS_PIN_DIR' cannot be READ (permission denied or an I/O error), so whether it is a pin root is UNKNOWN — and cannot-verify is never a pass. Fix its permissions, or point HARNESS_PIN_DIR at a readable path, then re-run: $0 check   (agent-infra#1852)" ;;
+    2) # rc 2 has TWO causes and each gets its own remedy — never assert the unobserved one.
+       if [ -n "$PIN_ROOT_BAD" ]; then
+         die "HARNESS_PIN_DIR='$HARNESS_PIN_DIR' $PIN_ROOT_BAD — so whether it is a pin root is UNKNOWN, and cannot-verify is never a pass. Re-run '$0 check' once nothing else is touching it   (agent-infra#1852)"
+       fi
+       die "HARNESS_PIN_DIR='$HARNESS_PIN_DIR' cannot be READ (permission denied or an I/O error), so whether it is a pin root is UNKNOWN — and cannot-verify is never a pass. Fix its permissions, or point HARNESS_PIN_DIR at a readable path, then re-run: $0 check   (agent-infra#1852)" ;;
   esac
   die "HARNESS_PIN_DIR='$HARNESS_PIN_DIR' $PIN_ROOT_BAD — 'apply' AND 'start' both refuse here, so this cell can neither be updated nor started. Quarantine it (move it aside; do not delete a directory you cannot account for) and re-run: $0 apply   (agent-infra#1852)"
 }
@@ -632,7 +709,10 @@ assert_pin_dir_safe() {
   pin_root_conformance "$dir"; rc=$?
   case "$rc" in
     0) return 0 ;;
-    2) die "refusing to rm -rf HARNESS_PIN_DIR='$dir': it cannot be READ (permission denied or an I/O error), so whether it is a pin root is UNKNOWN — and cannot-verify is not a pass here either." ;;
+    2) if [ -n "$PIN_ROOT_BAD" ]; then
+         die "refusing to rm -rf HARNESS_PIN_DIR='$dir': $PIN_ROOT_BAD — so this is not a root we can reclaim right now, and cannot-verify is not a pass here either."
+       fi
+       die "refusing to rm -rf HARNESS_PIN_DIR='$dir': it cannot be READ (permission denied or an I/O error), so whether it is a pin root is UNKNOWN — and cannot-verify is not a pass here either." ;;
   esac
   die "refusing to rm -rf HARNESS_PIN_DIR='$dir': it $PIN_ROOT_BAD. Remove it by hand if you are sure it holds nothing."
 }
@@ -1341,7 +1421,7 @@ cmd_prune() {
         # not be consulted at all is this file's own "instrument that cannot answer its own question".
         case "$?" in
           0) ;;
-          2) say "prune: NOT reclaiming $d — cannot VERIFY it is a pin: HARNESS_REPO is unresolved or not a git checkout. Fix HARNESS_REPO, then re-run '$0 prune'"
+          2) say "prune: NOT reclaiming $d — cannot VERIFY it is a pin: ${PIN_OWNED_ERR:-HARNESS_REPO is unresolved or not a git checkout}. Fix HARNESS_REPO (or the object store), then re-run '$0 prune'"
              continue ;;
           *) say "prune: NOT reclaiming $d — its name does not resolve to a commit in ${HARNESS_REPO:-<unresolved>}, so it is not provably a pin of ours"
              continue ;;

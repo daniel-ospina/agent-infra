@@ -49,7 +49,13 @@ AI1711_SOCKS=""
 ai1711_cleanup() {
   local s
   [ -n "${AI1711_SOCKS:-}" ] || return 0
-  for s in $AI1711_SOCKS; do tmux -L "$s" kill-server >/dev/null 2>&1 || true; done
+  for s in $AI1711_SOCKS; do
+    tmux -L "$s" kill-server >/dev/null 2>&1 || true
+    # ⛔ `kill-server` leaves the SOCKET FILE behind (verified on this box), so every run leaked one
+    # 0-byte inode per private server into `tmux-<uid>` and 2 144 had accumulated when this was
+    # measured (review round 3). Removing it makes a suite run a no-op on the operator's /tmp.
+    rm -f "${TMPDIR:-/tmp}/tmux-$(id -u)/$s" "/tmp/tmux-$(id -u)/$s" 2>/dev/null || true
+  done
 }
 trap 'ai1711_cleanup; rm -rf "$T"' EXIT
 
@@ -1617,9 +1623,13 @@ fi
 # (i-g) `cmd_check_pin_dir` asked a WEAKER question than `assert_pin_dir_safe` in two more branches:
 # (1) no containment deny-list, so `HARNESS_PIN_DIR=$CELL_HOME` holding only hex dirs was certified by
 # `check` while apply/start/prune died "it CONTAINS … which this cell needs"; (2) a `"$dir"/*` glob
-# skipped HIDDEN entries, so a root whose only entry was `.DS_Store` read as empty-and-safe on the
-# check side while the delete side refused the same root. The shared predicate answers both.
+# skipped HIDDEN entries, so a root whose only entry was a hidden DIRECTORY read as empty-and-safe on
+# the check side while the delete side refused the same root. The shared predicate answers both.
 # ⛔ Mutation caught: either branch reverts to a false pass and reddens its arm.
+# ⛔ The hidden entry here is a DIRECTORY named `.hidden-pin`, not `.DS_Store`: an OS droppings FILE is
+# deliberately TOLERATED (review round 3 measured a cell bricked by one Finder visit), so pinning the
+# false pass on `.DS_Store` would pin the wrong rule. The arm right below pins the tolerance in the
+# other direction, so neither can be changed without a red.
 say_case "check refuses a pin root that CONTAINS the cell home, or whose only entries are hidden (#1852)"
 qcheck_pin "$Q/home"
 [ "$QQ_RC" -ne 0 ] && ok "check REFUSES a HARNESS_PIN_DIR that CONTAINS the cell home" \
@@ -1628,14 +1638,27 @@ case "$QQ_OUT" in
   *"CONTAINS"*) ok "check names the containment (same reason apply/start give)" ;;
   *) bad "check's containment refusal does not say CONTAINS — $QQ_OUT" ;;
 esac
-HC="$T/pinhidden"; mkdir -p "$HC"; printf 'x\n' > "$HC/.DS_Store"
+HC="$T/pinhidden"; mkdir -p "$HC/.hidden-pin"
 qcheck_pin "$HC"
-[ "$QQ_RC" -ne 0 ] && ok "check REFUSES a root whose ONLY entry is hidden ('.DS_Store' — a glob would skip it)" \
+[ "$QQ_RC" -ne 0 ] && ok "check REFUSES a root whose ONLY entry is a hidden DIRECTORY (a glob would skip it)" \
                    || bad "check CERTIFIED a hidden-only root — the glob skipped it: $QQ_OUT"
 case "$QQ_OUT" in
-  *".DS_Store"*) ok "check names the hidden entry rather than reading the root as empty" ;;
+  *".hidden-pin"*) ok "check names the hidden entry rather than reading the root as empty" ;;
   *) bad "check does not name the hidden entry — $QQ_OUT" ;;
 esac
+# ⛔ THE OTHER DIRECTION: an OS droppings FILE must NOT brick the cell. A single Finder visit to the pin
+# root (the default is `$CELL_HOME/harness` on the operators' macOS server) creates `.DS_Store`, and
+# refusing it took all FOUR verbs down until a human deleted the file — measured in review round 3.
+# The file is a regular, non-symlink entry with a known name, so nothing of ours can hide behind it.
+HD="$T/pindroppings"; mkdir -p "$HD"; printf 'x\n' > "$HD/.DS_Store"
+qcheck_pin "$HD"
+[ "$QQ_RC" -eq 0 ] && ok "check TOLERATES a root whose only entry is an OS droppings file ('.DS_Store')" \
+                  || bad "check REFUSED a root holding only '.DS_Store' — one Finder visit bricks the cell: $QQ_OUT"
+# A dangling symlink is NOT droppings: `-L` true and `-d` false is the property `ls -A` exists for.
+HL="$T/pindangling"; mkdir -p "$HL"; ln -s "$HL/does-not-exist" "$HL/dead-link"
+qcheck_pin "$HL"
+[ "$QQ_RC" -ne 0 ] && ok "check still REFUSES a dangling symlink in the pin root (droppings tolerance is file-only)" \
+                   || bad "check certified a root holding a dangling symlink — $QQ_OUT"
 
 # (i-h) ⛔ THE CONTENT TEST IS THE DELETE SIDE'S ALONE. If the shared CONFORMANCE predicate consulted it,
 # an unresolved `$HARNESS_REPO` would make `check` refuse a legitimate pin root — a false block. So the
@@ -1710,6 +1733,107 @@ case "$QA_OUT" in
   *) bad "apply's refusal does not name the entry — $QA_OUT" ;;
 esac
 rm -rf "$Q/pin/notes"
+
+# (i-j) rc 2 is TWO states, and the callers must not describe one as the other. A root whose `ls -A`
+# FAILED has a permission/IO remedy; a root that listed non-empty and whose every entry then VANISHED
+# (a concurrent `apply`/`prune`) has "retry in a moment". The reason is carried out in PIN_ROOT_BAD
+# the way rc 1's is.
+# ⛔ The vanish state is provoked DETERMINISTICALLY with a stub `ls` that names an entry which does not
+# exist — no race, no flake. ⛔ Mutation caught: dropping the PIN_ROOT_BAD assignment on that return
+# makes the message fall back to "cannot be READ …" and reddens both arms of this case.
+say_case "a vanished-mid-read pin root is NOT reported as 'cannot be READ' (#1852)"
+VQ="$T/vanishmid"; mkdir -p "$VQ/pin" "$VQ/bin"
+printf '#!/bin/sh\necho ghost\n' > "$VQ/bin/ls"; chmod +x "$VQ/bin/ls"
+VBAD="$(
+  set -- status
+  export CELL_HOME="$VQ/cell" ENV_FILE="$VQ/none.env" O="$VQ/o" REPO="$VQ/repo" \
+         HARNESS_PIN_DIR="$VQ/pin" HARNESS_PIN_FILE="$VQ/hp"
+  . "$SUP" >/dev/null 2>&1
+  export PATH="$VQ/bin:$PATH"
+  pin_root_conformance "$VQ/pin"; echo "rc=$?"; echo "bad=$PIN_ROOT_BAD"
+)"
+case "$VBAD" in *"rc=2"*) ok "the vanish state is rc 2 (cannot verify), not a pass" ;; *) bad "pin_root_conformance did not answer 2 for a vanished entry — $VBAD" ;; esac
+case "$VBAD" in *"vanished"*) ok "the reason names the vanish, not a read failure" ;; *) bad "the rc-2 reason does not name the vanish — $VBAD" ;; esac
+VQ_OUT="$(
+  set -- status
+  export CELL_HOME="$VQ/cell" ENV_FILE="$VQ/none.env" O="$VQ/o" REPO="$VQ/repo" \
+         HARNESS_PIN_DIR="$VQ/pin" HARNESS_PIN_FILE="$VQ/hp"
+  . "$SUP" >/dev/null 2>&1
+  export PATH="$VQ/bin:$PATH"
+  cmd_check_pin_dir 2>&1
+)"; VQ_RC=$?
+[ "$VQ_RC" -ne 0 ] && ok "check REFUSES a vanished-mid-read root" || bad "check certified a root whose entries vanished mid-read — $VQ_OUT"
+case "$VQ_OUT" in
+  *"vanished"*) ok "check's message names the vanish" ;;
+  *"cannot be READ"*) bad "check blames a READ failure it never observed — the two rc-2 states are conflated: $VQ_OUT" ;;
+  *) bad "check's refusal does not name the vanish — $VQ_OUT" ;;
+esac
+
+# (i-k) ⛔ The containment deny-list compares PHYSICAL paths. Written as a raw string compare it was
+# defeated by SPELLING: `HARNESS_PIN_DIR=$CELL_HOME` was refused while `$CELL_HOME/` — the same
+# directory, one trailing slash — CONFORMED, and `$CELL_HOME/../cell` conformed too. That deny-list is
+# the only guard between the sweep and `rm -rf` over the cell home, so one operator-typed slash
+# disarmed it (review round 3, measured). ⛔ Mutation caught: reverting to `case "$p" in "$dir"…`
+# reddens the slash and `..` arms while the bare spelling stays green.
+say_case "containment is not defeated by path SPELLING (trailing slash, '..', '//') (#1852)"
+NC="$T/pinspell"; mkdir -p "$NC/cell/keep" "$NC/pin/$(pinsha "$AI" 12)"
+spell() { # $1 = the HARNESS_PIN_DIR spelling to test
+  local sd="$1"                  # ⛔ capture BEFORE `set -- status`: sourcing resets $@
+  (
+    set -- status
+    export PATH="$Q/bin:$PATH" CELL_HOME="$NC/cell" ENV_FILE="$NC/none.env" O="$NC/o" REPO="$NC/repo" \
+           HARNESS_PIN_DIR="$sd" HARNESS_PIN_FILE="$NC/hp"
+    . "$SUP" >/dev/null 2>&1
+    pin_root_conformance "$sd"; echo "rc=$?"; echo "bad=$PIN_ROOT_BAD"
+  )
+}
+for sp in "$NC/cell" "$NC/cell/" "$NC/cell//" "$NC/cell/../cell" "$NC/cell/."; do
+  SP_OUT="$(spell "$sp")"
+  case "$SP_OUT" in
+    *"rc=1"*CONTAINS*) ok "refused as CONTAINS the cell home: $sp" ;;
+    *) bad "spelling '$sp' was NOT refused as containment — the deny-list is defeated by spelling: $SP_OUT" ;;
+  esac
+done
+SP_OUT="$(spell "$NC/pin")"
+case "$SP_OUT" in
+  *"rc=0"*) ok "a legitimate pin root still conforms (normalization does not over-refuse)" ;;
+  *) bad "normalization broke a legitimate pin root — $SP_OUT" ;;
+esac
+
+# (i-l) ⛔ The DELETE authority must separate "that name is not a commit of ours" (rc 1) from "the
+# object store could not be READ" (rc 2). Collapsed, an EACCES on a loose object printed the
+# affirmative "its name does not resolve to a commit" — an instrument asserting a fact it could not
+# observe — and masked a blocked reclaim as "not a pin" (review round 3, reproduced).
+say_case "the delete authority separates 'not a pin' from 'cannot read the object store' (#1852)"
+pp_run "$AI" pin_entry_owned "aaaaaaaaaaaa"; PPRC=$?
+[ "$PPRC" = 1 ] && ok "a name that resolves to nothing is 'provably not ours' (rc 1)" \
+                || bad "pin_entry_owned answered $PPRC for a missing name — expected 1"
+if [ "$(id -u)" -eq 0 ]; then
+  echo "  ⏭ SKIP: running as root — chmod does not deny reading a loose object"
+else
+  OC="$(git -C "$AI" rev-parse HEAD)"; ONAME="$(pinsha "$AI" 12)"; OBJ="$AI/.git/objects/${OC:0:2}/${OC:2}"
+  if [ -f "$OBJ" ]; then
+    chmod 000 "$OBJ"
+    OR_OUT="$(
+      set -- status
+      export PATH="$Q/bin:$PATH" CELL_HOME="$T/pp/home" ENV_FILE="$T/pp/none.env" O="$T/pp/o" \
+             REPO="$T/pp/repo" HARNESS_PIN_DIR="$Q/pin" HARNESS_PIN_FILE="$T/pp/hp" HARNESS_REPO="$AI"
+      . "$SUP" >/dev/null 2>&1
+      pin_entry_owned "$ONAME"; echo "rc=$?"; echo "err=$PIN_OWNED_ERR"
+    )"
+    chmod 644 "$OBJ"
+    case "$OR_OUT" in
+      *"rc=2"*) ok "an unreadable object store is 'cannot verify' (rc 2), not 'not a pin'" ;;
+      *) bad "pin_entry_owned reported a read failure as a clean absence — $OR_OUT" ;;
+    esac
+    case "$OR_OUT" in
+      *"err="*"unable to open"*|*"err="*"Permission denied"*) ok "the diagnostic is carried out so prune can print it" ;;
+      *) bad "PIN_OWNED_ERR does not carry git's diagnostic — $OR_OUT" ;;
+    esac
+  else
+    echo "  ⏭ SKIP: the fixture's head object is packed — no loose object to deny"
+  fi
+fi
 
 echo
 echo "── Summary ───────────────────────────────────────────────────────"
