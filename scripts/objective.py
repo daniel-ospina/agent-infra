@@ -581,15 +581,14 @@ def rail_block_reason(red, flight, seen):
     return None
 
 
-def rollup_checks(cr):
-    """(red, flight) name-sets by POLARITY on the NEWEST attempt per (app, workflow, name).
+def newest_attempts(cr):
+    """[(name, NEWEST attempt)] grouped by (app, workflow, job name), newest by `id`.
 
     A re-run ADDS a check-run; it does not clear one -- so the newest attempt by `id` is the
     only honest read. Grouping by (app, workflow, job name) keeps two workflows that share a
-    job name apart, and `id` (not `started_at`, which is nullable) breaks the tie. Every
-    conclusion that is neither green nor explicitly non-red is RED -- INCLUDING one GitHub has
-    not documented, and a NULL one: read the group by polarity, never by an allow-list of the
-    failures you happen to expect.
+    job name apart, and `id` (not `started_at`, which is nullable) breaks the tie. ONE grouping
+    for the whole file: a RED/FLIGHT verdict and an AGE verdict about the same job must be
+    verdicts about the SAME attempt.
     """
     groups = defaultdict(list)
     for c in cr:
@@ -597,9 +596,19 @@ def rollup_checks(cr):
         du = c.get("details_url") or ""
         wf = "run" + du.split("/actions/runs/")[1].split("/")[0] if "/actions/runs/" in du else "?"
         groups[(app, wf, c.get("name"))].append(c)
+    return [(name, max(items, key=lambda x: x.get("id") or 0))
+            for (_a, _w, name), items in groups.items()]
+
+
+def rollup_checks(cr):
+    """(red, flight) name-sets by POLARITY on the NEWEST attempt per (app, workflow, name).
+
+    Every conclusion that is neither green nor explicitly non-red is RED -- INCLUDING one
+    GitHub has not documented, and a NULL one: read the group by polarity, never by an
+    allow-list of the failures you happen to expect.
+    """
     red, flight = set(), set()
-    for (_a, _w, name), items in groups.items():
-        newest = max(items, key=lambda x: x.get("id") or 0)
+    for name, newest in newest_attempts(cr):
         st = (newest.get("status") or "").lower()
         concl = (newest.get("conclusion") or "").lower()
         if st and st != "completed":
@@ -609,6 +618,166 @@ def rollup_checks(cr):
         else:
             red.add(name)
     return red, flight
+
+
+# ⛔ A CHECK-RUN THAT NEVER COMPLETES IS NOT "IN FLIGHT" FOREVER (#1926). GitHub does NOT
+# reconcile a run that was never picked up: a cancelled workflow, a runner that never came up,
+# or a job created and then orphaned leaves `status != completed` at that head PERMANENTLY, and
+# the classifier's answer is then indistinguishable from a healthy run's -- for as long as the
+# PR stays open. Nothing else in this loop looks at a check's AGE.
+#
+# THE DEFECT ON THIS BRANCH IS A WRONG ACTION, NOT A WAIT: a wedged required check reaches the
+# last arm and reads `fix-ci`, i.e. the beat tells the fleet to go REPAIR CODE for a job that
+# never ran (measured pre-fix at main=57edbd7a0: `{'fix-ci': 1}`). The wait-shaped version of
+# the same defect is the #1872 branch (PR #1930), where this shape reads `running` and the
+# dispatcher skips the PR. Either way the re-trigger never happens: the `rerun-checks` arm
+# requires `not req_seen`, and a wedged run is the one shape that is BOTH (it never reports, yet
+# its status is not `completed`) -- so it is absent from `seen` while its HEALTHY siblings are
+# not, `req_seen` is non-empty, and that arm cannot fire. (The #1872 branch re-words the same
+# arm as `not flight`, which a wedged run can never satisfy either: status != completed.)
+#
+# THE BOUND, and what it is derived from. Two clocks have to be covered, because the age of a
+# non-completed check is measured from whichever applies (see `flight_age_min`): a STARTED run's
+# job wall time, and a NEVER-started run's wait, which includes the runner queue. This file's
+# own measured figures, under the 2026-09 fleet load: the true execution critical path is
+# 11.6-17.3m (docstring trap 1; the printed `ci_crit_max` has since read up to 18.1m), and the
+# queue-INCLUSIVE run wall time (`createdAt -> updatedAt`) read 44.3m. The bound must sit above
+# the queue-inclusive figure, so 90m is ~2x it -- comfortably clear of the worst documented
+# HEALTHY wait, and still fast enough that a wedge is reported within ~1.5h rather than never.
+# ⛔ NOT `ci_critical_path()`'s 36.7m: that value is the #7516 MEASUREMENT ARTIFACT (an 8-day
+# window), and the function can no longer return it -- see the comment on CRIT_MAX_AGE_H.
+# A CONSTANT, not a live read, on purpose: the classification stays pure, and an unmeasurable
+# CI cannot silently switch the bound off.
+# ⛔ AND IT IS NOT A CONTRADICTION OF `ci-failure-set.sh`'s "NO AGE BOUND, DECIDED DELIBERATELY".
+# That decision is about a different artifact and a different question: a workflow RUN that
+# GitHub never expanded (`jobs == 0`), i.e. there is NO check-run to age, judged by which runs
+# count as `pending` before a landing. Here a check-run EXISTS at the head and is
+# non-completed, and the question is what the BEAT should call it. Its reasons (the safe net is
+# a `tested > 0` precondition; the only reachable clock would re-shape a shared run listing) do
+# not reach this read, which carries its own clocks.
+#
+# ⛔ SCOPE, STATED: the aged set is the REQUIRED contexts (`GATED_CHECKS`). A wedged RAIL gate
+# (`drift-guard`/`flip-gate`/`provenance`) is not in it, and is NOT silently waited on either --
+# it lands in `blocked-by-rail`, which is an ACTION the fleet dispatches a lane for, naming the
+# gate. Ageing it into `rerun-checks` would change the ladder for a non-required surface; that
+# is a separate call, deliberately not made here.
+FLIGHT_BOUND_MIN = 90.0
+
+# The contexts a landing actually waits on. `ai-review-gate` is EXCLUDED for the same reason
+# `call-rail` excludes it: it is DIFF-BOUND, so its truth is the head-bound attestation FILE,
+# never its check-run -- and re-triggering it does not make an attestation appear.
+GATED_CHECKS = tuple(n for n in REQUIRED if n != "ai-review-gate")
+
+
+def _epoch_ts(v):
+    """Unix seconds for a GitHub ISO-8601 timestamp, or None -- never a silent 0."""
+    try:
+        return datetime.fromisoformat(str(v).replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
+
+
+def _run_id(details_url):
+    """The ACTIONS RUN id in a check-run's `details_url`, or None (a non-Actions app's run)."""
+    try:
+        return (details_url or "").split("/actions/runs/")[1].split("/")[0]
+    except Exception:
+        return None
+
+
+def _pass_run_clock():
+    """`run_clock(run_id) -> unix seconds the run's CURRENT ATTEMPT started`, per pass.
+
+    ⛔ THE CHECK SUITE'S `created_at` IS NOT THIS CLOCK, and using it was a real bug caught in
+    review of the first cut of this fix. A re-run REUSES the suite: MEASURED 2026-10-17 on
+    agent-infra run 39004542024 -- attempts 1 and 2 both carry check suite 105706798511, while
+    `run_started_at` advanced 04:58:24 -> 05:05:10 (and the attempt-2 job's `created_at` is
+    05:05:11, i.e. only the RUN/JOB attempt clocks advance). With the suite clock, a PR whose
+    wedge was just re-triggered still aged from the original `created_at`, so the very next
+    beat would call it wedged again and re-trigger it again -- the churn the bound exists to
+    stop. `run_started_at` advances per attempt, so a re-trigger RESETS the age, as it must.
+
+    Only the never-started shape spends a read here: a check-run that has started carries its
+    own per-attempt `started_at` (also fresh after a re-run), and this closure is injected into
+    `stalled_flight` so the age logic itself stays pure. An unreadable clock is None -- the run
+    stays IN FLIGHT and never manufactures a re-trigger.
+    """
+    memo = {}
+
+    def run_clock(run_id):
+        global GH_LAST_ERROR
+        if not run_id:
+            return None
+        if run_id not in memo:
+            # ⛔ AN AGE READ MUST NOT BECOME THE FAILURE THE BEAT NAMES FOR A MAIN/QUEUE READ.
+            # `gh()` records the last failure for the report; this read is OPTIONAL, so its
+            # failure is restored away -- and swallowed, because a line-producer NEVER raises
+            # here: an assertion about a run's age is not worth losing the beat's whole verdict.
+            keep = GH_LAST_ERROR
+            d = None
+            try:
+                d = gh(f"repos/{REPO}/actions/runs/{run_id}")
+            except Exception:
+                d = None
+            finally:
+                GH_LAST_ERROR = keep
+            # ⛔ SHAPE-GUARD THE BODY, not just the call. `gh` can exit 0 with a non-object
+            # body ("Not Found", `[1,2]`), and `.get` on that raises OUTSIDE the guard above --
+            # which turns ONE unreadable clock into a lost beat line (`VERDICT=UNKNOWN error=`).
+            memo[run_id] = (_epoch_ts(d.get("run_started_at"))
+                            if isinstance(d, dict) else None)
+        return memo[run_id]
+
+    return run_clock
+
+
+def flight_age_min(c, now=None, run_clock=None):
+    """Minutes the ATTEMPT `c` has been non-completed, or None when there is no clock.
+
+    `started_at` when the run started (per attempt, and fresh after a re-run); else the wall
+    clock of the attempt that owns it, from `run_clock`. None -- not 0, and not infinity --
+    when neither can be read: an unreadable clock leaves the run IN FLIGHT and never
+    manufactures a re-trigger, the same rule as `rail_block_reason` (absence is not evidence).
+    """
+    since = _epoch_ts(c.get("started_at"))
+    if since is None and run_clock is not None:
+        since = run_clock(_run_id(c.get("details_url")))
+    if since is None:
+        return None
+    now = time.time() if now is None else now
+    return max(0.0, (now - since) / 60.0)
+
+
+def stalled_flight(cr, now=None, bound_min=None, run_clock=None):
+    """[(name, status, age_min)] -- GATED checks still non-completed PAST the flight bound.
+
+    ⛔ THIS IS THE SHAPE THE RE-TRIGGER ARM CANNOT REACH. Here that arm requires `not req_seen`
+    (#1872 re-words the same arm as `not flight`): a wedged run is missing from `seen` while its
+    HEALTHY siblings are not, so `req_seen` is non-empty and the arm cannot fire -- and it can
+    never satisfy `not flight` either, since its status is not `completed`. Past the bound it is
+    not a wait: nothing will ever complete it, so the work is to START it, which is what
+    `rerun-checks` already tells a lane to do.
+
+    ⛔ ONE ENTRY PER NAME, aged by the WORST attempt. Two workflows can publish the same job
+    name (the shape `newest_attempts`' grouping exists for), and a reason that prints
+    `docs queued 88m,docs queued 95m` names one check twice with two ages and no way to tell
+    which is which. `rollup_checks` collapses that pair to one name too, so the age read does
+    the same -- keeping the OLDER attempt, because that is the one that has been stuck.
+    """
+    bound = FLIGHT_BOUND_MIN if bound_min is None else bound_min
+    worst = {}
+    for name, newest in newest_attempts(cr):
+        if name not in GATED_CHECKS:
+            continue
+        st = (newest.get("status") or "").lower()
+        if not st or st == "completed":
+            continue
+        age = flight_age_min(newest, now=now, run_clock=run_clock)
+        if age is None or age <= bound:
+            continue
+        if name not in worst or age > worst[name][1]:
+            worst[name] = (st, age)
+    return sorted((n, st, age) for n, (st, age) in worst.items())
 
 
 def attestation_clean(number, head_sha):
@@ -643,13 +812,14 @@ def touches_surface(p):
     return False
 
 
-def classify_pr(pr, cr, att_clean):
+def classify_pr(pr, cr, att_clean, stalled=()):
     """The ONE action class for a non-draft PR, FIRST MATCH in CLASS_ORDER, or None if unread.
 
-    Pure on purpose: `cr` is a check-run list ALREADY READ and `att_clean` the attestation
-    verdict, so the classification is testable without touching GitHub. `None` (a miss) is
-    NOT `fix-ci` -- an unreadable PR must never be counted as work, or a blind read would
-    manufacture a queue of failures.
+    Pure on purpose: `cr` is a check-run list ALREADY READ, `att_clean` the attestation
+    verdict and `stalled` the aged-out flight list (see `stalled_flight`) -- so the
+    classification is testable without touching GitHub. `None` (a miss) is NOT `fix-ci` -- an
+    unreadable PR must never be counted as work, or a blind read would manufacture a queue of
+    failures.
     """
     if cr is None:
         return None
@@ -668,6 +838,7 @@ def classify_pr(pr, cr, att_clean):
     # head" -- and the head-bound attestation FILE states that authoritatively, so the check-run
     # is only a stale PROXY for `ai-review-gate` and never for the other six.
     nongreen_x = [n for n in nongreen if n != "ai-review-gate"]
+    gated_red = [n for n in GATED_CHECKS if n in red]
     # 1. call-rail -- every required check EXCEPT `ai-review-gate` is green AND a clean
     #    attestation exists at the CURRENT head AND the RAIL ITSELF would take it. The last
     #    clause was missing: an attested PR the rail refuses is a NAMED defect, not "not ready".
@@ -677,10 +848,21 @@ def classify_pr(pr, cr, att_clean):
     #    `sigpipe-guard` being red cannot reach here: they are not in REQUIRED).
     if not req_seen:
         return "rerun-checks"
-    # 3. resolve-conflict -- GitHub says DIRTY.
+    # 3. rerun-checks (WEDGED) -- a required check is still non-completed PAST the flight bound.
+    #    This is NOT a wait: nothing will ever complete it, so the work is to START it, which is
+    #    what `rerun-checks` means to a lane, and the reason names the check, its state and its
+    #    age. It sits HERE, matching `CLASS_ORDER` (rerun-checks above resolve-conflict and
+    #    record-review): a missing check tells you NOTHING, and a rebase CHANGES THE HEAD.
+    #    Without this arm the shape fell through to the last one -- `fix-ci` -- i.e. a lane sent
+    #    to REPAIR CODE FOR A JOB THAT NEVER RAN (measured pre-fix: `{'fix-ci': 1}`).
+    #    ⛔ A RED gated check is NEVER this class: a red check is real work, and re-triggering
+    #    would only mask it for a pass (same rule the `running` verdict states, #1872).
+    if stalled and not gated_red:
+        return "rerun-checks"
+    # 4. resolve-conflict -- GitHub says DIRTY.
     if (pr.get("mergeStateStatus") or "") == "DIRTY":
         return "resolve-conflict"
-    # 4. record-review -- every required check EXCEPT `ai-review-gate` is green and there is NO
+    # 5. record-review -- every required check EXCEPT `ai-review-gate` is green and there is NO
     #    current clean attestation at this head. This is the LEGITIMATE case, and it is the exact
     #    complement of arm 1: the ONLY difference between landing a PR and re-recording it is
     #    whether the attestation at THIS head exists, which is why the file -- not the check-run
@@ -688,7 +870,7 @@ def classify_pr(pr, cr, att_clean):
     #    green gate at an old head is evidence about that head, not this one.)
     if not nongreen_x and not att_clean:
         return "record-review"
-    # 5. fix-ci -- any OTHER required check non-green: real code work.
+    # 6. fix-ci -- any OTHER required check non-green: real code work.
     return "fix-ci"
 
 
@@ -720,16 +902,24 @@ def classify_queue(non):
     """
     classes, surface, unread = defaultdict(int), 0, 0
     by_class = defaultdict(list)
+    run_clock = _pass_run_clock()   # the age clock is per PASS, never across passes
+    now = time.time()
     for p in non:
         head = p.get("headRefOid") or ""
         cr = per_pr_checks(head)
-        k = classify_pr(p, cr, attestation_clean(p.get("number"), head))
+        stalled = stalled_flight(cr, now=now, run_clock=run_clock) if cr else []
+        k = classify_pr(p, cr, attestation_clean(p.get("number"), head), stalled)
         if k is None:
             unread += 1
         else:
             classes[k] += 1
             why = None
-            if k == "blocked-by-rail" and cr:
+            if k == "rerun-checks" and stalled:
+                # The REASON is the object of the action: WHICH check, in which state, for how
+                # long. A bare `rerun-checks=1: #8822` would make a wedged run and a head whose
+                # checks never got created look identical, and they need different repairs.
+                why = ",".join(f"{n} {st} {a:.0f}m" for n, st, a in stalled)
+            elif k == "blocked-by-rail" and cr:
                 _red, _fl = rollup_checks(cr)
                 why = rail_block_reason(_red, _fl,
                                         {c.get("name") for c in cr if c.get("name")})
