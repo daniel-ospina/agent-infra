@@ -90,7 +90,16 @@
 set -uo pipefail
 
 CELL_HOME="${CELL_HOME:-/tmp/cell-home}"
-REPO="${REPO:-/tmp/cell}"
+# ⛔ REPO HAS NO PATH DEFAULT (agent-infra#1935). This line used to be `REPO="${REPO:-/tmp/cell}"`,
+# and that path does not exist on the cloud cell: `start` died with `FATAL: no git repo at /tmp/cell`
+# — a controller that will not start, for a directory the operator never chose and nothing creates.
+# (The sibling defect is worse, in refresh-candidates.sh: ITS default was one developer's HOME
+# DIRECTORY, baked into every machine's harness.) A default is only safe if it is TRUE ON EVERY
+# BOX, so there is none — the value is REQUIRED, and resolve_repo() below may DERIVE it from a path
+# that really is a git checkout. The derivation is timid on purpose and never guesses between two
+# repos: this checkout decides the QUEUE (resolve_queue_target reads its `origin`), so adopting the
+# wrong one dispatches the wrong repo's work — the measured agent-infra#1901 defect.
+REPO="${REPO:-}"
 ENV_FILE="${ENV_FILE:-$CELL_HOME/keys.env}"
 O="${O:-$CELL_HOME/orchestrator}"
 # The harness is a SIBLING of this script inside agent-infra (scripts/orchestrator-harness/),
@@ -161,6 +170,64 @@ WORKER_ENV_NAMES="AI_REVIEW_GATE_KEY HOME O"
 
 say() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*"; }
 die() { say "FATAL: $*" >&2; exit 1; }
+
+# ── the TARGET checkout: the operator's value, else DERIVED from a real checkout ───────────────
+# Adoption rule, in order: $REPO as given; else exactly ONE candidate that is a git checkout; else,
+# when several are, the ones whose `origin` names the declared $OR — and if that is still not exactly
+# one, REFUSE. Two distinct checkouts on one box is precisely the case where a guess is unrecoverable
+# (the derivation feeds OR, and OR decides which queue the controller works), so the refusal names
+# both and asks. The candidate list is the harness's own provisioning locations — nothing walks the
+# filesystem — and `run`/`git` are the only tools this needs: no network, no config, no agent.
+REPO_SEEN=""       # what the derivation looked at, for the refusal
+resolve_repo() {
+  local cand url hits="" n=0
+  [ -n "$REPO" ] && return 0
+  REPO_SEEN=""
+  for cand in "${WORKDIR:-}" "$CELL_HOME/cell" "/tmp/cell" \
+              "${OR:+$CELL_HOME/${OR##*/}}" "${OR:+/tmp/cell-${OR##*/}}" "${OR:+/tmp/${OR##*/}}"; do
+    [ -n "$cand" ] || continue
+    case " $REPO_SEEN " in *" $cand "*) continue ;; esac
+    REPO_SEEN="${REPO_SEEN:+$REPO_SEEN }$cand"
+    [ -d "$cand" ] || continue
+    git -C "$cand" rev-parse --git-dir >/dev/null 2>&1 || continue
+    if [ -n "${OR:-}" ]; then
+      url="$(git -C "$cand" config --get remote.origin.url 2>/dev/null || true)"
+      case "$url" in
+        "$OR"|"$OR.git"|*":$OR"|*":$OR.git"|*"/$OR"|*"/$OR.git") ;;
+        *) continue ;;
+      esac
+    fi
+    hits="$hits$cand\n"
+  done
+  n="$(printf '%b' "$hits" | grep -c .)"
+  case "$n" in
+    1) REPO="$(printf '%b' "$hits" | head -1)"; REPO="$(cd "$REPO" && pwd -P)" || { REPO=""; return 1; }
+       say "REPO was not set — using $REPO (a checkout from the provisioning candidates${OR:+, origin $OR})"
+       return 0 ;;
+    0) return 1 ;;
+  esac
+  say "REPO was not set and ${n} candidate checkouts match${OR:+ $OR}:"
+  printf '%b' "$hits" | sed 's/^/       /' >&2
+  return 1
+}
+
+# ONE actionable line, on the verbs that cannot work without a checkout. `status` deliberately does
+# not call it: it is the verb an operator runs to DISCOVER this, so it must still answer.
+assert_repo() {
+  if ! resolve_repo; then
+    die "REPO is not set and no single checkout could be derived from ${REPO_SEEN:-the provisioning candidates} — set REPO=<a checkout of the repo this cell should work> (e.g. in $ENV_FILE), or clone it to /tmp/cell"
+  fi
+  # ⛔ THE GUARD MUST SEE THE VALUE THAT IS INTERPOLATED, not only the one the OPERATOR passed
+  # (agent-infra#1935 review). `cmd_start` validates REPO before this derives it — and skips an
+  # EMPTY value — so a DERIVED path was the one interpolated value that reached the tmux command
+  # string unvalidated: a checkout directory named with a quote would close the quote in
+  # `REPO='$REPO'` and the rest would be parsed as shell. This is the same class as the `$HARNESS`
+  # re-check below, which exists for exactly this reason (a value that changes after the guard).
+  safe_argv "$REPO" || die "\$REPO must not contain a quote or shell metacharacter: $REPO"
+  # A DERIVED checkout changes the queue target (resolve_queue_target reads its origin), so re-derive
+  # OR before anything asserts the pair.
+  resolve_queue_target || true; OR="$QUEUE_REPO"
+}
 
 # A quote or shell metacharacter in any value interpolated into the session command string would
 # break out of it — the string is handed to tmux, which runs it with sh -c. The harness applies
@@ -342,6 +409,13 @@ QUEUE_STATE=""       # derived|explicit = usable · mismatch|invalid|unreadable|
 # verbs that cannot do their job call assert_queue_target() below.
 resolve_queue_target() {
   QUEUE_DECLARED="${OR:-}"
+  # ⛔ AN EMPTY $REPO IS NOT "read the queue from the CURRENT DIRECTORY". `git -C ""` silently means
+  # no `-C` at all, so the pre-#1935 load-time call derived the queue from whatever directory the
+  # operator happened to be standing in — and then held the REAL checkout against it. A controller's
+  # queue must follow the checkout it names, never the caller's cwd.
+  if [ -z "$REPO" ]; then
+    QUEUE_REMOTE=""; QUEUE_DERIVED=""; QUEUE_REPO="$QUEUE_DECLARED"; QUEUE_STATE="unreadable"; return 1
+  fi
   QUEUE_REMOTE="$(git -C "$REPO" remote get-url origin 2>/dev/null)"
   QUEUE_DERIVED=""
   [ -n "$QUEUE_REMOTE" ] && QUEUE_DERIVED="$(queue_repo_from_url "$QUEUE_REMOTE")"
@@ -378,6 +452,10 @@ OR="$QUEUE_REPO"
 # does not start, with an error naming BOTH values, the remote that was read, and the repo this
 # machine needs so provisioning is unambiguous.
 assert_queue_target() {
+  # ⛔ REPO first: with no checkout, every QUEUE_STATE below is a SYMPTOM, and the old message read
+  # `cannot read the QUEUE … 'git -C  remote get-url origin' returned no URL` — an error about an
+  # empty path. The cause is the missing checkout, so name it.
+  [ -n "$REPO" ] || assert_repo
   case "$QUEUE_STATE" in
     derived|explicit) return 0 ;;
   esac
@@ -911,6 +989,11 @@ cmd_check() {
   # and install.sh warns rather than dying for it — so the two surfaces agree.
   command -v uv >/dev/null 2>&1 || say "warn: uv missing — lane.sh cannot sync a worktree venv, so in-lane tests will fail (non-fatal, as in install.sh)"
   gh auth status >/dev/null 2>&1 || die "gh not authenticated — run cloud-cell-bringup.sh --check"
+  # ⛔ RESOLVE THE CHECKOUT BEFORE ANYTHING READS IT. Every verdict below is about THIS repo, and an
+  # unresolved $REPO used to reach `die "no git repo at "` — an error naming an empty path, for a
+  # value the operator never set. assert_repo() derives it or refuses with one actionable line, and
+  # re-derives OR when it derived the checkout (the queue follows the checkout's origin).
+  assert_repo
   [ -d "$REPO/.git" ] || [ -f "$REPO/.git" ] || die "no git repo at $REPO"
   # ⛔ A LINKED WORKTREE HAS A `.git` FILE, NOT A DIRECTORY (agent-infra#1745). The old `-d` test
   # refused a worktree with "FATAL: no git repo at <path>" even though every git command in it works

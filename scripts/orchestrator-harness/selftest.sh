@@ -482,7 +482,256 @@ PY
   O="$RC" LIMIT=5 SC="$RC/fakesc" PY="$RC/fakesc/.venv/bin/python" PREFLIGHT="$RC/fakesc/tools/collision_preflight.py" bash "$TMP/refreshloop.sh" > "$TMP/collide-2.out" 2>&1
   case "$(tr '\n' ' ' < "$RC/candidates.txt")" in *10*) rc=0;; *) rc=1;; esac
   ck "shipped refresh loop: the COLLISION is re-attempted and queued once it clears" $rc
+
+  # ── 5f) a HOLDER-ONLY INCOMPLETE is decided by the CROSS-BOX claim registry (#1935) ─────────
+  # The live cloud cell's pre-flight returns nothing else: its fleet board cannot answer (no cmux
+  # lane registry, and this cmux flavor has no `sessions list`), so every candidate was INCOMPLETE
+  # and the backlog stayed 0 all evening. The tool's own arithmetic makes a holder-only INCOMPLETE a
+  # statement that every surface it COULD read was clean, so the holder question falls to the
+  # cross-box registry. Three arms: the answer is a claim (queue), it is unreadable (refuse), or
+  # another surface is ALSO unreadable (refuse — the tool could not judge the WORK).
+  HI="$TMP/holderinc"; mkdir -p "$HI/fakesc/.venv/bin"
+  printf '10\n' > "$HI/.pool"
+  : > "$HI/checked.txt"; : > "$HI/candidates.txt"; : > "$HI/dispatched.txt"
+  # The registry FILE the real reader sources; the READER function is supplied only in arm (ii), so
+  # arm (i) pins the "file present, function absent" shape the extraction really has.
+  : > "$HI/claims.sh"
+  cat > "$HI/fakesc/.venv/bin/python" <<'PY'
+#!/bin/bash
+# the live cell's actual answer: every other surface clean, the BOARD unable to say who holds it
+cat <<'REPORT'
+collision-preflight: issue #10
+issue assignee/holder           INCOMPLETE  0     claim gate: the FLEET BOARD could not answer — the board's live-session store could not be read
+
+INCOMPLETE SURFACES
+  [issue assignee/holder] claim gate: the FLEET BOARD could not answer — the board's live-session store could not be read, so NO lane's liveness is measurable
+
+VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be queried (issue assignee/holder); this is NOT clean for #10 in acme/widget
+REPORT
+exit 2
+PY
+  chmod +x "$HI/fakesc/.venv/bin/python"
+  # (i) OUTCOME ONLY. The extracted body carries no claim reader, and an undefined call returns 127 —
+  # which the `case` reads as neither 1 nor 2 and therefore QUEUES. Fail-closed arm: nothing queued.
+  O="$HI" LIMIT=5 SC="$HI/fakesc" PY="$HI/fakesc/.venv/bin/python" PREFLIGHT="$HI/fakesc/tools/collision_preflight.py" bash "$TMP/refreshloop.sh" > "$TMP/holderinc-none.out" 2>&1
+  case "$(tr '\n' ' ' < "$HI/candidates.txt")" in *10*) rc=1;; *) rc=0;; esac
+  ck "holder-only INCOMPLETE with NO claim reader available is NOT queued (127 is not CLEAN)" $rc
+  # (ii) the registry ANSWERS: a stub reader returns 0, supplied the way the shipped script has it at
+  # top level — prepended to the extraction, so the real arm is what runs.
+  { printf 'issue_claim_verdict() { CLAIM_RESULT="stub: no claim"; return 0; }\n'; cat "$TMP/refreshloop.sh"; } > "$TMP/refreshloop-claim.sh"
+  O="$HI" LIMIT=5 SC="$HI/fakesc" PY="$HI/fakesc/.venv/bin/python" PREFLIGHT="$HI/fakesc/tools/collision_preflight.py" bash "$TMP/refreshloop-claim.sh" > "$TMP/holderinc-claim.out" 2>&1
+  case "$(tr '\n' ' ' < "$HI/candidates.txt")" in *10*) rc=0;; *) rc=1;; esac
+  ck "holder-only INCOMPLETE: the cross-box registry's CLEAN verdict queues the candidate" $rc
+  case "$(tr '\n' ' ' < "$HI/checked.txt")" in *10*) rc=0;; *) rc=1;; esac
+  ck "holder-only INCOMPLETE queued via the registry is also marked checked" $rc
+  # (ii-b) the registry is NOT INSTALLED: nothing has answered the holder question, so refuse. This is
+  # the arm that keeps the re-route from becoming "no registry, so nobody holds it".
+  mv "$HI/claims.sh" "$HI/claims.sh.away"
+  : > "$HI/candidates.txt"; : > "$HI/checked.txt"
+  O="$HI" LIMIT=5 SC="$HI/fakesc" PY="$HI/fakesc/.venv/bin/python" PREFLIGHT="$HI/fakesc/tools/collision_preflight.py" bash "$TMP/refreshloop-claim.sh" > "$TMP/holderinc-noreg.out" 2>&1
+  case "$(tr '\n' ' ' < "$HI/candidates.txt")" in *10*) rc=1;; *) rc=0;; esac
+  ck "holder-only INCOMPLETE with NO claim registry on the box is NOT queued" $rc
+  mv "$HI/claims.sh.away" "$HI/claims.sh"
+  # (iii) a SECOND unreadable surface means the tool could not judge the work: no re-route.
+  HI2="$TMP/holderinc2"; mkdir -p "$HI2/fakesc/.venv/bin"
+  printf '10\n' > "$HI2/.pool"
+  : > "$HI2/checked.txt"; : > "$HI2/candidates.txt"; : > "$HI2/dispatched.txt"
+  cat > "$HI2/fakesc/.venv/bin/python" <<'PY'
+#!/bin/bash
+cat <<'REPORT'
+open PRs                        INCOMPLETE  0     gh: could not reach api.github.com
+issue assignee/holder           INCOMPLETE  0     claim gate: the FLEET BOARD could not answer
+
+INCOMPLETE SURFACES
+  [open PRs] gh: could not reach api.github.com
+  [issue assignee/holder] claim gate: the FLEET BOARD could not answer
+
+VERDICT: INCOMPLETE (exit 2) — 2 surface(s) could not be queried (open PRs, issue assignee/holder)
+REPORT
+exit 2
+PY
+  chmod +x "$HI2/fakesc/.venv/bin/python"
+  O="$HI2" LIMIT=5 SC="$HI2/fakesc" PY="$HI2/fakesc/.venv/bin/python" PREFLIGHT="$HI2/fakesc/tools/collision_preflight.py" bash "$TMP/refreshloop-claim.sh" > "$TMP/holderinc-multi.out" 2>&1
+  case "$(tr '\n' ' ' < "$HI2/candidates.txt")" in *10*) rc=1;; *) rc=0;; esac
+  ck "an INCOMPLETE with ANOTHER unreadable surface is NOT re-routed (the work itself is unjudged)" $rc
+
+  # ── 5g) the re-route's own safety properties, on the path where it FIRES ────────────────────
+  # Each arm reuses the fixture (holder-only report + a stub reader) and varies only what the
+  # registry ANSWERS. What is asserted every time is that a peer's work is never dispatched.
+  holder_arm() { # <name> <reader-body>  → runs the loop with that reader, prints nothing
+    { printf 'issue_claim_verdict() { CLAIM_RESULT="stub"; %s\n}\n' "$2"; cat "$TMP/refreshloop.sh"; } > "$TMP/refreshloop-h.sh"
+    : > "$HI/candidates.txt"; : > "$HI/checked.txt"
+    O="$HI" LIMIT=5 SC="$HI/fakesc" PY="$HI/fakesc/.venv/bin/python" PREFLIGHT="$HI/fakesc/tools/collision_preflight.py" bash "$TMP/refreshloop-h.sh" > "$TMP/holder-$1.out" 2>&1
+  }
+  # (a) A LIVE CLAIM is the primary thing this gate exists to catch: registry rc=1 must never queue.
+  holder_arm live 'return 1'
+  case "$(tr '\n' ' ' < "$HI/candidates.txt")" in *10*) rc=1;; *) rc=0;; esac
+  ck "holder-only INCOMPLETE + a LIVE claim: NOT queued (the registry's refusal is honoured)" $rc
+  case "$(tr '\n' ' ' < "$HI/checked.txt")" in *10*) rc=1;; *) rc=0;; esac
+  ck "holder-only INCOMPLETE + a LIVE claim: NOT marked checked (re-attempted next pass)" $rc
+  # (b) A STALE READER (rc=3, a claims.sh predating the issue reader) is a permanent local refusal.
+  holder_arm stale 'return 3'
+  case "$(tr '\n' ' ' < "$HI/candidates.txt")" in *10*) rc=1;; *) rc=0;; esac
+  ck "holder-only INCOMPLETE + a STALE claim reader (rc=3): NOT queued" $rc
+  # (c) F1's fail-OPEN (found in review): the SAME surface is also marked INCOMPLETE when the board
+  # DID answer and ATTRIBUTED a lane whose liveness it could not measure. The claim registry would
+  # then say CLEAN for a lane that never took a claim (or whose lease expired), so the name alone
+  # must NOT re-route — the whole-board wording is part of the condition.
+  H3="$TMP/holderinc3"; mkdir -p "$H3/fakesc/.venv/bin"
+  printf '10\n' > "$H3/.pool"; : > "$H3/checked.txt"; : > "$H3/candidates.txt"; : > "$H3/dispatched.txt"
+  : > "$H3/claims.sh"
+  cat > "$H3/fakesc/.venv/bin/python" <<'PY'
+#!/bin/bash
+cat <<'REPORT'
+issue assignee/holder           INCOMPLETE  0     claim gate: holder read from the FLEET BOARD (source: cache) — 1 lane(s) attributed, but its pid_alive is UNMEASURED
+
+INCOMPLETE SURFACES
+  [issue assignee/holder] claim gate: holder read from the FLEET BOARD (source: cache) — 1 lane(s) attributed to #10, and no pid reading exists for it
+
+VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be queried (issue assignee/holder)
+REPORT
+exit 2
+PY
+  chmod +x "$H3/fakesc/.venv/bin/python"
+  { printf 'issue_claim_verdict() { CLAIM_RESULT="stub: no claim"; return 0; }\n'; cat "$TMP/refreshloop.sh"; } > "$TMP/refreshloop-h3.sh"
+  O="$H3" LIMIT=5 SC="$H3/fakesc" PY="$H3/fakesc/.venv/bin/python" PREFLIGHT="$H3/fakesc/tools/collision_preflight.py" bash "$TMP/refreshloop-h3.sh" > "$TMP/holder-partial.out" 2>&1
+  case "$(tr '\n' ' ' < "$H3/candidates.txt")" in *10*) rc=1;; *) rc=0;; esac
+  ck "a PARTIAL board answer (a lane IS attributed) is NOT re-routed — a claimless lane is not a free issue" $rc
+  # (d) FORMAT DRIFT: an INCOMPLETE verdict with NO surface section at all must refuse, never re-route.
+  H4="$TMP/holderinc4"; mkdir -p "$H4/fakesc/.venv/bin"
+  printf '10\n' > "$H4/.pool"; : > "$H4/checked.txt"; : > "$H4/candidates.txt"; : > "$H4/dispatched.txt"
+  : > "$H4/claims.sh"
+  cat > "$H4/fakesc/.venv/bin/python" <<'PY'
+#!/bin/bash
+# a FUTURE producer that reworded the section away: the verdict is still INCOMPLETE
+printf 'VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be queried\n'
+exit 2
+PY
+  chmod +x "$H4/fakesc/.venv/bin/python"
+  O="$H4" LIMIT=5 SC="$H4/fakesc" PY="$H4/fakesc/.venv/bin/python" PREFLIGHT="$H4/fakesc/tools/collision_preflight.py" bash "$TMP/refreshloop-h3.sh" > "$TMP/holder-nosection.out" 2>&1
+  case "$(tr '\n' ' ' < "$H4/candidates.txt")" in *10*) rc=1;; *) rc=0;; esac
+  ck "an INCOMPLETE with NO surface section (format drift) is NOT re-routed" $rc
+
+  # ── 5f-2) the surface SET is read from the VERDICT LINE, and a report carrying a BLOCKING hit is
+  # not a verdict at all (cycle-2 review, F1 + F2 — both reproduced fail-OPENs before these arms).
+  # The producer is resolved from the TARGET repo, so it DRIFTS; these are the shapes that would
+  # have queued a candidate the same producer's own table calls blocked or unjudged.
+  holder_report() { # <outfile> <report-body>  → a fixture whose stub prints that body for issue 10
+    local d; d="$(mktemp -d "$TMP/hrep.XXXXXX")"; mkdir -p "$d/fakesc/.venv/bin"
+    printf '10\n' > "$d/.pool"; : > "$d/checked.txt"; : > "$d/candidates.txt"; : > "$d/dispatched.txt"; : > "$d/claims.sh"
+    { printf '#!/bin/bash\ncat <<\x27REPORT\x27\n'; printf '%s\n' "$2"; printf 'REPORT\nexit 2\n'; } > "$d/fakesc/.venv/bin/python"
+    chmod +x "$d/fakesc/.venv/bin/python"; printf '%s' "$d"
+  }
+  holder_run() { # <dir> [outfile-suffix]
+    O="$1" LIMIT=5 SC="$1/fakesc" PY="$1/fakesc/.venv/bin/python" PREFLIGHT="$1/fakesc/tools/collision_preflight.py" \
+      bash "$TMP/refreshloop-claim.sh" > "$TMP/holder-$2.out" 2>&1
+  }
+  holder_queued() { case "$(tr '\n' ' ' < "$1/candidates.txt")" in *10*) echo 1;; *) echo 0;; esac; }  # 1 = queued = FAIL code
+
+  # (f1) A BLOCKING HIT alongside an INCOMPLETE verdict. The re-route trusts the producer's verdict
+  # ORDER; this report is self-contradicting (the class the DEGRADED read already exists for, #1853),
+  # and its own table says COLLISION. An advisory hit must NOT trip this arm — hence the second case.
+  D5="$(holder_report x 'open PRs                        COLLISION   1     matched issue-number (10) in title, OPEN (number)
+issue assignee/holder           INCOMPLETE  0     claim gate: the FLEET BOARD could not answer
+
+HITS
+  [open PRs] #12 — matched issue-number (10) in title, OPEN (number)
+
+INCOMPLETE SURFACES
+  [issue assignee/holder] claim gate: the FLEET BOARD could not answer
+
+VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be queried (issue assignee/holder)')"
+  holder_run "$D5" f1; ck "an INCOMPLETE verdict carrying a BLOCKING hit is NOT queued (a self-contradicting report is not a verdict)" "$(holder_queued "$D5")"
+  # …and ADVISORY hits, which also print under HITS, must keep the re-route alive: the arm above is
+  # about a BLOCKING tag, not about "any hit at all" (the producer appends ` (advisory — cannot
+  # block)` AFTER the strength tag, so an advisory line does not END with it).
+  D6="$(holder_report x 'open PRs                        ADVISORY    1     matched issue-number (10) in title, MERGED (weak) (advisory — cannot block)
+issue assignee/holder           INCOMPLETE  0     claim gate: the FLEET BOARD could not answer
+
+HITS
+  [open PRs] #11 — matched issue-number (10) in title, MERGED (weak) (advisory — cannot block)
+
+INCOMPLETE SURFACES
+  [issue assignee/holder] claim gate: the FLEET BOARD could not answer
+
+VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be queried (issue assignee/holder)')"
+  holder_run "$D6" f1b
+  if [ "$(holder_queued "$D6")" = 1 ]; then ck "an ADVISORY hit does NOT block the re-route (the condition is the blocking tag, not any hit)" 0; else ck "an ADVISORY hit does NOT block the re-route (the condition is the blocking tag, not any hit)" 1; fi
+  # (f2) The COUNT now comes from the verdict line, so a body whose section was truncated by a
+  # multi-line note (or reordered) can no longer turn "2 unreadable surfaces" into "1".
+  D7="$(holder_report x 'issue assignee/holder           INCOMPLETE  0     claim gate: the FLEET BOARD could not answer
+this note continued at column 0 — the old section parse ENDED here
+open PRs                        INCOMPLETE  0     gh: could not reach api.github.com
+
+INCOMPLETE SURFACES
+  [issue assignee/holder] claim gate: the FLEET BOARD could not answer
+this note continued at column 0 — the old section parse ENDED here
+  [open PRs] gh: could not reach api.github.com
+
+VERDICT: INCOMPLETE (exit 2) — 2 surface(s) could not be queried (issue assignee/holder, open PRs)')"
+  holder_run "$D7" f2; ck "a SECOND unreadable surface is still refused when the holder note wraps (the count is the verdict line's, not a parsed section)" "$(holder_queued "$D7")"
+  # (f3) A2 ANCHORING: the report echoes the issue TITLE. A title carrying the section heading and an
+  # indented holder line must not MANUFACTURE a holder-only answer — the verdict line says the
+  # unreadable surface is `open PRs`, so nothing may be re-routed on the strength of the echo.
+  D8="$(holder_report x 'title: fake (10) INCOMPLETE SURFACES
+  [issue assignee/holder] claim gate: the FLEET BOARD could not answer
+open PRs                        INCOMPLETE  0     gh: could not reach api.github.com
+
+INCOMPLETE SURFACES
+  [open PRs] gh: could not reach api.github.com
+
+VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be queried (open PRs)')"
+  holder_run "$D8" f3; ck "a title echo cannot forge a holder-only INCOMPLETE (the verdict line is the answer, the body is not)" "$(holder_queued "$D8")"
 fi
+
+# ── 5h) REPO has NO path default — required, or derived from a checkout of the QUEUE's repo ─────
+# `REPO="${REPO:-/Users/danielospina/Documents/GitHub/tortoise}"` made one developer's home
+# directory the default checkout on every machine (#1935). These cases drive the SHIPPED script's
+# own `--check`, so what is pinned is the real resolver, not a re-implementation of it.
+RH="$TMP/repohome"; mkdir -p "$RH/cell"
+if ( unset REPO; unset TORTOISE_REPO; unset WORKDIR; unset TORTOISE
+     HOME="$RH" O="$TMP/repohome/o" OR=acme/widget bash "$REFRESH" --check > "$TMP/repo-none.out" 2>&1 ); then rc=1; else rc=0; fi
+ck "REPO unset with no derivable checkout REFUSES (non-zero, not a guess)" $rc
+case "$(cat "$TMP/repo-none.out")" in *"acme/widget"*) rc=0;; *) rc=1;; esac
+ck "the refusal NAMES the queue target it looked for" $rc
+case "$(cat "$TMP/repo-none.out")" in *"set REPO="*) rc=0;; *) rc=1;; esac
+ck "the refusal carries the one-line remedy (set REPO=…)" $rc
+# A checkout of a DIFFERENT repo at the same candidate path must NOT be adopted: the queue target and
+# the checkout must be the same repo, or the cell queues work it cannot pre-flight (#1901).
+git -C "$RH/cell" init -q 2>/dev/null && git -C "$RH/cell" remote add origin https://github.com/acme/other.git
+( unset REPO; unset TORTOISE_REPO; unset WORKDIR; unset TORTOISE
+  HOME="$RH" O="$TMP/repohome/o2" OR=acme/widget bash "$REFRESH" --check > "$TMP/repo-wrong.out" 2>&1 ) || true
+case "$(cat "$TMP/repo-wrong.out")" in *"REPO was not set"*) rc=1;; *) rc=0;; esac
+ck "a checkout of the WRONG repo at a candidate path is NOT adopted" $rc
+# …and the same path with the right origin IS adopted (the false-block control).
+git -C "$RH/cell" remote set-url origin https://github.com/acme/widget.git
+( unset REPO; unset TORTOISE_REPO; unset WORKDIR; unset TORTOISE
+  HOME="$RH" O="$TMP/repohome/o3" OR=acme/widget bash "$REFRESH" --check > "$TMP/repo-ok.out" 2>&1 ) || true
+case "$(cat "$TMP/repo-ok.out")" in *"REPO was not set — using $RH/cell"*) rc=0;; *) rc=1;; esac
+ck "a checkout whose origin IS the queue target is DERIVED (the resolver's positive path)" $rc
+# An EXPLICIT $REPO is held to the same proof (cycle-2 review, F3). It used to be adopted on trust, so
+# `refresh --check` returned CHECK OK for a pair that `cloud-cell-supervisor.sh check` refuses — and
+# bring-up hands this script whatever checkout it finds, so a wrong pair was certified by the gate that
+# exists to catch it. Three arms: mismatch refused, unreadable origin refused, match accepted.
+X="$TMP/repoexplicit"; mkdir -p "$X/other" "$X/samerepo"
+git -C "$X/other" init -q; git -C "$X/other" remote add origin https://github.com/acme/other.git
+HOME="$RH" REPO="$X/other" OR=acme/widget O="$TMP/repoexplicit/o" bash "$REFRESH" --check > "$TMP/repo-explicit-mismatch.out" 2>&1; rc=$?
+if [ "$rc" -ne 0 ]; then xr=0; else xr=1; fi
+ck "an EXPLICIT REPO whose origin is a DIFFERENT repo is REFUSED (the two entry points agree, #1901)" $xr
+case "$(cat "$TMP/repo-explicit-mismatch.out")" in
+  *"NOT the queue target"*) xr=0 ;;
+  *) xr=1 ;;
+esac
+ck "the mismatch refusal names the queue target and the checkout's origin" $xr
+git -C "$X/samerepo" init -q   # …a checkout with NO origin cannot prove anything either
+HOME="$RH" REPO="$X/samerepo" OR=acme/widget O="$TMP/repoexplicit/o2" bash "$REFRESH" --check > "$TMP/repo-explicit-noorigin.out" 2>&1; rc=$?
+if [ "$rc" -ne 0 ]; then xr=0; else xr=1; fi
+ck "an EXPLICIT REPO with NO readable origin is REFUSED (cannot-prove is not proved)" $xr
+git -C "$X/samerepo" remote add origin https://github.com/acme/widget.git
+HOME="$RH" REPO="$X/samerepo" OR=acme/widget O="$TMP/repoexplicit/o3" bash "$REFRESH" --check > "$TMP/repo-explicit-ok.out" 2>&1; rc=$?
+if [ "$rc" -eq 0 ]; then xr=0; else xr=1; fi
+ck "an EXPLICIT REPO that IS a checkout of the queue target is ACCEPTED (no false block)" $xr
+
 
 # ── 5e) the capture site itself: a failed `gh` leaves ABSENCE, not an empty file ──────────────
 # The reaper guard above is only sound if the capture never hands it an empty file for a FAILED

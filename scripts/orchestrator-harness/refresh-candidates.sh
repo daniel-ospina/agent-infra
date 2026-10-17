@@ -14,9 +14,24 @@
 # alive and can only merge. `--check` answers the provisioning question up front, WITH THE REASON,
 # so a cell is never STARTED in that state (cloud-cell-supervisor.sh `check` calls it).
 set -u
+# Did the OPERATOR name the queue target, or is this the harness default? The difference decides
+# whether a checkout whose `origin` cannot be compared to it is a refusal or a documented
+# tolerance (see resolve_repo): the supervisor DERIVES the queue from the checkout when $OR is not
+# declared, so an undeclared target and its checkout are coherent by construction; a DECLARED one
+# is a claim about a specific repo that the checkout must be able to prove.
+OR_DECLARED=0; [ -n "${OR:-}" ] && OR_DECLARED=1
 OR="${OR:-daniel-ospina/tortoise}"
-REPO="${REPO:-/Users/danielospina/Documents/GitHub/tortoise}"
-SC="$REPO/.worktrees/dispatch-scout"
+# ⛔ REPO HAS NO DEFAULT, AND THAT IS THE FIX (agent-infra#1935). This line used to read
+# `REPO="${REPO:-/Users/danielospina/Documents/GitHub/tortoise}"` — ONE DEVELOPER'S HOME DIRECTORY,
+# baked into a script every machine on the fleet runs. On any other box the default is a path that
+# does not exist, and the failure surfaces far from the cause: `resolve_preflight` finds no tool, the
+# scout worktree cannot be created, and on a cell whose keys.env does not carry REPO the whole
+# dispatch path dies for a reason nobody can see from the log. A default is only safe if it is TRUE
+# ON EVERY MACHINE; a personal path never is, so there is none. `resolve_repo` (below) accepts the
+# operator's value and otherwise discovers a checkout of $OR by its ORIGIN, so the checkout and the
+# queue target are provably the same repo — the fact a bare path cannot express.
+REPO="${REPO:-}"
+SC=""   # from $REPO, once resolve_repo has settled it
 
 # ── A USABLE $HOME IS A PRECONDITION OF THE PRE-FLIGHT, NOT A PER-CANDIDATE RESULT ─────────────
 # WHY THIS LIVES HERE AND NOT ONLY IN cloud-cell-bringup.sh. Bring-up already names this as friction
@@ -100,6 +115,99 @@ UV="${SCOUT_UV:-uv}"
 # help. Keep these in sync with orch-loop.sh's `-eq 3` handler.
 EXIT_TRANSIENT=1
 EXIT_NOT_PROVISIONABLE=3
+
+# ── the TARGET checkout: the operator's value, else DERIVED from a real checkout of $OR ─────────
+# ⛔ THE OLD DEFAULT WAS A DEVELOPER'S HOME DIRECTORY (see the top of this file), and a default that
+# is a path is unverifiable even when it exists: `$OR` (the queue target) and `$REPO` (the checkout)
+# are independent facts, and a cell standing in the wrong repo queues work it cannot pre-flight —
+# agent-infra#1901's measured defect. So a DERIVED candidate must prove BOTH: it is a git checkout,
+# and its `origin` names $OR. Anything else is refused rather than guessed, because a wrong guess
+# here does not fail loudly — it dispatches.
+#
+# The candidate list is ONE list, used by both the scan and the refusal text — a message that names
+# different paths than the scan probed is the worst kind of remedy (it sends the operator somewhere
+# the tool never looked, #1935 review). It is fixed and small (where this harness and its bring-up
+# put a checkout), so nothing walks the filesystem.
+repo_candidates() {
+  printf '%s\n' "${WORKDIR:-}" "$HOME/${OR##*/}" "$HOME/cell" "/tmp/cell" \
+                "/tmp/cell-${OR##*/}" "/tmp/${OR##*/}" "${TORTOISE_REPO:-}" "${TORTOISE:-}"
+}
+
+resolve_repo() {   # 0 and usable $REPO/$SC, or 1 with the reason printed by repo_unresolved
+  local cand url
+  # ⛔ AN EXPLICIT $REPO IS VERIFIED TOO (cycle-2 review, F3). It used to be adopted on trust, so the
+  # two entry points disagreed about the SAME pair: `refresh --check` said CHECK OK while
+  # `cloud-cell-supervisor.sh check` refused it as a queue/checkout mismatch (#1901) — and the
+  # consequence was measured, not theoretical: bring-up accepts whatever `.git` it finds under
+  # $WORKDIR and hands it here as REPO=, so the wrong pair was certified by the very gate that exists
+  # to catch it, and a hand-run refresh then pre-flighted one repo's issues against ANOTHER repo's
+  # tree. The supervisor's `assert_queue_target` already refuses a mismatch; this is that same
+  # deliberate trade (a fork-origin dev checkout must declare $OR), taken in one place instead of two
+  # that can diverge. Unreadable origin is a refusal, not a pass: "cannot prove" is never "proved".
+  if [ -n "$REPO" ]; then
+    url="$(git -C "$REPO" config --get remote.origin.url 2>/dev/null || true)"
+    case "$url" in
+      "$OR"|"$OR.git"|*":$OR"|*":$OR.git"|*"/$OR"|*"/$OR.git") ;;
+      "") echo "[refresh] NOT PROVISIONABLE: \$REPO ($REPO) has no readable 'origin' remote, so this pass cannot prove it is a checkout of $OR — an unproven checkout is how the wrong repo's issues get queued (#1901)"
+          echo "[refresh]   fix: git -C $REPO remote set-url origin https://github.com/$OR.git  (or unset REPO and let this script derive one)"
+          return 1 ;;
+      *) case "$url" in
+           # A URL-shaped origin names a repo that can be COMPARED, so a difference is a refusal.
+           *://*|*@*:*)
+             echo "[refresh] NOT PROVISIONABLE: \$REPO is $REPO, whose 'origin' is $url — NOT the queue target $OR"
+             echo "[refresh]   the queue target (\$OR) and the checkout (\$REPO) must be the same repo; retrying cannot fix this, and pre-flighting one repo's issues against another repo's tree is #1901"
+             echo "[refresh]   fix: set REPO=<a checkout of $OR>, or clone it to ~/cell"
+             return 1 ;;
+           # A FILESYSTEM-PATH origin (a local bare repo — what this harness's own fixtures use, and
+           # how a local dev clone is made) cannot express a queue target at all, so there is nothing to
+           # compare it to. Tolerated ONLY while the queue target was not declared: the pairing then
+           # comes from the harness default plus a checkout, never from an operator's claim about a
+           # SPECIFIC repo (a DECLARED target still needs proof, below), and it is announced rather
+           # than silent. The residual is stated here, not hidden: such a checkout is trusted on its
+           # path alone, which is why it is the one shape that cannot certify a declared pair.
+           *)
+             if [ "$OR_DECLARED" -eq 1 ]; then
+               echo "[refresh] NOT PROVISIONABLE: \$REPO is $REPO, whose 'origin' is the local path $url — it cannot prove it is a checkout of \$OR ($OR), and \$OR was DECLARED"
+               echo "[refresh]   fix: give the checkout a real remote (git -C $REPO remote set-url origin https://github.com/$OR.git), or unset OR to use the harness default"
+               return 1
+             fi
+             echo "[refresh] NOTE: \$REPO is $REPO, whose 'origin' is a local path ($url) — the queue target $OR is the HARNESS DEFAULT, so the pairing is not cross-checked (a declared \$OR would have to be proven)" ;;
+         esac ;;
+    esac
+    SC="$REPO/.worktrees/dispatch-scout"; return 0
+  fi
+  # FIRST MATCH WINS, deliberately, and it cannot change what gets dispatched: every candidate that
+  # passes the origin check is a checkout of the SAME repo, so the choice decides only which working
+  # tree hosts the scout worktree. Refusing on two would add a false block (a symlinked duplicate of
+  # one checkout counts twice once it is respelled) — the supervisor DOES refuse there, because its
+  # answer (the queue target) would otherwise be a guess.
+  while IFS= read -r cand; do
+    [ -n "$cand" ] || continue
+    [ -d "$cand" ] || continue
+    git -C "$cand" rev-parse --git-dir >/dev/null 2>&1 || continue
+    url="$(git -C "$cand" config --get remote.origin.url 2>/dev/null || true)"
+    case "$url" in
+      "$OR"|"$OR.git"|*":$OR"|*":$OR.git"|*"/$OR"|*"/$OR.git") ;;
+      *) continue ;;
+    esac
+    REPO="$(cd "$cand" && pwd -P)" || continue
+    SC="$REPO/.worktrees/dispatch-scout"
+    echo "[refresh] REPO was not set — using $REPO (git origin is $OR, the queue target)"
+    return 0
+  done < <(repo_candidates)
+  return 1
+}
+
+# ONE actionable refusal, not a mystery. `--check` and the run path both call it, so the operator's
+# remedy is byte-identical wherever the verdict is reached — and the paths it names are the paths
+# repo_candidates() actually probed.
+repo_unresolved() {
+  local seen
+  seen="$(repo_candidates | sed '/^$/d' | sort -u | tr '\n' ' ')"; seen="${seen% }"
+  echo "[refresh] NOT PROVISIONABLE: \$REPO is not set and no git checkout of $OR was found where this harness puts one ($seen) — the checkout the pass would stand in is UNKNOWN"
+  echo "[refresh]   the queue target (\$OR) and the checkout (\$REPO) must be the same repo; a path is not proof of that and the old default was one developer's home directory"
+  echo "[refresh]   fix: set REPO=<a checkout of $OR> (e.g. in $HOME/keys.env), or clone it to ~/cell"
+}
 
 # ── the interpreter minimum, from the TOOL (agent-infra#1748 review) ──────────────────────────
 # The collision pre-flight is stdlib-only, which is why a repo with no `pyproject.toml` needs no venv
@@ -354,6 +462,10 @@ issue_claim_verdict() { # <issue> -> 0 CLEAN / 1 COLLISION / 2 INCOMPLETE / 3 NO
 # ── --check: the read-only provisioning verdict ───────────────────────────────────────────────
 cmd_check() {
   local scout tool_dir
+  # The checkout first: every verdict below is about THIS repo, so an unresolved $REPO is not a
+  # per-issue "repo not found" (transient, retried forever) — it is provisioning, and retrying
+  # cannot mend it.
+  if ! resolve_repo; then repo_unresolved; return "$EXIT_NOT_PROVISIONABLE"; fi
   # ⛔ The gh precondition is DELIBERATELY NOT judged here. `--check` is what
   # cloud-cell-supervisor.sh's cmd_check and cloud-cell-bringup.sh's check_dispatch run, and each of
   # those already performs ONE `gh auth status` itself — the supervisor's in cmd_check, the bringup's
@@ -437,6 +549,9 @@ cmd_check() {
 }
 
 if [ "$MODE" = check ]; then cmd_check; exit $?; fi
+# Same refusal on the run path, before any network work: a pass that cannot say which checkout it
+# stands in must not pre-flight anything (the scout worktree is created INSIDE $REPO below).
+if ! resolve_repo; then repo_unresolved; exit "$EXIT_NOT_PROVISIONABLE"; fi
 # ⛔ AN UNWRITABLE STATE DIR REFUSES — it does not get absorbed. Every write below was unchecked, so a
 # state dir that cannot be WRITTEN let the run finish with `checked 0; backlog now` at rc 0 having
 # persisted NOTHING: no marker for orch-loop, no candidates, and the cell sits RUNNING with `lanes: 0`
@@ -820,6 +935,81 @@ while read -r N; do
   # ⛔ ANCHORED, because the report echoes the candidate's own `title:` line: an unanchored search for
   # this phrase would let an ISSUE TITLE set the flag and silently drop a genuine CLEAN (#1853 review).
   grep -qE '^ *ALSO INCOMPLETE: ' <<<"$PRE" && degraded=1
+  # ── the HOLDER arm when this box has no cmux fleet board (agent-infra#1935) ──────────────
+  # The pre-flight asks the FLEET BOARD one question — "is a lane still working this issue?" — and
+  # that board is built from `~/.pi/agent/state/lane-registry.tsv` plus `cmux sessions list`. Both are
+  # macOS-cmux artifacts: a cloud cell has no lane registry (nothing on it ever ran the retired cmux
+  # dispatcher, which was the only writer) and its cmux answers neither `list-surfaces` nor
+  # `sessions list`. Measured 2026-10-17 on the live cell, tool and pyproject.toml both present:
+  #   `issue assignee/holder  INCOMPLETE  claim gate: the FLEET BOARD could not answer — the board's
+  #    live-session store could not be read …`  →  `VERDICT: INCOMPLETE (exit 2)`
+  # for every candidate, every pass, so all six were left unchecked, the backlog stayed 0 and the
+  # controller reported RUNNING with `lanes: 0` all evening (#1935).
+  #
+  # A box whose board CANNOT ANSWER is not a box whose candidates are unsafe: an INCOMPLETE verdict
+  # means the tool read no terminal signal and NO BLOCKING HIT (its verdict order is LANDED, then
+  # COLLISION, then INCOMPLETE), so every surface it could read came back clean. The single open
+  # question is the holder one, and the harness holds a BETTER answer than the board for exactly that
+  # question: `refs/claims/issue-<N>` (claims.sh), the CROSS-MACHINE registry every would-be
+  # dispatcher of the issue writes and reads (#1850). The board is a LOCAL view of ONE box's lanes.
+  #
+  # ⛔ NOT A LOOSENING, AND THE POLARITY IS UNCHANGED — this is a SUBSTITUTION, not a skip. The
+  # requirement moves from "a local board must be readable" to "the cross-box registry must answer",
+  # and the CLEAN arm below is what READS it: a live claim is a COLLISION, an unreadable registry is
+  # INCOMPLETE, and an ABSENT registry is INCOMPLETE when the holder answer depends on it (the
+  # HOLDER_BY_CLAIMS branch). "Cannot determine" is never CLEAN. Only the case where the holder
+  # surface is the SOLE unreadable one is re-routed: any other incomplete surface (gh down, open PRs
+  # unreadable) keeps the refusal, because there the tool could not judge the WORK itself.
+  HOLDER_BY_CLAIMS=0
+  if [ "$V" = INCOMPLETE ] && [ "$degraded" -eq 0 ] && [ "$PRE_RC" -eq 2 ]; then
+    # ⛔ THE SURFACE SET COMES FROM THE VERDICT LINE, NOT FROM THE REPORT BODY (cycle-2 review, F2).
+    # The previous read awk-parsed the `INCOMPLETE SURFACES` section, and counting what survived it
+    # made TWO producer-implementation facts load-bearing that are not a contract: the holder surface
+    # had to be LAST in the producer's surface list, and its note had to stay SINGLE-LINE. Neither is
+    # guaranteed — the holder note interpolates a RECORDED COMMAND ERROR from the board's JSON
+    # (`collision_preflight.py` scan_issue_surface), which can carry a newline — and the failure mode
+    # if either assumption slips is a fail-OPEN: the count reads 1, the note matches, and a candidate
+    # with a SECOND unreadable surface is queued as verified. The verdict line already states the
+    # complete answer the tool is giving, so read the answer instead of re-deriving it: everything
+    # after `could not be queried (` up to the closing paren, and require it to be EXACTLY the holder.
+    inc_verdict="$(printf '%s\n' "$PRE" | sed -nE 's/^VERDICT: INCOMPLETE \(exit 2\).*could not be queried \(([^)]*)\).*/\1/p' | head -1)"
+    case "$inc_verdict" in
+      "issue assignee/holder") HOLDER_ONLY=1 ;;
+      *) HOLDER_ONLY=0 ;;
+    esac
+    # ⛔ …AND THE REPORT MAY NOT ALSO CARRY A BLOCKING HIT (cycle-2 review, F1 — a measured fail-OPEN).
+    # The whole re-route rests on the producer's verdict ORDER (LANDED → COLLISION → INCOMPLETE), so an
+    # INCOMPLETE verdict means "nothing blocking was found". The producer is NOT vendored with this
+    # harness — `resolve_preflight` prefers the TARGET repo's copy of the tool — so it DRIFTS, and the
+    # DEGRADED read above exists precisely because a producer version once emitted a self-contradicting
+    # report (#1853). A report carrying a strong/landed hit AND an INCOMPLETE verdict was queued by
+    # this block (reproduced) although the same report is a COLLISION by the tool's own table. The tag
+    # grammar is the producer's: a blocking hit line ENDS with `(number)` or `(landed)`, and an ADVISORY
+    # hit appends ` (advisory — cannot block)` after the strength tag, so an advisory line does not end
+    # with either. Refuse on any line that does.
+    hits_blocking=0
+    printf '%s\n' "$PRE" | grep -qE '^  \[[^]]+\] .*\((number|landed)\)$' && hits_blocking=1
+    # ⛔ THE NOTE IS STILL PART OF THE CONDITION, NOT ONLY THE NAME (agent-infra#1935 review — a
+    # measured fail-OPEN). The producer marks this ONE surface INCOMPLETE for TWO different reasons
+    # (tortoise tools/collision_preflight.py, `scan_issue_surface`):
+    #   * the WHOLE BOARD could not answer  → "claim gate: the FLEET BOARD could not answer — …",
+    #     which is this box, and is the case whose holder answer the claim registry can supply; and
+    #   * the board DID answer but ATTRIBUTED a lane whose liveness is unmeasured/ambiguous →
+    #     "claim gate: holder read from the FLEET BOARD (source: …) — …", which is a PEER ON THE
+    #     ISSUE, seen imperfectly.
+    # Re-routing the second shape would ask `refs/claims/issue-<N>` instead of believing the board —
+    # and a lane that took no claim (started by hand) or whose lease EXPIRED (claims.sh returns CLEAN
+    # for an expired claim) has no live ref, so the candidate would be queued WHILE a lane is
+    # attributed to it: the duplicate-dispatch class this gate exists to prevent. The line is matched
+    # ANCHORED at the report's own two-space hit shape, so a surface name or heading quoted in an
+    # issue title (which the tool echoes) cannot forge it.
+    if [ "$HOLDER_ONLY" -eq 1 ] && [ "$hits_blocking" -eq 0 ] && \
+       printf '%s\n' "$PRE" | grep -qE '^  \[issue assignee/holder\] claim gate: the FLEET BOARD could not answer'; then
+      HOLDER_BY_CLAIMS=1
+      echo "[refresh] ?#$N the pre-flight's HOLDER surface could not answer (the fleet board has no cmux lane/session store on this box) — the cross-box claim registry decides the holder question instead of refusing the candidate (agent-infra#1935)"
+      V=CLEAN
+    fi
+  fi
   case "$V" in
     CLEAN)
       # ⛔ A CLEAN that ALSO says INCOMPLETE is the DEGRADED answer, not a verdict — the tool could
@@ -839,13 +1029,24 @@ while read -r N; do
         # push. The registry is resolved from `$O`, which the loop has already resolved: there is no
         # `CLAIMS_SH` seam (an ambient value could have half-disabled the gate).
         ICR=0
-        # ⛔ A MISSING REGISTRY IS `ICR=0` ON PURPOSE — the documented loud fallthrough (see
-        # issue_claim_verdict's STATED LIMIT), and the only case in which a box without the registry
-        # keeps dispatching. It is NOT a verdict: the branch below announces it every time.
-        if [ -f "$O/claims.sh" ]; then
+        # ⛔ THE HOLDER ANSWER CANNOT BE WAIVED WHEN IT IS THE ONLY ANSWER LEFT. This loop body is
+        # also driven STANDALONE by selftest.sh (extracted from `n=0` to `done <`), where this reader
+        # is not defined — and an undefined call returns 127, which the `case` below reads as neither
+        # 1 nor 2 and therefore QUEUES. A missing reader is an unknown holder, not a free issue. (In
+        # the shipped script the function always exists; this closes the extraction's fail-open.)
+        if [ "${HOLDER_BY_CLAIMS:-0}" = 1 ] && ! declare -f issue_claim_verdict >/dev/null 2>&1; then
+          ICR=2; CLAIM_RESULT="the pre-flight's holder surface could not answer and no claim reader is available in this context"
+        # ⛔ A MISSING REGISTRY IS `ICR=0` ON PURPOSE on the ordinary CLEAN path — the documented loud
+        # fallthrough (see issue_claim_verdict's STATED LIMIT), and the only case in which a box
+        # without the registry keeps dispatching. It is NOT a verdict: the branch below announces it
+        # every time. It is NOT tolerated when the registry is the ONLY authority left: if the board
+        # could not answer either, nothing has answered the holder question (HOLDER_BY_CLAIMS).
+        elif [ -f "$O/claims.sh" ]; then
           # `cmd; rc=$?` rather than `if cmd; then …; else rc=$?; fi` — one shape, no reliance on the
           # condition's status surviving into the else branch.
           issue_claim_verdict "$N"; ICR=$?
+        elif [ "${HOLDER_BY_CLAIMS:-0}" = 1 ]; then
+          ICR=2; CLAIM_RESULT="the pre-flight's holder surface could not answer and the cross-box claim registry ($O/claims.sh) is NOT INSTALLED"
         else
           echo "[refresh] ⚠️ #$N: no claim registry at $O/claims.sh — the cross-box issue-claim check is OFF on this box (seed it: cp scripts/orchestrator-harness/*.sh ~/orchestrator/)"
         fi
