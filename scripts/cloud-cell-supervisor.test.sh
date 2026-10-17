@@ -1777,9 +1777,10 @@ esac
 # reddens the slash and `..` arms while the bare spelling stays green.
 say_case "containment is not defeated by path SPELLING (trailing slash, '..', '//') (#1852)"
 NC="$T/pinspell"; mkdir -p "$NC/cell/keep" "$NC/pin/$(pinsha "$AI" 12)"
-spell() { # $1 = the HARNESS_PIN_DIR spelling to test
+spell() { # $1 = the HARNESS_PIN_DIR spelling to test, resolved from $NC (so relative spellings work)
   local sd="$1"                  # ⛔ capture BEFORE `set -- status`: sourcing resets $@
   (
+    cd "$NC" || exit 3            # relative spellings below are relative to the cell home's PARENT
     set -- status
     export PATH="$Q/bin:$PATH" CELL_HOME="$NC/cell" ENV_FILE="$NC/none.env" O="$NC/o" REPO="$NC/repo" \
            HARNESS_PIN_DIR="$sd" HARNESS_PIN_FILE="$NC/hp"
@@ -1787,7 +1788,17 @@ spell() { # $1 = the HARNESS_PIN_DIR spelling to test
     pin_root_conformance "$sd"; echo "rc=$?"; echo "bad=$PIN_ROOT_BAD"
   )
 }
-for sp in "$NC/cell" "$NC/cell/" "$NC/cell//" "$NC/cell/../cell" "$NC/cell/."; do
+# Every spelling of ONE directory must get the same answer. The last two are the cases a missing tail
+# makes reachable: `…/cell/nonexistent/..` names the cell home while `-e` on it is FALSE (the `..`
+# cannot be resolved through a missing component), so resolving only the EXISTING part let it conform.
+# ⛔ The RELATIVE arms are not decoration: a version of `pin_path_real` that REFUSED relative input
+# ("return 1 on a non-absolute path") made the deny-list fail OPEN — the predicate fell back to the
+# spelled `cell`, no absolute deny-list entry matched, and a relative root conformed while the same
+# directory absolute was refused (VGATE round 4, reproduced). `$NC` is the cell home's parent, so
+# `cell`, `./cell`, `cell/` and `../pinspell/cell` all name `$NC/cell`.
+for sp in "$NC/cell" "$NC/cell/" "$NC/cell//" "$NC/cell/../cell" "$NC/cell/." \
+          "$NC/cell/nonexist/.." "$NC/cell/nonexist/../cell/.." \
+          cell ./cell cell/ ../pinspell/cell; do
   SP_OUT="$(spell "$sp")"
   case "$SP_OUT" in
     *"rc=1"*CONTAINS*) ok "refused as CONTAINS the cell home: $sp" ;;

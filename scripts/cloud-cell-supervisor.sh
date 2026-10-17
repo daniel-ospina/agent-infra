@@ -213,16 +213,18 @@ publish_worker_env() {
   fi
   list="$(printf '%s' "$list" | tr '\n' ' ')"
   # ⛔ A listed name is STRIPPED from the new session when the creating client lacks it
-  # (`update-environment` is a "these come from the client" list, not an allow-list). Which source is
-  # authoritative is therefore PER NAME, and the exception is load-bearing: `$ENV_FILE` is
-  # authoritative for every name here, and THIS SHELL is authoritative only for the names
-  # `cmd_start` does not drop (`HOME`, `O`, `DEEPSEEK_API_KEY`). `AI_REVIEW_GATE_KEY` is the
-  # exception — `cmd_start`'s `unset` (which runs BEFORE this call) drops it from this shell unless
-  # `$ENV_FILE` carries it, deliberately, so an ambient export cannot shadow the key file and
-  # falsify `cmd_check`'s verdict. A value living ONLY in the tmux server is not a supported
-  # configuration: the issue's `tmux set-environment -g` workaround reads its value FROM `keys.env`,
-  # so the `start` shell (which sources it) holds it and no strip can fire. A name with no value
-  # anywhere is the dead state #1852's residual records; `check` does not yet refuse it.
+  # (`update-environment` is a "these come from the client" list, not an allow-list). Authority is
+  # therefore PER NAME, and both exceptions are load-bearing:
+  #   * `HOME` — this shell, never the file: `export HOME="$CELL_HOME"` runs AFTER the source, so a
+  #     `HOME=` line in keys.env is deliberately discarded (everything below runs under the cell home).
+  #   * `AI_REVIEW_GATE_KEY` — the FILE only: `cmd_start`'s `unset` (which runs BEFORE this call) drops
+  #     it from this shell unless `$ENV_FILE` carries it, so an ambient export cannot shadow the key
+  #     file and falsify `cmd_check`'s verdict.
+  # Every OTHER name (`O`, `DEEPSEEK_API_KEY`) is authoritative in `$ENV_FILE` or this shell. A value
+  # living ONLY in the tmux server is not a supported configuration: the issue's
+  # `tmux set-environment -g` workaround reads its value FROM `keys.env`, so the `start` shell (which
+  # sources it) holds it and no strip can fire. A name with no value anywhere is the dead state
+  # #1852's residual records; `check` does not yet refuse it.
   for n in $WORKER_ENV_NAMES; do
     case " $list " in *" $n "*) ;; *) list="$list $n" ;; esac
   done
@@ -542,31 +544,50 @@ pin_name_ok() {
   return 0
 }
 
-# The PHYSICAL form of a path, resolved even when the path does not exist YET (a missing tail is
-# appended lexically, so `$CELL_HOME/harness` answers before the first `apply` creates it).
-# ⛔ Why this exists: a raw string compare of paths is defeated by SPELLING. Measured in review round
-# 3 — `HARNESS_PIN_DIR=$CELL_HOME` was refused, the SAME directory written `$CELL_HOME/` (one trailing
+# The PHYSICAL form of a path, resolved even when the path does not exist YET: the deepest existing
+# ancestor is resolved with `pwd -P` (symlinks, `//` and trailing slashes collapsed) and the missing
+# tail is then appended and collapsed LEXICALLY — those components do not exist, so none of them can be
+# a symlink and lexical `..` is the only correct reading. Resolving only the existing part was not
+# enough: `$CELL_HOME/nonexistent/..` names the cell home, `-e` on it is false (the `..` cannot be
+# resolved through a missing component), and the root therefore CONFORMED (review round 3, measured).
+# ⛔ Why this exists: a raw string compare of paths is defeated by SPELLING. Measured —
+# `HARNESS_PIN_DIR=$CELL_HOME` was refused, the SAME directory written `$CELL_HOME/` (one trailing
 # slash) CONFORMED, and `$CELL_HOME/../cell` conformed too: the containment deny-list is the only
 # guard against `rm -rf` over the cell home, so one operator-typed slash disarmed it. On macOS the
-# mirror-image problem is a `$TMPDIR`-derived `//` making two spellings of one directory disagree —
-# `pwd -P` collapses both, and `..`/symlinks with them.
+# mirror-image problem is a `$TMPDIR`-derived `//` making two spellings of one directory disagree.
+pin_norm_lex() { # collapse `.`/`..`/empty segments in an ABSOLUTE path; no filesystem access
+  local out="" seg
+  local IFS=/
+  for seg in $1; do
+    case "$seg" in
+      ''|.) continue ;;
+      ..) out="${out%/*}"; continue ;;
+    esac
+    out="$out/$seg"
+  done
+  printf '%s\n' "${out:-/}"
+}
 pin_path_real() {
-  local d="${1:-}" tail=""
+  local d="${1:-}" tail="" phys
   [ -n "$d" ] || return 1
+  # ⛔ RELATIVE spellings are resolved too, never rejected: rejecting them made the deny-list FAIL
+  # OPEN — `pin_root_conformance` would fall back to the spelled `cell`, no absolute deny-list entry
+  # could match it, and a relative root reached the sweep's `rm -rf` (VGATE round 4, reproduced:
+  # `HARNESS_PIN_DIR=cell` conformed while the same directory absolute was refused). `cd` resolves a
+  # relative path as well as an absolute one; only `pwd -P`'s absolute output is trusted.
   while [ ! -d "$d" ]; do
     if [ "$d" = "/" ] || [ "$d" = "." ] || [ -z "$d" ]; then return 1; fi
     tail="/$(basename "$d")$tail"
     d="$(dirname "$d")"
   done
-  # ⛔ A FAILED `cd` must not yield an EMPTY answer: an empty `$dir_real` turns the deny-list pattern
-  # `"$dir_real"/*` into `/*`, which matches EVERY absolute path — so an unreadable root refused for
-  # the wrong reason ("CONTAINS …") instead of naming the read failure. `$d` must be a directory AND
-  # `pwd -P` must return an absolute path, or this returns 1 and the caller falls back to the spelled
-  # path (which is already refused at the `ls` step).
-  local phys
+  # ⛔ A FAILED `cd` must not yield an EMPTY answer: an empty result turns the deny-list pattern
+  # `"$dir_real"/*` into `/*`, which matches EVERY absolute path — so an unreadable root was refused
+  # for the wrong reason ("CONTAINS …") instead of naming the read failure. `$d` must be a directory
+  # AND `pwd -P` must return an absolute path, or this returns 1 and the caller falls back to the
+  # spelled path (which the `ls` step refuses when the root is unreadable).
   phys="$(cd "$d" 2>/dev/null && pwd -P)" || return 1
   case "$phys" in /?*) ;; *) return 1 ;; esac
-  printf '%s%s\n' "$phys" "$tail"
+  pin_norm_lex "$phys$tail"
 }
 
 # The pin-root CONFORMANCE question, asked ONCE — the answer `check`, `apply`, `start` and `prune`
