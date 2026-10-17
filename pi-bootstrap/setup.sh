@@ -398,7 +398,16 @@ echo "    scripts fleet farm: $fleet_copied copied (fleet cadence, #373 + runner
 # scripts resolve it as `$(dirname "${BASH_SOURCE[0]}")/lib/beat-pair.sh`). A
 # missing lib makes the guard FAIL CLOSED: the pair is treated as unverifiable
 # and the act clause is withheld, with a logged reason — never a silent pass.
-lib_srcs=(pid-identity.sh diff-normalize.py beat-pair.sh)
+# #1921 adds a FOURTH sibling: the VENDORED transcript-pattern producer
+# (`scripts/lib/transcript-patterns.sh`) that the farmed `session-postmortem.sh`
+# execs for the Transcript Patterns section of every retrospective. Before this,
+# that producer was resolved from an absolute `/Users/<owner>/…/eldato/scripts/`
+# path in ANOTHER checkout — so on every box but the owner's (and on every Linux
+# cell) the section degraded to a placeholder inside a generated report. Farming
+# it beside the consumer is what makes the section exist everywhere the consumer
+# does (same `lib/` → `$DEST/scripts/lib/` layout as the three above; the
+# consumer resolves `$(dirname "${BASH_SOURCE[0]}")/lib/transcript-patterns.sh`).
+lib_srcs=(pid-identity.sh diff-normalize.py beat-pair.sh transcript-patterns.sh)
 mkdir -p "$DEST/scripts/lib"
 lib_copied=0
 lib_failed=0
@@ -429,10 +438,14 @@ for base in "${lib_srcs[@]}"; do
     lib_failed=$((lib_failed+1))
   fi
 done
+# The summary NAMES what it farmed, DERIVED from the array (#1921): a hand-kept list here drifts
+# the moment a lib is added, and test-setup-no-nesting.sh asserts every declared lib is named —
+# so a stale list turns a correct farm into a red, or worse, names a lib it did not copy.
+lib_names="$(printf '%s + ' "${lib_srcs[@]}")"; lib_names="${lib_names% + }"
 if [ "$lib_failed" -gt 0 ]; then
-  echo "    scripts lib farm: $lib_copied copied, $lib_failed FAILED/MISSING (pid-identity.sh + diff-normalize.py + beat-pair.sh, #1178/#1362)" >&2
+  echo "    scripts lib farm: $lib_copied copied, $lib_failed FAILED/MISSING ($lib_names, #1178/#1362/#1897/#1921)" >&2
 else
-  echo "    scripts lib farm: $lib_copied copied (pid-identity.sh + diff-normalize.py + beat-pair.sh, #1178/#1362)"
+  echo "    scripts lib farm: $lib_copied copied ($lib_names, #1178/#1362/#1897/#1921)"
 fi
 
 # Fleet-tools farm (#1178 unit 3): the scheduled lane-liveness report
