@@ -117,7 +117,7 @@ adds the **reads**, the **writes / emits** and the failure surface.
 | `install.sh` | a human | env, `launchd.plist.template` | the plist | prints the load command; does **not** start the loop. Warns on drift between the repo copy and `$O` for the scripts the daemon runs |
 | `selftest.sh` | a human / CI | the shipped scripts | pass/fail | offline; drives the shipped code rather than grepping it |
 | `check-port-drift.sh` | a human | `port-provenance.txt`, tortoise ref | pass/fail | gates the tortoise-side removal. **Compares against a PIN, so a stale pin reports work that has moved (see §6.4)** |
-| `test-claims.sh` / `test-crossbox.sh` / `test-gates.sh` / `spawn-gate.test.sh` / `refresh-scout.test.sh` / `sweep-quota.test.sh` | a human / CI | — | pass/fail | each pins one regression contract. `test-claims.sh` cannot prove cross-box atomicity on one machine |
+| `test-claims.sh` / `test-crossbox.sh` / `test-gates.sh` / `spawn-gate.test.sh` / `refresh-scout.test.sh` / `sweep-quota.test.sh` / `claim-exclusion.test.sh` | a human / CI | — | pass/fail | each pins one regression contract. `test-claims.sh` cannot prove cross-box atomicity on one machine; `claim-exclusion.test.sh` is the closest available — N processes raced at a barrier against a real `receive-pack` — and prints the per-operation exclusion table README §7.2d records |
 
 **Manual utility:** `adopt-fix.sh` — materialises a worktree for a foreign branch and runs
 `fix-one.sh` against a specific PR by hand; exits with the fixer's status.
