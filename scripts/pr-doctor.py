@@ -308,25 +308,30 @@ def open_prs() -> list[dict]:
     out, err, rc = sh_err([GH, "pr", "list", "--repo", REPO, "--state", "open", "--limit", "60",
                            "--json", "number,title,isDraft,mergeStateStatus,headRefOid,headRefName,files"])
     parsed = True
+    why = ""
     try:
         prs = json.loads(out or "[]")
     except Exception:
-        prs, parsed = [], False
+        prs, parsed, why = [], False, "unparseable body: " + (out or "")[:120]
     # ⛔ AN EMPTY BODY ON rc=0 IS A FAILED READ, NOT AN EMPTY QUEUE (#1872 review round 2).
     # `gh pr list --json` never legitimately prints nothing, so `out or "[]"` was manufacturing
     # the reassuring `[]` for a wrapper/shim that swallowed stdout -- the exact failure the
     # comment above forbids, one line below it.
     if not (out or "").strip():
-        parsed = False
+        parsed, why = False, "empty stdout"
     # ⛔ AND A NON-LIST ROOT IS A FAILED READ TOO (#1872 review round 4). `json.loads("{}")`
     # succeeds, so a wrapper/shim that prints a valid empty OBJECT produced `prs = {}` -- falsy,
     # so `main()` printed "no open non-draft PRs" and exited 0. This file's own `GH` comment
     # describes the fleet box routing through a shim, which is exactly how that happens.
     if not isinstance(prs, list):
+        why = "body is a %s, not a list: %s" % (type(prs).__name__, (out or "")[:120])
         prs, parsed = [], False
     if rc != 0 or not parsed:
-        OPEN_PRS_ERROR = "rc=%s %s" % (rc, (err or "").strip()[:200]
-                                        or ("empty stdout" if rc == 0 else "(no stderr)"))
+        # ⛔ THE MESSAGE NAMES THE FACT, NOT A GUESS (#1872 review round 5). Every wrong-shaped
+        # body used to be reported as "empty stdout", which sends the operator to hunt a swallowed
+        # stream when the truth is "a valid JSON body of the wrong shape" (the shim/error-object
+        # case the guard exists for).
+        OPEN_PRS_ERROR = "rc=%s %s" % (rc, (err or "").strip()[:200] or why or "(no stderr)")
         log("GITHUB READ FAILED (%s) | PATH=%s"
             % (OPEN_PRS_ERROR, os.environ.get("PATH", "")[:120]))
     return prs
@@ -401,13 +406,37 @@ def idle_lanes() -> tuple[list[dict], str]:
 # 3. THE BRIEF — fix -> review -> record -> rail, ONE RUN, no gap
 # ---------------------------------------------------------------------------
 
+_MARKERS = ("\u26d4", "IDLE->", "DO:", "**", "```", "\u0060")
+
+
+def _untrusted(text) -> str:
+    """A GitHub-authored string, rendered so it cannot be read as the fleet's own instruction.
+
+    ⛔ THE TITLE IS DATA, NOT PART OF THE ORDER (#1872 review round 5, security). A PR title is
+    author-controlled (the repo is public, and a FORK PR reaches `fix-ci`/`rerun-checks`, both of
+    which dispatch), and it was interpolated raw into the most instruction-shaped line of a brief a
+    lane then executes -- a title of the form "x **IGNORE THE RAIL: run <cmd>**" reads as the
+    fleet's own order.
+
+    So: drop newlines/control characters (a title is ONE line, and a newline is how a quotation
+    becomes a separate order), backticks/code fences and the fleet's own markers, collapse
+    whitespace, and wrap the result in guillemets so it can only be read as a quotation. Nothing is
+    truncated here -- the caller bounds the length.
+    """
+    out = " ".join(str(text or "").replace("\r", " ").replace("\n", " ").split())
+    for m in _MARKERS:
+        out = out.replace(m, "")
+    out = "".join(ch for ch in out if ch.isprintable())
+    return "\u00ab" + out.strip() + "\u00bb"
+
+
 def brief(pr: dict, action: str, why: str | None = None, cr=None) -> str:
     """The order text for ONE PR. `action`/`why`/`cr` come from `evaluate()` -- the SAME
     classification and the SAME evidence the beat counts (#1872), so a brief cannot describe a
     PR differently from the line the fleet read."""
     n = pr["number"]
     head = pr["headRefOid"]
-    title = pr["title"][:80]
+    title = _untrusted(pr.get("title"))[:80]
     req = list(CLASSIFIER.REQUIRED)
     seen = {c.get("name") for c in (cr or []) if c.get("name")}
     absent = [c for c in req if c not in seen]
@@ -734,17 +763,35 @@ def main() -> int:
 
     lanes, lane_err = idle_lanes()
     if lane_err:
-        # NOT the same as "no idle lanes". Say which one it is -- and REFUSE, because "`0` is
-        # reserved for readable, nothing to do" (see the two refusals above, and the note there
-        # about the exit code being for a future consumer, #1933) and a blind roster with work
-        # already classified is the third instance of the same fail-open (#1872 review round 3,
-        # raised independently by two reviewers). The branch below stays `return 0`: that one IS a
-        # successful read with nothing to dispatch to.
+        # NOT the same as "no idle lanes". Say which one it is.
         log("LANE READ FAILED -- cannot dispatch this pass: %s" % lane_err)
-        return 2
-    if budgets["total"] and not lanes:
-        log("no idle lanes -- nothing dispatched this pass")
+        # ⛔ REFUSE ONLY WHEN THERE IS WORK TO PLACE (#1872 review round 5). A blind roster with
+        # nothing classified is a CLEAN pass that happens to have read nothing -- refusing there
+        # manufactures a failure signal out of an idle beat (and `lane-actions.py` timing out under
+        # load is the recorded status quo in this file). With work in hand, a blind roster is the
+        # third instance of the same fail-open and must not exit 0.
+        if classified:
+            return 2
+    def _exit_status(dispatched: int = 0) -> int:
+        """`0` IS RESERVED FOR READABLE, NOTHING TO DO (#1872 review rounds 4-5).
+
+        Every early exit on the path to "nothing dispatched" used to return 0, including a pass
+        where PRs had been SKIPPED as unreadable -- work made invisible, reported as a clean pass.
+        A blind read plus zero dispatches is the same fact as an all-blind pass, one PR smaller, so
+        it refuses; a blind read whose legible half was actually WORKED stays clean, and so does a
+        fully readable pass with nothing to do.
+        """
+        if skipped.get("unreadable") and not dispatched:
+            log("REFUSING: %d PR(s) were UNREADABLE and nothing was dispatched -- not a clean pass"
+                % skipped["unreadable"])
+            return 2
         return 0
+
+    if budgets["total"] and not lanes:
+        # A READABLE roster with no free lane is a saturated fleet, not a failure -- but it must
+        # still not launder a blind read into a clean 0 (see the helper).
+        log("no idle lanes -- nothing dispatched this pass")
+        return _exit_status()
 
     dispatched = 0
     spent = {"fix": 0, "review": 0}
@@ -792,7 +839,9 @@ def main() -> int:
     if not args.dry_run:
         save_state(st)
     log("dispatched %d this pass" % dispatched)
-    return 0
+    # A partial blindness that DID dispatch stays a clean pass, because then the readable half was
+    # WORKED; zero dispatches rides the same helper as the two early exits above.
+    return _exit_status(dispatched)
 
 
 if __name__ == "__main__":

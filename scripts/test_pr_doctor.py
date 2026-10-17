@@ -30,6 +30,26 @@ pr = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(pr)
 
 
+@pytest.fixture(autouse=True)
+def _clean_module_state(monkeypatch):
+    """⛔ MODULE STATE LEAKS BETWEEN TESTS AND SILENTLY CHANGES THE EXIT CODE (#1872 round 5).
+
+    `open_prs()` WRITES the module global `OPEN_PRS_ERROR`, and `main()` reads it before anything
+    else (`if OPEN_PRS_ERROR: ... return 2`). A test that drives `open_prs()` into a failure leaves
+    that global truthy -- `monkeypatch` cannot undo a plain module assignment -- so every LATER test
+    in the same process that calls `main()` takes the queue-refusal branch instead of the branch it
+    was written for. MEASURED: running the open-PR-failure test before the partly-blind tests makes
+    them fail with `assert 2 == 0`; the file green in its own order only because that test happens to
+    sit 140 lines below them. Worse, it makes the round-5 saturation test pass for the WRONG REASON
+    (the queue refusal, not the unreadable refusal it exists to pin).
+
+    Same class of leak as `objective.GH_BLOCKED`: reset the state each test depends on, in one place.
+    """
+    monkeypatch.setattr(pr, "OPEN_PRS_ERROR", None, raising=False)
+    yield
+    monkeypatch.setattr(pr, "OPEN_PRS_ERROR", None, raising=False)
+
+
 def _pr(number: int, head: str = "a" * 40) -> dict:
     return {"number": number, "title": "t%d" % number, "isDraft": False, "headRefOid": head,
             "headRefName": "b", "mergeStateStatus": "CLEAN", "files": []}
@@ -261,7 +281,8 @@ def test_a_blind_read_cause_is_captured_per_pr_not_read_after_the_loop(monkeypat
         return ("running", None, [])
 
     monkeypatch.setattr(pr, "classify", classify)
-    assert pr.main() == 0
+    # 2 = the round-5 refusal (a blind read and nothing dispatched); this test is about the LOG.
+    assert pr.main() == 2
     joined = "\n".join(logs)
     assert "rate limit" in joined, joined
     assert "no gh error recorded" not in joined, joined
@@ -270,12 +291,14 @@ def test_a_blind_read_cause_is_captured_per_pr_not_read_after_the_loop(monkeypat
 # ── 5. ONE classifier: the beat and the dispatcher cannot disagree (#1872) ────────────────
 # The defect this section pins, measured on the live fleet 2026-10-16: `objective.py` (the beat's
 # per-class counts) and `pr-doctor.py` (the dispatcher's plan) each carried their OWN predicate
-# over the SAME PR set, sharing no code. They DISAGREED on 4 of 11 open non-draft PRs (36%), and
-# on 5 of 12 (41%) in a later pass -- one reader saying `fix-ci` (go repair the code) while the
-# other said `running` (wait) or `unreviewed` (review it) about the SAME PR. Same queue, same
-# question, two answers -- so the classifier lives in objective.py and the dispatcher calls it.
-# The rows marked `#NNNN` below reproduce the check-run SHAPES recorded for those PRs; what is
-# asserted is the CLASS, not which rollup a PR happened to hold at any one minute.
+# over the SAME PR set, sharing no code. They DISAGREED on 4 of 11 open non-draft PRs (36%) --
+# every one of them saying `fix-ci` (go repair the code) on this side while the other said
+# `running` (wait) or `unreviewed` (review it) about the SAME PR. Same queue, same question, two
+# answers -- so the classifier lives in objective.py and the dispatcher calls it.
+# The FOUR rows marked `#NNNN` below are exactly those four PRs, reproducing the check-run SHAPES
+# recorded for them; what is asserted is the CLASS, not which rollup a PR happened to hold at any
+# one minute. (Later re-reads of the queue found more disagreements as it moved; they had the same
+# shape, and none of them is claimed here -- a coverage claim must not outrun its rows.)
 
 def _cr(*, red=(), absent=(), flight=(), extra_red=()):
     """A check-run list in the REST shape `objective.per_pr_checks()` returns.
@@ -308,7 +331,7 @@ def _cr(*, red=(), absent=(), flight=(), extra_red=()):
 
 
 # name -> (check-runs, attestation_clean, mergeStateStatus, the ONE expected class)
-# The five `#NNNN` rows are the live disagreements, in the shape each PR actually carried.
+# The FOUR `#NNNN` rows are the live disagreements, in the shape each PR actually carried.
 _SHAPES = {
     "#8806": (_cr(red=["ai-review-gate"], absent=["python-ci-gate"],
                   flight=["test (a)", "test-slow (a)"]), False, "BLOCKED", "running"),
@@ -467,8 +490,31 @@ def test_an_unreadable_pr_is_never_dispatched(monkeypatch):
     assert any("REFUSING" in m for m in logs), logs
 
 
-def test_a_partly_blind_pass_is_reported_but_not_refused(monkeypatch):
-    """One blind PR out of two is a SKIP, not a refusal: the legible half must still be worked."""
+def test_a_partly_blind_pass_that_DID_work_is_a_clean_pass(monkeypatch):
+    """One blind PR out of two is a SKIP, not a refusal -- as long as the legible half is WORKED.
+
+    ⛔ THE "WORKED" HALF IS THE CONTRACT (#1872 review round 5). The previous fixture classified the
+    legible PR `running` (nothing to do) and still asserted rc 0: a pass where work was invisible
+    AND nothing was dispatched read as clean, which contradicts the invariant every other refusal in
+    this file serves. The invariant is now "readable, nothing to do", so a blind read plus zero
+    dispatches refuses -- and a blind read plus real work stays clean.
+    """
+    logs = []
+    monkeypatch.setattr(pr, "load_state", lambda: {})
+    monkeypatch.setattr(pr, "open_prs", lambda: [_pr(1), _pr(2)])
+    monkeypatch.setattr(pr, "classify",
+                        lambda p: (None, None, None) if p["number"] == 1 else ("record-review", "why", []))
+    monkeypatch.setattr(pr, "idle_lanes", lambda: ([_lane(1)], ""))
+    monkeypatch.setattr(pr, "brief", lambda p, a, w=None, cr=None: "brief")
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(pr, "dispatch", lambda ws, label, text, dry: True)
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--dry-run"])
+    assert pr.main() == 0
+    assert any("UNREADABLE" in m for m in logs), logs
+
+
+def test_a_partly_blind_pass_that_did_NOTHING_refuses(monkeypatch):
+    """…and with nothing dispatched, the same blindness is NOT a clean pass (round 5)."""
     logs = []
     monkeypatch.setattr(pr, "load_state", lambda: {})
     monkeypatch.setattr(pr, "open_prs", lambda: [_pr(1), _pr(2)])
@@ -477,8 +523,50 @@ def test_a_partly_blind_pass_is_reported_but_not_refused(monkeypatch):
     monkeypatch.setattr(pr, "idle_lanes", lambda: ([_lane(1)], ""))
     monkeypatch.setattr(pr, "log", logs.append)
     monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--dry-run"])
+    assert pr.main() == 2
+    assert any("REFUSING" in m for m in logs), logs
+
+
+def test_a_saturated_fleet_does_not_launder_a_blind_read_into_a_clean_pass(monkeypatch):
+    """⛔ FOUND BY THE VGATE, NOT BY A REVIEWER (#1872 review round 5).
+
+    The refusal was shadowed by the earlier `if budgets["total"] and not lanes: return 0` branch: a
+    pass with one UNREADABLE PR, one `record-review` PR, and a READABLE-but-empty roster exited 0
+    while printing the reassuring "no idle lanes -- nothing dispatched this pass". The invariant
+    ("`0` is reserved for readable, nothing to do") was still open on that path.
+    """
+    logs = []
+    monkeypatch.setattr(pr, "load_state", lambda: {})
+    monkeypatch.setattr(pr, "open_prs", lambda: [_pr(1), _pr(2)])
+    monkeypatch.setattr(pr, "classify",
+                        lambda p: (None, None, None) if p["number"] == 1 else ("record-review", "w", []))
+    monkeypatch.setattr(pr, "idle_lanes", lambda: ([], ""))      # a READABLE roster, no free lane
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--dry-run"])
+    assert pr.main() == 2
+    joined = "\n".join(logs)
+    # the UNREADABLE refusal specifically -- a bare "REFUSING" also matches the earlier queue/roster
+    # refusals, which would let this test pass with the shadowing bug back in place.
+    assert "UNREADABLE and nothing was dispatched" in joined, joined
+    assert "no idle lanes" in joined, joined
+
+
+def test_a_blind_lane_roster_with_nothing_to_dispatch_is_not_a_refusal(monkeypatch):
+    """⛔ A CLEAN BEAT IS NOT A FAILURE (#1872 review round 5).
+
+    `lane-actions.py` timing out under load is the recorded status quo in this file, so refusing
+    whenever the roster is blind manufactured a failure signal out of idle beats. The refusal is
+    scoped to a roster read that actually strands work.
+    """
+    logs = []
+    monkeypatch.setattr(pr, "load_state", lambda: {})
+    monkeypatch.setattr(pr, "open_prs", lambda: [_pr(1)])
+    monkeypatch.setattr(pr, "classify", lambda p: ("running", None, []))
+    monkeypatch.setattr(pr, "idle_lanes", lambda: ([], "lane-actions read failed rc=-1: timed out"))
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--dry-run"])
     assert pr.main() == 0
-    assert any("UNREADABLE" in m for m in logs), logs
+    assert any("LANE READ FAILED" in m for m in logs), logs
 
 
 
@@ -550,6 +638,15 @@ def test_open_prs_separates_an_empty_queue_from_a_failed_read(monkeypatch):
     assert pr.open_prs() == [] and pr.OPEN_PRS_ERROR is None
     monkeypatch.setattr(pr, "sh_err", lambda cmd: ("", "gh: not found", 127))
     assert pr.open_prs() == [] and "rc=127" in (pr.OPEN_PRS_ERROR or "")
+    # ⛔ AND THE MESSAGE MUST NAME THE FACT (#1872 review round 5, verified by the gate): every
+    # wrong shape used to be reported as "empty stdout", sending the operator to hunt a swallowed
+    # stream. Each of the three shapes now says what actually happened.
+    monkeypatch.setattr(pr, "sh_err", lambda cmd: ("", "", 0))
+    assert pr.open_prs() == [] and "empty stdout" in (pr.OPEN_PRS_ERROR or "")
+    monkeypatch.setattr(pr, "sh_err", lambda cmd: ("not json at all", "", 0))
+    assert pr.open_prs() == [] and "unparseable body" in (pr.OPEN_PRS_ERROR or "")
+    monkeypatch.setattr(pr, "sh_err", lambda cmd: ("{}", "", 0))
+    assert pr.open_prs() == [] and "not a list" in (pr.OPEN_PRS_ERROR or "")
 
 
 def test_a_nonlist_body_is_a_failed_read_not_an_empty_queue(monkeypatch):

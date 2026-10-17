@@ -290,16 +290,17 @@ PYAGE
 #     `test_the_FAIL_CLOSED_caveat_precedes_the_counts_it_qualifies`): `queue_read=BLIND(...)` --
 #     the token that says the counts are NOT a clearance -- and `ASK-USER: surface=N: #...`, the
 #     owner's actionable list. Both precede the queue segment; neither may move back to the tail.
-# 900 is simply "long enough for the shapes measured so far". Re-measure before lowering it, and
-# never treat it as a guarantee about any shape.
+# 900 is a CUT, not a guarantee, and this comment will not name the depth at which it starts to
+# bite -- the paragraph above says exactly why any such figure goes stale. What is true: the tail of
+# the queue segment (its last class's named PRs) and then the CI indicators ARE lost once the line
+# outgrows the cut, which is a known residual, not a promise.
 obj=$(sed -n '2p' "$STATE/objective.last" 2>/dev/null | cut -c1-900)
 
 # ── RES: the system-resource segment, on its OWN line (objective.last line 3) ──────────
 # Its own line because the objective line is ALREADY past the length it is read with (the
-# `cut -c1-900` above), so appending this would cut it off mid-token. Reading the objective line
-# is what used to truncate the per-class tokens; `fix-ci` does not even appear in that segment
-# any more (it is rendered as `IN-PROGRESS: fixing <check>=<n>`), so this paragraph and the one
-# above it describe the same fact from two directions and must be kept in step.
+# `cut -c1-900` above), so appending this would cut it off mid-token -- the same truncation the
+# paragraph above describes, from the other side. (`fix-ci` is not rendered in that segment at
+# all -- it appears as `IN-PROGRESS: fixing <check>=<n>` -- so nothing here depends on it.)
 # It is NOT truncated: the line is short and every field is load-bearing.
 # ⛔ FRESH EVERY BEAT, NEVER FROM THE CACHE. Reading line 3 of `objective.last` inherited that
 # file's 900 s TTL: two beats 7m33s apart printed BYTE-IDENTICAL values, including `runq=79`

@@ -83,6 +83,24 @@ def _clean_flag():
     objective.GH_BLOCKED_BY.clear()
 
 
+@pytest.fixture(autouse=True)
+def _isolate_stuck_ledger(tmp_path, monkeypatch):
+    """⛔ `build()` WRITES the STUCK ledger, so a test run must not touch the fleet's own.
+
+    `build()` -> `_stuck_bump()` opens `STUCK_FILE` (under `~/.pi/agent/state/`) and rewrites it
+    with whatever `call-rail` PRs the FIXTURE happens to contain -- normally `{}`. MEASURED 2026-10-17
+    (reviewer, #1872 review round 5): a suite run took the real file from
+    `{"1234": 3, "5678": 5}` to `{}` and bumped its mtime. The consequence is not cosmetic: that
+    ledger is what turns `call-rail` into "STUCK N beats -- pr-doctor has not landed it", so any
+    lane running this suite silently suppressed the fleet's one escalation for the next two beats.
+
+    Every test in this file that calls `build()` gets a private state dir; a test that wants to
+    inspect the ledger can still point `STUCK_FILE` at its own `tmp_path` explicitly.
+    """
+    monkeypatch.setattr(objective, "STATE", str(tmp_path))
+    monkeypatch.setattr(objective, "STUCK_FILE", str(tmp_path / "call-rail-stuck.json"))
+
+
 # --- DIRECTION 2: a healthy read must NOT flag -----------------------------------------
 
 def test_healthy_read_does_not_flag(monkeypatch):
