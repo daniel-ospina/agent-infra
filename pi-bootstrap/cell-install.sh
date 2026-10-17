@@ -827,11 +827,17 @@ verify_layer() {
       if [ ! -f "$snap" ]; then
         fail "the UNFARM leg never recorded a farm declaration snapshot ($snap_rel) — this cell's layer predates #1924 or the unfarm leg did not run; re-run --install"
       else
-        # The snapshot can differ in TWO directions, and they need different advice. Telling an
-        # operator "declare it retired" when the CELL's layer is merely older is not just wrong:
-        # following it puts a name in the retirement list that the farm still declares, and every
-        # later --install then refuses. `--install` is the remedy in both directions — it re-farms
-        # what this checkout declares and applies whatever retirement the list holds.
+        # The snapshot can differ in TWO directions, and they need DIFFERENT advice — the
+        # remedies are not interchangeable:
+        #   * declared here but not installed: this cell's layer is older than its checkout, so
+        #     `--install` is exactly the remedy (it re-farms what the checkout declares).
+        #   * recorded by the last install but no longer farmed: if that was a retirement it
+        #     must be declared, because `--install` does not delete what it no longer farms
+        #     (that is the gap this leg closes) — and if it was NOT a retirement, this checkout
+        #     is older than the installed layer and `--install` from it will REFUSE (the
+        #     orphan/shrink check), so the answer is to install from the newer checkout.
+        # Saying "declare it retired" in the second case, or "just re-run --install", is how an
+        # operator deletes an artifact the repo still ships or walks into a refusal loop.
         local uninstalled='' gone='' p snap_sorted msg
         snap_sorted="$(LC_ALL=C sort -u "$snap" | grep -v '^$' || true)"
         want_out="$(printf '%s' "$FARM_DECLARED_REL")"     # already newline-terminated
@@ -851,7 +857,7 @@ verify_layer() {
             msg="$msg Declared by this checkout but NOT installed here:$uninstalled."
           fi
           if [ -n "$gone" ]; then
-            msg="$msg Recorded by the last install but no longer farmed:$gone — if that was a retirement it must ALSO be declared in pi-bootstrap/farm-retired.txt (otherwise --install refuses to orphan it); if it was not, --install re-records the set."
+            msg="$msg Recorded by the last install but no longer farmed by this checkout:$gone — if that was a retirement it must ALSO be declared in pi-bootstrap/farm-retired.txt (otherwise --install refuses to orphan it, and the artifacts stay installed); if it was NOT a retirement, this checkout is OLDER than the layer installed here: install from the newer checkout, do not declare it (declaring would delete what the repo still ships)."
           fi
           fail "$msg"
         fi

@@ -285,6 +285,14 @@ fi
 # this leg used `farm_declared_rel=()` and `test-cell-install.sh` failed on it.
 farm_declared_rel=""
 
+# A farm array is a DECLARATION of what this checkout ships. A name it lists but the
+# checkout does not contain is an INCOMPLETE checkout, and skipping it in silence is how a
+# farm quietly delivers less than the repo says (#1931) — and, since #1924, how a
+# deployment reads as a retirement: the name would be recorded as declared, then look
+# orphaned (or worse, get "declared retired" by a reader following the orphan advice).
+# So missing names are collected here and the run FAILS before the UNFARM leg.
+farm_missing=""
+
 scripts_dir="$INFRA_ROOT/scripts/checkout-hygiene"
 if [ -d "$scripts_dir" ]; then
   mkdir -p "$DEST/scripts/checkout-hygiene"
@@ -305,7 +313,12 @@ if [ -d "$scripts_dir" ]; then
     chmod +x "$dest" 2>/dev/null || true
     copied=$((copied+1))
   done
+  if [ "$copied" -eq 0 ]; then
+    farm_missing+="scripts/checkout-hygiene/* (the directory exists but holds no farmable file)"$'\n'
+  fi
   echo "    scripts/checkout-hygiene farm: $copied copied (real files, #427)"
+else
+  farm_missing+="scripts/checkout-hygiene/ (the whole directory is absent — $INFRA_ROOT)"$'\n'
 fi
 
 # Fleet-scripts farm (#373 + #469 + #783 + #1311): the weekly fleet-cost cadence
@@ -395,7 +408,10 @@ fleet_copied=0
 for base in "${fleet_srcs[@]}"; do
   farm_declared_rel+="scripts/$base"$'\n'
   f="$INFRA_ROOT/scripts/$base"
-  [ -f "$f" ] || continue
+  if [ ! -f "$f" ]; then
+    farm_missing+="scripts/$base"$'\n'
+    continue
+  fi
   dest="$DEST/scripts/$base"
   if [ -L "$dest" ]; then
     echo "    replacing farm symlink with real copy: $base"
@@ -467,6 +483,7 @@ for base in "${lib_srcs[@]}"; do
 done
 if [ "$lib_failed" -gt 0 ]; then
   echo "    scripts lib farm: $lib_copied copied, $lib_failed FAILED/MISSING (pid-identity.sh + diff-normalize.py + beat-pair.sh, #1178/#1362)" >&2
+  farm_missing+="scripts/lib/ ($lib_failed declared sibling(s) FAILED or MISSING)"$'\n'
 else
   echo "    scripts lib farm: $lib_copied copied (pid-identity.sh + diff-normalize.py + beat-pair.sh, #1178/#1362)"
 fi
@@ -512,7 +529,10 @@ tools_copied=0
 for base in "${fleet_tools[@]}"; do
   farm_declared_rel+="scripts/fleet/$base"$'\n'
   f="$INFRA_ROOT/tools/fleet/$base"
-  [ -f "$f" ] || continue
+  if [ ! -f "$f" ]; then
+    farm_missing+="scripts/fleet/$base"$'\n'
+    continue
+  fi
   dest="$DEST/scripts/fleet/$base"
   if [ -L "$dest" ]; then
     echo "    replacing farm symlink with real copy: scripts/fleet/$base"
@@ -580,7 +600,10 @@ merge_gate_copied=0
 for base in "${merge_gate_srcs[@]}"; do
   farm_declared_rel+="scripts/$base"$'\n'
   f="$INFRA_ROOT/scripts/$base"
-  [ -f "$f" ] || continue
+  if [ ! -f "$f" ]; then
+    farm_missing+="scripts/$base"$'\n'
+    continue
+  fi
   dest="$DEST/scripts/$base"
   if [ -L "$dest" ]; then
     echo "    replacing farm symlink with real copy: $base"
@@ -623,6 +646,17 @@ echo "    scripts merge-gate farm: $merge_gate_copied copied (record-review.sh, 
 # the snapshot check (it was farmed here last run). Miss 3 and every later sync FAILS
 # at the launchd step on a broken target — loud, but it strands the whole sync, which
 # pi-bootstrap/tests/test-farm-unfarm.sh now catches at merge time.
+if [ -n "$farm_missing" ]; then
+  echo "ERROR: this checkout is INCOMPLETE — farm name(s) it DECLARES are not in $INFRA_ROOT:" >&2
+  while IFS= read -r missed; do
+    [ -n "$missed" ] && echo "         $missed" >&2
+  done <<<"$farm_missing"
+  echo "       Nothing below ran: the UNFARM leg, launchd convergence, the shell-profile wiring." >&2
+  echo "       A farm that delivers less than it declares is how the repo and the machines drift" >&2
+  echo "       apart in silence (#1931) — and, on the UNFARM side, how a file that was never" >&2
+  echo "       deployed comes to look retired. Re-run from a complete checkout (git status)." >&2
+  exit 1
+fi
 if [ ! -f "$BOOTSTRAP_DIR/lib/farm-retire.sh" ]; then
   echo "ERROR: $BOOTSTRAP_DIR/lib/farm-retire.sh is missing — the UNFARM leg cannot run, so a" >&2
   echo "       retired farm script would stay executable in $DEST/scripts with nothing to remove it." >&2
@@ -635,14 +669,16 @@ if ! farm_check_declared_shrink "$DEST" "$BOOTSTRAP_DIR/farm-retired.txt" "$farm
   echo "       previous run is now neither farmed nor retired (it would be ORPHANED), or the" >&2
   echo "       retirement list could not be read. Everything below this point" >&2
   echo "       did NOT run: launchd convergence, the shell-profile wiring, the TORTOISE_HOME probe." >&2
-  echo "       The copy legs above DID succeed, so the farm itself is current." >&2
-  echo "       Remedy: declare the path(s) in pi-bootstrap/farm-retired.txt and re-run ./sync.sh." >&2
+  echo "       The copy legs above completed (nothing was deleted), but this is NOT proof the farm" >&2
+  echo "       is current: an OLDER checkout declares fewer names than this box already has. Decide" >&2
+  echo "       which cause it is — the two remedies are opposite (see above)." >&2
   exit 1
 fi
 if ! farm_unfarm "$DEST" "$BOOTSTRAP_DIR/farm-retired.txt" "$farm_declared_rel"; then
   echo "ERROR: the UNFARM leg failed (see above) — a retirement the farm cannot apply is NOT applied." >&2
   echo "       Everything below this point did NOT run: launchd convergence, the shell-profile wiring," >&2
-  echo "       the TORTOISE_HOME probe. The copy legs above DID succeed, so the farm itself is current." >&2
+  echo "       the TORTOISE_HOME probe. NOTHING was deleted: the whole set is validated before the" >&2
+  echo "       first removal, so a refusal cannot leave a half-applied retirement behind." >&2
   echo "       Remedy: fix or remove the path(s) named above, then re-run ./sync.sh." >&2
   exit 1
 fi

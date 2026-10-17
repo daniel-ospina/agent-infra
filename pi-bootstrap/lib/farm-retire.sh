@@ -160,19 +160,86 @@ farm_retired_conflicts() {
 }
 
 # ── the removal leg ────────────────────────────────────────────────────────
+# farm_removal_problem <dest-root> <rel> <declared-list>
+# Prints why <rel> cannot be removed (and returns 1), or prints nothing and returns 0. It
+# is asked TWICE per run: once to validate the whole set before anything is touched, and
+# again immediately before the `rm` (a file can be replaced between the two passes).
+farm_removal_problem() {
+    local dest="$1" rel="$2" declared="${3:-}"
+    local path="$dest/$2" rel_dir parent resolved_dest expected drel
+
+    if [ ! -e "$path" ] && [ ! -L "$path" ]; then
+        printf 'nothing is installed at that path'
+        return 1
+    fi
+
+    # CONTAINMENT — the parent must resolve to EXACTLY the directory the relative path
+    # names, not merely to somewhere inside $DEST. "Inside $DEST" would let a symlinked
+    # farm subdirectory redirect the removal: `scripts/lib -> ../state` turns
+    # `scripts/lib/x.lock` into a delete inside $DEST/state, and `scripts/fleet -> scripts`
+    # makes `scripts/fleet/liveness.py` unlink the still-farmed `scripts/liveness.py`.
+    # Both are silent and exit 0, so the comparison is exact rather than a prefix.
+    rel_dir="$(dirname -- "$rel")"
+    parent="$(cd "$dest/$rel_dir" 2>/dev/null && pwd -P)" || parent=""
+    resolved_dest="$(cd "$dest" 2>/dev/null && pwd -P)" || resolved_dest=""
+    if [ -z "$parent" ] || [ -z "$resolved_dest" ]; then
+        printf 'its parent directory cannot be resolved'
+        return 1
+    fi
+    expected="$resolved_dest/$rel_dir"
+    if [ "$parent" != "$expected" ]; then
+        printf 'its parent directory resolves to %s, not %s — a symlinked farm subdirectory could redirect this removal' \
+               "$parent" "$expected"
+        return 1
+    fi
+
+    # SAME-FILE GUARD. farm_retired_conflicts compares STRINGS; `rm` resolves the name
+    # through the FILESYSTEM, and those differ in two ways that delete a live file:
+    #   * case-insensitive volume (macOS APFS/HFS+, the primary target of setup.sh):
+    #     `scripts/Record-Review.sh` and `scripts/record-review.sh` are ONE file, so an
+    #     entry differing only in case passes the string check and removes the still-farmed
+    #     artifact — on every sync, since the copy leg re-creates it;
+    #   * a hardlink alias reaches the same inode on ANY filesystem.
+    # So compare identity, not spelling. Only for a non-symlink target: unlinking a symlink
+    # never harms the file it points at, so a farm link to another farmed script is a
+    # legitimate retirement rather than a false block.
+    if [ ! -L "$path" ]; then
+        while IFS= read -r drel; do
+            [ -n "$drel" ] || continue
+            if [ "$path" -ef "$dest/$drel" ]; then
+                printf 'it is the SAME FILE as the still-farmed %s (a case-only or hardlink alias)' "$drel"
+                return 1
+            fi
+        done <<<"${declared:-}"
+    fi
+
+    if [ -L "$path" ]; then
+        return 0   # a farm symlink is a farm artifact: rm -f removes the LINK, not its target
+    elif [ -d "$path" ]; then
+        printf 'it is a DIRECTORY — an unfarm removes a file, never a directory (remove it by hand if that is really the intent)'
+        return 1
+    elif [ ! -f "$path" ]; then
+        printf 'it is not a regular file'
+        return 1
+    fi
+    return 0
+}
+
 # farm_unfarm <dest-root> <manifest> <declared-list>
 # <dest-root> is $DEST (the retirement paths are relative to it, e.g. scripts/x.py).
-# Prints one REMOVED line per artifact and a summary. Returns non-zero when anything
-# was refused or could not be removed — never silently.
+# Prints one REMOVED line per artifact and a summary. Returns non-zero when anything was
+# refused — never silently.
 #
-# A CONTRADICTION ABORTS THE WHOLE LEG, before anything is removed: if any declared
-# retirement is still declared by a farm array, the declaration and the farm disagree
-# about the repo's own state, and a half-applied deletion set is a state nobody
-# reviewed. Nothing is deleted; the caller fails loudly.
+# TWO PASSES, and the order is the safety property: the WHOLE set is validated before the
+# FIRST removal. An unfarm is a deletion, so a refusal on entry seven must not leave
+# entries one to six already gone: that is a half-applied retirement — a state nobody
+# reviewed — and in setup.sh it also aborts the run before launchd convergence, so the
+# box keeps a plist whose target the partial deletion just removed. Same rule as a
+# contradiction (which is checked first): nothing is deleted unless the whole set can be.
 farm_unfarm() {
     local dest="$1" manifest="$2" declared="${3:-}"
-    local entries conflicts rel path rel_dir parent resolved_dest expected
-    local removed=0 rc=0 conflict_rc=0
+    local entries conflicts rel path problem
+    local removed=0 rc=0 refused=0 conflict_rc=0 absent=0
 
     entries="$(farm_retired_entries "$manifest")" || return 1
     if [ -z "$entries" ]; then
@@ -193,72 +260,38 @@ farm_unfarm() {
            return 1 ;;
     esac
 
+    # PASS 1 — validate every entry. Nothing is removed here.
     while IFS= read -r rel; do
         [ -n "$rel" ] || continue
-
         path="$dest/$rel"
-        # Absent = already applied. This is what makes a re-run idempotent and quiet.
         if [ ! -e "$path" ] && [ ! -L "$path" ]; then
+            absent=$((absent + 1))      # already applied (or never landed): idempotent, not a problem
             continue
         fi
+        if ! problem="$(farm_removal_problem "$dest" "$rel" "$declared")"; then
+            printf 'ERROR: %s cannot be removed — %s\n' "$rel" "$problem" >&2
+            refused=$((refused + 1))
+        fi
+    done <<<"$entries"
+    if [ "$refused" -gt 0 ]; then
+        printf 'ERROR: %s of the declared retirement(s) cannot be applied safely, so NOTHING was removed —\n' "$refused" >&2
+        printf '       a half-applied retirement is a state nobody reviewed, and the caller then aborts\n' >&2
+        printf '       before launchd convergence. Fix or remove the path(s) named above and re-run.\n' >&2
+        printf '    unfarm: 0 removed (%s refused)\n' "$refused"
+        return 1
+    fi
 
-        # CONTAINMENT — the parent must resolve to EXACTLY the directory the relative
-        # path names, not merely to somewhere inside $DEST. "Inside $DEST" would let a
-        # symlinked farm subdirectory redirect the removal: `scripts/lib -> ../state`
-        # turns `scripts/lib/x.lock` into a delete inside $DEST/state, and
-        # `scripts/fleet -> scripts` makes `scripts/fleet/liveness.py` unlink the
-        # still-farmed `scripts/liveness.py`. Both are silent and exit 0, so the
-        # comparison is exact rather than a prefix.
-        rel_dir="$(dirname -- "$rel")"
-        parent="$(cd "$dest/$rel_dir" 2>/dev/null && pwd -P)" || parent=""
-        resolved_dest="$(cd "$dest" 2>/dev/null && pwd -P)" || resolved_dest=""
-        if [ -z "$parent" ] || [ -z "$resolved_dest" ]; then
-            printf 'ERROR: cannot resolve the parent directory of %s — refusing to remove it\n' "$rel" >&2
+    # PASS 2 — remove. farm_removal_problem is asked again: a file can be replaced between
+    # the passes, and the second answer is the one that precedes the `rm`.
+    while IFS= read -r rel; do
+        [ -n "$rel" ] || continue
+        path="$dest/$rel"
+        [ -e "$path" ] || [ -L "$path" ] || continue
+        if ! problem="$(farm_removal_problem "$dest" "$rel" "$declared")"; then
+            printf 'ERROR: %s changed while retiring and cannot be removed — %s\n' "$rel" "$problem" >&2
             rc=1
             continue
         fi
-        expected="$resolved_dest/$rel_dir"
-        if [ "$parent" != "$expected" ]; then
-            printf 'ERROR: the parent directory of %s resolves to %s, not %s — a symlinked farm subdirectory could redirect this removal; refusing\n' \
-                   "$rel" "$parent" "$expected" >&2
-            rc=1
-            continue
-        fi
-
-        # SAME-FILE GUARD. The contradiction check above compares STRINGS; `rm` resolves the
-        # name through the FILESYSTEM, and those differ in two ways that delete a live file:
-        #   * case-insensitive volume (macOS APFS/HFS+ — the primary target of setup.sh):
-        #     `scripts/Record-Review.sh` and `scripts/record-review.sh` are ONE file, so an
-        #     entry differing only in case passes the string check and removes the still-farmed
-        #     artifact — on every sync, since the copy leg re-creates it;
-        #   * a hardlink alias reaches the same inode on ANY filesystem.
-        # So compare identity, not spelling. Only for a non-symlink target: unlinking a
-        # symlink never harms the file it points at, so a farm link to another farmed script
-        # is a legitimate retirement rather than a false block.
-        if [ ! -L "$path" ]; then
-            local drel
-            while IFS= read -r drel; do
-                [ -n "$drel" ] || continue
-                if [ "$path" -ef "$dest/$drel" ]; then
-                    printf 'ERROR: %s is the SAME FILE as the still-farmed %s (a case-only or hardlink alias) — refusing to remove a farmed artifact\n' "$rel" "$drel" >&2
-                    rc=1
-                    continue 2
-                fi
-            done <<<"${declared:-}"
-        fi
-
-        if [ -L "$path" ]; then
-            :   # a farm symlink is a farm artifact: rm -f removes the LINK, not its target
-        elif [ -d "$path" ]; then
-            printf 'ERROR: %s is a DIRECTORY — an unfarm removes a file, never a directory (refusing; remove it by hand if that is really the intent)\n' "$rel" >&2
-            rc=1
-            continue
-        elif [ ! -f "$path" ]; then
-            printf 'ERROR: %s is not a regular file — refusing to remove it\n' "$rel" >&2
-            rc=1
-            continue
-        fi
-
         if rm -f -- "$path"; then
             printf '    unfarm: REMOVED %s (retired — it is no longer farmed)\n' "$rel"
             removed=$((removed + 1))
@@ -268,7 +301,9 @@ farm_unfarm() {
         fi
     done <<<"$entries"
 
-    printf '    unfarm: %d removed\n' "$removed"
+    printf '    unfarm: %d removed' "$removed"
+    if [ "$absent" -gt 0 ]; then printf ' (%s already absent)' "$absent"; fi
+    printf '\n'
     return "$rc"
 }
 
@@ -306,8 +341,14 @@ farm_check_declared_shrink() {
         # disk, and its prescribed remedy (declare it retired) would remove nothing.
         [ -e "$dest/$prev" ] || [ -L "$dest/$prev" ] || continue
         printf 'ERROR: %s was DECLARED and INSTALLED here by a previous run, and is now NEITHER farmed NOR retired.\n' "$prev" >&2
-        printf '       A name dropped from a farm array stays installed forever unless it is declared:\n' >&2
-        printf '       add its deployed path to pi-bootstrap/farm-retired.txt in the same commit.\n' >&2
+        printf '       TWO causes are possible, with OPPOSITE remedies — pick the right one:\n' >&2
+        printf '        (1) the name really LEFT the farm: add its deployed path to\n' >&2
+        printf '            pi-bootstrap/farm-retired.txt in the same commit.\n' >&2
+        printf '        (2) this checkout is OLDER than what was installed here (a partial clone, an old\n' >&2
+        printf '            branch, or a run pointed at a different checkout): do NOT declare it. Apply\n' >&2
+        printf '            from the checkout that still farms it. Declaring it would DELETE an artifact\n' >&2
+        printf '            the repo still ships, and since the farm re-creates it every later run would\n' >&2
+        printf '            then fail on a retirement the farm still declares.\n' >&2
         rc=1
     done < "$snapshot" || read_rc=$?
     if [ "$read_rc" -ne 0 ]; then

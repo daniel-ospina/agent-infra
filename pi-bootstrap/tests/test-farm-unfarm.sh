@@ -265,6 +265,27 @@ else
 fi
 
 # ===========================================================================
+hdr "(c2) lib: a refusal on ONE entry removes NOTHING (the set is validated first)"
+# An unfarm is a deletion, so a refusal on the last entry must not leave the earlier ones
+# already gone: setup.sh would then abort before launchd convergence with a plist whose
+# target the partial deletion removed — a half-applied retirement nobody reviewed.
+ATOM="$TMP/atomic"
+mkdir -p "$ATOM/dest/scripts/fleet"
+printf 'removable\n' > "$ATOM/dest/scripts/a.sh"
+printf 'x\n'         > "$ATOM/dest/scripts/fleet/liveness.py"
+printf 'scripts/a.sh\nscripts/fleet\n' > "$ATOM/manifest.txt"   # 2nd entry is a DIRECTORY
+out="$(farm_unfarm "$ATOM/dest" "$ATOM/manifest.txt" '' 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ]; then
+  fail "(c2) a retirement set with an unremovable entry exited 0"
+elif [ ! -f "$ATOM/dest/scripts/a.sh" ]; then
+  fail "(c2) PARTIAL APPLY: a.sh was removed even though the set could not be applied ($out)"
+elif ! grep -q 'NOTHING was removed' <<<"$out"; then
+  fail "(c2) the refusal did not say nothing was removed ($out)"
+else
+  ok "(c2) a set with one unremovable entry removes NOTHING (validated before the first rm)"
+fi
+
+# ===========================================================================
 hdr "(d) lib: unsafe entries are refused; directories and symlink targets are safe"
 SAFE="$TMP/safe"
 mkdir -p "$SAFE/dest/scripts"
@@ -632,6 +653,30 @@ else
   fail "(h) --install did not resolve an older-layer snapshot mismatch (see $LOG)"
 fi
 
+# The OTHER direction: the cell has a file the checkout no longer farms (a retirement that
+# was not declared, or a checkout older than the installed layer). --verify must name it as
+# "no longer farmed" and --install must REFUSE (it does not delete what it no longer farms,
+# and it will not orphan it either) — so the advice must not be "just re-run --install".
+set_fleet_srcs remove new-probe.sh || fail "(h) could not remove the farm entry from the COPY"
+out="$(CELL_HOME="$CELL_HOME" INFRA_ROOT="$COPY" bash "$CELL_INSTALL" --verify 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ]; then
+  fail "(h) --verify passed although the cell carries a farmed file this checkout no longer farms"
+elif ! grep -q 'no longer farmed by this checkout: scripts/new-probe.sh' <<<"$out"; then
+  fail "(h) the older-checkout direction was not named: $(grep -m1 'no longer farmed\|not this checkout' <<<"$out")"
+elif ! grep -q 'refuses to orphan' <<<"$out"; then
+  fail "(h) the gone direction did not say --install refuses to orphan it"
+else
+  ok "(h) a file the checkout no longer farms is named, and the advice does not promise --install will fix it"
+fi
+if CELL_HOME="$CELL_HOME" INFRA_ROOT="$COPY" bash "$CELL_INSTALL" --install >> "$LOG" 2>&1; then
+  fail "(h) --install did NOT refuse to orphan the still-installed name"
+elif [ ! -f "$CELL_DEST/scripts/new-probe.sh" ]; then
+  fail "(h) --install deleted the orphaned name instead of refusing"
+else
+  ok "(h) --install refuses to orphan a still-installed name (and deletes nothing)"
+fi
+set_fleet_srcs add new-probe.sh || fail "(h) could not restore the COPY's farm entry"
+
 # a checkout without the UNFARM leg must be refused BEFORE anything is copied (a cell
 # half-installed by a resolver that accepted an incomplete tree is #1723's state)
 NOLIB="$TMP/nolib-checkout"
@@ -667,6 +712,28 @@ elif ! grep -q 'refused (INFRA_ROOT is not a checkout' <<<"$out"; then
 else
   ok "(h) an invalid INFRA_ROOT is named as refused before the fallback is used"
 fi
+
+# ===========================================================================
+hdr "(i) an INCOMPLETE checkout fails loudly instead of reading as a retirement"
+# A farm array DECLARES what the checkout ships. A listed name that is not in the checkout
+# used to be skipped in silence (#1931), and since #1924 that silence is worse: the name is
+# recorded as declared, so on a later run it looks orphaned — and the orphan advice ("declare
+# it retired") would then delete an artifact the repo still ships. Measured on the real
+# script: a checkout missing scripts/checkout-hygiene/ produced eight "retirements".
+rm -f "$COPY/scripts/$KEPT_NAME"
+: > "$LOG"
+if HOME="$HOME_DIR" bash "$COPY/pi-bootstrap/setup.sh" >> "$LOG" 2>&1; then
+  fail "(i) setup.sh accepted a checkout that is missing a farm file it declares"
+elif ! grep -q 'INCOMPLETE' "$LOG"; then
+  fail "(i) the incomplete checkout was not named as such"
+elif ! grep -q "scripts/$KEPT_NAME" "$LOG"; then
+  fail "(i) the missing farm file was not named in the failure"
+elif grep -q 'NEITHER farmed NOR retired' "$LOG"; then
+  fail "(i) a missing farm file reached the orphan advice (which would lead to a WRONG retirement)"
+else
+  ok "(i) a missing farm file fails the run, names it, and never reaches the orphan advice"
+fi
+cp "$ROOT/scripts/$KEPT_NAME" "$COPY/scripts/$KEPT_NAME"
 
 # ===========================================================================
 if [ "$FAILURES" -gt 0 ]; then
