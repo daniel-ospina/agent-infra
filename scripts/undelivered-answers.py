@@ -12,7 +12,11 @@ The delivery predicate lives in ask-owner.py::scan(). An answer is delivered onl
 when ALL of these hold:
   1. the issue carries NONE OF  owner-decision / question-bounced / answer-delivered
   2. it has a comment starting with `RESEARCH:` (the declaration)
-  3. it has an `unlabeled owner-decision` timeline event newer than that declaration
+  3. it has an `unlabeled owner-decision` timeline event newer than that declaration,
+     AND (agent-infra#1903) the issue does NOT carry `question-bounced` — a bounce
+     writes that same removal, and a bounced question is out of the owner's queue,
+     so a removal while the bounce label is present is NOT an answer. Same rule as
+     ask-owner.py::owner_answered_at (one definition, two readers)
   4. it carries a `lane:` label, or the relay reports NO LANE ROUTE for it
 This script reports, per answered issue, which of those is missing.
 
@@ -70,7 +74,8 @@ def declaration_count(repo, n):
 
 
 def unlabeled_event_count(repo, n):
-    """Count `unlabeled owner-decision` events ACROSS ALL PAGES.
+    """Count `unlabeled owner-decision` events ACROSS ALL PAGES, EXCLUDING the
+    gate's own bounce removal.
 
     ⛔ The timeline endpoint returns the **FIRST page** by default, so a bare
     call shows the OLDEST events and silently misses the most recent ones — which
@@ -83,16 +88,32 @@ def unlabeled_event_count(repo, n):
     so `|length` emits one number PER PAGE and the caller cannot sum them (it
     would fall into the `None`/UNVERIFIED branch and silently disarm this check).
     Emitting one line per matching event and counting lines is pagination-safe.
+
+    ⛔ THE GATE WRITES THIS EVENT TOO (agent-infra#1903): a bounce removes
+    `owner-decision`. This count is the RAW event count (removals newer than the
+    newest `labeled question-bounced` event) — `diagnose` applies the label-state
+    rule on top, so a bounced question is never reported as "conditions satisfied
+    — PENDING (clean)", i.e. as an answer that does not exist.
     """
     rc, out, _ = sh(["gh", "api",
                      "repos/%s/issues/%d/timeline?per_page=100" % (repo, n),
                      "--paginate",
                      "--jq",
-                     '.[]|select(.event=="unlabeled" and .label.name=="%s")|.created_at'
-                     % QUEUE])
+                     '.[]|select((.event=="unlabeled" and .label.name=="%s") '
+                     'or (.event=="labeled" and .label.name=="%s"))'
+                     r'|"\(.event)\t\(.created_at)"' % (QUEUE, BOUNCED)])
     if rc != 0:
         return None
-    return len([ln for ln in out.splitlines() if ln.strip()])
+    removed, bounced = [], []
+    for ln in out.splitlines():
+        if not ln.strip():
+            continue
+        ev, _, at = ln.partition("\t")
+        if not at.strip():
+            continue
+        (removed if ev.strip() == "unlabeled" else bounced).append(at.strip())
+    newest_bounce = max(bounced) if bounced else ""
+    return len([at for at in removed if at > newest_bounce])
 
 
 def diagnose(repo, issue):
@@ -115,10 +136,18 @@ def diagnose(repo, issue):
         blockers.append("UNVERIFIED: could not read comments")
     # condition 3
     n_unl = unlabeled_event_count(repo, issue["number"])
-    if n_unl == 0:
-        blockers.append("no `unlabeled owner-decision` event (removal never happened)")
-    elif n_unl is None:
+    if n_unl is None:
         blockers.append("UNVERIFIED: could not read timeline")
+    elif n_unl == 0:
+        blockers.append("no `unlabeled owner-decision` event (removal never happened)")
+    elif BOUNCED in names:
+        # The gate's own bounce writes this removal (agent-infra#1903), so while
+        # `question-bounced` is present it is not an owner answer — do NOT tell the
+        # operator a removal "never happened" when one did, and do not pass this
+        # off as "conditions satisfied".
+        blockers.append("only `unlabeled owner-decision` events while "
+                        "`question-bounced` is present — the gate's own bounce, "
+                        "not an owner answer")
     # condition 4
     if not lanes:
         blockers.append("NO LANE ROUTE: no `lane:` label")
