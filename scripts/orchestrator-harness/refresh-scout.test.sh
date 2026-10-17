@@ -1822,9 +1822,12 @@ echo; echo "── the listings use the REST bucket: a starved GraphQL bucket no
 #     page files are only concatenated in order if they are zero-padded (`p010` sorts before `p2`
 #     otherwise), so the ordering claim is measured rather than asserted.
 echo; echo "── the REST helper's own refusals ──"
-run_bounded() {  # <seconds> <cmd...> — 124 means it did not finish
+run_bounded() {  # <seconds> <cmd...> — 124 means it did not finish. Output is the CALLER's business:
+                 # it must not be swallowed here, or every assertion that reads a message or a row
+                 # count passes vacuously (measured — that is how three of these assertions first
+                 # "passed").
   local secs="$1"; shift
-  "$@" >/dev/null 2>&1 & local pid=$!
+  "$@" & local pid=$!
   local i=0 max=$((secs * 10))
   while [ "$i" -lt "$max" ]; do
     kill -0 "$pid" 2>/dev/null || { wait "$pid" 2>/dev/null; return $?; }
@@ -1852,18 +1855,19 @@ case "$*" in
 esac
 SH
   chmod +x "$HD/gh"
+  # ⛔ `set -u` IS PART OF WHAT IS UNDER TEST: the shipped script sets it (refresh-candidates.sh:16),
+  # so a `set -u` regression inside `rest_list` (an unguarded expansion) would be invisible to a driver
+  # running with default options. Same class the install-probe driver pins for install.sh.
   cat > "$T/rr.sh" <<'RS'
+set -u
 . "$1"; shift
 OR=acme/widget
 rest_list "$@"
 RS
   drv() { run_bounded 5 bash "$T/rr.sh" "$T/rest.sh" "$@"; }
-  # ⛔ drv_out — the same call WITHOUT the bound, because `run_bounded` swallows stdout by design (it
-  # exists to bound a call that might never finish). Every assertion that READS the rows must use
-  # this one: asserting on a file the bound never wrote is a vacuous pass (measured while writing
-  # this block — the multi-page case "passed" at 0 rows for exactly that reason). These cases are
-  # deterministic (the stub always answers), so no bound is needed; the risk they cover is a wrong
-  # ANSWER, not a hang.
+  # drv_out — the same call WITHOUT the bound. `run_bounded` no longer swallows output, so both
+  # preserve it; the unbounded form is used where the stub is deterministic (the risk is a wrong
+  # ANSWER, not a hang), and the bounded one where the pre-fix code HUNG (a flag with no value).
   drv_out() { bash "$T/rr.sh" "$T/rest.sh" "$@"; }
   PATH="$HD:$PATH"; export PATH
   drv issues --repo acme/widget --json number > /dev/null 2>"$HD/err"; rc=$?
@@ -1873,14 +1877,51 @@ RS
   [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ] && ok "rest_list refuses a flag with NO VALUE instead of spinning for ever (rc=$rc)" \
                   || bad "rest_list did not refuse a value-less flag (rc=$rc; 124 = it hung)"
   drv issues --repo acme/widget --limit abc > /dev/null 2>"$HD/err"; rc=$?
-  [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ] && ok "rest_list refuses a NON-NUMERIC limit rather than paging unbounded (rc=$rc)" \
-                  || bad "rest_list accepted a non-numeric limit (rc=$rc)"
+  # ⛔ THE MESSAGE, NOT JUST THE STATUS: without the guard the helper pages and then dies inside the
+  # final `jq --argjson limit abc` (measured rc=2, "invalid JSON text passed to --argjson") — a
+  # non-zero rc that has nothing to do with a limit being unbounded.
+  grep -q 'is not a number' "$HD/err" 2>/dev/null && lim_msg=1 || lim_msg=0
+  [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ] && [ "$lim_msg" -eq 1 ] \
+    && ok "rest_list refuses a NON-NUMERIC limit AT THE GUARD (rc=$rc, 'is not a number') rather than paging unbounded" \
+    || bad "rest_list did not refuse a non-numeric limit at the guard (rc=$rc, message='$(head -1 "$HD/err")')"
   drv widgets > /dev/null 2>"$HD/err"; rc=$?
   [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ] && ok "rest_list refuses an UNKNOWN listing kind (rc=$rc)" \
                   || bad "rest_list accepted an unknown listing kind (rc=$rc)"
   drv_out issues --repo acme/widget --limit 500 --jq '.[].number' > "$HD/out" 2>"$HD/err"; rc=$?
   [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ] && ok "rest_list REFUSES a vanished page (LINK still advertises a next page, body has none)" \
                   || bad "rest_list read a vanished page as the end of the collection (rc=$rc) — a truncated listing at rc 0"
+  # ⛔ WHICH GUARD FIRED, because two of them cover this shape on a middle page: the short-page guard
+  # (`n < 100`) also catches `n == 0`, so an assertion on rc alone stays green if the VANISH half is
+  # deleted. The `page == pages` case below is the one only the vanish guard can catch.
+  grep -q 'answered with 0 rows' "$HD/err" 2>/dev/null && ok "the refusal is the VANISHED-PAGE one ('answered with 0 rows'), not the short-page one" \
+                                                        || bad "the vanished-page case was refused by another guard: '$(head -1 "$HD/err")'"
+  # ── the LAST requested page vanishing: the short-page guard is gated out here (`page < pages`), so
+  # only the vanish guard stands between the caller and 400 of 500 rows at rc 0 (measured on the
+  # pre-fix helper: rc=0, rows=400).
+  HDL="$T/restcase-lastvanish"; mkdir -p "$HDL"
+  cat > "$HDL/gh" <<'SH'
+#!/bin/bash
+pg="$(printf '%s' "$*" | sed -n 's/.*&page=\([0-9]*\).*/\1/p')"; [ -n "$pg" ] || pg=1
+if [ "$pg" -lt 5 ]; then
+  printf 'HTTP/2.0 200 OK\r\nLink: <x?page=%s>; rel="next"\r\n\r\n' "$((pg+1))"
+  jq -n --argjson p "$pg" '[range(100)|{number: (($p-1)*100 + .)}]'
+else
+  # the last page requested (limit 500 -> 5 pages) answers EMPTY while still advertising a next page
+  printf 'HTTP/2.0 200 OK\r\nLink: <x?page=6>; rel="next"\r\n\r\n[]\n'
+fi
+SH
+  chmod +x "$HDL/gh"
+  PATH="$HDL:$PATH"; export PATH
+  drv_out issues --repo acme/widget --limit 500 --jq '.[].number' > "$HDL/out" 2>"$HDL/err"; rc=$?
+  PATH="${PATH#$HDL:}"; export PATH
+  [ "$rc" -ne 0 ] && [ ! -s "$HDL/out" ] \
+    && ok "rest_list refuses a VANISHED LAST PAGE instead of returning the 400 rows it had (rc=$rc, 0 rows emitted)" \
+    || bad "a vanished last page returned $(wc -l < "$HDL/out") row(s) at rc=$rc — a 500-row listing truncated to 400 ($(head -1 "$HDL/err"))"
+  # ⛔ The LAST PAGE case must also be refused BY THE VANISH GUARD, not by a transport error: with the
+  # stub's `[]`+next answer a broken stub (measured, while the stub itself was malformed) returned
+  # rc=1 with an empty body and the assertion above passed for the wrong reason.
+  grep -q 'answered with 0 rows' "$HDL/err" 2>/dev/null && ok "the last-page refusal is the VANISHED-PAGE one, with the 400 rows already read" \
+                                                        || bad "the last-page case was refused by another path: '$(head -1 "$HDL/err")'"
   PATH="${PATH#$HD:}"; export PATH
   [ ! -s "$HD/out" ] && ok "rest_list emits NO rows for a refused listing (nothing for a caller to mistake for an answer)" \
                      || bad "rest_list emitted rows while refusing: $(head -2 "$HD/out" | tr '\n' ' ')"

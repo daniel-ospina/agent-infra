@@ -761,10 +761,17 @@ rest_list() {
   # reaper, which then un-blacklists an issue that has no PR of its own — the duplicate-lane defect of
   # #1705 from the other side. Dropped here ONCE FOR THIS FILE (the gh-rest adapter drops the same
   # rows, `gh-rest/gh:156`; that twin is why BOTH surfaces must be changed together if the rule ever
-  # moves). ⛔ THE LIMIT BOUNDS THE PROJECTED ROWS, NOT THE RAW ONES: PRs are dropped FIRST, so a
-  # tier's `--limit` counts issues — which also means a run can return exactly `--limit` rows while
-  # more issues exist beyond the last page read. (An earlier version of this comment claimed the
-  # limit cut the raw rows; the twin adapter agrees with the CODE — `gh-rest/gh:157-158` filters,)
+  # moves). ⛔ `--limit` IS A RAW-ROW BUDGET AND THE PROJECTED TOTAL IS SMALLER — stated with the
+  # measurement, because a review cycle "corrected" this the wrong way and a comment that lies about
+  # the window is worse than none: the page budget is `ceil(limit/100)` RAW rows (the loop above), and
+  # PRs are dropped only here, so a 500 window returns 500 minus however many pull requests were
+  # inside it. Driven against the real API: tortoise `--limit 500` -> 485 rows, agent-infra -> 454,
+  # where the pre-change listing returned 500 (it excludes pull requests by definition). The
+  # divergence is DELIBERATE and conservative: `.pr_brs` (kind=pulls) is unfiltered, so the #1705
+  # `has_pr` check is unaffected; `.open_iss` only NARROWS (fewer un-blacklists, never more); and a
+  # tier's window is re-read every cycle, so a candidate past the window is picked up next pass.
+  # (Fetching `limit` PROJECTED rows would mean paging past the budget — the shared core budget this
+  # change exists to protect; the twin adapter stops at the same place, `gh-rest/gh:157-158`.)
   jq -r -s --arg kind "$kind" --argjson limit "$limit" \
      'add // [] | (if $kind == "issues" then map(select(has("pull_request") | not)) else . end) | .[0:$limit] | '"$prog" \
      "$tmp"/p*.json
