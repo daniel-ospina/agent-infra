@@ -55,6 +55,17 @@ cap_refusal_gate() { # -> prints `load|disk` and returns 0 iff THIS dispatch was
   return 0
 }
 
+# ⛔ CAPTURE THIS CHAIN'S CLAIM COMMIT NOW, NOT INSIDE THE TRAP (2026-10-16 review). The handover
+# record is keyed on the ISSUE, and the same box can become the holder of the same issue a second
+# time while this chain is still alive (its lease lapsed; this chain is still waiting on a PR). The
+# second acquire OVERWRITES `$O/state/issueclaim-<N>` with the new commit, and a trap that read the
+# file when it fired would fence on that NEW commit — which IS the ref tip — so THIS (older) chain
+# would delete the claim of the chain that legitimately holds it. A peer would then read the issue as
+# free and dispatch it: the duplicate this registry exists to prevent, and a fail-OPEN. Captured
+# once, here, the value is this chain's own generation, and `claim_issue_release_record` refuses a
+# release whose record has moved on.
+CHAIN_CLAIM_COMMIT="$( . "$O/claims.sh" 2>/dev/null; claim_issue_record_commit "$O" "$N" 2>/dev/null )" || true
+
 # ── release the cross-box ISSUE claim (#1850) ────────────────────────────────────────────────
 # `orch-loop.sh` claimed `refs/claims/issue-<N>` when it dispatched this issue, and that claim is
 # this box's declaration that the issue is IN FLIGHT. Holding it after the chain is over would keep
@@ -67,15 +78,33 @@ cap_refusal_gate() { # -> prints `load|disk` and returns 0 iff THIS dispatch was
 # `claim_issue_release_record` (claims.sh), which is the ONE implementation of that handover — this
 # function only owns the TRAP and the log line.
 release_issue_claim() {
-  local csh="${CLAIMS_SH:-$O/claims.sh}"
+  local csh="$O/claims.sh" out rc=0
   trap - EXIT INT TERM
   [ -f "$csh" ] || return 0
   # CLAIM_REPO is the repo the claim was pushed to (refs/claims live in the TARGET repo's origin),
-  # which is the same value orch-loop.sh used when it acquired — a mismatch here would read the
-  # WRONG repo's ref and the release would be a no-op. Every git call in claims.sh is `-C
-  # "$CLAIM_REPO"`, so the cwd is irrelevant and no `cd` (a gated shape) is needed.
-  ( CLAIM_REPO="$REPO"; . "$csh"; claim_issue_release_record "$O" "$REPO" "$N" ) >/dev/null 2>&1 \
-    && echo "[chain $N] released refs/claims/issue-$N" >> "$LOG"
+  # which is the value orch-loop.sh used when it acquired — a mismatch here would read the WRONG
+  # repo's ref and the release would be a no-op. Every git call in claims.sh is `-C "$CLAIM_REPO"`,
+  # so the cwd is irrelevant and no `cd` (a gated shape) is needed.
+  # ⛔ SOURCED INTO THIS SHELL, NOT A SUBSHELL, AND ITS FAILURES ARE LOGGED (2026-10-16 review).
+  # `( … ) >/dev/null 2>&1 && echo released` reported SUCCESS ONLY: a refused fence, a network
+  # failure, or a registry too old to HAVE the release function left the claim running to its full
+  # lease with NOTHING in the chain log to say so — the operator's only signal was a missing
+  # "released" line. The reason lives in CLAIM_RESULT, which a subshell discards.
+  CLAIM_REPO="$REPO"
+  if ! . "$csh" 2>/dev/null; then
+    echo "[chain $N] ⚠️ $csh failed to source — the issue claim is NOT released (it runs to its lease, CLAIM_ISSUE_TTL=${CLAIM_ISSUE_TTL:-10800}s)" >> "$LOG"
+    return 0
+  fi
+  if ! declare -f claim_issue_release_record >/dev/null 2>&1; then
+    echo "[chain $N] ⚠️ $csh predates the issue-claim RELEASE (no claim_issue_release_record) — the claim is NOT released; fix: cp scripts/orchestrator-harness/*.sh ~/orchestrator/" >> "$LOG"
+    return 0
+  fi
+  if out="$(claim_issue_release_record "$O" "$REPO" "$N" "${CHAIN_CLAIM_COMMIT:-}")"; then
+    echo "[chain $N] released refs/claims/issue-$N" >> "$LOG"
+  else
+    rc=$?
+    echo "[chain $N] ⚠️ the issue claim was NOT released (rc=$rc): ${out:-${CLAIM_RESULT:-no reason given}} — it runs to its lease (CLAIM_ISSUE_TTL=${CLAIM_ISSUE_TTL:-10800}s)" >> "$LOG"
+  fi
   return 0
 }
 # ⛔ INT/TERM ARE SEPARATE AND THEY EXIT. A handler that only RETURNS does not terminate the shell

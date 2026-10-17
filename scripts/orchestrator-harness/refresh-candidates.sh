@@ -308,14 +308,23 @@ gh_env_verdict() {
 # being wrong differs: refusing costs one PR's merge, certifying a free issue costs duplicated work
 # on two boxes.
 #
-# ⚠️ STATED LIMIT: a box where the registry is NOT INSTALLED does not queue nothing — it falls
-# through to the pre-registry behaviour, loudly. `install.sh` seeds `claims.sh` into `$O` (it is in
-# the drift list precisely because the daemon executes it), so a deployed cell has it; a box without
-# it cannot take the claim either, and refusing to queue on a missing FILE would make every such box
-# merge-only — a bigger, less reversible failure than the state being removed. Missing is reported;
-# unreadable is refused.
-issue_claim_verdict() { # <issue> -> 0 CLEAN / 1 COLLISION / 2 INCOMPLETE; the reason in CLAIM_RESULT
-  local csh="${CLAIMS_SH:-$O/claims.sh}"
+# ⚠️ STATED LIMIT: a box where the registry FILE is NOT INSTALLED does not queue nothing — it falls
+# through to the pre-registry behaviour, loudly. A deployed box gets it from the deploy step that
+# seeds `$O` (`scripts/deploy-crossbox.sh`, `scripts/deploy-mac-orchestrator.sh`, or the manual
+# `cp scripts/orchestrator-harness/*.sh ~/orchestrator/` of README §4 — ⛔ NOT `install.sh`, which
+# only REPORTS the drift and prints that `cp` command; corrected 2026-10-16 after a review found the
+# old sentence sent the operator down a path that does not install it), so a deployed cell has it; a
+# box without it cannot take the claim either, and refusing to queue on a missing FILE would make
+# every such box merge-only — a bigger, less reversible failure than the state being removed.
+# Missing is reported; unreadable is refused; PRESENT BUT STALE is refused AND surfaced as a
+# provisioning failure (rc=3 below), because that one is local, permanent, and fixable in seconds.
+# ⛔ THE REGISTRY PATH IS NOT READ FROM THE ENVIRONMENT (2026-10-16 review). `CLAIMS_SH` was a
+# regression-test seam, but three production callers had begun to honour it, which let an ambient
+# value resolve a DIFFERENT registry in each of them — a gate half-disabled by the environment, the
+# exact "disable it by ambient env" shape orch-loop.sh's dispatch gate forbids. It is now a path:
+# `$O/claims.sh`, everywhere, and the regression suite drives a sandbox `O` instead.
+issue_claim_verdict() { # <issue> -> 0 CLEAN / 1 COLLISION / 2 INCOMPLETE / 3 NOT PROVISIONABLE
+  local csh="$O/claims.sh"
   if [ ! -f "$csh" ]; then
     CLAIM_RESULT="the claim registry ($csh) is NOT INSTALLED — INCOMPLETE, never CLEAN"
     return 2
@@ -325,12 +334,20 @@ issue_claim_verdict() { # <issue> -> 0 CLEAN / 1 COLLISION / 2 INCOMPLETE; the r
   # shellcheck source=/dev/null
   . "$csh" || { CLAIM_RESULT="$csh failed to source — INCOMPLETE, never CLEAN"; return 2; }
   # ⛔ A REGISTRY THAT CANNOT ANSWER IS NOT EVIDENCE OF FREEDOM. An older `claims.sh` in $O (drift:
-  # install.sh reports it, and the daemon executes the $O copy) has no `claim_issue_preflight`, and
-  # calling the missing function returns 127 — which the CLEAN arm's `case` would read as neither 1
-  # nor 2, and therefore QUEUE the issue. A stale flag that records a past state must not become a
+  # the drift check reports it, and the daemon executes the $O copy) has no `claim_issue_preflight`,
+  # and calling the missing function returns 127 — which the CLEAN arm's `case` would read as neither
+  # 1 nor 2, and therefore QUEUE the issue. A stale flag that records a past state must not become a
   # duplicate dispatch, so a registry that cannot answer counts as INCOMPLETE.
-  declare -f claim_issue_preflight >/dev/null 2>&1 \
-    || { CLAIM_RESULT="$csh predates the issue-claim reader — INCOMPLETE, never CLEAN"; return 2; }
+  # ⛔ AND THIS ONE IS ITS OWN CODE (rc=3, 2026-10-16 review), because unlike an unreadable registry
+  # it is PERMANENT and LOCAL: nothing about it is transient, so a pass that keeps answering
+  # INCOMPLETE queues nothing forever while the cell still reports RUNNING — the "a cell that can
+  # only merge, and looks healthy" defect this script has already been fixed for twice (#1748,
+  # #1736). rc=3 is the provisioning code `orch-loop.sh` turns into `$O/.refresh-blocked`, which
+  # stops the retry AND names the reason in `status`. The operator's fix is one `cp`.
+  if ! declare -f claim_issue_preflight >/dev/null 2>&1; then
+    CLAIM_RESULT="$csh predates the issue-claim reader (no claim_issue_preflight) — NOT PROVISIONABLE, never CLEAN"
+    return 3
+  fi
   claim_issue_preflight "$1"
 }
 
@@ -362,6 +379,28 @@ cmd_check() {
   fi
   echo "[refresh] check: repo=$REPO"
   echo "[refresh] check: pre-flight tool=$PREFLIGHT"
+  # ── the CROSS-BOX CLAIM REGISTRY, judged LOCALLY (agent-infra#1850 review, 2026-10-16) ──────
+  # The refresh refuses every issue when `$O/claims.sh` exists but predates the issue-claim reader,
+  # and that state is permanent and local — so a cell in it queues NOTHING forever. Catching it HERE
+  # is the whole point of a provisioning verdict: it needs no network, no `gh`, and no scout, and it
+  # refuses to certify a cell that could only merge. A byte-identical check to the one the refresh
+  # applies (`declare -f claim_issue_preflight`), so a check can never disagree with the run.
+  if [ -f "$O/claims.sh" ]; then
+    # ONE probe for both failure kinds — unloadable, or loaded but carrying no `claim_issue_preflight`
+    # — because they share the one operator fix and the one consequence (the pre-flight refuses every
+    # issue, so the cell can only merge). Behaviourally byte-identical to the refresh's own check.
+    if ! ( CLAIM_REPO="$SC"; . "$O/claims.sh"; declare -f claim_issue_preflight >/dev/null 2>&1 ) 2>/dev/null; then
+      echo "[refresh] check: FAIL $O/claims.sh cannot answer the issue-claim question (unloadable, or predating the issue-claim reader)"
+      echo "[refresh] NOT PROVISIONABLE: the pre-flight would refuse every issue as INCOMPLETE, so a cell on this repo would MERGE ONLY"
+      echo "[refresh]   fix: cp scripts/orchestrator-harness/*.sh ~/orchestrator/  (then re-run this check)"
+      return "$EXIT_NOT_PROVISIONABLE"
+    fi
+    echo "[refresh] check: claim registry=$O/claims.sh (issue-claim reader present)"
+  else
+    # NOT a failure: the documented loud fallthrough (issue_claim_verdict's STATED LIMIT). The box
+    # dispatches, without the cross-box gate, and says so — the same verdict the refresh reaches.
+    echo "[refresh] check: claim registry=$O/claims.sh absent — the refresh will WARN per issue and dispatch without a cross-box claim"
+  fi
   # ⛔ JUDGE THE INTERPRETER THE REFRESH WILL ACTUALLY USE. `--check` must not create the scout
   # worktree, but the venv it reads must be the one the run will find there. Reading
   # `$REPO/.venv/bin/python` whenever `$SC` did not exist was a FALSE PASS: the run uses
@@ -608,14 +647,21 @@ touch "$O/checked.txt" "$O/candidates.txt"
 # and that whole priority tier silently disappears into a "healthy" backlog, the #8465 priority
 # inversion this sort exists to prevent (#1853 review). The sentinel is a real file write from the
 # pipeline's subshell, so the parent sees it.
-rm -f "$O/.pool-err"
+# ⛔ EACH QUERY RECORDS WHICH WAY IT WENT, not only when it failed. `.pool-read` gets the tier
+# that ANSWERED (even with zero rows), `.pool-err` the tier that did not — so UNREADABLE (nothing
+# answered) is a fact the parent can check rather than an inference from an empty error file, and
+# PARTIAL can NAME the tiers that were read instead of only the ones that failed.
+rm -f "$O/.pool-err" "$O/.pool-read"
 {
-  gh issue list --repo "$OR" --state open --limit 300 --label P0-blocker --json number,assignees,title \
-    --jq '.[]|select((.assignees|length)==0)|select(.title|test("^(epic|lane|OWNER DECISION|decision|analysis|investigation)";"i")|not)|"0 \(.number)"' 2>>"$O/.pool-err" || echo "P0-blocker" >> "$O/.pool-err"
-  gh issue list --repo "$OR" --state open --limit 200 --label P1-severe --json number,assignees,title \
-    --jq '.[]|select((.assignees|length)==0)|select(.title|test("^(epic|OWNER DECISION)";"i")|not)|"1 \(.number)"' 2>>"$O/.pool-err" || echo "P1-severe" >> "$O/.pool-err"
-  gh issue list --repo "$OR" --state open --limit 200 --label P2-moderate --json number,assignees,title \
-    --jq '.[]|select((.assignees|length)==0)|select(.title|test("^(epic|OWNER DECISION)";"i")|not)|"2 \(.number)"' 2>>"$O/.pool-err" || echo "P2-moderate" >> "$O/.pool-err"
+  if gh issue list --repo "$OR" --state open --limit 300 --label P0-blocker --json number,assignees,title \
+    --jq '.[]|select((.assignees|length)==0)|select(.title|test("^(epic|lane|OWNER DECISION|decision|analysis|investigation)";"i")|not)|"0 \(.number)"' 2>>"$O/.pool-err"; then echo "P0-blocker" >> "$O/.pool-read"
+  else echo "P0-blocker" >> "$O/.pool-err"; fi
+  if gh issue list --repo "$OR" --state open --limit 200 --label P1-severe --json number,assignees,title \
+    --jq '.[]|select((.assignees|length)==0)|select(.title|test("^(epic|OWNER DECISION)";"i")|not)|"1 \(.number)"' 2>>"$O/.pool-err"; then echo "P1-severe" >> "$O/.pool-read"
+  else echo "P1-severe" >> "$O/.pool-err"; fi
+  if gh issue list --repo "$OR" --state open --limit 200 --label P2-moderate --json number,assignees,title \
+    --jq '.[]|select((.assignees|length)==0)|select(.title|test("^(epic|OWNER DECISION)";"i")|not)|"2 \(.number)"' 2>>"$O/.pool-err"; then echo "P2-moderate" >> "$O/.pool-read"
+  else echo "P2-moderate" >> "$O/.pool-err"; fi
 } | sort -k1,1n -k2,2n | awk '!seen[$2]++ {print $2}' > "$O/.pool"
 # ⛔ AN UNWRITTEN POOL IS NOT AN EMPTY ONE, and the test for it is the redirect's STATUS, not the
 # FILE's existence: a `.pool` left behind by an earlier run satisfied a `[ -f ]` test while THIS run's
@@ -626,20 +672,93 @@ rm -f "$O/.pool-err"
 # turns the extracted pipeline into a syntax error and reddens the #8465 severity-ordering check —
 # which would then stop covering the very ordering the pool depends on.
 pool_rc=$?
+
+# ── THE POOL'S READ STATE: EMPTY, PARTIAL or UNREADABLE (agent-infra#1931) ────────────────────
+# ⛔ A LAYER THAT CANNOT SEE MUST NOT REPORT AN EMPTY QUEUE. Measured 2026-10-17: a cell whose pool
+# listing failed refused correctly on 131 consecutive passes and dispatched nothing while 15 PRs sat
+# open — and `backlog=0` in the controller's cycle line was indistinguishable from a fleet with
+# nothing to do. So the read's outcome is now a NAMED state, in ONE vocabulary, and `EMPTY` is
+# reserved for the only answer that may ever mean "no work":
+#   EMPTY         every priority tier was READ, and the pool listed no dispatchable issue.
+#   READ(<n>)     every priority tier was read, and n candidate(s) were listed. A non-empty pool is
+#                 never labelled EMPTY; it is a third, plainly-different readable answer.
+#   PARTIAL(<t>)  some tiers were read and <t> were NOT — the survivors are a SUBSET, never a
+#                 complete pool, so nothing is queued from it (#1736).
+#   UNREADABLE    NO tier could be read. The fleet is BLIND to the backlog, and that is not "nothing
+#                 to do" — it is the state this whole change exists to make visible.
+# The state is persisted WITH the epoch of the read, so the controller's heartbeat line can carry it
+# (orch-loop.sh's queue_state_token prints it together with its age, so a frozen value cannot pass
+# as a fresh one). It is the READ's state, not the backlog's: it stays true even when a later step of
+# this pass refuses, and it never overrides the fail-closed refusals below.
+QUEUE_STATE_FILE="$O/state/queue-state"
+queue_state_write() {  # <STATE> — record what THIS pass learned about the pool, for the heartbeat
+  mkdir -p "$O/state" 2>/dev/null
+  if ! printf '%s %s\n' "$1" "$(date +%s)" > "$QUEUE_STATE_FILE" 2>/dev/null; then
+    # NOT fatal on purpose: this is the REPORTING contract, not the gate. The pass still refuses or
+    # queues exactly as before; what is lost is the heartbeat's copy of the state, and it says so
+    # rather than leaving a previous pass's reading standing in for this one.
+    echo "[refresh] WARN: cannot record the pool read state into $QUEUE_STATE_FILE — the heartbeat will not carry whether this pass could SEE the pool (agent-infra#1931)"
+  fi
+}
+# Which of the three tiers answered. A tier that recorded NEITHER outcome did not answer, so it
+# counts as FAILED: a read whose outcome cannot be proven is not a read (fail-closed).
+POOL_READ=""; POOL_FAILED=""
+for _tier in P0-blocker P1-severe P2-moderate; do
+  if grep -qx "$_tier" "$O/.pool-read" 2>/dev/null; then POOL_READ="$POOL_READ $_tier"
+  else POOL_FAILED="$POOL_FAILED $_tier"; fi
+done
+POOL_READ="${POOL_READ# }"; POOL_FAILED="${POOL_FAILED# }"
+
 if [ "$pool_rc" -ne 0 ]; then
+  # The listing ran but could not be CAPTURED, so this pass has no pool it can trust — blind, not empty.
+  queue_state_write "UNREADABLE"
+  echo "[refresh] queue=UNREADABLE — the pool listing could not be CAPTURED into $O (rc=$pool_rc), so this pass is blind to the backlog; that is not \"nothing to do\" (agent-infra#1931)"
   echo "[refresh] ABORT: cannot write the candidate pool into $O — the pool this pass would read is not the one it just listed"
   exit "$EXIT_TRANSIENT"
 fi
 
 # ⛔ AN UNREADABLE POOL IS NOT AN EMPTY ONE. TRANSIENT on purpose: the failure says nothing about
 # WHICH host would come back, and a marker only a human can clear must not be latched on a guess.
-if [ -s "$O/.pool-err" ]; then
-  echo "[refresh] ABORT: the candidate pool listing FAILED for $(grep -oE 'P[012]-[a-z]+' "$O/.pool-err" | tr '\n' ' ')— a partial pool is not a backlog (#1736)"
+# The state is written and printed BEFORE the abort, so the refusal and the heartbeat agree.
+if [ -n "$POOL_FAILED" ]; then
+  if [ -n "$POOL_READ" ]; then
+    # The argument names the tiers that could NOT be read, comma-joined (no spaces: the token is one
+    # field in a log line a human and a grep both read).
+    POOL_STATE="PARTIAL($(printf '%s' "$POOL_FAILED" | tr ' ' ','))"
+    queue_state_write "$POOL_STATE"
+    echo "[refresh] queue=$POOL_STATE — the pool listing could not be read for $POOL_FAILED (read: $POOL_READ), so the survivors are a SUBSET, not a complete pool, and nothing is queued from it (#1736, agent-infra#1931)"
+    # The refusal says which of the two shapes it is: a partial pool, or no pool at all.
+    echo "[refresh] ABORT: the candidate pool listing FAILED for $POOL_FAILED — a partial pool is not a backlog (#1736)"
+  else
+    POOL_STATE="UNREADABLE"
+    queue_state_write "$POOL_STATE"
+    echo "[refresh] queue=$POOL_STATE — NO priority tier could be read ($POOL_FAILED FAILED), so the fleet is BLIND to the backlog; \"no candidates\" here is NOT \"nothing to do\" (agent-infra#1931)"
+    echo "[refresh] ABORT: the candidate pool listing FAILED for $POOL_FAILED — no tier could be read, so there is NO pool to dispatch from (#1736)"
+  fi
   sed -n '1,6p' "$O/.pool-err" | sed 's/^/[refresh]   /'
-  rm -f "$O/.pool-err"
+  rm -f "$O/.pool-err" "$O/.pool-read"
   exit "$EXIT_TRANSIENT"
 fi
-rm -f "$O/.pool-err"
+rm -f "$O/.pool-err" "$O/.pool-read"
+# Every tier was read, so EMPTY is now an admissible answer — and the ONLY one that may say "no work".
+POOL_ROWS="$(wc -l < "$O/.pool" 2>/dev/null | tr -d ' ')"
+case "${POOL_ROWS:-}" in
+  ''|*[!0-9]*)
+    # The pool was just written at rc 0, so an unreadable row count means the file is gone or was
+    # replaced under us. UNKNOWN is not empty: refuse rather than report a backlog nobody counted.
+    queue_state_write "UNREADABLE"
+    echo "[refresh] queue=UNREADABLE — the pool was written but its row count could NOT be read, so this pass cannot say what it listed; that is not \"nothing to do\" (agent-infra#1931)"
+    echo "[refresh] ABORT: cannot count the candidate pool at $O/.pool — refusing to report a backlog this pass did not measure (#1736)"
+    exit "$EXIT_TRANSIENT" ;;
+esac
+if [ "$POOL_ROWS" -eq 0 ]; then
+  POOL_STATE="EMPTY"
+  echo "[refresh] queue=$POOL_STATE — every priority tier was READ and listed no dispatchable issue: this pass can SEE the pool, and it is genuinely empty (agent-infra#1931)"
+else
+  POOL_STATE="READ($POOL_ROWS)"
+  echo "[refresh] queue=$POOL_STATE — every priority tier was READ; $POOL_ROWS candidate(s) listed (agent-infra#1931)"
+fi
+queue_state_write "$POOL_STATE"
 
 n=0
 # `usable` counts the verdicts the pre-flight produced that the caller can act on: CLEAN, COLLISION,
@@ -652,6 +771,10 @@ usable=0
 # `judged`, so neither over-states the pass by one (#1853 review).
 judged=0
 degraded=0
+# Issue-claim outcomes for THIS pass, so a run whose registry answered nothing can NAME the registry
+# instead of looking like a healthy cell with an empty pool (2026-10-16 review: `lanes: 0` and an
+# unreadable registry were indistinguishable from the outside, and the per-issue lines scroll away).
+ICR_INCOMPLETE=0; QUEUED=0
 while read -r N; do
   [ -z "${N:-}" ] && continue
   grep -qx "$N" "$O/checked.txt" 2>/dev/null && continue
@@ -713,30 +836,26 @@ while read -r N; do
         # The tool above reads only immutable history and per-machine git state, so it reports CLEAN
         # for an issue a PEER started ten seconds ago and has not pushed yet. Read the registry
         # before certifying: an issue claim is a claim on the WORK, and it exists before the first
-        # push. `$CLAIMS_SH` may be unset here (the loop body is extracted and driven on its own by
-        # the regression suite), hence `${CLAIMS_SH:-$O/claims.sh}` rather than a bare expansion.
+        # push. The registry is resolved from `$O`, which the loop has already resolved: there is no
+        # `CLAIMS_SH` seam (an ambient value could have half-disabled the gate).
         ICR=0
-        if [ -f "${CLAIMS_SH:-$O/claims.sh}" ]; then
+        # ⛔ A MISSING REGISTRY IS `ICR=0` ON PURPOSE — the documented loud fallthrough (see
+        # issue_claim_verdict's STATED LIMIT), and the only case in which a box without the registry
+        # keeps dispatching. It is NOT a verdict: the branch below announces it every time.
+        if [ -f "$O/claims.sh" ]; then
           # `cmd; rc=$?` rather than `if cmd; then …; else rc=$?; fi` — one shape, no reliance on the
           # condition's status surviving into the else branch.
           issue_claim_verdict "$N"; ICR=$?
         else
-          echo "[refresh] ⚠️ #$N: no claim registry at ${CLAIMS_SH:-$O/claims.sh} — the cross-box issue-claim check is OFF on this box (install.sh seeds claims.sh into \$O)"
+          echo "[refresh] ⚠️ #$N: no claim registry at $O/claims.sh — the cross-box issue-claim check is OFF on this box (seed it: cp scripts/orchestrator-harness/*.sh ~/orchestrator/)"
         fi
+        # ⛔ THE CLEAN ARM IS NAMED, NOT THE WILDCARD (2026-10-16 review). `case 1) … 2) … *) CLEAN`
+        # read EVERY other code — 127 from a missing function, and any code a foreign or future
+        # registry might return — as CLEAN and queued the issue: fail-OPEN, in the one place this
+        # block declares it never fails open. A verdict this reader does not recognise is not a
+        # licence to dispatch; it is an INCOMPLETE. Only an explicit 0 queues.
         case "$ICR" in
-          1) # a live claim: a peer owns it. Leave it UNCHECKED so the next pass re-attempts it —
-             # a claim is a window, not a verdict (the peer's work lands).
-             # ⛔ AND IT IS USABLE — it is a COLLISION, which is one of the three verdicts the caller
-             # can act on. Without this the pool property-assertion below reads an ALL-claim-held pool
-             # as "judged NOTHING" and aborts rc=1 every cycle, in exactly the cross-box-collision
-             # state this check exists for, while the pass has already printed a verdict per candidate
-             # (#1853 review). ICR=2 (INCOMPLETE) stays uncounted — that is not a verdict.
-             usable=$((usable + 1))
-             echo "[refresh] =#$N COLLISION (cross-box issue claim) — $CLAIM_RESULT; retried next pass" ;;
-          2) # unreadable registry: INCOMPLETE, never CLEAN. Also left unchecked, so the issue is
-             # re-attempted rather than lost, and NOT queued, so nothing is dispatched on a guess.
-             echo "[refresh] ?#$N INCOMPLETE — $CLAIM_RESULT; not queued, retried next pass" ;;
-          *)
+          0)
             # ⛔ EVERY STATE WRITE IS CHECKED, AND THE PERMANENT ONE GOES LAST. `checked.txt` is what
             # makes an issue invisible to LATER passes — it is reclaimed only for numbers that reached
             # `dispatched.txt` — so writing it BEFORE the queue entry made a failed append to
@@ -757,7 +876,30 @@ while read -r N; do
               exit "${EXIT_TRANSIENT:-1}"
             fi
             usable=$((usable + 1))
+            QUEUED=$((QUEUED + 1))
             echo "[refresh] +#$N CLEAN -> backlog" ;;
+          1) # a live claim: a peer owns it. Leave it UNCHECKED so the next pass re-attempts it —
+             # a claim is a window, not a verdict (the peer's work lands).
+             # ⛔ AND IT IS USABLE — it is a COLLISION, which is one of the three verdicts the caller
+             # can act on. Without this the pool property-assertion below reads an ALL-claim-held pool
+             # as "judged NOTHING" and aborts rc=1 every cycle, in exactly the cross-box-collision
+             # state this check exists for, while the pass has already printed a verdict per candidate
+             # (#1853 review). ICR=2 (INCOMPLETE) stays uncounted — that is not a verdict.
+             usable=$((usable + 1))
+             echo "[refresh] =#$N COLLISION (cross-box issue claim) — $CLAIM_RESULT; retried next pass" ;;
+          2) # unreadable registry: INCOMPLETE, never CLEAN. Also left unchecked, so the issue is
+             # re-attempted rather than lost, and NOT queued, so nothing is dispatched on a guess.
+             ICR_INCOMPLETE=$((ICR_INCOMPLETE + 1))
+             echo "[refresh] ?#$N INCOMPLETE — $CLAIM_RESULT; not queued, retried next pass" ;;
+          3) # PRESENT BUT STALE: a local, PERMANENT provisioning failure. Refusing per-issue would
+             # queue nothing forever while the cell still reported RUNNING (the merge-only defect this
+             # script has been fixed for twice), so take it to the provisioning channel: orch-loop.sh
+             # records `.refresh-blocked`, stops retrying, and `status` names the reason.
+             echo "[refresh] NOT PROVISIONABLE: ${CLAIM_RESULT:-$O/claims.sh cannot answer the issue-claim question}"
+             echo "[refresh]   fix: cp scripts/orchestrator-harness/*.sh ~/orchestrator/  (then re-run)"
+             exit "${EXIT_NOT_PROVISIONABLE:-3}" ;;
+          *) ICR_INCOMPLETE=$((ICR_INCOMPLETE + 1))
+             echo "[refresh] ?#$N INCOMPLETE — the registry returned an UNRECOGNISED verdict (rc=$ICR); not queued, retried next pass" ;;
         esac
       fi ;;
     COLLISION)
@@ -789,6 +931,18 @@ while read -r N; do
       echo "[refresh] ?#$N no verdict from the pre-flight — left unchecked for the next pass" ;;
   esac
 done < "$O/.pool"
+# ── a pass the registry answered NOTHING for is not a healthy pass (2026-10-16 review) ──────────
+# The per-issue INCOMPLETE lines scroll away, and `lanes: 0` with `backlog=0` is exactly what a quiet
+# box looks like, so a git-transport-only outage (gh and the merge path both still working) or a
+# stale registry would leave every cell on the repo dispatching nothing while looking healthy. The
+# aggregate names the registry as the cause, and it is printed BEFORE the no-usable-verdict abort
+# below so that abort is not the only line that mentions it. ⚠️ There is deliberately NO SECOND
+# transient exit here: the `usable -eq 0` assertion below already exits TRANSIENT when every
+# candidate was INCOMPLETE, and exiting on `ICR_INCOMPLETE>0 && QUEUED==0` would also red a pass whose
+# whole pool is peer-owned COLLISIONs — an empty backlog for a legitimate reason (#1853 review).
+if [ "$ICR_INCOMPLETE" -gt 0 ]; then
+  echo "[refresh] $ICR_INCOMPLETE of $judged pre-flighted issues INCOMPLETE — the cross-box claim registry could not answer; $QUEUED queued"
+fi
 # ⛔ WHAT THIS DOES NOT COVER: the stall that leaves a HEALTHY-LOOKING NON-EMPTY backlog. A
 # persistently-colliding issue consumes the whole window while `checked N; backlog now M` still
 # prints and M > 0 — `COLLISION` counts as usable, so that class is invisible here. It is
