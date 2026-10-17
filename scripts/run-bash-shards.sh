@@ -125,6 +125,7 @@ run_shard scripts/checkout-hygiene/deepseek-balance-watch.test.sh          # #47
 run_shard scripts/checkout-hygiene/hub-state-check.test.sh                 # #1313 the DETECTOR (clean-but-stale PASS matrix)
 run_shard scripts/checkout-hygiene/hub-worktree.test.sh                    # #1309/#1313 the RECOVERY half
 run_shard scripts/install-launchd.test.sh                                  # #304 installer suite
+run_shard scripts/fleet-schedule.test.sh                                   # #1864 the portable scheduler: the repo's plists are READ (not hand-ported), install ends with a run, and --verify fails on a dead/stale/never-run/overdue schedule
 run_shard scripts/pi-reap-idle.test.sh                                     # #469 session reaper (fake PS/KILL/DATE shims)
 run_shard scripts/pi-task-session-prune.test.sh                            # #783 retention sweep (dry-run default)
 run_shard scripts/pi-reap-worktrees.test.sh                                # #1095 worktree reaper gates

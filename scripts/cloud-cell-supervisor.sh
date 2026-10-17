@@ -894,11 +894,49 @@ cmd_check() {
   say "CELL CAN RUN A CONTROLLER"
 }
 
+# ── the scheduled layer (agent-infra#1864) ──────────────────────────────────────────────────────
+# A cell has no launchd, no crontab binary and no systemd user bus, so the repo's recurring jobs
+# (declared once, as templates/launchd/*.plist) run from a supervised loop: scripts/fleet-schedule.py.
+# `cloud-cell-bringup.sh --check` installs and proves it; THIS is where it is brought back up
+# whenever the cell is started again — `start` is the cell's own "the cell is now alive" signal, so
+# a loop that died while the controller kept running must not need a whole bring-up to recover.
+#
+# ⛔ IDEMPOTENT AND ON THE ALREADY-RUNNING PATH, both deliberately: the early return below is hit
+# by the common `start`-after-`stop`, and placing this after it is how the loop would stay dead.
+# ⛔ A MISSING SCRIPT IS A WARN, NOT A DIE: a cell whose layer predates this line must still be
+# startable (that cell's gap is what bring-up reports). A script that EXISTS and refuses to start
+# IS fatal — a cell running lanes with no reaping and no liveness detection is the defect.
+scheduler_ensure() {
+  local sched="$CELL_HOME/.pi/agent/scripts/fleet-schedule.py" out rc=0
+  if [ ! -f "$sched" ]; then
+    say "warn: no scheduled layer on this cell ($sched is absent) — no reap/liveness/canary job will run; re-run cloud-cell-bringup.sh --check"
+    return 0
+  fi
+  out="$(HOME="$CELL_HOME" CELL_HOME="$CELL_HOME" python3 "$sched" --start 2>&1)" || rc=$?
+  # rc=3 is the scheduler's own "no job declarations found" (its documented contract): the layer's
+  # script is present but nothing tells it WHERE the declarations are, i.e. this cell was never
+  # installed by the current bring-up. That must NOT brick the controller — bring-up is the gate
+  # that installs and proves the layer — but it must never pass quietly either.
+  if [ "$rc" -eq 3 ]; then
+    printf '%s\n' "$out" | sed 's/^/    /' >&2
+    say "warn: the scheduled layer has no job declarations on this cell — no reap/liveness/canary job will run; re-run cloud-cell-bringup.sh --check"
+    return 0
+  fi
+  if [ "$rc" -ne 0 ]; then
+    printf '%s\n' "$out" | sed 's/^/    /' >&2
+    die "the scheduled layer would not start (rc=$rc) — this cell would run with no reaping, no liveness detection and no canary (#1864)"
+  fi
+  # One line, so `start` never becomes the place a scheduler is assumed rather than seen.
+  say "scheduled layer: $(printf '%s\n' "$out" | head -1)"
+}
+
 # ── start: controller under tmux (the launchd substitution) ─────────────────────
 cmd_start() {
   # Refuse a bad SCOPE before anything starts or is written (validate_scope is also the first thing
   # cmd_check does below — this call is what keeps the refusal ahead of the $O seed).
   validate_scope
+  # BEFORE the already-running early return: see scheduler_ensure's header.
+  scheduler_ensure
   # Guard BEFORE seeding. $O is the controller's working copy and `start` on a live cell would
   # otherwise replace the worker scripts its next spawn executes (and race a half-copied script).
   # Nothing is started or written on this path, so a bad value below cannot hurt it.
