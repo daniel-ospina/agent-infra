@@ -305,26 +305,31 @@ fi
 # $DEST/scripts/, which is this farm's destination.
 #
 # ⚠️ PARTIAL BY CONSTRUCTION — declared here, not left to be discovered. RE-MEASURED 2026-10-16: the
-# VERSIONED half of the SAME layer is seven producers, and the farm used to carry NONE of them, so a
-# box rebuilt from this file got every farmed CONSUMER without the PRODUCER it executes. FIVE of the
-# seven now join THIS array (`lane-actions.py`, `lane-watchdog.py`, `objective.py`, `cadence-nudge.sh`,
-# `publish-live-workspaces.py`). FOUR are exec'd by a caller THIS array already farms:
-#   * `lane-actions.py`  <- pr-doctor.py:238, lane-scan-fallback.sh:98 (both farmed; also
-#                           heartbeat-loop.sh:315, withheld — see below)
-#   * `objective.py`     <- cadence-nudge.sh:256,400 and orchestrator-heartbeat.sh:224 (both farmed),
-#                           plus lane-scan-fallback.sh step 0 (`objective.last`)
-#   * `cadence-nudge.sh` <- cadence-timer.sh:60 (the single cadence driver, farmed)
-#   * `publish-live-workspaces.py` <- live-workspaces-publisher.py:31 (farmed)
-# The FIFTH, `lane-watchdog.py`, is NOT needed by a farmed caller today: its ONLY caller is
-# `heartbeat-loop.sh:348,350`, and `heartbeat-loop.sh` is itself withheld pending #1553 (below). It is
-# farmed NOW so #1553's landing cannot yield a fresh farm whose caller is present and whose producer
-# is absent.
+# VERSIONED half of the SAME layer is a set of producers, and the farm used to carry NONE of them, so a
+# box rebuilt from this file got every farmed CONSUMER without the PRODUCER it executes. Five were
+# added to THIS array by that measurement (`lane-actions.py`, `lane-watchdog.py`, `objective.py`,
+# `cadence-nudge.sh`, `publish-live-workspaces.py`) — but WHICH producers exist is **no longer
+# measured here**: since #1899 the farm's own completeness gate
+# (`pi-bootstrap/tests/test-setup-no-nesting.sh`) DERIVES the set from the exec sites in the farmed
+# consumers and fails any producer that is in no array and in no named gap. **That gate is the single
+# source of truth for the population; this paragraph explains WHY the class exists, never which
+# members it has.** Four of the five are exec'd by a caller THIS array already farms; `lane-watchdog.py`
+# is not, and is farmed ahead of its caller (see below). No per-producer caller map is kept here on
+# purpose: every line-numbered edge this paragraph used to carry had already drifted (:238 -> :329 by
+# 2026-10-16), and the gate derives and pins the real edges on every run. Read the gate's
+# `DECLARED-*` / `SUMMARY:` lines, not this comment, for the current population. One producer it
+# cannot see is a NAMED residual, not a blank spot: `cloud-cell-supervisor.sh` is exec'd by the farmed
+# `cloud-cell-quiesce.sh` through a variable-held prefix, so it is in no array and a fresh farm gets the
+# consumer without it (the quiesce then falls back to `supervisor: <none found>`) — #1938 owns whether
+# it is delivered or stays cell-only.
 # They farm FLAT for the same reason as the rest of this list (the layer resolves siblings as
-# `$SCRIPTS/<name>` at $DEST/scripts/). Measured before the edit: absent from `fleet_srcs` AND from
-# every other farm array, so on a fresh `$DEST/scripts` each consumer either failed closed or failed
-# silent. Byte-identity repo↔live for these five was the #1795 residual measurement (2026-10-15).
+# `$SCRIPTS/<name>` at $DEST/scripts/).
+# `lane-watchdog.py`'s ONLY caller is `heartbeat-loop.sh`, and `heartbeat-loop.sh` is itself withheld
+# pending #1553 (below) — so it is farmed NOW, ahead of its caller, so that #1553's landing cannot
+# yield a fresh farm whose caller is present and whose producer is absent. The other four are reached
+# from callers this array already delivers.
 #
-# TWO of the seven are STILL not carried by this array, deliberately:
+# TWO are STILL not carried by this array, deliberately:
 #   * `lane-status.py` — the DESTINATION is ahead (repo 1993 lines / live 2005 at the 2026-10-15
 #     measurement; the live copy carries the #1777 abstention text, in flight in #1784). Farming the
 #     repo copy would OVERWRITE the running classifier with an older one — the fail-dangerous
@@ -333,19 +338,35 @@ fi
 #     because `lane-status.py` is.
 # #1553 owns both: it declares `lane_root_srcs=(lane-status.py heartbeat-loop.sh)` and sources them
 # from `scripts/` once `lane-status.py`'s live bytes land. Until then the gap is declared, and
-# `pi-bootstrap/tests/test-setup-no-nesting.sh` names the two explicitly so it can never go quiet —
-# that check asserts every one of the seven is ACCOUNTED FOR — declared in a farm array (`fleet_srcs`
-# or #1553's `lane_root_srcs`) or named as the two-file declared gap — and fails a producer that is in
-# neither array AND not so named. The repo↔deployed identity instrument
-# that would report drift continuously is #1760/#1759's — not this list's.
+# `pi-bootstrap/tests/test-setup-no-nesting.sh` makes the declaration do WORK: since #1899 that check
+# DERIVES its population from the exec sites in these consumers (transitively, so `lane-watchdog.py`
+# is reached through `heartbeat-loop.sh`) and fails any derived producer that is declared in NEITHER
+# farm array nor one of the named gaps. It is no longer a hand list that can fall behind the code —
+# adding an exec site is what changes the population, and the change must be dispositioned. The
+# repo↔deployed identity instrument that would report drift continuously is #1760/#1759's — not
+# this list's.
 # The same applies one directory over, to the `state/`-resident dependencies of the farmed consumers.
-# TWO of them are read FAIL-SILENTLY and are therefore invisible when absent — `state/lane-confirm.py`
-# (a non-zero exit is read as "screened, not stalled"; see the filed #1797) and
-# `state/lane-triage.py` (`2>/dev/null || log "NOTE triage unavailable"`). The third,
-# `state/queues/claim.py`, is NOT in that class: its read fails LOUDLY — `claim_next()` raises
-# `QueueReadError` and the caller prints `READ-FAILED <lane>: … withholding this lane (NOT read as
-# empty)` — while its RELEASE paths (`free`/`done`) do ignore their result. None of the three is in
-# any farm list.
+# The farm NEVER creates or copies into `$DEST/state/` — no `mkdir` and no `cp` target it anywhere in
+# this file (measured at #1899) — so these are broken on every fresh farm. #1899's derivation found
+# FIVE of them, not three:
+#   * `state/lane-confirm.py`  — read FAIL-SILENTLY (a non-zero exit is read as "screened, not
+#                                stalled"; see the filed #1797); exec'd through a hardcoded
+#                                /Users/<owner>/ absolute path at orchestrator-heartbeat.sh:336.
+#   * `state/lane-triage.py`   — read FAIL-SILENTLY (`2>/dev/null || log "NOTE triage unavailable"`,
+#                                orchestrator-heartbeat.sh:636); delivery owned by #1553.
+#   * `state/lane-verdict.py`  — the verdict-KEY LOADER (`lane-actions.py:80,1530`); absent it
+#                                degrades to `RULE` silently. Found by #1899's derivation, disclosed
+#                                to the #1552 umbrella.
+#   * `state/queues/claim.py`  — NOT in the silent class: its read fails LOUDLY (`claim_next()`
+#                                raises `QueueReadError` and the caller prints `READ-FAILED <lane>:
+#                                … withholding this lane (NOT read as empty)`), while its RELEASE
+#                                paths (`free`/`done`) do ignore their result. Untracked per #1567.
+#   * `state/queues/refresh-queues.py` — the queue REFRESH (`heartbeat-loop.sh:415`, non-fatal:
+#                                `|| echo "queue refresh failed (non-fatal; dispatcher uses the last
+#                                known-good queue)"`), so a fresh farm silently keeps refreshing
+#                                nothing. Untracked per #1567.
+# None of the five is in any farm list, and `test-setup-no-nesting.sh` names each with its owning
+# issue so the class cannot grow a silent member.
 # ⛔ Keep this assignment on ONE line: `scripts/ci_runner_gate.test.sh` reads it with
 # `sed -n 's/^fleet_srcs=(\(.*\))$/\1/p'`, so a wrapped array reads as EMPTY and that gate's
 # membership assertion goes RED. (Loud, not silent — do not describe it as vacuous.)
