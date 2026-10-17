@@ -157,8 +157,11 @@ PR="${PR:-$(( (RANDOM << 15 | RANDOM) % 900000 + 100000 ))}"
 # is the one ref whose identity is the number ALONE — and the teardown FORCE-DELETES it. If a repo's
 # issue numbers ever reached this band, teardown would delete a live box's claim, and a peer reading
 # the registry afterwards would see that issue as free. ONE implementation of the choice, used for
-# EVERY bare `issue-<N>` key this suite creates (the main key and the I9 probe — the probe originally
-# picked `ISSUE + 77` unchecked, which reintroduced exactly this defect).
+# EVERY bare `issue-<N>` key this suite CHOOSES (the main key and the I9 probe — the probe originally
+# picked `ISSUE + 77` unchecked, which reintroduced exactly this defect). The one exception is a
+# caller-supplied `ISSUE=`, honoured as-is so a run can be reproduced; and the `+1` bumps used to keep
+# the probe distinct are never re-checked against origin, so a peer claiming exactly that number in the
+# window between the choice and the acquire is handled by the acquire's own fence, not by this helper.
 unclaimed_issue_number() { # -> a number whose refs/claims/issue-<N> does not exist on origin (rc=1 if none)
   local n tries=0
   while [ "$tries" -lt 10 ]; do
@@ -167,6 +170,15 @@ unclaimed_issue_number() { # -> a number whose refs/claims/issue-<N> does not ex
     tries=$(( tries + 1 ))
   done
   return 1
+}
+# ⛔ THE FENCE'S DECISION, AS A FUNCTION, SO IT CAN BE TESTED DIRECTLY. `rc1` is the acquire's own
+# outcome and `own` its `CLAIM_COMMIT`; `now` is the ref's current tip. An acquire that LOST a race
+# returns rc1 != 0 and leaves the WINNER's commit as the tip — so fencing on "the tip equals what I
+# read" would delete a live claim. The rc1 test is therefore part of the fence, not a caller's
+# convenience (VGATE finding on the first draft of this teardown).
+probe_fence() { # <rc1> <own> <now> -> "delete" | "skip"
+  [ "$1" = "0" ] && [ -n "$2" ] && [ "$3" = "$2" ] && { printf 'delete'; return 0; }
+  printf 'skip'
 }
 if [ -n "${ISSUE:-}" ]; then ISSUE_SET=1; else ISSUE_SET=0; fi
 if [ "$ISSUE_SET" -eq 0 ]; then
@@ -837,9 +849,14 @@ PROBE_REF="refs/claims/issue-$PROBE_ISSUE"
 # only ref this suite may delete for the probe. The teardown below fences on it, NEVER on whatever
 # tip happens to be there (a lease on the observed value is not an ownership check: $A is wired to
 # the LIVE origin, so "delete whatever is there" can destroy a peer's claim).
+# ⛔ `own` IS `CLAIM_COMMIT`, NOT THE OBSERVED TIP (VGATE finding). `claims.sh` sets it ONLY on a
+# SUCCESSFUL acquire; an acquire that lost a race to a live peer returns rc=1 and leaves the PEER's
+# commit as the tip. Reading the tip here would hand the teardown the peer's commit as if it were
+# ours — the fence would pass, and the delete would destroy a live claim. That is precisely the hazard
+# this whole change exists to close, so the value must come from the acquire's own outcome.
 probe_out=$( ( cd "$A" && export CLAIM_OWNER_ID=boxA && . "$CLAIMS_SH"
                claim_issue_acquire 0 "$PROBE_ISSUE" 600 >/dev/null 2>&1; r1=$?
-               own="$(git ls-remote origin "refs/claims/issue-$PROBE_ISSUE" 2>/dev/null | awk '{print $1}')"
+               own="${CLAIM_COMMIT:-}"
                CLAIM_REPO="$A/definitely-not-a-repo"
                claim_issue_acquire 0 "$PROBE_ISSUE" 600 >/dev/null 2>&1; r2=$?
                printf '%s|%s|%s|%s' "$r1" "$r2" "${CLAIM_COMMIT:-}" "$own" ) )
@@ -851,21 +868,36 @@ ck "I9: an acquire against an UNREADABLE registry returns rc=2" "^2$" "$probe_rc
 [ -z "$probe_commit" ] \
   && { echo "  ✅ a failed acquire leaves CLAIM_COMMIT EMPTY (no previous issue's commit)"; PASS=$((PASS+1)); } \
   || { echo "  ❌ a failed acquire carried a STALE CLAIM_COMMIT ($probe_commit) — orch-loop would write a release record for an issue this box never claimed"; FAIL=$((FAIL+1)); }
-# remove ONLY our own probe ref: the lease is the commit THIS run pushed, so a peer's claim at that
-# number (which cannot exist, the key was chosen unclaimed — but a race could) survives untouched.
-if [ -z "$probe_own" ]; then
-  echo "  ❌ the probe's own claim commit is unknown — refusing to delete anything at $PROBE_REF"
-  FAIL=$((FAIL+1))
-else
-  probe_now="$(git -C "$A" ls-remote origin "$PROBE_REF" | awk '{print $1}')"
-  [ "$probe_now" = "$probe_own" ] \
-    && { git -C "$A" push -q --force-with-lease="$PROBE_REF:$probe_own" origin ":$PROBE_REF" 2>/dev/null
-         echo "  ✅ the probe ref is removed from origin (fenced on OUR commit)"; PASS=$((PASS+1)); } \
-    || { echo "  ⚠️ the probe ref moved (${probe_now:-<gone>} != $probe_own) — leaving it alone"; PASS=$((PASS+1)); }
+# remove ONLY our own probe ref: the lease is the commit THIS run's acquire created. When the acquire
+# did not win (rc1 != 0, so `own` is empty) nothing at all is deleted — a ref there belongs to whoever
+# won, and "it must be mine because I asked" is exactly the reasoning that deletes a peer's claim.
+probe_owned=0; probe_now=""
+[ "$probe_rc1" = "0" ] && probe_now="$(git -C "$A" ls-remote origin "$PROBE_REF" | awk '{print $1}')"
+case "$(probe_fence "$probe_rc1" "$probe_own" "$probe_now")" in
+  delete)
+    probe_owned=1
+    git -C "$A" push -q --force-with-lease="$PROBE_REF:$probe_own" origin ":$PROBE_REF" 2>/dev/null
+    echo "  ✅ the probe ref is removed from origin (fenced on OUR commit)"
+    PASS=$((PASS+1)) ;;
+  *)
+    if [ "$probe_rc1" != "0" ]; then
+      echo "  ⚠️ the probe never held a claim (rc1=$probe_rc1) — deleting NOTHING at $PROBE_REF"
+    else
+      echo "  ⚠️ the probe ref moved (${probe_now:-<gone>} != ${probe_own:-<none>}) — leaving it alone"
+    fi
+    PASS=$((PASS+1)) ;;
+esac
+# the DECISION TABLE itself — including the case the VGATE found: the acquire lost the race, yet the
+# tip happens to equal the value we read, so a tip-only fence would have deleted the winner's claim.
+ck "I9: the fence deletes when the acquire won and the tip is still ours" "^delete$" "$(probe_fence 0 abc abc)"
+ck "I9: the fence deletes NOTHING when the acquire LOST the race (tip == what we read)" "^skip$" "$(probe_fence 1 abc abc)"
+ck "I9: the fence deletes NOTHING when the tip moved" "^skip$" "$(probe_fence 0 abc def)"
+ck "I9: the fence deletes NOTHING with no commit of our own" "^skip$" "$(probe_fence 0 '' abc)"
+if [ "$probe_owned" = "1" ]; then
+  probe_left="$(git -C "$A" ls-remote origin "$PROBE_REF" | wc -l | tr -d ' ')"
+  [ "$probe_left" = "0" ] && { echo "  ✅ the probe ref is gone"; PASS=$((PASS+1)); } \
+                             || { echo "  ❌ the probe ref leaked ($PROBE_REF)"; FAIL=$((FAIL+1)); }
 fi
-probe_left="$(git -C "$A" ls-remote origin "$PROBE_REF" | wc -l | tr -d ' ')"
-[ "$probe_left" = "0" ] && { echo "  ✅ the probe ref is gone"; PASS=$((PASS+1)); } \
-                           || { echo "  ❌ the probe ref leaked ($PROBE_REF)"; FAIL=$((FAIL+1)); }
 cleanup_issue_ref
 
 echo

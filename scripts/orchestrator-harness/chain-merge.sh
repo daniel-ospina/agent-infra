@@ -53,10 +53,10 @@ release_issue_claim() {
     return 0
   fi
   # ⛔ NO CAPTURED GENERATION → DO NOT RELEASE (acceptance-review finding). The capture at chain start
-  # is empty exactly when the handover record did not exist yet (the `claim_issue_record` in
-  # orch-loop.sh failed — the loop logs that this chain cannot fence the release) or when `$O/claims.sh`
-  # predates the reader. `claim_issue_release_record` treats an EMPTY expectation as "read the record
-  # now", which is right for dispatch-merge.sh (its release is milliseconds after the write) but wrong
+  # is empty when the handover record did not exist yet (the `claim_issue_record` in orch-loop.sh
+  # failed — the loop logs that this chain cannot fence the release), when `$O/claims.sh` predates the
+  # reader, or when the record exists but is unreadable. `claim_issue_release_record` treats an EMPTY
+  # expectation as "read the record now", which is right for dispatch-merge.sh (its release is milliseconds after the write) but wrong
   # HERE: a chain that fires hours later would then fence on whatever generation the record holds —
   # the newer holder's own commit, which IS the ref tip — and delete a live claim. Refusing costs this
   # box one lease; deleting the wrong claim duplicates work on two boxes, so this is the fail-closed

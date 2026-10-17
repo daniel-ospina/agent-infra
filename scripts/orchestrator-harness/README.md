@@ -1006,8 +1006,10 @@ These are kept as a record because each one is a *failure mode of the design*, n
 
 ### 7.4c Defects found in the agent-infra#1850 review (fixed here)
 
-All but one are fail-**open** in a gate whose whole purpose is to refuse: each certifies a busy or
-unverifiable issue as free, hands it to a second box, or lets a release run without its fence. Pinned
+Six of the eight are fail-**open** in a gate whose whole purpose is to refuse: each certifies a busy or
+unverifiable issue as free, hands it to a second box, or lets a release run without its fence. (The two
+that are not: the silent-release row, which leaves the claim **held**, and the `CLAIM_COMMIT` row, which
+is state hygiene.) Pinned
 by `test-claims.sh` (I10, I9(5), I9(7)) and `refresh-scout.test.sh` §8(g) (unrecognised status),
 §9(iii) (stale-registry dispatch), §10 (fenced + generation-guarded release, the CAPTURE that wires
 it, and the no-generation refusal) and §11 (the chain-failure branch). The last three were found in
