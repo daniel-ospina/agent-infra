@@ -175,9 +175,12 @@ def _refuse_if_degraded(rows, where):
     `lane-actions.py --stdin "$SNAP"`, and `lane-scan-fallback.sh` is a second `--stdin` caller.
     ⚠️ CORRECTED 2026-10-13: this named `queue-dispatch` as the invoke-path consumer, which is
     FALSE — `queue-dispatch.py` never references `lane-actions.py` at all (it drives
-    `lane-status.py` / `lane-guard.py`). The real invoke-path consumer is `pr-doctor.py:238`
-    (`lane-actions.py --json`). Both paths are guarded; the tests that pin them live in
-    test_lane_actions.py."""
+    `lane-status.py` / `lane-guard.py`). The real invoke-path consumer is `pr-doctor.py`
+    (the one `lane-actions.py --json` call, found with `rg -n 'lane-actions' scripts/pr-doctor.py`).
+    ⛔ NAMED, NOT NUMBERED (#1872 review round 10): the line number that used to be here was already
+    wrong on `origin/main` by the time anyone read it, and it is not the call today -- a number in a
+    co-deployment pointer rots the moment either file is edited. Both paths are guarded; the tests
+    that pin them live in test_lane_actions.py."""
     if any(r.get("degraded") for r in rows if isinstance(r, dict)):
         raise SystemExit(DEGRADED_MSG + " (%s)" % where)
 
