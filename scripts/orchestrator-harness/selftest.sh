@@ -490,8 +490,14 @@ fi
 # left behind (`rm -f`), and on success the (empty) file must be present — that difference is what
 # lets the reaper tell "the read failed" from "the answer is none". The pre-fix `|| : > "$O/.pr_brs"`
 # wrote an empty file in BOTH cases, which is the fail-open being fixed here. (agent-infra#1705)
-awk '/^if ! gh issue list --repo "\$OR"/{f=1} f{print} f&&/^fi$/{c++; if(c==2) exit}' "$REFRESH" > "$TMP/acq.sh"
-if need "$TMP/acq.sh" "the listing capture is extracted from the shipped refresh-candidates.sh"; then
+# ⛔ THE ANCHOR MOVED WITH THE TRANSPORT (#1962), IT WAS NOT LOOSENED. The capture is now
+# `rest_list …` (a REST helper) instead of `gh issue list …` (GraphQL), so the extraction starts at
+# the helper section — which the captured lines CALL — and still stops after the SECOND capture
+# block. Anchoring below the helpers would have extracted two calls to an undefined function: both
+# "leaves NO .open_iss" checks would then pass for the wrong reason (command-not-found) while the
+# "a SUCCESSFUL empty listing leaves an EMPTY .pr_brs" check below went red.
+awk '/^# ── THE LISTINGS RUN ON THE REST BUCKET/{f=1} f{print} f&&/^fi$/{c++; if(c==2) exit}' "$REFRESH" > "$TMP/acq.sh"
+if need "$TMP/acq.sh" "the listing capture (with its REST helper) is extracted from the shipped refresh-candidates.sh"; then
   A="$TMP/acq"; mkdir -p "$A/fail" "$A/ok"
   cat > "$A/gh" <<'SH'
 #!/bin/bash
@@ -604,7 +610,7 @@ ck "the repo-root path selftest.sh uses resolves to a git working tree" $rc
 # deliberately absent, which also exercises the documented non-fatal-uv path end to end.
 if on_darwin; then
 FB="$TMP/pathbin"; mkdir -p "$FB" "$TMP/sb3/Library/LaunchAgents" "$TMP/sb3/.config" "$TMP/sb3/.pi/agent/scripts"
-for b in tmux gh pi; do printf '#!/bin/bash\nexit 0\n' > "$FB/$b"; chmod +x "$FB/$b"; done
+for b in tmux gh pi jq; do printf '#!/bin/bash\nexit 0\n' > "$FB/$b"; chmod +x "$FB/$b"; done
 ln -s "$HOME/.config/gh" "$TMP/sb3/.config/gh" 2>/dev/null || true
 HOME="$TMP/sb3" O="$TMP/path-o" REPO="$HERE/../.." OR="acme/widget" PATH="$FB:/usr/bin:/bin" bash "$INST" > "$TMP/inst-path.out" 2>&1
 PL3="$TMP/sb3/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
@@ -1993,10 +1999,10 @@ fi
 # patterns (cmux's `cmux-cli-shims` is a real one on this box) resolves the tool to a wrapper that
 # exits 127, and a resolution-only probe reports install success while every lane spawn then fails.
 # Drive the SHIPPED probe block with a fixture whose `pi` resolves but cannot run.
-awk '/^for bin in tmux uv pi gh; do$/{f=1} f{print} f&&/^done$/{exit}' "$INST" > "$TMP/probe.sh"
+awk '/^for bin in tmux uv pi gh jq; do$/{f=1} f{print} f&&/^done$/{exit}' "$INST" > "$TMP/probe.sh"
 if need "$TMP/probe.sh" "the install-time probe is extracted from the shipped install.sh"; then
   PB="$TMP/probe"; mkdir -p "$PB/bin"
-  for b in tmux uv gh; do printf '#!/bin/bash\nexit 0\n' > "$PB/bin/$b"; chmod +x "$PB/bin/$b"; done
+  for b in tmux uv gh jq; do printf '#!/bin/bash\nexit 0\n' > "$PB/bin/$b"; chmod +x "$PB/bin/$b"; done
   # ⛔ The driver runs under install.sh's OWN shell options (`set -euo pipefail`, line 12), not a
   # weaker `set -u`: `_p="$(… || true)"` is reached only because install.sh runs under errexit, and
   # a `set -u`-only driver cannot see the unguarded-assignment regression it exists to pin.
@@ -2014,7 +2020,7 @@ if need "$TMP/probe.sh" "the install-time probe is extracted from the shipped in
   # An EXPORTED shell function named `gh` must NOT satisfy the probe: `command -v` reports it, but a
   # function is not what launchd execs and the daemon PATH has no gh binary at all.
   PB2="$PB/bin2"; mkdir -p "$PB2"
-  for b in tmux uv pi; do printf '#!/bin/bash\nexit 0\n' > "$PB2/$b"; chmod +x "$PB2/$b"; done
+  for b in tmux uv pi jq; do printf '#!/bin/bash\nexit 0\n' > "$PB2/$b"; chmod +x "$PB2/$b"; done
   ( unset -f gh pi uv tmux; gh() { exit 0; }; export -f gh; \
     PATH="$PB2:/usr/bin:/bin" DAEMON_PATH="$PB2" bash "$PB/drive.sh" ) >/dev/null 2>&1; rc=$?
   [ "$rc" = "9" ] && rc=0 || { rc=1; echo "      probe rc=$rc (expected 9 — an exported gh FUNCTION is not a daemon binary)"; }
@@ -2022,7 +2028,7 @@ if need "$TMP/probe.sh" "the install-time probe is extracted from the shipped in
   # A wrapper that DELEGATES by name must not pass because the AMBIENT PATH can satisfy it: the
   # probe must execute under $DAEMON_PATH, where nothing can (the false green one layer in).
   PB3="$PB/w3"; mkdir -p "$PB3/shared" "$PB3/wrap" "$PB3/real" "$PB3/base"
-  for b in tmux uv gh; do printf '#!/bin/bash\nexit 0\n' > "$PB3/shared/$b"; chmod +x "$PB3/shared/$b"; done
+  for b in tmux uv gh jq; do printf '#!/bin/bash\nexit 0\n' > "$PB3/shared/$b"; chmod +x "$PB3/shared/$b"; done
   printf '#!/bin/bash\nexit 0\n' > "$PB3/real/pi"; chmod +x "$PB3/real/pi"
   cat > "$PB3/wrap/pi" <<'SH'
 #!/bin/bash

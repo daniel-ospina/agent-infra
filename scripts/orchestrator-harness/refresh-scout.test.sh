@@ -40,6 +40,36 @@ echo "==> refresh-candidates scout-provisioning contract ($HERE)"
 
 [ -f "$REFRESH" ] || { echo "  ❌ missing $REFRESH"; exit 1; }
 
+# mk_gh_wrapper <case-dir> — present a stub's answer in the shape `gh api -i` REALLY produces (#1962).
+# The shipped helper reads response HEADERS (`Link`, which is how it tells "the collection ended on a
+# page boundary" from "the body vanished") as well as the body, so a stub that printed a bare JSON
+# array would exercise nothing: the helper would split at a separator that is not there and read an
+# empty body — measured, every listing came back with 0 rows. The case-specific answer stays in
+# `gh.body`, untouched; this wrapper only adds the header block and passes stdout/stderr/rc through.
+mk_gh_wrapper() {
+  cat > "$1/bin/gh" <<'SH'
+#!/bin/bash
+d="$(cd "$(dirname "$0")" && pwd)"
+if [ "$1" = api ] && [ "$2" = -i ]; then
+  shift 2
+  out="$("$d/gh.body" api "$@" 2>"$d/.gh.err")"; rc=$?
+  [ -s "$d/.gh.err" ] && cat "$d/.gh.err" >&2
+  rm -f "$d/.gh.err"
+  [ "$rc" -eq 0 ] || exit "$rc"
+  # An EMPTY answer emits headers and NO body — exactly what a 204 looks like. Appending a newline to
+  # an empty answer would make a 1-byte body that the helper must read as "not a JSON array".
+  if [ -n "$out" ]; then
+    printf 'HTTP/2.0 200 OK\r\ncontent-type: application/json\r\n\r\n%s\n' "$out"
+  else
+    printf 'HTTP/2.0 204 No Content\r\ncontent-type: application/json\r\n\r\n'
+  fi
+  exit 0
+fi
+exec "$d/gh.body" "$@"
+SH
+  chmod +x "$1/bin/gh"
+}
+
 # mk_case <name> — a sandbox whose scout worktree already EXISTS as a plain dir (so the shipped
 # script skips `git worktree add` and does not need a repo/remote). Sets $D.
 D=""
@@ -47,7 +77,8 @@ mk_case() {
   D="$T/$1"; mkdir -p "$D/home" "$D/bin" "$D/o" "$D/repo/.worktrees/dispatch-scout"
   # `gh` succeeds and lists NOTHING: the reaper then sees a readable, empty answer (which it is
   # entitled to reap against) and the pool comes out empty unless a case stubs otherwise.
-  printf '#!/bin/bash\nexit 0\n' > "$D/bin/gh"; chmod +x "$D/bin/gh"
+  printf '#!/bin/bash\nexit 0\n' > "$D/bin/gh.body"; chmod +x "$D/bin/gh.body"
+  mk_gh_wrapper "$D"
   # ── a REAL git repo with a REAL (local, bare) origin, and the running registry (agent-infra#1850) ─
   # The pre-flight now reads `refs/claims/*` from the TARGET repo's origin before it certifies an
   # issue CLEAN, so the sandbox has to be a repo with an origin or every case would take the
@@ -106,6 +137,36 @@ print("VERDICT: CLEAN")
 PY
   chmod +x "$1"
 }
+# mk_gh_rest <case-dir> [issue-number] — the `gh` stub the SHIPPED refresh now talks to (#1962).
+#   * The listings are REST: `gh api repos/…/issues…` / `…/pulls…` answer with REST objects, because
+#     that is what the shipped script asks for. The GraphQL VERB forms (`gh issue list`, `gh pr list`)
+#     are REFUSED with the cell's own message — a stub that still answered those would pass on the
+#     PRE-FIX script too, so it could not tell the two transports apart at all.
+#   * <issue-number> puts ONE unassigned, non-epic P0-blocker row in the pool; with no argument the
+#     pool is genuinely EMPTY (a readable answer, not a failed read).
+#   * `auth token` answers (a credential is stored) and `gh api rate_limit` reports a HEALTHY REST
+#     bucket against a STARVED GraphQL one — the exact asymmetry the fix exists for.
+mk_gh_rest() {
+  local d="$1" n="${2:-}" rows='[]'
+  [ -n "$n" ] && rows="[{\"number\":$n,\"title\":\"a pool candidate\",\"assignees\":[]}]"
+  cat > "$d/bin/gh.body" <<SH
+#!/bin/bash
+case "\$1 \$2" in
+  "auth token") exit 0 ;;
+  *" rate_limit"*) printf '%s\n' '{"resources":{"core":{"remaining":4321},"graphql":{"remaining":0}}}' ;;
+  *"/pulls?"*) printf '[]\n' ;;                 # the reaper's branch list: readable, none
+  *"labels=P0-blocker"*) printf '%s\n' '$rows' ;;
+  *"/issues?"*) printf '[]\n' ;;
+  *) case "\$*" in
+       "issue list"*|'pr list'*) echo 'GraphQL: API rate limit already exceeded for user ID 81560491.' >&2; exit 1 ;;
+     esac
+     printf '[]\n' ;;
+esac
+SH
+  chmod +x "$d/bin/gh"
+  mk_gh_wrapper "$1"
+}
+
 # mk_uv_ok <dir> — a `uv` stub that RECORDS its argv and produces a runnable interpreter.
 mk_uv_ok() {
   cat > "$1/bin/uv" <<EOF
@@ -156,16 +217,18 @@ PY
 # (measured 2026-10-16: `gh auth status` fails under HOME=/home/ubuntu and succeeds under
 # HOME=/tmp/cell-home, on the same cell).
 mk_gh_noauth() {
-  cat > "$1/bin/gh" <<'SH'
+  cat > "$1/bin/gh.body" <<'SH'
 #!/bin/bash
-case "$1 $2" in
+case "$*" in
   "auth status") echo "To get started with GitHub CLI, please run: gh auth login" >&2; exit 1 ;;
   "auth token") echo "no oauth token found for github.com" >&2; exit 1 ;;
 esac
-case "$*" in *"--label P0-blocker"*) printf '0 42\n' ;; esac
+# #1962: the pool query is a REST call now, so the row is answered on the REST URL.
+case "$*" in *"labels=P0-blocker"*) printf '[{"number":42,"title":"a pool candidate","assignees":[]}]\n' ;; esac
 exit 0
 SH
   chmod +x "$1/bin/gh"
+  mk_gh_wrapper "$1"
 }
 # mk_gh_stale_token <case-dir> — a gh with a STORED-BUT-UNVALIDATABLE credential: `auth status`
 # exits 1 with the REAL output gh 2.97.0 prints behind a dead proxy (measured: `HTTPS_PROXY=
@@ -175,9 +238,9 @@ SH
 # exactly what a rejected credential prints, so a text-match discriminator cannot tell them apart —
 # only the API's own answer can, and an unreachable API answers with no status at all.
 mk_gh_stale_token() {
-  cat > "$1/bin/gh" <<'SH'
+  cat > "$1/bin/gh.body" <<'SH'
 #!/bin/bash
-case "$1 $2" in
+case "$*" in
   "auth status")
     cat >&2 <<'EOM'
   X Failed to log in to github.com account nobody (~/.config/gh/hosts.yml)
@@ -186,12 +249,13 @@ case "$1 $2" in
 EOM
     exit 1 ;;
   "auth token") exit 0 ;; # OFFLINE lookup succeeds: a credential IS stored
-  api\ *) echo 'Get "https://api.github.com/rate_limit": proxyconnect tcp: dial tcp 127.0.0.1:1: connect: connection refused' >&2; exit 1 ;;
+  *"api "*) echo 'Get "https://api.github.com/rate_limit": proxyconnect tcp: dial tcp 127.0.0.1:1: connect: connection refused' >&2; exit 1 ;;
 esac
-case "$*" in *"--label P0-blocker"*) printf '0 42\n' ;; esac
+case "$*" in *"labels=P0-blocker"*) printf '[{"number":42,"title":"a pool candidate","assignees":[]}]\n' ;; esac
 exit 0
 SH
   chmod +x "$1/bin/gh"
+  mk_gh_wrapper "$1"
 }
 # mk_gh_rejected <case-dir> — a gh with a STORED-BUT-REJECTED credential: `auth status` exits 1 with
 # the SAME prose a dead proxy prints (so a prose matcher cannot tell them apart), `auth token` — an
@@ -200,9 +264,9 @@ SH
 # A rejected credential is permanent — a retry cannot change it — so it MUST latch the marker rather
 # than stay a silent transient, which is how a cell stays MERGE-ONLY while reporting RUNNING (#1736).
 mk_gh_rejected() {
-  cat > "$1/bin/gh" <<'SH'
+  cat > "$1/bin/gh.body" <<'SH'
 #!/bin/bash
-case "$1 $2" in
+case "$*" in
   "auth status")
     cat >&2 <<'EOM'
   X Failed to log in to github.com account nobody (~/.config/gh/hosts.yml)
@@ -211,12 +275,13 @@ case "$1 $2" in
 EOM
     exit 1 ;;
   "auth token") exit 0 ;; # OFFLINE lookup succeeds: a credential IS stored
-  api\ *) echo 'gh: Bad credentials (HTTP 401)' >&2; exit 1 ;;
+  *"api "*) echo 'gh: Bad credentials (HTTP 401)' >&2; exit 1 ;;
 esac
-case "$*" in *"--label P0-blocker"*) printf '0 42\n' ;; esac
+case "$*" in *"labels=P0-blocker"*) printf '[{"number":42,"title":"a pool candidate","assignees":[]}]\n' ;; esac
 exit 0
 SH
   chmod +x "$1/bin/gh"
+  mk_gh_wrapper "$1"
 }
 # mk_degraded_tool <path> — what the REAL pre-flight answers when its gh surfaces are unreadable:
 # `VERDICT: COLLISION` (measured on the cells — a LANDED issue came back as a COLLISION under
@@ -310,9 +375,9 @@ print("collision-preflight: simulated usage/environment failure", file=sys.stder
 raise SystemExit(3)
 PY
 chmod +x "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
-cat > "$D/bin/gh" <<'SH'
+cat > "$D/bin/gh.body" <<'SH'
 #!/bin/bash
-case "$*" in *"--label P0-blocker"*) printf '0 42\n' ;; esac
+case "$*" in *"labels=P0-blocker"*) printf '[{"number":42,"title":"a pool candidate","assignees":[]}]\n' ;; esac
 exit 0
 SH
 chmod +x "$D/bin/gh"
@@ -349,7 +414,7 @@ esac
 echo; echo "── an unusable HOME is repaired by the refresh itself (the pre-flight's real precondition) ──"
 mk_case home-unusable
 mk_home_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
-printf '#!/bin/bash\ncase "$*" in *"--label P0-blocker"*) printf "0 42\\n" ;; esac\nexit 0\n' > "$D/bin/gh"
+printf '#!/bin/bash\ncase "$*" in *"labels=P0-blocker"*) printf "[{\\"number\\":42,\\"title\\":\\"a pool candidate\\",\\"assignees\\":[]}]\\n" ;; esac\nexit 0\n' > "$D/bin/gh.body"
 chmod +x "$D/bin/gh"
 rf "$D" refresh HOME="$D/no-such-home" CELL_HOME="$D/cellhome" HOMELOG="$D/homelog"
 [ "$RC" -eq 0 ] && ok "unusable HOME: the refresh still proceeds (rc=0)" \
@@ -369,7 +434,7 @@ esac
 echo; echo "── a writable HOME is used verbatim (the repair is a no-op on a normal box) ──"
 mk_case home-ok
 mk_home_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
-printf '#!/bin/bash\ncase "$*" in *"--label P0-blocker"*) printf "0 42\\n" ;; esac\nexit 0\n' > "$D/bin/gh"
+printf '#!/bin/bash\ncase "$*" in *"labels=P0-blocker"*) printf "[{\\"number\\":42,\\"title\\":\\"a pool candidate\\",\\"assignees\\":[]}]\\n" ;; esac\nexit 0\n' > "$D/bin/gh.body"
 chmod +x "$D/bin/gh"
 rf "$D" refresh HOMELOG="$D/homelog"
 [ "$(cat "$D/homelog" 2>/dev/null)" = "$D/home" ] \
@@ -430,7 +495,7 @@ mk_case ghes-host
 mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
 mkdir -p "$D/home/.config/gh"
 printf 'ghe.example.com:\n    oauth_token: x\n    user: n\n' > "$D/home/.config/gh/hosts.yml"
-cat > "$D/bin/gh" <<'SH'
+cat > "$D/bin/gh.body" <<'SH'
 #!/bin/bash
 printf '%s\n' "$*" >> "$GH_LOG"
 # This stub's own model of gh's default host: GH_HOST, else the ONE configured host, else github.com.
@@ -449,6 +514,9 @@ case "$*" in
 esac
 # Only the configured enterprise host is authenticated in this case.
 [ "$HOST" = github.com ] && { printf 'no oauth token found for github.com\n' >&2; exit 1; }
+# The listings are REST (#1962). Answer them from the same authenticated host — otherwise the pool
+# read fails and this case would be measuring the POOL instead of the host probe it exists for.
+case "$*" in *"repos/"*) printf '[]\n'; exit 0 ;; esac
 printf '{"resources":{}}\n'
 exit 0
 SH
@@ -472,11 +540,14 @@ grep -q 'auth token' "$D/gh-log" 2>/dev/null \
 echo; echo "── an unreadable pool listing is not an empty backlog ──"
 mk_case pool-unreadable
 mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
-cat > "$D/bin/gh" <<'SH'
+cat > "$D/bin/gh.body" <<'SH'
 #!/bin/bash
 case "$*" in
   "auth token"*) exit 0 ;; # a credential IS stored
-  "issue list"*) echo 'gh: could not resolve host: ghe.example.com' >&2; exit 1 ;;
+  # #1962: the listings are REST, so an unreadable HOST is modelled on `gh api`, not on the GraphQL
+  # verb forms. A stub that failed `issue list` would leave every tier READ here and prove nothing.
+  *"/issues?"*) echo 'gh: could not resolve host: ghe.example.com' >&2; exit 1 ;;
+  *"repos/"*) printf '[]\n'; exit 0 ;;
 esac
 printf '{"resources":{}}\n'
 exit 0
@@ -502,16 +573,15 @@ esac
 echo; echo "── a PARTIALLY read pool is not a backlog (one tier failed, another returned rows) ──"
 mk_case pool-partial
 mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
-cat > "$D/bin/gh" <<'SH'
+cat > "$D/bin/gh.body" <<'SH'
 #!/bin/bash
 case "$*" in
   "auth token"*) exit 0 ;;
-  "issue list"*)
-    case "$*" in
-      *"--label P0-blocker"*) echo 'gh: jq: error (at <stdin>:1): cannot index string' >&2; exit 1 ;;
-      *"--label P1-severe"*) printf '1 4242\n' ;;
-    esac
-    exit 0 ;;
+  # #1962: each tier is a REST call carrying its own `labels=` filter, so "one tier failed and another
+  # answered" is modelled on the URL the shipped script actually requests.
+  *"labels=P0-blocker"*) echo 'gh: jq: error (at <stdin>:1): cannot index string' >&2; exit 1 ;;
+  *"labels=P1-severe"*) printf '[{"number":4242,"title":"a pool candidate","assignees":[]}]\n'; exit 0 ;;
+  *"repos/"*) printf '[]\n'; exit 0 ;;
 esac
 printf '{"resources":{}}\n'
 exit 0
@@ -543,11 +613,12 @@ echo; echo "── the pool read state: EMPTY vs PARTIAL vs UNREADABLE, and neve
 # (a) NO tier could be read -> UNREADABLE, and explicitly NOT EMPTY.
 mk_case state-unreadable
 mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
-cat > "$D/bin/gh" <<'SH'
+cat > "$D/bin/gh.body" <<'SH'
 #!/bin/bash
 case "$*" in
   "auth token"*) exit 0 ;;
-  "issue list"*) echo 'gh: API rate limit exceeded' >&2; exit 1 ;;
+  *"/issues?"*) echo 'gh: API rate limit exceeded' >&2; exit 1 ;;
+  *"repos/"*) printf '[]\n'; exit 0 ;;
 esac
 printf '{"resources":{}}\n'
 exit 0
@@ -573,16 +644,13 @@ esac
 #     NOT the same reading as (a), and it still queues nothing.
 mk_case state-partial
 mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
-cat > "$D/bin/gh" <<'SH'
+cat > "$D/bin/gh.body" <<'SH'
 #!/bin/bash
 case "$*" in
   "auth token"*) exit 0 ;;
-  "issue list"*)
-    case "$*" in
-      *"--label P0-blocker"*) echo 'gh: server error' >&2; exit 1 ;;
-      *"--label P1-severe"*) printf '1 4242\n' ;;
-    esac
-    exit 0 ;;
+  *"labels=P0-blocker"*) echo 'gh: server error' >&2; exit 1 ;;
+  *"labels=P1-severe"*) printf '[{"number":4242,"title":"a pool candidate","assignees":[]}]\n'; exit 0 ;;
+  *"repos/"*) printf '[]\n'; exit 0 ;;
 esac
 printf '{"resources":{}}\n'
 exit 0
@@ -631,13 +699,12 @@ esac
 #     be labelled EMPTY by a later code path that only tests emptiness.
 mk_case state-read
 mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
-cat > "$D/bin/gh" <<'SH'
+cat > "$D/bin/gh.body" <<'SH'
 #!/bin/bash
 case "$*" in
   "auth token"*) exit 0 ;;
-  "issue list"*)
-    case "$*" in *"--label P1-severe"*) printf '1 4242\n' ;; esac
-    exit 0 ;;
+  *"labels=P1-severe"*) printf '[{"number":4242,"title":"a pool candidate","assignees":[]}]\n'; exit 0 ;;
+  *"repos/"*) printf '[]\n'; exit 0 ;;
 esac
 printf '{"resources":{}}\n'
 exit 0
@@ -723,8 +790,7 @@ esac
 echo; echo "── a READ-ONLY state dir with a stale pool is refused, not reported as a backlog ──"
 mk_case readonly-o
 mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
-printf '#!/bin/bash\ncase "$*" in *"--label P0-blocker"*) printf "0 77\\n" ;; esac\nexit 0\n' > "$D/bin/gh"
-chmod +x "$D/bin/gh"
+mk_gh_rest "$D" 77
 RF_PATH="$D/bin:$PATH" rf "$D" refresh               # a first, healthy run, so the stale state is real
 printf '99\n' > "$D/o/.pool"                         # a STALE pool the next run must not inherit
 chmod -R a-w "$D/o"
@@ -751,8 +817,7 @@ esac
 echo; echo "── a CLEAN issue is not suppressed when it was never queued ──"
 mk_case queue-unwritable
 mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
-printf '#!/bin/bash\ncase "$*" in *"--label P0-blocker"*) printf "0 42\\n" ;; esac\nexit 0\n' > "$D/bin/gh"
-chmod +x "$D/bin/gh"
+mk_gh_rest "$D" 42
 mkdir -p "$D/o/candidates.txt" # a DIRECTORY where the queue file must be
 rf "$D" refresh
 [ "$RC" -eq 1 ] && ok "queue unwritable: rc=1 (TRANSIENT — loud, and no permanent marker)" \
@@ -803,8 +868,7 @@ print("VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be queried (issue
 raise SystemExit(2)
 PY
 chmod +x "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
-printf '#!/bin/bash\ncase "$*" in *"--label P0-blocker"*) printf "0 42\\n" ;; esac\nexit 0\n' > "$D/bin/gh"
-chmod +x "$D/bin/gh"
+mk_gh_rest "$D" 42
 # Seed a sentinel so "nothing queued" is DISCRIMINATING (see the LANDED case below).
 echo 99 > "$D/o/candidates.txt"
 rf "$D" refresh
@@ -824,7 +888,7 @@ case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
   *) bad "no usable verdict: the backlog was clobbered — candidates='$(cat "$D/o/candidates.txt" 2>/dev/null)'" ;;
 esac
 # ...and the same script with an EMPTY pool must still exit 0 (the assertion is not a blanket refusal).
-printf '#!/bin/bash\nexit 0\n' > "$D/bin/gh"
+printf '#!/bin/bash\nexit 0\n' > "$D/bin/gh.body"
 chmod +x "$D/bin/gh"
 rf "$D" refresh
 [ "$RC" -eq 0 ] && ok "no usable verdict: an EMPTY pool still exits 0 (no false block)" \
@@ -843,8 +907,7 @@ print("VERDICT: LANDED (exit 4) — the issue's own state is CLOSED")
 raise SystemExit(4)
 PY
 chmod +x "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
-printf '#!/bin/bash\ncase "$*" in *"--label P0-blocker"*) printf "0 42\\n" ;; esac\nexit 0\n' > "$D/bin/gh"
-chmod +x "$D/bin/gh"
+mk_gh_rest "$D" 42
 # A sentinel makes the "not queued" assertion DISCRIMINATING: an empty candidates.txt is equally
 # consistent with "nothing was queued" and "the backlog was clobbered", and it is empty on the
 # pre-fix revision too. Seeding 99 proves #42 was neither added nor the file rewritten away.
@@ -880,8 +943,7 @@ print("  ALSO INCOMPLETE: 3 surface(s) could not be queried")
 raise SystemExit(1)
 PY
 chmod +x "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
-printf '#!/bin/bash\ncase "$*" in *"--label P0-blocker"*) printf "0 42\\n" ;; esac\nexit 0\n' > "$D/bin/gh"
-chmod +x "$D/bin/gh"
+mk_gh_rest "$D" 42
 # A sentinel makes the "nothing queued" assertion DISCRIMINATING (see the LANDED case): an empty
 # file cannot distinguish "the degraded answer was not queued" from "the backlog was clobbered".
 echo 99 > "$D/o/candidates.txt"
@@ -973,8 +1035,7 @@ print("  ALSO INCOMPLETE: 3 surface(s) could not be queried")
 raise SystemExit(0)
 PY
 chmod +x "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
-printf '#!/bin/bash\ncase "$*" in *"--label P0-blocker"*) printf "0 42\\n" ;; esac\nexit 0\n' > "$D/bin/gh"
-chmod +x "$D/bin/gh"
+mk_gh_rest "$D" 42
 # A sentinel makes "nothing queued" DISCRIMINATING: an empty file cannot distinguish "the degraded
 # CLEAN was not queued" from "the backlog was clobbered".
 echo 99 > "$D/o/candidates.txt"
@@ -1013,8 +1074,7 @@ print("VERDICT: CLEAN")
 raise SystemExit(0)
 PY
 chmod +x "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
-printf '#!/bin/bash\ncase "$*" in *"--label P0-blocker"*) printf "0 42\\n" ;; esac\nexit 0\n' > "$D/bin/gh"
-chmod +x "$D/bin/gh"
+mk_gh_rest "$D" 42
 rf "$D" refresh
 [ "$RC" -eq 0 ] && ok "title quotes the marker: rc=0 (no \"judged NOTHING\" abort over a genuine CLEAN)" \
                || bad "title quotes the marker: rc=$RC (want 0) — output: $OUT"
@@ -1032,12 +1092,7 @@ esac
 # reach the backlog — which can only happen if the resolved tool actually ran.
 mk_case own-tool
 mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
-cat > "$D/bin/gh" <<'SH'
-#!/bin/bash
-case "$*" in *"--label P0-blocker"*) printf '0 42\n' ;; esac
-exit 0
-SH
-chmod +x "$D/bin/gh"
+mk_gh_rest "$D" 42
 rf "$D" refresh TORTOISE_REPO="$D/tort" TOOL_LOG="$D/tool-log"
 [ "$RC" -eq 0 ] && ok "own tool: the refresh proceeds (rc=0)" || bad "own tool: rc=$RC — $OUT"
 case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
@@ -1313,13 +1368,9 @@ fi
 # NON-VACUITY, MEASURED: on the pre-change refresh-candidates.sh all three cases fail — (a) and (b)
 # because the candidate IS queued (nothing reads the registry), (c) because the warning line does not
 # exist. Reproduce against the pre-change tree by checking out the base revision of the script.
-mk_gh_one_issue() {   # <dir> — a `gh` stub that puts issue 42 in the pool
-  cat > "$1/bin/gh" <<'SH'
-#!/bin/bash
-case "$*" in *"--label P0-blocker"*) printf '0 42\n' ;; esac
-exit 0
-SH
-  chmod +x "$1/bin/gh"
+mk_gh_one_issue() {   # <dir> — the REST `gh` stub with issue 42 in the pool (#1962: see mk_gh_rest)
+  mk_gh_rest "$1" 42
+  mk_gh_wrapper "$1"
 }
 
 # (a) A LIVE claim from another box: the issue is a COLLISION, not CLEAN. It must not be queued
@@ -1741,6 +1792,165 @@ if [ -s "$DM" ] && grep -q 'release_issue_claim_unspawned' "$DM"; then
 else
   bad "dispatch-merge: could not extract the chain-failure branch (or it no longer releases)"
 fi
+
+# ── 12) THE LISTINGS DRAW ON THE REST BUCKET, so a starved GraphQL bucket cannot empty the
+#        backlog — and a failed REST listing must FAIL, not write a short one (#1962) ────
+# THE MEASURED DEFECT. On all three cloud cells, for hours: `gh issue list` / `gh pr list` (GraphQL)
+# answered `GraphQL: API rate limit already exceeded for user ID 81560491.` — one account, four boxes,
+# one bucket — so every priority tier FAILED, the pass aborted UNREADABLE, and `candidates.txt` stayed
+# at 0 lines. The cells could not dispatch because the READ that feeds dispatch had no budget.
+# REST is a SEPARATE bucket, so the same box can list while GraphQL is exhausted. (a) proves that;
+# (b) proves the other half — when REST fails too, the pass must FAIL rather than hand the reaper an
+# empty `.open_iss`/`.pr_brs` or a pool that silently drops a tier.
+echo; echo "── the listings use the REST bucket: a starved GraphQL bucket no longer stops dispatch ──"
+
+# (0) THE HELPER'S OWN REFUSALS ARE DRIVEN, NOT ASSUMED. `rest_list` carries five fail-closed guards
+#     — an unmodelled flag, a flag with no value, a non-numeric limit, an unknown listing kind, and a
+#     page that vanished while the LINK header still advertised a next page. Every one is category A
+#     (each prevents a WRONG answer being read as an empty one) and NONE is reachable from the five
+#     call sites, so a test that only drove the call sites would never execute them. The SHIPPED
+#     helper is extracted and called directly; `run_bounded` turns "it hangs" into a failure instead
+#     of wedging the suite (the pre-fix form spun for ever on a flag with no value — measured).
+echo; echo "── the REST helper's own refusals ──"
+run_bounded() {  # <seconds> <cmd...> — 124 means it did not finish
+  local secs="$1"; shift
+  "$@" >/dev/null 2>&1 & local pid=$!
+  local i=0 max=$((secs * 10))
+  while [ "$i" -lt "$max" ]; do
+    kill -0 "$pid" 2>/dev/null || { wait "$pid" 2>/dev/null; return $?; }
+    sleep 0.1; i=$((i + 1))
+  done
+  kill -9 "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+  return 124
+}
+{ awk '/^rest_fail\(\) \{/{f=1} f{print} f&&/^\}$/{f=0}' "$REFRESH"
+  awk '/^rest_list\(\) \{/{f=1} f{print} f&&/^\}$/{f=0}' "$REFRESH"; } > "$T/rest.sh"
+# the two shipped functions, extracted verbatim. A missing extraction is a FAILURE, never a skip.
+if [ -s "$T/rest.sh" ]; then
+  HD="$T/restcase"; mkdir -p "$HD"
+  cat > "$HD/gh" <<'SH'
+#!/bin/bash
+# page 1: a FULL page that advertises a next page. page 2: no rows, but STILL advertises one — the
+# vanished-page shape, which must be refused rather than read as the end of the collection.
+case "$*" in
+  # ANCHORED on `&page=1`, not `page=1`: the URL also carries `per_page=100`, whose `page=1` is a
+  # PREFIX of `page=100` — an unanchored pattern answers every page with page 1's full answer and the
+  # vanished-page check can then never fire (measured: n=100 on every page).
+  *"&page=1"*) printf 'HTTP/2.0 200 OK\r\nLink: <x?page=2>; rel="next"\r\n\r\n'
+               jq -n '[range(100)|{number:.}]' ;;
+  *) printf 'HTTP/2.0 200 OK\r\nLink: <x?page=3>; rel="next"\r\n\r\n[]\n' ;;
+esac
+SH
+  chmod +x "$HD/gh"
+  cat > "$T/rr.sh" <<'RS'
+. "$1"; shift
+OR=acme/widget
+rest_list "$@"
+RS
+  drv() { run_bounded 5 bash "$T/rr.sh" "$T/rest.sh" "$@"; }
+  PATH="$HD:$PATH"; export PATH
+  drv issues --repo acme/widget --json number > /dev/null 2>"$HD/err"; rc=$?
+  [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ] && ok "rest_list refuses an UNMODELLED flag (rc=$rc, no hang) — a dropped filter is a wrong answer" \
+                  || bad "rest_list accepted/dropped an unmodelled flag (rc=$rc)"
+  drv issues --repo acme/widget --limit > /dev/null 2>"$HD/err"; rc=$?
+  [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ] && ok "rest_list refuses a flag with NO VALUE instead of spinning for ever (rc=$rc)" \
+                  || bad "rest_list did not refuse a value-less flag (rc=$rc; 124 = it hung)"
+  drv issues --repo acme/widget --limit abc > /dev/null 2>"$HD/err"; rc=$?
+  [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ] && ok "rest_list refuses a NON-NUMERIC limit rather than paging unbounded (rc=$rc)" \
+                  || bad "rest_list accepted a non-numeric limit (rc=$rc)"
+  drv widgets > /dev/null 2>"$HD/err"; rc=$?
+  [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ] && ok "rest_list refuses an UNKNOWN listing kind (rc=$rc)" \
+                  || bad "rest_list accepted an unknown listing kind (rc=$rc)"
+  drv issues --repo acme/widget --limit 500 --jq '.[].number' > "$HD/out" 2>"$HD/err"; rc=$?
+  [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ] && ok "rest_list REFUSES a vanished page (LINK still advertises a next page, body has none)" \
+                  || bad "rest_list read a vanished page as the end of the collection (rc=$rc) — a truncated listing at rc 0"
+  PATH="${PATH#$HD:}"; export PATH
+  [ ! -s "$HD/out" ] && ok "rest_list emits NO rows for a refused listing (nothing for a caller to mistake for an answer)" \
+                     || bad "rest_list emitted rows while refusing: $(head -2 "$HD/out" | tr '\n' ' ')"
+else
+  bad "the REST helper could not be extracted from refresh-candidates.sh — the refusals are untested"
+fi
+
+# (a) GraphQL EXHAUSTED, REST healthy -> the backlog is built anyway, and NOT ONE GraphQL call is
+#     made. The stub records every gh invocation, so "the transport changed" is asserted structurally
+#     rather than by reading a log line the script could print while still calling GraphQL.
+mk_case rest-carries-a-starved-graphql
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+cat > "$D/bin/gh.body" <<'SH'
+#!/bin/bash
+printf '%s\n' "$*" >> "$GH_LOG"
+case "$*" in
+  "auth token") exit 0 ;;
+  *" rate_limit"*) printf '%s\n' '{"resources":{"core":{"remaining":4321},"graphql":{"remaining":0}}}'; exit 0 ;;
+  *"/pulls?"*) printf '[]\n'; exit 0 ;;
+  *"labels=P0-blocker"*) printf '[{"number":42,"title":"a pool candidate","assignees":[]}]\n'; exit 0 ;;
+  *"/issues?"*) printf '[]\n'; exit 0 ;;
+esac
+# Every GraphQL VERB FORM (what the pre-fix script used) answers the cells' own refusal.
+echo 'GraphQL: API rate limit already exceeded for user ID 81560491.' >&2
+exit 1
+SH
+chmod +x "$D/bin/gh"
+rf "$D" refresh GH_LOG="$D/gh-calls"
+[ "$RC" -eq 0 ] && ok "starved-graphql: the pass SUCCEEDS on REST (rc=0) — a starved bucket is not a broken box" \
+               || bad "starved-graphql: rc=$RC (want 0) — REST answered and the pass still refused — output: $OUT"
+case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
+  *42*) ok "starved-graphql: the candidate list IS built from the REST listing (#42 queued)" ;;
+  *) bad "starved-graphql: no candidate was queued — candidates='$(cat "$D/o/candidates.txt" 2>/dev/null)'" ;;
+esac
+case "$OUT" in
+  *"transport=REST"*) ok "starved-graphql: the log NAMES the transport it used" ;;
+  *) bad "starved-graphql: the log does not say which transport ran — output: $OUT" ;;
+esac
+case "$OUT" in
+  *"GraphQL remaining=0"*) ok "starved-graphql: the log reports the EXHAUSTED GraphQL bucket next to the working one" ;;
+  *) bad "starved-graphql: the bucket state is not reported (a reader cannot tell starved from broken) — output: $OUT" ;;
+esac
+gql_calls="$(grep -cE '^(issue list|pr list)' "$D/gh-calls" 2>/dev/null | tr -d ' ')"
+[ "${gql_calls:-1}" = "0" ] && ok "starved-graphql: ZERO GraphQL listings were attempted (the transport really changed)" \
+                          || bad "starved-graphql: $gql_calls GraphQL listing call(s) were still made — $(tr '\n' ' ' < "$D/gh-calls" 2>/dev/null)"
+grep -qE '^api repos/.*/issues\?.*labels=P0-blocker' "$D/gh-calls" 2>/dev/null \
+  && ok "starved-graphql: the tier query is a REST call carrying its --label filter" \
+  || bad "starved-graphql: the tier query is not a filtered REST call — $(tr '\n' ' ' < "$D/gh-calls" 2>/dev/null)"
+
+# (b) REST ALSO FAILING (HTTP 403, rate limited) -> TRANSIENT, and NOTHING written: no `.open_iss`, no
+#     `.pr_brs`, and the seeded backlog untouched. A truncated or empty listing here is the #1705 bug
+#     (an empty `.open_iss`/`.pr_brs` un-blacklists issues that DO have a PR) and the #8465 inversion.
+mk_case rest-fails-too
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+cat > "$D/bin/gh.body" <<'SH'
+#!/bin/bash
+case "$*" in
+  "auth token") exit 0 ;;
+  *" rate_limit"*) printf '%s\n' '{"resources":{"core":{"remaining":0},"graphql":{"remaining":0}}}'; exit 0 ;;
+  *"api "*) echo 'gh: API rate limit exceeded for user ID 81560491. (HTTP 403)' >&2; exit 1 ;;
+esac
+exit 1
+SH
+chmod +x "$D/bin/gh"
+# A sentinel makes "nothing written" DISCRIMINATING: an empty file cannot distinguish "the pass
+# refused" from "the backlog was clobbered".
+echo 99 > "$D/o/candidates.txt"
+rf "$D" refresh
+[ "$RC" -eq 1 ] && ok "rest-403: the pass exits TRANSIENT (rc=1) — a starved REST bucket is an outage, not 'no work'" \
+               || bad "rest-403: rc=$RC (want 1) — output: $OUT"
+[ ! -e "$D/o/.open_iss" ] && ok "rest-403: a FAILED issue listing leaves NO .open_iss (absence, not an empty answer)" \
+                          || bad "rest-403: a failed issue listing was written as an empty/partial .open_iss"
+[ ! -e "$D/o/.pr_brs" ] && ok "rest-403: a FAILED PR listing leaves NO .pr_brs" \
+                         || bad "rest-403: a failed PR listing was written as an empty/partial .pr_brs"
+case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
+  *42*) bad "rest-403: candidates were queued from a listing that failed" ;;
+  *99*) ok "rest-403: the backlog was NOT touched (seed 99 intact)" ;;
+  *) bad "rest-403: the backlog was clobbered — candidates='$(cat "$D/o/candidates.txt" 2>/dev/null)'" ;;
+esac
+case "$OUT" in
+  *"HTTP 403"*"REST bucket"*) ok "rest-403: the refusal NAMES the HTTP 403 on the REST bucket (starved vs broken)" ;;
+  *) bad "rest-403: the 403 is not named in the log — output: $OUT" ;;
+esac
+case "$OUT" in
+  *"queue=UNREADABLE"*) ok "rest-403: the queue state is UNREADABLE, not EMPTY" ;;
+  *) bad "rest-403: a blind pass was not reported as UNREADABLE — output: $OUT" ;;
+esac
 
 echo
 echo "── Summary ───────────────────────────────────────────────────────"

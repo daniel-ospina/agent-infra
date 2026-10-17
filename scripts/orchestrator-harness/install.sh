@@ -129,7 +129,11 @@ echo "==> preflight"
 [ -f "$TEMPLATE" ] || die "missing template: $TEMPLATE"
 
 # ── dependencies ─────────────────────────────────────────────────────────────────
-for bin in tmux gh pi; do
+# ⛔ jq JOINS THE HARD DEPENDENCIES (agent-infra#1962). The listings now run on the REST bucket and
+# assemble pages with jq; without it `rest_list` REFUSES rather than answer from a partial read, so
+# every refresh would report UNREADABLE and the backlog would never build — a missing jq is a broken
+# install, not a warning.
+for bin in tmux gh pi jq; do
   command -v "$bin" >/dev/null 2>&1 && ok "$bin" || die "$bin not on PATH"
 done
 command -v uv >/dev/null 2>&1 && ok "uv" || warn "uv not found — lane.sh needs it to sync each worktree"
@@ -183,7 +187,7 @@ DAEMON_PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 if [ -x "$HOME/.local/share/pi-node/current/bin/pi" ]; then
   command -v pi >/dev/null 2>&1 && add_dir "$HOME/.local/share/pi-node/current/bin"
 fi
-for bin in tmux gh uv pi; do
+for bin in tmux gh uv pi jq; do
   # ⛔ Resolve the BINARY, not a shell function/alias. `command -v` reports an exported function
   # REGARDLESS of PATH (and a BARE name for it), so with a `gh`/`pi` function in the environment the
   # real binary's directory would never be found AND the name would be unusable. `type -P` searches
@@ -227,7 +231,7 @@ ok "daemon PATH: $DAEMON_PATH"
 # the exclusion patterns (cmux's `cmux-cli-shims` is a real one) is caught here because its tool
 # exits 127. uv is optional (warned above): its failure WARNS, and is never fatal. Still BLIND to
 # trap (3) — TCC refuses the read only when LAUNCHD does it, not when an interactive shell does.
-for bin in tmux uv pi gh; do
+for bin in tmux uv pi gh jq; do
   command -v "$bin" >/dev/null 2>&1 || continue     # not present in this shell at all
   # ⛔ `|| true`: install.sh runs under `set -euo pipefail`, and `type -P` returns non-zero for a
   # tool that is not on $DAEMON_PATH. Unguarded, that bare assignment aborts the script AT THIS
