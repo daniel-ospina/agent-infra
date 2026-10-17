@@ -90,12 +90,13 @@ is_limit "${MAX_LOAD:-}" || MAX_LOAD=$(( 10#$_NCPU * 10 )); is_limit "${MAX_LOAD
 # ⛔ CAPACITY, NOT A LANE COUNT (owner ruling, 2026-10-17): "dispatch should be gated on capacity,
 # not on number of lanes. max lanes 8 is too low. that needs to be configured to 2.5x the number of
 # CPUs". Both numbers in play were LANE COUNTS that no hardware decided: the shipped default was a
-# FLAT 4, and the box this was measured on had its plist PINNED at 8 — `[cap] load=79/100 lanes=9/8
-# … [dispatch] skipped (lanes=9>=max_lanes=8)` — 21 points of load headroom and comfortable
-# swap/memory, so dispatch was refused for a lane count while capacity was available. The fleet sat
-# idle, the exact opposite of the intent. `MAX_LOAD` above already derives from cores; same rule here.
-# Integer division, so it FLOORS (4 cores -> 10, 3 -> 7). An EXPLICIT MAX_LANES still WINS and is
-# never recomputed — install.sh renders it, $ENV_FILE carries it into a cell (cloud-cell-supervisor.sh:1198).
+# FLAT 4, and the box this was measured on had its plist PINNED at 8 —
+# `[cap] load=79/100 lanes=9/8 … [dispatch] skipped (lanes=9>=max_lanes=8)` — 21 points of load
+# headroom and comfortable swap/memory, so the NEXT dispatch was refused for a lane count while
+# capacity was available. `MAX_LOAD` above already derives from cores; same rule here.
+# Integer division, so it FLOORS (4 cores -> 10, 3 -> 7). An explicit MAX_LANES still WINS and is not
+# recomputed — with ONE exception, spelled out at the coercion block below: a present-but-INVALID
+# value (`4x`, `09`, ten digits) is repaired there to this same derived default.
 MAX_LANES="${MAX_LANES:-$(( 10#$_NCPU * 5 / 2 ))}"
 MAX_REVIEW="${MAX_REVIEW:-4}"   # keep in sync with install.sh's default and README §4
 # Above this many UNOWNED open PRs (open PRs nothing is currently working — pr_owned() below),
