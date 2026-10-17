@@ -677,6 +677,69 @@ def test_materialise_refuses_a_reset_that_would_overwrite_untracked_files(monkey
     assert (pathlib.Path(wt) / "new.txt").read_text() == "untracked precious\n"
 
 
+def test_materialise_refuses_a_reset_when_a_tracked_file_shadows_an_untracked_dir(monkeypatch, tmp_path):
+    """Conflict is by path COMPONENT: an untracked `dir/precious` collides with a tracked FILE
+    `dir`, which string equality misses -- and `reset --hard` then deletes the untracked tree."""
+    repo, g = _git_repo(tmp_path)
+    g("branch", "feat/x")
+    head1 = g("rev-parse", "HEAD").stdout.strip()
+    _wire_repo(monkeypatch, repo)
+    wt, _ = pr.materialise_worktree(_prb(1, head1, "feat/x"))
+
+    def gw(*a):
+        return subprocess.run(["git", "-C", wt] + list(a), check=True,
+                              capture_output=True, text=True)
+
+    (pathlib.Path(wt) / "dir").write_text("file at head2\n")
+    gw("add", "dir")
+    gw("commit", "-qm", "tracked file dir")
+    head2 = gw("rev-parse", "HEAD").stdout.strip()
+    gw("reset", "--hard", head1)                    # the tracked `dir` FILE is gone
+    (pathlib.Path(wt) / "dir").mkdir()               # now an UNTRACKED DIRECTORY `dir/`
+    (pathlib.Path(wt) / "dir" / "precious.txt").write_text("precious\n")
+    wt2, err = pr.materialise_worktree(_prb(1, head2, "feat/x"))
+    assert wt2 == "" and "untracked" in err
+    assert (pathlib.Path(wt) / "dir" / "precious.txt").read_text() == "precious\n"
+
+
+def test_untracked_clobber_catches_a_tracked_dir_shadowed_by_an_untracked_file(monkeypatch, tmp_path):
+    """The reverse shape: head tracks `dir/file`, the worktree has an untracked FILE `dir`."""
+    repo, g = _git_repo(tmp_path)
+    head1 = g("rev-parse", "HEAD").stdout.strip()
+    (repo / "dir").mkdir()
+    (repo / "dir" / "file.txt").write_text("x\n")
+    g("add", "-A")
+    g("commit", "-qm", "track dir/file")
+    head2 = g("rev-parse", "HEAD").stdout.strip()
+    g("reset", "-q", "--hard", head1)
+    (repo / "dir").write_text("untracked file\n")   # untracked FILE named `dir`
+    assert os.path.isdir(repo / "dir") is False
+    assert pr._untracked_clobber(str(repo), head2) == ["dir"]
+
+
+def test_a_gitdir_file_pointing_at_another_worktree_is_not_live(monkeypatch, tmp_path):
+    """A `.git` FILE pointing at ANOTHER worktree's git dir passes the git-dir checks but is a
+    DIFFERENT worktree; accepting it would switch that worktree's branch out from under it."""
+    repo, g = _git_repo(tmp_path)
+    head = g("rev-parse", "HEAD").stdout.strip()
+    g("branch", "b1")
+    g("branch", "b2")
+    wt2 = repo / ".worktrees" / "wt2"
+    g("worktree", "add", str(wt2), "b2")
+    _wire_repo(monkeypatch, repo)
+    alias = repo / ".worktrees" / "prd-1"
+    alias.mkdir(parents=True)
+    (alias / ".git").write_text("gitdir: %s\n" % (repo / ".git" / "worktrees" / "wt2"))
+    (alias / "f.txt").write_text("ghost\n")
+    assert pr._live_worktree(str(alias)) is False
+    b2_before = g("rev-parse", "refs/heads/b2").stdout.strip()
+    wt, err = pr.materialise_worktree(_prb(1, head, "b1"))
+    assert err == "" and wt.endswith("prd-1-d")
+    assert g("rev-parse", "refs/heads/b2").stdout.strip() == b2_before
+    assert subprocess.run(["git", "-C", str(wt2), "symbolic-ref", "--short", "HEAD"],
+                          capture_output=True, text=True).stdout.strip() == "b2"
+
+
 def test_materialise_worktree_clears_a_stranded_record(monkeypatch, tmp_path):
     """Directory gone but the record remains: `worktree add` refuses until the record is cleared."""
     import shutil

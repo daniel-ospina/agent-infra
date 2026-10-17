@@ -458,7 +458,21 @@ def _live_worktree(path: str):
     cdp = (cd or "").strip()
     if not os.path.isabs(cdp):
         cdp = os.path.join(path, cdp)
-    return gd != os.path.realpath(cdp)
+    if gd == os.path.realpath(cdp):
+        return False                                # main checkout (or an alias of it)
+    # IDENTITY: the worktree record must point back at THIS path. A `.git` FILE pointing at
+    # ANOTHER worktree's git dir has git-dir != common-dir too, so without this it would be
+    # accepted and we would switch that other worktree's branch out from under it.
+    try:
+        with open(os.path.join(gd, "gitdir")) as fh:
+            back = fh.read().strip()
+    except OSError:
+        return False
+    if not back:
+        return False
+    if not os.path.isabs(back):
+        back = os.path.join(gd, back)
+    return os.path.dirname(os.path.realpath(back)) == os.path.realpath(path)
 
 
 def _disposable_dangling(path: str) -> bool:
@@ -538,7 +552,17 @@ def _untracked_clobber(path: str, head: str):
     if trc != 0:
         return None
     tracked = set((tree or "").split("\0"))
-    return sorted(u for u in untracked if u in tracked)
+
+    # Conflict is by PATH COMPONENT, not string equality: an untracked `dir/precious` collides with
+    # a tracked FILE `dir` (and a tracked `dir/file` with an untracked FILE `dir`). Equality alone
+    # misses both, and `reset --hard` deletes the untracked side (verified).
+    def _conflicts(u):
+        for t in tracked:
+            if u == t or u.startswith(t + "/") or t.startswith(u + "/"):
+                return True
+        return False
+
+    return sorted(u for u in untracked if _conflicts(u))
 
 
 def _ensure_head(path: str, branch: str, head: str) -> str:
