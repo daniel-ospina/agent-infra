@@ -279,20 +279,28 @@ PYAGE
 # that makes them readable (it is how `fix-ci=` was already being truncated). #1872 lengthened
 # the segment twice: the label is now `QUEUE(state; pr-doctor dispatches): ` (so the counts
 # cannot be mistaken for an instruction the automatic dispatcher already owns) and `running` is
-# named like every other class. MEASURED 2026-10-16 (review round 2, corrected -- round 1 quoted
-# 628 from a shape that predated the ASK-USER overlay and understated every reachable case):
-#   * 14 non-draft PRs, every class populated, BLIND caveat, ASK-USER naming all 14 ... 675 chars
-#   * the same with a rail-gate outage naming a gate on 3 `blocked-by-rail` entries ..... 532
-#   * 40 non-draft PRs, every class populated, ASK-USER naming 20 ...................... 799
-# 820 keeps all three whole. ⛔ THE LOAD-BEARING TOKEN IS NO LONGER AT THE TAIL: the fail-closed
-# `queue_read=BLIND(...)` caveat is emitted BEFORE the queue segment (objective.py), so a longer
-# queue can only ever cut the CI INDICATORS -- never the caveat. Re-measure before changing this
-# number; do not raise it blindly, and never move the caveat back to the tail.
-obj=$(sed -n '2p' "$STATE/objective.last" 2>/dev/null | cut -c1-820)
+# named like every other class.
+#
+# ⛔ THE BOUND IS NOT A MEASURED WORST CASE, AND SHOULD NOT BE WRITTEN AS ONE. Three review
+# rounds argued about the number (628 -> 675/799 -> 860) because the length is a function of
+# digits x named PRs x per-entry gate names x the ASK-USER overlay x the STUCK escalation; a
+# "worst case" line is therefore a claim about the FLEET, not about the format, and it goes
+# stale the first time the queue grows. What 900 IS:
+#   * measured long enough for the shapes this fleet reaches (40 non-draft PRs, every class
+#     populated, the BLIND caveat, a 20-PR ASK-USER overlay, 5-digit PR numbers, a STUCK
+#     escalation: 860), and
+#   * structurally safe to truncate, because the one token that must SURVIVE a cut is no longer
+#     at the tail: `queue_read=BLIND(...)` is emitted BEFORE the queue segment (objective.py,
+#     pinned by a test), so any truncation lands in the CI INDICATORS only.
+# Never move the caveat back to the tail; re-measure before lowering this number.
+obj=$(sed -n '2p' "$STATE/objective.last" 2>/dev/null | cut -c1-900)
 
 # ── RES: the system-resource segment, on its OWN line (objective.last line 3) ──────────
-# Its own line because the objective line is ALREADY past the 150 chars it is read with, so
-# appending this would cut it off mid-token -- which is what truncates `fix-ci=` today.
+# Its own line because the objective line is ALREADY past the length it is read with (the
+# `cut -c1-900` above), so appending this would cut it off mid-token. Reading the objective line
+# is what used to truncate the per-class tokens; `fix-ci` does not even appear in that segment
+# any more (it is rendered as `IN-PROGRESS: fixing <check>=<n>`), so this paragraph and the one
+# above it describe the same fact from two directions and must be kept in step.
 # It is NOT truncated: the line is short and every field is load-bearing.
 # ⛔ FRESH EVERY BEAT, NEVER FROM THE CACHE. Reading line 3 of `objective.last` inherited that
 # file's 900 s TTL: two beats 7m33s apart printed BYTE-IDENTICAL values, including `runq=79`

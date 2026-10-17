@@ -953,7 +953,7 @@ class TestActionVocabulary:
             # a red diff-bound gate + a rail gate red + the gate job never created
             "#8822": self._cr(red=["ai-review-gate"], absent=["python-ci-gate"],
                               extra_red=["drift-guard"]),
-            # a red diff-bound gate + fourteen jobs in flight
+            # a red diff-bound gate + nine jobs in flight
             "#8824": self._cr(red=["ai-review-gate"], absent=["python-ci-gate"],
                               flight=["test (%s)" % c for c in "abcdefghi"]),
             # a red diff-bound gate + a required check mid-run

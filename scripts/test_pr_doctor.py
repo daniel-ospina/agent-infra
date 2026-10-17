@@ -213,6 +213,11 @@ def test_fix_and_review_budgets_are_separate(monkeypatch):
 # ── 4. a failed lane read is a NAMED blindness, never a silent zero ──────────────────────
 
 def test_failed_lane_read_names_the_blindness(monkeypatch, capsys):
+    """⛔ AND IT REFUSES (#1872 review round 3). A blind lane roster is the THIRD blind read in
+    this file, and the two above it both end in rc 2; leaving this one at 0 made the stated
+    invariant -- "`0` is reserved for readable, nothing to do" -- false 33 lines below it, with
+    work already classified and nothing dispatched.
+    """
     logs = []
     monkeypatch.setattr(pr, "load_state", lambda: {})
     monkeypatch.setattr(pr, "open_prs", lambda: [_pr(1)])
@@ -223,12 +228,43 @@ def test_failed_lane_read_names_the_blindness(monkeypatch, capsys):
     monkeypatch.setattr(pr, "dispatch",
                         lambda *a, **k: pytest.fail("dispatch must not run on a blind read"))
     monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--dry-run"])
-    assert pr.main() == 0
+    assert pr.main() == 2
     joined = "\n".join(logs)
     assert "LANE READ FAILED" in joined
     assert "connection refused" in joined
     # and it must NOT be reported as "there was nothing to do"
     assert "nothing dispatched this pass" not in joined
+
+
+def test_a_blind_read_cause_is_captured_per_pr_not_read_after_the_loop(monkeypatch):
+    """⛔ THE CAUSE MUST BELONG TO THE READ THAT FAILED (#1872 review round 3).
+
+    `objective.GH_LAST_ERROR` is reset per read so it names THAT read -- which means re-reading it
+    after the classify loop reports the LAST PR's cause, and "(no gh error recorded)" whenever a
+    later PR read fine. Round 2 shipped exactly that inversion; this pins the fix.
+    """
+    logs = []
+    monkeypatch.setattr(pr, "load_state", lambda: {})
+    monkeypatch.setattr(pr, "open_prs", lambda: [_pr(1), _pr(2)])
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(pr, "idle_lanes", lambda: ([], ""))
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--dry-run"])
+
+    def classify(p):
+        if p["number"] == 1:
+            # the classifier records the failure and reports a blind read ...
+            monkeypatch.setattr(pr.CLASSIFIER, "GH_LAST_ERROR",
+                                "API rate limit exceeded for 1.2.3.4", raising=False)
+            return (None, None, None)
+        # ...then the NEXT PR reads fine and clears it, as the real per-read reset does
+        monkeypatch.setattr(pr.CLASSIFIER, "GH_LAST_ERROR", "", raising=False)
+        return ("running", None, [])
+
+    monkeypatch.setattr(pr, "classify", classify)
+    assert pr.main() == 0
+    joined = "\n".join(logs)
+    assert "rate limit" in joined, joined
+    assert "no gh error recorded" not in joined, joined
 
 
 # ── 5. ONE classifier: the beat and the dispatcher cannot disagree (#1872) ────────────────

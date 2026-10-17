@@ -90,13 +90,12 @@ REPO_DIR = os.path.join(HOME, "Documents", "GitHub", "tortoise")
 # protected tree. The shim is the admin-merge GUARD (#984); this job only READS, so it does
 # not need the guard. Landing still goes through the rail, in a lane.
 #
-# ⛔ ONE RESOLVER, NOT TWO (#1872 review round 2). This was a hardcoded path with no existence
-# check and no fallback, while the `objective.py` this file now IMPORTS resolves the binary env ->
-# ~/bin/gh -> PATH. Nothing in the repo PROVISIONS ~/bin/gh, so on a second cell, a fresh install
-# or after a `~/bin` cleanup the driver would refuse every pass (rc=2, "the open-PR read FAILED")
-# while the classifier it imported could have read GitHub fine. Taking the classifier's answer is
-# what makes the queue read and the check-run read incapable of disagreeing about the binary.
-GH = os.path.join(HOME, "bin", "gh")
+# ⛔ ONE RESOLVER, NOT TWO (#1872 review round 2). The binary used to be this hardcoded path, with
+# no existence check and no fallback, while the `objective.py` this file now IMPORTS resolves it
+# env -> ~/bin/gh -> PATH. Nothing in the repo PROVISIONS ~/bin/gh, so on a second cell, a fresh
+# install or after a `~/bin` cleanup the driver refused every pass (rc=2, "the open-PR read
+# FAILED") while the classifier it imported could have read GitHub fine. `GH` is now taken FROM
+# that resolver, after the seam check below.
 
 # ⛔ THE CLASSIFIER IS NOT OURS TO OWN (#1872). `objective.py` owns the class vocabulary, the
 # check-run read, the attestation read and the predicate; this file owns the DISPATCH. Loading
@@ -121,8 +120,10 @@ CLASSIFIER = _objective()
 # `~/.pi/agent/scripts/` as TWO INDIVIDUAL files (`pi-bootstrap/setup.sh` `fleet_srcs`), and that
 # farm SKIPS a source that is missing (`[ -f "$f" ] || continue`) -- so a newer pr-doctor.py can
 # sit beside an older objective.py. Without this check the import still succeeds, every PR then
-# fails INSIDE the per-PR swallow below, and the pass ends `dispatched 0` with exit 0 -- a dead
-# drain that reports success, which is the worst outcome this file can produce.
+# fails INSIDE the per-PR swallow below -- seven swallowed `AttributeError`s, and (once round 2
+# made an all-blind pass REFUSE rather than exit 0) a generic refusal that names no symbol. The
+# seam's value is now the DIAGNOSIS: it says which symbol is stale, in one line, before anything
+# runs.
 _SEAM = ("classify_one", "touches_surface", "CLASS_ORDER", "REQUIRED", "RAIL_GATES", "GH_BIN")
 _missing = [n for n in _SEAM if not hasattr(CLASSIFIER, n)]
 if _missing:
@@ -426,8 +427,9 @@ def brief(pr: dict, action: str, why: str | None = None, cr=None) -> str:
         return """# MERGE #{n} — nothing else is needed
 
 **#{n}** {title}
-Head `{head}`. All required checks are green and a `clean` attestation is already recorded at
-this head, and the rail's own gates would take it. **Everything is done except the last step.**
+Head `{head}`. Every required check this predicate waits on is green (`ai-review-gate` is
+diff-bound and clears by recording, so it is not a gate here) and a `clean` attestation is
+already recorded at this head, and the rail's own gates would take it. **Everything is done except the last step.**
 
 ```
 scripts/admin-merge.sh {n}
@@ -618,6 +620,7 @@ def main() -> int:
     # classify everything first, then dispatch highest-value first
     classified = []
     skipped = {}
+    causes = []          # WHY a read was blind, captured AT the failure, not after the loop
     for p in prs:
         try:
             k, why, cr = classify(p)
@@ -628,11 +631,17 @@ def main() -> int:
             # timeout produced "dispatched 0" with no skipped-unreadable token at all.
             log("#%s classify failed: %s" % (p["number"], e))
             skipped["unreadable"] = skipped.get("unreadable", 0) + 1
+            _c = (getattr(CLASSIFIER, "GH_LAST_ERROR", "") or str(e)).strip()
+            if _c:
+                causes.append(_c[:200])
             continue
         # ⛔ A MISS IS NEVER WORK. `None` means the checks could not be READ; rendering that as
         # any action (especially `fix-ci`) manufactures a queue out of a blind read.
         if k is None:
             skipped["unreadable"] = skipped.get("unreadable", 0) + 1
+            _c = (getattr(CLASSIFIER, "GH_LAST_ERROR", "") or "").strip()
+            if _c:
+                causes.append(_c[:200])
             continue
         # A required check is still IN FLIGHT: nothing to do this pass. It is a class, not a gap
         # (#1872) -- and `objective.py`'s arm is deliberately BROADER than the old predicate here:
@@ -657,9 +666,14 @@ def main() -> int:
     # "dispatched 0" left the operator with a bare number and no cause -- the reassuring-line
     # failure mode this file's `GH` constant was written against.
     if skipped.get("unreadable"):
-        log("%d PR(s) had UNREADABLE checks -- the cause: %s"
+        # ⛔ THE CAUSES ARE COLLECTED, NOT RE-READ (#1872 review round 3). `GH_LAST_ERROR` is reset
+        # per read (so it always names the read that failed), which means re-reading it after the
+        # loop reports the LAST PR's cause -- and "(no gh error recorded)" whenever a later PR read
+        # fine, i.e. exactly the symptom the per-read reset was added to fix, inverted.
+        _uniq = list(dict.fromkeys(c for c in causes if c))
+        log("%d PR(s) had UNREADABLE checks -- cause(s): %s"
             % (skipped["unreadable"],
-               (getattr(CLASSIFIER, "GH_LAST_ERROR", "") or "(no gh error recorded)").strip()[:240]))
+               "; ".join(_uniq)[:300] if _uniq else "(the read returned no error text)"))
     # ⛔ A COMPLETELY BLIND PASS IS NOT A CLEAN ONE (#1872 review round 2). The queue half returns
     # 2 when it cannot read the PR list; the check-run half kept exiting 0 when NO PR was legible,
     # so the asymmetry the two-line fix above exists to remove survived one function later -- and
@@ -699,9 +713,13 @@ def main() -> int:
 
     lanes, lane_err = idle_lanes()
     if lane_err:
-        # NOT the same as "no idle lanes". Say which one it is.
+        # NOT the same as "no idle lanes". Say which one it is -- and REFUSE, because "`0` is
+        # reserved for readable, nothing to do" (see the two refusals above) and a blind roster
+        # with work already classified is the third instance of the same fail-open (#1872 review
+        # round 3, raised independently by two reviewers). The branch below stays `return 0`: that
+        # one IS a successful read with nothing to dispatch to.
         log("LANE READ FAILED -- cannot dispatch this pass: %s" % lane_err)
-        return 0
+        return 2
     if budgets["total"] and not lanes:
         log("no idle lanes -- nothing dispatched this pass")
         return 0

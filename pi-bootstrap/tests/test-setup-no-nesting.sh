@@ -241,6 +241,24 @@ check_fleet_srcs_farmed() {
     [ "$declared" -gt 0 ] \
       || fail "$label: fleet_srcs declared ZERO entries — array empty or unreadable, and 0/0 must never read as clean"
   fi
+  # ⛔ ORDER MATTERS FOR ONE PAIR (#1872). The farm copies in ARRAY ORDER and `[ -f "$f" ] || continue`
+  # skips a missing source, so a farm interrupted between these two files leaves a partial pair —
+  # and only ONE direction of that pair is safe: a NEW `pr-doctor.py` beside an OLD `objective.py`
+  # is refused at import by the driver's seam (loud), while a NEW beat beside an OLD driver is
+  # silent, because the assertion lives in the driver. The array is otherwise unordered, so a
+  # future "let's sort this list" edit would restore the silent window with the suite still green.
+  # This turns that comment into a gate.
+  local idx_driver=0 idx_classifier=0 i=0
+  for entry in $line; do
+    i=$((i+1))
+    [ "$entry" = "pr-doctor.py" ] && idx_driver=$i
+    [ "$entry" = "objective.py" ] && idx_classifier=$i
+  done
+  if [ "$idx_driver" -gt 0 ] && [ "$idx_classifier" -gt 0 ] && [ "$idx_driver" -gt "$idx_classifier" ]; then
+    fail "$label: fleet_srcs lists objective.py ($idx_classifier) BEFORE pr-doctor.py ($idx_driver) — the\
+ farm copies in array order, and only the driver-first order makes an interrupted farm FAIL LOUDLY\
+ (the driver's import seam); the reverse order is silent (#1872)"
+  fi
 }
 
 # #1552 — PRODUCER COMPLETENESS, the half `check_fleet_srcs_farmed` cannot do. That function pins

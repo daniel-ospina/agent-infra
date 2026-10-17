@@ -160,9 +160,9 @@ GH_LAST_ERROR = ""
 # records the incident at its own `GH` constant: on the fleet box `~/.pi/agent/shims/gh` is a
 # symlink into ~/Documents, macOS TCC refuses to execute it (rc=126) under launchd, and the job
 # then printed a plausible "no open PRs" for two straight runs while doing NOTHING. That
-# protection used to hold only for pr-doctor's OWN reads; since the check-run read moved here,
-# this file performs the load-bearing read, so the same resolution must hold here or the guard
-# covers a path that no longer carries the risk. ~/bin/gh is a real binary outside the protected
+# protection used to hold only for pr-doctor's OWN reads; since pr-doctor's read was DELETED in
+# favour of this one (#1872), this file performs the load-bearing read, so the resolution must
+# hold here too. ~/bin/gh is a real binary outside the protected
 # tree; a box without it (CI, Linux) falls back to PATH, which is what it has always effectively
 # used there.
 # ⛔ `isfile` AND `access` — `os.access(p, os.X_OK)` is TRUE FOR A DIRECTORY, so the executable
@@ -495,8 +495,11 @@ SURFACE_PATHS = ("tortoise/sdk.py", "tortoise/tool_registry.py",
 # action. Reading this tuple as a class->action map is what sent lanes to "fix" a suite that was
 # still executing (#1872); every consumer must special-case `running` (both do: pr-doctor skips
 # it, pr-loop returns `wait`).
-# `call-rail` first: it is the win -- all 7 required green AND a clean attestation at
-# the current head, i.e. `bash scripts/admin-merge.sh <PR>` lands it with zero code work.
+# `call-rail` first: it is the win -- the SIX gated required checks green AND a clean
+# attestation at the current head, i.e. the merge rail's own script lands it with zero code work.
+# ⛔ NOT "all 7": `ai-review-gate` is diff-bound, red by construction whenever a record postdates
+# its last run (measured red on 8 of 11 open PRs), and its truth is the attestation FILE -- so it
+# is never a check this predicate waits on.
 # `rerun-checks` and `resolve-conflict` sit ABOVE `record-review` because a missing check
 # tells you NOTHING and a rebase CHANGES THE HEAD, staling any attestation.
 CLASS_ORDER = ("call-rail", "blocked-by-rail", "rerun-checks", "resolve-conflict",
@@ -785,9 +788,11 @@ def classify_pr(pr, cr, att_clean):
     # 6. rerun-checks -- SOME required check never ran at this head while others COMPLETED, and
     #    the head is not executing (arm 4). Absence is not green, and it is not a failure to FIX:
     #    the job that was never created has to be STARTED. MEASURED #8822: `python-ci-gate`
-    #    absent (its job never got created) with `drift-guard` red and NOTHING in flight -- the
-    #    arms above made that `fix-ci` (send a lane to repair code), and the dispatcher's fork
-    #    called it review-only (`unreviewed`). Both were wrong: re-trigger the check first.
+    #    absent (its job never got created), `drift-guard` red, `ai-review-gate` red and NOTHING
+    #    in flight -- the arms above made that `fix-ci` (send a lane to repair code), and the
+    #    dispatcher's fork called it review-only (`unreviewed`; that fork needed the
+    #    `ai-review-gate` red to get there -- without it, it said `no-checks`). Both were wrong:
+    #    re-trigger the check first.
     if gated_absent and not gated_red:
         return "rerun-checks"
     # 7. fix-ci -- a required check is RED: real code work.
@@ -1513,10 +1518,10 @@ def main():
     except Exception as e:                      # never break the heartbeat
         line = f"OBJECTIVE VERDICT=UNKNOWN error={str(e)[:60]}"
     # `RES:` GOES ON ITS OWN LINE. `cadence-nudge.sh` reads the objective line with a
-    # `cut -c1-820` (MEASURED 2026-10-16: 675 chars for 14 PRs with the ASK-USER overlay, 799
-    # for 40 PRs with 20 named), so APPENDING this segment would push the tail -- the CI
-    # indicators -- off the end. The fail-closed `queue_read=BLIND` caveat is emitted BEFORE the
-    # queue segment, so truncation can never drop it.
+    # `cut -c1-900` (its comment states what that covers, and why a "worst case" number is not
+    # worth claiming), so APPENDING this segment would push the tail -- the CI indicators -- off
+    # the end. The fail-closed `queue_read=BLIND` caveat is emitted BEFORE the queue segment, so
+    # truncation can never drop it.
     try:
         res = res_line()
     except Exception as e:
