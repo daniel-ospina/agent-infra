@@ -14,7 +14,8 @@
 # Upstream's own contract is preserved: stdin = a plain-text transcript, stdout = the
 # report, no arguments (it still accepts `--pr/--issues/--from-log/--all`).
 #
-# DEVIATIONS FROM THE UPSTREAM BYTES — three classes, four sites, all one defect:
+# DEVIATIONS FROM THE UPSTREAM BYTES — listed in full below (the pipefail-abort class is
+# three classes / four sites, all one defect; three further sites/deltas are recorded after it):
 # upstream runs under `set -euo pipefail`, and a pipeline whose `grep` finds NO match exits
 # 1, which ABORTS the whole producer. Measured on the vendored-as-received source:
 #     $ printf '[User] hi\n[Assistant] nothing here\n' | bash postmortem.sh
@@ -32,6 +33,12 @@
 # before the branch that fills them, so an empty transcript cannot reach the Summary with
 # them unset. Upstream's `${GATE_COUNT:-0}` fallbacks already covered that; the init only
 # makes the default visible where a reader looks for it.
+# A FIFTH delta, added in the same landing (#841/#864): four `echo "$text" | grep -q …`
+# sites became here-strings (`grep -q … <<<"$text"`). Same false-negative class, different
+# mechanism — `grep -q` exits at its first match, and under `set -o pipefail` the writer's
+# SIGPIPE makes the PIPELINE non-zero, so a transcript that DOES match reads as no-match
+# once it outgrows the pipe buffer. No pattern, and no output on any input, changed:
+# `bash scripts/check-no-sigpipe-grep.sh` is the instrument that refuses the idiom.
 #
 # Re-syncing with upstream: diff against the sha above; the only intended deltas are
 # the ones named here. Anything else is drift, and a second copy of this parser is how
@@ -100,17 +107,20 @@ detect_batch() {
     local text="$1"
 
     # "file issues" + "fix all" patterns
-    if echo "$text" | grep -qiE '(file|create).*issues.*(fix|implement).*all' 2>/dev/null; then
+    # Here-string, NOT a pipe (#841/#864): `grep -q` exits at the first match, and under
+    # `set -o pipefail` the resulting SIGPIPE on the writer makes the PIPELINE non-zero —
+    # so a matching transcript would read as no-match. A here-string has no writer to kill.
+    if grep -qiE '(file|create).*issues.*(fix|implement).*all' <<<"$text" 2>/dev/null; then
         echo "batch:issue-then-fix"
     fi
 
     # Numbered groupings: "all three", "both", "the first two"
-    if echo "$text" | grep -qiE '\b(all\s+(three|four|five|of\s+them)|the\s+(first|last)\s+(two|three))\b' 2>/dev/null; then
+    if grep -qiE '\b(all\s+(three|four|five|of\s+them)|the\s+(first|last)\s+(two|three))\b' <<<"$text" 2>/dev/null; then
         echo "batch:numbered-group"
     fi
 
     # "Do X for every Y" patterns
-    if echo "$text" | grep -qiE '\b(for\s+every|for\s+each|all\s+the)\b' 2>/dev/null; then
+    if grep -qiE '\b(for\s+every|for\s+each|all\s+the)\b' <<<"$text" 2>/dev/null; then
         echo "batch:for-each"
     fi
 
@@ -240,7 +250,7 @@ if [ -n "$SESSION_TEXT" ]; then
         IMPROVEMENTS=$((IMPROVEMENTS + 1))
     fi
     # Batch patterns → auto-continue or bulk tool
-    if echo "$BATCH" | grep -q . 2>/dev/null; then
+    if grep -q . <<<"$BATCH" 2>/dev/null; then
         echo "  - Batch pattern detected — consider bulk-operation tooling or /auto workflow"
         IMPROVEMENTS=$((IMPROVEMENTS + 1))
     fi

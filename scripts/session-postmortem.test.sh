@@ -300,8 +300,12 @@ fi
 # The literal that caused the defect, in CODE (a comment may cite the old path — the default is
 # what execs). Paired with the resolution assertion above: together they prove the producer is
 # derived from the script's own location, never a host-specific home path.
-if grep -vE '^[[:space:]]*#' "$SPM" | grep -qF '/Users/'; then
-  bad "session-postmortem.sh still carries a /Users/ literal in code: $(grep -vE '^[[:space:]]*#' "$SPM" | grep -nF '/Users/' | tr '\n' ' ')"
+# Capture first, then test: `grep -v … | grep -qF …` is the #841/#864 false-negative idiom — a
+# quiet grep exits at its first match, and the writer's SIGPIPE fails the pipeline under
+# `pipefail`, so a match can read as no-match.
+spm_code="$(grep -vE '^[[:space:]]*#' "$SPM" || true)"
+if grep -qF '/Users/' <<<"$spm_code"; then
+  bad "session-postmortem.sh still carries a /Users/ literal in code: $(grep -nF '/Users/' <<<"$spm_code" | tr '\n' ' ')"
 else
   ok "session-postmortem.sh has no /Users/ path in code (farmed: a Mac literal is a defect everywhere)"
 fi
