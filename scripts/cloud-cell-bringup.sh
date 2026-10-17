@@ -279,6 +279,12 @@ check_provider() {
           'Reply with exactly: LANE_READY' 2>&1 | tail -3)"
   case "$out" in
     *LANE_READY*) ok "provider call works (pi returned LANE_READY)" ;;
+    # ⛔ agent-infra#1884: `pi` is the SPAWN POINT now, and it refuses above the box's load ceiling —
+    # which is NOT a provider failure. Without this arm the refusal lands in the catch-all below and
+    # the bring-up reports "provider probe failed" for a call that never reached a provider, sending
+    # an operator to re-push a perfectly good key. The remedy for a refusal is capacity, so say that.
+    *'[pi-gate] REFUSED'*)
+      die "provider probe NOT RUN: the pi spawn point refused the launch (1-min load is at or above MAX_LOAD on this box). That is CAPACITY, not the provider — quieten the box (or raise MAX_LOAD deliberately) and re-run. Last output: $out" ;;
     *authentication_error*|*invalid*x-api-key*|*401*)
       die "provider key REJECTED (401). The image's pre-set key is stale — push a valid one." ;;
     *) die "provider probe failed. Last output: $out" ;;

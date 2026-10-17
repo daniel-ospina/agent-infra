@@ -30,7 +30,9 @@ is_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; 0) return 0 ;; 0*) return 1
 # FAIL-CLOSED, the opposite of the design's fail-open policy. `is_limit` (is_num AND at most 9
 # digits) is the predicate orch-loop.sh applies to every other tunable for exactly this reason.
 is_limit() { is_num "${1:-}" && [ "${#1}" -le 9 ]; }
-KIND=fixer; TAG="$PR"
+# ⛔ EXPORTED for the same reason as lane.sh: the SPAWN POINT is a child process (#1884), and a
+# refusal that cannot name its item is a log line an operator has to reverse-engineer.
+KIND=fixer; TAG="$PR"; export KIND TAG
 O="${O:-$HOME/orchestrator}"; mkdir -p "$O/logs" "$O/state"
 L="$O/logs/fix-$PR"
 export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
