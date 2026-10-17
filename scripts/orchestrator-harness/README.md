@@ -306,6 +306,75 @@ There is no scheduler, no queue service, no shared database. Two boxes running t
 the same repo work fine *because* GitHub is the coordination medium — but they will duplicate
 work unless they coordinate (see §5, "broad mode").
 
+### GitHub API surface — the REST adapter (`gh-rest`)
+
+The harness reaches GitHub through `gh`, whose hot paths (`pr view`, `pr checks`, `pr list`,
+`issue list`) are **GraphQL**. GraphQL has its own secondary limit, and when GitHub refuses it the
+failure is silent rather than loud: measured 2026-10-17, every GraphQL call returned
+`graphql_rate_limit` (even `{viewer{login}}`) while the primary quota still read `4511/5000` and the
+REST endpoints answered normally. A five-minute window with **every harness process killed** did not
+clear it.
+
+That one asymmetry stopped both halves of the harness, and neither log line named the cause:
+
+| Capability | Broken call | Symptom |
+|---|---|---|
+| dispatch | `fleet_state.py` board read (`gh pr list`) | *"the GitHub board could not be read"* → board stale → claim gate `INCOMPLETE` → backlog 0 |
+| merging | sweep per-PR reads (`gh pr view`, `gh pr checks`) | `NOCHECKS` → fail-closed → **no PR could merge** (19 mergeable PRs, hours) |
+
+`gh-rest/gh` is a PATH shim that supplies the REST equivalents for exactly those shapes and
+**delegates everything else verbatim** — including `gh api`, which is already REST:
+
+| Translated | REST endpoint |
+|---|---|
+| `pr view --json …` | `GET /repos/{o}/{r}/pulls/{n}` |
+| `pr checks --json …` | `GET /repos/{o}/{r}/commits/{sha}/check-runs` |
+| `pr list --json …` | `GET /repos/{o}/{r}/pulls?state=…` |
+| `issue list` / `issue view --json …` | `GET /repos/{o}/{r}/issues…` (PRs filtered out) |
+| `pr ready` | `POST …/pulls/{n}/ready_for_review` |
+| `pr merge` (incl. `--match-head-commit`) | `PUT …/pulls/{n}/merge` |
+| `pr comment --body` | `POST …/issues/{n}/comments` |
+
+**Design: an adapter, not a fork.** No harness file changes, so every cell stays on one harness
+version — the convergence property this repo exists to protect — while the API surface becomes a
+deployment concern. `install.sh` copies the shim to `$O/gh-rest/gh` and puts that directory **first**
+on the daemon `PATH`, so controller, lanes, chains and merge workers all inherit it.
+
+**Two deliberate refusals.** `pr merge --auto` is a GraphQL-only mutation (REST cannot express
+auto-merge), so it is *delegated* — it fails loudly while GraphQL is refused rather than pretending
+to have armed. And nothing is guessed: a failed REST call exits non-zero with the API's own message
+instead of returning an empty result that would read as "nothing to do".
+
+**The rule that keeps it honest:** a flag or filter the adapter does not model **delegates the whole
+call** to the real `gh`. It never drops a flag and answers anyway — dropping one is not a slow answer,
+it is a *wrong* one. Review of the first draft found that same bug at three severities, each of which
+would have caused the failure the adapter exists to prevent:
+
+| Dropped | Consequence |
+|---|---|
+| `pr list --head` | `chain-merge.sh` polls for "the branch's PR", gets the newest open PR, **merges an unrelated PR** and records the review marker against it |
+| `issue list --label` | the three severity queries return the same unfiltered list, so every issue is tier 0 and P0-before-P2 ordering inverts (#8465) |
+| `pr comment` output | `merge-one.sh` cannot extract the evidence URL and **parks every reviewed PR** with a false diagnosis |
+
+**Verify it** (offline; drives a stub `gh`, needs no credentials, 28 assertions):
+
+```bash
+bash gh-rest.test.sh
+```
+
+The invocations in the suite are **copied from the callers** (`chain-merge.sh`, `refresh-candidates.sh`,
+`fix-one.sh`, `merge-one.sh`), not invented — the first draft asserted shapes nobody used and shipped
+two P0s green. They pin: `--paginate` returning concatenated arrays; positionals starting at `$3`;
+a handler that falls through printing twice; REST's `open`/`true` vs gh's `OPEN`/`MERGEABLE`; REST
+`/issues` including PRs; `--limit`; legacy commit statuses (a protection context that is not a check
+run); a 200 whose body says `merged: false`; and a failing `--jq` exiting non-zero instead of looking
+like "no rows".
+
+**Known gap (tracked separately):** the install stamp and `check-deployed-drift.sh` fold their payload
+over `$O/*.sh` only, so this adapter — like `launchd.plist.template` — is outside the deployed-bytes
+record. Adding it in one place alone makes every healthy deployment read as drift, so it needs the
+stamp, the drift checker and the selftest moved together.
+
 ---
 
 ## 4. Install
