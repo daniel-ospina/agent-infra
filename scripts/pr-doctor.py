@@ -384,6 +384,10 @@ def materialise_worktree(pr: dict) -> tuple[str, str]:
     # pointer (disposable). A directory that might contain work is left alone for inspection.
     path = ""
     for cand in candidates:
+        if os.path.islink(cand):
+            # A symlink is never a free path: a DANGLING one fails `os.path.exists`, so without this
+            # it would be chosen as "absent" and `worktree add` would fail "already exists" for ever.
+            continue
         if not os.path.exists(cand):
             path = cand
             break
@@ -393,8 +397,8 @@ def materialise_worktree(pr: dict) -> tuple[str, str]:
             path = cand
             break
     if not path:
-        return "", ("%s and %s both exist but neither is a live worktree, and neither is "
-                    "disposable -- refusing to delete either; inspect and clean"
+        return "", ("%s and %s are both unusable (a symlink, a non-worktree directory, or an "
+                    "unremovable record) -- refusing to delete either; inspect and clean"
                     % (candidates[0], candidates[1]))
 
     # A fork PR's headRefName can COLLIDE with a local branch, so branch existence is NOT the
