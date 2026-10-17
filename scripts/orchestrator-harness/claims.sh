@@ -29,6 +29,15 @@
 # and stops a pushed-update PR from being blocked by a stale claim for its predecessor head.
 # This is also the defect #1709 found in the existing lock: it is keyed on <PR> alone.
 #
+# ⛔ REC 1 STANDS, AND THE LANDING PATH NEEDS A SECOND KEY ON TOP OF IT (agent-infra#1952).
+# `<PR>-<sha12>` says "this head", never "this PR" — two boxes looking at ONE PR at two DIFFERENT
+# heads mint two DISTINCT keys and each wins its own CAS. That is correct for review (a pushed
+# update IS new work, and a duplicate review is a tolerated duplicate comment), and WRONG for
+# landing a merge: the one operation whose duplicate does not degrade to at-least-once, because a
+# second landing attempt lands on a MOVED head with evidence bound to the old one (#1908's
+# per-operation table — measured as row M3 of its claim-exclusion measurement). So landing takes the
+# coarser `pr-<N>` key BELOW as well — the two are complementary, and neither is re-keyed.
+#
 # LEASE = DATA, NOT LIVENESS (rec 3). Git refs have no TTL and a remote owner's pid cannot be
 # probed (`kill -0` is meaningless across boxes — the existing `claim_live()` relies on it).
 # So the claim commit's message carries `owner` and `lease_until`; every box treats an expired
@@ -157,6 +166,29 @@ claim_issue_key() { printf 'issue-%s' "$1"; }
 # claim_issue_ref <issue> -> "refs/claims/issue-<N>"
 claim_issue_ref() { printf '%s/%s' "$CLAIM_NS" "$(claim_issue_key "$1")"; }
 
+# ── THE LANDING KEY: "pr-<N>", ONE REF PER PR (agent-infra#1952) ──────────────────────────────
+# Why a SECOND ref rather than re-keying the review claim: the issue number and the head sha are
+# different content addresses and only the head is additive. A `pr-<N>`-only registry would make a
+# pushed update wait behind a stale claim for its predecessor head — the exact defect rec 1 above
+# was written to remove — and it would also serialise two boxes that are legitimately reviewing two
+# different heads of one PR, which multiplies review cost across the fleet for no safety gain. So
+# the per-head key stays the review/evidence key and `pr-<N>` is taken ONLY by the landing path
+# (`merge-one.sh`), which is the one operation #1908's table says cannot tolerate a duplicate.
+#
+# ⛔ THE KEYS CANNOT COLLIDE, AND THAT IS WHY `pr-` IS A PREFIX AND NOT A BARE NUMBER. A per-head
+# key is `<N>-<sha12>`, so a bare `<N>` would in fact be disjoint too — but `pr-<N>` also cannot be
+# confused with `issue-<N>` (the two `-` prefixed forms are visibly the same family), and a reader
+# of `refs/claims/1850` alone could not tell which question it answers. One ref, one question.
+#
+# ⛔ HOLD ORDER IS FIXED: pr-<N> FIRST, THEN <N>-<sha12>. merge-one.sh takes them in that order at
+# every ingress, so the two locks have a total order and cannot deadlock by being taken in opposite
+# orders by two boxes. Both REFUSE rather than block (a claim is a CAS, not a mutex), so a transient
+# head-first holder only costs one cycle.
+claim_pr_key() { printf 'pr-%s' "$1"; }
+
+# claim_pr_ref <pr> -> "refs/claims/pr-<N>"
+claim_pr_ref() { printf '%s/%s' "$CLAIM_NS" "$(claim_pr_key "$1")"; }
+
 # _claim_commit <owner> <lease_until> -> commit sha carrying the lease as data
 #
 # ⛔ THE NONCE IS LOAD-BEARING, NOT DECORATION (P1 in the 2026-10-14 export review). A claim commit
@@ -199,10 +231,21 @@ claim_issue_acquire() {
   _claim_acquire_at "$(claim_issue_ref "$2")" "${3:-$CLAIM_ISSUE_TTL}" "$CLAIM_ISSUE_TTL"
 }
 
-# _claim_acquire_at <ref> [ttl] — the ref-explicit CAS core that BOTH keyings share.
-# ⛔ ONE IMPLEMENTATION, TWO KEYS. A second copy of the CAS for the issue key would let the two
-# drift, and every property #1709 established (atomic create, nonce, read-back, lease-as-data, CAS
-# reclaim, and the infra-vs-lost-race classification) is exactly what must NOT differ between them.
+# claim_pr_acquire <repo> <pr> [ttl] — the SAME CAS, keyed by PR (agent-infra#1952)
+# Sets CLAIM_RESULT / CLAIM_COMMIT / CLAIM_REF / CLAIM_OWNER exactly as claim_acquire does, so a
+# caller that already handles rc=1 (another box owns it) and rc=2 (infra) needs no new vocabulary.
+# ⛔ The default lease is the PR claim's own CLAIM_TTL, not the issue claim's 3 h: this claim covers
+#    a review-plus-merge, exactly like the per-head claim it is taken alongside, and merge-one.sh
+#    passes its derived `REVIEW_TIMEOUT + 1200` explicitly rather than relying on either default.
+claim_pr_acquire() {
+  _claim_acquire_at "$(claim_pr_ref "$2")" "${3:-$CLAIM_TTL}" "$CLAIM_TTL"
+}
+
+# _claim_acquire_at <ref> [ttl] — the ref-explicit CAS core that EVERY keying shares.
+# ⛔ ONE IMPLEMENTATION, EVERY KEY (per-head, issue, landing). A second copy of the CAS for a new key
+# would let the keyings drift, and every property #1709 established (atomic create, nonce, read-back,
+# lease-as-data, CAS reclaim, and the infra-vs-lost-race classification) is exactly what must NOT
+# differ between them.
 _claim_acquire_at() {
   local ref="$1" ttl="$2" dflt="${3:-$CLAIM_TTL}"
   local now until commit back cur tmp perr after
@@ -344,6 +387,13 @@ claim_issue_release() {
   _claim_release_at "$(claim_issue_ref "${2:-}")" "${3:-}"
 }
 
+# claim_pr_release <repo> <pr> [<own-commit>] — fenced release of a LANDING claim (#1952).
+# Same fence and same reason strings as claim_release, so a stale holder cannot delete a winner's
+# per-PR claim either.
+claim_pr_release() {
+  _claim_release_at "$(claim_pr_ref "${2:-}")" "${3:-}"
+}
+
 # _claim_release_at <ref> [<own-commit>]
 # ⛔ `own` IS READ WITH `:-`, AND THAT IS A FIX, NOT STYLE (agent-infra#1850). The PR-keyed wrapper
 # used to read `$4` BARE while `set -u` is on, so a three-argument call — a caller that has no
@@ -372,6 +422,11 @@ claim_status() {
 # claim_issue_status <repo> <issue> -> "owner\tlease_until", rc=1 if unheld (#1850)
 claim_issue_status() {
   _claim_status_at "$(claim_issue_ref "$2")"
+}
+
+# claim_pr_status <repo> <pr> -> "owner\tlease_until", rc=1 if unheld (#1952)
+claim_pr_status() {
+  _claim_status_at "$(claim_pr_ref "$2")"
 }
 
 _claim_status_at() {

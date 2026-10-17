@@ -202,7 +202,7 @@ processes in tmux sessions, so a killed worker cannot take the controller down w
 | `candidates.txt` | the dispatch backlog: issue numbers that passed collision pre-flight |
 | `dispatched.txt` | issues already handed to a lane — **pruned** when the issue is still open, no PR branch matches it and no `lane-<N>` is live (see §7.1) |
 | `checked.txt` | issues whose pre-flight returned **CLEAN** (the terminal verdict); an **errored** pre-flight and a **COLLISION** leave no entry, so the next pass re-attempts them (agent-infra#1716). A reaped number is dropped from it too, so the pre-flight re-queues the issue |
-| `state/mergeclaim-<PR>.lock` | single-owner claim: only one worker may review/record/merge a given PR |
+| `state/mergeclaim-<PR>.lock` | single-owner claim: only one worker may review/record/merge a given PR. **Per box** — the cross-box fence for the landing path is `refs/claims/pr-<PR>` in the shared repo (§7.2b) |
 | `state/needsfix-<PR>-<head>` | "a reviewer found real issues at this exact head" |
 | `state/fixcount-<PR>` | fixer attempts for that PR, capped by `MAX_FIX_TRIES` |
 | `state/parked-<PR>` | terminal state: the fixer cap was reached at the head recorded inside the file, so the sweep skips it until a new push re-arms it |
@@ -506,12 +506,16 @@ off macOS (it renders a launchd plist) — the portability that matters is `orch
    to a raw `gh pr merge` there. Either way the fail-closed rule holds *inside* the repo's own
    required set: a required check that has not reported is `PENDING`, never green, and an
    unreadable protection endpoint uses `FALLBACK_REQ` (non-empty), never an empty set.
-1b. **One owner per PR, per box.** Every path into `merge-one.sh` (the lane's `chain-<N>`, a
-   `fix-<PR>`, and the controller's sweep) takes the same atomic `state/mergeclaim-<PR>.lock` first.
-   Without it a freshly opened PR gets two concurrent reviewers racing one head: duplicate evidence
+1b. **One owner per PR, per box — and, for LANDING, one owner per PR ACROSS boxes.** Every path
+   into `merge-one.sh` (the lane's `chain-<N>`, a `fix-<PR>`, and the controller's sweep) takes the
+   same atomic `state/mergeclaim-<PR>.lock` first, then `refs/claims/pr-<PR>` (**before** the paid
+   reviewer) and `refs/claims/<PR>-<head-sha12>` (§7.2b).
+   Without the local lock a freshly opened PR gets two concurrent reviewers racing one head: duplicate
+   evidence
    comments, duplicate `record-review` writes, and an `ISSUES`/`CLEAN` interleaving.
-   **This is a local file, so it serialises one box only** — two boxes sharing a repo are not
-   coordinated by it (§7.2b, tortoise#5052).
+   **The lock is a local file, so it serialises one box only** — two boxes sharing a repo are not
+   coordinated by it (§7.2b, tortoise#5052). The per-head claim coordinates them per HEAD; the
+   per-PR claim coordinates them per PR, which is the only key that can express "one lander".
 2. **The reviewer must state a plain outcome.** Its final line is exactly `CLEAN <comment-url>`
    or `ISSUES <n>`. A CLEAN comment may not assert an unresolved outcome. The enforcer is the
    evidence veto in `scripts/record-review.sh`, and its vocabulary is `NOT CLEAN`, "requires human
@@ -738,6 +742,41 @@ agent-infra#1709's headline finding is that duplicate execution is unavoidable a
 must be idempotent per head, so failing closed would stall the whole fleet on one transient error.
 `SCOPE=own` (§5, item 3) remains a useful partition but is no longer the only cross-box barrier.
 
+#### The landing key `refs/claims/pr-<N>` — the per-head key cannot answer "is one box landing this PR?" (agent-infra#1952)
+
+The registry above is **content-addressed on the head sha**, so `refs/claims/<PR>-<head-sha12>` says
+*"another box is working THIS HEAD"*. That is the right question for a **review** — a pushed update is
+legitimately new work, and a duplicate review costs one duplicate comment. It is the wrong question
+for **landing a merge**, which is the one operation #1908's per-operation table records as *not*
+tolerating at-least-once: `gh pr merge` is **not pinned to a sha**, so the second lander merges
+whatever head is current at the moment it runs, against a signed marker bound to the head *it*
+reviewed. Two boxes that see one PR at two different heads mint **two distinct keys** and each wins
+its own CAS; that was measured — do not take it from this paragraph (row **M3** of
+`claim-exclusion.test.sh`, recorded in the per-operation table).
+
+So landing takes a **second, coarser ref, `refs/claims/pr-<N>`**, *in addition to* the head key — the
+head key is **not** re-keyed, because that would reverse rec 1 (`claims.sh`'s "KEY =
+<PR>-<head-sha12>, NOT <PR>") and make a pushed update wait behind a stale claim for its predecessor
+head. `merge-one.sh` takes `pr-<N>` **first** and `<N>-<sha12>` **second**, at every ingress (the
+lane's `chain-<N>`, a `fix-<PR>`, and the sweep), so the two refs have one total order and cannot be
+taken in opposite orders by two boxes. The landing claim is taken **before the paid reviewer runs**,
+so the losing box pays nothing, and it is released by the `EXIT` trap after the merge — both releases
+bounded (~20 s each), head first and the PR-wide ref second, so the coarser ref — the one every box
+must see free — is the last to be dropped. A refusal (`rc=1`) exits **before** the review; an
+**unreachable** registry (`rc=2`) fails **open** and logs it, the same policy the head claim uses
+(§7.2b above), and a box whose `$O/claims.sh` predates `claim_pr_acquire` is a **named** log state,
+not a silent degradation.
+
+⛔ **What is measured, and what is not.** `test-gates.sh` §"THE LANDING CLAIM" pins the mechanism
+hermetically against a throwaway bare origin: the second box is **refused the same PR** (L1), the
+three keys stay independent and the head key stays per-head (L2), a non-holder's fenced release is
+refused (L3), a release genuinely frees the PR (L4), the row is non-vacuous — a forced create push
+makes both boxes win, so L1 can go red (L5) — and `merge-one.sh` acquires before the reviewer and
+releases on every exit (L6). What is **not** measured is the merge itself: `gh pr merge` on a moved
+head needs GitHub, so the residual — a head that moves inside the marker-check→merge window — is
+closed only to the extent that a second **lander** is excluded; a push that races an in-flight merge
+from elsewhere is still possible and is why the marker is re-read at the live head.
+
 ### 7.2c ISSUE dispatch was the uncovered window — **FIXED in agent-infra#1850**
 
 `refs/claims/<PR>-<head-sha12>` is **content-addressed on a head sha**, so it cannot express an
@@ -788,6 +827,12 @@ Two incidental defects are fixed with it: `claim_release` read its third/fourth 
 under `set -u`, so a caller with no commit to fence on aborted with
 `line 260: $4: unbound variable` instead of taking the documented refusal — a release that **errors**
 leaves the claim held for the whole lease (3 h of a free issue, for the issue key).
+
+The registry now carries **three** keys, one question each, and none is a re-keying of another:
+`<PR>-<sha12>` ("this head", review/evidence), `issue-<N>` ("this issue", dispatch), and
+`pr-<N>` ("this PR", **landing** — §7.2b). They cannot collide: the `issue-` and `pr-` prefixes
+put them in their own families, and `<N>-<sha12>` always carries a dash, so a PR number alone never
+addresses a head.
 
 `test-claims.sh` (I1–I9) pins the issue key against live origin from two throwaway clones, including
 the **non-vacuity case for this defect**: A claims an issue with **no branch, no PR and no push of
@@ -985,7 +1030,7 @@ algorithmic advantage. The claim worth evaluating is *utilisation*, not *efficie
 | `fix-one.sh` | fixes a reviewer's findings, pushes, re-runs the merge chain |
 | `refresh-candidates.sh` | pre-flights issues (collision check) into the backlog |
 | `selftest.sh` | offline checks; each one drives the shipped code. Not part of the loop |
-| `test-gates.sh` | the `mp_reason` dispatch-gate rule table, extracted from the shipped `orch-loop.sh`. Not part of the loop |
+| `test-gates.sh` | the `mp_reason` dispatch-gate rule table, extracted from the shipped `orch-loop.sh`; the repo-authority contract and the rail branch driven from `merge-one.sh`; and (agent-infra#1952) the **landing claim** — a second box refused the same PR, three independent keys, fenced release, release frees the PR, non-vacuity, and `merge-one.sh`'s acquire-before-the-review ordering. Hermetic |
 | `test-claims.sh` | the claim CAS against live origin from two throwaway clones. Not the cross-box proof (one machine), but red on a defeated CAS. Not part of the loop |
 | `test-crossbox.sh` | drives the real `merge-one.sh` claim acquire + trap release with `gh` stubbed. Not part of the loop |
 | `refresh-scout.test.sh` | the agent-infra#1736 contract: repo-aware scout provisioning, per-repo tool resolution, and the permanent/transient refresh split. Not part of the loop |
