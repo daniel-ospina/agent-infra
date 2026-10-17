@@ -278,8 +278,8 @@ def test_main_writes_no_state_row_for_a_refused_spawn(monkeypatch):
     saved = {}
     monkeypatch.setattr(pr, "load_state", lambda: {})
     monkeypatch.setattr(pr, "open_prs", lambda: [_pr(1)])
-    monkeypatch.setattr(pr, "classify", lambda p: "failing")
-    monkeypatch.setattr(pr, "brief", lambda p, a: "b")
+    monkeypatch.setattr(pr, "classify", lambda p: ("fix-ci", "python-ci-gate", []))
+    monkeypatch.setattr(pr, "brief", lambda p, a, why=None, cr=None: "b")
     monkeypatch.setattr(pr, "log", lambda m: None)
     monkeypatch.setattr(pr, "worker_status", lambda name: "failed")
     monkeypatch.setattr(pr, "dispatch", lambda p, a, t, d: (False, "gate refused rc=75", False))
@@ -287,7 +287,9 @@ def test_main_writes_no_state_row_for_a_refused_spawn(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["pr-doctor.py"])
     monkeypatch.setenv("MAX_FIX", "16")
     monkeypatch.setenv("MAX_REVIEW", "12")
-    assert pr.main() == 0
+    # rc=2, not 0: since #1872 a pass with legible work that placed NOTHING is not a clean pass
+    # ("0 is reserved for readable, nothing to do"). The property this test pins is the STATE ROW.
+    assert pr.main() == 2
     assert not [k for k in saved if not k.startswith("_")], \
         "a refused spawn must not consume a state row / budget slot"
 
@@ -297,8 +299,8 @@ def test_main_writes_a_state_row_for_a_persistent_refusal(monkeypatch):
     saved = {}
     monkeypatch.setattr(pr, "load_state", lambda: {})
     monkeypatch.setattr(pr, "open_prs", lambda: [_pr(1)])
-    monkeypatch.setattr(pr, "classify", lambda p: "failing")
-    monkeypatch.setattr(pr, "brief", lambda p, a: "b")
+    monkeypatch.setattr(pr, "classify", lambda p: ("fix-ci", "python-ci-gate", []))
+    monkeypatch.setattr(pr, "brief", lambda p, a, why=None, cr=None: "b")
     monkeypatch.setattr(pr, "log", lambda m: None)
     monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
     monkeypatch.setattr(pr, "dispatch",
@@ -1131,8 +1133,10 @@ def _drive(monkeypatch, *, prs, action, cap_env, dispatch=None):
     sent = []
     monkeypatch.setattr(pr, "load_state", lambda: {})
     monkeypatch.setattr(pr, "open_prs", lambda: list(prs))
-    monkeypatch.setattr(pr, "classify", lambda p: action(p) if callable(action) else action)
-    monkeypatch.setattr(pr, "brief", lambda p, a: "brief-%s" % p["number"])
+    monkeypatch.setattr(pr, "classify",
+                        lambda p: ((action(p) if callable(action) else action), "why", []))
+    monkeypatch.setattr(pr, "brief",
+                        lambda p, a, why=None, cr=None: "brief-%s" % p["number"])
     monkeypatch.setattr(pr, "log", lambda msg: None)
     if dispatch is None:
         def dispatch(p, a, text, dry):
@@ -1277,8 +1281,8 @@ def test_a_worker_that_outlives_the_pass_still_writes_a_state_row(monkeypatch, t
     _wire_dispatch(monkeypatch, tmp_path, d, wt)
     monkeypatch.setattr(pr, "load_state", lambda: {})
     monkeypatch.setattr(pr, "open_prs", lambda: [_pr(5)])
-    monkeypatch.setattr(pr, "classify", lambda p: "failing")
-    monkeypatch.setattr(pr, "brief", lambda p, a: "b")
+    monkeypatch.setattr(pr, "classify", lambda p: ("fix-ci", "python-ci-gate", []))
+    monkeypatch.setattr(pr, "brief", lambda p, a, why=None, cr=None: "b")
     monkeypatch.setattr(pr, "save_state", lambda st: saved.update(st))
     monkeypatch.setattr(sys, "argv", ["pr-doctor.py"])
     monkeypatch.setenv("MAX_FIX", "16")
@@ -1329,8 +1333,8 @@ def test_a_head_change_does_not_bypass_the_live_worker_guard(monkeypatch):
                 "at": "2026-01-01T00:00:00Z", "at_epoch": 0}}
     monkeypatch.setattr(pr, "load_state", lambda: dict(st))
     monkeypatch.setattr(pr, "open_prs", lambda: [_pr(7)])
-    monkeypatch.setattr(pr, "classify", lambda p: "failing")
-    monkeypatch.setattr(pr, "brief", lambda p, a: "b")
+    monkeypatch.setattr(pr, "classify", lambda p: ("fix-ci", "python-ci-gate", []))
+    monkeypatch.setattr(pr, "brief", lambda p, a, why=None, cr=None: "b")
     monkeypatch.setattr(pr, "log", lambda m: None)
     monkeypatch.setattr(pr, "worker_status", lambda name: "running")   # prd-7 is alive
     monkeypatch.setattr(pr, "dispatch", lambda p, a, t, d: calls.append(p["number"]) or (True, "", True))
@@ -1686,14 +1690,13 @@ def test_the_brief_never_tells_a_fork_fixer_to_push(monkeypatch):
     commits no ref holds makes `_ensure_head` refuse that PR for ever afterwards. A base-repo PR
     gets the explicit refspec, which is the form that works from an ATTACHED *or* a DETACHED tree.
     """
-    monkeypatch.setattr(pr, "rollup", lambda n: ({}, [], [], []))
     fork = _pr(7)
     fork["isCrossRepository"] = True
-    text = pr.brief(fork, "failing")
+    text = pr.brief(fork, "fix-ci", "python-ci-gate", [])
     assert "THERE IS NO BRANCH HERE TO PUSH" in text
     assert "git push origin HEAD:" not in text, "a fork fixer was given a push it cannot perform"
     assert "refs/pull/7/head" in text
-    base = pr.brief(_pr(8), "failing")
+    base = pr.brief(_pr(8), "fix-ci", "python-ci-gate", [])
     assert "git push origin HEAD:refs/heads/fix/branch-8" in base
 
 
@@ -1720,3 +1723,402 @@ def test_dry_run_reports_the_worktree_refusal(monkeypatch, tmp_path):
     # read-only: nothing was created, deleted or registered
     assert (repo / ".worktrees" / "prd-5" / "precious.txt").read_text() == "work\n"
     assert "prd-5" not in g("worktree", "list", "--porcelain").stdout
+
+
+# ── 8. #1872/#1930 — ONE classifier, and a pass that places nothing is not a clean pass ──
+# These come from `origin/main` (`3f8ed4bca`), where they were hardened over fifteen review
+# rounds of the single-classifier change. This branch rewrote the DISPATCH transport underneath
+# them, so the cases that pin the LANE ROSTER (`idle_lanes`, "no idle lanes") do not apply here --
+# the lane table is retired (#1890) -- and are re-expressed against the worker transport where the
+# property still exists (see the `undeliverable` cases below).
+@pytest.fixture(autouse=True)
+def _clean_module_state(monkeypatch):
+    """⛔ MODULE STATE LEAKS BETWEEN TESTS AND SILENTLY CHANGES THE EXIT CODE (#1872 round 5).
+
+    `open_prs()` WRITES the module global `OPEN_PRS_ERROR`, and `main()` reads it before anything
+    else (`if OPEN_PRS_ERROR: ... return 2`). A test that drives `open_prs()` into a failure leaves
+    that global truthy, so every LATER test in the same process that calls `main()` takes the
+    queue-refusal branch instead of the branch it was written for. MEASURED: running the
+    open-PR-failure test before the partly-blind tests makes them fail with `assert 2 == 0`; the file
+    is green in its own order only because that test sits further down. Worse, it makes the round-5
+    saturation test pass for the WRONG REASON (the queue refusal, not the unreadable refusal it
+    exists to pin).
+
+    ⛔ HOW IT IS FIXED, STATED CORRECTLY (#1872 review round 9). `monkeypatch.setattr(obj, name, v)`
+    records the PRE-TEST value and restores it on undo, so a test body that assigns the global
+    DIRECTLY is still restored -- verified: a fixture whose only act is the setup `setattr` restores
+    `None` after the body writes `"dirty"`. The SETUP line below is therefore the whole fix; a
+    teardown reset would be redundant, and claiming that "monkeypatch cannot undo a plain module
+    assignment" would teach the next fixture a rule that is not true.
+
+    Same class of leak as `objective.GH_BLOCKED`: reset the state each test depends on, in one place.
+    """
+    monkeypatch.setattr(pr, "OPEN_PRS_ERROR", None, raising=False)
+
+def test_a_blind_read_cause_is_captured_per_pr_not_read_after_the_loop(monkeypatch):
+    """⛔ THE CAUSE MUST BELONG TO THE READ THAT FAILED (#1872 review round 3).
+
+    `objective.GH_LAST_ERROR` is reset per read so it names THAT read -- which means re-reading it
+    after the classify loop reports the LAST PR's cause, and "(no gh error recorded)" whenever a
+    later PR read fine. Round 2 shipped exactly that inversion; this pins the fix.
+    """
+    logs = []
+    monkeypatch.setattr(pr, "load_state", lambda: {})
+    monkeypatch.setattr(pr, "open_prs", lambda: [_pr(1), _pr(2)])
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--dry-run"])
+
+    def classify(p):
+        if p["number"] == 1:
+            # the classifier records the failure and reports a blind read ...
+            monkeypatch.setattr(pr.CLASSIFIER, "GH_LAST_ERROR",
+                                "API rate limit exceeded for 1.2.3.4", raising=False)
+            return (None, None, None)
+        # ...then the NEXT PR reads fine and clears it, as the real per-read reset does
+        monkeypatch.setattr(pr.CLASSIFIER, "GH_LAST_ERROR", "", raising=False)
+        return ("running", None, [])
+
+    monkeypatch.setattr(pr, "classify", classify)
+    # 2 = the round-5 refusal (a blind read and nothing dispatched); this test is about the LOG.
+    assert pr.main() == 2
+    joined = "\n".join(logs)
+    assert "rate limit" in joined, joined
+    assert "no gh error recorded" not in joined, joined
+
+def _cr(*, red=(), absent=(), flight=(), extra_red=()):
+    """A check-run list in the REST shape `objective.per_pr_checks()` returns.
+
+    `flight` names become `status=in_progress` attempts; a name outside the required set becomes
+    its own check-run, which is the live shape (`python-ci-gate` absent while its children run).
+    """
+    du = "https://github.com/o/r/actions/runs/1/job/2"
+    out, i = [], 0
+    for n in pr.CLASSIFIER.REQUIRED:
+        if n in absent:
+            continue
+        i += 1
+        out.append({"id": i, "name": n,
+                    "status": "in_progress" if n in flight else "completed",
+                    "conclusion": None if n in flight else (
+                        "failure" if n in red else "success"),
+                    "app": {"slug": "actions"}, "details_url": du})
+    for n in pr.CLASSIFIER.RAIL_GATES:
+        i += 1
+        out.append({"id": i, "name": n, "status": "completed", "conclusion": "success",
+                    "app": {"slug": "actions"}, "details_url": du})
+    for j, n in enumerate(extra_red):
+        out.append({"id": 900 + j, "name": n, "status": "completed",
+                    "conclusion": "failure", "app": {"slug": "actions"}, "details_url": du})
+    for j, n in enumerate([x for x in flight if x not in pr.CLASSIFIER.REQUIRED]):
+        out.append({"id": 950 + j, "name": n, "status": "in_progress", "conclusion": None,
+                    "app": {"slug": "actions"}, "details_url": du})
+    return out
+
+# The PR shapes #1930's acceptance test partitions (ported from origin/main).
+_SHAPES = {
+    "#8806": (_cr(red=["ai-review-gate"], absent=["python-ci-gate"],
+                  flight=["test (a)", "test-slow (a)"]), False, "BLOCKED", "running"),
+    # recorded with NOTHING in flight: the gate job was never created, so it must be re-triggered
+    "#8822": (_cr(red=["ai-review-gate"], absent=["python-ci-gate"], extra_red=["drift-guard"]),
+              False, "BLOCKED", "rerun-checks"),
+    "#8824": (_cr(red=["ai-review-gate"], absent=["python-ci-gate"],
+                  flight=["test (%s)" % c for c in "abcdefghi"]), False, "BLOCKED", "running"),
+    "#8825": (_cr(red=["ai-review-gate"], absent=["python-ci-gate"],
+                  flight=["pricing-artifact"]), False, "BLOCKED", "running"),
+    # ...and the shapes that DO need a lane, so the assertion is not "everything is running".
+    "ready": (_cr(red=["ai-review-gate"]), True, "BLOCKED", "call-rail"),
+    "review": (_cr(red=["ai-review-gate"]), False, "BLOCKED", "record-review"),
+    "red": (_cr(red=["python-ci-gate"]), False, "BLOCKED", "fix-ci"),
+    "conflict": (_cr(red=["python-ci-gate"]), False, "DIRTY", "resolve-conflict"),
+    "nothing-ran": (_cr(absent=pr.CLASSIFIER.REQUIRED), False, "BLOCKED", "rerun-checks"),
+}
+
+
+def _pr_set(monkeypatch, shapes=None):
+    """The PR dicts, with BOTH readers pointed at the same evidence through objective's seams."""
+
+
+def _pr_set(monkeypatch, shapes=None):
+    """The PR dicts, with BOTH readers pointed at the same evidence through objective's seams."""
+    shapes = shapes or _SHAPES
+    heads = {name: "%040x" % (i + 1) for i, name in enumerate(shapes)}
+    numbers = {name: 8800 + i for i, name in enumerate(shapes)}
+    by_head = {heads[name]: shapes[name][0] for name in shapes}
+    att = {numbers[name]: shapes[name][1] for name in shapes}
+    monkeypatch.setattr(pr.CLASSIFIER, "per_pr_checks", lambda sha: by_head.get(sha))
+    monkeypatch.setattr(pr.CLASSIFIER, "attestation_clean", lambda num, sha: att[num])
+    return [{"number": numbers[name], "isDraft": False, "mergeStateStatus": shapes[name][2],
+             "headRefOid": heads[name], "title": name, "files": []} for name in shapes], shapes
+
+def test_the_beat_counts_equal_the_dispatchers_classification(monkeypatch):
+    """THE ACCEPTANCE TEST (#1872). One PR set, one evidence read, ONE answer.
+
+    `objective.classify_queue()` produces the beat's per-class counts; `pr-doctor.classify()`
+    produces the dispatch plan. They are asserted to be the same multiset over the same PRs --
+    which is what makes them one instrument rather than two that happen to agree today.
+    """
+    non, shapes = _pr_set(monkeypatch)
+    classes, surface, by_class, surface_prs = pr.CLASSIFIER.classify_queue(non)
+    assert classes is not None, "the partition must reconcile over a fully-readable set"
+    # 1. the multiset is identical -- the property the issue asks for
+    assert sorted(pr.classify(p)[0] for p in non) == sorted(
+        k for k, c in classes.items() for _ in range(c)), (dict(classes), by_class)
+    # 2. every PR lands in its expected class -- so the matrix is not vacuous
+    want = {p["number"]: shapes[p["title"]][3] for p in non}
+    got = {p["number"]: pr.classify(p)[0] for p in non}
+    assert got == want, got
+    # 3. and the beat's per-PR bucket agrees with the plan, PR by PR (not merely in total)
+    by_number = {p["number"]: p for p in non}
+    for klass, rows in by_class.items():
+        for num, _why in rows:
+            assert pr.classify(by_number[num])[0] == klass, (klass, num)
+    # the PRs that USED to disagree: each now has ONE answer, and it is the one the evidence
+    # supports -- wait when the suite is running, re-trigger when the gate job was never created
+    for name in ("#8806", "#8824", "#8825"):
+        p = [x for x in non if x["title"] == name][0]
+        assert pr.classify(p)[0] == "running", name
+    p = [x for x in non if x["title"] == "#8822"][0]
+    assert pr.classify(p)[0] == "rerun-checks"
+    # the surface overlay names the PRs it counts -- an owner gate that prints only a NUMBER
+    # tells the person it gates nothing they can act on
+    assert surface == len(surface_prs)
+
+def test_a_red_required_check_is_still_work_beside_a_running_job(monkeypatch):
+    """⛔ THE BROADENING MUST NOT SWALLOW REAL WORK (#8708), AND THIS WAS A REAL DEFECT IN THE
+    FIRST CUT OF THIS CHANGE (found in review, reproduced here).
+
+    `python-ci-gate` is absent while its children run, so "absence + something in flight" means
+    "not reported yet" -- `running`. But a REQUIRED check that is genuinely RED is work NOW: a
+    FAST required context (`docs`, `legal-e2e`, `test-isolation`, `license-surface`) fails long
+    before the matrix finishes, so red-beside-an-absent-gate is the DOMINANT live shape. Without
+    the `not gated_red` term every such PR was `running` for the rest of the suite and no lane
+    ever repaired it.
+    """
+    non, _shapes = _pr_set(monkeypatch, {
+        # the shape that was masked: a RED fast gate, the gate job not created, lint running
+        "red-plus-absent-plus-running": (
+            _cr(red=["docs"], absent=["python-ci-gate"], flight=["agent-infra-ci / lint"]),
+            False, "BLOCKED", "fix-ci"),
+        # ...and the same red beside a REQUIRED check in flight is still work
+        "red-plus-required-flight": (_cr(red=["docs"], flight=["python-ci-gate"]),
+                                     False, "BLOCKED", "fix-ci"),
+        # no red: this is genuinely a wait
+        "absent-plus-running": (_cr(red=["ai-review-gate"], absent=["python-ci-gate"],
+                                    flight=["agent-infra-ci / lint"]),
+                                False, "BLOCKED", "running"),
+        # no red, nothing running: the job was never created, so start it
+        "absent-nothing-running": (_cr(red=["ai-review-gate"], absent=["python-ci-gate"]),
+                                   False, "BLOCKED", "rerun-checks"),
+    })
+    assert {p["title"]: pr.classify(p)[0] for p in non} == {
+        "red-plus-absent-plus-running": "fix-ci",
+        "red-plus-required-flight": "fix-ci",
+        "absent-plus-running": "running",
+        "absent-nothing-running": "rerun-checks",
+    }
+
+def test_the_dispatcher_carries_no_predicate_and_no_class_vocabulary_of_its_own():
+    """STRUCTURAL: a second classifier cannot come back without this failing.
+
+    The old file had `def rollup()`, `def classify()` with its own arms, its own `REQUIRED` tuple
+    and its own GraphQL read. Any of those returning is the #1872 defect returning.
+    """
+    src = (_REPO / "scripts" / "pr-doctor.py").read_text()
+    for banned in ("def rollup(", "def classify(", "REQUIRED = ", "GATE = ",
+                   "SURFACE_FILES = "):
+        assert banned not in src, banned
+    # the vocabulary itself is objective's, referenced through the loaded module
+    assert pr.CLASSIFIER.CLASS_ORDER and "call-rail" in pr.CLASSIFIER.CLASS_ORDER
+    # and the module pr-doctor loaded IS the repo's objective.py
+    assert pathlib.Path(pr.CLASSIFIER.__file__).resolve() == (_REPO / "scripts" / "objective.py").resolve()
+
+def test_a_running_pr_is_never_dispatched(monkeypatch):
+    """`running` is a class, and its action is NONE -- not a rail call, not a review."""
+    logs = []
+    monkeypatch.setattr(pr, "load_state", lambda: {})
+    monkeypatch.setattr(pr, "open_prs", lambda: [_pr(1), _pr(2)])
+    monkeypatch.setattr(pr, "classify",
+                        lambda p: ("running", None, []) if p["number"] == 1
+                        else ("call-rail", None, []))
+    monkeypatch.setattr(pr, "brief", lambda p, a, w=None, cr=None: "brief-%s" % p["number"])
+    monkeypatch.setattr(pr, "log", logs.append)
+    sent = []
+    monkeypatch.setattr(pr, "dispatch",
+                        lambda p, a, t, dry: sent.append("prd-%s" % p["number"]) or (True, "", False))
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--dry-run"])
+    assert pr.main() == 0
+    assert sent == ["prd-2"], sent                       # the running PR got NO order
+    assert any("skipped-running=1" in m for m in logs), logs
+
+def test_an_unreadable_pr_is_never_dispatched(monkeypatch):
+    """`None` (the checks could not be READ) must never become work -- it is not `fix-ci`.
+
+    ⛔ AND A PASS IN WHICH *NOTHING* WAS LEGIBLE IS NOT A CLEAN PASS (#1872 review round 2):
+    it exits 2, exactly like an unreadable QUEUE, because "dispatched 0, exit 0" is
+    indistinguishable to the launcher from "readable, nothing to do" -- the dead drain this
+    file's import seam calls the worst outcome it can produce.
+    """
+    logs = []
+    monkeypatch.setattr(pr, "load_state", lambda: {})
+    monkeypatch.setattr(pr, "open_prs", lambda: [_pr(1)])
+    monkeypatch.setattr(pr, "classify", lambda p: (None, None, None))
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(pr, "dispatch",
+                        lambda *a, **k: pytest.fail("an unreadable PR must not be dispatched"))
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--dry-run"])
+    assert pr.main() == 2
+    assert any("1 PR(s) had UNREADABLE checks" in m for m in logs), logs
+    assert any("REFUSING" in m for m in logs), logs
+
+def test_a_partly_blind_pass_that_DID_work_is_a_clean_pass(monkeypatch):
+    """One blind PR out of two is a SKIP, not a refusal -- as long as the legible half is WORKED.
+
+    ⛔ THE "WORKED" HALF IS THE CONTRACT (#1872 review round 5). The previous fixture classified the
+    legible PR `running` (nothing to do) and still asserted rc 0: a pass where work was invisible
+    AND nothing was dispatched read as clean, which contradicts the invariant every other refusal in
+    this file serves. The invariant is now "readable, nothing to do", so a blind read plus zero
+    dispatches refuses -- and a blind read plus real work stays clean.
+    """
+    logs = []
+    monkeypatch.setattr(pr, "load_state", lambda: {})
+    monkeypatch.setattr(pr, "open_prs", lambda: [_pr(1), _pr(2)])
+    monkeypatch.setattr(pr, "classify",
+                        lambda p: (None, None, None) if p["number"] == 1 else ("record-review", "why", []))
+    monkeypatch.setattr(pr, "brief", lambda p, a, w=None, cr=None: "brief")
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(pr, "dispatch", lambda p, a, t, dry: (True, "", False))
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--dry-run"])
+    assert pr.main() == 0
+    assert any("UNREADABLE" in m for m in logs), logs
+
+def test_a_partly_blind_pass_that_did_NOTHING_refuses(monkeypatch):
+    """…and with nothing dispatched, the same blindness is NOT a clean pass (round 5)."""
+    logs = []
+    monkeypatch.setattr(pr, "load_state", lambda: {})
+    monkeypatch.setattr(pr, "open_prs", lambda: [_pr(1), _pr(2)])
+    monkeypatch.setattr(pr, "classify",
+                        lambda p: (None, None, None) if p["number"] == 1 else ("running", None, []))
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--dry-run"])
+    assert pr.main() == 2
+    assert any("REFUSING" in m for m in logs), logs
+
+
+
+
+def test_a_pass_whose_every_order_was_refused_is_not_a_clean_pass(monkeypatch):
+    """⛔ NOTHING DELIVERED IS NOT NOTHING TO DO (#1872 review round 15, found by reviewer B).
+
+    `_exit_status` folded in ONE blindness axis (`skipped["unreadable"]`). A pass where the transport
+    would not place ANY order left `dispatched == 0` with `unreadable == 0`, so it reported the clean
+    `0` while nothing had been delivered — the same outcome as blindness by another route, and the
+    one path that emitted neither the `REFUSING:` line nor rc 2.
+
+    ⛔ RE-EXPRESSED FOR THE WORKER TRANSPORT (#1890). #1872 wrote this against the lane roster; this
+    branch RETIRES the lane table, so the order is refused by `dispatch()` (a transient spawn
+    failure: not recorded, retried next pass) rather than by every idle lane. The property under
+    test is unchanged: legible work + nothing placed + nothing recorded must not be a clean pass.
+    """
+    logs = []
+    monkeypatch.setattr(pr, "load_state", lambda: {})
+    monkeypatch.setattr(pr, "open_prs", lambda: [_pr(1, "a" * 40), _pr(2, "b" * 40)])
+    monkeypatch.setattr(pr, "classify", lambda p: ("record-review", "why", []))
+    monkeypatch.setattr(pr, "brief", lambda p, a, w=None, cr=None: "brief")
+    monkeypatch.setattr(pr, "worker_live", lambda name: False)
+    monkeypatch.setattr(pr, "dispatch",
+                        lambda p, a, t, dry: (False, "dispatcher exited rc=78", False))
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--dry-run"])
+    assert pr.main() == 2
+    joined = "\n".join(logs)
+    assert "no worker accepted" in joined, joined
+    assert "REFUSING" in joined and "not a clean pass" in joined, joined
+    assert "undeliverable" in joined, joined
+
+def test_a_DELIVERED_pass_is_still_clean_when_one_order_could_not_be_placed(monkeypatch):
+    """…and the same refusal must not punish a pass that DID deliver: one drop beside one success."""
+    logs = []
+    monkeypatch.setattr(pr, "load_state", lambda: {})
+    monkeypatch.setattr(pr, "open_prs", lambda: [_pr(1, "a" * 40), _pr(2, "b" * 40)])
+    monkeypatch.setattr(pr, "classify", lambda p: ("record-review", "why", []))
+    monkeypatch.setattr(pr, "brief", lambda p, a, w=None, cr=None: "brief")
+    monkeypatch.setattr(pr, "worker_live", lambda name: False)
+
+    # PR #1 is placed. PR #2's spawn fails transiently (not recorded -> undeliverable).
+    def dispatch(p, a, t, dry):
+        return (True, "", False) if p["number"] == 1 else (False, "dispatcher exited rc=78", False)
+
+    monkeypatch.setattr(pr, "dispatch", dispatch)
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--dry-run"])
+    assert pr.main() == 0
+    joined = "\n".join(logs)
+    assert "not dispatched -- retried on the next pass" in joined, joined   # the drop is reported
+    assert "dispatched 1 this pass" in joined, joined                       # …the delivery is counted
+    assert "REFUSING" not in joined, joined                                 # …but not a refusal
+
+
+def test_a_failed_pr_read_refuses_with_its_own_exit_code(monkeypatch):
+    """⛔ A BLIND READ MUST NOT EXIT 0 (#1872 review, reviewer E).
+
+    The classifier half is fail-closed (an unreadable check-run read is `None`, never work).
+    The QUEUE half folded both facts into one line and one exit code -- "no open non-draft PRs
+    (or GitHub read failed)" -- so a failed `gh pr list` was indistinguishable to the launcher
+    from a clean, empty pass.
+    """
+    logs = []
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(pr, "OPEN_PRS_ERROR", "rc=126 Operation not permitted")
+    monkeypatch.setattr(pr, "open_prs", lambda: [])
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--dry-run"])
+    assert pr.main() == 2
+    joined = "\n".join(logs)
+    assert "REFUSING" in joined and "Operation not permitted" in joined
+    # ...and the honest empty queue stays a clean pass
+    monkeypatch.setattr(pr, "OPEN_PRS_ERROR", None)
+    assert pr.main() == 0
+
+def test_open_prs_separates_an_empty_queue_from_a_failed_read(monkeypatch):
+    """`open_prs()` must report WHY, because `[]` is also the legitimate empty answer."""
+    monkeypatch.setattr(pr, "log", lambda msg: None)
+    monkeypatch.setattr(pr, "sh_err", lambda cmd: ("[]", "", 0))
+    assert pr.open_prs() == [] and pr.OPEN_PRS_ERROR is None
+    monkeypatch.setattr(pr, "sh_err", lambda cmd: ("", "gh: not found", 127))
+    assert pr.open_prs() == [] and "rc=127" in (pr.OPEN_PRS_ERROR or "")
+    # ⛔ AND THE MESSAGE MUST NAME THE FACT (#1872 review round 5, verified by the gate): every
+    # wrong shape used to be reported as "empty stdout", sending the operator to hunt a swallowed
+    # stream. Each of the three shapes now says what actually happened.
+    monkeypatch.setattr(pr, "sh_err", lambda cmd: ("", "", 0))
+    assert pr.open_prs() == [] and "empty stdout" in (pr.OPEN_PRS_ERROR or "")
+    monkeypatch.setattr(pr, "sh_err", lambda cmd: ("not json at all", "", 0))
+    assert pr.open_prs() == [] and "unparseable body" in (pr.OPEN_PRS_ERROR or "")
+    monkeypatch.setattr(pr, "sh_err", lambda cmd: ("{}", "", 0))
+    assert pr.open_prs() == [] and "not a list" in (pr.OPEN_PRS_ERROR or "")
+
+def test_a_nonlist_body_is_a_failed_read_not_an_empty_queue(monkeypatch):
+    """⛔ `json.loads("{}")` SUCCEEDS (#1872 review round 4).
+
+    A shim that prints a valid empty OBJECT therefore became `prs = {}` — falsy, so `main()`
+    printed "no open non-draft PRs" and exited 0: the same reassuring line this file's `GH`
+    constant records as having masked two dead runs. Shape-guarded like every other read here.
+    """
+    monkeypatch.setattr(pr, "log", lambda msg: None)
+    monkeypatch.setattr(pr, "sh_err", lambda cmd: ("{}", "", 0))
+    assert pr.open_prs() == [] and pr.OPEN_PRS_ERROR is not None
+
+def test_a_stale_sibling_objective_refuses_at_import(tmp_path):
+    """⛔ PINNED BECAUSE IT WAS NOT (#1872 review, reviewer E).
+
+    The two files are farmed SEPARATELY (`pi-bootstrap/setup.sh` `fleet_srcs`), so a partial farm
+    can leave this driver beside an older classifier. The driver asserts its seam at import;
+    without a test, an edit that dropped the assert would pass the whole suite while the fleet
+    silently dispatched from a classifier the beat never produced. Reproduction, not inspection.
+    """
+    import shutil
+    import subprocess
+    shutil.copy(pathlib.Path(__file__).with_name("pr-doctor.py"), tmp_path / "pr-doctor.py")
+    (tmp_path / "objective.py").write_text("REQUIRED = ()\n")   # an old copy: no classify_one
+    r = subprocess.run([sys.executable, str(tmp_path / "pr-doctor.py"), "--status"],
+                       capture_output=True, text=True, cwd=str(tmp_path), timeout=60)
+    assert r.returncode != 0, "a stale sibling must NOT run: it would dispatch blind"
+    assert "classify_one" in (r.stdout + r.stderr)
