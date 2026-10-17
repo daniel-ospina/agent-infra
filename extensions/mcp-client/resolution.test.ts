@@ -151,7 +151,16 @@ await test("parses as valid config with the expected server set", () => {
   ok(existsSync(basePath), `missing ${basePath}`);
   const config = JSON.parse(readFileSync(basePath, "utf-8"));
 
-  const expected = ["exa", "brave-search", "playwright-browser", "gemini", "tortoise"];
+  // #1656: seo-intelligence is the research-ladder RUNG 1 server, added to the
+  // base template after this suite was written; it is lazy (starts on demand).
+  const expected = [
+    "exa",
+    "brave-search",
+    "playwright-browser",
+    "gemini",
+    "seo-intelligence",
+    "tortoise",
+  ];
   deepEqual(Object.keys(config.mcpServers).sort(), [...expected].sort());
 
   const tortoise = config.mcpServers.tortoise;
@@ -165,6 +174,11 @@ await test("parses as valid config with the expected server set", () => {
   equal(config.mcpServers["playwright-browser"].lazy, true, "playwright is lazy");
   equal(config.mcpServers.gemini.lazy, true, "gemini is lazy");
   equal(config.mcpServers["brave-search"].lazy, true, "brave-search is lazy");
+  equal(
+    config.mcpServers["seo-intelligence"].lazy,
+    true,
+    "seo-intelligence is lazy (#1656 — research ladder starts on demand)",
+  );
 });
 
 section("expandEnvVars — ${VAR} and ${VAR:-default}");

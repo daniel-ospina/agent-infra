@@ -79,6 +79,16 @@ def _run(monkeypatch, tmp_path, q: dict, argv=("--act",), predicate=None) -> str
     return pl.LANES_FILE
 
 
+def _blind(q: dict) -> bool:
+    """The beat's predicate, called the way `build()` calls it: `(unknown, nondraft)`.
+
+    The signature is `objective.py`'s, NOT this file's convenience: `queue_read_is_blind` takes
+    the two numbers the report already has, so every call site here would fail loudly if the
+    threshold moved to a different shape.
+    """
+    return objective._queue_read_is_blind(q["unknown"], q["nondraft"])
+
+
 def _out(capsys) -> str:
     return capsys.readouterr().out
 
@@ -93,7 +103,7 @@ def test_a_blind_queue_dispatches_nothing(monkeypatch, tmp_path, capsys):
     that the classification came from a state GitHub never reported.
     """
     q = _queue(unknown=8, nondraft=10)
-    assert objective._queue_read_is_blind(q)          # the fixture really is blind
+    assert _blind(q)          # the fixture really is blind
     lanes_file = _run(monkeypatch, tmp_path, q)
     out = _out(capsys)
 
@@ -129,7 +139,7 @@ def test_a_readable_queue_dispatches_exactly_as_before(monkeypatch, tmp_path, ca
     entries are recorded under the same lane ids, and `rail` does not spend the cap.
     """
     q = _queue(unknown=0, nondraft=3)
-    assert not objective._queue_read_is_blind(q)
+    assert not _blind(q)
     lanes_file = _run(monkeypatch, tmp_path, q)
     out = _out(capsys)
 
@@ -152,7 +162,7 @@ def test_a_mostly_readable_queue_is_not_held(monkeypatch, tmp_path, capsys):
     the dispatcher keeps working. This is the fail-closed/fail-open boundary, pinned.
     """
     q = _queue(unknown=4, nondraft=10)
-    assert not objective._queue_read_is_blind(q)
+    assert not _blind(q)
     _run(monkeypatch, tmp_path, q)
     out = _out(capsys)
 
@@ -169,7 +179,7 @@ def test_the_hold_is_keyed_on_the_beats_predicate(monkeypatch, tmp_path, capsys)
     nothing else. A locally re-implemented heuristic would ignore the flip and keep holding.
     """
     _run(monkeypatch, tmp_path, _queue(unknown=8, nondraft=10),
-         predicate=lambda _q: False)
+         predicate=lambda *_nums: False)
     out = _out(capsys)
 
     assert "ACT fix #901" in out, out
@@ -182,13 +192,13 @@ def test_the_predicate_threshold_is_the_beats(monkeypatch, tmp_path):
     >= half of the non-draft queue unread is blind; below half is ordinary churn; an unreadable
     queue object is not a claim of blindness (that case is `queue() is None`, held elsewhere).
     """
-    assert objective._queue_read_is_blind(_queue(unknown=8, nondraft=10))
-    assert objective._queue_read_is_blind(_queue(unknown=5, nondraft=10))
-    assert not objective._queue_read_is_blind(_queue(unknown=4, nondraft=10))
-    assert not objective._queue_read_is_blind(_queue(unknown=0, nondraft=10))
-    # An EMPTY queue cannot be blind (no PR to be unread), and a missing object is not a verdict.
-    assert not objective._queue_read_is_blind({"unknown": 0, "nondraft": 0})
-    assert not objective._queue_read_is_blind(None)
+    assert _blind(_queue(unknown=8, nondraft=10))
+    assert _blind(_queue(unknown=5, nondraft=10))
+    assert not _blind(_queue(unknown=4, nondraft=10))
+    assert not _blind(_queue(unknown=0, nondraft=10))
+    # An EMPTY queue cannot be blind (no PR to be unread): 0 of 0 unread is a READABLE empty
+    # queue, and `max(1, 0)` is what keeps the comparison from reading 0 >= 0 as blind.
+    assert not objective._queue_read_is_blind(0, 0)
 
 
 def test_the_beat_and_the_dispatcher_read_the_same_function():
@@ -199,8 +209,15 @@ def test_the_beat_and_the_dispatcher_read_the_same_function():
     """
     src = (_HERE / "objective.py").read_text()
     body = src.split("def build(", 1)[1]
-    assert "_queue_read_is_blind(q)" in body
+    # The beat passes the two numbers it already has -- the same `(unknown, nondraft)` shape
+    # `pr-loop.py` calls, so the two sites cannot drift into different thresholders.
+    assert '_queue_read_is_blind(_u, q["nondraft"])' in body
     # The old inline expression must be gone; if it came back, there would be two definitions.
     assert "2 * _u >=" not in body
     # ...and the expression itself must live in exactly ONE place in the module.
     assert src.count("2 * unknown >=") == 1
+    # The DISPATCHER calls the same function, with the same arity, on the queue it acts from.
+    loop_src = (_HERE / "pr-loop.py").read_text()
+    assert '_queue_read_is_blind(_unknown, q["nondraft"])' in loop_src
+    # And no second threshold lives in `pr-loop.py`.
+    assert "2 * " not in loop_src, "a second definition of \"blind\" appeared in pr-loop.py"

@@ -145,9 +145,11 @@ def main():
     #
     # The predicate is `objective._queue_read_is_blind`, the SAME one the beat prints, NOT a
     # second definition of "blind": two thresholds would drift and the dispatcher would decide
-    # on a classification its own report calls untrustworthy.
-    if o._queue_read_is_blind(q):
-        _unknown = q.get("unknown") or 0
+    # on a classification its own report calls untrustworthy. Its signature is the beat's own
+    # `(unknown, nondraft)` -- NOT the queue dict -- so this call site is forced to move with it
+    # whenever "how blind is blind" is re-thresholded.
+    _unknown = q.get("unknown") or 0
+    if o._queue_read_is_blind(_unknown, q["nondraft"]):
         log(f"HOLD -- queue_read=BLIND({_unknown}/{q['nondraft']} mergeable_state unread): "
             f"nondraft={q['nondraft']} is measurable but the classes above it are NOT a clearance "
             f"-- dispatching nothing (a miss must never become an action)")
