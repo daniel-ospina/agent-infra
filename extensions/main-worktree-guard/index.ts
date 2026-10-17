@@ -1291,6 +1291,156 @@ function _hubBashWriteBlockReason(hit: { resolvedPath: string; rel: string; kind
 // children are unhatched by #617/#623, which is why this is the enforcement
 // surface for them).
 
+/**
+ * #1060 — the STATE predicate for a `cat-file-revert` descriptor
+ * (`git show HEAD:<path> > <target>`). Returns a block reason, or null to allow.
+ *
+ * WHY THIS REPLACED A TEMPLATE COMPARISON. The arm used to intersect the
+ * source pathspec (`HEAD:<path>` → `<path>`) with the command's bash write
+ * targets by EXACT STRING EQUALITY of two independently-anchored templates.
+ * Equality therefore held only when the two spellings matched character for
+ * character, and that is wrong in BOTH directions:
+ *
+ *  - it FAILS OPEN on two spellings of one file
+ *    (`git -C "$MAIN_REPO" show HEAD:dirty.txt > "$MAIN_REPO/dirty.txt"`) —
+ *    no intersection, so the arm `continue`d and the redirect reverted TRACKED,
+ *    MODIFIED content. The modification existed only in the working tree,
+ *    was never a git object, and has no other copy: unrecoverable loss.
+ *  - it FAILS CLOSED on any variable (`HEAD:"$x"`), because the generic
+ *    unresolvable-pathspec rule caught the source and refused a read-only
+ *    `git show` — the #940 friction, in the same hunk.
+ *
+ * The question the arm has to answer is about STATE ("does this redirect land
+ * on content that would be lost?"), so it is answered with state:
+ *
+ *   - no redirect target at all ⇒ a pure read; nothing can be written;
+ *   - otherwise probe `git status --porcelain` on every statically identifiable
+ *     candidate checkout — `writeCwd`, plus the nearest EXISTING ancestor
+ *     directory of each write target — and allow ONLY if all are free of
+ *     tracked dirt.
+ *
+ * `discardDestroysWip` (scope "all") already separates tracked dirt (real loss)
+ * from untracked-only dirt (nothing tracked is destroyed), so the arm neither
+ * blocks on `??` scratch output nor conflates the two in its message. Unlike
+ * the comparison it replaces, one wrong ALLOW here is unrecoverable, which is
+ * why the arm is conservative: an unresolvable target is probed at its nearest
+ * existing ancestor, and an unreadable status FAILS CLOSED.
+ *
+ * Declared residual: a target anchored to a name this command never assigns
+ * (`> "$SOME_ENV_VAR/f"`) keeps the literal `$SOME_ENV_VAR` component and is
+ * therefore probed at the command's own directory — the same conservative
+ * answer the old arm gave by failing closed. A target anchored to a name the
+ * command DOES assign is resolved here (`_wtCommandVars`), which is the fail-open
+ * this predicate exists to close.
+ */
+function _catFileRevertStateBlock(
+  d: { form: string; scope: string; pathspecs: string[] },
+  writeTargetsRel: string[],
+  writeCwd: string,
+  command: string,
+  scriptDir: string | null,
+): string | null {
+  // No redirect ⇒ nothing is written. This is the read-only `git show HEAD:x`
+  // and the `git show HEAD:x > /dev/null` cases: no loss is possible. #1125 —
+  // this arm is also why a read-only probe whose pathspec is a shell variable
+  // (`git cat-file -e "origin/$BRANCH:$f"`) is allowed instead of fail-closed
+  // on the unresolvable source: the hint has no LANDING SITE, so there is no
+  // discard. The decision is ordered by EFFECT, not by the pathspec's spelling.
+  if (writeTargetsRel.length === 0) return null;
+
+  const vars = _wtCommandVars(command);
+  const targets = writeTargetsRel.map((rel) => resolve(writeCwd, _wtSubstituteVars(rel, vars)));
+
+  // Candidate checkouts, in a deterministic order: the write cwd FIRST (its
+  // dirt is the one a relative target lands in, and it is the checkout the
+  // message should name first), then each target's nearest existing ancestor,
+  // then the checkout the discard was READ FROM when it came from a script.
+  //
+  // The script's own directory earns its place: a script's redirect is often
+  // anchored to a name the script computes at runtime (`hub-worktree.sh`
+  // derives `MAIN_REPO` from `git rev-parse --git-common-dir`), so it is not
+  // statically resolvable from the command text — but the script FILE is a
+  // statically identifiable checkout, and that is where such a discard can
+  // land. On the clean fixture it changes nothing; with tracked dirt there it
+  // is the difference between a block and an unrecoverable loss.
+  const candidates = new Set<string>([writeCwd]);
+  for (const t of targets) {
+    let dir = dirname(t);
+    // Bounded: a target under a not-yet-existing directory has no checkout of
+    // its own, so the walk finds the nearest one that exists.
+    for (let i = 0; i < 64 && !existsSync(dir); i++) {
+      const parent = dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
+    candidates.add(dir);
+  }
+  if (scriptDir !== null) candidates.add(scriptDir);
+
+  for (const cand of candidates) {
+    // Whole-checkout scope: the redirect's own path is not always statically
+    // known (it may still carry an unresolved component), so the question asked
+    // is the answerable one — "does this checkout hold tracked dirt at all?".
+    const dirty = _discardStatusPorcelain(cand, { scope: "all", pathspecs: [] });
+    if (dirty === false) continue;
+    // The reason must name the REDIRECT, not the source: `git show HEAD:a > b`
+    // discards `b`, and naming `a` here is the misattribution class #1139
+    // removed from this message. Report targets relative to the checkout being
+    // blamed when they are inside it, else their absolute spelling.
+    const named = {
+      form: d.form,
+      scope: "paths",
+      pathspecs: targets.map((t) => {
+        const rel = relative(cand, t);
+        return rel && !rel.startsWith("..") ? rel : t;
+      }),
+    };
+    return _worktreeDiscardBlockReason(
+      named,
+      cand,
+      dirty === null ? "the target checkout's status could not be read" : null,
+    );
+  }
+  return null;
+}
+
+/**
+ * #1060 — same-command `NAME=<literal>` assignments, used to resolve a `$NAME`
+ * component in a `cat-file-revert` write target before it is resolved.
+ *
+ * ONLY unambiguous, literal values are returned: a name assigned twice with
+ * different values, or assigned anything containing a substitution (`$`, a
+ * backtick, a brace expansion), is dropped rather than guessed — an unresolved
+ * component leaves the target at its nearest existing ancestor, which is the
+ * conservative arm. The anchor `(?:^|[;&|(\s])` keeps `--foo=bar` and other
+ * option operands out, and the value class stops at a separator so `V=/a/b;`
+ * yields `/a/b` and not `/a/b;` (the trailing `;` would be a path component and
+ * would break the ancestor walk this resolution exists to feed).
+ */
+function _wtCommandVars(command: string): Map<string, string> {
+  const out = new Map<string, string>();
+  const ambiguous = new Set<string>();
+  for (const m of String(command).matchAll(/(?:^|[;&|(\s])([A-Za-z_][A-Za-z0-9_]*)=("[^"]*"|'[^']*'|[^\s;&|()]+)/g)) {
+    const name = m[1];
+    const val = _dequoteShellWord(m[2]);
+    if (!val || /[$`]/.test(val) || /[{}]/.test(val)) { ambiguous.add(name); continue; }
+    const prev = out.get(name);
+    if (prev !== undefined && prev !== val) { ambiguous.add(name); continue; }
+    out.set(name, val);
+  }
+  for (const n of ambiguous) out.delete(n);
+  return out;
+}
+
+/** #1060 — replace `$NAME` / `${NAME}` with a resolved same-command assignment.
+ *  An unknown name is left VERBATIM (never emptied): a silently-shortened path
+ *  would name a different file and could clear a real block. */
+function _wtSubstituteVars(p: string, vars: Map<string, string>): string {
+  if (vars.size === 0 || !p.includes("$")) return p;
+  return p.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)/g,
+    (whole, braced, bare) => vars.get(braced ?? bare) ?? whole);
+}
+
 /** Bounded porcelain probe for a discard's target checkout.
  *  @returns true = would destroy uncommitted work; false = nothing to destroy;
  *           null = unverifiable (caller fails closed). */
@@ -1859,33 +2009,55 @@ function _worktreeDiscardBlock(command: string): string | null {
   for (const set of gatedSets) {
     // The `cat-file-revert` form (`git show HEAD:x > x`) needs the source's
     // bash WRITE targets (pure string walk) to find where the content lands.
-    let writeTargets: string[] = [];
+    // #1060 — they are kept in their WRITE-CWD-RELATIVE spelling: the state
+    // predicate substitutes a same-command `NAME=<literal>` assignment BEFORE
+    // resolving, so an ABSOLUTE `$MAIN_REPO` is not re-anchored under the write
+    // cwd (which is how the fail-open was measured).
+    let writeTargetsRel: string[] = [];
     if (set.discs.some((d) => d.form === "cat-file-revert")) {
       try {
         const src = set.script === null ? command : readFileSync(resolve(execCwd, set.script), "utf8");
-        writeTargets = extractBashWriteTargets(src, set.writeCwd).map((t) => resolve(set.writeCwd, t.resolvedPath));
+        writeTargetsRel = extractBashWriteTargets(src, set.writeCwd).map((t) => relative(set.writeCwd, t.resolvedPath) || ".");
       } catch { /* best-effort — a miss only means no extra block */ }
     }
 
     for (const d of set.discs) {
-      // #1125 — a `cat-file-revert` HINT is a discard ONLY when the reproduced
-      // committed content LANDS on a path: the form's whole model is `git show
-      // HEAD:x > x`, and index.ts intersects the hint with the command's bash
-      // write targets for exactly that reason. With NO write target in the
-      // command/script there is nowhere for the content to land, so the hint
-      // cannot be a revert whatever its pathspec spells — and a read-only probe
-      // (`git cat-file -e "origin/$BRANCH:$f"`, `git show "$ref:$f"`) is that
-      // shape. Failing closed on its unresolvable pathspec refused a command
+      // #1060 — the `cat-file-revert` form is decided on STATE (see
+      // `_catFileRevertStateBlock`). It also must not run the generic
+      // unresolvable-pathspec rule below: for this form the pathspec is the
+      // read-only SOURCE (`HEAD:<path>`), which may legitimately be a shell
+      // variable — the DESTRUCTION is the redirect, and that is what the state
+      // predicate probes. The script's own directory is passed as a candidate
+      // checkout (a script's redirect may be anchored to a name the script
+      // computes at runtime).
+      //
+      // #1125 — and the state predicate is what makes the check EFFECT-ORDERED:
+      // a `cat-file-revert` HINT is a discard ONLY when the reproduced committed
+      // content LANDS on a path (the form's whole model is `git show HEAD:x >
+      // x`). With NO write target in the command/script there is nowhere for the
+      // content to land, so the hint cannot be a revert whatever its pathspec
+      // spells — and a read-only probe (`git cat-file -e "origin/$BRANCH:$f"`,
+      // `git show "$ref:$f"`) is exactly that shape. `_catFileRevertStateBlock`
+      // answers that FIRST (`writeTargetsRel.length === 0 → null`), so the
+      // fail-closed arm on an unresolvable pathspec no longer refuses a command
       // with no discard effect at all: the sanctioned read-only triage tool
-      // `scripts/stale-main-triage.sh` could not be RUN by an agent, and the
-      // fleet-durability sweep's per-file `git cat-file -e` loop was blocked in
-      // three repos (2026-09-17 evidence on #1125). This is not a new
-      // allowance: the `lands.length === 0 → continue` arm below already treats
-      // "no write target" as "no discard" for RESOLVABLE hints, and the
-      // unresolvable check still runs (and still fails closed) whenever the
-      // command DOES carry a write surface — `git show HEAD:$f > $f` keeps
-      // blocking, as does a resolvable redirect.
-      if (d.form === "cat-file-revert" && writeTargets.length === 0) continue;
+      // `scripts/stale-main-triage.sh` could not be RUN by an agent on the dirty
+      // hub it diagnoses, and the fleet-durability sweep's per-file `git
+      // cat-file -e` loop was blocked in three repos (2026-09-17 evidence on
+      // #1125). That is not a relaxation — whenever the command DOES carry a
+      // write surface the state predicate still runs and still fails closed,
+      // so `git show HEAD:$f > $f` keeps blocking, as does a resolvable hint
+      // landing on its own path.
+      if (d.form === "cat-file-revert") {
+        let scriptDir: string | null = null;
+        if (set.script !== null && !/[$`]/.test(set.script)) {
+          try { scriptDir = dirname(resolve(execCwd, set.script)); } catch { scriptDir = null; }
+        }
+        const stateReason = _catFileRevertStateBlock(d, writeTargetsRel, set.writeCwd, command, scriptDir);
+        if (stateReason !== null) return stateReason;
+        continue;
+      }
+
       // Fail closed on anything whose blast radius is not statically known:
       // `--pathspec-from-file` (the list lives in a FILE), an unresolvable
       // `$VAR`/backtick pathspec, or an xargs/find `-exec` placeholder.
@@ -1917,12 +2089,11 @@ function _worktreeDiscardBlock(command: string): string | null {
 
       let probeCwd: string;
       let scope: { scope: string; pathspecs: string[]; fromTree?: boolean } = d;
-      if (d.form === "cat-file-revert") {
-        const lands = writeTargets.filter((t) => d.pathspecs.some((p) => resolve(set.writeCwd, p) === t));
-        if (lands.length === 0) continue; // the committed content is not redirecting onto its own path
-        probeCwd = set.writeCwd;
-        scope = { scope: "paths", pathspecs: lands.map((t) => relative(set.writeCwd, t) || "."), fromTree: true };
-      } else {
+      // The remaining forms (`checkout --`, `restore`, `reset --hard`, …): the
+      // invocation is resolved to its effective checkout and the probe is
+      // scoped to the pathspecs it names. `cat-file-revert` returned above — it
+      // is the one form whose pathspec is a SOURCE rather than a target.
+      {
         let eff: { effectiveCwd: string; worktreePath?: string | null } | null = null;
         try { eff = resolveInvocationTarget(d.inv, sessionCwd, set.baseCwd); } catch { eff = null; }
         if (eff === null) {
@@ -2687,6 +2858,18 @@ export default function (pi: ExtensionAPI) {
               pushDet?.verdict === "block:force-push" ||
               pushDet?.verdict === "block:push-delete";
             if (!gateablePush) {
+              // #1060 — this early-return used to SHADOW M5. It returned before
+              // the working-tree-discard arm ever evaluated, so on a disordered
+              // hub a `cat-file-revert` whose write target is a shell variable
+              // (`git show HEAD:"$x" > "$x"`) was ALLOWED — the redirect's
+              // spelling defeats the tracked-write gate above (`_hubBashTrackedWrite`
+              // matches resolved hub paths), M4 blocks the discard VERB family
+              // but `git show` is read-only by classification, and nothing else
+              // was left to decide. The hub's tracked dirt is exactly what that
+              // command destroys, so the effect gate must still be consulted
+              // before the arm calls the command done.
+              const discardReason = _worktreeDiscardBlock(command);
+              if (discardReason) return { block: true, reason: discardReason };
               return undefined; // sanctioned recovery / read-only / non-push — done
             }
           }

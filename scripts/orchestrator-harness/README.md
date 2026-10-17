@@ -12,6 +12,10 @@ doc_status: draft
 
 # Orchestrator harness
 
+> **Component reference:** [`ARCHITECTURE.md`](./ARCHITECTURE.md) — per-script I/O and failure
+> surface, the state-file lifecycle, the gate constants, triage and invariants. This file remains
+> the authority for provenance, install, merge policy and measured results.
+
 > **What this is.** A self-contained, single-host harness that turns one laptop into an
 > autonomous delivery lane: it sweeps the open PR queue, dispatches GitHub issues into
 > isolated worktrees as autonomous `pi` lanes, runs a fresh-context review → signed-record
