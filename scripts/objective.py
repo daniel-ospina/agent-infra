@@ -753,10 +753,21 @@ def classify_pr(pr, cr, att_clean):
     #    a lane was dispatched to repair a gate that had not concluded. That is the same harm arm 4
     #    exists to remove ("a check in flight is not work", 3h burned on #7924), so an
     #    in-flight rail gate reads `running` and a RED one still reads `blocked-by-rail`.
+    #    ⛔ AND A DIRTY HEAD IS STILL THE ONE THING A LANE CAN FIX (#1872 review round 12). This
+    #    arm already returns LAST-BUT-ONE in `CLASS_ORDER`, so returning `running` from here put it
+    #    ABOVE `resolve-conflict` -- the single exception to the arm order, and the one arm the suite
+    #    did not pin. MEASURED: six required contexts green + attestation + DIRTY + `drift-guard`
+    #    `in_progress` -> `running`, i.e. "wait", while the only available fix is a REBASE that no
+    #    check will ever do. Both consumers skip `running` and its only escalation is `STUCK`, which
+    #    is emitted for `call-rail` alone, so such a PR could wait forever.
     if not nongreen and att_clean:
         _rail = rail_block_reason(red, flight, seen)
         if _rail:
-            return "blocked-by-rail" if _rail in red else "running"
+            if _rail in red:
+                return "blocked-by-rail"
+            if (pr.get("mergeStateStatus") or "") == "DIRTY":
+                return "resolve-conflict"
+            return "running"
         return "call-rail"
     # 2. rerun-checks -- NO required check has REPORTED at this head, and nothing is executing.
     #    ⛔ `and not flight` IS LOAD-BEARING (#1872 review). Without it this arm SHADOWED arm 4
@@ -778,7 +789,9 @@ def classify_pr(pr, cr, att_clean):
     #    that has since gone DIRTY reads `call-rail`, whose brief says the rail would take it --
     #    while the rail refuses a conflicted PR. Pre-existing, and DELIBERATELY left alone here
     #    (the edge is pinned by `test_knows_the_one_edge_the_strict_order_creates` as "PINNED, NOT
-    #    ENDORSED", so fixing it changes the arm spec). Tracked in #1936; two reviewers rated it
+    #    ENDORSED", so fixing it changes the arm spec). Tracked in agent-infra #1936 (QUALIFIED, not
+    #    a bare `#1936`: these files live in agent-infra but a bare number reads as the repo under
+    #    test, tortoise, where #1936 is an unrelated packs feature); two reviewers rated it
     #    P1, so it should land before this ordering is trusted.
     if (pr.get("mergeStateStatus") or "") == "DIRTY":
         return "resolve-conflict"

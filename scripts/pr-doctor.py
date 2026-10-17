@@ -393,6 +393,21 @@ def idle_lanes() -> tuple[list[dict], str]:
         d = json.loads(out)
     except Exception as e:
         return [], "lane-actions output unparseable: %s" % e
+    # ⛔ A WELL-FORMED BODY OF THE WRONG SHAPE IS ALSO A FAILED READ (#1872 review round 12).
+    # `json.loads` succeeding was treated as "readable" -- so `{"error": "rate limit"}`, `{}` and
+    # `{"idle": null}` all came back as a GOOD, EMPTY roster: `lanes=0, status=""`, which then took
+    # the readable-roster path ("no idle lanes -- nothing dispatched this pass") and exited 0,
+    # bypassing the refusal four lines below in `main()` BECAUSE IT FIRES ONLY ON `lane_err`. That is
+    # the exact false PASS this function's docstring forbids, and the same shape round 4 fixed in
+    # `open_prs()` ("a NON-LIST ROOT is a failed read too"). `rc` is not compared here at all
+    # (`lane-actions.py` documents empty stdout as the caller's fail-closed detector), so the PAYLOAD
+    # is the only evidence there is -- and a dict without an `idle` list is not a roster.
+    if not isinstance(d, dict):
+        return [], "lane-actions body is a %s, not a roster" % type(d).__name__
+    if "idle" not in d:
+        return [], "lane-actions body has no 'idle' key: %s" % (sorted(d)[:6],)
+    if not isinstance(d.get("idle"), list):
+        return [], "lane-actions 'idle' is a %s, not a list" % type(d.get("idle")).__name__
     lanes = []
     for c in d.get("idle") or []:
         ws = c.get("ws")
@@ -673,7 +688,9 @@ def main() -> int:
     # ⚠️ WHAT ACTUALLY CARRIES THE SIGNAL TODAY, STATED HONESTLY: this pass's automated caller
     # (`scripts/heartbeat-loop.sh`) launches it DETACHED and never reads the exit status, so the
     # `REFUSING: ...` LOG LINE is the signal an operator can see, and rc=2 is for a human or a
-    # future launcher. That is #1933, filed separately: the launcher's own failure branch is
+    # future launcher. That is agent-infra #1933 (QUALIFIED: a bare `#1933` resolves to the repo
+    # under test, tortoise, where it is an unrelated packs feature), filed separately: the launcher's
+    # own failure branch is
     # unreachable (`rc=0` hardcoded above its own test). The three refusals below (this one, the
     # all-checks-blind one, and the lane-roster one) all exit 2 so that the day a consumer exists,
     # it needs no change here -- and so a direct `--dry-run` by a lane fails loudly today.

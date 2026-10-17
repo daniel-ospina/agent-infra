@@ -556,6 +556,47 @@ def test_a_saturated_fleet_does_not_launder_a_blind_read_into_a_clean_pass(monke
     assert "no idle lanes" in joined, joined
 
 
+def test_a_WRONG_SHAPED_lane_body_is_a_failed_read_not_an_empty_fleet(monkeypatch):
+    """⛔ `json.loads` SUCCEEDING IS NOT "READABLE" (#1872 review round 12, found by reviewer B).
+
+    `idle_lanes()` treated any parseable JSON as a good roster, so `{"error": "rate limit"}`, `{}` and
+    `{"idle": null}` all returned `([], "")` -- a GOOD, EMPTY fleet. `main()` then took the
+    readable-roster path, printed "no idle lanes -- nothing dispatched this pass", and exited 0,
+    bypassing the blindness refusal BECAUSE THAT FIRES ONLY ON `lane_err`. Same shape round 4 fixed
+    in `open_prs()`; `rc` is never compared here, so the payload is the only evidence there is.
+    """
+    def body(payload):
+        monkeypatch.setattr(pr, "sh_err", lambda cmd, timeout=None: (payload, "", 0))
+
+    body('{"error": "rate limit exceeded"}')
+    assert pr.idle_lanes()[0] == [] and pr.idle_lanes()[1], "a dict with no roster is a failed read"
+    body("{}")
+    assert pr.idle_lanes()[0] == [] and pr.idle_lanes()[1], "{} is a failed read"
+    body('{"idle": null}')
+    assert pr.idle_lanes()[0] == [] and pr.idle_lanes()[1], "a null roster is a failed read"
+    body('["not", "a", "dict"]')
+    assert pr.idle_lanes()[0] == [] and pr.idle_lanes()[1], "a list root is a failed read"
+    # …and a genuinely readable, genuinely empty fleet is still a CLEAN read
+    body('{"idle": []}')
+    assert pr.idle_lanes() == ([], "")
+
+
+def test_a_wrong_shaped_lane_body_with_work_in_hand_REFUSES(monkeypatch):
+    """The bypass, end to end: one `call-rail` PR and a body that parses but is not a roster."""
+    logs = []
+    monkeypatch.setattr(pr, "load_state", lambda: {})
+    monkeypatch.setattr(pr, "open_prs", lambda: [_pr(1)])
+    monkeypatch.setattr(pr, "classify", lambda p: ("call-rail", None, []))
+    monkeypatch.setattr(pr, "sh_err",
+                        lambda cmd, timeout=None: ('{"error": "rate limit exceeded"}', "", 0))
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--dry-run"])
+    assert pr.main() == 2
+    joined = "\n".join(logs)
+    assert "LANE READ FAILED" in joined, joined
+    assert "no idle lanes" not in joined, joined
+
+
 def test_a_blind_lane_roster_never_prints_the_busy_fleet_line(monkeypatch):
     """⛔ "CANNOT SEE THE FLEET" IS NOT "THE FLEET IS BUSY" (#1872 review round 7).
 
@@ -637,6 +678,19 @@ def test_a_rail_gate_in_flight_is_running_and_a_red_one_is_the_rail(monkeypatch)
     assert classify({"mergeStateStatus": "CLEAN"}, with_rail("completed", "failure"), True) \
         == "blocked-by-rail"
     assert classify({"mergeStateStatus": "CLEAN"}, with_rail("completed", "success"), True) \
+        == "call-rail"
+
+    # ⛔ AND A DIRTY HEAD BEATS A WAIT (#1872 review round 12): `resolve-conflict` sits ABOVE
+    # `running` in CLASS_ORDER, and a rebase is the only thing a lane can do here -- returning
+    # `running` from arm 1 put the arm above it, the one exception to the arm order. Both consumers
+    # skip `running` and its only escalation (`STUCK`) is emitted for `call-rail` alone, so such a
+    # PR waited forever. (A DIRTY head with the rail GREEN is still `call-rail`: that is agent-infra
+    # #1936's pinned, not-endorsed edge and this PR does not change it.)
+    assert classify({"mergeStateStatus": "DIRTY"}, with_rail("in_progress", None), True) \
+        == "resolve-conflict"
+    assert classify({"mergeStateStatus": "DIRTY"}, with_rail("completed", "failure"), True) \
+        == "blocked-by-rail"
+    assert classify({"mergeStateStatus": "DIRTY"}, with_rail("completed", "success"), True) \
         == "call-rail"
 
 
