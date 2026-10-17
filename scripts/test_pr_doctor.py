@@ -28,6 +28,7 @@ import pathlib
 import re
 import subprocess
 import sys
+import threading
 import time
 
 import pytest
@@ -185,18 +186,26 @@ def test_dispatch_invokes_the_background_spawn_argv(monkeypatch, tmp_path):
     monkeypatch.setattr(pr, "log", lambda m: None)
     monkeypatch.setattr(pr, "materialise_worktree", lambda p: ("/wt/prd-9", ""))
     monkeypatch.setattr(pr, "NONBLOCKING_DISPATCH", "/opt/orch/nonblocking-dispatch.sh")
-    monkeypatch.setattr(pr, "REFUSAL_WINDOW_S", 0.0)   # no .rc will appear; do not wait
+    monkeypatch.setattr(pr, "CONFIRM_WINDOW_S", 0.0)   # no .rc will appear; do not wait
+    # two pre-spawn liveness probes (both "not live"), then the post-window confirmation
+    statuses = iter(["lost", "lost", "running"])
+    monkeypatch.setattr(pr, "worker_status", lambda name: next(statuses))
 
-    def fake_sh_err(argv, timeout=180, cwd=None):
-        calls.append(argv)
-        return "launched prd-9 pid=1", "", 0
+    def fake_sh_err(argv, timeout=180, cwd=None, env=None, capture=True):
+        calls.append((argv, capture))
+        return "", "", 0
 
     monkeypatch.setattr(pr, "sh_err", fake_sh_err)
-    ok, _ = pr.dispatch(_pr(9), "failing", "brief text", dry=False)
-    assert ok is True
+    ok, _, record = pr.dispatch(_pr(9), "failing", "brief text", dry=False)
+    assert ok is True and record is True
     assert calls, "dispatch did not invoke the spawn command"
-    assert calls[0][1] == "/opt/orch/nonblocking-dispatch.sh"
-    assert "cmux" not in " ".join(calls[0])
+    argv, capture = calls[-1]
+    assert argv[1] == "/opt/orch/nonblocking-dispatch.sh"
+    assert "cmux" not in " ".join(argv)
+    # ⛔ NON-VACUITY for the P0: a CAPTURED spawn call blocks until the worker's stdout pipe
+    # closes, i.e. for the worker's whole life. See
+    # test_dispatch_returns_promptly_whatever_the_worker_does below (real harness, real worker).
+    assert capture is False, "the spawn call must not capture the worker's inherited pipe"
 
 
 def test_dispatch_does_not_record_a_gate_refusal(tmp_path, monkeypatch):
@@ -208,7 +217,11 @@ def test_dispatch_does_not_record_a_gate_refusal(tmp_path, monkeypatch):
     """
     d = tmp_path / "orch"
     d.mkdir()
-    (d / "spawn-gate.sh").write_text("run_agent() { return 75; }\n")
+    # ⛔ the marker is what distinguishes a GATE refusal from a `pi` that exited 75 itself; the
+    # real spawn-gate.sh writes it to the worker log before returning, so a stub that only returns
+    # 75 is not a gate refusal. (`test_the_refusal_markers_are_the_gates_own_lines` pins the text.)
+    (d / "spawn-gate.sh").write_text(
+        'run_agent() { echo "[load-gate] REFUSED bg: load=99 >= max_load=40" >> "$2"; return 75; }\n')
     wt = tmp_path / "wt"
     wt.mkdir()
     subprocess.run(["git", "init", "-q"], cwd=str(wt), check=True,
@@ -219,9 +232,46 @@ def test_dispatch_does_not_record_a_gate_refusal(tmp_path, monkeypatch):
     monkeypatch.setattr(pr, "materialise_worktree", lambda p: (str(wt), ""))
     monkeypatch.setattr(pr, "log", lambda m: None)
     monkeypatch.setenv("O", str(d))
-    ok, detail = pr.dispatch(_pr(11), "failing", "brief", dry=False)
-    assert ok is False
-    assert "refused" in detail and "75" in detail
+    ok, detail, record = pr.dispatch(_pr(11), "failing", "brief", dry=False)
+    assert ok is False and record is False
+    assert "refused" in detail.lower() and "75" in detail
+
+
+def test_dispatch_records_an_unmaterialisable_worktree(tmp_path, monkeypatch):
+    """A worktree refusal does NOT clear by waiting, so it must consume a cooldown.
+
+    Without the row the pass logs the same line every cycle for ever and the PR never appears in
+    `--status`. The gate-refusal case above is the OPPOSITE rule: nothing consumed, nothing burnt.
+    """
+    monkeypatch.setattr(pr, "STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(pr, "log", lambda m: None)
+    monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
+    monkeypatch.setattr(pr, "materialise_worktree",
+                        lambda p: ("", pr._Refusal(
+                            "worktree prd-3/fix/x is dirty -- refusing to reset it", persistent=True)))
+    called = []
+    monkeypatch.setattr(pr, "sh_err", lambda *a, **k: called.append(a) or ("", "", 0))
+    ok, detail, record = pr.dispatch(_pr(3), "failing", "x", dry=False)
+    assert (ok, record) == (False, True)
+    assert "dirty" in detail
+    assert not called, "nothing must be spawned when the worktree could not be materialised"
+
+
+def test_a_TRANSIENT_worktree_failure_is_not_recorded(monkeypatch, tmp_path):
+    """A failed fetch / git-probe timeout clears on its own, so it must NOT buy a 45-min cooldown.
+
+    It also must not eat a class slot for the rest of the pass -- `pass_budgets` charges the row on
+    the NEXT pass, so charging `spent` here too would starve the other PRs in this one.
+    """
+    monkeypatch.setattr(pr, "STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(pr, "log", lambda m: None)
+    monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
+    monkeypatch.setattr(pr, "materialise_worktree",
+                        lambda p: ("", "cannot materialise fix/x: origin/fix/x could not be "
+                                        "fetched (boom)"))
+    monkeypatch.setattr(pr, "sh_err", lambda *a, **k: ("", "", 0))
+    ok, detail, record = pr.dispatch(_pr(3), "failing", "x", dry=False)
+    assert (ok, record) == (False, False), (ok, detail, record)
 
 
 def test_main_writes_no_state_row_for_a_refused_spawn(monkeypatch):
@@ -231,7 +281,8 @@ def test_main_writes_no_state_row_for_a_refused_spawn(monkeypatch):
     monkeypatch.setattr(pr, "classify", lambda p: "failing")
     monkeypatch.setattr(pr, "brief", lambda p, a: "b")
     monkeypatch.setattr(pr, "log", lambda m: None)
-    monkeypatch.setattr(pr, "dispatch", lambda p, a, t, d: (False, "gate refused rc=75"))
+    monkeypatch.setattr(pr, "worker_status", lambda name: "failed")
+    monkeypatch.setattr(pr, "dispatch", lambda p, a, t, d: (False, "gate refused rc=75", False))
     monkeypatch.setattr(pr, "save_state", lambda st: saved.update(st))
     monkeypatch.setattr(sys, "argv", ["pr-doctor.py"])
     monkeypatch.setenv("MAX_FIX", "16")
@@ -241,14 +292,36 @@ def test_main_writes_no_state_row_for_a_refused_spawn(monkeypatch):
         "a refused spawn must not consume a state row / budget slot"
 
 
+def test_main_writes_a_state_row_for_a_persistent_refusal(monkeypatch):
+    """A refusal that will NOT clear on its own must reach a cooldown, not be retried for ever."""
+    saved = {}
+    monkeypatch.setattr(pr, "load_state", lambda: {})
+    monkeypatch.setattr(pr, "open_prs", lambda: [_pr(1)])
+    monkeypatch.setattr(pr, "classify", lambda p: "failing")
+    monkeypatch.setattr(pr, "brief", lambda p, a: "b")
+    monkeypatch.setattr(pr, "log", lambda m: None)
+    monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
+    monkeypatch.setattr(pr, "dispatch",
+                        lambda p, a, t, d: (False, "worktree dirty -- refusing", True))
+    monkeypatch.setattr(pr, "save_state", lambda st: saved.update(st))
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py"])
+    monkeypatch.setenv("MAX_FIX", "16")
+    monkeypatch.setenv("MAX_REVIEW", "12")
+    assert pr.main() == 0
+    assert saved.get("1", {}).get("head") == "a" * 40, "a persistent refusal must record a row"
+    assert saved["1"]["kind"] == "refused", \
+        "a refusal row must be stamped `refused`, or void_refused_rows will delete it on the next pass"
+
+
 def test_dispatch_reports_a_failed_worktree_instead_of_spawning(monkeypatch, tmp_path):
     monkeypatch.setattr(pr, "STATE_DIR", str(tmp_path))
     monkeypatch.setattr(pr, "log", lambda m: None)
+    monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
     monkeypatch.setattr(pr, "materialise_worktree",
                         lambda p: ("", "worktree add failed rc=1: boom"))
     called = []
     monkeypatch.setattr(pr, "sh_err", lambda *a, **k: called.append(a) or ("", "", 0))
-    ok, detail = pr.dispatch(_pr(3), "failing", "x", dry=False)
+    ok, detail, _ = pr.dispatch(_pr(3), "failing", "x", dry=False)
     assert ok is False
     assert "worktree add failed" in detail
     assert not called, "nothing must be spawned when the worktree could not be materialised"
@@ -260,12 +333,18 @@ def test_nonblocking_dispatch_routes_through_run_agent(tmp_path):
     A background dispatcher that carried its own spawn would never reach `run_agent()`. This
     asserts the call ARRIVES at the gate -- which is where the load gate lives -- by recording it.
     If the routing is ever "simplified" back to a direct `pi` spawn, this goes RED.
+
+    ⛔ AND IT PINS THE OTHER HALF OF THE P0: the stub worker SLEEPS 3 s, so a CAPTURED call can only
+    return promptly if the worker subshell closed the parent's stdout/stderr (`exec >/dev/null
+    2>&1`). Without that line this test takes the worker's lifetime; measured pre-fix, 5.02 s for a
+    5 s worker. Removing the `exec` from the harness reddens THIS test and nothing else, which is
+    the point: pr-doctor no longer captures, so no shipped pr-doctor caller would notice.
     """
     d = tmp_path / "orch"
     d.mkdir()
     marker = tmp_path / "marker.txt"
     (d / "spawn-gate.sh").write_text(
-        'run_agent() { echo "GATED $*" > "$MARK"; echo ran; return 0; }\n')
+        'run_agent() { echo "GATED $*" > "$MARK"; sleep 3; echo ran; return 0; }\n')
     wt = tmp_path / "wt"
     wt.mkdir()
     subprocess.run(["git", "init", "-q"], cwd=str(wt), check=True,
@@ -274,9 +353,13 @@ def test_nonblocking_dispatch_routes_through_run_agent(tmp_path):
     prompt.write_text("do the thing\n")
     env = dict(os.environ, O=str(d), MARK=str(marker))
     nb = _HARNESS / "nonblocking-dispatch.sh"
+    t0 = time.monotonic()
     r = subprocess.run(["bash", str(nb), "prd-1", str(wt), str(prompt), "5"],
-                       capture_output=True, text=True, env=env, timeout=60)
+                       capture_output=True, text=True, env=env, timeout=30)
+    elapsed = time.monotonic() - t0
     assert r.returncode == 0, r.stderr
+    assert elapsed < 2.0, ("the captured call waited %.2fs for a 3 s worker -- the worker "
+                           "subshell is holding the caller's pipe" % elapsed)
     for _ in range(100):
         if marker.exists():
             break
@@ -1054,8 +1137,9 @@ def _drive(monkeypatch, *, prs, action, cap_env, dispatch=None):
     if dispatch is None:
         def dispatch(p, a, text, dry):
             sent.append("prd-%s" % p["number"])
-            return True, ""
+            return True, "", False
     monkeypatch.setattr(pr, "dispatch", dispatch)
+    monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
     monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--dry-run"])
     monkeypatch.setenv("MAX_FIX", str(cap_env[0]))
     monkeypatch.setenv("MAX_REVIEW", str(cap_env[1]))
@@ -1097,3 +1181,492 @@ def test_fix_and_review_budgets_are_separate(monkeypatch):
     fix = [s for s in sent if s in ("prd-1", "prd-2", "prd-3", "prd-4", "prd-5")]
     review = [s for s in sent if s in ("prd-6", "prd-7", "prd-8", "prd-9", "prd-10")]
     assert len(fix) == 2 and len(review) == 3
+
+
+# ── 6. the spawn path RETURNS, and one PR never gets two workers ─────────────────────────
+#
+# Every test below drives the REAL `nonblocking-dispatch.sh` against a stub `spawn-gate.sh`, so the
+# thing under test is the shipped dispatcher plus pr-doctor -- not a stub of either. Each one fails
+# on e49fac32a; the pre-fix behaviour is named in its docstring.
+
+# `run_agent` bodies, one per shape of worker the finding names.
+# ⛔ EVERY ONE of these must OUTLIVE the assertion window (6 s vs a 3 s bound), or it cannot
+# distinguish the defect: a worker that exits at once closes its own end of the pipe, so even a
+# captured pre-fix call returned promptly for that shape.
+_WORKERS = {
+    # silent for its whole life
+    "sleeps past the window and writes nothing": "run_agent() { sleep 6; return 0; }\n",
+    # writes IMMEDIATELY (the shape where a caller with a pipe receives output first) and runs on
+    "writes at once, then sleeps": 'run_agent() { echo starting; sleep 6; return 0; }\n',
+    # writes to BOTH streams at the end
+    "sleeps, then writes to stdout and stderr": 'run_agent() { sleep 6; echo OUT; echo ERR >&2; }\n',
+}
+
+
+def _orch(tmp_path, run_agent_body):
+    """A private `$O` with a stub `spawn-gate.sh`, and a real git worktree to run in."""
+    d = tmp_path / "orch"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "spawn-gate.sh").write_text(run_agent_body)
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=str(wt), check=True,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return d, wt
+
+
+def _wire_dispatch(monkeypatch, tmp_path, d, wt):
+    monkeypatch.setattr(pr, "STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setattr(pr, "ORCH_DIR", str(d))
+    monkeypatch.setattr(pr, "NONBLOCKING_DISPATCH", str(_HARNESS / "nonblocking-dispatch.sh"))
+    monkeypatch.setattr(pr, "materialise_worktree", lambda p: (str(wt), ""))
+    monkeypatch.setattr(pr, "log", lambda m: None)
+    monkeypatch.setenv("O", str(d))
+
+
+def _stub_the_spawn(monkeypatch, rc_ok=False):
+    """Stub ONLY the spawn call (and record its argv), so the real git probes still run.
+
+    `rc_ok` writes the worker's exit status the way `nonblocking-dispatch.sh` does, so the
+    confirmation step sees a launch instead of an absent artifact.
+    """
+    seen = []
+    real = pr.sh_err
+
+    def fake(argv, timeout=180, cwd=None, env=None, capture=True):
+        if "--status" not in argv and "nonblocking-dispatch.sh" in str(argv[1] if len(argv) > 1 else ""):
+            seen.append(argv)
+            if rc_ok:
+                bg = pathlib.Path(pr.ORCH_DIR) / "bg"
+                bg.mkdir(parents=True, exist_ok=True)
+                (bg / (argv[2] + ".rc")).write_text("0\n")
+            return "", "", 0
+        return real(argv, timeout=timeout, cwd=cwd, env=env, capture=capture)
+
+    monkeypatch.setattr(pr, "sh_err", fake)
+    return seen
+
+
+@pytest.mark.parametrize("label", sorted(_WORKERS))
+def test_dispatch_returns_promptly_whatever_the_worker_does(monkeypatch, tmp_path, label):
+    """P0: the dispatch call must END WITH THE DISPATCHER, not with the worker.
+
+    PRE-FIX (`sh_err(spawn_argv(...), timeout=120)` with `capture_output=True`): `subprocess.run`
+    blocks on EOF of the capture pipe, and the worker subshell inherits it -- so this call lasted
+    the worker's whole life. For the sleeping worker that is 6 s here and TimeoutExpired at
+    timeout=120 in production, which returned rc=-1, logged `FAIL`, and wrote NO state row.
+    """
+    d, wt = _orch(tmp_path, _WORKERS[label])
+    _wire_dispatch(monkeypatch, tmp_path, d, wt)
+    t0 = time.monotonic()
+    ok, detail, record = pr.dispatch(_pr(5), "failing", "brief", dry=False)
+    elapsed = time.monotonic() - t0
+    assert ok is True and record is True, (ok, detail)
+    assert elapsed < 3.0, "dispatch took %.2fs -- it waited for the worker" % elapsed
+
+
+def test_a_worker_that_outlives_the_pass_still_writes_a_state_row(monkeypatch, tmp_path):
+    """P0: the state row is what stops the next pass re-spawning everything.
+
+    PRE-FIX: the 2400 s brief meant `sh_err` always hit `timeout=120`, so `dispatch()` returned
+    False, `main()` logged `#N: not spawned` and wrote NO row -- no cooldown, no budget consumed,
+    every later pass re-spawning every actionable PR.
+    """
+    saved = {}
+    d, wt = _orch(tmp_path, "run_agent() { sleep 6; return 0; }\n")
+    _wire_dispatch(monkeypatch, tmp_path, d, wt)
+    monkeypatch.setattr(pr, "load_state", lambda: {})
+    monkeypatch.setattr(pr, "open_prs", lambda: [_pr(5)])
+    monkeypatch.setattr(pr, "classify", lambda p: "failing")
+    monkeypatch.setattr(pr, "brief", lambda p, a: "b")
+    monkeypatch.setattr(pr, "save_state", lambda st: saved.update(st))
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py"])
+    monkeypatch.setenv("MAX_FIX", "16")
+    monkeypatch.setenv("MAX_REVIEW", "12")
+    assert pr.main() == 0
+    row = saved.get("5") or {}
+    assert row.get("head") == "a" * 40 and row.get("worker") == "prd-5", \
+        "a launched worker must consume a state row / cooldown: %r" % (saved,)
+    assert row.get("kind") == "spawn", "a launched worker's row must be a spawn row"
+
+
+def _artifacts(d):
+    return {s: (d / "bg" / ("prd-7." + s)).read_bytes()
+            for s in ("pid", "log", "started", "rc") if (d / "bg" / ("prd-7." + s)).exists()}
+
+
+def test_a_live_worker_is_never_spawned_over(monkeypatch, tmp_path):
+    """P1: a second spawn would DESTROY the live worker's log, `.rc` and `.pid`.
+
+    `nonblocking-dispatch.sh` starts with `rm -f "$RC"`, `: > "$LOG"`, `echo … > "$PIDF"`, and the
+    worker name (`prd-<n>`) and its worktree are deterministic -- so a second dispatch runs in the
+    same directory and overwrites all three. PRE-FIX: `dispatch()` never asked, so two consecutive
+    calls both returned True with pid2 in the pid file while pid1 was alive.
+    """
+    # 30 s, not 6: the assertion is about the SECOND dispatch, so the first worker must still be
+    # alive however slow the runner is (nothing waits on it -- it is disowned by the harness).
+    d, wt = _orch(tmp_path, "run_agent() { sleep 30; return 0; }\n")
+    _wire_dispatch(monkeypatch, tmp_path, d, wt)
+    ok1, detail1, record1 = pr.dispatch(_pr(7), "failing", "brief", dry=False)
+    assert ok1 is True and record1 is True, detail1
+    before = _artifacts(d)
+    assert "pid" in before and "log" in before, before
+    ok2, detail2, record2 = pr.dispatch(_pr(7), "failing", "other brief", dry=False)
+    assert (ok2, record2) == (False, False), "a live worker must not be spawned over"
+    assert "still running" in detail2
+    assert _artifacts(d) == before, "the live worker's pid/log/rc must be untouched"
+
+
+def test_a_head_change_does_not_bypass_the_live_worker_guard(monkeypatch):
+    """P1: the reported trigger -- worker A pushes at T+2min, the pass at T+3min sees a NEW head.
+
+    `prev.head != headRefOid` bypasses the cooldown by design, and `_ensure_head` is a no-op for a
+    worker that pushed. PRE-FIX: `main()` called `dispatch()` and the second worker landed on top
+    of the first. The guard must hold REGARDLESS of head movement.
+    """
+    calls = []
+    st = {"7": {"action": "failing", "worker": "prd-7", "head": "b" * 40,
+                "at": "2026-01-01T00:00:00Z", "at_epoch": 0}}
+    monkeypatch.setattr(pr, "load_state", lambda: dict(st))
+    monkeypatch.setattr(pr, "open_prs", lambda: [_pr(7)])
+    monkeypatch.setattr(pr, "classify", lambda p: "failing")
+    monkeypatch.setattr(pr, "brief", lambda p, a: "b")
+    monkeypatch.setattr(pr, "log", lambda m: None)
+    monkeypatch.setattr(pr, "worker_status", lambda name: "running")   # prd-7 is alive
+    monkeypatch.setattr(pr, "dispatch", lambda p, a, t, d: calls.append(p["number"]) or (True, "", True))
+    monkeypatch.setattr(pr, "save_state", lambda st2: None)
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py"])
+    monkeypatch.setenv("MAX_FIX", "16")
+    monkeypatch.setenv("MAX_REVIEW", "12")
+    assert pr.main() == 0
+    assert calls == [], "a live worker must be in flight, not a free slot"
+
+
+def test_materialise_adopts_a_worktree_the_pr_branch_is_already_in(monkeypatch, tmp_path):
+    """P1: a PR produced by a lane has its branch in THAT LANE'S worktree -- the normal case.
+
+    `git worktree add <path> <branch>` refuses to check one branch out twice (rc=128 "'fix/abc' is
+    already used by worktree at …"), and merging the PR is what frees the worktree, so refusing
+    deadlocks. PRE-FIX: `materialise_worktree` returned ("", "worktree add failed rc=128: …"), and
+    `dispatch()` then returned False with no state row -- one log line per pass, for ever.
+    """
+    repo, g = _git_repo(tmp_path)
+    head = g("rev-parse", "HEAD").stdout.strip()
+    g("branch", "fix/abc")
+    lane = repo / ".worktrees" / "fix-1529"
+    g("worktree", "add", str(lane), "fix/abc")
+    _wire_repo(monkeypatch, repo)
+    wt, err = pr.materialise_worktree(_prb(42, head, "fix/abc"))
+    assert err == "", err
+    assert os.path.realpath(wt) == os.path.realpath(str(lane)), \
+        "the PR's own branch worktree must be adopted, not refused"
+    assert subprocess.run(["git", "-C", wt, "symbolic-ref", "--short", "HEAD"],
+                          capture_output=True, text=True).stdout.strip() == "fix/abc"
+
+
+def test_adopting_an_unsafe_lane_worktree_refuses_AND_records_a_row(monkeypatch, tmp_path):
+    """P1: when adoption is UNSAFE the refusal must reach a cooldown, not retry for ever.
+
+    The lane worktree on the PR's branch holds uncommitted work at a different head, so it may be
+    neither reset nor ignored. PRE-FIX: `materialise_worktree` failed on `worktree add` and
+    `dispatch()` returned a bare False -- no row, so the pass re-attempted it every cycle and the
+    PR never appeared in `--status`.
+    """
+    repo, g = _git_repo(tmp_path)
+    c1 = g("rev-parse", "HEAD").stdout.strip()
+    g("branch", "fix/abc")
+    lane = repo / ".worktrees" / "fix-1529"
+    g("worktree", "add", str(lane), "fix/abc")
+    g("commit", "--allow-empty", "-qm", "second")          # PR head moves on main
+    c2 = g("rev-parse", "HEAD").stdout.strip()
+    (lane / "f.txt").write_text("a lane's uncommitted work\n")   # tracked -> dirty
+    _wire_repo(monkeypatch, repo)
+    monkeypatch.setattr(pr, "STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
+    _stub_the_spawn(monkeypatch)
+    ok, detail, record = pr.dispatch(_prb(42, c2, "fix/abc"), "failing", "brief", dry=False)
+    assert (ok, record) == (False, True), (ok, detail, record)
+    assert "uncommitted" in detail and str(lane) in detail, detail
+    assert (lane / "f.txt").read_text() == "a lane's uncommitted work\n", \
+        "the lane's work must never be reset (c1=%s)" % c1[:7]
+
+
+def test_an_adopted_lane_worktree_at_the_pr_head_is_dispatched(monkeypatch, tmp_path):
+    """The other half of adoption: a CLEAN lane worktree at the PR head runs the worker."""
+    repo, g = _git_repo(tmp_path)
+    head = g("rev-parse", "HEAD").stdout.strip()
+    g("branch", "fix/abc")
+    lane = repo / ".worktrees" / "fix-1529"
+    g("worktree", "add", str(lane), "fix/abc")
+    _wire_repo(monkeypatch, repo)
+    monkeypatch.setattr(pr, "STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
+    monkeypatch.setattr(pr, "CONFIRM_WINDOW_S", 0.5)
+    seen = _stub_the_spawn(monkeypatch, rc_ok=True)
+    ok, detail, record = pr.dispatch(_prb(42, head, "fix/abc"), "failing", "brief", dry=False)
+    assert ok is True and record is True, detail
+    assert seen and os.path.realpath(seen[-1][3]) == os.path.realpath(str(lane)), seen
+
+
+# ── 7. a partial exit-status write is NOT a verdict ──────────────────────────────────────
+
+def test_read_rc_ignores_a_partial_write(tmp_path):
+    """P3: `int(fh.read().strip())` accepted `7` -- the first byte of `75\\n` -- as the code 7.
+
+    `7` is not a refusal code, so dispatch() broke out of the poll and recorded as LAUNCHED a
+    spawn the gate had REFUSED. A partial write is not a verdict: the code is accepted only when
+    the trailing newline `echo` writes has arrived.
+    """
+    p = tmp_path / "x.rc"
+    p.write_text("7")
+    assert pr.read_rc(str(p)) is None
+    p.write_text("75")
+    assert pr.read_rc(str(p)) is None
+    p.write_text("75\n")
+    assert pr.read_rc(str(p)) == 75
+    assert pr.read_rc(str(tmp_path / "absent.rc")) is None
+
+
+def test_a_refusal_split_across_two_writes_is_finally_read(monkeypatch, tmp_path):
+    """End-to-end P3: the code lands in two chunks WHILE dispatch() is polling.
+
+    PRE-FIX: the first read saw `7`, `int()` accepted it, `7 not in (75, 77)` broke the loop, and
+    dispatch() returned True -- a recorded dispatch for a spawn the gate had refused.
+    """
+    d, wt = _orch(tmp_path, "run_agent() { return 0; }\n")
+    _wire_dispatch(monkeypatch, tmp_path, d, wt)
+    rc = d / "bg" / "prd-8.rc"
+    rc.parent.mkdir(parents=True, exist_ok=True)
+    rc.write_text("7")                          # the first chunk of `echo 75` has landed
+    (d / "bg" / "prd-8.log").write_text("[load-gate] REFUSED bg prd-8: load=99 >= max_load=40\n")
+    threading.Timer(0.4, lambda: rc.write_text("75\n")).start()
+
+    def fake_sh_err(argv, timeout=180, cwd=None, env=None, capture=True):
+        if "--status" in argv:
+            return "prd-8 lost (no exit status recorded and pid is gone)\n", "", 0
+        return "", "", 0
+
+    monkeypatch.setattr(pr, "sh_err", fake_sh_err)
+    monkeypatch.setattr(pr, "CONFIRM_WINDOW_S", 2.0)
+    ok, detail, record = pr.dispatch(_pr(8), "failing", "brief", dry=False)
+    assert (ok, record) == (False, False), (ok, detail, record)
+    assert "75" in detail
+
+
+def test_a_row_left_by_a_refused_spawn_is_reclaimed_on_the_next_pass(tmp_path, monkeypatch):
+    """P2: the durable backstop. A refusal that lands AFTER the confirmation window must not hold
+    a cooldown and a class slot for STALE_DISPATCH_S (90 min) -- the next pass re-reads the same
+    `.rc` artifact and drops the row. PRE-FIX: no window check existed at all, so the row stood."""
+    d = tmp_path / "orch"
+    (d / "bg").mkdir(parents=True)
+    (d / "bg" / "prd-4.rc").write_text("75\n")
+    (d / "bg" / "prd-4.log").write_text("[load-gate] REFUSED bg prd-4: load=99 >= max_load=40\n")
+    monkeypatch.setattr(pr, "ORCH_DIR", str(d))
+    st = {"4": {"action": "failing", "worker": "prd-4", "kind": "spawn", "head": "a" * 40,
+                "at": "2026-01-01T00:00:00Z", "at_epoch": 0}}
+    assert pr.void_refused_rows(st) == ["4"]
+    assert "4" not in st
+    assert pr.pass_budgets(st, {"max_fix": 1, "max_review": 1})["fix"] == 1, \
+        "the reclaimed slot must be usable again"
+
+
+def test_a_worktree_refusal_row_is_NOT_voided_by_a_stale_rc(tmp_path, monkeypatch):
+    """A `kind: refused` row owns no `.rc`, so an EARLIER worker's 75 must not delete it.
+
+    The row exists because the worktree refusal will not clear by waiting; if the stale artifact
+    voided it, the cooldown would never hold, the pass would re-probe every cycle and log the same
+    line for ever -- the exact loop the record exists to close.
+    """
+    d = tmp_path / "orch"
+    (d / "bg").mkdir(parents=True)
+    (d / "bg" / "prd-6.rc").write_text("75\n")                     # left by an EARLIER attempt
+    (d / "bg" / "prd-6.log").write_text("[load-gate] REFUSED bg prd-6\n")
+    monkeypatch.setattr(pr, "ORCH_DIR", str(d))
+    st = {"6": {"action": "failing", "worker": "prd-6", "kind": "refused", "head": "a" * 40,
+                "at": "2026-01-01T00:00:00Z", "at_epoch": 0}}
+    assert pr.void_refused_rows(st) == []
+    assert st["6"]["kind"] == "refused", "the row must survive, or the cooldown never holds"
+
+
+def test_a_row_is_kept_when_the_rc_came_from_pi_not_the_gate(tmp_path, monkeypatch):
+    """`pi` shares the 0-255 namespace: rc=75 with NO gate marker is an agent that RAN and failed.
+
+    Dropping that row would re-dispatch a PR whose worker really executed (bypassing its
+    cooldown); keeping it is what the `[load-gate] REFUSED` marker buys.
+    """
+    d = tmp_path / "orch"
+    (d / "bg").mkdir(parents=True)
+    (d / "bg" / "prd-9.rc").write_text("75\n")
+    (d / "bg" / "prd-9.log").write_text("[timeout] agent pid=42 wall_limit=2400s elapsed=9s rc=75\n")
+    monkeypatch.setattr(pr, "ORCH_DIR", str(d))
+    assert pr.gate_refused("prd-9", 75) is False
+    st = {"9": {"action": "failing", "worker": "prd-9", "kind": "spawn", "head": "a" * 40,
+                "at": "2026-01-01T00:00:00Z", "at_epoch": 0}}
+    assert pr.void_refused_rows(st) == []
+
+
+def test_the_refusal_markers_are_the_gates_own_lines():
+    """Anti-drift on the ONE piece of prose this file reads: reword it in spawn-gate.sh and the
+    refusal detection silently stops working (every refusal would read as a real dispatch)."""
+    gate = (_HARNESS / "spawn-gate.sh").read_text()
+    for marker in pr.REFUSAL_MARKERS:
+        assert 'echo "%s ' % marker in gate, \
+            "spawn-gate.sh no longer writes %r -- REFUSAL_MARKERS is stale" % marker
+
+
+def test_an_unreadable_worker_status_REFUSES_to_spawn(monkeypatch, tmp_path):
+    """`None` is not "free to spawn": a blind second spawn destroys a live worker's .log/.rc/.pid."""
+    monkeypatch.setattr(pr, "STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(pr, "log", lambda m: None)
+    monkeypatch.setattr(pr, "worker_status", lambda name: None)      # --status unanswerable
+    spawned = []
+    monkeypatch.setattr(pr, "sh_err", lambda *a, **k: spawned.append(a) or ("", "", 0))
+    ok, detail, record = pr.dispatch(_pr(12), "failing", "x", dry=False)
+    assert (ok, record) == (False, False)
+    assert "liveness" in detail
+    assert not spawned, "nothing may be spawned when liveness cannot be read"
+
+
+def test_a_recycled_pid_is_not_a_live_worker(tmp_path, monkeypatch):
+    """`--status` answers `running` from `kill -0` on an unpruned pid file; the harness's own
+    `.started` stamp bounds it, or a recycled pid would skip that PR for ever."""
+    d = tmp_path / "orch"
+    (d / "bg").mkdir(parents=True)
+    (d / "bg" / "prd-2.started").write_text("name=prd-2\n")
+    monkeypatch.setattr(pr, "ORCH_DIR", str(d))
+    monkeypatch.setattr(pr, "log", lambda m: None)
+    monkeypatch.setattr(pr, "worker_status", lambda name: "running")
+    assert pr.worker_live("prd-2") is True                       # fresh stamp, live pid
+    old = time.time() - (pr.SPAWN_TIMEOUT_S + pr.WORKER_STALE_SLACK_S + 60)
+    os.utime(str(d / "bg" / "prd-2.started"), (old, old))
+    assert pr.worker_live("prd-2") is False, "a stamp older than cap+slack is a recycled pid"
+
+
+def test_a_dispatcher_failure_reports_the_dispatchers_own_stderr(monkeypatch, tmp_path):
+    """The harness's stderr is the ONLY channel for a permanent misconfiguration.
+
+    `nonblocking-dispatch.sh` refuses with `exit 78` + a message on stderr when it cannot find
+    `spawn-gate.sh`. Routing stderr to DEVNULL (or to a pipe, the P0) either loses that text or
+    blocks; it goes to a temp file, so the log line names the real cause. This runs the shipped
+    harness with no `spawn-gate.sh` anywhere it looks.
+    """
+    d = tmp_path / "orch"
+    d.mkdir()
+    nb = d / "nonblocking-dispatch.sh"
+    nb.write_bytes((_HARNESS / "nonblocking-dispatch.sh").read_bytes())   # no sibling gate
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=str(wt), check=True,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    monkeypatch.setattr(pr, "STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setattr(pr, "ORCH_DIR", str(d))
+    monkeypatch.setattr(pr, "NONBLOCKING_DISPATCH", str(nb))
+    monkeypatch.setattr(pr, "materialise_worktree", lambda p: (str(wt), ""))
+    monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
+    monkeypatch.setattr(pr, "log", lambda m: None)
+    ok, detail, record = pr.dispatch(_pr(13), "failing", "brief", dry=False)
+    assert (ok, record) == (False, False)
+    assert "78" in detail and "spawn-gate.sh" in detail, detail
+
+
+def test_main_persists_a_voided_row_without_dispatching_anything(monkeypatch, tmp_path):
+    """The void must be WRITTEN, not merely logged: the helper drops the row in memory, and every
+    early return after it (`no open PRs`, `no budget`) used to skip `save_state` -- so the log
+    claimed a drop that no later pass would see."""
+    d = tmp_path / "orch"
+    (d / "bg").mkdir(parents=True)
+    (d / "bg" / "prd-3.rc").write_text("77\n")
+    (d / "bg" / "prd-3.log").write_text("[disk-gate] REFUSED bg prd-3: only 10MB free\n")
+    monkeypatch.setattr(pr, "ORCH_DIR", str(d))
+    monkeypatch.setattr(pr, "log", lambda m: None)
+    monkeypatch.setattr(pr, "load_state",
+                        lambda: {"3": {"action": "failing", "worker": "prd-3", "kind": "spawn",
+                                       "head": "a" * 40, "at": "2026-01-01T00:00:00Z",
+                                       "at_epoch": 0}})
+    saved = {}
+    monkeypatch.setattr(pr, "save_state", lambda st: saved.update({k: dict(v) for k, v in st.items()}))
+    monkeypatch.setattr(pr, "open_prs", lambda: [])          # the early-return path
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py"])
+    assert pr.main() == 0
+    assert "3" not in saved, "the refused row must be dropped AND persisted: %r" % (saved,)
+
+
+def test_main_shows_a_refused_row_as_refused_in_status(monkeypatch, capsys):
+    """`--status` is the operator's verb: a row that exists because the PR was REFUSED must not
+    read as a dispatch."""
+    monkeypatch.setattr(pr, "load_state",
+                        lambda: {"7": {"action": "failing", "worker": "prd-7", "kind": "refused",
+                                       "head": "a" * 40, "at": "2026-01-01T00:00:00Z",
+                                       "at_epoch": 0},
+                                 "8": {"action": "ready", "worker": "prd-8", "kind": "spawn",
+                                       "head": "b" * 40, "at": "2026-01-01T00:00:00Z",
+                                       "at_epoch": 0}})
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--status"])
+    assert pr.main() == 0
+    out = capsys.readouterr().out
+    assert "kind=refused" in out
+    assert "kind=spawn" not in out, "a real dispatch must print exactly what it always did"
+
+
+def test_an_agents_own_output_cannot_forge_a_refusal(tmp_path, monkeypatch):
+    """The worker log is shared with the AGENT. A `pi` that prints the marker and then exits 75
+    must be read as "an agent ran and failed", not as a gate refusal -- otherwise its row is
+    deleted and the PR is re-dispatched on top of work that really happened."""
+    d = tmp_path / "orch"
+    (d / "bg").mkdir(parents=True)
+    # ⛔ THE PRODUCER'S ORDER, not a convenient one: `spawn-gate.sh` starts `pi >> $LOG` and writes
+    # the `[timeout] agent pid=` line only AFTER `wait`, so an agent's output sits ABOVE it. A
+    # fixture that puts the marker FIRST would pass against a code that splits on it, which is how
+    # an inverted discriminator survived a "fix" once already.
+    (d / "bg" / "prd-4.log").write_text(
+        'the reviewer quoted the literal "[load-gate] REFUSED" marker\n'
+        "[timeout] agent pid=42 wall_limit=2400s elapsed=61s rc=75\n")
+    (d / "bg" / "prd-4.rc").write_text("75\n")
+    monkeypatch.setattr(pr, "ORCH_DIR", str(d))
+    assert pr.gate_refused("prd-4", 75) is False
+    st = {"4": {"action": "failing", "worker": "prd-4", "kind": "spawn", "head": "a" * 40,
+                "at": "2026-01-01T00:00:00Z", "at_epoch": 0}}
+    assert pr.void_refused_rows(st) == [], "a ran-and-failed worker keeps its cooldown"
+
+
+def test_a_large_worker_log_is_evidence_an_agent_ran(tmp_path, monkeypatch):
+    """Only an agent writes a big log; the gate refuses in a line. Past the read window the answer
+    must be "an agent ran" (keep the cooldown), never "nothing consumed"."""
+    d = tmp_path / "orch"
+    (d / "bg").mkdir(parents=True)
+    (d / "bg" / "prd-5.log").write_text('x\n' * (pr.REFUSAL_LOG_WINDOW // 2 + 10)
+                                       + "[load-gate] REFUSED quoted by the agent\n")
+    (d / "bg" / "prd-5.rc").write_text("75\n")
+    monkeypatch.setattr(pr, "ORCH_DIR", str(d))
+    assert pr.gate_refused("prd-5", 75) is False
+
+
+def test_the_agent_ran_marker_is_still_written_after_the_wait():
+    """`gate_refused` keys on `[timeout] agent pid=` meaning "an agent ran". If spawn-gate.sh stops
+    writing it -- or writes it BEFORE the agent is waited on -- every refusal-vs-run distinction
+    silently degrades to "refusal".
+
+    ⛔ ANCHORED ON THE COMMAND, NOT ON A SUBSTRING. `gate.index("wait ")` finds the FIRST `wait `
+    in the file, and that is a word in a comment (spawn-gate.sh's disk-gate rationale), not
+    `wait "$pid"` -- so a substring assertion is satisfied by prose and stays green when the real
+    `wait` is deleted. Line numbers are compared instead.
+    """
+    lines = gate_lines()
+    wait_ln = [i for i, l in enumerate(lines, 1) if re.match(r'^\s*wait\s+"\$pid"', l)]
+    marker_ln = [i for i, l in enumerate(lines, 1) if pr.AGENT_RAN_MARKER in l]
+    assert wait_ln, "spawn-gate.sh no longer waits on the agent pid"
+    assert marker_ln, "spawn-gate.sh no longer writes %r" % pr.AGENT_RAN_MARKER
+    assert min(marker_ln) > min(wait_ln), \
+        "the [timeout] marker must be written AFTER `wait`, or presence stops meaning 'ran'"
+    # ...and every refusal verdict is written BEFORE `pi` is launched, which is the other half of
+    # the discriminator: a gate line and a launch cannot both be true of one run.
+    launch_ln = [i for i, l in enumerate(lines, 1) if l.strip().startswith("pi -p")]
+    assert launch_ln, "spawn-gate.sh no longer launches the agent with `pi -p`"
+    for marker in pr.REFUSAL_MARKERS:
+        for i, l in enumerate(lines, 1):
+            if marker in l and l.lstrip().startswith("echo"):
+                assert i < min(launch_ln), "%r must be written BEFORE the agent starts" % marker
+
+
+def gate_lines():
+    return (_HARNESS / "spawn-gate.sh").read_text().splitlines()

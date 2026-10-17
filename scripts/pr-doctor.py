@@ -53,6 +53,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 
@@ -115,13 +116,62 @@ ORCH_DIR = os.environ.get("O") or os.path.join(HOME, "orchestrator")
 NONBLOCKING_DISPATCH = os.path.join(ORCH_DIR, "nonblocking-dispatch.sh")
 WORKTREE_ROOT = os.path.join(REPO_DIR, ".worktrees")
 SPAWN_TIMEOUT_S = 2400        # wall-clock cap handed to the background worker
-# `nonblocking-dispatch.sh` backgrounds `run_agent()` and returns 0 the moment the worker is
-# launched, so a GATE REFUSAL (AGENT_DISK_REFUSED=77 / AGENT_LOAD_REFUSED=75) only lands in
-# `$O/bg/<name>.rc`. A refusal is written within milliseconds (the gate is the first thing
-# run_agent does) and consumed nothing, so dispatch() gives it a brief window to land before
-# recording a dispatch. A launched worker writes NO `.rc` until it exits, so a normal dispatch
-# pays only the window and then proceeds.
-REFUSAL_WINDOW_S = 1.0
+# ⛔ THE SPAWN CALL MUST NOT WAIT FOR THE WORKER -- AND A CAPTURED CALL DOES. `subprocess.run`
+# blocks until EOF on the capture PIPE, not until the child exits; `nonblocking-dispatch.sh`
+# backgrounds the worker with `( … ) <&- &`, which closes STDIN only, so the worker subshell
+# INHERITED this process's stdout/stderr pipe and held it open for its entire life. MEASURED with
+# the shipped script and a stub `run_agent`: capture=True took 5.02 s for a 5 s worker, capture=
+# False 0.03 s. Every real brief is a fix->review->record->merge run, so the captured call always
+# hit the timeout and returned rc=-1 (TimeoutExpired) about a spawn that HAD launched -- 120 s of
+# dead time per PR, a false FAIL, and no state row, so every later pass re-spawned every
+# actionable PR.
+#
+# ⚠️ THE PIPE-SHAPE ABOVE IS NOT GONE EVERYWHERE, WHICH IS WHY THE CALLER FIXES IT TOO. This file
+# reaches the dispatcher at `$O/nonblocking-dispatch.sh`, a copy installed by hand (README §2) that
+# can be OLDER than the shipped one; the shipped script now closes stdout/stderr in the worker
+# subshell (`exec >/dev/null 2>&1`), and that is belt-and-braces for every OTHER captured caller.
+# Neither half depends on the other: the call below runs non-captured, so it returns in
+# milliseconds even against a stale deployed copy, and the harness closes the pipe so a stale
+# CALLER cannot be held either. Do not delete one as "redundant" with the other standing.
+#
+# The verdict comes from the worker's own artifacts under `$O/bg` (see `_confirm`), never from the
+# pipe. The timeout below is a guard on the DISPATCHER, which returns in well under a second -- not
+# on the worker.
+SPAWN_CALL_TIMEOUT_S = 120
+# A gate refusal (AGENT_DISK_REFUSED=77 / AGENT_LOAD_REFUSED=75) consumed nothing, so it must not
+# be recorded. `nonblocking-dispatch.sh` backgrounds `run_agent()` and returns 0 the moment the
+# worker is launched, so the refusal code only ever lands in `$O/bg/<name>.rc`; this is the bound
+# dispatch() gives it to appear before concluding that the worker launched.
+# MEASURED on this box (4 cores, load 0.15) with the REAL spawn-gate.sh and MAX_LOAD=0, 8 runs:
+# 32-36 ms from invocation to a newline-terminated code in `.rc` -- this window is ~28x that.
+# It is a LATENCY OPTIMISATION, NOT THE AUTHORITY. On a box slow enough to outrun it the refusal
+# lands after the row is written; `void_refused_rows()` re-reads the same durable artifact on the
+# next pass and drops such a row, so the cooldown and the class slot are not burnt for 90 minutes.
+CONFIRM_WINDOW_S = 1.0
+# A worker's `.rc` is a verdict ONLY when the write is COMPLETE. `echo "$?" > "$RC"` writes e.g.
+# `75\n`; a reader that lands mid-write sees `7`, and the old `int(fh.read().strip())` ACCEPTED it,
+# `7` is not a refusal code, so dispatch() recorded as launched a spawn the gate had REFUSED.
+# Require the trailing newline, so a partial write is never a verdict.
+_RC_RE = re.compile(r"([0-9]{1,3})\n\Z")
+GATE_REFUSALS = (75, 77)
+# The gate's OWN refusal lines in the worker log (`spawn-gate.sh` writes them to `$log` BEFORE
+# run_agent returns, and the harness writes `.rc` only after that). They are what separates "the
+# gate refused, nothing consumed" from "a `pi` exited 75 for its own reason" -- the ambiguity
+# spawn-gate.sh itself warns about. A test pins these literals against that file, so a reworded
+# marker reddens the suite instead of silently making every refusal look like a dispatch.
+REFUSAL_MARKERS = ("[load-gate] REFUSED", "[disk-gate] REFUSED")
+# `run_agent` appends this line only AFTER `pi` has been waited on (spawn-gate.sh starts `pi >> $LOG`
+# and writes this line after `wait`), so its presence in a log PROVES an agent ran -- and a gate
+# refusal is written strictly BEFORE any agent starts. That makes it a one-way discriminator: agent
+# output sits ABOVE this line, not below it, so nothing about the split matters -- presence is the
+# whole test.
+AGENT_RAN_MARKER = "[timeout] agent pid="
+# The gate writes a line or two and refuses; only an agent can produce a large log. A log past this
+# bound is therefore evidence of a run, and reading no further is what keeps this cheap.
+REFUSAL_LOG_WINDOW = 64 * 1024
+# A worker cannot outlive its own wall-clock cap (SPAWN_TIMEOUT_S) by more than the watchdog's
+# grace, so a pid still `running` long after its `.started` stamp is a RECYCLED pid, not a worker.
+WORKER_STALE_SLACK_S = 15 * 60
 
 # A dispatch draws on the budget of the work it starts. `failing` needs code/CI repair (MAX_FIX);
 # `no-checks` re-triggers the workflows and then runs the review+merge chain, so it is fix work;
@@ -219,19 +269,38 @@ def log(msg: str) -> None:
         pass
 
 
-def sh(args, timeout=180, cwd=None):
+def sh(args, timeout=180, cwd=None, env=None):
     try:
-        r = subprocess.run(args, capture_output=True, text=True, timeout=timeout, cwd=cwd)
+        r = subprocess.run(args, capture_output=True, text=True, timeout=timeout, cwd=cwd, env=env)
         return r.stdout
     except Exception as e:
         log("EXEC FAILED %s: %s" % (args[0], e))
         return ""
 
 
-def sh_err(args, timeout=180, cwd=None):
-    """Same, but returns (stdout, stderr, rc) -- so a failed read is REPORTED, never empty."""
+def sh_err(args, timeout=180, cwd=None, env=None, capture=True):
+    """Same, but returns (stdout, stderr, rc) -- so a failed read is REPORTED, never empty.
+
+    `capture=False` sends the child's STDOUT to DEVNULL and its STDERR to a temporary FILE, and
+    returns ("", stderr, rc). Use it for a child that hands its real work to a BACKGROUND
+    process: with `capture=True`, `subprocess.run` waits for EOF on the pipe -- i.e. for every
+    background descendant that inherited it -- so the call lasts as long as the work it was
+    supposed to start (SPAWN_CALL_TIMEOUT_S carries the measurement).
+
+    ⛔ STDERR GOES TO A FILE, NEVER TO A PIPE **OR** TO DEVNULL. A pipe is what blocks; DEVNULL is
+    what loses the dispatcher's own diagnosis (`spawn-gate.sh not found -- refusing to start an
+    ungated worker`, `no worktree …`), which is the only thing that tells an operator why a
+    permanent failure keeps happening. A regular file has neither problem: no EOF to wait for, and
+    the text is still there when the call returns.
+    """
     try:
-        r = subprocess.run(args, capture_output=True, text=True, timeout=timeout, cwd=cwd)
+        if not capture:
+            with tempfile.TemporaryFile() as errf:
+                r = subprocess.run(args, stdout=subprocess.DEVNULL, stderr=errf,
+                                   timeout=timeout, cwd=cwd, env=env)
+                errf.seek(0)
+                return "", errf.read().decode("utf-8", "replace"), r.returncode
+        r = subprocess.run(args, capture_output=True, text=True, timeout=timeout, cwd=cwd, env=env)
         return r.stdout, r.stderr, r.returncode
     except Exception as e:
         return "", "%s: %s" % (type(e).__name__, e), -1
@@ -329,6 +398,23 @@ def classify(pr: dict) -> str:
 # 2. MATERIALISE A WORKTREE — a fresh worker needs somewhere to run
 # ---------------------------------------------------------------------------
 
+class _Refusal(str):
+    """A refusal message that also knows whether WAITING can clear it.
+
+    `materialise_worktree` fails at eight sites and its callers unpack `(path, why)`, as do 25
+    tests -- a third tuple element would churn all of them for one boolean. A `str` subclass keeps
+    every existing `err == ""` / `"uncommitted" in err` check working while the flag rides along on
+    the object, so only the sites that can say "this will not clear by itself" have to say it.
+    """
+
+    persistent = False
+
+    def __new__(cls, msg, persistent=False):
+        self = super().__new__(cls, msg)
+        self.persistent = persistent
+        return self
+
+
 def materialise_worktree(pr: dict) -> tuple[str, str]:
     """Ensure a git worktree for the PR's branch at the PR's head; return (path, "") or ("", why).
 
@@ -345,6 +431,9 @@ def materialise_worktree(pr: dict) -> tuple[str, str]:
       * Only records whose directory is already GONE are cleared, so a live worktree can never be
         removed here. A dangling directory that holds anything is LEFT ALONE and the PR is
         materialised at a `-d` fallback path, so a previous worker's files survive.
+      * A base-repo PR whose branch is ALREADY CHECKED OUT somewhere is ADOPTED at that worktree,
+        not refused: git will not check one branch out twice, and the case is the normal one -- a
+        PR a lane produced has its branch in that lane's own worktree.
     """
     branch = pr["headRefName"]
     head = pr["headRefOid"]
@@ -366,6 +455,35 @@ def materialise_worktree(pr: dict) -> tuple[str, str]:
     for p, b in _worktrees():
         if not os.path.exists(p) and (p in ours or b == "refs/heads/%s" % branch):
             _drop_worktree_record(p)
+
+    # ADOPT A WORKTREE THE BRANCH IS ALREADY CHECKED OUT IN. A PR a lane produced has its branch
+    # checked out in THAT LANE'S worktree (`git worktree list` on the box: `.worktrees/fix-1529
+    # [fix/5389-a-fleet-veto]`, …), and `git worktree add <path> <branch>` REFUSES to check the
+    # same branch out twice: rc=128 `'fix/x' is already used by worktree at …`. Merging the PR is
+    # what frees that worktree, so failing here is a DEADLOCK for the normal case -- and the
+    # retired lane-table path could still hand the brief to that lane. So adopt it: the worktree
+    # is the lane's own, and the worker must be on the PR's branch anyway. `_ensure_head` still
+    # refuses to reset a worktree holding uncommitted work or orphan-able commits, and dispatch()
+    # RECORDS that refusal as a state row so the PR reaches a cooldown instead of retrying for ever.
+    #
+    # ⚠️ STATED RESIDUAL: liveness of the pr-doctor worker itself is checked in dispatch() before
+    # this runs; liveness of a LANE worker in the adopted worktree is NOT checked here. The
+    # dirty/ahead guards refuse the unsafe cases, and the box-wide lane liveness question has no
+    # mechanical answer in this file (it lives in the fleet board, #8175).
+    if not fork:
+        branch_ref = "refs/heads/%s" % branch
+        for p, b in _worktrees():
+            if b != branch_ref:
+                continue
+            live = _live_worktree(p)
+            if live is None:
+                return "", ("cannot determine whether %s (already on %s) is a worktree (git probe "
+                            "failed) -- refusing to adopt or reset it; inspect it" % (p, branch))
+            if not live:
+                continue      # exists but is not a worktree: not ours to adopt; `add` will report
+            log("materialise: adopting %s, already on %s (the lane's own worktree)" % (p, branch))
+            err = _ensure_head(p, branch, head, fetch_ref)
+            return (p, "") if not err else ("", err)
 
     # Reuse any candidate that is already a live worktree. UNKNOWN is NOT reuse: `True` would run
     # `_ensure_head` -> `reset --hard` against whatever `git -C <path>` resolves to, which for a
@@ -397,9 +515,10 @@ def materialise_worktree(pr: dict) -> tuple[str, str]:
             path = cand
             break
     if not path:
-        return "", ("%s and %s are both unusable (a symlink, a non-worktree directory, or an "
-                    "unremovable record) -- refusing to delete either; inspect and clean"
-                    % (candidates[0], candidates[1]))
+        return "", _Refusal(
+            "%s and %s are both unusable (a symlink, a non-worktree directory, or an unremovable "
+            "record) -- refusing to delete either; inspect and clean" % (candidates[0], candidates[1]),
+            persistent=True)
 
     # A fork PR's headRefName can COLLIDE with a local branch, so branch existence is NOT the
     # fork discriminator (GitHub's `isCrossRepository` is). Only a base-repo PR checks out a named
@@ -542,8 +661,9 @@ def _ensure_branch(path: str, branch: str, fork: bool = False) -> str:
         return ("cannot determine whether worktree %s is clean (git status rc=%s) -- refusing to "
                 "switch branch; inspect and clean it" % (path, drc))
     if (dirty or "").strip():
-        return ("worktree %s is on a different branch/HEAD and has uncommitted tracked changes -- "
-                "refusing to switch it to %s; inspect and clean it" % (path, branch))
+        return _Refusal("worktree %s is on a different branch/HEAD and has uncommitted tracked "
+                        "changes -- refusing to switch it to %s; inspect and clean it"
+                        % (path, branch), persistent=True)
     if detached:
         # Moving off a DETACHED commit no ref holds would orphan it.
         holders, _, hrc = sh_err(["git", "-C", path, "for-each-ref", "--contains", "HEAD",
@@ -551,8 +671,9 @@ def _ensure_branch(path: str, branch: str, fork: bool = False) -> str:
         if hrc != 0:
             return "cannot determine which refs hold worktree %s commits -- refusing to switch it" % path
         if not (holders or "").strip():
-            return ("worktree %s is detached with commit(s) held by no branch -- refusing to switch "
-                    "it and orphan them; create a branch or inspect it" % path)
+            return _Refusal("worktree %s is detached with commit(s) held by no branch -- refusing "
+                            "to switch it and orphan them; create a branch or inspect it" % path,
+                            persistent=True)
     # `checkout <branch>` changes the tree; git protects non-ignored untracked files but SILENTLY
     # OVERWRITES ignored ones (verified), so probe the target branch for both.
     clobber = _untracked_clobber(path, branch)
@@ -560,8 +681,9 @@ def _ensure_branch(path: str, branch: str, fork: bool = False) -> str:
         return ("cannot determine whether switching worktree %s to %s would overwrite untracked "
                 "files -- refusing; inspect it" % (path, branch))
     if clobber:
-        return ("worktree %s has untracked file(s) that %s would overwrite (%s) -- refusing to "
-                "switch it; move or remove them" % (path, branch, ", ".join(clobber[:3])))
+        return _Refusal("worktree %s has untracked file(s) that %s would overwrite (%s) -- "
+                        "refusing to switch it; move or remove them"
+                        % (path, branch, ", ".join(clobber[:3])), persistent=True)
     _, err, xrc = sh_err(["git", "-C", path, "checkout", branch], timeout=180)
     if xrc != 0:
         return "worktree %s could not be switched to %s: %s" % (
@@ -631,15 +753,16 @@ def _ensure_head(path: str, branch: str, head: str, fetch_ref: str = "") -> str:
         return ("cannot determine whether worktree %s is clean (git status rc=%s) -- refusing to "
                 "reset it; inspect and clean it" % (path, drc))
     if (dirty or "").strip():
-        return ("worktree %s is at a different head and has uncommitted tracked changes -- "
-                "refusing to reset it; inspect and clean it" % path)
+        return _Refusal("worktree %s is at a different head and has uncommitted tracked changes "
+                        "-- refusing to reset it; inspect and clean it" % path, persistent=True)
     clobber = _untracked_clobber(path, head)
     if clobber is None:
         return ("cannot determine whether resetting worktree %s would overwrite untracked files "
                 "-- refusing; inspect it" % path)
     if clobber:
-        return ("worktree %s has untracked file(s) that the PR head would overwrite (%s) -- "
-                "refusing to reset it; move or remove them" % (path, ", ".join(clobber[:3])))
+        return _Refusal("worktree %s has untracked file(s) that the PR head would overwrite (%s) "
+                        "-- refusing to reset it; move or remove them"
+                        % (path, ", ".join(clobber[:3])), persistent=True)
     # ⛔ A CLEAN worktree can still hold LOCAL COMMITS the PR head does not (a worker committed but
     # had not pushed, or the state row went stale). `reset --hard` would rewind the branch and
     # ORPHAN them. Only a fast-forward (HEAD an ancestor of head) may reset.
@@ -654,17 +777,18 @@ def _ensure_head(path: str, branch: str, head: str, fetch_ref: str = "") -> str:
     if n_ahead > 0:
         cur, _, curc = sh_err(["git", "-C", path, "symbolic-ref", "--short", "-q", "HEAD"], timeout=30)
         if curc == 0:
-            return ("worktree %s is on %s and has %d commit(s) not on the PR head -- refusing to "
-                    "reset it and orphan them; push or inspect the worktree"
-                    % (path, (cur or "").strip(), n_ahead))
+            return _Refusal("worktree %s is on %s and has %d commit(s) not on the PR head -- "
+                            "refusing to reset it and orphan them; push or inspect the worktree"
+                            % (path, (cur or "").strip(), n_ahead), persistent=True)
         # Detached: safe only when some OTHER ref still holds the commits.
         holders, _, hrc = sh_err(["git", "-C", path, "for-each-ref", "--contains", "HEAD",
                                   "--format=%(refname)", "refs/heads", "refs/remotes"], timeout=60)
         if hrc != 0:
             return "cannot determine which refs hold worktree %s commits -- refusing to reset it" % path
         if not (holders or "").strip():
-            return ("worktree %s is detached and has %d commit(s) held by no branch -- refusing to "
-                    "reset it and orphan them; create a branch or inspect it" % (path, n_ahead))
+            return _Refusal("worktree %s is detached and has %d commit(s) held by no branch -- "
+                            "refusing to reset it and orphan them; create a branch or inspect it"
+                            % (path, n_ahead), persistent=True)
     _, err, rc = sh_err(["git", "-C", path, "reset", "--hard", head], timeout=120)
     if rc != 0:
         return "worktree %s reset to %s failed rc=%s: %s" % (path, head[:12], rc, (err or "").strip()[:160])
@@ -796,7 +920,159 @@ Head `{head}`. `ai-review-gate` is the only red and there is **no attestation at
 
 
 # ---------------------------------------------------------------------------
-# 4. DISPATCH — one worker, one PR, logged
+# 4. WHAT HAPPENED TO A WORKER — the harness's own artifacts, never a guess
+# ---------------------------------------------------------------------------
+
+def bg_path(name: str, suffix: str) -> str:
+    return os.path.join(ORCH_DIR, "bg", "%s.%s" % (name, suffix))
+
+
+def _orch_env() -> dict:
+    """The environment the harness must run in. `O` is the harness's OWN root for `$O/bg`, so it
+    is `ORCH_DIR` here: pr-doctor's `<name>.rc`/`.pid` reads and `nonblocking-dispatch.sh`'s
+    writes can then never land in two different directories, which would make every status read
+    report `lost` and hide every refusal."""
+    return dict(os.environ, O=ORCH_DIR)
+
+
+def read_rc(path: str):
+    """The worker's exit status, or None when the file does not hold a COMPLETE verdict.
+
+    A partial write is NOT a verdict (see `_RC_RE`): `7` may be the first byte of `75\n`.
+    """
+    try:
+        with open(path) as fh:
+            data = fh.read()
+    except OSError:
+        return None
+    m = _RC_RE.match(data)
+    return int(m.group(1)) if m else None
+
+
+def gate_refused(name: str, code) -> bool:
+    """True iff a 75/77 `.rc` was written by the GATE, not by a `pi` that exited 75 itself.
+
+    Both codes share the 0-255 exit namespace with `pi`, so the code alone is ambiguous -- and the
+    two meanings have OPPOSITE consequences here ("nothing consumed, do not record" vs "an agent
+    ran, record it"). The discriminator is durable and already on disk: `spawn-gate.sh` appends
+    `[load-gate] REFUSED` / `[disk-gate] REFUSED` to the worker log BEFORE run_agent returns, and
+    the harness writes `.rc` only after that -- so at the instant the code is readable the marker
+    is too. A `pi` that failed on its own writes no gate line.
+
+    The READ is bounded to the first REFUSAL_LOG_WINDOW bytes: a refusal verdict is written at the
+    head of a freshly truncated log, so a short read answers the question and a log big enough to
+    exceed it is itself evidence that an agent ran.
+
+    Every ambiguous input errs toward "an agent ran" -- i.e. toward KEEPING the cooldown. The
+    opposite error (a real refusal read as a dispatch) is the one this method exists to prevent.
+    """
+    if code not in GATE_REFUSALS:
+        return False
+    try:
+        with open(bg_path(name, "log"), "rb") as fh:
+            data = fh.read(REFUSAL_LOG_WINDOW + 1)
+    except OSError:
+        return False
+    if len(data) > REFUSAL_LOG_WINDOW:
+        return False          # only an agent writes that much; the gate refuses in one line
+    text = data.decode("utf-8", "replace")
+    # ⛔ THE AGENT'S OWN OUTPUT IS NOT EVIDENCE. `pi` writes into the SAME log, so an agent that
+    # QUOTES the marker (it is reading this repo) and then exits 75 itself must not be read as a
+    # gate refusal -- that would release a cooldown and a class slot for work that really ran.
+    # Presence of AGENT_RAN_MARKER settles it: the gate writes its verdict BEFORE starting an
+    # agent, and that line is written only after `pi` has returned, so both cannot be true of one
+    # run. Note the polarity is deliberately the COOLDOWN-KEEPING side: an ambiguity reads as
+    # "an agent ran", never as "nothing consumed".
+    if AGENT_RAN_MARKER in text:
+        return False
+    return any(m in text for m in REFUSAL_MARKERS)
+
+
+def worker_status(name: str):
+    """`running` | `done` | `failed` | `lost`, exactly as `nonblocking-dispatch.sh --status`
+    reports it; None when the harness cannot answer."""
+    out, _, rc = sh_err(["bash", NONBLOCKING_DISPATCH, "--status", name], timeout=60,
+                        cwd=HOME, env=_orch_env())
+    if rc != 0:
+        return None
+    line = (out or "").strip()
+    head = name + " "
+    if not line.startswith(head):
+        return None
+    return line[len(head):].split(" ", 1)[0] or None
+
+
+def worker_live(name: str):
+    """True if the worker is still running, False if it provably is not, None if unanswerable.
+
+    The HARNESS owns this question (`--status` reads the `.rc` verdict first, then `kill -0` on
+    the `.pid`), so it is asked rather than re-derived: a second reader over the same files can
+    disagree with the writer, and the caller then spawns a second worker into the same directory.
+
+    ⛔ THREE-VALUED, AND `None` MEANS DO NOT SPAWN. Both callers act on the value, so a two-valued
+    reading here would turn "I could not tell" into "free slot" -- and `--status` cannot answer
+    while `sh_err` is timing out or the harness copy is missing, which are exactly the conditions
+    where a blind second spawn destroys a live worker's log/.rc/.pid.
+
+    ⛔ `running` IS BOUNDED BY THE ARTIFACT'S OWN AGE. `--status` answers `running` from `kill -0`
+    on a `.pid` file nothing prunes: a worker SIGKILLed before it wrote `.rc` leaves that file, and
+    once the pid is RECYCLED by an unrelated process the status reads `running` for ever -- which
+    would skip that PR with no cooldown and no STALE_DISPATCH_S escape. The harness already writes
+    `$O/bg/<name>.started`, and a worker cannot outlive its own wall-clock cap.
+    """
+    st = worker_status(name)
+    if st in ("done", "failed", "lost"):
+        return False
+    if st != "running":
+        return None
+    try:
+        age = time.time() - os.path.getmtime(bg_path(name, "started"))
+    except OSError:
+        return True                      # nothing to bound it with: believe the pid
+    if age > SPAWN_TIMEOUT_S + WORKER_STALE_SLACK_S:
+        log("worker %s claims pid running but its start stamp is %.0f min old (cap=%ds + %ds) -- "
+            "a recycled pid, treating it as gone"
+            % (name, age / 60, SPAWN_TIMEOUT_S, WORKER_STALE_SLACK_S))
+        return False
+    return True
+
+
+def void_refused_rows(st: dict) -> list[str]:
+    """Drop state rows whose worker turned out to be a GATE REFUSAL; return their keys.
+
+    A refusal consumed nothing, so it must not hold a cooldown and a budget slot for
+    STALE_DISPATCH_S. dispatch() catches the refusal inside CONFIRM_WINDOW_S (measured 32-36 ms),
+    and this is the DURABLE backstop for a box slow enough to outrun that window: the row was
+    written by a caller that could not yet see the verdict, and a later pass reads the same
+    artifact and undoes it.
+
+    ⛔ ONLY `kind: spawn` ROWS ARE ELIGIBLE. A row recorded for a WORKTREE refusal represents an
+    attempt that never spawned, so `$O/bg/<name>.rc` is by construction whatever an EARLIER
+    attempt left behind -- and that earlier refusal would void this row on every pass, re-opening
+    the "same line for ever" loop the record exists to close. Rows written before this field
+    existed carry no `kind` and are treated as spawn rows (the backstop still applies to them).
+
+    The gate marker (not the bare code) is what confirms the refusal -- see `gate_refused`, which
+    also keeps this from dropping the row of a worker that RAN and exited 75 on its own.
+    """
+    voided = []
+    for k in list(st):
+        if k.startswith("_"):
+            continue
+        row = st.get(k) or {}
+        if (row.get("kind") or "spawn") != "spawn":
+            continue
+        name = row.get("worker") or ""
+        if not name:
+            continue
+        if gate_refused(name, read_rc(bg_path(name, "rc"))):
+            del st[k]
+            voided.append(k)
+    return voided
+
+
+# ---------------------------------------------------------------------------
+# 5. DISPATCH — one worker, one PR, logged
 # ---------------------------------------------------------------------------
 
 def spawn_argv(name: str, worktree: str, brief_path: str) -> list[str]:
@@ -804,59 +1080,137 @@ def spawn_argv(name: str, worktree: str, brief_path: str) -> list[str]:
     return ["bash", NONBLOCKING_DISPATCH, name, worktree, brief_path, str(SPAWN_TIMEOUT_S)]
 
 
-def dispatch(pr: dict, action: str, text: str, dry: bool) -> tuple[bool, str]:
-    """Spawn a background worker for one PR. Returns (launched, detail).
+def _confirm(name: str) -> tuple[str, str]:
+    """('launched' | 'refused' | 'unconfirmed', detail) for a just-spawned worker -- BOUNDED.
+
+    Two steps, in order of authority:
+
+      1. poll `$O/bg/<name>.rc` for a COMPLETE code inside CONFIRM_WINDOW_S. A gate refusal lands
+         there in ~35 ms (measured), so a refusal is caught without waiting for an agent that may
+         run for 40 minutes;
+      2. if nothing landed, ASK THE HARNESS (`--status`): a refusal written just after the window
+         is still caught, a live pid is positive proof of a launch, and `lost` means the worker
+         vanished without a verdict -- neither a launch nor a refusal, and never a row.
+
+    A partial `.rc` is never a verdict (see `_RC_RE`): `7` may be the first byte of `75\n`.
+    """
+    rc_file = bg_path(name, "rc")
+    deadline = time.monotonic() + CONFIRM_WINDOW_S
+    while time.monotonic() < deadline:
+        code = read_rc(rc_file)
+        if code is not None:
+            if gate_refused(name, code):
+                return "refused", "gate REFUSED rc=%d" % code
+            return "launched", "worker exited rc=%d" % code
+        time.sleep(0.05)
+    st = worker_status(name)
+    code = read_rc(rc_file)
+    if gate_refused(name, code):
+        return "refused", "gate REFUSED rc=%d" % code
+    if st == "running":
+        return "launched", "launched, running"
+    if code is not None:
+        return "launched", "worker exited rc=%d" % code
+    if st in ("done", "failed"):
+        return "launched", "worker exited (%s)" % st
+    if st == "lost":
+        return "unconfirmed", "the worker recorded no exit status and no live pid"
+    return "unconfirmed", "`--status` could not be read (the harness is missing or broken)"
+
+
+def dispatch(pr: dict, action: str, text: str, dry: bool) -> tuple[bool, str, bool]:
+    """Spawn a background worker for one PR. Returns (launched, detail, record).
 
     ⛔ THIS IS THE ONLY DISPATCH PATH. The lane-table path (`idle_lanes()` + a cmux send to a
     workspace) is GONE, not merely unused: a replacement that is added but not switched on is
     indistinguishable from no replacement, and it hides the old path's flaws. The new path does
     not need a pre-existing idle lane -- `nonblocking-dispatch.sh` starts a fresh worker in the
     PR's own worktree and returns immediately.
+
+    `record` says whether the ATTEMPT belongs in the state file even though nothing was launched.
+    Two of the three refusal classes differ in exactly that:
+
+      * a GATE refusal (load 75 / disk 77) consumed nothing and CLEARS BY ITSELF -> not recorded;
+        a row would burn a 45-min cooldown and a 90-min budget slot for work that never ran;
+      * a WORKTREE refusal that is a verdict about the tree (uncommitted work, commits the PR
+        head does not have, a file the next checkout would overwrite, a path we may not delete)
+        does NOT clear by waiting -> recorded, so the PR reaches a cooldown instead of logging the
+        same line on every pass for ever. A transient worktree failure (a failed fetch, a probe
+        that timed out, `worktree add` losing a race) is NOT recorded: the next pass retries it.
+
+    ⛔ THE THIRD CLASS IS NOT RECORDED, DELIBERATELY: a dispatcher failure (`rc != 0` -- rc=78
+    "spawn-gate.sh not found", rc=2 "no worktree", rc=127 "dispatcher missing") is persistent but
+    it is ONE shared cause, not a fact about one PR. Recording it would put every open PR under a
+    45-min cooldown for a single broken install; the fix is the install, and the loud `FAIL` line
+    naming the dispatcher's own stderr is what says so.
     """
     n = pr["number"]
     name = "prd-%d" % n
     if dry:
         log("DRY-RUN would spawn %s in a fresh worktree for %s (%d bytes)"
             % (name, pr["headRefName"], len(text)))
-        return True, "dry-run"
+        return True, "dry-run", False
+    # ⛔ ONE WORKER PER PR, EVEN ACROSS A HEAD CHANGE. main()'s cooldown is keyed on the head, so a
+    # worker that PUSHES re-arms dispatch while it is still running -- and the worker name and its
+    # worktree are both deterministic, so the second spawn lands ON TOP of the live one in the same
+    # directory. Two agent processes then share one git index and one branch, and
+    # `nonblocking-dispatch.sh` starts by `rm -f "$RC"`, `: > "$LOG"`, `echo … > "$PIDF"`, which
+    # deterministically destroys the live worker's log, exit status and pid. So liveness is asked
+    # (the harness owns the question), never inferred from the state row.
+    live = worker_live(name)
+    if live:
+        return False, "worker %s is still running -- one worker per PR" % name, False
+    if live is None:
+        # ⛔ UNANSWERABLE IS NOT "FREE". Spawning on an unreadable status would re-create the exact
+        # defect this guard exists for -- two workers in one deterministic directory, the second
+        # destroying the first's log/.rc/.pid. It clears by itself as soon as `--status` answers.
+        return (False, "worker liveness could not be read (`%s --status` failed) -- refusing to "
+                       "spawn blind: a live worker would be destroyed" % NONBLOCKING_DISPATCH,
+                False)
     path = os.path.join(STATE_DIR, "pr-doctor-brief-%s.txt" % name)
     os.makedirs(STATE_DIR, exist_ok=True)
     with open(path, "w") as f:
         f.write(text)
     wt, err = materialise_worktree(pr)
     if not wt:
-        return False, err
+        return False, err, bool(getattr(err, "persistent", False))
+    # ⛔ THE GUARD IS CHECK-THEN-ACT, AND THE ACT IS MINUTES LATER. `materialise_worktree` can fetch
+    # (300 s timeouts) and add a worktree; another pr-doctor invocation (a manual `--only`, which
+    # the heartbeat lock does not cover) can pass the same guard inside that window. Re-asking here
+    # costs one `--status` on the only path that spawns anything.
+    again = worker_live(name)
+    if again is not False:
+        return (False, "worker %s appeared (or its liveness became unreadable) while the worktree "
+                       "was being prepared -- refusing to spawn a second one" % name, False)
     # cwd is HOME for the same TCC reason the old cmux path used it: a cwd under ~/Documents is
     # protected and a launchd-spawned caller has no Full Disk Access. The dispatcher takes absolute
     # paths and does its own `cd "$WT"` internally.
-    out, errout, rc = sh_err(spawn_argv(name, wt, path), timeout=120, cwd=HOME)
-    detail = (out or "").strip() or (errout or "").strip()
+    # ⛔ capture=False: this child exists to BACKGROUND a worker, and a captured call would wait for
+    # that worker's entire life (SPAWN_CALL_TIMEOUT_S carries the measurement). The verdict comes
+    # from `$O/bg` -- `_confirm` -- never from the pipe; stderr still comes back (a temp file), so
+    # the dispatcher's own refusal text reaches the log.
+    _, errout, rc = sh_err(spawn_argv(name, wt, path), timeout=SPAWN_CALL_TIMEOUT_S,
+                           cwd=HOME, env=_orch_env(), capture=False)
     if rc != 0:
-        log("spawn %s -> %s: FAIL rc=%s (%s)" % (name, wt, rc, detail[:120] or "no output"))
-        return False, detail
-    # ⛔ A GATE REFUSAL IS NOT A DISPATCH. `nonblocking-dispatch.sh` backgrounds `run_agent()` and
-    # returns 0 as soon as the worker is launched, so the refusal code (75/77) lands only in
-    # `$O/bg/<name>.rc`. A refused spawn consumed NOTHING, so it must not be recorded: a state row
-    # would burn a 45-min cooldown and a 90-min budget slot for work that never ran, and the pass
-    # log would claim a dispatch that did not happen.
-    rc_file = os.path.join(ORCH_DIR, "bg", "%s.rc" % name)
-    deadline = time.monotonic() + REFUSAL_WINDOW_S
-    while time.monotonic() < deadline:
-        if os.path.exists(rc_file):
-            try:
-                with open(rc_file) as fh:
-                    code = int(fh.read().strip())
-            except Exception:
-                # A PARTIAL write is not a verdict: keep polling rather than conclude success.
-                time.sleep(0.05)
-                continue
-            if code in (75, 77):
-                log("spawn %s: gate REFUSED rc=%s -- no agent started, nothing consumed" % (name, code))
-                return False, "gate refused rc=%s" % code
-            break
-        time.sleep(0.05)
-    log("spawn %s -> %s: %s" % (name, wt, detail[:120] or "launched"))
-    return True, detail
+        # ⛔ carry the CODE and the dispatcher's OWN words. rc=78 (no/stale spawn-gate.sh), rc=2 (no
+        # worktree / no brief) and rc=127 (dispatcher missing) are permanent, fleet-wide causes, and
+        # the message is the only thing that names which one it is.
+        detail = "rc=%s: %s" % (rc, (errout or "").strip()
+                                or "the dispatcher exited non-zero with no stderr")
+        log("spawn %s -> %s: FAIL %s" % (name, wt, detail[:200]))
+        return False, detail, False
+    verdict, detail = _confirm(name)
+    if verdict == "refused":
+        log("spawn %s: %s -- no agent started, nothing consumed" % (name, detail))
+        return False, detail, False
+    if verdict == "unconfirmed":
+        # Nothing durable says either way. NOT recorded, and that is safe BECAUSE liveness is
+        # checked before every spawn: if the worker did start, the next pass sees it running.
+        log("spawn %s -> %s: UNCONFIRMED (%s) -- no state row; liveness is re-checked next pass"
+            % (name, wt, detail))
+        return False, detail, False
+    log("spawn %s -> %s: %s" % (name, wt, detail))
+    return True, detail, True
 
 
 def load_state() -> dict:
@@ -894,10 +1248,27 @@ def main() -> int:
         for k, v in sorted(st.items()):
             if k.startswith("_"):
                 continue
-            print("%-8s %-11s worker=%-12s %s" % (k, v.get("action"),
-                                                  (v.get("worker") or v.get("lane") or "?")[:12],
-                                                  v.get("at")))
+            # `kind` is shown only when it is NOT "spawn", so a real dispatch prints exactly what
+            # it always did -- and a row that exists because the PR was REFUSED can no longer be
+            # read as "a worker was dispatched for this".
+            kind = v.get("kind") or "spawn"
+            print("%-8s %-11s worker=%-12s %s%s" % (k, v.get("action"),
+                                                    (v.get("worker") or v.get("lane") or "?")[:12],
+                                                    v.get("at"),
+                                                    "" if kind == "spawn" else "  kind=" + kind))
         return 0
+
+    # ⛔ A ROW LEFT BY A REFUSED SPAWN IS NOT A DISPATCH. dispatch() sees the refusal inside
+    # CONFIRM_WINDOW_S (measured 32-36 ms), but a box slow enough to outrun that window leaves a
+    # row behind for work that never started -- which would hold a 45-min cooldown and a 90-min
+    # budget slot. Re-read the durable artifact and drop such rows (and PERSIST the drop BEFORE any
+    # early return, so the log line does not claim a change that was never written).
+    voided = void_refused_rows(st)
+    for key in voided:
+        log("#%s: the recorded dispatch was a GATE REFUSAL (no agent ran) -- row dropped; it "
+            "consumed no cooldown and no budget slot" % key)
+    if voided and not args.dry_run:
+        save_state(st)
 
     prs = [p for p in open_prs() if not p.get("isDraft")]
     if args.only:
@@ -956,16 +1327,44 @@ def main() -> int:
         # GUARD: cooldown, and never re-dispatch while the last one may still be live
         if prev and now() - prev.get("at_epoch", 0) < COOLDOWN_S and prev.get("head") == p["headRefOid"]:
             continue
+        # ⛔ A LIVE WORKER IS IN FLIGHT, NOT A FREE SLOT -- REGARDLESS OF HEAD MOVEMENT. The
+        # cooldown above is keyed on the head, so a worker that pushes re-arms dispatch at T+2min
+        # while it is still running; the worker name and the worktree are deterministic, so the
+        # second spawn lands on top of the live one and destroys its log/.rc/.pid (see dispatch()).
+        # This is checked even with NO state row, because a lost state file is not a dead worker.
+        live = worker_live("prd-%s" % key)
+        if live:
+            log("#%s (%s): worker prd-%s is still running -- not spawning a second one"
+                % (key, action, key))
+            continue
+        if live is None:
+            # ⛔ UNANSWERABLE IS NOT "FREE" (see worker_live): skip, loudly. It clears as soon as
+            # `--status` answers again, and it costs nothing, because a spawn would fail too.
+            log("#%s (%s): worker prd-%s liveness could not be read -- skipping rather than "
+                "spawning blind over a possibly live worker" % (key, action, key))
+            continue
         text = brief(p, action)
         if not text:
             continue
-        ok, detail = dispatch(p, action, text, args.dry_run)
+        ok, detail, record = dispatch(p, action, text, args.dry_run)
         if not ok:
-            log("#%s (%s): not spawned -- starts on the next pass if it was transient: %s"
-                % (key, action, detail[:160]))
+            if record and not args.dry_run:
+                # RECORDED ANYWAY: a refusal that does not clear by waiting (uncommitted work in
+                # the PR's own worktree, commits the head does not have) must reach a cooldown, or
+                # the pass logs the same line for ever and the PR is never dispatched and never
+                # visible in `--status`. NOTE the row consumes the class slot on the NEXT pass via
+                # pass_budgets(), so it must not also be charged to this pass's `spent`.
+                st[key] = {"action": action, "worker": "prd-%s" % key, "kind": "refused",
+                           "head": p["headRefOid"], "at": ts(), "at_epoch": now()}
+                log("#%s (%s): REFUSED and RECORDED -- this will not clear by waiting, so the row "
+                    "holds a %d-min cooldown; fix the cause: %s"
+                    % (key, action, COOLDOWN_S // 60, detail[:160]))
+            else:
+                log("#%s (%s): not dispatched -- retried on the next pass: %s"
+                    % (key, action, detail[:160]))
             continue
         if not args.dry_run:
-            st[key] = {"action": action, "worker": "prd-%s" % key,
+            st[key] = {"action": action, "worker": "prd-%s" % key, "kind": "spawn",
                        "head": p["headRefOid"], "at": ts(), "at_epoch": now()}
         spent[cls] += 1
         dispatched += 1
