@@ -280,11 +280,13 @@ PYAGE
 # `QUEUE(state; pr-doctor dispatches): ` (so the counts cannot be mistaken for an instruction the
 # automatic dispatcher already owns) and `running` is named like every other class.
 #
-# ⛔ THIS IS A TRUNCATION POINT, NOT A WORST CASE, AND NO NUMBER BELONGS HERE. Four review rounds
-# argued about one (628 -> 675/799 -> 860 -> 900) and every value was falsified by the next
-# measurement, because the length is a function of DIGITS x NAMED PRs x per-entry gate names x the
-# overlay x the STUCK escalation: any figure is a claim about the FLEET, not about the format, and
-# it goes stale the first time the queue grows. What is true, and does not go stale:
+# ⛔ THIS IS A TRUNCATION POINT, NOT A WORST CASE, AND NO NUMBER BELONGS HERE. The width was raised
+# four times during the #1872 review (628 -> 675/799 -> 860 -> 900) and every value was falsified by
+# the next measurement, because the length is a function of DIGITS x NAMED PRs x per-entry gate names
+# x the overlay x the STUCK escalation: any figure is a claim about the FLEET, not about the format,
+# and it goes stale the first time the queue grows. (Do not restate the round COUNT anywhere -- the
+# number of rounds is itself that kind of claim, and it has already drifted between three files.)
+# What is true, and does not go stale:
 #   * what a cut CAN sever: the tail of the queue segment and then the CI indicators;
 #   * what a cut CANNOT sever, because of where it is emitted (`objective.py`, pinned by
 #     `test_the_FAIL_CLOSED_caveat_precedes_the_counts_it_qualifies`): `queue_read=BLIND(...)` --
@@ -406,8 +408,10 @@ _cont="${wip:-}"
 # ⛔ BUT NET-GROWTH ALONE IS NOT THE FREEZE — IT IS THE SYMPTOM, AND IT INVERTS ONCE THE QUEUE IS DRAINED
 # (owner correction 2026-10-09, via #6792). The owner's predicate for INTAKE-FROZEN is `waiting >=
 # TARGET_PRS(10)`; the freeze is DERIVED, never decided, and a SATISFIED PRECONDITION IS NOT A LIVE
-# ⛔ THE DERIVED TRIGGER, AND THE ONLY ONE: `waiting >= TARGET_PRS` (objective.py:66 — "queue depth at
-# target: fewer than 10 non-draft PRs waiting to land"). Both the constant and `waiting` are read from
+# ⛔ THE DERIVED TRIGGER, AND THE ONLY ONE: `waiting >= TARGET_PRS` (the constant NAMED, not numbered —
+# it is `objective.py`'s `TARGET_PRS = 10  # queue depth at target: fewer than 10 non-draft PRs waiting
+# to land`; a line number here pointed at the wrong line within a day of being written). Both the
+# constant and `waiting` are read from
 # their owner, objective.py, so there is no second source of truth and no state file.
 #
 # THREE PROXIES REMOVED HERE, each caught asserting a freeze its own numbers denied:

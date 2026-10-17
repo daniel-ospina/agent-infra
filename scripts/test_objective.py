@@ -385,8 +385,8 @@ def test_a_blind_mergeability_read_is_named_and_cannot_read_as_an_all_clear(monk
 def test_the_FAIL_CLOSED_caveat_precedes_the_counts_it_qualifies(tmp_path, monkeypatch):
     """⛔ THE CAVEAT'S POSITION IS THE GUARANTEE, NOT THE LENGTH OF THE LINE (#1872 review r3).
 
-    `cadence-nudge.sh` reads this line with a fixed `cut`. Three review rounds argued about what
-    the length bound should be, and every answer went stale as the queue grew -- but the property
+    `cadence-nudge.sh` reads this line with a fixed `cut`. The width was re-argued several times and
+    every answer went stale as the queue grew -- but the property
     that actually matters is structural: a truncated line must never lose the token that says the
     counts are NOT a clearance. That holds only while `queue_read=BLIND` is emitted BEFORE the
     `QUEUE(` segment, so the ordering is pinned here instead of being described in a comment
