@@ -816,19 +816,37 @@ def main() -> int:
         # third instance of the same fail-open and must not exit 0.
         if classified:
             return 2
-    def _exit_status(dispatched: int = 0) -> int:
-        """`0` IS RESERVED FOR READABLE, NOTHING TO DO (#1872 review rounds 4-5).
+    def _exit_status(dispatched: int = 0, undeliverable: int = 0) -> int:
+        """`0` IS RESERVED FOR READABLE, NOTHING TO DO (#1872 review rounds 4-5, 15).
 
         Every early exit on the path to "nothing dispatched" used to return 0, including a pass
         where PRs had been SKIPPED as unreadable -- work made invisible, reported as a clean pass.
         A blind read plus zero dispatches is the same fact as an all-blind pass, one PR smaller, so
         it refuses; a blind read whose legible half was actually WORKED stays clean, and so does a
         fully readable pass with nothing to do.
+
+        ⛔ AND "NOTHING DELIVERED" IS A SECOND AXIS (#1872 review round 15). `undeliverable` counts
+        the PRs whose ORDER NO LANE ACCEPTED -- work that was legible, placed, and then dropped by
+        every candidate pane. That left `dispatched == 0` with an empty `unreadable`, so the pass
+        reported the CLEAN `0` while nothing had been delivered: the same outcome as blindness, by a
+        different route, and the one path that emitted neither the `REFUSING:` line nor rc 2. It is
+        retried next pass either way (the state is not advanced), but "readable, nothing to do" must
+        not describe a pass that had work and delivered none of it.
         """
-        if skipped.get("unreadable") and not dispatched:
-            log("REFUSING: %d PR(s) were UNREADABLE and nothing was dispatched -- not a clean pass"
-                % skipped["unreadable"])
-            return 2
+        if not dispatched:
+            _unread, _undeliv = skipped.get("unreadable") or 0, undeliverable
+            if _unread and _undeliv:
+                log("REFUSING: %d PR(s) were UNREADABLE and %d order(s) no idle lane accepted,"
+                    " with nothing dispatched -- not a clean pass" % (_unread, _undeliv))
+                return 2
+            if _unread:
+                log("REFUSING: %d PR(s) were UNREADABLE and nothing was dispatched -- not a clean"
+                    " pass" % _unread)
+                return 2
+            if _undeliv:
+                log("REFUSING: %d order(s) no idle lane accepted and nothing was dispatched -- not"
+                    " a clean pass" % _undeliv)
+                return 2
         return 0
 
     if budgets["total"] and not lanes:
@@ -842,6 +860,7 @@ def main() -> int:
         return _exit_status()
 
     dispatched = 0
+    undeliverable = 0        # legible work whose order NO lane accepted (see `_exit_status`)
     spent = {"fix": 0, "review": 0}
     for p, action, why, cr in classified:
         if dispatched >= budgets["total"]:
@@ -876,6 +895,7 @@ def main() -> int:
         if sent is None:
             log("#%s (%s): no lane accepted the order in %d attempts -- leaving for next pass"
                 % (key, action, min(len(attempts), MAX_LANE_ATTEMPTS)))
+            undeliverable += 1
             continue
         lanes = [l for l in lanes if l["ws"] != sent["ws"]]   # keep it free for the next PR
         if not args.dry_run:
@@ -886,10 +906,12 @@ def main() -> int:
 
     if not args.dry_run:
         save_state(st)
-    log("dispatched %d this pass" % dispatched)
+    log("dispatched %d this pass%s" % (dispatched,
+                                       "" if not undeliverable else
+                                       " (%d order(s) undeliverable)" % undeliverable))
     # A partial blindness that DID dispatch stays a clean pass, because then the readable half was
     # WORKED; zero dispatches rides the same helper as the two early exits above.
-    return _exit_status(dispatched)
+    return _exit_status(dispatched, undeliverable)
 
 
 if __name__ == "__main__":

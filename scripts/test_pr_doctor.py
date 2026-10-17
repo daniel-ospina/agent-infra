@@ -597,6 +597,55 @@ def test_a_wrong_shaped_lane_body_with_work_in_hand_REFUSES(monkeypatch):
     assert "no idle lanes" not in joined, joined
 
 
+def test_a_pass_whose_every_order_was_refused_is_not_a_clean_pass(monkeypatch):
+    """⛔ NOTHING DELIVERED IS NOT NOTHING TO DO (#1872 review round 15, found by reviewer B).
+
+    `_exit_status` folded in ONE blindness axis (`skipped["unreadable"]`). A pass where every
+    candidate lane REFUSED the order left `dispatched == 0` with `unreadable == 0`, so it reported the
+    clean `0` while nothing had been delivered — the same outcome as blindness by another route, and
+    the one path that emitted neither the `REFUSING:` line nor rc 2. MEASURED before this fix: two
+    legible `record-review` PRs, a readable roster of two idle lanes, `dispatch()` False for both ->
+    "dispatched 0 this pass", rc 0.
+    """
+    logs = []
+    monkeypatch.setattr(pr, "load_state", lambda: {})
+    monkeypatch.setattr(pr, "open_prs", lambda: [_pr(1, "a" * 40), _pr(2, "b" * 40)])
+    monkeypatch.setattr(pr, "classify", lambda p: ("record-review", "why", []))
+    monkeypatch.setattr(pr, "idle_lanes", lambda: ([_lane(1), _lane(2)], ""))
+    monkeypatch.setattr(pr, "brief", lambda p, a, w=None, cr=None: "brief")
+    monkeypatch.setattr(pr, "dispatch", lambda ws, label, text, dry: False)   # every lane refuses
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--dry-run"])
+    assert pr.main() == 2
+    joined = "\n".join(logs)
+    assert "no lane accepted the order" in joined, joined
+    assert "REFUSING" in joined and "not a clean pass" in joined, joined
+    assert "undeliverable" in joined, joined
+
+
+def test_a_DELIVERED_pass_is_still_clean_when_one_order_could_not_be_placed(monkeypatch):
+    """…and the same refusal must not punish a pass that DID deliver: one drop beside one success."""
+    logs = []
+    monkeypatch.setattr(pr, "load_state", lambda: {})
+    monkeypatch.setattr(pr, "open_prs", lambda: [_pr(1, "a" * 40), _pr(2, "b" * 40)])
+    monkeypatch.setattr(pr, "classify", lambda p: ("record-review", "why", []))
+    monkeypatch.setattr(pr, "idle_lanes", lambda: ([_lane(1), _lane(2), _lane(3)], ""))
+    monkeypatch.setattr(pr, "brief", lambda p, a, w=None, cr=None: "brief")
+
+    # PR #1: lane 1 refuses (and is dropped from the pool), lane 2 ACCEPTS.  PR #2: lane 3 refuses.
+    def dispatch(ws, label, text, dry):
+        return ws == "ws-2"
+
+    monkeypatch.setattr(pr, "dispatch", dispatch)
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--dry-run"])
+    assert pr.main() == 0
+    joined = "\n".join(logs)
+    assert "no lane accepted" in joined, joined       # the drop is still reported
+    assert "dispatched 1 this pass" in joined, joined  # …and the delivery is counted
+    assert "REFUSING" not in joined, joined            # …but the pass is not a refusal
+
+
 def test_a_blind_lane_roster_never_prints_the_busy_fleet_line(monkeypatch):
     """⛔ "CANNOT SEE THE FLEET" IS NOT "THE FLEET IS BUSY" (#1872 review round 7).
 
