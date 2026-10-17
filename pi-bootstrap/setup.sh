@@ -5,6 +5,12 @@
 # Safe to run repeatedly: every re-run refreshes the ACTIVE ~/.pi/agent files
 # in place (content-merge), so repo updates flow to the live install and local
 # extras survive. Never deletes anything outside ~/.pi/agent.
+#
+# ⚠️ It DOES delete, INSIDE ~/.pi/agent, exactly two things: a legacy $DEST/tools/fleet/
+# (#1277, a pi boot-blocker) and the farm artifacts DECLARED in
+# pi-bootstrap/farm-retired.txt (#1924 — a retired script must stop existing on the
+# machines, not just stop being delivered). Nothing else is ever removed; a local extra
+# that is not declared retired is kept.
 # ============================================================
 set -euo pipefail
 
@@ -254,10 +260,12 @@ fi
 # Option C): they read ~/Documents repos, which launchd can never do without
 # an FDA grant, so extensions/session-checks.ts runs them age-gated from pi's
 # session_start (TCC-approved tree). Same model as the skills farm: idempotent
-# refresh on each sync.sh. Stale-dest caveat: a farm script removed from the
-# repo is NOT deleted from ~/.pi (extras kept) — install-launchd's
-# broken-target check can no longer catch it, so removing a farmed script
-# must also remove/retire its plist job. Test files and plist templates are
+# refresh on each sync.sh. Stale-dest caveat: a farm script removed from the repo is
+# NOT deleted from ~/.pi on that alone (extras kept) — so it must ALSO be declared in
+# pi-bootstrap/farm-retired.txt, which the UNFARM leg at the end of this file applies
+# (#1924). What remains true: install-launchd's broken-target check can no longer
+# catch a retired name, so retiring a farmed script must also remove/retire its plist
+# job (add the label to templates/launchd/RETIRED). Test files and plist templates are
 # not farmed (tests don't ship; plists render from templates/launchd).
 #
 # The paths every farm DECLARES, RELATIVE TO $DEST (#1924) — the same form the
@@ -266,6 +274,10 @@ fi
 # is still declared, and must not be silently removed either). The UNFARM leg at the end
 # of this file checks its retirement list against THIS set: a name in both is a
 # contradiction and is refused instead of deleted.
+# The set is also RECORDED in $DEST/state/farm-declared.txt after each apply, which is
+# what makes a DROPPED recording line (or a name quietly removed from a farm array)
+# observable: the next run compares against it and fails loudly instead of silently
+# leaving the file installed (farm_check_declared_shrink).
 # ⛔ A NEWLINE-SEPARATED STRING, deliberately NOT a bash array. pi-bootstrap/cell-install.sh's
 # read_farm_set() reads EVERY top-level `name=(...)` array in this file as a FARM and dies
 # on one it does not know ("declares farm array(s) this installer does not know") — so a
@@ -372,10 +384,11 @@ fi
 # install-launchd.sh's broken-target guard refuses the whole install when the
 # farmed script is absent.
 # ⛔ RETIRING A NAME IS TWO EDITS IN ONE COMMIT (#1924): drop it from this array AND
-# declare its deployed path (`scripts/<name>`) in pi-bootstrap/farm-retired.txt. Removing
-# it here alone stops DELIVERY only — every box that already has a copy keeps it,
-# executable, in $DEST/scripts. A name left in BOTH places is refused loudly by the
-# UNFARM leg at the end of this file (the copy leg would just re-create it).
+# declare its deployed path (`scripts/<name>`) in pi-bootstrap/farm-retired.txt.
+# Removing it here alone stops DELIVERY only — every box that already has a copy keeps
+# it, executable, in $DEST/scripts. A name left in BOTH places is refused loudly by the
+# UNFARM leg at the end of this file (the copy leg would just re-create it); dropping
+# it here WITHOUT declaring it is caught by the snapshot check on the next sync.
 fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-reap-worktrees.sh pi-reap-worktrees-launchd.py cleanup-stale-branches.sh ci_runner_gate.sh ask-owner.py beta-progress.py cadence-nudge.sh cadence-timer.sh child-check.py cloud-cell-quiesce.sh deploy-crossbox.sh deploy-mac-orchestrator.sh goal-state.py lane-actions.py lane-guard.py lane-read.py lane-scan-fallback.sh lane-watchdog.py lane-wip.py live-workspaces-publisher.py merge-queue.py objective.py orch-send.sh orchestrator-heartbeat.sh orphan-reap.py pr-doctor.py probe-one.py publish-live-workspaces.py queue-dispatch.py safe-send.sh seed-goal-map.py tree-cpu.py turn-classify.py turn-end.py unblock-lane.sh undelivered-answers.py)
 mkdir -p "$DEST/scripts"
 fleet_copied=0
@@ -600,10 +613,16 @@ echo "    scripts merge-gate farm: $merge_gate_copied copied (record-review.sh, 
 # failed to land" (the #1931 blindness class), and inference would delete working
 # scripts on a box whose checkout was incomplete.
 #
-# Retiring a name is TWO edits in ONE commit: drop it from every farm array above AND
-# declare its deployed path in the manifest. A name left in both lists is a
-# contradiction — the copy leg has just re-created it, so the leg below REFUSES to
-# remove it and this script exits non-zero (loud, never a silent no-op).
+# Retiring a name is THREE edits in ONE commit:
+#   1. drop it from every farm array above,
+#   2. declare its deployed path in pi-bootstrap/farm-retired.txt, and
+#   3. if a plist still targets it, add that label to templates/launchd/RETIRED.
+# Miss 1 or 2 and the deployed copy stays forever: a name left in BOTH lists is a
+# contradiction (the copy leg has just re-created it), so the leg below REFUSES to
+# remove it and this script exits non-zero; a name left in NEITHER list is caught by
+# the snapshot check (it was farmed here last run). Miss 3 and every later sync FAILS
+# at the launchd step on a broken target — loud, but it strands the whole sync, which
+# pi-bootstrap/tests/test-farm-unfarm.sh now catches at merge time.
 if [ ! -f "$BOOTSTRAP_DIR/lib/farm-retire.sh" ]; then
   echo "ERROR: $BOOTSTRAP_DIR/lib/farm-retire.sh is missing — the UNFARM leg cannot run, so a" >&2
   echo "       retired farm script would stay executable in $DEST/scripts with nothing to remove it." >&2
@@ -611,8 +630,27 @@ if [ ! -f "$BOOTSTRAP_DIR/lib/farm-retire.sh" ]; then
 fi
 # shellcheck source=lib/farm-retire.sh
 . "$BOOTSTRAP_DIR/lib/farm-retire.sh"
+if ! farm_check_declared_shrink "$DEST" "$BOOTSTRAP_DIR/farm-retired.txt" "$farm_declared_rel"; then
+  echo "ERROR: the farm retirement check FAILED (see above): either a name farmed on this box by a" >&2
+  echo "       previous run is now neither farmed nor retired (it would be ORPHANED), or the" >&2
+  echo "       retirement list could not be read. Everything below this point" >&2
+  echo "       did NOT run: launchd convergence, the shell-profile wiring, the TORTOISE_HOME probe." >&2
+  echo "       The copy legs above DID succeed, so the farm itself is current." >&2
+  echo "       Remedy: declare the path(s) in pi-bootstrap/farm-retired.txt and re-run ./sync.sh." >&2
+  exit 1
+fi
 if ! farm_unfarm "$DEST" "$BOOTSTRAP_DIR/farm-retired.txt" "$farm_declared_rel"; then
-  echo "ERROR: the UNFARM leg failed (see above) — a retirement the farm cannot apply is NOT applied" >&2
+  echo "ERROR: the UNFARM leg failed (see above) — a retirement the farm cannot apply is NOT applied." >&2
+  echo "       Everything below this point did NOT run: launchd convergence, the shell-profile wiring," >&2
+  echo "       the TORTOISE_HOME probe. The copy legs above DID succeed, so the farm itself is current." >&2
+  echo "       Remedy: fix or remove the path(s) named above, then re-run ./sync.sh." >&2
+  exit 1
+fi
+# Record what this apply declared, AFTER the removal leg succeeded — a failed run never
+# moves the baseline the shrink check compares against.
+if ! farm_record_declared "$DEST" "$farm_declared_rel"; then
+  echo "ERROR: could not record the farm declaration snapshot (see above) — the next run cannot" >&2
+  echo "       detect a name dropped from a farm array without being declared." >&2
   exit 1
 fi
 

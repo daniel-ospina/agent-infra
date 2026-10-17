@@ -10,7 +10,7 @@
 # Nothing reported it: install-launchd's broken-target check only sees a plist whose
 # target is MISSING, and check-deployed-drift.sh compares $O harness *.sh only.
 #
-# WHAT THIS SUITE PINS (each line is a real failure mode, not a restatement of the code):
+# WHAT THIS SUITE PINS (each item is a real failure mode, not a restatement of the code):
 #
 #   (a) LIB SEMANTICS — two scripts farmed, one retired, re-applied: the retired one is
 #       GONE and the other SURVIVES byte-identical. The second half is the assertion that
@@ -21,25 +21,33 @@
 #       then removes NOTHING AT ALL: the farm would re-create it, so a half-applied
 #       deletion set is a state nobody reviewed. Fails non-zero, loudly.
 #   (d) SAFE BY CONSTRUCTION — an entry that escapes the farm (absolute path, `..`,
-#       a glob, whitespace, shell metacharacters, the farm root itself) is REFUSED; a
+#       a glob, TAB or space, shell metacharacters, the farm root itself) is REFUSED; a
 #       DIRECTORY is refused (never `rm -rf`); a symlink is unlinked but its TARGET
-#       survives; a symlinked parent directory cannot be used to reach outside the farm.
-#   (e) LOUD WHEN UNREADABLE — a missing retirement list is an ERROR, never "nothing to
-#       retire": an unreadable list is a retirement that is not applied.
+#       survives; a symlinked parent directory cannot be used to reach outside the farm,
+#       and FOUR different symlink redirects that stay INSIDE $DEST are refused too
+#       (`scripts -> state`, `scripts/lib -> ../state`, `scripts/fleet -> scripts`) —
+#       "inside $DEST" is not the guard, "exactly the directory the entry names" is.
+#   (e) LOUD WHEN UNREADABLE — a missing retirement list AND a present-but-unreadable one
+#       (chmod 000) are both ERRORS, never "nothing to retire": an unreadable list is a
+#       retirement that is not applied. Plus the SNAPSHOT half: a name that was farmed by
+#       a previous apply and is now neither farmed nor retired fails the run.
 #   (f) THE REPO'S OWN DECLARATION — the real pi-bootstrap/farm-retired.txt does not
-#       intersect the real farm, read by an INDEPENDENT parser in this file (never the
-#       leg's own reader), and every entry passes the path rules. This is the gate that
-#       makes a contradictory manifest unmergeable.
-#   (g) END-TO-END, REAL setup.sh — farms two scripts, retires one IN THE REPO COPY
-#       (array edit + manifest entry, the two edits a real retirement is), re-applies:
-#       the retired script is gone from $DEST/scripts, the other is present and
-#       byte-identical, and a third re-apply is clean. Then the array entry is put BACK
-#       (the natural half-done retirement): setup.sh must FAIL and re-create the file
-#       rather than delete something the farm still declares.
-#   (h) THE CELL HALF — `cell-install.sh` applies the same leg, so a retirement reaches
-#       Linux cells too, and `--verify` REFUSES a cell that still carries the retired
-#       artifact (without it, a cell would be certified while executing a retired
-#       script — the false PASS this issue exists to remove).
+#       intersect the real farm (read by an INDEPENDENT parser in this file, never the
+#       leg's own reader), every entry passes the path rules, and every entry's basename
+#       is not still targeted by a LIVE launchd plist (edit 3 of the retirement rule —
+#       without it, every later sync fails on a broken target).
+#   (g) END-TO-END, REAL setup.sh — farms two scripts, records the snapshot, then retires
+#       one: FIRST the natural mistake (array entry dropped, nothing declared) must FAIL
+#       and leave the file installed; then the declaration (the second edit) removes it
+#       while the other script survives byte-identical; a third run is a clean no-op; and
+#       putting the array entry BACK (a contradictory list) fails the run and re-creates
+#       the farmed file rather than deleting it. The snapshot written here must equal the
+#       independent parse, which is what makes a dropped `farm_declared_rel` recording
+#       line — or a sixth farm wired into only one place — go red.
+#   (h) THE CELL HALF — `cell-install.sh` applies the same leg (so a retirement reaches
+#       Linux cells too), records the snapshot, and `--verify` REFUSES a cell that still
+#       carries the retired artifact (without it, a cell would be certified while
+#       executing a retired script — the false PASS this issue exists to remove).
 #
 # Hermetic: the repo is READ ONLY except for a throwaway copy made here ($COPY), HOME and
 # CELL_HOME are temp dirs, npm and launchctl are stubs (no network; test-setup-no-nesting
@@ -94,14 +102,72 @@ export LAUNCHCTL_LOG="$TMP/launchctl.log"
 export PATH="$FAKEBIN:$PATH"
 
 # --- a throwaway checkout of this repo, for the end-to-end cases -----------
-# setup.sh derives INFRA_ROOT from its own location, so the retirement has to be made IN
+# setup.sh derives INFRA_ROOT from its own location, so a retirement has to be made IN
 # a checkout. Copying is what keeps the real repo read-only; only the copy is edited, and
-# only in the two places a real retirement edits (the farm array, the manifest).
+# only in the two places a real retirement edits (the farm array, the manifest). `tools/`
+# is required by cell-install.sh (it farms tools/fleet/*.py), not by setup.sh.
 mkdir -p "$COPY"
-# `tools/` is required by cell-install.sh (`fleet_tools` farms tools/fleet/*.py into
-# $DEST/scripts/fleet), not by setup.sh — the COPY has to satisfy both.
 cp -R "$ROOT/pi-bootstrap" "$ROOT/scripts" "$ROOT/extensions" "$ROOT/skills" "$ROOT/templates" "$ROOT/tools" "$COPY/"
 cp "$ROOT/manifest.json" "$COPY/manifest.json"
+
+# declared_set.py <setup.sh> <checkout-root> — print the paths a farm DECLARES, relative
+# to $DEST, one per line, sorted. An INDEPENDENT reader: never the leg's own code and
+# never cell-install.sh's parser, so agreeing with what the installers record means
+# something. It FAILS on an array it does not know, so a farm added to setup.sh without
+# being wired here cannot pass silently (the same rule as cell-install.sh's FARM_LAYOUT).
+cat > "$TMP/declared_set.py" <<'PY'
+import os
+import re
+import sys
+
+setup_path, root = sys.argv[1:3]
+# array name -> destination dir under $DEST/scripts
+LAYOUT = {
+    "fleet_srcs": "scripts",
+    "merge_gate_srcs": "scripts",
+    "lane_root_srcs": "scripts",
+    "lane_srcs": "scripts/lane",
+    "lib_srcs": "scripts/lib",
+    "fleet_tools": "scripts/fleet",   # source tools/fleet, DEST scripts/fleet
+}
+
+src = open(setup_path).read()
+arrays = dict(
+    (m.group(1), re.findall(r"[^\s\\]+", m.group(2)))
+    for m in re.finditer(r"^([A-Za-z_][A-Za-z0-9_]*)=\((.*?)\)\s*$", src, re.M | re.S)
+)
+unknown = sorted(n for n in arrays if n not in LAYOUT)
+if unknown:
+    sys.exit(
+        "pi-bootstrap/setup.sh declares array(s) this suite does not know: %s\n"
+        "      A farm added to setup.sh must be mapped in test-farm-unfarm.sh's LAYOUT,\n"
+        "      otherwise the retirement check silently stops covering it." % ", ".join(unknown)
+    )
+
+declared = set()
+for name, bases in arrays.items():
+    for base in bases:
+        declared.add(LAYOUT[name] + "/" + base)
+
+# the checkout-hygiene farm is a directory glob (setup.sh skips *.plist and *.test.*)
+m = re.search(r'^scripts_dir="\$INFRA_ROOT/([^"]+)"', src, re.M)
+if not m:
+    sys.exit("setup.sh no longer declares scripts_dir=$INFRA_ROOT/... — the checkout-hygiene farm cannot be located")
+hyg = os.path.join(root, m.group(1))
+rel_hyg = m.group(1)   # dest path == checkout-relative path (FARM_LAYOUT: scripts/checkout-hygiene)
+for base in sorted(os.listdir(hyg)):
+    if base.endswith(".plist") or ".test." in base:
+        continue
+    if os.path.isfile(os.path.join(hyg, base)):
+        declared.add(rel_hyg + "/" + base)
+
+print("\n".join(sorted(declared)))
+PY
+
+# manifest_entries — the real retirement list's entries (comments/blank lines skipped).
+manifest_entries() {
+  grep -v '^[[:space:]]*#' "${1:-$MANIFEST}" | grep -v '^[[:space:]]*$' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+}
 
 # set_fleet_srcs <add|remove> <name> — edit the COPY's fleet_srcs array (one line, as
 # ci_runner_gate.test.sh and cell-install.sh also read it).
@@ -131,19 +197,14 @@ else:
 PY
 }
 
-# declare_retired <path> — append to the COPY's retirement list (the second of the two
+# declare_retired <path> — append to the COPY's retirement list (the second of the
 # edits a retirement is).
 declare_retired() {
   printf '%s\n' "$1" >> "$COPY/pi-bootstrap/farm-retired.txt"
 }
 
-# run_setup — the REAL setup.sh, from the COPY, into the temp HOME.
 run_setup() {
   echo "---- setup.sh (HOME=$HOME_DIR) ----" >> "$LOG"
-  HOME="$HOME_DIR" bash "$COPY/pi-bootstrap/setup.sh" >> "$LOG" 2>&1
-}
-run_setup_rc() {
-  echo "---- setup.sh (expect failure) ----" >> "$LOG"
   HOME="$HOME_DIR" bash "$COPY/pi-bootstrap/setup.sh" >> "$LOG" 2>&1
 }
 
@@ -210,18 +271,27 @@ mkdir -p "$SAFE/dest/scripts"
 printf 'canary\n' > "$SAFE/dest/scripts/canary.sh"
 printf 'outside\n' > "$SAFE/outside.sh"
 mkdir -p "$SAFE/outside-dir" && printf 'outside-dir\n' > "$SAFE/outside-dir/f.sh"
-for entry in '../outside.sh' "$SAFE/outside.sh" 'scripts/*' 'scripts/../outside.sh' \
-             'extensions/vision-interceptor' 'scripts/a b.sh' 'scripts' 'scripts/' \
-             'scripts/$(id).sh' 'scripts/;rm -rf x'; do
-  printf '%s\n' "$entry" > "$SAFE/bad.txt"
+refused_entry() {   # $1 = entry, tab and space spellings handled by the caller
+  printf '%s\n' "$1" > "$SAFE/bad.txt"
   if farm_retired_entries "$SAFE/bad.txt" > "$SAFE/bad.out" 2> "$SAFE/bad.err"; then
-    fail "(d) unsafe entry ACCEPTED: $entry"
+    fail "(d) unsafe entry ACCEPTED: $1"
   elif [ -s "$SAFE/bad.out" ]; then
-    fail "(d) unsafe entry $entry still produced an entry to act on"
+    fail "(d) unsafe entry $1 still produced an entry to act on"
   else
-    ok "(d) refused: $entry"
+    ok "(d) refused: $1"
   fi
-done
+}
+refused_entry '../outside.sh'
+refused_entry "$SAFE/outside.sh"
+refused_entry 'scripts/*'
+refused_entry 'scripts/../outside.sh'
+refused_entry 'extensions/vision-interceptor'
+refused_entry 'scripts/a b.sh'
+refused_entry 'scripts/a	b.sh'
+refused_entry 'scripts'
+refused_entry 'scripts/'
+refused_entry 'scripts/$(id).sh'
+refused_entry 'scripts/;rm -rf x'
 if [ -f "$SAFE/dest/scripts/canary.sh" ] && [ -f "$SAFE/outside.sh" ]; then
   ok "(d) refusals deleted nothing"
 else
@@ -260,8 +330,32 @@ else
   ok "(d) symlinked parent refused, outside file intact"
 fi
 
+# ...and the harder half: redirects that stay INSIDE $DEST. "The parent is inside $DEST"
+# is NOT the guard — the parent must BE the directory the entry names.
+RED="$TMP/redirect"
+mkdir -p "$RED/dest/state" "$RED/dest/scripts"
+printf 'a runtime lock\n' > "$RED/dest/state/pi-reap-idle.lock"
+printf 'still farmed\n' > "$RED/dest/scripts/liveness.py"
+ln -s "$RED/dest/state" "$RED/dest/scripts/dirlink"          # farm subdir -> state/
+printf 'scripts/dirlink/pi-reap-idle.lock\n' > "$RED/state.txt"
+out="$(farm_unfarm "$RED/dest" "$RED/state.txt" '' 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] || [ ! -f "$RED/dest/state/pi-reap-idle.lock" ]; then
+  fail "(d) a symlinked farm subdirectory redirected a removal INTO \$DEST/state (rc=$rc): $out"
+else
+  ok "(d) symlink-into-state refused, the runtime lock survives"
+fi
+mkdir -p "$RED/dest/scripts/fleet"
+ln -s "$RED/dest/scripts" "$RED/dest/scripts/fleet/up"        # fleet/up -> scripts/
+printf 'scripts/fleet/up/liveness.py\n' > "$RED/sibling.txt"
+out="$(farm_unfarm "$RED/dest" "$RED/sibling.txt" '' 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] || [ ! -f "$RED/dest/scripts/liveness.py" ]; then
+  fail "(d) a symlinked sibling subdirectory unlinked a DIFFERENT still-farmed file (rc=$rc): $out"
+else
+  ok "(d) sibling-redirect refused, the still-farmed file survives"
+fi
+
 # ===========================================================================
-hdr "(e) lib: a missing retirement list is loud, not 'nothing to retire'"
+hdr "(e) lib: a missing or UNREADABLE list is loud, and an orphaned name fails"
 out="$(farm_unfarm "$SAFE/dest" "$TMP/does-not-exist.txt" '' 2>&1)"; rc=$?
 if [ "$rc" -eq 0 ]; then
   fail "(e) a MISSING retirement list was accepted as 'nothing to retire'"
@@ -270,84 +364,86 @@ elif ! grep -q 'missing' <<<"$out"; then
 else
   ok "(e) missing list is an error"
 fi
+if [ "$(id -u)" = "0" ]; then
+  ok "(e) skipped the unreadable-list pin: running as root, where chmod 000 does not block a read"
+else
+  printf 'scripts/canary.sh\n' > "$SAFE/unreadable.txt"
+  chmod 000 "$SAFE/unreadable.txt"
+  out="$(farm_unfarm "$SAFE/dest" "$SAFE/unreadable.txt" '' 2>&1)"; rc=$?
+  chmod 644 "$SAFE/unreadable.txt"
+  if [ "$rc" -eq 0 ]; then
+    fail "(e) an UNREADABLE retirement list was accepted as 'nothing to retire' (rc=0): $out"
+  elif grep -q 'no retirements declared' <<<"$out"; then
+    fail "(e) an unreadable list reported 'no retirements declared' — a false PASS: $out"
+  elif [ ! -f "$SAFE/dest/scripts/canary.sh" ]; then
+    fail "(e) a refused (unreadable) run removed something"
+  else
+    ok "(e) unreadable list is an error, nothing removed"
+  fi
+fi
+
+# THE SNAPSHOT HALF: a name farmed by the previous apply and now neither farmed nor
+# retired is the "dropped from the array, forgot to declare it" mistake, which no set
+# comparison can see.
+SNAP="$TMP/snap"
+mkdir -p "$SNAP/dest/scripts"
+printf 'scripts/a.sh\nscripts/b.sh\n' > "$SNAP/manifest.txt"
+: > "$SNAP/manifest-empty.txt"
+farm_record_declared "$SNAP/dest" $'scripts/a.sh\nscripts/b.sh\n' >/dev/null 2>&1
+out="$(farm_check_declared_shrink "$SNAP/dest" "$SNAP/manifest-empty.txt" $'scripts/a.sh\n' 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ]; then
+  fail "(e) a name dropped from the farm and not declared was NOT reported (the silent-orphan case)"
+elif ! grep -q 'scripts/b.sh' <<<"$out"; then
+  fail "(e) the orphan report did not name the orphaned path ($out)"
+else
+  ok "(e) a farmed-but-now-undeclared name is reported as orphaned"
+fi
+out="$(farm_check_declared_shrink "$SNAP/dest" "$SNAP/manifest-empty.txt" $'scripts/a.sh\nscripts/b.sh\n' 2>&1)"; rc=$?
+[ "$rc" -eq 0 ] && ok "(e) nothing dropped -> clean" || fail "(e) a clean declaration was reported as a shrink ($out)"
+out="$(farm_check_declared_shrink "$SNAP/dest" "$SNAP/manifest.txt" $'scripts/a.sh\n' 2>&1)"; rc=$?
+# b.sh is retired now, so it is not an orphan — a retirement must not read as a shrink
+[ "$rc" -eq 0 ] && ok "(e) a RETIRED name is not reported as an orphan" || fail "(e) a declared retirement read as a shrink ($out)"
 
 # ===========================================================================
-hdr "(f) the repo's own declaration does not intersect the repo's farm"
-# INDEPENDENT reader: never the leg's own code and never cell-install's python. It maps
-# every farm array in setup.sh by name, plus the checkout-hygiene glob farm, to the paths
-# they land at under $DEST — and FAILS on an array it does not know, so a farm added
-# without being wired here cannot pass silently (same loud-failure rule as
-# cell-install.sh's FARM_LAYOUT).
-python3 - "$SETUP" "$ROOT" "$MANIFEST" <<'PY'
-import os
-import re
-import sys
-
-setup_path, root, manifest = sys.argv[1:4]
-# array name -> destination dir under $DEST/scripts
-LAYOUT = {
-    "fleet_srcs": "scripts",
-    "merge_gate_srcs": "scripts",
-    "lane_root_srcs": "scripts",
-    "lane_srcs": "scripts/lane",
-    "lib_srcs": "scripts/lib",
-    "fleet_tools": "scripts/fleet",
-}
-
-src = open(setup_path).read()
-arrays = dict(
-    (m.group(1), re.findall(r"[^\s\\]+", m.group(2)))
-    for m in re.finditer(r"^([A-Za-z_][A-Za-z0-9_]*)=\((.*?)\)\s*$", src, re.M | re.S)
-)
-unknown = sorted(n for n in arrays if n not in LAYOUT)
-if unknown:
-    sys.exit(
-        "FAIL: pi-bootstrap/setup.sh declares array(s) this suite does not know: %s\n"
-        "      A farm added to setup.sh must be mapped in test-farm-unfarm.sh's LAYOUT,\n"
-        "      otherwise the retirement check silently stops covering it." % ", ".join(unknown)
-    )
-
-declared = set()
-for name, bases in arrays.items():
-    for base in bases:
-        declared.add(LAYOUT[name] + "/" + base)
-
-# the checkout-hygiene farm is a directory glob (setup.sh skips *.plist and *.test.*)
-m = re.search(r'^scripts_dir="\$INFRA_ROOT/([^"]+)"', src, re.M)
-if not m:
-    sys.exit("FAIL: setup.sh no longer declares scripts_dir=$INFRA_ROOT/... — the checkout-hygiene farm cannot be located")
-hyg = os.path.join(root, m.group(1))
-for base in sorted(os.listdir(hyg)):
-    if base.endswith(".plist") or ".test." in base:
-        continue
-    if os.path.isfile(os.path.join(hyg, base)):
-        declared.add("scripts/" + m.group(1).split("scripts/")[-1] + "/" + base)
-
-retired = []
-for line in open(manifest):
-    line = line.strip()
-    if not line or line.startswith("#"):
-        continue
-    retired.append(line)
-
-overlap = sorted(set(retired) & declared)
-if overlap:
-    sys.exit(
-        "FAIL: pi-bootstrap/farm-retired.txt declares RETIRED path(s) that a farm array STILL declares: %s\n"
-        "      The copy leg re-creates them, so the UNFARM leg would refuse on every box and\n"
-        "      setup.sh would exit non-zero. Retire a name by removing it from the array too."
-        % ", ".join(overlap)
-    )
-print("ok: (f) %d declared retirement(s), %d farmed path(s), no intersection"
-      % (len(retired), len(declared)))
-PY
-[ $? -eq 0 ] || FAILURES=$((FAILURES + 1))
-
-# every entry of the real manifest also has to satisfy the path rules
+hdr "(f) the repo's own declaration: no intersection, no live plist, valid entries"
+DECLARED_REPO="$(python3 "$TMP/declared_set.py" "$SETUP" "$ROOT")" \
+  || fail "(f) the independent farm reader failed (see above)"
+RETIRED_REPO="$(manifest_entries "$MANIFEST")"
+overlap=""
+while IFS= read -r entry; do
+  [ -n "$entry" ] || continue
+  if grep -qxF -- "$entry" <<<"$DECLARED_REPO"; then overlap="$overlap $entry"; fi
+done <<<"$RETIRED_REPO"
+if [ -n "$overlap" ]; then
+  fail "(f) pi-bootstrap/farm-retired.txt declares RETIRED path(s) that a farm array STILL declares:$overlap — the copy leg re-creates them, so every sync would fail"
+else
+  ok "(f) no intersection between $(printf '%s' "$RETIRED_REPO" | grep -c . || true) declared retirement(s) and $(printf '%s' "$DECLARED_REPO" | grep -c . || true) farmed path(s)"
+fi
 if farm_retired_entries "$MANIFEST" > "$TMP/real-entries.txt" 2> "$TMP/real-entries.err"; then
-  ok "(f) every real retirement entry passes the path rules ($(grep -c . "$TMP/real-entries.txt" || true) entry/entries)"
+  ok "(f) every real retirement entry passes the path rules"
 else
   fail "(f) the REAL pi-bootstrap/farm-retired.txt has an unsafe entry: $(cat "$TMP/real-entries.err")"
+fi
+# EDIT 3 of the retirement rule: a retired script whose plist is still installed makes
+# install-launchd fail on a broken target — on EVERY box, on EVERY sync (sync.sh runs the
+# installer bare under `set -e`). Catch the pairing at merge time instead.
+plist_gap=""
+while IFS= read -r entry; do
+  [ -n "$entry" ] || continue
+  base="$(basename "$entry")"
+  for plist in "$ROOT"/templates/launchd/*.plist; do
+    [ -f "$plist" ] || continue
+    grep -qF -- "$base" "$plist" || continue
+    label="$(basename "$plist" .plist)"
+    if ! grep -qxF -- "$label" <<<"$(grep -v '^[[:space:]]*#' "$ROOT/templates/launchd/RETIRED" | grep -v '^[[:space:]]*$')"; then
+      plist_gap="$plist_gap $label($base)"
+    fi
+  done
+done <<<"$RETIRED_REPO"
+if [ -n "$plist_gap" ]; then
+  fail "(f) a retired script is still targeted by a LIVE plist:$plist_gap — add the label to templates/launchd/RETIRED (edit 3), or every later sync fails on a broken target"
+else
+  ok "(f) no retired script is still targeted by a live launchd plist"
 fi
 
 # ===========================================================================
@@ -355,21 +451,45 @@ hdr "(g) end-to-end: setup.sh farms two scripts, one is retired, re-applied"
 RETIRED_NAME="probe-one.py"
 KEPT_NAME="turn-end.py"
 
-# run 1 — both are farmed
-if ! run_setup; then
-  fail "(g) setup.sh run 1 failed (see $LOG)"
-fi
+run_setup
 if [ ! -f "$DEST_HOME/scripts/$RETIRED_NAME" ] || [ ! -f "$DEST_HOME/scripts/$KEPT_NAME" ]; then
-  fail "(g) run 1 did not farm both scripts — the retirement case cannot be judged"
+  fail "(g) run 1 did not farm both scripts — the retirement case cannot be judged (see $LOG)"
 else
   kept_sum_before="$(cksum < "$DEST_HOME/scripts/$KEPT_NAME")"
   ok "(g) run 1: both farmed ($RETIRED_NAME, $KEPT_NAME)"
 
-  # run 2 — the retirement, made as a real one is made: array edit + declaration
+  # The snapshot is the assertion that the DECLARED-SET WIRING is complete: every farm
+  # loop must record what it declares. Drop one recording line, or wire a sixth farm in
+  # only one place, and this comparison goes red — otherwise the contradiction guard
+  # silently stops covering that farm.
+  snapshot="$DEST_HOME/state/farm-declared.txt"
+  declared_copy="$(python3 "$TMP/declared_set.py" "$COPY/pi-bootstrap/setup.sh" "$COPY")"
+  if [ ! -f "$snapshot" ]; then
+    fail "(g) run 1 did not record the farm declaration snapshot ($snapshot)"
+  elif [ "$(LC_ALL=C sort -u "$snapshot")" = "$(printf '%s\n' "$declared_copy" | LC_ALL=C sort -u)" ]; then
+    ok "(g) run 1: the recorded snapshot equals the independent parse of the declared set"
+  else
+    fail "(g) the recorded snapshot DIFFERS from the independent parse — a farm loop is not recording what it declares:
+$(diff <(LC_ALL=C sort -u "$snapshot") <(printf '%s\n' "$declared_copy" | LC_ALL=C sort -u) | head -10)"
+  fi
+
+  # run 2 — the NATURAL MISTAKE: the array entry is dropped and nothing is declared.
+  # The deployed copy would be orphaned; the snapshot check must catch it and NOT delete.
   set_fleet_srcs remove "$RETIRED_NAME" || fail "(g) could not edit the COPY's fleet_srcs"
+  if HOME="$HOME_DIR" bash "$COPY/pi-bootstrap/setup.sh" >> "$LOG" 2>&1; then
+    fail "(g) setup.sh ACCEPTED a name dropped from the farm without a retirement declaration"
+  elif [ ! -f "$DEST_HOME/scripts/$RETIRED_NAME" ]; then
+    fail "(g) the orphan case DELETED the file instead of refusing"
+  elif ! grep -q 'NEITHER farmed NOR retired' "$LOG"; then
+    fail "(g) the orphan case was not reported by setup.sh"
+  else
+    ok "(g) run 2: a name dropped without a declaration fails the sync and stays installed"
+  fi
+
+  # run 3 — the second edit: declare it. Now it is removed, and the survivor is untouched.
   declare_retired "scripts/$RETIRED_NAME"
   if ! run_setup; then
-    fail "(g) setup.sh run 2 (the retirement) failed (see $LOG)"
+    fail "(g) setup.sh run 3 (the declared retirement) failed (see $LOG)"
   fi
   if [ -e "$DEST_HOME/scripts/$RETIRED_NAME" ]; then
     fail "(g) RETIREMENT DID NOT REACH THE MACHINE: $RETIRED_NAME is still in \$DEST/scripts"
@@ -379,14 +499,16 @@ else
     fail "(g) the still-farmed $KEPT_NAME changed"
   elif ! grep -q "REMOVED scripts/$RETIRED_NAME" "$LOG"; then
     fail "(g) the removal was not reported in the setup output"
+  elif grep -qxF -- "scripts/$RETIRED_NAME" "$snapshot"; then
+    fail "(g) the snapshot still lists the retired path — the next run would report it as orphaned"
   else
-    ok "(g) run 2: retired script gone, still-farmed script survived byte-identical, removal reported"
+    ok "(g) run 3: retired script gone, still-farmed script survived byte-identical, snapshot updated"
   fi
 
-  # run 3 — re-apply: still gone, sibling still there, nothing removed
+  # run 4 — re-apply: still gone, sibling still there, nothing removed
   : > "$LOG"
   if ! run_setup; then
-    fail "(g) setup.sh run 3 (re-apply) failed (see $LOG)"
+    fail "(g) setup.sh run 4 (re-apply) failed (see $LOG)"
   fi
   if [ -e "$DEST_HOME/scripts/$RETIRED_NAME" ]; then
     fail "(g) a re-apply re-created the retired script"
@@ -395,21 +517,21 @@ else
   elif ! grep -q 'unfarm: 0 removed' "$LOG"; then
     fail "(g) a re-apply did not report ' 0 removed' (idempotency is not observable)"
   else
-    ok "(g) run 3 (re-apply): retired still gone, survivor intact, 'unfarm: 0 removed'"
+    ok "(g) run 4 (re-apply): retired still gone, survivor intact, 'unfarm: 0 removed'"
   fi
 
-  # run 4 — the half-done retirement: the array entry is put BACK while the declaration
+  # run 5 — the half-done retirement: the array entry is put BACK while the declaration
   # stays. setup.sh must FAIL and must NOT delete what the farm still declares.
   set_fleet_srcs add "$RETIRED_NAME" || fail "(g) could not restore the COPY's fleet_srcs entry"
   : > "$LOG"
-  if run_setup_rc; then
+  if HOME="$HOME_DIR" bash "$COPY/pi-bootstrap/setup.sh" >> "$LOG" 2>&1; then
     fail "(g) setup.sh ACCEPTED a contradictory state (retired + still farmed)"
   elif [ ! -f "$DEST_HOME/scripts/$RETIRED_NAME" ]; then
     fail "(g) a contradictory state DELETED a script the farm still declares"
   elif ! grep -q 'still declares it' "$LOG"; then
     fail "(g) the contradiction was not reported by setup.sh"
   else
-    ok "(g) run 4: contradictory list fails the run and the farmed script is (re-)present"
+    ok "(g) run 5: contradictory list fails the run and the farmed script is (re-)present"
   fi
 fi
 
@@ -425,8 +547,10 @@ elif [ -e "$CELL_DEST/scripts/$RETIRED_NAME" ]; then
   fail "(h) a cell still receives the RETIRED script — the unfarm leg did not reach the cell"
 elif [ ! -f "$CELL_DEST/scripts/$KEPT_NAME" ]; then
   fail "(h) the cell is missing the still-farmed script"
+elif [ ! -f "$CELL_DEST/state/farm-declared.txt" ]; then
+  fail "(h) the cell install did not record the farm declaration snapshot"
 else
-  ok "(h) cell install: retired script absent, still-farmed script present"
+  ok "(h) cell install: retired script absent, still-farmed script present, snapshot recorded"
 fi
 if CELL_HOME="$CELL_HOME" INFRA_ROOT="$COPY" bash "$CELL_INSTALL" --verify >> "$LOG" 2>&1; then
   ok "(h) cell --verify passes on the retired-absent cell"
@@ -436,8 +560,7 @@ fi
 # a stale copy left behind on an existing cell must be REFUSED by --verify (a cell is
 # certified by reading the artifact back, never by trusting the installer's own output)
 printf 'stale retired dispatcher\n' > "$CELL_DEST/scripts/$RETIRED_NAME"
-CELL_HOME="$CELL_HOME" INFRA_ROOT="$COPY" bash "$CELL_INSTALL" --verify >> "$LOG" 2>&1
-if [ $? -eq 0 ]; then
+if CELL_HOME="$CELL_HOME" INFRA_ROOT="$COPY" bash "$CELL_INSTALL" --verify >> "$LOG" 2>&1; then
   fail "(h) cell --verify CERTIFIED a cell that still carries a retired artifact (the false PASS)"
 else
   ok "(h) cell --verify refuses a cell that still carries the retired artifact"
@@ -449,6 +572,27 @@ if CELL_HOME="$CELL_HOME" INFRA_ROOT="$COPY" bash "$CELL_INSTALL" --install >> "
 else
   fail "(h) cell --install did not repair the stale retired artifact (see $LOG)"
 fi
+# a checkout without the UNFARM leg must be refused BEFORE anything is copied (a cell
+# half-installed by a resolver that accepted an incomplete tree is #1723's state)
+NOLIB="$TMP/nolib-checkout"
+mkdir -p "$NOLIB"
+cp -R "$COPY/pi-bootstrap" "$COPY/scripts" "$COPY/extensions" "$COPY/skills" "$COPY/templates" "$COPY/tools" "$NOLIB/"
+cp "$COPY/manifest.json" "$NOLIB/"
+rm -rf "$NOLIB/pi-bootstrap/lib"
+# AGENT_INFRA_PATH/HARNESS are UNSET on purpose: with them set, the resolver falls back to
+# the ambient checkout (a valid candidate) and the case would install from THAT instead of
+# proving anything about the incomplete tree.
+# The script is invoked from the INCOMPLETE tree on purpose: `$SELF_DIR/..` is one of the
+# resolver's own candidates, so invoking the real repo's copy would resolve to a valid
+# checkout and prove nothing.
+if env -u AGENT_INFRA_PATH -u HARNESS CELL_HOME="$TMP/nolib-home" INFRA_ROOT="$NOLIB" \
+     bash "$NOLIB/pi-bootstrap/cell-install.sh" --install >> "$LOG" 2>&1; then
+  fail "(h) cell-install accepted a checkout with no UNFARM leg (it would half-install)"
+elif [ -e "$TMP/nolib-home/.pi/agent/scripts" ]; then
+  fail "(h) cell-install MUTATED the cell before refusing a checkout with no UNFARM leg"
+else
+  ok "(h) a checkout with no UNFARM leg is refused before anything is written"
+fi
 
 # ===========================================================================
 if [ "$FAILURES" -gt 0 ]; then
@@ -458,4 +602,5 @@ if [ "$FAILURES" -gt 0 ]; then
 fi
 echo ""
 echo "OK: retirement reaches both the laptop (setup.sh) and a cell (cell-install.sh),"
-echo "    over-deletion is refused, and a contradictory declaration fails loudly."
+echo "    over-deletion is refused, an undeclared drop is caught, and a contradictory"
+echo "    declaration fails loudly."

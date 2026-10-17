@@ -141,7 +141,8 @@
 #   real copies (not symlinks — a cell's checkout can live under /tmp, and #427 is the
 #   same reason links are not used for launchd-invoked scripts), so a re-run overwrites a
 #   cell-local mutation to a farmed/guard file. Local EXTRAS survive (nothing is deleted
-#   except a denied extension and a legacy tools/fleet/).
+#   except a denied extension, a legacy tools/fleet/, and a farm artifact DECLARED retired
+#   in pi-bootstrap/farm-retired.txt — #1924).
 #
 # Exit: 0 = installed + verified, 1 = a failure (details on stdout/stderr), 2 = usage.
 # ============================================================
@@ -194,10 +195,20 @@ MIN_FARM_FILES=20
 MIN_SHIP_LIST=10
 
 # ── locating the checkout to install FROM ────────────────────────────────────
-# A candidate "is a checkout" only if it carries BOTH files this script reads: the farm
-# declaration and the ship-list. Anything weaker would let a stray directory half-install.
+# A candidate "is a checkout" only if it carries EVERY file this script reads: the farm
+# declaration (pi-bootstrap/setup.sh), the extension ship-list (manifest.json), and — since
+# #1924 — the UNFARM leg and its retirement list. Anything weaker lets a shape-valid but
+# incomplete tree win the resolution and then die mid-install: measured, a candidate with
+# setup.sh + manifest.json but no pi-bootstrap/lib/ installed the whole farm and THEN failed
+# the unfarm leg, leaving a cell with $DEST/scripts and no guards/extensions/skills (#1723's
+# half-installed state). Requiring them here makes the resolver fall through to a complete
+# checkout and refuses a partial one BEFORE any mutation.
 is_infra_checkout() {
-  [ -n "${1:-}" ] && [ -f "$1/pi-bootstrap/setup.sh" ] && [ -f "$1/manifest.json" ]
+  [ -n "${1:-}" ] \
+    && [ -f "$1/pi-bootstrap/setup.sh" ] \
+    && [ -f "$1/manifest.json" ] \
+    && [ -f "$1/pi-bootstrap/lib/farm-retire.sh" ] \
+    && [ -f "$1/pi-bootstrap/farm-retired.txt" ]
 }
 
 resolve_infra_root() {
@@ -411,25 +422,50 @@ load_farm_retire() {
 # one kind of value from both callers.
 FARM_DECLARED_REL=""
 read_declared_farm_rel_paths() {   # $1 = rows, as emitted by read_farm_set
-  local rows="$1" src_rel dest_rel base
+  local rows="$1" src_rel dest_rel base rows_n=0 paths_n=0
   FARM_DECLARED_REL=""
   while IFS=$'\t' read -r src_rel dest_rel base; do
     [ -n "${base:-}" ] || continue
+    rows_n=$((rows_n + 1))
     case "$dest_rel" in
       scripts)   FARM_DECLARED_REL+="scripts/$base"$'\n' ;;
       scripts/*) FARM_DECLARED_REL+="$dest_rel/$base"$'\n' ;;
+      # A farm destination OUTSIDE scripts/ cannot be expressed in the retirement list
+      # (`scripts/…` only), so it must be a loud failure rather than a silently dropped
+      # row: the contradiction guard would then pass vacuously and --verify would certify
+      # a cell against a truncated declared set — the same silent-shrink class this file
+      # already guards with MIN_FARM_FILES / MIN_SHIP_LIST and read_farm_set's unknown-array
+      # refusal. There is no such farm today; this is the branch that keeps that true.
+      *) printf 'FATAL: the farm declares %s under %s, which is not under scripts/ — the retirement check cannot cover it (add it to the retirement list format or move the farm)\n' \
+                "$base" "$dest_rel" >&2
+         return 1 ;;
     esac
   done <<<"$rows"
+  paths_n="$(printf '%s' "$FARM_DECLARED_REL" | grep -c . || true)"
+  if [ "$paths_n" -ne "$rows_n" ]; then
+    printf 'FATAL: the declared path set parsed to %s of %s farm row(s) — refusing to run a retirement check against a TRUNCATED set\n' \
+           "$paths_n" "$rows_n" >&2
+    return 1
+  fi
+  return 0
 }
 
 install_unfarm() {
   local rows
   rows="$(read_farm_set)" || die "the declared farm set could not be read from setup.sh (see above)"
   load_farm_retire || die "the UNFARM leg cannot run — a retirement would not reach this cell, and certifying it anyway is the #1924 gap"
-  read_declared_farm_rel_paths "$rows"
+  read_declared_farm_rel_paths "$rows" \
+    || die "the declared path set could not be built in full — refusing to run the retirement check against a truncated set"
+  # The snapshot check catches the "dropped from a farm array without being declared"
+  # direction, which no set comparison can see (the name is then in neither list).
+  if ! farm_check_declared_shrink "$DEST" "$INFRA_ROOT/pi-bootstrap/farm-retired.txt" "$FARM_DECLARED_REL"; then
+    die "the farm retirement check failed (see above) — either a name farmed by a previous install is now neither farmed nor retired (it would be ORPHANED on this cell: declare it in pi-bootstrap/farm-retired.txt), or the retirement list could not be read"
+  fi
   if ! farm_unfarm "$DEST" "$INFRA_ROOT/pi-bootstrap/farm-retired.txt" "$FARM_DECLARED_REL"; then
     die "the UNFARM leg failed (see above) — a retirement the farm cannot apply is NOT applied"
   fi
+  farm_record_declared "$DEST" "$FARM_DECLARED_REL" \
+    || die "could not record the farm declaration snapshot — the next install could not detect a name dropped from a farm array without being declared"
 }
 
 # ── 2. extensions ────────────────────────────────────────────────────────────
@@ -672,8 +708,8 @@ GUARD_EXTENSIONS=(review-enforcer verification-gate main-worktree-guard search-g
 # shipped_content_matches <src-dir> <dst-dir> — every file in the SOURCE tree (minus
 # node_modules) must exist at the same relative path under the destination and be
 # byte-identical. Deliberately ONE-DIRECTIONAL: the installer never deletes a cell-local extra
-# (the header's contract — nothing is removed except a denied extension and a legacy
-# tools/fleet/), so a file that exists only on the cell is not a failure. A two-way `diff -rq`
+# (the header's contract — nothing is removed except a denied extension, a legacy tools/fleet/,
+# and a declared retirement), so a file that exists only on the cell is not a failure. A two-way `diff -rq`
 # refused such a cell and the installer could not repair it — a false block, not a finding.
 # A MISSING or EDITED shipped file still fails: that is drift.
 #
@@ -748,7 +784,9 @@ verify_layer() {
   if load_farm_retire; then
     local retired_list="" retired_rel conflict_out="" conflict_rc=0 retired_n=0
     if retired_list="$(farm_retired_entries "$INFRA_ROOT/pi-bootstrap/farm-retired.txt")"; then
-      read_declared_farm_rel_paths "$rows"
+      if ! read_declared_farm_rel_paths "$rows"; then
+        fail "the declared path set could not be built in full — verify cannot vouch for a retirement check against a truncated set"
+      fi
       conflict_out="$(farm_retired_conflicts "$INFRA_ROOT/pi-bootstrap/farm-retired.txt" "$FARM_DECLARED_REL")" || conflict_rc=$?
       case "$conflict_rc" in
         0) ;;
@@ -766,6 +804,26 @@ verify_layer() {
         fi
       done <<<"$retired_list"
       say "verified $retired_n declared retirement(s) absent from the cell"
+
+      # ...and that the leg RAN against THIS declaration. With an empty retirement list the
+      # loop above is vacuous — it cannot distinguish "nothing to retire" from "the leg never
+      # ran on this cell". The snapshot the last install recorded is the evidence, and it also
+      # catches a name that a previous install farmed and that has since been dropped from a
+      # farm array without being declared (invisible in neither set, so the retired-list
+      # read-back above is blind to it).
+      local snap snap_rel want_out
+      snap="$(farm_snapshot_path "$DEST")"
+      snap_rel="${snap#"$DEST"/}"
+      if [ ! -f "$snap" ]; then
+        fail "the UNFARM leg never recorded a farm declaration snapshot ($snap_rel) — this cell's layer predates #1924 or the unfarm leg did not run; re-run --install"
+      else
+        want_out="$(printf '%s' "$FARM_DECLARED_REL" | LC_ALL=C sort -u)"
+        if [ "$(LC_ALL=C sort -u "$snap" | grep -v '^$' || true)" != "$want_out" ]; then
+          fail "the farm declaration snapshot ($snap_rel) DIFFERS from the checkout's declared set — a farmed name was dropped from a farm array without being declared retired (the deployed copy is still installed and would be orphaned); re-run --install after declaring it"
+        else
+          say "verified the farm declaration snapshot against the checkout's declared set"
+        fi
+      fi
     else
       fail "the retirement list pi-bootstrap/farm-retired.txt could not be read — nothing could be vouched for on the UNFARM leg"
     fi
@@ -969,12 +1027,16 @@ main() {
   if [ "$MODE" = "--install" ]; then
     mkdir -p "$DEST" || die "cannot create $DEST"
     install_farms
-    install_unfarm
     install_extensions
     install_extension_deps
     install_skills
     install_config
     migrate_legacy_tools_farm
+    # LAST: the UNFARM leg can refuse (a contradiction, an unremovable artifact, a checkout
+    # without the leg). Running it here means a refusal follows a COMPLETE install, so the
+    # cell keeps its guards/extensions/skills and `--verify` reports the one remaining
+    # problem — instead of a die at this point leaving a guard-less half-installed cell.
+    install_unfarm
   elif [ ! -d "$DEST" ]; then
     # `--verify` writes NOTHING — not even the directory it would check. A cell home with
     # no ~/.pi/agent is a cell without the layer; say that, rather than creating it and

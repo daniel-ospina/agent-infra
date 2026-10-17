@@ -732,12 +732,17 @@ hdr "run 7: a silently SHRUNK farm parse is refused, never verified clean"
 # the wrong ')', a renamed array) installs FEWER files and then verifies clean against its own
 # truncated reading — the instrument agreeing with itself. The floor is what makes it loud.
 FAKE="$TMP/fake-infra"
-mkdir -p "$FAKE/pi-bootstrap" "$FAKE/scripts/checkout-hygiene" "$FAKE/extensions"
+mkdir -p "$FAKE/pi-bootstrap/lib" "$FAKE/scripts/checkout-hygiene" "$FAKE/extensions"
 {
   echo '#!/bin/bash'
   echo 'fleet_srcs=(record-review.sh)'
   echo 'scripts_dir="$INFRA_ROOT/scripts/checkout-hygiene"'
 } > "$FAKE/pi-bootstrap/setup.sh"
+# A checkout only counts if it carries the UNFARM leg (#1924). Without these two files the
+# resolver correctly declines $FAKE and falls back to this repo — so the case would install
+# the REAL farm and prove nothing about the floor.
+cp "$ROOT/pi-bootstrap/lib/farm-retire.sh" "$FAKE/pi-bootstrap/lib/farm-retire.sh"
+printf '# no retirements\n' > "$FAKE/pi-bootstrap/farm-retired.txt"
 cp "$ROOT/scripts/record-review.sh" "$FAKE/scripts/record-review.sh"
 echo "# stub" > "$FAKE/scripts/checkout-hygiene/hub-state-check.sh"
 cp "$MANIFEST" "$FAKE/manifest.json"
