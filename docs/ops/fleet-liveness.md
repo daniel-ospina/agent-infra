@@ -585,3 +585,29 @@ python3 tools/fleet/liveness.test.py                          # the predicate it
 The procfs is a **hermetic fixture** in the suite (`--proc-root`), so the `/proc` fallback is
 exercised by a leg rather than assumed — including the two shapes that must abstain (a refused
 `cwd`) and the one that is a real answer (a pid that is gone).
+
+## 10. `idle` must pass through Step 2, and a stale binding is never verified (#1867)
+
+§9's rule — *liveness must be proven from an artifact, not from a record* — has a second surface: the
+**lane classifier** (`scripts/lane-status.py` → `scripts/lane-actions.py`), which produces the `IDLE`
+list the beat and the dispatcher act on. Measured 2026-10-16 20:47Z: a lane whose `ps -o time`
+advanced **+4.93s over 25s** (pane showing an active spinner, transcript mtime current) was published
+as `DONE-READY — no session write for 13h34m`, and the beat prescribed *"hand each the next unheld
+item"* — into a lane at 85% context, mid-turn. Two independent causes, both of them **a record
+standing in for a proof**:
+
+| # | cause | rule now enforced |
+|---|---|---|
+| **a** | `lane_cpu_busy()` answers only with **exactly one lane ↔ exactly one pid**. A `task` **child is a second pi in the lane's own cwd**, so every lane waiting on a child got `None` from Step 2 — and `None` is *unread*, not *parked*. Step 2 was then skipped, and the verdict was taken from the transcript mtime alone. | `lane_cpu_progress()` answers the weaker question — *did a pi in this lane's own directory consume CPU?* — and returns **only `True` or `None`, never `False`** ("no pid I could see moved" is not "parked"). In a one-lane directory the work counted is this lane's or its child's. It yields `UNATTRIBUTED-WORKING`: **reported, never dispatched, never unblocked**. Deliberately not `WORKING`, which would short-circuit a real `WEDGED`/`CHILD-STUCK` on a child spinning under a stalled parent. |
+| **b** | the pane's resume record was **stale**. `resolve_session_ex()` treated a pane-provided id as authoritative even when the bound file had been quiet for 13h while *another* session file in the same directory was written in the same minute — a hand relaunch (`pi --session <id>`) leaves cmux carrying the old id. | a quiet bound file **plus a fresh sibling writer in the same directory** is an *unconfirmed* binding: `verified=False`, which makes the consumer abstain (`UNVERIFIED-SESSION`) — never `idle`, never `dead`. |
+
+**Ordering.** `lane-actions.classify_row()` asks Step 2 **before** the Step-0 identity abstentions:
+proven CPU progress is evidence about the **lane**, not about which session file the pane was
+launched with, so it settles the question the binding was going to answer — and it can only move a
+lane *out* of every action list.
+
+**Polarity.** Both answers fail toward `UNKNOWN`/report-only. Positive progress can only *suppress* an
+offer of work; it never invents one, and it never prescribes a relaunch.
+
+The suites that pin it: `python3 -m pytest scripts/test_lane_status.py scripts/test_lane_actions.py`
+(the nine legs added with the fix fail on the pre-change files).

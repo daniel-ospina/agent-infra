@@ -945,3 +945,116 @@ def test_the_degraded_message_still_reports_a_real_unreadable_roster(L, monkeypa
     msg = _degraded_stderr(L, dict(kind="nonzero", rc=1, cmd="cmux", attempt=2), monkeypatch)
     assert "unreadable after" in msg and "'nonzero'" in msg, msg
     assert "KILLED BY A SIGNAL" not in msg
+
+
+# ── Step 2 must not go blind just because a `task` child shares the lane's cwd (#1867) ────────
+# ⛔ MEASURED 2026-10-16 20:47Z. `cmux cloud` was published to the beat as
+#   `CAPACITY: 1 lane(s) idle >=20m with NO child in flight -- hand each the next unheld item`
+# on the strength of `DONE_READY, no session write for 13h34m`, while its own `ps -o time` moved
+# `838:22.16 -> 838:27.09` over 25s and its pane showed an active spinner. `lane_cpu_busy()` had
+# answered None -- not False -- because a live `task` CHILD is a second pi with the SAME cwd, and
+# its strict "exactly one lane <-> exactly one pid" rule excludes that case. Step 2 then did not
+# run at all, and the verdict was taken from the transcript mtime alone.
+
+def test_a_second_pi_in_the_lane_directory_does_not_blind_step_2(L):
+    """The lane's own progress, its child's progress, or both -- in a ONE-lane directory it is the
+    lane working, whether or not the pid can be named. The strict read keeps its answer (None);
+    the weaker one must be True."""
+    d = "--x-repo--"
+    dir_lanes, dir_pids = {d: ["L"]}, {d: ["10", "11"]}     # lane pi + its `task` child pi
+    cpu0, cpu1 = {"10": 100.0, "11": 5.0}, {"10": 104.93, "11": 5.0}
+    assert L.lane_cpu_busy("L", "/sessions/%s/s.jsonl" % d, dir_lanes, dir_pids,
+                           cpu0, cpu1) is None, \
+        "the strict exactly-one-pid rule must NOT be relaxed by this change"
+    assert L.lane_cpu_progress(d, dir_lanes, dir_pids, cpu0, cpu1) is True
+
+
+def test_a_childs_progress_counts_as_the_lanes_progress(L):
+    """The measured shape: the parent is quiet for a moment, the CHILD is burning the CPU. That is
+    still work in this lane's own directory, so it is still not free capacity."""
+    d = "--x-repo--"
+    dir_lanes, dir_pids = {d: ["L"]}, {d: ["10", "11"]}
+    cpu0, cpu1 = {"10": 100.0, "11": 5.0}, {"10": 100.0, "11": 9.9}
+    assert L.lane_cpu_progress(d, dir_lanes, dir_pids, cpu0, cpu1) is True
+
+
+def test_progress_in_a_shared_directory_is_not_attributed_to_a_lane(L):
+    """Two lanes on one cwd: a sibling's work is indistinguishable, so this ABSTAINS. Attributing it
+    would mark an idle lane busy (a lost dispatch); the strict read already refuses the same case."""
+    d = "--x-shared--"
+    dir_lanes, dir_pids = {d: ["L", "SIBLING"]}, {d: ["10", "11"]}
+    cpu0, cpu1 = {"10": 100.0, "11": 5.0}, {"10": 110.0, "11": 5.0}
+    assert L.lane_cpu_progress(d, dir_lanes, dir_pids, cpu0, cpu1) is None
+
+
+def test_no_visible_progress_is_never_reported_as_parked(L):
+    """⛔ THE POLARITY. This answers a VETO, so it may only say True or None. `False` would be read
+    as "the lane is parked" -- an idle claim built on a possibly partial process map."""
+    d = "--x-repo--"
+    dir_lanes, dir_pids = {d: ["L"]}, {d: ["10"]}
+    flat = {"10": 100.0}
+    assert L.lane_cpu_progress(d, dir_lanes, dir_pids, flat, flat) is None
+    assert L.lane_cpu_progress(d, dir_lanes, {d: []}, flat, flat) is None
+    assert L.lane_cpu_progress(None, dir_lanes, dir_pids, flat, flat) is None
+
+
+def test_an_idle_verdict_cannot_be_reached_past_unattributed_progress(L):
+    """⛔ `IDLE` IS REACHABLE ONLY THROUGH STEP 2 (#1867). Same inputs that produce `DONE-IDLE`
+    (quiet transcript, no spinner, a completed turn) produce a NON-idle verdict once progress in
+    the lane's own directory is known -- whatever the binding resolved to and whatever the mtime
+    says. The control assertion below is the pre-change behaviour, so this test fails on it."""
+    kw = dict(stale=48000, grew=False, spinner=False, last_kind="assistant", child=None,
+              child_stale=None, child_grew=None, child_activity_age=None, tool_inflight=None,
+              last_stop="stop", has_sid=True)
+    assert L.classify(**kw) == L.DONE_IDLE, "control: the pre-change verdict for these inputs"
+    assert L.classify(cpu_any=True, **kw) == L.UNATTRIBUTED_WORKING
+    # ...and the label is not an action label: no consumer may dispatch or unblock on it.
+    assert L.UNATTRIBUTED_WORKING not in L.ACTION_VERDICTS
+    assert L.UNATTRIBUTED_WORKING not in L.INBOUND_DISCOUNTS
+
+
+# ── a stale BINDING is not a confirmed one (#1867) ────────────────────────────────────────────
+# The pane's resume record is authoritative about what the pane was LAUNCHED with, not about what
+# is being written now: a hand relaunch (`pi --session <id>`) leaves cmux carrying the old id. When
+# another session file in the same directory is being written in the same minute, the bound id is
+# demonstrably not the live one, and `verified=True` would let a 13h-old transcript be published as
+# `DONE-IDLE` -- an instruction to dispatch into a working lane.
+
+def test_a_stale_binding_with_a_freshly_written_sibling_is_unverified(L, monkeypatch, tmp_path):
+    import time as _time
+    old = tmp_path / "22222222-2222-2222-2222-222222222222.jsonl"
+    old.write_text("{}\n")
+    os.utime(str(old), (_time.time() - 48840, _time.time() - 48840))     # 13h34m quiet
+    fresh = tmp_path / "33333333-3333-3333-3333-333333333333.jsonl"
+    fresh.write_text("{}\n")                                            # written THIS minute
+    monkeypatch.setattr(L, "sh", lambda *a, **k:
+                        "cd -- '/x' ; exec pi --session' '22222222-2222-2222-2222-222222222222'")
+    monkeypatch.setattr(L, "_recorded_session", lambda ws: None)
+    monkeypatch.setattr(L, "session_file", lambda sid: str(old))
+    monkeypatch.setattr(L, "registry", lambda: [])          # no cmux read in this unit
+    monkeypatch.setattr(L, "_content_session", lambda label, cf: None)   # the label match missed
+    sid, verified = L.resolve_session_ex("WS")
+    assert sid == "22222222-2222-2222-2222-222222222222"
+    assert verified is False, (
+        "a bound session quiet for 13h while a sibling file is written now is a STALE BINDING -- "
+        "reporting it verified is what published a working lane as free capacity")
+
+
+def test_a_stale_binding_with_no_live_writer_stays_verified(L, monkeypatch, tmp_path):
+    """The bound above must not become a blanket abstention: a lane genuinely at rest has a quiet
+    session and NO fresh writer in its directory, and its idleness is real."""
+    import time as _time
+    old = tmp_path / "44444444-4444-4444-4444-444444444444.jsonl"
+    old.write_text("{}\n")
+    os.utime(str(old), (_time.time() - 4000, _time.time() - 4000))
+    other = tmp_path / "55555555-5555-5555-5555-555555555555.jsonl"
+    other.write_text("{}\n")
+    os.utime(str(other), (_time.time() - 9000, _time.time() - 9000))    # OLDER than the bound one
+    monkeypatch.setattr(L, "sh", lambda *a, **k:
+                        "cd -- '/x' ; exec pi --session' '44444444-4444-4444-4444-444444444444'")
+    monkeypatch.setattr(L, "_recorded_session", lambda ws: None)
+    monkeypatch.setattr(L, "session_file", lambda sid: str(old))
+    monkeypatch.setattr(L, "registry", lambda: [])
+    monkeypatch.setattr(L, "_content_session", lambda label, cf: None)
+    sid, verified = L.resolve_session_ex("WS")
+    assert sid == "44444444-4444-4444-4444-444444444444" and verified is True

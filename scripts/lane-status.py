@@ -146,6 +146,18 @@ INBOUND_DISCOUNTS = (DONE_IDLE, WIP_IDLE)
 # lane was in fact simply free. A suppression target must name the evidence that produced it.
 WAITING_INBOUND = "RECENT-INBOUND"
 
+# ⛔ PROVEN PROGRESS WITH NO EXACT ATTRIBUTION (#1867). `lane_cpu_busy()` only answers when
+# EXACTLY one lane maps to EXACTLY one pid, so a lane that also has a `task` CHILD pi running in the
+# same directory -- two pids, one lane -- got `None` from Step 2. `None` is not "parked": it is
+# "unread", and every consumer then fell through the rest of the tree to the transcript mtime. That
+# is how a lane measured at `+4.93s of CPU over 25s` was published as `DONE-READY, no session write
+# for 13h34m` and prescribed a dispatch -- into a lane at 85% context, mid-turn.
+# This verdict says exactly what is known and nothing more: SOMETHING in this lane's own directory
+# advanced CPU, so the lane is not free capacity -- and which pid it was cannot be said from here.
+# It is deliberately NOT `WORKING`: WORKING would short-circuit a real WEDGED/CHILD-STUCK verdict
+# for a child that is spinning under a wedged parent. This label only vetoes the IDLE family.
+UNATTRIBUTED_WORKING = "UNATTRIBUTED-WORKING"
+
 
 def inbound_discounts_idle(verdict, inbound_age, stale_s=None):
     """Does a recent INBOUND event discount this verdict -- i.e. "do not call this idle"?
@@ -420,6 +432,39 @@ def lane_cpu_busy(label, session_file, dir_lanes, dir_pids, cpu0, cpu1):
     # A sub-0.1s twitch has the same signature from a parked child, a redraw and a timer wake,
     # so state the tolerance rather than letting the number mean nothing.
     return delta > 0.10
+
+
+def lane_cpu_progress(dir_key, dir_lanes, dir_pids, cpu0, cpu1):
+    """True when a pi in THIS lane's directory advanced CPU; None when that cannot be said.
+
+    ⛔ THE GAP `lane_cpu_busy()` LEAVES ON PURPOSE (#1867, measured 2026-10-16). Its exactly-one-pid
+    rule is right: a `task` CHILD is a second pi with the SAME cwd, so a lane waiting on a child
+    returned `None` from Step 2 -- the strongest signal silently skipped exactly on the lanes the
+    classifier most needs it for. MEASURED that tick: `cmux cloud` read `DONE-READY -- no session
+    write for 13h34m` and the beat prescribed `hand each the next unheld item`, while `ps -o time`
+    on its own pi moved `838:22.16 -> 838:27.09` in 25s. The record was stale; the process was not.
+
+    SO: this answers a NARROWER question than `lane_cpu_busy()` -- "did a pi in this lane's own
+    directory consume CPU in the window" -- and it can only ever return True or None, never False.
+    - The directory must belong to EXACTLY ONE lane. With two lanes sharing a cwd a sibling's work
+      is indistinguishable, so it abstains (the same reason `lane_cpu_busy` does).
+    - Every pid it looks at is in the lane's OWN cwd, so the work counted is this lane's or its
+      child's -- never another lane's.
+    - It never returns False: "no pid I could see moved" is not "the lane is parked" when the
+      process map may be partial, and a False here would be read as an idle claim.
+
+    A caller must treat this as a VETO on the idle family, not as `WORKING` -- see
+    `classify()`'s `cpu_any`.
+    """
+    if not dir_key or not cpu0 or not cpu1:
+        return None
+    if len(dir_lanes.get(dir_key, [])) != 1:
+        return None                     # a sibling lane shares this cwd -> unattributable
+    pids = dir_pids.get(dir_key) or []
+    seen = [p for p in pids if p in cpu0 and p in cpu1]
+    if not seen:
+        return None                     # no comparable pid -> unread, never "parked"
+    return True if any(cpu1[p] - cpu0[p] > 0.10 for p in seen) else None
 
 
 def lane_child_prefixes():
@@ -812,6 +857,20 @@ def resolve_session_ex(ws):
         alt = _content_session(label, cf)
         if alt:
             return os.path.basename(alt)[:-len(".jsonl")].split("_")[-1], True
+        # ⛔ THE CASE THE LABEL MATCH DOES NOT COVER (#1867, measured 2026-10-16). `_content_session`
+        # only accepts a newer file whose FIRST USER MESSAGE names the lane -- and a lane relaunched
+        # by hand (`pi --session <id>` typed into the pane, the documented recovery path) has a live
+        # file whose first message says nothing about the lane's title. MEASURED: `cmux cloud` was
+        # bound to a session 13h34m quiet while ANOTHER session file in the same directory was
+        # written in the very minute of the read; the pane record was stale, the transcript was not.
+        # With no fresh write to corroborate the bound id, `verified=True` (returned below, because
+        # `had_pane` was true) is a claim the read cannot support -- and the verdict built on it was
+        # `DONE-READY`, i.e. an instruction to dispatch into a working lane.
+        #
+        # The polarity is the fleet's: an unexplained fresh writer in this lane's directory means the
+        # binding is NOT confirmed, so ABSTAIN. Never `idle` from it, never `dead` from it.
+        if _live_sibling_session(cf):
+            return chosen, False
     if had_pane or not expect_live:
         # ⛔ A QUIET SESSION IS NOT AN UNCONFIRMED ONE. The PANE is authoritative about which
         # session it is running, and a lane waiting on a long child writes NOTHING for as long as
@@ -824,6 +883,38 @@ def resolve_session_ex(ws):
     # something corroborates it -- a write recent enough to be the live session. This is the path
     # that bound two lanes to sessions last written 64h18m and 12h30m earlier.
     return chosen, bool(cf) and (time.time() - os.path.getmtime(cf)) <= SESSION_VERIFY_S
+
+
+def _live_sibling_session(bound_file):
+    """A newer session file in the same lane directory that is being written RIGHT NOW.
+
+    Nothing more is claimed. It is a statement about the DIRECTORY, not about a lane: the sessions
+    dir is a mangling of the cwd, so a fresh sibling may belong to another lane that shares this
+    cwd. That ambiguity is exactly why this feeds an ABSTENTION (`verified=False`) instead of a
+    repair -- resolving it to an id would be a guess, and a guess here is a dispatch.
+
+    The window is `SESSION_VERIFY_S`, the file's own already-stated bound for "recent enough to be
+    the live session". A lane inside a long tool call writes nothing to its OWN file for minutes,
+    which is why the bound is generous rather than tight (see the pane-authority note in
+    `resolve_session_ex`); the failure direction of being generous is a report-only lane, never a
+    dispatch and never a relaunch.
+    """
+    d = os.path.dirname(bound_file or "")
+    if not (d and os.path.isdir(d)):
+        return None
+    try:
+        base = os.path.getmtime(bound_file)
+    except OSError:
+        return None
+    now = time.time()
+    for f in glob.glob(os.path.join(d, "*.jsonl")):
+        try:
+            mt = os.path.getmtime(f)
+        except OSError:
+            continue
+        if mt > base and (now - mt) <= SESSION_VERIFY_S:
+            return f
+    return None
 
 
 def _first_user_message(path):
@@ -1418,7 +1509,7 @@ def _idle_verdict(spinner):
 
 def classify(stale, grew, spinner, last_kind, child, child_stale, child_grew,
              child_activity_age, tool_inflight, last_stop=None, has_sid=False,
-             cpu_busy=None):
+             cpu_busy=None, cpu_any=None):
     # ── STEP 2 FIRST -- the doc's STRONGEST signal, and the only non-file, non-screen one ──
     # Ordered ahead of every proxy below because it is the one that cannot be fooled by a lane
     # executing a long tool call: such a lane writes nothing to its session (so `stale` climbs and
@@ -1428,6 +1519,15 @@ def classify(stale, grew, spinner, last_kind, child, child_stale, child_grew,
     # so a False here changes nothing and only a PROVEN True short-circuits.
     if cpu_busy:
         return WORKING
+    # ⛔ STEP 2 SAW PROGRESS BUT COULD NOT NAME THE PID (#1867). This is the multi-pid case a `task`
+    # child creates (see `lane_cpu_progress`). It is checked HERE, with Step 2, because it is the
+    # same evidence at lower resolution -- and it must be checked BEFORE every proxy below, since
+    # each of them (quiet transcript, stale screen, no child record) reads "nothing is happening"
+    # for a lane that is demonstrably consuming CPU. Returning a NON-idle verdict is the whole
+    # point: `DONE-IDLE` is an instruction to dispatch, and `UNATTRIBUTED-WORKING` is neither
+    # dispatchable nor an action.
+    if cpu_any:
+        return UNATTRIBUTED_WORKING
     if last_kind is None:
         # No session binding (or no records) -- which is NOT the same as the
         # pane having no session. Reported as unattributable, not as absent.
@@ -1829,9 +1929,15 @@ def main():
         ti = in_flight_tool(f)
 
         _cpu = lane_cpu_busy(label, s["file"], _dir_lanes, _dir_pids, cpu0, cpu1)
+        # Same window, same maps: when the strict read cannot name the pid, ask the weaker question
+        # rather than dropping Step 2 entirely (#1867).
+        _cpu_any = None
+        if _cpu is None and f:
+            _cpu_any = lane_cpu_progress(os.path.basename(os.path.dirname(f)),
+                                         _dir_lanes, _dir_pids, cpu0, cpu1)
         verdict = classify(stale, grew, spinner, last_kind, child, child_stale,
                            child_grew, child_act, ti, last_stop=last_stop,
-                           has_sid=bool(s["sid"]), cpu_busy=_cpu)
+                           has_sid=bool(s["sid"]), cpu_busy=_cpu, cpu_any=_cpu_any)
         # ── children the lane launched OUTSIDE its own root ──────────────────
         # Nothing inside the root moves while they work, so the lane reads
         # DONE_IDLE -- and DONE-IDLE tells the reader to dispatch it, which
@@ -1914,6 +2020,10 @@ def main():
                 cur_size = s["size"]
         out.append(dict(lane=label, verdict=verdict, stale_s=stale, grew=grew,
                        inbound_age=inbound_age, inbound_readable=inbound_readable, cpu=_cpu,
+                       # `cpu_any` is carried so a CONSUMER can apply the same veto on a snapshot it
+                       # did not build (lane-actions replaces Step-5 verdicts with its words layer,
+                       # so the producer's verdict alone is not the last word).
+                       cpu_any=_cpu_any,
                        inbound_msg=inbound_msg,
                        # ── THE TWO READ-QUALITY FLAGS, ON EVERY ROW ──────────────────────
                        # Neither is a verdict. `degraded` says the FLEET ROSTER could not be
@@ -1952,7 +2062,8 @@ def main():
 
     order = {CHILD_STUCK: 0, WAITING_OVERDUE: 1, WEDGED: 2, EMPTY: 3, UNBOUND: 3,
              WIP_IDLE: 4,
-             LONG_TOOL: 5, WAITING: 6, DONE_IDLE: 7, WORKING: 8, UNKNOWN: 9}
+             LONG_TOOL: 5, WAITING: 6, DONE_IDLE: 7, UNATTRIBUTED_WORKING: 7, WORKING: 8,
+             UNKNOWN: 9}
     out.sort(key=lambda r: order.get(r["verdict"], 9))
     print(f"{'LANE':<26} {'VERDICT':<14} {'SELF':>7} {'UI':<8} {'INBOUND':>10}  CHILD / LAST")
     print("-" * 106)
