@@ -75,6 +75,12 @@ ai_init_repo() {
   git -C "$1" commit -q --allow-empty -m base
 }
 ai_worktree() { git -C "$AI" worktree add -q --detach "$1" origin/main; }
+# A real, RESOLVING commit prefix — `pinsha <repo> <hex-len> [ref]`. A test that hand-builds a pin
+# root MUST name its pins after REAL commits: `pin_entry_owned` (the delete authority) requires the
+# name to resolve in $HARNESS_REPO, because `apply` names a pin after a commit. An invented name — the
+# old fixture's `000000000000` — is exactly the class the content test exists to REFUSE, so a fixture
+# using one would be testing the bug it is meant to catch.
+pinsha() { git -C "$1" rev-parse --short="${2:-12}" "${3:-HEAD}"; }
 make_ai_repo() {
   local w
   git init -q --bare "$AI_ORIGIN"
@@ -1144,18 +1150,19 @@ case "$(cat "$P/home/.harness-path" 2>/dev/null)" in
   "$P/pin"/*/scripts/orchestrator-harness) ok "the pin lives at HARNESS_PIN_DIR/<commit> (create-new, not replace-in-place)" ;;
   *) bad "the pin is not per-commit: $(cat "$P/home/.harness-path" 2>/dev/null)" ;;
 esac
-mkdir -p "$R/pin/000000000000/scripts/orchestrator-harness" "$R/pin/111111111111/scripts/orchestrator-harness"
-printf '%s\n' "$R/pin/111111111111/scripts/orchestrator-harness" > "$R/home/.harness-path"
+RP_A="$(pinsha "$R/repo" 12)"; RP_B="$(pinsha "$R/repo" 8)"
+mkdir -p "$R/pin/$RP_A/scripts/orchestrator-harness" "$R/pin/$RP_B/scripts/orchestrator-harness"
+printf '%s\n' "$R/pin/$RP_B/scripts/orchestrator-harness" > "$R/home/.harness-path"
 prunesup
-[ ! -e "$R/pin/000000000000" ] && ok "prune reclaims a SUPERSEDED harness pin (per-commit pinning would otherwise leak disk)" \
-                              || bad "prune kept a superseded harness pin — the new pin scheme leaks disk"
-[ -d "$R/pin/111111111111" ] && ok "prune KEEPS the ACTIVE harness pin" \
-                             || bad "prune deleted the ACTIVE pin — the cell no longer has its harness"
+[ ! -e "$R/pin/$RP_A" ] && ok "prune reclaims a SUPERSEDED harness pin (per-commit pinning would otherwise leak disk)" \
+                        || bad "prune kept a superseded harness pin — the new pin scheme leaks disk"
+[ -d "$R/pin/$RP_B" ] && ok "prune KEEPS the ACTIVE harness pin" \
+                      || bad "prune deleted the ACTIVE pin — the cell no longer has its harness"
 # An empty pin file means "which pin is live" is NOT KNOWN: an unknown is an abstention, not a licence.
 : > "$R/home/.harness-path"
 prunesup
-[ -d "$R/pin/111111111111" ] && ok "an UNKNOWN active pin is an abstention — no pin is deleted" \
-                             || bad "prune deleted a pin while it could not tell which one is active"
+[ -d "$R/pin/$RP_B" ] && ok "an UNKNOWN active pin is an abstention — no pin is deleted" \
+                      || bad "prune deleted a pin while it could not tell which one is active"
 
 # ⛔ A linked worktree under $SCRATCH_ROOT has a `.git` FILE, not a directory, and is checked-out source
 # that may hold unmerged work — never scratch, even when $REPO/$HARNESS_REPO do not register it.
@@ -1176,9 +1183,10 @@ say_case "prune's rm -rf and the HARNESS resolution: the review-found fail-opens
 # $HARNESS_PIN_DIR with NO validation at all, while `harness_apply` guarded the same shape of delete
 # with `assert_pin_dir_safe`. `HARNESS_PIN_DIR=$CELL_HOME` therefore deleted the cell home's own
 # state directory before the guard in `apply` could ever fire.
-U="$T/unsafe"; mkdir -p "$U/home/orchestrator/state" "$U/pin/111111111111/scripts/orchestrator-harness"
+U="$T/unsafe"; UP="$(pinsha "$AI" 12)"
+mkdir -p "$U/home/orchestrator/state" "$U/pin/$UP/scripts/orchestrator-harness"
 printf 'SECRET\n' > "$U/home/keys.env"
-printf '%s\n' "$U/pin/111111111111/scripts/orchestrator-harness" > "$U/home/.harness-path"
+printf '%s\n' "$U/pin/$UP/scripts/orchestrator-harness" > "$U/home/.harness-path"
 U_OUT=''; U_RC=0
 unsafe_prune() { # $1 = HARNESS_PIN_DIR
   U_OUT="$(CELL_HOME="$U/home" ENV_FILE="$U/home/keys.env" SESSION="ai1745-unprune-$$" \
@@ -1302,20 +1310,21 @@ SL_OUT="$(CELL_HOME="$R/home" ENV_FILE="$R/keys.env" SESSION="ai1745-sl-$$" O="$
 # and its admin dir behind — one per pin, forever, on the verb that exists to stop a disk leak.
 say_case "prune DEREGISTERS a superseded pin (no phantom worktree records) (#1745)"
 D="$T/deregpins"; mkdir -p "$D/home" "$D/pin"
-git -C "$AI" worktree add -q --detach "$D/pin/000000000000" origin/main
-git -C "$AI" worktree add -q --detach "$D/pin/111111111111" origin/main
-printf '%s\n' "$D/pin/111111111111/scripts/orchestrator-harness" > "$D/home/.harness-path"
+DP_A="$(pinsha "$AI" 12)"; DP_B="$(pinsha "$AI" 8)"
+git -C "$AI" worktree add -q --detach "$D/pin/$DP_A" origin/main
+git -C "$AI" worktree add -q --detach "$D/pin/$DP_B" origin/main
+printf '%s\n' "$D/pin/$DP_B/scripts/orchestrator-harness" > "$D/home/.harness-path"
 BC="$(git -C "$AI" worktree list --porcelain | grep -c '^worktree ')"
 CELL_HOME="$D/home" ENV_FILE="$D/keys.env" SESSION="ai1745-dereg-$$" O="$D/o" REPO="$D/repo" \
-  HARNESS_REPO="$AI" HARNESS_FETCH=0 HARNESS="$D/pin/111111111111/scripts/orchestrator-harness" \
+  HARNESS_REPO="$AI" HARNESS_FETCH=0 HARNESS="$D/pin/$DP_B/scripts/orchestrator-harness" \
   HARNESS_PIN_DIR="$D/pin" HARNESS_PIN_FILE="$D/home/.harness-path" bash "$SUP" prune --caches >/dev/null 2>&1
 AC="$(git -C "$AI" worktree list --porcelain | grep -c '^worktree ')"
-[ ! -e "$D/pin/000000000000" ] && ok "prune reclaimed the superseded pin's directory" \
-                                  || bad "prune kept the superseded pin on disk"
+[ ! -e "$D/pin/$DP_A" ] && ok "prune reclaimed the superseded pin's directory" \
+                          || bad "prune kept the superseded pin on disk"
 [ "$AC" = "$((BC - 1))" ] && ok "prune DEREGISTERED the reclaimed pin (no phantom worktree record, no admin-dir leak)" \
                             || bad "prune left a phantom worktree record: registrations $BC -> $AC (expected $((BC - 1)))"
-[ -d "$D/pin/111111111111" ] && ok "prune kept the ACTIVE pin on disk" \
-                              || bad "prune deleted the ACTIVE pin"
+[ -d "$D/pin/$DP_B" ] && ok "prune kept the ACTIVE pin on disk" \
+                      || bad "prune deleted the ACTIVE pin"
 
 # (i) A `case` allow-list of digits cannot see that `00`/`000` evaluate to zero (or that `010` is OCTAL
 # 8 in arithmetic): the floor this line exists to make un-disarmable was still bypassable by spelling.
@@ -1366,18 +1375,19 @@ esac
 # reclaimed the tree the cell was running from.
 say_case "prune never reclaims the IN-USE harness when the record disagrees (#1745)"
 K="$T/pinmismatch"; mkdir -p "$K/home" "$K/pin"
-git -C "$AI" worktree add -q --detach "$K/pin/aaaaaaaaaaaa" origin/main   # the RECORDED pin
-for n in bbbbbbbbbbbb cccccccccccc; do git -C "$AI" worktree add -q --detach "$K/pin/$n" origin/main; done
-printf '%s\n' "$K/pin/aaaaaaaaaaaa/scripts/orchestrator-harness" > "$K/home/.harness-path"
+KP_A="$(pinsha "$AI" 12)"; KP_B="$(pinsha "$AI" 8)"; KP_C="$(pinsha "$AI" 7)"
+git -C "$AI" worktree add -q --detach "$K/pin/$KP_A" origin/main   # the RECORDED pin
+for n in "$KP_B" "$KP_C"; do git -C "$AI" worktree add -q --detach "$K/pin/$n" origin/main; done
+printf '%s\n' "$K/pin/$KP_A/scripts/orchestrator-harness" > "$K/home/.harness-path"
 CELL_HOME="$K/home" ENV_FILE="$K/keys.env" SESSION="ai1745-k-$$" O="$K/o" REPO="$K/repo" \
-  HARNESS_REPO="$AI" HARNESS_FETCH=0 HARNESS="$K/pin/bbbbbbbbbbbb/scripts/orchestrator-harness" \
+  HARNESS_REPO="$AI" HARNESS_FETCH=0 HARNESS="$K/pin/$KP_B/scripts/orchestrator-harness" \
   HARNESS_PIN_DIR="$K/pin" HARNESS_PIN_FILE="$K/home/.harness-path" bash "$SUP" prune --caches >/dev/null 2>&1
-[ -d "$K/pin/bbbbbbbbbbbb" ] && ok "prune SPARED the harness actually IN USE (\$HARNESS) while the record named another pin" \
-                             || bad "prune DELETED the in-use harness because the record named a different pin — SILENT DESTRUCTION"
-[ -d "$K/pin/aaaaaaaaaaaa" ] && ok "prune kept the pin the RECORD names" \
-                              || bad "prune reclaimed the pin the record names as active"
-[ ! -e "$K/pin/cccccccccccc" ] && ok "prune still reclaimed a genuinely superseded pin (the guard is not a blanket refusal)" \
-                                || bad "prune kept a genuinely superseded pin — the reclaim arm is now vacuous"
+[ -d "$K/pin/$KP_B" ] && ok "prune SPARED the harness actually IN USE (\$HARNESS) while the record named another pin" \
+                      || bad "prune DELETED the in-use harness because the record named a different pin — SILENT DESTRUCTION"
+[ -d "$K/pin/$KP_A" ] && ok "prune kept the pin the RECORD names" \
+                      || bad "prune reclaimed the pin the record names as active"
+[ ! -e "$K/pin/$KP_C" ] && ok "prune still reclaimed a genuinely superseded pin (the guard is not a blanket refusal)" \
+                        || bad "prune kept a genuinely superseded pin — the reclaim arm is now vacuous"
 # ⚠️ Review round 4: repo-authority.sh is SOURCED by orch-loop.sh and merge-one.sh from $O
 # (repo-authority.sh's own per-repo merge contract), so a cell whose $O lacks it dies `exit 78`
 # on the FIRST cycle — but `check` used to certify it as "CELL CAN RUN A CONTROLLER". The file is
@@ -1441,10 +1451,11 @@ stub_missing "$Q/bin" pi
 # the pin state under test.
 QREF="$(git -C "$Q/harness" rev-parse HEAD)"
 QQ_OUT=''; QQ_RC=0
-qcheck() {
+qcheck() { qcheck_pin "$Q/pin"; }
+qcheck_pin() { # $1 = HARNESS_PIN_DIR
   QQ_OUT="$(PATH="$Q/bin:$PATH" CELL_HOME="$Q/home" ENV_FILE="$Q/keys.env" SESSION="ai1852-$$" \
             O="$Q/o" REPO="$Q/repo" HARNESS="$QH" HARNESS_REPO="$AI" HARNESS_FETCH=0 HARNESS_REF="$QREF" \
-            HARNESS_PIN_DIR="$Q/pin" HARNESS_PIN_FILE="$Q/home/.harness-path" bash "$SUP" check 2>&1)"
+            HARNESS_PIN_DIR="$1" HARNESS_PIN_FILE="$Q/home/.harness-path" bash "$SUP" check 2>&1)"
   QQ_RC=$?
 }
 
@@ -1475,6 +1486,14 @@ if [ "$PU_RC" != 99 ]; then
   for n in 8ffc2b aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa notes aa_bbbb aa-bbbb ''; do
     pinunit "$n" && bad "pin_name_ok ACCEPTED '$n' — an operator's non-pin entry would be blessed" \
                  || ok "pin_name_ok REFUSES '$n'"
+  done
+  # An all-digit name IS hex (so the SPELLING test accepts it) and is NOT a commit (so the DELETE
+  # authority, `pin_entry_owned`, refuses it). Pinning the accept HERE keeps the two questions from
+  # being conflated — and a mutation that narrows `pin_name_ok` to reject digits would re-brick a cell
+  # whose pin abbreviation happened to be all-digit, which this arm catches.
+  for n in 20260116 1718000000; do
+    pinunit "$n" && ok "pin_name_ok ACCEPTS '$n' (hex — the DELETE side, not this test, refuses it)" \
+                 || bad "pin_name_ok refused '$n' — the spelling test must not be the delete authority"
   done
 else
   bad "pin_name_ok boundary arms SKIPPED — the predicate is absent"
@@ -1513,6 +1532,143 @@ case "$QQ_OUT" in
   *"CELL CAN RUN A CONTROLLER"*) ok "check: reaches the CELL CAN RUN banner with an 8-hex pin" ;;
   *) bad "check: no CELL CAN RUN banner with an 8-hex pin — $QQ_OUT" ;;
 esac
+
+# (i-d) ⛔ THE DELETE AUTHORITY IS A CONTENT TEST, NOT A SPELLING ONE (agent-infra#1852, the defect the
+# owner introduced by widening the name pattern). `20260116` (a date) and `1718000000` (an epoch) are
+# valid hex, so `pin_name_ok` accepts them and `assert_pin_dir_safe` blessed the root — and `cmd_prune`,
+# run UNATTENDED from `cmd_start`, `rm -rf`'d every non-active subdirectory. `pin_entry_owned` requires
+# the name to resolve to a commit in $HARNESS_REPO. ⛔ Mutation caught: reverting the content test to
+# the name test reddens the two ALL-DIGIT arms (the operator's date-named dir would be reclaimed).
+say_case "prune reclaims a real superseded pin but NEVER an all-digit name that is not a commit (#1852)"
+PD="$T/pindel"; PD_LIVE="$(pinsha "$AI" 8)"; PD_DEAD="$(pinsha "$AI" 12)"
+mkdir -p "$PD/home" "$PD/pin"
+for n in "$PD_LIVE" "$PD_DEAD" 20260116 1718000000; do
+  mkdir -p "$PD/pin/$n/scripts/orchestrator-harness"
+  printf 'x\n' > "$PD/pin/$n/marker"
+done
+printf '%s\n' "$PD/pin/$PD_LIVE/scripts/orchestrator-harness" > "$PD/home/.harness-path"
+PD_OUT="$(CELL_HOME="$PD/home" ENV_FILE="$PD/keys.env" SESSION="ai1852-pd-$$" O="$PD/o" REPO="$PD/repo" \
+          HARNESS_REPO="$AI" HARNESS_FETCH=0 HARNESS="$PD/pin/$PD_LIVE/scripts/orchestrator-harness" \
+          HARNESS_PIN_DIR="$PD/pin" HARNESS_PIN_FILE="$PD/home/.harness-path" bash "$SUP" prune --caches 2>&1)"
+[ -d "$PD/pin/$PD_LIVE" ] && ok "prune kept the ACTIVE pin" || bad "prune deleted the ACTIVE pin — $PD_OUT"
+[ ! -e "$PD/pin/$PD_DEAD" ] && ok "prune RECLAIMED a superseded pin whose name resolves to a real commit (the reclaim arm is non-vacuous)" \
+                            || bad "prune kept a genuinely superseded real-commit pin — the content test over-refuses"
+[ -d "$PD/pin/20260116" ] && ok "prune did NOT reclaim '20260116' — hex-shaped but not a commit (the ALL-DIGIT delete is closed)" \
+                          || bad "prune rm -rf'd an operator's date-named directory — the SPELLING test is still the delete authority"
+[ -d "$PD/pin/1718000000" ] && ok "prune did NOT reclaim '1718000000' — an epoch is not a commit either" \
+                           || bad "prune rm -rf'd an all-digit epoch-named directory"
+
+# (i-e) ⛔ CANNOT-VERIFY IS NOT A PASS (check side). `ls -A`'s failure was swallowed by `2>/dev/null`,
+# so an unreadable pin root read as EMPTY (safe) and `check` certified the cell. ⛔ Mutation caught:
+# restoring the swallow makes this arm certify an unreadable root. `chmod 000` denies READDIR (so the
+# read fails) while `-d`/`-e` still answer, which is the exact shape.
+say_case "check REFUSES an UNREADABLE pin root instead of reading it as empty (#1852)"
+chmod 000 "$Q/pin"
+qcheck
+[ "$QQ_RC" -ne 0 ] && ok "check REFUSED an unreadable pin root (EACCES is not 'empty')" \
+                   || bad "check CERTIFIED an unreadable pin root — cannot-verify read as empty: $QQ_OUT"
+case "$QQ_OUT" in
+  *"cannot be READ"*) ok "check names the cannot-verify state (a READ failure), not a missing pin" ;;
+  *) bad "check's refusal does not name the unreadable state — $QQ_OUT" ;;
+esac
+chmod 755 "$Q/pin"
+qcheck
+[ "$QQ_RC" -eq 0 ] && ok "check passes again once the pin root is readable (the refusal is not sticky)" \
+                   || bad "check still refuses a readable pin root (rc=$QQ_RC) — $QQ_OUT"
+
+# (i-f) ⛔ The SAME cannot-verify shape on the DELETE side. The failure is surfaced as 2 instead of
+# being read as "empty", so prune REFUSES. ⛔ Mutation caught: restoring `2>/dev/null` makes prune
+# exit 0 (the two refusal arms redden). Note the deletion arm below holds in BOTH states — a failed
+# `ls` and a failed glob report the same nothing — so it is a safety assertion, not the discriminator;
+# the discriminator is the refusal. (The swallowing is genuinely destructive when `ls` itself is
+# absent or errors: the glob then still expands and the sweep proceeds with no read at all.)
+say_case "prune REFUSES an unreadable pin root — the delete side never reclaims blind (#1852)"
+IU="$T/unreadprune"; IUN="$(pinsha "$AI" 12)"
+mkdir -p "$IU/home" "$IU/pin/$IUN/scripts/orchestrator-harness"
+printf 'x\n' > "$IU/pin/$IUN/marker"
+printf '%s\n' "$IU/otherpin/scripts/orchestrator-harness" > "$IU/home/.harness-path"
+chmod 300 "$IU/pin"
+IU_OUT="$(CELL_HOME="$IU/home" ENV_FILE="$IU/keys.env" SESSION="ai1852-iu-$$" O="$IU/o" REPO="$IU/repo" \
+          HARNESS_REPO="$AI" HARNESS_FETCH=0 HARNESS="$IU/not-a-repo" \
+          HARNESS_PIN_DIR="$IU/pin" HARNESS_PIN_FILE="$IU/home/.harness-path" bash "$SUP" prune --caches 2>&1)"; IU_RC=$?
+[ "$IU_RC" -ne 0 ] && ok "prune REFUSED an unreadable pin root (delete side fails closed)" \
+                   || bad "prune accepted an unreadable pin root — $IU_OUT"
+case "$IU_OUT" in
+  *"cannot be READ"*) ok "prune names the cannot-verify state on the delete side" ;;
+  *) bad "prune's refusal does not name the unreadable state — $IU_OUT" ;;
+esac
+chmod 755 "$IU/pin"
+[ -d "$IU/pin/$IUN" ] && ok "nothing was deleted from a root prune could not read (the refusal preceded every rm -rf)" \
+                      || bad "prune DELETED from a root it could not read — SILENT DESTRUCTION"
+
+# (i-g) `cmd_check_pin_dir` asked a WEAKER question than `assert_pin_dir_safe` in two more branches:
+# (1) no containment deny-list, so `HARNESS_PIN_DIR=$CELL_HOME` holding only hex dirs was certified by
+# `check` while apply/start/prune died "it CONTAINS … which this cell needs"; (2) a `"$dir"/*` glob
+# skipped HIDDEN entries, so a root whose only entry was `.DS_Store` read as empty-and-safe on the
+# check side while the delete side refused the same root. The shared predicate answers both.
+# ⛔ Mutation caught: either branch reverts to a false pass and reddens its arm.
+say_case "check refuses a pin root that CONTAINS the cell home, or whose only entries are hidden (#1852)"
+qcheck_pin "$Q/home"
+[ "$QQ_RC" -ne 0 ] && ok "check REFUSES a HARNESS_PIN_DIR that CONTAINS the cell home" \
+                   || bad "check CERTIFIED a pin root over the cell home — apply/start/prune die here: $QQ_OUT"
+case "$QQ_OUT" in
+  *"CONTAINS"*) ok "check names the containment (same reason apply/start give)" ;;
+  *) bad "check's containment refusal does not say CONTAINS — $QQ_OUT" ;;
+esac
+HC="$T/pinhidden"; mkdir -p "$HC"; printf 'x\n' > "$HC/.DS_Store"
+qcheck_pin "$HC"
+[ "$QQ_RC" -ne 0 ] && ok "check REFUSES a root whose ONLY entry is hidden ('.DS_Store' — a glob would skip it)" \
+                   || bad "check CERTIFIED a hidden-only root — the glob skipped it: $QQ_OUT"
+case "$QQ_OUT" in
+  *".DS_Store"*) ok "check names the hidden entry rather than reading the root as empty" ;;
+  *) bad "check does not name the hidden entry — $QQ_OUT" ;;
+esac
+
+# (i-h) ⛔ THE CONTENT TEST IS THE DELETE SIDE'S ALONE. If the shared CONFORMANCE predicate consulted it,
+# an unresolved `$HARNESS_REPO` would make `check` refuse a legitimate pin root — a false block. So the
+# predicate does NOT consult it (0 = conforms), while the delete authority fails CLOSED (2 = cannot
+# verify). Directions pinned by unit arms on the shipped functions plus an end-to-end prune.
+say_case "an unresolved HARNESS_REPO fails the DELETE authority closed without false-blocking check (#1852)"
+pp_run() { # $1 = HARNESS_REPO value, $2 = function, $3.. = args
+  local repo="$1" fn="$2"; shift 2
+  local -a pargs=("$@")          # ⛔ capture BEFORE `set -- status`: sourcing resets $@
+  (
+    set -- status
+    export CELL_HOME="$T/pp/home" ENV_FILE="$T/pp/none.env" O="$T/pp/o" REPO="$T/pp/repo" \
+           HARNESS_PIN_DIR="$Q/pin" HARNESS_PIN_FILE="$T/pp/hp" HARNESS_REPO="$repo"
+    . "$SUP" >/dev/null 2>&1
+    type -t "$fn" >/dev/null 2>&1 || exit 99
+    "$fn" "${pargs[@]}"
+  )
+}
+pp_run "$AI" pin_root_conformance "$Q/pin"; PPRC=$?
+[ "$PPRC" = 0 ] && ok "conformance does NOT consult the delete authority — '$Q/pin' holds '8ffc2bc3', no commit in \$AI, yet it still conforms" \
+                || bad "pin_root_conformance refused a legitimate pin root because it consulted the content test (rc=$PPRC)"
+# The EMPTY-HARNESS_REPO guard. The script self-derives HARNESS_REPO from its own checkout at load,
+# so an empty ENV var is not enough to reach the branch — clear it after the source, which is the
+# state a box with no checkout anywhere reaches.
+(
+  set -- status
+  export CELL_HOME="$T/pp/home" ENV_FILE="$T/pp/none.env" O="$T/pp/o" REPO="$T/pp/repo" \
+         HARNESS_PIN_DIR="$Q/pin" HARNESS_PIN_FILE="$T/pp/hp" HARNESS_REPO="$AI"
+  . "$SUP" >/dev/null 2>&1
+  HARNESS_REPO=""
+  pin_entry_owned "$(pinsha "$AI" 12)"
+); PPRC=$?
+[ "$PPRC" = 2 ] && ok "the delete authority returns CANNOT VERIFY for an EMPTY \$HARNESS_REPO (prune must not reclaim blind)" \
+                || bad "pin_entry_owned did not fail closed on an empty HARNESS_REPO (rc=$PPRC)"
+pp_run "$T/not-a-repo" pin_entry_owned "$(pinsha "$AI" 12)"; PPRC=$?
+[ "$PPRC" = 2 ] && ok "the delete authority returns CANNOT VERIFY when HARNESS_REPO is not a git checkout" \
+                || bad "pin_entry_owned did not fail closed on a non-repo HARNESS_REPO (rc=$PPRC)"
+PG="$T/pinunres"; PGN="$(pinsha "$AI" 12)"; mkdir -p "$PG/home" "$PG/pin/$PGN/scripts/orchestrator-harness"
+printf 'x\n' > "$PG/pin/$PGN/marker"
+printf '%s\n' "$PG/otherpin/scripts/orchestrator-harness" > "$PG/home/.harness-path"
+PG_OUT="$(CELL_HOME="$PG/home" ENV_FILE="$PG/keys.env" SESSION="ai1852-pg-$$" O="$PG/o" REPO="$PG/repo" \
+          HARNESS_REPO="$T/not-a-repo" HARNESS_FETCH=0 HARNESS="$PG/not-a-repo" \
+          HARNESS_PIN_DIR="$PG/pin" HARNESS_PIN_FILE="$PG/home/.harness-path" bash "$SUP" prune --caches 2>&1)"; PG_RC=$?
+[ "$PG_RC" -eq 0 ] && ok "prune does not crash when it cannot verify a pin name" || bad "prune exited $PG_RC on a non-repo HARNESS_REPO — $PG_OUT"
+[ -d "$PG/pin/$PGN" ] && ok "prune did NOT reclaim a pin it could not verify (delete side fails closed on a non-repo HARNESS_REPO)" \
+                      || bad "prune reclaimed blind against a non-repo HARNESS_REPO — SILENT DESTRUCTION"
 
 echo
 echo "── Summary ───────────────────────────────────────────────────────"

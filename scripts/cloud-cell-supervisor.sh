@@ -505,15 +505,21 @@ linked_worktree_of() {
 # values an operator cannot plausibly set, while `HARNESS_PIN_DIR=$CELL_HOME` (or $HOME, or $O) drove
 # `rm -rf` over the cell home — keys.env, the gate key, the orchestrator state dir. Require a POSITIVE
 # allow instead: never an ancestor of anything this cell needs, and if it exists it must be a linked
-# worktree of $HARNESS_REPO, an empty directory, or a pin ROOT holding only 12-hex-char pin dirs.
-# Is $1 a name `apply` could have produced for a pin directory? `apply` truncates the commit to 12
-# hex (the `cut -c1-12` below), but that is a MOVING CONVENTION, not a property of a commit id: git's
-# own abbreviation length varies with repo size, and a revision of this script that used
-# `git rev-parse --short` produced 8-character names. Measured 2026-10-16: three cells had been seeded
-# by such a revision, and ONE 8-character directory made `apply` AND `start` both refuse ("Remove it
-# by hand") while `check` still certified the cell — zero capacity behind a green verdict. So accept
-# any unambiguous git abbreviation (7..40 hex chars) and leave the INTENT — "only pin directories" —
-# intact: an operator's `notes/` or `backup-2026/` is still refused, because it is not hex.
+# worktree of $HARNESS_REPO, an empty directory, or a pin ROOT holding only hex-named pin dirs.
+#
+# Is $1 a NAME `apply` could have produced for a pin directory? `apply` names each pin by the hex of
+# the commit it pins to (`cut -c1-12` below), but the LENGTH is a MOVING CONVENTION, not a property
+# of a commit id: git's own abbreviation length varies with repo size, and a revision of this script
+# that used `git rev-parse --short` produced 8-character names. Measured 2026-10-16: three cells had
+# been seeded by such a revision, and ONE 8-character directory made `apply` AND `start` both refuse
+# ("Remove it by hand") while `check` still certified the cell — zero capacity behind a green
+# verdict. So accept any unambiguous git abbreviation (7..40 hex chars) and leave the INTENT — "only
+# pin directories" — intact: an operator's `notes/` or `backup-2026/` is still refused, not being hex.
+#
+# ⛔ THIS ANSWERS "COULD apply HAVE NAMED IT", NEVER "MAY I DELETE IT". An all-digit name (`20260116`
+# — a date; `1718000000` — an epoch) is valid hex and satisfies this predicate while being no pin
+# `apply` ever named. Only `pin_entry_owned` (a CONTENT test against $HARNESS_REPO) authorizes the
+# `rm -rf`.
 pin_name_ok() {
   local n="${1:-}"
   case "$n" in
@@ -525,49 +531,94 @@ pin_name_ok() {
   return 0
 }
 
-# The pin-root CONFORMANCE question, split out from the `rm -rf` safety question below so `check` can
-# ask it without borrowing a message about deleting a directory it never deletes.
-cmd_check_pin_dir() {
-  local dir="$HARNESS_PIN_DIR" p bad=""
-  [ -e "$dir" ] || [ -L "$dir" ] || return 0
-  linked_worktree_of "$HARNESS_REPO" "$dir" && return 0
-  [ -d "$dir" ] || die "HARNESS_PIN_DIR='$dir' exists and is not a directory — 'apply' and 'start' will both refuse"
-  [ -z "$(ls -A "$dir" 2>/dev/null)" ] && return 0
-  for p in "$dir"/*; do
-    [ -e "$p" ] || continue
-    if [ ! -d "$p" ] || ! pin_name_ok "$(basename "$p")"; then bad="$(basename "$p")"; break; fi
-  done
-  [ -z "$bad" ] || die "HARNESS_PIN_DIR='$dir' holds '$bad', which is not a pin directory — 'apply' AND 'start' both refuse here, so this cell can neither be updated nor started. Quarantine it (move it aside; do not delete a directory you cannot account for) and re-run: $0 apply   (agent-infra#1852)"
-}
-
-assert_pin_dir_safe() {
-  local dir="$1" p entries ok
-  case "$dir" in ""|"/"|".") die "refusing to use HARNESS_PIN_DIR='$dir' as a worktree path";; esac
+# The pin-root CONFORMANCE question, asked ONCE — the answer `check`, `apply`, `start` and `prune`
+# must all agree on. `check`'s verdict is "this cell can run a controller", and every sibling verb
+# refuses a non-conforming root, so a `check` that skips this question certifies a cell its own verbs
+# reject: the false PASS of agent-infra#1852, measured 2026-10-16 on all three cells.
+# Returns 0 = conforms, 1 = does NOT conform (PIN_ROOT_BAD names why), 2 = CANNOT VERIFY.
+#
+# ⛔ CANNOT VERIFY IS NOT A PASS, on EITHER caller. An unreadable root used to read as an EMPTY (safe)
+# one, because `ls -A`'s failure was swallowed by `2>/dev/null`; here the failure is surfaced as 2 and
+# every caller refuses. The two callers fail closed to different things, and that direction is
+# deliberate: for `check` a refusal IS the verdict (a root that cannot be read is not certified), and
+# for `assert_pin_dir_safe` a refusal is a refusal to `rm -rf` (never reclaim blind).
+# ⛔ The enumeration is `ls -A`, not a `"$dir"/*` glob: a glob skips HIDDEN entries and dangling
+# symlinks, so a root whose only entry was `.DS_Store` read as EMPTY-AND-SAFE on the check side while
+# the delete side refused the same root — the same false pass, one branch over. `ls -A` sees every
+# entry, and each one must be a hex-named directory.
+# ⛔ Deliberately NOT a per-entry `git worktree list` path comparison: on macOS a `$TMPDIR`-derived
+# path carries a `//` that git normalizes in its listing output, so a literal comparison reports our
+# OWN pin as foreign and the guard becomes a false block.
+pin_root_conformance() {
+  local dir="${1:-}" p listing entries=0
+  PIN_ROOT_BAD=""
+  case "$dir" in
+    ""|"/"|".") PIN_ROOT_BAD="is '$dir'"; return 1 ;;
+  esac
+  # A root that CONTAINS anything this cell needs cannot be reclaimed, and every sibling verb refuses
+  # it — so `check` must refuse it too, not certify a cell whose own `apply`/`start`/`prune` die here.
   for p in "$CELL_HOME" "$HOME" "$O" "$REPO" "$HARNESS_REPO" "$(dirname "$ENV_FILE")"; do
     [ -n "$p" ] || continue
-    case "$p" in "$dir"|"$dir"/*) die "refusing HARNESS_PIN_DIR='$dir': it CONTAINS $p, which this cell needs. Point it at a dedicated worktree path (default $CELL_HOME/harness).";; esac
+    case "$p" in "$dir"|"$dir"/*) PIN_ROOT_BAD="CONTAINS $p, which this cell needs"; return 1 ;; esac
   done
-  [ -e "$dir" ] || [ -L "$dir" ] || return 0
-  linked_worktree_of "$HARNESS_REPO" "$dir" && return 0     # the legacy flat pin (one worktree = the root)
-  if [ -d "$dir" ]; then
-    [ -z "$(ls -A "$dir" 2>/dev/null)" ] && return 0
-    # A pin ROOT: `apply` names each pin by the 12 hex chars of its commit, so the root HOLDS
-    # worktrees rather than BEING one. Accept only that shape — a directory whose every entry is a
-    # 12-hex-character directory — so an operator's own directory is still refused. ⛔ Deliberately NOT
-    # "is each entry in `git worktree list`": on macOS a `$TMPDIR`-derived path carries a `//`, which
-    # git normalizes in its listing output, so a literal path comparison reports our OWN pin as foreign
-    # and the guard becomes a false block. The `rm -rf` never touches the root itself.
-    entries=0 ok=1
-    for p in "$dir"/*; do
-      [ -e "$p" ] || continue
-      entries=$((entries + 1))
-      [ -d "$p" ] || { ok=0; break; }
-      pin_name_ok "$(basename "$p")" || ok=0
-      [ "$ok" = 1 ] || break
-    done
-    [ "$ok" = 1 ] && [ "$entries" -gt 0 ] && return 0
-  fi
-  die "refusing to rm -rf HARNESS_PIN_DIR='$dir': it exists and is neither an empty directory, a linked worktree, nor a pin root of ${HARNESS_REPO:-<unresolved>}. Remove it by hand if you are sure it holds nothing."
+  [ -e "$dir" ] || [ -L "$dir" ] || return 0               # nothing there: nothing to refuse
+  linked_worktree_of "$HARNESS_REPO" "$dir" && return 0    # the legacy flat pin (root IS one worktree)
+  [ -d "$dir" ] || { PIN_ROOT_BAD="$dir is not a directory"; return 1; }
+  listing="$(ls -A "$dir" 2>/dev/null)" || return 2         # ⛔ a failed read is NOT an empty read
+  [ -n "$listing" ] || return 0                             # genuinely empty (`ls -A` drops . and ..)
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    entries=$((entries + 1))
+    if [ ! -d "$dir/$p" ] || ! pin_name_ok "$p"; then
+      PIN_ROOT_BAD="holds '$p', which is not a pin directory"
+      return 1
+    fi
+  done <<<"$listing"
+  [ "$entries" -gt 0 ] && return 0
+  return 2    # listed non-empty yet enumerated nothing: cannot verify
+}
+
+# The AUTHORITY TO DELETE one harness pin. `pin_name_ok` is a SPELLING test and cannot tell a pin from
+# an operator's date-named directory: `20260116` and `1718000000` are valid hex. `apply` names a pin
+# after a COMMIT in $HARNESS_REPO, so the only proof an entry is ours is a CONTENT test that its name
+# resolves there. Returns 0 = provably ours, 1 = provably not, 2 = CANNOT VERIFY.
+# ⛔ Fail-closed direction, stated and tested: `cmd_prune` — called UNATTENDED by `cmd_start` — must
+# treat BOTH 1 and 2 as "do not reclaim". An invented-but-hex name was never ours (the widened 7..40
+# pattern is what admitted `20260116`); and a blind reclaim against an unresolved $HARNESS_REPO is the
+# silent-destruction class this file refuses. `check` never consults this, so an unresolved
+# $HARNESS_REPO cannot turn a legitimate `check` into a false block.
+# ⛔ This cannot reintroduce the per-entry path-comparison false block named above: it asks whether a
+# NAME resolves in the repo and never compares a path, so a `$TMPDIR`-spelled pin still answers yes.
+pin_entry_owned() {
+  local n="${1:-}"
+  pin_name_ok "$n" || return 1
+  [ -n "$HARNESS_REPO" ] || return 2
+  git -C "$HARNESS_REPO" rev-parse --git-dir >/dev/null 2>&1 || return 2
+  git -C "$HARNESS_REPO" cat-file -e "${n}^{commit}" 2>/dev/null && return 0
+  return 1
+}
+
+# The check-side caller: the SAME conformance question, with a message about the cell being unusable
+# rather than about deleting a directory `check` never deletes.
+cmd_check_pin_dir() {
+  local rc
+  pin_root_conformance "$HARNESS_PIN_DIR"; rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    2) die "HARNESS_PIN_DIR='$HARNESS_PIN_DIR' cannot be READ (permission denied or an I/O error), so whether it is a pin root is UNKNOWN — and cannot-verify is never a pass. Fix its permissions, or point HARNESS_PIN_DIR at a readable path, then re-run: $0 check   (agent-infra#1852)" ;;
+  esac
+  die "HARNESS_PIN_DIR='$HARNESS_PIN_DIR' $PIN_ROOT_BAD — 'apply' AND 'start' both refuse here, so this cell can neither be updated nor started. Quarantine it (move it aside; do not delete a directory you cannot account for) and re-run: $0 apply   (agent-infra#1852)"
+}
+
+# The delete-side caller, used by `harness_apply` and `cmd_prune`.
+assert_pin_dir_safe() {
+  local dir="$1" rc
+  pin_root_conformance "$dir"; rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    2) die "refusing to rm -rf HARNESS_PIN_DIR='$dir': it cannot be READ (permission denied or an I/O error), so whether it is a pin root is UNKNOWN — and cannot-verify is not a pass here either." ;;
+  esac
+  die "refusing to rm -rf HARNESS_PIN_DIR='$dir': it $PIN_ROOT_BAD. Remove it by hand if you are sure it holds nothing."
 }
 
 # Pin the cell's harness to $HARNESS_REF in a detached worktree and record where it is. Idempotent:
@@ -1060,7 +1111,7 @@ cmd_start() {
   # into tmux's update-environment, so the sessions orch-loop.sh spawns copy the VALUES out of the
   # controller's environment. (Names, never values, on every tmux command line.) On a cold start
   # there is no server to publish into — the `new-session` just below creates it from this shell,
-  # which already holds the same three names — so publish_worker_env() only acts on an EXISTING one.
+  # which already holds the same names — so publish_worker_env() only acts on an EXISTING one.
   # Put any other tunable in $ENV_FILE rather than exporting it in an operator shell.
   # The session re-sources $ENV_FILE in ITS shell (same uncontrolled file). The `[ -f ]` guard keeps
   # an absent file from printing an open error, and `2>/dev/null` is GONE: suppressing it also hid
@@ -1226,7 +1277,7 @@ cmd_prune() {
     # settable, and without this `prune` — which `cmd_start` calls UNATTENDED — `rm -rf`s every
     # subdirectory of a misconfigured root: `HARNESS_PIN_DIR=$CELL_HOME` deleted the cell home and its
     # state dir BEFORE the guard in `harness_apply` could fire. `assert_pin_dir_safe` refuses any root
-    # that is not an empty dir, a linked worktree, or a pin root of 12-hex directories.
+    # that is not an empty dir, a linked worktree, or a pin root of hex-named directories.
     assert_pin_dir_safe "$HARNESS_PIN_DIR"
     if linked_worktree_of "$HARNESS_REPO" "$HARNESS_PIN_DIR"; then
       # The legacy FLAT PIN: the root IS the live worktree, so `"$HARNESS_PIN_DIR"/*/` would enumerate
@@ -1251,6 +1302,19 @@ cmd_prune() {
         [ -n "$d_real" ] && [ "$d_real" = "$live_root" ] && skip=1
         [ -n "$d_real" ] && [ "$d_real" = "$pin_root" ] && skip=1
         [ "$skip" = 1 ] && continue
+        # ⛔ AUTHORITY TO DELETE. `assert_pin_dir_safe` above only answered whether the ROOT conforms,
+        # and its name check is a SPELLING test. `apply` names a pin after a COMMIT in $HARNESS_REPO,
+        # so the only proof an entry is ours is a CONTENT test that its name resolves there — without
+        # it the widened 7..40 pattern let this UNATTENDED sweep (cmd_start calls prune) reclaim an
+        # operator's date-named directory (`20260116`, `1718000000` — valid hex, not commits).
+        # ⛔ Fail-closed on BOTH non-answers: 1 (provably not ours) and 2 (cannot verify — an
+        # unresolved $HARNESS_REPO or a git failure) both SKIP the reclaim. Reconciling the two
+        # directions: the delete side refuses on an unknown, and `check` never consults this test, so
+        # an unresolved $HARNESS_REPO cannot turn a legitimate `check` into a false block.
+        if ! pin_entry_owned "$(basename "$d")"; then
+          say "prune: NOT reclaiming $d — its name does not resolve to a commit in ${HARNESS_REPO:-<unresolved>}, so it is not provably a pin of ours"
+          continue
+        fi
         say "prune: reclaiming superseded harness pin $d"
         # Deregister as well as delete. A bare `git worktree prune` is banned (#1141), so the removal
         # must be PATH-SCOPED — but a removal that only `rm -rf`'d left a phantom `worktree list`
