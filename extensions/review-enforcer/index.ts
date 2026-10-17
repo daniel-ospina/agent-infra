@@ -357,7 +357,78 @@ const GIT_COMMIT_PATTERN = /(^|\s)git\s+(commit|push)(?=\s|$)/;
  *     follow-up; the only real fix is argv-level enforcement (a `gh` shim).
  */
 function normalizeForFlagScan(command: string): string {
-  return command.replace(/\\\r?\n/g, "").replace(/["'\\]/g, "");
+  return withoutMandatedRailPath(command).replace(/\\\r?\n/g, "").replace(/["'\\]/g, "");
+}
+
+/**
+ * #1203 — THE MANDATED RAIL'S OWN PATH IS NOT A MERGE VERB, AND ITS FILENAME IS
+ * NOT AN `admin` FLAG.
+ *
+ * `scripts/admin-merge.sh` is the route this gate's OWN refusal tells a caller to
+ * take. Its filename spells the two things the scanner keys on — the word `admin`
+ * (rule 2's construct-plus-`admin` read) and the word `merge` — so a command that
+ * merely INVOKES the rail is read as an admin merge, refused for carrying no
+ * resolvable PR number, and thereby told to run the very rail it was refused for
+ * running. Measured 2026-10-17 at HEAD, on the two spellings a lane actually
+ * writes (the path is almost never static — the lane exports `$AGENT_INFRA_PATH`):
+ *
+ *   for pr in 3891; do bash $AGENT_INFRA_PATH/scripts/admin-merge.sh $pr; done
+ *   gh run list --limit 1; bash $AGENT_INFRA_PATH/scripts/admin-merge.sh 3891
+ *
+ * Both are `isGitOp === true`, `isAdminMergeCommand === true`,
+ * `extractMergePrNumber === null` — i.e. the "`gh pr merge --admin` carries no
+ * resolvable PR number" block, for a command with no merge in it. The LITERAL
+ * `bash scripts/admin-merge.sh 3891` is not gated at all (`isGitOp === false`), so
+ * the current behaviour is an inconsistency between two spellings of the same
+ * COMPLIANT route, not a control.
+ *
+ * The substitution is LENGTH-PRESERVING on purpose. `scanTokens` records byte
+ * offsets (`starts`) that `isAdminMergeCommand` then slices the ORIGINAL command
+ * with, to read the arguments after the `merge` word (the `$VAR`-supplied-flag
+ * arm). A substitution that changed the length would shift every offset after the
+ * path and make that read return the wrong text — a fail-open manufactured by the
+ * fix itself. Equal length keeps ONE text model, which is the property this file
+ * keeps re-learning it needs.
+ *
+ * WHAT THIS CANNOT HIDE (the declared threat surface of #1203):
+ *   - the token is never the `gh` word and never a `--admin` flag — it is a path
+ *     ending in `admin-merge.sh`, and `railscriptname` is neither — so no real
+ *     merge VERB and no real FLAG is removed from the text;
+ *   - the token's shell CONSTRUCT (`$`, backtick, brace) is left in place, so
+ *     `hasUnresolvableConstruct` and `readsNonMergeGhCall`'s polarity see exactly
+ *     what they saw before;
+ *   - the rail is the COMPLIANT route, not a bypass: it computes and verifies the
+ *     head-bound evidence itself, and its internal `gh pr merge --admin` is decided
+ *     by the argv-level shim, i.e. the same invariant one layer down.
+ * OUT OF SCOPE, and deliberately NOT narrowed here: the general "a command that
+ * MENTIONS a merge anywhere is refused" class (#1382, #1124, #1776) and any
+ * narrowing of the ANSI-C rule (#1425 — four narrowing attempts each regressed).
+ * STATED LIMIT: a basename SPLIT by a backslash-newline continuation
+ * (`admin-\<newline>merge.sh`) is not matched, because both normalizers resolve the
+ * continuation AFTER this substitution. That spelling therefore keeps the old
+ * over-block when the same call also carries a `pr`/`gh` word — left as an OVER-BLOCK
+ * rather than moved, since resolving the continuation first is what would change the
+ * offset model `isAdminMergeCommand` slices with (the fail-open direction).
+ */
+const MANDATED_RAIL_BASENAME = "admin-merge.sh";
+/**
+ * A neutral word of EXACTLY the basename's length — DERIVED, not written out, so the
+ * length-preserving property cannot be broken by editing one constant and not the
+ * other. (Today's value is `railscriptname`.) Derived rather than enforced by a
+ * load-time `throw`: a module-level throw removes the WHOLE extension — every gate in
+ * this file — which is exactly the silent-absence shape this guard exists to refuse.
+ */
+const MANDATED_RAIL_PLACEHOLDER = "railscriptname"
+  .slice(0, MANDATED_RAIL_BASENAME.length)
+  .padEnd(MANDATED_RAIL_BASENAME.length, "x");
+/**
+ * BOUNDARY-TIGHT, so the exemption is the gate's OWN route and not the substring: a
+ * `my-admin-merge.sh` or an `admin-merge.sh.bak` is a different file, and exempting it
+ * would be exempting a path this gate never mandated.
+ */
+const MANDATED_RAIL_RE = /(^|[^\w.-])admin-merge\.sh(?![.\w-])/g;
+export function withoutMandatedRailPath(command: string): string {
+  return command.replace(MANDATED_RAIL_RE, `$1${MANDATED_RAIL_PLACEHOLDER}`);
 }
 
 /**
@@ -577,7 +648,10 @@ interface ScanTokens {
 function scanTokens(command: string): ScanTokens {
   // bash removes a backslash-newline outright, so `g\<newline>h` is the command
   // `gh`. Do the same before tokenizing, or the continuation splits the name.
-  const joined = stripRepoArgs(command).replace(/\\\r?\n/g, "");
+  // #1203: the mandated rail's own filename is neutralized BEFORE tokenizing, so
+  // the path cannot supply the words `admin`/`merge` the verbs and flags are read
+  // from. Length-preserving, so every offset below still addresses `command`.
+  const joined = stripRepoArgs(withoutMandatedRailPath(command)).replace(/\\\r?\n/g, "");
   const mask = unquotedMask(joined);
   const tokens = joined.split(/[\s;&|(){!]+/).filter((t) => t.length > 0);
   const starts: number[] = [];
@@ -864,7 +938,7 @@ export function mergeVerbInText(command: string): boolean {
   // exists for the construct AFTER a word rather than for the word itself. Normalizing
   // here as well was measured as redundant — the suite does not distinguish it — so it is
   // not kept as an unverifiable second mechanism.
-  const raw = command.trim().split(/\s+/);
+  const raw = withoutMandatedRailPath(command).trim().split(/\s+/);
   const rawAfterIsConstruct = (word: string): boolean => {
     for (let i = 0; i < raw.length - 1; i++) {
       if (dequote(raw[i]) !== word) continue;
@@ -1965,7 +2039,17 @@ const ADMIN_MERGE_EVIDENCE_RE = /<!--\s*admin-merge-safety:\s*([0-9a-fA-F]{7,40}
  *     merge, so it bypasses the MERGE-REGISTRY gate (`V=pr; gh $V merge 123
  *     --squash`). With an admin flag the rule below catches it, and an ANSI-C verb
  *     (`gh p$'r' …`) is refused by rule 2(a) regardless. The registry gate is
- *     outside #930's scope, so this is noted, not fixed.
+ *     outside #930's scope, so this is noted, not fixed;
+ *   - #1203 — a command that merely INVOKES the mandated rail is NOT an admin merge
+ *     here, because the rail's own filename (`admin-merge.sh`) is neutralized before
+ *     every read (`withoutMandatedRailPath`): its two words would otherwise be read
+ *     as the flag (`admin`, rule 2) and the verb (`merge`), refusing the gate's own
+ *     recommended route. A `--admin` handed to the rail as an ARGUMENT
+ *     (`bash …/admin-merge.sh 999 --admin`) therefore stops being read as one — the
+ *     rail accepts and drops that flag (`scripts/admin-merge.sh:5193`), computes and
+ *     verifies the head-bound evidence itself, and its internal
+ *     `gh pr merge --admin` is decided by the argv shim. The literal spelling
+ *     (`bash scripts/admin-merge.sh 999 --admin`) was never gated.
  * (A construct-supplied dash such as `-${V:--}admin=true` was on this list in an
  * earlier revision and is now CLOSED by rule 2 below — verified, not assumed.
  * BRACE EXPANSION is closed ONLY in the forms where the expanded word still
@@ -2035,11 +2119,17 @@ export function hasAdminMergeFlag(command: string): boolean {
   //    backslashes, line continuations), so `--ad""min=true` and `--ad\min=true`
   //    are seen as `--admin=true` rather than hiding the flag. (VGATE rounds 1-3:
   //    each of these returned FALSE while gh received a real admin merge.)
-  const probe = normalizeForFlagScan(command);
+  //    #1203: the mandated rail's own path is neutralized first — its filename is
+  //    `admin-merge.sh`, and reading that as the flag/verb it is not is what refused
+  //    the gate's own recommended route in a loop or beside another `gh` call.
+  //    `normalizeForFlagScan` neutralizes too (idempotent), so the probe and the raw
+  //    reads below cannot disagree about the same command.
+  const cmd = withoutMandatedRailPath(command);
+  const probe = normalizeForFlagScan(cmd);
   // 2. Fail CLOSED on what we cannot resolve. Guessing here is what produced
   //    seven rounds of fail-opens, so the rule is "unresolvable ⇒ admin merge".
   //    (a) ANSI-C quoting, or a `$`/backtick inside a literal `--` token;
-  if (isUnresolvableFlagToken(command, probe)) return true;
+  if (isUnresolvableFlagToken(cmd, probe)) return true;
   //    (b) a construct that could ASSEMBLE the flag — the dashes included. VGATE
   //    round 7: `-${V:--}admin=true`, `$V-admin=true` and
   //    `-$(printf %s '-')admin=true` all reach gh as `--admin=true`, and a rule
@@ -2048,7 +2138,7 @@ export function hasAdminMergeFlag(command: string): boolean {
   //    family; it is narrow in the direction that matters, because a construct
   //    WITHOUT the word `admin` — e.g. the common `gh pr merge "$PR" --squash` —
   //    is untouched.
-  if (hasUnresolvableConstruct(command) && /admin/i.test(command)) return true;
+  if (hasUnresolvableConstruct(cmd) && /admin/i.test(cmd)) return true;
   // 3. The literal flag — the DECISIVE read (see `hasLiteralAdminFlag`).
   return literalAdminFlagIn(probe);
 }
@@ -2825,10 +2915,16 @@ export default function (pi: ExtensionAPI) {
     // ── State ──────────────────────────────────────
     let extensionEnabled = true;
     let dispatchCount = 0;
+    // #1662 review: run_ids whose terminal `task_collect` already counted as a
+    // reviewer dispatch. `task_collect` is idempotent (the same terminal run
+    // can be reaped repeatedly), so without this a repeated collect inflates
+    // the ≥1-dispatch count and the durable `review_dispatch` audit total.
+    const countedCollectRuns = new Set<string>();
 
     // ── session_start ──────────────────────────────
     pi.on("session_start", async (_event, _ctx) => {
       dispatchCount = 0;
+      countedCollectRuns.clear();
 
       // Warn about env vars that never reach Node.js from bash export
       // (these have no effect — tier is read from marker file, skip gate from escape hatch)
@@ -2885,6 +2981,7 @@ export default function (pi: ExtensionAPI) {
     // ── session_shutdown ───────────────────────────
     pi.on("session_shutdown", async (_event, _ctx) => {
       dispatchCount = 0;
+      countedCollectRuns.clear();
       // Clear marker file to prevent persistent state leakage across sessions
       try {
         if (fs.existsSync(ISSUE_COMPLEXITY_FILE)) {
@@ -3154,7 +3251,24 @@ export default function (pi: ExtensionAPI) {
       // docs-only micro change reviewed via the `subagent` tool must not
       // false-block post-flip (micro relies on this counter as its only gate;
       // VGATE is shape-exempt and code review is skipped at micro).
-      if (event.toolName !== "task" && event.toolName !== "subagent") return undefined;
+      // #1662: a `task({ background: true })` dispatch returns at DISPATCH, not
+      // completion — counting it would satisfy the ≥1-dispatch gate while the
+      // reviewer is still running (a fail-open on the git-op gate). Count the
+      // reviewer when its verdict is actually reaped: the terminal
+      // `task_collect`. The returns-early notice and a not-finished collect are
+      // both ignored.
+      const reviewDetails = (event as { details?: { background?: boolean; terminal?: boolean; run_id?: string } }).details;
+      // #1662 review: the pre-spawn refusal / halted-chain / invalid-session-id
+      // results are built BEFORE the background branch, so they carry NO
+      // `details.background` — a refused `task({ background: true })` would then
+      // fall through and `dispatchCount++`, satisfying the ≥1-dispatch gate for a
+      // child that was never created. Read the tool INPUT too (the same dual
+      // signal `verification-gate` uses), so every background result —
+      // dispatched, refused, or halted — is recognised as background.
+      const reviewInput = (event as { input?: { background?: boolean } }).input;
+      const isTerminalCollect =
+        event.toolName === "task_collect" && reviewDetails?.terminal === true;
+      if (event.toolName !== "task_collect" && event.toolName !== "subagent" && event.toolName !== "task") return undefined;
       // #285 P2: task sub-agents never count dispatches — review DISPATCH is
       // parent-enforced (#825), and their own in-band [VGATE] dispatches must
       // not be counted/audited as review dispatches. (Today they never reach
@@ -3162,6 +3276,20 @@ export default function (pi: ExtensionAPI) {
       // this early return is what keeps the noise out.)
       if (isTaskSubAgent()) return undefined;
       if (!extensionEnabled) return undefined;
+      if (event.toolName === "task_collect" && !isTerminalCollect) return undefined;
+      if (reviewDetails?.background === true || reviewInput?.background === true) return undefined;
+      // #1662 review: `task_collect` is idempotent — every result carries the
+      // `run_id` it reaped (`details: view`). Count each run's verdict once, so
+      // re-collecting a finished lane cannot inflate the dispatch total (and
+      // the durable review_dispatch audit count) past the real dispatches.
+      if (isTerminalCollect) {
+        const collectRunId =
+          typeof reviewDetails?.run_id === "string" ? reviewDetails.run_id : "";
+        if (collectRunId) {
+          if (countedCollectRuns.has(collectRunId)) return undefined;
+          countedCollectRuns.add(collectRunId);
+        }
+      }
 
       dispatchCount++;
       console.log(

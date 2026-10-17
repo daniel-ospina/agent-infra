@@ -90,6 +90,14 @@ def lane_live(lane):
 
 def decide(klass, why):
     """(action, detail). A FIX ALWAYS CARRIES THE RAIL IT IS FOR (hard requirement 1)."""
+    if klass == "running":
+        # The head is still EXECUTING (#1872): a required check in flight, OR a required gate that
+        # has NOT YET REPORTED while anything at this head is in flight -- `objective.py`'s arm is
+        # `(gated_flight or (gated_absent and flight)) and not gated_red`. Without this arm the class
+        # falls through to the `ask-user` default below and a lane that is merely WAITING is
+        # reported as an owner decision. Reading this narrowly ("only a mid-run required check")
+        # is how a correct `running` gets tightened back into work.
+        return "wait", None
     if klass == "call-rail":
         return "rail", None
     if klass == "rerun-checks":
@@ -142,6 +150,8 @@ def main():
     for klass in o.CLASS_ORDER:
         for num, why in by_class.get(klass) or []:
             action, detail = decide(klass, why)
+            if action == "wait":                 # in flight: nothing to dispatch, nothing to ask
+                continue
             if num in lanes:                    # HARD REQUIREMENT 2: idempotent
                 log(f"SKIP #{num} ({klass}) -- lane {lanes[num]['lane']} already working it")
                 continue

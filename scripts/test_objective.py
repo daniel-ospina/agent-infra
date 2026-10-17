@@ -21,11 +21,15 @@ Run:  <venv>/bin/python -m pytest test_objective.py -q
 """
 from __future__ import annotations
 
+import atexit
 import importlib.util
 import itertools
 import json
 import pathlib
 import re
+import shutil
+import subprocess
+import tempfile
 import time
 
 import pytest
@@ -35,7 +39,28 @@ _SPEC = importlib.util.spec_from_file_location(
 objective = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(objective)
 
+# ⛔ THE SUITE MUST NOT PERSIST INTO THE LIVE LOOP'S STATE DIRECTORY (#1734, its second instance).
+# `objective.py` persists BETWEEN HEARTBEAT BEATS: `_stuck_bump` writes -- and, with no
+# `call-rail` PR in the fixture, TRUNCATES -- `~/.pi/agent/state/call-rail-stuck.json`, the file
+# the live loop maintains to escalate a `call-rail` PR that has gone quiet. Measured 2026-10-17:
+# a single `pytest scripts/test_objective.py` run left that file as `{}`. The redirect belongs
+# HERE, at load, because `build()` is what persists and every test calls it.
+# ⛔ REDIRECTING `STATE` DOES NOT COVER A PATH ADDED LATER: the module resolves its paths AT
+# IMPORT (`STUCK_FILE = os.path.join(STATE, ...)`), so a new state constant would compute itself
+# from the LIVE dir before this override runs. Each existing path is therefore named here, and
+# `test_the_suite_never_persists_into_the_live_state_dir` enumerates the module's own string
+# constants for leftovers -- a new one fails that test instead of silently writing production
+# state (the "one seam, every consumer" property, made mechanical).
+_STATE_SCRATCH = tempfile.mkdtemp(prefix="objective-state-")
+atexit.register(shutil.rmtree, _STATE_SCRATCH, ignore_errors=True)
+objective.STATE = _STATE_SCRATCH
+objective.CACHE = str(pathlib.Path(_STATE_SCRATCH) / "objective.last")
+objective.STUCK_FILE = str(pathlib.Path(_STATE_SCRATCH) / "call-rail-stuck.json")
+
 SHA = "9c4788400" + "b" * 31
+# #1872: the class segment is STATE, not a dispatch list -- the old `DO:` token is gone by design
+# (a monitor must not instruct the fleet to do work the dispatch chain owns).
+QUEUE_SEG = "| QUEUE(state; pr-doctor dispatches):"
 
 
 class _Result:
@@ -54,7 +79,18 @@ def _gql_ok():
 
 def install(monkeypatch, *, gql=None, rest=None, pr_list=None, ci_runs=None, ls_remote=None,
             runs=None):
-    """Patch the ONE seam every read goes through, and dispatch on the command."""
+    """Patch the ONE seam every read goes through, and dispatch on the command.
+
+    `pr_list` may be a SEQUENCE of `_Result`s: one QUEUE response per read, the last one
+    repeating once the sequence is spent (#1869's re-sample makes the queue read happen more
+    than once). Returns the list the re-sample backoff appends to -- `objective._sleep` is
+    patched to RECORD rather than wait, so the retry's budget is asserted instead of slept
+    through (CI bounds every test at 60 s).
+
+    `runs` stubs the ATTEMPT clock the flight-age bound reads (#1926), keyed by run id.
+    """
+    queue_reads = {"n": 0}
+    sleeps = []
     def fake_run(cmd, **kw):
         s = " ".join(cmd)
         if "ls-remote" in s:
@@ -80,11 +116,17 @@ def install(monkeypatch, *, gql=None, rest=None, pr_list=None, ci_runs=None, ls_
         if m:
             return (runs or {}).get(int(m.group(1)), _Result(1, "", "HTTP 404"))
         if cmd[:3] == ["gh", "pr", "list"]:
-            return pr_list if pr_list is not None else _Result(0, "[]")
+            seq = (list(pr_list) if isinstance(pr_list, (list, tuple))
+                   else [pr_list if pr_list is not None else _Result(0, "[]")])
+            i = min(queue_reads["n"], len(seq) - 1)
+            queue_reads["n"] += 1
+            return seq[i]
         if "/actions/workflows/" in s:
             return ci_runs if ci_runs is not None else _Result(0, json.dumps({"workflow_runs": []}))
         return _Result(0, "{}")
     monkeypatch.setattr(objective.subprocess, "run", fake_run)
+    monkeypatch.setattr(objective, "_sleep", sleeps.append)
+    return sleeps
 
 
 @pytest.fixture(autouse=True)
@@ -95,6 +137,71 @@ def _clean_flag():
     yield
     objective.GH_BLOCKED = None
     objective.GH_BLOCKED_BY.clear()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_stuck_ledger(tmp_path, monkeypatch):
+    """⛔ `build()` WRITES the STUCK ledger, so a test run must not touch the fleet's own.
+
+    `build()` -> `_stuck_bump()` opens `STUCK_FILE` (under `~/.pi/agent/state/`) and rewrites it
+    with whatever `call-rail` PRs the FIXTURE happens to contain -- normally `{}`. MEASURED 2026-10-17
+    (reviewer, #1872 review round 5): a suite run took the real file from
+    `{"1234": 3, "5678": 5}` to `{}` and bumped its mtime. The consequence is not cosmetic: that
+    ledger is what turns `call-rail` into "STUCK N beats -- pr-doctor has not landed it", so any
+    lane running this suite silently suppressed the fleet's one escalation for the next two beats.
+
+    Every test in this file that calls `build()` gets a private state dir; a test that wants to
+    inspect the ledger can still point `STUCK_FILE` at its own `tmp_path` explicitly.
+    """
+    monkeypatch.setattr(objective, "STATE", str(tmp_path))
+    monkeypatch.setattr(objective, "STUCK_FILE", str(tmp_path / "call-rail-stuck.json"))
+
+
+def test_the_fixture_redirects_the_state_dir_and_the_stuck_ledger():
+    """⛔ THE REDIRECT MUST BE IN FORCE, NOT MERELY WRITTEN (#1872 review round 7).
+
+    The autouse fixture above only prevents the ledger wipe while it EXISTS. A test that pins the
+    redirect is what makes DELETING it fail: `test_lane_actions.py` pins the identical seam
+    (`test_the_suite_never_points_at_the_production_state_dir`) for its own module, and this file
+    had none -- so the fix could be removed with the WHOLE FILE still green while every run resumed
+    rewriting `~/.pi/agent/state/call-rail-stuck.json` to `{}` and silently suppressing `call-rail`'s
+    one escalation. Verified by hand: deleting the two `monkeypatch.setattr` lines left every test
+    passing and the real ledger at `{}`.
+
+    Deliberately no test count: "the whole file is green" is the property that reproduces, and a
+    figure would only date this sentence.
+    """
+    prod = str(pathlib.Path.home() / ".pi" / "agent" / "state")
+    for name in ("STATE", "STUCK_FILE"):
+        value = getattr(objective, name)
+        assert not value.startswith(prod), f"{name} points at production: {value}"
+
+
+def test_a_REFUSED_queue_still_names_the_surface_prs(monkeypatch):
+    """⛔ THE OWNER'S LIST SURVIVES THE REFUSAL (#1872 review round 11).
+
+    `classify_queue()` returns a refusal tuple when the buckets are not a usable partition. Its
+    docstring used to document that tuple as `(None, n, {}, [])` -- with `surface_prs` DROPPED --
+    which is the opposite of the code and of why the names exist: a gate whose output is "N things
+    need you" without naming them is a stall with a receipt, and an UNREADABLE pass is exactly when
+    the owner's list matters most. Nothing pinned it, so the drop could have come back silently.
+    """
+    non = [{"number": 1, "files": []}, {"number": 2, "files": []}, {"number": 3, "files": []}]
+    monkeypatch.setattr(objective, "touches_surface", lambda p: p["number"] in (1, 3))
+
+    # (a) ONE unreadable PR refuses the pass, and the names still come back
+    monkeypatch.setattr(objective, "classify_one",
+                        lambda p: (None, None, None) if p["number"] == 2 else ("running", None, []))
+    classes, surface, by_class, surface_prs = objective.classify_queue(non)
+    assert classes is None and by_class == {}, (classes, by_class)
+    assert surface == 2 and surface_prs == [1, 3], (surface, surface_prs)
+
+    # (b) the OTHER trigger -- buckets that do not reconcile with `nondraft` -- behaves the same way
+    monkeypatch.setattr(objective, "classify_one",
+                        lambda p: ("not-a-class", None, []) if p["number"] == 2 else ("running", None, []))
+    classes, surface, by_class, surface_prs = objective.classify_queue(non)
+    assert classes is None and by_class == {}, (classes, by_class)
+    assert surface_prs == [1, 3], surface_prs
 
 
 # --- DIRECTION 2: a healthy read must NOT flag -----------------------------------------
@@ -293,6 +400,33 @@ def test_a_blind_mergeability_read_is_named_and_cannot_read_as_an_all_clear(monk
     assert "nondraft=75" in line, line
 
 
+def test_the_FAIL_CLOSED_caveat_precedes_the_counts_it_qualifies(tmp_path, monkeypatch):
+    """⛔ THE CAVEAT'S POSITION IS THE GUARANTEE, NOT THE LENGTH OF THE LINE (#1872 review r3).
+
+    `cadence-nudge.sh` reads this line with a fixed `cut`. The width was re-argued several times and
+    every answer went stale as the queue grew -- but the property
+    that actually matters is structural: a truncated line must never lose the token that says the
+    counts are NOT a clearance. That holds only while `queue_read=BLIND` is emitted BEFORE the
+    `QUEUE(` segment, so the ordering is pinned here instead of being described in a comment
+    nobody can enforce.
+
+    The same argument covers `ASK-USER` (#1872 review round 4): it names the surface PRs because
+    the count alone is not actionable, so a deep queue must not be able to sever the names and
+    leave the bare count the overlay was added to replace.
+    """
+    prs = json.dumps([dict(_pr(n, "UNKNOWN"),
+                           files=[{"path": "tortoise/sdk.py"}] if n % 3 == 0 else [])
+                      for n in range(1, 15)])
+    install(monkeypatch, pr_list=_Result(0, prs))
+    line = objective.build()
+    assert "queue_read=BLIND" in line and "| QUEUE(state;" in line, line
+    assert line.index("queue_read=BLIND") < line.index("| QUEUE(state;"), line
+    # ...and the OWNER'S list is protected the same way: it cannot be the token a deep queue
+    # severs. MEASURED before this: 60 non-draft PRs with a 20-PR overlay lost all 20 names.
+    assert "ASK-USER: surface=" in line, line
+    assert line.index("ASK-USER: surface=") < line.index("| QUEUE(state;"), line
+
+
 def test_a_resolved_mergeability_read_manufactures_no_unknown_bucket(monkeypatch):
     """DIRECTION 2 (the one that keeps the fix honest). A GOOD read must not gain the token.
 
@@ -321,6 +455,29 @@ def test_a_payload_omitting_the_field_is_blind_not_clear(monkeypatch):
     assert "mergeable_state_unknown=4" in line, line
     assert "blocked=" not in line, line          # owner ban: no state-words
     assert "queue_read=BLIND" in line, line       # ...but blindness is still NAMED
+
+
+def test_the_suite_never_persists_into_the_live_state_dir(monkeypatch):
+    """THE REDIRECT MUST BE IN FORCE, NOT MERELY PRESENT (#1734, second instance).
+
+    `build()` persists `call-rail-stuck.json` on every call that reaches the DO branch -- so a
+    test run against the real `~/.pi/agent/state` truncates the live loop's escalation counter,
+    and deleting the redirect would do it again silently. Asserted on the loaded module, which
+    is the seam every test in this file goes through, and ENUMERATED rather than listed: a state
+    path added later fails here instead of quietly pointing at production.
+    """
+    live = str(pathlib.Path.home() / ".pi" / "agent" / "state")
+    leaked = {name: value for name, value in vars(objective).items()
+              if isinstance(value, str) and value.startswith(live)}
+    assert not leaked, leaked
+    assert pathlib.Path(objective.STATE).is_dir(), objective.STATE
+    # ...and the persistence path really runs, so the assertion above is not vacuous.
+    install(monkeypatch, pr_list=_Result(0, json.dumps([_pr(1, "BLOCKED")])))
+    objective.build()
+    assert pathlib.Path(objective.STUCK_FILE).parent == pathlib.Path(objective.STATE)
+    assert pathlib.Path(objective.STUCK_FILE).exists()
+
+
 def test_a_draft_never_contributes_to_the_unknown_count(monkeypatch):
     """Drafts are outside the queue, so they cannot inflate its blindness either."""
     install(monkeypatch, pr_list=_Result(0, json.dumps(
@@ -328,6 +485,354 @@ def test_a_draft_never_contributes_to_the_unknown_count(monkeypatch):
     line = objective.build()
     assert "mergeability_unknown" not in line, line
     assert "nondraft=1" in line and "drafts=39" in line, line
+
+
+# --- #1869: A LAZILY-COMPUTED MERGE STATE IS RE-SAMPLED, NOT DECLARED BLIND ---------------
+# MEASURED 2026-10-16, two consecutive beats: 13:25 printed a full DO list, 13:34 printed
+# `queue_read=BLIND(14/14 unread)` and a DO list that had LOST `call-rail` and
+# `resolve-conflict` -- and the SAME read minutes later returned
+# `{BLOCKED: 8, DIRTY: 5, UNSTABLE: 1}`. The state was not wrong, it was NOT READY YET
+# (`mergeStateStatus` is recomputed on every base/head move), and `_gh_retry` cannot see that
+# because the transport SUCCEEDED. A lane acting on that beat's line treated two landable PRs
+# as "STUCK 13 beats" when both were `mergeable=true` the whole time.
+# ⇒ the queue read is SAMPLED AGAIN, and blindness is declared only if it never settles.
+
+def _blind_prs(n, lo=1):
+    return json.dumps([_pr(i, "UNKNOWN") for i in range(lo, lo + n)])
+
+
+def test_a_transiently_unknown_queue_is_resampled_and_keeps_its_do_list(monkeypatch):
+    """ACCEPTANCE 1 of #1869 -- the exact behaviour that failed.
+
+    First sample all-UNKNOWN, second sample real states: the beat must show the WORK, not
+    drop it. A blind first sample is not a blind queue.
+    """
+    sleeps = install(monkeypatch, pr_list=[
+        _Result(0, _blind_prs(2)),
+        _Result(0, json.dumps([_pr(1, "DIRTY"), _pr(2, "BLOCKED")]))])
+    line = objective.build()
+    assert "queue_read=BLIND" not in line, line          # the transient was absorbed
+    assert "mergeable_state_unknown" not in line, line   # ...and no stale blind count either
+    assert "queue_read=SETTLED(samples=2)" in line, line  # ...and the retry is NOT silent
+    assert QUEUE_SEG in line, line
+    assert "resolve-conflict=1" in line and "record-review=1" in line, line
+    assert sleeps == [objective.QUEUE_BLIND_BACKOFF_S[0]], sleeps
+
+
+def test_a_queue_unreadable_on_every_sample_still_reports_blind(monkeypatch):
+    """ACCEPTANCE 2 of #1869 -- the retry must not become a FAIL-OPEN.
+
+    Every sample unread => BLIND, exactly as before, and the re-sample stops at its own bound
+    instead of looping (the backoff is popped once per re-read, so `len(sleeps)` IS the
+    attempt count).
+    """
+    sleeps = install(monkeypatch, pr_list=[_Result(0, _blind_prs(14))])
+    line = objective.build()
+    assert f"queue_read=BLIND(14/14 unread, samples={objective.QUEUE_BLIND_ATTEMPTS})" in line, line
+    assert "queue_read=SETTLED" not in line, line
+    assert len(sleeps) == objective.QUEUE_BLIND_ATTEMPTS - 1, sleeps
+    assert sum(sleeps) <= 20, sleeps          # a SHORT backoff: the beat has a 90 s budget
+
+
+def test_a_blind_do_list_is_still_never_a_clearance(monkeypatch):
+    """ACCEPTANCE 3 of #1869 -- the property that must SURVIVE the fix.
+
+    A DO list printed from a blind read is not a clearance, and re-sampling must not launder
+    it into one: the token that says so stays beside it. A queue that improves but never
+    settles is reported from its BEST sample -- and still declared BLIND.
+    """
+    install(monkeypatch, pr_list=[
+        _Result(0, _blind_prs(14)),
+        _Result(0, json.dumps([_pr(i, "UNKNOWN") for i in range(1, 9)]
+                              + [_pr(i, "BLOCKED") for i in range(9, 15)]))])
+    line = objective.build()
+    assert "queue_read=BLIND(8/14 unread, samples=" in line, line   # best sample, still blind
+    assert "the QUEUE counts are NOT a clearance" in line, line
+    assert QUEUE_SEG in line, line
+    assert "queue_read=SETTLED" not in line, line
+
+
+def test_a_readable_queue_is_read_once(monkeypatch):
+    """...and the fix costs nothing on a healthy tick: no extra API call, no waiting."""
+    sleeps = install(monkeypatch, pr_list=[_Result(0, json.dumps(
+        [_pr(n, "BLOCKED") for n in range(1, 5)]))])
+    line = objective.build()
+    assert "queue_read=" not in line, line
+    assert sleeps == [], sleeps
+
+
+def test_the_resample_is_bounded_by_WALL_CLOCK_not_only_by_attempts(monkeypatch):
+    """A slow read must not be handed a full ladder of sleeps on top of it.
+
+    An attempt count bounds the number of READS, not the time they cost: the read can be slow
+    (a full recompute measured ~12 s, and one hung `gh` costs up to its own 120 s timeout), and
+    the beat's whole refresh is killed at 90 s (`heartbeat-loop.sh`, `run_bounded 90`) -- a
+    killed refresh writes NO line at all, which is worse than an honest BLIND. So the deadline
+    is checked before every re-read, and a spent budget stops the loop from re-reading.
+    """
+    sleeps = install(monkeypatch, pr_list=[_Result(0, _blind_prs(14))])
+    ticks = iter([0.0] + [objective.QUEUE_BLIND_BUDGET_S + 1.0] * 8)
+    monkeypatch.setattr(objective, "_monotonic", lambda: next(ticks))
+    reads = []
+    real = objective._gh_retry
+    monkeypatch.setattr(
+        objective, "_gh_retry", lambda *a, **k: (reads.append(1), real(*a, **k))[1])
+    line = objective.build()
+    assert "queue_read=BLIND(14/14 unread, samples=1)" in line, line
+    assert len(reads) == 1, reads          # no second re-read once the budget is spent
+    # ...and the wait that followed it was CLIPPED to the zero budget left, not slept in full.
+    assert sleeps == [0.0], sleeps
+
+
+def test_the_blind_token_precedes_the_list_it_qualifies(monkeypatch):
+    """ORDERING IS SEMANTICS to a truncating reader (#1869 acceptance 3, hardened).
+
+    The token that says "these counts are NOT a clearance" used to be appended AFTER the class list
+    segment, and the fleet brief cuts this line (`cadence-nudge.sh`: `cut -c1-900`, raised from 400
+    in #1872) -- so a growing class list pushed the only qualifier past the cut and left the reader
+    with a bare action list. Pinned on POSITION, not on presence: the assertion below is about where
+    the qualifier sits, and the width is only the budget that position has to fit in.
+    """
+    install(monkeypatch, pr_list=[_Result(0, _blind_prs(14))])
+    line = objective.build()
+    qualifier = line.index("queue_read=BLIND")
+    assert qualifier < line.index(QUEUE_SEG), line
+    assert len(line[:qualifier]) < 900, line      # ...and reachable inside the nudge's cut
+
+
+def test_a_Minority_unread_read_is_neither_blind_nor_resampled(monkeypatch):
+    """THE THRESHOLD ITSELF, which no other fixture exercises (#1869 review).
+
+    Every other fixture is all-UNKNOWN or all-resolved, so the half-the-queue predicate -- and
+    the fact that the RETRY and the REPORT share it -- was unpinned: `_blind = _u > 0` in the
+    report, or a bare `unknown > 0` predicate, both passed the whole suite. One unread PR in 14
+    must be a NAMED count and nothing more: no BLIND, no re-sample, no extra API call.
+    """
+    sleeps = install(monkeypatch, pr_list=[_Result(0, json.dumps(
+        [_pr(1, "UNKNOWN")] + [_pr(n, "BLOCKED") for n in range(2, 15)]))])
+    line = objective.build()
+    assert "mergeable_state_unknown=1" in line, line
+    assert "queue_read=" not in line, line
+    assert sleeps == [], sleeps
+
+
+def test_the_most_resolved_sample_is_the_one_reported(monkeypatch):
+    """KEEPING THE BEST SAMPLE, not the last one -- the case the other tests cannot see.
+
+    Every other fixture IMPROVES between samples, so `keep-last` looks identical to `keep-best`.
+    A later sample that lands in a SECOND recompute window is the shape that separates them: the
+    line must report the better reading (8/14), not the worse one that arrived last (14/14).
+    """
+    install(monkeypatch, pr_list=[
+        _Result(0, json.dumps([_pr(i, "UNKNOWN") for i in range(1, 15)])),
+        _Result(0, json.dumps([_pr(i, "UNKNOWN") for i in range(1, 9)]
+                              + [_pr(i, "BLOCKED") for i in range(9, 15)])),
+        _Result(0, _blind_prs(14))])
+    line = objective.build()
+    assert "mergeable_state_unknown=8" in line, line
+    assert "queue_read=BLIND(8/14 unread, samples=4)" in line, line
+
+
+def test_a_degenerate_sample_can_never_clear_a_blind_queue(monkeypatch):
+    """THE FAIL-OPEN THE RETRY COULD HAVE INTRODUCED (#1869 review, P2).
+
+    "Fewest unread keys" alone lets a degenerate answer win: 14 blind PRs, then an EMPTY list is
+    0 unread -- `nondraft=0`, no BLIND token, and `waiting < TARGET_PRS` flips the verdict to
+    AT-TARGET. That is the false all-clear this instrument exists to refuse, manufactured by the
+    retry itself. A queue that LOST PRs while we waited may not settle the read.
+    """
+    install(monkeypatch, pr_list=[_Result(0, _blind_prs(14)), _Result(0, "[]")])
+    line = objective.build()
+    assert "queue_read=BLIND(14/14 unread, samples=4)" in line, line
+    assert "nondraft=14" in line, line
+    assert "VERDICT=AT-TARGET" not in line, line
+
+
+def test_an_UNDERCOUNTED_first_sample_is_replaced_by_the_full_queue(monkeypatch):
+    """The same false all-clear from the OTHER direction (#1869 review).
+
+    "Fewest unread" with only a shrink guard is one-sided: a degraded FIRST answer that carries 3
+    of 14 PRs is never replaced by the larger later sample, because "more unread" was read as
+    "worse" regardless of size -- so `waiting=3` on a 14-PR queue and `waiting < TARGET_PRS` says
+    AT-TARGET. A sample that GAINED PRs is a MORE COMPLETE read, even with more unread ones.
+    """
+    install(monkeypatch, pr_list=[_Result(0, _blind_prs(3)), _Result(0, _blind_prs(14))])
+    line = objective.build()
+    assert "nondraft=14" in line, line
+    assert "queue_read=BLIND(14/14 unread, samples=4)" in line, line
+    assert "VERDICT=AT-TARGET" not in line, line
+
+
+def test_the_at_target_verdict_is_about_DEPTH_and_says_so_beside_blindness(monkeypatch):
+    """A blind merge state does not falsify the QUEUE DEPTH -- and that is intent, not accident.
+
+    `waiting` is `len(non_drafts)`: a real count of rows GitHub returned, unaffected by whether
+    the lazy merge field had settled. So a shallow queue reads AT-TARGET with the BLIND token
+    BESIDE it, and neither token is claiming the other's fact: the verdict is about depth, the
+    token is about classification. Pinned so a future change to either is a decision, not a
+    silent edit (the review asked for exactly this: no consumer re-checks `queue_read`).
+    """
+    install(monkeypatch, pr_list=[_Result(0, _blind_prs(3))])
+    line = objective.build()
+    assert "VERDICT=AT-TARGET" in line, line
+    assert "queue_read=BLIND(3/3 unread, samples=4)" in line, line
+    assert "waiting=3" in line, line
+
+
+def test_an_unread_merge_state_never_surfaces_as_a_zero_count(monkeypatch):
+    """`dirty`/`unstable` are DERIVED counts, so a blind read must yield None, not 0.
+
+    Nothing consumes them today, which is exactly why they are the trap: the next consumer that
+    reads `q["dirty"]` on a blind tick would inherit the false zero this file forbids ("an unread
+    value must never render as a zero") with no test in its way.
+    """
+    install(monkeypatch, pr_list=[_Result(0, _blind_prs(4))])
+    q = objective.queue()
+    assert q["unknown"] == 4, q
+    assert q["dirty"] is None and q["unstable"] is None, q
+    # ...and a readable read still reports the real counts.
+    install(monkeypatch, pr_list=[_Result(0, json.dumps(
+        [_pr(1, "DIRTY"), _pr(2, "UNSTABLE"), _pr(3, "BLOCKED")]))])
+    q = objective.queue()
+    assert (q["dirty"], q["unstable"], q["unknown"]) == (1, 1, 0), q
+
+
+def test_a_readable_sample_that_LOST_a_PRand_is_not_thrown_away(monkeypatch):
+    """THE RULE THE SHRINK GUARD MUST NOT BREAK (#1869 review, both reviewers).
+
+    14 blind PRs, then -- the ordinary event of a PR landing during the ~17 s wait -- 13 PRs
+    fully readable. Rejecting every shrink would keep the blind sample, print
+    `BLIND(14/14 unread)` and publish ITS action list while a COMPLETE answer was in hand: the
+    exact harm this retry exists to remove, manufactured by the retry. So a READABLE answer wins
+    -- unless it is EMPTY, which is the degenerate shape the guard is for.
+    """
+    install(monkeypatch, pr_list=[
+        _Result(0, _blind_prs(14)),
+        _Result(0, json.dumps([_pr(i, "DIRTY") for i in range(1, 14)]))])
+    line = objective.build()
+    assert "queue_read=BLIND" not in line, line
+    assert "queue_read=SETTLED(samples=2)" in line, line
+    assert "nondraft=13" in line, line
+    assert "resolve-conflict=13" in line, line
+
+
+def test_a_FIRST_read_timeout_still_declares_the_fleet_blind(monkeypatch):
+    """The classification that `main()`'s cache guard depends on, pinned (#1869 review).
+
+    Absorbing the raise moved this failure off a bare `error=` line (which the guard knows) onto
+    `queue=UNREADABLE` (which it does NOT). So the transport classification must be right: a
+    FIRST-read timeout is a failure to REACH GitHub and must name the fleet blind -- otherwise the
+    failed read is cached and served for up to 900 s (the #6142 class).
+    """
+    install(monkeypatch)
+
+    def boom(*a, **k):
+        raise subprocess.TimeoutExpired(cmd="gh", timeout=120)
+
+    monkeypatch.setattr(objective, "_gh_retry", boom)
+    line = objective.build()
+    assert "queue=UNREADABLE" in line, line
+    assert "gh=UNREADABLE(queue)" in line, line
+    assert "error=" not in line, line
+
+
+def test_the_resample_bounds_the_READ_itself_not_only_its_count(monkeypatch):
+    """The two mechanisms that make the wall-clock bound real must not be deletable silently.
+
+    `attempts=1` on a re-read (it is a retry already -- no nested 3 x transport chain) and a
+    timeout clipped to the remaining budget. Without either, the worst case returns to
+    4 samples x 3 attempts x 120 s, which `run_bounded 90` kills -- and a killed refresh writes
+    NO line at all. Asserted on the transport seam, because `install()`'s stub ignores both args.
+    """
+    install(monkeypatch, pr_list=[_Result(0, _blind_prs(14))])
+    real = objective._gh_retry
+    calls = []
+
+    def spy(argv, **kw):
+        calls.append(kw)
+        return real(argv, **kw)
+
+    monkeypatch.setattr(objective, "_gh_retry", spy)
+    objective.build()
+    assert len(calls) >= 2, calls
+    assert calls[0] == {}, calls[0]                       # first read: full transport resilience
+    for kw in calls[1:]:
+        assert kw.get("attempts") == 1, kw
+        assert 0 < kw.get("timeout", 0) <= objective.QUEUE_BLIND_BUDGET_S, kw
+
+
+def test_a_failed_resample_keeps_the_sample_it_already_has(monkeypatch):
+    """Re-reading must not make a transient WORSE than not re-reading.
+
+    The first sample ANSWERED (blind), so a 504 on the second must not collapse the line to
+    `queue=UNREADABLE` and throw away `open`/`nondraft`/the DO list.
+    """
+    install(monkeypatch, pr_list=[_Result(0, _blind_prs(3)),
+                                 _Result(1, "", "HTTP 504: Server Error")])
+    line = objective.build()
+    assert "queue=UNREADABLE" not in line, line
+    assert "nondraft=3" in line, line
+    assert QUEUE_SEG in line, line
+    assert "resample=FAILED" in line, line     # ...and the failure is REPORTED, not silent
+
+
+def test_a_failed_resample_never_claims_the_fleet_is_blind(monkeypatch):
+    """A RE-read failing is not the same fact as the queue being unreadable (#1869 review).
+
+    `queue` is a BLINDING surface, and `gh=UNREADABLE(queue)` is what `main()` keys on to refuse
+    the cache write and `turn-classify` keys on to tell every agent to distrust reads. But here
+    the queue WAS read and the held sample is on the line -- naming the queue as unreadable both
+    misattributes the failure and makes a transient re-read worse than no re-read at all. The
+    re-sample surface must therefore be distinctive and non-blinding.
+    """
+    install(monkeypatch, pr_list=[_Result(0, _blind_prs(3)),
+                                 _Result(1, "", "API rate limit exceeded for user ID 1")])
+    line = objective.build()
+    assert "gh=" not in line, line                      # no fleet-blindness claim
+    assert "GH-RATE-LIMITED" not in line, line          # ...and no verdict rewrite
+    assert "nondraft=3" in line, line
+    assert objective.GH_BLOCKED is None, objective.GH_BLOCKED
+
+
+def test_a_resample_TIMEOUT_does_not_blank_the_line(monkeypatch):
+    """`subprocess.run(timeout=...)` RAISES; it does not return `returncode != 0` (#1869 P1).
+
+    The short re-read timeout makes `TimeoutExpired` the most likely failure on precisely the
+    slow-API condition that triggers re-sampling. Uncaught, it escaped `queue()`/`build()` and
+    took the held sample, every count, the DO list and the BLIND token with it -- replaced by a
+    bare `error=` line, i.e. strictly worse than not re-reading.
+    """
+    install(monkeypatch, pr_list=[_Result(0, _blind_prs(5))])
+    real = objective._gh_retry
+    calls = []
+
+    def boom(*a, **k):
+        calls.append(1)
+        if len(calls) == 1:
+            return real(*a, **k)
+        raise subprocess.TimeoutExpired(cmd="gh", timeout=1)
+
+    monkeypatch.setattr(objective, "_gh_retry", boom)
+    line = objective.build()
+    assert "error=" not in line, line
+    assert "nondraft=5" in line, line
+    assert "queue=UNREADABLE" not in line, line
+    assert "resample=FAILED" in line, line
+    assert calls == [1, 1], calls          # it did try to re-read, and then stopped
+
+
+def test_a_mangled_resample_keeps_the_sample_it_already_has(monkeypatch):
+    """...and the same rule applies when the transport answered but the BODY was garbage.
+
+    Published as identical: the unparseable branch also returned None, discarding a sample that
+    had already parsed -- i.e. a mangled retry was made WORSE than no retry at all.
+    """
+    install(monkeypatch, pr_list=[_Result(0, _blind_prs(3)),
+                                 _Result(0, "<html>502 gateway</html>")])
+    line = objective.build()
+    assert "queue=UNREADABLE" not in line, line
+    assert "nondraft=3" in line, line
+    assert "gh=UNREADABLE" not in line, line   # a parse failure is not fleet blindness
 
 
 # --- THE VERDICT MUST BE ABLE TO GO RED ON A GROWING BACKLOG ------------------------------
@@ -362,10 +867,13 @@ def test_a_stale_sample_does_not_manufacture_a_growth_verdict(monkeypatch):
 # GitHub does not reconcile a run that was never picked up (a cancelled workflow, a runner that
 # never came up, a job created and then orphaned): `status` stays non-`completed` at that head
 # PERMANENTLY. Nothing in the classifier looked at a check's AGE, so the shape could never
-# leave it: the re-trigger arm requires `not req_seen` (and `not flight` on the #1872 branch),
-# and a wedged run is absent from `seen` while its healthy siblings are not. MEASURED pre-fix
-# at main=57edbd7a0, `classify_queue` on the state below returns `{'fix-ci': 1}` -- "go repair
-# the code" for a job that never ran.
+# leave it: a wedged run is PRESENT in `seen` while never reaching `completed`, so every
+# absence-based arm is structurally blind to it -- and `rollup_checks` puts it in `flight`.
+# MEASURED on this branch's original base (main=57edbd7a0) `classify_queue` returns
+# `{'fix-ci': 1}` -- "go repair the code" for a job that never ran. On the MERGED tree (#1930
+# landed) the same state reads `running`: a wait that never ends, which is what #1930's own
+# commit body recorded as #1926 "(`running` has no age bound, so a wedged check-run parks a PR
+# forever)". Both are pinned below.
 #
 # The fix carries the ONE missing dimension: the ATTEMPT's age. Pinned below, both ways: below
 # the bound nothing changes (a slow shard is not a stuck one), above it the class is the
@@ -375,11 +883,13 @@ NOW = 1_800_000_000.0                  # a FIXED clock: the bound is pinned, not
 # An age past the bound by a wide margin. A LITERAL, not `FLIGHT_BOUND_MIN + something`: the
 # constant's own range is pinned separately, so this cannot drift out of validity silently.
 WEDGED_MIN = 150
-# The contexts a landing waits on, spelled INDEPENDENTLY of the code. That does NOT make the
-# tests below fail behaviourally pre-fix: `stalled_flight` is a new symbol, so a pre-fix run
-# fails most of them with AttributeError. The BEHAVIOURAL pre-fix failure is
-# `test_the_beat_names_the_wedged_check_and_its_age` (it drives `classify_queue` only, and
-# reads `{'fix-ci': 1}` where the fix produces `rerun-checks`); the rest pin the contract.
+# The contexts a landing waits on, spelled INDEPENDENTLY of the code. That does NOT make EVERY
+# test below fail behaviourally pre-fix: `stalled_flight` is a new symbol, so a pre-fix run
+# fails most of them with AttributeError. The BEHAVIOURAL ones are
+# `test_a_run_past_the_bound_is_rerun_checks_not_a_wait` (the classifier's own answer, no new
+# symbols needed: `running` on the merged tree, `fix-ci` on this branch's original base) and
+# `test_the_beat_names_the_wedged_check_and_its_age` (it drives `classify_queue` only); the
+# rest pin the contract.
 GATED_FOR_TEST = ("pricing-artifact", "docs", "test-isolation", "license-surface",
                   "legal-e2e", "python-ci-gate")
 
@@ -428,12 +938,15 @@ def _a_pr(ms="UNSTABLE"):
 def test_a_run_past_the_bound_is_rerun_checks_not_a_wait():
     """THE DEFECT. A required check left `queued` -- the shape the issue names -- others green.
 
-    PRE-FIX `classify_pr` answers `fix-ci`: the beat sends a lane to repair code for a job that
-    never ran, and the re-trigger never happens. POST-FIX it is the actionable class the issue
-    asks for, and the reason names the check, its state and its age.
+    PRE-FIX `classify_pr` has no age term (no `stalled` argument at all), so the wedged check is
+    simply `in flight`. On the MERGED tree (#1930 landed) that answers `running`: the head is
+    assumed to be executing, both readers skip the PR, and nothing will ever complete it. On
+    this branch's original base it answered `fix-ci`: a lane sent to repair code for a job that
+    never ran. POST-FIX it is the actionable class the issue asks for, and the reason names the
+    check, its state and its age.
     """
     cr = _wedged_cr(age_min=WEDGED_MIN)
-    assert objective.classify_pr(_a_pr(), cr, False) == "fix-ci"     # no age term today
+    assert objective.classify_pr(_a_pr(), cr, False) == "running"     # no age term today
     stalled = objective.stalled_flight(cr, now=NOW, run_clock=_clock(attempt_min=WEDGED_MIN))
     assert [(n, st) for n, st, _a in stalled] == [("python-ci-gate", "queued")]
     assert round(stalled[0][2]) == WEDGED_MIN
@@ -448,7 +961,7 @@ def test_below_the_bound_a_slow_run_is_still_a_wait(monkeypatch):
             runs={9001: _Result(0, json.dumps({"run_started_at": _iso(NOW - 20 * 60)}))})
     monkeypatch.setattr(objective, "attestation_clean", lambda n, h: False)
     monkeypatch.setattr(objective.time, "time", lambda: NOW)
-    classes, _surface, by_class = objective.classify_queue([_a_pr()])
+    classes, _surface, by_class, _prs = objective.classify_queue([_a_pr()])
     assert classes["rerun-checks"] == 0, classes
     assert "rerun-checks" not in by_class, by_class
 
@@ -522,7 +1035,9 @@ def test_an_unreadable_clock_leaves_the_run_in_flight():
     cr = _wedged_cr(age_min=None)
     assert objective.stalled_flight(cr, now=NOW, run_clock=lambda rid: None) == []
     assert objective.stalled_flight(cr, now=NOW, run_clock=None) == []
-    assert objective.classify_pr(_a_pr(), cr, False, []) == "fix-ci"
+    # ...and nothing about the class changes: it is still the in-flight WAIT (`running` on the
+    # merged tree, `fix-ci` on this branch's original base), never a manufactured re-trigger.
+    assert objective.classify_pr(_a_pr(), cr, False, []) == "running"
 
 
 def test_a_red_check_is_work_even_beside_a_wedged_one():
@@ -577,9 +1092,85 @@ def test_the_beat_names_the_wedged_check_and_its_age(monkeypatch):
             runs={9001: _Result(0, json.dumps({"run_started_at": _iso(NOW - WEDGED_MIN * 60)}))})
     monkeypatch.setattr(objective, "attestation_clean", lambda n, h: False)
     monkeypatch.setattr(objective.time, "time", lambda: NOW)
-    classes, _surface, by_class = objective.classify_queue([_a_pr()])
+    classes, _surface, by_class, _prs = objective.classify_queue([_a_pr()])
     assert classes["rerun-checks"] == 1, classes
     why = f"python-ci-gate queued {WEDGED_MIN}m"
     assert by_class["rerun-checks"] == [(8822, why)], by_class
     assert (objective._class_token("rerun-checks", 1, by_class["rerun-checks"])
             == f"rerun-checks=1: #8822({why})")
+# --- THE PER-CLASS SEGMENT IS **STATE**, NOT A SECOND DISPATCH LIST (#1872) ---------------
+# The beat printed `DO: call-rail=1: #8795 (STUCK 3 beats — land or say why)` while `pr-doctor`
+# was running its own pass over the SAME PRs -- two copies of one decision, and the fleet follows
+# the instruction instead of the chain (measured 2026-10-16: the PR landed by hand). The counts
+# stay, as STATE, and a MONITOR keeps the two things only it can supply: main's health, the
+# objective's direction, and the one human gate (`ASK-USER`).
+
+def _stub_queue(monkeypatch, tmp_path, *, nondraft=4, classes=None, by_class=None,
+                surface=0, unknown=0, surface_prs=None):
+    monkeypatch.setattr(objective, "STATE", str(tmp_path))
+    monkeypatch.setattr(objective, "STUCK_FILE", str(tmp_path / "call-rail-stuck.json"))
+    monkeypatch.setattr(objective, "main_sha", lambda: SHA)
+    monkeypatch.setattr(objective, "main_health", lambda sha: ("GREEN", []))
+    monkeypatch.setattr(objective, "ci_critical_path", lambda: (5.0, "test (a)", 6.0))
+    monkeypatch.setattr(objective, "queue", lambda: {
+        "open": nondraft, "drafts": 0, "nondraft": nondraft, "dirty": 0, "unstable": 0,
+        "unknown": unknown, "classes": classes, "by_class": by_class or {},
+        "surface": surface, "surface_prs": surface_prs or []})
+
+
+def test_the_queue_segment_is_labelled_state_and_not_an_instruction(monkeypatch, tmp_path):
+    """The label IS the fix: `DO:` named work an automatic chain was already doing."""
+    from collections import Counter
+    _stub_queue(monkeypatch, tmp_path,
+                classes=Counter({"call-rail": 1, "record-review": 2, "running": 1}),
+                by_class={"call-rail": [(8795, None)],
+                          "record-review": [(8801, None), (8802, None)],
+                          "running": [(8806, None)]},
+                surface=1, surface_prs=[9001])
+    line = objective.build()
+    assert "| QUEUE(state; pr-doctor dispatches): " in line, line
+    assert "DO: " not in line, line                       # the instruction token is GONE
+    # ...the counts and their objects are still REPORTED -- as state
+    assert "call-rail=1: #8795" in line, line
+    assert "record-review=2: #8801 #8802" in line, line
+    # `running` is NAMED, not just counted (#1872 review): a check-run can stay non-completed
+    # indefinitely, so a bare `running=2` would let a wedged PR hide behind a number
+    assert "running=1: #8806" in line, line
+    # ...and the one thing only a human can take still reaches the owner -- WITH its objects
+    assert "ASK-USER: surface=1: #9001" in line, line
+
+
+def test_a_stuck_landable_pr_is_reported_as_a_fact_about_the_dispatcher(monkeypatch, tmp_path):
+    """The escalation must not be a second order. What the monitor can add is that a landable PR
+    has been landable for N beats and the chain has still not landed it."""
+    from collections import Counter
+    _stub_queue(monkeypatch, tmp_path, classes=Counter({"call-rail": 1}),
+                by_class={"call-rail": [(8795, None)]})
+    objective.build()                                     # beat 1: not stuck yet
+    line = objective.build()                              # beat 2: one full beat of waiting
+    assert "STUCK 2 beats" in line, line
+    assert "pr-doctor has not landed it" in line, line
+    assert "land or say why" not in line, line            # NOT an order
+
+
+def test_REGRESSING_still_reaches_the_owner_with_the_new_segment(monkeypatch, tmp_path):
+    """The MONITOR half must survive the change: direction over the window is why the token is
+    worth waking a human for, and it must not be collateral damage of renaming a label."""
+    from collections import Counter
+    _stub_queue(monkeypatch, tmp_path, nondraft=21, classes=Counter({"fix-ci": 3}),
+                by_class={"fix-ci": [(9, "docs"), (8, "docs"), (7, "python-ci-gate")]})
+    line = objective.build(prev=(12, 120.0))
+    assert "VERDICT=REGRESSING" in line, line
+    assert "| QUEUE(state; pr-doctor dispatches): " in line, line
+    assert "IN-PROGRESS: fixing docs=2 python-ci-gate=1" in line, line
+
+
+def test_a_missing_class_is_not_printed_as_a_zero(monkeypatch, tmp_path):
+    """An absent token is honest; a printed zero is a claim. The state segment keeps that rule."""
+    from collections import Counter
+    _stub_queue(monkeypatch, tmp_path, classes=Counter({"fix-ci": 1, "running": 2}),
+                by_class={"fix-ci": [(9, "docs")], "running": [(8, None), (7, None)]})
+    line = objective.build()
+    assert "call-rail=0" not in line, line
+    assert "record-review=0" not in line, line
+    assert "running=2" in line, line
