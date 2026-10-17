@@ -1663,6 +1663,7 @@ if [ -s "$T/release.sh" ] && grep -q 'claim_issue_release' "$T/release.sh"; then
     # inherit-only form: if someone puts the file read back, a stale re-run captures a generation it
     # never took and deletes the newer holder's claim (reproduced).
     grep -qx 'CHAIN_CLAIM_COMMIT="${CHAIN_CLAIM_COMMIT:-}"' "$HERE/chain-merge.sh" \
+      && [ "$(grep -c 'claim_issue_record_commit\|state/issueclaim-' "$HERE/chain-merge.sh")" = "0" ] \
       && ok "chain-merge: the generation is INHERITED, never read from the shared record (a manual re-run gets none and refuses)" \
       || bad "chain-merge: the generation is being re-derived from the record — a re-run after a re-acquire would capture a generation it never took"
     # ⛔ NO CAPTURED GENERATION → REFUSE THE RELEASE (acceptance-review finding). The capture is empty

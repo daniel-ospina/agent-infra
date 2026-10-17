@@ -101,7 +101,16 @@ cleanup_remote() {
   done
   return 0
 }
-cleanup_all() { trap - EXIT INT TERM; cleanup_remote; cleanup_boxes; }
+cleanup_all() { # ⛔ the ISSUE and PROBE refs are cleaned HERE too (adversarial round 2): with
+  # ISSUE_REF removed from cleanup_remote (it cannot be deleted on an observed-tip fence), an aborted
+  # run would otherwise leave a LIVE claim on the production origin. Both are ownership-checked, so
+  # adding them here is safe; the guards keep `set -u` from aborting the trap before the temp dirs go.
+  trap - EXIT INT TERM
+  cleanup_remote
+  [ -n "${ISSUE_REF:-}" ] && [ -n "${ISSUE:-}" ] && cleanup_issue_ref
+  [ -n "${PROBE_REF:-}" ] && [ -n "${probe_own:-}" ] && \
+    git -C "$A" push -q --force-with-lease="$PROBE_REF:$probe_own" origin ":$PROBE_REF" 2>/dev/null
+  cleanup_boxes; }
 trap cleanup_all EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
@@ -127,6 +136,7 @@ runB() { ( cd "$B" && export CLAIM_OWNER_ID=boxB && . "$CLAIMS_SH" && "$@" ); }
 # without a per-call-site log that a new section can silently miss.
 _owned_by_this_run() { # -> 0 if the lease on $ISSUE_REF names THIS process
   local st who
+  [ -n "${ISSUE:-}" ] || return 1
   # claim_issue_status takes (repo, issue) — the repo argument exists only for API symmetry, and
   # omitting it trips `set -u` inside claims.sh, which reads as "not ours" and silently disables every
   # teardown (measured: that is exactly how the first draft of this guard failed).
@@ -138,13 +148,17 @@ _owned_by_this_run() { # -> 0 if the lease on $ISSUE_REF names THIS process
   case "$who" in
     # the synthetic ids the sections hand-build leases with (`_claim_commit foreignbox 0` etc):
     # this suite planted them, so deleting them is not destroying a peer's claim
+    # ⛔ THIS IS SAFE ONLY BECAUSE claims.sh ALWAYS APPENDS `:<pid>` (claim_owner, `"${CLAIM_OWNER_ID}:
+    # $$"`). A real peer lease is therefore never these exact tokens. If that format ever loses the
+    # pid, this whitelist starts deleting other boxes' claims — pin the format, not just this list.
     expiredbox|foreignbox|twin|probe|proberef|boxA|boxB) return 0 ;;
   esac
   case "${who##*:}" in ''|*[!0-9]*) return 1 ;; esac
   [ "${who##*:}" = "$$" ]
 }
 cleanup_issue_ref() {
-  local cur; cur="$(git -C "$A" ls-remote origin "$ISSUE_REF" 2>/dev/null | awk '{print $1}')"
+  local cur; [ -n "${ISSUE_REF:-}" ] || return 0
+  cur="$(git -C "$A" ls-remote origin "$ISSUE_REF" 2>/dev/null | awk '{print $1}')"
   [ -n "$cur" ] || return 0
   if _owned_by_this_run; then
     git -C "$A" push -q --force-with-lease="$ISSUE_REF:$cur" origin ":$ISSUE_REF" 2>/dev/null
@@ -222,6 +236,13 @@ probe_fence() { # <rc1> <own> <now> -> "delete" | "skip"
   [ "$1" = "0" ] && [ -n "$2" ] && [ "$3" = "$2" ] && { printf 'delete'; return 0; }
   printf 'skip'
 }
+# ⛔ THE TEARDOWN'S OWNERSHIP CHECK NEEDS A CLAIM IT MUST *NOT* DELETE (adversarial round 2). Every
+# lease this suite plants is either written by its own box identities (pid == $$) or carries a
+# whitelisted synthetic id, so the not-owned branch is never entered: replacing `_owned_by_this_run`
+# with `return 0` — the exact pre-fix "delete whatever is there" — left the suite 115/0 GREEN. So a
+# FOREIGN claim is minted in a SEPARATE PROCESS (`bash -c`, whose $$ differs from this one), and the
+# teardown must leave it alone.
+run_unclaimed_guard() { ( A=/nonexistent; unclaimed_issue_number >/dev/null 2>&1; printf '%s' "$?" ); }
 if [ -n "${ISSUE:-}" ]; then ISSUE_SET=1; else ISSUE_SET=0; fi
 if [ "$ISSUE_SET" -eq 0 ]; then
   ISSUE="$(unclaimed_issue_number)" || {
@@ -255,6 +276,36 @@ ck() { # ck <label> <expected-regex> <actual>
   if grep -q "$2" <<<"$3"; then echo "  ✅ $1"; PASS=$((PASS+1));
   else echo "  ❌ $1 — expected /$2/ in: $3"; FAIL=$((FAIL+1)); fi
 }
+
+echo
+echo "=== I0. OWNERSHIP: a teardown must never delete a claim this run did not take ==="
+# (1) an UNREADABLE registry is a REFUSAL, not an empty answer — the polarity claim_issue_preflight
+# takes. Without this assertion, deleting `|| return 2` restores the fail-open silently.
+ck "I0: an unreadable registry REFUSES the key choice (rc=2), it does not pick a number" "^2$" "$(run_unclaimed_guard)"
+# (2) a FOREIGN claim must survive the teardown. Minted in a SEPARATE PROCESS so its $$ is not ours.
+FOREIGN="$(unclaimed_issue_number)" || { echo "❌ no unclaimed number for the foreign-claim case"; exit 2; }
+( cd "$A" && bash -c 'export CLAIM_OWNER_ID=peerbox; . "$1"; claim_issue_acquire 0 "$2" 600' _ "$CLAIMS_SH" "$FOREIGN" ) >/dev/null 2>&1
+FOREIGN_SHA="$(git -C "$A" ls-remote origin "refs/claims/issue-$FOREIGN" | awk '{print $1}')"
+ck "I0: the foreign claim was minted (by a different pid)" "^[0-9a-f]\{40\}$" "$FOREIGN_SHA"
+saved_issue="$ISSUE"; saved_ref="$ISSUE_REF"
+ISSUE="$FOREIGN"; ISSUE_REF="refs/claims/issue-$FOREIGN"
+cleanup_issue_ref >/dev/null 2>&1
+left="$(git -C "$A" ls-remote origin "$ISSUE_REF" | awk '{print $1}')"
+[ "$left" = "$FOREIGN_SHA" ] \
+  && { echo "  ✅ a claim this run did NOT take survives its teardown"; PASS=$((PASS+1)); } \
+  || { echo "  ❌ the teardown DELETED a foreign claim (${FOREIGN_SHA:-<none>} -> ${left:-<gone>})"; FAIL=$((FAIL+1)); }
+# (3) ...and the SAME teardown does remove a claim this run took (so the check is not "never delete").
+ISSUE="$saved_issue"; ISSUE_REF="$saved_ref"
+runA claim_issue_acquire "$A" "$saved_issue" 600 >/dev/null 2>&1
+own_sha="$(git -C "$A" ls-remote origin "$ISSUE_REF" | awk '{print $1}')"
+ck "I0: this run's own claim was taken" "^[0-9a-f]\{40\}$" "$own_sha"
+cleanup_issue_ref >/dev/null 2>&1
+left="$(git -C "$A" ls-remote origin "$ISSUE_REF" | awk '{print $1}')"
+[ -z "$left" ] \
+  && { echo "  ✅ this run's OWN claim is removed by the same teardown"; PASS=$((PASS+1)); } \
+  || { echo "  ❌ the teardown left this run's OWN claim behind (${left:-<gone>})"; FAIL=$((FAIL+1)); }
+# the foreign ref is ours to remove (we minted it), fenced on its own commit
+git -C "$A" push -q --force-with-lease="refs/claims/issue-$FOREIGN:$FOREIGN_SHA" origin ":refs/claims/issue-$FOREIGN" 2>/dev/null
 cleanup_ref() {
   local cur; cur="$(git -C "$A" ls-remote origin "$REF" | awk '{print $1}')"
   [ -n "$cur" ] && git -C "$A" push -q --force-with-lease="$REF:$cur" origin ":$REF" 2>/dev/null

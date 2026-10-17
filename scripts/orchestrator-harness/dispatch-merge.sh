@@ -72,10 +72,13 @@ for N in "$@"; do
   # the whole lease. (A failed LANE spawn is deliberately NOT released here: the chain IS alive and
   # waiting for that PR, so releasing would let a peer duplicate the work. That wait is bounded —
   # 90 minutes, then chain-merge.sh's own trap releases it.)
-  # ⛔ HAND THE CHAIN ITS GENERATION (adversarial review). This runs in the same loop body that wrote
-  # `$O/state/issueclaim-<N>`, so the record's value here is the one THIS dispatch created — the one
-  # fact a chain cannot safely discover for itself later (see chain-merge.sh's capture comment). Read
-  # it now, inject it into the child; a chain started any other way has none and refuses to release.
+  # ⛔ HAND THE CHAIN ITS GENERATION (adversarial review). The record here is the one THIS dispatch
+  # wrote — the one fact a chain cannot safely discover for itself later (see chain-merge.sh's comment).
+  # ⚠️ The window is NOT microseconds for every member of a batch: the loop sleeps between issues, so
+  # the k-th issue's record is read ~30·(k-1)s after it was written. The read is still correct because
+  # the record can only be OVERWRITTEN by a re-acquire, and a re-acquire needs the current claim to be
+  # RELEASED or to reach its CLAIM_ISSUE_TTL (3h) first — not because the gap is small. Do not shorten
+  # the TTL without revisiting this line.
   chain_gen="$( . "$O/claims.sh" 2>/dev/null; claim_issue_record_commit "$O" "$N" 2>/dev/null )" || true
   if tmux new-session -d -s "chain-$N" "CHAIN_CLAIM_COMMIT='$chain_gen' bash '$O/chain-merge.sh' '$REPO' '$OR' $N '$BR'" 2>/dev/null; then
     echo "        chain-$N (review->record->merge)"
