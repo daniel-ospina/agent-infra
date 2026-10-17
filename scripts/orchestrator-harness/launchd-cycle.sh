@@ -1,10 +1,18 @@
 #!/usr/bin/env bash
-# launchd-cycle.sh — the ONE implementation of "stop / enable / (re)start / PROVE it started" for this
-# repo's launchd job. Sourced by scripts/orchestrator-harness/install.sh; driven directly by
-# scripts/install-launchd-durability.test.sh with a stub `launchctl` first on PATH.
+# launchd-cycle.sh — the ONE implementation of "stop / enable / (re)start / PROVE it started" for the
+# ORCHESTRATOR job (label com.eldato.orchestrator-loop). Sourced by
+# scripts/orchestrator-harness/install.sh; driven directly by
+# scripts/orchestrator-harness/install-launchd-durability.test.sh with a stub `launchctl` first on PATH.
 #
-# ⛔ THE RULE THIS FILE ENCODES: NEVER WRITE A PERSISTENT DISABLE, AND NEVER REPORT A START YOU DID NOT
-#    VERIFY.
+# ⛔ NOT the only launchd seam in this repo, deliberately: `scripts/install-launchd.sh` runs the SAME
+# enable→bootout→bootstrap sequence for the template family under `templates/launchd/`. It is a separate
+# implementation because the two have OPPOSITE bootstrap-failure policies — that one treats a failed
+# bootstrap as terminal and removes the plist (`rm -f "$installed"  # nothing half-installed`), while
+# this one falls back to the legacy `load` path, which is what actually recovered THIS controller on
+# 2026-10-17. Neither seam serves the other's jobs; if you change one verb sequence, read the other.
+#
+# ⛔ THE RULE THIS FILE ENCODES: NEVER WRITE A PERSISTENT DISABLE, NEVER TOUCH A JOB THAT IS NOT OURS,
+#    AND NEVER REPORT A START YOU DID NOT VERIFY.
 #
 # The old flow was `launchctl unload -w` followed by `launchctl load -w` (install.sh --uninstall, its
 # printed start/stop guidance, and the README §4/§6/§9 commands an agent copies). `-w` is not a
@@ -43,25 +51,97 @@ lc_domain() { printf 'gui/%s\n' "$(id -u)"; }
 
 lc_err() { printf '%s\n' "$*" >&2; }
 
+# lc_real_home — the account's real home directory, or EMPTY when it cannot be determined (no `dscl`:
+# a Linux CI runner, where there is also no gui domain to protect). Captured first and parsed in the
+# shell, so no pipe is left to receive a SIGPIPE (#841) and a home path containing spaces survives.
+lc_real_home() {
+  local out
+  out="$(dscl . -read "/Users/$(id -un)" NFSHomeDirectory 2>/dev/null)" || return 0
+  case "$out" in
+    "NFSHomeDirectory: "*) printf '%s\n' "${out#NFSHomeDirectory: }" ;;
+  esac
+}
+
+# lc_canon <path> — canonical absolute path (symlinks resolved in the DIRECTORY), or empty when the
+# directory does not exist. macOS reports `/private/tmp/...` for a plist bootstrapped as `/tmp/...`, so
+# a byte comparison of the two spellings would call the same job "someone else's".
+lc_canon() {
+  local d b
+  [ -n "${1:-}" ] || return 0
+  d="$(cd "$(dirname "$1")" 2>/dev/null && pwd -P)" || return 0
+  b="$(basename "$1")"
+  [ -n "$d" ] && printf '%s/%s\n' "${d%/}" "$b"
+}
+
+# lc_loaded_path <label> — the plist PATH launchd has the job loaded from, or empty when it is not
+# loaded. This is the ONE datum that tells us whether a loaded job is OURS.
+lc_loaded_path() {
+  local out
+  out="$(launchctl print "$(lc_domain)/$1" 2>/dev/null)" || return 0
+  awk '/^[[:space:]]*path = /{ sub(/^[[:space:]]*path = /, ""); print; exit }' <<<"$out"
+}
+
+# lc_guard_mutate <label> <plist> — the two preconditions EVERY mutating verb must pass first.
+#
+# ⛔ (1) TEMP-HOME (#446). A run whose $HOME is not the real home registers (and removes) jobs in the
+# REAL gui domain: the observed failure was com.eldato.provider-latency-tripwire registered against a
+# deleted `pi-setup-test.*/home` path, runs=0, dead through the #413 window. This is the repo's recorded
+# decision and it is implemented the same way in scripts/install-launchd.sh:380-403; tests opt in with
+# ELDATO_ALLOW_TEST_HOME=1 plus a `launchctl` stub on PATH.
+#
+# ⛔ (2) IS THE LOADED JOB OURS? `launchctl bootout <domain> <path>` does NOT match on the path — the
+# path only selects which plist to read the LABEL from, and launchd then removes the service BY LABEL
+# (measured 2026-10-17 on this box: `bootout gui/501 /tmp/b/copy-with-same-label.plist` removed a job
+# bootstrapped from /tmp/a/…, rc=0). Since the rendered plist always carries the production label, a
+# sandboxed `--uninstall`/`--start` WOULD remove the live controller — the very failure this file
+# exists to prevent, arriving through the door it thought it had shut. So the loaded job's own `path`
+# must equal the plist we are about to act on, or we touch nothing. `enable` has no path form at all
+# (`enable | disable service-target`), which is why that check has to come before it, not with it.
+lc_guard_mutate() {
+  local label="$1" plist="${2:-}" real loaded mine
+  if [ "${ELDATO_ALLOW_TEST_HOME:-}" != "1" ]; then
+    real="$(lc_real_home)"
+    if [ -n "$real" ] && [ "$HOME" != "$real" ]; then
+      lc_err "❌ refusing to change launchd state for $label: HOME=$HOME is not the real home ($real), so this run would act in the REAL user domain. Next: run it from your own account, or for a test set ELDATO_ALLOW_TEST_HOME=1 with a launchctl stub on PATH (#446)"
+      return 1
+    fi
+  fi
+  loaded="$(lc_loaded_path "$label")"
+  if [ -n "$loaded" ] && [ -n "$plist" ]; then
+    mine="$(lc_canon "$plist")"
+    if [ "$(lc_canon "$loaded")" != "$mine" ]; then
+      lc_err "❌ refusing to touch $label: a job with that label is loaded from $loaded, not $plist — launchd resolves a removal by LABEL, so acting here would remove that job. Next: launchctl print $(lc_domain)/$label | head -20, and remove the foreign job by hand if it really is yours"
+      return 1
+    fi
+  fi
+  return 0
+}
+
 # lc_bootout <label> <plist>
 # Remove the job definition. NO `-w` and no `unload`, so launchd's persistent Disabled override is
 # never touched — this is the difference between "not loaded" (recoverable) and "disabled" (silent and
 # sticky).
 #
-# ⛔ PATH-KEYED, NEVER LABEL-KEYED (#1975). `launchctl bootout gui/<uid>/<label>` resolves the label in
-# the REAL user domain and IGNORES $HOME — so an installer run against a sandbox HOME (the self-test's
-# sandbox, a lane validating the harness) would boot out the PRODUCTION controller. That is the same
-# failure this whole file exists to prevent, arriving through a different door; the service-target form
-# is therefore not used here at all, and the plist path is the only handle. Consequence, stated: a job
-# whose plist has already been deleted cannot be removed by this function — it returns 0 and the job is
-# left loaded, which the caller's own read of `launchctl print` (and `pkill` per README §6) can see.
+# ⛔ GUARDED, AND ITS STATUS MEANS SOMETHING. `lc_guard_mutate` runs first (a temp-HOME run and a
+# label owned by another path both refuse), and a removal that actually FAILS returns non-zero with
+# launchd's own diagnostic instead of being swallowed — the old `… 2>/dev/null && return 0` plus an
+# unconditional `return 0` let `--uninstall` print "✅ Removed" over a job that was still loaded.
+# "Not loaded" stays a success: it is the common case on a fresh box and on a second `--uninstall`.
 lc_bootout() {
-  local plist="${2:-}" d
+  local label="$1" plist="${2:-}" d diag
   d="$(lc_domain)"
-  if [ -n "$plist" ] && [ -e "$plist" ]; then
-    launchctl bootout "$d" "$plist" 2>/dev/null && return 0
-  fi
-  return 0
+  lc_guard_mutate "$label" "$plist" || return 1
+  [ -n "$plist" ] && [ -e "$plist" ] || return 0
+  # NOT LOADED = nothing to remove, and that is a SUCCESS (a first install, a second `--uninstall`, a
+  # plist rendered but never bootstrapped). Checked by READING the domain rather than by interpreting
+  # launchctl's error text: `bootout` on an unknown service exits non-zero with no output at all.
+  [ -n "$(lc_loaded_path "$label")" ] || [ -n "$(lc_pid "$label")" ] || return 0
+  if diag="$(launchctl bootout "$d" "$plist" 2>&1)"; then return 0; fi
+  case "$diag" in
+    *"Could not find"*|*"No such process"*|*"not find service"*|*"Bad request"*) return 0 ;;
+  esac
+  lc_err "❌ launchctl bootout failed for $label (${diag:-no output}). Next: launchctl print $d/$label | head -20"
+  return 1
 }
 
 # lc_enable <label>
@@ -69,6 +149,10 @@ lc_bootout() {
 # recovered by an ordinary start, and it is the one verb here that removes a disable. Tolerated on
 # failure: a job with no override at all is the healthy state, and `enable` is allowed to report
 # nonzero for a service the domain does not know yet.
+# ⛔ `enable` HAS no path form (`man launchctl`: `enable | disable service-target`), so it always acts on
+# the label in the REAL domain. That is why this function must never be called before
+# `lc_guard_mutate` — the guard is what keeps a sandboxed run from clearing a deliberate operator
+# disable on the production job, and lc_start is the only caller that keeps that order.
 lc_enable() { launchctl enable "$(lc_domain)/$1" 2>/dev/null || true; }
 
 # lc_pid <label> — the job's pid, or EMPTY when it is not loaded or is loaded but not running.
@@ -112,10 +196,13 @@ lc_hb_value() {
 # disable straight back.
 lc_start() {
   local label="$1" plist="$2" diag diag2
+  lc_guard_mutate "$label" "$plist" || return 1
   lc_enable "$label"
   # A job that is still loaded cannot be bootstrapped again ("service already loaded"), so the bootout
-  # belongs to the START, not to a separate restart step.
-  lc_bootout "$label" "$plist"
+  # belongs to the START, not to a separate restart step — and a removal that FAILS is fatal here:
+  # carrying on would bootstrap over a job we could not clear, then fall through to `load`, and the
+  # restart would report a success that never happened (the stale-limits trap README §9 exists to close).
+  lc_bootout "$label" "$plist" || return 1
   if diag="$(launchctl bootstrap "$(lc_domain)" "$plist" 2>&1)"; then
     printf 'bootstrap\n'
     return 0
@@ -125,13 +212,18 @@ lc_start() {
     printf 'load\n'
     return 0
   fi
-  lc_err "❌ could not load $label — 'launchctl bootstrap' failed (${diag:-no output}) and the legacy fallback failed too (${diag2:-no output}). The job is left ENABLED and NOT running, so nothing here wrote a persistent disable. Next: launchctl print $(lc_domain)/$label | head -20; plutil -lint $plist"
+  lc_err "❌ could not load $label — 'launchctl bootstrap' failed (${diag:-no output}) and the legacy fallback failed too (${diag2:-no output}). The job is left ENABLED and NOT running, so nothing here wrote a persistent disable. Next: launchctl print $(lc_domain)/$label | head -20; plutil -lint '$plist'"
   printf 'none\n'
   return 1
 }
 
-# lc_assert_running <label> <O> <heartbeat_baseline> [timeout] — POLL until the label has a pid AND
-# $O/heartbeat advanced PAST <heartbeat_baseline>.
+# lc_assert_running <label> <O> <heartbeat_baseline> [timeout] [replaced_pid] — POLL until the label
+# has a pid AND $O/heartbeat advanced PAST <heartbeat_baseline>, then prove the pid is STABLE.
+# replaced_pid (when a job was already loaded) is the pid the caller saw BEFORE the start: it must be
+# GONE, because a start whose old process survives did not take effect — the old controller keeps the
+# old plist limits while the same pid and a fresh heartbeat make it look successful. (Checked inside the
+# poll window, not before it: a booted-out process takes a moment to die and its last heartbeat is
+# already on disk.)
 #
 # ⛔ THE BASELINE IS A PARAMETER, AND THAT IS THE WHOLE POINT. Reading "the current heartbeat" inside
 # this function reads the value the START IT JUST DID already wrote (orch-loop.sh's heartbeat() is the
@@ -142,12 +234,15 @@ lc_start() {
 # that exits at once (a second instance losing the lock race) can be relaunched by launchd a second
 # later — a single instantaneous read would call that a failure while it was still settling.
 lc_assert_running() {
-  local label="$1" O="$2" before="${3:-0}" timeout="${4:-30}" d cur pid i=0
+  local label="$1" O="$2" before="${3:-0}" timeout="${4:-30}" replaced="${5:-}" d cur pid i=0
   d="$(lc_domain)"
   while [ "$i" -lt "$timeout" ]; do
     pid="$(lc_pid "$label")"
     cur="$(lc_hb_value "$O")"
-    if [ -n "$pid" ] && [ "$cur" -gt "$before" ]; then
+    if [ -n "$pid" ] && [ "$cur" -gt "$before" ] && { [ -z "$replaced" ] || [ "$pid" != "$replaced" ]; }; then
+      # …and it must STAY up: a KeepAlive job that dies seconds after a start relaunches with a new pid
+      # and a fresh heartbeat, and every relaunch writes one (heartbeat is the first act of a cycle).
+      lc_assert_stable "$label" "${LC_SETTLE:-5}" || return 1
       printf '  ✓ %s running (pid %s) and the heartbeat advanced\n' "$label" "$pid"
       return 0
     fi
@@ -157,10 +252,42 @@ lc_assert_running() {
   pid="$(lc_pid "$label")"
   if [ -z "$pid" ]; then
     lc_err "❌ $label has NO pid ${timeout}s after the start — the label is not running. Next: launchctl print $d/$label | head -20; tail -40 $O/logs/launchd.err"
+  elif [ -n "$replaced" ] && [ "$pid" = "$replaced" ]; then
+    lc_err "❌ $label still has pid $pid ${timeout}s after the start — the job was NOT replaced, so the loaded plist may still be the OLD one. Next: launchctl print $d/$label | head -20, then boot it out by plist path and start again"
   else
     lc_err "❌ $label has pid $pid but $O/heartbeat did not advance within ${timeout}s — running but NOT cycling. Next: tail -40 $O/logs/orch-loop.log; cat $O/.orch.lock"
   fi
   return 1
+}
+
+# lc_runs <label> — the job's cumulative RELAUNCH counter from `launchctl print`, or empty when the job
+# is not loaded. This is the one signal that separates "cycling" from "crash-looping": `orch-loop.sh`
+# writes the heartbeat as the FIRST act of a cycle and the plist is KeepAlive, so a controller that dies
+# seconds after every start looks identical to a healthy one on pid+heartbeat alone — but every relaunch
+# bumps `runs`, and a healthy job's counter only moves when launchd restarts it.
+lc_runs() {
+  local out
+  out="$(launchctl print "$(lc_domain)/$1" 2>/dev/null)" || return 0
+  awk '/^[[:space:]]*runs = /{ sub(/^[[:space:]]*runs = /, ""); print; exit }' <<<"$out"
+}
+
+# lc_assert_stable <label> [settle] — the job must not be RELAUNCHED during a quiet window.
+# Cheap (one sleep) and read-only, so it is safe on a live box: a healthy controller's `runs` does not
+# move while it works; a crash loop moves it every few seconds.
+lc_assert_stable() {
+  local label="$1" settle="${2:-5}" r0 r1
+  r0="$(lc_runs "$label")"
+  if [ -z "$r0" ]; then
+    lc_err "❌ $label has no 'runs' counter — not loaded, so it cannot be cycling. Next: launchctl print $(lc_domain)/$label | head -20"
+    return 1
+  fi
+  sleep "$settle"
+  r1="$(lc_runs "$label")"
+  if [ -n "$r1" ] && [ "$r0" != "$r1" ]; then
+    lc_err "❌ $label is being RELAUNCHED (launchd runs $r0 → $r1 in ${settle}s) — it starts and dies, so a live pid and a fresh heartbeat prove nothing. Next: tail -40 $O/logs/launchd.err 2>/dev/null; tail -40 $O/logs/orch-loop.log"
+    return 1
+  fi
+  return 0
 }
 
 # lc_foreign_controller <O> — the pid of a controller that is alive but was NOT started by launchd
@@ -193,11 +320,13 @@ lc_restart() {
   printf '==> restarting %s (enable → bootout → bootstrap)\n' "$label"
   via="$(lc_start "$label" "$plist")" || return 1
   printf '  ✓ loaded via %s\n' "$via"
-  lc_assert_running "$label" "$O" "$before" "$timeout"
+  lc_assert_running "$label" "$O" "$before" "$timeout" "$pid"
 }
 
-# lc_ensure <label> <plist> <O> <plist_changed 0|1> [timeout]
+# lc_ensure <label> <plist> <O> <plist_changed 0|1> [timeout] [hb_stale]
 # The SAFE-ON-A-LIVE-BOX entry point behind `install.sh --start`:
+#   • the job is loaded from ANOTHER path                         → refuse before deciding anything (the
+#     "left untouched" branch below would otherwise report OUR controller healthy from a foreign job);
 #   • plist unchanged AND the job is loaded with a fresh heartbeat  → LEFT COMPLETELY UNTOUCHED
 #     (this is the validation run the brief protects: re-rendering the plist must never restart a
 #     healthy production controller);
@@ -207,16 +336,25 @@ lc_restart() {
 #   • plist changed                                                  → reload (the running job is on
 #     the old settings; applying them is the ONLY reason to touch a live job);
 #   • not loaded                                                     → start.
+# hb_stale is the "loaded but wedged" bound, passed in by the caller so it can track that cell's CYC
+# (a fixed 900s fails a healthy CYC=900 cell and points the operator at a needless restart).
 lc_ensure() {
-  local label="$1" plist="$2" O="$3" changed="${4:-1}" timeout="${5:-30}" pid age lock via before
+  local label="$1" plist="$2" O="$3" changed="${4:-1}" timeout="${5:-30}" stale="${6:-780}"
+  local pid age lock via before
+  lc_guard_mutate "$label" "$plist" || return 1
   pid="$(lc_pid "$label")"
   if [ "$changed" = "0" ] && [ -n "$pid" ]; then
     age="$(lc_hb_age "$O")"
-    if [ -n "$age" ] && [ "$age" -le "${LC_HB_STALE:-900}" ]; then
-      printf '  ✓ %s already running (pid %s, heartbeat %ss old) and the plist is UNCHANGED — left untouched\n' "$label" "$pid" "$age"
+    if [ -n "$age" ] && [ "$age" -le "$stale" ]; then
+      # ⛔ A FRESH HEARTBEAT IS NOT PROOF OF HEALTH. `orch-loop.sh` writes it as the first act of a
+      # cycle and the plist is KeepAlive, so a controller that dies seconds after every start keeps the
+      # age fresh forever and this branch would bless it as "already running". The relaunch counter is
+      # what separates them, and it is a read-only check — the live box is still left untouched.
+      lc_assert_stable "$label" "${LC_SETTLE:-5}" || return 1
+      printf '  ✓ %s already running (pid %s, heartbeat %ss old, not relaunching) and the plist is UNCHANGED — left untouched\n' "$label" "$pid" "$age"
       return 0
     fi
-    lc_err "❌ $label is loaded (pid $pid) but $O/heartbeat is ${age:-unreadable}s old — running but not cycling. Next: install.sh --restart"
+    lc_err "❌ $label is loaded (pid $pid) but $O/heartbeat is ${age:-unreadable}s old (limit ${stale}s) — running but not cycling. Next: install.sh --restart"
     return 1
   fi
   if [ -z "$pid" ]; then
@@ -237,5 +375,5 @@ lc_ensure() {
   fi
   via="$(lc_start "$label" "$plist")" || return 1
   printf '  ✓ loaded via %s\n' "$via"
-  lc_assert_running "$label" "$O" "$before" "$timeout"
+  lc_assert_running "$label" "$O" "$before" "$timeout" "$pid"
 }

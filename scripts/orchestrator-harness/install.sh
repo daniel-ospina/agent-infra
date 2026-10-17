@@ -83,15 +83,24 @@ TEMPLATE="$HERE/launchd.plist.template"
 # writes the heartbeat at the TOP of every cycle, so a live controller refreshes it within seconds of
 # being launched; 30s is slack for a cold start, not a cycle's worth of work.
 START_TIMEOUT="${START_TIMEOUT:-30}"
+# How old $O/heartbeat may be before a LOADED job counts as "running but not cycling" (the one state
+# `--start` refuses to fix silently; un-wedging it is `--restart`). Derived from CYC, not a constant: a
+# healthy controller's heartbeat age is bounded by one cycle plus that cycle's work, so a fixed 900s
+# fails a perfectly healthy cell run at CYC=900 and points the operator at the disruptive restart.
+# LC_HB_STALE overrides it for a cell whose cycles are unusually long.
+# ELDATO_ALLOW_TEST_HOME=1 is the test-only opt-in to the #446 temp-HOME guard in launchd-cycle.sh —
+# without it, a run whose $HOME is not the real home refuses to touch launchd at all.
 
 die() { echo "❌ $*" >&2; exit 1; }
 ok()  { echo "  ✓ $*"; }
 warn(){ echo "  ⚠️  $*"; }
 
 # ── the launchd lifecycle seam ───────────────────────────────────────────────────
-# ⛔ ONE implementation, sourced — never a second copy of the bootout/enable/bootstrap dance in this
-# file. FAIL CLOSED if it is missing: an installer that cannot reach the safe path must refuse, not
-# silently fall back to the legacy verbs whose `-w` is the defect (#1975).
+# ⛔ ONE implementation for THIS job's lifecycle, sourced — never a second copy of the
+# bootout/enable/bootstrap dance in this file. (scripts/install-launchd.sh is a separate seam for the
+# template family; it shares the sequence but not the bootstrap-failure policy — see the header of
+# launchd-cycle.sh.) FAIL CLOSED if the library is missing: an installer that cannot reach the safe path
+# must refuse, not silently fall back to the legacy verbs whose `-w` is the defect (#1975).
 LC_LIB="$HERE/launchd-cycle.sh"
 [ -f "$LC_LIB" ] || die "missing $LC_LIB — refusing to install without the launchd lifecycle helper (install.sh must run from the checkout, not from a partial copy)"
 # shellcheck source=launchd-cycle.sh
@@ -116,9 +125,26 @@ if [ "$ACTION" = uninstall ]; then
   # re-install is a plain start rather than a start that has to fight a sticky disable first. A
   # deliberate removal still leaves the job NOT RUNNING — which is the point — and the next
   # `install.sh --start` prints an explicit refusal if anything else holds the controller lock.
-  lc_bootout "$LABEL" "$PLIST"
+  #
+  # ⛔ AND IT IS VERIFIED. `launchctl bootout` reporting success is not proof the job is gone (this box
+  # has produced `Bootstrap failed: 5: Input/output error` in the same domain), and printing "✅ Removed"
+  # over a job that is still loaded with RunAtLoad/KeepAlive hands a human a laptop with the fleet still
+  # dispatching — README §6 step 2's `pkill` is undone by launchd a second later. So: remove, then READ
+  # the domain until the label has no pid, and fail loudly if it does.
+  lc_bootout "$LABEL" "$PLIST" || exit 1
+  pid=""
+  for _ in 1 2 3 4 5; do
+    pid="$(lc_pid "$LABEL")"
+    [ -n "$pid" ] || break
+    sleep 1
+  done
+  if [ -n "$pid" ]; then
+    # The plist is KEPT: it is the only handle a verified removal has (and the only thing a human can
+    # inspect), so destroying it here would leave the job loaded with nothing to retry against.
+    die "$LABEL is STILL loaded (pid $pid) after 'launchctl bootout' — NOT removed, and the plist is kept at $PLIST. Next: launchctl print $(lc_domain)/$LABEL | head -20"
+  fi
   rm -f "$PLIST"
-  echo "✅ Removed $LABEL."
+  echo "✅ Removed $LABEL (bootout; no persistent disable written)."
   echo "   State and logs left intact: $O/{logs,state,wip}"
   exit 0
 fi
@@ -706,10 +732,14 @@ write_provenance
 # unable to disturb a healthy production controller, because the last three times it could, the fleet
 # went unsupervised and silent (#1975). Reloading is either implied by an actual plist change on
 # `--start`, or explicitly requested by `--restart`.
-SELF="bash $HERE/install.sh"
+SELF="bash '$HERE/install.sh'"
+# How old $O/heartbeat may be before a loaded job counts as "not cycling" — derived from THIS cell's
+# cycle, so a quiet cell (CYC=900) is not declared wedged on a healthy controller. Passed down rather
+# than read from a global: the library must not depend on an unstated variable.
+LC_HB_STALE="${LC_HB_STALE:-$(( CYC * 2 + 300 ))}"
 case "$ACTION" in
-  start)   lc_ensure  "$LABEL" "$PLIST" "$O" "$PLIST_CHANGED" "$START_TIMEOUT" || exit 1 ;;
-  restart) lc_restart "$LABEL" "$PLIST" "$O" "$START_TIMEOUT"                 || exit 1 ;;
+  start)   lc_ensure  "$LABEL" "$PLIST" "$O" "$PLIST_CHANGED" "$START_TIMEOUT" "$LC_HB_STALE" || exit 1 ;;
+  restart) lc_restart "$LABEL" "$PLIST" "$O" "$START_TIMEOUT"                              || exit 1 ;;
 esac
 # Read-only: what `launchctl print` says right now. Used only to make the closing text TRUE — the old
 # banner said "The loop is NOT running" unconditionally, so an operator reading it after a start had no
@@ -729,11 +759,23 @@ cat <<EOF
 EOF
 
 if [ -n "$RUNNING_PID" ]; then
+  case "$ACTION" in
+    start|restart)
   cat <<EOF
 
-The loop IS running (launchd pid $RUNNING_PID). This run did not disturb it unless the plist changed.
+The loop IS running (launchd pid $RUNNING_PID) — this run started it and PROVED it: the pid exists and
+$O/heartbeat advanced.
 
 EOF
+      ;;
+    *)
+  cat <<EOF
+
+The loop IS running (launchd pid $RUNNING_PID).
+
+EOF
+      ;;
+  esac
 else
   cat <<EOF
 
