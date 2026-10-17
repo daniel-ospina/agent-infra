@@ -189,8 +189,10 @@ def test_the_hold_is_keyed_on_the_beats_predicate(monkeypatch, tmp_path, capsys)
 def test_the_predicate_threshold_is_the_beats(monkeypatch, tmp_path):
     """The truth table itself, so the shared definition cannot be quietly re-tuned.
 
-    >= half of the non-draft queue unread is blind; below half is ordinary churn; an unreadable
-    queue object is not a claim of blindness (that case is `queue() is None`, held elsewhere).
+    >= half of the non-draft queue unread is blind; below half is ordinary churn. The numbers
+    are passed positionally -- the beat's own `(unknown, nondraft)` shape -- because there is no
+    queue object to consult here: `queue() is None` (no readable queue at all) is a different
+    case, held by `pr-loop.py`'s first guard.
     """
     assert _blind(_queue(unknown=8, nondraft=10))
     assert _blind(_queue(unknown=5, nondraft=10))
