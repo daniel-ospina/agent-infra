@@ -185,6 +185,7 @@ def test_dispatch_invokes_the_background_spawn_argv(monkeypatch, tmp_path):
     monkeypatch.setattr(pr, "log", lambda m: None)
     monkeypatch.setattr(pr, "materialise_worktree", lambda p: ("/wt/prd-9", ""))
     monkeypatch.setattr(pr, "NONBLOCKING_DISPATCH", "/opt/orch/nonblocking-dispatch.sh")
+    monkeypatch.setattr(pr, "REFUSAL_WINDOW_S", 0.0)   # no .rc will appear; do not wait
 
     def fake_sh_err(argv, timeout=180, cwd=None):
         calls.append(argv)
@@ -196,6 +197,48 @@ def test_dispatch_invokes_the_background_spawn_argv(monkeypatch, tmp_path):
     assert calls, "dispatch did not invoke the spawn command"
     assert calls[0][1] == "/opt/orch/nonblocking-dispatch.sh"
     assert "cmux" not in " ".join(calls[0])
+
+
+def test_dispatch_does_not_record_a_gate_refusal(tmp_path, monkeypatch):
+    """A load/disk refusal consumed NOTHING, so it must not be recorded as a dispatch.
+
+    `nonblocking-dispatch.sh` backgrounds `run_agent()` and returns 0 immediately; the refusal
+    code lands only in `$O/bg/<name>.rc`. Recording it would burn a 45-min cooldown and a 90-min
+    budget slot for work that never ran -- a false PASS on the pass log.
+    """
+    d = tmp_path / "orch"
+    d.mkdir()
+    (d / "spawn-gate.sh").write_text("run_agent() { return 75; }\n")
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=str(wt), check=True,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    monkeypatch.setattr(pr, "STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setattr(pr, "ORCH_DIR", str(d))
+    monkeypatch.setattr(pr, "NONBLOCKING_DISPATCH", str(_HARNESS / "nonblocking-dispatch.sh"))
+    monkeypatch.setattr(pr, "materialise_worktree", lambda p: (str(wt), ""))
+    monkeypatch.setattr(pr, "log", lambda m: None)
+    monkeypatch.setenv("O", str(d))
+    ok, detail = pr.dispatch(_pr(11), "failing", "brief", dry=False)
+    assert ok is False
+    assert "refused" in detail and "75" in detail
+
+
+def test_main_writes_no_state_row_for_a_refused_spawn(monkeypatch):
+    saved = {}
+    monkeypatch.setattr(pr, "load_state", lambda: {})
+    monkeypatch.setattr(pr, "open_prs", lambda: [_pr(1)])
+    monkeypatch.setattr(pr, "classify", lambda p: "failing")
+    monkeypatch.setattr(pr, "brief", lambda p, a: "b")
+    monkeypatch.setattr(pr, "log", lambda m: None)
+    monkeypatch.setattr(pr, "dispatch", lambda p, a, t, d: (False, "gate refused rc=75"))
+    monkeypatch.setattr(pr, "save_state", lambda st: saved.update(st))
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py"])
+    monkeypatch.setenv("MAX_FIX", "16")
+    monkeypatch.setenv("MAX_REVIEW", "12")
+    assert pr.main() == 0
+    assert not [k for k in saved if not k.startswith("_")], \
+        "a refused spawn must not consume a state row / budget slot"
 
 
 def test_dispatch_reports_a_failed_worktree_instead_of_spawning(monkeypatch, tmp_path):
@@ -262,7 +305,126 @@ def test_pr_doctor_never_spawns_pi_itself():
     no_session = "--no" + "-session"
     assert no_session not in src
     assert "pi -p" not in src
-    assert not re.search(r'(^|[^[:alnum:]_-])(-p|--print)([^[:alnum:]_-]|$)', src)
+    pat = r'(?:^|[^A-Za-z0-9_-])(?:-p|--print)(?:[^A-Za-z0-9_-]|$)'
+    assert not re.search(pat, src)
+    # non-vacuity: the same pattern FIRES on a real headless-spawn spelling (the Python `re`
+    # module has no POSIX character classes, so `[^[:alnum:]_-]` matched nothing and this
+    # assertion could never fail -- proven by driving it).
+    assert re.search(pat, 'argv = ["pi", "-p", "x"]')
+
+
+# ── 3b. the worktree recipe is liveness-checked and never destroys work ────────────────
+
+def _git_repo(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    def g(*args, **kw):
+        return subprocess.run(["git", "-C", str(repo)] + list(args), check=kw.pop("check", True),
+                              capture_output=True, text=True)
+
+    g("init", "-q")
+    g("config", "user.email", "t@t")
+    g("config", "user.name", "t")
+    g("config", "commit.gpgsign", "false")
+    (repo / "f.txt").write_text("base\n")
+    g("add", "f.txt")
+    g("commit", "-qm", "base")
+    g("branch", "-M", "main")
+    return repo, g
+
+
+def _prb(number, head, branch):
+    p = _pr(number, head)
+    p["headRefName"] = branch
+    return p
+
+
+def _wire_repo(monkeypatch, repo):
+    monkeypatch.setattr(pr, "REPO_DIR", str(repo))
+    monkeypatch.setattr(pr, "WORKTREE_ROOT", str(repo / ".worktrees"))
+    monkeypatch.setattr(pr, "log", lambda m: None)
+
+
+def test_materialise_worktree_creates_then_reuses_at_the_head(monkeypatch, tmp_path):
+    repo, g = _git_repo(tmp_path)
+    g("branch", "feat/x")
+    head = g("rev-parse", "HEAD").stdout.strip()
+    _wire_repo(monkeypatch, repo)
+    wt, err = pr.materialise_worktree(_prb(1, head, "feat/x"))
+    assert err == "" and wt.endswith("prd-1")
+    # second call reuses it (same path) without re-adding
+    wt2, err2 = pr.materialise_worktree(_prb(1, head, "feat/x"))
+    assert (wt2, err2) == (wt, "")
+
+
+def test_materialise_worktree_clears_a_dangling_directory(monkeypatch, tmp_path):
+    """A directory whose record was removed keeps a `.git` file but git refuses to operate in it."""
+    import shutil
+    repo, g = _git_repo(tmp_path)
+    g("branch", "feat/x")
+    head = g("rev-parse", "HEAD").stdout.strip()
+    _wire_repo(monkeypatch, repo)
+    wt, _ = pr.materialise_worktree(_prb(1, head, "feat/x"))
+    assert (repo / ".worktrees" / "prd-1" / ".git").exists()
+    shutil.rmtree(repo / ".git" / "worktrees" / "prd-1")   # record gone, directory stays
+    assert not pr._live_worktree(wt)                        # the trap the old check fell into
+    wt2, err = pr.materialise_worktree(_prb(1, head, "feat/x"))
+    assert err == "" and wt2 == wt
+    assert pr._live_worktree(wt2)
+
+
+def test_materialise_worktree_clears_a_stranded_record(monkeypatch, tmp_path):
+    """Directory gone but the record remains: `worktree add` refuses until the record is cleared."""
+    import shutil
+    repo, g = _git_repo(tmp_path)
+    g("branch", "feat/x")
+    head = g("rev-parse", "HEAD").stdout.strip()
+    _wire_repo(monkeypatch, repo)
+    wt, _ = pr.materialise_worktree(_prb(1, head, "feat/x"))
+    shutil.rmtree(wt)
+    wt2, err = pr.materialise_worktree(_prb(1, head, "feat/x"))
+    assert err == "" and wt2 == wt
+    assert pr._live_worktree(wt2)
+
+
+def test_materialise_worktree_resets_a_stale_clean_worktree(monkeypatch, tmp_path):
+    repo, g = _git_repo(tmp_path)
+    g("branch", "feat/x")
+    head1 = g("rev-parse", "HEAD").stdout.strip()
+    _wire_repo(monkeypatch, repo)
+    wt, _ = pr.materialise_worktree(_prb(1, head1, "feat/x"))
+
+    def gw(*a):
+        return subprocess.run(["git", "-C", wt] + list(a), check=True,
+                              capture_output=True, text=True)
+
+    gw("commit", "--allow-empty", "-qm", "second")
+    head2 = gw("rev-parse", "HEAD").stdout.strip()
+    gw("checkout", "--detach", head1)                      # worktree back at the old head, clean
+    wt2, err = pr.materialise_worktree(_prb(1, head2, "feat/x"))
+    assert err == "" and wt2 == wt
+    assert gw("rev-parse", "HEAD").stdout.strip() == head2
+
+
+def test_materialise_worktree_refuses_to_reset_a_dirty_stale_worktree(monkeypatch, tmp_path):
+    repo, g = _git_repo(tmp_path)
+    g("branch", "feat/x")
+    head1 = g("rev-parse", "HEAD").stdout.strip()
+    _wire_repo(monkeypatch, repo)
+    wt, _ = pr.materialise_worktree(_prb(1, head1, "feat/x"))
+
+    def gw(*a):
+        return subprocess.run(["git", "-C", wt] + list(a), check=True,
+                              capture_output=True, text=True)
+
+    gw("commit", "--allow-empty", "-qm", "second")
+    head2 = gw("rev-parse", "HEAD").stdout.strip()
+    gw("checkout", "--detach", head1)
+    (pathlib.Path(wt) / "wip.txt").write_text("uncommitted\n")
+    wt2, err = pr.materialise_worktree(_prb(1, head2, "feat/x"))
+    assert wt2 == "" and "uncommitted" in err
+    assert (pathlib.Path(wt) / "wip.txt").exists(), "a dirty worktree must never be reset"
 
 
 # ── 4. the lane-table feeding is RETIRED, not merely unused ───────────────────────────────

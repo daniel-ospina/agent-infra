@@ -50,6 +50,7 @@ import json
 import os
 import plistlib
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -114,6 +115,12 @@ ORCH_DIR = os.environ.get("O") or os.path.join(HOME, "orchestrator")
 NONBLOCKING_DISPATCH = os.path.join(ORCH_DIR, "nonblocking-dispatch.sh")
 WORKTREE_ROOT = os.path.join(REPO_DIR, ".worktrees")
 SPAWN_TIMEOUT_S = 2400        # wall-clock cap handed to the background worker
+# `nonblocking-dispatch.sh` backgrounds `run_agent()` and returns 0 the moment the worker is
+# launched, so a GATE REFUSAL (AGENT_DISK_REFUSED=77 / AGENT_LOAD_REFUSED=75) only lands in
+# `$O/bg/<name>.rc`. A refusal is written in milliseconds (the gate is the first thing run_agent
+# does) and consumed nothing, so dispatch() gives it a short window to land before recording a
+# dispatch. A running worker holds the .rc file for minutes, so this never waits on real work.
+REFUSAL_WINDOW_S = 2.0
 
 # A dispatch draws on the budget of the work it starts. `failing` needs code/CI repair (MAX_FIX);
 # `no-checks` re-triggers the workflows and then runs the review+merge chain, so it is fix work;
@@ -322,28 +329,108 @@ def classify(pr: dict) -> str:
 # ---------------------------------------------------------------------------
 
 def materialise_worktree(pr: dict) -> tuple[str, str]:
-    """Ensure a git worktree for the PR's branch; return (path, "") or ("", why).
+    """Ensure a git worktree for the PR's branch at the PR's head; return (path, "") or ("", why).
 
-    `nonblocking-dispatch.sh` requires an existing worktree directory (`[ -d "$WT" ]`), and the
-    worker must be ON the PR's branch so a fixer can push. The shape mirrors `fix-one.sh`'s
-    materialisation, because that is the one shipped PR-fixer worktree recipe -- a second,
-    divergent one is how the two paths stop agreeing.
+    The worker must be ON the PR's branch at the PR's CURRENT head so a fixer pushes the right
+    commit. Two facts drive the shape:
+
+      * `git worktree list` is the LIVENESS authority, never a directory's `.git` file. That file
+        survives the worktree record being removed and leaves a directory git refuses to operate
+        in (`fatal: not a git repository`); trusting it makes `nonblocking-dispatch.sh` launch a
+        worker that cannot run a single git command.
+      * FAIL-CLOSED, NEVER DESTRUCTIVE. A reused worktree whose head moved is fast-forwarded to
+        the PR head ONLY when it is clean; a DIRTY one is refused, never reset, because resetting
+        would discard a previous worker's uncommitted work. Stranded records are cleared only for
+        OUR `prd-<n>` path or for a worktree whose directory is already GONE, so a live lane
+        worktree on the same branch is never touched.
     """
     branch = pr["headRefName"]
-    wt = os.path.join(WORKTREE_ROOT, "prd-%d" % pr["number"])
-    if os.path.exists(os.path.join(wt, ".git")):
-        return wt, ""                       # already materialised by an earlier pass
+    head = pr["headRefOid"]
+    path = os.path.join(WORKTREE_ROOT, "prd-%d" % pr["number"])
+
+    if _live_worktree(path):
+        out, _, rc = sh_err(["git", "-C", path, "rev-parse", "HEAD"], timeout=30)
+        if rc == 0 and (out or "").strip() == head:
+            return path, ""                       # already materialised at the right head
+        _, _, have = sh_err(["git", "-C", path, "cat-file", "-e", "%s^{commit}" % head], timeout=30)
+        if have != 0:
+            sh_err(["git", "-C", path, "fetch", "origin", branch, "--quiet"], timeout=300)
+        dirty, _, _ = sh_err(["git", "-C", path, "status", "--porcelain"], timeout=60)
+        if (dirty or "").strip():
+            return "", ("worktree %s is at a different head and has uncommitted changes -- "
+                        "refusing to reset it; inspect and clean it" % path)
+        _, err, rc = sh_err(["git", "-C", path, "reset", "--hard", head], timeout=120)
+        if rc != 0:
+            return "", "worktree %s reset to %s failed rc=%s: %s" % (
+                path, head[:12], rc, (err or "").strip()[:160])
+        return path, ""
+
+    # Not a live worktree at OUR path. Clear a stranded record or a dangling non-worktree there --
+    # it is in our own `prd-<n>` namespace, so this can never touch a lane's worktree.
+    if os.path.exists(path) or any(p == path for p, _ in _worktrees()):
+        _drop_worktree_record(path)
+        if os.path.exists(path):
+            log("materialise: removing a dangling non-worktree at %s" % path)
+            shutil.rmtree(path, ignore_errors=True)
+    # A stranded record for this branch ELSEWHERE (its directory already gone) also blocks
+    # `worktree add` with "already checked out for ever". Clear ONLY records whose dir is gone.
+    for p, b in _worktrees():
+        if b == "refs/heads/%s" % branch and not _live_worktree(p):
+            _drop_worktree_record(p)
+
     _, _, rc = sh_err(["git", "-C", REPO_DIR, "rev-parse", "--verify", "-q",
                        "refs/heads/%s" % branch], timeout=60)
     if rc == 0:
-        argv = ["git", "-C", REPO_DIR, "worktree", "add", wt, branch]
+        argv = ["worktree", "add", path, branch]
     else:
-        sh_err(["git", "-C", REPO_DIR, "fetch", "origin", branch, "--quiet"], timeout=300)
-        argv = ["git", "-C", REPO_DIR, "worktree", "add", wt, "-b", branch, "origin/%s" % branch]
-    _, err, rc = sh_err(argv, timeout=300)
-    if rc != 0 or not os.path.exists(os.path.join(wt, ".git")):
+        _, _, frc = _git(["fetch", "origin", branch, "--quiet"], timeout=300)
+        if frc == 0:
+            argv = ["worktree", "add", path, "-b", branch, "origin/%s" % branch]
+        else:
+            # A fork PR: its head is published in the BASE repo at refs/pull/<n>/head. Detached,
+            # because there is no branch in origin to push to -- the worker can review and merge,
+            # and a push is refused loudly rather than silently landing nowhere.
+            ref = "refs/pull/%d/head" % pr["number"]
+            _, ferr, frc = _git(["fetch", "origin", ref, "--quiet"], timeout=300)
+            if frc != 0:
+                return "", "cannot materialise %s: neither origin/%s nor %s could be fetched (%s)" % (
+                    branch, branch, ref, (ferr or "").strip()[:160])
+            argv = ["worktree", "add", "--detach", path, "FETCH_HEAD"]
+    _, err, rc = _git(argv, timeout=300)
+    if rc != 0:
         return "", "worktree add failed rc=%s: %s" % (rc, (err or "").strip()[:200] or "(no stderr)")
-    return wt, ""
+    if not _live_worktree(path):
+        return "", "worktree add reported success but %s is not a live worktree" % path
+    return path, ""
+
+
+def _git(args, timeout=120):
+    return sh_err(["git", "-C", REPO_DIR] + list(args), timeout=timeout)
+
+
+def _live_worktree(path: str) -> bool:
+    """True only when git can actually operate in <path> (a `.git` file alone is not enough)."""
+    _, _, rc = sh_err(["git", "-C", path, "rev-parse", "--is-inside-work-tree"], timeout=30)
+    return rc == 0
+
+
+def _worktrees() -> list[tuple[str, str]]:
+    """[(path, branch-ref)] from `git worktree list --porcelain`; [] if it cannot be read."""
+    out, _, rc = _git(["worktree", "list", "--porcelain"], timeout=60)
+    if rc != 0:
+        return []
+    rows, cur = [], ""
+    for line in (out or "").splitlines():
+        if line.startswith("worktree "):
+            cur = line[len("worktree "):]
+        elif line.startswith("branch "):
+            rows.append((cur, line[len("branch "):].strip()))
+    return rows
+
+
+def _drop_worktree_record(path: str) -> None:
+    """Targeted removal of one record. NEVER a bare `git worktree prune` (#1141)."""
+    _git(["worktree", "remove", "--force", path], timeout=120)
 
 
 # ---------------------------------------------------------------------------
@@ -473,6 +560,25 @@ def dispatch(pr: dict, action: str, text: str, dry: bool) -> tuple[bool, str]:
     if rc != 0:
         log("spawn %s -> %s: FAIL rc=%s (%s)" % (name, wt, rc, detail[:120] or "no output"))
         return False, detail
+    # ⛔ A GATE REFUSAL IS NOT A DISPATCH. `nonblocking-dispatch.sh` backgrounds `run_agent()` and
+    # returns 0 as soon as the worker is launched, so the refusal code (75/77) lands only in
+    # `$O/bg/<name>.rc`. A refused spawn consumed NOTHING, so it must not be recorded: a state row
+    # would burn a 45-min cooldown and a 90-min budget slot for work that never ran, and the pass
+    # log would claim a dispatch that did not happen.
+    rc_file = os.path.join(ORCH_DIR, "bg", "%s.rc" % name)
+    deadline = time.monotonic() + REFUSAL_WINDOW_S
+    while time.monotonic() < deadline:
+        if os.path.exists(rc_file):
+            try:
+                with open(rc_file) as fh:
+                    code = int(fh.read().strip())
+            except Exception:
+                code = None
+            if code in (75, 77):
+                log("spawn %s: gate REFUSED rc=%s -- no agent started, nothing consumed" % (name, code))
+                return False, "gate refused rc=%s" % code
+            break
+        time.sleep(0.1)
     log("spawn %s -> %s: %s" % (name, wt, detail[:120] or "launched"))
     return True, detail
 
