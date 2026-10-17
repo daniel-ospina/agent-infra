@@ -9,7 +9,7 @@
 # same claimable item inside the same lease window, is it REFUSED — and if not, what does it do?
 #
 #   M1  dispatch      — `claim_issue_acquire` (key `refs/claims/issue-<N>`), N processes released
-#                       simultaneously at a barrier.
+#                       at a barrier and then staggered by a few ms (see the racer's note).
 #   M2  review/record — `claim_acquire` (key `refs/claims/<PR>-<sha12>`), same shape.
 #   M3  landing       — the SAME PR offered at TWO DIFFERENT heads. The key is content-addressed on
 #                       the head, so this is the row where the claim cannot express "this PR" and
@@ -185,7 +185,7 @@ echo "  origin=$ORIGIN_MODE  laps=$LAPS  racers=$RACERS  stagger=${STAGGER_MS}ms
 # Prints one line per racer. Sets R_WIN / R_LOST / R_INFRA / R_ODD and R_LINES (for prose asserts).
 R_WIN=0; R_LOST=0; R_INFRA=0; R_ODD=0; R_LINES=""
 race() { # race <op> [op-args...]
-  local d="$T/race" i line rc res com
+  local d="$T/race" i line rc res
   rm -rf "$d"; mkdir -p "$d"
   i=1
   while [ "$i" -le "$RACERS" ]; do
@@ -209,7 +209,7 @@ race() { # race <op> [op-args...]
     # "exactly one winner" true while nothing was measured.
     [ -n "$line" ] || line=$'90\t<the racer wrote nothing — it never reached the acquire>\t'
     rc="${line%%$'\t'*}"; line="${line#*$'\t'}"
-    res="${line%%$'\t'*}"; com="${line##*$'\t'}"
+    res="${line%%$'\t'*}"
     printf '    box%s rc=%s :: %s\n' "$i" "$rc" "$res"
     R_LINES="$R_LINES box$i:rc=$rc:$res"
     case "$rc" in
