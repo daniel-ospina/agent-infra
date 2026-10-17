@@ -1556,11 +1556,57 @@ qsup start "$Q/tortoise-repo" "$Q/st-scp"
                   || bad "start rejected a scp-style origin — $Q_OUT"
 git -C "$Q/tortoise-repo" remote set-url origin https://github.com/daniel-ospina/tortoise.git
 
+# (7b) The SCHEME is an allow-list, and a scp-like URL's pre-colon part must be a HOST. Both were
+# fail-OPEN holes a reviewer reproduced: `git clone file://localhost/<path>` RECORDS
+# `file://localhost/<owner>/<repo>` as origin, which passed every other check here and derived a queue
+# target from a LOCAL PATH; and a local path may carry both `@` and `:` (`/home/u@srv:o/r.git`), which
+# the scp-like branch read as host/repo. Deriving a host/repo pair that nothing said was one is exactly
+# the "invention, not a read" this gate exists to refuse. (Both arms redden on the pre-fix script:
+# with no derivation there is no refusal at all, so `start` returns 0.)
+git -C "$Q/tortoise-repo" remote set-url origin file://localhost/daniel-ospina/tortoise.git
+qsup start "$Q/tortoise-repo" "$Q/st-file-scheme"
+[ "$Q_RC" -ne 0 ] && ok "start REFUSES a file:// origin (a filesystem remote names no repo on a git host)" \
+                  || bad "start derived a queue from a file:// remote — a local path read as a host/repo pair: $Q_OUT"
+case "$Q_OUT" in
+  *"cannot derive the QUEUE"*) ok "the file:// refusal names the underivable queue" ;;
+  *) bad "the file:// refusal is not explained — $Q_OUT" ;;
+esac
+case "$Q_OUT" in
+  *"https://, http://, ssh://"*) ok "the underivable refusal lists the accepted scheme forms (an operator can act on it)" ;;
+  *) bad "the underivable refusal does not say which forms are accepted — $Q_OUT" ;;
+esac
+git -C "$Q/tortoise-repo" remote set-url origin /home/u@srv:daniel-ospina/tortoise.git
+qsup start "$Q/tortoise-repo" "$Q/st-local-path"
+[ "$Q_RC" -ne 0 ] && ok "start REFUSES a local path that carries both @ and : (it is not a host/repo pair)" \
+                  || bad "start read a local path as host/repo (scp-like branch) — $Q_OUT"
+# …while the accepted shapes still derive: an ssh:// URL with an explicit port, and an http:// URL.
+git -C "$Q/tortoise-repo" remote set-url origin ssh://git@github.com:22/daniel-ospina/tortoise.git
+qsup start "$Q/tortoise-repo" "$Q/st-ssh-port"
+[ "$Q_RC" -eq 0 ] && ok "an ssh:// origin with an explicit port derives the same queue" \
+                  || bad "start rejected ssh://git@github.com:22/… — $Q_OUT"
+git -C "$Q/tortoise-repo" remote set-url origin http://github.com/daniel-ospina/tortoise.git
+qsup start "$Q/tortoise-repo" "$Q/st-http"
+[ "$Q_RC" -eq 0 ] && ok "an http:// origin derives the same queue" \
+                  || bad "start rejected an http:// origin — $Q_OUT"
+git -C "$Q/tortoise-repo" remote set-url origin https://github.com/daniel-ospina/tortoise.git
+
 # (8) `check` refuses the same pair `start` refuses — a preflight that says YES where `start` dies is
 # a FALSE PASS on exactly the question its verdict answers.
 qsup check "$Q/agent-repo" "$Q/st-check" OR=daniel-ospina/tortoise
 [ "$Q_RC" -ne 0 ] && ok "check REFUSES the mismatch too (no green preflight for a cell that cannot start)" \
                   || bad "check certified the mismatched pair — $Q_OUT"
+# ⛔ The reason must be the QUEUE gate, not some unrelated precondition: pre-fix `cmd_check` dies
+# earlier ("worker scripts missing from $O" in the §12 fixture), so a bare rc assertion also passed on
+# the PRE-FIX script and would stay green if `assert_queue_target` were deleted from cmd_check.
+# Name the refusal, so the arm proves the gate and reddens on the pre-fix script.
+case "$Q_OUT" in
+  *"DIFFERENT repos"*) ok "check's refusal IS the queue gate (both verbs assert the same pair)" ;;
+  *) bad "check refused for an UNRELATED reason, so the queue gate in cmd_check is unproven: $Q_OUT" ;;
+esac
+case "$Q_OUT" in
+  *"daniel-ospina/agent-infra"*) ok "check's refusal names the CHECKOUT's repo too" ;;
+  *) bad "check's refusal does not name the checkout's repo — $Q_OUT" ;;
+esac
 case "$Q_OUT" in
   *"CELL CAN RUN A CONTROLLER"*) bad "check printed the CELL CAN RUN banner for a mismatched pair" ;;
   *) ok "check: no CELL CAN RUN banner on a mismatched pair" ;;

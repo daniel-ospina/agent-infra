@@ -287,26 +287,36 @@ LOCK="$O/.orch.lock"
 # ⛔ NOT fixed here, deliberately: the refresh loop's own retry/starvation behaviour (#1729). Making
 # the mismatch impossible is this change; making the retry loop smarter is that one.
 
-# owner/repo out of a git remote URL. Takes the three shapes a clone actually records —
-#   https://github.com/<owner>/<repo>.git · ssh://git@github.com/<owner>/<repo>.git ·
-#   git@github.com:<owner>/<repo>.git                     (and any of them without `.git`)
+# owner/repo out of a git remote URL. Takes the shapes a clone actually records —
+#   https://github.com/<owner>/<repo>.git · http://github.com/<owner>/<repo>.git ·
+#   ssh://git@github.com/<owner>/<repo>.git · git@github.com:<owner>/<repo>.git
+#                                                         (and any of them without `.git`)
 # …and REFUSES everything else, INCLUDING a bare local path: a filesystem remote does not name a repo
-# on a git host, so deriving a queue target from it would be an invention, not a read.
+# on a git host, so deriving a queue target from it would be an invention, not a read. The SCHEME is an
+# allow-list for the same reason (see the review catch below).
 # ⛔ The accepted charset is deliberately narrow. The value is interpolated into the tmux session
 # command string, so `safe_argv` must be true of it BY CONSTRUCTION rather than by a later check that
 # could be refactored away.
 queue_repo_from_url() {
   local url="${1:-}" host path owner name
   case "$url" in
-    *"://"*)
+    https://*|http://*|ssh://*)
       # scheme URL: host[:port]/<path>. `${url#*://*/}` removes the SHORTEST prefix ending in `:///`
       # (the leading slash of the path), so it yields the path for every scheme form.
+      # ⛔ The scheme is an ALLOW-LIST, not `*"://"*` (review catch): a filesystem/foreign scheme
+      # names no repo on a git HOST, and the form `git clone file://localhost/<owner>/<repo>` — a
+      # REAL clone — records `file://localhost/<owner>/<repo>` as origin, which passed every other
+      # check here and was DERIVED into a queue target: a local path read as a host/repo pair, i.e.
+      # an invention, and it failed OPEN in a gate whose whole contract is fail-closed.
       path="${url#*://*/}"
       [ "$path" != "$url" ] || return 1                   # no slash after the host: nothing to parse
       host="${url#*://}"; host="${host%%/*}"; host="${host#*@}"; host="${host%%:*}"
       ;;
     *@*:*)
-      # scp-like: [user@]host:<path>
+      # scp-like: [user@]host:<path>. ⛔ The part before the `:` must be a HOST, so it may not carry
+      # a `/`: a LOCAL PATH can contain both `@` and `:` (`/home/u@srv:o/r.git`) and was otherwise
+      # read as a host/repo pair that nothing said was one — the same invention as the scheme case.
+      case "${url%%:*}" in */*) return 1 ;; esac
       host="${url%%:*}"; host="${host#*@}"
       path="${url#*:}"
       ;;
@@ -383,7 +393,7 @@ assert_queue_target() {
       die "cannot read the QUEUE this cell would target: 'git -C $REPO remote get-url origin' returned no URL${QUEUE_DECLARED:+, so OR='$QUEUE_DECLARED' cannot be verified against the checkout}. Starting anyway is the measured agent-infra#1901 failure — the controller runs, reports lanes and a loaded queue, and judges nothing. $needs."
       ;;
     underivable)
-      die "cannot derive the QUEUE from $REPO's origin remote '$QUEUE_REMOTE' — it does not name <host>/<owner>/<repo>. $needs."
+      die "cannot derive the QUEUE from $REPO's origin remote '$QUEUE_REMOTE' — it does not name <owner>/<repo> in an accepted form (https://, http://, ssh://, or scp-like git@host:owner/repo.git), so there is no repo on a git host to target. $needs."
       ;;
     *)
       die "cannot determine the QUEUE this cell would target (state '${QUEUE_STATE:-unknown}') — refusing to run a controller that cannot judge the queue it names. $needs."
@@ -398,7 +408,7 @@ queue_state_text() {
     explicit)    printf 'ok — OR matches the checkout' ;;
     mismatch)    printf 'MISMATCH — start/check refuse (agent-infra#1901)' ;;
     unreadable)  printf 'UNREADABLE — the checkout has no origin remote; start/check refuse' ;;
-    underivable) printf 'UNDERIVABLE — origin does not name <host>/<owner>/<repo>; start/check refuse' ;;
+    underivable) printf 'UNDERIVABLE — origin is not https/http/ssh/scp-like naming <owner>/<repo>; start/check refuse' ;;
     invalid)     printf 'INVALID — OR is not <owner>/<repo>; start/check refuse' ;;
     *)           printf 'unknown' ;;
   esac
