@@ -374,6 +374,22 @@ jobs:
         # asserts as a PRECONDITION before trusting any verdict — and through real
         # jiti where jiti is resolvable (reported as skipped otherwise).
         run: npx tsx extensions/skill-enforcer.test.ts
+      - name: Skill-registry farm suite (#1323, zero-dep)
+        # #1323 — this extension built its registry by shelling out to
+        # `<project>/operations/tools/skill_registry.py`, a file that lives in
+        # eldato and has NEVER existed in agent-infra. Its `$AGENT_INFRA_PATH`
+        # fallback therefore named a path that could not exist for any repo;
+        # every non-eldato session printed that warning while an empty cache made
+        # the whole extension a silent no-op (one class: a missing input read as
+        # "nothing to do"). The rewrite enumerates the layout in TypeScript and
+        # reports honestly; this suite pins the four indicators AND the two
+        # hazards the rewrite introduces — a SYMLINKED farm must never be written
+        # through, and a LINKED WORKTREE's skills must never be linked into the
+        # machine's farm. Negative controls are first-class (a foreign live
+        # symlink is not removed, a diverging farm copy is not overwritten).
+        # Zero-dep by construction (the pi SDK import is TYPE-only), so it MUST
+        # run in THIS job, which performs no `npm ci`.
+        run: npx tsx extensions/skill-registry.test.ts
       - name: Merge-scope subtraction suite (#755, SDK-free)
         # #755 — zero-dependency by construction: subtract-scope.test.ts imports
         # ./index.js as a TYPE only (erased by tsx) and drives real git in temp

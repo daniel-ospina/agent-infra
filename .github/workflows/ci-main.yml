@@ -178,6 +178,12 @@ jobs:
         # and through real jiti where resolvable. Mirrors the ci.yml verify step.
         echo "== extensions/skill-enforcer.test.ts =="
         npx tsx extensions/skill-enforcer.test.ts || failures=$((failures+1))
+        # #1323 — skill-registry: the farm must be built from the LAYOUT, not
+        # from an eldato-only Python generator that never existed here, and an
+        # empty input must never read as a success. Zero-dep (pi SDK import is
+        # TYPE-only), so it needs no `npm ci`. Mirrors the ci.yml verify step.
+        echo "== extensions/skill-registry.test.ts =="
+        npx tsx extensions/skill-registry.test.ts || failures=$((failures+1))
         # #426 — review-enforcer: the merge-registry gate (gates EVERY merge in
         # this account). Needs the pi package (real runtime import): installed as
         # a devDep (package.json) from the public registry, pinned to the pi
