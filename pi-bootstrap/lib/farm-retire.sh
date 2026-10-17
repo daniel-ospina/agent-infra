@@ -390,7 +390,20 @@ farm_check_declared_shrink() {
     local dest="$1" manifest="$2" declared="${3:-}"
     local snapshot prev entries rc=0 read_rc=0
     snapshot="$(farm_snapshot_path "$dest")"
-    [ -f "$snapshot" ] || return 0     # first apply on this box: nothing to compare against
+    # THREE STATES HERE TOO. `[ -f ]` is false for a genuine first apply AND for a snapshot
+    # path that is a directory, a dangling symlink, or under a non-searchable state/ — and
+    # reading those as "first apply" silently disables the ONLY detector for a name dropped
+    # from a farm array without being declared. Absent is a fact; anything else that is not a
+    # readable regular file is an anomaly and must refuse.
+    case "$(farm_artifact_state "$dest" "state/farm-declared.txt")" in
+        absent) return 0 ;;     # first apply on this box: nothing to compare against
+        *) if [ ! -f "$snapshot" ]; then
+               printf 'ERROR: %s exists but is not a readable regular file — refusing to treat that as "first apply"\n' "$snapshot" >&2
+               printf '       (with no usable baseline, a name dropped from a farm array and left undeclared\n' >&2
+               printf '       would stay installed and unreported: the #1924 gap)\n' >&2
+               return 1
+           fi ;;
+    esac
     entries="$(farm_retired_entries "$manifest")" || return 1
     while IFS= read -r prev; do
         [ -n "$prev" ] || continue
@@ -443,8 +456,11 @@ farm_record_declared() {
     # and record a BLANK line, which is not a path in any set the leg compares against.
     body="$declared"
     while [ "${body%$'\n'}" != "$body" ]; do body="${body%$'\n'}"; done
+    # `mv -f file existing-directory` MOVES INTO it and exits 0, so the write is proved by
+    # reading the destination back — never by mv's status alone.
     if { if [ -n "$body" ]; then printf '%s\n' "$body"; fi; } | LC_ALL=C sort -u > "$tmp" 2>/dev/null \
-       && mv -f "$tmp" "$snapshot" 2>/dev/null; then
+       && mv -f "$tmp" "$snapshot" 2>/dev/null \
+       && [ -f "$snapshot" ]; then
         printf '    farm declared set recorded: %s\n' "${snapshot#"$dest"/}"
         return 0
     fi

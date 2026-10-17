@@ -802,9 +802,10 @@ verify_layer() {
   # leg exists to close, and the reason the cell half cannot be skipped: a laptop-only
   # unfarm leaves every cell behind.
   if load_farm_retire; then
-    local retired_list="" retired_rel conflict_out="" conflict_rc=0 retired_n=0
+    local retired_list="" retired_rel conflict_out="" conflict_rc=0 retired_n=0 declared_ok=1
     if retired_list="$(farm_retired_entries "$INFRA_ROOT/pi-bootstrap/farm-retired.txt")"; then
       if ! read_declared_farm_rel_paths "$rows"; then
+        declared_ok=0
         fail "the declared path set could not be built in full — verify cannot vouch for a retirement check against a truncated set"
       fi
       conflict_out="$(farm_retired_conflicts "$INFRA_ROOT/pi-bootstrap/farm-retired.txt" "$FARM_DECLARED_REL")" || conflict_rc=$?
@@ -849,7 +850,11 @@ verify_layer() {
       snap="$(farm_snapshot_path "$DEST")"
       snap_rel="${snap#"$DEST"/}"
       if [ ! -f "$snap" ]; then
-        fail "the UNFARM leg never recorded a farm declaration snapshot ($snap_rel) — this cell's layer predates #1924 or the unfarm leg did not run; re-run --install"
+        if [ "$(farm_artifact_state "$DEST" "state/farm-declared.txt")" = absent ]; then
+          fail "the UNFARM leg never recorded a farm declaration snapshot ($snap_rel) — this cell's layer predates #1924 or the unfarm leg did not run; re-run --install"
+        else
+          fail "$snap_rel exists but is not a readable regular file (a directory? a dangling symlink? a non-searchable state/?) — that is NOT 'the layer predates #1924'; fix it and re-run --install"
+        fi
       else
         # The snapshot can differ in TWO directions, and they need DIFFERENT advice — the
         # remedies are not interchangeable:
@@ -862,20 +867,32 @@ verify_layer() {
         #     orphan/shrink check), so the answer is to install from the newer checkout.
         # Saying "declare it retired" in the second case, or "just re-run --install", is how an
         # operator deletes an artifact the repo still ships or walks into a refusal loop.
-        local uninstalled='' gone='' p snap_sorted msg
-        snap_sorted="$(LC_ALL=C sort -u "$snap" | grep -v '^$' || true)"
-        want_out="$(printf '%s' "$FARM_DECLARED_REL")"     # already newline-terminated
-        while IFS= read -r p; do
-          [ -n "$p" ] || continue
-          farm_rel_listed "$p" "$snap_sorted" || uninstalled="$uninstalled $p"
-        done <<<"$want_out"
-        while IFS= read -r p; do
-          [ -n "$p" ] || continue
-          farm_rel_listed "$p" "$want_out" || gone="$gone $p"
-        done <<<"$snap_sorted"
-        if [ -z "$uninstalled" ] && [ -z "$gone" ]; then
+        local uninstalled='' gone='' p snap_sorted msg snap_ok=1
+        # `sort`'s OWN status is what proves the snapshot was read: discarding it turns an
+        # unreadable snapshot into an EMPTY one, which reads as "this cell is missing every
+        # farmed file" — the right verdict for the wrong reason, pointing the operator at a
+        # rebuild instead of at permissions. Same rule as the retirement list above. And when
+        # either list could not be read, the directional comparison is skipped entirely: a
+        # message built from a truncated set is worse than the one failure that names it.
+        if ! snap_sorted="$(LC_ALL=C sort -u "$snap")"; then
+          snap_ok=0
+          snap_sorted=""
+          fail "the farm declaration snapshot ($snap_rel) could not be READ — that is not 'the cell is missing files'; fix its permissions and re-run --verify"
+        fi
+        if [ "$snap_ok" = 1 ] && [ "$declared_ok" = 1 ]; then
+          want_out="$(printf '%s' "$FARM_DECLARED_REL")"     # already newline-terminated
+          while IFS= read -r p; do
+            [ -n "$p" ] || continue
+            farm_rel_listed "$p" "$snap_sorted" || uninstalled="$uninstalled $p"
+          done <<<"$want_out"
+          while IFS= read -r p; do
+            [ -n "$p" ] || continue
+            farm_rel_listed "$p" "$want_out" || gone="$gone $p"
+          done <<<"$snap_sorted"
+        fi
+        if [ "$snap_ok" = 1 ] && [ "$declared_ok" = 1 ] && [ -z "$uninstalled" ] && [ -z "$gone" ]; then
           say "verified the farm declaration snapshot against the checkout's declared set"
-        else
+        elif [ "$snap_ok" = 1 ] && [ "$declared_ok" = 1 ]; then
           msg="the farm declaration snapshot ($snap_rel) is not this checkout's declared set — re-run --install."
           if [ -n "$uninstalled" ]; then
             msg="$msg Declared by this checkout but NOT installed here:$uninstalled."

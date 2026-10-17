@@ -510,6 +510,41 @@ else
   fi
 fi
 
+# The SNAPSHOT PATH itself must be read three-state too: `[ -f ]` is false for a genuine
+# first apply AND for a directory, a dangling symlink, or a non-searchable state/ — and each
+# of those read as "first apply" disables the ONLY detector for an undeclared drop, while
+# `farm_record_declared` even reported it as recorded (`mv -f` INTO a directory exits 0).
+SNAPBAD="$TMP/snapbad"
+mkdir -p "$SNAPBAD/dest/state" "$SNAPBAD/dest/scripts"
+printf 'a\n' > "$SNAPBAD/dest/scripts/a.sh"
+: > "$SNAPBAD/empty.txt"
+mkdir -p "$SNAPBAD/dest/state/farm-declared.txt"          # a DIRECTORY at the snapshot path
+farm_record_declared "$SNAPBAD/dest" $'scripts/a.sh\n' > "$SNAPBAD/rec.out" 2>&1; rec_rc=$?
+if [ "$rec_rc" -eq 0 ]; then
+  fail "(e) farm_record_declared reported success although the snapshot path is a DIRECTORY (mv moved the temp file INTO it)"
+elif grep -q 'recorded:' "$SNAPBAD/rec.out"; then
+  fail "(e) farm_record_declared printed 'recorded' for a snapshot it did not write: $(cat "$SNAPBAD/rec.out")"
+else
+  ok "(e) a directory at the snapshot path is not reported as 'recorded'"
+fi
+out="$(farm_check_declared_shrink "$SNAPBAD/dest" "$SNAPBAD/empty.txt" $'scripts/a.sh\n' 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ]; then
+  fail "(e) a DIRECTORY at the snapshot path was read as 'first apply' — the orphan guard was silently disabled"
+elif ! grep -q 'readable regular file' <<<"$out"; then
+  fail "(e) the anomalous snapshot path was not named: $out"
+else
+  ok "(e) a directory at the snapshot path is refused, not read as 'first apply'"
+fi
+rm -rf "$SNAPBAD/dest/state/farm-declared.txt"
+ln -s "$SNAPBAD/nowhere.txt" "$SNAPBAD/dest/state/farm-declared.txt"   # a DANGLING symlink
+out="$(farm_check_declared_shrink "$SNAPBAD/dest" "$SNAPBAD/empty.txt" $'scripts/a.sh\n' 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ]; then
+  fail "(e) a DANGLING SYMLINK at the snapshot path was read as 'first apply' (the orphan baseline would be overwritten in silence)"
+else
+  ok "(e) a dangling symlink at the snapshot path is refused, not read as 'first apply'"
+fi
+rm -f "$SNAPBAD/dest/state/farm-declared.txt"
+
 # THE SNAPSHOT HALF: a name farmed by the previous apply and now neither farmed nor
 # retired is the "dropped from the array, forgot to declare it" mistake, which no set
 # comparison can see.
@@ -788,6 +823,26 @@ elif [ -e "$TMP/nolib-home/.pi/agent/scripts" ]; then
   fail "(h) cell-install MUTATED the cell before refusing a checkout with no UNFARM leg"
 else
   ok "(h) a checkout with no UNFARM leg is refused before anything is written"
+fi
+
+# An UNREADABLE snapshot (mode 000, parent searchable) must not read as "this cell is missing
+# every farmed file": `sort`'s status is what proves it was read, and the wrong verdict sends
+# the operator to a rebuild instead of to permissions.
+if [ "$(id -u)" = "0" ]; then
+  ok "(h) skipped the unreadable-snapshot pin: running as root, where file permissions are not enforced"
+else
+  chmod 000 "$CELL_DEST/state/farm-declared.txt"
+  out="$(CELL_HOME="$CELL_HOME" INFRA_ROOT="$COPY" bash "$CELL_INSTALL" --verify 2>&1)"; rc=$?
+  chmod 644 "$CELL_DEST/state/farm-declared.txt"
+  if [ "$rc" -eq 0 ]; then
+    fail "(h) --verify passed although the snapshot could not be read"
+  elif grep -q 'NOT installed here' <<<"$out"; then
+    fail "(h) an unreadable snapshot was reported as 'the cell is missing farmed files' (a misleading verdict)"
+  elif ! grep -q 'could not be READ' <<<"$out"; then
+    fail "(h) the unreadable snapshot was not named as the problem: $(tail -3 <<<"$out" | tr '\n' ' ')"
+  else
+    ok "(h) an unreadable snapshot is reported as unreadable, not as a missing farm"
+  fi
 fi
 
 # A PRESENT-but-EMPTY checkout-hygiene farm must be refused by the cell too. It emits zero
