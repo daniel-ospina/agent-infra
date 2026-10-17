@@ -118,6 +118,33 @@ def test_the_fixture_redirects_the_state_dir_and_the_stuck_ledger():
         assert not value.startswith(prod), f"{name} points at production: {value}"
 
 
+def test_a_REFUSED_queue_still_names_the_surface_prs(monkeypatch):
+    """⛔ THE OWNER'S LIST SURVIVES THE REFUSAL (#1872 review round 11).
+
+    `classify_queue()` returns a refusal tuple when the buckets are not a usable partition. Its
+    docstring used to document that tuple as `(None, n, {}, [])` -- with `surface_prs` DROPPED --
+    which is the opposite of the code and of why the names exist: a gate whose output is "N things
+    need you" without naming them is a stall with a receipt, and an UNREADABLE pass is exactly when
+    the owner's list matters most. Nothing pinned it, so the drop could have come back silently.
+    """
+    non = [{"number": 1, "files": []}, {"number": 2, "files": []}, {"number": 3, "files": []}]
+    monkeypatch.setattr(objective, "touches_surface", lambda p: p["number"] in (1, 3))
+
+    # (a) ONE unreadable PR refuses the pass, and the names still come back
+    monkeypatch.setattr(objective, "classify_one",
+                        lambda p: (None, None, None) if p["number"] == 2 else ("running", None, []))
+    classes, surface, by_class, surface_prs = objective.classify_queue(non)
+    assert classes is None and by_class == {}, (classes, by_class)
+    assert surface == 2 and surface_prs == [1, 3], (surface, surface_prs)
+
+    # (b) the OTHER trigger -- buckets that do not reconcile with `nondraft` -- behaves the same way
+    monkeypatch.setattr(objective, "classify_one",
+                        lambda p: ("not-a-class", None, []) if p["number"] == 2 else ("running", None, []))
+    classes, surface, by_class, surface_prs = objective.classify_queue(non)
+    assert classes is None and by_class == {}, (classes, by_class)
+    assert surface_prs == [1, 3], surface_prs
+
+
 # --- DIRECTION 2: a healthy read must NOT flag -----------------------------------------
 
 def test_healthy_read_does_not_flag(monkeypatch):

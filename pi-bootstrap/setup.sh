@@ -309,12 +309,13 @@ fi
 # box rebuilt from this file got every farmed CONSUMER without the PRODUCER it executes. FIVE of the
 # seven now join THIS array (`lane-actions.py`, `lane-watchdog.py`, `objective.py`, `cadence-nudge.sh`,
 # `publish-live-workspaces.py`). FOUR are exec'd by a caller THIS array already farms:
-# ⛔ CALL SITES ARE NAMED, NOT NUMBERED (#1872 review round 9). These pointers used to carry line
-# numbers (`pr-doctor.py:238`, `cadence-nudge.sh:256,400`, `heartbeat-loop.sh:315`) and EVERY ONE of
-# them was stale -- each insertion in a producer moves them, and this branch's own +18 lines in
-# `cadence-nudge.sh` shifted its call sites (the `--res` read, the `TARGET_PRS` sed, the
-# `--gate-clause` read) away from the numbers on this line. A pointer whose job is co-deployment must
-# be findable with `rg`, not with a count that rots.
+# ⛔ CALL SITES ARE NAMED, NOT NUMBERED (#1872 review rounds 9-11). These pointers used to carry line
+# numbers (`pr-doctor.py:238`, `cadence-nudge.sh:256,400`, `heartbeat-loop.sh:315`) and every one of
+# the three was already stale -- each insertion in a producer moves them, and this branch's own +18
+# lines in `cadence-nudge.sh` shifted its call sites (the `--res` read, the `TARGET_PRS` sed, the
+# `--gate-clause` read) away from the numbers on this line. One replaced number
+# (`lane-scan-fallback.sh:98`) WAS exact; it is named for the same reason as the others, because the
+# next edit rots a number again. A pointer whose job is co-deployment must be findable with `rg`.
 #   * `lane-actions.py`  <- pr-doctor.py (the roster read) and lane-scan-fallback.sh (both farmed;
 #                           also heartbeat-loop.sh, withheld — see below)
 #   * `objective.py`     <- cadence-nudge.sh (the `--res`, `TARGET_PRS` and `--gate-clause` reads) and

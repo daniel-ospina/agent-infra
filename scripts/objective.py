@@ -885,15 +885,19 @@ def classify_one(p):
 
 
 def classify_queue(non):
-    """(Counter of CLASS_ORDER, surface_count, by_class, surface_prs), or (None, n, {}, []) when
-    ANY PR was unreadable.
+    """(Counter of CLASS_ORDER, surface_count, by_class, surface_prs), or
+    (None, surface_count, {}, surface_prs) when the buckets are NOT a usable partition.
 
-    FIRST MATCH makes the buckets a PARTITION of `nondraft`, asserted here rather than assumed:
-    the token is omitted entirely when the sum does not reconcile, because a partial sum that
-    still LOOKS like a partition is worse than no token at all.
+    ⛔ `surface_prs` IS RETURNED IN BOTH DIRECTIONS (#1872 review round 11). The refusal tuple used
+    to be documented as `(None, n, {}, [])`, i.e. with the names DROPPED -- which is the opposite of
+    what the code does and of why the names exist: a gate whose output is "N things need you"
+    without naming them is a stall with a receipt. An unreadable pass is exactly when the owner's
+    list matters most, so `surface_prs` survives the refusal.
 
-    `surface_prs` names the PRs behind `ASK-USER: surface=N` -- a gate whose output is "N things
-    need you" without naming them is a stall with a receipt (#1872 review finding).
+    TWO conditions produce that tuple, not one: ANY PR whose classification came back unreadable,
+    and a set whose buckets do not add up to `nondraft` (a partial sum that still LOOKS like a
+    partition is worse than no token at all). FIRST MATCH is what makes the buckets a partition, so
+    the sum is asserted here rather than assumed.
     """
     classes, surface, unread = defaultdict(int), 0, 0
     by_class = defaultdict(list)
