@@ -297,6 +297,8 @@ own `pi` workers, which do not go through `task`.
 
 **`cloud-cell-supervisor.sh check` vouches only for what it actually probes, and refuses to certify
 a cell missing any of them: `tmux`, an authenticated `gh`, `git`, `python3`, `pi`, a cloned repo
+whose `origin` remote names the SAME repo the queue dispatches (`OR` is derived from it; a mismatch,
+or a pair that cannot be read, is refused naming both values — agent-infra#1901), a checkout
 with the worker scripts in `$O`, and — since agent-infra#1717 — a non-empty, executable
 `~/.pi/agent/scripts/record-review.sh` with its `lib/diff-normalize.py` sibling.** The rest of the
 table is *not* a refusal by name: a missing `AI_REVIEW_GATE_KEY` is a **warning** — a keyless cell
