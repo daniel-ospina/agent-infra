@@ -529,6 +529,170 @@ case "$OUT" in
   *) ok "partial pool: the readable tier's issue is NOT queued as if the pool were complete" ;;
 esac
 
+# ── THE POOL'S READ STATE: EMPTY, PARTIAL and UNREADABLE are three DIFFERENT readings ────────
+# agent-infra#1931. The refusals above were already correct, but the LOG could not tell them apart:
+# a cell whose pool listing failed refused on 131 consecutive passes and dispatched nothing while 15
+# PRs sat open, and every cycle line still read `backlog=0` — the same line a fleet with nothing to
+# do prints. A layer that cannot see must not report an empty queue, so each outcome is now a NAMED
+# state, persisted (with the epoch of the read) for the controller's heartbeat line.
+# ⛔ NOT ONE of these assertions can pass on the pre-fix script: there is no `queue=` token anywhere
+# in its output, it persists no state file, and it reports a PARTIAL read with the identical sentence
+# it uses for a TOTAL one — i.e. the distinction these tests exist for does not exist there.
+echo; echo "── the pool read state: EMPTY vs PARTIAL vs UNREADABLE, and never EMPTY by accident ──"
+
+# (a) NO tier could be read -> UNREADABLE, and explicitly NOT EMPTY.
+mk_case state-unreadable
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+cat > "$D/bin/gh" <<'SH'
+#!/bin/bash
+case "$*" in
+  "auth token"*) exit 0 ;;
+  "issue list"*) echo 'gh: API rate limit exceeded' >&2; exit 1 ;;
+esac
+printf '{"resources":{}}\n'
+exit 0
+SH
+chmod +x "$D/bin/gh"
+rf "$D" refresh
+[ "$RC" -eq 1 ] && ok "state/unreadable: refused TRANSIENT (rc=1) — a failed read is never a green 'nothing to do'" \
+               || bad "state/unreadable: rc=$RC (want 1) — output: $OUT"
+case "$OUT" in
+  *"queue=UNREADABLE"*) ok "state/unreadable: the output SAYS queue=UNREADABLE" ;;
+  *) bad "state/unreadable: the output never names the state — output: $OUT" ;;
+esac
+case "$OUT" in
+  *"queue=EMPTY"*) bad "state/unreadable: a read that FAILED was reported as EMPTY — output: $OUT" ;;
+  *) ok "state/unreadable: a failed read is NOT collapsed into EMPTY" ;;
+esac
+case "$(head -1 "$D/o/state/queue-state" 2>/dev/null)" in
+  "UNREADABLE "*) ok "state/unreadable: the state is persisted for the heartbeat (state/queue-state)" ;;
+  *) bad "state/unreadable: no state persisted — '$(head -1 "$D/o/state/queue-state" 2>/dev/null)'" ;;
+esac
+
+# (b) SOME tiers read, others not -> PARTIAL, naming what could not be read. It is a SUBSET, so it is
+#     NOT the same reading as (a), and it still queues nothing.
+mk_case state-partial
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+cat > "$D/bin/gh" <<'SH'
+#!/bin/bash
+case "$*" in
+  "auth token"*) exit 0 ;;
+  "issue list"*)
+    case "$*" in
+      *"--label P0-blocker"*) echo 'gh: server error' >&2; exit 1 ;;
+      *"--label P1-severe"*) printf '1 4242\n' ;;
+    esac
+    exit 0 ;;
+esac
+printf '{"resources":{}}\n'
+exit 0
+SH
+chmod +x "$D/bin/gh"
+rf "$D" refresh
+[ "$RC" -eq 1 ] && ok "state/partial: refused TRANSIENT (rc=1)" || bad "state/partial: rc=$RC (want 1) — output: $OUT"
+case "$OUT" in
+  *"queue=PARTIAL(P0-blocker)"*) ok "state/partial: the output names the state AND the tiers it could not read" ;;
+  *) bad "state/partial: the state does not name the unread tiers — output: $OUT" ;;
+esac
+case "$OUT" in
+  *"queue=UNREADABLE"*) bad "state/partial: a PARTIAL read was reported as UNREADABLE — the two are different readings" ;;
+  *) ok "state/partial: PARTIAL is not collapsed into UNREADABLE" ;;
+esac
+case "$(head -1 "$D/o/state/queue-state" 2>/dev/null)" in
+  "PARTIAL(P0-blocker) "*) ok "state/partial: the persisted state names the unread tiers too" ;;
+  *) bad "state/partial: persisted '$(head -1 "$D/o/state/queue-state" 2>/dev/null)' (want PARTIAL(P0-blocker) <epoch>)" ;;
+esac
+case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
+  *4242*) bad "state/partial: queued a survivor of a partial read as if the pool were complete" ;;
+  *) ok "state/partial: a partial read still queues NOTHING (#1736's rule, kept)" ;;
+esac
+
+# (c) EVERY tier read and genuinely empty -> EMPTY. This is the only answer that may mean "no work",
+#     and it must still report the empty backlog (a successful empty read IS an empty backlog).
+mk_case state-empty
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+rf "$D" refresh     # the default gh stub answers every listing with nothing
+[ "$RC" -eq 0 ] && ok "state/empty: a successful empty read succeeds (rc=0)" \
+               || bad "state/empty: rc=$RC (want 0) — output: $OUT"
+case "$OUT" in
+  *"queue=EMPTY"*) ok "state/empty: a read that succeeded and listed nothing says queue=EMPTY" ;;
+  *) bad "state/empty: EMPTY is never named — output: $OUT" ;;
+esac
+case "$OUT" in
+  *"checked 0; backlog now 0"*) ok "state/empty: EMPTY may report an empty backlog (it measured one)" ;;
+  *) bad "state/empty: the successful empty read lost its backlog report — output: $OUT" ;;
+esac
+case "$(head -1 "$D/o/state/queue-state" 2>/dev/null)" in
+  "EMPTY "*) ok "state/empty: the persisted state is EMPTY" ;;
+  *) bad "state/empty: persisted '$(head -1 "$D/o/state/queue-state" 2>/dev/null)'" ;;
+esac
+
+# (d) EVERY tier read and NON-empty -> READ(n). A third readable answer, so a non-empty pool can never
+#     be labelled EMPTY by a later code path that only tests emptiness.
+mk_case state-read
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+cat > "$D/bin/gh" <<'SH'
+#!/bin/bash
+case "$*" in
+  "auth token"*) exit 0 ;;
+  "issue list"*)
+    case "$*" in *"--label P1-severe"*) printf '1 4242\n' ;; esac
+    exit 0 ;;
+esac
+printf '{"resources":{}}\n'
+exit 0
+SH
+chmod +x "$D/bin/gh"
+rf "$D" refresh
+[ "$RC" -eq 0 ] && ok "state/read: a fully readable pool succeeds (rc=0)" || bad "state/read: rc=$RC (want 0) — output: $OUT"
+case "$OUT" in
+  *"queue=READ(1)"*) ok "state/read: a readable NON-empty pool is READ(n), not EMPTY" ;;
+  *) bad "state/read: the readable non-empty pool is not named READ(n) — output: $OUT" ;;
+esac
+case "$OUT" in
+  *"queue=EMPTY"*) bad "state/read: a non-empty pool was labelled EMPTY" ;;
+  *) ok "state/read: a non-empty pool is never EMPTY" ;;
+esac
+
+# (e) THE HEARTBEAT CARRIES IT. The controller is where a human reads a cell's queue, so the cycle
+#     line must carry the state — and the state must be READ BACK, with the age of the reading, by ONE
+#     reader (a second vocabulary for the same fact is the defect this issue names). The shipped
+#     reader is extracted and driven; a re-implementation would pass on a broken copy too.
+echo; echo "── the heartbeat line carries the state (orch-loop.sh) ──"
+awk '/^is_num\(\) \{/{print; exit}' "$LOOP" > "$T/isnum.sh"
+awk '/^queue_state_token\(\) \{/{f=1} f{print} f&&/^}$/{exit}' "$LOOP" > "$T/qstate.sh"
+if [ -s "$T/qstate.sh" ] && [ -s "$T/isnum.sh" ]; then
+  ok "orch-loop: the pool-state reader is extractable from the shipped loop"
+  QD="$T/qstate"; mkdir -p "$QD/state"
+  # qs — the SHIPPED reader, over a state dir the case writes; no re-implementation of the format.
+  qs() { ( O="$QD"; . "$T/isnum.sh"; . "$T/qstate.sh"; queue_state_token ); }
+  rm -f "$QD/state/queue-state"
+  [ "$(qs)" = "UNKNOWN" ] && ok "heartbeat: no recorded read is UNKNOWN — never EMPTY (absence is not a measurement of emptiness)" \
+                          || bad "heartbeat: an absent state file read as '$(qs)' (want UNKNOWN)"
+  for want in UNREADABLE "PARTIAL(P0-blocker)" EMPTY "READ(7)"; do
+    printf '%s %s\n' "$want" "$(date +%s)" > "$QD/state/queue-state"
+    case "$(qs)" in
+      "$want""("*) ok "heartbeat: a recorded $want is carried, with the age of the reading" ;;
+      *) bad "heartbeat: $want read as '$(qs)'" ;;
+    esac
+  done
+  # A torn / foreign / hand-edited file must not be printed as a state: an unparseable record is
+  # UNKNOWN, not evidence of an empty queue.
+  printf 'garbage here\n' > "$QD/state/queue-state"
+  [ "$(qs)" = "UNKNOWN" ] && ok "heartbeat: a torn/foreign state file is UNKNOWN, never a fabricated reading" \
+                          || bad "heartbeat: a garbage state file read as '$(qs)'"
+else
+  bad "orch-loop: could not extract queue_state_token (or is_num) from the shipped loop"
+fi
+# The two lines a human actually reads beside `backlog=`: the per-cycle heartbeat line, and the
+# 'backlog empty' claim that used to read as "nothing to do" even when the pool was unreadable.
+grep -q 'backlog=\$(wc -l.*queue=\$(queue_state_token)' "$LOOP" \
+  && ok "orch-loop: the per-cycle heartbeat line carries the state beside the backlog" \
+  || bad "orch-loop: the cycle line does not carry the pool state"
+grep -q '\[dispatch\] backlog empty queue=\$(queue_state_token)' "$LOOP" \
+  && ok "orch-loop: the 'backlog empty' claim carries the state, so blindness cannot read as stillness" \
+  || bad "orch-loop: 'backlog empty' is still printed without the state"
+
 # ── an unwritable state dir REFUSES, it is not absorbed ───────────────────────────────────────
 # `mkdir -p "$O"` was unchecked and every write below it was too, so a non-directory `$O` finished with
 # `checked 0; backlog now` at rc 0 having persisted NOTHING: no marker for orch-loop, no candidates, a
