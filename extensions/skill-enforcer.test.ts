@@ -6,9 +6,8 @@
  * Run: npx tsx extensions/skill-enforcer.test.ts   (from any agent-infra checkout)
  *
  * Zero-dep by construction: `skill-enforcer.ts` has no runtime import outside
- * `node:*` and `./shared/*` (the pi SDK import is TYPE-only; the tool-call
- * predicate lives in `./shared/tool-call-event.ts` — see the file header), so
- * this suite runs on a bare checkout with no `npm ci`.
+ * `node:*` and `./shared/*` (the pi SDK value import is inlined — see the file
+ * header), so this suite runs on a bare checkout with no `npm ci`.
  *
  * ── Fixture honesty (read before trusting a green run) ───────────────────────
  * pi loads extensions with **jiti**, which keeps the SYMLINK path in
@@ -52,19 +51,6 @@ import hook, {
 
 const REPO_ROOT = resolve(__dirname, "..");
 const REAL_MANIFEST = join(REPO_ROOT, "enforcement", "dangerous-ops.txt");
-
-/**
- * Declaration-form-agnostic detector for an INLINED `isToolCallEventType`
- * (#1330): a `function` / `export` / `async function`, or a `const`/`let`/`var`
- * with an optional type annotation. Deliberately NOT a bare name match — an
- * `import { isToolCallEventType }` or a call site must not trip it. Scanned over
- * RAW source, so a comment quoting a declaration also trips it: the guard fails
- * CLOSED (a false positive costs a look; a miss re-opens the drift). A weak
- * regex cannot hide behind today's clean sources — the detector is pinned by its
- * own positive controls in section F.
- */
-const DECLARES_TOOL_CALL_PREDICATE =
-  /(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s+isToolCallEventType\b|(?:const|let|var)\s+isToolCallEventType\s*(?::[^=;]*)?=/;
 
 let passed = 0;
 let failed = 0;
@@ -979,42 +965,14 @@ async function main() {
   await test("the SDK is imported for TYPES only — the module loads with zero node_modules", () => {
     ok(!/^\s*import\s+(?!type\b)[^;\n]*@earendil-works/m.test(SOURCE), "a runtime SDK import would break the bare-checkout suite");
     ok(SOURCE.includes('import type { ExtensionAPI, ToolCallEventResult } from "@earendil-works/pi-coding-agent"'));
-    ok(SOURCE.includes('from "./shared/tool-call-event.js"'), "the tool-call predicate must come from the ONE shared copy (#1330)");
-    ok(!DECLARES_TOOL_CALL_PREDICATE.test(SOURCE), "an inlined isToolCallEventType is the #1330 drift — one shared copy only");
-  });
-  await test("the declaration scan detects every inlined form — and only those (#1330)", () => {
-    // A guard run only against today's CLEAN sources cannot fail when its regex
-    // weakens, so pin the detector itself (the #966 'declaration scan' practice).
-    for (const positive of [
-      "function isToolCallEventType(toolName: string, event: unknown): boolean {",
-      "export function isToolCallEventType(toolName: string, event: unknown): boolean {",
-      "async function isToolCallEventType() {}",
-      "const isToolCallEventType = (t: string, e: unknown) => false;",
-      "const isToolCallEventType: Predicate = (t, e) => false;",
-      "let isToolCallEventType = function () { return false; };",
-      "var isToolCallEventType = () => false;",
-    ]) {
-      ok(DECLARES_TOOL_CALL_PREDICATE.test(positive), `must detect: ${positive}`);
-    }
-    for (const decoy of [
-      'import { isToolCallEventType } from "./shared/tool-call-event.js";',
-      "export { isToolCallEventType };",
-      "const isToolCallEventTypeForTest = 1;",
-      "const x = isToolCallEventType(\"bash\", event);",
-      "// do not declare isToolCallEventType locally",
-    ]) {
-      ok(!DECLARES_TOOL_CALL_PREDICATE.test(decoy), `must ignore: ${decoy}`);
-    }
-  });
-  await test("neither zero-dep extension inlines the tool-call predicate (#1330)", () => {
-    const sources: Array<[string, string]> = [
-      ["skill-enforcer", SOURCE],
-      ["sequence-enforcer", readFileSync(join(REPO_ROOT, "extensions", "sequence-enforcer", "index.ts"), "utf-8")],
-    ];
-    for (const [name, src] of sources) {
-      ok(src.includes("shared/tool-call-event.js"), `${name} must import the shared tool-call predicate (#1330)`);
-      ok(!DECLARES_TOOL_CALL_PREDICATE.test(src), `${name} must not declare a local isToolCallEventType (#1330: one copy only)`);
-    }
+    // #1330 — the predicate is no longer inlined HERE. It has one home
+    // (shared/tool-call-event.ts) and is pinned against the real export by
+    // extensions/verification-gate/tool-call-event-parity.test.ts; a private copy
+    // in this file would drift under a pi upgrade with every gate still reporting
+    // `✅ Loaded`. shared/tool-call-event.test.ts asserts this import repo-wide.
+    ok(SOURCE.includes('import { isToolCallEventType } from "./shared/tool-call-event.js"'),
+      "the shared predicate import must be present (it replaces the #1321 inline)");
+    ok(!/function isToolCallEventType\(/.test(SOURCE), "the predicate must not be re-inlined here (#1330)");
   });
   await test("no gate key is built from SKILLS_PREFIX any more (only the display fallback)", () => {
     const hits = SOURCE.match(/SKILLS_PREFIX\}\$\{/g) ?? [];

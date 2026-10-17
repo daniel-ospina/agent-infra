@@ -42,11 +42,13 @@ import { resolve, join, dirname, isAbsolute } from "node:path";
 import { homedir } from "node:os";
 import { isPrintMode } from "./shared/print-mode.js";
 import { register } from "./shared/health.js";
-// #1330 — ONE copy of pi's `isToolCallEventType`, shared with sequence-enforcer.
-// It was inlined here because this gate suite runs on a bare checkout with no
-// node_modules; the earlier per-file inline drifted independently and an inline
-// that stops matching silently turns every gate into a no-op. The copy carries
-// the pi version stamp + the SDK parity pin that make a pi upgrade deliberate.
+// #1321/#1330 — the inlined copy of pi's `isToolCallEventType` now has ONE home
+// (shared/tool-call-event.ts) and is pinned against the real export by
+// extensions/verification-gate/tool-call-event-parity.test.ts. It is imported
+// rather than re-declared
+// here precisely so the pin covers every consumer: a private copy in this file
+// would drift under a pi upgrade while the extension kept reporting
+// `✅ Loaded — enforcing N skill gates` with every gate inert (#1330).
 import { isToolCallEventType } from "./shared/tool-call-event.js";
 
 // ── Real module location ────────────────────────────
@@ -789,7 +791,10 @@ export default function (pi: ExtensionAPI) {
       return undefined;
     }
 
-    // Prerequisite chains: block write/edit if routing skill read but no dispatch (#7220)
+    // Prerequisite chains: block write/edit if routing skill read but no dispatch (#7220).
+    // Deliberately a DIRECT property read, not the predicate: this branch must
+    // read the tool name off whatever shape pi sends, so a predicate drift cannot
+    // take the prerequisite gate out with it (#1330).
     const toolName = (event as any).toolName ?? "";
     if (toolName === "write" || toolName === "edit") {
       for (const [skillName, prereq] of Object.entries(PREREQUISITES)) {

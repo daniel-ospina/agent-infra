@@ -1,37 +1,49 @@
 /**
- * tool-call-event.ts — THE single copy of pi's `isToolCallEventType` predicate
- * for the extensions whose gate suites run on a bare checkout (#1330).
+ * shared/tool-call-event.ts — THE single home for the inlined copy of pi's
+ * `isToolCallEventType` (#1330).
  *
- * WHY THIS EXISTS. `extensions/skill-enforcer.ts` and
- * `extensions/sequence-enforcer/index.ts` run their suites in CI's `verify` job,
- * which performs no `npm ci`, so they cannot value-import the pi SDK at runtime.
- * pi's export is one line, so it used to be inlined in each file. TWO copies
- * drift independently, and a copy whose shape stops matching silently makes
- * every gate a no-op while the extension still reports `✅ Loaded — enforcing N
- * skill gates` — the inert-enforcer class (category A, #1330). One copy means
- * one place to fix and the pins below all point at it.
+ * ── WHY A COPY EXISTS AT ALL ────────────────────────────────────────────────
+ * The extensions that need this predicate (skill-enforcer, sequence-enforcer)
+ * have ZERO-DEPENDENCY gate suites: `ci.yml`'s `verify` job runs them with no
+ * `npm ci`, so `import { isToolCallEventType } from "@earendil-works/pi-coding-
+ * agent"` is unavailable in the module under test. pi's loader resolves the
+ * package from its own bundled module table at runtime, but the suite loads the
+ * module directly, so the value import had to be replaced by a copy.
  *
- * THE PIN. Verified against pi 0.85.1 internals (Q1):
- *   dist/core/extensions/types.js:45  export function isToolCallEventType(toolName, event) {
- *   dist/core/extensions/types.js:46      return event.toolName === toolName;
- *   dist/core/extensions/types.js:47  }
- * The `pi 0.85.1` above is a mirror version stamp: scripts/check-pi-pin-lockstep.mjs
- * guard (i) fails on any bump of PI_VERSION_PIN that leaves it stale, so the
- * predicate can never be carried across a pi upgrade without a deliberate
- * re-verification. The behavioural half of the pin is the SDK parity assertion
- * in extensions/verification-gate/index.test.ts — the shared function and the
- * installed SDK's real export must agree on the whole event matrix.
+ * ── THE FAILURE MODE THIS FILE IS WRITTEN AGAINST (#1330) ───────────────────
+ * A copy of an SDK predicate drifts silently under an upgrade: if pi moves the
+ * tool name (nested, renamed, wrapped), the copy returns `false` for EVERY
+ * event, the block branches are never reached, and the extension keeps printing
+ * `✅ Loaded — enforcing N skill gates` — an inert enforcer reporting success.
+ * So the copy is not allowed to be a private detail of whichever file needed it
+ * first: it is ONE exported function, and it is PINNED against the real export
+ * by `extensions/verification-gate/tool-call-event-parity.test.ts`, which runs
+ * with the pi
+ * package installed (see that file's header for why the pin is SDK-bearing).
  *
- * NULL-SAFETY IS DELIBERATE, NOT DRIFT. pi reads `event.toolName` unguarded and
- * throws on a null/undefined event; this copy is its null-safe totalization,
- * because a `tool_call` handler can be invoked with an absent event during
- * teardown. The parity pin applies the same totalization to pi, so this
- * superset is asserted rather than assumed.
+ * ── THE PINNED UPSTREAM SOURCE ─────────────────────────────────────────────
+ *   @earendil-works/pi-coding-agent 0.85.1
+ *   dist/core/extensions/types.js:45-47
+ *     export function isToolCallEventType(toolName, event) {
+ *         return event.toolName === toolName;
+ *     }
+ *   (d.ts overloads narrow per built-in tool name; the runtime body is the
+ *   single line above.)
  *
- * The signature stays exactly `(string, unknown) => boolean`: the callers keep
- * their own `(event.input as ...)` narrowing, and returning a plain boolean (not
- * a pi-style type predicate) preserves their current compile behaviour.
+ * The body below is upstream's, EXACTLY — including its behaviour on a
+ * `null`/`undefined` event (a TypeError, not `false`). The earlier private
+ * copies were written as `event?.toolName === toolName`, which is NOT what
+ * upstream does: it swallowed the malformed-event case where upstream throws.
+ * That was an unintentional divergence found while building this pin, and it is
+ * why the parity suite compares thrown-ness as well as return values. Do not
+ * re-add the optional chain here — add tolerance upstream first, or the pin is
+ * asserting something the SDK does not do.
+ *
+ * Consumers import this with an ESM `.js` specifier (repo convention; pi's jiti
+ * and tsx both resolve it to this `.ts`):
+ *   import { isToolCallEventType } from "./shared/tool-call-event.js";   // flat extension
+ *   import { isToolCallEventType } from "../shared/tool-call-event.js";  // dir extension
  */
 export function isToolCallEventType(toolName: string, event: unknown): boolean {
-  return (event as { toolName?: unknown })?.toolName === toolName;
+  return (event as { toolName?: unknown }).toolName === toolName;
 }
