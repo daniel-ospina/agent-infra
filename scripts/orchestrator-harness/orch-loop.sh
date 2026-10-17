@@ -87,7 +87,17 @@ is_limit "${_NCPU:-}"    || _NCPU=4
 [ "${_NCPU:-0}" -ge 1 ] || _NCPU=4
 MAX_LOAD="${MAX_LOAD:-$(( 10#$_NCPU * 10 ))}"
 is_limit "${MAX_LOAD:-}" || MAX_LOAD=$(( 10#$_NCPU * 10 )); is_limit "${MAX_LOAD:-}" || MAX_LOAD=40
-MAX_LANES="${MAX_LANES:-4}"
+# ⛔ CAPACITY, NOT A LANE COUNT (owner ruling, 2026-10-17): "dispatch should be gated on capacity,
+# not on number of lanes. max lanes 8 is too low. that needs to be configured to 2.5x the number of
+# CPUs". Both numbers in play were LANE COUNTS that no hardware decided: the shipped default was a
+# FLAT 4, and the box this was measured on had its plist PINNED at 8 —
+# `[cap] load=79/100 lanes=9/8 … [dispatch] skipped (lanes=9>=max_lanes=8)` — 21 points of load
+# headroom and comfortable swap/memory, so the NEXT dispatch was refused for a lane count while
+# capacity was available. `MAX_LOAD` above already derives from cores; same rule here.
+# Integer division, so it FLOORS (4 cores -> 10, 3 -> 7). An explicit MAX_LANES still WINS and is not
+# recomputed — with ONE exception, spelled out at the coercion block below: a present-but-INVALID
+# value (`4x`, `09`, ten digits) is repaired there to this same derived default.
+MAX_LANES="${MAX_LANES:-$(( 10#$_NCPU * 5 / 2 ))}"
 MAX_REVIEW="${MAX_REVIEW:-4}"   # keep in sync with install.sh's default and README §4
 # Above this many UNOWNED open PRs (open PRs nothing is currently working — pr_owned() below),
 # merging takes priority and new lanes stop being dispatched. The pre-fix gate counted the TOTAL
@@ -169,7 +179,14 @@ is_limit "${MIN_MEM_FREE_MB:-512}" || MIN_MEM_FREE_MB=512
 # attempt 10 run; and `$((MAX_REVIEW + 2))` reads a leading-zero value as OCTAL (030 -> 26, not 30),
 # which is the same trap the scope decision already normalises with `10#` below. MAX_FIX is coerced
 # for the same reason. Each is first read below this point, so coercing here is still guard-before-use.
-is_limit "${MAX_LANES:-}"         || MAX_LANES=4
+# ⛔ MAX_LANES IS REPAIRED TO ITS OWN DERIVED DEFAULT, not to a flat 4 (owner ruling, 2026-10-17):
+# a garbage plist value must leave the box with the ceiling its CORES imply (see the derivation at
+# the top), or a typo would silently pin one machine to a lane count its hardware never chose. The
+# repair is BOUNDED exactly as MAX_LOAD's is: `_NCPU` passes `is_limit` at nine digits, so
+# `* 5 / 2` can produce a ten-digit lane count that `is_limit` rejects — and only a TRUE default can
+# repair that, since re-deriving from the same probe returns the same value. 10 = a 4-core box's
+# 2.5x. `MAX_LANES=0` still passes `is_limit` and dispatches nothing — unchanged, deliberate.
+is_limit "${MAX_LANES:-}"         || { MAX_LANES=$(( 10#$_NCPU * 5 / 2 )); is_limit "${MAX_LANES:-}" || MAX_LANES=10; }
 is_limit "${MAX_REVIEW:-}"        || MAX_REVIEW=4
 is_limit "${MERGE_PRIORITY_AT:-}" || MERGE_PRIORITY_AT=25
 is_limit "${MAX_FIX:-}"           || MAX_FIX=3
