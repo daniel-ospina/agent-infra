@@ -161,16 +161,33 @@ load_config_file
 SLUG=""; SLUG_REPO=""
 
 # ── SCOPED process reads ───────────────────────────────────────────────────────────────────────
-# ⛔ Every read below is scoped to THIS state dir's own orch-loop.sh path, and never a bare
-# `pgrep -f orch-loop.sh`. Measured 2026-10-15: an unscoped read matched FOUR controllers on a dev
-# box — this box's real controller, a leaked test fixture, and two of a peer lane's own test — and a
-# destructive verb driven by that read would have killed a peer's work. Descendants are excluded for
-# the same measured reason (`orch-loop.sh` spawns children whose command line also matches).
+# ⛔ Every read below is scoped to THIS state dir's own orch-loop.sh path AND the harness path this
+# machine actually runs it from, never a bare `pgrep -f orch-loop.sh`. Measured 2026-10-15: an
+# unscoped read matched FOUR controllers on a dev box — this box's real controller, a leaked test
+# fixture, and two of a peer lane's own test — and a destructive verb driven by that read would have
+# killed a peer's work. Descendants are excluded for the same measured reason (`orch-loop.sh` spawns
+# children whose command line also matches).
+#
+# ⛔ BOTH PATHS ARE REQUIRED, and that is not belt-and-braces: MEASURED 2026-10-17 on `pi-cell-2`, the
+# controller's argv is
+#   bash /tmp/bringup-1761/scripts/orchestrator-harness/orch-loop.sh
+# — the HARNESS path, NOT `$O/orch-loop.sh`. `$O` is seeded so the WORKERS (fix-one.sh, merge-one.sh)
+# can be invoked from it; the controller itself execs the harness it was started from. A read scoped
+# to `$O` alone therefore found NO controller on a cell that was busy spawning lanes, and `status`
+# reported "no orch-loop.sh pid observed yet" over a live loop (the same false-STOPPED class #1761 is
+# about, one path further in).
+harness_ctl_path() {
+  local p=""
+  if [ -n "${HARNESS:-}" ]; then printf '%s\n' "$HARNESS"; return 0; fi
+  [ -f "$HARNESS_PIN_FILE" ] && p="$(head -1 "$HARNESS_PIN_FILE" 2>/dev/null)"
+  [ -n "$p" ] || p="$HARNESS_BRINGUP"
+  printf '%s\n' "$p"
+}
 local_controller_pids() {
-  ps -eo pid=,ppid=,command= 2>/dev/null | awk -v want="$O/orch-loop.sh" '
+  ps -eo pid=,ppid=,command= 2>/dev/null | awk -v a="$O/orch-loop.sh" -v b="$(harness_ctl_path)/orch-loop.sh" '
     { ppid[$1]=$2; c=$0; sub(/^[[:space:]]*[0-9]+[[:space:]]+[0-9]+[[:space:]]+/,"",c)
       n=split(c,tok," ")
-      if (n>=2 && tok[2]==want && tok[1] ~ /(bash|sh|dash|zsh)$/) m[$1]=1 }
+      if (n>=2 && (tok[2]==a || (b!="" && tok[2]==b)) && tok[1] ~ /(bash|sh|dash|zsh)$/) m[$1]=1 }
     END { for (p in m) { q=p; d=0
             for (i=0;i<64;i++) { if (!(q in ppid) || ppid[q]<=1) break; q=ppid[q]; if (q in m) { d=1; break } }
             if (!d) print p } }'
@@ -664,13 +681,22 @@ cmd_stop() {
 # candidate file's mtime is the read that catches the measured failure: a controller with a fresh
 # heartbeat and a candidates.txt that has not moved is a controller doing nothing.
 cmd_status() {
+  # ⛔ RESOLVE the identity before reporting: `status` is the verb an operator runs to find out WHAT
+  # this machine is doing, so printing `<unresolved>` for a perfectly readable checkout would make the
+  # one screen they trust the least informative one. A pair that cannot be resolved is REPORTED (the
+  # refusal is `check`'s job), never refused here — the same rule cloud-cell-supervisor.sh applies to
+  # its `status`.
+  if [ -n "${REPO:-}" ] && [ -d "${REPO:-}" ]; then
+    resolve_repo_identity 2>/dev/null || SLUG_REPO=""
+    [ -n "$SLUG_REPO" ] && { SLUG="$(registry_slug "$SLUG_REPO" 2>/dev/null)" || SLUG=""; }
+  fi
   say "platform:  $PLATFORM"
   say "repo:      ${SLUG_REPO:-<unresolved>}  @ ${REPO:-<unset>}${REPO_SRC:+  (${REPO_SRC})}"
   say "state dir: $O"
   say "config:    $ENV_FILE$([ -f "$ENV_FILE" ] && printf ' (present)' || printf ' (absent)')"
   if [ "$PLATFORM" = "cell" ]; then
     local recorded=""; [ -f "$HARNESS_PIN_FILE" ] && recorded="$(head -1 "$HARNESS_PIN_FILE" 2>/dev/null)"
-    say "harness:   ${recorded:-<no pin recorded>}"
+    say "harness:   ${recorded:-$(harness_ctl_path) (not pinned — running from the checkout)}"
     [ -f "$O/.agent-infra-stamp.json" ] && say "stamp:     commit $(sed -n 's/.*"commit": *"\([^"]*\)".*/\1/p' "$O/.agent-infra-stamp.json" | head -1) relation $(sed -n 's/.*"relation": *"\([^"]*\)".*/\1/p' "$O/.agent-infra-stamp.json" | head -1)"
   else
     [ -f "$O/.agent-infra-stamp.json" ] && say "harness:   $(sed -n 's/.*"harness": *"\([^"]*\)".*/\1/p' "$O/.agent-infra-stamp.json" | head -1)"

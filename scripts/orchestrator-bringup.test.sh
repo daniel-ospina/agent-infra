@@ -345,6 +345,25 @@ case "$OUT" in
   *) bad "status did not warn about the empty candidate file — $OUT" ;;
 esac
 
+# §6b THE CONTROLLER RUNS FROM THE HARNESS PATH, NOT FROM $O. Measured 2026-10-17 on pi-cell-2: the
+# controller's argv is `bash <HARNESS>/orch-loop.sh` — $O is seeded for the WORKERS, and the loop
+# itself execs the harness it was started from. A read scoped to `$O/orch-loop.sh` alone therefore
+# found no controller on a cell that was busy spawning lanes, and `status` printed "no orch-loop.sh
+# pid observed yet" over a live loop (the false-STOPPED class #1761 is about, one path further in).
+M="$T/m"; mk_bin "$M/bin" cell; mk_clone "$M/repo" "daniel-ospina/agent-infra"; mkdir -p "$M/home" "$M/O"
+mkdir -p "$M/harness"; mk_controller "$M/harness"
+printf 'DEEPSEEK_API_KEY=sk-test\n' > "$M/home/keys.env"
+printf '%s\n' "$M/harness" > "$M/home/.harness-path"
+M_PID="$(start_controller "$M/harness")"; sleep 0.4
+# NOTE: $M/O deliberately has NO orch-loop.sh — only the harness does.
+BRINGUP_ARGS=status bringup "$M/home" "$M/bin" "" CELL_HOME="$M/home" REPO="$M/repo" O="$M/O" \
+  HARNESS_PIN_DIR="$M/home/harness" HARNESS_PIN_FILE="$M/home/.harness-path"
+case "$OUT" in
+  *"controller: RUNNING  pid $M_PID"*) ok "status: finds a controller running from the HARNESS path (the measured cell argv), not just \$O" ;;
+  *) bad "status: missed a controller whose argv is the harness path — $OUT" ;;
+esac
+kill -9 "$M_PID" 2>/dev/null
+
 # ── §7 the cell path ───────────────────────────────────────────────────────────────────────────
 say_case "§7 the cell path: apply -> start via the supervisor, pid read from ITS status verb"
 K="$T/k"; mk_bin "$K/bin" cell; mk_clone "$K/repo" "daniel-ospina/agent-infra"; mkdir -p "$K/home"
