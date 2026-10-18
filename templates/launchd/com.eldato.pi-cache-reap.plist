@@ -25,8 +25,12 @@
          owner's, because arming is a deliberate, per-machine consequence decision.
 
          ARMING (owner action, one argument, reversible):
-           1. replace the dry-run argument below with the apply argument
-              (or set CACHE_REAP_APPLY=1 in EnvironmentVariables)
+           1. replace the dry-run argument below with the apply argument.
+              ⛔ Do NOT reach for CACHE_REAP_APPLY=1 here instead: the script lets an
+              explicit flag win over that env default (so a requested dry run really
+              is one), which means the variable CANNOT arm a job whose
+              ProgramArguments still say dry-run — it would report itself installed
+              and loaded while doing nothing, the inert-enforcer shape #1678 removed.
            2. re-run scripts/install-launchd.sh
          The armed copy is then a dated, auditable state — re-rendered from this
          template on every sync, so there is no second copy to drift.
@@ -83,7 +87,11 @@
              to the script default — the same value, but pinned where a machine
              can be tuned from source. The bring-up report and the supervisor read
              the bound from the script (its print-config mode), so this is one of the
-             two places it may legitimately be tuned (the other: the default). -->
+             two places it may legitimately be tuned (the other: the default).
+             ⚠️ Tuning the bound HERE binds THIS job only: the bring-up report and the
+             supervisor resolve the bound from the environment THEY run in, and
+             its print-config mode prints the `bound_source` it used so the two cannot be
+             read as the same policy when they differ. -->
         <key>CACHE_REAP_MAX_MB</key>
         <string>2048</string>
     </dict>

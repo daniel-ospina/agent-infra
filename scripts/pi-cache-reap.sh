@@ -90,19 +90,25 @@
 #     consequence decision — agent-infra#1678, owner ruling 2026-10-11: "the reaper
 #     may run unattended; arming it may not", and "Arming a deletion tool must not
 #     be reachable by a lane at all". Every sibling reaper (`pi-reap-worktrees`,
-#     `pi-task-session-prune`) ships unarmed for the same reason. Arming is one
-#     argument in the plist (or one env var, CACHE_REAP_APPLY=1) plus a re-run of
-#     scripts/install-launchd.sh — a dated, reversible, owner-owned step.
+#     `pi-task-session-prune`) ships unarmed for the same reason. ARMING IS THE
+#     ARGUMENT: replace `--dry-run` with `--apply` in the plist's ProgramArguments
+#     and re-run scripts/install-launchd.sh — a dated, reversible, owner-owned step.
+#     ⛔ `CACHE_REAP_APPLY=1` in EnvironmentVariables does NOT arm that job: an
+#     explicit flag wins over the env default (so a requested dry run really is one),
+#     which means the env var can only arm an invocation that passes no flag.
 #   * The destructive path a CELL still reaches automatically is the pre-existing
 #     low-disk emergency one: `cloud-cell-supervisor.sh` calls `prune --caches`
 #     unattended when free space falls under 2x MIN_FREE_MB (no live worker), and
-#     `prune --caches` delegates here with --apply. That is not new arming — it is
-#     the existing emergency delete path, extended to a sink that is strictly safer
-#     to reclaim than the `.venv` trees it already removes (regenerable, unowned,
-#     no uncommitted work). The operator verb `cloud-cell-supervisor.sh prune
-#     --caches` reaches the same arm, and `cloud-cell-bringup.sh --check` REPORTS
-#     every cache size (with the bound), so a growing disk is visible before it
-#     stops dispatch.
+#     `cmd_prune` delegates here with --apply. That is not new arming — it is the
+#     existing emergency delete path, extended to a sink that is strictly safer to
+#     reclaim than the `.venv` trees it already removes (regenerable, unowned, no
+#     uncommitted work).
+#     ⛔ ALL `prune` FORMS reach that arm (`prune`, `prune --caches`,
+#     `prune --scratch`): `reap_global_caches` runs unconditionally inside
+#     `cmd_prune`, and `--caches` only selects its early return. State it plainly so
+#     nobody reads "prune --caches" as the only armed verb.
+#     `cloud-cell-bringup.sh --check` REPORTS every cache size (with the bound), so a
+#     growing disk is visible before it stops dispatch.
 #
 # Usage:
 #   pi-cache-reap.sh [--dry-run] [--apply] [--print-config] [--help]
@@ -332,6 +338,16 @@ ps_matches() {
                 {
                     exe = $2; sub(/.*\//, "", exe)
                     if (exe == tool) { print; next }
+                    # ⛔ npm and pip are NOT native binaries: npm runs as
+                    # `node .../node_modules/npm/bin/npm-cli.js`, pip as
+                    # `python3 .../pip/__main__.py` (or `python3 -m pip`). An argv[0]
+                    # comparison therefore NEVER matches them, and a measured probe
+                    # showed a live `npm install` failing to block the escalation —
+                    # the guard was untested because the suite only stubbed a native
+                    # uv holder. Match what the process IS, not just its binary name.
+                    if (tool == "npm" && (index($0, "npm-cli.js") || index($0, "bin/npm"))) { print; next }
+                    if (tool == "pip" && (index($0, "pip/__main__.py") || index($0, " -m pip") || index($0, " -m pip3") || index($0, "bin/pip3"))) { print; next }
+                    if (tool == "uv" && index($0, "bin/uv ")) { print; next }
                     if (exe == "env") {
                         i = 3
                         while (i <= NF && $i ~ /=/) i++
@@ -377,6 +393,21 @@ shared_file_in() {
     f="$(find "$1" -type f -links +1 -print -quit 2>/dev/null)" || return 2
     [ -n "$f" ] || return 1
     printf '%s' "$f"
+}
+
+# remove_entry <entry> — delete an entry WITHOUT ever crossing a filesystem boundary.
+# ⛔ `rm -rf` recurses through a mount ANYWHERE below the entry, not only at it: a tmpfs
+# mounted at `$CACHE/archive-v0/inner` was deleted THROUGH in a measured probe, because the
+# depth-1 `same_device` stat of the entry cannot see it. `-xdev` never descends into another
+# filesystem, so whatever is mounted there survives; the entry then cannot be removed whole
+# and the pass reports the residue instead of claiming the reclaim. `-links 1` is a second
+# belt: the entry-level check already refused shared entries, and a file that acquired a
+# link since then must not be unlinked here either.
+remove_entry() {
+    local e="$1"
+    find "$e" -xdev \( -type f -o -type l \) -links 1 -delete 2>/dev/null || true
+    find "$e" -xdev -depth -type d -empty -delete 2>/dev/null || true
+    [ ! -e "$e" ]
 }
 
 # entries_by_size <dir> <outfile> — every top-level entry of <dir>, largest first, as
@@ -440,6 +471,14 @@ reap_target() {
     now_kb="$(kb_of "$dir")" \
         || { fail_closed "$class: cannot measure $dir after the prune — the shrink cannot be verified"; return 0; }
 
+    # ⛔ No pre-pass free-space reading means NO WAY TO PROVE THE RECLAIM, so escalating is
+    # deleting on a claim that cannot be checked (and the no-gain brake, keyed on that same
+    # reading, would be silently inert while the pass emptied the cache). Refuse first.
+    if [ "$now_kb" -gt "$MAX_KB" ] && [ -z "${before_free_kb:-}" ]; then
+        fail_closed "$class: $dir is $(mb_str "$now_kb") > ${MAX_MB}MB but free space could not be read before the pass (df) — escalating would delete without any way to prove the reclaim"
+        return 0
+    fi
+
     # ── (2) escalate: largest entries first, skipping anything a live process names ──
     if [ "$now_kb" -gt "$MAX_KB" ]; then
         ps_snapshot || { fail_closed "$class: $dir is $(mb_str "$now_kb") > ${MAX_MB}MB and the ps probe could not answer — NOT escalating an unproven cache"; return 0; }
@@ -492,7 +531,7 @@ reap_target() {
                 fail_closed "$class: cannot determine whether $e is still hardlinked — refusing to delete an entry that may free nothing"
                 break
             fi
-            if rm -rf -- "$e" 2>/dev/null; then
+            if remove_entry "$e"; then
                 evicted=$((evicted + 1))
                 # Re-measure the WHOLE cache, not the entry: an entry can be a directory
                 # holding more than `du` charged to its own top level (block rounding).
@@ -577,7 +616,12 @@ cap_log() {
 # --apply passes measure the same free-space delta, so one could print VERIFIED for a
 # shrink the other performed. Same shape as pi-reap-worktrees.sh:425.
 lock_release() {
-    if [ "$LOCK_HELD" = 1 ]; then rm -rf "$LOCK_DIR" 2>/dev/null || true; LOCK_HELD=0; fi
+    if [ "$LOCK_HELD" = 1 ]; then
+        # ⛔ Only ever remove a lock that is PROVABLY OURS: a pass that broke this one as stale
+        # and took it must not have its own lock deleted by the previous holder's EXIT trap.
+        [ "$(cat "$LOCK_DIR/owner" 2>/dev/null)" = "$$" ] && rm -rf "$LOCK_DIR" 2>/dev/null || true
+        LOCK_HELD=0
+    fi
     return 0
 }
 lock_acquire() {
@@ -609,7 +653,20 @@ lock_acquire() {
             return 1
         fi
         plog "pi-cache-reap: breaking a stale lock (owner=${owner:-?} age=${age}s)"
-        rm -rf "$LOCK_DIR" 2>/dev/null || true
+        # ⛔ The BREAK must have exactly one winner. A read-then-`rm -rf`-then-`mkdir` lets two
+        # passes both observe the same stale lock, both remove it and both run — and a late
+        # breaker deletes the fresh lock the winner just created (reproduced). One process wins
+        # the break token; the loser does not run.
+        if ! mkdir "$LOCK_DIR.break" 2>/dev/null; then
+            say "pi-cache-reap: another pass is already clearing a stale lock — this one does not run"
+            return 1
+        fi
+        # Re-read under the token: the lock may have been replaced while we were deciding.
+        if [ -d "$LOCK_DIR" ] && [ "$(cat "$LOCK_DIR/started" 2>/dev/null)" = "$started" ]; then
+            mv "$LOCK_DIR" "$LOCK_DIR.stale.$$" 2>/dev/null || true
+            rm -rf "$LOCK_DIR.stale.$$" 2>/dev/null || true
+        fi
+        rmdir "$LOCK_DIR.break" 2>/dev/null || true
     fi
     if ! mkdir "$LOCK_DIR" 2>/dev/null; then
         say "pi-cache-reap: lock raced with another pass — this one does not run"
@@ -682,6 +739,7 @@ PIPD_MAC="${CACHE_REAP_PIP_DIR_MAC:-${HOME:-}/Library/Caches/pip}"
 # is how a tuned bound ends up disagreeing with the report about the same cache.
 if [ "$PRINT_CONFIG" = 1 ]; then
     printf 'bound_mb=%s\n' "$MAX_MB"
+    if [ -n "${CACHE_REAP_MAX_MB:-}" ]; then printf 'bound_source=env\n'; else printf 'bound_source=default\n'; fi
     printf 'cache=uv:%s\n' "$UVD"
     printf 'cache=npm:%s\n' "$NPMD"
     printf 'cache=pip:%s\n' "$PIPD"

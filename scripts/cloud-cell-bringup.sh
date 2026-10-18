@@ -444,7 +444,7 @@ check_caches() {
   local d kb total=0 listed="" maxmb=2048 bound over=0 measured du_rc cfg line reaper
   # A NEWLINE-SEPARATED list, not an array: bash 3.2 (the macOS default) treats `${#arr[@]}` on an
   # empty array as an unbound-variable error under `set -u`.
-  local dirs_list=""
+  local dirs_list="" bound_source=default
   # The reaper is the ONE place that knows WHERE the caches are and WHAT the bound is. Two reasons
   # (agent-infra#1987): `uv cache dir` honours XDG_CACHE_HOME, so a literal `$HOME/.cache/uv` here
   # can report "absent" for a box whose uv cache is 3GB elsewhere; and a tuned bound must not leave
@@ -462,6 +462,11 @@ check_caches() {
       ''|*[!0-9]*|0*) ;;
       *) maxmb="$line" ;;
     esac
+    # WHERE the bound came from, reported next to it: a bound tuned in the launchd plist does not
+    # reach a bring-up shell's environment, so the two numbers can legitimately differ — and a
+    # report that hides its source reads as the policy the armed job enforces (#1987 review).
+    bound_source="$(printf '%s\n' "$cfg" | sed -n 's/^bound_source=//p' | head -1)"
+    case "$bound_source" in env|default) ;; *) bound_source=unknown ;; esac
     while IFS= read -r line; do
       case "$line" in cache=*) dirs_list="$dirs_list${dirs_list:+
 }${line#cache=*:}" ;; esac
@@ -503,7 +508,7 @@ check_caches() {
     fi
   done <<<"$dirs_list"
   listed="${listed#, }"
-  ok "caches: $listed — total $(( total / 1024 ))MB (bound ${maxmb}MB per cache)"
+  ok "caches: $listed — total $(( total / 1024 ))MB (bound ${maxmb}MB per cache, source ${bound_source})"
   if [ "$over" -gt 0 ]; then
     warn "  $over package cache(s) exceed the ${maxmb}MB bound — this is the sink that took pi-cell-3"
     warn "  from 7.1GB in ~/.cache/uv to 258MB free and refused every dispatch (#1987). Reclaim it now:"

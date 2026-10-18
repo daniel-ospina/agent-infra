@@ -85,6 +85,22 @@ cat >"$T/bin/ps-uv" <<'SH'
 #!/bin/sh
 printf '%s\n' "    1 /sbin/init" " 4242 /usr/local/bin/uv sync --frozen"
 SH
+# The REAL shapes: npm is a script run by node, pip a module run by python3 — neither has an
+# argv[0] of "npm"/"pip", so an argv[0]-only matcher never sees them (measured: a live
+# `npm install` did not block the escalation).
+cat >"$T/bin/ps-npm" <<'SH'
+#!/bin/sh
+printf '%s\n' "    1 /sbin/init" " 5151 /usr/local/bin/node /usr/local/lib/node_modules/npm/bin/npm-cli.js install"
+SH
+cat >"$T/bin/ps-pip" <<'SH'
+#!/bin/sh
+printf '%s\n' "    1 /sbin/init" " 5152 /usr/bin/python3 -m pip install requests"
+SH
+# df that cannot answer at all: "cannot judge", never "plenty".
+cat >"$T/bin/df-silent" <<'SH'
+#!/bin/sh
+exit 0
+SH
 cat >"$T/bin/ps-empty" <<'SH'
 #!/bin/sh
 exit 0
@@ -231,6 +247,18 @@ assert_eq "$(kb "$H/.cache/uv")" "$UV_BEFORE" "the locked-out pass mutated nothi
 assert_contains "$OUT" "another pass is running" "the skip names the holder, not a silent no-op"
 
  echo
+echo "── 3d. a STALE lock is broken (dead owner) and the pass runs ──"
+H="$T/h3d"
+new_cache "$H/.cache/uv" 3000 2000
+mkdir -p "$H/.pi/agent/state/pi-cache-reap.lock"
+printf '%s\n' "999999" >"$H/.pi/agent/state/pi-cache-reap.lock/owner"   # a pid that cannot be alive
+printf '%s\n' "$(( $(date +%s) - 7200 ))" >"$H/.pi/agent/state/pi-cache-reap.lock/started"
+OUT="$(run_reap "$H" --apply 2>&1)"; RC=$?
+assert_eq "$RC" "0" "a stale lock does not wedge the reaper forever (owners reboot, passes die)"
+assert_le "$(kb "$H/.cache/uv")" "$BOUND_KB" "the pass that broke the stale lock actually bounded the cache"
+[ ! -d "$H/.pi/agent/state/pi-cache-reap.lock" ] && ok "the lock was released on exit" || bad "a lock was left behind"
+
+ echo
 echo "── 4. a live holder: nothing evicted, and the pass refuses ──"
 H="$T/h4"
 new_cache "$H/.cache/uv" 3000 2000
@@ -242,6 +270,20 @@ assert_contains "$OUT" "live uv process is running" "the refusal names the tool-
 assert_contains "$OUT" "uv sync" "the refusal names the actual holder process"
 
 echo
+echo "── 4a. a live npm / pip holder is seen too (they are not native binaries) ──"
+# The holder class must match the CACHE class under test: npm's cache is $HOME/.npm/_cacache,
+# pip's is $HOME/.cache/pip (a uv-class fixture would never consult the npm/pip matcher).
+for pair in "ps-npm:.npm/_cacache" "ps-pip:.cache/pip"; do
+  stub="${pair%%:*}"; cdir="${pair#*:}"
+  H="$T/h4a-$stub"
+  new_cache "$H/$cdir" 3000 2000
+  UV_BEFORE="$(kb "$H/$cdir")"
+  OUT="$(PS_STUB="$T/bin/$stub" run_reap "$H" --apply 2>&1)"; RC=$?
+  assert_eq "$RC" "3" "a live holder via $stub blocks the escalation (exit 3)"
+  assert_eq "$(kb "$H/$cdir")" "$UV_BEFORE" "nothing was evicted while $stub was resolving against the cache"
+done
+
+ echo
 echo "── 4b. a process naming ONE entry preserves only that entry ──"
 H="$T/h4b"
 new_cache "$H/.cache/uv" 700 3000
@@ -293,6 +335,16 @@ OUT="$(DU_STUB=1 run_reap "$H" --apply CACHE_REAP_DU="$T/bin/du-partial" 2>&1)";
 assert_eq "$RC" "3" "a du that exits non-zero exits 3 even though it printed a number"
 assert_eq "$(kb "$H/.cache/uv")" "$UV_BEFORE" "nothing was evicted on a measurement that only saw part of the cache"
 assert_contains "$OUT" "cannot measure" "the refusal names the measurement, not the cache"
+
+ echo
+echo "── 5c. an unreadable df REFUSES to escalate (no way to prove the reclaim) ──"
+H="$T/h5c"
+new_cache "$H/.cache/uv" 3000 2000
+UV_BEFORE="$(kb "$H/.cache/uv")"
+OUT="$(DF_STUB="$T/bin/df-silent" run_reap "$H" --apply 2>&1)"; RC=$?
+assert_eq "$RC" "3" "a cache that cannot be measured against free space exits 3"
+assert_eq "$(kb "$H/.cache/uv")" "$UV_BEFORE" "NOTHING was deleted: the pass cannot prove what an empty df would hide"
+assert_contains "$OUT" "free space could not be read" "the refusal names df, not a phantom success"
 
  echo
 echo "── 6. the hardlink case: cache shrank, disk did not gain a byte ──"
@@ -385,6 +437,7 @@ assert_contains "$OUT" "bound_mb=2048" "--print-config reports the bound the rea
 assert_contains "$OUT" "cache=uv:$H/.cache/uv" "--print-config reports the uv cache the reaper will bound"
 assert_contains "$OUT" "cache=npm:$H/.npm/_cacache" "--print-config reports the npm cache"
 assert_contains "$OUT" "cache=pip:$H/.cache/pip" "--print-config reports the pip cache"
+assert_contains "$OUT" "bound_source=" "--print-config says WHERE the bound came from (a plist-tuned bound is not this process's env)"
 assert_contains "$(cat "$BRINGUP")" "--print-config" "the cell's report reads the bound from the reaper, not from a second literal"
 
  echo
@@ -395,9 +448,9 @@ assert_contains "$(sed -n 's/^fleet_srcs=(\(.*\))$/\1/p' "$SETUP")" "pi-cache-re
 assert_contains "$(cat "$TEMPLATE" 2>/dev/null)" "{{HOME}}/.pi/agent/scripts/pi-cache-reap.sh" \
     "the plist runs the FARMED script ($HOME/.pi/agent/scripts), not a ~/Documents path"
 assert_contains "$(cat "$TEMPLATE" 2>/dev/null)" "<string>--dry-run</string>" \
-    "the plist ships DRY-RUN: arming a scheduled deletion is an owner-level decision (#1678 ruling)"
+    "the plist ships DRY-RUN, the stance #1678's owner ruling requires"
 assert_not_contains "$(cat "$TEMPLATE" 2>/dev/null)" "<string>--apply</string>" \
-    "the plist does NOT ship armed — a lane may not arm a deletion tool by editing a tracked template"
+    "the tracked template ships UNARMED (a gate does not enforce this — #1678 owns that: the installer should refuse to render an armed plist)"
 assert_contains "$(cat "$TEMPLATE" 2>/dev/null)" "#1678" \
     "the plist names the ruling it follows, so the next lane does not 'tidy' it either way"
 assert_contains "$(cat "$TEMPLATE" 2>/dev/null)" "<integer>3600</integer>" "the plist is hourly"

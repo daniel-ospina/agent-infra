@@ -162,8 +162,8 @@ case "$BR_OUT" in
   *) bad "bring-up does not report the package caches — a disk sink is invisible again (#1987): $BR_OUT" ;;
 esac
 case "$BR_OUT" in
-  *"per cache)"*) ok "the cache report carries the bound (an operator can see what 'too big' means)" ;;
-  *) bad "the cache report does not name the bound: $BR_OUT" ;;
+  *"per cache, source "*) ok "the cache report carries the bound AND where it came from (an operator can see what 'too big' means, and whether the plist or this environment set it)" ;;
+  *) bad "the cache report does not name the bound and its source: $BR_OUT" ;;
 esac
 
 # ── 2b) a cell that ALREADY carries the layer is a read-back, not a re-install (#1723) ───────────
