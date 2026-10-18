@@ -1223,9 +1223,27 @@ if [ "$rc" -ne 0 ]; then ok "a MISSING heartbeat refuses (non-zero)"; else bad "
 # The substring names the DATUM, not just the phrase: `lc_guard_mutate` and `lc_probe` refuse with
 # "could not be read" too, so a generic match would keep passing if the probe or the guard were what
 # actually refused in this fixture (review finding).
-assert_contains "$out" "heartbeat is missing or not a regular file" "…and names the MISSING heartbeat specifically"
+assert_contains "$out" "heartbeat is missing, is not a regular file" "…and names the MISSING heartbeat specifically"
 assert_not_contains "$out" "running but not cycling" "…and does NOT claim the controller is wedged"
 assert_not_contains "$out" "unreadables old" "…and never prints a value it did not read"
+
+# An EMPTY or DIGITS-FREE heartbeat is PRESENT and unusable — it must not be reported as missing. These
+# two cases are what pin the arm's `[ -f ]` guard: `[ -s ]` would send an existing, zero-length file down
+# the missing arm and tell the operator it does not exist.
+for fixture in empty garbage; do
+  fresh "$(( $(date +%s) - 5 ))"
+  ( . "$LIB"; lc_start "$LABEL" "$T/o/x.plist" >/dev/null 2>&1 )
+  case "$fixture" in
+    empty)   : > "$T/o/heartbeat" ;;
+    garbage) printf 'n/a\n' > "$T/o/heartbeat" ;;
+  esac
+  : > "$FAKE_LOG"
+  out="$( . "$LIB"; LC_SETTLE=1 lc_ensure "$LABEL" "$T/o/x.plist" "$T/o" 0 2 2>&1 )"; rc=$?
+  if [ "$rc" -ne 0 ]; then ok "an ${fixture} heartbeat refuses (non-zero)"; else bad "an unusable datum was accepted as a duration"; fi
+  assert_contains "$out" "is PRESENT but is not a usable instant" "…(${fixture}) named as PRESENT-and-unusable"
+  assert_not_contains "$out" "is missing, is not a regular file" "…(${fixture}) and NOT called missing"
+  assert_not_contains "$out" "unreadables old" "…(${fixture}) and no fabricated duration"
+done
 
 # A heartbeat that is PRESENT but not a usable instant is a different operator problem (a clock step),
 # and `lc_hb_age` returns empty for it too. Naming it "missing" would send the operator to `ls -l` on a
@@ -1237,7 +1255,7 @@ printf '%s\n' "$(( $(date +%s) + 86400 ))" > "$T/o/heartbeat"
 out="$( . "$LIB"; LC_SETTLE=1 lc_ensure "$LABEL" "$T/o/x.plist" "$T/o" 0 2 2>&1 )"; rc=$?
 if [ "$rc" -ne 0 ]; then ok "a FUTURE-dated heartbeat refuses too (non-zero)"; else bad "a future instant was accepted as a duration"; fi
 assert_contains "$out" "is PRESENT but is not a usable instant" "…and it does NOT call a present file 'missing'"
-assert_not_contains "$out" "is missing or not a regular file" "…(the missing wording stays off this arm)"
+assert_not_contains "$out" "is missing, is not a regular file" "…(the missing wording stays off this arm)"
 assert_not_contains "$out" "running but not cycling" "…and it does not claim the controller is wedged"
 
 # ── O. the last empty-is-falsy traps ─────────────────────────────────────────────────────────────

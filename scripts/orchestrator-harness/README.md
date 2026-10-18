@@ -1111,12 +1111,12 @@ implemented or explicitly not claimed:
 
 | requirement | where |
 |---|---|
-| never write a persistent Disabled override | no shipped line invokes `disable`, `unload`, or `-w` (asserted from the stub's argv log wherever the path runs, **and** from a source scan of every `*.sh`/`*.template` in `scripts/orchestrator-harness/` where it cannot (outside that directory the scan does not reach — checked by hand at the time of writing, not by a test)); `--uninstall` uses `bootout` only |
+| never write a persistent Disabled override | no shipped line invokes `disable`, `unload`, or `-w` (asserted from the stub's argv log wherever the path runs, **and** from a source scan of every TOP-LEVEL `*.sh`/`*.template` in `scripts/orchestrator-harness/` where it cannot (`*.test.sh` excluded — its fixtures must be free to contain those verbs; subdirectories such as `retired/` and the rest of the repo are not reached by the glob — hand-checked at the time of writing, not by a test)); `--uninstall` uses `bootout` only |
 | clear a disable a previous flow already wrote | `lc_start` runs `enable` before `bootout`/`bootstrap`; the status it writes is read back with `print-disabled` |
 | actually load the job (not just PRINT the command) | `install.sh --start` / `--restart` call `lc_start`; a plain run never starts anything |
 | assert the job came back | `lc_assert_running`: new pid + heartbeat strictly advanced + `runs` did not move across the settle window |
 | remove by proof, not by label | `lc_guard_mutate` reads the loaded job's `path =` and refuses unless it is this plist |
-| an unreadable domain is UNKNOWN | every read of launchd's JOB STATE is tri-state (`lc_probe`); not every read in the file is — `lc_min_runtime` falls back to launchd's own 10 s default, and a successful-but-empty `print-disabled` reads as `unset` (no override), because that is exactly what it means. UNKNOWN refuses or withholds the claim instead of being scored |
+| an unreadable domain is UNKNOWN | `lc_probe` is the tri-state read, and every DECISION POINT goes through it (`lc_guard_mutate`, `lc_assert_running`, `lc_assert_stable`) or withholds its claim. The thin wrappers `lc_pid`, `lc_runs` and `lc_loaded_path` fold UNKNOWN into empty — indistinguishable from 'not loaded' — which is safe only because each of those callers re-probes first. Not every read in the file is tri-state: `lc_min_runtime` falls back to launchd's own 10 s default, and a successful-but-empty `print-disabled` reads as `unset` (no override), because that is exactly what it means. UNKNOWN refuses or withholds the claim instead of being scored |
 
 ⛔ **What is still GAP is the reporting side, and it is the item that matters most**: nothing
 **detects** a job that has been disabled or booted out — `KeepAlive`/`RunAtLoad`

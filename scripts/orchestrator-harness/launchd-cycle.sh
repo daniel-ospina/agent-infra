@@ -616,7 +616,7 @@ lc_ensure() {
       if [ -f "$O/heartbeat" ]; then
         lc_err "❌ refusing to decide on $label: $O/heartbeat is PRESENT but is not a usable instant (empty, unreadable, non-numeric, or future-dated beyond the 60s skew), so 'not cycling' is UNPROVEN. Next: cat -v $O/heartbeat; date +%s; tail -40 $O/logs/orch-loop.log"
       else
-        lc_err "❌ refusing to decide on $label: $O/heartbeat is missing or not a regular file (so there is no readable instant at that path), so 'not cycling' is UNPROVEN. Next: ls -l $O/heartbeat; tail -40 $O/logs/orch-loop.log"
+        lc_err "❌ refusing to decide on $label: $O/heartbeat is missing, is not a regular file, or could not be stat'ed (so there is no readable instant at that path), so 'not cycling' is UNPROVEN. Next: ls -l $O/heartbeat; tail -40 $O/logs/orch-loop.log"
       fi
       return 1
     fi
