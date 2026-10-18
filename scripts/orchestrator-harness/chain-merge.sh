@@ -5,6 +5,13 @@ set -u
 REPO="$1"; OR="$2"; N="$3"; BR="$4"
 O="${O:-$HOME/orchestrator}"; mkdir -p "$O/logs" "$O/state"
 export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
+# ⛔ THE gh SHIM MUST STAY FIRST (#1988). The line above prepends the tool dirs, so a REAL gh in
+# either of them outranks the seeded `$O/gh-rest` (Mac REST adapter) / `$O/gh-limit` (cell
+# serialiser) — and a shim that is never resolved is an INERT layer: it reports protection and
+# provides none. Re-assert both here, adapter last so `$O/gh-rest` (which itself calls the same
+# helper) wins where it exists. Guarded by `-d`, so a box that ships neither is unchanged.
+if [ -d "$O/gh-limit" ]; then PATH="$O/gh-limit:$PATH"; fi
+if [ -d "$O/gh-rest" ]; then PATH="$O/gh-rest:$PATH"; fi
 LOG="$O/logs/chain-$N.log"
 echo "[chain $N] waiting for PR on $BR $(date)" > "$LOG"
 

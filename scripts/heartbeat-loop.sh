@@ -9,6 +9,12 @@
 # failure silently degraded turn-classify's question scan ("3 repo(s) unreadable").
 # Pin the two directories here so no child depends on how the loop was launched.
 export PI_FLEET_PATH_PINNED=1
+# ⛔ `O` IS EXPORTED HERE TOO (#1988). The nine heartbeat tools resolve the gh layer through `$O`
+# (`$O/gh-rest/gh`, then `$O/gh-limit/gh`) and fall back to the #1872 pin when it is unset — and this
+# launcher, their ONLY launcher, never set it. So on the Mac every one of them — including
+# `objective.py`'s refresh, the heaviest gh reader in the tree — kept calling gh unserialised and
+# un-backed-off, while the cells (whose supervisor exports `O`) had the layer. Same default as
+# `orch-loop.sh` and `deploy-mac-orchestrator.sh`.
 export PATH="/Users/danielospina/bin:/Users/danielospina/.pi/agent/shims:$PATH"
 # RAISE THE CLI DEADLINE. Measured 2026-10-01: `cmux workspace list` takes 0.2-2s on a
 # quiet box but 13.4-15.1s at load 130+, against a fixed 15s CLI deadline — so a slow
@@ -159,6 +165,13 @@ fi
 # was started with, which may be a cmux pane's interactive shell. Pin the two
 # variables everything downstream actually needs rather than trusting that.
 export HOME="/Users/danielospina"
+# ⛔ DERIVED FROM THE **PINNED** HOME — i.e. after the `export HOME=` above, never before it. A `:-`
+# default is evaluated once; computing it from the AMBIENT `$HOME` (a `sudo`/`su` shell, an agent
+# session) exports a path that does not exist on this box, and every tool silently falls back to its
+# pinned real gh — an inert layer with nothing on any stream (#1988, review round 9). Keep this line
+# BELOW the HOME pin (the re-exec block above it must not freeze an ambient-HOME value). Same value
+# the nine resolvers look for: `$O/gh-rest/gh`, then `$O/gh-limit/gh`.
+export O="${O:-$HOME/orchestrator}"
 # `~/.pi/agent/shims` is where `gh` lives on this box (a symlink to the agent-infra
 # gh-shim). It was MISSING from the first version of this PATH, and the very first
 # tick logged "NOTE ask-owner scan produced nothing usable" — the gate was silently

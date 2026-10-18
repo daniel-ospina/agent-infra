@@ -180,10 +180,48 @@ GH_LAST_ERROR = ""
 # `~/bin/gh` that exists and runs but predates a flag this file uses (`--slurp`) would still win
 # over PATH. It is recorded here rather than probed, because a capability probe costs a
 # subprocess per process start for a case no reader of this file has ever been the cause of.
+#
+# ⛔ AND PREFER THE HARNESS'S OWN gh LAYER (#1988) WHEN ONE IS DEPLOYED. `objective.py` is the
+# highest-volume READ on the shared account (the heartbeat's refresh), so resolving straight at the
+# real binary made the layer inert for the caller that spends the most quota. The layer's path comes
+# from `$O` — NEVER from PATH. ⛔ THE LAYER ITSELF then resolves the real gh by walking PATH, so
+# "#1872 cannot come back" would be FALSE: in a minimal environment the first `gh` on PATH can be a
+# shim that refuses at runtime (the 2026 incident: rc=126 with `os.access` still passing). The pin
+# is therefore passed THROUGH the layer (`GH_REST_REAL_GH`/`GH_LIMIT_REAL_GH`), so these readers keep
+# calling the binary #1872 chose for them and still get serialisation and backoff.
+def _gh_layer():
+    o = os.environ.get("O", "")
+    if not o:
+        return None
+    # ⛔ ORDER: `gh-rest` FIRST, matching every shell call site (`orch-loop.sh`: "adapter last so
+    # `$O/gh-rest` wins where it exists"). The adapter serves a GraphQL refusal over REST (#1959);
+    # preferring the non-translating wrapper here made this reader fail exactly as it did before that
+    # fix while the same box's shell calls took the other transport.
+    for c in (os.path.join(o, "gh-rest", "gh"), os.path.join(o, "gh-limit", "gh")):
+        if os.path.isfile(c) and os.access(c, os.X_OK):
+            return c
+    return None
+
+
+GH_REAL_PIN = next((p for p in (os.path.expanduser("~/bin/gh"),)
+                     if os.path.isfile(p) and os.access(p, os.X_OK)), None)
 GH_BIN = (os.environ.get("OBJECTIVE_GH")
-          or next((p for p in (os.path.expanduser("~/bin/gh"),)
-                   if os.path.isfile(p) and os.access(p, os.X_OK)), None)
+          or _gh_layer()
+          or GH_REAL_PIN
           or "gh")
+# The layer resolves the real gh itself; tell it WHICH one (see _gh_layer's comment). Empty when we
+# are not going through a layer, so a direct call is unaffected.
+GH_LAYER_ENV = ({"GH_REST_REAL_GH": GH_REAL_PIN, "GH_LIMIT_REAL_GH": GH_REAL_PIN}
+                if GH_REAL_PIN and GH_BIN.endswith(("/gh-rest/gh", "/gh-limit/gh")) else {})
+
+
+# ⛔ THE LAYER MUST NOT SLEEP INSIDE THIS PROCESS (#1988). The heartbeat bounds this refresh (90/120 s)
+# while the layer's first documented backoff is 60 s: an in-call wait outlives the caller, and the
+# caller is killed before the layer can say why — a rate-limited box then reports UNKNOWN/STALL
+# instead of the RATE-LIMITED verdict it can prove. NO_WAIT makes the layer record the limit and
+# return at once, so this process's own deferral takes over. It is inherited by every DESCENDANT
+# of this process — all of them parts of the same bounded heartbeat step.
+os.environ.setdefault("GH_LIMIT_NO_WAIT", "1")
 
 
 def gh(*args, paginate=False):
@@ -197,7 +235,8 @@ def gh(*args, paginate=False):
     """
     global GH_LAST_ERROR
     cmd = [GH_BIN, "api"] + (["--paginate", "--slurp"] if paginate else []) + list(args)
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=90,
+                       env={**os.environ, **GH_LAYER_ENV} if GH_LAYER_ENV else None)
     if r.returncode != 0:
         GH_LAST_ERROR = (r.stdout or "") + (r.stderr or "")
         return None
@@ -261,7 +300,8 @@ def gql_commit_checks(sha):
     q = GQL_CHECKS % sha
     r = subprocess.run([GH_BIN, "api", "graphql", "-f", f"query={q}",
                         "-f", "owner=daniel-ospina", "-f", "name=tortoise"],
-                       capture_output=True, text=True, timeout=90)
+                       capture_output=True, text=True, timeout=90,
+                       env={**os.environ, **GH_LAYER_ENV} if GH_LAYER_ENV else None)
     global GH_LAST_ERROR
     # ⛔ APPEND, NEVER REPLACE: this fallback runs BECAUSE the REST read already failed, and the
     # REST cause is the actionable one ("rate limit exceeded" says wait; a 404 on the fallback
@@ -514,7 +554,8 @@ def _gh_retry(argv, attempts=3, timeout=120):
     """
     last = None
     for i in range(attempts):
-        last = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        last = subprocess.run(argv, capture_output=True, text=True, timeout=timeout,
+                              env={**os.environ, **GH_LAYER_ENV} if GH_LAYER_ENV else None)
         if last.returncode == 0:
             return last
         low = ((last.stdout or "") + (last.stderr or "")).lower()
@@ -1031,7 +1072,11 @@ def _queue_read_is_blind(unknown, nondraft):
 
 def queue():
     """The open PR queue, re-sampled while its LAZY merge state is unread (see above)."""
-    argv = ["gh", "pr", "list", "--repo", REPO, "--state", "open",
+    # ⛔ THE HEAVIEST READ MUST GO THROUGH THE LAYER TOO. `gh pr list` is GraphQL and this is the
+    # beat's largest read; a bare `"gh"` here resolved on PATH — unserialised, un-backed-off, and
+    # subject to the #1872 shim — while every other read in this file uses GH_BIN (found in review
+    # round 5).
+    argv = [GH_BIN, "pr", "list", "--repo", REPO, "--state", "open",
             "--limit", "400", "--json",
             "number,isDraft,mergeable,mergeStateStatus,headRefOid,files"]
     sample = None

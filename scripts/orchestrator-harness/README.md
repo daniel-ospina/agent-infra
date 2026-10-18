@@ -341,6 +341,82 @@ That one asymmetry stopped both halves of the harness, and neither log line name
 | `pr merge` (incl. `--match-head-commit`) | `PUT …/pulls/{n}/merge` |
 | `pr comment --body` | `POST …/issues/{n}/comments` |
 
+### The layer underneath: `gh-limit` (#1988)
+
+Four boxes act as **one GitHub account**, so they share one REST bucket and one GraphQL bucket.
+Nothing serialised the harness's calls and nothing backed off when a box was refused, so one box's
+burst became another box's secondary limit — and the refused call was read by its caller as "no
+data", which is how a cell that could not merge looked like a cell with nothing to do.
+
+`gh-limit.py` is the one implementation of GitHub's documented policy (serialise; honour
+`retry-after`; honour the bucket's `x-ratelimit-reset` when it is empty; otherwise wait at least a
+minute and grow exponentially; fail after a bounded number of attempts). It is reached from two thin
+entry points, both of which put it FIRST on the harness's `PATH`, so no call site has to remember it
+and no new call site can forget it:
+
+| Entry point | Where | Installed by |
+|---|---|---|
+| `gh-rest/gh` (the REST adapter above) | Mac | `install.sh` → `$O/gh-rest` first on the daemon PATH |
+| `gh-limit/gh` (nothing but the layer) | cloud cells | `cloud-cell-supervisor.sh` → `$O/gh-limit` first on the controller PATH **and** published through tmux `update-environment`; `deploy-crossbox.sh` seeds the same two files and passes the PATH on the controller's `new-session` line (it does not touch `update-environment`) |
+
+⛔ **The shim has to be re-asserted after the tool-dir prepend.** Every gh-calling harness script
+opens with `export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH`, which puts a REAL `gh` ahead of the
+seeded shim on any box whose gh lives in one of those dirs (measured: on the Mac it does), leaving
+an inert layer that reports protection and provides none. `orch-loop.sh`, `merge-one.sh`,
+`fix-one.sh`, `lane.sh` and `chain-merge.sh` therefore re-prepend `$O/gh-limit`/`$O/gh-rest` after
+that line — and so does `nonblocking-dispatch.sh`, which calls no `gh` itself but spawns a whole
+worker session in-process, so its PATH becomes that worker's PATH.
+
+The predicate, exactly: **every `*.sh` in this directory that prepends those tool dirs AND invokes
+`gh` must carry BOTH stanzas** (`$O/gh-limit` and `$O/gh-rest`), plus `nonblocking-dispatch.sh` for
+the spawning reason above, and `gh-limit.test.sh` fails naming the file and the missing stanza. It is
+a per-file two-line obligation — not an unpickable one — and a new script written outside this
+directory is not covered by it. Two further entry paths exist so the common callers do not depend on
+that obligation: the Mac adapter already resolves the layer for every call it serves, and the
+heartbeat's own telemetry tools (`objective.py`, `merge-queue.py`, `beta-progress.py`,
+`queue-dispatch.py`, `ask-owner.py`, `turn-classify.py`, `turn-end.py`, `undelivered-answers.py`,
+`pr-doctor.py`) prefer `$O/gh-rest/gh` then `$O/gh-limit/gh` over their pinned real binary — derived
+from `$O`, never from PATH. ⛔ THAT DOES NOT KEEP #1872'S PIN BY ITSELF: the layer resolves the real
+`gh` by walking PATH, so the tools that have a pinned candidate hand it through as
+`GH_REST_REAL_GH`/`GH_LIMIT_REAL_GH`; the three that never had one let the layer walk.
+
+Why two entry points rather than one: moving the call sites onto REST is #1978/#1986's change, and
+mixing a REST translation into a cell with a new backoff would make a translation bug and a backoff
+bug indistinguishable. The wrapper therefore translates nothing; the REST adapter additionally
+translates, and both call the same helper.
+
+Notes worth keeping:
+
+* **Single flight is per box, not per account.** Boxes cannot see each other; what this buys is a
+  burst of 1 per box instead of 1 per lane. The lock is held per ATTEMPT and released across the
+  wait, so a sleeping caller does not park the box — the invariant is "no two requests overlap",
+  and the `/rate_limit` probe, which runs during backoff, holds it too.
+* **A successful call is invisible** (stdout/stderr replayed byte for byte) because callers parse
+  merged output. Retries are announced in `$GH_LIMIT_DIR/events.log`; only a FINAL failure writes to
+  stderr.
+* **A limited box says so**: `$GH_LIMIT_DIR/last-limit` is printed by `orch-loop.sh`'s cycle line as
+  `gh=rate_limited(bucket=graphql reset=<epoch> <age>)`, age-bounded to 15 minutes so a past limit
+  cannot pass as a current one — and as `gh=recovered(bucket=… <age>)` once a later call succeeded,
+  because a record is not a state. The failure text carries the words "rate limit", which is the
+  phrase `objective.py`'s transport markers turn into `VERDICT=GH-RATE-LIMITED`.
+* **The waits belong to the call sites that can afford them.** `GH_LIMIT_NO_WAIT=1` makes the layer
+  record the limit and return at once (and bounds the LOCK wait to `GH_LIMIT_NO_WAIT_LOCK_S`, 5 s, so
+  a busy box cannot queue a 90 s reader to death); the nine heartbeat tools set it, because they are
+  killed at 90-420 s while the first documented backoff is 60 s — sleeping there converts a
+  RATE-LIMITED verdict into a timeout. The shim is also `exec`'d, not spawned, so a caller's timeout
+  or `run_bounded`'s TERM kills the helper instead of orphaning it mid-backoff against a bucket
+  GitHub has already refused.
+* **A shim is identified by its own sentinel line** (`harness-gh-shim-marker`), not by the helper
+  beside it: the missing helper is the fail-open state, and keying identity on it made two shims
+  resolve into each other and every gh call exit 127.
+* **Conditional REST is a GET only.** `gh api <path>` (optionally `--jq`) stores its ETag per URL and
+  replays a 304 from cache — free, because a 304 is not charged to the primary limit. The cached body
+  is base64 (`byte-exact` on replay, binary included) and the cache is bounded, since every distinct
+  poll URL earns an entry. Any shape whose output this layer would have to re-create by hand
+  (`--paginate`, `--template`, `-H`, `-f`, a non-GET method) is left completely alone, and an
+  unframeable response is returned AS-IS — never re-requested (a second request on a box that is
+  being refused is exactly what the layer exists to prevent; the suite pins one request, no re-run).
+
 **Design: an adapter, not a fork.** No harness file changes, so every cell stays on one harness
 version — the convergence property this repo exists to protect — while the API surface becomes a
 deployment concern. `install.sh` copies the shim to `$O/gh-rest/gh` and puts that directory **first**
@@ -1554,6 +1630,7 @@ algorithmic advantage. The claim worth evaluating is *utilisation*, not *efficie
 | `test-gates.sh` | the `mp_reason` dispatch-gate rule table, extracted from the shipped `orch-loop.sh`. Not part of the loop |
 | `test-claims.sh` | the PR **and issue** claim CAS against live origin from two scratch repos (`git init` + `remote add`, not clones; random keys per run so concurrent runs cannot collide). Not the cross-box proof (one machine), but red on a defeated CAS. Not part of the loop |
 | `claim-exclusion.test.sh` | **the measurement:** N processes released at a barrier against a real (bare) origin, per operation class, answering *does a duplicate holder get refused*. Prints the table §7.2d records; hermetic, a CI shard |
+| `gh-limit.test.sh` | #1988 the layer UNDER every gh call: one call in flight per box — the retry path AND the `/rate_limit` probe (measured from the stub's own timestamps, with an unserialised control that MUST overlap), the documented backoff order (`retry-after` → the bucket's reset → ≥60s doubling, 4 attempts, then a loud failure), the failing bucket NAMED, `>= 1s` between mutations, conditional REST (`if-none-match` → a 304 replayed byte-exactly from a bounded cache), and the shim surviving the `/opt/homebrew` PATH prepend in every gh-calling script. Fake clock, stub gh, hermetic, a CI shard |
 | `gh-rest.test.sh` | the `gh` REST adapter's argv-to-argv **TRANSLATION**, offline against a stub `gh`: `pr list --head` must not widen to the newest open PR and `pr comment` must print a URL (both shipped green once, as P0s, when nothing asserted them). Hermetic, a CI shard |
 | `test-crossbox.sh` | drives the real `merge-one.sh` claim acquire + trap release with `gh` stubbed. Not part of the loop |
 | `refresh-scout.test.sh` | the agent-infra#1736 contract — repo-aware scout provisioning, per-repo tool resolution, the permanent/transient refresh split — plus the agent-infra#1850 issue-claim pre-flight verdict table (CLEAN/COLLISION/INCOMPLETE/NOT PROVISIONABLE/unrecognised), the dispatch-side claim, and the fenced + generation-guarded release. Not part of the loop |

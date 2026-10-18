@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# gh-limit/gh — the CELL-side `gh` entry point: serialisation, the documented backoff, and the
+# rate-limit record. Nothing else.
+#
+# WHY A SHIM AND NOT CALL-SITE EDITS. Four boxes share one GitHub account, so one box's burst is
+# another box's secondary limit (#1988). A layer each call site has to remember is a layer that
+# gets forgotten — one new `gh` call is all it takes — so this dir is put FIRST on the harness's
+# PATH and every `gh` a controller, lane or worker runs lands here. That is the same deployment
+# shape `install.sh` uses for `gh-rest/gh` on the Mac, with one deliberate difference: this wrapper
+# does NOT translate GraphQL calls to REST. Moving the call sites to REST is #1978/#1986's job
+# (their `gh api` calls are already REST and pass through here untouched); mixing the two in one
+# change would make a translation bug and a backoff bug indistinguishable.
+#
+# The work is in ../gh-limit.py — ONE implementation shared with the Mac adapter, so the backoff
+# cannot drift between the box that has the REST adapter and the boxes that do not.
+#
+# harness-gh-shim-marker: every entry point of the gh limit layer carries this line (#1988).
+# ⛔ IDENTITY IS THE FILE'S OWN CONTENT, NOT A SIBLING. Recognising a shim by "`../gh-limit.py`
+# exists" made the identity vanish exactly when the helper is the missing file — the fail-open state
+# this wrapper exists for — and the two shims then resolved into each other again, turning a
+# half-installed cell into one where EVERY gh call exits 127. Keep this line in any copy, and keep
+# it in the first 8 KiB (that is the window every resolver reads).
+set -uo pipefail
+
+SELF="${BASH_SOURCE[0]}"
+SELF_DIR="$(cd "$(dirname "$SELF")" 2>/dev/null && pwd)"
+SELF_REAL="$SELF_DIR/$(basename "$SELF")"
+# One level up: the repo/deployment keeps a single `gh-limit.py` beside BOTH entry points.
+HELPER="$SELF_DIR/../gh-limit.py"
+
+# ⛔ NEVER EXEC ANOTHER HARNESS SHIM. Two interposers that each skip only THEMSELVES resolve to EACH
+# OTHER (measured: 1,700 processes in 6 s, then `fork: Resource temporarily unavailable` — the whole
+# box could not spawn anything). Both shims are installed beside ONE `../gh-limit.py`, so that
+# marker identifies a shim exactly. The depth guard is the backstop for a shim this file cannot
+# know about: one refused gh call beats a dead box.
+if [ "${HARNESS_GH_SHIM_DEPTH:-0}" -ge 2 ]; then
+  printf 'gh-limit: refusing a third gh-shim hop (HARNESS_GH_SHIM_DEPTH=%s) — the shims are resolving to each other and no real gh is reachable\n' \
+    "$HARNESS_GH_SHIM_DEPTH" >&2
+  exit 127
+fi
+export HARNESS_GH_SHIM_DEPTH=$(( ${HARNESS_GH_SHIM_DEPTH:-0} + 1 ))
+
+# The fail-open path: run the next real gh UNWRAPPED. ⛔ Its WARNING IS EMITTED ONLY WHEN THE CALL
+# FAILS — a caller that does `… 2>&1` and parses the bytes as JSON would otherwise get the banner
+# inside its data (the same rule the helper states for its own streams).
+_run_plain() {  # <real-gh> [argv…]
+  local _real="$1" _errf _rc
+  shift
+  _errf="$(mktemp "${TMPDIR:-/tmp}/gh-limit-err.XXXXXX" 2>/dev/null)" || _errf=""
+  if [ -z "$_errf" ]; then
+    # No temp file (a full or read-only TMPDIR): the notice accompanies a FAILURE only, so a caller
+    # that does `… 2>&1` and parses JSON never finds the banner inside a good answer.
+    "$_real" "$@"; _rc=$?
+    [ "$_rc" -eq 0 ] || printf 'gh-limit: WARNING no helper at %s — that call was NOT serialised or backed off (#1988)\n' "$HELPER" >&2
+    return "$_rc"
+  fi
+  "$_real" "$@" 2>"$_errf"; _rc=$?
+  if [ "$_rc" -ne 0 ]; then
+    printf 'gh-limit: WARNING no helper at %s — this call was NOT serialised or backed off (#1988)\n' "$HELPER" >&2
+  fi
+  # The child's stderr is replayed on SUCCESS too: the banner is failure-only, the child's own words
+  # are not (the helper replays both streams byte for byte; this path must agree).
+  [ -s "$_errf" ] && cat "$_errf" >&2
+  rm -f "$_errf"
+  return "$_rc"
+}
+
+if [ ! -f "$HELPER" ]; then
+  # Fail OPEN on the protection and LOUDLY, never on the call: a half-installed cell must still be
+  # able to merge, and a silent fallback would hide that the layer is gone. The real gh is found by
+  # walking PATH and skipping THIS file (device+inode) and any other harness shim.
+  _IFS_save="${IFS:-}"; IFS=:
+  for _d in ${PATH:-/usr/bin:/bin}; do
+    [ -n "$_d" ] || continue
+    # ⛔ `-x` IS TRUE FOR A DIRECTORY. `~/.pi/agent/shims/gh` is a documented state of this box, and
+    # selecting it made the fail-open path exec a directory: every gh call exited 126 and the real gh
+    # one entry later was never reached (found in review round 5).
+    [ -f "$_d/gh" ] && [ -x "$_d/gh" ] || continue
+    [ "$_d/gh" -ef "$SELF_REAL" ] && continue
+    # Skip EVERY harness shim by its OWN sentinel line, not by a sibling that may be the missing file.
+    # No pipe: `head | grep -q` can report failure through SIGPIPE under `pipefail` (the #841 class).
+    _head="$(head -c 8192 "$_d/gh" 2>/dev/null)" || _head=""
+    grep -q 'harness-gh-shim-marker' <<<"$_head" && continue
+    IFS="$_IFS_save"
+    _run_plain "$_d/gh" "$@"
+    exit $?
+  done
+  IFS="$_IFS_save"
+  printf 'gh-limit: the layer is missing (%s not found); install it from scripts/orchestrator-harness/, or call gh-rest/gh with GH_REST_REAL_GH set to a real gh\n' "$HELPER" >&2
+  exit 127
+fi
+
+# `--self` makes the helper skip THIS file while walking PATH, so it cannot exec itself. Passing it
+# as an argument (rather than letting the helper guess from argv[0]) keeps the resolution honest
+# through symlinks and a `$0` that a caller rewrote.
+exec python3 "$HELPER" --self "$SELF_REAL" -- "$@"
