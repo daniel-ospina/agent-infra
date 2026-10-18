@@ -172,9 +172,9 @@ default**, so a job already loaded keeps the old value until it is reloaded (or 
 
 | Gate / limit (emitted string where the loop logs one) | Constant | Default | Notes |
 |---|---|---|---|
-| `merge-priority (<n> open PRs — draining before opening more)` | `MERGE_PRIORITY_AT` | 10 | fires only when `open > threshold` **AND** `lanes + workers >= 1`, so it names *work in flight*, not merely an open queue |
+| `merge-priority (<n> open PRs — draining before opening more)` | `MERGE_PRIORITY_AT` | 25 | fires only when `open > threshold` **AND** `lanes + workers >= 1`, so it names *work in flight*, not merely an open queue |
 | `load=<n>>=max_load=<m>` | `MAX_LOAD` | **derived**: `10#$_NCPU * 10`, where `_NCPU` is `sysctl -n hw.ncpu` / `nproc` / `getconf _NPROCESSORS_ONLN`, falling back to 4 — so 40 on an unprobeable host. If the derived value fails `is_limit`, it falls back to 40 | the plist may pin a different value |
-| `lanes=<n>>=max_lanes=<m>` | `MAX_LANES` | 4 | |
+| `lanes=<n>>=max_lanes=<m>` | `MAX_LANES` | **derived**: `10#$_NCPU * 5 / 2` (2.5 × cores, floored — 25 on a 10-core box, 10 on a 4-core box or a failed probe; a derived value that fails `is_limit` falls back to 10) | the plist may pin a different value: a **valid** pin wins and is never recomputed; an **invalid** one is refused by `install.sh` and repaired by the loop to the derived default. Capacity is the ceiling, not a lane count: a flat 4 (and this box's pinned 8) closed this gate while the load/memory gates still had headroom |
 | `swap_free=<n>M<=min_swap_free=<m>M` | `MIN_SWAP_FREE` | 600 | `swap_total=0` means swap is uninitialised (fresh boot), NOT pressure — allowed |
 | `mem_probe_failed (capacity unknown -> do not add work)` | — | — | unreadable memory ⇒ refuse, never assume |
 | `mem_avail=<n>M<=min_mem_free_mb=<m>M` | `MIN_MEM_FREE_MB` | 512 | |

@@ -8,16 +8,19 @@ export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
 LOG="$O/logs/chain-$N.log"
 echo "[chain $N] waiting for PR on $BR $(date)" > "$LOG"
 
-# ⛔ CAPTURE THIS CHAIN'S CLAIM COMMIT NOW, NOT INSIDE THE TRAP (2026-10-16 review). The handover
-# record is keyed on the ISSUE, and the same box can become the holder of the same issue a second
-# time while this chain is still alive (its lease lapsed; this chain is still waiting on a PR). The
-# second acquire OVERWRITES `$O/state/issueclaim-<N>` with the new commit, and a trap that read the
-# file when it fired would fence on that NEW commit — which IS the ref tip — so THIS (older) chain
-# would delete the claim of the chain that legitimately holds it. A peer would then read the issue as
-# free and dispatch it: the duplicate this registry exists to prevent, and a fail-OPEN. Captured
-# once, here, the value is this chain's own generation, and `claim_issue_release_record` refuses a
-# release whose record has moved on.
-CHAIN_CLAIM_COMMIT="$( . "$O/claims.sh" 2>/dev/null; claim_issue_record_commit "$O" "$N" 2>/dev/null )" || true
+# ⛔ THE GENERATION IS INHERITED FROM WHOEVER SPAWNED THIS CHAIN, NEVER READ HERE (adversarial review).
+# The handover record is keyed on the ISSUE, and the same box can hold the same issue twice while this
+# chain is alive (its lease lapsed and the loop re-acquired; this chain is still waiting on a PR). A
+# trap that read the record when it FIRED would fence on the newer commit — which IS the ref tip — and
+# delete a live claim. Capturing at START fixed that for the trap, but a read at start is still a read
+# of shared state: a chain RE-RUN by hand (both this file's own timeout message and
+# nonblocking-dispatch.sh invite that) starts *after* a re-acquire, so it would capture a generation
+# it never took and release the holder's claim on exit — reproduced.
+# So `dispatch-merge.sh`, which spawns this chain in the same loop body that wrote the record
+# milliseconds earlier, passes `CHAIN_CLAIM_COMMIT` in the environment. Nothing else sets it: a manual
+# re-run has NO generation, and the refusal below then keeps the claim instead of deleting someone
+# else's. That is the fail-closed direction, and it costs one lease.
+CHAIN_CLAIM_COMMIT="${CHAIN_CLAIM_COMMIT:-}"
 
 # ── release the cross-box ISSUE claim (#1850) ────────────────────────────────────────────────
 # `orch-loop.sh` claimed `refs/claims/issue-<N>` when it dispatched this issue, and that claim is
@@ -50,6 +53,19 @@ release_issue_claim() {
   fi
   if ! declare -f claim_issue_release_record >/dev/null 2>&1; then
     echo "[chain $N] ⚠️ $csh predates the issue-claim RELEASE (no claim_issue_release_record) — the claim is NOT released; fix: cp scripts/orchestrator-harness/*.sh ~/orchestrator/" >> "$LOG"
+    return 0
+  fi
+  # ⛔ NO CAPTURED GENERATION → DO NOT RELEASE (acceptance-review finding). The capture at chain start
+  # is empty when the handover record did not exist yet (the `claim_issue_record` in orch-loop.sh
+  # failed — the loop logs that this chain cannot fence the release), when `$O/claims.sh` predates the
+  # reader, or when the record exists but is unreadable. `claim_issue_release_record` treats an EMPTY
+  # expectation as "read the record now", which is right for dispatch-merge.sh (its release is milliseconds after the write) but wrong
+  # HERE: a chain that fires hours later would then fence on whatever generation the record holds —
+  # the newer holder's own commit, which IS the ref tip — and delete a live claim. Refusing costs this
+  # box one lease; deleting the wrong claim duplicates work on two boxes, so this is the fail-closed
+  # side of the same asymmetry as the pre-flight. Loud, and the lease still reaps it.
+  if [ -z "${CHAIN_CLAIM_COMMIT:-}" ]; then
+    echo "[chain $N] ⚠️ no captured claim generation (the handover record was absent at chain start) — NOT releasing refs/claims/issue-$N: a stale chain must never delete a NEWER claim. It runs to its lease (CLAIM_ISSUE_TTL=${CLAIM_ISSUE_TTL:-10800}s)." >> "$LOG"
     return 0
   fi
   if out="$(claim_issue_release_record "$O" "$REPO" "$N" "${CHAIN_CLAIM_COMMIT:-}")"; then
