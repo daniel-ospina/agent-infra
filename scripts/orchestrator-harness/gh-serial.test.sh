@@ -445,9 +445,14 @@ bare="$(grep -nE "$GH_BARE_RE" "$REFRESH" \
   | grep -vE 'gh auth (token|status)|gh api rate_limit|command -v gh' || true)"
 [ -z "$bare" ] && rc=0 || { rc=1; note "unwrapped bare gh lines: $bare"; }
 ck "every OTHER bare gh line in refresh-candidates.sh is an allowlisted pre-flight probe" $rc
-printf '%s\n' 'BAD="$(gh pr list --repo x/y)"' | grep -qE "$GH_BARE_RE" && rc=0 || rc=1
+# ⛔ Here-strings, not pipes (#841): `printf … | grep -q` lets grep exit at its first match while the
+# writer is still pushing, so the writer takes SIGPIPE and `pipefail` reports 141 — the false negative
+# `scripts/check-no-sigpipe-grep.sh` exists to forbid (this suite is in its scan set).
+grep -qE "$GH_BARE_RE" <<<'BAD="$(gh pr list --repo x/y)"' && rc=0 || rc=1
 ck "the bare-gh guard MATCHES the command-substitution shape it exists to catch (non-vacuity)" $rc
-printf '%s\n' 'ghs_run -- gh pr list --repo x/y' | grep -E "$GH_BARE_RE" | grep -vE 'ghs_run|ghs_mut|ghs_rest' | grep -q . && rc=1 || rc=0
+# The wired form must stay EXCLUDABLE — captured first, tested in the shell, no pipe into a quiet grep.
+wired_leftover="$(grep -E "$GH_BARE_RE" <<<'ghs_run -- gh pr list --repo x/y' | grep -vE 'ghs_run|ghs_mut|ghs_rest' || true)"
+[ -z "$wired_leftover" ] && rc=0 || rc=1
 ck "the bare-gh guard's WIRED calls (ghs_run) remain excludable" $rc
 # ⛔ THE STALE-LOCK BOUND MUST EXCEED THE PASS IT GUARDS (#1988 review). One refresh makes five
 # serialised `ghs_run` calls and does NOT abort at the first failure, and each call may burn the

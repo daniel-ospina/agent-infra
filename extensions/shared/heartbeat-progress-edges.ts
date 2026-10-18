@@ -680,6 +680,26 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     guardedBy: NONE,
     note: "worker-log freshness bound — an AGED, not family-named, bound",
   },
+  // #1988: the refresh stale-LOCK bound. It is DELIBERATELY derived — one refresh makes five
+  // serialised gh calls, each of which may burn the layer's whole backoff budget, so a literal bound
+  // (it was 20 min) became SHORTER than the pass it guards: the controller deleted a lock held by a
+  // LIVE refresh, spawned a DUPLICATE writing the same .pool/.open_iss/.pr_brs, and the first pass's
+  // `rm -rf` then freed the lock for a third. `value: null` because the value is not a local literal
+  // (it is computed from ghs_worst_case_call_seconds, itself derived from the layer's constants).
+  {
+    name: "REFRESH_STALE_MIN",
+    owners: ["scripts/orchestrator-harness/orch-loop.sh"],
+    value: null,
+    axis: "kill",
+    guardedBy:
+      "scripts/orchestrator-harness/gh-serial.test.sh — extracts the SHIPPED gh-serial's own " +
+      "derivation (sed -n '/^ghs_worst_case_call_seconds()/,/^}/p') plus the shipped " +
+      "REFRESH_STALE_MIN= line and evaluates them, then requires the bound to cover FIVE worst-case " +
+      "call budgets (the pass's own five wired calls); a second assertion fails the suite if the " +
+      "literal 20-minute form ever returns. The DERIVATION is what is asserted, so moving the layer's " +
+      "constants moves this bound with it instead of silently under-cutting it.",
+    note: "how long a refresh lock may sit before the controller deletes it. NOT a wall-clock taste: it must EXCEED one worst-case pass, and the layer's backoff is what makes a pass long.",
+  },
   {
     name: "SWEEP_MAX_AGE",
     owners: ["scripts/orchestrator-harness/orch-loop.sh"],
