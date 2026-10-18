@@ -106,6 +106,27 @@ wait "$PID" 2>/dev/null
 ck "…and after the bounded wait it reviews (the wait is bounded, never a hang)" \
    $(ran && echo 0 || echo 1)
 
+# ── 4b. a STALE phase marker is a claim about the PAST — do not honour it ───────────────────────
+# The marker carries its own epoch ("<issue> <epoch>"). Testing only `[ -f ]` meant a lane killed at
+# its wall limit left a marker that stalled this chain for the FULL handoff wait (30 min) on a PR
+# nobody was working — and those 30 minutes are what push the issue claim past its lease.
+rig
+printf '42 %s\n' "$(( $(date +%s) - 999999 ))" > "$T/o/state/lanemerge-5.phase"
+printf 'FIX_REQUIRED from a lane that is long gone\n' > "$T/o/state/lanemerge-5.verdict"
+drive 0 30
+for _ in 1 2 3 4 5 6 7 8 9 10; do ran && break; sleep 1; done
+stop
+ck "a phase marker OLDER than the lane's wall limit is STALE: the chain reviews now instead of waiting" \
+   $(ran && grep -q "STALE merge-phase marker" "$T/o/logs/chain-42.log" && echo 0 || echo 1)
+ck "…and it removes the dead marker (a stale flag that is never revalidated is how a lane is blocked twice)" \
+   $([ ! -f "$T/o/state/lanemerge-5.phase" ] && echo 0 || echo 1)
+# The age is DERIVED from the epoch the marker carries (STALL_TERM_REGISTRY term `_PHASE_AGE`,
+# value: null): a hard-coded constant here would make the staleness verdict depend on a second clock
+# that drifts from the lane's. Asserted in source shape, because that is the property — the behaviour
+# above already covers the outcome.
+ck "_PHASE_AGE is still DERIVED from the marker's own epoch (not a fixed literal)" \
+   $(grep -q '_PHASE_AGE="\$(_phase_age)"' "$SCRIPT" && echo 0 || echo 1)
+
 # ── 5. the claim release still happens on both exit paths (the EXIT trap is not bypassed) ────────
 rig
 printf '42 %s\n' "$(date +%s)" > "$T/o/state/lanemerge-5.phase"
