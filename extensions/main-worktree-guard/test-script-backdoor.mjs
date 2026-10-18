@@ -40,7 +40,7 @@
 //
 // Run: node extensions/main-worktree-guard/test-script-backdoor.mjs
 import { execSync } from "node:child_process";
-import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -85,9 +85,12 @@ const isShebangScript = (p) => {
 };
 // `command -v gh` resolves to the repo's gh SHIM (a bash script) on this machine,
 // so the compiled binary is looked for BY PATH and identified by its bytes.
-const ghBinary = [process.env.GH_BIN, "/Users/danielospina/bin/gh", "/opt/homebrew/bin/gh", "/usr/local/bin/gh", "/usr/bin/gh"]
+// A candidate must EXIST and be a regular file: `isShebangScript` answers false
+// for a missing path, so a bare name filter would select `/opt/homebrew/bin/gh` on
+// a Linux runner and assert against a file that is not there (measured in CI).
+const ghBinary = [process.env.GH_BIN, "/Users/danielospina/bin/gh", "/opt/homebrew/bin/gh", "/usr/local/bin/gh", "/usr/bin/gh", "/bin/gh"]
   .filter(Boolean)
-  .filter((p) => { try { return !isShebangScript(p); } catch { return false; } })[0] ?? null;
+  .filter((p) => { try { return statSync(p).isFile() && !isShebangScript(p); } catch { return false; } })[0] ?? null;
 let ghOnPath = null;
 try { ghOnPath = execSync("command -v gh", { encoding: "utf-8" }).trim(); } catch { /* not installed */ }
 
