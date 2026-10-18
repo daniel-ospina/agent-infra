@@ -71,10 +71,18 @@ else
 fi
 # ⛔ THE ORDER MUST SAY THE SAME THING ON BOTH BODIES. Two lengths exist (full for the alert body,
 # short for the pulse), which is the file's own precedent for ROLE/MAP/PRIORITY — but two wordings
-# can silently diverge, so every ELEMENT the owner named is asserted as a marker on BOTH. A variant
-# that drops one (the four boxes, the rail, cell-2, the closing line) fails here, not in production.
-FRAGMENTS=("FLEET ADVANCE" "ALL FOUR BOXES" "AUTOPILOT" "USE THE CAPACITY" "DRIVE THE P0/P1"
-           "agent-infra" "cell-2" "scripts/admin-merge.sh" "WASTED BEAT")
+# can silently diverge, so every ELEMENT the owner named is asserted on BOTH, at CONTENT level and not
+# just as a token: a bare "AUTOPILOT" would pass while the variant never said what AUTOPILOT means,
+# and "ALL FOUR BOXES" would pass while the variant never said which four. FRAGMENTS is the lowercase
+# content set (matched case-insensitively, so a variant may shout or not); ONLY_FULL is the inverse
+# pin — phrases that exist in the full wording alone, and must therefore be ABSENT from the quiet
+# beat, which is what actually distinguishes the two variants at runtime.
+# ⛔ DECLARED ONCE, before its first use: a second copy further down would let the wiring check and
+# the delivered-beat checks assert different element sets while both look green.
+FRAGMENTS=("fleet advance" "all four boxes" "three cloud vms" "autopilot" "unattended"
+           "use the capacity" "drive the p0/p1" "agent-infra" "cell-2" "admin-merge.sh"
+           "wasted beat")
+ONLY_FULL=("name the specific prs that should land this cycle" "paragraph about load")
 # The definition lines must each be a single double-quoted literal with NOTHING inside that bash
 # would interpret: no `"` (terminates the literal early), no backtick (command substitution), no `$`
 # (expansion). This is the rule the file itself states for MSG, asserted mechanically on each variant.
@@ -91,7 +99,7 @@ for _v in FLEETADV FLEETADV_SHORT; do
                 else
                   _miss=""
                   for _f in "${FRAGMENTS[@]}"; do
-                    has "$_inner" "$_f" || _miss="$_miss [$_f]"
+                    has "$(printf '%s' "$_inner" | tr '[:upper:]' '[:lower:]')" "$_f" || _miss="$_miss [$_f]"
                   done
                   if [ -z "$_miss" ]; then
                     pass "$_v is one self-contained literal and names every required element (${#_inner} chars)"
@@ -103,6 +111,16 @@ for _v in FLEETADV FLEETADV_SHORT; do
     *) fail "$_v is not a single double-quoted literal on one line (got: ${_defn:0:60}…)" ;;
   esac
 done
+# The two literal lengths, used by the proportionality bound below (and quoted in the script's own
+# comment), read from the SHIPPED source rather than restated here.
+_ifull="$(sed -n 's/^FLEETADV="\(.*\)"$/\1/p' "$HB" | head -1)"
+_ishort="$(sed -n 's/^FLEETADV_SHORT="\(.*\)"$/\1/p' "$HB" | head -1)"
+# A quiet body bounded at 1100 chars plus the SHORT variant: the measured base is ~985, so this
+# tolerates ~115 chars of legitimate growth and still FAILS the regression it names -- the FULL
+# variant on the pulse path (985 + 758 = ~1743). A loose absolute bound (e.g. 2000) passes that
+# regression, which is how an assertion like this ends up dead.
+QUIET_BOUND=$(( 1100 + ${#_ishort} ))
+hasi(){ case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in *"$2"*) return 0 ;; *) return 1 ;; esac; }
 # Unconditional: the FULL-body append must be a top-level statement, never inside an `if`. A cheap
 # but real structural read — indentation is how every conditional in this file is written. (The
 # short-form append is indented BY DESIGN: it lives inside the short-form branch, asserted below.)
@@ -173,11 +191,6 @@ beat(){ # beat <home> <script> -> the message the tick SENT
   ( HOME="$1" PATH="$1/bin:$PATH" bash "$2" >/dev/null 2>&1 )
   cat "$1/.pi/agent/sessions/s1/hb-11111111-1111-1111-1111-111111111111.jsonl" 2>/dev/null
 }
-FRAGMENTS=("FLEET ADVANCE" "ALL FOUR BOXES" "AUTOPILOT" "USE THE CAPACITY" "DRIVE THE P0/P1"
-           "agent-infra" "cell-2" "scripts/admin-merge.sh" "WASTED BEAT")
-
-# (the marker array is declared in section 0 above — one definition, so the wiring check and the
-# behavioural checks cannot assert different element sets)
 
 echo "1. a QUIET beat (short form) carries the order — with every conditional clause EMPTY"
 h="$TMP/quiet"; sandbox "$h" 0
@@ -199,17 +212,25 @@ else
     pass "no conditional clause fired in the quiet beat (so only an unconditional append could add it)"
   fi
   for f in "${FRAGMENTS[@]}"; do
-    if has "$out" "$f"; then pass "  quiet beat names: $f"; else fail "  quiet beat is MISSING: $f"; fi
+    if hasi "$out" "$f"; then pass "  quiet beat names: $f"; else fail "  quiet beat is MISSING: $f"; fi
   done
-  # ⛔ PROPORTIONALITY, measured: the quiet body exists to stay readable, so the SHORT variant must
-  # ride it. If a future edit points the pulse path at the full text, the quiet beat roughly doubles
-  # — that is the regression (full text = 758 chars against a 985-char body, +77%), and it is
-  # invisible to a marker check because both variants carry every element.
+  # The INVERSE pin: the full wording's own phrases must be ABSENT here. This — not a length figure
+  # alone — is what proves the SHORT variant rode this body rather than the full one.
+  for f in "${ONLY_FULL[@]}"; do
+    if hasi "$out" "$f"; then
+      fail "  quiet beat carries the FULL wording ('$f') — the pulse path got the long variant"
+    else
+      pass "  quiet beat does not carry the full-only phrase: $f"
+    fi
+  done
+  # ⛔ PROPORTIONALITY, measured against the SHORT variant's own length: the quiet body exists to stay
+  # readable, and the bound is derived so it genuinely fires on the regression (the FULL variant on
+  # the pulse path, ~1743 chars) instead of at a number the regression cannot reach.
   _qlen=${#out}
-  if [ "$_qlen" -lt 2000 ]; then
-    pass "the quiet beat stays short with the order on it (${_qlen} chars — the full variant alone is ~758)"
+  if [ "$_qlen" -lt "$QUIET_BOUND" ]; then
+    pass "the quiet beat stays short with the order on it (${_qlen} < ${QUIET_BOUND}; full variant = ${#_ifull})"
   else
-    fail "the quiet beat is ${_qlen} chars — the FULL variant appears to ride the pulse path"
+    fail "the quiet beat is ${_qlen} chars (bound ${QUIET_BOUND}) — the FULL variant appears to ride it"
   fi
 fi
 
@@ -228,15 +249,17 @@ else
     fail "the question beat carried neither form's marker — the message shape changed unexpectedly"
   fi
   for f in "${FRAGMENTS[@]}"; do
-    if has "$out" "$f"; then pass "  full beat names: $f"; else fail "  full beat is MISSING: $f"; fi
+    if hasi "$out" "$f"; then pass "  full beat names: $f"; else fail "  full beat is MISSING: $f"; fi
   done
   # The full body carries the FULL wording — the alert tick is where the specific instructions
-  # (name the PRs, the rail, the four boxes on separate lines) are worth their length.
-  if has "$out" "name the specific PRs that should land this cycle"; then
-    pass "the full beat carries the FULL wording (it names the PRs that should land this cycle)"
-  else
-    fail "the full beat does not carry the full wording — the alert body got the condensed variant"
-  fi
+  # (name the PRs, the rail, the four boxes in words) are worth their length.
+  for f in "${ONLY_FULL[@]}"; do
+    if hasi "$out" "$f"; then
+      pass "  full beat carries the full-only phrase: $f"
+    else
+      fail "  full beat is MISSING the full-only phrase: $f — the alert body got the condensed variant"
+    fi
+  done
 fi
 
 echo ""
@@ -264,6 +287,15 @@ else
 fi
 
 echo ""
+# ⛔ A FLOOR ON THE ASSERTION COUNT. Emptying a loop body, or deleting one, would otherwise let this
+# suite report "✅ passed (4 assertions)" over a run that checked almost nothing — the same false-PASS
+# shape `scripts/run-bash-shards.sh` guards with its own runtime counters. Deliberately BELOW the
+# 36 shipped, so a small legitimate edit does not false-block, while a lost loop (which removes
+# 10+) is caught. Lower it only with a deliberate reason.
+MIN_CHECKS=30
+if [ "$checks" -lt "$MIN_CHECKS" ]; then
+  fail "only $checks assertions ran, below the shipped floor of $MIN_CHECKS — a check loop was lost"
+fi
 if [ "$failures" -eq 0 ]; then
   echo "✅ heartbeat-fleet-advance suite passed (${checks} assertions)"
   exit 0
