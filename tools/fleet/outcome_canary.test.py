@@ -2449,6 +2449,117 @@ def test_an_UNKNOWN_probe_in_skip_is_a_usage_error_not_a_silent_no_op():
 
 
 @test
+def test_CONTROLLER_ABSENT_also_abstains_on_a_REJECTED_controller_row():
+    """The cycle-27 guard was gated on launchd holding a pid, so a cell whose launchctl read failed (or
+    whose controller is a plain tmux job) still reached FAIL/CONTROLLER_ABSENT — "no controller exists
+    at all", the ONLY respawn trigger — over a census that had just rejected
+    `nice -n 5 /bin/bash <o_dir>/orch-loop.sh`. Whether the cell used launchd decided the verdict, not
+    whether the controller existed."""
+    m = load()
+    cfg = m.cfg_from_dict({"o_dir": "/O"})
+    d = fx("controller-absent")
+    d["facts"]["controller"] = {
+        "ok": True, "pids": [], "scoped_to": ["/O/orch-loop.sh"],
+        "near_misses": [{"pid": 90210, "cmd": "nice -n 5 /bin/bash /O/orch-loop.sh"}]}
+    d["facts"]["launchd"] = {"label": "l", "loaded": False, "pid": None}
+    v = [x for x in m.evaluate(d["facts"], cfg) if x.name == "controller_cycling"][0]
+    assert (v.status, v.variant) == (m.INCONCLUSIVE, "CENSUS_NEAR_MISS"), (v.status, v.variant)
+    assert v.variant not in m.RESPAWN_TRIGGERS, v.variant
+    assert "nice -n 5" in v.evidence, v.evidence
+    assert "name the controller" in v.evidence.lower(), v.evidence
+    # …a rejected row for a DIFFERENT directory (a leaked fixture) is still the absence it is
+    d["facts"]["controller"]["near_misses"] = [
+        {"pid": 9915, "cmd": "/bin/bash /var/folders/x/T/fleet-inventory-test.a/O/orch-loop.sh"}]
+    v2 = [x for x in m.evaluate(d["facts"], cfg) if x.name == "controller_cycling"][0]
+    assert (v2.status, v2.variant) == (m.FAIL, "CONTROLLER_ABSENT"), (v2.status, v2.variant)
+
+
+@test
+def test_a_REJECTED_daemon_row_is_not_an_ABSENT_daemon():
+    """`pick_pane_daemon_pids` rejects an interpreter invocation with a flag before the binary
+    (`node --enable-source-maps /usr/local/bin/cmux-tui`), so a LIVE daemon could be a near miss — and
+    the FAIL printed "REJECTED (mentioned the name, is not the daemon)" in its own evidence while
+    asserting "processes matching cmux-tui: 0"."""
+    m = load()
+    d = fx("healthy")
+    d["facts"]["pane"] = {"ok": True, "pids": [], "protection_supported": False,
+                          "near_misses": [{"pid": 777,
+                                           "cmd": "node --enable-source-maps /usr/local/bin/cmux-tui"}]}
+    cfg = m.cfg_from_dict(d["config"])
+    v = [x for x in m.evaluate(d["facts"], cfg) if x.name == "pane_daemon"][0]
+    assert (v.status, v.variant) == (m.INCONCLUSIVE, "DAEMON_CENSUS_NEAR_MISS"), (v.status, v.variant)
+    # …and the operator's own `tail -f` on the log is NOT a daemon-shaped row, so absence still FAILs
+    d["facts"]["pane"]["near_misses"] = [{"pid": 905, "cmd": "tail -f /Users/x/.cmux/cmux-tui.out"}]
+    v2 = [x for x in m.evaluate(d["facts"], cfg) if x.name == "pane_daemon"][0]
+    assert (v2.status, v2.variant) == (m.FAIL, "DAEMON_ABSENT"), (v2.status, v2.variant)
+
+
+@test
+def test_an_UNDISCLOSED_page_bound_is_truncation_when_the_bound_was_actually_REACHED():
+    """`gh.get("page_full")` read a payload that never said so as a COMPLETE population, so 100 rows
+    with no disclosure graded as a whole population — while the collector two functions away says
+    "unprovable coverage is truncated, never complete". The bound is material only when it is reached:
+    a 1-row payload cannot have been cut by a 100-row page."""
+    m = load()
+    cfg = m.cfg_from_dict({"repo": "o/r"})
+    row = {"merge_state_status": "CLEAN", "checks_green": True, "checks_state": "green",
+           "auto_armed": True, "review_decision": "APPROVED", "probed": True, "draft": False}
+
+    def gh(n, **kw):
+        prs = [dict(row, number=i) for i in range(n)]
+        out = {"ok": True, "source": "graphql", "open_prs": prs, "open_pr_count": n}
+        out.update(kw)
+        return {"github": out}
+
+    v = m.check_landers(gh(100), cfg)
+    assert (v.status, v.variant) == (m.INCONCLUSIVE, "PARTIAL_POPULATION"), (v.status, v.variant,
+                                                                            v.evidence[:200])
+    v2 = m.check_landers(gh(100, page_full=False), cfg)
+    assert v2.status == m.PASS, (v2.status, v2.variant)
+    v3 = m.check_landers(gh(1), cfg)
+    assert v3.status == m.PASS, "a 1-row payload cannot have been cut by a 100-row page"
+    # a BOOLEAN count is not a count
+    g = gh(1)
+    g["github"]["open_pr_count"] = True
+    v4 = m.check_landers(g, cfg)
+    assert v4.status == m.INCONCLUSIVE, (v4.status, v4.variant)
+
+
+@test
+def test_a_CONCLUDED_red_outranks_an_IN_FLIGHT_check_in_either_order():
+    """`rollup_state` returned on the first in-flight GROUP, so the answer depended on dict ordering:
+    `[red, queued]` said "red" and `[queued, red]` said "inflight", labelling a PR with a FAILED check
+    as `:inflight`."""
+    m = load()
+    red = {"workflowName": "CI", "name": "changes", "conclusion": "FAILURE", "status": "COMPLETED"}
+    queued = {"workflowName": "CI", "name": "ai-review-gate", "status": "QUEUED"}
+    assert m.rollup_state([red, queued]) == "red", m.rollup_state([red, queued])
+    assert m.rollup_state([queued, red]) == "red", m.rollup_state([queued, red])
+    assert m.rollup_state([queued]) == "inflight"
+    green = {"workflowName": "CI", "name": "ci", "conclusion": "SUCCESS", "status": "COMPLETED"}
+    assert m.rollup_state([green]) == "green"
+
+
+@test
+def test_an_INJECTED_fact_set_is_disclosed_as_such():
+    """`--facts` replaced the whole fact dict while the header still said "LIVE" and stamped the RUN's
+    clock, so two runs supplying the same file minutes apart were indistinguishable in the field a
+    reader uses to judge currency."""
+    m = load()
+    d = tempfile.mkdtemp(prefix="oc-inj-")
+    path = os.path.join(d, "facts.json")
+    with open(path, "w") as fh:
+        json.dump({"facts": dict(fx("healthy")["facts"], observed_at="2026-10-17T00:00:00-0500")}, fh)
+    cap = os.path.join(d, "cap")
+    rc, out, err = run_cli(["--live", "--facts", path, "--capture-dir", cap, "--no-respawn",
+                            "--repo", "o/r"])
+    assert "FACTS INJECTED" in out, out[:400]
+    assert "not a live observation" in out, out[:400]
+    assert "2026-10-17T00:00:00-0500" in out, "the payload's observed_at must beat the run clock"
+    assert "LIVE box=" not in out, out[:400]
+
+
+@test
 def test_a_REJECTED_controller_row_is_not_an_ABSENT_controller():
     """The census is SCOPED to exactly `<shell> <this cell's orch-loop.sh>`, so a controller started as
     `nice -n 5 /bin/bash …/orch-loop.sh` lands in `near_misses`. The launchd arm turned that zero into
@@ -4184,9 +4295,30 @@ def test_source_never_contains_a_forbidden_launchctl_form():
 
 MUTATIONS = [
     # (label, old, new, paired test)
+    # ── cycle-28 defects ──────────────────────────────────────────────────────────────────
+    ("CONTROLLER_ABSENT ignores a rejected controller row",
+     "    if not pids and near_ours:",
+     "    if False:",
+     "test_CONTROLLER_ABSENT_also_abstains_on_a_REJECTED_controller_row"),
+    ("a rejected daemon row is graded as an absent daemon",
+     "    if not pids and pane_near:",
+     "    if False:",
+     "test_a_REJECTED_daemon_row_is_not_an_ABSENT_daemon"),
+    ("an undisclosed page bound is read as a complete population",
+     '    if gh.get("page_full") is True or (gh.get("page_full") is None and len(prs) >= 100):',
+     '    if gh.get("page_full") is True:',
+     "test_an_UNDISCLOSED_page_bound_is_truncation_when_the_bound_was_actually_REACHED"),
+    ("the rollup state returns on the first in-flight group",
+     "        if any(_in_flight(chk) for _r, chk in entries):\n            seen_inflight = True\n            continue",
+     "        if any(_in_flight(chk) for _r, chk in entries):\n            return \"inflight\"",
+     "test_a_CONCLUDED_red_outranks_an_IN_FLIGHT_check_in_either_order"),
+    ("an injected fact set is reported as a live observation",
+     '              % ("FACTS INJECTED (%s; not a live observation)" % a.facts if _injected else "LIVE",',
+     '              % ("LIVE",',
+     "test_an_INJECTED_fact_set_is_disclosed_as_such"),
     # ── cycle-27 defects ──────────────────────────────────────────────────────────────────
     ("a rejected controller row is graded as an absent controller",
-     "    if not pids and launchd.get(\"pid\") is not None and near_ours:",
+     "    if not pids and near_ours:",
      "    if False:",
      "test_a_REJECTED_controller_row_is_not_an_ABSENT_controller"),
     ("the respawn re-measure ignores a rejected controller row",
@@ -4194,8 +4326,8 @@ MUTATIONS = [
      "    if False:",
      "test_the_RESPAWN_action_refuses_when_the_census_REJECTED_a_controller_shaped_row"),
     ("the rollup state read does not group attempts",
-     "        attempts.setdefault(_check_key(chk), []).append((_check_rank(chk, pos), chk))\n    worst = \"green\"",
-     "        attempts.setdefault(pos, []).append((_check_rank(chk, pos), chk))\n    worst = \"green\"",
+     "    attempts = {}\n    for pos, chk in enumerate(rollup):\n        if not isinstance(chk, dict):\n            return None\n        attempts.setdefault(_check_key(chk), []).append((_check_rank(chk, pos), chk))",
+     "    attempts = {}\n    for pos, chk in enumerate(rollup):\n        if not isinstance(chk, dict):\n            return None\n        attempts.setdefault(str(pos), []).append((_check_rank(chk, pos), chk))",
      "test_the_two_rollup_reads_agree_and_are_GROUPED"),
     ("the graphql collector never records the rollup state",
      '            "checks_state": state,',
@@ -4223,9 +4355,9 @@ MUTATIONS = [
      '    if _src == "state/queue-state" and kind == "EMPTY":',
      "test_an_UNAGED_EMPTY_record_cannot_manufacture_idleness_either"),
     ("an in-flight rollup is reported as a red conclusion",
-     '        if any(_in_flight(chk) for _r, chk in entries):\n            return "inflight" if worst == "green" else worst',
-     '        if any(_in_flight(chk) for _r, chk in entries):\n            return "red" if worst == "green" else worst',
-     "test_an_IN_FLIGHT_check_is_labelled_inflight_not_RED"),
+     '        if any(_in_flight(chk) for _r, chk in entries):\n            seen_inflight = True\n            continue',
+     '        if any(_in_flight(chk) for _r, chk in entries):\n            return "inflight"',
+     "test_a_CONCLUDED_red_outranks_an_IN_FLIGHT_check_in_either_order"),
     # ── cycle-25 defects ──────────────────────────────────────────────────────────────────
     ("an absent pids key is graded as an empty process table",
      '    raw_pids = ctrl.get("pids")',
@@ -4452,7 +4584,7 @@ MUTATIONS = [
      "    if not isinstance(prs, list):\n        prs = []\n    if False:",
      "test_a_payload_that_is_NOT_a_population_is_not_graded"),
     ("a payload whose count contradicts its rows is graded anyway",
-     '    if not isinstance(gh.get("open_pr_count"), int) or gh["open_pr_count"] != len(prs):',
+     '    if (not isinstance(gh.get("open_pr_count"), int) or isinstance(gh.get("open_pr_count"), bool)\n            or gh["open_pr_count"] != len(prs)):',
      "    if False:",
      "test_a_payload_that_is_NOT_a_population_is_not_graded"),
     ("a PR skipped for a known reason is dropped without being counted",
@@ -4596,7 +4728,8 @@ MUTATIONS = [
      "            pass",
      "test_a_fixture_with_no_expect_asserts_nothing_and_says_so"),
     ("a truncated open-PR page is treated as the whole population",
-     '    if gh.get("page_full"):', "    if False:",
+     '    if gh.get("page_full") is True or (gh.get("page_full") is None and len(prs) >= 100):',
+     "    if False:",
      "test_a_truncated_open_PR_population_is_not_a_population"),
     # ── cycle-5 defects ──────────────────────────────────────────────────────────────
     ("REST's lowercase mergeability state is not normalised, so landers grades nothing",
@@ -4796,9 +4929,8 @@ MUTATIONS = [
      "            print(\"outcome-canary: %s\" % exc, file=sys.stderr)\n            return 1",
      "test_a_bad_fixture_path_is_a_USAGE_error_not_the_FAIL_exit_code"),
     ("a truncated merged page reads as nothing merged",
-     "    if gh.get(\"merged_page_full\") and not (isinstance(n, int) and not "
-     "isinstance(n, bool) and n > 0):",
-     "    if False:",
+     "    if (gh.get(\"merged_page_full\") is True",
+     "    if (gh.get(\"merged_page_full\") is False",
      "test_a_TRUNCATED_merged_page_does_not_read_as_nothing_merged"),
     ("a lane spawn from ANOTHER batch vouches for this one",
      "        live = [e for e in all_started if _is_this_batch(e)\n"
@@ -4824,8 +4956,10 @@ MUTATIONS = [
      "            \"\"",
      "test_an_UNPARSEABLE_memory_probe_is_INCONCLUSIVE_not_zero_free_mib"),
     ("an ABSENT open_pr_count counts as agreement",
-     "    if not isinstance(gh.get(\"open_pr_count\"), int) or gh[\"open_pr_count\"] != len(prs):",
-     "    if isinstance(gh.get(\"open_pr_count\"), int) and gh[\"open_pr_count\"] != len(prs):",
+     '    if (not isinstance(gh.get("open_pr_count"), int) or isinstance(gh.get("open_pr_count"), bool)\n            or gh["open_pr_count"] != len(prs)):',
+     '''    if (isinstance(gh.get("open_pr_count"), int)
+            and not isinstance(gh.get("open_pr_count"), bool)
+            and gh["open_pr_count"] != len(prs)):''',
      "test_an_ABSENT_open_pr_count_is_a_missing_read_not_agreement"),
     ("a rollup AT the GraphQL page bound is graded anyway",
      "        if rollup_truncated(rollup):",

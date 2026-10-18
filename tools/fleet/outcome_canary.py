@@ -271,6 +271,8 @@ class Cfg(object):
         """The controller script(s) for THIS cell: `$O/orch-loop.sh`, plus the harness copy if a
         deployed layout keeps one. Derived from the same `$O` the log and heartbeat come from — a
         separate notion of "where the controller lives" is how two verdicts drift apart."""
+        if not self.o_dir:
+            return []           # not configured: no path to compare a rejected row against
         out = [os.path.join(self.o_dir, "orch-loop.sh")]
         harness = os.path.join(self.o_dir, "orchestrator-harness", "orch-loop.sh")
         if harness not in out:
@@ -705,6 +707,36 @@ def newest(events):
     return best
 
 
+def _names_our_program(rows, paths=(), names=()):
+    """The rejected rows whose COMMAND LINE names the program we are looking for.
+
+    ⛔ EXACT TOKENS, NOT SUBSTRINGS. A substring test counted the operator's own `tail -f
+    ~/.cmux/cmux-tui.out` as the daemon, and a bare `orch-loop.sh` basename counted a leaked fixture
+    from another directory as THIS cell's controller — so the "a rejected row names it, abstain"
+    guard fired on evidence that named a different program entirely.
+    """
+    out = []
+    want = [x for x in paths if x]
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        toks = str(r.get("cmd") or "").split()
+        hit = any(t in want for t in toks)
+        if not hit and names:
+            hit = any(os.path.basename(t) in names for t in toks)
+        if hit:
+            out.append(r)
+    return out
+
+
+def _near_ours_txt(rows):
+    """Render the rejected rows that NAME this cell's controller — a different claim from `_near_txt`,
+    whose every entry is `not this cell's controller`."""
+    if not rows:
+        return "(none)"
+    return "; ".join("pid %s: %s" % (r.get("pid"), str(r.get("cmd") or "")[:160]) for r in rows[:4])
+
+
 def _near_txt(ctrl):
     """The rejected processes, with the reason they were rejected.
 
@@ -792,6 +824,29 @@ def check_controller_cycling(f, c):
                  "table must never reach it. Not green.")
 
     # ── ABSENT: no process AND launchd has no pid ────────────────────────────────────────────
+    # ⛔ THE SCOPED CENSUS'S ZERO IS NOT ABSENCE — IN EITHER ARM. The guard below was gated on
+    # launchd holding a pid, so a cell whose launchd reports NO pid (or whose launchctl read failed)
+    # still reached FAIL/CONTROLLER_ABSENT — "no controller exists at all", a RESPAWN TRIGGER — over a
+    # census that had just rejected `nice -n 5 /bin/bash …/orch-loop.sh`. Whether the cell uses
+    # launchd decided the verdict, not whether the controller exists. The check is hoisted above BOTH
+    # absence arms, and the rejected row is quoted as `names the controller` (not "not this cell's
+    # controller", which is what most rejections are).
+    near = ctrl.get("near_misses") or []
+    # ⛔ THE PAYLOAD'S OWN `scoped_to` IS THE AUTHORITY when it carries one: it is the path list the
+    # census actually applied, so a rejected row can be compared against what was really scoped
+    # rather than against a config the payload may not have used.
+    _paths = [p for p in (ctrl.get("scoped_to") or c.controller_paths()) if p]
+    near_ours = _names_our_program(near, paths=_paths,
+                                  names=() if _paths else ("orch-loop.sh",))
+    if not pids and near_ours:
+        return V("controller_cycling", INCONCLUSIVE, "CENSUS_NEAR_MISS",
+                 "processes matching THIS cell's orch-loop.sh: 0\n"
+                 "REJECTED rows that NAME the controller: %s\n"
+                 "launchd %s: %s\n%s" % (_near_ours_txt(near_ours), lc, lc_txt, log_txt),
+                 "the SCOPED census matched nothing, but it REJECTED a process whose command names "
+                 "this cell's orch-loop.sh — so 'no controller exists' is not established, and a "
+                 "canary that respawns on an unestablished absence can kill a live controller. Not "
+                 "green, and NOT a respawn trigger.")
     if not pids and launchd.get("pid") is None:
         return V("controller_cycling", FAIL, "CONTROLLER_ABSENT",
                  "processes matching THIS cell's orch-loop.sh: 0\n"
@@ -805,25 +860,7 @@ def check_controller_cycling(f, c):
                  "is attempted (this is the ONLY state that respawns).")
 
     # ── launchd claims a pid but nothing in the process table matches it ─────────────────────
-    # ⛔ THE CENSUS IS SCOPED, SO ITS ZERO IS NOT "nothing is running". It rejects any argv that is not
-    # exactly `<shell> <this cell's orch-loop.sh>` — a controller started as `nice -n 5 /bin/bash
-    # …/orch-loop.sh`, or with one extra argument, lands in `near_misses`. Turning that zero into
-    # FAIL/LAUNCHD_PID_UNRESOLVED asserted "no such process exists" over a census that had just
-    # REJECTED a controller-shaped row, and this variant is a RESPAWN TRIGGER: `kickstart -k` then ran
-    # against a live controller, killing a cycle mid-flight. When the census rejected a row that names
-    # this cell's controller, the honest answer is that the process table does not resolve it.
-    near = ctrl.get("near_misses") or []
-    near_ours = [r for r in near
-                 if isinstance(r, dict) and "orch-loop.sh" in str(r.get("cmd") or "")]
-    if not pids and launchd.get("pid") is not None and near_ours:
-        return V("controller_cycling", INCONCLUSIVE, "CENSUS_NEAR_MISS",
-                 "processes matching THIS cell's orch-loop.sh: 0\n"
-                 "REJECTED rows that NAME the controller: %s\n"
-                 "launchd %s: %s\n%s" % (_near_txt(ctrl), lc, lc_txt, log_txt),
-                 "the SCOPED census matched nothing, but it REJECTED a process whose command names "
-                 "this cell's orch-loop.sh — so 'no such process exists' is not established, and a "
-                 "canary that respawns on an unestablished absence can kill a live controller. Not "
-                 "green, and NOT a respawn trigger.")
+    # (the scoped-census guard above covers this arm too — it is hoisted above both)
     if not pids and launchd.get("pid") is not None:
         return V("controller_cycling", FAIL, "LAUNCHD_PID_UNRESOLVED",
                  "processes matching THIS cell's orch-loop.sh: 0\n"
@@ -1642,7 +1679,10 @@ def check_pr_merged(f, c):
     if isinstance(n, int) and n > 0:
         return V("pr_merged", PASS, "MERGED", ev)
     busy, why = _activity(f, cfg=c)
-    if gh.get("merged_page_full") and not (isinstance(n, int) and not isinstance(n, bool) and n > 0):
+    _n_is_int = isinstance(n, int) and not isinstance(n, bool)
+    if (gh.get("merged_page_full") is True
+            or (gh.get("merged_page_full") is None and _n_is_int and n >= 100)) \
+            and not (_n_is_int and n > 0):
         # A FULL, creation-ordered page cannot tell "nothing merged" from "merged PRs created before
         # the page cut". Abstaining is the honest answer; a FAIL here would be a false alarm, and a
         # PASS impossible.
@@ -1696,6 +1736,19 @@ def check_pane_daemon(f, c):
         return V("pane_daemon", INCONCLUSIVE, "PROCESS_TABLE_UNREADABLE",
                  "process table read failed: %s" % (pane.get("error") or "?"),
                  "whether the pane daemon is alive could not be established. Not green.")
+    # ⛔ THE PANE CENSUS IS SCOPED TOO. `pick_pane_daemon_pids` rejects an interpreter invocation
+    # with a flag before the binary (`node --enable-source-maps /usr/local/bin/cmux-tui`), so a live
+    # daemon can be a `near_miss`; the FAIL then printed "REJECTED (mentioned the name, is not the
+    # daemon): …" in its own evidence while asserting "processes matching cmux-tui: 0". Every other
+    # unread in this check abstains; a non-empty near-miss list must too.
+    pane_near = _names_our_program(pane.get("near_misses") or [],
+                                  names=(os.path.basename(cmd),))
+    if not pids and pane_near:
+        return V("pane_daemon", INCONCLUSIVE, "DAEMON_CENSUS_NEAR_MISS",
+                 "processes matching %s: 0\nREJECTED rows that NAME it: %s\n%s"
+                 % (cmd, _near_ours_txt(pane_near), _pane_protection_txt(pane)),
+                 "the scoped census matched nothing but rejected a process whose command names %s, "
+                 "so 'the daemon is absent' is not established. Not green." % cmd)
     if not pids:
         return V("pane_daemon", FAIL, "DAEMON_ABSENT",
                  "processes matching %s: 0\n%s" % (cmd, _pane_protection_txt(pane)),
@@ -1900,20 +1953,25 @@ def rollup_state(rollup):
         if not isinstance(chk, dict):
             return None
         attempts.setdefault(_check_key(chk), []).append((_check_rank(chk, pos), chk))
-    worst = "green"
+    # ⛔ A CONCLUDED RED OUTRANKS AN IN-FLIGHT CHECK, whatever order the groups arrive in. Returning
+    # on the first in-flight group made the answer depend on dict ordering: `[red, queued]` said "red"
+    # and `[queued, red]` said "inflight", so a PR with a FAILED check was labelled `:inflight`. The
+    # verdict is unaffected (neither is landable) but the LABEL is a claim.
+    seen_inflight = False
     for _key, entries in attempts.items():
-        # ⛔ GROUPED, exactly like `rollup_is_green`: the newest attempt PER CHECK decides that check.
-        # An ungrouped max() let a newer green attempt of a DIFFERENT workflow mask a red one, so the
-        # two functions disagreed on the same rollup — two verdict functions, one of them wrong.
+        # GROUPED, exactly like the boolean projection uses: the newest attempt PER CHECK decides
+        # that check. An ungrouped max() let a newer green attempt of a DIFFERENT workflow mask a red.
         if any(_in_flight(chk) for _r, chk in entries):
-            return "inflight" if worst == "green" else worst
+            seen_inflight = True
+            continue
         _rank, chk = max(entries, key=lambda e: e[0])
         concl = _check_conclusion(chk)
         if concl is None:
-            return "inflight" if worst == "green" else worst
+            seen_inflight = True
+            continue
         if concl not in GREEN_CONCLUSIONS:
-            worst = "red"
-    return worst
+            return "red"
+    return "inflight" if seen_inflight else "green"
 
 
 def rollup_is_green(rollup):
@@ -2087,7 +2145,8 @@ def check_landers(f, c):
                  % ", ".join(sorted(gh.keys())),
                  "the open-PR population is absent from the payload, so 'every green PR has an armed "
                  "lander' would be asserted over nothing. Not green.")
-    if not isinstance(gh.get("open_pr_count"), int) or gh["open_pr_count"] != len(prs):
+    if (not isinstance(gh.get("open_pr_count"), int) or isinstance(gh.get("open_pr_count"), bool)
+            or gh["open_pr_count"] != len(prs)):
         return V("landers", INCONCLUSIVE, "GH_UNREADABLE",
                  "gh: open_pr_count=%r but %d row(s) were returned"
                  % (gh.get("open_pr_count"), len(prs)),
@@ -2161,7 +2220,12 @@ def check_landers(f, c):
         skip_txt = ("skipped (known, not landable): %d — %s"
                     % (len(skipped), ", ".join(skipped[:12]) + (" …" if len(skipped) > 12 else "")))
 
-    if gh.get("page_full"):
+    # ⛔ AN ABSENT FLAG IS NOT A COMPLETE POPULATION WHEN THE BOUND IS REACHED. `gh.get("page_full")`
+    # read a payload that never said so as complete, so 100 rows with no disclosure graded as a whole
+    # population — the polarity the collector states two functions away ("unprovable coverage is
+    # truncated, never 'complete'"). The bound is MATERIAL only when it is reached: a 1-row payload
+    # cannot have been cut by a 100-row page, so absence there is not evidence of truncation either.
+    if gh.get("page_full") is True or (gh.get("page_full") is None and len(prs) >= 100):
         # HOISTED above the no-candidate branch: a truncated population is not a population, and
         # "none of the PRs I saw is green" (or "the one I saw is armed") says nothing about the page
         # that was never fetched.
@@ -2836,14 +2900,15 @@ def _controller_fingerprint(machine, cfg):
     # abstain exactly like every other read in this file.
     # `pids_ok` carries WHICH read produced the list: `attempt_respawn` refuses on it, so an absent
     # process list at the moment of action cannot present as "nothing is running".
-    near = snap.get("near_misses") or []
+    _paths = [p for p in (snap.get("scoped_to") or cfg.controller_paths()) if p]
+    near = _names_our_program(snap.get("near_misses") or [], paths=_paths,
+                              names=() if _paths else ("orch-loop.sh",))
     return {"ok": snap.get("ok") is True,
             "pids_ok": isinstance(snap.get("pids"), list),
             # ⛔ THE CENSUS IS SCOPED, SO ITS EMPTY `pids` DOES NOT PROVE ABSENCE. A row the scope
             # REJECTED while naming this cell's controller is a live controller the census could not
             # resolve, and `kickstart -k` on it kills a cycle in flight.
-            "near_miss": any(isinstance(r, dict) and "orch-loop.sh" in str(r.get("cmd") or "")
-                             for r in near),
+            "near_miss": bool(near),
             "pids": [p.get("pid") for p in snap.get("pids") or []
                      if isinstance(p, dict)] if isinstance(snap.get("pids"), list) else [],
             "mtime": log.get("mtime"),
@@ -3467,7 +3532,8 @@ def _collect_rest(gh, repo, cfg, now, errors):
                                       % (row["merge_state_status"],))
         rows.append(row)
     out["open_prs"] = rows
-    out["unprobed"] = unprobed
+    # (`unprobed` was a count nothing read, and it included DRAFT rows that `landers` treats as
+    # SKIPPED — a miscount waiting to be wired up. The per-row `unprobed_reason` is the disclosure.)
     if detail_errors:
         out["detail_errors"] = detail_errors[:5]
     if len(open_raw) >= 100:
@@ -4036,12 +4102,23 @@ def main(argv=None):
     code = exit_code(verdicts, not_evaluated)
 
     obs_iso = _iso(now)
-    header = ("outcome canary — LIVE box=%s repo=%s  %s\n"
+    # ⛔ AN INJECTED FACT SET IS NOT A LIVE OBSERVATION. `--facts` replaced the whole fact dict, yet the
+    # header still said "LIVE" and stamped the RUN's clock — so two runs supplying the same file
+    # minutes or days apart were indistinguishable, in exactly the field a reader uses to judge
+    # currency. The provenance is now stated, and an `observed_at` in the payload is preferred to the
+    # run clock.
+    _injected = bool(a.facts)
+    _obs_at = facts.get("observed_at") if isinstance(facts, dict) else None
+    if _injected and _obs_at:
+        obs_iso = str(_obs_at)
+    header = ("outcome canary — %s box=%s repo=%s  %s\n"
               "window=%.0fs  pr-window=%.0fs  mem-floor=%.0fMiB  disk-floor=%.0fGiB  pool-threshold=%d"
-              % (cfg.box, cfg.repo or "(unknown — pass --repo)", obs_iso, cfg.window_s,
+              % ("FACTS INJECTED (%s; not a live observation)" % a.facts if _injected else "LIVE",
+                 cfg.box, cfg.repo or "(unknown — pass --repo)", obs_iso, cfg.window_s,
                  cfg.pr_window_s, cfg.mem_floor_mb, cfg.disk_floor_gb, cfg.pool_threshold))
 
-    reported = {"respawn": None, "sent": [], "suppressed": [], "not_delivered": []}
+    reported = {"respawn": None, "sent": [], "suppressed": [], "not_delivered": [],
+                "facts": ("injected: %s" % a.facts) if _injected else "live collection"}
 
     # (a) respawn — ONLY when the controller is genuinely absent
     ctrl = [v for v in verdicts if v.name == "controller_cycling"]
@@ -4051,6 +4128,12 @@ def main(argv=None):
         reported["respawn"] = rr
         # Re-check after a successful respawn so the report reflects what is TRUE now.
         if rr.get("took"):
+            # ⛔ THIS REPLACES THE INJECTED FACT SET WITH A LIVE ONE. That is the right thing to do
+            # after a respawn (the report must say what is true NOW), and silently mixing the two
+            # would make the verdicts unattributable — so the swap is recorded in the report.
+            if _injected:
+                reported["facts"] = ("injected for the first read (%s); RE-COLLECTED LIVE after the "
+                                     "respawn" % a.facts)
             facts2 = collect_live(cfg, machine=machine, now=time.time(), skip=skip)
             verdicts = evaluate(facts2, cfg, only=only)
             not_evaluated = [n for n in CHECK_ORDER if n not in set(v.name for v in verdicts)]
@@ -4077,6 +4160,18 @@ def main(argv=None):
             for argv, rc, out in rr.get("commands") or []:
                 extra.append("  $ %s  → rc=%s %s" % (" ".join(argv), rc, (out or "")[:200]))
         for v in to_send:
+            # ⛔ A REMOTE BOX'S OUTCOME CANNOT BE MESSAGED FROM HERE. `--box` scopes the FACTS and the
+            # state key, but `find_controller_workspace`/`send_message` run on the LOCAL cmux socket —
+            # so a run for cell-2 discovered box A's controller and delivered into it, and the report
+            # recorded `delivered` for a recipient that cannot act on cell-2. The respawn path already
+            # refuses honestly for a remote box (`NOT ATTEMPTED (remote)`); the send path now does too.
+            if machine.remote:
+                reported["not_delivered"].append((v.key, "NOT DELIVERED: box %s is REMOTE — the "
+                                                  "cmux socket, and therefore the controller pane, "
+                                                  "belongs to THIS machine. A remote box's "
+                                                  "controller cannot be messaged from here."
+                                                  % cfg.box))
+                continue
             ws = cfg.controller_ws
             ws_why = "--controller-ws"
             if not ws:

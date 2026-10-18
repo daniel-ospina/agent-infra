@@ -227,8 +227,8 @@ shape changes, and it is pruned with the rest of its check.
 ## The suite
 
 ```bash
-python3 tools/fleet/outcome_canary.test.py              # 161 tests
-python3 tools/fleet/outcome_canary.test.py --mutations  # 158 mutations, each must go RED
+python3 tools/fleet/outcome_canary.test.py              # 166 tests
+python3 tools/fleet/outcome_canary.test.py --mutations  # 163 mutations, each must go RED
 ```
 
 The signal tests drive the **real CLI** end-to-end (`--live --facts … --capture-dir …`), so what is
@@ -363,6 +363,30 @@ Six more (cycle 13), each a case where a datum the tool held was not the one it 
   not a pass, so the PR is not landable yet) and is labelled `:inflight`, not `:red`: the verdict is
   the same, the CLAIM is true. `rollup_state()` is that three-way read; `rollup_is_green()` is the
   boolean projection the collectors use.
+- **A rejected census row is not an absence — in EITHER absence arm, and for the pane daemon too.**
+  `CONTROLLER_ABSENT` was still reachable when launchd reported no pid (or its read failed): the guard
+  was gated on `launchd.pid is not None`, so whether the cell used launchd decided the verdict, not
+  whether the controller existed. It is hoisted above both arms now. `pane_daemon` had the same shape
+  (`DAEMON_ABSENT` with "REJECTED (mentioned the name, is not the daemon)" in its own evidence). The
+  match is on **exact tokens** of the cell's own controller paths (or the daemon's basename) — a
+  substring test counted the operator's `tail -f ~/.cmux/cmux-tui.out` as the daemon, and a bare
+  `orch-loop.sh` basename counted a leaked fixture as this cell's controller.
+- **An undisclosed page bound means truncation only when the bound was REACHED.**
+  `gh.get("page_full")` read a payload that never said so as a COMPLETE population: a 100-row payload
+  with no disclosure graded as whole (the collector's own rule is "unprovable coverage is truncated,
+  never complete"), while a 1-row payload cannot have been cut by a 100-row page. Same for
+  `merged_page_full`, and a BOOLEAN `open_pr_count` is not a count.
+- **A concluded RED outranks an in-flight check, in either order.** `rollup_state` returned on the
+  first in-flight group, so `[red, queued]` said "red" and `[queued, red]` said "inflight" — a PR with
+  a FAILED check labelled `:inflight`.
+- **`--facts` is disclosed as INJECTED, not "LIVE".** The header said "LIVE" and stamped the RUN's
+  clock, so two runs supplying the same fact file days apart were indistinguishable in the field a
+  reader uses to judge currency; an `observed_at` in the payload now wins, and the respawn re-check
+  that swaps injected facts for live ones says so.
+- **A `--box` run does not message the LOCAL controller.** `--box` scoped the facts and the state key,
+  but the send path discovered and delivered into *this* machine's pane (the cmux socket is local), so
+  the report recorded `delivered` for a recipient that cannot act on that box. It is `NOT DELIVERED`
+  with the reason, as the respawn path already refused.
 - **A rejected controller row is not an absent controller.** The controller census is scoped to
   exactly `<shell> <this cell's orch-loop.sh>`, so a controller started as `nice -n 5 /bin/bash
   …/orch-loop.sh` lands in `near_misses`. The launchd arm turned that zero into
