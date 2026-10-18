@@ -127,7 +127,9 @@
 #   CACHE_REAP_MAX_MB     per-cache ceiling in MiB (default 2048)
 #   CACHE_REAP_UV_DIR     uv cache dir      (default: `uv cache dir`, else $UV_CACHE_DIR,
 #                         else $HOME/.cache/uv)
-#   CACHE_REAP_NPM_DIR    npm cacache dir   (default $HOME/.npm/_cacache)
+#   CACHE_REAP_NPM_DIR    npm cache ROOT   (default: `npm config get cache`, else
+#                         $HOME/.npm — the ROOT, so `_cacache`, `_npx` and `_logs` are
+#                         all inside the bound)
 #   CACHE_REAP_PIP_DIR    pip cache dir     (default $HOME/.cache/pip; the macOS
 #                         ~/Library/Caches/pip is probed as a second candidate)
 #   CACHE_REAP_APPLY      "1" arms the pass (a default: explicit flags still win)
@@ -136,7 +138,9 @@
 #   CACHE_REAP_LOG        pass log (default $HOME/.pi/agent/state/pi-cache-reap.log)
 #   CACHE_REAP_LOG_MAX_BYTES  rotate the log past this size (default 1 MiB)
 #   CACHE_REAP_LOCK       pass lock dir (default $HOME/.pi/agent/state/pi-cache-reap.lock)
-#   CACHE_REAP_LOCK_STALE_SECONDS  break a lock older than this (default 3600)
+#   CACHE_REAP_LOCK_STALE_SECONDS  break a lock older than this (default 1800 =
+#                         half the hourly trigger: a bound equal to the interval lets
+#                         the next tick break a pass that is still running)
 #   CACHE_REAP_PS         ps binary  (default /bin/ps)
 #   CACHE_REAP_DF         df binary  (default df)
 #   CACHE_REAP_DU         du binary  (default du)
@@ -276,8 +280,10 @@ prune_cache() {
     case "$class" in
         uv|npm) ;;
         *)
-            # pip has no unused-entry prune (`pip cache purge` is the whole-cache
-            # delete, i.e. the ESCALATION arm). Nothing to do safely — not a failure.
+            # pip has no unused-entry prune. (`pip cache purge` is a whole-cache
+            # delete, which this script never uses: the escalation arm removes
+            # entries one by one, under the holder/mount/hardlink checks.)
+            # Nothing to do safely here — not a failure.
             return 1 ;;
     esac
     if [ -z "$tool" ] || ! command -v "$tool" >/dev/null 2>&1; then
@@ -326,16 +332,21 @@ ps_snapshot() {
 }
 
 # ps_matches <tool|dir> <class> <dir> — snapshot lines that could hold this cache.
-# rc 0 = at least one line on stdout, 1 = none, 2 = no usable snapshot.
+# rc 0 = the scan ran (stdout may be EMPTY: no match) · 2 = no usable snapshot.
+# ⚠️ There is no rc 1: the matching branches return 0 whether or not they printed.
 # ⛔ This runs against a SNAPSHOT taken before the probe process existed, so the
 # scanner can never match itself (a `grep` whose argv holds the cache path would
 # otherwise make every pass report a phantom holder).
-# ⛔ The tool match is on the EXECUTABLE (argv[0], or the token after `/usr/bin/env`),
-# NOT on a substring of the whole command line. Substring matching made an operator's
-# own shell — any command text containing `uv ` — report itself as a live uv process,
-# which refused escalation on a box with no uv running at all (measured while writing
-# this script). The exec test still catches every real case: `uv sync`, `uv run …`,
-# `/usr/bin/env UV_CACHE_DIR=… uv …`.
+# ⛔ The tool match is argv[0] (the executable name), or — for the interpreter-hosted
+# tools — an ABSOLUTE argv token whose basename is that tool's entry point: npm runs as
+# `node /…/npm/bin/npm-cli.js`, pip as `python3 /…/pip/__main__.py` or `python3 -m pip`,
+# and uv's `uv tool run` entry point is `uvx`. An argv[0] test alone never matches npm or
+# pip (measured: a live `npm install` failed to block the escalation).
+# ⚠️ Why ABSOLUTE: a path in argv that is not absolute is not an executed binary — without
+# that rule an operator's own `grep -rn bin/uv docs/` reported itself as a live uv and
+# refused escalation on a box with no uv running (measured). With it, `uv sync`,
+# `uv run …`, `node …/npm-cli.js`, `python3 -m pip` and `env UV_CACHE_DIR=… uv …` all
+# still match.
 # ⛔ The entry match is `index()` — a LITERAL substring test. A sed-escaped ERE broke on
 # any path carrying `+ ? ( ) { } |`: `/tmp/a+work/.cache/uv` became `a+work` under ERE
 # (a quantifier), matched nothing, so a live process's entry was deleted and the pass
@@ -355,19 +366,25 @@ ps_matches() {
                 {
                     exe = $2; sub(/.*\//, "", exe)
                     if (exe == tool) { print; next }
-                    # ⛔ npm and pip are NOT native binaries: npm runs as
-                    # `node .../node_modules/npm/bin/npm-cli.js`, pip as
-                    # `python3 .../pip/__main__.py` (or `python3 -m pip`). An argv[0]
-                    # comparison therefore NEVER matches them, and a measured probe
-                    # showed a live `npm install` failing to block the escalation —
-                    # the guard was untested because the suite only stubbed a native
-                    # uv holder. Match what the process IS, not just its binary name.
-                    if (tool == "npm" && (index($0, "npm-cli.js") || index($0, "bin/npm"))) { print; next }
-                    if (tool == "pip" && (index($0, "pip/__main__.py") || index($0, " -m pip") || index($0, "bin/pip"))) { print; next }
-                    # `uvx` is the `uv tool run` entry point of uv and resolves through the SAME
-                    # cache: matching only `uv`/`bin/uv ` let a live uvx through the veto (measured
-                    # control pair: a uv holder → exit 3, the same row with argv[0]=uvx → VERIFIED).
-                    if (tool == "uv" && (exe == "uvx" || index($0, "bin/uvx") || index($0, "bin/uv "))) { print; next }
+                    if (tool == "uv" && exe == "uvx") { print; next }
+                    # npm and pip are NOT native binaries: npm runs as
+                    # `node …/npm/bin/npm-cli.js`, pip as `python3 …/pip/__main__.py` or
+                    # `python3 -m pip`. An argv[0] test therefore never matches them (measured: a
+                    # live `npm install` failed to block the escalation).
+                    # ⛔ The token must be an ABSOLUTE path: a path in argv that is not absolute is
+                    # not an executed binary, so without that rule a plain
+                    # `grep -rn bin/uv docs/` matched `uv` and refused escalation on a box with no
+                    # uv running at all (measured).
+                    for (i = 2; i <= NF; i++) {
+                        t = $i
+                        b = t; sub(/.*\//, "", b)
+                        if (index(t, "/") == 1) {
+                            if (tool == "uv" && (b == "uv" || b == "uvx")) { print; next }
+                            if (tool == "npm" && (b == "npm" || b == "npm-cli.js")) { print; next }
+                            if (tool == "pip" && (b ~ /^pip[0-9.]*$/ || t ~ /\/pip\/__main__\.py$/)) { print; next }
+                        }
+                        if (tool == "pip" && t == "-m" && $(i + 1) == "pip") { print; next }
+                    }
                     if (exe == "env") {
                         i = 3
                         while (i <= NF && $i ~ /=/) i++
@@ -518,13 +535,6 @@ entries_by_size() {
     return 0
 }
 
-# guard_target <class> <dir> — rc 0 the target can be a package cache · rc 1 refused (reported).
-# ⛔ The env seams are honoured, so a mis-set seam names an ARBITRARY directory — and `uv cache
-# prune` pointed at one deletes it (measured: `UV_CACHE_DIR=/tmp/rp5 uv cache prune` removed
-# `mystuff/` and `keep.txt`). Measured end-to-end with the seam set to $HOME: the pass reported
-# "$HOME 40MB -> 4KB … VERIFIED", deleted $HOME/precious — and then deleted its own state dir, so
-# every later log line failed silently. The seams stay usable for the suite because a cache-shaped
-# directory passes; what is refused is a target that cannot be a cache at all.
 # canon <path> — the path with symlinks resolved, or the input when it cannot be resolved (so a
 # comparison never fails OPEN because the other side was spelled differently).
 canon() {
@@ -535,6 +545,10 @@ canon() {
 }
 
 # guard_target <class> <resolved-dir> <declared-dir> — rc 0 usable · rc 1 refused (reported).
+# ⛔ The env seams are honoured, so a mis-set seam names an ARBITRARY directory — and `uv cache
+# prune` pointed at one deletes it (measured). End to end with the seam set to $HOME the pass
+# reported "$HOME 40MB -> 4KB … VERIFIED", deleted $HOME/precious, and then deleted its own state
+# dir so every later log line failed silently.
 # ⛔ The env seams are honoured, so a mis-set seam names an ARBITRARY directory — and `uv cache
 # prune` pointed at one deletes it (measured). The SHAPE test therefore runs on the RESOLVED name,
 # NOT on the declared one: the declared name is cache-shaped for every real sink by construction, so
@@ -578,7 +592,7 @@ guard_target() {
 reap_target() {
     local class="$1" dir="$2" before_kb before_free_kb now_kb new_kb after_kb after_free_kb
     local pruned=none evicted=0 kb e cur_free holders dir_holders held_entries="" keep_entries=""
-    local no_gain_stop=0 no_gain=0 free_fell=0 any_gain=0 last_free="" claimed_kb gained_kb credited_kb credited_note min_gain_kb stop_note=""
+    local no_gain_stop=0 no_gain=0 any_gain=0 last_free="" claimed_kb gained_kb credited_kb min_gain_kb stop_note=""
     local dev_rc share_rc fresh_holders free_str parent mnt_rc resolved declared_dir
 
     case "$dir" in
@@ -760,7 +774,7 @@ reap_target() {
                         # low-disk box this exists for, other lanes are writing while the pass runs.
                         # Counting that as "not reclaiming" stopped the eviction early (leaving the
                         # cache over bound) AND blamed hardlinked venvs for a delta it never saw.
-                        no_gain=0; free_fell=1
+                        no_gain=0
                     else
                         no_gain=$((no_gain + 1))
                         [ "$no_gain" -ge 2 ] && { no_gain_stop=1; stop_note=" (eviction STOPPED EARLY: deleting this cache no longer reclaims disk)"; break; }
@@ -791,14 +805,6 @@ reap_target() {
         free_str="could not be read"
         [ -n "${after_free_kb:-}" ] && free_str="$(mb_str "$after_free_kb")"
         fail_closed "$class: $dir was $(mb_str "$before_kb") -> $(mb_str "$after_kb") after evicting every removable entry (prune=$pruned evicted=$evicted) — still over the ${MAX_MB}MB bound; free $(mb_str "${before_free_kb:-0}") -> $free_str${held_entries:+ — PRESERVED because a live process names them: $held_entries}${keep_entries:+ — preserved: $keep_entries}${stop_note}"
-        return 0
-    fi
-    # ⛔ After the still-over verdict, "did not shrink" can only mean nothing could be removed at
-    # all — it must NOT claim the pass "acted on" the cache (measured: a single-entry cache whose
-    # only entry a live process names printed "acted on … the size did NOT decrease" and LOST the
-    # PRESERVED line, i.e. the one datum a human needs, and counted the cache twice as a failure).
-    if [ "$after_kb" -ge "$before_kb" ]; then
-        fail_closed "$class: $dir is under its ${MAX_MB}MB bound but did NOT decrease ($(mb_str "$before_kb") -> $(mb_str "$after_kb"), prune=$pruned evicted=$evicted) — the shrink is NOT verified${held_entries:+ — held by a live process: $held_entries}${keep_entries:+ — preserved: $keep_entries}${stop_note}"
         return 0
     fi
 
@@ -841,9 +847,7 @@ reap_target() {
     # bytes satisfy the 50% proof and be printed as `(+192MB) VERIFIED` for a pass that freed
     # nothing. The credit is capped at what the cache actually gave up, and an excess is named.
     credited_kb="$gained_kb"
-    credited_note="the reclaim is capped at what this cache gave up: $(mb_str "$gained_kb") of df gain, at most $(mb_str "$claimed_kb") attributable to this pass"
     if [ "$gained_kb" -gt "$claimed_kb" ]; then credited_kb="$claimed_kb"; fi
-    [ "$gained_kb" -le "$claimed_kb" ] && credited_note="$(mb_str "$gained_kb") of that is attributable to this pass" 
     if [ "$gained_kb" -lt "$min_gain_kb" ]; then
         fail_closed "$class: $dir shrank $(mb_str "$before_kb") -> $(mb_str "$after_kb") ($(mb_str "$claimed_kb") claimed) but the filesystem gained only $(mb_str "$gained_kb") ($(mb_str "$before_free_kb") -> $(mb_str "$after_free_kb")) — under ${MIN_RECLAIM_PCT}% of the claim, so the bytes are NOT verified as reclaimed (hardlinked into a .venv? the owner for those is: cloud-cell-supervisor.sh prune)${stop_note}"
         return 0

@@ -450,7 +450,10 @@ check_caches() {
   # can report "absent" for a box whose uv cache is 3GB elsewhere; and a tuned bound must not leave
   # this report describing a different policy than the one enforced.
   reaper=""
-  for d in "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/pi-cache-reap.sh" \
+  # ${CACHE_REAPER:-} FIRST: the same override the cell clock and the supervisor honour, so the
+  # report cannot describe a different copy than the one that runs.
+  for d in "${CACHE_REAPER:-}" \
+           "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/pi-cache-reap.sh" \
            "${HOME:-}/.pi/agent/scripts/pi-cache-reap.sh"; do
     [ -n "$d" ] && [ -f "$d" ] && { reaper="$d"; break; }
   done

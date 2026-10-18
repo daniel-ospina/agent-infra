@@ -324,9 +324,10 @@ assert_contains "$OUT" "uv sync" "the refusal names the actual holder process"
 
 echo
 echo "── 4a. a live npm / pip holder is seen too (they are not native binaries) ──"
-# The holder class must match the CACHE class under test: npm's cache is $HOME/.npm/_cacache,
-# pip's is $HOME/.cache/pip (a uv-class fixture would never consult the npm/pip matcher).
-for pair in "ps-npm:.npm/_cacache" "ps-pip:.cache/pip" "ps-pip2:.cache/pip"; do
+# The holder class must match the CACHE class under test: npm's cache is $HOME/.npm (the ROOT —
+# its `_cacache` child is what the matcher used to be written against), pip's is $HOME/.cache/pip
+# (a uv-class fixture would never consult the npm/pip matcher).
+for pair in "ps-npm:.npm" "ps-pip:.cache/pip" "ps-pip2:.cache/pip"; do
   stub="${pair%%:*}"; cdir="${pair#*:}"
   H="$T/h4a-$stub"
   new_cache "$H/$cdir" 3000 2000
@@ -729,14 +730,17 @@ assert_eq "$RC" "3" "a cache symlinked onto a data directory exits 3 (the declar
 echo
 echo "── 9t. a symlinked \$HOME cannot defeat the \$HOME refusal ──"
 H="$T/h9t"
-mkdir -p "$H/real/Documents" "$H/real/.cache"
-dd if=/dev/zero of="$H/real/Documents/data.bin" bs=1024 count=3000 2>/dev/null
-ln -sfn "$H/real" "$H/linkhome"
-OUT="$(env HOME="$H/linkhome" CACHE_REAP_MAX_MB=2 CACHE_REAP_UV_DIR="$H/real" CACHE_REAP_LOG="$H/reap.log" \
+# The resolved target must be HOME *and* cache-shaped (`uv-real`), or the shape guard refuses first
+# and this test would pass with the canonical-$HOME comparison removed (measured — it did).
+mkdir -p "$H/uv-real/Documents" "$H/uv-real/.cache"
+dd if=/dev/zero of="$H/uv-real/Documents/data.bin" bs=1024 count=3000 2>/dev/null
+ln -sfn "$H/uv-real" "$H/linkhome"
+OUT="$(env HOME="$H/linkhome" CACHE_REAP_MAX_MB=2 CACHE_REAP_UV_DIR="$H/linkhome" CACHE_REAP_LOG="$H/reap.log" \
         CACHE_REAP_PS="$T/bin/ps-idle" CACHE_REAP_DF="$T/bin/df-gain" CACHE_REAP_UV="$T/bin/uv-noprune" \
         CACHE_REAP_NPM="$T/bin/uv-noprune" CACHE_REAP_PIP="$T/bin/uv-noprune" bash "$REAPER" --apply 2>&1)"; RC=$?
 assert_eq "$RC" "3" "a target that IS \$HOME through a symlink is refused (the comparison is canonical on both sides)"
-[ -f "$H/real/Documents/data.bin" ] && ok "the home directory SURVIVED" || bad "a symlinked \$HOME defeated the home refusal"
+assert_contains "$OUT" "or an ancestor of it" "the refusal is the \$HOME one — not the shape guard catching it by accident"
+[ -f "$H/uv-real/Documents/data.bin" ] && ok "the home directory SURVIVED" || bad "a symlinked \$HOME defeated the home refusal"
 
 echo
 echo "── 9u. uvx is a uv holder (same cache) ──"
@@ -836,6 +840,85 @@ rm -f "$T/df.calls"
 OUT="$(DF_STUB="$T/bin/df-always-falls" run_reap "$H" --apply 2>&1)"; RC=$?
 assert_eq "$RC" "3" "a falling delta with NO observed gain fails closed (the reclaim is unverified)"
 assert_contains "$OUT" "NOT ONE eviction of this pass was followed by a gain" "the refusal says what evidence was missing"
+
+echo
+echo "── 9w. a RELATIVE path in someone else's argv is not a holder (absolute-token rule) ──"
+H="$T/h9w"
+new_cache "$H/.cache/uv" 3000 2000
+cat >"$T/bin/ps-grep" <<'SH'
+#!/bin/sh
+printf '%s\n' "  7777 grep -rn bin/uv /home/x/docs"
+SH
+chmod +x "$T/bin/ps-grep"
+OUT="$(PS_STUB="$T/bin/ps-grep" run_reap "$H" --apply 2>&1)"; RC=$?
+assert_eq "$RC" "0" "a grep whose argv holds a RELATIVE 'bin/uv' is not a live uv (it used to refuse the escalation)"
+assert_le "$(kb "$H/.cache/uv")" "$BOUND_KB" "the cache still came under its bound"
+
+echo
+echo "── 9x. the ACT-POINT re-probe: a holder that appears MID-pass stops it ──"
+H="$T/h9x"
+new_cache "$H/.cache/uv" 900 900 900 900
+cat >"$T/bin/ps-actpoint" <<SH
+#!/bin/sh
+n=\$(cat "$T/ps.calls" 2>/dev/null || echo 0)
+echo \$((n + 1)) >"$T/ps.calls"
+# The pass takes TWO ps snapshots before the loop (one for the prune guard, one for the
+# whole-cache veto); the third is the ACT-POINT re-probe, so the holder must appear from n=2 on.
+if [ "\$n" -ge 2 ]; then printf '%s\n' "  7777 /usr/local/bin/uv sync"; else printf '%s\n' "    1 /sbin/init"; fi
+SH
+chmod +x "$T/bin/ps-actpoint"
+rm -f "$T/ps.calls"
+OUT="$(PS_STUB="$T/bin/ps-actpoint" run_reap "$H" --apply 2>&1)"; RC=$?
+assert_eq "$RC" "3" "a uv that appears after the pass-start snapshot stops the pass"
+assert_contains "$OUT" "started during this pass" "the refusal says the holder appeared mid-pass"
+assert_eq "$(find "$H/.cache/uv" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')" "4" "NOTHING was evicted (the pass-stop happens before the first removal)"
+
+echo
+echo "── 9y. lock_release removes only a lock that is PROVABLY ours ──"
+H="$T/h9y"
+new_cache "$H/.cache/uv" 3000 2000
+LOCK_DIR="$H/.pi/agent/state/pi-cache-reap.lock"
+cat >"$T/bin/ps-swaplock" <<SH
+#!/bin/sh
+n=\$(cat "$T/ps.calls" 2>/dev/null || echo 0)
+echo \$((n + 1)) >"$T/ps.calls"
+if [ "\$n" -ge 1 ]; then printf '999999\n' >"$LOCK_DIR/owner"; fi
+printf '%s\n' "    1 /sbin/init"
+SH
+chmod +x "$T/bin/ps-swaplock"
+rm -f "$T/ps.calls"
+OUT="$(PS_STUB="$T/bin/ps-swaplock" run_reap "$H" --apply 2>&1)"; RC=$?
+assert_eq "$RC" "0" "the pass completes"
+assert_eq "$(cat "$LOCK_DIR/owner" 2>/dev/null)" "999999" "the lock another pass took is NOT deleted by this pass's EXIT trap"
+
+echo
+echo "── 9z. the log is rotated at CACHE_REAP_LOG_MAX_BYTES (it is a disk sink too) ──"
+H="$T/h9z"
+new_cache "$H/.cache/uv" 100
+printf '%0400d\n' 0 >"$H/reap.log"
+OUT="$(env HOME="$H" CACHE_REAP_MAX_MB="$BOUND_MB" CACHE_REAP_LOG="$H/reap.log" CACHE_REAP_LOG_MAX_BYTES=100 \
+        CACHE_REAP_PS="$T/bin/ps-idle" CACHE_REAP_DF="$T/bin/df-gain" \
+        CACHE_REAP_UV="$T/bin/uv-noprune" CACHE_REAP_NPM="$T/bin/uv-noprune" CACHE_REAP_PIP="$T/bin/uv-noprune" \
+        bash "$REAPER" --apply 2>&1)"; RC=$?
+assert_eq "$RC" "0" "an under-bound pass completes"
+[ -f "$H/reap.log.1" ] && ok "the oversized log was rotated to .1" || bad "the log was not rotated (it grows without bound)"
+
+echo
+echo "── 9aa. a df gain LARGER than the claim is not credited as this pass's reclaim ──"
+H="$T/h9aa"
+new_cache "$H/.cache/uv" 1200 1200
+cat >"$T/bin/df-flood" <<SH
+#!/bin/sh
+n=\$(cat "$T/df.calls" 2>/dev/null || echo 0)
+echo \$((n + 1)) >"$T/df.calls"
+echo "Filesystem 1024-blocks Used Available Capacity Mounted"
+if [ "\$n" -eq 0 ]; then echo "/dev/fake 4000000 4000 10000 4% /"; else echo "/dev/fake 4000000 4000 2000000 4% /"; fi
+SH
+chmod +x "$T/bin/df-flood"
+rm -f "$T/df.calls"
+OUT="$(DF_STUB="$T/bin/df-flood" run_reap "$H" --apply 2>&1)"; RC=$?
+assert_eq "$RC" "0" "the pass verifies (the cache did shrink)"
+assert_contains "$OUT" "NOT attributable to this pass" "a df gain beyond what the cache gave up is named as foreign, not folded into the reclaim"
 
 echo
 echo "── 10. wiring: a bound no box runs is the defect ──"

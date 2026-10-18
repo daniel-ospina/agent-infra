@@ -1280,7 +1280,10 @@ cmd_status() {
   # unmeasurable cache, an entry that cannot be sized, a shrink it could not verify — would
   # otherwise read exactly like a healthy cell, which is the blind spot #1987 was filed for.
   if [ -f "$O/state/.cache-reap-blocked" ]; then
-    say "⛔ CACHE BOUND NOT ENFORCED — the package-cache reaper fail-closed on its last pass:"
+    # NOT "fail-closed": exit 5 (a cache over bound on the shipped dry-run stance) is the common
+  # case on an unarmed box, and the reaper's exit vocabulary calls only 3 fail-closed. The record
+  # below already names the cause (5 = unarmed, 3 = the pass failed) — do not contradict it.
+  say "⛔ CACHE BOUND NOT ENFORCED — the package-cache reaper's last pass:"
     sed 's/^/    /' "$O/state/.cache-reap-blocked"
   fi
   # the loop's own view of itself
@@ -1350,7 +1353,11 @@ sweep_root_caches() {
 # only finds that script.
 cache_reaper_path() {
   local cand
-  for cand in "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/pi-cache-reap.sh" \
+  # ${CACHE_REAPER:-} FIRST, exactly like orchestrator-harness/orch-loop.sh: one override must not
+  # be honoured by the clock and ignored by the only ARMED caller, or two copies of a deletion
+  # policy run on one box, chosen by two different rules.
+  for cand in "${CACHE_REAPER:-}" \
+              "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/pi-cache-reap.sh" \
               "${HOME:-}/.pi/agent/scripts/pi-cache-reap.sh"; do
     [ -n "$cand" ] || continue
     if [ -f "$cand" ]; then printf '%s' "$cand"; return 0; fi
