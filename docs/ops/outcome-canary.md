@@ -28,8 +28,8 @@ outcome.
 | `controller_cycling` | a controller process exists **and** its log advanced within the window | `CONTROLLER_ABSENT`, `LAUNCHD_PID_UNRESOLVED` | `LOG_SILENT`, `LOG_MISSING`, `LOG_NO_CYCLE`; `LOG_UNREADABLE`, `PROCESS_TABLE_UNREADABLE` (inconclusive) |
 | `queue_readable` | the last refresh produced a READABLE verdict (**from the newer of the header token and `state/queue-state`'s own verdict**) | `QUEUE_UNREADABLE`, `QUEUE_NEVER_READ`, `QUEUE_PARTIAL` | `NO_REFRESH` |
 | `work_dispatched` | a `[dispatch] … -> <issue>` line is inside the window **and the batch's lane actually started** | `NOT_DISPATCHED`, `NO_DISPATCH`, `NO_DISPATCH_GATED`, `NO_LANE_STARTED` | `NO_CYCLE_IN_WINDOW`, `DISPATCH_UNCONFIRMED` |
-| `pr_created` | ≥1 PR opened in the PR window | `NO_PR_CREATED` | `IDLE_NO_WORK` (inconclusive) |
-| `pr_merged` | ≥1 PR merged in the PR window | `NO_PR_MERGED` | `IDLE_NO_WORK`, `MERGED_SURFACE_TRUNCATED` (inconclusive) |
+| `pr_created` | ≥1 PR opened in the PR window (**the created population includes PRs opened and then CLOSED unmerged** — a superseded PR was still opened; the closed page is read for both counts, so one call carries both) | `NO_PR_CREATED` | `IDLE_NO_WORK`, `GH_COUNT_UNREAD` (inconclusive: the surface answered but carried no count, so "opened nothing" was never measured) |
+| `pr_merged` | ≥1 PR merged in the PR window | `NO_PR_MERGED` | `IDLE_NO_WORK`, `MERGED_SURFACE_TRUNCATED`, `GH_COUNT_UNREAD` (inconclusive) |
 | `pane_daemon` | a live `cmux-tui` **and** a readable protection value that protects it | `DAEMON_ABSENT`, `PROTECTION_ABSENT` | `PROTECTION_UNEVALUABLE`, `PROTECTION_PARTIAL_UNREAD` (inconclusive: an UNREAD value is not an unprotected one — the tag is distinct from the FAIL's `PROTECTION_PARTIAL` because the notifier suppresses on `name\|variant` and only a PASS clears the key) |
 | `headroom` | disk and available memory above their floors, **with the numbers printed** | `BELOW_FLOOR` | `PROBE_UNREADABLE` |
 | `landers` | every green+mergeable PR is armed or railed (**a decision in the log counts only when the log's own repo matches `--repo`; a log that names NO repo is treated as this cell's — identity unknown is not a mismatch**) — see Honest gaps | `LANDER_MISSING` | `LANDER_EXPIRED`, `PARTIAL_POPULATION` |
@@ -221,8 +221,8 @@ shape changes, and it is pruned with the rest of its check.
 ## The suite
 
 ```bash
-python3 tools/fleet/outcome_canary.test.py              # 123 tests
-python3 tools/fleet/outcome_canary.test.py --mutations  # 113 mutations, each must go RED
+python3 tools/fleet/outcome_canary.test.py              # 126 tests
+python3 tools/fleet/outcome_canary.test.py --mutations  # 118 mutations, each must go RED
 ```
 
 The signal tests drive the **real CLI** end-to-end (`--live --facts … --capture-dir …`), so what is
@@ -242,8 +242,11 @@ Three more tests exist for the same reason — an outcome read as present when i
 - **A re-run is an ATTEMPT, not a check.** The rollup is a list in which a flaky job appears twice, so
   a flat "every entry must be green" walk reads a commit that re-ran green as **red**, and a
   red-reading green PR drops out of the `landers` population. Attempts are grouped on
-  `(workflowName, name)` and ordered by the attempt's `startedAt` — NOT on `app` and NOT by `id`,
-  because the live surface (`gh pr list --json statusCheckRollup`) carries neither: it emits
+  `(workflowName, name)` and ordered by the attempt's `id` where the surface carries one (the REST
+  check-runs payload does), else by the latest of `completedAt`/`startedAt` (the GraphQL surface
+  carries no `id`), else — only when an entry carries neither, e.g. a legacy status context — by
+  list position, and never on `app`. The live GraphQL surface
+  (`gh pr list --json statusCheckRollup`) carries no `id`: it emits
   `name, workflowName, status, conclusion, startedAt, completedAt, detailsUrl`. Grouping on `app` (or
   on the merge rail's `(app, name)`) collapsed every workflow into one check — `changes` is published
   by both `CI` and `Python CI` — and its list order is not chronological. `app.slug` is the fallback

@@ -273,9 +273,16 @@ class Cfg(object):
         return out
 
     def as_json(self):
-        """The subset a FIXTURE may declare — the inputs that change a verdict."""
+        """The inputs a report must disclose to EXPLAIN ITS OWN VERDICT.
+
+        ⛔ Not "the subset a fixture may declare" (that was wrong in both directions: it omitted
+        `queue_stale_s`, which decides STATE_FROZEN, and `cfg_from_dict` accepts every default). Two
+        runs with `--queue-stale-min 90` and `--queue-stale-min 0` emitted byte-identical config
+        blocks while grading the same record differently.
+        """
         return {
             "window_s": self.window_s,
+            "queue_stale_s": self.queue_stale_s,
             "pr_window_s": self.pr_window_s,
             "mem_floor_mb": self.mem_floor_mb,
             "disk_floor_gb": self.disk_floor_gb,
@@ -1371,6 +1378,18 @@ def check_pr_created(f, c):
                  "the PR population could not be read, so 'no PR was created' is not established. "
                  "Not green.")
     n = gh.get("prs_created_in_window")
+    # ⛔ AN `ok` SURFACE WITH NO COUNT IS NOT A MEASURED ZERO. `isinstance(n, int) and n > 0` sends
+    # `None` into the FAIL branch, so a payload that answered but carries no
+    # `prs_created_in_window` produced `FAIL/NO_PR_CREATED` — asserting the fleet "opened no PR in
+    # 3.0h" off a field that was never read, and printing `PRs created in the last 3h: None` beside
+    # it. Same rule as headroom's `ok`-with-no-number guard: a FAIL on this check means one was
+    # MEASURED, or it means nothing.
+    if not isinstance(n, int):
+        return V("pr_created", INCONCLUSIVE, "GH_COUNT_UNREAD",
+                 "the gh surface answered but carries no prs_created_in_window (got %r)\n%s"
+                 % (n, _gh_surface_txt(gh)),
+                 "the created count was not read, so 'no PR was created' is not established. "
+                 "Not green.")
     # ⛔ The labels and the values were CROSSED: `open=` printed the merged count and `merged=` the
     # open count, so the evidence of a PASS contradicted `pr_merged`'s own block two checks later
     # (measured live: "PRs created in the last 3h: 25 / (open=13 merged=24)" for 24 open, 13 merged).
@@ -1400,6 +1419,14 @@ def check_pr_merged(f, c):
                  "the merge population could not be read. Not green.")
     n = gh.get("prs_merged_in_window")
     open_n = gh.get("open_pr_count")
+    # ⛔ AN `ok` SURFACE WITH NO COUNT IS NOT A MEASURED ZERO — see `check_pr_created`. Without this,
+    # a payload with no `prs_merged_in_window` reached the `open_n > 0` branch and reported
+    # "N PR(s) are open and nothing merged in 3.0h" off a count it never read.
+    if not isinstance(n, int):
+        return V("pr_merged", INCONCLUSIVE, "GH_COUNT_UNREAD",
+                 "the gh surface answered but carries no prs_merged_in_window (got %r)\n%s"
+                 % (n, _gh_surface_txt(gh)),
+                 "the merge count was not read, so 'nothing merged' is not established. Not green.")
     ev = ("PRs MERGED in the last %.2gh: %s\nopen PRs now: %s\nlast merged: %s\n%s"
           % (win / 3600.0, n, open_n, gh.get("last_merged") or "none in the query window",
              _gh_surface_txt(gh)))
@@ -2964,18 +2991,25 @@ def _collect_graphql(gh, repo, cfg, now, errors):
     if open_prs is None:
         errors.append("graphql: gh pr list --state open returned unparseable JSON")
         return None
-    rc, txt = _run_gh([gh, "pr", "list", "--repo", repo, "--state", "merged", "--limit", "100",
+    # ⛔ THE MERGED SUBSET WAS THE WHOLE POPULATION, so a PR opened and CLOSED UNMERGED was invisible
+    # and `pr_created` could report FAIL/NO_PR_CREATED for a fleet that did open it (the REST path had
+    # the same hole; `also_created` closes both). `--state closed` returns merged AND closed-unmerged
+    # rows in ONE call — same call count, strictly more data — and the merged subset is filtered here,
+    # exactly as `_collect_rest` already did.
+    rc, txt = _run_gh([gh, "pr", "list", "--repo", repo, "--state", "closed", "--limit", "100",
                        "--json", "number,mergedAt,createdAt"])
     if rc != 0:
-        errors.append("graphql: gh pr list --state merged rc=%s: %s" % (rc, _one_line(txt)))
+        errors.append("graphql: gh pr list --state closed rc=%s: %s" % (rc, _one_line(txt)))
         return None
-    merged = _json_list(txt)
-    if merged is None:
-        errors.append("graphql: gh pr list --state merged returned unparseable JSON")
+    closed = _json_list(txt)
+    if closed is None:
+        errors.append("graphql: gh pr list --state closed returned unparseable JSON")
         return None
+    merged = [p for p in closed if p.get("mergedAt")]
     out = _gh_empty()
     out["source"] = "graphql"
-    _fill_counts(out, open_prs, merged, cfg, now)
+    _fill_counts(out, open_prs, merged, cfg, now, merged_page_rows=len(closed),
+                 also_created=closed)
     rows = []
     for p in open_prs:
         mss = (p.get("mergeStateStatus") or "").strip().upper()
@@ -3033,7 +3067,8 @@ def _collect_rest(gh, repo, cfg, now, errors):
 
     out = _gh_empty()
     out["source"] = "rest"
-    _fill_counts(out, open_raw, merged, cfg, now, merged_page_rows=len(closed))
+    _fill_counts(out, open_raw, merged, cfg, now, merged_page_rows=len(closed),
+                 also_created=closed)
 
     probe_max = int(cfg.rest_probe_max)
     rows, unprobed, detail_errors = [], 0, []
@@ -3094,7 +3129,7 @@ def _collect_rest(gh, repo, cfg, now, errors):
     return out
 
 
-def _fill_counts(out, open_prs, merged, cfg, now, merged_page_rows=None):
+def _fill_counts(out, open_prs, merged, cfg, now, merged_page_rows=None, also_created=None):
     win = cfg.pr_window_s
     merged_ts = [t for t in (parse_github_ts(p.get("mergedAt") or p.get("merged_at"))
                              for p in merged) if t]
@@ -3110,8 +3145,21 @@ def _fill_counts(out, open_prs, merged, cfg, now, merged_page_rows=None):
     _page = merged_page_rows if merged_page_rows is not None else len(merged)
     out["merged_page_full"] = _page >= 100
     out["last_merged"] = _iso(max(merged_ts)) if merged_ts else None
+    # ⛔ A PR THAT WAS OPENED AND CLOSED UNMERGED STILL COUNTS AS CREATED. The population was built
+    # from the OPEN list plus the MERGED list, and `_collect_rest` drops `closed`-without-`merged_at`
+    # rows before this ever sees them — so a fleet that opened work and superseded it read
+    # `FAIL/NO_PR_CREATED` ("opened no PR in 3.0h") while the closed page held the PRs it opened.
+    # `also_created` carries those rows; dedup by number keeps a PR from being counted twice.
+    seen, created_rows = set(), []
+    for p in list(merged) + list(open_prs) + list(also_created or ()):
+        num = p.get("number")
+        if num is not None and num in seen:
+            continue
+        if num is not None:
+            seen.add(num)
+        created_rows.append(p)
     created_ts = [t for t in (parse_github_ts(p.get("createdAt") or p.get("created_at"))
-                              for p in list(merged) + list(open_prs)) if t]
+                              for p in created_rows) if t]
     out["prs_created_in_window"] = len([t for t in created_ts if now - t <= win])
     out["last_created"] = _iso(max(created_ts)) if created_ts else None
     out["open_pr_count"] = len(open_prs)

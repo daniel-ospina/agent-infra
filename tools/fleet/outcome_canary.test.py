@@ -685,6 +685,76 @@ def test_a_usage_error_is_exit_3_not_the_inconclusive_code():
 
 
 @test
+def test_an_ok_gh_surface_with_NO_COUNT_is_UNREAD_not_a_measured_zero():
+    """`isinstance(n, int) and n > 0` sends `None` into the FAIL branch, so a payload that ANSWERED
+    but carries no `prs_created_in_window` produced `FAIL/NO_PR_CREATED` — asserting the fleet
+    "opened no PR in 3.0h" off a field that was never read, and printing `PRs created: None` beside
+    it. The headroom arm already enforces this rule ("an `ok` read with no number is not 0 GiB");
+    a FAIL on this check must mean one was MEASURED."""
+    m = load()
+    cfg = m.cfg_from_dict({})
+    for name, fn, key in (("pr_created", m.check_pr_created, "prs_created_in_window"),
+                          ("pr_merged", m.check_pr_merged, "prs_merged_in_window")):
+        gh = {"ok": True, "source": "rest", "open_pr_count": 9, "open_prs": []}
+        v = fn({"github": gh}, cfg)
+        assert (v.status, v.variant) == (m.INCONCLUSIVE, "GH_COUNT_UNREAD"), (name, v.status, v.variant)
+        assert key in v.evidence, v.evidence
+        # …and the same surface WITH the count still grades normally (the guard cannot swallow it)
+        gh[key] = 4 if name == "pr_created" else 0
+        gh["open_pr_count"] = 0
+        v2 = fn({"github": gh}, cfg)
+        assert v2.variant != "GH_COUNT_UNREAD", (name, v2.variant)
+
+
+@test
+def test_a_PR_opened_and_CLOSED_UNMERGED_still_counts_as_CREATED():
+    """The created population was built from the OPEN list plus the MERGED list, and
+    `_collect_rest` drops `closed`-without-`merged_at` rows before the counter sees them — so a
+    fleet that opened work and superseded it read `FAIL/NO_PR_CREATED` ("opened no PR in 3.0h")
+    while the closed page held the PRs it opened."""
+    m = load()
+    cfg = m.cfg_from_dict({"pr_window_s": 10800.0})
+    now = 1792327664.0
+    iso = m._iso(now - 600)
+    closed_unmerged = {"number": 11, "createdAt": iso, "mergedAt": None}
+    merged = {"number": 12, "createdAt": iso, "mergedAt": iso}
+    open_row = {"number": 13, "createdAt": iso, "mergedAt": None}
+    out = {}
+    m._fill_counts(out, [open_row], [merged], cfg, now, merged_page_rows=3,
+                   also_created=[closed_unmerged, merged, open_row])
+    assert out["prs_created_in_window"] == 3, out
+    # ⛔ and a row that appears in BOTH populations is counted ONCE (the closed page contains the
+    # merged rows too, so double counting would inflate the created count by the merge count)
+    out2 = {}
+    m._fill_counts(out2, [open_row], [merged], cfg, now, merged_page_rows=3,
+                   also_created=[merged, merged])
+    assert out2["prs_created_in_window"] == 2, out2
+    # without the closed page the same world reads 1 — this is the count that used to be graded
+    out3 = {}
+    m._fill_counts(out3, [open_row], [merged], cfg, now)
+    assert out3["prs_created_in_window"] == 2, out3
+
+
+@test
+def test_the_report_DISCLOSES_every_input_that_changes_a_verdict():
+    """`--live --json` never disclosed `queue_stale_s`, the input that produces STATE_FROZEN, so two
+    runs with `--queue-stale-min 90` and `--queue-stale-min 0` emitted byte-identical config blocks
+    while grading the same record differently. Its docstring also called the block "the subset a
+    FIXTURE may declare", which was wrong in both directions (`cfg_from_dict` accepts every
+    default)."""
+    m = load()
+    a = m.cfg_from_dict({"queue_stale_s": 90.0, "window_s": 60.0})
+    b = m.cfg_from_dict({"queue_stale_s": 0.0, "window_s": 60.0})
+    assert a.as_json() != b.as_json(), (a.as_json(), b.as_json())
+    assert a.as_json()["queue_stale_s"] == 90.0, a.as_json()
+    # every default that a fixture can declare must round-trip through the report, so a report can
+    # explain a verdict it produced
+    for k, v in m.Cfg.DEFAULTS.items():
+        if isinstance(v, (int, float, str)) and k in a.as_json():
+            assert a.as_json()[k] is not None, k
+
+
+@test
 def test_the_pr_created_evidence_names_the_counts_it_prints():
     """The labels and the values were crossed (`open=` printed the merged count and `merged=` the open
     count), so a PASS's evidence contradicted `pr_merged`'s block two checks later."""
@@ -748,7 +818,7 @@ def test_a_PR_with_NO_check_surface_is_UNPROBED_not_dropped_from_the_lander_popu
     def fake(argv):
         j = " ".join(argv)
         if j.endswith("--json") or "pr list" in j:
-            if "--state merged" in j:
+            if "--state closed" in j:
                 return 0, "[]"
             return 0, json.dumps([{                                  # CLEAN + APPROVED, no checks
                 "number": 4242, "mergeStateStatus": "CLEAN", "autoMergeRequest": None,
@@ -3155,6 +3225,27 @@ def test_source_never_contains_a_forbidden_launchctl_form():
 
 MUTATIONS = [
     # (label, old, new, paired test)
+    # ── cycle-20 defects ──────────────────────────────────────────────────────────────────
+    ("an `ok` gh surface with no created count is graded as a measured zero",
+     '    if not isinstance(n, int):\n        return V("pr_created", INCONCLUSIVE, "GH_COUNT_UNREAD",',
+     '    if False:\n        return V("pr_created", INCONCLUSIVE, "GH_COUNT_UNREAD",',
+     "test_an_ok_gh_surface_with_NO_COUNT_is_UNREAD_not_a_measured_zero"),
+    ("an `ok` gh surface with no merged count is graded as a measured zero",
+     '    if not isinstance(n, int):\n        return V("pr_merged", INCONCLUSIVE, "GH_COUNT_UNREAD",',
+     '    if False:\n        return V("pr_merged", INCONCLUSIVE, "GH_COUNT_UNREAD",',
+     "test_an_ok_gh_surface_with_NO_COUNT_is_UNREAD_not_a_measured_zero"),
+    ("a PR opened and closed unmerged drops out of the created population",
+     "    for p in list(merged) + list(open_prs) + list(also_created or ()):",
+     "    for p in list(merged) + list(open_prs):",
+     "test_a_PR_opened_and_CLOSED_UNMERGED_still_counts_as_CREATED"),
+    ("a row present in two populations is counted twice",
+     "        if num is not None and num in seen:\n            continue",
+     "        if False:\n            continue",
+     "test_a_PR_opened_and_CLOSED_UNMERGED_still_counts_as_CREATED"),
+    ("the report omits the input that decides STATE_FROZEN",
+     '            "queue_stale_s": self.queue_stale_s,',
+     '',
+     "test_the_report_DISCLOSES_every_input_that_changes_a_verdict"),
     ("a live pid alone passes as a cycling controller",
      "    if log_age > win:", "    if False:",
      "test_controller_alive_with_frozen_log_is_fail_but_not_respawned"),
@@ -3217,9 +3308,13 @@ MUTATIONS = [
      '          % (win / 3600.0, n, gh.get("open_pr_count"), gh.get("prs_merged_in_window"),',
      '          % (win / 3600.0, n, gh.get("prs_merged_in_window"), gh.get("open_pr_count"),',
      "test_the_pr_created_evidence_names_the_counts_it_prints"),
+    # ⛔ THE MUTANT MUST EXPRESS THE DEFECT, NOT RAISE. Turning the guard off outright made `len()`
+    # raise on a dict payload, so the RED came from the crash guard's PREDICATE_ERROR rather than
+    # from "an unreadable payload was graded". Coercing to `[]` first reproduces what the check
+    # actually did historically: an unread payload read as an EMPTY population.
     ("a payload with no open-PR rows is graded as zero PRs",
      "    if not isinstance(prs, list):",
-     "    if False:",
+     "    if not isinstance(prs, list):\n        prs = []\n    if False:",
      "test_a_payload_that_is_NOT_a_population_is_not_graded"),
     ("a payload whose count contradicts its rows is graded anyway",
      '    if not isinstance(gh.get("open_pr_count"), int) or gh["open_pr_count"] != len(prs):',
@@ -3340,6 +3435,7 @@ MUTATIONS = [
     ("an EMPTY read with NO age is graded as a current read",
      '    if age is None:\n'
      '        # an unaged reading cannot support ANY claim',
+     '    if age is None:\n        return None\n'
      '    if False:\n'
      '        # an unaged reading cannot support ANY claim',
      "test_an_EMPTY_read_with_NO_age_is_not_a_current_read"),
@@ -3403,8 +3499,7 @@ MUTATIONS = [
     ("an unwritable outbox crashes the run",
      '    try:\n        with open(path, "w") as fh:\n            fh.write(msg)\n'
      '    except Exception as exc:',
-     '    if True:\n        with open(path, "w") as fh:\n            fh.write(msg)\n'
-     '    except Exception as exc:',
+     '    if True:\n        with open(path, "w") as fh:\n            fh.write(msg)',
      "test_an_unwritable_outbox_is_NOT_DELIVERED_not_a_crash"),
     # ── cycle-3 defects ──────────────────────────────────────────────────────────────
     ("unread PRs are a footnote once one probed PR is armed",
@@ -3659,10 +3754,18 @@ def run_suite(names=None, quiet=False):
             failed += 1
             if not quiet:
                 print("  ❌ %s\n       %s" % (name, exc))
+            else:
+                # ⛔ QUIET MODE STILL NAMES THE FAILURE AND ITS REASON, because the mutation harness
+                # reads this line to tell a mutant that MIS-GRADES from one that CRASHES (the crash
+                # guard turns the latter into INCONCLUSIVE/PREDICATE_ERROR, a red for the wrong
+                # reason). One line, so `--mutations` stays readable.
+                print("  ❌ %s: %s" % (name, str(exc)[:300]))
         except Exception as exc:
             failed += 1
             if not quiet:
                 print("  ❌ %s\n       %s: %s" % (name, type(exc).__name__, exc))
+            else:
+                print("  ❌ %s: %s: %s" % (name, type(exc).__name__, str(exc)[:300]))
         else:
             passed += 1
             if not quiet:
@@ -3681,8 +3784,20 @@ def run_mutations():
             assert src.count(old) == 1, "mutation anchor not unique (%d hits): %.60r" % (
                 src.count(old), old)
             mutated = os.path.join(tmp, "outcome_canary_mut_%d.py" % len(os.listdir(tmp)))
+            mutated_src = src.replace(old, new)
+            # ⛔ A MUTANT THAT DOES NOT COMPILE IS NOT A CAUGHT DEFECT. `returncode != 0` scores an
+            # unimportable module as RED, so a mutation could be "caught" by a SyntaxError no test
+            # ever graded (measured: #57 replaced `try:` and left `except` dangling). Compile first
+            # and fail the SUITE, never silently count it.
+            try:
+                compile(mutated_src, mutated, "exec")
+            except SyntaxError as exc:
+                bad += 1
+                print("  ❌ INVALID MUTANT (not python, so its RED would be an import error, not a "
+                      "caught defect) — %s\n       %s" % (label, exc))
+                continue
             with open(mutated, "w") as fh:
-                fh.write(src.replace(old, new))
+                fh.write(mutated_src)
             env = dict(os.environ)
             env["OUTCOME_CANARY_MODULE"] = mutated
             env["PYTHONDONTWRITEBYTECODE"] = "1"
@@ -3691,7 +3806,16 @@ def run_mutations():
                                capture_output=True, text=True, env=env, timeout=600)
             if p.returncode != 0:
                 ok += 1
-                print("  ✅ RED as required — %s\n       (paired: %s)" % (label, paired))
+                # ⛔ A MUTANT THAT CRASHES IS NOT EVIDENCE THE PAIRED TEST DISCRIMINATES THE DEFECT.
+                # `evaluate` turns a crashing predicate into INCONCLUSIVE/PREDICATE_ERROR, so a test
+                # asserting "INCONCLUSIVE, but a different variant" goes red for the CRASH rather
+                # than for the defect. Reported distinctly so a weak mutation cannot hide.
+                crashed = "PREDICATE_ERROR" in (p.stdout or "") or "Traceback" in (p.stderr or "")
+                print("  %s %s — %s\n       (paired: %s)%s"
+                      % ("⚠️  RED (mutant CRASHED, not mis-graded)" if crashed else "✅ RED as required",
+                         "" if crashed else "", label, paired,
+                         "\n       the mutation must express the DEFECT, not make the code raise"
+                         if crashed else ""))
             else:
                 bad += 1
                 print("  ❌ STILL GREEN — %s\n       %s did not catch it; the test is decoration"
