@@ -1375,6 +1375,8 @@ sup_loop_alive() {
 # has on it.
 #   rc 0 — the loop is not running (ended, already gone, or a DIFFERENT incarnation abstained on)
 #   rc 1 — a live pid matching the recorded identity survived TERM and KILL
+#   rc 2 — CANNOT VERIFY: the pid is live but its identity cannot be read, so nothing here can say
+#          whether ending it is safe. Never a pass: both callers report "could not end the loop".
 end_loop_pid() { # [<pid> <ident>]
   local lpid="${1:-}" lident="${2:-}" i
   if [ -z "$lpid" ]; then
@@ -1384,9 +1386,15 @@ end_loop_pid() { # [<pid> <ident>]
   fi
   [ -n "$lpid" ] || return 0
   kill -0 "$lpid" 2>/dev/null || return 0
-  # A live pid whose identity does NOT match is a RECYCLED pid: abstain (never signal an innocent
-  # process), and treat the loop as gone — it is. Same fence `stop` applies to the kill.
-  [ -n "$lident" ] && [ "$lident" = "$lpid|$(sup_pid_ident "$lpid")" ] || return 0
+  # ⛔ THREE OUTCOMES, NOT TWO (#1989 review). A live pid whose identity does NOT match is a RECYCLED
+  # pid: abstain (never signal an innocent process) and report the loop gone — rc 0. But an identity
+  # that cannot be READ is not evidence of a recycled pid: folding it into "gone" let a loop that
+  # could not be verified survive a `stop` that returned success, and an unstopped doctor keeps
+  # landing PRs. rc 2 = cannot-verify; both callers treat any non-zero as "could not end the loop".
+  local lcur
+  lcur="$(sup_pid_ident "$lpid")"
+  [ -n "$lcur" ] || return 2
+  [ -n "$lident" ] && [ "$lident" = "$lpid|$lcur" ] || return 0
   kill -TERM "$lpid" 2>/dev/null || true
   for i in 1 2 3 4 5; do kill -0 "$lpid" 2>/dev/null || break; sleep 1; done
   kill -0 "$lpid" 2>/dev/null && kill -KILL "$lpid" 2>/dev/null || true
@@ -1709,8 +1717,6 @@ cmd_stop() {
   # box), so "a session with this name exists" is NOT evidence that it is this cell's — the #1856
   # hazard, one layer out. Record the claim before the marker goes away: a started cell owns its
   # doctor, and the loop's own identity record proves it directly.
-  local had_desired=0
-  [ -f "$ROLES_DIR/.desired" ] && had_desired=1
   rm -f "$ROLES_DIR/.desired" 2>/dev/null || { say "warn: could not remove $ROLES_DIR/.desired — an in-flight restart may re-arm this cell"; rc=1; }
   bump_stop_generation || { say "warn: could not record the stop generation in $O/$STOP_GEN_FILE_REL — an in-flight start may still complete and undo this stop"; rc=1; }
   # ORDER: the desired-state marker is dropped first (with the generation bump, above — the two stop
@@ -1745,7 +1751,12 @@ cmd_stop() {
     rm -f "$ROLES_DIR/restart.ident"
   fi
   if tmux has-session -t "=$DOCTOR_SESSION" 2>/dev/null; then
-    if sup_loop_alive || [ "$had_desired" = 1 ]; then
+    # ⛔ THE LIVE, IDENTITY-MATCHED LOOP RECORD IS THE ONLY PROOF (#1989 review b). This branch used
+    # to also accept `had_desired`, and `$ROLES_DIR/.desired` OUTLIVES a SIGKILLed doctor: the marker
+    # says this cell was started once, never that the session holding the machine-scoped name right
+    # now is ours. So a stale marker plus a peer repo's doctor turned `stop` into a kill of the peer's
+    # doctor. Ours-but-stale is the `else` arm below: reported, left alone, and healed by `start`.
+    if sup_loop_alive; then
       tmux kill-session -t "=$DOCTOR_SESSION" || { say "warn: could not stop the doctor loop '$DOCTOR_SESSION'"; rc=1; }
       say "doctor loop stopped (tmux '$DOCTOR_SESSION')"
     else
@@ -1983,9 +1994,8 @@ run_role() {
 # marker is what tells the doctor that the cell is SUPPOSED to be up — without it a `stop` would be
 # undone by the next pass, and an operator's stop would never stick.
 start_doctor_loop() {
-  local d had_desired=0
+  local d
   mkdir -p "$ROLES_DIR" "$O/logs" || die "cannot create $ROLES_DIR"
-  [ -f "$ROLES_DIR/.desired" ] && had_desired=1
   : > "$ROLES_DIR/.desired" || die "cannot record the desired running state at $ROLES_DIR/.desired"
   d="$(doctor_path)" || die "cloud-cell-doctor.sh not found (looked in $O, then beside $SUP_SELF in orchestrator-harness/, then beside $SUP_SELF) — the cell cannot run its repair/merge roles"
   if tmux has-session -t "=$DOCTOR_SESSION" 2>/dev/null; then
