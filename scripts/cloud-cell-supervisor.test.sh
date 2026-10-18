@@ -106,7 +106,7 @@ make_ai_repo() {
   git -C "$AI" config user.name test
   git -C "$AI" config commit.gpgsign false
   mkdir -p "$AI/scripts/orchestrator-harness"
-  for w in orch-loop.sh claims.sh repo-authority.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do
+  for w in orch-loop.sh claims.sh repo-authority.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh repo-slug.sh; do
     : > "$AI/scripts/orchestrator-harness/$w"
   done
   write_doctor_stub "$AI/scripts/orchestrator-harness"
@@ -336,7 +336,7 @@ ai_worktree "$W/harness"
 # Mirror the shipped required-worker set (`cloud-cell-supervisor.sh` cmd_check): claims.sh is a
 # required worker script now (orch-loop.sh/merge-one.sh SOURCE it from $O), so a fixture without it
 # dies in cmd_check with "worker scripts missing from …: claims.sh".
-for f in claims.sh repo-authority.sh dispatch-merge.sh lane.sh chain-merge.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do : > "$W/harness/$f"; done
+for f in claims.sh repo-authority.sh dispatch-merge.sh lane.sh chain-merge.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh repo-slug.sh; do : > "$W/harness/$f"; done
 write_doctor_stub "$W/harness"
 printf '#!/bin/bash\nexit 0\n' > "$W/bin/gh"; chmod +x "$W/bin/gh"
 # #1717: the shipped `start` PROVISIONS the record step from the checkout, and `cmd_check` refuses a
@@ -603,7 +603,7 @@ ai_worktree "$F/harness"
 # required worker script now, so a fixture without it dies in cmd_check with "worker scripts
 # missing from …: claims.sh" before the #1736 provisioning contract below can be exercised.
 # (P1, 2026-10-14 review round — the §7 fixture was updated, this one was missed.)
-for f in orch-loop.sh claims.sh repo-authority.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh adopt-fix.sh cloud-cell-doctor.sh; do
+for f in orch-loop.sh claims.sh repo-authority.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh adopt-fix.sh cloud-cell-doctor.sh repo-slug.sh; do
   : > "$F/harness/$f"; : > "$F/o/$f"
 done
 write_doctor_stub "$F/harness"; write_doctor_stub "$F/o"
@@ -714,7 +714,7 @@ say_case "harness provenance: reports, records, refuses and mends (agent-infra#1
 
 P="$T/prov"; mkdir -p "$P/home" "$P/o" "$P/bin" "$P/untracked" "$P/lowbin"
 ai_init_repo "$P/repo"
-for f in orch-loop.sh claims.sh repo-authority.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do
+for f in orch-loop.sh claims.sh repo-authority.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh repo-slug.sh; do
   : > "$P/o/$f"; : > "$P/untracked/$f"
 done
 write_doctor_stub "$P/o"; write_doctor_stub "$P/untracked"
@@ -1477,6 +1477,24 @@ cellcheck 0
 [ "$CC_RC" -eq 0 ] && ok "check: passes again once repo-authority.sh is present" \
                    || bad "check: still refuses with the worker restored (rc=$CC_RC)"
 
+# ⚠️ Review round 3 (#2040): repo-slug.sh is SOURCED by orch-loop.sh from $O — `exit 78` when the
+# file is missing OR present-but-stale (no derive_or) — and refresh-candidates.sh refuses without it.
+# A $O missing it is a KeepAlive crash loop, so `check`, the verb an operator runs BECAUSE the box
+# looks stuck, must not certify it. Same class as repo-authority.sh above.
+say_case "check refuses a cell whose \$O lacks repo-slug.sh (review round 3)"
+rm -f "$F/o/repo-slug.sh"
+cellcheck 0
+[ "$CC_RC" -ne 0 ] && ok "check: a missing repo-slug.sh refuses (the controller would crash-loop)" \
+                   || bad "check: certified a cell whose \$O lacks repo-slug.sh"
+case "$CC_OUT" in
+  *"repo-slug.sh"*) ok "check: names the missing helper" ;;
+  *) bad "check: does not name repo-slug.sh — output: $CC_OUT" ;;
+esac
+: > "$F/o/repo-slug.sh"  # restore the fixture for any later case
+cellcheck 0
+[ "$CC_RC" -eq 0 ] && ok "check: passes again once repo-slug.sh is present" \
+                   || bad "check: still refuses with the helper restored (rc=$CC_RC)"
+
 # ── 12) THE QUEUE TARGET IS THE CHECKOUT (agent-infra#1901) ─────────────────────────────────────
 # MEASURED 2026-10-15 on `pi-cell-2`, harness pin `a4a1249794e7`:
 #
@@ -1499,7 +1517,7 @@ say_case "the queue target IS the checkout's remote (agent-infra#1901)"
 Q="$T/queue"; mkdir -p "$Q/home" "$Q/bin"
 QH="$Q/harness"
 ai_worktree "$Q/harness"
-for f in orch-loop.sh claims.sh repo-authority.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh adopt-fix.sh cloud-cell-doctor.sh; do : > "$Q/harness/$f"; done
+for f in orch-loop.sh claims.sh repo-authority.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh adopt-fix.sh cloud-cell-doctor.sh repo-slug.sh; do : > "$Q/harness/$f"; done
 write_doctor_stub "$Q/harness"
 # The provisioning probe must answer rc=0 here: this section is about the PAIR, not about dispatch.
 # It echoes the OR it was handed, so a probe run against the wrong queue could not pass silently.
@@ -2390,7 +2408,7 @@ ai_init_repo "$W2/repo"
 ai_worktree "$W2/harness"
 # The harness a cell seeds is the worker DIRECTORY: the required set must be at its root (a fixture
 # without it dies in `cmd_check` with "worker scripts missing"), and the doctor stub is one of them.
-for f in claims.sh repo-authority.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do : > "$W2/harness/$f"; done
+for f in claims.sh repo-authority.sh repo-slug.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do : > "$W2/harness/$f"; done
 write_doctor_stub "$W2/harness"
 write_doctor_stub "$W2/o"
 cat > "$W2/harness/orch-loop.sh" <<EOF
