@@ -658,7 +658,10 @@ cmd_start() {
             # `status`; the harness path it execs is NOT repo-scoped, so `owned` may legitimately be
             # empty here. The supervisor's own read is the authority on that platform.
     mac)
-      if ! printf '%s\n' "$owned" | grep -qx "$pid"; then
+      # A here-string, never a pipe: under `pipefail` a builtin writer piped into a quiet grep is the
+      # SIGPIPE false-negative idiom (#841/#864) — `grep -qx` exits at the first match, the writer
+      # takes SIGPIPE, and the pipeline's status is the 141, not grep's 1. Caught by sigpipe-grep.
+      if ! grep -qx "$pid" <<<"$owned"; then
         unknown "launchd reports pid $pid but no $O/orch-loop.sh process runs as it — refusing to record a pid this state dir cannot prove is its own controller; check: launchctl print gui/$(id -u)/$LABEL"
       fi
       ;;
