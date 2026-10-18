@@ -60,6 +60,11 @@
 #   (t) do not clear a pidfile the row has PROVEN stale                        → §9q (2 arms: start
 #       cannot repair the row, and the row stays FAILING afterwards)
 #   (u) have the caller assume it started something                          → §9r only
+#   (v) accept any non-empty FLEET_CELL_HOME as cell identity                → §9p only (a defaulted
+#       path made every Linux box a "cell": the entry point defaults CELL_HOME)
+#   (w) delete a pidfile naming a live copy at ANOTHER PATH (no basename proof) → §9q(b) only (start
+#       manufactured a duplicate, then read OK over two live loops)
+#   (x) refuse the repair entirely                                         → §9q (2 arms)
 # A red in a section the mutation does not name means the arm is coupled to the wrong behaviour —
 # e.g. (b) reddening §2 would mean §2 is asserting the controller's duplicate logic.
 
@@ -429,7 +434,8 @@ ONLY_SKIPPED="$(printf 'controller\tx\ty\tOK\t\ncell-supervisor\tx\ty\tSKIPPED\t
 # must never render the same. A CELL is a box that carries a cell's identity (FLEET_CELL_HOME):
 # `bringup` maps `uname -s = Linux` to platform=cell, so without that marker every Linux dev box and
 # CI runner would get a permanently-red row for a supervisor it does not have (new arm below).
-ROWS="$(run_rows 'FLEET_PLATFORM=cell; FLEET_CELL_HOME=/srv/cell; FLEET_CELL_SUPERVISOR=""; fleet_rows ""')"
+mkdir -p "$T/srvcell"; : > "$T/srvcell/keys.env"
+ROWS="$(run_rows 'FLEET_PLATFORM=cell; FLEET_CELL_HOME="'"$T"'/srvcell"; FLEET_CELL_SUPERVISOR=""; fleet_rows ""')"
 st="$(state_of "$ROWS" cell-supervisor)"
 [ "$st" = "MISSING" ] && ok "§4 on a CELL the same component reads MISSING (absence ≠ not-applicable)" \
                       || bad "§4 on a cell with no supervisor the row should be MISSING, got [$st]"
@@ -970,8 +976,9 @@ ROWS="$(run_rows 'FLEET_PLATFORM=cell; FLEET_CELL_HOME=""; FLEET_CELL_SUPERVISOR
 st="$(state_of "$ROWS" cell-supervisor)"
 [ "$st" = "SKIPPED" ] && ok "§9p a non-cell Linux box reads SKIPPED even when the supervisor script EXISTS" \
                       || bad "§9p a Linux dev box / CI runner must not be red — got [$st]"
-# (b) …and the identity seam the entry point already uses (CELL_HOME) marks it
-CELLH="$T/cellhome"; mkdir -p "$CELLH"
+# (b) …and a PROVISIONED cell home marks it (a bare directory is not evidence: the entry point
+# DEFAULTS CELL_HOME=/tmp/cell-home, which is how this identity test became dead code — cycle-4 review)
+CELLH="$T/cellhome"; mkdir -p "$CELLH"; : > "$CELLH/keys.env"
 # ⛔ CELL_HOME must be in the ENVIRONMENT: the library maps it to FLEET_CELL_HOME when it is SOURCED,
 # so setting it in the eval (after the source) is too late — the same trap `run_rows` cannot express.
 ROWS="$(env FLEET_HOME="$H" FLEET_O="$O" FLEET_AGENT_SCRIPTS="$SCRIPTS" FLEET_AGENT_STATE="$STATE" \
@@ -981,8 +988,15 @@ ROWS="$(env FLEET_HOME="$H" FLEET_O="$O" FLEET_AGENT_SCRIPTS="$SCRIPTS" FLEET_AG
 st="$(state_of "$ROWS" cell-supervisor)"
 [ "$st" = "MISSING" ] && ok "§9p CELL_HOME (the entry point's own seam) marks a cell → supervisor gone is MISSING" \
                       || bad "§9p a cell with no supervisor must be MISSING, got [$st]"
+# (b2) a bare directory with no cell marker is NOT identity — the defaulted path must not make a
+# Linux dev box or CI runner a "cell"
+BAREH="$T/barehome"; mkdir -p "$BAREH"
+ROWS="$(run_rows 'FLEET_PLATFORM=cell; FLEET_CELL_HOME="'"$BAREH"'"; FLEET_CELL_SUPERVISOR="'"$T"'/cloud-cell-supervisor.sh"; fleet_rows ""')"
+st="$(state_of "$ROWS" cell-supervisor)"
+[ "$st" = "SKIPPED" ] && ok "§9p a bare CELL_HOME path is not cell identity (only a PROVISIONED one is)" \
+                      || bad "§9p a defaulted-but-empty cell home must not count as identity — got [$st]"
 # (c) a real cell whose supervisor is missing reads MISSING, not "not a cell"
-ROWS="$(run_rows 'FLEET_PLATFORM=cell; FLEET_CELL_HOME=/srv/cell; FLEET_CELL_SUPERVISOR=/nonexistent.sh; fleet_rows ""')"
+ROWS="$(run_rows 'FLEET_PLATFORM=cell; FLEET_CELL_HOME="'"$T"'/srvcell"; FLEET_CELL_SUPERVISOR=/nonexistent.sh; fleet_rows ""')"
 st="$(state_of "$ROWS" cell-supervisor)"; d="$(detail_of "$ROWS" cell-supervisor)"
 [ "$st" = "MISSING" ] && ok "§9p a cell whose supervisor is GONE reads MISSING (never a SKIPPED pass)" \
                       || bad "§9p a cell with a missing supervisor should be MISSING, got [$st]"
@@ -1034,6 +1048,41 @@ st="$(state_of "$ROWS" heartbeat-loop)"
 [ "$st" = "OK" ] && ok "§9q …and the row is OK afterwards (repair verified by the predicate)" \
                  || bad "§9q the row should be OK after the repair, got [$st] — $(detail_of "$ROWS" heartbeat-loop)"
 pkill -9 -f "$SCRIPTS/heartbeat-loop.sh" 2>/dev/null
+
+# …and the OTHER direction, which the first version of this repair got WRONG: a pidfile naming a live
+# copy running from a DIFFERENT path. The exact-argv predicate cannot see that copy, so "not this path"
+# is not proof of "recycled pid" — deleting the record started a second loop and then reported OK over
+# two of them (a false pass, and the duplicate this file exists to catch).
+say_case "§9q(b) a pidfile naming a live copy at ANOTHER PATH is respected, not deleted"
+seed_quiet_box
+mkdir -p "$T/other"
+cat > "$T/other/heartbeat-loop.sh" <<'OTHER'
+#!/bin/bash
+printf '%s\n' "$$" > "$HEARTBEAT_PIDFILE"
+sleep 300
+OTHER
+chmod +x "$T/other/heartbeat-loop.sh"
+OPID="$(HEARTBEAT_PIDFILE="$STATE/heartbeat-loop.pid" bash "$T/other/heartbeat-loop.sh" >/dev/null 2>&1 & echo $!)"
+timeout_kill() { kill -9 "$1" 2>/dev/null; }
+track "$OPID"
+sleep 0.4
+mk_proc_script "$SCRIPTS/heartbeat-loop.sh"      # the installed copy EXISTS but must not be started
+printf '%s\n' "$(date +%s)" > "$STATE/orchestrator-heartbeat.log"
+ROWS="$(run_rows 'fleet_rows ""')"
+st="$(state_of "$ROWS" heartbeat-loop)"
+[ "$st" = "FAILING" ] && ok "§9q(b) the fixture reads FAILING (the record is not the installed copy)" \
+                      || bad "§9q(b) the fixture should read FAILING, got [$st]"
+OUT="$(run_rows 'fleet_start_component heartbeat-loop' 2>&1)"; SRC=$?
+case "$OUT" in
+  *"another path"*) ok "§9q(b) start REFUSES: the live copy at another path owns the record" ;;
+  *) bad "§9q(b) start did not name the other-path copy — $OUT" ;;
+esac
+[ "$SRC" = 0 ] && ok "§9q(b) start returns 0 (nothing was started, nothing failed)" \
+               || bad "§9q(b) start returned $SRC — $OUT"
+NAPPLIED="$(env FLEET_O="$O" FLEET_HOME="$H" bash -c '. "$1"; fleet_pids_for "$2"' _ "$FLEET_LIB" "$SCRIPTS/heartbeat-loop.sh" | awk 'NF' | wc -l | tr -d ' ')"
+[ "${NAPPLIED:-0}" -eq 0 ] && ok "§9q(b) NO second copy was launched (no manufactured duplicate)" \
+                          || bad "§9q(b) start launched the installed copy beside the other-path one"
+kill -9 "$OPID" 2>/dev/null
 
 # §9r (cycle-3 issue 4) THE CALLER MUST NOT SAY "started" FOR A NO-OP.
 # The verb said "already running — left alone" and the caller then printed "started heartbeat-loop": two

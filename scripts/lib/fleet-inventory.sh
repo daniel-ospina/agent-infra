@@ -258,6 +258,19 @@ _fleet_lock_owner() {
         if (b ~ /^(bash|sh|dash|zsh)$/ && t[2] ~ /(^|\/)orch-loop\.sh$/) print p } }'
 }
 
+# fleet_pid_argv_names <pid> <basename> — does this pid's argv name a script with that BASENAME?
+# Deliberately weaker than `fleet_pids_for` (exact path) and used only to REFUSE a deletion: a live
+# loop run from another path is still this component, and a record it owns must not be removed.
+fleet_pid_argv_names() { # <pid> <basename>
+  local p="${1:-}" base="${2:-}" cmd
+  [ -n "$p" ] && [ -n "$base" ] || return 1
+  cmd="$(fleet_ps_snapshot 2>/dev/null)" || return 1
+  printf '%s\n' "$cmd" | awk -v p="$p" -v b="$base" '
+    $1 != p { next }
+    { for (i=3;i<=NF;i++) { t=$i; sub(/^.*\//, "", t); if (t == b) { found=1; break } } }
+    END { exit(found ? 0 : 1) }'
+}
+
 # fleet_count — distinct pids (sorted, de-duplicated), newline separated.
 fleet_uniq_pids() { awk 'NF && !seen[$0]++'; }
 
@@ -712,6 +725,21 @@ fleet_row_reaper() { # <label> <own-log-name> <script-path>
 # A cell has no launchd: `cloud-cell-supervisor.sh` owns the controller's tmux session. On a Mac
 # this component does not exist, and saying so is the point — "absent" and "not applicable" must not
 # render the same.
+# _fleet_cell_identity — does THIS box carry a cell's identity?
+# ⛔ NOT "is FLEET_CELL_HOME set". The entry point DEFAULTS `CELL_HOME=/tmp/cell-home`, and mapping a
+# default into this seam made every Linux box a "cell" — which is how the identity test in the row
+# became dead code (cycle-4 review). Evidence must be provisioned, not defaulted: the environment
+# variable itself, a keyfile a provisioner mounted, the harness pin, or an explicit state marker.
+_fleet_cell_identity() {
+  [ -f "$FLEET_AGENT_STATE/.cell" ] && return 0
+  [ -n "$FLEET_CELL_HOME" ] || return 1
+  [ -f "$FLEET_CELL_HOME/keys.env" ] || [ -f "$FLEET_CELL_HOME/.harness-path" ] && return 0
+  # A caller that SET the variable has said the box is a cell; the library cannot see whether it was
+  # defaulted, so an existing directory is the weaker-but-explicit alternative and a missing one is not.
+  [ -d "$FLEET_CELL_HOME" ] && [ -n "${FLEET_CELL_HOME_SET:-}" ] && return 0
+  return 1
+}
+
 fleet_row_cell_supervisor() {
   local supervisor="${FLEET_CELL_SUPERVISOR:-}" platform="${FLEET_PLATFORM:-}"
   case "$platform" in
@@ -739,7 +767,7 @@ fleet_row_cell_supervisor() {
   #   (b) `$STATE/.cell` had no writer anywhere in the repo, so a REAL cell whose supervisor was gone
   #       read SKIPPED — told it was "not a cell" — a pass on the component that keeps a cell's
   #       controller alive.
-  if [ -z "$FLEET_CELL_HOME" ] && [ ! -f "$FLEET_AGENT_STATE/.cell" ]; then
+  if ! _fleet_cell_identity; then
     fleet_row cell-supervisor "1 cell supervisor (cell only)" "no cell identity on this box" SKIPPED \
       "the platform reads 'cell' from the kernel alone (Linux; no CELL_HOME and no $FLEET_AGENT_STATE/.cell marker), so this is a dev box or CI runner, not a cell — nothing to check here (NOT a healthy supervisor)"; return 0
   fi
@@ -987,10 +1015,20 @@ fleet_start_component() { # <name>
       # launcher's own pidfile guard ("already running (pid $old)") exits immediately, the read-back
       # fails, and `start` reports a failure that points at the LAUNCHER instead of the pidfile the
       # row names — a diagnosed row left permanently un-repairable.
-      local pf="$FLEET_AGENT_STATE/${name}.pid" pf_pid
+      local pf="$FLEET_AGENT_STATE/${name}.pid" pf_pid pf_base
+      pf_base="${script##*/}"
       if [ -f "$pf" ]; then
         pf_pid="$(tr -dc '0-9' 2>/dev/null < "$pf")"
         if [ -n "$pf_pid" ] && kill -0 "$pf_pid" 2>/dev/null; then
+          if fleet_pid_argv_names "$pf_pid" "$pf_base"; then
+            # ⛔ THE PIDFILE IS *RIGHT*: a live copy of THIS component exists, just not at the path the
+            # row's exact-argv predicate counts. Deleting its record (the first version of this repair)
+            # started a second copy and then reported OK over two loops — a false pass, and the
+            # duplicate that `DUPLICATE` exists to catch (cycle-4 review, measured).
+            FLEET_START_ACTION="not started — $pf names pid $pf_pid, which is running $pf_base from another path, so that copy owns the record; two copies would both run"
+            say "$name: $FLEET_START_ACTION"
+            return 0
+          fi
           rm -f "$pf" && say "$name: removed $pf — it named pid $pf_pid, which is alive but is not $name (a recycled pid)"
         fi
       fi

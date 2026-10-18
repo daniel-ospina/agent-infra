@@ -125,6 +125,7 @@ esac
 # (cloud-cell-supervisor.sh DOES honour `O=` in keys.env) — two surfaces disagreeing about which
 # directory holds the lock is the #1745 class, and it was found in review of #1856.
 O_ENV="${O:-}"
+CELL_HOME_ENV="${CELL_HOME:-}"                 # only the ENVIRONMENT value is evidence of a cell
 CELL_HOME="${CELL_HOME:-/tmp/cell-home}"
 if [ "$PLATFORM" = "cell" ]; then
   # The cell's own home. `cloud-cell-bringup.sh` documents why it is not /home/ubuntu (which does not
@@ -141,6 +142,14 @@ if [ "$PLATFORM" = "cell" ]; then
   # `check` would refuse a perfectly good cell (or worse, a `start` would launch a controller whose
   # every gh call fails). Every read below — gh, git, the registry — must run under the cell's home.
   export HOME="$CELL_HOME"
+  # A cell states its own identity for the inventory: the entry point is the ONE place that knows
+  # whether it is running as a cell (`CELL_HOME` from the environment, or a provisioned cell home).
+  # The default above is a fallback PATH, not proof — exporting it unconditionally made every Linux
+  # box look like a cell and killed the inventory's identity branch (cycle-4 review).
+  case "${CELL_HOME_ENV:-}" in
+    '') : ;;                                     # defaulted: no evidence from the environment
+    *) export FLEET_CELL_HOME="${FLEET_CELL_HOME:-$CELL_HOME}" ;;
+  esac
 else
   ENV_FILE="${ENV_FILE:-$HOME/.config/orchestrator/bringup.env}"
   O="${O:-$HOME/orchestrator}"
