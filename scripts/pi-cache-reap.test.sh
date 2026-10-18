@@ -48,6 +48,7 @@ assert_eq() { if [ "$1" = "$2" ]; then ok "$3"; else bad "$3 (got: $1, want: $2)
 assert_contains() { if grep -qF -- "$2" <<<"$1"; then ok "$3"; else bad "$3 (missing: $2)"; fi }
 assert_not_contains() { if grep -qF -- "$2" <<<"$1"; then bad "$3 (unexpected: $2)"; else ok "$3"; fi }
 assert_le() { if [ "${1:-x}" -le "${2:-y}" ] 2>/dev/null; then ok "$3"; else bad "$3 (got: ${1:-?}, want <= ${2:-?})"; fi }
+assert_ne() { if [ "$1" = "$2" ]; then bad "$3 (got: $1, which is exactly what it must not be)"; else ok "$3"; fi }
 
 T="$(mktemp -d "${TMPDIR:-/tmp}/pi-cache-reap-test.XXXXXX")"
 trap 'rm -rf "$T"' EXIT
@@ -156,6 +157,15 @@ cat >"$T/bin/uv-fail" <<'SH'
 #!/bin/sh
 exit 1
 SH
+# ps stub that answers `-o lstart=` with a FIXED string: the lock's holder-identity check reads
+# the process start time, and the other stubs answer every invocation with the same two rows.
+cat >"$T/bin/ps-lstart" <<'SH'
+#!/bin/sh
+case "$*" in
+  *lstart*) printf '%s\n' "Sun Jan  1 00:00:00 2023"; exit 0 ;;
+esac
+printf '%s\n' "    1 /sbin/init" "  222 bash -l"
+SH
 # du: a cache with one unreadable subdirectory still prints a NUMERIC partial total and
 # exits 1 (measured: `16` for a 3016KiB tree). Accepting that number reports a cache as
 # bounded while most of it was never seen.
@@ -176,6 +186,7 @@ run_reap() { # run_reap <home> <mode> [extra env assignments...]
         CACHE_REAP_DF="${DF_STUB:-$T/bin/df-gain}" \
         CACHE_REAP_UV="${UV_STUB:-$T/bin/uv-noprune}" \
         CACHE_REAP_NPM="${UV_STUB:-$T/bin/uv-noprune}" \
+        CACHE_REAP_MOUNTINFO="${MOUNTINFO:-}" \
         CACHE_REAP_PIP="${UV_STUB:-$T/bin/uv-noprune}" \
         "$@" \
         bash "$REAPER" "$mode"
@@ -187,15 +198,15 @@ new_cache "$H/.cache/uv" 3000 2000
 new_cache "$H/.npm/_cacache" 2600
 new_cache "$H/.cache/pip" 2400
 new_cache "$H/.cache/keepme" 10
-UV_BEFORE="$(kb "$H/.cache/uv")"; NPM_BEFORE="$(kb "$H/.npm/_cacache")"; PIP_BEFORE="$(kb "$H/.cache/pip")"
+UV_BEFORE="$(kb "$H/.cache/uv")"; NPM_BEFORE="$(kb "$H/.npm")"; PIP_BEFORE="$(kb "$H/.cache/pip")"
 OUT="$(run_reap "$H" --apply 2>&1)"; RC=$?
 assert_eq "$RC" "0" "an armed pass over three over-bound caches exits 0 (shrink verified)"
 assert_le "$(kb "$H/.cache/uv")" "$BOUND_KB" "uv cache is UNDER the ${BOUND_MB}MB bound after the pass (a reaper that is not invoked leaves it over)"
-assert_le "$(kb "$H/.npm/_cacache")" "$BOUND_KB" "npm cache is UNDER the bound after the pass"
+assert_le "$(kb "$H/.npm")" "$BOUND_KB" "the npm cache ROOT is UNDER the bound after the pass (the bound covers _cacache, _npx and _logs, not only _cacache)"
 assert_le "$(kb "$H/.cache/pip")" "$BOUND_KB" "pip cache is UNDER the bound after the pass"
 [ "$(kb "$H/.cache/uv")" -lt "$UV_BEFORE" ] && ok "uv cache strictly SHRANK ($(( UV_BEFORE / 1024 ))MB -> $(( $(kb "$H/.cache/uv") / 1024 ))MB)" \
                                            || bad "uv cache did not shrink at all ($UV_BEFORE KB)"
-[ "$(kb "$H/.npm/_cacache")" -lt "$NPM_BEFORE" ] && ok "npm cache strictly SHRANK" || bad "npm cache did not shrink"
+[ "$(kb "$H/.npm")" -lt "$NPM_BEFORE" ] && ok "npm cache strictly SHRANK" || bad "npm cache did not shrink"
 [ "$(kb "$H/.cache/pip")" -lt "$PIP_BEFORE" ] && ok "pip cache strictly SHRANK" || bad "pip cache did not shrink"
 assert_contains "$OUT" "VERIFIED" "the pass says the shrink is VERIFIED"
 assert_contains "$OUT" "->" "the pass logs the before/after in one line (| -> |)"
@@ -461,7 +472,7 @@ OUT="$(env HOME="$H" CACHE_REAP_UV_DIR="$H/.cache/uv" CACHE_REAP_MAX_MB=2048 bas
 assert_eq "$RC" "0" "--print-config exits 0"
 assert_contains "$OUT" "bound_mb=2048" "--print-config reports the bound the reaper will enforce"
 assert_contains "$OUT" "cache=uv:$H/.cache/uv" "--print-config reports the uv cache the reaper will bound"
-assert_contains "$OUT" "cache=npm:$H/.npm/_cacache" "--print-config reports the npm cache"
+assert_contains "$OUT" "cache=npm:$H/.npm" "--print-config reports the npm cache ROOT (the tool's own answer: _cacache's siblings _npx/_logs are unbounded trees too)"
 assert_contains "$OUT" "cache=pip:$H/.cache/pip" "--print-config reports the pip cache"
 assert_contains "$OUT" "bound_source=" "--print-config says WHERE the bound came from (a plist-tuned bound is not this process's env)"
 assert_contains "$(cat "$BRINGUP")" "--print-config" "the cell's report reads the bound from the reaper, not from a second literal"
@@ -530,6 +541,114 @@ ln -sfn /etc/hostname "$H/.cache/uv/$(printf 'x\npi-cache-reap: npm VERIFIED evi
 OUT="$(run_reap "$H" --apply 2>&1)"; RC=$?
 assert_eq "$RC" "3" "a name that cannot be represented fails the pass closed, symlink or not"
 assert_not_contains "$OUT" "pi-cache-reap: npm VERIFIED evicted=999" "the forged log line never reached the log"
+
+echo
+echo "── 9i. a cache dir that is a SYMLINK is measured THROUGH the link ──"
+H="$T/h9i"
+mkdir -p "$H/.cache" "$H/bigdisk"
+new_cache "$H/bigdisk/uv" 3000 2000
+ln -sfn "$H/bigdisk/uv" "$H/.cache/uv"
+BIG_BEFORE="$(kb "$H/bigdisk/uv")"
+OUT="$(run_reap "$H" --apply 2>&1)"; RC=$?
+assert_eq "$RC" "0" "a symlinked (relocated) cache is bounded, not reported as 0KB/under bound"
+assert_contains "$OUT" "$H/bigdisk/uv" "the verdict names the RESOLVED tree (the link itself measures 0)"
+assert_le "$(kb "$H/bigdisk/uv")" "$BOUND_KB" "the real tree behind the symlink came UNDER the bound"
+[ "$(kb "$H/bigdisk/uv")" -lt "$BIG_BEFORE" ] && ok "the tree behind the symlink SHRANK (du/find on a link argument see nothing, so this used to exit 0 over the bound)" \
+                                            || bad "the tree behind the symlink did not shrink"
+
+echo
+echo "── 9j. a MOUNT inside the cache is never deleted THROUGH (same-device bind mounts too) ──"
+H="$T/h9j"
+new_cache "$H/.cache/uv" 500
+mkdir -p "$H/.cache/uv/precious"; dd if=/dev/zero of="$H/.cache/uv/precious/important.db" bs=1024 count=3000 2>/dev/null
+PRECIOUS_BEFORE="$(md5sum "$H/.cache/uv/precious/important.db" | cut -d' ' -f1)"
+: >"$T/mountinfo"
+printf '1 0 8:1 / %s rw - ext4 /dev/sda1 rw\n' "/" >>"$T/mountinfo"
+printf '2 0 8:1 / %s rw - ext4 /dev/sda1 rw\n' "$H/.cache/uv/precious" >>"$T/mountinfo"
+OUT="$(MOUNTINFO="$T/mountinfo" run_reap "$H" --apply 2>&1)"; RC=$?
+assert_eq "$(md5sum "$H/.cache/uv/precious/important.db" | cut -d' ' -f1)" "$PRECIOUS_BEFORE" \
+    "the tree under a mount point inside the cache is UNTOUCHED (st_dev cannot see a same-device bind mount, so -xdev walks through it)"
+assert_contains "$(cat "$H/reap.log" 2>/dev/null)" "THROUGH a mount" "the log says WHY the entry was kept"
+assert_contains "$OUT" "preserved" "the verdict reports the preservation rather than claiming a full bound"
+
+echo
+echo "── 9k. a target that cannot be a cache is refused (a mis-set seam is not a delete order) ──"
+H="$T/h9k"
+mkdir -p "$H/precious"; dd if=/dev/zero of="$H/precious/db" bs=1024 count=3000 2>/dev/null
+BEFORE="$(md5sum "$H/precious/db" | cut -d' ' -f1)"
+OUT="$(env HOME="$H" CACHE_REAP_MAX_MB=2 CACHE_REAP_UV_DIR="$H/precious" CACHE_REAP_NPM_DIR="$H/none" \
+        CACHE_REAP_PIP_DIR="$H/none2" CACHE_REAP_PIP_DIR_MAC="$H/none3" CACHE_REAP_LOG="$H/log" \
+        CACHE_REAP_PS="$T/bin/ps-idle" CACHE_REAP_DF="$T/bin/df-gain" CACHE_REAP_UV="$T/bin/uv-noprune" \
+        CACHE_REAP_NPM="$T/bin/uv-noprune" CACHE_REAP_PIP="$T/bin/uv-noprune" \
+        bash "$REAPER" --apply 2>&1)"; RC=$?
+assert_eq "$RC" "3" "a non-cache-shaped target exits 3 instead of pruning it"
+assert_eq "$(md5sum "$H/precious/db" | cut -d' ' -f1)" "$BEFORE" "nothing inside the mis-set target was deleted"
+OUT="$(env HOME="$H" CACHE_REAP_MAX_MB=2 CACHE_REAP_UV_DIR="$H" CACHE_REAP_NPM_DIR="$H/none" \
+        CACHE_REAP_PIP_DIR="$H/none2" CACHE_REAP_PIP_DIR_MAC="$H/none3" CACHE_REAP_LOG="$H/log" \
+        CACHE_REAP_PS="$T/bin/ps-idle" CACHE_REAP_DF="$T/bin/df-gain" CACHE_REAP_UV="$T/bin/uv-noprune" \
+        CACHE_REAP_NPM="$T/bin/uv-noprune" CACHE_REAP_PIP="$T/bin/uv-noprune" \
+        bash "$REAPER" --apply 2>&1)"; RC=$?
+assert_eq "$RC" "3" "a target that IS \$HOME is refused even when its basename looks cache-shaped"
+[ -f "$H/precious/db" ] && ok "\$HOME survived the refused pass" || bad "\$HOME was pruned"
+
+echo
+echo "── 9l. a lock whose pid was RECYCLED does not pin the reaper for ever ──"
+H="$T/h9l"
+new_cache "$H/.cache/uv" 3000 2000
+LOCK_DIR="$H/.pi/agent/state/pi-cache-reap.lock"
+mkdir -p "$LOCK_DIR"
+# The owner pid must be one this user can signal: the test shell's own (it is alive throughout).
+printf '%s\n' "$$" >"$LOCK_DIR/owner"; printf '%s\n' "$(( $(date +%s) - 99999 ))" >"$LOCK_DIR/started"
+printf 'Thu Jan  1 00:00:00 1970\n' >"$LOCK_DIR/lstart"   # not this process's start time
+OUT="$(PS_STUB="$T/bin/ps-lstart" run_reap "$H" --apply 2>&1)"; RC=$?
+assert_ne "$RC" "4" "a recycled owner pid is treated as stale, not as a running pass (exit 4 pins the reaper for ever)"
+assert_contains "$(cat "$H/reap.log" 2>/dev/null)" "RECYCLED" "the pass says why it broke a lock whose owner is alive"
+mkdir -p "$LOCK_DIR"   # the pass above released its own lock
+printf '%s\n' "$$" >"$LOCK_DIR/owner"; printf '%s\n' "$(( $(date +%s) - 5 ))" >"$LOCK_DIR/started"
+printf '%s\n' "Sun Jan  1 00:00:00 2023" >"$LOCK_DIR/lstart"
+OUT="$(PS_STUB="$T/bin/ps-lstart" run_reap "$H" --apply 2>&1)"; RC=$?
+assert_eq "$RC" "4" "a lock whose owner pid AND start time match is honoured (exit 4, the pass does not run)"
+
+echo
+echo "── 9m. a stale BREAK TOKEN is cleared (it used to wedge the lock for ever) ──"
+H="$T/h9m"
+new_cache "$H/.cache/uv" 3000 2000
+LOCK_DIR="$H/.pi/agent/state/pi-cache-reap.lock"
+mkdir -p "$LOCK_DIR" "$LOCK_DIR.break"
+printf '999999\n' >"$LOCK_DIR/owner"; printf '1\n' >"$LOCK_DIR/started"
+touch -t 200001010000 "$LOCK_DIR.break"
+OUT="$(PS_STUB="$T/bin/ps-lstart" run_reap "$H" --apply 2>&1)"; RC=$?
+assert_ne "$RC" "4" "a breaker that died does not pin the lock for ever"
+assert_contains "$(cat "$H/reap.log" 2>/dev/null)" "stale break token" "the pass says it cleared the abandoned token"
+
+echo
+echo "── 9n. npx's package trees are inside the bound, not beside it ──"
+H="$T/h9n"
+new_cache "$H/.npm/_cacache" 10
+mkdir -p "$H/.npm/_npx/hash/node_modules"; dd if=/dev/zero of="$H/.npm/_npx/hash/node_modules/blob" bs=1024 count=3000 2>/dev/null
+OUT="$(run_reap "$H" --apply 2>&1)"; RC=$?
+assert_eq "$RC" "0" "the npm ROOT is bounded"
+assert_le "$(kb "$H/.npm")" "$BOUND_KB" "~/.npm/_npx came under the bound (bounding only _cacache reported 'absent' and left it)"
+
+echo
+echo "── 10b. the armed remedy READS the reaper's exit status (executed, not grepped) ──"
+# The supervisor's low-disk prune is the only ARMED caller, and the reaper has five exit codes.
+# Grepping the supervisor's source proves nothing about the mapping, so this executes the SHIPPED
+# bytes of cache_reaper_path()/reap_global_caches() with a stub reaper and watches what reaches
+# the operator.
+H="$T/h10b"; mkdir -p "$H"
+awk '/^cache_reaper_path\(\)/,/^}/' "$SUPERVISOR" >"$H/fn.sh"
+awk '/^reap_global_caches\(\)/,/^}/' "$SUPERVISOR" >>"$H/fn.sh"
+grep -q 'reap_global_caches()' "$H/fn.sh" || bad "could not extract reap_global_caches() from the supervisor (the test needs the SHIPPED bytes)"
+for want in 0 4 5 3; do
+    printf '#!/bin/sh\nexit %s\n' "$want" >"$H/pi-cache-reap.sh"
+    chmod +x "$H/pi-cache-reap.sh"
+    out="$(env HOME="$H" bash -c 'say() { printf "%s\n" "$*"; }; . "$1"; reap_global_caches' _ "$H/fn.sh" 2>&1)"
+    case "$want" in
+        0|4|5) assert_not_contains "$out" "warn:" "exit $want is NOT a failure: no warning is raised (4 = did not run, 5 = over bound and not acted on)" ;;
+        3)     assert_contains "$out" "warn: the cache reaper exited 3" "a fail-closed pass (exit 3) DOES warn, naming the status and the log" ;;
+    esac
+done
 
 echo
 echo "── 10. wiring: a bound no box runs is the defect ──"

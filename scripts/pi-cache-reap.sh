@@ -375,6 +375,19 @@ ps_matches() {
     esac
 }
 
+# lstart_of <pid> — the process start time as the OS prints it, or rc 1 when ps cannot answer.
+# The lock stores the HOLDER's own lstart, so a later pass can tell "the process that took the
+# lock is still alive" from "its pid was recycled by an unrelated live process". Without that,
+# a single dead pass pins the reaper for ever: measured, a lock whose owner pid was long dead but
+# recycled printed "another pass is running (pid …, 1792295491s)" and exited 4 on every tick —
+# and every caller reads 4 as silence (#1987 review).
+lstart_of() {
+    local l
+    l="$("${PS_BIN:-ps}" -o lstart= -p "$1" 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')" || return 1
+    [ -n "${l:-}" ] || return 1
+    printf '%s' "$l"
+}
+
 # dev_of <path> — the device id owning <path> (stat's portable spelling differs by OS).
 dev_of() {
     local d
@@ -383,9 +396,43 @@ dev_of() {
     printf '%s' "$d"
 }
 
-# same_device <entry> <cache-dir> — rc 0 same fs · rc 1 different fs (a MOUNT inside
-# the cache) · rc 2 undecidable. Never delete THROUGH a mount: `rm -rf` on a bind/FUSE
-# mount point inside the cache recurses into whatever is mounted there.
+# ⛔ st_dev CANNOT SEE EVERY MOUNT. A bind mount, a btrfs subvolume and an APFS volume mounted
+# with the same device id all report the cache's own st_dev, and `find -xdev` descends through
+# them. Measured with `unshare -rm`: a same-device bind mount of a 6MB directory inside the cache
+# was emptied THROUGH the mount and the pass printed VERIFIED / exit 0. So the mount TABLE is the
+# first check and `-xdev` is only the second belt.
+read_mount_table() {
+    if [ -n "${CACHE_REAP_MOUNTINFO:-}" ] && [ -r "${CACHE_REAP_MOUNTINFO}" ]; then
+        MOUNT_POINTS="$(awk '{ p=$5; gsub(/\\040/," ",p); print p }' "$CACHE_REAP_MOUNTINFO" 2>/dev/null)" || { MOUNTS_RC=2; return 2; }
+    elif [ -r /proc/self/mountinfo ]; then
+        MOUNT_POINTS="$(awk '{ p=$5; gsub(/\\040/," ",p); gsub(/\\011/,"\t",p); gsub(/\\134/,"\\\\",p); print p }' /proc/self/mountinfo 2>/dev/null)" || { MOUNTS_RC=2; return 2; }
+    elif mount >/dev/null 2>&1; then
+        MOUNT_POINTS="$(mount 2>/dev/null | sed -n 's/.* on \(.*\) ([^()]*)$/\1/p')" || { MOUNTS_RC=2; return 2; }
+    else
+        MOUNTS_RC=2; return 2
+    fi
+    [ -n "${MOUNT_POINTS:-}" ] || { MOUNTS_RC=2; return 2; }
+    MOUNTS_RC=0; return 0
+}
+
+# mount_at_or_below <path> — rc 0 = the mount table has a mount point at or below <path>
+# (deleting it would reach through the mount) · rc 1 = no mount point there · rc 2 = the
+# table could not be read, so "no mount" cannot be claimed.
+mount_at_or_below() {
+    local root="$1" p
+    [ "${MOUNTS_RC:-2}" = 0 ] || return 2
+    while IFS= read -r p; do
+        [ -n "$p" ] || continue
+        case "$p" in "$root"|"$root"/*) return 0 ;; esac
+    done <<MOUNTEOF
+$MOUNT_POINTS
+MOUNTEOF
+    return 1
+}
+
+# same_device <entry> <cache-dir> — rc 0 same fs · rc 1 different fs · rc 2 undecidable.
+# The SECOND belt behind the mount table (see read_mount_table): it catches the cheap case
+# (a different-device mount) without reading the table, and it cannot see the expensive one.
 same_device() {
     local a b
     a="$(dev_of "$1")" || return 2
@@ -463,12 +510,46 @@ entries_by_size() {
     return 0
 }
 
+# guard_target <class> <dir> — rc 0 the target can be a package cache · rc 1 refused (reported).
+# ⛔ The env seams are honoured, so a mis-set seam names an ARBITRARY directory — and `uv cache
+# prune` pointed at one deletes it (measured: `UV_CACHE_DIR=/tmp/rp5 uv cache prune` removed
+# `mystuff/` and `keep.txt`). Measured end-to-end with the seam set to $HOME: the pass reported
+# "$HOME 40MB -> 4KB … VERIFIED", deleted $HOME/precious — and then deleted its own state dir, so
+# every later log line failed silently. The seams stay usable for the suite because a cache-shaped
+# directory passes; what is refused is a target that cannot be a cache at all.
+guard_target() {
+    local class="$1" dir="$2" b st
+    b="$(basename "$dir")"
+    if [ "$dir" = "/" ]; then
+        fail_closed "$class: refusing to bound '/' — a cache is never the filesystem root"
+        return 1
+    fi
+    if [ -n "${HOME:-}" ]; then
+        case "${HOME}/" in
+            "$dir"/*) fail_closed "$class: refusing to bound $dir — it is $HOME or an ancestor of it (deleting here destroys the user's home, not a cache)"
+                      return 1 ;;
+        esac
+    fi
+    for st in "${LOG:-}" "${LOCK_DIR:-}"; do
+        [ -n "$st" ] || continue
+        case "$(dirname "$st")/" in
+            "$dir"/*) fail_closed "$class: refusing to bound $dir — it contains this reaper's own state directory ($(dirname "$st")); a prune here deletes the lock and the log mid-pass"
+                      return 1 ;;
+        esac
+    done
+    case "$b" in
+        uv|.uv|uv-*|npm|.npm|_npm*|_cacache|_npx|pip|.pip|pip-*|*cache*|cache|.cache) return 0 ;;
+    esac
+    fail_closed "$class: refusing to bound $dir — its name ('$b') is not cache-shaped, so it is almost certainly a mis-set CACHE_REAP_*_DIR/UV_CACHE_DIR/XDG_CACHE_HOME rather than a package cache (a prune on it deletes whatever is there)"
+    return 1
+}
+
 # reap_target <class> <dir> — bound ONE cache. Prints exactly one verdict line.
 reap_target() {
     local class="$1" dir="$2" before_kb before_free_kb now_kb new_kb after_kb after_free_kb
     local pruned=none evicted=0 kb e cur_free holders dir_holders held_entries="" keep_entries=""
     local no_gain_stop=0 no_gain=0 last_free="" claimed_kb gained_kb min_gain_kb stop_note=""
-    local dev_rc share_rc fresh_holders free_str parent
+    local dev_rc share_rc fresh_holders free_str parent mnt_rc resolved
 
     case "$dir" in
         /*) ;;
@@ -488,6 +569,19 @@ reap_target() {
         return 0
     fi
     [ -d "$dir" ] || { fail_closed "$class: $dir exists but is not a directory"; return 0; }
+    # ⛔ A cache dir that is itself a SYMLINK measures 0: `du -sk <link>` stats the link, not the
+    # tree, and `find <link> -mindepth 1` yields nothing. So the standard "move the cache to a
+    # bigger disk" idiom — `ln -s /mnt/big/uv ~/.cache/uv` — made an over-bound cache report
+    # "0KB <= bound — no action" and the pass EXIT 0 in both modes, and `uv cache dir` hands back
+    # the symlink spelling, so this is the path the script's own rule receives. Resolve once and
+    # use the canonical path for sizing, enumeration, containment and df.
+    resolved="$(cd "$dir" 2>/dev/null && pwd -P)" || resolved=""
+    if [ -z "$resolved" ]; then
+        fail_closed "$class: $dir exists but cannot be resolved to a real directory (cd failed) — refusing to size a cache at 0"
+        return 0
+    fi
+    dir="$resolved"
+    guard_target "$class" "$dir" || return 0
 
     before_kb="$(kb_of "$dir")" \
         || { fail_closed "$class: cannot measure $dir (du failed) — the bound cannot be enforced"; return 0; }
@@ -534,6 +628,7 @@ reap_target() {
             fail_closed "$class: $dir is $(mb_str "$now_kb") > ${MAX_MB}MB and a live $class process is running, so the entries it holds cannot be known — NOT escalating; process(es): $holders (the cache is shared, so any live $class on this box may be resolving against it)"
             return 0
         fi
+        read_mount_table || MOUNTS_RC=2   # read once per cache; rc 2 => every entry is refused
         if ! entries_by_size "$dir" "$TMPLIST2"; then
             fail_closed "$class: $dir is $(mb_str "$now_kb") > ${MAX_MB}MB but one of its entries could not be measured — refusing to evict a cache we cannot size"
             return 0
@@ -569,6 +664,17 @@ reap_target() {
                 held_entries="${held_entries:+$held_entries, }$e"
                 plog "pi-cache-reap:   preserving $e — a live process names it"
                 continue
+            fi
+            # The mount table FIRST: a same-device bind mount is invisible to st_dev, and
+            # `find -xdev` walks straight through it (measured, see read_mount_table).
+            mount_at_or_below "$e"; mnt_rc=$?
+            if [ "$mnt_rc" -eq 0 ]; then
+                keep_entries="${keep_entries:+$keep_entries, }$e"
+                plog "pi-cache-reap:   preserving $e — the mount table holds a mount point at or below it; nothing is deleted THROUGH a mount"
+                continue
+            elif [ "$mnt_rc" -ne 1 ]; then
+                fail_closed "$class: cannot read the mount table, so it cannot be shown that $e holds no mount — refusing to delete"
+                break
             fi
             same_device "$e" "$dir"; dev_rc=$?
             if [ "$dev_rc" -eq 1 ]; then
@@ -682,7 +788,7 @@ lock_release() {
     return 0
 }
 lock_acquire() {
-    local owner started now age mtime
+    local owner started now age mtime held_lstart now_lstart break_age bm
     # rc 3 when the lock cannot exist at all (unusable state dir): that is fail-closed, NOT a
     # benign "another pass holds it". Suppressing this made an unwritable state dir look like a
     # skip forever — the reaper never ran and every surface reported success-by-silence.
@@ -712,8 +818,14 @@ lock_acquire() {
         # can outlast the trigger period, and breaking it re-creates the double-pass this lock
         # exists to prevent). Only an unverifiable owner is subject to the age bound.
         if is_pos_int "$owner" && kill -0 "$owner" 2>/dev/null; then
-            say "pi-cache-reap: another pass is running (pid $owner, ${age}s) — this one does not run ($ISSUE_REF)"
-            return 1
+            held_lstart="$(cat "$LOCK_DIR/lstart" 2>/dev/null || printf '')"
+            now_lstart=" $(lstart_of "$owner" 2>/dev/null || printf '')"; now_lstart="${now_lstart# }"
+            if [ -n "$held_lstart" ] && [ -n "$now_lstart" ] && [ "$held_lstart" != "$now_lstart" ]; then
+                plog "pi-cache-reap: lock owner pid $owner is a RECYCLED pid (start time '$now_lstart' != '$held_lstart') — treating the lock as stale"
+            else
+                say "pi-cache-reap: another pass is running (pid $owner, ${age}s) — this one does not run ($ISSUE_REF)"
+                return 1
+            fi
         fi
         if [ "$age" -lt "$LOCK_STALE_SECONDS" ]; then
             say "pi-cache-reap: lock held (owner=${owner:-?} age ${age}s, owner unverifiable) — this pass does not run"
@@ -725,8 +837,19 @@ lock_acquire() {
         # breaker deletes the fresh lock the winner just created (reproduced). One process wins
         # the break token; the loser does not run.
         if ! mkdir "$LOCK_DIR.break" 2>/dev/null; then
-            say "pi-cache-reap: another pass is already clearing a stale lock — this one does not run"
-            return 1
+            # ⛔ A breaker that died while holding the token wedges the lock FOR EVER, and every
+            # caller reads exit 4 as silence. Age the token out on the lock's own bound.
+            bm="$(/bin/date -r "$LOCK_DIR.break" +%s 2>/dev/null || printf '')"
+            break_age=""
+            if is_pos_int "$bm" && is_pos_int "$now" && [ "$now" -ge "$bm" ]; then break_age=$(( now - bm )); fi
+            if [ -n "$break_age" ] && [ "$break_age" -ge "$LOCK_STALE_SECONDS" ]; then
+                plog "pi-cache-reap: clearing a stale break token (age ${break_age}s)"
+                rmdir "$LOCK_DIR.break" 2>/dev/null || true
+            fi
+            if ! mkdir "$LOCK_DIR.break" 2>/dev/null; then
+                say "pi-cache-reap: another pass is already clearing a stale lock — this one does not run"
+                return 1
+            fi
         fi
         # Re-read under the token: the lock may have been replaced while we were deciding.
         if [ -d "$LOCK_DIR" ] && [ "$(cat "$LOCK_DIR/started" 2>/dev/null)" = "$started" ]; then
@@ -746,6 +869,7 @@ lock_acquire() {
     fi
     printf '%s\n' "$$" >"$LOCK_DIR/owner" 2>/dev/null || true
     printf '%s\n' "$(now_epoch)" >"$LOCK_DIR/started" 2>/dev/null || true
+    lstart_of "$$" >"$LOCK_DIR/lstart" 2>/dev/null || true
     LOCK_HELD=1
     return 0
 }
@@ -814,16 +938,18 @@ resolve_uv_dir() {
     printf '%s' "${UV_CACHE_DIR:-${XDG_CACHE_HOME:-${HOME:-}/.cache}/uv}"
 }
 
-# npm answers with the cache ROOT; the directory this script bounds is its `_cacache` child
-# (prune_cache already special-cases that basename).
+# npm answers with the cache ROOT, and the ROOT is what is bounded — not its `_cacache` child:
+# `~/.npm/_npx` (npx's package trees, 62MB on this box from a handful of runs) and `_logs` sit
+# beside `_cacache`, so bounding the child reported "absent (nothing to bound)" for a box whose
+# npm cache was the sink. prune_cache still special-cases the `_cacache` basename.
 resolve_npm_dir() {
     local d
     if [ -n "${CACHE_REAP_NPM_DIR:-}" ]; then printf '%s' "$CACHE_REAP_NPM_DIR"; return 0; fi
     if command -v "$NPM_BIN" >/dev/null 2>&1; then
         d="$("$NPM_BIN" config get cache 2>/dev/null | tail -1)"
-        case "${d:-}" in /*) printf '%s' "$d/_cacache"; return 0 ;; esac
+        case "${d:-}" in /*) printf '%s' "$d"; return 0 ;; esac
     fi
-    printf '%s' "${HOME:-}/.npm/_cacache"
+    printf '%s' "${HOME:-}/.npm"
 }
 
 # `pip cache dir` also resolves the macOS ~/Library/Caches/pip case, which the separate

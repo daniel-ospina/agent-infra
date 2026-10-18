@@ -441,7 +441,7 @@ check_operational_layer() {
 # that is working fine on a large disk. Measured on pi-cell-3: 258MB free, `~/.cache/uv` alone
 # 7.1GB — every dispatch refused, and nothing on the box reported the cache as the cause.
 check_caches() {
-  local d kb total=0 listed="" maxmb=2048 bound over=0 measured du_rc cfg line reaper
+  local d kb total=0 listed="" maxmb=2048 bound over=0 measured du_rc cfg line reaper real_d
   # A NEWLINE-SEPARATED list, not an array: bash 3.2 (the macOS default) treats `${#arr[@]}` on an
   # empty array as an unbound-variable error under `set -u`.
   local dirs_list="" bound_source=default
@@ -484,6 +484,18 @@ check_caches() {
     if [ ! -d "$d" ]; then
       listed="$listed, $(basename "$(dirname "$d")")/$(basename "$d")=absent"
       continue
+    fi
+    # A cache dir that is itself a SYMLINK (the "move it to a bigger disk" idiom) measures 0:
+    # `du -sk <link>` stats the link, not the tree. Resolve it first, or this report reads
+    # "0MB on a 7.1GB cache" — the very blind spot the check exists to remove.
+    if [ -L "$d" ]; then
+      real_d="$(cd "$d" 2>/dev/null && pwd -P)" || real_d=""
+      if [ -z "$real_d" ]; then
+        warn "cache $d: is a symlink that cannot be resolved — the size cannot be measured"
+        listed="$listed, $d=unresolvable"
+        continue
+      fi
+      d="$real_d"
     fi
     # A cache that cannot be measured is REPORTED as unmeasurable — never as 0, which would read
     # as "nothing to see" for the one number this check exists to surface. `du`'s STATUS decides:
