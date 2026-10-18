@@ -283,6 +283,24 @@ own `pi` workers, which do not go through `task`.
 | a collision pre-flight tool | `refresh-candidates.sh` refuses overlapping dispatches | resolved **per repo** (agent-infra#1736): the target repo's own `tools/collision_preflight.py`, else a tortoise checkout (`TORTOISE_REPO`, or its legacy `TORTOISE` alias). The tool requires **Python >= 3.12** and refuses an older interpreter with exit 3 and no verdict, so the selected interpreter (scout venv, or a bare `python3` when there is no `pyproject.toml`) is version-gated: `--check` and the refresh both refuse a too-old one (permanent `rc=3`) instead of queueing nothing in silence. `SCOUT_PY` pins the interpreter, like `SCOUT_UV` pins `uv`. Put `TORTOISE_REPO` in `keys.env` — the controller session re-sources it, while an ambient-only export does not reach a pre-existing tmux server |
 | `.worktrees/` gitignored in the target repo | worktrees are created under it | `git check-ignore .worktrees` |
 
+**`cmux` is a macOS-shaped dependency with an explicit CELL story, not an implied one (agent-infra#2051).**
+The collision pre-flight's `issue assignee/holder` surface reads lane liveness from the fleet board,
+whose only source is `cmux sessions list --json --all`; when cmux cannot run, that surface is
+INCOMPLETE and the refresh aborts by design (#1736) — `candidates.txt` stays at 0 while the controller
+reports RUNNING. On a Mac, `install.sh` bakes the app-bundle directory into the daemon PATH and
+`refresh-candidates.sh`'s `resolve_cmux()` repairs an already-running deployment's own PATH. **Neither
+applies on a Linux cell**: it has no cmux CLI, and `install.sh`'s probe deliberately skips a box with
+no cmux (`command -v "$bin" || continue`), so the install succeeds, bakes nothing, and the cell
+reproduces the same drained backlog. Nothing refuses that cell — a cell may legitimately serve a board
+another box measured, and the abort guard (not the read-only probe) owns "a pass judged nothing" — but
+it is no longer silent: `--check` prints `CHECK NOT PROVISIONABLE: cmux …` instead of `CHECK OK` (its
+rc stays 0, see the block comment in `refresh-candidates.sh`), and the cell's own seam is
+`CMUX_BIN_DIR`, the only candidate a non-macOS box can satisfy. **Declared residual:**
+`cloud-cell-supervisor.sh`'s `cmd_check` reads that probe's EXIT CODE and then prints
+`ok: dispatch provisioning — this repo can be pre-flighted` unconditionally, so on a cell that summary
+line still contradicts the NOT PROVISIONABLE text printed just above it; branching it on the same
+marker is the follow-up.
+
 **`cloud-cell-supervisor.sh check` vouches only for what it actually probes, and refuses to certify
 a cell missing any of them: `tmux`, an authenticated `gh`, `git`, `python3`, `pi`, a cloned repo
 whose `origin` remote names the SAME repo the queue dispatches (`OR` is derived from it; a mismatch,

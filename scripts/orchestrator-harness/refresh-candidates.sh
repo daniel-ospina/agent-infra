@@ -247,6 +247,34 @@ resolve_preflight() {   # sets PREFLIGHT to the resolved tool path; returns 1 if
 # copy, and it is what makes this resolver hermetically testable (a sandbox HOME), which is the only
 # way a regression test can pin "the controller's PATH has no cmux" without the host's own cmux
 # answering for it.
+#
+# ⛔⛔ THE CELL STORY, STATED RATHER THAN IMPLIED (#2051 review finding 11). Every candidate below
+# except `$CMUX_BIN_DIR` is a macOS APP BUNDLE path, so this repair is a Mac-shaped repair and it buys
+# a cell NOTHING. On a Linux cell the state is:
+#   * `command -v cmux` fails — the CLI ships inside the Mac app bundle, not in a cell image;
+#   * `install.sh`'s probe SKIPS a box with no cmux (`command -v "$bin" || continue`), so the install
+#     SUCCEEDS and bakes nothing into the daemon PATH — by its own rule, "a box with NO cmux never
+#     reaches here", which with `harness.sh`'s own comment ("a cell may legitimately serve a SHARED
+#     board it did not build") is the cell's normal shape, not a misconfiguration;
+#   * `resolve_cmux` returns 1, `CMUX_HINT=1`, and EVERY pass still aborts `judged NOTHING` — the SAME
+#     drained backlog this commit exists to end, on a cell, with the controller alive and `lanes: 1`.
+# So on a cell the backlog is drained for the SAME reason and by the SAME mechanism, and NOTHING in
+# the cell's own logs said so before this change. Two parts of the story are therefore deliberate:
+#   1. `--check` NAMES it and REFUSES TO CERTIFY (below): that is the cell's surfacing surface, since
+#      `cloud-cell-supervisor.sh check` runs this probe before it starts a cell. It does NOT refuse
+#      the cell (rc stays 0) — whether an unmeasured board is fatal is not this script's call, because
+#      a cell may serve a board another box measured, and the ABORT GUARD owns "judged nothing".
+#   2. `$CMUX_BIN_DIR` is the CELL'S SEAM: it is the only candidate a Linux box can satisfy, so a cell
+#      that really does carry a cmux CLI (or a wrapper that talks to the fleet control plane) is made
+#      provisionable by pointing that at its directory — no code change, no Mac.
+# ⛔ DECLARED RESIDUAL, NOT A SILENT ONE: `cloud-cell-supervisor.sh cmd_check` reads the probe's EXIT
+# CODE and then prints "ok: dispatch provisioning — this repo can be pre-flighted" unconditionally, so
+# on a cell that summary line still contradicts the NOT PROVISIONABLE text printed just above it. The
+# one-line follow-up is to branch that summary on the same marker this branch prints. Not done here:
+# this PR does not otherwise touch that file, and this branch's copy is 481 lines behind main, so an
+# edit would conflict on merge. Measured 2026-10-18; the cell path itself could not be executed from
+# this box (no cell is reachable without running a remote command, and this lane must not touch the
+# fleet), so what is recorded here is the CODE path and its decision, not a live cell measurement.
 resolve_cmux() {
   local cand
   if command -v cmux >/dev/null 2>&1; then return 0; fi
@@ -527,16 +555,35 @@ cmd_check() {
     echo "[refresh]   fix: set SCOUT_PY=<a Python >= $MIN_PY_MAJOR.$MIN_PY_MINOR>, or put one on PATH"
     return "$EXIT_NOT_PROVISIONABLE"
   fi
-  # cmux is not a gate here (see resolve_cmux: the abort guard, not this check, owns "judged
-  # nothing"), but the operator needs it NAMED when it is the reason every verdict comes back
-  # INCOMPLETE — the state that reads as a healthy cell with an empty pool from the outside.
+  # ── cmux: NEVER CERTIFY A BOX WHOSE HOLDER SURFACE CANNOT BE MEASURED ─────────────────────────
+  # ⛔ THE FALSE PASS THIS CLOSES (#2051 review finding 7). This branch used to print its WARN and then
+  # fall through to `[refresh] CHECK OK: this repo can be provisioned for dispatch` at rc 0 — in the
+  # EXACT measured state where `cmux` is unresolvable, every candidate's verdict is INCOMPLETE and
+  # `candidates.txt` is stuck at 0. The operator runs `--check`, reads OK, and goes looking for the bug
+  # in the wrong layer (it was gh-rest falling back to the raw binary; #1960 took hours).
+  # ⛔ THE SIBLING SURFACES ABOVE ARE NOT THE MODEL HERE. The pre-flight tool, `jq`, the claim registry
+  # and the interpreter each REFUSE (rc=$EXIT_NOT_PROVISIONABLE) because each is a PERMANENT
+  # configuration verdict. An unresolvable cmux is not that class: `install.sh` REPAIRS it on a Mac
+  # (baking the bundle directory into the daemon PATH), a cell can serve a board another box measured,
+  # and the ABORT GUARD — not this read-only probe — owns "a pass judged nothing" (#1736). Escalating
+  # it to a hard refusal would refuse cells that the fix exists to make work.
+  # ⛔ SO THE VERDICT LINE ITSELF CHANGES: no `CHECK OK` on this path, ever. rc stays 0 (see the
+  # declared reasoning above), which means this is an assertion about the TEXT, and the text is what
+  # both callers SHOW: install.sh prints the probe's output, and `cloud-cell-supervisor.sh check`
+  # prints it before it decides — so a cell now says "cannot be certified" on the way in instead of
+  # saying nothing for 2,641 passes.
   if [ -z "$CMUX_HINT" ]; then
     echo "[refresh] check: cmux=$(command -v cmux)"
-  else
-    echo "[refresh] check: WARN 'cmux' is NOT resolvable (tried \$CMUX_BIN_DIR, \$HOME/Applications/cmux.app/Contents/Resources/bin, /Applications/cmux.app/Contents/Resources/bin) — the pre-flight's holder surface reads the fleet board's live-session store through it, so every verdict from this box is INCOMPLETE and NOTHING can be queued (#8175)"
-    echo "[refresh]   fix: run install.sh (it bakes the cmux directory into the daemon PATH), or set CMUX_BIN_DIR=<the directory holding cmux>"
+    echo "[refresh] CHECK OK: this repo can be provisioned for dispatch"
+    return 0
   fi
-  echo "[refresh] CHECK OK: this repo can be provisioned for dispatch"
+  echo "[refresh] check: cmux=UNRESOLVABLE (tried \$CMUX_BIN_DIR, \$HOME/Applications/cmux.app/Contents/Resources/bin, /Applications/cmux.app/Contents/Resources/bin)"
+  echo "[refresh] CHECK NOT PROVISIONABLE: cmux is not resolvable, so the pre-flight's holder surface cannot read the fleet board's live-session store — every verdict from this box is INCOMPLETE and NOTHING can be queued (#8175/#1736)"
+  echo "[refresh]   fix: run install.sh (it bakes the cmux directory into the daemon PATH), or set CMUX_BIN_DIR=<the directory holding cmux>"
+  # ⛔ rc=0 IS DELIBERATE, and it is the ONE thing here a later reader is likely to "fix" into a
+  # refusal. See the block above: this probe's exit code is its PERMANENT-CONFIG verdict, and both
+  # callers turn non-zero into a refusal to install/start. That is the right answer for a missing
+  # pre-flight tool and the wrong one for a Mac-shaped PATH repair on a cell that may not need it.
   return 0
 }
 

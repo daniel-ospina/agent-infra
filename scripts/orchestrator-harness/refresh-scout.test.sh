@@ -1182,6 +1182,63 @@ case "$OUT" in
   *) ok "cmux-measurable: no \"judged NOTHING\" abort" ;;
 esac
 
+# ── cmux: `--check` MUST NOT CERTIFY A BOX WHOSE HOLDER SURFACE CANNOT BE MEASURED (#2051) ──────
+# THE DEFECT. On the measured drained-backlog box `--check` printed
+#     [refresh] check: WARN 'cmux' is NOT resolvable …
+#     [refresh] CHECK OK: this repo can be provisioned for dispatch        (rc 0)
+# in the exact state where every verdict is INCOMPLETE and `candidates.txt` is stuck at 0. The
+# operator reads OK and looks for the bug in the wrong layer. The sibling surfaces on this checker
+# (`jq`, the pre-flight tool, the claim registry, the interpreter) all refuse with NOT PROVISIONABLE.
+# ⛔ DRIVEN AS AN EXTRACTED BLOCK, for the same reason the jq guard is (case 1c): a fixture CANNOT
+# build a genuinely cmux-less box on a host that owns /Applications/cmux.app, because the SHIPPED
+# resolver's last candidate IS that host-global bundle. What is asserted is the SHIPPED verdict block
+# itself, both arms, driven by `CMUX_HINT` — the same variable the resolver sets.
+echo
+echo "── cmux: --check must not certify a box whose holder surface cannot be measured ──"
+awk '/── cmux: NEVER CERTIFY/{f=1} f&&/^}$/{exit} f{print}' "$REFRESH" > "$T/cmux-verdict.sh"
+if [ -s "$T/cmux-verdict.sh" ] && grep -q 'CHECK NOT PROVISIONABLE: cmux' "$T/cmux-verdict.sh"; then
+  { printf 'set -u\ncmux_verdict() {\n  CMUX_HINT=1\n'; cat "$T/cmux-verdict.sh"; printf '}\ncmux_verdict\n'; } > "$T/cmux-verdict-bad.sh"
+  bash -n "$T/cmux-verdict-bad.sh" && ok "check-cmux: the extracted verdict block parses" \
+    || bad "check-cmux: the extracted verdict block does not parse"
+  OUTJ="$(bash "$T/cmux-verdict-bad.sh" 2>&1)"; rcj=$?
+  # ⛔ rc=0 IS THE DESIGNED ANSWER, asserted so a later change to it is a DECISION, not an accident:
+  # a non-zero --check makes `cloud-cell-supervisor.sh check` and `cloud-cell-bringup.sh` REFUSE a cell,
+  # and whether an unmeasured board is fatal is the abort guard's call, not this read-only probe's.
+  [ "$rcj" -eq 0 ] && ok "check-cmux: the branch keeps rc=0 (the abort guard owns 'judged nothing')" \
+                   || bad "check-cmux: rc=$rcj — a non-zero --check would refuse a cell over a PATH repair"
+  case "$OUTJ" in
+    *"CHECK OK"*) bad "check-cmux: the cmux branch STILL prints CHECK OK — the false PASS is back" ;;
+    *) ok "check-cmux: no CHECK OK on a box whose holder surface is unmeasurable" ;;
+  esac
+  case "$OUTJ" in
+    *"CHECK NOT PROVISIONABLE: cmux"*) ok "check-cmux: it prints CHECK NOT PROVISIONABLE: cmux …" ;;
+    *) bad "check-cmux: no NOT PROVISIONABLE verdict — output: $OUTJ" ;;
+  esac
+  case "$OUTJ" in
+    *"NOTHING can be queued"*) ok "check-cmux: the verdict names the consequence" ;;
+    *) bad "check-cmux: the verdict does not name the consequence — output: $OUTJ" ;;
+  esac
+  case "$OUTJ" in
+    *"CMUX_BIN_DIR"*) ok "check-cmux: it names the remedy and the cell's own seam" ;;
+    *) bad "check-cmux: no remedy named — output: $OUTJ" ;;
+  esac
+  # …and the OTHER arm, from the SAME shipped code: a resolvable cmux still certifies, and says which
+  # binary. Without this, deleting the CHECK OK line entirely would pass every assertion above.
+  mkdir -p "$T/cmuxok"; printf '#!/bin/sh\nexit 0\n' > "$T/cmuxok/cmux"; chmod +x "$T/cmuxok/cmux"
+  { printf 'set -u\ncmux_verdict() {\n  CMUX_HINT=""\n'; cat "$T/cmux-verdict.sh"; printf '}\ncmux_verdict\n'; } > "$T/cmux-verdict-ok.sh"
+  OUTJ="$(PATH="$T/cmuxok:$PATH" bash "$T/cmux-verdict-ok.sh" 2>&1)"
+  case "$OUTJ" in
+    *"CHECK OK: this repo can be provisioned for dispatch"*) ok "check-cmux: a RESOLVABLE cmux still certifies" ;;
+    *) bad "check-cmux: a resolvable cmux no longer certifies — output: $OUTJ" ;;
+  esac
+  case "$OUTJ" in
+    *"cmux=$T/cmuxok/cmux"*) ok "check-cmux: the certified line NAMES the cmux binary it found" ;;
+    *) bad "check-cmux: the certified line does not name the binary — output: $OUTJ" ;;
+  esac
+else
+  bad "check-cmux: the shipped --check cmux verdict block could not be extracted (deleted, or the NOT PROVISIONABLE branch is gone)"
+fi
+
 # ── 1j) A NETWORK FAULT IS TRANSIENT, NOT PERMANENT (agent-infra#1853 review P1) ────────────────
 # The discriminator is the PRESENCE OF A STORED CREDENTIAL, not gh's prose. MEASURED on gh 2.97.0
 # behind a dead proxy (`HTTPS_PROXY=http://127.0.0.1:1`): a PURE transport fault still prints "The
