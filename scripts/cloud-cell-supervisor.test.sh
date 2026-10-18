@@ -2163,6 +2163,55 @@ esac
 [ -f "$Y/started" ] && bad "start: created a session anyway" || ok "start: created no session"
 kill -9 "$Y_PEER" 2>/dev/null; wait "$Y_PEER" 2>/dev/null
 
+# ── §(n) the disk reaper's pass record is REPORTED, and failure is never silence (#2032) ────────
+say_case "status reports the scheduled disk reaper's last pass, and a failed/absent pass is a warning (#2032)"
+DR="$T/diskreaper"; mkdir -p "$DR/home/.pi/agent/state" "$DR/o/state" "$DR/repo"
+git init -q "$DR/repo" 2>/dev/null || bad "fixture: cannot git init $DR/repo"
+dr_sup() { # the SAME supervisor, pointed at this fixture's state dir
+  HOME="$DR/home" CELL_HOME="$DR/home" ENV_FILE="$DR/keys.env" SESSION="ai2004-$$" \
+    O="$DR/o" REPO="$DR/repo" DISK_REAPER_STATE_DIR="$DR/home/.pi/agent/state" \
+    bash "$SUP" status 2>&1
+}
+# (1) installed but never run: absence must be a ⛔, not a blank line that reads as health
+rm -f "$DR/home/.pi/agent/state/disk-reaper.status"
+OUT="$(dr_sup)"
+case "$OUT" in
+  *"DISK REAPER HAS NEVER RUN"*) ok "status: a reaper that never ran is reported, not omitted" ;;
+  *) bad "status: no warning for a reaper that never ran — $OUT" ;;
+esac
+# (2) a good pass: success is stated WITH the bytes freed, per class
+printf 'epoch=%s\niso=2026-10-18T17:00:00Z\nmode=apply\nok=1\nrc=0\nclasses=uv,venv,worktree\nfreed_mb=1234\nfreed_mb_uv=1000\nfreed_mb_venv=210\nfreed_mb_worktree=24\ncandidates_uv=0\nverdict_uv=ok\nverdict_venv=ok\nverdict_worktree=ok\ndetail=ok\n' "$(date +%s)" \
+  >"$DR/home/.pi/agent/state/disk-reaper.status"
+OUT="$(dr_sup)"
+case "$OUT" in
+  *"disk reaper: last pass"*"freed 1234MB"*) ok "status: reports the last pass and the bytes it freed" ;;
+  *) bad "status: does not report the reclaimed bytes — $OUT" ;;
+esac
+case "$OUT" in
+  *"uv=1000MB venv=210MB worktree=24MB"*) ok "status: breaks the reclaim down per class" ;;
+  *) bad "status: does not break the reclaim down — $OUT" ;;
+esac
+# (3) a failed pass: the ⛔ line names the class that failed, so the operator knows what did not run
+printf 'epoch=%s\niso=2026-10-18T17:00:00Z\nmode=apply\nok=0\nrc=3\nclasses=uv,venv,worktree\nfreed_mb=8\nfreed_mb_uv=0\nfreed_mb_venv=8\nfreed_mb_worktree=0\ncandidates_uv=0\nverdict_uv=ok\nverdict_venv=ok\nverdict_worktree=fail-closed\ndetail=pi-reap-worktrees.sh exited 3\n' "$(date +%s)" \
+  >"$DR/home/.pi/agent/state/disk-reaper.status"
+OUT="$(dr_sup)"
+case "$OUT" in
+  *"DISK REAPER NOT HEALTHY"*"worktree"*) ok "status: a failed pass is a ⛔ that names the failed class" ;;
+  *) bad "status: a failed pass is not surfaced — $OUT" ;;
+esac
+case "$OUT" in
+  *"worktree=fail-closed"*) ok "status: the per-class verdict is printed, not summarised away" ;;
+  *) bad "status: the failed class is not named — $OUT" ;;
+esac
+# (4) a STALE record (a timer that stopped firing) is not reported as healthy
+printf 'epoch=%s\niso=2026-10-17T00:00:00Z\nmode=apply\nok=1\nrc=0\nclasses=uv\nfreed_mb=5\nfreed_mb_uv=5\nfreed_mb_venv=0\nfreed_mb_worktree=0\nverdict_uv=ok\ndetail=ok\n' "$(( $(date +%s) - 86400 ))" \
+  >"$DR/home/.pi/agent/state/disk-reaper.status"
+OUT="$(dr_sup)"
+case "$OUT" in
+  *"DISK REAPER NOT HEALTHY"*"stale"*) ok "status: a stale pass record (timers stopped) is a ⛔, not health" ;;
+  *) bad "status: a day-old record still reads healthy — $OUT" ;;
+esac
+
 trap 'ai1711_cleanup; [ -n "${AI1761_PIDS:-}" ] && kill -9 $AI1761_PIDS 2>/dev/null; rm -rf "$T"' EXIT
 
 echo

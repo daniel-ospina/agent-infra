@@ -1649,6 +1649,33 @@ cmd_status() {
     say "⛔ CACHE BOUND NOT ENFORCED — the package-cache reaper's last pass:"
     sed 's/^/    /' "$O/state/.cache-reap-blocked"
   fi
+  # agent-infra#2032: the scheduled DISK reaper. Its pass record is the only place that answers
+  # "did the last unattended run succeed, and how much did it free" — a failed or STALE pass is
+  # therefore a ⛔ line here, never an absence that reads like health. Disk exhaustion is the second
+  # reason cells stopped working: at ~97% a controller still beats and every dispatch is refused.
+  local _dr _drs _drc _dst _det
+  _dr=""
+  for cand in "${DISK_REAPER:-}" \
+              "${HOME:-}/.pi/agent/scripts/disk-reaper.sh" \
+              "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/disk-reaper.sh"; do
+    [ -n "$cand" ] && [ -f "$cand" ] && { _dr="$cand"; break; }
+  done
+  unset cand
+  if [ -z "$_dr" ]; then
+    say "⛔ DISK REAPER NOT INSTALLED — no disk-reaper.sh found (\$DISK_REAPER, \$HOME/.pi/agent/scripts, beside this script); the uv caches, dead lane venvs and merged worktrees are unbounded"
+  else
+    _drs="$(bash "$_dr" --print-status 2>/dev/null)"; _drc=$?
+    _dst="$(printf '%s\n' "$_drs" | sed -n 's/^status=//p' | head -1)"
+    _det="$(printf '%s\n' "$_drs" | sed -n 's/^detail=//p' | head -1)"
+    if [ "$_drc" -eq 0 ]; then
+      say "disk reaper: last pass $(printf '%s\n' "$_drs" | sed -n 's/^iso=//p' | head -1) ($(printf '%s\n' "$_drs" | sed -n 's/^age_seconds=//p' | head -1)s ago) mode=$(printf '%s\n' "$_drs" | sed -n 's/^mode=//p' | head -1) freed $(printf '%s\n' "$_drs" | sed -n 's/^freed_mb=//p' | head -1)MB (uv=$(printf '%s\n' "$_drs" | sed -n 's/^freed_mb_uv=//p' | head -1)MB venv=$(printf '%s\n' "$_drs" | sed -n 's/^freed_mb_venv=//p' | head -1)MB worktree=$(printf '%s\n' "$_drs" | sed -n 's/^freed_mb_worktree=//p' | head -1)MB)"
+    elif [ "$_dst" = "never" ]; then
+      say "⛔ DISK REAPER HAS NEVER RUN — installed but no pass recorded ($_det); start it: sudo systemctl start eldato-disk-reaper.service"
+    else
+      say "⛔ DISK REAPER NOT HEALTHY — status=${_dst:-unknown} rc=$(printf '%s\n' "$_drs" | sed -n 's/^rc=//p' | head -1) last=$(printf '%s\n' "$_drs" | sed -n 's/^iso=//p' | head -1): ${_det:-no detail}"
+      say "    per class: uv=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_uv=//p' | head -1) venv=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_venv=//p' | head -1) worktree=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_worktree=//p' | head -1)"
+    fi
+  fi
   # the loop's own view of itself
   tail -3 "$O/logs/orch-loop.log" 2>/dev/null | sed 's/^/  /' || say "  (no orch-loop.log yet)"
   say "lanes: $(tmux ls 2>/dev/null | grep -c '^lane-')"
