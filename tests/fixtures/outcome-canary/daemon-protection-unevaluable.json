@@ -122,6 +122,16 @@
      "ts": 1792327664
     }
    ],
+   "lane_failed": [],
+   "lane_started": [
+    {
+     "age_s": 60,
+     "issue": 4601,
+     "lane": 1,
+     "raw": "#4601: lane-1 (implement+PR)",
+     "ts": 1792327664
+    }
+   ],
    "railed": [],
    "unparsed_headers": 0
   },

@@ -1873,7 +1873,10 @@ def test_a_fixture_expectation_naming_an_unknown_check_is_a_mismatch():
             json.dump(d2, fh)
         rc, out, err = run_cli(["--static", "--fixture", only,
                                 "--only", "work_dispatched", "--json"])
-        assert rc == 0, (rc, out[-300:])
+        # ⛔ `--only` NARROWS, IT DOES NOT CERTIFY: no mismatch, but 7 of 8 checks were not asserted,
+        # so the run must not exit 0. A green exit here is quotable as "the suite passes" while 7/8
+        # of it never ran — the same rule the live path enforces with `not_evaluated`.
+        assert rc == 2, (rc, out[-300:])
         j = json.loads(out)
         assert j["mismatches"] == [], j["mismatches"]
         assert set(x["check"] for x in j["skipped"]) == set(m.CHECK_ORDER) - {"work_dispatched"}, \
@@ -1881,16 +1884,165 @@ def test_a_fixture_expectation_naming_an_unknown_check_is_a_mismatch():
         # …and the whole shipped fixture set can be run against ONE check (it used to fail 105 times)
         rc, out, err = run_cli(["--static", "--fixtures-dir", FIXTURES,
                                 "--only", "work_dispatched", "--json"])
-        assert rc == 0, (rc, out[-400:])
+        assert rc == 2, (rc, out[-400:])
         j = json.loads(out)
         assert j["mismatches"] == [], j["mismatches"][:3]
         assert len(j["skipped"]) >= 15, len(j["skipped"])
-        # an UNKNOWN name is still a mismatch: that one asserts nothing at all
-        rc, out, err = run_cli(["--static", "--fixture", only,
+        # a MISMATCH outranks the abstention: an observed FAIL is stronger evidence than "not asked"
+        rc, out, err = run_cli(["--static", "--fixture", bad,
                                 "--only", "work_dispatched", "--json"])
+        assert rc == 1, (rc, out[-300:])
+        # and the un-narrowed run still exits 0 on a set that asserts everything
+        rc, out, err = run_cli(["--static", "--fixture", only, "--json"])
         assert rc == 0, (rc, out[-300:])
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+@test
+def test_a_dispatch_INTENT_is_not_a_dispatch():
+    """⛔ THE BATCH LINE IS AN INTENT, AND THIS CHECK EXISTS TO GRADE THE OUTCOME.
+
+    `orch-loop.sh` echoes `[dispatch] load=… -> N` and only THEN calls `dispatch-merge.sh`, whose
+    spawn fails in ways that print their own lines (`#N: worktree add failed (branch exists?) —
+    skipping`, `#N: chain-N could NOT be started`) or print NOTHING at all (`tmux new-session`'s
+    branch has no else). The disambiguating lines sit in the same tail and were never parsed, so the
+    check that matters most returned PASS/DISPATCHED + exit 0 for a fleet that spawned nothing.
+    """
+    m = load()
+    cfg = m.cfg_from_dict({})
+    ev = lambda bucket, **kw: dict({"raw": "", "age_s": 30, "ts": 1792327000}, **kw)
+
+    def facts(lane_started, lane_failed):
+        return {"log_events": {
+            "headers": [ev("headers", raw="=== Sun Oct 18 07:47:44 EST 2026 load=90 lanes=2 "
+                                        "backlog=47 queue=READ(223)(9m) ===", backlog=47,
+                           queue_token="READ(223)(9m)", lanes=2, load=90)],
+            "dispatch_ok": [dict(ev("dispatch_ok", raw="[dispatch] load=90 lanes=2 -> 1981"),
+                                 issues=[1981], issue_count=1)],
+            "lane_started": lane_started, "lane_failed": lane_failed,
+            "dispatch_refused": [], "dispatch_empty": [], "dispatch_skipped": [],
+            "armed": [], "railed": []}}
+
+    started = [dict(ev("s", raw="#1981: lane-2 (implement+PR)"), issue=1981, lane=2)]
+    failed = [dict(ev("f", raw="#1981: worktree add failed (branch exists?) — skipping"),
+                   issue=1981, reason="worktree add failed (branch exists?) — skipping")]
+
+    # every spawn failed → the intent is refuted by the outcome
+    v = m.check_work_dispatched(facts([], failed), cfg)
+    assert (v.status, v.variant) == (m.FAIL, "NO_LANE_STARTED"), (v.status, v.variant, v.evidence)
+    assert "worktree add failed" in v.evidence, v.evidence
+    # no spawn outcome at all (a truncated tail looks exactly like this) → abstain, never green
+    v = m.check_work_dispatched(facts([], []), cfg)
+    assert (v.status, v.variant) == (m.INCONCLUSIVE, "DISPATCH_UNCONFIRMED"), (v.status, v.reason)
+    # a lane actually started → PASS, and the spawn is NAMED in the evidence
+    v = m.check_work_dispatched(facts(started, failed), cfg)
+    assert (v.status, v.variant) == (m.PASS, "DISPATCHED"), (v.status, v.variant)
+    assert "#1981 lane-2 (implement+PR)" in v.evidence, v.evidence
+    # …and a failed spawn beside a successful one is still PRINTED: a pass may not hide it
+    assert "lane spawn FAILED" in v.evidence, v.evidence
+
+
+@test
+def test_the_spawn_line_shapes_the_harness_actually_prints_are_parsed():
+    """The regexes are the load-bearing part: they must match the harness's OWN strings, including
+    the em-dash in `worktree add failed (branch exists?) — skipping`."""
+    m = load()
+    log = [
+        "=== Sun Oct 18 07:47:44 EST 2026 load=90 lanes=2 backlog=47 queue=READ(223)(9m) ===",
+        "[dispatch] load=90 lanes=2 -> 1981 1982",
+        "#1981: worktree add failed (branch exists?) \u2014 skipping",
+        "#1982: lane-3 (implement+PR)",
+    ]
+    ev = m.parse_log(log)
+    assert [e["issue"] for e in ev["lane_started"]] == [1982], ev["lane_started"]
+    assert [e["issue"] for e in ev["lane_failed"]] == [1981], ev["lane_failed"]
+    # the un-asked question: a chain that could not be started is ALSO a spawn failure
+    ev2 = m.parse_log(["=== Sun Oct 18 07:47:44 EST 2026 load=90 lanes=2 backlog=47 queue=READ(1) ===",
+                       "#4242: chain-4242 could NOT be started"])
+    assert [e["issue"] for e in ev2["lane_failed"]] == [4242], ev2["lane_failed"]
+
+
+@test
+def test_a_cycle_header_OLDER_than_the_window_is_not_a_cycle():
+    """The window bound on cycle headers was unpinned: a mutation that dropped it (counting every
+    header ever seen) survived the whole suite. A fresh log mtime plus one ancient header is a
+    controller that started once and wedged, which is the exact shape LOG_NO_CYCLE exists for."""
+    m = load()
+    d = fx("healthy")
+    d["facts"]["log"]["age_s"] = 20.0                     # the log IS advancing
+    d["facts"]["log_events"]["headers"][0]["age_s"] = 99999.0   # …by a header older than the window
+    cfg = m.cfg_from_dict(d.get("config") or {})
+    v = [x for x in m.evaluate(d["facts"], cfg) if x.name == "controller_cycling"][0]
+    assert (v.status, v.variant) == (m.FAIL, "LOG_NO_CYCLE"), (v.status, v.variant, v.evidence)
+
+
+@test
+def test_the_queue_token_AGE_is_read_with_ITS_OWN_multiplier():
+    """`READ(223)(9m)` is nine MINUTES. The multiplier was unpinned — `m` silently became seconds,
+    which turns a stale refresh into a fresh one, i.e. exactly the false green this token exists to
+    prevent."""
+    m = load()
+    assert m.parse_queue_token("READ(223)(9m)")["token_age_s"] == 540.0
+    assert m.parse_queue_token("READ(223)(9s)")["token_age_s"] == 9.0
+    assert m.parse_queue_token("READ(223)(2h)")["token_age_s"] == 7200.0
+    assert m.parse_queue_token("READ(223)")["token_age_s"] is None
+    # …and it must actually REACH a verdict. The multiplier is load-bearing for EMPTINESS: an
+    # OLD empty read beside an unreadable queue state is the only age the check has, and
+    # past the limit "the pool is empty" is a claim about then — STATE_FROZEN, never READABLE.
+    d = fx("healthy")
+    d["facts"]["queue_state"] = {"path": "q", "ok": False, "error": "EACCES"}
+    # 120m, not 90m: 90m is EXACTLY the 5400s limit, and the boundary is deliberately inclusive
+    d["facts"]["log_events"]["headers"][0]["queue_token"] = "EMPTY(120m)"
+    d["facts"]["log_events"]["headers"][0]["backlog"] = 0
+    cfg = m.cfg_from_dict(d.get("config") or {})
+    v = [x for x in m.evaluate(d["facts"], cfg) if x.name == "queue_readable"][0]
+    assert (v.status, v.variant) == (m.INCONCLUSIVE, "STATE_FROZEN"), (v.status, v.variant, v.evidence)
+    # the SAME token read as seconds (90s) is inside the limit: the `m`/`s` multiplier is what makes
+    # the difference, so the assertion above cannot be satisfied by ignoring the suffix.
+    d["facts"]["log_events"]["headers"][0]["queue_token"] = "EMPTY(90s)"
+    v = [x for x in m.evaluate(d["facts"], cfg) if x.name == "queue_readable"][0]
+    assert v.variant != "STATE_FROZEN", (v.status, v.variant, v.evidence)
+
+
+@test
+def test_a_DRAFT_PR_is_COUNTED_as_skipped_not_dropped_silently():
+    """A draft row hit `continue` before the skip bookkeeping, so it appeared NOWHERE: the
+    population arithmetic did not reconcile and the `DRAFT` entry in KNOWN_NON_MERGEABLE was
+    unreachable. Silent omission is the failure mode; the count is the fix."""
+    m = load()
+    d = fx("healthy")
+    prs = d["facts"]["github"]["open_prs"]
+    prs.append({"number": 4321, "draft": True, "probed": True, "mergeable": "MERGEABLE",
+                "merge_state": "CLEAN", "armed_in_window": True})
+    d["facts"]["github"]["open_pr_count"] = len(prs)
+    cfg = m.cfg_from_dict(d.get("config") or {})
+    v = [x for x in m.evaluate(d["facts"], cfg) if x.name == "landers"][0]
+    assert "4321:DRAFT" in v.evidence, v.evidence
+
+
+@test
+def test_each_headroom_floor_is_graded_ON_ITS_OWN():
+    """The shipped low-headroom fixture has disk AND memory under floor, so either comparison alone
+    still produced a FAIL — neither floor was pinned, and deleting one comparison was invisible."""
+    m = load()
+    cfg = m.cfg_from_dict({})
+    ok_disk = {"ok": True, "avail_bytes": int(400 * (1 << 30)), "used_pct": 40.0, "mount": "/"}
+    ok_mem = {"ok": True, "avail_mb": 9000, "source": "darwin"}
+    low_disk = {"ok": True, "avail_bytes": int(2 * (1 << 30)), "used_pct": 99.0, "mount": "/"}
+    low_mem = {"ok": True, "avail_mb": 50, "source": "darwin"}
+    for disk, mem, bad, good in ((low_disk, ok_mem, "disk", "memory"),
+                                 (ok_disk, low_mem, "memory", "disk")):
+        v = m.check_headroom({"headroom": {"disk": disk, "mem": mem}}, cfg)
+        assert v.status == m.FAIL and v.variant == "BELOW_FLOOR", (v.status, v.variant)
+        # ONLY the floor that is actually under is named in the reason: that is what pins each
+        # comparison independently, so deleting either one is visible.
+        named = v.detail.split("below the configured floor: ")[-1]
+        assert bad in named and good not in named, (bad, named)
+    # and a PASS must PRINT both numbers, not assert "fine"
+    v = m.check_headroom({"headroom": {"disk": ok_disk, "mem": ok_mem}}, cfg)
+    assert v.status == m.PASS and "GiB free" in v.evidence and "MiB available" in v.evidence, \
+        v.evidence
 
 
 @test
@@ -2607,6 +2759,48 @@ MUTATIONS = [
      "            exists = (present.strip().endswith(\"YES\")) if rc3 == 0 else None",
      "            exists = False",
      "test_a_log_that_cannot_be_stat_ed_is_unreadable_not_missing"),
+    ("the dispatch INTENT line is graded as the dispatch outcome",
+     "        started = newest_with_age(events.get(\"lane_started\"), win)\n"
+     "        spawn_fail = newest_with_age(events.get(\"lane_failed\"), win)",
+     "        started = newest_with_age(events.get(\"dispatch_ok\"), win)\n"
+     "        spawn_fail = None",
+     "test_a_dispatch_INTENT_is_not_a_dispatch"),
+    ("an intent-only log PASSES instead of abstaining",
+     "            return V(\"work_dispatched\", INCONCLUSIVE, \"DISPATCH_UNCONFIRMED\",",
+     "            return V(\"work_dispatched\", PASS, \"DISPATCH_UNCONFIRMED\",",
+     "test_a_dispatch_INTENT_is_not_a_dispatch"),
+    ("a spawn failure is not parsed at all (the failure line is invisible)",
+     "RE_LANE_FAILED = re.compile(\n"
+     "    r\"^#(?P<issue>\\d+): (?P<reason>worktree add failed[^\\n]*|chain-\\d+ could NOT be "
+     "started[^\\n]*)\\s*$\")",
+     "RE_LANE_FAILED = re.compile(r\"^#(?P<issue>\\d+): LONG_MATCHES_NOTHING$\")",
+     "test_the_spawn_line_shapes_the_harness_actually_prints_are_parsed"),
+    ("the cycle-header window bound is dropped (any header ever seen counts)",
+     "              if h.get(\"age_s\") is not None and h[\"age_s\"] <= win]",
+     "              if h.get(\"age_s\") is not None]",
+     "test_a_cycle_header_OLDER_than_the_window_is_not_a_cycle"),
+    ("the queue token age loses its unit multiplier",
+     "        mult = {\"s\": 1, \"m\": 60, \"h\": 3600}[a.group(\"unit\")]",
+     "        mult = 1",
+     "test_the_queue_token_AGE_is_read_with_ITS_OWN_multiplier"),
+    ("a DRAFT PR is dropped with no line at all",
+     '            skipped.append("%s:DRAFT" % (pr.get("number"),))\n            continue',
+     "            continue",
+     "test_a_DRAFT_PR_is_COUNTED_as_skipped_not_dropped_silently"),
+    ("only the disk floor is graded",
+     "        if mb < c.mem_floor_mb:\n"
+     '            bad.append("memory %.0f MiB < %.0f MiB" % (mb, c.mem_floor_mb))',
+     "        pass",
+     "test_each_headroom_floor_is_graded_ON_ITS_OWN"),
+    ("only the memory floor is graded",
+     "        if gb < c.disk_floor_gb:\n"
+     '            bad.append("disk %.1f GiB < %.1f GiB" % (gb, c.disk_floor_gb))',
+     "        pass",
+     "test_each_headroom_floor_is_graded_ON_ITS_OWN"),
+    ("--static --only certifies the checks it never asserted",
+     "        return 2 if only else 0",
+     "        return 0",
+     "test_a_fixture_expectation_naming_an_unknown_check_is_a_mismatch"),
     ("a recovery leaves the ambiguity marker behind (a repeat failure goes silent)",
      '        amb = self.data["boxes"][self.box].get("ambiguous") or {}\n'
      '        for k in list(amb):\n            if k.split("|")[0] == check:\n'

@@ -357,6 +357,16 @@ RE_BACKLOG = re.compile(r"\bbacklog=(?P<n>\d+)")
 RE_QUEUE = re.compile(r"\bqueue=(?P<tok>\S+)")
 
 RE_DISPATCH_OK = re.compile(r"^\[dispatch\] load=(?P<load>\d+) lanes=(?P<lanes>\d+) -> (?P<issues>[0-9 ]+)\s*$")
+# ⛔ THE BATCH LINE IS AN INTENT, NOT THE OUTCOME. `orch-loop.sh` echoes `[dispatch] load=… -> N` and
+# only THEN calls `dispatch-merge.sh`, whose spawn can fail with its own lines and produce no lane at
+# all: `#N: worktree add failed (branch exists?) — skipping`, or — the dangerous one — NOTHING, when
+# `tmux new-session` fails (the `&& echo "#$N: lane-$N (implement+PR)"` has no else, so a dead tmux
+# server, a stale `chain-$N` session or a full session table prints only the failed chain line). The
+# disambiguating lines are in the same 6000-line tail and were never parsed, so `work_dispatched` —
+# "the outcome that matters most" — graded an intention and read PASS while nothing was spawned.
+RE_LANE_STARTED = re.compile(r"^#(?P<issue>\d+): lane-(?P<lane>\d+) \(implement\+PR\)\s*$")
+RE_LANE_FAILED = re.compile(
+    r"^#(?P<issue>\d+): (?P<reason>worktree add failed[^\n]*|chain-\d+ could NOT be started[^\n]*)\s*$")
 # ⛔ The refusal line has TWO measured shapes, and the second one was being dropped entirely:
 #   [dispatch] #4725 NOT dispatched — could not build claim commit          (orch-loop.sh:1608-1644)
 #   [dispatch] #1620 NOT dispatched (claim infra error) — …                  (orch-loop.sh:1620)
@@ -386,16 +396,19 @@ MONTHS = {
 DOW = {"Mon": 0, "Tue": 1, "Wed": 2, "Thu": 3, "Fri": 4, "Sat": 5, "Sun": 6}
 
 
-# Zone abbreviations the loop's `date` can print, as SECONDS EAST OF UTC. Only unambiguous tokens
-# are listed (so no `IST`, which is both Irish and Indian time, and no `CST`, which is both US Central
-# and China Standard): a token that is not here is NOT guessed at.
+# Zone abbreviations the loop's `date` can print, as SECONDS EAST OF UTC. ⛔ ONLY TOKENS THAT CANNOT
+# COLLIDE ARE HERE, and a token that is not here is NOT guessed at — it falls back to the local-time
+# reading. Deliberately ABSENT because they are ambiguous: `IST` (Irish/Indian/Israel), `CST`
+# (US Central / China Standard / Cuba), `BST` (British Summer / Bangladesh Standard), `AST` (Atlantic
+# / Arabia Standard). A wrong offset is worse than the fallback: mapping CST to US Central on a China
+# cell makes every header 14h in the future and `_age_of` answers UNKNOWN, i.e. a permanent false red.
 TZ_OFFSETS = {
     "Z": 0, "UT": 0, "UTC": 0, "GMT": 0,
     "EST": -18000, "EDT": -14400, "CST": -21600, "CDT": -18000,
     "MST": -25200, "MDT": -21600, "PST": -28800, "PDT": -25200,
     "AKST": -32400, "AKDT": -28800, "HST": -36000,
-    "AST": -14400, "ADT": -10800, "NST": -12600, "NDT": -9000,
-    "WET": 0, "WEST": 3600, "BST": 3600, "CET": 3600, "CEST": 7200,
+    "NST": -12600, "NDT": -9000,
+    "WET": 0, "WEST": 3600, "CET": 3600, "CEST": 7200,
     "EET": 7200, "EEST": 10800, "MSK": 10800,
     "JST": 32400, "KST": 32400, "SGT": 28800, "HKT": 28800,
     "AWST": 28800, "ACST": 34200, "ACDT": 37800, "AEST": 36000, "AEDT": 39600,
@@ -498,6 +511,8 @@ def parse_log(lines, now=None):
         "dispatch_skipped": [],
         "armed": [],
         "railed": [],
+        "lane_started": [],
+        "lane_failed": [],
         "unparsed_headers": 0,
     }
     cur = None  # epoch of the enclosing header, or None when the header was unparseable
@@ -531,6 +546,8 @@ def parse_log(lines, now=None):
             ("dispatch_skipped", RE_DISPATCH_SKIPPED),
             ("armed", RE_ARMED),
             ("railed", RE_RAILED),
+            ("lane_started", RE_LANE_STARTED),
+            ("lane_failed", RE_LANE_FAILED),
         ):
             mm = rx.match(line)
             if mm:
@@ -561,7 +578,7 @@ def parse_log(lines, now=None):
                 break
     if now is not None:
         for bucket in ("headers", "dispatch_ok", "dispatch_refused", "dispatch_empty",
-                       "dispatch_skipped", "armed", "railed"):
+                       "dispatch_skipped", "armed", "railed", "lane_started", "lane_failed"):
             for rec in ev[bucket]:
                 rec["age_s"] = _age_of(now, rec.get("ts"))
     return ev
@@ -974,15 +991,6 @@ def check_work_dispatched(f, c):
                        % (len(refused_all),
                           "; ".join("%s x%d" % (w, n) for w, n in top[:3]),
                           refused_all[-1].get("raw")))
-    ok = newest_with_age(events.get("dispatch_ok"), win)
-    if ok is not None:
-        # PASS is PASS by the outcome, but the refusals are EVIDENCE and a pass that hides them is
-        # the green-while-broken failure this whole file exists to end. They are printed, always.
-        return V("work_dispatched", PASS, "DISPATCHED",
-                 "dispatch line (%s): %s\n%d issue(s) dispatched inside the %.0fs window%s"
-                 % (_age_txt(ok.get("age_s")), ok.get("raw"), ok.get("issue_count") or 0, win,
-                    refused_txt))
-
     refused = refused_all
     empty = newest_with_age(events.get("dispatch_empty"), win)
     skipped = newest_with_age(events.get("dispatch_skipped"), win)
@@ -1014,12 +1022,47 @@ def check_work_dispatched(f, c):
     ev_lines.append("last successful dispatch line: %s"
                     % (("%s (%s)" % (last_ok.get("raw"), _age_txt(last_ok.get("age_s"))))
                        if last_ok else "NONE in the parsed log tail"))
+    ok = newest_with_age(events.get("dispatch_ok"), win)
     unparsed = events.get("unparsed_headers") or 0
     if unparsed:
         # The same datum `queue_readable` reads: "no cycle in the window" is a claim about the LOG,
         # and N headers the parser could not read make it false. One rule, both checks.
         ev_lines.append("%d header(s) present but UNPARSEABLE — the log format moved" % unparsed)
     evidence = "\n".join(ev_lines)
+
+    # ⛔ THE BATCH LINE IS AN INTENT. `[dispatch] load=… -> N` is echoed BEFORE `dispatch-merge.sh`
+    # runs, and its spawn can fail silently (no else on the `tmux new-session` branch) or with its own
+    # `#N: worktree add failed` / `#N: chain-N could NOT be started` lines. Grading the intent as the
+    # outcome is a PASS on "everything is up and nothing ships" — measured: 110 of 110 real batch
+    # lines are followed by `#N: lane-N (implement+PR)`, so the proof is in the tail and unpriced.
+    if ok is not None:
+        started = newest_with_age(events.get("lane_started"), win)
+        spawn_fail = newest_with_age(events.get("lane_failed"), win)
+        spawn_txt = ""
+        if started is not None:
+            spawn_txt = "\nlane spawn (%s): #%s lane-%s (implement+PR)" % (
+                _age_txt(started.get("age_s")), started.get("issue"), started.get("lane"))
+        if spawn_fail is not None:
+            spawn_txt += "\nlane spawn FAILED (%s): %s" % (
+                _age_txt(spawn_fail.get("age_s")), spawn_fail.get("raw"))
+        if started is None:
+            if spawn_fail is not None:
+                return V("work_dispatched", FAIL, "NO_LANE_STARTED",
+                         evidence + spawn_txt,
+                         "a dispatch batch was issued and EVERY spawn failed: the `[dispatch] -> N` "
+                         "line is written before the spawner runs, so it is an intention, not an "
+                         "outcome. Nothing was started, so no work is going out.")
+            return V("work_dispatched", INCONCLUSIVE, "DISPATCH_UNCONFIRMED",
+                     evidence + spawn_txt,
+                     "a dispatch batch was issued, but no lane-spawn outcome (`#N: lane-N "
+                     "(implement+PR)`) appears in the window — so 'work was dispatched' rests on the "
+                     "intent line alone. Not green.")
+        # PASS is PASS by the outcome, but the refusals and the spawns are EVIDENCE and a pass that
+        # hides them is the green-while-broken failure this whole file exists to end. Always printed.
+        return V("work_dispatched", PASS, "DISPATCHED",
+                 "dispatch line (%s): %s\n%d issue(s) dispatched inside the %.0fs window%s%s"
+                 % (_age_txt(ok.get("age_s")), ok.get("raw"), ok.get("issue_count") or 0, win,
+                    refused_txt, spawn_txt))
 
     # POSITIVE evidence that work existed and none of it went out → FAIL. This is the check's whole
     # point; it is the branch that catches "everything is up and nothing ships".
@@ -1515,6 +1558,11 @@ def check_landers(f, c):
     candidates, unprobed, skipped = [], [], []
     for pr in prs:
         if pr.get("draft"):
+            # ⛔ COUNTED like every other known skip. A draft was dropped with no line at all, so the
+            # population arithmetic did not reconcile (measured: `open PRs: 54`, `skipped: 25`,
+            # `unprobed: 28` — one row unaccounted for) and `DRAFT` in KNOWN_NON_MERGEABLE was
+            # unreachable, because this `continue` fired first.
+            skipped.append("%s:DRAFT" % (pr.get("number"),))
             continue
         mss, green = pr.get("merge_state_status"), pr.get("checks_green")
         # ⛔ "GRADED OR UNPROBED, NEVER NEITHER" — enforced HERE, not only in the collectors.
@@ -1566,7 +1614,8 @@ def check_landers(f, c):
     if not candidates:
         if unprobed:
             return V("landers", INCONCLUSIVE, "PARTIAL_POPULATION",
-                     "open PRs: %d, unprobed (beyond the probe bound): %s\n%s\n%s%s"
+                     "open PRs: %d, unprobed (never read: no check surface, a failed probe, "
+                     "mergeability unknown, or beyond the probe bound): %s\n%s\n%s%s"
                      % (len(prs), unprobed, _gh_surface_txt(gh), _prs_brief(prs),
                         ("\n" + skip_txt) if skip_txt else ""),
                      "%d open PR(s) could not be probed (the REST fallback is bounded), so "
@@ -2936,6 +2985,13 @@ REQUIRED_FIXTURES = (
     "healthy", "controller-absent", "log-silent", "queue-unreadable", "dispatch-refused",
     "empty-backlog-large-pool", "no-pr-merged", "gh-unreadable", "lander-expired",
     "daemon-absent", "headroom-low", "idle-empty-pool",
+    # ⛔ EACH OF THESE PINS A BRANCH THAT WAS REACHABLE AND UNPINNED. A fixture set that only shows
+    # the happy path lets a predicate be deleted outright without a single red: the FAIL branches of
+    # `pr_created`/`pr_merged`, the two headroom floors (the low fixture had BOTH under floor, so
+    # either comparison alone still failed), the intent-vs-outcome distinction in `work_dispatched`,
+    # and the UNCONFIRMED branch that an intent-only log must fall into.
+    "dispatch-intent-not-spawned", "dispatch-unconfirmed", "no-pr-created", "idle-no-work",
+    "headroom-disk-only-low", "headroom-mem-only-low",
 )
 
 
@@ -3169,7 +3225,11 @@ def main(argv=None):
                           % (",".join(only), len(CHECK_ORDER) - len(only)))
                 else:
                     print("✅ every fixture matched its declared _expect")
-        return 1 if mism else 0
+        if mism:
+            return 1
+        # ⛔ `--only` NARROWS, IT DOES NOT CERTIFY — the same rule the live path enforces. A green
+        # static run that asserted 1 of 8 checks and exited 0 would be quoted as "the suite passes".
+        return 2 if only else 0
 
     # ── live ────────────────────────────────────────────────────────────────────────────────
     cfg = cfg_from_args(a)

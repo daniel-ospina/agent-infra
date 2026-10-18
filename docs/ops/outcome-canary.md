@@ -27,7 +27,7 @@ outcome.
 |---|---|---|---|
 | `controller_cycling` | a controller process exists **and** its log advanced within the window | `CONTROLLER_ABSENT`, `LAUNCHD_PID_UNRESOLVED` | `LOG_SILENT`, `LOG_MISSING` |
 | `queue_readable` | the last refresh produced a READABLE verdict | `QUEUE_UNREADABLE`, `QUEUE_NEVER_READ`, `QUEUE_PARTIAL` | `NO_REFRESH` |
-| `work_dispatched` | a `[dispatch] … -> <issue>` line is inside the window | `NOT_DISPATCHED`, `NO_DISPATCH`, `NO_DISPATCH_GATED` | `NO_CYCLE_IN_WINDOW` |
+| `work_dispatched` | a `[dispatch] … -> <issue>` line is inside the window **and the batch's lane actually started** | `NOT_DISPATCHED`, `NO_DISPATCH`, `NO_DISPATCH_GATED`, `NO_LANE_STARTED` | `NO_CYCLE_IN_WINDOW`, `DISPATCH_UNCONFIRMED` |
 | `pr_created` | ≥1 PR opened in the PR window | `NO_PR_CREATED` | `IDLE_NO_WORK` (inconclusive) |
 | `pr_merged` | ≥1 PR merged in the PR window | `NO_PR_MERGED` | `IDLE_NO_WORK` (inconclusive) |
 | `pane_daemon` | a live `cmux-tui` **and** a readable protection value that protects it | `DAEMON_ABSENT`, `PROTECTION_ABSENT`, `PROTECTION_PARTIAL` | `PROTECTION_UNEVALUABLE` |
@@ -42,6 +42,22 @@ suite is structurally unable to see.
 A `PASS` that hides a degradation is the failure this file exists to end, so `work_dispatched` prints
 the refusal counts **even when it passes**: four dispatches beside 955 refusals is not a green fleet,
 and the reader must be able to see that in one line.
+
+**⛔ The batch line is an INTENT, not the dispatch.** `orch-loop.sh` echoes
+`[dispatch] load=… lanes=… -> N` and only **then** calls `dispatch-merge.sh`, whose spawn fails in
+ways that print their own lines (`#N: worktree add failed (branch exists?) — skipping`,
+`#N: chain-N could NOT be started`) — or print **nothing at all**, because the `tmux new-session`
+branch has no `else`, so a dead tmux server or a full session table is silent. The disambiguating
+lines are in the same tail. Grading the intent was a `PASS`/`DISPATCHED` **and exit 0** for a fleet
+that spawned nothing, i.e. a green verdict on the exact outcome this check exists to assert. The
+batch now needs its **spawn outcome**:
+
+- `#N: lane-M (implement+PR)` in the window → `PASS`/`DISPATCHED`, and the spawn line is named in the
+  evidence (a pass may not hide a *failed* sibling spawn, which is printed beside it);
+- a batch whose **every** spawn failed → `FAIL`/`NO_LANE_STARTED`;
+- a batch with **no spawn outcome** in the window (a truncated tail looks identical) →
+  `INCONCLUSIVE`/`DISPATCH_UNCONFIRMED`. Measured 2026-10-18: 110 of 110 real batch lines are
+  followed by a lane line, so the outcome is genuinely available and its absence is not normal.
 
 ## INCONCLUSIVE is not green
 
@@ -202,8 +218,8 @@ shape changes, and it is pruned with the rest of its check.
 ## The suite
 
 ```bash
-python3 tools/fleet/outcome_canary.test.py              # 91 tests
-python3 tools/fleet/outcome_canary.test.py --mutations  # 71 mutations, each must go RED
+python3 tools/fleet/outcome_canary.test.py              # 97 tests
+python3 tools/fleet/outcome_canary.test.py --mutations  # 80 mutations, each must go RED
 ```
 
 The signal tests drive the **real CLI** end-to-end (`--live --facts … --capture-dir …`), so what is
@@ -296,6 +312,10 @@ Four more, found by measuring the surface the tool actually reads rather than th
   `CLOCK_SKEW_TOLERANCE_S` rule had been applied to the log mtime only; `max(0.0, now - ts)` made a
   stale record the freshest possible reading, which defeats the `queue_stale_s` guard whose whole job
   is to stop a frozen EMPTY read establishing "nothing to do".
+- **`--only` narrows; it does not certify** — in `--live` (exit 2, `not_evaluated` named) *and* in
+  `--static` (exit 2 when any check was excluded). A green static run that asserted 1 of 8 checks is
+  quotable as "the suite passes", which is precisely the claim it must not support. A mismatch still
+  exits 1: an observed FAIL is stronger evidence than "not asked".
 - **`--static` asserts ALL of a fixture's expectations, and the fixture POPULATION is part of the
   pin.** `_expect: {"headroom": "PASS"}` ran seven checks, asserted one and reported success; a
   DELETED fixture removes the outcome it pinned while every remaining assertion still passes. A
