@@ -106,7 +106,7 @@ mkfakehome() { # $1 = home dir
     # resolve at
     # install time (broken-target guard).
     mkdir -p "$1/.pi/agent/scripts"
-    for f in fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-reap-worktrees.sh pi-reap-worktrees-launchd.py cleanup-stale-branches.sh ci_runner_gate.sh; do
+    for f in fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-cache-reaper.sh pi-reap-worktrees.sh pi-reap-worktrees-launchd.py cleanup-stale-branches.sh ci_runner_gate.sh; do
         touch "$1/.pi/agent/scripts/$f"
         chmod +x "$1/.pi/agent/scripts/$f"
     done
@@ -260,6 +260,14 @@ assert_contains "$(cat "$PRUNE_INSTALLED")" "<string>1</string>" "prune plist SH
 assert_contains "$(cat "$PRUNE_INSTALLED")" "StartInterval" "prune job is interval-scheduled"
 assert_contains "$(cat "$PRUNE_INSTALLED")" "<integer>3600</integer>" "prune job hourly (StartInterval 3600)"
 assert_contains "$(cat "$PRUNE_INSTALLED")" "agent-infra-plist-version: 0.1.0" "prune template carries version marker"
+# #1987 — pi-cache-reaper rendered-plist asserts (farmed path, size bound, scheduled). The job
+# bounds the MACHINE-GLOBAL package caches, so the farmed target must resolve or the broken-target
+# guard refuses the whole install.
+CACHE_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.pi-cache-reaper.plist"
+assert_contains "$OUT" "pi-cache-reaper: installed + loaded" "pi-cache-reaper installed on fresh machine (#1987)"
+assert_contains "$(cat "$CACHE_INSTALLED")" "$HOME1/.pi/agent/scripts/pi-cache-reaper.sh" "cache-reaper plist rendered with fake HOME (farmed path, #1987)"
+assert_contains "$(cat "$CACHE_INSTALLED")" "CACHE_REAPER_MAX_MB" "cache-reaper plist carries the size bound (#1987)"
+assert_contains "$(cat "$CACHE_INSTALLED")" "agent-infra-plist-version: 0.1.0" "cache-reaper template carries version marker"
 # #1178 unit 3 — lane-liveness rendered-plist content asserts (farmed tools path,
 # the PINNED probe library, and the interval schedule). #1277: the farmed path is
 # scripts/fleet/, never tools/fleet/ (pi's startup scan blocks interactive boot on
@@ -362,8 +370,13 @@ assert_not_contains "$OUT" "hub-state-check: installed + loaded" "retired hub jo
 assert_not_contains "$OUT" "skill-lint-oracle: installed + loaded" "retired oracle job NOT installed on fresh machine"
 [ ! -f "$HUB_RETIRED" ] && ok "no retired hub plist left behind" || bad "no retired hub plist left behind"
 [ ! -f "$ORACLE_RETIRED" ] && ok "no retired oracle plist left behind" || bad "no retired oracle plist left behind"
+# ⛔ This count is the inventory of ACTIVE jobs, and it had already drifted before #1987: the
+# pre-fix expectation (8) still omitted com.tortoise.branch-reaper (#1787) and
+# com.tortoise.worktree-reaper (#1311), both of which DO resolve in this fixture (it plants a
+# TORTOISE_REPO sibling), so the assertion was red on main at 10 vs 8. The list below is the whole set
+# the fixture installs, so it fails loudly on the NEXT unrecorded template too.
 BOOTSTRAP_COUNT1="$(grep -c 'launchctl bootstrap' "$LOG")"
-assert_eq "$BOOTSTRAP_COUNT1" "8" "fresh install bootstraps only active jobs (canary + tripwire + fleet + pi-session-reaper + balance-watch + pi-task-session-prune + lane-liveness + ci-runner-gate)"
+assert_eq "$BOOTSTRAP_COUNT1" "11" "fresh install bootstraps only active jobs (canary + balance-watch + fleet + lane-liveness + pi-cache-reaper + pi-session-reaper + pi-task-session-prune + tripwire + branch-reaper + ci-runner-gate + worktree-reaper)"
 
 echo "── 2. Retirement: pre-seeded old plists get unloaded + removed ───"
 seed_retired "$HOME2"

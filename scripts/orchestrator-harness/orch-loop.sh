@@ -1054,6 +1054,24 @@ while true; do
     fi
   fi
 
+  # ── machine-global package caches (agent-infra#1987) ────────────────────────
+  # A CELL HAS NO launchd AND NO cron — this loop is its only scheduler, so the hourly cache sweep
+  # has to live here or the measured box dies again the same way. On 2026-10-18 pi-cell-3
+  # (32 GB disk) sat at 258MB free and refused EVERY dispatch (`ABORT: disk 258MB < 1200MB`) while
+  # this loop kept beating: ~/.cache/uv had grown to 7.1 GB from every lane's `uv sync`/`uv run` on
+  # the box, and nothing bounded it (#1949 reaps a lane's own .venv, #1851/#1858 bound worktree
+  # weight, #1745 sweeps worktree-root caches — none of them touches the shared cache). Clearing it
+  # freed 7.1 GB and the box launched a lane immediately. Macs get the same pass from
+  # com.eldato.pi-cache-reaper; the reaper is idempotent and reports "within max" on a box where the
+  # launchd job already ran, so running from both surfaces costs one `du` and nothing else.
+  # Hourly, in the background, never blocking the sweep — and a missing script is a no-op (the
+  # launcher farms it, but a controller running from a bare checkout must not break on its absence).
+  CACHE_REAPER="${CACHE_REAPER:-$HOME/.pi/agent/scripts/pi-cache-reaper.sh}"
+  if [ -x "$CACHE_REAPER" ] && [ -z "$(find "$O/state/.cache-reaped" -mmin -60 2>/dev/null)" ]; then
+    touch "$O/state/.cache-reaped"
+    ( "$CACHE_REAPER" >> "$LOG" 2>&1 || echo "[cache-reaper] rc=$? — a package cache is over its bound and was NOT brought under it" >> "$LOG" ) &
+  fi
+
   # ── ownership: the merge-priority gate's input ──────────────────────────────
   # Merge priority counts what is UNOWNED, not what is open: a PR that is mid-review, mid-fix,
   # mid-merge, or held by a claim on another box is healthy queue depth, not a reason to stop

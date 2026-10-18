@@ -154,6 +154,46 @@ esac
 [ ! -e "$TOK" ] && ok "token file removed on the success path (as before the fix)" \
                 || bad "token file SURVIVED a successful run"
 
+# ── 2a) the shared package caches are REPORTED, so a growing disk is visible early (#1987) ────────
+# The incident was a machine-global cache that reached 7.1 GB and refused every dispatch while
+# nothing in `--check` mentioned it. A report that merely prints the word "absent" proves nothing, so
+# this case plants a MEASURED cache (4 MiB under the CELL_HOME `--check` exported as HOME) and
+# asserts the number it prints; then a bound below that size must be called out.
+say_case "the machine-global package caches are reported, with their size (#1987)"
+# Pin the three sinks at the fixture HOME: this suite may be run from a box whose environment already
+# exports UV_CACHE_DIR (every cell does), and then the report would measure the OPERATOR's cache.
+export UV_CACHE_DIR="$T/home/.cache/uv" NPM_CACHE_DIR="$T/home/.npm/_cacache" PIP_CACHE_DIR="$T/home/.cache/pip"
+mkdir -p "$UV_CACHE_DIR"
+dd if=/dev/zero of="$UV_CACHE_DIR/big.bin" bs=1048576 count=4 2>/dev/null
+printf '%s\n' "$TOK_BODY" > "$TOK"
+br ok normal --check
+[ "$BR_RC" -eq 0 ] && ok "the cache report does not break the clean run (rc=0)" \
+                   || bad "the clean run FAILED with the cache report (rc=$BR_RC): $BR_OUT"
+case "$BR_OUT" in
+  *"package caches:"*"uv=4"*) ok "it reports the uv cache's MEASURED size (uv=4), not just its presence" ;;
+  *) bad "the uv cache size was not reported — output: $BR_OUT" ;;
+esac
+case "$BR_OUT" in
+  *"MB free on"*) ok "it reports the free space on the cell's disk alongside it" ;;
+  *) bad "no free-space figure in the cache report — output: $BR_OUT" ;;
+esac
+case "$BR_OUT" in
+  *"CELL READY"*"disk caches"*) ok "the readiness banner names the disk caches it verified" ;;
+  *) bad "the CELL READY banner does not mention the caches — output: $BR_OUT" ;;
+esac
+printf '%s\n' "$TOK_BODY" > "$TOK"
+export CACHE_REAPER_MAX_MB=1          # below the 4 MiB fixture: the over-bound arm
+br ok normal --check
+unset CACHE_REAPER_MAX_MB
+case "$BR_OUT" in
+  *"package cache over the 1MB bound"*) ok "a cache over the bound is called out by NAME and size" ;;
+  *) bad "a cache over the bound was not reported — output: $BR_OUT" ;;
+esac
+case "$BR_OUT" in
+  *"pi-cache-reaper.sh"*) ok "the warning names the reclaim command an operator can run" ;;
+  *) bad "the over-bound warning gives the operator no reclaim step — output: $BR_OUT" ;;
+esac
+
 # ── 2b) a cell that ALREADY carries the layer is a read-back, not a re-install (#1723) ───────────
 # `--check` verifies first and only installs when the read-back refuses, so a re-run against a
 # provisioned cell must not re-copy the layer. The discriminator is the installer's own mode

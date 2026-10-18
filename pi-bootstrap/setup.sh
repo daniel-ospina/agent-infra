@@ -336,6 +336,10 @@ fi
 # executes $DEST/scripts/ci_runner_gate.sh, so farming it is what makes the REPO
 # copy the copy that runs — without it a box keeps executing a hand-copied
 # duplicate (a merged fix never reaches it) and a second box has no fallback gate.
+# #1987 adds pi-cache-reaper.sh: the launchd job com.eldato.pi-cache-reaper runs
+# the farmed copy, and a cell's controller loop resolves the same path — so this
+# farm is what puts the bound on the machine-global package caches ($HOME/.cache/uv,
+# $HOME/.npm/_cacache, $HOME/.cache/pip) on BOTH surfaces.
 #
 # #1552 — the LAPTOP-ONLY lane-orchestration layer joins this farm. Each of the 27 entries
 # below existed on exactly ONE disk (~/.pi/agent/scripts) and in no repo file, so a repair to the
@@ -430,7 +434,7 @@ fi
 # it, executable, in $DEST/scripts. A name left in BOTH places is refused loudly by the
 # UNFARM leg at the end of this file (the copy leg would just re-create it); dropping
 # it here WITHOUT declaring it is caught by the snapshot check on the next sync.
-fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-reap-worktrees.sh pi-reap-worktrees-launchd.py cleanup-stale-branches.sh ci_runner_gate.sh ask-owner.py beta-progress.py cadence-nudge.sh cadence-timer.sh child-check.py cloud-cell-quiesce.sh deploy-crossbox.sh deploy-mac-orchestrator.sh goal-state.py lane-actions.py lane-guard.py lane-read.py lane-scan-fallback.sh lane-watchdog.py lane-wip.py live-workspaces-publisher.py merge-queue.py orch-send.sh orchestrator-heartbeat.sh orphan-reap.py pr-doctor.py objective.py probe-one.py publish-live-workspaces.py queue-dispatch.py safe-send.sh seed-goal-map.py tree-cpu.py turn-classify.py turn-end.py unblock-lane.sh undelivered-answers.py)
+fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-cache-reaper.sh pi-reap-worktrees.sh pi-reap-worktrees-launchd.py cleanup-stale-branches.sh ci_runner_gate.sh ask-owner.py beta-progress.py cadence-nudge.sh cadence-timer.sh child-check.py cloud-cell-quiesce.sh deploy-crossbox.sh deploy-mac-orchestrator.sh goal-state.py lane-actions.py lane-guard.py lane-read.py lane-scan-fallback.sh lane-watchdog.py lane-wip.py live-workspaces-publisher.py merge-queue.py orch-send.sh orchestrator-heartbeat.sh orphan-reap.py pr-doctor.py objective.py probe-one.py publish-live-workspaces.py queue-dispatch.py safe-send.sh seed-goal-map.py tree-cpu.py turn-classify.py turn-end.py unblock-lane.sh undelivered-answers.py)
 mkdir -p "$DEST/scripts"
 fleet_copied=0
 for base in "${fleet_srcs[@]}"; do

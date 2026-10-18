@@ -323,6 +323,50 @@ check_repo() {
   git -C "$WORKDIR" config user.name  "cmux cloud lane"
 }
 
+# ── the machine-global package caches: the disk sink that stopped a cell (agent-infra#1987) ──────
+# MEASURED 2026-10-18 on cell pi-cell-3 (vm-915c3930c4e94e4884229d974522d05d, 32 GB disk):
+#
+#     /tmp/cell-home/.cache/uv    7.1 GB
+#     df /                        258M free   ->  ABORT: disk 258MB < 1200MB
+#
+# and every dispatch was refused while the controller kept beating and the queue read fine. Clearing
+# just the package cache freed 7.1 GB and the same box launched a lane immediately (258MB -> 7.7 GB).
+# It is MACHINE-GLOBAL — every lane's `uv sync`/`uv run` on the box feeds it — so it grows fastest on
+# the boxes that dispatch most, and it is invisible until the disk floor refuses work.
+#
+# This reports the size of each shared sink and the free space on the cell's disk, so a cache eating
+# the disk is visible BEFORE it stops dispatch. It is a REPORT, not a gate: a large cache is
+# fixable in seconds (the hourly `pi-cache-reaper.sh` sweep does it, and the Mac job of the same
+# name does on a laptop), whereas refusing bring-up over it would strand a cell that is otherwise
+# ready. The one thing it must never do is claim a size it could not measure — an unreadable `du`
+# says so instead of printing 0.
+check_caches() {
+  local max_mb path name mb over="" report="" free_mb
+  max_mb="${CACHE_REAPER_MAX_MB:-2048}"
+  free_mb="$(df -Pk "$CELL_HOME" 2>/dev/null | awk 'NR==2 && $4 ~ /^[0-9]+$/ {printf "%d", $4 / 1024}')"
+  for path in "${UV_CACHE_DIR:-$HOME/.cache/uv}" \
+              "${NPM_CACHE_DIR:-$HOME/.npm/_cacache}" \
+              "${PIP_CACHE_DIR:-$HOME/.cache/pip}"; do
+    name="$(basename "$path")"
+    case "$path" in
+      */uv)       name="uv" ;;
+      */_cacache) name="npm" ;;
+      */pip)      name="pip" ;;
+    esac
+    if [ ! -e "$path" ]; then mb="absent"; else
+      mb="$(du -sk "$path" 2>/dev/null | awk 'NR==1 && $1 ~ /^[0-9]+$/ {print int($1 / 1024)}')"
+      [ -n "$mb" ] || mb="UNMEASURABLE"
+    fi
+    report="$report $name=$mb"
+    case "$mb" in ''|*[!0-9]*) ;; *) [ "$mb" -le "$max_mb" ] || over="$over $name=${mb}MB" ;; esac
+  done
+  ok "package caches:$report (bound ${max_mb}MB each) — ${free_mb:-unknown}MB free on $(dirname "$CELL_HOME")"
+  if [ -n "$over" ]; then
+    warn "package cache over the ${max_mb}MB bound:$over — it is shared by EVERY lane on this box and it is what filled pi-cell-3's disk (#1987). The hourly sweep reclaims it; to do it now:"
+    warn "  bash ${HOME:-$CELL_HOME}/.pi/agent/scripts/pi-cache-reaper.sh    (or: cloud-cell-supervisor.sh prune)"
+  fi
+}
+
 # ── dispatch provisioning: can this repo be pre-flighted? (agent-infra#1736) ─────
 # A cell that cannot provision its dispatch scout merges forever with `lanes: 0`, and the
 # controller stays RUNNING while it does — the refresh runs in a BACKGROUNDED subshell, so its
@@ -444,6 +488,7 @@ main() {
       check_provider
       check_gh
       check_repo
+      check_caches
       check_dispatch
       check_operational_layer
       # `CELL READY` is a claim about the cell, and "no pushed credential left on disk" is part of
@@ -451,7 +496,7 @@ main() {
       # too, so the banner is never printed while a registered secret is still there.
       remove_secrets \
         || die "a secret file could not be removed — refusing to report readiness; delete it by hand before using this VM"
-      say "CELL READY — all links verified (home, tools, network, provider, gh auth, push, clone, dispatch pre-flight, operational layer)"
+      say "CELL READY — all links verified (home, tools, network, provider, gh auth, push, clone, disk caches, dispatch pre-flight, operational layer)"
       ;;
     *)
       say "unknown mode: $MODE (use --check)"; exit 2 ;;

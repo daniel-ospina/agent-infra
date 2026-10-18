@@ -1093,6 +1093,27 @@ prunesup --scratch=0
 [ -e "$R/scratch/stale" ] && bad "prune --scratch did not delete an old, unregistered scratch checkout" \
                           || ok "prune --scratch deleted an old, unregistered scratch checkout"
 
+# ── (ii-b) the MACHINE-GLOBAL package caches are in this verb's reach (agent-infra#1987) ─────────
+# The disk gate's refusal TEXT tells the operator to run exactly this command, so if `prune` does not
+# reach the shared caches the remedy is a lie: on pi-cell-3 every dispatch was refused at 258MB free
+# while `~/.cache/uv` held 7.1 GB, and `prune --caches` returned having swept worktree roots only.
+# The verb DELEGATES to the reaper (one policy owner), so the assertions are: it is invoked, and its
+# absence is REPORTED as unswept rather than silently skipped.
+say_case "prune delegates to the package-cache reaper, and names its absence (#1987)"
+REAPER_FIX="$R/home/.pi/agent/scripts/pi-cache-reaper.sh"
+mkdir -p "$(dirname "$REAPER_FIX")"
+printf '#!/bin/sh\necho invoked >> %s/reaper-calls\nexit 0\n' "$R" > "$REAPER_FIX"
+chmod +x "$REAPER_FIX"
+prunesup --caches
+[ -f "$R/reaper-calls" ] && ok "prune --caches INVOKES the package-cache reaper (the shared sinks are in reach)" \
+                          || bad "prune --caches never invoked the reaper — the disk gate's remedy still does not reclaim the measured consumer"
+rm -f "$REAPER_FIX"
+prunesup --caches
+case "$PR_OUT" in
+  *"were NOT swept"*) ok "a missing reaper is REPORTED as unswept, not silently skipped" ;;
+  *) bad "a missing reaper produced no warning (success while freeing nothing) — output: $PR_OUT" ;;
+esac
+
 # ── (iii) the second review round: validated floor, atomic stamp, mirroring, per-commit pins ─────
 say_case "review round: floor validation, atomic stamp, seeding mirror, per-commit pins (#1745)"
 

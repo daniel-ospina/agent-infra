@@ -1412,6 +1412,21 @@ cmd_prune() {
   fi
   before="$(free_mb "$CELL_HOME")"
   tmux has-session -t "$SESSION" 2>/dev/null && say "warn: a controller is running — a pruned venv makes the lane using it re-resolve its deps"
+  # (0b) The MACHINE-GLOBAL package caches (agent-infra#1987). This verb is what the disk gate's
+  # refusal text tells an operator to run (`reclaim with 'cloud-cell-supervisor.sh prune'`), and until
+  # this line existed the measured consumer was NOT in its reach: on 2026-10-18 pi-cell-3 was at
+  # 258MB free with ~/.cache/uv holding 7.1 GB, every dispatch refused, and `prune --caches` returned
+  # having swept worktree roots only. The reaper owns the policy (size bound, prune-then-escalate,
+  # the uv lock gate, refuse-to-act), so this verb DELEGATES rather than reimplementing it — one
+  # implementation, or the two drift and one of them silently stops reclaiming. A missing reaper is
+  # reported, never silently skipped: that is the "success while freeing nothing" shape on the one
+  # command an operator reaches for when the cell is already disk-dead.
+  local reaper="$CELL_HOME/.pi/agent/scripts/pi-cache-reaper.sh"
+  if [ -x "$reaper" ]; then
+    "$reaper" || say "warn: the package-cache sweep reported a cache still over its bound (see $CELL_HOME/.pi/agent/state/pi-cache-reaper.log) — nothing else on this box reclaims it"
+  else
+    say "warn: no package-cache reaper at $reaper — the shared caches (~/.cache/uv, ~/.npm/_cacache, ~/.cache/pip) were NOT swept"
+  fi
   for r in "$REPO" "$HARNESS_REPO"; do
     [ -n "$r" ] || continue
     git -C "$r" rev-parse --git-dir >/dev/null 2>&1 || continue

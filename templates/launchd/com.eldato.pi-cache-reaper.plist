@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- agent-infra-plist-version: 0.1.0 -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- pi-cache-reaper (#1987): the machine-global PACKAGE CACHE is the disk sink nothing bounded.
+         Measured on cell pi-cell-3: ~/.cache/uv at 7.1 GB, / at 258 MB free, and every dispatch
+         refused (`ABORT: disk 258MB < 1200MB`) while the controller kept beating and the queue read
+         fine. Clearing the cache freed 7.1 GB and the same box launched a lane immediately. Unlike
+         the per-lane reapers (#1949 a lane's .venv, #1851/#1858 worktree weight, #1745 worktree-root
+         caches), ~/.cache/uv is fed by EVERY lane on the box, so it grows fastest exactly where the
+         most dispatching happens.
+
+         WHAT THE JOB DOES, per sink (~/.cache/uv, ~/.npm/_cacache, ~/.cache/pip):
+           measure -> `uv cache prune` / `npm cache verify` (the tool's own in-use-safe command) ->
+           escalate ONLY if still over CACHE_REAPER_MAX_MB, and ONLY for entries the cache
+           EXCLUSIVELY owns (every file link-count 1) so a venv's hardlinked payload is never
+           sacrificed for a re-download that frees nothing. The uv escalation is gated on uv's own
+           .lock (flock) and npm/pip on a live-process probe; a probe that cannot answer blocks.
+         One line per sink logs before -> after; a sink still over the bound afterwards makes the
+         job exit 3 loudly rather than report a reclaim that did not happen (the issue's point 4).
+
+         ARMED, unlike the retention sweep above: this content is REGENERABLE BY DEFINITION (a wheel
+         cache), the ladder's first rung is the tool's own prune, and the second rung cannot touch a
+         byte a venv still holds. Disarming is CACHE_REAPER_MAX_MB raised (or an operator editing
+         this file); there is no data-loss class here, so there is no separate arming step.
+         Canonical script: agent-infra/scripts/pi-cache-reaper.sh (farmed to
+         {{HOME}}/.pi/agent/scripts/ by pi-bootstrap/setup.sh; #427: launchd cannot read
+         ~/Documents under macOS TCC). Rendered by scripts/install-launchd.sh (#304). -->
+    <key>Label</key>
+    <string>com.eldato.pi-cache-reaper</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/env</string>
+        <string>bash</string>
+        <string>{{HOME}}/.pi/agent/scripts/pi-cache-reaper.sh</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- launchd's default PATH has no homebrew/bin and no nvm — uv/npm live there. -->
+        <key>PATH</key>
+        <string>{{PATH}}</string>
+        <key>CACHE_REAPER_MAX_MB</key>
+        <string>2048</string>
+    </dict>
+    <key>StartInterval</key>
+    <integer>3600</integer>
+</dict>
+</plist>
