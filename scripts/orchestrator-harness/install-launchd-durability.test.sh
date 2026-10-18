@@ -448,6 +448,20 @@ else bad "lc_hb_age reports nothing for a normal heartbeat"; fi
 printf '%s\n' "$(( $(date +%s) + 30 ))" > "$T/o/heartbeat"
 assert_eq "$( . "$LIB"; lc_hb_age "$T/o" )" "0" "a heartbeat 30s inside the skew band reads as age 0, never negative"
 
+# ⛔ NON-VACUITY (review finding): every other expectation on `lc_hb_value` is 0, and every start
+# fixture seeds the heartbeat with 100 — below the epoch floor, so 0 is what the CORRECT code returns
+# too. Without this line a regression that made `lc_hb_value` return 0 for EVERY input would keep the
+# whole suite green, and it would fail OPEN: with a baseline of 0, `cur > before` is satisfied by any
+# plausible-past heartbeat with no new write at all, so "running but NOT cycling" becomes unreportable.
+past="$(( $(date +%s) - 5 ))"
+printf '%s\n' "$past" > "$T/o/heartbeat"
+got="$( . "$LIB"; lc_hb_value "$T/o" )"
+if [ -n "$got" ] && [ "$got" -ge "$(( past - 3 ))" ] && [ "$got" -le "$(( past + 3 ))" ]; then
+  ok "non-vacuity: a plausible heartbeat is returned as a BASELINE (not folded to 0)"
+else
+  bad "lc_hb_value returned '$got' for a plausible heartbeat at $past — the start proof is vacuous"
+fi
+
 echo "-- B4. a 20-DIGIT run wraps in bash, so it is UNKNOWN — not an instant"
 # ⛔ THE 12-DIGIT LENGTH BOUND IS LOAD-BEARING, NOT DECORATION (review finding), and bash does NOT abort
 # on the overflow: measured `10#99999999999999999999` → 7766279631452241919 with rc 0, so no `set -e`
