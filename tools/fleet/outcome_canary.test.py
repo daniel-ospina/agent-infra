@@ -2218,8 +2218,12 @@ def test_the_GRAPHQL_collector_reads_the_CLOSED_page_AND_a_MERGE_ordered_page():
     genuinely establishes "nothing merged in the window"."""
     m = load()
     cfg = m.cfg_from_dict({"pr_window_s": 10800.0})
-    now = 1792327664.0
-    inside = "2026-10-18T19:40:00Z"          # 64s before `now`
+    # ⛔ `now` IS CHOSEN SO A WINDOW-SIZED SHIFT CHANGES THE DATE. With a mid-afternoon `now` the
+    # `±3h` bound floors to the SAME day, so a mutant that moves it a window into the future — which
+    # on the real surface excludes every in-window merge, i.e. a false NO_PR_MERGED — is
+    # indistinguishable from the correct code. 01:00Z sits 3h from the previous date boundary.
+    now = m.datetime.datetime(2026, 10, 18, 1, 0, tzinfo=m.datetime.timezone.utc).timestamp()
+    inside = m._iso(now - 600)
     closed = [{"number": i, "createdAt": inside, "mergedAt": None} for i in range(100)]
     closed[0] = dict(closed[0], mergedAt=inside)
     calls, merge_rows = [], {"rows": []}
@@ -2233,6 +2237,7 @@ def test_the_GRAPHQL_collector_reads_the_CLOSED_page_AND_a_MERGE_ordered_page():
         if "--state closed" in j:
             return 0, json.dumps(closed)
         if "merged:>=" in j:
+            merge_rows["bound"] = j.split("merged:>=")[1].split()[0].strip('"')
             return 0, json.dumps(merge_rows["rows"])
         return 0, ""
 
@@ -2254,9 +2259,15 @@ def test_the_GRAPHQL_collector_reads_the_CLOSED_page_AND_a_MERGE_ordered_page():
         gh2 = m.collect_github("o/r", cfg, now=now)
         assert gh2["prs_merged_in_window"] == 1, gh2
         assert "merged:>=" in gh2.get("merged_surface", ""), gh2
-        # ⛔ and the merge-ordered read is DATED: an unbounded one would report merges from before
-        # the window as if they had just landed
+        # ⛔ and the merge-ordered read is DATED, AND THE DATE IS THE ONE THAT MATTERS. Asserting only
+        # that a `merged:>=` appears let a mutant move the bound a whole window into the FUTURE (which
+        # excludes every in-window merge on the real surface, i.e. a false NO_PR_MERGED) pass the
+        # entire suite. A day-floored bound can only move EARLIER and `_fill_counts` re-filters with
+        # the exact window, so the query must be a SUPERSET of the window: `bound <= window start`.
         assert any("--search" in c and "merged:>=" in c for c in calls), calls
+        want = m.datetime.datetime.fromtimestamp(
+            now - 10800.0, m.datetime.timezone.utc).strftime("%Y-%m-%d")
+        assert merge_rows.get("bound") == want, (merge_rows.get("bound"), want)
     finally:
         m._run_gh = real
 
@@ -2278,6 +2289,105 @@ def test_the_GRAPHQL_collector_reads_the_CLOSED_page_AND_a_MERGE_ordered_page():
         m._run_gh = real
     assert gh3["merged_page_full"] is True, gh3       # abstain rather than under-count silently
     assert "merge-ordered read failed" in (gh3.get("fallback_note") or ""), gh3
+
+
+@test
+def test_an_EMPTY_backlog_is_judged_against_the_pool_from_ITS_OWN_header():
+    """`backlog=` and `queue=` are written on ONE header line by ONE cycle; the graded token can come
+    from a NEWER `state/queue-state`, which carries no backlog. Pairing its pool with the header's
+    backlog compares two refreshes and reports the difference as a defect (#1931's shape, falsely)."""
+    m = load()
+    cfg = m.cfg_from_dict({"pool_threshold": 25})
+    facts = {"log_events": {"headers": [{"raw": "=== h load=3 lanes=0 backlog=0 queue=READ(10) ===",
+                                         "age_s": 40, "ts": 0, "backlog": 0,
+                                         "queue_token": "READ(10)"}]},
+             "queue_state": {"path": "q", "ok": True, "raw": "READ(223) 1792327000", "age_s": 20.0}}
+    got = [v for v in m.evaluate(facts, cfg) if v.name == "queue_readable"][0]
+    # the header's own pair (backlog=0, pool=10) is not the #1931 shape
+    assert got.status == m.PASS, (got.status, got.variant, got.evidence)
+    assert "READ(223)" in got.evidence, got.evidence       # …and the disagreement is PRINTED
+    # the header's own pair IS the shape when its pool is large
+    facts["log_events"]["headers"][0].update({"queue_token": "READ(223)",
+                                             "raw": "=== h load=3 lanes=0 backlog=0 queue=READ(223) ==="})
+    got2 = [v for v in m.evaluate(facts, cfg) if v.name == "queue_readable"][0]
+    assert (got2.status, got2.variant) == (m.FAIL, "EMPTY_WITH_LARGE_POOL"), (got2.status,
+                                                                             got2.variant)
+
+
+@test
+def test_an_EMPTY_state_record_supersedes_an_older_header_backlog():
+    """`backlog=` is written by ONE cycle header from the PREVIOUS refresh's `candidates.txt`, so it
+    cannot be attributed to a NEWER `state/queue-state`. Measured: header `backlog=47` beside a
+    20s-old `state/queue-state: EMPTY` produced "backlog=47 pool=None (source: state/queue-state)"
+    and two FAILs ("the fleet HAD WORK IN HAND") about a superseded refresh."""
+    m = load()
+    cfg = m.cfg_from_dict({})
+    facts = {"log_events": {"headers": [{"raw": "h", "age_s": 60, "backlog": 47,
+                                        "queue_token": "READ(200)"}]},
+             "queue_state": {"path": "q", "ok": True, "raw": "EMPTY 1792327000", "age_s": 20.0}}
+    busy, why = m._activity(facts, cfg.window_s)
+    assert busy is False, (busy, why)
+    assert "supersedes" in why and "state/queue-state" in why, why
+    # …and when the header is the graded record its backlog is named as the header's own
+    facts2 = {"log_events": {"headers": [{"raw": "h", "age_s": 60, "backlog": 47,
+                                         "queue_token": "READ(200)"}]},
+              "queue_state": {"path": "q", "ok": True, "raw": "READ(200)", "age_s": 900.0}}
+    busy2, why2 = m._activity(facts2, cfg.window_s)
+    assert busy2 is True, (busy2, why2)
+    assert "source: cycle header" in why2, why2
+
+
+@test
+def test_pr_merged_abstains_when_the_activity_input_is_unread():
+    """The two PR checks answer one question, so they must answer it the same way: `pr_created`
+    abstained ACTIVITY_UNKNOWN on the #1931 blind-pool shape while `pr_merged` FAILed NO_PR_MERGED
+    off the very same facts — a FAIL block whose own evidence disclaimed the reading it used."""
+    m = load()
+    cfg = m.cfg_from_dict({})
+    gh = {"ok": True, "prs_merged_in_window": 0, "open_pr_count": 1, "open_prs": [],
+          "source": "rest", "merged_page_full": False, "prs_created_in_window": 0}
+    facts = {"github": gh,
+             "log_events": {"headers": [{"raw": "h", "age_s": 60, "backlog": 0,
+                                         "queue_token": "UNREADABLE"}]},
+             "queue_state": {"path": "q", "ok": False, "error": "permission denied"}}
+    got = dict((v.name, v) for v in m.evaluate(facts, cfg))
+    assert got["pr_merged"].variant == "ACTIVITY_UNKNOWN", (got["pr_merged"].status,
+                                                             got["pr_merged"].variant)
+    assert got["pr_created"].variant == "ACTIVITY_UNKNOWN", got["pr_created"].variant
+    # …and a KNOWN activity still FAILs with open PRs and nothing merged
+    facts2 = {"github": gh,
+              "log_events": {"headers": [{"raw": "h", "age_s": 60, "backlog": 5,
+                                          "queue_token": "READ(200)"}]},
+              "queue_state": {"path": "q", "ok": True, "raw": "READ(200)", "age_s": 60.0}}
+    got2 = dict((v.name, v) for v in m.evaluate(facts2, cfg))
+    assert got2["pr_merged"].variant == "NO_PR_MERGED", (got2["pr_merged"].status,
+                                                         got2["pr_merged"].variant)
+
+
+@test
+def test_the_report_says_WHICH_READ_produced_the_merge_count():
+    """`merged_surface`/`fallback_note` were written by the collector and read by NOTHING, so a
+    report could not tell a window-bounded merge count from a creation-ordered-page count — and the
+    `no-pr-merged` fixture's own stated reason ("the merge-ordered read succeeded and returned
+    nothing") was asserted by no test."""
+    m = load()
+    cfg = m.cfg_from_dict({"pr_window_s": 10800.0})
+    gh = {"ok": True, "prs_merged_in_window": 0, "open_pr_count": 1, "open_prs": [], "source": "graphql",
+          "merged_page_full": False, "merged_surface": "merge-ordered (merged:>=2026-10-18)"}
+    v = m.check_pr_merged({"github": gh}, cfg)
+    assert "merge-ordered (merged:>=2026-10-18)" in v.evidence, v.evidence
+    # the fallback shape discloses the bound it fell back to
+    gh2 = dict(gh, merged_surface=None,
+               fallback_note="merge-ordered read failed (rc=1); merged count is from the "
+                             "creation-ordered closed page")
+    v2 = m.check_pr_merged({"github": gh2}, cfg)
+    assert "creation-ordered closed page" in v2.evidence, v2.evidence
+    # …and the shipped fixture carries exactly the shape it claims
+    d = fx("no-pr-merged")
+    assert d["facts"]["github"]["merged_surface"].startswith("merge-ordered"), d["facts"]["github"]
+    got = [x for x in m.evaluate(d["facts"], m.cfg_from_dict(d["config"])) if x.name == "pr_merged"][0]
+    assert got.variant == "NO_PR_MERGED", (got.status, got.variant)
+    assert "merge-ordered" in got.evidence, got.evidence
 
 
 @test
@@ -3520,6 +3630,29 @@ def test_source_never_contains_a_forbidden_launchctl_form():
 
 MUTATIONS = [
     # (label, old, new, paired test)
+    # ── cycle-23 defects ──────────────────────────────────────────────────────────────────
+    ("the merge-ordered window bound moves a window into the future",
+     "        now - cfg.pr_window_s, datetime.timezone.utc).strftime(\"%Y-%m-%d\")",
+     "        now + cfg.pr_window_s, datetime.timezone.utc).strftime(\"%Y-%m-%d\")",
+     "test_the_GRAPHQL_collector_reads_the_CLOSED_page_AND_a_MERGE_ordered_page"),
+    ("the merge surface never reaches the report",
+     '    merge = gh.get("merged_surface") or gh.get("fallback_note")',
+     "    merge = None",
+     "test_the_report_says_WHICH_READ_produced_the_merge_count"),
+    ("an EMPTY backlog is paired with a pool from another refresh",
+     '    pair = parse_queue_token(hdr.get("queue_token") or "")',
+     '    pair = tok',
+     "test_an_EMPTY_backlog_is_judged_against_the_pool_from_ITS_OWN_header"),
+    ("fleet activity attributes the header's backlog to a newer state record",
+     '    if _src == "state/queue-state" and kind == "EMPTY":',
+     "    if False:",
+     "test_an_EMPTY_state_record_supersedes_an_older_header_backlog"),
+    ("pr_merged FAILs while its own activity input is unread",
+     "    if busy is None:\n"
+     '        # \u26d4 HOISTED ABOVE THE `open_n > 0` ARM.',
+     "    if False:\n"
+     '        # \u26d4 HOISTED ABOVE THE `open_n > 0` ARM.',
+     "test_pr_merged_abstains_when_the_activity_input_is_unread"),
     # ── cycle-22 defects ──────────────────────────────────────────────────────────────────
     ("an unparseable header is graded as a mid-cycle wedge",
      "    if not cycles and unparsed:",

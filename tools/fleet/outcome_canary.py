@@ -963,11 +963,20 @@ def check_queue_readable(f, c):
                  "header: %s has no backlog= field, so 'empty' cannot be checked against it"
                  % hdr.get("raw"),
                  "an incomplete header is not a readable verdict.")
-    if isinstance(backlog, int) and backlog == 0 \
-            and isinstance(pool, int) and pool >= c.pool_threshold:
+    # ⛔ A BACKLOG AND A POOL FROM DIFFERENT RECORDS ARE NOT A PAIR. `backlog=` and `queue=` are
+    # written on ONE header line by ONE cycle, so the header's own pair is consistent; when the graded
+    # token comes from the NEWER `state/queue-state` (which carries no backlog), pairing its pool with
+    # the header's one-refresh-old backlog compares two refreshes and reports the difference as a
+    # defect. The pair is taken from the header, and the state record's own verdict is printed beside
+    # it so a human can see when the two disagree.
+    pair = parse_queue_token(hdr.get("queue_token") or "")
+    pair_pool = pair.get("pool")
+    if isinstance(backlog, int) and not isinstance(backlog, bool) and backlog == 0 \
+            and isinstance(pair_pool, int) and pair_pool >= c.pool_threshold:
         return V("queue_readable", FAIL, "EMPTY_WITH_LARGE_POOL",
-                 "header: %s\nbacklog=0 while the refresh had just READ %d issue(s) "
-                 "(threshold %d)\n%s" % (hdr.get("raw"), pool, c.pool_threshold, state_txt),
+                 "header: %s\nbacklog=0 while the SAME header had just READ %d issue(s) "
+                 "(threshold %d)\ngraded record: %s (pool %s)\n%s"
+                 % (hdr.get("raw"), pair_pool, c.pool_threshold, raw_tok, pool, state_txt),
                  "the refresh produced an EMPTY backlog out of a pool it had just read as large. "
                  "Either the pool read was wrong (a refresh defect, #1931) or every issue is "
                  "already claimed — the evidence above is what tells the two apart.")
@@ -1390,10 +1399,21 @@ def _activity(f, window_s=None):
     pool = _tok.get("pool")
     kind = _tok.get("kind")
     age_txt = _age_txt(hdr.get("age_s"))
+    # ⛔ `backlog=` IS WRITTEN BY ONE CYCLE HEADER (from `candidates.txt`, produced by the PREVIOUS
+    # refresh — `orch-loop.sh` writes the header at the top and refreshes later), so it cannot be
+    # attributed to a NEWER `state/queue-state` record. Measured: header `backlog=47` beside a 20s-old
+    # `state/queue-state: EMPTY` produced `backlog=47 pool=None (source: state/queue-state)` and two
+    # FAILs ("the fleet HAD WORK IN HAND") about a refresh that had already been superseded. The
+    # graded record's own verdict wins: a current EMPTY says there is nothing to dispatch.
+    backlog_src = "cycle header"
+    if _src == "state/queue-state" and kind == "EMPTY":
+        return False, ("the graded record is state/queue-state: EMPTY (%s) — it supersedes the "
+                       "%s cycle header's backlog=%s" % (age_txt, backlog_src, backlog))
     busy = bool((isinstance(backlog, int) and not isinstance(backlog, bool) and backlog > 0)
                 or (isinstance(pool, int) and not isinstance(pool, bool) and pool > 0))
     if busy:
-        return True, "backlog=%s pool=%s (source: %s, %s)" % (backlog, pool, _src, age_txt)
+        return True, "backlog=%s (source: %s, %s) pool=%s (source: %s)" % (
+            backlog, backlog_src, age_txt, pool, _src)
     # ⛔ "NOTHING IN HAND" IS A CLAIM, AND AN UNREAD POOL CANNOT SUPPORT IT. Every non-numeric kind
     # fell through to `busy=False`, so a box whose refresh answered `UNREADABLE` — the #1931 shape
     # this file fixes everywhere else — was reported as benign idleness by `pr_created` while
@@ -1402,15 +1422,21 @@ def _activity(f, window_s=None):
     if kind not in ("EMPTY", "READ", "PARTIAL") or (kind == "READ" and not isinstance(pool, int)):
         return None, ("the pool reading is %s (source: %s, %s), so 'the fleet had nothing in hand' "
                       "is not established" % (_tok.get("raw") or "(absent)", _src, age_txt))
-    return False, "backlog=%s pool=%s (source: %s, %s)" % (backlog, pool, _src, age_txt)
+    return False, "backlog=%s (source: %s, %s) pool=%s (source: %s)" % (
+        backlog, backlog_src, age_txt, pool, _src)
 
 
 def _gh_surface_txt(gh):
     src = gh.get("source")
-    if not src:
-        return "surface: none (gh unreadable)"
     note = gh.get("fallback_reason")
-    return "surface: %s%s" % (src, (" (%s)" % note) if note else "")
+    txt = ("surface: %s%s" % (src, (" (%s)" % note) if note else "")) if src \
+        else "surface: none (gh unreadable)"
+    # ⛔ WHICH READ PRODUCED THE MERGE COUNT IS PART OF THE EVIDENCE. The merge count comes from a
+    # separate, merge-ordered read; when that read FAILED the count falls back to a creation-ordered
+    # page and the bound is admitted. `merged_surface`/`fallback_note` were written by the collector
+    # and read by NOTHING, so a report could not tell a window-bounded count from a page-bounded one.
+    merge = gh.get("merged_surface") or gh.get("fallback_note")
+    return "%s\nmerged count from: %s" % (txt, merge) if merge else txt
 
 
 def check_pr_created(f, c):
@@ -1495,15 +1521,21 @@ def check_pr_merged(f, c):
                  "merge older than the page cut cannot be seen",
                  "the merge population is truncated, so 'nothing merged in the window' is not "
                  "established. Not green.")
-    if isinstance(open_n, int) and open_n > 0:
+    if busy is None:
+        # ⛔ HOISTED ABOVE THE `open_n > 0` ARM. The two PR checks answer one question, so they must
+        # answer it the same way: `pr_created` abstained ACTIVITY_UNKNOWN on the #1931 blind-pool
+        # shape while `pr_merged` FAILed NO_PR_MERGED off the very same facts, with its own evidence
+        # line saying "the pool reading is UNREADABLE … so 'the fleet had nothing in hand' is not
+        # established" — a FAIL block that disclaims the reading it used, and the block `main`
+        # turns into a delivered message. The `open_n > 0` arm keeps its FAIL when activity IS known.
+        return V("pr_merged", INCONCLUSIVE, "ACTIVITY_UNKNOWN", ev + "\nfleet activity: %s" % why,
+                 "whether the fleet had work in hand could not be read, so 'nothing merged' is "
+                 "neither a failure nor an idle. Not green.")
+    if isinstance(open_n, int) and not isinstance(open_n, bool) and open_n > 0:
         return V("pr_merged", FAIL, "NO_PR_MERGED", ev + "\nfleet activity: %s" % why,
                  "%d PR(s) are open and nothing merged in %.1fh. Every component can be 'up' while "
                  "the fleet ships nothing — that is this check's whole reason to exist."
                  % (open_n, win / 3600.0))
-    if busy is None:
-        return V("pr_merged", INCONCLUSIVE, "ACTIVITY_UNKNOWN", ev + "\nfleet activity: %s" % why,
-                 "whether the fleet had work in hand could not be read, so 'nothing merged' is "
-                 "neither a failure nor an idle. Not green.")
     if busy:
         return V("pr_merged", FAIL, "NO_PR_MERGED", ev + "\nfleet activity: %s" % why,
                  "the fleet had work in hand and merged nothing in %.1fh." % (win / 3600.0))
@@ -3088,7 +3120,12 @@ def _collect_graphql(gh, repo, cfg, now, errors):
     # abstained). One MERGE-ORDERED read answers it exactly: `merged:>=<date>` returns the merges in
     # the window, so an EMPTY result genuinely establishes "nothing merged" and a non-empty one is
     # the count. The closed page stays for the created population.
-    since = datetime.datetime.utcfromtimestamp(now - cfg.pr_window_s).strftime("%Y-%m-%d")
+    # `utcfromtimestamp` is DEPRECATED and scheduled for removal; under 3.12 (what CI runs) the
+    # warning is one `-W error` away from a traceback inside `collect_live`, which exits 1 — the code
+    # the docs define as "a real FAIL". The date is floored to a DAY, which can only move the bound
+    # EARLIER, and `_fill_counts` re-filters with the exact window, so the query is a superset.
+    since = datetime.datetime.fromtimestamp(
+        now - cfg.pr_window_s, datetime.timezone.utc).strftime("%Y-%m-%d")
     rc, txt = _run_gh([gh, "pr", "list", "--repo", repo, "--state", "merged", "--limit", "100",
                        "--search", "merged:>=%s" % since, "--json", "number,mergedAt,createdAt"])
     merged_in_window_rows = None
