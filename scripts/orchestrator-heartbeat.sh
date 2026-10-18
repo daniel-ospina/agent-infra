@@ -920,15 +920,31 @@ MSG="${MSG} ⛔ PRIORITY: before dispatching, read the ranked order IN THE GRAPH
 # instructions the owner gave plus the closing line, defined ONCE and embedded VERBATIM in both
 # bodies; only the (1)(2)(3) numbering and the one elaboration sentence below belong to the alert
 # body alone. That is what lets the coverage assertion be COMPLETE instead of a list of tokens:
-# tests/heartbeat-fleet-advance/run.sh asserts each of these sentences verbatim in the DELIVERED
-# quiet beat AND the delivered alert beat, so no condensation can drop, reword or soften an
-# instruction -- a variant can differ only by elaboration. (Reviewer-driven: three rounds of
-# "delete this phrase, suite stays green" mutants, each pointing at a different word, are all the
-# same defect -- a marker per phrase cannot be exhaustive; a shared sentence can.)
-# MEASURED 2026-10-18: the core is 618 chars and the alert body 707, so the order adds ~618 to a
-# ~970-char quiet beat -- still the largest single clause there, and deliberately so: it is the only
-# clause that tells the lane to DO something. The quiet body's ceiling is bounded on the VARIANT
-# (not derived from it), so growth of this text fails CI rather than silently re-inflating the pulse.
+# tests/heartbeat-fleet-advance/run.sh pins each of these sentences verbatim in the DELIVERED quiet
+# beat, the DELIVERED busy-fleet short beat and the DELIVERED alert beat, so no condensation can
+# drop, reword or soften an instruction, and pins both composed literals to their EXACT documented
+# text so nothing can be ADDED to one body either (an added clause -- even a contradictory one --
+# is a variant differing by more than elaboration). (Reviewer-driven: round after round of "delete
+# this phrase, suite stays green" mutants, each pointing at a different word, were all the same
+# defect -- a marker per phrase cannot be exhaustive; a shared sentence can.)
+# ⛔ THE ONE OWNER-ORDERED SENTENCE THAT IS ALERT-ONLY IS DELIBERATE: order (2)'s "not described in
+# a paragraph about load" rides FLEETADV alone. FA2 keeps the normative half ("USE THE CAPACITY, DO
+# NOT REPORT IT"), and the short body is where the pulse must stay short. Adding that elaborating
+# sentence to the quiet beat means raising the quiet-body ceiling in the suite DELIBERATELY, not
+# tweaking a literal until it fits.
+# MEASURED 2026-10-18: the SHORT rendering is 618 chars and the alert body's CLAUSE 707 (the
+# delivered alert body is ~4.3k, most of it the verdict legend). The order adds ~618 to a ~970-char
+# quiet beat -- still the largest single clause there, and deliberately so: it is the only clause
+# that tells the lane to DO something. BOTH bounds are FIXED numbers in the suite, never derived
+# from the text they bound: the order at 700 chars, the delivered quiet body at 1700 (shipped 1590)
+# -- so growth fails CI instead of silently re-inflating the pulse. Bounding only the clause left
+# the body itself unguarded (measured: an unrelated clause bloated to 2401 chars with the suite
+# green), which is why both are pinned.
+# ⛔ NOT THE DOMINANT SENDER (stated, not absorbed): scripts/cadence-nudge.sh is the cadence FLOOR
+# and, per its own header and this file's note below, the sender that SURVIVES when this tick is
+# killed at its budget -- and it carries no advance order either. That is a separate sender with its
+# own constraints (offline, one giant MSG line) and is filed as agent-infra#1993; this clause is the
+# tick's, which is what #1991 names.
 # ⛔ NO BACKTICKS, NO DOUBLE QUOTES AND NO $ IN FA1..FA4 -- the same rule as the rest of MSG (see
 # the warning above): MSG is a DOUBLE-QUOTED assignment, so a backticked span is command-substituted
 # AT ASSIGNMENT TIME and silently vanishes, leaving a hole the file on disk still looks right about.

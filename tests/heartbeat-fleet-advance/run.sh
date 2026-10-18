@@ -40,6 +40,11 @@
 #      carries all four sentences verbatim. That is the unconditionality proof: nothing but an
 #      unconditional append could have put them there. The alert body's elaboration must be
 #      ABSENT here (that is what makes the two bodies distinguishable at runtime).
+#   1b. THE BUSY BEAT — the same SHORT FORM with a fleet that is actually running (one WORKING
+#      lane, so N_TOTAL=1). Added in review: §1 alone proves the order at ONE point in the state
+#      space, and a mutant that empties the order only when the fleet is non-empty therefore
+#      stayed green — the exact "it must not be conditional" defect this suite exists for.
+#      Every sentence must be present exactly ONCE, which also kills a duplicate append.
 #   2. THE FULL BEAT — the alert body (built before the short-form overwrite) carries the same
 #      four sentences verbatim, plus the elaboration.
 #   3. PROPORTIONALITY — the quiet beat is genuinely the shorter body, and the SHORT wording is
@@ -71,6 +76,10 @@ fail(){ checks=$((checks + 1)); failures=$((failures + 1)); echo "  FAIL $1"; }
 # assertion, i.e. exactly backwards. Case globs have no upstream writer to race with.
 # `hasi` lowercases the haystack: the shipped text may shout, the assertion may not care.
 hasi(){ case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in *"$2"*) return 0 ;; *) return 1 ;; esac; }
+# `count_of` — how many times a needle occurs. Not a quiet grep: `grep -o` writes to the pipe, so
+# there is no SIGPIPE race under `pipefail`, and an exact count is what makes "the order appears
+# twice" (a duplicate append inflating every quiet beat) a red instead of a pass.
+count_of(){ printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | grep -o -F "$2" | wc -l | tr -d ' '; }
 
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 
@@ -78,8 +87,10 @@ echo "0. the clause under test is the SHIPPED one"
 if [ ! -f "$HB" ]; then
   echo "❌ heartbeat-fleet-advance suite: $HB not found"; exit 1
 fi
-# The four order sentences, read from the SHIPPED source — not restated here, or this suite
-# would drift from the text it claims to pin. `text_of` returns the assignment's value.
+# `text_of` returns an assignment's VALUE from the shipped script. It feeds the FORMATION checks,
+# the "defined exactly once" check and the rendered-length ceiling — it is NEVER the source of the
+# CONTENT expectation. The content expectation is the fixed `ORDER` array further down (see the ⛔ note
+# in the header: a suite whose expectations come from the artifact cannot fail on the artifact).
 text_of(){ sed -n "s/^$1=\"\\(.*\\)\"$/\\1/p" "$HB" | head -1; }
 for _v in FA1 FA2 FA3 FA4 FLEETADV FLEETADV_SHORT; do
   case "$(sed -n "s/^$_v=\"\\(.*\\)\"$/\\1/p" "$HB" | wc -l | tr -d ' ')" in
@@ -87,13 +98,15 @@ for _v in FA1 FA2 FA3 FA4 FLEETADV FLEETADV_SHORT; do
     *) fail "$_v must be defined exactly once (found $(sed -n "s/^$_v=\".*\$/X/p" "$HB" | wc -l | tr -d ' ')) — two copies diverge" ;;
   esac
 done
-# EXECUTABLE position: comments stripped BEFORE counting, so a clause that survives only in a
-# comment (or was deleted) fails here rather than being "found" in the prose that explains it.
-_live_hits="$(sed 's/#.*//' "$HB" | grep -c 'FLEETADV' || true)"
+# EXECUTABLE position: comments stripped BEFORE counting, and only APPEND sites counted (a count of
+# the word `FLEETADV` is satisfied by the two definition lines alone, which the define-once loop above
+# already guarantees — measured in review: with both appends commented out this check still printed
+# "ok, 2 sites"). Two appends are required: the alert body's, and the short-form branch's.
+_live_hits="$(sed 's/#.*//' "$HB" | grep -cE '^[[:space:]]*MSG="\$\{MSG\} \$\{FLEETADV(_SHORT)?\}"' || true)"
 if [ "${_live_hits:-0}" -ge 2 ]; then
-  pass "the clause is referenced in executable position (${_live_hits} sites, not only in comments)"
+  pass "the order is appended in executable position at ${_live_hits} sites (not only in comments)"
 else
-  fail "FLEETADV is absent or commented out in orchestrator-heartbeat.sh — the order would never ship"
+  fail "the order is not appended at both bodies (found ${_live_hits:-0} append site(s)) — the order would never ship"
   echo "❌ heartbeat-fleet-advance suite: the clause is not wired"; exit 1
 fi
 # FORMATION. Each SENTENCE must be a single double-quoted literal with nothing inside that bash
@@ -116,12 +129,24 @@ for _v in FLEETADV FLEETADV_SHORT; do
     *'$'*) fail "$_v contains a \$-reference other than \${FA1}..\${FA4} — bash would expand it" ;;
     *'`'*) fail "$_v contains a backtick — bash would command-substitute it away at assignment" ;;
     *'"'*) fail "$_v contains a double quote — it would terminate the literal early" ;;
-    *)     if hasi "$_raw" '${fa1}' && hasi "$_raw" '${fa2}' && hasi "$_raw" '${fa3}' && hasi "$_raw" '${fa4}'; then
-             pass "$_v is composed of \${FA1}..\${FA4} and nothing bash would interpret"
-           else
-             fail "$_v does not embed all four order sentences — a body would miss an instruction"
-           fi ;;
+    *)     pass "$_v contains nothing bash would interpret beyond its \${FA1}..\${FA4} references" ;;
   esac
+done
+# COMPOSITION, EXACTLY. "The variant carries the four sentences" permits ADDITION: a clause can be
+# appended to one body only (measured in review: " ⛔ DO NOT MERGE ANYTHING THIS CYCLE." shipped in
+# every quiet beat with this suite green at 34/34, because 662 chars is still under the ceiling). The
+# design says a variant may differ ONLY by elaboration, so both bodies are pinned to their FULL exact
+# text — header, order, separators and the alert-only elaboration — and nothing else may be in them.
+_elab_expected="Lanes must be running on real work, not described in a paragraph about load."
+_EXPECT_SHORT='⛔ FLEET ADVANCE — an ORDER, not a report. ${FA1} ${FA2} ${FA3} ${FA4} '
+_EXPECT_FULL="⛔ FLEET ADVANCE — an ORDER, not a report. (1) \${FA1} (2) \${FA2} ${_elab_expected} (3) \${FA3} \${FA4} "
+for _pair in "FLEETADV:$_EXPECT_FULL" "FLEETADV_SHORT:$_EXPECT_SHORT"; do
+  _name="${_pair%%:*}"; _want="${_pair#*:}"
+  if [ "$(text_of "$_name")" = "$_want" ]; then
+    pass "$_name is EXACTLY its documented composition (no added clause, no reordering, no rephrase)"
+  else
+    fail "$_name differs from its documented composition — a variant may differ only by elaboration (got: $(text_of "$_name"))"
+  fi
 done
 # PLACEMENT. The full-body append must be a column-0 statement (an indented one lives inside an
 # `if`, which would make the order conditional); the short-form append must be indented, i.e.
@@ -145,8 +170,8 @@ echo ""
 # The `ask` knob selects the two message bodies:
 #   ask=0  every conditional input empty -> the QUIET/PULSE path -> the SHORT FORM
 #   ask=1  a routed question             -> the alert body (built BEFORE the short-form overwrite)
-sandbox(){ # sandbox <dir> <ask:0|1>
-  local h="$1" ask="$2"
+sandbox(){ # sandbox <dir> <ask:0|1> [lanes:empty|busy|alert]
+  local h="$1" ask="$2" lanes="${3:-empty}"
   mkdir -p "$h/.pi/agent/scripts" "$h/.pi/agent/state" "$h/.pi/agent/sessions/s1" "$h/bin"
   # The registry only has to be READABLE (the tick exits early without it) — its content is
   # never the subject of this suite.
@@ -160,8 +185,18 @@ sandbox(){ # sandbox <dir> <ask:0|1>
     > "$h/.pi/agent/scripts/beta-progress.py"
   printf '#!/usr/bin/env python3\nprint("QUEUE: 12 open, no verdict")\n' > "$h/.pi/agent/scripts/merge-queue.py"
   printf '#!/usr/bin/env python3\nprint("OBJECTIVE ok")\n' > "$h/.pi/agent/scripts/objective.py"
-  printf '#!/usr/bin/env python3\nimport json,sys\njson.dump([], sys.stdout)\n' \
-    > "$h/.pi/agent/scripts/lane-status.py"
+  # The fleet view the tick consumes. `lane-status.py` is the ONLY source of N_TOTAL / N_ACT /
+  # N_ALERT, and its rows are what make a beat "busy" or "alerting" — see `sandbox` callers.
+  case "$lanes" in
+    # a fleet that is running: short form, but N_TOTAL=1 (see §1b)
+    busy)  _rows='[{"lane":"cell-2","ws":"s1","verdict":"WORKING"}]' ;;
+    # a lane needing attention: EMPTY is in NURT but not WEAK, so no screen is attempted and the
+    # alert fires — the full body, with N_ALERT=1
+    alert) _rows='[{"lane":"2b","ws":"w2","verdict":"EMPTY"}]' ;;
+    *)     _rows='[]' ;;
+  esac
+  printf '#!/usr/bin/env python3\nimport json,sys\njson.dump(%s, sys.stdout)\n' \
+    "$_rows" > "$h/.pi/agent/scripts/lane-status.py"
   chmod +x "$h/.pi/agent/scripts"/*.py
   # `cmux` — the orchestrator pane must report a live pi (else the liveness guard withholds the
   # send), the pane must not look mid-turn (else the idle guard withholds it), and `send` is
@@ -227,10 +262,13 @@ else
     pass "no conditional clause fired in the quiet beat (only an unconditional append could add it)"
   fi
   for i in 0 1 2 3; do
-    if hasi "$quiet" "$(printf '%s' "${ORDER[$i]}" | tr '[:upper:]' '[:lower:]')"; then
-      pass "  quiet beat carries canonical sentence $((i + 1)) VERBATIM"
-    else
+    _n="$(count_of "$quiet" "$(printf '%s' "${ORDER[$i]}" | tr '[:upper:]' '[:lower:]')")"
+    if [ "$_n" = "1" ]; then
+      pass "  quiet beat carries canonical sentence $((i + 1)) VERBATIM, exactly once"
+    elif [ "$_n" = "0" ]; then
       fail "  quiet beat is MISSING (or has reworded) canonical sentence $((i + 1)): ${ORDER[$i]}"
+    else
+      fail "  quiet beat carries canonical sentence $((i + 1)) ${_n} times — a duplicate append doubles the order"
     fi
   done
   # The alert body's elaboration must not be here — it is what makes the two bodies different,
@@ -240,6 +278,37 @@ else
   else
     pass "the quiet beat omits the alert-only elaboration (it carries the short body)"
   fi
+fi
+
+echo ""
+echo "1b. a BUSY fleet's short beat (N_TOTAL=1, N_ACT=1) carries the same four sentences, verbatim"
+# Review finding: §1 pins the order at ONE point in the state space — an empty fleet. A mutant of the
+# form `[ "$N_TOTAL" -gt 0 ] && FLEETADV_SHORT=""` (skip the order when the fleet is actually running)
+# is therefore green at 34/34, and it reproduces exactly the defect this suite exists for. The order is
+# unconditional, so the short form is checked with lanes present too.
+h="$TMP/busy"; sandbox "$h" 0 busy
+busy="$(beat "$h" "$HB")"
+if [ -z "$busy" ]; then
+  fail "the busy short beat produced NO message — the tick exited before sending (guard changed?)"
+elif ! hasi "$busy" "1active/"; then
+  fail "the busy sandbox did not report an active lane — N_TOTAL would still be 0 and this proves nothing"
+else
+  pass "the busy beat really carries a running lane (N_TOTAL=1, N_ACT=1)"
+  if hasi "$busy" "no alerts."; then
+    pass "the busy beat is still the SHORT form (no alerts, so the pulse path)"
+  else
+    fail "the busy beat did not take the short form — §1b would not be testing the pulse path"
+  fi
+  for i in 0 1 2 3; do
+    _n="$(count_of "$busy" "$(printf '%s' "${ORDER[$i]}" | tr '[:upper:]' '[:lower:]')")"
+    if [ "$_n" = "1" ]; then
+      pass "  busy short beat carries canonical sentence $((i + 1)) VERBATIM, exactly once"
+    elif [ "$_n" = "0" ]; then
+      fail "  busy short beat is MISSING (or has reworded) canonical sentence $((i + 1)) — the order became conditional on the fleet being empty"
+    else
+      fail "  busy short beat carries canonical sentence $((i + 1)) ${_n} times — a duplicate append"
+    fi
+  done
 fi
 
 echo ""
@@ -269,6 +338,30 @@ else
 fi
 
 echo ""
+echo "2b. an ALERTING fleet's full beat (N_ALERT=1) carries the same four sentences"
+# The mirror of §1b on the other branch: a mutant that empties the order only when an alert fires
+# (`[ "$N_ALERT" -gt 0 ] && FLEETADV=""`) is green without this point in the state space.
+h="$TMP/alert"; sandbox "$h" 0 alert
+alertb="$(beat "$h" "$HB")"
+if [ -z "$alertb" ]; then
+  fail "the alerting beat produced NO message — the tick exited before sending (guard changed?)"
+elif ! hasi "$alertb" "2b:empty"; then
+  fail "the alert sandbox did not report the alert — N_ALERT would be 0 and this proves nothing"
+else
+  pass "the alerting beat really carries the alert (N_ALERT=1)"
+  for i in 0 1 2 3; do
+    _n="$(count_of "$alertb" "$(printf '%s' "${ORDER[$i]}" | tr '[:upper:]' '[:lower:]')")"
+    if [ "$_n" = "1" ]; then
+      pass "  alerting beat carries canonical sentence $((i + 1)) VERBATIM, exactly once"
+    elif [ "$_n" = "0" ]; then
+      fail "  alerting beat is MISSING (or has reworded) canonical sentence $((i + 1)) — the order became conditional on there being an alert"
+    else
+      fail "  alerting beat carries canonical sentence $((i + 1)) ${_n} times — a duplicate append"
+    fi
+  done
+fi
+
+echo ""
 echo "3. proportionality: the quiet body is the SHORTER one, and the short wording is bounded"
 if [ -n "$quiet" ] && [ -n "$full" ]; then
   if [ "${#quiet}" -lt "${#full}" ]; then
@@ -288,6 +381,19 @@ for _i in 1 2 3 4; do
   _rend="${_rend//"\${FA$_i}"/$_val}"
 done
 _short_text="$_rend"
+# The DELIVERED quiet body itself, not just the order inside it. Review finding: bounding only the
+# variant left the pulse unbounded — a mutant adding six copies of the MAP sentence to the short-form
+# literal produced a 2316-char quiet beat with this suite green, i.e. the 2396-char wall the SHORT FORM
+# exists to prevent came back unguarded. Shipped is 1590, so 1700 leaves room for incidental growth and
+# nothing for another clause.
+_body_ceiling=1700
+if [ -n "$quiet" ] && [ "${#quiet}" -lt "$_body_ceiling" ]; then
+  pass "the delivered quiet beat is under the fixed ${_body_ceiling}-char ceiling (${#quiet} chars)"
+elif [ -n "$quiet" ]; then
+  fail "the delivered quiet beat is ${#quiet} chars, over the fixed ${_body_ceiling}-char ceiling — the pulse is becoming a wall"
+else
+  fail "the delivered quiet beat could not be measured — §1 produced no message"
+fi
 if [ "${#_short_text}" -lt "$_ceiling" ]; then
   pass "the SHORT wording is under the fixed ${_ceiling}-char ceiling (${#_short_text} chars)"
 else
@@ -327,7 +433,7 @@ echo ""
 # the suite still reports green (measured in review: 30-of-36 absorbed three such deletions). At the
 # exact count any removal is red. Adding assertions is safe; REMOVING one means lowering this number
 # deliberately, which is the point.
-MIN_CHECKS=34
+MIN_CHECKS=48
 if [ "$checks" -lt "$MIN_CHECKS" ]; then
   fail "only $checks assertions ran, below the shipped floor of $MIN_CHECKS — a check was removed"
 fi
