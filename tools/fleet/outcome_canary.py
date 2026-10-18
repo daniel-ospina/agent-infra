@@ -836,9 +836,12 @@ def check_queue_readable(f, c):
                     if unparsed else ""),
                  "the refresh did not run in the window, so its verdict cannot be read. Not green.")
 
-    tok = parse_queue_token(hdr.get("queue_token"))
-    raw_tok = hdr.get("queue_token") or "(absent)"
+    # ⛔ THE AUTHORITATIVE TOKEN, not merely the newest header's: see `authoritative_queue_token`.
+    tok, raw_tok, tok_src = authoritative_queue_token(f, hdr)
     state_txt = _queue_state_file_txt(f)
+    if tok_src != "cycle header":
+        state_txt += "\nqueue verdict graded from: %s (it is NEWER than the header token %s)" % (
+            tok_src, hdr.get("queue_token") or "(absent)")
     backlog = hdr.get("backlog")
 
     if tok["kind"] == "UNREADABLE":
@@ -961,6 +964,44 @@ def _queue_frozen_txt(f, stale):
     return "\n".join(lines)
 
 
+# `gh pr list --json statusCheckRollup` builds `contexts(first:100)` and drops `pageInfo`, so a
+# rollup at the bound may be missing checks entirely. One bound, named once.
+GRAPHQL_ROLLUP_PAGE = 100
+
+
+def rollup_truncated(rollup):
+    """True when a rollup read reached the GraphQL page bound (it may be missing checks)."""
+    return isinstance(rollup, list) and len(rollup) >= GRAPHQL_ROLLUP_PAGE
+
+
+def authoritative_queue_token(f, hdr):
+    """(token, raw, source) — the NEWER of the header token and `state/queue-state`'s own verdict.
+
+    ⛔ THE HEADER TOKEN IS ALWAYS ONE REFRESH OLD, AND THE STATE RECORD WAS NEVER PARSED. `orch-loop.sh`
+    writes the cycle header at the TOP of a cycle (`:832`) and runs `refresh-candidates.sh` LATER in
+    the same cycle (`:1607`), so the newest header's `queue=` token is derived from the PREVIOUS
+    refresh and `state/queue-state` is always the newer record. Only its epoch was read, so a
+    header `EMPTY(3m)` beside a 40s-old `state/queue-state: UNREADABLE` graded
+    `PASS/READABLE` + `PASS/IDLE_EMPTY_POOL` and exit 0, with no message — agent-infra#1931
+    ("the fleet is BLIND, which is not 'nothing to do'") recorded as health. Measured on this box:
+    header `queue=READ(218)` beside `state/queue-state: PARTIAL(P2-moderate)`.
+
+    Ties and unaged records resolve to the header (the documented shape); a state record that is
+    newer and readable wins, because it is what the fleet actually concluded.
+    """
+    hdr_tok = parse_queue_token(hdr.get("queue_token") if hdr else "")
+    qs = f.get("queue_state") or {}
+    qs_raw = (qs.get("raw") or "").strip()
+    qs_tok = parse_queue_token(qs_raw) if qs_raw else None
+    if (qs.get("ok") is not False and qs_tok is not None
+            and qs_tok["kind"] != "UNPARSEABLE"):
+        hdr_age = hdr.get("age_s") if hdr else None
+        qs_age = qs.get("age_s")
+        if qs_age is not None and (hdr_age is None or qs_age < hdr_age):
+            return qs_tok, qs_raw.split()[0] if qs_raw.split() else qs_raw, "state/queue-state"
+    return hdr_tok, (hdr.get("queue_token") or "(absent)") if hdr else "(absent)", "cycle header"
+
+
 def _queue_state_file_txt(f):
     qs = f.get("queue_state") or {}
     if qs.get("ok") is False:
@@ -996,7 +1037,11 @@ def check_work_dispatched(f, c):
     skipped = newest_with_age(events.get("dispatch_skipped"), win)
     hdr = newest_with_age(events.get("headers"), win)
     backlog = hdr.get("backlog") if hdr else None
-    pool = parse_queue_token(hdr.get("queue_token") if hdr else "").get("pool")
+    # The SAME authoritative token `queue_readable` grades, so the two checks cannot disagree about
+    # whether the pool was read as empty (they did: header EMPTY, state UNREADABLE).
+    _tok, _raw, _src = authoritative_queue_token(f, hdr)
+    pool = _tok.get("pool")
+    pool_kind = _tok.get("kind")
     last_ok = newest(events.get("dispatch_ok"))
 
     ev_lines = []
@@ -1036,9 +1081,36 @@ def check_work_dispatched(f, c):
     # outcome is a PASS on "everything is up and nothing ships" — measured: 110 of 110 real batch
     # lines are followed by `#N: lane-N (implement+PR)`, so the proof is in the tail and unpriced.
     if ok is not None:
-        started = newest_with_age(events.get("lane_started"), win)
-        spawn_fail = newest_with_age(events.get("lane_failed"), win)
+        # ⛔ THE SPAWN MUST BELONG TO THE BATCH BEING GRADED. `newest_with_age` over ALL lane lines
+        # meant an OLDER cycle's spawn vouched for the newest batch: measured input — previous batch
+        # (540s) spawned 4400/4401, newest batch (60s) spawned nothing → PASS/DISPATCHED and exit 0,
+        # which is precisely the silently-failed spawn (`dispatch-merge.sh` has no `else` on the
+        # `tmux new-session` branch) this check exists to catch. A spawn cannot precede its intent,
+        # so it must be for one of this batch's issues and no older than the batch line.
+        batch_issues = [str(i) for i in (ok.get("issues") or [])]
+        ok_age = ok.get("age_s")
+
+        def _is_this_batch(e):
+            if e is None:
+                return False
+            if batch_issues and str(e.get("issue")) not in batch_issues:
+                return False
+            if e.get("age_s") is None or ok_age is None:
+                return False
+            # +2s: both take their age from the same cycle header, but a per-line timestamp (or a
+            # second-granularity difference) must not turn a real spawn into an abstention.
+            return e["age_s"] <= ok_age + 2.0
+
+        all_started = events.get("lane_started") or []
+        all_failed = events.get("lane_failed") or []
+        started = newest_with_age([e for e in all_started if _is_this_batch(e)], win)
+        spawn_fail = newest_with_age([e for e in all_failed if _is_this_batch(e)], win)
+        foreign = newest([e for e in all_started if not _is_this_batch(e)])
         spawn_txt = ""
+        if started is None and foreign is not None:
+            # Named, so a truncated tail and a silent spawn failure stay distinguishable in one read.
+            spawn_txt = ("\nlane spawn for a DIFFERENT batch (%s): %s — it does not vouch for this "
+                         "one" % (_age_txt(foreign.get("age_s")), foreign.get("raw")))
         if started is not None:
             spawn_txt = "\nlane spawn (%s): #%s lane-%s (implement+PR)" % (
                 _age_txt(started.get("age_s")), started.get("issue"), started.get("lane"))
@@ -1083,7 +1155,11 @@ def check_work_dispatched(f, c):
                  "window. Work existed and did not move." % backlog)
 
     # No dispatch, no refusals, nothing in the backlog: is that IDLE or BLIND?
-    pool_kind = parse_queue_token(hdr.get("queue_token") if hdr else "").get("kind") if hdr else None
+    # ⛔ THE SAME AUTHORITATIVE TOKEN `queue_readable` GRADES. Reading the header's token here while
+    # `queue_readable` read the newer state record let a BLIND refresh be called IDLE: header
+    # `EMPTY` + newer `state/queue-state: UNREADABLE` → PASS/IDLE_EMPTY_POOL (agent-infra#1931 as
+    # health). One source, both checks.
+    pool_kind = pool_kind if hdr is not None else None
     if hdr is None:
         return V("work_dispatched", INCONCLUSIVE, "NO_CYCLE_IN_WINDOW", evidence,
                  "no cycle ran in the window, so whether work existed is unknown. Not green.")
@@ -1536,10 +1612,10 @@ def check_landers(f, c):
                  % ", ".join(sorted(gh.keys())),
                  "the open-PR population is absent from the payload, so 'every green PR has an armed "
                  "lander' would be asserted over nothing. Not green.")
-    if isinstance(gh.get("open_pr_count"), int) and gh["open_pr_count"] != len(prs):
+    if not isinstance(gh.get("open_pr_count"), int) or gh["open_pr_count"] != len(prs):
         return V("landers", INCONCLUSIVE, "GH_UNREADABLE",
-                 "gh: open_pr_count=%d but %d row(s) were returned"
-                 % (gh["open_pr_count"], len(prs)),
+                 "gh: open_pr_count=%r but %d row(s) were returned"
+                 % (gh.get("open_pr_count"), len(prs)),
                  "the payload disagrees with itself about how many open PRs exist, so the population "
                  "is not established. Not green.")
     events = f.get("log_events") or {}
@@ -2481,10 +2557,17 @@ class Machine(object):
                         "mount": f[-1]}
         rc, out = self.sh(
             "if [ -r /proc/meminfo ]; then awk '/^MemAvailable:/{print \"linux \" $2}' /proc/meminfo; "
-            "else vm_stat | awk '/page size of/{ps=$8} /Pages free/{free=$3} "
+            "else vm_stat | awk '/page size of/{ps=$8; seen=1} /Pages free/{free=$3} "
             "/Pages inactive/{inact=$3} /Pages speculative/{spec=$3} "
+            # ⛔ UNSEEN FIELDS MUST NOT PRINT A NUMBER. The END block used to emit
+            # `(free+inact+spec)*ps` unconditionally, so a `vm_stat` whose wording moved (or which
+            # failed) yielded `%d` of the uninitialised/zero fields = `darwin 0` — and `0 MiB` is a
+            # FAIL/BELOW_FLOOR, i.e. an UNREADABLE probe reported as an OOM emergency on the one
+            # check whose FAIL is supposed to mean one. `seen` makes the read's own success explicit.
             "END{gsub(/\\./,\"\",ps); gsub(/\\./,\"\",free); gsub(/\\./,\"\",inact); "
-            "gsub(/\\./,\"\",spec); printf \"darwin %d\\n\", (free+inact+spec)*ps/1024/1024}'; fi 2>&1")
+            "gsub(/\\./,\"\",spec); "
+            "if (!seen || ps == \"\" || free == \"\") print \"darwin UNKNOWN\"; "
+            "else printf \"darwin %d\\n\", (free+inact+spec)*ps/1024/1024}'; fi 2>&1")
         mem = {"ok": False, "error": (out or "").strip()[:200]}
         if rc == 0 and out.strip():
             parts = out.split()
@@ -2658,7 +2741,18 @@ def _collect_graphql(gh, repo, cfg, now, errors):
     rows = []
     for p in open_prs:
         mss = (p.get("mergeStateStatus") or "").strip().upper()
-        green = rollup_is_green(p.get("statusCheckRollup"))
+        rollup = p.get("statusCheckRollup")
+        # ⛔ A FULL GRAPHQL PAGE IS NOT A ROLLUP — the same doctrine `page_full` applies to the PR
+        # list. `gh pr list --json statusCheckRollup` builds `contexts(first:100)` with NO
+        # pagination and drops `pageInfo` (cli/cli `api/query_builder.go`), while the REST fallback
+        # below DOES read `total_count`. So a PR with ≥100 contexts could have a red one beyond the
+        # bound and read green here, which ADDS a lander candidate rather than dropping one.
+        # Not reachable on a 54-PR repo today (max rollup length 28, measured) — but the bound is
+        # the bound, and silence about it is how it becomes reachable.
+        if rollup_truncated(rollup):
+            green = None
+        else:
+            green = rollup_is_green(rollup)
         rows.append({
             "number": p.get("number"),
             "merge_state_status": mss,
@@ -2990,7 +3084,8 @@ REQUIRED_FIXTURES = (
     # `pr_created`/`pr_merged`, the two headroom floors (the low fixture had BOTH under floor, so
     # either comparison alone still failed), the intent-vs-outcome distinction in `work_dispatched`,
     # and the UNCONFIRMED branch that an intent-only log must fall into.
-    "dispatch-intent-not-spawned", "dispatch-unconfirmed", "no-pr-created", "idle-no-work",
+    "dispatch-intent-not-spawned", "dispatch-unconfirmed", "dispatch-previous-batch-spawn",
+    "queue-state-unreadable-newer", "no-pr-created", "idle-no-work",
     "headroom-disk-only-low", "headroom-mem-only-low",
 )
 

@@ -26,7 +26,7 @@ outcome.
 | check | passes only when | absent variant | stale variant |
 |---|---|---|---|
 | `controller_cycling` | a controller process exists **and** its log advanced within the window | `CONTROLLER_ABSENT`, `LAUNCHD_PID_UNRESOLVED` | `LOG_SILENT`, `LOG_MISSING` |
-| `queue_readable` | the last refresh produced a READABLE verdict | `QUEUE_UNREADABLE`, `QUEUE_NEVER_READ`, `QUEUE_PARTIAL` | `NO_REFRESH` |
+| `queue_readable` | the last refresh produced a READABLE verdict (**from the newer of the header token and `state/queue-state`'s own verdict**) | `QUEUE_UNREADABLE`, `QUEUE_NEVER_READ`, `QUEUE_PARTIAL` | `NO_REFRESH` |
 | `work_dispatched` | a `[dispatch] … -> <issue>` line is inside the window **and the batch's lane actually started** | `NOT_DISPATCHED`, `NO_DISPATCH`, `NO_DISPATCH_GATED`, `NO_LANE_STARTED` | `NO_CYCLE_IN_WINDOW`, `DISPATCH_UNCONFIRMED` |
 | `pr_created` | ≥1 PR opened in the PR window | `NO_PR_CREATED` | `IDLE_NO_WORK` (inconclusive) |
 | `pr_merged` | ≥1 PR merged in the PR window | `NO_PR_MERGED` | `IDLE_NO_WORK` (inconclusive) |
@@ -52,8 +52,11 @@ lines are in the same tail. Grading the intent was a `PASS`/`DISPATCHED` **and e
 that spawned nothing, i.e. a green verdict on the exact outcome this check exists to assert. The
 batch now needs its **spawn outcome**:
 
-- `#N: lane-M (implement+PR)` in the window → `PASS`/`DISPATCHED`, and the spawn line is named in the
-  evidence (a pass may not hide a *failed* sibling spawn, which is printed beside it);
+- `#N: lane-M (implement+PR)` **for one of that batch's issues, written no earlier than the batch
+  line** → `PASS`/`DISPATCHED`, and the spawn line is named in the evidence (a pass may not
+  hide a *failed* sibling spawn, which is printed beside it). A spawn from an earlier cycle is
+  named as `for a DIFFERENT batch` and does not vouch for this one: measured, an older batch's
+  4400/4401 spawn made the newest batch (which spawned nothing) read `PASS` + exit 0;
 - a batch whose **every** spawn failed → `FAIL`/`NO_LANE_STARTED`;
 - a batch with **no spawn outcome** in the window (a truncated tail looks identical) →
   `INCONCLUSIVE`/`DISPATCH_UNCONFIRMED`. Measured 2026-10-18: 110 of 110 real batch lines are
@@ -218,8 +221,8 @@ shape changes, and it is pruned with the rest of its check.
 ## The suite
 
 ```bash
-python3 tools/fleet/outcome_canary.test.py              # 97 tests
-python3 tools/fleet/outcome_canary.test.py --mutations  # 80 mutations, each must go RED
+python3 tools/fleet/outcome_canary.test.py              # 102 tests
+python3 tools/fleet/outcome_canary.test.py --mutations  # 87 mutations, each must go RED
 ```
 
 The signal tests drive the **real CLI** end-to-end (`--live --facts … --capture-dir …`), so what is
@@ -312,6 +315,14 @@ Four more, found by measuring the surface the tool actually reads rather than th
   `CLOCK_SKEW_TOLERANCE_S` rule had been applied to the log mtime only; `max(0.0, now - ts)` made a
   stale record the freshest possible reading, which defeats the `queue_stale_s` guard whose whole job
   is to stop a frozen EMPTY read establishing "nothing to do".
+- **⛔ The header's `queue=` token is always one refresh OLD, so the state record outranks it.** The
+  cycle header is written at the top of a cycle and `refresh-candidates.sh` runs later in the same
+  cycle, which makes `state/queue-state` the newer record. Only its epoch used to be read, so a
+  header `EMPTY(3m)` beside a 40s-old `state/queue-state: UNREADABLE` graded `PASS`/`READABLE`
+  + `PASS`/`IDLE_EMPTY_POOL` and exit 0 with **no message** — agent-infra#1931 ("the fleet is
+  BLIND, which is not 'nothing to do'") recorded as health. `queue_readable` and
+  `work_dispatched` now read the same authoritative token (`authoritative_queue_token`), and the
+  evidence names which source was graded and that it is newer.
 - **`--only` narrows; it does not certify** — in `--live` (exit 2, `not_evaluated` named) *and* in
   `--static` (exit 2 when any check was excluded). A green static run that asserted 1 of 8 checks is
   quotable as "the suite passes", which is precisely the claim it must not support. A mismatch still

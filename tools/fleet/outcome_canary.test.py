@@ -1900,6 +1900,177 @@ def test_a_fixture_expectation_naming_an_unknown_check_is_a_mismatch():
 
 
 @test
+def test_a_lane_spawn_from_ANOTHER_batch_does_not_vouch_for_this_one():
+    """⛔ THE SPAWN MUST BELONG TO THE BATCH BEING GRADED.
+
+    `started` came from every lane line in the window, so an OLDER cycle's spawn vouched for the
+    newest batch. Measured input: previous batch (540s ago) spawned 4400/4401, newest batch (60s ago)
+    spawned nothing → PASS/DISPATCHED and exit 0 — the silently-failed spawn this check exists for,
+    because `dispatch-merge.sh` has no `else` on its `tmux new-session` branch.
+    """
+    m = load()
+    cfg = m.cfg_from_dict({})
+    hdr = {"raw": "=== Sun Oct 18 07:47:44 EST 2026 load=50 lanes=2 backlog=9 queue=READ(223)(9m) ===",
+           "age_s": 60, "ts": 1792327000, "backlog": 9, "queue_token": "READ(223)(9m)",
+           "lanes": 2, "load": 50}
+    facts = {"log_events": {
+        "headers": [hdr],
+        "dispatch_ok": [
+            {"raw": "[dispatch] load=50 lanes=2 -> 4400 4401", "issues": [4400, 4401],
+             "issue_count": 2, "age_s": 540, "ts": 1792326520},
+            {"raw": "[dispatch] load=50 lanes=2 -> 5001 5002", "issues": [5001, 5002],
+             "issue_count": 2, "age_s": 60, "ts": 1792327000}],
+        "lane_started": [
+            {"raw": "#4400: lane-4400 (implement+PR)", "issue": 4400, "lane": 4400,
+             "age_s": 540, "ts": 1792326520},
+            {"raw": "#4401: lane-4401 (implement+PR)", "issue": 4401, "lane": 4401,
+             "age_s": 540, "ts": 1792326520}],
+        "lane_failed": [], "dispatch_refused": [], "dispatch_empty": [], "dispatch_skipped": [],
+        "armed": [], "railed": []}}
+    v = m.check_work_dispatched(facts, cfg)
+    assert (v.status, v.variant) == (m.INCONCLUSIVE, "DISPATCH_UNCONFIRMED"), \
+        (v.status, v.variant, v.evidence)
+    assert "DIFFERENT batch" in v.evidence, v.evidence
+    # a spawn for THIS batch, issued no earlier than the batch line, is the proof
+    facts["log_events"]["lane_started"].append(
+        {"raw": "#5001: lane-5001 (implement+PR)", "issue": 5001, "lane": 5001,
+         "age_s": 60, "ts": 1792327000})
+    v = m.check_work_dispatched(facts, cfg)
+    assert (v.status, v.variant) == (m.PASS, "DISPATCHED"), (v.status, v.variant, v.evidence)
+    assert "#5001 lane-5001" in v.evidence, v.evidence
+    # …and a spawn that PRECEDES the batch line it is credited to is not proof either
+    facts["log_events"]["lane_started"] = [
+        {"raw": "#5001: lane-5001 (implement+PR)", "issue": 5001, "lane": 5001,
+         "age_s": 300, "ts": 1792326700}]        # inside the window, but OLDER than the batch line
+    v = m.check_work_dispatched(facts, cfg)
+    assert v.status == m.INCONCLUSIVE, (v.status, v.variant, v.evidence)
+
+
+@test
+def test_the_QUEUE_STATE_record_outranks_a_header_that_is_one_refresh_old():
+    """⛔ THE HEADER TOKEN IS ALWAYS ONE REFRESH OLD AND THE STATE RECORD WAS NEVER PARSED.
+
+    `orch-loop.sh` writes the cycle header at the TOP of a cycle and runs `refresh-candidates.sh`
+    later in the same cycle, so `state/queue-state` is always the newer record — only its EPOCH was
+    read. A header `EMPTY(3m)` beside a 40s-old `state/queue-state: UNREADABLE` therefore graded
+    PASS/READABLE + PASS/IDLE_EMPTY_POOL and exit 0 with no message: agent-infra#1931 recorded as
+    health. Measured on this box: header `queue=READ(218)` beside `state/queue-state: PARTIAL(P2-...)`.
+    """
+    m = load()
+    cfg = m.cfg_from_dict({})
+    hdr = {"raw": "=== Sun Oct 18 07:47:44 EST 2026 load=10 lanes=0 backlog=0 queue=EMPTY(3m) ===",
+           "age_s": 180, "ts": 1792327000, "backlog": 0, "queue_token": "EMPTY(3m)",
+           "lanes": 0, "load": 10}
+    base = {"log_events": {"headers": [hdr], "dispatch_ok": [], "dispatch_empty": [],
+                           "dispatch_skipped": [], "dispatch_refused": [], "armed": [],
+                           "railed": [], "lane_started": [], "lane_failed": []}}
+
+    def facts(qs):
+        f = dict(base)
+        f["queue_state"] = qs
+        return f
+
+    # the newer state record says UNREADABLE → the header's EMPTY is stale and must not be graded
+    f = facts({"path": "q", "ok": True, "raw": "UNREADABLE 1792343000", "age_s": 40})
+    v = [x for x in m.evaluate(f, cfg) if x.name == "queue_readable"][0]
+    assert (v.status, v.variant) == (m.FAIL, "QUEUE_UNREADABLE"), (v.status, v.variant, v.evidence)
+    assert "state/queue-state" in v.evidence, v.evidence
+    # …and a blind refresh is NOT "nothing to do": work_dispatched must not read the stale EMPTY
+    w = [x for x in m.evaluate(f, cfg) if x.name == "work_dispatched"][0]
+    assert w.status != m.PASS, (w.status, w.variant, w.evidence)
+    assert "IDLE_EMPTY_POOL" not in w.variant, w.variant
+    # an OLDER state record does not outrank the header (the documented shape still works)
+    f = facts({"path": "q", "ok": True, "raw": "READ(223) 1792326000", "age_s": 1200})
+    v = [x for x in m.evaluate(f, cfg) if x.name == "queue_readable"][0]
+    assert v.status == m.PASS, (v.status, v.variant, v.evidence)
+    # a state record with NO age cannot outrank anything (an unaged record is not "newer")
+    f = facts({"path": "q", "ok": True, "raw": "UNREADABLE", "age_s": None})
+    assert m.authoritative_queue_token(f, hdr)[2] == "cycle header"
+
+
+@test
+def test_an_UNPARSEABLE_memory_probe_is_INCONCLUSIVE_not_zero_free_mib():
+    """The awk `END` block emitted `(free+inact+spec)*ps` unconditionally, so a `vm_stat` whose
+    wording moved produced `darwin 0` — and 0 MiB is FAIL/BELOW_FLOOR, i.e. an unreadable probe
+    reported as an OOM emergency, on the one check whose FAIL is supposed to mean one."""
+    m = load()
+    mach = m.Machine(None)
+    seen = {}
+
+    def fake_sh(cmd, timeout=None):
+        if "df -k" in cmd:
+            return (0, "/dev/disk1 100 900000000 400000000 40% /")
+        seen["mem_cmd"] = cmd
+        return (0, "darwin UNKNOWN")
+
+    mach.sh = fake_sh
+    hr = mach.headroom("/")
+    assert "UNKNOWN" in seen["mem_cmd"] and "seen" in seen["mem_cmd"], seen["mem_cmd"]
+    assert hr["disk"]["ok"] is True, hr["disk"]
+    assert hr["mem"]["ok"] is False, hr["mem"]        # ← the whole point: unread, not zero
+    v = m.check_headroom({"headroom": hr}, m.cfg_from_dict({}))
+    assert (v.status, v.variant) == (m.INCONCLUSIVE, "PROBE_UNREADABLE"), (v.status, v.variant)
+
+    # a real reading still parses
+    mach.sh = lambda cmd, timeout=None: (
+        (0, "/dev/disk1 100 900000000 400000000 40% /") if "df -k" in cmd else (0, "darwin 8192"))
+    hr = mach.headroom("/")
+    assert hr["mem"] == {"ok": True, "avail_mb": 8192.0, "source": "darwin"}, hr["mem"]
+    assert m.check_headroom({"headroom": hr}, m.cfg_from_dict({})).status == m.PASS
+
+
+@test
+def test_an_ABSENT_open_pr_count_is_a_missing_read_not_agreement():
+    """The self-consistency guard is `isinstance(count, int) AND count != len(prs)` — so an ABSENT
+    count SKIPPED the guard and the check reasoned over a population nothing had confirmed."""
+    m = load()
+    d = fx("healthy")
+    cfg = m.cfg_from_dict(d.get("config") or {})
+    del d["facts"]["github"]["open_pr_count"]
+    v = [x for x in m.evaluate(d["facts"], cfg) if x.name == "landers"][0]
+    assert (v.status, v.variant) == (m.INCONCLUSIVE, "GH_UNREADABLE"), (v.status, v.variant)
+    assert "open_pr_count" in v.evidence, v.evidence
+
+
+@test
+def test_a_rollup_AT_the_graphql_page_bound_is_unprobed():
+    """`gh pr list --json statusCheckRollup` builds `contexts(first:100)` with no pagination and drops
+    `pageInfo`, while the REST fallback DOES read `total_count`. A full page is therefore not a
+    rollup: a red check beyond the bound would read green and ADD a lander candidate."""
+    m = load()
+    green = [{"__typename": "CheckRun", "name": "c%d" % i, "workflowName": "CI", "status": "COMPLETED",
+              "conclusion": "SUCCESS", "startedAt": "2026-10-18T10:00:00Z", "completedAt": None,
+              "detailsUrl": "u"} for i in range(100)]
+    assert m.rollup_is_green(green) is True          # the predicate alone cannot see the bound…
+    assert m.rollup_truncated(green) is True and m.rollup_truncated(green[:99]) is False
+    # …so the COLLECTOR must apply it, and the row must come out UNPROBED (probed=False), not PASS
+    real = m._run_gh
+
+    def fake(argv):
+        cmd = " ".join(argv)
+        if "--state open" in cmd:
+            return 0, json.dumps([{"number": 950, "mergeStateStatus": "CLEAN",
+                                   "autoMergeRequest": {"x": 1}, "isDraft": False,
+                                   "statusCheckRollup": green, "reviewDecision": "APPROVED"}])
+        return 0, "[]"
+
+    try:
+        m._run_gh = fake
+        gh = m.collect_github("o/r", m.Cfg(), now=1792327664.0)
+    finally:
+        m._run_gh = real
+    assert gh["ok"] is True and gh["source"] == "graphql", (gh.get("source"), gh.get("error"))
+    row = gh["open_prs"][0]
+    assert row["checks_green"] is None and row["probed"] is False, row
+    # …which keeps it OUT of the "every green PR is armed" population rather than in it
+    facts = fx("healthy")["facts"]
+    facts["github"] = gh
+    v = [x for x in m.evaluate(facts, m.cfg_from_dict(fx("healthy")["config"]))
+         if x.name == "landers"][0]
+    assert v.status == m.INCONCLUSIVE and v.variant == "PARTIAL_POPULATION", (v.status, v.variant)
+
+
+@test
 def test_a_dispatch_INTENT_is_not_a_dispatch():
     """⛔ THE BATCH LINE IS AN INTENT, AND THIS CHECK EXISTS TO GRADE THE OUTCOME.
 
@@ -2526,7 +2697,7 @@ MUTATIONS = [
      "    if False:",
      "test_a_payload_that_is_NOT_a_population_is_not_graded"),
     ("a payload whose count contradicts its rows is graded anyway",
-     '    if isinstance(gh.get("open_pr_count"), int) and gh["open_pr_count"] != len(prs):',
+     '    if not isinstance(gh.get("open_pr_count"), int) or gh["open_pr_count"] != len(prs):',
      "    if False:",
      "test_a_payload_that_is_NOT_a_population_is_not_graded"),
     ("a PR skipped for a known reason is dropped without being counted",
@@ -2759,11 +2930,38 @@ MUTATIONS = [
      "            exists = (present.strip().endswith(\"YES\")) if rc3 == 0 else None",
      "            exists = False",
      "test_a_log_that_cannot_be_stat_ed_is_unreadable_not_missing"),
+    ("a lane spawn from ANOTHER batch vouches for this one",
+     "        started = newest_with_age([e for e in all_started if _is_this_batch(e)], win)",
+     "        started = newest_with_age(all_started, win)",
+     "test_a_lane_spawn_from_ANOTHER_batch_does_not_vouch_for_this_one"),
+    ("a spawn that PRECEDES its batch line still counts",
+     "            return e[\"age_s\"] <= ok_age + 2.0",
+     "            return e[\"age_s\"] <= 9e9",
+     "test_a_lane_spawn_from_ANOTHER_batch_does_not_vouch_for_this_one"),
+    ("the queue verdict is read from the one-refresh-old header token",
+     "    tok, raw_tok, tok_src = authoritative_queue_token(f, hdr)",
+     "    tok, raw_tok, tok_src = parse_queue_token(hdr.get(\"queue_token\")), "
+     "hdr.get(\"queue_token\"), \"cycle header\"",
+     "test_the_QUEUE_STATE_record_outranks_a_header_that_is_one_refresh_old"),
+    ("work_dispatched reads a different pool token than queue_readable",
+     "    pool_kind = pool_kind if hdr is not None else None",
+     "    pool_kind = parse_queue_token(hdr.get(\"queue_token\")).get(\"kind\")",
+     "test_the_QUEUE_STATE_record_outranks_a_header_that_is_one_refresh_old"),
+    ("an unreadable memory probe is reported as 0 MiB free",
+     "            \"if (!seen || ps == \\\"\\\" || free == \\\"\\\") print \\\"darwin UNKNOWN\\\"; \"",
+     "            \"\"",
+     "test_an_UNPARSEABLE_memory_probe_is_INCONCLUSIVE_not_zero_free_mib"),
+    ("an ABSENT open_pr_count counts as agreement",
+     "    if not isinstance(gh.get(\"open_pr_count\"), int) or gh[\"open_pr_count\"] != len(prs):",
+     "    if isinstance(gh.get(\"open_pr_count\"), int) and gh[\"open_pr_count\"] != len(prs):",
+     "test_an_ABSENT_open_pr_count_is_a_missing_read_not_agreement"),
+    ("a rollup AT the GraphQL page bound is graded anyway",
+     "        if rollup_truncated(rollup):",
+     "        if False:",
+     "test_a_rollup_AT_the_graphql_page_bound_is_unprobed"),
     ("the dispatch INTENT line is graded as the dispatch outcome",
-     "        started = newest_with_age(events.get(\"lane_started\"), win)\n"
-     "        spawn_fail = newest_with_age(events.get(\"lane_failed\"), win)",
-     "        started = newest_with_age(events.get(\"dispatch_ok\"), win)\n"
-     "        spawn_fail = None",
+     "        all_started = events.get(\"lane_started\") or []",
+     "        all_started = events.get(\"dispatch_ok\") or []",
      "test_a_dispatch_INTENT_is_not_a_dispatch"),
     ("an intent-only log PASSES instead of abstaining",
      "            return V(\"work_dispatched\", INCONCLUSIVE, \"DISPATCH_UNCONFIRMED\",",

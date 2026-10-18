@@ -363,13 +363,17 @@ jobs:
         # (#646). Its own step so one verdict cannot suppress the other.
         run: python3.12 tools/fleet/outcome_canary.test.py
       - name: Outcome-canary mutation evidence (zero-dep)
-        # The suite above is only a pin if it can FAIL. Each of the 80 mutations reintroduces a
+        # The suite above is only a pin if it can FAIL. Each of the 87 mutations reintroduces a
         # defect the canary exists to catch — a live pid graded as a cycling controller, a refused
         # dispatch forgiven, an UNREADABLE pool read as readable, a gh refusal read as zero PRs, a
         # deny-list check-result rule, an alert on every poll, no re-arm after recovery, a respawn on
         # any non-PASS, INCONCLUSIVE exiting 0, a substring controller census, a refused send
         # recorded as delivered, a stale dispatch graded fresh, a skipped-line regex that never
         # matches the real emitter, a delivery that does not supersede the check's sibling shapes,
+        # a spawn from ANOTHER batch vouching for this one, a spawn predating its batch line, the
+        # queue verdict read from the one-refresh-old header token, the two checks reading
+        # DIFFERENT pool tokens, an unreadable memory probe reported as 0 MiB free, an ABSENT
+        # open_pr_count treated as agreement, a rollup at the GraphQL page bound graded anyway,
         # a dispatch INTENT line graded as the dispatch outcome, an intent-only log passing instead
         # of abstaining, a spawn-failure line never parsed, a cycle header counted outside the
         # window, a queue-token age without its unit multiplier, a DRAFT PR dropped with no line,
