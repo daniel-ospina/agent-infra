@@ -113,6 +113,7 @@ import re
 import subprocess
 import sys
 import calendar
+import datetime
 import time
 
 # ── status vocabulary ────────────────────────────────────────────────────────────────────────────
@@ -1330,16 +1331,18 @@ def rollup_is_green(rollup):
         # exists for. `None` makes the collectors mark it UNPROBED, which reaches
         # PARTIAL_POPULATION. `_collect_rest` has always required `checks_green is not None`.
         return None
-    newest = {}
+    attempts = {}
     for pos, chk in enumerate(rollup):
         if not isinstance(chk, dict):
             return False
-        key = _check_key(chk)
-        rank = _check_rank(chk, pos)
-        prev = newest.get(key)
-        if prev is None or rank >= prev[0]:
-            newest[key] = (rank, chk)
-    for _rank, chk in newest.values():
+        attempts.setdefault(_check_key(chk), []).append((_check_rank(chk, pos), chk))
+    for _key, entries in attempts.items():
+        # ⛔ AN ATTEMPT IN FLIGHT MAKES ITS CHECK UNKNOWN, whatever the ordering says: a re-run that
+        # has not concluded is not evidence that the previous attempt's verdict still stands, and a
+        # queued attempt carries no timestamp at all (so an ordering alone would rank it LAST).
+        if any(_in_flight(chk) for _r, chk in entries):
+            return False
+        _rank, chk = max(entries, key=lambda e: e[0])
         concl = _check_conclusion(chk)
         if concl is None:
             # queued / in progress / no conclusion yet: NOT green (in flight is not a pass)
@@ -1350,30 +1353,72 @@ def rollup_is_green(rollup):
 
 
 def _check_key(chk):
-    """(app slug, check name) — the identity the merge rail groups by. A check run carries `name`,
-    a legacy status context carries `context`; a missing app stays EMPTY rather than being dropped,
-    because an ungrouped check would escape the verdict entirely."""
-    app = ""
-    a = chk.get("app")
-    if isinstance(a, dict):
-        app = str(a.get("slug") or "")
-    elif isinstance(a, str):
-        app = a
+    """(workflow, check name) — what makes two entries THE SAME CHECK.
+
+    ⛔ MEASURED ON THE LIVE SURFACE: `gh pr list --json statusCheckRollup` emits
+    `__typename, name, workflowName, status, conclusion, startedAt, completedAt, detailsUrl` — there
+    is NO `app` and NO `id`. Keying on `app` therefore collapsed EVERY workflow into one group, so
+    `changes` (published by both `CI` and `Python CI`) and `ai-review-gate` (measured twice with
+    DIFFERING conclusions on the same PR) were graded as one check, and an arbitrary one of the two
+    decided the PR. `workflowName` is the discriminator that exists; `app.slug` is the fallback the
+    REST check-runs payload offers, and an entry with neither is grouped alone rather than dropped
+    (an ungrouped check would escape the verdict).
+    """
+    wf = str(chk.get("workflowName") or "")
+    if not wf:
+        a = chk.get("app")
+        if isinstance(a, dict):
+            wf = str(a.get("slug") or "")
+        elif isinstance(a, str):
+            wf = a
     name = chk.get("name")
     if name in (None, ""):
         name = chk.get("context")
-    return (app, str(name) if name is not None else "")
+    return (wf, str(name) if name is not None else "")
+
+
+def _iso_epoch(v):
+    """ISO-8601 → epoch seconds, or None. `Z` is normalised first: `datetime.fromisoformat` rejects it
+    before python 3.11, and CI runs 3.12 while a dev box may run 3.9."""
+    if not isinstance(v, str) or not v.strip():
+        return None
+    t = v.strip()
+    if t.endswith("Z"):
+        t = t[:-1] + "+00:00"
+    try:
+        return datetime.datetime.fromisoformat(t).timestamp()
+    except Exception:
+        return None
 
 
 def _check_rank(chk, pos):
-    """Sort key for attempts of ONE check: highest `id` is newest. Ids are the honest ordering —
-    `started_at` is NULLABLE (a queued attempt has none), so a timestamp-first rank can rank a stale
-    attempt over a fresh one. An id-less surface (status context) falls back to list position, which
-    is the only ordering it has."""
+    """Newest attempt LAST, per surface.
+
+    A check-run `id` is monotonic and therefore the honest ordering — but REST is the ONLY surface
+    that carries one. GraphQL carries timestamps instead, and its list order is NOT chronological
+    (measured: 18 of 59 adjacent pairs have a later position with an earlier `startedAt`), so "last
+    in the list wins" picks arbitrarily on real data. Order: id where present, else the latest of
+    completed/started, else list position.
+    """
     ident = chk.get("id")
     if isinstance(ident, int) and not isinstance(ident, bool):
-        return (1, ident, pos)
-    return (0, 0, pos)
+        return (1, float(ident), 0.0, pos)
+    ts = 0.0
+    for key in ("completedAt", "completed_at", "startedAt", "started_at"):
+        e = _iso_epoch(chk.get(key))
+        if e is not None and e > ts:
+            ts = e
+    return (0, 0.0, ts, pos)
+
+
+def _in_flight(chk):
+    """Has this attempt concluded? A check run's `status` is COMPLETED or not; a legacy status context
+    answers `state == PENDING`. Absent means "not stated" — the conclusion is then graded directly."""
+    st = chk.get("status")
+    if isinstance(st, str) and st.strip():
+        return st.strip().upper() != "COMPLETED"
+    state = chk.get("state")
+    return isinstance(state, str) and state.strip().upper() == "PENDING"
 
 
 def _check_conclusion(chk):
@@ -1388,6 +1433,11 @@ def _check_conclusion(chk):
 
 
 MERGEABLE_STATES = ("CLEAN",)
+# The mergeability states that mean "known, and not mergeable" — `BEHIND` for a branch main has moved
+# past, `BLOCKED` for a required review or check, `DIRTY` for a conflict, `DRAFT`, `HAS_HOOKS` and
+# `UNSTABLE` (a failing check). Anything else — including an ABSENT or unrecognised value — is a PR
+# this check cannot grade, and it must reach `unprobed` rather than silently leaving the population.
+KNOWN_NON_MERGEABLE = ("BLOCKED", "BEHIND", "DIRTY", "DRAFT", "HAS_HOOKS", "UNSTABLE")
 
 # The states a REST/GraphQL response can carry that mean "mergeability is NOT KNOWN YET" (GraphQL
 # documents `mergeStateStatus: UNKNOWN` while it computes). Such a PR must be reported as UNPROBED so
@@ -1422,12 +1472,18 @@ def check_landers(f, c):
     for pr in prs:
         if pr.get("draft"):
             continue
-        if not pr.get("probed", True):
+        mss, green = pr.get("merge_state_status"), pr.get("checks_green")
+        # ⛔ "GRADED OR UNPROBED, NEVER NEITHER" — enforced HERE, not only in the collectors.
+        # `pr.get("probed", True)` read an ABSENT key as `True` (every fixture omitted it), and a row
+        # the filters below could not grade — no mergeability, no check surface — left BOTH lists, so
+        # an unread PR vanished from a PASS. A missing input is a missing read: abstain.
+        if (pr.get("probed") is not True or green is None
+                or (mss not in MERGEABLE_STATES and mss not in KNOWN_NON_MERGEABLE)):
             unprobed.append(pr.get("number"))
             continue
-        if pr.get("merge_state_status") not in MERGEABLE_STATES:
+        if mss not in MERGEABLE_STATES:
             continue
-        if not pr.get("checks_green"):
+        if not green:
             continue
         if pr.get("review_decision") not in (None, "", "APPROVED"):
             continue
@@ -2686,7 +2742,10 @@ def collect_live(cfg, machine=None, now=None, skip=()):
         txt = hb_raw.strip().split()[0] if hb_raw.strip() else ""
         hb["ok"] = bool(re.match(r"^\d+$", txt))
         hb["raw"] = txt
-        hb["age_s"] = max(0.0, now - int(txt)) if hb["ok"] else None
+        # `_age_of` applies the CLOCK_SKEW_TOLERANCE_S rule: a future timestamp is UNKNOWN, never
+        # "0s ago". `max(0.0, now - ts)` here made a clock running AHEAD of the canary look fresher
+        # than any real reading — on the one datum the respawn proof uses to see the controller move.
+        hb["age_s"] = _age_of(now, int(txt)) if hb["ok"] else None
         if not hb["ok"]:
             hb["error"] = "unparseable heartbeat: %r" % hb_raw[:80]
     facts["heartbeat"] = hb
@@ -2701,7 +2760,10 @@ def collect_live(cfg, machine=None, now=None, skip=()):
         qs["ok"] = True
         qs["raw"] = qs_raw.strip()[:120]
         m = re.search(r"\b(\d{9,})\b", qs_raw)
-        qs["age_s"] = max(0.0, now - int(m.group(1))) if m else None
+        # Same rule, and this one is load-bearing for a verdict: `queue_stale_s` is the defence that
+        # stops a frozen pool read from establishing EMPTINESS, and `max(0.0, …)` let a clock running
+        # ahead of the canary make a stale record read as 0s old.
+        qs["age_s"] = _age_of(now, int(m.group(1))) if m else None
     facts["queue_state"] = qs
 
     facts["controller"] = machine.snapshot_controller()
@@ -2755,6 +2817,14 @@ def run_static(paths, only=None):
             # An EMPTY assertion set is not "all zero assertions satisfied": a new fixture with a
             # misspelt `_expects` key contributed no coverage while the runner printed success.
             mism.append((path, "(fixture)", ">=1 expectation", "NO_EXPECT", None))
+        else:
+            # ⛔ A PARTIAL set is the same defect one key wide: `_expect: {"headroom": "PASS"}` ran
+            # seven checks, asserted one, and printed "every fixture matched its declared _expect"
+            # with exit 0. Coverage is declared per fixture, so it is required per fixture.
+            gap = [n for n in CHECK_ORDER if n not in expect]
+            if gap:
+                mism.append((path, "(fixture)", "an expectation for all %d checks"
+                             % len(CHECK_ORDER), "PARTIAL_EXPECT (%s)" % ",".join(gap), None))
         for name, want in expect.items():
             if name not in got:
                 # ⛔ A fixture that names a check which does not exist asserts NOTHING, and the old
@@ -2783,6 +2853,23 @@ def fixture_paths(paths, fixtures_dir):
     if fixtures_dir:
         out.extend(sorted(glob.glob(os.path.join(fixtures_dir, "*.json"))))
     return out
+
+
+# The fixture POPULATION is part of the pin: deleting a fixture removes the outcome it pinned and
+# every remaining assertion still passes. These names are outcome-critical, so their absence is a
+# mismatch rather than a smaller run. (A new fixture is free — this is a lower bound, not a manifest.)
+REQUIRED_FIXTURES = (
+    "healthy", "controller-absent", "log-silent", "queue-unreadable", "dispatch-refused",
+    "empty-backlog-large-pool", "no-pr-merged", "gh-unreadable", "lander-expired",
+    "daemon-absent", "headroom-low", "idle-empty-pool",
+)
+
+
+def missing_fixtures(paths):
+    """Required fixture names absent from `paths` (compared on basename, `.json` stripped)."""
+    have = set(os.path.basename(p)[:-5] if p.endswith(".json") else os.path.basename(p)
+               for p in paths or [])
+    return [n for n in REQUIRED_FIXTURES if n not in have]
 
 
 def default_fixtures_dir():
@@ -2952,6 +3039,13 @@ def main(argv=None):
             print("outcome-canary: no fixtures found (pass --fixture or --fixtures-dir)", file=sys.stderr)
             return 3
         rows, mism, skipped = run_static(paths, only=only)
+        if a.fixtures_dir is not None or not a.fixture:
+            # The POPULATION is part of the pin: a deleted fixture removes the outcome it pinned and
+            # every remaining assertion still passes. Only checked when this run claims to cover a
+            # directory (an explicit --fixture list is deliberately a subset).
+            for name in missing_fixtures(paths):
+                mism.append((a.fixtures_dir or default_fixtures_dir(), "(fixture-set)",
+                             "fixture present", "MISSING_FIXTURE (%s)" % name, None))
         if a.json:
             print(json.dumps({"mode": "static", "fixtures": [
                 {"path": p, "name": n, "note": note,

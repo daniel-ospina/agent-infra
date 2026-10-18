@@ -363,7 +363,7 @@ jobs:
         # (#646). Its own step so one verdict cannot suppress the other.
         run: python3.12 tools/fleet/outcome_canary.test.py
       - name: Outcome-canary mutation evidence (zero-dep)
-        # The suite above is only a pin if it can FAIL. Each of the 54 mutations reintroduces a
+        # The suite above is only a pin if it can FAIL. Each of the 62 mutations reintroduces a
         # defect the canary exists to catch — a live pid graded as a cycling controller, a refused
         # dispatch forgiven, an UNREADABLE pool read as readable, a gh refusal read as zero PRs, a
         # deny-list check-result rule, an alert on every poll, no re-arm after recovery, a respawn on
@@ -395,8 +395,13 @@ jobs:
         # MENTIONS the pane daemon counted as the daemon, an empty gh response read as zero PRs, a
         # truncated check-run page graded green, the header timezone dropped for local time, a dry run
         # persisting the state, a --box run borrowing THIS machine's repo plist, an unparseable header
-        # reported as no header, "idle" reported as "dispatched", a --only exclusion graded as wrong —
-        # into a TEMP copy, and requires its paired test to go
+        # reported as no header, "idle" reported as "dispatched", a --only exclusion graded as wrong,
+        # the rollup grouped on an `app` the live surface does not emit (workflows collapsing into one
+        # check), the rollup ranked by list position instead of timestamp, an in-flight attempt graded
+        # on the previous attempt's verdict, an absent `probed` key read as probed, an unrecognised
+        # mergeability state skipped instead of abstaining, a future-dated queue-state clamped to the
+        # freshest reading, a fixture asserting a SUBSET of the checks, a deleted outcome-critical
+        # fixture going unnoticed — into a TEMP copy, and requires its paired test to go
         # RED. A mutation that survives is reported as a suite failure.
         run: python3.12 tools/fleet/outcome_canary.test.py --mutations
       - name: Sequence-enforcer suite (incl. joint checker→enforcer test)

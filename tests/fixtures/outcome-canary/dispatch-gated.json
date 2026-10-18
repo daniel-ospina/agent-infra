@@ -42,6 +42,7 @@
      "draft": false,
      "merge_state_status": "CLEAN",
      "number": 900,
+     "probed": true,
      "review_decision": "APPROVED"
     },
     {
@@ -50,6 +51,7 @@
      "draft": false,
      "merge_state_status": "BLOCKED",
      "number": 901,
+     "probed": true,
      "review_decision": "REVIEW_REQUIRED"
     }
    ],

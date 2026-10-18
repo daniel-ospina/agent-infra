@@ -361,6 +361,157 @@ def test_rollup_polarity_unknown_and_null_conclusions_are_red():
 
 
 @test
+def test_the_rollup_is_graded_on_the_shape_the_LIVE_surface_actually_emits():
+    """MEASURED: `gh pr list --json statusCheckRollup` emits
+    `__typename, name, workflowName, status, conclusion, startedAt, completedAt, detailsUrl` — no
+    `app`, no `id` — so grouping on `app` collapsed every workflow into one check and ranking on `id`
+    always fell through to LIST POSITION, which is not chronological (measured: 18 of 59 adjacent
+    pairs have a later position with an earlier `startedAt`). `changes` is published by BOTH `CI` and
+    `Python CI`, and `ai-review-gate` appears twice with differing conclusions on the same PR: one of
+    them decided the PR arbitrarily."""
+    m = load()
+
+    def run(**kw):
+        e = {"__typename": "CheckRun", "status": "COMPLETED"}
+        e.update(kw)
+        return e
+
+    ok_ci = run(name="changes", workflowName="CI", conclusion="SUCCESS",
+                startedAt="2026-10-18T13:00:00Z")
+    bad_py = run(name="changes", workflowName="Python CI", conclusion="FAILURE",
+                 startedAt="2026-10-18T13:00:00Z")
+    # same NAME, different WORKFLOWS: two checks, and the red one reddens the PR whatever the order
+    assert not m.rollup_is_green([ok_ci, bad_py])
+    assert not m.rollup_is_green([bad_py, ok_ci])
+    # same workflow, two attempts: the NEWER startedAt decides even when the list order says otherwise
+    first_red = run(name="ai-review-gate", workflowName="AI Review", conclusion="FAILURE",
+                    startedAt="2026-10-18T12:00:00Z")
+    rerun_ok = run(name="ai-review-gate", workflowName="AI Review", conclusion="SUCCESS",
+                   startedAt="2026-10-18T13:00:00Z")
+    assert m.rollup_is_green([rerun_ok, first_red])       # later position is the OLDER attempt
+    assert m.rollup_is_green([first_red, rerun_ok])
+    # and the newest attempt being RED is red (a re-run that came back red)
+    assert not m.rollup_is_green([rerun_ok, dict(first_red, conclusion="FAILURE",
+                                                 startedAt="2026-10-18T14:00:00Z")])
+    # an attempt IN FLIGHT makes its check unknown, whatever the timestamps say: a queued attempt
+    # carries no startedAt at all, so an ordering alone would rank it last and grade the stale green
+    in_flight = {"__typename": "CheckRun", "name": "ai-review-gate", "workflowName": "AI Review",
+                 "status": "IN_PROGRESS", "conclusion": None}
+    assert not m.rollup_is_green([rerun_ok, in_flight])
+    assert not m.rollup_is_green([in_flight, rerun_ok])
+
+
+@test
+def test_a_PR_row_that_cannot_be_GRADED_is_UNPROBED_not_silent():
+    """`pr.get("probed", True)` read an ABSENT key as `True` (every fixture omitted it), and a row the
+    filters could not grade — no mergeability, no check surface — left BOTH `candidates` and
+    `unprobed`. An unread PR then vanished from a PASS on the one check that exists to catch a lander
+    expiring on a PR nobody looked at."""
+    m = load()
+
+    def verdict(rows):
+        d = fx("healthy")
+        d["facts"]["github"]["open_prs"] = rows
+        cfg = m.cfg_from_dict(d["config"])
+        return [x for x in m.evaluate(d["facts"], cfg) if x.name == "landers"][0]
+
+    base = {"number": 700, "merge_state_status": "CLEAN", "checks_green": True,
+            "auto_armed": True, "draft": False, "probed": True}
+    # (a) fully graded + armed: the healthy shape still passes
+    v = verdict([dict(base)])
+    assert (v.status, v.variant) == (m.PASS, "LANDERS_ARMED"), (v.status, v.variant, v.evidence)
+    # (b) `probed` ABSENT: a missing read, so unprobed — never graded
+    no_probed = dict(base)
+    del no_probed["probed"]
+    v = verdict([no_probed])
+    assert v.status == m.INCONCLUSIVE and v.variant == "PARTIAL_POPULATION", (v.status, v.variant)
+    assert "700" in v.evidence, v.evidence
+    # (c) no mergeability value at all
+    v = verdict([{"number": 701, "checks_green": True, "auto_armed": True, "draft": False,
+                  "probed": True}])
+    assert v.variant == "PARTIAL_POPULATION", (v.status, v.variant, v.evidence)
+    # (d) a mergeability state this tool does not recognise
+    v = verdict([dict(base, number=702, merge_state_status="SOMETHING_NEW")])
+    assert v.variant == "PARTIAL_POPULATION", (v.status, v.variant, v.evidence)
+    # (e) a KNOWN non-mergeable state is skipped, NOT unprobed: a busy box must not go INCONCLUSIVE
+    #     just because PRs are BEHIND or BLOCKED
+    v = verdict([dict(base, number=703, merge_state_status="BEHIND"),
+                 dict(base, number=704, merge_state_status="BLOCKED")])
+    assert v.status == m.PASS and v.variant == "NOTHING_GREEN", (v.status, v.variant, v.evidence)
+
+
+@test
+def test_a_FUTURE_dated_queue_state_or_heartbeat_is_UNKNOWN_not_fresh():
+    """The CLOCK_SKEW rule was applied to the log mtime and not to the heartbeat or the queue-state
+    file, both of which used `max(0.0, now - ts)` — so a box whose clock runs AHEAD made a stale
+    record the freshest possible reading. On the queue-state file that defeats the `queue_stale_s`
+    guard whose whole job is to stop a frozen EMPTY read establishing "nothing to do"."""
+    m = load()
+    now = 1792327664.0
+    real_read, real_sh = m.Machine.read_file, m.Machine.sh
+
+    future = int(now + 5 * 3600)
+    try:
+        m.Machine.read_file = lambda self, path: ("EMPTY %d" % future, None)
+        m.Machine.sh = lambda self, cmd: (0, "some-out")
+        mc = m.Machine(None)
+        mc.controller_paths = []
+        cfg = m.Cfg(o_dir="/tmp/x", label="l")
+        facts = m.collect_live(cfg, machine=mc, now=now)
+    finally:
+        m.Machine.read_file, m.Machine.sh = real_read, real_sh
+    assert facts["queue_state"]["age_s"] is None, facts["queue_state"]
+    assert facts["heartbeat"]["age_s"] is None, facts["heartbeat"]
+    # …and that reaches the verdict: an EMPTY read with NO usable age cannot establish emptiness
+    d = fx("healthy")
+    d["facts"]["log_events"]["headers"] = [{
+        "raw": "=== Sun Oct 18 07:47:44 EST 2026 load=4 lanes=0 backlog=0 queue=EMPTY ===",
+        "age_s": 60, "ts": now, "backlog": 0, "queue_token": "EMPTY", "lanes": 0}]
+    d["facts"]["log_events"]["dispatch_ok"] = []
+    d["facts"]["queue_state"] = {"path": "q", "ok": True, "raw": "EMPTY %d" % future,
+                                 "age_s": None}
+    cfg2 = m.cfg_from_dict(d["config"])
+    got = dict((x.name, x) for x in m.evaluate(d["facts"], cfg2))
+    assert got["work_dispatched"].status == m.INCONCLUSIVE, got["work_dispatched"].as_json()
+    assert got["work_dispatched"].variant == "STATE_FROZEN", got["work_dispatched"].variant
+
+
+@test
+def test_static_refuses_a_PARTIAL_expectation_and_a_MISSING_fixture():
+    """`_expect: {"headroom": "PASS"}` ran seven checks, asserted one, and printed "every fixture
+    matched its declared _expect" with exit 0. And a DELETED fixture removes the outcome it pinned
+    while every remaining assertion still passes: the population is part of the pin."""
+    m = load()
+    tmp = tempfile.mkdtemp(prefix="oc-partial-")
+    try:
+        d = fx("healthy")
+        d["_expect"] = {"headroom": "PASS"}
+        one = os.path.join(tmp, "healthy.json")
+        with open(one, "w") as fh:
+            json.dump(d, fh)
+        rc, out, err = run_cli(["--static", "--fixture", one, "--json"])
+        assert rc == 1, (rc, out[-300:])
+        j = json.loads(out)
+        assert any(str(x["got"]).startswith("PARTIAL_EXPECT") for x in j["mismatches"]),             j["mismatches"]
+        # a directory that no longer holds the outcome-critical fixtures is a mismatch, not a
+        # smaller run
+        d2 = fx("healthy")
+        d2["_expect"] = dict((n, "PASS") for n in m.CHECK_ORDER)
+        with open(one, "w") as fh:
+            json.dump(d2, fh)
+        rc, out, err = run_cli(["--static", "--fixtures-dir", tmp, "--json"])
+        assert rc == 1, (rc, out[-300:])
+        j = json.loads(out)
+        missing = [x["got"] for x in j["mismatches"] if "MISSING_FIXTURE" in str(x["got"])]
+        assert len(missing) >= 5, j["mismatches"]
+        assert any("lander-expired" in x for x in missing), missing
+        # the shipped directory satisfies both rules
+        assert m.missing_fixtures(sorted(m.glob.glob(os.path.join(FIXTURES, "*.json")))) == []
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@test
 def test_a_flaky_re_run_reads_GREEN_rather_than_red():
     """The rollup is a list of ATTEMPTS, not a list of checks. A job that failed and then passed on
     re-run appears TWICE, so a flat "every entry must be green" walk reads that commit RED — and a
@@ -369,7 +520,7 @@ def test_a_flaky_re_run_reads_GREEN_rather_than_red():
     does not clear one.)
     """
     m = load()
-    gh_a = {"slug": "github-actions"}
+    gh_a = {"slug": "github-actions"}      # a REST-shaped surface: it carries `app` and `id`
     ok = {"app": gh_a, "name": "build", "conclusion": "SUCCESS", "id": 20}
     bad = {"app": gh_a, "name": "build", "conclusion": "FAILURE", "id": 10}
     assert m.rollup_is_green([bad, ok])              # newest attempt (highest id) is the one graded
@@ -1513,7 +1664,8 @@ def test_a_fixture_expectation_naming_an_unknown_check_is_a_mismatch():
     tmp = tempfile.mkdtemp(prefix="oc-badexpect-")
     try:
         d = fx("healthy")
-        d["_expect"] = {"lnders": "FAIL"}
+        d["_expect"] = dict((n, "PASS") for n in m.CHECK_ORDER)
+        d["_expect"]["lnders"] = "FAIL"            # a NAME that is not a check: asserts nothing
         bad = os.path.join(tmp, "bad.json")
         with open(bad, "w") as fh:
             json.dump(d, fh)
@@ -1526,7 +1678,7 @@ def test_a_fixture_expectation_naming_an_unknown_check_is_a_mismatch():
         # of them) while the "every fixture matched" branch could never print — an advertised flag
         # pair that could never succeed. It must still be LOUD, or "asserted nothing" goes silent.
         d2 = fx("healthy")
-        d2["_expect"] = {"landers": "PASS"}
+        d2["_expect"] = dict((n, "PASS") for n in m.CHECK_ORDER)
         only = os.path.join(tmp, "only.json")
         with open(only, "w") as fh:
             json.dump(d2, fh)
@@ -1535,7 +1687,8 @@ def test_a_fixture_expectation_naming_an_unknown_check_is_a_mismatch():
         assert rc == 0, (rc, out[-300:])
         j = json.loads(out)
         assert j["mismatches"] == [], j["mismatches"]
-        assert [x["check"] for x in j["skipped"]] == ["landers"], j["skipped"]
+        assert set(x["check"] for x in j["skipped"]) == set(m.CHECK_ORDER) - {"work_dispatched"}, \
+            j["skipped"]
         # …and the whole shipped fixture set can be run against ONE check (it used to fail 105 times)
         rc, out, err = run_cli(["--static", "--fixtures-dir", FIXTURES,
                                 "--only", "work_dispatched", "--json"])
@@ -1981,6 +2134,39 @@ MUTATIONS = [
     ("the census is not scoped to this cell's controller path",
      "        if paths and os.path.normpath(toks[1]) not in paths:", "        if False:",
      "test_the_census_is_scoped_to_THIS_cell_and_reports_what_it_rejected"),
+    # ── cycle-12 defects ────────────────────────────────────────────────────────────
+    ("the rollup is grouped on the app, which the LIVE surface does not emit, so workflows collapse",
+     '    wf = str(chk.get("workflowName") or "")',
+     '    wf = ""',
+     "test_the_rollup_is_graded_on_the_shape_the_LIVE_surface_actually_emits"),
+    ("the rollup ranks attempts by list position instead of by timestamp",
+     '        if e is not None and e > ts:\n            ts = e\n    return (0, 0.0, ts, pos)',
+     '        if e is not None and e > ts:\n            ts = e\n    return (0, 0.0, 0.0, pos)',
+     "test_the_rollup_is_graded_on_the_shape_the_LIVE_surface_actually_emits"),
+    ("an attempt in flight is graded on the previous attempt's verdict",
+     "        if any(_in_flight(chk) for _r, chk in entries):",
+     "        if False:",
+     "test_the_rollup_is_graded_on_the_shape_the_LIVE_surface_actually_emits"),
+    ("an absent `probed` key reads as probed, so an unread PR is graded",
+     '        if (pr.get("probed") is not True or green is None',
+     '        if (pr.get("probed", True) is not True or green is None',
+     "test_a_PR_row_that_cannot_be_GRADED_is_UNPROBED_not_silent"),
+    ("an unrecognised mergeability state is skipped instead of abstaining",
+     '                or (mss not in MERGEABLE_STATES and mss not in KNOWN_NON_MERGEABLE)):',
+     '                or (mss not in MERGEABLE_STATES and mss in KNOWN_NON_MERGEABLE)):',
+     "test_a_PR_row_that_cannot_be_GRADED_is_UNPROBED_not_silent"),
+    ("a future-dated queue-state is clamped to the freshest possible reading",
+     '        qs["age_s"] = _age_of(now, int(m.group(1))) if m else None',
+     '        qs["age_s"] = max(0.0, now - int(m.group(1))) if m else None',
+     "test_a_FUTURE_dated_queue_state_or_heartbeat_is_UNKNOWN_not_fresh"),
+    ("a fixture may assert a SUBSET of the checks and still report success",
+     "            gap = [n for n in CHECK_ORDER if n not in expect]",
+     "            gap = []",
+     "test_static_refuses_a_PARTIAL_expectation_and_a_MISSING_fixture"),
+    ("a deleted outcome-critical fixture is not noticed",
+     "            for name in missing_fixtures(paths):",
+     "            for name in []:",
+     "test_static_refuses_a_PARTIAL_expectation_and_a_MISSING_fixture"),
     # ── cycle-11 defects ────────────────────────────────────────────────────────────
     ("an unread check surface is graded RED, so a green unarmed PR drops out of the population",
      "    if not rollup:",
@@ -2031,8 +2217,8 @@ MUTATIONS = [
      "test_a_fixture_expectation_naming_an_unknown_check_is_a_mismatch"),
     # ── cycle-10 defects ────────────────────────────────────────────────────────────
     ("a re-run attempt is judged by its OLDEST entry, so a flaky job that re-ran green reads red",
-     "        if prev is None or rank >= prev[0]:",
-     "        if prev is None:",
+     "        _rank, chk = max(entries, key=lambda e: e[0])",
+     "        _rank, chk = min(entries, key=lambda e: e[0])",
      "test_a_flaky_re_run_reads_GREEN_rather_than_red"),
     ("an armed decision in the log is a lander forever, however old or unaged",
      '    armed_log = _in_window(events.get("armed"), c.pr_window_s)',

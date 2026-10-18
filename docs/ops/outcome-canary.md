@@ -202,8 +202,8 @@ shape changes, and it is pruned with the rest of its check.
 ## The suite
 
 ```bash
-python3 tools/fleet/outcome_canary.test.py              # 79 tests
-python3 tools/fleet/outcome_canary.test.py --mutations  # 54 mutations, each must go RED
+python3 tools/fleet/outcome_canary.test.py              # 83 tests
+python3 tools/fleet/outcome_canary.test.py --mutations  # 62 mutations, each must go RED
 ```
 
 The signal tests drive the **real CLI** end-to-end (`--live --facts … --capture-dir …`), so what is
@@ -271,3 +271,30 @@ the module already held and did not read.
 Also corrected: `--static --only X` reported every other expectation as a mismatch (105 of them on
 the shipped fixtures), i.e. a flag pair that could never succeed; a known check excluded by `--only`
 is now **SKIPPED and listed**, never silently counted as asserted.
+
+Four more, found by measuring the surface the tool actually reads rather than the shape it assumed:
+
+- **The rollup is grouped and ranked on fields the LIVE surface emits.** `gh pr list --json
+  statusCheckRollup` sends `name, workflowName, status, conclusion, startedAt, completedAt,
+  detailsUrl` — and **no `app`, no `id`**. Grouping on `app` therefore collapsed every workflow into
+  one check, so `changes` (published by both `CI` and `Python CI`) and `ai-review-gate` (measured
+  twice with differing conclusions on the same PR) were graded as one, and ranking on `id` always fell
+  through to list position — which is not chronological (18 of 59 adjacent pairs have a later position
+  with an earlier `startedAt`). Grouping is now `(workflowName, name)`, ordering is the timestamp, and
+  **a group with an attempt still in flight is not green**: a queued attempt carries no timestamp at
+  all, so an ordering alone would rank it last and grade the stale green.
+- **"Graded or unprobed, never neither" is enforced in the predicate**, not only in the collectors.
+  `pr.get("probed", True)` read an ABSENT key as probed, and a row the filters could not grade (no
+  mergeability, no check surface) left BOTH lists — an unread PR disappearing from a PASS. An absent
+  or unrecognised mergeability state now abstains, while the known non-mergeable states (`BEHIND`,
+  `BLOCKED`, `DIRTY`, `DRAFT`, `HAS_HOOKS`, `UNSTABLE`) are still simply skipped, so a busy box does
+  not go INCONCLUSIVE just because its PRs are behind.
+- **A future-dated clock is UNKNOWN in the heartbeat and the queue-state file too.** The
+  `CLOCK_SKEW_TOLERANCE_S` rule had been applied to the log mtime only; `max(0.0, now - ts)` made a
+  stale record the freshest possible reading, which defeats the `queue_stale_s` guard whose whole job
+  is to stop a frozen EMPTY read establishing "nothing to do".
+- **`--static` asserts ALL of a fixture's expectations, and the fixture POPULATION is part of the
+  pin.** `_expect: {"headroom": "PASS"}` ran seven checks, asserted one and reported success; a
+  DELETED fixture removes the outcome it pinned while every remaining assertion still passes. A
+  partial `_expect` is a `PARTIAL_EXPECT` mismatch and a missing outcome-critical fixture is a
+  `MISSING_FIXTURE` mismatch.
