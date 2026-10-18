@@ -8555,15 +8555,22 @@ export function extractScriptArgs(command, scriptPath) {
 const OPAQUE_PROBE_BYTES = 4096;
 
 /** Leading bytes of compiled executables this probe resolves as OPAQUE: ELF,
- *  Mach-O (32/64-bit, both endiannesses), the fat/universal wrapper, and PE
- *  (`MZ`). A `#!` file is a text script by construction, and is checked FIRST so
- *  no magic below can claim it. */
+ *  Mach-O (32/64-bit, both endiannesses) and the fat/universal wrapper. A `#!`
+ *  file is a text script by construction, and is checked FIRST so no magic below
+ *  can claim it.
+ *
+ *  ⚠️ PE (`MZ`) was REMOVED at review (cycle 2, reproduced): it is a TWO-BYTE
+ *  ASCII-printable magic, so a text script starting with the perfectly ordinary
+ *  assignment `MZ=1` was classified opaque and its content was never read —
+ *  `MZ=1` + an operation executed from a hub-rooted session. Every remaining
+ *  magic is a 4-byte non-text sequence a text program cannot begin with, and a
+ *  PE binary (which nothing on this fleet executes) walked as text is the
+ *  pre-#1485 fail-closed direction. */
 const OPAQUE_MAGIC = [
   [0x7f, 0x45, 0x4c, 0x46], // ELF
   [0xfe, 0xed, 0xfa, 0xce], [0xce, 0xfa, 0xed, 0xfe], // Mach-O 32
   [0xfe, 0xed, 0xfa, 0xcf], [0xcf, 0xfa, 0xed, 0xfe], // Mach-O 64 (gh's own)
   [0xca, 0xfe, 0xba, 0xbe], [0xbe, 0xba, 0xfe, 0xca], // fat/universal
-  [0x4d, 0x5a], // PE (MZ) — Windows launcher / .exe
 ];
 
 /**
@@ -8577,15 +8584,19 @@ const OPAQUE_MAGIC = [
  *   1. `#!` → a text script, never opaque (checked first; a shebang script's
  *      bytes may still contain NULs — `node test.mjs` fixtures do).
  *   2. a known executable magic → opaque.
- *   3. a NUL byte in the probe (or byte 0 = 0) → opaque: no POSIX text program
- *      can contain one, and every binary format this probe does not name spells
- *      its header with them (`\0asm`, a fat archive's padding, …).
- * Nothing else counts. A control-byte ratio was considered and dropped: an ESC
- * byte is inside the distribution of legitimate text (a colour-code helper), and
- * widening this predicate fails OPEN on the #1484 gate — a text script read as
- * "opaque" would never be gated at all. Precision is the safe direction here
- * because an unrecognised binary still contains a NUL, and a miss only restores
- * the pre-#1485 behaviour.
+ *   3. nothing else.
+ *
+ * ⚠️ NUL BYTES ARE **NOT** EVIDENCE OF A BINARY, and reading them that way was a
+ * fail-OPEN hole (#1485 review, reproduced): `bash <path>` STRIPS NULs from a
+ * text script, so `#!/bin/bash` + an operation + a trailing `\0` still runs the
+ * operation — while a "a NUL in the probe ⇒ opaque" rule skipped the content walk
+ * entirely (measured: `git branch -D victim` actually deleted the branch from a
+ * hub-rooted session). A leading `\n` before the shebang defeats a `#!`-at-byte-0
+ * test the same way. Two consequences, both required: the NUL rules are GONE
+ * from this predicate (a binary whose magic this probe does not name is walked as
+ * text, which is the pre-#1485 fail-closed direction), and `scriptGitVerdict`
+ * strips NULs from the content before the walk — mirroring what the interpreter
+ * does with them, so `gi\0t branch -D victim` reads as the operation it is.
  *
  * Bounded: reads at most `OPAQUE_PROBE_BYTES` with one fd, never the whole file.
  * @param {string} path
@@ -8600,15 +8611,12 @@ export function isOpaqueExecutablePath(path) {
     if (n <= 0) return false; // empty/unreadable → no positive evidence
     const probe = buf.subarray(0, n);
     if (probe[0] === 0x23 && probe[1] === 0x21) return false; // `#!` → a script
-    if (probe[0] === 0) return true;                          // `\0asm` and friends
     for (const magic of OPAQUE_MAGIC) {
       if (probe.length < magic.length) continue;
       let hit = true;
       for (let i = 0; i < magic.length; i++) if (probe[i] !== magic[i]) { hit = false; break; }
       if (hit) return true;
     }
-    // A NUL anywhere in the probe: no text program contains one.
-    for (let i = 0; i < probe.length; i++) if (probe[i] === 0) return true;
     return false;
   } catch {
     return false;
@@ -8617,47 +8625,60 @@ export function isOpaqueExecutablePath(path) {
   }
 }
 
+/** Shell / interpreter command words that read their FILE operand as TEXT. */
+const INTERPRETER_WORDS = /^(?:sh|bash|zsh|dash|ksh|ash|mksh|oksh|source|\.|python[0-9.]*|node|deno|bun|ruby|perl|php|pwsh|powershell|lua|osascript|Rscript|tclsh)$/;
+
 /**
- * Is `path` a COMMITTED script of the repo that owns it — tracked, and
- * byte-identical to the blob at `HEAD`?
+ * Will `command` hand the file at `scriptPath` to an INTERPRETER (so the
+ * interpreter reads it as TEXT), or execute it DIRECTLY (execve / a compiled
+ * program)?
  *
- * The comparison is against `HEAD`, not against the index and not against a
- * `git status` line, because those are the ways a "committed" answer could be
- * bought without a commit:
- *   - an UNTRACKED file (`write /tmp/x.sh`, or `write scripts/x.sh` before any
- *     `git add`) is the #1484 threat itself → not committed;
- *   - `git add scripts/x.sh` makes the path look tracked while its content has
- *     never been reviewed (staging is not gated) → not committed;
- *   - `git update-index --assume-unchanged` hides a later MODIFICATION from
- *     `git status`, so a status-clean path can still run bytes nobody reviewed
- *     → the blob comparison is immune to it.
+ * WHY THIS EXISTS (#1485 review cycle 3, reproduced). `isOpaqueExecutablePath`
+ * answers a question about BYTES, and a text program can carry any byte prefix:
+ * `printf '\177ELF\n' > x.sh; echo '<operation>' >> x.sh; bash x.sh` SKIPS the
+ * magic, reports `command not found` for the first line, and runs the rest — so a
+ * magic-prefixed TEXT file executed by a shell was allowed while the operation
+ * ran (the same class as the `MZ=1` defect, reached with one `printf`). No magic
+ * list can fix that, because a shell does not care about the header.
  *
- * Fail direction: anything unresolvable (not a repo, unknown HEAD, unreadable
- * blob) answers `false`, i.e. the content walk runs exactly as before.
- * @param {string} path
- * @param {string} content — the bytes the shell would actually execute
+ * The invocation does care: a file handed to `bash`/`sh`/`python3`/… is TEXT by
+ * definition, so the content walk runs whatever the first bytes are; a file
+ * executed directly is a binary when its bytes say so (that is the `gh` case —
+ * `/Users/…/bin/gh issue list` is a direct execution, never interpreted).
+ *
+ * Fail direction: when the path token cannot be located in the command at all,
+ * this answers TRUE (treat as text → walk it), because a missed interpretation is
+ * a bypass while a spurious one only re-reads a binary.
+ * @param {string} command
+ * @param {string} scriptPath — the spelling the caller resolved
  * @returns {boolean}
  */
-export function isCommittedRepoScript(path, content) {
+export function scriptIsInterpreted(command, scriptPath) {
+  let tokens;
   try {
-    const real = realpathSync(path);
-    const dir = dirname(real);
-    const top = execFileSync("git", ["rev-parse", "--show-toplevel"], {
-      cwd: dir, encoding: "utf-8", timeout: 5000, stdio: ["ignore", "pipe", "ignore"],
-    }).trim();
-    if (!top) return false;
-    const topReal = realpathSync(top);
-    const rel = relative(topReal, real);
-    // Outside the repo that owns `dir` (a symlinked spelling can point out of
-    // it) → not this repo's committed script.
-    if (!rel || rel.startsWith("..") || isAbsolute(rel)) return false;
-    const blob = execFileSync("git", ["cat-file", "blob", `HEAD:${rel}`], {
-      cwd: topReal, encoding: "utf-8", timeout: 5000, stdio: ["ignore", "pipe", "ignore"],
-    });
-    return blob === content;
+    tokens = _tokenize(String(command ?? ""));
   } catch {
-    return false;
+    return true;
   }
+  const want = String(scriptPath ?? "");
+  if (!want) return true;
+  const wantBase = basename(want);
+  let found = false;
+  for (let i = 0; i < tokens.length; i++) {
+    const w = _stripQuotes(tokens[i]);
+    if (w !== want && basename(w) !== wantBase) continue;
+    found = true;
+    // Walk back over options (`sh -e x.sh`) to the command word.
+    for (let k = i - 1; k >= 0 && i - k <= 4; k--) {
+      const prev = _stripQuotes(tokens[k]);
+      if (!prev || _isShellBoundary(tokens[k])) break;
+      if (prev.startsWith("-")) continue;
+      if (INTERPRETER_WORDS.test(basename(prev))) return true;
+      break;
+    }
+  }
+  // Not locatable → treat as text (safe direction).
+  return !found;
 }
 
 /**
@@ -8667,45 +8688,45 @@ export function isCommittedRepoScript(path, content) {
  * Unreadable/missing file → "allow" (the file doesn't exist yet — nothing to
  * execute; a later call re-checks after the write).
  *
- * The content walk runs only when the path IS a text program AND is not a
- * committed repo script (#1485) — see `isOpaqueExecutablePath` and
- * `isCommittedRepoScript` for why, and for the fail-closed direction of each.
- * A committed script skips only the TEXT-UNVERIFIABLE arm; a real invocation it
- * contains is still judged (see the call site).
+ * The content walk runs only when the path IS a text program: a compiled
+ * executable executed DIRECTLY has no program to read (#1485) — see
+ * `isOpaqueExecutablePath` for the probe, and `viaInterpreter` /
+ * `scriptIsInterpreted` for why a magic header cannot decide this on its own.
+ *
+ * ⚠️ #1485 ALSO PROPOSED a general "committed repo script" exemption, and it was
+ * REJECTED at review with a reproduced bypass: "committed" is purchasable — a
+ * temp repo (`git init` + `add` + `commit`, all allowed operations) or a lane's own
+ * branch makes any content committed, and a script committed that way and then
+ * executed ran `eval '<destructive op>'` from a hub-rooted session (the text arms
+ * are what catch it, so skipping them for "committed" content skipped exactly the
+ * check that mattered). The sanctioned script list in index.ts
+ * (`SANCTIONED_SCRIPT_RELPATHS`, #1129) is the repo's reviewed answer for the same
+ * false positive: a NAMED path in the guard's own checkout, audited per use, with
+ * the #1129 P0 boundary intact.
  * @param {string} path
  * @param {string|null} currentBranch
  * @returns {"allow"|"block"}
  */
-export function scriptGitVerdict(path, currentBranch, executionCwd = process.cwd(), sessionCwd = process.cwd(), scriptArgs = null) {
+export function scriptGitVerdict(path, currentBranch, executionCwd = process.cwd(), sessionCwd = process.cwd(), scriptArgs = null, { viaInterpreter = false } = {}) {
   // #1485 (1): a compiled binary has no program to read. Probe BEFORE the read —
   // reading a 38 MB Go binary as utf-8 and scanning its bytes is what matched
   // the word `git` inside `/Users/…/bin/gh` and refused every `gh` invocation.
-  if (isOpaqueExecutablePath(path)) return "allow";
+  // …but ONLY when the path is executed directly. A file handed to a shell or an
+  // interpreter is TEXT by definition, however its bytes begin (see
+  // `scriptIsInterpreted` for the reproduced bypass this closes).
+  if (!viaInterpreter && isOpaqueExecutablePath(path)) return "allow";
   let content;
   try {
     content = readFileSync(path, "utf-8");
   } catch {
     return "allow";
   }
-  // #1485 (2): a committed, unmodified repo script is not the #1484 threat —
-  // `bash scripts/admin-merge.sh <pr>` is the repo's own rail, and its content
-  // necessarily contains the operation it implements.
-  //
-  // The exemption covers ONLY the text-unverifiable arm: the false positives are
-  // scripts whose BLOCK came from a heuristic reading prose as code (a usage
-  // heredoc, a fenced example, a `$(…)` mention) while containing no real
-  // non-sanctioned invocation at all — measured: `scripts/admin-merge.sh` and
-  // `scripts/gh-shim/gh` yield ZERO git invocations and are blocked by that arm
-  // alone. It does NOT license a real destructive invocation: `scripts/
-  // cleanup-worktree.sh` is equally committed and its `git worktree remove` /
-  // `git branch -D` must still be refused (the #1129 adversarial-review P0
-  // boundary), so the INVOCATION verdict still runs — a committed script whose
-  // real invocations are all sanctioned/read-only is allowed, and one that is
-  // not is blocked exactly as before.
-  if (isCommittedRepoScript(path, content)) {
-    return _gitInvocationsVerdict(allGitInvocations(_stripShellComments(content)), currentBranch, executionCwd, sessionCwd);
-  }
-  return scriptContentGitVerdict(content, currentBranch, executionCwd, sessionCwd, scriptArgs);
+  // #1485 review: `bash <path>` STRIPS NULs, so a text script can carry one and
+  // still execute — `gi\0t -C <hub> branch -D victim` ran the deletion while the
+  // tokenizer saw two words and no invocation. Strip them before the walk, which
+  // is what the interpreter does with them anyway.
+  const program = content.replace(/\u0000/g, "");
+  return scriptContentGitVerdict(program, currentBranch, executionCwd, sessionCwd, scriptArgs);
 }
 
 /** Split a `case` pattern list on UNQUOTED, UNBRACKETED `|`. */

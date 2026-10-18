@@ -694,6 +694,24 @@ const SHELL_PAYLOAD_RUNNERS = new Set([
 ]);
 
 /**
+ * Commands that WRAP another program (`su`, `doas`, `timeout`, `setsid`,
+ * `stdbuf`, `watch`, `chroot`, `flock`, …) — a bullet's operand can be the
+ * program, so they participate in the SHELL-PAYLOAD decision, but only together
+ * with a `-c` introducer (`su -c '<payload>'`, `timeout 5 sh -c '<payload>'`).
+ *
+ * ⚠️ They are NOT in `SHELL_PAYLOAD_RUNNERS`, and the distinction is measured
+ * (cycle 2): a wrapper word alone made every quoted ARGUMENT of the wrapped
+ * command code — `timeout 30 gh issue list --search '<mention>'`,
+ * `flock /tmp/lock gh pr comment --body '<mention>'` each counted 1 and were
+ * refused, which is the #1485 false-positive class returning through a side
+ * door. Only `-c` turns a quoted region into a program.
+ */
+const SHELL_WRAPPER_WORDS = new Set([
+  "sudo", "doas", "su", "runuser", "pkexec", "timeout", "setsid", "stdbuf",
+  "watch", "chroot", "flock", "nice", "env", "nohup", "time", "command", "exec",
+]);
+
+/**
  * Commands whose STDIN is a PROGRAM: a shell or an interpreter (`python3`, `node`,
  * …), plus the executors that read a script from stdin (`make -f -`, `awk -f -`,
  * `xargs`). Used by `dataCharMask` for `… | <runner>`, where the previous stage's
@@ -821,7 +839,13 @@ function dataCharMask(scan: ScanTokens): boolean[] {
     // output as a program).
     if (!/(^|[^|])\|([^|]|$)/.test(gap)) return false;
     const next = shellWord(scan.tokens[end + 1]);
-    return STDIN_PROGRAM_RUNNERS.has(next) || STDIN_PROGRAM_INTERPRETER_RE.test(next);
+    return STDIN_PROGRAM_RUNNERS.has(next) || STDIN_PROGRAM_INTERPRETER_RE.test(next) ||
+      // #1485 review: a PATH-spelled shell (`| /bin/sh`, `| /usr/bin/bash`) is the
+      // same program as `| sh`, and `| /usr/bin/env sh` is one word away from it —
+      // measured bypass: `echo 'gh pr merge 999 --admin' | /bin/sh` read as data.
+      /(^|\/)(?:sh|bash|zsh|dash|ksh|ash|mksh|oksh)$/.test(next) ||
+      (/(^|\/)(?:env|exec|command|nohup|nice|timeout|setsid|stdbuf|su|doas)$/.test(next) &&
+        STDIN_PROGRAM_RUNNERS.has(shellWord(scan.tokens[end + 2] ?? "")));
   };
   let i = 0;
   while (i < mask.length) {
@@ -840,9 +864,36 @@ function dataCharMask(scan: ScanTokens): boolean[] {
       !/^[A-Za-z_][A-Za-z0-9_]*\+?=/.test(tokens[ti]);
     const isShellPayload = SHELL_PAYLOAD_RUNNERS.has(cmdWord) ||
       /(^|\/)(?:sh|bash|zsh|dash|ksh|ash|mksh|oksh)$/.test(cmdWord);
+    // #1485 review (P0, reproduced): the runner need not be the simple command's
+    // FIRST word. `timeout 5 sh -c '<payload>'`, `env FOO=1 bash -c '<payload>'`,
+    // `su -c '<payload>'`, `stdbuf -oL sh -c '<payload>'` are all shells running
+    // the quoted text, and keying only on `tokens[seg]` read their payload as DATA
+    // - which made `countMergeVerbs` 0 for a real admin merge, stood the evidence
+    // gate down, and would have landed an unevidenced merge.
+    //
+    // The rule is deliberately NARROW: a shell payload is introduced by `-c`, and
+    // a shell word appears earlier in the same simple command. Scanning "any
+    // runner word anywhere earlier" instead was measured (cycle 2) to be a NEW
+    // false positive of exactly the class #1485 fixes - `timeout 30 gh issue list
+    // --search '<mention>'` and `flock /tmp/lock gh pr comment --body '<mention>'`
+    // had their `gh` ARGUMENTS read as programs, counted 1, and were refused. In
+    // those the region's introducer is `--search`/`-f`, not `-c`, so they stay
+    // DATA. A non-shell interpreter is still not a runner: its `-c` payload is
+    // another language's source (see the declared residual); `| python3` - a pipe
+    // whose STDIN is the program - is a different question, handled in
+    // `pipedIntoRunner`.
+    const payloadFlagAfterShell = shellWord(tokens[ti - 1] ?? "") === "-c" && (() => {
+      for (let k = seg; k < ti - 1; k++) {
+        const w = shellWord(tokens[k]);
+        if (!w) continue;
+        if (SHELL_PAYLOAD_RUNNERS.has(w) || SHELL_WRAPPER_WORDS.has(w)) return true;
+        if (/(^|\/)(?:sh|bash|zsh|dash|ksh|ash|mksh|oksh)$/.test(w)) return true;
+      }
+      return false;
+    })();
     const isGhVerbSlot = /(^|\/)gh$/.test(cmdWord) && ti > seg && ti <= seg + 3;
     const isExecPayload = EXEC_PAYLOAD_FLAGS.has(shellWord(tokens[ti - 1] ?? ""));
-    if (isCommandName || isShellPayload || isGhVerbSlot || isExecPayload || pipedIntoRunner(ti) || inProcessSub(ti)) {
+    if (isCommandName || isShellPayload || payloadFlagAfterShell || isGhVerbSlot || isExecPayload || pipedIntoRunner(ti) || inProcessSub(ti)) {
       continue; // executable
     }
     // DATA — but a command substitution inside it still runs. Only a
@@ -3366,10 +3417,16 @@ export default function (pi: ExtensionAPI) {
         // evidence gate to certify, so the candidate came from DATA (a payload, a
         // jq filter, a PR body). Polarity is `readsNonMergeGhCall`'s: a command
         // whose gh invocations this scan cannot read (a construct outside a data
-        // region, a `$P/g''h` path, an unresolvable verb) stays gated below, and an
-        // interpreter payload that would merge via its own argv is left to the
-        // argv-level gh shim — never to a data region.
-        if (merges === 0 && readsNonMergeGhCall(command)) {
+        // region, a `$P/g''h` path, an unresolvable verb) stays gated below.
+        //
+        // #1485 review (P0, reproduced): standing down is only sound while the
+        // argv layer is INSTALLED, because that is what still sees a merge this
+        // text scan mis-read as data (`timeout 5 sh -c '<payload>'`, a payload in
+        // a prefix the data model does not know). With the shim off — a supported
+        // state (`AGENT_GH_SHIM=0`) — nothing downstream would catch it, so the
+        // previous conservative refusal is kept instead of a stand-down. Same
+        // guard, same reason as the #1776 deferral above.
+        if (merges === 0 && readsNonMergeGhCall(command) && ghShimWillEnforce(shimDir)) {
           console.log(
             "[review-enforcer] ✅ Admin-merge evidence gate: no merge invocation (mention only) — allowed"
           );

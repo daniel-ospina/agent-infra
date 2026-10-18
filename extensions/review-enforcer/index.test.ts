@@ -4266,6 +4266,49 @@ test("#1485: countMergeVerbs counts INVOCATIONS, not every `gh` word in a comman
   ok(countMergeVerbs("gh pr ${X}merge 999 --admin") === 1, "…in either splice direction");
   ok(countMergeVerbs("gh pr --repo=$(cat x) merge 999 $V") === 1,
     "the repo-flag stripper's residue still reads as one merge");
+
+  // #1485 REVIEW (P0, reproduced): a payload runner is not always the simple
+  // command's FIRST word, so keying the data/program decision on `tokens[seg]`
+  // alone read these as DATA — `countMergeVerbs` returned 0, the "mention only"
+  // stand-down fired, and a real `--admin` merge landed with no head-bound
+  // evidence. Every spelling below is a shell RUNNING the quoted program.
+  const PREFIXED_RUNNERS = [
+    "timeout 5 sh -c __P__", "setsid sh -c __P__", "stdbuf -oL sh -c __P__",
+    "watch -n1 sh -c __P__", "X=1 sh -c __P__", "FOO=bar bash -c __P__",
+    "su -c __P__", "doas sh -c __P__", "sudo sh -c __P__", "env FOO=1 sh -c __P__",
+    "echo __P__ | /bin/sh", "echo __P__ | /bin/bash", "echo __P__ | /usr/bin/env sh",
+  ];
+  for (const shape of PREFIXED_RUNNERS) {
+    const cmd = `gh pr view 1; ${shape.replace("__P__", "'gh pr merge 999 --admin'")}`;
+    ok(countMergeVerbs(cmd) >= 1, `a wrapped payload counts: ${shape}`);
+  }
+  // REVIEW CYCLE 2 (P1, reproduced): the first cut scanned "any runner word
+  // anywhere earlier in the simple command", which made the `gh` ARGUMENTS of a
+  // WRAPPED read-only call code — `timeout 30 gh issue list --search '<mention>'`
+  // counted 1 and was refused. That is the #1485 false-positive class returning
+  // through a side door, so the rule is now `-c` + a shell/wrapper word. These
+  // four were the measured regressions.
+  const WRAPPED_ARGUMENTS = [
+    `timeout 30 gh issue list --search 'gh pr merge 999 --admin in:body'`,
+    `timeout 30 gh pr view 42 --json body --jq '.body | test("gh pr merge 999 --admin")'`,
+    `flock /tmp/lock gh pr comment 42 --body 'the rail runs gh pr merge 999 --admin after evidence'`,
+    `stdbuf -oL gh pr view 42 --jq 'select(.body|contains("gh pr merge 999 --admin"))'`,
+  ];
+  for (const cmd of WRAPPED_ARGUMENTS) {
+    ok(countMergeVerbs(cmd) === 0, `a wrapped read-only call's ARGUMENT is data: ${cmd.slice(0, 48)}`);
+  }
+  // …and the wrapper family the `-c` rule exists for still counts.
+  for (const shape of ["su -c __P__", "sudo -u user sh -c __P__", "flock /tmp/lock sh -c __P__",
+    "chroot /dir sh -c __P__", "find . -maxdepth 1 -exec sh -c __P__ \\;", "xargs -0 sh -c __P__"]) {
+    const cmd = `gh pr view 1; ${shape.replace("__P__", "'gh pr merge 999 --admin'")}`;
+    ok(countMergeVerbs(cmd) >= 1, `a wrapped payload still counts: ${shape}`);
+  }
+
+  // …and the measured false positives stay ZERO, so the fix is not a one-way
+  // tightening that re-breaks the reported refusal.
+  ok(countMergeVerbs('gh run view 1 --log-failed 2>&1 | grep -viE "^\\s*$"') === 0, "a grep pattern is still data");
+  ok(countMergeVerbs('gh api repos/o/r/issues/1/comments --jq \'.[].body\' | python3 -c "print(1)"') === 0,
+    "…and a non-shell interpreter payload is still data (the declared residual)");
 });
 
 test("#1485: the polarity predicate ignores quoted DATA, so a mention does not blind the positive read", () => {
