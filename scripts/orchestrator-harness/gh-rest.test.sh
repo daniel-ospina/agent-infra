@@ -109,6 +109,19 @@ out="$(run pr checks 8833 --repo o/r 2>&1)"
 ck "pr checks without --json DELEGATES (table output is not modelled)" \
    "$(haslog 'pr checks 8833 --repo o/r' && echo 0 || echo 1)"
 
+# ── D3. an UNMODELLED --json FIELD must delegate (the flag rule, applied to fields) ───────────────
+# Measured AFTER shipping: collision_preflight.py asks for `closingIssuesReferences` — GraphQL-only,
+# absent from REST. The adapter answered null, the pre-flight read that as "closes nothing", every
+# candidate went INCOMPLETE and the backlog stayed 0 with capacity free: no lanes dispatched.
+: >"$TMP/log"
+run pr list --repo o/r --state open --json number,closingIssuesReferences >/dev/null 2>&1
+ck "unservable --json field (closingIssuesReferences) DELEGATES instead of answering null" \
+   "$(haslog 'closingIssuesReferences' && echo 0 || echo 1)"
+: >"$TMP/log"
+run pr list --repo o/r --state open --json number >/dev/null 2>&1
+ck "a servable --json field still uses REST (no needless delegation)" \
+   "$(haslog 'pulls?state=' && echo 0 || echo 1)"
+
 # ── E. pr list --head must reach the API (chain-merge.sh:44 — else the WRONG PR is merged) ───────
 : >"$TMP/log"
 run pr list --repo o/r --state open --head BR --json number --jq '.[0].number' >/dev/null 2>&1
