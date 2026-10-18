@@ -332,8 +332,14 @@ def screened_stalled(label):
     SCREEN_CAP[0] -= 1
     try:
         import subprocess
+        # ⛔ THE PATH IS OVERRIDABLE SO THE SCREEN CAN BE STUBBED. tests/heartbeat-fleet-advance
+        # drives this tick in a sandbox HOME, and a hard-coded absolute path escapes that sandbox:
+        # on a box where the file exists the test would call the LIVE Jev screen (~30s, real cost)
+        # and its verdict would decide the delivered body. The default is unchanged, so production
+        # is unaffected. Separately: rc=2 from a MISSING file is read as "not stalled" here, which
+        # inverts this docstring -- that fail-open defect is agent-infra#1797, not this change.
         r=subprocess.run(["/usr/bin/python3",
-                          "/Users/danielospina/.pi/agent/state/lane-confirm.py", label],
+                          os.environ.get("LANE_CONFIRM", "/Users/danielospina/.pi/agent/state/lane-confirm.py"), label],
                          capture_output=True, text=True, timeout=900)
         return r.returncode == 0       # 0 == STALLED (lettered); anything else == suppress
     except Exception:
@@ -874,6 +880,87 @@ MSG="[HEARTBEAT ${TS}] fleet ${N_ACT}active/${N_WAIT}waiting-child of ${N_TOTAL}
 # the orchestrator asserted a decided option set ("the graph's ranking put X first")
 # when the graph had only RANKED the options for the owner to pick between.
 # NO BACKTICKS in this text -- MSG is a double-quoted assignment, so backticks are
+# -- ⛔ FLEET ADVANCE: the standing order the beat had NO half of (owner, 2026-10-18) ---------
+# MEASURED BEFORE THIS CLAUSE EXISTED: 12 open non-draft PRs, 8 of them closing a P0/P1 issue,
+# ALL 8 blocked, and merged_24h unmoved for over an hour -- while every beat in that window read
+# as a healthy fleet. The beat carried ROLE, MAP and PRIORITY (how to behave) and no instruction
+# to ADVANCE anything, so a lane could read it, write a paragraph about load and lanes, dispatch
+# nothing, and nothing on the line said that was wrong.
+# WHY HERE AND NOT AGENTS.md: AGENTS.md holds the standing rules; the beat holds what to do with
+# the NEXT TEN MINUTES. The failure was never ignorance of the rules -- it was a beat that read
+# like a finished report. HYPOTHESIS (labelled as one on purpose: it is not measured): a rule in a
+# document does not change what a report triggers, while an order IN the report does. It sits beside
+# ROLE/MAP/PRIORITY because that is the block an agent already reads, and whether it changes lane
+# behaviour is the one thing this file cannot measure -- merged_24h is where that shows up.
+# ⛔ UNCONDITIONAL, AND IT MUST RIDE THE SHORT FORM TOO (the SHORT FORM block below rebuilds MSG): a
+# quiet beat is exactly when the order is needed, and the short form is what a quiet beat receives --
+# it REBUILDS MSG from scratch, so an order that lives only in the FULL body is discarded on every
+# quiet tick.
+# ⛔ ONE ORDER, TWO LENGTHS -- AND THE ORDER ITSELF IS NEVER REPHRASED. FA1..FA4 are the three
+# instructions the owner gave plus the closing line, defined ONCE and embedded VERBATIM in both body
+# literals; only the (1)(2)(3) numbering and the one elaboration sentence below belong to the alert
+# body alone. tests/heartbeat-fleet-advance/run.sh pins each of these sentences in the DELIVERED body
+# of ELEVEN fleet states (no lanes / one working lane / working+waiting-child / a 12-lane production
+# fleet / idle capacity / alert+capacity / no live pi record / a routed question / an alerting lane /
+# a queue bottleneck / an objective at risk), pins both composed literals to their EXACT documented
+# text, and pins each delivered body to its exact LENGTH -- so no condensation can drop, reword or
+# soften an instruction, and nothing can be ADDED to a body either (an added clause, even a
+# contradictory one, changes that body's length).
+# (Reviewer-driven: round after round of "delete this phrase, suite stays green" mutants, each
+# pointing at a different word, were all one defect -- a marker per phrase cannot be exhaustive; a
+# shared sentence, a fixed state matrix and an exact delivered body can.)
+# ⛔ WHY THE ORDER IS EMBEDDED IN THE LITERALS RATHER THAN APPENDED. Two review rounds measured
+# zero-net-line edits that dropped it anyway: wrap an append in an `if` (no count changes, no visited
+# state changes) or rewrite the message on its way out (`${MSG:0:400}`, `${MSG/.../}`). So the order
+# lives INSIDE the two literals -- there is no append statement to wrap -- and the suite pins the
+# EGRESS: exactly one send statement, in its exact shipped form, with no slicing or substitution of
+# MSG anywhere in this file. (Also: an append below the short-form rebuild was one deleted line away
+# from losing the order on every quiet tick, which is how #1991 was originally mis-fixed.)
+# ⛔ THE ONE OWNER-ORDERED SENTENCE THAT IS ALERT-ONLY IS DELIBERATE: order (2)'s "not described in
+# a paragraph about load" rides FLEETADV alone. FA2 keeps the normative half ("USE THE CAPACITY, DO
+# NOT REPORT IT"), and the short body is where the pulse must stay short. Adding that elaborating
+# sentence to the quiet beat is not a ceiling question -- the suite asserts the elaboration ABSENT
+# from the quiet body (it is what makes the two bodies distinguishable), so that edit is red until
+# the assertion is changed deliberately.
+# MEASURED 2026-10-18, IN BYTES (the suite pins LC_ALL=C, and the order carries the characters that
+# differ between bytes and chars -- the em dash and the ⛔): the SHORT rendering is 624 and the alert
+# body's clause 713, on a base pulse of 985 -- so the order is ~39% of the PLAIN quiet beat, and the
+# largest of the ROLE / MAP / PRIORITY / order clauses there (the suppressed verdict legend, 840, is
+# larger; the whole point of the legend is that it is suppressed on a quiet tick). Delivered bodies:
+# quiet 1608, a 12-lane fleet 1609, idle capacity 1847, alert+capacity 4120, the alert body ~4.3k.
+# ⛔ WHAT THE SUITE ENFORCES, AND WHAT IT DOES NOT. It enforces: the exact delivered text LENGTH in
+# each of the eleven states, the four sentences exactly once each, the framing ("an ORDER, not a
+# report") in the delivered text, the order LAST in a plain pulse, immediately BEFORE the CAPACITY
+# clause in the capacity states, a fixed 700-byte ceiling on the SHORT wording, the embedded-not-
+# appended shape, the single pinned egress, and a coarse lint on statements touching the order or
+# MSG. It does NOT enforce: an edit keyed on a COMBINATION of states the eleven do not visit and
+# written without adding a statement or touching the egress -- e.g. text added to a body that only
+# differs on that combination. That is the residual, and saying it plainly is the point: the previous
+# round called a fixable gap "irreducible" and it stopped a round from closing it.
+# ⛔ NOT THE DOMINANT SENDER (stated, not absorbed): scripts/cadence-nudge.sh is the cadence FLOOR and,
+# per its own header and this file's note below, the sender that SURVIVES when this tick is killed at
+# its budget. It does carry nudges of its own ("CHECK EVERY LANE IS MOVING", "NEXT: ... spend spare
+# capacity on P0, then P1") -- what it does NOT carry is #1991's specific order: AUTOPILOT with its
+# gloss, the four boxes, the rail by name, cell-2's automation. A separate sender with its own
+# constraints (offline, one giant MSG line), it is filed as agent-infra#1993 so #1993's implementer
+# adds only what is missing instead of duplicating what is there. This clause is the tick's, which is
+# what #1991 names.
+# ⛔ NO BACKTICKS, NO DOUBLE QUOTES AND NO $ IN FA1..FA4 -- the same rule as the rest of MSG (see
+# the warning above): MSG is a DOUBLE-QUOTED assignment, so a backticked span is command-substituted
+# AT ASSIGNMENT TIME and silently vanishes, leaving a hole the file on disk still looks right about.
+# The two composed bodies may reference ${FA1}..${FA4}, and ONLY those references -- an added $ or
+# backtick there is the same defect, so it is the composed literal that carries the check.
+# ⛔ "ALL FOUR BOXES (local + the three cloud VMs)" IS THE OWNER'S OWN WORDING, quoted verbatim: the
+# count is a fact about the fleet, not about this code, and nothing in the repo enumerates the VMs
+# (only pi-cell-2 appears by name). If a box is added or retired this sentence must be re-issued by
+# the owner, not silently edited here -- an order carrying a visibly stale fact teaches the reader
+# to skim the order.
+FA1="CHECK THE cmux LANES AND ALL FOUR BOXES (local + the three cloud VMs) and push each toward AUTOPILOT — dispatching, creating PRs, fixing them, merging them UNATTENDED."
+FA2="USE THE CAPACITY, DO NOT REPORT IT: dispatch locally if the local machine has room, on a cloud VM if it is idle."
+FA3="DRIVE THE P0/P1 PRs: name the specific PRs that should land this cycle, take each one to the rail via scripts/admin-merge.sh, and advance agent-infra (cell-2 owns it) toward automating dispatch, PR creation, fixing and merging."
+FA4="A beat that reports state and dispatches nothing is a WASTED BEAT."
+FLEETADV="⛔ FLEET ADVANCE — an ORDER, not a report. (1) ${FA1} (2) ${FA2} Lanes must be running on real work, not described in a paragraph about load. (3) ${FA3} ${FA4} "
+FLEETADV_SHORT="⛔ FLEET ADVANCE — an ORDER, not a report. ${FA1} ${FA2} ${FA3} ${FA4} "
 # command-substituted at assignment time and silently vanish (see the warning below).
 MSG="${MSG} ⛔ ROLE: orchestrate, don't implement — dispatch work and verify the artifact, never do a lane's work here. Owner decisions are never yours: they go through the AGENTS.md protocol to the owner-decision label (ask-owner.py). "
 
@@ -900,79 +987,8 @@ MSG="${MSG} ⛔ MAP: the CI-and-merge crisis is the Tortoise graph, entered via 
 # command ran, its output went nowhere, and the words disappeared. This file already carried the
 # warning at :377-379 (a lane name in backticks was executed as a command) and it was repeated
 # anyway. Quote plainly, or use the word 'run'.
-MSG="${MSG} ⛔ PRIORITY: before dispatching, read the ranked order IN THE GRAPH (the restated PRIORITY STACK + the objective cascade: DRAIN -> BE ABLE TO MERGE -> COMPLETE P0/P1 -> LAUNCH ALPHA -> PILOTS -> REVENUE), then VERIFY each item's state with gh issue view N --json state — a stack entry is a hypothesis about the work, never a statement that it is open. "
+MSG="${MSG} ⛔ PRIORITY: before dispatching, read the ranked order IN THE GRAPH (the restated PRIORITY STACK + the objective cascade: DRAIN -> BE ABLE TO MERGE -> COMPLETE P0/P1 -> LAUNCH ALPHA -> PILOTS -> REVENUE), then VERIFY each item's state with gh issue view N --json state — a stack entry is a hypothesis about the work, never a statement that it is open. ${FLEETADV}"
 
-# -- ⛔ FLEET ADVANCE: the standing order the beat had NO half of (owner, 2026-10-18) ---------
-# MEASURED BEFORE THIS CLAUSE EXISTED: 12 open non-draft PRs, 8 of them closing a P0/P1 issue,
-# ALL 8 blocked, and merged_24h unmoved for over an hour -- while every beat in that window read
-# as a healthy fleet. The beat carried ROLE, MAP and PRIORITY (how to behave) and no instruction
-# to ADVANCE anything, so a lane could read it, write a paragraph about load and lanes, dispatch
-# nothing, and nothing on the line said that was wrong.
-# WHY HERE AND NOT AGENTS.md: AGENTS.md holds the standing rules; the beat holds what to do with
-# the NEXT TEN MINUTES. The failure was never ignorance of the rules -- it was a beat that read
-# like a finished report. HYPOTHESIS (labelled as one on purpose: it is not measured): a rule in a
-# document does not change what a report triggers, while an order IN the report does. It sits beside
-# ROLE/MAP/PRIORITY because that is the block an agent already reads, and whether it changes lane
-# behaviour is the one thing this file cannot measure -- merged_24h is where that shows up.
-# ⛔ UNCONDITIONAL, AND IT MUST RIDE THE SHORT FORM TOO (the SHORT FORM block below rebuilds MSG): a
-# quiet beat is exactly when the order is needed, and the short form is what a quiet beat receives --
-# it REBUILDS MSG from scratch, so a clause appended only ABOVE it is discarded on every quiet tick.
-# ⛔ ONE ORDER, TWO LENGTHS -- AND THE ORDER ITSELF IS NEVER REPHRASED. FA1..FA4 are the three
-# instructions the owner gave plus the closing line, defined ONCE and embedded VERBATIM in both
-# bodies; only the (1)(2)(3) numbering and the one elaboration sentence below belong to the alert
-# body alone. tests/heartbeat-fleet-advance/run.sh pins each of these sentences verbatim in the
-# DELIVERED body of EIGHT fleet states (no lanes / one working lane / working+waiting-child / idle
-# capacity / a routed question / an alerting lane / a queue bottleneck / an objective at risk), pins
-# both composed literals to their EXACT documented text, and pins each delivered body to its exact
-# LENGTH -- so no condensation can drop, reword or soften an instruction, and nothing can be ADDED
-# to a body either (an added clause, even a contradictory one, changes that body's length).
-# (Reviewer-driven: round after round of "delete this phrase, suite stays green" mutants, each
-# pointing at a different word, were all one defect -- a marker per phrase cannot be exhaustive; a
-# shared sentence, a fixed state matrix and an exact delivered body can.)
-# ⛔ THE ONE OWNER-ORDERED SENTENCE THAT IS ALERT-ONLY IS DELIBERATE: order (2)'s "not described in
-# a paragraph about load" rides FLEETADV alone. FA2 keeps the normative half ("USE THE CAPACITY, DO
-# NOT REPORT IT"), and the short body is where the pulse must stay short. Adding that elaborating
-# sentence to the quiet beat is not a ceiling question -- the suite asserts the elaboration ABSENT
-# from the quiet body (it is what makes the two bodies distinguishable), so that edit is red until
-# the assertion is changed deliberately.
-# MEASURED 2026-10-18, IN BYTES (the suite pins LC_ALL=C, and the order carries the characters that
-# differ between bytes and chars -- the em dash and the ⛔): the SHORT rendering is 624 and the alert
-# body's clause 713, on a base pulse of 985 -- so the order is ~39% of every quiet beat, still the
-# largest single clause there and deliberately: it is the only clause that tells the lane to DO
-# something. The delivered quiet body is 1610, the idle-capacity one 1849, the alert body ~4.3k.
-# ⛔ WHAT THE SUITE ENFORCES, AND WHAT IT DOES NOT. It enforces: the exact delivered text LENGTH in
-# each of the eight states, the four sentences exactly once each, the framing ("an ORDER, not a
-# report") in the delivered text, the order last in a plain pulse and immediately before the
-# CAPACITY clause, a fixed 700-byte ceiling on the order's own wording, and a coarse lint on the
-# number of statements touching the order or MSG. It does NOT enforce: an edit keyed on a
-# COMBINATION of states the eight do not visit, written without adding a statement (the irreducible
-# residual -- say so rather than claiming more). The lint counts statements; the length pins catch
-# text. Neither is "exhaustive by construction", and the comment should not pretend otherwise.
-# ⛔ NOT THE DOMINANT SENDER (stated, not absorbed): scripts/cadence-nudge.sh is the cadence FLOOR and,
-# per its own header and this file's note below, the sender that SURVIVES when this tick is killed at
-# its budget. It does carry nudges of its own ("CHECK EVERY LANE IS MOVING", "NEXT: ... spend spare
-# capacity on P0, then P1") -- what it does NOT carry is #1991's specific order: AUTOPILOT with its
-# gloss, the four boxes, the rail by name, cell-2's automation. A separate sender with its own
-# constraints (offline, one giant MSG line), it is filed as agent-infra#1993 so #1993's implementer
-# adds only what is missing instead of duplicating what is there. This clause is the tick's, which is
-# what #1991 names.
-# ⛔ NO BACKTICKS, NO DOUBLE QUOTES AND NO $ IN FA1..FA4 -- the same rule as the rest of MSG (see
-# the warning above): MSG is a DOUBLE-QUOTED assignment, so a backticked span is command-substituted
-# AT ASSIGNMENT TIME and silently vanishes, leaving a hole the file on disk still looks right about.
-# The two composed bodies may reference ${FA1}..${FA4}, and ONLY those references -- an added $ or
-# backtick there is the same defect, so it is the composed literal that carries the check.
-# ⛔ "ALL FOUR BOXES (local + the three cloud VMs)" IS THE OWNER'S OWN WORDING, quoted verbatim: the
-# count is a fact about the fleet, not about this code, and nothing in the repo enumerates the VMs
-# (only pi-cell-2 appears by name). If a box is added or retired this sentence must be re-issued by
-# the owner, not silently edited here -- an order carrying a visibly stale fact teaches the reader
-# to skim the order.
-FA1="CHECK THE cmux LANES AND ALL FOUR BOXES (local + the three cloud VMs) and push each toward AUTOPILOT — dispatching, creating PRs, fixing them, merging them UNATTENDED."
-FA2="USE THE CAPACITY, DO NOT REPORT IT: dispatch locally if the local machine has room, on a cloud VM if it is idle."
-FA3="DRIVE THE P0/P1 PRs: name the specific PRs that should land this cycle, take each one to the rail via scripts/admin-merge.sh, and advance agent-infra (cell-2 owns it) toward automating dispatch, PR creation, fixing and merging."
-FA4="A beat that reports state and dispatches nothing is a WASTED BEAT."
-FLEETADV="⛔ FLEET ADVANCE — an ORDER, not a report. (1) ${FA1} (2) ${FA2} Lanes must be running on real work, not described in a paragraph about load. (3) ${FA3} ${FA4} "
-FLEETADV_SHORT="⛔ FLEET ADVANCE — an ORDER, not a report. ${FA1} ${FA2} ${FA3} ${FA4} "
-MSG="${MSG} ${FLEETADV}"
 if [ -n "${CAPTEXT:-}" ]; then MSG="${MSG} ${CAPTEXT}"; fi
 
 # -- SHORT FORM when there is nothing to act on -------------------------------
@@ -982,12 +998,12 @@ if [ -n "${CAPTEXT:-}" ]; then MSG="${MSG} ${CAPTEXT}"; fi
 # two lines that matter and keep the full text for ticks that carry an alert.
 # The delivery check greps for "HEARTBEAT ${TS}", which both forms contain.
 if [ "${FORCE_SHORT:-0}" = "1" ] || { [ "$N_ALERT" -eq 0 ] && [ -z "$ASK_EV" ]; }; then
-  MSG="[HEARTBEAT ${TS}] fleet ${N_ACT}active/${N_WAIT}waiting-child of ${N_TOTAL}. ${DELIV} ${QUEUE} ${OBJ} ⛔ ROLE: orchestrate, don't implement — dispatch and verify the artifact; never decide for the owner (their questions go through the AGENTS.md protocol to the owner-decision label, ask-owner.py). ⛔ MAP: the CI-and-merge crisis is the Tortoise graph, entered via the graph comment on #4844 — read it, keep it current. ⛔ PRIORITY: read the ranked order IN THE GRAPH (restated PRIORITY STACK + the cascade DRAIN -> MERGE -> P0/P1 -> ALPHA -> PILOTS -> REVENUE) and VERIFY each item's state (gh issue view N --json state) before dispatching — a stack entry is a hypothesis, not proof it is open. No alerts. (Verdict legend suppressed: CHILD-STUCK / WEDGED / DONE-IDLE / UNBOUND are WEAK signals — confirm against the pane or a content scan before acting. Full legend + VERDICTS known= are in ${LOG##*/}.)"
-  # ⛔ THE SHORT FORM REBUILDS MSG, so the FLEET ADVANCE order must be re-appended here or every
-  # quiet beat loses the one instruction that tells the lane to dispatch something. It goes BEFORE
-  # the capacity clause: the order first, the detail it acts on second. The SHORT phrasing, not the
-  # full one -- this body exists to stay readable (see the two-lengths note above).
-  MSG="${MSG} ${FLEETADV_SHORT}"
+  MSG="[HEARTBEAT ${TS}] fleet ${N_ACT}active/${N_WAIT}waiting-child of ${N_TOTAL}. ${DELIV} ${QUEUE} ${OBJ} ⛔ ROLE: orchestrate, don't implement — dispatch and verify the artifact; never decide for the owner (their questions go through the AGENTS.md protocol to the owner-decision label, ask-owner.py). ⛔ MAP: the CI-and-merge crisis is the Tortoise graph, entered via the graph comment on #4844 — read it, keep it current. ⛔ PRIORITY: read the ranked order IN THE GRAPH (restated PRIORITY STACK + the cascade DRAIN -> MERGE -> P0/P1 -> ALPHA -> PILOTS -> REVENUE) and VERIFY each item's state (gh issue view N --json state) before dispatching — a stack entry is a hypothesis, not proof it is open. No alerts. (Verdict legend suppressed: CHILD-STUCK / WEDGED / DONE-IDLE / UNBOUND are WEAK signals — confirm against the pane or a content scan before acting. Full legend + VERDICTS known= are in ${LOG##*/}.) ${FLEETADV_SHORT}"
+  # ⛔ THE ORDER RIDES THE LITERAL ABOVE, and that is deliberate: the SHORT FORM REBUILDS MSG, so an
+  # order appended as a SEPARATE statement below this rebuild is both easily lost (delete one line and
+  # every quiet beat loses it) and easily made conditional (wrap it in an `if` and no count changes).
+  # Embedded in the literal there is no append statement to wrap, and the capacity clause still comes
+  # AFTER it -- the order first, the detail it acts on second, pinned by the suite.
   if [ -n "${CAPTEXT:-}" ]; then MSG="${MSG} ${CAPTEXT}"; fi
 fi
 # -- the bottleneck clause, when the queue is the constraint -------------------
