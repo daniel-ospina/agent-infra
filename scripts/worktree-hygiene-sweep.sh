@@ -48,24 +48,50 @@
 # after the engine pass if the engine took it, using the same branch the engine
 # retained (so the re-add is a checkout, never a branch creation).
 #
-# SHIPS ARMED, AND THE ARMING IS VISIBLE HERE (not in an env default). The
-# general rule (#1678, owner ruling 2026-10-11) is that a deletion tool ships
-# dry-run and arming is a separate, dated, reversible step. The owner took that
-# step for this box on 2026-10-18 by instructing a bounded, recurring sweep; the
-# arming therefore lives in the plist's `--apply` argument and in this file's
-# `--apply` flag being passed through, and reversing it is one command:
-#     launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.tortoise.worktree-hygiene.plist
-#     rm ~/Library/LaunchAgents/com.tortoise.worktree-hygiene.plist
+# SHIPS DISARMED (#1678, owner ruling 2026-10-11: "the reaper may run
+# unattended; arming it may not"). The general rule is that a deletion tool
+# ships dry-run and arming is a separate, dated, reversible, PER-BOX step. This
+# file and its plist template BOTH default to dry-run; the installed unit is
+# armed only by an explicit installer verb that (a) records who armed it, when,
+# and why in a dated file, and (b) refuses to arm a box whose prerequisites do
+# not resolve (see §PREREQUISITES BELOW). Reversing it is one command:
+#     install-launchd.sh --disarm-worktree-hygiene
+# The armed state is VISIBLE IN THE INSTALLED UNIT (`--apply` in
+# ProgramArguments), never an environment default, so `--status` and a `cat` of
+# ~/Library/LaunchAgents/com.tortoise.worktree-hygiene.plist both answer "is this
+# box deleting anything?" without reading this file.
+#
+# PREREQUISITES, PROBED BEFORE ANY WORK (--preflight, and at the top of every
+# pass). The engine is a FARMED script that sources sibling libraries from its
+# own directory (`lib/*.sh`), and this sweep's entire step 1 is that engine. AN
+# ENGINE whose library did not land exits 3 on EVERY pass; if this wrapper
+# reported that as the generic "INCOMPLETE (rc=2)" the job would sit inert for
+# weeks behind a log line that reads like a bad PR surface. So the prerequisite
+# set is probed FIRST and BY NAME, an unmet one exits 6 with the missing path
+# named, and the reason is written to the blocked marker (below) as well as the
+# log. `--preflight` prints that probe and exits — the installer runs it before
+# it will arm this job on a box.
+#
+# THE BLOCKED MARKER. $STATE_DIR/worktree-hygiene-blocked exists iff the LAST
+# pass did not complete cleanly; it holds the timestamp and the exact reason
+# lines. A scheduler's exit code is invisible to every probe (launchd records it
+# and nobody reads it), so the verdict is also a FILE, the same idiom
+# orch-loop.sh uses for .cache-reap-blocked.
 #
 # Usage:
 #   worktree-hygiene-sweep.sh [--apply] [--repo PATH] [--engine PATH]
-#                             [--aged-days N] [--backup-dir DIR] [--help]
+#                             [--aged-days N] [--backup-dir DIR]
+#                             [--preflight] [--help]
 #
 #   (no mode flag)  DRY RUN: classify with both engines, remove nothing
-#   --apply         armed pass (the plist passes this; see §SHIPS ARMED)
+#   --dry-run       explicit dry-run (wins over --apply if given last)
+#   --apply         armed pass (only the ARMED installed unit passes this; see
+#                   §SHIPS DISARMED — the template ships --dry-run)
+#   --preflight     probe the prerequisites and exit (0 ready, 6 not ready)
 #
 # Exit: 0 clean · 2 INCOMPLETE (a surface unqueryable — nothing deleted)
-#       4 PARTIAL (>=1 engine refused a row) · 3 usage · 5 internal
+#       3 usage · 4 PARTIAL (>=1 engine refused a row) · 5 internal
+#       6 PREREQUISITE MISSING (the pass cannot run at all; nothing attempted)
 #
 # Boundedness: the worktree engine is bounded by REAP_WT_BUDGET_SECONDS (1800
 # here, raised from the 300 default per the estate measurement recorded in the
@@ -78,8 +104,10 @@ EXIT_INCOMPLETE=2
 EXIT_USAGE=3
 EXIT_PARTIAL=4
 EXIT_INTERNAL=5
+EXIT_PREREQ=6
 
 MODE=dry-run
+PREFLIGHT_ONLY=0
 REPO="${TORTOISE_REPO:-$HOME/eldato/tortoise}"
 ENGINE=""
 AGED_DAYS=7
@@ -105,6 +133,7 @@ while [ $# -gt 0 ]; do
         --engine)     ENGINE="${2:-}"; shift 2 ;;
         --aged-days)  AGED_DAYS="${2:-}"; shift 2 ;;
         --backup-dir) BACKUP_DIR="${2:-}"; shift 2 ;;
+        --preflight)  PREFLIGHT_ONLY=1; shift ;;
         --help|-h)    usage; exit "$EXIT_OK" ;;
         *) echo "worktree-hygiene: unknown argument $1 (--help)" >&2; exit "$EXIT_USAGE" ;;
     esac
@@ -122,6 +151,28 @@ esac
 git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1 || {
     echo "worktree-hygiene: not a git repository: $REPO" >&2; exit "$EXIT_USAGE"; }
 
+# A --preflight is an INSPECTION: it writes nothing, not even its own state dirs.
+if [ "$PREFLIGHT_ONLY" != 1 ]; then
+    mkdir -p "$STATE_DIR" "$BACKUP_DIR" 2>/dev/null || {
+        echo "worktree-hygiene: cannot create $STATE_DIR or $BACKUP_DIR" >&2; exit "$EXIT_INCOMPLETE"; }
+fi
+
+BLOCKED_MARKER="$STATE_DIR/worktree-hygiene-blocked"
+# record_blocked <reason...> — the pass's verdict as a FILE, cleared only by a
+# clean pass. A scheduler's exit code reaches no human; this marker does. The
+# FIRST reason of a pass truncates: the marker describes the LAST pass that had
+# a reason, so it cannot grow without bound and cannot report two passes at once.
+BLOCKED_SEEN=0
+record_blocked() {
+    if [ "$BLOCKED_SEEN" = 0 ]; then
+        : > "$BLOCKED_MARKER" 2>/dev/null || true
+        BLOCKED_SEEN=1
+    fi
+    { printf '%s ' "$(date '+%Y-%m-%dT%H:%M:%S')"; printf '%s\n' "$*"; } \
+        >> "$BLOCKED_MARKER" 2>/dev/null || true
+}
+clear_blocked() { rm -f "$BLOCKED_MARKER" 2>/dev/null || true; }
+
 if [ -z "$ENGINE" ]; then
     for cand in "$HOME/.pi/agent/scripts/pi-reap-worktrees.sh" \
                 "$REPO/scripts/pi-reap-worktrees.sh"; do
@@ -135,15 +186,83 @@ fi
 # whole file exists to remove.
 [ -f "${ENGINE:-}" ] || {
     echo "worktree-hygiene: no worktree engine found (looked for ~/.pi/agent/scripts/pi-reap-worktrees.sh and $REPO/scripts/pi-reap-worktrees.sh); nothing reaped — farm it with pi-bootstrap/setup.sh" >&2
+    [ "$PREFLIGHT_ONLY" = 1 ] && exit "$EXIT_PREREQ"
+    record_blocked "rc=$EXIT_PREREQ no worktree engine found (farm it: pi-bootstrap/setup.sh)"
     exit "$EXIT_INCOMPLETE"; }
 
 REAPER="$REPO/tools/branch_reaper.py"
 [ -f "$REAPER" ] || {
     echo "worktree-hygiene: $REAPER not found; branch half cannot run — nothing reaped" >&2
+    [ "$PREFLIGHT_ONLY" = 1 ] && exit "$EXIT_PREREQ"
+    record_blocked "rc=$EXIT_PREREQ $REAPER not found"
     exit "$EXIT_INCOMPLETE"; }
 
-mkdir -p "$STATE_DIR" "$BACKUP_DIR" 2>/dev/null || {
-    echo "worktree-hygiene: cannot create $STATE_DIR or $BACKUP_DIR" >&2; exit "$EXIT_INCOMPLETE"; }
+# ── prerequisites (§PREREQUISITES, probed statically and by name) ────────────
+# Prints one line per prerequisite and sets, for the CALLER (never in a
+# subshell — a `$(prereq_probe)` would lose both counters and read as READY
+# however broken the box is):
+#   PREREQ_UNMET  count of unmet prerequisites
+#   PREREQ_WHY    one line per unmet prerequisite, naming the path
+# STATIC on purpose: running the engine to discover that it cannot run would
+# cost a real pass (~10 min on the measured estate) on every tick.
+ENGINE_DIR="$(cd "$(dirname "$ENGINE")" 2>/dev/null && pwd -P || printf '%s' "$(dirname "$ENGINE")")"
+# oneline — the multi-line unmet reasons as one line, without a trailing separator
+# (a message ending in `;` reads like it was truncated).
+oneline() { printf '%s' "$1" | tr '\n' ';' | sed 's/[;[:space:]]*$//'; }
+prereq_probe() {
+    local lib found
+    PREREQ_UNMET=0
+    PREREQ_WHY=""
+    printf 'ok\tengine\t%s\n' "$ENGINE"
+    # The engine sources its sibling libraries as `$(dirname "${BASH_SOURCE[0]}")/lib/<x>`.
+    # Only source/dot lines are read, so a `lib/...` mention in a comment can
+    # never demand a file the engine will not actually read. ⛔ `-E`, not BRE
+    # `\|`: BSD sed (macOS, the only platform this job runs on) does not support
+    # BRE alternation, so `\(source\|\.\)` matched nothing and the probe read as
+    # READY however broken the box was.
+    for lib in $(sed -n -E 's/^[[:space:]]*(source|\.)[[:space:]]+.*(lib\/[A-Za-z0-9._-][A-Za-z0-9._-]*\.sh).*/\2/p' "$ENGINE" 2>/dev/null | sort -u); do
+        found="$ENGINE_DIR/${lib#./}"
+        if [ -f "$found" ]; then
+            printf 'ok\tdependency\t%s -> %s\n' "$lib" "$found"
+        else
+            printf 'MISSING\tdependency\t%s -> %s (the engine sources it from its own directory; without it the engine exits 3 on EVERY pass)\n' "$lib" "$found"
+            PREREQ_UNMET=$((PREREQ_UNMET + 1))
+            PREREQ_WHY="${PREREQ_WHY}missing $lib (expected $found)"$'\n'
+        fi
+    done
+    printf 'ok\tbranch-reaper\t%s\n' "$REAPER"
+    if command -v python3 >/dev/null 2>&1; then
+        printf 'ok\tpython3\t%s\n' "$(command -v python3)"
+    else
+        printf 'MISSING\tpython3\tthe branch half runs `python3 tools/branch_reaper.py`; with no python3 on PATH it cannot run\n'
+        PREREQ_UNMET=$((PREREQ_UNMET + 1))
+        PREREQ_WHY="${PREREQ_WHY}missing python3 (the branch half cannot run)"$'\n'
+    fi
+    return 0
+}
+
+if [ "$PREFLIGHT_ONLY" = 1 ]; then
+    prereq_probe
+    if [ "$PREREQ_UNMET" -gt 0 ]; then
+        printf 'PREREQ BLOCKED: %s' "$(oneline "$PREREQ_WHY")" >&2
+        printf ' — the pass can do NOTHING until this resolves (farm it: pi-bootstrap/setup.sh)\n' >&2
+        exit "$EXIT_PREREQ"
+    fi
+    echo "PREREQ OK: every prerequisite resolves — an armed pass would run"
+    exit "$EXIT_OK"
+fi
+
+# ⛔ THE PROBE GATES THE PASS. A prerequisite that does not resolve is not an
+# "incomplete surface" — it is a job that can do NOTHING at all, and it must say
+# so in its own name (6) instead of hiding behind the generic 2, which reads
+# like a bad PR surface and let the job sit inert for weeks.
+prereq_probe >> "$LOG" 2>/dev/null
+if [ "$PREREQ_UNMET" -gt 0 ]; then
+    echo "worktree-hygiene: PREREQUISITE MISSING — nothing attempted:" >&2
+    printf '%s' "$PREREQ_WHY" >&2
+    record_blocked "rc=$EXIT_PREREQ PREREQUISITE MISSING: $(oneline "$PREREQ_WHY")"
+    exit "$EXIT_PREREQ"
+fi
 
 TODAY="$(date +%Y-%m-%d)"
 BACKUP_TODAY="$BACKUP_DIR/$TODAY"
@@ -176,17 +295,34 @@ engine_mode="--dry-run"
 engine_out="$(bash "$ENGINE" "$engine_mode" --repo "$REPO" --aged-days "$AGED_DAYS" 2>&1)"
 engine_rc=$?
 printf '%s\n' "$engine_out" >> "$LOG"
-removed=$(printf '%s\n' "$engine_out" | grep -c '^remove ')
-log "worktree engine: rc=$engine_rc remove-rows=$removed"
+# ⛔ THE ENGINE'S ROWS ARE TAB-SEPARATED (`remove\treclaimable\t...`, `remove\tprunable\t\t...`).
+# This counted `^remove ` — a SPACE — and therefore reported `remove-rows=0` on
+# every pass that removed a hundred worktrees: the exact false-report shape this
+# file's header exists to remove. Split on the tab and compare the VERB field, so
+# a row whose reason ever contains the word "remove" cannot inflate the count.
+removed=$(printf '%s\n' "$engine_out" | awk -F'\t' '$1 == "remove" { n++ } END { print n + 0 }')
+log "worktree engine: mode=$engine_mode rc=$engine_rc remove-rows=$removed"
 case "$engine_rc" in
     0) ;;
-    3) log "worktree engine FAIL-CLOSED (rc=3) — nothing removed this pass"; rc_total=$EXIT_INCOMPLETE ;;
-    *) log "worktree engine rc=$engine_rc — see $LOG"; rc_total=$EXIT_INCOMPLETE ;;
+    3) log "worktree engine FAIL-CLOSED (rc=3) — nothing removed this pass"
+       record_blocked "rc=3 worktree engine FAIL-CLOSED"
+       rc_total=$EXIT_INCOMPLETE ;;
+    *) log "worktree engine rc=$engine_rc — see $LOG"
+       record_blocked "rc=$engine_rc worktree engine"
+       rc_total=$EXIT_INCOMPLETE ;;
 esac
 
 # ── the dispatch-scout carve-out (see §THE DISPATCH-SCOUT CARVE-OUT) ────────
+# ⛔ ARMED PASSES ONLY. `git worktree add` WRITES to the repo; a dry run that
+# re-created an absent scout checkout would make "dry run" untrue (the sibling
+# disk-reaper's dry run is required to write nothing, and this one raced
+# refresh-candidates.sh provisioning the same path). A dry-run pass therefore
+# reports the absence and leaves provisioning to the owner that owns it.
 SC="$REPO/.worktrees/dispatch-scout"
-if [ ! -d "$SC" ] && git -C "$REPO" show-ref --verify --quiet refs/heads/chore/dispatch-scout; then
+if [ "$MODE" != apply ] && [ ! -d "$SC" ]; then
+    log "dispatch-scout checkout absent — NOT re-established (dry run writes nothing; refresh-candidates.sh provisions it)"
+fi
+if [ "$MODE" = apply ] && [ ! -d "$SC" ] && git -C "$REPO" show-ref --verify --quiet refs/heads/chore/dispatch-scout; then
     if git -C "$REPO" worktree add "$SC" chore/dispatch-scout >/dev/null 2>&1; then
         log "re-established the dispatch-scout checkout (branch was retained)"
     else
@@ -206,13 +342,23 @@ reaper_rc=0
 if git -C "$REPO" worktree add --detach "$run_wt" origin/main >/dev/null 2>&1; then
     bundle_arg=""
     [ "$MODE" = apply ] && bundle_arg="--backup-bundle $BACKUP_TODAY/branch-reaper.bundle"
+    # ⛔ THE REPORT PATH MUST RESOLVE IN BOTH MODES. It used to point under
+    # $BACKUP_TODAY unconditionally, but that directory is only created for an
+    # ARMED pass — so a dry run handed the reaper a path inside a directory that
+    # does not exist. A dry run accounts in the STATE dir; the dated backup dir is
+    # an armed pass's artifact.
+    if [ "$MODE" = apply ]; then
+        report_path="$BACKUP_TODAY/branch-reaper-report.md"
+    else
+        report_path="$STATE_DIR/branch-reaper-report.md"
+    fi
     # shellcheck disable=SC2086  # bundle_arg is a flag pair, empty in dry-run
     ( cd "$run_wt" && python3 "$REAPER" $([ "$MODE" = apply ] && echo --apply) \
         $bundle_arg \
-        --report "$BACKUP_TODAY/branch-reaper-report.md" \
+        --report "$report_path" \
         --json ) > "$STATE_DIR/branch-reaper.json" 2>>"$LOG"
     reaper_rc=$?
-    log "branch reaper: rc=$reaper_rc report=$STATE_DIR/branch-reaper.json"
+    log "branch reaper: mode=$MODE rc=$reaper_rc report=$report_path"
     # Remove the throwaway checkout. NOT --force: if it somehow holds changes,
     # leaving it is correct and the next engine pass will classify it.
     git -C "$REPO" worktree remove "$run_wt" >/dev/null 2>&1 \
@@ -224,15 +370,30 @@ else
 fi
 case "$reaper_rc" in
     0) ;;
-    2) log "branch reaper INCOMPLETE (rc=2) — nothing deleted (truncated/unqueryable PR surface)"; rc_total=$EXIT_INCOMPLETE ;;
-    4) log "branch reaper PARTIAL (rc=4) — at least one deletion refused"; [ "$rc_total" -eq 0 ] && rc_total=$EXIT_PARTIAL ;;
-    6) log "branch reaper rc=6 — aborted AFTER a deletion; the bundle + recovery record are authoritative"; rc_total=$EXIT_INCOMPLETE ;;
-    *) log "branch reaper rc=$reaper_rc"; rc_total=$EXIT_INCOMPLETE ;;
+    2) log "branch reaper INCOMPLETE (rc=2) — nothing deleted (truncated/unqueryable PR surface)"
+       record_blocked "rc=2 branch reaper INCOMPLETE (truncated/unqueryable PR surface)"
+       rc_total=$EXIT_INCOMPLETE ;;
+    4) log "branch reaper PARTIAL (rc=4) — at least one deletion refused"
+       record_blocked "rc=4 branch reaper PARTIAL"
+       [ "$rc_total" -eq 0 ] && rc_total=$EXIT_PARTIAL ;;
+    6) log "branch reaper rc=6 — aborted AFTER a deletion; the bundle + recovery record are authoritative"
+       record_blocked "rc=6 branch reaper aborted AFTER a deletion — the bundle is authoritative"
+       rc_total=$EXIT_INCOMPLETE ;;
+    *) log "branch reaper rc=$reaper_rc"
+       record_blocked "rc=$reaper_rc branch reaper"
+       rc_total=$EXIT_INCOMPLETE ;;
 esac
 
 # ── 3. after-state, so the log answers "did it work" without a second command ─
-wts=$(( $(git -C "$REPO" worktree list 2>/dev/null | wc -l) - 1 ))
-brs=$(git -C "$REPO" for-each-ref refs/heads --format=x 2>/dev/null | wc -l)
+# `wc -l` of a FAILED listing is 0, which the old expression turned into -1: a
+# count no measurement can produce, in the one line printed to answer "is the
+# leak bounded?".
+wts_listed=$(git -C "$REPO" worktree list 2>/dev/null | wc -l | tr -d ' ')
+[ "${wts_listed:-0}" -gt 0 ] || wts_listed=1   # keep the subtraction honest when the listing failed
+wts=$(( wts_listed - 1 ))
+brs=$(git -C "$REPO" for-each-ref refs/heads --format=x 2>/dev/null | wc -l | tr -d ' ')
 log "after: worktrees=$wts branches=$brs (excluding the main checkout)"
 
+[ "$rc_total" -eq 0 ] && clear_blocked
+log "pass end mode=$MODE rc=$rc_total"
 exit "$rc_total"

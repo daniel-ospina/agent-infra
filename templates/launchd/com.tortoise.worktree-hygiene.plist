@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- agent-infra-plist-version: 0.1.0 -->
+<!-- agent-infra-plist-version: 0.2.0 -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -8,27 +8,47 @@
 
          WHY A SECOND JOB WHEN com.tortoise.worktree-reaper EXISTS. It does not,
          on this box: nothing is scheduled (measured 2026-10-18 — `launchctl
-         list` showed no reaper, `crontab -l` carried only the graph reaper), and
-         the shipped template arms itself with `--dry-run`, so installing it
-         alone would have produced a nightly report while 70 worktrees and 349
-         local branches accumulated. More importantly it reaps CHECKOUTS ONLY.
-         The dispatch blocker measured on 2026-10-18 was a BRANCH:
-         `feat/8090-tm`, 0 commits ahead of main, 13 behind, clean tree — the
-         intake pre-flight matched its name and refused to dispatch #8090, and
-         by recorded decision (#6108) a zero-commit branch still blocks. A
-         checkout reaper cannot clear that, because `git worktree remove` never
-         deletes a branch. This job runs both reviewed engines, in order.
+         list` showed no reaper, `crontab -l` carried only the graph reaper). A
+         checkout reaper cannot clear a BRANCH blocker in any case: `git worktree
+         remove` never deletes a branch. This job runs both reviewed engines, in
+         order.
 
-         WHY `--apply`. The owner ruling behind #1678 is that a deletion tool
-         ships dry-run and arming is a separate, dated, reversible step. That
-         step was taken for this box on 2026-10-18, when the owner instructed a
-         bounded recurring sweep whose whole point is boundedness. The arming is
-         VISIBLE IN THIS FILE (the --apply argument below), never in an env
-         default, and reversing it is one command:
-             launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.tortoise.worktree-hygiene.plist
-             rm ~/Library/LaunchAgents/com.tortoise.worktree-hygiene.plist
-         Deleting the flag instead does NOT unarm it silently: the sweep reads
-         the mode from its own argument, so a flag-less plist is a dry-run job.
+         ⛔ SHIPS DISARMED — {{WORKTREE_HYGIENE_MODE}} RENDERS the `dry-run` flag.
+         This is a DELETION tool on a 6-hourly timer (worktree checkouts, then
+         local branch refs), and the recorded rule (#1678, owner ruling
+         2026-10-11: "the reaper may run unattended; arming it may not") is that
+         such a tool ships dry-run and arming is a SEPARATE, DATED, REVERSIBLE
+         step. Three facts make that rule load-bearing here and not ceremonial:
+           * `install-launchd.sh` with no arguments installs EVERY template in
+             this directory — that is the documented, idempotent, routine
+             invocation;
+           * `pi-bootstrap/setup.sh` runs exactly that invocation automatically
+             on every Darwin box, so a literal `apply` flag in this file would arm
+             a fleet from one merge, with no human step and no dry-run
+             observation pass;
+           * the owner's 2026-10-18 instruction authorised a bounded recurring
+             sweep on ONE box. It authorises that box, not the mechanism.
+         ARMING, therefore, is per-box and it is a command. ⛔ The exact spelling
+         is NOT written out in this comment: XML forbids a doubled hyphen inside
+         a comment, so `install-launchd.sh help` (or this file in git, where the
+         same text is a shell comment) is the copy-pasteable source. The verb is
+         `arm-worktree-hygiene` (optionally followed by its reason argument) and
+         it (a) runs the sweep's own preflight mode and REFUSES a box whose
+         engine prerequisites do not resolve — an armed job that cannot run exits
+         6 every 6h and deletes nothing, silently — and (b) writes a dated record
+         (who/when/host/repo/reason) that this placeholder renders from. The
+         reversing verb is `disarm-worktree-hygiene`.
+         ⛔ NOT AN ENVIRONMENT DEFAULT. The mode is materialised into the
+         INSTALLED unit's ProgramArguments, so `install-launchd.sh status` and
+         `cat ~/Library/LaunchAgents/com.tortoise.worktree-hygiene.plist` both
+         answer "is this box deleting anything?" — an env var would arm the job
+         from a stray export with nothing on disk to show for it, and a job reads
+         no ambient env under launchd anyway.
+         ⛔ Do NOT "tidy" this back to a literal apply/dry-run flag: a
+         literal cannot be armed (the separate step becomes an untracked
+         hand-edit of the installed plist, silently reverted by the next sync)
+         and a literal apply flag re-creates the fleet-wide arming this
+         placeholder exists to prevent.
 
          WHY /bin/bash DIRECTLY, NOT THE CHECKOUT'S PYTHON LAUNCHER. The sibling
          reaper templates route through pi-reap-worktrees-launchd.py because
@@ -45,7 +65,12 @@
          REAP_WT_BUDGET_SECONDS (1800s; a 300s budget was measured to classify
          22 of 454 rows and defer the rest, i.e. the bound defeated the job's
          purpose) and the reaper bounds every subprocess. Deferred rows are
-         PRESERVED, never partially removed.
+         PRESERVED, never partially removed. The sweep also probes its own
+         PREREQUISITES at the top of every pass (the engine is a FARMED script
+         that sources sibling libraries from its own directory): an unresolvable
+         prerequisite exits 6 immediately, names the missing path, and writes
+         $HOME/.pi/agent/state/worktree-hygiene-blocked, so an inert job is a
+         FILE a probe can read rather than an exit code nobody reads.
 
          WHAT IT WILL NOT REMOVE. Dirty worktrees (tracked or untracked), a
          branch held by any worktree, trunk, an OPEN PR's head, a CLOSED-unmerged
@@ -57,7 +82,7 @@
     <array>
         <string>/bin/bash</string>
         <string>{{HOME}}/.pi/agent/scripts/worktree-hygiene-sweep.sh</string>
-        <string>--apply</string>
+        <string>{{WORKTREE_HYGIENE_MODE}}</string>
         <string>--repo</string>
         <string>{{TORTOISE_REPO}}</string>
     </array>
