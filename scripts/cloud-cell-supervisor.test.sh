@@ -98,9 +98,10 @@ make_ai_repo() {
   git -C "$AI" config user.name test
   git -C "$AI" config commit.gpgsign false
   mkdir -p "$AI/scripts/orchestrator-harness"
-  for w in orch-loop.sh claims.sh repo-authority.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh; do
+  for w in orch-loop.sh claims.sh repo-authority.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do
     : > "$AI/scripts/orchestrator-harness/$w"
   done
+  write_doctor_stub "$AI/scripts/orchestrator-harness"
   # #1717: `start` PROVISIONS the record step from the harness checkout — `recorder_src()` resolves
   # `$HARNESS/../record-review.sh` plus its declared sibling `lib/diff-normalize.py` — so a fixture
   # checkout without the pair makes `start` die "the harness checkout must be a full agent-infra
@@ -117,6 +118,16 @@ make_ai_repo() {
   git -C "$AI" push -q origin main
   git -C "$AI" fetch -q origin
 }
+# #1989: `cmd_check` now requires cloud-cell-doctor.sh, and `start` launches it as a LOOP. An empty
+# fixture file would make that session exit immediately (a real tmux server notices; the doubles
+# below do not), so every fixture gets a stub that stays alive for the `loop` verb. It exits 0 for
+# every other verb, so it can never decide an assertion in place of the code under test.
+write_doctor_stub() { # <dir>
+  mkdir -p "$1" || return 1
+  printf '#!/bin/bash\n[ "${1:-}" = loop ] && exec sleep 20\nexit 0\n' > "$1/cloud-cell-doctor.sh" || return 1
+  chmod +x "$1/cloud-cell-doctor.sh"
+}
+
 make_ai_repo
 
 SUP_RC=0; SUP_OUT=''
@@ -309,7 +320,8 @@ ai_worktree "$W/harness"
 # Mirror the shipped required-worker set (`cloud-cell-supervisor.sh` cmd_check): claims.sh is a
 # required worker script now (orch-loop.sh/merge-one.sh SOURCE it from $O), so a fixture without it
 # dies in cmd_check with "worker scripts missing from …: claims.sh".
-for f in claims.sh repo-authority.sh dispatch-merge.sh lane.sh chain-merge.sh fix-one.sh refresh-candidates.sh adopt-fix.sh; do : > "$W/harness/$f"; done
+for f in claims.sh repo-authority.sh dispatch-merge.sh lane.sh chain-merge.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do : > "$W/harness/$f"; done
+write_doctor_stub "$W/harness"
 printf '#!/bin/bash\nexit 0\n' > "$W/bin/gh"; chmod +x "$W/bin/gh"
 # #1717: the shipped `start` PROVISIONS the record step from the checkout, and `cmd_check` refuses a
 # cell without it — or without its declared sibling `lib/diff-normalize.py` (the recorder resolves the
@@ -565,9 +577,10 @@ ai_worktree "$F/harness"
 # required worker script now, so a fixture without it dies in cmd_check with "worker scripts
 # missing from …: claims.sh" before the #1736 provisioning contract below can be exercised.
 # (P1, 2026-10-14 review round — the §7 fixture was updated, this one was missed.)
-for f in orch-loop.sh claims.sh repo-authority.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh adopt-fix.sh; do
+for f in orch-loop.sh claims.sh repo-authority.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh adopt-fix.sh cloud-cell-doctor.sh; do
   : > "$F/harness/$f"; : > "$F/o/$f"
 done
+write_doctor_stub "$F/harness"; write_doctor_stub "$F/o"
 printf '#!/bin/bash\nexit 0\n' > "$F/bin/gh"; chmod +x "$F/bin/gh"
 # #1717: cmd_check now also refuses a cell without the record step (and its declared sibling), so a
 # dispatch-provisioning fixture must be a cell that PASSES that earlier probe — otherwise every
@@ -675,9 +688,10 @@ say_case "harness provenance: reports, records, refuses and mends (agent-infra#1
 
 P="$T/prov"; mkdir -p "$P/home" "$P/o" "$P/bin" "$P/untracked" "$P/lowbin"
 ai_init_repo "$P/repo"
-for f in orch-loop.sh claims.sh repo-authority.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh; do
+for f in orch-loop.sh claims.sh repo-authority.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do
   : > "$P/o/$f"; : > "$P/untracked/$f"
 done
+write_doctor_stub "$P/o"; write_doctor_stub "$P/untracked"
 printf '#!/bin/bash\nexit 0\n' > "$P/bin/gh"; chmod +x "$P/bin/gh"
 # #1717: `check` refuses a cell whose $CELL_HOME lacks the record step (and its declared sibling),
 # so seed the pair exactly where the shipped `start` lays it down. Without this every §9 arm that
@@ -1420,7 +1434,8 @@ say_case "the queue target IS the checkout's remote (agent-infra#1901)"
 Q="$T/queue"; mkdir -p "$Q/home" "$Q/bin"
 QH="$Q/harness"
 ai_worktree "$Q/harness"
-for f in orch-loop.sh claims.sh repo-authority.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh adopt-fix.sh; do : > "$Q/harness/$f"; done
+for f in orch-loop.sh claims.sh repo-authority.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh adopt-fix.sh cloud-cell-doctor.sh; do : > "$Q/harness/$f"; done
+write_doctor_stub "$Q/harness"
 # The provisioning probe must answer rc=0 here: this section is about the PAIR, not about dispatch.
 # It echoes the OR it was handed, so a probe run against the wrong queue could not pass silently.
 cat > "$Q/harness/refresh-candidates.sh" <<'SH'

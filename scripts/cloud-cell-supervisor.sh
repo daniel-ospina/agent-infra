@@ -12,6 +12,7 @@
 #
 # Runs ON THE CELL (Linux). Usage:
 #   bash cloud-cell-supervisor.sh check|start|stop|status|logs|apply|prune
+#                                  |doctor|merge|reap|hygiene
 #
 #   apply   fetch agent-infra main and PIN this cell's harness to it (agent-infra#1745). This is the
 #           whole of "apply the proper harness"; `start` runs it before every launch, so it is
@@ -19,6 +20,26 @@
 #   prune   reclaim the regenerable disk the lanes leave behind (.venv per worktree, caches) and
 #           report the review scratch that accumulates under /tmp. --scratch[=DAYS] also deletes
 #           scratch checkouts older than DAYS. A full disk is what breaks a cell FIRST.
+#
+# ── THE ROLES, AND WHY `status` HAD TO STOP LYING (agent-infra#1989) ─────────────────────────────
+# The supervisor used to launch exactly one thing (`orch-loop.sh`) and answer "is its tmux session
+# up?". A cell whose loop had died and a cell that was idle printed the SAME `controller: RUNNING /
+# lanes: 0`, and nothing recorded whether a repair pass, a merge attempt or a reap had ever run. So
+# `start` now also launches the cell doctor (`cloud-cell-doctor.sh loop`, tmux session
+# `$DOCTOR_SESSION`), and `status` reads the per-role last-pass records it writes. A started cell
+# whose roles never ran is NOT healthy, and `status` exits non-zero for it.
+#
+#   doctor  one pass: reap + keep the ONE dispatcher running (`start` when its session is gone; a
+#           stale-but-present controller is REPORTED, never killed — that is a P0 action)
+#   reap    one wedged-session pass, gated (namespace, log, two observations, human ancestry)
+#   merge   land PRs with a clean attestation at head, through `admin-merge.sh`, and record every
+#           refusal with its reason (never an override; never a blind retry at the same head)
+#   hygiene `uv cache prune`, worktree-root caches (only when no worker is live), stale worktrees
+#           via the shipped `pi-reap-worktrees.sh` (armed only under disk pressure by default)
+#
+# The verbs run ONE pass and are idempotent; `start` runs the loop that schedules them. Both write
+# the same `$O/state/roles/<role>.state` records, so "configured" and "ran a pass at HH:MM:SSZ" are
+# different lines in `status` rather than the same green tick.
 #
 # ── THE QUEUE TARGET IS THE CHECKOUT (agent-infra#1901) ──────────────────────────────────────────
 # `REPO` (a path) and `OR` (an owner/repo) used to be two independent facts that nothing compared, so
@@ -120,6 +141,15 @@ recorder_src()  { printf '%s\n' "$HARNESS/../record-review.sh"; }
 recorder_lib_path() { printf '%s\n' "$(dirname "$(recorder_path)")/lib/diff-normalize.py"; }
 recorder_lib_src()  { printf '%s\n' "$HARNESS/../lib/diff-normalize.py"; }
 SESSION="${SESSION:-orch}"
+# The doctor loop's tmux session (agent-infra#1989). A NAME of its own, never a prefix of `$SESSION`:
+# every tmux target below uses `=name` exact matching for the reason orch-loop's reaper documents
+# (`-t merge-82` resolved to `merge-821` and killed an in-flight worker), and a distinct name keeps
+# `stop` from ever matching the wrong role.
+DOCTOR_SESSION="${DOCTOR_SESSION:-cell-doctor}"
+# This file's own path, resolved ONCE and handed to the doctor loop, so a restart from inside the
+# loop runs the SAME supervisor the operator started (not a `$PATH` guess).
+SUP_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && printf '%s/%s' "$PWD" "$(basename "${BASH_SOURCE[0]}")")"
+[ -n "$SUP_SELF" ] || SUP_SELF="${BASH_SOURCE[0]}"
 # OR (the queue's owner/repo) is interpolated into the session command string, so it must always be
 # DEFINED — the guard below reads it with `${!v}` under `set -u`, which errors on an unset name.
 # ⛔ It is deliberately NOT defaulted to a repo any more (agent-infra#1901). A default here is a
@@ -260,6 +290,8 @@ source_env_file
 # gh auth" and the cell started, and then every gh call in the session failed.
 export HOME="$CELL_HOME"
 LOCK="$O/.orch.lock"
+# Recomputed AFTER $ENV_FILE is sourced (it may repoint $O), exactly like $LOCK above.
+ROLES_DIR="$O/state/roles"
 
 # ── the QUEUE's repo and the CHECKOUT are ONE fact (agent-infra#1901) ────────────────────────────
 # MEASURED 2026-10-15 on `pi-cell-2`: harness pin `a4a1249794e7` standing in an AGENT-INFRA checkout
@@ -939,7 +971,10 @@ cmd_check() {
   # contract — a false "CELL CAN RUN A CONTROLLER" (repo-authority.sh, review round 4).
   say "ok: HOME, harness, tmux, gh auth, repo, state dir"
   local missing="" w
-  for w in orch-loop.sh claims.sh repo-authority.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh; do
+  # cloud-cell-doctor.sh is launched from $O by `start` (the doctor loop), so its absence is the same
+  # false "CELL CAN RUN A CONTROLLER" the rest of this list exists to prevent: the controller would
+  # run, `start` would report success, and the cell would never reap or land anything.
+  for w in orch-loop.sh claims.sh repo-authority.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do
     [ -f "$O/$w" ] || missing="$missing $w"
   done
   [ -z "$missing" ] || die "worker scripts missing from $O:$missing — run 'start' (it seeds $O) or: cp '$HARNESS'/*.sh '$O'/"
@@ -1086,7 +1121,7 @@ cmd_start() {
   # ⛔ Ahead of both the queue-target gate and the `has-session` return: this is the INJECTION guard,
   # and its refusal is the one that must win for a value that reaches a shell string.
   local v
-  for v in O REPO CELL_HOME ENV_FILE HARNESS OR HARNESS_REPO HARNESS_PIN_DIR HARNESS_PIN_FILE; do
+  for v in O REPO CELL_HOME ENV_FILE HARNESS OR HARNESS_REPO HARNESS_PIN_DIR HARNESS_PIN_FILE DOCTOR_SESSION SUP_SELF; do
     [ -n "${!v}" ] || continue
     safe_argv "${!v}" || die "\$$v must not contain a quote or shell metacharacter: ${!v}"
   done
@@ -1102,6 +1137,10 @@ cmd_start() {
   # Nothing is started or written on this path, so a bad value below cannot hurt it.
   if tmux has-session -t "$SESSION" 2>/dev/null; then
     say "already running (tmux session '$SESSION') — use: status | logs | stop"
+    # agent-infra#1989: a live controller with no doctor is exactly the measured state (one loop on
+    # the box). `start` is the idempotent launch verb, so it heals that half too rather than
+    # answering "already running" about a cell that cannot reap or land.
+    start_doctor_loop
     return 0
   fi
   # ── the harness this cell will run, fixed BEFORE anything is seeded (agent-infra#1745) ────────
@@ -1242,15 +1281,36 @@ cmd_start() {
   else
     die "controller exited immediately — read $O/logs/controller.log"
   fi
+  # The SECOND role. `start` is not successful unless the repair/merge loop is also up: a cell that
+  # dispatches but cannot land is the measured #1989 state, and a start that reported success over
+  # it would be the same false green this file refuses everywhere else.
+  start_doctor_loop
 }
 
 cmd_stop() {
-  tmux has-session -t "$SESSION" 2>/dev/null || { say "not running"; return 0; }
+  local rc=0
+  # The doctor FIRST, then the desired-state marker, then the controller. Order matters: if the
+  # marker outlived the loop, a surviving pass would restart the controller the operator just
+  # stopped; if the loop outlived the marker, its next pass would report "cell not started" and keep
+  # reaping — harmless, but the session would linger. Either way `stop` is a REQUEST the operator
+  # makes once, and the marker is what makes it stick.
+  if tmux has-session -t "$DOCTOR_SESSION" 2>/dev/null; then
+    tmux kill-session -t "=$DOCTOR_SESSION" || { say "warn: could not stop the doctor loop '$DOCTOR_SESSION'"; rc=1; }
+    say "doctor loop stopped (tmux '$DOCTOR_SESSION')"
+  fi
+  rm -f "$ROLES_DIR/.desired" "$ROLES_DIR/loop.pid"
+  if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+    say "controller: not running"
+    [ "$rc" -eq 0 ] || return 1
+    return 0
+  fi
   # A failed kill must NOT fall through to the lock release and a 0 exit: `stop` would report
   # success while the controller is still running (the same "failed precondition as success" shape).
   tmux kill-session -t "$SESSION" || die "tmux kill-session failed for '$SESSION' — the controller may still be running"
   say "controller stopped (tmux '$SESSION')"
   rm -f "$LOCK" && say "released lock $LOCK"
+  [ "$rc" -eq 0 ] || return 1
+  return 0
 }
 
 cmd_status() {
@@ -1278,9 +1338,77 @@ cmd_status() {
   # the loop's own view of itself
   tail -3 "$O/logs/orch-loop.log" 2>/dev/null | sed 's/^/  /' || say "  (no orch-loop.log yet)"
   say "lanes: $(tmux ls 2>/dev/null | grep -c '^lane-')"
+  # agent-infra#1989: CONFIGURED vs RAN. Each role's own last-pass record is printed, and a started
+  # cell whose role never ran / went stale fails this verb — the issue's validation requirement, and
+  # the fix for the measured "a dead loop looks identical to an idle cell".
+  local d rl rrc=0
+  if d="$(doctor_path)"; then
+    rl="$(CELL_HOME="$CELL_HOME" O="$O" REPO="$REPO" OR="$OR" SESSION="$SESSION" bash "$d" status 2>&1)"
+    rrc=$?
+    printf '%s\n' "$rl" | sed 's/^/  /'
+  else
+    say "  roles: UNKNOWN — cloud-cell-doctor.sh not found (run: $0 apply)"
+    [ -f "$ROLES_DIR/.desired" ] && rrc=1
+  fi
+  return "$rrc"
 }
 
 cmd_logs() { tail -30 "$O/logs/orch-loop.log" 2>/dev/null || say "no log yet at $O/logs/orch-loop.log"; }
+
+# ── the cell doctor's roles (agent-infra#1989) ──────────────────────────────────────────────────
+# `cloud-cell-doctor.sh` owns the passes; this file owns the launch and the report. The seeded copy
+# in $O is preferred because $O is what the harness provenance record describes (cmd_check pins the
+# payload hash), and falling back to the copy beside this supervisor keeps `doctor`/`merge`/`reap`
+# usable on a cell that has not been started yet.
+doctor_path() {
+  local c
+  for c in "$O/cloud-cell-doctor.sh" "$(dirname "$SUP_SELF")/orchestrator-harness/cloud-cell-doctor.sh" \
+           "$(dirname "$SUP_SELF")/cloud-cell-doctor.sh"; do
+    [ -n "$c" ] && [ -f "$c" ] && { printf '%s\n' "$c"; return 0; }
+  done
+  return 1
+}
+
+# One role pass, in this cell's own environment. OR is the RESOLVED queue target (assert_queue_target
+# runs first for every verb), so the doctor never re-derives a second one.
+run_role() {
+  local role="$1" d; shift
+  d="$(doctor_path)" || die "cloud-cell-doctor.sh not found (looked in $O, then beside $SUP_SELF in orchestrator-harness/, then beside $SUP_SELF) — run '$0 start' (it seeds $O) or '$0 apply'"
+  CELL_HOME="$CELL_HOME" O="$O" REPO="$REPO" OR="$OR" SESSION="$SESSION" \
+    MIN_FREE_MB="$MIN_FREE_MB" DOCTOR_SUPERVISOR="$SUP_SELF" \
+    bash "$d" "$role" "$@"
+}
+
+# The loop `start` runs. Idempotent by tmux session name: a second `start` (or a restart driven from
+# inside the loop) finds it and returns, so the cell never grows two doctors. The desired-state
+# marker is what tells the doctor that the cell is SUPPOSED to be up — without it a `stop` would be
+# undone by the next pass, and an operator's stop would never stick.
+start_doctor_loop() {
+  local d
+  mkdir -p "$ROLES_DIR" "$O/logs" || die "cannot create $ROLES_DIR"
+  : > "$ROLES_DIR/.desired" || die "cannot record the desired running state at $ROLES_DIR/.desired"
+  d="$(doctor_path)" || die "cloud-cell-doctor.sh not found (looked in $O, then beside $SUP_SELF in orchestrator-harness/, then beside $SUP_SELF) — the cell cannot run its repair/merge roles"
+  if tmux has-session -t "$DOCTOR_SESSION" 2>/dev/null; then
+    say "doctor loop already running (tmux '$DOCTOR_SESSION')"
+    return 0
+  fi
+  # ⛔ The command string interpolates only values cmd_start has already passed through safe_argv.
+  # The loop re-sources $ENV_FILE for the same reason the controller does: a tmux session is served
+  # from the SERVER's environment on a pre-existing server, so this shell's exports would be dropped.
+  tmux new-session -d -s "$DOCTOR_SESSION" -c "$HARNESS" \
+    "set -a; [ ! -f '$ENV_FILE' ] || . '$ENV_FILE'; set +a; HOME='$CELL_HOME' CELL_HOME='$CELL_HOME' O='$O' REPO='$REPO' OR='$OR' SESSION='$SESSION' MIN_FREE_MB='$MIN_FREE_MB' DOCTOR_SUPERVISOR='$SUP_SELF' bash '$d' loop 2>&1 | tee -a '$O/logs/cell-doctor.log'"
+  sleep 2
+  if tmux has-session -t "$DOCTOR_SESSION" 2>/dev/null; then
+    say "doctor loop started (tmux '$DOCTOR_SESSION')"
+  else
+    die "the doctor loop exited immediately — read $O/logs/cell-doctor.log"
+  fi
+}
+
+cmd_doctor()  { assert_queue_target; run_role doctor "$@"; }
+cmd_merge()   { assert_queue_target; run_role merge "$@"; }
+cmd_reap()    { run_role reap "$@"; }
+cmd_hygiene() { run_role hygiene "$@"; }
 
 # ── apply: put the PROPER harness on this cell (agent-infra#1745) ─────────────────────────────────
 # The owner's complaint was that "apply our harness to the cell" should be one simple job and had
@@ -1461,12 +1589,16 @@ cmd_prune() {
 }
 
 case "${1:-status}" in
-  check)  cmd_check ;;
-  start)  cmd_start ;;
-  apply)  shift; cmd_apply "$@" ;;
-  prune)  shift; cmd_prune "$@" ;;
-  stop)   cmd_stop ;;
-  status) cmd_status ;;
-  logs)   cmd_logs ;;
-  *)      say "usage: $0 check|start|stop|status|logs|apply|prune"; exit 2 ;;
+  check)   cmd_check ;;
+  start)   cmd_start ;;
+  apply)   shift; cmd_apply "$@" ;;
+  prune)   shift; cmd_prune "$@" ;;
+  stop)    cmd_stop ;;
+  status)  cmd_status ;;
+  logs)    cmd_logs ;;
+  doctor)  shift; cmd_doctor "$@" ;;
+  merge)   shift; cmd_merge "$@" ;;
+  reap)    shift; cmd_reap "$@" ;;
+  hygiene) shift; cmd_hygiene "$@" ;;
+  *)       say "usage: $0 check|start|stop|status|logs|apply|prune|doctor|merge|reap|hygiene"; exit 2 ;;
 esac
