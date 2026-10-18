@@ -292,6 +292,7 @@ UV_BEFORE="$(kb "$H/.cache/uv")"
 mkdir -p "$H/.pi/agent/state/pi-cache-reap.lock"
 printf '%s\n' "$$" >"$H/.pi/agent/state/pi-cache-reap.lock/owner"
 printf '%s\n' "$(date +%s)" >"$H/.pi/agent/state/pi-cache-reap.lock/started"
+printf '%s\n' "pi-cache-reap" >"$H/.pi/agent/state/pi-cache-reap.lock/kind"
 OUT="$(run_reap "$H" --apply 2>&1)"; RC=$?
 assert_eq "$RC" "4" "a pass that finds a LIVE lock exits 4 — NOT 0: a caller that clears its alert on 0 must not clear it on a pass that never ran"
 assert_eq "$(kb "$H/.cache/uv")" "$UV_BEFORE" "the locked-out pass mutated nothing — two passes cannot credit each other's reclaim"
@@ -303,6 +304,7 @@ H="$T/h3d"
 new_cache "$H/.cache/uv" 3000 2000
 mkdir -p "$H/.pi/agent/state/pi-cache-reap.lock"
 printf '%s\n' "999999" >"$H/.pi/agent/state/pi-cache-reap.lock/owner"   # a pid that cannot be alive
+printf '%s\n' "pi-cache-reap" >"$H/.pi/agent/state/pi-cache-reap.lock/kind"
 printf '%s\n' "$(( $(date +%s) - 7200 ))" >"$H/.pi/agent/state/pi-cache-reap.lock/started"
 OUT="$(run_reap "$H" --apply 2>&1)"; RC=$?
 assert_eq "$RC" "0" "a stale lock does not wedge the reaper forever (owners reboot, passes die)"
@@ -627,12 +629,14 @@ new_cache "$H/.cache/uv" 3000 2000
 LOCK_DIR="$H/.pi/agent/state/pi-cache-reap.lock"
 mkdir -p "$LOCK_DIR"
 # The owner pid must be one this user can signal: the test shell's own (it is alive throughout).
+printf '%s\n' "pi-cache-reap" >"$LOCK_DIR/kind"
 printf '%s\n' "$$" >"$LOCK_DIR/owner"; printf '%s\n' "$(( $(date +%s) - 99999 ))" >"$LOCK_DIR/started"
 printf 'Thu Jan  1 00:00:00 1970\n' >"$LOCK_DIR/lstart"   # not this process's start time
 OUT="$(PS_STUB="$T/bin/ps-lstart" run_reap "$H" --apply 2>&1)"; RC=$?
 assert_ne "$RC" "4" "a recycled owner pid is treated as stale, not as a running pass (exit 4 pins the reaper for ever)"
 assert_contains "$(cat "$H/reap.log" 2>/dev/null)" "RECYCLED" "the pass says why it broke a lock whose owner is alive"
 mkdir -p "$LOCK_DIR"   # the pass above released its own lock
+printf '%s\n' "pi-cache-reap" >"$LOCK_DIR/kind"
 printf '%s\n' "$$" >"$LOCK_DIR/owner"; printf '%s\n' "$(( $(date +%s) - 5 ))" >"$LOCK_DIR/started"
 printf '%s\n' "Sun Jan  1 00:00:00 2023" >"$LOCK_DIR/lstart"
 OUT="$(PS_STUB="$T/bin/ps-lstart" run_reap "$H" --apply 2>&1)"; RC=$?
@@ -645,6 +649,7 @@ new_cache "$H/.cache/uv" 3000 2000
 LOCK_DIR="$H/.pi/agent/state/pi-cache-reap.lock"
 mkdir -p "$LOCK_DIR" "$LOCK_DIR.break"
 printf '999999\n' >"$LOCK_DIR/owner"; printf '1\n' >"$LOCK_DIR/started"
+printf 'pi-cache-reap\n' >"$LOCK_DIR/kind"
 touch -t 200001010000 "$LOCK_DIR.break"
 OUT="$(PS_STUB="$T/bin/ps-lstart" run_reap "$H" --apply 2>&1)"; RC=$?
 assert_ne "$RC" "4" "a breaker that died does not pin the lock for ever"
@@ -694,6 +699,16 @@ assert_eq "$RC" "3" "a pre-existing directory at \$CACHE_REAP_LOCK that is not a
 [ -f "$H/precious/state/notes.md" ] && ok "the directory SURVIVED (breaking a 'stale lock' is rm -rf, so it must be provably ours)" \
                                      || bad "an arbitrary directory was removed by the stale-lock path"
 assert_contains "$OUT" "not a lock this reaper made" "the refusal says why it will not remove it"
+# …and a directory carrying an impostor credential (a file NAMED owner, contents unchecked before)
+mkdir -p "$H/impostor"
+printf 'not-a-pid\n' >"$H/impostor/owner"
+touch -t 200001010000 "$H/impostor"
+OUT="$(env HOME="$H" CACHE_REAP_MAX_MB="$BOUND_MB" CACHE_REAP_LOCK="$H/impostor" \
+        CACHE_REAP_LOG="$H/reap.log" CACHE_REAP_PS="$T/bin/ps-idle" CACHE_REAP_DF="$T/bin/df-gain" \
+        CACHE_REAP_UV="$T/bin/uv-noprune" CACHE_REAP_NPM="$T/bin/uv-noprune" CACHE_REAP_PIP="$T/bin/uv-noprune" \
+        bash "$REAPER" --dry-run 2>&1)"; RC=$?
+assert_eq "$RC" "3" "a directory holding a file NAMED owner (contents not a pid) is refused too"
+[ -d "$H/impostor" ] && ok "the impostor directory survived" || bad "a file named 'owner' was enough to authorise an rm -rf"
 
 echo
 echo "── 9p. a RELOCATED cache keeps its bound even if the target dir is not cache-named ──"
@@ -780,12 +795,18 @@ echo
 echo "── 9v. a FALLING df is another writer, not a failed reclaim ──"
 H="$T/h9v"
 new_cache "$H/.cache/uv" 2000 1200
+# rise-then-fall: the FIRST post-eviction sample rises (this pass reclaimed), then a concurrent
+# writer eats the gain — exactly the busy-box shape. A monotonically falling df is the different
+# case (no observed gain => the reclaim is unverified), covered by 9v2.
 cat >"$T/bin/df-shrink" <<SH
 #!/bin/sh
 n=\$(cat "$T/df.calls" 2>/dev/null || echo 0)
 echo \$((n + 1)) >"$T/df.calls"
-echo "Filesystem 1024-blocks Used Available Capacity Mounted"
-echo "/dev/fake 100000 4000 \$(( 48000 - n * 1024 )) 4% /"
+case "\$n" in
+  0) echo 48000 ;;
+  1) echo 60000 ;;
+  *) echo 10000 ;;
+esac | { read v; echo "Filesystem 1024-blocks Used Available Capacity Mounted"; echo "/dev/fake 100000 4000 \$v 4% /"; }
 SH
 chmod +x "$T/bin/df-shrink"
 rm -f "$T/df.calls"
@@ -794,6 +815,27 @@ assert_eq "$RC" "0" "a cache brought UNDER its bound exits 0 even when free spac
 assert_le "$(kb "$H/.cache/uv")" "$BOUND_KB" "the bound was still enforced"
 assert_contains "$OUT" "UNATTRIBUTABLE" "the verdict says the disk-gain claim cannot be attributed, instead of blaming hardlinks"
 assert_not_contains "$OUT" "hardlinked into a .venv" "it does NOT blame hardlinked venvs for a delta it never saw"
+assert_contains "$OUT" "WAS followed by a gain" "the verdict gives the evidence it DOES have instead of the raw df delta"
+
+echo
+echo "── 9v2. a delta that ONLY falls, with no observed gain, is NOT a verified reclaim ──"
+# The counter-example that makes 9v safe to pass: unlinked bytes still pinned by an open descriptor
+# free nothing. Here no eviction is followed by a gain, so the pass must NOT exit 0 on a falling
+# delta — a pass that frees nothing must never clear the alarm the cell reads.
+H="$T/h9v2"
+new_cache "$H/.cache/uv" 2000 1200
+cat >"$T/bin/df-always-falls" <<SH
+#!/bin/sh
+n=\$(cat "$T/df.calls" 2>/dev/null || echo 0)
+echo \$((n + 1)) >"$T/df.calls"
+echo "Filesystem 1024-blocks Used Available Capacity Mounted"
+echo "/dev/fake 100000 4000 \$(( 48000 - n * 1024 )) 4% /"
+SH
+chmod +x "$T/bin/df-always-falls"
+rm -f "$T/df.calls"
+OUT="$(DF_STUB="$T/bin/df-always-falls" run_reap "$H" --apply 2>&1)"; RC=$?
+assert_eq "$RC" "3" "a falling delta with NO observed gain fails closed (the reclaim is unverified)"
+assert_contains "$OUT" "NOT ONE eviction of this pass was followed by a gain" "the refusal says what evidence was missing"
 
 echo
 echo "── 10. wiring: a bound no box runs is the defect ──"

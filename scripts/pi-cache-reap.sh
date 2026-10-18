@@ -578,7 +578,7 @@ guard_target() {
 reap_target() {
     local class="$1" dir="$2" before_kb before_free_kb now_kb new_kb after_kb after_free_kb
     local pruned=none evicted=0 kb e cur_free holders dir_holders held_entries="" keep_entries=""
-    local no_gain_stop=0 no_gain=0 free_fell=0 last_free="" claimed_kb gained_kb min_gain_kb stop_note=""
+    local no_gain_stop=0 no_gain=0 free_fell=0 any_gain=0 last_free="" claimed_kb gained_kb credited_kb credited_note min_gain_kb stop_note=""
     local dev_rc share_rc fresh_holders free_str parent mnt_rc resolved declared_dir
 
     case "$dir" in
@@ -754,7 +754,7 @@ reap_target() {
                 fi
                 if [ -n "$last_free" ]; then
                     if [ "$cur_free" -gt "$last_free" ]; then
-                        no_gain=0
+                        no_gain=0; any_gain=1
                     elif [ "$cur_free" -lt "$last_free" ]; then
                         # ⛔ A FALLING df is ANOTHER WRITER, not a failed reclaim: on the busy
                         # low-disk box this exists for, other lanes are writing while the pass runs.
@@ -778,10 +778,6 @@ reap_target() {
         || { fail_closed "$class: cannot measure $dir after the pass — the shrink cannot be verified"; return 0; }
     after_free_kb="$(free_kb "$dir")"
 
-    if [ "$after_kb" -ge "$before_kb" ]; then
-        fail_closed "$class: acted on $dir ($(mb_str "$before_kb"), prune=$pruned, evicted=$evicted) but the size did NOT decrease — the shrink is NOT verified"
-        return 0
-    fi
     case "${before_free_kb:-}:${after_free_kb:-}" in
         :*|*:)
             fail_closed "$class: $dir shrank $(mb_str "$before_kb") -> $(mb_str "$after_kb") but free space could not be read before and after (df) — the bytes actually freed are NOT verified (the entries may be hardlinked into live .venv trees)"
@@ -797,6 +793,14 @@ reap_target() {
         fail_closed "$class: $dir was $(mb_str "$before_kb") -> $(mb_str "$after_kb") after evicting every removable entry (prune=$pruned evicted=$evicted) — still over the ${MAX_MB}MB bound; free $(mb_str "${before_free_kb:-0}") -> $free_str${held_entries:+ — PRESERVED because a live process names them: $held_entries}${keep_entries:+ — preserved: $keep_entries}${stop_note}"
         return 0
     fi
+    # ⛔ After the still-over verdict, "did not shrink" can only mean nothing could be removed at
+    # all — it must NOT claim the pass "acted on" the cache (measured: a single-entry cache whose
+    # only entry a live process names printed "acted on … the size did NOT decrease" and LOST the
+    # PRESERVED line, i.e. the one datum a human needs, and counted the cache twice as a failure).
+    if [ "$after_kb" -ge "$before_kb" ]; then
+        fail_closed "$class: $dir is under its ${MAX_MB}MB bound but did NOT decrease ($(mb_str "$before_kb") -> $(mb_str "$after_kb"), prune=$pruned evicted=$evicted) — the shrink is NOT verified${held_entries:+ — held by a live process: $held_entries}${keep_entries:+ — preserved: $keep_entries}${stop_note}"
+        return 0
+    fi
 
     # ⛔ A FALLING delta cannot be attributed to this pass at all: another process wrote more than
     # the cache freed, which is the normal state of the busy low-disk box this exists for.
@@ -805,7 +809,19 @@ reap_target() {
     # the cell write `.cache-reap-blocked` ("BOUND NOT ENFORCED") for a cache that WAS bounded.
     # The bound is decided by the cache's own measured size; the disk-gain claim is simply not made.
     if [ "$after_free_kb" -lt "$before_free_kb" ]; then
-        say "pi-cache-reap: $class $dir $(mb_str "$before_kb") -> $(mb_str "$after_kb") (prune=$pruned evicted=$evicted) max=${MAX_MB}MB — UNDER its bound; the free-space delta is UNATTRIBUTABLE ($(mb_str "$before_free_kb") -> $(mb_str "$after_free_kb"): another process wrote during the pass), so no disk-gain claim is made${keep_entries:+ (preserved: $keep_entries)}${stop_note}"
+        # ⛔ A FALLING delta is not PROOF of anything — and it is not a licence to waive the proof
+        # either. Measured counter-example: a cache whose blobs were still pinned by open file
+        # descriptors (the leaked-backend shape) shrank on disk, freed NOTHING, and a falling delta
+        # made the pass exit 0 — which the cell's clock reads as "clear the alarm". So the pass
+        # accepts the unattributable delta ONLY when it also observed at least one eviction after
+        # which free space ROSE (that is this pass's own reclaim, seen through a concurrent writer);
+        # with no such sample the reclaim is UNVERIFIED and the pass fails closed, exactly as
+        # ruling 4 requires, rather than certifying a shrink it cannot attribute.
+        if [ "$any_gain" -eq 1 ]; then
+            say "pi-cache-reap: $class $dir $(mb_str "$before_kb") -> $(mb_str "$after_kb") (prune=$pruned evicted=$evicted) max=${MAX_MB}MB — UNDER its bound; the net free-space delta is UNATTRIBUTABLE ($(mb_str "$before_free_kb") -> $(mb_str "$after_free_kb"): another process wrote during the pass), but at least one eviction of this pass WAS followed by a gain, so the pass did reclaim (the net figure is masked by another writer)${keep_entries:+ (preserved: $keep_entries)}${stop_note}"
+            return 0
+        fi
+        fail_closed "$class: $dir shrank $(mb_str "$before_kb") -> $(mb_str "$after_kb") (prune=$pruned evicted=$evicted) while free space FELL ($(mb_str "$before_free_kb") -> $(mb_str "$after_free_kb")) and NOT ONE eviction of this pass was followed by a gain — the reclaim is NOT verified (another writer is masking it, or the bytes are still pinned by an open descriptor); re-verification belongs to the next pass${stop_note}"
         return 0
     fi
     if [ "$after_free_kb" -eq "$before_free_kb" ]; then
@@ -820,12 +836,20 @@ reap_target() {
     claimed_kb=$(( before_kb - after_kb ))
     gained_kb=$(( after_free_kb - before_free_kb ))
     min_gain_kb=$(( claimed_kb * MIN_RECLAIM_PCT / 100 ))
+    # ⛔ The df delta is a NET figure and any process can move it: the supervisor's own `prune`, a
+    # lane finishing, or a build writing. Reporting the raw delta as this pass's reclaim let foreign
+    # bytes satisfy the 50% proof and be printed as `(+192MB) VERIFIED` for a pass that freed
+    # nothing. The credit is capped at what the cache actually gave up, and an excess is named.
+    credited_kb="$gained_kb"
+    credited_note="the reclaim is capped at what this cache gave up: $(mb_str "$gained_kb") of df gain, at most $(mb_str "$claimed_kb") attributable to this pass"
+    if [ "$gained_kb" -gt "$claimed_kb" ]; then credited_kb="$claimed_kb"; fi
+    [ "$gained_kb" -le "$claimed_kb" ] && credited_note="$(mb_str "$gained_kb") of that is attributable to this pass" 
     if [ "$gained_kb" -lt "$min_gain_kb" ]; then
         fail_closed "$class: $dir shrank $(mb_str "$before_kb") -> $(mb_str "$after_kb") ($(mb_str "$claimed_kb") claimed) but the filesystem gained only $(mb_str "$gained_kb") ($(mb_str "$before_free_kb") -> $(mb_str "$after_free_kb")) — under ${MIN_RECLAIM_PCT}% of the claim, so the bytes are NOT verified as reclaimed (hardlinked into a .venv? the owner for those is: cloud-cell-supervisor.sh prune)${stop_note}"
         return 0
     fi
 
-    say "pi-cache-reap: $class $dir $(mb_str "$before_kb") -> $(mb_str "$after_kb") (prune=$pruned evicted=$evicted) max=${MAX_MB}MB; free $(mb_str "$before_free_kb") -> $(mb_str "$after_free_kb") (+$(mb_str "$gained_kb")) VERIFIED${keep_entries:+ (preserved: $keep_entries)}${stop_note}"
+    say "pi-cache-reap: $class $dir $(mb_str "$before_kb") -> $(mb_str "$after_kb") (prune=$pruned evicted=$evicted) max=${MAX_MB}MB; free $(mb_str "$before_free_kb") -> $(mb_str "$after_free_kb") (+$(mb_str "$credited_kb") verified reclaim$([ "$gained_kb" -gt "$claimed_kb" ] && printf '; df gained %s more, NOT attributable to this pass' "$(mb_str "$(( gained_kb - claimed_kb ))")")) VERIFIED${keep_entries:+ (preserved: $keep_entries)}${stop_note}"
     return 0
 }
 
@@ -855,6 +879,20 @@ lock_release() {
     fi
     return 0
 }
+# lock_is_ours — rc 0 only when $LOCK_DIR carries a credential THIS reaper writes: a `kind` marker
+# plus an `owner` and a `started` that PARSE as positive integers. Breaking a "stale lock" is
+# `rm -rf`, so anything weaker deletes a directory that merely happens to sit at that path.
+lock_is_ours() {
+    local k o1 s1
+    k="$(cat "$LOCK_DIR/kind" 2>/dev/null || printf '')"
+    o1="$(cat "$LOCK_DIR/owner" 2>/dev/null || printf '')"
+    s1="$(cat "$LOCK_DIR/started" 2>/dev/null || printf '')"
+    [ "$k" = "pi-cache-reap" ] || return 1
+    is_pos_int "$o1" || return 1
+    is_pos_int "$s1" || return 1
+    return 0
+}
+
 lock_acquire() {
     local owner started now age mtime held_lstart now_lstart break_age bm
     # rc 3 when the lock cannot exist at all (unusable state dir): that is fail-closed, NOT a
@@ -905,8 +943,13 @@ lock_acquire() {
         # pass exited 0 — on a DRY RUN. A real lock always writes `owner` and `started` right
         # after mkdir, and a lock younger than the bound never reaches here, so the mkdir→write
         # window cannot be misread as "not ours".
-        if [ ! -f "$LOCK_DIR/owner" ] && [ ! -f "$LOCK_DIR/started" ]; then
-            printf '%s\n' "pi-cache-reap: $LOCK_DIR exists, is older than ${LOCK_STALE_SECONDS}s, and holds neither 'owner' nor 'started' — it is not a lock this reaper made, so it will not be removed (exit 3)" >&2
+        # ⛔ …and "a file named owner OR started exists" is NOT that evidence: measured, a directory
+        # holding `owner` with the content "not-a-pid" (or `started`="1" alone) was `rm -rf`'d by a
+        # DRY RUN that then exited 0 — `owner` is a plausible filename in any project directory, and
+        # its CONTENT was never checked. The credential must be something only this reaper writes:
+        # a `kind` marker, plus an owner and a start stamp that PARSE as positive integers.
+        if ! lock_is_ours; then
+            printf '%s\n' "pi-cache-reap: $LOCK_DIR exists, is older than ${LOCK_STALE_SECONDS}s, and is not a lock this reaper made (kind/owner/started do not match) — it will not be removed (exit 3)" >&2
             return 3
         fi
         plog "pi-cache-reap: breaking a stale lock (owner=${owner:-?} age=${age}s)"
@@ -947,6 +990,7 @@ lock_acquire() {
     fi
     printf '%s\n' "$$" >"$LOCK_DIR/owner" 2>/dev/null || true
     printf '%s\n' "$(now_epoch)" >"$LOCK_DIR/started" 2>/dev/null || true
+    printf '%s\n' "pi-cache-reap" >"$LOCK_DIR/kind" 2>/dev/null || true
     lstart_of "$$" >"$LOCK_DIR/lstart" 2>/dev/null || true
     LOCK_HELD=1
     return 0
