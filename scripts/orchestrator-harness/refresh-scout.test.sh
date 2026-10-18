@@ -2269,7 +2269,12 @@ case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
   *) bad "rest-403: the backlog was clobbered — candidates='$(cat "$D/o/candidates.txt" 2>/dev/null)'" ;;
 esac
 case "$OUT" in
-  *"HTTP 403"*"REST bucket"*) ok "rest-403: the refusal NAMES the HTTP 403 on the REST bucket (starved vs broken)" ;;
+  # ⛔ THE LABEL AND THE STATUS MUST BE ADJACENT IN ONE WORDING, because a two-needle glob let this
+  # assertion pass on the ECHOED provider text: `*"HTTP 403"*"REST bucket"*` matched across lines off
+  # the `… (HTTP 403)` inside the quoted stderr, so forcing the status parse to yield nothing
+  # (`HTTP ?`) left it green — a false PASS on exactly the regression it is named for (measured). It
+  # is also order-sensitive: reordering the log line made a single-line refusal fail for the format.
+  *"REST bucket refused it as RATE-LIMITED (HTTP 403"*) ok "rest-403: the refusal NAMES the HTTP 403 on the REST bucket (starved vs broken)" ;;
   *) bad "rest-403: the 403 is not named in the log — output: $OUT" ;;
 esac
 case "$OUT" in
