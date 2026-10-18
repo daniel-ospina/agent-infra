@@ -29,6 +29,21 @@ PHASE="${PHASE:-AB}"
 WAIT="${WAIT:-0}"
 PATIENCE="${PATIENCE:-2400}"     # seconds to wait for a quiet moment before giving up on B
 STAGE="${STAGE:-/tmp/harness-main.$$}"
+# ⛔ REPO IS REQUIRED AND IS NOT DEFAULTED (agent-infra#1935) — but only when this run includes
+# phase B, which RELAUNCHES the controller. An unset REPO would leave a controller that exits 78 on
+# its own guard, and this script's verification would report `after: 0 scoped match(es)` over a
+# stopped runtime instead of naming the cause. Refuse BEFORE anything is stopped or copied, so a bad
+# deploy leaves the box as it found it. A hardcoded path is not an option: that is the defect this
+# guard removes. (PHASE=A only copies files and touches no controller, so it does not need REPO.)
+case "$PHASE" in *B*)
+  REPO="${REPO:-}"
+  [ -n "$REPO" ] || { echo "deploy-mac-orchestrator: FATAL REPO is not set — export REPO=<the target repo's local checkout> (needed because phase B relaunches the controller)" >&2; exit 78; }
+  [ -d "$REPO" ] || { echo "deploy-mac-orchestrator: FATAL REPO=$REPO does not exist" >&2; exit 78; }
+  # No `export REPO` is needed for the relaunch below: REPO can only get past the guard by ARRIVING
+  # in the environment (a value set without `export` never reaches this script), so it is already
+  # exported and `nohup bash "$O/orch-loop.sh"` inherits it.
+  ;;
+esac
 
 log() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
 
@@ -175,8 +190,47 @@ log "controller stopped"
 
 # Relaunch with the SAME command the live controller was started with (captured from
 # ps at deploy time): cd $HOME, fixed PATH, nohup into logs/nohup.out.
+# PATH for the relaunched controller, probed in THIS shell — the same idea as install.sh's
+# `__PATH__` render (`install.sh` probes the same four: `tmux gh uv pi`), and the reason there is no /Users/<someone>/... literal here any more: a
+# hardcoded home is the landmine class this file's REPO guard removes (#1935).
+# ⛔ Same REFUSAL as install.sh: a directory under `.pi/` or a `shims` directory is skipped, because a
+# shim silently substitutes a different `gh`/`pi` than the one the operator means. (install.sh refuses
+# the class for a measured reason: macOS TCC makes such a symlink EPERM under launchd.)
+DEPLOY_PATH=""
+# Scan PATH ENTRIES and test for an executable file, rather than `command -v` + `dirname`: `command -v`
+# reports an exported shell FUNCTION by bare name, so `dirname` would bake `.` into the relaunched
+# controller's PATH (install.sh calls that trap (2), `install.sh:157-159`). Scanning the entries also
+# keeps a tool findable when its first PATH directory is a refused shim (this box's `gh` is
+# `~/.pi/agent/shims/gh`): the refusal drops the DIRECTORY, and the next entry that really owns the
+# binary wins — which is what install.sh's resolve-past-a-wrapper loop achieves.
+# keeps a tool findable when one of its PATH directories is a refused shim (this box has a `gh` shim
+# at `~/.pi/agent/shims/gh`, behind the real `~/bin/gh`): the refusal drops the DIRECTORY, and the next
+# entry that really owns the binary wins — the same outcome install.sh's resolve-past-a-wrapper loop
+# reaches.
+# ⛔ `set -f` for the scan: a PATH entry containing `*` would otherwise be GLOB-EXPANDED into a
+# directory that is not on PATH at all (install.sh documents the same trap). And each entry is
+# resolved to its PHYSICAL path before the refusal test, because a symlink pointing INTO a shim
+# directory passes a name-pattern check while resolving to the shim.
+_oldIFS="$IFS"; IFS=:; set -f
+for _t in pi tmux gh uv; do
+  for _d in $PATH; do
+    case "$_d" in ""|.) continue ;; esac
+    _rd="$(cd "$_d" 2>/dev/null && pwd -P)" || continue
+    case "$_rd" in */.pi/*|*/shims|*/shims/*) continue ;; esac
+    [ -x "$_rd/$_t" ] || continue
+    case ":$DEPLOY_PATH:" in *":$_rd:"*) ;; *) DEPLOY_PATH="${DEPLOY_PATH:+$DEPLOY_PATH:}$_rd" ;; esac
+    break
+  done
+done
+set +f; IFS="$_oldIFS"
+for _d in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/bin /bin /usr/sbin /sbin; do
+  [ -d "$_d" ] || continue
+  case ":$DEPLOY_PATH:" in *":$_d:"*) ;; *) DEPLOY_PATH="${DEPLOY_PATH:+$DEPLOY_PATH:}$_d" ;; esac
+done
+[ -n "$DEPLOY_PATH" ] || DEPLOY_PATH="/usr/bin:/bin:/usr/sbin:/sbin"
+log "relaunch PATH: $DEPLOY_PATH"
 cd "$HOME" || exit 1
-PATH="/Users/danielospina/.local/bin:/Users/danielospina/.local/share/pi-node/current/bin:/opt/homebrew/bin:/Users/danielospina/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+PATH="$DEPLOY_PATH" \
   nohup bash "$O/orch-loop.sh" >> "$O/logs/nohup.out" 2>&1 &
 sleep 8
 

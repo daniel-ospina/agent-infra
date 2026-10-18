@@ -10,7 +10,7 @@ was done **by hand**. This is that walk, as code, with the dry-run as the defaul
 
     #5035's own words: "`ppid 1` is a silent promotion to 'nobody owns this.'"
 
-THE FOUR GATES (all must pass; any unclear read => REPORT, never reap)
+THE FIVE GATES (all must pass; any unclear read => REPORT, never reap)
   1. CPU DELTA, tolerance stated — a sub-0.1 s twitch has the same signature as a parked fork
      child, a human's prompt redraw, or a timer wake. So: PARKED = delta < 0.10 s over the
      sample. (A spin, by contrast, is 100x that: #5035 measured +19.44 s over 30 s.)
@@ -37,7 +37,7 @@ Reapable != right to reap: a candidate with diagnostic value stays (evidence bea
 
 USAGE
     orphan-reap.py                 # dry run (default): report every candidate + gate reading
-    orphan-reap.py --apply         # SIGTERM the ones that pass all four, then verify gone
+    orphan-reap.py --apply         # SIGTERM the ones that pass all five, then verify gone
     orphan-reap.py --sample 20     # CPU sample window in seconds (default 15)
 """
 from __future__ import annotations

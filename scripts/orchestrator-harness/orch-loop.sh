@@ -3,16 +3,23 @@
 # Fast, non-blocking cycle: heartbeat -> merge sweep -> capacity-gated dispatch -> background refresh.
 set -u
 OR="${OR:-daniel-ospina/tortoise}"
-# ⛔ THE OLD DEFAULT POINTED AT A PATH THAT DOES NOT EXIST ON THIS BOX
-# (/Users/home/eldato/tortoise). Under the shipped launchd job this is only a FALLBACK --
-# install.sh renders its own REPO into the plist via __REPO__, and that value overrides this one.
-# It still matters for every REPO-less run (manual starts, the runbook, a re-install without env),
-# and there a missing path is indistinguishable from "nothing to do" -- the same class as the
-# gh-shim failure (#8246). Corrected, and made to fail LOUD rather than run against a path with
-# nothing in it. (Corrected after a fresh-context verifier showed the original comment misstated
-# the mechanism -- see the review on this PR.)
-REPO="${REPO:-/Users/danielospina/Documents/GitHub/tortoise}"
+# ⛔ REPO HAS NO DEFAULT, AND THAT IS THE FIX. It used to default to ONE DEVELOPER'S HOME
+# (`/Users/<user>/Documents/GitHub/tortoise`), so on any other machine it resolved to a path with
+# nothing behind it: the guard just below killed the controller at startup, and under KeepAlive that
+# is a crash loop whose only trace is launchd.err — it reads exactly like a box with nothing to do.
+# (The other shape, "the controller keeps beating while the refresh aborts every cycle", is a REPO
+# that EXISTS but is the wrong repo — refresh-candidates.sh still carries its own default of that
+# kind, #1935/#1977.) A path is not a thing this repo can guess — the daemon gets it from install.sh
+# (`__REPO__` in the plist), a cell from its keys.env/supervisor, and an operator from §4 step 2.
+# Unset is a CONFIGURATION ERROR and it is refused HERE, before any command can run against it.
+REPO="${REPO:-}"
+if [ -z "$REPO" ]; then echo "orch-loop: FATAL REPO is not set — export REPO=<the target repo's checkout> (see README §4 step 2)" >&2; exit 78; fi
 if [ ! -d "$REPO" ]; then echo "orch-loop: FATAL REPO=$REPO does not exist" >&2; exit 78; fi
+# ⛔ NO `export REPO` HERE, DELIBERATELY. It would be a no-op for every supported invocation: a
+# value that reached this script through the environment is ALREADY exported to the refresh and
+# every child, and a value set without `export` in the operator's shell never reaches the script at
+# all -- the guard above exits 78 first. (Sourcing this file instead of executing it is not a
+# supported entry point, and would be the one case where `export` was load-bearing.)
 O="${O:-$HOME/orchestrator}"
 export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
 export AGENT_SKIP_REVIEW_GATE=1 ELDATO_SKIP_VGATE=1
@@ -26,7 +33,6 @@ MAX_FIX_TRIES="${MAX_FIX_TRIES:-3}"
 # that it is too tight for a 17-workspace fleet on 10 cores -- NOT that it never opened. The box
 # merged 25 PRs in a day at load 17-52 and has been observed functioning at ~100; a ceiling at 16
 # leaves the dispatcher off for most of the day.
-# (Corrected after a fresh-context verifier counted the dispatch lines the first claim ignored.)
 # The REAL capacity constraint is the machine (available RAM / swap) -- see the gate chain below.
 # Derive the ceiling from the core count so it scales, and keep the env override.
 # sysctl -n hw.ncpu is macOS-only: on a Linux cell sysctl may be absent entirely (Debian's procps
