@@ -251,6 +251,12 @@ ck "it is recorded under its OWN name" $rc
 GHS_STATE_DIR="$CASE_STATE" "$ENGINE" state >"$TMP/state.out" 2>&1
 grep -q 'last-lock-timeout:.*age=[0-9]*s' "$TMP/state.out" && rc=0 || rc=1
 ck "'state' reports the record WITH ITS AGE (a write-only record would be a stale flag)" $rc
+# ALL records, not the first: `last-limit` is never cleared, so returning on the first hit lets a
+# months-old rate limit mask the wedged lock that is the CURRENT reason a cycle is blind.
+printf 'bucket=graphql reset=unknown at=%s attempts=4 cmd=gh pr list\n' "$(( $(date +%s) - 172800 ))" > "$CASE_STATE/last-limit"
+GHS_STATE_DIR="$CASE_STATE" "$ENGINE" state >"$TMP/state2.out" 2>&1
+grep -q 'last-limit:' "$TMP/state2.out" && grep -q 'last-lock-timeout:' "$TMP/state2.out" && rc=0 || rc=1
+ck "'state' prints EVERY record present, so a stale limit cannot mask the current cause" $rc
 
 echo "── a permission 403 is NOT a rate limit: replayed once, never slept on ──"
 fresh_state perm
@@ -325,6 +331,13 @@ grep -q 'if-none-match: "abc123"' "$ARGS" && rc=0 || rc=1
 ck "the second poll SENT if-none-match (so GitHub can answer 304 and charge nothing)" $rc
 [ "$(grep -c 'if-none-match' "$ARGS")" = "1" ] && rc=0 || rc=1
 ck "exactly one charged fetch and one conditional confirmation" $rc
+# The etag and the body it validates are ONE invariant. Two files replaced separately can pair a NEW
+# etag with an OLD body (a concurrent poll, or a kill between the writes), and every later 304 then
+# replays bytes the server never validated — with rc 0. Assert the SHAPE, or a regression back to two
+# files passes every other check in this section (round-2 review).
+[ "$(ls "$CASE_STATE/etag" | grep -c '\.cache$')" = "1" ] \
+  && [ "$(ls "$CASE_STATE/etag" | wc -l | tr -d ' ')" = "1" ] && rc=0 || rc=1
+ck "the cache is ONE file per URL (etag+body replaced atomically, no .etag/.body sibling)" $rc
 
 cat > "$TMP/bin/jq-gh" <<'SH'
 #!/bin/bash
@@ -390,6 +403,18 @@ ck "and says it refused to fall back" $rc
 GHS_GH=/nonexistent/gh "$ENGINE" run -- pr list >/dev/null 2>"$TMP/nogh.err"
 [ "$?" -eq 127 ] && rc=0 || rc=1
 ck "a missing real gh is a LOUD 127" $rc
+# The layer must never answer a question gh was asked. `-h/--help` belongs to the layer ONLY when no
+# gh command has been named yet; once one has, the flag is gh's (and is forwarded to it). The shape
+# that exposes it is the no-`--` one, where `--help` arrives AFTER a gh token.
+out="$(GHS_GH="$TMP/bin/fast-gh" "$ENGINE" run gh pr create --help 2>/dev/null)"
+case "$out" in
+  *"MODES"*|*"gh-serial run"*) rc=1 ;;
+  *) rc=0 ;;
+esac
+ck "'run gh … --help' is NOT swallowed by the layer's own help" $rc
+out="$(GHS_GH="$TMP/bin/fast-gh" "$ENGINE" run --help 2>/dev/null)"
+case "$out" in *"MODES"*) rc=0 ;; *) rc=1 ;; esac
+ck "but a bare 'run --help' still answers with the layer's own help" $rc
 
 echo "── wiring: the harness scripts call the layer EXPLICITLY ──"
 REFRESH="$HERE/refresh-candidates.sh"
@@ -420,8 +445,10 @@ grep -q "gh-serial/lib.sh gh-serial/gh-serial gh-serial/gh_serial.py" "$HERE/../
 ck "cloud-cell-supervisor.sh's check REFUSES a cell without the layer" $rc
 grep -q 'gh-serial' "$HERE/../deploy-crossbox.sh" && rc=0 || rc=1
 ck "deploy-crossbox.sh seeds it too" $rc
-grep -q 'the layer would install incomplete' "$HERE/install.sh" && rc=0 || rc=1
-ck "install.sh dies on an incomplete shipped set (never an OK over a broken layer)" $rc
+grep -q 'the layer would install incomplete' "$HERE/install.sh" && rc=1 || rc=0
+ck "install.sh's incomplete-set branch is not DEAD code claiming a refusal it cannot reach" $rc
+grep -q 'die "gh-serial/ is missing from the shipped set' "$HERE/install.sh" && rc=0 || rc=1
+ck "install.sh REFUSES (die, non-zero) a shipped set without the layer" $rc
 grep -q 'ghs_run version' "$HERE/install.sh" && rc=0 || rc=1
 ck "install.sh proves the artifact the CALL SITES use (lib.sh), not just the engine" $rc
 

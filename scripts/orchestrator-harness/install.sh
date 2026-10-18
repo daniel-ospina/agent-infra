@@ -482,10 +482,12 @@ fi
 # Four boxes × N lanes share ONE account, and GitHub's SECONDARY limit is triggered by CONCURRENCY:
 # measured 2026-10-18 with core 2948/5000 free and every GraphQL call refused. Without this the
 # controller logs `[scope] open=UNKNOWN` and `queue=UNREADABLE` — blind, and reading as idle.
+# One gate, not two: the outer `if` already proves all three files exist, so an inner per-file
+# existence check would be DEAD CODE — and a dead `die` is worse than none, because a test that greps
+# its message reads as if the refusal exists. This branch is the refusal.
 if [ -f "$HERE/gh-serial/gh-serial" ] && [ -f "$HERE/gh-serial/gh_serial.py" ] && [ -f "$HERE/gh-serial/lib.sh" ]; then
   mkdir -p "$O/gh-serial" || die "cannot create $O/gh-serial"
   for f in gh-serial gh_serial.py lib.sh; do
-    [ -f "$HERE/gh-serial/$f" ] || die "gh-serial/$f missing from the shipped set — the layer would install incomplete and every wired gh call would exit 127"
     if [ -f "$O/gh-serial/$f" ] && ! diff -q "$HERE/gh-serial/$f" "$O/gh-serial/$f" >/dev/null 2>&1; then
       warn "replacing a DIFFERENT $O/gh-serial/$f — the installed layer was stale"
     fi
@@ -501,7 +503,11 @@ if [ -f "$HERE/gh-serial/gh-serial" ] && [ -f "$HERE/gh-serial/gh_serial.py" ] &
     || die "the installed gh-serial layer cannot run through lib.sh (python3 missing, or a file is incomplete)"
   ok "gh serialisation/backoff layer -> $O/gh-serial (explicit call path; gh is NOT substituted)"
 else
-  warn "gh-serial/ missing from the shipped set — refusing to install the harness: its wired gh calls would be undefined (127) and every read would look empty. This checkout is too old to install."
+  # ⛔ die, NOT warn (round-2 review). A warning lets the installer finish with exit 0 and an $O that
+  # has no layer — which is the blind-but-idle cell this change exists to remove: every wired call
+  # exits 127, the refresh reports queue=UNREADABLE, and the controller still reports RUNNING. An
+  # incomplete shipped set is an install-time fact, so it is refused here where an operator can see it.
+  die "gh-serial/ is missing from the shipped set — refusing to install a harness whose wired gh calls would be undefined (127) and whose every read would look empty. This checkout is too old to install."
 fi
 
 # ── render plist ─────────────────────────────────────────────────────────────────

@@ -13,6 +13,10 @@ and `orch-loop.sh` (the open-PR count, `pr ready`, both merges). NOT yet wired: 
 `fix-one.sh`, `lane.sh`, `chain-merge.sh`, and `orch-loop.sh`'s per-PR `gh pr view` / `gh pr checks` /
 `gh run rerun` reads — those still call a bare `gh` and still fail silently when limited. Do not read
 "the harness's guard" as "every gh call is guarded".
+**The layer must be SHIPPED, or the wiring becomes a 127.** `install.sh` seeds it and **dies** on an
+incomplete shipped set (a warning would finish with exit 0 and an `$O` whose every wired call exits 127
+— blind, and reporting RUNNING); `cloud-cell-supervisor.sh`'s `seed_and_stamp` and `deploy-crossbox.sh`
+seed it into a cell, and `check` refuses a cell whose `$O` lacks it.
 
 | What it does | Why |
 |---|---|
@@ -27,7 +31,10 @@ The distinction the layer exists to preserve: a refused read is **unreadable**, 
 it, a limit surfaced as `[scope] open=UNKNOWN rc=1` and `queue=UNREADABLE` — a fleet that looks idle
 rather than blind. Now the caller sees exit 75 and a named bucket (through its captured stderr:
 `.open-err`, `.pool-err`, the merge log), and the durable record is `$GHS_STATE_DIR/last-limit`,
-printed **with its age** by `gh-serial state` so a past limit cannot be read as a current one.
+printed **with its age** by `gh-serial state` so a past limit cannot be read as a current one. That
+command prints **every** record present (`last-limit`, `last-lock-timeout`, `last-call-timeout`), each
+with its own age — printing only the first let a months-old rate limit mask the wedged lock that is
+the current reason a cycle is blind.
 
 ```bash
 # state dir (per box): the lock, the mutative clock, the ETag cache, the last limit

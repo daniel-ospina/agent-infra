@@ -1641,6 +1641,11 @@ git init -q "$TMP/tm/repo"
 # names. `acme/widget` matches the OR the injection arms already pass.
 git -C "$TMP/tm/repo" remote add origin https://github.com/acme/widget.git
 cp "$HERE"/*.sh "$TMP/tm/harness/"
+# #1988: the layer is a SUBDIRECTORY, so `cp *.sh` cannot carry it, and `start` REFUSES a harness
+# without it — every case below would be decided by that refusal instead of the guard it names.
+mkdir -p "$TMP/tm/harness/gh-serial"
+cp "$HERE/gh-serial/gh-serial" "$HERE/gh-serial/gh_serial.py" "$HERE/gh-serial/lib.sh" "$TMP/tm/harness/gh-serial/"
+chmod +x "$TMP/tm/harness/gh-serial/gh-serial"
 # The supervisor's `check` now also judges DISPATCH PROVISIONING (agent-infra#1736), so the fixture
 # must model a repo that can be pre-flighted: a repo carrying its own tools/collision_preflight.py.
 # Without it `start` dies in cmd_check and no session command is ever recorded.
@@ -2622,6 +2627,10 @@ ck "a rejected render leaves no temp plist behind (the render is not atomic by a
 # cannot open its input, and assert the sandbox holds ONLY the seed afterwards -- the `trap ... EXIT`
 # is what makes this pass, so deleting it turns this red.
 HDR="$TMP/hdr"; rm -rf "$HDR"; mkdir -p "$HDR"; cp "$HERE"/*.sh "$HERE/launchd.plist.template" "$HDR/" 2>/dev/null
+# #1988: `cp *.sh` cannot carry the SUBDIRECTORY, and install.sh now REFUSES (die, non-zero) a shipped
+# set without it — so without this every case below is decided by that refusal, not by the render guard
+# it names. Seeded here, not in install.sh: the refusal is the point, the fixture is what must satisfy it.
+mkdir -p "$HDR/gh-serial"; cp "$HERE/gh-serial/gh-serial" "$HERE/gh-serial/gh_serial.py" "$HERE/gh-serial/lib.sh" "$HDR/gh-serial/"; chmod +x "$HDR/gh-serial/gh-serial"
 chmod 000 "$HDR/launchd.plist.template"
 SBR="$(mk_sb)"; out="$(run_inst_at "$HDR/install.sh" "$SBR")"
 [ "$(inst_rc "$out")" != "0" ] && [ "$(inst_pl "$out")" = "SEED" ] && rc=0 || { rc=1; echo "      unreadable template -> '$out'"; }
@@ -2650,6 +2659,7 @@ chmod 644 "$HDR/launchd.plist.template"
 # render that wrote straight into the live plist would blindside only one that failed AFTER it. Force
 # that path with a template token that has no substitution rule, in a COPY of the harness.
 HD="$TMP/hd"; mkdir -p "$HD"; cp "$HERE"/*.sh "$HERE/launchd.plist.template" "$HD/" 2>/dev/null
+mkdir -p "$HD/gh-serial"; cp "$HERE/gh-serial/gh-serial" "$HERE/gh-serial/gh_serial.py" "$HERE/gh-serial/lib.sh" "$HD/gh-serial/"; chmod +x "$HD/gh-serial/gh-serial"   # #1988: see the HDR note
 printf '\n\t<key>__NORULE__</key>\n\t<string>x</string>\n' >> "$HD/launchd.plist.template"
 out="$(run_inst_at "$HD/install.sh" "$(mk_sb)")"
 [ "$(inst_rc "$out")" != "0" ] && [ "$(inst_pl "$out")" = "SEED" ] && rc=0 || { rc=1; echo "      post-render rejection -> '$out'"; }

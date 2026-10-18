@@ -387,13 +387,14 @@ def record_lock_timeout(sd, argv, waited):
 
 
 def mode_state():
-    """Print the recorded limit WITH ITS AGE — a write-only record is a stale flag.
+    """Print every recorded non-limit/wedge event WITH ITS AGE — a write-only record is a stale flag.
 
-    The bucket already reaches a cycle through the caller's captured stderr (`.open-err`,
-    `.pool-err`); this is the durable artifact an operator (or a future heartbeat) reads, and it
-    ages itself so a week-old limit cannot be reported as current.
+    ALL records, not the first: `last-limit` is never cleared, so returning on the first hit made a
+    months-old rate limit mask the wedged lock or hung `gh` that is the CURRENT reason a cycle is
+    blind (round-2 review). Each line ages itself, so a past event cannot read as current.
     """
     sd = state_dir()
+    printed = False
     for name in ("last-limit", "last-lock-timeout", "last-call-timeout"):
         path = os.path.join(sd, name)
         try:
@@ -405,13 +406,14 @@ def mode_state():
         for field in line.split():
             if field.startswith("at=") and field[3:].isdigit():
                 at = int(field[3:])
+        printed = True
         if at is None:
             sys.stdout.write("%s: %s age=unknown\n" % (name, line))
-            continue
-        age = max(0, int(time.time()) - at)
-        sys.stdout.write("%s: %s age=%ss\n" % (name, line, age))
-        return 0
-    sys.stdout.write("no limit recorded\n")
+        else:
+            age = max(0, int(time.time()) - at)
+            sys.stdout.write("%s: %s age=%ss\n" % (name, line, age))
+    if not printed:
+        sys.stdout.write("no limit recorded\n")
     return 0
 
 
@@ -546,7 +548,10 @@ def mode_run(argv):
             break
         if arg == "--mutative":
             mutative = True
-        elif arg in ("-h", "--help"):
+        elif arg in ("-h", "--help") and not rest:
+            # ONLY the layer's own help, and only when no gh command has been named yet. Matching it
+            # anywhere in the argv swallowed `ghs_run -- gh pr create --help` and printed THIS
+            # docstring with rc 0 — an adapter answering a question gh was asked (#1959/#1981 class).
             sys.stdout.write(__doc__ or "")
             return 0
         else:

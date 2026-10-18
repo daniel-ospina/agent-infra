@@ -338,11 +338,17 @@ longer sleep — and a bounded backoff *once limited*: honour `retry-after`; hon
 bounded, then fail. `gh-rest` makes the calls cheaper; `gh-serial` stops them colliding and refuses
 to pretend a refusal was an empty answer.
 
+**The layer is part of the SHIPPED SET, and an install refuses without it.** `install.sh` seeds
+`$O/gh-serial/` from `$HERE/gh-serial/` (a **subdirectory**, so a `cp *.sh` seed cannot carry it) and
+**dies** when the set is incomplete — a warning would finish with exit 0 and an `$O` whose every wired
+gh call exits 127, i.e. a controller that is blind and still reports RUNNING. `cloud-cell-supervisor.sh`
+seeds it into a cell and `check` refuses a cell whose `$O` lacks it.
+
 | Concern | Where it lives |
 |---|---|
 | one `gh` invocation at a time **per box** | `fcntl.flock` on `$GHS_STATE_DIR/gh.lock`, held across the request and **released during the wait** (a waiter must not serialise the sleep too) |
 | backoff order | `retry-after` → reset (when remaining is 0) → `max(60 s, base × 2^(n-1))` with jitter, `GHS_MAX_ATTEMPTS=4`, `GHS_MAX_WAIT=300 s` per call |
-| a refusal is never data | exhausted budget ⇒ stderr `RATE_LIMITED bucket=<core\|graphql> reset=<epoch> … THIS IS NOT EMPTY DATA` and **exit 75** (EX_TEMPFAIL). The bucket reaches the cycle through the caller's captured stderr (`.open-err`, `.pool-err`, the merge log); `$GHS_STATE_DIR/last-limit` is the durable record, printed by `gh-serial state` **with its age**, so a past limit cannot be reported as current |
+| a refusal is never data | exhausted budget ⇒ stderr `RATE_LIMITED bucket=<core\|graphql> reset=<epoch> … THIS IS NOT EMPTY DATA` and **exit 75** (EX_TEMPFAIL). The bucket reaches the cycle through the caller's captured stderr (`.open-err`, `.pool-err`, the merge log); `$GHS_STATE_DIR/last-limit` is the durable record, printed by `gh-serial state` **with its age**, so a past limit cannot be reported as current. `state` prints **every** record (`last-limit`, `last-lock-timeout`, `last-call-timeout`) — printing the first let a stale limit mask the wedged lock that is the current cause |
 | a hung child or a wedged lock | `GHS_CALL_TIMEOUT` (120 s) kills a gh that never returns → exit 124, transport, not retried; a lock that cannot be acquired in `GHS_LOCK_TIMEOUT` → a named 75. Neither writes `last-limit` (that would blame quota for a stuck process) |
 | mutative pacing | ≥ 1 s between merge/edit/comment (`GHS_MUTATIVE_SPACING`) |
 | free polling | `ghs_rest <path>` sends `if-none-match`; a 304 replays the cached body **byte-exactly** and costs no primary quota (GraphQL has no ETag) |

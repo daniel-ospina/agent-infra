@@ -698,6 +698,12 @@ fi
 # the only scripts its `bash -n` sweep sees are the ones under test.
 STAGE="$T/stage"; mkdir -p "$STAGE"
 cp "$INSTALL" "$LIB" "$HARNESS/launchd.plist.template" "$STAGE/" 2>/dev/null
+# #1988: install.sh seeds the gh single-flight/backoff layer and DIES on a shipped set without it (an
+# $O whose every wired gh call exits 127 is blind and still reports RUNNING). The STAGE copy is a
+# shipped set, so it must carry the layer — `cp *.sh` cannot, it is a subdirectory.
+mkdir -p "$STAGE/gh-serial"
+cp "$HARNESS/gh-serial/gh-serial" "$HARNESS/gh-serial/gh_serial.py" "$HARNESS/gh-serial/lib.sh" "$STAGE/gh-serial/"
+chmod +x "$STAGE/gh-serial/gh-serial"
 SHOME="$T/home"; mkdir -p "$SHOME/Library/LaunchAgents" "$SHOME/.local/share/pi-node/current/bin" \
   "$SHOME/.pi/agent/scripts"
 # install.sh probes the real binaries: gh (network), tmux, pi, uv.
