@@ -325,7 +325,67 @@ file_mtime() {
     else stat -c '%Y' "$1" 2>/dev/null; fi
 }
 
-# du_mb <path> — blocks occupied, MiB. Empty on failure (never 0: 0 reads as "empty").
+# ⛔ macOS SHIPS NO `timeout` (nor `gtimeout` without coreutils). Every call below therefore
+# returned 127 on the Mac and EVERY delegate class recorded `fail-closed` — the reaper was inert on
+# the very box it was developed on, and the pass printed a plausible "fail-closed" as though a
+# delegate were broken rather than absent. That is the same silent-failure shape this feature exists
+# to remove, so bound the command portably: use a real `timeout` where it exists (every Linux cell),
+# and fall back to the repo's established bash watchdog (merge-one.sh:78, spawn-gate.sh:276) where it
+# does not. Identical semantics on the cells; the Mac stops lying.
+TIMEOUT_BIN=""
+if command -v timeout >/dev/null 2>&1; then TIMEOUT_BIN=timeout
+elif command -v gtimeout >/dev/null 2>&1; then TIMEOUT_BIN=gtimeout
+fi
+
+bounded() { # bounded <seconds> <cmd...> — combined stdout+stderr; rc 124 only if the WATCHDOG fired
+    local t="$1"; shift
+    _bounded_run merge "$t" "$@"
+}
+bounded_out() { # bounded_out <seconds> <cmd...> — stdout only, i.e. the caller's `2>/dev/null`
+    local t="$1"; shift
+    _bounded_run stdout "$t" "$@"
+}
+
+_bounded_run() {
+    local mode="$1" t="$2"; shift 2
+    case "$t" in
+        ''|*[!0-9]*) printf '%s: bounded: invalid seconds %q\n' "$SCRIPT_NAME" "$t" >&2; return 2 ;;
+    esac
+    if [ -n "$TIMEOUT_BIN" ]; then
+        if [ "$mode" = stdout ]; then "$TIMEOUT_BIN" "$t" "$@" 2>/dev/null
+        else "$TIMEOUT_BIN" "$t" "$@" 2>&1; fi
+        return $?
+    fi
+    local pid w rc outf flag
+    outf="$(mktemp "${TMPDIR:-/tmp}/disk-reaper.out.XXXXXX")" || return 3
+    flag="$outf.timeout"
+    if [ "$mode" = stdout ]; then "$@" >"$outf" 2>/dev/null & else "$@" >"$outf" 2>&1 & fi
+    pid=$!
+    # The watchdog traps its own TERM so the `sleep <bound>` it started dies with it. Without that
+    # trap every bounded call orphaned a `sleep` reparented to pid 1 (one per du and per class).
+    ( sp=""
+      trap 'kill "${sp:-}" 2>/dev/null; exit 0' TERM INT
+      sleep "$t" & sp=$!
+      wait "$sp" 2>/dev/null
+      : >"$flag"
+      kill -TERM "$pid" 2>/dev/null
+      sleep 5; kill -KILL "$pid" 2>/dev/null ) >/dev/null 2>&1 &
+    w=$!
+    wait "$pid" 2>/dev/null; rc=$?
+    kill -TERM "$w" 2>/dev/null; wait "$w" 2>/dev/null
+    cat "$outf" 2>/dev/null
+    # ⛔ 124 ONLY WHEN THE WATCHDOG FIRED. The previous `[ "$rc" -ge 128 ] && rc=124` reclassified
+    # EVERY signal death as "timeout", so a segfault (139) or an OOM kill (137) was recorded as a
+    # timeout — a plausible-but-wrong story in the artefact the supervisor reads.
+    # ⚠️ KNOWN RESIDUAL: the watchdog signals the direct child only, not its process group, so a
+    # grandchild (a recursive delete, `git`, `du`) can outlive a fail-closed class. GNU `timeout` —
+    # which every Linux cell has — does signal the group, so this gap is macOS-only; tracked in
+    # agent-infra#2036.
+    [ -f "$flag" ] && rc=124
+    rm -f "$outf" "$flag"
+    return "$rc"
+}
+
 du_mb() {
     local kb
     kb="$(tb_timeout "$DU_TIMEOUT" "$DU_BIN" -sk "$1" 2>/dev/null)" || return 1

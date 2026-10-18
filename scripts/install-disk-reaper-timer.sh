@@ -94,6 +94,117 @@ resolve_repos() {
     printf '%s' "$out"
 }
 
+# ── refuse to install a unit that points into transient scratch space ───────────────────────────
+# MEASURED FAILURE (2026-10-18, pi-cell-2 and pi-cell-3). A harness invoked this installer with
+# HOME=/tmp/tmp.XXXX/bg/home and no SYSTEMD_UNIT_DIR, so it took the SYSTEM target and wrote
+#   ExecStart=/bin/bash /tmp/tmp.XXXX/bg/home/.pi/agent/scripts/disk-reaper.sh --apply
+# into /etc/systemd/system. The mktemp dir was gone before the first tick, so EVERY hourly pass
+# exited 127 (command not found) while `systemctl list-timers` kept showing the job as scheduled and
+# healthy — an inert enforcer produced by the INSTALLER itself. The disks sat at 94-96% for hours
+# with a "reaper" nominally on the clock. `init=...`/127 is invisible to a timer listing, so the
+# installer is the only place that can see the path is transient, and it must not write it.
+#
+# WHY THE TEST IS A MKTEMP SHAPE AND NOT "/tmp". A cell legitimately runs with HOME=/tmp/cell-home
+# and repos under /tmp/cell-ai; banning /tmp would refuse the real target. What is transient by
+# CONSTRUCTION is a `mktemp -d` name (`tmp.` + random suffix), which is what leaked into the units.
+is_transient_scratch() { # is_transient_scratch <path>
+    # ⛔ NORMALISE FIRST. macOS sets TMPDIR with a TRAILING SLASH, so `mktemp -d "$TMPDIR/tmp.X"`
+    # yields `/var/folders/.../T//tmp.X` — a DOUBLE slash. A naive prefix test against
+    # `${TMPDIR%/}/tmp.` therefore MISSES it, and the guard silently allows the exact install it
+    # exists to refuse (measured while writing this guard). Collapse duplicate slashes before any
+    # comparison, and keep the comparison on path components rather than string prefixes.
+    local p="$1" t t2
+    [ -n "$p" ] || return 1
+    # Collapse duplicate slashes (`tr -s /`). NOTE: the bash replacement form for this inserts a
+    # LITERAL backslash and leaves the path unmatched — measured, do not "simplify" this back.
+    p="$(printf '%s' "$p" | tr -s '/')"
+    case "$p" in
+        /tmp/tmp.?*|/var/tmp/tmp.?*|/private/tmp/tmp.?*|/private/var/tmp/tmp.?*) return 0 ;;
+        # macOS's OWN temp root is /var/folders/<a>/<b>/T/ — NOT /tmp — so it must be named, or the
+        # guard misses the very platform it was written on once TMPDIR is unset in its environment.
+        /var/folders/*/*/T/tmp.?*|/private/var/folders/*/*/T/tmp.?*) return 0 ;;
+    esac
+    # TMPDIR may be somewhere else entirely. Compare BOTH spellings: macOS reports /var/folders/...
+    # while the physical path (what `pwd -P` and a fixture actually carry) is /private/var/folders/...
+    for t in "${TMPDIR:-}"; do
+        [ -n "$t" ] || continue
+        t="$(printf '%s' "$t" | tr -s '/')"
+        t="${t%/}"
+        [ -n "$t" ] || continue
+        case "$t" in /var/*) t2="/private$t" ;; *) t2="$t" ;; esac
+        case "$p" in "$t"/tmp.?*|"$t2"/tmp.?*|"/private$t"/tmp.?*) return 0 ;; esac
+    done
+    return 1
+}
+
+# A path systemd can actually execute. systemd resolves a relative ExecStart argument against the
+# UNIT's working directory (not this installer's cwd), so `ExecStart=/bin/bash scripts/disk-reaper.sh`
+# is a permanent 127 even though it resolves fine HERE — and `[ -f ]` cannot tell the difference.
+is_absolute_path() { case "$1" in /*) return 0 ;; *) return 1 ;; esac; }
+
+# A genuine systemd unit directory. If the "test" override names one of these it is pointing at the
+# real thing, so it must NOT inherit the override's scratch-friendly bypass.
+is_real_systemd_dir() {
+    case "$(printf '%s' "${1:-}" | tr -s '/')" in
+        /etc/systemd*|/usr/lib/systemd*|/lib/systemd*|/run/systemd*) return 0 ;;
+    esac
+    return 1
+}
+
+refuse_transient_target() {
+    local t="$TARGET" bad="" v p r
+    # ── ALWAYS enforced, override or not ─────────────────────────────────────────────────────────
+    for v in "REAPER=$REAPER" "HOME=$HOME" "STATE_DIR=$STATE_DIR"; do
+        p="${v#*=}"
+        is_absolute_path "$p" || {
+            err "REFUSING: ${v%%=*} '$p' is not an absolute path — systemd resolves ExecStart against the unit's working directory, so the pass would exit 127 every tick"
+            return 1
+        }
+    done
+    [ -f "$REAPER" ] && [ -r "$REAPER" ] || {
+        err "reaper '$REAPER' does not exist (or is unreadable) — refusing to install a unit that cannot run"
+        return 1
+    }
+    # ── The scratch heuristic: skipped ONLY for a genuine scratch override ───────────────────────
+    # ⛔ The override is documented as "tests: a temp dir". Nothing used to stop it naming
+    # /etc/systemd/system — which reproduced the measured defect verbatim, one env var away — and it
+    # ALSO short-circuited the existence check above. It bypasses only the HEURISTIC, never those.
+    if [ -n "${SYSTEMD_UNIT_DIR:-}" ] && ! is_real_systemd_dir "$SYSTEMD_UNIT_DIR"; then
+        return 0
+    fi
+    is_transient_scratch "$REAPER"      && bad="REAPER=$REAPER"
+    is_transient_scratch "$HOME"        && bad="${bad:+$bad; }HOME=$HOME"
+    is_transient_scratch "$STATE_DIR"   && bad="${bad:+$bad; }STATE_DIR=$STATE_DIR"
+    if [ -n "$bad" ]; then
+        err "REFUSING a $t install rendered from transient scratch space: $bad"
+        err "The unit would point at a directory that is deleted before the first tick, so every pass"
+        err "exits 127 while 'list-timers' shows the job as scheduled. That is the exact inert-enforcer"
+        err "shape this installer must never create (agent-infra#2032, measured on pi-cell-2/-3)."
+        err "Re-run from the box's real HOME (a login shell or cloud-cell-bringup.sh), or set"
+        err "SYSTEMD_UNIT_DIR to a scratch dir when this is a test."
+        return 1
+    fi
+    # ── Whitespace: systemd SPLITS unquoted Environment=/ExecStart= values, so a path containing a
+    # space renders a unit that cannot run (measured: HOME="…/bg/my home"). Refuse, do not escape.
+    for v in "HOME=$HOME" "PATH=$PATH" "STATE_DIR=$STATE_DIR" "REPOS=$REPOS" "REAPER=$REAPER"; do
+        case "${v#*=}" in
+            *[[:space:]]*) err "REFUSING: ${v%%=*} contains whitespace — systemd splits the rendered unit on it, so it would never run"; return 1 ;;
+        esac
+    done
+    # A transient REPO is deliberately NOT a refusal: it makes that class fail closed (exit 3), which
+    # the unit now reports RED, so it is loud rather than silent. Refusing here would be a false block
+    # on cells whose only checkout currently lives under a mktemp dir. Read LINE-wise — an unquoted
+    # `for` would split a repo path containing a space into fragments and miss the real path.
+    while IFS= read -r r; do
+        [ -n "$r" ] || continue
+        is_transient_scratch "$r" && \
+            err "WARNING: repo '$r' is transient scratch — its venv/worktree classes will fail closed (exit 3, red) every pass"
+    done <<EOF
+$(printf '%s' "$REPOS" | tr ':' '\n')
+EOF
+    return 0
+}
+
 render() { # render <template> <dest>
     local tpl="$1" dest="$2"
     sed -e "s|{{USER}}|$(id -un)|g" \
@@ -135,6 +246,8 @@ do_install() {
     REPOS="$(resolve_repos)"
     [ -n "$REPOS" ] || err "WARNING: no repo resolved on this box — the venv and worktree classes will fail closed every pass. Set DISK_REAPER_REPOS or REPO."
     choose_target || { err "no scheduler available: no passwordless sudo for a system unit, and no systemd user manager. Install by hand, or give the cell sudo. NOT silently skipping — a reaper that never runs is the failure this exists to remove."; return 1; }
+
+    refuse_transient_target || return 1
 
     tmpd="$(mktemp -d "${TMPDIR:-/tmp}/disk-reaper-unit.XXXXXX")" || { err "cannot create a temp dir"; return 1; }
     render "$src_svc" "$tmpd/$UNIT_NAME.service" || { rm -rf "$tmpd"; return 1; }

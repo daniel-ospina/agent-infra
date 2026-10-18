@@ -32,4 +32,14 @@ IOSchedulingClass=idle
 # The pass writes its own bounded log under DISK_REAPER_STATE_DIR; journald keeps the exit status.
 ExecStart=/bin/bash {{REAPER}} --apply
 # A pass that exits 3 (a class failed closed) must not look like success to `systemctl start`.
-SuccessExitStatus=0 4 5
+# ⛔ AND NEITHER MAY 4 OR 5 ANY MORE. The earlier directive also listed both as success, which made
+# two real outcomes GREEN: 4 = "a class completed but at least one removal FAILED" — and, from the
+# other `exit 4` path, "another pass holds the lock" (see docs/ops/disk-reaper.md:141) — and 5 =
+# "dry-run reported work it would do, so the condition is still present". Measured consequence (2026-10-18):
+# the estate carried a "succeeding" hourly reaper on cells whose disks were at 94-96% used. An exit
+# code that a unit file reclassifies as success is a silent failure, and a silent failure is the bug
+# (same class as the pr-doctor exit-2 defect). Only a genuine, fully-cleaned pass is 0.
+SuccessExitStatus=0
+# Auditability: journald keeps the pass's stdout/stderr with the exit status, and the pass ALSO
+# writes $DISK_REAPER_STATE_DIR/disk-reaper.status (per-class bytes reclaimed) plus its bounded log.
+# No `StandardOutput=null` and no `-` prefix on ExecStart: a reaper must never be quiet.

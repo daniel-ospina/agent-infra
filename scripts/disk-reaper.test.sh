@@ -58,6 +58,11 @@ assert_nodir()    { if [ -d "$1" ]; then bad "$2 (still present: $1)"; else ok "
 assert_file()     { if [ -f "$1" ]; then ok "$2"; else bad "$2 (missing file: $1)"; fi; }
 
 [ -f "$REAPER" ] || { echo "FATAL: $REAPER missing — this suite tests the entry point, and there is none"; exit 1; }
+# Templates are NOT farmed (only scripts are), so a farmed copy of the suite has no ../templates.
+# Assert the precondition by its OWN name: without this, T8/T13 fail as "missing: REFUSING", which
+# reads as a broken guard rather than a missing fixture.
+REPO_ROOT="$(cd "$HERE/.." && pwd)"
+[ -d "$REPO_ROOT/templates/systemd" ] || { echo "FATAL: $REPO_ROOT/templates/systemd missing — the suite renders units from it"; exit 1; }
 
 T="$(mktemp -d "${TMPDIR:-/tmp}/disk-reaper-test.XXXXXX")"
 T="$(cd "$T" && pwd -P)"
@@ -147,7 +152,6 @@ commit_in "$WT" "$OLD_DATE" dead
 mkdir -p "$T/t1/cache-uv/entry-a" "$T/t1/cache-uv/entry-b"
 dd if=/dev/zero of="$T/t1/cache-uv/entry-a/blob" bs=1M count=3 >/dev/null 2>&1
 dd if=/dev/zero of="$T/t1/cache-uv/entry-b/blob" bs=1M count=3 >/dev/null 2>&1
-CACHE_REAP_MAX_MB=1 CACHE_REAP_UV_DIR="$T/$ENVNAME/cache-uv"
 CACHE_BEFORE="$(du -sm "$T/$ENVNAME/cache-uv" | awk '{print $1}')"
 OUT="$(CACHE_REAP_MAX_MB=1 CACHE_REAP_UV_DIR="$T/$ENVNAME/cache-uv" run_reaper --dry-run --repo "$REPO" --min-age 0 2>&1)"; RC=$?
 assert_eq "$RC" "5" "T1 dry-run with work found exits 5 (informative, not a failure)"
@@ -241,7 +245,6 @@ assert_contains "$RMS" 'LOCK_DIR' "T6 and the lock it does remove is named"
 # ── T7: the pass record answers "did it succeed, and how much did it free" ──────────────────────
 ENVNAME=t7
 REPO="$(mk_repo t7)"
-CACHE_REAP_MAX_MB=1 CACHE_REAP_UV_DIR="$T/t7/cache-uv"
 mkdir -p "$T/t7/cache-uv/e1"; dd if=/dev/zero of="$T/t7/cache-uv/e1/blob" bs=1M count=4 >/dev/null 2>&1
 CACHE_REAP_MAX_MB=1 CACHE_REAP_UV_DIR="$T/t7/cache-uv" run_reaper --apply --only uv >/dev/null 2>&1
 ST="$(HOME="$T/home" DISK_REAPER_STATE_DIR="$T/$ENVNAME/state" bash "$REAPER" --print-status 2>&1)"; SRC=$?
@@ -449,11 +452,62 @@ assert_eq "$RC" "3" "T15 an unusable TB_TIMEOUT_BIN is REFUSED, not silently ign
 assert_contains "$OUT" "TB_TIMEOUT_BIN" "T15 and the refusal names the pin"
 assert_absent "$OUT" "class=" "T15 no per-class line for a refused pass"
 
+# ── T16: the installer REFUSES a system unit rendered from transient scratch space ──────────────
+# MEASURED (2026-10-18, pi-cell-2 and pi-cell-3). A harness ran the installer with
+# HOME=/tmp/tmp.XXXX/bg/home and no SYSTEMD_UNIT_DIR, so `choose_target` took the SYSTEM target and
+# wrote `ExecStart=/bin/bash /tmp/tmp.XXXX/bg/home/.pi/agent/scripts/disk-reaper.sh --apply` into
+# /etc/systemd/system. The mktemp dir was deleted before the first tick, so every hourly pass has
+# exited 127 (command not found) ever since, while `systemctl list-timers` kept showing the job as
+# scheduled and healthy — the disks sat at 94-96% with a "reaper" on the clock. The installer is the
+# only component that can see the path is transient by construction, so it must refuse it.
+ENVNAME=t16
+REPO="$(mk_repo t16)"
+SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/tmp.XXXXXXXXXX")"
+mkdir -p "$SCRATCH/bg/home/.pi/agent/scripts" "$T/t16/units"
+cp "$REAPER" "$SCRATCH/bg/home/.pi/agent/scripts/disk-reaper.sh"
+: >"$T/t16/calls.log"
+OUT="$(HOME="$SCRATCH/bg/home" SUDO="true" SYSTEMCTL="$T/t8/bin/systemctl" \
+      SYSTEMCTL_CALLS="$T/t16/calls.log" DISK_REAPER_REPOS="$REPO" \
+      TEMPLATES_DIR="$HERE/../templates/systemd" \
+      bash "$INST" --install 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T16 a system install rendered from a mktemp HOME is REFUSED"
+assert_contains "$OUT" "REFUSING" "T16 and the refusal is loud, not a silent skip"
+assert_absent "$(cat "$T/t16/calls.log" 2>/dev/null || true)" "enable --now" \
+    "T16 nothing is ENABLED for a unit that could never run"
+assert_absent "$(cat "$T/t16/calls.log" 2>/dev/null || true)" "daemon-reload" \
+    "T16 and no unit directory is touched at all"
+# The guard must not false-block: the documented test override (a scratch unit dir + fake systemctl)
+# is exactly how this suite installs, so that path must still succeed.
+OUT="$(HOME="$SCRATCH/bg/home" DISK_REAPER="$SCRATCH/bg/home/.pi/agent/scripts/disk-reaper.sh" \
+      DISK_REAPER_REPOS="$REPO" SYSTEMD_UNIT_DIR="$T/t16/units" \
+      TEMPLATES_DIR="$HERE/../templates/systemd" \
+      SYSTEMCTL="$T/t8/bin/systemctl" SYSTEMCTL_CALLS="$T/t16/calls.log" \
+      bash "$INST" --install 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T16 an explicit SYSTEMD_UNIT_DIR override still installs (no false block)"
+assert_contains "$OUT" "target=override" "T16 and it reports the override target"
+assert_contains "$(cat "$T/t16/calls.log")" "daemon-reload" \
+    "T16 positive control: a real install DOES log daemon-reload (so its absence above is meaningful)"
+assert_contains "$(cat "$T/t16/calls.log")" "enable --now" \
+    "T16 positive control: a real install DOES enable the timer"
+rm -rf "$SCRATCH"
+# A unit that only reports WORK PENDING or a FAILED removal must not read green. The template's
+# SuccessExitStatus is the thing that decides that, so assert on the rendered bytes.
+# Directive-level, not literal-string: strip comments, take only `SuccessExitStatus=` lines, and
+# require the token set to be EXACTLY {0}. A substring grep would pass on `0 4 5`, miss `0 4`, and
+# false-fail on a comment that quotes the old value.
+SES_LINES="$(grep -h '^SuccessExitStatus=' "$T/t16/units/eldato-disk-reaper.service" | sed 's/^[^=]*=//')"
+assert_eq "$(printf '%s\n' "$SES_LINES" | grep -c .)" "1" \
+    "T16 the unit declares exactly one SuccessExitStatus directive"
+assert_eq "$(printf '%s\n' "$SES_LINES" | tr -s '[:space:]' '\n' | grep -c .)" "1" \
+    "T16 a failed removal (4) and work-pending (5) are NOT masked as success"
+assert_eq "$(printf '%s\n' "$SES_LINES" | tr -s '[:space:]' '\n' | grep '^0$' | grep -c .)" "1" \
+    "T16 only a fully-clean pass (0) is success"
+
 echo
 echo "──────────────────────────────────────────────────────────────────────"
 if [ "$FAIL" -eq 0 ]; then
     echo "ALL PASS ($PASS assertions)"
     exit 0
 fi
-echo "FAILURES: $FAIL of $PASS assertions"
+echo "FAILURES: $FAIL of $((PASS + FAIL)) assertions"
 exit 1
