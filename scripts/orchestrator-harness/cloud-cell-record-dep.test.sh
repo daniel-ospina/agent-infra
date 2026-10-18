@@ -58,9 +58,10 @@ echo "==> #1717 cloud-cell record dependency ($HERE)"
 # state dir's, and an ABSENT `ps` is indistinguishable from an UNREADABLE one — the supervisor then
 # refuses to start ("cannot read the process table"), which is correct behaviour and wrong subject
 # matter for this suite (it pins the recorder dependency). Every real cell has `ps`; the
-# unreadable-`ps` refusals are pinned in scripts/cloud-cell-supervisor.test.sh §(o). The read is
-# scoped to $O/orch-loop.sh and $HARNESS/orch-loop.sh under this fixture's own mktemp tree, so no
-# process on the host can match it and the fixture stays hermetic.
+# unreadable-`ps` refusals are pinned in scripts/cloud-cell-supervisor.test.sh §(o) for `status`,
+# `stop` and `start` (not `apply`, which runs the loop in-process and is listed as a residual). The
+# read is scoped to $O/orch-loop.sh and $HARNESS/orch-loop.sh under this fixture's own mktemp tree,
+# so no process on the host can match it and the fixture stays hermetic.
 COREUTILS="date tr mkdir cp rm mv ls cat dirname basename env sed grep chmod head tail awk seq sleep diff stat touch true false df sha256sum shasum ps"
 mkstubs() { # mkstubs <dir>
   local d="$1" b p

@@ -1904,7 +1904,12 @@ xs_bad() { # <sub>
            SESSION="orch-different-$$" O="$X/oB" REPO="$X/repo" OR="daniel-ospina/agent-infra" \
            SCOPE=own HARNESS="$X/harness" bash "$SUP" "$1" 2>&1)"; X_RC=$?
 }
-for verb in status stop; do
+for verb in status stop start; do
+  # `start` belongs in this list for the same reason as `stop`: both act on a session, and its two
+  # guards (the `has-session` branch's and the pre-launch one) are the pair whose failure is #1761's
+  # duplicate — an unreadable table reading as "no controller", so a second controller is launched
+  # onto one queue. `apply`'s guard is a separate path (it runs the loop in-process) and is not
+  # covered here; it is named in the issue's residual list rather than silently implied.
   xs_bad "$verb"
   [ "$X_RC" -ne 0 ] && ok "$verb: rc=$X_RC when 'ps' cannot answer (never a silent 0)" \
                     || bad "$verb: exited 0 on an unreadable process table — $X_OUT"
