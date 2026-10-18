@@ -560,6 +560,57 @@ Step 3 also records **which harness commit this box runs** in `$O/.agent-infra-s
 is not a git repo the record reads `UNKNOWN` and `check-deployed-drift.sh` exits 2 rather than
 passing, which is the intended fail-closed behaviour and not an install failure.
 
+### 4.1 Redeploying an existing box — `deploy-harness.sh`, and what a success is allowed to mean
+
+**The only supported redeploy path is `deploy-harness.sh`.** Step 1's `cp scripts/orchestrator-harness/*.sh`
+is the *first* install and it has the same two gaps a redeploy used to have: it copies only depth-1
+`*.sh` (never `gh-rest/gh`, `gh-limit/gh` or `retired/`) and it checks nothing.
+
+```bash
+bash scripts/orchestrator-harness/deploy-harness.sh \
+  --repo . --o ~/orchestrator          # or --src <harness dir>; notifies $O/bg/notify.sh
+```
+
+Exit `0` means **DEPLOYED AND VERIFIED**, and that phrase is a conjunction of three facts about
+*this run*: the source shipped ≥1 file, every one of those files was copied by this run, and every
+one compares byte-for-byte equal at the target (with the executable bit intact). Nothing is ever
+counted from a listing of the target — a runtime full of the previous deployment's scripts cannot
+make an empty deploy look successful, which is the exact defect this replaced (agent-infra#2041:
+`bg/finish.sh` ran a bare `cp -R`, ignored its rc, and then notified `convergence COMPLETE` quoting
+`$(ls "$O"/*.sh | wc -l)` — the *previous* deploy's files — as this one's evidence. Measured
+consequence: `gh-limit.py` and the `gh-limit/` shim were missing from a deployment everyone believed
+current, so every harness `gh` call was unserialised and unbounded).
+
+Exit `1` = the copy or the verification failed; `78` = refused **before touching the target**
+(source absent, source is not a harness, source ships no files, target is not a directory). Every
+non-zero path emits a **failure** notification and none emits a success one; a refusal writes
+nothing at all, not even the ledger.
+
+`$O/.deploy-ledger.tsv` is the per-file evidence (`copied` / `verified` / `COPY-FAIL` / `DRIFT` per
+path, plus the verdict line). It is written only once a copy has been attempted, so it is never
+present in a runtime that was refused, and `check-deployed-drift.sh` ignores it (it hashes `*.sh`).
+
+The helper does **not** restart the controller — restart ownership stays with the caller, because a
+deploy helper that restarts cannot avoid claiming a restart. `bg/finish.sh` (unversioned; see #2026)
+must call it and gate on its exit code, replacing its old lines 31–36 with:
+
+```bash
+      if ! bash "$R"/scripts/orchestrator-harness/deploy-harness.sh --repo "$R" --o "$O"; then
+        log "DEPLOY FAILED — main was NOT re-adopted; controller left alone"
+        exit 1
+      fi
+      cd "$O" && nohup bash "$O/supervisor.sh" >> "$O/logs/supervisor.out" 2>&1 & disown
+      sleep 10
+      bash "$B/notify.sh" "orchestrator: controller restarted" \
+        "Re-adopted main; the deploy is VERIFIED (see $O/.deploy-ledger.tsv). Controller restarted on those bytes." high
+      log "RE-ADOPTED main; deploy verified; controller restarted"
+      exit 0
+```
+
+That is the whole fix: success stops being a statement the deploy makes about itself and becomes a
+verdict reached from its own copy ledger — and the restart message can no longer speak for a deploy
+that did not happen.
+
 ```bash
 # liveness / stop
 cat ~/orchestrator/heartbeat                 # epoch seconds, should be < ~5 min old
