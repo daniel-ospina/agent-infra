@@ -268,6 +268,18 @@ ck "the chain is launched nohup/detached (a blocking reviewer call would look li
 ck "the detached launch records its own MERGED from state/merged-<PR>.done (no supervisor needed)" \
    $(grep -q 'state/merged-\$4.done' "$SCRIPT" && grep -q 'LM_VERDICT' "$SCRIPT" && echo 0 || echo 1)
 
+# ── 12b. a PARTIAL read (state present, head empty) is refused — an empty head is a default-branch read
+# Measured live: a rate-limited read returned `open|||behind`, and the loop then polled
+# `commits//check-runs`, which GitHub resolves against the DEFAULT BRANCH — so the verdict would have
+# been about main, not this PR, and the next step it gates is launching the merge chain. That is a
+# FALSE PASS, not a cosmetic gap.
+new_o "$T/pr24.tsv"
+printf 'open|||clean\n' > "$T/pr24.tsv"
+printf 'allgood\tcompleted\tsuccess\t41\tgithub-actions\n' > "$T/checks-headless.tsv"
+run 37 --repo o/r --pr-tsv "$T/pr24.tsv" --checks-tsv "$T/checks-headless.tsv"
+ck "a read with an EMPTY head is refused (exit 2) and never polls commits//check-runs" \
+   $([ "$RC" = 2 ] && grep -q "HEAD SHA is EMPTY" <<<"$OUT" && [ ! -f "$OT/logs/lane-merge-37.log" ] && echo 0 || echo 1)
+
 # ── 13. a bad PR id, and an unreadable PR, are refused WITHOUT attempting anything ──────────────
 new_o "$T/pr11.tsv"
 run '12;rm -rf /' --repo o/r --pr-tsv "$T/pr4.tsv"

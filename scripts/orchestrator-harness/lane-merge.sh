@@ -174,6 +174,8 @@ pr_read() {
 # full paginated read (the count comes back in the same response, so the branch costs nothing extra).
 checks_read() { # checks_read <head> [--full]
   local head="$1" full="${2:-}"
+  # Defence in depth for the same defect: an empty head is a DEFAULT-BRANCH read, never this PR's.
+  [ -n "$head" ] || { say_err "lane-merge: checks_read called with an EMPTY head — refusing (GitHub would answer for the default branch)"; return 1; }
   if [ -n "$CHECKS_TSV" ]; then [ -f "$CHECKS_TSV" ] || return 1; cat "$CHECKS_TSV"; return 0; fi
   local q="repos/$OR/commits/$head/check-runs?per_page=100&filter=all"
   local rows='(.check_runs[] | [(.name // ""), (.status // ""), (.conclusion // ""), (.id // 0), (.app.slug // "")] | @tsv)'
@@ -548,6 +550,17 @@ read_up="$(pr_read)"; IFS='|' read -r ST MT HD MS <<< "${read_up:-}"
 if [ -z "${ST:-}" ]; then
   say_err "lane-merge: could not read PR #$PR in $OR (rate limit, auth, or wrong --repo)."
   say_err "            Nothing was attempted. Re-run when gh answers; do NOT hand-roll a merge."
+  exit 2
+fi
+# ⛔ A HEAD IS NOT OPTIONAL (measured: a rate-limited read returned `open|||behind`, and the loop then
+# polled `commits//check-runs` — which GitHub resolves against the DEFAULT BRANCH. So the loop
+# classified MAIN's checks as this PR's, and a lane could have been told its own PR was green on the
+# strength of a branch it never touched. An empty field must never reach an API URL; the one write
+# that could follow (launching the merge chain) makes that a false PASS, not a cosmetic bug.
+if [ -z "${HD:-}" ]; then
+  say_err "lane-merge: read PR #$PR but its HEAD SHA is EMPTY (partial/truncated API response)."
+  say_err "            Refusing to poll a blank head — GitHub would resolve it to the DEFAULT BRANCH,"
+  say_err "            so any verdict would be about a branch this lane never touched. Nothing attempted."
   exit 2
 fi
 HEAD="${HD:-}"
