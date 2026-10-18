@@ -20,9 +20,10 @@ export CMUXTERM_CLI_RESPONSE_TIMEOUT_SEC="${CMUXTERM_CLI_RESPONSE_TIMEOUT_SEC:-6
 # 3. BOUNDED LOG (last 2000 lines).
 # 4. IT VERIFIES ITS OWN DELIVERY and records delivered=yes|UNVERIFIED.
 # 5. IT DOES NOT READ ~/Documents (macOS TCC denies a launchd-spawned bash that tree —
-#    see com.tortoise.worktree-reaper.plist). Everything here is under ~/.pi/agent,
-#    which is why a plain `bash` entry point is sound where the reaper needs the
-#    checkout's own interpreter.
+#    see com.tortoise.branch-reaper.plist and the consolidated com.eldato.disk-reaper
+#    job, whose pass needs the checkout's own interpreter for exactly this reason, #2048).
+#    Everything here is under ~/.pi/agent, which is why a plain `bash` entry point is
+#    sound where the reaper needs an interpreter that holds the TCC access.
 #
 # ⛔ TWO FAILURES THIS SCRIPT WAS BORN WITH — DO NOT REINTRODUCE THEM:
 #   (a) IT USED `rg`. ripgrep lives at ~/.pi/agent/bin/rg, which is NOT on launchd's

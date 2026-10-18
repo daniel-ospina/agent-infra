@@ -164,7 +164,8 @@ mkfakehome() { # $1 = home dir
 # the retirement pass has something to unload (mirrors real machines that
 # installed them pre-retirement — #432).
 seed_retired() { # $1 = home dir
-    for label in com.eldato.hub-state-check com.eldato.skill-lint-oracle; do
+    for label in com.eldato.hub-state-check com.eldato.skill-lint-oracle \
+                 com.eldato.pi-cache-reap com.tortoise.worktree-reaper; do
         cat > "$1/Library/LaunchAgents/$label.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -218,7 +219,11 @@ assert_contains "$OUT" "provider-latency-tripwire: installed + loaded" "provider
 assert_contains "$OUT" "fleet-cost-weekly: installed + loaded" "fleet-cost-weekly installed on fresh machine (#373)"
 assert_contains "$OUT" "pi-session-reaper: installed + loaded" "pi-session-reaper installed on fresh machine (#469)"
 assert_contains "$OUT" "pi-task-session-prune: installed + loaded" "pi-task-session-prune installed on fresh machine (#783)"
-assert_contains "$OUT" "pi-cache-reap: installed + loaded" "pi-cache-reap installed on fresh machine (#1987)"
+# #2048 — com.eldato.pi-cache-reap is RETIRED: its `uv` class moved into the consolidated pass
+# (scripts/install-disk-reaper-schedule.sh installs com.eldato.disk-reaper, which runs the same
+# scripts/pi-cache-reap.sh). A second clock for one class is the divergence #2032 removed on the
+# cells; this suite pins that install-launchd no longer installs it.
+assert_not_contains "$OUT" "pi-cache-reap: installed + loaded" "the retired per-class cache job is NOT installed by install-launchd (#2048)"
 assert_contains "$OUT" "lane-liveness: installed + loaded" "lane-liveness installed on fresh machine (#1178)"
 assert_contains "$OUT" "deepseek-balance-watch: installed + loaded" "deepseek-balance-watch installed on fresh machine (#476)"
 assert_contains "$OUT" "ci-runner-gate: installed + loaded" "ci-runner-gate installed on fresh machine (#1719)"
@@ -262,19 +267,27 @@ assert_contains "$(cat "$PRUNE_INSTALLED")" "<string>1</string>" "prune plist SH
 assert_contains "$(cat "$PRUNE_INSTALLED")" "StartInterval" "prune job is interval-scheduled"
 assert_contains "$(cat "$PRUNE_INSTALLED")" "<integer>3600</integer>" "prune job hourly (StartInterval 3600)"
 assert_contains "$(cat "$PRUNE_INSTALLED")" "agent-infra-plist-version: 0.1.0" "prune template carries version marker"
-# #1987 — the machine-global cache bound. It ships DRY-RUN like every sibling reaper: arming a
-# scheduled DELETION is an owner-level consequence decision (agent-infra#1678, owner ruling
-# 2026-10-11: "the reaper may run unattended; arming it may not"). ⚠️ NOTHING ENFORCES THIS: the
-# arming route is a tracked-template edit plus an installer re-run, which is exactly what #1678's
-# requirement 3 says the installer should refuse without an owner marker. These asserts pin the
-# COMMITTED stance; they are not a gate.
-assert_contains "$(cat "$CACHE_REAP_INSTALLED")" "$HOME1/.pi/agent/scripts/pi-cache-reap.sh" "cache-reap plist rendered with fake HOME (farmed path)"
-assert_contains "$(cat "$CACHE_REAP_INSTALLED")" "<string>--dry-run</string>" "cache-reap plist SHIPS DRY-RUN (#1987 / #1678 arming ruling)"
-assert_not_contains "$(cat "$CACHE_REAP_INSTALLED")" "<string>--apply</string>" "the committed cache-reap template ships unarmed"
-assert_contains "$(cat "$CACHE_REAP_INSTALLED")" "<key>CACHE_REAP_MAX_MB</key>" "cache-reap plist pins the size bound in the plist, not the shell"
-assert_contains "$(cat "$CACHE_REAP_INSTALLED")" "<string>2048</string>" "cache-reap plist pins the bound's VALUE (a key-only assert passes on a typo that mints a dead timer)"
-assert_contains "$(cat "$CACHE_REAP_INSTALLED")" "<integer>3600</integer>" "cache-reap job hourly (StartInterval 3600)"
-assert_contains "$(cat "$CACHE_REAP_INSTALLED")" "agent-infra-plist-version: 0.1.0" "cache-reap template carries version marker"
+# #1987 → #2048 — the machine-global cache bound used to have its own plist; that label is RETIRED
+# and the `uv` class is now scheduled by the CONSOLIDATED pass (scripts/install-disk-reaper-schedule.sh
+# installs com.eldato.disk-reaper, whose `uv` class resolves the same scripts/pi-cache-reap.sh). The
+# bound and the arming stance are pinned on the REPLACEMENT template here; that installer's own suite
+# pins the rendered job.
+assert_not_contains "$OUT" "pi-cache-reap: installed + loaded" "no per-class cache plist is installed any more (#2048)"
+[ ! -f "$CACHE_REAP_INSTALLED" ] && ok "no com.eldato.pi-cache-reap plist left on the box" \
+    || bad "no com.eldato.pi-cache-reap plist left on the box"
+assert_contains "$(cat "$REPO_TEMPLATES/RETIRED")" "com.eldato.pi-cache-reap" "the cache job is declared RETIRED (so an old install is unloaded, not stranded)"
+assert_contains "$(cat "$REPO_TEMPLATES/RETIRED")" "com.tortoise.worktree-reaper" "the worktree job is declared RETIRED too (#2048)"
+REPLACEMENT="$REPO_TEMPLATES/com.eldato.disk-reaper.plist.tmpl"
+[ -f "$REPLACEMENT" ] && ok "the consolidated pass has a launchd template" \
+    || bad "the consolidated pass has a launchd template"
+assert_contains "$(cat "$REPLACEMENT" 2>/dev/null)" "<key>CACHE_REAP_MAX_MB</key>" "the replacement pins the uv size bound in the plist, not the shell"
+assert_contains "$(cat "$REPLACEMENT" 2>/dev/null)" "<string>2048</string>" "the replacement pins the bound's VALUE"
+assert_contains "$(cat "$REPLACEMENT" 2>/dev/null)" "<key>REAP_WT_BUDGET_SECONDS</key>" "the replacement carries the worktree pass budget the retired job had raised (#1095)"
+assert_contains "$(cat "$REPLACEMENT" 2>/dev/null)" "<key>REAP_WT_GH_TIMEOUT</key>" "the replacement carries the gh timeout the retired job had raised"
+# The `.plist.tmpl` suffix is the OWNERSHIP MARKER: install-launchd renders `*.plist`, so it cannot
+# bootstrap this job half-rendered (a literal placeholder as an argument).
+[ ! -f "$REPO_TEMPLATES/com.eldato.disk-reaper.plist" ] && ok "the replacement is not in install-launchd's *.plist glob (one installer owns it)" \
+    || bad "the replacement is not in install-launchd's *.plist glob (one installer owns it)"
 # #1178 unit 3 — lane-liveness rendered-plist content asserts (farmed tools path,
 # the PINNED probe library, and the interval schedule). #1277: the farmed path is
 # scripts/fleet/, never tools/fleet/ (pi's startup scan blocks interactive boot on
@@ -378,7 +391,7 @@ assert_not_contains "$OUT" "skill-lint-oracle: installed + loaded" "retired orac
 [ ! -f "$HUB_RETIRED" ] && ok "no retired hub plist left behind" || bad "no retired hub plist left behind"
 [ ! -f "$ORACLE_RETIRED" ] && ok "no retired oracle plist left behind" || bad "no retired oracle plist left behind"
 BOOTSTRAP_COUNT1="$(grep -c 'launchctl bootstrap' "$LOG")"
-assert_eq "$BOOTSTRAP_COUNT1" "9" "fresh install bootstraps only active jobs (canary + tripwire + fleet + pi-session-reaper + balance-watch + pi-task-session-prune + pi-cache-reap + lane-liveness + ci-runner-gate)"
+assert_eq "$BOOTSTRAP_COUNT1" "8" "fresh install bootstraps only active jobs (canary + tripwire + fleet + pi-session-reaper + balance-watch + pi-task-session-prune + lane-liveness + ci-runner-gate; the two retired per-class reapers are not bootstrapped, #2048)"
 
 echo "── 2. Retirement: pre-seeded old plists get unloaded + removed ───"
 seed_retired "$HOME2"
@@ -387,6 +400,13 @@ RC=$?
 assert_eq "$RC" "0" "installer with seeded retired jobs exits 0"
 assert_contains "$OUT" "com.eldato.hub-state-check: RETIRED (unloaded + removed)" "hub retired job unloaded + removed"
 assert_contains "$OUT" "com.eldato.skill-lint-oracle: RETIRED (unloaded + removed)" "oracle retired job unloaded + removed"
+# #2048 — the two per-class reaper labels the consolidated pass replaced. They must be BOOTED OUT and
+# REMOVED, not merely ignored: a stranded plist keeps running the old single-class clock with no
+# report in the consolidated record.
+assert_contains "$OUT" "com.eldato.pi-cache-reap: RETIRED (unloaded + removed)" "the per-class cache job is unloaded + removed (#2048)"
+assert_contains "$OUT" "com.tortoise.worktree-reaper: RETIRED (unloaded + removed)" "the per-class worktree job is unloaded + removed (#2048)"
+[ ! -f "$HOME2/Library/LaunchAgents/com.eldato.pi-cache-reap.plist" ] && ok "retired cache plist file gone" || bad "retired cache plist file gone"
+[ ! -f "$HOME2/Library/LaunchAgents/com.tortoise.worktree-reaper.plist" ] && ok "retired worktree plist file gone" || bad "retired worktree plist file gone"
 [ ! -f "$HOME2/Library/LaunchAgents/com.eldato.hub-state-check.plist" ] && ok "hub retired plist file gone" || bad "hub retired plist file gone"
 [ ! -f "$HOME2/Library/LaunchAgents/com.eldato.skill-lint-oracle.plist" ] && ok "oracle retired plist file gone" || bad "oracle retired plist file gone"
 OUT="$(LOG="$LOG2" run_installer "$HOME2")"
@@ -495,7 +515,9 @@ RC=$?
 assert_eq "$RC" "0" "--status exits 0"
 assert_contains "$OUT" "provider-latency-tripwire: installed=loaded version=v0.1.0 (DRIFTED" "status flags drifted tripwire"
 assert_contains "$OUT" "corruption-canary: installed=loaded version=v0.1.0 (in sync)" "status reports canary in sync"
-assert_contains "$OUT" "Retired (moved to session-checks, #432)" "status lists retired jobs"
+assert_contains "$OUT" "Retired (unloaded + removed — #432 session-checks, #2048 consolidated disk reaper)" \
+    "status lists retired jobs and names BOTH retirement reasons"
+assert_contains "$OUT" "com.eldato.pi-cache-reap" "status names the retired per-class reaper (#2048)"
 
 echo "── 10. --uninstall ───────────────────────────────────────────────"
 OUT="$(run_installer "$HOME1" --uninstall)"
@@ -576,16 +598,78 @@ else
 fi
 
 echo ""
-echo "── 13. worktree-reaper installs under the TCC-holding interpreter (#1311) ──"
-# This template is SKIPPED whenever {{TORTOISE_REPO}} is unresolved — and no
-# other section sets it — so without this section the installer suite would
-# never exercise the worktree-reaper template at all (it would ship green on
-# XML lint alone). A fake tortoise with its own .venv python is the minimum
-# that lets the template resolve and install.
+echo "── 13. the retired per-class reapers are replaced by ONE consolidated job (#2048) ──"
+# #2048 retires com.tortoise.worktree-reaper (its `worktree` class) and com.eldato.pi-cache-reap (its
+# `uv` class) in favour of com.eldato.disk-reaper, which scripts/install-disk-reaper-schedule.sh
+# installs on BOTH platforms and which runs the SAME pass entry point (disk-reaper.sh) with the SAME
+# flags as the cells' systemd timer. This suite owns the install-launchd half: the labels must be gone
+# from the installer's template set and declared retired, and the replacement must keep the TCC seam
+# that made the old worktree job work at all (#1311/#1095) — a launchd-spawned `bash` is denied the
+# ~/Documents script read AND the repo read a `git` needs, so the interpreter holding the access must
+# still front the pass.
+#
+# (The retired labels' end-to-end unload is asserted in §2 via seed_retired. The replacement's own
+# RENDERED job — idempotency, reload-on-pass-change, dry-run vs armed — is asserted by
+# scripts/install-disk-reaper-schedule.test.sh, which owns that installer.)
+assert_contains "$(cat "$REPO_TEMPLATES/RETIRED")" "com.tortoise.worktree-reaper" \
+    "the per-class worktree job is declared RETIRED"
+[ ! -f "$REPO_TEMPLATES/com.tortoise.worktree-reaper.plist" ] \
+    && ok "its template is deleted (a retired label with a template is a hard error)" \
+    || bad "its template is deleted (a retired label with a template is a hard error)"
+[ ! -f "$REPO_TEMPLATES/com.eldato.pi-cache-reap.plist" ] \
+    && ok "the per-class cache template is deleted too" \
+    || bad "the per-class cache template is deleted too"
+# One owner per class: the two labels that remain are NOT disk-sink classes.
+assert_contains "$(cat "$REPO_TEMPLATES/RETIRED")" "DELIBERATELY NOT RETIRED" \
+    "the retirement names what stays and why (branch refs / idle processes are not sink classes)"
+for live in com.tortoise.branch-reaper com.eldato.pi-session-reaper; do
+    [ -f "$REPO_TEMPLATES/$live.plist" ] && ok "$live still has its template (not a sink class)" \
+        || bad "$live still has its template (not a sink class)"
+done
+REPLACEMENT_TMPL="$REPO_TEMPLATES/com.eldato.disk-reaper.plist.tmpl"
+[ -f "$REPLACEMENT_TMPL" ] && ok "the consolidated pass has a launchd template" \
+    || bad "the consolidated pass has a launchd template"
+grep -q '{{PYTHON_BIN}}' "$REPLACEMENT_TMPL" \
+    && ok "the replacement resolves its entry point to the TCC-holding interpreter (placeholder, rendered by its own installer)" \
+    || bad "the replacement resolves its entry point to the TCC-holding interpreter"
+grep -q '{{LAUNCHER}}' "$REPLACEMENT_TMPL" \
+    && ok "the replacement keeps the farmed shared launcher as its door to bash" \
+    || bad "the replacement keeps the farmed shared launcher as its door to bash"
+grep -q '{{REAPER}}' "$REPLACEMENT_TMPL" \
+    && ok "the replacement targets the pass itself (one entry point, not a per-class script)" \
+    || bad "the replacement targets the pass itself"
+grep -q '{{MODE_FLAG}}' "$REPLACEMENT_TMPL" \
+    && ok "the mode flag is RENDERED by the installer (arming is a visible, separate step, #1678)" \
+    || bad "the mode flag is RENDERED by the installer"
+# EXECUTE the real launcher against a fake reaper. The text assertions above
+# cannot see an ARGUMENT-FORWARDING defect, and one shipped: the launcher once
+# used argparse.REMAINDER, which does NOT absorb unknown OPTIONALS, so an
+# installed job ("--script x --repo y --dry-run") exited 2 before it read the
+# script at all — every pass a no-op, green through this suite.
+FAKE_REAPER="$T/fake-reaper.sh"
+printf '#!/bin/bash\necho "ARGS: $@"\n' > "$FAKE_REAPER"
+OUT="$(python3 "$SCRIPT_DIR/../scripts/pi-reap-worktrees-launchd.py" \
+    --script "$FAKE_REAPER" --repo /tmp/some-repo --dry-run 2>&1)"
+assert_eq "$OUT" "ARGS: --repo /tmp/some-repo --dry-run" \
+    "launcher forwards the repo and mode args to the reaper (no separator needed)"
+OUT="$(python3 "$SCRIPT_DIR/../scripts/pi-reap-worktrees-launchd.py" \
+    --script "$FAKE_REAPER" --apply 2>&1)"
+assert_eq "$OUT" "ARGS: --apply" \
+    "the launcher forwards a bare mode flag too (the consolidated job passes exactly one)"
+OUT="$(python3 "$SCRIPT_DIR/../scripts/pi-reap-worktrees-launchd.py" \
+    --script /tmp/does-not-exist-launcher-probe.sh --repo /tmp/x 2>&1; echo "rc=$?")"
+case "$OUT" in
+    *"cannot read"*rc=1) ok "launcher fails cleanly (no traceback) on an unreadable script" ;;
+    *) bad "launcher fails cleanly on an unreadable script (got: $OUT)" ;;
+esac
+
+echo ""
+echo "── 14. branch-reaper installs UNARMED via the shared launcher (#1787) ──"
+# A fake tortoise with its own .venv python: the branch-reaper template is SKIPPED whenever
+# {{TORTOISE_REPO}} is unresolved, so this is the minimum that lets it resolve and install.
 HOME3="$T/home3"; mkfakehome "$HOME3"
 mkdir -p "$HOME3/tortoise/.venv/bin" "$HOME3/tortoise/.git"
 touch "$HOME3/tortoise/.venv/bin/python"; chmod +x "$HOME3/tortoise/.venv/bin/python"
-WT_INSTALLED="$HOME3/Library/LaunchAgents/com.tortoise.worktree-reaper.plist"
 (
     export HOME="$HOME3"
     export PATH="$T/bin:$PATH"
@@ -598,51 +682,7 @@ WT_INSTALLED="$HOME3/Library/LaunchAgents/com.tortoise.worktree-reaper.plist"
     export ELDATO_ALLOW_TEST_HOME=1
     bash "$INSTALLER" >/dev/null 2>&1
 )
-if [ -f "$WT_INSTALLED" ]; then
-    ok "worktree-reaper installs when {{TORTOISE_REPO}} resolves"
-    # The entry point MUST be the checkout's own interpreter: a launchd-spawned
-    # `bash` is denied BOTH the ~/Documents script read and the repo read a
-    # `git` needs, so a `bash <script>` entry point installs a job that can
-    # never classify a worktree.
-    grep -q "$HOME3/tortoise/.venv/bin/python" "$WT_INSTALLED" \
-        && ok "entry point is the TCC-holding checkout interpreter" \
-        || bad "entry point is the TCC-holding checkout interpreter"
-    grep -q "$HOME3/.pi/agent/scripts/pi-reap-worktrees-launchd.py" "$WT_INSTALLED" \
-        && ok "entry point reaches the FARMED launcher" \
-        || bad "entry point reaches the FARMED launcher"
-    grep -q "$HOME3/.pi/agent/scripts/pi-reap-worktrees.sh" "$WT_INSTALLED" \
-        && ok "launcher targets the FARMED reaper script" \
-        || bad "launcher targets the FARMED reaper script"
-    grep -q "<string>--dry-run</string>" "$WT_INSTALLED" \
-        && ok "worktree-reaper ships UNARMED (--dry-run)" \
-        || bad "worktree-reaper ships UNARMED (--dry-run)"
-    grep -q '{{' "$WT_INSTALLED" \
-        && bad "no unresolved placeholders remain" \
-        || ok "no unresolved placeholders remain"
 
-    # EXECUTE the real launcher against a fake reaper. The text assertions above
-    # cannot see an ARGUMENT-FORWARDING defect, and one shipped: the launcher
-    # once used argparse.REMAINDER, which does NOT absorb unknown OPTIONALS, so
-    # the installed job ("--script x --repo y --dry-run") exited 2 before it
-    # read the script at all — every pass a no-op, green through this suite.
-    FAKE_REAPER="$T/fake-reaper.sh"
-    printf '#!/bin/bash\necho "ARGS: $@"\n' > "$FAKE_REAPER"
-    OUT="$(python3 "$SCRIPT_DIR/../scripts/pi-reap-worktrees-launchd.py" \
-        --script "$FAKE_REAPER" --repo /tmp/some-repo --dry-run 2>&1)"
-    assert_eq "$OUT" "ARGS: --repo /tmp/some-repo --dry-run" \
-        "launcher forwards the repo and mode args to the reaper (no separator needed)"
-    OUT="$(python3 "$SCRIPT_DIR/../scripts/pi-reap-worktrees-launchd.py" \
-        --script /tmp/does-not-exist-launcher-probe.sh --repo /tmp/x 2>&1; echo "rc=$?")"
-    case "$OUT" in
-        *"cannot read"*rc=1) ok "launcher fails cleanly (no traceback) on an unreadable script" ;;
-        *) bad "launcher fails cleanly on an unreadable script (got: $OUT)" ;;
-    esac
-else
-    bad "worktree-reaper installs when {{TORTOISE_REPO}} resolves"
-fi
-
-echo ""
-echo "── 14. branch-reaper installs UNARMED via the shared launcher (#1787) ──"
 # Same {{TORTOISE_REPO}}-gated shape as §13 (so it is skipped on a box with no
 # tortoise checkout). The pins that matter: the SHARED launcher is the entry
 # point, the FARMED reaper is its target, the checkout is passed explicitly,

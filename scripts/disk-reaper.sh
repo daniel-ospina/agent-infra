@@ -44,12 +44,18 @@
 # A `du` figure is never reported as freed bytes, and a `df` delta that is negative or zero is
 # reported as 0 with the raw delta, not hidden.
 #
-# SCHEDULING (installed by the cell bring-up, see cloud-cell-bringup.sh install_disk_reaper_timer)
-#   templates/systemd/eldato-disk-reaper.{service,timer} — hourly, `--apply`, installed and enabled
-#   by `cloud-cell-bringup.sh --check` on a systemd cell. Arming is an OWNER decision (#1678 is the
-#   general rule: deletion tools ship dry-run and arming is a dated, reversible owner step). This
-#   feature was explicitly instructed to run unattended, so the unit is armed and the arming is
-#   recorded in the unit file itself, not implied by a default.
+# SCHEDULING — ONE installer, TWO schedulers (agent-infra#2048)
+#   scripts/install-disk-reaper-schedule.sh installs this pass on BOTH platforms: a systemd timer on a
+#   cell (templates/systemd/eldato-disk-reaper.{service,timer}, hourly, installed and enabled by
+#   `cloud-cell-bringup.sh --check`) and a launchd job on a Mac
+#   (templates/launchd/com.eldato.disk-reaper.plist.tmpl, hourly, installed by pi-bootstrap/setup.sh).
+#   Same entry point, same flags, same pass record; only the scheduler differs, plus Darwin's
+#   binary-resolution seam (a launchd-spawned `bash` cannot read a repo under ~/Documents, so the Mac
+#   job starts an interpreter that can and hands it THIS file on stdin — TCC is per-binary, #427).
+#   Arming is an OWNER decision (#1678 is the general rule: deletion tools ship dry-run and arming is a
+#   dated, reversible owner step). The installer therefore ships REPORT-ONLY and takes `--apply`
+#   explicitly; the flag lands in the installed unit/plist, never in an environment default. The cell
+#   was explicitly instructed to run unattended, so its bring-up passes `--apply`.
 #
 # STATUS — the supervisor's `status` verb reads this pass record (`--print-status` prints it):
 #   $STATE_DIR/disk-reaper.status   key=value, written ATOMICALLY at the end of every pass

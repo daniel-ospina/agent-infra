@@ -6,7 +6,7 @@ doc_status: live
 subjects.team: organisation-design-team
 created: 2026-10-18
 aboutSubjects: organisation-design-team
-aboutObjects: agent-infra, issue-2032, disk-reclaim, uv-cache, lane-venvs, worktrees, systemd
+aboutObjects: agent-infra, issue-2032, issue-2048, disk-reclaim, uv-cache, lane-venvs, worktrees, systemd, launchd, macos
 ---
 
 # Disk reaper (#2032)
@@ -127,26 +127,63 @@ that row. Unmerged heads keep the blanket floor, where age still separates a sta
 scratch checkout from work in progress. Setting it equal to `REAP_WT_AGED_DAYS`
 restores the pre-exemption behaviour.
 
-## Scheduling — installed by the bring-up, armed by owner instruction
+## Scheduling — ONE install verb, TWO schedulers (#2032, #2048)
 
-`templates/systemd/eldato-disk-reaper.{service,timer}` — hourly
-(`OnCalendar=hourly`, `Persistent=true`), installed and enabled by
-`cloud-cell-bringup.sh --check` through
-`scripts/install-disk-reaper-timer.sh` (idempotent: a second install is a no-op).
-The installer tries a **system unit** via passwordless sudo, then a **user unit**,
-and fails loudly when neither is available — an unscheduled reaper is the false PASS
-this feature exists to remove.
+`scripts/install-disk-reaper-schedule.sh` installs the pass on **both** platforms the fleet runs on.
+It is one verb because the fleet is one system: a Mac and a cell differ in *what* wakes the pass, not
+in what the pass is.
 
-**Arming.** The repo's general rule (#1678, owner ruling 2026-10-11) is that
-deletion tools ship dry-run and arming is a separate, dated, reversible owner step.
-This feature was explicitly instructed to run unattended on the cell, so the unit's
-`ExecStart` carries `--apply`; the arming is visible in the installed file, not
-hidden in an environment default. Re-run the installer with `--dry-run` to install a
-report-only unit.
+| platform | artifact | installed by | interval |
+|---|---|---|---|
+| Linux cell | `templates/systemd/eldato-disk-reaper.{service,timer}` → `eldato-disk-reaper.timer` | `cloud-cell-bringup.sh --check` (which passes `--apply`) | hourly, `Persistent=true` |
+| macOS | `templates/launchd/com.eldato.disk-reaper.plist.tmpl` → `~/Library/LaunchAgents/com.eldato.disk-reaper.plist` | `pi-bootstrap/setup.sh` on Darwin | hourly, `StartInterval=3600`, `RunAtLoad` |
 
-The timer's environment is rendered from this box (`HOME`, `PATH`, repos that git
-confirms exist), so the pass never depends on a login shell. The venv and worktree
-classes need a repo; a pass with none **fails closed** rather than scanning nothing.
+Both run **the same entry point with the same flags** (`disk-reaper.sh` + one mode flag). The only
+other platform difference is the *binary-resolution seam*: a launchd-spawned `bash` cannot read a
+script, or a repo, under `~/Documents` (TCC is per-binary — #427, and the control experiment is in
+#1095), so the Darwin job starts the checkout's own interpreter on the farmed launcher
+`pi-reap-worktrees-launchd.py`, which hands **the same pass file** to bash on stdin. Without it the
+Mac's venv and worktree classes would fail closed on every pass.
+
+The macOS template is named `*.plist.tmpl` on purpose: `install-launchd.sh` renders
+`templates/launchd/*.plist`, and this job needs machine state that installer does not carry (the pass
+path, the mode flag, the state dir, the repos). The suffix keeps the job out of that glob, so it
+cannot be bootstrapped half-rendered with a literal placeholder as its argument — **one installer owns
+each job**.
+
+Idempotency: a second install compares the rendered artifact byte for byte and changes nothing
+(systemd additionally `daemon-reload`s, which is free). An unscheduled box is a **FAIL the bring-up
+reports** — `--status` exits 1, and on the Mac `pi-bootstrap/setup.sh` finishes with a non-zero exit
+naming the remedy. A box with neither scheduler fails loudly with the remedy; a scheduled-but-never-run
+reaper is exactly the false PASS this feature removes.
+
+### Arming is a separate, visible step (#1678, owner ruling 2026-10-11)
+
+The installer **ships report-only**: with no mode flag the installed job carries the pass's dry-run
+flag, and `--status` reports `armed=dry-run`. `--apply` installs the armed job, and the flag lands
+*inside* the unit/plist, so the answer is readable from the scheduled artifact — never from an
+environment default, and never inferred from the command that built it. Re-running with `--dry-run`
+puts the report-only mode back: reversible, one copy, nothing to drift.
+
+The cell's bring-up passes `--apply` **explicitly** (that feature was instructed to run unattended, and
+the arming is now one visible line in `cloud-cell-bringup.sh` plus the `ExecStart` it renders). A Mac
+ships report-only until the owner arms it.
+
+### A changed pass reloads its job (#1738)
+
+An edit to a script a scheduled job runs is silent until that job is reloaded — the loaded job keeps
+the program and environment it was bootstrapped with, which is how an armed reaper becomes inert while
+still reporting itself installed. So the installer stamps the pass's **SHA-256** in
+`$DISK_REAPER_STATE_DIR/disk-reaper.schedule` and forces a reload when the bytes change, even when the
+unit text is byte-identical:
+
+```
+pass_changed=yes reload_reason=pass-changed     # launchd: bootout + bootstrap; systemd: daemon-reload + restart
+pass_changed=no  reload_reason=none             # a true no-op
+```
+
+`--status` prints `pass_sha=`, `pass_drift=in-sync|CHANGED since install|no-stamp` so a stale install
+is visible on the box instead of being inferred from a log.
 
 ## Status — the supervisor answers "did it succeed, and how much did it free"
 
@@ -168,6 +205,24 @@ from the record on macOS too.
 bytes, and prints a `⛔` line when the pass failed, is stale (older than
 `DISK_REAPER_STALE_SECONDS`, default 7200) or has never run. A failure in one class
 does not hide the others' reclaim — it names the class and its verdict.
+
+`install-disk-reaper-schedule.sh --status` answers the *scheduling* half in one vocabulary on both
+platforms, then prints that same record:
+
+```
+platform=darwin|linux        scheduler=launchd|systemd     job=<label|unit>
+installed=yes|no             enabled=enabled|disabled      active=active|inactive
+armed=apply|dry-run          interval_seconds=3600         next_run=<...>|unknown
+last_exit=<n>|unknown        pass=</path/to/disk-reaper.sh>
+pass_sha=<...>               pass_drift=in-sync|CHANGED since install
+--- pass record ---
+  status=ok|stale|failed|never  mode=apply|dry-run  freed_mb=<n>  ...
+pass_status_rc=0|3
+```
+
+Exit codes: `0` scheduled and loaded · `1` not scheduled (the bring-up's FAIL). Whether the last pass
+was *clean* is reported in `pass_status_rc` and the record, **not** folded into this verb's exit code:
+a fresh box whose first pass has not fired yet is scheduled and healthy at the scheduling question.
 
 `disk-reaper.sh --print-status` prints the same record; exit 0 ok, 3
 failed/stale/never, 2 usage.
@@ -197,10 +252,25 @@ failed/stale/never, 2 usage.
 | T9 | a pass that **loses** the lock never releases the live owner's lock |
 | T10 | an `--only` list naming nothing is refused (never a healthy no-op) |
 | T11 | a dry run records 0 bytes freed (it removed nothing) |
-| T12 | the installer's `--dry-run` changes nothing; a set-but-missing `$DISK_REAPER` is refused |
+| T12 | the installer's `--preview` changes nothing; a set-but-missing `$DISK_REAPER` is refused |
 | T13 | the bounded-execution resolution ORDER is pinned (`timeout` -> `gtimeout` -> internal watchdog) with a PATH holding only the case's own stub (#2046) |
 | T14 | a host with neither binary still **classifies** (candidates found, rc=5) and names the fallback; a stub `timeout` on PATH is preferred, and then the report gains no provenance line (#2046) |
 | T15 | a missing `scripts/lib/bounded.sh`, or an unusable `TB_TIMEOUT_BIN`, is a **refusal at startup** (exit 3, no per-class line, no pass record) — never per-class `fail-closed` (#2046) |
+
+`scripts/install-disk-reaper-schedule.test.sh` — 120 assertions, its own `run-bash-shards.sh` shard —
+owns the SCHEDULE (`disk-reaper.test.sh` owns the pass):
+
+| | |
+|---|---|
+| T1 | one verb, two schedulers: both backends are rendered in one run and their **mode flags are compared**, so "same flags" is checked, not claimed |
+| T2 | idempotent on both — a second install is a no-op **and reloads nothing** (a bootstrap per bring-up would re-run the pass) |
+| T3 | report-only by default; `--apply` arms; `--status` reads the arming off the **installed** artifact; `--dry-run` reverts |
+| T4 | a changed pass reloads its job (#1738) on both backends, with `reload_reason=pass-changed` |
+| T5 | one status vocabulary: the `key=` set is identical on both platforms and the **pass record block is byte-identical** |
+| T6 | every impossible state is a loud refusal: no scheduler, temp HOME on Darwin (#446), missing pass, unresolved placeholder, malformed plist |
+| T7 | the Mac does not get a second pass: the job's target is the pass, no per-class script is named, and the `*.plist.tmpl` suffix keeps the job out of `install-launchd.sh`'s glob |
+| T8 | `--uninstall` is reversible and removes the stamp; `--status` then exits 1 |
+| T9 | static pins: every `rm -rf` in the installer removes only a mktemp dir it made, and the shipped default is the report-only flag |
 
 T9, T10 and T12 were each red on the build that preceded the fresh-context review
 that found them.
@@ -213,9 +283,13 @@ that found them.
   under a size bound, because a venv hardlinks into it.
 * **Removing branches** — `git worktree remove` deletes checkouts; branch refs are
   never deleted by any class.
-* **A macOS schedule** — Macs keep their existing launchd jobs
-  (`com.tortoise.worktree-reaper`, `com.eldato.pi-cache-reap`); this entry point and
-  its timer are the **cell** answer, which is where the measured exhaustion happened.
+* **The per-class macOS jobs** — `com.eldato.pi-cache-reap` (the `uv` class) and
+  `com.tortoise.worktree-reaper` (the `worktree` class) are **RETIRED** in favour of the
+  consolidated job, which runs the same owners through this pass (#2048). Each ran the same
+  owner script, so no delete rule changed — only how many clocks ran it, and how many report
+  formats existed. `com.tortoise.branch-reaper` (local branch refs) and
+  `com.eldato.pi-session-reaper` (idle pi processes) are **not** disk-sink classes and keep
+  their own jobs: one owner per class, and no second implementation of any of them.
 
 ## Measured evidence (2026-10-18, cell-3, this box)
 
