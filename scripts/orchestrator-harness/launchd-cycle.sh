@@ -369,6 +369,15 @@ lc_start() {
   local label="$1" plist="$2" diag diag2
   lc_guard_mutate "$label" "$plist" || return 1
   lc_enable "$label"
+
+  # ⛔ THE ENABLE IS VERIFIED, NOT ASSUMED (review finding: the README claimed this read-back and the code
+  # only used it in a failure diagnostic). A DEFINITE `disabled` here means the override did not clear, so
+  # the load would either fail or — worse — succeed into a state the next boot loses. Anything we cannot
+  # read is a WARNING and the bootstrap decides: an unknown must not become a false block either.
+  case "$(lc_disable_state "$label")" in
+    disabled) lc_err "❌ refusing to load $label: the persistent Disabled override still reads 'disabled' after 'launchctl enable', so loading it would not survive a reboot. Next: launchctl enable $(lc_domain)/$label; launchctl print-disabled $(lc_domain) | grep $label"; return 1 ;;
+    unknown)  printf '%s\n' "⚠️  could not read whether $label is disabled (launchctl print-disabled gave no answer) — continuing; the bootstrap below is the proof" >&2 ;;
+  esac
   # A job that is still loaded cannot be bootstrapped again ("service already loaded"), so the bootout
   # belongs to the START, not to a separate restart step — and a removal that FAILS is fatal here:
   # carrying on would bootstrap over a job we could not clear, then fall through to `load`, and the
@@ -538,7 +547,7 @@ lc_restart() {
   if [ -z "$pid" ]; then
     lock="$(lc_foreign_controller "$O")"
     if [ -n "$lock" ]; then
-      lc_err "❌ refusing to start $label: a controller started OUTSIDE launchd already holds $O/.orch.lock (pid $lock), so launchd's copy would exit at once and KeepAlive would relaunch it forever. Next: stop it (pkill -f "[b]ash $O/orch-loop.sh", then verify with pgrep -fl '[o]rch-loop' and only then rm -f $O/.orch.lock), then re-run"
+      lc_err "❌ refusing to start $label: a controller started OUTSIDE launchd already holds $O/.orch.lock (pid $lock), so launchd's copy would exit at once and KeepAlive would relaunch it forever. Next: stop it (pkill -f \"[b]ash $O/orch-loop.sh\", then verify with pgrep -fl '[o]rch-loop' and only then rm -f $O/.orch.lock), then re-run"
       return 1
     fi
   fi
@@ -607,7 +616,7 @@ lc_ensure() {
   if [ -z "$pid" ]; then
     lock="$(lc_foreign_controller "$O")"
     if [ -n "$lock" ]; then
-      lc_err "❌ refusing to start $label: a controller started OUTSIDE launchd already holds $O/.orch.lock (pid $lock), so launchd's copy would exit at once and KeepAlive would relaunch it forever. Next: stop it (pkill -f "[b]ash $O/orch-loop.sh", then verify with pgrep -fl '[o]rch-loop' and only then rm -f $O/.orch.lock), then re-run"
+      lc_err "❌ refusing to start $label: a controller started OUTSIDE launchd already holds $O/.orch.lock (pid $lock), so launchd's copy would exit at once and KeepAlive would relaunch it forever. Next: stop it (pkill -f \"[b]ash $O/orch-loop.sh\", then verify with pgrep -fl '[o]rch-loop' and only then rm -f $O/.orch.lock), then re-run"
       return 1
     fi
   fi

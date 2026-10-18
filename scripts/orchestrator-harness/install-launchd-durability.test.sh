@@ -505,6 +505,18 @@ out="$( . "$LIB"; lc_restart "$LABEL" "$T/o/x.plist" "$T/o" 2 2>&1 )"; rc=$?
 if [ "$rc" -ne 0 ]; then ok "a foreign lock holder makes the start REFUSE (non-zero)"; else bad "it started anyway"; fi
 assert_contains "$out" "$T/o/.orch.lock" "the refusal names the lock and its pid"
 assert_not_contains "$(calls)" "bootstrap" "nothing was bootstrapped over the foreign controller"
+# ⛔ AND THE REMEDY IT PRINTS MUST BE THE SCOPED, QUOTED ONE (review finding): the message is a
+# DOUBLE-QUOTED string, so an unescaped `pkill -f "[b]ash …"` reaches the operator as
+# `pkill -f [b]ash /O/orch-loop.sh` — where `[b]ash` is a separate ERE matching EVERY bash process on the
+# box (measured: 102). That is worse than the unscoped line it replaced, and nothing asserted the form.
+assert_contains "$out" 'pkill -f "[b]ash'  "the printed remedy keeps the QUOTED scoped pattern"
+assert_not_contains "$out" "pkill -f [b]ash" "…and never prints the bare ERE that matches every shell"
+# the same message is reachable from lc_ensure (the other start path)
+fresh
+printf '%s\n' "$$" > "$T/o/.orch.lock"
+out="$( . "$LIB"; lc_ensure "$LABEL" "$T/o/x.plist" "$T/o" 1 2 2>&1 )"; rc=$?
+assert_contains "$out" 'pkill -f "[b]ash'  "the lc_ensure refusal keeps the quoted scoped pattern too"
+rm -f "$T/o/.orch.lock"
 rm -f "$T/o/.orch.lock"
 
 echo "-- D5. the staleness bound tracks the CELL's cycle, not a constant"
@@ -1088,6 +1100,7 @@ out="$( cd "$T/sandbox2" && env -u ELDATO_ALLOW_TEST_HOME HOME="$T/sandbox2" PAT
   bash -c '. "$1"; lc_guard_mutate "$2" "$3"' _ "$LIB" "$LABEL" "$T/o/x.plist" 2>&1 )"; rc=$?
 if [ "$rc" -ne 0 ]; then ok "a blank NFSHomeDirectory REFUSES even with cwd=\$HOME (non-zero)"; else bad "a blank NFSHomeDirectory became 'the real home' and the guard passed"; fi
 assert_contains "$out" "real home" "…and the refusal is the HOME guard"
+assert_contains "$out" "could not be read" "…from the ACCOUNT read (the lc_real_home layer, not only the belt that rejects an EMPTY account home)"
 assert_not_contains "$(calls)" "bootout" "…and nothing was removed"
 
 # ── L. a FUTURE-dated heartbeat must not poison the start-proof baseline ─────────────────────────
@@ -1116,6 +1129,23 @@ assert_contains "$out" "and the heartbeat advanced" "…and the assertion really
 assert_not_contains "$out" "abcs" "the diagnostic does not quote the garbage value back as a duration"
 
 
+
+# ── N3. `lc_ensure` must not score an unreadable read as "not loaded" ───────────────────────────
+# This is the read the whole property starts with: if it fails, "already running and current" is
+# unproven, and treating it as "not loaded" makes `--start` MUTATE a healthy controller on one transient
+# EIO. The mutant `pid="$(lc_pid "$label")"` survived the suite until this case existed.
+echo "-- N3. an unreadable read at lc_ensure refuses instead of starting"
+fresh "$(( $(date +%s) - 5 ))"
+export FAKE_PLIST="$T/o/x.plist"
+( . "$LIB"; lc_start "$LABEL" "$T/o/x.plist" >/dev/null 2>&1 )
+: > "$FAKE_STATE/printcalls"
+export FAKE_PRINT_FAIL_ON=2          # 1 = the guard's read, 2 = lc_ensure's own read
+: > "$FAKE_LOG"
+out="$( . "$LIB"; LC_SETTLE=1 lc_ensure "$LABEL" "$T/o/x.plist" "$T/o" 0 2 2>&1 )"; rc=$?
+unset FAKE_PRINT_FAIL_ON
+if [ "$rc" -ne 0 ]; then ok "an unreadable lc_ensure read exits NON-ZERO"; else bad "an unreadable read was scored as 'not loaded' and the start went ahead"; fi
+assert_contains "$out" "could not be read" "…and names the failed read"
+assert_not_contains "$(calls)" "bootstrap" "…and NOTHING was mutated (no bootstrap over a live job)"
 
 # ── O. the last empty-is-falsy traps ─────────────────────────────────────────────────────────────
 echo "-- O. a SILENT unreadable read-back, a FIFO lock, hostile LC_HB_STALE, a symlinked plist"

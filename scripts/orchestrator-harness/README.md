@@ -1011,7 +1011,7 @@ names where its exclusion actually lives; there is no single file that says "the
 
 ### 6.5.6 The controller must be un-removable by a routine install
 
-**MUST.** `install.sh` must **enable and load** the job (`launchctl enable` → `bootout` →
+**MUST.** `install.sh --start` / `--restart` must **enable and load** the job (`launchctl enable` → `bootout` →
 `bootstrap`, falling back to legacy `load`, and saying which path ran), **assert** the outcome (the
 label loaded with a pid, and the heartbeat file advancing within ~30 s), and exit **non-zero** if
 either fails. A **watchdog** must restore a REMOVED service: `KeepAlive` relaunches a job that EXITS
