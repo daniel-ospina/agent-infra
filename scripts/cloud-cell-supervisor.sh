@@ -1653,14 +1653,13 @@ cmd_status() {
   # "did the last unattended run succeed, and how much did it free" — a failed or STALE pass is
   # therefore a ⛔ line here, never an absence that reads like health. Disk exhaustion is the second
   # reason cells stopped working: at ~97% a controller still beats and every dispatch is refused.
-  local _dr _drs _drc _dst _det
+  local _dr _drs _drc _dst _det cand
   _dr=""
   for cand in "${DISK_REAPER:-}" \
               "${HOME:-}/.pi/agent/scripts/disk-reaper.sh" \
               "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/disk-reaper.sh"; do
     [ -n "$cand" ] && [ -f "$cand" ] && { _dr="$cand"; break; }
   done
-  unset cand
   if [ -z "$_dr" ]; then
     say "⛔ DISK REAPER NOT INSTALLED — no disk-reaper.sh found (\$DISK_REAPER, \$HOME/.pi/agent/scripts, beside this script); the uv caches, dead lane venvs and merged worktrees are unbounded"
   else

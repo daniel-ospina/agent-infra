@@ -187,8 +187,22 @@ class failed closed), and the pass record carried `freed_mb=233`,
 ⛔ **Expect `verdict_uv=fail-closed` on a busy cell.** The cache owner preserves the
 whole cache while any `uv` process is live (it cannot know what that process is
 resolving against — #1987). Lanes run `uv run pytest` continuously, so the bound is
-enforced in the gaps between lanes, not on every hourly tick. The class-1 bound and
-its byte accounting are proven by `disk-reaper.test.sh` T4 and T7 on a real cache.
+enforced in the gaps between lanes, not on every hourly tick.
+
+The uv class then ran in a gap, and it is the clearest evidence for the accounting
+rule in this document:
+
+| | |
+|---|---|
+| uv cache apparent size | 5761 MB → **1 MB** (prune + escalation under the 2048 MB bound) |
+| `df` actually gained | **+74 MB** (`9860 MB` → `9936 MB` free) |
+| verdict | `fail-closed` — the owner **refuses to claim** a 5761 MB reclaim when the filesystem gained under 50% of it |
+
+That gap is the hardlink rule: the cache's blocks were already owned by the live lane
+venvs, so emptying the cache freed almost nothing real (and the next `uv sync` will
+copy rather than hardlink). A reaper that reported the `du` number would have claimed
+5.7 GB for 74 MB. The class-1 bound itself is proven with real bytes by
+`disk-reaper.test.sh` T4/T7 on a fixture cache that has no hardlinks.
 
 Safety on live estate, both passes: `live-process` and `live-cwd` rows were preserved
 (including the running controller's own harness pin and every active lane worktree);
