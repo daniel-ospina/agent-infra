@@ -363,7 +363,7 @@ jobs:
         # (#646). Its own step so one verdict cannot suppress the other.
         run: python3.12 tools/fleet/outcome_canary.test.py
       - name: Outcome-canary mutation evidence (zero-dep)
-        # The suite above is only a pin if it can FAIL. Each of the 32 mutations reintroduces a
+        # The suite above is only a pin if it can FAIL. Each of the 37 mutations reintroduces a
         # defect the canary exists to catch — a live pid graded as a cycling controller, a refused
         # dispatch forgiven, an UNREADABLE pool read as readable, a gh refusal read as zero PRs, a
         # deny-list check-result rule, an alert on every poll, no re-arm after recovery, a respawn on
@@ -384,7 +384,10 @@ jobs:
         # collected and never shown, an unguarded outbox write, REST's lowercase mergeability state
         # left un-normalised (landers grading nothing), an unknown mergeability counted as graded, an
         # incomplete header blessed as a genuinely empty pool, a fixture _expect naming a check that
-        # does not exist — into a TEMP copy, and requires its paired test to go
+        # does not exist, the age of a pool read parsed and never read (a frozen EMPTY read passing as
+        # current), a future-dated log mtime clamped to "0s ago", a fixture with no _expect asserting
+        # nothing, a truncated open-PR page treated as the whole population — into a TEMP copy, and
+        # requires its paired test to go
         # RED. A mutation that survives is reported as a suite failure.
         run: python3.12 tools/fleet/outcome_canary.test.py --mutations
       - name: Sequence-enforcer suite (incl. joint checker→enforcer test)

@@ -190,6 +190,10 @@ class Cfg(object):
     """Everything a predicate may consult. Immutable in practice; fixtures may override any field."""
 
     DEFAULTS = {
+        # how old a POOL READ may be before it stops being evidence. The refresh runs every cycle
+        # (~240s); 30 min tolerates several missed cycles while still catching a frozen refresh
+        # overnight. The harness's precedent for an equivalent bound is GH_LIMIT_STALE_S=900.
+        "queue_stale_s": 5400.0,
         # How long a "recent" outcome may be before it is stale. 720s = 3 cycles of a 240s cell.
         "window_s": 720.0,
         # PRs are coarser than cycles: a healthy fleet at night can legitimately go an hour without
@@ -244,6 +248,10 @@ class Cfg(object):
                   "respawn_timeout_s"):
             setattr(self, k, float(getattr(self, k)))
         self.pool_threshold = int(self.pool_threshold)
+
+    # 90 minutes: the harness's own token formatter switches from minutes to hours at 5400s, so that is
+    # the repo's existing boundary for "this read is old enough to matter" — not a number invented here.
+    queue_stale_s = 5400.0
 
     def controller_paths(self):
         """The controller script(s) for THIS cell: `$O/orch-loop.sh`, plus the harness copy if a
@@ -772,6 +780,16 @@ def check_queue_readable(f, c):
     # the shape, the evidence carries the pool count and the queue token, and a human can tell the
     # two apart in one read. (Silence is not the safe default here — a blind refresh looks identical.)
     pool = tok.get("pool")
+    stale = _queue_stale(f, c)
+    if stale is not None and tok["kind"] == "EMPTY":
+        # ⛔ EMPTINESS IS THE ONE CLAIM A FROZEN READ CANNOT SUPPORT. "Nothing to do" read from a
+        # six-hour-old record is the state record acting as a stale flag — the exact failure the
+        # token's age suffix exists to prevent. A stale READ(n) still supports "readable, n
+        # candidates"; it is reported as evidence and does not flip the verdict.
+        return V("queue_readable", INCONCLUSIVE, "STATE_FROZEN", _queue_frozen_txt(f, stale),
+                 "the pool was read as EMPTY %s ago (limit %.0fs), so 'the pool is empty' is a "
+                 "claim about then, not now. Not green." % (
+                     _age_txt(stale["age_s"]), c.queue_stale_s))
     if tok["kind"] == "EMPTY" and backlog is None:
         return V("queue_readable", INCONCLUSIVE, "HEADER_INCOMPLETE",
                  "header: %s has no backlog= field, so 'empty' cannot be checked against it"
@@ -789,6 +807,49 @@ def check_queue_readable(f, c):
     return V("queue_readable", PASS, "READABLE",
              "header: %s\npool token: %s\n%s\nbacklog=%s"
              % (hdr.get("raw"), raw_tok, state_txt, backlog))
+
+
+def _queue_age(f, c):
+    """The age of THIS pool reading, and where it came from.
+
+    Two independent clocks carry it, and BOTH are read rather than trusting the header alone: the
+    token's own `(57m)` suffix (which the refresh appends for exactly this purpose) and the
+    `state/queue-state` epoch. The OLDER of the two is the honest age — a fresh token beside a state
+    file nobody has rewritten for hours means the writing side is frozen, not that the read is new.
+    """
+    events = f.get("log_events") or {}
+    hdr = newest(events.get("headers"))
+    tok_age = parse_queue_token(hdr.get("queue_token") or "").get("token_age_s") if hdr else None
+    qs = f.get("queue_state") or {}
+    qs_age = qs.get("age_s") if qs.get("ok") else None
+    ages = [(a, "token") for a in [tok_age] if isinstance(a, (int, float))]
+    ages += [(a, "state/queue-state") for a in [qs_age] if isinstance(a, (int, float))]
+    if not ages:
+        return None, None
+    age, src = max(ages, key=lambda t: t[0])
+    return age, src
+
+
+def _queue_stale(f, c):
+    """{"age_s", "source"} when the pool reading is older than the limit, else None."""
+    age, src = _queue_age(f, c)
+    limit = getattr(c, "queue_stale_s", 1800.0) or 1800.0
+    if age is None or age <= limit:
+        return None
+    return {"age_s": age, "source": src, "limit_s": limit}
+
+
+def _queue_frozen_txt(f, stale):
+    events = f.get("log_events") or {}
+    hdr = newest(events.get("headers"))
+    lines = ["pool read age: %s (source: %s, limit %.0fs)"
+             % (_age_txt(stale["age_s"]), stale["source"], stale["limit_s"])]
+    if hdr:
+        lines.append("cycle header: %s" % hdr.get("raw"))
+    qs = f.get("queue_state") or {}
+    if qs.get("raw"):
+        lines.append("state/queue-state: %s (%s)" % (qs.get("raw"), _age_txt(qs.get("age_s"))))
+    return "\n".join(lines)
 
 
 def _queue_state_file_txt(f):
@@ -890,6 +951,14 @@ def check_work_dispatched(f, c):
     # `queue_readable` already refuses to grade it. Accepting the absence as zero here let
     # `work_dispatched` — "the one that matters most" — assert that a fleet's non-dispatch was
     # CORRECT on evidence the module had declared incomplete.
+    stale = _queue_stale(f, c)
+    if stale is not None and (pool_kind == "EMPTY" or backlog == 0):
+        # "Nothing to dispatch" is the CORRECT outcome only on a CURRENT read. A frozen read makes it
+        # unestablished, and this is the branch that would otherwise bless it.
+        return V("work_dispatched", INCONCLUSIVE, "STATE_FROZEN", _queue_frozen_txt(f, stale),
+                 "the pool was read as empty %s ago (limit %.0fs), so 'there was nothing to "
+                 "dispatch' is not established. Not green." % (
+                     _age_txt(stale["age_s"]), c.queue_stale_s))
     if pool_kind == "EMPTY" and backlog is None:
         return V("work_dispatched", INCONCLUSIVE, "HEADER_INCOMPLETE",
                  "queue=EMPTY but the header carries no `backlog=` field: %s" % hdr,
@@ -1162,6 +1231,17 @@ def check_landers(f, c):
         if pr.get("review_decision") not in (None, "", "APPROVED"):
             continue
         candidates.append(pr)
+
+    if gh.get("page_full"):
+        # HOISTED above the no-candidate branch: a truncated population is not a population, and
+        # "none of the PRs I saw is green" (or "the one I saw is armed") says nothing about the page
+        # that was never fetched.
+        return V("landers", INCONCLUSIVE, "PARTIAL_POPULATION",
+                 "open PRs: %d — POPULATION TRUNCATED at the gh page bound, so PRs beyond it were "
+                 "never read\n%s\n%s"
+                 % (len(prs), _gh_surface_txt(gh), _prs_brief(prs)),
+                 "the open-PR list came back full, so the population is TRUNCATED and 'every green "
+                 "PR has an armed lander' cannot be established over it. Not green.")
 
     if not candidates:
         if unprobed:
@@ -1915,7 +1995,13 @@ class Machine(object):
                "error": (out or "").strip()[-200:] or None}
         if mtime is not None:
             rec["exists"] = True
-            rec["age_s"] = max(0.0, time.time() - mtime)
+            # ⛔ A future mtime is UNKNOWN, not 0s-old. `max(0, ...)` turned a clock-skewed cell into
+            # the freshest possible log, so the "pid alive but the log stopped" state — the one that
+            # must fire — read PASS, and since absence is the only respawn trigger nothing was raised.
+            skew = time.time() - mtime
+            rec["age_s"] = (None if skew < -CLOCK_SKEW_TOLERANCE_S else max(0.0, skew))
+            if rec["age_s"] is None:
+                rec["error"] = "log mtime is %.0fs in the FUTURE (clock skew)" % (-skew)
             rec["mtime_iso"] = time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(mtime))
             return rec
         rc3, present = self.sh("test -e %s && echo YES || echo NO" % _q(self.log_path))
@@ -1951,9 +2037,13 @@ class Machine(object):
                      "error": (out or "").strip()[-200:] or "stat returned no epoch"}, [], "stat")
         now = time.time()
         tail_lines = tail.splitlines() if rc2 == 0 else []
+        skew = now - mtime
         return ({"path": path, "exists": True, "mtime": mtime,
                  "mtime_iso": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(mtime)),
-                 "age_s": max(0.0, now - mtime)}, tail_lines, None)
+                 # same rule as the events: a future mtime is UNKNOWN, never the freshest possible
+                 "age_s": (None if skew < -CLOCK_SKEW_TOLERANCE_S else max(0.0, skew)),
+                 "error": ("log mtime is %.0fs in the FUTURE (clock skew)" % (-skew)
+                           if skew < -CLOCK_SKEW_TOLERANCE_S else None)}, tail_lines, None)
 
     def read_file(self, path):
         rc, out = self.sh("cat %s 2>&1" % _q(path))
@@ -2244,6 +2334,10 @@ def _collect_rest(gh, repo, cfg, now, errors):
     out["unprobed"] = unprobed
     if detail_errors:
         out["detail_errors"] = detail_errors[:5]
+    if len(open_raw) >= 100:
+        # The page bound is a POPULATION bound, not a detail: a PR beyond page one is in neither
+        # `candidates` nor `unprobed`, so `landers` would speak for a population it never saw.
+        out["page_full"] = True
     out["ok"] = True
     return out
 
@@ -2259,6 +2353,7 @@ def _fill_counts(out, open_prs, merged, cfg, now):
     out["prs_created_in_window"] = len([t for t in created_ts if now - t <= win])
     out["last_created"] = _iso(max(created_ts)) if created_ts else None
     out["open_pr_count"] = len(open_prs)
+    out.setdefault("page_full", len(open_prs) >= 100)
 
 
 def _one_line(txt):
@@ -2401,6 +2496,10 @@ def run_static(paths, only=None):
         verdicts = evaluate(fx["facts"], cfg, only=only)
         expect = fx.get("_expect") or {}
         got = dict((v.name, v.status) for v in verdicts)
+        if not expect:
+            # An EMPTY assertion set is not "all zero assertions satisfied": a new fixture with a
+            # misspelt `_expects` key contributed no coverage while the runner printed success.
+            mism.append((path, "(fixture)", ">=1 expectation", "NO_EXPECT", None))
         for name, want in expect.items():
             if name not in got:
                 # ⛔ A fixture that names a check which does not exist asserts NOTHING, and the old
@@ -2481,6 +2580,8 @@ def build_parser():
     ap.add_argument("--mem-floor-mb", type=float, default=None)
     ap.add_argument("--disk-floor-gb", type=float, default=None)
     ap.add_argument("--pool-threshold", type=int, default=None)
+    ap.add_argument("--queue-stale-min", type=float, default=None,
+                    help="how old an EMPTY pool read may be before it is not evidence (default 90)")
     ap.add_argument("--controller-ws", default=None, help="controller workspace UUID (live send)")
     ap.add_argument("--controller-name", default=None, help="substring of the controller workspace NAME")
     ap.add_argument("--state", dest="state_path", default=None, help="notification state file/dir")
@@ -2530,6 +2631,8 @@ def cfg_from_args(a):
         kw["disk_floor_gb"] = a.disk_floor_gb
     if a.pool_threshold is not None:
         kw["pool_threshold"] = a.pool_threshold
+    if getattr(a, "queue_stale_min", None) is not None:
+        kw["queue_stale_s"] = a.queue_stale_min * 60.0
     if a.capture_dir and not a.state_path:
         # ⛔ A PREVIEW must not silence the real alert. `--capture-dir` records deliveries, so pointing
         # it at the default state file marks a failure "notified" that nobody was ever told about —

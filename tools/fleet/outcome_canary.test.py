@@ -40,6 +40,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -866,6 +867,123 @@ def test_an_ambiguous_send_is_not_blind_retried_but_a_refusal_is():
 
 
 @test
+def test_a_FROZEN_pool_read_is_not_a_current_one():
+    """The refresh appends the age to the token for exactly one reason: "a value frozen by a dead
+    refresh cannot pass as a fresh one". The age was parsed and never read, so `queue=EMPTY(6h)` with
+    backlog=0 PASSed both queue checks and the whole run exited 0 on a six-hour-old reading."""
+    m = load()
+    d = fx("healthy")
+    d["facts"]["log_events"]["headers"] = [{
+        "raw": "=== Sun Oct 18 07:47:44 EST 2026 load=12 lanes=1 backlog=0 queue=EMPTY(6h) ===",
+        "age_s": 60, "ts": 0, "backlog": 0, "queue_token": "EMPTY(6h)"}]
+    d["facts"]["log_events"]["dispatch_ok"] = []
+    d["facts"]["queue_state"] = {"path": "q", "ok": True, "raw": "EMPTY",
+                                 "age_s": 6 * 3600.0}
+    cfg = m.cfg_from_dict(d["config"])
+    got = dict((v.name, v) for v in m.evaluate(d["facts"], cfg))
+    assert (got["queue_readable"].status, got["queue_readable"].variant) == (
+        m.INCONCLUSIVE, "STATE_FROZEN"), (got["queue_readable"].status,
+                                          got["queue_readable"].variant)
+    assert got["work_dispatched"].status == m.INCONCLUSIVE, (
+        got["work_dispatched"].status, got["work_dispatched"].variant)
+    assert got["work_dispatched"].variant == "STATE_FROZEN", got["work_dispatched"].variant
+    # a stale EMPTY read must not let the whole run report green
+    assert m.exit_code(list(got.values())) in (1, 2), m.exit_code(list(got.values()))
+
+    # …but a stale NON-EMPTY read still supports "readable, n candidates": dispatch may be flowing on
+    # it, and failing that would cry wolf on a healthy box (measured here: READ(223)(57m) while two
+    # issues had been dispatched 101s earlier).
+    d3 = fx("healthy")
+    d3["facts"]["log_events"]["headers"] = [{
+        "raw": "=== Sun Oct 18 07:47:44 EST 2026 load=12 lanes=1 backlog=33 queue=READ(223)(6h) ===",
+        "age_s": 60, "ts": 0, "backlog": 33, "queue_token": "READ(223)(6h)"}]
+    d3["facts"]["queue_state"] = {"path": "q", "ok": True, "raw": "READ(223)", "age_s": 6 * 3600.0}
+    cfg3 = m.cfg_from_dict(d3["config"])
+    got3 = dict((v.name, v) for v in m.evaluate(d3["facts"], cfg3))
+    assert got3["queue_readable"].status == m.PASS, (got3["queue_readable"].variant,
+                                                     got3["queue_readable"].evidence)
+
+    # a CURRENT read of the same shape is still the documented PASS
+    d2 = fx("healthy")
+    d2["facts"]["log_events"]["headers"] = [{
+        "raw": "=== Sun Oct 18 07:47:44 EST 2026 load=12 lanes=1 backlog=0 queue=EMPTY(1m) ===",
+        "age_s": 60, "ts": 0, "backlog": 0, "queue_token": "EMPTY(1m)"}]
+    d2["facts"]["queue_state"] = {"path": "q", "ok": True, "raw": "EMPTY", "age_s": 60.0}
+    cfg2 = m.cfg_from_dict(d2["config"])
+    got2 = dict((v.name, v) for v in m.evaluate(d2["facts"], cfg2))
+    assert got2["queue_readable"].status == m.PASS, got2["queue_readable"].variant
+
+
+@test
+def test_a_future_dated_log_mtime_is_UNKNOWN_not_the_freshest_possible():
+    """`max(0.0, now - mtime)` turned a clock-skewed cell's log into the freshest possible one, so
+    "pid alive but the log stopped" — the state that must fire — read PASS, and since absence is the
+    only respawn trigger nothing was raised."""
+    m = load()
+
+    class Fwd(object):
+        remote = False
+        box = "local"
+        log_path = "/x/log"
+        tail_lines = 10
+
+        def sh(self, cmd, timeout=None):
+            if cmd.startswith("stat"):
+                # 30 minutes in the FUTURE
+                return 0, "%d\n" % (time.time() + 1800)
+            if cmd.startswith("tail"):
+                return 0, ""
+            return 0, "YES"
+
+    log, lines, err = m.Machine.read_log(Fwd(), "/x/log")
+    assert log["exists"] is True and log["age_s"] is None, log
+    assert "FUTURE" in (log.get("error") or ""), log
+
+    facts = fx("healthy")["facts"]
+    facts["log"] = {"path": "/x/log", "exists": True, "age_s": None,
+                    "error": "log mtime is 1800s in the FUTURE (clock skew)"}
+    cfg = m.cfg_from_dict(fx("healthy")["config"])
+    v = [x for x in m.evaluate(facts, cfg) if x.name == "controller_cycling"][0]
+    assert (v.status, v.variant) == (m.INCONCLUSIVE, "LOG_UNREADABLE"), (v.status, v.variant)
+
+
+@test
+def test_a_fixture_with_no_expect_asserts_nothing_and_says_so():
+    """An EMPTY assertion set is not "all zero assertions satisfied": a new fixture with a misspelt
+    `_expects` key contributed no coverage while the runner printed success and exited 0."""
+    m = load()
+    tmp = tempfile.mkdtemp(prefix="oc-noexpect-")
+    try:
+        d = fx("healthy")
+        d.pop("_expect", None)
+        bad = os.path.join(tmp, "noexpect.json")
+        with open(bad, "w") as fh:
+            json.dump(d, fh)
+        rc, out, err = run_cli(["--static", "--fixture", bad, "--json"])
+        assert rc == 1, (rc, out[-300:])
+        j = json.loads(out)
+        assert j["mismatches"] and j["mismatches"][0]["got"] == "NO_EXPECT", j["mismatches"]
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@test
+def test_a_truncated_open_PR_population_is_not_a_population():
+    """A PR beyond page one is in neither `candidates` nor `unprobed`, so `landers` would speak for a
+    population it never saw. Only the per-PR probe bound used to be reported."""
+    m = load()
+    d = fx("healthy")
+    prs = [{"number": n, "merge_state_status": "BLOCKED", "checks_green": False,
+            "auto_armed": False, "draft": False, "probed": True} for n in range(1, 101)]
+    d["facts"]["github"]["open_prs"] = prs
+    d["facts"]["github"]["page_full"] = True
+    cfg = m.cfg_from_dict(d["config"])
+    v = [x for x in m.evaluate(d["facts"], cfg) if x.name == "landers"][0]
+    assert (v.status, v.variant) == (m.INCONCLUSIVE, "PARTIAL_POPULATION"), (v.status, v.variant)
+    assert "TRUNCATED" in v.evidence, v.evidence
+
+
+@test
 def test_landers_grades_REST_shaped_rows():
     """REST spells mergeability LOWERCASE ("clean"). Comparing it to "CLEAN" dropped every REST-probed
     PR from `candidates` while leaving probed=True, so it appeared in neither the candidates NOR the
@@ -1388,6 +1506,26 @@ MUTATIONS = [
     ("the census is not scoped to this cell's controller path",
      "        if paths and os.path.normpath(toks[1]) not in paths:", "        if False:",
      "test_the_census_is_scoped_to_THIS_cell_and_reports_what_it_rejected"),
+    # ── cycle-6 defects ──────────────────────────────────────────────────────────────
+    ("the age of the pool read is parsed and never read, so a frozen read passes as current",
+     "    if age is None or age <= limit:\n        return None",
+     "    if True:\n        return None",
+     "test_a_FROZEN_pool_read_is_not_a_current_one"),
+    ("a frozen read still lets work_dispatched bless 'nothing to dispatch'",
+     '        return V("work_dispatched", INCONCLUSIVE, "STATE_FROZEN", _queue_frozen_txt(f, stale),',
+     '        return V("work_dispatched", PASS, "IDLE_EMPTY_POOL", _queue_frozen_txt(f, stale),',
+     "test_a_FROZEN_pool_read_is_not_a_current_one"),
+    ("a future-dated log mtime is clamped to '0s ago'",
+     '                 "age_s": (None if skew < -CLOCK_SKEW_TOLERANCE_S else max(0.0, skew)),',
+     '                 "age_s": max(0.0, skew),',
+     "test_a_future_dated_log_mtime_is_UNKNOWN_not_the_freshest_possible"),
+    ("an empty _expect set asserts nothing and reports success",
+     '            mism.append((path, "(fixture)", ">=1 expectation", "NO_EXPECT", None))',
+     "            pass",
+     "test_a_fixture_with_no_expect_asserts_nothing_and_says_so"),
+    ("a truncated open-PR page is treated as the whole population",
+     '    if gh.get("page_full"):', "    if False:",
+     "test_a_truncated_open_PR_population_is_not_a_population"),
     # ── cycle-5 defects ──────────────────────────────────────────────────────────────
     ("REST's lowercase mergeability state is not normalised, so landers grades nothing",
      '        row["merge_state_status"] = (det.get("mergeable_state") or "").strip().upper()',

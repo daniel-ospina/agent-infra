@@ -136,7 +136,19 @@ reason and use the exit code + log for the signal.
   `--controller-ws`.
 - **Respawn is local-only.** `--box` evaluates a remote machine's outcomes; a controller on another
   machine is reported as `NOT ATTEMPTED (remote)` rather than pretended-restarted.
-- **`landers` never speaks for a PR it did not read.** The REST fallback stops probing at a bound
+- **A frozen pool read cannot establish EMPTINESS.** The refresh appends the reading's age to the
+  token precisely so a value frozen by a dead refresh cannot pass as current, and an `EMPTY(6h)` read
+  with `backlog=0` used to let both queue checks pass and the whole run exit 0. Now an `EMPTY` read
+  older than `--queue-stale-min` (default 90, the harness's own minutes-to-hours boundary) is
+  `INCONCLUSIVE / STATE_FROZEN` for `queue_readable` and `work_dispatched`. A stale **non-empty** read
+  still supports "readable, n candidates" — failing that would cry wolf on a box that is dispatching
+  from it.
+- **A future-dated log mtime is UNKNOWN, not the freshest possible.** `max(0, now - mtime)` made a
+  clock-skewed cell's log read as 0s old, so "the pid is alive but the log stopped" — the state that
+  must fire — read PASS.
+- **`landers` never speaks for a PR it did not read** — including a population truncated at the gh
+  page bound (a full page means PRs beyond it were never fetched) — and a fixture with no `_expect`
+  is a mismatch rather than a silently satisfied empty assertion set. The REST fallback stops probing at a bound
   (`rest_probe_max`, 25) and a failed check-runs call also leaves a PR unprobed. Once ANY unprobed
   non-draft PR exists the verdict is `INCONCLUSIVE / PARTIAL_POPULATION`, even when a probed PR is
   armed — a checked PR says nothing about the ones nobody looked at, and this is the check whose whole
@@ -187,8 +199,8 @@ shape changes, and it is pruned with the rest of its check.
 ## The suite
 
 ```bash
-python3 tools/fleet/outcome_canary.test.py              # 60 tests
-python3 tools/fleet/outcome_canary.test.py --mutations  # 32 mutations, each must go RED
+python3 tools/fleet/outcome_canary.test.py              # 64 tests
+python3 tools/fleet/outcome_canary.test.py --mutations  # 37 mutations, each must go RED
 ```
 
 The signal tests drive the **real CLI** end-to-end (`--live --facts … --capture-dir …`), so what is
