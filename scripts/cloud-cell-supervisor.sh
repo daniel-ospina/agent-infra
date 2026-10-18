@@ -157,7 +157,11 @@ OR="${OR:-}"
 #   O                  — the worker's log/state dir. A worker defaulting `$HOME/orchestrator` splits
 #                        the per-PR claim file from the controller's, which is how one head gets two
 #                        concurrent reviewers
-WORKER_ENV_NAMES="AI_REVIEW_GATE_KEY HOME O"
+#   PATH               — the gh-limit layer (#1988) lives FIRST on the controller's PATH, and the
+#                        sessions the controller spawns are created by a client holding THAT PATH, so
+#                        publishing the name is what puts the layer in front of every lane's and
+#                        worker's `gh` too. Without it only the controller would be serialised.
+WORKER_ENV_NAMES="AI_REVIEW_GATE_KEY HOME O PATH"
 
 say() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*"; }
 die() { say "FATAL: $*" >&2; exit 1; }
@@ -946,6 +950,34 @@ seed_and_stamp() {
     n=$((n + 1))
   done
   [ "$n" -gt 0 ] || die "no *.sh scripts in $HARNESS — nothing to seed into $O"
+  # ── the gh-limit layer (#1988) ────────────────────────────────────────────────────────────────
+  # Four boxes act as ONE GitHub account, so an unserialised, un-backoff'd box spends everyone's
+  # quota. The layer is a `gh` shim on the controller's PATH plus the ONE python helper the Mac
+  # adapter uses — same bytes, same backoff, so it cannot drift between the box with the REST
+  # adapter and the boxes without it. Seeded with the SAME stage-then-rename as the *.sh files: a
+  # running lane's `gh` may be executed at any moment, and a truncated shim would be a broken `gh`.
+  if [ -f "$HARNESS/gh-limit/gh" ] && [ -f "$HARNESS/gh-limit.py" ]; then
+    mkdir -p "$O/gh-limit" || die "cannot create $O/gh-limit"
+    seed_one() {  # <src> <dest>
+      local _src="$1" _dst="$2" _tmp="$O/.seed-$(basename "$2").$$"
+      cp -p "$_src" "$_tmp" || die "cannot stage $(basename "$_dst") into $O — free space ($0 prune)"
+      chmod +x "$_tmp"     || { rm -f "$_tmp"; die "cannot chmod $(basename "$_dst")"; }
+      mv -f "$_tmp" "$_dst" || { rm -f "$_tmp"; die "cannot install $_dst into $O"; }
+    }
+    seed_one "$HARNESS/gh-limit/gh" "$O/gh-limit/gh"
+    seed_one "$HARNESS/gh-limit.py" "$O/gh-limit.py"
+  else
+    # ⛔ MIRROR the stale pair away (the same rule the *.sh loop below applies). A `$O/gh-limit/gh` left
+    # by an earlier harness would stay on the controller PATH with its helper gone — a shim that can
+    # serialise nothing; the cell's documented fail-open (PATH's real gh, with a warning) is the correct
+    # state, not a half-installed layer.
+    if [ -e "$O/gh-limit/gh" ] || [ -e "$O/gh-limit.py" ]; then
+      rm -f "$O/gh-limit/gh" "$O/gh-limit.py" || die "cannot remove the stale gh-limit layer from $O"
+      rmdir "$O/gh-limit" 2>/dev/null || true
+      say "seed: removed the stale gh-limit layer — the harness no longer ships it"
+    fi
+    say "WARN: $HARNESS ships no gh-limit layer — this cell's gh calls will NOT be serialised or backed off (#1988)"
+  fi
   # ⛔ MIRROR, do not merely overlay. `orch-loop.sh`/`merge-one.sh` invoke workers BY NAME from $O, so a
   # script RENAMED upstream would leave its old copy live in $O and still invocable — the record would
   # describe the harness while the cell ran a worker the harness no longer ships.
@@ -1112,6 +1144,20 @@ cmd_check() {
     [ -f "$O/$w" ] || missing="$missing $w"
   done
   [ -z "$missing" ] || die "worker scripts missing from $O:$missing — run 'start' (it seeds $O) or: cp '$HARNESS'/*.sh '$O'/"
+  # ── the gh-limit layer (#1988): present, AND able to run ──────────────────────────────────────
+  # Presence alone is the false-green this file refuses everywhere else: a shim that cannot find the
+  # real gh exits 127 on EVERY call, which would stop merges altogether. So resolve `gh` through the
+  # very PATH the session will get and require it to answer.
+  if [ -f "$O/gh-limit/gh" ] && [ -f "$O/gh-limit.py" ]; then
+    # ⛔ `NO_WAIT` ON THE PROBE. Without it a box with one gh hanging in flight makes `check` wait up
+    # to the layer's 600 s lock budget — and `check` is the diagnostic an operator runs BECAUSE the
+    # box looks stuck. `gh --version` needs no lock at all, but the lock is taken before the child is
+    # classified (review round 9).
+    PATH="$O/gh-limit:$PATH" GH_LIMIT_NO_WAIT=1 GH_LIMIT_NO_WAIT_LOCK_S=2 gh --version >/dev/null 2>&1 \
+      || die "the gh-limit layer at $O/gh-limit cannot run gh — every gh call in the session would fail. Fix the layer or remove it before starting (a cell without it MERGES but is not serialised, #1988)."
+  else
+    say "WARN: no gh-limit layer in $O — this cell's gh calls are NOT serialised/backed off (#1988); run 'start' to seed it"
+  fi
 
   # ── which commit is this cell running? (agent-infra#1745) ────────────────────────────────────
   # Placed BEFORE the dispatch-provisioning probe: a tree off main's line can pass every later
@@ -1415,7 +1461,7 @@ cmd_start() {
   # into tmux's update-environment, so the sessions orch-loop.sh spawns copy the VALUES out of the
   # controller's environment. (Names, never values, on every tmux command line.) On a cold start
   # there is no server to publish into — the `new-session` just below creates it from this shell,
-  # which already holds the same three names — so publish_worker_env() only acts on an EXISTING one.
+  # which already holds every name in $WORKER_ENV_NAMES — so publish_worker_env() only acts on an EXISTING one.
   # Put any other tunable in $ENV_FILE rather than exporting it in an operator shell.
   # The session re-sources $ENV_FILE in ITS shell (same uncontrolled file). The `[ -f ]` guard keeps
   # an absent file from printing an open error, and `2>/dev/null` is GONE: suppressing it also hid
@@ -1445,7 +1491,7 @@ cmd_start() {
   # what the preflight's delivery claim is about; the publish itself dies on a failed `set-option`.
   publish_worker_env
   tmux new-session -d -s "$SESSION" -c "$HARNESS" \
-    "set -a; [ ! -f '$ENV_FILE' ] || . '$ENV_FILE'; set +a; HOME='$CELL_HOME' REPO='$REPO' O='$O' OR='$OR' SCOPE='$SCOPE' bash '$HARNESS/orch-loop.sh' 2>&1 | tee -a '$O/logs/controller.log'"
+    "set -a; [ ! -f '$ENV_FILE' ] || . '$ENV_FILE'; set +a; PATH='$O/gh-limit':\"\$PATH\" HOME='$CELL_HOME' REPO='$REPO' O='$O' OR='$OR' SCOPE='$SCOPE' bash '$HARNESS/orch-loop.sh' 2>&1 | tee -a '$O/logs/controller.log'"
   sleep 3
   if tmux has-session -t "$SESSION" 2>/dev/null; then
     say "controller started (tmux '$SESSION'), state=$O"

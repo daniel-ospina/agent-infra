@@ -62,6 +62,8 @@ Usage:
 from __future__ import annotations
 
 import argparse
+
+
 import importlib.util
 import json
 import os
@@ -71,6 +73,13 @@ import subprocess
 import sys
 import time
 from datetime import datetime, timezone
+# ⛔ THE LAYER MUST NOT SLEEP INSIDE THIS PROCESS (#1988). This script runs either synchronously
+# under `run_bounded` or DETACHED (`nohup … &`, reaped by its own lock), but every gh call it makes is
+# bounded at 180 s while the layer's first documented backoff is 60 s — an in-call wait would outlive
+# the call that asked for it, and the beat would report an unreadable surface instead of the
+# RATE-LIMITED verdict it can prove. NO_WAIT makes the layer record the limit and return at once, so
+# this process's own retry/report takes over. Inherited by every descendant (same bounded step).
+os.environ.setdefault("GH_LIMIT_NO_WAIT", "1")
 
 HOME = os.path.expanduser("~")
 HERE = os.path.dirname(os.path.realpath(__file__))
@@ -135,6 +144,11 @@ if _missing:
 
 # Taken AFTER the seam check, so the diagnostic above is the one a stale sibling produces.
 GH = CLASSIFIER.GH_BIN
+# ⛔ HAND THE LAYER THE BINARY #1872 PINNED (#1988). `GH` may be `$O/gh-rest/gh`, which then resolves
+# the real gh by walking PATH — the very environment (`~/.pi/agent/shims/gh`, TCC-refused, rc 126)
+# that #1872 pinned a binary for. CLASSIFIER computed the pin; pass it through so this process keeps
+# calling that binary and still gets serialisation and the documented backoff.
+GH_LAYER_ENV = dict(getattr(CLASSIFIER, "GH_LAYER_ENV", {}) or {})
 
 # Guards
 COOLDOWN_S = 45 * 60          # do not re-dispatch the same PR inside this window
@@ -268,7 +282,8 @@ def log(msg: str) -> None:
 
 def sh(args, timeout=180, cwd=None):
     try:
-        r = subprocess.run(args, capture_output=True, text=True, timeout=timeout, cwd=cwd)
+        r = subprocess.run(args, capture_output=True, text=True, timeout=timeout, cwd=cwd,
+                           env={**os.environ, **GH_LAYER_ENV} if GH_LAYER_ENV else None)
         return r.stdout
     except Exception as e:
         log("EXEC FAILED %s: %s" % (args[0], e))
@@ -278,7 +293,8 @@ def sh(args, timeout=180, cwd=None):
 def sh_err(args, timeout=180, cwd=None):
     """Same, but returns (stdout, stderr, rc) -- so a failed read is REPORTED, never empty."""
     try:
-        r = subprocess.run(args, capture_output=True, text=True, timeout=timeout, cwd=cwd)
+        r = subprocess.run(args, capture_output=True, text=True, timeout=timeout, cwd=cwd,
+                           env={**os.environ, **GH_LAYER_ENV} if GH_LAYER_ENV else None)
         return r.stdout, r.stderr, r.returncode
     except Exception as e:
         return "", "%s: %s" % (type(e).__name__, e), -1

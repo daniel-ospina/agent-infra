@@ -22,6 +22,13 @@ if [ ! -d "$REPO" ]; then echo "orch-loop: FATAL REPO=$REPO does not exist" >&2;
 # supported entry point, and would be the one case where `export` was load-bearing.)
 O="${O:-$HOME/orchestrator}"
 export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
+# ⛔ THE gh SHIM MUST STAY FIRST (#1988). The line above prepends the tool dirs, so a REAL gh in
+# either of them outranks the seeded `$O/gh-rest` (Mac REST adapter) / `$O/gh-limit` (cell
+# serialiser) — and a shim that is never resolved is an INERT layer: it reports protection and
+# provides none. Re-assert both here, adapter last so `$O/gh-rest` (which itself calls the same
+# helper) wins where it exists. Guarded by `-d`, so a box that ships neither is unchanged.
+if [ -d "$O/gh-limit" ]; then PATH="$O/gh-limit:$PATH"; fi
+if [ -d "$O/gh-rest" ]; then PATH="$O/gh-rest:$PATH"; fi
 export AGENT_SKIP_REVIEW_GATE=1 ELDATO_SKIP_VGATE=1
 
 MAX_FIX="${MAX_FIX:-3}"
@@ -472,6 +479,49 @@ queue_state_token() {  # -> EMPTY(12s) / READ(7)(3m) / PARTIAL(P0-blocker)(2m) /
   elif [ "$age" -lt 5400 ]; then printf '%s(%sm)' "$tok" "$(( age / 60 ))"
   else                            printf '%s(%sh)' "$tok" "$(( age / 3600 ))"; fi
 }
+# ── the box's last gh RATE-LIMIT observation (#1988) ─────────────────────────────────────
+# `queue_state_token` above says WHETHER this box could see the pool. This says WHY, when the answer
+# is the shared GitHub bucket — the reason a `queue=UNREADABLE` cycle used to have none.
+# Every harness gh call passes through `gh-limit.py` (the layer under the REST adapter and under the
+# cell-side wrapper), which records the bucket the call was REFUSED on and the reset it observed.
+# Those two facts are the ones gh's error text does not carry and `gh api rate_limit` actively
+# misreports: measured, it read 4999/5000 on the REST counter while EVERY GraphQL call was refused,
+# because the two pools are separate (#1762).
+# ⛔ AGE-BOUNDED ON READ, because a record is not a state: a limit observed before the last 15
+# minutes — or one stamped by a clock that has since stepped backwards — is not evidence about THIS
+# cycle and is not printed. That is the "stale flag that records a past state and is never
+# revalidated" failure, applied to the fix that reports it.
+GH_LIMIT_STALE_S=900
+gh_limit_token() {  # -> "gh=rate_limited(…)" | "gh=recovered(…)" | EMPTY
+  local f rec kv at="" bucket="" reset="" rec_at="" now age
+  f="${GH_LIMIT_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/gh-limit}/last-limit"
+  [ -f "$f" ] || return 0
+  rec="$(cat "$f" 2>/dev/null)" || return 0
+  # The record is ONE line of `key=value` pairs with no spaces in any value, so word splitting is
+  # the parse — no sed/jq spawn on a line printed every cycle.
+  for kv in $rec; do
+    case "$kv" in
+      at=*)        at="${kv#at=}" ;;
+      bucket=*)    bucket="${kv#bucket=}" ;;
+      reset=*)     reset="${kv#reset=}" ;;
+      recovered=*) rec_at="${kv#recovered=}" ;;
+    esac
+  done
+  is_num "${at:-}" || return 0
+  is_num "${reset:-}" || reset=""
+  [ "${reset:-0}" = 0 ] && reset="?"
+  now="$(date +%s)"; age=$(( now - at ))
+  { [ "$age" -ge 0 ] && [ "$age" -le "$GH_LIMIT_STALE_S" ]; } || return 0
+  # ⛔ A RECOVERED LIMIT IS NOT A CURRENT ONE. The record outlives the process that wrote it, so
+  # without this a one-off limit kept the box asserting `gh=rate_limited(...)` for 15 minutes while
+  # the same line showed a healthy queue — a token an operator learns to ignore. The layer marks the
+  # record `recovered=<epoch>` on the first success after it (gh-limit.py record_recovery).
+  if is_num "${rec_at:-}" && [ "$rec_at" -ge "$at" ]; then
+    printf 'gh=recovered(bucket=%s %ss)' "${bucket:-?}" "$age"
+    return 0
+  fi
+  printf 'gh=rate_limited(bucket=%s reset=%s %ss)' "${bucket:-?}" "$reset" "$age"
+}
 # Exact session-name test. `tmux has-session -t <name>` prefix-matches, so a guard for PR #82
 # would report "in flight" because `fix-820` exists — starving #82 while that worker lives.
 sess() { tmux ls -F '#{session_name}' 2>/dev/null | grep -qx "$1"; }
@@ -829,7 +879,9 @@ while true; do
   res_line   # MEASURE every resource; decide nothing from it
   reap_stale_workers
   L="$(load1)"
-  echo "=== $(date) load=$L lanes=$(tmux ls 2>/dev/null | grep -c '^lane-') backlog=$(wc -l < "$O/candidates.txt" | tr -d ' ') queue=$(queue_state_token) ===" >> "$LOG"
+  # Read the gh-limit record ONCE per cycle; the token is age-bounded inside (see gh_limit_token).
+  GHL="$(gh_limit_token)"
+  echo "=== $(date) load=$L lanes=$(tmux ls 2>/dev/null | grep -c '^lane-') backlog=$(wc -l < "$O/candidates.txt" | tr -d ' ') queue=$(queue_state_token)${GHL:+ $GHL} ===" >> "$LOG"
 
   # ---- 1) merge sweep (this box's open PRs) -------------------------------
   # scope: when the repo has >10 open PRs, help drain EVERYONE's (broad); otherwise just this box's.
