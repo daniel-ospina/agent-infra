@@ -149,6 +149,72 @@ def find_transcript(sid):
     return max(hits, key=os.path.getmtime)
 
 
+# ── scheduled reapers: a maintainer that fails SILENTLY ───────────────────
+# A reaper's whole point is to run unattended, so its exit status is the ONLY thing that can
+# tell anyone it stopped working. `launchctl list` reports that status and NOTHING read it:
+# the measured estate carried `com.eldato.pi-cache-reap` at exit 5 for days while the caches it
+# exists to bound sat at 8745MB/9479MB, `com.tortoise.worktree-reaper` loaded-and-inert, and
+# the three cloud cells died of a disk-full at 94-96%. A silent failure IS the bug (the same
+# rule as the pr-doctor exit-2 defect), so the scan reports every reaper's last exit.
+#
+# ⛔ THE EXIT VOCABULARY IS NOT PORTABLE AND MUST NOT BE FLATTENED. Per the scripts' own exit
+# contracts: pi-cache-reap.sh 5 = "a cache is OVER its bound and nothing was done (dry-run —
+# the shipped stance)" — an ACTIONABLE ALARM, never a crash; 3 = fail-closed (real breakage);
+# 4 = did not run (lock held / benign skip). pi-reap-worktrees.sh uses 4 for "a removal FAILED"
+# and 3 for "lock held" — the OPPOSITE mapping. So each family gets its own table, and an
+# UNRECOGNISED code is reported as an alarm rather than assumed benign (allow-list polarity).
+REAPERS = [
+    ("com.eldato.pi-cache-reap",       "cache"),
+    ("com.eldato.pi-session-reaper",   "cache"),
+    ("com.eldato.pi-task-session-prune", "cache"),
+    ("com.tortoise.embedded-reaper",   "other"),
+    ("com.tortoise.worktree-reaper",   "worktree"),
+    ("com.tortoise.branch-reaper",     "other"),
+]
+# family -> {code: (meaning, alarm?)}
+REAPER_CODES = {
+    "cache":    {0: ("ok", False), 4: ("did not run (lock held)", False),
+                 5: ("OVER BOUND and nothing reclaimed — dry-run; arming is the owner's decision (#1678)", True)},
+    "worktree": {0: ("ok", False), 3: ("lock held (benign skip)", False),
+                 4: ("a removal FAILED", True)},
+    "other":    {0: ("ok", False)},
+}
+
+
+def reaper_section():
+    """Print each scheduled reaper's last exit with its MEANING. Return alarm strings."""
+    try:
+        out = subprocess.run(["launchctl", "list"], capture_output=True, text=True,
+                             timeout=20).stdout
+    except Exception as exc:                                    # noqa: BLE001
+        print(f"\nreapers: CANNOT READ launchctl ({exc}) — this is NOT 'no reapers'")
+        return ["reapers: launchctl unreadable (abstention, not absence)"]
+    rows = {}
+    for line in out.splitlines()[1:]:
+        f = line.split("\t")
+        if len(f) >= 3:
+            rows[f[2].strip()] = f[1].strip()          # label -> last exit status
+    print("\nreapers (launchd, last exit)")
+    alarms = []
+    for label, family in REAPERS:
+        if label not in rows:
+            print(f"  {label:<36} NOT INSTALLED")
+            alarms.append(f"{label}: NOT INSTALLED (a box with no clock has no reaper)")
+            continue
+        raw = rows[label]
+        code = int(raw) if raw.lstrip("-").isdigit() else None
+        if code is None:
+            print(f"  {label:<36} exit={raw}  (not a status — run it in the foreground)")
+            alarms.append(f"{label}: unreadable exit status {raw!r}")
+            continue
+        meaning, is_alarm = REAPER_CODES[family].get(
+            code, (f"UNRECOGNISED exit {code} — treated as broken", True))
+        print(f"  {label:<36} exit={code}  {meaning}")
+        if is_alarm:
+            alarms.append(f"{label}: {meaning}")
+    return alarms
+
+
 def main():
     now = time.time()
     prev = {}
@@ -242,6 +308,12 @@ def main():
         json.dump({str(r.get("pid")): {"cpu": cputime_secs(r.get("pid")), "at": now}
                    for r in hook.values() if r.get("pid")}, fh)
 
+    reaper_alarms = reaper_section()
+    if reaper_alarms:
+        print(f"\n⚠️  {len(reaper_alarms)} REAPER alarm(s) — a scheduled maintainer is not protecting this box:")
+        for a in reaper_alarms:
+            print(f"   - {a}")
+
     print()
     if suspects:
         print(f"⚠️  {len(suspects)} suspect(s) — confirm with cmux read-screen before acting:")
@@ -256,6 +328,10 @@ def main():
         # SUPPRESS a suspect the ladder did find, which is the same defect one level up
         # from where the identity abstention was fixed.
         print("⚠️  hook store unreadable or shape-drifted — scan INCOMPLETE (lane identity not established)")
+        return 1
+    if reaper_alarms:
+        # A reaper alarm does not make the LANE rows wrong, so it is reported after them — but it
+        # must still be a non-zero exit, or a scheduler calling this script cannot see it either.
         return 1
 
 

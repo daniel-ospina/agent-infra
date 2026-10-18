@@ -223,6 +223,24 @@ fail_closed() {
 now_epoch() { date +%s 2>/dev/null; }
 is_pos_int() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; esac; return 0; }
 
+# canon_lstart <lstart> — a comparison key that does not depend on DATE-FIELD ORDER.
+# `ps -o lstart=` prints `<Wday> <A> <B> <HH:MM:SS> <YYYY>` where <A>/<B> are the month and the day
+# in an order that follows the caller's locale: en_GB gives `Sun 18 Oct …`, C gives `Sun Oct 18 …`.
+# Sorting that pair makes the two spellings compare EQUAL, so a formatting difference can never be
+# mistaken for a recycled pid (which would let a live owner's lock be broken).
+canon_lstart() {
+    local w a b
+    # shellcheck disable=SC2086
+    set -- $1
+    [ $# -ge 3 ] || { printf '%s' "${1:-}"; return 0; }
+    w="$1"; a="$2"; b="$3"
+    if [ "$a" \< "$b" ] || [ "$a" = "$b" ]; then printf '%s %s %s' "$w" "$a" "$b"
+    else printf '%s %s %s' "$w" "$b" "$a"; fi
+    shift 3
+    [ $# -gt 0 ] && printf ' %s' "$*"
+    return 0
+}
+
 cleanup() {
     [ -n "$TMPLIST" ] && rm -f "$TMPLIST"
     [ -n "$TMPLIST2" ] && rm -f "$TMPLIST2"
@@ -443,7 +461,18 @@ mtime_of() {
 # and every caller reads 4 as silence (#1987 review).
 lstart_of() {
     local l
-    l="$("${PS_BIN:-ps}" -o lstart= -p "$1" 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')" || return 1
+    # ⛔ LC_ALL=C IS LOAD-BEARING, NOT TIDINESS. `ps -o lstart=` prints a DATE STRING whose field
+    # order follows the caller's locale: en_GB yields `Sun 18 Oct 17:41:03 2026`, C/POSIX yields
+    # `Sun Oct 18 17:41:03 2026`. The lock stores the holder's lstart and a later pass compares it
+    # to ITS OWN `ps` output, so when the writer and the reader disagree — which is the norm, since
+    # launchd runs with a minimal environment while an interactive shell carries en_GB — the two
+    # strings NEVER match and every live lock is read as a RECYCLED pid. Measured on this box:
+    #   lock owner pid 83079 is a RECYCLED pid (start time 'Sun Oct 18 16:59:31 2026' != 'Sun 18 Oct 16:59:31 2026')
+    # The consequence is not cosmetic: with the age under the stale bound the pass SILENTLY SKIPS
+    # (exit 4, "did not run") — the reaper that grows caches while reporting nothing — and once the
+    # lock ages past the bound the same false verdict permits BREAKING A LIVE OWNER'S LOCK, which is
+    # the double-pass this lock exists to prevent. Pin the locale so both sides are comparable.
+    l="$(LC_ALL=C "${PS_BIN:-ps}" -o lstart= -p "$1" 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')" || return 1
     [ -n "${l:-}" ] || return 1
     printf '%s' "$l"
 }
@@ -968,8 +997,12 @@ lock_acquire() {
         # exists to prevent). Only an unverifiable owner is subject to the age bound.
         if is_pos_int "$owner" && kill -0 "$owner" 2>/dev/null; then
             held_lstart="$(cat "$LOCK_DIR/lstart" 2>/dev/null || printf '')"
-            now_lstart=" $(lstart_of "$owner" 2>/dev/null || printf '')"; now_lstart="${now_lstart# }"
-            if [ -n "$held_lstart" ] && [ -n "$now_lstart" ] && [ "$held_lstart" != "$now_lstart" ]; then
+            now_lstart="$(lstart_of "$owner" 2>/dev/null || printf '')"
+            # Compare CANONICAL forms. lstart_of pins LC_ALL=C, so this is belt-and-braces for a lock
+            # written by a build that did not — a raw string compare there read every live holder as
+            # RECYCLED and either skipped the pass (age < bound) or broke a live owner's lock.
+            if [ -n "$held_lstart" ] && [ -n "$now_lstart" ] && \
+               [ "$(canon_lstart "$held_lstart")" != "$(canon_lstart "$now_lstart")" ]; then
                 plog "pi-cache-reap: lock owner pid $owner is a RECYCLED pid (start time '$now_lstart' != '$held_lstart') — treating the lock as stale"
             else
                 say "pi-cache-reap: another pass is running (pid $owner, ${age}s) — this one does not run ($ISSUE_REF)"
