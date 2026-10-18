@@ -39,10 +39,15 @@
 #
 # Usage:
 #   bash cloud-cell-doctor.sh reap|doctor|merge|hygiene|status [--dry-run]
+#   …`status` exits 1 when a STARTED cell has a role that never ran, went STALE, or whose last pass
+#   recorded a non-zero / unreadable verdict (the `VERDICT` row) — printing a verdict in prose while
+#   exiting 0 is the same row in words, and a monitoring probe reads the exit status.
 #   bash cloud-cell-doctor.sh loop
 #
-# Exit codes: 0 = pass completed (including "nothing to do"); 2 = usage; 3 = the read a pass needs
-# could not be taken (cannot-verify is never a pass).
+# Exit codes: 0 = pass completed (including "nothing to do"); 2 = usage; 3 = the pass is NOT clean —
+# a read it needs could not be taken (cannot-verify is never a pass), or an action it took could not
+# be verified to have taken effect (a `kill-session` that did not land). `status` prints the recorded
+# rc, so a pass that could not do its job reads as `rc=3`, never as a healthy green row.
 
 set -uo pipefail
 
@@ -94,6 +99,8 @@ CONTROLLER_START_TIMEOUT="${CONTROLLER_START_TIMEOUT:-600}"
 # one PR cannot stall the merge role for the whole interval.
 RAIL_TIMEOUT="${DOCTOR_RAIL_TIMEOUT:-900}"
 MERGE_MAX_PRS="${MERGE_MAX_PRS:-100}"
+# The open-PR read's own bound (see run_merge): an unbounded `gh` stalls the role with its lock held.
+MERGE_READ_TIMEOUT="${MERGE_READ_TIMEOUT:-60}"
 # A refusal is RECORDED and not retried blind: the same head is not offered to the rail again inside
 # this window. A push moves the head, which re-arms it naturally.
 MERGE_RETRY_S="${MERGE_RETRY_S:-3600}"
@@ -115,10 +122,15 @@ DOCTOR_GRACE_S="${DOCTOR_GRACE_S:-300}"
 for _v in DOCTOR_INTERVAL MERGE_INTERVAL HYGIENE_INTERVAL LOOP_TICK REAP_MIN_S REAP_SAMPLE_S \
           CONTROLLER_STALE_S CONTROLLER_START_TIMEOUT RAIL_TIMEOUT MERGE_MAX_PRS MERGE_RETRY_S \
           HYGIENE_TIMEOUT STALE_WORKTREE_DAYS MIN_FREE_MB DOCTOR_GRACE_S REAP_TIMEOUT \
-          READ_CALL_TIMEOUT; do
+          READ_CALL_TIMEOUT MERGE_READ_TIMEOUT; do
   num_ok "${!_v}" || { printf 'FATAL: %s must be a whole number 0..999999999 (got "%s")\n' "$_v" "${!_v}" >&2; exit 2; }
 done
 case "$HYGIENE_WORKTREES" in auto|dry-run|apply) ;; *) printf 'FATAL: HYGIENE_WORKTREES must be auto|dry-run|apply (got "%s")\n' "$HYGIENE_WORKTREES" >&2; exit 2 ;; esac
+# ⛔ A zero TIMEOUT is not "no bound configured", it is `timeout 0`, which runs the command with NO
+# timeout at all — so a `=0` here would silently remove the bound the variable exists to impose.
+for _v in READ_CALL_TIMEOUT REAP_TIMEOUT RAIL_TIMEOUT HYGIENE_TIMEOUT CONTROLLER_START_TIMEOUT MERGE_READ_TIMEOUT; do
+  [ "${!_v}" -gt 0 ] || { printf 'FATAL: %s must be > 0 (0 disables timeout(1) entirely) — got "%s"\n' "$_v" "${!_v}" >&2; exit 2; }
+done
 [ -n "$DOCTOR_STALE_S" ] || DOCTOR_STALE_S=$((DOCTOR_INTERVAL * 2))
 num_ok "$DOCTOR_STALE_S" || { printf 'FATAL: DOCTOR_STALE_S must be a whole number 0..999999999 (got "%s")\n' "$DOCTOR_STALE_S" >&2; exit 2; }
 
@@ -196,9 +208,12 @@ mtime_epoch() {
 # Bound ONE external read (tmux/ps). `timeout` is a cell runtime dependency in practice, but its
 # absence must not turn a bounded read into an unbounded one silently — the caller is told.
 if ! command -v timeout >/dev/null 2>&1; then
-  printf 'warn: timeout(1) not on PATH — reads are bounded only by REAP_TIMEOUT/%ss per pass\n' \
+  printf 'warn: timeout(1) not on PATH — a single read is UNBOUNDED here; REAP_TIMEOUT/%ss bounds the pass only BETWEEN reads, so a hung tmux/ps call stalls this pass with the role lock held\n' \
          "${REAP_TIMEOUT}" >&2
 fi
+# ⛔ Where `timeout` is absent (a bare macOS host; every Linux cell has it) this degrades to an
+# UNBOUNDED call. That is why every caller of this helper is a READ whose worst case is the pass
+# stalling — never a kill decision made on a shortcut.
 bounded() { local s="$1"; shift; if command -v timeout >/dev/null 2>&1; then timeout "$s" "$@"; else "$@"; fi; }
 
 # Free MiB. `df -Pk`'s 4th column is 1KiB blocks; `printf %d` (never awk's OFMT, which prints
@@ -229,12 +244,51 @@ free_mb() { df -Pk "${1:-.}" 2>/dev/null | awk 'NR==2 && $4 ~ /^[0-9]+$/ {printf
 #      the extra TERM/KILL is fenced on the pane pid's `lstart` re-read, so a recycled pid cannot
 #      receive a signal meant for a corpse (the fleet's one identity rule, #1178).
 
-# Names of the sessions in this harness's namespace. A `tmux ls` that fails with NO server is an
-# empty list (nothing to reap); a tmux binary that is absent is CANNOT-VERIFY and is reported as such
-# by the caller before this runs.
+# ONE bounded read of the session list, classified ONCE — the primitive every session question in
+# this file is answered from.
+#   0 = the list was read (names on stdout)
+#   1 = NO SERVER: an EMPTY list (nothing exists to find — the normal state of a stopped cell)
+#   3 = the read could not be taken: CANNOT-VERIFY.
+# The 1-vs-3 split is the whole point. `tmux ls` exits non-zero BOTH for "no server running" (an
+# empty list) and for a connection/tool failure (which proves nothing), so a caller that only reads
+# the exit status cannot tell "there is nothing" from "I could not look" — and in a destructive pass
+# the second arrives as the first. `has-session` cannot make the distinction at all: it answers rc=1
+# for "no such session" and for every client/server error alike. The read is `bounded` because a
+# wedged tmux is exactly the condition this pass runs under (README §6.5.2), and an unbounded read
+# here would hang the pass with the role lock held, stopping the merge and hygiene roles too.
+# ⛔ No logging in here: this runs inside `$( )` at both call sites, so a log line would become part
+# of the list. Callers log; this function only answers.
+tmux_session_list() {
+  local out rc err="$ROLES_DIR/.tmux-ls.$$"
+  mkdir -p "$ROLES_DIR" 2>/dev/null || true
+  out="$(bounded "$READ_CALL_TIMEOUT" "$TMUX_BIN" ls -F '#{session_name}' 2>"$err")"; rc=$?
+  if [ "$rc" -eq 0 ]; then rm -f "$err"; printf '%s\n' "$out" | sed '/^$/d'; return 0; fi
+  # ⛔ TWO benign messages, and the ANCHOR is what keeps a broken BINARY out of them. tmux 3.4 (measured)
+  # answers `no server running on …` once a server has existed and its last session died, and
+  # `error connecting to … (No such file or directory)` when no server has EVER started in that
+  # $TMUX_TMPDIR — the socket file does not exist yet, which is exactly a FRESH cell. Both are an empty
+  # namespace. A missing binary answers `/bin/bash: line 1: /nonexistent/tmux: No such file or
+  # directory` with rc=127, which proves nothing and must stay cannot-verify: matching only at the
+  # start of the line, and only the `error connecting to` form, is what separates the two. Without
+  # this leg every role on a fresh box records rc=3 forever, and a cannot-verify row that never clears
+  # is a row operators learn to ignore.
+  if grep -qiE '^(no server running|error connecting to .*\(No such file or directory\))' "$err" 2>/dev/null; then
+    rm -f "$err"; return 1
+  fi
+  rm -f "$err"
+  return 3
+}
+
+# Names of the sessions in this harness's namespace, and the read's own verdict: 0 = read (0 or more
+# names), 1 = no server (an empty list), 3 = the list could not be read. ⛔ A blind read is never an
+# empty answer: with `DOCTOR_TMUX_BIN=/nonexistent/tmux` the pre-fix version printed nothing, the
+# caller recorded `seen=0 … no harness session to judge` and the pass exited 0 — the reaper inert and
+# its `status` row green, which is the failure this whole file exists to make visible.
 harness_sessions() {
-  local s
-  for s in $(bounded "$READ_CALL_TIMEOUT" "$TMUX_BIN" ls -F '#{session_name}' 2>/dev/null); do
+  local list lrc s
+  list="$(tmux_session_list)"; lrc=$?
+  [ "$lrc" -eq 0 ] || return "$lrc"
+  for s in $list; do
     case "$s" in
       lane-*|fix-*|merge-*|chain-*) ;;
       *) continue ;;
@@ -245,12 +299,59 @@ harness_sessions() {
   done
 }
 
+# Seconds are not the question here — whether a HUMAN is watching is the last gate before a kill, so a
+# read that failed must not answer "0 clients". 0 = read (the count is on stdout), 3 = cannot-verify.
+# MEASURED pre-fix with a tmux whose `list-clients` errors and whose session list is healthy: the
+# reaper printed `lane-77 WOULD REAP (… no human)` and, without `--dry-run`, SIGTERMs a lane a human
+# is attached to. That is the same failed-read-arrives-as-evidence class as the process table, the
+# session list and the ancestry walk (`human_above`, whose own empty answer is "no human above").
 pane_pid() { bounded "$READ_CALL_TIMEOUT" "$TMUX_BIN" list-panes -t "=$1" -F '#{pane_pid}' 2>/dev/null | head -1; }
-attached_clients() { bounded "$READ_CALL_TIMEOUT" "$TMUX_BIN" list-clients -t "=$1" 2>/dev/null | awk 'NF{n++} END{printf "%d\n", n+0}'; }
+attached_clients() {
+  local out
+  out="$(bounded "$READ_CALL_TIMEOUT" "$TMUX_BIN" list-clients -t "=$1" 2>/dev/null)" || return 3
+  printf '%s\n' "$out" | awk 'NF{n++} END{printf "%d\n", n+0}'
+}
 pid_lstart() { bounded "$READ_CALL_TIMEOUT" "$PS_BIN" -p "$1" -o lstart= 2>/dev/null; }
+
+# 0 = the session is present, 1 = ABSENT, 3 = CANNOT-VERIFY. One bounded read, and the difference
+# between "gone" and "could not read" is decided from the tool's OWN message: `tmux ls` exits
+# non-zero both for "no server running" (which IS an empty list — nothing is left to find) and for a
+# connection/tool failure, which proves NOTHING about the session. `has-session` cannot make that
+# distinction at all: it answers rc=1 for "no such session" and for every client/server error alike,
+# so a failed read would arrive as positive evidence that a kill took effect — the same class of
+# false PASS this pass exists to remove, one layer up. The read is bounded because a wedged tmux is
+# exactly the condition the reap runs under (README §6.5.2), and an unbounded read here would hang
+# the pass with the role lock held, stopping the merge and hygiene roles too.
+session_present() {
+  local out rc
+  out="$(tmux_session_list)"; rc=$?
+  [ "$rc" -eq 0 ] || return "$rc"
+  # ⛔ A HERE-STRING, never `printf … | grep -q` (#841): the quiet grep exits at its first match, the
+  # writer takes SIGPIPE, and under this file's `set -uo pipefail` the pipeline reads non-zero — so a
+  # session that IS present would answer "absent". `scripts/check-no-sigpipe-grep.sh` reds the pipe
+  # form, in CI and in the pre-commit hook.
+  # ⛔ The tree ships two other exact-name readers (`orch-loop.sh`'s `sess()`/`wsess()`), and this one
+  # is deliberately STRICTER: they discard the read's status, so a failed `tmux ls` answers "absent"
+  # there too. That divergence is stated rather than shared because `sess()` also gates the controller's
+  # own in-flight checks, and changing its contract is that file's decision, not this one's.
+  # ⛔ `-F` (LITERAL), and grep's own answer classified. Both halves were measured here: `$SESSION` is
+  # unvalidated env, so a name carrying an ERE metacharacter (`orch[`) made `grep -qx` exit 2 —
+  # invalid regex — which a caller reading only `-eq 3`/`-eq 0` took as ABSENT and tried to restart;
+  # and an unescaped `.` (`orch.2`) matched a live `orchX2`, so the doctor reported RUNNING for a
+  # controller that did not exist. A pattern is not a name.
+  grep -Fqx -- "$1" <<<"$out"
+  rc=$?
+  [ "$rc" -le 1 ] && return "$rc"   # 0 = present, 1 = absent
+  return 3                            # grep could not answer -> cannot-verify, never "absent"
+}
 
 # Seconds of cumulative CPU time for <pid> and every descendant. Prints "NA" when the root is not in
 # the table (an unreadable/empty `ps`: cannot-verify, never "0 seconds of progress").
+# ⛔ "NA" for an UNPARSEABLE `time` column too, not only for a missing root. A table this code cannot
+# read (a truncated row, a `??:??` sentinel, a widened field) otherwise parses to 0 seconds on BOTH
+# observations, and two equal readings are indistinguishable from a frozen subtree — so a failed READ
+# would arrive at the reaper as evidence of a wedge. Every row's `time` must match the ps shape
+# (`[[dd-]hh:]mm:ss` with an optional fraction) or the whole answer is cannot-verify.
 subtree_cpu_secs() {
   bounded "$READ_CALL_TIMEOUT" "$PS_BIN" -A -o pid=,ppid=,time= 2>/dev/null | awk -v root="$1" '
     function secs(t,   n,a,i,d,h,m,s) {
@@ -263,8 +364,17 @@ subtree_cpu_secs() {
       else             { h = 0;         m = 0;         s = a[1] + 0 }
       return d * 86400 + h * 3600 + m * 60 + s
     }
-    { ppid[$1] = $2; cpu[$1] = secs($3) }
+    {
+      rows++
+      # ⛔ `[0-9][0-9]`, NOT `[0-9]{2}`: mawk 1.3.4 (the awk on a Linux cell) PANICS on the interval
+      # form inside this alternation ("REcompile() - panic: values still on machine stack"), and a
+      # panicking awk returns no answer at all — the reaper would be inert on exactly the boxes it
+      # runs on. Measured with the shipped suite on mawk; the two-digit spelling is equivalent here.
+      if ($1 !~ /^[0-9]+$/ || $2 !~ /^[0-9]+$/ || $3 !~ /^([0-9]+-)?([0-9]+:)?[0-9]+:[0-9][0-9](\.[0-9]+)?$/) bad = 1
+      ppid[$1] = $2; cpu[$1] = secs($3)
+    }
     END {
+      if (bad || rows == 0) { print "NA"; exit }
       if (!(root in ppid)) { print "NA"; exit }
       found[root] = 1; changed = 1
       while (changed) {
@@ -283,10 +393,17 @@ subtree_cpu_secs() {
 # fleet's reapers use. ⛔ Plain `tmux` is NOT a marker: every harness lane lives in tmux, so matching
 # it would make the reaper inert. A human *watching* a session is caught by attached_clients().
 human_above() {
-  local pid="$1" n=0 row ppid args
+  local pid="$1" n=0 row rc ppid args
+  # 0 = a human terminal is above, 1 = none, 3 = CANNOT-VERIFY. ⛔ The third answer is not pedantry:
+  # this is the gate immediately before `kill-session`, so an EMPTY ancestry read that answered "no
+  # human" would authorise the kill — and an empty row is exactly what a `ps` cut by
+  # `READ_CALL_TIMEOUT`, or a walk hole where an ancestor exited between two reads, produces (the
+  # `ps -A` observation that follows is a DIFFERENT invocation and succeeds, so nothing downstream
+  # notices). Measured pre-fix with an unreadable per-pid `ps`: `human_above <pid>` → 1 → the lane was
+  # killed and the pass recorded `reaped=1` rc=0.
   while [ -n "$pid" ] && [ "$pid" != 0 ] && [ "$pid" != 1 ] && [ "$n" -lt 40 ]; do
-    row="$(bounded "$READ_CALL_TIMEOUT" "$PS_BIN" -p "$pid" -o ppid=,args= 2>/dev/null)"
-    [ -n "$row" ] || return 1
+    row="$(bounded "$READ_CALL_TIMEOUT" "$PS_BIN" -p "$pid" -o ppid=,args= 2>/dev/null)"; rc=$?
+    [ "$rc" -eq 0 ] && [ -n "$row" ] || return 3
     read -r ppid args <<<"$row"
     case "$args" in
       *Terminal.app*|*iTerm*|*Warp.app*|*kitty.app*|*Alacritty.app*|*"/usr/bin/login"*|*" sshd"*|*sshd:*)
@@ -299,25 +416,44 @@ human_above() {
 }
 
 run_reap() {
-  local dry="$1" s log m0 m1 c0 c1 age now pid clients ls0 ls1 started elapsed
-  local seen=0 skipped=0 reaped=0 would=0 result=""
+  local dry="$1" s log m0 m1 c0 c1 age now pid clients ls0 ls1 sp spid ha started elapsed
+  local seen=0 skipped=0 reaped=0 would=0 cannot=0 failed=0 result="" list lrc total=0
   note() { log "[reap] $*"; result="${result}${result:+; }$*"; }
   started="$(date +%s)"
 
-  for s in $(harness_sessions); do
+  # ONE read of the session list, and its verdict decides the pass. A list that could not be read is
+  # NOT an empty namespace: with `DOCTOR_TMUX_BIN=/nonexistent/tmux` the pre-fix version judged
+  # nothing, recorded `no harness session to judge` and exited 0 (reaper inert, `status` row green).
+  list="$(harness_sessions)"; lrc=$?
+  if [ "$lrc" -eq 3 ]; then
+    log "[reap] CANNOT-VERIFY: the session list could not be read — no lane was judged this pass"
+    state_write reap 3 "cannot-verify: the session list could not be read (tmux ls failed)"
+    return 3
+  fi
+  [ -z "$list" ] || total="$(printf '%s\n' "$list" | wc -l | tr -d ' ')"
+
+  for s in $list; do
     seen=$((seen + 1))
     # The budget is for the WHOLE read (§6.5.2). Checked at the top of each lane so a pass that has
     # spent it stops touching anything further and says so — the unreached lanes are NOT "quiet".
     elapsed=$(( $(date +%s) - started ))
     if [ "$elapsed" -gt "$REAP_TIMEOUT" ]; then
-      log "[reap] CANNOT-VERIFY: the read budget (${REAP_TIMEOUT}s) was spent after $seen of $(harness_sessions | wc -l | tr -d ' ') lane(s) — nothing further was judged"
+      log "[reap] CANNOT-VERIFY: the read budget (${REAP_TIMEOUT}s) was spent after $seen of $total lane(s) — nothing further was judged"
       state_write reap 3 "cannot-verify: read budget ${REAP_TIMEOUT}s spent after $seen lane(s); ${seen} judged: $result"
       return 3
     fi
     log="$WORKER_LOG_DIR/$s.log"
+    # ⛔ Two different facts, and they were one branch: NO LOG is the documented exclusion (a lane that
+    # tees nothing cannot be judged), while a log that EXISTS but whose mtime cannot be read (a broken
+    # or missing `stat`) is a failed read — counted as an exclusion it produced `seen=1 skipped=1`,
+    # rc=0 and a permanently green reap row on a box whose `stat` does not work.
+    if [ ! -f "$log" ]; then
+      skipped=$((skipped + 1)); note "$s SKIP no log (no progress signal)"
+      continue
+    fi
     m0="$(mtime_epoch "$log")"
-    if [ ! -f "$log" ] || [ -z "$m0" ]; then
-      skipped=$((skipped + 1)); note "$s SKIP no readable log (no progress signal)"
+    if [ -z "$m0" ]; then
+      cannot=$((cannot + 1)); skipped=$((skipped + 1)); note "$s SKIP cannot read the log mtime (cannot-verify)"
       continue
     fi
     age=$(( $(date +%s) - m0 ))
@@ -327,22 +463,50 @@ run_reap() {
     fi
     pid="$(pane_pid "$s")"
     if ! num_ok "${pid:-}" || [ "${pid:-0}" -le 1 ]; then
-      skipped=$((skipped + 1)); note "$s SKIP no usable pane pid"
+      # ⛔ An EMPTY pane pid is two different facts, and this is the gate before the kill: the session
+      # ended between the list read and this one (benign — nothing left to judge), or the read FAILED
+      # (a refused/wedged `list-panes`) which proves nothing. `pane_pid` runs `… | head -1` under
+      # `pipefail`, so its own status also reports SIGPIPE for a healthy multi-pane session and cannot
+      # arbitrate; one classified session read can, and it is the one this file already owns.
+      # Counted as a plain skip before: a failed read produced `seen=1 skipped=1`, rc=0, a green row.
+      spid=0; session_present "$s" || spid=$?
+      if [ "$spid" -eq 1 ]; then
+        skipped=$((skipped + 1)); note "$s SKIP session is gone (no pane left)"
+      else
+        cannot=$((cannot + 1)); skipped=$((skipped + 1)); note "$s SKIP cannot read the pane pid (cannot-verify)"
+      fi
       continue
     fi
-    clients="$(attached_clients "$s")"
+    if ! clients="$(attached_clients "$s")"; then
+      cannot=$((cannot + 1)); skipped=$((skipped + 1)); note "$s SKIP cannot read the client list (cannot-verify)"
+      continue
+    fi
     if [ "${clients:-0}" -gt 0 ]; then
       skipped=$((skipped + 1)); note "$s SKIP a tmux client is attached (human watching)"
       continue
     fi
-    if human_above "$pid"; then
+    ha=0; human_above "$pid" || ha=$?
+    if [ "$ha" -eq 3 ]; then
+      # ⛔ `ps -p <pid>` exits 1 for "no such process", which is an ANSWER, not a failed read — and it
+      # is what the walk gets when the pane's process exited between the pid read and this one. The
+      # session read says which: gone = the lane ended mid-pass (benign skip; `cannot-verify` for every
+      # normal lane exit is the row operators learn to ignore), still listed = the answer is the walk's.
+      spid=0; session_present "$s" || spid=$?
+      if [ "$spid" -eq 1 ]; then
+        skipped=$((skipped + 1)); note "$s SKIP session is gone (the pane process exited)"
+      else
+        cannot=$((cannot + 1)); skipped=$((skipped + 1)); note "$s SKIP cannot read the process ancestry (cannot-verify)"
+      fi
+      continue
+    fi
+    if [ "$ha" -eq 0 ]; then
       skipped=$((skipped + 1)); note "$s SKIP ancestry reaches a human terminal/login"
       continue
     fi
     # ── observation 1 ──
     c0="$(subtree_cpu_secs "$pid")"
     if [ "${c0:-NA}" = "NA" ]; then
-      skipped=$((skipped + 1)); note "$s SKIP cannot read the process table (cannot-verify)"
+      cannot=$((cannot + 1)); skipped=$((skipped + 1)); note "$s SKIP cannot read the process table (cannot-verify)"
       continue
     fi
     ls0="$(pid_lstart "$pid")"
@@ -351,7 +515,7 @@ run_reap() {
     m1="$(mtime_epoch "$log")"
     c1="$(subtree_cpu_secs "$pid")"
     if [ -z "$m1" ] || [ "${c1:-NA}" = "NA" ]; then
-      skipped=$((skipped + 1)); note "$s SKIP second observation unreadable (cannot-verify)"
+      cannot=$((cannot + 1)); skipped=$((skipped + 1)); note "$s SKIP second observation unreadable (cannot-verify)"
       continue
     fi
     if [ "$m1" -gt "$m0" ]; then
@@ -360,6 +524,17 @@ run_reap() {
     fi
     if [ "${c1:-0}" -gt "${c0:-0}" ]; then
       skipped=$((skipped + 1)); note "$s SKIP child is still working (cpu ${c0}s -> ${c1}s)"
+      continue
+    fi
+    # ⛔ A DECREASE is not "no progress" either — it is proof the two readings are not comparable.
+    # Cumulative CPU cannot shrink for a fixed process set, so a lower second reading means the table
+    # changed under us: a subtree member exited during the sample (taking its seconds with it), or the
+    # bounded read was TRUNCATED (`bounded` cutting a slow `ps` at a record boundary — the measured
+    # cause of long reads on a loaded cell). Both are cannot-verify. Reading the fall as "unchanged"
+    # keeps the exact false-wedge route this pass exists to remove, one branch over from the parse
+    # check: the only comparable reading is an EQUAL one.
+    if [ "${c1:-0}" -lt "${c0:-0}" ]; then
+      cannot=$((cannot + 1)); skipped=$((skipped + 1)); note "$s SKIP cpu went ${c0}s -> ${c1}s (readings not comparable, cannot-verify)"
       continue
     fi
     # The sampling window is where a budget is actually spent, so it is re-checked HERE: a pass that
@@ -377,6 +552,21 @@ run_reap() {
     # ── act ──
     log "[reap] $s silent ${age}s, cpu ${c0}s unchanged -> killing session (pane_pid=${pid})"
     "$TMUX_BIN" kill-session -t "=$s" 2>/dev/null || true
+    # ⛔ The kill is VERIFIED before anything is recorded or signalled. Counting a failed
+    # `kill-session` as a reap puts a fix in the state record and in `status` that did not happen —
+    # the lane is still wedged and the next pass reads "reaped" as "handled". The extra TERM/KILL is
+    # skipped on that path too: a tmux refusal is a reason to report, never to signal harder.
+    sp=0; session_present "$s" || sp=$?
+    if [ "$sp" -eq 3 ]; then
+      cannot=$((cannot + 1)); skipped=$((skipped + 1))
+      note "$s SKIP kill unverified (the tmux read failed) — cannot-verify; no signal sent, not counted as reaped"
+      continue
+    fi
+    if [ "$sp" -eq 0 ]; then
+      failed=$((failed + 1)); skipped=$((skipped + 1))
+      note "$s KILL FAILED (session still present after kill-session) — the action did not take, not counted as reaped"
+      continue
+    fi
     # The extra TERM/KILL is fenced: only signal the pid if it still holds the incarnation whose
     # lstart we recorded. An off-fence or absent pid is an ABSTENTION, never a kill (#1178).
     ls1="$(pid_lstart "$pid")"
@@ -390,6 +580,15 @@ run_reap() {
     result="${result}${result:+; }reaped $s"
   done
   [ -n "$result" ] || result="no harness session to judge"
+  # ⛔ cannot-verify is never a pass, and neither is an action that did not take: both are recorded as
+  # rc=3 so `status` shows a reap row that could not do its job instead of a green one. The other
+  # skips (no log, an attached client, a human above, a child still working) are DECISIONS taken on a
+  # read that succeeded — genuine exclusions, and the pass is clean.
+  if [ "$cannot" -gt 0 ] || [ "$failed" -gt 0 ]; then
+    state_write reap 3 "seen=$seen reaped=$reaped would=$would skipped=$skipped cannot=$cannot failed=$failed — $result"
+    log "[reap] seen=$seen reaped=$reaped would=$would skipped=$skipped cannot=$cannot failed=$failed — NOT clean (cannot-verify/action failed)"
+    return 3
+  fi
   state_write reap 0 "seen=$seen reaped=$reaped would=$would skipped=$skipped — $result"
   log "[reap] seen=$seen reaped=$reaped would=$would skipped=$skipped"
   return 0
@@ -421,21 +620,36 @@ rail_path() {
 attestation_clean() {
   local pr="$1" head="$2" dir="$CELL_HOME/.pi/agent/reviews" slug f rc
   slug="$(printf '%s' "$OR" | tr '/' '-')"
+  # 0 = a CLEAN attestation at THIS head, 1 = none (no record, or one for another head — the normal
+  # "not reviewed yet" answer), 3 = CANNOT-VERIFY: a record that is present but cannot be read or
+  # parsed. This read decides whether the rail is called, and a corrupt record answering 1 arrives as
+  # "nothing to land": measured pre-fix with a truncated record, `candidates=1 attempted=0 landed=0
+  # skipped=1 — nothing to land`, rc=0 — so a reviewed PR never lands and `status` shows merge green,
+  # which is the #1989 symptom ("it can create work and cannot finish it") wearing a clean row.
   for f in "$dir/${slug}-${pr}.json" "$dir/${pr}.json"; do
-    [ -f "$f" ] || continue
+    [ -e "$f" ] || continue
+    [ -r "$f" ] || return 3
     python3 - "$f" "$head" <<'PY' 2>/dev/null
 import json, sys
+# ⛔ The BODY is inside the try, and "not clean at this head" is a SENTINEL (10), never 1: a record
+# that parses but is not an object (`null`, `[]`, a string) raises AttributeError, and python's own
+# error exit is 1 — so keying "not clean" on 1 made exactly the corrupt-record case this hunk exists
+# for indistinguishable from "not reviewed yet", and a reviewed PR never landed.
 try:
     with open(sys.argv[1]) as fh:
         d = json.load(fh)
+    h = str(d.get("head_sha") or "")
+    v = str(d.get("verdict") or "").lower()
 except Exception:
-    sys.exit(1)
-h = str(d.get("head_sha") or "")
-v = str(d.get("verdict") or "").lower()
-sys.exit(0 if h == sys.argv[2] and v in ("clean", "clean-micro", "clean-low") else 1)
+    # DISTINCT from "not clean at this head": the record exists and could not be read.
+    sys.exit(3)
+sys.exit(0 if h == sys.argv[2] and v in ("clean", "clean-micro", "clean-low") else 10)
 PY
     rc=$?
     [ "$rc" -eq 0 ] && return 0
+    # Anything that is neither "not clean here" (10) nor "clean here" (0) is a read that could not be
+    # taken — including a missing/broken `python3` (rc 127), which must never read as "no attestation".
+    [ "$rc" -eq 10 ] || return 3
   done
   return 1
 }
@@ -455,7 +669,7 @@ attempt_record() { # <pr> <head> [<rc>]
 
 run_merge() {
   local dry="$1" rail err prs line pr head draft now ep aep merge_parse_failed=0
-  local candidates=0 attempted=0 landed=0 skipped=0 result="" out rc
+  local candidates=0 attempted=0 landed=0 skipped=0 result="" out rc mcv=0 rcv=0
   if [ -z "$OR" ]; then
     log "[merge] CANNOT-VERIFY: \$OR is unset (the queue target is resolved by the supervisor)"
     state_write merge 3 "cannot-verify: OR unset"; return 3
@@ -470,7 +684,10 @@ run_merge() {
   fi
   mkdir -p "$ROLES_DIR" || true
   err="$ROLES_DIR/.merge-read.$$"
-  prs="$("$GH_BIN" api "repos/$OR/pulls?state=open&per_page=$MERGE_MAX_PRS" 2>"$err")"
+  # ⛔ BOUNDED like every other read in this file: a hung `gh` (a network blackhole) stalls the merge
+  # role with its lock held, so merge never runs again until the loop is restarted — the failure
+  # READ_CALL_TIMEOUT exists to prevent for tmux/ps. `MERGE_READ_TIMEOUT` bounds the whole read.
+  prs="$(bounded "$MERGE_READ_TIMEOUT" "$GH_BIN" api "repos/$OR/pulls?state=open&per_page=$MERGE_MAX_PRS" 2>"$err")"
   rc=$?
   if [ "$rc" -ne 0 ] || [ -z "${prs//[[:space:]]/}" ]; then
     local why; why="$(head -3 "$err" 2>/dev/null | tr '\n' ' ')"
@@ -512,7 +729,13 @@ for p in d:
     case "$pr" in ''|*[!0-9]*) continue ;; esac
     [ "$draft" = "1" ] && { skipped=$((skipped + 1)); continue; }
     candidates=$((candidates + 1))
-    if ! attestation_clean "$pr" "$head"; then
+    acv=0; attestation_clean "$pr" "$head" || acv=$?
+    if [ "$acv" -eq 3 ]; then
+      log "[merge] CANNOT-VERIFY: the review record for #$pr is present but unreadable — the rail was NOT called for it"
+      result="${result}${result:+; }#${pr} attestation cannot-verify"; mcv=$((mcv + 1))
+      skipped=$((skipped + 1)); continue
+    fi
+    if [ "$acv" -ne 0 ]; then
       skipped=$((skipped + 1)); continue
     fi
     aep="$(attempt_epoch "$pr" "$head")"
@@ -545,15 +768,31 @@ for p in d:
       result="${result}${result:+; }landed #$pr"
     else
       local why; why="$(tail -2 "$out" 2>/dev/null | tr '\n' ' ' | cut -c1-300)"
-      log "[merge] #$pr REFUSED by the rail rc=$rc — ${why:-no output}; recorded, not retried for ${MERGE_RETRY_S}s at this head"
-      result="${result}${result:+; }REFUSED #$pr rc=$rc"
+      # ⛔ 124 = killed at its own bound, 126/127 = it could not be executed. The merge may or may not
+      # have landed, so this is NOT the rail's refusal (which is data on a clean pass): it is an action
+      # whose outcome is unknown, and the header's rc=3 clause covers it.
+      case "$rc" in
+        124|126|127)
+          log "[merge] CANNOT-VERIFY: the rail for #$pr did not answer (rc=$rc) — ${why:-no output}; the merge may or may not have landed"
+          result="${result}${result:+; }#$pr rail cannot-verify rc=$rc"; rcv=$((rcv + 1)) ;;
+        *)
+          log "[merge] #$pr REFUSED by the rail rc=$rc — ${why:-no output}; recorded, not retried for ${MERGE_RETRY_S}s at this head"
+          result="${result}${result:+; }REFUSED #$pr rc=$rc" ;;
+      esac
     fi
   done < "$parsed"
   rm -f "$parsed"
   [ -n "$result" ] || result="nothing to land"
-  state_write merge 0 "candidates=$candidates attempted=$attempted landed=$landed skipped=$skipped — $result"
+  # An unreadable attestation makes the pass PARTIAL: "nothing to land" over a record it could not
+  # read is the false clean row this role exists to remove.
+  local mrc=0; [ "$((mcv + rcv))" -eq 0 ] || mrc=3
+  # ⛔ Named separately: the summary is what `role_row` prints, and one counter for two different
+  # unknowns told the operator an ATTESTATION could not be read when it was the RAIL that did not answer.
+  [ "$mcv" -eq 0 ] || result="$result; $mcv attestation(s) cannot-verify"
+  [ "$rcv" -eq 0 ] || result="$result; $rcv rail call(s) cannot-verify"
+  state_write merge "$mrc" "candidates=$candidates attempted=$attempted landed=$landed skipped=$skipped — $result"
   log "[merge] candidates=$candidates attempted=$attempted landed=$landed skipped=$skipped"
-  return 0
+  return "$mrc"
 }
 
 # ── HYGIENE (the disk the cell fills without noticing) ───────────────────────────────────────────
@@ -561,7 +800,7 @@ for p in d:
 # (#1987); before that, an abandoned 5.8 GB worktree. The two sinks are pruned here, with the
 # shipped tools and the shipped gates — this role adds the SCHEDULE, not another reaper.
 run_hygiene() {
-  local dry="$1" before after mb rc wt mode out result=""
+  local dry="$1" before after mb rc wt mode out result="" hlist="" hrc=0 hv=0
   # 1) the package cache. `uv cache prune` removes UNUSED entries (safe while lanes resolve); it is
   #    NOT `uv cache clean` — emptying a cache a live lane is reading is the class #1987 forbids.
   if command -v uv >/dev/null 2>&1; then
@@ -578,7 +817,9 @@ run_hygiene() {
       rc=$?
       after="$(du -sm "$CELL_HOME/.cache/uv" 2>/dev/null | awk '{print $1}')"
       log "[hygiene] uv cache prune rc=$rc ${before:-?}MB -> ${after:-?}MB"
-      result="uv ${before:-?}MB->${after:-?}MB"
+      # ⛔ An action that did not take is not a pass (the rule the reap applies to `kill-session`).
+      if [ "$rc" -eq 0 ]; then result="uv ${before:-?}MB->${after:-?}MB"
+      else result="uv prune FAILED rc=$rc (${before:-?}MB -> ${after:-?}MB)"; hv=3; fi
     fi
   else
     result="uv absent"
@@ -587,16 +828,40 @@ run_hygiene() {
   #    ⛔ Never while a worker session is live: the sweep deletes `.venv`, and a lane using it would
   #    re-resolve mid-run (the reason `cmd_start` guards the same delete). The supervisor's `prune`
   #    WARNS about a running controller but does not guard it, so the guard lives here.
-  if [ "$(harness_sessions | awk 'END {printf "%d\n", NR}')" -gt 0 ]; then
+  #    ⛔ The verdict is read, NEVER the count: `$(harness_sessions | awk …)` makes the substitution's
+  #    status awk's, so the 3 this file defines one screen up becomes `0` here — i.e. "no worker is
+  #    live" — and a failed read ARMS the destructive sweep, on the very guard whose comment says it
+  #    must never run while a lane is live. MEASURED pre-fix (`DOCTOR_TMUX_BIN=/nonexistent/tmux`, one
+  #    live `lane-42`): `prune --caches` was invoked and the pass recorded `last_rc=0`, while the same
+  #    fixture with a readable list logged `caches-sweep skipped (workers live)` and invoked nothing.
+  #    `uv cache prune` above is safe while lanes resolve (unused entries only), so it still ran.
+  # ⛔ A failed read skips STEP 2 ONLY. Returning here also skipped step 3 (the worktree reaper), which
+  # needs no session list at all — its own contract preserves any worktree a live process holds (ps
+  # argv + a bounded lsof cwd probe) — so the early return disabled the one role that exists to
+  # prevent a disk-full cell, on a box that was under pressure precisely because it was wedged.
+  hlist="$(harness_sessions)"; hrc=$?
+  if [ "$hrc" -eq 3 ]; then
+    log "[hygiene] CANNOT-VERIFY: the session list could not be read — the worktree-root cache sweep was NOT run (it deletes .venv and node_modules)"
+    result="${result}${result:+; }caches-sweep skipped (cannot-verify)"
+    hv=3
+  elif [ -n "$hlist" ]; then
     log "[hygiene] worker sessions are live — skipping the worktree-root cache sweep"
     result="${result}${result:+; }caches-sweep skipped (workers live)"
   elif [ -n "${SUPERVISOR:-}" ] && [ -f "$SUPERVISOR" ]; then
     if [ "$dry" = "--dry-run" ]; then
       result="${result}${result:+; }would sweep worktree caches"
     else
-      bash "$SUPERVISOR" prune --caches >>"$O/logs/doctor.log" 2>&1 || true
-      result="${result}${result:+; }worktree caches swept"
+      bash "$SUPERVISOR" prune --caches >>"$O/logs/doctor.log" 2>&1
+      rc=$?
+      # ⛔ `|| true` here recorded "worktree caches swept" over a sweep that FAILED — the same
+      # clean-row-over-an-unverified-action shape as the unverified kill, one action over.
+      if [ "$rc" -eq 0 ]; then result="${result}${result:+; }worktree caches swept"
+      else result="${result}${result:+; }caches-sweep FAILED rc=$rc"; hv=3; fi
     fi
+  else
+    # No supervisor path = the sweep cannot be attempted at all. Silent success here told the operator
+    # the disk was reclaimed when nothing ran (measured: `rc=0`, `last_result=… worktree caches swept`).
+    result="${result}${result:+; }caches-sweep cannot-verify (no supervisor)"; hv=3
   fi
   # 3) stale worktrees — the shipped reaper, whose own gates preserve anything dirty, unreferenced or
   #    unreachable. `auto` arms it only under disk pressure: the failure being prevented is a FULL
@@ -611,22 +876,54 @@ run_hygiene() {
     mode="$HYGIENE_WORKTREES"
     if [ "$mode" = "auto" ]; then
       mb="$(free_mb "$CELL_HOME")"
-      if [ -n "$mb" ] && [ "$mb" -lt "$((MIN_FREE_MB * 2))" ]; then mode=apply; else mode=dry-run; fi
+      if [ -z "$mb" ]; then
+        # ⛔ `free_mb`'s own comment says an empty answer is "cannot judge, never enough" — and the
+        # else branch here made it mean exactly "enough": the reaper stayed in dry-run and the pass
+        # reported clean forever on a box whose disk it cannot measure. The SAFE direction is kept
+        # (dry-run, never an armed sweep); the pass is cannot-verify.
+        mode=dry-run; hv=3; result="${result}${result:+; }cannot read free space (sweep stays dry-run)"
+      elif [ "$mb" -lt "$((MIN_FREE_MB * 2))" ]; then mode=apply; else mode=dry-run; fi
     fi
     if [ "$dry" = "--dry-run" ]; then mode=dry-run; fi
     out="$O/logs/doctor-worktrees.log"
     if command -v timeout >/dev/null 2>&1; then
-      timeout "$HYGIENE_TIMEOUT" bash "$wt" "--$mode" --repo "$REPO" --aged-days "$STALE_WORKTREE_DAYS" >>"$out" 2>&1 || true
+      timeout "$HYGIENE_TIMEOUT" bash "$wt" "--$mode" --repo "$REPO" --aged-days "$STALE_WORKTREE_DAYS" >>"$out" 2>&1
     else
-      bash "$wt" "--$mode" --repo "$REPO" --aged-days "$STALE_WORKTREE_DAYS" >>"$out" 2>&1 || true
+      bash "$wt" "--$mode" --repo "$REPO" --aged-days "$STALE_WORKTREE_DAYS" >>"$out" 2>&1
     fi
-    result="${result}${result:+; }worktrees $mode"
+    rc=$?
+    # The shipped reaper's own exit codes are meaningful (0 removed, 2 usage, 3 FAIL-CLOSED abort,
+    # 4 remove-failed) — discarding them recorded a reaper that aborted as `worktrees dry-run`.
+    if [ "$rc" -eq 0 ]; then result="${result}${result:+; }worktrees $mode"
+    else result="${result}${result:+; }worktrees $mode FAILED rc=$rc"; hv=3; fi
   else
-    result="${result}${result:+; }worktree reaper not found"
+    # Not found = the sweep could not even be ATTEMPTED, and a clean pass here told the operator the
+    # worktrees were handled. (`pi-reap-worktrees.sh` is not in the supervisor's required-worker list,
+    # so a `check`-green cell can genuinely lack it.)
+    result="${result}${result:+; }worktrees cannot-verify (no reaper found)"; hv=3
   fi
-  state_write hygiene 0 "$result"
+  # ⛔ A REHEARSAL IS NOT A VERDICT. `--dry-run` is the verb an operator is told to run first, and it
+  # performs no action at all (`uv cache prune` and the sweep are both logged as "WOULD") — so it cannot
+  # know whether the previous failure is fixed. Recording its own rc overwrote a `cannot-verify` with a
+  # clean row and the row-level verdict then read that as health for a whole interval: measured, a real
+  # pass recording `uv prune FAILED rc=1` (status rc=1) followed by `hygiene --dry-run` gave
+  # `last_rc=0` / `status` rc=0. The rehearsal is recorded as such and KEEPS the previous verdict;
+  # an unknown previous verdict stays cannot-verify (fail-closed).
+  if [ "$dry" = "--dry-run" ]; then
+    local prev; prev="$(state_get hygiene last_rc)"
+    case "${prev:-}" in ''|*[!0-9]*) prev=3 ;; esac
+    # ⛔ …and the WORSE of the two, or the fix becomes the same defect pointing the other way: a rehearsal
+    # that itself hit cannot-verify (an unreadable session list, an unreadable disk) returned rc=3 while
+    # recording the PREVIOUS rc=0 — a clean row for the very "box is wedged, operator runs the documented
+    # first verb" case. It is also the only fail-closed answer for the unknown-prev branch.
+    [ "$hv" -gt "$prev" ] && prev="$hv"
+    state_write hygiene "$prev" "dry-run: $result"
+    log "[hygiene] dry-run: $result"
+    return "$hv"
+  fi
+  state_write hygiene "$hv" "$result"
   log "[hygiene] $result"
-  return 0
+  return "$hv"
 }
 
 # ── DOCTOR (reap + keep the ONE dispatcher running) ─────────────────────────────────────────────
@@ -652,9 +949,26 @@ run_doctor() {
   result="reap: $(state_get reap last_result | cut -c1-160)"
   if [ ! -f "$DESIRED" ]; then
     log "[doctor] cell is not started (no $DESIRED) — supervising nothing; reap still ran"
-    state_write doctor 0 "not-started; $result"; return 0
+    # ⛔ The nested reap's verdict is kept HERE too. The supervision half has nothing to do on a stopped
+    # cell, but the pass still took a read it could not complete: recording a 0 next to a
+    # `reap: cannot-verify` result is the clean-row-over-a-failed-read shape this file's own header
+    # says the rc prevents (measured pre-fix: `doctor last_rc=0` beside `reap last_rc=3`).
+    state_write doctor "$rrc" "not-started; $result"; return "$rrc"
   fi
-  if "$TMUX_BIN" has-session -t "=$SESSION" 2>/dev/null; then
+  # ⛔ `session_present`, not `has-session`: a failed tmux read must never become evidence of
+  # ABSENCE, because the branch below RESTARTS the controller on absence. `has-session` answers rc=1
+  # both for "no such session" and for every client/server error, so a blind read would restart a
+  # live cell's controller and report `controller RESTARTED` from a read that proved nothing.
+  local sp=0
+  session_present "$SESSION" || sp=$?
+  if [ "$sp" -eq 3 ]; then
+    log "[doctor] CANNOT-VERIFY: the controller session could not be read — NOT restarting (a restart decided from a failed read answers a question nobody asked); reap and the independent merge role continue"
+    result="$result; controller cannot-verify (the tmux read failed)"
+    state_write doctor 3 "$result"
+    log "[doctor] $result"
+    return 3
+  fi
+  if [ "$sp" -eq 0 ]; then
     hb="$(cat "$O/heartbeat" 2>/dev/null)"
     case "${hb:-}" in ''|*[!0-9]*) hb=0 ;; esac
     if [ "$hb" -gt 0 ]; then
@@ -680,16 +994,23 @@ run_doctor() {
         bash "$SUPERVISOR" start >>"$O/logs/doctor.log" 2>&1
       fi
       rc=$?
+      # ⛔ The verdict is KEPT, not just printed: this is an action the pass took
+      # (`supervisor start`), and one that did not take is exactly what the header's rc=3 clause
+      # names. Measured pre-fix: `controller restart FAILED (supervisor start rc=1)` with
+      # `last_rc=0` beside it and `status` showing a green doctor row for a controller that is not
+      # running — the false-clean shape this whole file exists to remove.
       if [ "$rc" -eq 0 ]; then
         log "[doctor] controller restarted (supervisor start rc=0)"
         result="$result; controller RESTARTED"
       else
         log "[doctor] controller restart FAILED (supervisor start rc=$rc) — see $O/logs/doctor.log"
         result="$result; controller restart FAILED rc=$rc"
+        [ "$rrc" -ne 0 ] || rrc=3
       fi
     else
       log "[doctor] CANNOT-VERIFY: controller absent and DOCTOR_SUPERVISOR is not a file — cannot restart"
       result="$result; controller restart cannot-verify (no supervisor)"
+      [ "$rrc" -ne 0 ] || rrc=3
     fi
   fi
   # A nested reap that could not be taken makes THIS pass partial too: the supervision half ran, but
@@ -727,6 +1048,15 @@ role_row() { # <role> <stale-bound-seconds>
     printf '%-8s STALE     no pass in %ss (bound %ss)\n' "$role" "$age" "$bound"
     return 1
   fi
+  # ⛔ The VERDICT the row prints, carried by the exit status. A role whose last pass recorded
+  # cannot-verify — or whose record holds no readable rc — is not a healthy cell, and printing `rc=3`
+  # in prose while exiting 0 is the same row in words: a monitoring probe reads the status, not the
+  # text. This is the row-level half of the same rule `cmd_status` applies to the cell-level verdict.
+  case "${rc:-}" in
+    ''|*[!0-9]*) printf '%-8s VERDICT   last pass recorded no readable rc — cannot-verify\n' "$role"; return 1 ;;
+    0) : ;;
+    *) printf '%-8s VERDICT   last pass recorded rc=%s (cannot-verify)\n' "$role" "$rc"; return 1 ;;
+  esac
   return 0
 }
 

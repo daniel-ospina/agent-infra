@@ -1037,7 +1037,8 @@ looked healthy while producing nothing. This is the §6.5 opening requirement's 
 NOTICE, DECIDE and ACT on a schedule that does not depend on the controller being healthy"* applied
 to the cell, and the doctor is the something.
 
-**Implementation: `cloud-cell-doctor.sh`**, launched as tmux session `cell-doctor-<SESSION>` by
+**Implementation: `cloud-cell-doctor.sh`**, launched as tmux session `cell-doctor` (the
+`$DOCTOR_SESSION` default — a fixed name, not derived from `$SESSION`) by
 `cloud-cell-supervisor.sh start` (removed by `stop`; `.desired` in `state/roles/` records the
 intent so a `stop` is not undone by the next pass). Roles, each idempotent with its own lock and
 its own `state/roles/<role>.state` last-pass record:
@@ -1049,7 +1050,7 @@ its own `state/roles/<role>.state` last-pass record:
 | `merge` | 300 s | land PRs that already have a **clean attestation at THIS head** by EXECUTING `scripts/admin-merge.sh` — the standard rail, never a re-implementation |
 | `hygiene` | 3600 s | `uv cache prune` (not `cache clean`), worktree-root caches, and the **shipped** `pi-reap-worktrees.sh` (dry-run unless `HYGIENE_WORKTREES=apply`, or `auto` + the box is under disk pressure) |
 | `loop` | 10 s tick | the timer; every role also runs once immediately on start |
-| `status` | — | the liveness table; **exit 1** when a started cell has a role that never ran or went stale. A loop younger than `DOCTOR_GRACE_S` (300 s) prints `WAITING` instead — its first doctor pass samples every lane, so `start && status` must not call a healthy cell dead; a cell with no loop-age record is judged immediately (fail-closed) |
+| `status` | — | the liveness table; **exit 1** when a started cell has a role that never ran, went stale, or whose last pass recorded a **non-zero / unreadable verdict** (the `VERDICT` row — printing a verdict in prose while exiting 0 is the same row in words, and a monitoring probe reads the exit status). A loop younger than `DOCTOR_GRACE_S` (300 s) prints `WAITING` instead — its first doctor pass samples every lane, so `start && status` must not call a healthy cell dead; a cell with no loop-age record is judged immediately (fail-closed) |
 
 **The reap decision is the safety core**, and it is the §6.5.1 rules applied to the fleet
 namespace: a session is a candidate only if its log has not grown for `REAP_MIN_S` (**2700 s**, above
@@ -1057,7 +1058,9 @@ the controller's own `STALE_MIN=40` and the harness stall bound); the decision t
 observations** `REAP_SAMPLE_S` apart; and the lane's **subtree must show no CPU delta**, because a
 long model call is not a wedge. The whole read has an **overall** budget (`REAP_TIMEOUT`, 300 s) —
 a per-call bound would let the total grow with the fleet — and each `tmux`/`ps` call is separately
-bounded (`READ_CALL_TIMEOUT`). A pass that spends the budget STOPS at the lane it reached and
+bounded (`READ_CALL_TIMEOUT`) **where `timeout(1)` exists** (every Linux cell has it); without it the
+per-call bound degrades to unbounded and only the between-reads `REAP_TIMEOUT` check applies, which a
+hung call never reaches. A pass that spends the budget STOPS at the lane it reached and
 records `rc=3 cannot-verify`; it never acts on a partial read and never reports the lanes it did not
 reach as quiet (§6.5.2, and the 800-failed-passes measurement there). Three exclusions are hard: a session with an **attached client**, a
 session whose ancestry reaches a **human terminal**, and a session with **no log** are reported and
@@ -1069,13 +1072,15 @@ review state is not the Mac's). It does not review, classify checks or merge on 
 that is `merge-one.sh`'s job, and #1872 measured two classifiers disagreeing on 4 of 11 live PRs.
 A refusal is recorded **verbatim** (with its reason), the pass still exits 0 (a refusal is data, not
 a failed read), and the same head is not retried for `MERGE_RETRY_S` (**3600 s**) — a new push moves
-the head and re-arms it. An unreadable open-PR listing is `rc=3`, never an empty queue.
+the head and re-arms it. An unreadable open-PR listing is `rc=3`, never an empty queue; the read is
+bounded by `MERGE_READ_TIMEOUT` (**60 s**, and a bound of `0` is refused at startup because `timeout 0`
+runs the command with *no* timeout at all), so a hung `gh` cannot stall the role with its lock held.
 
 **Status: IMPLEMENTED for a cell started by the current supervisor.** Three residuals, named:
 
 - **It runs only where `start` launched it.** The supervisor starts the loop, so a cloud cell gets it;
   a Mac cell's `orch-loop.sh` launchd job does not, and nothing schedules the doctor there.
-- **`cmd_check` now refuses a cell without it** (it is in the required-worker list, `:977`), so a cell
+- **`cmd_check` now refuses a cell without it** (it is in `cmd_check`'s required-worker list), so a cell
   pinned to an older harness fails `check`/`start` loudly instead of silently running one loop — the
   correct direction, but it means the pin must be moved before those cells can start again.
 - **Landing is not releasing.** The merge role gets a PR merged; it does not delete branches, reap a
@@ -1593,7 +1598,7 @@ algorithmic advantage. The claim worth evaluating is *utilisation*, not *efficie
 | `test-crossbox.sh` | drives the real `merge-one.sh` claim acquire + trap release with `gh` stubbed. Not part of the loop |
 | `refresh-scout.test.sh` | the agent-infra#1736 contract — repo-aware scout provisioning, per-repo tool resolution, the permanent/transient refresh split — plus the agent-infra#1850 issue-claim pre-flight verdict table (CLEAN/COLLISION/INCOMPLETE/NOT PROVISIONABLE/unrecognised), the dispatch-side claim, and the fenced + generation-guarded release. Not part of the loop |
 | `check-port-drift.sh` | gates the tortoise-side removal: fails if the tortoise harness moved past the pinned sync point (`port-provenance.txt`). Not part of the loop |
-| `cloud-cell-doctor.sh` | the cell's scheduled roles — `reap` / `doctor` / `merge` / `hygiene` / `status` (§6.5.7). Launched as tmux `cell-doctor-<SESSION>` by `cloud-cell-supervisor.sh start`; `merge` EXECUTES `scripts/admin-merge.sh` and never re-implements it |
+| `cloud-cell-doctor.sh` | the cell's scheduled roles — `reap` / `doctor` / `merge` / `hygiene` / `status` (§6.5.7). Launched as tmux `cell-doctor` (`$DOCTOR_SESSION`) by `cloud-cell-supervisor.sh start`; `merge` EXECUTES `scripts/admin-merge.sh` and never re-implements it |
 | `cloud-cell-doctor.test.sh` | #1989: drives the shipped doctor and the supervisor's role verbs against stubbed tmux/ps/rail — a lane whose child is still writing is NOT reaped, an attached/human-tty lane is NOT touched, the rail is gated on a clean attestation at the head, a refusal is recorded and not retried at the same head, and `status` FAILS a started cell whose roles never ran. A CI shard |
 | `cloud-cell-record-dep.test.sh` | #1717: drives `cloud-cell-supervisor.sh check/start` and `merge-one.sh` against a stubbed toolchain — the recorder is a checked, provisioned dependency, and a record failure parks. Registered in `scripts/run-bash-shards.sh`, so both CI lanes run it |
 | `check-deployed-drift.sh` | answers whether the DEPLOYED `$O` matches the repo: the recorded commit against the live ref (`merge-base --is-ancestor`, never a commit count), the recorded payload hash against the deployed bytes, and every repo-shipped `*.sh` blob against its `$O` copy. Exit 0 match / 1 drift / **2 UNKNOWN — never a pass** (agent-infra#1745). Not part of the loop |

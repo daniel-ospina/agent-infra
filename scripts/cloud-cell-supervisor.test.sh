@@ -44,8 +44,14 @@ BRINGUP="$HERE/cloud-cell-bringup.sh"
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS + 1)); echo "  ✅ $1"; }
 bad() { FAIL=$((FAIL + 1)); echo "  ❌ $1"; }
+# ⛔ SKIP is INITIALISED: this suite runs under `set -u`, where `SKIP=$((SKIP + 1))` on an unset variable
+# is a FATAL error — so on a root box the first skip() aborted the run mid-suite and every arm after it
+# silently never executed. (cloud-cell-bringup.test.sh initialises all three the same way.)
+SKIP=0
+skip() { SKIP=$((SKIP + 1)); echo "  ⏭ SKIPPED — $1"; }
 
 T="$(mktemp -d "${TMPDIR:-/tmp}/cloud-cell-test.XXXXXX")"
+ST_LOOP=""
 # ⛔ HERMETIC means the CALLER's environment must not decide a fixture. agent-infra#1901 makes `OR`
 # (the queue's owner/repo) a VALIDATED INPUT — derived from the checkout unless declared — so an
 # ambient `OR` in a developer's shell would be judged against every fixture checkout (which carries a
@@ -61,7 +67,9 @@ ai1711_cleanup() {
   [ -n "${AI1711_SOCKS:-}" ] || return 0
   for s in $AI1711_SOCKS; do tmux -L "$s" kill-server >/dev/null 2>&1 || true; done
 }
-trap 'ai1711_cleanup; rm -rf "$T"' EXIT
+# ⛔ The loop fixtures (`sleep 60 &`) must not outlive the suite on an interrupt either: §13's
+# `ST_LOOP` is killed inline on the happy path, and here on every other path.
+trap '[ -n "${ST_LOOP:-}" ] && kill -TERM "$ST_LOOP" 2>/dev/null; ai1711_cleanup; rm -rf "$T"' EXIT
 
 for f in "$SUP" "$BRINGUP"; do
   [ -f "$f" ] && ok "shipped script present: $(basename "$f")" || { bad "missing $f"; exit 1; }
@@ -378,6 +386,10 @@ sub="${1:-}"; shift
 case "$sub" in
   has-session)
     n=""; while [ $# -gt 0 ]; do case "$1" in -t) n="$2"; shift 2 ;; *) shift ;; esac; done
+    # ⛔ tmux's `=name` is an EXACT-match prefix, not part of the session name: the shipped script
+    # reads the doctor session that way (`has-session -t "=$DOCTOR_SESSION"`), and a double that keeps
+    # the `=` looks for `up.=cell-doctor` and answers "the session is gone" for a live one.
+    n="${n#=}"
     no_server && exit 1
     [ -n "$n" ] && [ -f "$S/up.$n" ] && exit 0; exit 1 ;;
   show-options)
@@ -393,6 +405,20 @@ case "$sub" in
     [ "${1:-}" = "update-environment" ] || exit 1
     shift
     printf '%s' "${1:-}" | tr ' ' '\n' | grep . > "$S/update-env" || true
+    exit 0 ;;
+  ls)
+    # ⛔ Both FORMATS are modelled. `-F '#{session_name}'` prints bare names (what the shipped reader
+    # asks for); a plain `ls` prints tmux's display line, so a future edit that drops `-F` answers
+    # ABSENT for a LIVE session here instead of passing silently.
+    no_server && { printf 'no server running on /tmp/tmux-1000/default\n' >&2; exit 1; }
+    names=""
+    for f in "$S"/up.*; do
+      [ -f "$f" ] || continue
+      names="${names}${names:+
+}${f##*/up.}"
+    done
+    if [ "${1:-}" = "-F" ]; then printf '%s\n' "$names" | sed '/^$/d'
+    else while IFS= read -r n; do [ -n "$n" ] && printf '%s: 1 windows (created Thu Oct 15 21:00:00 2026)\n' "$n"; done <<<"$names"; fi
     exit 0 ;;
   new-session)
     if no_server; then
@@ -711,8 +737,23 @@ cat > "$P/bin/tmux" <<'SH'
 #!/bin/bash
 case "${1:-}" in
   has-session) [ -f "${PROV_TMUX_UP:-/nonexistent}" ] && exit 0; exit 1 ;;
-  new-session) : > "${PROV_TMUX_UP:-/dev/null}"; exit 0 ;;
-  ls) if [ -n "${PROV_TMUX_STREAM:-}" ]; then printf 'merge-1: x\n'; i=0; while [ "$i" -lt 60000 ]; do printf 'other-%s: y\n' "$i"; i=$((i+1)); done; exit 0; fi
+  new-session) sess=""; while [ $# -gt 0 ]; do case "$1" in -s) sess="$2"; shift 2 ;; *) shift ;; esac; done
+               : > "${PROV_TMUX_UP:-/dev/null}"; printf '%s\n' "$sess" > "${PROV_TMUX_UP:-/dev/null}.name"; exit 0 ;;
+  ls)
+      # A read that cannot be taken (the guard in front of the unattended prune must not read it as
+      # "no workers live") …
+      [ -n "${PROV_TMUX_FAIL_LS:-}" ] && { printf 'error connecting to /tmp/tmux-0/default (Permission denied)\n' >&2; exit 1; }
+      # …and one that fails only from the Nth read on: `start`'s own guard has already passed by then,
+      # so the read in front of the UNATTENDED cache prune is the one that cannot be taken.
+      if [ -n "${PROV_TMUX_FAIL_LS_AFTER:-}" ]; then
+        n=0; [ -f "${PROV_TMUX_UP}.reads" ] && n="$(cat "${PROV_TMUX_UP}.reads")"
+        n=$((n + 1)); printf '%s\n' "$n" > "${PROV_TMUX_UP}.reads"
+        [ "$n" -ge "$PROV_TMUX_FAIL_LS_AFTER" ] && { printf 'error connecting to /tmp/tmux-0/default (Permission denied)\n' >&2; exit 1; }
+      fi
+      if [ -n "${PROV_TMUX_STREAM:-}" ]; then printf 'merge-1: x\n'; i=0; while [ "$i" -lt 60000 ]; do printf 'other-%s: y\n' "$i"; i=$((i+1)); done; exit 0; fi
+      # … otherwise the session `new-session` started, plus anything the arm seeds. Bare names: the
+      # shipped call asks for `-F '#{session_name}'`.
+      if [ -f "${PROV_TMUX_UP:-/nonexistent}" ] && [ -f "${PROV_TMUX_UP}.name" ]; then cat "${PROV_TMUX_UP}.name"; fi
       [ -n "${PROV_TMUX_SESSIONS:-}" ] && printf '%s\n' "$PROV_TMUX_SESSIONS"; exit 0 ;;
   *) exit 0 ;;
 esac
@@ -741,7 +782,7 @@ printf '#!/bin/bash\nexit 1\n' > "$P/nodfbin/df"; chmod +x "$P/nodfbin/df"   # d
 PH=""; PPATH=""; PREF=""; PROV_OUT=''; PROV_RC=0
 prov() {
   local sub="$1"; shift
-  rm -f "$P/tmuxup"
+  rm -f "$P/tmuxup" "$P/tmuxup.reads"
   PROV_OUT="$(PATH="${PPATH:+$PPATH:}$P/bin:$PATH" PROV_TMUX_UP="$P/tmuxup" \
               CELL_HOME="$P/home" ENV_FILE="$P/keys.env" SESSION="ai1745-$$" \
               O="$P/o" REPO="$P/repo" HARNESS_REPO="$AI" HARNESS_FETCH=0 HARNESS_REF="${PREF:-origin/main}" \
@@ -1066,6 +1107,18 @@ PROV_TMUX_STREAM=1 PPATH="$P/prunebin" prov start
                        || bad "start pruned a LIVE worker's .venv — 'tmux ls | grep -q' took SIGPIPE and read a MATCH as no match"
 unset PROV_TMUX_STREAM
 PPATH=""
+# ⛔ The read in front of the UNATTENDED `rm -rf` of `.venv`/`node_modules`, on its own: `start`'s guard
+# has already answered (first read), and the worker count cannot be taken (second read). A count would
+# have printed `0` = "no worker is live" and armed the delete; the VERDICT must skip it.
+rm -rf "$P/repo/.venv"; mkdir -p "$P/repo/.venv"; printf 'x\n' > "$P/repo/.venv/marker"
+PROV_TMUX_FAIL_LS_AFTER=2 PPATH="$P/prunebin" prov start
+[ -d "$P/repo/.venv" ] && ok "start: an unreadable worker list does NOT arm the unattended cache prune" \
+                        || bad "start: pruned caches on a session list it could not read"
+case "$PROV_OUT" in
+  *"could NOT be read"*) ok "start: says the worker list could not be read and names the consequence" ;;
+  *) bad "start: the skip is silent — $PROV_OUT" ;;
+esac
+unset PROV_TMUX_FAIL_LS_AFTER
 
 # ── 10) PRUNE: the destructive verb (agent-infra#1745) ─────────────────────────────────────────────
 # `prune` owns every `rm -rf` in this file and had NO test at all. Two guards had none either: (i) the
@@ -1089,12 +1142,34 @@ mkdir -p "$R/repo/.venv" "$R/repo-wt/.venv" "$R/repo-wt/node_modules" "$R/repo-w
 printf 'x\n' > "$R/repo/.venv/marker"; printf 'x\n' > "$R/repo-wt/.venv/marker"
 printf 'x\n' > "$R/repo-wt/sub/__pycache__/x.pyc"
 prunesup --caches
+[ "$PR_RC" -eq 0 ] && ok "prune --caches exits 0 when every removal succeeded (the positive control)" \
+                 || bad "prune reported a FAILURE over a sweep that succeeded (rc=$PR_RC) — $PR_OUT"
 [ -e "$R/repo-wt/.venv" ] && bad "prune --caches did NOT reach the LINKED worktree's .venv (the incident's case)" \
                           || ok "prune --caches reclaimed the LINKED worktree's .venv"
 [ -e "$R/repo-wt/node_modules" ] && bad "linked-worktree node_modules survived" || ok "linked-worktree node_modules reclaimed"
 [ -e "$R/repo-wt/.pytest_cache" ] && bad "linked-worktree .pytest_cache survived" || ok "linked-worktree .pytest_cache reclaimed"
 [ -e "$R/repo-wt/sub/__pycache__" ] && bad "linked-worktree __pycache__ survived" || ok "linked-worktree __pycache__ reclaimed"
 [ -e "$R/repo/.venv" ] && bad "the main checkout's .venv survived" || ok "the main checkout is still swept too"
+# ⛔ A removal that FAILED must reach the caller's exit status. `rm_cache` printed its warning and
+# returned `say`'s 0, and `prune --caches` ended in a literal `return 0`, so a `.venv` this user cannot
+# remove (root-owned from a container, read-only mount) was a clean sweep — and the doctor's hygiene
+# role recorded "worktree caches swept" over it. Measured with a .venv under an unwritable root.
+if [ "$(id -u)" = 0 ]; then
+  skip "root can remove a mode-500 entry — this fixture cannot exercise the failure (prune's rc wiring)"
+else
+QW="$R/qw"; mkdir -p "$QW/home" "$QW/repo/.venv"; ai_init_repo "$QW/repo"; mkdir -p "$QW/repo/.venv"
+printf 'x\n' > "$QW/repo/.venv/marker"; chmod 500 "$QW/repo"
+QW_OUT="$(CELL_HOME="$QW/home" ENV_FILE="$QW/keys.env" SESSION="ai1745-prune-$$" O="$QW/o" REPO="$QW/repo" \
+          HARNESS_REPO="$QW/repo" HARNESS_FETCH=0 HARNESS="$QW/repo" SCRATCH_ROOT="$R/scratch" \
+          HARNESS_PIN_DIR="$QW/pin" HARNESS_PIN_FILE="$QW/home/.harness-path" \
+          bash "$SUP" prune --caches 2>&1)"; QW_RC=$?
+chmod 700 "$QW/repo"
+[ -e "$QW/repo/.venv" ] || bad "the undeletable .venv went away — the fixture did not exercise the failure"
+[ "$QW_RC" -ne 0 ] && ok "prune --caches exits NON-ZERO when a cache could not be removed (rc=$QW_RC)" \
+                   || bad "prune --caches reported a clean sweep over a cache it could not remove"
+case "$QW_OUT" in *"could not remove"*) ok "prune names the path it could not remove" ;;
+  *) bad "prune is silent about the failed removal — $QW_OUT" ;; esac
+fi
 # (ii) --scratch: a registered worktree is unmerged work and must survive; an unregistered old
 # checkout is what the flag exists to reclaim.
 git -C "$R/repo" worktree add -q --detach "$R/scratch/registered" HEAD
@@ -1104,8 +1179,25 @@ touch -t 202001010000 "$R/scratch/registered" "$R/scratch/stale"
 prunesup --scratch=0
 [ -e "$R/scratch/registered/WIP.txt" ] && ok "prune --scratch did NOT delete a REGISTERED worktree (unmerged work protected)" \
                                        || bad "prune --scratch DELETED a registered worktree — unmerged work lost"
+[ "$PR_RC" -eq 0 ] && ok "prune --scratch exits 0 when every deletion succeeded (the clean direction)" \
+                  || bad "prune --scratch reported a FAILURE over a clean sweep (rc=$PR_RC) — $PR_OUT"
 [ -e "$R/scratch/stale" ] && bad "prune --scratch did not delete an old, unregistered scratch checkout" \
                           || ok "prune --scratch deleted an old, unregistered scratch checkout"
+# ⛔ …and a checkout it could NOT delete is not a clean pass either: the scratch path is the other
+# caller of `rm_cache`, and it discarded the failure while marking the directory freed (dropping it from
+# the "still on disk" list the operator reads). Permission-based, so it is guarded like the caches arm.
+if [ "$(id -u)" = 0 ]; then
+  skip "root can remove a mode-500 checkout — the scratch failure path is not exercisable here"
+else
+  git init -q "$R/scratch/locked"; touch -t 202001010000 "$R/scratch/locked"; chmod 500 "$R/scratch/locked"
+  prunesup --scratch=0
+  chmod 700 "$R/scratch/locked"
+  [ -d "$R/scratch/locked" ] || bad "the undeletable scratch checkout went away — the fixture did not exercise the failure"
+  [ "$PR_RC" -ne 0 ] && ok "prune --scratch exits NON-ZERO when a checkout could not be removed (rc=$PR_RC)" \
+                     || bad "prune --scratch reported a clean pass over a checkout it could not delete"
+  case "$PR_OUT" in *"could not remove"*) ok "prune names the scratch path it could not remove" ;;
+    *) bad "prune is silent about the failed scratch removal — $PR_OUT" ;; esac
+fi
 
 # ── (iii) the second review round: validated floor, atomic stamp, mirroring, per-commit pins ─────
 say_case "review round: floor validation, atomic stamp, seeding mirror, per-commit pins (#1745)"
@@ -1325,6 +1417,9 @@ BC="$(git -C "$AI" worktree list --porcelain | grep -c '^worktree ')"
 CELL_HOME="$D/home" ENV_FILE="$D/keys.env" SESSION="ai1745-dereg-$$" O="$D/o" REPO="$D/repo" \
   HARNESS_REPO="$AI" HARNESS_FETCH=0 HARNESS="$D/pin/111111111111/scripts/orchestrator-harness" \
   HARNESS_PIN_DIR="$D/pin" HARNESS_PIN_FILE="$D/home/.harness-path" bash "$SUP" prune --caches >/dev/null 2>&1
+DEREG_RC=$?
+[ "$DEREG_RC" -eq 0 ] && ok "prune exits 0 on the clean pin-reclaim path (the clean direction)" \
+                      || bad "prune reported a FAILURE over a clean pin reclaim (rc=$DEREG_RC)"
 AC="$(git -C "$AI" worktree list --porcelain | grep -c '^worktree ')"
 [ ! -e "$D/pin/000000000000" ] && ok "prune reclaimed the superseded pin's directory" \
                                   || bad "prune kept the superseded pin on disk"
@@ -1332,6 +1427,30 @@ AC="$(git -C "$AI" worktree list --porcelain | grep -c '^worktree ')"
                             || bad "prune left a phantom worktree record: registrations $BC -> $AC (expected $((BC - 1)))"
 [ -d "$D/pin/111111111111" ] && ok "prune kept the ACTIVE pin on disk" \
                               || bad "prune deleted the ACTIVE pin"
+
+# ⛔ …and the THIRD caller of `rm_cache` — the pin-reclaim fallback — folds its failure the same way.
+# Without this arm, deleting the fold leaves the suite green (measured): `prune` is the command the
+# operator is told to run to free space, so a failure it swallows is a failure nobody sees.
+say_case "prune's pin-reclaim path propagates a removal it could not complete"
+if [ "$(id -u)" = 0 ]; then
+  skip "root can remove a mode-500 pin root — this fixture cannot exercise the failure"
+else
+  PF="$T/pinfail"; mkdir -p "$PF/home" "$PF/pin"
+  git -C "$AI" worktree add -q --detach "$PF/pin/000000000000" origin/main
+  git -C "$AI" worktree add -q --detach "$PF/pin/111111111111" origin/main
+  printf '%s\n' "$PF/pin/111111111111/scripts/orchestrator-harness" > "$PF/home/.harness-path"
+  chmod 500 "$PF/pin"
+  PF_OUT="$(CELL_HOME="$PF/home" ENV_FILE="$PF/keys.env" SESSION="ai1745-pf-$$" O="$PF/o" REPO="$PF/repo" \
+            HARNESS_REPO="$AI" HARNESS_FETCH=0 HARNESS="$PF/pin/111111111111/scripts/orchestrator-harness" \
+            HARNESS_PIN_DIR="$PF/pin" HARNESS_PIN_FILE="$PF/home/.harness-path" \
+            bash "$SUP" prune --caches 2>&1)"; PF_RC=$?
+  chmod 700 "$PF/pin"
+  [ -d "$PF/pin/000000000000" ] || bad "the unreclaimable pin went away — the fixture did not exercise the failure"
+  [ "$PF_RC" -ne 0 ] && ok "prune exits NON-ZERO when a superseded pin could not be reclaimed (rc=$PF_RC)" \
+                     || bad "prune reported a clean pass over a pin it could not reclaim"
+  [ -d "$PF/pin/111111111111" ] && ok "prune kept the ACTIVE pin (the failure did not widen)" \
+                                || bad "prune deleted the ACTIVE pin while failing on the superseded one"
+fi
 
 # (i) A `case` allow-list of digits cannot see that `00`/`000` evaluate to zero (or that `010` is OCTAL
 # 8 in arithmetic): the floor this line exists to make un-disarmable was still bypassable by spelling.
@@ -1464,9 +1583,11 @@ case "${1:-}" in
   new-session)
     sess=""; cmd=""
     while [ $# -gt 0 ]; do case "$1" in -d) shift ;; -s) sess="$2"; shift 2 ;; -c) shift 2 ;; *) cmd="$1"; shift ;; esac; done
-    : > "$S/up"; printf '%s\n' "$cmd" > "$S/cmd"
+    : > "$S/up"; printf '%s\n' "$sess" > "$S/name"; printf '%s\n' "$cmd" > "$S/cmd"
     exit 0 ;;
-  ls) exit 0 ;;
+  # ⛔ The read the shipped code now takes: it must report what `new-session` started, or the
+  # post-launch verification reads a live controller as absent.
+  ls) [ -f "$S/up" ] && cat "$S/name" 2>/dev/null; exit 0 ;;
   *) exit 0 ;;
 esac
 SH
@@ -1647,9 +1768,408 @@ case "$Q_OUT" in
   *) bad "status's mismatch line does not name both sides — $Q_OUT" ;;
 esac
 
+# ── 13) THE CELL'S OTHER ROLES (agent-infra#1989) ────────────────────────────────────────────────
+# Measured 2026-10-18 on pi-cell-2/pi-cell-3: the supervisor's whole vocabulary was
+# `check|start|stop|status|logs|apply|prune`, so a cell could DISPATCH and nothing on the box could
+# repair a red PR, land a green one, or reap a wedge. On the pre-#1989 script every arm below is
+# unreachable — `doctor` prints usage and exits 2 — which is what makes this section non-vacuous.
+say_case "the cell's other roles: doctor|merge|reap|hygiene, and a status that fails a dead role (#1989)"
+R="$T/roles"; mkdir -p "$R/bin" "$R/home"
+
+# A per-SESSION tmux double. §12's is a single `up` flag, which cannot tell the controller and the
+# doctor apart — the pair this section is about — and cannot say WHICH session died. ⛔ `-t name`
+# PREFIX-matches when no exact session exists, exactly like tmux: that is what makes the `=name` arm
+# below meaningful (measured: `tmux has-session -t cell-doctor` answered YES for `cell-doctor-other`).
+cat > "$R/bin/tmux" <<'SH'
+#!/bin/bash
+S="${R_STATE:?}"
+mkdir -p "$S"
+printf '%s\n' "$*" >> "$S/argv"
+sub="${1:-}"; shift
+arg() { local want="$1"; shift; while [ $# -gt 0 ]; do if [ "$1" = "$want" ]; then printf '%s' "$2"; return 0; fi; shift; done; }
+case "$sub" in
+  has-session)
+    # ⛔ Faithful to tmux (measured 3.4), INCLUDING the precedence: an EXACT match wins, and a bare
+    # target resolves by prefix ONLY when exactly ONE session matches — two matches is
+    # `can't find session` (rc=1), not a hit. The sibling `kill-session` branch below already models
+    # this; a read gate that is MORE PERMISSIVE than the real tool cannot see the failure it guards.
+    n="$(arg -t "$@")"; base="${n#=}"
+    case "$n" in
+      =*) grep -qx -- "$base" "$S/sessions" 2>/dev/null ;;
+      *)  if grep -qx -- "$base" "$S/sessions" 2>/dev/null; then exit 0; fi
+          [ "$(grep -c -- "^$base" "$S/sessions" 2>/dev/null | tr -d ' ' || true)" = "1" ] ;;
+    esac
+    exit $? ;;
+  new-session)
+    sess=""; cmd=""
+    while [ $# -gt 0 ]; do case "$1" in -d) shift ;; -s) sess="$2"; shift 2 ;; -c) shift 2 ;; *) cmd="$1"; shift ;; esac; done
+    # Starting a session creates the SERVER: the cold-start marker can no longer be true afterwards.
+    rm -f "$S/no-socket"
+    printf '%s\n' "$sess" >> "$S/sessions"
+    printf '%s\n' "$cmd" > "$S/cmd.$sess"
+    exit 0 ;;
+  kill-session)
+    # ⛔ Faithful to tmux, INCLUDING the destructive half AND its PRECEDENCE: an EXACT match wins
+    # even when longer names also start with the target (measured on tmux 3.4: with `cell` and
+    # `cell-doctor-other` alive, `kill-session -t cell` destroys `cell`); only when no exact name
+    # exists does a bare target resolve by PREFIX, and then only a single match is accepted
+    # (otherwise `can't find session`). A double that exact-matched a bare name would be STRICTER
+    # than the real tool on the one path that destroys a session, so the suite could never see a
+    # wrong-target kill — and one that prefix-killed regardless would let a buggy bare target look
+    # correct in the coexistence case the arms below actually construct.
+    n="$(arg -t "$@")"; printf '%s\n' "$n" >> "$S/killed"
+    base="${n#=}"
+    if grep -qx -- "$base" "$S/sessions" 2>/dev/null; then
+      pat="^$base\$"
+    elif [ "$(grep -c -- "^$base" "$S/sessions" 2>/dev/null | tr -d ' ' || true)" = "1" ]; then
+      pat="^$base"
+    else
+      exit 1
+    fi
+    grep -v -- "$pat" "$S/sessions" > "$S/s.tmp" 2>/dev/null || true
+    mv -f "$S/s.tmp" "$S/sessions" 2>/dev/null || : > "$S/sessions"
+    exit 0 ;;
+  ls)
+    # ⛔ A refused connection, NOT the `(No such file or directory)` form: on tmux 3.4 that one means
+    # the socket file does not exist — a box where no server has ever started — which is an EMPTY
+    # namespace and is exactly the COLD START `start` performs (measured: the real-tmux cold-start arms
+    # go red if `start` treats it as cannot-verify).
+    [ -f "$S/fail-ls" ] && { printf 'error connecting to /tmp/tmux-0/default (Permission denied)\n' >&2; exit 1; }
+    [ -f "$S/no-socket" ] && { printf 'error connecting to /tmp/tmux-0/default (No such file or directory)\n' >&2; exit 1; }
+    # ⛔ Both formats, or a dropped `-F` is invisible: bare names for `-F '#{session_name}'`, tmux's
+    # display line otherwise (which a literal name match answers ABSENT for).
+    if [ "${1:-}" = "-F" ]; then cat "$S/sessions" 2>/dev/null
+    else while IFS= read -r n; do [ -n "$n" ] && printf '%s: 1 windows (created Thu Oct 15 21:00:00 2026)\n' "$n"; done < "$S/sessions" 2>/dev/null; fi
+    exit 0 ;;
+  *) exit 0 ;;
+esac
+SH
+chmod +x "$R/bin/tmux"
+printf '#!/bin/bash\nexit 0\n' > "$R/bin/gh"; chmod +x "$R/bin/gh"
+stub_missing "$R/bin" pi
+
+# The role double records the argv AND the environment the supervisor hands it, so an arm can assert
+# the doctor runs as THIS cell (its own $CELL_HOME review store, its own $O) and exits with the rc the
+# arm asks for. It is a double, never a re-implementation: the doctor's own decisions are the doctor
+# suite's business.
+rwrite_doctor() { # <state dir> <rc> [<line to print>]
+  mkdir -p "$1/o/logs" || return 1
+  cat > "$1/o/cloud-cell-doctor.sh" <<SH
+#!/bin/bash
+printf '%s\n' "\$*" >> "$1/doctor-argv"
+printf 'CELL_HOME=%s\nO=%s\nREPO=%s\nOR=%s\nSESSION=%s\n' "\$CELL_HOME" "\$O" "\$REPO" "\$OR" "\$SESSION" > "$1/doctor-env"
+printf '%s\n' '${3:-}'
+exit $2
+SH
+  chmod +x "$1/o/cloud-cell-doctor.sh"
+}
+
+R_OUT=''; R_RC=0
+rsup() { # <verb> <state dir> [VAR=value …]   — R_KEEP=1 (a SHELL var) preserves a pre-seeded dir
+  local sub="$1" st="$2"; shift 2
+  if [ "${R_KEEP:-0}" != 1 ]; then
+    rm -rf "$st"; mkdir -p "$st/home"
+    # Written AFTER the wipe, or the fixture would delete its own double and a REAL role would run.
+    rwrite_doctor "$st" "${R_DOCTOR_RC:-0}" "${R_DOCTOR_SAY:-}"
+  fi
+  mkdir -p "$st/home"
+  R_OUT="$(env -u OR "$@" R_STATE="$st/tmux" PATH="$R/bin:$PATH" CELL_HOME="$st/home" \
+           ENV_FILE="$st/keys.env" SESSION="ai1989-$$" O="$st/o" REPO="$Q/tortoise-repo" \
+           HARNESS="$Q/harness" HARNESS_REPO="$AI" HARNESS_FETCH=0 HARNESS_REF="$Q_REF" \
+           bash "$SUP" "$sub" 2>&1)"
+  R_RC=$?
+}
+rresult() { case "$R_OUT" in *"$1"*) return 0 ;; esac; return 1; }
+
+# (1) the vocabulary exists at all.
+R_KEEP=1 R_DOCTOR_RC=0 rsup doctorzz "$R/v-usage"
+[ "$R_RC" -eq 2 ] && ok "an unknown verb is still refused (rc=2)" || bad "unknown verb rc=$R_RC — $R_OUT"
+case "$R_OUT" in
+  *doctor*merge*reap*hygiene*) ok "usage names doctor|merge|reap|hygiene (the cell's other roles)" ;;
+  *) bad "usage does not name the role verbs — $R_OUT" ;;
+esac
+
+# (2) each verb runs the role ONCE, in THIS cell's environment, and its rc is the verb's.
+rsup doctor "$R/v-doctor"
+[ "$R_RC" -eq 0 ] && ok "doctor: a clean pass exits 0" || bad "doctor rc=$R_RC — $R_OUT"
+# ⛔ `wc -l`, not equality: the double APPENDS, so a SECOND dispatch is visible as a second line —
+# the double-act the doctor's own role lock exists to prevent would otherwise overwrite the evidence
+# with an identical line and the arm would be green for exactly the bug it names.
+[ "$(wc -l < "$R/v-doctor/doctor-argv" 2>/dev/null)" -eq 1 ] \
+  && [ "$(head -1 "$R/v-doctor/doctor-argv" 2>/dev/null)" = "doctor" ] \
+  && ok "doctor: invokes the doctor exactly once, with role 'doctor'" \
+  || bad "doctor was invoked $(wc -l < "$R/v-doctor/doctor-argv" 2>/dev/null) time(s), argv=[$(cat "$R/v-doctor/doctor-argv" 2>/dev/null | tr '\n' '|')]"
+grep -qx "CELL_HOME=$R/v-doctor/home" "$R/v-doctor/doctor-env" 2>/dev/null \
+  && ok "doctor: the role runs under the CELL's HOME (its own review store)" \
+  || bad "doctor did not hand the cell's HOME to the role — $(cat "$R/v-doctor/doctor-env" 2>/dev/null | tr '\n' ' ')"
+grep -qx "O=$R/v-doctor/o" "$R/v-doctor/doctor-env" 2>/dev/null \
+  && ok "doctor: the role runs against the cell's own \$O" \
+  || bad "doctor did not hand \$O to the role — $(cat "$R/v-doctor/doctor-env" 2>/dev/null | tr '\n' ' ')"
+grep -qx "OR=daniel-ospina/tortoise" "$R/v-doctor/doctor-env" 2>/dev/null \
+  && ok "doctor: the role is handed the RESOLVED queue, not a second derivation" \
+  || bad "doctor did not hand the resolved queue to the role — $(cat "$R/v-doctor/doctor-env" 2>/dev/null | tr '\n' ' ')"
+
+for v in merge reap hygiene; do
+  rsup "$v" "$R/v-$v"
+  [ "$R_RC" -eq 0 ] && [ "$(wc -l < "$R/v-$v/doctor-argv" 2>/dev/null)" -eq 1 ] \
+    && [ "$(head -1 "$R/v-$v/doctor-argv" 2>/dev/null)" = "$v" ] \
+    && ok "$v: dispatches the '$v' role exactly once (rc=0)" \
+    || bad "$v: rc=$R_RC argv=[$(cat "$R/v-$v/doctor-argv" 2>/dev/null | tr '\n' '|')] — $R_OUT"
+done
+
+# (3) a role that CANNOT VERIFY does not report a clean pass to the operator.
+R_DOCTOR_RC=3 rsup merge "$R/v-rc"
+[ "$R_RC" -eq 3 ] && ok "merge: the role's cannot-verify rc reaches the verb (not a silent 0)" \
+                 || bad "merge: the role's rc=3 was swallowed (verb rc=$R_RC) — $R_OUT"
+
+# (4) `status` delegates the role table and its verdict — the fix for "a dead loop looks identical to
+# an idle cell". Driven with the REAL doctor, because the table and the verdict are what is under
+# test: a STARTED cell whose roles never passed must FAIL the verb.
+S_REAL="$R/v-status"; rm -rf "$S_REAL"; mkdir -p "$S_REAL/home" "$S_REAL/o/logs" "$S_REAL/o/state/roles"
+cp "$HERE/orchestrator-harness/cloud-cell-doctor.sh" "$S_REAL/o/cloud-cell-doctor.sh" || bad "cannot stage the real doctor"
+: > "$S_REAL/o/state/roles/.desired"
+R_KEEP=1 rsup status "$S_REAL"
+[ "$R_RC" -ne 0 ] && ok "status: a started cell whose roles NEVER RAN fails the verb" \
+                 || bad "status: rc=0 with every role never run — $R_OUT"
+rresult "NEVER RAN" && ok "status: prints the per-role table (configured is not 'ran')" \
+                   || bad "status: the role table is missing — $R_OUT"
+
+# …and the same cell is green once every role has passed and the loop is live.
+sleep 60 & ST_LOOP=$!
+for role in reap doctor merge hygiene; do
+  printf 'role=%s\nlast_pass_at=now\nlast_pass_epoch=%s\npasses=1\nlast_rc=0\nlast_result=ok\n' \
+    "$role" "$(date +%s)" > "$S_REAL/o/state/roles/$role.state"
+done
+printf '%s\n' "$ST_LOOP" > "$S_REAL/o/state/roles/loop.pid"
+R_KEEP=1 rsup status "$S_REAL"
+[ "$R_RC" -eq 0 ] && ok "status: rc=0 once the loop is live and every role has passed" \
+                 || bad "status: rc=$R_RC on a healthy cell — $R_OUT"
+rresult "last pass" && ok "status: prints a LAST PASS time per role" || bad "status: no last-pass time — $R_OUT"
+kill -TERM "$ST_LOOP" 2>/dev/null || true
+
+# (5) `start` launches the doctor loop beside the controller, and `stop` stops BOTH and makes the stop
+# stick. The doctor loop is the role that does not exist at all on the pre-#1989 script.
+rsup start "$R/v-start"
+[ "$R_RC" -eq 0 ] && ok "start: a clean start exits 0" || bad "start rc=$R_RC — $R_OUT"
+grep -qx "cell-doctor" "$R/v-start/tmux/sessions" 2>/dev/null \
+  && ok "start: launches the doctor loop in its own session (tmux 'cell-doctor')" \
+  || bad "start: no doctor session was created — $(tail -3 "$R/v-start/tmux/argv" 2>/dev/null | tr '\n' ' ')"
+grep -qF "cloud-cell-doctor.sh' loop" "$R/v-start/tmux/cmd.cell-doctor" 2>/dev/null \
+  && ok "start: the doctor session runs the 'loop' verb" \
+  || bad "start: the doctor session command is wrong — $(cat "$R/v-start/tmux/cmd.cell-doctor" 2>/dev/null)"
+[ -f "$R/v-start/o/state/roles/.desired" ] \
+  && ok "start: records the DESIRED running state (a stop can stick)" \
+  || bad "start: no .desired marker — the next pass would restart what an operator stopped"
+
+R_KEEP=1 rsup stop "$R/v-start"
+[ "$R_RC" -eq 0 ] && ok "stop: exits 0 for a started cell" || bad "stop rc=$R_RC — $R_OUT"
+grep -qx "=cell-doctor" "$R/v-start/tmux/killed" 2>/dev/null \
+  && ok "stop: kills the doctor session by EXACT name" \
+  || bad "stop: did not stop the doctor loop — $(cat "$R/v-start/tmux/killed" 2>/dev/null | tr '\n' ' ')"
+[ ! -f "$R/v-start/o/state/roles/.desired" ] \
+  && ok "stop: clears the desired marker so the stop sticks" \
+  || bad "stop: left .desired — the next pass would restart the controller"
+[ "$(cat "$R/v-start/tmux/sessions" 2>/dev/null | wc -l)" -eq 0 ] \
+  && ok "stop: no harness session survives" || bad "stop: sessions left behind — $(cat "$R/v-start/tmux/sessions" 2>/dev/null | tr '\n' ' ')"
+
+# (6) THE PREFIX TRAP. tmux resolves a bare `-t cell-doctor` by prefix, so an unrelated
+# `cell-doctor-other` session made `start` report "doctor loop already running" and return success
+# while the cell had NO doctor — the exact "creates work, can never finish it" state #1989 is about.
+# This arm reddens on the script that reads the session by bare name.
+S_DECOY="$R/v-decoy"; rm -rf "$S_DECOY"; mkdir -p "$S_DECOY/home" "$S_DECOY/tmux"
+printf 'cell-doctor-other\n' > "$S_DECOY/tmux/sessions"
+R_KEEP=1 rsup start "$S_DECOY"
+grep -qx "cell-doctor" "$S_DECOY/tmux/sessions" 2>/dev/null \
+  && ok "start: a 'cell-doctor-other' session is NOT read as the doctor loop (exact name)" \
+  || bad "start: a prefix-matched session suppressed the doctor loop — ${R_OUT}"
+
+# (7) THE SAME TRAP ON THE CONTROLLER — and its destructive half. `$SESSION` is `ai1989-<pid>` here, so
+# a session called `ai1989-<pid>-extra` is a PREFIX NEIGHBOUR of the controller. Both answers below were
+# measured on the real binary: with only the neighbour alive, `has-session -t <controller>` says YES, and
+# `kill-session -t <controller>` DESTROYS the neighbour. So a bare target makes `start` report "already
+# running" having started nothing (a false green on the one verb that launches a cell) and makes `stop`
+# kill a session that is not the controller (silent destruction of whatever it was).
+S_NEIGH="$R/v-neighbour"; rm -rf "$S_NEIGH"; mkdir -p "$S_NEIGH/home" "$S_NEIGH/tmux"
+printf 'ai1989-%s-extra\n' "$$" > "$S_NEIGH/tmux/sessions"
+R_KEEP=1 rsup start "$S_NEIGH"
+grep -qx "ai1989-$$" "$S_NEIGH/tmux/sessions" 2>/dev/null \
+  && ok "start: a prefix NEIGHBOUR of the controller does not satisfy 'already running'" \
+  || bad "start: a prefix neighbour suppressed the controller launch — ${R_OUT}"
+rresult "controller started" \
+  && ok "start: reports the controller it actually launched" \
+  || bad "start: never claimed to start a controller — ${R_OUT}"
+
+# …and with BOTH alive — the state the `start` arm above leaves — `stop` must take the controller and
+# leave the neighbour. ⛔ This arm is green on the PRE-FIX script too (there the controller was never
+# launched, so its absence afterwards is vacuous — the precondition arm below is what reddens); the
+# arm that shows the DAMAGE is the neighbour-only one further down, which is why the double must model
+# tmux's exact-over-prefix precedence (measured on 3.4).
+# ⛔ The TARGET and a PRECONDITION, not just the absence. On the pre-#1989 script `start` above never
+# launched a controller at all (the bare `has-session` matched the neighbour and answered "already
+# running"), so "the controller is gone after stop" was true VACUOUSLY — the arm was green for a path
+# it never reached. Requiring the controller to be present first, and the kill to carry the exact
+# target, is what makes it red there.
+grep -qx "ai1989-$$" "$S_NEIGH/tmux/sessions" 2>/dev/null \
+  && ok "stop: the controller IS present before the stop (the arm has something to stop)" \
+  || bad "stop: no controller to stop — the arm would be vacuous — $(cat "$S_NEIGH/tmux/sessions" 2>/dev/null | tr '\n' ' ')"
+R_KEEP=1 rsup stop "$S_NEIGH"
+grep -qx "=ai1989-$$" "$S_NEIGH/tmux/killed" 2>/dev/null \
+  && ok "stop: kills the controller by its EXACT target (=ai1989-…)" \
+  || bad "stop: the kill target was not exact — $(cat "$S_NEIGH/tmux/killed" 2>/dev/null | tr '\n' ' ')"
+grep -qx "ai1989-$$" "$S_NEIGH/tmux/sessions" 2>/dev/null \
+  && bad "stop: left the controller behind while a neighbour was present" \
+  || ok "stop: stops the controller when a neighbour also matches the prefix"
+grep -qx "ai1989-$$-extra" "$S_NEIGH/tmux/sessions" 2>/dev/null \
+  && ok "stop: the neighbour SURVIVES when the controller is the exact target" \
+  || bad "stop: killed the neighbour while stopping the controller — $(cat "$S_NEIGH/tmux/killed" 2>/dev/null | tr '\n' ' ')"
+
+# A FRESH state dir: the arms above left a real controller session behind, and `stop` is entitled to
+# stop that one. This arm is about a cell whose ONLY session is the neighbour.
+S_NEIGH2="$R/v-neighbour2"; rm -rf "$S_NEIGH2"; mkdir -p "$S_NEIGH2/home" "$S_NEIGH2/tmux"
+printf 'ai1989-%s-extra\n' "$$" > "$S_NEIGH2/tmux/sessions"
+R_KEEP=1 rsup stop "$S_NEIGH2"
+[ "$R_RC" -eq 0 ] && ok "stop: exits 0 when only a neighbour session exists (nothing to stop)" \
+                 || bad "stop: rc=$R_RC with only a neighbour — ${R_OUT}"
+grep -qx "ai1989-$$-extra" "$S_NEIGH2/tmux/sessions" 2>/dev/null \
+  && ok "stop: the prefix NEIGHBOUR survives (a stranger session is never killed)" \
+  || bad "stop: killed the prefix neighbour — $(cat "$S_NEIGH2/tmux/killed" 2>/dev/null | tr '\n' ' ')"
+rresult "controller stopped" && bad "stop: claimed to stop a controller it never matched" \
+                             || ok "stop: does not claim to have stopped a controller that is not there"
+
+# (8) A READ THAT FAILED IS NOT ABSENCE — on the verbs that ACT. `has-session` answers rc=1 both for
+# "no such session" and for every client/server error, so before this the guard read a refused
+# connection as "no controller": `start` would then seed over a live cell's worker scripts, `status`
+# printed STOPPED, and `stop` printed "not running" while leaving the lock.
+say_case "a failed session read never becomes 'no controller' on an acting verb"
+S_READ="$R/v-read"; rm -rf "$S_READ"; mkdir -p "$S_READ/home" "$S_READ/tmux"
+: > "$S_READ/tmux/fail-ls"
+R_KEEP=1 rsup start "$S_READ"
+[ "$R_RC" -ne 0 ] && ok "start: REFUSES when the session list cannot be read (nothing is seeded over a live cell)" \
+  || bad "start: proceeded on a read that failed (rc=$R_RC) — ${R_OUT}"
+rresult "CANNOT-VERIFY" && ok "start: names the read it could not take" || bad "start: the refusal is unnamed — ${R_OUT}"
+[ -s "$S_READ/tmux/sessions" ] \
+  && bad "start: created a session after an unverifiable read — $(cat "$S_READ/tmux/sessions" 2>/dev/null | tr '\n' ' ')" \
+  || ok "start: launched nothing"
+R_KEEP=1 rsup status "$S_READ"
+rresult "controller: UNKNOWN" && ok "status: prints UNKNOWN, never STOPPED, when the list cannot be read" \
+  || bad "status: reported a failed read as a state — ${R_OUT}"
+R_KEEP=1 rsup stop "$S_READ"
+[ "$R_RC" -ne 0 ] && ok "stop: does not report success when it cannot confirm the stop" \
+  || bad "stop: rc=0 on an unverifiable read — ${R_OUT}"
+R_KEEP=1 rsup status "$S_READ"
+rresult "lanes: UNKNOWN" && ok "status: the LANE count is UNKNOWN too (the verdict's own read, not a second one)" \
+  || bad "status: reported lanes from a failed read — ${R_OUT}"
+# ⛔ The VERDICT, not just the words: a monitoring probe reads the exit status. Printing UNKNOWN and
+# exiting 0 is the same row in words, and the role table's own rc is 0 on a healthy doctor.
+[ "$R_RC" -ne 0 ] && ok "status: the UNKNOWN verdict is carried by the EXIT STATUS (rc=$R_RC)" \
+                  || bad "status: printed UNKNOWN and exited 0 — a probe cannot see the verdict"
+rm -f "$S_READ/tmux/fail-ls"
+R_KEEP=1 rsup status "$S_READ"
+rresult "controller: STOPPED" && ok "status: reads STOPPED once the list is readable again (the arm is not vacuous)" \
+  || bad "status: did not report STOPPED on a readable empty list — ${R_OUT}"
+rresult "lanes: 0" && ok "status: the readable empty list still prints 'lanes: 0' (non-vacuous)" \
+  || bad "status: no lane line on a readable list — ${R_OUT}"
+
+# (8b) The SESSION NAMES, validated where they are USED. `=name` kills only PREFIX resolution; tmux's
+# target parser still splits on `:` and `.`, so `kill-session -t '=orch.0'` DESTROYS the session named
+# `orch` (measured on tmux 3.4) — and tmux cannot even host `orch.0` (`new-session -s 'orch.0'` creates
+# `orch_0`). The refusal must also survive `$ENV_FILE`, which is sourced AFTER the defaults: the check
+# runs post-source, so a `keys.env` line cannot walk around it.
+say_case "a session name carrying a tmux target character is refused (also from keys.env)"
+V_DIR="$R/v-name"; rm -rf "$V_DIR"; mkdir -p "$V_DIR/home" "$V_DIR/tmux"
+: > "$V_DIR/keys.env"
+for bad_name in 'orch.0' 'orch:1'; do
+  V_OUT="$(env -u OR SESSION="$bad_name" R_STATE="$V_DIR/tmux" PATH="$R/bin:$PATH" CELL_HOME="$V_DIR/home" \
+           ENV_FILE="$V_DIR/keys.env" O="$V_DIR/o" REPO="$Q/tortoise-repo" HARNESS="$Q/harness" \
+           HARNESS_REPO="$AI" HARNESS_FETCH=0 HARNESS_REF="$Q_REF" bash "$SUP" status 2>&1)"; V_RC=$?
+  [ "$V_RC" -eq 2 ] && case "$V_OUT" in *"SESSION must not contain"*) ok "SESSION=$bad_name refused at load (rc=2)" ;;
+      *) bad "SESSION=$bad_name exited 2 without naming the rule: $V_OUT" ;; esac \
+    || bad "SESSION=$bad_name was ACCEPTED (rc=$V_RC) — a kill aimed at it addresses a DIFFERENT session" 
+done
+V_OUT="$(env -u OR DOCTOR_SESSION='cell:doctor' R_STATE="$V_DIR/tmux" PATH="$R/bin:$PATH" CELL_HOME="$V_DIR/home" \
+         ENV_FILE="$V_DIR/keys.env" O="$V_DIR/o" REPO="$Q/tortoise-repo" HARNESS="$Q/harness" \
+         HARNESS_REPO="$AI" HARNESS_FETCH=0 HARNESS_REF="$Q_REF" bash "$SUP" status 2>&1)"; V_RC=$?
+[ "$V_RC" -eq 2 ] && case "$V_OUT" in *"DOCTOR_SESSION must not contain"*) ok "DOCTOR_SESSION with ':' is refused at load" ;;
+    *) bad "DOCTOR_SESSION exited 2 without naming the rule: $V_OUT" ;; esac \
+  || bad "DOCTOR_SESSION='cell:doctor' was ACCEPTED (rc=$V_RC)"
+# ⛔ From the ENV FILE, which is sourced after the defaults: this is the arm that fails if the check is
+# put back in the top-of-file block (it validated a value that was about to be overwritten).
+printf 'SESSION=ai1989-dot.name\n' > "$V_DIR/keys.env"
+V_OUT="$(env -u OR R_STATE="$V_DIR/tmux" PATH="$R/bin:$PATH" CELL_HOME="$V_DIR/home" \
+         ENV_FILE="$V_DIR/keys.env" SESSION="" O="$V_DIR/o" REPO="$Q/tortoise-repo" HARNESS="$Q/harness" \
+         HARNESS_REPO="$AI" HARNESS_FETCH=0 HARNESS_REF="$Q_REF" bash "$SUP" status 2>&1)"; V_RC=$?
+[ "$V_RC" -eq 2 ] && ok "a dotted SESSION from keys.env is refused too (the check runs AFTER the source)" \
+                  || bad "keys.env walked around the session-name refusal (rc=$V_RC): $V_OUT"
+printf 'SESSION=ai1989-clean\n' > "$V_DIR/keys.env"
+V_OUT="$(env -u OR R_STATE="$V_DIR/tmux" PATH="$R/bin:$PATH" CELL_HOME="$V_DIR/home" \
+         ENV_FILE="$V_DIR/keys.env" SESSION="" O="$V_DIR/o" REPO="$Q/tortoise-repo" HARNESS="$Q/harness" \
+         HARNESS_REPO="$AI" HARNESS_FETCH=0 HARNESS_REF="$Q_REF" bash "$SUP" status 2>&1)"; V_RC=$?
+case "$V_OUT" in *"must not contain"*) bad "a legitimate dashed name was refused — the guard over-blocks" ;;
+  *) ok "a legitimate dashed SESSION from keys.env is accepted (the refusal is not a blanket block)" ;; esac
+
+# (8c) The read BOUND is validated like the disk floor it sits beside: `timeout 0` is NOT "no bound",
+# it runs the command with NO timeout at all — so `=0` silently removes the bound every verb depends on.
+say_case "TMUX_READ_TIMEOUT is validated (0 disables timeout(1) entirely)"
+for bad_to in 0 abc; do
+  T_OUT="$(env -u OR TMUX_READ_TIMEOUT="$bad_to" R_STATE="$V_DIR/tmux" PATH="$R/bin:$PATH" CELL_HOME="$V_DIR/home" \
+           ENV_FILE="$V_DIR/keys.env" SESSION="ai1989-to" O="$V_DIR/o" REPO="$Q/tortoise-repo" HARNESS="$Q/harness" \
+           HARNESS_REPO="$AI" HARNESS_FETCH=0 HARNESS_REF="$Q_REF" bash "$SUP" status 2>&1)"; T_RC=$?
+  [ "$T_RC" -eq 2 ] && case "$T_OUT" in *TMUX_READ_TIMEOUT*) ok "TMUX_READ_TIMEOUT='$bad_to' is refused (rc=2)" ;;
+      *) bad "TMUX_READ_TIMEOUT='$bad_to' exited 2 without naming the knob: $T_OUT" ;; esac \
+    || bad "TMUX_READ_TIMEOUT='$bad_to' was ACCEPTED (rc=$T_RC) — the read bound can be removed" 
+done
+T_OUT="$(env -u OR TMUX_READ_TIMEOUT=20 R_STATE="$V_DIR/tmux" PATH="$R/bin:$PATH" CELL_HOME="$V_DIR/home" \
+         ENV_FILE="$V_DIR/keys.env" SESSION="ai1989-to" O="$V_DIR/o" REPO="$Q/tortoise-repo" HARNESS="$Q/harness" \
+         HARNESS_REPO="$AI" HARNESS_FETCH=0 HARNESS_REF="$Q_REF" bash "$SUP" status 2>&1)"; T_RC=$?
+case "$T_OUT" in *TMUX_READ_TIMEOUT*) bad "TMUX_READ_TIMEOUT=20 was refused — a legitimate value is a false block" ;;
+  *) ok "TMUX_READ_TIMEOUT=20 is accepted" ;; esac
+rm -f "$V_DIR/keys.env"
+
+# (9a) The verbs that ACT on the read, other than start/status/stop. `check` CERTIFIES the cell, so an
+# unreadable list is a refusal (the same rule the file already applies to an unreadable `git status`);
+# `apply` must not replace the harness tree it cannot prove is idle; `prune` must say it could not look.
+say_case "check / apply / prune on a session read that cannot be taken"
+S_CAP="$R/v-cap"; rm -rf "$S_CAP"; mkdir -p "$S_CAP/home/.pi/agent/scripts/lib" "$S_CAP/tmux"
+# The recorder pair `check` requires, or the refusal would be about a MISSING RECORDER rather than
+# about the session read this arm is testing.
+printf '#!/bin/bash\nexit 0\n' > "$S_CAP/home/.pi/agent/scripts/record-review.sh"
+printf '#!/usr/bin/env python3\n' > "$S_CAP/home/.pi/agent/scripts/lib/diff-normalize.py"
+# …and the worker scripts `check` requires in $O (what `start` seeds), or the refusal would be about
+# MISSING WORKERS rather than about the session read this arm is testing.
+mkdir -p "$S_CAP/o"; for f in "$Q"/harness/*.sh; do [ -f "$f" ] && cp "$f" "$S_CAP/o/"; done
+: > "$S_CAP/tmux/fail-ls"
+R_KEEP=1 rsup check "$S_CAP"
+[ "$R_RC" -ne 0 ] && ok "check: REFUSES to certify a cell whose session list cannot be read" \
+  || bad "check: certified the cell on a read that failed (rc=$R_RC) — ${R_OUT}"
+rresult "CELL CAN RUN A CONTROLLER" && bad "check: printed the certification banner over an unreadable read" \
+  || ok "check: does not print the certification banner"
+rresult "cannot verify" && ok "check: names what it could not verify" || bad "check: unnamed — ${R_OUT}"
+R_KEEP=1 rsup apply "$S_CAP"
+[ "$R_RC" -ne 0 ] && rresult "CANNOT-VERIFY" \
+  && ok "apply: refuses rather than replacing the harness tree it cannot prove is idle" \
+  || bad "apply: proceeded on an unverifiable read (rc=$R_RC) — ${R_OUT}"
+R_KEEP=1 rsup prune "$S_CAP"
+rresult "CANNOT-VERIFY" && ok "prune: warns that a controller MAY be running instead of staying silent" \
+  || bad "prune: said nothing about an unreadable session list — ${R_OUT}"
+
+# (9) A FRESH BOX is an EMPTY namespace, not cannot-verify: on tmux 3.4 a box where no server has ever
+# started answers `error connecting to … (No such file or directory)`, and this is the COLD START
+# `start` performs. Hermetic (the marker), so the decision is pinned without a real tmux on the runner.
+say_case "a fresh box (no tmux server yet) is an empty namespace, not cannot-verify"
+S_COLD="$R/v-cold"; rm -rf "$S_COLD"; mkdir -p "$S_COLD/home" "$S_COLD/tmux"
+: > "$S_COLD/tmux/no-socket"
+R_KEEP=1 rsup status "$S_COLD"
+rresult "controller: STOPPED" && ok "status: a never-started server reads STOPPED, not UNKNOWN" \
+  || bad "status: reported a fresh box as UNKNOWN — ${R_OUT}"
+rm -rf "$S_COLD"; mkdir -p "$S_COLD/home" "$S_COLD/tmux"; : > "$S_COLD/tmux/no-socket"
+R_KEEP=1 rsup start "$S_COLD"
+[ "$R_RC" -eq 0 ] && ok "start: launches on a fresh box (the ENOENT leg is an empty list, not cannot-verify)" \
+  || bad "start: rc=$R_RC on a fresh box — ${R_OUT}"
+
+
 echo
 echo "── Summary ───────────────────────────────────────────────────────"
-echo "  PASS=$PASS FAIL=$FAIL"
+echo "  PASS=$PASS FAIL=$FAIL${SKIP:+ SKIP=$SKIP}"
 [ "$FAIL" -eq 0 ] || { echo "  ❌ FAILURES — fix and re-run"; exit 1; }
 echo "  ✅ all checks passed"
 exit 0

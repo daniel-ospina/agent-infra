@@ -141,11 +141,21 @@ recorder_src()  { printf '%s\n' "$HARNESS/../record-review.sh"; }
 recorder_lib_path() { printf '%s\n' "$(dirname "$(recorder_path)")/lib/diff-normalize.py"; }
 recorder_lib_src()  { printf '%s\n' "$HARNESS/../lib/diff-normalize.py"; }
 SESSION="${SESSION:-orch}"
-# The doctor loop's tmux session (agent-infra#1989). A NAME of its own, never a prefix of `$SESSION`:
-# every tmux target below uses `=name` exact matching for the reason orch-loop's reaper documents
-# (`-t merge-82` resolved to `merge-821` and killed an in-flight worker), and a distinct name keeps
-# `stop` from ever matching the wrong role.
+# The doctor loop's tmux session (agent-infra#1989). A NAME of its own, never a prefix of `$SESSION`,
+# and one never a prefix of IT: two roles whose names are prefixes of each other would collide the
+# moment any target is resolved by prefix. ⛔ EVERY tmux target in this file is `=name` (exact) for
+# the reason orch-loop's reaper documents — `-t merge-82` resolved to `merge-821` and killed an
+# in-flight worker — and HERE it was measured twice more over the two roles that must never be
+# confused: `has-session -t cell-doctor` answered YES for `cell-doctor-other`, so `start` reported
+# "doctor loop already running" and returned success having started nothing; and `kill-session -t
+# <controller>` destroyed an unrelated session whose name merely began with it. A bare target is a
+# prefix match, and on the `start`/`stop`/`status` paths a prefix match is a false green at best and
+# silent destruction at worst.
 DOCTOR_SESSION="${DOCTOR_SESSION:-cell-doctor}"
+# The bound on ONE tmux read (see `sup_session_list`): a wedged server must not block `start`/`stop`/
+# `status`/`apply` for ever. Every read AND every kill goes through `sup_bounded`. NOTE: it is
+# VALIDATED after $ENV_FILE is sourced (below), like MIN_FREE_MB — see there for why.
+TMUX_READ_TIMEOUT="${TMUX_READ_TIMEOUT:-15}"
 # This file's own path, resolved ONCE and handed to the doctor loop, so a restart from inside the
 # loop runs the SAME supervisor the operator started (not a `$PATH` guess).
 SUP_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && printf '%s/%s' "$PWD" "$(basename "${BASH_SOURCE[0]}")")"
@@ -514,6 +524,25 @@ HARNESS_PIN_FILE="${HARNESS_PIN_FILE:-$CELL_HOME/.harness-path}"
 HARNESS_FETCH="${HARNESS_FETCH:-1}"
 HARNESS_APPLIED=""
 MIN_FREE_MB="${MIN_FREE_MB:-500}"
+# ⛔ VALIDATED HERE, not in the default block above: `$ENV_FILE` is sourced between the two, and it can
+# set any of these — a check that ran before the source validated a value that was about to be
+# overwritten. `=name` kills only PREFIX resolution; tmux's target parser still splits on `:` and `.`,
+# so `kill-session -t '=orch.0'` DESTROYS the session named `orch` (measured on 3.4) — and tmux cannot
+# even host `orch.0` (`new-session -s 'orch.0'` creates `orch_0`). A name carrying either character
+# can only ever aim at something else, so it is refused instead of being trusted by every verb.
+case "$SESSION" in
+  *[:.]*) printf 'FATAL: SESSION must not contain ":" or "." (tmux reads them as window/pane targets, so "=%s" would address a DIFFERENT session): %s\n' "$SESSION" "$SESSION" >&2; exit 2 ;;
+esac
+case "$DOCTOR_SESSION" in
+  *[:.]*) printf 'FATAL: DOCTOR_SESSION must not contain ":" or "." (tmux target syntax): %s\n' "$DOCTOR_SESSION" >&2; exit 2 ;;
+esac
+# ⛔ A zero TIMEOUT is not "no bound configured": `timeout 0` runs the command with NO timeout at all,
+# so `=0` silently removes the bound this variable was introduced to impose (measured: `timeout 0
+# sleep 2` runs the full 2 s).
+case "$TMUX_READ_TIMEOUT" in
+  ''|*[!0-9]*) printf 'FATAL: TMUX_READ_TIMEOUT must be a whole number of seconds (got "%s")\n' "$TMUX_READ_TIMEOUT" >&2; exit 2 ;;
+esac
+[ "$TMUX_READ_TIMEOUT" -gt 0 ] || { printf 'FATAL: TMUX_READ_TIMEOUT must be > 0 (0 disables timeout(1) entirely, so every session read becomes unbounded) — got "%s"\n' "$TMUX_READ_TIMEOUT" >&2; exit 2; }
 SCRATCH_DAYS="${SCRATCH_DAYS:-3}"
 # Where review scratch checkouts accumulate. Parameterized so the destructive `--scratch` path can be
 # driven hermetically by the test suite; a cell uses the default.
@@ -570,6 +599,66 @@ command -v sha256sum >/dev/null 2>&1 || SHA_CMD="shasum -a 256"
 # false pass this floor exists to remove). Convert once, here. Empty when df cannot answer — read as
 # "cannot judge", never as "enough".
 free_mb() { df -Pk "$1" 2>/dev/null | awk 'NR==2 && $4 ~ /^[0-9]+$/ {print int($4 / 1024)}'; }
+
+# ── the session read, CLASSIFIED (0 = present, 1 = absent, 3 = cannot-verify) ─────────────────────
+# ⛔ `has-session` cannot answer "is it there?" on its own: it exits 1 BOTH for "no such session" and
+# for every client/server error, so a failed read arrives as ABSENCE — and every caller here ACTS on
+# that answer: `start` re-seeds a live cell's worker scripts, `apply` replaces the harness tree under
+# a live controller, `stop` prints "not running" and leaves the lock, `status` prints STOPPED.
+# ⛔ NOT a `has-session` fast path either, for two measured reasons: it is UNBOUNDED (a wedged server
+# blocks `start`/`stop`/`status`/`apply` for ever, which is the failure this file's own bound exists
+# to prevent), and `=name` kills only PREFIX resolution — tmux's target parser still splits on `:` and
+# `.`, so `has-session -t '=orch.0'` answers YES for a live `orch` (measured on 3.4) and `status`
+# printed RUNNING for a session that does not exist. ONE bounded list read is literal in both
+# respects, and it is what the doctor's reader does.
+# ⛔ TWO benign messages, and the ANCHOR keeps a broken BINARY out of them: tmux 3.4 says
+# `no server running on …` once a server's last session died, and `error connecting to … (No such file
+# or directory)` on a box where no server has EVER started. The second is not exotic — it is the COLD
+# START this very command performs — and a missing binary answers `/bin/bash: …: No such file or
+# directory` rc=127, which does not start with `error connecting to` and stays CANNOT-VERIFY.
+# 0 = the list is on stdout; 1 = no server (an empty list); 3 = the list could not be read.
+sup_bounded() { local s="$1"; shift; if command -v timeout >/dev/null 2>&1; then timeout "$s" "$@"; else "$@"; fi; }
+if ! command -v timeout >/dev/null 2>&1; then
+  say "warn: timeout(1) not on PATH — a single tmux read/kill here is UNBOUNDED (TMUX_READ_TIMEOUT cannot be honoured); a wedged server can block these verbs"
+fi
+sup_session_list() {
+  local out rc
+  out="$(sup_bounded "${TMUX_READ_TIMEOUT:-15}" tmux ls -F '#{session_name}' 2>&1)"; rc=$?
+  if [ "$rc" -eq 0 ]; then printf '%s\n' "$out" | sed '/^$/d'; return 0; fi
+  if grep -qiE '^(no server running|error connecting to .*\(No such file or directory\))' <<<"$out"; then
+    return 1
+  fi
+  return 3
+}
+# ⛔ A here-string, never `printf … | grep -q` (#841): the quiet grep exits at its first match, the
+# writer takes SIGPIPE, and under this file's `pipefail` a PRESENT session would answer "absent".
+# `scripts/check-no-sigpipe-grep.sh` reds the pipe form.
+tmux_session_present() {
+  local list rc
+  list="$(sup_session_list)"; rc=$?
+  [ "$rc" -eq 0 ] || return "$rc"
+  grep -Fxq -- "$1" <<<"$list"
+  rc=$?
+  [ "$rc" -le 1 ] && return "$rc"   # 0 = present, 1 = absent
+  return 3                            # grep could not answer -> cannot-verify, never "absent"
+}
+
+# Harness sessions of <pattern>, and the read's verdict: 0 = read (the count is on stdout), 1 = no
+# server (0), 3 = cannot-verify. Same taxonomy as the doctor's `harness_sessions`, because this count
+# is the guard in front of the UNATTENDED cache prune below — `tmux ls | grep -c` printed `0` for every
+# failure of that read, i.e. "no worker is live", and armed an `rm -rf` of `.venv`/`node_modules` at
+# every worktree root.
+harness_session_count() { # <extended-regex>
+  local list rc n
+  list="$(sup_session_list)"; rc=$?
+  if [ "$rc" -eq 0 ]; then
+    n="$(grep -cE "$1" <<<"$list" || true)"
+    printf '%s\n' "${n:-0}"; return 0
+  fi
+  [ "$rc" -eq 1 ] && { printf '0\n'; return 1; }
+  return 3
+}
+harness_worker_count() { harness_session_count '^(lane|fix|merge|chain)-'; }
 
 # ⛔ `--verify --quiet` is load-bearing, not tidiness: a bare `git rev-parse <unknown>` ECHOES its
 # argument to stdout (`git rev-parse origin/nope` prints `origin/nope`) while exiting non-zero — so a
@@ -899,10 +988,18 @@ cmd_check_provenance() {
     sd="$(stamp_field_raw agentInfraDirty)"
     [ "$sd" = false ] || die "DRIFT — the record at $STAMP does not say its source was CLEAN (agentInfraDirty=${sd:-<absent>}); a dirty record's commit does not describe the seeded bytes. Remedy: $0 apply"
     say "ok: recorded install — commit ${sc:0:12}, relation '${sr}', payload ${sp:0:12}"
-  elif tmux has-session -t "$SESSION" 2>/dev/null; then
-    die "a controller is RUNNING (tmux '$SESSION') with NO harness provenance recorded at $STAMP — 'which commit is this cell running?' has no answer for a live merge actor. Remedy: stop, then $0 apply"
   else
-    say "ok: no install recorded yet (pre-start) — 'start' or 'apply' writes $STAMP"
+    local vp=0; tmux_session_present "$SESSION" || vp=$?
+    if [ "$vp" -eq 3 ]; then
+      # ⛔ `check` CERTIFIES the cell, so an unknown here is a refusal, not a warning — the same rule this
+      # function already applies to an unreadable `git status` 25 lines above ("cannot-verify is never a
+      # pass"). A warning followed by "CELL CAN RUN A CONTROLLER" is a false PASS.
+      die "cannot verify which commit this cell is running: the session list could not be read and no provenance is recorded at $STAMP — cannot-verify is never a pass. Check 'tmux ls', then re-run."
+    elif [ "$vp" -eq 0 ]; then
+      die "a controller is RUNNING (tmux '$SESSION') with NO harness provenance recorded at $STAMP — 'which commit is this cell running?' has no answer for a live merge actor. Remedy: stop, then $0 apply"
+    else
+      say "ok: no install recorded yet (pre-start) — 'start' or 'apply' writes $STAMP"
+    fi
   fi
 }
 
@@ -1135,7 +1232,13 @@ cmd_start() {
   # Guard BEFORE seeding. $O is the controller's working copy and `start` on a live cell would
   # otherwise replace the worker scripts its next spawn executes (and race a half-copied script).
   # Nothing is started or written on this path, so a bad value below cannot hurt it.
-  if tmux has-session -t "$SESSION" 2>/dev/null; then
+  local sp=0; tmux_session_present "$SESSION" || sp=$?
+  # ⛔ A read that could not be taken is NOT "no controller": proceeding would seed over a live cell's
+  # worker scripts — the same delete/overwrite this guard exists to prevent — so it REFUSES instead.
+  if [ "$sp" -eq 3 ]; then
+    die "CANNOT-VERIFY: the tmux session list could not be read, so 'start' cannot tell whether '$SESSION' is already live — and starting over a live controller replaces the worker scripts its next spawn executes. NOTHING was started. Check tmux ('tmux ls') and re-run."
+  fi
+  if [ "$sp" -eq 0 ]; then
     say "already running (tmux session '$SESSION') — use: status | logs | stop"
     # agent-infra#1989: a live controller with no doctor is exactly the measured state (one loop on
     # the box). `start` is the idempotent launch verb, so it heals that half too rather than
@@ -1161,9 +1264,19 @@ cmd_start() {
          # worker session is alive, and report the low-space state instead of acting.
          # ⛔ `grep -c`, NOT `grep -q`. An early exit down a pipe lets the producer take SIGPIPE, and
          # under `set -o pipefail` the pipeline then reports the producer's failure — so a MATCH read
-         # as "no workers" and the unattended prune deleted a LIVE worker's .venv. `-c` consumes all
-         # input. (`tmux ls | grep -c` below is already the safe form.)
-         if [ "$(tmux ls 2>/dev/null | grep -cE '^(lane|fix|merge)-')" -gt 0 ]; then
+         # as "no workers" and the unattended prune deleted a LIVE worker's .venv. The count form now
+         # lives in `harness_worker_count`, which also returns the READ'S VERDICT — the guard below
+         # needs that verdict, not the number.
+         # ⛔ The VERDICT, never the count: `$(tmux ls | grep -c …)` printed `0` for a read that
+         # FAILED, i.e. "no worker is live", and armed the delete. Measured with a tmux whose read
+         # cannot be taken: `grep -c` → 0 → `prune --caches`. A `chain-*` worker counts too (the
+         # doctor's namespace is `lane|fix|merge|chain`, and a live chain lane's venv is just as
+         # busy as any other).
+         local wn=0 wrc=0
+         wn="$(harness_worker_count)"; wrc=$?
+         if [ "$wrc" -eq 3 ]; then
+           say "warn: only ${mb}MB free, but the worker sessions could NOT be read — NOT auto-pruning caches (a pruned venv breaks the live lane using it). Check 'tmux ls', then run '$0 prune'."
+         elif [ "${wn:-0}" -gt 0 ]; then
            say "warn: only ${mb}MB free, but worker sessions are still running — NOT auto-pruning caches (a pruned venv breaks the lane using it). Run '$0 prune' once they finish."
          else
            cmd_prune --caches
@@ -1276,11 +1389,16 @@ cmd_start() {
   tmux new-session -d -s "$SESSION" -c "$HARNESS" \
     "set -a; [ ! -f '$ENV_FILE' ] || . '$ENV_FILE'; set +a; HOME='$CELL_HOME' REPO='$REPO' O='$O' OR='$OR' SCOPE='$SCOPE' bash '$HARNESS/orch-loop.sh' 2>&1 | tee -a '$O/logs/controller.log'"
   sleep 3
-  if tmux has-session -t "$SESSION" 2>/dev/null; then
-    say "controller started (tmux '$SESSION'), state=$O"
-  else
-    die "controller exited immediately — read $O/logs/controller.log"
-  fi
+  # ⛔ The verification of the ACTION, so it must be a classified read: `has-session` answering rc=1 for a
+  # client/server error would be reported as "the controller exited immediately" — a positive claim
+  # about an action that may well have taken, and `die` would then skip `start_doctor_loop`, leaving a
+  # running controller with no repair/merge role (the #1989 state) reported as a failed start.
+  local cv=0; tmux_session_present "$SESSION" || cv=$?
+  case "$cv" in
+    0) say "controller started (tmux '$SESSION'), state=$O" ;;
+    3) die "CANNOT-VERIFY: the controller was launched but the session list could not be read, so it cannot be confirmed running — check 'tmux ls' and $O/logs/controller.log" ;;
+    *) die "controller exited immediately — read $O/logs/controller.log" ;;
+  esac
   # The SECOND role. `start` is not successful unless the repair/merge loop is also up: a cell that
   # dispatches but cannot land is the measured #1989 state, and a start that reported success over
   # it would be the same false green this file refuses everywhere else.
@@ -1294,19 +1412,40 @@ cmd_stop() {
   # stopped; if the loop outlived the marker, its next pass would report "cell not started" and keep
   # reaping — harmless, but the session would linger. Either way `stop` is a REQUEST the operator
   # makes once, and the marker is what makes it stick.
-  if tmux has-session -t "$DOCTOR_SESSION" 2>/dev/null; then
+  # ⛔ `=name` here and at both `start_doctor_loop` arms below: tmux resolves a bare `-t cell-doctor`
+  # by PREFIX when no exact session exists, so `tmux has-session -t cell-doctor` answered YES for an
+  # unrelated `cell-doctor-other` session (measured). On the `start` arm that is a FAIL-OPEN: `start`
+  # printed "doctor loop already running" and returned success while the cell had no doctor at all —
+  # the exact "it created work and could never finish it" state this whole file exists to remove.
+  local ds=0; tmux_session_present "$DOCTOR_SESSION" || ds=$?
+  if [ "$ds" -eq 3 ]; then
+    # The target is EXACT and validated (no `:`/`.`), so attempting the kill on an unverifiable read is
+    # safe; claiming it worked is not. Bounded like the read: this arm exists for the wedged-server
+    # case, which is exactly when an unbounded call would hang the verb.
+    sup_bounded "$TMUX_READ_TIMEOUT" tmux kill-session -t "=$DOCTOR_SESSION" 2>/dev/null || true
+    say "warn: CANNOT-VERIFY — the session list could not be read, so the doctor loop '$DOCTOR_SESSION' has been asked to stop but that cannot be confirmed (check 'tmux ls')"
+    rc=1
+  elif [ "$ds" -eq 0 ]; then
     tmux kill-session -t "=$DOCTOR_SESSION" || { say "warn: could not stop the doctor loop '$DOCTOR_SESSION'"; rc=1; }
     say "doctor loop stopped (tmux '$DOCTOR_SESSION')"
   fi
   rm -f "$ROLES_DIR/.desired" "$ROLES_DIR/loop.pid"
-  if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+  local cs=0; tmux_session_present "$SESSION" || cs=$?
+  if [ "$cs" -eq 3 ]; then
+    # ⛔ Neither "not running" (a false claim that leaves the lock) nor a blind success: attempt the
+    # EXACT kill, and report the stop as unverified.
+    sup_bounded "$TMUX_READ_TIMEOUT" tmux kill-session -t "=$SESSION" 2>/dev/null || true
+    say "warn: CANNOT-VERIFY — the session list could not be read, so '$SESSION' has been asked to stop but that cannot be confirmed; the lock is KEPT (check 'tmux ls', then re-run stop)"
+    return 1
+  fi
+  if [ "$cs" -eq 1 ]; then
     say "controller: not running"
     [ "$rc" -eq 0 ] || return 1
     return 0
   fi
   # A failed kill must NOT fall through to the lock release and a 0 exit: `stop` would report
   # success while the controller is still running (the same "failed precondition as success" shape).
-  tmux kill-session -t "$SESSION" || die "tmux kill-session failed for '$SESSION' — the controller may still be running"
+  tmux kill-session -t "=$SESSION" || die "tmux kill-session failed for '$SESSION' — the controller may still be running"
   say "controller stopped (tmux '$SESSION')"
   rm -f "$LOCK" && say "released lock $LOCK"
   [ "$rc" -eq 0 ] || return 1
@@ -1314,8 +1453,20 @@ cmd_stop() {
 }
 
 cmd_status() {
-  if tmux has-session -t "$SESSION" 2>/dev/null; then say "controller: RUNNING (tmux '$SESSION')"
-  else say "controller: STOPPED"; fi
+  # ⛔ ONE read feeds BOTH lines below (the controller's state and the lane count): they are two facts
+  # about one snapshot, and a second read can answer the other way (measured: the controller line from
+  # snapshot A beside `lanes: UNKNOWN` from snapshot B).
+  local slist="" src=0 unk=0
+  slist="$(sup_session_list)"; src=$?
+  case "$src" in
+    0)
+      if grep -Fxq -- "$SESSION" <<<"$slist"; then say "controller: RUNNING (tmux '$SESSION')"
+      else say "controller: STOPPED"; fi ;;
+    # ⛔ "STOPPED" from a failed read is the false healthy row #1989 exists to remove, one layer down —
+    # and printing UNKNOWN while exiting 0 is the same row in words: the verdict is carried below.
+    3) say "controller: UNKNOWN — the session list could not be read (cannot-verify)"; unk=1 ;;
+    *) say "controller: STOPPED" ;;
+  esac
   say "state dir: $O"
   # agent-infra#1901: does this cell stand where it is pointed? ONE line — the repo the queue targets,
   # the checkout it is standing in, and the remote that fact was read from. Reported, never refused:
@@ -1337,7 +1488,12 @@ cmd_status() {
   fi
   # the loop's own view of itself
   tail -3 "$O/logs/orch-loop.log" 2>/dev/null | sed 's/^/  /' || say "  (no orch-loop.log yet)"
-  say "lanes: $(tmux ls 2>/dev/null | grep -c '^lane-')"
+  # …from the SAME read: the count of `lane-*` in the snapshot above. A second read printed `0` for its
+  # own failure — the "`lanes: 0`" #1989 quotes as the symptom.
+  case "$src" in
+    3) say "lanes: UNKNOWN — the session list could not be read (cannot-verify)" ;;
+    *) say "lanes: $(grep -c '^lane-' <<<"$slist" || true)" ;;
+  esac
   # agent-infra#1989: CONFIGURED vs RAN. Each role's own last-pass record is printed, and a started
   # cell whose role never ran / went stale fails this verb — the issue's validation requirement, and
   # the fix for the measured "a dead loop looks identical to an idle cell".
@@ -1350,6 +1506,9 @@ cmd_status() {
     say "  roles: UNKNOWN — cloud-cell-doctor.sh not found (run: $0 apply)"
     [ -f "$ROLES_DIR/.desired" ] && rrc=1
   fi
+  # ⛔ The cell-level verdict, not just the doctor's: printing UNKNOWN while exiting 0 is the same row
+  # in words — a monitoring probe reads the exit status, not the prose.
+  [ "$unk" -eq 0 ] || [ "$rrc" -ne 0 ] || rrc=1
   return "$rrc"
 }
 
@@ -1388,21 +1547,32 @@ start_doctor_loop() {
   mkdir -p "$ROLES_DIR" "$O/logs" || die "cannot create $ROLES_DIR"
   : > "$ROLES_DIR/.desired" || die "cannot record the desired running state at $ROLES_DIR/.desired"
   d="$(doctor_path)" || die "cloud-cell-doctor.sh not found (looked in $O, then beside $SUP_SELF in orchestrator-harness/, then beside $SUP_SELF) — the cell cannot run its repair/merge roles"
-  if tmux has-session -t "$DOCTOR_SESSION" 2>/dev/null; then
+  local dp0=0; tmux_session_present "$DOCTOR_SESSION" || dp0=$?
+  # ⛔ On a failed read, launching is the safe direction — an existing exact-name session makes
+  # `new-session` fail with `duplicate session`, which changes nothing — but CLAIMING "already running"
+  # is not: it is the false green this loop exists to remove. So an unverifiable read falls through to
+  # the launch, whose rc is then read below instead of being assumed.
+  if [ "$dp0" -eq 0 ]; then
     say "doctor loop already running (tmux '$DOCTOR_SESSION')"
     return 0
   fi
   # ⛔ The command string interpolates only values cmd_start has already passed through safe_argv.
   # The loop re-sources $ENV_FILE for the same reason the controller does: a tmux session is served
   # from the SERVER's environment on a pre-existing server, so this shell's exports would be dropped.
+  local nrc=0
   tmux new-session -d -s "$DOCTOR_SESSION" -c "$HARNESS" \
-    "set -a; [ ! -f '$ENV_FILE' ] || . '$ENV_FILE'; set +a; HOME='$CELL_HOME' CELL_HOME='$CELL_HOME' O='$O' REPO='$REPO' OR='$OR' SESSION='$SESSION' MIN_FREE_MB='$MIN_FREE_MB' DOCTOR_SUPERVISOR='$SUP_SELF' bash '$d' loop 2>&1 | tee -a '$O/logs/cell-doctor.log'"
+    "set -a; [ ! -f '$ENV_FILE' ] || . '$ENV_FILE'; set +a; HOME='$CELL_HOME' CELL_HOME='$CELL_HOME' O='$O' REPO='$REPO' OR='$OR' SESSION='$SESSION' MIN_FREE_MB='$MIN_FREE_MB' DOCTOR_SUPERVISOR='$SUP_SELF' bash '$d' loop 2>&1 | tee -a '$O/logs/cell-doctor.log'" || nrc=$?
   sleep 2
-  if tmux has-session -t "$DOCTOR_SESSION" 2>/dev/null; then
-    say "doctor loop started (tmux '$DOCTOR_SESSION')"
-  else
-    die "the doctor loop exited immediately — read $O/logs/cell-doctor.log"
-  fi
+  local dp1=0; tmux_session_present "$DOCTOR_SESSION" || dp1=$?
+  case "$dp1" in
+    0)
+      # ⛔ `new-session` refused a name that already existed: the loop is UP, but it was not started by
+      # this call — saying "started" would claim an action that did not take effect.
+      if [ "$nrc" -ne 0 ]; then say "doctor loop already running (tmux '$DOCTOR_SESSION') — the earlier read could not confirm it"
+      else say "doctor loop started (tmux '$DOCTOR_SESSION')"; fi ;;
+    3) die "CANNOT-VERIFY: the doctor loop could not be confirmed running (it may not have started) — check 'tmux ls' and $O/logs/doctor.log / $O/logs/cell-doctor.log" ;;
+    *) die "the doctor loop exited immediately — read $O/logs/cell-doctor.log" ;;
+  esac
 }
 
 cmd_doctor()  { assert_queue_target; run_role doctor "$@"; }
@@ -1429,7 +1599,11 @@ cmd_apply() {
   safe_argv "${HARNESS_PIN_DIR:-}" || die "\$HARNESS_PIN_DIR must not contain a quote or shell metacharacter"
   safe_argv "${HARNESS_PIN_FILE:-}" || die "\$HARNESS_PIN_FILE must not contain a quote or shell metacharacter"
   local before_c; before_c="$(harness_commit)"
-  if tmux has-session -t "$SESSION" 2>/dev/null && [ "$force" != 1 ]; then
+  local ap=0; tmux_session_present "$SESSION" || ap=$?
+  if [ "$ap" -eq 3 ] && [ "$force" != 1 ]; then
+    die "CANNOT-VERIFY: the session list could not be read, so apply cannot tell whether a controller is live — and apply would replace the harness tree under it. NOTHING was applied. Re-run when tmux answers ('tmux ls'), or --force if you know the cell is stopped"
+  fi
+  if [ "$ap" -eq 0 ] && [ "$force" != 1 ]; then
     die "a controller is RUNNING (tmux '$SESSION') and apply would replace the harness tree under it — 'stop' first, or re-run with --force"
   fi
   harness_apply
@@ -1448,15 +1622,22 @@ cmd_apply() {
 rm_cache() {
   [ -e "$1" ] || return 0
   local mb; mb="$(du -sm "$1" 2>/dev/null | awk '{print $1}')"
-  if rm -rf "$1" 2>/dev/null; then say "prune: -${mb:-?}MB $1"; else say "warn: could not remove $1"; fi
+  if rm -rf "$1" 2>/dev/null; then say "prune: -${mb:-?}MB $1"; else say "warn: could not remove $1"; return 1; fi
 }
 
 # Regenerable caches at ONE worktree root. `--maxdepth 5` keeps the pycache sweep bounded.
+# ⛔ A removal that FAILED returns 1. It used to print its warning and return the status of `say` (0),
+# so every caller saw a clean sweep: `prune --caches` ended in a literal `return 0`, and the doctor's
+# hygiene role recorded "worktree caches swept" over caches it could not remove (a root-owned or
+# read-only `.venv` is the reachable case — measured, not hypothetical).
 sweep_root_caches() {
-  local root="$1"
+  local root="$1" rc=0
   [ -d "$root" ] || return 0
-  rm_cache "$root/.venv"; rm_cache "$root/node_modules"; rm_cache "$root/.pytest_cache"
-  find "$root" -maxdepth 5 -type d -name __pycache__ -prune -exec rm -rf {} + 2>/dev/null || true
+  rm_cache "$root/.venv" || rc=1
+  rm_cache "$root/node_modules" || rc=1
+  rm_cache "$root/.pytest_cache" || rc=1
+  find "$root" -maxdepth 5 -type d -name __pycache__ -prune -exec rm -rf {} + 2>/dev/null || rc=1
+  return "$rc"
 }
 
 # Is <path> a worktree of $REPO or $HARNESS_REPO? Scratch deletion must never touch one — a worktree
@@ -1492,7 +1673,7 @@ cmd_prune() {
     esac
   done
   case "$days" in ''|*[!0-9]*) die "prune: DAYS must be a number (got '$days')";; esac
-  local before after mb r root d active_pin d_real live_root pin_root skip
+  local before after mb r root d active_pin d_real live_root pin_root skip sweep_rc=0
   # (0) Harness pins superseded by the current one. `apply` names each pin by its commit, so a main
   # advance leaves the previous pin behind; only the path $HARNESS_PIN_FILE names is kept. Without this
   # per-commit pinning is a disk LEAK — the very thing `prune` exists to stop. An empty pin file means
@@ -1534,12 +1715,14 @@ cmd_prune() {
         # entry plus its admin dir behind, one per pin forever, on the very verb that exists to stop a
         # disk leak. `worktree remove --force` handles both; `rm_cache` is the fallback when the
         # record is already gone or this is not a registered worktree.
-        git -C "$HARNESS_REPO" worktree remove --force "$d" >/dev/null 2>&1 || rm_cache "$d"
+        git -C "$HARNESS_REPO" worktree remove --force "$d" >/dev/null 2>&1 || rm_cache "$d" || sweep_rc=1
       done
     fi
   fi
   before="$(free_mb "$CELL_HOME")"
-  tmux has-session -t "$SESSION" 2>/dev/null && say "warn: a controller is running — a pruned venv makes the lane using it re-resolve its deps"
+  local pcp=0; tmux_session_present "$SESSION" || pcp=$?
+  [ "$pcp" -eq 0 ] && say "warn: a controller is running — a pruned venv makes the lane using it re-resolve its deps"
+  [ "$pcp" -eq 3 ] && say "warn: CANNOT-VERIFY — the session list could not be read, so a controller MAY be running: a pruned venv makes the lane using it re-resolve its deps"
   for r in "$REPO" "$HARNESS_REPO"; do
     [ -n "$r" ] || continue
     git -C "$r" rev-parse --git-dir >/dev/null 2>&1 || continue
@@ -1552,15 +1735,15 @@ cmd_prune() {
     # `for root in "$(git … worktree list …)" "$r"` quoted the whole list into ONE word, so
     # `[ -d "$root" ]` skipped it and only the main checkout was ever swept: the incident's single
     # largest consumer was a 5.6G `.venv` in ONE LINKED worktree, which this loop could never reach.
-    while IFS= read -r root; do sweep_root_caches "$root"; done \
+    while IFS= read -r root; do sweep_root_caches "$root" || sweep_rc=1; done \
       < <(git -C "$r" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10)}')
-    sweep_root_caches "$r"
+    sweep_root_caches "$r" || sweep_rc=1
   done
-  [ "$caches_only" = 1 ] && { after="$(free_mb "$CELL_HOME")"; [ -n "$before" ] && [ -n "$after" ] && say "prune: free ${before}MB → ${after}MB"; return 0; }
+  [ "$caches_only" = 1 ] && { after="$(free_mb "$CELL_HOME")"; [ -n "$before" ] && [ -n "$after" ] && say "prune: free ${before}MB → ${after}MB"; return "$sweep_rc"; }
   # (3) /tmp review scratch. REPORTED, never deleted implicitly: a scratch checkout is source, and
   # the brief is explicit that source may be unmerged work. --scratch deletes only what is (a) a git
   # checkout, (b) NOT a registered worktree, and (c) older than DAYS.
-  local kept="" freed_scratch=0
+  local kept=""
   for d in "$SCRATCH_ROOT"/*/; do
     d="${d%/}"
     [ -d "$d" ] || continue
@@ -1572,7 +1755,10 @@ cmd_prune() {
     # cell does not happen to have registered ($REPO/$HARNESS_REPO).
     [ -f "$d/.git" ] && continue
     if [ "$do_scratch" = 1 ] && [ -n "$(find "$d" -maxdepth 0 -mtime +"$days" 2>/dev/null)" ]; then
-      rm_cache "$d"; freed_scratch=1
+      # ⛔ …and a scratch checkout it could NOT delete is not a clean pass: `rm_cache` names the path it
+      # failed on and this folds the failure into the verb's own exit status. (It is NOT added to the
+      # "still on disk" list below — that list is the REPORT of what aging left behind, not of attempts.)
+      rm_cache "$d" || sweep_rc=1
     else
       mb="$(du -sm "$d" 2>/dev/null | awk '{print $1}')"
       kept="$kept
@@ -1583,9 +1769,12 @@ cmd_prune() {
     say "prune: scratch checkouts still on disk (source — NOT deleted; use --scratch[=DAYS] to reclaim):"
     printf '%s\n' "$kept"
   fi
-  [ "$freed_scratch" = 1 ] || true
   after="$(free_mb "$CELL_HOME")"
   [ -n "$before" ] && [ -n "$after" ] && say "prune: free ${before}MB → ${after}MB"
+  # The verb's own verdict: a removal it could not complete is not a clean pass, on EVERY path (the
+  # `--caches` early return above and this one), because `prune` is the command the operator is told to
+  # run to free space.
+  return "$sweep_rc"
 }
 
 case "${1:-status}" in
