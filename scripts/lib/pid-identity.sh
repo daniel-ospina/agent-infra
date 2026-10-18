@@ -175,6 +175,46 @@ pid_row() {
     return 0
 }
 
+# ── start epoch + the "began after" fence (agent-infra#1761) ───────────
+# ONE slack for one question: "this process began AFTER that record was written, so it cannot be the
+# process the record names". Two consumers fence pid REUSE with it — the per-(machine,repo)
+# controller registry (scripts/lib/orchestrator-registry.sh) and cloud-cell-supervisor.sh's
+# lock-owner read (`lock_controller_pid`). Review of #1856 found the two consumers carrying their own
+# copies of the parser AND two different slacks (+1s and +5s) next to this library's ±3s fence.
+# cloud-cell-supervisor.sh keeps a PINNED MIRROR of the two functions below because it must run
+# standalone — it is farmed into a runtime dir, and a suite arm copies it outside any checkout, so it
+# cannot source a sibling library. The pair is pinned by a drift arm
+# (cloud-cell-supervisor.test.sh §(n)): divergence reddens CI instead of becoming a wrong kill.
+PID_START_SLACK_SECONDS="${PID_START_SLACK_SECONDS:-5}"
+
+# pid_start_epoch <pid> — when the process began, from `ps -o etime=`, whose [[dd-]hh:]mm:ss shape is
+# the SAME on BSD and GNU ps (unlike etimes/lstart, which are not). rc 1 when it cannot be read.
+pid_start_epoch() {
+  local p="${1:-}" e d h m s r
+  case "$p" in ''|*[!0-9]*) return 1 ;; esac
+  e="$("${PS_BIN:-/bin/ps}" -o etime= -p "$p" 2>/dev/null | tr -d '[:space:]')" || return 1
+  [ -n "$e" ] || return 1
+  d=0
+  case "$e" in *-*) d="${e%%-*}"; r="${e#*-}" ;; *) r="$e" ;; esac
+  case "$d" in ''|*[!0-9]*) return 1 ;; esac
+  case "$r" in
+    *:*:*) h="${r%%:*}"; r="${r#*:}"; m="${r%%:*}"; s="${r##*:}" ;;
+    *:*)   h=0;                 m="${r%%:*}"; s="${r##*:}" ;;
+    *) return 1 ;;
+  esac
+  case "$h$m$s" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s\n' "$(( $(date +%s) - (d * 86400 + h * 3600 + m * 60 + s) ))"
+}
+
+# pid_began_after <pid> <epoch> — 0 when the process began AFTER <epoch> + the slack. rc 1 for "no"
+# AND for "cannot tell": an unreadable age never witnesses a reuse.
+pid_began_after() {
+  local pe="${2:-}" ps
+  case "$pe" in ''|*[!0-9]*) return 1 ;; esac
+  ps="$(pid_start_epoch "${1:-}")" || return 1
+  [ "$ps" -gt "$((pe + PID_START_SLACK_SECONDS))" ]
+}
+
 # ── the probe ──────────────────────────────────────────────────────────
 # pid_probe <pid> <recorded-startSeconds> — see the CLI contract above.
 pid_probe() {

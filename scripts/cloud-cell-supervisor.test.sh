@@ -1733,6 +1733,10 @@ esac
                    || ok "start: no second session was created"
 # The child (a worker-shape transient) must be gone before `stop` asserts the state dir is clear.
 for i in $(seq 1 40); do [ -n "$CHILD" ] && kill -0 "$CHILD" 2>/dev/null || break; sleep 0.25; done
+# ⛔ RE-CREATE THE LOCK. The arm above removed it to prove `status` cannot be blinded by a deleted
+# lock; without restoring it, `stop`'s "released lock" arm asserted a release of a file that was not
+# there (`rm -f` succeeds on an absent path) — an assertion that cannot fail (#1856 review).
+printf '%s\n' "$ROOT" > "$L/o/.orch.lock"
 OUT="$(own_sup stop)"
 case "$OUT" in
   *"not running"*) bad "stop: reported 'not running' over a live controller (no false STOPPED)" ;;
@@ -1801,6 +1805,146 @@ case "$OUT" in
   *) bad "stop: left a dead-pid lock behind without explaining it — $OUT" ;;
 esac
 [ -e "$P/o/.orch.lock" ] && bad "stop: the dead-pid lock is still there" || ok "stop: the stale lock is gone"
+
+
+# ── §(o) SESSION OWNERSHIP, THE OWNED/SEEN SPLIT, AND AN UNREADABLE `ps` (#1856 review) ─────────
+# A tmux session name is MACHINE-scoped (`orch` by default) while `$O` is per-REPO, so on a two-repo
+# machine "the session exists" is not evidence that THIS state dir's controller is in it. Measured in
+# review with a tmux double: repo B's `stop` TERMed repo A's live loop and exited 0 — a foreign
+# controller killed by a state dir that could not prove it owned it.
+say_case "session ownership, owned-vs-seen, and a `ps` that cannot answer (#1856 review)"
+X="$T/sess"; mkdir -p "$X/home" "$X/oB" "$X/harness" "$X/bin" "$X/repo"
+git init -q "$X/repo" 2>/dev/null || bad "fixture: cannot git init $X/repo"
+git -C "$X/repo" remote add origin https://github.com/daniel-ospina/agent-infra.git 2>/dev/null || true
+cat > "$X/harness/orch-loop.sh" <<'STUB'
+#!/bin/bash
+trap 'exit 0' TERM INT
+while :; do sleep 1; done
+STUB
+chmod +x "$X/harness/orch-loop.sh"
+# The tmux double: the session EXISTS, and kill-session is recorded so "did stop kill it" is answered
+# by evidence rather than by the absence of an error.
+cat > "$X/bin/tmux" <<SH
+#!/bin/bash
+case "\${1:-}" in
+  has-session) exit 0 ;;
+  kill-session) printf '%s\n' "\$*" >> "$X/killed"; exit 0 ;;
+  *) exit 0 ;;
+esac
+SH
+chmod +x "$X/bin/tmux"
+X_RC=0; X_OUT=''
+xs() { # <sub> [VAR=value …]
+  X_OUT="$(env -u OR "$@" PATH="$X/bin:$PATH" CELL_HOME="$X/home" ENV_FILE="$X/home/keys.env" \
+           SESSION="orch" O="$X/oB" REPO="$X/repo" OR="daniel-ospina/agent-infra" SCOPE=own \
+           HARNESS="$X/harness" bash "$SUP" "${XS_VERB:-status}" 2>&1)"; X_RC=$?
+}
+# A controller for the OTHER repo: it runs from the shared harness path and holds NO lock in $O.
+bash "$X/harness/orch-loop.sh" & X_PID=$!
+AI1761_PIDS="${AI1761_PIDS:-} $X_PID"
+sleep 0.5
+XS_VERB=stop xs
+[ "$X_RC" -ne 0 ] && ok "stop: REFUSES to kill a session it cannot prove it owns (rc=$X_RC)" \
+                   || bad "stop: reported success over a session held by a foreign controller — $X_OUT"
+case "$X_OUT" in
+  *"does NOT belong to this state dir"*) ok "stop: names the reason (the session's controller is not this state dir's)" ;;
+  *) bad "stop: does not say why it refused — $X_OUT" ;;
+esac
+[ -e "$X/killed" ] && bad "stop: KILLED the shared session anyway — $(cat "$X/killed")" \
+                   || ok "stop: never called kill-session (no foreign controller was terminated)"
+kill -0 "$X_PID" 2>/dev/null && ok "stop: the foreign controller SURVIVED" \
+                              || bad "stop: the foreign controller was killed"
+# The read that names it must say WHOSE it is not: "RUNNING" alone would attribute another repo's
+# work to this queue.
+XS_VERB=status xs
+case "$X_OUT" in
+  *"RUNNING"*"NOT this state dir's"*) ok "status: reports a harness-path controller as NOT this state dir's" ;;
+  *"controller: RUNNING (pid $X_PID)"*) bad "status: claimed the foreign controller as this state dir's owner — $X_OUT" ;;
+  *) bad "status: neither claimed nor disclaimed the visible controller — $X_OUT" ;;
+esac
+# …and the POSITIVE direction, so the refusal above is not "stop never kills anything": with a lock
+# naming a live $O controller, the session IS this state dir's and is stopped.
+rm -f "$X/killed"
+cat > "$X/oB/orch-loop.sh" <<'STUB'
+#!/bin/bash
+trap 'exit 0' TERM INT
+while :; do sleep 1; done
+STUB
+chmod +x "$X/oB/orch-loop.sh"
+bash "$X/oB/orch-loop.sh" & X_OWN=$!
+AI1761_PIDS="$AI1761_PIDS $X_OWN"
+printf '%s\n' "$X_OWN" > "$X/oB/.orch.lock"
+sleep 0.5
+XS_VERB=stop xs
+case "$X_OUT" in
+  *"controller stopped"*|*"released lock"*) ok "stop: PROCEEDS when the lock proves this state dir owns a live controller" ;;
+  *) bad "stop: refused even with a provable owner — $X_OUT" ;;
+esac
+grep -q kill-session "$X/killed" 2>/dev/null && ok "stop: killed the session it owns" \
+                                            || bad "stop: did not kill the session it owns — $(cat "$X/killed" 2>/dev/null)"
+sleep 0.5
+kill -0 "$X_OWN" 2>/dev/null && bad "stop: its own controller survived" || ok "stop: its own controller is gone"
+kill -0 "$X_PID" 2>/dev/null && ok "stop: the OTHER repo's controller is still untouched" \
+                             || bad "stop: killed the other repo's controller while stopping its own"
+# ── an unreadable process table is CANNOT-DETERMINE, never STOPPED ────────────────────────────────
+# `ps` failing (a truncated PATH, a locked /proc, a denied exec) used to yield an empty read, which is
+# indistinguishable from "no controller" — the false-STOPPED class this whole change exists to close.
+mkdir -p "$X/badbin"; printf '#!/bin/sh\nexit 1\n' > "$X/badbin/ps"; chmod +x "$X/badbin/ps"
+xs_bad() { # <sub>
+  X_OUT="$(PATH="$X/badbin:$X/bin:$PATH" CELL_HOME="$X/home" ENV_FILE="$X/home/keys.env" \
+           SESSION="orch-different-$$" O="$X/oB" REPO="$X/repo" OR="daniel-ospina/agent-infra" \
+           SCOPE=own HARNESS="$X/harness" bash "$SUP" "$1" 2>&1)"; X_RC=$?
+}
+for verb in status stop; do
+  xs_bad "$verb"
+  [ "$X_RC" -ne 0 ] && ok "$verb: rc=$X_RC when 'ps' cannot answer (never a silent 0)" \
+                    || bad "$verb: exited 0 on an unreadable process table — $X_OUT"
+  case "$X_OUT" in
+    *"cannot read the process table"*) ok "$verb: says the process table is unreadable" ;;
+    *) bad "$verb: does not name the unreadable read — $X_OUT" ;;
+  esac
+done
+kill -9 "$X_PID" 2>/dev/null
+
+# ── §(p) THE TWO PINNED MIRRORS MUST NOT DRIFT (#1856 review) ───────────────────────────────────
+# cloud-cell-supervisor.sh cannot source scripts/lib/pid-identity.sh (it is deployed STANDALONE into a
+# cell's harness), so it carries `_proc_start_epoch`/`_proc_began_after` as pinned MIRRORS of
+# `pid_start_epoch`/`pid_began_after`. Two copies of a timing predicate is how the fleet ends up with
+# two different slacks — the divergence #1178 exists to prevent. Bodies are compared with the names
+# normalised, so a change made to one copy alone reddens this arm.
+say_case "the pinned pid-identity mirrors do not drift from scripts/lib/pid-identity.sh (#1178)"
+PIB="$(dirname "$SUP")/lib/pid-identity.sh"
+if [ -f "$PIB" ]; then
+  # ⛔ NEVER SOURCE the supervisor to read its functions: it is a SCRIPT, so sourcing it runs its
+  # entry point (which would start reading keys, tmux and the registry inside this arm). The text is
+  # extracted instead — and that is also the more honest check, because the duplication IS text.
+  extract_fn() { # <file> <name>  → the whole `name() { … }` block
+    awk -v n="$2" 'index($0, n"() {")==1 {p=1} p{print} p && /^}$/{exit}' "$1"
+  }
+  norm() {
+    sed -e 's/_proc_start_epoch/FN_START/g' -e 's/_proc_began_after/FN_AFTER/g' \
+        -e 's/pid_start_epoch/FN_START/g'   -e 's/pid_began_after/FN_AFTER/g' \
+        -e 's/LOCK_START_SLACK_SECONDS/SLACK/g' -e 's/PID_START_SLACK_SECONDS/SLACK/g' \
+        -e 's/[[:space:]]\+$//' -e '/^[[:space:]]*$/d'
+  }
+  SUP_BODY="$( { extract_fn "$SUP" _proc_start_epoch; extract_fn "$SUP" _proc_began_after; } | norm )"
+  LIB_BODY="$( { extract_fn "$PIB" pid_start_epoch;    extract_fn "$PIB" pid_began_after;    } | norm )"
+  if [ -n "$SUP_BODY" ] && [ -n "$LIB_BODY" ] && [ "$SUP_BODY" = "$LIB_BODY" ]; then
+    ok "the mirror's BODIES are identical to the library's (normalised for the two names)"
+  else
+    bad "the supervisor's pid-identity mirror has DRIFTED from $PIB"
+    diff <(printf '%s\n' "$LIB_BODY") <(printf '%s\n' "$SUP_BODY") | sed 's/^/      /' | head -20
+  fi
+  # The constants can drift independently of the bodies.
+  slack_of() { grep -oE '[0-9]+' <<<"$1" | tail -1; }
+  sup_slack="$(slack_of "$(sed -n 's/^\(LOCK_START_SLACK_SECONDS=.*\)/\1/p' "$SUP" | head -1)")"
+  lib_slack="$(slack_of "$(sed -n 's/^\(PID_START_SLACK_SECONDS=.*\)/\1/p' "$PIB" | head -1)")"
+  [ -n "$sup_slack" ] && [ "$sup_slack" = "$lib_slack" ] \
+    && ok "the two slack constants agree ($sup_slack s)" \
+    || bad "slack drifted: supervisor=${sup_slack:-<absent>} library=${lib_slack:-<absent>}"
+else
+  bad "scripts/lib/pid-identity.sh is missing next to the supervisor — the mirrors cannot be checked"
+fi
 
 trap 'ai1711_cleanup; [ -n "${AI1761_PIDS:-}" ] && kill -9 $AI1761_PIDS 2>/dev/null; rm -rf "$T"' EXIT
 

@@ -73,9 +73,13 @@ warn() { printf 'warn: %s\n' "$*" >&2; }
 refuse()  { printf 'bringup: REFUSED: %s\n' "$1" >&2; exit 1; }
 unknown() { printf 'bringup: CANNOT DETERMINE: %s\n' "$1" >&2; exit 2; }
 
-usage() {
+usage() { # <exit-code>
   sed -n '2,/^set -uo pipefail$/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//; $d'
-  exit 0
+  # ⛔ NOT always 0: an unusable command line is a REFUSAL (exit 1) under this file's own contract
+  # (0 ok · 1 refused · 2 cannot-determine). `usage` with a bad argument used to exit 0 after
+  # printing the header — so `start --force` (a flag the SUPERVISOR's apply accepts, the natural
+  # mistake) reported success having started nothing (#1856 review, reproduced).
+  exit "${1:-0}"
 }
 
 VERB=""; RESEED=0
@@ -83,8 +87,8 @@ for a in "$@"; do
   case "$a" in
     check|start|stop|status) VERB="$a" ;;
     --reseed)               RESEED=1 ;;
-    -h|--help)              usage ;;
-    *) printf 'bringup: unknown argument %s\n' "$a" >&2; usage ;;
+    -h|--help)              usage 0 ;;
+    *) printf 'bringup: unknown argument %s\n' "$a" >&2; usage 1 ;;
   esac
 done
 [ -n "$VERB" ] || VERB="check"
@@ -183,28 +187,73 @@ SLUG=""; SLUG_REPO=""
 # reported "no orch-loop.sh pid observed yet" over a live loop (the same false-STOPPED class #1761 is
 # about, one path further in).
 harness_ctl_path() {
-  local p=""
+  local p="" pin="${HARNESS_PIN_FILE:-}"
   if [ -n "${HARNESS:-}" ]; then printf '%s\n' "$HARNESS"; return 0; fi
-  [ -f "$HARNESS_PIN_FILE" ] && p="$(head -1 "$HARNESS_PIN_FILE" 2>/dev/null)"
+  # ⛔ `${HARNESS_PIN_FILE:-}`: the pin is a CELL concept and the variable is assigned only in the
+  # cell branch, so on the Mac path a bare "$HARNESS_PIN_FILE" ABORTED this command substitution under
+  # `set -u` — the harness-path scope silently vanished and every Mac run printed `unbound variable`
+  # into a read that then reported STOPPED (#1856 review, reproduced).
+  [ -n "$pin" ] && [ -f "$pin" ] && p="$(head -1 "$pin" 2>/dev/null)"
   [ -n "$p" ] || p="$HARNESS_BRINGUP"
   printf '%s\n' "$p"
 }
-local_controller_pids() {
-  ps -eo pid=,ppid=,command= 2>/dev/null | awk -v a="$O/orch-loop.sh" -v b="$(harness_ctl_path)/orch-loop.sh" '
-    { ppid[$1]=$2; c=$0; sub(/^[[:space:]]*[0-9]+[[:space:]]+[0-9]+[[:space:]]+/,"",c)
-      n=split(c,tok," ")
-      if (n>=2 && (tok[2]==a || (b!="" && tok[2]==b)) && tok[1] ~ /(bash|sh|dash|zsh)$/) m[$1]=1 }
-    END { for (p in m) { q=p; d=0
-            for (i=0;i<64;i++) { if (!(q in ppid) || ppid[q]<=1) break; q=ppid[q]; if (q in m) { d=1; break } }
-            if (!d) print p } }'
+# Controller pids, in two SCOPEs — the distinction is load-bearing (#1856 review).
+#
+# state_dir_pids — processes running THIS state dir's own `orch-loop.sh`. Nothing else is asserted.
+# local_controller_pids — the REPORTING read: the above plus anything running the harness path this
+#   machine executes the loop from. ⛔ That harness path is one directory per cell home
+#   (`$CELL_HOME/harness`), so TWO REPOS ON ONE MACHINE SHARE IT and this read returns repo A's
+#   controller to repo B. It may be reported; it may never witness "this repo is running".
+# owned_pids — what this state dir may CLAIM and SIGNAL: the lock owner plus state_dir_pids.
+# The scope predicate itself. A QUOTED heredoc, not a single-quoted variable: the program contains
+# "" and $1, and re-expanding a variable would hand awk a mangled program (which fails the read and
+# reads as "no controller" — a false STOPPED, the exact class this file exists to prevent).
+_ps_scope_awk() {
+  cat <<'AWK'
+  { ppid[$1]=$2; c=$0; sub(/^[[:space:]]*[0-9]+[[:space:]]+[0-9]+[[:space:]]+/,"",c)
+    n=split(c,tok," ")
+    if (n>=2 && (tok[2]==a || (b!="" && tok[2]==b)) && tok[1] ~ /(bash|sh|dash|zsh)$/) m[$1]=1 }
+  END { for (p in m) { q=p; d=0
+          for (i=0;i<64;i++) { if (!(q in ppid) || ppid[q]<=1) break; q=ppid[q]; if (q in m) { d=1; break } }
+          if (!d) print p } }
+AWK
 }
+_ps_scoped() { # <primary-path> <extra-path-or-empty>; rc 1 when ps cannot answer
+  local t prog
+  t="$(ps -eo pid=,ppid=,command= 2>/dev/null)" || return 1
+  case "$t" in *[![:space:]]*) ;; *) return 1 ;; esac
+  prog="$(_ps_scope_awk)"
+  printf '%s\n' "$t" | awk -v a="$1" -v b="$2" "$prog" || return 1
+}
+state_dir_pids() { _ps_scoped "$O/orch-loop.sh" ""; }
+local_controller_pids() {
+  _ps_scoped "$O/orch-loop.sh" "$(harness_ctl_path)/orch-loop.sh"
+}
+owned_pids() {
+  local a b
+  a="$(state_dir_pids)" || return 1
+  b="$(lock_pid)" || b=""
+  printf '%s\n%s\n' "$a" "$b" | awk 'NF && !s[$0]++'
+}
+# lock_pid — the pid $O/.orch.lock names, when it is alive, IS an orch-loop.sh INVOCATION, and cannot
+# have begun after the lock was written.
+#
+# ⛔ THIS IS THE SUPERVISOR'S PREDICATE, NOT A SUBSTRING MATCH. The previous form (`case "$c" in
+# *orch-loop.sh*`) was exactly the shape cloud-cell-supervisor.sh's `lock_controller_pid` documents as
+# a P0 it just fixed — and this file then used it twice: `check` printed a FALSE PASS naming a foreign
+# pid as the lock owner, and `start_cell`'s fallback could persist that pid into the registry, where
+# it reads `live` forever and every later start refuses until a human hand-edits the record (the
+# #8175 class). A predicate that feeds a durable record must be the strict one (#1856 review).
 lock_pid() {
-  local p c
+  local p lt
   p="$(tr -dc '0-9' 2>/dev/null < "$O/.orch.lock")"
   [ -n "$p" ] || return 0
   kill -0 "$p" 2>/dev/null || return 0
-  c="$(ps -o command= -p "$p" 2>/dev/null)" || return 0
-  case "$c" in *orch-loop.sh*) printf '%s\n' "$p" ;; esac
+  registry_pid_is_controller "$p" || return 0
+  lt="$(date -r "$O/.orch.lock" +%s 2>/dev/null)" || return 0
+  [ -n "$lt" ] || return 0
+  pid_began_after "$p" "$lt" && return 0
+  printf '%s\n' "$p"
 }
 pids_join() { printf '%s' "$1" | tr '\n' ' ' | sed 's/ *$//'; }
 
@@ -214,18 +263,26 @@ pids_join() { printf '%s' "$1" | tr '\n' ' ' | sed 's/ *$//'; }
 # refuses the pair, and cloud-cell-supervisor.sh refuses it again on the start path — the duplication
 # is deliberate on a REFUSAL (each surface must be safe on its own); what must never be duplicated is
 # a PASS.
-resolve_repo_identity() {
-  [ -n "${REPO:-}" ] || return 1
+#
+# ⛔ IT RETURNS; IT DOES NOT EXIT. `status` and `stop` call it too, and they must stay ANSWERABLE —
+# the supervisor's own tested rule ("status: a MISMATCH is reported, not refused"). While this
+# function refused by exiting, those two verbs died SILENTLY (the caller discarded stderr) and
+# returned 1 printing nothing at all, so `status` — the one screen an operator reads — was a black
+# hole on exactly the misconfigured machine it exists to explain (#1856 review, reproduced).
+IDENTITY_MSG=""
+resolve_repo_identity() { # 0 ok · 1 refused/cannot-derive, with IDENTITY_MSG set
+  IDENTITY_MSG=""
+  [ -n "${REPO:-}" ] || { IDENTITY_MSG="no repo is configured for this machine"; return 1; }
   if [ -n "${OR:-}" ]; then
     repo_matches_checkout "$OR" "$REPO"; local rc=$?
     case "$rc" in
       0) SLUG_REPO="$OR"; return 0 ;;
-      1) refuse "the queue repo and the checkout name DIFFERENT repos: OR=$OR but $REPO is a checkout of '$(repo_of_checkout "$REPO" 2>/dev/null || printf '?')' (origin $(git -C "$REPO" remote get-url origin 2>/dev/null)) — set OR to the checkout's repo, or point REPO at an $OR checkout" ;;
-      *) refuse "cannot read the 'origin' remote of $REPO, so OR=$OR cannot be verified against it — a queue target that cannot be checked is never a pass (agent-infra#1901); fix the checkout's remote or unset OR to derive it" ;;
+      1) IDENTITY_MSG="the queue repo and the checkout name DIFFERENT repos: OR=$OR but $REPO is a checkout of '$(repo_of_checkout "$REPO" 2>/dev/null || printf '?')' (origin $(git -C "$REPO" remote get-url origin 2>/dev/null)) — set OR to the checkout's repo, or point REPO at an $OR checkout"; return 1 ;;
+      *) IDENTITY_MSG="cannot read the 'origin' remote of $REPO, so OR=$OR cannot be verified against it — a queue target that cannot be checked is never a pass (agent-infra#1901); fix the checkout's remote or unset OR to derive it"; return 1 ;;
     esac
   fi
   SLUG_REPO="$(repo_of_checkout "$REPO")" \
-    || refuse "cannot derive the repo identity from $REPO — its 'origin' remote is missing or does not name <owner>/<repo> in an accepted form (https://, http://, ssh://, or git@host:owner/repo.git), so this machine cannot say which repo it would control"
+    || { IDENTITY_MSG="cannot derive the repo identity from $REPO — its 'origin' remote is missing or does not name <owner>/<repo> in an accepted form (https://, http://, ssh://, or git@host:owner/repo.git), so this machine cannot say which repo it would control"; return 1; }
   return 0
 }
 
@@ -334,7 +391,7 @@ cmd_check() {
   fi
   git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1 \
     || refuse "$REPO is not a git checkout (no .git directory or linked-worktree .git file) — pass REPO=<a real checkout>"
-  resolve_repo_identity
+  resolve_repo_identity || refuse "$IDENTITY_MSG"
   SLUG="$(registry_slug "$SLUG_REPO")" \
     || refuse "the repo identity '$SLUG_REPO' is not usable as a registry key — it must be <owner>/<repo>"
   ok "repo $SLUG_REPO at $REPO (origin $(git -C "$REPO" remote get-url origin 2>/dev/null))"
@@ -351,6 +408,10 @@ cmd_check() {
 
   # 3. keys load. The cell reads them from the config file; the Mac's launchd plist has no
   # environment and install.sh exports them into it, so both paths ultimately need ONE provider key.
+  # ⛔ ON THE MAC, A CONFIG FILE IS NOT THE KEY SOURCE — so a config with no `*_API_KEY` in it is not
+  # a refusal there. The previous form refused on `-f "$ENV_FILE"` at every platform, which made
+  # `--reseed` self-defeating: the documented repair CREATES that file (REPO/OR/O, no key), and every
+  # later `check`/`start` then refused "no provider key" (#1856 review, reproduced).
   if [ -f "$ENV_FILE" ]; then
     bash -n "$ENV_FILE" 2>/dev/null \
       || refuse "$ENV_FILE cannot be parsed as shell — sourcing it would silently drop every key it sets; fix it (or move the keys to a file that is only assignments)"
@@ -360,8 +421,10 @@ cmd_check() {
     done
     if [ "$count" -gt 0 ]; then
       ok "keys: $count provider key(s) load from $ENV_FILE"
-    else
+    elif [ "$PLATFORM" = "cell" ]; then
       refuse "no provider key (*_API_KEY) with a value loads from $ENV_FILE — every lane would fail its first model call; add one to that file"
+    else
+      warn "no provider key (*_API_KEY) in $ENV_FILE — fine on a Mac: this box's keys come from the shell that runs 'install.sh'"
     fi
   elif [ "$PLATFORM" = "cell" ]; then
     refuse "no config file at $ENV_FILE — a cell lane has no provider key and no HOME; push one or run: $0 --reseed"
@@ -372,10 +435,14 @@ cmd_check() {
   # 4. the harness pin is exactly one and owned (cell) / the deployed copy is on the repo's line (Mac).
   check_harness_pin
 
-  # 5. the lock: free, or owned by a live controller.
-  local lp live
-  lp="$(lock_pid)"
-  live="$(local_controller_pids)"
+  # 5. the lock: free, or owned by a live controller. AND the split that the whole #1761 review turns
+  # on: what this state dir OWNS vs what merely runs this machine's harness (another repo's
+  # controller, when two repos share the cell's harness path).
+  local lp live own foreign
+  lp="$(lock_pid)" || lp=""
+  live="$(local_controller_pids)" || live=""
+  own="$(owned_pids)" || own=""
+  foreign="$(comm -23 <(printf '%s\n' "$live" | awk 'NF' | sort -u) <(printf '%s\n' "$own" | awk 'NF' | sort -u))"
   if [ -n "$lp" ]; then
     ok "lock $O/.orch.lock owned by live controller pid $lp"
   elif [ -f "$O/.orch.lock" ]; then
@@ -383,7 +450,11 @@ cmd_check() {
   else
     ok "lock free ($O/.orch.lock absent)"
   fi
-  [ -z "$live" ] || ok "controller running for this state dir: pid $(pids_join "$live")"
+  [ -z "$own" ] || ok "controller running for this state dir: pid $(pids_join "$own")"
+  # ⛔ REPORTED, never blessed: a pid running the shared harness path with no lock here is the OTHER
+  # repo's controller on a two-repo machine. Calling it "running for this state dir" is how repo B's
+  # `status`/`check` would claim repo A's work (#1856 review, reproduced).
+  [ -z "$foreign" ] || warn "also seen (NOT this state dir's): pid $(pids_join "$foreign") runs this machine's harness but holds no $O/.orch.lock — another repo's controller"
 
   # 6. the per-repo registry: at most ONE live controller per (machine, repo).
   check_registry
@@ -482,8 +553,8 @@ check_registry() {
   local f verdict kind pid ro st
   f="$(registry_file "$SLUG_REPO")" || unknown "the repo identity '$SLUG_REPO' cannot be turned into a registry key"
   verdict="$(registry_verdict "$f")"
-  # shellcheck disable=SC2086
-  set -- $verdict; kind="${1:-}"; pid="${2:-}"; ro="${3:-}"; st="${4:-}"
+  IFS=$'\t' read -r kind pid ro st <<<"$verdict"
+  kind="${kind:-}"; pid="${pid:-}"; ro="${ro:-}"; st="${st:-}"
   case "$kind" in
     absent)
       ok "registry: no controller recorded for $SLUG_REPO on this machine"
@@ -540,7 +611,7 @@ cmd_start() {
   if [ -z "${REPO:-}" ] || [ ! -d "${REPO:-}" ]; then
     cmd_check   # produces the exact refusal (missing path / unset / not a checkout)
   fi
-  resolve_repo_identity
+  resolve_repo_identity || refuse "$IDENTITY_MSG"
   SLUG="$(registry_slug "$SLUG_REPO")" || unknown "the repo identity '$SLUG_REPO' is not usable as a registry key"
   local f; f="$(registry_file "$SLUG_REPO")" || unknown "cannot compute the registry path for $SLUG_REPO"
 
@@ -560,6 +631,22 @@ cmd_start() {
   esac
   pid="$STARTED_PID"
   [ -n "$pid" ] || unknown "the controller was launched but its pid could not be read — the registry is left unclaimed so a second start is not blocked by a phantom; check: $0 status"
+  # ⛔ RECORD ONLY A PID THIS STATE DIR CAN PROVE. The fallback chain below can return the pid of a
+  # controller running from the SHARED harness path, which on a machine with two repos is the OTHER
+  # repo's controller — recording it would report "controller RUNNING" for a repo nothing started,
+  # and the record would then refuse every later start as a duplicate (#1856 review). Membership in
+  # the state dir's own process set is the only assertion available without a second authority.
+  local owned; owned="$(owned_pids)"
+  case "$PLATFORM" in
+    cell) ;; # a cell controller is started by the supervisor's tmux session and reported by its
+            # `status`; the harness path it execs is NOT repo-scoped, so `owned` may legitimately be
+            # empty here. The supervisor's own read is the authority on that platform.
+    mac)
+      if ! printf '%s\n' "$owned" | grep -qx "$pid"; then
+        unknown "launchd reports pid $pid but no $O/orch-loop.sh process runs as it — refusing to record a pid this state dir cannot prove is its own controller; check: launchctl print gui/$(id -u)/$LABEL"
+      fi
+      ;;
+  esac
   registry_write "$f" "$SLUG_REPO" "$O" "$pid" running \
     || refuse "the controller is RUNNING as pid $pid but the registry record at $f could not be written — a second start for $SLUG_REPO would not be refused; fix the permissions on $(dirname "$f")"
   PENDING_FILE=""
@@ -571,8 +658,8 @@ cmd_start() {
 registry_claim_or_refuse() { # <file>
   local f="${1:?}" verdict kind pid ro st
   verdict="$(registry_verdict "$f")"
-  # shellcheck disable=SC2086
-  set -- $verdict; kind="${1:-}"; pid="${2:-}"; ro="${3:-}"; st="${4:-}"
+  IFS=$'\t' read -r kind pid ro st <<<"$verdict"
+  kind="${kind:-}"; pid="${pid:-}"; ro="${ro:-}"; st="${st:-}"
   case "$kind" in
     live)
       if [ "$st" = "foreign-process" ]; then
@@ -591,16 +678,30 @@ registry_claim_or_refuse() { # <file>
         pid-reused) warn "reclaiming a STALE registry entry for $SLUG_REPO (pid $pid was REUSED by an unrelated process, O=$ro) — it is not blocking this start" ;;
         *)          warn "reclaiming a STALE registry entry for $SLUG_REPO (pid $pid is gone, O=$ro) — it is not blocking this start" ;;
       esac
+      # Reclaim, then claim: the removal is what makes the EXCLUSIVE create below possible. If another
+      # start claims between the two, its create wins and ours is the one that loses — whichever
+      # order, exactly one of them owns the record.
+      rm -f "$f"
       ;;
     unreadable)
       unknown "the registry record $f cannot be read ($st) — it may name a live controller for $SLUG_REPO; refusing to start a possible duplicate"
       ;;
   esac
-  registry_write "$f" "$SLUG_REPO" "$O" "$$" starting \
-    || unknown "cannot write the registry record at $f — without it a concurrent start could not be refused; fix the permissions on $(dirname "$f")"
+  # ⛔ THE CLAIM IS AN EXCLUSIVE CREATE, not a write. See registry_claim.
+  registry_claim "$f" "$SLUG_REPO" "$O" "$$" starting
+  case "$?" in
+    0) ;;
+    1)
+      # Someone created the record between our verdict and our create: report the record that WON,
+      # never overwrite it. This is the operator's double-tap, closed.
+      verdict="$(registry_verdict "$f")"
+      IFS=$'\t' read -r kind pid ro st <<<"$verdict"
+      refuse "another start claimed $SLUG_REPO between the check and the claim (pid ${pid:-?} at O=${ro:-?}, state=${st:-?}) — refusing to run a second controller for one repo"
+      ;;
+    *) unknown "cannot create the registry record at $f — without it a concurrent start could not be refused; fix the permissions on $(dirname "$f")" ;;
+  esac
   PENDING_FILE="$f"
 }
-
 # Waits for the platform to name its controller pid. Bounded: `start` returns as soon as tmux/the
 # daemon is told to run, and the loop writes its lock a beat later. A pid we did NOT observe is never
 # recorded — a registry entry naming a process we invented is worse than no entry.
@@ -633,12 +734,22 @@ start_cell() {
   if [ -z "$STARTED_PID" ]; then
     STARTED_PID="$(lock_pid)"
   fi
-  [ -n "$STARTED_PID" ] || STARTED_PID="$(local_controller_pids | head -1)"
+  # ⛔ NO THIRD FALLBACK. The old last resort (`local_controller_pids | head -1`) could return the pid
+  # of a controller started from this cell's SHARED harness path — the other repo's controller on a
+  # two-repo machine — and record it as this repo's owner (#1856 review). A pid we did not read from
+  # the supervisor's own status or from the strict lock predicate is a pid we do not know.
 }
 # The pid, read from the platform's OWN status verb rather than re-derived here: one authority per
 # question, and `status` is the verb whose answer an operator will also see.
+#
+# ⛔ ONLY a line that claims possession. `status` also prints `controller: RUNNING (pid N) — NOT this
+# state dir's` when the process it sees belongs to another repo (they share this cell's harness path),
+# and extracting N from THAT line would record a stranger as the owner — the false "controller RUNNING"
+# the registry then acts on.
 roster_pid_from_status() {
-  bash "$SUPERVISOR" status 2>/dev/null | sed -n 's/.*controller: RUNNING (pid \([0-9][0-9]*\).*/\1/p' | head -1
+  bash "$SUPERVISOR" status 2>/dev/null \
+    | grep -v "NOT this state dir's" \
+    | sed -n 's/.*controller: RUNNING (pid \([0-9][0-9]*\).*/\1/p' | head -1
 }
 
 plist_path() { printf '%s\n' "$HOME/Library/LaunchAgents/$LABEL.plist"; }
@@ -670,8 +781,13 @@ launchd_pid() {
 # ── stop ──────────────────────────────────────────────────────────────────────────────────────
 cmd_stop() {
   if [ -n "${REPO:-}" ] && [ -d "${REPO:-}" ]; then
-    if resolve_repo_identity 2>/dev/null; then
+    # ⛔ REPORT, never die: `stop` is the verb an operator reaches for on a machine that is wrong,
+    # and it must stay answerable (the supervisor's own tested rule for its `status`). A pair that
+    # cannot be resolved costs the registry release below — and that is SAID, not silent.
+    if resolve_repo_identity; then
       SLUG="$(registry_slug "$SLUG_REPO" 2>/dev/null)" || SLUG=""
+    else
+      warn "$IDENTITY_MSG — continuing; the registry record (if any) will be left in place"
     fi
   fi
   case "$PLATFORM" in
@@ -680,12 +796,27 @@ cmd_stop() {
       bash "$SUPERVISOR" stop || refuse "cloud-cell-supervisor.sh stop failed (see its output above) — the controller may still be running"
       ;;
     mac)
-      local plist; plist="$(plist_path)"
-      if [ ! -f "$plist" ]; then
-        say "not running (no agent at $plist)"
-      else
-        launchctl unload -w "$plist" || refuse "launchctl unload -w $plist failed — the controller may still be running"
+      local plist live; plist="$(plist_path)"
+      if [ -f "$plist" ]; then
+        # ⛔ `launchctl unload -w` EXITS 0 WHILE PRINTING "Unload failed" (measured on macOS: a plist
+        # that was never loaded gives `Unload failed: 5: Input/output error` and rc=0). Trusting that
+        # exit code made `stop` report "controller stopped" over an agent it had not stopped — a false
+        # PASS on the one verb whose whole job is to make "is it still running?" false (#1856 review).
+        # The answer is the READ AFTER, never the command's status.
+        launchctl unload -w "$plist" 2>/dev/null || true
+        sleep 1
+        live="$( { launchd_pid; owned_pids; } | awk 'NF && !s[$0]++' )"
+        [ -z "$live" ] || refuse "launchctl unload returned success but the agent is STILL RUNNING (pid $(pids_join "$live")) — check: launchctl print gui/$(id -u)/$LABEL"
         say "controller stopped (launchd $LABEL)"
+      else
+        # No agent file does NOT mean no controller: a controller started outside launchd (or whose
+        # plist was removed by hand) is still live, and #1761's contradiction 2 is exactly that
+        # state. Report it; never claim "not running" over it, and never erase the record.
+        live="$(owned_pids)"
+        if [ -n "$live" ]; then
+          refuse "no launchd agent at $plist, but a controller IS running for this state dir (pid $(pids_join "$live")) — stop it by hand (kill $(pids_join "$live")), or give it an agent: $0 start"
+        fi
+        say "not running (no agent at $plist, no controller process for $O)"
       fi
       ;;
   esac
@@ -711,13 +842,19 @@ cmd_status() {
   # this machine is doing, so printing `<unresolved>` for a perfectly readable checkout would make the
   # one screen they trust the least informative one. A pair that cannot be resolved is REPORTED (the
   # refusal is `check`'s job), never refused here — the same rule cloud-cell-supervisor.sh applies to
-  # its `status`.
+  # its `status`. While `resolve_repo_identity` refused by EXITING, this line killed the whole screen
+  # and printed nothing at all (#1856 review, reproduced: rc=1, 0 bytes on both streams).
+  local ident_err=""
   if [ -n "${REPO:-}" ] && [ -d "${REPO:-}" ]; then
-    resolve_repo_identity 2>/dev/null || SLUG_REPO=""
-    [ -n "$SLUG_REPO" ] && { SLUG="$(registry_slug "$SLUG_REPO" 2>/dev/null)" || SLUG=""; }
+    if resolve_repo_identity; then
+      SLUG="$(registry_slug "$SLUG_REPO" 2>/dev/null)" || SLUG=""
+    else
+      ident_err="$IDENTITY_MSG"; SLUG_REPO=""
+    fi
   fi
   say "platform:  $PLATFORM"
   say "repo:      ${SLUG_REPO:-<unresolved>}  @ ${REPO:-<unset>}${REPO_SRC:+  (${REPO_SRC})}"
+  [ -z "$ident_err" ] || say "identity:  UNRESOLVED — $ident_err"
   say "state dir: $O"
   say "config:    $ENV_FILE$([ -f "$ENV_FILE" ] && printf ' (present)' || printf ' (absent)')"
   if [ "$PLATFORM" = "cell" ]; then
@@ -727,17 +864,25 @@ cmd_status() {
   else
     [ -f "$O/.agent-infra-stamp.json" ] && say "harness:   $(sed -n 's/.*"harness": *"\([^"]*\)".*/\1/p' "$O/.agent-infra-stamp.json" | head -1)"
   fi
-  local lp live
-  lp="$(lock_pid)"; live="$(local_controller_pids)"
-  if [ -n "$live" ]; then
-    say "controller: RUNNING  pid $(pids_join "$live")  (lock: ${lp:-none})"
+  local lp live own foreign
+  lp="$(lock_pid)" || lp=""
+  live="$(local_controller_pids)" || live=""
+  own="$(owned_pids)" || own=""
+  foreign="$(comm -23 <(printf '%s\n' "$live" | awk 'NF' | sort -u) <(printf '%s\n' "$own" | awk 'NF' | sort -u))"
+  if [ -n "$own" ]; then
+    say "controller: RUNNING  pid $(pids_join "$own")  (lock: ${lp:-none})"
+  elif [ -n "$foreign" ]; then
+    # ⛔ SEEN IS NOT OWNED: this machine's harness is shared by every repo on it, so this pid may be
+    # the other repo's controller. Naming it as this state dir's owner is the misattribution the
+    # review reproduced (#1856).
+    say "controller: RUNNING  pid $(pids_join "$foreign") — NOT this state dir's (another repo on this machine's shared harness path; lock: ${lp:-none})"
   elif tmux has-session -t "${SESSION:-orch}" 2>/dev/null; then
     say "controller: RUNNING  (tmux session, no orch-loop.sh pid observed yet)"
   else
     say "controller: STOPPED"
   fi
   if [ -n "${SLUG:-}" ]; then
-    local f v; f="$(registry_file "$SLUG_REPO")"; v="$(registry_verdict "$f")"
+    local f v; f="$(registry_file "$SLUG_REPO")"; v="$(registry_verdict "$f" | tr '\t' ' ')"
     say "registry:   $v$([ -f "$f" ] && printf '  (%s)' "$f")"
   else
     say "registry:   not consulted (repo identity unresolved)"

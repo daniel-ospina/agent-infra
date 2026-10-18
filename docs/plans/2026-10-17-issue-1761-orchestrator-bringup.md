@@ -67,7 +67,7 @@ plist, `cloud-cell-supervisor.sh` pins/seeds/starts, and the entry point calls t
 question is what stops `check` and `start` disagreeing (the failure #1745 measured).
 
 **`scripts/lib/orchestrator-registry.sh`** — the machine-local registry at
-`${XDG_STATE_HOME:-$HOME/.local/state}/orchestrator/<owner>-<repo>` recording `{repo, O, pid,
+`${XDG_STATE_HOME:-$HOME/.local/state}/orchestrator/<owner>~<repo>` recording `{repo, O, pid,
 started, state}`. The identity is the **pair**, never the box and never the state dir:
 
 | state | verdict |
@@ -109,33 +109,40 @@ and mtime, and a warning when it is empty.
 | same-repo duplicate refused, naming the pid | `lib/orchestrator-registry.sh` `registry_verdict` + `check_registry` | `§1` (and `§7` on the cell path) |
 | different repo allowed on one machine | `check_registry` | `§1` second direction |
 | stale record reclaimed + reported | `registry_claim_or_refuse` | `§2`, `§7` |
-| a **reused** pid is reclaimed, not a permanent refusal | `proc_start_epoch` + `registry_verdict` | `§3b` |
+| a **reused** pid is reclaimed, not a permanent refusal | `pid_start_epoch` + `registry_verdict` | `§3b` |
 | foreign pid refused with the record to remove, never signalled | `registry_pid_is_controller` | `§3` |
 | repo path from another machine refused, naming it | `cmd_check` arm 1 | `§4` |
 | `--reseed` preserves secrets + state | `cmd_reseed` | `§4b` |
 | dispatch read published | `cmd_status` | `§6` |
-| the controller is found where it actually runs (harness path, not `$O`) | `local_controller_pids` | `§6b` |
+| the controller is found where it actually runs (harness path, not `$O`), and a foreign one is REPORTED, not claimed | `local_controller_pids` / `owned_pids` | `§6b`, `§8b` |
 | the config file's `O=` is honoured; an explicit env `O` still wins | `O_ENV` provenance | `§6c` |
 | a failing delegated verb refuses in one line (never dies on `set -u`) | `start_cell` / `start_mac` | `§7b` |
 | a stale lock naming a **peer** controller is never signalled; a dead-pid lock is released | `lock_controller_pid` + `cmd_stop` | supervisor suite `§(m)` |
+| a session is killed only for a controller this state dir can prove it owns | `cmd_stop` | supervisor suite `§(o)` |
 
 Registered in `scripts/run-bash-shards.sh`, so **both** CI lanes run the suite by construction.
 
-## Review findings (fresh-context reviewer over the whole change)
+## Refusal paths pinned by the suites
 
-Seven, all verified against the source before applying; every one is pinned by an arm that reddens on
-the pre-fix code (`BRINGUP=`/`SUP=` pointed at `HEAD` in a scratch worktree: 10 and 5 red
-respectively).
+Each row is a way a verb could answer WRONGLY — a false pass, a false failure, or a wrong target — and
+the arm that reddens if it regresses. Pointing `BRINGUP=`/`SUP=` at an earlier copy of a script shows
+the arm failing there and passing here; that is the non-vacuity check for every row.
 
-| # | Finding | Disposition |
+| property | surface | arm |
 |---|---|---|
-| P0 | `lock_controller_pid` matched `*orch-loop.sh*` as a SUBSTRING, so a stale `$O/.orch.lock` naming a pid the OS recycled to a **peer lane's controller** made `stop` TERM/KILL another repo's controller — reproduced, peer killed | **fixed**: argv must be `<shell> …/orch-loop.sh` AND the process must not have begun after the lock was written (`proc_start_epoch`); the supervisor suite's `§(m)` reddens on the pre-fix code |
-| P1 | the `apply`-failure refusal expanded `$HARNESS_REF`/`$HARNESS_REPO`, which this script never assigns — under `set -u` the shell died before the refusal printed, so a live controller's refusal reached the operator as `unbound variable` | **fixed** (`${VAR:-…}`), `§7b` |
-| P1 | a record whose pid was **recycled** was a permanent false refusal (nothing revalidated it — the #8175 class) | **fixed** (wall-clock re-check), `§3b` |
-| P1 | `§3`'s "the foreign process was NOT signalled" ran only `check`, which has no signalling path — an assertion that cannot fail | **fixed**: the real property moved to the supervisor's `§(m)`, which drives `stop` |
-| P2 | `registry_slug` joined `owner-repo` with `-`, which BOTH parts may contain: `premise-labs/agent-infra` and `premise/labs-agent-infra` shared one record | **fixed** → `owner~repo` |
-| P2 | the config file's `O=` was captured AFTER the platform default, so the arm was dead — `check` read a state dir the controller never uses | **fixed** (`O_ENV` before defaulting), `§6c` |
-| P2 | no arm drove a FAILING `start`, which is why the P1 above was green | **fixed** (`§7b`, cell + mac) |
+| the registry key is `<owner>~<repo>` (both parts may contain `-`) | `registry_slug` | `§1`, `§3` |
+| a record is claimed EXCLUSIVELY, so two concurrent `start`s cannot both win | `registry_claim` | `§8` |
+| a bare `OR=repo` and a scheme URL with no host are refused, not keyed | `resolve_repo_identity` | `§8` |
+| `status`/`stop` stay ANSWERABLE on a mismatched pair and say the identity is unresolved | `resolve_repo_identity`/`IDENTITY_MSG` | `§8` |
+| an unknown argument exits non-zero and reaches no verb | `usage()` | `§8` |
+| two repos sharing one harness path: A's controller is REPORTED to B, never claimed | `owned_pids`/`local_controller_pids` | `§8b` |
+| `stop` (mac) takes its verdict from the read AFTER `launchctl unload`, and never erases a live record | `cmd_stop` | `§8c` |
+| `stop` (cell) releases only a record naming its own `$O` | `cmd_stop` | `§8d` |
+| a session is killed only for a controller this state dir can PROVE it owns | `cmd_stop` | supervisor `§(o)` |
+| a harness-path controller is reported as NOT this state dir's | `cmd_status` | supervisor `§(o)` |
+| an unreadable `ps` is cannot-determine, never STOPPED | `owned_controller_pids`/`seen_controller_pids` | supervisor `§(o)` |
+| the standalone mirrors of the pid-identity predicates do not drift from the library | `_proc_start_epoch`/`_proc_began_after` | supervisor `§(p)` |
+| a stale lock naming a peer controller is never signalled; a dead-pid lock is released, and said | `lock_controller_pid` + `cmd_stop` | supervisor `§(m)` |
 
 ## Validation (live cell)
 

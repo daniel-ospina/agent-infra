@@ -37,7 +37,7 @@
 #   §7  THE CELL PATH delegates to `cloud-cell-supervisor.sh apply` then `start`, reads the pid from
 #       the platform's OWN status verb, and records it — so a second start is refused naming that pid.
 #
-# Hermetic:每个 case builds its own temp HOME, temp clones, temp state dirs, and PATH stubs for
+# Hermetic: every case builds its own temp HOME, temp clones, temp state dirs, and PATH stubs for
 # `gh`, `uname`, `launchctl` and the harness. No network, no real launchctl, no real tmux server, and
 # nothing is read from or written to the operator's ~/.local/state.
 # Run:  bash scripts/orchestrator-bringup.test.sh
@@ -146,6 +146,12 @@ start_controller() { # <state-dir>  → echoes pid
 }
 
 registry_dir() { printf '%s\n' "$1/.local/state/orchestrator"; }
+# lib_src — the library that belongs to the implementation UNDER TEST, never the checkout's copy.
+# `$HERE/lib` made a `BRINGUP=` mutation of the lib invisible to every cell case: those arms copied
+# the checkout's lib into the fixture, so they passed for the wrong reason (#1856 review).
+lib_src() { printf '%s/lib\n' "$(dirname "$BRINGUP")"; }
+# registry_lib — source the library directly, for the arms that test a PREDICATE (not a verb).
+registry_lib() { . "$(lib_src)/orchestrator-registry.sh"; }
 write_registry() { # <home> <file-name> <repo> <O> <pid> <state>
   mkdir -p "$(registry_dir "$1")"
   printf 'repo=%s\nO=%s\npid=%s\nstarted=%s\nstate=%s\n' "$3" "$4" "$5" "$(date +%s)" "$6" \
@@ -438,7 +444,7 @@ printf '%s\n' "$K/pin/aaaaaaaaaaaa/scripts/orchestrator-harness" > "$K/home/.har
 # The bringup resolves its sibling supervisor; give it one by running a copy from a scratch scripts/
 # dir that carries the stub under the expected name.
 mkdir -p "$K/scripts"; cp "$BRINGUP" "$K/scripts/orchestrator-bringup.sh"
-cp -r "$HERE/lib" "$K/scripts/lib"
+cp -r "$(lib_src)" "$K/scripts/lib"
 cp "$K/bin/cloud-cell-supervisor-stub.sh" "$K/scripts/cloud-cell-supervisor.sh"
 mkdir -p "$K/scripts/orchestrator-harness"
 CELL_BRINGUP="$K/scripts/orchestrator-bringup.sh"
@@ -468,7 +474,7 @@ grep -qx 'state=running' "$F" 2>/dev/null && ok "start (cell): the record is mar
 FAILED="$T/failed"; mk_bin "$FAILED/bin" cell; mk_clone "$FAILED/repo" "daniel-ospina/agent-infra"
 mkdir -p "$FAILED/home" "$FAILED/O" "$FAILED/scripts" "$FAILED/scripts/orchestrator-harness"
 printf 'DEEPSEEK_API_KEY=sk-test\n' > "$FAILED/home/keys.env"
-cp "$BRINGUP" "$FAILED/scripts/orchestrator-bringup.sh"; cp -r "$HERE/lib" "$FAILED/scripts/lib"
+cp "$BRINGUP" "$FAILED/scripts/orchestrator-bringup.sh"; cp -r "$(lib_src)" "$FAILED/scripts/lib"
 cat > "$FAILED/scripts/cloud-cell-supervisor.sh" <<'STUB'
 #!/bin/bash
 case "$1" in
@@ -519,7 +525,7 @@ esac
 FRESH="$T/fresh"; mk_bin "$FRESH/bin" cell; mk_clone "$FRESH/repo" "daniel-ospina/agent-infra"
 mkdir -p "$FRESH/home" "$FRESH/O" "$FRESH/scripts" "$FRESH/scripts/orchestrator-harness"
 printf 'DEEPSEEK_API_KEY=sk-test\n' > "$FRESH/home/keys.env"
-cp "$BRINGUP" "$FRESH/scripts/orchestrator-bringup.sh"; cp -r "$HERE/lib" "$FRESH/scripts/lib"
+cp "$BRINGUP" "$FRESH/scripts/orchestrator-bringup.sh"; cp -r "$(lib_src)" "$FRESH/scripts/lib"
 cp "$K/bin/cloud-cell-supervisor-stub.sh" "$FRESH/scripts/cloud-cell-supervisor.sh"
 OUT="$(env -i HOME="$FRESH/home" XDG_STATE_HOME="$FRESH/home/.local/state" \
   PATH="$FRESH/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" CELL_HOME="$FRESH/home" \
@@ -558,8 +564,20 @@ printf 'DEEPSEEK_API_KEY=sk-test\n' > "$L/home/keys.env"
 L_PID="$(start_controller "$L/O1")"; sleep 0.4
 printf '%s\n' "$L/pin/aaaaaaaaaaaa/scripts/orchestrator-harness" > "$L/home/.harness-path"
 write_registry "$L/home" "daniel-ospina~agent-infra" "daniel-ospina/agent-infra" "$L/O1" "$L_PID" running
-mkdir -p "$L/scripts"; cp "$BRINGUP" "$L/scripts/orchestrator-bringup.sh"; cp -r "$HERE/lib" "$L/scripts/lib"
-cp "$K/bin/cloud-cell-supervisor-stub.sh" "$L/scripts/cloud-cell-supervisor.sh"
+mkdir -p "$L/scripts"; cp "$BRINGUP" "$L/scripts/orchestrator-bringup.sh"; cp -r "$(lib_src)" "$L/scripts/lib"
+# L gets its OWN stub, logging to L's dir. Reusing K's made every assertion on L's log vacuous: the
+# path is baked in at heredoc expansion, so only K's file could ever appear.
+cat > "$L/scripts/cloud-cell-supervisor.sh" <<EOF
+#!/bin/bash
+printf '%s\\n' "\$1" >> "$L/sup/called"
+case "\$1" in
+  apply) exit 0 ;;
+  start) exit 0 ;;
+  status) echo "controller: STOPPED" ;;
+  stop)   exit 0 ;;
+esac
+EOF
+chmod +x "$L/scripts/cloud-cell-supervisor.sh"; : > "$L/sup/called"
 OUT="$(env -i HOME="$L/home" XDG_STATE_HOME="$L/home/.local/state" \
   PATH="$L/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" CELL_HOME="$L/home" \
   REPO="$L/repo" O="$L/O2" HARNESS_PIN_DIR="$L/pin" HARNESS_PIN_FILE="$L/home/.harness-path" \
@@ -569,8 +587,208 @@ case "$OUT" in
   *) bad "start (cell) did not refuse a duplicate $SLUG in a different state dir — rc=$RC $OUT" ;;
 esac
 [ "$RC" = 1 ] && ok "start (cell): rc=1 on the duplicate refusal" || bad "start (cell): rc=$RC, want 1"
-[ ! -f "$L/sup/started" ] 2>/dev/null && ok "start (cell): NO second controller was launched" \
-                                      || bad "start (cell): launched a controller despite the refusal"
+# ⛔ ASSERT ON THE STUB'S OWN CALL LOG. The previous arm tested `[ ! -f "$L/sup/started" ]`, and the L
+# case reused the K stub whose `start` branch writes `$K/sup/started` (baked in at heredoc expansion),
+# so nothing in the suite could ever create `$L/sup/started`: the arm passed whether or not a
+# controller launched — an assertion that cannot fail, guarding the PR's headline claim (#1856 review).
+grep -qx start "$L/sup/called" 2>/dev/null \
+  && bad "start (cell): launched a controller despite the refusal" \
+  || ok "start (cell): NO second controller was launched (the supervisor was never asked to 'start')"
+
+
+# ── §8 the refusal paths: a verb that cannot answer must SAY so, and must not act ───────────────
+# Every arm here pins a defect found in review of #1856 where the shipped code was silent, miscounted
+# or acted on a reading it could not justify. They are separate from §1-§7 because each one is a
+# FALSE-PASS or FALSE-FAIL path rather than a feature: a wrong answer from these verbs is what makes
+# an operator kill the wrong controller.
+say_case "§8 refusal paths: unresolved identity, unknown verb, unprovable pid, and shared harness"
+N="$T/n"; mk_bin "$N/bin" cell; mk_clone "$N/repo" "daniel-ospina/agent-infra"; mkdir -p "$N/home" "$N/O" "$N/sup"
+printf 'DEEPSEEK_API_KEY=sk-test\n' > "$N/home/keys.env"
+mkdir -p "$N/scripts"; cp "$BRINGUP" "$N/scripts/orchestrator-bringup.sh"; cp -r "$(lib_src)" "$N/scripts/lib"
+cat > "$N/scripts/cloud-cell-supervisor.sh" <<EOF
+#!/bin/bash
+printf '%s\n' "\$1" >> "$N/sup/called"
+case "\$1" in
+  apply) exit 0 ;;
+  start) exit 0 ;;
+  status) echo "controller: STOPPED" ;;
+  stop)   exit 0 ;;
+esac
+EOF
+chmod +x "$N/scripts/cloud-cell-supervisor.sh"
+N_BRINGUP="$N/scripts/orchestrator-bringup.sh"
+nrun() {
+  OUT="$(env -i HOME="$N/home" XDG_STATE_HOME="$N/home/.local/state" \
+    PATH="$N/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" CELL_HOME="$N/home" \
+    HARNESS_PIN_DIR="$N/home/harness" HARNESS_PIN_FILE="$N/home/.harness-path" \
+    "$@" bash "$N_BRINGUP" ${BRINGUP_ARGS:-} 2>&1)"; RC=$?
+}
+
+# An unknown argument must REFUSE, and must not reach a verb. It used to `exit 0` after printing
+# usage — so a typo'd flag read as success and started nothing, which is indistinguishable from
+# "started and did fine" to any caller that checks the exit code.
+: > "$N/sup/called"
+BRINGUP_ARGS="start --force" nrun REPO="$N/repo" O="$N/O"
+[ "$RC" = 1 ] && ok "unknown argument: rc=1 (was 0 — a typo read as success)" \
+              || bad "unknown argument: rc=$RC, want 1"
+case "$OUT" in
+  *"unknown argument"*) ok "unknown argument: names the offending token on stderr" ;;
+  *) bad "unknown argument: does not name it — $OUT" ;;
+esac
+grep -qx start "$N/sup/called" 2>/dev/null \
+  && bad "unknown argument: a verb ran anyway" \
+  || ok "unknown argument: no verb ran (start was never reached)"
+
+# An `OR` that is a bare repo name is NOT a resolvable identity: it would mint a SECOND registry key
+# for a repo that already has one, and the duplicate guard would then fail OPEN.
+BRINGUP_ARGS=start nrun REPO="$N/repo" O="$N/O" OR=agent-infra
+[ "$RC" = 1 ] && ok "identity: a bare 'OR=agent-infra' (no owner) is REFUSED, not keyed as a second repo" \
+              || bad "identity: a bare repo name was accepted (a second key → the guard fails open) — rc=$RC $OUT"
+
+# …and `status`/`stop` must stay ANSWERABLE on the same broken pair instead of dying silently. The
+# old form called `exit 1` deep inside `resolve_repo_identity` with its message on a stderr nobody
+# read: `status` printed nothing at all (0 bytes on both streams, reproduced in review).
+BRINGUP_ARGS=status nrun REPO="$N/repo" O="$N/O" OR="someone/else"
+[ "$RC" = 0 ] && ok "status: rc=0 on a MISMATCHED OR — the verb stays answerable" \
+              || bad "status: rc=$RC on a mismatched OR (it must not die) — $OUT"
+case "$OUT" in
+  *"identity:"*UNRESOLVED*) ok "status: NAMES the unresolved identity (and still prints the rest)" ;;
+  *) bad "status: the identity problem is invisible — $OUT" ;;
+esac
+case "$OUT" in
+  *"controller:"*) ok "status: still answers the question it was asked (controller state printed)" ;;
+  *) bad "status: died before the controller line — $OUT" ;;
+esac
+BRINGUP_ARGS=stop nrun REPO="$N/repo" O="$N/O" OR="someone/else"
+[ "$RC" = 0 ] && ok "stop: rc=0 on a mismatched OR, and says what it is leaving behind" \
+              || bad "stop: rc=$RC on a mismatched OR — $OUT"
+case "$OUT" in
+  *"left in place"*) ok "stop: says the registry record is left in place (no silent release)" ;;
+  *) bad "stop: released (or claimed to release) a record it could not identify — $OUT" ;;
+esac
+
+# An `origin` the derivation cannot READ is not an identity either. `repo_of_checkout` used to accept
+# any URL whose last path components looked right, so `file:///srv/x/agent-infra` derived
+# `srv/agent-infra` while `queue_repo_from_url` refused the same form — two surfaces, two answers.
+F="$T/f"; mk_bin "$F/bin" cell; mkdir -p "$F/repo" "$F/home" "$F/O"
+git init -q "$F/repo" && git -C "$F/repo" remote add origin "file:///srv/elsewhere/agent-infra"
+printf 'DEEPSEEK_API_KEY=sk-test\n' > "$F/home/keys.env"
+OUT="$(env -i HOME="$F/home" XDG_STATE_HOME="$F/home/.local/state" \
+  PATH="$F/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" CELL_HOME="$F/home" \
+  REPO="$F/repo" O="$F/O" OR="daniel-ospina/agent-infra" bash "$N_BRINGUP" start 2>&1)"; RC=$?
+[ "$RC" = 1 ] && ok "identity: a scheme URL with no host is REFUSED rather than derived from its path" \
+              || bad "identity: derived a repo from an unreadable origin — rc=$RC $OUT"
+
+# The claim must be EXCLUSIVE: two starts racing must not both win. `registry_claim` is the noclobber
+# create; the fixture proves the loser cannot overwrite the winner's record.
+(
+  . "$(lib_src)/orchestrator-registry.sh"
+  d="$T/claim"; mkdir -p "$d"
+  registry_claim "$d/r" "daniel-ospina/agent-infra" "$d/O" 1111 starting >/dev/null 2>&1 && echo WIN > "$d/first"
+  registry_claim "$d/r" "daniel-ospina/agent-infra" "$d/O" 2222 starting >/dev/null 2>&1 || echo LOSE > "$d/second"
+)
+[ -f "$T/claim/first" ] && ok "claim: the first start wins the record" || bad "claim: the first start did not create the record"
+[ -f "$T/claim/second" ] && ok "claim: the SECOND start is refused (exclusive create, not last-writer-wins)" \
+                         || bad "claim: a second start overwrote the first record — the claim is not exclusive"
+grep -qx 'pid=1111' "$T/claim/r" 2>/dev/null \
+  && ok "claim: the winner's pid survives the losing attempt byte for byte" \
+  || bad "claim: the loser rewrote the record — $(tr '\n' ' ' < "$T/claim/r" 2>/dev/null)"
+
+# ── §8b TWO repos on ONE harness path ──────────────────────────────────────────────────────────
+# The cell home is per-MACHINE, so `$CELL_HOME/harness` is shared by every repo on it. A read scoped
+# to that path returns repo A's controller to repo B; the code now separates OWNED (this state dir
+# may signal) from SEEN (a report, never a claim). Every earlier fixture gave each repo its own
+# harness dir, so the shared-path case was untested by construction (#1856 review).
+say_case "§8b two repos share one harness path: A's controller is never B's"
+S="$T/s"; mk_bin "$S/bin" cell; mk_clone "$S/repoA" "daniel-ospina/agent-infra"; mk_clone "$S/repoB" "premise-labs/tortoise"
+mkdir -p "$S/home/harness/aaaaaaaaaaaa" "$S/OA" "$S/OB" "$S/scripts"
+S_HARNESS="$S/home/harness/aaaaaaaaaaaa"   # the pin dir is per-machine, so BOTH repos exec THIS path
+printf 'DEEPSEEK_API_KEY=sk-test\n' > "$S/home/keys.env"
+printf '%s\n' "$S_HARNESS" > "$S/home/.harness-path"
+mk_controller "$S_HARNESS"
+cp "$BRINGUP" "$S/scripts/orchestrator-bringup.sh"; cp -r "$(lib_src)" "$S/scripts/lib"
+cp "$N/scripts/cloud-cell-supervisor.sh" "$S/scripts/cloud-cell-supervisor.sh"
+S_PID="$(start_controller "$S_HARNESS")"; sleep 0.4
+printf '%s\n' "$S_PID" > "$S/OA/.orch.lock"
+srun() { OUT="$(env -i HOME="$S/home" XDG_STATE_HOME="$S/home/.local/state" \
+    PATH="$S/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" CELL_HOME="$S/home" \
+    HARNESS_PIN_DIR="$S/home/harness" HARNESS_PIN_FILE="$S/home/.harness-path" \
+    "$@" bash "$S/scripts/orchestrator-bringup.sh" ${BRINGUP_ARGS:-} 2>&1)"; RC=$?; }
+BRINGUP_ARGS=status srun REPO="$S/repoA" O="$S/OA"
+case "$OUT" in
+  *"controller: RUNNING  pid $S_PID"*) ok "shared harness: repo A owns the controller it started and locked" ;;
+  *) bad "shared harness: A lost its own controller — $OUT" ;;
+esac
+BRINGUP_ARGS=status srun REPO="$S/repoB" O="$S/OB"
+case "$OUT" in
+  *"NOT this state dir's"*) ok "shared harness: repo B is TOLD the controller it can see is not its own" ;;
+  *"controller: RUNNING  pid $S_PID"*"lock: none"*) bad "shared harness: repo B claimed repo A's controller as its own" ;;
+  *) bad "shared harness: B's answer is neither a claim nor a disclaimer — $OUT" ;;
+esac
+BRINGUP_ARGS=check srun REPO="$S/repoB" O="$S/OB"
+case "$OUT" in
+  *"also seen (NOT this state dir's): pid $S_PID"*) ok "shared harness: check REPORTS A's controller as foreign, not as B's" ;;
+  *"controller running for this state dir: pid $S_PID"*) bad "shared harness: check blessed repo A's controller as repo B's" ;;
+  *) bad "shared harness: check said nothing useful about the visible controller — $OUT" ;;
+esac
+kill -9 "$S_PID" 2>/dev/null
+
+# ── §8c 'stop' on a Mac: the read after, never the exit code ───────────────────────────────────
+say_case "§8c stop (mac): never a false PASS over a live agent, never a silent record erase"
+P="$T/p"; mk_bin "$P/bin" mac; mk_clone "$P/repo" "daniel-ospina/agent-infra"; mkdir -p "$P/home" "$P/O"
+mk_controller "$P/O"   # the loop runs from $O on a Mac (launchd's ProgramArguments point at it)
+mkdir -p "$P/home/Library/LaunchAgents" "$P/home/.local/state/orchestrator"
+prun() { OUT="$(env -i HOME="$P/home" XDG_STATE_HOME="$P/home/.local/state" \
+    PATH="$P/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+    "$@" bash "$BRINGUP" ${BRINGUP_ARGS:-} 2>&1)"; RC=$?; }
+# A live controller with NO launchd agent — a plist removed by hand, or a loop started outside launchd
+# (#1761's contradiction 2). Reporting "not running" here is the false STOPPED, and releasing the
+# record would then let a second controller start over the live one.
+P_PID="$(start_controller "$P/O")"; sleep 0.4
+write_registry "$P/home" "daniel-ospina~agent-infra" "daniel-ospina/agent-infra" "$P/O" "$P_PID" running
+BRINGUP_ARGS=stop prun REPO="$P/repo" O="$P/O"
+[ "$RC" = 1 ] && ok "stop (mac): REFUSES to report 'stopped' over a live controller with no agent" \
+              || bad "stop (mac): rc=$RC over a live controller — $OUT"
+[ -f "$(registry_dir "$P/home")/daniel-ospina~agent-infra" ] \
+  && ok "stop (mac): the record is NOT erased when the controller is still live" \
+  || bad "stop (mac): erased the record of a controller it did not stop"
+# …and when the agent file IS there, `launchctl unload` exits 0 while printing "Unload failed" and
+# leaving the process running (measured on macOS). The verdict must come from the read AFTER.
+cat > "$P/bin/launchctl" <<EOF
+#!/bin/bash
+# LIES on purpose: unload returns 0 and does nothing, exactly like macOS on a never-loaded plist.
+case "\$1" in
+  print) echo "	pid = $P_PID"; exit 0 ;;
+  *) exit 0 ;;
+esac
+EOF
+chmod +x "$P/bin/launchctl"
+printf 'x\n' > "$P/home/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
+BRINGUP_ARGS=stop prun REPO="$P/repo" O="$P/O"
+[ "$RC" = 1 ] && ok "stop (mac): a launchctl that exits 0 without stopping does NOT read as success" \
+              || bad "stop (mac): trusted 'launchctl unload' rc=0 over a still-running controller — $OUT"
+case "$OUT" in
+  *"STILL RUNNING"*) ok "stop (mac): says the agent is STILL RUNNING, naming the pid" ;;
+  *) bad "stop (mac): does not name the surviving controller — $OUT" ;;
+esac
+kill -9 "$P_PID" 2>/dev/null
+
+# ── §8d 'stop' on a cell releases ONLY the record it owns ─────────────────────────────────────
+say_case "§8d stop (cell): releases this state dir's record, and no other"
+BRINGUP_ARGS=stop nrun REPO="$N/repo" O="$N/O"
+[ "$RC" = 0 ] && ok "stop (cell): rc=0 when the supervisor stops cleanly" || bad "stop (cell): rc=$RC — $OUT"
+grep -qx stop "$N/sup/called" 2>/dev/null && ok "stop (cell): asked the supervisor to stop" \
+                                          || bad "stop (cell): 'stop' exists but never reached the supervisor"
+write_registry "$N/home" "daniel-ospina~agent-infra" "daniel-ospina/agent-infra" "$N/some-other-O" 9999 running
+BRINGUP_ARGS=stop nrun REPO="$N/repo" O="$N/O"
+[ -f "$(registry_dir "$N/home")/daniel-ospina~agent-infra" ] \
+  && ok "stop (cell): a record naming ANOTHER state dir is left alone" \
+  || bad "stop (cell): released a record that belongs to another state dir"
+write_registry "$N/home" "daniel-ospina~agent-infra" "daniel-ospina/agent-infra" "$N/O" 9999 running
+BRINGUP_ARGS=stop nrun REPO="$N/repo" O="$N/O"
+[ ! -f "$(registry_dir "$N/home")/daniel-ospina~agent-infra" ] \
+  && ok "stop (cell): this state dir's own record IS released" \
+  || bad "stop (cell): the record for \$O survived its own stop"
 
 echo
 echo "── Summary ───────────────────────────────────────────────────────"
