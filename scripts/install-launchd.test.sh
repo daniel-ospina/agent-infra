@@ -204,6 +204,12 @@ run_installer() { # <home> [extra env assignments...]
         export SWARM_ROOT="$HOME/swarm"
         export PYTHON_BIN="$HOME/swarm/.venv/bin/python"
         export ELDATO_ALLOW_TEST_HOME=1  # #446: fake HOME + launchctl shim above = isolated
+        # #1987 — the job set must not depend on whether THIS host has a tortoise checkout. The two
+        # {{TORTOISE_REPO}}-gated jobs (branch-reaper, worktree-reaper) install only when the
+        # invoker exports a resolvable TORTOISE_REPO, so an inherited value made the bootstrap count
+        # in §1 read 11 on a dev box and 9 on CI — the same suite, two different totals. §13/§14 set
+        # TORTOISE_REPO explicitly in their own subshell and are the gated jobs' real coverage.
+        unset TORTOISE_REPO
         shift
         bash "$INSTALLER" "$@"
     )
@@ -212,6 +218,8 @@ run_installer() { # <home> [extra env assignments...]
 echo "── 1. Fresh-HOME simulation ──────────────────────────────────────"
 OUT="$(run_installer "$HOME1")"
 RC=$?
+OUT1="$OUT"  # #1987 — §1's own output. The all-shim PATH guard below reassigns $OUT, so a §1
+             # assertion that reads $OUT late in the section was reading the WRONG run's log.
 assert_eq "$RC" "0" "fresh install exits 0"
 assert_contains "$OUT" "corruption-canary: installed + loaded" "corruption-canary installed on fresh machine"
 assert_contains "$OUT" "provider-latency-tripwire: installed + loaded" "provider-latency-tripwire installed on fresh machine"
@@ -366,17 +374,47 @@ assert_not_contains "$(installed_path "$TRIPWIRE_INSTALLED")" "/shims" "tripwire
 # #432 — hub-state-check + skill-lint-oracle are RETIRED from launchd (their
 # work moved to extensions/session-checks.ts — macOS TCC blocks launchd from
 # ~/Documents, so they run from pi's session_start instead).
-assert_not_contains "$OUT" "hub-state-check: installed + loaded" "retired hub job NOT installed on fresh machine"
-assert_not_contains "$OUT" "skill-lint-oracle: installed + loaded" "retired oracle job NOT installed on fresh machine"
+assert_not_contains "$OUT1" "hub-state-check: installed + loaded" "retired hub job NOT installed on fresh machine"
+assert_not_contains "$OUT1" "skill-lint-oracle: installed + loaded" "retired oracle job NOT installed on fresh machine"
 [ ! -f "$HUB_RETIRED" ] && ok "no retired hub plist left behind" || bad "no retired hub plist left behind"
 [ ! -f "$ORACLE_RETIRED" ] && ok "no retired oracle plist left behind" || bad "no retired oracle plist left behind"
-# ⛔ This count is the inventory of ACTIVE jobs, and it had already drifted before #1987: the
-# pre-fix expectation (8) still omitted com.tortoise.branch-reaper (#1787) and
-# com.tortoise.worktree-reaper (#1311), both of which DO resolve in this fixture (it plants a
-# TORTOISE_REPO sibling), so the assertion was red on main at 10 vs 8. The list below is the whole set
-# the fixture installs, so it fails loudly on the NEXT unrecorded template too.
+# ⛔ This count is the inventory of ACTIVE jobs, and part of it is HOST-DEPENDENT BY DESIGN: the
+# installer resolves {{TORTOISE_REPO}} from the environment AND from disk (install-launchd.sh:76-82 —
+# `$INFRA_ROOT/../tortoise`, `$HOME/Documents/GitHub/tortoise`, `$HOME/tortoise`), so a checkout
+# sitting beside this one installs branch-reaper (#1787) + worktree-reaper (#1311) and a bare CI
+# checkout does not. The old expectation (8) matched CI's own 8 and was red on the dev box (10);
+# pinning this box's 11 turned green CI red. The number was never the defect — an expectation that
+# cannot move with the run's own resolution is. So: 9 always-installable jobs, plus whichever
+# {{TORTOISE_REPO}}-gated templates THIS run installed, derived from the fixture's template dir.
 BOOTSTRAP_COUNT1="$(grep -c 'launchctl bootstrap' "$LOG")"
-assert_eq "$BOOTSTRAP_COUNT1" "11" "fresh install bootstraps only active jobs (canary + balance-watch + fleet + lane-liveness + pi-cache-reaper + pi-session-reaper + pi-task-session-prune + tripwire + branch-reaper + ci-runner-gate + worktree-reaper)"
+GATED_TEMPLATES1=0
+GATED_INSTALLED1=0
+for _tpl in "$TEMPLATES"/*.plist; do
+    grep -q '{{TORTOISE_REPO}}' "$_tpl" || continue
+    GATED_TEMPLATES1=$((GATED_TEMPLATES1 + 1))
+    case "$OUT1" in *"$(basename "$_tpl" .plist): installed + loaded"*) GATED_INSTALLED1=$((GATED_INSTALLED1 + 1)) ;; esac
+done
+# The gated inventory is PINNED, not merely counted: deriving it from the template dir too would let a
+# new {{TORTOISE_REPO}}-gated job raise both sides of the equation at once and pass unrecorded. A third
+# host-conditional job must come here — and into §13/§14-style coverage of its own content.
+assert_eq "$GATED_TEMPLATES1" "2" "the {{TORTOISE_REPO}}-gated inventory is accounted for (branch-reaper #1787 + worktree-reaper #1311)"
+# A visible checkout whose resolution produced NOTHING is a regression, not a host without one. Ask the
+# same three candidates install-launchd.sh:76-82 asks (the fixture's HOME is the fake one the run used).
+GATED_VISIBLE1=0
+for _cand in "$HOME1/Documents/GitHub/tortoise" "$(cd "$SCRIPT_DIR/.." && pwd)/../tortoise" "$HOME1/tortoise"; do
+    if [ -d "$_cand" ] && [ -d "$_cand/.git" ]; then GATED_VISIBLE1=1; break; fi
+done
+if [ "$GATED_INSTALLED1" -eq 0 ] && [ "$GATED_VISIBLE1" -eq 0 ]; then
+    ok "no {{TORTOISE_REPO}}-gated job installed — this host resolves no tortoise checkout"
+elif [ "$GATED_INSTALLED1" -eq 0 ]; then
+    bad "a tortoise checkout is visible to the installer but NO {{TORTOISE_REPO}}-gated job installed — the resolution regressed"
+else
+    # The installer resolves the placeholder ONCE for the whole run, so a run either installs every
+    # gated template or none. A partial set means one was skipped while the others proceeded, and a
+    # scalar total would have absorbed it silently.
+    assert_eq "$GATED_INSTALLED1" "$GATED_TEMPLATES1" "every {{TORTOISE_REPO}}-gated template installed, or none did"
+fi
+assert_eq "$BOOTSTRAP_COUNT1" "$((9 + GATED_INSTALLED1))" "fresh install bootstraps only active jobs (9 always-installable: canary + balance-watch + fleet + lane-liveness + pi-cache-reaper + pi-session-reaper + pi-task-session-prune + tripwire + ci-runner-gate, plus whichever {{TORTOISE_REPO}}-gated jobs this host resolves)"
 
 echo "── 2. Retirement: pre-seeded old plists get unloaded + removed ───"
 seed_retired "$HOME2"
