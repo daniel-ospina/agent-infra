@@ -837,14 +837,22 @@ ck "the extracted gate-chain fixture runs with NO unbound-variable noise (WORKER
 # bind. Both fixtures above pass SWTOTAL=0, which short-circuits the gate's own `[ "$SWTOTAL" -ne 0 ]`
 # guard BEFORE the comparison is reached -- so the gate was never driven at all. Drive it with real
 # swap, in both directions.
-[ "$(mrw 1 0 2048 100 0 9999 100 4 "$swp_def" "$mem_def")" = "swap_free=100M<=min_swap_free=600M" ] && rcw=0 || { rcw=1; echo "      got '$(mrw 1 0 2048 100 0 9999 100 4 "$swp_def" "$mem_def")'"; }
-ck "the swap gate FIRES below the ceiling and names it (swap_free<=min_swap_free)" $rcw
+# ⛔ #1985: the veto now requires RAM to be tight AS WELL, so drive MEMAVAIL low with it, and the
+# message must name BOTH inputs or a future reader cannot tell which fired.
+[ "$(mrw 1 0 2048 100 0 100 100 4 "$swp_def" "$mem_def")" = "swap_free=100M<=min_swap_free=600M AND mem_avail=100M<=$(( ${mem_def:-512} * 2 ))M (both tight)" ] && rcw=0 || { rcw=1; echo "      got '$(mrw 1 0 2048 100 0 100 100 4 "$swp_def" "$mem_def")'"; }
+ck "the swap gate FIRES when swap AND ram are both tight, and names both" $rcw
 [ -z "$(mrw 1 0 2048 2000 0 9999 100 4 "$swp_def" "$mem_def")" ] && rcw=0 || rcw=1
 ck "the swap gate does NOT fire when free swap is above the ceiling" $rcw
+  # ⛔ THE #1985 REGRESSION, pinned. Low swap with AMPLE ram must NOT veto: a 1 GB macOS swap file
+  # stays half occupied for the life of the boot, and the old arm blocked dispatch forever while the
+  # box had 1.4 GB available with 20 of 20 lane slots idle. Without this case the fix can be reverted
+  # to the old unconditional arm and the suite stays green.
+[ -z "$(mrw 1 0 2048 100 0 1400 100 4 "$swp_def" "$mem_def")" ] && rcw=0 || { rcw=1; echo "      got '$(mrw 1 0 2048 100 0 1400 100 4 "$swp_def" "$mem_def")'" ; }
+ck "the swap gate does NOT fire when swap is low but ram is ample (#1985)" $rcw
 # ⛔ And with a NON-DEFAULT ceiling: the two cases above pass `$swp_def`, so they prove the gate fires
 # at whatever the default is -- a regression that HARDCODED 600 into the comparison (leaving the
 # plist's MIN_SWAP_FREE inert) stayed green. A ceiling the default cannot be pins the wiring itself.
-[ "$(mrw 1 0 2048 650 0 9999 100 4 700 "$mem_def")" = "swap_free=650M<=min_swap_free=700M" ] && rcw=0 || { rcw=1; echo "      got '$(mrw 1 0 2048 650 0 9999 100 4 700 "$mem_def")'"; }
+[ "$(mrw 1 0 2048 650 0 100 100 4 700 "$mem_def")" = "swap_free=650M<=min_swap_free=700M AND mem_avail=100M<=$(( ${mem_def:-512} * 2 ))M (both tight)" ] && rcw=0 || { rcw=1; echo "      got '$(mrw 1 0 2048 650 0 100 100 4 700 "$mem_def")'"; }
 ck "the swap gate honours a NON-DEFAULT MIN_SWAP_FREE (the ceiling is read, not hardcoded)" $rcw
 [ -z "$(mrw 1 0 2048 750 0 9999 100 4 700 "$mem_def")" ] && rcw=0 || rcw=1
 ck "the swap gate stays shut just above a non-default ceiling" $rcw
