@@ -567,40 +567,6 @@ STARVED=0
 # thing to optimise (a starved pass stopped pruning blacklisted issues that have no PR). This block is
 # now only the SEAM RESOLUTION; the decision is taken where its cost is known.
 
-# ── NOW THAT THE BLACKLIST IS PRUNED, CAN THIS PASS AFFORD ANYTHING AT ALL? (#1736 follow-up) ────
-# ⛔ THIS GATE IS DELIBERATELY **LATE — BELOW THE REAPER — AND NOT AT THE TOP OF THE PASS.** It used
-# to sit immediately after `gh_env_verdict`, where refusing genuinely cost zero calls, and “zero
-# calls” was the wrong thing to optimise. MEASURED shape (agent-infra#1736 follow-up review): on a
-# starved box the pass exited BEFORE the reaper above ever ran, so the one piece of housekeeping that
-# UN-BLACKLISTS a dispatched issue that is still open, has NO PR and no live lane stopped happening
-# exactly when the box was too poor to do anything else — and the reaper's own note states that this
-# is the only thing that ever removes such an entry, so the entry stayed until the bucket recovered
-# and `orch-loop.sh` (which skips only what `dispatched.txt` names) never re-dispatched it.
-# So the pass now pays the reaper's two listings (each `rest_list` page is ~1 core call; the two
-# captures are what the reaper's `has_pr`/`open_iss` test needs) UNCONDITIONALLY, whatever the budget
-# says, and refuses AFTER them. What it still does NOT do when starved is the expensive half — the
-# three priority-tier listings (~40 calls) and any pre-flight run. The refusal is therefore ~2 calls
-# dear, not free, and that is the trade: the cheap call that keeps the blacklist honest, then stop.
-# ⛔ `queue_state_write` CANNOT MOVE UP HERE WITHOUT INVENTING A READING. `EMPTY`/`READ(<n>)`/
-# `PARTIAL(<t>)`/`UNREADABLE` are statements about the pool LISTING, which happens below this line;
-# writing one from a pass that never listed would be the false report that state exists to prevent
-# (and `UNREADABLE` would then be indistinguishable from a real blind read). The heartbeat keeps the
-# PREVIOUS reading together WITH ITS AGE (`orch-loop.sh`'s `queue_state_token`), so a frozen value
-# cannot pass as a fresh one — which is what makes leaving it stale honest rather than silent.
-# ⛔ ONE candidate AND the reserve must fit, or this pass would spend its last calls to judge a
-# handful and produce no usable verdict at all.
-if [ "$CORE_PACING" -eq 1 ]; then
-  if CORE_NOW="$(core_remaining)"; then
-    if [ "$CORE_NOW" -lt $(( CORE_RESERVE + CORE_PER_CANDIDATE )) ]; then
-      echo "[refresh] ABORT: REST core budget remaining=$CORE_NOW cannot buy one candidate without eating the reserve=$CORE_RESERVE (~$CORE_PER_CANDIDATE per candidate) — this pass ran NOTHING of the pool and judged NOTHING, so an empty backlog would be a false report (#1736). The dispatched.txt reaper HAS run (that is why the refusal is here and not earlier); the pool is left untouched and the next cycle retries."
-      exit "$EXIT_TRANSIENT"
-    fi
-    echo "[refresh] budget: REST core remaining=$CORE_NOW, reserve=$CORE_RESERVE, ~$CORE_PER_CANDIDATE per candidate — up to $(( (CORE_NOW - CORE_RESERVE) / CORE_PER_CANDIDATE )) candidate(s) affordable this pass (limit $LIMIT)"
-  else
-    echo "[refresh] WARN: the REST core budget could not be read — pacing is OFF for this pass (it will not be starved on an unreadable metric). The pre-flight's own fail-closed rules still decide every verdict."
-  fi
-fi
-
 # The scout is a dedicated throwaway worktree used only to run the collision pre-flight.
 # Provision it on first use: an earlier version just `cd`-ed into it, so on a fresh box the
 # refresh subshell exited 1 every cycle, wrote nothing, and the backlog silently never refilled.
@@ -1040,6 +1006,40 @@ if [ "$reap_rc" -ne 0 ]; then
   exit "$EXIT_TRANSIENT"
 fi
 for f in "$O/.open_iss" "$O/.pr_brs"; do rm -f "$f"; done
+
+# ── NOW THAT THE BLACKLIST IS PRUNED, CAN THIS PASS AFFORD ANYTHING AT ALL? (#1736 follow-up) ────
+# ⛔ THIS GATE IS DELIBERATELY **LATE — BELOW THE REAPER — AND NOT AT THE TOP OF THE PASS.** It used
+# to sit immediately after `gh_env_verdict`, where refusing genuinely cost zero calls, and “zero
+# calls” was the wrong thing to optimise. MEASURED shape (agent-infra#1736 follow-up review): on a
+# starved box the pass exited BEFORE the reaper above ever ran, so the one piece of housekeeping that
+# UN-BLACKLISTS a dispatched issue that is still open, has NO PR and no live lane stopped happening
+# exactly when the box was too poor to do anything else — and the reaper's own note states that this
+# is the only thing that ever removes such an entry, so the entry stayed until the bucket recovered
+# and `orch-loop.sh` (which skips only what `dispatched.txt` names) never re-dispatched it.
+# So the pass now pays the reaper's two listings (each `rest_list` page is ~1 core call; the two
+# captures are what the reaper's `has_pr`/`open_iss` test needs) UNCONDITIONALLY, whatever the budget
+# says, and refuses AFTER them. What it still does NOT do when starved is the expensive half — the
+# three priority-tier listings (~40 calls) and any pre-flight run. The refusal is therefore ~2 calls
+# dear, not free, and that is the trade: the cheap call that keeps the blacklist honest, then stop.
+# ⛔ `queue_state_write` CANNOT MOVE UP HERE WITHOUT INVENTING A READING. `EMPTY`/`READ(<n>)`/
+# `PARTIAL(<t>)`/`UNREADABLE` are statements about the pool LISTING, which happens below this line;
+# writing one from a pass that never listed would be the false report that state exists to prevent
+# (and `UNREADABLE` would then be indistinguishable from a real blind read). The heartbeat keeps the
+# PREVIOUS reading together WITH ITS AGE (`orch-loop.sh`'s `queue_state_token`), so a frozen value
+# cannot pass as a fresh one — which is what makes leaving it stale honest rather than silent.
+# ⛔ ONE candidate AND the reserve must fit, or this pass would spend its last calls to judge a
+# handful and produce no usable verdict at all.
+if [ "$CORE_PACING" -eq 1 ]; then
+  if CORE_NOW="$(core_remaining)"; then
+    if [ "$CORE_NOW" -lt $(( CORE_RESERVE + CORE_PER_CANDIDATE )) ]; then
+      echo "[refresh] ABORT: REST core budget remaining=$CORE_NOW cannot buy one candidate without eating the reserve=$CORE_RESERVE (~$CORE_PER_CANDIDATE per candidate) — this pass ran NOTHING of the pool and judged NOTHING, so an empty backlog would be a false report (#1736). The dispatched.txt reaper HAS run (that is why the refusal is here and not earlier); the pool is left untouched and the next cycle retries."
+      exit "$EXIT_TRANSIENT"
+    fi
+    echo "[refresh] budget: REST core remaining=$CORE_NOW, reserve=$CORE_RESERVE, ~$CORE_PER_CANDIDATE per candidate — up to $(( (CORE_NOW - CORE_RESERVE) / CORE_PER_CANDIDATE )) candidate(s) affordable this pass (limit $LIMIT)"
+  else
+    echo "[refresh] WARN: the REST core budget could not be read — pacing is OFF for this pass (it will not be starved on an unreadable metric). The pre-flight's own fail-closed rules still decide every verdict."
+  fi
+fi
 
 touch "$O/checked.txt" "$O/candidates.txt"
 

@@ -68,8 +68,17 @@ mk_case() {
 # status line), and CHARGES the scripted budget for every page it serves. `rate-body` overrides the
 # `api rate_limit` payload (case 5 serves one WITHOUT the core field: an answer that is not a
 # measurement).
+# mk_gh <case-dir> <rows> [rate-body] [open-rows] — the `gh` stub. Answers the REST listings the
+# shipped script asks for, wrapped in the header block `gh api -i` really produces (the helper reads
+# `Link` and the status line), and CHARGES the scripted budget for every page it serves. `rate-body`
+# overrides the `api rate_limit` payload (case 5 serves one WITHOUT the core field: an answer that is
+# not a measurement). ⛔ `open-rows` is the UNLABELLED `state=open&limit=500` window the reaper reads
+# into `.open_iss` — a different question from the label-filtered tier listings, so it gets its own
+# seam: with it defaulted, a fixture that seeds a `dispatched.txt` entry could never show it being
+# PRUNED (the reaper would see an empty open set and keep every entry), and the prune assertions in
+# case 4 would pass by vacuity rather than by the reaper running.
 mk_gh() {
-  local d="$1" rows="$2" rate_body="${3:-}"
+  local d="$1" rows="$2" rate_body="${3:-}" open_rows="${4:-[]}"
   cat > "$d/bin/gh.body" <<SH
 #!/bin/bash
 charge() {  # <cost> — spend from the scripted budget (never below 0)
@@ -82,7 +91,7 @@ case "\$*" in
     else printf '{"resources":{"core":{"remaining":%s},"graphql":{"remaining":4990}}}\n' "\$(cat "$d/core")"; fi ;;
   *"/pulls?"*) charge 1; printf '[]\n' ;;
   *"labels=P0-blocker"*) charge 1; printf '%s\n' '$rows' ;;
-  *"/issues?"*) charge 1; printf '[]\n' ;;
+  *"/issues?"*) charge 1; printf '%s\n' '$open_rows' ;;
   *) printf '[]\n' ;;
 esac
 SH
@@ -235,14 +244,30 @@ esac
 [ "$remaining" -ge 40 ] && ok "starved: stopped with $remaining remaining (reserve 40 intact)" \
                         || bad "starved: spent through the reserve ($remaining left, want >= 40)"
 
-# ── 4) NO AFFORDABLE CANDIDATE: a NAMED refusal, never a false empty backlog ────────────────────
+# ── 4) NO AFFORDABLE CANDIDATE: a NAMED refusal, never a false empty backlog — AND THE REAPER STILL
+#      RUNS (review finding #8) ────────────────────────────────────────────────────────────────
 # `judged 0` is deliberately outside the `usable -eq 0` assertion (that one requires `judged > 0`), so
 # without an explicit arm a budget-starved pass would print `checked 0; backlog now 0` at rc 0 — the
-# #1736 false report arriving through the budget door. And it must refuse BEFORE the listings: those
-# cost ~40 calls the next pass needs.
+# #1736 false report arriving through the budget door.
+# ⛔ BUT THE REFUSAL IS DELIBERATELY **NOT** THE FIRST THING THE PASS DOES (review finding #8, P1). It
+# used to sit at the top, above the `dispatched.txt` reaper, and “zero calls spent” was its stated
+# virtue — which is exactly backwards: the reaper is the ONLY thing that un-blacklists a dispatched
+# issue that is still OPEN, has NO PR, and has no live lane (the file's own note above the reaper says
+# so), and a starved box therefore stopped pruning precisely when it was too poor to do anything else.
+# The re-dispatched-when-free class stayed blacklisted until the bucket recovered on its own.
+# So this case now asserts the OPPOSITE of the old assertion, and it asserts the CONSEQUENCE rather
+# than the call count: `#41` is seeded into `dispatched.txt` + `checked.txt`, gh reports it as still
+# open with no PR branch, and the starved pass must have PRUNED it. The spend is bounded, not zero —
+# the reaper's two listings are the price, and the expensive half (the priority-tier listings, ~40) is
+# pinned by "no `.pool`" below.
 mk_case unaffordable 20
-mk_gh "$D" "$(rows 6)"
+mk_gh "$D" "$(rows 6)" "" "$(rows 6)"   # .open_iss = issues 41..46, .pr_brs = no branches
 mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+# A `tmux` stub, so "no live lane" is a fact of the fixture rather than of the host: the reaper asks
+# `tmux ls` for `lane-<issue>` sessions, and an ambient session on a real box would keep the entry.
+printf '#!/bin/bash\nexit 0\n' > "$D/bin/tmux"; chmod +x "$D/bin/tmux"
+printf '41\n' > "$D/o/dispatched.txt"
+printf '41\n' > "$D/o/checked.txt"
 rf "$D" refresh COLLISION_PREFLIGHT_CORE_RESERVE=40
 spent_dry=$(( 20 - $(cat "$D/core") ))
 [ "$RC" -eq 1 ] && ok "unaffordable: refuses TRANSIENTLY (rc=1, retried next cycle) rather than exiting 0" \
@@ -255,8 +280,23 @@ case "$OUT" in
   *"backlog now"*) bad "unaffordable: printed a backlog count for a pass that judged nothing — the #1736 false report" ;;
   *) ok "unaffordable: no 'backlog now' line — an unjudged pool is never reported as an empty one" ;;
 esac
-[ "$spent_dry" -eq 0 ] && ok "unaffordable: refused BEFORE the listings (0 core calls spent)" \
-                       || bad "unaffordable: spent $spent_dry core calls before refusing — the listings ran for nothing"
+# ⛔ FINDING #8's PROPERTY, asserted on the ARTIFACT rather than on the log: a starved pass still prunes
+# a blacklisted issue that is open, has no PR and no live lane. Non-vacuity is the SEED (the entry is
+# there before the pass and the fixture proves the reaper can see it: gh lists #41 as open).
+case "$(tr '\n' ' ' < "$D/o/dispatched.txt" 2>/dev/null)" in
+  *41*) bad "unaffordable: #41 is STILL in dispatched.txt — a starved pass did not prune the blacklist (the reaper now runs below the budget gate, so it must have)" ;;
+  *) ok "unaffordable: the starved pass STILL PRUNED #41 from dispatched.txt (open, no PR, no lane) — the reaper is not skipped when the box is broke" ;;
+esac
+case "$(tr '\n' ' ' < "$D/o/checked.txt" 2>/dev/null)" in
+  *41*) bad "unaffordable: #41 is still in checked.txt — the prune did not clear the blacklist entry it un-blacklisted" ;;
+  *) ok "unaffordable: the prune cleared #41 from checked.txt as well (un-blacklisted, not half-cleared)" ;;
+esac
+[ ! -e "$D/o/.pool" ] && ok "unaffordable: the priority-tier listings did NOT run (no .pool) — the refusal still precedes the ~40-call half" \
+                       || bad "unaffordable: .pool exists — the priority listings ran for a pass that then refused"
+# The reaper's two listings are the ONLY permitted spend. Bounded, and proven non-zero by the prune
+# above (a reaper that never listed cannot have un-blacklisted anything).
+[ "$spent_dry" -le 4 ] && ok "unaffordable: refused after $spent_dry core call(s) — the reaper's two listings only, not the ~40 the pool listing costs" \
+                       || bad "unaffordable: spent $spent_dry core calls before refusing — more than the reaper's two listings, so something else ran"
 
 # ── 5) AN UNREADABLE BUDGET DOES NOT STARVE (a metric outage is not a dispatch outage) ──────────
 # If the probe cannot answer, the pass must proceed on the pre-flight's own fail-closed rules — never
