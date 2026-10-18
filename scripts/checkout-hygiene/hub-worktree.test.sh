@@ -156,6 +156,85 @@ assert_contains "$out" "WIP-preservation path" "off-main guidance mentions push 
 git -C "$REPO" checkout -q main
 git -C "$REPO" branch -q -D strand/br
 
+# ── 6b. #854: the salvage hub-cleanup NAMES every path it reverses ──────────
+# The defect this pins: salvage reverts the shared hub's tracked dirt to HEAD
+# and used to do so with NO line naming the paths — so a sub-agent running the
+# sanctioned recovery could destroy a parent session's uncommitted edit (the
+# observed case: a TRACKED `.mcp.json` reverted to its exact HEAD bytes, mtime
+# inside the dispatch window) with nothing in its report. The reversal must be
+# (a) NAMED, with the branch that preserved it, and (b) printed even though the
+# hub ends CLEAN — a clean exit must not swallow it.
+REPO854="$REAL_FIX/repo854"
+ORIGIN854="$REAL_FIX/origin854.git"
+git init -q --bare -b main "$ORIGIN854"
+git init -q -b main "$REPO854"
+git -C "$REPO854" config user.email t@t
+git -C "$REPO854" config user.name t
+printf '{\n  "mcpServers": {}\n}\n' > "$REPO854/.mcp.json"   # TRACKED (the incident file)
+printf '.worktrees/\n' > "$REPO854/.gitignore"
+git -C "$REPO854" add . && git -C "$REPO854" commit -qm init
+git -C "$REPO854" remote add origin "$ORIGIN854"
+git -C "$REPO854" push -q origin main
+# An UNRELATED uncommitted tracked edit (the parent's user-approved config) +
+# untracked WIP, neither of them the recovering session's.
+printf '{\n  "mcpServers": { "hosted-tortoise": { "url": "https://example.invalid" } }\n}\n' > "$REPO854/.mcp.json"
+echo "scratch" > "$REPO854/notes.md"
+out="$(bash "$HELPER" salvage feat/salvage-854 "$REPO854" 2>&1)" && rc=$? || rc=$?
+assert_eq "$rc" 0 "#854: salvage of the incident shape exits 0"
+assert_contains "$out" "hub cleanup REVERSED the dirty set" "#854: the cleanup names the reversal"
+assert_contains "$out" "the uncommitted change now lives ONLY on feat/salvage-854" "#854: the reversal names where the change went"
+assert_contains "$out" "     .mcp.json" "#854: the reverted TRACKED path is named (the incident file)"
+assert_contains "$out" "     notes.md" "#854: the removed untracked path is named"
+# The reversal really happened (hub back to HEAD bytes) AND was preserved.
+assert_eq "$(git -C "$REPO854" hash-object .mcp.json)" "$(git -C "$REPO854" rev-parse HEAD:.mcp.json)" "#854: hub file reverted to HEAD byte-exact"
+grep -q "hosted-tortoise" "$REPO854/.worktrees/feat/salvage-854/.mcp.json" && ok "#854: the reversed change IS preserved on the salvage branch" || bad "#854: the reversed change NOT preserved on the branch"
+assert_eq "$(git -C "$REPO854" status --porcelain | wc -l | tr -d ' ')" "0" "#854: hub clean after the named reversal"
+# A CLEAN hub prints no reversal record (the record must describe a real
+# reversal, not be emitted unconditionally).
+out="$(bash "$HELPER" salvage feat/salvage-854-nothing "$REPO854" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "#854: a clean hub still refuses salvage → exit 1"
+case "$out" in *"hub cleanup REVERSED"*) bad "#854: clean hub emitted a reversal record" ;; *) ok "#854: no reversal record when nothing was reversed" ;; esac
+
+# ── 6c. #854: the untracked sweep must NOT take `.worktrees/` ──────────
+# `.worktrees/` appears as an untracked DIRECTORY whenever it is not
+# gitignored, so an unguarded `rm -rf` destroys every sibling session's live
+# worktree, and the paths are never named. Pin the guard with a sibling
+# worktree holding an uncommitted edit.
+# `status.showUntrackedFiles=all` is set deliberately: it is the user config
+# under which the sweep's porcelain arrives as `.worktrees/<name>/` instead of
+# the collapsed `.worktrees/`, so a guard matching only the container path
+# fails OPEN and deletes the sibling worktree (and, on the capture side,
+# publishes it to the salvage branch as an embedded-repo gitlink). Both guards
+# must match every form the path can arrive in.
+REPO854B="$REAL_FIX/repo854b"
+ORIGIN854B="$REAL_FIX/origin854b.git"
+git init -q --bare -b main "$ORIGIN854B"
+git init -q -b main "$REPO854B"
+git -C "$REPO854B" config user.email t@t
+git -C "$REPO854B" config user.name t
+git -C "$REPO854B" config status.showUntrackedFiles all
+echo a > "$REPO854B/a.txt"
+git -C "$REPO854B" add . && git -C "$REPO854B" commit -qm init
+git -C "$REPO854B" remote add origin "$ORIGIN854B"
+git -C "$REPO854B" push -q origin main
+git -C "$REPO854B" worktree add -q "$REPO854B/.worktrees/sibling" -b wt/sibling HEAD
+echo "sibling-uncommitted" >> "$REPO854B/.worktrees/sibling/a.txt"
+echo "hub-dirt" >> "$REPO854B/a.txt"
+out="$(bash "$HELPER" salvage feat/salvage-854b "$REPO854B" 2>&1)" && rc=$? || rc=$?
+assert_eq "$rc" 1 "#854: a hub whose .worktrees is not gitignored does NOT report a clean hub"
+assert_contains "$out" "is the isolated-worktree container" "#854: the refusal names the .worktrees container"
+if [ -e "$REPO854B/.worktrees/sibling/a.txt" ]; then ok "#854: the sibling worktree SURVIVED the sweep"; else bad "#854: the sibling worktree was DELETED"; fi
+grep -q "sibling-uncommitted" "$REPO854B/.worktrees/sibling/a.txt" 2>/dev/null && ok "#854: the sibling's uncommitted edit survived" || bad "#854: the sibling's uncommitted edit was destroyed"
+# The capture pass must not put the container on the salvage branch either:
+# with `--untracked-files=all` the pre-existing sibling arrives as
+# `.worktrees/sibling/`, and copying it makes git record an embedded-repo
+# gitlink on the branch the PR is opened from.
+if git -C "$ORIGIN854B" ls-tree -r --name-only feat/salvage-854b 2>/dev/null | grep -q '^\.worktrees'; then
+  bad "#854: the salvage branch CAPTURED the .worktrees container (sibling worktree)"
+else
+  ok "#854: the salvage branch carries no .worktrees path"
+fi
+
 echo ""
 echo "hub-worktree.test.sh: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
