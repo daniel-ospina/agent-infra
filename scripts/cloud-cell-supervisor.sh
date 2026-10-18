@@ -954,7 +954,7 @@ seed_and_stamp() {
   # controller reporting RUNNING (the #1736 shape). Refuse to seed an incomplete layer rather than
   # producing that cell.
   [ -d "$HARNESS/gh-serial" ] \
-    || die "$HARNESS/gh-serial is missing — refusing to seed a cell whose gh layer would be absent (every wired gh call would exit 127)"
+    || die "$HARNESS/gh-serial is missing — THIS HARNESS COMMIT DOES NOT SHIP the gh serialisation layer (#1988), so no cell can be seeded from it. Refusing rather than seeding a cell that runs a harness predating the layer. A PINNED harness (provenance relation 'behind') legitimately lacks it: move HARNESS_REF forward, or set HARNESS to a checkout that ships gh-serial/"
   mkdir -p "$O/gh-serial" || die "cannot create $O/gh-serial"
   for src in "$HARNESS"/gh-serial/gh-serial "$HARNESS"/gh-serial/gh_serial.py "$HARNESS"/gh-serial/lib.sh; do
     [ -f "$src" ] || die "$(basename "$src") missing from $HARNESS/gh-serial — the layer would be seeded incomplete"
@@ -1143,7 +1143,7 @@ cmd_check() {
     [ -f "$O/$w" ] || missing="$missing $w"
   done
   [ -z "$missing" ] \
-    || die "the gh serialisation layer is missing from $O:$missing — run 'start' (it seeds $O), or: mkdir -p '$O/gh-serial' && cp '$HARNESS'/gh-serial/* '$O/gh-serial/'"
+    || die "the gh serialisation layer is missing from $O:$missing — run 'start' (it seeds $O), or: mkdir -p '$O/gh-serial' && cp '$HARNESS'/gh-serial/* '$O/gh-serial/' (if $HARNESS/gh-serial is ITSELF absent this harness predates #1988 and 'start' cannot help — move HARNESS_REF forward)"
 
   # ── which commit is this cell running? (agent-infra#1745) ────────────────────────────────────
   # Placed BEFORE the dispatch-provisioning probe: a tree off main's line can pass every later

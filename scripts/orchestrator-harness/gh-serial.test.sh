@@ -432,9 +432,41 @@ ck "orch-loop.sh's open-PR count (the 'open=UNKNOWN' symptom) uses it" $rc
 # The pre-flight probes are deliberately NOT wrapped (they are the diagnostics that must stay
 # cheap and must keep distinguishing a 401 from a transport fault). Allowlist them explicitly so a
 # NEW bare gh call cannot slip in unnoticed.
-bare="$(grep -nE '^[[:space:]]*(if |elif |! )?gh ' "$REFRESH" | grep -vE 'gh auth (token|status)|gh api rate_limit|command -v gh' || true)"
+# ⛔ THE GUARD MUST MATCH THE SHAPE THE FILE ACTUALLY USES (#1988 review). The anchor used to be
+# statement-initial only (`^[[:space:]]*(if |elif |! )?gh `), which matched NOTHING: every bare call
+# left in this script is `X="$(gh …)"`, so a new `BAD="$(gh pr list …)"` passed green. A guard that
+# cannot fail is worse than no guard — it certifies a wiring it never inspected. It now also matches
+# the command-substitution/assignment shapes, with a NON-VACUITY self-check below proving it still
+# catches a synthetic one (and that the wired `ghs_run` lines stay excludable).
+GH_BARE_RE='(^|[;&|]|\$\(|`)[[:space:]]*(if |elif |! )?gh '
+bare="$(grep -nE "$GH_BARE_RE" "$REFRESH" \
+  | grep -vE '^[0-9]+:[[:space:]]*#' \
+  | grep -vE 'ghs_run|ghs_mut|ghs_rest' \
+  | grep -vE 'gh auth (token|status)|gh api rate_limit|command -v gh' || true)"
 [ -z "$bare" ] && rc=0 || { rc=1; note "unwrapped bare gh lines: $bare"; }
 ck "every OTHER bare gh line in refresh-candidates.sh is an allowlisted pre-flight probe" $rc
+printf '%s\n' 'BAD="$(gh pr list --repo x/y)"' | grep -qE "$GH_BARE_RE" && rc=0 || rc=1
+ck "the bare-gh guard MATCHES the command-substitution shape it exists to catch (non-vacuity)" $rc
+printf '%s\n' 'ghs_run -- gh pr list --repo x/y' | grep -E "$GH_BARE_RE" | grep -vE 'ghs_run|ghs_mut|ghs_rest' | grep -q . && rc=1 || rc=0
+ck "the bare-gh guard's WIRED calls (ghs_run) remain excludable" $rc
+# ⛔ THE STALE-LOCK BOUND MUST EXCEED THE PASS IT GUARDS (#1988 review). One refresh makes five
+# serialised `ghs_run` calls and does NOT abort at the first failure, and each call may burn the
+# layer's whole backoff budget — yet the bound was a literal 20 min, so the controller deleted a lock
+# held by a LIVE refresh and spawned a DUPLICATE (both writing .pool/.open_iss/.pr_brs), the first
+# pass's unconditional `rm -rf` then freeing the lock for a THIRD. Assert the literal is gone, that
+# the bound is derived, and that the SHIPPED derivation — extracted and evaluated, never
+# re-implemented here — yields a bound that covers five full pass budgets.
+! grep -qE -- '-mmin \+20[^0-9]' "$LOOP" && rc=0 || rc=1
+ck "the refresh stale-lock bound is no longer the literal 20 minutes" $rc
+if budget="$( { sed -n '/^ghs_worst_case_call_seconds()/,/^}/p' "$LOOP";
+                printf 'ghs_worst_case_call_seconds\n'; } | bash 2>/dev/null )" && [ -n "$budget" ]; then
+  stale_min="$( { sed -n '/^ghs_worst_case_call_seconds()/,/^}/p' "$LOOP";
+                   grep -E '^[[:space:]]*REFRESH_STALE_MIN=\$\(.*\)$' "$LOOP";
+                   printf 'printf "%%s" "$REFRESH_STALE_MIN"\n'; } | bash 2>/dev/null )"
+  if [ -n "$stale_min" ] && [ $(( stale_min * 60 )) -ge $(( 5 * budget )) ]; then rc=0
+  else rc=1; note "stale bound=${stale_min:-<unparsed>}m vs 5×call budget=${budget}s"; fi
+else rc=1; note "could not evaluate ghs_worst_case_call_seconds from $LOOP"; fi
+ck "the derived stale bound (${stale_min:-?}m) COVERS one worst-case refresh pass (5 × ${budget:-?}s)" $rc
 # The LAYER must reach the BOX, not just the checkout. install.sh seeds the Mac; the cell seeders are
 # a different path, and a cell seeded without gh-serial/ runs UNDEFINED ghs_run ⇒ 127 on every read ⇒
 # queue=UNREADABLE forever with the cell reporting RUNNING (#1736). That was a review finding on this

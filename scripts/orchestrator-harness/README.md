@@ -384,7 +384,7 @@ conversions go through `ghs_rest`/`ghs_run` without changing this layer.
 | 127 | no real `gh` on PATH, or the engine is missing (it refuses to fall back to an unserialised `gh`) |
 | other | `gh`'s own status, output replayed untouched (a permission 403, a 404, a network error) |
 
-**Verify it** (offline; stub `gh` + a sleep recorder, 59 assertions):
+**Verify it** (offline; stub `gh` + a sleep recorder — the suite prints its own check count):
 
 ```bash
 bash gh-serial.test.sh

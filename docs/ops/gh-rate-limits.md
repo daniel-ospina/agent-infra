@@ -41,7 +41,7 @@ the current reason a cycle is blind.
 #   ${XDG_CACHE_HOME:-~/.cache}/pi-gh-serial
 "${O:-$HOME/orchestrator}/gh-serial/gh-serial" version   # the layer is seeded BESIDE $O, never on PATH
 "${O:-$HOME/orchestrator}/gh-serial/gh-serial" state     # last limit/lock/call-timeout WITH AGE
-bash scripts/orchestrator-harness/gh-serial.test.sh       # offline contract test (59 checks)
+bash scripts/orchestrator-harness/gh-serial.test.sh       # offline contract test (hermetic; prints its own check count)
 ```
 
 Knobs: `GHS_MAX_ATTEMPTS` (4), `GHS_BASE_WAIT` (60), `GHS_MAX_WAIT` (300), `GHS_MUTATIVE_SPACING` (1),

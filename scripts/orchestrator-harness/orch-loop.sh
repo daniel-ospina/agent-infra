@@ -190,6 +190,18 @@ safe_ref() {
 # Single-quoting with `'\''` escaping is POSIX and correct for EVERY byte (a newline included), so
 # it needs no character screen and cannot be defeated by a byte the screen forgot.
 shq() { local s="${1:-}" q="'"; printf "'%s'" "${s//$q/$q\\$q$q}"; }
+# ghs_worst_case_call_seconds — the gh layer's OWN budget for ONE wired call, derived from the
+# backoff it documents (GHS_MAX_ATTEMPTS, GHS_BASE_WAIT) plus the per-attempt child timeout.
+# ⛔ ONE definition, consumed by the refresh stale-lock bound below and asserted by
+# gh-serial.test.sh. A hardcoded copy is how the bound silently became shorter than the pass it
+# guards (#1988 review): the layer waits base×(2^0+2^1+…) for the first attempts-1 sleeps (the last
+# attempt does not sleep) and can spend up to GHS_CALL_TIMEOUT on each attempt.
+ghs_worst_case_call_seconds() {
+  local attempts="${GHS_MAX_ATTEMPTS:-4}" base="${GHS_BASE_WAIT:-60}" tmo="${GHS_CALL_TIMEOUT:-120}"
+  local total=$(( attempts * tmo )) i=1
+  while [ "$i" -lt "$attempts" ]; do total=$(( total + base * (1 << (i - 1)) )); i=$(( i + 1 )); done
+  printf '%s\n' "$total"
+}
 # A non-numeric threshold makes `[ -le ]` ERROR -- which returns false, and a false test in the gate
 # chain OPENS the gate. So a typo in the plist env (MIN_MEM_FREE_MB=abc) would silently remove the very
 # back-pressure these gates exist to apply. Coerce to the documented default instead of failing open.
@@ -1644,8 +1656,20 @@ PY
           echo "[refresh] FAILED rc=$rc (transient — retried next cycle)" >> "$LOG"
         fi ) &
     else
-      # stale lock guard (>20 min)
-      if [ -n "$(find "$O/.refresh.lock" -mmin +20 2>/dev/null)" ]; then rm -rf "$O/.refresh.lock"; echo "[refresh] cleared stale lock" >> "$LOG"; fi
+      # ⛔ THE STALE BOUND MUST EXCEED THE LAYER'S OWN WORST-CASE PASS (#1988 review).
+      # One refresh makes FIVE serialised `ghs_run` calls (2 listings + 3 priority tiers) and does NOT
+      # abort at the first failure — it records that read as unreadable and CARRIES ON. Under a
+      # SECONDARY rate limit each call burns its budget independently, so a legitimate pass can hold
+      # this lock for well over half an hour. A literal bound (it was 20 min) then became shorter than
+      # the pass it guards: the controller deleted a lock held by a LIVE refresh, spawned a DUPLICATE,
+      # and both wrote .pool/.open_iss/.pr_brs — then the first pass's unconditional `rm -rf` freed the
+      # lock for a THIRD. That is a self-amplifying blind-refresh loop in exactly the condition this
+      # layer exists to survive, so the bound is DERIVED from the layer's constants, never hardcoded.
+      REFRESH_STALE_MIN=$(( (5 * $(ghs_worst_case_call_seconds) + 599) / 60 + 15 ))
+      if [ -n "$(find "$O/.refresh.lock" -mmin +"$REFRESH_STALE_MIN" 2>/dev/null)" ]; then
+        rm -rf "$O/.refresh.lock"
+        echo "[refresh] cleared stale lock (idle >${REFRESH_STALE_MIN}m; a pass budgets 5 × $(ghs_worst_case_call_seconds)s)" >> "$LOG"
+      fi
     fi
   fi
 
