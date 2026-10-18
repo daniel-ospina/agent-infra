@@ -698,11 +698,44 @@ assert_contains "$OUT" "not a lock this reaper made" "the refusal says why it wi
 echo
 echo "── 9p. a RELOCATED cache keeps its bound even if the target dir is not cache-named ──"
 H="$T/h9p"
-mkdir -p "$H/.cache" "$H/bigdisk"; new_cache "$H/bigdisk/data" 3000 2000
-ln -sfn "$H/bigdisk/data" "$H/.cache/uv"
+mkdir -p "$H/.cache" "$H/bigdisk"; new_cache "$H/bigdisk/uv-cache" 3000 2000
+ln -sfn "$H/bigdisk/uv-cache" "$H/.cache/uv"
 OUT="$(run_reap "$H" --apply 2>&1)"; RC=$?
-assert_eq "$RC" "0" "a relocated cache is bounded (the shape guard reads the DECLARED name too)"
-assert_le "$(kb "$H/bigdisk/data")" "$BOUND_KB" "the tree behind the symlink came under the bound"
+assert_eq "$RC" "0" "a relocated, cache-NAMED cache is bounded"
+assert_le "$(kb "$H/bigdisk/uv-cache")" "$BOUND_KB" "the tree behind the symlink came under the bound"
+# … and a relocation onto a NON-cache-named directory is refused, not wiped:
+H="$T/h9p2"
+mkdir -p "$H/.cache" "$H/Documents"; dd if=/dev/zero of="$H/Documents/thesis.dat" bs=1024 count=3000 2>/dev/null
+ln -sfn "$H/Documents" "$H/.cache/uv"
+OUT="$(run_reap "$H" --apply 2>&1)"; RC=$?
+assert_eq "$RC" "3" "a cache symlinked onto a data directory exits 3 (the declared name is always cache-shaped, so the RESOLVED one is what must be tested)"
+[ -f "$H/Documents/thesis.dat" ] && ok "the data directory SURVIVED" || bad "a symlink at ~/.cache/uv wiped a data directory"
+
+echo
+echo "── 9t. a symlinked \$HOME cannot defeat the \$HOME refusal ──"
+H="$T/h9t"
+mkdir -p "$H/real/Documents" "$H/real/.cache"
+dd if=/dev/zero of="$H/real/Documents/data.bin" bs=1024 count=3000 2>/dev/null
+ln -sfn "$H/real" "$H/linkhome"
+OUT="$(env HOME="$H/linkhome" CACHE_REAP_MAX_MB=2 CACHE_REAP_UV_DIR="$H/real" CACHE_REAP_LOG="$H/reap.log" \
+        CACHE_REAP_PS="$T/bin/ps-idle" CACHE_REAP_DF="$T/bin/df-gain" CACHE_REAP_UV="$T/bin/uv-noprune" \
+        CACHE_REAP_NPM="$T/bin/uv-noprune" CACHE_REAP_PIP="$T/bin/uv-noprune" bash "$REAPER" --apply 2>&1)"; RC=$?
+assert_eq "$RC" "3" "a target that IS \$HOME through a symlink is refused (the comparison is canonical on both sides)"
+[ -f "$H/real/Documents/data.bin" ] && ok "the home directory SURVIVED" || bad "a symlinked \$HOME defeated the home refusal"
+
+echo
+echo "── 9u. uvx is a uv holder (same cache) ──"
+H="$T/h9u"
+new_cache "$H/.cache/uv" 3000 2000
+UV_BEFORE="$(kb "$H/.cache/uv")"
+cat >"$T/bin/ps-uvx" <<SH
+#!/bin/sh
+printf '%s\n' "  4242 /usr/local/bin/uvx ruff check"
+SH
+chmod +x "$T/bin/ps-uvx"
+OUT="$(PS_STUB="$T/bin/ps-uvx" run_reap "$H" --apply 2>&1)"; RC=$?
+assert_eq "$RC" "3" "a live uvx blocks the whole-cache escalation (uvx resolves through the same uv cache)"
+assert_eq "$(kb "$H/.cache/uv")" "$UV_BEFORE" "nothing was evicted while uvx could be resolving against the cache"
 
 echo
 echo "── 9q. a du that stops answering MID-pass stops the deletion ──"
@@ -713,7 +746,7 @@ OUT="$(DU_STUB="$T/bin/du-flaky" run_reap "$H" --apply 2>&1)"; RC=$?
 assert_eq "$RC" "3" "an unmeasurable cache mid-pass fails closed"
 assert_contains "$OUT" "STOPPING" "the pass says it STOPPED rather than continuing blind"
 LEFT="$(find "$H/.cache/uv" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')"
-[ "$LEFT" -gt 2 ] && ok "the deletion STOPPED early ($LEFT of 10 entries left) — it did not empty a cache it could not measure" \
+[ "$LEFT" -ge 2 ] && ok "the deletion STOPPED early ($LEFT of 10 entries left) — it did not empty a cache it could not measure" \
                   || bad "the pass kept deleting after du stopped answering ($LEFT of 10 entries left)"
 
 echo
@@ -737,10 +770,30 @@ cat >"$T/bin/ps-backslash" <<SH
 #!/bin/sh
 printf '%s\n' "  999 cat $D/entry-1/blob"
 SH
+chmod +x "$T/bin/ps-backslash"
 OUT="$(PS_STUB="$T/bin/ps-backslash" CACHE_REAP_UV_DIR="$D" run_reap "$H" --apply 2>&1)"; RC=$?
 assert_eq "$RC" "0" "the pass still bounds the cache around the held entry"
 [ -f "$D/entry-1/blob" ] && ok "the entry a live process names SURVIVED (awk -v unescapes the path; ENVIRON does not)" \
                          || bad "a held entry was deleted because the path was mangled by awk -v"
+
+echo
+echo "── 9v. a FALLING df is another writer, not a failed reclaim ──"
+H="$T/h9v"
+new_cache "$H/.cache/uv" 2000 1200
+cat >"$T/bin/df-shrink" <<SH
+#!/bin/sh
+n=\$(cat "$T/df.calls" 2>/dev/null || echo 0)
+echo \$((n + 1)) >"$T/df.calls"
+echo "Filesystem 1024-blocks Used Available Capacity Mounted"
+echo "/dev/fake 100000 4000 \$(( 48000 - n * 1024 )) 4% /"
+SH
+chmod +x "$T/bin/df-shrink"
+rm -f "$T/df.calls"
+OUT="$(DF_STUB="$T/bin/df-shrink" run_reap "$H" --apply 2>&1)"; RC=$?
+assert_eq "$RC" "0" "a cache brought UNDER its bound exits 0 even when free space FELL (the delta is unattributable, not a failure)"
+assert_le "$(kb "$H/.cache/uv")" "$BOUND_KB" "the bound was still enforced"
+assert_contains "$OUT" "UNATTRIBUTABLE" "the verdict says the disk-gain claim cannot be attributed, instead of blaming hardlinks"
+assert_not_contains "$OUT" "hardlinked into a .venv" "it does NOT blame hardlinked venvs for a delta it never saw"
 
 echo
 echo "── 10. wiring: a bound no box runs is the defect ──"

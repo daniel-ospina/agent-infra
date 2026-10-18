@@ -364,7 +364,10 @@ ps_matches() {
                     # uv holder. Match what the process IS, not just its binary name.
                     if (tool == "npm" && (index($0, "npm-cli.js") || index($0, "bin/npm"))) { print; next }
                     if (tool == "pip" && (index($0, "pip/__main__.py") || index($0, " -m pip") || index($0, "bin/pip"))) { print; next }
-                    if (tool == "uv" && index($0, "bin/uv ")) { print; next }
+                    # `uvx` is the `uv tool run` entry point of uv and resolves through the SAME
+                    # cache: matching only `uv`/`bin/uv ` let a live uvx through the veto (measured
+                    # control pair: a uv holder → exit 3, the same row with argv[0]=uvx → VERIFIED).
+                    if (tool == "uv" && (exe == "uvx" || index($0, "bin/uvx") || index($0, "bin/uv "))) { print; next }
                     if (exe == "env") {
                         i = 3
                         while (i <= NF && $i ~ /=/) i++
@@ -522,39 +525,52 @@ entries_by_size() {
 # "$HOME 40MB -> 4KB … VERIFIED", deleted $HOME/precious — and then deleted its own state dir, so
 # every later log line failed silently. The seams stay usable for the suite because a cache-shaped
 # directory passes; what is refused is a target that cannot be a cache at all.
+# canon <path> — the path with symlinks resolved, or the input when it cannot be resolved (so a
+# comparison never fails OPEN because the other side was spelled differently).
+canon() {
+    local r
+    r="$(cd "$1" 2>/dev/null && pwd -P)" || r=""
+    [ -n "$r" ] || r="$1"
+    printf '%s' "$r"
+}
+
+# guard_target <class> <resolved-dir> <declared-dir> — rc 0 usable · rc 1 refused (reported).
+# ⛔ The env seams are honoured, so a mis-set seam names an ARBITRARY directory — and `uv cache
+# prune` pointed at one deletes it (measured). The SHAPE test therefore runs on the RESOLVED name,
+# NOT on the declared one: the declared name is cache-shaped for every real sink by construction, so
+# an OR of the two is INERT — measured, with no seam mis-set at all,
+# `ln -s ~/Documents ~/.cache/uv` produced "uv …/Documents 6008KB -> 4KB … VERIFIED", exit 0, and
+# deleted a thesis and a photos archive. A relocation is still supported, but its TARGET must be
+# cache-named (`ln -s /bigdisk/uv-cache ~/.cache/uv`); a non-cache-named target is refused loudly.
 guard_target() {
-    local class="$1" dir="$2" declared="$3" b declared_b st
-    # The SHAPE test runs against BOTH names: the declared spelling (`~/.cache/uv`) and the
-    # resolved one (`/bigdisk/data`). Applying it only to the resolved path refused the very
-    # relocation this script supports — `ln -s /bigdisk/data ~/.cache/uv` measured as
-    # "its name ('data') is not cache-shaped … mis-set seam", exit 3, cache never bounded, and the
-    # message blamed the operator. The absolute refusals below stay on the RESOLVED path.
+    local class="$1" dir="$2" declared="$3" b chome cst
     b="$(basename "$dir")"
-    declared_b="$(basename "${declared:-$dir}")"
     if [ "$dir" = "/" ]; then
         fail_closed "$class: refusing to bound '/' — a cache is never the filesystem root"
         return 1
     fi
+    # Both sides are compared CANONICALLY: `$dir` is resolved, so an unresolved `$HOME` (or state
+    # dir) spelled through a symlink never matched and the refusal was inert on any box whose home
+    # is reached through a link (measured: HOME=/tmp/…/h4link, uv → the real home, Documents wiped).
     if [ -n "${HOME:-}" ]; then
-        case "${HOME}/" in
+        chome="$(canon "$HOME")"
+        case "${chome}/" in
             "$dir"/*) fail_closed "$class: refusing to bound $dir — it is $HOME or an ancestor of it (deleting here destroys the user's home, not a cache)"
                       return 1 ;;
         esac
     fi
     for st in "${LOG:-}" "${LOCK_DIR:-}"; do
         [ -n "$st" ] || continue
-        case "$(dirname "$st")/" in
-            "$dir"/*) fail_closed "$class: refusing to bound $dir — it contains this reaper's own state directory ($(dirname "$st")); a prune here deletes the lock and the log mid-pass"
+        cst="$(canon "$(dirname "$st")")"
+        case "${cst}/" in
+            "$dir"/*) fail_closed "$class: refusing to bound $dir — it contains this reaper's own state directory ($cst); a prune here deletes the lock and the log mid-pass"
                       return 1 ;;
         esac
     done
     case "$b" in
-        uv|.uv|uv-*|npm|.npm|_npm*|_cacache|_npx|pip|.pip|pip-*|*cache*|cache|.cache) return 0 ;;
+        uv|.uv|uv-*|uvx|npm|.npm|_npm*|_cacache|_npx|pip|.pip|pip-*|*cache*|cache|.cache) return 0 ;;
     esac
-    case "$declared_b" in
-        uv|.uv|uv-*|npm|.npm|_npm*|_cacache|_npx|pip|.pip|pip-*|*cache*|cache|.cache) return 0 ;;
-    esac
-    fail_closed "$class: refusing to bound $dir — its name ('$b') is not cache-shaped, so it is almost certainly a mis-set CACHE_REAP_*_DIR/UV_CACHE_DIR/XDG_CACHE_HOME rather than a package cache (a prune on it deletes whatever is there)"
+    fail_closed "$class: refusing to bound $dir — its resolved name ('$b', declared as '$declared') is not cache-shaped, so it is not a package cache: either the seam is mis-set (CACHE_REAP_*_DIR/UV_CACHE_DIR/XDG_CACHE_HOME) or a relocation points at something else. PRUNE HERE DELETES WHATEVER IS THERE; name the relocation target after its tool (e.g. \`ln -s /bigdisk/uv-cache ~/.cache/uv\`) and keep the cache in it"
     return 1
 }
 
@@ -562,7 +578,7 @@ guard_target() {
 reap_target() {
     local class="$1" dir="$2" before_kb before_free_kb now_kb new_kb after_kb after_free_kb
     local pruned=none evicted=0 kb e cur_free holders dir_holders held_entries="" keep_entries=""
-    local no_gain_stop=0 no_gain=0 last_free="" claimed_kb gained_kb min_gain_kb stop_note=""
+    local no_gain_stop=0 no_gain=0 free_fell=0 last_free="" claimed_kb gained_kb min_gain_kb stop_note=""
     local dev_rc share_rc fresh_holders free_str parent mnt_rc resolved declared_dir
 
     case "$dir" in
@@ -713,15 +729,21 @@ reap_target() {
                 evicted=$((evicted + 1))
                 # Re-measure the WHOLE cache, not the entry: an entry can be a directory
                 # holding more than `du` charged to its own top level (block rounding).
-                # ⛔ A measurement failure MID-PASS used to be absorbed: now_kb kept its last
-                # good value, so "still over bound" stayed true and the loop kept deleting
-                # entries it could not show were reclaiming anything (reproduced: a du that
-                # dies after enumeration evicted 10 of 10 entries, then reported FAIL-CLOSED).
-                if ! new_kb="$(kb_of "$dir")"; then
-                    fail_closed "$class: cannot re-measure $dir after evicting $e — STOPPING (no further deletion on a cache that can no longer be measured)"
-                    break
+                # ⛔ NO FULL-CACHE `du` PER EVICTION. Re-walking the whole cache after every
+                # removal is `evictions × cache_size` — measured 54× amplification on an 80-entry
+                # fixture, and THOUSANDS of multi-GB walks on the 7.1GB box this exists for, i.e. a
+                # pass that outruns its own 1800s lock bound and its hourly tick. Subtract the
+                # entry's own measured size (conservative: it never claims more than was removed)
+                # and re-walk ONCE, when the running estimate says the bound is reached — the final
+                # `after_kb` measurement re-walks again, so the verdict is always measured.
+                if [ "$kb" -ge "$now_kb" ]; then now_kb=0; else now_kb=$((now_kb - kb)); fi
+                if [ "$now_kb" -le "$MAX_KB" ]; then
+                    if ! new_kb="$(kb_of "$dir")"; then
+                        fail_closed "$class: cannot re-measure $dir after evicting $e — STOPPING (no further deletion on a cache that can no longer be measured)"
+                        break
+                    fi
+                    now_kb="$new_kb"
                 fi
-                now_kb="$new_kb"
                 cur_free="$(free_kb "$dir")"
                 # ⛔ An unreadable df is NOT "plenty of space": skipping the brake when df went
                 # silent let the pass empty the cache and only then report the unreadable df
@@ -733,6 +755,12 @@ reap_target() {
                 if [ -n "$last_free" ]; then
                     if [ "$cur_free" -gt "$last_free" ]; then
                         no_gain=0
+                    elif [ "$cur_free" -lt "$last_free" ]; then
+                        # ⛔ A FALLING df is ANOTHER WRITER, not a failed reclaim: on the busy
+                        # low-disk box this exists for, other lanes are writing while the pass runs.
+                        # Counting that as "not reclaiming" stopped the eviction early (leaving the
+                        # cache over bound) AND blamed hardlinked venvs for a delta it never saw.
+                        no_gain=0; free_fell=1
                     else
                         no_gain=$((no_gain + 1))
                         [ "$no_gain" -ge 2 ] && { no_gain_stop=1; stop_note=" (eviction STOPPED EARLY: deleting this cache no longer reclaims disk)"; break; }
@@ -770,7 +798,17 @@ reap_target() {
         return 0
     fi
 
-    if [ "$after_free_kb" -le "$before_free_kb" ]; then
+    # ⛔ A FALLING delta cannot be attributed to this pass at all: another process wrote more than
+    # the cache freed, which is the normal state of the busy low-disk box this exists for.
+    # Measured consequence of treating it as a failed reclaim: the pass exited 3 on a cache it had
+    # ALREADY brought under its bound, blamed hardlinked venvs for a delta it never saw, and made
+    # the cell write `.cache-reap-blocked` ("BOUND NOT ENFORCED") for a cache that WAS bounded.
+    # The bound is decided by the cache's own measured size; the disk-gain claim is simply not made.
+    if [ "$after_free_kb" -lt "$before_free_kb" ]; then
+        say "pi-cache-reap: $class $dir $(mb_str "$before_kb") -> $(mb_str "$after_kb") (prune=$pruned evicted=$evicted) max=${MAX_MB}MB — UNDER its bound; the free-space delta is UNATTRIBUTABLE ($(mb_str "$before_free_kb") -> $(mb_str "$after_free_kb"): another process wrote during the pass), so no disk-gain claim is made${keep_entries:+ (preserved: $keep_entries)}${stop_note}"
+        return 0
+    fi
+    if [ "$after_free_kb" -eq "$before_free_kb" ]; then
         fail_closed "$class: $dir shrank $(mb_str "$before_kb") -> $(mb_str "$after_kb") but the filesystem did NOT gain free space ($(mb_str "$before_free_kb") -> $(mb_str "$after_free_kb")) — the entries are still holding their bytes elsewhere (hardlinked into a .venv); nothing was actually freed. The owner for those bytes is the per-worktree sweep: cloud-cell-supervisor.sh prune${stop_note}"
         return 0
     fi
