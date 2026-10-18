@@ -261,6 +261,145 @@ source_env_file
 export HOME="$CELL_HOME"
 LOCK="$O/.orch.lock"
 
+# ── controller ownership (agent-infra#1761) ───────────────────────────────────────────────────────
+# ONE authority for "does a controller own this state dir?". The lock names the owner; a SCOPED
+# process read catches a controller whose lock was REMOVED while it was live — the measured mechanism
+# behind #1761's duplicate ("the launcher DELETES the lock, so the lock cannot prevent a duplicate").
+# `status`/`start`/`stop`/`apply` all read THIS, never the tmux session alone: a controller launched
+# outside the `orch` session (a leftover harness copy — #1761 contradiction 4) is invisible to
+# `tmux has-session`, so the old read reported STOPPED while a controller was merging, and `start`
+# would launch a second one.
+#
+# ⛔ SCOPED to THIS cell's own orch-loop.sh paths, never a bare `pgrep -f orch-loop.sh`: a dev box
+# runs PEER lanes' fixtures, and an unscoped match read FOUR controllers on 2026-10-15 (a real Mac
+# controller, a leaked test fixture, and two of a peer lane's test), none of them ours. A path scope
+# is what makes acting on these processes safe; an unscoped one is how a `stop` kills a peer's work.
+# ⛔ DESCENDANTS ARE EXCLUDED. `orch-loop.sh` spawns short-lived CHILDREN whose command line also
+# matches (measured `93150 53696 … orch-loop.sh`), so a naive count reports a duplicate that is not
+# there — the false positive the #1761 thread warns a per-box read must avoid.
+_controller_ps_awk='
+  { ppid[$1]=$2; c=$0; sub(/^[[:space:]]*[0-9]+[[:space:]]+[0-9]+[[:space:]]+/,"",c)
+    n=split(c,tok," ")
+    if (n>=2 && tok[2]!="-" && index(tok[2],"orch-loop.sh") && (tok[2]==a || (h!="" && tok[2]==h)) && tok[1] ~ /(bash|sh)$/) m[$1]=1 }
+  END { for (p in m) { q=p; d=0
+          for (i=0;i<64;i++) { if (!(q in ppid) || ppid[q]<=1) break; q=ppid[q]; if (q in m) { d=1; break } }
+          if (!d) print p } }'
+# ⛔ Match the INVOCATION, not the string. A process whose command line merely CONTAINS
+# `$O/orch-loop.sh` is not a controller — the caller itself is the measured false positive (a
+# `bash -c` whose script text mentions the path matches a `index(c,path)` test; the same shape made a
+# bare `pgrep -f` read the test fixture as a live controller). The controller's argv is exactly
+# `<shell> <path>` (orch-loop.sh takes no arguments), so require tok[2] == the path and a shell tok[1].
+# ⛔ A FAILED READ IS NOT "NO CONTROLLER" (#1856 review). `ps` piped into awk cannot report its own
+# failure, so a box whose `ps` is broken read as STOPPED — and `stop` then reported "not running" and
+# released the lock over a live controller, which is the false pass this whole block exists to remove.
+# An empty table is treated the same way: the probing process itself must appear in any real table
+# (`scripts/lib/pid-identity.sh`'s #1178 C3 rule), so empty means unreadable, never absent.
+_controller_pids_path() { # <primary-path> <extra-path-or-empty>
+  local t
+  t="$(ps -eo pid=,ppid=,command= 2>/dev/null)" || return 1
+  case "$t" in *[![:space:]]*) ;; *) return 1 ;; esac
+  printf '%s\n' "$t" | awk -v a="$1" -v h="$2" "$_controller_ps_awk"
+}
+# proc_start_epoch <pid> — when the process began, from `ps -o etime=`, whose [[dd-]hh:]mm:ss shape is
+# the SAME on BSD and GNU ps (unlike etimes/lstart, which are not). rc 1 when it cannot be read.
+#
+# ⛔ THIS BODY IS A PINNED MIRROR OF `pid_start_epoch` IN scripts/lib/pid-identity.sh, which is the
+# fleet's ONE process-identity rule (#1178) and which `scripts/lib/orchestrator-registry.sh` sources.
+# The copy exists because THIS file must run standalone — it is farmed into a runtime dir and a suite
+# arm copies it outside any checkout — so it cannot source a sibling library. Two copies of an
+# identity rule that may DRIFT are the #1178 defect ("two contracts for one safety rule",
+# docs/ops/fleet-liveness.md §3), so the pair is pinned by a drift arm in
+# cloud-cell-supervisor.test.sh (§(n)): a divergence reddens CI instead of becoming a kill.
+_proc_start_epoch() {
+  local p="${1:-}" e d h m s r
+  case "$p" in ''|*[!0-9]*) return 1 ;; esac
+  e="$("${PS_BIN:-/bin/ps}" -o etime= -p "$p" 2>/dev/null | tr -d '[:space:]')" || return 1
+  [ -n "$e" ] || return 1
+  d=0
+  case "$e" in *-*) d="${e%%-*}"; r="${e#*-}" ;; *) r="$e" ;; esac
+  case "$d" in ''|*[!0-9]*) return 1 ;; esac
+  case "$r" in
+    *:*:*) h="${r%%:*}"; r="${r#*:}"; m="${r%%:*}"; s="${r##*:}" ;;
+    *:*)   h=0;                 m="${r%%:*}"; s="${r##*:}" ;;
+    *) return 1 ;;
+  esac
+  case "$h$m$s" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s\n' "$(( $(date +%s) - (d * 86400 + h * 3600 + m * 60 + s) ))"
+}
+# _proc_began_after <pid> <epoch> — the pinned twin of pid_began_after (see the note above).
+_proc_began_after() {
+  local pe="${2:-}" ps
+  case "$pe" in ''|*[!0-9]*) return 1 ;; esac
+  ps="$(_proc_start_epoch "${1:-}")" || return 1
+  [ "$ps" -gt "$((pe + LOCK_START_SLACK_SECONDS))" ]
+}
+
+# The pid $O/.orch.lock names, when it is alive and IS an orch-loop.sh INVOCATION.
+#
+# ⛔ ITS PATH IS NOT CHECKED — the lock is per-$O and the leftover-copy case must still be stoppable —
+# BUT ITS SHAPE AND ITS AGE ARE, and both are load-bearing:
+#   * SHAPE: argv must be `<shell> <.../orch-loop.sh>`. Matching the string anywhere in the command
+#     line is how a `tmux` client, a `bash -c` launcher or an editor picks up the pattern (the same
+#     measured false positive the scoped reads above exist to avoid).
+#   * AGE: the lock is data on disk and outlives a `kill -9`/OOM/reboot. If the OS RECYCLED that pid
+#     to a peer lane's controller — the exact shape of the processes this box runs — then the pid is
+#     alive, its argv matches, and `stop` would TERM/KILL another repo's controller. A controller
+#     always writes $LOCK after it starts, so a process that BEGAN after the lock was written cannot
+#     be its owner. Unprovable age (a `ps`/`date` that cannot answer) is treated as NOT ours: an
+#     unasserted target is not ours to kill, and `seen_controller_pids` still reports it.
+lock_controller_pid() {
+  local p c t lt ps
+  p="$(tr -dc '0-9' 2>/dev/null < "$LOCK")"
+  [ -n "$p" ] || return 0
+  kill -0 "$p" 2>/dev/null || return 0
+  c="$(ps -o command= -p "$p" 2>/dev/null)" || return 0
+  # shellcheck disable=SC2086
+  set -- $c
+  [ "$#" -ge 2 ] || return 0
+  case "${1##*/}" in bash|sh|dash|zsh) ;; *) return 0 ;; esac
+  case "${2##*/}" in orch-loop.sh) ;; *) return 0 ;; esac
+  lt="$(date -r "$LOCK" +%s 2>/dev/null)" || return 0
+  [ -n "$lt" ] || return 0
+  _proc_began_after "$p" "$lt" && return 0
+  printf '%s\n' "$p"
+}
+# The ONE slack for "this process began after the record was written, so it cannot be the owner".
+# Same value as scripts/lib/pid-identity.sh:PID_START_SLACK_SECONDS; the drift arm pins the pair.
+LOCK_START_SLACK_SECONDS=5
+# Controllers this cell may SIGNAL: the lock owner, plus any process running THIS state dir's own
+# orch-loop.sh (a launcher that removed the lock). Never a $HARNESS-path match: that path is shared
+# with peer lanes on a dev box, and signalling it is the failure this scope exists to avoid.
+#
+# ⛔ rc 1 = THE PROCESS TABLE COULD NOT BE READ. Every caller must treat that as cannot-determine:
+# an empty answer is what a broken `ps` returns, and acting on it is how a live controller gets
+# reported STOPPED.
+owned_controller_pids() {
+  local a b
+  a="$(_controller_pids_path "$O/orch-loop.sh" "")" || return 1
+  b="$(lock_controller_pid)" || return 1
+  printf '%s\n%s\n' "$a" "$b" | awk 'NF && !s[$0]++'
+}
+# Every controller this cell can SEE — the signalable set plus a $HARNESS-path match. Reported, and
+# used to REFUSE a start/apply; never signalled (an unasserted target is not ours to kill).
+#
+# ⛔ THE $HARNESS LEG IS NOT AN OWNERSHIP CLAIM. HARNESS_PIN_DIR defaults to ONE directory per cell
+# home (`$CELL_HOME/harness`), so two repos on one machine pin the same harness path and this read
+# returns repo A's controller to repo B (#1856 review, reproduced). That is why `status` separates
+# OWNED from SEEN, why `stop` proves the SESSION's owner before killing it, and why only
+# `owned_controller_pids` may witness "still alive after stop".
+seen_controller_pids() {
+  local h="" a b
+  [ -n "$HARNESS" ] && h="$HARNESS/orch-loop.sh"
+  a="$(_controller_pids_path "$O/orch-loop.sh" "$h")" || return 1
+  b="$(lock_controller_pid)" || return 1
+  printf '%s\n%s\n' "$a" "$b" | awk 'NF && !s[$0]++'
+}
+# The pids in <seen> that are NOT in <owned>: a controller another repo is running from the shared
+# harness path. Reported, never signalled, never fatal.
+_pids_minus() { # <seen> <owned>
+  comm -23 <(printf '%s\n' "$1" | awk 'NF' | sort -u) <(printf '%s\n' "$2" | awk 'NF' | sort -u)
+}
+_pids_join() { printf '%s' "$1" | tr '\n' ' ' | sed 's/ *$//'; }
 # ── the QUEUE's repo and the CHECKOUT are ONE fact (agent-infra#1901) ────────────────────────────
 # MEASURED 2026-10-15 on `pi-cell-2`: harness pin `a4a1249794e7` standing in an AGENT-INFRA checkout
 # (`git -C $REPO remote get-url origin` → https://github.com/daniel-ospina/agent-infra.git) while the
@@ -1100,8 +1239,45 @@ cmd_start() {
   # Guard BEFORE seeding. $O is the controller's working copy and `start` on a live cell would
   # otherwise replace the worker scripts its next spawn executes (and race a half-copied script).
   # Nothing is started or written on this path, so a bad value below cannot hurt it.
+  #
+  # ⛔ A SESSION IS A MACHINE-SCOPED NAME (`orch`), NOT A PER-REPO ONE, and a pinned harness path is
+  # shared by every repo on this cell: "a session exists" and "something is running for this repo"
+  # are therefore different questions (#1856 review). Answer both, from the ownership read, and
+  # never bless "already running" for a repo whose controller is somebody else's.
   if tmux has-session -t "$SESSION" 2>/dev/null; then
-    say "already running (tmux session '$SESSION') — use: status | logs | stop"
+    local down seen0
+    down="$(owned_controller_pids)" \
+      || die "cannot read the process table (ps) — refusing to answer 'already running' from an unreadable read"
+    seen0="$(seen_controller_pids)" \
+      || die "cannot read the process table (ps) — refusing to answer 'already running' from an unreadable read"
+    if [ -n "$down" ]; then
+      say "already running (controller pid $(_pids_join "$down")) — use: status | logs | stop"
+      return 0
+    fi
+    # Nothing of ours holds it. Either this repo's loop has not written its lock yet (the seconds
+    # `start` spends in check/seed — report it, do not refuse), or the session belongs to ANOTHER
+    # repo sharing this cell's harness path (then it is not evidence about $OR at all).
+    if [ -z "$seen0" ]; then
+      say "already running (tmux session '$SESSION', no controller pid observed yet) — use: status | logs | stop"
+      return 0
+    fi
+    die "session '$SESSION' is held by a controller that is NOT provably this state dir's (pid $(_pids_join "$seen0"), no $LOCK owner, no $O/orch-loop.sh) — a session name is shared across repos, so it is not evidence that $OR is running; attach with: tmux attach -t $SESSION, or pin a distinct SESSION per repo in $ENV_FILE"
+  fi
+  # A controller can be running OUTSIDE the session (a leftover harness copy, or one whose lock a
+  # launcher removed). Refuse, naming it: a second controller either exits on the lock (leaving a
+  # confusing "controller exited immediately") or, with the lock gone, drains the SAME queue as the
+  # first (#1761). The read is scoped to this cell's own paths — see the ownership block above.
+  local live own
+  live="$(seen_controller_pids)" \
+    || die "cannot read the process table (ps) — refusing to start on an unreadable read"
+  own="$(owned_controller_pids)" \
+    || die "cannot read the process table (ps) — refusing to start on an unreadable read"
+  if [ -n "$live" ]; then
+    if [ -n "$own" ]; then
+      say "already running (controller pid $(_pids_join "$own")) — use: status | logs | stop"
+    else
+      say "already running (controller pid $(_pids_join "$live")) from the shared harness path — that one is not provably this state dir's; use: status | logs | stop"
+    fi
     return 0
   fi
   # ── the harness this cell will run, fixed BEFORE anything is seeded (agent-infra#1745) ────────
@@ -1245,17 +1421,110 @@ cmd_start() {
 }
 
 cmd_stop() {
-  tmux has-session -t "$SESSION" 2>/dev/null || { say "not running"; return 0; }
-  # A failed kill must NOT fall through to the lock release and a 0 exit: `stop` would report
-  # success while the controller is still running (the same "failed precondition as success" shape).
-  tmux kill-session -t "$SESSION" || die "tmux kill-session failed for '$SESSION' — the controller may still be running"
-  say "controller stopped (tmux '$SESSION')"
+  local live own p foreign
+  if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+    own="$(owned_controller_pids)" \
+      || die "cannot read the process table (ps) — refusing to report 'stopped' from an unreadable read"
+    if [ -z "$own" ]; then
+      # NOT "not running" while a $HARNESS-path controller is alive: reporting STOPPED over a live
+      # controller is the false pass this read exists to remove (#1761). Report it; do not signal an
+      # unasserted target.
+      live="$(seen_controller_pids)" \
+        || die "cannot read the process table (ps) — refusing to report 'stopped' from an unreadable read"
+      [ -z "$live" ] || die "a controller is running outside session '$SESSION' (pid $(_pids_join "$live")) and does not hold $LOCK — refusing to report 'stopped'; stop it by hand"
+      # Nothing of ours is running, but $LOCK is data on disk and outlives a kill/OOM/reboot. A lock
+      # naming a DEAD pid is left behind by exactly that, and the harness's own `acq()` then reads
+      # `kill -0` → gone → removes it, so it is only noise — but a lock naming a RECYCLED pid makes
+      # `acq()` see a live process and exit 0 SILENTLY: the next start does nothing, and no surface
+      # says why. Release the provably-dead case here and say so; a lock whose pid is alive but is
+      # not an owner is reported above and never removed (we cannot prove it is not a controller we
+      # simply cannot see).
+      if [ -f "$LOCK" ]; then
+        local lp; lp="$(tr -dc '0-9' 2>/dev/null < "$LOCK")"
+        if [ -n "$lp" ] && ! kill -0 "$lp" 2>/dev/null; then
+          rm -f "$LOCK" && say "released a stale lock $LOCK (its owner pid $lp is gone)"
+        fi
+      fi
+      say "not running"
+      return 0
+    fi
+    say "no tmux session '$SESSION', but a controller is live (pid $(_pids_join "$own")) — stopping it"
+  else
+    # ⛔ A TMUX SESSION IS A MACHINE-SCOPED NAME (`orch` by default), NOT A PER-REPO ONE. Two repos on
+    # one machine share it, so "a session with this name exists" is not evidence that THIS repo's
+    # controller is in it — and killing it on that evidence is how repo B's `stop` TERMs repo A's
+    # controller (#1856 review; measured with a tmux stub: B's stop killed A's live loop and reported
+    # success). Prove the session holds something this state dir owns BEFORE killing; otherwise
+    # report and refuse.
+    own="$(owned_controller_pids)" \
+      || die "cannot read the process table (ps) — refusing to kill a session on an unreadable read"
+    if [ -z "$own" ]; then
+      live="$(seen_controller_pids)" \
+        || die "cannot read the process table (ps) — refusing to kill a session on an unreadable read"
+      if [ -n "$live" ]; then
+        die "session '$SESSION' is held by a controller that does NOT belong to this state dir (pid $(_pids_join "$live")) — refusing to kill another repo's controller; stop it from its own state dir, or pin a distinct SESSION per repo in $ENV_FILE"
+      fi
+      die "session '$SESSION' exists but nothing in it can be proven to be this state dir's controller (no $LOCK owner, no $O/orch-loop.sh) — refusing to kill a session this state dir cannot prove it owns; inspect it with: tmux attach -t $SESSION"
+    fi
+    # A failed kill must NOT fall through to the lock release and a 0 exit: `stop` would report
+    # success while the controller is still running (the same "failed precondition as success" shape).
+    tmux kill-session -t "$SESSION" || die "tmux kill-session failed for '$SESSION' — the controller may still be running"
+    say "controller stopped (tmux '$SESSION')"
+  fi
+  # Terminate the owners this cell may signal, and PROVE they are gone BEFORE releasing the lock. A
+  # lock removed while its owner lives is #1761's duplicate: the next `start` acquires it and runs a
+  # second controller on the same queue.
+  local i=0
+  own="$(owned_controller_pids)" \
+    || die "cannot read the process table (ps) — refusing to release $LOCK on an unreadable read"
+  if [ -n "$own" ]; then
+    for p in $own; do kill "$p" 2>/dev/null || true; done
+    while [ "$i" -lt 15 ]; do
+      sleep 1; i=$((i + 1))
+      [ -z "$(owned_controller_pids)" ] && break
+    done
+    for p in $(owned_controller_pids); do kill -9 "$p" 2>/dev/null || true; done
+    sleep 1
+  fi
+  # ⛔ THE POST-KILL ASSERTION IS OVER *OWNED*, NOT *SEEN*: a peer repo's controller running from the
+  # shared harness path can never be stopped from here, so asserting on it would make this state
+  # dir's `stop` fail forever while another repo runs — the owner's second half, broken (#1856
+  # review). A leftover SEEN controller is REPORTED and left alone.
+  own="$(owned_controller_pids)" \
+    || die "cannot read the process table (ps) — NOT releasing $LOCK on an unreadable read"
+  [ -z "$own" ] || die "controller(s) still alive after stop (pid $(_pids_join "$own")) — NOT releasing $LOCK"
+  live="$(seen_controller_pids)" \
+    || die "cannot read the process table (ps) — NOT releasing $LOCK on an unreadable read"
+  foreign="$(_pids_minus "$live" "$own")"
+  [ -z "$foreign" ] || say "note: a controller for ANOTHER repo is still running from the shared harness path (pid $(_pids_join "$foreign")) — left alone"
   rm -f "$LOCK" && say "released lock $LOCK"
 }
 
 cmd_status() {
-  if tmux has-session -t "$SESSION" 2>/dev/null; then say "controller: RUNNING (tmux '$SESSION')"
-  else say "controller: STOPPED"; fi
+  local cpids own foreign
+  cpids="$(seen_controller_pids)" \
+    || die "cannot read the process table (ps) — refusing to report a controller state from an unreadable read"
+  own="$(owned_controller_pids)" \
+    || die "cannot read the process table (ps) — refusing to report a controller state from an unreadable read"
+  foreign="$(_pids_minus "${cpids:-}" "${own:-}")"
+  if [ -n "$own" ]; then
+    # Name the owner and the scope (#1761's per-box read): the answer to "which box owns this queue",
+    # from the lock and this cell's own process scope — never the tmux session alone.
+    say "controller: RUNNING (pid $(_pids_join "$own")) — scope=$SCOPE repo=$OR"
+  elif [ -n "$cpids" ]; then
+    # ⛔ SEEN BUT NOT OWNED. HARNESS_PIN_DIR is one directory per cell home, so a controller for a
+    # DIFFERENT repo on this machine runs the SAME harness path and this read returns it (#1856
+    # review, reproduced). Naming it as this state dir's owner would attribute another repo's work
+    # to this queue, so say exactly what was read and which part is not ours.
+    say "controller: RUNNING (pid $(_pids_join "$cpids")) — NOT this state dir's (another repo sharing the harness path); scope=$SCOPE repo=$OR"
+  elif tmux has-session -t "$SESSION" 2>/dev/null; then
+    # The session exists but no orch-loop.sh pid is visible yet: `start` spends seconds in
+    # check/seed before the loop execs, so report starting — NOT the false STOPPED.
+    say "controller: RUNNING (tmux '$SESSION', no orch-loop.sh pid observed yet) — scope=$SCOPE repo=$OR"
+  else
+    say "controller: STOPPED"
+  fi
+  [ -z "$foreign" ] || say "also seen:  pid $(_pids_join "$foreign") runs this machine's harness but does not hold $LOCK — another repo's controller; reported, never signalled"
   say "state dir: $O"
   # agent-infra#1901: does this cell stand where it is pointed? ONE line — the repo the queue targets,
   # the checkout it is standing in, and the remote that fact was read from. Reported, never refused:
@@ -1287,7 +1556,7 @@ cmd_logs() { tail -30 "$O/logs/orch-loop.log" 2>/dev/null || say "no log yet at 
 # taken days. It is this command, and `start` runs the same code — so it is normally not typed.
 cmd_apply() {
   validate_scope
-  local force=0 a
+  local force=0 a live=""
   for a in "$@"; do
     case "$a" in
       --force) force=1 ;;
@@ -1301,8 +1570,19 @@ cmd_apply() {
   safe_argv "${HARNESS_PIN_DIR:-}" || die "\$HARNESS_PIN_DIR must not contain a quote or shell metacharacter"
   safe_argv "${HARNESS_PIN_FILE:-}" || die "\$HARNESS_PIN_FILE must not contain a quote or shell metacharacter"
   local before_c; before_c="$(harness_commit)"
-  if tmux has-session -t "$SESSION" 2>/dev/null && [ "$force" != 1 ]; then
-    die "a controller is RUNNING (tmux '$SESSION') and apply would replace the harness tree under it — 'stop' first, or re-run with --force"
+  # Same authority as `start`/`status`: a controller outside the session still owns the harness tree
+  # this verb is about to replace, so the tmux session is not sufficient (#1761).
+  if [ "$force" != 1 ]; then
+    live="$(seen_controller_pids)" \
+      || die "cannot read the process table (ps) — refusing to replace the harness tree on an unreadable read"
+    # ⛔ THE REFUSAL IS RIGHT EVEN WHEN THE CONTROLLER IS ANOTHER REPO'S, and the message says so:
+    # the harness tree is SHARED across repos on one machine, so replacing it changes the code a peer
+    # repo's controller is running. The false-block direction is a real cost (the owner's second
+    # half), so name the pid, say it may not be yours, and give the remedy rather than implying
+    # `stop` will clear it.
+    [ -z "$live" ] || die "a controller is RUNNING (pid $(_pids_join "$live")) — possibly another repo's, from this cell's shared harness path — and apply would replace the harness tree under it; 'stop' it from its own state dir, or re-run with --force"
+    tmux has-session -t "$SESSION" 2>/dev/null \
+      && die "a controller is RUNNING (tmux '$SESSION') and apply would replace the harness tree under it — 'stop' first, or re-run with --force"
   fi
   harness_apply
   seed_and_stamp
