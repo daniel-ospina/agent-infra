@@ -85,9 +85,12 @@
 #
 # Exit codes: 0 pass completed, every class ok
 #             2 usage
-#             3 fail-closed: a delegate is missing, failed closed, or a class had no repo to scan —
-#               nothing is claimed for it (a skipped class is NEVER a pass)
+#             3 MISCONFIGURED: a delegate is missing, or a class had no repo to scan — nothing is
+#               claimed for it (a skipped class is NEVER a pass). The scheduled unit stays RED.
 #             4 a class completed but at least one removal FAILED
+#             6 a DELEGATE refused (a live uv process, an unreachable gh) — a normal busy-cell
+#               outcome; the record is still ok=0 and the supervisor still shows ⛔, but the unit
+#               is not painted red every hour for the box being busy
 #             5 dry-run only: a class reported work it would do (over budget / reapable items), so
 #               the pass is informative but the condition is still present
 #
@@ -128,6 +131,12 @@ CAND_UV=0; CAND_VENV=0; CAND_WT=0
 RC_UV=0; RC_VENV=0; RC_WT=0
 VERDICT_UV="not-run"; VERDICT_VENV="not-run"; VERDICT_WT="not-run"
 NOTE_UV=""; NOTE_VENV=""; NOTE_WT=""
+# A DELEGATE refusing (uv cache busy, gh unreachable) is a NORMAL busy-cell outcome and must not make
+# the systemd unit red every hour — that is how an alarm becomes wallpaper. The entry point refusing
+# (delegate missing, no repo) is a misconfiguration and stays exit 3. The pass exit code separates
+# them: 3 = this reaper is misconfigured, 6 = a delegate failed closed. Both are recorded `ok=0`, and
+# the supervisor shows ⛔ for both — the record, not the unit's colour, is the verdict channel.
+MISCONFIG=0
 
 say() { printf '%s\n' "$*"; }
 log() { printf '%s\n' "$*" >>"$LOG" 2>/dev/null || true; }
@@ -362,6 +371,7 @@ class_verdict() { # class_verdict <rc>
         0) printf 'ok' ;;
         4) printf 'removal-failed' ;;
         5) if is_dry; then printf 'over-bound'; else printf 'fail-closed'; fi ;;
+        6) printf 'fail-closed' ;;   # a DELEGATE refused; the entry point itself is fine
         *) printf 'fail-closed' ;;
     esac
 }
@@ -396,7 +406,7 @@ reap_uv() {
     local before after delta path would count=0 cands="" line size bound
     if [ -z "$CACHE_REAPER_PATH" ]; then
         say "disk-reaper: ⛔ class=uv FAIL-CLOSED — pi-cache-reap.sh not found (looked at \$CACHE_REAPER, \$HOME/.pi/agent/scripts, and beside this script)"
-        NOTE_UV="pi-cache-reap.sh not found"; RC_UV=3; return 3
+        NOTE_UV="pi-cache-reap.sh not found"; RC_UV=3; MISCONFIG=1; return 3
     fi
     # WHERE the cache is, and WHAT the bound is, come from the owner (`--print-config`), never from a
     # second copy of the paths here — the uv cache honours XDG_CACHE_HOME and a tuned bound must not
@@ -406,6 +416,9 @@ reap_uv() {
     before="$(free_kb_for_path "$path")"
     run_class bash "$CACHE_REAPER_PATH" "$(mode_flag)"
     RC_UV="$CLASS_RC"
+    # The cache owner exits 3 when it cannot safely bound the cache (a uv process is live). That is a
+    # REFUSAL on a busy cell, not a broken install — see MISCONFIG above.
+    if [ "$RC_UV" = 3 ]; then RC_UV=6; NOTE_UV="${NOTE_UV:-pi-cache-reap.sh refused (fail-closed)}"; fi
     after="$(free_kb_for_path "$path")"
     delta=""
     if [ -n "$before" ] && [ -n "$after" ]; then
@@ -483,11 +496,11 @@ reap_venv() {
     local before after delta repo out rc count all_c=0 cands="" rows="" freed=0 b a d
     if [ -z "$VENV_REAPER_PATH" ]; then
         say "disk-reaper: ⛔ class=venv FAIL-CLOSED — reap-lane-venvs.sh not found (agent-infra PR #1949 owns this policy)"
-        NOTE_VENV="reap-lane-venvs.sh not found"; RC_VENV=3; return 3
+        NOTE_VENV="reap-lane-venvs.sh not found"; RC_VENV=3; MISCONFIG=1; return 3
     fi
     if ! resolve_repos; then
         say "disk-reaper: ⛔ class=venv FAIL-CLOSED — no repo to scan (pass --repo PATH, or set DISK_REAPER_REPOS); a class that scans nothing is NOT a pass"
-        NOTE_VENV="no repo to scan"; RC_VENV=3; return 3
+        NOTE_VENV="no repo to scan"; RC_VENV=3; MISCONFIG=1; return 3
     fi
     # df is measured PER REPO: --repo may name paths on different filesystems, and the first repo's
     # delta would then report 0MB for gigabytes removed from another mount.
@@ -502,6 +515,7 @@ reap_venv() {
         rows="${rows}${rows:+$'\n'}$out"
         RC_VENV="$(worst_rc "$RC_VENV" "$rc")"
         [ "$rc" -gt 0 ] && NOTE_VENV="${NOTE_VENV:-reap-lane-venvs.sh exited $rc}"
+        [ "$rc" = 3 ] && rc=6
     done <<<"$REPOS"
     VERDICT_VENV="$(class_verdict "$RC_VENV")"
     if is_dry; then FREED_VENV=0; else FREED_VENV="$freed"; fi
@@ -536,11 +550,11 @@ reap_worktree() {
     local before after delta repo out rc count all_c=0 cands="" rows="" path size freed=0 b a d sweep_end swept
     if [ -z "$WORKTREE_REAPER_PATH" ]; then
         say "disk-reaper: ⛔ class=worktree FAIL-CLOSED — pi-reap-worktrees.sh not found"
-        NOTE_WT="pi-reap-worktrees.sh not found"; RC_WT=3; return 3
+        NOTE_WT="pi-reap-worktrees.sh not found"; RC_WT=3; MISCONFIG=1; return 3
     fi
     if ! resolve_repos; then
         say "disk-reaper: ⛔ class=worktree FAIL-CLOSED — no repo to scan (pass --repo PATH, or set DISK_REAPER_REPOS)"
-        NOTE_WT="no repo to scan"; RC_WT=3; return 3
+        NOTE_WT="no repo to scan"; RC_WT=3; MISCONFIG=1; return 3
     fi
     # df is measured PER REPO: --repo may span filesystems.
     while IFS= read -r repo; do
@@ -554,6 +568,7 @@ reap_worktree() {
         rows="${rows}${rows:+$'\n'}$out"
         RC_WT="$(worst_rc "$RC_WT" "$rc")"
         [ "$rc" -gt 0 ] && NOTE_WT="${NOTE_WT:-pi-reap-worktrees.sh exited $rc}"
+        [ "$rc" = 3 ] && rc=6
     done <<<"$REPOS"
     VERDICT_WT="$(class_verdict "$RC_WT")"
     if is_dry; then FREED_WT=0; else FREED_WT="$freed"; fi
@@ -621,6 +636,8 @@ for rc in "$RC_UV" "$RC_VENV" "$RC_WT"; do
         *) verdict=3 ;;
     esac
 done
+# 3 is "this reaper cannot run a class" (misconfigured); 6 is "a delegate refused" (a busy cell).
+if [ "$verdict" = 3 ] && [ "$MISCONFIG" = 0 ]; then verdict=6; fi
 if [ "$verdict" = 0 ] && is_dry \
    && { [ "$CAND_UV" -gt 0 ] || [ "$CAND_VENV" -gt 0 ] || [ "$CAND_WT" -gt 0 ]; }; then
     verdict=5

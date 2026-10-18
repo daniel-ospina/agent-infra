@@ -27,6 +27,7 @@
 #   T11 a dry run records 0 bytes freed (it removed nothing). Guard, not a pre-change failure: in an
 #       idle fixture the old code also recorded 0, because df happened not to move.
 #   T12 the installer's --dry-run changes nothing, and a SET-but-missing $DISK_REAPER is refused.
+#   T13 a DELEGATE refusal exits 6 (a busy cell); only a misconfiguration exits 3. Both record ok=0.
 #
 # PRE-CHANGE BEHAVIOUR. Each assertion below fails before this change, for the reason the section
 # names: there is no entry point at all, so `bash scripts/disk-reaper.test.sh` on the pre-change tree
@@ -282,6 +283,8 @@ assert_contains "$(cat "$T/t8/units/eldato-disk-reaper.service")" "DISK_REAPER_R
     "T8 the rendered unit carries this box's repo (the venv/worktree classes need one)"
 assert_contains "$(cat "$T/t8/calls.log")" "enable --now eldato-disk-reaper.timer" \
     "T8 the timer is ENABLED, not just written"
+assert_contains "$(cat "$T/t8/units/eldato-disk-reaper.service")" "SuccessExitStatus=0 5 6" \
+    "T8 a delegate refusal (6) is not a unit failure; a misconfiguration (3) still is"
 OUT="$(inst --install 2>&1)"
 assert_contains "$OUT" "changed=0" "T8 a second install is a no-op (the bring-up re-runs it every check)"
 OUT="$(inst --dry-run 2>&1)"
@@ -347,6 +350,21 @@ OUT="$(DISK_REAPER="$T/t12/not-here.sh" HOME="$T/t12/home" DISK_REAPER_REPOS="$R
     SYSTEMD_UNIT_DIR="$T/t12/units" SYSTEMCTL="$T/t8/bin/systemctl" SYSTEMCTL_CALLS="$T/t12/calls2.log" \
     bash "$INST" --install 2>&1)"; RC=$?
 assert_eq "$RC" "2" "T12 a SET but missing \$DISK_REAPER is refused (never a silent different copy)"
+
+# ── T13: a DELEGATE refusal is exit 6 (a busy cell), not exit 3 (a broken install) ──────────────
+# The scheduled unit must not go red every hour because a live `uv` process held the cache; the pass
+# record still says ok=0 and the supervisor still shows ⛔. Exit 3 is reserved for THIS reaper being
+# misconfigured (T5), which systemd keeps red.
+ENVNAME=t13
+REPO="$(mk_repo t13)"
+mkdir -p "$T/t13"
+printf '#!/usr/bin/env bash\necho "stub: refusing (fail-closed)"; exit 3\n' >"$T/t13/refuse.sh"
+OUT="$(VENV_REAPER="$T/t13/refuse.sh" run_reaper --apply --repo "$REPO" --only venv 2>&1)"; RC=$?
+assert_eq "$RC" "6" "T13 a delegate that fails closed gives the pass exit 6"
+assert_contains "$OUT" "verdict=fail-closed" "T13 the class still reports fail-closed"
+ST="$(cat "$T/t13/state/disk-reaper.status" 2>/dev/null || true)"
+assert_contains "$ST" "ok=0" "T13 and the pass record is NOT healthy (the supervisor shows ⛔)"
+assert_contains "$ST" "rc=6" "T13 the record keeps the refusal code"
 
 echo
 echo "──────────────────────────────────────────────────────────────────────"

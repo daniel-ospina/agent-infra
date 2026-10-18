@@ -137,9 +137,15 @@ failed/stale/never, 2 usage.
 |---|---|
 | 0 | pass completed, every selected class ok |
 | 2 | usage |
-| 3 | fail-closed: a delegate is missing, failed closed, or a class had no repo — nothing is claimed for it |
+| 3 | **misconfigured**: a delegate is missing, or a class had no repo — nothing is claimed for it |
 | 4 | a class completed but at least one removal failed (or another pass holds the lock) |
 | 5 | dry-run only: a class reported work it would do |
+| 6 | **a delegate refused** (a live `uv` process held the cache; `gh` could not answer): a normal busy-cell outcome, recorded `ok=0` |
+
+3 and 6 are deliberately different: 3 means *this reaper* cannot work, 6 means *the box was busy*.
+The scheduled unit treats 6 as success (a refusal is safe: nothing was deleted) and 3/4 as failure,
+so a busy cell does not paint `systemctl --failed` red every hour while a real misconfiguration still
+does. Either way the pass record carries the verdict, and `cloud-cell-supervisor.sh status` prints ⛔.
 
 ## Tests
 
@@ -157,6 +163,7 @@ failed/stale/never, 2 usage.
 | T10 | an `--only` list naming nothing is refused (never a healthy no-op) |
 | T11 | a dry run records 0 bytes freed (it removed nothing) |
 | T12 | the installer's `--dry-run` changes nothing; a set-but-missing `$DISK_REAPER` is refused |
+| T13 | a **delegate** refusal is exit 6 (busy cell) while a missing delegate stays 3 (misconfigured), and the record is `ok=0` either way |
 
 T9, T10 and T12 were each red on the build that preceded the fresh-context review
 that found them.

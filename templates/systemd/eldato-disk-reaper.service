@@ -31,5 +31,10 @@ Nice=10
 IOSchedulingClass=idle
 # The pass writes its own bounded log under DISK_REAPER_STATE_DIR; journald keeps the exit status.
 ExecStart=/bin/bash {{REAPER}} --apply
-# A pass that exits 3 (a class failed closed) must not look like success to `systemctl start`.
-SuccessExitStatus=0 4 5
+# A DELEGATE that fails closed exits 6 (a live uv process, an unreachable gh): that is a normal
+# busy-cell outcome, not a unit failure — marking it red hourly is how an alarm becomes wallpaper
+# (the same hazard `resolve_repos` names). Exit 3 (this reaper is misconfigured: a delegate is
+# missing, or there is no repo to scan) and 4 (a selected removal FAILED) stay red, because those
+# are not refusals. The verdict for every pass — including a 6 — is in the pass record, which
+# `cloud-cell-supervisor.sh status` prints with ⛔ when the last pass did not succeed.
+SuccessExitStatus=0 5 6
