@@ -32,8 +32,15 @@
               ProgramArguments still say dry-run — it would report itself installed
               and loaded while doing nothing, the inert-enforcer shape #1678 removed.
            2. re-run scripts/install-launchd.sh
-         The armed copy is then a dated, auditable state — re-rendered from this
+         The armed copy is then a dated, auditable state - re-rendered from this
          template on every sync, so there is no second copy to drift.
+         ⛔ EDIT IT IN THE MAIN CHECKOUT. setup.sh re-renders from the main
+         checkout's template on every sync, so an arm done in a worktree copy is
+         silently reverted at the next sync (agent-infra#1678 §2).
+         ⛔ NOTHING YET ENFORCES OWNER-NESS: a merged template edit arms every Mac
+         that installs it, because install-launchd.sh has no owner marker. That
+         gap is agent-infra#1678 requirement 3 and it is open; this template
+         ships unarmed and says so rather than pretending it is gated.
          ⛔ Do NOT "tidy" an armed install back to dry-run without the owner: the
          measured incident this job exists for (7.1GB -> 258MB free -> every
          dispatch refused) recurs as soon as nothing bounds the cache.

@@ -145,8 +145,11 @@ chmod +x "$T/bin/"*
 # recorded, because a directory RESOLUTION is not a prune.
 cat >"$T/bin/uv-noprune" <<SH
 #!/bin/sh
-if [ "\$1" = cache ] && [ "\$2" = dir ]; then exit 0; fi
-echo "prune \$* UV_CACHE_DIR=\${UV_CACHE_DIR:-unset}" >>"$T/prune.calls"
+# Only a PRUNE is recorded: `cache dir` (uv/pip) and `config get cache` (npm) are directory
+# RESOLUTIONS, not prunes, and counting them would make "was uv invoked?" unanswerable.
+if [ "\$1" = cache ] && [ "\$2" = prune ]; then
+  echo "prune \$* UV_CACHE_DIR=\${UV_CACHE_DIR:-unset}" >>"$T/prune.calls"
+fi
 exit 0
 SH
 cat >"$T/bin/uv-fail" <<'SH'
@@ -225,7 +228,9 @@ H="$T/h3"
 new_cache "$H/.cache/uv" 3000 2000
 UV_BEFORE="$(kb "$H/.cache/uv")"
 OUT="$(run_reap "$H" --dry-run 2>&1)"; RC=$?
-assert_eq "$RC" "0" "dry-run exits 0"
+assert_eq "$RC" "5" "dry-run over an over-bound cache exits 5 (checked and OVER — not 0, which a caller reads as cleared)"
+assert_contains "$OUT" "are OVER the" "the pass-end line says the cache is over bound and was NOT acted on"
+assert_not_contains "$OUT" "every present cache is under" "dry-run never claims a bound it did not enforce"
 assert_eq "$(kb "$H/.cache/uv")" "$UV_BEFORE" "dry-run deleted NOTHING"
 assert_contains "$OUT" "DRY-RUN" "dry-run says so, naming the cache over its bound"
 
@@ -235,7 +240,7 @@ H="$T/h3b"
 new_cache "$H/.cache/uv" 3000 2000
 UV_BEFORE="$(kb "$H/.cache/uv")"
 OUT="$(run_reap "$H" --dry-run CACHE_REAP_APPLY=1 2>&1)"; RC=$?
-assert_eq "$RC" "0" "an armed-by-env pass asked for --dry-run exits 0"
+assert_eq "$RC" "5" "an armed-by-env pass asked for --dry-run runs DRY and reports the over-bound state (exit 5)"
 assert_eq "$(kb "$H/.cache/uv")" "$UV_BEFORE" "CACHE_REAP_APPLY=1 did NOT turn a requested dry run into the destructive pass"
 assert_contains "$OUT" "DRY-RUN" "the pass reports the mode it actually ran"
 
@@ -462,6 +467,71 @@ assert_contains "$OUT" "bound_source=" "--print-config says WHERE the bound came
 assert_contains "$(cat "$BRINGUP")" "--print-config" "the cell's report reads the bound from the reaper, not from a second literal"
 
  echo
+echo "── 9c. a cache relocated by the tool's own env is still bounded (not 'absent') ──"
+H="$T/h9c"
+mkdir -p "$H/.cache"
+new_cache "$H/xdg/pip" 3000 2000
+OUT="$(XDG_CACHE_HOME="$H/xdg" run_reap "$H" --apply 2>&1)"; RC=$?
+assert_eq "$RC" "0" "a pip cache under XDG_CACHE_HOME is bounded and verified"
+assert_le "$(kb "$H/xdg/pip")" "$BOUND_KB" "the relocated pip cache came UNDER the bound (a \$HOME guess reports it 'absent' and exits 0)"
+assert_not_contains "$OUT" "pip $H/.cache/pip absent (nothing to bound)" "the pass did not call the real cache 'absent'"
+
+echo
+echo "── 9d. a state dir that cannot hold a lock is fail-closed, not a benign skip ──"
+H="$T/h9d"
+new_cache "$H/.cache/uv" 3000 2000
+UV_BEFORE="$(kb "$H/.cache/uv")"
+mkdir -p "$H/.pi/agent"
+printf 'not a dir\n' >"$H/.pi/agent/state"
+OUT="$(run_reap "$H" --apply 2>&1)"; RC=$?
+assert_eq "$RC" "3" "an unusable state dir exits 3 — NOT 4 (which callers read as 'another pass is running')"
+assert_eq "$(kb "$H/.cache/uv")" "$UV_BEFORE" "nothing was deleted without mutual exclusion"
+assert_contains "$OUT" "lock" "the refusal names the lock, not a phantom concurrent pass"
+
+echo
+echo "── 9e. an ARMED pass refuses to delete with no audit trail ──"
+H="$T/h9e"
+new_cache "$H/.cache/uv" 3000 2000
+UV_BEFORE="$(kb "$H/.cache/uv")"
+mkdir -p "$H/blocker"; printf 'x\n' >"$H/blocker/x.log"
+OUT="$(cd "$H" && env HOME="$H" CACHE_REAP_MAX_MB="$BOUND_MB" \
+        CACHE_REAP_LOG="$H/blocker/x.log/sub/x.log" \
+        CACHE_REAP_PS="$T/bin/ps-idle" CACHE_REAP_DF="$T/bin/df-gain" \
+        CACHE_REAP_UV="$T/bin/uv-noprune" CACHE_REAP_NPM="$T/bin/uv-noprune" \
+        CACHE_REAP_PIP="$T/bin/uv-noprune" bash "$REAPER" --apply 2>&1)"; RC=$?
+assert_eq "$RC" "3" "an armed pass with an unwritable log exits 3 (the family rule: no audit trail, no deletion)"
+assert_eq "$(kb "$H/.cache/uv")" "$UV_BEFORE" "nothing was deleted with no way to record it"
+assert_contains "$OUT" "audit trail" "the refusal names the missing audit trail"
+
+echo
+echo "── 9f. an entry starting with two dots is ENUMERATED (never silently skipped) ──"
+H="$T/h9f"
+new_cache "$H/.cache/uv" 900
+mkdir -p "$H/.cache/uv/..dots"; dd if=/dev/zero of="$H/.cache/uv/..dots/blob" bs=1024 count=3000 2>/dev/null
+OUT="$(run_reap "$H" --apply 2>&1)"; RC=$?
+assert_eq "$RC" "0" "the pass bounds the cache including a '..'-prefixed entry"
+assert_le "$(kb "$H/.cache/uv")" "$BOUND_KB" "the '..'-prefixed entry was evicted too (a plain glob misses it, so the bound could never be met)"
+
+echo
+echo "── 9g. an unreadable cache is not an ABSENT one ──"
+H="$T/h9g"
+new_cache "$H/.cache/pip" 3000
+chmod 000 "$H/.cache"
+OUT="$(run_reap "$H" --apply 2>&1)"; RC=$?
+chmod 755 "$H/.cache"
+assert_eq "$RC" "3" "a cache the pass cannot SEE exits 3 (never 'absent, nothing to bound')"
+assert_contains "$OUT" "cannot be seen" "the refusal distinguishes unreadable from absent"
+
+echo
+echo "── 9h. a symlinked entry with a newline in its name cannot forge the log ──"
+H="$T/h9h"
+new_cache "$H/.cache/uv" 3000 2000
+ln -sfn /etc/hostname "$H/.cache/uv/$(printf 'x\npi-cache-reap: npm VERIFIED evicted=999')"
+OUT="$(run_reap "$H" --apply 2>&1)"; RC=$?
+assert_eq "$RC" "3" "a name that cannot be represented fails the pass closed, symlink or not"
+assert_not_contains "$OUT" "pi-cache-reap: npm VERIFIED evicted=999" "the forged log line never reached the log"
+
+echo
 echo "── 10. wiring: a bound no box runs is the defect ──"
 assert_contains "$(sed -n 's/^fleet_srcs=(\(.*\))$/\1/p' "$SETUP")" "pi-cache-reap.sh" \
     "pi-bootstrap/setup.sh's farm declares pi-cache-reap.sh (it is the copy the boxes execute)"

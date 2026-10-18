@@ -144,11 +144,15 @@
 #   CACHE_REAP_PIP_DIR_MAC  the macOS pip cache candidate (default
 #                         $HOME/Library/Caches/pip)
 #
-# Exit codes: 0 bounded / reclaim verified / nothing to do · 2 usage (unknown argument) ·
-# 3 fail-closed (the cache could not be measured, an entry name could not be represented,
-# an entry's sharing or filesystem could not be determined, a live tool run made eviction
-# unsafe, or the reclaim could not be verified) · 4 did not run (another pass holds the
-# lock — NOT a pass, so callers must not read it as one).
+# Exit codes: 0 every present cache is under its bound (a pass that acted also verified the
+# reclaim) · 2 usage (unknown argument) · 3 fail-closed (the cache could not be measured or
+# seen, an entry name could not be represented, an entry's sharing or filesystem could not be
+# determined, a live tool run made eviction unsafe, the reclaim could not be verified, or the
+# audit log cannot be written on an armed pass) · 4 did not run (another pass holds the lock) ·
+# 5 a cache is OVER its bound and nothing was done about it (dry-run — the shipped stance).
+# ⚠️ NOT the sibling reapers' vocabulary: pi-reap-worktrees.sh uses 4 for "a removal FAILED"
+# and 3 for "lock held". Here 4 is a benign skip and 3 is always fail-closed; a fleet reader
+# must not apply the other mapping.
 # ── usage end ──
 
 set -uo pipefail
@@ -168,12 +172,17 @@ STATE_DIR="${HOME:-}/.pi/agent/state"
 LOG="${CACHE_REAP_LOG:-$STATE_DIR/pi-cache-reap.log}"
 LOG_MAX_BYTES="${CACHE_REAP_LOG_MAX_BYTES:-1048576}"
 LOCK_DIR="${CACHE_REAP_LOCK:-$STATE_DIR/pi-cache-reap.lock}"
-LOCK_STALE_SECONDS="${CACHE_REAP_LOCK_STALE_SECONDS:-3600}"
+# Half the hourly trigger period, like the sibling reapers (REAP_WT_LOCK_STALE_SECONDS=1800)
+#: a bound equal to the interval lets the next tick break a pass that is still running.
+LOCK_STALE_SECONDS="${CACHE_REAP_LOCK_STALE_SECONDS:-1800}"
 
 MODE=dry-run
 MODE_SET=0
 PRINT_CONFIG=0
 FAILS=0
+# Caches found OVER their bound on a pass that is not armed. Exit 5, so a caller can tell
+# "checked and over" from "checked and fine" (0) and from "did not run" (4).
+OVER_ONLY=0
 LOCK_HELD=0
 TMPLIST=""
 TMPLIST2=""
@@ -408,7 +417,9 @@ shared_file_in() {
 # link since then must not be unlinked here either.
 remove_entry() {
     local e="$1"
-    find "$e" -xdev \( -type f -o -type l \) -links 1 -delete 2>/dev/null || true
+    # `! -type d` (files, links, FIFOs, sockets), not `-type f -o -type l`: a fifo or socket with
+    # another name would otherwise survive and pin the entry forever, leaving the bound unmeetable.
+    find "$e" -xdev ! -type d -links 1 -delete 2>/dev/null || true
     find "$e" -xdev -depth -type d -empty -delete 2>/dev/null || true
     [ ! -e "$e" ]
 }
@@ -423,23 +434,31 @@ remove_entry() {
 entries_by_size() {
     local dir="$1" out="$2" e kb
     : >"$TMPLIST"
-    for e in "$dir"/* "$dir"/.[!.]*; do
-        [ -e "$e" ] || continue
-        [ -L "$e" ] && { plog "pi-cache-reap:   skip symlinked entry $e"; continue; }
+    # ⛔ `find -print0` + `read -d ''`, NOT a glob and NOT `find -print`:
+    #   * the shell globs `"$dir"/* "$dir"/.[!.]*` MISS a name beginning with two dots
+    #     (`..x`, `...`), which then never reaches the record, never gets logged, and can never
+    #     be evicted — so the bound becomes unmeetable for that cache and the verdict's "after
+    #     evicting every removable entry" is a claim the pass did not test (measured).
+    #   * `find -print` cannot carry a NEWLINE in a name: it would arrive as two records.
+    while IFS= read -r -d '' e; do
         # ⛔ A TAB or NEWLINE in an entry name FORGES a record in this file. Measured: a cache
         # entry named $'evil\n999999\t<name>' produced a second record that sorted FIRST, and
         # the eviction loop deleted a cwd-relative `<name>` OUTSIDE the cache. Any process that
         # can write into the cache (a build backend, a postinstall script) can plant such a name,
         # and the deletion happens later, unattended. Refuse the whole cache instead: a name that
-        # cannot be represented in the record must not be acted on.
+        # cannot be represented in the record must not be acted on, and (because the log is the
+        # only audit trail) must not be written to the log either — which is why this check runs
+        # BEFORE the symlink skip.
         case "$e" in
             *"$TAB"*|*"
-"*) plog "pi-cache-reap:   entry name is not representable in the eviction list (tab/newline) — refusing to act on $dir"
+"*) plog "pi-cache-reap:   an entry name is not representable in the eviction list (tab/newline) — refusing to act on $dir"
                 return 1 ;;
         esac
+        [ -L "$e" ] && { plog "pi-cache-reap:   skip symlinked entry $e"; continue; }
+        [ -e "$e" ] || continue
         kb="$(kb_of "$e")" || { plog "pi-cache-reap:   cannot measure entry $e — refusing to size it as 0"; return 1; }
         printf '%s\t%s\n' "$kb" "$e" >>"$TMPLIST"
-    done
+    done < <(find "$dir" -mindepth 1 -maxdepth 1 -print0 2>/dev/null)
     sort -rn -k1,1 "$TMPLIST" >"$out"
     return 0
 }
@@ -449,13 +468,22 @@ reap_target() {
     local class="$1" dir="$2" before_kb before_free_kb now_kb new_kb after_kb after_free_kb
     local pruned=none evicted=0 kb e cur_free holders dir_holders held_entries="" keep_entries=""
     local no_gain_stop=0 no_gain=0 last_free="" claimed_kb gained_kb min_gain_kb stop_note=""
-    local dev_rc share_rc fresh_holders free_str
+    local dev_rc share_rc fresh_holders free_str parent
 
     case "$dir" in
         /*) ;;
         *) fail_closed "$class: cache dir '$dir' is not an absolute path — refusing to measure or touch it"; return 0 ;;
     esac
-    if [ ! -e "$dir" ]; then
+    if [ ! -e "$dir" ] && [ ! -L "$dir" ]; then
+        # ⛔ `-e` is false when an ANCESTOR denies search permission, so an existing, over-bound,
+        # unreadable cache used to be reported as "absent (nothing to bound)" and the pass exited 0
+        # — a pass on an unverified claim, which the contract forbids. Absent is only absent when
+        # the parent is actually searchable.
+        parent="$(dirname "$dir")"
+        if [ -d "$parent" ] && [ ! -x "$parent" ]; then
+            fail_closed "$class: $dir cannot be seen (the parent $parent is not searchable) — an unreadable cache is NOT an absent one"
+            return 0
+        fi
         say "pi-cache-reap: $class $dir absent (nothing to bound)"
         return 0
     fi
@@ -472,6 +500,7 @@ reap_target() {
     fi
 
     if [ "$MODE" != "apply" ]; then
+        OVER_ONLY=$((OVER_ONLY + 1))
         say "pi-cache-reap: DRY-RUN $class $dir $(mb_str "$before_kb") > ${MAX_MB}MB bound — would prune, then evict the largest entries while no $class process holds the cache (re-run with --apply)"
         return 0
     fi
@@ -654,7 +683,13 @@ lock_release() {
 }
 lock_acquire() {
     local owner started now age mtime
-    mkdir -p "$(dirname "$LOCK_DIR")" 2>/dev/null || true
+    # rc 3 when the lock cannot exist at all (unusable state dir): that is fail-closed, NOT a
+    # benign "another pass holds it". Suppressing this made an unwritable state dir look like a
+    # skip forever — the reaper never ran and every surface reported success-by-silence.
+    if ! mkdir -p "$(dirname "$LOCK_DIR")" 2>/dev/null; then
+        printf '%s\n' "pi-cache-reap: cannot create the lock directory ($(dirname "$LOCK_DIR")) — refusing to run without mutual exclusion (exit 3)" >&2
+        return 3
+    fi
     if [ -d "$LOCK_DIR" ]; then
         owner="$(cat "$LOCK_DIR/owner" 2>/dev/null || printf '')"
         started="$(cat "$LOCK_DIR/started" 2>/dev/null || printf '')"
@@ -672,7 +707,11 @@ lock_acquire() {
             fi
         fi
         [ -n "$age" ] || age=0
-        if is_pos_int "$owner" && kill -0 "$owner" 2>/dev/null && [ "$age" -lt "$LOCK_STALE_SECONDS" ]; then
+        # ⛔ A LIVE owner is never broken, however old the lock is: the age bound exists for a
+        # pass that died without releasing, not for one that is still running (a multi-GB cache
+        # can outlast the trigger period, and breaking it re-creates the double-pass this lock
+        # exists to prevent). Only an unverifiable owner is subject to the age bound.
+        if is_pos_int "$owner" && kill -0 "$owner" 2>/dev/null; then
             say "pi-cache-reap: another pass is running (pid $owner, ${age}s) — this one does not run ($ISSUE_REF)"
             return 1
         fi
@@ -697,6 +736,11 @@ lock_acquire() {
         rmdir "$LOCK_DIR.break" 2>/dev/null || true
     fi
     if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+        # Could not create the lock although nobody holds it: an unusable state dir, not a race.
+        if [ ! -d "$LOCK_DIR" ]; then
+            printf '%s\n' "pi-cache-reap: cannot create the lock at $LOCK_DIR — refusing to run without mutual exclusion (exit 3)" >&2
+            return 3
+        fi
         say "pi-cache-reap: lock raced with another pass — this one does not run"
         return 1
     fi
@@ -729,7 +773,15 @@ if [ "$MODE_SET" -eq 0 ] && [ "${CACHE_REAP_APPLY:-0}" = "1" ]; then MODE=apply;
 # the launchd job captures no stderr, so a typo'd CACHE_REAP_MAX_MB would otherwise mint
 # an hourly timer that is dead and invisible.
 if [ -n "$LOG" ]; then
-    mkdir -p "$(dirname "$LOG")" 2>/dev/null || LOG=""
+    if ! mkdir -p "$(dirname "$LOG")" 2>/dev/null || ! : >>"$LOG" 2>/dev/null; then
+        # The family rule: a reaper that deletes with no audit trail is indistinguishable from
+        # one that did nothing. Dry-run may proceed loudly on stderr; an ARMED pass may not run.
+        if [ "$MODE" = apply ]; then
+            printf '%s\n' "pi-cache-reap: cannot write the pass log ($LOG) — refusing to delete with no audit trail (exit 3)" >&2
+            exit 3
+        fi
+        LOG=""
+    fi
 fi
 
 case "${MAX_MB:-}" in
@@ -746,10 +798,12 @@ case "$MIN_RECLAIM_PCT" in ''|*[!0-9]*) MIN_RECLAIM_PCT=50 ;; esac
 [ "$MIN_RECLAIM_PCT" -le 100 ] || MIN_RECLAIM_PCT=100
 
 # ── the sinks (uv, npm, pip — the same class of machine-global sink) ─────────
-# uv's OWN answer is authoritative: `uv cache dir` honours XDG_CACHE_HOME and the tool's
-# own resolution. A hardcoded `$HOME/.cache/uv` bounded a directory uv may not even use
-# (measured: with XDG_CACHE_HOME set, uv's cache is $XDG_CACHE_HOME/uv — the old path
-# reported "absent" and the pass exited 0 while 2.9MB sat over bound at the real one).
+# EVERY sink is resolved from its OWNING TOOL's answer, not from a `$HOME` guess. A guessed
+# path bounds a directory the tool may not use, and the failure is silent: the pass reports
+# "absent (nothing to bound)", exits 0, and the real cache stays over bound. Measured for uv
+# (XDG_CACHE_HOME set → uv's cache is $XDG_CACHE_HOME/uv), and the same hole existed for pip
+# (XDG_CACHE_HOME) and npm (NPM_CONFIG_CACHE / .npmrc `cache=`) until they were resolved too.
+# Each falls back to the documented location when the tool is absent or answers nothing.
 resolve_uv_dir() {
     local d
     if [ -n "${CACHE_REAP_UV_DIR:-}" ]; then printf '%s' "$CACHE_REAP_UV_DIR"; return 0; fi
@@ -757,12 +811,36 @@ resolve_uv_dir() {
         d="$("$UV_BIN" cache dir 2>/dev/null)"
         case "${d:-}" in /*) printf '%s' "$d"; return 0 ;; esac
     fi
-    printf '%s' "${UV_CACHE_DIR:-${HOME:-}/.cache/uv}"
+    printf '%s' "${UV_CACHE_DIR:-${XDG_CACHE_HOME:-${HOME:-}/.cache}/uv}"
+}
+
+# npm answers with the cache ROOT; the directory this script bounds is its `_cacache` child
+# (prune_cache already special-cases that basename).
+resolve_npm_dir() {
+    local d
+    if [ -n "${CACHE_REAP_NPM_DIR:-}" ]; then printf '%s' "$CACHE_REAP_NPM_DIR"; return 0; fi
+    if command -v "$NPM_BIN" >/dev/null 2>&1; then
+        d="$("$NPM_BIN" config get cache 2>/dev/null | tail -1)"
+        case "${d:-}" in /*) printf '%s' "$d/_cacache"; return 0 ;; esac
+    fi
+    printf '%s' "${HOME:-}/.npm/_cacache"
+}
+
+# `pip cache dir` also resolves the macOS ~/Library/Caches/pip case, which the separate
+# PIPD_MAC probe below keeps as a second candidate for an older pip.
+resolve_pip_dir() {
+    local d
+    if [ -n "${CACHE_REAP_PIP_DIR:-}" ]; then printf '%s' "$CACHE_REAP_PIP_DIR"; return 0; fi
+    if command -v "$PIP_BIN" >/dev/null 2>&1; then
+        d="$("$PIP_BIN" cache dir 2>/dev/null)"
+        case "${d:-}" in /*) printf '%s' "$d"; return 0 ;; esac
+    fi
+    printf '%s' "${XDG_CACHE_HOME:-${HOME:-}/.cache}/pip"
 }
 
 UVD="$(resolve_uv_dir)"
-NPMD="${CACHE_REAP_NPM_DIR:-${HOME:-}/.npm/_cacache}"
-PIPD="${CACHE_REAP_PIP_DIR:-${HOME:-}/.cache/pip}"
+NPMD="$(resolve_npm_dir)"
+PIPD="$(resolve_pip_dir)"
 PIPD_MAC="${CACHE_REAP_PIP_DIR_MAC:-${HOME:-}/Library/Caches/pip}"
 
 # --print-config: the ONE place that knows the paths and the bound. The bring-up report
@@ -785,9 +863,12 @@ TMPLIST2="$(mktemp "${TMPDIR:-/tmp}/pi-cache-reap.XXXXXX")" || { printf '%s: can
 # "cache bound not enforced" record on 0; a pass that never ran must neither clear it nor
 # set it, or a launchd pass holding the lock makes the cell's hourly clock erase a real
 # failure it did not re-measure.
-if ! lock_acquire; then
-    exit 4
-fi
+lock_acquire; LOCK_RC=$?
+case "$LOCK_RC" in
+    0) ;;
+    3) exit 3 ;;   # the lock cannot exist: fail closed, never a silent skip
+    *) exit 4 ;;   # another pass holds it: did not run
+esac
 trap 'cleanup; lock_release' EXIT
 
 say "pi-cache-reap: pass start mode=$MODE max=${MAX_MB}MB per cache ($ISSUE_REF)"
@@ -803,5 +884,13 @@ if [ "$FAILS" -gt 0 ]; then
     say "pi-cache-reap: FAILED — $FAILS cache(s) could not be bounded or verified this pass (exit 3)"
     exit 3
 fi
-say "pi-cache-reap: pass end — every present cache bounded and verified"
+# ⛔ THE PASS-END LINE MUST NOT CLAIM A BOUND THE PASS DID NOT ENFORCE. On the shipped dry-run
+# stance an over-bound cache used to print "every present cache bounded and verified" and exit 0
+# — and the cell's clock reads 0 as "the bound was cleared", so the incident state (cache over
+# bound, reaper unarmed) was indistinguishable from a healthy one on every surface.
+if [ "$OVER_ONLY" -gt 0 ]; then
+    say "pi-cache-reap: pass end mode=$MODE — $OVER_ONLY cache(s) are OVER the ${MAX_MB}MB bound and were NOT acted on (dry-run: arming is an owner step, agent-infra#1678)"
+    exit 5
+fi
+say "pi-cache-reap: pass end mode=$MODE — every present cache is under the ${MAX_MB}MB bound"
 exit 0

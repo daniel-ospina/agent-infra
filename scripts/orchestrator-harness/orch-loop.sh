@@ -1064,16 +1064,18 @@ while true; do
     touch "$O/state/.cache-reaped"
     _cache_reaper="${CACHE_REAPER:-${HOME:-}/.pi/agent/scripts/pi-cache-reap.sh}"
     if [ -f "$_cache_reaper" ]; then
-      # ⛔ `&` discards the exit status, and that status is the reaper's ONLY signal for six
-      # distinct refusals (the class the ⛔ further down this file records for the refresh:
+      # ⛔ `&` discards the exit status, and that status is the reaper's ONLY signal (the class the
+      # ⛔ further down this file records for the refresh:
       # "a refresh that aborts EVERY cycle reads as a healthy cell"). Record a non-zero pass where
       # `status` prints it, and clear it on the next clean one.
       (
         bash "$_cache_reaper" --dry-run >>"$LOG" 2>&1
         _rc=$?
         case "$_rc" in
-          0) rm -f "$O/state/.cache-reap-blocked" ;;   # a real pass cleared the bound
+          0) rm -f "$O/state/.cache-reap-blocked" ;;   # checked: every cache is under its bound
           4) : ;;                                      # did not run (lock held) — touch nothing
+          5) { printf 'a package cache is OVER its bound and the reaper is not armed (dry-run):\n';
+               tail -3 "$LOG" 2>/dev/null; } >"$O/state/.cache-reap-blocked" 2>/dev/null || true ;;
           *) { printf 'cache reaper exit %s at %s\n' "$_rc" "$(date -u +%Y-%m-%dT%H:%M:%SZ)";
                tail -2 "$LOG" 2>/dev/null; } >"$O/state/.cache-reap-blocked" 2>/dev/null || true ;;
         esac

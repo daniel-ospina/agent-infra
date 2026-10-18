@@ -270,7 +270,7 @@ assert_contains "$(cat "$PRUNE_INSTALLED")" "agent-infra-plist-version: 0.1.0" "
 # COMMITTED stance; they are not a gate.
 assert_contains "$(cat "$CACHE_REAP_INSTALLED")" "$HOME1/.pi/agent/scripts/pi-cache-reap.sh" "cache-reap plist rendered with fake HOME (farmed path)"
 assert_contains "$(cat "$CACHE_REAP_INSTALLED")" "<string>--dry-run</string>" "cache-reap plist SHIPS DRY-RUN (#1987 / #1678 arming ruling)"
-assert_not_contains "$(cat "$CACHE_REAP_INSTALLED")" "<string>--apply</string>" "cache-reap plist is NOT armed by a lane"
+assert_not_contains "$(cat "$CACHE_REAP_INSTALLED")" "<string>--apply</string>" "the committed cache-reap template ships unarmed"
 assert_contains "$(cat "$CACHE_REAP_INSTALLED")" "<key>CACHE_REAP_MAX_MB</key>" "cache-reap plist pins the size bound in the plist, not the shell"
 assert_contains "$(cat "$CACHE_REAP_INSTALLED")" "<string>2048</string>" "cache-reap plist pins the bound's VALUE (a key-only assert passes on a typo that mints a dead timer)"
 assert_contains "$(cat "$CACHE_REAP_INSTALLED")" "<integer>3600</integer>" "cache-reap job hourly (StartInterval 3600)"

@@ -1368,9 +1368,10 @@ reap_global_caches() {
   fi
   rc=0
   bash "$reaper" --apply || rc=$?
-  # 4 = it did not run (another pass holds the lock): neither a success nor a failure, and warning
-  # about it would train the reader to ignore the one line that matters.
-  [ "$rc" -eq 0 ] || [ "$rc" -eq 4 ] || say "warn: the cache reaper exited $rc — see ${CACHE_REAP_LOG:-$HOME/.pi/agent/state/pi-cache-reap.log}"
+  # 4 = it did not run (another pass holds the lock); 5 = a cache is over its bound, which cannot
+  # happen on this --apply path but is neutral by design. Neither is a failure, and warning about
+  # them would train the reader to ignore the one line that matters.
+  [ "$rc" -eq 0 ] || [ "$rc" -eq 4 ] || [ "$rc" -eq 5 ] || say "warn: the cache reaper exited $rc — see ${CACHE_REAP_LOG:-$HOME/.pi/agent/state/pi-cache-reap.log}"
   return 0
 }
 
