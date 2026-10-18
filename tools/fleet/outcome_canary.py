@@ -805,6 +805,25 @@ def check_controller_cycling(f, c):
                  "is attempted (this is the ONLY state that respawns).")
 
     # ── launchd claims a pid but nothing in the process table matches it ─────────────────────
+    # ⛔ THE CENSUS IS SCOPED, SO ITS ZERO IS NOT "nothing is running". It rejects any argv that is not
+    # exactly `<shell> <this cell's orch-loop.sh>` — a controller started as `nice -n 5 /bin/bash
+    # …/orch-loop.sh`, or with one extra argument, lands in `near_misses`. Turning that zero into
+    # FAIL/LAUNCHD_PID_UNRESOLVED asserted "no such process exists" over a census that had just
+    # REJECTED a controller-shaped row, and this variant is a RESPAWN TRIGGER: `kickstart -k` then ran
+    # against a live controller, killing a cycle mid-flight. When the census rejected a row that names
+    # this cell's controller, the honest answer is that the process table does not resolve it.
+    near = ctrl.get("near_misses") or []
+    near_ours = [r for r in near
+                 if isinstance(r, dict) and "orch-loop.sh" in str(r.get("cmd") or "")]
+    if not pids and launchd.get("pid") is not None and near_ours:
+        return V("controller_cycling", INCONCLUSIVE, "CENSUS_NEAR_MISS",
+                 "processes matching THIS cell's orch-loop.sh: 0\n"
+                 "REJECTED rows that NAME the controller: %s\n"
+                 "launchd %s: %s\n%s" % (_near_txt(ctrl), lc, lc_txt, log_txt),
+                 "the SCOPED census matched nothing, but it REJECTED a process whose command names "
+                 "this cell's orch-loop.sh — so 'no such process exists' is not established, and a "
+                 "canary that respawns on an unestablished absence can kill a live controller. Not "
+                 "green, and NOT a respawn trigger.")
     if not pids and launchd.get("pid") is not None:
         return V("controller_cycling", FAIL, "LAUNCHD_PID_UNRESOLVED",
                  "processes matching THIS cell's orch-loop.sh: 0\n"
@@ -1431,12 +1450,22 @@ def check_work_dispatched(f, c):
         return V("work_dispatched", PASS, "IDLE_EMPTY_POOL", evidence,
                  "nothing was dispatched because the pool was read as genuinely EMPTY — the one "
                  "shape where 'no dispatch' is the correct outcome.")
-    if isinstance(pool, int) and pool >= c.pool_threshold:
+    # ⛔ THE PAIR COMES FROM ONE RECORD. `pool` is the graded token's (possibly the NEWER
+    # state/queue-state) while `backlog` is the header's, so comparing them compared two refreshes and
+    # reported the difference as a defect "upstream (queue_readable owns it)" — a defect
+    # `queue_readable`'s own `EMPTY_WITH_LARGE_POOL` arm can never report, because it deliberately
+    # pairs the pool with ITS OWN header. Use the header's own pair here, and say only what it shows.
+    _pair = parse_queue_token(hdr.get("queue_token") or "") if hdr else {}
+    if isinstance(_pair.get("pool"), int) and _pair.get("pool") >= c.pool_threshold \
+            and backlog == 0 and not superseded_backlog:
         return V("work_dispatched", INCONCLUSIVE, "NO_CANDIDATES",
-                 evidence + "\npool=%d (above threshold %d) but backlog=0" % (pool, c.pool_threshold),
-                 "the pool held %d issue(s) and the backlog was empty, so there was nothing to "
-                 "dispatch: the defect is upstream (queue_readable owns it), and 'no work "
-                 "dispatched' cannot be graded from here. Not green." % pool)
+                 evidence + "\nheader pair: pool=%d (above threshold %d) beside backlog=0"
+                 % (_pair.get("pool"), c.pool_threshold),
+                 "the header's OWN pair shows %d candidates in the pool beside an empty dispatch "
+                 "backlog, and nothing was dispatched: whether that is a refresh that lost its "
+                 "backlog or a backlog that was genuinely empty one refresh ago cannot be told from "
+                 "here, so 'no work dispatched' is not graded as correct OR as a failure. Not green."
+                 % _pair.get("pool"))
     return V("work_dispatched", INCONCLUSIVE, "NO_WORK_EVIDENCE", evidence,
              "no dispatch line and no positive evidence that dispatchable work existed. Not green.")
 
@@ -1524,6 +1553,14 @@ def _gh_surface_txt(gh):
     # surface did not disclose itself.
     txt = ("surface: %s%s" % (src, (" (%s)" % note) if note else "")) if src \
         else "surface: not disclosed by this payload"
+    # ⛔ THE DIAGNOSTIC WAS IN HAND AND DISCARDED. `_collect_rest` records WHY each PR went unprobed
+    # (`detail_errors`: a 403 on `pulls/<n>`, a truncated check-runs page, an unreadable commit), and
+    # nothing read the field — so a report could say "UNPROBED: [7, 9]" while the reason sat in the
+    # facts. "Beyond rest_probe_max", "the detail call 403'd" and "this page was truncated" are
+    # different failures with different fixes.
+    errs = gh.get("detail_errors") or []
+    if errs:
+        txt += "\nprobe failures (up to 5): %s" % "; ".join(str(e) for e in errs[:5])
     # ⛔ WHICH READ PRODUCED THE MERGE COUNT IS PART OF THE EVIDENCE. The merge count comes from a
     # separate, merge-ordered read; when that read FAILED the count falls back to a creation-ordered
     # page and the bound is admitted. `merged_surface`/`fallback_note` were written by the collector
@@ -1856,22 +1893,27 @@ def rollup_state(rollup):
     CLEAN, APPROVED, UNARMED PR was reported as known-not-landable `:red` inside a PASS block. The
     VERDICT is unchanged (an in-flight PR is not landable yet); only the claim made about it is.
     """
-    if not isinstance(rollup, list):
+    if not isinstance(rollup, list) or not rollup:
         return None
-    if not rollup:
-        return None
-    entries = []
+    attempts = {}
     for pos, chk in enumerate(rollup):
         if not isinstance(chk, dict):
             return None
-        entries.append((_check_rank(chk, pos), chk))
-    if any(_in_flight(chk) for _r, chk in entries):
-        return "inflight"
-    _rank, chk = max(entries, key=lambda e: e[0])
-    concl = _check_conclusion(chk)
-    if concl is None:
-        return "inflight"
-    return "green" if concl in GREEN_CONCLUSIONS else "red"
+        attempts.setdefault(_check_key(chk), []).append((_check_rank(chk, pos), chk))
+    worst = "green"
+    for _key, entries in attempts.items():
+        # ⛔ GROUPED, exactly like `rollup_is_green`: the newest attempt PER CHECK decides that check.
+        # An ungrouped max() let a newer green attempt of a DIFFERENT workflow mask a red one, so the
+        # two functions disagreed on the same rollup — two verdict functions, one of them wrong.
+        if any(_in_flight(chk) for _r, chk in entries):
+            return "inflight" if worst == "green" else worst
+        _rank, chk = max(entries, key=lambda e: e[0])
+        concl = _check_conclusion(chk)
+        if concl is None:
+            return "inflight" if worst == "green" else worst
+        if concl not in GREEN_CONCLUSIONS:
+            worst = "red"
+    return worst
 
 
 def rollup_is_green(rollup):
@@ -1896,39 +1938,13 @@ def rollup_is_green(rollup):
     is RED. A missing check is not a green check — and an EMPTY/absent rollup is not "not green"
     either: it is `None`, meaning NO CHECK SURFACE WAS READ.
     """
-    if not rollup:
-        # ⛔ `None`, NOT False. "No check surface at all" — a path-filtered workflow, a fork PR
-        # awaiting approval, a repo with no required checks — is a MISSING READ. Grading it False
-        # dropped that PR out of `landers` entirely (a `False` `checks_green` is skipped by the
-        # candidate filter while `probed: True` kept it out of `unprobed`), so a CLEAN, APPROVED,
-        # UNARMED PR produced PASS/NOTHING_GREEN and exit 0 — the exact silent expiry this check
-        # exists for. `None` makes the collectors mark it UNPROBED, which reaches
-        # PARTIAL_POPULATION. `_collect_rest` has always required `checks_green is not None`.
-        return None
-    attempts = {}
-    for pos, chk in enumerate(rollup):
-        # ⛔ AN UNREADABLE ENTRY IS NOT A RED CHECK. `False` here is a POSITIVE claim ("this PR's CI
-        # is red") made about an entry that could not be parsed, and `check_landers` then reports the
-        # PR as "red" among the known-not-landable skips — so a green, approved, UNARMED PR produced
-        # PASS/NOTHING_GREEN and exit 0, which is the silent expiry this check exists to catch. An
-        # unreadable ENTRY abstains exactly like an unreadable SURFACE (`if not rollup: return None`).
-        if not isinstance(chk, dict):
-            return None
-        attempts.setdefault(_check_key(chk), []).append((_check_rank(chk, pos), chk))
-    for _key, entries in attempts.items():
-        # ⛔ AN ATTEMPT IN FLIGHT MAKES ITS CHECK UNKNOWN, whatever the ordering says: a re-run that
-        # has not concluded is not evidence that the previous attempt's verdict still stands, and a
-        # queued attempt carries no timestamp at all (so an ordering alone would rank it LAST).
-        if any(_in_flight(chk) for _r, chk in entries):
-            return False
-        _rank, chk = max(entries, key=lambda e: e[0])
-        concl = _check_conclusion(chk)
-        if concl is None:
-            # queued / in progress / no conclusion yet: NOT green (in flight is not a pass)
-            return False
-        if concl not in GREEN_CONCLUSIONS:
-            return False
-    return True
+    # ⛔ ONE GRADING IMPLEMENTATION. This function is the BOOLEAN PROJECTION of `rollup_state`, which
+    # holds the grouping and the polarity; a second copy of that logic is how an in-flight check was
+    # graded red here while `rollup_state` (added later) answered "inflight" for the same rollup.
+    state = rollup_state(rollup)
+    if state is None:
+        return None          # no check surface read at all — a MISSING READ, not a verdict
+    return state == "green"
 
 
 RE_ACTIONS_RUN = re.compile(r"/actions/runs/(\d+)")
@@ -2096,7 +2112,7 @@ def check_landers(f, c):
     stale_log = ((_decisions(events.get("armed")) | _decisions(events.get("railed")))
                  - (armed_log | railed_log))
 
-    candidates, unprobed, skipped = [], [], []
+    candidates, unprobed, skipped, unprobed_reasons = [], [], [], []
     for pr in prs:
         if pr.get("draft"):
             # ⛔ COUNTED like every other known skip. A draft was dropped with no line at all, so the
@@ -2113,6 +2129,8 @@ def check_landers(f, c):
         if (pr.get("probed") is not True or green is None
                 or (mss not in MERGEABLE_STATES and mss not in KNOWN_NON_MERGEABLE)):
             unprobed.append(pr.get("number"))
+            if pr.get("unprobed_reason"):
+                unprobed_reasons.append("%s: %s" % (pr.get("number"), pr.get("unprobed_reason")))
             continue
         if mss not in MERGEABLE_STATES:
             # A KNOWN non-mergeable state is skipped — but COUNTED and printed, or `landers` reads
@@ -2160,7 +2178,8 @@ def check_landers(f, c):
                      "open PRs: %d, unprobed (never read: no check surface, a failed probe, "
                      "mergeability unknown, or beyond the probe bound): %s\n%s\n%s%s"
                      % (len(prs), unprobed, _gh_surface_txt(gh), _prs_brief(prs),
-                        ("\n" + skip_txt) if skip_txt else ""),
+                        ("\nwhy (from the payload): %s" % "; ".join(unprobed_reasons[:8]))
+                        if unprobed_reasons else ""),
                      "%d open PR(s) could not be probed (the REST fallback is bounded), so "
                      "'every green PR has an armed lander' is not established over the whole "
                      "population. Not green." % len(unprobed))
@@ -2205,6 +2224,8 @@ def check_landers(f, c):
         # expiring on a PR nobody looked at.
         ev.append("UNPROBED (never read: no check surface, mergeability unknown, or beyond the "
                   "probe bound): %s" % unprobed)
+        if unprobed_reasons:
+            ev.append("why (from the payload): %s" % "; ".join(unprobed_reasons[:8]))
     if expired:
         ev.append("ARMED IN THE LOG, NOT ARMED IN GITHUB (expired): %s" % sorted(expired))
     if missing:
@@ -2727,6 +2748,12 @@ def attempt_respawn(v, cfg, machine, dry_run=False, plist=None, uid=None, poll_d
                          "action, so a live controller cannot be ruled out — an unreadable read is "
                          "NOT absence (%s)" % (before.get("error") or "no error recorded"))
         return res
+    if before.get("near_miss"):
+        res["attempted"] = False
+        res["detail"] = ("NOT ATTEMPTED: the re-measure REJECTED a process whose command names this "
+                         "cell's orch-loop.sh — the scoped census cannot resolve it, so a live "
+                         "controller cannot be ruled out")
+        return res
     if before.get("pids_ok") is not True:
         res["attempted"] = False
         res["detail"] = ("NOT ATTEMPTED: the re-measure returned no `pids` LIST (ok=%r), so a live "
@@ -2809,8 +2836,14 @@ def _controller_fingerprint(machine, cfg):
     # abstain exactly like every other read in this file.
     # `pids_ok` carries WHICH read produced the list: `attempt_respawn` refuses on it, so an absent
     # process list at the moment of action cannot present as "nothing is running".
+    near = snap.get("near_misses") or []
     return {"ok": snap.get("ok") is True,
             "pids_ok": isinstance(snap.get("pids"), list),
+            # ⛔ THE CENSUS IS SCOPED, SO ITS EMPTY `pids` DOES NOT PROVE ABSENCE. A row the scope
+            # REJECTED while naming this cell's controller is a live controller the census could not
+            # resolve, and `kickstart -k` on it kills a cycle in flight.
+            "near_miss": any(isinstance(r, dict) and "orch-loop.sh" in str(r.get("cmd") or "")
+                             for r in near),
             "pids": [p.get("pid") for p in snap.get("pids") or []
                      if isinstance(p, dict)] if isinstance(snap.get("pids"), list) else [],
             "mtime": log.get("mtime"),
@@ -3316,20 +3349,30 @@ def _collect_graphql(gh, repo, cfg, now, errors):
         # the bound, and silence about it is how it becomes reachable.
         if rollup_truncated(rollup):
             green = None
+            state = None
         else:
             green = rollup_is_green(rollup)
+            state = rollup_state(rollup)
         rows.append({
             "number": p.get("number"),
             "merge_state_status": mss,
             "auto_armed": p.get("autoMergeRequest") is not None,
             "draft": bool(p.get("isDraft")),
             "checks_green": green,
+            # WHICH not-green: a concluded red or an attempt still in flight. `landers` labels the
+            # skip from this, so an in-flight check cannot be reported as "red".
+            "checks_state": state,
             "review_decision": p.get("reviewDecision"),
             # ⛔ `probed` is NOT mergeability alone. Deriving it from `mergeStateStatus` while a
             # `None` rollup read answered "not green" put such a PR in NEITHER `candidates` NOR
             # `unprobed`: `landers` then spoke for a PR it never read, in the silencing direction.
             "probed": green is not None and mss not in MERGEABILITY_UNKNOWN,
         })
+        if not rows[-1]["probed"]:
+            rows[-1]["unprobed_reason"] = ("rollup truncated at its page bound"
+                                           if rollup_truncated(rollup)
+                                           else "no check surface read" if green is None
+                                           else "mergeability unknown (%r)" % (mss,))
     out["open_prs"] = rows
     out["ok"] = True
     return out
@@ -3374,16 +3417,20 @@ def _collect_rest(gh, repo, cfg, now, errors):
         num = p.get("number")
         row = {"number": num, "draft": bool(p.get("draft")),
                "auto_armed": p.get("auto_merge") is not None,
-               "merge_state_status": None, "checks_green": None, "review_decision": None,
-               "probed": False}
+               "merge_state_status": None, "checks_green": None, "checks_state": None,
+               "review_decision": None, "probed": False}
         if row["draft"] or i >= probe_max:
             unprobed += 1
+            row["unprobed_reason"] = ("DRAFT" if row["draft"]
+                                      else "beyond rest_probe_max=%d (position %d)"
+                                      % (probe_max, i + 1))
             rows.append(row)
             continue
         rc, txt = _run_gh([gh, "api", "repos/%s/pulls/%s" % (repo, num)])
         det = _json_obj(txt) if rc == 0 else None
         if det is None:
             detail_errors.append("pulls/%s rc=%s" % (num, rc))
+            row["unprobed_reason"] = "pulls/%s rc=%s" % (num, rc)
             rows.append(row)
             continue
         # ⛔ NORMALISE AT THE COLLECTOR BOUNDARY, and treat "not known yet" as UNPROBED.
@@ -3414,6 +3461,10 @@ def _collect_rest(gh, repo, cfg, now, errors):
                 detail_errors.append("commits/%s/check-runs rc=%s" % (sha[:8], rc2))
         row["probed"] = (row["checks_green"] is not None
                          and row["merge_state_status"] not in MERGEABILITY_UNKNOWN)
+        if not row["probed"]:
+            row["unprobed_reason"] = ("no check surface read" if row["checks_green"] is None
+                                      else "mergeability unknown (%r)"
+                                      % (row["merge_state_status"],))
         rows.append(row)
     out["open_prs"] = rows
     out["unprobed"] = unprobed
@@ -3617,7 +3668,16 @@ def run_static(paths, only=None):
     rows, mism, skipped = [], [], []
     for path in paths:
         fx = load_fixture(path)
-        cfg = cfg_from_dict(fx.get("config"))
+        try:
+            cfg = cfg_from_dict(fx.get("config"))
+        except (ValueError, TypeError) as exc:
+            # ⛔ A BROKEN INPUT IS A USAGE ERROR (exit 3), NOT A FAILED CHECK (exit 1). `Cfg` coerces
+            # its numerics, so a hand-edited or half-written fixture (`{"pool_threshold": "many"}`)
+            # raised ValueError straight out of `run_static`; `main`'s `except FixtureError` never saw
+            # it, the traceback exited 1, and a scheduler read "at least one check FAILed" about a
+            # fleet that was never evaluated.
+            raise FixtureError("%s: unreadable `config` (%s: %s)"
+                               % (path, type(exc).__name__, exc))
         verdicts = evaluate(fx["facts"], cfg, only=only)
         expect = fx.get("_expect") or {}
         got = dict((v.name, v.status) for v in verdicts)

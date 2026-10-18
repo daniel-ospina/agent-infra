@@ -227,8 +227,8 @@ shape changes, and it is pruned with the rest of its check.
 ## The suite
 
 ```bash
-python3 tools/fleet/outcome_canary.test.py              # 155 tests
-python3 tools/fleet/outcome_canary.test.py --mutations  # 152 mutations, each must go RED
+python3 tools/fleet/outcome_canary.test.py              # 161 tests
+python3 tools/fleet/outcome_canary.test.py --mutations  # 158 mutations, each must go RED
 ```
 
 The signal tests drive the **real CLI** end-to-end (`--live --facts … --capture-dir …`), so what is
@@ -363,6 +363,29 @@ Six more (cycle 13), each a case where a datum the tool held was not the one it 
   not a pass, so the PR is not landable yet) and is labelled `:inflight`, not `:red`: the verdict is
   the same, the CLAIM is true. `rollup_state()` is that three-way read; `rollup_is_green()` is the
   boolean projection the collectors use.
+- **A rejected controller row is not an absent controller.** The controller census is scoped to
+  exactly `<shell> <this cell's orch-loop.sh>`, so a controller started as `nice -n 5 /bin/bash
+  …/orch-loop.sh` lands in `near_misses`. The launchd arm turned that zero into
+  `FAIL / LAUNCHD_PID_UNRESOLVED` — "no such process exists" — and that variant is a RESPAWN TRIGGER,
+  so `kickstart -k` killed a live controller mid-cycle while the log, the header and the heartbeat all
+  said it was working. A rejected row that NAMES this cell's controller is
+  `INCONCLUSIVE / CENSUS_NEAR_MISS`; the action path's re-measure refuses on the same evidence, and a
+  near miss naming a DIFFERENT script still leaves the real absence fireable.
+- **`rollup_state()` is the ONE rollup read.** `rollup_is_green()` is its boolean projection, so the
+  two cannot drift — before that, the state read did not group attempts and answered "green" for a
+  red check masked by a newer green attempt of another workflow. The collectors also write
+  `checks_state`, which is what `landers` prints (`7:inflight` vs `7:red`).
+- **A malformed fixture `config` is a USAGE error (exit 3).** `Cfg` coerces its numerics, so
+  `{"pool_threshold": "many"}` raised `ValueError` straight out of `run_static`; the traceback exited
+  1, which a scheduler reads as "at least one check FAILed" about a fleet that was never evaluated.
+- **The probe FAILURES reach the report.** The REST collector has always recorded WHY a PR went
+  unprobed (`detail_errors`, per-row `unprobed_reason`); nothing read them, so "beyond
+  `rest_probe_max`", "the detail call 403'd" and "this page was truncated" — three different failures
+  with three different fixes — were indistinguishable in a report that listed only PR numbers.
+- **`NO_CANDIDATES` uses the header's OWN pair.** It compared the graded token's pool (possibly the
+  NEWER `state/queue-state`) with the header's one-refresh-old backlog and called the difference a
+  defect "upstream (queue_readable owns it)" — which `queue_readable`'s arm can never report, because
+  it deliberately pairs the pool with its own header.
 - **A superseded `backlog=` cannot grade "work existed and did not move".** The header's `backlog=`
   and `queue=` are one refresh old, so when the newer `state/queue-state` reads the pool EMPTY the
   header's remaining candidates are already gone. `work_dispatched` graded them anyway, producing —

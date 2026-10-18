@@ -781,6 +781,10 @@ def test_a_PR_with_NO_check_surface_is_UNPROBED_not_dropped_from_the_lander_popu
     m = load()
     assert m.rollup_is_green([]) is None          # NO SURFACE READ — not "red", not "green"
     assert m.rollup_is_green(None) is None
+    # …and the direction that matters for the population: a READ, green surface stays green. Without
+    # this line a "no surface ⇒ red" mutant survives, because every other assertion here is satisfied
+    # by a function that answers False/None and never True.
+    assert m.rollup_is_green([{"conclusion": "SUCCESS"}]) is True
     assert m.rollup_is_green([{"conclusion": "FAILURE"}]) is False
 
     real = m._run_gh
@@ -2445,6 +2449,163 @@ def test_an_UNKNOWN_probe_in_skip_is_a_usage_error_not_a_silent_no_op():
 
 
 @test
+def test_a_REJECTED_controller_row_is_not_an_ABSENT_controller():
+    """The census is SCOPED to exactly `<shell> <this cell's orch-loop.sh>`, so a controller started as
+    `nice -n 5 /bin/bash …/orch-loop.sh` lands in `near_misses`. The launchd arm turned that zero into
+    FAIL/LAUNCHD_PID_UNRESOLVED — "no such process exists" — and that variant is a RESPAWN TRIGGER, so
+    `launchctl kickstart -k` killed a live controller mid-cycle while three liveness signals (advancing
+    log, fresh header, fresh heartbeat) said it was working."""
+    m = load()
+    cfg = m.cfg_from_dict({})
+    d = fx("healthy")
+    d["facts"]["controller"] = {
+        "ok": True, "pids": [], "launchd": {"loaded": True, "pid": 4242},
+        "near_misses": [{"pid": 4242, "cmd": "nice -n 5 /bin/bash /O/orch-loop.sh"}]}
+    v = [x for x in m.evaluate(d["facts"], cfg) if x.name == "controller_cycling"][0]
+    assert (v.status, v.variant) == (m.INCONCLUSIVE, "CENSUS_NEAR_MISS"), (v.status, v.variant,
+                                                                            v.evidence)
+    assert v.variant not in m.RESPAWN_TRIGGERS, v.variant
+    assert "nice -n 5" in v.evidence, v.evidence
+    # …a near miss that names a DIFFERENT script does not rescue the arm
+    d["facts"]["controller"]["near_misses"] = [{"pid": 99, "cmd": "/bin/bash /O/other.sh"}]
+    v2 = [x for x in m.evaluate(d["facts"], cfg) if x.name == "controller_cycling"][0]
+    assert (v2.status, v2.variant) == (m.FAIL, "LAUNCHD_PID_UNRESOLVED"), (v2.status, v2.variant)
+
+
+@test
+def test_the_RESPAWN_action_refuses_when_the_census_REJECTED_a_controller_shaped_row():
+    """The action's own re-measure read the same scoped census, so the live-but-near-missed controller
+    was invisible twice and `kickstart -k` ran anyway."""
+    m = load()
+
+    class NearMiss(object):
+        remote = False
+        box = "local"
+
+        def __init__(self):
+            self.ran = []
+
+        def snapshot_controller(self):
+            return {"ok": True, "pids": [],
+                    "near_misses": [{"pid": 4242, "cmd": "env X=1 /bin/bash /O/orch-loop.sh"}]}
+
+        def log_stat(self):
+            return {"exists": True, "mtime": 1000, "age_s": 5.0}
+
+        def sh_argv(self, argv, timeout=None):
+            self.ran.append(argv)
+            return 0, ""
+
+    fm = NearMiss()
+    v = m.V("controller_cycling", m.FAIL, "CONTROLLER_ABSENT", "e")
+    rr = m.attempt_respawn(v, m.Cfg(), fm, dry_run=False, poll_deadline_s=0.1)
+    assert rr["attempted"] is False, rr
+    assert "orch-loop.sh" in rr["detail"], rr["detail"]
+    assert fm.ran == [], "no launchctl command may run when the census rejected a controller row"
+
+
+@test
+def test_the_two_rollup_reads_agree_and_are_GROUPED():
+    """`rollup_state` (added for the `:inflight` label) did not group, so ONE red check was masked by a
+    newer green attempt of a DIFFERENT workflow and the two functions disagreed on the same rollup:
+    `rollup_is_green` said red, `rollup_state` said green."""
+    m = load()
+
+    def run(**kw):
+        e = {"__typename": "CheckRun", "status": "COMPLETED"}
+        e.update(kw)
+        return e
+
+    red_old = run(name="changes", workflowName="CI", conclusion="FAILURE",
+                  startedAt="2026-10-18T10:00:00Z")
+    green_new = run(name="changes", workflowName="Python CI", conclusion="SUCCESS",
+                    startedAt="2026-10-18T11:00:00Z")
+    assert m.rollup_state([red_old, green_new]) == "red"
+    assert m.rollup_is_green([red_old, green_new]) is False
+    # one check's own re-run still resolves to its newest attempt
+    rerun = run(name="ci", workflowName="CI", conclusion="SUCCESS",
+                startedAt="2026-10-18T11:00:00Z")
+    first = run(name="ci", workflowName="CI", conclusion="FAILURE",
+                startedAt="2026-10-18T10:00:00Z")
+    assert m.rollup_state([rerun, first]) == "green"
+    # and the two never disagree, whatever the mix
+    mixed = [[], None, [rerun], [first], [red_old, green_new], [rerun, {"name": "x"}]]
+    for i, roll in enumerate(mixed):
+        st = m.rollup_state(roll)
+        gr = m.rollup_is_green(roll)
+        assert gr == (None if st is None else st == "green"), (i, roll, st, gr)
+
+
+@test
+def test_the_collectors_PRODUCE_the_label_landers_prints():
+    """The cycle-26 `:inflight` label read `pr["checks_state"]` — a field NO collector wrote, so the
+    shipped CLI still printed `:red` and `rollup_state` was dead code."""
+    m = load()
+    cfg = m.cfg_from_dict({"repo": "o/r"})
+    green = {"__typename": "CheckRun", "name": "ci", "workflowName": "CI", "status": "COMPLETED",
+             "conclusion": "SUCCESS"}
+    inflight = {"__typename": "CheckRun", "name": "ci2", "workflowName": "CI",
+                "status": "IN_PROGRESS"}
+    real = m._run_gh
+
+    def fake(argv):
+        j = " ".join(argv)
+        if "--json" in j or "pr list" in j:
+            return 0, json.dumps([{"number": 7, "mergeStateStatus": "CLEAN",
+                                   "autoMergeRequest": None, "isDraft": False,
+                                   "reviewDecision": "APPROVED",
+                                   "statusCheckRollup": [green, inflight]}])
+        return 0, "[]"
+
+    try:
+        m._run_gh = fake
+        gh = m.collect_github("o/r", cfg)
+    finally:
+        m._run_gh = real
+    assert gh["ok"] is True, gh
+    row = (gh.get("open_prs") or [])[0]
+    assert row["checks_state"] == "inflight", row
+    v = m.check_landers({"github": dict(gh, open_pr_count=len(gh["open_prs"]))}, cfg)
+    assert "7:inflight" in v.evidence, v.evidence
+    assert "7:red" not in v.evidence, v.evidence
+
+
+@test
+def test_a_MALFORMED_fixture_config_is_a_USAGE_error_not_a_failed_check():
+    """`Cfg` coerces its numerics, so a half-written fixture raised ValueError straight out of
+    `run_static`; `main`'s `except FixtureError` never saw it and the traceback exited 1 — which a
+    scheduler reads as "at least one check FAILed" about a fleet that was never evaluated."""
+    m = load()
+    d = tempfile.mkdtemp(prefix="oc-badcfg-")
+    path = os.path.join(d, "bad.json")
+    with open(path, "w") as fh:
+        json.dump({"config": {"pool_threshold": "many"}, "facts": {}, "_expect": {}}, fh)
+    rc, out, err = run_cli(["--static", "--fixture", path])
+    assert rc == 3, (rc, out[-300:], err[-300:])
+    assert "unreadable `config`" in err, err[-300:]
+
+
+@test
+def test_the_probe_FAILURES_reach_the_report():
+    """`_collect_rest` recorded WHY each PR went unprobed and nothing read the field, so a report could
+    say `UNPROBED: [7]` while "beyond the probe bound", "the detail call 403'd" and "this page was
+    truncated" — three different failures with three different fixes — sat unread in the facts."""
+    m = load()
+    gh = {"ok": True, "source": "rest",
+          "detail_errors": ["pulls/7 rc=403", "check-runs TRUNCATED (100)"],
+          "open_prs": [{"number": 7, "probed": False, "draft": False,
+                        "unprobed_reason": "pulls/7 rc=403", "checks_green": None,
+                        "merge_state_status": "CLEAN", "auto_armed": False,
+                        "review_decision": "APPROVED"}],
+          "open_pr_count": 1}
+    v = m.check_landers({"github": gh}, m.cfg_from_dict({"repo": "o/r"}))
+    assert v.variant == "PARTIAL_POPULATION", (v.status, v.variant)
+    assert "pulls/7 rc=403" in v.evidence, v.evidence
+    assert "probe failures" in v.evidence, v.evidence
+    assert "why (from the payload)" in v.evidence, v.evidence
+
+
+@test
 def test_a_SUPERSEDED_backlog_cannot_grade_work_as_NOT_dispatched():
     """The header's `backlog=` is ONE refresh old. When the newer `state/queue-state` reads the pool
     EMPTY, the header's 47 remaining candidates are already gone — but `work_dispatched` still graded
@@ -4023,6 +4184,31 @@ def test_source_never_contains_a_forbidden_launchctl_form():
 
 MUTATIONS = [
     # (label, old, new, paired test)
+    # ── cycle-27 defects ──────────────────────────────────────────────────────────────────
+    ("a rejected controller row is graded as an absent controller",
+     "    if not pids and launchd.get(\"pid\") is not None and near_ours:",
+     "    if False:",
+     "test_a_REJECTED_controller_row_is_not_an_ABSENT_controller"),
+    ("the respawn re-measure ignores a rejected controller row",
+     '    if before.get("near_miss"):',
+     "    if False:",
+     "test_the_RESPAWN_action_refuses_when_the_census_REJECTED_a_controller_shaped_row"),
+    ("the rollup state read does not group attempts",
+     "        attempts.setdefault(_check_key(chk), []).append((_check_rank(chk, pos), chk))\n    worst = \"green\"",
+     "        attempts.setdefault(pos, []).append((_check_rank(chk, pos), chk))\n    worst = \"green\"",
+     "test_the_two_rollup_reads_agree_and_are_GROUPED"),
+    ("the graphql collector never records the rollup state",
+     '            "checks_state": state,',
+     '            "checks_state": None,',
+     "test_the_collectors_PRODUCE_the_label_landers_prints"),
+    ("a malformed fixture config exits with the FAIL code",
+     '        except (ValueError, TypeError) as exc:',
+     "        except ZeroDivisionError as exc:",
+     "test_a_MALFORMED_fixture_config_is_a_USAGE_error_not_a_failed_check"),
+    ("the probe failure detail never reaches the report",
+     "    errs = gh.get(\"detail_errors\") or []",
+     "    errs = []",
+     "test_the_probe_FAILURES_reach_the_report"),
     # ── cycle-26 defects ──────────────────────────────────────────────────────────────────
     ("a superseded header backlog still grades a FAIL",
      '    superseded_backlog = (pool_kind == "EMPTY" and _tok_src == "state/queue-state" and stale is None)',
@@ -4037,8 +4223,8 @@ MUTATIONS = [
      '    if _src == "state/queue-state" and kind == "EMPTY":',
      "test_an_UNAGED_EMPTY_record_cannot_manufacture_idleness_either"),
     ("an in-flight rollup is reported as a red conclusion",
-     '    if any(_in_flight(chk) for _r, chk in entries):\n        return "inflight"',
-     '    if any(_in_flight(chk) for _r, chk in entries):\n        return "red"',
+     '        if any(_in_flight(chk) for _r, chk in entries):\n            return "inflight" if worst == "green" else worst',
+     '        if any(_in_flight(chk) for _r, chk in entries):\n            return "red" if worst == "green" else worst',
      "test_an_IN_FLIGHT_check_is_labelled_inflight_not_RED"),
     # ── cycle-25 defects ──────────────────────────────────────────────────────────────────
     ("an absent pids key is graded as an empty process table",
@@ -4312,8 +4498,8 @@ MUTATIONS = [
      "test_static_refuses_a_PARTIAL_expectation_and_a_MISSING_fixture"),
     # ── cycle-11 defects ────────────────────────────────────────────────────────────
     ("an unread check surface is graded RED, so a green unarmed PR drops out of the population",
-     "    if not rollup:\n        # \u26d4 `None`, NOT False.",
-     "    if not rollup:\n        return False\n        # \u26d4 `None`, NOT False.",
+     "    state = rollup_state(rollup)\n    if state is None:",
+     "    state = 'red' if rollup else None\n    if state is None:",
      "test_a_PR_with_NO_check_surface_is_UNPROBED_not_dropped_from_the_lander_population"),
     ("the pane census counts any process whose command line MENTIONS the daemon",
      '        is_daemon = (base0 == name\n'
