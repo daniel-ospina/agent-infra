@@ -1997,6 +1997,16 @@ pred "$P2_TRUE" && ok "registry: ACCEPTS a real 'bash …/orch-loop.sh' invocati
                 || bad "registry: rejected a genuine controller invocation"
 pred "$P2_FAKE" && bad "registry: accepted a NON-controller ('bash -c …; /abs/orch-loop.sh') as the lock owner — the supervisor says STOPPED for it" \
                 || ok "registry: REJECTS the bash -c shape the supervisor also rejects (one rule, both surfaces)"
+# ⛔ AND NOT A SUPERSET: `${2##*/}` = `orch-loop.sh` is the whole rule. An arm that accepted any path
+# ENDING in `orch-loop.sh` claimed `/abs/foo-orch-loop.sh` — a non-controller — while the supervisor
+# answered STOPPED for it (#1856 review).
+printf '#!/bin/bash\nsleep 30\n' > "$P2R/foo-orch-loop.sh"
+bash "$P2R/foo-orch-loop.sh" & P2_LOOK=$!
+AI1761_PIDS="${AI1761_PIDS:-} $P2_LOOK"
+sleep 0.4
+pred "$P2_LOOK" && bad "registry: accepted '/abs/foo-orch-loop.sh' — a path only ENDING in the script name, which the supervisor rejects" \
+              || ok "registry: REJECTS a basename that merely ends in 'orch-loop.sh' (not a superset of the supervisor)"
+kill -9 "$P2_LOOK" 2>/dev/null; wait "$P2_LOOK" 2>/dev/null
 kill -9 "$P2_TRUE" "$P2_FAKE" 2>/dev/null; wait "$P2_TRUE" "$P2_FAKE" 2>/dev/null
 
 # ── §(q) AN UNDATABLE PID IS NOT AN OWNER, AND "SEEN" IS NOT "ALREADY RUNNING" (#1856 review) ───

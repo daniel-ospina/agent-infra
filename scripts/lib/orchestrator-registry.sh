@@ -206,12 +206,17 @@ registry_pid_is_controller() {
   # later `start` was refused until a human edited the record (#1856 review; the shipped supervisor
   # answered STOPPED for the same pid). Two contracts for one safety rule is the #1178 defect.
   #
-  # The one deliberate widening: `ps -o command=` does not quote, so a state dir containing a space
-  # (`/tmp/my cell/orchestrator`) splits argv[2] and its basename never equals `orch-loop.sh`. An
-  # ABSOLUTE path ending in the script name is accepted in argv[2] position only — a `bash -c` script
-  # word is not an absolute path, so the false positive above cannot come back through it.
+  # `${2##*/}` already accepts every absolute path whose BASENAME is exactly `orch-loop.sh` — which
+  # is exactly the supervisor's rule — so nothing else is needed. A looser arm (`/?*orch-loop.sh`,
+  # any path ENDING in those characters) is a strict SUPERSET: it accepts `/abs/foo-orch-loop.sh`,
+  # a non-controller, and the two surfaces then disagree again (measured: the registry claimed a pid
+  # the supervisor reported STOPPED for). Do not re-add it (#1856 review).
   case "${2##*/}" in orch-loop.sh) return 0 ;; esac
-  case "${2:-}" in /?*orch-loop.sh) return 0 ;; esac
+  # NOT handled on purpose: a state dir containing a space (`/tmp/my cell/o`) splits argv[2] in
+  # `ps -o command=`, which does not quote, so no token equals the script name. That is refused
+  # UPSTREAM — the supervisor's `safe_argv` rejects a space in $O before it starts anything, and the
+  # harness applies the same guard — so this predicate does not try to reassemble a split path. If
+  # that upstream guard is ever relaxed, BOTH copies must learn the same reassembly together.
   return 1
 }
 
