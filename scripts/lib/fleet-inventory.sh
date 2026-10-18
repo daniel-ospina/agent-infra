@@ -116,17 +116,26 @@ FLEET_PS="${FLEET_PS:-ps}"
 FLEET_PLUTIL="${FLEET_PLUTIL:-plutil}"
 FLEET_TMUX="${FLEET_TMUX:-tmux}"
 FLEET_UID="${FLEET_UID:-$(id -u 2>/dev/null || printf '0')}"
-# The controller's freshness bound. `orch-loop.sh`'s own target is ~9 min per cycle plus its sleep;
-# three cycles of silence is the point at which "alive" stops meaning "working".
+# The controller's freshness bound. `orch-loop.sh` sleeps `CYC` (240s default, minus a jitter share,
+# plus each cycle's own work), so 1800 s of silence is many cycles — the point at which "alive" stops
+# meaning "working". Deliberately stated as "many cycles" rather than a cycle COUNT: a cycle's work is
+# unbounded, so any precise multiple would be a number nothing pins.
 FLEET_CONTROLLER_LATE_S="${FLEET_CONTROLLER_LATE_S:-1800}"
-# The heartbeat loop's bound: three passes of the same ~9-11 min clock.
+# The heartbeat loop's bound: ~45 min, about FIVE passes of the loop's own ~9 min total-pass budget
+# (`TARGET=540`, and the sleep is target-minus-elapsed — not a fixed interval added on top). NOT three
+# passes (that is the controller's 1800 s), and not the "9-11 min pass" figure `cadence-timer.sh`'s
+# header still quotes from the design that predated the total-pass budget.
 FLEET_HEARTBEAT_LATE_S="${FLEET_HEARTBEAT_LATE_S:-2700}"
 # The cadence timer's bound: its own default interval is 450s (CADENCE_TIMER_INTERVAL), and a
 # delivered message is what it exists to produce. Four intervals of silence is late, not merely slow.
 FLEET_CADENCE_LATE_S="${FLEET_CADENCE_LATE_S:-1800}"
-# A lander's bound. `chain-merge.sh` waits at most 90 min for a PR to exist and then runs the
-# merge; 150 min is that wait plus the merge's own bound. A waiter past it is the EXPIRED state the
-# owner observed parking green PRs, not a slow one.
+# A lander's bound. `chain-merge.sh` waits at most 90 min for a PR to exist and then runs the merge.
+# 150 min is a PLANNING ALLOCATION on top of that wait, not the sum of two named bounds: the merge
+# path's own tail (`merge-one.sh`'s 1800 s review bound plus the rail's re-run fail-safe) is not
+# bounded by the remaining 60 min, so a busy chain-merge can outlive this row and read EXPIRED. That
+# direction is deliberate — over-reporting a busy lander costs a look, while under-reporting is the
+# parked-green-PR state this row exists for.
+# A waiter past it is the EXPIRED state the owner observed parking green PRs, not a slow one.
 FLEET_LANDER_BOUND_S="${FLEET_LANDER_BOUND_S:-9000}"
 # Set by `fleet_start_component` to WHAT IT DID, so a caller cannot print "started" for a no-op (cycle-3
 # review: the verb said "already running, left alone" and the caller then printed "started heartbeat-loop").

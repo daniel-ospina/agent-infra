@@ -65,6 +65,13 @@
 #   (w) delete a pidfile naming a live copy at ANOTHER PATH (no basename proof) → §9q(b) only (start
 #       manufactured a duplicate, then read OK over two live loops)
 #   (x) refuse the repair entirely                                         → §9q (2 arms)
+#   (y) hard-code the heartbeat loop's bound instead of reading
+#       `FLEET_HEARTBEAT_LATE_S`                                           → §9t's LATE arm only
+#   (z) hard-code the cadence row's bound instead of reading
+#       `FLEET_CADENCE_LATE_S`                                             → §9t's LATE arm only
+#   (aa) drop `+ $FLEET_JOB_SLACK_S` from the launchd freshness bound       → §9t's job-slack OK arm
+#   (ab) hard-code the controller's bound instead of reading
+#       `FLEET_CONTROLLER_LATE_S`                                           → §9t's controller LATE arm
 # A red in a section the mutation does not name means the arm is coupled to the wrong behaviour —
 # e.g. (b) reddening §2 would mean §2 is asserting the controller's duplicate logic.
 
@@ -1147,6 +1154,79 @@ esac
 [ "$SRC" = 2 ] && ok "§9s …and the exit code is 2 (cannot determine), not 1 or 0" \
                || bad "§9s an abstaining read must exit 2, got $SRC"
 kill9 "$CPL"
+
+# §9t (#2026) THE LIVENESS BOUNDS §9t OWNS ARE PINNED BY NAME, IN BOTH DIRECTIONS.
+# `FLEET_HEARTBEAT_LATE_S` is the one term the stall-term registry's reverse scan can SEE (its name
+# carries the HEARTBEAT token); `FLEET_CONTROLLER_LATE_S`, `FLEET_CADENCE_LATE_S` and
+# `FLEET_JOB_SLACK_S` carry no family token, so they are registered as out-of-family — and a term
+# registered that way must cite a test that actually names it (the registry's guardedBy-attribution
+# assertion). (`FLEET_LANDER_BOUND_S` is the fifth registered term; §9e flips it.) More to the point, a bound with
+# no arm is a bound a future edit can delete silently: the LATE arms above use `touch -t` far in the
+# past, which trips ANY bound, so none of them distinguishes the bound's VALUE from luck. These arms
+# move only the named seam, so the row can only flip because the bound moved.
+say_case "§9t the heartbeat, controller, cadence and job-slack bounds each flip the row when only THAT seam moves"
+seed_quiet_box
+mk_proc_script "$SCRIPTS/heartbeat-loop.sh"
+HL2="$(spawn_component "$SCRIPTS/heartbeat-loop.sh")"; printf '%s\n' "$HL2" > "$STATE/heartbeat-loop.pid"
+printf '%s\n' "$(date +%s)" > "$STATE/orchestrator-heartbeat.log"
+sleep 2.2                                     # the log is now ~2 s old, and readable as such
+ROWS="$(run_rows 'FLEET_HEARTBEAT_LATE_S=1; fleet_rows ""')"
+st="$(state_of "$ROWS" heartbeat-loop)"
+[ "$st" = "LATE" ] && ok "§9t FLEET_HEARTBEAT_LATE_S=1 makes a ~2 s old log LATE (the bound is read, not decoration)" \
+                    || bad "§9t a 2 s old log under a 1 s bound should read LATE, got [$st]"
+ROWS="$(run_rows 'FLEET_HEARTBEAT_LATE_S=9000; fleet_rows ""')"
+st="$(state_of "$ROWS" heartbeat-loop)"
+[ "$st" = "OK" ] && ok "§9t …and FLEET_HEARTBEAT_LATE_S=9000 reads the SAME log OK (so the arm cannot pass by always LATE)" \
+                 || bad "§9t a 2 s old log under a 9000 s bound should read OK, got [$st]"
+kill9 "$HL2"; rm -f "$STATE/heartbeat-loop.pid"
+# The controller's bound is read straight off `$O/heartbeat`, so the seam is moved the same way. This
+# one had NO seam arm at all before: §9f trips it with `touch -t 202001010000`, which would stay LATE
+# under any bound, so a hard-coded 1800 passed every arm.
+seed_quiet_box
+mk_proc_script "$O/orch-loop.sh"
+CL2="$(spawn_component "$O/orch-loop.sh")"; printf '%s\n' "$CL2" > "$O/.orch.lock"
+printf '%s\n' "$(date +%s)" > "$O/heartbeat"
+sleep 2.2
+ROWS="$(run_rows 'FLEET_CONTROLLER_LATE_S=1; fleet_rows ""')"
+st="$(state_of "$ROWS" controller)"
+[ "$st" = "LATE" ] && ok "§9t FLEET_CONTROLLER_LATE_S=1 makes a ~2 s old heartbeat LATE" \
+                    || bad "§9t a 2 s old controller heartbeat under a 1 s bound should read LATE, got [$st]"
+ROWS="$(run_rows 'FLEET_CONTROLLER_LATE_S=9000; fleet_rows ""')"
+st="$(state_of "$ROWS" controller)"
+[ "$st" = "OK" ] && ok "§9t …and FLEET_CONTROLLER_LATE_S=9000 reads the same heartbeat OK" \
+                 || bad "§9t a 2 s old controller heartbeat under a 9000 s bound should read OK, got [$st]"
+kill9 "$CL2"; rm -f "$O/.orch.lock"
+seed_quiet_box
+mk_proc_script "$SCRIPTS/cadence-timer.sh"
+CT2="$(spawn_component "$SCRIPTS/cadence-timer.sh")"; printf '%s\n' "$CT2" > "$STATE/cadence-timer.pid"
+printf '%s\n' "$(date +%s)" > "$STATE/cadence-timer.beat"
+sleep 2.2
+ROWS="$(run_rows 'FLEET_CADENCE_LATE_S=1; fleet_rows ""')"
+st="$(state_of "$ROWS" cadence-timer)"
+[ "$st" = "LATE" ] && ok "§9t FLEET_CADENCE_LATE_S=1 makes a ~2 s old beacon LATE" \
+                    || bad "§9t a 2 s old beacon under a 1 s bound should read LATE, got [$st]"
+ROWS="$(run_rows 'FLEET_CADENCE_LATE_S=9000; fleet_rows ""')"
+st="$(state_of "$ROWS" cadence-timer)"
+[ "$st" = "OK" ] && ok "§9t …and FLEET_CADENCE_LATE_S=9000 reads the same beacon OK" \
+                 || bad "§9t a 2 s old beacon under a 9000 s bound should read OK, got [$st]"
+kill9 "$CT2"; rm -f "$STATE/cadence-timer.pid"
+seed_quiet_box
+# A job's own freshness bound is `2 × its StartInterval + FLEET_JOB_SLACK_S`. With a 1 s interval the
+# base bound is 2 s, so a ~3 s old log is LATE at slack 0 and OK at the shipped-magnitude slack — the
+# slack is the ONLY thing that moved between the two readings.
+mk_plist "com.tortoise.worktree-reaper" 1 ""
+printf 'PID\tStatus\tLabel\n-\t0\tcom.tortoise.worktree-reaper\n' > "$LC_LIST"
+: > "$STATE/pi-reap-worktrees.log"
+sleep 3.2
+ROWS="$(run_rows 'FLEET_JOB_SLACK_S=0; fleet_rows ""')"
+st="$(state_of "$ROWS" reaper.worktree-reaper)"
+[ "$st" = "LATE" ] && ok "§9t FLEET_JOB_SLACK_S=0 makes a 3 s old log LATE against a 2 s derived bound" \
+                    || bad "§9t a 3 s old log under a 2 s bound should read LATE, got [$st]"
+ROWS="$(run_rows 'FLEET_JOB_SLACK_S=300; fleet_rows ""')"
+st="$(state_of "$ROWS" reaper.worktree-reaper)"
+[ "$st" = "OK" ] && ok "§9t …and FLEET_JOB_SLACK_S=300 reads the same log OK (the slack widened the bound)" \
+                 || bad "§9t a 3 s old log under a 302 s bound should read OK, got [$st]"
+rm -f "$STATE/pi-reap-worktrees.log"
 
 
 printf '\n%s\n' "──────────────────────────────────────────────"
