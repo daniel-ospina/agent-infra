@@ -26,7 +26,7 @@
 #   measure     an unmeasurable cache (a path that is not a directory) → exit 3
 #   symlinks    a symlinked entry inside a cache is skipped, never followed
 #   policy      prune (the safe half) runs BEFORE any entry is removed
-#   wiring      the farm declares the script, the plist ships ARMED and hourly,
+#   wiring      the farm declares the script, the plist ships DRY-RUN and hourly,
 #               and both triggers (Mac launchd, cell controller loop) name it —
 #               a bound no box ever runs is the defect this issue is about
 
@@ -95,6 +95,12 @@ SH
 cat >"$T/bin/ps-pip" <<'SH'
 #!/bin/sh
 printf '%s\n' "    1 /sbin/init" " 5152 /usr/bin/python3 -m pip install requests"
+SH
+# pip installed as a console script is `<python3> .../bin/pip install …` — argv[0] is python3, and
+# the matcher knew only `bin/pip3`, so a canonical `pip install` did not block the escalation.
+cat >"$T/bin/ps-pip2" <<'SH'
+#!/bin/sh
+printf '%s\n' "    1 /sbin/init" " 5153 /usr/bin/python3 /opt/venv/bin/pip install somepkg"
 SH
 # df that cannot answer at all: "cannot judge", never "plenty".
 cat >"$T/bin/df-silent" <<'SH'
@@ -242,7 +248,7 @@ mkdir -p "$H/.pi/agent/state/pi-cache-reap.lock"
 printf '%s\n' "$$" >"$H/.pi/agent/state/pi-cache-reap.lock/owner"
 printf '%s\n' "$(date +%s)" >"$H/.pi/agent/state/pi-cache-reap.lock/started"
 OUT="$(run_reap "$H" --apply 2>&1)"; RC=$?
-assert_eq "$RC" "0" "a pass that finds a LIVE lock exits 0 (it did not run, and nothing is wrong)"
+assert_eq "$RC" "4" "a pass that finds a LIVE lock exits 4 — NOT 0: a caller that clears its alert on 0 must not clear it on a pass that never ran"
 assert_eq "$(kb "$H/.cache/uv")" "$UV_BEFORE" "the locked-out pass mutated nothing — two passes cannot credit each other's reclaim"
 assert_contains "$OUT" "another pass is running" "the skip names the holder, not a silent no-op"
 
@@ -273,7 +279,7 @@ echo
 echo "── 4a. a live npm / pip holder is seen too (they are not native binaries) ──"
 # The holder class must match the CACHE class under test: npm's cache is $HOME/.npm/_cacache,
 # pip's is $HOME/.cache/pip (a uv-class fixture would never consult the npm/pip matcher).
-for pair in "ps-npm:.npm/_cacache" "ps-pip:.cache/pip"; do
+for pair in "ps-npm:.npm/_cacache" "ps-pip:.cache/pip" "ps-pip2:.cache/pip"; do
   stub="${pair%%:*}"; cdir="${pair#*:}"
   H="$T/h4a-$stub"
   new_cache "$H/$cdir" 3000 2000
@@ -316,6 +322,21 @@ OUT="$(PS_STUB="$T/bin/ps-entry2" run_reap "$H" --apply 2>&1)"; RC=$?
 assert_eq "$RC" "3" "a cache STILL over its bound after every removable entry exits 3"
 [ -d "$H/.cache/uv/entry-1" ] && ok "the held entry was still never touched" || bad "the held entry was deleted"
 assert_contains "$OUT" "PRESERVED because a live process names them" "the refusal names what blocked the bound (not a vague 'failed')"
+
+echo "── 4d. an entry name that FORGES a list record cannot delete outside the cache ──"
+H="$T/h4d"
+new_cache "$H/.cache/uv" 3000 2000
+# Measured attack shape: a process able to write into the cache (a build backend, a postinstall
+# script) plants a name whose newline starts a SECOND record, which sorts first and points at a
+# cwd-relative victim. Without a containment check the reaper deleted that victim and printed
+# VERIFIED.
+mkdir -p "$H/wd/victimdir"
+printf 'keep me\n' >"$H/wd/victimdir/data"
+mkdir "$H/.cache/uv/evil"$'\n'"999999"$'\t'"victimdir"
+OUT="$(cd "$H/wd" && run_reap "$H" --apply 2>&1)"; RC=$?
+assert_eq "$RC" "3" "an unrepresentable entry name fails the pass closed"
+[ -f "$H/wd/victimdir/data" ] && ok "a directory OUTSIDE the cache survived the forged record" \
+                              || bad "a forged record deleted a path outside the cache"
 
 echo "── 5. an unusable ps probe is never read as 'no holder' ──"
 H="$T/h5"
@@ -422,7 +443,7 @@ assert_contains "$OUT" "CACHE_REAP_MAX_MB" "the refusal names the variable"
 OUT="$(bash "$REAPER" --bogus 2>&1)"; RC=$?
 assert_eq "$RC" "2" "an unknown argument is a usage error"
 OUT="$(bash "$REAPER" --help 2>&1)"; RC=$?
-assert_eq "$RC" "2" "--help prints usage (documented exit 2)"
+assert_eq "$RC" "0" "--help exits 0, like every sibling reaper (a --help && … must not fail)"
 assert_contains "$OUT" "--apply" "--help documents the arming flag"
 assert_contains "$OUT" "Exit codes" "--help prints the exit codes (the contract a scheduled job is read by)"
 assert_contains "$OUT" "fail-closed" "--help names the fail-closed exit"

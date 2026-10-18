@@ -1069,13 +1069,14 @@ while true; do
       # "a refresh that aborts EVERY cycle reads as a healthy cell"). Record a non-zero pass where
       # `status` prints it, and clear it on the next clean one.
       (
-        if bash "$_cache_reaper" --dry-run >>"$LOG" 2>&1; then
-          rm -f "$O/state/.cache-reap-blocked"
-        else
-          _rc=$?
-          { printf 'cache reaper exit %s at %s\n' "$_rc" "$(date -u +%Y-%m-%dT%H:%M:%SZ)";
-            tail -2 "$LOG" 2>/dev/null; } >"$O/state/.cache-reap-blocked" 2>/dev/null || true
-        fi
+        bash "$_cache_reaper" --dry-run >>"$LOG" 2>&1
+        _rc=$?
+        case "$_rc" in
+          0) rm -f "$O/state/.cache-reap-blocked" ;;   # a real pass cleared the bound
+          4) : ;;                                      # did not run (lock held) — touch nothing
+          *) { printf 'cache reaper exit %s at %s\n' "$_rc" "$(date -u +%Y-%m-%dT%H:%M:%SZ)";
+               tail -2 "$LOG" 2>/dev/null; } >"$O/state/.cache-reap-blocked" 2>/dev/null || true ;;
+        esac
       ) &
     else
       echo "[cache-reap] NOT RUN — $_cache_reaper is absent, so the machine-global uv/npm/pip caches are unbounded (farm it: pi-bootstrap/setup.sh)" >> "$LOG"

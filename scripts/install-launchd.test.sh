@@ -264,8 +264,10 @@ assert_contains "$(cat "$PRUNE_INSTALLED")" "<integer>3600</integer>" "prune job
 assert_contains "$(cat "$PRUNE_INSTALLED")" "agent-infra-plist-version: 0.1.0" "prune template carries version marker"
 # #1987 — the machine-global cache bound. It ships DRY-RUN like every sibling reaper: arming a
 # scheduled DELETION is an owner-level consequence decision (agent-infra#1678, owner ruling
-# 2026-10-11: "the reaper may run unattended; arming it may not"), so a lane may not arm it by
-# editing this tracked template. Arming is one argument plus a re-run of the installer.
+# 2026-10-11: "the reaper may run unattended; arming it may not"). ⚠️ NOTHING ENFORCES THIS: the
+# arming route is a tracked-template edit plus an installer re-run, which is exactly what #1678's
+# requirement 3 says the installer should refuse without an owner marker. These asserts pin the
+# COMMITTED stance; they are not a gate.
 assert_contains "$(cat "$CACHE_REAP_INSTALLED")" "$HOME1/.pi/agent/scripts/pi-cache-reap.sh" "cache-reap plist rendered with fake HOME (farmed path)"
 assert_contains "$(cat "$CACHE_REAP_INSTALLED")" "<string>--dry-run</string>" "cache-reap plist SHIPS DRY-RUN (#1987 / #1678 arming ruling)"
 assert_not_contains "$(cat "$CACHE_REAP_INSTALLED")" "<string>--apply</string>" "cache-reap plist is NOT armed by a lane"

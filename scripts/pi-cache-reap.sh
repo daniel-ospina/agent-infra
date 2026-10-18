@@ -80,7 +80,7 @@
 #     which honours XDG_CACHE_HOME) rather than a hardcoded `$HOME` guess: bounding a
 #     directory the tool does not use is a report about a cache that does not exist.
 #
-# SCHEDULING (installed by default, ARMED by the owner)
+# SCHEDULING (installed by default, DRY-RUN until an owner arms it)
 #   * Mac:   templates/launchd/com.eldato.pi-cache-reap.plist (hourly).
 #   * Cell:  a Linux cell has no launchd; its only scheduler is the controller loop,
 #            which runs this hourly from scripts/orchestrator-harness/orch-loop.sh
@@ -111,14 +111,16 @@
 #     growing disk is visible before it stops dispatch.
 #
 # Usage:
-#   pi-cache-reap.sh [--dry-run] [--apply] [--print-config] [--help]
+#   pi-cache-reap.sh [--dry-run] [--apply] [--print-config] [--help]   (--help exits 0)
 #
 #   (no mode flag)  dry-run: measure + report what WOULD be done, mutate nothing
 #   --dry-run       explicit dry-run (wins over CACHE_REAP_APPLY=1)
 #   --apply         armed pass (CACHE_REAP_APPLY=1 supplies the default mode only)
-#   --print-config  print `bound_mb=<n>` and `cache=<class>:<path>` for each sink,
-#                   as the reaper resolves them (the supervisor/bringup report reads
-#                   this instead of keeping its own copy of the paths and the bound)
+#   --print-config  print `bound_mb=<n>`, `bound_source=env|default` and
+#                   `cache=<class>:<path>` for each sink, as the reaper resolves them
+#                   (the bring-up report reads this instead of keeping its own copy of
+#                   the paths and the bound; the source says whether this process's
+#                   environment or the script default set it)
 #   --help          this text
 #
 # Env seams (also the test suite's):
@@ -142,10 +144,11 @@
 #   CACHE_REAP_PIP_DIR_MAC  the macOS pip cache candidate (default
 #                         $HOME/Library/Caches/pip)
 #
-# Exit codes: 0 bounded / reclaim verified / nothing to do (incl. a pass skipped
-# because another one holds the lock) · 2 usage · 3 fail-closed (the cache could not
-# be measured, an entry's sharing or filesystem could not be determined, a live tool
-# run made eviction unsafe, or the reclaim could not be verified).
+# Exit codes: 0 bounded / reclaim verified / nothing to do · 2 usage (unknown argument) ·
+# 3 fail-closed (the cache could not be measured, an entry name could not be represented,
+# an entry's sharing or filesystem could not be determined, a live tool run made eviction
+# unsafe, or the reclaim could not be verified) · 4 did not run (another pass holds the
+# lock — NOT a pass, so callers must not read it as one).
 # ── usage end ──
 
 set -uo pipefail
@@ -177,7 +180,7 @@ TMPLIST2=""
 
 usage() {
     sed -n '/^# Usage:/,/^# ── usage end ──/p' "$0" | sed 's/^# \{0,1\}//' | sed '$d'
-    exit 2
+    exit "${1:-2}"
 }
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -346,7 +349,7 @@ ps_matches() {
                     # the guard was untested because the suite only stubbed a native
                     # uv holder. Match what the process IS, not just its binary name.
                     if (tool == "npm" && (index($0, "npm-cli.js") || index($0, "bin/npm"))) { print; next }
-                    if (tool == "pip" && (index($0, "pip/__main__.py") || index($0, " -m pip") || index($0, " -m pip3") || index($0, "bin/pip3"))) { print; next }
+                    if (tool == "pip" && (index($0, "pip/__main__.py") || index($0, " -m pip") || index($0, "bin/pip"))) { print; next }
                     if (tool == "uv" && index($0, "bin/uv ")) { print; next }
                     if (exe == "env") {
                         i = 3
@@ -423,6 +426,17 @@ entries_by_size() {
     for e in "$dir"/* "$dir"/.[!.]*; do
         [ -e "$e" ] || continue
         [ -L "$e" ] && { plog "pi-cache-reap:   skip symlinked entry $e"; continue; }
+        # ⛔ A TAB or NEWLINE in an entry name FORGES a record in this file. Measured: a cache
+        # entry named $'evil\n999999\t<name>' produced a second record that sorted FIRST, and
+        # the eviction loop deleted a cwd-relative `<name>` OUTSIDE the cache. Any process that
+        # can write into the cache (a build backend, a postinstall script) can plant such a name,
+        # and the deletion happens later, unattended. Refuse the whole cache instead: a name that
+        # cannot be represented in the record must not be acted on.
+        case "$e" in
+            *"$TAB"*|*"
+"*) plog "pi-cache-reap:   entry name is not representable in the eviction list (tab/newline) — refusing to act on $dir"
+                return 1 ;;
+        esac
         kb="$(kb_of "$e")" || { plog "pi-cache-reap:   cannot measure entry $e — refusing to size it as 0"; return 1; }
         printf '%s\t%s\n' "$kb" "$e" >>"$TMPLIST"
     done
@@ -449,8 +463,9 @@ reap_target() {
 
     before_kb="$(kb_of "$dir")" \
         || { fail_closed "$class: cannot measure $dir (du failed) — the bound cannot be enforced"; return 0; }
-    before_free_kb="$(free_kb "$dir")"
 
+    # Read free space only when the cache is OVER its bound: an under-bound pass is then one
+    # `du` per cache and nothing else, which is what makes an hourly clock cheap.
     if [ "$before_kb" -le "$MAX_KB" ]; then
         say "pi-cache-reap: $class $dir $(mb_str "$before_kb") <= ${MAX_MB}MB bound — no action"
         return 0
@@ -460,6 +475,8 @@ reap_target() {
         say "pi-cache-reap: DRY-RUN $class $dir $(mb_str "$before_kb") > ${MAX_MB}MB bound — would prune, then evict the largest entries while no $class process holds the cache (re-run with --apply)"
         return 0
     fi
+
+    before_free_kb="$(free_kb "$dir")"
 
     # ── (1) the safe half ────────────────────────────────────────────────────
     prune_cache "$class" "$dir"
@@ -500,6 +517,17 @@ reap_target() {
         while IFS="$TAB" read -r kb e; do
             [ -n "${e:-}" ] || continue
             [ "$now_kb" -gt "$MAX_KB" ] || break
+            # A malformed record is not a delete instruction. Both halves are validated: the
+            # size must be a number, and the path must be INSIDE the cache being bounded — the
+            # containment rule is the one the whole script promises, so it is enforced here,
+            # at the point of deletion, not assumed from how the list was built.
+            case "${kb:-}" in
+                ''|*[!0-9]*) fail_closed "$class: malformed eviction record ('${kb:-}' '$e') — refusing to delete from a list that cannot be trusted"; break ;;
+            esac
+            case "$e" in
+                "$dir"/*) ;;
+                *) fail_closed "$class: entry '$e' is NOT inside $dir — refusing to delete outside the cache"; break ;;
+            esac
             # ── the ACT-POINT re-probe (a resolver spawned mid-pass is invisible to the
             #    pass-start snapshot; #1105 is that class in the sibling reaper) ──
             ps_snapshot || { fail_closed "$class: the ps probe could not answer immediately before removing $e — NOT deleting an unproven entry"; break; }
@@ -684,7 +712,10 @@ for a in "$@"; do
         --dry-run) MODE=dry-run; MODE_SET=1 ;;
         --apply) MODE=apply; MODE_SET=1 ;;
         --print-config) PRINT_CONFIG=1 ;;
-        --help|-h) usage ;;
+        # The sibling reapers exit 0 on --help (pi-reap-worktrees.sh:1130, pi-reap-idle.sh:1229,
+        # pi-task-session-prune.sh:260): `reaper --help && ...` must not fail. 2 stays the code
+        # for an UNKNOWN argument.
+        --help|-h) usage 0 ;;
         *) printf '%s: unknown argument %s\n' "$SCRIPT_NAME" "$a" >&2; usage ;;
     esac
 done
@@ -750,8 +781,12 @@ fi
 TMPLIST="$(mktemp "${TMPDIR:-/tmp}/pi-cache-reap.XXXXXX")" || { printf '%s: cannot create a temp file\n' "$SCRIPT_NAME" >&2; exit 3; }
 TMPLIST2="$(mktemp "${TMPDIR:-/tmp}/pi-cache-reap.XXXXXX")" || { printf '%s: cannot create a temp file\n' "$SCRIPT_NAME" >&2; exit 3; }
 
+# ⛔ A SKIPPED PASS IS NOT A PASS (exit 4, distinct from 0). The callers clear their
+# "cache bound not enforced" record on 0; a pass that never ran must neither clear it nor
+# set it, or a launchd pass holding the lock makes the cell's hourly clock erase a real
+# failure it did not re-measure.
 if ! lock_acquire; then
-    exit 0
+    exit 4
 fi
 trap 'cleanup; lock_release' EXIT
 
