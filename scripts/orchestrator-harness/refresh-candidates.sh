@@ -79,6 +79,18 @@ resolve_home --create \
   || echo "[refresh] WARN: neither \$HOME ('${HOME:-<unset>}') nor CELL_HOME ('$CELL_HOME') is a writable directory — the pre-flight's gh surfaces will be unreadable and its verdicts degraded"
 
 O="${O:-$HOME/orchestrator}"
+
+# ⛔ ONE BOARD REBUILD PER PASS, NOT ONE PER CANDIDATE (#2022). A pass runs the pre-flight once per
+# candidate, and the fleet-board rebuild inside it measured 15.9 s of a 19 s run — identical every
+# time. Six rebuilds per pass contend with the controller's own sweep; a contended GitHub read returns
+# as an UNQUERYABLE SURFACE, which is not a verdict, so every candidate is "left unchecked", the
+# backlog stays 0 and CREATE ACTIVITY STOPS with no error anywhere.
+# The tool (tortoise#8948) caches its own PARTIAL board in this private directory and never writes
+# fleet_state.DEFAULT_OUT. Measured: 16.8 s -> 3.6 s -> 3.4 s per candidate, identical verdicts.
+# Unset => the tool behaves exactly as before.
+export COLLISION_PREFLIGHT_CACHE="${COLLISION_PREFLIGHT_CACHE:-$O/state/.preflight-cache}"
+export COLLISION_PREFLIGHT_CACHE_TTL="${COLLISION_PREFLIGHT_CACHE_TTL:-300}"
+mkdir -p "$COLLISION_PREFLIGHT_CACHE" 2>/dev/null || true
 # ⛔ APPEND, never PREPEND. These two directories are where launchd's minimal environment finds the
 # harness's tools, so they must stay on PATH — but hard-prepending them silently OUTRANKED the
 # caller's own PATH: a caller that put a pinned/stub `uv` first (the regression suite, or an
