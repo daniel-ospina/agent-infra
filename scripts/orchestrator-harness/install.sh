@@ -168,20 +168,30 @@ if [ "$ACTION" = uninstall ]; then
   # job. Folding it into "not loaded" made this loop break on the first iteration and delete the plist
   # over a live controller (review finding).
   # ⛔ AND THE VERDICT COMES FROM THE PROBE ITSELF (review finding): `prc=0` IS the proof that launchd
-  # still holds the label. Deriving the verdict from a SECOND read (`lc_loaded_path`) re-introduced the
+  # still holds the label. Deriving the verdict from a SECOND `path =` read re-introduced the
   # same flattening one layer down — a read that failed, or a block with no parsable `path =` line,
   # returned empty and the plist was deleted with ✅ printed over a job launchd still had.
-  held=""; pid=""; unread=""; prc=0
+  held=""; pid=""; unread=""; unread_diag=""; prc=0
   for _ in 1 2 3 4 5 6 7 8; do
-    prc=0; block=""; block="$(lc_probe "$LABEL")" || prc=$?
-    if [ "$prc" -eq 2 ]; then unread="$block"; break; fi
+    # ⛔ THE VERDICT IS THE *LAST* OBSERVATION, NOT THE FIRST (review finding): `held` was sticky, so one
+    # loaded read during the settle window decided the answer and the loop's whole point — wait for the
+    # lag between `bootout` and launchd forgetting the label — could never flip it. A job that IS gone
+    # then produced a false "STILL loaded" refusal on the operator's documented handoff command.
+    prc=0; block=""; held=""; pid=""
+    block="$(lc_probe "$LABEL")" || prc=$?
+    # ⛔ A BOOLEAN FLAG, NOT THE DATUM (review finding): an UNKNOWN read whose output is EMPTY stored ""
+    # in the flag, the `[ -n "$unread" ]` test below was then false, and the script fell straight through
+    # to `rm -f` + "✅ Removed" over a job launchd still held — the same empty-is-falsy trap one layer
+    # over from `lc_assert_stable`'s second read. `lc_probe` returns 2 with no output whenever
+    # `launchctl print` exits non-zero silently, which is exactly what a killed or re-exec'ing launchd does.
+    if [ "$prc" -eq 2 ]; then unread=1; unread_diag="$block"; break; fi
     [ "$prc" -eq 0 ] || break          # definitively not loaded: the removal holds
     held=1
     pid="$(awk '/^[[:space:]]*pid = [0-9]+$/ { print $3; exit }' <<<"$block")"
     sleep 1
   done
   if [ -n "$unread" ]; then
-    die "launchd's state for $LABEL could not be read after 'launchctl bootout' (${unread:-no output}) — the removal cannot be VERIFIED, so the plist is kept at $PLIST. Next: launchctl print $(lc_domain)/$LABEL | head -20, then re-run this --uninstall"
+    die "launchd's state for $LABEL could not be read after 'launchctl bootout' (${unread_diag:-no output}) — the removal cannot be VERIFIED, so the plist is kept at $PLIST. Next: launchctl print $(lc_domain)/$LABEL | head -20, then re-run this --uninstall"
   fi
   if [ -n "$held" ]; then
     # The plist is KEPT: it is the only handle a verified removal has (and the only thing a human can
@@ -987,5 +997,5 @@ Liveness — a stale heartbeat means the controller is wedged:
 Stop it before handing the machine to a human, and capture dirty work (README §6):
 
     $SELF --uninstall        # bootout + remove the plist — NO persistent disable is written
-    pkill -f orch-loop.sh; rm -f "$O/.orch.lock"
+    pkill -f "[b]ash $O/orch-loop.sh"; pgrep -fl '[o]rch-loop'   # verify YOUR controller is gone, then: rm -f "$O/.orch.lock"
 EOF
