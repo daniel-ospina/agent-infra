@@ -66,8 +66,12 @@ lc_real_home() {
   local out
   command -v dscl >/dev/null 2>&1 || return 2
   out="$(dscl . -read "/Users/$(id -un)" NFSHomeDirectory 2>/dev/null)" || return 1
+  # ⛔ THE VALUE MUST BE NON-EMPTY (review finding): `"NFSHomeDirectory: "` with nothing after it
+  # matched the prefix and returned 0 with an EMPTY home, and `cd ""` then makes the caller's "real
+  # home" the CURRENT DIRECTORY — the same trap as an empty $HOME, one layer down. A record without a
+  # home is a failed read, not a home of "".
   case "$out" in
-    "NFSHomeDirectory: "*) printf '%s\n' "${out#NFSHomeDirectory: }"; return 0 ;;
+    "NFSHomeDirectory: "?*) printf '%s\n' "${out#NFSHomeDirectory: }"; return 0 ;;
   esac
   return 1
 }
@@ -162,6 +166,14 @@ lc_guard_mutate() {
       return 1
     fi
     if [ "$rc" -eq 0 ]; then
+      # ⛔ AN EMPTY ACCOUNT HOME IS NOT A HOME, and `cd ""` SUCCEEDS (review finding): it leaves $PWD
+      # unchanged, so `real` became the current directory and `home_real` matched it — a sandboxed run
+      # from `cd "$SANDBOX"` PASSED the guard. `lc_real_home` now refuses a blank value; this is the
+      # belt for the same brace, so neither layer alone can turn "no datum" into "same path".
+      if [ -z "$real" ]; then
+        lc_err "❌ refusing to change launchd state for $label: this account's real home read back EMPTY, so the temp-HOME guard (#446) cannot decide whether this run would act in the REAL user domain. Next: dscl . -read ~ NFSHomeDirectory, or for a test set ELDATO_ALLOW_TEST_HOME=1 with a launchctl stub on PATH"
+        return 1
+      fi
       # Canonicalise the SPELLING before comparing: `HOME=/Users/me/` and a symlink to the real home are
       # the real account, and refusing them told the operator to "run it from your own account" while
       # they already were (a false block with a false reason — found in review).
@@ -191,6 +203,13 @@ lc_guard_mutate() {
     return 1
   fi
   if [ -n "$loaded" ] && [ -n "$plist" ]; then
+    # ⛔ IDENTITY BEFORE SPELLING (review finding): a stow/chezmoi-style `~/Library/LaunchAgents/….plist`
+    # that is a SYMLINK to the dotfiles copy is the same file, and `lc_canon` resolves only the DIRECTORY,
+    # so the guard refused a perfectly ordinary layout with "loaded from …, not …". `-ef` compares the
+    # file itself; the canonical comparison stays as the fallback (it also handles a plist that is gone).
+    if [ -e "$plist" ] && [ "$loaded" -ef "$plist" ]; then
+      return 0
+    fi
     mine="$(lc_canon "$plist")"
     theirs="$(lc_canon "$loaded")"
     # ⛔ An EMPTY canonicalisation means "cannot resolve this path" (its directory is gone, or it is
@@ -386,7 +405,7 @@ lc_start() {
 # that exits at once (a second instance losing the lock race) can be relaunched by launchd a second
 # later — a single instantaneous read would call that a failure while it was still settling.
 lc_assert_running() {
-  local label="$1" O="$2" before="${3:-0}" timeout="${4:-30}" replaced="${5:-}" d cur pid i=0
+  local label="$1" O="$2" before="${3:-0}" timeout="${4:-30}" replaced="${5:-}" d cur pid i=0 prc blk
   d="$(lc_domain)"
   # ⛔ A NON-NUMERIC TIMEOUT IS NOT A SHORT TIMEOUT. `[ "$i" -lt "abc" ]` ERRORS, the loop body never
   # runs, and every start fails after ZERO observations ("has NO pid abcs after the start") — the same
@@ -409,7 +428,17 @@ lc_assert_running() {
   done
   pid="$(lc_pid "$label")"
   if [ -z "$pid" ]; then
-    lc_err "❌ $label has NO pid ${timeout}s after the start — the label is not running. Next: launchctl print $d/$label | head -20; tail -40 $O/logs/launchd.err"
+    # ⛔ A READ THAT FAILED IS NOT "NO pid" (review finding): `lc_pid` folds UNKNOWN into empty, so an
+    # unreadable domain was reported as "the label is not running" — a measurement about a domain that
+    # was never read. The exit is non-zero either way; the DIAGNOSIS is what changes.
+    prc=0; blk=""; blk="$(lc_probe "$label")" || prc=$?
+    if [ "$prc" -eq 2 ]; then
+      lc_err "❌ refusing to decide on $label: launchd's state could not be read after the start (${blk:-no output}), so 'not running' is unproven. Next: launchctl print $d/$label | head -20; tail -40 $O/logs/launchd.err"
+    elif [ "$prc" -eq 0 ]; then
+      lc_err "❌ $label is LOADED but launchd reports NO pid ${timeout}s after the start — it is not running. Next: launchctl print $d/$label | head -20; tail -40 $O/logs/launchd.err"
+    else
+      lc_err "❌ $label is NOT loaded ${timeout}s after the start — the label is not running. Next: launchctl print $d/$label | head -20; tail -40 $O/logs/launchd.err"
+    fi
   elif [ -n "$replaced" ] && [ "$pid" = "$replaced" ]; then
     lc_err "❌ $label still has pid $pid ${timeout}s after the start — the job was NOT replaced, so the loaded plist may still be the OLD one. Next: launchctl print $d/$label | head -20, then boot it out by plist path and start again"
   else
@@ -446,7 +475,16 @@ lc_assert_stable() {
   [ "$settle" -ge 1 ] || settle="$floor"
   r0="$(lc_runs "$label")"
   if [ -z "$r0" ]; then
-    lc_err "❌ $label has no 'runs' counter — not loaded, so it cannot be cycling. Next: launchctl print $(lc_domain)/$label | head -20"
+    # ⛔ AN ABSENT COUNTER IS NOT "NOT LOADED" (review finding): a LOADED block with no `runs` line was
+    # reported as not loaded — a measurement about a line that was never read.
+    prc=0; _b=""; _b="$(lc_probe "$label")" || prc=$?
+    if [ "$prc" -eq 0 ]; then
+      lc_err "❌ refusing to certify $label: the job is LOADED but launchd reported no 'runs' counter (${_b:-no output}), so a relaunch cannot be observed. Next: launchctl print $(lc_domain)/$label | head -20"
+    elif [ "$prc" -eq 1 ]; then
+      lc_err "❌ $label is NOT loaded, so it cannot be cycling. Next: launchctl print $(lc_domain)/$label | head -20"
+    else
+      lc_err "❌ refusing to certify $label: launchd's state for that label could not be read (${_b:-no output}), so 'not cycling' is unproven. Next: launchctl print $(lc_domain)/$label | head -20"
+    fi
     return 1
   fi
   sleep "$settle"
@@ -482,6 +520,10 @@ lc_assert_stable() {
 # nothing, because orch-loop.sh's EXIT trap is the only thing that removes it.
 lc_foreign_controller() {
   local lock
+  # ⛔ THE SAME `-f` GUARD `lc_hb_value` NEEDS, ON THE SIBLING READ, ON THE BRANCH THAT RUNS WHEN THE JOB
+  # IS ABSENT (review finding): with a non-regular `$O/.orch.lock` (a FIFO, a wedged network mount) the
+  # `tr` BLOCKS ON OPEN, so `--start`/`--restart` — the documented recovery — hung with no output.
+  [ -f "$1/.orch.lock" ] || return 0
   lock="$(tr -dc '0-9' < "$1/.orch.lock" 2>/dev/null)" || return 0
   [ -n "$lock" ] || return 0
   kill -0 "$lock" 2>/dev/null || return 0
@@ -496,7 +538,7 @@ lc_restart() {
   if [ -z "$pid" ]; then
     lock="$(lc_foreign_controller "$O")"
     if [ -n "$lock" ]; then
-      lc_err "❌ refusing to start $label: a controller started OUTSIDE launchd already holds $O/.orch.lock (pid $lock), so launchd's copy would exit at once and KeepAlive would relaunch it forever. Next: stop it (pkill -f orch-loop.sh; rm -f $O/.orch.lock), then re-run"
+      lc_err "❌ refusing to start $label: a controller started OUTSIDE launchd already holds $O/.orch.lock (pid $lock), so launchd's copy would exit at once and KeepAlive would relaunch it forever. Next: stop it (pkill -f "[b]ash $O/orch-loop.sh", then verify with pgrep -fl '[o]rch-loop' and only then rm -f $O/.orch.lock), then re-run"
       return 1
     fi
   fi
@@ -531,10 +573,22 @@ lc_restart() {
 # (a fixed 900s fails a healthy CYC=900 cell and points the operator at a needless restart).
 lc_ensure() {
   local label="$1" plist="$2" O="$3" changed="${4:-1}" timeout="${5:-30}" stale="${6:-780}"
-  local pid age lock via before
+  local pid age lock via before prc block
   LC_OUTCOME="started"
+  # ⛔ NORMALISED LIKE `START_TIMEOUT` AND `LC_SETTLE` (review finding): `[ abc -le … ]` makes bash print
+  # an integer-expression error and the test FAIL, so `LC_HB_STALE=abc` refused a perfectly healthy
+  # controller with a stale-heartbeat claim that was not true, pointing at a bootout+bootstrap. Anything
+  # non-numeric (or below 1) falls back to the cell's own bound.
+  case "$stale" in ''|*[!0-9]*) stale=$(( ${CYC:-240} * 2 + 300 )) ;; esac
+  [ "$stale" -ge 1 ] || stale=$(( ${CYC:-240} * 2 + 300 ))
   lc_guard_mutate "$label" "$plist" || return 1
-  pid="$(lc_pid "$label")"
+  prc=0; block=""; block="$(lc_probe "$label")" || prc=$?
+  if [ "$prc" -eq 2 ]; then
+    lc_err "❌ refusing to decide on $label: launchd's state for that label could not be read (${block:-no output}), so 'already running' and 'not loaded' are both unproven. Next: launchctl print $(lc_domain)/$label | head -20"
+    return 1
+  fi
+  pid=""
+  [ "$prc" -eq 0 ] && pid="$(awk '/^[[:space:]]*pid = [0-9]+$/ { print $3; exit }' <<<"$block")"
   if [ "$changed" = "0" ] && [ -n "$pid" ]; then
     age="$(lc_hb_age "$O")"
     if [ -n "$age" ] && [ "$age" -le "$stale" ]; then
@@ -553,7 +607,7 @@ lc_ensure() {
   if [ -z "$pid" ]; then
     lock="$(lc_foreign_controller "$O")"
     if [ -n "$lock" ]; then
-      lc_err "❌ refusing to start $label: a controller started OUTSIDE launchd already holds $O/.orch.lock (pid $lock), so launchd's copy would exit at once and KeepAlive would relaunch it forever. Next: stop it (pkill -f orch-loop.sh; rm -f $O/.orch.lock), then re-run"
+      lc_err "❌ refusing to start $label: a controller started OUTSIDE launchd already holds $O/.orch.lock (pid $lock), so launchd's copy would exit at once and KeepAlive would relaunch it forever. Next: stop it (pkill -f "[b]ash $O/orch-loop.sh", then verify with pgrep -fl '[o]rch-loop' and only then rm -f $O/.orch.lock), then re-run"
       return 1
     fi
   fi

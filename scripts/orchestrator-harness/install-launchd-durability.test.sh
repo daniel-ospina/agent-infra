@@ -153,6 +153,21 @@ case "${1:-}" in
       printf 'gui/0/%s = {\n\tactive count = 1\n\tstate = running\n\n\truns = 1\n\tpid = 9911\n}\n' "${FAKE_LABEL:-com.eldato.orchestrator-loop}"
       exit 0
     fi
+    # FAKE_PRINT_SILENT_ON=N: call N exits non-zero and prints NOTHING — launchd killed or re-exec'ing.
+    # `lc_probe` returns UNKNOWN with EMPTY output, which is the shape that made an `unread="$block"`
+    # flag falsy and let `--uninstall` delete the plist over a live job.
+    if [ -n "${FAKE_PRINT_SILENT_ON:-}" ]; then
+      n=$(( $(cat "$st/printcalls" 2>/dev/null || echo 0) + 1 ))
+      printf '%s\n' "$n" > "$st/printcalls"
+      if [ "$n" -eq "${FAKE_PRINT_SILENT_ON}" ]; then exit 1; fi
+    fi
+    # FAKE_PRINT_NO_RUNS: LOADED with a pid but no `runs` line — an ABSENT datum on a loaded job, which
+    # must not be reported as "not loaded".
+    if [ -n "${FAKE_PRINT_NO_RUNS:-}" ]; then
+      printf 'gui/0/%s = {\n\tactive count = 1\n\tpath = %s\n\tstate = running\n\n\tpid = 4242\n}\n' \
+        "${FAKE_LABEL:-com.eldato.orchestrator-loop}" "${FAKE_PLIST:-$FAKE_O/x.plist}"
+      exit 0
+    fi
     if [ -n "${FAKE_PRINT_FAIL_UNLOADED:-}" ] && [ ! -f "$st/loaded" ]; then printf 'Print failed: 5: Input/output error\n' >&2; exit 1; fi
     # FAKE_PRINT_FAIL_ON=N: exactly the Nth `print` call in this run fails and every other one succeeds.
     # This is the shape the whole-run knob cannot express: the SECOND read of `lc_assert_stable` (or a
@@ -171,6 +186,17 @@ case "${1:-}" in
       printf '%s\n' "$n" > "$st/printcalls"
       if [ "$n" -ge "${FAKE_DOMAIN_GONE_ON}" ]; then
         printf 'Bad request.\nCould not find domain for user gui: 999\n' >&2; exit 1
+      fi
+    fi
+    if [ -n "${FAKE_BOOTOUT_LAG:-}" ] && [ -f "$st/lag" ]; then
+      n="$(cat "$st/lag")"
+      if [ "$n" -ge 1 ]; then
+        printf '%s\n' $(( n + 1 )) > "$st/lag"
+        if [ "$n" -eq 1 ]; then cat "$st/print"; exit 0; fi   # one last sight of the (already removed) job
+        rm -f "$st/print" "$st/loaded" "$st/lag"
+        printf 'Bad request.\nCould not find service "%s" in domain for user gui: 0\n' \
+          "${FAKE_LABEL:-com.eldato.orchestrator-loop}" >&2
+        exit 1
       fi
     fi
     if [ -n "${FAKE_PRINT_FILE:-}" ]; then cat "$FAKE_PRINT_FILE"; exit 0; fi
@@ -194,6 +220,21 @@ case "${1:-}" in
     # FAKE_BOOTOUT_LIE: reports success while the job stays loaded — the exact case a status check cannot
     # catch, and the one that needs the caller to READ the domain back.
     [ -n "${FAKE_BOOTOUT_LIE:-}" ] && exit 0
+    # FAKE_BOOTOUT_LAG: the removal SUCCEEDED, but launchd keeps printing the job for exactly one more
+    # read (the settle lag). The caller must wait it out and end with a verified removal — a verdict taken
+    # from the FIRST observation instead of the last refused the operator's own handoff command.
+    if [ -n "${FAKE_BOOTOUT_LAG:-}" ]; then
+      printf '%s\n' 1 > "$st/lag"
+      exit 0
+    fi
+    # FAKE_BOOTOUT_LIE_NOPID: the lying bootout AND the job it lied about has no pid right now — which is
+    # what a KeepAlive job looks like inside its respawn throttle, and exactly the state in which a
+    # verdict taken from a PID (instead of from the probe) prints "Removed" over a live job.
+    if [ -n "${FAKE_BOOTOUT_LIE_NOPID:-}" ]; then
+      printf 'gui/0/%s = {\n\tactive count = 1\n\tpath = %s\n\tstate = running\n\n\tminimum runtime = 10\n\truns = 1\n}\n' \
+        "${FAKE_LABEL:-com.eldato.orchestrator-loop}" "${FAKE_PLIST:-$FAKE_O/x.plist}" > "$st/print"
+      exit 0
+    fi
     if [ -f "$st/loaded" ]; then rm -f "$st/loaded" "$st/print"; exit 0; fi
     exit 3 ;;  bootstrap)
     [ -n "${FAKE_BOOTSTRAP_FAIL:-}" ] && { printf 'Bootstrap failed: 5: Input/output error\n' >&2; exit 1; }
@@ -220,7 +261,7 @@ fresh() { # reset the stub's world; $1 = heartbeat seed (optional)
   unset FAKE_BOOTSTRAP_FAIL FAKE_LOAD_FAIL FAKE_NO_HB FAKE_PRINT_FILE FAKE_BOOTOUT_FAIL \
     FAKE_BOOTOUT_LIE FAKE_BOOTOUT_LIE_NOPID FAKE_CRASHLOOP FAKE_PLIST FAKE_THROTTLE \
     FAKE_MIN_RUNTIME FAKE_STALE_PID FAKE_BOOTOUT_RACE FAKE_BOOTSTRAP_ALREADY_LOADED \
-    FAKE_PRINT_FAIL FAKE_PRINT_FAIL_UNLOADED FAKE_HB_EPOCH FAKE_PRINT_BADONLY FAKE_PRINT_NO_PATH FAKE_PRINT_FAIL_ON FAKE_DOMAIN_GONE_ON FAKE_PRINT_DOMAIN FAKE_SERVICE_GONE_ON 2>/dev/null || true
+    FAKE_PRINT_FAIL FAKE_PRINT_FAIL_UNLOADED FAKE_HB_EPOCH FAKE_PRINT_BADONLY FAKE_PRINT_NO_PATH FAKE_PRINT_FAIL_ON FAKE_DOMAIN_GONE_ON FAKE_PRINT_DOMAIN FAKE_SERVICE_GONE_ON FAKE_PRINT_SILENT_ON FAKE_PRINT_NO_RUNS FAKE_BOOTOUT_LIE_NOPID FAKE_BOOTOUT_LAG 2>/dev/null || true
 }
 calls() { cat "$FAKE_LOG" 2>/dev/null || true; }
 verbs() { awk '$1 != "print" && $1 != "print-disabled" {printf "%s ", $1}' "$FAKE_LOG" 2>/dev/null; }
@@ -483,7 +524,7 @@ assert_contains "$(code_of "$INSTALL")" 'SELF="bash $(shq "$HERE/install.sh")"' 
 # has just exited sits loaded with no pid for up to its respawn throttle, so a pid-only read-back
 # calls a job launchd still holds "removed" (review finding). The behavioural case above covers the
 # lying-bootout path; this pins the datum itself, which no stub can model.
-assert_contains "$(code_of "$INSTALL")" 'held=1' "the --uninstall verdict comes from the PROBE (launchd still holds the label), not from a pid or a second path read"
+
 assert_contains "$(code_of "$INSTALL")" 'launchd-loaded.sha256' "the render launchd loaded is RECORDED, so 'unchanged' cannot mean 'the file did not change'"
 
 # ── G. the loaded job must be OURS, or nothing is touched ────────────────────────────────────────
@@ -803,7 +844,17 @@ assert_contains "$out" "left untouched" "…and says so"
   out="$(ORUN 2>&1)"; rc=$?
   assert_contains "$out" "could NOT be read" "an unreadable domain is reported as UNKNOWN in the banner"
   assert_not_contains "$out" "The loop is NOT running" "…and NOT as 'the loop is NOT running'"
+  # ⛔ A PLAIN RUN MUST NOT INVENT A WARNING (review finding): dropping `&& [ "$PLIST_CHANGED" = "1" ]`
+  # from the warning guard survived the whole suite, and the mutant makes a validation run print "which
+  # render launchd loaded is UNKNOWN (no … record yet)" while the record exists and MATCHES — sending the
+  # operator to `--start`, the one path that can restart a healthy controller.
   unset FAKE_PRINT_FAIL
+  fresh "$(( $(date +%s) - 5 ))"
+  ORUN --start >/dev/null 2>&1
+  out="$(ORUN 2>&1)"; rc=$?
+  if [ "$rc" -eq 0 ]; then ok "a plain run on a current, healthy render exits 0"; else bad "a plain run on a current render failed: $out"; fi
+  assert_not_contains "$out" "which render launchd loaded is UNKNOWN" "…and does NOT claim the loaded-render record is missing"
+  assert_not_contains "$out" "NOT on the rendered plist" "…and does NOT warn about a stale render"
 
 # an unknown flag must be REFUSED, not ignored: a typo'd --strt would otherwise install and exit 0.
 out="$(ORUN --strt 2>&1)"; rc=$?
@@ -1024,6 +1075,21 @@ for bad in "$T/dsclfail" "$T/dscljunk"; do
   assert_contains "$out" "could not be read" "$(basename "$bad"): the refusal names the failed read"
 done
 
+# ── N2. a PARSED-BUT-EMPTY account record is not "the real home" ─────────────────
+# `cd ""` SUCCEEDS and leaves $PWD, so a blank `NFSHomeDirectory` made the guard's "real home" the CURRENT
+# DIRECTORY — and a sandboxed run written the usual way (`cd "$SANDBOX"; HOME="$SANDBOX" …`) then PASSED
+# the #446 guard. Same trap as an empty $HOME, one layer down.
+echo "-- N2. a blank NFSHomeDirectory cannot become 'the real home'"
+mkdir -p "$T/dsclempty"
+printf '#!/usr/bin/env bash\nprintf "NFSHomeDirectory: \\n"\n' > "$T/dsclempty/dscl"
+chmod +x "$T/dsclempty/dscl"
+fresh; mkdir -p "$T/sandbox2"
+out="$( cd "$T/sandbox2" && env -u ELDATO_ALLOW_TEST_HOME HOME="$T/sandbox2" PATH="$T/dsclempty:$PATH" \
+  bash -c '. "$1"; lc_guard_mutate "$2" "$3"' _ "$LIB" "$LABEL" "$T/o/x.plist" 2>&1 )"; rc=$?
+if [ "$rc" -ne 0 ]; then ok "a blank NFSHomeDirectory REFUSES even with cwd=\$HOME (non-zero)"; else bad "a blank NFSHomeDirectory became 'the real home' and the guard passed"; fi
+assert_contains "$out" "real home" "…and the refusal is the HOME guard"
+assert_not_contains "$(calls)" "bootout" "…and nothing was removed"
+
 # ── L. a FUTURE-dated heartbeat must not poison the start-proof baseline ─────────────────────────
 # The proof is `cur > before`. A future-dated file (clock correction, foreign clock, corruption) makes
 # that target unreachable, so a HEALTHY start is reported as "running but NOT cycling" — with the wrong
@@ -1050,6 +1116,119 @@ assert_contains "$out" "and the heartbeat advanced" "…and the assertion really
 assert_not_contains "$out" "abcs" "the diagnostic does not quote the garbage value back as a duration"
 
 
+
+# ── O. the last empty-is-falsy traps ─────────────────────────────────────────────────────────────
+echo "-- O. a SILENT unreadable read-back, a FIFO lock, hostile LC_HB_STALE, a symlinked plist"
+# F1: `lc_probe` returns UNKNOWN (2) with EMPTY output whenever `launchctl print` exits non-zero and
+# prints nothing. Storing that in the `unread` FLAG made it "" — and "" is falsy, so `--uninstall` fell
+# through to `rm -f` + "✅ Removed" over a job launchd still held.
+fresh "$(( $(date +%s) - 5 ))"
+# The RENDERED plist path is what install.sh will act on, and the loaded job must be THAT file — otherwise
+# the run refuses at the ownership guard and never reaches the read-back at all.
+PLISTO="$T/o/home/Library/LaunchAgents/$LABEL.plist"
+mkdir -p "$(dirname "$PLISTO")"; : > "$PLISTO"
+export FAKE_PLIST="$PLISTO"
+( . "$LIB"; lc_start "$LABEL" "$PLISTO" >/dev/null 2>&1 )
+: > "$FAKE_STATE/printcalls"
+export FAKE_PRINT_SILENT_ON=3          # guard 1, bootout pre-check 2, the read-back 3
+out="$( env ELDATO_ALLOW_TEST_HOME=1 HOME="$T/o/home" O="$T/o" REPO="$T/repo" OR="acme/widget" \
+  PATH="$T/bin:$PATH" LC_SETTLE=1 START_TIMEOUT=2 FAKE_PLIST="$PLISTO" \
+  bash "$INSTALL" --uninstall 2>&1 )"; rc=$?
+unset FAKE_PRINT_SILENT_ON
+if [ "$rc" -ne 0 ]; then ok "a SILENT unknown read-back makes --uninstall exit NON-ZERO"; else bad "an empty-output unknown read was scored as 'removed'"; fi
+assert_contains "$out" "could not be read" "…and it names the failed read"
+assert_not_contains "$out" "✅ Removed" "…and does not print ✅"
+[ -f "$PLISTO" ] && ok "…and the plist is KEPT" || bad "the plist was deleted on an unverified removal"
+
+# …and where `bootout` LIES about a job that has NO pid: the verdict must come from the PROBE, not from a
+# pid test. A KeepAlive job inside its respawn throttle is loaded with no pid, so a pid-derived verdict
+# prints "Removed" and deletes the plist over a live job — and a SOURCE GREP for `held=1` cannot tell the
+# two apart (review finding: the mutant `[ -n "$held" ]` → `[ -n "$pid" ]` survived the whole suite).
+fresh "$(( $(date +%s) - 5 ))"
+PLISTN="$T/o/home2/Library/LaunchAgents/$LABEL.plist"
+mkdir -p "$(dirname "$PLISTN")"; : > "$PLISTN"
+export FAKE_PLIST="$PLISTN"
+( . "$LIB"; lc_start "$LABEL" "$PLISTN" >/dev/null 2>&1 )
+export FAKE_BOOTOUT_LIE_NOPID=1
+out="$( env ELDATO_ALLOW_TEST_HOME=1 HOME="$T/o/home2" O="$T/o" REPO="$T/repo" OR="acme/widget" \
+  PATH="$T/bin:$PATH" LC_SETTLE=1 START_TIMEOUT=2 FAKE_PLIST="$PLISTN" \
+  bash "$INSTALL" --uninstall 2>&1 )"; rc=$?
+unset FAKE_BOOTOUT_LIE_NOPID
+if [ "$rc" -ne 0 ]; then ok "a lying bootout over a loaded-NO-PID job makes --uninstall exit NON-ZERO"; else bad "a pid-derived verdict removed a job launchd still held (no pid)"; fi
+assert_contains "$out" "STILL loaded" "…and it says the label is still loaded"
+assert_not_contains "$out" "✅ Removed" "…and does NOT print ✅"
+[ -f "$PLISTN" ] && ok "…and the plist is KEPT" || bad "the plist was deleted over a job that is still loaded"
+
+# …and the settle window can still flip the verdict: launchd keeps printing the job for one read after a
+# successful bootout (the lag the retry loop exists for), then forgets it. `held` must be the LAST
+# observation, so this ends as a VERIFIED removal — a sticky flag refused the operator's own handoff.
+fresh "$(( $(date +%s) - 5 ))"
+PLISTL="$T/o/home3/Library/LaunchAgents/$LABEL.plist"
+mkdir -p "$(dirname "$PLISTL")"; : > "$PLISTL"
+export FAKE_PLIST="$PLISTL"
+( . "$LIB"; lc_start "$LABEL" "$PLISTL" >/dev/null 2>&1 )
+export FAKE_BOOTOUT_LAG=1
+out="$( env ELDATO_ALLOW_TEST_HOME=1 HOME="$T/o/home3" O="$T/o" REPO="$T/repo" OR="acme/widget" \
+  PATH="$T/bin:$PATH" LC_SETTLE=1 START_TIMEOUT=2 FAKE_PLIST="$PLISTL" \
+  bash "$INSTALL" --uninstall 2>&1 )"; rc=$?
+unset FAKE_BOOTOUT_LAG
+if [ "$rc" -eq 0 ]; then ok "a one-read removal LAG still ends as a verified removal (rc=0)"; else bad "a sticky verdict refused a removal that did happen: $out"; fi
+assert_contains "$out" "✅ Removed" "…and prints ✅ once launchd has forgotten the label"
+
+# F3: a non-regular $O/.orch.lock must not BLOCK the branch that runs when the job is absent — that is
+# the operator's recovery path (`--start`), so a hang here has no output and no exit code at all.
+fresh; rm -f "$T/o/.orch.lock"; mkfifo "$T/o/.orch.lock" 2>/dev/null || true
+if [ -p "$T/o/.orch.lock" ]; then
+  perl -e 'alarm 10; exec @ARGV' bash -c '. "$1"; lc_foreign_controller "$2"' _ "$LIB" "$T/o" > "$T/lock.out" 2>&1
+  rc=$?; out="$(cat "$T/lock.out")"
+  assert_eq "$rc" "0" "lc_foreign_controller on a FIFO lock returns instead of blocking"
+  assert_eq "$out" "" "…and reports no foreign controller"
+fi
+rm -f "$T/o/.orch.lock"
+
+# F5: `LC_HB_STALE` is a NUMBER, and a non-numeric one used to make `[ abc -le … ]` error — refusing a
+# healthy controller with a stale-heartbeat claim that was not true, and pointing at a bootout+bootstrap.
+fresh "$(( $(date +%s) - 5 ))"
+export FAKE_PLIST="$T/o/x.plist"
+( . "$LIB"; lc_start "$LABEL" "$T/o/x.plist" >/dev/null 2>&1 )
+out="$( . "$LIB"; LC_SETTLE=1 lc_ensure "$LABEL" "$T/o/x.plist" "$T/o" 0 2 abc 2>&1 )"; rc=$?
+if [ "$rc" -eq 0 ]; then ok "LC_HB_STALE=abc falls back to the cell bound (a healthy job is left untouched)"; else bad "a non-numeric LC_HB_STALE refused a healthy controller: $out"; fi
+assert_not_contains "$out" "integer expression expected" "…with no bash arithmetic error"
+out="$( . "$LIB"; LC_SETTLE=1 lc_ensure "$LABEL" "$T/o/x.plist" "$T/o" 0 2 -5 2>&1 )"; rc=$?
+if [ "$rc" -eq 0 ]; then ok "LC_HB_STALE=-5 falls back too"; else bad "a negative LC_HB_STALE refused a healthy controller"; fi
+
+# F7: a stow/chezmoi-style SYMLINKED plist is the same FILE, so the ownership guard must accept it —
+# comparing canonical DIRECTORIES alone refused an ordinary dotfiles layout and claimed the job came
+# from somewhere else.
+fresh
+mkdir -p "$T/dotfiles"
+printf 'x\n' > "$T/dotfiles/real.plist"
+ln -sf "$T/dotfiles/real.plist" "$T/o/x.plist"
+export FAKE_PLIST="$T/o/x.plist"
+( . "$LIB"; lc_start "$LABEL" "$T/o/x.plist" >/dev/null 2>&1 )
+export FAKE_PRINT_FILE="$T/o/print.symlink"
+{ printf 'gui/0/%s = {\n\tactive count = 1\n\tpath = %s\n\tstate = running\n\n\truns = 1\n\tpid = 4242\n}\n' "$LABEL" "$T/dotfiles/real.plist"; } > "$FAKE_PRINT_FILE"
+out="$( . "$LIB"; lc_guard_mutate "$LABEL" "$T/o/x.plist" 2>&1 )"; rc=$?
+unset FAKE_PRINT_FILE
+if [ "$rc" -eq 0 ]; then ok "a symlinked plist is accepted as the same FILE (stow/chezmoi layout)"; else bad "the ownership guard refused a symlinked plist: $out"; fi
+
+# F4: the two messages that folded an absent datum into a measurement.
+fresh
+export FAKE_PRINT_NO_RUNS=1
+( . "$LIB"; lc_start "$LABEL" "$T/o/x.plist" >/dev/null 2>&1 )
+out="$( . "$LIB"; LC_SETTLE=1 lc_assert_stable "$LABEL" 1 2>&1 )"; rc=$?
+unset FAKE_PRINT_NO_RUNS
+if [ "$rc" -ne 0 ]; then ok "a LOADED block with no 'runs' line refuses (non-zero)"; else bad "a missing 'runs' counter was certified"; fi
+assert_contains "$out" "LOADED but launchd reported no 'runs' counter" "…and names the ABSENT datum instead of claiming the job is not loaded"
+fresh "$(( $(date +%s) - 5 ))"
+export FAKE_PLIST="$T/o/x.plist"
+( . "$LIB"; lc_start "$LABEL" "$T/o/x.plist" >/dev/null 2>&1 )
+export FAKE_PRINT_FAIL=1
+out="$( . "$LIB"; lc_assert_running "$LABEL" "$T/o" 0 2 2>&1 )"; rc=$?
+unset FAKE_PRINT_FAIL
+if [ "$rc" -ne 0 ]; then ok "an unreadable domain after a start refuses (non-zero)"; else bad "an unreadable domain was scored as a start"; fi
+assert_contains "$out" "could not be read" "…and the message names the failed read, not 'no pid'"
+assert_not_contains "$out" "NO pid" "…it does not claim the label has no pid"
 echo
 if [ "$FAIL" -eq 0 ]; then
   printf '==> all %d checks passed (%d skipped)\n' "$PASS" "$SKIP"
