@@ -201,7 +201,7 @@ done
 # Resolve PAST a wrapper: add the first PATH entry holding a real executable of that name outside a
 # shim/.pi directory, so the shim can find it. Tested on the PHYSICAL path like add_dir(), so a
 # symlink TO a shim directory is recognised as a shim too.
-for bin in gh pi uv tmux; do
+for bin in gh pi uv tmux jq; do
   p="$(type -P "$bin" 2>/dev/null)" || continue
   case "$p" in /*) ;; *) continue ;; esac
   _pd="$(cd "$(dirname "$p")" 2>/dev/null && pwd -P)" || continue

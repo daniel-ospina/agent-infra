@@ -341,6 +341,32 @@ case "$OUT" in
   *"Python >= 3.12"*) ok "--check: the refusal names the tool's minimum (Python >= 3.12)" ;;
   *) bad "--check: the refusal does not name the minimum — output: $OUT" ;;
 esac
+
+# ── 1c) `--check` must REFUSE a box with NO jq (agent-infra#1962) ────────────────────────────────
+# The listings are assembled with jq, so its absence is PERMANENT and LOCAL: `--check` used to print
+# CHECK OK, cloud-cell-bringup.sh started the cell, and every refresh then reported
+# `queue=UNREADABLE` forever — the "a cell that can only merge, and looks healthy" shape this check
+# exists to refuse. One of the two guards this change added that had no assertion at all (measured:
+# deleting it left `PASS=217 FAIL=0`).
+mk_case nojq
+mk_tool "$D/tort/tools/collision_preflight.py"
+NJ="$T/bin-nojq"; mkdir -p "$NJ"
+# A PATH holding every /usr/bin entry EXCEPT jq, plus /bin (bash lives there on macOS; /bin holds
+# no jq — checked, so `command -v jq` is genuinely unsatisfiable). The script appends
+# /opt/homebrew/bin:/usr/local/bin, and neither holds a jq on a stock box. A stub named `jq` would be
+# the wrong test: it would only prove the probe reads PATH.
+for f in /usr/bin/*; do [ "$(basename "$f")" = jq ] || ln -sf "$f" "$NJ/" 2>/dev/null; done
+RF_PATH="$D/bin:$NJ:/bin" rf "$D" check TORTOISE_REPO="$D/tort"
+[ "$RC" -eq 3 ] && ok "--check: a box WITHOUT jq is REFUSED (rc=3, not the transient retry code)" \
+               || bad "--check: rc=$RC (want 3) on a box with no jq — $OUT"
+case "$OUT" in
+  *"NOT PROVISIONABLE"*jq*) ok "--check: the no-jq refusal is NOT PROVISIONABLE and names jq" ;;
+  *) bad "--check: no NOT-PROVISIONABLE/jq verdict on a box with no jq — output: $OUT" ;;
+esac
+case "$OUT" in
+  *"CHECK OK"*) bad "--check: printed CHECK OK with no jq (a cell certified to read UNREADABLE for ever)" ;;
+  *) ok "--check: no CHECK OK on a box with no jq" ;;
+esac
 # (run) the same interpreter on the refresh path must be PERMANENT (rc=3), so orch-loop.sh writes
 # the merge-only marker instead of the script exiting 0 with an empty backlog.
 mk_case old-python-run
@@ -2064,6 +2090,34 @@ SH
   [ "$rc" -eq 0 ] && [ "$(wc -l < "$HD10/out")" -eq 10 ] \
     && ok "a --limit 10 caller is NOT refused over a next page it never asked for (rc=0, 10 rows)" \
     || bad "the page<pages exemption is broken: rc=$rc, rows=$(wc -l < "$HD10/out") — $(head -1 "$HD10/err")"
+
+  # ── /issues RETURNS PULL REQUESTS: they must not become DISPATCH CANDIDATES ─────────────────────
+  # Both kinds, because the rule is ASYMMETRIC and deleting it stayed green before these cases: the
+  # `map(select(has("pull_request") | not))` filter was the ONE guard in this helper with no
+  # assertion (measured: replacing it with `(.)` left `PASS=217 FAIL=0`). The hazard is the POOL, not
+  # the reaper — a labelled PR passes the tier programs (`no assignee, non-epic title`), is queued as
+  # `0 <PR#>`, enters `dispatched.txt`, and a lane is spawned for a PR number. `kind=pulls` must keep
+  # every row: `.pr_brs` feeds the #1705 `has_pr` check.
+  HDP="$T/restcase-prrows"; mkdir -p "$HDP"
+  cat > "$HDP/gh" <<'SH'
+#!/bin/bash
+printf 'HTTP/2.0 200 OK\r\n\r\n'
+case "$*" in
+  *"/pulls"*) jq -n '[{"number":900,"pull_request":{"url":"u"},"head":{"ref":"pr-branch"}},{"number":901,"head":{"ref":"pr-branch-2"}}]' ;;
+  *)          jq -n '[{"number":41,"title":"a real issue"},{"number":900,"title":"a PR","pull_request":{"url":"u"}}]' ;;
+esac
+SH
+  chmod +x "$HDP/gh"
+  PATH="$HDP:$PATH"; export PATH
+  drv_out issues --repo acme/widget --limit 10 --jq '.[].number' > "$HDP/out" 2>"$HDP/err"; rc=$?
+  [ "$rc" -eq 0 ] && [ "$(cat "$HDP/out")" = "41" ] \
+    && ok "kind=issues DROPS the pull_request row and keeps the real issue (out=$(tr '\n' ' ' < "$HDP/out"))" \
+    || bad "kind=issues did not drop the PR row: rc=$rc, out=$(tr '\n' ' ' < "$HDP/out") — $(head -1 "$HDP/err")"
+  drv_out pulls --repo acme/widget --limit 10 --jq '.[]|.head.ref' > "$HDP/out2" 2>"$HDP/err"; rc=$?
+  PATH="${PATH#$HDP:}"; export PATH
+  [ "$rc" -eq 0 ] && [ "$(wc -l < "$HDP/out2")" -eq 2 ] \
+    && ok "kind=pulls KEEPS every row (2 head refs — .pr_brs is deliberately unfiltered)" \
+    || bad "kind=pulls dropped a row: rc=$rc, out=$(tr '\n' ' ' < "$HDP/out2") — $(head -1 "$HDP/err")"
 
   # ── THE MULTI-PAGE SUCCESS PATH, in order ──────────────────────────────────────────────────
   # Ten full pages. The page files are concatenated by a GLOB, so this only comes back in order if

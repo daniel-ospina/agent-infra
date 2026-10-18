@@ -595,7 +595,7 @@ git fetch origin --quiet 2>/dev/null || true
 # ⛔ WHY NOT `$O/gh-rest` HERE. That adapter translates the same commands correctly, but it is a
 # DAEMON-PATH concern, and a fail-closed read may not depend on something whose ABSENCE is silent:
 # measured the same day on pi-cell-2, `/tmp/cell-home/orchestrator/gh-rest/` DOES NOT EXIST, and
-# install.sh treats a missing adapter as a WARNING (`install.sh:353`) rather than a failure — so a
+# install.sh treats a missing adapter as a WARNING (`install.sh:380`) rather than a failure — so a
 # refresh wired to it would have gone on spending GraphQL on every cell while reading as fixed. `gh api`
 # is core gh, present exactly where `gh` is, which the provisioning check above requires.
 #
@@ -707,9 +707,13 @@ rest_list() {
       rest_fail "$kind" "$page" "$pf.err"
       rm -rf "$tmp"; return 1
     fi
-    # `-i` prepends the response headers; the body is everything after the first blank line. Matched on
-    # LENGTH, not on `/^\r?$/`: BSD awk does not treat `\r` as CR in a regex, so that form never split
-    # the two (measured: every page read as 0 rows).
+    # `-i` prepends the response headers; the body is everything after the first blank line. The
+    # separator is matched on LENGTH rather than with `/^\r?$/`, and the reason is PORTABILITY, not
+    # BSD's behaviour: `\r` inside an awk regex is not portable, and MAWK — Ubuntu's default, i.e.
+    # what the cells run — reads it as a literal `r`, so that form never splits and every page reads
+    # as 0 rows (a truncated listing one layer up). BSD awk here DOES honour `\r` in a regex
+    # (measured: identical output from both forms), which is precisely the trap: the `\r` form looks
+    # correct on a Mac and fails on every cell.
     awk 'b { print } !b && length($0) <= 1 { b = 1 }' "$pf.raw" > "$pf.json"
     # ⛔ THE LINK HEADER IS THE PROVIDER'S OWN STATEMENT about whether another page exists, and it is
     # the only reliable way to separate "the collection ended exactly on a page boundary" (a
@@ -763,11 +767,16 @@ rest_list() {
     if [ "$n" -lt 100 ] || [ "$page" -ge "$pages" ]; then break; fi   # short page, or the window is reached
     page=$((page + 1))
   done
-  # ⛔ /issues RETURNS PULL REQUESTS TOO. Left in, a PR's number would be read as an OPEN ISSUE by the
-  # reaper, which then un-blacklists an issue that has no PR of its own — the duplicate-lane defect of
-  # #1705 from the other side. Dropped here ONCE FOR THIS FILE (the gh-rest adapter drops the same
-  # rows, `gh-rest/gh:156`; that twin is why BOTH surfaces must be changed together if the rule ever
-  # moves). ⛔ `--limit` IS A RAW-ROW BUDGET AND THE PROJECTED TOTAL IS SMALLER — stated with the
+  # ⛔ /issues RETURNS PULL REQUESTS TOO. Left in, a labelled PR becomes a DISPATCH CANDIDATE: the tier
+  # programs below only require "no assignee and a non-epic title", so it would be queued as
+  # `0 <PR#>`, land in `dispatched.txt`, and get a lane spawned for a PR number the pass never
+  # adjudicated as an issue. (The REAPER's own path is not the hazard, which matters because a reader
+  # who checks the reaper finds nothing to break there and deletes this guard: issues and PRs share
+  # ONE number space per repo, so a PR row in `.open_iss` can only name a number that is already a
+  # PR — and `has_pr` is what decides it.) Dropped for `kind=issues` ONLY: `.pr_brs` is kind=pulls and
+  # the #1705 `has_pr` check needs those rows. Dropped here ONCE FOR THIS FILE (the gh-rest adapter
+  # drops the same rows, `gh-rest/gh:156`; that twin is why BOTH surfaces must be changed together if
+  # the rule ever moves). ⛔ `--limit` IS A RAW-ROW BUDGET AND THE PROJECTED TOTAL IS SMALLER — stated with the
   # measurement, because a review cycle "corrected" this the wrong way and a comment that lies about
   # the window is worse than none: the page budget is `ceil(limit/100)` RAW rows (the loop above), and
   # PRs are dropped only here, so a 500 window returns 500 minus however many pull requests were
