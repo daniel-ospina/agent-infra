@@ -790,6 +790,75 @@ BRINGUP_ARGS=stop nrun REPO="$N/repo" O="$N/O"
   && ok "stop (cell): this state dir's own record IS released" \
   || bad "stop (cell): the record for \$O survived its own stop"
 
+
+# ── §9 an UNREADABLE read is cannot-determine — on every verb, for BOTH failure shapes ──────────
+# Two distinct shapes, and the second is the one that hides: `ps` failing outright (an empty table)
+# and `ps` answering the TABLE while failing the AGE of one pid (a PS_BIN shim, a ps without
+# `-o etime`). The second made `pid_began_after`'s "cannot tell" indistinguishable from "began
+# before" — i.e. an undatable pid became the STRONGEST claim of ownership, and `stop` signalled
+# whatever a stale lock named. Both shapes must end in rc=2 and act on nothing (#1856 review).
+say_case "§9 an unreadable process read never becomes a verdict: stop keeps the record, check refuses to answer"
+R="$T/r"; mk_bin "$R/bin" mac; mk_clone "$R/repo" "daniel-ospina/agent-infra"; mkdir -p "$R/home" "$R/O" "$R/home/.local/state/orchestrator"
+mk_controller "$R/O"
+rrun() { # <bin-dir> [VAR=value …]
+  local d="$1"; shift
+  OUT="$(env -i HOME="$R/home" XDG_STATE_HOME="$R/home/.local/state" \
+    PATH="$d:$R/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+    ${PS_BIN:+PS_BIN="$PS_BIN"} "$@" bash "$BRINGUP" ${BRINGUP_ARGS:-} 2>&1)"; RC=$?; }
+R_PID="$(start_controller "$R/O")"; sleep 0.4
+write_registry "$R/home" "daniel-ospina~agent-infra" "daniel-ospina/agent-infra" "$R/O" "$R_PID" running
+REC="$(registry_dir "$R/home")/daniel-ospina~agent-infra"
+# (a) the table itself cannot be read
+mkdir -p "$R/no-ps"; printf '#!/bin/sh\nexit 1\n' > "$R/no-ps/ps"; chmod +x "$R/no-ps/ps"
+for verb in status check stop; do
+  BRINGUP_ARGS="$verb" rrun "$R/no-ps" REPO="$R/repo" O="$R/O"
+  [ "$RC" = 2 ] && ok "$verb: rc=2 when the process table cannot be read (never a verdict)" \
+                || bad "$verb: rc=$RC on an unreadable process table — $OUT"
+done
+[ -f "$REC" ] && ok "stop: the registry record SURVIVES an unreadable read (no release without proof)" \
+              || bad "stop: released the record of a controller it could not see — the next start is unguarded"
+kill -0 "$R_PID" 2>/dev/null && ok "stop: the live controller was NOT signalled on an unreadable read" \
+                              || bad "stop: signalled a controller from an unreadable read"
+# (b) the table answers; the AGE of the lock's pid does not
+mkdir -p "$R/etime-bin"
+cat > "$R/etime-bin/ps" <<'EOS'
+#!/bin/bash
+# Answers the table, refuses the age — the shape of a ps without -o etime, or a PS_BIN shim.
+case "$*" in *etime*) exit 1 ;; esac
+exec /bin/ps "$@"
+EOS
+chmod +x "$R/etime-bin/ps"
+printf '%s\n' "$R_PID" > "$R/O/.orch.lock"
+PS_BIN="$R/etime-bin/ps" BRINGUP_ARGS=status rrun "$R/etime-bin" REPO="$R/repo" O="$R/O"
+[ "$RC" = 2 ] && ok "status: rc=2 when the lock's pid cannot be DATED (the lock's owner is not asserted)" \
+              || bad "status: rc=$RC with an undatable lock owner — $OUT"
+PS_BIN="$R/etime-bin/ps" BRINGUP_ARGS=stop rrun "$R/etime-bin" REPO="$R/repo" O="$R/O"
+[ "$RC" = 2 ] && ok "stop: rc=2 when the lock's pid cannot be dated — it does not claim the pid" \
+              || bad "stop: rc=$RC with an undatable lock owner (it may have claimed the pid) — $OUT"
+kill -0 "$R_PID" 2>/dev/null && ok "stop: the undatable owner was NOT signalled" \
+                              || bad "stop: signalled an undatable pid"
+# (c) the registry key refuses anything that is not exactly <owner>/<repo> — `a/b/c` and `a//b`
+#     would create a DIRECTORY where another repo's record file belongs
+(
+  . "$(lib_src)/orchestrator-registry.sh"
+  bad_slugs=""
+  for r in a/b/c a//b agent-infra - a/b/ /a.b; do
+    registry_slug "$r" >/dev/null 2>&1 || bad_slugs="$bad_slugs $r"
+  done
+  printf '%s\n' "$bad_slugs" > "$T/bad-slugs"
+)
+[ "$(cat "$T/bad-slugs")" = " a/b/c a//b agent-infra - a/b/ /a.b" ] \
+  && ok "registry_slug: refuses every form that is not exactly <owner>/<repo> (a/b/c, a//b, bare, '-')" \
+  || bad "registry_slug accepted a non-owner/repo form — refused only:$(cat "$T/bad-slugs")"
+(
+  . "$(lib_src)/orchestrator-registry.sh"
+  registry_slug "Daniel-Ospina/Agent-Infra" > "$T/slug1"; registry_slug "daniel-ospina/agent-infra" > "$T/slug2"
+)
+[ "$(cat "$T/slug1")" = "$(cat "$T/slug2")" ] && [ "$(cat "$T/slug1")" = "daniel-ospina~agent-infra" ] \
+  && ok "registry_slug: one key for one repo regardless of case, joined with '~'" \
+  || bad "registry_slug: case-fold/separator wrong ($(cat "$T/slug1") vs $(cat "$T/slug2"))"
+kill -9 "$R_PID" 2>/dev/null; wait "$R_PID" 2>/dev/null
+
 echo
 echo "── Summary ───────────────────────────────────────────────────────"
 echo "  PASS=$PASS FAIL=$FAIL"

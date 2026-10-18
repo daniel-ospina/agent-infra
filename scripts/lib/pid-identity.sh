@@ -184,7 +184,7 @@ pid_row() {
 # cloud-cell-supervisor.sh keeps a PINNED MIRROR of the two functions below because it must run
 # standalone — it is farmed into a runtime dir, and a suite arm copies it outside any checkout, so it
 # cannot source a sibling library. The pair is pinned by a drift arm
-# (cloud-cell-supervisor.test.sh §(n)): divergence reddens CI instead of becoming a wrong kill.
+# (cloud-cell-supervisor.test.sh §(p)): divergence reddens CI instead of becoming a wrong kill.
 PID_START_SLACK_SECONDS="${PID_START_SLACK_SECONDS:-5}"
 
 # pid_start_epoch <pid> — when the process began, from `ps -o etime=`, whose [[dd-]hh:]mm:ss shape is
@@ -203,15 +203,31 @@ pid_start_epoch() {
     *) return 1 ;;
   esac
   case "$h$m$s" in ''|*[!0-9]*) return 1 ;; esac
+  # ⛔ `10#`, NOT a bare `$(( ))`. etime ZERO-PADS its fields, and bash reads a leading zero as
+  # OCTAL: `$((08 * 3600))` is an ERROR ("value too great for base"). So every process whose age has
+  # an `08`/`09` in seconds, minutes, hours or days made this function fail — and the lock predicates
+  # read a failed age as "it began before the fence", i.e. "this pid IS the lock's owner". On a live
+  # controller that is a few percent of reads, and the consequence was `stop` signalling a recycled
+  # pid (#1856 review, reproduced with a PS_BIN stub printing `08:31`; the bash error was visible in
+  # the suite's own stderr before this arm existed, and nothing asserted on it).
+  h=$((10#${h:-0})); m=$((10#${m:-0})); s=$((10#${s:-0})); d=$((10#${d:-0}))
   printf '%s\n' "$(( $(date +%s) - (d * 86400 + h * 3600 + m * 60 + s) ))"
 }
 
-# pid_began_after <pid> <epoch> — 0 when the process began AFTER <epoch> + the slack. rc 1 for "no"
-# AND for "cannot tell": an unreadable age never witnesses a reuse.
+# pid_began_after <pid> <epoch> — 0 when the process began AFTER <epoch> + the slack, 1 when it did
+# NOT, 2 when the age cannot be read.
+#
+# ⛔ THREE OUTCOMES, AND `2` IS NOT `1`. The lock predicates that consume this (`lock_pid` here, and
+# the supervisor's `lock_controller_pid`) use "began before the lock was written" as the TEST FOR
+# OWNERSHIP: an rc of 1 lets them claim the pid, so folding "cannot tell" into 1 made an unreadable
+# age the strongest possible evidence of ownership — the recycled-pid kill guard vanished on exactly
+# the boxes where `ps -o etime=` cannot answer (a PS_BIN shim, a ps without `-o etime`), and `stop`
+# then signalled whatever a stale lock named (#1856 review, reproduced with an etime-failing PS_BIN).
+# Cannot-tell must reach the caller AS cannot-tell so it can fail closed.
 pid_began_after() {
   local pe="${2:-}" ps
-  case "$pe" in ''|*[!0-9]*) return 1 ;; esac
-  ps="$(pid_start_epoch "${1:-}")" || return 1
+  case "$pe" in ''|*[!0-9]*) return 2 ;; esac
+  ps="$(pid_start_epoch "${1:-}")" || return 2
   [ "$ps" -gt "$((pe + PID_START_SLACK_SECONDS))" ]
 }
 

@@ -74,10 +74,15 @@ registry_root() {
 registry_slug() {
   local r="${1:-}" o w
   case "$r" in
-    # ⛔ EXACTLY ONE SLASH. `*/*/*` alone let a BARE repo name through (`OR=agent-infra`), which built
-    # the key `agent-infra~agent-infra` — a SECOND key for a repo that already had one, so the
-    # duplicate guard read `absent` and let a second controller start (#1856 review, reproduced).
-    */*/*|*/*) ;;
+    # ⛔ EXACTLY ONE SLASH — and the ACCEPT arm must be exactly `*/*`. Written as `*/*/*|*/*` this
+    # case accepted everything with at least one slash: `a/b/c` built the key `a~b/c`, and
+    # `registry_claim`'s `mkdir -p "$(dirname "$f")"` then created `$root/a~b/` as a DIRECTORY,
+    # which permanently collides with the record FILE of repo `a/b` — one of the two can never claim
+    # again, and a 2-slash spelling of one repo mints a second key (the guard fails open). The bare
+    # form (`OR=agent-infra`) built `agent-infra~agent-infra`, a second key for a repo that already
+    # had one (#1856 review, both reproduced).
+    */*/*) return 1 ;;
+    */*) ;;
     *) return 1 ;;
   esac
   case "$r" in
@@ -193,15 +198,20 @@ registry_pid_is_controller() {
   set -- $c
   [ "$#" -ge 2 ] || return 1
   case "${1##*/}" in bash|sh|dash|zsh) ;; *) return 1 ;; esac
-  # ⛔ ANY ABSOLUTE-PATH ARGV TOKEN whose basename is `orch-loop.sh`, not just argv[1]: `ps -o command=`
-  # does not quote, so a state dir containing a space (`/tmp/my cell/orchestrator`) splits the path
-  # across tokens and `basename` never equals `orch-loop.sh` — a LIVE controller read as foreign, a
-  # durable refusal whose only remedy is a hand-edit of the record (#1856 review). Requiring the `/`
-  # keeps the "the caller itself mentions the path" false positive out: a `bash -c` script word is not
-  # an absolute path.
-  for tok in "$@"; do
-    case "$tok" in /?*orch-loop.sh) return 0 ;; esac
-  done
+  # ⛔ THE SAME RULE AS THE SUPERVISOR'S `lock_controller_pid`: it answers the SAME question ("is this
+  # pid the lock's controller?"), and the two are consumed by different verbs of one entry point.
+  # Matching ANY argv token (`/?*orch-loop.sh`) failed OPEN: for `bash -c "sleep 300; /abs/orch-loop.sh"`
+  # this accepted a NON-controller, so `check` printed `lock owned by live controller pid N`, `status`
+  # printed RUNNING, and `start_cell` persisted the pid into the durable registry — after which every
+  # later `start` was refused until a human edited the record (#1856 review; the shipped supervisor
+  # answered STOPPED for the same pid). Two contracts for one safety rule is the #1178 defect.
+  #
+  # The one deliberate widening: `ps -o command=` does not quote, so a state dir containing a space
+  # (`/tmp/my cell/orchestrator`) splits argv[2] and its basename never equals `orch-loop.sh`. An
+  # ABSOLUTE path ending in the script name is accepted in argv[2] position only — a `bash -c` script
+  # word is not an absolute path, so the false positive above cannot come back through it.
+  case "${2##*/}" in orch-loop.sh) return 0 ;; esac
+  case "${2:-}" in /?*orch-loop.sh) return 0 ;; esac
   return 1
 }
 

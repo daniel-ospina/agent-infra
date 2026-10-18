@@ -230,9 +230,10 @@ local_controller_pids() {
   _ps_scoped "$O/orch-loop.sh" "$(harness_ctl_path)/orch-loop.sh"
 }
 owned_pids() {
-  local a b
-  a="$(state_dir_pids)" || return 1
-  b="$(lock_pid)" || b=""
+  local a b rc
+  a="$(state_dir_pids)" || return 2
+  b="$(lock_pid)"; rc=$?
+  case "$rc" in 0) ;; 1) b="" ;; *) return 2 ;; esac
   printf '%s\n%s\n' "$a" "$b" | awk 'NF && !s[$0]++'
 }
 # lock_pid — the pid $O/.orch.lock names, when it is alive, IS an orch-loop.sh INVOCATION, and cannot
@@ -252,7 +253,16 @@ lock_pid() {
   registry_pid_is_controller "$p" || return 0
   lt="$(date -r "$O/.orch.lock" +%s 2>/dev/null)" || return 0
   [ -n "$lt" ] || return 0
-  pid_began_after "$p" "$lt" && return 0
+  # ⛔ THREE OUTCOMES. 0 = began after the lock (a recycled pid — not ours), 1 = began before (ours),
+  # 2 = the age CANNOT BE READ. Folding 2 into 1 made an unreadable age the strongest evidence of
+  # ownership and `stop`/`check` then acted on a pid they could not date (#1856 review, reproduced
+  # with an etime-failing PS_BIN); 2 is propagated so every caller fails closed.
+  pid_began_after "$p" "$lt"
+  case $? in
+    0) return 0 ;;
+    1) ;;
+    *) return 2 ;;
+  esac
   printf '%s\n' "$p"
 }
 pids_join() { printf '%s' "$1" | tr '\n' ' ' | sed 's/ *$//'; }
@@ -438,10 +448,15 @@ cmd_check() {
   # 5. the lock: free, or owned by a live controller. AND the split that the whole #1761 review turns
   # on: what this state dir OWNS vs what merely runs this machine's harness (another repo's
   # controller, when two repos share the cell's harness path).
+  # ⛔ EVERY READ HERE FAILS CLOSED. `|| VAR=""` turned "ps cannot answer" into an EMPTY read, which
+  # is indistinguishable from "no controller": `check` printed `lock free`, and `stop` released the
+  # durable one-per-(machine,repo) record over a controller that was still running — so the next
+  # `start` (from any $O) read `absent` and was allowed: two controllers on one queue, the exact
+  # #1761 defect (#1856 review, reproduced with a failing `ps` stub).
   local lp live own foreign
-  lp="$(lock_pid)" || lp=""
-  live="$(local_controller_pids)" || live=""
-  own="$(owned_pids)" || own=""
+  lp="$(lock_pid)" || unknown "cannot determine the lock owner: the process table (ps) or the owning pid's age cannot be read — check cannot answer from an unreadable read"
+  live="$(local_controller_pids)" || unknown "cannot read the process table (ps) — check cannot answer from an unreadable read"
+  own="$(owned_pids)" || unknown "cannot determine which controllers belong to this state dir (ps/etime unreadable) — check cannot answer"
   foreign="$(comm -23 <(printf '%s\n' "$live" | awk 'NF' | sort -u) <(printf '%s\n' "$own" | awk 'NF' | sort -u))"
   if [ -n "$lp" ]; then
     ok "lock $O/.orch.lock owned by live controller pid $lp"
@@ -630,13 +645,14 @@ cmd_start() {
     mac)  start_mac ;;
   esac
   pid="$STARTED_PID"
-  [ -n "$pid" ] || unknown "the controller was launched but its pid could not be read — the registry is left unclaimed so a second start is not blocked by a phantom; check: $0 status"
+  [ -n "$pid" ] || unknown "start reported success but no controller pid could be read (neither its status nor this state dir's lock names a provable owner) — the registry is left unclaimed so a second start is not blocked by a phantom; check: $0 status"
   # ⛔ RECORD ONLY A PID THIS STATE DIR CAN PROVE. The fallback chain below can return the pid of a
   # controller running from the SHARED harness path, which on a machine with two repos is the OTHER
   # repo's controller — recording it would report "controller RUNNING" for a repo nothing started,
   # and the record would then refuse every later start as a duplicate (#1856 review). Membership in
   # the state dir's own process set is the only assertion available without a second authority.
-  local owned; owned="$(owned_pids)"
+  local owned; owned="$(owned_pids)" \
+    || unknown "cannot verify that pid $pid is this state dir's controller (ps/etime unreadable) — refusing to record a pid that cannot be checked"
   case "$PLATFORM" in
     cell) ;; # a cell controller is started by the supervisor's tmux session and reported by its
             # `status`; the harness path it execs is NOT repo-scoped, so `owned` may legitimately be
@@ -732,7 +748,7 @@ start_cell() {
   fi
   STARTED_PID="$(await_pid roster_pid_from_status)"
   if [ -z "$STARTED_PID" ]; then
-    STARTED_PID="$(lock_pid)"
+    STARTED_PID="$(lock_pid)" || STARTED_PID=""   # rc 2 (age unreadable) is not a pid
   fi
   # ⛔ NO THIRD FALLBACK. The old last resort (`local_controller_pids | head -1`) could return the pid
   # of a controller started from this cell's SHARED harness path — the other repo's controller on a
@@ -805,14 +821,21 @@ cmd_stop() {
         # The answer is the READ AFTER, never the command's status.
         launchctl unload -w "$plist" 2>/dev/null || true
         sleep 1
-        live="$( { launchd_pid; owned_pids; } | awk 'NF && !s[$0]++' )"
+        # ⛔ THE READS ARE CAPTURED SEPARATELY. `$( { launchd_pid; owned_pids; } | awk )` keeps only
+        # awk's status, so an unreadable `ps` produced an EMPTY `live`, and `stop` then said
+        # "controller stopped" over a live agent and released the registry record (#1856 review,
+        # reproduced with a failing `ps` stub).
+        local lpid lowned
+        lpid="$(launchd_pid)"
+        lowned="$(owned_pids)" || unknown "cannot verify whether the agent is still running (ps/etime unreadable) — refusing to report 'stopped' from an unreadable read"
+        live="$(printf '%s\n%s\n' "$lpid" "$lowned" | awk 'NF && !s[$0]++')"
         [ -z "$live" ] || refuse "launchctl unload returned success but the agent is STILL RUNNING (pid $(pids_join "$live")) — check: launchctl print gui/$(id -u)/$LABEL"
         say "controller stopped (launchd $LABEL)"
       else
         # No agent file does NOT mean no controller: a controller started outside launchd (or whose
         # plist was removed by hand) is still live, and #1761's contradiction 2 is exactly that
         # state. Report it; never claim "not running" over it, and never erase the record.
-        live="$(owned_pids)"
+        live="$(owned_pids)" || unknown "cannot verify whether a controller is running (ps/etime unreadable) — refusing to report 'not running' from an unreadable read"
         if [ -n "$live" ]; then
           refuse "no launchd agent at $plist, but a controller IS running for this state dir (pid $(pids_join "$live")) — stop it by hand (kill $(pids_join "$live")), or give it an agent: $0 start"
         fi
@@ -865,9 +888,9 @@ cmd_status() {
     [ -f "$O/.agent-infra-stamp.json" ] && say "harness:   $(sed -n 's/.*"harness": *"\([^"]*\)".*/\1/p' "$O/.agent-infra-stamp.json" | head -1)"
   fi
   local lp live own foreign
-  lp="$(lock_pid)" || lp=""
-  live="$(local_controller_pids)" || live=""
-  own="$(owned_pids)" || own=""
+  lp="$(lock_pid)" || unknown "cannot determine the lock owner (ps/etime unreadable) — refusing to report a controller state from an unreadable read"
+  live="$(local_controller_pids)" || unknown "cannot read the process table (ps) — refusing to report a controller state from an unreadable read"
+  own="$(owned_pids)" || unknown "cannot determine which controllers belong to this state dir (ps/etime unreadable) — refusing to report a controller state"
   foreign="$(comm -23 <(printf '%s\n' "$live" | awk 'NF' | sort -u) <(printf '%s\n' "$own" | awk 'NF' | sort -u))"
   if [ -n "$own" ]; then
     say "controller: RUNNING  pid $(pids_join "$own")  (lock: ${lp:-none})"

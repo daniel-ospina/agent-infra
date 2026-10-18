@@ -1499,6 +1499,13 @@ qsup start "$Q/tortoise-repo" "$Q/st-explicit" OR=daniel-ospina/tortoise
 [ "$Q_RC" -eq 0 ] && ok "start ACCEPTS an explicit OR that equals the checkout's remote (the override path)" \
                   || bad "start refused an explicit OR that MATCHES the remote — a false block: $Q_OUT"
 
+# (2b) GitHub owner/repo names are CASE-INSENSITIVE: the same pair spelled in another case must be
+# accepted here too, or `check` (which folds) answers "this machine can run it" and `start` then dies
+# — the #1745 false-pass shape on the one fact the design calls single-sourced (#1856 review).
+qsup start "$Q/tortoise-repo" "$Q/st-case" OR=Daniel-Ospina/Tortoise
+[ "$Q_RC" -eq 0 ] && ok "start ACCEPTS an explicit OR that differs from the remote only in CASE (one repo, one queue)" \
+                  || bad "start false-blocked a case-only spelling of the same repo — $Q_OUT"
+
 # (3) A MISMATCH refuses, naming BOTH values, the remote it read, and the repo the machine needs.
 qsup start "$Q/agent-repo" "$Q/st-mismatch" OR=daniel-ospina/tortoise
 [ "$Q_RC" -ne 0 ] && ok "start REFUSES the measured pair (queue=tortoise standing in an agent-infra checkout)" \
@@ -1812,7 +1819,7 @@ esac
 # machine "the session exists" is not evidence that THIS state dir's controller is in it. Measured in
 # review with a tmux double: repo B's `stop` TERMed repo A's live loop and exited 0 — a foreign
 # controller killed by a state dir that could not prove it owned it.
-say_case "session ownership, owned-vs-seen, and a `ps` that cannot answer (#1856 review)"
+say_case 'session ownership, owned-vs-seen, and an unreadable ps table (#1856 review)'
 X="$T/sess"; mkdir -p "$X/home" "$X/oB" "$X/harness" "$X/bin" "$X/repo"
 git init -q "$X/repo" 2>/dev/null || bad "fixture: cannot git init $X/repo"
 git -C "$X/repo" remote add origin https://github.com/daniel-ospina/agent-infra.git 2>/dev/null || true
@@ -1904,7 +1911,7 @@ for verb in status stop; do
     *) bad "$verb: does not name the unreadable read — $X_OUT" ;;
   esac
 done
-kill -9 "$X_PID" 2>/dev/null
+kill -9 "$X_PID" 2>/dev/null; wait "$X_PID" 2>/dev/null
 
 # ── §(p) THE TWO PINNED MIRRORS MUST NOT DRIFT (#1856 review) ───────────────────────────────────
 # cloud-cell-supervisor.sh cannot source scripts/lib/pid-identity.sh (it is deployed STANDALONE into a
@@ -1925,12 +1932,13 @@ if [ -f "$PIB" ]; then
     sed -e 's/_proc_start_epoch/FN_START/g' -e 's/_proc_began_after/FN_AFTER/g' \
         -e 's/pid_start_epoch/FN_START/g'   -e 's/pid_began_after/FN_AFTER/g' \
         -e 's/LOCK_START_SLACK_SECONDS/SLACK/g' -e 's/PID_START_SLACK_SECONDS/SLACK/g' \
-        -e 's/[[:space:]]\+$//' -e '/^[[:space:]]*$/d'
+        -e 's/[[:space:]]\+$//' -e '/^[[:space:]]*$/d' \
+        -e '/^[[:space:]]*#/d'
   }
   SUP_BODY="$( { extract_fn "$SUP" _proc_start_epoch; extract_fn "$SUP" _proc_began_after; } | norm )"
   LIB_BODY="$( { extract_fn "$PIB" pid_start_epoch;    extract_fn "$PIB" pid_began_after;    } | norm )"
   if [ -n "$SUP_BODY" ] && [ -n "$LIB_BODY" ] && [ "$SUP_BODY" = "$LIB_BODY" ]; then
-    ok "the mirror's BODIES are identical to the library's (normalised for the two names)"
+    ok "the mirror's CODE is identical to the library's (names + slack normalised, comments excluded)"
   else
     bad "the supervisor's pid-identity mirror has DRIFTED from $PIB"
     diff <(printf '%s\n' "$LIB_BODY") <(printf '%s\n' "$SUP_BODY") | sed 's/^/      /' | head -20
@@ -1945,6 +1953,113 @@ if [ -f "$PIB" ]; then
 else
   bad "scripts/lib/pid-identity.sh is missing next to the supervisor — the mirrors cannot be checked"
 fi
+
+
+# ── §(p2) AN OCTAL-LOOKING AGE AND A SECOND OWNERSHIP PREDICATE (#1856 review) ────────────────────
+# (a) etime ZERO-PADS, and `$((08 * 3600))` is a bash ERROR — "value too great for base". A live
+#     controller's age hits an 08/09 field a few percent of the time, and a failed age used to read as
+#     "began before the fence" = "this pid IS the owner". The stub prints exactly that age.
+say_case "an 08/09 age field is readable in BOTH copies, and one predicate owns 'is this the lock's controller'"
+mkdir -p "$T/octal"
+cat > "$T/octal/ps" <<'EOS'
+#!/bin/bash
+case "$*" in *etime*) printf '08:31\n'; exit 0 ;; esac
+exec /bin/ps "$@"
+EOS
+chmod +x "$T/octal/ps"
+octal_epoch() { # <file> <function>
+  ( . "$(dirname "$SUP")/lib/pid-identity.sh" 2>/dev/null
+    set +u
+    eval "$(extract_fn "$1" "$2")" 2>/dev/null || exit 1
+    PS_BIN="$T/octal/ps" "$2" $$ )
+}
+LIB_E="$(octal_epoch "$(dirname "$SUP")/lib/pid-identity.sh" pid_start_epoch)"
+SUP_E="$(octal_epoch "$SUP" _proc_start_epoch)"
+case "$LIB_E" in ''|*[!0-9]*) bad "pid_start_epoch: an '08:31' age is UNREADABLE (rc/''=${LIB_E:-<empty>}) — an octal parse error, which the fence reads as ownership" ;;
+                 *) ok "pid_start_epoch: parses an '08:31' age as decimal (epoch $LIB_E)" ;; esac
+case "$SUP_E" in ''|*[!0-9]*) bad "_proc_start_epoch (the standalone mirror): an '08:31' age is UNREADABLE" ;;
+                 *) ok "_proc_start_epoch (the standalone mirror): parses '08:31' as decimal too" ;; esac
+
+# (b) ONE rule for "is this pid the lock's controller". The registry predicate used to accept ANY argv
+#     token ending in orch-loop.sh, so `bash -c "sleep 300; /abs/orch-loop.sh"` — a NON-controller —
+#     was blessed as the owner by check/status and persisted into the durable registry by start_cell,
+#     while the shipped supervisor said STOPPED for the same pid.
+P2R="$T/pred"; mkdir -p "$P2R"
+printf '#!/bin/bash\nsleep 30\n' > "$P2R/orch-loop.sh"
+bash "$P2R/orch-loop.sh" & P2_TRUE=$!
+bash -c "sleep 30; $P2R/orch-loop.sh" & P2_FAKE=$!
+AI1761_PIDS="${AI1761_PIDS:-} $P2_TRUE $P2_FAKE"
+sleep 0.4
+pred() { ( . "$(dirname "$SUP")/lib/orchestrator-registry.sh"; registry_pid_is_controller "$1" ); }
+pred "$P2_TRUE" && ok "registry: ACCEPTS a real 'bash …/orch-loop.sh' invocation" \
+                || bad "registry: rejected a genuine controller invocation"
+pred "$P2_FAKE" && bad "registry: accepted a NON-controller ('bash -c …; /abs/orch-loop.sh') as the lock owner — the supervisor says STOPPED for it" \
+                || ok "registry: REJECTS the bash -c shape the supervisor also rejects (one rule, both surfaces)"
+kill -9 "$P2_TRUE" "$P2_FAKE" 2>/dev/null; wait "$P2_TRUE" "$P2_FAKE" 2>/dev/null
+
+# ── §(q) AN UNDATABLE PID IS NOT AN OWNER, AND "SEEN" IS NOT "ALREADY RUNNING" (#1856 review) ───
+# Two shapes of the same mistake, both reproduced in review:
+#   (a) `_proc_began_after` returned 1 for BOTH "began before" and "cannot tell", and the lock
+#       predicate reads 1 as "this pid is the owner" — so on any box where the etime read fails
+#       (`PS_BIN` shim, a ps without `-o etime`), a stale lock naming a PEER controller became the
+#       owner and `stop` signalled it;
+#   (b) `start` answered rc=0 "already running" for a state dir that started NOTHING, because a
+#       controller for another repo was visible on the shared harness path — a success report for a
+#       repo that is not running, naming a `stop` that the same state dir refuses.
+say_case "an undatable lock owner is not signalable, and a foreign controller is not 'already running' (#1856 review)"
+Y="$T/undatable"; mkdir -p "$Y/home" "$Y/o" "$Y/peer" "$Y/bin" "$Y/etime"
+git init -q "$Y/repo" 2>/dev/null || bad "fixture: cannot git init $Y/repo"
+git -C "$Y/repo" remote add origin https://github.com/daniel-ospina/agent-infra.git 2>/dev/null || true
+cat > "$Y/bin/tmux" <<SH
+#!/bin/bash
+case "\${1:-}" in has-session) exit 1 ;; new-session) : > "$Y/started"; exit 0 ;; *) exit 0 ;; esac
+SH
+chmod +x "$Y/bin/tmux"
+cat > "$Y/peer/orch-loop.sh" <<'STUB'
+#!/bin/bash
+trap 'exit 0' TERM INT
+while :; do sleep 1; done
+STUB
+chmod +x "$Y/peer/orch-loop.sh"
+bash "$Y/peer/orch-loop.sh" & Y_PEER=$!
+AI1761_PIDS="${AI1761_PIDS:-} $Y_PEER"
+sleep 0.5
+# A lock that names the PEER, written BEFORE the peer began: the recycled/shared-lock shape the
+# fence exists for. The peer is a live orch-loop.sh invocation, so only the AGE can exclude it.
+printf '%s\n' "$Y_PEER" > "$Y/o/.orch.lock"
+touch -t "$(date -v-5M +%Y%m%d%H%M.%S 2>/dev/null || date -d '-5 minutes' +%Y%m%d%H%M.%S)" "$Y/o/.orch.lock"
+cat > "$Y/etime/ps" <<'EOS'
+#!/bin/bash
+# The table answers; the AGE does not — a ps without `-o etime`, or a PS_BIN shim.
+case "$*" in *etime*) exit 1 ;; esac
+exec /bin/ps "$@"
+EOS
+chmod +x "$Y/etime/ps"
+y_run() { # <verb> [VAR=value …]
+  Y_OUT="$(env -u OR "$@" PATH="$Y/bin:$PATH" CELL_HOME="$Y/home" ENV_FILE="$Y/keys.env" \
+           SESSION="ai1856-undate-$$" O="$Y/o" REPO="$Y/repo" OR="daniel-ospina/agent-infra" \
+           SCOPE=own HARNESS="$Y/peer" bash "$SUP" "${Y_VERB:-status}" 2>&1)"; Y_RC=$?
+}
+Y_VERB=stop PS_BIN="$Y/etime/ps" y_run
+[ "$Y_RC" -ne 0 ] && ok "stop: refuses when the lock's owner pid cannot be DATED (rc=$Y_RC)" \
+                  || bad "stop: acted on an undatable pid — $Y_OUT"
+kill -0 "$Y_PEER" 2>/dev/null && ok "stop: the undatable peer SURVIVED (an undatable pid is not ours)" \
+                              || bad "stop: KILLED the peer from a pid it could not date"
+# (non-vacuity: with a READABLE age the same lock is correctly excluded and stop says so)
+Y_VERB=stop y_run
+kill -0 "$Y_PEER" 2>/dev/null && ok "control: with a readable age the peer is excluded and survives" \
+                              || bad "control: the peer was killed even with a readable age"
+# (b) start must not answer success for a repo that started nothing. This state dir has no lock and
+# no $O/orch-loop.sh; the peer runs from the harness path this machine shares.
+Y_VERB=start y_run
+[ "$Y_RC" -ne 0 ] && ok "start: REFUSES (rc=$Y_RC) when only a FOREIGN harness-path controller is visible" \
+                  || bad "start: reported success for a repo that started nothing — $Y_OUT"
+case "$Y_OUT" in
+  *"not provably this state dir's"*) ok "start: says the visible controller is not provably this state dir's" ;;
+  *) bad "start: does not say why it refused — $Y_OUT" ;;
+esac
+[ -f "$Y/started" ] && bad "start: created a session anyway" || ok "start: created no session"
+kill -9 "$Y_PEER" 2>/dev/null; wait "$Y_PEER" 2>/dev/null
 
 trap 'ai1711_cleanup; [ -n "${AI1761_PIDS:-}" ] && kill -9 $AI1761_PIDS 2>/dev/null; rm -rf "$T"' EXIT
 

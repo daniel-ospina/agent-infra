@@ -309,7 +309,7 @@ _controller_pids_path() { # <primary-path> <extra-path-or-empty>
 # arm copies it outside any checkout — so it cannot source a sibling library. Two copies of an
 # identity rule that may DRIFT are the #1178 defect ("two contracts for one safety rule",
 # docs/ops/fleet-liveness.md §3), so the pair is pinned by a drift arm in
-# cloud-cell-supervisor.test.sh (§(n)): a divergence reddens CI instead of becoming a kill.
+# cloud-cell-supervisor.test.sh (§(p)): a divergence reddens CI instead of becoming a kill.
 _proc_start_epoch() {
   local p="${1:-}" e d h m s r
   case "$p" in ''|*[!0-9]*) return 1 ;; esac
@@ -324,13 +324,19 @@ _proc_start_epoch() {
     *) return 1 ;;
   esac
   case "$h$m$s" in ''|*[!0-9]*) return 1 ;; esac
+  # ⛔ `10#`, NOT a bare `$(( ))`. etime ZERO-PADS its fields, and bash reads a leading zero as
+  # OCTAL: `$((08 * 3600))` is an ERROR ("value too great for base"). So every process whose age has
+  # an `08`/`09` in its fields made this function fail, and a failed age reads as "began before the
+  # fence" = "this pid IS the lock's owner" (#1856 review, reproduced with a PS_BIN stub printing
+  # `08:31`). Same fix in scripts/lib/pid-identity.sh; §(p) pins the two copies together.
+  h=$((10#${h:-0})); m=$((10#${m:-0})); s=$((10#${s:-0})); d=$((10#${d:-0}))
   printf '%s\n' "$(( $(date +%s) - (d * 86400 + h * 3600 + m * 60 + s) ))"
 }
 # _proc_began_after <pid> <epoch> — the pinned twin of pid_began_after (see the note above).
 _proc_began_after() {
   local pe="${2:-}" ps
-  case "$pe" in ''|*[!0-9]*) return 1 ;; esac
-  ps="$(_proc_start_epoch "${1:-}")" || return 1
+  case "$pe" in ''|*[!0-9]*) return 2 ;; esac
+  ps="$(_proc_start_epoch "${1:-}")" || return 2
   [ "$ps" -gt "$((pe + LOCK_START_SLACK_SECONDS))" ]
 }
 
@@ -360,7 +366,15 @@ lock_controller_pid() {
   case "${2##*/}" in orch-loop.sh) ;; *) return 0 ;; esac
   lt="$(date -r "$LOCK" +%s 2>/dev/null)" || return 0
   [ -n "$lt" ] || return 0
-  _proc_began_after "$p" "$lt" && return 0
+  # ⛔ THREE OUTCOMES, and 2 is NOT 1: folding "cannot tell" into "began before" made an unreadable
+  # age the strongest evidence of ownership, so `stop` signalled whatever a stale lock named on any
+  # box where the etime read fails (#1856 review, reproduced). 2 is propagated as cannot-determine.
+  _proc_began_after "$p" "$lt"
+  case $? in
+    0) return 0 ;;
+    1) ;;
+    *) return 2 ;;
+  esac
   printf '%s\n' "$p"
 }
 # The ONE slack for "this process began after the record was written, so it cannot be the owner".
@@ -374,9 +388,13 @@ LOCK_START_SLACK_SECONDS=5
 # an empty answer is what a broken `ps` returns, and acting on it is how a live controller gets
 # reported STOPPED.
 owned_controller_pids() {
-  local a b
+  local a b rc
   a="$(_controller_pids_path "$O/orch-loop.sh" "")" || return 1
-  b="$(lock_controller_pid)" || return 1
+  # ⛔ `|| return 1` would fold lock_controller_pid's rc 2 (age unreadable) into "cannot read the
+  # process table" — a DIFFERENT cause, right verdict by luck. Propagate the code so the message a
+  # caller prints is true, and so a future caller cannot silently read 2 as "no owner".
+  b="$(lock_controller_pid)"; rc=$?
+  [ "$rc" -eq 0 ] || return "$rc"
   printf '%s\n%s\n' "$a" "$b" | awk 'NF && !s[$0]++'
 }
 # Every controller this cell can SEE — the signalable set plus a $HARNESS-path match. Reported, and
@@ -388,10 +406,11 @@ owned_controller_pids() {
 # OWNED from SEEN, why `stop` proves the SESSION's owner before killing it, and why only
 # `owned_controller_pids` may witness "still alive after stop".
 seen_controller_pids() {
-  local h="" a b
+  local h="" a b rc
   [ -n "$HARNESS" ] && h="$HARNESS/orch-loop.sh"
   a="$(_controller_pids_path "$O/orch-loop.sh" "$h")" || return 1
-  b="$(lock_controller_pid)" || return 1
+  b="$(lock_controller_pid)"; rc=$?
+  [ "$rc" -eq 0 ] || return "$rc"
   printf '%s\n%s\n' "$a" "$b" | awk 'NF && !s[$0]++'
 }
 # The pids in <seen> that are NOT in <owned>: a controller another repo is running from the shared
@@ -503,7 +522,15 @@ resolve_queue_target() {
   esac
   if [ -n "$QUEUE_STATE" ]; then QUEUE_REPO="$QUEUE_DECLARED"; return 1; fi
   QUEUE_REPO="$QUEUE_DECLARED"
-  [ "$QUEUE_DECLARED" = "$QUEUE_DERIVED" ] && { QUEUE_STATE="explicit"; return 0; }
+  # ⛔ FOLD CASE, exactly as `repo_matches_checkout` does: GitHub owner/repo names are case-
+  # insensitive, so `Daniel-Ospina/Tortoise` and `daniel-ospina/tortoise` are ONE repo. A verbatim
+  # comparison refused a pair the entry point's `check` had just passed — the #1745 shape (check says
+  # "this machine can run it", start then dies) on the one fact the design calls single-sourced
+  # (#1856 review, reproduced).
+  if [ "$(printf '%s' "$QUEUE_DECLARED" | tr '[:upper:]' '[:lower:]')" = \
+       "$(printf '%s' "$QUEUE_DERIVED" | tr '[:upper:]' '[:lower:]')" ]; then
+    QUEUE_STATE="explicit"; return 0
+  fi
   QUEUE_STATE="mismatch"
   return 1
 }
@@ -1272,13 +1299,17 @@ cmd_start() {
     || die "cannot read the process table (ps) — refusing to start on an unreadable read"
   own="$(owned_controller_pids)" \
     || die "cannot read the process table (ps) — refusing to start on an unreadable read"
-  if [ -n "$live" ]; then
-    if [ -n "$own" ]; then
-      say "already running (controller pid $(_pids_join "$own")) — use: status | logs | stop"
-    else
-      say "already running (controller pid $(_pids_join "$live")) from the shared harness path — that one is not provably this state dir's; use: status | logs | stop"
-    fi
+  if [ -n "$own" ]; then
+    say "already running (controller pid $(_pids_join "$own")) — use: status | logs | stop"
     return 0
+  fi
+  if [ -n "$live" ]; then
+    # ⛔ NOT "already running", and NOT rc=0. This state dir started NOTHING: the pid runs the harness
+    # path this MACHINE shares, so it is unprovably another repo's controller. Answering 0 said "$OR is
+    # up" when it was not, and named `stop` as the remedy — which this same state dir refuses in this
+    # exact state (#1856 review, reproduced). Starting here would put a second controller on one
+    # queue, which is what #1761 forbids, so refuse and say exactly what is and is not known.
+    die "a controller runs from this machine's shared harness path (pid $(_pids_join "$live")) and is not provably this state dir's — refusing to start a second controller; it is left alone. Give this repo its own SESSION in $ENV_FILE, or stop it from the state dir that owns it"
   fi
   # ── the harness this cell will run, fixed BEFORE anything is seeded (agent-infra#1745) ────────
   # `start` is the one command that applies the proper harness: fetch, pin to $HARNESS_REF in a
