@@ -920,6 +920,14 @@ OR_SHOW="${OR:-}"
 if [ -z "$OR_SHOW" ]; then
   OR_SHOW="$( ( . "$HERE/repo-slug.sh" 2>/dev/null; derive_or "$REPO" "" ) 2>/dev/null || true )"
 fi
+# ⛔ THE DEFAULT IS RESOLVED OUTSIDE THE HEREDOC (measured on this rebase, 2026-10-18). Nesting it —
+# `${OR_SHOW:-<derived from this checkout's origin by the loop>}` — made bash report
+# `bad substitution: no closing '}'` at this heredoc: the apostrophe in "checkout's" OPENS a quote
+# that `${…}` cannot close, so install.sh exited 1 on EVERY run (no plist, no guidance) and both
+# install suites reddened: install-launchd-durability 11 failures, selftest §install 4. Same class as
+# the `$(case … esac)`-in-a-heredoc bug below — computed first, printed second.
+OR_SHOW_TEXT="$OR_SHOW"
+[ -n "$OR_SHOW_TEXT" ] || OR_SHOW_TEXT="<derived from the checkout origin by the loop>"
 
 cat <<EOF
 
@@ -927,7 +935,7 @@ cat <<EOF
 
   harness   $O
   provenance  $STAMP   (which harness commit this box runs — agent-infra#1745)
-  repo      $REPO   (${OR_SHOW:-<derived from this checkout's origin by the loop>})
+  repo      $REPO   ($OR_SHOW_TEXT)
   limits    lanes=$MAX_LANES (default: 2.5x cores unless pinned) review=$MAX_REVIEW fix=$MAX_FIX fix_tries=$MAX_FIX_TRIES
             max_load=$MAX_LOAD min_swap_free=${MIN_SWAP_FREE}M min_mem_free_mb=${MIN_MEM_FREE_MB}M batch=$BATCH cycle=${CYC}s
             merge_priority_at=${MERGE_PRIORITY_AT} UNOWNED open PRs
