@@ -354,7 +354,10 @@ check_caches() {
       */pip)      name="pip" ;;
     esac
     if [ ! -e "$path" ]; then mb="absent"; else
-      mb="$(du -sk "$path" 2>/dev/null | awk 'NR==1 && $1 ~ /^[0-9]+$/ {print int($1 / 1024)}')"
+      # "$path/" — the trailing slash dereferences a SYMLINKED sink (`ln -s /data/uv ~/.cache/uv`, the
+      # standard small-root-disk workaround). `du -sk <link>` reports 0, so the one line that is
+      # supposed to make a growing disk visible would say the cache is empty.
+      mb="$(du -sk "$path/" 2>/dev/null | awk 'NR==1 && $1 ~ /^[0-9]+$/ {print int($1 / 1024)}')"
       [ -n "$mb" ] || mb="UNMEASURABLE"
     fi
     report="$report $name=$mb"
@@ -363,7 +366,7 @@ check_caches() {
   ok "package caches:$report (bound ${max_mb}MB each) — ${free_mb:-unknown}MB free on $(dirname "$CELL_HOME")"
   if [ -n "$over" ]; then
     warn "package cache over the ${max_mb}MB bound:$over — it is shared by EVERY lane on this box and it is what filled pi-cell-3's disk (#1987). The hourly sweep reclaims it; to do it now:"
-    warn "  bash ${HOME:-$CELL_HOME}/.pi/agent/scripts/pi-cache-reaper.sh    (or: cloud-cell-supervisor.sh prune)"
+    warn "  bash ${HOME:-$CELL_HOME}/.pi/agent/scripts/pi-cache-reaper.sh --apply    (or: cloud-cell-supervisor.sh prune)"
   fi
 }
 

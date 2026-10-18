@@ -1107,6 +1107,17 @@ chmod +x "$REAPER_FIX"
 prunesup --caches
 [ -f "$R/reaper-calls" ] && ok "prune --caches INVOKES the package-cache reaper (the shared sinks are in reach)" \
                           || bad "prune --caches never invoked the reaper — the disk gate's remedy still does not reclaim the measured consumer"
+# The reaper's refuse-to-act verdict must not be flattened: this verb IS the remedy the disk gate's
+# refusal text names, so a caller checking $? has to be able to tell "reclaimed" from "refused".
+{ echo '#!/bin/sh'; echo 'exit 3'; } > "$REAPER_FIX"
+chmod +x "$REAPER_FIX"
+prunesup --caches
+[ "$PR_RC" -ne 0 ] && ok "a reaper that refuses (exit 3) makes prune exit non-zero, not 0 with a warning" \
+                   || bad "prune exited 0 while the cache reaper refused — the remedy reports success without reclaiming"
+case "$PR_OUT" in
+  *"still over its bound"*) ok "the refusal is still named on the output" ;;
+  *) bad "the propagated failure was not named — output: $PR_OUT" ;;
+esac
 rm -f "$REAPER_FIX"
 prunesup --caches
 case "$PR_OUT" in

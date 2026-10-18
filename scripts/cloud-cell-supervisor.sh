@@ -1422,8 +1422,13 @@ cmd_prune() {
   # reported, never silently skipped: that is the "success while freeing nothing" shape on the one
   # command an operator reaches for when the cell is already disk-dead.
   local reaper="$CELL_HOME/.pi/agent/scripts/pi-cache-reaper.sh"
+  local cache_rc=0
   if [ -x "$reaper" ]; then
-    "$reaper" || say "warn: the package-cache sweep reported a cache still over its bound (see $CELL_HOME/.pi/agent/state/pi-cache-reaper.log) — nothing else on this box reclaims it"
+    # `--apply`: the script ships dry-run (the fleet's reaper convention); THIS verb is the arming step
+    # for an operator who is already disk-dead, so it must actually reclaim. ⛔ Its rc is PROPAGATED:
+    # this command is the remedy the disk gate's refusal text names, so "reclaimed" and "refused, still
+    # over the bound" must not both exit 0 — a caller checking $? could not tell them apart.
+    "$reaper" --apply || { cache_rc=$?; say "warn: the package-cache sweep reported a cache still over its bound (see $CELL_HOME/.pi/agent/state/pi-cache-reaper.log) — nothing else on this box reclaims it"; }
   else
     say "warn: no package-cache reaper at $reaper — the shared caches (~/.cache/uv, ~/.npm/_cacache, ~/.cache/pip) were NOT swept"
   fi
@@ -1443,7 +1448,7 @@ cmd_prune() {
       < <(git -C "$r" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10)}')
     sweep_root_caches "$r"
   done
-  [ "$caches_only" = 1 ] && { after="$(free_mb "$CELL_HOME")"; [ -n "$before" ] && [ -n "$after" ] && say "prune: free ${before}MB → ${after}MB"; return 0; }
+  [ "$caches_only" = 1 ] && { after="$(free_mb "$CELL_HOME")"; [ -n "$before" ] && [ -n "$after" ] && say "prune: free ${before}MB → ${after}MB"; return "$cache_rc"; }
   # (3) /tmp review scratch. REPORTED, never deleted implicitly: a scratch checkout is source, and
   # the brief is explicit that source may be unmerged work. --scratch deletes only what is (a) a git
   # checkout, (b) NOT a registered worktree, and (c) older than DAYS.
@@ -1473,6 +1478,7 @@ cmd_prune() {
   [ "$freed_scratch" = 1 ] || true
   after="$(free_mb "$CELL_HOME")"
   [ -n "$before" ] && [ -n "$after" ] && say "prune: free ${before}MB → ${after}MB"
+  return "$cache_rc"
 }
 
 case "${1:-status}" in

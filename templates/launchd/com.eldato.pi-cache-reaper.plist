@@ -21,9 +21,11 @@
          job exit 3 loudly rather than report a reclaim that did not happen (the issue's point 4).
 
          ARMED, unlike the retention sweep above: this content is REGENERABLE BY DEFINITION (a wheel
-         cache), the ladder's first rung is the tool's own prune, and the second rung cannot touch a
-         byte a venv still holds. Disarming is CACHE_REAPER_MAX_MB raised (or an operator editing
-         this file); there is no data-loss class here, so there is no separate arming step.
+         cache) and the ladder's first rung is the tool's own prune. The SCRIPT ships dry-run (the
+         fleet's reaper convention, docs/ops/task-runs-retention.md); THIS JOB is the arming step,
+         and it passes the apply flag explicitly (line 2 of ProgramArguments). Disarming the job is
+         dropping that argument (or raising CACHE_REAPER_MAX_MB); there is no data-loss class here,
+         so no separate owner ceremony.
          Canonical script: agent-infra/scripts/pi-cache-reaper.sh (farmed to
          {{HOME}}/.pi/agent/scripts/ by pi-bootstrap/setup.sh; #427: launchd cannot read
          ~/Documents under macOS TCC). Rendered by scripts/install-launchd.sh (#304). -->
@@ -34,6 +36,7 @@
         <string>/usr/bin/env</string>
         <string>bash</string>
         <string>{{HOME}}/.pi/agent/scripts/pi-cache-reaper.sh</string>
+        <string>--apply</string>
     </array>
     <key>EnvironmentVariables</key>
     <dict>

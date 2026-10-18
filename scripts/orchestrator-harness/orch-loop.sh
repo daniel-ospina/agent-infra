@@ -1066,10 +1066,13 @@ while true; do
   # launchd job already ran, so running from both surfaces costs one `du` and nothing else.
   # Hourly, in the background, never blocking the sweep — and a missing script is a no-op (the
   # launcher farms it, but a controller running from a bare checkout must not break on its absence).
+  # `--apply` because this cadence IS the cell's armed surface: the script itself ships dry-run (the
+  # fleet's reaper convention, docs/ops/task-runs-retention.md), and a cell — with no launchd to carry
+  # an armed plist — has to name it.
   CACHE_REAPER="${CACHE_REAPER:-$HOME/.pi/agent/scripts/pi-cache-reaper.sh}"
   if [ -x "$CACHE_REAPER" ] && [ -z "$(find "$O/state/.cache-reaped" -mmin -60 2>/dev/null)" ]; then
     touch "$O/state/.cache-reaped"
-    ( "$CACHE_REAPER" >> "$LOG" 2>&1 || echo "[cache-reaper] rc=$? — a package cache is over its bound and was NOT brought under it" >> "$LOG" ) &
+    ( "$CACHE_REAPER" --apply >> "$LOG" 2>&1 || echo "[cache-reaper] rc=$? — a package cache is over its bound and was NOT brought under it" >> "$LOG" ) &
   fi
 
   # ── ownership: the merge-priority gate's input ──────────────────────────────

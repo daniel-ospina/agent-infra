@@ -41,6 +41,8 @@
 #              the same lock uv waits on (verified against uv 0.12.5: with `.lock` held,
 #              `uv cache prune` prints "Cache is currently in-use, waiting for other uv processes
 #              to finish"), so "lock free" is uv's own answer to "is a lane working in this cache".
+#              The lock is HELD for the whole escalation, not probed and dropped: a probe answers a
+#              question about the past, and the deletes run seconds after it.
 #        npm — `npm cache clean --force` (npm has no partial prune; index-v5 is not ours to edit).
 #        pip — `pip cache purge` (pip has no prune at all).
 #      npm/pip ship no lock file, so their gate is a `ps` probe for a live npm/npx/pip/pip3; a
@@ -51,7 +53,9 @@
 #
 # REFUSE-TO-ACT (the issue's point 4). A reaper that reports success while freeing nothing is the
 # failure mode this repo keeps hitting. Exit 0 means EVERY present sink is at or under the bound,
-# measured after the ladder ran. Exit 3 means at least one sink is still over the bound, or the
+# measured after the ladder ran — and the exit code is a statement about the SINKS, not about whether
+# work was performed, so a dry run that finds a sink over the bound also exits 3 (nothing attempted,
+# but the bound is not met). Exit 3 means at least one sink is still over the bound, or the
 # ladder could not be attempted (lock held / lock state undeterminable / tool missing / a step
 # failed / a sink could not be measured / the log cannot be written), and the line says which sink
 # and why — including, for uv, how many bytes sit in entries a venv still hardlinks into. A sink
@@ -63,18 +67,19 @@
 #
 # Usage:
 #   pi-cache-reaper.sh [--dry-run] [--apply] [--max-mb N] [--help]
-#     (no mode flag)  act: prune, and escalate under the lock gate (or CACHE_REAPER_DRY_RUN=0)
-#     --dry-run       report what would be done, delete nothing (CACHE_REAPER_DRY_RUN=1)
-#     --apply         explicit act
+#     (no mode flag)  DRY-RUN: report what would be done, delete nothing (the default)
+#     --dry-run       same as the default (CACHE_REAPER_DRY_RUN=1)
+#     --apply         arm it: prune, and escalate under the lock gate (CACHE_REAPER_DRY_RUN=0)
 #     --max-mb N      per-sink bound in MiB (default CACHE_REAPER_MAX_MB or 2048)
 #
 # Env seams (tests drive these; nothing else should need them):
 #   UV_CACHE_DIR NPM_CACHE_DIR PIP_CACHE_DIR   the sinks (defaults under $HOME)
-#   CACHE_REAPER_MAX_MB (2048)  CACHE_REAPER_DRY_RUN (0)  CACHE_REAPER_LOG
+#   CACHE_REAPER_MAX_MB (2048)  CACHE_REAPER_DRY_RUN (1)  CACHE_REAPER_LOG
 #   UV_BIN NPM_BIN PIP_BIN   tool binaries (default: `command -v <tool>`)
 #   PS_BIN (default /bin/ps)  PYTHON_BIN (default `command -v python3`)
 #
-# Exit codes: 0 = every present sink within the bound, 2 = usage, 3 = fail-closed (see above).
+# Exit codes: 0 = every present sink within the bound, 2 = usage, 3 = a sink is over the bound (or
+# the ladder could not be attempted) — including under --dry-run, where nothing was attempted.
 
 set -uo pipefail
 
@@ -82,7 +87,12 @@ SCRIPT_NAME="pi-cache-reaper.sh"
 ISSUE_REF="#1987"
 
 MAX_MB="${CACHE_REAPER_MAX_MB:-2048}"
-DRY_RUN="${CACHE_REAPER_DRY_RUN:-0}"
+# ⛔ DRY-RUN IS THE DEFAULT (the fleet's reaper convention: pi-reap-idle.sh, pi-reap-worktrees.sh and
+# pi-task-session-prune.sh all ship inert, and arming is a separate, explicit act — recorded decision in
+# docs/ops/task-runs-retention.md). Every ARMED caller passes `--apply`: the launchd template, the
+# cell's orch-loop cadence, and `cloud-cell-supervisor.sh prune`. A bare `bash pi-cache-reaper.sh` is
+# therefore a report, never a delete.
+DRY_RUN="${CACHE_REAPER_DRY_RUN:-1}"
 PS_BIN="${PS_BIN:-/bin/ps}"
 LOG="${CACHE_REAPER_LOG:-}"
 MODE="act"
@@ -100,9 +110,9 @@ $SCRIPT_NAME — bound the machine-global package caches ($ISSUE_REF)
 Usage:
   $SCRIPT_NAME [--dry-run] [--apply] [--max-mb N] [--help]
 
-  (no mode flag)  act: prune, then escalate under the lock gate
-  --dry-run       report what would be done, delete nothing
-  --apply         explicit act
+  (no mode flag)  DRY-RUN: report what would be done, delete nothing (the default)
+  --dry-run       same as the default
+  --apply         arm it: prune, then escalate under the lock gate
   --max-mb N      per-sink bound in MiB (default ${MAX_MB})
 
 Sinks: \$UV_CACHE_DIR, \$NPM_CACHE_DIR, \$PIP_CACHE_DIR (defaults under \$HOME).
@@ -126,11 +136,19 @@ while [ "$#" -gt 0 ]; do
     shift
 done
 case "${MAX_MB:-}" in ''|*[!0-9]*) printf '%s: --max-mb must be a whole number of MiB (got %s)\n' "$SCRIPT_NAME" "${MAX_MB:-<empty>}" >&2; exit 2 ;; esac
-# A zero bound would ask the reaper to empty every cache, and a 10-digit one is not a disk. Coerce
-# the absurd to the documented default rather than acting on it.
-[ "$((10#$MAX_MB))" -ge 1 ] || MAX_MB=2048
-[ "${#MAX_MB}" -le 6 ] || MAX_MB=2048
 MAX_MB="$((10#$MAX_MB))"
+# ⛔ REFUSE an out-of-range bound; never silently repair it. A repaired pin acts on a bound the
+# operator did not ask for — the worst direction here (a 0 bound would empty every cache, and a
+# "bound" above 999999 MiB is a typo, not a policy). MEMORY.md [bash] records the contract: a value
+# the script accepts must be the value it uses, and a bad explicit pin is refused, not rewritten.
+if [ "$MAX_MB" -lt 1 ]; then
+    printf '%s: --max-mb must be at least 1 MiB (got %s) — a 0 bound would empty every cache\n' "$SCRIPT_NAME" "$MAX_MB" >&2
+    exit 2
+fi
+if [ "$MAX_MB" -gt 999999 ]; then
+    printf '%s: --max-mb %s MiB is not a plausible package-cache bound (max 999999) — refusing rather than acting on a different bound\n' "$SCRIPT_NAME" "$MAX_MB" >&2
+    exit 2
+fi
 case "${DRY_RUN:-}" in 0|1) ;; *) DRY_RUN=1 ;; esac
 
 # ── sinks ─────────────────────────────────────────────────────────────────────
@@ -176,7 +194,13 @@ dir_mb() {
     local kb
     [ -e "$1" ] || { printf '0\n'; return 0; }
     [ -d "$1" ] || return 1
-    kb="$(du -sk "$1" 2>/dev/null | awk 'NR==1 && $1 ~ /^[0-9]+$/ {print $1}')"
+    # ⛔ "$1/" — with the trailing slash, deliberately. `du -sk <path>` does NOT follow a symlink's
+    # final component, so a sink moved onto another volume (`ln -s /data/uv ~/.cache/uv`, the standard
+    # small-root-disk workaround — the very situation this reaper exists for) measured **0 MB** and
+    # read as "within the bound": a FALSE PASS, exit 0, on the layout most likely to need the bound.
+    # The slash dereferences the sink ITSELF and nothing inside it (verified: `du -sk link` -> 0,
+    # `du -sk link/` -> the real size). A sink that cannot be measured is still a refusal, never a 0.
+    kb="$(du -sk "$1/" 2>/dev/null | awk 'NR==1 && $1 ~ /^[0-9]+$/ {print $1}')"
     [ -n "${kb:-}" ] || return 1
     printf '%s\n' "$(( 10#$kb / 1024 ))"
 }
@@ -184,37 +208,87 @@ dir_mb() {
 human_mb() { printf '%sMB' "$1"; }
 
 # ── holders: is a live process working in this sink? ─────────────────────────────
-# uv_lock_free <cache-root> — uv's own answer, on uv's own lock file.
-#   0 = free/absent (no uv process is working in this cache)
-#   1 = HELD     (a uv process is mid-operation; uv itself waits here)
-#   2 = cannot determine (no python3, lock unreadable) — the caller must treat it as HELD
-# Verified against uv 0.12.5: with `.lock` held, `uv cache prune` prints "Cache is currently
-# in-use, waiting for other uv processes to finish".
-uv_lock_free() {
-    local root="$1" lock="$1/.lock" py
-    [ -e "$lock" ] || return 0
+# uv_lock_hold <cache-root> — acquire uv's OWN lock and HOLD it for the whole escalation.
+#   0 = we hold it (the caller MUST call uv_lock_release)
+#   1 = HELD by a live uv process
+#   2 = cannot determine (no python3, unreadable lock, a probe that could not start)
+# ⛔ WHY HOLD RATHER THAN PROBE. The first shape ACQUIRED the lock and RELEASED it, then deleted
+# entries seconds later — a whole-cache `du` plus a per-entry `find`/`rm` — so a lane's `uv sync`
+# starting in that window resolved against a cache being unlinked under it. That is check-then-act,
+# and the issue is explicit: "only escalate while no lane holds the lock". A probe answers a question
+# about the PAST; holding answers it for the whole operation.
+# Verified against uv 0.12.5: with `.lock` held, `uv cache prune` prints "Cache is currently in-use,
+# waiting for other uv processes to finish", i.e. uv waits on this same flock.
+# The holder is a python process (macOS ships no `flock(1)`). It releases on the marker this shell
+# touches, and it also exits when its PARENT changes, so a shell that dies mid-escalation cannot
+# leave uv's lock held (a stale holder would block every lane on the box).
+uv_lock_hold() {
+    local root="$1" lock="$1/.lock" py dir pid i
+    [ -e "$lock" ] || return 0      # uv does not lock this cache: nothing to hold
     py="${PYTHON_BIN:-$(command -v python3 2>/dev/null)}"
     [ -n "${py:-}" ] || return 2
-    "$py" - "$lock" <<'PY'
-import fcntl, sys
+    dir="$(mktemp -d "${TMPDIR:-/tmp}/pi-cache-reaper-lock.XXXXXX" 2>/dev/null)" || return 2
+    "$py" - "$lock" "$dir/ready" "$dir/release" >/dev/null 2>&1 <<'PY' &
+import fcntl, os, sys, time
+lock, ready, release = sys.argv[1], sys.argv[2], sys.argv[3]
 try:
-    handle = open(sys.argv[1], "r+b")
+    handle = open(lock, "r+b")
 except OSError:
-    sys.exit(2)          # unreadable lock: cannot determine -> treat as held
+    sys.exit(2)          # unreadable lock: cannot determine -> treated as held
 try:
     fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
 except OSError:
     sys.exit(1)          # held by a live uv process
+parent = os.getppid()
 try:
-    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-finally:
-    handle.close()
+    open(ready, "w").close()
+except OSError:
+    sys.exit(2)
+deadline = time.time() + 600
+while time.time() < deadline:
+    if os.path.exists(release) or os.getppid() != parent:
+        break
+    time.sleep(0.05)
 sys.exit(0)
 PY
+    pid=$!
+    i=0
+    while [ "$i" -lt 200 ]; do
+        [ -e "$dir/ready" ] && break
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.05; i=$(( i + 1 ))
+    done
+    if [ ! -e "$dir/ready" ]; then
+        # The child is either done (it refused) or never signalled. Kill, reap, classify.
+        kill "$pid" 2>/dev/null
+        wait "$pid" 2>/dev/null
+        case "$?" in
+            1) rm -rf -- "$dir"; return 1 ;;   # held by a live uv process
+            *) rm -rf -- "$dir"; return 2 ;;   # unreadable / no answer: never clearance
+        esac
+    fi
+    UV_LOCK_PID="$pid"; UV_LOCK_DIR="$dir"
+    return 0
+}
+
+uv_lock_release() {
+    [ -n "${UV_LOCK_DIR:-}" ] || return 0
+    : > "$UV_LOCK_DIR/release" 2>/dev/null || true
+    wait "$UV_LOCK_PID" 2>/dev/null || true
+    rm -rf -- "$UV_LOCK_DIR" 2>/dev/null || true
+    UV_LOCK_PID=""; UV_LOCK_DIR=""
 }
 
 # ps_busy <ere> — 0 = a matching process is live, 1 = none, 2 = the probe itself failed
 # (a failed probe is BUSY to the caller: fail closed, never delete on an unknown).
+# ⛔ THE PATTERN MUST MATCH THE ARGV SHAPE THE TOOL ACTUALLY HAS. npm's bin is a node script
+# (`npm-cli.js`, shebang `#!/usr/bin/env node`), so a live install looks like
+#
+#     1234 node /usr/lib/node_modules/npm/bin/npm-cli.js install
+#
+# — "npm" followed by `-`, no space and no end-of-line. A pattern requiring `([[:space:]]|$)` after
+# the tool name answered CLEAR on exactly that line (measured) and the gate then wiped the cache under
+# a live `npm ci`. Match a tool name as a path component/word instead: any non-LETTER terminator.
 ps_busy() {
     local re="$1" out
     out="$("$PS_BIN" -axo pid=,command= 2>/dev/null)" || return 2
@@ -224,19 +298,36 @@ ps_busy() {
 }
 
 # ── prune rung (upstream's in-use-safe command) ──────────────────────────────────
+# npm_cache_root <sink-path> — the value npm's OWN `--cache` wants. npm's layout is
+# <cache-root>/_cacache, so the sink this reaper measures (`~/.npm/_cacache`) is one level BELOW the
+# root npm must be told. Passing nothing was a real defect: `NPM_CACHE_DIR` is not an npm variable, so
+# `npm cache verify` / `npm cache clean --force` acted on the DEFAULT `~/.npm/_cacache` — a directory
+# this reaper never measured — while the named sink stayed over the bound (verified: with
+# NPM_CACHE_DIR set, `npm cache verify` still reports `~/.npm/_cacache`; with `--cache` it reports the
+# named one). A seam that is not `_cacache` is treated as the root itself (npm then uses
+# `<root>/_cacache`, which is inside the tree that was measured).
+npm_cache_root() {
+    case "$(basename "$1")" in
+        _cacache) dirname "$1" ;;
+        *)        printf '%s' "$1" ;;
+    esac
+}
+
 # run_prune <sink> — 0 ran, 1 no prune exists / tool absent (caller escalates), 2 the tool failed
 run_prune() {
-    local sink="$1" bin rc
+    local sink="$1" bin rc path
+    path="$(sink_path "$sink")" || return 1
     case "$sink" in
         uv)
             bin="${UV_BIN:-$(command -v uv 2>/dev/null)}"
             [ -n "${bin:-}" ] || return 1
-            UV_CACHE_DIR="$(sink_path uv)" "$bin" cache prune >>"$LOG" 2>&1; rc=$?
+            # The FLAG pins the sink the reaper measured, whatever the caller's environment says.
+            UV_CACHE_DIR="$path" "$bin" cache prune --cache-dir "$path" >>"$LOG" 2>&1; rc=$?
             ;;
         npm)
             bin="${NPM_BIN:-$(command -v npm 2>/dev/null)}"
             [ -n "${bin:-}" ] || return 1
-            "$bin" cache verify >>"$LOG" 2>&1; rc=$?
+            "$bin" cache verify --cache "$(npm_cache_root "$path")" >>"$LOG" 2>&1; rc=$?
             ;;
         pip) return 1 ;;   # pip has no prune; escalation is the only reclaim it offers
         *)   return 1 ;;
@@ -299,7 +390,10 @@ uv_escalate() {
     limit_kb=$(( max * 1024 ))
     # One measurement of the whole cache, then per-entry sizes; the running total is adjusted by
     # each entry's own size so the loop does not re-walk a multi-GB tree per entry.
-    total_kb="$(du -sk "$root" 2>/dev/null | awk 'NR==1 && $1 ~ /^[0-9]+$/ {print $1}')"
+    # `"$root/"` for the same reason dir_mb uses it: `du -sk` on a SYMLINKED cache root reports 0, and
+    # a 0 total makes the whole escalation loop a no-op that reports success (found by the symlink
+    # fixture: the pass returned "prune+escalate" having freed nothing).
+    total_kb="$(du -sk "$root/" 2>/dev/null | awk 'NR==1 && $1 ~ /^[0-9]+$/ {print $1}')"
     [ -n "${total_kb:-}" ] || return 2
     [ -d "$arch" ] || return 0        # nothing entry-shaped to reclaim (uv may change its layout)
     set -- "$arch"/*
@@ -337,7 +431,7 @@ escalate() {
     local sink="$1" path="$2" bin rc
     case "$sink" in
         uv)
-            uv_lock_free "$path"; rc=$?
+            uv_lock_hold "$path"; rc=$?
             case "$rc" in
                 0) : ;;
                 1) say "deferred: $sink cache is IN USE (uv holds $path/.lock) — not deleting a cache a lane is resolving against"
@@ -347,25 +441,28 @@ escalate() {
                    log "deferred sink=uv path=$path reason=lock-unknown"
                    return 1 ;;
             esac
+            # ⛔ The lock is HELD across the deletes (released below), so no lane can start resolving
+            # into this cache inside the escalation window.
             uv_escalate "$path" "$MAX_MB"; rc=$?
+            uv_lock_release
             case "$rc" in
                 0) log "escalated sink=uv path=$path entries=$REMOVED shared=$SHARED_ENTRIES/$(human_mb "$(( SHARED_KB / 1024 ))") unknown=$UNKNOWN_ENTRIES" ;;
                 *) log "escalate-failed sink=uv path=$path rc=$rc"; return 2 ;;
             esac
             ;;
         npm)
-            holder_gate_ps npm "$path" '(^|[[:space:]/])(npm|npx)([[:space:]]|$)' || return 1
+            holder_gate_ps npm "$path" '(^|[[:space:]/])(npm|npx)([^[:alpha:]]|$)' || return 1
             bin="${NPM_BIN:-$(command -v npm 2>/dev/null)}"
             [ -n "${bin:-}" ] || { say "cannot escalate: no npm on PATH and $path is over the bound"; log "escalate-failed sink=npm path=$path reason=tool-absent"; return 2; }
-            "$bin" cache clean --force >>"$LOG" 2>&1 || { log "escalate-failed sink=npm path=$path reason=clean-rc"; return 2; }
-            log "escalated sink=npm path=$path via=npm-cache-clean"
+            "$bin" cache clean --force --cache "$(npm_cache_root "$path")" >>"$LOG" 2>&1 || { log "escalate-failed sink=npm path=$path reason=clean-rc"; return 2; }
+            log "escalated sink=npm path=$path via=npm-cache-clean cache_root=$(npm_cache_root "$path")"
             ;;
         pip)
-            holder_gate_ps pip "$path" '(^|[[:space:]/])(pip|pip3)([[:space:]]|$)' || return 1
+            holder_gate_ps pip "$path" '(^|[[:space:]/])(pip|pip3)([^[:alpha:]]|$)' || return 1
             bin="${PIP_BIN:-$(command -v pip3 2>/dev/null || command -v pip 2>/dev/null)}"
             [ -n "${bin:-}" ] || { say "cannot escalate: no pip on PATH and $path is over the bound"; log "escalate-failed sink=pip path=$path reason=tool-absent"; return 2; }
-            "$bin" cache purge >>"$LOG" 2>&1 || { log "escalate-failed sink=pip path=$path reason=purge-rc"; return 2; }
-            log "escalated sink=pip path=$path via=pip-cache-purge"
+            "$bin" cache purge --cache-dir "$path" >>"$LOG" 2>&1 || { log "escalate-failed sink=pip path=$path reason=purge-rc"; return 2; }
+            log "escalated sink=pip path=$path via=pip-cache-purge cache_dir=$path"
             ;;
         *) return 2 ;;
     esac
@@ -393,9 +490,13 @@ reap_sink() {
         return 0
     fi
     if [ "$DRY_RUN" = 1 ]; then
-        say "$sink  $path  $(human_mb "$before") OVER max=$(human_mb "$MAX_MB") — DRY-RUN, nothing deleted (prune, then escalate)"
+        say "$sink  $path  $(human_mb "$before") OVER max=$(human_mb "$MAX_MB") — DRY-RUN, nothing deleted (would prune, then escalate)"
         log "dry-run sink=$sink path=$path mb=$before max=$MAX_MB"
-        return 0
+        # ⛔ Still a NON-PASS. The exit code is a statement about the SINKS, not about whether work was
+        # performed, so a dry run over the bound must not report the bound as met — otherwise the
+        # reaper's own disarm doubles as a green "check" on a 7 GB cache (the class of false PASS this
+        # issue exists to end).
+        return 1
     fi
     # Rung 2: prune.
     run_prune "$sink"; rc=$?
@@ -455,7 +556,11 @@ main() {
         reap_sink "$sink" || rc=3
     done
     if [ "$rc" -ne 0 ]; then
-        warn "a package cache is over the ${MAX_MB}MB bound and was NOT brought under it — the disk this reaper exists to protect is still being consumed (see the lines above and $LOG)"
+        if [ "$DRY_RUN" = 1 ]; then
+            warn "a package cache is over the ${MAX_MB}MB bound (DRY-RUN: nothing was attempted, see the lines above and $LOG) — re-run with --apply to reclaim it"
+        else
+            warn "a package cache is over the ${MAX_MB}MB bound and was NOT brought under it — the disk this reaper exists to protect is still being consumed (see the lines above and $LOG)"
+        fi
         log "end rc=$rc"
         exit 3
     fi
@@ -463,4 +568,8 @@ main() {
     exit 0
 }
 
-main "$@"
+# Sourcing this file (for the tests that exercise the lock holder directly) must NOT run a pass.
+if [ "${BASH_SOURCE[0]:-$0}" = "$0" ]; then
+    main "$@"
+fi
+

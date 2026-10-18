@@ -25,6 +25,14 @@
 #      controller cadence), `pi-bootstrap/setup.sh` farms the script the plist names, bringup reports
 #      the cache size, and this suite is in the one shard list both lanes run. A reaper nothing
 #      invokes is the bug, not the fix.
+#   I. a SYMLINKED sink is measured, not read as 0 MB (`ln -s /data/uv ~/.cache/uv` is the standard
+#      small-root-disk workaround — the layout most likely to need the bound).
+#   J. DRY-RUN IS THE DEFAULT: no mode flag deletes nothing; `--apply` acts.
+#   K. an out-of-range `--max-mb` is REFUSED (exit 2), never silently repaired into a different bound.
+#   L. npm/pip act on the sink that was MEASURED (npm needs `--cache <root>`, pip `--cache-dir <dir>`),
+#      not on their own defaults.
+#   M. the uv lock is HELD for the whole escalation (a competing acquire fails while it is held), and
+#      the holder cleans up after itself.
 #
 # Hermetic: temp HOME with fixture cache trees, stub `uv`/`npm`/`pip3`/`ps` on PATH, no network, no
 # real cache touched. Run: bash scripts/pi-cache-reaper.test.sh
@@ -135,7 +143,12 @@ BEFORE="$(sink_mb "$H/.cache/uv")"
 : > "$T/stub.log"
 REAPER_ARGS=(--dry-run --max-mb 10)
 OUT="$(run_reaper "$H")"; RC=$?
-[ "$RC" -eq 0 ] && ok "dry-run exits 0 (nothing attempted)" || bad "dry-run exited $RC"
+# A dry run attempts nothing, but its rc is a statement about the SINKS: an over-bound sink must not
+# read as green just because the reaper was disarmed (that would make the disarm a false "check").
+[ "$RC" -eq 3 ] && ok "dry-run exits 3 while a sink is over the bound (nothing attempted, bound not met)" \
+                || bad "dry-run exited $RC — an over-bound sink must not be a green verdict"
+grep -qF "DRY-RUN: nothing was attempted" <<<"$OUT" && ok "the dry-run refusal says nothing was attempted and names --apply" \
+                                                || bad "the dry-run refusal did not distinguish 'nothing attempted'"
 grep -qF "OVER max=10MB" <<<"$OUT" && ok "dry-run REPORTS the fixture as over the bound" \
                                      || bad "dry-run did not report the fixture as over the bound"
 AFTER="$(sink_mb "$H/.cache/uv")"
@@ -228,6 +241,20 @@ grep -qF "npm cache clean" "$T/stub.log" && bad "npm cache was cleaned while an 
 [ "$RC" -eq 3 ] && ok "the deferred npm sink is a refusal (exit 3), not a pass" \
                 || bad "expected exit 3, got $RC"
 : > "$T/stub.log"
+# ⛔ THE SHAPE THAT MATTERS: npm's bin is a node script (npm-cli.js), so a real install appears as
+#   node /usr/lib/node_modules/npm/bin/npm-cli.js install
+# — no space after the tool name. A probe requiring a space there answered CLEAR and the cache was
+# wiped under a live npm ci (agent-infra#1987 review, P1).
+OUT="$(run_reaper "$H" PS_OUT=' 1234 node /usr/lib/node_modules/npm/bin/npm-cli.js install')"; RC=$?
+grep -qF "npm cache clean" "$T/stub.log" && bad "npm cache was cleaned under a LIVE npm-cli.js process (the argv shape real npm has)" \
+                                         || ok "a live \"node <path>/npm-cli.js install\" process blocks the npm escalation"
+[ "$RC" -eq 3 ] && ok "the deferred npm sink is a refusal (exit 3), not a pass" \
+                || bad "expected exit 3, got $RC"
+: > "$T/stub.log"
+OUT="$(run_reaper "$H" PS_OUT=' 42 python3 -m pip install six')"; RC=$?
+grep -qF "pip3 cache purge" "$T/stub.log" && bad "the pip cache was purged under a LIVE \"python3 -m pip install\" process" \
+                                          || ok "a live \"python3 -m pip install\" process blocks the pip escalation"
+: > "$T/stub.log"
 OUT="$(run_reaper "$H" PS_FAIL=1)"; RC=$?
 grep -qF "npm cache clean" "$T/stub.log" && bad "npm cache was cleaned on a FAILED ps probe (fail-open)" \
                                          || ok "a ps probe that cannot run is treated as BUSY (fail closed)"
@@ -245,6 +272,126 @@ grep -qF "(absent)" <<<"$OUT" && ok "absent sinks are named, not silently skippe
 [ "$(stub_calls)" -eq 0 ] && ok "no tool was invoked when nothing was over the bound" \
                           || bad "a tool was invoked while every sink was within the bound"
 
+say_case "I. a SYMLINKED sink is measured (not a 0MB false pass) and bounded"
+H="$T/homeI"; mkdir -p "$H/.cache" "$T/sym-real"
+# The sink is a symlink onto another volume — the standard small-root-disk workaround, and an
+# unmeasured sink reports "within the bound" while it is the thing filling the disk.
+mk_uv_cache Ireal "$T/sym-real-home" 40 0
+ln -s "$T/sym-real-home/.cache/uv" "$H/.cache/uv"
+BEFORE="$(sink_mb "$T/sym-real-home/.cache/uv")"
+[ "$BEFORE" -gt 10 ] && ok "the symlinked fixture really holds ${BEFORE}MB" || bad "the symlink fixture is vacuous (${BEFORE}MB)"
+: > "$T/stub.log"
+REAPER_ARGS=(--apply --max-mb 10)
+OUT="$(run_reaper "$H")"; RC=$?
+case "$OUT" in
+  *"uv  $H/.cache/uv  0MB"*) bad "the symlinked sink was measured as 0MB — a false PASS on the layout this reaper exists for" ;;
+  *) ok "the symlinked sink is not reported as 0MB" ;;
+esac
+[ -d "$T/sym-real-home/.cache/uv/archive-v0/exclusive-entry" ] && bad "the symlinked sink was not reclaimed (measured as empty)" \
+                                                              || ok "the symlinked sink's exclusive entry was reclaimed through the link"
+[ "$RC" -eq 0 ] && ok "the symlinked fixture ends within the bound (exit 0)" || bad "expected exit 0 on the symlinked fixture, got $RC"
+
+say_case "J. DRY-RUN is the default; --apply is what acts"
+H="$T/homeJ"; mkdir -p "$H"
+mk_uv_cache J "$H" 40 0
+BEFORE="$(sink_mb "$H/.cache/uv")"
+: > "$T/stub.log"
+REAPER_ARGS=(--max-mb 10)          # NO mode flag
+OUT="$(run_reaper "$H")"; RC=$?
+AFTER="$(sink_mb "$H/.cache/uv")"
+[ "$AFTER" -ge "$BEFORE" ] && ok "a bare invocation deleted nothing (${BEFORE}MB -> ${AFTER}MB)" \
+                           || bad "a bare invocation DELETED bytes — the fleet reaper convention is dry-run by default"
+[ "$RC" -eq 3 ] && ok "a bare pass over the bound exits 3 (a report, not a pass)" || bad "bare dry-run exited $RC (expected 3)"
+grep -qF "DRY-RUN" <<<"$OUT" && ok "the pass SAYS it was a dry run" || bad "the pass did not name the dry run"
+[ "$(stub_calls)" -eq 0 ] && ok "a bare dry-run invoked no tool" || bad "a bare dry-run invoked a tool"
+REAPER_ARGS=(--apply --max-mb 10)
+OUT="$(run_reaper "$H")"
+[ "$(sink_mb "$H/.cache/uv")" -lt "$BEFORE" ] && ok "--apply is what reclaims (non-vacuity: the default really is the discriminator)" \
+                                             || bad "--apply did not reclaim either"
+
+say_case "K. an out-of-range bound is REFUSED, never silently repaired"
+H="$T/homeK"; mkdir -p "$H"
+mk_uv_cache K "$H" 40 0
+BEFORE="$(sink_mb "$H/.cache/uv")"
+: > "$T/stub.log"
+REAPER_ARGS=(--apply --max-mb 0)
+OUT="$(run_reaper "$H")"; RC=$?
+[ "$RC" -eq 2 ] && ok "--max-mb 0 is refused with exit 2" || bad "--max-mb 0 exited $RC (expected 2)"
+grep -qF "at least 1 MiB" <<<"$OUT" && ok "the refusal names why a 0 bound is refused" || bad "the refusal did not explain the 0 bound"
+REAPER_ARGS=(--apply --max-mb 2000000)
+OUT="$(run_reaper "$H")"; RC=$?
+[ "$RC" -eq 2 ] && ok "an implausible --max-mb is refused with exit 2" || bad "--max-mb 2000000 exited $RC (expected 2)"
+[ "$(stub_calls)" -eq 0 ] && ok "a refused bound acted on nothing" || bad "a refused bound still invoked a tool"
+[ "$(sink_mb "$H/.cache/uv")" -ge "$BEFORE" ] && ok "a refused bound deleted nothing" || bad "a refused bound deleted bytes"
+
+say_case "L. npm/pip act on the sink that was MEASURED, not on their own defaults"
+H="$T/homeL"; mkdir -p "$H"
+mk_uv_cache L "$H" 1 0              # uv within the bound: isolate the npm/pip rungs
+mk_npm_cache "$H" 40
+mkdir -p "$H/.cache/pip/wheels"; dd if=/dev/zero of="$H/.cache/pip/wheels/blob.bin" bs=1048576 count=40 2>/dev/null
+: > "$T/stub.log"
+REAPER_ARGS=(--apply --max-mb 10)
+OUT="$(run_reaper "$H")"; RC=$?
+grep -qF "npm cache clean --force --cache $H/.npm" "$T/stub.log" && ok "npm is told the measured --cache root (npm's own layout is <root>/_cacache)" \
+                                                                    || bad "npm was invoked without --cache, so it would act on the DEFAULT cache it never measured: $(cat "$T/stub.log")"
+grep -qF "pip3 cache purge --cache-dir $H/.cache/pip" "$T/stub.log" && ok "pip is told the measured --cache-dir sink" \
+                                                                     || bad "pip was invoked without --cache-dir: $(cat "$T/stub.log")"
+[ "$RC" -eq 3 ] && ok "still over the bound after prune-only sinks -> exit 3" || bad "expected exit 3, got $RC"
+
+say_case "M. the uv lock is HELD across the escalation, and the holder cleans up"
+LOCKROOT="$T/lockcase"; mkdir -p "$LOCKROOT"; : > "$LOCKROOT/.lock"
+OUT="$(
+    ( set +u
+      . "$REAPER"
+      PYTHON_BIN="$(command -v python3)"
+      uv_lock_hold "$LOCKROOT"; echo "hold_rc=$?"
+      python3 - "$LOCKROOT/.lock" <<'PY'
+import fcntl, sys
+try:
+    handle = open(sys.argv[1], "r+b")
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+except OSError:
+    sys.exit(1)     # still held by the reaper: the answer we require
+sys.exit(0)
+PY
+      echo "compete_while_held=$?"
+      d="$UV_LOCK_DIR"
+      uv_lock_release
+      echo "leftover=$([ -e "$d" ] && echo yes || echo no)"
+      python3 - "$LOCKROOT/.lock" <<'PY'
+import fcntl, sys
+try:
+    handle = open(sys.argv[1], "r+b")
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+except OSError:
+    sys.exit(1)
+sys.exit(0)
+PY
+      echo "compete_after_release=$?"
+    ) 2>&1
+)"
+grep -qF "hold_rc=0" <<<"$OUT" && ok "uv_lock_hold acquires a free uv lock" || bad "uv_lock_hold did not acquire: $OUT"
+grep -qF "compete_while_held=1" <<<"$OUT" && ok "a competing acquire FAILS while the reaper holds it (the deletes run under the lock)" \
+                                       || bad "the lock was NOT held during the escalation window: $OUT"
+grep -qF "leftover=no" <<<"$OUT" && ok "the holder cleans up its markers" || bad "the holder leaked its marker dir: $OUT"
+grep -qF "compete_after_release=0" <<<"$OUT" && ok "the lock is free again after release (no wedged uv)" \
+                                           || bad "the lock stayed held after release: $OUT"
+
+# held by a live holder: a second uv_lock_hold must REFUSE (1), not steal it. The holder here is the
+# reaper's own hold path in a background subshell that simply does not release until it exits.
+OUT="$(
+    ( set +u
+      . "$REAPER"
+      PYTHON_BIN="$(command -v python3)"
+      ( uv_lock_hold "$LOCKROOT"; sleep 4 ) >/dev/null 2>&1 &
+      sleep 1
+      uv_lock_hold "$LOCKROOT"; echo "second_hold_rc=$?"
+      wait
+    ) 2>&1
+)"
+grep -qF "second_hold_rc=1" <<<"$OUT" && ok "a lock already held by a live process is REFUSED (not stolen)" \
+                                     || bad "a held lock was not refused: $OUT"
+
 say_case "H. WIRING — a timed job on BOTH surfaces, and bringup reports the size"
 TPL="$REPO_ROOT/templates/launchd/com.eldato.pi-cache-reaper.plist"
 if [ -f "$TPL" ]; then
@@ -254,6 +401,8 @@ if [ -f "$TPL" ]; then
         || bad "the template does not point at the farmed script path"
     grep -qF 'CACHE_REAPER_MAX_MB' "$TPL" && ok "the template carries the size bound" \
                                           || bad "the template does not carry CACHE_REAPER_MAX_MB"
+    grep -qF '<string>--apply</string>' "$TPL" && ok "the job is ARMED explicitly (--apply) while the script itself ships dry-run" \
+                                              || bad "the plist does not pass --apply, so the timed job would be a no-op"
     grep -qF '<key>StartInterval</key>' "$TPL" && ok "the template is scheduled (StartInterval)" \
                                                || bad "the template has no StartInterval"
 else

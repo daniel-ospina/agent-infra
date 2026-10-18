@@ -48,11 +48,14 @@ reproducible in kind on any box: 6091 MB of cache for one lane's own `uv` use, w
    * **measure** → within bound: report, do nothing;
    * **prune** with the tool's own in-use-safe command (`uv cache prune`, `npm cache verify`);
    * **escalate** only while still over the bound AND no live holder: uv by removing the largest
-     **exclusively cache-owned** `archive-v0` entries, gated on uv's own `.lock`
-     (`flock(LOCK_EX|LOCK_NB)`, verified: with the lock held, `uv cache prune` prints *"Cache is
-     currently in-use, waiting for other uv processes to finish"*), npm via `npm cache clean --force`
-     and pip via `pip cache purge`, gated on a live-process probe that is treated as BUSY when it
-     cannot answer;
+     **exclusively cache-owned** `archive-v0` entries, under uv's own `.lock` **held for the whole
+     escalation** (`flock(LOCK_EX|LOCK_NB)` in a holder process — a probe answers a question about the
+     past, and the deletes run seconds later; verified: with the lock held, `uv cache prune` prints
+     *"Cache is currently in-use, waiting for other uv processes to finish"*), npm via
+     `npm cache clean --force` and pip via `pip cache purge`, each **pointed at the sink that was
+     measured** (`--cache <root>` / `--cache-dir <dir>` — npm honours neither `NPM_CACHE_DIR` nor the
+     reaper's own measurement otherwise) and gated on a live-process probe that is treated as BUSY
+     when it cannot answer;
    * one line per sink with before → after and the rung that produced it;
    * **refuse to act**: a sink still over the bound afterwards, or a ladder that freed nothing, exits
      3 and says so.
@@ -115,7 +118,7 @@ so it did not qualify as a user question.
 ### Integration Docs
 
 Depends on `du`, `find -links`, `awk`, `sort`, `ps`, `df` (POSIX/POSIX-adjacent, present on macOS and
-the Ubuntu cells), optional `python3` for the `flock` probe (absent → *undeterminable* → treated as
+the Ubuntu cells), optional `python3` for the lock request (absent → *undeterminable* → treated as
 held, never as clearance), and the `uv`/`npm`/`pip3` binaries already required by bring-up
 (`check_tools`). No new dependency is introduced: `flock(1)` is deliberately NOT used because macOS
 ships no `flock` binary.
@@ -134,8 +137,13 @@ ships no `flock` binary.
 * **A per-worktree venv reaper instead** — rejected as scope: #1949/#1745 already own that, and the
   measured failure was the *shared* sink surviving all of it. The residue line in this reaper points
   those flows at the worktrees that hold the bytes.
-* **Shipping it disarmed (dry-run default)** — rejected: the content is regenerable by definition, the
-  first rung is the tool's own prune, the second cannot touch a byte a venv holds, and a reaper that
-  only reports leaves the incident's cause in place. `CACHE_REAPER_DRY_RUN=1` remains the disarm.
+* **Shipping the SCRIPT armed (act by default)** — resolved the other way after review: the fleet's
+  reaper convention is dry-run by default with arming as a separate, explicit act (the recorded
+  decision in `docs/ops/task-runs-retention.md`; `pi-reap-idle.sh`, `pi-reap-worktrees.sh` and
+  `pi-task-session-prune.sh` all ship inert). The incident's cause is not left in place, because every
+  surface that is supposed to act is ARMED EXPLICITLY — the launchd job passes `--apply`,
+  `orch-loop.sh` passes `--apply`, and `cloud-cell-supervisor.sh prune` passes `--apply`. A bare
+  `bash pi-cache-reaper.sh` is therefore a report (exit 3 while a sink is over the bound), which is
+  also the honest thing for an operator to run first on a disk-dead box.
 * **A cron entry installed by bring-up** — rejected: these VMs do not run cron and `cmux vm exec`
   sessions do not persist one; the controller loop is the surface's actual clock.
