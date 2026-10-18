@@ -2005,7 +2005,48 @@ SH
     && ok "rest_fail falls back to the generic PAGE-naming refusal for anything else" \
     || bad "rest_fail did not fall back to the generic refusal: '$(head -1 "$HD404/err")'"
 
-  # ── THE `page < pages` EXEMPTION IS THE DECIDING BRANCH for a small limit ────────────────────
+  # ── A SHORT LAST PAGE WITH A NEXT PAGE IS A TRUNCATION, not the end of the collection ────────
+  # The shape a PAGE-POSITION exemption misses: `--limit 500` reads 5 pages, pages 1-4 are full, page 5
+  # returns 40 rows and STILL advertises page 6. Measured on the position-gated helper: rc=0 with 440
+  # rows — a truncated `.pr_brs`, which makes `has_pr` false for issues that DO have a PR (#1705). The
+  # exemption must be a FILLED WINDOW, not "we happen to be on the last page".
+  HDS="$T/restcase-shortlast"; mkdir -p "$HDS"
+  cat > "$HDS/gh" <<'SH'
+#!/bin/bash
+pg="$(printf '%s' "$*" | sed -n 's/.*&page=\([0-9]*\).*/\1/p')"; [ -n "$pg" ] || pg=1
+printf 'HTTP/2.0 200 OK\r\nLink: <x?page=%s>; rel="next"\r\n\r\n' "$((pg+1))"
+if [ "$pg" -lt 5 ]; then jq -n --argjson p "$pg" '[range(100)|{number: (($p-1)*100 + .)}]'
+else jq -n '[range(40)|{number: (400 + .)}]'; fi
+SH
+  chmod +x "$HDS/gh"
+  PATH="$HDS:$PATH"; export PATH
+  drv_out issues --repo acme/widget --limit 500 --jq '.[].number' > "$HDS/out" 2>"$HDS/err"; rc=$?
+  PATH="${PATH#$HDS:}"; export PATH
+  grep -q 'a short page is not a complete listing' "$HDS/err" 2>/dev/null && sl_msg=1 || sl_msg=0
+  [ "$rc" -ne 0 ] && [ "$sl_msg" -eq 1 ] \
+    && ok "rest_list REFUSES a short LAST page that still advertises a next page (rc=$rc, window not filled)" \
+    || bad "a short last page returned $(wc -l < "$HDS/out") row(s) at rc=$rc — a 500-row window truncated to 440"
+
+  # ── …while a FULL last page that advertises a next page is FINE (the window is filled) ───────
+  # The other side of the same branch: refusing here would break every multi-page listing whose window
+  # ends exactly on a page boundary — the common case, since all five shipped limits are multiples of
+  # 100. Without this case, over-tightening the guard to "any next link on the last page" stays green.
+  HDF="$T/restcase-fullwindow"; mkdir -p "$HDF"
+  cat > "$HDF/gh" <<'SH'
+#!/bin/bash
+pg="$(printf '%s' "$*" | sed -n 's/.*&page=\([0-9]*\).*/\1/p')"; [ -n "$pg" ] || pg=1
+printf 'HTTP/2.0 200 OK\r\nLink: <x?page=%s>; rel="next"\r\n\r\n' "$((pg+1))"
+jq -n --argjson p "$pg" '[range(100)|{number: (($p-1)*100 + .)}]'
+SH
+  chmod +x "$HDF/gh"
+  PATH="$HDF:$PATH"; export PATH
+  drv_out issues --repo acme/widget --limit 500 --jq '.[].number' > "$HDF/out" 2>"$HDF/err"; rc=$?
+  PATH="${PATH#$HDF:}"; export PATH
+  [ "$rc" -eq 0 ] && [ "$(wc -l < "$HDF/out")" -eq 500 ] \
+    && ok "a FULL last page that advertises a next page is ACCEPTED (rc=0, 500 rows — the window is filled)" \
+    || bad "a full last page was refused/miscounted: rc=$rc, rows=$(wc -l < "$HDF/out") — $(head -1 "$HDF/err")"
+
+  # ── THE SMALL-LIMIT EXEMPTION: a `--limit 10` caller must not be refused over a next page ────────────────────
   # A one-page caller (`--limit 10`) that gets 40 rows and a `rel="next"` must NOT be refused: the
   # next page is one it never asked for. Without the exemption the short-page guard would refuse every
   # small-limit listing on a busy repo; nothing else in this block exercises that branch (the 40-row

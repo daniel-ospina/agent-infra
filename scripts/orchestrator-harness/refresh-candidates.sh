@@ -747,14 +747,20 @@ rest_list() {
     # ⛔ A SHORT PAGE THAT STILL ADVERTISES A NEXT PAGE IS NOT THE END OF THE COLLECTION EITHER. GitHub
     # returns exactly `per_page` rows on every page but the last, so `rel="next"` together with FEWER
     # rows means the page was filtered or stripped — and returning it at rc 0 is a truncated listing: a
-    # short `.pr_brs` un-blacklists issues that already have a PR (#1705). Gated on `page < pages` so a
-    # caller who only asked for one page (`--limit 10`) is not refused over a next page it never wanted
-    # — that case is settled by the limit, not by the collection's length.
-    if [ "${more:-0}" -ge 1 ] && [ "$n" -lt 100 ] && [ "$page" -lt "$pages" ]; then
+    # short `.pr_brs` un-blacklists issues that already have a PR (#1705).
+    # ⛔ THE EXEMPTION IS A FILLED WINDOW, NOT A PAGE POSITION. An earlier version gated this on
+    # `page < pages`, which is FALSE on the last page of every multi-page window — so `--limit 500`
+    # with 100 rows on pages 1-4 and 40 on page 5 returned 440 rows at rc 0 while page 5 still
+    # advertised a next page (measured). The question is not where the page sits but whether the
+    # caller's window was FILLED: `want` rows are still missing after this page, so a short page that
+    # has more behind it is a truncation — while `--limit 10` against a 40-row page is not (40 >= 10:
+    # the window is full, and the next page is one the caller never asked for).
+    want=$(( limit - 100 * (page - 1) ))
+    if [ "${more:-0}" -ge 1 ] && [ "$n" -lt 100 ] && [ "$n" -lt "$want" ]; then
       echo "REST: the $kind listing page $page returned only $n rows although the LINK header advertises a next page — a short page is not a complete listing" >&2
       rm -rf "$tmp"; return 1
     fi
-    if [ "$n" -lt 100 ] || [ "$page" -ge "$pages" ]; then break; fi   # short page, or the limit is reached
+    if [ "$n" -lt 100 ] || [ "$page" -ge "$pages" ]; then break; fi   # short page, or the window is reached
     page=$((page + 1))
   done
   # ⛔ /issues RETURNS PULL REQUESTS TOO. Left in, a PR's number would be read as an OPEN ISSUE by the
