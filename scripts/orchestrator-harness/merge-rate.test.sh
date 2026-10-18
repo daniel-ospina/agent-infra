@@ -101,7 +101,7 @@ ck "an out-of-range --hours is refused with exit 2 (no silently-overflowed all-t
 say >/dev/null 2>&1
 ck "the text report exits 0 (a measurement is not a gate)" $([ $? = 0 ] && echo 0 || echo 1)
 ck "the text report states the defect line and the n/a-safe rate field" \
-   $(say | grep -q "ended at PR_OPENED" && say | grep -q "MERGE RATE" && echo 0 || echo 1)
+   $(rep="$(say)"; grep -q "ended at PR_OPENED" <<<"$rep" && grep -q "MERGE RATE" <<<"$rep" && echo 0 || echo 1)
 
 echo
 if [ "$fail" -eq 0 ]; then

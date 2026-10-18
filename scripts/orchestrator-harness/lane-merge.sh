@@ -594,7 +594,7 @@ while :; do
     # BOTH LINES, NOT JUST THE FIRST: a truncated classification (INFLIGHT present, RED missing — a
     # crash between the two prints, a broken pipe, a future edit) left RED empty and read as GREEN,
     # launching a merge on a head whose red was never reported (reviewer finding). Fail closed.
-    if ! printf '%s' "$classified" | grep -q '^INFLIGHT ' || ! printf '%s' "$classified" | grep -q '^RED '; then
+    if ! grep -q '^INFLIGHT ' <<<"$classified" || ! grep -q '^RED ' <<<"$classified"; then
       say_err "lane-merge: the check-run classifier produced no verdict (python3 missing or its"
       say_err "            output was not understood) — refusing to call this head green."
       verdict WAITING_CLASSIFIER "could not classify this head's check-runs"

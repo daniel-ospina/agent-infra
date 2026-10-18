@@ -92,7 +92,7 @@ printf 'closed|2026-10-18T00:00:00Z|abc123|clean\n' > "$T/pr.tsv"
 new_o "$T/pr.tsv"
 run 7 --issue 42 --repo o/r --pr-tsv "$T/pr.tsv"
 ck "a merged PR → exit 0, verdict MERGED, sha printed" \
-   $([ "$RC" = 0 ] && [ "$(verdict_of 7 | cut -d' ' -f1)" = MERGED ] && printf '%s' "$OUT" | grep -q abc123 && echo 0 || echo 1)
+   $([ "$RC" = 0 ] && [ "$(verdict_of 7 | cut -d' ' -f1)" = MERGED ] && grep -q abc123 <<<"$OUT" && echo 0 || echo 1)
 ck "the ISSUE-keyed verdict exists (that is what chain-merge waits on)" \
    $([ "$(cat "$OT/state/lanemerge-issue-42.verdict" 2>/dev/null | cut -d' ' -f1)" = MERGED ] && echo 0 || echo 1)
 
@@ -110,7 +110,7 @@ run 9 --repo o/r --pr-tsv "$T/pr3.tsv"
 ck "dirty → exit 15 FIX_CONFLICT, round 1 spent" \
    $([ "$RC" = 15 ] && [ "$(verdict_of 9 | cut -d' ' -f1)" = FIX_CONFLICT ] && [ "$(cat "$OT/state/lanemerge-9.round")" = 1 ] && echo 0 || echo 1)
 ck "…and it says re-apply onto main / force-push own branch, never pick a side on a generated file" \
-   $(printf '%s' "$OUT" | grep -q "re-apply THIS lane's own change" && printf '%s' "$OUT" | grep -q "Never resolve a GENERATED file" && echo 0 || echo 1)
+   $(grep -q "re-apply THIS lane's own change" <<<"$OUT" && grep -q "Never resolve a GENERATED file" <<<"$OUT" && echo 0 || echo 1)
 
 # ── 5. RED checks → FIX_REQUIRED naming them, and the names are recorded for the handoff ────────
 printf 'open||abc123|clean\n' > "$T/pr4.tsv"
@@ -118,21 +118,21 @@ printf 'lint\tcompleted\tfailure\t11\nunit\tcompleted\tsuccess\t12\n' > "$T/chec
 new_o "$T/pr4.tsv"
 run 10 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-red.tsv"
 ck "red check → exit 10 FIX_REQUIRED naming 'lint' (and NOT the green one)" \
-   $([ "$RC" = 10 ] && printf '%s' "$OUT" | grep -qE "checks are RED: lint$" && [ "$(cat "$OT/state/lanemerge-10.last")" = lint ] && echo 0 || echo 1)
+   $([ "$RC" = 10 ] && grep -qE "checks are RED: lint$" <<<"$OUT" && [ "$(cat "$OT/state/lanemerge-10.last")" = lint ] && echo 0 || echo 1)
 
 # ── 6. POLARITY: an undocumented conclusion is RED; cancelled/stale are not ─────────────────────
 printf 'a\tcompleted\tsuccess\t1\nb\tcompleted\tfailure\t2\nc\tcompleted\tsuccess\t3\nc\tcompleted\twatchamacallit\t4\nd\tcompleted\tcancelled\t5\ne\tcompleted\tstale\t6\nf\tcompleted\t\t7\n' > "$T/checks-pol.tsv"
 new_o "$T/pr5.tsv"
 run 11 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-pol.tsv"
 ck "unknown conclusion + null conclusion are RED; cancelled/stale are not; newest attempt by id wins (c → red)" \
-   $(printf '%s' "$OUT" | grep -q "RED: b c f" && echo 0 || echo 1)
+   $(grep -q "RED: b c f" <<<"$OUT" && echo 0 || echo 1)
 
 # ── 6b. TWO WORKFLOWS SHARING A JOB NAME must not mask each other (group by app+name) ──────────
 printf 'packaging-smoke\tcompleted\tfailure\t10\tgithub-actions\npackaging-smoke\tcompleted\tsuccess\t11\tother-app\n' > "$T/checks-apps.tsv"
 new_o "$T/pr19.tsv"
 run 27 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-apps.tsv"
 ck "the same job name from two apps is TWO groups — the newer green of one does not mask the red of the other" \
-   $(printf '%s' "$OUT" | grep -q "github-actions:packaging-smoke" && echo 0 || echo 1)
+   $(grep -q "github-actions:packaging-smoke" <<<"$OUT" && echo 0 || echo 1)
 
 # ── 7. in-flight at the bound is NOT a green and NOT a failure of the lane ──────────────────────
 printf 'slow\tin_progress\t\t21\n' > "$T/checks-inflight.tsv"
@@ -146,7 +146,7 @@ printf 'q\tqueued\t\t31\n' > "$T/checks-queued.tsv"
 new_o "$T/pr7.tsv"
 run 13 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-queued.tsv"
 ck "queued-only head → exit 11 IN FLIGHT, and the chain is NOT launched (a queued run is not green)" \
-   $([ "$RC" = 11 ] && printf '%s' "$OUT" | grep -q "still IN FLIGHT" && [ ! -f "$OT/logs/lane-merge-13.log" ] && echo 0 || echo 1)
+   $([ "$RC" = 11 ] && grep -q "still IN FLIGHT" <<<"$OUT" && [ ! -f "$OT/logs/lane-merge-13.log" ] && echo 0 || echo 1)
 
 # ── 9. GREEN → the harness chain is launched (never a hand-rolled gh merge) ─────────────────────
 printf 'allgood\tcompleted\tsuccess\t41\n' > "$T/checks-green.tsv"
@@ -155,7 +155,7 @@ new_o "$T/pr8.tsv"
 run 14 --repo o/r --pr-tsv "$T/pr8.tsv" --checks-tsv "$T/checks-green.tsv"
 sleep 1
 ck "green → exit 11 WAITING and the chain log shows it ran (the lane does not merge itself)" \
-   $([ "$RC" = 11 ] && printf '%s' "$OUT" | grep -q "launched the merge chain" && grep -q "MERGED via the rail" "$OT/logs/lane-merge-14.log" 2>/dev/null && echo 0 || echo 1)
+   $([ "$RC" = 11 ] && grep -q "launched the merge chain" <<<"$OUT" && grep -q "MERGED via the rail" "$OT/logs/lane-merge-14.log" 2>/dev/null && echo 0 || echo 1)
 # …and once the chain has merged, the next invocation reports MERGED from the PR state (the artifact
 # is authoritative, not the chain's exit code).
 run 14 --repo o/r --pr-tsv "$T/pr8.tsv"
@@ -180,7 +180,7 @@ new_o "$T/pr10.tsv"
 printf '3\n' > "$OT/state/lanemerge-17.round"
 run 17 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-green.tsv"; RC1=$RC
 ck "round 3 spent + GREEN → the last fix is verified and the chain is launched (convergence, not a cap breach)" \
-   $([ "$RC1" = 11 ] && printf '%s' "$OUT" | grep -q "launched the merge chain" && [ "$(cat "$OT/state/lanemerge-17.round")" = 3 ] && echo 0 || echo 1)
+   $([ "$RC1" = 11 ] && grep -q "launched the merge chain" <<<"$OUT" && [ "$(cat "$OT/state/lanemerge-17.round")" = 3 ] && echo 0 || echo 1)
 
 # ── 11b. a PARTIAL classification must never read as green (fail closed) ───────────────────────
 new_o "$T/pr16.tsv"
@@ -272,11 +272,11 @@ ck "the detached launch records its own MERGED from state/merged-<PR>.done (no s
 new_o "$T/pr11.tsv"
 run '12;rm -rf /' --repo o/r --pr-tsv "$T/pr4.tsv"
 ck "a non-numeric PR id is refused (exit 2) — the id reaches an API URL" \
-   $([ "$RC" = 2 ] && printf '%s' "$OUT" | grep -q "non-numeric" && echo 0 || echo 1)
+   $([ "$RC" = 2 ] && grep -q "non-numeric" <<<"$OUT" && echo 0 || echo 1)
 new_o "$T/pr12.tsv"
 run 18 --repo o/r
 ck "an unreadable PR (no fixture, stub gh answers empty) → exit 2 and it says nothing was attempted" \
-   $([ "$RC" = 2 ] && printf '%s' "$OUT" | grep -q "Nothing was attempted" && [ ! -f "$OT/state/lanemerge-18.round" ] && echo 0 || echo 1)
+   $([ "$RC" = 2 ] && grep -q "Nothing was attempted" <<<"$OUT" && [ ! -f "$OT/state/lanemerge-18.round" ] && echo 0 || echo 1)
 
 # ── 15. --watch is BOUNDED too (a pid probe cannot prove the chain is still working) ────────────
 new_o "$T/pr14.tsv"
@@ -303,14 +303,14 @@ printf '999999\n' > "$OT/state/mergeclaim-29.lock"
 run 29 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-green.tsv"
 sleep 1
 ck "a stale lock (dead pid) is cleared and the chain IS launched (a lock's existence is not a holder)" \
-   $([ "$RC" = 11 ] && printf '%s' "$OUT" | grep -q "STALE merge lock" && grep -q "MERGED via the rail" "$OT/logs/lane-merge-29.log" 2>/dev/null && echo 0 || echo 1)
+   $([ "$RC" = 11 ] && grep -q "STALE merge lock" <<<"$OUT" && grep -q "MERGED via the rail" "$OT/logs/lane-merge-29.log" 2>/dev/null && echo 0 || echo 1)
 
 # ── 14. an absurd/impossible cap is coerced, not obeyed (it feeds arithmetic) ───────────────────
 new_o "$T/pr13.tsv"
 OUT="$(PATH="$BIN:$PATH" O="$OT" HOME="$T/home" LANE_MERGE_MAX_ROUNDS=9223372036854775807 \
       bash "$SCRIPT" 19 --status 2>&1)"; RC=$?
 ck "an out-of-range LANE_MERGE_MAX_ROUNDS falls back to 3 and says so" \
-   $([ "$RC" = 0 ] && printf '%s' "$OUT" | grep -q "using 3" && printf '%s' "$OUT" | grep -q "/3" && echo 0 || echo 1)
+   $([ "$RC" = 0 ] && grep -q "using 3" <<<"$OUT" && grep -q "/3" <<<"$OUT" && echo 0 || echo 1)
 
 # ── 17. the POLL must be eligible for the conditional (ETag/304) layer (E3) ────────────────────
 # `gh-limit.py` leaves every argv containing --paginate COMPLETELY alone, so a paginated poll is never
