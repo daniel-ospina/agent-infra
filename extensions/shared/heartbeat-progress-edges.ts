@@ -673,6 +673,24 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     guardedBy: NONE,
   },
   {
+    name: "REAP_MIN_S",
+    owners: ["scripts/orchestrator-harness/cloud-cell-doctor.sh"],
+    value: "${REAP_MIN_S:-2700}",
+    axis: "reap",
+    guardedBy:
+      "scripts/orchestrator-harness/cloud-cell-doctor.test.sh §reap — a lane younger than the floor is NOT killed, and one past it is; the value is asserted by THIS registry's forward check, since the suite drives its own REAP_MIN_S in the environment",
+    note: "how long a worker lane must have been idle before the cell's reap role may kill it (45 min). The cell reaps on a schedule, so the floor is what stops a scheduled pass from killing a lane that is merely between tool calls — the same class `REAP_IDLE_HOURS` bounds for the interactive reaper, at the far shorter cadence a cloud cell runs at.",
+  },
+  {
+    name: "REAP_SAMPLE_S",
+    owners: ["scripts/orchestrator-harness/cloud-cell-doctor.sh"],
+    value: "${REAP_SAMPLE_S:-15}",
+    axis: "reap",
+    guardedBy:
+      "scripts/orchestrator-harness/cloud-cell-doctor.test.sh §reap — the two-observation gate: a lane that is BUSY on the second sample is not reaped, and an unreadable first sample is cannot-verify rather than dead",
+    note: "the spacing between the reap role's two observations of a candidate lane's CPU. Two samples are what separate an idle lane from one that is mid-command (a single snapshot cannot), so this is the width of that gate — NOT a bound on how long work may take.",
+  },
+  {
     name: "MAX_AGE",
     owners: ["scripts/monitor-worker.sh"],
     value: "${2:-60}",

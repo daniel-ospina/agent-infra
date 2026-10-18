@@ -192,6 +192,7 @@ processes in tmux sessions, so a killed worker cannot take the controller down w
 | `chain-<N>` | `chain-merge.sh` | — | wait for the lane's PR, then delegate to `merge-one.sh` |
 | `merge-<PR>` | `merge-one.sh` | — | **repo-authority-dependent**: gate mode = fresh review → signed record → wait green → squash-merge; rail mode = the repo's own `scripts/admin-merge.sh` |
 | `fix-<PR>` | `fix-one.sh` | the PR's worktree | repair findings **or a failing required check**, push, re-run the merge chain |
+| `cell-doctor` | `cloud-cell-doctor.sh loop` | `state/roles/`, `logs/doctor.log` | the cell's **own** scheduled roles — `doctor` (reap + restart a missing controller), `merge` (land attested PRs on the standard rail), `hygiene` (caches/worktrees). Started by `cloud-cell-supervisor.sh start`; see §6.5.7 |
 
 ### State files (`$O/`)
 
@@ -211,6 +212,10 @@ processes in tmux sessions, so a killed worker cannot take the controller down w
 | `state/merged-<PR>.done` | merge confirmation |
 | `state/last-open-n` | the last SUCCESSFUL open-PR count; reused only when positive if a later count fails — a failure never reads as 0 |
 | `state/last-open-prs` | the `number:headOid` rows from that same SUCCESSFUL listing — the **ownership scan's** input (`unowned_pr_count`). Written on success and REMOVED on a failed listing, so a fallback count is never paired with the previous listing's rows; absent rows mean **nothing is owned** (the whole count is unowned), which is the fail-closed direction. Both files come from ONE `gh pr list` call. |
+| `state/roles/<role>.state` | the cell doctor's LAST-PASS record per role (`last_pass_at`, `last_pass_epoch`, `passes`, `last_rc`, `last_result`), written atomically and only by a completed pass — `status` reads it, so "never ran" is distinguishable from "idle" (§6.5.7) |
+| `state/roles/.desired` | the cell is SUPPOSED to be running; written by `start`, removed by `stop`, so the doctor restarts a controller that `stop` did not silence |
+| `state/roles/loop.ident` | `pid|<identity>` for the doctor loop, where the identity is `proc:<starttime>` from `/proc/<pid>/stat` on Linux and `ps -o lstart=` where `/proc` does not exist — `status` verifies BOTH before reporting the loop RUNNING, so a recycled pid (after a tmux server restart, an OOM kill or a crash) cannot make a dead loop read as alive |
+| `state/roles/merge.attempts` | `PR head epoch reason` for every rail call the merge role made — the head-level cooldown that stops a REFUSED head being retried blind |
 | `logs/` | one log per worker: `lane-*.log`, `chain-*.log`, `merge-*.log`, `fix-*.log`, `orch-loop.log` |
 | `wip/` | dirty-worktree captures taken before a shutdown (see §6) |
 
@@ -941,9 +946,14 @@ worktree. That is a box at its lane ceiling, with a full disk, producing nothing
 any of them. A human found it by reading a report, which is the gap stated exactly: the condition had
 no signal of its own.
 
-**Status: PARTIAL — the controller's own lanes ARE reaped, and even that half breaches two clauses of
-this MUST: one mtime sample with no CPU tolerance, and one 40-minute bound applied to `lane`, `merge`
-and `fix` alike rather than per class. The fleet-wide requirement is not met.**
+**Status: PARTIAL — the cell's own doctor now reaps the fleet's harness namespace with two
+observations, a CPU tolerance and a human-ancestry gate (§6.5.7), and the controller's own lanes are
+still reaped by `orch-loop.sh` with the older one-sample rule. What is NOT met: the doctor exists
+only where `cloud-cell-supervisor.sh start` launched it (a Mac cell's launchd job still does not run
+it), and the controller's own `reap_stale_workers()` — which runs only while the controller is alive
+— still uses one mtime sample, no CPU tolerance, and one 40-minute bound for `lane`, `merge` and
+`fix` alike. The doctor's bound is per-run and requires the lane's subtree to show no CPU delta, so
+the two in-tree reapers disagree; the doctor is the one this MUST is being met by.**
 `reap_stale_workers()` (`orch-loop.sh:420`) reaps only the controller's OWN
 `lane|merge|fix` tmux sessions, on log-mtime staleness past `STALE_MIN=40` (`orch-loop.sh:409`) —
 one signal, one population, and only while a controller is alive. The fleet-level reapers are
@@ -1126,6 +1136,107 @@ On 2026-10-17 the label was disabled twice more *during this PR's own review* by
 the pre-#1975 flow from other checkouts; both times a human reading `launchctl print` found it, not an
 instrument. A watchdog that runs `enable` + `bootstrap` when the label is absent, and reports it, is
 the missing piece — agent-infra#1860.
+
+### 6.5.7 The cell's own roles run on a schedule, not when someone looks
+
+**MUST.** A cell that can dispatch must also **land**, **repair** and **un-wedge** without a human,
+and its `status` must be able to say **"this role has never run"** — because a cell that dispatched
+its backlog and then did nothing prints exactly what a working cell prints (`controller: RUNNING`,
+`lanes: 0`).
+
+**Why (measured 2026-10-18, pi-cell-2/pi-cell-3).** A cloud cell ran exactly one loop
+(`orch-loop.sh`). A green PR with a clean review record at its head sat **unlanded** until a human
+ran the rail, and a wedged `lane-*` session held its slot until someone noticed — and the supervisor
+could only answer *"is the tmux session up?"*. `status` reported `controller: RUNNING`, so the box
+looked healthy while producing nothing. This is the §6.5 opening requirement's *"something must
+NOTICE, DECIDE and ACT on a schedule that does not depend on the controller being healthy"* applied
+to the cell, and the doctor is the something.
+
+**Implementation: `cloud-cell-doctor.sh`**, launched as tmux session `cell-doctor` by
+`cloud-cell-supervisor.sh start` (removed by `stop`; `.desired` in `state/roles/` records the
+intent so a `stop` is not undone by the next pass). **A `stop` always WINS over an in-flight
+`start`**: `stop` bumps a generation counter (`state/roles/.stop-generation`) as its first action,
+and `start` snapshots it on entry and tears down whatever it created if it moved — the doctor's own
+`supervisor start` restart can take minutes, and process-group signalling cannot close that window
+(its recorded pid is a `timeout` wrapper, so killing it orphans the real child). The doctor loop's
+command string carries the operator's `DOCTOR_SESSION`, `SESSION`, `SCOPE`, `HARNESS_REF` and pin
+paths for the same reason it re-sources `ENV_FILE`: a tmux session is served from the server's
+environment, and a restart that re-derives the defaults would come back under a *second* doctor
+session (two loops on one state dir) or under the wrong scope. Roles, each idempotent with its own lock and
+its own `state/roles/<role>.state` last-pass record:
+
+| Role | Interval | What it ACTUALLY does |
+|---|---|---|
+| `reap` | 120 s | one wedged-session pass over the HARNESS namespace only (`lane-*`, `chain-*`, `merge-*`, `fix-*`); see the decision below |
+| `doctor` | 120 s | `reap` + controller supervision: restart `orch-loop.sh` when its session is **gone** and the cell is `.desired`; a **stale-but-present** controller is reported, never killed |
+| `merge` | 300 s | land PRs that already have a **clean attestation at THIS head** by EXECUTING `scripts/admin-merge.sh` — the standard rail, never a re-implementation |
+| `hygiene` | 3600 s | `uv cache prune` (not `cache clean`), worktree-root caches, and the **shipped** `pi-reap-worktrees.sh` (dry-run unless `HYGIENE_WORKTREES=apply`, or `auto` + the box is under disk pressure) |
+| `loop` | 10 s tick | the timer; every role also runs once immediately on start |
+| `status` | — | the liveness table; the stale bounds account for every role that runs BETWEEN two passes of the same role (the roles run in sequence in one loop), so a busy-but-healthy cell is not reported STALE; **exit 1** when a started cell has a role that never ran, went stale, or whose LAST pass failed (`rc≠0` — a failed controller restart, a cannot-verify read). One clean pass clears it, so a transient failure reads as one failing pass, not as a dead cell. A loop younger than `DOCTOR_GRACE_S` (300 s) — or a role whose FIRST pass is still running (`state/roles/.<role>.running`, what `run_role_pass` writes, bounded by `ALL_PASSES_S` so a killed loop's leftover cannot hide a dead role for ever) — prints `WAITING` instead — its first doctor pass samples every lane, so `start && status` must not call a healthy cell dead; a cell with no loop-age record is judged immediately (fail-closed) |
+
+**The reap decision is the safety core**, and it is the §6.5.1 rules applied to the fleet
+namespace: a session is a candidate only if its log has not grown for `REAP_MIN_S` (**2700 s**, above
+the controller's own `STALE_MIN=40` and the harness stall bound); the decision then takes **two
+observations** `REAP_SAMPLE_S` apart; and the lane's **subtree must show no CPU delta**, because a
+long model call is not a wedge. The whole read has an **overall** budget (`REAP_TIMEOUT`, 300 s) —
+a per-call bound would let the total grow with the fleet — and each `tmux`/`ps`/`gh` call is
+separately bounded (`READ_CALL_TIMEOUT` for tmux/ps, `MERGE_READ_TIMEOUT` for the queue listing;
+without `timeout(1)` the bound is enforced by the shell itself, so its absence cannot silently
+re-open an unbounded read). A pass that spends the budget STOPS at the lane it reached and
+records `rc=3 cannot-verify`; it never acts on a partial read and never reports the lanes it did not
+reach as quiet (§6.5.2, and the 800-failed-passes measurement there). Three exclusions are hard: a session with an **attached client**, a
+session whose ancestry reaches a **human terminal**, and a session with **no log** are reported and
+skipped. A read that cannot be taken is `SKIP ... cannot-verify` — never a reap, and never a pass.
+
+**A `stop` is honoured MID-PASS too.** `stop` TERMs the loop and KILLs it if it does not go, but the
+loop's destructive steps (the merge rail, `uv cache prune`, the worktree sweep/reaper) run in the
+FOREGROUND, and bash defers a TERM trap while it waits on a foreground child — so a TERM+KILL lands on
+a loop that was mid-rail and orphans that child, which then finishes (a merge that lands, a reaper
+that keeps deleting) after `stop` returned 0. Each pass therefore snapshots `.desired` and the stop
+generation on entry and re-checks them immediately before every destructive call: once a stop has
+arrived, nothing NEW is started. (A stop that lands *inside* an already-running rail still lets that
+rail finish — killing a merge mid-flight is worse — and that residual is named here, not hidden.)
+
+**An unreadable read is never an empty one.** A missing `tmux`, or a `tmux ls` that fails for any
+reason other than "no server running", makes `reap` record `rc=3 cannot-verify` instead of a clean
+pass over zero lanes; the same unreadable list makes `hygiene` SKIP the worktree-cache sweep (its
+"no workers are live" guard fails closed). `hygiene` records `rc=3` when `uv cache prune` itself fails (or is
+cut at `HYGIENE_TIMEOUT`), when it cannot run the cache sweep, and when it cannot find the
+shipped worktree reaper at all — "could not find the tool" was the silent no-op this role exists to
+remove. The loop's own liveness is identity-fenced (`state/roles/loop.ident` = `pid|<identity>`, `/proc` start time where the kernel offers one), so a
+recycled pid cannot make a dead loop read as RUNNING.
+
+**The merge role only offers a PR to the rail when the cell holds its OWN clean attestation for the
+HEAD it is looking at** (`~/.pi/agent/reviews/<owner>-<repo>-<pr>.json` at `$CELL_HOME`, so a cell's
+review state is not the Mac's). It does not review, classify checks or merge on its own evidence —
+that is `merge-one.sh`'s job, and #1872 measured two classifiers disagreeing on 4 of 11 live PRs.
+A refusal is recorded **verbatim** (with its reason), the pass still exits 0 (a refusal is data, not
+a failed read), and the same head is not retried for `MERGE_RETRY_S` (**3600 s**) — a new push moves
+the head and re-arms it. An unreadable open-PR listing is `rc=3`, never an empty queue. **It takes the same per-PR link the
+controller's `merge-one.sh` takes** (`$O/state/mergeclaim-<pr>.lock`, noclobber + a live-owner test):
+without it the doctor could rail a head that a `merge-one.sh` worker is already reviewing on the same
+box — duplicate evidence, duplicate record-review writes, one worker's needsfix landing after the
+other merged. A claim held by a live worker is a clean skip that names the holder; a stale claim is
+reclaimed; only the claim the pass took is released. **So is an
+unreadable review STORE**: a permissions failure on `~/.pi/agent/reviews`, or an attestation file
+that is present but unparseable, is `rc=3 cannot-verify` for that candidate — it used to render exactly
+like "no attestation", so every candidate was skipped and the pass reported a clean *nothing to
+land* while reviewed PRs silently never landed. A store that simply has no attestation for a PR is
+still an ordinary, clean skip. The rail runs
+FROM `$REPO` (a subshell `cd`, as `merge-one.sh` does), because its flake reproduction is
+`git -C "$PWD" worktree add … <base>` and the loop's own cwd is the harness. The whole pass is
+bounded by `MERGE_BUDGET_S` (**2400 s**), checked before each candidate: a spent budget ends the pass
+`rc=3` and names the PRs it never tried.
+
+**Status: IMPLEMENTED for a cell started by the current supervisor.** Three residuals, named:
+
+- **It runs only where `start` launched it.** The supervisor starts the loop, so a cloud cell gets it;
+  a Mac cell's `orch-loop.sh` launchd job does not, and nothing schedules the doctor there.
+- **`cmd_check` now refuses a cell without it** (it is in the required-worker list in `cmd_check`), so a cell
+  pinned to an older harness fails `check`/`start` loudly instead of silently running one loop — the
+  correct direction, but it means the pin must be moved before those cells can start again.
+- **Landing is not releasing.** The merge role gets a PR merged; it does not delete branches, reap a
+  merged PR's worktree, or manage a test container — §6.5.4 stays GAP.
 
 ---
 
@@ -1723,6 +1834,8 @@ algorithmic advantage. The claim worth evaluating is *utilisation*, not *efficie
 | `test-crossbox.sh` | drives the real `merge-one.sh` claim acquire + trap release with `gh` stubbed. Not part of the loop |
 | `refresh-scout.test.sh` | the agent-infra#1736 contract — repo-aware scout provisioning, per-repo tool resolution, the permanent/transient refresh split — plus the agent-infra#1850 issue-claim pre-flight verdict table (CLEAN/COLLISION/INCOMPLETE/NOT PROVISIONABLE/unrecognised), the dispatch-side claim, and the fenced + generation-guarded release. Not part of the loop |
 | `check-port-drift.sh` | gates the tortoise-side removal: fails if the tortoise harness moved past the pinned sync point (`port-provenance.txt`). Not part of the loop |
+| `cloud-cell-doctor.sh` | the cell's scheduled roles — `reap` / `doctor` / `merge` / `hygiene` / `status` (§6.5.7). Launched as tmux `cell-doctor` by `cloud-cell-supervisor.sh start`; `merge` EXECUTES `scripts/admin-merge.sh` and never re-implements it |
+| `cloud-cell-doctor.test.sh` | #1989: drives the shipped doctor and the supervisor's role verbs against stubbed tmux/ps/rail — a lane whose child is still writing is NOT reaped, an attached/human-tty lane is NOT touched, the rail is gated on a clean attestation at the head, a refusal is recorded and not retried at the same head, and `status` FAILS a started cell whose roles never ran. A CI shard |
 | `cloud-cell-record-dep.test.sh` | #1717: drives `cloud-cell-supervisor.sh check/start` and `merge-one.sh` against a stubbed toolchain — the recorder is a checked, provisioned dependency, and a record failure parks. Registered in `scripts/run-bash-shards.sh`, so both CI lanes run it |
 | `check-deployed-drift.sh` | answers whether the DEPLOYED `$O` matches the repo: the recorded commit against the live ref (`merge-base --is-ancestor`, never a commit count), the recorded payload hash against the deployed bytes, and every repo-shipped `*.sh` blob against its `$O` copy. Exit 0 match / 1 drift / **2 UNKNOWN — never a pass** (agent-infra#1745). Not part of the loop |
 | `report.sh` | read-only operator summary: merges in a window, per-kind agent wall-time and cap-hit rate from `state/walltime.tsv`, live `refs/claims/*`, queue health, and the last dispatch decisions. Safe to run while the loop is working. Not part of the loop |

@@ -61,7 +61,15 @@ ai1711_cleanup() {
   [ -n "${AI1711_SOCKS:-}" ] || return 0
   for s in $AI1711_SOCKS; do tmux -L "$s" kill-server >/dev/null 2>&1 || true; done
 }
-trap 'ai1711_cleanup; rm -rf "$T"' EXIT
+trap 'ai1711_cleanup; tmux kill-session -t "=${DOCTOR_SESSION:-cell-doctor}" 2>/dev/null || true; rm -rf "$T"' EXIT
+# ⛔ A DOCTOR SESSION NAME IS MACHINE-SCOPED (`cell-doctor` by default), so a session left by ANOTHER
+# cell on this box — or by a previous run of this suite — is indistinguishable from this fixture's by
+# name alone. Every fixture therefore pins a UNIQUE name, and one stale default-name session from an
+# earlier run is cleared once, so a foreign session cannot decide an arm (the supervisor now refuses to
+# bless a doctor session it cannot prove is its own — agent-infra#1989 — and that refusal must be
+# exercised deliberately, not by accident).
+export DOCTOR_SESSION="cell-doctor-test-$$"
+tmux kill-session -t "=cell-doctor" 2>/dev/null || true
 
 for f in "$SUP" "$BRINGUP"; do
   [ -f "$f" ] && ok "shipped script present: $(basename "$f")" || { bad "missing $f"; exit 1; }
@@ -98,9 +106,10 @@ make_ai_repo() {
   git -C "$AI" config user.name test
   git -C "$AI" config commit.gpgsign false
   mkdir -p "$AI/scripts/orchestrator-harness"
-  for w in orch-loop.sh claims.sh repo-authority.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh; do
+  for w in orch-loop.sh claims.sh repo-authority.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do
     : > "$AI/scripts/orchestrator-harness/$w"
   done
+  write_doctor_stub "$AI/scripts/orchestrator-harness"
   # #1717: `start` PROVISIONS the record step from the harness checkout — `recorder_src()` resolves
   # `$HARNESS/../record-review.sh` plus its declared sibling `lib/diff-normalize.py` — so a fixture
   # checkout without the pair makes `start` die "the harness checkout must be a full agent-infra
@@ -121,6 +130,16 @@ make_ai_repo() {
   git -C "$AI" push -q origin main
   git -C "$AI" fetch -q origin
 }
+# #1989: `cmd_check` now requires cloud-cell-doctor.sh, and `start` launches it as a LOOP. An empty
+# fixture file would make that session exit immediately (a real tmux server notices; the doubles
+# below do not), so every fixture gets a stub that stays alive for the `loop` verb. It exits 0 for
+# every other verb, so it can never decide an assertion in place of the code under test.
+write_doctor_stub() { # <dir>
+  mkdir -p "$1" || return 1
+  printf '#!/bin/bash\n[ "${1:-}" = loop ] && exec sleep 20\nexit 0\n' > "$1/cloud-cell-doctor.sh" || return 1
+  chmod +x "$1/cloud-cell-doctor.sh"
+}
+
 make_ai_repo
 
 SUP_RC=0; SUP_OUT=''
@@ -148,7 +167,11 @@ stub_missing() { # <bin dir> <tool>…
 
 # A temp HOME and a state dir per case, so no case can see another's O.
 mkdir -p "$T/home"
-say_case() { echo; echo "── $1 ──"; }
+# Each case starts with NO doctor session for this suite's pinned name: a session left by an earlier
+# case is indistinguishable by name from this one's (machine-scoped names), and the supervisor now
+# refuses to bless a doctor session it cannot prove is its own (#1989) — so the leftover must be
+# cleared, or a later, unrelated arm fails for a reason it is not about.
+say_case() { tmux kill-session -t "=${DOCTOR_SESSION:-cell-doctor}" 2>/dev/null || true; echo; echo "── $1 ──"; }
 
 # ── 1) keys.env with a top-level `exit` ──────────────────────────────────────────────────────────
 say_case "keys.env = 'exit 0' (the measured #1713 shape)"
@@ -313,7 +336,8 @@ ai_worktree "$W/harness"
 # Mirror the shipped required-worker set (`cloud-cell-supervisor.sh` cmd_check): claims.sh is a
 # required worker script now (orch-loop.sh/merge-one.sh SOURCE it from $O), so a fixture without it
 # dies in cmd_check with "worker scripts missing from …: claims.sh".
-for f in claims.sh repo-authority.sh dispatch-merge.sh lane.sh chain-merge.sh fix-one.sh refresh-candidates.sh adopt-fix.sh; do : > "$W/harness/$f"; done
+for f in claims.sh repo-authority.sh dispatch-merge.sh lane.sh chain-merge.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do : > "$W/harness/$f"; done
+write_doctor_stub "$W/harness"
 printf '#!/bin/bash\nexit 0\n' > "$W/bin/gh"; chmod +x "$W/bin/gh"
 # #1717: the shipped `start` PROVISIONS the record step from the checkout, and `cmd_check` refuses a
 # cell without it — or without its declared sibling `lib/diff-normalize.py` (the recorder resolves the
@@ -370,6 +394,9 @@ sub="${1:-}"; shift
 case "$sub" in
   has-session)
     n=""; while [ $# -gt 0 ]; do case "$1" in -t) n="$2"; shift 2 ;; *) shift ;; esac; done
+    # tmux's `-t =name` means EXACT match; every other form is a prefix. The double must model that,
+    # or a `has-session -t "=cell-doctor"` would look for a session LITERALLY named `=cell-doctor`.
+    n="${n#=}"
     no_server && exit 1
     [ -n "$n" ] && [ -f "$S/up.$n" ] && exit 0; exit 1 ;;
   show-options)
@@ -482,7 +509,7 @@ wk_case() {
   for i in $(seq 1 40); do pgrep -f "$W/harness/orch-loop\.sh" >/dev/null 2>&1 || break; sleep 0.25; done
   env AI_REVIEW_GATE_KEY="$amb" PATH="$W/bin:$bin:$PATH" AI1711_STATE="$st" AI1711_SOCK="$sock" \
       CELL_HOME="$W/cellhome" HOME="$W/cellhome" ENV_FILE="$envf" \
-      SESSION="$sess" O="$W/o" REPO="$W/repo" HARNESS="$W/harness" HARNESS_REPO="$AI" HARNESS_FETCH=0 SCOPE=own \
+      SESSION="$sess" DOCTOR_SESSION="cell-doctor-1711" O="$W/o" REPO="$W/repo" HARNESS="$W/harness" HARNESS_REPO="$AI" HARNESS_FETCH=0 SCOPE=own MIN_FREE_MB=1 \
       HARNESS_REF="$W_REF" \
       bash "$SUP" start >"$W/start.$kind.$route.$server.out" 2>&1 || rc=$?
   for i in $(seq 1 80); do [ -f "$W/worker-key" ] && break; sleep 0.25; done
@@ -576,9 +603,10 @@ ai_worktree "$F/harness"
 # required worker script now, so a fixture without it dies in cmd_check with "worker scripts
 # missing from …: claims.sh" before the #1736 provisioning contract below can be exercised.
 # (P1, 2026-10-14 review round — the §7 fixture was updated, this one was missed.)
-for f in orch-loop.sh claims.sh repo-authority.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh adopt-fix.sh; do
+for f in orch-loop.sh claims.sh repo-authority.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh adopt-fix.sh cloud-cell-doctor.sh; do
   : > "$F/harness/$f"; : > "$F/o/$f"
 done
+write_doctor_stub "$F/harness"; write_doctor_stub "$F/o"
 printf '#!/bin/bash\nexit 0\n' > "$F/bin/gh"; chmod +x "$F/bin/gh"
 # #1717: cmd_check now also refuses a cell without the record step (and its declared sibling), so a
 # dispatch-provisioning fixture must be a cell that PASSES that earlier probe — otherwise every
@@ -686,9 +714,10 @@ say_case "harness provenance: reports, records, refuses and mends (agent-infra#1
 
 P="$T/prov"; mkdir -p "$P/home" "$P/o" "$P/bin" "$P/untracked" "$P/lowbin"
 ai_init_repo "$P/repo"
-for f in orch-loop.sh claims.sh repo-authority.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh; do
+for f in orch-loop.sh claims.sh repo-authority.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do
   : > "$P/o/$f"; : > "$P/untracked/$f"
 done
+write_doctor_stub "$P/o"; write_doctor_stub "$P/untracked"
 printf '#!/bin/bash\nexit 0\n' > "$P/bin/gh"; chmod +x "$P/bin/gh"
 # #1717: `check` refuses a cell whose $CELL_HOME lacks the record step (and its declared sibling),
 # so seed the pair exactly where the shipped `start` lays it down. Without this every §9 arm that
@@ -1380,11 +1409,11 @@ for v in 00 000 18446744073709551617; do
     *) bad "MIN_FREE_MB=$v was ACCEPTED — the floor is disarmed: $MFM_OUT" ;;
   esac
 done
-MFM_OUT="$(MIN_FREE_MB=010 CELL_HOME="$T/home" ENV_FILE="$T/keys.env" SESSION="ai1745-mfm-$$" \
+MFM_OUT="$(MIN_FREE_MB=110 CELL_HOME="$T/home" ENV_FILE="$T/keys.env" SESSION="ai1745-mfm-$$" \
            O="$T/o" REPO="$T/not-a-repo" bash "$SUP" status 2>&1)"
 case "$MFM_OUT" in
-  *MIN_FREE_MB*) bad "MIN_FREE_MB=010 was refused at load — a legitimate decimal is a false block" ;;
-  *) ok "MIN_FREE_MB=010 is read as DECIMAL 10 (not octal 8, not zero)" ;;
+  *MIN_FREE_MB*) bad "MIN_FREE_MB=110 was refused at load — a legitimate decimal is a false block" ;;
+  *) ok "MIN_FREE_MB=110 is read as DECIMAL 10 (not octal 8, not zero)" ;;
 esac
 
 # (j) `HARNESS_REPO` must never resolve to the PIN. A linked worktree's own toplevel IS the pin, so
@@ -1470,7 +1499,8 @@ say_case "the queue target IS the checkout's remote (agent-infra#1901)"
 Q="$T/queue"; mkdir -p "$Q/home" "$Q/bin"
 QH="$Q/harness"
 ai_worktree "$Q/harness"
-for f in orch-loop.sh claims.sh repo-authority.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh adopt-fix.sh; do : > "$Q/harness/$f"; done
+for f in orch-loop.sh claims.sh repo-authority.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh adopt-fix.sh cloud-cell-doctor.sh; do : > "$Q/harness/$f"; done
+write_doctor_stub "$Q/harness"
 # The provisioning probe must answer rc=0 here: this section is about the PAIR, not about dispatch.
 # It echoes the OR it was handed, so a probe run against the wrong queue could not pass silently.
 cat > "$Q/harness/refresh-candidates.sh" <<'SH'
@@ -1723,12 +1753,31 @@ chmod +x "$L/o/orch-loop.sh"
 cat > "$L/bin/tmux" <<SH
 #!/bin/bash
 case "\${1:-}" in
-  has-session) [ -f "$L/tmuxup" ] && exit 0; exit 1 ;;
-  new-session) : > "$L/tmuxup"; exit 0 ;;
+  has-session)
+    t=""; while [ \$# -gt 0 ]; do case "\$1" in -t) t="\$2"; shift 2 ;; *) shift ;; esac; done
+    t="\${t#=}"
+    # ⛔ NAME-AWARE. #1989's `start` heals a missing doctor loop on the "already running" path, and a
+    # name-blind `tmuxup` marker then makes `has-session -t $SESSION` true forever after — `status`
+    # reporting a controller that `stop` already killed, which is the false pass this fixture exists to
+    # exclude.
+    [ -f "$L/up.\$t" ] && exit 0; exit 1 ;;
+  kill-session)
+    t=""; while [ \$# -gt 0 ]; do case "\$1" in -t) t="\$2"; shift 2 ;; *) shift ;; esac; done
+    t="\${t#=}"; rm -f "$L/up.\$t"; exit 0 ;;
+  new-session)
+    # Record the NAME: #1989's `start` heals a missing doctor loop on the "already running" path, and
+    # that session is not a second CONTROLLER. A name-blind marker cannot tell them apart.
+    n=""; while [ \$# -gt 0 ]; do case "\$1" in -s) n="\$2"; shift 2 ;; *) shift ;; esac; done
+    printf '%s\n' "\$n" >> "$L/tmuxnames"
+    [ -n "\$n" ] && : > "$L/up.\$n"
+    : > "$L/tmuxup"; exit 0 ;;
   *) exit 0 ;;
 esac
 SH
 chmod +x "$L/bin/tmux"
+# #1989: `start` heals a missing doctor on the already-running path, so this fixture needs one — and a
+# doctor SESSION the stub can create and kill by name.
+write_doctor_stub "$L/o"
 own_sup() { # <sub>
   PATH="$L/bin:$PATH" CELL_HOME="$L/home" ENV_FILE="$L/keys.env" SESSION="ai1761-$$" \
     O="$L/o" REPO="$L/repo" OR="daniel-ospina/agent-infra" SCOPE=own HARNESS="" \
@@ -1781,8 +1830,18 @@ case "$OUT" in
   *"already running"*) bad "start: refused WITHOUT naming the live pid ($ROOT) — $OUT" ;;
   *) bad "start: did NOT refuse a live controller: $OUT" ;;
 esac
-[ -f "$L/tmuxup" ] && bad "start: created a session despite a live controller" \
-                   || ok "start: no second session was created"
+# ⛔ The CONTROLLER session must not be created; a healed DOCTOR session is #1989's intent and is
+# asserted separately (it is not a second controller draining the queue).
+if grep -qxF -- "ai1761-$$" "$L/tmuxnames" 2>/dev/null; then
+  bad "start: created a CONTROLLER session despite a live controller"
+else
+  ok "start: no second CONTROLLER session was created"
+fi
+# Either this call created it, or an earlier arm in this fixture already had — both mean the cell is
+# no longer without a doctor, which is what #1989 asks for.
+{ [ -f "$L/up.$DOCTOR_SESSION" ] || grep -qxF -- "$DOCTOR_SESSION" "$L/tmuxnames" 2>/dev/null; } \
+  && ok "start: the missing DOCTOR loop was healed on the already-running path (#1989)" \
+  || bad "start: a live controller with no doctor was left without one (#1989) — names=[$(tr '\n' ' ' < "$L/tmuxnames" 2>/dev/null)] out=$(printf '%s' "$OUT" | tail -2 | tr '\n' ' ')"
 # The child (a worker-shape transient) must be gone before `stop` asserts the state dir is clear.
 for i in $(seq 1 40); do [ -n "$CHILD" ] && kill -0 "$CHILD" 2>/dev/null || break; sleep 0.25; done
 # ⛔ RE-CREATE THE LOCK. The arm above removed it to prove `status` cannot be blinded by a deleted
@@ -2214,7 +2273,301 @@ esac
 
 trap 'ai1711_cleanup; [ -n "${AI1761_PIDS:-}" ] && kill -9 $AI1761_PIDS 2>/dev/null; rm -rf "$T"' EXIT
 
+# ── 20) `stop` must STOP the doctor loop, not merely its tmux session (#1989 review round 3) ────
+# tmux HUPs the pane's `sh -c` wrapper; the loop is the far side of a `bash … | tee` pipeline and can
+# survive as an orphan, whose trap never fires. It would then keep LANDING PRs and pruning caches
+# after an explicit stop, and a later `start` would leave it invisible to `status`.
+say_case "stop ends an ORPHANED doctor loop (a session kill is not proof it is gone)"
+SP="$T/stop"; mkdir -p "$SP/bin" "$SP/home" "$SP/o/state/roles" "$SP/tm"
+ai_init_repo "$SP/repo"
+cat > "$SP/bin/tmux" <<'SH'
+#!/bin/bash
+# A session that reports itself present and KILLS NOTHING — the measured orphan shape. ⛔ Only for the
+# DOCTOR session: the controller's own ownership rules (#1856) must not be exercised by accident here,
+# or this arm fails for a reason it is not about.
+sub="${1:-}"; shift 2>/dev/null || true
+t=""; while [ $# -gt 0 ]; do case "$1" in -t) t="$2"; shift 2 ;; *) shift ;; esac; done
+case "$sub" in
+  has-session) [ "${t#=}" = "${DOCTOR_SESSION:-cell-doctor}" ] && exit 0; exit 1 ;;
+  *) exit 0 ;;
+esac
+SH
+chmod +x "$SP/bin/tmux"
+# A loop that IGNORES TERM (so only the KILL backstop can end it), plus its identity record.
+bash -c 'trap "" TERM; while :; do sleep 1; done' & FAKE_LOOP=$!
+sleep 0.3
+ident="$(sed 's/.*) //' "/proc/$FAKE_LOOP/stat" 2>/dev/null | awk '{print $20}')"
+case "$ident" in ''|*[!0-9]*) ident="$(ps -p "$FAKE_LOOP" -o lstart= 2>/dev/null)" ;; *) ident="proc:$ident" ;; esac
+printf '%s\n' "$FAKE_LOOP" > "$SP/o/state/roles/loop.pid"
+printf '%s|%s\n' "$FAKE_LOOP" "$ident" > "$SP/o/state/roles/loop.ident"
+: > "$SP/o/state/roles/.desired"
+( PATH="$SP/bin:$PATH" HOME="$SP/home" CELL_HOME="$SP/home" REPO="$SP/repo" O="$SP/o" \
+    bash "$SUP" stop > "$SP/stop.out" 2>&1 ); SRC=$?
+kill -0 "$FAKE_LOOP" 2>/dev/null && still=1 || still=0
+kill -KILL "$FAKE_LOOP" 2>/dev/null || true
+[ "$still" = 0 ] && ok "stop: the orphaned loop (a TERM-ignoring pid) is actually GONE after stop" \
+  || bad "stop: the loop survived stop (pid $FAKE_LOOP) — $(cat "$SP/stop.out")"
+[ "$SRC" -eq 0 ] && ok "stop: rc=0 once the loop is gone" || bad "stop: rc=$SRC — $(cat "$SP/stop.out")"
+[ ! -f "$SP/o/state/roles/.desired" ] && ok "stop: the desired-state marker is removed (the stop sticks)" \
+  || bad "stop: .desired survived"
+[ ! -f "$SP/o/state/roles/loop.pid" ] && ok "stop: the loop record is cleared" || bad "stop: loop.pid survived"
+
+# The SESSION may already be gone (a tmux server restart) while the loop survives: the backstop must
+# run even then — that is exactly the shape a session-only stop missed.
+cat > "$SP/bin/tmux" <<'SH'
+#!/bin/bash
+exit 1   # no session at all: `has-session` fails for every target
+SH
+chmod +x "$SP/bin/tmux"
+bash -c 'trap "" TERM; while :; do sleep 1; done' & ORPHAN=$!
+sleep 0.3
+oid="$(sed 's/.*) //' "/proc/$ORPHAN/stat" 2>/dev/null | awk '{print $20}')"
+case "$oid" in ''|*[!0-9]*) oid="$(ps -p "$ORPHAN" -o lstart= 2>/dev/null)" ;; *) oid="proc:$oid" ;; esac
+printf '%s\n' "$ORPHAN" > "$SP/o/state/roles/loop.pid"
+printf '%s|%s\n' "$ORPHAN" "$oid" > "$SP/o/state/roles/loop.ident"
+( PATH="$SP/bin:$PATH" HOME="$SP/home" CELL_HOME="$SP/home" REPO="$SP/repo" O="$SP/o" \
+    bash "$SUP" stop > "$SP/stop2.out" 2>&1 ); ORC=$?
+oalive=0; kill -0 "$ORPHAN" 2>/dev/null && oalive=1
+kill -KILL "$ORPHAN" 2>/dev/null || true
+[ "$oalive" = 0 ] && [ "$ORC" -eq 0 ] \
+  && ok "stop: an orphaned loop is ended even when its tmux SESSION is already gone" \
+  || bad "stop: no session -> the orphan survived (alive=$oalive rc=$ORC) — $(cat "$SP/stop2.out")"
+
+# The same fenced end is used by the supersede teardown. Drive the SHIPPED functions directly: a
+# teardown that rm's the record without ending the process destroys the only handle on an orphan that
+# keeps landing PRs, so this asserts the process is ended, and that a recycled pid is left alone.
+say_case "end_loop_pid: ends the recorded loop, abstains on a recycled pid"
+EL="$SP/endloop"; mkdir -p "$EL"
+{ sed -n '/^sup_pid_ident() {/,/^}/p' "$SUP"; sed -n '/^end_loop_pid() {/,/^}/p' "$SUP"; } > "$EL/lib.sh"
+bash -c 'trap "" TERM; while :; do sleep 1; done' & ELP=$!
+sleep 0.3
+elid="$(bash -c ". '$EL/lib.sh'; sup_pid_ident $ELP")"
+printf '%s\n' "$ELP" > "$EL/loop.pid"
+printf '%s|%s\n' "$ELP" "$elid" > "$EL/loop.ident"
+ER=0
+( ROLES_DIR="$EL"; . "$EL/lib.sh"; end_loop_pid ) || ER=$?
+elalive=0; kill -0 "$ELP" 2>/dev/null && elalive=1
+kill -KILL "$ELP" 2>/dev/null || true
+[ "$ER" -eq 0 ] && [ "$elalive" = 0 ] \
+  && ok "end_loop_pid: ends the recorded loop process (rc=0, gone) — not just its record" \
+  || bad "end_loop_pid: the recorded loop survived (alive=$elalive rc=$ER)"
+bash -c 'while :; do sleep 1; done' & ELI=$!
+sleep 0.3
+printf '%s\n' "$ELI" > "$EL/loop.pid"
+printf '%s|proc:1\n' "$ELI" > "$EL/loop.ident"
+( ROLES_DIR="$EL"; . "$EL/lib.sh"; end_loop_pid ) || ER2=$?
+elialive=0; kill -0 "$ELI" 2>/dev/null && elialive=1
+kill -KILL "$ELI" 2>/dev/null || true
+[ "${ER2:-0}" -eq 0 ] && [ "$elialive" = 1 ] \
+  && ok "end_loop_pid: a recycled pid is NOT signalled (the fence abstains)" \
+  || bad "end_loop_pid: signalled a recycled pid (alive=$elialive rc=${ER2:-0})"
+
+# A RECYCLED pid must not be signalled: the recorded identity no longer matches, so stop abstains.
+bash -c 'while :; do sleep 1; done' & INNOCENT=$!
+sleep 0.3
+printf '%s\n' "$INNOCENT" > "$SP/o/state/roles/loop.pid"
+printf '%s|proc:1\n' "$INNOCENT" > "$SP/o/state/roles/loop.ident"
+( PATH="$SP/bin:$PATH" HOME="$SP/home" CELL_HOME="$SP/home" REPO="$SP/repo" O="$SP/o" \
+    bash "$SUP" stop > "$SP/stop3.out" 2>&1 ); RRC=$?
+alive=0; kill -0 "$INNOCENT" 2>/dev/null && alive=1
+kill -KILL "$INNOCENT" 2>/dev/null || true
+# ⛔ The "survived" verdict must be FENCED too: an abstained kill is a SUCCESSFUL stop, so warning
+# (and rc=1) here would tell the operator that a stop which worked had failed.
+[ "$RRC" -eq 0 ] && ! grep -q 'survived the stop' "$SP/stop3.out" \
+  && ok "stop: a recycled pid is not reported as 'survived' (an abstained kill is not a failure)" \
+  || bad "stop: a recycled pid made stop fail (rc=$RRC) — $(cat "$SP/stop3.out")"
+[ "$alive" = 1 ] && ok "stop: an innocent process with a recycled pid is NOT signalled (identity fence)" \
+  || bad "stop: killed a process the loop record did not describe"
+
 echo
+# ── §7b) agent-infra#1989: the stop/start fence, the verb path's configuration, and doctor
+# idempotency. A PRIVATE fixture (its own repo, harness and cell home): every assertion here is about
+# what `start`/`stop` pass to the doctor, and a shared fixture would let another section's paths,
+# sessions or leftover controller processes decide it.
+say_case "#1989: stop/start fence, verb-path configuration, doctor idempotency"
+W2="$T/wk2"; rm -rf "$W2"; mkdir -p "$W2/bin" "$W2/stub" "$W2/o/state/roles" "$W2/home"
+ai_init_repo "$W2/repo"
+ai_worktree "$W2/harness"
+# The harness a cell seeds is the worker DIRECTORY: the required set must be at its root (a fixture
+# without it dies in `cmd_check` with "worker scripts missing"), and the doctor stub is one of them.
+for f in claims.sh repo-authority.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do : > "$W2/harness/$f"; done
+write_doctor_stub "$W2/harness"
+write_doctor_stub "$W2/o"
+cat > "$W2/harness/orch-loop.sh" <<EOF
+#!/bin/bash
+sleep 4
+EOF
+chmod +x "$W2/harness/orch-loop.sh"
+# `start` PROVISIONS the record step from ONE LEVEL ABOVE the harness (`$HARNESS/../record-review.sh`),
+# so the fixture's copy lives there — inside the harness it is not found and `start` refuses.
+cat > "$W2/record-review.sh" <<'SH'
+#!/bin/bash
+exit 0
+SH
+mkdir -p "$W2/lib"; printf '#!/usr/bin/env python3\n' > "$W2/lib/diff-normalize.py"
+chmod +x "$W2/record-review.sh"
+git -C "$W2/harness" add -A >/dev/null 2>&1 || true
+git -C "$W2/harness" -c user.email=t@t -c user.name=t commit -q -m "1989 fixture harness" >/dev/null 2>&1 || true
+W2_REF="$(git -C "$W2/harness" rev-parse HEAD 2>/dev/null || echo origin/main)"
+printf '#!/bin/bash\nexit 0\n' > "$W2/bin/gh"; chmod +x "$W2/bin/gh"
+stub_missing "$W2/bin" pi
+# A tmux double that records every argv and models `-t =name` exact matching.
+cat > "$W2/stub/tmux" <<'SH'
+#!/bin/bash
+S="${AI1989_STATE:?}"
+printf '%s\n' "$*" >> "$S/argv"
+sub="${1:-}"; shift
+n=""
+while [ $# -gt 0 ]; do case "$1" in -s|-t) n="$2"; shift 2 ;; *) shift ;; esac; done
+n="${n#=}"
+case "$sub" in
+  has-session) [ -n "$n" ] && [ -f "$S/up.$n" ] && exit 0; exit 1 ;;
+  new-session) [ -n "$n" ] && : > "$S/up.$n"; exit 0 ;;
+  kill-session) [ -n "$n" ] && rm -f "$S/up.$n"; exit 0 ;;
+  *) exit 0 ;;
+esac
+SH
+chmod +x "$W2/stub/tmux"
+mkdir -p "$W2/st" "$W2/o/logs"
+export AI1989_STATE="$W2/st"
+
+# A `stop` that arrives DURING a start must win: the start tears down what it created and returns
+# non-zero, so the stop is not silently undone by the restart completing after it. The window is real
+# — the doctor's own `supervisor start` runs under a bound of up to CONTROLLER_START_TIMEOUT — and a
+# process-group kill cannot close it (the restart's recorded pid is a `timeout` wrapper).
+say_case "a stop arriving during a start SUPERSEDES it (the stop is not undone)"
+SG="$W2/state.supersede"; rm -rf "$SG"; mkdir -p "$SG"
+: > "$W2/o/state/roles/.stop-generation"
+( sleep 1; printf '7\n' > "$W2/o/state/roles/.stop-generation" ) & SUP_BG=$!
+SUP_SRC=0
+env PATH="$W2/bin:$W2/stub:$PATH" AI1989_STATE="$SG" AI1711_SOCK="" \
+    CELL_HOME="$W2/home" HOME="$W2/home" ENV_FILE="$W2/keys-env.env" \
+    SESSION="ai1989-sup-$$" DOCTOR_SESSION="cell-doctor-1989" O="$W2/o" REPO="$W2/repo" HARNESS="$W2/harness" HARNESS_REPO="$AI" \
+    HARNESS_FETCH=0 SCOPE=own MIN_FREE_MB=1 HARNESS_REF="$W2_REF" \
+    bash "$SUP" start >"$W2/start.supersede.out" 2>&1 || SUP_SRC=$?
+wait "$SUP_BG" 2>/dev/null || true
+[ "$SUP_SRC" -ne 0 ] && grep -q 'a STOP arrived while this start was running' "$W2/start.supersede.out" \
+  && ok "start: a stop during the start makes it ABORT (rc=$SUP_SRC) instead of undoing the stop" \
+  || bad "start: a concurrent stop did not supersede the start (rc=$SUP_SRC) — $(tail -3 "$W2/start.supersede.out" | tr '\n' ' ')"
+rm -f "$W2/o/state/roles/.stop-generation"
+
+# …and the SAME fence on the "already running" branch: a live controller with no doctor is healed by
+# `start`, and that heal must not outlive a concurrent stop either (otherwise it re-writes `.desired`
+# and re-creates the doctor session the stop just removed).
+SG2="$W2/state.supersede2"; rm -rf "$SG2"; mkdir -p "$SG2"
+: > "$W2/o/state/roles/.stop-generation"
+: > "$SG2/up.ai1989-busy-$$"        # the controller session already exists
+( sleep 1; printf '9\n' > "$W2/o/state/roles/.stop-generation" ) & SUP_BG2=$!
+SUP_SRC2=0
+env PATH="$W2/bin:$W2/stub:$PATH" AI1989_STATE="$SG2" AI1711_SOCK="" \
+    CELL_HOME="$W2/home" HOME="$W2/home" ENV_FILE="$W2/keys-env.env" \
+    SESSION="ai1989-busy-$$" O="$W2/o" REPO="$W2/repo" HARNESS="$W2/harness" HARNESS_REPO="$AI" \
+    HARNESS_FETCH=0 SCOPE=own MIN_FREE_MB=1 HARNESS_REF="$W2_REF" \
+    bash "$SUP" start >"$W2/start.supersede2.out" 2>&1 || SUP_SRC2=$?
+wait "$SUP_BG2" 2>/dev/null || true
+[ "$SUP_SRC2" -ne 0 ] && grep -q 'a STOP arrived while this start was running' "$W2/start.supersede2.out" \
+  && ok "start: the 'already running' heal is fenced too (rc=$SUP_SRC2, not a silent re-arm)" \
+  || bad "start: the already-running heal ignored a concurrent stop (rc=$SUP_SRC2) — $(tail -2 "$W2/start.supersede2.out" | tr '\n' ' ')"
+rm -f "$W2/o/state/roles/.stop-generation"
+
+# ⛔ DOCTOR_SESSION must be CARRIED into the loop's command string, like SESSION. A tmux session is
+# served from the SERVER's environment, so on a pre-existing server the operator's custom name is
+# otherwise dropped — and the loop's own `supervisor start` restart re-derives `cell-doctor`, finds no
+# session under that name, and spawns a SECOND loop: two loops on one state dir (reap/merge at double
+# rate), which `stop` on the custom name cannot end.
+say_case "the doctor loop's command string carries DOCTOR_SESSION (agent-infra#1989)"
+# ⛔ The DOCTOR_SESSION carry must be asserted on a start that COMPLETES: the supersede arms above abort
+# before the doctor loop is launched, so their argv proves nothing about it.
+DOS="$W2/state.docsession"; rm -rf "$DOS"; mkdir -p "$DOS"
+env PATH="$W2/bin:$W2/stub:$PATH" AI1989_STATE="$DOS" CELL_HOME="$W2/home" HOME="$W2/home" \
+    ENV_FILE="$W2/keys-env.env" SESSION="ai1989-doc-$$" DOCTOR_SESSION="cell-doctor-1989" \
+    O="$W2/o" REPO="$W2/repo" HARNESS="$W2/harness" HARNESS_REPO="$AI" \
+    HARNESS_FETCH=0 SCOPE=own MIN_FREE_MB=1 HARNESS_REF="$W2_REF" \
+    bash "$SUP" start >"$W2/start.docsession.out" 2>&1 || true
+grep -q "DOCTOR_SESSION='cell-doctor-1989'" "$DOS/argv" 2>/dev/null \
+  && ok "start: the doctor loop's command string carries the operator's DOCTOR_SESSION" \
+  || bad "start: DOCTOR_SESSION was not carried into the doctor loop's command string — argv=$(tr '\n' '|' < "$DOS/argv" 2>/dev/null | cut -c1-400)"
+rm -f "$W2/o/state/roles/.desired"
+
+say_case "a manual role verb carries SCOPE/ENV_FILE/DOCTOR_SESSION/HARNESS_* to the doctor (#1989)"
+RV="$W2/verb"; mkdir -p "$RV/o"
+cat > "$RV/o/cloud-cell-doctor.sh" <<'SH'
+#!/bin/bash
+{ printf 'SCOPE=%s\n' "${SCOPE:-}"; printf 'ENV_FILE=%s\n' "${ENV_FILE:-}"
+  printf 'DOCTOR_SESSION=%s\n' "${DOCTOR_SESSION:-}"; printf 'HARNESS_REF=%s\n' "${HARNESS_REF:-}"
+  printf 'HARNESS_REPO=%s\n' "${HARNESS_REPO:-}"; } > "${VERB_OUT:?}"
+exit 0
+SH
+chmod +x "$RV/o/cloud-cell-doctor.sh"
+env PATH="$W2/bin:$W2/stub:$PATH" CELL_HOME="$W2/home" HOME="$W2/home" \
+    ENV_FILE="$W2/keys-verb.env" SESSION="ai1989-verb-$$" DOCTOR_SESSION="verb-doctor" \
+    O="$RV/o" REPO="$W2/repo" HARNESS_REPO="$AI" HARNESS_REF=origin/main SCOPE=own VERB_OUT="$RV/env" \
+    bash "$SUP" merge >"$RV/out" 2>&1 || true
+for want in "SCOPE=own" "ENV_FILE=$W2/keys-verb.env" "DOCTOR_SESSION=verb-doctor" "HARNESS_REF=origin/main"; do
+  grep -qxF -- "$want" "$RV/env" 2>/dev/null \
+    && ok "verb: the doctor was handed '$want'" \
+    || bad "verb: the doctor was NOT handed '$want' — $(tr '\n' ' ' < "$RV/env" 2>/dev/null)"
+done
+
+# ⛔ The restart's baseline is the generation the DOCTOR observed, not the one `start` reads after its
+# own startup: a `stop` landing between the launch and that read would otherwise be invisible and the
+# restart would complete after the stop. `STOP_GENERATION_AT_LAUNCH` is how the doctor hands it over.
+say_case "a restart acts under the generation its launcher observed (#1989)"
+: > "$W2/o/state/roles/.stop-generation"
+printf '5\n' > "$W2/o/state/roles/.stop-generation"          # the doctor's observed generation
+printf '6\n' > "$W2/o/state/roles/.stop-generation"          # ...and a stop has since landed
+RSRC=0; HSTATE="$W2/state.handoff"; rm -rf "$HSTATE"; mkdir -p "$HSTATE"
+env PATH="$W2/bin:$W2/stub:$PATH" AI1989_STATE="$HSTATE" AI1711_SOCK="" \
+    CELL_HOME="$W2/home" HOME="$W2/home" ENV_FILE="$W2/keys-env.env" \
+    SESSION="ai1989-handoff-$$" O="$W2/o" REPO="$W2/repo" HARNESS="$W2/harness" HARNESS_REPO="$AI" \
+    HARNESS_FETCH=0 SCOPE=own MIN_FREE_MB=1 HARNESS_REF="$W2_REF" STOP_GENERATION_AT_LAUNCH=5 \
+    bash "$SUP" start >"$W2/start.handoff.out" 2>&1 || RSRC=$?
+[ "$RSRC" -ne 0 ] && grep -q 'a STOP arrived while this start was running' "$W2/start.handoff.out" \
+  && ok "start: a handed-over generation makes the stop visible even if the read raced it" \
+  || bad "start: the handed generation was ignored (rc=$RSRC) — $(tail -2 "$W2/start.handoff.out" | tr '\n' ' ')"
+# …and the handoff only ever TIGHTENS: a launcher-passed generation that matches still starts.
+rm -f "$W2/o/state/roles/.stop-generation"
+
+# ⛔ `start`'s doctor idempotency must rest on the LOOP RECORD, not only on the tmux session: after a
+# tmux server restart the session is gone while the loop survives as an orphan, and that orphan's own
+# restart (`supervisor start`) would create a SECOND loop — which overwrites `loop.pid` and hides the
+# orphan from `stop`/`status`.
+say_case "start does not spawn a second doctor when the loop SURVIVES without its session (#1989)"
+LA="$W2/loopalive"; rm -rf "$LA"; mkdir -p "$LA/o/state/roles" "$LA/home" "$LA/st" "$LA/h"
+# ⛔ Its OWN harness, not the section's. `start` refuses when a live `<shell> <harness>/orch-loop.sh` is
+# on the box and is not provably this state dir's, and the section's `$W2/harness` path is shared with
+# every other case here — a leftover fixture controller from an earlier one made THIS case report a
+# false regression about a loop record (measured red on CI, green locally). The assertion is about the
+# loop record, so the harness path it is scanned against must be private to it.
+cp -a "$W2/harness/." "$LA/h/"
+# …plus the record step, which `start` provisions from ONE LEVEL ABOVE the harness (`$HARNESS/../`).
+cp -a "$W2/record-review.sh" "$LA/record-review.sh"; cp -a "$W2/lib" "$LA/lib"
+cat > "$LA/o/cloud-cell-doctor.sh" <<'SH'
+#!/bin/bash
+[ "${1:-}" = loop ] && exec sleep 30
+exit 0
+SH
+chmod +x "$LA/o/cloud-cell-doctor.sh"
+# A live loop process with a matching identity record, and NO tmux session at all.
+bash -c 'exec sleep 60' & LAPID=$!
+la_ident="$(sed 's/.*) //' "/proc/$LAPID/stat" 2>/dev/null | awk '{print $20}')"
+case "$la_ident" in ''|*[!0-9]*) la_ident="$(ps -p "$LAPID" -o lstart= 2>/dev/null)" ;; *) la_ident="proc:$la_ident" ;; esac
+printf '%s\n' "$LAPID" > "$LA/o/state/roles/loop.pid"
+printf '%s|%s\n' "$LAPID" "$la_ident" > "$LA/o/state/roles/loop.ident"
+LARC=0
+env PATH="$W2/bin:$W2/stub:$PATH" AI1989_STATE="$LA/st" AI1711_SOCK="" \
+    CELL_HOME="$LA/home" HOME="$LA/home" ENV_FILE="$W2/keys-verb.env" \
+    SESSION="ai1989-loopalive-$$" O="$LA/o" REPO="$W2/repo" HARNESS="$LA/h" HARNESS_REPO="$AI" \
+    HARNESS_FETCH=0 SCOPE=own MIN_FREE_MB=1 HARNESS_REF="$W2_REF" \
+    bash "$SUP" start >"$LA/out" 2>&1 || LARC=$?
+alive_after=0; kill -0 "$LAPID" 2>/dev/null && alive_after=1
+kill -KILL "$LAPID" 2>/dev/null || true
+# `has-session -t =cell-doctor` appears either way; what must NOT appear is a NEW SESSION for it.
+newdoc=0; grep -qE 'new-session.*-s cell-doctor( |$)' "$LA/st/argv" 2>/dev/null && newdoc=1
+[ "$LARC" -eq 0 ] && [ "$newdoc" = 0 ] \
+  && ok "start: a live loop record with no session is treated as RUNNING (no second doctor session)" \
+  || bad "start: a surviving loop was ignored (rc=$LARC, new doctor session=$newdoc) — $(tail -2 "$LA/out" | tr '\n' ' ') // live matches: $(ps -eo pid=,ppid=,command= 2>/dev/null | awk -v a="$LA/o/orch-loop.sh" -v h="$LA/h/orch-loop.sh" '{ c=$0; sub(/^[[:space:]]*[0-9]+[[:space:]]+[0-9]+[[:space:]]+/,"",c); n=split(c,t," "); if (n>=2 && (t[2]==a || t[2]==h)) print $1" "t[2] }' | tr '\n' ' ')"
+
 echo "── Summary ───────────────────────────────────────────────────────"
 echo "  PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ] || { echo "  ❌ FAILURES — fix and re-run"; exit 1; }
