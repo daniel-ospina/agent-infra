@@ -87,7 +87,17 @@ is_limit "${_NCPU:-}"    || _NCPU=4
 [ "${_NCPU:-0}" -ge 1 ] || _NCPU=4
 MAX_LOAD="${MAX_LOAD:-$(( 10#$_NCPU * 10 ))}"
 is_limit "${MAX_LOAD:-}" || MAX_LOAD=$(( 10#$_NCPU * 10 )); is_limit "${MAX_LOAD:-}" || MAX_LOAD=40
-MAX_LANES="${MAX_LANES:-4}"
+# ⛔ CAPACITY, NOT A LANE COUNT (owner ruling, 2026-10-17): "dispatch should be gated on capacity,
+# not on number of lanes. max lanes 8 is too low. that needs to be configured to 2.5x the number of
+# CPUs". Both numbers in play were LANE COUNTS that no hardware decided: the shipped default was a
+# FLAT 4, and the box this was measured on had its plist PINNED at 8 —
+# `[cap] load=79/100 lanes=9/8 … [dispatch] skipped (lanes=9>=max_lanes=8)` — 21 points of load
+# headroom and comfortable swap/memory, so the NEXT dispatch was refused for a lane count while
+# capacity was available. `MAX_LOAD` above already derives from cores; same rule here.
+# Integer division, so it FLOORS (4 cores -> 10, 3 -> 7). An explicit MAX_LANES still WINS and is not
+# recomputed — with ONE exception, spelled out at the coercion block below: a present-but-INVALID
+# value (`4x`, `09`, ten digits) is repaired there to this same derived default.
+MAX_LANES="${MAX_LANES:-$(( 10#$_NCPU * 5 / 2 ))}"
 MAX_REVIEW="${MAX_REVIEW:-4}"   # keep in sync with install.sh's default and README §4
 # Above this many UNOWNED open PRs (open PRs nothing is currently working — pr_owned() below),
 # merging takes priority and new lanes stop being dispatched. The pre-fix gate counted the TOTAL
@@ -169,7 +179,14 @@ is_limit "${MIN_MEM_FREE_MB:-512}" || MIN_MEM_FREE_MB=512
 # attempt 10 run; and `$((MAX_REVIEW + 2))` reads a leading-zero value as OCTAL (030 -> 26, not 30),
 # which is the same trap the scope decision already normalises with `10#` below. MAX_FIX is coerced
 # for the same reason. Each is first read below this point, so coercing here is still guard-before-use.
-is_limit "${MAX_LANES:-}"         || MAX_LANES=4
+# ⛔ MAX_LANES IS REPAIRED TO ITS OWN DERIVED DEFAULT, not to a flat 4 (owner ruling, 2026-10-17):
+# a garbage plist value must leave the box with the ceiling its CORES imply (see the derivation at
+# the top), or a typo would silently pin one machine to a lane count its hardware never chose. The
+# repair is BOUNDED exactly as MAX_LOAD's is: `_NCPU` passes `is_limit` at nine digits, so
+# `* 5 / 2` can produce a ten-digit lane count that `is_limit` rejects — and only a TRUE default can
+# repair that, since re-deriving from the same probe returns the same value. 10 = a 4-core box's
+# 2.5x. `MAX_LANES=0` still passes `is_limit` and dispatches nothing — unchanged, deliberate.
+is_limit "${MAX_LANES:-}"         || { MAX_LANES=$(( 10#$_NCPU * 5 / 2 )); is_limit "${MAX_LANES:-}" || MAX_LANES=10; }
 is_limit "${MAX_REVIEW:-}"        || MAX_REVIEW=4
 is_limit "${MERGE_PRIORITY_AT:-}" || MERGE_PRIORITY_AT=25
 is_limit "${MAX_FIX:-}"           || MAX_FIX=3
@@ -1439,13 +1456,27 @@ PY
       # ⛔ BOTH REFUSALS STOP THE DISPATCH — INCLUDING THE INFRA ONE (rc=2). claims.sh fails OPEN on
       # an unreachable remote for a PR claim, because refusing there costs one merge; here the safe
       # reading is the opposite: an UNREADABLE registry is not evidence of freedom, and dispatching
-      # on it is the exact duplicate this issue exists to remove. The cost is bounded — the same
-      # outage fails the pre-flight's `gh` surfaces, so the cell is already stalled — and it is the
-      # polarity `claim_issue_preflight` takes on the read side.
+      # on it is the exact duplicate this issue exists to remove.
+      # ⛔ ITS BLAST RADIUS IS THE FLEET, NOT THIS BOX — DO NOT SOFTEN THE REFUSAL ON THE ASSUMPTION
+      # THAT `gh` IS DOWN TOO (2026-10-16 review). This comment used to assert "the same outage fails
+      # the pre-flight's `gh` surfaces, so the cell is already stalled"; that is FALSE, and the
+      # regression case for it (`claim-unreachable`) disproves it with a WORKING gh stub: the
+      # registry read is `git ls-remote` — a GIT transport — while the pre-flight tool and the whole
+      # merge path use the `gh` REST API. A git-only failure (credentials, a ruleset, a transport
+      # block) therefore refuses every issue on EVERY box pointed at this repo, so nothing is queued
+      # and nothing is dispatched, while merges keep working. That is the intended direction (a
+      # registry outage must never become a duplicate dispatch), but it is a fleet-wide stop on
+      # dispatch and it must be visible: refresh-candidates.sh reports it in aggregate and exits
+      # non-zero, so the controller never reads it as "no work available".
       #
       # ⚠️ NO KILL-SWITCH. An ambient env var that turns this off is the "disable a gate by ambient
-      # env" shape (a bypass), so the fallback below is only for a registry that is genuinely not
-      # provisioned, and it says so in the log every time it is used.
+      # env" shape (a bypass), so the ONLY fallback is a registry that is genuinely NOT PROVISIONED
+      # (no file at all), and it says so in the log every time it is used. ⛔ A registry that EXISTS
+      # but is too old to take a claim is NOT that case (2026-10-16 review): it is local drift on
+      # THIS box, and dispatching unclaimed while this same box's pre-flight refuses every issue as
+      # INCOMPLETE is a fail-open that can duplicate a peer's work — so it stops the dispatch, names
+      # the fix, and `refresh-candidates.sh --check` refuses the cell up front. Pre-flight and
+      # dispatch now take the SAME polarity on the same condition.
       if [ -f "$O/claims.sh" ] && declare -f claim_issue_acquire >/dev/null 2>&1; then
         if claim_issue_acquire "" "$ISS"; then
           # The commit this box pushed, for the FENCED release. Written only on a successful acquire,
@@ -1453,11 +1484,32 @@ PY
           claim_issue_record "$O" "$ISS" "${CLAIM_COMMIT:-}" \
             || echo "[dispatch] ⚠️ #$ISS: could not record the claim commit — chain-merge.sh cannot FENCE the release (the claim will run to its lease)" >> "$LOG"
         else
-          echo "[dispatch] #$ISS NOT dispatched — ${CLAIM_RESULT:-issue claim refused}" >> "$LOG"
+          acq_rc=$?
+          # ⛔ rc=2 WITH A COMMIT IN HAND IS A RELEASE PATH, NOT JUST A REFUSAL (2026-10-16 review).
+          # claims.sh sets CLAIM_COMMIT on the create/reclaim paths whose push MAY have landed and
+          # only the read-back failed — its own comment says the caller can attempt a FENCED release,
+          # and merge-one.sh already does exactly that for the same condition. Discarding it here
+          # orphaned a claim THIS BOX created for the whole lease, with every peer reading the issue
+          # as taken: the abandoned-claim class this change exists to close.
+          if [ "$acq_rc" = "2" ] && [ -n "${CLAIM_COMMIT:-}" ]; then
+            claim_issue_record "$O" "$ISS" "$CLAIM_COMMIT" 2>/dev/null
+            if claim_issue_release_record "$O" "$REPO" "$ISS" "$CLAIM_COMMIT" >/dev/null 2>&1; then
+              echo "[dispatch] #$ISS NOT dispatched (claim infra error) — the claim commit this box may have pushed WAS released (fenced on $CLAIM_COMMIT)" >> "$LOG"
+            else
+              echo "[dispatch] #$ISS NOT dispatched — ${CLAIM_RESULT:-issue claim refused}; the possibly-created claim could NOT be released — it will expire with its lease" >> "$LOG"
+            fi
+          else
+            echo "[dispatch] #$ISS NOT dispatched — ${CLAIM_RESULT:-issue claim refused}" >> "$LOG"
+          fi
           continue
         fi
+      elif [ -f "$O/claims.sh" ]; then
+        # PRESENT BUT STALE — see the polarity note above. The box would have to dispatch unclaimed,
+        # which is the fail-open this branch now refuses.
+        echo "[dispatch] #$ISS NOT dispatched — \$O/claims.sh predates the issue key (no claim_issue_acquire), so this box cannot take the claim; fix: cp scripts/orchestrator-harness/*.sh ~/orchestrator/" >> "$LOG"
+        continue
       else
-        echo "[dispatch] ⚠️ #$ISS: no claim registry at \$O/claims.sh (or it predates the issue key) — dispatching WITHOUT a cross-box claim" >> "$LOG"
+        echo "[dispatch] ⚠️ #$ISS: no claim registry at \$O/claims.sh — dispatching WITHOUT a cross-box claim (seed it: cp scripts/orchestrator-harness/*.sh ~/orchestrator/)" >> "$LOG"
       fi
       echo "$ISS" >> "$O/.batch"; echo "$ISS" >> "$O/dispatched.txt"; K=$((K+1)); [ "$K" -ge "$BATCH" ] && break
     done < "$O/candidates.txt"

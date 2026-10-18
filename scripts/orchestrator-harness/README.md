@@ -93,7 +93,7 @@ doc_status: draft
 > |---|---|
 > | `orch-loop.sh` guards **every** limit with `is_limit` (digits **and** at most nine of them) before its first arithmetic read — `MAX_LANES`, `MAX_REVIEW`, `MERGE_PRIORITY_AT`, `MAX_FIX`, `MAX_FIX_TRIES`, `BATCH`, `CYC`, `STALE_MIN`, `SWEEP_MAX_AGE`, `SWEEP_MIN_REMAIN` (and `MAX_LOAD`/`MIN_SWAP_FREE`/`MIN_MEM_FREE_MB`, which had `is_num`: the first two are plist-supplied gates that `[` would ERR on at or above 2**63, the last is plist-supplied too, so all three moved to `is_limit`) | two failure modes, both fail-**OPEN**: `[ -ge ]` on a non-number is FALSE and FALSE in the gate chain ALLOWS, so `MAX_LANES=4x` dropped the lane cap, `MERGE_PRIORITY_AT=notanum` removed the drain-before-dispatch gate, `BATCH=abc` dispatched the whole backlog in one cycle, and `MAX_FIX_TRIES=abc` let fixer attempt 10 run past a cap of 3. `[` also ERRORS at or above 2**63, so an absurd-but-numeric limit opened them the same way. `is_num` itself stays unbounded for an **epoch mtime** (already 10 digits), but `_NCPU` is now `is_limit` too: its source is the host (`sysctl`/`nproc`), not the plist, so an absurd-but-numeric probe reached `$(( 10#$_NCPU * 10 ))` and WRAPPED — 99999999999999999999 to 3875820019684212726, 19 digits but still BELOW 2**63-1, so `[ -ge ]` does NOT ERROR: it simply never binds and the gate OPENS **silently** (the earlier wording said `[ -ge ]` ERRORS here — corrected, fifth review round 2026-10-14) — and 2**63 to exactly 0, which `is_limit` ACCEPTS because install.sh allows 0 for every limit but CYC (`[ "$L" -ge 0 ]` is always true, so the gate CLOSES and the box dispatches nothing). `install.sh` now mirrors the loop's guard (`is_limit` + the `_NCPU >= 1` probe guard + the two MAX_LOAD guards) because install.sh is what substitutes `__MAX_LOAD__` into the live plist — the wrap survived there on the real production path |
 > | `orch-loop.sh` reads base 10 where it read base 8 | `$((MAX_REVIEW + 2))` read `030` as **octal** (26, not 30) and `$((STALE_MIN * 60))` did the same. `MERGE_PRIORITY_AT` already normalised with `10#` |
-> | `install.sh` refuses a non-integer, an out-of-range value, or a value carrying a `__TOKEN__` | `MAX_LANES=4x` was written into the live launchd plist and `install.sh` exited 0, so the plist lied about the ceiling; and the sed rules run in order, so `OR=__MAX_LANES__` rendered as `4` — exit 0, valid XML, and the daemon then ran `gh --repo 4` |
+> | `install.sh` refuses a non-integer, an out-of-range value, or a value carrying a `__TOKEN__` | `MAX_LANES=4x` was written into the live launchd plist and `install.sh` exited 0, so the plist lied about the ceiling; and the sed rules run in order, so `OR=__MAX_LANES__` rendered as the default (then a literal `4`, now 2.5× cores) — exit 0, valid XML, and the daemon then ran `gh --repo <default>` |
 > | `install.sh` renders to a temp file and `mv`s it into place, and asserts no `__…__` survived | the redirect truncates `$PLIST` **before** `sed` runs, so rejecting after writing straight to it left the live plist empty or poisoned — and §9's next step (`launchctl unload && load`) then failed, so a rejected re-install destroyed a working daemon config. `plutil -lint` cannot see a substitution that did not take |
 > | `install.sh` creates the plist's directory (`mkdir -p "$(dirname "$PLIST")"`) | an agent-infra addition, not a lost tortoise line: a sandboxed or first-time `HOME` has no `Library/LaunchAgents` and the redirect then died |
 > | `selftest.sh` pins the documented default of every host-independent limit, drives the swap gate with real swap (`SWTOTAL` != 0) **and** a non-default ceiling, drives `install.sh` instead of grepping it, and extracts the coercion lines to RUN them | the default-agreement check could not see both files drifting **together**; `SWTOTAL=0` short-circuits the swap gate before the comparison; a source-text pin survives the guard being disabled (`if false && grep …`); and a fixture that re-implements the pattern in the test asserts nothing about the shipped code |
@@ -281,6 +281,8 @@ own `pi` workers, which do not go through `task`.
 
 **`cloud-cell-supervisor.sh check` vouches only for what it actually probes, and refuses to certify
 a cell missing any of them: `tmux`, an authenticated `gh`, `git`, `python3`, `pi`, a cloned repo
+whose `origin` remote names the SAME repo the queue dispatches (`OR` is derived from it; a mismatch,
+or a pair that cannot be read, is refused naming both values — agent-infra#1901), a checkout
 with the worker scripts in `$O`, and — since agent-infra#1717 — a non-empty, executable
 `~/.pi/agent/scripts/record-review.sh` with its `lib/diff-normalize.py` sibling.** The rest of the
 table is *not* a refusal by name: a missing `AI_REVIEW_GATE_KEY` is a **warning** — a keyless cell
@@ -464,7 +466,7 @@ secret into a world-readable plist, and launchd inherits no shell environment �
 | Var | Value | Why |
 |---|---|---|
 | `MAX_LOAD` | `cores*10` (100 on a 10-core box; sanity ceiling) | dispatch stops above this 1-min load |
-| `MAX_LANES` | `4` | concurrent implementation lanes |
+| `MAX_LANES` | **derived**: `10#$_NCPU * 5 / 2` — 2.5× cores, floored (25 on a 10-core box, 10 on a 4-core box, 10 on an unprobeable host) | concurrent implementation lanes. **Capacity gates dispatch, not a lane count** (owner ruling, 2026-10-17, verbatim: *"dispatch should be gated on capacity, not on number of lanes. max lanes 8 is too low. that needs to be configured to 2.5x the number of CPUs"*). The shipped default was a flat `4`, and the box this was measured on had its plist **pinned** at `8`: `[cap] load=79/100 lanes=9/8 … [dispatch] skipped (lanes=9>=max_lanes=8)` — 21 points of load headroom and comfortable swap/memory, so dispatch was refused for a lane count while capacity was available. A **valid** pin (plist/`keys.env`) still wins and is never recomputed; an **invalid** one is refused by `install.sh` and repaired by the loop to the derived default; a derived value that fails `is_limit` falls back to `10`. ⚠️ The plist **pins** the number, so a box picks this default up only on a fresh `install.sh` render. ⚠️ `2.5 × cores` is ALSO `LOAD_SUSPEND_THRESHOLD`'s default (`docs/ops/load-policy.md` §2) — that is a 1-minute **load** threshold, this is a count of **lanes**; they are not one ceiling |
 | `MAX_REVIEW` | `4` | concurrent `merge-<PR>` reviewers |
 | `MERGE_PRIORITY_AT` | `25` | above this many **unowned** open PRs (nothing currently working them — no `fix-`/`merge-` session, no live cross-box claim, no unconsumed `needsfix-*` marker), **merging takes priority**: dispatch of new lanes stops (unless none are running) and reviewer **and fixer** headroom rises to `MAX_REVIEW+2` / `MAX_FIX+2`. It was `10` against the TOTAL open count, which capped the fleet on a healthy queue (measured 2026-10-16: `lanes=1` of 32, 59-86% CPU idle, on a cell logging `merge-priority (20 open PRs — draining)` with 17 of those 20 already `BEHIND`/`DIRTY`) |
 | `MAX_FIX` | `3` | concurrent `fix-<PR>` fixers |
@@ -492,7 +494,7 @@ The ten are substituted verbatim — deliberately not routed through the escapin
 number has nothing to escape — so `install.sh` validates each before rendering: digits only, at most
 nine of them (`[` errors at or above 2**63, and an errored test reads FALSE, which OPENS the gate it
 configures), `CYC` additionally at least 5 (see below), and no `__…__` pattern, because the sed rules run in order and `OR=__MAX_LANES__`
-therefore rendered as `4` and still exited 0. It then renders to a **temp file**, lints that, asserts
+therefore rendered as the default (then `4`, now 2.5× cores) and still exited 0. It then renders to a **temp file**, lints that, asserts
 no placeholder survived, and only then moves it into place — the redirect truncates its target before
 `sed` runs, so rejecting after writing straight to `$PLIST` left the live plist empty and the next
 `launchctl unload && load` failed. The loop coerces the same values on its own, so a bad plist is
@@ -529,10 +531,13 @@ the band in which the spawn sites hold back (`16`–`99` is now permitted, where
 Closing that needs `can_spawn()` to consult memory as well, which changes the one-line shape its
 self-test extracts from the shipped file; tracked as agent-infra#1732 rather than half-done here.
 
-**Swap, not lanes, is what actually throttles this box.** Observed at 15 concurrent workers:
-`swap_free=588M` → dispatch correctly refused. Raising `MAX_LANES` alone buys nothing on the box
-this was measured on (the original 8 GB host — the current one is 32 GB);
-it just moves the pressure into the compressor. `swap_total=0` right after boot is treated as
+**Swap, not lanes, is what actually throttles an 8 GB box.** Observed at 15 concurrent workers on the
+original 8 GB host: `swap_free=588M` → dispatch correctly refused. On THAT host raising `MAX_LANES`
+alone buys nothing; it just moves the pressure into the compressor. It is not a general rule, and the
+lane ceiling was a second, independent cap: on today's 32 GB host capacity was available (21 points
+of `MAX_LOAD` headroom, comfortable swap and memory) while dispatch was refused by a lane count —
+which is why `MAX_LANES` is now derived from cores instead of pinned to a small literal (§4).
+`swap_total=0` right after boot is treated as
 *uninitialised*, not as pressure (that bug silently blocked all dispatch for the first minutes
 after a restart until it was fixed).
 
@@ -606,6 +611,10 @@ off macOS (it renders a launchd plist) — the portability that matters is `orch
    ⛔ **This is a partition, not coordination.** Ownership is still inferred from *local*
    branches/worktrees, which are invisible across boxes, so two `own`-pinned boxes can still race
    the same PR (§7.2b, tortoise#5052) — the pin must not be mistaken for a claim registry.
+   ⛔ **And it is not the cross-box barrier for any operation.** It selects PR branches by naming
+   convention, which every box shares; what excludes a concurrent holder is the claim registry, now
+   measured per operation in **§7.2d** (agent-infra#1908). That measurement retires the pin's
+   *safety* role for dispatch and review and keeps an exclusion requirement on the landing row.
 4. **Drafts are deliberately excluded** from the sweep — a peer's draft PR is not yours to
    merge. The cost is that a *peer's* draft stalls until they ready it. Our **own** lanes' drafts do
    not: the sweep selects drafts whose branch matches the harness's own patterns (`*-tm`, `*-cap`,
@@ -820,9 +829,10 @@ live under `refs/claims-tmp/*`, **not** the pruned `refs/claims-cache/*` namespa
 purpose** — if the claim store is unreachable the harness proceeds and logs it — because
 agent-infra#1709's headline finding is that duplicate execution is unavoidable and the side effects
 must be idempotent per head, so failing closed would stall the whole fleet on one transient error.
-`SCOPE=own` (§5, item 3) remains a useful partition but is no longer the only cross-box barrier.
+`SCOPE=own` (§5, item 3) remains a useful partition but is no longer the only cross-box barrier —
+and §7.2d measures what the barrier actually covers, per operation.
 
-### 7.2c ISSUE dispatch was the uncovered window — **FIXED in agent-infra#1850**
+### 7.2d ISSUE dispatch was the uncovered window — **FIXED in agent-infra#1850**
 
 `refs/claims/<PR>-<head-sha12>` is **content-addressed on a head sha**, so it cannot express an
 issue at all: `claim_ref <pr> <sha>` has no sha to address, `claim_live()` returns 1 on an empty
@@ -858,31 +868,146 @@ reap. The decisions that are not obvious:
   which is sized (`CLAIM_ISSUE_TTL`, default 3 h) to cover lane + chain — releasing early is the
   normal path, so the lease only runs its full length when the box is gone.
 - **The pre-flight now CONSULTS it, and fails CLOSED.** `refresh-candidates.sh` calls
-  `claim_issue_preflight` after a clean tool verdict: a live claim is a **COLLISION** (left
-  unchecked, so a window is re-attempted when it closes), an **unreadable** registry is
-  **INCOMPLETE** and is never queued, and a registry that **cannot answer** (an older `$O/claims.sh`
-  with no issue functions — the drift `install.sh` reports) is INCOMPLETE too. This is the opposite
-  polarity from the PR claim's fail-open, on purpose: refusing a merge on a network blip costs one
-  merge, while certifying a free issue costs duplicated work on two boxes. The one limit is stated
-  rather than hidden — a box where `claims.sh` is **not installed** falls through to the
-  pre-registry behaviour **loudly**; `install.sh` seeds `$O/claims.sh`, and making a missing file
-  refuse would turn such a box merge-only, a bigger and less reversible failure.
+  `claim_issue_preflight` after a clean tool verdict and branches on its **exit code**, never on
+  output text: **0 CLEAN** (no claim, or the only claim expired) queues the issue; **1 COLLISION**
+  (a live claim, or a lease that cannot be parsed — a lease nobody can read is treated as live) is
+  left unchecked, so the window is re-attempted when it closes; **2 INCOMPLETE** (the registry could
+  not be READ — `git ls-remote` failed, or the local clock is unreadable) is never queued and counts
+  toward the run's aggregate `INCOMPLETE=n` line, and a pass that produced **no usable verdict at
+  all** exits transient (rc=1) — so an unreadable registry that queues nothing is a red run, not a
+  quiet one; **3 NOT PROVISIONABLE** (the registry is present but
+  predates the issue key — an `$O/claims.sh` with no `claim_issue_*` functions, i.e. the drift
+  `install.sh` reports) refuses the issue the same way, and rc=3 also earns a **`.refresh-blocked`**
+  marker (the provisioning channel: `orch-loop.sh` stops retrying and `status` names the reason), so a
+  persistent condition is visible rather than a silent no-queue. rc=2 does **not** write that marker —
+  it is transient by construction, so the pass exits 1 and the cycle is logged `FAILED rc=1` and
+  retried; the marker would make a network blip look like a broken cell. This
+  is the opposite polarity from the PR claim's fail-open, and it was applied to **every** exit, not
+  just the obvious one: an unrecognised status is treated as INCOMPLETE, so no future code path can
+  widen the CLEAN arm by accident. The one limit is stated rather than hidden — a box where
+  `claims.sh` is **not installed at all** falls through to the pre-registry behaviour **loudly**,
+  because making a missing file refuse would turn such a box merge-only, a bigger and less
+  reversible failure. (The file reaches `$O` by `cp -p "$H"/*.sh "$O"/` in
+  `scripts/deploy-crossbox.sh` — `install.sh` itself only diffs and reports drift; it does not copy.)
 
 Two incidental defects are fixed with it: `claim_release` read its third/fourth arguments **bare**
 under `set -u`, so a caller with no commit to fence on aborted with
 `line 260: $4: unbound variable` instead of taking the documented refusal — a release that **errors**
 leaves the claim held for the whole lease (3 h of a free issue, for the issue key).
 
-`test-claims.sh` (I1–I9) pins the issue key against live origin from two throwaway clones, including
-the **non-vacuity case for this defect**: A claims an issue with **no branch, no PR and no push of
-anything but the claim ref**, and B's pre-flight read must not be CLEAN — a test that only passes
-after a push does not test it. Measured: 35 of those assertions fail on the pre-change
-`claims.sh` (`CLAIMS_SH=<old copy> bash test-claims.sh`). `refresh-scout.test.sh` drives the
-**shipped** refresh step and the **shipped** dispatch block against a real local origin for the
-collision, unreachable, absent and stale-registry verdicts, plus the fenced release on the chain's
-exit path (14 assertions fail on the pre-change scripts).
+`test-claims.sh` (I1–I10) pins the issue key against live origin from two scratch repositories (each
+`git init` + `remote add origin <bare repo>` — **not** clones), including the **non-vacuity case for
+this defect**: A claims an issue with **no branch, no PR and no push of anything but the claim ref**,
+and B's pre-flight read must not be CLEAN — a test that only passes after a push does not test it.
+Its keys are random per run (`PR`/`ISSUE` overridable), because two concurrent runs of the suite used
+to collide on one fixed pair of refs in the **production** `refs/claims` namespace and delete each
+other's refs mid-CAS — a green suite then reported 15–19 false failures, and the fleet runs several
+reviewers of one PR at once. Measured (reproduce with the base commit of this PR as `<rev>`):
 
-### 7.2d A refresh that cannot READ the pool reported an empty queue — **FIXED in agent-infra#1931**
+```bash
+T=$(mktemp -d); cp scripts/orchestrator-harness/*.sh "$T/"
+git show <rev>:scripts/orchestrator-harness/claims.sh > "$T/claims.sh"
+CLAIMS_SH="$T/claims.sh" bash scripts/orchestrator-harness/test-claims.sh   # 65 passed, 45 failed
+```
+
+`refresh-scout.test.sh` drives the **shipped** refresh step and the **shipped** dispatch block against
+a real local origin for the collision, unreachable, absent, stale-registry and unrecognised-status
+verdicts, plus the fenced release on the chain's exit path and the generation guard. Measured (the
+counts cover the whole #1850 change — the feature and this fix round — not the fix alone):
+
+```bash
+cp scripts/orchestrator-harness/*.sh "$T/"
+for f in claims refresh-candidates orch-loop chain-merge dispatch-merge; do
+  git show <rev>:scripts/orchestrator-harness/$f.sh > "$T/$f.sh"; done
+( cd "$T" && bash ./refresh-scout.test.sh )                                  # PASS=72 FAIL=67
+```
+
+Three further defects in the same family are fixed and pinned with it, all fail-**open** directions:
+
+- **The pre-flight's clock is guarded.** `date +%s` is a *second* input to the same decision, and if
+it cannot be read the old comparison `[ "$now" -le "$until" ]` was neither true nor an error the
+code handled — bash prints `integer expression expected` and the test is FALSE, so the reader fell
+through to CLEAN. An unreadable clock is now rc=2 INCOMPLETE, alongside an unreadable registry.
+- **The release record is generation-guarded.** A chain captures the commit it pushed when it becomes
+the holder; the record file is keyed on the **issue**, so if the same box re-acquires after its lease
+lapses, a newer generation overwrites it. A release that read the file when its trap fired would
+fence on the new commit — which **is** the ref tip — delete the live holder's claim and free a busy
+issue for a peer. The captured generation is compared and a mismatch **refuses** the release (naming
+it), leaving the newer record for its own release. ⚠️ The guard is deliberately **inert on the
+no-chain path** in `dispatch-merge.sh`: that release runs seconds after the record was written, so
+the record *is* that dispatch's generation — there is no older holder to refuse, and the fence is the
+record's value. It earns its keep in `chain-merge.sh`, whose trap can fire hours later, after the same
+box has re-acquired and overwritten the record.
+- **The lease polarity has ONE implementation** (`_lease_unparseable` / `_lease_is_live`) shared by
+`claim_acquire`, `claim_issue_preflight` and `claim_prune` — three copies of the same comparison, and
+"a lease that cannot be read is live" is exactly the predicate they must not answer differently.
+(`orch-loop.sh`'s `claim_live` keeps a fourth deliberately: it reads the local SNAPSHOT rather than a
+ref and `selftest.sh` extracts it standalone, so it cannot share an in-process helper.)
+
+### 7.2d Does a claim EXCLUDE? — **MEASURED, per operation** (agent-infra#1908)
+
+agent-infra#1908 held the retirement of the `SCOPE=own` partition **conditional**: retire it only
+once a claim is *demonstrated* to exclude a concurrent holder, and only for the operations that
+tolerate at-least-once. A registry that exists is not that demonstration — #1850 landed the **code**,
+and a claim had never been observed refusing anything under real contention. `claim-exclusion.test.sh`
+is the measurement, and this section is its recorded output. **This table is copied from that suite**;
+if a row changes polarity the suite goes red and names the row, so it cannot go stale silently.
+
+```bash
+./claim-exclusion.test.sh                 # hermetic: a throwaway bare origin, the CI form
+./claim-exclusion.test.sh --origin live   # THIS checkout's origin, in a $$-scoped namespace
+```
+
+**What it actually does, and its limit.** It releases **N independent processes** (default 6) at a
+barrier against a **real `git receive-pack`**, each presenting as a different box through
+`CLAIM_OWNER_ID`, so the CAS is genuinely raced rather than replayed sequentially. Each racer waits
+`n × 3 ms` after the barrier: released in the same microsecond, every push contends for the same
+`<ref>.lock` and the losers are refused by **git's ref lock** before they ever reach the CAS —
+measured by forcing the create push and still getting exactly one winner, which would have let a
+defeated CAS report EXCLUDES. Two boxes are never that synchronised, so the stagger measures the case
+the CAS has to handle. **Non-vacuity, measured:** with the stagger in place, pointing `CLAIMS_SH` at
+a copy of `claims.sh` whose create push is forced (`push -q --force`) reddens **M2** with
+`2 winners in one lap`, while the shipped `claims.sh` is 15/15 green — so the suite discriminates a
+defeated CAS from an exclusive one. **Limit, stated:** the default origin is a bare
+repo in the sandbox, so this measures ref-update atomicity, not the network. `--origin live` closes
+that gap on demand (it leaves no claim ref and no probe branch behind — the trap deletes both).
+
+| operation | claim key | duplicate behaviour MEASURED | tolerates at-least-once? |
+|---|---|---|---|
+| **dispatch** (start a fixer/reviewer) | `refs/claims/issue-<N>` | 3/3 laps × 6 racers: **exactly one** winner per lap; every loser gets rc=1 and is told *who* holds it (`held by box2:1529071 until …`) | **yes** — side effects are idempotent |
+| **review / record evidence** | `refs/claims/<PR>-<sha12>` | 3/3 laps × 6 racers: **exactly one** winner; loser refused | **yes** — the cost of a duplicate is a duplicate comment |
+| **landing: the same head** | `refs/claims/<PR>-<sha12>` | the same CAS as review; the second worker exits **before** it reviews or merges (`merge-one.sh`, `CROSS_RC=1`) | **only for that head** |
+| **landing: the PR moved to a new head** | `<PR>-<sha12>` — **a different key** | **both acquire.** Measured: an issue/PR claim is content-addressed on the HEAD, so two heads of ONE PR are two distinct CASes and the claim cannot express *"this PR"* | **NO — see below** |
+| **fencing** (release / stale write) | the ref's **value** | a loser's release is refused (rc=1, ref unchanged); a **fast-forwardable** push leased on a stale base is refused — by the lease, not by non-fast-forward | n/a — a fence, not a claim |
+
+**So, per operation:**
+
+- **Dispatch and review are retired from the `SCOPE=own` question.** The measurement shows the claim
+excludes, on both keys, under real concurrency — and `SCOPE=own` was **never** what excluded them:
+it selects which *PR branches* this box's **sweep** looks at (`*-tm`, `*-cap`, `fix/*`), by a naming
+convention every box shares, so two `own`-pinned boxes select the same PRs. The code has said so
+since the pin was added (§5 item 3, "a partition, not coordination"); the measurement now says the
+claim covers those two classes without it.
+- **Landing is NOT retired, and must not be.** The claim is per-head. Two boxes at two heads of one
+PR hold **two live claims** and both proceed toward a merge of the same PR. `SCOPE=own` does not
+cover that either (it is a selection filter, and the PR is in both boxes' selection), so this row
+keeps an **exclusion requirement that nothing in the harness currently satisfies**. Naming the row
+that justifies keeping it is the whole point: *landing: the PR moved to a new head*
+(**agent-infra#1952** carries the decision: add a per-PR exclusion, or exempt the row explicitly).
+- **What the merge path does have, and what it does not.** `merge-one.sh` re-reads `LIVE_HEAD` before
+merging and requires a **signed marker for that live head**, so the merged content is at least the
+head some reviewer signed. It does **not** pin `gh pr merge` to a sha, so the guard is a read, not a
+fence, and the window between the two is real. ⛔ **That last sentence is read from the code, not
+measured** — exercising `gh pr merge` on a moved head needs GitHub, so it is not claimed as a
+measured merge outcome here.
+
+**For §0.3/§0.4/§0.5 when they land.** Those sections (the requirements and the keep/legacy
+inventory, agent-infra#1905) are not on `main` yet, so this section — not them — is the source of
+record for the measurement today. §0.4's "at-least-once with idempotent side effects" is accurate for
+the **dispatch** and **review** rows and **not** for the landing row; §0.5's `SCOPE=own` row may move
+from *retired* to *retired, see measurement* for the first two and must not for the third.
+
+### 7.2e A refresh that cannot READ the pool reported an empty queue — **FIXED in agent-infra#1931**
 
 `backlog=0` was the same line whether the pool had been read and was empty or the pool listing had
 **failed**. Measured 2026-10-17: a cell refused on **131 consecutive passes** (its abort was correct)
@@ -951,6 +1076,31 @@ These are kept as a record because each one is a *failure mode of the design*, n
 | Defect | Impact | Fix |
 |---|---|---|
 | **`cmd_check` never tested `record-review.sh`, and neither cell script provisioned it (agent-infra#1717)** | `merge-one.sh` executes `$HOME/.pi/agent/scripts/record-review.sh` to mint the signed marker, and a fresh cell has no such file. `cmd_check` printed `CELL CAN RUN A CONTROLLER` anyway (a false PASS on the only question that verdict answers), the cell ran a full fresh-context review — up to `REVIEW_TIMEOUT` = 1800 s, **paid** — and only then hit 127. The pre-fix `exit 3` left no terminal state at all — nothing was recorded and nothing was parked: it returns from the `CLEAN*)` arm, and the `*)` arm that writes the fixer marker is reached only for a non-CLEAN verdict, so the marker was never written on this path either way: the next cycle saw an unmarked `FAILED:ai-review-gate` and spawned another review, **one paid review per cycle, forever** | `cmd_check` probes the runtime dependencies the loop actually invokes — `git`, `python3`, `pi` (`uv` warns, matching `install.sh`) and the recorder path it reads from `$CELL_HOME` — and refuses to print the verdict without them; `start` provisions the recorder from the checkout. The record step is also checked **before** the paid review in `merge-one.sh`, and any of its failures (absent, empty, non-executable, non-regular-file, non-zero rc, an `rc=0` record that posted **no signed marker** into the PR body, or a CLEAN verdict that named no comment) writes the controller's own terminal `state/parked-<PR>` marker at the reviewed head plus a `state/parkreason-<PR>` naming why — and the worker itself refuses to re-review a head it has already parked, so the `chain-<N>`/`fix-<one.sh>` paths that never consult the controller cannot re-pay either. The controller's own park sites (`orch-loop.sh`, conflict/fix/CI caps) write the same `parkreason-<PR>` pair through `park_ctrl()`, so a **controller** park at a moved head never leaves the previous head's reason behind for the exit-5 refusal to misreport. ⚠️ **Residual:** `merge-one.sh`'s own rail cap writes `state/parked-<PR>` directly and no `parkreason-<PR>`; that site `exit 0`s before the exit-5 refusal can print a reason, so it cannot itself misreport — but a human reading `state/parkreason-<PR>` beside a newer marker still can. A later push changes the head and re-arms the PR by construction |
+
+### 7.4c Defects found in the agent-infra#1850 review (fixed here)
+
+Eight of the ten are fail-**open** in a gate whose whole purpose is to refuse: each certifies a busy or
+unverifiable issue as free, hands it to a second box, or lets a release run without its fence. (The two
+that are not: the silent-release row, which leaves the claim **held**, and the `CLAIM_COMMIT` row, which
+is state hygiene.) Pinned
+by `test-claims.sh` (I10, I9(5), I9(7)) and `refresh-scout.test.sh` §8(g) (unrecognised status),
+§9(iii) (stale-registry dispatch), §10 (fenced + generation-guarded release, the CAPTURE that wires
+it, and the no-generation refusal) and §11 (the chain-failure branch). The last three were found in
+the later review cycles, precisely by asking what each new assertion would do if the line it protects
+were deleted.
+
+| Defect | Impact | Fix |
+|---|---|---|
+| **the CLEAN arm was a wildcard** (`case $rc in 0) queue;; 1) COLLISION;; *) INCOMPLETE`) | the intended set is {0,1,2}; `*)` silently absorbed everything else, so a **stale** registry (`rc=3`) and an unexecutable `claims.sh` (`rc=127`) both queued the issue — the pre-flight asking its question and then ignoring a "cannot answer" | explicit `0` / `1` / `2`+`*` / `3` arms; anything unrecognised is INCOMPLETE, so no future status widens CLEAN by default |
+| **`claim_issue_preflight`'s clock was unguarded** | `date +%s` is a *second* input to the same decision — the `ls-remote` read that proves "no claim ref exists" does not need it, but the lease comparison does. On an unreadable clock `[ "$now" -le "$until" ]` is FALSE (bash prints `integer expression expected`), so a **held** claim's reader fell through to `return 0` — a **false CLEAN** in the one direction the gate exists to prevent | a non-numeric/empty `now` is rc=2 INCOMPLETE, alongside an unreadable registry |
+| **the release record was read when the trap FIRED, not when the claim was taken** | the record file is keyed on the **issue**, so a box that re-acquires after its lease lapses overwrites it. The older chain's trap then fenced on the *new* commit — which **is** the ref tip — and deleted the live holder's claim, freeing a busy issue for a peer: the exact duplicate the key exists to prevent | `chain-merge.sh` captures the commit at chain start (`claim_issue_record_commit`) and `claim_issue_release_record` refuses on a generation mismatch, naming it and leaving the newer record intact |
+| **a registry too old to take a claim still dispatched** | `refresh-candidates.sh` refused every issue on such a box (`rc=3`) while `orch-loop.sh` acquired anyway, found no `claim_issue_acquire`, and **dispatched unclaimed** — the fail-open half of the same condition, and the collision on two boxes | present-but-stale is now split from genuinely-absent: the loop refuses the dispatch and names the fix; only a **missing** `claims.sh` (pre-registry box) falls through, loudly |
+| **release failures were silent** (`>/dev/null 2>&1 && echo`) | a refused or failed release left the claim held for its whole lease (3 h of a free issue) with nothing in the log to say so — and `CLAIM_RESULT` was lost because the helper ran in a subshell | the helper `declare -f`s the function, sources `claims.sh` into the **current** shell, passes the captured commit, and logs the reason on every failure branch |
+| **the chain-failure arm released a claim whose LANE was still running** | the lane is spawned *before* the chain in the same loop body, so "no chain will ever run" was true while "nothing is running" was **not**: the release declared an issue this box was actively implementing free, a peer claimed it and duplicated the work, and this box still opened a PR nothing would merge | stop the lane first (exact session match) and release only once it is confirmed gone; if it cannot be stopped, **keep** the claim — the lease expiring it is the safe direction |
+| **a chain with NO captured generation still released** | the capture is empty when the handover record was absent at chain start (`orch-loop.sh`'s `claim_issue_record` failed) or `$O/claims.sh` predates the reader. `claim_issue_release_record` treats an empty expectation as "read the record now" — right for `dispatch-merge.sh`, whose release is milliseconds after the write, but WRONG for a trap that can fire **hours** later: the record then holds the newer holder's own commit, which **is** the ref tip, so the stale chain deleted a live claim | `chain-merge.sh` refuses the release when it has no captured generation, names the reason and lets the lease reap it (one lease lost vs duplicated work on two boxes) |
+| **`CLAIM_COMMIT` was a per-CYCLE global** (not fail-open — state hygiene) | `claims.sh` reset it only when sourced, so an acquire that failed *before* any push (`rc=2`: unreadable ref, unfetchable claim) left the **previous** issue's commit in it. `orch-loop.sh`'s "rc=2 with a claim commit → record it and try a fenced release" then wrote a handover record for an issue this box never claimed, consumed it, and logged a release that never happened — the fence keeps the registry safe, but the *log* is what an operator reads | cleared at the top of `_claim_acquire_at`, so the value always means "what THIS attempt may have pushed" |
+| **a chain RE-RUN by hand captured a generation it never took** | the capture read the handover record, and the same box can hold the same issue twice (its lease lapsed and the loop re-acquired while the old chain still waited). A re-run starts *after* the re-acquire, so it captured the NEWER generation — the one on the ref tip — and its trap deleted the live holder's claim. Both this file's timeout message and `nonblocking-dispatch.sh` invite exactly that re-run | the generation is now **injected by the spawning process** (`dispatch-merge.sh`, in the loop body that wrote the record) and inherited by `chain-merge.sh`, which never re-derives it. A chain started any other way has none and refuses, leaving the claim to its lease |
+| **the suite's other two teardowns leased on the OBSERVED tip** | `--force-with-lease=<ref>:<observed>` is a conditional *write*, not an ownership check (it refuses only if the ref moves in the microseconds between the `ls-remote` and the push), so `cleanup_issue_ref` deleted whatever was at `issue-<N>` — reachable with the documented `ISSUE=` override, and with `PR`/`ISSUE` equal. The probe was fixed; these two were not | ownership now comes from the **registry's own lease** (`<id>:<pid>`, and the suite runs all boxes from one process), plus a whitelist of the synthetic lease ids the sections hand-build. A claim this run did not create is left alone and named |
 
 ### 7.5 Still open, deliberately not fixed here
 
@@ -1085,7 +1235,7 @@ algorithmic advantage. The claim worth evaluating is *utilisation*, not *efficie
 | Script | Role |
 |---|---|
 | `orch-loop.sh` | the controller: merge sweep → capacity-gated dispatch → backlog refresh |
-| `claims.sh` | cross-box claim registry: `refs/claims/<PR>-<head-sha12>` CAS, lease-as-data, `--force-with-lease` fencing. Sourced by `orch-loop.sh`, `merge-one.sh` and `fix-one.sh` |
+| `claims.sh` | cross-box claim registry: `refs/claims/<PR>-<head-sha12>` for PRs and `refs/claims/issue-<N>` for issues (agent-infra#1850), same CAS, lease-as-data and `--force-with-lease` fencing. Sourced by `orch-loop.sh`, `refresh-candidates.sh`, `chain-merge.sh`, `dispatch-merge.sh`, `merge-one.sh` and `fix-one.sh` |
 | `repo-authority.sh` | **the per-repo merge contract** (agent-infra#1764): reads THIS repo's required status checks and derives whether the review gate applies to it, so the controller no longer enforces tortoise's check names on every repo. Fail-closed — an unreadable or unrepresentable set refuses. Sourced by `orch-loop.sh` and `merge-one.sh` |
 | `dispatch-merge.sh` | creates the worktree and starts the `lane-*` + `chain-*` pair for an issue |
 | `lane.sh` | the implementation worker (prompt template included) |
@@ -1095,9 +1245,11 @@ algorithmic advantage. The claim worth evaluating is *utilisation*, not *efficie
 | `refresh-candidates.sh` | pre-flights issues (collision check) into the backlog |
 | `selftest.sh` | offline checks; each one drives the shipped code. Not part of the loop |
 | `test-gates.sh` | the `mp_reason` dispatch-gate rule table, extracted from the shipped `orch-loop.sh`. Not part of the loop |
-| `test-claims.sh` | the claim CAS against live origin from two throwaway clones. Not the cross-box proof (one machine), but red on a defeated CAS. Not part of the loop |
+| `test-claims.sh` | the PR **and issue** claim CAS against live origin from two scratch repos (`git init` + `remote add`, not clones; random keys per run so concurrent runs cannot collide). Not the cross-box proof (one machine), but red on a defeated CAS. Not part of the loop |
+| `claim-exclusion.test.sh` | **the measurement:** N processes released at a barrier against a real (bare) origin, per operation class, answering *does a duplicate holder get refused*. Prints the table §7.2d records; hermetic, a CI shard |
+| `gh-rest.test.sh` | the `gh` REST adapter's argv-to-argv **TRANSLATION**, offline against a stub `gh`: `pr list --head` must not widen to the newest open PR and `pr comment` must print a URL (both shipped green once, as P0s, when nothing asserted them). Hermetic, a CI shard |
 | `test-crossbox.sh` | drives the real `merge-one.sh` claim acquire + trap release with `gh` stubbed. Not part of the loop |
-| `refresh-scout.test.sh` | the agent-infra#1736 contract: repo-aware scout provisioning, per-repo tool resolution, and the permanent/transient refresh split. Not part of the loop |
+| `refresh-scout.test.sh` | the agent-infra#1736 contract — repo-aware scout provisioning, per-repo tool resolution, the permanent/transient refresh split — plus the agent-infra#1850 issue-claim pre-flight verdict table (CLEAN/COLLISION/INCOMPLETE/NOT PROVISIONABLE/unrecognised), the dispatch-side claim, and the fenced + generation-guarded release. Not part of the loop |
 | `check-port-drift.sh` | gates the tortoise-side removal: fails if the tortoise harness moved past the pinned sync point (`port-provenance.txt`). Not part of the loop |
 | `cloud-cell-record-dep.test.sh` | #1717: drives `cloud-cell-supervisor.sh check/start` and `merge-one.sh` against a stubbed toolchain — the recorder is a checked, provisioned dependency, and a record failure parks. Registered in `scripts/run-bash-shards.sh`, so both CI lanes run it |
 | `check-deployed-drift.sh` | answers whether the DEPLOYED `$O` matches the repo: the recorded commit against the live ref (`merge-base --is-ancestor`, never a commit count), the recorded payload hash against the deployed bytes, and every repo-shipped `*.sh` blob against its `$O` copy. Exit 0 match / 1 drift / **2 UNKNOWN — never a pass** (agent-infra#1745). Not part of the loop |
@@ -1152,7 +1304,7 @@ O="${O:-$HOME/orchestrator}"
 ```
 
 The shipped copies are **not** byte-identical to the ones running on the original box: they are
-those copies **plus every §7.4 fix** (and the §7.4b ones). `install.sh` compares the scripts it invokes — the nine loop
+those copies **plus every §7.4 fix** (and the §7.4b and §7.4c ones). `install.sh` compares the scripts it invokes — the nine loop
 scripts in §9 plus the manual `adopt-fix.sh` — against the running copies at `$O` and warns loudly
 on drift, because the daemon executes `$O/<script>` — a fix that only lands in this directory is not
 in effect. That set is the one `install.sh`'s drift loop lists; `selftest.sh` is shipped but not
@@ -1197,6 +1349,9 @@ agent-infra#1736.
    `agent-infra/scripts/orchestrator-harness/` (agent-infra#1700).
 2. Should the two boxes coordinate through an explicit claim registry instead of branch-name
    heuristics? tortoise#5052 already proposes "an authoritative, expiring claim registry" —
-   §7.1 is the same problem seen from the dispatcher's side.
+   §7.1 is the same problem seen from the dispatcher's side. **Partly answered 2026-10-15/16:**
+   both keys now exist (`refs/claims/<PR>-<head-sha12>` for merges, `refs/claims/issue-<N>` for
+   dispatch — §7.2b/§7.2d). What is still open is **coverage, not mechanism**: every path that can
+   take work must remember to acquire, and an issue claim is still no proof of life.
 3. Is a `~/`-rooted bash harness the right shape at all, or should this fold into the fleet
    rail's cmux workspaces (agent-infra#1683)?

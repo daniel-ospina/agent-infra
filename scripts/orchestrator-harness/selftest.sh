@@ -18,6 +18,11 @@ ck() { # ck <name> <0|1>
 }
 LOOP="$HERE/orch-loop.sh"; MERGE="$HERE/merge-one.sh"; INST="$HERE/install.sh"; REFRESH="$HERE/refresh-candidates.sh"
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+# ⛔ HERMETIC (agent-infra#1901): `OR` is now a VALIDATED INPUT — the queue's repo, derived from the
+# fixture checkout's `origin` remote unless declared — so a developer's ambient OR would be held
+# against every fixture remote below and turn unrelated cases red (measured: 13 such arms). Cases
+# that care about OR set it EXPLICITLY on the command line.
+unset OR
 # A missing extraction must FAIL, not warn: if the shipped script lacks the code under test the
 # dependent checks would pass on an empty file — the exact vacuity this file was rewritten to fix.
 need() { if [ -s "$1" ]; then return 0; else ck "$2" 1; return 1; fi; }
@@ -704,15 +709,62 @@ ck "every limit resolves to a real default in both files (not UNSET=UNSET)" $rcu
 # green while the swap gate became `[ "$SWFREE" -le 0 ]`, which can never bind — the back-pressure
 # README §8 calls the box's real throttle, silently disabled. MAX_LOAD is excluded because its default
 # is the host's core count; §8's nlim driver covers it behaviourally.
+# ⛔ MAX_LANES JOINED IT (2026-10-17, owner ruling: the lane ceiling is "2.5x the number of CPUs").
+# Its default is derived from `_NCPU` too now, so it cannot sit in a host-independent table — the
+# driver immediately below pins the derivation BEHAVIOURALLY, against a substituted probe instead.
 dval() { printf '%s\n' "$_db" | awk -F= -v k="$1" '$1==k{print $2}' | head -1; }
-expect_lim="BATCH=2 CYC=240 MAX_FIX=3 MAX_FIX_TRIES=3 MAX_LANES=4 MAX_REVIEW=4 MERGE_PRIORITY_AT=25 MIN_MEM_FREE_MB=512 MIN_SWAP_FREE=600"
+expect_lim="BATCH=2 CYC=240 MAX_FIX=3 MAX_FIX_TRIES=3 MAX_REVIEW=4 MERGE_PRIORITY_AT=25 MIN_MEM_FREE_MB=512 MIN_SWAP_FREE=600"
 got_lim=""
-for _k in BATCH CYC MAX_FIX MAX_FIX_TRIES MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MIN_MEM_FREE_MB MIN_SWAP_FREE; do
+for _k in BATCH CYC MAX_FIX MAX_FIX_TRIES MAX_REVIEW MERGE_PRIORITY_AT MIN_MEM_FREE_MB MIN_SWAP_FREE; do
   got_lim="$got_lim $_k=$(dval "$_k")"
 done
 got_lim="${got_lim# }"
 [ "$got_lim" = "$expect_lim" ] && rcv=0 || { rcv=1; echo "      limits differ from the documented defaults:"; echo "        expected: $expect_lim"; echo "        got:      $got_lim"; }
 ck "every host-independent limit default matches README §4 (two files cannot drift together)" $rcv
+# ⛔ THE LANE CEILING IS DERIVED, AND THAT IS DRIVEN — not restated (2026-10-17). The owner's ruling
+# is "2.5x the number of CPUs", so the property to pin is: the SHIPPED assignment, given a core
+# count, yields 2.5x that count with a FLOOR — and a failed or absurd probe falls back to a 4-core
+# box's 2.5x. Every line this runs comes out of the file under test (its own `_NCPU` probe through
+# `MAX_LANES`, plus the loop's own coercion); only the OS probe is substituted. So reverting either
+# file to a flat 4 reddens every case, and deleting either BOUND reddens the nine-digit one.
+# A vacuous extraction cannot pass: an empty range leaves `MAX_LANES` unset and every case fails.
+lane_drv() { # <file> <probe-output> [explicit MAX_LANES] -> resolved MAX_LANES
+  local f="$1" p="$2"
+  { echo 'set -uo pipefail'
+    grep -F 'is_num() {' "$f"; grep -F 'is_limit() {' "$f"
+    printf 'sysctl() { printf "%%s\\n" %s; }\n' "'$p'"
+    sed -n '/^_NCPU=/,/^MAX_REVIEW=/p' "$f"
+    grep -E '^is_limit "\$\{MAX_LANES:' "$f"
+    printf 'printf "%%s" "${MAX_LANES:-UNSET}"'
+  } > "$TMP/lane-drive.sh"
+  if [ $# -ge 3 ]; then env MAX_LANES="$3" bash "$TMP/lane-drive.sh" 2>&1
+  else env -u MAX_LANES bash "$TMP/lane-drive.sh" 2>&1; fi
+}
+rcl=0; rk=0; lanes_cases=0
+for _case in 10:25 4:10 3:7 1:2 0:10 garbage:10 9223372036854775808:10 999999999:10; do
+  _p="${_case%%:*}"; _want="${_case##*:}"
+  for _f in "$LOOP" "$INST"; do
+    _got="$(lane_drv "$_f" "$_p")"
+    [ "$_got" = "$_want" ] || { rcl=1; echo "      $(basename "$_f") _NCPU=$_p -> MAX_LANES='$_got', expected $_want"; }
+  done
+  lanes_cases=$((lanes_cases+1))
+done
+ck "MAX_LANES derives 2.5x cores (floored) in BOTH files, and a failed/absurd probe falls back to 10" $rcl
+for _f in "$LOOP" "$INST"; do
+  _got="$(lane_drv "$_f" 10 7)"
+  [ "$_got" = "7" ] || { rk=1; echo "      $(basename "$_f") pinned MAX_LANES=7 on a 10-core probe -> '$_got', expected 7 (a pin must not be recomputed)"; }
+  _got="$(lane_drv "$_f" 10 0)"
+  [ "$_got" = "0" ] || { rk=1; echo "      $(basename "$_f") deliberate MAX_LANES=0 -> '$_got', expected 0 (only the derivation is bounded)"; }
+done
+ck "an explicit MAX_LANES still WINS (7 stays 7, a deliberate 0 stays 0 — never recomputed)" $rk
+[ "$lanes_cases" = "8" ] && rc=0 || rc=1
+ck "the lane-derivation driver ran all 8 probe cases (an empty case list cannot pass)" $rc
+# README §4's table is the source the files are pinned against, so its MAX_LANES row must carry the
+# derivation rather than a number the code no longer uses. ⛔ ANCHORED TO THE ROW, not the file: an
+# unanchored grep stays green if the row reverts to `| MAX_LANES | 4 |` while the string survives
+# anywhere else in 1,200 lines (found in review round 1).
+grep -qE '^\| `MAX_LANES` \| \*\*derived\*\*: `10#\$_NCPU \* 5 / 2`' "$HERE/README.md" && rc=0 || rc=1
+ck "README §4's MAX_LANES ROW documents the core-derived default, not a flat number" $rc
 
 # ── 8) the dispatch gate consults load and names the binding gate ────────────────
 # MAX_LOAD was rendered into the plist and documented, but never compared to anything.
@@ -1547,6 +1599,11 @@ TM="$TMP/tm/bin"; mkdir -p "$TM" "$TMP/tm/home" "$TMP/tm/harness"
 # verifies the repo with `git -C "$REPO" rev-parse --git-dir`, so an empty `.git` dir is refused
 # before any session command can be recorded.
 git init -q "$TMP/tm/repo"
+# ⛔ agent-infra#1901: the queue's repo is DERIVED from $REPO's `origin` remote, and a pair that
+# cannot be READ is refused (cannot-verify is never a pass) — so a fixture checkout must carry one,
+# or every case below is decided by the queue refusal instead of the forwarding/injection guard it
+# names. `acme/widget` matches the OR the injection arms already pass.
+git -C "$TMP/tm/repo" remote add origin https://github.com/acme/widget.git
 cp "$HERE"/*.sh "$TMP/tm/harness/"
 # The supervisor's `check` now also judges DISPATCH PROVISIONING (agent-infra#1736), so the fixture
 # must model a repo that can be pre-flighted: a repo carrying its own tools/collision_preflight.py.
@@ -1679,6 +1736,10 @@ KC="$TMP/kc"; mkdir -p "$KC/home" "$KC/o" "$KC/harness"
 # `-d`-only test false-blocked it. An empty `.git` directory is not a git checkout, so the fixture
 # must be one or every case below dies at the repo gate before reaching the key verdicts.
 git init -q "$KC/repo"
+# ⛔ agent-infra#1901: `cmd_check` derives the queue's repo from $REPO's `origin` remote and refuses a
+# pair it cannot READ, so the fixture checkout needs one — otherwise every key verdict below is
+# decided by the queue refusal rather than by the key probe it names.
+git -C "$KC/repo" remote add origin https://github.com/acme/widget.git
 cp "$HERE"/*.sh "$KC/harness/"; cp "$HERE"/*.sh "$KC/o/"
 # Same fixture requirement as §16e: cmd_check also judges DISPATCH PROVISIONING (#1736), so the
 # repo must carry a pre-flight tool or the key verdicts below are never reached.
@@ -2355,8 +2416,12 @@ ck "the shipped CYC floor is extracted too (CYC=0 cannot be driven without it)" 
 nlim() { ( _NCPU=10; MAX_LOAD="$1"; MAX_LANES="$2"; MERGE_PRIORITY_AT="$3"; BATCH="$4"; CYC="${5:-abc}"
            MAX_REVIEW=; MAX_FIX=; MAX_FIX_TRIES=; STALE_MIN=
            eval "$NGRD"; printf 'load=%s lanes=%s mpa=%s batch=%s cyc=%s review=%s fix=%s fixtries=%s stale=%s' "$MAX_LOAD" "$MAX_LANES" "$MERGE_PRIORITY_AT" "$BATCH" "$CYC" "$MAX_REVIEW" "$MAX_FIX" "$MAX_FIX_TRIES" "$STALE_MIN" ); }
-[ "$(nlim abc abc notanum two)" = "load=100 lanes=4 mpa=25 batch=2 cyc=240 review=4 fix=3 fixtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim abc abc notanum two)'"; }
+[ "$(nlim abc abc notanum two)" = "load=100 lanes=25 mpa=25 batch=2 cyc=240 review=4 fix=3 fixtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim abc abc notanum two)'"; }
 ck "non-numeric plist limits are coerced to their defaults, not left to fail OPEN" $rc
+# ⛔ AND MAX_LANES IS REPAIRED TO ITS DERIVED DEFAULT, NOT TO A FLAT NUMBER (owner ruling, 2026-10-17):
+# the driver pins `_NCPU=10`, so a garbage lane ceiling must come back as 25 — the value the box's
+# CORES imply — not the 4 it used to be repaired to. Reverting the coercion to `|| MAX_LANES=4`
+# reddens the two cases above and below.
 [ "$(nlim 30 6 20 5)" = "load=30 lanes=6 mpa=20 batch=5 cyc=240 review=4 fix=3 fixtries=3 stale=40" ] && rc=0 || rc=1
 ck "numeric plist limits survive the coercion unchanged" $rc
 # ⛔ A 2**63-shaped value is the SECOND failure mode, and is_num alone cannot see it: `[ -ge ]` on it
@@ -2406,7 +2471,7 @@ fi
 # `is_num`, so tightening the predicate coerces every leading-zero limit to its default — this drives
 # that, and it is RED on the lax predicate. (`nlim 08 09 030 05` covers 2-digit, 3-digit and the
 # single `0`-followed-by-digit forms.)
-[ "$(nlim 08 09 030 05)" = "load=100 lanes=4 mpa=25 batch=2 cyc=240 review=4 fix=3 fixtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim 08 09 030 05)'"; }
+[ "$(nlim 08 09 030 05)" = "load=100 lanes=25 mpa=25 batch=2 cyc=240 review=4 fix=3 fixtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim 08 09 030 05)'"; }
 ck "leading-zero limits (08/09/030/05) are coerced to defaults, not read as octal" $rc
 # ⛔ CYC=0 — the FOURTH failure mode, and the one every guard above lets through: `0` is a valid
 # integer and a valid is_limit, so it survives the coercion and the loop then runs `sleep 0` per
