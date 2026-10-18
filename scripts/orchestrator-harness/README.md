@@ -1000,18 +1000,38 @@ Measured in `~/.pi/agent/state/pr-doctor.log`, read 2026-10-18T00:42Z:
 Counted as distinct timestamps, with `pass:` lines as the successes. The un-wedger could not read the
 thing it un-wedges for a large share of a day, and each failed pass dispatched nothing.
 
-**Status: PARTIAL — the polarity is IMPLEMENTED, the bound is a GAP.** `lane-status.py:1689` raises
-`SystemExit(3)` rather than publish an empty roster; `lane-actions.py:153` refuses a `degraded`
-snapshot; `queue-dispatch.py:320,377` raises `LaneReadError` naming the timeout instead of returning
-`[]`; `pr-doctor.py:809-819` refuses the pass **when it has work to place** — and deliberately
+**Status: PARTIAL — a WHOLE-READ budget now exists for the lane roster, and the reader it wraps
+still has none of its own.** The polarity is IMPLEMENTED: `lane-status.py` raises `SystemExit(3)`
+rather than publish an empty roster; `lane-actions.py` refuses a `degraded` snapshot
+(`_refuse_if_degraded`); `queue-dispatch.py` raises `LaneReadError` naming the timeout instead of
+returning `[]`; `pr-doctor.py` refuses the pass **when it has work to place** — and deliberately
 stays exit 0 on a blind read with nothing classified, because manufacturing a failure out of an idle
-beat is its own defect (`:812-819`). What does not exist is a deadline
-inside the READER, and `queue-dispatch.py:110` says so outright — *"lane-status.py has no internal
-deadline, so this is the only stop between a stalled scan and an unbounded wait"*. Every bound on the
-WHOLE read is a CALLER's — 300 s (`lane-actions.py:1528`), 600 s (`queue-dispatch.py:110`), 600 s
-(`pr-doctor.py:389`) — which is why the caller fails instead of getting an answer. (The reader does
-hold per-CALL bounds -- 60 s, 45 s, 45 s at `lane-status.py:267,383,599` -- and that is exactly the
-shape this MUST rules out: it bounds each probe and lets their SUM grow with the fleet.)
+beat is its own defect (`:812-819`).
+
+New as of 2026-10-18: `lane-actions.py` takes **one deadline for the whole read** (`--budget`) and
+splits it across its two attempts, so the cached pass can no longer consume the retry's allowance and
+the tool cannot outlive the caller waiting on it; a failed re-scan returns the roster already read
+with `COMPLETENESS UNMEASURED` on stderr instead of discarding a readable datum. `pr-doctor.py`
+consumes the **published** roster (`$STATE/lane-status.last.json` via `lane-actions.py --stdin`,
+**2.8 s measured**) instead of paying a scan on every pass, and falls back to a bounded scan when that
+file is absent, stale, degraded, partition-less or unreadable — saying which happened.
+
+What does NOT exist: a deadline inside `lane-status.py` itself. Every remaining bound on the whole
+read is a CALLER's — `queue-dispatch.py`'s 600 s on its direct `lane-status.py` call, `pr-doctor.py`'s
+`LANE_BUDGET_S + margin` on the fallback scan. (The reader does hold per-CALL bounds — 60 s, 45 s,
+45 s — and that is exactly the shape this MUST rules out: it bounds each probe and lets their SUM grow
+with the fleet.) `queue-dispatch.py` still prints the residual: *"lane-status.py has no internal
+deadline, so this is the only stop between a stalled scan and an unbounded wait"*.
+
+⛔ AND THE PASS MUST SAY WHAT IT DID. A dispatcher that refuses is a failure the fleet can see: every
+exit of `pr-doctor.py` writes `$STATE/pr-doctor.status.json` (`rc`, a one-line reason, the PRs that
+went out) and prints `dispatched N of M queued — <why>`, so `dispatched 0` is never healthy while the
+queue has runnable items; `objective.py` renders the last pass's verdict as `PR-DOCTOR(last run):
+RED rc=N Nm ago — <reason>` beside the queue's own shape, and `heartbeat-loop.sh` prints the same
+verdict and launchd's last exit. `queue-dispatch.py` consumes that record's `issue_work` field as a
+**gate**: new issue work is SKIPPED while un-owned PRs exist, and the gate refuses only on a positive,
+FRESH reading (a missing, stale, unreadable or refused record blocks nothing and says so).
+
 agent-infra#1774, #1788.
 
 ### 6.5.3 Ancestry is the safety rail
