@@ -1909,9 +1909,15 @@ for verb in status stop; do
   xs_bad "$verb"
   [ "$X_RC" -ne 0 ] && ok "$verb: rc=$X_RC when 'ps' cannot answer (never a silent 0)" \
                     || bad "$verb: exited 0 on an unreadable process table — $X_OUT"
-  case "$X_OUT" in
-    *"cannot read the process table"*) ok "$verb: says the process table is unreadable" ;;
-    *) bad "$verb: does not name the unreadable read — $X_OUT" ;;
+  # THIS verb's refusal, by a suffix unique to the UNREADABLE-READ case: "cannot read the process
+  # table" appears 14 times in the supervisor, and the short forms are not unique either — stop's
+  # "nothing provable" refusal also says "refusing to kill a session", so a trimmed suffix matched a
+  # fail-open mutation (measured: it stayed green). Within one verb the two reads are a redundant
+  # pair carrying the SAME message, so which one fired is not — and need not be — distinguished.
+  case "$verb:$X_OUT" in
+    status:*"refusing to report a controller state from an unreadable read"*) ok "status: names the unreadable read it refused on" ;;
+    stop:*"refusing to kill a session on an unreadable read"*) ok "stop: names the unreadable read it refused on" ;;
+    *) bad "$verb: does not name the unreadable read it refused on — $X_OUT" ;;
   esac
 done
 # `start` has TWO unreadable-`ps` guards, and they are DIFFERENT refusals that share a prefix. Each
