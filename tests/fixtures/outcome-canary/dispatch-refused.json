@@ -1,0 +1,157 @@
+{
+ "_expect": {
+  "controller_cycling": "PASS",
+  "headroom": "PASS",
+  "landers": "PASS",
+  "pane_daemon": "PASS",
+  "pr_created": "PASS",
+  "pr_merged": "PASS",
+  "queue_readable": "PASS",
+  "work_dispatched": "FAIL"
+ },
+ "config": {
+  "disk_floor_gb": 20.0,
+  "label": "com.eldato.orchestrator-loop",
+  "mem_floor_mb": 512.0,
+  "pool_threshold": 25,
+  "pr_window_s": 10800.0,
+  "repo": "daniel-ospina/tortoise",
+  "window_s": 720.0
+ },
+ "facts": {
+  "box": "local",
+  "controller": {
+   "pids": [
+    {
+     "cmd": "/bin/bash /Users/me/orchestrator/orch-loop.sh",
+     "depth": 0,
+     "pid": 4242,
+     "ppid": 1
+    }
+   ]
+  },
+  "github": {
+   "last_created": "2026-10-18T06:40:00-0400",
+   "last_merged": "2026-10-18T06:49:30-0400",
+   "ok": true,
+   "open_pr_count": 7,
+   "open_prs": [
+    {
+     "auto_armed": true,
+     "checks_green": true,
+     "draft": false,
+     "merge_state_status": "CLEAN",
+     "number": 900,
+     "review_decision": "APPROVED"
+    },
+    {
+     "auto_armed": false,
+     "checks_green": false,
+     "draft": false,
+     "merge_state_status": "BLOCKED",
+     "number": 901,
+     "review_decision": "REVIEW_REQUIRED"
+    }
+   ],
+   "prs_created_in_window": 3,
+   "prs_merged_in_window": 5
+  },
+  "headroom": {
+   "disk": {
+    "avail_bytes": 355000000000,
+    "mount": "/",
+    "ok": true,
+    "used_pct": 63.0
+   },
+   "mem": {
+    "avail_mb": 10765,
+    "ok": true,
+    "source": "darwin"
+   }
+  },
+  "heartbeat": {
+   "age_s": 30,
+   "ok": true,
+   "path": "~/orchestrator/heartbeat"
+  },
+  "launchd": {
+   "label": "com.eldato.orchestrator-loop",
+   "loaded": true,
+   "pid": 4242
+  },
+  "log": {
+   "age_s": 42,
+   "exists": true,
+   "mtime_iso": "2026-10-18T07:47:44-0400",
+   "path": "~/orchestrator/logs/orch-loop.log"
+  },
+  "log_events": {
+   "armed": [
+    {
+     "age_s": 90,
+     "pr": 900,
+     "raw": "#900 auto-armed",
+     "ts": 1792327600
+    }
+   ],
+   "dispatch_empty": [
+    {
+     "age_s": 42,
+     "raw": "[dispatch] backlog empty queue=READ(223)(9m)",
+     "ts": 1792327664
+    }
+   ],
+   "dispatch_ok": [],
+   "dispatch_refused": [
+    {
+     "age_s": 42,
+     "issue": 4601,
+     "raw": "[dispatch] #4601 NOT dispatched - could not build claim commit",
+     "reason": "could not build claim commit",
+     "ts": 1792327664
+    },
+    {
+     "age_s": 42,
+     "issue": 4602,
+     "raw": "[dispatch] #4602 NOT dispatched - could not build claim commit",
+     "reason": "could not build claim commit",
+     "ts": 1792327664
+    }
+   ],
+   "dispatch_skipped": [],
+   "headers": [
+    {
+     "age_s": 42,
+     "backlog": 47,
+     "lanes": 2,
+     "load": 40,
+     "queue_token": "READ(223)(9m)",
+     "raw": "=== Sun Oct 18 07:47:44 EST 2026 load=40 lanes=2 backlog=47 queue=READ(223)(9m) ===",
+     "ts": 1792327664
+    }
+   ],
+   "railed": [],
+   "unparsed_headers": 0
+  },
+  "observed_at": "2026-10-18T07:47:44-0400",
+  "pane": {
+   "cmd": "cmux-tui",
+   "ok": true,
+   "pids": [
+    {
+     "oom_score_adj": -1000,
+     "pid": 700
+    }
+   ],
+   "protection_source": "oom_score_adj",
+   "protection_supported": true
+  },
+  "queue_state": {
+   "age_s": 120,
+   "ok": true,
+   "raw": "READ(223) 1792327124"
+  }
+ },
+ "name": "dispatch-refused",
+ "note": "THE shape that matters: controller cycling, queue readable, and every dispatch attempt refused"
+}
