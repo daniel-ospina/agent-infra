@@ -34,6 +34,8 @@
   "github": {
    "last_created": "2026-10-18T06:40:00-0400",
    "last_merged": "2026-10-18T06:49:30-0400",
+   "merged_page_full": false,
+   "merged_surface": "merge-ordered (merged:>=2026-10-18) [fixture]",
    "ok": true,
    "open_pr_count": 2,
    "open_prs": [
@@ -156,5 +158,5 @@
   }
  },
  "name": "no-pr-merged",
- "note": "PRs are open and nothing merged: every component 'up', nothing shipping"
+ "note": "PRs are open and nothing merged: every component 'up', nothing shipping The merge-ordered read (merged:>=<date>) succeeded and returned nothing, so `merged_page_full` is False: the FAIL arm is reached through a shape the collector really emits."
 }

@@ -2208,17 +2208,21 @@ def test_the_REST_collector_does_NOT_call_a_covering_page_TRUNCATED():
 
 
 @test
-def test_the_GRAPHQL_collector_reads_the_CLOSED_page_and_calls_a_full_one_TRUNCATED():
-    """`gh pr list` is CREATION-desc, so a full page really can hide a merge. The collector must also
-    read the CLOSED page (not only the MERGED subset) or a PR opened and closed unmerged vanished
-    from the created count."""
+def test_the_GRAPHQL_collector_reads_the_CLOSED_page_AND_a_MERGE_ordered_page():
+    """Two populations, two orderings. The CLOSED page (creation-desc) answers "what was opened" —
+    without it a PR opened and closed unmerged vanished from the created count. It CANNOT answer
+    "did anything merge in the window": on any repo with >=100 closed PRs the page is always full and
+    a merge older than the page cut is invisible, which made `merged_page_full` true on every live
+    run and deleted `pr_merged`'s only FAIL arm (measured: 100 closed rows on this repo). So one
+    MERGE-ORDERED read (`merged:>=<date>`) carries the merge count, and an EMPTY result of it
+    genuinely establishes "nothing merged in the window"."""
     m = load()
     cfg = m.cfg_from_dict({"pr_window_s": 10800.0})
     now = 1792327664.0
     inside = "2026-10-18T19:40:00Z"          # 64s before `now`
     closed = [{"number": i, "createdAt": inside, "mergedAt": None} for i in range(100)]
     closed[0] = dict(closed[0], mergedAt=inside)
-    calls = []
+    calls, merge_rows = [], {"rows": []}
     real = m._run_gh
 
     def fake(argv):
@@ -2228,18 +2232,139 @@ def test_the_GRAPHQL_collector_reads_the_CLOSED_page_and_calls_a_full_one_TRUNCA
             return 0, "[]"
         if "--state closed" in j:
             return 0, json.dumps(closed)
+        if "merged:>=" in j:
+            return 0, json.dumps(merge_rows["rows"])
         return 0, ""
 
     try:
         m._run_gh = fake
+        # (a) nothing merged in the window: the merge-ordered page is EMPTY, which is a measurement,
+        #     so the truncation flag must NOT fire and the FAIL arm stays reachable
         gh = m.collect_github("o/r", cfg, now=now)
+        assert gh and gh.get("source") == "graphql", gh
+        assert gh["merged_page_full"] is False, gh
+        assert gh["prs_merged_in_window"] == 0, gh
+        # …and the closed page still supplies the created population
+        assert gh["prs_created_in_window"] == 100, gh
+        check = m.check_pr_merged({"github": dict(gh, open_pr_count=2)}, cfg)
+        assert (check.status, check.variant) == (m.FAIL, "NO_PR_MERGED"), (check.status,
+                                                                          check.variant)
+        # (b) a merge inside the window is counted, and the search is bounded by the window's date
+        merge_rows["rows"] = [{"number": 1, "mergedAt": inside, "createdAt": inside}]
+        gh2 = m.collect_github("o/r", cfg, now=now)
+        assert gh2["prs_merged_in_window"] == 1, gh2
+        assert "merged:>=" in gh2.get("merged_surface", ""), gh2
+        # ⛔ and the merge-ordered read is DATED: an unbounded one would report merges from before
+        # the window as if they had just landed
+        assert any("--search" in c and "merged:>=" in c for c in calls), calls
     finally:
         m._run_gh = real
-    assert gh and gh.get("source") == "graphql", gh
-    assert gh["merged_page_full"] is True, gh      # creation-ordered page: full really is truncated
-    assert gh["prs_merged_in_window"] == 1, gh
-    assert gh["prs_created_in_window"] == 100, gh
-    assert any("--state closed" in c for c in calls), calls
+
+    # (c) the merge-ordered read FAILS: fall back to the creation-ordered page and DISCLOSE the bound
+    def fake_fail(argv):
+        j = " ".join(argv)
+        if "--state open" in j:
+            return 0, "[]"
+        if "--state closed" in j:
+            return 0, json.dumps(closed)
+        if "merged:>=" in j:
+            return 1, "GraphQL: something went wrong"
+        return 0, ""
+
+    try:
+        m._run_gh = fake_fail
+        gh3 = m.collect_github("o/r", cfg, now=now)
+    finally:
+        m._run_gh = real
+    assert gh3["merged_page_full"] is True, gh3       # abstain rather than under-count silently
+    assert "merge-ordered read failed" in (gh3.get("fallback_note") or ""), gh3
+
+
+@test
+def test_an_UNPARSEABLE_header_is_NOT_a_mid_cycle_wedge():
+    """`parse_log` counts a header it cannot parse in `unparsed_headers`; `queue_readable` and
+    `work_dispatched` both abstain on it, and `controller_cycling` graded the same datum
+    FAIL/LOG_NO_CYCLE ("a mid-cycle wedge") — a MEASURED failure from a value it could not read, on
+    the check an operator reads first, for a controller whose log format had merely moved."""
+    m = load()
+    d = fx("healthy")
+    d["facts"]["log_events"]["headers"] = []
+    d["facts"]["log_events"]["unparsed_headers"] = 5
+    cfg = m.cfg_from_dict(d["config"])
+    got = dict((v.name, v) for v in m.evaluate(d["facts"], cfg))
+    v = got["controller_cycling"]
+    assert (v.status, v.variant) == (m.INCONCLUSIVE, "LOG_FORMAT_UNREAD"), (v.status, v.variant)
+    assert "UNPARSEABLE" in v.evidence, v.evidence
+    assert got["queue_readable"].status == m.INCONCLUSIVE, got["queue_readable"].status
+    # …and with NO unparseable headers, zero cycles is still the wedge it says it is
+    d2 = fx("healthy")
+    d2["facts"]["log_events"]["headers"] = []
+    cfg2 = m.cfg_from_dict(d2["config"])
+    v2 = [x for x in m.evaluate(d2["facts"], cfg2) if x.name == "controller_cycling"][0]
+    assert (v2.status, v2.variant) == (m.FAIL, "LOG_NO_CYCLE"), (v2.status, v2.variant)
+
+
+@test
+def test_a_BOOL_headroom_number_is_UNREAD_not_a_manufactured_OOM():
+    """`isinstance(True, int)` is true, so a boolean `avail_bytes`/`avail_mb` was divided and
+    subtracted as a number: "disk: 0.0 GiB free", "memory: 1 MiB available" — a fake OOM emergency
+    manufactured on the check whose FAIL must mean one."""
+    m = load()
+    cfg = m.cfg_from_dict({})
+    v = m.check_headroom({"headroom": {"disk": {"ok": True, "avail_bytes": True, "used_pct": 10,
+                                                "mount": "/"},
+                                       "mem": {"ok": True, "avail_mb": 9000, "source": "d"}}}, cfg)
+    assert (v.status, v.variant) == (m.INCONCLUSIVE, "PROBE_UNREADABLE"), (v.status, v.variant)
+    v2 = m.check_headroom({"headroom": {"disk": {"ok": True, "avail_bytes": int(400 * (1 << 30)),
+                                                 "used_pct": 10, "mount": "/"},
+                                        "mem": {"ok": True, "avail_mb": True, "source": "d"}}}, cfg)
+    assert (v2.status, v2.variant) == (m.INCONCLUSIVE, "PROBE_UNREADABLE"), (v2.status, v2.variant)
+
+
+@test
+def test_an_UNREADABLE_pool_is_not_reported_as_benign_idleness():
+    """"The fleet had nothing in hand" is a CLAIM, and an `UNREADABLE` pool cannot support it. Every
+    non-numeric kind fell through to `busy=False`, so the #1931 shape (blind fleet) was reported as
+    idleness by `pr_created` while `queue_readable` FAILed QUEUE_UNREADABLE in the same run."""
+    m = load()
+    d = fx("healthy")
+    d["facts"]["log_events"]["headers"] = [{"raw": "=== Sun Oct 18 07:47:44 EST 2026 load=4 lanes=0 "
+                                                   "backlog=0 queue=UNREADABLE ===",
+                                            "age_s": 60, "ts": 0, "backlog": 0,
+                                            "queue_token": "UNREADABLE"}]
+    d["facts"]["queue_state"] = {"path": "q", "ok": False, "error": "permission denied"}
+    d["facts"]["github"]["prs_created_in_window"] = 0
+    d["facts"]["github"]["prs_merged_in_window"] = 0
+    d["facts"]["github"]["open_pr_count"] = 1
+    cfg = m.cfg_from_dict(d["config"])
+    got = dict((v.name, v) for v in m.evaluate(d["facts"], cfg))
+    assert got["pr_created"].variant == "ACTIVITY_UNKNOWN", (got["pr_created"].status,
+                                                             got["pr_created"].variant)
+    assert got["pr_merged"].variant in ("ACTIVITY_UNKNOWN", "NO_PR_MERGED"), got["pr_merged"].variant
+    busy, why = m._activity(d["facts"], cfg.window_s)
+    assert busy is None and "not established" in why, (busy, why)
+    # a genuinely EMPTY pool is still a measured idle, not an abstention
+    d2 = fx("healthy")
+    d2["facts"]["github"]["prs_created_in_window"] = 0
+    busy2, _ = m._activity(d2["facts"], m.cfg_from_dict(d2["config"]).window_s)
+    assert busy2 is not None, busy2
+
+
+@test
+def test_the_report_discloses_WHICH_CELL_was_read():
+    """`--o` is how a cell is named, and two runs against different cells emitted identical config
+    blocks: `o_dir`/`log_path`/`state_path` are `None` in DEFAULTS, so a
+    `isinstance(v, (int, float, str))` loop over DEFAULTS could never require them."""
+    m = load()
+    a = m.cfg_from_dict({})
+    a.o_dir, a.log_path, a.state_path = "/cell/A", "/cell/A/logs/orch-loop.log", "/cell/A/q"
+    b = m.cfg_from_dict({})
+    b.o_dir, b.log_path, b.state_path = "/cell/B", "/cell/B/logs/orch-loop.log", "/cell/B/q"
+    assert a.as_json() != b.as_json(), (a.as_json(), b.as_json())
+    assert a.as_json()["o_dir"] == "/cell/A", a.as_json()
+    # every Cfg.FIELDS member is disclosed, so a report can explain which records it read
+    missing = [k for k in m.Cfg.FIELDS if k not in a.as_json()]
+    assert not missing, "undisclosed config fields: %s" % (missing,)
 
 
 @test
@@ -3395,6 +3520,25 @@ def test_source_never_contains_a_forbidden_launchctl_form():
 
 MUTATIONS = [
     # (label, old, new, paired test)
+    # ── cycle-22 defects ──────────────────────────────────────────────────────────────────
+    ("an unparseable header is graded as a mid-cycle wedge",
+     "    if not cycles and unparsed:",
+     "    if False:",
+     "test_an_UNPARSEABLE_header_is_NOT_a_mid_cycle_wedge"),
+    ("a bool headroom number is divided as a number",
+     "    if disk.get(\"ok\") and (not isinstance(disk.get(\"avail_bytes\"), (int, float))\n"
+     "                          or isinstance(disk.get(\"avail_bytes\"), bool)):",
+     "    if disk.get(\"ok\") and not isinstance(disk.get(\"avail_bytes\"), (int, float)):",
+     "test_a_BOOL_headroom_number_is_UNREAD_not_a_manufactured_OOM"),
+    ("an unreadable pool token reads as benign idleness",
+     "    if kind not in (\"EMPTY\", \"READ\", \"PARTIAL\") or (kind == \"READ\" and not "
+     "isinstance(pool, int)):",
+     "    if False:",
+     "test_an_UNREADABLE_pool_is_not_reported_as_benign_idleness"),
+    ("the report stops disclosing which cell was read",
+     '            "o_dir": self.o_dir,',
+     '',
+     "test_the_report_discloses_WHICH_CELL_was_read"),
     # ── cycle-21 defects ──────────────────────────────────────────────────────────────────
     ("a full closed page is called truncated whatever its ordering",
      "                 merged_page_full=len(closed) >= 100 and not page_covers_window)",
@@ -3405,9 +3549,14 @@ MUTATIONS = [
      "    _fill_counts(out, open_raw, merged, cfg, now,",
      "test_the_REST_collector_does_NOT_call_a_covering_page_TRUNCATED"),
     ("the GraphQL collector stops passing the closed page as a created population",
-     "                 merged_page_full=len(closed) >= 100)",
-     "                 merged_page_full=len(merged) >= 100)",
-     "test_the_GRAPHQL_collector_reads_the_CLOSED_page_and_calls_a_full_one_TRUNCATED"),
+     "        _fill_counts(out, open_prs, merged_in_window_rows, cfg, now, also_created=closed,",
+     "        _fill_counts(out, open_prs, merged_in_window_rows, cfg, now,",
+     "test_the_GRAPHQL_collector_reads_the_CLOSED_page_AND_a_MERGE_ordered_page"),
+    ("the merge-ordered read loses its window bound, so old merges count as new",
+     '                       "--search", "merged:>=%s" % since, "--json", '
+     '"number,mergedAt,createdAt"])',
+     '                       "--json", "number,mergedAt,createdAt"])',
+     "test_the_GRAPHQL_collector_reads_the_CLOSED_page_AND_a_MERGE_ordered_page"),
     ("an unread pane population is graded as zero daemons",
      '    if pane.get("ok") is True and not isinstance(pane.get("pids"), list):',
      "    if False:",
@@ -3790,7 +3939,8 @@ MUTATIONS = [
      "            and (f.get(\"queue_state\") or {}).get(\"ok\") is not False:",
      "test_the_queue_checks_use_ALLOW_LIST_polarity_on_the_record"),
     ("an ok MEMORY read with no number reads as 0 MiB",
-     "    if mem.get(\"ok\") and not isinstance(mem.get(\"avail_mb\"), (int, float)):",
+     "    if mem.get(\"ok\") and (not isinstance(mem.get(\"avail_mb\"), (int, float))\n"
+     "                         or isinstance(mem.get(\"avail_mb\"), bool)):",
      "    if False:",
      "test_an_ok_MEMORY_read_with_no_number_is_UNREAD_not_zero_mib"),
     ("vm_stat sums the inactive/speculative fields without checking they were seen",
@@ -3803,10 +3953,10 @@ MUTATIONS = [
      "        merged_page_full = False",
      "test_the_merged_page_bound_models_the_SURFACE_that_produced_it"),
     ("fleet activity reads the one-refresh-old header token",
-     "    _tok, _raw, _src = authoritative_queue_token(f, hdr)\n    pool = _tok.get(\"pool\")\n"
-     "    busy = bool((isinstance(backlog, int) and backlog > 0) or (isinstance(pool, int) and pool > 0))",
-     "    pool = parse_queue_token(hdr.get(\"queue_token\")).get(\"pool\")\n    _src = \"cycle header\"\n"
-     "    busy = bool((isinstance(backlog, int) and backlog > 0) or (isinstance(pool, int) and pool > 0))",
+     "    _tok, _raw, _src = authoritative_queue_token(f, hdr)\n"
+     "    pool = _tok.get(\"pool\")",
+     "    _tok = parse_queue_token(hdr.get(\"queue_token\"))\n    _raw, _src = _tok.get(\"raw\"), "
+     "\"cycle header\"\n    pool = _tok.get(\"pool\")",
      "test_fleet_activity_reads_the_SAME_queue_token_as_the_queue_checks"),
     ("a failed read of the queue record passes through the stale header",
      "    if qs_rec.get(\"ok\") is not True and tok_src == \"cycle header\":",
@@ -3833,7 +3983,8 @@ MUTATIONS = [
      "    if False:",
      "test_an_UNREAD_oom_protection_value_is_UNEVALUABLE_not_unprotected"),
     ("an ok disk read with no number reads as 0 GiB",
-     "    if disk.get(\"ok\") and not isinstance(disk.get(\"avail_bytes\"), (int, float)):",
+     "    if disk.get(\"ok\") and (not isinstance(disk.get(\"avail_bytes\"), (int, float))\n"
+     "                          or isinstance(disk.get(\"avail_bytes\"), bool)):",
      "    if False:",
      "test_an_ok_disk_read_with_no_number_is_UNREAD_not_zero_gib"),
     ("an unaged queue record forfeits its authority",
@@ -3866,7 +4017,8 @@ MUTATIONS = [
      "            print(\"outcome-canary: %s\" % exc, file=sys.stderr)\n            return 1",
      "test_a_bad_fixture_path_is_a_USAGE_error_not_the_FAIL_exit_code"),
     ("a truncated merged page reads as nothing merged",
-     "    if gh.get(\"merged_page_full\") and not (isinstance(n, int) and n > 0):",
+     "    if gh.get(\"merged_page_full\") and not (isinstance(n, int) and not "
+     "isinstance(n, bool) and n > 0):",
      "    if False:",
      "test_a_TRUNCATED_merged_page_does_not_read_as_nothing_merged"),
     ("a lane spawn from ANOTHER batch vouches for this one",

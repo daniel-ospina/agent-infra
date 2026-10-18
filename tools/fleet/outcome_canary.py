@@ -293,6 +293,14 @@ class Cfg(object):
             "label": self.label,
             "repo": self.repo,
             "box": self.box,
+            # ⛔ WHICH CELL was read is part of explaining a verdict: `--o` is how a cell is named,
+            # and two runs against different cells emitted byte-identical config blocks. These are
+            # disclosed from the INSTANCE (their defaults are None), which is why a
+            # `isinstance(v, (int, float, str))` loop over DEFAULTS could never require them.
+            "o_dir": self.o_dir,
+            "log_path": self.log_path,
+            "state_path": self.state_path,
+            "controller_ws": self.controller_ws,
         }
 
 
@@ -811,6 +819,20 @@ def check_controller_cycling(f, c):
 
     cycles = [h for h in (f.get("log_events") or {}).get("headers") or []
               if h.get("age_s") is not None and h["age_s"] <= win]
+    # ⛔ AN UNPARSEABLE HEADER IS NOT AN ABSENT ONE. `parse_log` counts a header it cannot parse
+    # in `unparsed_headers`, and `queue_readable`/`work_dispatched` both abstain on it — while this
+    # check graded the same datum FAIL/LOG_NO_CYCLE ("a mid-cycle wedge"), reddening a healthy
+    # controller whose log format had merely moved. The parser already carries two timestamp formats
+    # (`RE_TS_A`/`RE_TS_B`) because the log changed once; a third would have raised a false alarm on
+    # the check an operator reads first.
+    unparsed = (f.get("log_events") or {}).get("unparsed_headers") or 0
+    if not cycles and unparsed:
+        return V("controller_cycling", INCONCLUSIVE, "LOG_FORMAT_UNREAD",
+                 "controller pid(s): %s IS ALIVE (launchd %s: %s)\n%s\n%s\n%d cycle header(s) "
+                 "present but UNPARSEABLE — the log format moved, so 'no cycle completes' was NOT "
+                 "established" % (pid_txt, lc, lc_txt, log_txt, _last_header_txt(f), unparsed),
+                 "the log carries %d header(s) this build cannot parse, so a wedge cannot be told "
+                 "from a format change. Not green." % unparsed)
     if not cycles:
         # ⛔ A MOVING FILE IS NOT A CYCLE. `cycles` was computed, printed and never graded, so a
         # controller wedged mid-cycle read PASS/CYCLING for as long as anything else appended to the
@@ -1366,9 +1388,21 @@ def _activity(f, window_s=None):
     # hand") off the same facts. The pool number and its SOURCE go into the evidence.
     _tok, _raw, _src = authoritative_queue_token(f, hdr)
     pool = _tok.get("pool")
-    busy = bool((isinstance(backlog, int) and backlog > 0) or (isinstance(pool, int) and pool > 0))
-    return busy, "backlog=%s pool=%s (source: %s, %s)" % (
-        backlog, pool, _src, _age_txt(hdr.get("age_s")))
+    kind = _tok.get("kind")
+    age_txt = _age_txt(hdr.get("age_s"))
+    busy = bool((isinstance(backlog, int) and not isinstance(backlog, bool) and backlog > 0)
+                or (isinstance(pool, int) and not isinstance(pool, bool) and pool > 0))
+    if busy:
+        return True, "backlog=%s pool=%s (source: %s, %s)" % (backlog, pool, _src, age_txt)
+    # ⛔ "NOTHING IN HAND" IS A CLAIM, AND AN UNREAD POOL CANNOT SUPPORT IT. Every non-numeric kind
+    # fell through to `busy=False`, so a box whose refresh answered `UNREADABLE` — the #1931 shape
+    # this file fixes everywhere else — was reported as benign idleness by `pr_created` while
+    # `queue_readable` FAILed QUEUE_UNREADABLE in the same run. `work_dispatched` has a
+    # `HEADER_INCOMPLETE` guard for exactly this; `_activity` had none.
+    if kind not in ("EMPTY", "READ", "PARTIAL") or (kind == "READ" and not isinstance(pool, int)):
+        return None, ("the pool reading is %s (source: %s, %s), so 'the fleet had nothing in hand' "
+                      "is not established" % (_tok.get("raw") or "(absent)", _src, age_txt))
+    return False, "backlog=%s pool=%s (source: %s, %s)" % (backlog, pool, _src, age_txt)
 
 
 def _gh_surface_txt(gh):
@@ -1415,6 +1449,10 @@ def check_pr_created(f, c):
     if isinstance(n, int) and n > 0:
         return V("pr_created", PASS, "CREATED", ev)
     busy, why = _activity(f, c.window_s)
+    if busy is None:
+        return V("pr_created", INCONCLUSIVE, "ACTIVITY_UNKNOWN", ev + "\nfleet activity: %s" % why,
+                 "whether the fleet had work in hand could not be read, so 'no PR was created' is "
+                 "neither a failure nor an idle. Not green.")
     if busy:
         return V("pr_created", FAIL, "NO_PR_CREATED", ev + "\nfleet activity: %s" % why,
                  "the fleet had work in hand and opened no PR in %.1fh. A fleet that dispatches "
@@ -1448,7 +1486,7 @@ def check_pr_merged(f, c):
     if isinstance(n, int) and n > 0:
         return V("pr_merged", PASS, "MERGED", ev)
     busy, why = _activity(f, c.window_s)
-    if gh.get("merged_page_full") and not (isinstance(n, int) and n > 0):
+    if gh.get("merged_page_full") and not (isinstance(n, int) and not isinstance(n, bool) and n > 0):
         # A FULL, creation-ordered page cannot tell "nothing merged" from "merged PRs created before
         # the page cut". Abstaining is the honest answer; a FAIL here would be a false alarm, and a
         # PASS impossible.
@@ -1462,6 +1500,10 @@ def check_pr_merged(f, c):
                  "%d PR(s) are open and nothing merged in %.1fh. Every component can be 'up' while "
                  "the fleet ships nothing — that is this check's whole reason to exist."
                  % (open_n, win / 3600.0))
+    if busy is None:
+        return V("pr_merged", INCONCLUSIVE, "ACTIVITY_UNKNOWN", ev + "\nfleet activity: %s" % why,
+                 "whether the fleet had work in hand could not be read, so 'nothing merged' is "
+                 "neither a failure nor an idle. Not green.")
     if busy:
         return V("pr_merged", FAIL, "NO_PR_MERGED", ev + "\nfleet activity: %s" % why,
                  "the fleet had work in hand and merged nothing in %.1fh." % (win / 3600.0))
@@ -1627,7 +1669,11 @@ def check_headroom(f, c):
     # ⛔ AN `ok` READ WITH NO NUMBER IS NOT 0 GiB. `(avail_bytes or 0)` turned a missing field into
     # "disk 0.0 GiB free" — a manufactured OOM emergency on the check whose FAIL must mean one. Same
     # defect as the `vm_stat` arm; the surface is UNREAD, so it belongs in `unknown`.
-    if disk.get("ok") and not isinstance(disk.get("avail_bytes"), (int, float)):
+    # ⛔ `isinstance(True, int)` IS TRUE: a boolean `avail_bytes`/`avail_mb` was divided and
+    # subtracted as a number and manufactured `FAIL/BELOW_FLOOR` ("0.0 GiB free", "1 MiB available")
+    # — a fake OOM emergency on the check whose FAIL must mean one. Same polarity as the PR counts.
+    if disk.get("ok") and (not isinstance(disk.get("avail_bytes"), (int, float))
+                          or isinstance(disk.get("avail_bytes"), bool)):
         lines.append("disk: READ ok but NO avail_bytes field (%r)" % (disk.get("avail_bytes"),))
         unknown.append("disk")
     elif disk.get("ok"):
@@ -1643,7 +1689,8 @@ def check_headroom(f, c):
 
     # ⛔ THE DISK ARM'S TWIN: `(avail_mb or 0)` manufactures "0 MiB available" out of a field that
     # was never read, i.e. an OOM emergency on the check whose FAIL must mean one.
-    if mem.get("ok") and not isinstance(mem.get("avail_mb"), (int, float)):
+    if mem.get("ok") and (not isinstance(mem.get("avail_mb"), (int, float))
+                         or isinstance(mem.get("avail_mb"), bool)):
         lines.append("memory: READ ok but NO avail_mb field (%r)" % (mem.get("avail_mb"),))
         unknown.append("memory")
     elif mem.get("ok"):
@@ -2744,10 +2791,6 @@ class Machine(object):
         out = out.strip()
         return int(out) if re.match(r"^-?\d+$", out) else None
 
-    def log_age(self):
-        log, _ = self.facts_probe_log()
-        return log.get("age_s")
-
     def stat_mtime(self, path):
         """mtime of `path`, or None when it cannot be read. A failed read is not a mtime."""
         rc, out = self.sh("stat -c %%Y %s 2>/dev/null || stat -f %%m %s 2>/dev/null"
@@ -3037,11 +3080,37 @@ def _collect_graphql(gh, repo, cfg, now, errors):
         errors.append("graphql: gh pr list --state closed returned unparseable JSON")
         return None
     merged = [p for p in closed if p.get("mergedAt")]
+    # ⛔ A CREATION-ORDERED PAGE CANNOT ANSWER "DID ANYTHING MERGE IN THE WINDOW". `pr list` is
+    # creation-desc, so on any repo with ≥100 closed PRs the page is ALWAYS full and a merge older
+    # than the page cut is invisible — which made `merged_page_full` true on every live run and
+    # deleted `pr_merged`'s only FAIL arm on the primary surface (measured: 100 closed rows on this
+    # repo, so "everything is up and nothing ships" could never be reported for merges, only
+    # abstained). One MERGE-ORDERED read answers it exactly: `merged:>=<date>` returns the merges in
+    # the window, so an EMPTY result genuinely establishes "nothing merged" and a non-empty one is
+    # the count. The closed page stays for the created population.
+    since = datetime.datetime.utcfromtimestamp(now - cfg.pr_window_s).strftime("%Y-%m-%d")
+    rc, txt = _run_gh([gh, "pr", "list", "--repo", repo, "--state", "merged", "--limit", "100",
+                       "--search", "merged:>=%s" % since, "--json", "number,mergedAt,createdAt"])
+    merged_in_window_rows = None
+    if rc == 0:
+        merged_in_window_rows = _json_list(txt)
     out = _gh_empty()
     out["source"] = "graphql"
-    # creation-ordered: a full page really can hide a merge
-    _fill_counts(out, open_prs, merged, cfg, now, also_created=closed,
-                 merged_page_full=len(closed) >= 100)
+    if merged_in_window_rows is not None:
+        # `merged_page_full` stays False even if this page is FULL: 100 in-window merges is n > 0, so
+        # the bound can hide nothing that matters (the check PASSes on a positive count and never
+        # needs the population). It is the absence of merges that the flag must protect, and an
+        # EMPTY result of a window-bounded query is that absence, measured.
+        _fill_counts(out, open_prs, merged_in_window_rows, cfg, now, also_created=closed,
+                     merged_page_full=False)
+        out["merged_surface"] = "merge-ordered (merged:>=%s)" % since
+    else:
+        # the merge-ordered read failed: fall back to the creation-ordered page and DISCLOSE the
+        # bound rather than silently under-counting
+        out["fallback_note"] = ("merge-ordered read failed (rc=%s); merged count is from the "
+                                "creation-ordered closed page" % rc)
+        _fill_counts(out, open_prs, merged, cfg, now, also_created=closed,
+                     merged_page_full=len(closed) >= 100)
     rows = []
     for p in open_prs:
         mss = (p.get("mergeStateStatus") or "").strip().upper()
