@@ -141,6 +141,26 @@ failed/stale/never, 2 usage.
 | 4 | a class completed but at least one removal failed (or another pass holds the lock) |
 | 5 | dry-run only: a class reported work it would do |
 
+## Tests
+
+`scripts/disk-reaper.test.sh` — 65 assertions, run by the `disk-reaper` shard of
+`run-bash-shards.sh`:
+
+| | |
+|---|---|
+| T1–T4 | dry-run removes nothing and names every candidate with a byte count; a live-cwd worktree is never selected (and IS once its holder is gone); a merged checkout is selected; the size budget is honoured |
+| T5 | a missing delegate is fail-closed and recorded as failed |
+| T6 | the entry point deletes no sink itself (static pin: its only recursive delete is the lock) |
+| T7 | the pass record answers "did it succeed, and how much did it free" without a log |
+| T8 | the schedule installs, is idempotent, and is armed |
+| T9 | a pass that **loses** the lock never releases the live owner's lock |
+| T10 | an `--only` list naming nothing is refused (never a healthy no-op) |
+| T11 | a dry run records 0 bytes freed (it removed nothing) |
+| T12 | the installer's `--dry-run` changes nothing; a set-but-missing `$DISK_REAPER` is refused |
+
+T9, T10 and T12 were each red on the build that preceded the fresh-context review
+that found them.
+
 ## Deliberately out of scope
 
 * **`node_modules`** — still reclaimed by the supervisor's existing sweep; it is not
