@@ -358,7 +358,7 @@ STRAY8="$("$REAL_GIT" -C "$R8/repo" ls-remote origin 'refs/claims/*' 2>/dev/null
 [ -z "$STRAY8" ]; ck "C8 [PINNED] NOTHING was pushed to the same-named child repo's origin (no silent wrong-repo claim)" $?
 
 echo
-echo "── C9: a BARE cd OPTION must not be read as a directory (pins the `--`) ───────────────"
+echo "── C9: a BARE cd OPTION must not be read as a directory (pins the \`--\`) ──────────────"
 # `CLAIM_REPO=-P` is not a path: without `--`, `cd -P` takes NO operand and SUCCEEDS into $HOME
 # (measured) — so a bare-option value would claim into whatever repo $HOME happens to be. `$HOME`
 # here IS such a repo, with its own origin, so the check is behavioural: the claim must be refused
