@@ -22,12 +22,24 @@
 #   5. DEPLOY IS ALL-OR-NOTHING. A differing orch-loop.sh under a running controller is the corruption
 #      supervisor.sh warns about (bash reads scripts incrementally); deploy must refuse BEFORE writing
 #      anything, so the OTHER files it would have replaced are still the old bytes.
+#   6. A REMOVAL IS NEVER A SIDE EFFECT (#2044 review finding 4). `$O` is the LIVE directory a running
+#      fleet execs by absolute path, so a file the repo does not ship is refused — named, with
+#      nothing written — unless `--prune` asks for exactly that. This holds for `restart` too,
+#      because restart is the documented RECOVERY and it reached the deletions.
 #   6. VERIFY DISTINGUISHES RED FROM UNKNOWN. A label launchd does not have → exit 1 (red); a launchd
 #      that cannot be read → exit 2 (cannot determine), never 0 and never the same code as red.
 #   7. THE RECORD COVERS THE NON-`.sh` SHIPPED SURFACE, AND IS BUILT FROM THE REPO (#1960). Deleting
 #      `$O/gh-limit.py` or `$O/gh-rest/gh` — neither of which a `*.sh` record can see — makes `drift`
 #      exit 1 and NAME the file MISSING, while the stamp still lists it; and a stamp that omits a
 #      shipped path is itself drift, because a record cannot report a file it does not list.
+
+# ⛔ ON LINUX, 31 OF THESE ASSERTIONS USED TO SKIP AND THE SUITE STILL EXITED 0 (#2044 finding 9).
+# `DEPLOY_OK=0` whenever `uname != Darwin`, so sections 4–8 were skipped and the summary printed PASS
+# — in the ONLY lane that runs CI. The suite's headline claims were therefore unverified where the
+# merge is gated. The fix is not to hide the skips: `install.sh` really does refuse non-Darwin, so a
+# full deploy cannot be asserted on Linux. It is to assert the guarantees that need NO installer,
+# NO launchd and NO Darwin — the plan/refusal phase (#2) and the launchd classification (#7) — on
+# every platform, and to FAIL if that neutral path did not actually run (see `NEUTRAL_GATE`).
 
 set -uo pipefail
 
@@ -37,6 +49,9 @@ SELF="$HARNESS/harness.sh"
 GITTOP="$(git -C "$HARNESS" rev-parse --show-toplevel 2>/dev/null || true)"
 
 PASS=0; FAIL=0; SKIP=0
+# Set once the platform-neutral refusal path (#2) has actually executed. A suite that skips every
+# falsifiable assertion must not report success, so this is asserted at the end (#2044 finding 9).
+NEUTRAL_GATE=0
 ok()    { PASS=$((PASS + 1)); printf '  \033[32mPASS\033[0m  %s\n' "$1"; }
 bad()   { FAIL=$((FAIL + 1)); printf '  \033[31mFAIL\033[0m  %s\n' "$1"; }
 skipd() { SKIP=$((SKIP + 1)); printf '  \033[33mSKIP\033[0m  %s\n' "$1"; }
@@ -121,7 +136,58 @@ out="$("$SELF" drift 2>&1)"; rc=$?
 assert_eq "$rc" "2" "drift with no record exits 2 (cannot determine)"
 assert_contains "$out" "NOT a pass" "it says so — cannot-verify is not a pass"
 
-echo "== 2. deploy makes the box answerable"
+echo "== 2. deploy REFUSES before writing — on EVERY platform"
+# ⛔ THE TWO HEADLINE GUARANTEES, ASSERTED WHERE CI ACTUALLY RUNS (#2044 finding 9). Both live in the
+# plan/gate phase, before install.sh is ever invoked, so neither needs Darwin or launchd. The later
+# sections keep the same assertions for the full macOS deploy; these are the ones a Linux runner runs.
+printf '#!/usr/bin/env bash\nsleep 20\n' > "$O/orch-loop.sh"     # differs from the shipped copy
+printf '\n# stale: an older commit did not have this line\n' >> "$O/install.sh"
+bash "$O/orch-loop.sh" & STUB_PID=$!
+sleep 1
+out="$("$SELF" deploy 2>&1)"; rc=$?
+kill "$STUB_PID" 2>/dev/null; wait "$STUB_PID" 2>/dev/null
+assert_eq "$rc" "1" "deploy refuses while a controller executes orch-loop.sh"
+assert_contains "$out" "Nothing was written" "the refusal says nothing was written"
+# The half-deploy assertion: if deploy had written file-by-file it would already have repaired the
+# drifted install.sh by the time it noticed orch-loop.sh. It must still hold the stale bytes.
+if grep -qF '# stale: an older commit did not have this line' "$O/install.sh"; then
+  ok "the OTHER drifted file was NOT written (no half-deploy)"
+else
+  bad "install.sh was replaced before the refusal — the deploy is not all-or-nothing"
+fi
+cp "$HARNESS/install.sh" "$O/install.sh"; cp "$HARNESS/orch-loop.sh" "$O/orch-loop.sh"
+
+# ⛔ #2044 review finding 4, the destructive path. `deploy`/`restart` used to `rm -f` ANY top-level
+# `.sh` in $O the repo does not ship, with no allowlist and a `warn` on stdout as the only evidence —
+# and `restart`, the DOCUMENTED RECOVERY, performed the deletions. A file a human left there is not a
+# retired harness script. Removal must be an explicit request.
+printf '#!/usr/bin/env bash\n# a human put this here; the harness does not ship it\n' > "$O/keys.sh"
+out="$("$SELF" deploy 2>&1)"; rc=$?
+assert_eq "$rc" "1" "deploy refuses when \$O holds a script the harness does not ship"
+assert_contains "$out" "keys.sh" "the refusal NAMES the file it will not delete"
+assert_contains "$out" "--prune" "it names the explicit request that would delete it"
+assert_contains "$out" "Nothing was written" "…and says nothing was written"
+[ -f "$O/keys.sh" ] && ok "the file is still there (no side-effect deletion)" \
+  || bad "deploy deleted a file it was not asked to delete"
+# THE SAME GATE ON THE RECOVERY VERB, AND BEFORE ANYTHING IS STOPPED — a restart that stops the fleet
+# and only then discovers it would delete a file nobody agreed to delete is the reachable failure.
+out="$(STUB_LC=not-loaded "$SELF" restart 2>&1)"; rc=$?
+assert_eq "$rc" "1" "restart refuses too (it is the documented recovery, and it reached the deletions)"
+assert_absent "$out" "==> booting out" "…and refuses BEFORE touching launchd"
+assert_contains "$out" "keys.sh" "…naming the same file"
+[ -f "$O/keys.sh" ] && ok "restart did not delete it either" || bad "restart deleted a file it was not asked to delete"
+
+# …and the explicit request is HONOURED, exactly. `--prune` is the operator's decision, per run.
+out="$("$SELF" deploy --prune 2>&1)"; rc=$?
+assert_contains "$out" "prune plan (--prune): remove keys.sh" "--prune prints the plan before writing"
+[ -f "$O/keys.sh" ] && bad "--prune did not remove the named file" || ok "--prune removed EXACTLY the named file"
+assert_absent "$out" "refusing to deploy" "…and it is not the refusal path"
+# An option this verb does not know is a usage error, never silently ignored.
+run 2 "an unknown deploy option exits 2" "$SELF" deploy --frobnicate
+assert_contains "$LAST_OUT" "unknown option for deploy" "…and it names the option"
+NEUTRAL_GATE=1
+
+echo "== 3. deploy makes the box answerable"
 if [ "$DEPLOY_OK" -ne 1 ]; then
   skipd "deploy sections skipped: $WHY"
 elif [ -n "$GITTOP" ] && [ -n "$(git -C "$GITTOP" status --porcelain -- "$HARNESS" 2>/dev/null)" ]; then
@@ -136,7 +202,7 @@ else
   assert_contains "$out" "identical: supervisor.sh" "the versioned supervisor is part of the deployed surface"
   [ -f "$O/.agent-infra-stamp.json" ] && ok "the deploy wrote a provenance record" || bad "no provenance record after deploy"
 
-  echo "== 3. a stale deployed file is named, and the exit is non-zero"
+  echo "== 4. a stale deployed file is named, and the exit is non-zero"
   # Stands for "the deployed installer is an OLDER COMMIT's bytes" — the measured live state. Synthetic
   # rather than `HEAD~1` so the assertion does not depend on what the previous commit happened to touch.
   printf '\n# stale: an older commit did not have this line\n' >> "$O/install.sh"
@@ -145,30 +211,15 @@ else
   assert_contains "$out" "install.sh — the deployed copy DIFFERS" "it names the stale file"
   assert_contains "$out" "changed after it was recorded" "it names the hand edit that the payload hash caught"
 
-  echo "== 4. a script the harness no longer ships is named"
+  echo "== 5. a script the harness no longer ships is named"
   printf '#!/usr/bin/env bash\n# retired upstream\n' > "$O/run-wrapped.sh"
   out="$("$SELF" drift 2>&1)"; rc=$?
   assert_eq "$rc" "1" "an unshipped script in \$O makes drift exit 1"
   assert_contains "$out" "run-wrapped.sh — present in /" "it names the unshipped script"
   rm -f "$O/run-wrapped.sh"
-
-  echo "== 5. deploy is all-or-nothing: it refuses BEFORE writing"
-  # install.sh is drifted (section 3) AND orch-loop.sh will be made to differ under a running reader —
-  # if deploy wrote anything before noticing, the install.sh drift would be repaired. It must not be.
-  printf '#!/usr/bin/env bash\nsleep 20\n' > "$O/orch-loop.sh"     # differs from the shipped copy
-  bash "$O/orch-loop.sh" & STUB_PID=$!
-  sleep 1
-  out="$("$SELF" deploy 2>&1)"; rc=$?
-  kill "$STUB_PID" 2>/dev/null; wait "$STUB_PID" 2>/dev/null
-  assert_eq "$rc" "1" "deploy refuses while a controller executes orch-loop.sh"
-  assert_contains "$out" "Nothing was written" "the refusal says nothing was written"
-  if grep -qF '# stale: an older commit did not have this line' "$O/install.sh"; then
-    ok "the OTHER drifted file was NOT written (no half-deploy)"
-  else
-    bad "install.sh was replaced before the refusal — the deploy is not all-or-nothing"
-  fi
-  cp "$HARNESS/install.sh" "$O/install.sh"   # restore for the remaining sections
-  cp "$HARNESS/orch-loop.sh" "$O/orch-loop.sh"
+  # §4's stale edit is left in place ON PURPOSE for §5 (a second drift cause must not mask the first);
+  # restore it here so §6 can assert a full-surface MATCH rather than re-testing §4.
+  cp "$HARNESS/install.sh" "$O/install.sh"
 
   echo "== 6. the record covers the NON-.sh shipped surface, and names its absence (#1960)"
   # ⛔ THE DEFECT THIS SECTION EXISTS FOR, measured on the laptop 2026-10-18. `$O/gh-limit.py` was ABSENT
@@ -225,22 +276,24 @@ else
   assert_eq "$rc" "2" "a record whose count disagrees with its list is UNKNOWN (exit 2)"
   assert_contains "$out" "count and its own list disagree" "…and it says which two claims disagree"
   cp "$SB/stamp.keep" "$stamp"
-
-  echo "== 7. verify distinguishes RED from UNKNOWN"
-  # ⛔ THE CLASSIFICATION IS WHAT IS ASSERTED, not the aggregate exit code: in a sandbox $O that has no
-  # live stack, "no controller running" is RED no matter what launchd says, so the aggregate would be 1
-  # in both cases and the assertion would pass without exercising anything. What must differ is how the
-  # LAUNCHD component is classified — and "absent" and "unreadable" are different facts about different
-  # worlds (launchd answered vs launchd did not).
-  out="$(STUB_LC=not-loaded "$SELF" verify 2>&1)"; rc=$?
-  assert_contains "$out" "is NOT loaded" "an absent label is reported as NOT loaded (RED)"
-  assert_absent "$out" "launchd's state for $LABEL could not be read" "…and does not claim the read failed"
-  [ "$rc" -ne 0 ] && ok "verify exits non-zero when the job is absent" || bad "verify exited 0 with the job absent"
-  out="$(STUB_LC=silent-fail "$SELF" verify 2>&1)"; rc=$?
-  assert_contains "$out" "UNKNOWN launchd's state for" "an unreadable domain is classified UNKNOWN, not RED"
-  assert_absent "$out" "is NOT loaded" "…and 'not loaded' is NOT asserted from a read that failed"
-  [ "$rc" -ne 0 ] && ok "verify exits non-zero on an unreadable domain (it is never a pass)" || bad "verify exited 0 with launchd unreadable"
 fi
+
+echo "== 7. verify distinguishes RED from UNKNOWN"
+# ⛔ PLATFORM-NEUTRAL, and moved out of the Darwin gate for that reason (#2044 finding 9): the
+# classification is produced by the launchd probe + the drift verdict, neither of which needs install.sh.
+# The CLASSIFICATION IS WHAT IS ASSERTED, not the aggregate exit code: in a sandbox $O that has no live
+# stack, "no controller running" is RED no matter what launchd says, so the aggregate would be 1 in
+# both cases and the assertion would pass without exercising anything. What must differ is how the
+# LAUNCHD component is classified — and "absent" and "unreadable" are different facts about different
+# worlds (launchd answered vs launchd did not).
+out="$(STUB_LC=not-loaded "$SELF" verify 2>&1)"; rc=$?
+assert_contains "$out" "is NOT loaded" "an absent label is reported as NOT loaded (RED)"
+assert_absent "$out" "launchd's state for $LABEL could not be read" "…and does not claim the read failed"
+[ "$rc" -ne 0 ] && ok "verify exits non-zero when the job is absent" || bad "verify exited 0 with the job absent"
+out="$(STUB_LC=silent-fail "$SELF" verify 2>&1)"; rc=$?
+assert_contains "$out" "UNKNOWN launchd's state for" "an unreadable domain is classified UNKNOWN, not RED"
+assert_absent "$out" "is NOT loaded" "…and 'not loaded' is NOT asserted from a read that failed"
+[ "$rc" -ne 0 ] && ok "verify exits non-zero on an unreadable domain (it is never a pass)" || bad "verify exited 0 with launchd unreadable"
 
 echo "== 8. a restart that does not come up is NOT a successful restart"
 # The launchctl stub makes every launchd verb "succeed" while the job never appears — which is exactly
@@ -265,6 +318,17 @@ done
 run 2 "an unknown verb exits 2" "$SELF" frobnicate
 
 echo
+echo "== the neutral path RAN — a suite that skips everything is not a pass (#2044 finding 9)"
+# ⛔ THE ANTI-VACUITY GUARD, ONE LAYER ABOVE THE PER-ASSERTION SKIPS. `selftest.sh` §P and CI only see
+# this file's exit code, so a future change that made every falsifiable path conditional (a new
+# `DEPLOY_OK` precondition, a `command -v` that is absent on the runner) would turn this suite back
+# into a green no-op. This assertion is what fails instead.
+if [ "$NEUTRAL_GATE" -eq 1 ]; then
+  ok "the platform-neutral refusal path executed (deploy refuses before writing on THIS platform)"
+else
+  bad "the neutral refusal path did not run — every falsifiable assertion was skipped"
+fi
 printf '==> %d passed, %d failed, %d skipped\n' "$PASS" "$FAIL" "$SKIP"
+[ "$SKIP" -gt 0 ] && printf '==> %d skipped: the full macOS deploy sections; the plan/refusal and\n    verify-classification guarantees were asserted above on THIS platform.\n' "$SKIP"
 [ "$FAIL" -eq 0 ] || exit 1
 exit 0

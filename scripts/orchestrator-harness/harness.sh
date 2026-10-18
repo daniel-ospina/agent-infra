@@ -6,7 +6,10 @@
 #   harness.sh verify      read-only ASSERTION — exit 0 healthy · 1 unhealthy · 2 cannot determine
 #   harness.sh drift       does the deployed copy match the repo? per-file, with --all
 #   harness.sh deploy      mirror the repo's harness dir into $O + render the plist + record provenance
-#   harness.sh restart     STOP the stack → deploy → start → VERIFY   ← the whole thing, one command
+#   harness.sh deploy --prune
+#                          …and remove files in $O this harness does not ship (see PRUNE below)
+#   harness.sh restart [--prune]
+#                          STOP the stack → deploy → start → VERIFY   ← the whole thing, one command
 #   harness.sh stop        stop the whole stack (verified; never signals a pid it did not identify)
 #
 # WHY THIS EXISTS (2026-10-18, owner's requirement verbatim):
@@ -40,6 +43,17 @@
 #   0  ok             1  refused / unhealthy (one actionable line on stderr)   2  cannot determine
 # ⛔ 2 IS NOT 1 AND NEITHER IS 0. "I could not read the datum" is never a pass in this repo
 # (agent-infra#1745). A verb that cannot answer says so and exits 2.
+#
+# ⛔ PRUNE: DELETING FROM A LIVE DIRECTORY IS NEVER A SIDE EFFECT (#2044 review finding 4).
+# `$O` is not a build output directory — it is the LIVE harness a running fleet execs by ABSOLUTE
+# PATH (`bash $O/orch-loop.sh`, `bash $O/bg/digest.sh`, …). Mirroring means a file the repo no longer
+# ships must not stay INVOCABLE, so `deploy` has to be able to remove one; but "not shipped by the
+# repo" is not the same as "retired": a `keys.sh`, a one-off `fix-2044.sh` or a hotfix copy is a
+# HUMAN'S file in a directory the repo does not own, and the first version of this verb deleted it
+# with a `warn` on stdout as its only evidence. Removal is now an EXPLICIT REQUEST: the plan is
+# printed, and without `--prune` the verb REFUSES BEFORE WRITING ANYTHING (exit 1), naming every
+# file it would have deleted and the exact command to delete them. `--prune` reproduces the previous
+# mirror semantics deliberately, per invocation — never as an ambient default.
 #
 # Runs from the REPO or from the deployed $O: `status`/`verify`/`drift` work from either, since
 # check-deployed-drift.sh finds the checkout itself. `deploy`/`restart` REFUSE from a non-checkout —
@@ -275,6 +289,8 @@ cmd_verify() { # machine-readable-ish: one verdict line per component, then the 
 # rule orchestrator-bringup.sh applies). Atomic per file: stage next to the target, then rename, so a
 # lane that spawns `bash $O/<worker>.sh` in the window never reads a half-written file.
 DEPLOYED=0; REMOVED=0
+# Removal is opt-in per invocation; see the PRUNE paragraph in the header. 0 = refuse to delete.
+PRUNE=0
 
 # ── WHAT SHIPS IS DATA (#1960) ────────────────────────────────────────────────────────────────
 # ⛔ THE COPY LIST IS NOT A GLOB. It was `"$HERE"/*.sh "$HERE"/*.template "$HERE"/port-provenance.txt`,
@@ -299,6 +315,22 @@ load_shipped() {
 is_shipped() { # <relative path> — exact membership of the data list, never a glob
   case $'\n'"$SHIPPED_LIST"$'\n' in *$'\n'"$1"$'\n'*) return 0 ;; esac
   return 1
+}
+
+# ⛔ THE GATE, NOT A WARNING (#2044 review finding 4). Asked BEFORE anything is written, by BOTH
+# verbs that deploy — because `restart` is the DOCUMENTED RECOVERY and it reached the deletions as
+# part of the recovery, so a human repairing a box would have lost their own files without ever
+# typing "deploy". Refusing here costs nothing: nothing has been stopped or written yet.
+prune_gate() {
+  load_shipped || refuse "no SHIPPED-SURFACE beside $HERE — without the data list of what this harness ships I cannot tell a RETIRED script from a HUMAN's file in $O, so I refuse to delete anything. Nothing was written. Restore scripts/orchestrator-harness/SHIPPED-SURFACE and re-run."
+  local list
+  list="$(unshipped_in_o | tr '\n' ' ')"; list="${list% }"
+  [ -n "$list" ] || return 0
+  if [ "$PRUNE" -eq 1 ]; then
+    say "prune plan (--prune): remove $list from $O"
+    return 0
+  fi
+  refuse "refusing to deploy: $O holds '$list', which this harness does not ship. $O is the LIVE directory the running fleet execs by absolute path, and 'not shipped by this repo' does not mean 'retired' — a keys.sh, a one-off fix-*.sh or a hotfix copy is your file, and this verb will not delete it as a side effect. Nothing was written. If those files ARE retired harness scripts, re-run the same command with --prune to remove exactly them; otherwise move them out of $O."
 }
 # ⛔ WHAT THE DEPLOYMENT MAY HOLD AND THE REPO MAY NOT, scoped to what the harness EXECUTES. The mirror
 # rule exists so a retired or hand-placed file cannot stay INVOCABLE, so the scan covers the two kinds
@@ -359,6 +391,13 @@ SHIPPEDHERE
 }
 deploy_apply() {
   local f tmp d
+  # ⛔ THE SECOND LOCK ON THE SAME DOOR. `prune_gate` is what the operator meets; this is what any
+  # FUTURE caller meets. It runs BEFORE the copy loop so "nothing was written" stays true when it
+  # fires, and it exists because the destructive line below is the one line in this file that cannot
+  # be undone — a guard that only sits upstream is a guard one new caller away from being absent.
+  if [ "$PRUNE" -ne 1 ] && [ -n "$PLAN_REMOVE" ]; then
+    refuse "internal guard: $PLAN_REMOVE is planned for removal but --prune was not passed — refusing before writing anything (removal must be an explicit request; see prune_gate)"
+  fi
   for f in $PLAN_CHANGED; do
     d="${f%/*}"
     if [ "$d" = "$f" ]; then d="."; else
@@ -375,7 +414,7 @@ deploy_apply() {
     ok "deployed $f"; DEPLOYED=$((DEPLOYED + 1))
   done
   for f in $PLAN_REMOVE; do
-    warn "removing $O/$f — the harness no longer ships it (a renamed or retired script must not stay invocable)"
+    warn "removing $O/$f — --prune was given and the harness does not ship it (a renamed or retired script must not stay invocable)"
     rm -f "$O/$f"; REMOVED=$((REMOVED + 1))
   done
   say "deploy: $DEPLOYED file(s) updated, $REMOVED removed"
@@ -426,6 +465,7 @@ run_install() { # [--restart]
 
 cmd_deploy() {
   resolve_render_params
+  prune_gate      # ⛔ refuses an unrequested removal BEFORE the first write (finding #4)
   deploy_plan
   deploy_apply
   run_install
@@ -499,6 +539,10 @@ cmd_restart() {
   # knowable at argv time. A restart that can fail must fail while everything is still running.
   [ -n "$GITROOT" ] || refuse "no checkout at $HERE — restart must run from the repo (deploy has nothing to deploy from a deployed copy). Nothing was stopped."
   resolve_render_params   # read-only: refuse a bad REPO/TEMPLATE BEFORE stopping anything
+  # ⛔ AND THE SAME FOR AN UNREQUESTED DELETION. `restart` is the recovery verb, so it must not stop
+  # the fleet and *then* discover that the only way forward would delete a file nobody agreed to
+  # delete. Read-only, and a refusal here leaves the stack exactly as it was.
+  prune_gate
   say "==> restarting the harness as one act: stop → deploy → render → start → verify"
   say "    O=$O label=$LABEL ($LABEL_SOURCE)$([ -n "$GITROOT" ] && printf ' repo=%s' "$GITROOT") ref=$REF"
   # stop is a function that exits, so run the stop half in a subshell-free way: inline the same steps.
@@ -539,9 +583,15 @@ case "${1:-}" in
   status)  cmd_status ;;
   verify)  cmd_verify ;;
   drift)   shift; cmd_drift "${1:-}" ;;
-  deploy)  cmd_deploy ;;
+  deploy)
+    shift
+    for _a in "$@"; do case "$_a" in --prune) PRUNE=1 ;; *) printf 'harness: unknown option for deploy: %s\n\n' "$_a" >&2; usage; exit 2 ;; esac; done
+    cmd_deploy ;;
   stop)    cmd_stop ;;
-  restart) cmd_restart ;;
+  restart)
+    shift
+    for _a in "$@"; do case "$_a" in --prune) PRUNE=1 ;; *) printf 'harness: unknown option for restart: %s\n\n' "$_a" >&2; usage; exit 2 ;; esac; done
+    cmd_restart ;;
   -h|--help|help) usage; exit 0 ;;
   '')      usage; exit 2 ;;
   *)       printf 'harness: unknown verb %s\n\n' "$1" >&2; usage; exit 2 ;;
