@@ -357,8 +357,16 @@ esac
 # `uv` lens already paid for this exact trap — see SCOUT_UV / agent-infra#1748 just above. The block
 # below is the shipped guard VERBATIM, so deleting the guard fails this case; a missing extraction is
 # a FAILURE, never a skip.
-awk '/^  # ⛔ jq IS A PREREQUISITE OF THE LISTING READ/{f=1} f{print} f&&/^  echo "\[refresh\] check: jq=/{exit}' "$REFRESH" > "$T/jqguard.sh"
-if [ -s "$T/jqguard.sh" ] && grep -q 'command -v jq' "$T/jqguard.sh"; then
+# ⛔ THE END ANCHOR IS THE *NEXT SECTION*, not the guard's own output line: an anchor inside the
+# block makes a harmless reword of that line run the extraction to EOF, where `command -v jq` matches
+# `rest_list`'s own probe far below — the "guard present" branch then executes the whole script and
+# the case fails for a reason that has nothing to do with jq (measured: 3 red assertions reading
+# `MODE: unbound variable`). The independent marker cannot be moved by editing the guard, the size
+# bound refuses an over-run, and the discriminator is the guard's own verdict text.
+awk '/^  # ⛔ jq IS A PREREQUISITE OF THE LISTING READ/{f=1} f{print} f&&/^  # ── the CROSS-BOX CLAIM REGISTRY/{exit}' "$REFRESH" \
+  | sed '$d' > "$T/jqguard.sh"
+if [ -s "$T/jqguard.sh" ] && [ "$(wc -l < "$T/jqguard.sh")" -le 20 ] \
+   && grep -q 'NOT PROVISIONABLE' "$T/jqguard.sh"; then
   # A wrapper, because the block ends in `return` and names the script's own exit code.
   { printf 'set -u\nEXIT_NOT_PROVISIONABLE=3\ncmd_check_jq() {\n'; cat "$T/jqguard.sh"; printf '}\ncmd_check_jq\n'; } > "$T/jqguard-run.sh"
   # An EMPTY PATH dir: `command -v jq` is unsatisfiable for real, with nothing host-dependent in it.
@@ -1838,7 +1846,7 @@ fi
 # at 0 lines. REST is a SEPARATE bucket, so the same box can list while GraphQL is exhausted. (a)
 # proves that; (b) proves the other half — when REST fails too, the pass must FAIL rather than hand the
 # reaper an empty `.open_iss`/`.pr_brs` or a pool that silently drops a tier.
-# ⛔ WHAT IT DOES **NOT** PROVE, stated because an earlier draft of this heading overclaimed it: the
+# ⛔ WHAT IT DOES **NOT** PROVE: the
 # per-candidate PRE-FLIGHT (`tools/collision_preflight.py`) still reads `gh issue view` / `gh pr list`
 # and is fail-closed, so on a box where GraphQL is refused this change turns "the pool could not be
 # READ" into "the pool was read and the pre-flight could not CERTIFY" — a named, later failure, NOT
@@ -2031,6 +2039,25 @@ SH
   [ "$rc" -ne 0 ] && [ "$perm_msg" -eq 1 ] \
     && ok "rest_fail names a PERMISSION 403 as such, and does not call it a rate limit" \
     || bad "rest_fail mis-diagnosed a permission 403: '$(head -1 "$HD403/err")'"
+  # ── A RATE LIMIT IS NOT ALWAYS A 403, AND THE LOG MUST NOT INVENT ONE. GitHub answers secondary
+  #    limits with 429; the branch used to print a hardcoded "HTTP 403" and drop the provider's text,
+  #    which is the only evidence of the real status. Both halves are asserted: the status comes from
+  #    the message, and the message is carried.
+  HD429="$T/restcase-429"; mkdir -p "$HD429"
+  printf '#!/bin/bash\necho "gh: You have exceeded a secondary rate limit (HTTP 429)" >&2\nexit 1\n' > "$HD429/gh"
+  chmod +x "$HD429/gh"
+  PATH="$HD429:$PATH"; export PATH
+  drv_out issues --repo acme/widget --limit 10 > /dev/null 2>"$HD429/err"; rc=$?
+  PATH="${PATH#$HD429:}"; export PATH
+  [ "$rc" -ne 0 ] && grep -q 'RATE-LIMITED (HTTP 429' "$HD429/err" 2>/dev/null \
+    && ok "rest_fail reads a 429 rate limit AS a 429 (not a hardcoded 403)" \
+    || bad "rest_fail mis-stated a 429 rate limit: '$(head -1 "$HD429/err")'"
+  grep -q 'HTTP 403' "$HD429/err" 2>/dev/null \
+    && bad "rest_fail claimed HTTP 403 for a 429 — the log now names a cause the provider never gave" \
+    || ok "rest_fail does not claim HTTP 403 for a 429"
+  grep -q 'secondary rate limit' "$HD429/err" 2>/dev/null \
+    && ok "rest_fail carries the provider's own words through the rate-limit branch" \
+    || bad "rest_fail dropped the provider's message in the rate-limit branch: '$(head -1 "$HD429/err")'"
   HD404="$T/restcase-generic"; mkdir -p "$HD404"
   printf '#!/bin/bash\necho "gh: something else went wrong" >&2\nexit 1\n' > "$HD404/gh"
   chmod +x "$HD404/gh"

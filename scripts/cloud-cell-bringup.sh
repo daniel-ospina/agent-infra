@@ -233,8 +233,11 @@ setup_home() {
 check_tools() {
   local missing=""
   # ⛔ jq IS A RUNTIME DEPENDENCY OF THE HARNESS ITSELF since the listings moved to REST (#1962):
-  # `rest_list` assembles and projects every page with the jq BINARY (until then every harness jq use
-  # was the CLI's own --jq, so jq need not have been installed). A cell without it is certified here
+  # `rest_list` assembles and projects every page with the jq BINARY, on the DISPATCH path — and it
+  # probes for it rather than assuming it, so a cell without it is refused instead of reading
+  # `queue=UNREADABLE` for ever. (jq was already used by the gh-rest adapter, `gh-rest/gh:229,238`,
+  # but install.sh never resolved it into DAEMON_PATH, so that dependence was silently unmet on a
+  # host without jq on the launchd PATH.) A cell without it is certified here
   # and then reports `queue=UNREADABLE` on every refresh — merge-only — which `check_dispatch` catches
   # one step later; catching it in the toolchain step keeps the diagnostic where the operator looks.
   for c in git gh node python3 uv tmux jq; do

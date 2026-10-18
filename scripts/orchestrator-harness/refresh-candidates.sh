@@ -627,12 +627,18 @@ lists_transport_note() {  # once per pass: which transport the LISTINGS use, and
 # rest_fail <kind> <page> <stderr-file> — ONE line the caller prefixes. It separates "starved" from
 # "broken", and it does NOT call every 403 a rate limit.
 rest_fail() {
-  local kind="$1" page="$2" errf="$3" msg core
+  local kind="$1" page="$2" errf="$3" msg core status
   msg="$(tr '\n' ' ' < "$errf" 2>/dev/null | tr -s ' ' | cut -c1-240)"
   case "$msg" in
     *"rate limit"*|*"Rate limit"*|*"API rate limit"*)
       core="$(gh api rate_limit 2>/dev/null | jq -r '.resources.core.remaining // "unknown"' 2>/dev/null)"
-      echo "REST $kind listing FAILED — HTTP 403, the REST bucket refused it as RATE-LIMITED (core remaining=${core:-unknown}); this is NOT an empty listing" >&2 ;;
+      # ⛔ THE STATUS IS READ FROM THE PROVIDER'S OWN MESSAGE, NEVER ASSUMED. GitHub answers a rate
+      # limit with 403 AND with 429 (secondary limits), so a hardcoded "HTTP 403" would mislabel the
+      # one case where the provider's text is the only evidence there is — and dropping that text is
+      # the same "naming the wrong cause closes the investigation" failure the 403 branch below is
+      # written to avoid. `gh` prints the status in the same message ("… (HTTP 429)").
+      status="$(printf '%s' "$msg" | sed -n 's/.*(HTTP \([0-9][0-9]*\)).*/\1/p')"
+      echo "REST $kind listing FAILED — the REST bucket refused it as RATE-LIMITED (HTTP ${status:-?}, core remaining=${core:-unknown}): $msg; this is NOT an empty listing" >&2 ;;
     # ⛔ A 403 IS NOT NECESSARILY A RATE LIMIT. `gh api` answers a PERMISSION refusal with a 403 too
     # ("Resource not accessible by integration"), and naming the wrong cause closes the investigation
     # — worse than naming none. The provider's own words are carried through, and both causes named.
@@ -758,11 +764,10 @@ rest_list() {
     # returns exactly `per_page` rows on every page but the last, so `rel="next"` together with FEWER
     # rows means the page was filtered or stripped — and returning it at rc 0 is a truncated listing: a
     # short `.pr_brs` un-blacklists issues that already have a PR (#1705).
-    # ⛔ THE EXEMPTION IS A FILLED WINDOW, NOT A PAGE POSITION. An earlier version gated this on
-    # `page < pages`, which is FALSE on the last page of every multi-page window — so `--limit 500`
-    # with 100 rows on pages 1-4 and 40 on page 5 returned 440 rows at rc 0 while page 5 still
-    # advertised a next page (measured). The question is not where the page sits but whether the
-    # caller's window was FILLED: `want` rows are still missing after this page, so a short page that
+    # ⛔ THE EXEMPTION IS A FILLED WINDOW, NOT A PAGE POSITION. `page < pages` is FALSE on the last
+    # page of every multi-page window, so gating on it would return 440 rows at rc 0 for `--limit 500`
+    # with 100 rows on pages 1-4 and 40 on page 5, while page 5 still advertised a next page. The
+    # question is not where the page sits but whether the caller's window was FILLED: `want` rows are still missing after this page, so a short page that
     # has more behind it is a truncation — while `--limit 10` against a 40-row page is not (40 >= 10:
     # the window is full, and the next page is one the caller never asked for).
     want=$(( limit - 100 * (page - 1) ))
@@ -782,18 +787,27 @@ rest_list() {
   # space per repo, and that is precisely why these rows have to be dropped HERE: nothing downstream
   # can tell a PR row from an issue row.
   # Dropped for `kind=issues` ONLY: `.pr_brs` is kind=pulls and the #1705 `has_pr` check needs those
-  # rows. Dropped here ONCE FOR THIS FILE (the gh-rest adapter drops the same rows, `gh-rest/gh:156`;
+  # rows. Dropped here ONCE FOR THIS FILE (the gh-rest adapter drops the same rows, `gh-rest/gh:157`;
   # that twin is why BOTH surfaces must be changed together if the rule ever moves). ⛔ `--limit` IS A RAW-ROW BUDGET AND THE PROJECTED TOTAL IS SMALLER — stated with the
-  # measurement, because a review cycle "corrected" this the wrong way and a comment that lies about
-  # the window is worse than none: the page budget is `ceil(limit/100)` RAW rows (the loop above), and
-  # PRs are dropped only here, so a 500 window returns 500 minus however many pull requests were
-  # inside it. Driven against the real API: tortoise `--limit 500` -> 485 rows, agent-infra -> 454,
-  # where the pre-change listing returned 500 (it excludes pull requests by definition). The
-  # divergence is DELIBERATE and conservative: `.pr_brs` (kind=pulls) is unfiltered, so the #1705
-  # `has_pr` check is unaffected; `.open_iss` only NARROWS (fewer un-blacklists, never more); and a
-  # tier's window is re-read every cycle, so a candidate past the window is picked up next pass.
-  # (Fetching `limit` PROJECTED rows would mean paging past the budget — the shared core budget this
-  # change exists to protect; the twin adapter stops at the same place, `gh-rest/gh:157-158`.)
+  # measurement, because a comment that lies about the window is worse than none: the page budget is
+  # `ceil(limit/100)` RAW rows (the loop above), and PRs are dropped only here, so a 500 window
+  # returns 500 minus however many pull requests were inside it. Driven against the real API:
+  # tortoise `--limit 500` -> 485 rows, agent-infra -> 454, where the pre-change listing returned 500
+  # (it excludes pull requests by definition).
+  # ⛔ WHAT THAT COSTS, said plainly rather than softened: the endpoint's default order is created
+  # DESCENDING (verified against the live API: a 500 read returned 1993 -> 961), so the window keeps
+  # the NEWEST rows and an issue pushed out of it does not come back on the next pass — it moves
+  # further out as the board grows. That is the opposite end from the one the pool prefers
+  # (`sort -k1,1n -k2,2n` at the tier ranking is OLDEST-FIRST), so a repo with more than 500 open
+  # issues would lose its oldest ones from `.open_iss` permanently. Accepted here because it only
+  # NARROWS: fewer issues are visible to the reaper, so fewer un-blacklists (never more), and the
+  # three TIER queries carry `labels=`, so their window is the labelled subset, not this one.
+  # `.pr_brs` (kind=pulls) is unfiltered, so the #1705 `has_pr` check is unaffected.
+  # The alternative — fetching `limit` PROJECTED rows — means paging past the budget on the shared
+  # core bucket this change exists to protect. The gh-rest adapter makes exactly that trade the other
+  # way (`gh-rest/gh:229,238` page the whole collection, then `:157` drops PR rows and `:158` slices
+  # the projection), so the two surfaces differ deliberately: the adapter bounds its OUTPUT, this
+  # helper bounds its SPEND.
   jq -r -s --arg kind "$kind" --argjson limit "$limit" \
      'add // [] | (if $kind == "issues" then map(select(has("pull_request") | not)) else . end) | .[0:$limit] | '"$prog" \
      "$tmp"/p*.json
