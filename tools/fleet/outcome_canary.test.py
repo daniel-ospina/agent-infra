@@ -1900,6 +1900,159 @@ def test_a_fixture_expectation_naming_an_unknown_check_is_a_mismatch():
 
 
 @test
+def test_the_WIRED_machine_carries_o_dir_so_the_heartbeat_leg_works():
+    """The respawn proof is `log_advanced or hb_advanced`, and `_heartbeat_epoch` needs `machine.o_dir`.
+    `main` wired `log_path`, `tail_lines` and `controller_paths` but NOT `o_dir` (only `collect_live`
+    set it), so the heartbeat leg was DEAD in the shipped CLI while the suite stayed green — its test
+    hands the function a fake that already carries `o_dir`. On a high-load cell a successful respawn
+    cannot write the log inside the 40 s bound, so the failure mode is a SUCCESSFUL respawn reported
+    and SENT as `RESPAWN DID NOT TAKE`."""
+    m = load()
+    cfg = m.cfg_from_dict({"o_dir": "/O"})
+    mach = m.build_machine(cfg)
+    assert mach.o_dir == "/O", mach.o_dir
+    assert mach.log_path == cfg.log_path and mach.tail_lines == 6000
+    # …and the heartbeat epoch is actually reachable through that object
+    seen = {}
+
+    def fake_sh(cmd, timeout=None):
+        seen["cmd"] = cmd
+        return (0, "1792344305")
+
+    mach.sh = fake_sh
+    assert m._heartbeat_epoch(mach) == 1792344305, seen.get("cmd")
+    assert "heartbeat" in seen["cmd"], seen["cmd"]
+
+
+@test
+def test_a_lander_decision_from_ANOTHER_repo_does_not_vouch_for_this_repos_PR():
+    """`armed`/`railed` were matched to PRs by NUMBER alone and the log's own repo was never compared
+    with `--repo`. Measured on this Mac: the controller log names daniel-ospina/tortoise 972 times and
+    daniel-ospina/agent-infra zero times, its plist says OR=tortoise — and `--repo agent-infra` read
+    PASS/LANDERS_ARMED off tortoise's rail line. Mirror direction: a false LANDER_EXPIRED."""
+    m = load()
+    d = fx("healthy")
+    prs = [{"number": 900, "merge_state_status": "CLEAN", "checks_green": True, "probed": True,
+            "auto_armed": False, "draft": False, "review_decision": "APPROVED"}]
+    d["facts"]["github"].update({"open_prs": prs, "open_pr_count": 1})
+    d["facts"]["log_events"]["railed"] = [
+        {"raw": "#900 PENDING (rail mode)", "pr": 900, "age_s": 60, "ts": 1792327000}]
+    d["facts"]["log_events"]["armed"] = []
+    d["facts"]["log_events"]["repo"] = [
+        {"raw": "[req] daniel-ospina/tortoise: required checks from branch protection",
+         "repo": "daniel-ospina/tortoise", "age_s": 60, "ts": 1792327000}]
+    cfg = m.cfg_from_dict({"repo": "daniel-ospina/agent-infra"})
+    v = [x for x in m.evaluate(d["facts"], cfg) if x.name == "landers"][0]
+    # the rail line belongs to tortoise → it cannot arm agent-infra's #900
+    assert v.status != m.PASS, (v.status, v.variant, v.evidence)
+    assert "ANOTHER REPO" in v.evidence, v.evidence
+    assert "tortoise" in v.evidence, v.evidence
+    # the same log for its OWN repo vouches normally
+    cfg2 = m.cfg_from_dict({"repo": "daniel-ospina/tortoise"})
+    v = [x for x in m.evaluate(d["facts"], cfg2) if x.name == "landers"][0]
+    assert (v.status, v.variant) == (m.PASS, "LANDERS_ARMED"), (v.status, v.variant, v.evidence)
+    # the ARMED direction is the same defect: a foreign repo's `auto-armed` line cannot arm this PR
+    d["facts"]["log_events"]["railed"] = []
+    d["facts"]["log_events"]["armed"] = [
+        {"raw": "#900 auto-armed", "pr": 900, "age_s": 60, "ts": 1792327000}]
+    v = [x for x in m.evaluate(d["facts"], cfg) if x.name == "landers"][0]
+    # MISSING, not EXPIRED: a foreign line may neither arm this PR (that would be a false PASS) nor
+    # claim its lander expired (that would be a false alarm). Pinning the VARIANT is what makes the
+    # difference between the two guards observable at all.
+    assert (v.status, v.variant) == (m.FAIL, "LANDER_MISSING"), (v.status, v.variant, v.evidence)
+    # …and for the log's OWN repo that same line is a genuine silent expiry (log says armed,
+    # GitHub says not armed) — which is what makes the cross-repo case a false verdict either way
+    v = [x for x in m.evaluate(d["facts"], cfg2) if x.name == "landers"][0]
+    assert (v.status, v.variant) == (m.FAIL, "LANDER_EXPIRED"), (v.status, v.variant)
+    d["facts"]["log_events"]["armed"] = []
+    d["facts"]["log_events"]["railed"] = [
+        {"raw": "#900 PENDING (rail mode)", "pr": 900, "age_s": 60, "ts": 1792327000}]
+    # …and a log that names no repo keeps working (identity unknown is not a mismatch)
+    d["facts"]["log_events"]["repo"] = []
+    v = [x for x in m.evaluate(d["facts"], cfg) if x.name == "landers"][0]
+    assert (v.status, v.variant) == (m.PASS, "LANDERS_ARMED"), (v.status, v.variant, v.evidence)
+
+
+@test
+def test_an_EMPTY_process_or_launchd_read_is_a_FAILED_READ_not_absence():
+    """`ps -Ao` prints at least one row on any live system, so empty-with-rc0 is a broken probe — and
+    reading it as "no such process" reached CONTROLLER_ABSENT, the ONLY state that respawns. The
+    re-measure guard uses the same probe and the same polarity, so it could not save it. This is the
+    doctrine `_json_list` already states for gh ("EMPTY STDOUT IS A FAILED READ")."""
+    m = load()
+    cfg = m.cfg_from_dict({"o_dir": "/O", "controller_paths": ["/O/orch-loop.sh"]})
+    mach = m.Machine(None)
+    mach.controller_paths = ["/O/orch-loop.sh"]
+    mach.sh = lambda cmd, timeout=None: (0, "")
+    assert mach.snapshot_controller()["ok"] is False, mach.snapshot_controller()
+    assert mach.snapshot_pane()["ok"] is False, mach.snapshot_pane()
+    assert mach.launchd_state("x")["loaded"] is None, mach.launchd_state("x")
+    # a real table still parses
+    mach.sh = lambda cmd, timeout=None: (
+        (0, "  1     0 /sbin/launchd\n  2     1 /bin/zsh") if "ps -Ao pid=,ppid=" in cmd
+        else (0, "  PANEL  0  com.eldato.orchestrator-loop"))
+    assert mach.snapshot_controller()["ok"] is True
+    # and the predicate must not resume on an unreadable table: it ABSTAINS, never respawns
+    facts = {"controller": {"ok": False, "pids": [], "error": "empty process table (rc=0)"},
+             "launchd": {"loaded": False, "pid": None}, "log": {"exists": True, "age_s": 5.0},
+             "log_events": {"headers": [{"raw": "h", "age_s": 5.0, "ts": 1}]}}
+    v = m.check_controller_cycling(facts, cfg)
+    assert (v.status, v.variant) == (m.INCONCLUSIVE, "PROCESS_TABLE_UNREADABLE"), (v.status, v.variant)
+    assert v.variant not in m.RESPAWN_TRIGGERS, v.variant
+
+
+@test
+def test_an_ABSENT_controller_ok_is_a_MISSING_read_not_an_empty_table():
+    """Every other collector gate in this file is `is not True`; `controller` used `is False`, so an
+    absent key read as a successful read of an empty table — and an empty table is the ONLY state
+    that respawns. The fixtures had no `ok` key at all, which is how it stayed invisible."""
+    m = load()
+    cfg = m.cfg_from_dict({})
+    d = fx("healthy")
+    del d["facts"]["controller"]["ok"]
+    v = [x for x in m.evaluate(d["facts"], cfg) if x.name == "controller_cycling"][0]
+    assert (v.status, v.variant) == (m.INCONCLUSIVE, "PROCESS_TABLE_UNREADABLE"), (v.status, v.variant)
+    d = fx("healthy")
+    del d["facts"]["pane"]["ok"]
+    v = [x for x in m.evaluate(d["facts"], cfg) if x.name == "pane_daemon"][0]
+    assert v.status == m.INCONCLUSIVE, (v.status, v.variant)
+
+
+@test
+def test_a_bad_fixture_path_is_a_USAGE_error_not_the_FAIL_exit_code():
+    """`run_static` raises FixtureError and `main` never caught it, so a typo'd --fixture printed a
+    traceback and exited 1 — the code the contract reserves for "at least one check FAILed". A
+    scheduler reads that as "the fleet failed" when nothing was evaluated at all."""
+    m = load() if False else None      # (the CLI is driven through run_cli below)
+    rc, out, err = run_cli(["--static", "--fixture", "/tmp/oc-definitely-missing-%d.json" % os.getpid()])
+    assert rc == 3, (rc, out[-200:], err[-200:])
+    assert "Traceback" not in err, err[-300:]
+
+
+@test
+def test_a_TRUNCATED_merged_page_does_not_read_as_nothing_merged():
+    """`gh pr list --state merged` is CREATED-desc (measured), so `--limit 100` bounds creation, not
+    merge recency: the 100 newest-created merged PRs span 7.6 days here, so a PR created 8+ days ago
+    and merged an hour ago sits outside the page and the count reads 0 — a false NO_PR_MERGED."""
+    m = load()
+    d = fx("healthy")
+    gh = d["facts"]["github"]
+    gh["prs_merged_in_window"] = 0
+    gh["merged_page_full"] = True
+    cfg = m.cfg_from_dict(d.get("config") or {})
+    v = [x for x in m.evaluate(d["facts"], cfg) if x.name == "pr_merged"][0]
+    assert (v.status, v.variant) == (m.INCONCLUSIVE, "MERGED_SURFACE_TRUNCATED"), (v.status, v.variant)
+    # an in-window merge on a full page is still a PASS: the datum is positive evidence
+    gh["prs_merged_in_window"] = 3
+    v = [x for x in m.evaluate(d["facts"], cfg) if x.name == "pr_merged"][0]
+    assert (v.status, v.variant) == (m.PASS, "MERGED"), (v.status, v.variant)
+    # and an un-truncated empty read is unchanged (still FAIL / IDLE as the fixture declared)
+    gh["merged_page_full"] = False
+    gh["prs_merged_in_window"] = 0
+    assert [x for x in m.evaluate(d["facts"], cfg) if x.name == "pr_merged"][0].status != m.PASS
+
+
+@test
 def test_a_lane_spawn_from_ANOTHER_batch_does_not_vouch_for_this_one():
     """⛔ THE SPAWN MUST BELONG TO THE BATCH BEING GRADED.
 
@@ -1983,9 +2136,21 @@ def test_the_QUEUE_STATE_record_outranks_a_header_that_is_one_refresh_old():
     f = facts({"path": "q", "ok": True, "raw": "READ(223) 1792326000", "age_s": 1200})
     v = [x for x in m.evaluate(f, cfg) if x.name == "queue_readable"][0]
     assert v.status == m.PASS, (v.status, v.variant, v.evidence)
-    # a state record with NO age cannot outrank anything (an unaged record is not "newer")
+    # ⛔ AN UNREADABLE RECORD WITH NO EPOCH IS STILL AUTHORITATIVE. Requiring an age demoted it and
+    # let the one-refresh-old header decide — the harness prints a bare token exactly when its epoch
+    # field is missing or torn, so this shape is real, and it reproduced the PASS/exit-0 it fixed.
     f = facts({"path": "q", "ok": True, "raw": "UNREADABLE", "age_s": None})
-    assert m.authoritative_queue_token(f, hdr)[2] == "cycle header"
+    assert m.authoritative_queue_token(f, hdr)[2] == "state/queue-state"
+    v = [x for x in m.evaluate(f, cfg) if x.name == "queue_readable"][0]
+    assert (v.status, v.variant) == (m.FAIL, "QUEUE_UNREADABLE"), (v.status, v.variant, v.evidence)
+    # An EMPTINESS read with NO age anywhere establishes nothing: STATE_FROZEN, not merely "loses
+    # the contest". (An unaged record whose header token DOES carry `(3m)` is still aged — the two
+    # clocks are read together and the older one wins — which is why the token below carries none.)
+    f = facts({"path": "q", "ok": True, "raw": "EMPTY", "age_s": None})
+    f["log_events"]["headers"] = [dict(hdr, raw="=== Sun Oct 18 07:47:44 EST 2026 load=10 lanes=0 "
+                                              "backlog=0 queue=EMPTY ===", queue_token="EMPTY")]
+    v = [x for x in m.evaluate(f, cfg) if x.name == "queue_readable"][0]
+    assert (v.status, v.variant) == (m.INCONCLUSIVE, "STATE_FROZEN"), (v.status, v.variant, v.evidence)
 
 
 @test
@@ -2930,6 +3095,39 @@ MUTATIONS = [
      "            exists = (present.strip().endswith(\"YES\")) if rc3 == 0 else None",
      "            exists = False",
      "test_a_log_that_cannot_be_stat_ed_is_unreadable_not_missing"),
+    ("an unaged queue record forfeits its authority",
+     "        if qs_age is None or hdr_age is None or qs_age < hdr_age:",
+     "        if qs_age is not None and (hdr_age is None or qs_age < hdr_age):",
+     "test_the_QUEUE_STATE_record_outranks_a_header_that_is_one_refresh_old"),
+    ("the wired machine does not carry o_dir",
+     "    m.o_dir = cfg.o_dir\n", "",
+     "test_the_WIRED_machine_carries_o_dir_so_the_heartbeat_leg_works"),
+    ("a foreign repo's rail decision counts as this repo's lander",
+     "        elif n in railed_log and not repo_mismatch:",
+     "        elif n in railed_log:",
+     "test_a_lander_decision_from_ANOTHER_repo_does_not_vouch_for_this_repos_PR"),
+    ("a foreign repo's armed decision counts as this repo's lander",
+     "        elif n in armed_log and not repo_mismatch:",
+     "        elif n in armed_log:",
+     "test_a_lander_decision_from_ANOTHER_repo_does_not_vouch_for_this_repos_PR"),
+    ("an empty process table is absence (it respawns)",
+     "        if rc != 0 or not (out or \"\").strip():\n"
+     "            return {\"ok\": False, \"pids\": [],",
+     "        if rc != 0:\n"
+     "            return {\"ok\": False, \"pids\": [],",
+     "test_an_EMPTY_process_or_launchd_read_is_a_FAILED_READ_not_absence"),
+    ("an absent controller.ok reads as an empty table",
+     "    if ctrl.get(\"ok\") is not True:",
+     "    if ctrl.get(\"ok\") is False:",
+     "test_an_ABSENT_controller_ok_is_a_MISSING_read_not_an_empty_table"),
+    ("a bad fixture path exits with the FAIL code",
+     "            print(\"outcome-canary: %s\" % exc, file=sys.stderr)\n            return 3",
+     "            print(\"outcome-canary: %s\" % exc, file=sys.stderr)\n            return 1",
+     "test_a_bad_fixture_path_is_a_USAGE_error_not_the_FAIL_exit_code"),
+    ("a truncated merged page reads as nothing merged",
+     "    if gh.get(\"merged_page_full\") and not (isinstance(n, int) and n > 0):",
+     "    if False:",
+     "test_a_TRUNCATED_merged_page_does_not_read_as_nothing_merged"),
     ("a lane spawn from ANOTHER batch vouches for this one",
      "        started = newest_with_age([e for e in all_started if _is_this_batch(e)], win)",
      "        started = newest_with_age(all_started, win)",

@@ -383,6 +383,12 @@ RE_DISPATCH_SKIPPED = re.compile(r"^\[dispatch\] skipped \((?P<why>.*)\)"
                                  r"(?:\s+lanes=\S+\s+workers=\S+)?\s*$")
 RE_ARMED = re.compile(r"^#(?P<pr>\d+) auto-armed\s*$")
 RE_RAILED = re.compile(r"^#(?P<pr>\d+) PENDING \(rail mode")
+# ⛔ THE LOG NAMES ITS OWN REPO, AND THE DECISIONS IN IT BELONG TO THAT REPO. `armed`/`railed` were
+# matched to PRs by NUMBER alone, never compared with `--repo`: measured on this Mac, the controller
+# log names daniel-ospina/tortoise 972 times and daniel-ospina/agent-infra zero times, its plist says
+# OR=tortoise, and `--repo agent-infra` still read PASS/LANDERS_ARMED off tortoise's rail line (mirror
+# direction: a false LANDER_EXPIRED). Same family as the cross-batch spawn and the cross-cell census.
+RE_LOG_REPO = re.compile(r"^(?:\[req\]|\[authority\])\s+(?P<repo>[\w.-]+/[\w.-]+):")
 
 # The refresh's own vocabulary (orch-loop.sh `queue_state_token`). One vocabulary, parsed not
 # re-invented: EMPTY / READ(n) / PARTIAL(<labels>) / UNREADABLE / UNKNOWN.
@@ -398,10 +404,15 @@ DOW = {"Mon": 0, "Tue": 1, "Wed": 2, "Thu": 3, "Fri": 4, "Sat": 5, "Sun": 6}
 
 # Zone abbreviations the loop's `date` can print, as SECONDS EAST OF UTC. ⛔ ONLY TOKENS THAT CANNOT
 # COLLIDE ARE HERE, and a token that is not here is NOT guessed at — it falls back to the local-time
-# reading. Deliberately ABSENT because they are ambiguous: `IST` (Irish/Indian/Israel), `CST`
-# (US Central / China Standard / Cuba), `BST` (British Summer / Bangladesh Standard), `AST` (Atlantic
-# / Arabia Standard). A wrong offset is worse than the fallback: mapping CST to US Central on a China
-# cell makes every header 14h in the future and `_age_of` answers UNKNOWN, i.e. a permanent false red.
+# reading. Deliberately ABSENT because they are ambiguous: `IST` (Irish/Indian/Israel), `BST`
+# (British Summer / Bangladesh Standard), `AST` (Atlantic / Arabia Standard). A wrong offset is worse
+# than the fallback: mapping one of those to the wrong reading makes a header hours off, `_age_of`
+# answers UNKNOWN, and the check is a permanent false red.
+# ⛔ `CST`/`CDT` ARE KEPT, AND THE AMBIGUITY IS STATED RATHER THAN HIDDEN: they are read as US
+# Central (this fleet's cell prints `CST`). A cell that prints `CST` meaning UTC+8 — China Standard —
+# must set `TZ` to a numeric form, because the local-time fallback would be wrong for a REMOTE box and
+# the table would be wrong for this one. Naming that here is how the adopter finds it before the
+# research has to rediscover it.
 TZ_OFFSETS = {
     "Z": 0, "UT": 0, "UTC": 0, "GMT": 0,
     "EST": -18000, "EDT": -14400, "CST": -21600, "CDT": -18000,
@@ -513,6 +524,7 @@ def parse_log(lines, now=None):
         "railed": [],
         "lane_started": [],
         "lane_failed": [],
+        "repo": [],
         "unparsed_headers": 0,
     }
     cur = None  # epoch of the enclosing header, or None when the header was unparseable
@@ -547,6 +559,7 @@ def parse_log(lines, now=None):
             ("armed", RE_ARMED),
             ("railed", RE_RAILED),
             ("lane_started", RE_LANE_STARTED),
+            ("repo", RE_LOG_REPO),
             ("lane_failed", RE_LANE_FAILED),
         ):
             mm = rx.match(line)
@@ -578,8 +591,9 @@ def parse_log(lines, now=None):
                 break
     if now is not None:
         for bucket in ("headers", "dispatch_ok", "dispatch_refused", "dispatch_empty",
-                       "dispatch_skipped", "armed", "railed", "lane_started", "lane_failed"):
-            for rec in ev[bucket]:
+                       "dispatch_skipped", "armed", "railed", "lane_started", "lane_failed",
+                       "repo"):
+            for rec in ev.get(bucket) or []:
                 rec["age_s"] = _age_of(now, rec.get("ts"))
     return ev
 
@@ -723,7 +737,10 @@ def check_controller_cycling(f, c):
     hb_txt = "heartbeat %s" % (_age_txt(hb.get("age_s")) if hb.get("age_s") is not None else "absent/unreadable")
 
     # ── ABSTAIN: the process table itself could not be read ──────────────────────────────
-    if ctrl.get("ok") is False:
+    # ⛔ ALLOW-LIST POLARITY, like every other read in this file: an ABSENT `ok` is a MISSING READ,
+    # not a successful one. `is False` made `{"controller": {}}` (a collector regression, or an
+    # injected facts dict) read as an EMPTY PROCESS TABLE, which is the one state that respawns.
+    if ctrl.get("ok") is not True:
         return V("controller_cycling", INCONCLUSIVE, "PROCESS_TABLE_UNREADABLE",
                  "process table read FAILED (%s)\nlaunchd %s: %s\n%s"
                  % (ctrl.get("error") or "no error recorded", lc, lc_txt, log_txt),
@@ -909,6 +926,12 @@ def check_queue_readable(f, c):
              % (hdr.get("raw"), raw_tok, state_txt, backlog))
 
 
+def _log_repo_of(f):
+    """The repo this cell's controller says it manages (from `[req]`/`[authority]` lines), or None."""
+    e = newest(((f.get("log_events") or {}).get("repo")) or [])
+    return (e or {}).get("repo")
+
+
 def _queue_age(f, c):
     """The age of THIS pool reading, and where it came from.
 
@@ -986,8 +1009,14 @@ def authoritative_queue_token(f, hdr):
     ("the fleet is BLIND, which is not 'nothing to do'") recorded as health. Measured on this box:
     header `queue=READ(218)` beside `state/queue-state: PARTIAL(P2-moderate)`.
 
-    Ties and unaged records resolve to the header (the documented shape); a state record that is
-    newer and readable wins, because it is what the fleet actually concluded.
+    ⛔ A RECORD THAT WAS READ AND PARSED IS AUTHORITATIVE EVEN WITH NO EPOCH. Requiring an age made
+    the fix cover only the shapes that carry one: the harness prints a bare token when its `$at`
+    field is missing or unparsable (a record `refresh-candidates.sh` calls "torn or hand-edited"), so
+    an UNREADABLE record with no epoch was silently DEMOTED and the one-refresh-old header decided —
+    the same PASS/READABLE + PASS/IDLE_EMPTY_POOL + exit 0, reached through the one shape the fix did
+    not cover, with the contradicting `UNREADABLE` printed bare in its own evidence. The age question
+    belongs to `_queue_stale(require_known=True)`, which already answers STATE_FROZEN for an unaged
+    EMPTINESS: an unaged record must lose its CLAIM, never its authority.
     """
     hdr_tok = parse_queue_token(hdr.get("queue_token") if hdr else "")
     qs = f.get("queue_state") or {}
@@ -997,7 +1026,9 @@ def authoritative_queue_token(f, hdr):
             and qs_tok["kind"] != "UNPARSEABLE"):
         hdr_age = hdr.get("age_s") if hdr else None
         qs_age = qs.get("age_s")
-        if qs_age is not None and (hdr_age is None or qs_age < hdr_age):
+        # A NEWER record always wins; an UNKNOWN age is not "older" — the record still holds the
+        # verdict the fleet wrote, and only its currency is in doubt (`_queue_stale` judges that).
+        if qs_age is None or hdr_age is None or qs_age < hdr_age:
             return qs_tok, qs_raw.split()[0] if qs_raw.split() else qs_raw, "state/queue-state"
     return hdr_tok, (hdr.get("queue_token") or "(absent)") if hdr else "(absent)", "cycle header"
 
@@ -1269,6 +1300,15 @@ def check_pr_merged(f, c):
     if isinstance(n, int) and n > 0:
         return V("pr_merged", PASS, "MERGED", ev)
     busy, why = _activity(f)
+    if gh.get("merged_page_full") and not (isinstance(n, int) and n > 0):
+        # A FULL, creation-ordered page cannot tell "nothing merged" from "merged PRs created before
+        # the page cut". Abstaining is the honest answer; a FAIL here would be a false alarm, and a
+        # PASS impossible.
+        return V("pr_merged", INCONCLUSIVE, "MERGED_SURFACE_TRUNCATED",
+                 ev + "\nthe merged list hit its 100-row page bound (it is creation-ordered), so a "
+                 "merge older than the page cut cannot be seen",
+                 "the merge population is truncated, so 'nothing merged in the window' is not "
+                 "established. Not green.")
     if isinstance(open_n, int) and open_n > 0:
         return V("pr_merged", FAIL, "NO_PR_MERGED", ev + "\nfleet activity: %s" % why,
                  "%d PR(s) are open and nothing merged in %.1fh. Every component can be 'up' while "
@@ -1290,7 +1330,7 @@ def check_pane_daemon(f, c):
     pane = f.get("pane") or {}
     pids = pane.get("pids") or []
     cmd = pane.get("cmd") or "cmux-tui"
-    if pane.get("ok") is False:
+    if pane.get("ok") is not True:
         return V("pane_daemon", INCONCLUSIVE, "PROCESS_TABLE_UNREADABLE",
                  "process table read failed: %s" % (pane.get("error") or "?"),
                  "whether the pane daemon is alive could not be established. Not green.")
@@ -1626,6 +1666,12 @@ def check_landers(f, c):
     # age before they count. The bound is the PR-scale window (`pr_window_s`), not the 3-cycle
     # `window_s`: a rail legitimately persists for hours, and a 12-minute bound would fail every
     # green PR on the box.
+    # ⛔ A DECISION WRITTEN BY ANOTHER REPO'S CONTROLLER IS NOT A LANDER FOR THIS REPO'S PR. A
+    # mismatch does not invalidate the GITHUB facts (which are read for `c.repo`), only the log's
+    # decisions — so it unprobes the candidates that need one and never invents a claim about a PR it
+    # did read. `PASS/NOTHING_GREEN` is untouched: "no PR is green+mergeable" needs no log at all.
+    log_repo = _log_repo_of(f)
+    repo_mismatch = bool(log_repo and c.repo and log_repo.lower() != c.repo.lower())
     armed_log = _in_window(events.get("armed"), c.pr_window_s)
     railed_log = _in_window(events.get("railed"), c.pr_window_s)
     stale_log = ((_decisions(events.get("armed")) | _decisions(events.get("railed")))
@@ -1708,9 +1754,9 @@ def check_landers(f, c):
         n = pr.get("number")
         if pr.get("auto_armed"):
             ok.append(n)
-        elif n in railed_log:
+        elif n in railed_log and not repo_mismatch:
             ok.append(n)          # rail mode: `--auto` is deliberately NOT armed by design
-        elif n in armed_log:
+        elif n in armed_log and not repo_mismatch:
             # The LOG says a lander was armed and GitHub says it is not armed now. That is the
             # silent expiry: the lander went away and nothing said so.
             expired.append(n)
@@ -1720,6 +1766,10 @@ def check_landers(f, c):
     ev = ["open PRs: %d, green+mergeable: %d" % (len(prs), len(candidates)),
           _gh_surface_txt(gh),
           "armed/railed: %s" % (sorted(ok) if ok else "none")]
+    if repo_mismatch:
+        ev.append("⛔ THE LOG BELONGS TO ANOTHER REPO (%s) — its armed/railed decisions were NOT "
+                  "counted for %s; only GitHub's own autoMergeRequest was. Grade with a --repo the "
+                  "cell actually runs." % (log_repo, c.repo or "(no repo)"))
     if unprobed:
         # ⛔ NOT a footnote. `_collect_rest` stops probing at `rest_probe_max`, and a failed
         # check-runs call also yields probed=False, so on a box where GraphQL is exhausted this is
@@ -1750,7 +1800,10 @@ def check_landers(f, c):
     if missing:
         return V("landers", FAIL, "LANDER_MISSING", evidence,
                  "%d green, mergeable PR(s) have no lander at all — neither an armed auto-merge "
-                 "nor a rail-mode PENDING decision." % len(missing))
+                 "nor a rail-mode PENDING decision%s."
+                 % (len(missing),
+                    (" (the orchestrator log belongs to %s, so it could not vouch either — re-run "
+                     "with the --repo this cell actually manages)" % log_repo) if repo_mismatch else ""))
     if unprobed:
         return V("landers", INCONCLUSIVE, "PARTIAL_POPULATION", evidence,
                  "%d of %d non-draft open PR(s) could not be probed, so 'every green PR has an "
@@ -2428,16 +2481,23 @@ class Machine(object):
         (measured fleet behaviour: a single cmux call takes 13-15s at that load).
         """
         rc, out = self.sh("ps -Ao pid=,ppid=,command= 2>&1")
-        if rc != 0:
-            return {"ok": False, "pids": [], "error": (out or "").strip()[:300]}
+        # ⛔ EMPTY STDOUT IS A FAILED READ — the doctrine `_json_list` states for gh, which `ps`
+        # never received. `ps -Ao` prints at least one row on any live system, so empty-with-rc0
+        # is a broken probe. Reading it as "no such process" reached CONTROLLER_ABSENT — the only
+        # state that RESPAWNS — and the re-measure guard uses the same probe and the same polarity,
+        # so it could not save it.
+        if rc != 0 or not (out or "").strip():
+            return {"ok": False, "pids": [],
+                    "error": ((out or "").strip()[:300] or "empty process table (rc=0)")}
         rows, near = pick_controller_pids(out, self.controller_paths)
         return {"ok": True, "pids": rows, "near_misses": near[:8],
                 "scoped_to": list(self.controller_paths or [])}
 
     def snapshot_pane(self):
         rc, out = self.sh("ps -Ao pid=,command= 2>&1")
-        if rc != 0:
-            return {"ok": False, "error": out.strip()[:300], "pids": []}
+        if rc != 0 or not out.strip():
+            return {"ok": False, "pids": [],
+                    "error": (out.strip()[:300] or "empty process table (rc=0)")}
         rows, near = pick_pane_daemon_pids(out)
         pids = [{"pid": r["pid"], "oom_score_adj": self.oom_score_adj(r["pid"])} for r in rows]
         probe_rc, probe = self.sh("test -r /proc/self/oom_score_adj && echo yes || echo no")
@@ -2462,6 +2522,12 @@ class Machine(object):
     def log_age(self):
         log, _ = self.facts_probe_log()
         return log.get("age_s")
+
+    def stat_mtime(self, path):
+        """mtime of `path`, or None when it cannot be read. A failed read is not a mtime."""
+        rc, out = self.sh("stat -c %%Y %s 2>/dev/null || stat -f %%m %s 2>/dev/null"
+                          % (_q(path), _q(path)))
+        return parse_stat_mtime(out) if rc == 0 else None
 
     def log_stat(self):
         """{exists, mtime, mtime_iso, age_s, error} — stat only, NO tail.
@@ -2535,8 +2601,9 @@ class Machine(object):
 
     def launchd_state(self, label):
         rc, out = self.sh("launchctl list 2>&1")
-        if rc != 0:
-            return {"loaded": None, "pid": None, "label": label, "error": out.strip()[:200]}
+        if rc != 0 or not (out or "").strip():
+            return {"loaded": None, "pid": None, "label": label,
+                    "error": ((out or "").strip()[:200] or "empty launchctl list (rc=0)")}
         for line in out.splitlines():
             parts = line.split("\t")
             if len(parts) >= 3 and parts[2].strip() == label:
@@ -2861,6 +2928,11 @@ def _fill_counts(out, open_prs, merged, cfg, now):
     merged_ts = [t for t in (parse_github_ts(p.get("mergedAt") or p.get("merged_at"))
                              for p in merged) if t]
     out["prs_merged_in_window"] = len([t for t in merged_ts if now - t <= win])
+    # ⛔ `gh pr list --state merged` is CREATED-desc (measured), so `--limit 100` bounds creation,
+    # not merge recency: on this repo the 100 newest-created merged PRs span 7.6 days, so a PR created
+    # 8+ days ago and merged in the last 3h sits OUTSIDE the page and the count reads 0 — a false
+    # NO_PR_MERGED. `page_full` already discloses the same bound for open PRs; merges had nothing.
+    out["merged_page_full"] = len(merged) >= 100
     out["last_merged"] = _iso(max(merged_ts)) if merged_ts else None
     created_ts = [t for t in (parse_github_ts(p.get("createdAt") or p.get("created_at"))
                               for p in list(merged) + list(open_prs)) if t]
@@ -2981,6 +3053,14 @@ def collect_live(cfg, machine=None, now=None, skip=()):
         # stops a frozen pool read from establishing EMPTINESS, and `max(0.0, …)` let a clock running
         # ahead of the canary make a stale record read as 0s old.
         qs["age_s"] = _age_of(now, int(m.group(1))) if m else None
+        if qs["age_s"] is None:
+            # The harness writes `"$token $(date +%s)"`; a record whose epoch field never got written
+            # still has an mtime, which IS when it was recorded. Without this its currency was
+            # permanently UNKNOWN and `queue_stale_s` could never fire on it.
+            mt = machine.stat_mtime(os.path.join(cfg.o_dir, "state", "queue-state"))
+            if mt is not None:
+                qs["age_s"] = _age_of(now, mt)
+                qs["age_source"] = "file mtime"
     facts["queue_state"] = qs
 
     facts["controller"] = machine.snapshot_controller()
@@ -3085,8 +3165,8 @@ REQUIRED_FIXTURES = (
     # either comparison alone still failed), the intent-vs-outcome distinction in `work_dispatched`,
     # and the UNCONFIRMED branch that an intent-only log must fall into.
     "dispatch-intent-not-spawned", "dispatch-unconfirmed", "dispatch-previous-batch-spawn",
-    "queue-state-unreadable-newer", "no-pr-created", "idle-no-work",
-    "headroom-disk-only-low", "headroom-mem-only-low",
+    "queue-state-unreadable-newer", "lander-from-another-repo", "merged-surface-truncated",
+    "no-pr-created", "idle-no-work", "headroom-disk-only-low", "headroom-mem-only-low",
 )
 
 
@@ -3171,7 +3251,8 @@ def build_parser():
                     help="how old an EMPTY pool read may be before it is not evidence (default 90)")
     ap.add_argument("--controller-ws", default=None, help="controller workspace UUID (live send)")
     ap.add_argument("--controller-name", default=None, help="substring of the controller workspace NAME")
-    ap.add_argument("--state", dest="state_path", default=None, help="notification state file/dir")
+    ap.add_argument("--state", dest="state_path", default=None, help="notification state FILE (default_state_path accepts a directory; "
+                         "--state does not)")
     ap.add_argument("--facts", default=None,
                     help="live mode: evaluate an injected facts file instead of probing the box "
                          "(the notify/respawn machinery still runs; combine with --dry-run and "
@@ -3190,6 +3271,24 @@ def build_parser():
     ap.add_argument("--no-respawn", action="store_true", help="never attempt a respawn")
     ap.add_argument("--verbose", action="store_true")
     return ap
+
+
+def build_machine(cfg):
+    """The ONE place the machine handle is wired. ⛔ `o_dir` BELONGS HERE.
+
+    It was set only inside `collect_live`, so the object `main` built carried `o_dir=None` for the
+    whole run — and `_heartbeat_epoch` returns None without it. The heartbeat leg of the respawn
+    proof (`advanced = log_advanced or hb_advanced`) was therefore DEAD in the shipped CLI path, on
+    the exact box it exists for (a high-load cell where a successful respawn cannot write the log
+    within the 40 s bound), so a SUCCESSFUL respawn was reported and SENT as `RESPAWN DID NOT TAKE`.
+    The suite could not see it: its test hands the function a fake that already carries `o_dir`.
+    """
+    m = Machine(None if cfg.box in (None, "local") else cfg.box)
+    m.o_dir = cfg.o_dir
+    m.log_path = cfg.log_path
+    m.tail_lines = 6000
+    m.controller_paths = cfg.controller_paths()
+    return m
 
 
 def cfg_from_args(a):
@@ -3277,7 +3376,11 @@ def main(argv=None):
         if not paths:
             print("outcome-canary: no fixtures found (pass --fixture or --fixtures-dir)", file=sys.stderr)
             return 3
-        rows, mism, skipped = run_static(paths, only=only)
+        try:
+            rows, mism, skipped = run_static(paths, only=only)
+        except FixtureError as exc:
+            print("outcome-canary: %s" % exc, file=sys.stderr)
+            return 3        # nothing was evaluated; 1 means "at least one check FAILed"
         if a.fixtures_dir is not None or not a.fixture:
             # The POPULATION is part of the pin: a deleted fixture removes the outcome it pinned and
             # every remaining assertion still passes. Only checked when this run claims to cover a
@@ -3328,10 +3431,7 @@ def main(argv=None):
 
     # ── live ────────────────────────────────────────────────────────────────────────────────
     cfg = cfg_from_args(a)
-    machine = Machine(None if cfg.box in (None, "local") else cfg.box)
-    machine.log_path = cfg.log_path
-    machine.tail_lines = 6000
-    machine.controller_paths = cfg.controller_paths()
+    machine = build_machine(cfg)
     if a.facts:
         # INJECTED FACTS through the LIVE path. The predicates are the same ones `--static` runs;
         # what this adds is the SIGNAL machinery (compose → de-duplicate → send/respawn) so that

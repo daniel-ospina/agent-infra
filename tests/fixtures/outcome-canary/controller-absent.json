@@ -21,6 +21,7 @@
  "facts": {
   "box": "local",
   "controller": {
+   "ok": true,
    "pids": []
   },
   "github": {

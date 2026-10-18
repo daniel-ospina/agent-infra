@@ -21,6 +21,7 @@
  "facts": {
   "box": "local",
   "controller": {
+   "ok": true,
    "pids": [
     {
      "cmd": "/bin/bash /Users/me/orchestrator/orch-loop.sh",
