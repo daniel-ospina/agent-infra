@@ -727,11 +727,13 @@ prov_payload_hash() {
     (
       cd "$O" || exit 3
       for f in *.sh; do [ -f "$f" ] || continue; $PROV_SHA "$f" || exit 3; done
-      # ⛔ gh-rest/gh is NOT folded in here. The payload digest and check-deployed-drift.sh
-      # compute it over the shell files in $O; adding a non-shell file in one place alone
-      # makes every HEALTHY deployment read as drift. Covering the adapter, and
-      # launchd.plist.template which has the same gap, needs the stamp, the drift checker
-      # and selftest changed together. Tracked separately; do not half-fix it here.
+      # ⛔ gh-rest/gh is NOT folded in here, and neither is gh-limit.py: this digest is the `*.sh` payload
+      # fold that the CELL records too — cloud-cell-supervisor.sh has the same o_payload_hash — so
+      # widening it on one surface alone would make every healthy deployment read as drift on the
+      # other. The non-shell shipped surface is covered PER FILE instead — see prov_shipped_files
+      # below, and agent-infra#1960 for the $O/gh-limit.py measurement that made it necessary.
+      # ⛔ TWO THINGS ARE UNPARSEABLE IN A COMMENT HERE — an open paren, and an APOSTROPHE. Both are
+      # quoted text that the substitution counts; each swallowed the rest of this file once.
       # ⛔ NEVER put an open paren in a comment nested in command substitution — bash
       # counts it as syntax and swallows the rest of the file looking for the match.
     ) | $PROV_SHA | awk '{print $1}' )" || return 1
@@ -765,6 +767,67 @@ prov_dirty() {
   out="$(git -C "$HERE" status --porcelain -- . 2>/dev/null)" || return 2
   [ -n "$out" ]
 }
+
+# ── the SHIPPED SURFACE, per file, from the SOURCE (#1960) ───────────────────────
+# ⛔ BUILT FROM THE REPO, NEVER FROM $O. This is the half that answers "which files should be there",
+# and it is the half the record could not previously answer at all: `payloadSha256` above is folded
+# from `$O/*.sh`, so a file that is ABSENT from the deployment contributes nothing to it. A record
+# built by scanning the deployment can only describe what survived — it is structurally blind to its
+# own gap, which is why `$O/gh-limit.py` could be missing from the live box while every record and
+# every check said MATCH. Measured 2026-10-18: `$O/gh-rest/gh:102` resolves `../gh-limit.py`; without
+# it the shim warned `no limit layer … this call was NOT serialised or backed off (#1988)` and fell
+# back to the raw binary, which then failed `GraphQL: API rate limit already exceeded` — every
+# `gh issue view` refused, pre-flight DEGRADED for every candidate, `refresh-candidates.sh` aborted by
+# design (#1736), `candidates.txt` empty for 4.5 h, `[dispatch] backlog empty queue=READ(203)` with 200
+# issues open. `check-deployed-drift.sh` now reads BOTH sides (this list, and the ref's own).
+#
+# The list is DATA — $HERE/SHIPPED-SURFACE, one path per line, `!` = deliberately not shipped — so a
+# `.py`, an extensionless bin shim or a template is covered by being NAMED, not by matching a glob.
+prov_shipped_paths() { # prints the shipped relative paths the source tree declares
+  [ -f "$HERE/SHIPPED-SURFACE" ] || return 1
+  sed -e 's/#.*//' "$HERE/SHIPPED-SURFACE" \
+    | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
+    | grep -v '^$' | grep -v '^!'
+}
+
+# Fills PROV_FILE_MAP (JSON members) and PROV_FILE_COUNT. A path the manifest names but the source does
+# not contain is WARNED, not recorded: recording a hash for a file that is not there would be the same
+# fabricated datum this block exists to stop.
+PROV_FILE_MAP=""; PROV_FILE_COUNT=0
+prov_shipped_files() {
+  local p h n=0 map=""
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    if [ ! -f "$HERE/$p" ]; then
+      warn "SHIPPED-SURFACE names $p but $HERE has no such file — NOT recorded (the surface list and the source disagree; check-deployed-drift.sh grades this at the ref)"
+      continue
+    fi
+    # `|| continue`: under `set -euo pipefail` a sha tool that cannot read one file must skip THAT
+    # FILE and keep recording the rest, never abort the installer before the record is written.
+    h="$($PROV_SHA "$HERE/$p" 2>/dev/null | awk '{print $1}')" || continue
+    case "$h" in
+      ????????????????????????????????????????????????????????????????)
+        if [ "$n" -gt 0 ]; then map="$map,"$'\n'; fi
+        map="$map    \"$p\": \"$h\""
+        n=$((n + 1)) ;;
+      *) warn "could not hash $HERE/$p ($PROV_SHA produced no digest) — not recorded" ;;
+    esac
+  done <<PROVSHIPPEDEOF
+$(prov_shipped_paths)
+PROVSHIPPEDEOF
+  PROV_FILE_MAP="$map"; PROV_FILE_COUNT="$n"
+  [ "$n" -gt 0 ]
+}
+# NOT FATAL, and it must not be: a source that is not a checkout is the measured #1745 laptop state
+# and it must still install and still RECORD. An unreadable surface records `"shippedFiles": "UNKNOWN"`,
+# which check-deployed-drift.sh reads as "this record cannot say what it installed" — an explicit
+# answer the check can act on, never a silent absence.
+prov_ship_json='"UNKNOWN"'
+if prov_shipped_files; then
+  prov_ship_json="{"$'\n'"$PROV_FILE_MAP"$'\n'"  }"
+else
+  warn "could not enumerate the shipped surface from $HERE — the record will say shippedFiles: UNKNOWN, so it cannot answer 'which files should be here'"
+fi
 
 write_provenance() {
   local commit rel dirty_word payload tmp drc _depf _depb dep_why
@@ -833,6 +896,8 @@ write_provenance() {
   "relation": "$rel",
   "agentInfraDirty": $dirty_word,
   "deployedMatchesSource": $dep_match,
+  "shippedFileCount": $PROV_FILE_COUNT,
+  "shippedFiles": $prov_ship_json,
   "payloadSha256": "$payload",
   "recordedAt": "$(date -u +%FT%TZ)"
 }

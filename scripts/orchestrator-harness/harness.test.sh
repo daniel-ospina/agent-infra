@@ -24,6 +24,10 @@
 #      anything, so the OTHER files it would have replaced are still the old bytes.
 #   6. VERIFY DISTINGUISHES RED FROM UNKNOWN. A label launchd does not have → exit 1 (red); a launchd
 #      that cannot be read → exit 2 (cannot determine), never 0 and never the same code as red.
+#   7. THE RECORD COVERS THE NON-`.sh` SHIPPED SURFACE, AND IS BUILT FROM THE REPO (#1960). Deleting
+#      `$O/gh-limit.py` or `$O/gh-rest/gh` — neither of which a `*.sh` record can see — makes `drift`
+#      exit 1 and NAME the file MISSING, while the stamp still lists it; and a stamp that omits a
+#      shipped path is itself drift, because a record cannot report a file it does not list.
 
 set -uo pipefail
 
@@ -166,7 +170,63 @@ else
   cp "$HARNESS/install.sh" "$O/install.sh"   # restore for the remaining sections
   cp "$HARNESS/orch-loop.sh" "$O/orch-loop.sh"
 
-  echo "== 6. verify distinguishes RED from UNKNOWN"
+  echo "== 6. the record covers the NON-.sh shipped surface, and names its absence (#1960)"
+  # ⛔ THE DEFECT THIS SECTION EXISTS FOR, measured on the laptop 2026-10-18. `$O/gh-limit.py` was ABSENT
+  # from the live deployment while present on origin/main. The record covered `$O/*.sh`, so a `.py` could
+  # never be in it; `$O/gh-rest/gh:102` resolves `$SELF_DIR/../gh-limit.py`, so the shim printed
+  # `gh-rest: WARNING no limit layer … this call was NOT serialised or backed off (#1988)` and fell back
+  # to the raw binary, which failed outright (`GraphQL: API rate limit already exceeded`). Every
+  # `gh issue view`/`gh pr list` was refused → pre-flight DEGRADED/INCOMPLETE → refresh-candidates.sh
+  # aborts by design (#1736) → candidates.txt stayed 0 lines for 4.5 h → `[dispatch] backlog empty
+  # queue=READ(203)` with 200 issues open and 19 of 20 lane slots free. Nothing below is about the
+  # `.sh` payload hash: gh-limit.py is not a `.sh`, so ONLY the per-file shipped-surface record can
+  # see it. `assert_absent` on the payload line is what keeps these assertions honest.
+  stamp="$O/.agent-infra-stamp.json"
+  assert_contains "$(cat "$stamp")" '"gh-limit.py": "' "the record carries a per-file hash for a shipped .py"
+  assert_contains "$(cat "$stamp")" '"gh-rest/gh": "' "…and for the gh-rest shim (no .sh in its name either)"
+  assert_absent "$(cat "$stamp")" '"retired/' "…and NOT for a file the surface declares not-shipped"
+  out="$("$SELF" drift --all 2>&1)"; rc=$?
+  assert_eq "$rc" "0" "a full-surface deployment matches (the .py and the shims are shipped, not tolerated)"
+  assert_contains "$out" "identical: gh-limit.py" "--all prints gh-limit.py as a SAME file"
+  assert_contains "$out" "identical: gh-rest/gh" "--all prints the gh-rest shim as a SAME file"
+  # 1. the missing LIMIT LAYER — the exact file the measurement lost
+  rm -f "$O/gh-limit.py"
+  out="$("$SELF" drift 2>&1)"; rc=$?
+  assert_eq "$rc" "1" "deleting the non-.sh limit layer makes drift exit 1 (not 0, not 2)"
+  assert_contains "$out" "gh-limit.py — shipped by the repo at" "it names gh-limit.py"
+  assert_contains "$out" "MISSING from" "…as MISSING, not as an absence nothing can see"
+  # ⛔ THE RECORD IS BUILT FROM THE REPO, NOT FROM THE DEPLOYMENT — the whole point of #1960. A record
+  # that scanned $O could not name a file $O no longer has; this one still does.
+  assert_contains "$(cat "$stamp")" '"gh-limit.py": "' "the record STILL names gh-limit.py after the deployment lost it (repo-derived)"
+  cp "$HARNESS/gh-limit.py" "$O/gh-limit.py"
+  # 2. the REST ADAPTER SHIM — a shipped file in a subdirectory, also not a .sh file at depth 1
+  rm -f "$O/gh-rest/gh"
+  out="$("$SELF" drift 2>&1)"; rc=$?
+  assert_eq "$rc" "1" "deleting gh-rest/gh makes drift exit 1"
+  assert_contains "$out" "gh-rest/gh — shipped by the repo at" "it names the shim by its SUBDIRECTORY path"
+  cp "$HARNESS/gh-rest/gh" "$O/gh-rest/gh"; chmod +x "$O/gh-rest/gh"
+  # 3. a record that OMITS a shipped path cannot report that path missing — grade the record itself.
+  # The count line goes too: with the count still claiming 43 files over a 42-entry list, the check
+  # correctly answers CANNOT-DETERMINE (two of the record's own claims disagree), which is a different
+  # verdict from the one this case is about.
+  cp "$stamp" "$SB/stamp.keep"
+  grep -vF '"gh-limit.py": "' "$SB/stamp.keep" | grep -vF '"shippedFileCount": ' > "$stamp"
+  out="$("$SELF" drift 2>&1)"; rc=$?
+  assert_eq "$rc" "1" "a record missing a shipped path is drift, not a pass"
+  assert_contains "$out" "gh-limit.py — shipped by" "…and the path it omits is named"
+  assert_contains "$out" "NOT named in the record at" "…with the reason: the record cannot report what it does not list"
+  cp "$SB/stamp.keep" "$stamp"
+  out="$("$SELF" drift 2>&1)"; rc=$?
+  assert_eq "$rc" "0" "restoring the complete record restores MATCH"
+  # a record whose own COUNT disagrees with its own list is CANNOT-VERIFY, never a pass and never a
+  # drift verdict: nothing can say which of the record's two claims is the damaged one.
+  sed 's/"shippedFileCount": [0-9]*/"shippedFileCount": 999/' "$SB/stamp.keep" > "$stamp"
+  out="$("$SELF" drift 2>&1)"; rc=$?
+  assert_eq "$rc" "2" "a record whose count disagrees with its list is UNKNOWN (exit 2)"
+  assert_contains "$out" "count and its own list disagree" "…and it says which two claims disagree"
+  cp "$SB/stamp.keep" "$stamp"
+
+  echo "== 7. verify distinguishes RED from UNKNOWN"
   # ⛔ THE CLASSIFICATION IS WHAT IS ASSERTED, not the aggregate exit code: in a sandbox $O that has no
   # live stack, "no controller running" is RED no matter what launchd says, so the aggregate would be 1
   # in both cases and the assertion would pass without exercising anything. What must differ is how the
@@ -182,7 +242,7 @@ else
   [ "$rc" -ne 0 ] && ok "verify exits non-zero on an unreadable domain (it is never a pass)" || bad "verify exited 0 with launchd unreadable"
 fi
 
-echo "== 7. a restart that does not come up is NOT a successful restart"
+echo "== 8. a restart that does not come up is NOT a successful restart"
 # The launchctl stub makes every launchd verb "succeed" while the job never appears — which is exactly
 # the false PASS #1975 paid for (installer exits 0, controller removed and disabled). `restart` must
 # exit non-zero and say so. The SUCCESS path is launchd-cycle.sh's lc_restart, pinned by
@@ -197,7 +257,7 @@ else
   assert_absent "$out" "restart: done" "it does not print a completion line"
 fi
 
-echo "== 8. the verb surface is the documented one"
+echo "== 9. the verb surface is the documented one"
 run 0 "harness.sh --help exits 0" "$SELF" --help
 for v in status verify drift deploy stop restart; do
   assert_contains "$LAST_OUT" "harness.sh $v" "--help documents '$v'"

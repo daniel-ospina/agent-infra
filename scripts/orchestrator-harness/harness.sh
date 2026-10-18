@@ -275,6 +275,52 @@ cmd_verify() { # machine-readable-ish: one verdict line per component, then the 
 # rule orchestrator-bringup.sh applies). Atomic per file: stage next to the target, then rename, so a
 # lane that spawns `bash $O/<worker>.sh` in the window never reads a half-written file.
 DEPLOYED=0; REMOVED=0
+
+# ── WHAT SHIPS IS DATA (#1960) ────────────────────────────────────────────────────────────────
+# ⛔ THE COPY LIST IS NOT A GLOB. It was `"$HERE"/*.sh "$HERE"/*.template "$HERE"/port-provenance.txt`,
+# which is the same defect the drift check had: a deployment built from that list never receives
+# `gh-rest/gh`, `gh-limit/gh` or `gh-limit.py` — no `.sh` in any of those names — and NOTHING said so.
+# Measured 2026-10-18: `$O/gh-limit.py` was absent while present on origin/main, `$O/gh-rest/gh`
+# resolves `$SELF_DIR/../gh-limit.py`, and without it the shim warned `no limit layer … this call was
+# NOT serialised or backed off (#1988)`, fell back to the raw binary and failed outright
+# (`GraphQL: API rate limit already exceeded`) — every gh call refused, `candidates.txt` empty for
+# 4.5 h, `[dispatch] backlog empty queue=READ(203)` with 200 issues open. The list is DATA:
+# $HERE/SHIPPED-SURFACE, one path per line, `!` = deliberately not shipped — and the SAME file is what
+# install.sh records per file and check-deployed-drift.sh grades the deployment against.
+SHIPPED_LIST=""
+load_shipped() {
+  [ -n "$SHIPPED_LIST" ] && return 0
+  [ -f "$HERE/SHIPPED-SURFACE" ] || return 1
+  SHIPPED_LIST="$(sed -e 's/#.*//' "$HERE/SHIPPED-SURFACE" \
+                   | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
+                   | grep -v '^$' | grep -v '^!')"
+  [ -n "$SHIPPED_LIST" ]
+}
+is_shipped() { # <relative path> — exact membership of the data list, never a glob
+  case $'\n'"$SHIPPED_LIST"$'\n' in *$'\n'"$1"$'\n'*) return 0 ;; esac
+  return 1
+}
+# ⛔ WHAT THE DEPLOYMENT MAY HOLD AND THE REPO MAY NOT, scoped to what the harness EXECUTES. The mirror
+# rule exists so a retired or hand-placed file cannot stay INVOCABLE, so the scan covers the two kinds
+# the harness execs (`*.sh`, `*.py` — `$O/gh-limit.py` is executed by every gh call) plus the two shim
+# directories. It deliberately does NOT sweep all of $O: that directory holds runtime state at depth 1
+# (`candidates.txt`, `dispatched.txt`, `heartbeat`, `-<issue>-fixer.txt`, `*.bak-*`) and the workers in
+# `bg/` are NOT shipped by this repo — a deploy that removed them would destroy the fleet's own state
+# and the processes it supervises, under the name of a deploy. Kept IDENTICAL to
+# check-deployed-drift.sh's reverse rule on purpose: a deploy that clears less than the check flags
+# loops on a refusal it cannot clear, and one that clears more deletes data.
+unshipped_in_o() {
+  local f b
+  for f in "$O"/*.sh "$O"/*.py "$O"/gh-rest/* "$O"/gh-limit/*; do
+    [ -f "$f" ] || continue
+    case "$f" in
+      "$O"/gh-rest/*) b="gh-rest/${f##*/}" ;;
+      "$O"/gh-limit/*) b="gh-limit/${f##*/}" ;;
+      *)              b="${f##*/}" ;;
+    esac
+    is_shipped "$b" || printf '%s\n' "$b"
+  done
+}
 # ⛔ PLAN, THEN APPLY — NEVER HALF A DEPLOY. The first version of this function copied file by file and
 # discovered the orch-loop.sh hazard when it reached that file, so it had already replaced install.sh
 # and four other scripts by the time it refused: a half-updated harness that no message describes, and
@@ -284,18 +330,19 @@ PLAN_CHANGED=""; PLAN_REMOVE=""
 deploy_plan() {
   [ -n "$GITROOT" ] || refuse "no checkout at $HERE — deploy must run from the repo, not from the deployed copy (the old raw 'cp -R' is exactly how $O drifted with no record)"
   local src f
-  for src in "$HERE"/*.sh "$HERE"/*.template "$HERE"/port-provenance.txt; do
-    [ -f "$src" ] || continue
-    f="$(basename "$src")"
-    if [ -f "$O/$f" ] && cmp -s "$src" "$O/$f"; then continue; fi
+  load_shipped || refuse "no SHIPPED-SURFACE beside $HERE/shipped — it is the DATA list of what this harness deploys (one path per line, '!' = not shipped). Refusing to deploy from a glob: a glob is how gh-limit.py and the gh-rest/gh shim came to be absent from a box that reported MATCH (#1960)"
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    [ -f "$HERE/$f" ] || refuse "SHIPPED-SURFACE names $f but the source at $HERE has no such file — refusing to deploy a surface the repo cannot supply. Nothing was written."
+    if [ -f "$O/$f" ] && cmp -s "$HERE/$f" "$O/$f"; then continue; fi
     PLAN_CHANGED="$PLAN_CHANGED $f"
-  done
+  done <<SHIPPEDHERE
+$SHIPPED_LIST
+SHIPPEDHERE
   # MIRROR, not overlay: a script the harness no longer ships must not stay invocable in $O (the same
   # rule orchestrator-bringup.sh applies). Removal is planned here and applied below.
-  for f in "$O"/*.sh; do
-    [ -f "$f" ] || continue
-    [ -f "$HERE/$(basename "$f")" ] || PLAN_REMOVE="$PLAN_REMOVE $(basename "$f")"
-  done
+  PLAN_REMOVE="$(unshipped_in_o | tr '\n' ' ')"
+  PLAN_REMOVE="${PLAN_REMOVE% }"
   # ⛔ THE ONE FILE THAT MUST NOT BE SWAPPED UNDER A RUNNING READER. bash reads a script INCREMENTALLY,
   # so replacing orch-loop.sh while the controller is executing it means the controller reads the NEW
   # bytes at its OLD offset — a silent mid-script corruption of the process that owns the fleet
@@ -311,11 +358,18 @@ deploy_plan() {
   return 0
 }
 deploy_apply() {
-  local f tmp
+  local f tmp d
   for f in $PLAN_CHANGED; do
-    tmp="$O/.seed-$f.$$"
-    # Stage next to the target, then rename: a lane that spawns `bash $O/<worker>.sh` in the window
-    # never reads a half-written file.
+    d="${f%/*}"
+    if [ "$d" = "$f" ]; then d="."; else
+      # A SHIPPED SUBDIRECTORY (gh-rest/, gh-limit/) is part of the surface: without it the shim is
+      # staged into a directory that does not exist and the deployment silently lacks the layer.
+      mkdir -p "$O/$d" || refuse "cannot create $O/$d — check permissions (nothing else was written)"
+    fi
+    # Stage next to the TARGET, then rename: a lane that spawns `bash $O/<worker>.sh` in the window
+    # never reads a half-written file, and the rename is atomic because source and target share a
+    # directory. `-p` keeps the executable bit, which both gh shims need.
+    tmp="$O/$d/.seed-${f##*/}.$$"
     cp -p "$HERE/$f" "$tmp" || { rm -f "$tmp"; refuse "cannot stage $f into $O — check free space (nothing else was written)"; }
     mv -f "$tmp" "$O/$f" || { rm -f "$tmp"; refuse "cannot install $f into $O"; }
     ok "deployed $f"; DEPLOYED=$((DEPLOYED + 1))

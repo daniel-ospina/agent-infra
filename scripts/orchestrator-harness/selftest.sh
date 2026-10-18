@@ -2950,8 +2950,41 @@ if need "$TMP/prov-block.body" "install.sh's provenance block is extracted (its 
     # list. It exists so the `deployedMatchesSource` assertions below can prove the field measures
     # the whole deployed surface rather than that 11-name subset (review finding, P2).
     printf 'cd v1\n' > "$PW/scripts/orchestrator-harness/check-port-drift.sh"
+    # ── the NON-`.sh` shipped surface (#1960) ──────────────────────────────────────────
+    # Measured on the laptop 2026-10-18: `$O/gh-limit.py` was ABSENT while present on origin/main, and
+    # the record — which folded `$O/*.sh` — could not see a `.py`. `$O/gh-rest/gh` resolves
+    # `$SELF_DIR/../gh-limit.py`, so the shim fell back to the raw binary and every gh call was
+    # refused: refresh-candidates.sh aborted by design (#1736), candidates.txt stayed 0 lines for
+    # 4.5 h, and the controller logged `[dispatch] backlog empty queue=READ(203)` over 200 open
+    # issues. The fixture therefore ships a `.py`, an extensionless bin SHIM in a subdirectory, and a
+    # `SHIPPED-SURFACE` manifest — the three shapes a `*.sh` glob is structurally blind to.
+    printf 'limit v1\n' > "$PW/scripts/orchestrator-harness/gh-limit.py"
+    mkdir -p "$PW/scripts/orchestrator-harness/gh-rest"
+    printf '#!/bin/sh\n# shim v1\n' > "$PW/scripts/orchestrator-harness/gh-rest/gh"
+    printf '#!/bin/sh\n# retired v1\n' > "$PW/scripts/orchestrator-harness/retired-probe.sh"
+    mkdir -p "$PW/scripts/orchestrator-harness/retired"
+    printf '#!/bin/sh\n# gone v1\n' > "$PW/scripts/orchestrator-harness/retired/old.sh"
+    cat > "$PW/scripts/orchestrator-harness/SHIPPED-SURFACE" <<'SHIPEOF'
+# fixture shipped surface: every tree file ships except the explicit exclusion
+SHIPPED-SURFACE
+orch-loop.sh
+claims.sh
+check-port-drift.sh
+gh-limit.py
+gh-rest/gh
+retired-probe.sh
+!retired/
+SHIPEOF
     $PG init -q >/dev/null 2>&1 && $PG add -A >/dev/null 2>&1 && $PG commit -qm base >/dev/null 2>&1
-    deploy() { mkdir -p "$PO"; rm -f "$PO"/*.sh; cp "$PW"/scripts/orchestrator-harness/*.sh "$PO"/; }
+    # The deployment mirrors the MANIFEST, not a glob — the same rule harness.sh deploy applies, and
+    # the reason a `.py` or a shim can no longer be silently absent from the deployed copy.
+    deploy() {
+      mkdir -p "$PO"; rm -f "$PO"/*.sh
+      local p
+      for p in $(sed -e 's/#.*//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "$PW/scripts/orchestrator-harness/SHIPPED-SURFACE" | grep -v '^$' | grep -v '^!'); do
+        mkdir -p "$PO/$(dirname "$p")"; cp "$PW/scripts/orchestrator-harness/$p" "$PO/$p"
+      done
+    }
     prov() { ( HERE="$PW/scripts/orchestrator-harness"; O="$PO"; HARNESS_REF=HEAD; . "$TMP/prov-block.sh" ); }
     dc()  { bash "$PC/check-deployed-drift.sh" --o "$PO" --repo "$PW" --ref HEAD --rel scripts/orchestrator-harness --no-fetch "$@" >/dev/null 2>&1; }
     dcm() { bash "$PC/check-deployed-drift.sh" --o "$PO" --repo "$PW" --ref HEAD --rel scripts/orchestrator-harness --no-fetch "$@" 2>&1; }
@@ -3044,6 +3077,55 @@ if need "$TMP/prov-block.body" "install.sh's provenance block is extracted (its 
     out="$(dcm)"; rc=$?
     [ "$rc" -eq 1 ] && case "$out" in *"NOT shipped"*) rc=0;; *) rc=1;; esac || rc=1
     ck "check-deployed-drift: an extra hand-placed script in \$O is drift" $rc
+    # ── #1960: the record covers the NON-`.sh` shipped surface, and is built from the REPO ─────
+    deploy; prov
+    dc; rc=$?; [ "$rc" -eq 0 ] && rc=0 || { rc=1; echo "      full-surface deployment exited $rc"; }
+    ck "check-deployed-drift: a deployment carrying the .py and the subdirectory shim matches" $rc
+    grep -qE '"gh-limit\.py": "[0-9a-f]{64}"' "$PO/.agent-infra-stamp.json" 2>/dev/null && rc=0 || rc=1
+    ck "the stamp records a per-file hash for a shipped .py (a \$O/*.sh fold cannot)" $rc
+    grep -qE '"gh-rest/gh": "[0-9a-f]{64}"' "$PO/.agent-infra-stamp.json" 2>/dev/null && rc=0 || rc=1
+    ck "the stamp records the extensionless shim by its SUBDIRECTORY path" $rc
+    grep -q '"retired/' "$PO/.agent-infra-stamp.json" 2>/dev/null && rc=1 || rc=0
+    ck "the stamp does NOT record a file the surface declares not-shipped" $rc
+    grep -qE '"shippedFileCount": [1-9][0-9]*' "$PO/.agent-infra-stamp.json" 2>/dev/null && rc=0 || rc=1
+    ck "the stamp counts the files it lists (a truncated record is detectable)" $rc
+    # the missing LIMIT LAYER — the exact file the measurement lost. Not a `.sh`: only the per-file
+    # shipped-surface half can see it, so this assertion fails if that half is ever narrowed again.
+    rm -f "$PO/gh-limit.py"
+    out="$(dcm)"; rc=$?
+    [ "$rc" -eq 1 ] && case "$out" in *gh-limit.py*MISSING*) rc=0;; *) rc=1; echo "      missing .py exited $rc: $out";; esac || rc=1
+    ck "check-deployed-drift: a missing non-.sh shipped file is DRIFT, and named MISSING" $rc
+    # ⛔ THE RECORD IS BUILT FROM THE REPO, NOT FROM THE DEPLOYMENT. A record that scanned $O could
+    # not name a file $O no longer holds — which is exactly why the live box's record said MATCH.
+    grep -q '"gh-limit.py"' "$PO/.agent-infra-stamp.json" 2>/dev/null && rc=0 || rc=1
+    ck "the record STILL names gh-limit.py after the deployment lost it (repo-derived, not a scan of \$O)" $rc
+    # the extensionless shim in a subdirectory, same class
+    deploy; prov; rm -f "$PO/gh-rest/gh"
+    out="$(dcm)"; rc=$?
+    [ "$rc" -eq 1 ] && case "$out" in *gh-rest/gh*MISSING*) rc=0;; *) rc=1;; esac || rc=1
+    ck "check-deployed-drift: a missing shim in a shipped SUBDIRECTORY is DRIFT, and named" $rc
+    # a record that omits a shipped path cannot report that path missing — grade the record itself.
+    # The count line goes too: with the count still claiming one more file than it lists, the check
+    # correctly answers CANNOT-DETERMINE — a different verdict from the one this case is about.
+    deploy; prov
+    grep -vF '"gh-limit.py": "' "$PO/.agent-infra-stamp.json" | grep -vF '"shippedFileCount": ' > "$TMP/prov-stamp.nomap"
+    mv "$TMP/prov-stamp.nomap" "$PO/.agent-infra-stamp.json"
+    out="$(dcm)"; rc=$?
+    [ "$rc" -eq 1 ] && case "$out" in *"NOT named in the record"*) rc=0;; *) rc=1;; esac || rc=1
+    ck "check-deployed-drift: a record missing a shipped path is DRIFT, not a pass" $rc
+    deploy; prov
+    # a file in the tree that the manifest neither ships nor excludes: the manifest's OWN gap is red
+    printf 'x\n' > "$PW/scripts/orchestrator-harness/unlisted-probe.py"
+    $PG add -A >/dev/null 2>&1; $PG commit -qm unlisted >/dev/null 2>&1
+    deploy; prov
+    out="$(dcm)"; rc=$?
+    [ "$rc" -eq 1 ] && case "$out" in *"neither shipped nor declared not-shipped"*) rc=0;; *) rc=1;; esac || rc=1
+    ck "check-deployed-drift: a tree file the manifest does not name is DRIFT (the manifest's own gap)" $rc
+    printf 'unlisted-probe.py\n' >> "$PW/scripts/orchestrator-harness/SHIPPED-SURFACE"
+    $PG add -A >/dev/null 2>&1; $PG commit -qm listed >/dev/null 2>&1
+    deploy; prov
+    dc; rc=$?; [ "$rc" -eq 0 ] && rc=0 || { rc=1; echo "      named file exited $rc"; }
+    ck "check-deployed-drift: naming it in the manifest restores the match" $rc
     # a FAILING mktemp used to make the whole byte comparison silently skip and print OK (exit 0)
     deploy; prov
     MKB="$TMP/prov-nomk"; mkdir -p "$MKB"

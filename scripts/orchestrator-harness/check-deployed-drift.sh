@@ -30,12 +30,32 @@
 #      `merge-base --is-ancestor`, NEVER a commit count (measured 2026-10-14: `rev-list --count`
 #      printed 1 while `--is-ancestor` printed NO). current -> continue; behind / diverged -> drift;
 #      a recorded commit that is not an object in the repo -> exit 2.
-#   3. BYTES. Every `*.sh` the repo ships at the ref (depth 1 of the harness dir — what README §4
-#      and `cp <harness>/*.sh $O/` put there) must be present in $O with the SAME git blob sha1, and
-#      $O must carry no `*.sh` the repo does not ship. This is check-port-drift.sh's primitive —
-#      blob shas read from the ref's tree — applied to the DEPLOYED copy. The recorded payload hash
-#      is also recomputed live, so a post-install hand edit to $O is caught even when the recorded
-#      commit is unchanged.
+#   3. BYTES. Every path the repo SHIPS at the ref must be present in $O with the SAME git blob
+#      sha1, and $O must carry no executable the repo does not ship. The shipped set is DATA —
+#      `<rel>/SHIPPED-SURFACE`, a list of paths read from the REF's tree — not a glob over it
+#      (agent-infra#1960). This is check-port-drift.sh's primitive — blob shas read from the ref's
+#      tree — applied to the DEPLOYED copy. The recorded payload hash is also recomputed live, so a
+#      post-install hand edit to $O is caught even when the recorded commit is unchanged.
+#
+# ⛔ WHY THE SHIPPED SET IS AN ALLOWLIST READ FROM THE REF, AND NOT A GLOB (agent-infra#1960). Until
+# 2026-10-18 this half enumerated `grep -E '^<rel>/[^/]+\.sh$'` — depth 1, shell files only. Measured
+# on the laptop that day: `$O/gh-limit.py` was ABSENT from the live deployment while present on
+# origin/main, and this check reported the surface it could see as consistent, because a `.py` is not
+# a `.sh`. `$O/gh-rest/gh` resolves `$SELF_DIR/../gh-limit.py`; without it the shim printed
+#   `gh-rest: WARNING no limit layer … this call was NOT serialised or backed off (#1988)`
+# and fell back to the raw binary, which failed outright (`GraphQL: API rate limit already exceeded`
+# while REST reported `graphql 4537/5000` remaining) → every `gh issue view` / `gh pr list` refused →
+# pre-flight DEGRADED/INCOMPLETE → `refresh-candidates.sh` aborts by design (#1736) → `candidates.txt`
+# stayed 0 lines for 4.5 h → `[dispatch] backlog empty queue=READ(203)` with 200 issues open.
+# A filter is not a record: it can only cover the file kinds its author thought of, and every kind it
+# does not name is invisible BY CONSTRUCTION. So the EXPECTED set now comes from the repo (the ref's
+# manifest ∩ the ref's tree) and the DELIVERED set from $O — never the other way round. A record built
+# from the deployment can only report what survives there, which is precisely the file that is gone.
+#
+# The record written by install.sh carries the same list per-file (`shippedFiles`, a path → sha256 map
+# hashed from the SOURCE tree, plus `shippedFileCount`), and when that map describes THIS commit it is
+# cross-checked against the ref's list: a record that omits a shipped path cannot detect its absence,
+# so the record's own completeness is a graded property rather than an assumption.
 #
 # It answers ONE question and changes nothing: READ-ONLY, safe to run while the loop is working.
 # A `git fetch` of the ref is the only network call (skipped with --no-fetch), and a failed fetch
@@ -195,6 +215,26 @@ LIVE="$(o_payload_hash)" || unknown "could not hash the deployed copy at $O (an 
 [ "$PAYLOAD" = "$LIVE" ] || drift "the deployed copy at $O changed after it was recorded (recorded ${PAYLOAD:0:12} vs live ${LIVE:0:12}) — a post-install hand edit"
 [ "$DIRTY" = true ] && drift "the record's source was DIRTY (agentInfraDirty=true): ${HAS:0:12} does not describe the deployed bytes"
 
+# The record's per-file list (#1960). Read from the `shippedFiles` object ONLY: `stamp_field` above
+# scans the whole file, and a map entry whose name happened to match a top-level key would be read as
+# that key. The object is written by install.sh one entry per line, so a line reader is exact.
+stamp_shipped_paths() {
+  awk '
+    /"shippedFiles"[[:space:]]*:[[:space:]]*\{/ { f = 1; next }
+    f && /^[[:space:]]*\}/ { exit }
+    f && match($0, /"[^"]+"/) { print substr($0, RSTART + 1, RLENGTH - 2) }
+  ' "$STAMP"
+}
+# ⛔ A COUNT THAT DISAGREES WITH THE LIST IS CANNOT-VERIFY, not drift: the record would be making two
+# different claims about the same file set and nothing here can say which half is the damaged one.
+REC_COUNT="$(stamp_field_raw shippedFileCount)"
+REC_N="$(stamp_shipped_paths | grep -c . || true)"
+case "$REC_COUNT" in
+  ''|UNKNOWN|*[!0-9]*) : ;;
+  *) [ "$REC_COUNT" -eq "$REC_N" ] \
+       || unknown "the record at $STAMP says it lists $REC_COUNT shipped file(s) but lists $REC_N — the record's own count and its own list disagree, so neither can be used to verify the deployment" ;;
+esac
+
 TMPD="$(mktemp -d 2>/dev/null || true)"
 # ⛔ A FAILED mktemp MUST NOT SILENTLY SKIP THE BYTE COMPARISON. The script is `set -u` (no `set -e`),
 # so an empty TMPD made every redirect below fail, the `|| true`s swallowed it, both `while` loops
@@ -203,19 +243,88 @@ TMPD="$(mktemp -d 2>/dev/null || true)"
 # unwritable TMPDIR blessed a deployment with a MISSING script).
 [ -n "$TMPD" ] || unknown "could not create a temp directory (TMPDIR unset, full or read-only) — the byte comparison cannot run"
 trap 'rm -rf "$TMPD"' EXIT
-git -C "$REPO" ls-tree -r --name-only "$TIP" -- "$REL" 2>/dev/null | grep -E "^${REL}/[^/]+\.sh\$" > "$TMPD/repo-sh" || unknown "cannot read the harness tree at $TIP"
-( cd "$O" && ls -1 *.sh 2>/dev/null || true ) > "$TMPD/deployed-sh" || unknown "cannot list the deployed copy at $O"
+# ── the shipped surface, as DATA read from the REF (#1960) ───────────────────────────────────────
+MAN_REL="$REL/SHIPPED-SURFACE"
+git -C "$REPO" show "$TIP:$MAN_REL" > "$TMPD/manifest" 2>/dev/null \
+  || unknown "cannot read $MAN_REL at $REF ($TIP_SHORT) — the shipped surface is DATA (one path per line, '!' = deliberately not shipped) and without it the expected set is unknown. A ref that predates the manifest cannot be checked, and falling back to a *.sh glob is the blindness #1960 removes"
+manifest_shipped() { # <file> — the shipped paths, one per line
+  sed -e 's/#.*//' "$1" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | grep -v '^$' | grep -v '^!'
+}
+manifest_excluded() { # <file> — the `!` entries; a trailing `/` covers a whole directory
+  sed -n 's/^[[:space:]]*!\(.*\)$/\1/p' "$1" | sed -e 's/[[:space:]]*$//' | grep -v '^$'
+}
+manifest_shipped "$TMPD/manifest" > "$TMPD/shipped" \
+  || unknown "cannot parse $MAN_REL at $REF"
+# ⛔ AN EMPTY SHIPPED LIST MUST NOT BECOME A MATCH. Every loop below iterates this file; with no
+# entries the comparison runs zero times, `problems` stays 0, and this script would print OK over any
+# $O at all — the same fail-open shape as the failed-mktemp defect above, one input over.
+[ -s "$TMPD/shipped" ] \
+  || unknown "$MAN_REL at $REF ($TIP_SHORT) names NO shipped paths — an empty surface would report every deployment as a MATCH"
+manifest_excluded "$TMPD/manifest" > "$TMPD/excluded" || :
 
-while IFS= read -r f; do
-  [ -n "$f" ] || continue
-  d="${f#"$REL"/}"
+# The ref's whole tree under the harness dir: the ground truth the manifest is checked AGAINST.
+git -C "$REPO" ls-tree -r --name-only "$TIP" -- "$REL" 2>/dev/null | sed "s|^$REL/||" > "$TMPD/tree" \
+  || unknown "cannot read the harness tree at $TIP"
+[ -s "$TMPD/tree" ] \
+  || unknown "no files under $REL at $TIP ($TIP_SHORT) — cannot verify a shipped surface against an empty tree"
+
+# ── the manifest's own completeness (#1960) ─────────────────────────────────────────────────────
+# ⛔ THIS IS THE ONE PLACE AN INCOMPLETE MANIFEST IS VISIBLE, so it is graded rather than trusted. A
+# file added to the tree but never added to the manifest is exactly the `gh-limit.py` class again: the
+# record would cover a surface derived from a list that does not contain it. Both directions are red.
+man_problems=0
+man_drift() { man_problems=$((man_problems + 1)); drift "$*"; }
+while IFS= read -r p; do
+  [ -n "$p" ] || continue
+  grep -qxF -- "$p" "$TMPD/shipped" && continue
+  excl=0
+  while IFS= read -r e; do
+    [ -n "$e" ] || continue
+    case "$e" in
+      */) case "$p" in "$e"*) excl=1 ;; esac ;;
+      *)  [ "$p" = "$e" ] && excl=1 ;;
+    esac
+  done < "$TMPD/excluded"
+  [ "$excl" -eq 1 ] \
+    || man_drift "$p — present in the repo tree at $REF but neither shipped nor declared not-shipped in $MAN_REL: the record CANNOT cover a path the manifest does not name (#1960)"
+done < "$TMPD/tree"
+while IFS= read -r p; do
+  [ -n "$p" ] || continue
+  grep -qxF -- "$p" "$TMPD/tree" \
+    || man_drift "$p — named as shipped in $MAN_REL but ABSENT from the repo tree at $REF ($TIP_SHORT): the record would require a file the ref cannot supply"
+done < "$TMPD/shipped"
+
+# ── the record's own file list vs the ref's (#1960) ─────────────────────────────────────────────
+# Only meaningful when the record describes THIS commit: at an older recorded commit its list
+# legitimately describes that older tree, and the BEHIND verdict above is the finding, not these.
+if [ "$HAS" = "$TIP" ]; then
+  if [ "$REC_N" -eq 0 ]; then
+    note "note: the record at $STAMP carries no per-file list (an installer from before #1960) — grading the deployment against $REF's own list, which is the authoritative one"
+  else
+    stamp_shipped_paths > "$TMPD/recorded"
+    while IFS= read -r p; do
+      [ -n "$p" ] || continue
+      grep -qxF -- "$p" "$TMPD/shipped" \
+        || drift "$p — named in the record at $STAMP but NOT shipped by $REF ($TIP_SHORT): the record and the repo disagree about what this deployment contains"
+    done < "$TMPD/recorded"
+    while IFS= read -r p; do
+      [ -n "$p" ] || continue
+      grep -qxF -- "$p" "$TMPD/recorded" \
+        || drift "$p — shipped by $REF but NOT named in the record at $STAMP: a record that omits a shipped path cannot report that path MISSING (#1960)"
+    done < "$TMPD/shipped"
+  fi
+fi
+
+# ── every SHIPPED path, against the deployment ───────────────────────────────────────────────────
+while IFS= read -r d; do
+  [ -n "$d" ] || continue
   if [ ! -f "$O/$d" ]; then
     drift "$d — shipped by the repo at $REF but MISSING from $O"
     continue
   fi
   have="$(git hash-object -- "$O/$d" 2>/dev/null || true)"
-  want="$(git -C "$REPO" rev-parse --verify --quiet "$TIP:$f" 2>/dev/null || true)"
-  [ -n "$want" ] || unknown "cannot read $f at $TIP — cannot verify the deployed $d"
+  want="$(git -C "$REPO" rev-parse --verify --quiet "$TIP:$REL/$d" 2>/dev/null || true)"
+  [ -n "$want" ] || unknown "cannot read $REL/$d at $TIP — cannot verify the deployed $d"
   [ -n "$have" ] || unknown "cannot read $O/$d (unreadable?) — cannot verify it"
   if [ "$have" = "$want" ]; then
     # An `if`, not `[ … ] && …`: the AND-OR list's status is 1 in the ordinary case.
@@ -223,16 +332,32 @@ while IFS= read -r f; do
   else
     drift "$d — the deployed copy DIFFERS from the repo at $REF ($want)"
   fi
-done < "$TMPD/repo-sh"
+done < "$TMPD/shipped"
 
+# ── what the deployment carries that the repo does not ship ──────────────────────────────────────
+# ⛔ SCOPED ON PURPOSE, TO THE KINDS THE HARNESS EXECUTES. The mirror rule (a retired or hand-placed
+# file must not stay INVOCABLE) is what this half is for, so it covers the two kinds the harness
+# execs (`*.sh`, `*.py` — `$O/gh-limit.py` is executed by every gh call) and the two shim directories.
+# It deliberately does NOT sweep every file in $O: that directory also holds runtime state at depth 1
+# (`candidates.txt`, `dispatched.txt`, `heartbeat`, `-<issue>-fixer.txt`, `*.bak-*`), and a rule that
+# called those drift would make every healthy box red — the over-block this check must not become.
+( cd "$O" && { ls -1 *.sh *.py gh-rest/* gh-limit/* 2>/dev/null || true; } ) > "$TMPD/deployed" 2>/dev/null \
+  || unknown "cannot list the deployed copy at $O"
 while IFS= read -r d; do
   [ -n "$d" ] || continue
-  grep -qxF "$REL/$d" "$TMPD/repo-sh" || drift "$d — present in $O but NOT shipped by the repo at $REF (a hand-placed or retired script)"
-done < "$TMPD/deployed-sh"
+  [ -d "$O/$d" ] && continue
+  grep -qxF -- "$d" "$TMPD/shipped" \
+    || drift "$d — present in $O but NOT shipped by the repo at $REF (a hand-placed or retired file the harness would execute)"
+done < "$TMPD/deployed"
 
 if [ "$problems" -gt 0 ]; then
   bad ""
   bad "check-deployed-drift: the deployed harness at $O does NOT match $REPO@$REF ($TIP_SHORT)"
+  if [ "$man_problems" -gt 0 ]; then
+    # A manifest defect is NOT repaired by deploying: say so, or the operator loops on the remedy.
+    bad "  ($man_problems of these are about $MAN_REL itself, at $REF — a REPO defect, not this box's:"
+    bad "   add the file to that list as shipped, or declare it '!'-not-shipped with a reason, and commit)"
+  fi
   bad "  remedy: deploy AND restart from the repo in one verified step — never a bare cp, which"
   bad "  cannot stamp the record and can swap orch-loop.sh under a running controller:"
   bad "    O='$O' REPO='$REPO' bash '$REPO/$REL/harness.sh' restart"

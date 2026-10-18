@@ -1,0 +1,105 @@
+# SHIPPED-SURFACE — the harness's shipped surface, AS DATA (agent-infra#1960).
+#
+# WHAT THIS FILE IS. The one place that says, in reviewable text, which files under
+# scripts/orchestrator-harness/ a deployment at $O is supposed to receive. Three programs read it and
+# none of them keeps its own copy of the answer:
+#
+#   install.sh                 records a per-file content hash of every shipped path in
+#                              $O/.agent-infra-stamp.json ("shippedFiles" + "shippedFileCount"),
+#                              taken from the SOURCE tree — never from the deployment.
+#   check-deployed-drift.sh    reads this file AT THE REF and requires every shipped path to be
+#                              present in $O with the ref's bytes; a missing one is named MISSING.
+#   harness.sh deploy          mirrors exactly this list into $O and removes what it no longer names.
+#
+# ⛔ WHY THIS EXISTS — the defect it removes. Until 2026-10-18 the deployed-bytes record covered
+# `$O/*.sh` and nothing else: a `grep -E '^…/[^/]+\.sh$'` over the ref's tree. Measured on the laptop
+# the same day: `$O/gh-limit.py` was ABSENT from the live deployment while present on origin/main, and
+# the record never saw it, because a `.py` is not a `.sh`. `$O/gh-rest/gh:102` resolves
+# `$SELF_DIR/../gh-limit.py`; without it the shim printed
+#   `gh-rest: WARNING no limit layer … this call was NOT serialised or backed off (#1988)`
+# and fell back to the raw binary, which then failed outright (`GraphQL: API rate limit already
+# exceeded` while REST reported `graphql 4537/5000` remaining). Every `gh issue view` / `gh pr list`
+# was refused → pre-flight DEGRADED/INCOMPLETE for every candidate → `refresh-candidates.sh` aborts by
+# design (#1736) → `candidates.txt` stayed 0 lines for 4.5 h → `[dispatch] backlog empty queue=READ(203)`
+# with 200 issues open and 19 of 20 lane slots free. A filter is not a record: a glob can only cover
+# the kinds of file its author happened to think of, and every kind it does not name is invisible
+# BY CONSTRUCTION — the record then reports a MATCH over a deployment that is missing files.
+#
+# ⛔ THE RULE, AND WHY IT IS AN ALLOWLIST OF PATHS RATHER THAN OF EXTENSIONS. Every file in this
+# directory ships UNLESS it is named below with a leading `!`. A new file added to the tree is
+# therefore NOT covered by default: `check-deployed-drift.sh` compares the ref's tree against THIS
+# FILE and reports any tree file that is neither shipped nor declared not-shipped. That is the one
+# place the incompleteness of this list can be seen, and it is a red deployment, not a silence.
+# Extensions would have been shorter and would have re-created the defect the first time someone
+# shipped a `.json`, a `.toml`, or an extensionless bin shim.
+#
+# FORMAT — one path per line, relative to this directory:
+#   <path>        ships: deploy copies it to $O/<path> and the record must name it
+#   !<path>       does NOT ship. <path> may end in `/` to cover a whole directory.
+#   # …           comment. Blank lines ignored.
+# Keep this file sorted within its groups.
+#
+# ── documentation ────────────────────────────────────────────────────────────────────────────────
+ARCHITECTURE.md
+README.md
+# ── the entry point, the supervisor, and the scripts the daemon executes ─────────────────────────
+harness.sh
+supervisor.sh
+orch-loop.sh
+launchd-cycle.sh
+# ── the gh layers: the REST adapter (Mac) and the serialiser/backoff shim (cell). BOTH ship, because
+#    `gh-rest/gh` and `gh-limit/gh` are the two entry points over ONE `../gh-limit.py` — the shims
+#    recognise each other by the `harness-gh-shim-marker` line instead of by a sibling's existence, so
+#    a box carrying both resolves to the REAL gh rather than into a loop (#1988).
+gh-rest/gh
+gh-limit/gh
+gh-limit.py
+# ── dispatch, merge and claims ───────────────────────────────────────────────────────────────────
+claims.sh
+refresh-candidates.sh
+repo-authority.sh
+spawn-gate.sh
+dispatch-merge.sh
+nonblocking-dispatch.sh
+lane.sh
+chain-merge.sh
+merge-one.sh
+fix-one.sh
+adopt-fix.sh
+# ── operator surfaces: the installer, the drift checks, the report ───────────────────────────────
+install.sh
+check-deployed-drift.sh
+check-port-drift.sh
+report.sh
+# ── launchd job templates (rendered by install.sh; a stack label rendered from the single-loop
+#    template would replace a supervised stack with a bare loop — see harness.sh's TEMPLATE rule) ──
+launchd.plist.template
+launchd-stack.plist.template
+port-provenance.txt
+# ── the shipped surface itself. It ships: a deployment that cannot say what it should contain is a
+#    deployment whose record cannot be audited offline.
+SHIPPED-SURFACE
+# ── suites. They ship because `cp <harness>/*.sh $O/` has always shipped them, and because a
+#    deployment's own self-test is worth having beside the bytes it grades. ──────────────────────
+selftest.sh
+supervisor.test.sh
+harness.test.sh
+gh-rest.test.sh
+gh-limit.test.sh
+spawn-gate.test.sh
+sweep-quota.test.sh
+refresh-scout.test.sh
+claim-cwd.test.sh
+claim-exclusion.test.sh
+cloud-cell-record-dep.test.sh
+install-launchd-durability.test.sh
+test-claims.sh
+test-crossbox.sh
+test-gates.sh
+# ── DELIBERATELY NOT SHIPPED ─────────────────────────────────────────────────────────────────────
+# `retired/` is kept in the tree for archaeology and must NEVER be deployed: these wrappers name
+# scripts and call shapes the harness no longer has, and a retired wrapper left invocable in $O is
+# how a stale entry point outlives the fix that retired it (harness.sh `deploy` reports it as
+# "present in $O but NOT shipped by the repo"). It is listed here so its absence from $O is a
+# DECISION with a reason, not an oversight the record should rediscover.
+!retired/
