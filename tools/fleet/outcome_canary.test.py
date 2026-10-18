@@ -1900,6 +1900,128 @@ def test_a_fixture_expectation_naming_an_unknown_check_is_a_mismatch():
 
 
 @test
+def test_a_TORN_queue_record_is_a_failed_read_not_a_missing_key():
+    """`read_file` returns ("", None) for `cat` of an EMPTY file, and the harness writes the record with
+    `>` (truncate, then write), so a full disk — the exact moment `headroom` FAILs — a kill or a reboot
+    leaves it EMPTY BUT FRESH. Read as `ok: True, raw: ""` the record was silently dropped, the
+    one-refresh-old header decided, and both queue checks answered PASS with a blank printed where the
+    verdict should be."""
+    m = load()
+    cfg = m.cfg_from_dict({"o_dir": "/O"})
+    mach = m.Machine(None)
+    mach.o_dir = "/O"
+    mach.sh = lambda cmd, timeout=None: (0, "")      # cat of an empty file: rc 0, no stdout
+    rec = m.read_queue_state(mach, cfg, 1792327664.0)
+    assert rec["ok"] is False, rec
+    assert "torn" in (rec.get("error") or ""), rec
+    # a readable record still parses, with its epoch
+    mach.sh = lambda cmd, timeout=None: (0, "READ(203) 1792327600")
+    rec = m.read_queue_state(mach, cfg, 1792327664.0)
+    assert rec["ok"] is True and rec["raw"] == "READ(203) 1792327600", rec
+    assert rec["age_s"] == 64.0, rec
+    # a record whose epoch was never written still gets its age from the FILE, not from nothing
+    mach.sh = lambda cmd, timeout=None: (0, "READ(203)")
+    mach.stat_mtime = lambda path: 1792327600
+    rec = m.read_queue_state(mach, cfg, 1792327664.0)
+    assert rec["age_s"] == 64.0 and rec["age_source"] == "file mtime", rec
+
+
+@test
+def test_the_queue_checks_use_ALLOW_LIST_polarity_on_the_record():
+    """`is False` / `is not False` at the two queue sites let an ABSENT `queue_state` key grade
+    PASS/READABLE over nothing that was read — the one rule the file states for every other collector."""
+    m = load()
+    cfg = m.cfg_from_dict({})
+    d = fx("healthy")
+    del d["facts"]["queue_state"]
+    v = [x for x in m.evaluate(d["facts"], cfg) if x.name == "queue_readable"][0]
+    assert (v.status, v.variant) == (m.INCONCLUSIVE, "QUEUE_STATE_UNREADABLE"), (v.status, v.variant)
+    # a blind box is not an idle one: with no dispatch line and an EMPTY header token the IDLE branch
+    # is the one that would fire, and it must stay shut without a READ record
+    d["facts"]["log_events"]["dispatch_ok"] = []
+    d["facts"]["log_events"]["lane_started"] = []
+    d["facts"]["log_events"]["headers"] = [
+        {"raw": "=== Sun Oct 18 07:47:44 EST 2026 load=5 lanes=0 backlog=0 queue=EMPTY(3m) ===",
+         "age_s": 180, "ts": 1792327000, "backlog": 0, "queue_token": "EMPTY(3m)", "lanes": 0,
+         "load": 5}]
+    w = [x for x in m.evaluate(d["facts"], cfg) if x.name == "work_dispatched"][0]
+    assert w.variant != "IDLE_EMPTY_POOL" and w.status != m.PASS, (w.status, w.variant)
+
+
+@test
+def test_an_ok_MEMORY_read_with_no_number_is_UNREAD_not_zero_mib():
+    """The disk arm's twin: `(avail_mb or 0)` manufactured "0 MiB available" from a field that was never
+    read, i.e. an OOM emergency on the check whose FAIL must mean one."""
+    m = load()
+    cfg = m.cfg_from_dict({})
+    hr = {"disk": {"ok": True, "avail_bytes": int(400 * (1 << 30)), "used_pct": 40.0, "mount": "/"},
+          "mem": {"ok": True, "source": "linux"}}
+    v = m.check_headroom({"headroom": hr}, cfg)
+    assert (v.status, v.variant) == (m.INCONCLUSIVE, "PROBE_UNREADABLE"), (v.status, v.variant)
+    assert "avail_mb" in v.evidence, v.evidence
+
+
+@test
+def test_the_vm_stat_awk_refuses_a_NUMBER_when_any_SUMMED_field_is_missing():
+    """`inact` and `spec` are summed but were never checked, so a reworded label silently contributed
+    0 — measured on this box, rewording two page-count labels turned 7.0 GiB into 214 MiB and produced
+    FAIL/BELOW_FLOOR on a healthy machine."""
+    m = load()
+    mach = m.Machine(None)
+    seen = {}
+
+    def fake_sh(cmd, timeout=None):
+        if "df -k" in cmd:
+            return (0, "/dev/disk1 100 900000000 400000000 40% /")
+        seen["mem_cmd"] = cmd
+        return (0, "darwin UNKNOWN")
+
+    mach.sh = fake_sh
+    hr = mach.headroom("/")
+    for field in ("ps", "free", "inact", "spec"):
+        assert '|| %s == ""' % field in seen["mem_cmd"], (field, seen["mem_cmd"])
+    assert hr["mem"]["ok"] is False, hr["mem"]
+
+
+@test
+def test_the_REST_merged_page_bound_counts_the_CLOSED_page_not_the_merged_subset():
+    """`_collect_rest` filters `merged_at is not None` out of a 100-row closed page, so keying
+    `merged_page_full` on the merged SUBSET could never fire on the surface that answers when
+    GraphQL's bucket is exhausted (measured: 100 closed rows, 97 merged)."""
+    m = load()
+    cfg = m.Cfg()
+    out = {}
+    closed = [{"number": i, "merged_at": None, "created_at": "2026-10-01T00:00:00Z"} for i in range(100)]
+    merged = [{"number": i, "merged_at": "2026-10-18T10:00:00Z"} for i in range(97)]
+    m._fill_counts(out, closed, merged, cfg, 1792327664.0, merged_page_rows=len(closed))
+    assert out["merged_page_full"] is True, out
+    # a short page is not full, whatever fraction of it merged
+    m._fill_counts(out, closed[:10], merged[:10], cfg, 1792327664.0, merged_page_rows=10)
+    assert out["merged_page_full"] is False, out
+
+
+@test
+def test_fleet_activity_reads_the_SAME_queue_token_as_the_queue_checks():
+    """`_activity` read the one-refresh-old header, so four checks disagreed about one world: measured,
+    `queue_readable` FAILed EMPTY_WITH_LARGE_POOL while `pr_created` answered IDLE_NO_WORK ("the fleet
+    had nothing in hand") off the same facts."""
+    m = load()
+    cfg = m.cfg_from_dict({})
+    d = fx("healthy")
+    d["facts"]["log_events"]["headers"] = [
+        {"raw": "=== Sun Oct 18 07:47:44 EST 2026 load=5 lanes=0 backlog=0 queue=EMPTY(3m) ===",
+         "age_s": 180, "ts": 1792327000, "backlog": 0, "queue_token": "EMPTY(3m)", "lanes": 0,
+         "load": 5}]
+    d["facts"]["queue_state"] = {"path": "q", "ok": True, "raw": "READ(223) 1792347000", "age_s": 30}
+    d["facts"]["github"]["prs_created_in_window"] = 0
+    busy, why = m._activity(d["facts"])
+    assert busy is True, why
+    assert "state/queue-state" in why, why
+    v = [x for x in m.evaluate(d["facts"], cfg) if x.name == "pr_created"][0]
+    assert (v.status, v.variant) == (m.FAIL, "NO_PR_CREATED"), (v.status, v.variant)
+
+
+@test
 def test_a_FAILED_READ_of_the_queue_record_does_not_pass_through_the_stale_header():
     """The record exists (a readable header token proves the refresh ran and wrote it), so "I could
     not read it" is a MISSING read — not a licence for the one-refresh-old header to answer EMPTY.
@@ -2303,6 +2425,21 @@ def test_an_UNPARSEABLE_memory_probe_is_INCONCLUSIVE_not_zero_free_mib():
     assert "UNKNOWN" in seen["mem_cmd"] and "seen" in seen["mem_cmd"], seen["mem_cmd"]
     assert hr["disk"]["ok"] is True, hr["disk"]
     assert hr["mem"]["ok"] is False, hr["mem"]        # ← the whole point: unread, not zero
+    # …and the emitted awk must actually DO it, not merely contain the words. Run the program the
+    # command carries against a REAL vm_stat-shaped input, with the fields it SUMS reworded: grepping
+    # the command for "UNKNOWN" cannot tell `if (0) print "darwin UNKNOWN"` from the real guard.
+    prog = re.search(r"vm_stat \| awk '(.*?)'; fi", seen["mem_cmd"], re.S).group(1)
+    full = ("Mach Virtual Memory Statistics: (page size of 16384 bytes)\n"
+            "Pages free:                          100.\n"
+            "Pages inactive:                      200.\n"
+            "Pages speculative:                    50.\n")
+    reworded = full.replace("Pages inactive", "Pages idle-ish").replace(
+        "Pages speculative", "Pages guessed")
+    run = lambda text: subprocess.run(["awk", prog], input=text, capture_output=True,
+                                      text=True).stdout.strip()
+    assert run(full).startswith("darwin "), run(full)
+    assert run(full) != "darwin UNKNOWN", run(full)
+    assert run(reworded) == "darwin UNKNOWN", run(reworded)
     v = m.check_headroom({"headroom": hr}, m.cfg_from_dict({}))
     assert (v.status, v.variant) == (m.INCONCLUSIVE, "PROBE_UNREADABLE"), (v.status, v.variant)
 
@@ -3226,8 +3363,40 @@ MUTATIONS = [
      "            exists = (present.strip().endswith(\"YES\")) if rc3 == 0 else None",
      "            exists = False",
      "test_a_log_that_cannot_be_stat_ed_is_unreadable_not_missing"),
-    ("a failed read of the queue record passes through the stale header",
+    ("a TORN (empty) queue record counts as a successful read",
+     "        qs[\"ok\"] = False\n        qs[\"raw\"] = None\n"
+     "        qs[\"error\"] = \"empty state/queue-state record (torn write)\"",
+     "        qs[\"ok\"] = True\n        qs[\"raw\"] = None",
+     "test_a_TORN_queue_record_is_a_failed_read_not_a_missing_key"),
+    ("an ABSENT queue_state key grades green (deny-list polarity)",
+     "    if qs_rec.get(\"ok\") is not True and tok_src == \"cycle header\":",
      "    if qs_rec.get(\"ok\") is False and tok_src == \"cycle header\":",
+     "test_the_queue_checks_use_ALLOW_LIST_polarity_on_the_record"),
+    ("work_dispatched's IDLE branch accepts an absent queue record",
+     "            and (f.get(\"queue_state\") or {}).get(\"ok\") is True:",
+     "            and (f.get(\"queue_state\") or {}).get(\"ok\") is not False:",
+     "test_the_queue_checks_use_ALLOW_LIST_polarity_on_the_record"),
+    ("an ok MEMORY read with no number reads as 0 MiB",
+     "    if mem.get(\"ok\") and not isinstance(mem.get(\"avail_mb\"), (int, float)):",
+     "    if False:",
+     "test_an_ok_MEMORY_read_with_no_number_is_UNREAD_not_zero_mib"),
+    ("vm_stat sums the inactive/speculative fields without checking they were seen",
+     "            \"if (!seen || ps == \\\"\\\" || free == \\\"\\\" || inact == \\\"\\\" || spec == "
+     "\\\"\\\") \"",
+     "            \"if (!seen || ps == \\\"\\\" || free == \\\"\\\") \"",
+     "test_the_vm_stat_awk_refuses_a_NUMBER_when_any_SUMMED_field_is_missing"),
+    ("the REST merged page bound counts the merged subset, not the closed page",
+     "    _page = merged_page_rows if merged_page_rows is not None else len(merged)",
+     "    _page = len(merged)",
+     "test_the_REST_merged_page_bound_counts_the_CLOSED_page_not_the_merged_subset"),
+    ("fleet activity reads the one-refresh-old header token",
+     "    _tok, _raw, _src = authoritative_queue_token(f, hdr)\n    pool = _tok.get(\"pool\")\n"
+     "    busy = bool((isinstance(backlog, int) and backlog > 0) or (isinstance(pool, int) and pool > 0))",
+     "    pool = parse_queue_token(hdr.get(\"queue_token\")).get(\"pool\")\n    _src = \"cycle header\"\n"
+     "    busy = bool((isinstance(backlog, int) and backlog > 0) or (isinstance(pool, int) and pool > 0))",
+     "test_fleet_activity_reads_the_SAME_queue_token_as_the_queue_checks"),
+    ("a failed read of the queue record passes through the stale header",
+     "    if qs_rec.get(\"ok\") is not True and tok_src == \"cycle header\":",
      "    if False:",
      "test_a_FAILED_READ_of_the_queue_record_does_not_pass_through_the_stale_header"),
     ("an UNPARSEABLE queue record is demoted to the header",
@@ -3305,7 +3474,8 @@ MUTATIONS = [
      "    pool_kind = parse_queue_token(hdr.get(\"queue_token\")).get(\"kind\")",
      "test_the_QUEUE_STATE_record_outranks_a_header_that_is_one_refresh_old"),
     ("an unreadable memory probe is reported as 0 MiB free",
-     "            \"if (!seen || ps == \\\"\\\" || free == \\\"\\\") print \\\"darwin UNKNOWN\\\"; \"",
+     "            \"if (!seen || ps == \\\"\\\" || free == \\\"\\\" || inact == \\\"\\\" || spec == "
+     "\\\"\\\") \"",
      "            \"\"",
      "test_an_UNPARSEABLE_memory_probe_is_INCONCLUSIVE_not_zero_free_mib"),
     ("an ABSENT open_pr_count counts as agreement",

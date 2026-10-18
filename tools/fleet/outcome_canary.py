@@ -867,7 +867,9 @@ def check_queue_readable(f, c):
             tok_src, hdr.get("queue_token") or "(absent)")
     backlog = hdr.get("backlog")
 
-    if qs_rec.get("ok") is False and tok_src == "cycle header":
+    # ⛔ ALLOW-LIST POLARITY: an ABSENT `ok` is a MISSING READ, not a successful one. `is False` let
+    # a facts dict with NO `queue_state` key at all grade PASS/READABLE over nothing that was read.
+    if qs_rec.get("ok") is not True and tok_src == "cycle header":
         return V("queue_readable", INCONCLUSIVE, "QUEUE_STATE_UNREADABLE",
                  "header: %s\npool token: %s\n%s"
                  % (hdr.get("raw"), raw_tok, state_txt),
@@ -937,6 +939,50 @@ def check_queue_readable(f, c):
     return V("queue_readable", PASS, "READABLE",
              "header: %s\npool token: %s\n%s\nbacklog=%s"
              % (hdr.get("raw"), raw_tok, state_txt, backlog))
+
+
+def read_queue_state(machine, cfg, now):
+    """The refresh's own recorded verdict: `{ok, raw, age_s, path}`.
+
+    Extracted from `collect_live` so the COLLECTOR CONTRACT is testable directly: every defect in
+    this record's reading (a failed `cat`, a torn/empty body, a missing epoch) was a green verdict
+    that fixtures alone could not reach, because the fixtures supply an already-built dict.
+    """
+    qs_raw, qs_err = machine.read_file(os.path.join(cfg.o_dir, "state", "queue-state"))
+    qs = {"path": os.path.join(cfg.o_dir, "state", "queue-state")}
+    if qs_raw is None:
+        qs["ok"] = False
+        qs["error"] = qs_err
+        qs["raw"] = None
+    elif not (qs_raw or "").strip():
+        # ⛔ A TORN WRITE IS NOT A VERDICT. `read_file` returns ("", None) for `cat` of an EMPTY file
+        # (rc 0, no stdout), and `refresh-candidates.sh` writes the record with `>` — truncate first,
+        # then write — so a full disk (the exact moment `headroom` FAILs), a kill or a reboot
+        # mid-write leaves it EMPTY BUT FRESH. Read as `ok: True, raw: ""` the record was silently
+        # dropped, the one-refresh-old header decided, and both queue checks answered PASS / exit 0
+        # with a blank printed where the verdict should be: agent-infra#1931 as health, one shape
+        # beyond the failed-read and UNPARSEABLE shapes already closed. The harness's own
+        # `queue_state_token` maps an empty body to UNKNOWN; this must agree.
+        qs["ok"] = False
+        qs["raw"] = None
+        qs["error"] = "empty state/queue-state record (torn write)"
+    else:
+        qs["ok"] = True
+        qs["raw"] = qs_raw.strip()[:120]
+        m = re.search(r"\b(\d{9,})\b", qs_raw)
+        # Same rule, and this one is load-bearing for a verdict: `queue_stale_s` is the defence that
+        # stops a frozen pool read from establishing EMPTINESS, and `max(0.0, …)` let a clock running
+        # ahead of the canary make a stale record read as 0s old.
+        qs["age_s"] = _age_of(now, int(m.group(1))) if m else None
+        if qs["age_s"] is None:
+            # The harness writes `"$token $(date +%s)"`; a record whose epoch field never got written
+            # still has an mtime, which IS when it was recorded. Without this its currency was
+            # permanently UNKNOWN and `queue_stale_s` could never fire on it.
+            mt = machine.stat_mtime(os.path.join(cfg.o_dir, "state", "queue-state"))
+            if mt is not None:
+                qs["age_s"] = _age_of(now, mt)
+                qs["age_source"] = "file mtime"
+    return qs
 
 
 def _log_repo_of(f):
@@ -1034,7 +1080,7 @@ def authoritative_queue_token(f, hdr):
     hdr_tok = parse_queue_token(hdr.get("queue_token") if hdr else "")
     qs = f.get("queue_state") or {}
     qs_raw = (qs.get("raw") or "").strip()
-    qs_tok = parse_queue_token(qs_raw) if qs_raw else None
+    qs_tok = parse_queue_token(qs_raw) if (qs_raw and qs.get("ok") is True) else None
     # ⛔ `UNPARSEABLE` IS AUTHORITATIVE TOO — one rule for both sources. `refresh-candidates.sh`'s
     # `queue_state_token` maps a token outside the vocabulary to UNKNOWN, and the harness's own suite
     # writes exactly that (`garbage here`), so excluding it graded the same record two ways: as the
@@ -1236,7 +1282,8 @@ def check_work_dispatched(f, c):
                  "queue=EMPTY but the header carries no `backlog=` field: %s" % hdr,
                  "an incomplete header cannot establish that the pool was genuinely empty, so "
                  "'nothing to dispatch' is not established. Not green.")
-    if pool_kind == "EMPTY" and backlog == 0 and (f.get("queue_state") or {}).get("ok") is not False:
+    if pool_kind == "EMPTY" and backlog == 0 \
+            and (f.get("queue_state") or {}).get("ok") is True:
         return V("work_dispatched", PASS, "IDLE_EMPTY_POOL", evidence,
                  "nothing was dispatched because the pool was read as genuinely EMPTY — the one "
                  "shape where 'no dispatch' is the correct outcome.")
@@ -1262,9 +1309,14 @@ def _activity(f):
     if not hdr:
         return False, "no cycle header in the parsed log tail"
     backlog = hdr.get("backlog")
-    pool = parse_queue_token(hdr.get("queue_token")).get("pool")
+    # ⛔ THE SAME AUTHORITATIVE TOKEN the queue checks grade. Reading the one-refresh-old header here
+    # made four checks disagree about one world: measured, `queue_readable` FAILed
+    # EMPTY_WITH_LARGE_POOL while `pr_created` answered IDLE_NO_WORK ("the fleet had nothing in
+    # hand") off the same facts. The pool number and its SOURCE go into the evidence.
+    _tok, _raw, _src = authoritative_queue_token(f, hdr)
+    pool = _tok.get("pool")
     busy = bool((isinstance(backlog, int) and backlog > 0) or (isinstance(pool, int) and pool > 0))
-    return busy, "backlog=%s pool=%s" % (backlog, pool)
+    return busy, "backlog=%s pool=%s (source: %s)" % (backlog, pool, _src)
 
 
 def _gh_surface_txt(gh):
@@ -1500,8 +1552,13 @@ def check_headroom(f, c):
         lines.append("disk: UNREADABLE (%s)" % (disk.get("error") or "?"))
         unknown.append("disk")
 
-    if mem.get("ok"):
-        mb = mem.get("avail_mb") or 0
+    # ⛔ THE DISK ARM'S TWIN: `(avail_mb or 0)` manufactures "0 MiB available" out of a field that
+    # was never read, i.e. an OOM emergency on the check whose FAIL must mean one.
+    if mem.get("ok") and not isinstance(mem.get("avail_mb"), (int, float)):
+        lines.append("memory: READ ok but NO avail_mb field (%r)" % (mem.get("avail_mb"),))
+        unknown.append("memory")
+    elif mem.get("ok"):
+        mb = mem["avail_mb"]
         lines.append("memory: %.0f MiB available — floor %.0f MiB (source: %s)"
                      % (mb, c.mem_floor_mb, mem.get("source") or "?"))
         if mb < c.mem_floor_mb:
@@ -1537,10 +1594,12 @@ def rollup_is_green(rollup):
     — and a red-reading green PR silently drops out of the `landers` population, which is a false
     green on the one check that exists to catch a lander expiring on a PR nobody looked at. (The
     repo-wide rule: a re-run ADDS a red, it does not clear one.)
-    So attempts are grouped and only the newest per group is graded. Grouping matches the MERGE
-    RAIL (`scripts/admin-merge.sh`), which keys checks on `(app, name)` — two workflows can share a
-    job name, and that conflation is the rail's own declared residual, so this check reads the same
-    surface the merge decision reads instead of inventing a third notion of "green".
+    So attempts are grouped and only the newest per group is graded. ⛔ GROUPING IS
+    `(workflowName | actions-run id | app.slug, name)` — the merge rail's `(app, name)` key is
+    deliberately NOT reused, because it merges two workflows that share a job name (measured:
+    `changes` is published by both `CI` and `Python CI`), and a shared job name is exactly how a
+    red check gets masked by a green one. See `_check_key`; the rail's conflation is its own
+    declared residual, referenced there and not inherited here.
     Newest attempt = highest `id` (`started_at` is nullable and `completed_at` can tie). Where a
     surface supplies no ids (a legacy status context), later list position wins.
 
@@ -2704,7 +2763,11 @@ class Machine(object):
             # check whose FAIL is supposed to mean one. `seen` makes the read's own success explicit.
             "END{gsub(/\\./,\"\",ps); gsub(/\\./,\"\",free); gsub(/\\./,\"\",inact); "
             "gsub(/\\./,\"\",spec); "
-            "if (!seen || ps == \"\" || free == \"\") print \"darwin UNKNOWN\"; "
+            # inact/spec are SUMMED, so a reworded label for either silently contributed 0: measured
+            # on this box, rewording "Pages inactive"/"Pages speculative" turned 7.0 GiB into 214 MiB
+            # and produced FAIL/BELOW_FLOOR on a healthy machine.
+            "if (!seen || ps == \"\" || free == \"\" || inact == \"\" || spec == \"\") "
+            "print \"darwin UNKNOWN\"; "
             "else printf \"darwin %d\\n\", (free+inact+spec)*ps/1024/1024}'; fi 2>&1")
         mem = {"ok": False, "error": (out or "").strip()[:200]}
         if rc == 0 and out.strip():
@@ -2933,7 +2996,7 @@ def _collect_rest(gh, repo, cfg, now, errors):
 
     out = _gh_empty()
     out["source"] = "rest"
-    _fill_counts(out, open_raw, merged, cfg, now)
+    _fill_counts(out, open_raw, merged, cfg, now, merged_page_rows=len(closed))
 
     probe_max = int(cfg.rest_probe_max)
     rows, unprobed, detail_errors = [], 0, []
@@ -2994,7 +3057,7 @@ def _collect_rest(gh, repo, cfg, now, errors):
     return out
 
 
-def _fill_counts(out, open_prs, merged, cfg, now):
+def _fill_counts(out, open_prs, merged, cfg, now, merged_page_rows=None):
     win = cfg.pr_window_s
     merged_ts = [t for t in (parse_github_ts(p.get("mergedAt") or p.get("merged_at"))
                              for p in merged) if t]
@@ -3003,7 +3066,12 @@ def _fill_counts(out, open_prs, merged, cfg, now):
     # not merge recency: on this repo the 100 newest-created merged PRs span 7.6 days, so a PR created
     # 8+ days ago and merged in the last 3h sits OUTSIDE the page and the count reads 0 — a false
     # NO_PR_MERGED. `page_full` already discloses the same bound for open PRs; merges had nothing.
-    out["merged_page_full"] = len(merged) >= 100
+    # ⛔ THE PAGE IS THE CLOSED PAGE, NOT THE MERGED SUBSET. `_collect_rest` filters
+    # `merged_at is not None` out of a 100-row `state=closed` page, so `len(merged)` can never reach
+    # the bound unless nothing was filtered — the guard could not fire on the surface that answers
+    # when GraphQL's shared bucket is exhausted (measured here: 100 closed rows, 97 merged).
+    _page = merged_page_rows if merged_page_rows is not None else len(merged)
+    out["merged_page_full"] = _page >= 100
     out["last_merged"] = _iso(max(merged_ts)) if merged_ts else None
     created_ts = [t for t in (parse_github_ts(p.get("createdAt") or p.get("created_at"))
                               for p in list(merged) + list(open_prs)) if t]
@@ -3110,29 +3178,7 @@ def collect_live(cfg, machine=None, now=None, skip=()):
             hb["error"] = "unparseable heartbeat: %r" % hb_raw[:80]
     facts["heartbeat"] = hb
 
-    qs_raw, qs_err = machine.read_file(os.path.join(cfg.o_dir, "state", "queue-state"))
-    qs = {"path": os.path.join(cfg.o_dir, "state", "queue-state")}
-    if qs_raw is None:
-        qs["ok"] = False
-        qs["error"] = qs_err
-        qs["raw"] = None
-    else:
-        qs["ok"] = True
-        qs["raw"] = qs_raw.strip()[:120]
-        m = re.search(r"\b(\d{9,})\b", qs_raw)
-        # Same rule, and this one is load-bearing for a verdict: `queue_stale_s` is the defence that
-        # stops a frozen pool read from establishing EMPTINESS, and `max(0.0, …)` let a clock running
-        # ahead of the canary make a stale record read as 0s old.
-        qs["age_s"] = _age_of(now, int(m.group(1))) if m else None
-        if qs["age_s"] is None:
-            # The harness writes `"$token $(date +%s)"`; a record whose epoch field never got written
-            # still has an mtime, which IS when it was recorded. Without this its currency was
-            # permanently UNKNOWN and `queue_stale_s` could never fire on it.
-            mt = machine.stat_mtime(os.path.join(cfg.o_dir, "state", "queue-state"))
-            if mt is not None:
-                qs["age_s"] = _age_of(now, mt)
-                qs["age_source"] = "file mtime"
-    facts["queue_state"] = qs
+    facts["queue_state"] = read_queue_state(machine, cfg, now)
 
     facts["controller"] = machine.snapshot_controller()
     facts["launchd"] = machine.launchd_state(cfg.label)
@@ -3238,7 +3284,7 @@ REQUIRED_FIXTURES = (
     "dispatch-intent-not-spawned", "dispatch-unconfirmed", "dispatch-previous-batch-spawn",
     "queue-state-unreadable-newer", "lander-from-another-repo", "merged-surface-truncated",
     "no-pr-created", "idle-no-work", "headroom-disk-only-low", "headroom-mem-only-low",
-    "queue-state-read-failed", "daemon-protection-unread",
+    "queue-state-read-failed", "queue-state-torn", "daemon-protection-unread",
 )
 
 
