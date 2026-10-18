@@ -393,6 +393,265 @@ def test_a_flaky_re_run_reads_GREEN_rather_than_red():
 
 
 @test
+def test_a_PR_with_NO_check_surface_is_UNPROBED_not_dropped_from_the_lander_population():
+    """`rollup_is_green` answers None for "there is no check surface to read" (a path-filtered
+    workflow, a fork PR awaiting approval, a repo with no required checks). Grading that `False` while
+    `probed` derived from mergeability alone put the PR in NEITHER `candidates` NOR `unprobed`, so a
+    CLEAN, APPROVED, UNARMED PR produced PASS/NOTHING_GREEN and exit 0 — the exact silent expiry the
+    check exists for. Both collectors must mark it UNPROBED."""
+    m = load()
+    assert m.rollup_is_green([]) is None          # NO SURFACE READ — not "red", not "green"
+    assert m.rollup_is_green(None) is None
+    assert m.rollup_is_green([{"conclusion": "FAILURE"}]) is False
+
+    real = m._run_gh
+
+    def fake(argv):
+        j = " ".join(argv)
+        if j.endswith("--json") or "pr list" in j:
+            if "--state merged" in j:
+                return 0, "[]"
+            return 0, json.dumps([{                                  # CLEAN + APPROVED, no checks
+                "number": 4242, "mergeStateStatus": "CLEAN", "autoMergeRequest": None,
+                "isDraft": False, "statusCheckRollup": [], "reviewDecision": "APPROVED",
+                "createdAt": "2026-10-18T03:00:00Z", "mergedAt": None}])
+        return 0, "[]"
+
+    try:
+        m._run_gh = fake
+        gh = m.collect_github("o/r", m.Cfg(), now=1792327664.0)
+    finally:
+        m._run_gh = real
+    assert gh["ok"] is True, gh
+    row = gh["open_prs"][0]
+    assert row["checks_green"] is None, row
+    assert row["probed"] is False, row           # …so it reaches PARTIAL_POPULATION, not silence
+
+    facts = fx("healthy")["facts"]
+    facts["github"] = gh
+    cfg = m.cfg_from_dict(fx("healthy")["config"])
+    v = [x for x in m.evaluate(facts, cfg) if x.name == "landers"][0]
+    assert v.status == m.INCONCLUSIVE, (v.status, v.variant, v.evidence)
+    assert v.variant == "PARTIAL_POPULATION", v.variant
+    assert "4242" in v.evidence, v.evidence
+
+
+@test
+def test_a_process_that_MENTIONS_the_daemon_is_not_the_daemon():
+    """The unscoped-substring defect the controller census was fixed for, three times over, was still
+    open in the pane census: `tail -f ~/.cmux/cmux-tui.out` and `less …/cmux-tui.log` counted as the
+    daemon — processes an operator creates by following this check's own NEXT COMMAND — and because
+    the fleet deprioritises lanes they inherit a negative oom_score_adj, so a machine with NO daemon
+    read PASS/ALIVE_PROTECTED."""
+    m = load()
+    ps = "\n".join([
+        "  72496 /Applications/cmux.app/Contents/MacOS/cmux-tui",
+        "  76777 /usr/local/bin/cmux-tui --no-color",
+        "  905 tail -f /Users/x/.cmux/cmux-tui.out",
+        "  906 less /Users/x/.cmux/logs/cmux-tui.log",
+        "  907 /bin/zsh -c less /Users/x/.cmux/cmux-tui.log",
+        "  908 node /opt/homebrew/lib/node_modules/cmux/cmux-tui serve",
+        "  909 ps -Ao pid=,command=",
+    ])
+    pids, near = m.pick_pane_daemon_pids(ps)
+    assert [r["pid"] for r in pids] == [72496, 76777, 908], pids
+    # 909 is the probe's OWN `ps` line: it does not mention the daemon, so it is not even a candidate
+    assert sorted(n["pid"] for n in near) == [905, 906, 907], near
+
+    facts = fx("healthy")["facts"]
+    facts["pane"] = {"ok": True, "cmd": "cmux-tui", "protection_supported": True,
+                     "protection_source": "oom_score_adj",
+                     "pids": [], "near_misses": near}
+    cfg = m.cfg_from_dict(fx("healthy")["config"])
+    v = [x for x in m.evaluate(facts, cfg) if x.name == "pane_daemon"][0]
+    assert v.status == m.FAIL, (v.status, v.variant)
+    assert v.variant == "DAEMON_ABSENT", v.variant
+    assert "905" in v.evidence, v.evidence        # what was REJECTED is evidence
+
+
+@test
+def test_an_EMPTY_gh_response_is_a_failed_read_not_zero_PRs():
+    """`json.loads(txt or "[]")` turned a gh that exited 0 with NO output (a wrapper that swallows
+    stdout, a truncated pipe) into "zero PRs": collect_github returned ok=True and `landers` PASSed
+    over a population it never read. `_gh_empty()` exists to forbid exactly that."""
+    m = load()
+    assert m._json_list("") is None and m._json_list("   ") is None
+    assert m._json_obj("") is None
+    assert m._json_list("[]") == []               # a real empty list still parses
+    real = m._run_gh
+    try:
+        m._run_gh = lambda argv: (0, "")
+        gh = m.collect_github("o/r", m.Cfg(), now=1792327664.0)
+    finally:
+        m._run_gh = real
+    assert gh["ok"] is False, gh                  # NOT ok=True with zero PRs
+    facts = fx("healthy")["facts"]
+    facts["github"] = gh
+    cfg = m.cfg_from_dict(fx("healthy")["config"])
+    got = dict((v.name, (v.status, v.variant)) for v in m.evaluate(facts, cfg))
+    for name in ("pr_created", "pr_merged", "landers"):
+        assert got[name] == (m.INCONCLUSIVE, "GH_UNREADABLE"), (name, got[name])
+
+
+@test
+def test_a_TRUNCATED_check_run_page_is_not_a_green_rollup():
+    """The REST check-runs read is bounded at per_page=100 and the bound was never surfaced, though
+    `total_count` was in hand and the PR-list bound is a verdict input (`page_full`). A red run past
+    page one made the page-one read `True` and the PR LANDERS_ARMED on a commit that is not green."""
+    m = load()
+    real = m._run_gh
+
+    def fake(argv):
+        j = " ".join(argv)
+        if "pulls?state=open" in j:
+            return 0, json.dumps([{"number": 900, "draft": False, "auto_merge": {"x": 1},
+                                   "mergeable_state": "clean", "head": {"sha": "a" * 40}}])
+        if "pulls?state=closed" in j:
+            return 0, "[]"
+        if "check-runs" in j:
+            # 102 runs exist; the page holds one, and it is GREEN — the red one is past the bound
+            return 0, json.dumps({"total_count": 102,
+                                  "check_runs": [{"conclusion": "success", "name": "ci"}]})
+        return 0, json.dumps({"mergeable_state": "clean", "head": {"sha": "a" * 40}})
+
+    try:
+        m._run_gh = fake
+        gh = m.collect_github("o/r", m.Cfg(), now=1792327664.0)
+    finally:
+        m._run_gh = real
+    assert gh["ok"] is True and gh["source"] == "rest", gh.get("source")
+    row = gh["open_prs"][0]
+    assert row["checks_green"] is None, row       # TRUNCATED is not green
+    assert row["probed"] is False, row
+    assert "TRUNCATED" in " ".join(gh.get("detail_errors") or []), gh.get("detail_errors")
+
+
+@test
+def test_the_header_timezone_is_USED_so_a_remote_cell_is_not_graded_in_local_time():
+    """The tz token was matched and dropped, with the rest read as LOCAL time. A PST cell read from
+    an EST box reported a 5-minute-old event as 4h05m old, so its `#N auto-armed` line fell out of the
+    window and a green ARMED PR read LANDER_MISSING — the silent-expiry verdict, falsely."""
+    m = load()
+    base = "Sun Oct 18 07:44:14 %s 2026"
+    est, pst = m.parse_cycle_ts(base % "EST"), m.parse_cycle_ts(base % "PST")
+    assert est is not None and pst is not None
+    # 07:44 PST is 3h LATER than 07:44 EST in absolute time: the token decides, not this machine's clock
+    assert pst - est == 3 * 3600, (est, pst)
+    # an absolute conversion, not this machine's zone: 07:44:14 EST is 12:44:14 UTC
+    assert est == m.calendar.timegm((2026, 10, 18, 12, 44, 14, 0, 1, -1)), est
+    # numeric offsets are accepted too (a `date` with a format string prints these)
+    assert m.parse_cycle_ts(base % "+0200") == m.parse_cycle_ts(base % "CEST")
+    # an UNKNOWN token falls back to the local reading rather than being guessed at
+    assert m.parse_cycle_ts(base % "QZT") == m.time.mktime((2026, 10, 18, 7, 44, 14, 0, 1, -1))
+
+
+@test
+def test_a_dry_run_does_NOT_persist_the_default_notification_state():
+    """`--dry-run` says "report only: never send, never respawn" and it still SAVED the state file —
+    clearing a delivered key, which re-arms an alert already sent so the next real poll stacks a
+    SECOND brief, and writing a `last_status` of all-PASS the box does not have."""
+    m = load()
+    tmp = tempfile.mkdtemp(prefix="oc-drystate-")
+    try:
+        facts = os.path.join(tmp, "f.json")
+        with open(facts, "w") as fh:
+            json.dump(fx("dispatch-refused"), fh)
+        # (a) a bare --dry-run must not write the DEFAULT state file
+        default = os.path.join(tmp, "default", "state.json")
+        rc, out, err = run_cli(["--live", "--facts", facts, "--json", "--dry-run",
+                                "--controller-ws", "00000000-0000-0000-0000-0000000000c1"],
+                               env={"OUTCOME_CANARY_STATE": default})
+        j = json.loads(out)
+        assert j["signal"]["state_persisted"] is False, j["signal"]
+        assert not os.path.exists(default), "a preview wrote the default state file"
+        # …and a PRE-EXISTING default state (a delivered key) is left byte-identical, so an alert
+        # already sent is not silently re-armed into a second brief on the next real poll
+        os.makedirs(os.path.dirname(default))
+        with open(default, "w") as fh:
+            json.dump({"version": 1, "boxes": {"local": {"notified": {
+                "work_dispatched|NOT_DISPATCHED": {"at": 1, "delivered": True}}}}}, fh)
+        before = open(default).read()
+        rc, out, err = run_cli(["--live", "--facts", facts, "--json", "--dry-run",
+                                "--controller-ws", "00000000-0000-0000-0000-0000000000c1"],
+                               env={"OUTCOME_CANARY_STATE": default})
+        assert open(default).read() == before, "a preview rewrote the state it only read"
+        # (b) a caller who NAMES a destination (--state / --capture-dir) may write there: that is the
+        # same rule the capture path already follows, and it keeps de-duplication testable
+        rc, out, err = run_cli(_live_facts_args(tmp, "dispatch-refused",
+                                                os.path.join(tmp, "s.json"),
+                                                os.path.join(tmp, "cap")))
+        j = json.loads(out)
+        assert j["signal"]["state_persisted"] is True, j["signal"]
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@test
+def test_a_box_run_does_not_grade_against_THIS_machines_repo():
+    """`_repo_from_plist` opens the LOCAL LaunchAgents plist, so a `--box` run graded a remote cell
+    against whichever cell this machine happens to run — a healthy fleet reported for a repo nobody
+    is working on. Reading the box's plist is not plumbed, so an unnamed repo must abstain."""
+    m = load()
+    a = m.build_parser().parse_args(["--live", "--box", "cell-2"])
+    cfg = m.cfg_from_args(a)
+    assert cfg.repo == "", cfg.repo              # not this machine's repo, and not a guess
+    facts = fx("healthy")["facts"]
+    facts["github"] = m.collect_github("", cfg)  # …which makes the three PR checks abstain
+    got = dict((v.name, v.status) for v in m.evaluate(facts, cfg))
+    for name in ("pr_created", "pr_merged", "landers"):
+        assert got[name] == m.INCONCLUSIVE, (name, got[name])
+    a2 = m.build_parser().parse_args(["--live", "--box", "cell-2", "--repo", "o/r"])
+    assert m.cfg_from_args(a2).repo == "o/r"
+
+
+@test
+def test_an_UNPARSEABLE_header_is_reported_as_unparseable_not_as_absent():
+    """`unparsed_headers` was counted and never read, so the evidence said "none in the parsed log
+    tail" while the log held N headers — a false statement about the world that reads exactly like
+    "the loop wrote nothing"."""
+    m = load()
+    d = fx("healthy")
+    d["facts"]["log_events"]["headers"] = []
+    d["facts"]["log_events"]["unparsed_headers"] = 5
+    cfg = m.cfg_from_dict(d["config"])
+    got = dict((x.name, x) for x in m.evaluate(d["facts"], cfg))
+    v = got["queue_readable"]
+    assert v.variant == "NO_REFRESH", v.variant
+    assert "5 header(s) present but UNPARSEABLE" in v.evidence, v.evidence
+    # …and the SAME datum, because "no cycle in the window" is a claim about the log there too
+    d2 = fx("healthy")
+    d2["facts"]["log_events"]["headers"] = []
+    d2["facts"]["log_events"]["dispatch_ok"] = []
+    d2["facts"]["log_events"]["unparsed_headers"] = 5
+    cfg2 = m.cfg_from_dict(d2["config"])
+    w = [x for x in m.evaluate(d2["facts"], cfg2) if x.name == "work_dispatched"][0]
+    assert w.variant == "NO_CYCLE_IN_WINDOW", (w.variant, w.evidence)
+    assert "5 header(s) present but UNPARSEABLE" in w.evidence, w.evidence
+
+
+@test
+def test_a_genuinely_EMPTY_pool_is_IDLE_and_the_report_SAYS_idle():
+    """The one branch that grants PASS for the ABSENCE of a dispatch (`IDLE_EMPTY_POOL`) was asserted
+    by no fixture and no test, and its variant — the only thing separating "work moved" from "nothing
+    to do" — was unpinned: mutating the variant to `DISPATCHED` survived every gate, so a report line
+    reading "work dispatched" for a fleet that dispatched nothing was unfalsifiable."""
+    m = load()
+    d = fx("healthy")
+    d["facts"]["log_events"]["headers"] = [{
+        "raw": "=== Sun Oct 18 07:47:44 EST 2026 load=4 lanes=0 backlog=0 queue=EMPTY(1m) ===",
+        "age_s": 60, "ts": 1792327664, "backlog": 0, "queue_token": "EMPTY(1m)", "lanes": 0}]
+    d["facts"]["log_events"]["dispatch_ok"] = []
+    d["facts"]["queue_state"] = {"path": "q", "ok": True, "raw": "EMPTY", "age_s": 60.0}
+    cfg = m.cfg_from_dict(d["config"])
+    v = [x for x in m.evaluate(d["facts"], cfg) if x.name == "work_dispatched"][0]
+    assert (v.status, v.variant) == (m.PASS, "IDLE_EMPTY_POOL"), (v.status, v.variant, v.evidence)
+    # …and the fixture that ships with it must agree, through the real CLI
+    rc, out, err = run_cli(["--static", "--fixture",
+                            os.path.join(FIXTURES, "idle-empty-pool.json")])
+    assert rc == 0, (rc, out[-300:], err[-300:])
+
+
+@test
 def test_log_parser_reads_both_measured_header_formats():
     m = load()
     a = "=== Sun Oct 18 07:47:44 EST 2026 load=40 lanes=2 backlog=47 queue=READ(223)(9m) ==="
@@ -1262,7 +1521,10 @@ def test_a_fixture_expectation_naming_an_unknown_check_is_a_mismatch():
         assert rc == 1, (rc, out[-300:])
         j = json.loads(out)
         assert j["mismatches"] and j["mismatches"][0]["got"] == "UNKNOWN_CHECK", j["mismatches"]
-        # and a check excluded by --only must not be silently counted as asserted
+        # A KNOWN check excluded by --only is SKIPPED, not a mismatch: the caller asked for a subset.
+        # Grading it as one made `--static --only X` fail on every fixture's other expectations (105
+        # of them) while the "every fixture matched" branch could never print — an advertised flag
+        # pair that could never succeed. It must still be LOUD, or "asserted nothing" goes silent.
         d2 = fx("healthy")
         d2["_expect"] = {"landers": "PASS"}
         only = os.path.join(tmp, "only.json")
@@ -1270,9 +1532,21 @@ def test_a_fixture_expectation_naming_an_unknown_check_is_a_mismatch():
             json.dump(d2, fh)
         rc, out, err = run_cli(["--static", "--fixture", only,
                                 "--only", "work_dispatched", "--json"])
-        assert rc == 1, (rc, out[-300:])
+        assert rc == 0, (rc, out[-300:])
         j = json.loads(out)
-        assert any(x["got"] == "NOT_EVALUATED" for x in j["mismatches"]), j["mismatches"]
+        assert j["mismatches"] == [], j["mismatches"]
+        assert [x["check"] for x in j["skipped"]] == ["landers"], j["skipped"]
+        # …and the whole shipped fixture set can be run against ONE check (it used to fail 105 times)
+        rc, out, err = run_cli(["--static", "--fixtures-dir", FIXTURES,
+                                "--only", "work_dispatched", "--json"])
+        assert rc == 0, (rc, out[-400:])
+        j = json.loads(out)
+        assert j["mismatches"] == [], j["mismatches"][:3]
+        assert len(j["skipped"]) >= 15, len(j["skipped"])
+        # an UNKNOWN name is still a mismatch: that one asserts nothing at all
+        rc, out, err = run_cli(["--static", "--fixture", only,
+                                "--only", "work_dispatched", "--json"])
+        assert rc == 0, (rc, out[-300:])
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -1707,6 +1981,54 @@ MUTATIONS = [
     ("the census is not scoped to this cell's controller path",
      "        if paths and os.path.normpath(toks[1]) not in paths:", "        if False:",
      "test_the_census_is_scoped_to_THIS_cell_and_reports_what_it_rejected"),
+    # ── cycle-11 defects ────────────────────────────────────────────────────────────
+    ("an unread check surface is graded RED, so a green unarmed PR drops out of the population",
+     "    if not rollup:",
+     "    if not rollup:\n        return False\n    if False:",
+     "test_a_PR_with_NO_check_surface_is_UNPROBED_not_dropped_from_the_lander_population"),
+    ("the pane census counts any process whose command line MENTIONS the daemon",
+     '        is_daemon = (base0 == name\n'
+     '                     or (len(toks) > 1 and os.path.basename(toks[1]) == name',
+     '        is_daemon = (name in cmd or base0 == name\n'
+     '                     or (len(toks) > 1 and os.path.basename(toks[1]) == name',
+     "test_a_process_that_MENTIONS_the_daemon_is_not_the_daemon"),
+    ("an empty gh response reads as zero PRs instead of a failed read",
+     '    if not (txt or "").strip():\n        return None\n    try:\n        d = json.loads(txt)\n'
+     '        return d if isinstance(d, list) else None',
+     '    try:\n        d = json.loads(txt or "[]")\n'
+     '        return d if isinstance(d, list) else None',
+     "test_an_EMPTY_gh_response_is_a_failed_read_not_zero_PRs"),
+    ("a truncated check-run page is graded as a green rollup",
+     '                if isinstance(total, int) and total > len(runs["check_runs"]):',
+     '                if False:',
+     "test_a_TRUNCATED_check_run_page_is_not_a_green_rollup"),
+    ("the header timezone token is dropped and the reading assumes local time",
+     "        off = tz_offset_s(gd.get(\"tz\"))\n        if off is not None:\n"
+     "            return calendar.timegm(struct) - off",
+     "        off = None\n        if off is not None:\n"
+     "            return calendar.timegm(struct) - off",
+     "test_the_header_timezone_is_USED_so_a_remote_cell_is_not_graded_in_local_time"),
+    ("a dry run persists the default notification state",
+     '        if not self.persist:\n            return False          # a preview: the state was '
+     'READ, never WRITTEN',
+     "        if False:\n            return False",
+     "test_a_dry_run_does_NOT_persist_the_default_notification_state"),
+    ("a --box run grades a remote cell against THIS machine's repo plist",
+     "    elif a.box:",
+     "    elif False:",
+     "test_a_box_run_does_not_grade_against_THIS_machines_repo"),
+    ("an unparseable header is reported as a log that contains no header",
+     '                    if unparsed else ""),',
+     '                    if False else ""),',
+     "test_an_UNPARSEABLE_header_is_reported_as_unparseable_not_as_absent"),
+    ("the idle-empty-pool PASS is reported as a DISPATCH",
+     '        return V("work_dispatched", PASS, "IDLE_EMPTY_POOL", evidence,',
+     '        return V("work_dispatched", PASS, "DISPATCHED", evidence,',
+     "test_a_genuinely_EMPTY_pool_is_IDLE_and_the_report_SAYS_idle"),
+    ("a check excluded by --only is graded as a mismatch, so --static --only can never pass",
+     "                if only and name in PREDICATES:",
+     "                if False:",
+     "test_a_fixture_expectation_naming_an_unknown_check_is_a_mismatch"),
     # ── cycle-10 defects ────────────────────────────────────────────────────────────
     ("a re-run attempt is judged by its OLDEST entry, so a flaky job that re-ran green reads red",
      "        if prev is None or rank >= prev[0]:",

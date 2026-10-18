@@ -112,6 +112,7 @@ import os
 import re
 import subprocess
 import sys
+import calendar
 import time
 
 # ── status vocabulary ────────────────────────────────────────────────────────────────────────────
@@ -384,12 +385,54 @@ MONTHS = {
 DOW = {"Mon": 0, "Tue": 1, "Wed": 2, "Thu": 3, "Fri": 4, "Sat": 5, "Sun": 6}
 
 
+# Zone abbreviations the loop's `date` can print, as SECONDS EAST OF UTC. Only unambiguous tokens
+# are listed (so no `IST`, which is both Irish and Indian time, and no `CST`, which is both US Central
+# and China Standard): a token that is not here is NOT guessed at.
+TZ_OFFSETS = {
+    "Z": 0, "UT": 0, "UTC": 0, "GMT": 0,
+    "EST": -18000, "EDT": -14400, "CST": -21600, "CDT": -18000,
+    "MST": -25200, "MDT": -21600, "PST": -28800, "PDT": -25200,
+    "AKST": -32400, "AKDT": -28800, "HST": -36000,
+    "AST": -14400, "ADT": -10800, "NST": -12600, "NDT": -9000,
+    "WET": 0, "WEST": 3600, "BST": 3600, "CET": 3600, "CEST": 7200,
+    "EET": 7200, "EEST": 10800, "MSK": 10800,
+    "JST": 32400, "KST": 32400, "SGT": 28800, "HKT": 28800,
+    "AWST": 28800, "ACST": 34200, "ACDT": 37800, "AEST": 36000, "AEDT": 39600,
+    "NZST": 43200, "NZDT": 46800,
+}
+
+
+def tz_offset_s(tok):
+    """Seconds east of UTC for a header's zone token, or None when it is not understood.
+
+    ⛔ THE TOKEN USED TO BE MATCHED AND THROWN AWAY, with the rest read as LOCAL time. That is only
+    correct while every cell shares the canary's zone: a PST cell read from an EST box reported a
+    5-minute-old event as 4h05m old, so its `#N auto-armed` line fell out of the window and a green
+    ARMED PR read LANDER_MISSING (and a fresh cycle read NO_REFRESH). Neither direction is safe, so
+    the token is converted when it is known and the local-time reading is kept only as a fallback.
+
+    Numeric forms are accepted too (`+0200`, `-05:00`, `+02`), because a `date` with a format string
+    prints those instead of a name.
+    """
+    t = (tok or "").strip().upper()
+    if not t:
+        return None
+    if t in TZ_OFFSETS:
+        return TZ_OFFSETS[t]
+    m = re.match(r"^(?P<sign>[+-])(?P<h>\d{1,2}):?(?P<m>\d{2})?$", t)
+    if not m:
+        return None
+    off = int(m.group("h")) * 3600 + int(m.group("m") or 0) * 60
+    return -off if m.group("sign") == "-" else off
+
+
 def parse_cycle_ts(ts):
     """'Sun Oct 18 07:47:44 EST 2026' → epoch seconds, or None. Both measured formats accepted.
 
-    The timezone token is DROPPED and the rest is interpreted as LOCAL time, which is what the loop
-    wrote it in. `time.strptime('%Z')` only understands UTC/GMT, so parsing it would silently
-    mis-handle EST/EDT by an hour — a wrong age is worse than an unknown one.
+    The timezone token IS USED: a known abbreviation (or a numeric offset) yields an ABSOLUTE epoch,
+    so a cell's age is the same however the canary's own clock is set. An unknown token falls back to
+    the old local-time reading — the writer is a `date` on the box, so local time is the fallback that
+    matches the same-zone case, and guessing at an unrecognised name would be worse than the fallback.
     """
     if not ts:
         return None
@@ -402,8 +445,11 @@ def parse_cycle_ts(ts):
         return None
     try:
         hh, mm, ss = [int(x) for x in gd["hms"].split(":")]
-        return time.mktime((int(gd["year"]), MONTHS[gd["mon"]], int(gd["day"]),
-                            hh, mm, ss, 0, 1, -1))
+        struct = (int(gd["year"]), MONTHS[gd["mon"]], int(gd["day"]), hh, mm, ss, 0, 1, -1)
+        off = tz_offset_s(gd.get("tz"))
+        if off is not None:
+            return calendar.timegm(struct) - off
+        return time.mktime(struct)
     except Exception:
         return None
 
@@ -747,9 +793,16 @@ def check_queue_readable(f, c):
     hdr = newest_with_age(events.get("headers"), win)
     if hdr is None:
         allh = newest(events.get("headers"))
+        unparsed = events.get("unparsed_headers") or 0
         return V("queue_readable", INCONCLUSIVE, "NO_REFRESH",
-                 "no cycle header inside the %.0fs window\nlast: %s"
-                 % (win, allh.get("raw") if allh else "none in the parsed log tail"),
+                 "no cycle header inside the %.0fs window\nlast: %s%s"
+                 % (win, allh.get("raw") if allh else "none in the parsed log tail",
+                    # ⛔ COUNTED AND NEVER READ. The parser counts a header it cannot read, and the
+                    # evidence then said "none in the parsed log tail" while the log held N of them —
+                    # a false statement about the world that reads exactly like "the loop wrote
+                    # nothing", which is the artifact the census's near-misses were created to end.
+                    ("\n%d header(s) present but UNPARSEABLE — the log format moved" % unparsed)
+                    if unparsed else ""),
                  "the refresh did not run in the window, so its verdict cannot be read. Not green.")
 
     tok = parse_queue_token(hdr.get("queue_token"))
@@ -942,6 +995,11 @@ def check_work_dispatched(f, c):
     ev_lines.append("last successful dispatch line: %s"
                     % (("%s (%s)" % (last_ok.get("raw"), _age_txt(last_ok.get("age_s"))))
                        if last_ok else "NONE in the parsed log tail"))
+    unparsed = events.get("unparsed_headers") or 0
+    if unparsed:
+        # The same datum `queue_readable` reads: "no cycle in the window" is a claim about the LOG,
+        # and N headers the parser could not read make it false. One rule, both checks.
+        ev_lines.append("%d header(s) present but UNPARSEABLE — the log format moved" % unparsed)
     evidence = "\n".join(ev_lines)
 
     # POSITIVE evidence that work existed and none of it went out → FAIL. This is the check's whole
@@ -1136,7 +1194,53 @@ def check_pane_daemon(f, c):
              % (len(pids), cmd, pid_txt, adj, prot_txt))
 
 
+PANE_INTERP = re.compile(r"^(?:ba|z|da|k|a)?sh$|^node$|^python3?(?:\.\d+)?$|^bun$|^deno$")
+
+
+def pick_pane_daemon_pids(ps_out, name="cmux-tui"):
+    """Every process that IS the pane daemon — and, separately, every process that merely MENTIONS it.
+
+    ⛔ THE SAME UNSCOPED-SUBSTRING DEFECT THE CONTROLLER CENSUS WAS FIXED FOR, THREE TIMES OVER, left
+    open here: a substring match on the whole command line counted `tail -f ~/.cmux/cmux-tui.out` and
+    `less …/cmux-tui.log` as the daemon. Those are exactly the processes an operator creates by
+    following this check's own NEXT COMMAND (`pgrep -fl cmux-tui`), and the fleet deprioritises lanes,
+    so they inherit a negative `oom_score_adj` and the check read **ALIVE_PROTECTED** while the daemon
+    that carries every lane's surface did not exist. Two processes are the daemon: the binary itself,
+    and an interpreter running it as its FIRST argument. Everything else is a near-miss, returned as
+    evidence so "no daemon" does not look like "there was nothing to see".
+
+    Input is `ps -Ao pid=,command=` (pid, then the command); returns ([{pid, cmd}], [near-miss]).
+    """
+    rows, near = [], []
+    for line in ps_out.splitlines():
+        line = line.strip()
+        if name not in line:
+            continue
+        parts = line.split(None, 1)
+        if len(parts) < 2 or not parts[0].isdigit():
+            continue
+        pid, cmd = int(parts[0]), parts[1]
+        toks = cmd.split()
+        if not toks:
+            continue
+        base0 = os.path.basename(toks[0])
+        is_daemon = (base0 == name
+                     or (len(toks) > 1 and os.path.basename(toks[1]) == name
+                         and PANE_INTERP.match(base0) is not None))
+        if is_daemon:
+            rows.append({"pid": pid, "cmd": cmd[:300]})
+        else:
+            near.append({"pid": pid, "cmd": cmd[:300]})
+    return rows, near
+
+
 def _pane_protection_txt(pane):
+    near = pane.get("near_misses") or []
+    if near:
+        # Evidence, not decoration: a census that rejected something must say so, or "0 daemons"
+        # looks identical to "there was nothing to look at".
+        return "REJECTED (mentioned the name, is not the daemon): %s" % ", ".join(
+            "%s %s" % (n.get("pid"), (n.get("cmd") or "")[:60]) for n in near[:5])
     if pane.get("protection_supported"):
         return ("protection source: %s (negative = deprioritised; -1000 = immune; 0 is the "
                 "DEFAULT and protects nothing)" % (pane.get("protection_source") or "oom_score_adj"))
@@ -1214,10 +1318,18 @@ def rollup_is_green(rollup):
 
     Polarity, not vocabulary: `success`/`neutral`/`skipped` are green, `cancelled`/`stale` are
     non-red, and EVERY OTHER CONCLUSION — including one GitHub has not documented and a null one —
-    is RED. A missing check is not a green check: an EMPTY rollup returns False.
+    is RED. A missing check is not a green check — and an EMPTY/absent rollup is not "not green"
+    either: it is `None`, meaning NO CHECK SURFACE WAS READ.
     """
     if not rollup:
-        return False
+        # ⛔ `None`, NOT False. "No check surface at all" — a path-filtered workflow, a fork PR
+        # awaiting approval, a repo with no required checks — is a MISSING READ. Grading it False
+        # dropped that PR out of `landers` entirely (a `False` `checks_green` is skipped by the
+        # candidate filter while `probed: True` kept it out of `unprobed`), so a CLEAN, APPROVED,
+        # UNARMED PR produced PASS/NOTHING_GREEN and exit 0 — the exact silent expiry this check
+        # exists for. `None` makes the collectors mark it UNPROBED, which reaches
+        # PARTIAL_POPULATION. `_collect_rest` has always required `checks_green is not None`.
+        return None
     newest = {}
     for pos, chk in enumerate(rollup):
         if not isinstance(chk, dict):
@@ -1368,7 +1480,8 @@ def check_landers(f, c):
         # 15 of 40 PRs. A probed-and-armed PR used to end the question: the verdict was PASS and the
         # unread PRs appeared NOWHERE — a false green on the one check that exists to catch a lander
         # expiring on a PR nobody looked at.
-        ev.append("UNPROBED (never read, beyond the probe bound): %s" % unprobed)
+        ev.append("UNPROBED (never read: no check surface, mergeability unknown, or beyond the "
+                  "probe bound): %s" % unprobed)
     if expired:
         ev.append("ARMED IN THE LOG, NOT ARMED IN GITHUB (expired): %s" % sorted(expired))
     if missing:
@@ -1492,9 +1605,15 @@ class State(object):
     that check CLEARS the key so a re-break speaks again.
     """
 
-    def __init__(self, path, box):
+    def __init__(self, path, box, persist=True):
         self.path = path
         self.box = box
+        # ⛔ `--dry-run` MUST NOT PERSIST. `save()` is called from the DELIVERY path as well as at the
+        # end of the run, so a guard at one call site is not enough — the delivery-path save is what
+        # cleared a delivered key, re-arming an alert already sent (the next real poll then stacks a
+        # second brief) and writing a `last_status` of all-PASS the box does not have. Reading is
+        # untouched: a preview should still show what WOULD be sent.
+        self.persist = bool(persist)
         self.data = {"version": STATE_VERSION, "boxes": {}}
         try:
             with open(path) as fh:
@@ -1563,6 +1682,8 @@ class State(object):
                 del amb[k]
 
     def save(self):
+        if not self.persist:
+            return False          # a preview: the state was READ, never WRITTEN
         d = os.path.dirname(os.path.abspath(self.path)) or "."
         try:
             os.makedirs(d, exist_ok=True)
@@ -1572,6 +1693,7 @@ class State(object):
         with open(tmp, "w") as fh:
             json.dump(self.data, fh, indent=1, sort_keys=True)
         os.replace(tmp, self.path)
+        return True
 
 
 def compose_message(v, verdicts, box, obs_iso, extra_lines=None):
@@ -2061,19 +2183,12 @@ class Machine(object):
         rc, out = self.sh("ps -Ao pid=,command= 2>&1")
         if rc != 0:
             return {"ok": False, "error": out.strip()[:300], "pids": []}
-        pids = []
-        for line in out.splitlines():
-            line = line.strip()
-            if "cmux-tui" not in line or "ps -Ao" in line:
-                continue
-            pid = line.split(None, 1)[0]
-            if not pid.isdigit():
-                continue
-            adj = self.oom_score_adj(pid)
-            pids.append({"pid": int(pid), "oom_score_adj": adj})
+        rows, near = pick_pane_daemon_pids(out)
+        pids = [{"pid": r["pid"], "oom_score_adj": self.oom_score_adj(r["pid"])} for r in rows]
         probe_rc, probe = self.sh("test -r /proc/self/oom_score_adj && echo yes || echo no")
         supported = (probe.strip().endswith("yes"))
         rec = {"ok": True, "pids": pids, "cmd": "cmux-tui",
+               "near_misses": near[:8],
                "protection_supported": supported,
                "protection_source": "oom_score_adj" if supported else None}
         if not supported:
@@ -2361,18 +2476,23 @@ def _collect_graphql(gh, repo, cfg, now, errors):
     out = _gh_empty()
     out["source"] = "graphql"
     _fill_counts(out, open_prs, merged, cfg, now)
-    out["open_prs"] = [
-        {
+    rows = []
+    for p in open_prs:
+        mss = (p.get("mergeStateStatus") or "").strip().upper()
+        green = rollup_is_green(p.get("statusCheckRollup"))
+        rows.append({
             "number": p.get("number"),
-            "merge_state_status": (p.get("mergeStateStatus") or "").strip().upper(),
+            "merge_state_status": mss,
             "auto_armed": p.get("autoMergeRequest") is not None,
             "draft": bool(p.get("isDraft")),
-            "checks_green": rollup_is_green(p.get("statusCheckRollup")),
+            "checks_green": green,
             "review_decision": p.get("reviewDecision"),
-            "probed": (p.get("mergeStateStatus") or "").strip().upper() not in MERGEABILITY_UNKNOWN,
-        }
-        for p in open_prs
-    ]
+            # ⛔ `probed` is NOT mergeability alone. Deriving it from `mergeStateStatus` while a
+            # `None` rollup read answered "not green" put such a PR in NEITHER `candidates` NOR
+            # `unprobed`: `landers` then spoke for a PR it never read, in the silencing direction.
+            "probed": green is not None and mss not in MERGEABILITY_UNKNOWN,
+        })
+    out["open_prs"] = rows
     out["ok"] = True
     return out
 
@@ -2434,6 +2554,15 @@ def _collect_rest(gh, repo, cfg, now, errors):
             runs = _json_obj(txt2) if rc2 == 0 else None
             if runs is not None and isinstance(runs.get("check_runs"), list):
                 row["checks_green"] = rollup_is_green(runs["check_runs"])
+                total = runs.get("total_count")
+                if isinstance(total, int) and total > len(runs["check_runs"]):
+                    # ⛔ A TRUNCATED ROLLUP IS NOT A ROLLUP — the doctrine `page_full` already applies
+                    # to the PR list, applied to the checks. The page holds at most 100 runs; a red
+                    # run past it is invisible, so page one reading `True` became LANDERS_ARMED on a
+                    # commit that is not green. `total_count` is already in hand, so it is read.
+                    row["checks_green"] = None
+                    detail_errors.append("commits/%s check-runs TRUNCATED (%d of %d)"
+                                         % (sha[:8], len(runs["check_runs"]), total))
                 row["review_decision"] = None   # REST exposes no reviewDecision; the required
                 #                                  review-gate CHECK is in the rollup above, which is
                 #                                  what the merge rail actually keys on.
@@ -2474,16 +2603,24 @@ def _one_line(txt):
 
 
 def _json_list(txt):
+    """A parsed JSON list, or None. ⛔ EMPTY STDOUT IS A FAILED READ, not an empty list: `txt or "[]"`
+    turned a `gh` that exited 0 with no output (a wrapper that swallows stdout, a truncated pipe)
+    into "zero PRs", so `collect_github` returned ok=True and `landers` PASSed over a population it
+    never read — the thing `_gh_empty()` exists to forbid. An empty response parses as nothing."""
+    if not (txt or "").strip():
+        return None
     try:
-        d = json.loads(txt or "[]")
+        d = json.loads(txt)
         return d if isinstance(d, list) else None
     except ValueError:
         return None
 
 
 def _json_obj(txt):
+    if not (txt or "").strip():
+        return None
     try:
-        d = json.loads(txt or "{}")
+        d = json.loads(txt)
         return d if isinstance(d, dict) else None
     except ValueError:
         return None
@@ -2600,8 +2737,14 @@ def load_fixture(path):
 
 
 def run_static(paths, only=None):
-    """Evaluate fixtures and compare against each fixture's own `_expect`. Returns (rows, mismatches)."""
-    rows, mism = [], []
+    """Evaluate fixtures, compare against each fixture's `_expect`.
+
+    Returns (rows, mismatches, skipped). `skipped` are KNOWN checks the caller excluded with `--only`:
+    a subset asked for is not a mismatch, and grading it as one made `--static --only X` fail on every
+    fixture's other seven expectations (105 mismatches) while the "every fixture matched" branch could
+    never print. Loudly reported, never silently dropped.
+    """
+    rows, mism, skipped = [], [], []
     for path in paths:
         fx = load_fixture(path)
         cfg = cfg_from_dict(fx.get("config"))
@@ -2619,6 +2762,9 @@ def run_static(paths, only=None):
                 # reports the opposite of what it did. (Also covers `--only`, which excludes checks
                 # from `got`.) An unknown name is a mismatch; a known name excluded by --only is
                 # reported as SKIPPED, loudly, by the caller.
+                if only and name in PREDICATES:
+                    skipped.append((path, name))
+                    continue
                 mism.append((path, name, want, "UNKNOWN_CHECK" if name not in PREDICATES
                              else "NOT_EVALUATED", None))
                 continue
@@ -2627,7 +2773,7 @@ def run_static(paths, only=None):
                              [v for v in verdicts if v.name == name][0]))
         rows.append((path, fx.get("name") or os.path.basename(path), fx.get("note") or "",
                      verdicts, expect))
-    return rows, mism
+    return rows, mism, skipped
 
 
 def fixture_paths(paths, fixtures_dir):
@@ -2732,6 +2878,14 @@ def cfg_from_args(a):
     }
     if a.repo:
         kw["repo"] = a.repo
+    elif a.box:
+        # ⛔ THE BOX'S REPO IS NOT THIS MACHINE'S REPO. `_repo_from_plist` opens the LOCAL
+        # ~/Library/LaunchAgents/<label>.plist, so a `--box` run graded a remote cell against the
+        # repository of whichever cell this machine happens to run — "a healthy fleet for a repo
+        # nobody is working on", the outcome that reader's own docstring calls worse than no canary.
+        # Reading the plist across the machine boundary is not plumbed, so the honest answer is
+        # "unknown": the three PR checks then abstain (GH_UNREADABLE) instead of speaking.
+        kw["repo"] = ""
     else:
         kw["repo"] = _repo_from_plist(a.label or Cfg.DEFAULTS["label"]) or ""
     if a.label:
@@ -2797,12 +2951,13 @@ def main(argv=None):
         if not paths:
             print("outcome-canary: no fixtures found (pass --fixture or --fixtures-dir)", file=sys.stderr)
             return 3
-        rows, mism = run_static(paths, only=only)
+        rows, mism, skipped = run_static(paths, only=only)
         if a.json:
             print(json.dumps({"mode": "static", "fixtures": [
                 {"path": p, "name": n, "note": note,
                  "verdicts": [v.as_json() for v in vs], "expect": ex}
-                for p, n, note, vs, ex in rows], "mismatches": [
+                for p, n, note, vs, ex in rows], "skipped": [
+                    {"path": p, "check": c} for p, c in skipped], "mismatches": [
                     {"path": p, "check": c, "expected": w, "got": g,
                      "variant": (vv.variant if vv is not None else None),
                      "evidence": (vv.evidence if vv is not None else None)}
@@ -2812,6 +2967,11 @@ def main(argv=None):
                 hdr = "fixture %s (%s)%s" % (n, os.path.basename(p), (" — " + note) if note else "")
                 print(render(vs, cfg_from_dict({}), hdr))
                 print()
+            if skipped:
+                print("⚠️  %d expectation(s) NOT ASSERTED because --only %s excluded them:"
+                      % (len(skipped), ",".join(only or [])))
+                for p, c in skipped[:12]:
+                    print("   %s: %s" % (os.path.basename(p), c))
             if mism:
                 print("⛔ %d predicate mismatch(es) against the fixture's own _expect:" % len(mism))
                 for p, c, w, g, vv in mism:
@@ -2877,7 +3037,12 @@ def main(argv=None):
     # (b)+(c) notify — change-only, sanctioned path, never mid-turn
     state = None
     if not a.no_notify:
-        state = State(cfg.state_path, cfg.box)
+        # A PREVIEW READS THE STATE AND DOES NOT WRITE THE *DEFAULT* ONE (see `State.persist`). A
+        # caller who NAMED a destination — `--state` or `--capture-dir` — has declared where its state
+        # lives, and the same rule already governs the capture path; what must never happen is a
+        # bare `--dry-run` mutating the state file the NEXT REAL POLL reads.
+        state = State(cfg.state_path, cfg.box,
+                      persist=not (a.dry_run and not (a.state_path or a.capture_dir)))
         to_send, suppressed = plan_notifications(verdicts, state, cfg.box, obs_iso, now)
         reported["suppressed"] = [v.key for v in suppressed]
         extra = None
@@ -2932,6 +3097,7 @@ def main(argv=None):
             state.save()
         except Exception as exc:
             reported["state_error"] = "%s: %s" % (type(exc).__name__, exc)
+        reported["state_persisted"] = bool(state.persist)
 
     if a.json:
         print(json.dumps({"mode": "live", "box": cfg.box, "repo": cfg.repo,
@@ -2945,6 +3111,7 @@ def main(argv=None):
                               "suppressed": reported["suppressed"],
                               "not_delivered": reported["not_delivered"],
                               "state_error": reported.get("state_error"),
+                              "state_persisted": reported.get("state_persisted"),
                           }}, indent=1))
         return code
 

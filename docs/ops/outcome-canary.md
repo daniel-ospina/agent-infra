@@ -202,8 +202,8 @@ shape changes, and it is pruned with the rest of its check.
 ## The suite
 
 ```bash
-python3 tools/fleet/outcome_canary.test.py              # 70 tests
-python3 tools/fleet/outcome_canary.test.py --mutations  # 44 mutations, each must go RED
+python3 tools/fleet/outcome_canary.test.py              # 79 tests
+python3 tools/fleet/outcome_canary.test.py --mutations  # 54 mutations, each must go RED
 ```
 
 The signal tests drive the **real CLI** end-to-end (`--live --facts … --capture-dir …`), so what is
@@ -238,3 +238,36 @@ Three more tests exist for the same reason — an outcome read as present when i
   `PARTIAL_POPULATION`. It used to be read as `getattr(cfg, "rest_probe_max", 25)` and declared
   nowhere — an inert setting, which is the defect class this tool exists to catch, so the suite
   asserts the bound is actually honoured, not merely that the field exists.
+
+Five more, from the same review: every one of them was a PASS (or a FALSE FAIL) produced by a datum
+the module already held and did not read.
+
+- **An unread check surface is UNPROBED, not "not green".** `rollup_is_green` answers `None` when
+  there is no rollup at all — a path-filtered workflow, a fork PR awaiting approval, a repo with no
+  required checks — and both collectors now mark that PR `probed: False`. Before, the `False` was
+  skipped by the candidate filter while `probed: True` kept the PR out of the unprobed list, so a
+  CLEAN, APPROVED, UNARMED PR produced `PASS/NOTHING_GREEN` and **exit 0**: the silent expiry this
+  check exists for, recorded as health. The REST check-runs page is bounded too, so `total_count` is
+  now compared with the page (`TRUNCATED` → unprobed) — the doctrine `page_full` already applied to
+  the PR list.
+- **An empty `gh` response is a failed read.** `json.loads(txt or "[]")` turned a `gh` that exited 0
+  with no output into "zero PRs", so `landers` PASSed over a population it never read.
+- **The pane census is scoped to the daemon's own argv.** A substring match counted
+  `tail -f …/cmux-tui.out` — a process this check's own NEXT COMMAND tells an operator to create —
+  and because the fleet deprioritises lanes it inherits a negative `oom_score_adj`, so a machine with
+  no daemon read `ALIVE_PROTECTED`. Rejected rows are printed as evidence.
+- **The header's timezone token is used, not dropped.** Reading the rest as local time is only
+  correct while every cell shares the canary's zone: a PST cell read from an EST box reported a
+  5-minute-old event as 4h05m old, so its `#N auto-armed` line fell out of the window and a green
+  ARMED PR read `LANDER_MISSING`. Known abbreviations (and numeric offsets) give an absolute epoch;
+  an unknown token falls back to the local reading rather than being guessed at.
+- **A preview does not persist, and `--box` does not borrow this machine's repo.** A bare `--dry-run`
+  no longer writes the default notification state (it was clearing a delivered key, re-arming an
+  alert already sent so the next real poll stacked a second brief); a caller who names `--state` or
+  `--capture-dir` has declared where its state lives and may write there. And `--box` used to read
+  the LOCAL launchd plist for `OR`, grading a remote cell against whichever repo this machine runs —
+  it now abstains (`GH_UNREADABLE`) unless `--repo` is given.
+
+Also corrected: `--static --only X` reported every other expectation as a mismatch (105 of them on
+the shipped fixtures), i.e. a flag pair that could never succeed; a known check excluded by `--only`
+is now **SKIPPED and listed**, never silently counted as asserted.

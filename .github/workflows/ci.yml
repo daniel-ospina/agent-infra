@@ -363,7 +363,7 @@ jobs:
         # (#646). Its own step so one verdict cannot suppress the other.
         run: python3.12 tools/fleet/outcome_canary.test.py
       - name: Outcome-canary mutation evidence (zero-dep)
-        # The suite above is only a pin if it can FAIL. Each of the 44 mutations reintroduces a
+        # The suite above is only a pin if it can FAIL. Each of the 54 mutations reintroduces a
         # defect the canary exists to catch — a live pid graded as a cycling controller, a refused
         # dispatch forgiven, an UNREADABLE pool read as readable, a gh refusal read as zero PRs, a
         # deny-list check-result rule, an alert on every poll, no re-arm after recovery, a respawn on
@@ -390,8 +390,13 @@ jobs:
         # graded as current, a staleness limit that is not a config field, a zero staleness limit
         # treated as unset, a re-run attempt graded by its OLDEST entry (a flaky job that re-ran green
         # reading red and leaving the lander population), an armed/railed decision believed however
-        # old or unaged, the REST probe bound declared nowhere so a caller's bound does nothing — into
-        # a TEMP copy, and requires its paired test to go
+        # old or unaged, the REST probe bound declared nowhere so a caller's bound does nothing, an
+        # unread check surface graded red (a green unarmed PR leaving the population), a process that
+        # MENTIONS the pane daemon counted as the daemon, an empty gh response read as zero PRs, a
+        # truncated check-run page graded green, the header timezone dropped for local time, a dry run
+        # persisting the state, a --box run borrowing THIS machine's repo plist, an unparseable header
+        # reported as no header, "idle" reported as "dispatched", a --only exclusion graded as wrong —
+        # into a TEMP copy, and requires its paired test to go
         # RED. A mutation that survives is reported as a suite failure.
         run: python3.12 tools/fleet/outcome_canary.test.py --mutations
       - name: Sequence-enforcer suite (incl. joint checker→enforcer test)
