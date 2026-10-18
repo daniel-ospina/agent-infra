@@ -720,14 +720,13 @@ def test_a_PR_opened_and_CLOSED_UNMERGED_still_counts_as_CREATED():
     merged = {"number": 12, "createdAt": iso, "mergedAt": iso}
     open_row = {"number": 13, "createdAt": iso, "mergedAt": None}
     out = {}
-    m._fill_counts(out, [open_row], [merged], cfg, now, merged_page_rows=3,
+    m._fill_counts(out, [open_row], [merged], cfg, now,
                    also_created=[closed_unmerged, merged, open_row])
     assert out["prs_created_in_window"] == 3, out
     # ⛔ and a row that appears in BOTH populations is counted ONCE (the closed page contains the
     # merged rows too, so double counting would inflate the created count by the merge count)
     out2 = {}
-    m._fill_counts(out2, [open_row], [merged], cfg, now, merged_page_rows=3,
-                   also_created=[merged, merged])
+    m._fill_counts(out2, [open_row], [merged], cfg, now, also_created=[merged, merged])
     assert out2["prs_created_in_window"] == 2, out2
     # without the closed page the same world reads 1 — this is the count that used to be graded
     out3 = {}
@@ -747,11 +746,15 @@ def test_the_report_DISCLOSES_every_input_that_changes_a_verdict():
     b = m.cfg_from_dict({"queue_stale_s": 0.0, "window_s": 60.0})
     assert a.as_json() != b.as_json(), (a.as_json(), b.as_json())
     assert a.as_json()["queue_stale_s"] == 90.0, a.as_json()
-    # every default that a fixture can declare must round-trip through the report, so a report can
-    # explain a verdict it produced
+    # ⛔ NOT `and k in a.as_json()` — that guard is vacuous for exactly the key that is missing, so
+    # deleting `window_s`, `pr_window_s` or `rest_probe_max` from the report survived the suite.
+    # Every scalar input must be DISCLOSED, whether or not it is there today.
+    missing = [k for k, v in m.Cfg.DEFAULTS.items()
+               if isinstance(v, (int, float, str)) and k not in a.as_json()]
+    assert not missing, "undisclosed verdict inputs: %s" % (missing,)
     for k, v in m.Cfg.DEFAULTS.items():
-        if isinstance(v, (int, float, str)) and k in a.as_json():
-            assert a.as_json()[k] is not None, k
+        if isinstance(v, (int, float, str)):
+            assert a.as_json()[k] == getattr(a, k), (k, a.as_json()[k])
 
 
 @test
@@ -2135,20 +2138,187 @@ def test_the_vm_stat_awk_refuses_a_NUMBER_when_any_SUMMED_field_is_missing():
 
 
 @test
-def test_the_REST_merged_page_bound_counts_the_CLOSED_page_not_the_merged_subset():
-    """`_collect_rest` filters `merged_at is not None` out of a 100-row closed page, so keying
-    `merged_page_full` on the merged SUBSET could never fire on the surface that answers when
-    GraphQL's bucket is exhausted (measured: 100 closed rows, 97 merged)."""
+def test_the_merged_page_bound_models_the_SURFACE_that_produced_it():
+    """A 100-row page is not a truncated POPULATION unless the page's ORDERING can hide a row.
+
+    `gh pr list` is CREATION-desc, so `--limit 100` bounds CREATION and a PR created 8+ days ago and
+    merged in the last 3h sits outside the page — real truncation. REST is
+    `sort=updated&direction=desc`, so a 100-row page whose oldest `updated_at` is 38.65h old covers a
+    3h window COMPLETELY (measured on the live target). Keying the flag on `len(closed) >= 100`
+    alone made every full closed page "truncated", which deleted `pr_merged`'s only FAIL arm on the
+    shipped repo: a genuinely quiet fleet could never be reported as such."""
     m = load()
-    cfg = m.Cfg()
-    out = {}
+    cfg = m.cfg_from_dict({"pr_window_s": 10800.0})
+    now = 1792327664.0
     closed = [{"number": i, "merged_at": None, "created_at": "2026-10-01T00:00:00Z"} for i in range(100)]
     merged = [{"number": i, "merged_at": "2026-10-18T10:00:00Z"} for i in range(97)]
-    m._fill_counts(out, closed, merged, cfg, 1792327664.0, merged_page_rows=len(closed))
+    # the collector decides; `_fill_counts` only stores the verdict input
+    out = {}
+    m._fill_counts(out, closed, merged, cfg, now, also_created=closed, merged_page_full=True)
     assert out["merged_page_full"] is True, out
-    # a short page is not full, whatever fraction of it merged
-    m._fill_counts(out, closed[:10], merged[:10], cfg, 1792327664.0, merged_page_rows=10)
+    m._fill_counts(out, closed[:10], merged[:10], cfg, now, also_created=closed[:10],
+                   merged_page_full=False)
     assert out["merged_page_full"] is False, out
+    # …and a caller that cannot say abstains: unprovable coverage is TRUNCATED, never "complete"
+    m._fill_counts(out, closed, merged, cfg, now)
+    assert out["merged_page_full"] is True, out
+
+
+@test
+def test_the_REST_collector_does_NOT_call_a_covering_page_TRUNCATED():
+    """The wiring of the fix above: `_collect_rest` must compute the bound from `updated_at` vs the
+    window, not from the row count — and must pass the closed page as `also_created` (a PR opened and
+    then closed unmerged was still opened)."""
+    m = load()
+    cfg = m.cfg_from_dict({"pr_window_s": 10800.0})
+    now = 1792327664.0
+    closed = [{"number": i, "merged_at": None, "created_at": "2026-10-01T00:00:00Z"}
+              for i in range(100)]
+    page = [{"number": p["number"], "merged_at": p["merged_at"], "draft": False,
+             "auto_merge": None, "updated_at": "2026-10-16T00:00:00Z",     # 38h+ old: covers 3h
+             "state": "closed", "created_at": "2026-10-01T00:00:00Z"} for p in closed]
+    inside = "2026-10-18T19:40:00Z"          # 64s before `now`
+    page[0] = dict(page[0], merged_at=inside, updated_at=inside, created_at=inside)
+    page[1] = dict(page[1], created_at=inside)                          # opened, closed unmerged
+
+    calls = []
+    real = m._run_gh
+
+    def fake(argv):
+        calls.append(" ".join(argv))
+        j = " ".join(argv)
+        if "pulls?state=open" in j:
+            return 0, "[]"
+        if "pulls?state=closed" in j:
+            return 0, json.dumps(page)
+        return 0, ""
+
+    try:
+        m._run_gh = fake
+        gh = m.collect_github("o/r", cfg, now=now)
+    finally:
+        m._run_gh = real
+    assert gh and gh.get("ok") is True, gh
+    assert gh["source"] == "rest", gh
+    # a page that reaches past the window is NOT truncated, so pr_merged keeps its FAIL arm
+    assert gh["merged_page_full"] is False, gh
+    # …and a PR opened and closed unmerged is still a PR the fleet OPENED
+    assert gh["prs_created_in_window"] == 2, gh["prs_created_in_window"]
+    assert any("sort=updated" in c for c in calls), calls
+
+
+@test
+def test_the_GRAPHQL_collector_reads_the_CLOSED_page_and_calls_a_full_one_TRUNCATED():
+    """`gh pr list` is CREATION-desc, so a full page really can hide a merge. The collector must also
+    read the CLOSED page (not only the MERGED subset) or a PR opened and closed unmerged vanished
+    from the created count."""
+    m = load()
+    cfg = m.cfg_from_dict({"pr_window_s": 10800.0})
+    now = 1792327664.0
+    inside = "2026-10-18T19:40:00Z"          # 64s before `now`
+    closed = [{"number": i, "createdAt": inside, "mergedAt": None} for i in range(100)]
+    closed[0] = dict(closed[0], mergedAt=inside)
+    calls = []
+    real = m._run_gh
+
+    def fake(argv):
+        j = " ".join(argv)
+        calls.append(j)
+        if "--state open" in j:
+            return 0, "[]"
+        if "--state closed" in j:
+            return 0, json.dumps(closed)
+        return 0, ""
+
+    try:
+        m._run_gh = fake
+        gh = m.collect_github("o/r", cfg, now=now)
+    finally:
+        m._run_gh = real
+    assert gh and gh.get("source") == "graphql", gh
+    assert gh["merged_page_full"] is True, gh      # creation-ordered page: full really is truncated
+    assert gh["prs_merged_in_window"] == 1, gh
+    assert gh["prs_created_in_window"] == 100, gh
+    assert any("--state closed" in c for c in calls), calls
+
+
+@test
+def test_an_ABSENT_pane_population_is_not_a_measured_ZERO_daemons():
+    """`pids or []` sent an unread population into `FAIL/DAEMON_ABSENT` — "processes matching
+    cmux-tui: 0", a MEASURED failure from a value never read. `check_landers` already rejects an
+    absent `open_prs` list the same way."""
+    m = load()
+    cfg = m.cfg_from_dict({})
+    v = m.check_pane_daemon({"pane": {"ok": True, "cmd": "cmux-tui", "protection_supported": True,
+                                      "protection_source": "oom_score_adj"}}, cfg)
+    assert (v.status, v.variant) == (m.INCONCLUSIVE, "PROCESS_TABLE_UNREADABLE"), (v.status, v.variant)
+    assert "pids" in v.evidence, v.evidence
+    # an EMPTY list is a real read of "no daemon" and still FAILs
+    v2 = m.check_pane_daemon({"pane": {"ok": True, "pids": [], "cmd": "cmux-tui"}}, cfg)
+    assert (v2.status, v2.variant) == (m.FAIL, "DAEMON_ABSENT"), (v2.status, v2.variant)
+
+
+@test
+def test_a_STALE_header_cannot_manufacture_work_in_hand():
+    """`_activity` read the newest header with NO freshness bound, so a three-day-old
+    `backlog=47 pool=223` turned an idle fleet into FAIL/NO_PR_CREATED + FAIL/NO_PR_MERGED ("the
+    fleet HAD WORK IN HAND") while `queue_readable`/`work_dispatched` abstained on the same facts."""
+    m = load()
+    d = fx("healthy")
+    for name in ("headers", "dispatch_ok", "lane_started", "lane_failed", "armed", "railed",
+                 "dispatch_refused", "dispatch_empty", "dispatch_skipped"):
+        for e in d["facts"]["log_events"].get(name) or []:
+            e["age_s"] = 300000.0
+    d["facts"]["github"]["prs_created_in_window"] = 0
+    d["facts"]["github"]["prs_merged_in_window"] = 0
+    d["facts"]["github"]["open_pr_count"] = 0
+    cfg = m.cfg_from_dict(d["config"])
+    got = dict((v.name, v) for v in m.evaluate(d["facts"], cfg))
+    assert got["pr_created"].variant == "IDLE_NO_WORK", (got["pr_created"].status,
+                                                         got["pr_created"].variant)
+    assert got["pr_merged"].variant == "IDLE_NO_WORK", (got["pr_merged"].status,
+                                                        got["pr_merged"].variant)
+    busy, why = m._activity(d["facts"], cfg.window_s)
+    assert busy is False and "inside the window" in why, (busy, why)
+    # …and a FRESH header with a backlog still says busy, with its age in the evidence
+    d2 = fx("healthy")
+    busy2, why2 = m._activity(d2["facts"], m.cfg_from_dict(d2["config"]).window_s)
+    assert busy2 is True and "s ago" in why2 or "ago" in why2, (busy2, why2)
+
+
+@test
+def test_a_BOOL_is_not_a_count():
+    """`isinstance(True, int)` is True, so a payload carrying `prs_created_in_window: true` graded
+    PASS/CREATED with "PRs created in the last 3h: True"."""
+    m = load()
+    cfg = m.cfg_from_dict({})
+    for fn, key, name in ((m.check_pr_created, "prs_created_in_window", "pr_created"),
+                          (m.check_pr_merged, "prs_merged_in_window", "pr_merged")):
+        v = fn({"github": {"ok": True, key: True, "open_pr_count": 3, "open_prs": [],
+                           "source": "rest"}}, cfg)
+        assert (v.status, v.variant) == (m.INCONCLUSIVE, "GH_COUNT_UNREAD"), (name, v.status, v.variant)
+
+
+@test
+def test_an_ABSENT_auto_armed_key_is_UNREAD_not_unarmed():
+    """`pr.get("auto_armed")` reads a MISSING key as a negative, so a row that never carried the field
+    produced FAIL/LANDER_MISSING — indistinguishable from a real read of `autoMergeRequest: null`."""
+    m = load()
+    cfg = m.cfg_from_dict({"repo": "o/r"})
+    row = {"number": 5, "draft": False, "merge_state_status": "CLEAN", "checks_green": True,
+           "review_decision": "APPROVED", "probed": True}
+    facts = {"github": {"ok": True, "open_pr_count": 1, "open_prs": [row], "source": "rest",
+                        "page_full": False},
+             "log_events": {"headers": [{"raw": "h", "age_s": 5, "backlog": 0,
+                                         "queue_token": "READ(3)"}], "armed": [], "railed": [],
+                            "repo": [{"repo": "o/r", "age_s": 5}]}}
+    v = m.check_landers(facts, cfg)
+    assert (v.status, v.variant) == (m.INCONCLUSIVE, "PARTIAL_POPULATION"), (v.status, v.variant)
+    # a row that DID read the field and says "not armed" is a real LANDER_MISSING
+    row2 = dict(row, auto_armed=False)
+    facts["github"]["open_prs"] = [row2]
+    v2 = m.check_landers(facts, cfg)
+    assert (v2.status, v2.variant) == (m.FAIL, "LANDER_MISSING"), (v2.status, v2.variant)
 
 
 @test
@@ -3225,13 +3395,50 @@ def test_source_never_contains_a_forbidden_launchctl_form():
 
 MUTATIONS = [
     # (label, old, new, paired test)
+    # ── cycle-21 defects ──────────────────────────────────────────────────────────────────
+    ("a full closed page is called truncated whatever its ordering",
+     "                 merged_page_full=len(closed) >= 100 and not page_covers_window)",
+     "                 merged_page_full=len(closed) >= 100)",
+     "test_the_REST_collector_does_NOT_call_a_covering_page_TRUNCATED"),
+    ("the REST collector stops passing the closed page as a created population",
+     "    _fill_counts(out, open_raw, merged, cfg, now, also_created=closed,",
+     "    _fill_counts(out, open_raw, merged, cfg, now,",
+     "test_the_REST_collector_does_NOT_call_a_covering_page_TRUNCATED"),
+    ("the GraphQL collector stops passing the closed page as a created population",
+     "                 merged_page_full=len(closed) >= 100)",
+     "                 merged_page_full=len(merged) >= 100)",
+     "test_the_GRAPHQL_collector_reads_the_CLOSED_page_and_calls_a_full_one_TRUNCATED"),
+    ("an unread pane population is graded as zero daemons",
+     '    if pane.get("ok") is True and not isinstance(pane.get("pids"), list):',
+     "    if False:",
+     "test_an_ABSENT_pane_population_is_not_a_measured_ZERO_daemons"),
+    ("fleet activity trusts a header of any age",
+     '    hdr = newest_with_age(events.get("headers"), window_s) if window_s is not None \\',
+     '    hdr = newest(events.get("headers")) if False \\',
+     "test_a_STALE_header_cannot_manufacture_work_in_hand"),
+    ("a bool counts as a PR count",
+     '    if not isinstance(n, int) or isinstance(n, bool):\n'
+     '        return V("pr_created", INCONCLUSIVE, "GH_COUNT_UNREAD",',
+     '    if not isinstance(n, int):\n'
+     '        return V("pr_created", INCONCLUSIVE, "GH_COUNT_UNREAD",',
+     "test_a_BOOL_is_not_a_count"),
+    ("an absent auto_armed key is read as unarmed",
+     '        if "auto_armed" not in pr:\n            unprobed.append(n)\n            continue',
+     "        if False:\n            unprobed.append(n)\n            continue",
+     "test_an_ABSENT_auto_armed_key_is_UNREAD_not_unarmed"),
+    ("the report stops disclosing a verdict input",
+     '            "window_s": self.window_s,',
+     '',
+     "test_the_report_DISCLOSES_every_input_that_changes_a_verdict"),
     # ── cycle-20 defects ──────────────────────────────────────────────────────────────────
     ("an `ok` gh surface with no created count is graded as a measured zero",
-     '    if not isinstance(n, int):\n        return V("pr_created", INCONCLUSIVE, "GH_COUNT_UNREAD",',
+     '    if not isinstance(n, int) or isinstance(n, bool):\n'
+     '        return V("pr_created", INCONCLUSIVE, "GH_COUNT_UNREAD",',
      '    if False:\n        return V("pr_created", INCONCLUSIVE, "GH_COUNT_UNREAD",',
      "test_an_ok_gh_surface_with_NO_COUNT_is_UNREAD_not_a_measured_zero"),
     ("an `ok` gh surface with no merged count is graded as a measured zero",
-     '    if not isinstance(n, int):\n        return V("pr_merged", INCONCLUSIVE, "GH_COUNT_UNREAD",',
+     '    if not isinstance(n, int) or isinstance(n, bool):\n'
+     '        return V("pr_merged", INCONCLUSIVE, "GH_COUNT_UNREAD",',
      '    if False:\n        return V("pr_merged", INCONCLUSIVE, "GH_COUNT_UNREAD",',
      "test_an_ok_gh_surface_with_NO_COUNT_is_UNREAD_not_a_measured_zero"),
     ("a PR opened and closed unmerged drops out of the created population",
@@ -3591,10 +3798,10 @@ MUTATIONS = [
      "\\\"\\\") \"",
      "            \"if (!seen || ps == \\\"\\\" || free == \\\"\\\") \"",
      "test_the_vm_stat_awk_refuses_a_NUMBER_when_any_SUMMED_field_is_missing"),
-    ("the REST merged page bound counts the merged subset, not the closed page",
-     "    _page = merged_page_rows if merged_page_rows is not None else len(merged)",
-     "    _page = len(merged)",
-     "test_the_REST_merged_page_bound_counts_the_CLOSED_page_not_the_merged_subset"),
+    ("a caller that cannot prove its page covers the window calls it complete",
+     "        merged_page_full = True",
+     "        merged_page_full = False",
+     "test_the_merged_page_bound_models_the_SURFACE_that_produced_it"),
     ("fleet activity reads the one-refresh-old header token",
      "    _tok, _raw, _src = authoritative_queue_token(f, hdr)\n    pool = _tok.get(\"pool\")\n"
      "    busy = bool((isinstance(backlog, int) and backlog > 0) or (isinstance(pool, int) and pool > 0))",

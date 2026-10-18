@@ -288,8 +288,11 @@ class Cfg(object):
             "disk_floor_gb": self.disk_floor_gb,
             "pool_threshold": self.pool_threshold,
             "rest_probe_max": self.rest_probe_max,
+            # decides whether a reported respawn "took" (advance within this budget)
+            "respawn_timeout_s": self.respawn_timeout_s,
             "label": self.label,
             "repo": self.repo,
+            "box": self.box,
         }
 
 
@@ -1342,12 +1345,20 @@ def check_work_dispatched(f, c):
 # ════════════════════════════════════════════════════════════════════════════════════════════════
 
 
-def _activity(f):
-    """Did the fleet have work in hand? Used to decide whether 'no PR' is a FAILURE or an IDLE."""
+def _activity(f, window_s=None):
+    """Did the fleet have work in hand? Used to decide whether 'no PR' is a FAILURE or an IDLE.
+
+    ⛔ THE HEADER MUST BE INSIDE THE WINDOW. Every other reader windows it (`newest_with_age(...)`);
+    this one took `newest(...)` with no freshness bound, so a THREE-DAY-OLD `backlog=47 pool=223`
+    turned an idle fleet into `FAIL/NO_PR_CREATED` + `FAIL/NO_PR_MERGED` ("the fleet HAD WORK IN
+    HAND", asserting no PR was opened) while `queue_readable` and `work_dispatched` abstained on the
+    very same facts — one world graded two ways, and the FAIL carrying no age in its evidence.
+    """
     events = f.get("log_events") or {}
-    hdr = newest(events.get("headers"))
+    hdr = newest_with_age(events.get("headers"), window_s) if window_s is not None \
+        else newest(events.get("headers"))
     if not hdr:
-        return False, "no cycle header in the parsed log tail"
+        return False, "no cycle header inside the window"
     backlog = hdr.get("backlog")
     # ⛔ THE SAME AUTHORITATIVE TOKEN the queue checks grade. Reading the one-refresh-old header here
     # made four checks disagree about one world: measured, `queue_readable` FAILed
@@ -1356,7 +1367,8 @@ def _activity(f):
     _tok, _raw, _src = authoritative_queue_token(f, hdr)
     pool = _tok.get("pool")
     busy = bool((isinstance(backlog, int) and backlog > 0) or (isinstance(pool, int) and pool > 0))
-    return busy, "backlog=%s pool=%s (source: %s)" % (backlog, pool, _src)
+    return busy, "backlog=%s pool=%s (source: %s, %s)" % (
+        backlog, pool, _src, _age_txt(hdr.get("age_s")))
 
 
 def _gh_surface_txt(gh):
@@ -1384,7 +1396,10 @@ def check_pr_created(f, c):
     # 3.0h" off a field that was never read, and printing `PRs created in the last 3h: None` beside
     # it. Same rule as headroom's `ok`-with-no-number guard: a FAIL on this check means one was
     # MEASURED, or it means nothing.
-    if not isinstance(n, int):
+    # ⛔ `isinstance(True, int)` IS TRUE: a payload carrying `prs_created_in_window: true` graded
+    # PASS/ CREATED with "PRs created in the last 3h: True". `_check_rank` already guards its `id`
+    # the same way; a count is an int and a bool is not a count.
+    if not isinstance(n, int) or isinstance(n, bool):
         return V("pr_created", INCONCLUSIVE, "GH_COUNT_UNREAD",
                  "the gh surface answered but carries no prs_created_in_window (got %r)\n%s"
                  % (n, _gh_surface_txt(gh)),
@@ -1399,7 +1414,7 @@ def check_pr_created(f, c):
              gh.get("last_created") or "none in the query window", _gh_surface_txt(gh)))
     if isinstance(n, int) and n > 0:
         return V("pr_created", PASS, "CREATED", ev)
-    busy, why = _activity(f)
+    busy, why = _activity(f, c.window_s)
     if busy:
         return V("pr_created", FAIL, "NO_PR_CREATED", ev + "\nfleet activity: %s" % why,
                  "the fleet had work in hand and opened no PR in %.1fh. A fleet that dispatches "
@@ -1422,7 +1437,7 @@ def check_pr_merged(f, c):
     # ⛔ AN `ok` SURFACE WITH NO COUNT IS NOT A MEASURED ZERO — see `check_pr_created`. Without this,
     # a payload with no `prs_merged_in_window` reached the `open_n > 0` branch and reported
     # "N PR(s) are open and nothing merged in 3.0h" off a count it never read.
-    if not isinstance(n, int):
+    if not isinstance(n, int) or isinstance(n, bool):
         return V("pr_merged", INCONCLUSIVE, "GH_COUNT_UNREAD",
                  "the gh surface answered but carries no prs_merged_in_window (got %r)\n%s"
                  % (n, _gh_surface_txt(gh)),
@@ -1432,7 +1447,7 @@ def check_pr_merged(f, c):
              _gh_surface_txt(gh)))
     if isinstance(n, int) and n > 0:
         return V("pr_merged", PASS, "MERGED", ev)
-    busy, why = _activity(f)
+    busy, why = _activity(f, c.window_s)
     if gh.get("merged_page_full") and not (isinstance(n, int) and n > 0):
         # A FULL, creation-ordered page cannot tell "nothing merged" from "merged PRs created before
         # the page cut". Abstaining is the honest answer; a FAIL here would be a false alarm, and a
@@ -1461,8 +1476,18 @@ def check_pr_merged(f, c):
 
 def check_pane_daemon(f, c):
     pane = f.get("pane") or {}
-    pids = pane.get("pids") or []
     cmd = pane.get("cmd") or "cmux-tui"
+    # ⛔ `pids or []` GRADED AN UNREAD POPULATION AS ZERO DAEMONS. `ok: True` with the list absent
+    # reached `FAIL/DAEMON_ABSENT` — "processes matching cmux-tui: 0", a MEASURED failure reported
+    # from a value that was never read, and the exact shape `check_landers` rejects one check over
+    # (`if not isinstance(prs, list)`). A census that answered without a list answered nothing.
+    if pane.get("ok") is True and not isinstance(pane.get("pids"), list):
+        return V("pane_daemon", INCONCLUSIVE, "PROCESS_TABLE_UNREADABLE",
+                 "the pane census answered without a `pids` list (keys: %s)\n%s"
+                 % (sorted(pane.keys()), _pane_protection_txt(pane)),
+                 "the daemon population was not read, so 'no %s is running' is not established. "
+                 "Not green." % cmd)
+    pids = pane.get("pids") if isinstance(pane.get("pids"), list) else []
     if pane.get("ok") is not True:
         return V("pane_daemon", INCONCLUSIVE, "PROCESS_TABLE_UNREADABLE",
                  "process table read failed: %s" % (pane.get("error") or "?"),
@@ -1942,6 +1967,12 @@ def check_landers(f, c):
     expired, missing, ok = [], [], []
     for pr in candidates:
         n = pr.get("number")
+        # ⛔ AN ABSENT `auto_armed` KEY IS NOT "NOT ARMED". `pr.get("auto_armed")` reads a missing
+        # read as a negative and produced `FAIL/LANDER_MISSING` from a value the payload never
+        # carried — indistinguishable from a real read of `autoMergeRequest: null`.
+        if "auto_armed" not in pr:
+            unprobed.append(n)
+            continue
         if pr.get("auto_armed"):
             ok.append(n)
         elif n in railed_log and not repo_mismatch:
@@ -3008,8 +3039,9 @@ def _collect_graphql(gh, repo, cfg, now, errors):
     merged = [p for p in closed if p.get("mergedAt")]
     out = _gh_empty()
     out["source"] = "graphql"
-    _fill_counts(out, open_prs, merged, cfg, now, merged_page_rows=len(closed),
-                 also_created=closed)
+    # creation-ordered: a full page really can hide a merge
+    _fill_counts(out, open_prs, merged, cfg, now, also_created=closed,
+                 merged_page_full=len(closed) >= 100)
     rows = []
     for p in open_prs:
         mss = (p.get("mergeStateStatus") or "").strip().upper()
@@ -3064,11 +3096,16 @@ def _collect_rest(gh, repo, cfg, now, errors):
         errors.append("rest: pulls?state=closed returned unparseable JSON")
         return None
     merged = [p for p in closed if p.get("merged_at")]
+    win_rest = cfg.pr_window_s
 
     out = _gh_empty()
     out["source"] = "rest"
-    _fill_counts(out, open_raw, merged, cfg, now, merged_page_rows=len(closed),
-                 also_created=closed)
+    # updated-ordered: the page hides a merge only if it does not reach past the window
+    oldest_updated = min([t for t in (parse_github_ts(p.get("updated_at")) for p in closed) if t],
+                         default=None)
+    page_covers_window = oldest_updated is not None and (now - oldest_updated) > win_rest
+    _fill_counts(out, open_raw, merged, cfg, now, also_created=closed,
+                 merged_page_full=len(closed) >= 100 and not page_covers_window)
 
     probe_max = int(cfg.rest_probe_max)
     rows, unprobed, detail_errors = [], 0, []
@@ -3129,7 +3166,7 @@ def _collect_rest(gh, repo, cfg, now, errors):
     return out
 
 
-def _fill_counts(out, open_prs, merged, cfg, now, merged_page_rows=None, also_created=None):
+def _fill_counts(out, open_prs, merged, cfg, now, also_created=None, merged_page_full=None):
     win = cfg.pr_window_s
     merged_ts = [t for t in (parse_github_ts(p.get("mergedAt") or p.get("merged_at"))
                              for p in merged) if t]
@@ -3142,8 +3179,20 @@ def _fill_counts(out, open_prs, merged, cfg, now, merged_page_rows=None, also_cr
     # `merged_at is not None` out of a 100-row `state=closed` page, so `len(merged)` can never reach
     # the bound unless nothing was filtered — the guard could not fire on the surface that answers
     # when GraphQL's shared bucket is exhausted (measured here: 100 closed rows, 97 merged).
-    _page = merged_page_rows if merged_page_rows is not None else len(merged)
-    out["merged_page_full"] = _page >= 100
+    # ⛔ THE PAGE BOUND IS A PROPERTY OF THE SURFACE'S ORDERING, NOT OF THE ROW COUNT. `gh pr list`
+    # is CREATION-desc, so `--limit 100` bounds CREATION: a PR created 8+ days ago and merged in the
+    # last 3h sits outside the page, and a 100-row closed page REALLY does hide merges. REST is
+    # `sort=updated&direction=desc`, so a 100-row page whose oldest `updated_at` is 38.65h old covers
+    # a 3h window completely (measured on the live target) — truncation there is FALSE, and keying the
+    # flag on `len(closed) >= 100` deleted `pr_merged`'s only FAIL arm on the shipped repo (every
+    # closed page is full, so a genuinely quiet fleet could never be reported). So the collector
+    # decides: creation-ordered page full = truncated; updated-ordered page that still reaches past
+    # the window = not truncated; unprovable = truncated (abstain rather than accuse).
+    if merged_page_full is None:
+        # a caller that cannot say whether its page COVERS the window must abstain: unprovable
+        # coverage is truncated, never "complete"
+        merged_page_full = True
+    out["merged_page_full"] = bool(merged_page_full)
     out["last_merged"] = _iso(max(merged_ts)) if merged_ts else None
     # ⛔ A PR THAT WAS OPENED AND CLOSED UNMERGED STILL COUNTS AS CREATED. The population was built
     # from the OPEN list plus the MERGED list, and `_collect_rest` drops `closed`-without-`merged_at`
