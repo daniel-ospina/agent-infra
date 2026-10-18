@@ -767,6 +767,12 @@ for _pair in "alert:0:alert:none:ok" "bottleneck:0:empty:bottleneck:ok" "objecti
   state "$_name" "$_ask" "$_lanes" "$_mq" "$_obj" || continue
   body="$BODY"
   order_check "$_name" "$body"
+  # ⛔ `rcfail`'s golden ends with the two LITERAL characters `\` `n`, and that is the EGRESS, not a
+  # recording artifact: the tick's recovery branch runs `cmux send … '\n'` (single-quoted, so cmux
+  # receives backslash-n and types the newline that releases a parked composer), and the double records
+  # the argv it was handed verbatim. Every OTHER golden ends with `.` because only this state takes the
+  # recovery branch. Do not "tidy" the tail when regenerating it, and do not read it as noise: removing
+  # it would silently drop the assertion that the recovery payload is a bare newline.
   golden_check "$_name" "$body"
   if [ "$_name" = "rcfail" ]; then
     # The recovery send's PAYLOAD is the property: it is a bare newline that releases a parked
