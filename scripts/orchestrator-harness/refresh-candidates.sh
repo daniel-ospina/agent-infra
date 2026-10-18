@@ -14,9 +14,14 @@
 # alive and can only merge. `--check` answers the provisioning question up front, WITH THE REASON,
 # so a cell is never STARTED in that state (cloud-cell-supervisor.sh `check` calls it).
 set -u
-OR="${OR:-daniel-ospina/tortoise}"
 REPO="${REPO:-/Users/danielospina/Documents/GitHub/tortoise}"
 SC="$REPO/.worktrees/dispatch-scout"
+
+# ⛔ OR IS DERIVED FROM $REPO, THROUGH THE SAME FUNCTION THE LOOP USES (agent-infra#2040). The
+# candidate POOL is read from $OR (below), and the controller grades/merges against $OR — if the two
+# derived differently (or one fell back to a literal while the other did not), this box would queue
+# ONE repo's issues while grading ANOTHER repo's PRs. One function (repo-slug.sh), one answer. An
+# explicit OR still wins; a REPO whose origin cannot be parsed falls back to the literal LOUDLY.
 
 # ── A USABLE $HOME IS A PRECONDITION OF THE PRE-FLIGHT, NOT A PER-CANDIDATE RESULT ─────────────
 # WHY THIS LIVES HERE AND NOT ONLY IN cloud-cell-bringup.sh. Bring-up already names this as friction
@@ -91,6 +96,37 @@ O="${O:-$HOME/orchestrator}"
 export COLLISION_PREFLIGHT_CACHE="${COLLISION_PREFLIGHT_CACHE:-$O/state/.preflight-cache}"
 export COLLISION_PREFLIGHT_CACHE_TTL="${COLLISION_PREFLIGHT_CACHE_TTL:-300}"
 mkdir -p "$COLLISION_PREFLIGHT_CACHE" 2>/dev/null || true
+# ⛔ THE DERIVATION RUNS *AFTER* O IS DEFAULTED (review round 6). Sourcing it above this line meant
+# `$O/repo-slug.sh` was never preferred whenever O was not in the environment — byte-for-byte the
+# defect fixed one file over in orch-loop.sh — so a stale/partial helper in $O was silently bypassed
+# and the guard it provides was not wired. It must sit AFTER `resolve_home` too: O's default uses the
+# REPAIRED $HOME, and sourcing earlier would look in the unrepaired one.
+_REFRESH_HERE="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
+if [ -f "${O:-}/repo-slug.sh" ]; then . "${O:-}/repo-slug.sh"
+elif [ -f "$_REFRESH_HERE/repo-slug.sh" ]; then . "$_REFRESH_HERE/repo-slug.sh"
+fi
+# ⛔ THE FILE IS NOT THE FUNCTION, AND A MISSING HELPER IS FATAL HERE. Falling back to the literal
+# when repo-slug.sh is absent would read the POOL from one repo while the controller dispatches into
+# another — it would queue repo A's issue numbers for repo B's checkout, which is worse than the
+# mismatch this fixes. (Measured in review round 2: with $O carrying no repo-slug.sh, the old arm
+# returned the literal at rc 0 and blamed REPO in the message.)
+command -v derive_or >/dev/null 2>&1 \
+  || { echo "[refresh] FATAL repo-slug.sh missing/stale (no derive_or) — refusing to read a pool it cannot attribute; re-seed: cp scripts/orchestrator-harness/*.sh ${O:-~/orchestrator}/" >&2; exit 78; }
+OR_EXPLICIT="${OR:-}"
+OR_RC=0
+OR="$(derive_or "${REPO:-}" "$OR_EXPLICIT")" || OR_RC=$?
+if [ "$OR_RC" = "2" ]; then
+  _fatal_or="FATAL OR='$OR_EXPLICIT' is not owner/name — refusing to read a pool for a repo it cannot name (unset OR to derive it)"
+  echo "[refresh] $_fatal_or" >&2
+  # Also to the log the operator reads: the controller classifies rc 78 as permanent and records it in
+  # $O/.refresh-blocked, but the REASON must not exist only in launchd.err (review round 8).
+  [ -d "${O:-}" ] && echo "$(date) [refresh] $_fatal_or" >> "${O:-}/logs/orch-loop.log" 2>/dev/null
+  exit 78
+fi
+if [ "$OR_RC" != "0" ]; then
+  OR="daniel-ospina/tortoise"
+  echo "[refresh] WARN cannot derive owner/name from REPO='${REPO:-}' origin ('$(git -C "${REPO:-.}" remote get-url origin 2>/dev/null || echo none)') — reading the pool from $OR; set OR=<owner/name> to name the repo explicitly" >&2
+fi
 # ⛔ APPEND, never PREPEND. These two directories are where launchd's minimal environment finds the
 # harness's tools, so they must stay on PATH — but hard-prepending them silently OUTRANKED the
 # caller's own PATH: a caller that put a pinned/stub `uv` first (the regression suite, or an
@@ -1080,10 +1116,20 @@ degraded=0
 # instead of looking like a healthy cell with an empty pool (2026-10-16 review: `lanes: 0` and an
 # unreadable registry were indistinguishable from the outside, and the per-issue lines scroll away).
 ICR_INCOMPLETE=0; QUEUED=0
+# ── THE FUNNEL'S PER-REASON COUNTS (agent-infra#2040) ───────────────────────────────────────────
+# `queue=READ(223)` beside `[dispatch] backlog empty` is a CONTRADICTION that hid a total dispatch
+# stop for hours on every cloud cell: the pool was read (223 candidates), the backlog was empty, and
+# nothing in the log said which step ate the 223. Each arm below therefore counts itself, and the
+# pass writes ONE machine-readable line (state/refresh-funnel) that orch-loop.sh prints as the
+# dispatch funnel. The counts SUM to the pool: listed = skipped_checked + skipped_dispatched +
+# judged + not_reached, and judged = queued + collision + landed + unjudged. A count that cannot be
+# reconciled is not reported (see the assertion after the loop).
+SKIP_CHECKED=0; SKIP_DISPATCHED=0
+V_QUEUED=0; V_COLLISION=0; V_LANDED=0; V_UNJUDGED=0
 while read -r N; do
   [ -z "${N:-}" ] && continue
-  grep -qx "$N" "$O/checked.txt" 2>/dev/null && continue
-  grep -qx "$N" "$O/dispatched.txt" 2>/dev/null && continue
+  if grep -qx "$N" "$O/checked.txt" 2>/dev/null; then SKIP_CHECKED=$((SKIP_CHECKED + 1)); continue; fi
+  if grep -qx "$N" "$O/dispatched.txt" 2>/dev/null; then SKIP_DISPATCHED=$((SKIP_DISPATCHED + 1)); continue; fi
   n=$((n+1)); [ "$n" -gt "$LIMIT" ] && break
   # ⛔ A pre-flight that ERRORED is not a verdict — and a COLLISION is not terminal. `echo "$N" >>
   # checked.txt` used to run BEFORE the verdict was read, so a pre-flight that produced no VERDICT
@@ -1135,6 +1181,7 @@ while read -r N; do
       # A DEGRADED pre-flight short-circuits BEFORE the claim read: the verdict is not trustworthy,
       # so the issue is left unchecked and is neither queued nor certified either way.
       if [ "$degraded" -eq 1 ]; then
+        V_UNJUDGED=$((V_UNJUDGED + 1))
         echo "[refresh] ?#$N CLEAN is DEGRADED (the pre-flight could not query every surface) — not counted as a verdict, left unchecked for the next pass"
       else
         # ── the cross-box ISSUE claim is a BLOCKING surface (agent-infra#1850) ───────────────────
@@ -1181,7 +1228,7 @@ while read -r N; do
               exit "${EXIT_TRANSIENT:-1}"
             fi
             usable=$((usable + 1))
-            QUEUED=$((QUEUED + 1))
+            QUEUED=$((QUEUED + 1)); V_QUEUED=$((V_QUEUED + 1))
             echo "[refresh] +#$N CLEAN -> backlog" ;;
           1) # a live claim: a peer owns it. Leave it UNCHECKED so the next pass re-attempts it —
              # a claim is a window, not a verdict (the peer's work lands).
@@ -1190,11 +1237,12 @@ while read -r N; do
              # as "judged NOTHING" and aborts rc=1 every cycle, in exactly the cross-box-collision
              # state this check exists for, while the pass has already printed a verdict per candidate
              # (#1853 review). ICR=2 (INCOMPLETE) stays uncounted — that is not a verdict.
-             usable=$((usable + 1))
+             usable=$((usable + 1)); V_COLLISION=$((V_COLLISION + 1))
              echo "[refresh] =#$N COLLISION (cross-box issue claim) — $CLAIM_RESULT; retried next pass" ;;
           2) # unreadable registry: INCOMPLETE, never CLEAN. Also left unchecked, so the issue is
              # re-attempted rather than lost, and NOT queued, so nothing is dispatched on a guess.
              ICR_INCOMPLETE=$((ICR_INCOMPLETE + 1))
+             V_UNJUDGED=$((V_UNJUDGED + 1))
              echo "[refresh] ?#$N INCOMPLETE — $CLAIM_RESULT; not queued, retried next pass" ;;
           3) # PRESENT BUT STALE: a local, PERMANENT provisioning failure. Refusing per-issue would
              # queue nothing forever while the cell still reported RUNNING (the merge-only defect this
@@ -1204,6 +1252,7 @@ while read -r N; do
              echo "[refresh]   fix: cp scripts/orchestrator-harness/*.sh ~/orchestrator/  (then re-run)"
              exit "${EXIT_NOT_PROVISIONABLE:-3}" ;;
           *) ICR_INCOMPLETE=$((ICR_INCOMPLETE + 1))
+             V_UNJUDGED=$((V_UNJUDGED + 1))
              echo "[refresh] ?#$N INCOMPLETE — the registry returned an UNRECOGNISED verdict (rc=$ICR); not queued, retried next pass" ;;
         esac
       fi ;;
@@ -1215,9 +1264,10 @@ while read -r N; do
       # environment report a healthy `checked N; backlog now 0` — the reading this pass exists to
       # refuse (#1853 review).
       if [ "$degraded" -eq 1 ]; then
+        V_UNJUDGED=$((V_UNJUDGED + 1))
         echo "[refresh] ?#$N COLLISION is DEGRADED (the pre-flight could not query every surface) — not counted as a verdict, left unchecked for the next pass"
       else
-        usable=$((usable + 1))
+        usable=$((usable + 1)); V_COLLISION=$((V_COLLISION + 1))
         echo "[refresh] =#$N collision — a peer owns it, retried next pass"
       fi ;;
     LANDED)
@@ -1228,14 +1278,63 @@ while read -r N; do
       # (canonical arm: tortoise operations/orchestrator-harness/refresh-candidates.sh:266-274, #8560/#8625 —
       # this copy deliberately does NOT carry its landed.txt / answered-pass budget; that half is
       # port-provenance.txt:208, NOT DONE).
-      usable=$((usable + 1))
+      usable=$((usable + 1)); V_LANDED=$((V_LANDED + 1))
       echo "[refresh] ~#$N LANDED — already resolved, not queued" ;;
     INCOMPLETE)
+      V_UNJUDGED=$((V_UNJUDGED + 1))
       echo "[refresh] ?#$N INCOMPLETE from the pre-flight (it could not query every surface) — not a verdict, left unchecked for the next pass" ;;
     *)
+      V_UNJUDGED=$((V_UNJUDGED + 1))
       echo "[refresh] ?#$N no verdict from the pre-flight — left unchecked for the next pass" ;;
   esac
 done < "$O/.pool"
+# ── THE FUNNEL RECORD ─────────────────────────────────────────────────────────────────────────────
+# Written HERE, before the no-usable-verdict abort below, because the abort is precisely the cycle
+# that used to print `[dispatch] backlog empty queue=READ(223)` with no trace of where 223 went.
+# ONE line, `key=value` pairs, atomic (write+rename) so a reader never sees a torn record and a
+# half-written one cannot be mistaken for a measurement. The counts must RECONCILE — a record that
+# does not add up is reported as UNRECONCILED with both sides, never silently published as truth.
+# This is instrumentation: a failure to write it is logged and does NOT fail the pass (the backlog
+# is the product; the funnel explains it).
+FUNNEL_LISTED="${POOL_ROWS:-}"
+# A plain digit test, not `is_num`: this script defines no such helper and MUST NOT grow a second
+# number parser (selftest extracts it). `wc -l` output is already space-stripped at POOL_ROWS.
+case "$FUNNEL_LISTED" in ''|*[!0-9]*) FUNNEL_LISTED="-" ;; esac
+FUNNEL_NOTREACHED="-"
+if [ "$FUNNEL_LISTED" != "-" ]; then
+  FUNNEL_NOTREACHED=$(( 10#$FUNNEL_LISTED - SKIP_CHECKED - SKIP_DISPATCHED - judged ))
+  [ "$FUNNEL_NOTREACHED" -lt 0 ] && FUNNEL_NOTREACHED=0
+  if [ $(( SKIP_CHECKED + SKIP_DISPATCHED + judged + FUNNEL_NOTREACHED )) -ne "$(( 10#$FUNNEL_LISTED ))" ] \
+     || [ $(( V_QUEUED + V_COLLISION + V_LANDED + V_UNJUDGED )) -ne "$judged" ]; then
+    echo "[refresh] WARN funnel does not reconcile: listed=$FUNNEL_LISTED (skipped_checked=$SKIP_CHECKED skipped_dispatched=$SKIP_DISPATCHED judged=$judged not_reached=$FUNNEL_NOTREACHED) vs judged split (queued=$V_QUEUED collision=$V_COLLISION landed=$V_LANDED unjudged=$V_UNJUDGED)"
+  fi
+fi
+# `reconciled=0` when the parts do NOT sum to the pool. The reader then prints UNRECONCILED instead
+# of a decomposition: a record that does not add up must not be presented as one that does (the WARN
+# below is in the refresh's log, which an operator reading the dispatch line never sees).
+# ⛔ OPTIMISTIC DEFAULT REMOVED (review round 4, finding 7). FUNNEL_OK started at 1 and was only
+# recomputed when `listed` was numeric — so a pass whose pool count was unusable (listed="-")
+# published `reconciled=1` beside a decomposition nothing had checked. Unverified is not reconciled:
+# the flag now starts at 0 and only a numeric pool that passes BOTH checks sets it.
+# ⛔ AND BE HONEST ABOUT WHAT THE POOL CHECK CAN SEE. `not_reached` is DERIVED from the same three
+# numbers, so the pool half cannot detect a row that was never counted at all; what it DOES catch is
+# OVER-counting — one row landing in two skip buckets, or a verdict arm that increments nothing —
+# which is the reachable failure when someone adds a `continue` without a counter. The judged half is
+# the split invariant. Neither check can see a pool row that vanished; the reader's wording says
+# what is verified, not that the pool is provably complete.
+FUNNEL_OK=0
+if [ "$FUNNEL_LISTED" != "-" ]; then
+  [ $(( SKIP_CHECKED + SKIP_DISPATCHED + judged + FUNNEL_NOTREACHED )) -eq "$(( 10#$FUNNEL_LISTED ))" ] \
+    && [ $(( V_QUEUED + V_COLLISION + V_LANDED + V_UNJUDGED )) -eq "$judged" ] && FUNNEL_OK=1
+fi
+FUNNEL_LINE="listed=$FUNNEL_LISTED judged=$judged queued=$V_QUEUED collision=$V_COLLISION landed=$V_LANDED unjudged=$V_UNJUDGED skipped_checked=$SKIP_CHECKED skipped_dispatched=$SKIP_DISPATCHED not_reached=$FUNNEL_NOTREACHED limit=$LIMIT reconciled=$FUNNEL_OK at=$(date +%s)"
+if printf '%s\n' "$FUNNEL_LINE" > "$O/state/.refresh-funnel.$$" 2>/dev/null \
+   && mv "$O/state/.refresh-funnel.$$" "$O/state/refresh-funnel" 2>/dev/null; then
+  echo "[refresh] funnel $FUNNEL_LINE"
+else
+  rm -f "$O/state/.refresh-funnel.$$" 2>/dev/null
+  echo "[refresh] WARN could not record the funnel in $O/state/refresh-funnel — the dispatch line will say UNRECORDED rather than report a decomposition it does not have"
+fi
 # ── a pass the registry answered NOTHING for is not a healthy pass (2026-10-16 review) ──────────
 # The per-issue INCOMPLETE lines scroll away, and `lanes: 0` with `backlog=0` is exactly what a quiet
 # box looks like, so a git-transport-only outage (gh and the merge path both still working) or a
