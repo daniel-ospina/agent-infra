@@ -26,7 +26,8 @@
 #        for every start scenario the triple (running?, disabled?, exit code) is checked, and the
 #        cell "not running AND (disabled OR exit 0)" fails the suite. This is the regression the issue
 #        is about: something died, nothing said so, and the exit code claimed success.
-#   F. end-to-end install.sh (macOS only — it renders a launchd plist and needs plutil):
+#   F. end-to-end install.sh (runs everywhere; `plutil` is stubbed off macOS so the incident's own path
+#      — `--uninstall` and its read-back — is gated in CI, not only on a developer's mac):
 #        plain install = zero mutating calls; --start proves itself; a failed --start exits non-zero
 #        with one actionable line; --uninstall bootouts AND verifies the job is gone; an unknown flag
 #        is refused.
@@ -92,7 +93,10 @@ bump_hb() { # a live controller refreshes $O/heartbeat at the top of every cycle
   # "it advanced" (a real controller's cycle is minutes, but a test must not depend on the clock).
   prev="$(cat "$f" 2>/dev/null || echo 0)"
   v="$(date +%s)"
-  [ "$v" -le "$prev" ] && v=$(( prev + 1 ))
+  # FAKE_HB_EPOCH=1 writes the REAL clock even when that is not an increase — the one shape the
+  # strictly-increasing rule below cannot express, and the shape that exposes a poisoned baseline
+  # (a heartbeat seeded in the FUTURE, then a healthy controller writing `now`).
+  if [ -z "${FAKE_HB_EPOCH:-}" ]; then [ "$v" -le "$prev" ] && v=$(( prev + 1 )); fi
   printf '%s\n' "$v" > "$f"
 }
 start_ok() { # $1 = ignored; the pid is DERIVED from the launch count, because launchd gives every start
@@ -109,13 +113,21 @@ start_ok() { # $1 = ignored; the pid is DERIVED from the launch count, because l
     pid=$(( 4200 + runs ))
   fi
   printf '%s\n' "$pid" > "$st/lastpid"
-  printf 'gui/0/%s = {\n\tactive count = 1\n\tpath = %s\n\tstate = running\n\n\truns = %s\n\tpid = %s\n}\n' \
-    "${FAKE_LABEL:-com.eldato.orchestrator-loop}" "${FAKE_PLIST:-$FAKE_O/x.plist}" "$runs" "$pid" > "$st/print"
+  # `minimum runtime = N` is launchd's own report of ThrottleInterval (default 10s) — measured on this box
+  # against com.eldato.orchestrator-loop and two other labels. lc_assert_stable derives its window from it.
+  printf 'gui/0/%s = {\n\tactive count = 1\n\tpath = %s\n\tstate = running\n\n\tminimum runtime = %s\n\truns = %s\n\tpid = %s\n}\n' \
+    "${FAKE_LABEL:-com.eldato.orchestrator-loop}" "${FAKE_PLIST:-$FAKE_O/x.plist}" "${FAKE_MIN_RUNTIME:-10}" "$runs" "$pid" > "$st/print"
   : > "$st/loaded"
   bump_hb
 }
 case "${1:-}" in
   print)
+    # ⛔ A READ THAT FAILS IS NOT "NO SUCH SERVICE". FAKE_PRINT_FAIL models the EIO family: launchd
+    # cannot tell us anything, so "loaded" and "not loaded" are both unproven and the caller must
+    # refuse. FAKE_PRINT_FAIL_UNLOADED models the same read breaking AFTER a successful removal — the
+    # state that let `--uninstall` print ✅ and delete the plist over a job it could not read back.
+    if [ -n "${FAKE_PRINT_FAIL:-}" ]; then printf 'Print failed: 5: Input/output error\n' >&2; exit 1; fi
+    if [ -n "${FAKE_PRINT_FAIL_UNLOADED:-}" ] && [ ! -f "$st/loaded" ]; then printf 'Print failed: 5: Input/output error\n' >&2; exit 1; fi
     if [ -n "${FAKE_PRINT_FILE:-}" ]; then cat "$FAKE_PRINT_FILE"; exit 0; fi
     # FAKE_CRASHLOOP: a job that starts and dies — launchd bumps `runs` between two reads while the pid
     # and the heartbeat stay plausible (that is exactly why pid+heartbeat cannot detect it).
@@ -130,12 +142,19 @@ case "${1:-}" in
   enable)   : > "$st/enabled"; exit 0 ;;
   bootout)
     [ -n "${FAKE_BOOTOUT_FAIL:-}" ] && { printf 'Bootout failed: 5: Input/output error\n' >&2; exit 1; }
+    # Real launchd on an unknown service: exit 3 with this exact line (`man launchctl` territory). Modelled
+    # because lc_bootout's tolerance allow-list exists for the harmless "gone between the read and the
+    # verb" race, and an unreachable branch is an untested one.
+    [ -n "${FAKE_BOOTOUT_RACE:-}" ] && { printf 'Boot-out failed: 3: No such process\n' >&2; exit 3; }
     # FAKE_BOOTOUT_LIE: reports success while the job stays loaded — the exact case a status check cannot
     # catch, and the one that needs the caller to READ the domain back.
     [ -n "${FAKE_BOOTOUT_LIE:-}" ] && exit 0
     if [ -f "$st/loaded" ]; then rm -f "$st/loaded" "$st/print"; exit 0; fi
     exit 3 ;;  bootstrap)
     [ -n "${FAKE_BOOTSTRAP_FAIL:-}" ] && { printf 'Bootstrap failed: 5: Input/output error\n' >&2; exit 1; }
+    # Real launchd REFUSES a bootstrap over an already-loaded service (EIO — the incident's own line); modelled
+    # so the "bootout before bootstrap" ordering is proven load-bearing rather than convenient.
+    [ -n "${FAKE_BOOTSTRAP_ALREADY_LOADED:-}" ] && [ -f "$st/loaded" ] && { printf 'Bootstrap failed: 5: Input/output error\n' >&2; exit 1; }
     start_ok 4242; exit 0 ;;
   load)
     [ -n "${FAKE_LOAD_FAIL:-}" ] && { printf 'Load failed: 5: Input/output error\n' >&2; exit 1; }
@@ -154,7 +173,9 @@ fresh() { # reset the stub's world; $1 = heartbeat seed (optional)
   export FAKE_LOG="$T/launchctl.log" FAKE_STATE="$T/state" FAKE_O="$T/o"
   : > "$FAKE_LOG"
   unset FAKE_BOOTSTRAP_FAIL FAKE_LOAD_FAIL FAKE_NO_HB FAKE_PRINT_FILE FAKE_BOOTOUT_FAIL \
-    FAKE_BOOTOUT_LIE FAKE_CRASHLOOP FAKE_PLIST 2>/dev/null || true
+    FAKE_BOOTOUT_LIE FAKE_BOOTOUT_LIE_NOPID FAKE_CRASHLOOP FAKE_PLIST FAKE_THROTTLE \
+    FAKE_MIN_RUNTIME FAKE_STALE_PID FAKE_BOOTOUT_RACE FAKE_BOOTSTRAP_ALREADY_LOADED \
+    FAKE_PRINT_FAIL FAKE_PRINT_FAIL_UNLOADED FAKE_HB_EPOCH 2>/dev/null || true
 }
 calls() { cat "$FAKE_LOG" 2>/dev/null || true; }
 verbs() { awk '$1 != "print" && $1 != "kickstart" {printf "%s ", $1}' "$FAKE_LOG" 2>/dev/null; }
@@ -215,10 +236,11 @@ else bad "README still ships a copyable '-w' command: $R_W"; fi
 # degrade to the legacy verbs).
 LIB_CODE="$(code_of "$LIB")"
 INSTALL_CODE="$(code_of "$INSTALL")"
-for v in bootout enable bootstrap; do
-  if grep -q "launchctl $v" <<<"$LIB_CODE"; then ok "launchd-cycle.sh uses 'launchctl $v'"
-  else bad "launchd-cycle.sh does not use 'launchctl $v'"; fi
-done
+# ⛔ NO SOURCE GREPS FOR THE VERBS. `grep "launchctl bootout"` is satisfied by our own error message
+# ("launchctl bootout failed for …"), so it can pass while the call is renamed/moved to a variable —
+# measured: rewriting the call as `_v=bootout; launchctl "$_v" …` kept the suite green. The verbs are
+# asserted BEHAVIOURALLY instead, from the stub's argv log (sections C and F), which cannot be spoofed
+# by a string in a diagnostic.
 assert_contains "$INSTALL_CODE" 'launchd-cycle.sh' "install.sh has the helper's path"
 if grep -q 'LC_LIB' <<<"$INSTALL_CODE" && grep -q 'die "missing \$LC_LIB' <<<"$INSTALL_CODE"; then
   ok "install.sh FAILS CLOSED when launchd-cycle.sh is missing"
@@ -277,6 +299,16 @@ unset FAKE_PRINT_FILE
 got="$( . "$LIB"; lc_pid "$LABEL" )"
 assert_eq "$got" "" "lc_pid returns EMPTY for a job that is not loaded (empty, never a guess)"
 
+echo "-- B3. a heartbeat in the FUTURE is UNKNOWN, not infinitely fresh"
+# `[ -N -le M ]` is true for every negative N, so `now - value` with value > now would pass the staleness
+# gate forever (a clock correction, a file written under another clock, a corrupt value).
+fresh
+printf '%s\n' "$(( $(date +%s) + 86400 ))" > "$T/o/heartbeat"
+assert_eq "$( . "$LIB"; lc_hb_age "$T/o" )" "" "a future heartbeat reads as EMPTY (unknown)"
+printf '%s\n' "$(( $(date +%s) - 5 ))" > "$T/o/heartbeat"
+if [ -n "$( . "$LIB"; lc_hb_age "$T/o" )" ]; then ok "non-vacuity: a past heartbeat still reads as an age"
+else bad "lc_hb_age reports nothing for a normal heartbeat"; fi
+
 # ── C. lc_start: order, reporting, and the load fallback ─────────────────────────────────────────
 echo "-- C. lc_start"
 fresh
@@ -314,7 +346,7 @@ out="$( . "$LIB"; lc_start "$LABEL" "$T/o/x.plist" 2>"$T/err.txt" )"; rc=$?
 assert_eq "$out" "none" "both paths failing reports via=none"
 if [ "$rc" -ne 0 ]; then ok "both paths failing returns NON-ZERO"; else bad "both paths failing returned 0"; fi
 assert_contains "$(cat "$T/err.txt")" "could not load $LABEL" "the failure names the label"
-assert_contains "$(cat "$T/err.txt")" "left ENABLED and NOT running" "the failure states the end state (enabled, not running)"
+assert_contains "$(cat "$T/err.txt")" "Disabled override now reads" "the failure READS the disable state instead of asserting it"
 assert_eq "$(violations)" "" "neither failure path wrote a persistent disable"
 if [ -f "$T/state/enabled" ]; then ok "the job was ENABLED before the failed bootstrap"
 else bad "the job was never enabled"; fi
@@ -367,6 +399,15 @@ out="$( . "$LIB"; LC_SETTLE=1 lc_ensure "$LABEL" "$T/o/x.plist" "$T/o" 0 3 2100 
 assert_eq "$rc" "0" "a 1500s-old heartbeat is HEALTHY when the bound is 2*CYC+300 for CYC=900 (2100) — a fixed 900s calls it wedged"
 assert_contains "$out" "left untouched" "…and the controller is still left alone"
 assert_contains "$(code_of "$INSTALL")" 'LC_HB_STALE:-$(( CYC * 2 + 300 ))' "install.sh derives the bound from CYC"
+# The recovery command an operator pastes must survive a checkout path with a `'` in it; the naive
+# `SELF="bash '$HERE/install.sh'"` produced an unparseable line (review finding).
+assert_contains "$(code_of "$INSTALL")" 'SELF="bash $(shq "$HERE/install.sh")"' "the printed recovery command is single-quote-safe"
+# ⛔ THE READ-BACK ASKS "IS THE LABEL STILL LOADED", NOT "DOES IT HAVE A PID": a KeepAlive job that
+# has just exited sits loaded with no pid for up to its respawn throttle, so a pid-only read-back
+# calls a job launchd still holds "removed" (review finding). The behavioural case above covers the
+# lying-bootout path; this pins the datum itself, which no stub can model.
+assert_contains "$(code_of "$INSTALL")" 'loaded="$(lc_loaded_path "$LABEL")"' "the --uninstall read-back tests LOADED, not pid"
+assert_contains "$(code_of "$INSTALL")" 'launchd-loaded.sha256' "the render launchd loaded is RECORDED, so 'unchanged' cannot mean 'the file did not change'"
 
 # ── G. the loaded job must be OURS, or nothing is touched ────────────────────────────────────────
 # MEASURED 2026-10-17 on this box: with a job bootstrapped from /tmp/a/x.plist, running
@@ -396,7 +437,7 @@ FOREIGN
 export FAKE_PRINT_FILE="$T/foreign-print.txt"
 out="$( . "$LIB"; lc_bootout "$LABEL" "$T/o/x.plist" 2>&1 )"; rc=$?
 if [ "$rc" -ne 0 ]; then ok "a job loaded from ANOTHER path makes bootout REFUSE (non-zero)"; else bad "it booted out a job that was not loaded from our plist"; fi
-assert_contains "$out" "loaded from $T/elsewhere/before.plist" "the refusal names where the loaded job actually lives"
+assert_contains "$out" "$T/elsewhere/before.plist" "the refusal names the path launchd actually reported (the datum, not the wording)"
 assert_not_contains "$(calls)" "bootout" "NO removal was issued (which would have resolved by label)"
 : > "$FAKE_LOG"
 out="$( . "$LIB"; lc_start "$LABEL" "$T/o/x.plist" 2>&1 )"; rc=$?
@@ -408,10 +449,52 @@ unset FAKE_PRINT_FILE
 # ── H. pid + fresh heartbeat is not health: the crash loop ───────────────────────────────────────
 # `orch-loop.sh` writes the heartbeat FIRST in every cycle and the plist is KeepAlive=true, so a
 # controller that dies seconds after each start produces a fresh heartbeat forever and a plausible pid.
+echo "-- G3. a job that VANISHES between the read and the verb is not a failure"
+# lc_bootout's allow-list ("No such process") exists for this race: the pre-check saw a loaded job, the
+# verb found none. Without it a harmless race is reported as a fatal removal failure. The stub emits
+# launchd's real line (`Boot-out failed: 3: No such process`, exit 3).
+fresh "$(( $(date +%s) - 5 ))"
+export FAKE_PLIST="$T/o/x.plist"
+( . "$LIB"; lc_start "$LABEL" "$T/o/x.plist" >/dev/null 2>&1 )
+export FAKE_BOOTOUT_RACE=1
+out="$( . "$LIB"; lc_bootout "$LABEL" "$T/o/x.plist" 2>&1 )"; rc=$?
+assert_eq "$rc" "0" "a raced removal is tolerated (rc=0), not reported as a failure"
+assert_not_contains "$out" "bootout failed" "…and it does not print a failure message"
+unset FAKE_BOOTOUT_RACE
+
+# …and a bootstrap over an already-loaded job is REFUSED by launchd: the start must boot the old one out
+# FIRST. If that ordering ever regressed, every restart on a live box would report the incident's own EIO.
+fresh "$(( $(date +%s) - 5 ))"
+( . "$LIB"; lc_start "$LABEL" "$T/o/x.plist" >/dev/null 2>&1 )
+export FAKE_BOOTSTRAP_ALREADY_LOADED=1
+: > "$FAKE_LOG"
+via="$( . "$LIB"; lc_start "$LABEL" "$T/o/x.plist" )"; rc=$?
+assert_eq "$rc" "0" "a start over a loaded job still succeeds when launchd refuses a second bootstrap"
+assert_eq "$via" "bootstrap" "…coming up via bootstrap (the old job was removed first)"
+assert_contains "$(calls)" "bootout" "…which is why the bootout precedes it"
+unset FAKE_BOOTSTRAP_ALREADY_LOADED
+
+echo "-- G2. a LOADED job whose plist is gone is still removable"
+# The guard has just proved the loaded job came from this plist, so the service-target form is safe here
+# and is the only handle left. Treating "the file is missing" as "nothing to do" left a job launchd
+# still holds while the installer printed success (review finding).
+fresh "$(( $(date +%s) - 5 ))"
+export FAKE_PLIST="$T/o/x.plist"
+( . "$LIB"; lc_start "$LABEL" "$T/o/x.plist" >/dev/null 2>&1 )
+rm -f "$T/o/x.plist"
+: > "$FAKE_LOG"
+out="$( . "$LIB"; lc_bootout "$LABEL" "$T/o/x.plist" 2>&1 )"; rc=$?
+assert_eq "$rc" "0" "a loaded job whose plist is gone is removed (rc=0)"
+assert_contains "$(calls)" "bootout gui/$(id -u)/$LABEL" "…via the service-target form, which the ownership guard has just made safe"
+if is_loaded; then bad "the job is still loaded after the removal"; else ok "the job is gone afterwards (asserted)"; fi
+
+
 echo "-- H. a crash-looping job is caught, not blessed"
 fresh "$(( $(date +%s) - 5 ))"
 export LC_SETTLE=1
-export FAKE_CRASHLOOP=1
+# FAKE_THROTTLE=1 so a 1s window can observe a respawn at all; the SHIPPED default window is derived
+# from launchd's own throttle (see D6), not from this test knob.
+export FAKE_CRASHLOOP=1 FAKE_THROTTLE=1 FAKE_MIN_RUNTIME=1
 out="$( . "$LIB"; lc_start "$LABEL" "$T/o/x.plist" >/dev/null 2>&1; lc_ensure "$LABEL" "$T/o/x.plist" "$T/o" 0 3 2>&1 )"; rc=$?
 if [ "$rc" -ne 0 ]; then ok "a relaunching job is NOT reported as 'already running' (non-zero)"; else bad "a crash-looping controller was blessed as healthy"; fi
 assert_contains "$out" "RELAUNCHED" "the message names the relaunch instead of a stale heartbeat"
@@ -419,7 +502,7 @@ assert_contains "$out" "RELAUNCHED" "the message names the relaunch instead of a
 out="$( . "$LIB"; lc_start "$LABEL" "$T/o/x.plist" >/dev/null 2>&1; lc_ensure "$LABEL" "$T/o/x.plist" "$T/o" 1 3 2>&1 )"; rc=$?
 if [ "$rc" -ne 0 ]; then ok "a start that lands on a crash loop returns NON-ZERO"; else bad "a crash-looping start returned 0"; fi
 assert_contains "$(calls)" "bootout" "…and it really did try (the bootout happened, the assertion is what failed)"
-unset FAKE_CRASHLOOP LC_SETTLE
+unset FAKE_CRASHLOOP LC_SETTLE FAKE_THROTTLE FAKE_MIN_RUNTIME
 
 # ── I. TEMP HOME (#446) ────────────────────────────────────────────────────────────────────────
 # A run whose $HOME is not the real home registers/removes jobs in the REAL user's domain. This is a
@@ -442,6 +525,24 @@ assert_not_contains "$(calls)" "bootout" "no launchctl call was issued at all"
 out="$( env HOME="$T/sandbox-home" ELDATO_ALLOW_TEST_HOME=1 PATH="$T/dsclbin:$PATH" bash -c '. "$1"; lc_bootout "$2" "$3"' _ "$LIB" "$LABEL" "$T/o/x.plist" 2>&1 )"; rc=$?
 assert_eq "$rc" "0" "ELDATO_ALLOW_TEST_HOME=1 is the documented opt-in and it works"
 
+echo "-- I2. the guard compares the REAL home, not its SPELLING"
+# A trailing slash or a symlink to the real home IS the real account; refusing it told the operator to
+# "run it from your own account" while they already were (review finding: false block, false reason).
+mkdir -p "$T/realhome" "$T/dsclreal"
+ln -sfn "$T/realhome" "$T/realhome-link"
+cat > "$T/dsclreal/dscl" <<DSHIM2
+#!/usr/bin/env bash
+printf 'NFSHomeDirectory: %s\n' "$T/realhome"
+DSHIM2
+chmod +x "$T/dsclreal/dscl"
+fresh
+for spelling in "$T/realhome" "$T/realhome/" "$T/realhome-link"; do
+  : > "$FAKE_LOG"
+  out="$( env HOME="$spelling" PATH="$T/dsclreal:$PATH" bash -c '. "$1"; lc_bootout "$2" "$3"' _ "$LIB" "$LABEL" "$T/o/x.plist" 2>&1 )"; rc=$?
+  assert_eq "$rc" "0" "HOME=$spelling is the real account and is ALLOWED ($out)"
+done
+
+
 echo "-- H2. a start that does NOT replace the old process is caught"
 # `launchctl bootstrap` can report success while launchd kept the old process. The old controller then
 # keeps the OLD plist limits — and its pid plus a fresh heartbeat make the naive assertion pass.
@@ -455,7 +556,27 @@ assert_contains "$out" "NOT replaced" "the message says the job was not replaced
 assert_contains "$out" "pid $oldpid" "it names the surviving pid"
 unset FAKE_STALE_PID
 
+echo "-- D6. the relaunch window is derived from launchd's THROTTLE, not a constant"
+# `man launchd.plist` ThrottleInterval: "jobs will not be spawned more than once every 10 seconds";
+# `launchctl print` reports it as `minimum runtime = N`. An observation window shorter than N can never
+# see a respawn — a 5s window was reviewed as systematically blind on the start path.
+# ⛔ The DERIVATION is asserted from the source, not by timing: a wall-clock test of "a 5s window misses a
+# 10s throttle, a 13s window catches it" depends on how long `sleep` actually takes on a loaded box, and
+# the assertion it protects would then be flaky in the direction of passing. The behavioural half below
+# stays, with a 1s throttle, so the fallback path itself is still exercised.
+assert_contains "$(code_of "$LIB")" 'floor=$(( $(lc_min_runtime "$label") + 3 ))' "the window is derived from the job's own throttle (+3s margin)"
+assert_contains "$(code_of "$LIB")" "minimum runtime = [0-9]" "lc_min_runtime reads launchd's own 'minimum runtime' field"
+fresh "$(( $(date +%s) - 5 ))"
+export FAKE_MIN_RUNTIME=1 FAKE_THROTTLE=1 FAKE_CRASHLOOP=1
+export LC_SETTLE=abc      # a non-numeric value must NOT become a zero-width window
+( . "$LIB"; lc_start "$LABEL" "$T/o/x.plist" >/dev/null 2>&1 )
+assert_eq "$( . "$LIB"; lc_min_runtime "$LABEL" )" "1" "lc_min_runtime reads the printed value (1 here)"
+out="$( . "$LIB"; lc_assert_stable "$LABEL" "abc" 2>&1 )"; rc=$?
+if [ "$rc" -ne 0 ]; then ok "a NON-NUMERIC settle falls back to the derived window instead of a zero-width pass"; else bad "a non-numeric settle silently disabled the check"; fi
+assert_contains "$out" "RELAUNCHED" "the message names the relaunch"
+unset FAKE_CRASHLOOP FAKE_THROTTLE FAKE_MIN_RUNTIME LC_SETTLE
 
+# ── E. the forbidden end state, across every driveable start scenario ───────────────────────────
 echo "-- E. no forbidden end state in any start scenario"
 drive() { # <name> <0|fail>
   local name="$1" expect="$2" rc
@@ -475,115 +596,250 @@ fresh; export FAKE_NO_HB=1;                                  drive "loaded with 
 
 # ── F. end-to-end install.sh ─────────────────────────────────────────────────────────────────────
 echo "-- F. install.sh end to end"
+# ⛔ NOT GATED ON macOS ANY MORE. The half that is genuinely platform-specific is `plutil -lint`, and on a
+# Linux CI runner there is no plutil to run it — so the suite stubs it THERE and runs the rest, because
+# the rest is the incident's own path (`--uninstall` and its read-back, `--start` and its proof, the
+# flag refusal, "a plain run mutates nothing"). Leaving all of §F on the developer's mac meant a
+# regression in that half shipped green through the only automated gate.
 if [ "$PLATFORM" != "Darwin" ]; then
-  skipd "install.sh end-to-end — install.sh is macOS-only by construction (launchd + plutil)"
+  printf '#!/bin/sh\nexit 0\n' > "$T/bin/plutil"; chmod +x "$T/bin/plutil"
+  STUBBED_PLUTIL=1
+  export ELDATO_ALLOW_NON_DARWIN=1   # install.sh's real platform gate, bypassed in this suite only
 else
-  # The installer is driven from a STAGE copy so it cannot reach this checkout's neighbours, and so
-  # the only scripts its `bash -n` sweep sees are the ones under test.
-  STAGE="$T/stage"; mkdir -p "$STAGE"
-  cp "$INSTALL" "$LIB" "$HARNESS/launchd.plist.template" "$STAGE/" 2>/dev/null
-  SHOME="$T/home"; mkdir -p "$SHOME/Library/LaunchAgents" "$SHOME/.local/share/pi-node/current/bin" \
-    "$SHOME/.pi/agent/scripts"
-  # install.sh probes the real binaries: gh (network), tmux, pi, uv.
-  printf '#!/bin/bash\nexit 0\n' > "$T/bin/gh"
-  printf '#!/bin/bash\nexit 0\n' > "$T/bin/tmux"
-  printf '#!/bin/bash\nexit 0\n' > "$SHOME/.local/share/pi-node/current/bin/pi"
-  chmod +x "$T/bin/gh" "$T/bin/tmux" "$SHOME/.local/share/pi-node/current/bin/pi"
-  PLIST="$SHOME/Library/LaunchAgents/$LABEL.plist"
-  # The stub reports the loaded job's `path =` as the plist the installer rendered (passed per call in
-  # ORUN, because each scenario starts from `fresh`), so the ownership guard (G) sees OUR job. Without
-  # it the stub would claim `$T/o/x.plist` and every §F run would correctly refuse.
-  ORUN() { # <extra args…>
-    # ⛔ ELDATO_ALLOW_TEST_HOME=1 is the #446 guard's documented opt-in: this HOME is a sandbox, so the
-    # run WOULD otherwise (correctly) refuse to touch launchd. With it, the `launchctl` stub on PATH is
-    # what stands in for the real domain — no real job is registered or removed by this suite.
-    env HOME="$SHOME" O="$T/o" REPO="$(cd "$HARNESS/../.." && pwd)" OR="acme/widget" \
-      ELDATO_ALLOW_TEST_HOME=1 LC_SETTLE=1 START_TIMEOUT=2 FAKE_PLIST="$PLIST" \
-      PATH="$SHOME/.local/share/pi-node/current/bin:$T/bin:$PATH" \
-      bash "$STAGE/install.sh" "$@"
-  }
-  mutating() { grep -vE '^(print|kickstart)( |$)' "$FAKE_LOG" 2>/dev/null || true; }
-
-  fresh
-  out="$(ORUN 2>&1)"; rc=$?
-  assert_eq "$rc" "0" "plain install exits 0"
-  [ -f "$PLIST" ] && ok "plain install rendered the plist" || bad "plain install rendered no plist"
-  if [ -z "$(mutating)" ]; then ok "plain install made ZERO mutating launchctl calls (a validation run cannot disturb a live controller)"
-  else bad "plain install MUTATED launchd: $(mutating)"; fi
-
-  # --start with a healthy box: the job comes up and the start is PROVEN.
-  fresh "$(( $(date +%s) - 5 ))"
-  out="$(ORUN --start 2>&1)"; rc=$?
-  assert_eq "$rc" "0" "--start on a fresh box exits 0"
-  is_loaded && ok "--start left the job loaded" || bad "--start did not load the job"
-  assert_contains "$out" "heartbeat advanced" "--start VERIFIED the heartbeat advanced"
-
-  # --start where bootstrap AND load fail: MUST be non-zero, with one actionable line.
-  fresh
-  export FAKE_BOOTSTRAP_FAIL=1 FAKE_LOAD_FAIL=1
-  out="$(ORUN --start 2>&1)"; rc=$?
-  if [ "$rc" -ne 0 ]; then ok "a failed --start exits NON-ZERO (the old installer exited 0 here)"; else bad "a failed --start exited 0"; fi
-  assert_contains "$out" "could not load $LABEL" "the failure prints one actionable line naming the label"
-  assert_contains "$out" "Next: launchctl print" "…and names the next command to run"
-  assert_eq "$(violations)" "" "the failed start wrote no persistent disable"
-
-  # --start where the job comes up but NEVER cycles: also non-zero, and the message distinguishes
-  # "no pid" from "pid but no heartbeat" (they have different remedies).
-  fresh
-  export FAKE_NO_HB=1
-  out="$(ORUN --start 2>&1)"; rc=$?
-  if [ "$rc" -ne 0 ]; then ok "loaded-but-not-cycling --start exits NON-ZERO"; else bad "loaded-but-not-cycling exited 0"; fi
-  assert_contains "$out" "running but NOT cycling" "the message distinguishes 'not cycling' from 'not running'"
-
-  # --start on a HEALTHY live job with an UNCHANGED plist: left alone.
-  fresh "$(( $(date +%s) - 5 ))"
-  out="$(ORUN --start 2>&1)"; rc=$?
-  assert_eq "$rc" "0" "second --start exits 0"
-  : > "$FAKE_LOG"
-  out="$(ORUN --start 2>&1)"; rc=$?
-  assert_eq "$rc" "0" "idempotent --start exits 0"
-  if [ -z "$(mutating)" ]; then ok "an unchanged, healthy box is NOT disturbed by --start"
-  else bad "--start disturbed a healthy unchanged controller: $(mutating)"; fi
-  assert_contains "$out" "left untouched" "…and says so"
-
-  # an unknown flag must be REFUSED, not ignored: a typo'd --strt would otherwise install and exit 0.
-  out="$(ORUN --strt 2>&1)"; rc=$?
-  if [ "$rc" -ne 0 ]; then ok "an unknown flag is refused (non-zero)"; else bad "an unknown flag was silently accepted"; fi
-  assert_contains "$out" "unknown argument" "the refusal names the problem"
-
-  # --uninstall: bootout, PROVE the job is gone, then remove the plist.
-  fresh "$(( $(date +%s) - 5 ))"
-  ORUN --start >/dev/null 2>&1
-  : > "$FAKE_LOG"          # scope the assertion: only THIS command's calls count
-  out="$(ORUN --uninstall 2>&1)"; rc=$?
-  assert_eq "$rc" "0" "--uninstall exits 0 when the removal verifiably worked"
-  if is_loaded; then bad "--uninstall reported success but the job is STILL loaded"; else ok "--uninstall left the job NOT loaded (asserted, not assumed)"; fi
-  [ ! -f "$PLIST" ] && ok "--uninstall removed the plist" || bad "--uninstall left the plist"
-  assert_contains "$(calls)" "bootout" "--uninstall booted the job out"
-  assert_eq "$(violations)" "" "--uninstall wrote NO persistent disable (the next start is a plain start)"
-  assert_eq "$(service_target_bootouts)" "" "--uninstall removed by plist PATH, so a sandboxed HOME cannot boot out the live job"
-
-  # --uninstall where launchd REFUSES the removal (EIO — the incident's own error class): it must NOT
-  # print ✅, must NOT delete the plist (the only handle for a retry), and must exit non-zero.
-  fresh "$(( $(date +%s) - 5 ))"
-  ORUN --start >/dev/null 2>&1
-  export FAKE_BOOTOUT_FAIL=1
-  out="$(ORUN --uninstall 2>&1)"; rc=$?
-  if [ "$rc" -ne 0 ]; then ok "a refused removal makes --uninstall exit NON-ZERO (it used to print ✅)"; else bad "--uninstall exited 0 over a job that is still loaded"; fi
-  assert_not_contains "$out" "✅ Removed" "it does not claim removal it could not verify"
-  assert_contains "$out" "bootout failed" "the failure carries launchd's own diagnostic"
-  [ -f "$PLIST" ] && ok "the plist is KEPT, so the removal can be retried/verified" || bad "--uninstall deleted its own only handle"
-
-  # …and where launchd LIES (reports success, job still loaded): the READ-BACK is what catches it.
-  fresh "$(( $(date +%s) - 5 ))"
-  ORUN --start >/dev/null 2>&1
-  export FAKE_BOOTOUT_LIE=1
-  out="$(ORUN --uninstall 2>&1)"; rc=$?
-  if [ "$rc" -ne 0 ]; then ok "a claimed-but-failed removal still exits NON-ZERO (the read-back, not the status)"; else bad "--uninstall trusted 'launchctl bootout' exit 0 and reported success"; fi
-  assert_contains "$out" "STILL loaded" "the failure states the job is still loaded"
-  assert_not_contains "$out" "✅ Removed" "it does not print ✅ over a live job"
-
+  STUBBED_PLUTIL=""
 fi
+# The installer is driven from a STAGE copy so it cannot reach this checkout's neighbours, and so
+# the only scripts its `bash -n` sweep sees are the ones under test.
+STAGE="$T/stage"; mkdir -p "$STAGE"
+cp "$INSTALL" "$LIB" "$HARNESS/launchd.plist.template" "$STAGE/" 2>/dev/null
+SHOME="$T/home"; mkdir -p "$SHOME/Library/LaunchAgents" "$SHOME/.local/share/pi-node/current/bin" \
+  "$SHOME/.pi/agent/scripts"
+# install.sh probes the real binaries: gh (network), tmux, pi, uv.
+printf '#!/bin/bash\nexit 0\n' > "$T/bin/gh"
+printf '#!/bin/bash\nexit 0\n' > "$T/bin/tmux"
+printf '#!/bin/bash\nexit 0\n' > "$SHOME/.local/share/pi-node/current/bin/pi"
+chmod +x "$T/bin/gh" "$T/bin/tmux" "$SHOME/.local/share/pi-node/current/bin/pi"
+PLIST="$SHOME/Library/LaunchAgents/$LABEL.plist"
+# The stub reports the loaded job's `path =` as the plist the installer rendered (passed per call in
+# ORUN, because each scenario starts from `fresh`), so the ownership guard (G) sees OUR job. Without
+# it the stub would claim `$T/o/x.plist` and every §F run would correctly refuse.
+ORUN() { # <extra args…>
+  # ⛔ ELDATO_ALLOW_TEST_HOME=1 is the #446 guard's documented opt-in: this HOME is a sandbox, so the
+  # run WOULD otherwise (correctly) refuse to touch launchd. With it, the `launchctl` stub on PATH is
+  # what stands in for the real domain — no real job is registered or removed by this suite.
+  env HOME="$SHOME" O="$T/o" REPO="$(cd "$HARNESS/../.." && pwd)" OR="acme/widget" \
+    ELDATO_ALLOW_TEST_HOME=1 LC_SETTLE=1 START_TIMEOUT=2 FAKE_PLIST="$PLIST" \
+    PATH="$SHOME/.local/share/pi-node/current/bin:$T/bin:$PATH" \
+    bash "$STAGE/install.sh" "$@"
+}
+mutating() { grep -vE '^(print|kickstart)( |$)' "$FAKE_LOG" 2>/dev/null || true; }
+
+fresh
+out="$(ORUN 2>&1)"; rc=$?
+assert_eq "$rc" "0" "plain install exits 0"
+[ -f "$PLIST" ] && ok "plain install rendered the plist" || bad "plain install rendered no plist"
+if [ -z "$(mutating)" ]; then ok "plain install made ZERO mutating launchctl calls (a validation run cannot disturb a live controller)"
+else bad "plain install MUTATED launchd: $(mutating)"; fi
+if [ -n "${STUBBED_PLUTIL:-}" ]; then
+  ok "plutil was STUBBED on this platform — the XML-lint half of this section is not exercised here, the launchd half is"
+fi
+
+# --start with a healthy box: the job comes up and the start is PROVEN.
+fresh "$(( $(date +%s) - 5 ))"
+out="$(ORUN --start 2>&1)"; rc=$?
+assert_eq "$rc" "0" "--start on a fresh box exits 0"
+is_loaded && ok "--start left the job loaded" || bad "--start did not load the job"
+assert_contains "$out" "heartbeat advanced" "--start VERIFIED the heartbeat advanced"
+
+# --start where bootstrap AND load fail: MUST be non-zero, with one actionable line.
+fresh
+export FAKE_BOOTSTRAP_FAIL=1 FAKE_LOAD_FAIL=1
+out="$(ORUN --start 2>&1)"; rc=$?
+if [ "$rc" -ne 0 ]; then ok "a failed --start exits NON-ZERO (the old installer exited 0 here)"; else bad "a failed --start exited 0"; fi
+assert_contains "$out" "could not load $LABEL" "the failure prints one actionable line naming the label"
+assert_contains "$out" "Next: launchctl print" "…and names the next command to run"
+assert_eq "$(violations)" "" "the failed start wrote no persistent disable"
+
+# --start where the job comes up but NEVER cycles: also non-zero, and the message distinguishes
+# "no pid" from "pid but no heartbeat" (they have different remedies).
+fresh
+export FAKE_NO_HB=1
+out="$(ORUN --start 2>&1)"; rc=$?
+if [ "$rc" -ne 0 ]; then ok "loaded-but-not-cycling --start exits NON-ZERO"; else bad "loaded-but-not-cycling exited 0"; fi
+assert_contains "$out" "running but NOT cycling" "the message distinguishes 'not cycling' from 'not running'"
+
+# --start on a HEALTHY live job with an UNCHANGED plist: left alone.
+fresh "$(( $(date +%s) - 5 ))"
+out="$(ORUN --start 2>&1)"; rc=$?
+assert_eq "$rc" "0" "second --start exits 0"
+: > "$FAKE_LOG"
+out="$(ORUN --start 2>&1)"; rc=$?
+assert_eq "$rc" "0" "idempotent --start exits 0"
+if [ -z "$(mutating)" ]; then ok "an unchanged, healthy box is NOT disturbed by --start"
+else bad "--start disturbed a healthy unchanged controller: $(mutating)"; fi
+assert_contains "$out" "left untouched" "…and says so"
+  # ⛔ AND THE BANNER MUST NOT CLAIM A START (review finding): this run made zero mutating calls, so
+  # "this run started it and PROVED it" is a process claim with no artifact behind it.
+  assert_not_contains "$out" "started it and PROVED it" "the banner does NOT claim this run started it"
+  assert_contains "$out" "VERIFIED it" "…it says the run VERIFIED a job it left alone"
+
+  # ⛔ THE STALE-RENDER RELOAD (review finding): a plain install OVERWRITES the plist without reloading
+  # the job. Comparing the render to the FILE then says "unchanged" on the next --start, which would
+  # skip the reload it exists to perform and exit 0 with the old settings still live.
+  fresh "$(( $(date +%s) - 5 ))"
+  MAX_LANES=5 ORUN --start >/dev/null 2>&1
+  out="$(MAX_LANES=7 ORUN 2>&1)"                       # plain run: writes the file, does not reload
+  assert_contains "$out" "NOT on the rendered plist" "a plain run WARNS that the loaded job is stale"
+  : > "$FAKE_LOG"
+  out="$(MAX_LANES=7 ORUN --start 2>&1)"; rc=$?
+  assert_eq "$rc" "0" "--start after a plain install exits 0"
+  assert_contains "$(calls)" "bootout" "…and RELOADS the stale job (the file was unchanged, the job was not)"
+  assert_contains "$out" "RELOADED" "the banner says it reloaded rather than started"
+
+  # ⛔ AND AN ABSENT RECORD IS NOT "STALE". `$O/state/launchd-loaded.sha256` does not exist on any box
+  # that has not run `--start` under this version, so the FIRST plain run of a healthy, byte-identical
+  # install would otherwise tell the operator "it still uses the OLD settings" — and point at a
+  # `--restart` of the production controller — from an absent file (review finding).
+  fresh "$(( $(date +%s) - 5 ))"
+  MAX_LANES=5 ORUN --start >/dev/null 2>&1
+  rm -f "$T/o/state/launchd-loaded.sha256"
+  out="$(MAX_LANES=5 ORUN 2>&1)"
+  assert_contains "$out" "which render launchd loaded is UNKNOWN" "a MISSING record is reported as UNKNOWN"
+  assert_not_contains "$out" "it still uses the OLD settings" "…and NOT as a measurement of staleness"
+  assert_not_contains "$out" "--restart" "…nor does it point at a needless restart"
+
+# an unknown flag must be REFUSED, not ignored: a typo'd --strt would otherwise install and exit 0.
+out="$(ORUN --strt 2>&1)"; rc=$?
+if [ "$rc" -ne 0 ]; then ok "an unknown flag is refused (non-zero)"; else bad "an unknown flag was silently accepted"; fi
+assert_contains "$out" "unknown argument" "the refusal names the problem"
+
+# --uninstall: bootout, PROVE the job is gone, then remove the plist.
+fresh "$(( $(date +%s) - 5 ))"
+ORUN --start >/dev/null 2>&1
+: > "$FAKE_LOG"          # scope the assertion: only THIS command's calls count
+out="$(ORUN --uninstall 2>&1)"; rc=$?
+assert_eq "$rc" "0" "--uninstall exits 0 when the removal verifiably worked"
+if is_loaded; then bad "--uninstall reported success but the job is STILL loaded"; else ok "--uninstall left the job NOT loaded (asserted, not assumed)"; fi
+[ ! -f "$PLIST" ] && ok "--uninstall removed the plist" || bad "--uninstall left the plist"
+assert_contains "$(calls)" "bootout" "--uninstall booted the job out"
+assert_eq "$(violations)" "" "--uninstall wrote NO persistent disable (the next start is a plain start)"
+assert_eq "$(service_target_bootouts)" "" "--uninstall removed by plist PATH, so a sandboxed HOME cannot boot out the live job"
+
+# --uninstall where launchd REFUSES the removal (EIO — the incident's own error class): it must NOT
+# print ✅, must NOT delete the plist (the only handle for a retry), and must exit non-zero.
+fresh "$(( $(date +%s) - 5 ))"
+ORUN --start >/dev/null 2>&1
+export FAKE_BOOTOUT_FAIL=1
+out="$(ORUN --uninstall 2>&1)"; rc=$?
+if [ "$rc" -ne 0 ]; then ok "a refused removal makes --uninstall exit NON-ZERO (it used to print ✅)"; else bad "--uninstall exited 0 over a job that is still loaded"; fi
+assert_not_contains "$out" "✅ Removed" "it does not claim removal it could not verify"
+assert_contains "$out" "bootout failed" "the failure carries launchd's own diagnostic"
+[ -f "$PLIST" ] && ok "the plist is KEPT, so the removal can be retried/verified" || bad "--uninstall deleted its own only handle"
+
+# …and where launchd LIES (reports success, job still loaded): the READ-BACK is what catches it.
+fresh "$(( $(date +%s) - 5 ))"
+ORUN --start >/dev/null 2>&1
+export FAKE_BOOTOUT_LIE=1
+out="$(ORUN --uninstall 2>&1)"; rc=$?
+if [ "$rc" -ne 0 ]; then ok "a claimed-but-failed removal still exits NON-ZERO (the read-back, not the status)"; else bad "--uninstall trusted 'launchctl bootout' exit 0 and reported success"; fi
+assert_contains "$out" "STILL loaded" "the failure states the job is still loaded"
+assert_not_contains "$out" "✅ Removed" "it does not print ✅ over a live job"
+
+  # …and where the domain read BREAKS after the removal: an unreadable domain is not a removal, so the
+  # plist must survive and the run must fail. This is the end-to-end half of §J (review finding).
+  fresh "$(( $(date +%s) - 5 ))"
+  ORUN --start >/dev/null 2>&1
+  export FAKE_PRINT_FAIL_UNLOADED=1
+  out="$(ORUN --uninstall 2>&1)"; rc=$?
+  if [ "$rc" -ne 0 ]; then ok "an UNVERIFIABLE removal exits NON-ZERO"; else bad "--uninstall exited 0 when the domain could not be read back"; fi
+  assert_contains "$out" "cannot be VERIFIED" "the failure says the removal could not be VERIFIED"
+  assert_contains "$out" "Input/output error" "…quoting launchd's own diagnostic"
+  [ -f "$PLIST" ] && ok "the plist SURVIVES an unverifiable removal (the only handle a retry has)" \
+    || bad "the plist was DELETED on an unverifiable removal"
+  assert_not_contains "$out" "✅ Removed" "it does not print ✅ over a removal it could not read back"
+  unset FAKE_PRINT_FAIL_UNLOADED
+
+# ── J. an UNREADABLE launchd is NOT "not loaded" ────────────────────────────────────────────────
+# `launchctl print` failing says NOTHING about whether the job exists. Flattening the two made
+# `--uninstall` issue no bootout at all, the read-back see an empty read, and the installer print ✅ and
+# DELETE the plist over a live KeepAlive controller — while the ownership guard was skipped for the same
+# reason, so even `enable` (which has no path form) no longer required proof the job was ours.
+echo "-- J. an unreadable domain refuses, and is never read as 'not loaded'"
+fresh "$(( $(date +%s) - 5 ))"
+export FAKE_PLIST="$T/o/x.plist"
+( . "$LIB"; lc_start "$LABEL" "$T/o/x.plist" >/dev/null 2>&1 )
+( . "$LIB"; lc_probe "$LABEL" >/dev/null 2>&1 ); assert_eq "$?" "0" "lc_probe returns 0 for a LOADED job"
+fresh
+( . "$LIB"; lc_probe "$LABEL" >/dev/null 2>&1 ); assert_eq "$?" "1" "lc_probe returns 1 for launchd's own not-found answer (definitively absent)"
+( . "$LIB"; lc_start "$LABEL" "$T/o/x.plist" >/dev/null 2>&1 )
+export FAKE_PRINT_FAIL=1
+( . "$LIB"; lc_probe "$LABEL" >/dev/null 2>&1 ); assert_eq "$?" "2" "lc_probe returns 2 when the read FAILED (unknown, not absent)"
+: > "$FAKE_LOG"
+out="$( . "$LIB"; lc_bootout "$LABEL" "$T/o/x.plist" 2>&1 )"; rc=$?
+if [ "$rc" -ne 0 ]; then ok "an unreadable domain makes bootout REFUSE (non-zero)"; else bad "bootout reported success on an unreadable domain"; fi
+assert_contains "$out" "could not be read" "the refusal says the read failed"
+assert_not_contains "$(calls)" "bootout" "NO removal was issued"
+: > "$FAKE_LOG"
+out="$( . "$LIB"; lc_start "$LABEL" "$T/o/x.plist" 2>&1 )"; rc=$?
+if [ "$rc" -ne 0 ]; then ok "an unreadable domain makes a start REFUSE (non-zero)"; else bad "it started on an unreadable domain"; fi
+assert_not_contains "$(calls)" "enable" "enable was NOT issued over a job whose ownership could not be proven"
+assert_not_contains "$(calls)" "bootstrap" "nothing was bootstrapped"
+unset FAKE_PRINT_FAIL
+
+# ── K. the refusal must be PRINTED under the CALLER's shell options ──────────────────────────────
+# launchd-cycle.sh is SOURCED into install.sh's `set -euo pipefail`. An unguarded `x="$(cd … && pwd -P)"`
+# therefore aborts the CALLER mid-function: the refusal line is never printed, `2>/dev/null` swallows
+# `cd`'s own error, and an operator recovering a dead controller sees an exit code and NO output.
+echo "-- K. the guard's refusal survives a \`set -e\` caller"
+fresh
+out="$( env -u ELDATO_ALLOW_TEST_HOME HOME="$T/no-such-home" PATH="$T/dsclbin:$PATH" \
+  bash -c 'set -euo pipefail; . "$1"; lc_guard_mutate "$2" "$3"' _ "$LIB" "$LABEL" "$T/o/x.plist" 2>&1 )"; rc=$?
+if [ "$rc" -ne 0 ]; then ok "a missing HOME makes the guard REFUSE under \`set -e\` (non-zero)"; else bad "the guard returned 0 with a missing HOME"; fi
+assert_contains "$out" "is not the real home" "…and the refusal is actually PRINTED (not swallowed by set -e)"
+assert_not_contains "$(calls)" "bootout" "no launchctl call was issued"
+
+# ── N. an UNREADABLE account record is not "no check needed" ────────────────────────────────────
+# `dscl` absent (Linux) and `dscl` FAILING are different states: the first has no gui domain to protect,
+# the second means the #446 check cannot decide — and skipping the check there is how a sandboxed run
+# registers a job against a throwaway $HOME in the REAL domain.
+echo "-- N. an unreadable account record refuses instead of skipping the #446 guard"
+mkdir -p "$T/dsclfail" "$T/dscljunk"
+printf '#!/usr/bin/env bash\nexit 1\n' > "$T/dsclfail/dscl"
+printf '#!/usr/bin/env bash\nprintf "something else\\n"\n' > "$T/dscljunk/dscl"
+chmod +x "$T/dsclfail/dscl" "$T/dscljunk/dscl"
+for bad in "$T/dsclfail" "$T/dscljunk"; do
+  fresh
+  out="$( env -u ELDATO_ALLOW_TEST_HOME HOME="$T/whatever" PATH="$bad:$PATH" \
+    bash -c '. "$1"; lc_guard_mutate "$2" "$3"' _ "$LIB" "$LABEL" "$T/o/x.plist" 2>&1 )"; rc=$?
+  if [ "$rc" -ne 0 ]; then ok "$(basename "$bad"): an unreadable home REFUSES (non-zero)"; else bad "$(basename "$bad"): the #446 guard was silently skipped"; fi
+  assert_contains "$out" "could not be read" "$(basename "$bad"): the refusal names the failed read"
+done
+
+# ── L. a FUTURE-dated heartbeat must not poison the start-proof baseline ─────────────────────────
+# The proof is `cur > before`. A future-dated file (clock correction, foreign clock, corruption) makes
+# that target unreachable, so a HEALTHY start is reported as "running but NOT cycling" — with the wrong
+# remedy, and once per `--restart` retry, because each retry boots the controller out first.
+echo "-- L. a future heartbeat reads as UNKNOWN, in the age AND in the advance baseline"
+fresh
+printf '%s\n' "$(( $(date +%s) + 86400 ))" > "$T/o/heartbeat"
+assert_eq "$( . "$LIB"; lc_hb_value "$T/o" )" "0" "lc_hb_value reads a future heartbeat as UNKNOWN (0), not as a huge target"
+export FAKE_HB_EPOCH=1 LC_SETTLE=1
+out="$( . "$LIB"; lc_ensure "$LABEL" "$T/o/x.plist" "$T/o" 1 3 2>&1 )"; rc=$?
+assert_eq "$rc" "0" "a future-dated baseline does not make a healthy start look dead"
+assert_contains "$out" "and the heartbeat advanced" "…the start is reported as verified"
+unset FAKE_HB_EPOCH LC_SETTLE
+
+# ── M. a non-numeric START_TIMEOUT must not zero the poll ────────────────────────────────────────
+# `[ "$i" -lt "abc" ]` ERRORS, so the loop body never runs and every start fails after ZERO
+# observations ("has NO pid abcs after the start") — the same defect lc_assert_stable had, in the
+# parameter that gates the operator's recovery command.
+echo "-- M. a non-numeric timeout falls back to a real window"
+fresh
+out="$( . "$LIB"; lc_ensure "$LABEL" "$T/o/x.plist" "$T/o" 1 abcs 2>&1 )"; rc=$?
+assert_eq "$rc" "0" "a non-numeric START_TIMEOUT still starts and VERIFIES (no zero-width poll)"
+assert_contains "$out" "and the heartbeat advanced" "…and the assertion really ran"
+assert_not_contains "$out" "abcs" "the diagnostic does not quote the garbage value back as a duration"
+
 
 echo
 if [ "$FAIL" -eq 0 ]; then

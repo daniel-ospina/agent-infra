@@ -459,7 +459,13 @@ one line rather than acting if either fails: **`$HOME` must be the real home** (
 acts in the real user's domain — agent-infra#446; tests opt in with `ELDATO_ALLOW_TEST_HOME=1` plus a
 `launchctl` stub on PATH), and **a job already loaded under this label must be loaded from this
 plist** — `launchctl bootout <domain> <path>` resolves the removal by the LABEL it reads out of that
-plist (measured), so without that check a sandboxed run would remove the production controller.
+plist (measured), so without that check a sandboxed run would remove the production controller. A
+third read guards both of those: `launchctl print` failing is **UNKNOWN**, never "not loaded", so an
+unreadable domain (or an unreadable account record) makes the run refuse instead of acting on a guess.
+
+`ELDATO_ALLOW_NON_DARWIN=1` is the suite's test-only bypass of the installer's macOS precondition (the
+only automated gate runs on Linux, and `--start`/`--uninstall` are the incident's own path). It is the
+same discipline as `ELDATO_ALLOW_TEST_HOME=1` and never applies to a normal run.
 
 Run the offline self-test first — it needs no network, tmux server or git writes. **Every check
 exercises the shipped script** (it extracts the real classifier, `sess()`, the claim block and the
@@ -696,11 +702,13 @@ clear about what is and is not enforced:
 
 The ritual, in order — the point is that **no uncommitted work is lost**:
 
-1. `bash scripts/orchestrator-harness/install.sh --uninstall` (from the checkout; the installer is not in
-   `$O`, whose copies are the loop's own scripts) — `bootout` + remove the plist, so it does not restart
-   on boot and no persistent Disabled override is written (which is what `unload -w` did; agent-infra#1975).
-   It READS the domain back afterwards and fails if the job is still loaded, so step 2 cannot be undone
-   by a launchd that quietly kept the job.
+1. `bash scripts/orchestrator-harness/install.sh --uninstall` (from the checkout root, as §4): the
+   installer resolves `launchd-cycle.sh` and `launchd.plist.template` from its OWN directory, so a stale
+   copy under `$O` refuses with "missing …launchd-cycle.sh" — `bootout` + remove the plist, so it does
+   not restart on boot and no persistent Disabled override is written (which is what `unload -w` did;
+   agent-infra#1975). It READS THE DOMAIN BACK afterwards — "is the label still loaded", not "does it
+   have a pid", because a `KeepAlive` job inside its 10s respawn throttle is loaded with no pid — and
+   fails if the job is still there.
 2. `pkill -f orch-loop.sh`, then `rm -f $O/.orch.lock`.
 3. Freeze workers: `tmux kill-server` (or kill sessions individually) and check for strays.
 4. Capture every dirty worktree: `git -C <wt> diff HEAD > $O/wip/<name>.patch`, plus a
@@ -1262,6 +1270,8 @@ algorithmic advantage. The claim worth evaluating is *utilisation*, not *efficie
 | `fix-one.sh` | fixes a reviewer's findings, pushes, re-runs the merge chain |
 | `refresh-candidates.sh` | pre-flights issues (collision check) into the backlog |
 | `selftest.sh` | offline checks; each one drives the shipped code. Not part of the loop |
+| `install.sh` / `launchd-cycle.sh` | the installer, and the ONE implementation of stop/enable/(re)start/verify for the launchd job (§4). A plain `install.sh` never touches a loaded job; `--start`/`--restart` harness the loop and PROVE it started. The library never writes a persistent disable and never mutates a job that was not loaded from this plist |
+| `install-launchd-durability.test.sh` | the agent-infra#1975 contract — no persistent-disable verb in code or in a copyable README command, `bootstrap`→`load` fallback, the ownership guard, and "not running AND (disabled OR exit 0)" as a FAILURE. Hermetic (`launchctl` stub first on `PATH`, throwaway `$HOME`/`$O`), and a CI shard via `scripts/run-bash-shards.sh` |
 | `test-gates.sh` | the `mp_reason` dispatch-gate rule table, extracted from the shipped `orch-loop.sh`. Not part of the loop |
 | `test-claims.sh` | the PR **and issue** claim CAS against live origin from two scratch repos (`git init` + `remote add`, not clones; random keys per run so concurrent runs cannot collide). Not the cross-box proof (one machine), but red on a defeated CAS. Not part of the loop |
 | `claim-exclusion.test.sh` | **the measurement:** N processes released at a barrier against a real (bare) origin, per operation class, answering *does a duplicate holder get refused*. Prints the table §7.2d records; hermetic, a CI shard |
@@ -1335,20 +1345,28 @@ script's own**. A job already loaded with `MAX_LOAD=16` keeps `16` no matter wha
 defaults to. `install.sh` overwrites the plist *file* but does not reload an already-loaded job, and
 `launchctl load -w` on a job that is already loaded does not reliably re-read it. So for a limits
 change: re-run `bash scripts/orchestrator-harness/install.sh --restart` — it re-renders, `bootout`s,
-`bootstrap`s and then verifies pid + heartbeat. (Plain `… install.sh --start` also reloads, but ONLY when
-the rendered plist actually differs, so a validation run cannot disturb a healthy controller. A plain
-`… install.sh` never touches a loaded job at all; it warns instead when the plist changed under a
-running controller.)
+`bootstrap`s and then verifies pid + heartbeat. (Plain `… install.sh --start` also reloads, but only when
+the loaded job was NOT recorded as this render — the render launchd was last seen loading is written to
+`$O/state/launchd-loaded.sha256` at every successful start, because "the file did not change" is not the
+question: a plain run overwrites the plist without reloading it. An absent record is reported as
+UNKNOWN, not as "the old settings are live", and unknown reloads once. So a validation run cannot
+disturb a healthy controller, and the first `--start` after upgrading records the render. A plain
+`… install.sh` never touches a loaded job; it warns, naming `--restart` only when it can show the loaded
+job is on an older render.)
 
-⚠️ **And `launchctl bootout` touches nothing when the controller was not started by launchd.** On this
-box the loop runs as `nohup … orch-loop.sh` from a session — `launchctl list | grep orchestrator` is
-empty even though the plist exists — so a bootout/bootstrap pair is a no-op *for that process* and the
-old controller keeps the old limits: the operator believes a limits change took effect when it did not.
-`install.sh --start`/`--restart` therefore **refuses** to start while a live pid outside launchd holds
-`~/orchestrator/.orch.lock` (launchd's copy would exit at once on that lock and `KeepAlive` would
-relaunch it forever) and tells you to stop it first. Check with
-`launchctl list` before trusting the pair, and stop a session-started controller with
-`pkill -f orch-loop.sh` (§6) rather than with `launchctl`.
+⚠️ **And `launchctl bootout` touches nothing when the controller was not started by launchd.** A loop
+started as `nohup … orch-loop.sh` from a session has no launchd job at all, so a bootout/bootstrap pair
+is a no-op *for that process* and the old controller keeps the old limits: the operator believes a
+limits change took effect when it did not. The two reads that answer it are
+`launchctl print gui/$(id -u)/com.eldato.orchestrator-loop` (its `path` and `pid` — or `rc=113` when
+there is no job) and `cat ~/orchestrator/.orch.lock`; `install.sh --start`/`--restart` **refuse** to
+start while `$O/.orch.lock` holds a live pid that launchd is not running (launchd's copy would exit at
+once on that lock and `KeepAlive` would relaunch it forever) and tell you to stop it first. Stop a
+session-started controller with `pkill -f orch-loop.sh` (§6) rather than with `launchctl`.
+
+> Do not record "on this box the loop runs under nohup" as a fact — it is a state, and it changes: on
+> 2026-10-17 this box was launchd-owned for part of the day and session-owned for another part. Read
+> the two commands above at the moment you care.
 
 Everything else is still tortoise-shaped and must be changed on another target: the branch
 suffix (`tm`), `feat/<N>-tm` naming, `lane.sh`'s `uv sync --extra embeddings --extra parity`, the

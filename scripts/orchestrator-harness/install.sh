@@ -130,20 +130,34 @@ if [ "$ACTION" = uninstall ]; then
   # has produced `Bootstrap failed: 5: Input/output error` in the same domain), and printing "✅ Removed"
   # over a job that is still loaded with RunAtLoad/KeepAlive hands a human a laptop with the fleet still
   # dispatching — README §6 step 2's `pkill` is undone by launchd a second later. So: remove, then READ
-  # the domain until the label has no pid, and fail loudly if it does.
+  # the domain until the label is no longer LOADED, and fail loudly if it still is.
   lc_bootout "$LABEL" "$PLIST" || exit 1
-  pid=""
-  for _ in 1 2 3 4 5; do
+  # ⛔ "IS IT STILL LOADED" — not "does it have a pid". A KeepAlive job that has just exited sits LOADED
+  # with no pid for up to its respawn throttle (`minimum runtime`, 10s by default), so a pid-only read
+  # declared a job removed that launchd still holds and will relaunch (review finding). `lc_probe` is
+  # the read that answers the question, and the pid is kept only for the diagnostic.
+  # ⛔ AND "UNREADABLE" IS NOT "REMOVED": `lc_probe`'s 2 is a FAILED read, which says nothing about the
+  # job. Folding it into "not loaded" made this loop break on the first iteration and delete the plist
+  # over a live controller (review finding).
+  loaded=""; pid=""; unread=""; prc=0
+  for _ in 1 2 3 4 5 6 7 8; do
+    prc=0; block=""; block="$(lc_probe "$LABEL")" || prc=$?
+    if [ "$prc" -eq 2 ]; then unread="$block"; break; fi
+    [ "$prc" -eq 0 ] || break          # definitively not loaded: the removal holds
+    loaded="$(lc_loaded_path "$LABEL")"
     pid="$(lc_pid "$LABEL")"
-    [ -n "$pid" ] || break
     sleep 1
   done
-  if [ -n "$pid" ]; then
+  if [ -n "$unread" ]; then
+    die "launchd's state for $LABEL could not be read after 'launchctl bootout' (${unread:-no output}) — the removal cannot be VERIFIED, so the plist is kept at $PLIST. Next: launchctl print $(lc_domain)/$LABEL | head -20, then re-run this --uninstall"
+  fi
+  if [ -n "$loaded" ]; then
     # The plist is KEPT: it is the only handle a verified removal has (and the only thing a human can
     # inspect), so destroying it here would leave the job loaded with nothing to retry against.
-    die "$LABEL is STILL loaded (pid $pid) after 'launchctl bootout' — NOT removed, and the plist is kept at $PLIST. Next: launchctl print $(lc_domain)/$LABEL | head -20"
+    die "$LABEL is STILL loaded${pid:+ (pid $pid)} after 'launchctl bootout' — NOT removed, and the plist is kept at $PLIST. Next: launchctl print $(lc_domain)/$LABEL | head -20"
   fi
   rm -f "$PLIST"
+  rm -f "$O/state/launchd-loaded.sha256"
   echo "✅ Removed $LABEL (bootout; no persistent disable written)."
   echo "   State and logs left intact: $O/{logs,state,wip}"
   exit 0
@@ -166,8 +180,14 @@ case "$O" in
 esac
 
 # ── platform ─────────────────────────────────────────────────────────────────────
+# ⛔ THE GATE IS REAL (launchd + tmux only exist here) BUT IT IS TEST-ONLY BYPASSABLE. `--uninstall` and
+# `--start` are the incident's own path (#1975), and the only automated gate runs on Linux — without a
+# declared hatch those assertions simply cannot run in CI. Same pattern and same opt-in discipline as
+# the temp-$HOME guard (#446): a test that needs it says so, and a normal run on a Mac never sets it.
 echo "==> preflight"
-[ "$(uname)" = "Darwin" ] || die "this harness uses launchd + tmux; only macOS is supported"
+if [ "$(uname)" != "Darwin" ] && [ "${ELDATO_ALLOW_NON_DARWIN:-}" != "1" ]; then
+  die "this harness uses launchd + tmux; only macOS is supported"
+fi
 [ -f "$TEMPLATE" ] || die "missing template: $TEMPLATE"
 
 # ── dependencies ─────────────────────────────────────────────────────────────────
@@ -508,16 +528,32 @@ if grep -q '__[A-Z_]*__' "$RENDER"; then
   _toks="$(grep -o '__[A-Z_]*__' "$RENDER" | sort -u | tr '\n' ' ')— a template token has no substitution rule"
   rm -f "$RENDER"; die "rendered plist still contains ${_toks}"
 fi
-# ⛔ DID THE RENDERED PLIST ACTUALLY CHANGE? Recorded BEFORE the mv, because that is the only moment
-# the answer exists — and it is what makes this installer safe on a live box (agent-infra#1975 item 3):
-# a validation run that renders the same bytes must not disturb a healthy production controller. The
-# `--start` path reloads only when this is 1; a plain run never reloads at all.
+# ⛔ IS THE LOADED JOB ON THIS RENDER? Recorded BEFORE the mv, because that is the only moment the file
+# content exists — and it is what makes this installer safe on a live box (agent-infra#1975 item 3): a
+# validation run that renders the same bytes must not disturb a healthy production controller.
+#
+# ⛔ BUT "the FILE did not change" is NOT the question (review finding): a plain `install.sh` OVERWRITES
+# the plist without reloading the job, so after any limits change the file matches the render while
+# launchd still runs the old one — and the next `--start` would read "unchanged", skip the reload it
+# exists to perform, and exit 0 with the stale settings still in effect. So the comparison is against
+# the render launchd was last SEEN loading (recorded at every successful start), not against the file.
+# ⛔ AND THERE ARE THREE STATES, NOT TWO (review finding): current, STALE, and UNKNOWN (no record yet —
+# true of every box that has not run `--start` under this version). Unknown must not be reported as
+# stale: a missing record is not a measurement, and telling an operator "it still uses the OLD settings"
+# from an absent file is the "an absent read must not render as a signal" rule. Unknown and stale both
+# reload (safe direction); only the MESSAGE differs. Unknown is written as unknown.
+RENDER_SHA="$(shasum -a 256 "$RENDER" | awk '{print $1}')"
+LOADED_SHA_FILE="$O/state/launchd-loaded.sha256"
+LOADED_SHA="$(cat "$LOADED_SHA_FILE" 2>/dev/null || true)"
+PLIST_STATE=unknown
+if [ -n "$LOADED_SHA" ]; then
+  if [ "$RENDER_SHA" = "$LOADED_SHA" ]; then PLIST_STATE=current; else PLIST_STATE=stale; fi
+fi
 PLIST_CHANGED=1
-if [ -f "$PLIST" ] && cmp -s "$PLIST" "$RENDER"; then PLIST_CHANGED=0; fi
+[ "$PLIST_STATE" = "current" ] && PLIST_CHANGED=0
 mv -f "$RENDER" "$PLIST"
 ok "plist valid"
-if [ "$PLIST_CHANGED" = "0" ]; then ok "plist unchanged (byte-identical to the installed one)"; fi
-
+if [ "$PLIST_CHANGED" = "0" ]; then ok "plist unchanged and it is the render launchd loaded"; fi
 # launchd runs $O/<script>, not the copies in this directory — check EVERY script the daemon
 # invokes, not just orch-loop.sh. A drift here is silent and serious: a fix applied only to the
 # shipped copy (e.g. the fail-closed ai-review-gate classifier) would never reach the running box.
@@ -726,13 +762,24 @@ STAMPEOF
 write_provenance
 # ── harness provenance (agent-infra#1745) END ──
 
-# ── explicit start / reload — the ONLY place this installer touches a loaded job ────────────────
-# ⛔ NO MUTATING launchctl CALL HAPPENS ABOVE THIS LINE. That is a load-bearing property, not an
-# accident: a plain `install.sh` (validation, drift check, a lane proving the harness installs) must be
-# unable to disturb a healthy production controller, because the last three times it could, the fleet
-# went unsupervised and silent (#1975). Reloading is either implied by an actual plist change on
-# `--start`, or explicitly requested by `--restart`.
-SELF="bash '$HERE/install.sh'"
+# ── explicit start / reload — the ONLY launchd-mutating path below the render ───────────────────
+# ⛔ ON THE RENDER PATH (ACTION=none) NOTHING MUTATES LAUNCHD, above or below this line: that is a
+# load-bearing property, not an accident — a plain `install.sh` (validation, drift check, a lane proving
+# the harness installs) must be unable to disturb a healthy production controller, because the last
+# three times it could, the fleet went unsupervised and silent (#1975). The only mutating calls in this
+# file are the `--uninstall` branch (above, which exists to touch a loaded job), `--start` and
+# `--restart`; reloading on a start is implied by a stale loaded job, and is explicit on `--restart`.
+# ⛔ A single-quote-safe spelling: `bash '$HERE/install.sh'` is unparseable when the checkout path
+# contains a `'` (review finding), and this is the string an operator pastes while recovering.
+shq() {
+  local s="$1" out="" c i
+  for (( i=0; i<${#s}; i++ )); do
+    c="${s:i:1}"
+    if [ "$c" = "'" ]; then out="$out'\\''"; else out="$out$c"; fi
+  done
+  printf "'%s'" "$out"
+}
+SELF="bash $(shq "$HERE/install.sh")"
 # How old $O/heartbeat may be before a loaded job counts as "not cycling" — derived from THIS cell's
 # cycle, so a quiet cell (CYC=900) is not declared wedged on a healthy controller. Passed down rather
 # than read from a global: the library must not depend on an unstated variable.
@@ -741,6 +788,13 @@ case "$ACTION" in
   start)   lc_ensure  "$LABEL" "$PLIST" "$O" "$PLIST_CHANGED" "$START_TIMEOUT" "$LC_HB_STALE" || exit 1 ;;
   restart) lc_restart "$LABEL" "$PLIST" "$O" "$START_TIMEOUT"                              || exit 1 ;;
 esac
+# Record the render launchd is now running, so the NEXT run can tell "current" from "the file was
+# overwritten earlier and never reloaded" (see PLIST_CHANGED above). Written AFTER the start succeeded —
+# a failed start must leave the old record in place, or the next run would call a stale job current.
+if [ "$ACTION" = "start" ] || [ "$ACTION" = "restart" ]; then
+  mkdir -p "$O/state" 2>/dev/null || true
+  printf '%s\n' "$RENDER_SHA" > "$LOADED_SHA_FILE" 2>/dev/null || warn "could not record the loaded render at $LOADED_SHA_FILE"
+fi
 # Read-only: what `launchctl print` says right now. Used only to make the closing text TRUE — the old
 # banner said "The loop is NOT running" unconditionally, so an operator reading it after a start had no
 # way to tell a live controller from a dead one.
@@ -759,12 +813,24 @@ cat <<EOF
 EOF
 
 if [ -n "$RUNNING_PID" ]; then
-  case "$ACTION" in
-    start|restart)
+  # ⛔ THE BANNER REPORTS WHAT THIS RUN ACTUALLY DID (review finding): on the "already running and
+  # current — left untouched" branch the old text claimed "this run started it and PROVED it", which is
+  # a process claim with no artifact behind it, and it made the honest branch indistinguishable from a
+  # real start.
+  case "${LC_OUTCOME:-}" in
+    left-untouched)
   cat <<EOF
 
-The loop IS running (launchd pid $RUNNING_PID) — this run started it and PROVED it: the pid exists and
-$O/heartbeat advanced.
+The loop IS running (launchd pid $RUNNING_PID) and this run VERIFIED it — pid present, heartbeat fresh,
+launchd not relaunching it. It was NOT restarted: the loaded job is on the current render.
+
+EOF
+      ;;
+    started|restarted|reloaded)
+  cat <<EOF
+
+The loop IS running (launchd pid $RUNNING_PID) — this run $(case "$LC_OUTCOME" in reloaded) printf 'RELOADED' ;; *) printf 'started' ;; esac) it and PROVED it: the pid exists, it is a NEW
+process, and $O/heartbeat advanced.
 
 EOF
       ;;
@@ -786,11 +852,21 @@ The loop is NOT running. Start it — and have the start PROVEN (pid + heartbeat
 EOF
 fi
 
-# A changed plist with a live job is the ONE case a plain run leaves genuinely stale, so it is said out
-# loud rather than left for an operator to discover from a limits value that never took effect.
+# A loaded job that is not on this render with a live controller is the ONE case a plain run leaves
+# genuinely wrong, so it is said out loud rather than left for an operator to discover from a limits
+# value that never took effect. PLIST_CHANGED is 1 for STALE and for UNKNOWN — and the two must not
+# share a sentence, because only one of them is a measurement (see PLIST_STATE above).
 if [ "$ACTION" = "none" ] && [ "$PLIST_CHANGED" = "1" ] && [ -n "$RUNNING_PID" ]; then
-  warn "the rendered plist DIFFERS from the loaded one and $LABEL is running (pid $RUNNING_PID) — it still uses the OLD settings"
+  case "$PLIST_STATE" in
+    stale)
+  warn "the loaded job is NOT on the rendered plist and $LABEL is running (pid $RUNNING_PID) — it still uses the OLD settings"
   warn "  apply them safely: $SELF --restart   (enable → bootout → bootstrap, then verifies pid + heartbeat)"
+      ;;
+    *)
+  warn "which render launchd loaded is UNKNOWN (no $LOADED_SHA_FILE record yet — one is written by a successful --start), so this run cannot tell whether $LABEL (pid $RUNNING_PID) is on the current settings"
+  warn "  prove it: $SELF --start   (reloads once, then records the render it loaded)"
+      ;;
+  esac
 fi
 
 cat <<EOF
