@@ -547,10 +547,21 @@ def test_an_AGE_UNKNOWN_pool_read_is_not_READABLE():
     got = grade("READ(223)(9m)", {"path": "q", "ok": True, "raw": "READ(223) 1792327000",
                                   "age_s": 600})
     assert got["queue_readable"].status == m.PASS, got["queue_readable"].as_json()
-    # a KNOWN-and-OLD READ token is still accepted: it does say "readable, n candidates"
+    # ⛔ A KNOWN-and-OLD READ token is NOT accepted any more. This test used to ASSERT the old trade
+    # ("it does say readable, n candidates"), and that trade let a box whose refresh froze three hours
+    # ago exit 0 for the WHOLE run while the controller dispatched off a stale `candidates.txt` —
+    # #1931 wearing a pass. The reading is legible; the claim is about three hours ago.
     got = grade("READ(223)(6h)", {"path": "q", "ok": True, "raw": "READ(223) 1792300000",
                                   "age_s": 40000})
-    assert got["queue_readable"].status == m.PASS, got["queue_readable"].as_json()
+    assert (got["queue_readable"].status, got["queue_readable"].variant) == (
+        m.INCONCLUSIVE, "READABLE_STALE"), got["queue_readable"].as_json()
+    assert m.exit_code(list(got.values())) != 0
+
+    # ⛔ and a KNOWN-and-old EMPTY read is STATE_FROZEN, not READABLE_STALE: "the pool is empty" is a
+    # POSITIVE claim, and a frozen read cannot support it
+    got = grade("EMPTY(6h)", {"path": "q", "ok": True, "raw": "EMPTY", "age_s": 40000}, backlog=0)
+    assert (got["queue_readable"].status, got["queue_readable"].variant) == (
+        m.INCONCLUSIVE, "STATE_FROZEN"), got["queue_readable"].as_json()
 
 
 @test
@@ -1630,15 +1641,19 @@ def test_a_FROZEN_pool_read_is_not_a_current_one():
     assert (got["queue_readable"].status, got["queue_readable"].variant) == (
         m.INCONCLUSIVE, "STATE_FROZEN"), (got["queue_readable"].status,
                                           got["queue_readable"].variant)
+    assert "EMPTY" in got["queue_readable"].evidence, got["queue_readable"].evidence
     assert got["work_dispatched"].status == m.INCONCLUSIVE, (
         got["work_dispatched"].status, got["work_dispatched"].variant)
     assert got["work_dispatched"].variant == "STATE_FROZEN", got["work_dispatched"].variant
     # a stale EMPTY read must not let the whole run report green
     assert m.exit_code(list(got.values())) in (1, 2), m.exit_code(list(got.values()))
 
-    # …but a stale NON-EMPTY read still supports "readable, n candidates": dispatch may be flowing on
-    # it, and failing that would cry wolf on a healthy box (measured here: READ(223)(57m) while two
-    # issues had been dispatched 101s earlier).
+    # ⛔ …and NOR does a stale NON-EMPTY read. This leg used to assert PASS ("it does say readable, n
+    # candidates"), reasoning that a FAIL would cry wolf on a healthy box (measured: READ(223)(57m)
+    # while two issues had been dispatched 101s earlier). The reasoning was right about FAIL and wrong
+    # about PASS: the honest answer is neither — ABSTAIN. INCONCLUSIVE cries no wolf (it accuses no
+    # one, and `work_dispatched` reports the dispatches it can actually see) and it is not green on a
+    # six-hour-old pool number the controller may still be dispatching off.
     d3 = fx("healthy")
     d3["facts"]["log_events"]["headers"] = [{
         "raw": "=== Sun Oct 18 07:47:44 EST 2026 load=12 lanes=1 backlog=33 queue=READ(223)(6h) ===",
@@ -1646,8 +1661,9 @@ def test_a_FROZEN_pool_read_is_not_a_current_one():
     d3["facts"]["queue_state"] = {"path": "q", "ok": True, "raw": "READ(223)", "age_s": 6 * 3600.0}
     cfg3 = m.cfg_from_dict(d3["config"])
     got3 = dict((v.name, v) for v in m.evaluate(d3["facts"], cfg3))
-    assert got3["queue_readable"].status == m.PASS, (got3["queue_readable"].variant,
-                                                     got3["queue_readable"].evidence)
+    assert (got3["queue_readable"].status, got3["queue_readable"].variant) == (
+        m.INCONCLUSIVE, "READABLE_STALE"), (got3["queue_readable"].variant)
+    assert m.exit_code(list(got3.values())) != 0
 
     # a CURRENT read of the same shape is still the documented PASS
     d2 = fx("healthy")
@@ -2322,14 +2338,16 @@ def test_an_EMPTY_state_record_supersedes_an_older_header_backlog():
     and two FAILs ("the fleet HAD WORK IN HAND") about a superseded refresh."""
     m = load()
     cfg = m.cfg_from_dict({})
-    facts = {"log_events": {"headers": [{"raw": "h", "age_s": 60, "backlog": 47,
+    facts = {"github": {"open_pr_count": 0, "open_prs": []},
+             "log_events": {"headers": [{"raw": "h", "age_s": 60, "backlog": 47,
                                         "queue_token": "READ(200)"}]},
              "queue_state": {"path": "q", "ok": True, "raw": "EMPTY 1792327000", "age_s": 20.0}}
     busy, why = m._activity(facts, cfg.window_s)
     assert busy is False, (busy, why)
     assert "supersedes" in why and "state/queue-state" in why, why
     # …and when the header is the graded record its backlog is named as the header's own
-    facts2 = {"log_events": {"headers": [{"raw": "h", "age_s": 60, "backlog": 47,
+    facts2 = {"github": {"open_pr_count": 0, "open_prs": []},
+              "log_events": {"headers": [{"raw": "h", "age_s": 60, "backlog": 47,
                                          "queue_token": "READ(200)"}]},
               "queue_state": {"path": "q", "ok": True, "raw": "READ(200)", "age_s": 900.0}}
     busy2, why2 = m._activity(facts2, cfg.window_s)
@@ -2346,7 +2364,7 @@ def test_pr_merged_abstains_when_the_activity_input_is_unread():
     cfg = m.cfg_from_dict({})
     gh = {"ok": True, "prs_merged_in_window": 0, "open_pr_count": 1, "open_prs": [],
           "source": "rest", "merged_page_full": False, "prs_created_in_window": 0}
-    facts = {"github": gh,
+    facts = {"github": dict(gh, open_pr_count=0),
              "log_events": {"headers": [{"raw": "h", "age_s": 60, "backlog": 0,
                                          "queue_token": "UNREADABLE"}]},
              "queue_state": {"path": "q", "ok": False, "error": "permission denied"}}
@@ -2362,6 +2380,180 @@ def test_pr_merged_abstains_when_the_activity_input_is_unread():
     got2 = dict((v.name, v) for v in m.evaluate(facts2, cfg))
     assert got2["pr_merged"].variant == "NO_PR_MERGED", (got2["pr_merged"].status,
                                                          got2["pr_merged"].variant)
+
+
+@test
+def test_a_FAILED_TAIL_is_a_MISSING_read_not_an_empty_log():
+    """`read_log` discarded the `tail` exit status, so a log whose CONTENT could not be read (EACCES,
+    TCC, a timed-out remote exec) returned an empty line list with a fresh mtime — and
+    `controller_cycling` graded the pair FAIL/LOG_NO_CYCLE ("the log IS advancing, but not by a
+    cycle"): a measured claim about content that was never read, on the check an operator reads
+    first. `queue_readable` abstains on the same datum."""
+    m = load()
+    cfg = m.cfg_from_dict({})
+    # ── the COLLECTOR contract: a failed tail must come back as a failed read ────────────────────
+    mach = m.Machine()
+    calls = []
+
+    def fake_sh(cmd, timeout=None):
+        calls.append(cmd)
+        if cmd.startswith("stat"):
+            return 0, "1792327000\n"
+        if cmd.startswith("tail"):
+            return 1, "tail: Permission denied"
+        return 0, ""
+
+    mach.sh = fake_sh
+    rec, lines, err = mach.read_log("/o/orch-loop.log")
+    assert rec["exists"] is True and rec["tail_ok"] is False, rec
+    assert lines == [] and "Permission denied" in (rec.get("tail_error") or ""), rec
+    assert err is None, err
+    # ── the PREDICATE: a fresh mtime with unreadable contents abstains, never LOG_NO_CYCLE ──────
+    facts = {"controller": {"ok": True, "pids": [{"pid": 4242, "cmd": "/bin/zsh /o/orch-loop.sh"}],
+                            "launchd": {"loaded": True, "pid": 4242}},
+             "log": rec,
+             "heartbeat": {"ok": True, "age_s": 15.0},
+             "pane": {"ok": True, "pids": [], "protection_supported": False},
+             "headroom": {"disk": {"ok": True, "avail_bytes": int(400 * (1 << 30)), "used_pct": 10,
+                                   "mount": "/"}, "mem": {"ok": True, "avail_mb": 9000, "source": "d"}},
+             "github": {"ok": True, "open_pr_count": 0, "open_prs": [], "source": "rest",
+                        "prs_created_in_window": 1, "prs_merged_in_window": 1},
+             "log_events": {"headers": [], "dispatch_ok": [], "lane_started": [], "lane_failed": [],
+                            "armed": [], "railed": []}}
+    v = [x for x in m.evaluate(facts, cfg) if x.name == "controller_cycling"][0]
+    assert (v.status, v.variant) == (m.INCONCLUSIVE, "LOG_UNREADABLE"), (v.status, v.variant)
+    assert "Permission denied" in v.evidence, v.evidence
+    # …and a READABLE, empty tail is still the wedge it says it is
+    facts["log"] = dict(rec, tail_ok=True, tail_error=None)
+    v2 = [x for x in m.evaluate(facts, cfg) if x.name == "controller_cycling"][0]
+    # a readable log with no cycle header in it is the wedge it says it is (LOG_NO_CYCLE) — or, with
+    # no headers at all and a fresh heartbeat, LOG_SILENT
+    assert v2.status == m.FAIL and v2.variant in ("LOG_NO_CYCLE", "LOG_SILENT"), (v2.status,
+                                                                                 v2.variant)
+
+
+@test
+def test_a_STALE_read_cannot_grade_work_as_NOT_dispatched():
+    """`work_dispatched` exempted a stale NON-EMPTY read with a non-empty backlog from its staleness
+    abstention, so it graded FAIL/NO_DISPATCH ("the refresh reported 47 candidate(s) and no dispatch
+    line was written") off a reading six hours old — while `queue_readable`, on the SAME facts dict,
+    abstained READABLE_STALE. Two checks, one record, opposite answers, and the FAIL was the one that
+    would page someone about a box whose refresh had merely frozen."""
+    m = load()
+    d = fx("healthy")
+    d["facts"]["log_events"]["headers"] = [{
+        "raw": "=== Sun Oct 18 07:47:44 EST 2026 load=12 lanes=1 backlog=47 queue=READ(223)(6h) ===",
+        "age_s": 60, "ts": 0, "backlog": 47, "queue_token": "READ(223)(6h)"}]
+    d["facts"]["log_events"]["dispatch_ok"] = []
+    d["facts"]["log_events"]["lane_started"] = []
+    d["facts"]["queue_state"] = {"path": "q", "ok": True, "raw": "READ(223)", "age_s": 6 * 3600.0}
+    cfg = m.cfg_from_dict(d["config"])
+    got = dict((v.name, v) for v in m.evaluate(d["facts"], cfg))
+    assert got["work_dispatched"].status == m.INCONCLUSIVE, got["work_dispatched"].as_json()
+    assert got["work_dispatched"].variant == "STATE_FROZEN", got["work_dispatched"].variant
+    assert got["queue_readable"].variant == "READABLE_STALE", got["queue_readable"].variant
+    # both checks answer "that record is not current" — never one FAIL beside one abstention
+    assert got["work_dispatched"].status == got["queue_readable"].status, (
+        got["work_dispatched"].as_json(), got["queue_readable"].as_json())
+    # …and a CURRENT read of the same shape is still the FAIL: work existed and did not move
+    d["facts"]["log_events"]["headers"][0].update({"queue_token": "READ(223)", "raw": "=== h ===",
+                                                   "age_s": 30})
+    d["facts"]["queue_state"] = {"path": "q", "ok": True, "raw": "READ(223)", "age_s": 30.0}
+    cfg2 = m.cfg_from_dict(d["config"])
+    got2 = dict((v.name, v) for v in m.evaluate(d["facts"], cfg2))
+    assert (got2["work_dispatched"].status, got2["work_dispatched"].variant) == (
+        m.FAIL, "NO_DISPATCH"), (got2["work_dispatched"].status, got2["work_dispatched"].variant)
+
+
+@test
+def test_a_current_EMPTY_state_record_supersedes_the_headers_large_pool():
+    """The header's `queue=` and `backlog=` are ONE refresh old; a newer `state/queue-state: EMPTY`
+    supersedes both. Grading the header's pair anyway produced `queue_readable`
+    FAIL/EMPTY_WITH_LARGE_POOL beside `work_dispatched` PASS/IDLE_EMPTY_POOL for ONE facts dict, with
+    the FAIL's own evidence saying "graded from: state/queue-state (it is NEWER than the header)"."""
+    m = load()
+    cfg = m.cfg_from_dict({"pool_threshold": 25})
+    facts = {"github": {"ok": True, "open_pr_count": 0, "open_prs": [], "source": "rest",
+                        "prs_created_in_window": 1, "prs_merged_in_window": 1},
+             "log_events": {"headers": [{"raw": "=== h load=3 lanes=0 backlog=0 queue=READ(198)(3m) ===",
+                                         "age_s": 42, "ts": 0, "backlog": 0,
+                                         "queue_token": "READ(198)(3m)"}],
+                            "dispatch_ok": [], "lane_started": [], "lane_failed": [],
+                            "armed": [], "railed": []},
+             "queue_state": {"path": "q", "ok": True, "raw": "EMPTY 1792327000", "age_s": 40.0}}
+    got = dict((v.name, v) for v in m.evaluate(facts, cfg))
+    assert got["queue_readable"].status == m.PASS, (got["queue_readable"].status,
+                                                    got["queue_readable"].variant,
+                                                    got["queue_readable"].evidence)
+    assert got["work_dispatched"].variant == "IDLE_EMPTY_POOL", got["work_dispatched"].variant
+    # …and the header's own pair IS graded when no newer record supersedes it
+    facts["queue_state"] = {"path": "q", "ok": True, "raw": "READ(198) 1792327000", "age_s": 900.0}
+    got2 = dict((v.name, v) for v in m.evaluate(facts, cfg))
+    assert got2["queue_readable"].variant == "EMPTY_WITH_LARGE_POOL", (got2["queue_readable"].status,
+                                                                      got2["queue_readable"].variant)
+
+
+@test
+def test_a_LEGIBLE_BUT_OLD_non_empty_read_is_not_GREEN():
+    """A KNOWN-and-old NON-EMPTY read graded PASS/READABLE, so a box whose refresh froze three hours
+    ago exited 0 for the WHOLE run while the controller dispatched off a stale `candidates.txt` — the
+    #1931 failure wearing a pass."""
+    m = load()
+    cfg = m.cfg_from_dict({"queue_stale_s": 5400.0})
+    now = 1792327664.0
+    facts = {"github": {"ok": True, "open_pr_count": 0, "open_prs": [], "source": "rest",
+                        "prs_created_in_window": 1, "prs_merged_in_window": 1},
+             "log_events": {"headers": [{"raw": "=== h load=3 lanes=0 backlog=47 queue=READ(223)(3h) ===",
+                                         "age_s": 60, "ts": 0, "backlog": 47,
+                                         "queue_token": "READ(223)(3h)"}],
+                            "dispatch_ok": [], "lane_started": [], "lane_failed": [],
+                            "armed": [], "railed": []},
+             "queue_state": {"path": "q", "ok": True, "raw": "READ(223) %d" % int(now - 10800),
+                             "age_s": 10800.0}}
+    v = [x for x in m.evaluate(facts, cfg) if x.name == "queue_readable"][0]
+    assert (v.status, v.variant) == (m.INCONCLUSIVE, "READABLE_STALE"), (v.status, v.variant,
+                                                                         v.evidence)
+    assert "3.0h" in v.evidence, v.evidence
+    # a FRESH non-empty read is still a plain PASS
+    facts["log_events"]["headers"][0].update({"queue_token": "READ(223)", "raw": "=== h queue=READ(223) ===",
+                                              "age_s": 30})
+    facts["queue_state"] = {"path": "q", "ok": True, "raw": "READ(223) %d" % int(now - 30), "age_s": 30.0}
+    v2 = [x for x in m.evaluate(facts, cfg) if x.name == "queue_readable"][0]
+    assert (v2.status, v2.variant) == (m.PASS, "READABLE"), (v2.status, v2.variant)
+
+
+@test
+def test_a_FULL_merge_ordered_page_is_disclosed():
+    """`merged:>=<day-floored date>` is bounded by the DAY, not by `pr_window_s`, so a full page can
+    hold zero in-window rows and hide the merge that matters. Hardcoding `merged_page_full=False`
+    there asserted "nothing merged" off a cut page."""
+    m = load()
+    cfg = m.cfg_from_dict({"pr_window_s": 10800.0})
+    now = 1792327664.0
+    inside = m._iso(now - 600)
+    outside = m._iso(now - 20000)
+    rows = [{"number": i, "createdAt": outside, "mergedAt": outside} for i in range(100)]
+    real = m._run_gh
+
+    def fake(argv):
+        j = " ".join(argv)
+        if "--state open" in j:
+            return 0, "[]"
+        if "--state closed" in j:
+            return 0, json.dumps([{"number": 1, "createdAt": inside, "mergedAt": None}])
+        if "merged:>=" in j:
+            return 0, json.dumps(rows)
+        return 0, ""
+
+    try:
+        m._run_gh = fake
+        gh = m.collect_github("o/r", cfg, now=now)
+    finally:
+        m._run_gh = real
+    assert gh["prs_merged_in_window"] == 0, gh
+    assert gh["merged_page_full"] is True, gh       # a FULL page is a bound, whatever its ordering
+    v = m.check_pr_merged({"github": gh}, cfg)
+    assert (v.status, v.variant) == (m.INCONCLUSIVE, "MERGED_SURFACE_TRUNCATED"), (v.status, v.variant)
 
 
 @test
@@ -2445,7 +2637,10 @@ def test_an_UNREADABLE_pool_is_not_reported_as_benign_idleness():
     d["facts"]["queue_state"] = {"path": "q", "ok": False, "error": "permission denied"}
     d["facts"]["github"]["prs_created_in_window"] = 0
     d["facts"]["github"]["prs_merged_in_window"] = 0
-    d["facts"]["github"]["open_pr_count"] = 1
+    d["facts"]["github"]["open_pr_count"] = 0
+    d["facts"]["github"]["open_prs"] = []
+    d["facts"]["log_events"]["dispatch_ok"] = []
+    d["facts"]["log_events"]["lane_started"] = []
     cfg = m.cfg_from_dict(d["config"])
     got = dict((v.name, v) for v in m.evaluate(d["facts"], cfg))
     assert got["pr_created"].variant == "ACTIVITY_UNKNOWN", (got["pr_created"].status,
@@ -2507,6 +2702,7 @@ def test_a_STALE_header_cannot_manufacture_work_in_hand():
     d["facts"]["github"]["prs_created_in_window"] = 0
     d["facts"]["github"]["prs_merged_in_window"] = 0
     d["facts"]["github"]["open_pr_count"] = 0
+    d["facts"]["github"]["open_prs"] = []
     cfg = m.cfg_from_dict(d["config"])
     got = dict((v.name, v) for v in m.evaluate(d["facts"], cfg))
     assert got["pr_created"].variant == "IDLE_NO_WORK", (got["pr_created"].status,
@@ -2515,10 +2711,33 @@ def test_a_STALE_header_cannot_manufacture_work_in_hand():
                                                         got["pr_merged"].variant)
     busy, why = m._activity(d["facts"], cfg.window_s)
     assert busy is False and "inside the window" in why, (busy, why)
-    # …and a FRESH header with a backlog still says busy, with its age in the evidence
+    # …a FRESH header with a backlog still says busy, with the age of the header that carried it
     d2 = fx("healthy")
+    d2["facts"]["github"]["open_pr_count"] = 0
+    d2["facts"]["github"]["open_prs"] = []
+    d2["facts"]["log_events"]["dispatch_ok"] = []
+    d2["facts"]["log_events"]["lane_started"] = []
     busy2, why2 = m._activity(d2["facts"], m.cfg_from_dict(d2["config"]).window_s)
-    assert busy2 is True and "s ago" in why2 or "ago" in why2, (busy2, why2)
+    assert busy2 is True and "ago" in why2, (busy2, why2)
+    # …and OPEN PRs or a fresh dispatch are work in hand even when the queue record says idle: the
+    # tool's own fields refuted "the fleet had nothing in hand" (measured: `work_dispatched`
+    # PASS/DISPATCHED three lines above `pr_created`'s "nothing in hand")
+    d3 = fx("healthy")
+    d3["facts"]["log_events"]["headers"] = [{"raw": "=== h load=2 lanes=0 backlog=0 queue=EMPTY ===",
+                                             "age_s": 60, "ts": 0, "backlog": 0,
+                                             "queue_token": "EMPTY"}]
+    d3["facts"]["queue_state"] = {"path": "q", "ok": True, "raw": "EMPTY 1792327000", "age_s": 30}
+    d3["facts"]["log_events"]["dispatch_ok"] = []
+    d3["facts"]["log_events"]["lane_started"] = []
+    d3["facts"]["github"]["open_pr_count"] = 2
+    busy3, why3 = m._activity(d3["facts"], m.cfg_from_dict(d3["config"]).window_s)
+    assert busy3 is True and "open PR" in why3, (busy3, why3)
+    d3["facts"]["github"]["open_pr_count"] = 0
+    d3["facts"]["github"]["open_prs"] = []
+    d3["facts"]["log_events"]["dispatch_ok"] = [{"raw": "[dispatch] load=9 lanes=0 -> 4601",
+                                                 "age_s": 60, "issues": [4601]}]
+    busy4, why4 = m._activity(d3["facts"], m.cfg_from_dict(d3["config"]).window_s)
+    assert busy4 is True and "dispatch" in why4, (busy4, why4)
 
 
 @test
@@ -2570,6 +2789,10 @@ def test_fleet_activity_reads_the_SAME_queue_token_as_the_queue_checks():
          "load": 5}]
     d["facts"]["queue_state"] = {"path": "q", "ok": True, "raw": "READ(223) 1792347000", "age_s": 30}
     d["facts"]["github"]["prs_created_in_window"] = 0
+    d["facts"]["github"]["open_pr_count"] = 0
+    d["facts"]["github"]["open_prs"] = []
+    d["facts"]["log_events"]["dispatch_ok"] = []
+    d["facts"]["log_events"]["lane_started"] = []
     busy, why = m._activity(d["facts"])
     assert busy is True, why
     assert "state/queue-state" in why, why
@@ -3630,6 +3853,31 @@ def test_source_never_contains_a_forbidden_launchctl_form():
 
 MUTATIONS = [
     # (label, old, new, paired test)
+    # ── cycle-24 defects ──────────────────────────────────────────────────────────────────
+    ("a failed tail is graded as an empty log",
+     '        tail_ok = rc2 == 0',
+     "        tail_ok = True",
+     "test_a_FAILED_TAIL_is_a_MISSING_read_not_an_empty_log"),
+    ("a superseded header pair is graded anyway",
+     '    superseded = (tok["kind"] == "EMPTY" and tok_src == "state/queue-state" and stale is None)',
+     "    superseded = False",
+     "test_a_current_EMPTY_state_record_supersedes_the_headers_large_pool"),
+    ("a legible but OLD non-empty read is green",
+     '        return V("queue_readable", INCONCLUSIVE, "READABLE_STALE", _queue_frozen_txt(f, stale),',
+     '        return V("queue_readable", PASS, "READABLE", _queue_frozen_txt(f, stale),',
+     "test_a_LEGIBLE_BUT_OLD_non_empty_read_is_not_GREEN"),
+    ("a full merge-ordered page is called complete",
+     "                     merged_page_full=len(merged_in_window_rows) >= 100)",
+     "                     merged_page_full=False)",
+     "test_a_FULL_merge_ordered_page_is_disclosed"),
+    ("a stale read still grades work as not-dispatched",
+     '    stale = _graded_stale(f, c, _tok_src)\n    if stale is not None:\n        # "Nothing to dispatch" is the CORRECT outcome only on a CURRENT read, and "work existed and',
+     '    stale = _graded_stale(f, c, _tok_src)\n    if stale is not None and (stale["age_s"] is None or pool_kind == "EMPTY" or backlog == 0):\n        # "Nothing to dispatch" is the CORRECT outcome only on a CURRENT read, and "work existed and',
+     "test_a_STALE_read_cannot_grade_work_as_NOT_dispatched"),
+    ("fleet activity ignores open PRs and fresh dispatches",
+     "    if isinstance(gh_open, int) and not isinstance(gh_open, bool) and gh_open > 0:",
+     "    if False:",
+     "test_a_STALE_header_cannot_manufacture_work_in_hand"),
     # ── cycle-23 defects ──────────────────────────────────────────────────────────────────
     ("the merge-ordered window bound moves a window into the future",
      "        now - cfg.pr_window_s, datetime.timezone.utc).strftime(\"%Y-%m-%d\")",
@@ -3778,8 +4026,8 @@ MUTATIONS = [
      "test_the_census_is_scoped_to_THIS_cell_and_reports_what_it_rejected"),
     # ── cycle-13 defects ────────────────────────────────────────────────────────────
     ("an age-UNKNOWN non-empty pool read passes as READABLE",
-     '    if stale is not None and (stale["age_s"] is None or tok["kind"] == "EMPTY"):',
-     '    if stale is not None and tok["kind"] == "EMPTY":',
+     '    if stale is not None:\n        if stale["age_s"] is None:\n            return V("queue_readable", INCONCLUSIVE, "STATE_FROZEN", _queue_frozen_txt(f, stale),',
+     '    if stale is not None and tok["kind"] == "EMPTY":\n        if stale["age_s"] is None:\n            return V("queue_readable", INCONCLUSIVE, "STATE_FROZEN", _queue_frozen_txt(f, stale),',
      "test_an_AGE_UNKNOWN_pool_read_is_not_READABLE"),
     ("a moving log counts as a cycling controller",
      "    if not cycles:",

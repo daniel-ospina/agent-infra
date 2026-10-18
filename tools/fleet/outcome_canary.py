@@ -116,8 +116,6 @@ import os
 import re
 import subprocess
 import sys
-import calendar
-import datetime
 import time
 
 # ── status vocabulary ────────────────────────────────────────────────────────────────────────────
@@ -808,6 +806,16 @@ def check_controller_cycling(f, c):
                            log.get("error") or "no error recorded"),
                  "the log age is unknown, so 'alive but useless' cannot be told from 'alive and "
                  "working'. Not green.")
+    if log.get("tail_ok") is False:
+        # a fresh mtime proves the file is MOVING; it says nothing about WHAT is in it. Without this
+        # arm the failed read fell through to LOG_NO_CYCLE — "the log IS advancing, but not by a
+        # cycle" — which is a claim about content nobody read.
+        return V("controller_cycling", INCONCLUSIVE, "LOG_UNREADABLE",
+                 "controller pid(s): %s IS ALIVE (launchd %s: %s)\n"
+                 "%s\ntail: %s"
+                 % (pid_txt, lc, lc_txt, log_txt, log.get("tail_error") or "tail failed"),
+                 "the log's mtime is readable but its CONTENT is not, so 'no cycle completes' cannot "
+                 "be told from 'the tail was refused'. Not green.")
     if log_age > win:
         return V("controller_cycling", FAIL, "LOG_SILENT",
                  "controller pid(s): %s IS ALIVE (launchd %s: %s)\n"
@@ -947,17 +955,29 @@ def check_queue_readable(f, c):
     # having lost its epoch, read as current, and `queue_stale_s` — whose whole job is to stop that —
     # could not fire because `_queue_age` answered None. A KNOWN-and-old NON-EMPTY read is still
     # accepted (it does say "readable, n candidates"); an unaged one is not.
-    if stale is not None and (stale["age_s"] is None or tok["kind"] == "EMPTY"):
+    if stale is not None:
         if stale["age_s"] is None:
             return V("queue_readable", INCONCLUSIVE, "STATE_FROZEN", _queue_frozen_txt(f, stale),
                      "the pool reading (%s) carries NO AGE — no epoch in the token, none in "
                      "state/queue-state — so a current read cannot be told from a record frozen "
                      "hours ago. A state record with no age is a stale flag waiting to be read as "
                      "current, and an UNKNOWN age is not a fresh one. Not green." % (raw_tok,))
-        return V("queue_readable", INCONCLUSIVE, "STATE_FROZEN", _queue_frozen_txt(f, stale),
-                 ("the pool was read as EMPTY %s ago (limit %.0fs), so 'the pool is empty' is a "
-                  "claim about then, not now. Not green." % (
-                      _age_txt(stale["age_s"]), stale["limit_s"])))
+        if tok["kind"] == "EMPTY":
+            return V("queue_readable", INCONCLUSIVE, "STATE_FROZEN", _queue_frozen_txt(f, stale),
+                     ("the pool was read as EMPTY %s ago (limit %.0fs), so 'the pool is empty' is a "
+                      "claim about then, not now. Not green." % (
+                          _age_txt(stale["age_s"]), stale["limit_s"])))
+        # ⛔ GREEN ON A FROZEN REFRESH IS THE #1931 FAILURE WEARING A PASS. A KNOWN-and-old NON-EMPTY
+        # read was graded PASS/READABLE ("it does say readable, n candidates"), so a box whose refresh
+        # froze three hours ago exited 0 for the WHOLE run while the controller dispatched off a stale
+        # `candidates.txt` — constructed and measured: fresh header, `queue=READ(223)(3h)`,
+        # `state/queue-state` 3h old → PASS/READABLE, exit 0. The claim is legible now, and it is not
+        # a pass: the pool number is a statement about three hours ago.
+        return V("queue_readable", INCONCLUSIVE, "READABLE_STALE", _queue_frozen_txt(f, stale),
+                 ("the pool was read as %s %s ago (limit %.0fs): the reading is legible but not "
+                  "CURRENT, so 'the last refresh produced a readable verdict' is a claim about %.0fs "
+                  "ago. Not green." % (raw_tok, _age_txt(stale["age_s"]), stale["limit_s"],
+                                       stale["age_s"])))
     if tok["kind"] == "EMPTY" and backlog is None:
         return V("queue_readable", INCONCLUSIVE, "HEADER_INCOMPLETE",
                  "header: %s has no backlog= field, so 'empty' cannot be checked against it"
@@ -971,8 +991,15 @@ def check_queue_readable(f, c):
     # it so a human can see when the two disagree.
     pair = parse_queue_token(hdr.get("queue_token") or "")
     pair_pool = pair.get("pool")
+    # ⛔ A CURRENT `state/queue-state: EMPTY` SUPERSEDES THE HEADER'S PAIR. The header's `queue=` and
+    # `backlog=` are ONE refresh old; when the newer record says the pool is now EMPTY, the header's
+    # large pool is superseded too, and grading the header's pair anyway produced
+    # `queue_readable FAIL/EMPTY_WITH_LARGE_POOL` beside `work_dispatched PASS/IDLE_EMPTY_POOL` for
+    # ONE facts dict — two checks reading one world in opposite directions, with the FAIL's own
+    # evidence line saying "graded from: state/queue-state (it is NEWER than the header token)".
+    superseded = (tok["kind"] == "EMPTY" and tok_src == "state/queue-state" and stale is None)
     if isinstance(backlog, int) and not isinstance(backlog, bool) and backlog == 0 \
-            and isinstance(pair_pool, int) and pair_pool >= c.pool_threshold:
+            and isinstance(pair_pool, int) and pair_pool >= c.pool_threshold and not superseded:
         return V("queue_readable", FAIL, "EMPTY_WITH_LARGE_POOL",
                  "header: %s\nbacklog=0 while the SAME header had just READ %d issue(s) "
                  "(threshold %d)\ngraded record: %s (pool %s)\n%s"
@@ -1315,17 +1342,6 @@ def check_work_dispatched(f, c):
                  "%d dispatch attempt(s) were REFUSED in the window and nothing was dispatched. "
                  "The controller is cycling, the queue is readable, and no work is going out."
                  % len(refused))
-    if isinstance(backlog, int) and backlog > 0 and skipped is not None:
-        return V("work_dispatched", FAIL, "NO_DISPATCH_GATED", evidence,
-                 "the refresh reported %d candidate(s) and the dispatch gate skipped every cycle "
-                 "in the window (reason on the [dispatch] skipped line above). The outcome is "
-                 "absent — the evidence names WHY, which distinguishes a gated fleet from a "
-                 "silently dead one." % backlog)
-    if isinstance(backlog, int) and backlog > 0:
-        return V("work_dispatched", FAIL, "NO_DISPATCH", evidence,
-                 "the refresh reported %d candidate(s) and no dispatch line was written in the "
-                 "window. Work existed and did not move." % backlog)
-
     # No dispatch, no refusals, nothing in the backlog: is that IDLE or BLIND?
     # ⛔ THE SAME AUTHORITATIVE TOKEN `queue_readable` GRADES. Reading the header's token here while
     # `queue_readable` read the newer state record let a BLIND refresh be called IDLE: header
@@ -1340,17 +1356,38 @@ def check_work_dispatched(f, c):
     # `work_dispatched` — "the one that matters most" — assert that a fleet's non-dispatch was
     # CORRECT on evidence the module had declared incomplete.
     stale = _graded_stale(f, c, _tok_src)
-    if stale is not None and (stale["age_s"] is None or pool_kind == "EMPTY" or backlog == 0):
-        # "Nothing to dispatch" is the CORRECT outcome only on a CURRENT read. A frozen read makes it
-        # unestablished, and this is the branch that would otherwise bless it.
+    if stale is not None:
+        # "Nothing to dispatch" is the CORRECT outcome only on a CURRENT read, and "work existed and
+        # did not move" is a claim about NOW. A frozen read establishes neither — so ANY stale read
+        # abstains here, including a legible non-empty one. The guard used to exempt a stale NON-EMPTY
+        # read with a non-empty backlog, which let `work_dispatched` grade FAIL/NO_DISPATCH ("the
+        # refresh reported %d candidate(s) and no dispatch line was written") off a reading hours old,
+        # while `queue_readable` abstained on the very same record — one facts dict, two answers, and
+        # the FAIL was the one that would have paged someone.
         return V("work_dispatched", INCONCLUSIVE, "STATE_FROZEN", _queue_frozen_txt(f, stale),
-                 ("the pool was read as empty %s ago (limit %.0fs), so 'there was nothing to "
-                  "dispatch' is not established. Not green." % (
+                 ("the pool was read %s ago (limit %.0fs), so neither 'there was nothing to "
+                  "dispatch' nor 'work existed and did not move' is established. Not green." % (
                       _age_txt(stale["age_s"]), stale["limit_s"]))
                  if stale["age_s"] is not None else
                  ("the pool reading carries NO AGE (no epoch in the token, none in "
                   "state/queue-state), so 'there was nothing to dispatch' cannot be told from a "
                   "record frozen hours ago. Not green."))
+    # ⛔ THESE TWO FAIL ARMS REST ON THE QUEUE RECORD, so they sit BELOW the staleness abstention.
+    # Above it they were reached first and graded FAIL/NO_DISPATCH ("the refresh reported 47
+    # candidate(s) and no dispatch line was written… Work existed and did not move") off a six-hour-old
+    # reading — the exact claim the abstention exists to withhold, and a FAIL that pages someone while
+    # `queue_readable`, on the same record, abstains. An abstention placed after the arm it must
+    # suppress is dead code (the same structural bug as `check_pr_merged`'s in cycle 23).
+    if isinstance(backlog, int) and backlog > 0 and skipped is not None:
+        return V("work_dispatched", FAIL, "NO_DISPATCH_GATED", evidence,
+                 "the refresh reported %d candidate(s) and the dispatch gate skipped every cycle "
+                 "in the window (reason on the [dispatch] skipped line above). The outcome is "
+                 "absent — the evidence names WHY, which distinguishes a gated fleet from a "
+                 "silently dead one." % backlog)
+    if isinstance(backlog, int) and backlog > 0:
+        return V("work_dispatched", FAIL, "NO_DISPATCH", evidence,
+                 "the refresh reported %d candidate(s) and no dispatch line was written in the "
+                 "window. Work existed and did not move." % backlog)
     if pool_kind == "EMPTY" and backlog is None:
         return V("work_dispatched", INCONCLUSIVE, "HEADER_INCOMPLETE",
                  "queue=EMPTY but the header carries no `backlog=` field: %s" % hdr,
@@ -1376,7 +1413,7 @@ def check_work_dispatched(f, c):
 # ════════════════════════════════════════════════════════════════════════════════════════════════
 
 
-def _activity(f, window_s=None):
+def _activity(f, window_s=None, cfg=None):
     """Did the fleet have work in hand? Used to decide whether 'no PR' is a FAILURE or an IDLE.
 
     ⛔ THE HEADER MUST BE INSIDE THE WINDOW. Every other reader windows it (`newest_with_age(...)`);
@@ -1385,6 +1422,8 @@ def _activity(f, window_s=None):
     HAND", asserting no PR was opened) while `queue_readable` and `work_dispatched` abstained on the
     very same facts — one world graded two ways, and the FAIL carrying no age in its evidence.
     """
+    if cfg is not None and window_s is None:
+        window_s = cfg.window_s
     events = f.get("log_events") or {}
     hdr = newest_with_age(events.get("headers"), window_s) if window_s is not None \
         else newest(events.get("headers"))
@@ -1406,6 +1445,20 @@ def _activity(f, window_s=None):
     # FAILs ("the fleet HAD WORK IN HAND") about a refresh that had already been superseded. The
     # graded record's own verdict wins: a current EMPTY says there is nothing to dispatch.
     backlog_src = "cycle header"
+    # ⛔ THE QUEUE RECORD IS NOT THE ONLY EVIDENCE OF WORK IN HAND, AND SAYING "NOTHING IN HAND" WHEN
+    # THE RUN ITSELF PROVES OTHERWISE IS A FALSE STATEMENT EVEN AT EXIT 2. Measured: `work_dispatched`
+    # PASS/DISPATCHED from a fresh `[dispatch] … -> 4601` + `#4601: lane-N` sat three lines above
+    # `pr_created`'s "the fleet had nothing in hand, so a PR was not expected". Open PRs and a fresh
+    # dispatch are the same positive evidence `pr_merged`'s `open_n > 0` arm already trusts.
+    gh_open = (f.get("github") or {}).get("open_pr_count")
+    pr_win = cfg.pr_window_s if cfg is not None else 10800.0
+    fresh_dispatch = newest_with_age(events.get("dispatch_ok") or [], pr_win) or \
+        newest_with_age(events.get("lane_started") or [], pr_win)
+    if isinstance(gh_open, int) and not isinstance(gh_open, bool) and gh_open > 0:
+        return True, "%d open PR(s) — work in hand, independent of the queue record" % gh_open
+    if fresh_dispatch:
+        return True, "a dispatch landed %s ago (the queue record is not the only evidence)" % (
+            _age_txt(fresh_dispatch.get("age_s")))
     if _src == "state/queue-state" and kind == "EMPTY":
         return False, ("the graded record is state/queue-state: EMPTY (%s) — it supersedes the "
                        "%s cycle header's backlog=%s" % (age_txt, backlog_src, backlog))
@@ -1474,7 +1527,7 @@ def check_pr_created(f, c):
              gh.get("last_created") or "none in the query window", _gh_surface_txt(gh)))
     if isinstance(n, int) and n > 0:
         return V("pr_created", PASS, "CREATED", ev)
-    busy, why = _activity(f, c.window_s)
+    busy, why = _activity(f, cfg=c)
     if busy is None:
         return V("pr_created", INCONCLUSIVE, "ACTIVITY_UNKNOWN", ev + "\nfleet activity: %s" % why,
                  "whether the fleet had work in hand could not be read, so 'no PR was created' is "
@@ -1511,7 +1564,7 @@ def check_pr_merged(f, c):
              _gh_surface_txt(gh)))
     if isinstance(n, int) and n > 0:
         return V("pr_merged", PASS, "MERGED", ev)
-    busy, why = _activity(f, c.window_s)
+    busy, why = _activity(f, cfg=c)
     if gh.get("merged_page_full") and not (isinstance(n, int) and not isinstance(n, bool) and n > 0):
         # A FULL, creation-ordered page cannot tell "nothing merged" from "merged PRs created before
         # the page cut". Abstaining is the honest answer; a FAIL here would be a false alarm, and a
@@ -2884,12 +2937,21 @@ class Machine(object):
             return ({"path": path, "exists": exists, "age_s": None,
                      "error": (out or "").strip()[-200:] or "stat returned no epoch"}, [], "stat")
         now = time.time()
-        tail_lines = tail.splitlines() if rc2 == 0 else []
+        # ⛔ A FAILED `tail` IS A MISSING READ, NOT AN EMPTY LOG. The exit status was discarded, so a
+        # log whose tail could not be read (EACCES/TCC, a timed-out remote exec) came back with an
+        # EMPTY line list and a fresh mtime — and `controller_cycling` graded the pair
+        # FAIL/LOG_NO_CYCLE ("the log IS advancing, but not by a cycle"): a MEASURED claim about
+        # content that was never read, on the check an operator reads first. `queue_readable` already
+        # abstains on the same datum (NO_REFRESH) — one datum, one polar.
+        tail_ok = rc2 == 0
+        tail_lines = tail.splitlines() if tail_ok else []
+        tail_err = None if tail_ok else ("tail failed rc=%s: %s" % (rc2, (tail or "").strip()[-160:]))
         skew = now - mtime
         return ({"path": path, "exists": True, "mtime": mtime,
                  "mtime_iso": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(mtime)),
                  # same rule as the events: a future mtime is UNKNOWN, never the freshest possible
                  "age_s": (None if skew < -CLOCK_SKEW_TOLERANCE_S else max(0.0, skew)),
+                 "tail_ok": tail_ok, "tail_error": tail_err,
                  "error": ("log mtime is %.0fs in the FUTURE (clock skew)" % (-skew)
                            if skew < -CLOCK_SKEW_TOLERANCE_S else None)}, tail_lines, None)
 
@@ -3138,8 +3200,14 @@ def _collect_graphql(gh, repo, cfg, now, errors):
         # the bound can hide nothing that matters (the check PASSes on a positive count and never
         # needs the population). It is the absence of merges that the flag must protect, and an
         # EMPTY result of a window-bounded query is that absence, measured.
+        # ⛔ THE MERGE-ORDERED PAGE CAN BE FULL TOO. `merged:>=<day-floored date>` is bounded by the
+        # DAY, not by `pr_window_s`, so a full page can hold zero in-window rows and hide the merge
+        # that matters: `merged_page_full=False` hardcoded there asserted "nothing merged" off a cut
+        # page. The flag costs nothing on the positive side — `pr_merged` returns PASS on `n > 0`
+        # BEFORE the truncation arm — so only the `n == 0` case abstains, which is exactly the case
+        # that needs it.
         _fill_counts(out, open_prs, merged_in_window_rows, cfg, now, also_created=closed,
-                     merged_page_full=False)
+                     merged_page_full=len(merged_in_window_rows) >= 100)
         out["merged_surface"] = "merge-ordered (merged:>=%s)" % since
     else:
         # the merge-ordered read failed: fall back to the creation-ordered page and DISCLOSE the
@@ -3391,7 +3459,6 @@ def collect_live(cfg, machine=None, now=None, skip=()):
     machine = machine or Machine(cfg.box if cfg.box not in (None, "local") else None)
     machine.log_path = cfg.log_path
     machine.controller_paths = cfg.controller_paths()
-    machine.o_dir = cfg.o_dir
     machine.o_dir = cfg.o_dir
     machine.tail_lines = int(getattr(cfg, "log_tail_lines", 6000))
     facts = {"box": cfg.box or "local", "observed_at": _iso(now)}

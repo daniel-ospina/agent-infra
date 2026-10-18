@@ -160,9 +160,15 @@ reason and use the exit code + log for the signal.
   with `backlog=0` used to let both queue checks pass and the whole run exit 0. Now an `EMPTY` read
   older than `--queue-stale-min` (default 90, the harness's own minutes-to-hours boundary) is
   `INCONCLUSIVE / STATE_FROZEN` for `queue_readable` and `work_dispatched`. A stale **non-empty** read
-  still supports "readable, n candidates" — failing that would cry wolf on a box that is dispatching
-  from it. An `EMPTY` read carrying **no age at all** is also `STATE_FROZEN`: the harness emits that
-  shape from a torn state file, and an unaged record is a stale flag waiting to be read as current.
+  is `INCONCLUSIVE / READABLE_STALE`: legible, so a FAIL would accuse a box that may still be
+  dispatching off it, and old, so a PASS would certify a pool number from hours ago while the
+  controller read a stale `candidates.txt` — #1931 wearing a pass. Neither: abstain, and let
+  `work_dispatched` report the dispatches it can actually see. `work_dispatched` abstains on ANY stale
+  record for the same reason, and its two backlog-based FAIL arms sit **below** that abstention: an
+  abstention placed after the arm it must suppress is dead code, and the FAIL it let through
+  (`NO_DISPATCH`, "work existed and did not move") accused a box whose refresh had merely frozen. An `EMPTY` read carrying **no age at
+  all** is `STATE_FROZEN`: the harness emits that shape from a torn state file, and an unaged record is
+  a stale flag waiting to be read as current.
   The limit is `--queue-stale-min` / `config.queue_stale_s`, and it is a real field — not an
   advertised flag that `Cfg` silently discards.
 - **A future-dated log mtime is UNKNOWN, not the freshest possible.** `max(0, now - mtime)` made a
@@ -221,8 +227,8 @@ shape changes, and it is pruned with the rest of its check.
 ## The suite
 
 ```bash
-python3 tools/fleet/outcome_canary.test.py              # 140 tests
-python3 tools/fleet/outcome_canary.test.py --mutations  # 136 mutations, each must go RED
+python3 tools/fleet/outcome_canary.test.py              # 145 tests
+python3 tools/fleet/outcome_canary.test.py --mutations  # 142 mutations, each must go RED
 ```
 
 The signal tests drive the **real CLI** end-to-end (`--live --facts … --capture-dir …`), so what is
@@ -340,8 +346,23 @@ Six more (cycle 13), each a case where a datum the tool held was not the one it 
 
 - **An age-UNKNOWN pool read is not READABLE.** The staleness guard fired only for `EMPTY`, so
   `queue=READ(223)` written without an epoch — the bare token the harness emits when its `$at` field
-  is missing or unparsable — was graded `READABLE` with the age printed as `UNKNOWN`. A known-and-old
-  non-empty read is still accepted (it does say "readable, n candidates"); an unaged one is not.
+  is missing or unparsable — was graded `READABLE` with the age printed as `UNKNOWN`. An unaged one is
+  `STATE_FROZEN`, and a known-and-old non-empty read is `READABLE_STALE` (see below) — it is legible,
+  and it is not current.
+- **An unreadable log is not an empty log.** `read_log` discarded the `tail` exit status, so a log
+  whose content could not be read (EACCES, TCC, a timed-out remote exec) came back with a fresh mtime
+  and no lines, and `controller_cycling` graded that pair `FAIL / LOG_NO_CYCLE` — "the log IS
+  advancing, but not by a cycle": a measured claim about content nobody read, on the first check an
+  operator looks at. A failed tail is `INCONCLUSIVE / LOG_UNREADABLE` with the error in the evidence.
+- **A current `state/queue-state: EMPTY` supersedes the header's pair.** The header's `queue=` and
+  `backlog=` are one refresh old; when the newer record says the pool is now empty, grading the
+  header's pair anyway produced `queue_readable FAIL / EMPTY_WITH_LARGE_POOL` beside
+  `work_dispatched PASS / IDLE_EMPTY_POOL` for one world — two checks reading the same facts in
+  opposite directions.
+- **Open PRs and a fresh dispatch are work in hand.** The queue record answers "what did the last
+  refresh say"; the PR checks' "nothing in hand" abstention reads it, so a stale record could silence
+  a real FAIL while the log showed a dispatch inside the PR window. Measured: `work_dispatched
+  PASS/DISPATCHED` three lines above "nothing in hand".
 - **A moving log is not a cycling controller.** `cycles` was computed, printed and never graded, so a
   controller wedged mid-cycle read `PASS/CYCLING` for as long as anything appended to the log —
   `claim-prune` and the `[reap-worker]` lines do, by design. Zero cycle headers in the window is now
