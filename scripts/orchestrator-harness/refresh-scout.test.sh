@@ -1023,7 +1023,166 @@ case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
   *) bad "degraded COLLISION: the backlog was clobbered — candidates='$(cat "$D/o/candidates.txt" 2>/dev/null)'" ;;
 esac
 
-# ── 1h) A NETWORK FAULT IS TRANSIENT, NOT PERMANENT (agent-infra#1853 review P1) ────────────────
+# ── 1i) THE PRE-FLIGHT'S HOLDER SURFACE NEEDS cmux — THE COLLECTOR MUST BE ABLE TO RUN IT ───────
+# THE DEFECT (measured 2026-10-18, the drained-backlog P0). The collision pre-flight's
+# `issue assignee/holder` surface reads lane liveness from the fleet board, and the board's ONLY
+# source for it is `cmux sessions list --json --all` (tortoise `tools/fleet_state.py`
+# `live_sessions()`). When that cannot run, `liveness_measured` is False, the board carries
+# `orphans[kind=liveness-unmeasured]`, and the pre-flight refuses to read an unmeasured liveness as a
+# dead owner (fail-closed, #8175) — so the surface is INCOMPLETE, EVERY candidate's verdict is
+# unusable, and the refresh aborts BY DESIGN (#1736) on every cycle. Measured on the Mac fleet box:
+# `candidates.txt: 0`, `checked.txt: 310`, pool READ(203), `lanes: 1`, and every pass logging
+#   [refresh] ?#1981 INCOMPLETE from the pre-flight (it could not query every surface)
+#   [refresh] ABORT: none of the 6 candidate(s) the pre-flight ran produced a usable verdict
+# with `command -v cmux` failing under the daemon PATH
+#   /Users/home/orchestrator/gh-rest:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+# (`cmux` lives in the app bundle /Applications/cmux.app/Contents/Resources/bin, which an interactive
+# LOGIN shell gets from cmux's own shim setup — launchd reads no profile, and `install.sh` never probed
+# it either, so a fresh install reproduced the same PATH).
+#
+# TWO CASES, because the repair has two halves and a host that HAS cmux would silently cover for both:
+#   (A) the SHIPPED resolver, driven as an extracted block with a PATH that really cannot resolve cmux
+#       — the only way to ask "does the repair happen?" on a box that already has the tool;
+#   (B) the END-TO-END property: an unmeasurable holder surface aborts the pass and never reports an
+#       empty backlog as "no work", while a measurable one queues the candidate.
+# ⛔ A PRE-FLIGHT STAND-IN, not the real tortoise tool: this suite is offline and hermetic. It
+# reproduces tortoise's fail-closed shape exactly (a surface that cannot be measured is INCOMPLETE, and
+# an INCOMPLETE is never a verdict), so what is asserted is the SHIPPED script's behaviour.
+echo; echo "── cmux: an unmeasurable holder surface drains the backlog, and the collector must repair it ──"
+awk '/^resolve_cmux\(\) \{/{f=1} f{print} f&&/^\}$/{exit}' "$REFRESH" > "$T/cmux-resolver.sh"
+if [ -s "$T/cmux-resolver.sh" ] && grep -q 'cmux.app/Contents/Resources/bin' "$T/cmux-resolver.sh"; then
+  mk_cmux_stub() {  # <dir> — a cmux that answers `sessions list` and nothing else
+    mkdir -p "$1"
+    cat > "$1/cmux" <<'SH'
+#!/bin/bash
+[ "$1 $2" = "sessions list" ] || exit 2
+printf '%s\n' '{"sessions":[]}'
+SH
+    chmod +x "$1/cmux"
+  }
+  CR="$T/cmuxres"; mkdir -p "$CR/bin" "$CR/home" "$CR/bare"
+  # A PATH that cannot resolve cmux: the two dirs the shipped script appends are MASKED by an empty
+  # PATH for the driver (the driver calls the function directly, so nothing else needs them).
+  { echo 'set -u'; echo 'PATH="$1"; HOME="$2"; export PATH HOME'; cat "$T/cmux-resolver.sh"
+    echo 'CMUX_HINT=""; if resolve_cmux; then printf "RESOLVED %s|%s\n" "$(command -v cmux)" "$PATH"; else echo "UNRESOLVED"; fi'
+  } > "$CR/drive.sh"
+  bash -n "$CR/drive.sh" && ok "cmux: the resolver driver parses" || bad "cmux: the resolver driver does not parse"
+  mk_cmux_stub "$CR/home/Applications/cmux.app/Contents/Resources/bin"
+  out="$(bash "$CR/drive.sh" "$CR/bare" "$CR/home")"
+  # Non-vacuity FIRST: with the bundle on no PATH, the tool really is unqueryable — this is the
+  # controller's state, and the assertion below is worthless without it.
+  ( PATH="$CR/bare" command -v cmux >/dev/null 2>&1 ) \
+    && bad "cmux: non-vacuity — 'cmux' resolves from a bare PATH, so the case cannot see the repair" \
+    || ok "cmux: non-vacuity — a bare PATH cannot resolve cmux (the controller's shape)"
+  case "$out" in
+    *"RESOLVED $CR/home/Applications/cmux.app/Contents/Resources/bin/cmux|"*)
+      ok "cmux: the SHIPPED resolver finds and uses \$HOME/Applications/cmux.app/Contents/Resources/bin" ;;
+    *) bad "cmux: the resolver did not repair PATH — output: $out" ;;
+  esac
+  case "$out" in
+    *"$CR/home/Applications/cmux.app/Contents/Resources/bin/cmux|"*) ok "cmux: 'cmux' resolves inside the app bundle afterwards" ;;
+    *) bad "cmux: cmux still does not resolve after the repair — output: $out" ;;
+  esac
+  # ⛔ APPEND, NEVER PREPEND: that bundle directory also ships `open`, `ghostty`, `grok` and `muse`,
+  # so prepending it would shadow /usr/bin/open for every child of the pass.
+  case "$out" in
+    *"|$CR/bare:$CR/home/Applications/cmux.app/Contents/Resources/bin") ok "cmux: the bundle directory is APPENDED (it cannot shadow /usr/bin/open)" ;;
+    *) bad "cmux: the bundle directory was not appended last — output: $out" ;;
+  esac
+  # ...and with the seam honoured, and with nothing anywhere, the two clear answers.
+  mk_cmux_stub "$CR/seam"
+  out="$(bash "$CR/drive.sh" "$CR/bare" "$CR/bare" )"
+  # ⛔ HOST-DEPENDENT BY NATURE, and stated rather than faked: the resolver's last candidate is the
+  # SYSTEM bundle, so on a box that has /Applications/cmux.app the "nothing anywhere" state cannot be
+  # built here. Assert the answer the host can actually give instead of skipping the case.
+  if [ -x /Applications/cmux.app/Contents/Resources/bin/cmux ]; then
+    case "$out" in
+      *"RESOLVED /Applications/cmux.app/Contents/Resources/bin/cmux|"*)
+        ok "cmux: with nothing under \$HOME the resolver falls back to the SYSTEM bundle (this host installs one)" ;;
+      *) bad "cmux: the system-bundle fallback did not fire — output: $out" ;;
+    esac
+  else
+    case "$out" in
+      UNRESOLVED*) ok "cmux: nothing to resolve anywhere -> the resolver SAYS SO (it does not claim a repair)" ;;
+      *) bad "cmux: an unresolvable cmux was reported as repaired — output: $out" ;;
+    esac
+  fi
+  { echo 'set -u'; echo 'PATH="$1"; HOME="$2"; CMUX_BIN_DIR="$3"; export PATH HOME CMUX_BIN_DIR'; cat "$T/cmux-resolver.sh"
+    echo 'CMUX_HINT=""; if resolve_cmux; then printf "RESOLVED %s\n" "$(command -v cmux)"; else echo "UNRESOLVED"; fi'
+  } > "$CR/drive-seam.sh"
+  out="$(bash "$CR/drive-seam.sh" "$CR/bare" "$CR/home" "$CR/seam")"
+  case "$out" in *"$CR/seam/cmux"*) ok "cmux: \$CMUX_BIN_DIR is honoured (the operator seam works without a bundle)" ;;
+                 *) bad "cmux: \$CMUX_BIN_DIR was ignored — output: $out" ;; esac
+else
+  bad "the cmux resolver could not be extracted from the shipped refresh-candidates.sh (deleted, or its anchor moved)"
+fi
+
+# (B) THE PROPERTY, end to end: the pass must ABORT when the holder surface cannot be measured, and
+# QUEUE when it can. `$D/bin` is first on the pass's PATH, so the sandbox's cmux decides — a host that
+# has its own cmux cannot make either case pass vacuously.
+mk_holder_preflight() {  # <case-dir> — CLEAN iff `cmux sessions list` really runs
+  mkdir -p "$1/repo/.worktrees/dispatch-scout/tools"
+  cat > "$1/repo/.worktrees/dispatch-scout/tools/collision_preflight.py" <<'PY'
+#!/usr/bin/env python3
+import shutil, subprocess, sys
+cmux = shutil.which("cmux")
+measured = bool(cmux) and subprocess.run(
+    [cmux, "sessions", "list", "--json", "--all"],
+    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+if measured:
+    print("VERDICT: CLEAN")
+    raise SystemExit(0)
+print("SURFACE  issue assignee/holder  INCOMPLETE  0  the board's live-session store could not be read")
+print("VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be queried (issue assignee/holder); NOT clean")
+raise SystemExit(2)
+PY
+  chmod +x "$1/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+}
+mk_case cmux-unmeasurable
+mk_holder_preflight "$D"
+mk_gh_rest "$D" 42
+printf '#!/bin/bash\nexit 127\n' > "$D/bin/cmux"; chmod +x "$D/bin/cmux"   # resolves, cannot run
+echo 99 > "$D/o/candidates.txt"
+rf "$D" refresh
+[ "$RC" -ne 0 ] && ok "cmux-unmeasurable: the pass ABORTS (rc=$RC) — an unjudged pool is not a success" \
+               || bad "cmux-unmeasurable: rc=0 — a pass that judged nothing reported a healthy empty backlog"
+case "$OUT" in
+  *"judged NOTHING"*) ok "cmux-unmeasurable: the abort names what happened" ;;
+  *) bad "cmux-unmeasurable: the abort does not name the cause — output: $OUT" ;;
+esac
+case "$OUT" in
+  *"checked "*"backlog now"*) bad "cmux-unmeasurable: printed \"checked N; backlog now 0\" over judgments that never happened" ;;
+  *) ok "cmux-unmeasurable: the false empty-backlog report is suppressed" ;;
+esac
+case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
+  *42*) bad "cmux-unmeasurable: queued candidates from an unmeasurable verdict" ;;
+  *99*) ok "cmux-unmeasurable: nothing is queued (seed 99 intact, #42 absent)" ;;
+  *) bad "cmux-unmeasurable: the backlog was clobbered — candidates='$(cat "$D/o/candidates.txt" 2>/dev/null)'" ;;
+esac
+
+mk_case cmux-measurable
+mk_holder_preflight "$D"
+mk_gh_rest "$D" 42
+cat > "$D/bin/cmux" <<'SH'
+#!/bin/bash
+[ "$1 $2" = "sessions list" ] || exit 2
+printf '%s\n' '{"sessions":[]}'
+SH
+chmod +x "$D/bin/cmux"
+echo 99 > "$D/o/candidates.txt"
+rf "$D" refresh
+[ "$RC" -eq 0 ] && ok "cmux-measurable: the pass SUCCEEDS (rc=0) once the surface can be measured" \
+               || bad "cmux-measurable: rc=$RC — output: $OUT"
+case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
+  *42*) ok "cmux-measurable: #42 reached the backlog — the property the drain was about" ;;
+  *) bad "cmux-measurable: nothing queued — candidates='$(cat "$D/o/candidates.txt" 2>/dev/null)'" ;;
+esac
+case "$OUT" in
+  *"judged NOTHING"*) bad "cmux-measurable: the pass still aborted with a usable verdict available" ;;
+  *) ok "cmux-measurable: no \"judged NOTHING\" abort" ;;
+esac
+
+# ── 1j) A NETWORK FAULT IS TRANSIENT, NOT PERMANENT (agent-infra#1853 review P1) ────────────────
 # The discriminator is the PRESENCE OF A STORED CREDENTIAL, not gh's prose. MEASURED on gh 2.97.0
 # behind a dead proxy (`HTTPS_PROXY=http://127.0.0.1:1`): a PURE transport fault still prints "The
 # token in ~/.config/gh/hosts.yml is invalid.", so any text match on `invalid` classes an outage as

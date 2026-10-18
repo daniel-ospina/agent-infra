@@ -212,6 +212,69 @@ resolve_preflight() {   # sets PREFLIGHT to the resolved tool path; returns 1 if
   return 1
 }
 
+# ── cmux must be EXECUTABLE by the pre-flight, or EVERY verdict is unusable ────────────────────
+# WHY. The pre-flight's `issue assignee/holder` surface reads lane liveness from the FLEET BOARD, and
+# the board's only source for it is the live-session store: tortoise's `tools/fleet_state.py`
+# `live_sessions()` shells out to `cmux sessions list --json --all`. When cmux cannot be executed that
+# read returns `{}`, `build_state` writes `liveness_measured: False`, and the board carries an
+# `orphans[kind=liveness-unmeasured]` row. The pre-flight refuses to read an unmeasured liveness as a
+# dead owner (`_board_liveness_error`, fail-closed — #8175), so the surface is INCOMPLETE.
+#
+# ⛔ ONE UNMEASURABLE SURFACE IS THE WHOLE PASS. Every blocking surface must answer before the tool
+# prints anything this script counts, so a holder surface it can never measure makes EVERY candidate
+# unusable and the pass aborts BY DESIGN (#1736) — correctly, but forever. MEASURED 2026-10-18 on this
+# box: `candidates.txt: 0`, `checked.txt: 310`, pool READ(203), and every cycle of
+# `~/orchestrator/logs/orch-loop.log` carrying
+#     [refresh] ?#1981 INCOMPLETE from the pre-flight (it could not query every surface)
+#     [refresh] ABORT: none of the 6 candidate(s) the pre-flight ran produced a usable verdict
+# under the daemon PATH `com.eldato.orchestrator-stack` really sets:
+#     /Users/home/orchestrator/gh-rest:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+# cmux is not on it and CANNOT be: the binary ships inside the app bundle
+# (/Applications/cmux.app/Contents/Resources/bin/cmux), which is on no default PATH. An interactive
+# shell finds it only because cmux's own shim setup adds that directory to the LOGIN shell's PATH —
+# and launchd inherits no shell. `install.sh` never probed cmux either (its list was tmux/gh/uv/pi/jq),
+# so a FRESH INSTALL reproduced the same PATH. Both halves are fixed: install.sh now bakes the
+# resolved directory into the daemon PATH, and this resolver repairs a RUNNING deployment — the
+# refresh's own PATH — without one.
+#
+# ⛔ APPEND, NEVER PREPEND. That bundle directory also ships `open`, `ghostty`, `grok` and `muse`;
+# prepending it would shadow /usr/bin/open for every child of this pass. Appending keeps cmux
+# findable while changing which binary wins for nothing.
+# ⛔ ALSO ASK IT TO RUN. `/Applications/cmux.app` can be present with its CLI unable to talk to the
+# app; that is a different failure and the pre-flight reports it as INCOMPLETE with its own reason, so
+# this resolver's contract is only the PATH half — it must not claim more than it checked.
+# ⛔ THIS HOME'S BUNDLE IS TRIED BEFORE /Applications: a user-local install must win over the system
+# copy, and it is what makes this resolver hermetically testable (a sandbox HOME), which is the only
+# way a regression test can pin "the controller's PATH has no cmux" without the host's own cmux
+# answering for it.
+resolve_cmux() {
+  local cand
+  if command -v cmux >/dev/null 2>&1; then return 0; fi
+  for cand in \
+    "${CMUX_BIN_DIR:-}" \
+    "${HOME:-/nonexistent}/Applications/cmux.app/Contents/Resources/bin" \
+    /Applications/cmux.app/Contents/Resources/bin \
+  ; do
+    [ -n "$cand" ] || continue
+    [ -x "$cand/cmux" ] || continue
+    PATH="$PATH:$cand"; export PATH
+    echo "[refresh] cmux was NOT on PATH — appended $cand: the pre-flight's holder surface reads the fleet board's live-session store through 'cmux sessions list', and without it EVERY verdict is INCOMPLETE (#8175/#1736)"
+    return 0
+  done
+  return 1
+}
+# Resolved ONCE, at load, so `--check` and the run judge the SAME environment and the repair is
+# written once per pass either way. Non-fatal: whether an unmeasured board is fatal is not this
+# script's call (the abort guard owns "a pass judged nothing", and a cell may legitimately serve a
+# SHARED board it did not build) — but it is never silent: `--check` has its own line below, and a
+# RUN says so here, because the abort it causes ("judged NOTHING", #1736) names no cause and the
+# pre-flight's own reason is swallowed by the summary.
+CMUX_HINT=""
+if ! resolve_cmux; then
+  CMUX_HINT=1
+  [ "$MODE" = "check" ] || echo "[refresh] WARN: 'cmux' is not resolvable (tried \$CMUX_BIN_DIR, \$HOME/Applications/cmux.app/Contents/Resources/bin, /Applications/cmux.app/Contents/Resources/bin) — the pre-flight's holder surface reads the fleet board's live-session store through 'cmux sessions list', so every verdict from this box is INCOMPLETE and nothing can be queued (#8175/#1736) — fix: run install.sh, or set CMUX_BIN_DIR=<the directory holding cmux>"
+fi
+
 # ── gh must be able to AUTHENTICATE, or the pre-flight's verdicts are degraded fiction ─────────
 # WHY. The surfaces of tools/collision_preflight.py that DECIDE a verdict — issue metadata, open PRs,
 # the assignee/holder surfaces — are gh-backed. The three it reads from git (local branches, remote
@@ -463,6 +526,15 @@ cmd_check() {
     echo "[refresh] NOT PROVISIONABLE: the pre-flight tool requires Python >= $MIN_PY_MAJOR.$MIN_PY_MINOR and no usable interpreter is available, so a cell on this repo would MERGE ONLY (#1736)"
     echo "[refresh]   fix: set SCOUT_PY=<a Python >= $MIN_PY_MAJOR.$MIN_PY_MINOR>, or put one on PATH"
     return "$EXIT_NOT_PROVISIONABLE"
+  fi
+  # cmux is not a gate here (see resolve_cmux: the abort guard, not this check, owns "judged
+  # nothing"), but the operator needs it NAMED when it is the reason every verdict comes back
+  # INCOMPLETE — the state that reads as a healthy cell with an empty pool from the outside.
+  if [ -z "$CMUX_HINT" ]; then
+    echo "[refresh] check: cmux=$(command -v cmux)"
+  else
+    echo "[refresh] check: WARN 'cmux' is NOT resolvable (tried \$CMUX_BIN_DIR, \$HOME/Applications/cmux.app/Contents/Resources/bin, /Applications/cmux.app/Contents/Resources/bin) — the pre-flight's holder surface reads the fleet board's live-session store through it, so every verdict from this box is INCOMPLETE and NOTHING can be queued (#8175)"
+    echo "[refresh]   fix: run install.sh (it bakes the cmux directory into the daemon PATH), or set CMUX_BIN_DIR=<the directory holding cmux>"
   fi
   echo "[refresh] CHECK OK: this repo can be provisioned for dispatch"
   return 0
