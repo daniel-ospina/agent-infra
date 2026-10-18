@@ -654,8 +654,15 @@ BRINGUP_ARGS=start nrun REPO="$N/repo" O="$N/O" OR=agent-infra
 # old form called `exit 1` deep inside `resolve_repo_identity` with its message on a stderr nobody
 # read: `status` printed nothing at all (0 bytes on both streams, reproduced in review).
 BRINGUP_ARGS=status nrun REPO="$N/repo" O="$N/O" OR="someone/else"
-[ "$RC" = 0 ] && ok "status: rc=0 on a MISMATCHED OR — the verb stays answerable" \
-              || bad "status: rc=$RC on a mismatched OR (it must not die) — $OUT"
+# ⛔ rc CHANGED DELIBERATELY (fleet-inventory, 2026-10-18), and the property this arm exists for is
+# unchanged: `status` must stay ANSWERABLE on a broken pair — it prints the header, names the
+# unresolved identity, and still answers the controller question. Its exit code is now the FLEET
+# TABLE's verdict (worst row), so on this fixture it is 1 for rows that are absent, not the old
+# hard-coded 0. Asserting 0 here would have forced the table's verdict to be suppressed on exactly
+# the misconfigured machine an operator runs `status` to understand. "Answerable" is asserted from
+# the OUTPUT; a `cannot determine` (2) is asserted to be reserved for an unreadable read (§9).
+[ "$RC" = 1 ] && ok "status: rc=1 on a MISMATCHED OR — the TABLE's verdict, and the verb stays answerable" \
+              || bad "status: rc=$RC on a mismatched OR (want 1 = a non-OK fleet row, never 2/silent) — $OUT"
 case "$OUT" in
   *"identity:"*UNRESOLVED*) ok "status: NAMES the unresolved identity (and still prints the rest)" ;;
   *) bad "status: the identity problem is invisible — $OUT" ;;
