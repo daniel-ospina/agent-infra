@@ -38,6 +38,7 @@ TEMPLATE="$SCRIPT_DIR/../templates/launchd/com.eldato.pi-cache-reap.plist"
 SETUP="$SCRIPT_DIR/../pi-bootstrap/setup.sh"
 ORCH="$SCRIPT_DIR/orchestrator-harness/orch-loop.sh"
 SUPERVISOR="$SCRIPT_DIR/cloud-cell-supervisor.sh"
+BRINGUP="$SCRIPT_DIR/cloud-cell-bringup.sh"
 
 PASS=0
 FAIL=0
@@ -117,14 +118,25 @@ SH
 chmod +x "$T/bin/"*
 
 # uv stub: "prunes" (records the call) but removes nothing — the WORST case the
-# escalation arm must handle, and it keeps the fixture deterministic.
+# escalation arm must handle, and it keeps the fixture deterministic. `uv cache dir`
+# is answered with nothing (so the resolver falls back to $HOME/.cache/uv) and is NOT
+# recorded, because a directory RESOLUTION is not a prune.
 cat >"$T/bin/uv-noprune" <<SH
 #!/bin/sh
+if [ "\$1" = cache ] && [ "\$2" = dir ]; then exit 0; fi
 echo "prune \$* UV_CACHE_DIR=\${UV_CACHE_DIR:-unset}" >>"$T/prune.calls"
 exit 0
 SH
 cat >"$T/bin/uv-fail" <<'SH'
 #!/bin/sh
+exit 1
+SH
+# du: a cache with one unreadable subdirectory still prints a NUMERIC partial total and
+# exits 1 (measured: `16` for a 3016KiB tree). Accepting that number reports a cache as
+# bounded while most of it was never seen.
+cat >"$T/bin/du-partial" <<'SH'
+#!/bin/sh
+printf '16\t%s\n' "${@:-$1}"
 exit 1
 SH
 chmod +x "$T/bin/"*
@@ -196,6 +208,29 @@ assert_eq "$(kb "$H/.cache/uv")" "$UV_BEFORE" "dry-run deleted NOTHING"
 assert_contains "$OUT" "DRY-RUN" "dry-run says so, naming the cache over its bound"
 
 echo
+echo "── 3b. an explicit --dry-run WINS over CACHE_REAP_APPLY=1 ──"
+H="$T/h3b"
+new_cache "$H/.cache/uv" 3000 2000
+UV_BEFORE="$(kb "$H/.cache/uv")"
+OUT="$(run_reap "$H" --dry-run CACHE_REAP_APPLY=1 2>&1)"; RC=$?
+assert_eq "$RC" "0" "an armed-by-env pass asked for --dry-run exits 0"
+assert_eq "$(kb "$H/.cache/uv")" "$UV_BEFORE" "CACHE_REAP_APPLY=1 did NOT turn a requested dry run into the destructive pass"
+assert_contains "$OUT" "DRY-RUN" "the pass reports the mode it actually ran"
+
+ echo
+echo "── 3c. a second concurrent pass does not run (two clocks, one cache) ──"
+H="$T/h3c"
+new_cache "$H/.cache/uv" 3000 2000
+UV_BEFORE="$(kb "$H/.cache/uv")"
+mkdir -p "$H/.pi/agent/state/pi-cache-reap.lock"
+printf '%s\n' "$$" >"$H/.pi/agent/state/pi-cache-reap.lock/owner"
+printf '%s\n' "$(date +%s)" >"$H/.pi/agent/state/pi-cache-reap.lock/started"
+OUT="$(run_reap "$H" --apply 2>&1)"; RC=$?
+assert_eq "$RC" "0" "a pass that finds a LIVE lock exits 0 (it did not run, and nothing is wrong)"
+assert_eq "$(kb "$H/.cache/uv")" "$UV_BEFORE" "the locked-out pass mutated nothing — two passes cannot credit each other's reclaim"
+assert_contains "$OUT" "another pass is running" "the skip names the holder, not a silent no-op"
+
+ echo
 echo "── 4. a live holder: nothing evicted, and the pass refuses ──"
 H="$T/h4"
 new_cache "$H/.cache/uv" 3000 2000
@@ -250,6 +285,16 @@ assert_eq "$(kb "$H/.cache/uv")" "$UV_BEFORE" "nothing was evicted on an unprove
 assert_contains "$OUT" "ps probe could not answer" "the refusal names the probe, not a phantom holder"
 
 echo
+echo "── 5b. a PARTIAL du (numeric total, non-zero status) is not a measurement ──"
+H="$T/h5b"
+new_cache "$H/.cache/uv" 3000 2000
+UV_BEFORE="$(kb "$H/.cache/uv")"
+OUT="$(DU_STUB=1 run_reap "$H" --apply CACHE_REAP_DU="$T/bin/du-partial" 2>&1)"; RC=$?
+assert_eq "$RC" "3" "a du that exits non-zero exits 3 even though it printed a number"
+assert_eq "$(kb "$H/.cache/uv")" "$UV_BEFORE" "nothing was evicted on a measurement that only saw part of the cache"
+assert_contains "$OUT" "cannot measure" "the refusal names the measurement, not the cache"
+
+ echo
 echo "── 6. the hardlink case: cache shrank, disk did not gain a byte ──"
 H="$T/h6"
 new_cache "$H/.cache/uv" 3000 2000
@@ -282,6 +327,20 @@ assert_contains "$OUT" "under 50% of the claim" "the refusal names the reclaim r
 assert_contains "$OUT" "cloud-cell-supervisor.sh prune" "the refusal points at the owner for hardlinked venv bytes"
 
 echo
+echo "── 6d. an entry that is STILL HARDLINKED is preserved (unlinking it frees nothing) ──"
+H="$T/h6d"
+new_cache "$H/.cache/uv" 3000 2000
+mkdir -p "$H/.venv/lib"
+ln "$H/.cache/uv/entry-1/blob" "$H/.venv/lib/blob"   # a .venv that hardlinks the cache entry
+OUT="$(run_reap "$H" --apply 2>&1)"; RC=$?
+assert_eq "$RC" "3" "a cache still over its bound after preserving shared entries exits 3 (it refuses to claim a bound it did not reach)"
+[ -d "$H/.cache/uv/entry-1" ] && ok "the HARDLINKED entry was preserved — deleting it would have freed zero bytes for the hourly job to redo forever" \
+                                  || bad "the hardlinked entry was deleted: the next hourly pass would delete the next one, for nothing"
+[ ! -d "$H/.cache/uv/entry-2" ] && ok "the unshared entry was still evicted (preservation is per-entry, not per-cache)" \
+                                 || bad "the unshared entry survived, so the escalation did not run"
+assert_contains "$(cat "$H/reap.log" 2>/dev/null)" "still hardlinked" "the log says WHY that entry was kept"
+
+ echo
 echo "── 7. an unmeasurable cache fails closed ──"
 H="$T/h7"
 mkdir -p "$H/.cache"
@@ -313,19 +372,41 @@ assert_eq "$RC" "2" "an unknown argument is a usage error"
 OUT="$(bash "$REAPER" --help 2>&1)"; RC=$?
 assert_eq "$RC" "2" "--help prints usage (documented exit 2)"
 assert_contains "$OUT" "--apply" "--help documents the arming flag"
+assert_contains "$OUT" "Exit codes" "--help prints the exit codes (the contract a scheduled job is read by)"
+assert_contains "$OUT" "fail-closed" "--help names the fail-closed exit"
 
 echo
+echo "── 9b. --print-config is the ONE description of the paths and the bound ──"
+H="$T/h9b"
+mkdir -p "$H"
+OUT="$(env HOME="$H" CACHE_REAP_UV_DIR="$H/.cache/uv" CACHE_REAP_MAX_MB=2048 bash "$REAPER" --print-config 2>&1)"; RC=$?
+assert_eq "$RC" "0" "--print-config exits 0"
+assert_contains "$OUT" "bound_mb=2048" "--print-config reports the bound the reaper will enforce"
+assert_contains "$OUT" "cache=uv:$H/.cache/uv" "--print-config reports the uv cache the reaper will bound"
+assert_contains "$OUT" "cache=npm:$H/.npm/_cacache" "--print-config reports the npm cache"
+assert_contains "$OUT" "cache=pip:$H/.cache/pip" "--print-config reports the pip cache"
+assert_contains "$(cat "$BRINGUP")" "--print-config" "the cell's report reads the bound from the reaper, not from a second literal"
+
+ echo
 echo "── 10. wiring: a bound no box runs is the defect ──"
 assert_contains "$(sed -n 's/^fleet_srcs=(\(.*\))$/\1/p' "$SETUP")" "pi-cache-reap.sh" \
     "pi-bootstrap/setup.sh's farm declares pi-cache-reap.sh (it is the copy the boxes execute)"
 [ -f "$TEMPLATE" ] && ok "the launchd template exists" || bad "missing $TEMPLATE"
 assert_contains "$(cat "$TEMPLATE" 2>/dev/null)" "{{HOME}}/.pi/agent/scripts/pi-cache-reap.sh" \
     "the plist runs the FARMED script ($HOME/.pi/agent/scripts), not a ~/Documents path"
-assert_contains "$(cat "$TEMPLATE" 2>/dev/null)" "<string>--apply</string>" \
-    "the plist ships ARMED (a reporting-only job leaves the 7.1GB incident free to recur)"
+assert_contains "$(cat "$TEMPLATE" 2>/dev/null)" "<string>--dry-run</string>" \
+    "the plist ships DRY-RUN: arming a scheduled deletion is an owner-level decision (#1678 ruling)"
+assert_not_contains "$(cat "$TEMPLATE" 2>/dev/null)" "<string>--apply</string>" \
+    "the plist does NOT ship armed — a lane may not arm a deletion tool by editing a tracked template"
+assert_contains "$(cat "$TEMPLATE" 2>/dev/null)" "#1678" \
+    "the plist names the ruling it follows, so the next lane does not 'tidy' it either way"
 assert_contains "$(cat "$TEMPLATE" 2>/dev/null)" "<integer>3600</integer>" "the plist is hourly"
-assert_contains "$(cat "$ORCH" 2>/dev/null)" "pi-cache-reap.sh" \
-    "a CELL has no launchd: the controller loop names the reaper as its trigger"
+assert_contains "$(cat "$ORCH" 2>/dev/null)" "\"\$_cache_reaper\" --dry-run" \
+    "the CELL's clock also runs UNARMED (the armed arm is the supervisor's low-disk prune)"
+assert_contains "$(cat "$ORCH" 2>/dev/null)" ".cache-reap-blocked" \
+    "a fail-closed pass is recorded where the cell's status verb prints it (not only in a log)"
+assert_contains "$(cat "$SUPERVISOR" 2>/dev/null)" ".cache-reap-blocked" \
+    "the supervisor surfaces that record instead of leaving an hourly failure in a log"
 assert_contains "$(cat "$SUPERVISOR" 2>/dev/null)" "pi-cache-reap.sh" \
     "the low-disk prune remedy reaches the machine-global caches too"
 

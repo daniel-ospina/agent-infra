@@ -40,9 +40,17 @@
 #     `$CACHE/builds-v0/.tmp*` (ppid 1, hours old, never exiting — three were
 #     running on pi-cell-3), and a whole-cache veto on those is the same
 #     never-reaps non-action this script exists to remove. Anything preserved is
-#     REPORTED; nothing is ever raced.
-#   * ALWAYS ONE LINE PER CACHE, with the before/after bytes in it. A reaper whose
-#     log cannot be read at a glance is indistinguishable from one that did nothing.
+#     REPORTED. The process table is re-read IMMEDIATELY BEFORE EACH REMOVAL, not
+#     only at pass start: a resolver that starts mid-pass is invisible to a
+#     pass-start snapshot, which is the #1105 class the sibling reapers re-probe
+#     for (`pi-reap-idle.sh`: "settle re-verify BEFORE each signal uses a FRESH
+#     per-pid ps probe"). Two concurrent passes are excluded by a lock, because
+#     two passes computing free-space deltas over the same filesystem can credit
+#     each other's reclaim.
+#   * ALWAYS ONE LINE PER CACHE, with the before/after bytes in it, and exactly ONE
+#     verdict per cache. A reaper whose log cannot be read at a glance is
+#     indistinguishable from one that did nothing — and a log that says both
+#     "VERIFIED" and "STILL over bound" is worse than either.
 #   * REFUSE-TO-ACT VERIFICATION (the point of #1987's item 4). A pass that acted on
 #     a cache must PROVE the reclaim:
 #       - the cache's own size must have decreased, AND
@@ -54,54 +62,85 @@
 #     on pi-cell-3 while this script was being written: 914 MB of cache evicted,
 #     7 MB of disk gained. A pass that reports that as a success is exactly "a
 #     reaper reports success while freeing nothing", the failure mode #1987 names.
-#   * STOP DESTROYING WHAT IS NOT RECLAIMING. Two consecutive evictions with no free
-#     -space gain end the escalation. A cache is a performance asset; trading it for
-#     nothing is damage, so the pass stops and reports instead of emptying it.
+#     For the same reason an entry that still HAS another link is PRESERVED and
+#     reported: unlinking it cannot free its bytes, so deleting it would trade a
+#     performance asset for nothing. Same for an entry on another filesystem (a
+#     mount inside the cache): never delete THROUGH a mount.
+#   * STOP DESTROYING WHAT IS NOT RECLAIMING. On top of the link rule, two
+#     consecutive evictions with no free-space gain end the escalation. A cache is a
+#     performance asset; trading it for nothing is damage, so the pass stops and
+#     reports instead of emptying it.
 #   * FAIL CLOSED: a cache that cannot be MEASURED (unreadable, `du` failed, a
-#     relative/empty path) is exit 3, never a pass. Same for an unusable `ps`
-#     probe when escalation is needed. No pass may exit 0 on an unverified claim.
+#     relative/empty path) is exit 3, never a pass. `du` exiting non-zero can still
+#     print a NUMERIC PARTIAL total, so its STATUS — not just the number — decides
+#     measurability. Same for an unusable `ps` probe when escalation is needed, and
+#     for an entry whose sharing or filesystem cannot be determined. No pass may
+#     exit 0 on an unverified claim.
+#   * The cache directory is whatever the OWNING TOOL says it is (`uv cache dir`,
+#     which honours XDG_CACHE_HOME) rather than a hardcoded `$HOME` guess: bounding a
+#     directory the tool does not use is a report about a cache that does not exist.
 #
-# SCHEDULING (one owner, two triggers — deliberate, not duplicated machinery)
-#   * Mac:   templates/launchd/com.eldato.pi-cache-reap.plist (hourly, --apply).
-#   * Cell:  a Linux cell has no launchd; its only scheduler is the controller
-#            loop, which runs this hourly from scripts/orchestrator-harness/
-#            orch-loop.sh (next to its hourly claim_prune). The reaper is the
-#            single owner of the POLICY in both cases; the two triggers only
-#            decide when it runs, and a pass is idempotent and cheap when a
-#            cache is under its bound.
-#   * Operator verbs also reach it: `cloud-cell-supervisor.sh prune --caches`
-#            (the low-disk remedy, agent-infra#1745) and `cloud-cell-bringup.sh
-#            --check` (which now REPORTS the sizes, so a growing disk is visible
-#            before it stops dispatch).
+# SCHEDULING (installed by default, ARMED by the owner)
+#   * Mac:   templates/launchd/com.eldato.pi-cache-reap.plist (hourly).
+#   * Cell:  a Linux cell has no launchd; its only scheduler is the controller loop,
+#            which runs this hourly from scripts/orchestrator-harness/orch-loop.sh
+#            (next to its hourly claim_prune). The reaper owns the POLICY on both;
+#            the triggers only decide when it runs.
+#   * Both triggers ship DRY-RUN. Arming a scheduled DELETION is an owner-level
+#     consequence decision — agent-infra#1678, owner ruling 2026-10-11: "the reaper
+#     may run unattended; arming it may not", and "Arming a deletion tool must not
+#     be reachable by a lane at all". Every sibling reaper (`pi-reap-worktrees`,
+#     `pi-task-session-prune`) ships unarmed for the same reason. Arming is one
+#     argument in the plist (or one env var, CACHE_REAP_APPLY=1) plus a re-run of
+#     scripts/install-launchd.sh — a dated, reversible, owner-owned step.
+#   * The destructive path a CELL still reaches automatically is the pre-existing
+#     low-disk emergency one: `cloud-cell-supervisor.sh` calls `prune --caches`
+#     unattended when free space falls under 2x MIN_FREE_MB (no live worker), and
+#     `prune --caches` delegates here with --apply. That is not new arming — it is
+#     the existing emergency delete path, extended to a sink that is strictly safer
+#     to reclaim than the `.venv` trees it already removes (regenerable, unowned,
+#     no uncommitted work). The operator verb `cloud-cell-supervisor.sh prune
+#     --caches` reaches the same arm, and `cloud-cell-bringup.sh --check` REPORTS
+#     every cache size (with the bound), so a growing disk is visible before it
+#     stops dispatch.
 #
 # Usage:
-#   pi-cache-reap.sh [--dry-run] [--apply] [--help]
+#   pi-cache-reap.sh [--dry-run] [--apply] [--print-config] [--help]
 #
 #   (no mode flag)  dry-run: measure + report what WOULD be done, mutate nothing
-#   --dry-run       explicit dry-run
-#   --apply         armed pass (or env CACHE_REAP_APPLY=1)
+#   --dry-run       explicit dry-run (wins over CACHE_REAP_APPLY=1)
+#   --apply         armed pass (CACHE_REAP_APPLY=1 supplies the default mode only)
+#   --print-config  print `bound_mb=<n>` and `cache=<class>:<path>` for each sink,
+#                   as the reaper resolves them (the supervisor/bringup report reads
+#                   this instead of keeping its own copy of the paths and the bound)
 #   --help          this text
 #
 # Env seams (also the test suite's):
 #   CACHE_REAP_MAX_MB     per-cache ceiling in MiB (default 2048)
-#   CACHE_REAP_UV_DIR     uv cache dir      (default $UV_CACHE_DIR, else $HOME/.cache/uv)
+#   CACHE_REAP_UV_DIR     uv cache dir      (default: `uv cache dir`, else $UV_CACHE_DIR,
+#                         else $HOME/.cache/uv)
 #   CACHE_REAP_NPM_DIR    npm cacache dir   (default $HOME/.npm/_cacache)
 #   CACHE_REAP_PIP_DIR    pip cache dir     (default $HOME/.cache/pip; the macOS
 #                         ~/Library/Caches/pip is probed as a second candidate)
-#   CACHE_REAP_APPLY      "1" arms the pass (equivalent to --apply)
+#   CACHE_REAP_APPLY      "1" arms the pass (a default: explicit flags still win)
 #   CACHE_REAP_MIN_RECLAIM_PCT  share of the claimed reduction that must appear as
 #                         free disk before a pass counts as verified (default 50)
 #   CACHE_REAP_LOG        pass log (default $HOME/.pi/agent/state/pi-cache-reap.log)
 #   CACHE_REAP_LOG_MAX_BYTES  rotate the log past this size (default 1 MiB)
+#   CACHE_REAP_LOCK       pass lock dir (default $HOME/.pi/agent/state/pi-cache-reap.lock)
+#   CACHE_REAP_LOCK_STALE_SECONDS  break a lock older than this (default 3600)
 #   CACHE_REAP_PS         ps binary  (default /bin/ps)
 #   CACHE_REAP_DF         df binary  (default df)
+#   CACHE_REAP_DU         du binary  (default du)
 #   CACHE_REAP_UV/NPM/PIP the tool binaries used for the PRUNE step
 #   CACHE_REAP_PIP_DIR_MAC  the macOS pip cache candidate (default
 #                         $HOME/Library/Caches/pip)
 #
-# Exit codes: 0 bounded / reclaim verified · 2 usage · 3 fail-closed (the cache could
-# not be measured, a live tool run made eviction unsafe, or the reclaim could not be
-# verified).
+# Exit codes: 0 bounded / reclaim verified / nothing to do (incl. a pass skipped
+# because another one holds the lock) · 2 usage · 3 fail-closed (the cache could not
+# be measured, an entry's sharing or filesystem could not be determined, a live tool
+# run made eviction unsafe, or the reclaim could not be verified).
+# ── usage end ──
 
 set -uo pipefail
 
@@ -112,18 +151,26 @@ TAB="$(printf '\t')"
 MAX_MB="${CACHE_REAP_MAX_MB:-2048}"
 PS_BIN="${CACHE_REAP_PS:-/bin/ps}"
 DF_BIN="${CACHE_REAP_DF:-df}"
+DU_BIN="${CACHE_REAP_DU:-du}"
 UV_BIN="${CACHE_REAP_UV:-uv}"
 NPM_BIN="${CACHE_REAP_NPM:-npm}"
 PIP_BIN="${CACHE_REAP_PIP:-pip}"
-LOG="${CACHE_REAP_LOG:-${HOME:-}/.pi/agent/state/pi-cache-reap.log}"
+STATE_DIR="${HOME:-}/.pi/agent/state"
+LOG="${CACHE_REAP_LOG:-$STATE_DIR/pi-cache-reap.log}"
 LOG_MAX_BYTES="${CACHE_REAP_LOG_MAX_BYTES:-1048576}"
+LOCK_DIR="${CACHE_REAP_LOCK:-$STATE_DIR/pi-cache-reap.lock}"
+LOCK_STALE_SECONDS="${CACHE_REAP_LOCK_STALE_SECONDS:-3600}"
 
 MODE=dry-run
+MODE_SET=0
+PRINT_CONFIG=0
 FAILS=0
+LOCK_HELD=0
 TMPLIST=""
+TMPLIST2=""
 
 usage() {
-    sed -n '/^# Usage:/,/^# Exit codes:/p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '/^# Usage:/,/^# ── usage end ──/p' "$0" | sed 's/^# \{0,1\}//' | sed '$d'
     exit 2
 }
 
@@ -142,14 +189,32 @@ fail_closed() {
     say "pi-cache-reap: FAIL-CLOSED — $*"
 }
 
-cleanup() { [ -n "$TMPLIST" ] && rm -f "$TMPLIST"; }
+now_epoch() { date +%s 2>/dev/null; }
+is_pos_int() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; esac; return 0; }
+
+cleanup() {
+    [ -n "$TMPLIST" ] && rm -f "$TMPLIST"
+    [ -n "$TMPLIST2" ] && rm -f "$TMPLIST2"
+}
 trap cleanup EXIT
 
-# kb_of <dir> — size of <dir> in KiB on stdout; non-zero (and nothing usable) when
-# it cannot be MEASURED. Callers must treat that as fail-closed, never as 0.
+# kb_of <dir> — size of <dir> in KiB on stdout; non-zero when it cannot be
+# MEASURED. ⛔ The `du` STATUS decides, not just the printed number: a `du` that
+# cannot read a subdirectory still prints a NUMERIC PARTIAL total (measured: a
+# 3016 KiB tree with one mode-000 subdir prints `16` and exits 1). Accepting that
+# number reports a cache as bounded when most of it was never seen — the exact
+# false PASS this script exists to remove. One retry, because a live cache can
+# legitimately lose an entry mid-walk.
 kb_of() {
-    local kb
-    kb="$(du -sk "$1" 2>/dev/null | awk 'NR==1 {print $1}')"
+    local kb try=0
+    while :; do
+        kb="$("$DU_BIN" -sk "$1" 2>/dev/null | awk 'NR==1 {print $1}')" || {
+            try=$((try + 1))
+            [ "$try" -lt 2 ] && continue
+            return 1
+        }
+        break
+    done
     case "${kb:-}" in
         ''|*[!0-9]*) return 1 ;;
     esac
@@ -181,35 +246,48 @@ tool_of() {
 # prune_cache <class> <dir> — the SAFE half: ask the owning tool to drop entries
 # nothing references. Never fatal: a tool that is absent, or that fails, only
 # means the cache is still over its bound, which the caller checks anyway.
+# rc 0 = pruned · 1 = the tool is not available · 2 = the tool ran and failed.
+# The three are LOGGED SEPARATELY: "prune=none" used to conflate "uv is not on this
+# job's PATH" with "pip has no safe half", and the first of those silently skips the
+# safe half and goes straight to entry removal.
 # The tool is pointed at THE DIRECTORY THIS PASS MEASURED (UV_CACHE_DIR / --cache),
 # so pruning can never hit a different cache than the one being bounded.
 prune_cache() {
-    local class="$1" dir="$2" tool out
+    local class="$1" dir="$2" tool out rc
     tool="$(tool_of "$class")"
     case "$class" in
+        uv|npm) ;;
+        *)
+            # pip has no unused-entry prune (`pip cache purge` is the whole-cache
+            # delete, i.e. the ESCALATION arm). Nothing to do safely — not a failure.
+            return 1 ;;
+    esac
+    if [ -z "$tool" ] || ! command -v "$tool" >/dev/null 2>&1; then
+        plog "pi-cache-reap:   prune($class): '${tool:-?}' is NOT on PATH (${PATH:-}) — the safe half is unavailable, only the escalation arm can act"
+        return 1
+    fi
+    case "$class" in
         uv)
-            [ -n "$tool" ] || return 1
-            command -v "$tool" >/dev/null 2>&1 || return 1
-            out="$(UV_CACHE_DIR="$dir" "$tool" cache prune 2>&1)" || { plog "pi-cache-reap:   prune($class) failed: ${out:-no output}"; return 1; }
-            return 0 ;;
+            # UV_LOCK_TIMEOUT bounds uv's own wait for a concurrent uv to release the
+            # cache lock (vendor-documented 5 min default). Unbounded, a synchronous
+            # `prune --caches` on a busy box stalls before it reports anything.
+            out="$(UV_CACHE_DIR="$dir" UV_LOCK_TIMEOUT=30 "$tool" cache prune 2>&1)"; rc=$? ;;
         npm)
-            [ -n "$tool" ] || return 1
-            command -v "$tool" >/dev/null 2>&1 || return 1
             # npm's cache ROOT is the parent of `_cacache`; point --cache at whichever
             # of the two this pass was given, so prune and measure cannot disagree.
             case "$(basename "$dir")" in
-                _cacache) out="$("$tool" cache verify --cache "$(dirname "$dir")" 2>&1)" ;;
-                *)        out="$("$tool" cache verify --cache "$dir" 2>&1)" ;;
-            esac || { plog "pi-cache-reap:   prune($class) failed: ${out:-no output}"; return 1; }
-            return 0 ;;
-        *)
-            # pip has no unused-entry prune (`pip cache purge` is the whole-cache
-            # delete, i.e. the ESCALATION arm). Nothing to do safely.
-            return 1 ;;
+                _cacache) out="$("$tool" cache verify --cache "$(dirname "$dir")" 2>&1)"; rc=$? ;;
+                *)        out="$("$tool" cache verify --cache "$dir" 2>&1)"; rc=$? ;;
+            esac ;;
     esac
+    if [ "$rc" -ne 0 ]; then
+        plog "pi-cache-reap:   prune($class) failed (rc=$rc): ${out:-no output}"
+        return 2
+    fi
+    return 0
 }
 
-# ── process table: ONE read per pass ─────────────────────────────────
+# ── process table ─────────────────────────────────────────────────────
 # MEASURED ON THE INCIDENT BOX (pi-cell-3, 2026-10-16): `uv` LEAKS its build-backend
 # processes — three `python -c 'import setuptools.build_meta'` children running inside
 # `$UV_CACHE/builds-v0/.tmpXXXX`, ppid 1, 4-8 hours old. They will never exit. A probe
@@ -231,7 +309,7 @@ ps_snapshot() {
 
 # ps_matches <tool|dir> <class> <dir> — snapshot lines that could hold this cache.
 # rc 0 = at least one line on stdout, 1 = none, 2 = no usable snapshot.
-# ⛔ This runs against the SNAPSHOT taken before any probe process existed, so the
+# ⛔ This runs against a SNAPSHOT taken before the probe process existed, so the
 # scanner can never match itself (a `grep` whose argv holds the cache path would
 # otherwise make every pass report a phantom holder).
 # ⛔ The tool match is on the EXECUTABLE (argv[0], or the token after `/usr/bin/env`),
@@ -240,8 +318,12 @@ ps_snapshot() {
 # which refused escalation on a box with no uv running at all (measured while writing
 # this script). The exec test still catches every real case: `uv sync`, `uv run …`,
 # `/usr/bin/env UV_CACHE_DIR=… uv …`.
+# ⛔ The entry match is `index()` — a LITERAL substring test. A sed-escaped ERE broke on
+# any path carrying `+ ? ( ) { } |`: `/tmp/a+work/.cache/uv` became `a+work` under ERE
+# (a quantifier), matched nothing, so a live process's entry was deleted and the pass
+# reported VERIFIED (measured control pair, one character apart).
 ps_matches() {
-    local kind="$1" class="$2" dir="$3" pat
+    local kind="$1" class="$2" dir="$3"
     [ -n "$PS_SNAP" ] || return 2
     case "$kind" in
         tool)
@@ -259,35 +341,70 @@ ps_matches() {
                 }'
             return 0 ;;
         dir)
-            pat="$(printf '%s' "$dir" | sed 's/[][\.*^$/]/\\&/g')"
-            printf '%s\n' "$PS_SNAP" | awk -v me="$$" '$1 != me' | grep -E -e "$pat"
+            printf '%s\n' "$PS_SNAP" | awk -v me="$$" -v d="$dir" '$1 != me && index($0, d) { print }'
             return 0 ;;
         *) return 2 ;;
     esac
 }
 
-# entries_by_size <dir> — every top-level entry of <dir>, largest first, as
-# "<KiB><TAB><path>" lines. No recursive walk: only the cache's OWN top level is
-# enumerated (uv: archive-v0/builds-v0/wheels-v3/…; npm: content-v2/index-v5/…;
+# dev_of <path> — the device id owning <path> (stat's portable spelling differs by OS).
+dev_of() {
+    local d
+    d="$(stat -c %d "$1" 2>/dev/null)" || d="$(stat -f %d "$1" 2>/dev/null)" || return 1
+    case "${d:-}" in ''|*[!0-9]*) return 1 ;; esac
+    printf '%s' "$d"
+}
+
+# same_device <entry> <cache-dir> — rc 0 same fs · rc 1 different fs (a MOUNT inside
+# the cache) · rc 2 undecidable. Never delete THROUGH a mount: `rm -rf` on a bind/FUSE
+# mount point inside the cache recurses into whatever is mounted there.
+same_device() {
+    local a b
+    a="$(dev_of "$1")" || return 2
+    b="$(dev_of "$2")" || return 2
+    [ "$a" = "$b" ] && return 0
+    return 1
+}
+
+# shared_file_in <entry> — rc 0 = an entry file still has another link (stdout: that
+# file) · rc 1 = nothing in the entry is hardlinked · rc 2 = could not be determined.
+# PRESERVING a shared entry is the point: a uv cache entry is hardlinked into every
+# `.venv` built from it, so unlinking the cache name frees NO bytes (measured: 914MB
+# evicted, 7MB gained). Deterministic, unlike a "stop after N non-reclaiming deletes"
+# heuristic — and it cannot be reset by the next hourly pass.
+shared_file_in() {
+    local f
+    f="$(find "$1" -type f -links +1 -print -quit 2>/dev/null)" || return 2
+    [ -n "$f" ] || return 1
+    printf '%s' "$f"
+}
+
+# entries_by_size <dir> <outfile> — every top-level entry of <dir>, largest first, as
+# "<KiB><TAB><path>" lines in <outfile>. No recursive walk: only the cache's OWN top
+# level is enumerated (uv: archive-v0/builds-v0/wheels-v3/…; npm: content-v2/index-v5/…;
 # pip: http-v2/wheels/…), and `du` walks each entry once. Symlinked entries are
 # SKIPPED — a planted `$CACHE/x -> ~/.ssh` must never reach a delete path.
+# rc 1 when an entry cannot be measured: an unmeasurable entry must fail the pass, not
+# silently sort last as size 0 (which is how a 3MB subdirectory became "16KB").
 entries_by_size() {
-    local dir="$1" e kb
+    local dir="$1" out="$2" e kb
     : >"$TMPLIST"
     for e in "$dir"/* "$dir"/.[!.]*; do
         [ -e "$e" ] || continue
         [ -L "$e" ] && { plog "pi-cache-reap:   skip symlinked entry $e"; continue; }
-        kb="$(kb_of "$e")" || kb=0
+        kb="$(kb_of "$e")" || { plog "pi-cache-reap:   cannot measure entry $e — refusing to size it as 0"; return 1; }
         printf '%s\t%s\n' "$kb" "$e" >>"$TMPLIST"
     done
-    sort -rn -k1,1 "$TMPLIST"
+    sort -rn -k1,1 "$TMPLIST" >"$out"
+    return 0
 }
 
-# reap_target <class> <dir> — bound ONE cache. Prints exactly one summary line.
+# reap_target <class> <dir> — bound ONE cache. Prints exactly one verdict line.
 reap_target() {
     local class="$1" dir="$2" before_kb before_free_kb now_kb new_kb after_kb after_free_kb
-    local pruned=none evicted=0 kb e cur_free holders dir_holders held_entries rc
+    local pruned=none evicted=0 kb e cur_free holders dir_holders held_entries="" keep_entries=""
     local no_gain_stop=0 no_gain=0 last_free="" claimed_kb gained_kb min_gain_kb stop_note=""
+    local dev_rc share_rc fresh_holders free_str
 
     case "$dir" in
         /*) ;;
@@ -314,7 +431,12 @@ reap_target() {
     fi
 
     # ── (1) the safe half ────────────────────────────────────────────────────
-    if prune_cache "$class" "$dir"; then pruned=ok; else pruned=none; fi
+    prune_cache "$class" "$dir"
+    case $? in
+        0) pruned=ok ;;
+        2) pruned=failed ;;
+        *) pruned=unavailable ;;
+    esac
     now_kb="$(kb_of "$dir")" \
         || { fail_closed "$class: cannot measure $dir after the prune — the shrink cannot be verified"; return 0; }
 
@@ -324,32 +446,56 @@ reap_target() {
         holders="$(ps_matches tool "$class" "$dir")" \
             || { fail_closed "$class: $dir is $(mb_str "$now_kb") > ${MAX_MB}MB and the ps probe could not answer — NOT escalating an unproven cache"; return 0; }
         if [ -n "$holders" ]; then
-            fail_closed "$class: $dir is $(mb_str "$now_kb") > ${MAX_MB}MB and a live $class process is running, so the entries it holds cannot be known — NOT escalating; process(es): $holders"
+            fail_closed "$class: $dir is $(mb_str "$now_kb") > ${MAX_MB}MB and a live $class process is running, so the entries it holds cannot be known — NOT escalating; process(es): $holders (the cache is shared, so any live $class on this box may be resolving against it)"
             return 0
         fi
-        # Entry-level holders: a process whose argv NAMES an entry keeps that entry.
-        dir_holders="$(ps_matches dir "$class" "$dir" || true)"
-        held_entries=""
-        # ⛔ STOP DESTROYING WHEN DELETION STOPS RECLAIMING. A uv cache entry is HARDLINKED into
-        # every `.venv` built from it, so unlinking it can free nothing while the cache's apparent
-        # size drops by hundreds of MB — MEASURED on pi-cell-3: evicting 914MB of cache gained 7MB
-        # of disk. Two consecutive evictions with no free-space gain means the remaining entries are
-        # shared, and continuing would trade a perf asset for nothing. Stop and report instead.
+        if ! entries_by_size "$dir" "$TMPLIST2"; then
+            fail_closed "$class: $dir is $(mb_str "$now_kb") > ${MAX_MB}MB but one of its entries could not be measured — refusing to evict a cache we cannot size"
+            return 0
+        fi
+        # ⛔ STOP DESTROYING WHEN DELETION STOPS RECLAIMING. Two mechanisms, because they
+        # catch different things: (a) a shared entry is PRESERVED (see shared_file_in) so
+        # the hourly clock cannot re-delete what frees nothing; (b) if plain deletes still
+        # reclaim nothing, two in a row end the escalation.
         no_gain_stop=0; no_gain=0; last_free="${before_free_kb:-}"
         while IFS="$TAB" read -r kb e; do
             [ -n "${e:-}" ] || continue
             [ "$now_kb" -gt "$MAX_KB" ] || break
-            if [ -n "$dir_holders" ] && grep -qF -- "$e" <<<"$dir_holders"; then
+            # ── the ACT-POINT re-probe (a resolver spawned mid-pass is invisible to the
+            #    pass-start snapshot; #1105 is that class in the sibling reaper) ──
+            ps_snapshot || { fail_closed "$class: the ps probe could not answer immediately before removing $e — NOT deleting an unproven entry"; break; }
+            if [ -n "$(ps_matches tool "$class" "$dir" || true)" ]; then
+                fail_closed "$class: a $class process started during this pass — stopping before $e (the entries it holds cannot be known)"
+                break
+            fi
+            fresh_holders="$(ps_matches dir "$class" "$dir" || true)"
+            if [ -n "$fresh_holders" ] && grep -qF -- "$e" <<<"$fresh_holders"; then
                 held_entries="${held_entries:+$held_entries, }$e"
                 plog "pi-cache-reap:   preserving $e — a live process names it"
                 continue
+            fi
+            same_device "$e" "$dir"; dev_rc=$?
+            if [ "$dev_rc" -eq 1 ]; then
+                keep_entries="${keep_entries:+$keep_entries, }$e"
+                plog "pi-cache-reap:   preserving $e — a different filesystem (mount point inside the cache); nothing is deleted THROUGH a mount"
+                continue
+            elif [ "$dev_rc" -ne 0 ]; then
+                fail_closed "$class: cannot determine the filesystem holding $e — refusing to delete an entry that may be a mount"
+                break
+            fi
+            shared_file_in "$e"; share_rc=$?
+            if [ "$share_rc" -eq 0 ]; then
+                keep_entries="${keep_entries:+$keep_entries, }$e"
+                plog "pi-cache-reap:   preserving $e — still hardlinked (another name holds these bytes, so unlinking this one frees nothing)"
+                continue
+            elif [ "$share_rc" -ne 1 ]; then
+                fail_closed "$class: cannot determine whether $e is still hardlinked — refusing to delete an entry that may free nothing"
+                break
             fi
             if rm -rf -- "$e" 2>/dev/null; then
                 evicted=$((evicted + 1))
                 # Re-measure the WHOLE cache, not the entry: an entry can be a directory
                 # holding more than `du` charged to its own top level (block rounding).
-                # A failed re-measure keeps the last good value — the verification below
-                # governs the verdict, so a stale number can only make it stricter.
                 if new_kb="$(kb_of "$dir")"; then now_kb="$new_kb"; fi
                 cur_free="$(free_kb "$dir")"
                 if [ -n "$last_free" ] && [ -n "$cur_free" ]; then
@@ -364,7 +510,7 @@ reap_target() {
             else
                 plog "pi-cache-reap:   could not remove $e"
             fi
-        done < <(entries_by_size "$dir")
+        done <"$TMPLIST2"
     fi
 
     # ── (3) verify — a pass that acted must PROVE the shrink ─────────────────
@@ -381,15 +527,26 @@ reap_target() {
             fail_closed "$class: $dir shrank $(mb_str "$before_kb") -> $(mb_str "$after_kb") but free space could not be read before and after (df) — the bytes actually freed are NOT verified (the entries may be hardlinked into live .venv trees)"
             return 0 ;;
     esac
+
+    # ⛔ ONE VERDICT PER CACHE: the still-over-bound check comes BEFORE the success line.
+    # Printing "VERIFIED" and then "FAIL-CLOSED … STILL over bound" leaves a log in which
+    # `grep VERIFIED` reports a cache that was never bounded.
+    if [ "$after_kb" -gt "$MAX_KB" ]; then
+        free_str="could not be read"
+        [ -n "${after_free_kb:-}" ] && free_str="$(mb_str "$after_free_kb")"
+        fail_closed "$class: $dir was $(mb_str "$before_kb") -> $(mb_str "$after_kb") after evicting every removable entry (prune=$pruned evicted=$evicted) — still over the ${MAX_MB}MB bound; free $(mb_str "${before_free_kb:-0}") -> $free_str${held_entries:+ — PRESERVED because a live process names them: $held_entries}${keep_entries:+ — preserved: $keep_entries}${stop_note}"
+        return 0
+    fi
+
     if [ "$after_free_kb" -le "$before_free_kb" ]; then
         fail_closed "$class: $dir shrank $(mb_str "$before_kb") -> $(mb_str "$after_kb") but the filesystem did NOT gain free space ($(mb_str "$before_free_kb") -> $(mb_str "$after_free_kb")) — the entries are still holding their bytes elsewhere (hardlinked into a .venv); nothing was actually freed. The owner for those bytes is the per-worktree sweep: cloud-cell-supervisor.sh prune${stop_note}"
         return 0
     fi
-    # The disk gain must be a real fraction of what the cache claims to have given up. A 1:100
-    # gain is the incident's own failure mode wearing a success line: MEASURED on pi-cell-3 after
-    # this arm landed — 914MB of cache evicted, 7MB of disk gained, because the entries were
-    # hardlinked into that box's worktree `.venv`s. Tunable, because a busy box can legitimately
-    # write while the pass runs.
+    # The disk gain must be a real fraction of what the cache claims to have given up. A
+    # 1:100 gain is the incident's own failure mode wearing a success line: MEASURED on
+    # pi-cell-3 after this arm landed — 914MB of cache evicted, 7MB of disk gained,
+    # because the entries were hardlinked into that box's worktree `.venv`s. Tunable,
+    # because a busy box can legitimately write while the pass runs.
     claimed_kb=$(( before_kb - after_kb ))
     gained_kb=$(( after_free_kb - before_free_kb ))
     min_gain_kb=$(( claimed_kb * MIN_RECLAIM_PCT / 100 ))
@@ -398,11 +555,7 @@ reap_target() {
         return 0
     fi
 
-    say "pi-cache-reap: $class $dir $(mb_str "$before_kb") -> $(mb_str "$after_kb") (prune=$pruned evicted=$evicted) max=${MAX_MB}MB; free $(mb_str "$before_free_kb") -> $(mb_str "$after_free_kb") (+$(mb_str "$gained_kb")) VERIFIED${stop_note}"
-
-    if [ "$after_kb" -gt "$MAX_KB" ]; then
-        fail_closed "$class: $dir is STILL $(mb_str "$after_kb") > ${MAX_MB}MB after evicting every removable entry${held_entries:+ — PRESERVED because a live process names them: $held_entries}"
-    fi
+    say "pi-cache-reap: $class $dir $(mb_str "$before_kb") -> $(mb_str "$after_kb") (prune=$pruned evicted=$evicted) max=${MAX_MB}MB; free $(mb_str "$before_free_kb") -> $(mb_str "$after_free_kb") (+$(mb_str "$gained_kb")) VERIFIED${keep_entries:+ (preserved: $keep_entries)}${stop_note}"
     return 0
 }
 
@@ -417,19 +570,86 @@ cap_log() {
     mv -f "$LOG" "$LOG.1" 2>/dev/null || true
 }
 
+# ── lock (macOS has no flock) ────────────────────────────────────────────────
+# TWO CLOCKS EXIST ON A MAC: the launchd job and the orchestrator harness both run
+# this script (`install.sh` is macOS-only and orch-loop is what deploy-mac-orchestrator
+# runs). The version of this script that relied on "each platform has one clock" let two
+# --apply passes measure the same free-space delta, so one could print VERIFIED for a
+# shrink the other performed. Same shape as pi-reap-worktrees.sh:425.
+lock_release() {
+    if [ "$LOCK_HELD" = 1 ]; then rm -rf "$LOCK_DIR" 2>/dev/null || true; LOCK_HELD=0; fi
+    return 0
+}
+lock_acquire() {
+    local owner started now age mtime
+    mkdir -p "$(dirname "$LOCK_DIR")" 2>/dev/null || true
+    if [ -d "$LOCK_DIR" ]; then
+        owner="$(cat "$LOCK_DIR/owner" 2>/dev/null || printf '')"
+        started="$(cat "$LOCK_DIR/started" 2>/dev/null || printf '')"
+        now="$(now_epoch)"
+        # A missing/corrupt owner or start stamp must NOT read as "stale": the window
+        # between `mkdir` and the owner write is real, and treating it as stale let two
+        # passes run concurrently in pi-reap-worktrees. Unknown age => not stale.
+        age=""
+        if is_pos_int "$started" && is_pos_int "$now" && [ "$now" -ge "$started" ]; then
+            age=$(( now - started ))
+        else
+            mtime="$(/bin/date -r "$LOCK_DIR" +%s 2>/dev/null || printf '')"
+            if is_pos_int "$mtime" && is_pos_int "$now" && [ "$now" -ge "$mtime" ]; then
+                age=$(( now - mtime ))
+            fi
+        fi
+        [ -n "$age" ] || age=0
+        if is_pos_int "$owner" && kill -0 "$owner" 2>/dev/null && [ "$age" -lt "$LOCK_STALE_SECONDS" ]; then
+            say "pi-cache-reap: another pass is running (pid $owner, ${age}s) — this one does not run ($ISSUE_REF)"
+            return 1
+        fi
+        if [ "$age" -lt "$LOCK_STALE_SECONDS" ]; then
+            say "pi-cache-reap: lock held (owner=${owner:-?} age ${age}s, owner unverifiable) — this pass does not run"
+            return 1
+        fi
+        plog "pi-cache-reap: breaking a stale lock (owner=${owner:-?} age=${age}s)"
+        rm -rf "$LOCK_DIR" 2>/dev/null || true
+    fi
+    if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+        say "pi-cache-reap: lock raced with another pass — this one does not run"
+        return 1
+    fi
+    printf '%s\n' "$$" >"$LOCK_DIR/owner" 2>/dev/null || true
+    printf '%s\n' "$(now_epoch)" >"$LOCK_DIR/started" 2>/dev/null || true
+    LOCK_HELD=1
+    return 0
+}
+
 # ── arguments ────────────────────────────────────────────────────────────────
 for a in "$@"; do
     case "$a" in
-        --dry-run) MODE=dry-run ;;
-        --apply) MODE=apply ;;
+        --dry-run) MODE=dry-run; MODE_SET=1 ;;
+        --apply) MODE=apply; MODE_SET=1 ;;
+        --print-config) PRINT_CONFIG=1 ;;
         --help|-h) usage ;;
         *) printf '%s: unknown argument %s\n' "$SCRIPT_NAME" "$a" >&2; usage ;;
     esac
 done
-[ "${CACHE_REAP_APPLY:-0}" = "1" ] && MODE=apply
+# ⛔ An explicit flag wins. `CACHE_REAP_APPLY=1` is a DEFAULT (arm this machine in a
+# shell profile), so `CACHE_REAP_APPLY=1 pi-cache-reap.sh --dry-run` must inspect and
+# mutate nothing — the previous order (env last) turned that inspection into the
+# destructive pass it was meant to preview.
+if [ "$MODE_SET" -eq 0 ] && [ "${CACHE_REAP_APPLY:-0}" = "1" ]; then MODE=apply; fi
+
+# The log dir is created BEFORE validation so a rejected bound still leaves a trace:
+# the launchd job captures no stderr, so a typo'd CACHE_REAP_MAX_MB would otherwise mint
+# an hourly timer that is dead and invisible.
+if [ -n "$LOG" ]; then
+    mkdir -p "$(dirname "$LOG")" 2>/dev/null || LOG=""
+fi
 
 case "${MAX_MB:-}" in
-    ''|*[!0-9]*|0*) printf '%s: CACHE_REAP_MAX_MB must be a positive whole number of MiB (got %s)\n' "$SCRIPT_NAME" "${MAX_MB:-}" >&2; exit 2 ;;
+    ''|*[!0-9]*|0*)
+        msg="$SCRIPT_NAME: CACHE_REAP_MAX_MB must be a positive whole number of MiB (got ${MAX_MB:-})"
+        printf '%s\n' "$msg" >&2
+        [ -n "$LOG" ] && printf '%s\n' "$msg" >>"$LOG" 2>/dev/null
+        exit 2 ;;
 esac
 MAX_KB=$(( 10#$MAX_MB * 1024 ))
 # The share of the claimed reduction that must actually appear as free disk (#1987 item 4).
@@ -437,16 +657,45 @@ MIN_RECLAIM_PCT="${CACHE_REAP_MIN_RECLAIM_PCT:-50}"
 case "$MIN_RECLAIM_PCT" in ''|*[!0-9]*) MIN_RECLAIM_PCT=50 ;; esac
 [ "$MIN_RECLAIM_PCT" -le 100 ] || MIN_RECLAIM_PCT=100
 
-if [ -n "$LOG" ]; then
-    mkdir -p "$(dirname "$LOG")" 2>/dev/null || LOG=""
-fi
-TMPLIST="$(mktemp "${TMPDIR:-/tmp}/pi-cache-reap.XXXXXX")" || { printf '%s: cannot create a temp file\n' "$SCRIPT_NAME" >&2; exit 3; }
-
 # ── the sinks (uv, npm, pip — the same class of machine-global sink) ─────────
-UVD="${CACHE_REAP_UV_DIR:-${UV_CACHE_DIR:-${HOME:-}/.cache/uv}}"
+# uv's OWN answer is authoritative: `uv cache dir` honours XDG_CACHE_HOME and the tool's
+# own resolution. A hardcoded `$HOME/.cache/uv` bounded a directory uv may not even use
+# (measured: with XDG_CACHE_HOME set, uv's cache is $XDG_CACHE_HOME/uv — the old path
+# reported "absent" and the pass exited 0 while 2.9MB sat over bound at the real one).
+resolve_uv_dir() {
+    local d
+    if [ -n "${CACHE_REAP_UV_DIR:-}" ]; then printf '%s' "$CACHE_REAP_UV_DIR"; return 0; fi
+    if command -v "$UV_BIN" >/dev/null 2>&1; then
+        d="$("$UV_BIN" cache dir 2>/dev/null)"
+        case "${d:-}" in /*) printf '%s' "$d"; return 0 ;; esac
+    fi
+    printf '%s' "${UV_CACHE_DIR:-${HOME:-}/.cache/uv}"
+}
+
+UVD="$(resolve_uv_dir)"
 NPMD="${CACHE_REAP_NPM_DIR:-${HOME:-}/.npm/_cacache}"
 PIPD="${CACHE_REAP_PIP_DIR:-${HOME:-}/.cache/pip}"
 PIPD_MAC="${CACHE_REAP_PIP_DIR_MAC:-${HOME:-}/Library/Caches/pip}"
+
+# --print-config: the ONE place that knows the paths and the bound. The bring-up report
+# and the supervisor's remedy line read this instead of keeping their own copies, which
+# is how a tuned bound ends up disagreeing with the report about the same cache.
+if [ "$PRINT_CONFIG" = 1 ]; then
+    printf 'bound_mb=%s\n' "$MAX_MB"
+    printf 'cache=uv:%s\n' "$UVD"
+    printf 'cache=npm:%s\n' "$NPMD"
+    printf 'cache=pip:%s\n' "$PIPD"
+    [ "$PIPD_MAC" = "$PIPD" ] || printf 'cache=pip:%s\n' "$PIPD_MAC"
+    exit 0
+fi
+
+TMPLIST="$(mktemp "${TMPDIR:-/tmp}/pi-cache-reap.XXXXXX")" || { printf '%s: cannot create a temp file\n' "$SCRIPT_NAME" >&2; exit 3; }
+TMPLIST2="$(mktemp "${TMPDIR:-/tmp}/pi-cache-reap.XXXXXX")" || { printf '%s: cannot create a temp file\n' "$SCRIPT_NAME" >&2; exit 3; }
+
+if ! lock_acquire; then
+    exit 0
+fi
+trap 'cleanup; lock_release' EXIT
 
 say "pi-cache-reap: pass start mode=$MODE max=${MAX_MB}MB per cache ($ISSUE_REF)"
 reap_target uv "$UVD"

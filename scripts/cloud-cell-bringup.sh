@@ -441,24 +441,59 @@ check_operational_layer() {
 # that is working fine on a large disk. Measured on pi-cell-3: 258MB free, `~/.cache/uv` alone
 # 7.1GB — every dispatch refused, and nothing on the box reported the cache as the cause.
 check_caches() {
-  local d kb total=0 listed="" maxmb bound over=0
-  maxmb="${CACHE_REAP_MAX_MB:-2048}"
+  local d kb total=0 listed="" maxmb=2048 bound over=0 measured du_rc cfg line reaper
+  # A NEWLINE-SEPARATED list, not an array: bash 3.2 (the macOS default) treats `${#arr[@]}` on an
+  # empty array as an unbound-variable error under `set -u`.
+  local dirs_list=""
+  # The reaper is the ONE place that knows WHERE the caches are and WHAT the bound is. Two reasons
+  # (agent-infra#1987): `uv cache dir` honours XDG_CACHE_HOME, so a literal `$HOME/.cache/uv` here
+  # can report "absent" for a box whose uv cache is 3GB elsewhere; and a tuned bound must not leave
+  # this report describing a different policy than the one enforced.
+  reaper=""
+  for d in "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/pi-cache-reap.sh" \
+           "${HOME:-}/.pi/agent/scripts/pi-cache-reap.sh"; do
+    [ -n "$d" ] && [ -f "$d" ] && { reaper="$d"; break; }
+  done
+  cfg=""
+  if [ -n "$reaper" ]; then
+    cfg="$(bash "$reaper" --print-config 2>/dev/null)" || cfg=""
+    line="$(printf '%s\n' "$cfg" | sed -n 's/^bound_mb=//p' | head -1)"
+    case "$line" in
+      ''|*[!0-9]*|0*) ;;
+      *) maxmb="$line" ;;
+    esac
+    while IFS= read -r line; do
+      case "$line" in cache=*) dirs_list="$dirs_list${dirs_list:+
+}${line#cache=*:}" ;; esac
+    done <<<"$cfg"
+  fi
+  # No farmed resolver yet (a fresh box, or the script is not farmed): report the documented
+  # locations rather than nothing — a check that silently reports no caches is the blind spot this
+  # function exists to remove.
+  if [ -z "$dirs_list" ]; then
+    dirs_list="$(printf '%s\n' "$HOME/.cache/uv" "$HOME/.npm/_cacache" "$HOME/.cache/pip" "$HOME/Library/Caches/pip")"
+  fi
   case "$maxmb" in ''|*[!0-9]*|0*) maxmb=2048 ;; esac
   bound=$(( 10#$maxmb * 1024 ))
-  for d in "$HOME/.cache/uv" "$HOME/.npm/_cacache" "$HOME/.cache/pip" "$HOME/Library/Caches/pip"; do
+  while IFS= read -r d; do
     if [ ! -d "$d" ]; then
       listed="$listed, $(basename "$(dirname "$d")")/$(basename "$d")=absent"
       continue
     fi
     # A cache that cannot be measured is REPORTED as unmeasurable — never as 0, which would read
-    # as "nothing to see" for the one number this check exists to surface.
-    kb="$(du -sk "$d" 2>/dev/null | awk 'NR==1 {print $1}')"
-    case "${kb:-}" in
-      ''|*[!0-9]*)
-        warn "cache $d: cannot be measured (du failed) — a full disk reads healthy when nothing is measured"
-        listed="$listed, $d=unmeasurable"
-        continue ;;
-    esac
+    # as "nothing to see" for the one number this check exists to surface. `du`'s STATUS decides:
+    # a partially unreadable cache still prints a numeric partial total (measured: a 3016KB tree
+    # with one mode-000 subdir prints `16` and exits 1).
+    measured=1
+    kb="$(du -sk "$d" 2>/dev/null)"; du_rc=$?
+    kb="${kb%%[[:space:]]*}"
+    [ "$du_rc" -eq 0 ] || measured=0
+    case "${kb:-}" in ''|*[!0-9]*) measured=0 ;; esac
+    if [ "$measured" -eq 0 ]; then
+      warn "cache $d: cannot be measured (du failed) — a full disk reads healthy when nothing is measured"
+      listed="$listed, $d=unmeasurable"
+      continue
+    fi
     total=$(( total + kb ))
     if [ "$kb" -gt "$bound" ]; then
       over=$(( over + 1 ))
@@ -466,13 +501,13 @@ check_caches() {
     else
       listed="$listed, $d=$(( kb / 1024 ))MB"
     fi
-  done
+  done <<<"$dirs_list"
   listed="${listed#, }"
   ok "caches: $listed — total $(( total / 1024 ))MB (bound ${maxmb}MB per cache)"
   if [ "$over" -gt 0 ]; then
     warn "  $over package cache(s) exceed the ${maxmb}MB bound — this is the sink that took pi-cell-3"
     warn "  from 7.1GB in ~/.cache/uv to 258MB free and refused every dispatch (#1987). Reclaim it now:"
-    warn "    bash $HOME/.pi/agent/scripts/pi-cache-reap.sh --apply"
+    warn "    bash ${reaper:-$HOME/.pi/agent/scripts/pi-cache-reap.sh} --apply"
   fi
 }
 

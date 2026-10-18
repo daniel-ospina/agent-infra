@@ -14,16 +14,34 @@
          `$HOME/.cache/uv`. Same class of sink: `~/.npm/_cacache` and
          `~/.cache/pip`.
 
-         SHIPS ARMED (its own apply flag). The bound IS the fix: a reaper that only reports
-         leaves the incident free to recur, which is what #1987 exists to stop.
-         What keeps that safe is the script's own policy, not a dry-run default:
-         `uv cache prune`/`npm cache verify` (the safe half) run first, entry
-         removal happens only while NO live process of that tool holds the cache,
-         and a pass that acted must PROVE the shrink (cache size down AND
-         filesystem free space up) or it exits 3. Removal is also safe for an
-         installed `.venv`: cache entries are hardlinked, so unlinking one never
-         breaks an environment — and when it frees nothing, that verification is
-         what reports it instead of a false success.
+         SHIPS IN DRY-RUN, LIKE EVERY SIBLING REAPER. This job is INSTALLED by
+         default and hourly, and it only REPORTS until it is armed:
+         `com.tortoise.worktree-reaper` and `com.eldato.pi-task-session-prune`
+         both ship in a dry run, and the reason is a recorded OWNER ruling
+         (agent-infra#1678, 2026-10-11): "the reaper may run unattended; arming it
+         may not", and "Arming a deletion tool must not be reachable by a lane at
+         all". The reaper's own gates are what make an armed pass SAFE — they are a
+         correctness argument, not an authorisation; the authorisation is the
+         owner's, because arming is a deliberate, per-machine consequence decision.
+
+         ARMING (owner action, one argument, reversible):
+           1. replace the dry-run argument below with the apply argument
+              (or set CACHE_REAP_APPLY=1 in EnvironmentVariables)
+           2. re-run scripts/install-launchd.sh
+         The armed copy is then a dated, auditable state — re-rendered from this
+         template on every sync, so there is no second copy to drift.
+         ⛔ Do NOT "tidy" an armed install back to dry-run without the owner: the
+         measured incident this job exists for (7.1GB -> 258MB free -> every
+         dispatch refused) recurs as soon as nothing bounds the cache.
+
+         What an armed pass may do (scripts/pi-cache-reap.sh, one owner of the
+         policy): `uv cache prune`/`npm cache verify` first (the safe half, no
+         deletion of live entries), then — only while NO live process of that tool
+         holds the cache — remove the largest entries, preserving anything still
+         hardlinked (unlinking it frees nothing) and anything on another filesystem
+         (never delete through a mount). A pass that acted must PROVE the shrink
+         (cache size down AND filesystem free space up by >=50% of the claim) or it
+         exits 3; two concurrent passes are excluded by a lock.
 
          Canonical script: agent-infra/scripts/pi-cache-reap.sh
          (COPIED to ~/.pi/agent/scripts/ by pi-bootstrap/setup.sh's fleet-scripts
@@ -31,11 +49,13 @@
          and this script reads only $HOME, so it runs under plain bash).
          Rendered by scripts/install-launchd.sh (#304) — placeholders only.
 
-         ONE OWNER, TWO TRIGGERS. This plist is the Mac's timer. A Linux cell has
-         no launchd, so its controller loop runs the same script hourly
-         (scripts/orchestrator-harness/orch-loop.sh, beside its hourly
-         claim_prune). Both triggers are deliberate: the reaper owns the policy,
-         a pass is idempotent, and each platform simply has a different clock.
+         TWO CLOCKS, ONE CACHE. This plist is the Mac's timer; the orchestrator
+         harness (scripts/orchestrator-harness/orch-loop.sh) also runs the same
+         script hourly on the same Mac AND on a Linux cell, which has no launchd. A
+         pass is idempotent and cheap when a cache is under its bound, and both
+         triggers ship dry-run; two overlapping ARMED passes cannot corrupt each
+         other's before/after free-space measurement because the script takes a lock
+         (`~/.pi/agent/state/pi-cache-reap.lock`).
 
          BUDGET. Hourly: growth is proportional to dispatch volume (the measured
          box went 0 -> 7.1GB), and the pass is cheap when under the bound (a `du`
@@ -52,7 +72,7 @@
         <string>/usr/bin/env</string>
         <string>bash</string>
         <string>{{HOME}}/.pi/agent/scripts/pi-cache-reap.sh</string>
-        <string>--apply</string>
+        <string>--dry-run</string>
     </array>
     <key>EnvironmentVariables</key>
     <dict>
@@ -61,7 +81,9 @@
         <!-- In the plist, not inherited: a launchd job gets neither the shell's
              env nor its rc files, so an unset bound here would silently fall back
              to the script default — the same value, but pinned where a machine
-             can be tuned from source. -->
+             can be tuned from source. The bring-up report and the supervisor read
+             the bound from the script (its print-config mode), so this is one of the
+             two places it may legitimately be tuned (the other: the default). -->
         <key>CACHE_REAP_MAX_MB</key>
         <string>2048</string>
     </dict>

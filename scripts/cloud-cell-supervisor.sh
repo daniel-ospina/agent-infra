@@ -1275,6 +1275,14 @@ cmd_status() {
     say "⛔ MERGE-ONLY: dispatch provisioning is BLOCKED — no implementation lane will be dispatched"
     sed 's/^/    /' "$O/.refresh-blocked"
   fi
+  # agent-infra#1987: the cache bound runs on this cell's clock as a BACKGROUND job, so its exit
+  # status is discarded at the call site (orch-loop.sh). A pass that fail-closes every hour — an
+  # unmeasurable cache, an entry that cannot be sized, a shrink it could not verify — would
+  # otherwise read exactly like a healthy cell, which is the blind spot #1987 was filed for.
+  if [ -f "$O/state/.cache-reap-blocked" ]; then
+    say "⛔ CACHE BOUND NOT ENFORCED — the package-cache reaper fail-closed on its last pass:"
+    sed 's/^/    /' "$O/state/.cache-reap-blocked"
+  fi
   # the loop's own view of itself
   tail -3 "$O/logs/orch-loop.log" 2>/dev/null | sed 's/^/  /' || say "  (no orch-loop.log yet)"
   say "lanes: $(tmux ls 2>/dev/null | grep -c '^lane-')"

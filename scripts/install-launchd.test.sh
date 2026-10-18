@@ -262,13 +262,15 @@ assert_contains "$(cat "$PRUNE_INSTALLED")" "<string>1</string>" "prune plist SH
 assert_contains "$(cat "$PRUNE_INSTALLED")" "StartInterval" "prune job is interval-scheduled"
 assert_contains "$(cat "$PRUNE_INSTALLED")" "<integer>3600</integer>" "prune job hourly (StartInterval 3600)"
 assert_contains "$(cat "$PRUNE_INSTALLED")" "agent-infra-plist-version: 0.1.0" "prune template carries version marker"
-# #1987 — the machine-global cache bound. It is the INVERSE of the prune job above: it ships ARMED
-# (its own apply flag, no dry-run env), because the bound IS the fix — a reporting-only job leaves the
-# measured 7.1GB incident free to recur. What makes that safe is the script's own policy (prune first,
-# escalate only with no live holder, prove the shrink), asserted in scripts/pi-cache-reap.test.sh.
+# #1987 — the machine-global cache bound. It ships DRY-RUN like every sibling reaper: arming a
+# scheduled DELETION is an owner-level consequence decision (agent-infra#1678, owner ruling
+# 2026-10-11: "the reaper may run unattended; arming it may not"), so a lane may not arm it by
+# editing this tracked template. Arming is one argument plus a re-run of the installer.
 assert_contains "$(cat "$CACHE_REAP_INSTALLED")" "$HOME1/.pi/agent/scripts/pi-cache-reap.sh" "cache-reap plist rendered with fake HOME (farmed path)"
-assert_contains "$(cat "$CACHE_REAP_INSTALLED")" "<string>--apply</string>" "cache-reap plist SHIPS ARMED (#1987)"
+assert_contains "$(cat "$CACHE_REAP_INSTALLED")" "<string>--dry-run</string>" "cache-reap plist SHIPS DRY-RUN (#1987 / #1678 arming ruling)"
+assert_not_contains "$(cat "$CACHE_REAP_INSTALLED")" "<string>--apply</string>" "cache-reap plist is NOT armed by a lane"
 assert_contains "$(cat "$CACHE_REAP_INSTALLED")" "<key>CACHE_REAP_MAX_MB</key>" "cache-reap plist pins the size bound in the plist, not the shell"
+assert_contains "$(cat "$CACHE_REAP_INSTALLED")" "<string>2048</string>" "cache-reap plist pins the bound's VALUE (a key-only assert passes on a typo that mints a dead timer)"
 assert_contains "$(cat "$CACHE_REAP_INSTALLED")" "<integer>3600</integer>" "cache-reap job hourly (StartInterval 3600)"
 assert_contains "$(cat "$CACHE_REAP_INSTALLED")" "agent-infra-plist-version: 0.1.0" "cache-reap template carries version marker"
 # #1178 unit 3 — lane-liveness rendered-plist content asserts (farmed tools path,
