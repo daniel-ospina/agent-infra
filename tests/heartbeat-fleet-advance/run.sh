@@ -83,6 +83,12 @@ FRAGMENTS=("fleet advance" "all four boxes" "three cloud vms" "autopilot" "unatt
            "use the capacity" "drive the p0/p1" "agent-infra" "cell-2" "admin-merge.sh"
            "wasted beat")
 ONLY_FULL=("name the specific prs that should land this cycle" "paragraph about load")
+# The mirror image: an element that exists ONLY in the short wording. Without this, a condensation
+# that drops "name this cycle's PRs" — an explicit verb of the owner's order (3) — from the body that
+# carries the order on every quiet tick passes the shared marker set, because the other elements are
+# still there. Asserted PRESENT on the quiet beat and ABSENT on the full one, so the two variants are
+# pinned from both sides.
+SHORT_ONLY=("name this cycle's prs")
 # The definition lines must each be a single double-quoted literal with NOTHING inside that bash
 # would interpret: no `"` (terminates the literal early), no backtick (command substitution), no `$`
 # (expansion). This is the rule the file itself states for MSG, asserted mechanically on each variant.
@@ -111,15 +117,21 @@ for _v in FLEETADV FLEETADV_SHORT; do
     *) fail "$_v is not a single double-quoted literal on one line (got: ${_defn:0:60}…)" ;;
   esac
 done
-# The two literal lengths, used by the proportionality bound below (and quoted in the script's own
+# The two literal lengths, used by the proportionality checks below (and quoted in the script's own
 # comment), read from the SHIPPED source rather than restated here.
 _ifull="$(sed -n 's/^FLEETADV="\(.*\)"$/\1/p' "$HB" | head -1)"
 _ishort="$(sed -n 's/^FLEETADV_SHORT="\(.*\)"$/\1/p' "$HB" | head -1)"
-# A quiet body bounded at 1100 chars plus the SHORT variant: the measured base is ~985, so this
-# tolerates ~115 chars of legitimate growth and still FAILS the regression it names -- the FULL
-# variant on the pulse path (985 + 758 = ~1743). A loose absolute bound (e.g. 2000) passes that
-# regression, which is how an assertion like this ends up dead.
-QUIET_BOUND=$(( 1100 + ${#_ishort} ))
+# ⛔ THE QUIET BODY'S CEILING IS A FIXED NUMBER, NOT DERIVED FROM THE VARIANT UNDER TEST. Deriving it
+# as (base + len(FLEETADV_SHORT)) made it SELF-RELAXING: replacing the short literal's CONTENT with
+# the full text (the same regression, one line higher) raised the bound with it and passed. 1700 is
+# measured against the shipped 1526 and against the regression's 1730 (the full variant on the pulse
+# path), leaving ~170 chars for legitimate growth of the standing clauses -- and half a knock-out
+# below it (the 2396-char wall this file's SHORT FORM was built to escape, :939).
+QUIET_CEIL=1700
+# The property is separate from the ceiling: the short wording must really be the shorter one, which
+# no absolute number can express if both variants grow.
+PAIR_IS_SHORTER=0
+[ "${#_ishort}" -lt "${#_ifull}" ] && PAIR_IS_SHORTER=1
 hasi(){ case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in *"$2"*) return 0 ;; *) return 1 ;; esac; }
 # Unconditional: the FULL-body append must be a top-level statement, never inside an `if`. A cheap
 # but real structural read — indentation is how every conditional in this file is written. (The
@@ -223,14 +235,28 @@ else
       pass "  quiet beat does not carry the full-only phrase: $f"
     fi
   done
-  # ⛔ PROPORTIONALITY, measured against the SHORT variant's own length: the quiet body exists to stay
-  # readable, and the bound is derived so it genuinely fires on the regression (the FULL variant on
-  # the pulse path, ~1743 chars) instead of at a number the regression cannot reach.
-  _qlen=${#out}
-  if [ "$_qlen" -lt "$QUIET_BOUND" ]; then
-    pass "the quiet beat stays short with the order on it (${_qlen} < ${QUIET_BOUND}; full variant = ${#_ifull})"
+  # ...and the SHORT wording's own element must be HERE.
+  for f in "${SHORT_ONLY[@]}"; do
+    if hasi "$out" "$f"; then
+      pass "  quiet beat carries the short-only element: $f"
+    else
+      fail "  quiet beat is missing the short-only element: $f — the order lost an element it names"
+    fi
+  done
+  # ⛔ PROPORTIONALITY: (a) the short wording must really be shorter than the full one, and (b) the
+  # delivered quiet body must stay under a FIXED ceiling. (a) cannot be satisfied by growing both
+  # variants; (b) is not derived from the variant under test, so editing the short literal upward
+  # cannot raise its own bound.
+  if [ "$PAIR_IS_SHORTER" = "1" ]; then
+    pass "the SHORT wording is shorter than the full one (${#_ishort} < ${#_ifull} chars)"
   else
-    fail "the quiet beat is ${_qlen} chars (bound ${QUIET_BOUND}) — the FULL variant appears to ride it"
+    fail "FLEETADV_SHORT (${#_ishort}) is not shorter than FLEETADV (${#_ifull}) — the pulse body would carry the long text"
+  fi
+  _qlen=${#out}
+  if [ "$_qlen" -lt "$QUIET_CEIL" ]; then
+    pass "the quiet beat stays under the fixed ceiling (${_qlen} < ${QUIET_CEIL}; short variant = ${#_ishort}, full = ${#_ifull})"
+  else
+    fail "the quiet beat is ${_qlen} chars, over the ${QUIET_CEIL} ceiling (short variant = ${#_ishort}, full = ${#_ifull}) — the quiet body grew, or the FULL variant rode it"
   fi
 fi
 
@@ -260,6 +286,15 @@ else
       fail "  full beat is MISSING the full-only phrase: $f — the alert body got the condensed variant"
     fi
   done
+  # The short wording's element belongs to the QUIET body; if it appears here, one variant has been
+  # pasted over the other.
+  for f in "${SHORT_ONLY[@]}"; do
+    if hasi "$out" "$f"; then
+      fail "  full beat carries the short-only element ('$f') — the two variants have been merged"
+    else
+      pass "  full beat does not carry the short-only element: $f"
+    fi
+  done
 fi
 
 echo ""
@@ -287,14 +322,14 @@ else
 fi
 
 echo ""
-# ⛔ A FLOOR ON THE ASSERTION COUNT. Emptying a loop body, or deleting one, would otherwise let this
-# suite report "✅ passed (4 assertions)" over a run that checked almost nothing — the same false-PASS
-# shape `scripts/run-bash-shards.sh` guards with its own runtime counters. Deliberately BELOW the
-# 36 shipped, so a small legitimate edit does not false-block, while a lost loop (which removes
-# 10+) is caught. Lower it only with a deliberate reason.
-MIN_CHECKS=30
+# ⛔ A FLOOR ON THE ASSERTION COUNT, SET TO THE SHIPPED COUNT EXACTLY. A lower number leaves slack in
+# which a single-check guard — the sensitivity mutant, the formation rules, one inverse pin — can be
+# deleted while the suite still reports green (measured: 30-of-36 absorbed all three). At the exact
+# count, any removal is red. Adding assertions is always safe; REMOVING one means lowering this
+# number deliberately, which is the point.
+MIN_CHECKS=39
 if [ "$checks" -lt "$MIN_CHECKS" ]; then
-  fail "only $checks assertions ran, below the shipped floor of $MIN_CHECKS — a check loop was lost"
+  fail "only $checks assertions ran, below the shipped floor of $MIN_CHECKS — a check was removed"
 fi
 if [ "$failures" -eq 0 ]; then
   echo "✅ heartbeat-fleet-advance suite passed (${checks} assertions)"
