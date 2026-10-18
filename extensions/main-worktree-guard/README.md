@@ -1144,7 +1144,7 @@ NOT routine options, and using any of them while the hub is disordered makes
 |---|---|---|
 | env hatch | `AGENT_ALLOW_MAIN_EDITS=1` at session start | Full guard bypass of the BLOCKING gates — M2/M3/M4 off (M1 deviation detection stays active, warn-only). Nothing automated exempts agent-infra main dirt anymore (#615/#619 — hub-state-check now includes agent-infra + the sibling hub repos tortoise/premise-labs/DMeer/eldato; sibling sessions in the hub are unprotected and will be disrupted). Prefer `hub-worktree.sh <branch>` instead. |
 | TTL escape marker (#207) | `touch ~/.pi/agent/.allow-main-edits  # reason` as its own bash call | Bypasses M2/M3 for 15 min — but **M4 stays ACTIVE** (D3): in an off-main/dirty hub you can only run sanctioned recovery ops, never resume feature work. The audit log records your session id. |
-| script backdoor | ~~write /tmp/x.sh + bash /tmp/x.sh~~ | **CLOSED (#1484)** — git-bearing scripts are gated by the M4 allowlist. **#627:** the non-shell sibling (`python -c`, `node -e`, `ruby -e`, `perl -e`, `php -r`, `pwsh -Command`) is closed for INLINE payloads too; residuals: `python -m`/bare-stdin/pipe payloads, dynamic string construction, and file/shebang payloads (`python x.py`, `./x.py`). Env hatch / TTL marker still bypass it. |
+| script backdoor | ~~write /tmp/x.sh + bash /tmp/x.sh~~ | **CLOSED (#1484)** — git-bearing scripts are gated by the M4 allowlist. **#1485** narrows the surface to what is actually READ: an opaque executable (no program to read) and a byte-identical COMMITTED repo script (content that already passed review) skip the walk — a committed script performing a real destructive op does NOT (see the #1485 note in the backdoor section). **#627:** the non-shell sibling (`python -c`, `node -e`, `ruby -e`, `perl -e`, `php -r`, `pwsh -Command`) is closed for INLINE payloads too; residuals: `python -m`/bare-stdin/pipe payloads, dynamic string construction, and file/shebang payloads (`python x.py`, `./x.py`). Env hatch / TTL marker still bypass it. |
 | terminal | a human runs `cd <repo> && git checkout main && git pull --ff-only` | THE sanctioned recovery (#206). Terminals are never intercepted; this is how a stranded hub gets un-stranded. |
 
 Rule of thumb: **if you are not recovering the hub or working alone, you
@@ -1350,6 +1350,58 @@ another path still blocks; a destructive framework helper still blocks).
 **#1139 completes the pair:** #1129 exempted this list from M4's content walk
 only, so `hub-worktree.sh` stayed blocked by M5 — the *other* walk — see the
 M5 section **above**.
+
+**#1485 — the gate reads PROGRAMS, not paths (two false positives).** #1484's
+premise was "the bytes at any executed path are a program whose git operations
+we can read", and applying it to every path refused things that are not
+programs at all. Both were measured in a hub-rooted session on 2026-10-18:
+- **A compiled executable was read as a script.** `/Users/…/bin/gh` is a 38 MB
+  Go binary whose bytes contain the word `git`, so **every** `gh` invocation —
+  `gh issue list`, `gh api`, `gh pr list` — was refused with "script content
+  contains a blocked git operation", naming an operation that does not exist.
+  No lane could read issue or PR state from a hub-rooted session.
+- **A committed repo script was gated on the operation it implements.**
+  `bash scripts/admin-merge.sh <pr>` is this repo's own merge rail; it was
+  refused because its content names the merge it performs (measured: the block
+  came from the `$(bash "$HELPER" …)`-shaped text arm — see below — with zero
+  real git invocations in either `admin-merge.sh` or `scripts/gh-shim/gh`).
+
+Two exemptions, both keyed on **what the path IS**, and both fail closed:
+- **`isOpaqueExecutablePath`** — a bounded 4 KiB probe (one fd, never the whole
+  file). `#!` answers *script* FIRST, so no magic can claim a text program; then
+  a known magic (ELF, Mach-O 32/64 both endiannesses, fat/universal, PE `MZ`),
+  byte 0 = NUL, or a NUL anywhere in the probe answers *opaque* and the content
+  walk is skipped. An unreadable/empty file is **not** opaque (no positive
+  evidence), so it keeps the pre-#1485 fail-closed read. A control-byte ratio
+  was considered and rejected: it fails OPEN on the #1484 gate.
+- **`isCommittedRepoScript`** — the file's content is compared byte-for-byte
+  against `git cat-file blob HEAD:<relpath>` of the repo that owns it. Not the
+  index and not `git status`, because those are ways to buy a "committed"
+  answer without a commit: `git add` makes a path look tracked while its content
+  was never reviewed, and `git update-index --assume-unchanged` hides a later
+  modification from `status`. Anything unresolvable (not a repo, unknown HEAD,
+  unreadable blob, a symlink pointing out of the repo) answers **false**.
+
+**The committed exemption releases reviewed TEXT, never an operation.** It skips
+only the text-unverifiable arm (substitutions, fences, prose read as code — the
+`#1129` false-positive class); the per-invocation verdict still runs, so a
+committed script containing a real destructive invocation is refused exactly as
+before. That is what keeps `scripts/cleanup-worktree.sh` (`git worktree remove
+--force`, `git branch -D`) blocked — the #1129 adversarial-review P0 boundary —
+while `admin-merge.sh`, `gh-shim/gh` and `scratch-worktree.sh` become runnable.
+An untracked, staged, or modified copy keeps the full content walk, i.e. the
+#1484 threat (`write /tmp/x.sh` + `bash /tmp/x.sh`, or writing a script into the
+repo) is unchanged.
+
+Pinned by `test-script-backdoor.mjs` (wired into `ci.yml` as its own step): both
+false positives through the REAL `tool_call` handler, the reverse direction of
+each exemption (a `#!` file with the same words blocks; the modified/staged/
+untracked copy blocks), a committed script with a real destructive op still
+blocking, and the original #1484 threat still blocked and still named in the
+message. The suite is red-before-green by construction: behavioural assertions
+go through `scriptGitVerdict` (present before and after) and predicate-level
+assertions SKIP when the predicate is absent — measured **8 failed / 10 skipped
+before → 34 passed after**.
 
 Deliberately still blocked (documented residuals): a git op inside a quoted
 heredoc PIPED/ fed to a shell (`cat <<'EOF' | sh`), an existing-file or

@@ -4223,6 +4223,69 @@ test("countMergeVerbs: a compound command must fail closed", () => {
   ok(countMergeVerbs("gh -R o/r pr merge 1 --admin") === 1, "the global -R flag does not hide the verb");
 });
 
+test("#1485: countMergeVerbs counts INVOCATIONS, not every `gh` word in a command that carries a construct", () => {
+  // The reported defect, verbatim in shape: TWO read-only gh calls plus a
+  // `$`-anchored grep pattern were refused with "This command contains more than
+  // one `gh pr merge`" — the pre-fix rule counted EVERY `gh` word once the command
+  // carried any `$`/backtick/brace (`hasUnresolvableConstruct`), and neither call
+  // was a merge. Reading the verb is the only thing that may make a word a merge:
+  // no `gh` subcommand other than `pr merge` can merge a PR.
+  const TWO_RUN_VIEWS =
+    'cd /repo && echo "===== gate ====="; gh run view 38865296238 --log-failed --job 117027248773 2>&1 | tail -30; echo; ' +
+    'echo "===== test ====="; gh run view 38865296238 --log-failed --job 117025954943 2>&1 | grep -viE "^\\s*$" | tail -40';
+  ok(countMergeVerbs(TWO_RUN_VIEWS) === 0, "two read-only `gh run view` calls + a `$`-anchored grep are ZERO merges");
+  ok(countMergeVerbs("gh run view 1 2>&1 | tail -3") === 0, "a redirection is not a construct and not a merge");
+  ok(countMergeVerbs("gh api /repos/o/r --method POST --jq '.id' ; gh api /repos/o/r/issues --jq '.id'") === 0,
+    "two read-only `gh api` calls are ZERO merges");
+  ok(countMergeVerbs("gh pr checks 1; gh pr view 2 --json body") === 0, "read-only `pr` subcommands are ZERO merges");
+
+  // A mention in quoted DATA is not an invocation: a payload, a jq filter, a
+  // pattern, a body. (This is the reporter's "phrase `pr merge` inside an inline
+  // python string argument".)
+  const PY_MENTION = 'gh api repos/o/r/issues/1/comments --jq \'.[].body\' | python3 -c "\nimport sys\ndoc = \'Run: gh pr merge\'\nprint(f\'len={len(sys.stdin.read())} doc={doc}\')\n"';
+  ok(countMergeVerbs(PY_MENTION) === 0, "a `pr merge` mention in an interpreter payload is ZERO invocations");
+  ok(countMergeVerbs('gh api repos/o/r/issues/1/comments -f body="the rail is: gh pr merge (see docs)" --jq \'.id\'') === 0,
+    "…as is one in a body value");
+  ok(countMergeVerbs('x="say gh pr merge 1"; gh pr merge 1006 --admin') === 1,
+    "…and a mention in a quoted assignment does not double a real merge (which would look compound)");
+
+  // The SPLICE family still counts — that is what the old construct rule bought,
+  // and it must not be lost with the over-count.
+  ok(countMergeVerbs("gh pr merge 111 --admin; sh -c 'gh pr merge 999 --admin'") === 2, "a wrapped second verb counts");
+  ok(countMergeVerbs("gh pr merge 111 --admin; eval 'gh pr merge 999 --admin'") === 2, "an eval payload counts");
+  ok(countMergeVerbs('gh pr merge 111 --admin; "gh" pr merge 999 --admin') === 2, "a quoted command name counts");
+  ok(countMergeVerbs("gh pr merge 111 --admin; gh pr $'merge' 999 --admin") === 2, "an ANSI-C verb counts");
+  ok(countMergeVerbs("gh pr merge 111 --admin; gh p$'r' merge 999 --admin") === 2, "an ANSI-C group counts");
+  ok(countMergeVerbs("gh pr merge 111 --admin; gh pr ${X}merge 999 --admin") === 2, "a brace-spliced verb counts");
+  ok(countMergeVerbs("gh pr merge 111 --admin; gh ${X}pr merge 999 --admin") === 2, "a brace-spliced group counts");
+  ok(countMergeVerbs('echo "$(gh pr merge 111 --admin) $(gh pr merge 999 --admin)"') === 2,
+    "a command substitution inside quotes counts (bash runs it)");
+  // One merge is ONE even when its own words are spliced across several tokens:
+  // an over-count is not free — it would refuse a SINGLE admin merge as compound.
+  ok(countMergeVerbs("gh ${X}pr merge 999 --admin") === 1, "a spliced single merge is one, not two");
+  ok(countMergeVerbs("gh pr ${X}merge 999 --admin") === 1, "…in either splice direction");
+  ok(countMergeVerbs("gh pr --repo=$(cat x) merge 999 $V") === 1,
+    "the repo-flag stripper's residue still reads as one merge");
+});
+
+test("#1485: the polarity predicate ignores quoted DATA, so a mention does not blind the positive read", () => {
+  // `readsNonMergeGhCall` is what stands the text layer down (#1776). A construct
+  // inside a value it is HANDED — a grep pattern, a jq filter, a payload — is not
+  // a way to hide an executable word, and reading it as one handed read-only
+  // commands to the evidence gate.
+  ok(readsNonMergeGhCall('gh run view 1 2>&1 | grep -viE "^\\s*$"'), "a `$` in a grep pattern does not blind the read");
+  ok(readsNonMergeGhCall("gh run view 1 2>&1 | tail -3"), "a redirection is not a construct");
+  ok(readsNonMergeGhCall('gh api repos/o/r --jq \'[.items[] | select(.x)] | "\\(length)"\''), "a jq filter is data");
+  // …and the polarity is untouched where it matters: a program that the shell or
+  // an interpreter will RUN keeps the gate (the #1776 boundary test enumerates the
+  // spellings; these are the two whose data-ness is decided by a pipe/flag).
+  ok(!readsNonMergeGhCall('gh pr view 1; echo "$C $P $M 999 $V" | python3'), "piped into an interpreter ⇒ not a positive read");
+  ok(!readsNonMergeGhCall('gh pr view 1; osascript -e "do shell script \\"$A $B $C 9 $D\\""'),
+    "an `-e` payload is a program ⇒ not a positive read");
+  ok(!mergeVerbInText('gh pr view 1; echo "$C $P $M 999 $V" | sh'), "a piped program still names a merge");
+  ok(!mergeVerbInText("gh pr view 1"), "a non-merge read does not name one");
+});
+
 test("extractMergePrNumber: flag order never hides the PR number", () => {
   equal(extractMergePrNumber("gh pr merge 123"), 123);
   equal(extractMergePrNumber("gh pr merge --admin 123"), 123, "flag before the number (the evasion)");
@@ -5706,6 +5769,54 @@ test("#1776: the boundary's two predicates, each pinned on its own (polarity + m
 // reviewer. Without a dispatch the uniform >=1-dispatch gate refuses it for an unrelated
 // reason, which is exactly why the stand-down test above cannot distinguish "the admin
 // gate stood down" from "another gate happened to refuse it" — this test can.
+testAsync("#1485: a read-only gh command whose PAYLOAD quotes the rail is not refused (the reported false positive)", async () => {
+  // The refusal reported on 2026-10-18 (tortoise#1484, comment 6245894830): a
+  // command containing ONE read-only `gh api` call was blocked with "This command
+  // contains more than one `gh pr merge`" because the phrase appeared inside an
+  // inline python payload. Same class: two read-only `gh run view` calls refused
+  // because a `grep -viE "^\s*$"` supplied a construct. Neither is a mutating
+  // invocation, so NOTHING may block them.
+  const COMMANDS = [
+    'gh api repos/o/r/issues/1/comments --jq \'.[].body\' | python3 -c "\nimport sys\ndoc = \'Run: gh pr merge\'\nprint(f\'len={len(sys.stdin.read())} doc={doc}\')\n"',
+    'gh api repos/o/r/issues/1/comments -f body="the rail is: gh pr merge (see docs)" --jq \'.id\'',
+    'gh run view 38865296238 --log-failed 2>&1 | grep -viE "^\\s*$" | tail -5; gh run view 1 --log-failed 2>&1 | tail -5',
+  ];
+  await withTempHome(async () => {
+    const prevShim = process.env.AGENT_GH_SHIM;
+    const prevMode = process.env.PI_MODE;
+    delete process.env.AGENT_GH_SHIM; // the argv layer IS installed
+    process.env.PI_MODE = "print";
+    // A failing gh probe: if the evidence gate ran at all, its head lookup would
+    // throw and the command would be refused. Reaching `undefined` means it did not.
+    _setRunGhOverride(() => { throw ghError("gh: could not resolve host github.com"); });
+    try {
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      await fire("session_start");
+      // One reviewer dispatch, so the UNIFORM >=1-dispatch gate (which reads
+      // `isGitOp`, and therefore also over-reads a mention) cannot mask the
+      // question this test asks: is the MERGE evidence gate standing down?
+      await fire("tool_result", { toolName: "task" });
+      for (const command of COMMANDS) {
+        const res = await fire("tool_call", { toolName: "bash", input: { command } });
+        ok(
+          res === undefined || res.block !== true,
+          `a read-only command with a quoted mention must not be blocked: ${command.slice(0, 80)} :: ${String(res?.reason ?? "").slice(0, 140)}`
+        );
+      }
+      equal(
+        tempAuditLines().filter((l) => l.event === "merge_gate_block").length,
+        0,
+        "…and no merge_gate_block row is written for any of them"
+      );
+    } finally {
+      _setRunGhOverride(null);
+      if (prevShim === undefined) delete process.env.AGENT_GH_SHIM; else process.env.AGENT_GH_SHIM = prevShim;
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+    }
+  });
+});
+
 testAsync("#1776: the #1775 command is ALLOWED once the session has dispatched (the false positive is gone)", async () => {
   await withTempHome(async () => {
     const prevShim = process.env.AGENT_GH_SHIM;

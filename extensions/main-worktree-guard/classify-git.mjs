@@ -8,9 +8,9 @@
 // default = inactive → block).
 
 import { execSync, execFileSync } from "node:child_process";
-import { resolve, join, dirname, relative, basename } from "node:path";
+import { resolve, join, dirname, relative, basename, isAbsolute } from "node:path";
 import { homedir } from "node:os";
-import { existsSync, statSync, readFileSync, realpathSync, readdirSync } from "node:fs";
+import { existsSync, statSync, readFileSync, realpathSync, readdirSync, openSync, readSync, closeSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 //
@@ -8523,22 +8523,187 @@ export function extractScriptArgs(command, scriptPath) {
   }
 }
 
+// ── #1485: what is NOT a script (the two script-surface false positives) ────
+// The #1484 closure gates a script's CONTENT. That premise is "the bytes at
+// this path are a PROGRAM in a language whose git operations we can read". It
+// was applied to every executed path, so two classes of false positive
+// followed, and both were measured in a hub-rooted session on 2026-10-18:
+//
+//   1. A COMPILED EXECUTABLE has no shell program to read. `/Users/…/bin/gh` is
+//      a 38 MB Go binary whose bytes contain the ASCII string `git`, so the
+//      content walk "found" a git operation and refused EVERY invocation of the
+//      CLI — `gh issue list`, `gh api`, `gh pr list` — meaning no lane and no
+//      orchestrator could read issue/PR state through the sanctioned tool. The
+//      refusal named a blocked git operation that did not exist, so it sent the
+//      reader looking for a git problem.
+//   2. A COMMITTED REPO SCRIPT was gated on the very operation it implements.
+//      `bash scripts/admin-merge.sh 8754` is the repo's own merge rail, and its
+//      content necessarily contains the merge invocation it exists to perform,
+//      so the sanctioned route was unrunnable from a session.
+//
+// The two are separated by WHAT THE PATH IS, not by what its bytes mention:
+//   - opaque executable → there is no program to read → nothing to gate;
+//   - COMMITTED, UNMODIFIED repo script → its content already passed review and
+//     is part of the repository history, which is not the #1484 threat (that is
+//     `write /tmp/x.sh` + `bash /tmp/x.sh`: content that was never reviewed and
+//     exists only in a working tree).
+// See `scriptGitVerdict` for the two gates and their fail-closed directions.
+
+/** Bytes read for the binary probe. Enough for every executable magic, and a
+ *  NUL in the first 4 KiB is decisive — reading a 38 MB binary to discover it is
+ *  not shell would cost more than the gate is worth. */
+const OPAQUE_PROBE_BYTES = 4096;
+
+/** Leading bytes of compiled executables this probe resolves as OPAQUE: ELF,
+ *  Mach-O (32/64-bit, both endiannesses), the fat/universal wrapper, and PE
+ *  (`MZ`). A `#!` file is a text script by construction, and is checked FIRST so
+ *  no magic below can claim it. */
+const OPAQUE_MAGIC = [
+  [0x7f, 0x45, 0x4c, 0x46], // ELF
+  [0xfe, 0xed, 0xfa, 0xce], [0xce, 0xfa, 0xed, 0xfe], // Mach-O 32
+  [0xfe, 0xed, 0xfa, 0xcf], [0xcf, 0xfa, 0xed, 0xfe], // Mach-O 64 (gh's own)
+  [0xca, 0xfe, 0xba, 0xbe], [0xbe, 0xba, 0xfe, 0xca], // fat/universal
+  [0x4d, 0x5a], // PE (MZ) — Windows launcher / .exe
+];
+
+/**
+ * Is the file at `path` an OPAQUE EXECUTABLE — i.e. something with no shell
+ * program in it whose git content could be read?
+ *
+ * THREE signals, in this order, and every one of them is a POSITIVE observation
+ * (`false` is not "it is a script", it is "this probe found no evidence it is
+ * not one" — so an unreadable file is `false` and the caller's read then fails
+ * closed/clopen exactly as before):
+ *   1. `#!` → a text script, never opaque (checked first; a shebang script's
+ *      bytes may still contain NULs — `node test.mjs` fixtures do).
+ *   2. a known executable magic → opaque.
+ *   3. a NUL byte in the probe (or byte 0 = 0) → opaque: no POSIX text program
+ *      can contain one, and every binary format this probe does not name spells
+ *      its header with them (`\0asm`, a fat archive's padding, …).
+ * Nothing else counts. A control-byte ratio was considered and dropped: an ESC
+ * byte is inside the distribution of legitimate text (a colour-code helper), and
+ * widening this predicate fails OPEN on the #1484 gate — a text script read as
+ * "opaque" would never be gated at all. Precision is the safe direction here
+ * because an unrecognised binary still contains a NUL, and a miss only restores
+ * the pre-#1485 behaviour.
+ *
+ * Bounded: reads at most `OPAQUE_PROBE_BYTES` with one fd, never the whole file.
+ * @param {string} path
+ * @returns {boolean}
+ */
+export function isOpaqueExecutablePath(path) {
+  let fd = null;
+  try {
+    fd = openSync(path, "r");
+    const buf = Buffer.alloc(OPAQUE_PROBE_BYTES);
+    const n = readSync(fd, buf, 0, OPAQUE_PROBE_BYTES, 0);
+    if (n <= 0) return false; // empty/unreadable → no positive evidence
+    const probe = buf.subarray(0, n);
+    if (probe[0] === 0x23 && probe[1] === 0x21) return false; // `#!` → a script
+    if (probe[0] === 0) return true;                          // `\0asm` and friends
+    for (const magic of OPAQUE_MAGIC) {
+      if (probe.length < magic.length) continue;
+      let hit = true;
+      for (let i = 0; i < magic.length; i++) if (probe[i] !== magic[i]) { hit = false; break; }
+      if (hit) return true;
+    }
+    // A NUL anywhere in the probe: no text program contains one.
+    for (let i = 0; i < probe.length; i++) if (probe[i] === 0) return true;
+    return false;
+  } catch {
+    return false;
+  } finally {
+    if (fd !== null) { try { closeSync(fd); } catch { /* nothing to close */ } }
+  }
+}
+
+/**
+ * Is `path` a COMMITTED script of the repo that owns it — tracked, and
+ * byte-identical to the blob at `HEAD`?
+ *
+ * The comparison is against `HEAD`, not against the index and not against a
+ * `git status` line, because those are the ways a "committed" answer could be
+ * bought without a commit:
+ *   - an UNTRACKED file (`write /tmp/x.sh`, or `write scripts/x.sh` before any
+ *     `git add`) is the #1484 threat itself → not committed;
+ *   - `git add scripts/x.sh` makes the path look tracked while its content has
+ *     never been reviewed (staging is not gated) → not committed;
+ *   - `git update-index --assume-unchanged` hides a later MODIFICATION from
+ *     `git status`, so a status-clean path can still run bytes nobody reviewed
+ *     → the blob comparison is immune to it.
+ *
+ * Fail direction: anything unresolvable (not a repo, unknown HEAD, unreadable
+ * blob) answers `false`, i.e. the content walk runs exactly as before.
+ * @param {string} path
+ * @param {string} content — the bytes the shell would actually execute
+ * @returns {boolean}
+ */
+export function isCommittedRepoScript(path, content) {
+  try {
+    const real = realpathSync(path);
+    const dir = dirname(real);
+    const top = execFileSync("git", ["rev-parse", "--show-toplevel"], {
+      cwd: dir, encoding: "utf-8", timeout: 5000, stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    if (!top) return false;
+    const topReal = realpathSync(top);
+    const rel = relative(topReal, real);
+    // Outside the repo that owns `dir` (a symlinked spelling can point out of
+    // it) → not this repo's committed script.
+    if (!rel || rel.startsWith("..") || isAbsolute(rel)) return false;
+    const blob = execFileSync("git", ["cat-file", "blob", `HEAD:${rel}`], {
+      cwd: topReal, encoding: "utf-8", timeout: 5000, stdio: ["ignore", "pipe", "ignore"],
+    });
+    return blob === content;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Gate a script FILE's git content against the hub-recovery allowlist.
  * "block" = the script performs a non-sanctioned git mutation (backdoor
  * pattern); "allow" = no git, or all git ops are sanctioned/read-only.
  * Unreadable/missing file → "allow" (the file doesn't exist yet — nothing to
  * execute; a later call re-checks after the write).
+ *
+ * The content walk runs only when the path IS a text program AND is not a
+ * committed repo script (#1485) — see `isOpaqueExecutablePath` and
+ * `isCommittedRepoScript` for why, and for the fail-closed direction of each.
+ * A committed script skips only the TEXT-UNVERIFIABLE arm; a real invocation it
+ * contains is still judged (see the call site).
  * @param {string} path
  * @param {string|null} currentBranch
  * @returns {"allow"|"block"}
  */
 export function scriptGitVerdict(path, currentBranch, executionCwd = process.cwd(), sessionCwd = process.cwd(), scriptArgs = null) {
+  // #1485 (1): a compiled binary has no program to read. Probe BEFORE the read —
+  // reading a 38 MB Go binary as utf-8 and scanning its bytes is what matched
+  // the word `git` inside `/Users/…/bin/gh` and refused every `gh` invocation.
+  if (isOpaqueExecutablePath(path)) return "allow";
   let content;
   try {
     content = readFileSync(path, "utf-8");
   } catch {
     return "allow";
+  }
+  // #1485 (2): a committed, unmodified repo script is not the #1484 threat —
+  // `bash scripts/admin-merge.sh <pr>` is the repo's own rail, and its content
+  // necessarily contains the operation it implements.
+  //
+  // The exemption covers ONLY the text-unverifiable arm: the false positives are
+  // scripts whose BLOCK came from a heuristic reading prose as code (a usage
+  // heredoc, a fenced example, a `$(…)` mention) while containing no real
+  // non-sanctioned invocation at all — measured: `scripts/admin-merge.sh` and
+  // `scripts/gh-shim/gh` yield ZERO git invocations and are blocked by that arm
+  // alone. It does NOT license a real destructive invocation: `scripts/
+  // cleanup-worktree.sh` is equally committed and its `git worktree remove` /
+  // `git branch -D` must still be refused (the #1129 adversarial-review P0
+  // boundary), so the INVOCATION verdict still runs — a committed script whose
+  // real invocations are all sanctioned/read-only is allowed, and one that is
+  // not is blocked exactly as before.
+  if (isCommittedRepoScript(path, content)) {
+    return _gitInvocationsVerdict(allGitInvocations(_stripShellComments(content)), currentBranch, executionCwd, sessionCwd);
   }
   return scriptContentGitVerdict(content, currentBranch, executionCwd, sessionCwd, scriptArgs);
 }
