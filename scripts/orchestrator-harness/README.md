@@ -1087,7 +1087,7 @@ names where its exclusion actually lives; there is no single file that says "the
 
 ### 6.5.6 The controller must be un-removable by a routine install
 
-**MUST.** `install.sh` must **enable and load** the job (`launchctl enable` → `bootout` →
+**MUST.** `install.sh --start` / `--restart` must **enable and load** the job (`launchctl enable` → `bootout` →
 `bootstrap`, falling back to legacy `load`, and saying which path ran), **assert** the outcome (the
 label loaded with a pid, and the heartbeat file advancing within ~30 s), and exit **non-zero** if
 either fails. A **watchdog** must restore a REMOVED service: `KeepAlive` relaunches a job that EXITS
@@ -1104,21 +1104,28 @@ that follows has to bootstrap to clear it — and that bootstrap is what failed 
 ```
 
 The controller was **absent**, not crashed, and it dispatched nothing for 48 minutes and then 19,
-with the heartbeat simply gone — the only signal that it had happened. ⛔ **The safe sequence, and the
-one to copy: `launchctl enable` → `launchctl bootout` → `launchctl bootstrap`, exactly as
-`scripts/install-launchd.sh:275-285` does it (removing the plist if `bootstrap` fails) — never
-`unload -w` followed by `load -w`.** §9's limits-change note now gives the same safe sequence; what
-is still unsafe is `install.sh:698`, which PRINTS `launchctl load -w` and does not load anything at all
-(#1976).
+with the heartbeat simply gone — the only signal that it had happened.
 
-**Status: GAP.** `install.sh:698` only PRINTS the load command and never `enable`s or loads;
-`--uninstall` (`install.sh:107`) runs `launchctl unload -w`, i.e. it WRITES the override; nothing
-asserts the heartbeat; and nothing **restores a job that has been disabled or booted out, or asserts
-that it came back** — `KeepAlive`/`RunAtLoad` (`launchd.plist.template:15-18`) relaunch a job that
-EXITS, which is not the same state as one launchd no longer has, and `com.eldato.lane-liveness.plist`
-watches LANES by design with no controller alive. The correct pattern already exists in this repo — `scripts/install-launchd.sh:275-285`
-does `enable` + `bootout` + `bootstrap` and removes the plist when `bootstrap` fails.
-agent-infra#1975, #1976, #1860.
+**Status: the installer half is CLOSED (#1975).** Every requirement in the list above is now either
+implemented or explicitly not claimed:
+
+| requirement | where |
+|---|---|
+| never write a persistent Disabled override | no shipped line invokes `disable`, `unload`, or `-w` (asserted from the stub's argv log wherever the path runs, **and** from a source scan of every TOP-LEVEL `*.sh`/`*.template` in `scripts/orchestrator-harness/` where it cannot (`*.test.sh` excluded — its fixtures must be free to contain those verbs; subdirectories such as `retired/` and the rest of the repo are not reached by the glob — hand-checked at the time of writing, not by a test)); `--uninstall` uses `bootout` only |
+| clear a disable a previous flow already wrote | `lc_start` runs `enable` before `bootout`/`bootstrap`; the status it writes is read back with `print-disabled` |
+| actually load the job (not just PRINT the command) | `install.sh --start` / `--restart` call `lc_start`; a plain run never starts anything |
+| assert the job came back | `lc_assert_running`: new pid + heartbeat strictly advanced + `runs` did not move across the settle window |
+| remove by proof, not by label | `lc_guard_mutate` reads the loaded job's `path =` and refuses unless it is this plist |
+| an unreadable domain is UNKNOWN | `lc_probe` is the tri-state read, and every DECISION POINT that must distinguish 'not loaded' from 'could not read' re-probes with it: `lc_ensure`, the `--uninstall` read-back in `install.sh` (`block="$(lc_probe "$LABEL")"` — its verdict is the probe's own status, not a derived second read), `lc_guard_mutate`, `lc_assert_running`, `lc_assert_stable`, and `lc_bootout` (which refuses to treat a label as 'not loaded' rather than removing by a failed read). The thin wrappers `lc_pid` and `lc_runs` fold UNKNOWN into empty, so their callers must not read empty as 'not loaded'. Those decisions re-probe — **except `lc_restart`, and that is a hole this row names rather than hides**: a restart is unconditional, so it needs no probe to decide *whether* to act, but the folded `lc_pid` read it takes BEFORE the start is passed into `lc_assert_running` as `replaced`, so when that read is UNREADABLE (rather than 'not loaded') `replaced` is empty and the "the old process survived the start" check is silently SKIPPED. Not every read in the file is tri-state: `lc_min_runtime` falls back to launchd's own 10 s default, and a successful-but-empty `print-disabled` reads as `unset` (no override), because that is exactly what it means |
+
+⛔ **What is still GAP is the reporting side, and it is the item that matters most**: nothing
+**detects** a job that has been disabled or booted out — `KeepAlive`/`RunAtLoad`
+(`launchd.plist.template:15-18`) relaunch a job that EXITS, which is not the same state as one launchd
+no longer has, and `com.eldato.lane-liveness.plist` watches LANES by design with no controller alive.
+On 2026-10-17 the label was disabled twice more *during this PR's own review* by agent sessions running
+the pre-#1975 flow from other checkouts; both times a human reading `launchctl print` found it, not an
+instrument. A watchdog that runs `enable` + `bootstrap` when the label is absent, and reports it, is
+the missing piece — agent-infra#1860.
 
 ---
 
