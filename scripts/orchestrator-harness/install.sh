@@ -1,11 +1,21 @@
 #!/usr/bin/env bash
 # install.sh — render + install the launchd agent for the orchestrator harness.
 #
-# Deliberately does NOT start the loop. It writes the plist and prints the load command.
+# Deliberately does NOT start the loop unless asked. It writes the plist and prints the start command.
 # Starting an autonomous merge loop is an explicit act, not a side effect of installing.
 #
-#   ./install.sh                 # render + install (idempotent)
-#   ./install.sh --uninstall     # unload + remove the plist (leaves state/logs alone)
+#   ./install.sh                 # render + install (idempotent; NEVER touches a running job)
+#   ./install.sh --start         # render + install, then ensure it is running — and PROVE it
+#   ./install.sh --restart       # render + install, then bootout + bootstrap — and PROVE it
+#   ./install.sh --uninstall     # bootout + remove the plist AND the loaded-render record (logs and the
+#                                # rest of state untouched)
+#
+# ⛔ THE LAUNCHCTL DISCIPLINE (agent-infra#1975). Every load/removal goes through launchd-cycle.sh,
+# which uses `bootout` + `enable` + `bootstrap` and NEVER `unload -w`/`load -w`: `-w` writes a
+# PERSISTENT Disabled override, so the old unload-then-load pair was a disable whose re-enable needed a
+# bootstrap that is allowed to fail. It failed on 2026-10-17 (EIO) and left the production controller
+# removed AND disabled while this installer exited 0. `bootout` writes no override, so the worst case
+# is "not loaded" — repaired by the next start — never "disabled".
 #
 # Config comes from the environment; defaults are the values this harness was built with
 # (see README §4). Nothing is written outside ~/Library/LaunchAgents and $O.
@@ -88,8 +98,8 @@ MIN_MEM_FREE_MB="${MIN_MEM_FREE_MB:-512}"
 BATCH="${BATCH:-2}"
 CYC="${CYC:-240}"
 # Drain scope (README §5): auto (count rule) | own (pin own-only) | broad (pin broad).
-# A fleet runs exactly ONE broad box; the rest pin own. Validated below, AFTER the --uninstall
-# branch (uninstall does not render, and must never be blocked by a config typo).
+# A fleet runs exactly ONE broad box; the rest pin own. Validated below, AFTER the action parse
+# (uninstall does not render, and must never be blocked by a config typo).
 # ⛔ Presence, not emptiness: `${SCOPE:-auto}` would coerce a set-but-BLANK value to auto and
 # silently evaporate the pin — the exact failure the whole SCOPE override exists to prevent.
 [ -z "${SCOPE+x}" ] && SCOPE=auto
@@ -97,17 +107,91 @@ CYC="${CYC:-240}"
 LABEL="com.eldato.orchestrator-loop"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 TEMPLATE="$HERE/launchd.plist.template"
+# Seconds to wait for the label to show a pid AND for $O/heartbeat to advance after a start. The loop
+# writes the heartbeat at the TOP of every cycle, so a live controller refreshes it within seconds of
+# being launched; 30s is slack for a cold start, not a cycle's worth of work.
+START_TIMEOUT="${START_TIMEOUT:-30}"
+# How old $O/heartbeat may be before a LOADED job counts as "running but not cycling" (the one state
+# `--start` refuses to fix silently; un-wedging it is `--restart`). Derived from CYC, not a constant: a
+# healthy controller's heartbeat age is bounded by one cycle plus that cycle's work, so a fixed 900s
+# fails a perfectly healthy cell run at CYC=900 and points the operator at the disruptive restart.
+# LC_HB_STALE overrides it for a cell whose cycles are unusually long.
+# ELDATO_ALLOW_TEST_HOME=1 is the test-only opt-in to the #446 temp-HOME guard in launchd-cycle.sh —
+# without it, a run whose $HOME is not the real home refuses to touch launchd at all.
 
 die() { echo "❌ $*" >&2; exit 1; }
 ok()  { echo "  ✓ $*"; }
 warn(){ echo "  ⚠️  $*"; }
 
+# ── the launchd lifecycle seam ───────────────────────────────────────────────────
+# ⛔ ONE implementation for THIS job's lifecycle, sourced — never a second copy of the
+# bootout/enable/bootstrap dance in this file. (scripts/install-launchd.sh is a separate seam for the
+# template family; it shares the sequence but not the bootstrap-failure policy — see the header of
+# launchd-cycle.sh.) FAIL CLOSED if the library is missing: an installer that cannot reach the safe path
+# must refuse, not silently fall back to the legacy verbs whose `-w` is the defect (#1975).
+LC_LIB="$HERE/launchd-cycle.sh"
+[ -f "$LC_LIB" ] || die "missing $LC_LIB — refusing to install without the launchd lifecycle helper (install.sh must run from the checkout, not from a partial copy)"
+# shellcheck source=launchd-cycle.sh
+. "$LC_LIB"
+
+# ── action ───────────────────────────────────────────────────────────────────────
+# Parsed BEFORE anything renders: `--uninstall` must work on a broken config (it removes the job), and
+# an unknown flag must be REFUSED rather than silently ignored — a typo'd `--strt` would otherwise
+# install and exit 0 with the controller still down, which is the exact false PASS this fixes.
+ACTION=none
+case "${1:-}" in
+  "")        ;;
+  --start)   ACTION=start ;;
+  --restart) ACTION=restart ;;
+  --uninstall) ACTION=uninstall ;;
+  *) die "unknown argument '$1' (accepted: --start, --restart, --uninstall, or no argument)" ;;
+esac
+
 # ── uninstall ────────────────────────────────────────────────────────────────────
-if [ "${1:-}" = "--uninstall" ]; then
-  launchctl unload -w "$PLIST" 2>/dev/null || true
+if [ "$ACTION" = uninstall ]; then
+  # NO `unload -w`: `bootout` removes the job and writes NO persistent Disabled override, so a later
+  # re-install is a plain start rather than a start that has to fight a sticky disable first. A
+  # deliberate removal still leaves the job NOT RUNNING — which is the point — and the next
+  # `install.sh --start` prints an explicit refusal if anything else holds the controller lock.
+  #
+  # ⛔ AND IT IS VERIFIED. `launchctl bootout` reporting success is not proof the job is gone (this box
+  # has produced `Bootstrap failed: 5: Input/output error` in the same domain), and printing "✅ Removed"
+  # over a job that is still loaded with RunAtLoad/KeepAlive hands a human a laptop with the fleet still
+  # dispatching — README §6 step 2's `pkill` is undone by launchd a second later. So: remove, then READ
+  # the domain until the label is no longer LOADED, and fail loudly if it still is.
+  lc_bootout "$LABEL" "$PLIST" || exit 1
+  # ⛔ "IS IT STILL LOADED" — not "does it have a pid". A KeepAlive job that has just exited sits LOADED
+  # with no pid for up to its respawn throttle (`minimum runtime`, 10s by default), so a pid-only read
+  # declared a job removed that launchd still holds and will relaunch (review finding). `lc_probe` is
+  # the read that answers the question, and the pid is kept only for the diagnostic.
+  # ⛔ AND "UNREADABLE" IS NOT "REMOVED": `lc_probe`'s 2 is a FAILED read, which says nothing about the
+  # job. Folding it into "not loaded" made this loop break on the first iteration and delete the plist
+  # over a live controller (review finding).
+  # ⛔ AND THE VERDICT COMES FROM THE PROBE ITSELF (review finding): `prc=0` IS the proof that launchd
+  # still holds the label. Deriving the verdict from a SECOND read (`lc_loaded_path`) re-introduced the
+  # same flattening one layer down — a read that failed, or a block with no parsable `path =` line,
+  # returned empty and the plist was deleted with ✅ printed over a job launchd still had.
+  held=""; pid=""; unread=""; prc=0
+  for _ in 1 2 3 4 5 6 7 8; do
+    prc=0; block=""; block="$(lc_probe "$LABEL")" || prc=$?
+    if [ "$prc" -eq 2 ]; then unread="$block"; break; fi
+    [ "$prc" -eq 0 ] || break          # definitively not loaded: the removal holds
+    held=1
+    pid="$(awk '/^[[:space:]]*pid = [0-9]+$/ { print $3; exit }' <<<"$block")"
+    sleep 1
+  done
+  if [ -n "$unread" ]; then
+    die "launchd's state for $LABEL could not be read after 'launchctl bootout' (${unread:-no output}) — the removal cannot be VERIFIED, so the plist is kept at $PLIST. Next: launchctl print $(lc_domain)/$LABEL | head -20, then re-run this --uninstall"
+  fi
+  if [ -n "$held" ]; then
+    # The plist is KEPT: it is the only handle a verified removal has (and the only thing a human can
+    # inspect), so destroying it here would leave the job loaded with nothing to retry against.
+    die "$LABEL is STILL loaded${pid:+ (pid $pid)} after 'launchctl bootout' — NOT removed, and the plist is kept at $PLIST. Next: launchctl print $(lc_domain)/$LABEL | head -20"
+  fi
   rm -f "$PLIST"
-  echo "✅ Removed $LABEL."
-  echo "   State and logs left intact: $O/{logs,state,wip}"
+  rm -f "$O/state/launchd-loaded.sha256"
+  echo "✅ Removed $LABEL (bootout; no persistent disable written)."
+  echo "   State and logs left intact apart from the loaded-render record: $O/{logs,state,wip}"
   exit 0
 fi
 
@@ -128,8 +212,14 @@ case "$O" in
 esac
 
 # ── platform ─────────────────────────────────────────────────────────────────────
+# ⛔ THE GATE IS REAL (launchd + tmux only exist here) BUT IT IS TEST-ONLY BYPASSABLE. `--uninstall` and
+# `--start` are the incident's own path (#1975), and the only automated gate runs on Linux — without a
+# declared hatch those assertions simply cannot run in CI. Same pattern and same opt-in discipline as
+# the temp-$HOME guard (#446): a test that needs it says so, and a normal run on a Mac never sets it.
 echo "==> preflight"
-[ "$(uname)" = "Darwin" ] || die "this harness uses launchd + tmux; only macOS is supported"
+if [ "$(uname)" != "Darwin" ] && [ "${ELDATO_ALLOW_NON_DARWIN:-}" != "1" ]; then
+  die "this harness uses launchd + tmux; only macOS is supported"
+fi
 [ -f "$TEMPLATE" ] || die "missing template: $TEMPLATE"
 
 # ── dependencies ─────────────────────────────────────────────────────────────────
@@ -471,9 +561,32 @@ if grep -q '__[A-Z_]*__' "$RENDER"; then
   _toks="$(grep -o '__[A-Z_]*__' "$RENDER" | sort -u | tr '\n' ' ')— a template token has no substitution rule"
   rm -f "$RENDER"; die "rendered plist still contains ${_toks}"
 fi
+# ⛔ IS THE LOADED JOB ON THIS RENDER? Recorded BEFORE the mv, because that is the only moment the file
+# content exists — and it is what makes this installer safe on a live box (agent-infra#1975 item 3): a
+# validation run that renders the same bytes must not disturb a healthy production controller.
+#
+# ⛔ BUT "the FILE did not change" is NOT the question (review finding): a plain `install.sh` OVERWRITES
+# the plist without reloading the job, so after any limits change the file matches the render while
+# launchd still runs the old one — and the next `--start` would read "unchanged", skip the reload it
+# exists to perform, and exit 0 with the stale settings still in effect. So the comparison is against
+# the render launchd was last SEEN loading (recorded at every successful start), not against the file.
+# ⛔ AND THERE ARE THREE STATES, NOT TWO (review finding): current, STALE, and UNKNOWN (no record yet —
+# true of every box that has not run `--start` under this version). Unknown must not be reported as
+# stale: a missing record is not a measurement, and telling an operator "it still uses the OLD settings"
+# from an absent file is the "an absent read must not render as a signal" rule. Unknown and stale both
+# reload (safe direction); only the MESSAGE differs. Unknown is written as unknown.
+RENDER_SHA="$(shasum -a 256 "$RENDER" | awk '{print $1}')"
+LOADED_SHA_FILE="$O/state/launchd-loaded.sha256"
+LOADED_SHA="$(cat "$LOADED_SHA_FILE" 2>/dev/null || true)"
+PLIST_STATE=unknown
+if [ -n "$LOADED_SHA" ]; then
+  if [ "$RENDER_SHA" = "$LOADED_SHA" ]; then PLIST_STATE=current; else PLIST_STATE=stale; fi
+fi
+PLIST_CHANGED=1
+[ "$PLIST_STATE" = "current" ] && PLIST_CHANGED=0
 mv -f "$RENDER" "$PLIST"
 ok "plist valid"
-
+if [ "$PLIST_CHANGED" = "0" ]; then ok "plist unchanged and it is the render launchd loaded"; fi
 # launchd runs $O/<script>, not the copies in this directory — check EVERY script the daemon
 # invokes, not just orch-loop.sh. A drift here is silent and serious: a fix applied only to the
 # shipped copy (e.g. the fail-closed ai-review-gate classifier) would never reach the running box.
@@ -682,6 +795,52 @@ STAMPEOF
 write_provenance
 # ── harness provenance (agent-infra#1745) END ──
 
+# ── explicit start / reload — the ONLY launchd-mutating path below the render ───────────────────
+# ⛔ ON THE RENDER PATH (ACTION=none) NOTHING MUTATES LAUNCHD, above or below this line: that is a
+# load-bearing property, not an accident — a plain `install.sh` (validation, drift check, a lane proving
+# the harness installs) must be unable to disturb a healthy production controller, because the last
+# three times it could, the fleet went unsupervised and silent (#1975). The only mutating calls in this
+# file are the `--uninstall` branch (above, which exists to touch a loaded job), `--start` and
+# `--restart`; reloading on a start is implied by a stale loaded job, and is explicit on `--restart`.
+# ⛔ A single-quote-safe spelling: `bash '$HERE/install.sh'` is unparseable when the checkout path
+# contains a `'` (review finding), and this is the string an operator pastes while recovering.
+shq() {
+  local s="$1" out="" c i
+  for (( i=0; i<${#s}; i++ )); do
+    c="${s:i:1}"
+    if [ "$c" = "'" ]; then out="$out'\\''"; else out="$out$c"; fi
+  done
+  printf "'%s'" "$out"
+}
+SELF="bash $(shq "$HERE/install.sh")"
+# How old $O/heartbeat may be before a loaded job counts as "not cycling" — derived from THIS cell's
+# cycle, so a quiet cell (CYC=900) is not declared wedged on a healthy controller. Passed down rather
+# than read from a global: the library must not depend on an unstated variable.
+LC_HB_STALE="${LC_HB_STALE:-$(( CYC * 2 + 300 ))}"
+case "$ACTION" in
+  start)   lc_ensure  "$LABEL" "$PLIST" "$O" "$PLIST_CHANGED" "$START_TIMEOUT" "$LC_HB_STALE" || exit 1 ;;
+  restart) lc_restart "$LABEL" "$PLIST" "$O" "$START_TIMEOUT"                              || exit 1 ;;
+esac
+# Record the render launchd is now running, so the NEXT run can tell "current" from "the file was
+# overwritten earlier and never reloaded" (see PLIST_CHANGED above). Written AFTER the start succeeded —
+# a failed start must leave the old record in place, or the next run would call a stale job current.
+if [ "$ACTION" = "start" ] || [ "$ACTION" = "restart" ]; then
+  mkdir -p "$O/state" 2>/dev/null || true
+  printf '%s\n' "$RENDER_SHA" > "$LOADED_SHA_FILE" 2>/dev/null || warn "could not record the loaded render at $LOADED_SHA_FILE"
+fi
+# Read-only: what launchd says right now, TRI-STATE. Used only to make the closing text TRUE — the old
+# banner said "The loop is NOT running" unconditionally, so an operator reading it after a start had no
+# way to tell a live controller from a dead one. ⛔ AND AN UNREADABLE READ IS NOT "NOT RUNNING" (review
+# finding): `lc_pid` alone returns empty for both "not loaded" and "the read failed", so the one run that
+# could not tell said the most. The block is read ONCE and the pid parsed from it.
+RUNNING_PID=""; LC_STATE=unknown; _blk=""; _prc=0
+_blk="$(lc_probe "$LABEL")" || _prc=$?
+case "$_prc" in
+  0) LC_STATE=loaded; RUNNING_PID="$(awk '/^[[:space:]]*pid = [0-9]+$/ { print $3; exit }' <<<"$_blk")" ;;
+  1) LC_STATE=absent ;;
+  *) LC_STATE=unknown ;;
+esac
+
 cat <<EOF
 
 ✅ Installed $LABEL
@@ -692,11 +851,89 @@ cat <<EOF
   limits    lanes=$MAX_LANES (default: 2.5x cores unless pinned) review=$MAX_REVIEW fix=$MAX_FIX fix_tries=$MAX_FIX_TRIES
             max_load=$MAX_LOAD min_swap_free=${MIN_SWAP_FREE}M min_mem_free_mb=${MIN_MEM_FREE_MB}M batch=$BATCH cycle=${CYC}s
             merge_priority_at=${MERGE_PRIORITY_AT} UNOWNED open PRs
+EOF
 
-The loop is NOT running. To start it:
+if [ "$LC_STATE" = "loaded" ] && [ -n "$RUNNING_PID" ]; then
+  # ⛔ THE BANNER REPORTS WHAT THIS RUN ACTUALLY DID (review finding): on the "already running and
+  # current — left untouched" branch the old text claimed "this run started it and PROVED it", which is
+  # a process claim with no artifact behind it, and it made the honest branch indistinguishable from a
+  # real start.
+  case "${LC_OUTCOME:-}" in
+    left-untouched)
+  cat <<EOF
 
-    launchctl load -w "$PLIST"
+The loop IS running (launchd pid $RUNNING_PID) and this run VERIFIED it — pid present, heartbeat fresh,
+launchd not relaunching it. It was NOT restarted: the loaded job is on the current render.
 
+EOF
+      ;;
+    started|restarted|reloaded)
+  # ⛔ NOT AN INLINE `$(case … esac)` IN THE HEREDOC (review finding): the `)` closing the `reloaded)`
+  # pattern ENDED the command substitution, so bash printed `syntax error near unexpected token` and
+  # substituted NOTHING — every successful start rendered `— this run  printf 'RELOADED' ;; *) printf
+  # 'started' ;; esac) it and PROVED it`. The suite passed it because its assertion looked for the
+  # KEYWORD `RELOADED`, which that garbage happens to contain: a false PASS on the one line an operator
+  # reads after a recovery. Computed first, printed second.
+  case "${LC_OUTCOME:-}" in reloaded) _did="RELOADED" ;; *) _did="started" ;; esac
+  cat <<EOF
+
+The loop IS running (launchd pid $RUNNING_PID) — this run $_did it and PROVED it: the pid exists, it is a NEW
+process, and $O/heartbeat advanced.
+
+EOF
+      ;;
+    *)
+  cat <<EOF
+
+The loop IS running (launchd pid $RUNNING_PID).
+
+EOF
+      ;;
+  esac
+else
+  if [ "$LC_STATE" = "loaded" ]; then
+  cat <<EOF
+
+$LABEL is LOADED but has no pid right now — that is what a KeepAlive job looks like inside its respawn
+throttle. Next: launchctl print $(lc_domain)/$LABEL | head -20
+
+EOF
+  elif [ "$LC_STATE" = "unknown" ]; then
+  cat <<EOF
+
+⛔ launchd's state for $LABEL could NOT be read, so whether the loop is running is UNKNOWN — this run
+cannot answer it. Next: launchctl print $(lc_domain)/$LABEL | head -20
+
+EOF
+  else
+  cat <<EOF
+
+The loop is NOT running. Start it — and have the start PROVEN (pid + heartbeat), not assumed:
+
+    $SELF --start
+
+EOF
+  fi
+fi
+
+# A loaded job that is not on this render with a live controller is the ONE case a plain run leaves
+# genuinely wrong, so it is said out loud rather than left for an operator to discover from a limits
+# value that never took effect. PLIST_CHANGED is 1 for STALE and for UNKNOWN — and the two must not
+# share a sentence, because only one of them is a measurement (see PLIST_STATE above).
+if [ "$ACTION" = "none" ] && [ "$PLIST_CHANGED" = "1" ] && [ "$LC_STATE" = "loaded" ]; then
+  case "$PLIST_STATE" in
+    stale)
+  warn "the loaded job is NOT on the rendered plist and $LABEL is running (pid $RUNNING_PID) — it still uses the OLD settings"
+  warn "  apply them safely: $SELF --restart   (enable → bootout → bootstrap, then verifies pid + heartbeat)"
+      ;;
+    *)
+  warn "which render launchd loaded is UNKNOWN (no $LOADED_SHA_FILE record yet — one is written by a successful --start), so this run cannot tell whether $LABEL (pid $RUNNING_PID) is on the current settings"
+  warn "  prove it: $SELF --start   (reloads once, then records the render it loaded)"
+      ;;
+  esac
+fi
+
+cat <<EOF
 Watch it (the first line of the decision log each cycle):
 
     tail -f "$O/logs/orch-loop.log"
@@ -707,5 +944,6 @@ Liveness — a stale heartbeat means the controller is wedged:
 
 Stop it before handing the machine to a human, and capture dirty work (README §6):
 
-    launchctl unload -w "$PLIST"; pkill -f orch-loop.sh; rm -f "$O/.orch.lock"
+    $SELF --uninstall        # bootout + remove the plist — NO persistent disable is written
+    pkill -f orch-loop.sh; rm -f "$O/.orch.lock"
 EOF

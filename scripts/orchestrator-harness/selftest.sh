@@ -45,6 +45,16 @@ on_darwin() { [ "${PLATFORM:-}" = "Darwin" ]; }
 # need the real resolution build their own PATH explicitly (§17 daemon-PATH, §6c) and are unaffected.
 GSTUB="$TMP/stub-bin"; mkdir -p "$GSTUB"
 printf '#!/bin/bash\n[ -n "${GH_HOME_RECORD:-}" ] && printf "%%s\\n" "$HOME" >> "$GH_HOME_RECORD"\nexit 0\n' > "$GSTUB/gh"; chmod +x "$GSTUB/gh"
+# ⛔ AND A `launchctl` STUB. install.sh READS the domain on every run (the closing banner) and
+# `--uninstall` removes the job — against the REAL launchd, from a sandbox $HOME whose rendered plist
+# carries the PRODUCTION label. Measured 2026-10-17: that removal resolves by label, so this self-test
+# booted the live controller out. Nothing here may reach the real launchd.
+# ⛔ AND IT MUST SPEAK launchd's OWN NOT-FOUND LANGUAGE (`Could not find service …`, exit != 0), not a
+# bare `exit 1`: `lc_probe` classifies a non-zero read with UNRECOGNISED output as UNKNOWN and the guard
+# then refuses, so a silent stub made every `install.sh --uninstall` here fail — and the failing check
+# was labelled "blocked by SCOPE=banana", pointing the next lane at config validation instead of a
+# fixture (review finding: a registered shard went red). Real launchd prints exactly this line.
+printf '#!/bin/bash\nprintf "Bad request.\\nCould not find service in domain for user gui: 0\\n" >&2\nexit 1\n' > "$GSTUB/launchctl"; chmod +x "$GSTUB/launchctl"
 PATH="$GSTUB:$PATH"; export PATH
 echo "==> offline self-test ($HERE)"
 
@@ -606,7 +616,11 @@ if on_darwin; then
 FB="$TMP/pathbin"; mkdir -p "$FB" "$TMP/sb3/Library/LaunchAgents" "$TMP/sb3/.config" "$TMP/sb3/.pi/agent/scripts"
 for b in tmux gh pi; do printf '#!/bin/bash\nexit 0\n' > "$FB/$b"; chmod +x "$FB/$b"; done
 ln -s "$HOME/.config/gh" "$TMP/sb3/.config/gh" 2>/dev/null || true
-HOME="$TMP/sb3" O="$TMP/path-o" REPO="$HERE/../.." OR="acme/widget" PATH="$FB:/usr/bin:/bin" bash "$INST" > "$TMP/inst-path.out" 2>&1
+# ⛔ AND THE STUB MUST STAY ON *EVERY* PATH THIS FILE HANDS THE INSTALLER (review finding, T5): this
+# line used to be PATH="$FB:/usr/bin:/bin", which DROPPED $GSTUB, so install.sh's post-install banner read
+# the REAL domain (`launchctl print gui/<uid>/com.eldato.orchestrator-loop`). Read-only that day — and one
+# added mutating call away from the 2026-10-17 incident this whole file guards against.
+HOME="$TMP/sb3" O="$TMP/path-o" REPO="$HERE/../.." OR="acme/widget" PATH="$FB:$GSTUB:/usr/bin:/bin" bash "$INST" > "$TMP/inst-path.out" 2>&1
 PL3="$TMP/sb3/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
 [ -f "$PL3" ] && rc=0 || { rc=1; echo "      controlled-PATH install did not render: $(tail -3 "$TMP/inst-path.out")"; }
 ck "install.sh renders with a controlled PATH (uv absent stays non-fatal)" $rc
@@ -1553,8 +1567,10 @@ for bad in 'o space' "o'q" 'o"q' 'o`q' 'o$q' 'o;q' 'o|q' 'o&q'; do
 done
 
 # --uninstall renders nothing, so an unrelated SCOPE typo must not block it: the operator removing
-# a misbehaving daemon is exactly who must not be stopped by it.
-( HOME="$SB" SCOPE=banana bash "$INST" --uninstall >/dev/null 2>&1 ); rc=$?
+# a misbehaving daemon is exactly who must not be stopped by it. ELDATO_ALLOW_TEST_HOME=1 is the #446
+# opt-in — this $HOME is a sandbox, so install.sh would otherwise (correctly) refuse to touch launchd;
+# with it, the `launchctl` stub above stands in for the real domain.
+( HOME="$SB" ELDATO_ALLOW_TEST_HOME=1 SCOPE=banana bash "$INST" --uninstall >/dev/null 2>&1 ); rc=$?
 [ "$rc" -eq 0 ] && rc=0 || { rc=1; echo "      install.sh --uninstall was blocked by SCOPE=banana"; }
 ck "install.sh --uninstall is not blocked by an invalid SCOPE" $rc
 
