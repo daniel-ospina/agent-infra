@@ -42,6 +42,11 @@
 # nothing is read from or written to the operator's ~/.local/state.
 # Run:  bash scripts/orchestrator-bringup.test.sh
 #       BRINGUP=path/to/other/copy bash scripts/orchestrator-bringup.test.sh   # non-vacuity runs
+# ⛔ COPY THE SCRIPTS INTO A GIT CHECKOUT (a throwaway `git init` + one commit is enough). One arm
+# resolves its own `$HERE` through `git worktree list` and reports cannot-determine when that copy has
+# no checkout around it, which reddens ~15 Mac arms that have nothing to do with the change —
+# measured in review of #1856: the recipe above produced 15 spurious reds plus the real ones, so a
+# reader could not attribute a red.
 
 set -uo pipefail
 
@@ -584,7 +589,7 @@ OUT="$(env -i HOME="$L/home" XDG_STATE_HOME="$L/home/.local/state" \
   bash "$L/scripts/orchestrator-bringup.sh" start 2>&1)"; RC=$?
 case "$OUT" in
   *"ALREADY RUNNING"*"pid $L_PID"*) ok "start (cell): a second controller for the SAME repo in a different \$O is REFUSED, naming pid $L_PID" ;;
-  *) bad "start (cell) did not refuse a duplicate $SLUG in a different state dir — rc=$RC $OUT" ;;
+  *) bad "start (cell) did not refuse a duplicate of the same repo in a different state dir — rc=$RC $OUT" ;;
 esac
 [ "$RC" = 1 ] && ok "start (cell): rc=1 on the duplicate refusal" || bad "start (cell): rc=$RC, want 1"
 # ⛔ ASSERT ON THE STUB'S OWN CALL LOG. The previous arm tested `[ ! -f "$L/sup/started" ]`, and the L
@@ -725,6 +730,23 @@ case "$OUT" in
   *"controller: RUNNING  pid $S_PID"*"lock: none"*) bad "shared harness: repo B claimed repo A's controller as its own" ;;
   *) bad "shared harness: B's answer is neither a claim nor a disclaimer — $OUT" ;;
 esac
+# …AND WHEN B IS RUNNING ITS OWN CONTROLLER TOO, it must still REPORT A's. The `elif` published the
+# foreign population only when this state dir owned nothing, so on a two-repo machine B's `status` —
+# the screen an operator reads — never mentioned A although the read had it (#1856 review).
+mk_controller "$S/OB"
+S_PID_B="$(start_controller "$S/OB")"; sleep 0.4
+printf '%s\n' "$S_PID_B" > "$S/OB/.orch.lock"
+BRINGUP_ARGS=status srun REPO="$S/repoB" O="$S/OB"
+case "$OUT" in
+  *"controller: RUNNING  pid $S_PID_B"*) ok "shared harness: B names its OWN controller" ;;
+  *) bad "shared harness: B lost its own controller — $OUT" ;;
+esac
+case "$OUT" in
+  *"also seen:"*"pid $S_PID"*) ok "shared harness: B ALSO reports A's controller while owning one (the population it can see is published)" ;;
+  *) bad "shared harness: B's status hides the other repo's live controller — $OUT" ;;
+esac
+kill -9 "$S_PID_B" 2>/dev/null; wait "$S_PID_B" 2>/dev/null
+
 BRINGUP_ARGS=check srun REPO="$S/repoB" O="$S/OB"
 case "$OUT" in
   *"also seen (NOT this state dir's): pid $S_PID"*) ok "shared harness: check REPORTS A's controller as foreign, not as B's" ;;
@@ -791,6 +813,48 @@ BRINGUP_ARGS=stop nrun REPO="$N/repo" O="$N/O"
   || bad "stop (cell): the record for \$O survived its own stop"
 
 
+say_case "§10 two branches no fixture could reach: an empty-host origin, and an unparseable record"
+U="$T/u"; mk_bin "$U/bin" cell; mkdir -p "$U/home" "$U/O" "$U/repo"
+printf 'DEEPSEEK_API_KEY=sk-test\n' > "$U/home/keys.env"
+urrun() { OUT="$(env -i HOME="$U/home" XDG_STATE_HOME="$U/home/.local/state" \
+    PATH="$U/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" CELL_HOME="$U/home" \
+    REPO="$U/repo" O="$U/O" "$@" bash "$BRINGUP" ${BRINGUP_ARGS:-} 2>&1)"; RC=$?; }
+# (a) `https:///srv/elsewhere/agent-infra` HAS a scheme and a path but NO host, so it reaches the host
+# check rather than the unknown-scheme branch. Deriving `srv/elsewhere` from it here while the
+# supervisor's queue parser refuses the same URL is the two-authorities fail-open (#1745 shape).
+git init -q "$U/repo" && git -C "$U/repo" remote add origin "https:///onyx/tortoise"
+BRINGUP_ARGS=check urrun OR="daniel-ospina/agent-infra"
+[ "$RC" -ne 0 ] && ok "identity: a scheme URL with an EMPTY HOST is refused, not derived from its path" \
+                || bad "identity: derived a repo from https:///onyx/tortoise — the empty-host refusal is not reached"
+case "$OUT" in
+  *onyx/tortoise*) bad "identity: the refusal still prints a derived 'onyx/tortoise' repo — $OUT" ;;
+  *) ok "identity: no repo is invented from the hostless URL" ;;
+esac
+# …and the plain `file://` form (no scheme this machine can read) is refused by its own branch.
+git -C "$U/repo" remote set-url origin "file:///onyx/tortoise"
+BRINGUP_ARGS=check urrun OR="daniel-ospina/agent-infra"
+[ "$RC" -ne 0 ] && ok "identity: an unreadable scheme (file://) is refused too" \
+                || bad "identity: accepted file:// as an origin — $OUT"
+# (b) a record whose pid cannot be parsed. `unreadable` must reach the callers' refusal (unknown, rc=2)
+# — reading it as `absent` would launch a second controller for a repo that may be running.
+git -C "$U/repo" remote set-url origin "https://github.com/daniel-ospina/agent-infra.git"
+mkdir -p "$(registry_dir "$U/home")"
+printf 'repo=daniel-ospina/agent-infra\nO=%s\npid=notanumber\nstarted=1\nstate=running\n' "$U/O" \
+  > "$(registry_dir "$U/home")/daniel-ospina~agent-infra"
+for verb in check start; do
+  BRINGUP_ARGS="$verb" urrun OR="daniel-ospina/agent-infra"
+  [ "$RC" = 2 ] && ok "$verb: an UNPARSEABLE record is rc=2 (cannot judge), never 'absent'" \
+                || bad "$verb: rc=$RC on a record whose pid cannot be parsed — a record that cannot be read must not read as 'no owner' — $OUT"
+done
+: > "$(registry_dir "$U/home")/daniel-ospina~agent-infra"
+BRINGUP_ARGS=check urrun OR="daniel-ospina/agent-infra"
+[ "$RC" = 0 ] && ok "check: an EMPTY record is reported as a reclaimable stale entry (not a refusal)" \
+              || bad "check: rc=$RC on an empty record — $OUT"
+case "$OUT" in
+  *"stale"*) ok "check: says the empty record is stale ('start' reclaims it)" ;;
+  *) bad "check: does not classify the empty record — $OUT" ;;
+esac
+
 # ── §9 an UNREADABLE read is cannot-determine — on every verb, for BOTH failure shapes ──────────
 # Two distinct shapes, and the second is the one that hides: `ps` failing outright (an empty table)
 # and `ps` answering the TABLE while failing the AGE of one pid (a PS_BIN shim, a ps without
@@ -852,11 +916,23 @@ kill -0 "$R_PID" 2>/dev/null && ok "stop: the undatable owner was NOT signalled"
   || bad "registry_slug accepted a non-owner/repo form — refused only:$(cat "$T/bad-slugs")"
 (
   . "$(lib_src)/orchestrator-registry.sh"
+  export XDG_STATE_HOME="$T/xdg"
   registry_slug "Daniel-Ospina/Agent-Infra" > "$T/slug1"; registry_slug "daniel-ospina/agent-infra" > "$T/slug2"
+  # The KEY is what the guard compares, but the FILE is what it reads: assert the path too, so a
+  # regression that folds only the printed slug reddens here (#1856 review).
+  registry_file "Daniel-Ospina/Agent-Infra" > "$T/file1"; registry_file "daniel-ospina/agent-infra" > "$T/file2"
+  # BOTH parts may contain `-`, so the separator must not be one: these two must stay TWO records.
+  registry_file "premise-labs/agent-infra" > "$T/file3"; registry_file "premise/labs-agent-infra" > "$T/file4"
 )
 [ "$(cat "$T/slug1")" = "$(cat "$T/slug2")" ] && [ "$(cat "$T/slug1")" = "daniel-ospina~agent-infra" ] \
   && ok "registry_slug: one key for one repo regardless of case, joined with '~'" \
   || bad "registry_slug: case-fold/separator wrong ($(cat "$T/slug1") vs $(cat "$T/slug2"))"
+[ "$(cat "$T/file1")" = "$(cat "$T/file2")" ] \
+  && ok "registry_file: one casing of one repo addresses ONE record (a second casing cannot read 'absent')" \
+  || bad "registry_file: the two casings address different records ($(cat "$T/file1") vs $(cat "$T/file2")) — the duplicate guard fails open"
+[ "$(cat "$T/file3")" != "$(cat "$T/file4")" ] \
+  && ok "registry_file: 'premise-labs/agent-infra' and 'premise/labs-agent-infra' are TWO records (the '-' collision)" \
+  || bad "registry_file: two distinct repos share one record — a '-' separator would do exactly this"
 kill -9 "$R_PID" 2>/dev/null; wait "$R_PID" 2>/dev/null
 
 echo

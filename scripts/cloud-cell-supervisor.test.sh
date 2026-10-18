@@ -1700,6 +1700,14 @@ sleep 0.6
 CHILD="$(pgrep -P "$ROOT" 2>/dev/null | head -1)"
 [ -n "$CHILD" ] && { AI1761_PIDS="$AI1761_PIDS $CHILD"; ok "fixture: the controller stub spawned a matching CHILD (pid $CHILD)"; } \
                  || bad "fixture: the controller stub spawned no child — the exclusion cannot be exercised"
+# ⛔ COUNT NOW, NOT AFTER THE NEXT TWO SUPERVISOR CALLS. The child is deliberately short-lived
+# (`sleep 2`), and the count used to be taken after two whole invocations — measured at 2086-2382ms
+# against a child that dies at 2000ms, so the arm reddened on BYTE-IDENTICAL code (1-of-3, then
+# 3-of-5 across runs), which reads as a regression in the ownership exclusion (#1856 review).
+# Portable count: macOS `pgrep` has no `-c`, so `pgrep -cf` reads 0 on a Mac.
+NAIVE="$(pgrep -f "$L/o/orch-loop.sh" 2>/dev/null | wc -l | tr -d ' ')"
+[ "${NAIVE:-0}" -ge 2 ] && ok "fixture: a naive pgrep count sees $NAIVE (the exclusion is non-vacuous)" \
+                      || bad "fixture: the naive count is ${NAIVE:-0} — the exclusion proves nothing"
 # The read names the OWNER and its SCOPE — the #1761 verification read, not a session probe.
 OUT="$(own_sup status)"
 case "$OUT" in
@@ -1714,12 +1722,6 @@ esac
   *"pid $ROOT $CHILD"*|*"pid $CHILD"*) bad "status: reported the controller's CHILD as a second controller" ;;
   *) ok "status: EXCLUDED the controller's child (a descendant is not a duplicate)" ;;
 esac; }
-# Non-vacuity: the exclusion is doing work only if a naive read DOES see two.
-# Portable count: macOS `pgrep` has no `-c` (it exits with a usage error), so `pgrep -cf` read 0
-# everywhere on a Mac and this arm reddened for a reason that had nothing to do with the exclusion.
-NAIVE="$(pgrep -f "$L/o/orch-loop.sh" 2>/dev/null | wc -l | tr -d ' ')"
-[ "${NAIVE:-0}" -ge 2 ] && ok "fixture: a naive pgrep count sees $NAIVE (the exclusion is non-vacuous)" \
-                      || bad "fixture: the naive count is ${NAIVE:-0} — the exclusion proves nothing"
 # THE #1761 MECHANISM: a launcher removes the lock while the controller lives. The read must NOT
 # fall back to STOPPED, and `start` must not launch a second controller.
 rm -f "$L/o/.orch.lock"

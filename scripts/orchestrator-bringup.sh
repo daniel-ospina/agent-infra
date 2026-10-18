@@ -904,6 +904,13 @@ cmd_status() {
   else
     say "controller: STOPPED"
   fi
+  # ⛔ AND REPORT THE OTHER REPO EVEN WHEN THIS ONE OWNS A CONTROLLER. The `elif` above published the
+  # foreign population only when this state dir owned nothing, so on a two-repo machine B's `status` —
+  # the one screen an operator reads — showed B's controller and never mentioned A's, although the
+  # read had it. `check` prints both; two answers to one question is the defect, and an unreported
+  # population is how a reader over-reads a verdict (#1856 review; docs/ops/fleet-liveness.md §5).
+  [ -z "$own" ] || [ -z "$foreign" ] \
+    || say "also seen:  pid $(pids_join "$foreign") — NOT this state dir's (another repo on this machine's shared harness path); reported, never signalled"
   if [ -n "${SLUG:-}" ]; then
     local f v; f="$(registry_file "$SLUG_REPO")"; v="$(registry_verdict "$f" | tr '\t' ' ')"
     say "registry:   $v$([ -f "$f" ] && printf '  (%s)' "$f")"
