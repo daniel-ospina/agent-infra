@@ -484,7 +484,11 @@ else bad "the job was never enabled"; fi
 
 # ── D. lc_ensure: safe on a live box ─────────────────────────────────────────────────────────────
 echo "-- D. lc_ensure leaves a healthy controller alone"
-mutating_calls() { grep -vE '^(print|print-disabled|kickstart)( |$)' "$FAKE_LOG" 2>/dev/null || true; }
+# ⛔ `kickstart` is NOT read-only — it starts (or with `-k`, restarts) the job. Excluding it would make
+# every "ZERO mutating launchctl calls" assertion below pass while a future `launchctl kickstart`
+# restarted the live controller (review finding). Only `print` and `print-disabled` are reads (`verbs()`
+# counts `kickstart` as a call for the same reason).
+mutating_calls() { grep -vE '^(print|print-disabled)( |$)' "$FAKE_LOG" 2>/dev/null || true; }
 
 fresh "$(( $(date +%s) - 5 ))"
 ( . "$LIB"; lc_start "$LABEL" "$T/o/x.plist" >/dev/null 2>&1 )
@@ -783,7 +787,7 @@ ORUN() { # <extra args…>
     PATH="$SHOME/.local/share/pi-node/current/bin:$T/bin:$PATH" \
     bash "$STAGE/install.sh" "$@"
 }
-mutating() { grep -vE '^(print|print-disabled|kickstart)( |$)' "$FAKE_LOG" 2>/dev/null || true; }
+mutating() { mutating_calls; }   # ONE definition (the two drifted apart once already)
 
 fresh
 out="$(ORUN 2>&1)"; rc=$?
@@ -1160,12 +1164,14 @@ assert_contains "$out" "could not be read" "…and names the failed read"
 assert_not_contains "$(calls)" "bootstrap" "…and NOTHING was mutated (no bootstrap over a live job)"
 
 # ── P. the ENABLE is verified: all four answers of `print-disabled` ─────────────────
-echo "-- P. the persistent Disable override is read back, and all four answers behave"
-# Five answers: two healthy (an override that reads `enabled`, and NO override at all — which a
-# successful-but-empty `print-disabled` also means), one definite refusal, and two unknowns (a failed
-# read, and an entry we cannot classify). The healthy pair must be SILENT: `unset` is the state of
-# every real box that carries no override, and reporting it as an unreadable answer is the false
-# alarm the split exists to remove.
+echo "-- P. the persistent Disable override is read back, and all six fixtures behave"
+# SIX fixtures, FOUR states:
+#   healthy  — `enabled`, `unset` (no line for our label: the state of a box with no override at all),
+#              `silent` (exit 0, empty output — also "no override"; a successful-but-empty answer is an
+#              ANSWER, and scoring it UNKNOWN is the false alarm the split exists to remove);
+#   refused  — `disabled`;
+#   unknown  — `fail` (the verb failed), `garbage` (an entry we cannot classify).
+# The three healthy ones must be SILENT: a healthy box that warns about itself is the failure mode.
 for pd in enabled unset silent disabled fail garbage; do
   fresh
   export FAKE_PD="$pd"
@@ -1184,6 +1190,8 @@ for pd in enabled unset silent disabled fail garbage; do
       # `print-disabled` is READ-ONLY (launchd-cycle.sh's own doctrine). It sits on lc_start's success
       # path, so a filter that does not exclude it makes a read look like a mutation to every future
       # "zero mutating calls" assertion.
+      # `assert_not_contains` alone passes whether or not `lc_start` ever reads it, so name the read too.
+      assert_contains "$(calls)" "print-disabled" "…and the enable really was READ BACK"
       assert_not_contains "$(mutating_calls)" "print-disabled" "…and the read-back is not scored as a mutation" ;;
     fail|garbage)
       if [ "$rc" -eq 0 ]; then ok "print-disabled='$pd' warns and CONTINUES (the bootstrap is the proof)"; else bad "an unreadable override was a false block: $out"; fi
@@ -1192,6 +1200,13 @@ for pd in enabled unset silent disabled fail garbage; do
   esac
 done
 unset FAKE_PD
+# `kickstart` STARTS the job (and `-k` restarts it), so it must never be filtered out of a
+# "zero mutating calls" assertion — the library does not call it today, and this keeps that true if it
+# ever does. (Review finding: the filter excluded it, so such an assertion could not fail.)
+: > "$FAKE_LOG"
+printf '%s\n' "kickstart gui/501/$LABEL --kill" >> "$FAKE_LOG"
+assert_contains "$(mutating_calls)" "kickstart" "kickstart IS counted as a mutation (it starts the job)"
+: > "$FAKE_LOG"
 
 # ── Q. an ABSENT heartbeat is not a duration ──────────────────────────────────────────
 # `lc_hb_age` returns EMPTY when the file is missing or unparseable. Rendering that as
@@ -1208,7 +1223,7 @@ if [ "$rc" -ne 0 ]; then ok "a MISSING heartbeat refuses (non-zero)"; else bad "
 # The substring names the DATUM, not just the phrase: `lc_guard_mutate` and `lc_probe` refuse with
 # "could not be read" too, so a generic match would keep passing if the probe or the guard were what
 # actually refused in this fixture (review finding).
-assert_contains "$out" "heartbeat is missing" "…and names the MISSING heartbeat specifically"
+assert_contains "$out" "heartbeat is missing or not a regular file" "…and names the MISSING heartbeat specifically"
 assert_not_contains "$out" "running but not cycling" "…and does NOT claim the controller is wedged"
 assert_not_contains "$out" "unreadables old" "…and never prints a value it did not read"
 
@@ -1222,7 +1237,7 @@ printf '%s\n' "$(( $(date +%s) + 86400 ))" > "$T/o/heartbeat"
 out="$( . "$LIB"; LC_SETTLE=1 lc_ensure "$LABEL" "$T/o/x.plist" "$T/o" 0 2 2>&1 )"; rc=$?
 if [ "$rc" -ne 0 ]; then ok "a FUTURE-dated heartbeat refuses too (non-zero)"; else bad "a future instant was accepted as a duration"; fi
 assert_contains "$out" "is PRESENT but is not a usable instant" "…and it does NOT call a present file 'missing'"
-assert_not_contains "$out" "missing (no readable file)" "…(the missing wording stays off this arm)"
+assert_not_contains "$out" "is missing or not a regular file" "…(the missing wording stays off this arm)"
 assert_not_contains "$out" "running but not cycling" "…and it does not claim the controller is wedged"
 
 # ── O. the last empty-is-falsy traps ─────────────────────────────────────────────────────────────

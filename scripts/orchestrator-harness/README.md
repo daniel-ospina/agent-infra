@@ -1040,7 +1040,7 @@ implemented or explicitly not claimed:
 | actually load the job (not just PRINT the command) | `install.sh --start` / `--restart` call `lc_start`; a plain run never starts anything |
 | assert the job came back | `lc_assert_running`: new pid + heartbeat strictly advanced + `runs` did not move across the settle window |
 | remove by proof, not by label | `lc_guard_mutate` reads the loaded job's `path =` and refuses unless it is this plist |
-| an unreadable domain is UNKNOWN | every read is tri-state; UNKNOWN refuses or withholds the claim instead of being scored |
+| an unreadable domain is UNKNOWN | every read of launchd's JOB STATE is tri-state (`lc_probe`); not every read in the file is — `lc_min_runtime` falls back to launchd's own 10 s default, and a successful-but-empty `print-disabled` reads as `unset` (no override), because that is exactly what it means. UNKNOWN refuses or withholds the claim instead of being scored |
 
 ⛔ **What is still GAP is the reporting side, and it is the item that matters most**: nothing
 **detects** a job that has been disabled or booted out — `KeepAlive`/`RunAtLoad`
