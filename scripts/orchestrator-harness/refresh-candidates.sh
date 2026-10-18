@@ -1071,20 +1071,85 @@ n=0
 # answering from partial evidence — the broken-environment fingerprint this gate exists to catch),
 # and a run that emitted no VERDICT at all. See the property assertion after the loop.
 usable=0
-# `judged` counts the candidates the pre-flight ACTUALLY RAN — `n` counts the slots the loop
-# ATTEMPTED, because it is incremented before the LIMIT break. The abort and the final report use
-# `judged`, so neither over-states the pass by one (#1853 review).
+# ── TWO BUDGETS: `n` IS SLOTS FILLED, `judged` IS PRE-FLIGHT RUNS (agent-infra#1729) ─────────────
+# `n` counts the SLOTS this pass filled, and a slot is filled ONLY by a verdict that MOVES THE HEAD:
+# CLEAN (queued, and `checked.txt` then retires it from every later pass) or LANDED (the issue left
+# the pool by itself). A COLLISION, an INCOMPLETE, a DEGRADED answer or a verdict-less run fills NO
+# slot — that candidate stays exactly where it was in `$O/.pool`.
+# ⛔ WHY THE DISTINCTION IS THE FIX. `n` used to be incremented for every candidate the loop TOUCHED,
+# so `$LIMIT` consecutive candidates a peer held consumed the WHOLE window. MEASURED on the live
+# controller, four consecutive passes (orch-loop.log, 2026-10-18):
+#     queue=READ(200) … =#8486 =#8488 =#8999 =#7773 =#8083 =#8084 collision … checked 6; backlog now 0
+# — the SIX lowest-numbered candidates, every one of them held by a peer, every pass, forever, while
+# 194 other candidates were never examined (`candidates.txt` pinned at 0 lines). The intake was not
+# blind (READ(200) is honest); it was starved by a cursor that could never advance: `$O/.pool` is
+# rebuilt `tier, then number` on every pass, nothing rotated it, and a collision is deliberately left
+# UNCHECKED so the same six sat at the head again. `COLLISION` counts as `usable`, so even the
+# "judged NOTHING" abort below stayed quiet and the pass read as healthy while it queued nothing.
+# ⛔ SO A PASS WALKS PAST A CANDIDATE IT CANNOT MOVE, bounded by `RUN_BUDGET` pre-flight RUNS — a
+# hard cost bound, because each run is a network call against a rate-limit bucket four boxes share.
+# A healthy pass still stops after `$LIMIT` slots and costs exactly what it did before; only a
+# blocked head spends the allowance, and only to reach the candidates behind it.
 judged=0
+RUN_BUDGET=$(( LIMIT * 2 ))
 degraded=0
 # Issue-claim outcomes for THIS pass, so a run whose registry answered nothing can NAME the registry
 # instead of looking like a healthy cell with an empty pool (2026-10-16 review: `lanes: 0` and an
 # unreadable registry were indistinguishable from the outside, and the per-issue lines scroll away).
 ICR_INCOMPLETE=0; QUEUED=0
+# ── THE COLLISION LEDGER: what this pass — and the last TTL of passes — knows is HELD ────────────
+# Walking past a blocked head fixes ONE pass; with no record, the NEXT pass starts at the same head
+# and re-buys the same six collisions — six network runs a pass on a bucket four boxes share
+# (measured on the live controller: core remaining fell 3684 -> 3249 -> 2931 -> 2397 over three
+# passes). So a COLLISION is recorded with the epoch at which that record expires, and a later pass
+# walks past it for free.
+# ⛔ WHAT MAKES IT SAFE. (1) It can only skip a PRE-FLIGHT, never a dispatch: a skipped candidate is
+# left exactly where a COLLISION leaves it — unqueued, un-`checked`, still in the pool. (2) Every
+# record EXPIRES (`POOL_COLLISION_TTL`, 900 s) and expired records are dropped on the next write, so
+# a collision is DEFERRED, never dropped — #1716's contract that a held candidate is retried on a
+# later pass holds, and the worst a stale record can cost is one TTL of delay on work a peer holds.
+# (3) ONLY `COLLISION` IS RECORDED. A DEGRADED answer, an INCOMPLETE registry and a verdict-less run
+# are ENVIRONMENT failures, not peer collisions: suppressing those for a TTL would hide the
+# merge-only / starved-read defect this script exists to surface (#1736). They still get the in-pass
+# skip-ahead, so they cannot consume the whole window either — they are re-judged next pass, loudly.
+# (4) An ABSENT or UNREADABLE ledger means "nothing is known to be held": the conservative direction
+# is to pre-flight a candidate again (one wasted run), never to skip one on evidence nobody read.
+COLLISION_LEDGER="$O/state/collided"
+COLLISION_TTL="${POOL_COLLISION_TTL:-900}"
+case "$COLLISION_TTL" in ''|*[!0-9]*) COLLISION_TTL=900 ;; esac
+COLLIDED_FRESH=" "      # space-hedged, so `case … in *" $N "*)` cannot match a substring of a number
+COLLIDED_NEW=""         # numbers THIS pass found held by a peer
+skipped=0               # candidates walked past because a recent pass already found them held
+_now="$(date +%s 2>/dev/null || echo 0)"
+# ⛔ A RECORD MAY NOT DEFER A CANDIDATE FOR LONGER THAN A TTL. This script only ever writes
+# `now + TTL`, so an expiry further out than `2 × TTL` is CORRUPTION (a truncated or hand-edited
+# file), and the conservative direction is to judge the candidate again — never to let a stale flag
+# suppress work for ever. The bound is derived locally, so a bad record requires no cleanup.
+_max="$(( _now + COLLISION_TTL * 2 ))"
+if [ -r "$COLLISION_LEDGER" ]; then
+  while read -r _exp _iss; do
+    [ -n "${_iss:-}" ] || continue
+    case "$_exp" in ''|*[!0-9]*) continue ;; esac   # a corrupt record is not evidence of a block
+    [ "$_exp" -gt "$_now" ] || continue             # EXPIRED => judged again, i.e. never dropped
+    [ "$_exp" -le "$_max" ] || continue             # ABSURD future => corruption => judged again
+    COLLIDED_FRESH="$COLLIDED_FRESH$_iss "
+  done < "$COLLISION_LEDGER"
+fi
 while read -r N; do
   [ -z "${N:-}" ] && continue
   grep -qx "$N" "$O/checked.txt" 2>/dev/null && continue
   grep -qx "$N" "$O/dispatched.txt" 2>/dev/null && continue
-  n=$((n+1)); [ "$n" -gt "$LIMIT" ] && break
+  # A candidate a recent pass already found HELD is walked past at NO network cost. It is NOT written
+  # to `checked.txt`: when the record expires the normal path judges it again (ledger note above).
+  case "$COLLIDED_FRESH" in
+    *" $N "*)
+      skipped=$((skipped + 1))
+      echo "[refresh] >#$N SKIPPED — a pass less than ${COLLISION_TTL}s ago found a peer holding it; retried when that record expires (agent-infra#1729)"
+      continue ;;
+  esac
+  # ⛔ STOP ON SLOTS FILLED, OR ON RUNS SPENT — never on "candidates touched".
+  [ "$n" -ge "$LIMIT" ] && break
+  [ "$judged" -ge "$RUN_BUDGET" ] && break
   # ⛔ A pre-flight that ERRORED is not a verdict — and a COLLISION is not terminal. `echo "$N" >>
   # checked.txt` used to run BEFORE the verdict was read, so a pre-flight that produced no VERDICT
   # line (API failure, missing venv, timeout) blacklisted the issue forever, invisibly: checked.txt
@@ -1182,6 +1247,7 @@ while read -r N; do
             fi
             usable=$((usable + 1))
             QUEUED=$((QUEUED + 1))
+            n=$((n + 1))     # a SLOT is filled: this candidate has left the head for good (#1729)
             echo "[refresh] +#$N CLEAN -> backlog" ;;
           1) # a live claim: a peer owns it. Leave it UNCHECKED so the next pass re-attempts it —
              # a claim is a window, not a verdict (the peer's work lands).
@@ -1191,6 +1257,9 @@ while read -r N; do
              # state this check exists for, while the pass has already printed a verdict per candidate
              # (#1853 review). ICR=2 (INCOMPLETE) stays uncounted — that is not a verdict.
              usable=$((usable + 1))
+             # Held by a peer, so the next pass walks past it for free instead of re-buying this
+             # verdict — for `POOL_COLLISION_TTL` seconds, after which it is judged again (#1729).
+             COLLIDED_NEW="$COLLIDED_NEW$N "
              echo "[refresh] =#$N COLLISION (cross-box issue claim) — $CLAIM_RESULT; retried next pass" ;;
           2) # unreadable registry: INCOMPLETE, never CLEAN. Also left unchecked, so the issue is
              # re-attempted rather than lost, and NOT queued, so nothing is dispatched on a guess.
@@ -1218,6 +1287,7 @@ while read -r N; do
         echo "[refresh] ?#$N COLLISION is DEGRADED (the pre-flight could not query every surface) — not counted as a verdict, left unchecked for the next pass"
       else
         usable=$((usable + 1))
+        COLLIDED_NEW="$COLLIDED_NEW$N "   # a peer holds it: recorded so the next pass skips it (#1729)
         echo "[refresh] =#$N collision — a peer owns it, retried next pass"
       fi ;;
     LANDED)
@@ -1229,6 +1299,7 @@ while read -r N; do
       # this copy deliberately does NOT carry its landed.txt / answered-pass budget; that half is
       # port-provenance.txt:208, NOT DONE).
       usable=$((usable + 1))
+      n=$((n + 1))     # a SLOT is filled: the issue has left the pool, so the head moved (#1729)
       echo "[refresh] ~#$N LANDED — already resolved, not queued" ;;
     INCOMPLETE)
       echo "[refresh] ?#$N INCOMPLETE from the pre-flight (it could not query every surface) — not a verdict, left unchecked for the next pass" ;;
@@ -1236,6 +1307,34 @@ while read -r N; do
       echo "[refresh] ?#$N no verdict from the pre-flight — left unchecked for the next pass" ;;
   esac
 done < "$O/.pool"
+# ── persist what this pass learned about HELD candidates (agent-infra#1729) ─────────────────────
+# REWRITTEN, never appended: every record that is still fresh is carried over with its ORIGINAL
+# expiry (re-stamping one this pass did not re-judge would make a held candidate's record permanent),
+# expired records are dropped, and this pass's new collisions are added. `mv` is atomic within the
+# directory, so a concurrent reader sees the old file or the new one. A failure here is LOUD but NOT
+# fatal: the ledger is an optimisation, and losing it costs exactly one pass of re-buying the same
+# collisions — while aborting the pass would throw away the candidates it has just queued.
+if [ -n "${COLLISION_LEDGER:-}" ]; then
+  _now="$(date +%s 2>/dev/null || echo 0)"
+  _exp=$(( _now + ${COLLISION_TTL:-0} ))
+  mkdir -p "$(dirname "$COLLISION_LEDGER")" 2>/dev/null || true
+  if {
+       if [ -r "$COLLISION_LEDGER" ]; then
+         while read -r _e _i; do
+           [ -n "${_i:-}" ] || continue
+           case "$_e" in ''|*[!0-9]*) continue ;; esac
+           [ "$_e" -gt "$_now" ] || continue
+           printf '%s %s\n' "$_e" "$_i"
+         done < "$COLLISION_LEDGER"
+       fi
+       for _i in ${COLLIDED_NEW:-}; do printf '%s %s\n' "$_exp" "$_i"; done
+     } > "${COLLISION_LEDGER}.new" 2>/dev/null \
+     && mv "${COLLISION_LEDGER}.new" "$COLLISION_LEDGER" 2>/dev/null; then :
+  else
+    rm -f "${COLLISION_LEDGER}.new" 2>/dev/null
+    echo "[refresh] WARN: could not record the collision ledger at $COLLISION_LEDGER — the next pass will re-pre-flight the same held candidates (this pass's verdicts stand)"
+  fi
+fi
 # ── a pass the registry answered NOTHING for is not a healthy pass (2026-10-16 review) ──────────
 # The per-issue INCOMPLETE lines scroll away, and `lanes: 0` with `backlog=0` is exactly what a quiet
 # box looks like, so a git-transport-only outage (gh and the merge path both still working) or a
@@ -1248,10 +1347,10 @@ done < "$O/.pool"
 if [ "$ICR_INCOMPLETE" -gt 0 ]; then
   echo "[refresh] $ICR_INCOMPLETE of $judged pre-flighted issues INCOMPLETE — the cross-box claim registry could not answer; $QUEUED queued"
 fi
-# ⛔ WHAT THIS DOES NOT COVER: the stall that leaves a HEALTHY-LOOKING NON-EMPTY backlog. A
-# persistently-colliding issue consumes the whole window while `checked N; backlog now M` still
-# prints and M > 0 — `COLLISION` counts as usable, so that class is invisible here. It is
-# agent-infra#1729 and stays OPEN.
+# ⛔ THE COLLISION-CONSUMES-THE-WINDOW CLASS IS NOW COVERED (agent-infra#1729): a persistently
+# colliding head used to eat the whole window while `checked N; backlog now 0` printed and the pool
+# was never advanced. It is addressed by the SLOT budget + the collision ledger above, not by this
+# assertion — so what remains here is the narrower reading: a pass whose every RUN was unjudgeable.
 # ⛔ ... and a MIXED pass: ONE usable verdict masks any number of `?no verdict` / DEGRADED candidates,
 # so `checked N; backlog now M` can still be printed over candidates the pre-flight could not judge.
 # An abort on any degraded candidate would be worse — it would discard a pass that DID find a CLEAN
@@ -1302,4 +1401,14 @@ mv "$O/.cand" "$O/candidates.txt" || {
   echo "[refresh] ABORT: cannot replace $O/candidates.txt with the deduped backlog (#1736)"
   exit "$EXIT_TRANSIENT"
 }
+if [ "${skipped:-0}" -gt 0 ]; then
+  echo "[refresh] skipped $skipped candidate(s) a peer is holding (recorded within the last ${COLLISION_TTL:-0}s) — walked past so the pass could reach the candidates behind them; each is retried when its record expires (agent-infra#1729)"
+fi
+# ⛔ A PASS THAT JUDGED NOTHING BECAUSE EVERYTHING IT WALKED WAS HELD IS NOT "NO WORK", and its
+# `checked 0` is not `nothing to do` — so it says which of the two it is. It makes NO claim about the
+# backlog's size: the `checked N; backlog now M` line below carries that, and a NOTE that guessed it
+# was measured printing "the empty backlog is that" over a backlog of 3.
+if [ "${judged:-0}" -eq 0 ] && [ "${skipped:-0}" -gt 0 ]; then
+  echo "[refresh] NOTE: nothing was judged this pass — every candidate the walk reached was a recorded peer collision, so this is NOT an empty pool and NOT \"nothing to do\" (queue=${POOL_STATE:-?}, agent-infra#1729)"
+fi
 echo "[refresh] checked $judged; backlog now $(wc -l < "$O/candidates.txt" | tr -d ' ') issues"
