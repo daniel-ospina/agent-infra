@@ -49,6 +49,40 @@ armed elsewhere or not at all; do not infer that they run from their presence.
 
 ---
 
+### 1.1 Re-measured 2026-10-18T13:15Z, at merge time — the rows above are HISTORY, not current state
+
+`main` moved on (`64385b25` → `df746a05`, **5** commits) while this file sat in review, so the Mac row above
+is **two kinds of stale at once** — and telling them apart is the whole point of §2. The Mac runtime has
+not been touched since **12:53:01Z** (the last of the five live-only file edits made between 12:46Z and
+12:53Z), so the live-only bytes are **still live-only**:
+
+```
+$ bash scripts/orchestrator-harness/check-deployed-drift.sh --no-fetch   # exit 1, never a pass
+# 11 findings. CONDENSED here — the tool prints one line per file, with blob shas.
+DRIFT: recorded from a4a1249794e7, which is BEHIND origin/main (df746a05)   <- the STAMP is stale
+DRIFT: the deployed copy changed after it was recorded (ff1b27dd → 99a28a52) <- a hand edit
+DRIFT: claims.sh, orch-loop.sh                     DIFFER  <- LIVE-ONLY   (§3.1)
+DRIFT: install.sh                                  DIFFERS <- LIVE-ONLY and behind (its DRIFTED guard)
+DRIFT: launchd-cycle.sh, refresh-candidates.sh,
+       install-launchd-durability.test.sh          DIFFER  <- main moved AHEAD
+DRIFT: launchd-controller.sh, watchdog.sh,
+       watchdog-loop.sh present but NOT shipped     <- not on main
+# and, INVISIBLE to this tool (it hashes only *.sh): launchd.plist.template — see §3.1. That one is
+# the pivot; §2's hand loop is the only read that surfaces it.
+```
+
+Two directions of drift with **opposite** remedies, and one "differs" column cannot tell them apart:
+*live-only* must be **lifted** (copying over it is the loss), *behind* must be **installed** — and
+`install.sh` is **both**, which is why the tool's own printed remedy (§3.1) is the one command on this
+box that must not be run. So **do not read this exit 1 as "the runtime is wrong"**. The 11 findings
+break down as: 2 arms of the stale stamp, 6 differing `*.sh` (2 live-only, 1 both, 3 main-ahead), and 3
+scripts not on main. And it is the `*.sh` half of the picture — §2's hand loop, which is not
+`*.sh`-blind, reports **8** differing files, adding `launchd.plist.template` and `README.md`, which this
+tool structurally cannot report. The stamp those first two arms read still says `a4a12497` /
+2026-10-17T00:39Z, i.e. it describes the 12:42Z install and none of the five edits after it.
+
+---
+
 ## 2. How to re-derive this table (do not trust a row you have not re-measured)
 
 ```bash
@@ -68,8 +102,13 @@ git rev-parse "origin/main:scripts/orchestrator-harness/claims.sh"
 cmux cloud exec "$VM" -- bash -lc \
   'git hash-object /tmp/cell-home/harness/<sha12>/scripts/orchestrator-harness/claims.sh'
 
-# The Mac runtime. Compare ONLY files that exist on one side, or every runtime-only helper
-# (launchd-controller.sh, watchdog.sh, merged-not-closed.sh) reports a false DRIFT:
+# The Mac runtime. Compare ONLY files that exist on one side, or every file that is not a harness
+# entry reports a false DRIFT. Measured 2026-10-18T13:15Z: THREE runtime-only *scripts* —
+# launchd-controller.sh, watchdog.sh, watchdog-loop.sh — plus (a) 11 state/backup files this loop
+# also lists as RUNTIME-ONLY (candidates.txt, *.bak-*, heartbeat, …; ignore those) and (b) two
+# DRIFT lines the *.sh-only tool structurally CANNOT produce: launchd.plist.template and README.md.
+# (An earlier draft named `merged-not-closed.sh`, which is NOT on this box, and omitted
+# watchdog-loop.sh and the template — the template is the most consequential of the three.)
 for f in "$HOME"/orchestrator/*; do b=$(basename "$f"); [ -d "$f" ] && continue
   want=$(git rev-parse "origin/main:scripts/orchestrator-harness/$b" 2>/dev/null) || {
     echo "RUNTIME-ONLY (not a harness entry): $b"; continue; }
@@ -125,22 +164,73 @@ grant attached to one binary on one machine. The durable alternatives are (a) ma
 and re-grantable after an OS update that re-signs the interpreter, or (b) move the canonical clone out
 of `~/Documents` and point `REPO` at it, which is TCC-free but moves the tree every lane works in.
 
-⛔ **This box's runtime is being edited live, by more than one lane, right now.** At 12:42Z this audit
-installed `64385b25` into `~/orchestrator` and verified all files byte-identical; by 12:49Z a
-concurrent lane had written live-only bytes over two of them and added an entrypoint that exists in no
-commit:
+⛔ **This box's runtime was edited live, by more than one lane.** At 12:42Z this audit installed
+`64385b25` into `~/orchestrator` and verified all files byte-identical; by 12:53Z a concurrent lane had
+written **five** live-only edits over it, none of which is on `origin/main`:
 
 ```
-claims.sh          47,291 B  12:47:04Z  afea5179ea0a…    (adds a _claim_debug_log that logs cwd=[$PWD])
-orch-loop.sh      128,112 B  12:49:37Z  fd44db41c936…    (main at 64385b25 is 124,052 B)
-launchd-controller.sh  3,246 B  12:46Z  — exists in NO commit; it is the plist's ProgramArguments now
+claims.sh              47,291 B  12:47:04Z  afea5179ea0a…  (adds a _claim_debug_log that logs cwd=[$PWD])
+orch-loop.sh          128,112 B  12:49:37Z  fd44db41c936…  (main at 64385b25 is 124,052 B — below)
+launchd-controller.sh   3,246 B  12:46:19Z  — not on main; it is the plist's ProgramArguments now
+launchd.plist.template  c545f507  12:52:43Z  — not on main; it is what POINTS ProgramArguments there
+install.sh             923ddfa7  12:53:01Z  — not on main; adds the entrypoint to its DRIFTED check
 com.eldato.orchestrator-loop.plist — ProgramArguments rewritten 12:46:23Z
 ```
+
+**The lift is in flight, not hypothetical: PR #2020** (`fix/lift-live-only-harness-fixes`, head
+`7ef31cde`) carries `claims.sh`, `install.sh`, `launchd-controller.sh`, `launchd.plist.template` and
+`orch-loop.sh`. Check its state before re-authoring any of them — and the whole point stands while it is
+unmerged: until it lands, one command reverts all five, on the box, silently.
+
+**`orch-loop.sh`'s 4,060-byte delta is THREE behaviour fixes, not instrumentation** — lift it as such;
+lifting one or two of the three leaves the queue able to silence its own repair:
+
+1. `queue_age_secs` — an unreadable queue mtime returns a LARGE age, never `0` (`0` reads as "the queue
+   is fresh, leave it" and re-freezes it).
+2. An **age-based refresh trigger** (`REFRESH_MAX_AGE`, default 1800s) beside the old `backlog < 6`.
+   Measured: a refresh ABORTed mid-pass and left a PARTIAL `candidates.txt` of 42 entries. 42 is not
+   `< 6`, so no refresh ever spawned again and the queue froze for six hours — the larger the backlog,
+   the less likely anything refreshed it. Age is the trigger that cannot be starved by its own input.
+3. Dispatching in `$O/.pool` order instead of `candidates.txt` order, because the queue is
+   **append-only** — so, as its own comment records, the live queue had **12 open P0-blockers sitting at
+   positions 28–29 of 47** while P2 work dispatched (#8465's severity inversion re-entering through the
+   append path instead of the pool sort).
+
+None of the three is on `origin/main`; all three are in #2020.
 
 **This is the loss mode this file exists to prevent**, caught in the act: the working fix is live-only,
 so the next `deploy-mac-orchestrator.sh` (or any harness install) silently reverts it and the box goes
 back to refusing every candidate. It must be lifted into `scripts/orchestrator-harness/` (entrypoint
 included in `launchd.plist.template`) before any redeploy — see §5.
+
+**⛔ AND "any harness install" INCLUDES the supported one.** Re-measured 13:15Z, the revert is in
+shipped code, so no operator error is needed to trigger it — but **which copy you run decides the
+effect**:
+
+- **`launchd.plist.template` is the pivot, and the live one is already patched** (`c545f507` emits
+  `__O__/launchd-controller.sh`; main still emits `__O__/orch-loop.sh`). `install.sh` renders
+  `TEMPLATE="$HERE/launchd.plist.template"` and then `mv -f`s the result over
+  `~/Library/LaunchAgents/com.eldato.orchestrator-loop.plist` on the **install path — bare `install.sh`,
+  `--start`, `--restart`** (only `--uninstall` skips the render, and that one deletes the plist instead).
+  So `bash ~/orchestrator/install.sh` **preserves** the entrypoint *only because the live template beside
+  it is the patched one*; the SAME command run from the repo renders main's template and deletes it. A
+  bare `install.sh`'s header says it "NEVER touches a running job" — true of the *job*, false of the
+  plist FILE.
+- `install.sh` is itself live-only, and it is a GUARD rather than a bystander: its `DRIFTED` list gained
+  `launchd-controller.sh`, so it is what makes a harness install *report* the unshipped entrypoint at all.
+  Copying main's `install.sh` over it removes the detector for the defect this section describes.
+- ⛔ **`deploy-mac-orchestrator.sh` PHASE=A silently reverts the template, and no checker can see it.**
+  It does `git archive "$SRC_REF" scripts/orchestrator-harness` and copies every entry, so it overwrites
+  the patched `launchd.plist.template` (and `README.md`) with `origin/main`'s. `check-deployed-drift.sh`
+  hashes only `*.sh` (`grep -E "^${REL}/[^/]+\.sh$"`), so this is drift it structurally CANNOT report —
+  §2's hand loop is the only read that sees it. Safe once #2020 merges; not before.
+- `check-deployed-drift.sh` reports the `.sh` state correctly — `DRIFT: launchd-controller.sh — present in
+  /Users/danielospina/orchestrator but NOT shipped by the repo at origin/main (a hand-placed or retired
+  script)`, exit 1 — and then prints a remedy that **causes the loss**: `cp …/harness/*.sh $O/ && install.sh`.
+  Following it byte-overwrites `claims.sh`, `orch-loop.sh` and `install.sh` with main's bytes — discarding
+  three of the five — and then runs the **repo** copy of `install.sh`, which renders the **repo** template.
+  Until #2020 merges, treat that printed remedy as ⛔ and use §5's sequence instead. A checker must not
+  hand out a remedy that destroys the condition it was asked to report.
 
 ### 3.2 lane-1 is merge-inert: the queue repo and the checkout name different repositories
 
@@ -205,10 +295,27 @@ nothing" shape, and it is the state this audit found on the Mac.
   **not** write `$O/.agent-infra-stamp.json` (this box's stamp was 1.5 days stale, `a4a12497`, while the
   runtime held other bytes). It also relaunches from its own environment, so `SCOPE` drops from the
   plist's `own` to `orch-loop.sh`'s `auto` default — an unpinned cell draining the shared queue.
-  Do instead: `PHASE=A bash deploy-mac-orchestrator.sh` (atomic `cp`+`mv`, no controller touched), install
-  `orch-loop.sh` the same way, then restart through launchd:
-  `launchctl bootout gui/$(id -u)/com.eldato.orchestrator-loop` → `launchctl enable …` →
-  `launchctl bootstrap gui/$(id -u) <plist>`.
+  ⛔ **The entrypoint survives or dies by WHICH `install.sh`/template you run — not by a flag (§3.1).**
+  `bash ~/orchestrator/install.sh --restart` renders the box's OWN patched `launchd.plist.template` and so
+  KEEPS the tmux entrypoint, and it is the restart that **proves itself**: it goes through
+  `launchd-cycle.sh` (`enable` → `bootout` → `bootstrap`, never `unload -w`) and then asserts a pid **and**
+  an advancing heartbeat, instead of trusting that a `bootstrap` returning 0 means the loop is running —
+  which is how #1975 left the controller removed AND disabled while the installer exited 0. ⚠️ It
+  re-renders **every** limit and `SCOPE` from the CALLER's environment, so it is only safe invoked with
+  the box's pinned values; without them it re-pins `own` → `auto`, the same trap as phase B above.
+  ⛔ The REPO copy (`scripts/orchestrator-harness/install.sh`) renders main's UNFIXED template and
+  deletes the entrypoint — that is the revert.
+  ⛔ **And not phase A either, while #2020 is unmerged**: it copies `origin/main`'s
+  `launchd.plist.template` (and `claims.sh`) over the box's patched/live-only copies, and no checker can
+  see the template half (§3.1) — so the next install reverts the entrypoint. The atomic `cp`+`mv` phase A
+  uses is still the right *method*; the wrong *source*. Until #2020 merges, touch only what §1.1 shows as
+  behind — never `claims.sh`, `install.sh` or the template — and restart with the runtime `install.sh
+  --restart` above.
+  If you must drive launchd by hand instead (the runtime `install.sh` is unavailable), the sequence is
+  `launchctl enable gui/$(id -u)/com.eldato.orchestrator-loop` →
+  `launchctl bootout gui/$(id -u)/com.eldato.orchestrator-loop` →
+  `launchctl bootstrap gui/$(id -u) <plist>` — in that order, and understand that this one does **not**
+  prove itself: check `launchctl print` names a pid AND `logs/heartbeat` advanced.
   ⛔ Never `launchctl unload -w` / `load -w` (a persistent disable). ⛔ Never an unscoped `pkill`.
   ⛔ **Stop `com.eldato.orchestrator-watchdog` before the cycle and start it after** — it reloads the
   loop when it sees the job absent, so it resurrects the job mid-change (measured: a `bootout` looked
