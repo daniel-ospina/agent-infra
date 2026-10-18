@@ -500,14 +500,25 @@ fi
 # left behind (`rm -f`), and on success the (empty) file must be present — that difference is what
 # lets the reaper tell "the read failed" from "the answer is none". The pre-fix `|| : > "$O/.pr_brs"`
 # wrote an empty file in BOTH cases, which is the fail-open being fixed here. (agent-infra#1705)
-awk '/^if ! gh issue list --repo "\$OR"/{f=1} f{print} f&&/^fi$/{c++; if(c==2) exit}' "$REFRESH" > "$TMP/acq.sh"
-if need "$TMP/acq.sh" "the listing capture is extracted from the shipped refresh-candidates.sh"; then
+# ⛔ THE ANCHOR MOVED WITH THE TRANSPORT (#1962), IT WAS NOT LOOSENED. The capture is now
+# `rest_list …` (a REST helper) instead of `gh issue list …` (GraphQL), so the extraction starts at
+# the helper section — which the captured lines CALL — and still stops after the SECOND capture
+# block. Anchoring below the helpers would have extracted two calls to an undefined function: both
+# "leaves NO .open_iss" checks would then pass for the wrong reason (command-not-found) while the
+# "a SUCCESSFUL empty listing leaves an EMPTY .pr_brs" check below went red.
+awk '/^# ── THE LISTINGS RUN ON THE REST BUCKET/{f=1} f{print} f&&/^fi$/{c++; if(c==2) exit}' "$REFRESH" > "$TMP/acq.sh"
+if need "$TMP/acq.sh" "the listing capture (with its REST helper) is extracted from the shipped refresh-candidates.sh"; then
   A="$TMP/acq"; mkdir -p "$A/fail" "$A/ok"
+  # ⛔ THE STUB ANSWERS IN `gh api -i` SHAPE, because that is what the shipped helper reads. It parses
+  # the response HEADERS (the `Link` header decides whether the collection ended) and only accepts an
+  # EMPTY body when the status line says 204 — a bare `exit 0` would look like a 200 with no body,
+  # which is refused on purpose (a vanished body is not "no rows": it would write an EMPTY `.pr_brs`).
+  # So "a successful empty listing" is `200` + `[]`, which is exactly what GitHub returns.
   cat > "$A/gh" <<'SH'
 #!/bin/bash
 case "${GH_MODE:-}" in
   fail) echo 'gh: could not reach api.github.com' >&2; exit 1 ;;
-  ok)   exit 0 ;;
+  ok)   printf 'HTTP/2.0 200 OK\r\ncontent-type: application/json\r\n\r\n[]\n' ;;
 esac
 SH
   chmod +x "$A/gh"
@@ -614,7 +625,7 @@ ck "the repo-root path selftest.sh uses resolves to a git working tree" $rc
 # deliberately absent, which also exercises the documented non-fatal-uv path end to end.
 if on_darwin; then
 FB="$TMP/pathbin"; mkdir -p "$FB" "$TMP/sb3/Library/LaunchAgents" "$TMP/sb3/.config" "$TMP/sb3/.pi/agent/scripts"
-for b in tmux gh pi; do printf '#!/bin/bash\nexit 0\n' > "$FB/$b"; chmod +x "$FB/$b"; done
+for b in tmux gh pi jq; do printf '#!/bin/bash\nexit 0\n' > "$FB/$b"; chmod +x "$FB/$b"; done
 ln -s "$HOME/.config/gh" "$TMP/sb3/.config/gh" 2>/dev/null || true
 # ⛔ AND THE STUB MUST STAY ON *EVERY* PATH THIS FILE HANDS THE INSTALLER (review finding, T5): this
 # line used to be PATH="$FB:/usr/bin:/bin", which DROPPED $GSTUB, so install.sh's post-install banner read
@@ -826,14 +837,22 @@ ck "the extracted gate-chain fixture runs with NO unbound-variable noise (WORKER
 # bind. Both fixtures above pass SWTOTAL=0, which short-circuits the gate's own `[ "$SWTOTAL" -ne 0 ]`
 # guard BEFORE the comparison is reached -- so the gate was never driven at all. Drive it with real
 # swap, in both directions.
-[ "$(mrw 1 0 2048 100 0 9999 100 4 "$swp_def" "$mem_def")" = "swap_free=100M<=min_swap_free=600M" ] && rcw=0 || { rcw=1; echo "      got '$(mrw 1 0 2048 100 0 9999 100 4 "$swp_def" "$mem_def")'"; }
-ck "the swap gate FIRES below the ceiling and names it (swap_free<=min_swap_free)" $rcw
+# ⛔ #1985: the veto now requires RAM to be tight AS WELL, so drive MEMAVAIL low with it, and the
+# message must name BOTH inputs or a future reader cannot tell which fired.
+[ "$(mrw 1 0 2048 100 0 100 100 4 "$swp_def" "$mem_def")" = "swap_free=100M<=min_swap_free=600M AND mem_avail=100M<=$(( ${mem_def:-512} * 2 ))M (both tight)" ] && rcw=0 || { rcw=1; echo "      got '$(mrw 1 0 2048 100 0 100 100 4 "$swp_def" "$mem_def")'"; }
+ck "the swap gate FIRES when swap AND ram are both tight, and names both" $rcw
 [ -z "$(mrw 1 0 2048 2000 0 9999 100 4 "$swp_def" "$mem_def")" ] && rcw=0 || rcw=1
 ck "the swap gate does NOT fire when free swap is above the ceiling" $rcw
+  # ⛔ THE #1985 REGRESSION, pinned. Low swap with AMPLE ram must NOT veto: a 1 GB macOS swap file
+  # stays half occupied for the life of the boot, and the old arm blocked dispatch forever while the
+  # box had 1.4 GB available with 20 of 20 lane slots idle. Without this case the fix can be reverted
+  # to the old unconditional arm and the suite stays green.
+[ -z "$(mrw 1 0 2048 100 0 1400 100 4 "$swp_def" "$mem_def")" ] && rcw=0 || { rcw=1; echo "      got '$(mrw 1 0 2048 100 0 1400 100 4 "$swp_def" "$mem_def")'" ; }
+ck "the swap gate does NOT fire when swap is low but ram is ample (#1985)" $rcw
 # ⛔ And with a NON-DEFAULT ceiling: the two cases above pass `$swp_def`, so they prove the gate fires
 # at whatever the default is -- a regression that HARDCODED 600 into the comparison (leaving the
 # plist's MIN_SWAP_FREE inert) stayed green. A ceiling the default cannot be pins the wiring itself.
-[ "$(mrw 1 0 2048 650 0 9999 100 4 700 "$mem_def")" = "swap_free=650M<=min_swap_free=700M" ] && rcw=0 || { rcw=1; echo "      got '$(mrw 1 0 2048 650 0 9999 100 4 700 "$mem_def")'"; }
+[ "$(mrw 1 0 2048 650 0 100 100 4 700 "$mem_def")" = "swap_free=650M<=min_swap_free=700M AND mem_avail=100M<=$(( ${mem_def:-512} * 2 ))M (both tight)" ] && rcw=0 || { rcw=1; echo "      got '$(mrw 1 0 2048 650 0 100 100 4 700 "$mem_def")'"; }
 ck "the swap gate honours a NON-DEFAULT MIN_SWAP_FREE (the ceiling is read, not hardcoded)" $rcw
 [ -z "$(mrw 1 0 2048 750 0 9999 100 4 700 "$mem_def")" ] && rcw=0 || rcw=1
 ck "the swap gate stays shut just above a non-default ceiling" $rcw
@@ -2009,10 +2028,10 @@ fi
 # patterns (cmux's `cmux-cli-shims` is a real one on this box) resolves the tool to a wrapper that
 # exits 127, and a resolution-only probe reports install success while every lane spawn then fails.
 # Drive the SHIPPED probe block with a fixture whose `pi` resolves but cannot run.
-awk '/^for bin in tmux uv pi gh; do$/{f=1} f{print} f&&/^done$/{exit}' "$INST" > "$TMP/probe.sh"
+awk '/^for bin in tmux uv pi gh jq; do$/{f=1} f{print} f&&/^done$/{exit}' "$INST" > "$TMP/probe.sh"
 if need "$TMP/probe.sh" "the install-time probe is extracted from the shipped install.sh"; then
   PB="$TMP/probe"; mkdir -p "$PB/bin"
-  for b in tmux uv gh; do printf '#!/bin/bash\nexit 0\n' > "$PB/bin/$b"; chmod +x "$PB/bin/$b"; done
+  for b in tmux uv gh jq; do printf '#!/bin/bash\nexit 0\n' > "$PB/bin/$b"; chmod +x "$PB/bin/$b"; done
   # ⛔ The driver runs under install.sh's OWN shell options (`set -euo pipefail`, line 12), not a
   # weaker `set -u`: `_p="$(… || true)"` is reached only because install.sh runs under errexit, and
   # a `set -u`-only driver cannot see the unguarded-assignment regression it exists to pin.
@@ -2030,7 +2049,7 @@ if need "$TMP/probe.sh" "the install-time probe is extracted from the shipped in
   # An EXPORTED shell function named `gh` must NOT satisfy the probe: `command -v` reports it, but a
   # function is not what launchd execs and the daemon PATH has no gh binary at all.
   PB2="$PB/bin2"; mkdir -p "$PB2"
-  for b in tmux uv pi; do printf '#!/bin/bash\nexit 0\n' > "$PB2/$b"; chmod +x "$PB2/$b"; done
+  for b in tmux uv pi jq; do printf '#!/bin/bash\nexit 0\n' > "$PB2/$b"; chmod +x "$PB2/$b"; done
   ( unset -f gh pi uv tmux; gh() { exit 0; }; export -f gh; \
     PATH="$PB2:/usr/bin:/bin" DAEMON_PATH="$PB2" bash "$PB/drive.sh" ) >/dev/null 2>&1; rc=$?
   [ "$rc" = "9" ] && rc=0 || { rc=1; echo "      probe rc=$rc (expected 9 — an exported gh FUNCTION is not a daemon binary)"; }
@@ -2038,7 +2057,7 @@ if need "$TMP/probe.sh" "the install-time probe is extracted from the shipped in
   # A wrapper that DELEGATES by name must not pass because the AMBIENT PATH can satisfy it: the
   # probe must execute under $DAEMON_PATH, where nothing can (the false green one layer in).
   PB3="$PB/w3"; mkdir -p "$PB3/shared" "$PB3/wrap" "$PB3/real" "$PB3/base"
-  for b in tmux uv gh; do printf '#!/bin/bash\nexit 0\n' > "$PB3/shared/$b"; chmod +x "$PB3/shared/$b"; done
+  for b in tmux uv gh jq; do printf '#!/bin/bash\nexit 0\n' > "$PB3/shared/$b"; chmod +x "$PB3/shared/$b"; done
   printf '#!/bin/bash\nexit 0\n' > "$PB3/real/pi"; chmod +x "$PB3/real/pi"
   cat > "$PB3/wrap/pi" <<'SH'
 #!/bin/bash

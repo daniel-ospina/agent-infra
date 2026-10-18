@@ -341,6 +341,82 @@ That one asymmetry stopped both halves of the harness, and neither log line name
 | `pr merge` (incl. `--match-head-commit`) | `PUT …/pulls/{n}/merge` |
 | `pr comment --body` | `POST …/issues/{n}/comments` |
 
+### The layer underneath: `gh-limit` (#1988)
+
+Four boxes act as **one GitHub account**, so they share one REST bucket and one GraphQL bucket.
+Nothing serialised the harness's calls and nothing backed off when a box was refused, so one box's
+burst became another box's secondary limit — and the refused call was read by its caller as "no
+data", which is how a cell that could not merge looked like a cell with nothing to do.
+
+`gh-limit.py` is the one implementation of GitHub's documented policy (serialise; honour
+`retry-after`; honour the bucket's `x-ratelimit-reset` when it is empty; otherwise wait at least a
+minute and grow exponentially; fail after a bounded number of attempts). It is reached from two thin
+entry points, both of which put it FIRST on the harness's `PATH`, so no call site has to remember it
+and no new call site can forget it:
+
+| Entry point | Where | Installed by |
+|---|---|---|
+| `gh-rest/gh` (the REST adapter above) | Mac | `install.sh` → `$O/gh-rest` first on the daemon PATH |
+| `gh-limit/gh` (nothing but the layer) | cloud cells | `cloud-cell-supervisor.sh` → `$O/gh-limit` first on the controller PATH **and** published through tmux `update-environment`; `deploy-crossbox.sh` seeds the same two files and passes the PATH on the controller's `new-session` line (it does not touch `update-environment`) |
+
+⛔ **The shim has to be re-asserted after the tool-dir prepend.** Every gh-calling harness script
+opens with `export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH`, which puts a REAL `gh` ahead of the
+seeded shim on any box whose gh lives in one of those dirs (measured: on the Mac it does), leaving
+an inert layer that reports protection and provides none. `orch-loop.sh`, `merge-one.sh`,
+`fix-one.sh`, `lane.sh` and `chain-merge.sh` therefore re-prepend `$O/gh-limit`/`$O/gh-rest` after
+that line — and so does `nonblocking-dispatch.sh`, which calls no `gh` itself but spawns a whole
+worker session in-process, so its PATH becomes that worker's PATH.
+
+The predicate, exactly: **every `*.sh` in this directory that prepends those tool dirs AND invokes
+`gh` must carry BOTH stanzas** (`$O/gh-limit` and `$O/gh-rest`), plus `nonblocking-dispatch.sh` for
+the spawning reason above, and `gh-limit.test.sh` fails naming the file and the missing stanza. It is
+a per-file two-line obligation — not an unpickable one — and a new script written outside this
+directory is not covered by it. Two further entry paths exist so the common callers do not depend on
+that obligation: the Mac adapter already resolves the layer for every call it serves, and the
+heartbeat's own telemetry tools (`objective.py`, `merge-queue.py`, `beta-progress.py`,
+`queue-dispatch.py`, `ask-owner.py`, `turn-classify.py`, `turn-end.py`, `undelivered-answers.py`,
+`pr-doctor.py`) prefer `$O/gh-rest/gh` then `$O/gh-limit/gh` over their pinned real binary — derived
+from `$O`, never from PATH. ⛔ THAT DOES NOT KEEP #1872'S PIN BY ITSELF: the layer resolves the real
+`gh` by walking PATH, so the tools that have a pinned candidate hand it through as
+`GH_REST_REAL_GH`/`GH_LIMIT_REAL_GH`; the three that never had one let the layer walk.
+
+Why two entry points rather than one: moving the call sites onto REST is #1978/#1986's change, and
+mixing a REST translation into a cell with a new backoff would make a translation bug and a backoff
+bug indistinguishable. The wrapper therefore translates nothing; the REST adapter additionally
+translates, and both call the same helper.
+
+Notes worth keeping:
+
+* **Single flight is per box, not per account.** Boxes cannot see each other; what this buys is a
+  burst of 1 per box instead of 1 per lane. The lock is held per ATTEMPT and released across the
+  wait, so a sleeping caller does not park the box — the invariant is "no two requests overlap",
+  and the `/rate_limit` probe, which runs during backoff, holds it too.
+* **A successful call is invisible** (stdout/stderr replayed byte for byte) because callers parse
+  merged output. Retries are announced in `$GH_LIMIT_DIR/events.log`; only a FINAL failure writes to
+  stderr.
+* **A limited box says so**: `$GH_LIMIT_DIR/last-limit` is printed by `orch-loop.sh`'s cycle line as
+  `gh=rate_limited(bucket=graphql reset=<epoch> <age>)`, age-bounded to 15 minutes so a past limit
+  cannot pass as a current one — and as `gh=recovered(bucket=… <age>)` once a later call succeeded,
+  because a record is not a state. The failure text carries the words "rate limit", which is the
+  phrase `objective.py`'s transport markers turn into `VERDICT=GH-RATE-LIMITED`.
+* **The waits belong to the call sites that can afford them.** `GH_LIMIT_NO_WAIT=1` makes the layer
+  record the limit and return at once (and bounds the LOCK wait to `GH_LIMIT_NO_WAIT_LOCK_S`, 5 s, so
+  a busy box cannot queue a 90 s reader to death); the nine heartbeat tools set it, because they are
+  killed at 90-420 s while the first documented backoff is 60 s — sleeping there converts a
+  RATE-LIMITED verdict into a timeout. The shim is also `exec`'d, not spawned, so a caller's timeout
+  or `run_bounded`'s TERM kills the helper instead of orphaning it mid-backoff against a bucket
+  GitHub has already refused.
+* **A shim is identified by its own sentinel line** (`harness-gh-shim-marker`), not by the helper
+  beside it: the missing helper is the fail-open state, and keying identity on it made two shims
+  resolve into each other and every gh call exit 127.
+* **Conditional REST is a GET only.** `gh api <path>` (optionally `--jq`) stores its ETag per URL and
+  replays a 304 from cache — free, because a 304 is not charged to the primary limit. The cached body
+  is base64 (`byte-exact` on replay, binary included) and the cache is bounded, since every distinct
+  poll URL earns an entry. Any shape whose output this layer would have to re-create by hand
+  (`--paginate`, `--template`, `-H`, `-f`, a non-GET method) is left completely alone, and an
+  unframeable response is returned AS-IS — never re-requested (a second request on a box that is
+  being refused is exactly what the layer exists to prevent; the suite pins one request, no re-run).
+
 **Design: an adapter, not a fork.** No harness file changes, so every cell stays on one harness
 version — the convergence property this repo exists to protect — while the API surface becomes a
 deployment concern. `install.sh` copies the shim to `$O/gh-rest/gh` and puts that directory **first**
@@ -1219,6 +1295,87 @@ git show <rev>:scripts/orchestrator-harness/claims.sh > "$T/claims.sh"
 CLAIMS_SH="$T/claims.sh" bash scripts/orchestrator-harness/test-claims.sh   # 65 passed, 45 failed
 ```
 
+`claim-cwd.test.sh` pins the claim builder's **cwd independence** — the property a redeploy silently
+took away on 2026-10-18, when the launchd cell (whose WorkingDirectory is **not** a repository)
+refused every candidate in the queue while the controller looked alive:
+
+```
+[dispatch] #4513 NOT dispatched — could not build claim commit
+```
+
+The builder returned an EMPTY hash, so nothing entered the batch — a total dispatch stall that emits
+no error of its own. Two independent hunks, each with its OWN discriminator:
+
+- **`_git` must `cd` into `CLAIM_REPO` in a subshell, not hand git `-C`.** The `-C` form still STARTS
+  in the caller's cwd and has to resolve it, which is exactly what the affected cells deny
+  (`fatal: Unable to read current working directory: Operation not permitted`). The check runs the
+  SHIPPED builder with its cwd set to a directory that cannot be resolved at all, and asserts a claim
+  commit is produced and the ref lands on the target origin. **This is the hunk that unblocked
+  dispatch.**
+- **`CLAIM_REPO` must derive from `REPO`, not `.`** — hardening, not the incident's cause: the
+  controller assigns `CLAIM_REPO="$REPO"` itself (`orch-loop.sh`), and every other shipped caller
+  sets it explicitly. An ABSOLUTE `$REPO` is used as named (it needs no resolution, so no cwd can
+  make it wrong); a RELATIVE one is used only when the cwd is not already a work-tree root, and
+  otherwise `.` wins — see the six `cd` hazards below, which is why the simple form is not enough.
+
+⛔ **`cd` IS NOT A FREE SWAP FOR `-C` — six defects found in the first three versions of this fix**,
+each measured and each now pinned by the suite. `-C` treats its argument literally; `cd` is a builtin
+with its own resolution rules:
+
+- **an EMPTY `CLAIM_REPO`** — `cd ""` SUCCEEDS and leaves the cwd alone, so `|| return 1` never fired
+  and a full acquire pushed `refs/claims/…` into the **caller's** repo, a repository nobody named.
+  Closed in both orderings: the value that reaches `_git`, and an empty value that is already SET
+  when the file is sourced (kept refused instead of being coerced into a default);
+- **`$CDPATH`** — the builtin searches it for a relative path, and a same-named directory there WINS
+  over the local one (measured), so a relative `CLAIM_REPO` ran every git call — and pushed the claim
+  — in a repo the caller never named. `-C` never did that;
+- **a RELATIVE `$REPO` from a caller already inside it** — `fix-one.sh` and `merge-one.sh` `cd "$REPO"`
+  and then source this file with no `CLAIM_REPO`, so `$REPO` resolved from inside `$REPO` names
+  `$REPO/$REPO`, which does not exist: every claim refused with the SAME `could not build claim
+  commit` the fix exists to remove;
+- **a same-named SUBDIRECTORY that is itself a repo** — the same caller shape, where `$REPO/$REPO`
+  does exist. A default keyed on `[ -d "$REPO" ]` then ran every git call in the INNER repo and
+  acquired with `RESULT=acquired` on an origin nobody named — a wrong-repo claim, silently, which is
+  the duplicate dispatch this registry exists to prevent. Hence the cwd-work-tree-root test;
+- **a BARE `cd` OPTION** — `CLAIM_REPO=-P` is not a path: `cd -P` takes NO operand and SUCCEEDS into
+  `$HOME` (measured), so without the `--` a bare-option value claims into whatever repo `$HOME`
+  happens to be. `-C` read it as a directory name and failed;
+- **an ABSOLUTE `$REPO` while standing in ANOTHER repo's root** — the cwd-root test alone answers `.`
+  there, so a caller naming repo B absolutely got `RESULT=acquired` with the ref on repo A's origin,
+  silently: the same wrong-repo class one shape over. An absolute path needs no resolution, so it is
+  used as named and the heuristic is left to the relative case.
+
+Measured, which is what the suite is for (four baselines, `/tmp` copies via the `CLAIMS_SH` seam):
+
+```bash
+CLAIMS_SH=<pre-fix main>            bash …/claim-cwd.test.sh   # 19 passed, 17 FAILED (C1, C2, C5, C10)
+CLAIMS_SH=<the two hunks alone>     bash …/claim-cwd.test.sh   # 20 passed, 16 FAILED (C5–C9)
+CLAIMS_SH=<round-1 fixes, no cwd test / no SET test>          # 31 passed, 5 FAILED (C5 pre-set, C8)
+CLAIMS_SH=<round-2 fixes, no absolute-REPO branch>            # 33 passed, 3 FAILED (C10)
+CLAIMS_SH=<shipped, with `cd --` removed>                     # 33 passed, 3 FAILED (C9)
+```
+
+Each guard is pinned by exactly ONE check, so a later "simplification" of any single one of them
+reddens the suite on its own:
+
+```bash
+CLAIMS_SH=<shipped, `cd --` removed>      bash …/claim-cwd.test.sh  # C9 reds alone — fail-open into $HOME
+CLAIMS_SH=<shipped, absolute branch gone> bash …/claim-cwd.test.sh  # C10 reds alone — claims on the cwd repo
+```
+
+⛔ **The stand-in, stated**: the OS denial (TCC/EPERM on the process cwd) cannot be constructed
+hermetically, so the first check puts a `git` shim first on PATH whose only job is that read
+(`/bin/pwd -P` on the cwd it was STARTED in) before exec'ing the real git. The DENIAL is modelled;
+`claims.sh`, the commit, the acquisition and the assertion are real. Non-vacuity is measured against
+the pre-fix file, and the RED run fails with the incident's own log line:
+
+```bash
+CLAIMS_SH=<pre-fix main> bash scripts/orchestrator-harness/claim-cwd.test.sh  # 19 passed, 17 failed
+bash scripts/orchestrator-harness/claim-cwd.test.sh                           # 36 passed, 0 failed
+```
+
+To reproduce `<pre-fix main>`: `git show <main>:scripts/orchestrator-harness/claims.sh > $TMP/claims.sh`.
+
 `refresh-scout.test.sh` drives the **shipped** refresh step and the **shipped** dispatch block against
 a real local origin for the collision, unreachable, absent, stale-registry and unrecognised-status
 verdicts, plus the fenced release on the chain's exit path and the generation guard. Measured (the
@@ -1561,6 +1718,7 @@ algorithmic advantage. The claim worth evaluating is *utilisation*, not *efficie
 | `test-gates.sh` | the `mp_reason` dispatch-gate rule table, extracted from the shipped `orch-loop.sh`. Not part of the loop |
 | `test-claims.sh` | the PR **and issue** claim CAS against live origin from two scratch repos (`git init` + `remote add`, not clones; random keys per run so concurrent runs cannot collide). Not the cross-box proof (one machine), but red on a defeated CAS. Not part of the loop |
 | `claim-exclusion.test.sh` | **the measurement:** N processes released at a barrier against a real (bare) origin, per operation class, answering *does a duplicate holder get refused*. Prints the table §7.2d records; hermetic, a CI shard |
+| `gh-limit.test.sh` | #1988 the layer UNDER every gh call: one call in flight per box — the retry path AND the `/rate_limit` probe (measured from the stub's own timestamps, with an unserialised control that MUST overlap), the documented backoff order (`retry-after` → the bucket's reset → ≥60s doubling, 4 attempts, then a loud failure), the failing bucket NAMED, `>= 1s` between mutations, conditional REST (`if-none-match` → a 304 replayed byte-exactly from a bounded cache), and the shim surviving the `/opt/homebrew` PATH prepend in every gh-calling script. Fake clock, stub gh, hermetic, a CI shard |
 | `gh-rest.test.sh` | the `gh` REST adapter's argv-to-argv **TRANSLATION**, offline against a stub `gh`: `pr list --head` must not widen to the newest open PR and `pr comment` must print a URL (both shipped green once, as P0s, when nothing asserted them). Hermetic, a CI shard |
 | `test-crossbox.sh` | drives the real `merge-one.sh` claim acquire + trap release with `gh` stubbed. Not part of the loop |
 | `refresh-scout.test.sh` | the agent-infra#1736 contract — repo-aware scout provisioning, per-repo tool resolution, the permanent/transient refresh split — plus the agent-infra#1850 issue-claim pre-flight verdict table (CLEAN/COLLISION/INCOMPLETE/NOT PROVISIONABLE/unrecognised), the dispatch-side claim, and the fenced + generation-guarded release. Not part of the loop |

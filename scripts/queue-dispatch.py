@@ -61,9 +61,50 @@ CLAIM = os.path.join(STATE, "claim.py")
 # Same defect class as beta-progress.py/merge-queue.py: `gh` on PATH resolves to the
 # agent gh-shim, which refuses when it cannot find the real binary. Read-only queries
 # do not need the shim (it guards admin landing), so resolve the binary directly.
+# ⛔ BUT PREFER THE HARNESS'S OWN gh LAYER (#1988) WHEN ONE IS DEPLOYED. It is derived from `$O` —
+# never from PATH. ⛔ THE LAYER then resolves the real gh by WALKING PATH, so "#1872 cannot come back"
+# would be false (in a minimal environment the first `gh` on PATH can be a shim that refuses at
+# runtime, rc=126, with `os.access` still passing). The pin is therefore passed THROUGH the layer
+# below (`GH_REST_REAL_GH`/`GH_LIMIT_REAL_GH`): the binary #1872 chose, plus the layer.
+# ⛔ NO ABSOLUTE HOME PATH: `~/bin/gh` is the binary #1872 pinned, and expanduser builds the same
+# path without hard-coding another user's home in shipped code.
+_GH_CANDIDATES = (os.path.expanduser("~/bin/gh"), "/opt/homebrew/bin/gh", "/usr/local/bin/gh")
+
+
+def _gh_bin():
+    o = os.environ.get("O", "")
+    if o:
+        # ⛔ ORDER: `gh-rest` FIRST, matching every shell call site (`orch-loop.sh`: "adapter last so
+        # `$O/gh-rest` wins where it exists"). The adapter is what serves a GraphQL refusal over REST
+        # (#1959); preferring the non-translating wrapper here made these readers fail exactly as they
+        # did before that fix while the same box's shell calls took the other transport.
+        for c in (os.path.join(o, "gh-rest", "gh"), os.path.join(o, "gh-limit", "gh")):
+            if os.path.isfile(c) and os.access(c, os.X_OK):
+                return c
+    # `isfile` + X_OK, never `exists`: a DIRECTORY at a candidate path would be selected and then
+    # raise from `subprocess.run` (or, worse, answer as "gh not found" — the same trap the fail-open
+    # walks had; found in review round 7).
+    return next((p for p in _GH_CANDIDATES
+                 if os.path.isfile(p) and os.access(p, os.X_OK)), "gh")
+
+
+GH = _gh_bin()
+# Hand the layer the binary #1872 pinned (empty when we are not going through a layer).
+_PIN = next((p for p in _GH_CANDIDATES
+             if os.path.isfile(p) and os.access(p, os.X_OK)), None)   # a DIRECTORY is not a pin
+GH_LAYER_ENV = ({"GH_REST_REAL_GH": _PIN, "GH_LIMIT_REAL_GH": _PIN}
+                if _PIN and GH.endswith(("/gh-rest/gh", "/gh-limit/gh")) else {})
+
+
+# ⛔ THE LAYER MUST NOT SLEEP INSIDE THIS PROCESS (#1988). It may run inside a heartbeat pass or
+# DETACHED (`nohup … &`, bounded by its own lock), but its gh reads are bounded at 60 s while the
+# layer's first documented backoff is 60 s: an in-call wait alone consumes the whole budget, and the
+# caller is killed before the layer can say why — a rate-limited box then reports UNKNOWN/STALL
+# instead of the RATE-LIMITED verdict it can prove. NO_WAIT makes the layer record the limit and
+# return at once, so this process's own deferral takes over. Inherited by every DESCENDANT of this
+# process (including the `claim` calls below) — all parts of the same bounded dispatch step.
+os.environ.setdefault("GH_LIMIT_NO_WAIT", "1")
 REPO = "daniel-ospina/tortoise"
-GH = next((p for p in ("/Users/danielospina/bin/gh", "/opt/homebrew/bin/gh",
-                       "/usr/local/bin/gh") if os.path.exists(p)), "gh")
 
 
 def pr_still_open(item: str):
@@ -94,7 +135,8 @@ def pr_still_open(item: str):
     try:
         r = subprocess.run([GH, "pr", "view", pr, "--repo", REPO, "--json", "state",
                             "--jq", ".state"],
-                           capture_output=True, text=True, errors="replace", timeout=60)
+                           capture_output=True, text=True, errors="replace", timeout=60,
+                           env={**os.environ, **GH_LAYER_ENV} if GH_LAYER_ENV else None)
     except Exception:
         return None
     if r.returncode != 0 or not r.stdout.strip():

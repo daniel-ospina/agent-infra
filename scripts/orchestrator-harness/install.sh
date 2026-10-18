@@ -233,7 +233,11 @@ fi
 [ -f "$TEMPLATE" ] || die "missing template: $TEMPLATE"
 
 # ── dependencies ─────────────────────────────────────────────────────────────────
-for bin in tmux gh pi; do
+# ⛔ jq JOINS THE HARD DEPENDENCIES (agent-infra#1962). The listings now run on the REST bucket and
+# assemble pages with jq; without it `rest_list` REFUSES rather than answer from a partial read, so
+# every refresh would report UNREADABLE and the backlog would never build — a missing jq is a broken
+# install, not a warning.
+for bin in tmux gh pi jq; do
   command -v "$bin" >/dev/null 2>&1 && ok "$bin" || die "$bin not on PATH"
 done
 command -v uv >/dev/null 2>&1 && ok "uv" || warn "uv not found — lane.sh needs it to sync each worktree"
@@ -287,7 +291,7 @@ DAEMON_PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 if [ -x "$HOME/.local/share/pi-node/current/bin/pi" ]; then
   command -v pi >/dev/null 2>&1 && add_dir "$HOME/.local/share/pi-node/current/bin"
 fi
-for bin in tmux gh uv pi; do
+for bin in tmux gh uv pi jq; do
   # ⛔ Resolve the BINARY, not a shell function/alias. `command -v` reports an exported function
   # REGARDLESS of PATH (and a BARE name for it), so with a `gh`/`pi` function in the environment the
   # real binary's directory would never be found AND the name would be unusable. `type -P` searches
@@ -301,7 +305,7 @@ done
 # Resolve PAST a wrapper: add the first PATH entry holding a real executable of that name outside a
 # shim/.pi directory, so the shim can find it. Tested on the PHYSICAL path like add_dir(), so a
 # symlink TO a shim directory is recognised as a shim too.
-for bin in gh pi uv tmux; do
+for bin in gh pi uv tmux jq; do
   p="$(type -P "$bin" 2>/dev/null)" || continue
   case "$p" in /*) ;; *) continue ;; esac
   _pd="$(cd "$(dirname "$p")" 2>/dev/null && pwd -P)" || continue
@@ -331,7 +335,7 @@ ok "daemon PATH: $DAEMON_PATH"
 # the exclusion patterns (cmux's `cmux-cli-shims` is a real one) is caught here because its tool
 # exits 127. uv is optional (warned above): its failure WARNS, and is never fatal. Still BLIND to
 # trap (3) — TCC refuses the read only when LAUNCHD does it, not when an interactive shell does.
-for bin in tmux uv pi gh; do
+for bin in tmux uv pi gh jq; do
   command -v "$bin" >/dev/null 2>&1 || continue     # not present in this shell at all
   # ⛔ `|| true`: install.sh runs under `set -euo pipefail`, and `type -P` returns non-zero for a
   # tool that is not on $DAEMON_PATH. Unguarded, that bare assignment aborts the script AT THIS
@@ -431,6 +435,17 @@ for f in "$HERE"/*.sh; do
 done
 # the gh REST adapter is a bin shim, not a *.sh — check it explicitly (#1959)
 [ -f "$HERE/gh-rest/gh" ] && { bash -n "$HERE/gh-rest/gh" || die "syntax error in gh-rest/gh"; }
+# the limit layer too (#1988): a python file is not covered by the `*.sh` sweep either
+[ -f "$HERE/gh-limit.py" ] && {
+  # ⛔ NAME THE INTERPRETER. The helper is EXECUTED by every gh call (`exec python3`), so without
+  # python3 the layer would 127 every call — dying is right. But `2>/dev/null` also swallows the
+  # shell's own "command not found", so a missing python3 was reported as "gh-limit.py does not
+  # parse", sending the operator to edit a file that was fine.
+  command -v python3 >/dev/null 2>&1 \
+    || die "python3 is not on PATH — the gh limit layer (gh-limit.py) cannot run without it"
+  python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' "$HERE/gh-limit.py" 2>/dev/null \
+    || die "gh-limit.py does not parse"
+}
 ok "all shipped scripts parse"
 
 # ── state dir ────────────────────────────────────────────────────────────────────
@@ -449,8 +464,35 @@ if [ -f "$HERE/gh-rest/gh" ]; then
   if [ -f "$O/gh-rest/gh" ] && ! diff -q "$HERE/gh-rest/gh" "$O/gh-rest/gh" >/dev/null 2>&1; then
     warn "replacing a DIFFERENT $O/gh-rest/gh — the installed adapter was stale"
   fi
-  cp "$HERE/gh-rest/gh" "$O/gh-rest/gh" || die "cannot install $O/gh-rest/gh"
-  chmod +x "$O/gh-rest/gh"               || die "cannot chmod $O/gh-rest/gh"
+  # ⛔ STAGE-THEN-RENAME — the adapter is the ENTRY POINT every gh call on a live daemon resolves, so
+  # a plain `cp` (which truncates before it writes) has a window in which a call reads a partially
+  # written shim. Worse than a syntax error: a truncation at a statement boundary leaves a VALID script
+  # that prints nothing and exits 0 — `pr view --json` answering "" with rc 0, which every caller reads
+  # as "no data". `mv` is atomic within the one filesystem (same rule as the helper below).
+  _ctmp="$O/.seed-gh-rest.$$"
+  cp "$HERE/gh-rest/gh" "$_ctmp" || { rm -f "$_ctmp"; die "cannot stage gh-rest/gh into $O"; }
+  chmod +x "$_ctmp"                || { rm -f "$_ctmp"; die "cannot chmod gh-rest/gh"; }
+  mv -f "$_ctmp" "$O/gh-rest/gh"   || { rm -f "$_ctmp"; die "cannot install $O/gh-rest/gh"; }
+  # ── the limit layer (#1988) ─────────────────────────────────────────────────
+  # The adapter routes EVERY gh call it makes through `../gh-limit.py` — serialisation, the
+  # documented backoff, bucket naming and conditional REST. It is installed BESIDE the adapter
+  # (`$O/gh-limit.py`, which is what `$O/gh-rest/gh`'s `$SELF_DIR/../gh-limit.py` resolves to), so a
+  # box that gets the adapter gets the layer with it and a stale pair is impossible.
+  # ⛔ A MISSING HELPER IS NOT A FATAL: `gh-rest/gh` falls back to running the real gh with a loud
+  # warning. Failing the install here would turn a missing optimisation into a box that cannot
+  # merge at all.
+  if [ -f "$HERE/gh-limit.py" ]; then
+    # ⛔ STAGE-THEN-RENAME, like the cell supervisor's seeding. A plain `cp` truncates the target
+    # before writing it, and this file is EXECUTED by every gh call on a live daemon — a call that
+    # landed in the window would run `python3` on half a file (SyntaxError) and fail. `mv` is
+    # atomic within the one filesystem, so a reader sees the old file or the new one, never neither.
+    _tmp="$O/.seed-gh-limit.py.$$"
+    cp "$HERE/gh-limit.py" "$_tmp" || { rm -f "$_tmp"; die "cannot stage gh-limit.py into $O"; }
+    chmod +x "$_tmp"                || { rm -f "$_tmp"; die "cannot chmod gh-limit.py"; }
+    mv -f "$_tmp" "$O/gh-limit.py"   || { rm -f "$_tmp"; die "cannot install $O/gh-limit.py"; }
+  else
+    warn "gh-limit.py missing from the shipped set — gh calls will NOT be serialised or backed off (#1988)"
+  fi
   # ⛔ Route the PATH entry through add_dir, NOT a bare assignment: add_dir applies the TCC guard
   # (a physical path under ~/Documents is EPERM for launchd) that no install-time probe can see.
   add_dir "$O/gh-rest"
@@ -611,14 +653,14 @@ if [ "$PLIST_CHANGED" = "0" ]; then ok "plist unchanged and it is the render lau
 # missing AGENT_DISK_REFUSED, which under `set -u` aborts a refusal before its refund (the callers
 # are tolerant of that now, but surviving a stale helper silently is not the same as DETECTING it).
 DRIFTED=""
-for f in orch-loop.sh claims.sh repo-authority.sh spawn-gate.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh gh-rest/gh; do
+for f in orch-loop.sh claims.sh repo-authority.sh spawn-gate.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh gh-rest/gh gh-limit.py; do
   [ -f "$O/$f" ] || { DRIFTED="$DRIFTED $f(missing)"; continue; }
   diff -q "$HERE/$f" "$O/$f" >/dev/null 2>&1 || DRIFTED="$DRIFTED $f"
 done
 if [ -n "$DRIFTED" ]; then
   warn "the running copy at \$O differs from the shipped copy:$DRIFTED"
   warn "  the daemon executes \$O/<script> — sync them or the fixes here are not in effect:"
-  warn "  cp '$HERE'/*.sh '$O'/ && mkdir -p '$O/gh-rest' && cp '$HERE'/gh-rest/gh '$O/gh-rest/'";
+  warn "  cp '$HERE'/*.sh '$O'/ && mkdir -p '$O/gh-rest' && cp '$HERE'/gh-rest/gh '$O/gh-rest/' && cp '$HERE'/gh-limit.py '$O/'";
 fi
 
 # ── harness provenance (agent-infra#1745) ────────────────────────────────────────

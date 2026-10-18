@@ -26,7 +26,28 @@ ck() { if [ "$2" -eq 0 ]; then pass=$((pass+1)); printf '  ok   %s\n' "$1"; else
 cat >"$TMP/stub-gh" <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"$STUB_LOG"
-case "$*" in *"--jq .head.sha"*) printf '%s' '75c0353907f016cf71661d8a6b11f61bf4d5092f'; exit 0 ;; esac
+if [ "${STUB_ANY_FAIL:-0}" = 1 ]; then
+  # EXACTLY what the layer prints when it gives up on a read: bucket + reset, on stderr.
+  printf 'gh-limit: gh rate limit (bucket=core reset=1700003600) — FAILED after 4 attempts\n' >&2
+  exit 1
+fi
+case "$*" in *"/comments?per_page"*)
+  if [ "${STUB_COMMENTS_FAIL:-0}" = 1 ]; then
+    printf 'gh-limit: gh rate limit (bucket=core reset=1700003600) — FAILED after 4 attempts\n' >&2
+    exit 1
+  fi ;; esac
+case "$*" in *"commits/"*"/status")
+  if [ "${STUB_STS_FAIL:-0}" = 1 ]; then
+    printf 'gh-limit: gh rate limit (bucket=core reset=1700003600) — FAILED after 4 attempts\n' >&2
+    exit 1
+  fi ;; esac
+case "$*" in *"--jq .head.sha"*)
+  if [ "${STUB_SHA_FAIL:-0}" = 1 ]; then
+    # EXACTLY what the layer prints when it gives up: the bucket and the reset, on stderr.
+    printf 'gh-limit: RATE LIMITED bucket=core reset=1700003600 attempts=4\n' >&2
+    exit 1
+  fi
+  printf '%s' '75c0353907f016cf71661d8a6b11f61bf4d5092f'; exit 0 ;; esac
 case "$*" in *"--auto"*) printf 'STUB: delegated auto-merge'; exit 0 ;; esac
 # POST /comments (pr comment) and GET /comments (pr view --json comments) share a path — split on method.
 case "$*" in *"-X POST"*"/comments"*) printf '{"id":7,"html_url":"https://github.com/o/r/pull/8833#issuecomment-7"}'; exit 0 ;; esac
@@ -52,7 +73,10 @@ esac
 echo "STUB: no fixture for: $*" >&2; exit 1
 STUB
 chmod +x "$TMP/stub-gh"
-run() { STUB_LOG="$TMP/log" GH_REST_REAL_GH="$TMP/stub-gh" bash "$SHIM" "$@"; }
+# GH_LIMIT_DIR keeps the LIMIT LAYER (#1988) hermetic too: without it the adapter's helper would
+# write its lock, ETag cache and limit record into the operator's real ~/.cache/gh-limit.
+run() { STUB_LOG="$TMP/log" GH_REST_REAL_GH="$TMP/stub-gh" GH_LIMIT_DIR="$TMP/limit" \
+        GH_LIMIT_CONDITIONAL=0 bash "$SHIM" "$@"; }
 stublog() { cat "$TMP/log" 2>/dev/null; }
 json_eq() { python3 -c "import json,sys; d=json.load(sys.stdin); print(0 if $1 else 1)" 2>/dev/null || echo 1; }
 # ⛔ No `producer | grep -q`: a quiet grep writes nothing into the pipe, so the PIPE (not the content)
@@ -156,6 +180,14 @@ ck "pr comment PRINTS the comment URL (P0: else every reviewed PR parks)" \
 : >"$TMP/log"
 run pr merge 8833 --repo o/r --squash --match-head-commit 75c0353 >/dev/null 2>&1
 ck "pr merge --squash -> PUT merge_method=squash" "$(haslog 'merge_method=squash' && echo 0 || echo 1)"
+# ⛔ THE POST-MERGE STEPS MUST NOT DECIDE THE EXIT CODE. The layer helper is `exec`'d, so a bare
+# `[ … ] && run_real … || true` replaced the shim with the DELETE and returned ITS status: a
+# SUCCESSFUL merge (this stub's DELETE always fails, as the real one does — the ref path is a
+# pre-existing bug) came back rc≠0 and the caller read a landed merge as a failure.
+run pr merge 8833 --repo o/r --squash --delete-branch >/dev/null 2>&1; rc=$?
+ck "pr merge --delete-branch still reports SUCCESS (the branch delete cannot fail the merge)" \
+   "$([ "$rc" -eq 0 ] && echo 0 || echo 1)"
+ck "pr merge --delete-branch does attempt the delete" "$(haslog 'git/refs/heads' && echo 0 || echo 1)"
 ck "pr merge passes --match-head-commit as sha" "$(haslog 'sha=75c0353' && echo 0 || echo 1)"
 : >"$TMP/log"
 run pr merge 9001 --repo o/r --squash >/dev/null 2>&1; rc=$?
@@ -169,8 +201,13 @@ run pr merge 8833 --repo o/r >/dev/null 2>&1
 ck "pr merge with NO method delegates (gh derives it from repo settings)" \
    "$(haslog 'pr merge 8833' && echo 0 || echo 1)"
 : >"$TMP/log"
-run pr ready 8833 --repo o/r >/dev/null 2>&1
+# ⛔ THE OUTPUT IS THE ASSERTION, NOT THE EXIT CODE: with `exec` in `run_real`, a bare form replaced
+# the shim with the POST, so the confirmation line was lost while rc stayed 0 in BOTH shapes —
+# asserting only rc passed on the reverted code (found in review round 4).
+out="$(run pr ready 8833 --repo o/r 2>&1)"; rc=$?
 ck "pr ready -> REST ready_for_review" "$(haslog 'ready_for_review' && echo 0 || echo 1)"
+ck "pr ready still prints its confirmation after an exec'd request" \
+   "$([ "$rc" -eq 0 ] && has 'marked as "ready for review"' "$out" && echo 0 || echo 1)"
 
 # ── K. failures stay loud ────────────────────────────────────────────────────────────────────────
 ck "a failing --jq exits NON-ZERO (empty+0 is indistinguishable from 'no rows')" \
@@ -179,6 +216,50 @@ ck "a failing --jq exits NON-ZERO (empty+0 is indistinguishable from 'no rows')"
 run api repos/o/r --jq .name >/dev/null 2>&1
 ck "untranslated command delegates verbatim (gh api is already REST)" \
    "$(haslog 'api repos/o/r' && echo 0 || echo 1)"
+
+# ── Z. A REFUSED READ MUST NOT LOOK LIKE AN EMPTY SURFACE ────────────────────────────────────────
+# The head-sha read threw stderr away (`2>/dev/null`), so a layer refusal became "empty response" and
+# the caller — which reads stdout only — turned it into NOCHECKS: a PR skipped silently every cycle on
+# a box that was merely limited. The refusal's own words must reach the caller (review round 9).
+# `GH_LIMIT_NO_WAIT=1` = what every bounded harness caller sets: the layer records the refusal and
+# returns at once instead of sleeping 60 s (this suite has no fake clock).
+out="$(GH_LIMIT_NO_WAIT=1 STUB_SHA_FAIL=1 run pr checks 8833 --repo o/r --json name,state 2>"$TMP/err-z")"; rc=$?
+err="$(cat "$TMP/err-z")"
+ck "pr checks on a REFUSED head-sha read names the refusal (bucket + reset) on stderr" \
+   "$([ "$rc" -ne 0 ] && has 'RATE LIMITED bucket=core reset=1700003600' "$err" && echo 0 || echo 1)"
+ck "pr checks on a REFUSED read prints NO surface on stdout (never a partial check set)" \
+   "$([ -z "$out" ] && echo 0 || echo 1)"
+
+# ── Y. EVERY READ KEEPS THE LAYER'S WORDS ────────────────────────────────────────────────────────
+# `run_real … 2>&1 | jq` fed the refusal to jq: jq failed, its stdout was empty, and `die "$var"`
+# printed a BLANK `gh-rest: ` with the bucket/reset nowhere — on four of the five reads (review
+# round 10). Each must now name the bucket, and none may print a surface.
+for _sub in "pr list --repo o/r --json number,title" \
+            "issue list --repo o/r --json number,title" \
+            "pr view 8833 --repo o/r --json state,comments" \
+            "pr checks 8833 --repo o/r --json name,state"; do
+  _o="$(GH_LIMIT_NO_WAIT=1 STUB_ANY_FAIL=1 run $_sub 2>"$TMP/err-y")"; _r=$?
+  if [ "$_r" -ne 0 ] && has 'bucket=core reset=1700003600' "$(cat "$TMP/err-y")" && [ -z "$_o" ]; then
+    pass=$((pass+1)); printf '  ok   refused %s: names the bucket and prints no surface\n' "$_sub"
+  else
+    fail=$((fail+1)); printf '  FAIL refused %s: rc=%s stdout=[%s] stderr=[%s]\n' \
+      "$_sub" "$_r" "$_o" "$(cat "$TMP/err-y")"
+  fi
+done
+
+# The COMMENTS read is the one `read_json` site whose sibling base read succeeds, so it is the only
+# way to exercise that half of the fix directly.
+_o="$(GH_LIMIT_NO_WAIT=1 STUB_COMMENTS_FAIL=1 run pr view 8833 --repo o/r --json state,comments 2>"$TMP/err-c")"; _r=$?
+ck "a refused COMMENTS read names the bucket (not a bare jq parse error)" \
+   "$([ "$_r" -ne 0 ] && has 'bucket=core reset=1700003600' "$(cat "$TMP/err-c")" \
+      && ! has 'jq: parse error' "$(cat "$TMP/err-c")" && echo 0 || echo 1)"
+
+# ── X. A REFUSED LEGACY-STATUS READ IS AN INCOMPLETE SURFACE, NOT "no legacy contexts" ────────────
+# It used to return rc 0 with every StatusContext silently missing (a required context then read
+# PENDING forever) and a message every caller discards.
+_o="$(GH_LIMIT_NO_WAIT=1 STUB_STS_FAIL=1 run pr checks 8833 --repo o/r --json name,state 2>"$TMP/err-x")"; _r=$?
+ck "a refused legacy commit-status read FAILS the call (rc!=0) and says the set is incomplete" \
+   "$([ "$_r" -ne 0 ] && has 'INCOMPLETE' "$(cat "$TMP/err-x")" && [ -z "$_o" ] && echo 0 || echo 1)"
 
 echo
 printf 'gh-rest: %d passed, %d failed\n' "$pass" "$fail"

@@ -5,6 +5,13 @@ set -u
 REPO="$1"; OR="$2"; N="$3"; BR="$4"
 O="${O:-$HOME/orchestrator}"; mkdir -p "$O/logs" "$O/state"
 export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
+# ⛔ THE gh SHIM MUST STAY FIRST (#1988). The line above prepends the tool dirs, so a REAL gh in
+# either of them outranks the seeded `$O/gh-rest` (Mac REST adapter) / `$O/gh-limit` (cell
+# serialiser) — and a shim that is never resolved is an INERT layer: it reports protection and
+# provides none. Re-assert both here, adapter last so `$O/gh-rest` (which itself calls the same
+# helper) wins where it exists. Guarded by `-d`, so a box that ships neither is unchanged.
+if [ -d "$O/gh-limit" ]; then PATH="$O/gh-limit:$PATH"; fi
+if [ -d "$O/gh-rest" ]; then PATH="$O/gh-rest:$PATH"; fi
 LOG="$O/logs/chain-$N.log"
 echo "[chain $N] waiting for PR on $BR $(date)" > "$LOG"
 
@@ -39,8 +46,10 @@ release_issue_claim() {
   [ -f "$csh" ] || return 0
   # CLAIM_REPO is the repo the claim was pushed to (refs/claims live in the TARGET repo's origin),
   # which is the value orch-loop.sh used when it acquired — a mismatch here would read the WRONG
-  # repo's ref and the release would be a no-op. Every git call in claims.sh is `-C "$CLAIM_REPO"`,
-  # so the cwd is irrelevant and no `cd` (a gated shape) is needed.
+  # repo's ref and the release would be a no-op. Every git call in claims.sh resolves the repo from
+  # CLAIM_REPO itself (it `cd`s into it inside a subshell, 2026-10-18 — a `git -C` there was NOT
+  # cwd-independent and returned an empty claim commit on the launchd cells), so THIS file's cwd is
+  # irrelevant and no `cd` (a gated shape) is needed here.
   # ⛔ SOURCED INTO THIS SHELL, NOT A SUBSHELL, AND ITS FAILURES ARE LOGGED (2026-10-16 review).
   # `( … ) >/dev/null 2>&1 && echo released` reported SUCCESS ONLY: a refused fence, a network
   # failure, or a registry too old to HAVE the release function left the claim running to its full
