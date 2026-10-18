@@ -608,7 +608,16 @@ while :; do
     emit_fix FIX_REQUIRED "this head's own checks are RED: $(printf '%s' "$RED" | tr ',' ' ')"
   fi
   [ "${IF:-0}" = "0" ] && break
+  # ⛔ SAY SOMETHING WHILE YOU WAIT (measured live on this change's own PR). With every required
+  # check in flight the loop printed NOTHING for up to WAIT_S — and to every liveness instrument we
+  # have, a lane that has produced no output for 15 minutes is indistinguishable from a wedged one.
+  # The header promises progress; this is it. Printed when the count CHANGES (so a stable wait does
+  # not spam 45 identical lines) and at least once a minute otherwise.
   now="$(date +%s)"
+  if [ "${IF:-}" != "${_last_if:-}" ] || [ $(( now - ${_last_say:-0} )) -ge 60 ]; then
+    say "… ${IF} check(s) in flight at head ${HEAD:0:12} — waiting ($(( deadline - now ))s left in this bound)"
+    _last_if="$IF"; _last_say="$now"
+  fi
   if [ "$now" -ge "$deadline" ]; then
     # In flight at the bound is NOT a failure of the lane and NOT a green: it is an unexplained
     # wait. Say so and let the caller re-run (a re-run costs one PR read).
