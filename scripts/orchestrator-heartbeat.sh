@@ -901,6 +901,28 @@ MSG="${MSG} ⛔ MAP: the CI-and-merge crisis is the Tortoise graph, entered via 
 # warning at :377-379 (a lane name in backticks was executed as a command) and it was repeated
 # anyway. Quote plainly, or use the word 'run'.
 MSG="${MSG} ⛔ PRIORITY: before dispatching, read the ranked order IN THE GRAPH (the restated PRIORITY STACK + the objective cascade: DRAIN -> BE ABLE TO MERGE -> COMPLETE P0/P1 -> LAUNCH ALPHA -> PILOTS -> REVENUE), then VERIFY each item's state with gh issue view N --json state — a stack entry is a hypothesis about the work, never a statement that it is open. "
+
+# -- ⛔ FLEET ADVANCE: the standing order the beat had NO half of (owner, 2026-10-18) ---------
+# MEASURED BEFORE THIS CLAUSE EXISTED: 12 open non-draft PRs, 8 of them closing a P0/P1 issue,
+# ALL 8 blocked, and merged_24h unmoved for over an hour -- while every beat in that window read
+# as a healthy fleet. The beat carried ROLE, MAP and PRIORITY (how to behave) and no instruction
+# to ADVANCE anything, so a lane could read it, write a paragraph about load and lanes, dispatch
+# nothing, and nothing on the line said that was wrong.
+# WHY HERE AND NOT AGENTS.md: AGENTS.md holds the standing rules; the beat holds what to do with
+# the NEXT TEN MINUTES. The failure was never ignorance of the rules -- it was a beat that read
+# like a finished report. A document cannot change the behaviour a report triggers; putting the
+# order IN the report is what does. It sits beside ROLE/MAP/PRIORITY because that is the block an
+# agent already reads.
+# ⛔ UNCONDITIONAL, AND IT MUST RIDE THE SHORT FORM TOO (see the PULSE block below): a quiet beat
+# is exactly when the order is needed, and the short form is what a quiet beat receives -- the
+# short form REBUILDS MSG, so a clause appended only above it is discarded on every quiet tick.
+# FLEETADV is a variable only so the two bodies cannot drift apart.
+# ⛔ NO BACKTICKS, NO DOUBLE QUOTES AND NO $ IN FLEETADV -- the same rule as the rest of MSG
+# (see the warning above): MSG is a DOUBLE-QUOTED assignment, so a backticked span is
+# command-substituted AT ASSIGNMENT TIME and silently vanishes, leaving a hole the file on disk
+# still looks right about. tests/heartbeat-fleet-advance/run.sh asserts all three.
+FLEETADV="⛔ FLEET ADVANCE — this beat is an ORDER, not a report. (1) CHECK THE cmux LANES AND ALL FOUR BOXES (the local machine plus the three cloud VMs) and push every one toward AUTOPILOT — dispatching, creating PRs, fixing them, merging them UNATTENDED. (2) USE THE CAPACITY, DO NOT REPORT IT: if the local machine has room, dispatch locally; if a cloud VM is idle, dispatch there — lanes must be running on real work, not described in a paragraph about load. (3) DRIVE THE P0/P1 PRs: name the specific PRs that should land this cycle and take each one to the rail — run scripts/admin-merge.sh — and advance agent-infra (cell-2 owns it) toward automating dispatch, PR creation, fixing and merging. A beat that reports state and dispatches nothing is a WASTED BEAT. "
+MSG="${MSG} ${FLEETADV}"
 if [ -n "${CAPTEXT:-}" ]; then MSG="${MSG} ${CAPTEXT}"; fi
 
 # -- SHORT FORM when there is nothing to act on -------------------------------
@@ -911,6 +933,10 @@ if [ -n "${CAPTEXT:-}" ]; then MSG="${MSG} ${CAPTEXT}"; fi
 # The delivery check greps for "HEARTBEAT ${TS}", which both forms contain.
 if [ "${FORCE_SHORT:-0}" = "1" ] || { [ "$N_ALERT" -eq 0 ] && [ -z "$ASK_EV" ]; }; then
   MSG="[HEARTBEAT ${TS}] fleet ${N_ACT}active/${N_WAIT}waiting-child of ${N_TOTAL}. ${DELIV} ${QUEUE} ${OBJ} ⛔ ROLE: orchestrate, don't implement — dispatch and verify the artifact; never decide for the owner (their questions go through the AGENTS.md protocol to the owner-decision label, ask-owner.py). ⛔ MAP: the CI-and-merge crisis is the Tortoise graph, entered via the graph comment on #4844 — read it, keep it current. ⛔ PRIORITY: read the ranked order IN THE GRAPH (restated PRIORITY STACK + the cascade DRAIN -> MERGE -> P0/P1 -> ALPHA -> PILOTS -> REVENUE) and VERIFY each item's state (gh issue view N --json state) before dispatching — a stack entry is a hypothesis, not proof it is open. No alerts. (Verdict legend suppressed: CHILD-STUCK / WEDGED / DONE-IDLE / UNBOUND are WEAK signals — confirm against the pane or a content scan before acting. Full legend + VERDICTS known= are in ${LOG##*/}.)"
+  # ⛔ THE SHORT FORM REBUILDS MSG, so the FLEET ADVANCE order must be re-appended here or every
+  # quiet beat loses the one instruction that tells the lane to dispatch something. It goes BEFORE
+  # the capacity clause: the order first, the detail it acts on second.
+  MSG="${MSG} ${FLEETADV}"
   if [ -n "${CAPTEXT:-}" ]; then MSG="${MSG} ${CAPTEXT}"; fi
 fi
 # -- the bottleneck clause, when the queue is the constraint -------------------
