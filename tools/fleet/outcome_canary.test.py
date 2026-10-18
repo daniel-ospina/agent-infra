@@ -1570,14 +1570,14 @@ def test_an_ambiguous_send_is_not_blind_retried_but_a_refusal_is():
     # a DIFFERENT shape re-arms automatically, because the key carries the variant
     v2 = m.V("work_dispatched", m.FAIL, "NO_DISPATCH", "e")
     to_send, _ = m.plan_notifications([v2], st, "local", "iso", 2.0)
-    assert [x.key for x, _ in to_send] == [v2.key], to_send
+    assert [x.key for x in to_send] == [v2.key], to_send
     # …and when v2 is DELIVERED the stale marker for v1 must go with it, or a return to v1 is
     # suppressed by an attempt recorded for a shape that no longer exists.
     st.clear_others("work_dispatched", keep=v2.key)
     st.mark(v2.key, 2.0, delivered=True)
     assert st.is_ambiguous(v.key) is False, "a delivered sibling must clear the stale marker"
     to_send, _ = m.plan_notifications([v], st, "local", "iso", 3.0)
-    assert [x.key for x, _ in to_send] == [v.key], ("a return to the first shape went silent", to_send)
+    assert [x.key for x in to_send] == [v.key], ("a return to the first shape went silent", to_send)
 
 
 @test
@@ -2442,6 +2442,102 @@ def test_an_UNKNOWN_probe_in_skip_is_a_usage_error_not_a_silent_no_op():
     assert "unknown probe" in err.lower(), err[-400:]
     rc2, _, err2 = run_cli(["--static", "--skip", "github"])
     assert rc2 == 0, (rc2, err2[-400:])
+
+
+@test
+def test_a_SUPERSEDED_backlog_cannot_grade_work_as_NOT_dispatched():
+    """The header's `backlog=` is ONE refresh old. When the newer `state/queue-state` reads the pool
+    EMPTY, the header's 47 remaining candidates are already gone — but `work_dispatched` still graded
+    them, so ONE facts dict produced `queue_readable PASS/READABLE (graded from: state/queue-state, it
+    is NEWER)` beside `work_dispatched FAIL/NO_DISPATCH — work existed and did not move`: exit 1 and a
+    message to the controller about a backlog a 40-second-old record had superseded."""
+    m = load()
+    cfg = m.cfg_from_dict({"pool_threshold": 25})
+    hdr = {"raw": "=== h load=40 lanes=2 backlog=47 queue=READ(223)(4m) ===",
+           "queue_token": "READ(223)(4m)", "backlog": 47, "age_s": 60}
+    facts = {"github": {"ok": True, "open_pr_count": 0, "open_prs": [], "source": "rest",
+                        "prs_created_in_window": 1, "prs_merged_in_window": 1},
+             "log_events": {"headers": [hdr], "dispatch_ok": [], "lane_started": [],
+                            "lane_failed": [], "armed": [], "railed": []},
+             "queue_state": {"path": "q", "ok": True, "raw": "EMPTY 1792327660", "age_s": 40}}
+    got = dict((v.name, v) for v in m.evaluate(facts, cfg))
+    assert got["queue_readable"].status == m.PASS, got["queue_readable"].as_json()
+    assert (got["work_dispatched"].status, got["work_dispatched"].variant) == (
+        m.PASS, "IDLE_EMPTY_POOL"), (got["work_dispatched"].status,
+                                     got["work_dispatched"].variant,
+                                     got["work_dispatched"].evidence)
+    # …and a backlog the grade DOES own still produces the FAIL
+    facts["queue_state"] = {"path": "q", "ok": True, "raw": "READ(223) 1792327600", "age_s": 30}
+    got2 = dict((v.name, v) for v in m.evaluate(facts, cfg))
+    assert (got2["work_dispatched"].status, got2["work_dispatched"].variant) == (
+        m.FAIL, "NO_DISPATCH"), (got2["work_dispatched"].status, got2["work_dispatched"].variant)
+
+
+@test
+def test_an_IN_FLIGHT_check_is_labelled_inflight_not_RED():
+    """An in-flight check makes its check UNKNOWN, and `landers` printed `:red` for it: a CLEAN,
+    APPROVED, UNARMED PR was reported as known-not-landable "red" inside a PASS block while its CI was
+    still running (a QUEUED run awaiting approval stays that way for hours). The verdict is unchanged —
+    an in-flight PR is not landable yet — but the LABEL is a claim, and it was false."""
+    m = load()
+    green = {"name": "ci", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"}
+    inflight = {"name": "ci2", "workflowName": "CI", "status": "IN_PROGRESS"}
+    assert m.rollup_state([green]) == "green"
+    assert m.rollup_state([green, inflight]) == "inflight"
+    assert m.rollup_state([green, None]) is None, "an unreadable entry is not a state"
+    assert m.rollup_state([{"name": "ci2"}]) == "inflight", "no conclusion yet is in flight"
+    assert m.rollup_state([green, {"name": "c3", "conclusion": "FAILURE"}]) == "red"
+    cfg = m.cfg_from_dict({"repo": "o/r"})
+    v = m.check_landers({"github": {"ok": True, "source": "graphql", "open_pr_count": 1, "open_prs": [
+        {"number": 7, "merge_state_status": "CLEAN", "checks_green": False,
+         "checks_state": "inflight", "auto_armed": False, "review_decision": "APPROVED",
+         "probed": True, "draft": False}]}}, cfg)
+    assert v.status == m.PASS and v.variant == "NOTHING_GREEN", (v.status, v.variant, v.evidence)
+    assert "7:inflight" in v.evidence, v.evidence
+    assert "7:red" not in v.evidence, v.evidence
+
+
+@test
+def test_an_UNAGED_EMPTY_record_cannot_manufacture_idleness_either():
+    """`_activity`'s supersede guard ignored the record's AGE, so an `EMPTY` with no epoch granted
+    "the fleet had nothing in hand" while `queue_readable` and `work_dispatched` both said
+    STATE_FROZEN about the very same record — an unaged record loses its CLAIM, never its authority."""
+    m = load()
+    cfg = m.cfg_from_dict({})
+    facts = {"github": {"ok": True, "open_pr_count": 0, "open_prs": [], "source": "rest",
+                        "prs_created_in_window": 0, "prs_merged_in_window": 0},
+             "log_events": {"headers": [{"raw": "=== h backlog=47 queue=READ(223) ===",
+                                         "queue_token": "READ(223)", "backlog": 47, "age_s": 60}],
+                            "dispatch_ok": [], "lane_started": [], "lane_failed": [],
+                            "armed": [], "railed": []},
+             "queue_state": {"path": "q", "ok": True, "raw": "EMPTY", "age_s": None}}
+    got = dict((v.name, v) for v in m.evaluate(facts, cfg))
+    assert (got["queue_readable"].status, got["queue_readable"].variant) == (
+        m.INCONCLUSIVE, "STATE_FROZEN"), got["queue_readable"].variant
+    # the PR check must not then assert the thing the queue checks refuse to
+    assert "nothing in hand" not in got["pr_created"].detail, got["pr_created"].detail
+
+
+@test
+def test_the_landers_UNPROBED_leg_reads_the_fields_the_predicate_reads():
+    """The cycle-25 test built its PR row with `merge_state`/`armed`/`review`, but `check_landers` reads
+    `merge_state_status`/`auto_armed`/`review_decision` — so the row was unprobed for a reason that had
+    nothing to do with the check surface, and the assertion could not discriminate the defect it named."""
+    m = load()
+    green = {"name": "ci", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"}
+    cfg = m.cfg_from_dict({"repo": "o/r"})
+    base = {"number": 7, "merge_state_status": "CLEAN", "auto_armed": False,
+            "review_decision": "APPROVED", "probed": True, "draft": False}
+    # a GREEN row with no lander is the check's own FAIL…
+    v_green = m.check_landers({"github": {"ok": True, "source": "graphql", "open_pr_count": 1,
+                                          "open_prs": [dict(base, checks_green=True)]}}, cfg)
+    assert v_green.status == m.FAIL, (v_green.status, v_green.variant, v_green.evidence)
+    assert v_green.variant in ("LANDER_MISSING", "LANDER_EXPIRED", "UNLANDED"), v_green.variant
+    # …and an UNPROBED surface is unprobed, whatever else the row says
+    v_unp = m.check_landers({"github": {"ok": True, "source": "graphql", "open_pr_count": 1,
+                                        "open_prs": [dict(base, checks_green=None)]}}, cfg)
+    assert (v_unp.status, v_unp.variant) == (m.INCONCLUSIVE, "PARTIAL_POPULATION"), (
+        v_unp.status, v_unp.variant, v_unp.evidence)
 
 
 @test
@@ -3762,7 +3858,7 @@ def test_a_recovery_rearms_an_ambiguously_sent_alert():
     st.clear("work_dispatched")           # the fleet recovered
     assert st.is_ambiguous(v.key) is False, "a recovery must clear the ambiguity marker"
     to_send, _ = m.plan_notifications([v], st, "local", "iso", 2.0)
-    assert [x.key for x, _ in to_send] == [v.key], ("the repeat failure went silent", to_send)
+    assert [x.key for x in to_send] == [v.key], ("the repeat failure went silent", to_send)
 
 
 @test
@@ -3927,6 +4023,23 @@ def test_source_never_contains_a_forbidden_launchctl_form():
 
 MUTATIONS = [
     # (label, old, new, paired test)
+    # ── cycle-26 defects ──────────────────────────────────────────────────────────────────
+    ("a superseded header backlog still grades a FAIL",
+     '    superseded_backlog = (pool_kind == "EMPTY" and _tok_src == "state/queue-state" and stale is None)',
+     "    superseded_backlog = False",
+     "test_a_SUPERSEDED_backlog_cannot_grade_work_as_NOT_dispatched"),
+    ("an in-flight check is labelled red",
+     '            skipped.append("%s:%s" % (pr.get("number"), pr.get("checks_state") or "red"))',
+     '            skipped.append("%s:red" % (pr.get("number"),))',
+     "test_an_IN_FLIGHT_check_is_labelled_inflight_not_RED"),
+    ("an unaged EMPTY record still manufactures idleness",
+     '    if _src == "state/queue-state" and kind == "EMPTY" and _graded_stale(f, cfg, _src) is None:',
+     '    if _src == "state/queue-state" and kind == "EMPTY":',
+     "test_an_UNAGED_EMPTY_record_cannot_manufacture_idleness_either"),
+    ("an in-flight rollup is reported as a red conclusion",
+     '    if any(_in_flight(chk) for _r, chk in entries):\n        return "inflight"',
+     '    if any(_in_flight(chk) for _r, chk in entries):\n        return "red"',
+     "test_an_IN_FLIGHT_check_is_labelled_inflight_not_RED"),
     # ── cycle-25 defects ──────────────────────────────────────────────────────────────────
     ("an absent pids key is graded as an empty process table",
      '    raw_pids = ctrl.get("pids")',
@@ -3937,8 +4050,8 @@ MUTATIONS = [
      "    if False:",
      "test_the_RESPAWN_re_measure_refuses_an_absent_pids_list"),
     ("a malformed rollup entry is called red",
-     "        if not isinstance(chk, dict):\n            return None",
-     "        if not isinstance(chk, dict):\n            return False",
+     "        if not isinstance(chk, dict):\n            return None\n        attempts.setdefault(",
+     "        if not isinstance(chk, dict):\n            return False\n        attempts.setdefault(",
      "test_a_MALFORMED_rollup_ENTRY_is_unprobed_not_RED"),
     ("an undisclosed surface is reported as a failed read",
      '        else "surface: not disclosed by this payload"',
@@ -3991,7 +4104,7 @@ MUTATIONS = [
      '    pair = tok',
      "test_an_EMPTY_backlog_is_judged_against_the_pool_from_ITS_OWN_header"),
     ("fleet activity attributes the header's backlog to a newer state record",
-     '    if _src == "state/queue-state" and kind == "EMPTY":',
+     '    if _src == "state/queue-state" and kind == "EMPTY" and _graded_stale(f, cfg, _src) is None:',
      "    if False:",
      "test_an_EMPTY_state_record_supersedes_an_older_header_backlog"),
     ("pr_merged FAILs while its own activity input is unread",
@@ -4199,8 +4312,8 @@ MUTATIONS = [
      "test_static_refuses_a_PARTIAL_expectation_and_a_MISSING_fixture"),
     # ── cycle-11 defects ────────────────────────────────────────────────────────────
     ("an unread check surface is graded RED, so a green unarmed PR drops out of the population",
-     "    if not rollup:",
-     "    if not rollup:\n        return False\n    if False:",
+     "    if not rollup:\n        # \u26d4 `None`, NOT False.",
+     "    if not rollup:\n        return False\n        # \u26d4 `None`, NOT False.",
      "test_a_PR_with_NO_check_surface_is_UNPROBED_not_dropped_from_the_lander_population"),
     ("the pane census counts any process whose command line MENTIONS the daemon",
      '        is_daemon = (base0 == name\n'
@@ -4516,8 +4629,8 @@ MUTATIONS = [
      "hdr.get(\"queue_token\"), \"cycle header\"",
      "test_the_QUEUE_STATE_record_outranks_a_header_that_is_one_refresh_old"),
     ("work_dispatched reads a different pool token than queue_readable",
-     "    pool_kind = pool_kind if hdr is not None else None",
-     "    pool_kind = parse_queue_token(hdr.get(\"queue_token\")).get(\"kind\")",
+     "    _tok, _raw, _tok_src = authoritative_queue_token(f, hdr)",
+     "    _tok, _raw, _tok_src = parse_queue_token(hdr.get(\"queue_token\")), None, \"cycle header\"",
      "test_the_QUEUE_STATE_record_outranks_a_header_that_is_one_refresh_old"),
     ("an unreadable memory probe is reported as 0 MiB free",
      "            \"if (!seen || ps == \\\"\\\" || free == \\\"\\\" || inact == \\\"\\\" || spec == "

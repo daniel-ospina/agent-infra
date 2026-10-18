@@ -227,8 +227,8 @@ shape changes, and it is pruned with the rest of its check.
 ## The suite
 
 ```bash
-python3 tools/fleet/outcome_canary.test.py              # 151 tests
-python3 tools/fleet/outcome_canary.test.py --mutations  # 148 mutations, each must go RED
+python3 tools/fleet/outcome_canary.test.py              # 155 tests
+python3 tools/fleet/outcome_canary.test.py --mutations  # 152 mutations, each must go RED
 ```
 
 The signal tests drive the **real CLI** end-to-end (`--live --facts … --capture-dir …`), so what is
@@ -359,9 +359,17 @@ Six more (cycle 13), each a case where a datum the tool held was not the one it 
   `False` — a positive claim that a PR's CI is red — so `landers` filed a CLEAN, APPROVED, UNARMED PR
   under the known-not-landable skips and returned `PASS / NOTHING_GREEN`, which is the silent expiry
   this check exists to catch. An unreadable entry now abstains exactly like an unreadable surface
-  (`PARTIAL_POPULATION`). (An entry that PARSES but has no conclusion is still "not green": in flight
-  is not a pass, so the PR is not yet landable — the skip line's `:red` over-reads that, and the
-  verdict does not.)
+  (`PARTIAL_POPULATION`). An entry that PARSES but has not concluded is **not green** (in flight is
+  not a pass, so the PR is not landable yet) and is labelled `:inflight`, not `:red`: the verdict is
+  the same, the CLAIM is true. `rollup_state()` is that three-way read; `rollup_is_green()` is the
+  boolean projection the collectors use.
+- **A superseded `backlog=` cannot grade "work existed and did not move".** The header's `backlog=`
+  and `queue=` are one refresh old, so when the newer `state/queue-state` reads the pool EMPTY the
+  header's remaining candidates are already gone. `work_dispatched` graded them anyway, producing —
+  for ONE facts dict — `queue_readable PASS/READABLE ("graded from: state/queue-state, it is NEWER")`
+  beside `work_dispatched FAIL/NO_DISPATCH` and a message to the controller. Both backlog FAIL arms
+  are now gated on `superseded_backlog`, and `IDLE_EMPTY_POOL` is reachable from a header that still
+  carries a backlog.
 - **`--skip` refuses an unknown probe (exit 3).** `--skip githbu` was dropped silently: the operator
   believed a probe was suppressed and the run neither suppressed it nor said so. `--only` already
   refused unknown names; `--skip` now does, against the same kind of closed list (`SKIPPABLE`).

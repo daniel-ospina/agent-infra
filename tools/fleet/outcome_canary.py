@@ -1370,7 +1370,6 @@ def check_work_dispatched(f, c):
     # `queue_readable` read the newer state record let a BLIND refresh be called IDLE: header
     # `EMPTY` + newer `state/queue-state: UNREADABLE` → PASS/IDLE_EMPTY_POOL (agent-infra#1931 as
     # health). One source, both checks.
-    pool_kind = pool_kind if hdr is not None else None
     if hdr is None:
         return V("work_dispatched", INCONCLUSIVE, "NO_CYCLE_IN_WINDOW", evidence,
                  "no cycle ran in the window, so whether work existed is unknown. Not green.")
@@ -1395,19 +1394,30 @@ def check_work_dispatched(f, c):
                  ("the pool reading carries NO AGE (no epoch in the token, none in "
                   "state/queue-state), so 'there was nothing to dispatch' cannot be told from a "
                   "record frozen hours ago. Not green."))
+    # ⛔ A SUPERSEDED BACKLOG CANNOT SUPPORT "work existed and did not move". The header's
+    # `backlog=` and `queue=` are ONE refresh old (`orch-loop.sh` writes the header at the top of the
+    # cycle; the refresh runs later), so when the newer `state/queue-state` reads the pool EMPTY, the
+    # header's 47 remaining candidates are already gone. Grading them anyway produced, for ONE facts
+    # dict, `queue_readable PASS/READABLE ("graded from: state/queue-state, it is NEWER")` beside
+    # `work_dispatched FAIL/NO_DISPATCH ("the refresh reported 47 candidate(s) … work existed and did
+    # not move")` — exit 1 and a message to the controller, about a backlog a 40-second-old record had
+    # already superseded. `_activity` and `queue_readable` both honour this; this was the third check
+    # in the file still reading the superseded field.
+    superseded_backlog = (pool_kind == "EMPTY" and _tok_src == "state/queue-state" and stale is None)
     # ⛔ THESE TWO FAIL ARMS REST ON THE QUEUE RECORD, so they sit BELOW the staleness abstention.
     # Above it they were reached first and graded FAIL/NO_DISPATCH ("the refresh reported 47
     # candidate(s) and no dispatch line was written… Work existed and did not move") off a six-hour-old
     # reading — the exact claim the abstention exists to withhold, and a FAIL that pages someone while
     # `queue_readable`, on the same record, abstains. An abstention placed after the arm it must
     # suppress is dead code (the same structural bug as `check_pr_merged`'s in cycle 23).
-    if isinstance(backlog, int) and backlog > 0 and skipped is not None:
+    if isinstance(backlog, int) and backlog > 0 and skipped is not None \
+            and not superseded_backlog:
         return V("work_dispatched", FAIL, "NO_DISPATCH_GATED", evidence,
                  "the refresh reported %d candidate(s) and the dispatch gate skipped every cycle "
                  "in the window (reason on the [dispatch] skipped line above). The outcome is "
                  "absent — the evidence names WHY, which distinguishes a gated fleet from a "
                  "silently dead one." % backlog)
-    if isinstance(backlog, int) and backlog > 0:
+    if isinstance(backlog, int) and backlog > 0 and not superseded_backlog:
         return V("work_dispatched", FAIL, "NO_DISPATCH", evidence,
                  "the refresh reported %d candidate(s) and no dispatch line was written in the "
                  "window. Work existed and did not move." % backlog)
@@ -1416,7 +1426,7 @@ def check_work_dispatched(f, c):
                  "queue=EMPTY but the header carries no `backlog=` field: %s" % hdr,
                  "an incomplete header cannot establish that the pool was genuinely empty, so "
                  "'nothing to dispatch' is not established. Not green.")
-    if pool_kind == "EMPTY" and backlog == 0 \
+    if pool_kind == "EMPTY" and (backlog == 0 or superseded_backlog) \
             and (f.get("queue_state") or {}).get("ok") is True:
         return V("work_dispatched", PASS, "IDLE_EMPTY_POOL", evidence,
                  "nothing was dispatched because the pool was read as genuinely EMPTY — the one "
@@ -1482,7 +1492,10 @@ def _activity(f, window_s=None, cfg=None):
     if fresh_dispatch:
         return True, "a dispatch landed %s ago (the queue record is not the only evidence)" % (
             _age_txt(fresh_dispatch.get("age_s")))
-    if _src == "state/queue-state" and kind == "EMPTY":
+    # ⛔ AN UNAGED RECORD LOSES ITS CLAIM, NEVER ITS AUTHORITY. `_graded_stale` is what decides
+    # currency; without this guard an `EMPTY` with no epoch re-granted "the fleet had nothing in hand"
+    # while `queue_readable` and `work_dispatched` both said STATE_FROZEN about the same record.
+    if _src == "state/queue-state" and kind == "EMPTY" and _graded_stale(f, cfg, _src) is None:
         return False, ("the graded record is state/queue-state: EMPTY (%s) — it supersedes the "
                        "%s cycle header's backlog=%s" % (age_txt, backlog_src, backlog))
     busy = bool((isinstance(backlog, int) and not isinstance(backlog, bool) and backlog > 0)
@@ -1834,6 +1847,33 @@ def check_headroom(f, c):
 GREEN_CONCLUSIONS = ("SUCCESS", "NEUTRAL", "SKIPPED", "CANCELLED", "STALE")
 
 
+def rollup_state(rollup):
+    """The three-way READ of a check rollup: "green", "red", "inflight", or None (unreadable).
+
+    ⛔ THE DISTINCTION EXISTS BECAUSE THE LABEL IS A CLAIM. `landers` prints a skip line per PR it will
+    not land, and calling an in-flight check "red" asserts a conclusion nobody has reached — a
+    QUEUED check-run awaiting approval or a `PENDING` legacy context stays in flight for hours, and a
+    CLEAN, APPROVED, UNARMED PR was reported as known-not-landable `:red` inside a PASS block. The
+    VERDICT is unchanged (an in-flight PR is not landable yet); only the claim made about it is.
+    """
+    if not isinstance(rollup, list):
+        return None
+    if not rollup:
+        return None
+    entries = []
+    for pos, chk in enumerate(rollup):
+        if not isinstance(chk, dict):
+            return None
+        entries.append((_check_rank(chk, pos), chk))
+    if any(_in_flight(chk) for _r, chk in entries):
+        return "inflight"
+    _rank, chk = max(entries, key=lambda e: e[0])
+    concl = _check_conclusion(chk)
+    if concl is None:
+        return "inflight"
+    return "green" if concl in GREEN_CONCLUSIONS else "red"
+
+
 def rollup_is_green(rollup):
     """Is this PR's rollup green — ONE verdict per CHECK, from its NEWEST attempt.
 
@@ -2081,7 +2121,9 @@ def check_landers(f, c):
             skipped.append("%s:%s" % (pr.get("number"), mss))
             continue
         if not green:
-            skipped.append("%s:red" % (pr.get("number"),))
+            # ⛔ NAME THE REASON THE ROW CARRIES. A not-green PR is skipped either because a check
+            # CONCLUDED red or because one is still IN FLIGHT, and `:red` asserted the first for both.
+            skipped.append("%s:%s" % (pr.get("number"), pr.get("checks_state") or "red"))
             continue
         rd = pr.get("review_decision")
         if rd not in (None, "", "APPROVED"):
@@ -2430,7 +2472,7 @@ def compose_message(v, verdicts, box, obs_iso, extra_lines=None):
     return "\n".join(lines) + "\n"
 
 
-def plan_notifications(verdicts, state, box, obs_iso, now):
+def plan_notifications(verdicts, state, box=None, obs_iso=None, now=None):
     """Which verdicts need a message. Change-only, per (box, check, variant).
 
     Returns (to_send, suppressed). A key is only recorded once a send is CONFIRMED, so a refused
@@ -2446,7 +2488,10 @@ def plan_notifications(verdicts, state, box, obs_iso, now):
         if v.key in state.notified or state.is_ambiguous(v.key):
             suppressed.append(v)
             continue
-        to_send.append((v, compose_message(v, verdicts, box, obs_iso)))
+        # ⛔ NOTHING IS COMPOSED HERE. `main` composes the bytes it sends, extras included, and threw
+        # this copy away — so a future edit to `compose_message` had two call sites where only one was
+        # visible in the report. This function's job is WHICH verdicts to send, not what they say.
+        to_send.append(v)
     return to_send, suppressed
 
 
@@ -3971,7 +4016,7 @@ def main(argv=None):
             extra = ["RESPAWN", "  " + (rr.get("detail") or "not attempted")]
             for argv, rc, out in rr.get("commands") or []:
                 extra.append("  $ %s  → rc=%s %s" % (" ".join(argv), rc, (out or "")[:200]))
-        for v, _msg in to_send:
+        for v in to_send:
             ws = cfg.controller_ws
             ws_why = "--controller-ws"
             if not ws:
