@@ -2364,7 +2364,15 @@ chmod +x "$D/bin/gh"
 # A sentinel makes "nothing written" DISCRIMINATING: an empty file cannot distinguish "the pass
 # refused" from "the backlog was clobbered".
 echo 99 > "$D/o/candidates.txt"
-rf "$D" refresh
+# ⛔ PACING IS OFF FOR THIS CASE, DELIBERATELY (agent-infra#1736 follow-up, 2026-10-18). The fixture
+# serves `core.remaining=0` to model a starved bucket, and the shipped script now has an EARLIER gate
+# for exactly that state: a pass that cannot buy one candidate refuses before the listings run (it
+# would otherwise spend ~40 calls the next pass needs). That refusal is a DIFFERENT subject — it is
+# covered by `refresh-quota.test.sh` (`unaffordable:` case) — while this case's subject is what the
+# LISTINGS do when the bucket refuses them mid-read: the named 403, no `.open_iss`/`.pr_brs`, and an
+# untouched backlog. Leaving pacing on here would make the budget gate answer for the listing gate and
+# the assertions below would pass without ever exercising it.
+rf "$D" refresh COLLISION_PREFLIGHT_CORE_PACING=0
 [ "$RC" -eq 1 ] && ok "rest-403: the pass exits TRANSIENT (rc=1) — a starved REST bucket is an outage, not 'no work'" \
                || bad "rest-403: rc=$RC (want 1) — output: $OUT"
 [ ! -e "$D/o/.open_iss" ] && ok "rest-403: a FAILED issue listing leaves NO .open_iss (absence, not an empty answer)" \
