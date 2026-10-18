@@ -606,12 +606,18 @@ lc_ensure() {
   [ "$prc" -eq 0 ] && pid="$(awk '/^[[:space:]]*pid = [0-9]+$/ { print $3; exit }' <<<"$block")"
   if [ "$changed" = "0" ] && [ -n "$pid" ]; then
     age="$(lc_hb_age "$O")"
-    # ⛔ AN ABSENT HEARTBEAT IS NOT A MEASUREMENT (review finding): `lc_hb_age` returns EMPTY for a
-    # missing/unparseable file, and `${age:-unreadable}s old` then asserted "running but NOT cycling"
-    # from a value that was never read — and pointed at `--restart`, a mutating remedy, on a controller
-    # that may be perfectly healthy. Refuse and say which datum is missing.
+    # ⛔ AN ABSENT HEARTBEAT IS NOT A MEASUREMENT (review finding): `lc_hb_age` returns EMPTY when the
+    # read produced no usable INSTANT, and `${age:-unreadable}s old` then asserted "running but NOT
+    # cycling" from a value that was never read — and pointed at `--restart`, a mutating remedy, on a
+    # controller that may be perfectly healthy. Refuse, and name the datum that is actually at fault:
+    # "missing" and "present but not a usable instant" (future-dated beyond the skew tolerance, or a
+    # value bash will not compare) send the operator to different places.
     if [ -z "$age" ]; then
-      lc_err "❌ refusing to decide on $label: $O/heartbeat could not be read (missing or unparseable), so 'not cycling' is UNPROVEN. Next: ls -l $O/heartbeat; tail -40 $O/logs/orch-loop.log"
+      if [ -f "$O/heartbeat" ]; then
+        lc_err "❌ refusing to decide on $label: $O/heartbeat is PRESENT but is not a usable instant (future-dated beyond the 60s skew, or a value bash will not compare), so 'not cycling' is UNPROVEN. Next: cat -v $O/heartbeat; date +%s; tail -40 $O/logs/orch-loop.log"
+      else
+        lc_err "❌ refusing to decide on $label: $O/heartbeat is missing (no readable file), so 'not cycling' is UNPROVEN. Next: ls -l $O/heartbeat; tail -40 $O/logs/orch-loop.log"
+      fi
       return 1
     fi
     if [ "$age" -le "$stale" ]; then

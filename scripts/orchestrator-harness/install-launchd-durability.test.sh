@@ -1205,9 +1205,25 @@ rm -f "$T/o/heartbeat"
 : > "$FAKE_LOG"
 out="$( . "$LIB"; LC_SETTLE=1 lc_ensure "$LABEL" "$T/o/x.plist" "$T/o" 0 2 2>&1 )"; rc=$?
 if [ "$rc" -ne 0 ]; then ok "a MISSING heartbeat refuses (non-zero)"; else bad "an absent datum was rendered as a staleness measurement"; fi
-assert_contains "$out" "could not be read" "…and names the missing datum"
+# The substring names the DATUM, not just the phrase: `lc_guard_mutate` and `lc_probe` refuse with
+# "could not be read" too, so a generic match would keep passing if the probe or the guard were what
+# actually refused in this fixture (review finding).
+assert_contains "$out" "heartbeat is missing" "…and names the MISSING heartbeat specifically"
 assert_not_contains "$out" "running but not cycling" "…and does NOT claim the controller is wedged"
 assert_not_contains "$out" "unreadables old" "…and never prints a value it did not read"
+
+# A heartbeat that is PRESENT but not a usable instant is a different operator problem (a clock step),
+# and `lc_hb_age` returns empty for it too. Naming it "missing" would send the operator to `ls -l` on a
+# file they can see.
+fresh "$(( $(date +%s) - 5 ))"
+( . "$LIB"; lc_start "$LABEL" "$T/o/x.plist" >/dev/null 2>&1 )
+printf '%s\n' "$(( $(date +%s) + 86400 ))" > "$T/o/heartbeat"
+: > "$FAKE_LOG"
+out="$( . "$LIB"; LC_SETTLE=1 lc_ensure "$LABEL" "$T/o/x.plist" "$T/o" 0 2 2>&1 )"; rc=$?
+if [ "$rc" -ne 0 ]; then ok "a FUTURE-dated heartbeat refuses too (non-zero)"; else bad "a future instant was accepted as a duration"; fi
+assert_contains "$out" "is PRESENT but is not a usable instant" "…and it does NOT call a present file 'missing'"
+assert_not_contains "$out" "missing (no readable file)" "…(the missing wording stays off this arm)"
+assert_not_contains "$out" "running but not cycling" "…and it does not claim the controller is wedged"
 
 # ── O. the last empty-is-falsy traps ─────────────────────────────────────────────────────────────
 echo "-- O. a SILENT unreadable read-back, a FIFO lock, hostile LC_HB_STALE, a symlinked plist"
