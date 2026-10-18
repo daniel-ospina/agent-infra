@@ -28,7 +28,8 @@
 #                                                                 un-open-PR checkouts; merged heads
 #                                                                 are exempt from the 7-day floor
 #
-# ⛔ IT NEVER DELETES ANYTHING ITSELF. There is no `rm` on a filesystem path in this file, and that is
+# ⛔ IT NEVER DELETES A SINK ITSELF. The only recursive delete in this file is its OWN lock dir (and
+# only by the pass that acquired it) — there is no `rm` of a worktree, venv or cache path, and that is
 # the point: a fourth copy of the policy is exactly how a live lane loses its env to a sweep whose
 # author only read one of the other three. If a delegate is missing, the class is FAIL-CLOSED (exit
 # 3, named loudly) — never silently skipped, because a reaper that quietly does nothing reads exactly
@@ -109,6 +110,9 @@ WT_AGED_DAYS="${DISK_REAPER_WT_AGED_DAYS:-7}"
 VENV_MIN_AGE="${DISK_REAPER_VENV_MIN_AGE:-1800}"
 CLASS_TIMEOUT="${DISK_REAPER_CLASS_TIMEOUT:-1800}"
 DU_TIMEOUT="${DISK_REAPER_DU_TIMEOUT:-120}"
+# One budget for the whole per-candidate sizing sweep (not per candidate): a pass over N checkouts
+# must not be able to hold the lock for N x DU_TIMEOUT and age itself out of it.
+DU_BUDGET="${DISK_REAPER_DU_BUDGET:-300}"
 STALE_SECONDS="${DISK_REAPER_STALE_SECONDS:-7200}"
 
 DU_BIN="${DU_BIN:-du}"
@@ -152,6 +156,21 @@ while [ $# -gt 0 ]; do
         *) die "unknown argument: $1 (see --help)" ;;
     esac
 done
+
+# A class list that names nothing would run nothing and report a healthy box (a false PASS): a typo
+# silently drops a sink, and an empty list means "reap nothing, forever" while the timer says ok.
+ONLY_CLASSES=""
+if [ -n "$ONLY" ]; then
+    for c in $(printf '%s' "$ONLY" | tr ',' ' '); do
+        case "$c" in
+            uv|venv|worktree) ;;
+            *) die "unknown --only class '$c' (valid: uv, venv, worktree)" ;;
+        esac
+        ONLY_CLASSES="${ONLY_CLASSES}${ONLY_CLASSES:+,}$c"
+    done
+    [ -n "$ONLY_CLASSES" ] || die "--only was given an empty list (valid: uv, venv, worktree)"
+    ONLY="$ONLY_CLASSES"
+fi
 
 # ── status record ────────────────────────────────────────────────────────────────────────────────
 # One key per line, so the supervisor can read it with `sed -n 's/^k=//p'` and no jq. Written to a
@@ -286,6 +305,7 @@ acquire_lock() {
     local owner
     if mkdir "$LOCK_DIR" 2>/dev/null; then
         printf 'pid=%s started=%s\n' "$$" "$(now)" >"$LOCK_DIR/token" 2>/dev/null || true
+        LOCK_HELD=1
         return 0
     fi
     owner="$(sed -n 's/^pid=//p' "$LOCK_DIR/token" 2>/dev/null | head -1)"
@@ -300,13 +320,25 @@ acquire_lock() {
         rm -rf "$LOCK_DIR" 2>/dev/null || true
         mkdir "$LOCK_DIR" 2>/dev/null || { say "disk-reaper: cannot take the lock — refusing"; exit 3; }
         printf 'pid=%s started=%s\n' "$$" "$(now)" >"$LOCK_DIR/token" 2>/dev/null || true
+        LOCK_HELD=1
         return 0
     fi
     say "disk-reaper: lock $LOCK_DIR is held by pid ${owner:-?} (${age}s) — not running"
     exit 4
 }
 
-release_lock() { rm -rf "$LOCK_DIR" 2>/dev/null || true; }
+# Only the pass that WON the lock may release it. The EXIT trap is installed before acquire_lock
+# runs, so a contender that loses the race exits 4 THROUGH the trap — without this flag it would
+# delete the live owner's lock and let a third pass in; two passes would then compute df deltas over
+# one filesystem and credit each other's reclaim.
+LOCK_HELD=0
+release_lock() {
+    [ "${LOCK_HELD:-0}" = 1 ] || return 0
+    LOCK_HELD=0
+    rm -rf "$LOCK_DIR" 2>/dev/null || true
+}
+# A long but PROGRESSING pass must not age out of its own lock (a stale lock is taken by a contender).
+heartbeat_lock() { [ "${LOCK_HELD:-0}" = 1 ] && touch "$LOCK_DIR" 2>/dev/null; return 0; }
 trap release_lock EXIT
 
 # Class selection: a tiny membership test that cannot be fooled by substring (e.g. `venv` vs
@@ -377,7 +409,9 @@ reap_uv() {
     after="$(free_kb_for_path "$path")"
     delta=""
     if [ -n "$before" ] && [ -n "$after" ]; then
-        delta=$(( (after - before) / 1024 )); [ "$delta" -lt 0 ] && delta=0; FREED_UV="$delta"
+        delta=$(( (after - before) / 1024 )); [ "$delta" -lt 0 ] && delta=0
+        # A dry-run removed nothing: whatever df moved belongs to a concurrent writer, not to us.
+        if is_dry; then FREED_UV=0; else FREED_UV="$delta"; fi
     fi
     # Per-candidate would-free, from the owner's own dry-run line. Pulled out rather than recomputed:
     # "size minus bound" is the OWNER's rule, and a second implementation could disagree with it.
@@ -397,6 +431,12 @@ reap_uv() {
                 ;;
         esac
     done <<<"$CLASS_OUT"
+    # rc 5 in dry-run means "over bound" — that is still WORK PRESENT, even when the owner printed no
+    # row this pass. Counting it keeps a parse miss from becoming verdict 0.
+    if is_dry && [ "$count" -eq 0 ] && [ "$RC_UV" = 5 ]; then
+        count=1; cands="${cands}${cands:+
+}disk-reaper: WOULD-PRUNE class=uv (? bytes — owner reported over-bound but printed no sized row) ${path}"
+    fi
     CAND_UV="$count"
     VERDICT_UV="$(class_verdict "$RC_UV")"
     # A class that did not finish ok must say so in the record's `detail`, or the supervisor prints
@@ -440,7 +480,7 @@ resolve_repos() {
 # Byte counts: the owner prints a size on every row it classifies; the entry point lifts those and
 # labels them as the owner does (du over-counts hardlinked uv-cache blocks).
 reap_venv() {
-    local before after delta repo out rc count all_c=0 cands="" rows=""
+    local before after delta repo out rc count all_c=0 cands="" rows="" freed=0 b a d
     if [ -z "$VENV_REAPER_PATH" ]; then
         say "disk-reaper: ⛔ class=venv FAIL-CLOSED — reap-lane-venvs.sh not found (agent-infra PR #1949 owns this policy)"
         NOTE_VENV="reap-lane-venvs.sh not found"; RC_VENV=3; return 3
@@ -449,21 +489,22 @@ reap_venv() {
         say "disk-reaper: ⛔ class=venv FAIL-CLOSED — no repo to scan (pass --repo PATH, or set DISK_REAPER_REPOS); a class that scans nothing is NOT a pass"
         NOTE_VENV="no repo to scan"; RC_VENV=3; return 3
     fi
-    before="$(free_kb_for_path "$(printf '%s\n' "$REPOS" | head -1)")"
+    # df is measured PER REPO: --repo may name paths on different filesystems, and the first repo's
+    # delta would then report 0MB for gigabytes removed from another mount.
     while IFS= read -r repo; do
         [ -n "$repo" ] || continue
+        b="$(free_kb_for_path "$repo")"
         run_class bash "$VENV_REAPER_PATH" --gc --repo "$repo" --min-age "$VENV_MIN_AGE" "$(mode_flag)"
         out="$CLASS_OUT"; rc="$CLASS_RC"
+        a="$(free_kb_for_path "$repo")"
+        if [ -n "$b" ] && [ -n "$a" ]; then d=$(( (a - b) / 1024 )); [ "$d" -lt 0 ] && d=0; freed=$((freed + d)); fi
         say "$out"
         rows="${rows}${rows:+$'\n'}$out"
         RC_VENV="$(worst_rc "$RC_VENV" "$rc")"
         [ "$rc" -gt 0 ] && NOTE_VENV="${NOTE_VENV:-reap-lane-venvs.sh exited $rc}"
     done <<<"$REPOS"
-    after="$(free_kb_for_path "$(printf '%s\n' "$REPOS" | head -1)")"
     VERDICT_VENV="$(class_verdict "$RC_VENV")"
-    if [ -n "$before" ] && [ -n "$after" ]; then
-        delta=$(( (after - before) / 1024 )); [ "$delta" -lt 0 ] && delta=0; FREED_VENV="$delta"
-    fi
+    if is_dry; then FREED_VENV=0; else FREED_VENV="$freed"; fi
     # Candidate rows are the owner's `REAP <reason> <N>MB <path>` lines (the lowercase `reap` rows are
     # its log format; the uppercase ones are the pass report). Only counted in dry-run: in apply mode
     # the df delta is the number that matters and a row already happened.
@@ -492,7 +533,7 @@ reap_venv() {
 
 # ── class: worktree (clean + reachable + holder-free checkouts) ─────────────────────────────────
 reap_worktree() {
-    local before after delta repo out rc count all_c=0 cands="" rows="" path size
+    local before after delta repo out rc count all_c=0 cands="" rows="" path size freed=0 b a d sweep_end swept
     if [ -z "$WORKTREE_REAPER_PATH" ]; then
         say "disk-reaper: ⛔ class=worktree FAIL-CLOSED — pi-reap-worktrees.sh not found"
         NOTE_WT="pi-reap-worktrees.sh not found"; RC_WT=3; return 3
@@ -501,26 +542,29 @@ reap_worktree() {
         say "disk-reaper: ⛔ class=worktree FAIL-CLOSED — no repo to scan (pass --repo PATH, or set DISK_REAPER_REPOS)"
         NOTE_WT="no repo to scan"; RC_WT=3; return 3
     fi
-    before="$(free_kb_for_path "$(printf '%s\n' "$REPOS" | head -1)")"
+    # df is measured PER REPO: --repo may span filesystems.
     while IFS= read -r repo; do
         [ -n "$repo" ] || continue
+        b="$(free_kb_for_path "$repo")"
         run_class bash "$WORKTREE_REAPER_PATH" "$(mode_flag)" --repo "$repo" --aged-days "$WT_AGED_DAYS"
         out="$CLASS_OUT"; rc="$CLASS_RC"
+        a="$(free_kb_for_path "$repo")"
+        if [ -n "$b" ] && [ -n "$a" ]; then d=$(( (a - b) / 1024 )); [ "$d" -lt 0 ] && d=0; freed=$((freed + d)); fi
         say "$out"
         rows="${rows}${rows:+$'\n'}$out"
         RC_WT="$(worst_rc "$RC_WT" "$rc")"
         [ "$rc" -gt 0 ] && NOTE_WT="${NOTE_WT:-pi-reap-worktrees.sh exited $rc}"
     done <<<"$REPOS"
-    after="$(free_kb_for_path "$(printf '%s\n' "$REPOS" | head -1)")"
     VERDICT_WT="$(class_verdict "$RC_WT")"
-    if [ -n "$before" ] && [ -n "$after" ]; then
-        delta=$(( (after - before) / 1024 )); [ "$delta" -lt 0 ] && delta=0; FREED_WT="$delta"
-    fi
+    if is_dry; then FREED_WT=0; else FREED_WT="$freed"; fi
     # The owner deliberately reports NO byte figure (its `.venv`s are hardlinked into the uv cache,
     # measured 84 GB du delta vs 22 GB freed). The consolidation requirement is "byte counts in
     # dry-run", so the ENTRY POINT measures each selected checkout with a bounded `du` and labels it
     # for what it is. The owner's contract is untouched: it still never claims a saving.
     if is_dry; then
+        # CLASS_TIMEOUT bounds the DELEGATE, not this sweep: N candidates x DU_TIMEOUT each would let a
+        # single pass hold the lock for hours. The sweep gets ONE budget for the whole class.
+        sweep_end=$(( $(now) + DU_BUDGET )); swept=0
         while IFS= read -r line; do
             if [[ "$line" == remove* ]]; then
                 # The owner's row is `remove   <path>` (ragged columns): drop the verb, then LEADING
@@ -530,11 +574,13 @@ reap_worktree() {
                 path="${path#"${path%%[![:space:]]*}"}"
                 path="${path%%[[:space:]]*}"
                 [[ "$path" == /* ]] || continue
-                size="$(du_mb "$path")" || size="?"
+                if [ "$(now)" -ge "$sweep_end" ]; then size="?"
+                else size="$(du_mb "$path")" || size="?"; fi
+                swept=$((swept + 1)); [ $((swept % 25)) -eq 0 ] && heartbeat_lock
                 all_c=$((all_c + 1))
                 case "$size" in
                     ''|*[!0-9]*) cands="${cands}${cands:+
-}disk-reaper: WOULD-REMOVE class=worktree (? bytes unmeasurable) ${path}" ;;
+}disk-reaper: WOULD-REMOVE class=worktree (? bytes unmeasured — du budget exhausted) ${path}" ;;
                     *) WOULD_WT=$((WOULD_WT + size))
                        cands="${cands}${cands:+
 }disk-reaper: WOULD-REMOVE class=worktree ${size}MB ${path} (du estimate, over-counts hardlinked .venv blocks)" ;;
@@ -560,9 +606,10 @@ acquire_lock
     log "delegates: cache=${CACHE_REAPER_PATH:-MISSING} venv=${VENV_REAPER_PATH:-MISSING} worktree=${WORKTREE_REAPER_PATH:-MISSING}"
 } | tee -a "$LOG"
 
-want_class uv       && reap_uv
-want_class venv     && reap_venv
-want_class worktree && reap_worktree
+# Heartbeat after each class: a pass that is making progress must never be aged out of its own lock.
+want_class uv       && { reap_uv;       heartbeat_lock; }
+want_class venv     && { reap_venv;     heartbeat_lock; }
+want_class worktree && { reap_worktree; heartbeat_lock; }
 
 # Verdict: a fail-closed class wins over a removal failure, which wins over "dry-run found work".
 verdict=0

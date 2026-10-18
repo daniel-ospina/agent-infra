@@ -65,6 +65,10 @@ usage() { sed -n '2,45p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 # The FARMED copy first: it is what a cell has after `pi-bootstrap/setup.sh`, and a unit pointing at
 # a worktree checkout would break the day that worktree is reaped (by this very tool).
 REAPER=""
+if [ -n "${DISK_REAPER:-}" ] && [ ! -f "$DISK_REAPER" ]; then
+    err "\$DISK_REAPER is set to '$DISK_REAPER' but that is not a regular file — refusing to install a unit that points at a DIFFERENT copy of the reaper"
+    exit 2
+fi
 for cand in "${DISK_REAPER:-}" "${HOME:-}/.pi/agent/scripts/disk-reaper.sh" "$INFRA_ROOT/scripts/disk-reaper.sh"; do
     [ -n "$cand" ] || continue
     if [ -f "$cand" ]; then REAPER="$cand"; break; fi
@@ -200,9 +204,12 @@ do_status() {
 }
 
 do_uninstall() {
+    if [ "${DRY_RUN:-0}" = "1" ]; then
+        say "dry-run: would disable and remove $UNIT_NAME.service/.timer (nothing was changed)"
+        return 0
+    fi
     choose_target || { err "no scheduler available"; return 1; }
     $SC disable --now "$UNIT_NAME.timer" >/dev/null 2>&1 || true
-    if [ "${DRY_RUN:-0}" = "1" ]; then say "dry-run: would remove the units from $UNIT_DIR"; return 0; fi
     if [ -n "${SYSTEMD_UNIT_DIR:-}" ]; then
         rm -f "$UNIT_DIR/$UNIT_NAME.service" "$UNIT_DIR/$UNIT_NAME.timer"
     else
@@ -216,7 +223,7 @@ do_uninstall() {
 while [ $# -gt 0 ]; do
     case "$1" in
         --install)   MODE=--install ;;
-        --dry-run)   MODE=--install; DRY_RUN=1 ;;
+        --dry-run)   DRY_RUN=1 ;;
         --status)    MODE=--status ;;
         --uninstall) MODE=--uninstall ;;
         --help|-h)   sed -n '2,45p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;

@@ -21,6 +21,12 @@
 #   T5 a missing delegate is FAIL-CLOSED, never a silent skip — and it is recorded as failed.
 #   T6 the entry point deletes nothing itself (static pin: its only `rm -rf` is the lock).
 #   T7 the pass record answers "did it succeed, and how much did it free" without a log.
+#   T8 the schedule is installable, idempotent and ARMED.
+#   T9 a pass that LOSES the lock does not release the live owner's lock.
+#   T10 an --only list naming nothing is refused (never a healthy no-op / false PASS).
+#   T11 a dry run records 0 bytes freed (it removed nothing). Guard, not a pre-change failure: in an
+#       idle fixture the old code also recorded 0, because df happened not to move.
+#   T12 the installer's --dry-run changes nothing, and a SET-but-missing $DISK_REAPER is refused.
 #
 # PRE-CHANGE BEHAVIOUR. Each assertion below fails before this change, for the reason the section
 # names: there is no entry point at all, so `bash scripts/disk-reaper.test.sh` on the pre-change tree
@@ -284,6 +290,63 @@ OUT="$(inst --status 2>&1)"; RC=$?
 assert_eq "$RC" "0" "T8 --status exits 0 for a healthy install"
 assert_contains "$OUT" "installed=yes" "T8 --status reports the install"
 assert_contains "$OUT" "enabled=enabled" "T8 --status reports the timer as enabled"
+
+# ── T9: a contender that LOSES the lock does not release it ────────────────────────────────────
+# The EXIT trap is installed before acquire_lock runs, so the contention exit passes THROUGH it. If
+# release_lock fired on a pass that never held the lock, the live owner's lock would be deleted and a
+# third pass would enter — two passes computing df deltas over one filesystem, crediting each other.
+ENVNAME=t9
+REPO="$(mk_repo t9)"
+mkdir -p "$T/t9/state/disk-reaper.lock"
+printf 'pid=%s started=%s\n' "$$" "$(date +%s)" >"$T/t9/state/disk-reaper.lock/token"
+OUT="$(run_reaper --dry-run --repo "$REPO" 2>&1)"; RC=$?
+assert_eq "$RC" "4" "T9 a pass that cannot take the lock exits 4"
+assert_file "$T/t9/state/disk-reaper.lock/token" \
+    "T9 the contender left the LIVE owner's lock in place (it never held it)"
+rm -rf "$T/t9/state/disk-reaper.lock"
+
+# ── T10: an --only list that names nothing is REFUSED, never a healthy no-op ────────────────────
+# A typo would otherwise run zero classes, exit 0 and record ok=1 — a false PASS on a disk sink.
+ENVNAME=t10
+REPO="$(mk_repo t10)"
+OUT="$(run_reaper --dry-run --only bogus --repo "$REPO" 2>&1)"; RC=$?
+assert_eq "$RC" "2" "T10 an unknown --only class exits 2"
+assert_contains "$OUT" "unknown --only class" "T10 and it names the offending token"
+assert_absent "$(cat "$T/t10/state/disk-reaper.status" 2>/dev/null || true)" "ok=1" \
+    "T10 a refused class list never writes a healthy record"
+OUT="$(run_reaper --dry-run --only 'uv,venv' --repo "$REPO" 2>&1)"; RC=$?
+assert_contains "$OUT" "class=venv" "T10 a valid list still runs the classes it names"
+
+# ── T11: a DRY RUN claims no bytes (it removed nothing) ─────────────────────────────────────────
+# df moves for reasons that are not this pass (lanes write continuously). Recording a df delta from a
+# pass that deleted nothing would print freed_mb>0 next to "NOTHING was removed".
+ENVNAME=t11
+REPO="$(mk_repo t11)"
+run_reaper --dry-run --repo "$REPO" >/dev/null 2>&1
+ST="$(cat "$T/t11/state/disk-reaper.status" 2>/dev/null || true)"
+assert_contains "$ST" "freed_mb=0" "T11 a dry-run pass records 0 bytes freed"
+assert_contains "$ST" "mode=dry-run" "T11 and it says it was a dry run"
+
+# ── T12: the installer's dry run is a dry run, and a missing pinned reaper is refused ───────────
+ENVNAME=t12
+REPO="$(mk_repo t12)"
+inst() {
+    HOME="$T/t12/home" DISK_REAPER="$T/t12/reaper.sh" DISK_REAPER_REPOS="$REPO" \
+    SYSTEMD_UNIT_DIR="$T/t12/units" SYSTEMCTL="$T/t8/bin/systemctl" SYSTEMCTL_CALLS="$T/t12/calls.log" \
+    bash "$INST" "$@"
+}
+mkdir -p "$T/t12/unused"
+cp "$REAPER" "$T/t12/reaper.sh"
+: >"$T/t12/calls.log"
+OUT="$(inst --dry-run --uninstall 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T12 --dry-run --uninstall succeeds"
+assert_absent "$(cat "$T/t12/calls.log")" "disable" \
+    "T12 --dry-run --uninstall disables NOTHING (flag order must not change the verb)"
+assert_absent "$(cat "$T/t12/calls.log")" "stop" "T12 and it stops nothing"
+OUT="$(DISK_REAPER="$T/t12/not-here.sh" HOME="$T/t12/home" DISK_REAPER_REPOS="$REPO" \
+    SYSTEMD_UNIT_DIR="$T/t12/units" SYSTEMCTL="$T/t8/bin/systemctl" SYSTEMCTL_CALLS="$T/t12/calls2.log" \
+    bash "$INST" --install 2>&1)"; RC=$?
+assert_eq "$RC" "2" "T12 a SET but missing \$DISK_REAPER is refused (never a silent different copy)"
 
 echo
 echo "──────────────────────────────────────────────────────────────────────"
