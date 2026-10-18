@@ -708,12 +708,18 @@ rest_list() {
       rm -rf "$tmp"; return 1
     fi
     # `-i` prepends the response headers; the body is everything after the first blank line. The
-    # separator is matched on LENGTH rather than with `/^\r?$/`, and the reason is PORTABILITY, not
-    # BSD's behaviour: `\r` inside an awk regex is not portable, and MAWK — Ubuntu's default, i.e.
-    # what the cells run — reads it as a literal `r`, so that form never splits and every page reads
-    # as 0 rows (a truncated listing one layer up). BSD awk here DOES honour `\r` in a regex
-    # (measured: identical output from both forms), which is precisely the trap: the `\r` form looks
-    # correct on a Mac and fails on every cell.
+    # separator is found by LENGTH rather than by matching `/^\r?$/`. The choice is PORTABILITY, not
+    # a workaround: `\r` inside an ERE is a backslash before an ordinary character, which POSIX leaves
+    # undefined, so a match on it would be a property of the awk build rather than of the response.
+    # `length($0) <= 1` asks the question the header format actually answers — "is this line blank, or
+    # a bare CR?" — and needs no escape at all. MEASURED, both forms on both awks this fleet runs, and
+    # they agree: macOS awk 20200816 here and mawk 1.3.4 20240123 on pi-cell-2 (the cell's only awk)
+    # each return the identical body from `A`/CR/CR/`B` input, and `/^\r?$/` matches the bare-CR line
+    # on both (1 match) while `/^r?$/` matches none (0). So no build is known to fail this; the line
+    # is written to not depend on the answer.
+    # If a split ever did fail, the consequence is a REFUSAL, never a quiet undercount: the body comes
+    # back empty, and an empty body on a 200 hits the empty-body guard below (only 204/304 may be
+    # empty) and the page is refused — it cannot truncate a listing at rc 0.
     awk 'b { print } !b && length($0) <= 1 { b = 1 }' "$pf.raw" > "$pf.json"
     # ⛔ THE LINK HEADER IS THE PROVIDER'S OWN STATEMENT about whether another page exists, and it is
     # the only reliable way to separate "the collection ended exactly on a page boundary" (a
@@ -770,13 +776,14 @@ rest_list() {
   # ⛔ /issues RETURNS PULL REQUESTS TOO. Left in, a labelled PR becomes a DISPATCH CANDIDATE: the tier
   # programs below only require "no assignee and a non-epic title", so it would be queued as
   # `0 <PR#>`, land in `dispatched.txt`, and get a lane spawned for a PR number the pass never
-  # adjudicated as an issue. (The REAPER's own path is not the hazard, which matters because a reader
-  # who checks the reaper finds nothing to break there and deletes this guard: issues and PRs share
-  # ONE number space per repo, so a PR row in `.open_iss` can only name a number that is already a
-  # PR — and `has_pr` is what decides it.) Dropped for `kind=issues` ONLY: `.pr_brs` is kind=pulls and
-  # the #1705 `has_pr` check needs those rows. Dropped here ONCE FOR THIS FILE (the gh-rest adapter
-  # drops the same rows, `gh-rest/gh:156`; that twin is why BOTH surfaces must be changed together if
-  # the rule ever moves). ⛔ `--limit` IS A RAW-ROW BUDGET AND THE PROJECTED TOTAL IS SMALLER — stated with the
+  # adjudicated as an issue. The REAPER is exposed to the same rows for an unrelated reason —
+  # `has_pr` (below) keys on PR head-BRANCH names, not on numbers, so a PR row whose branch does not
+  # embed its own number is un-blacklisted exactly like an issue. Issues and PRs share ONE number
+  # space per repo, and that is precisely why these rows have to be dropped HERE: nothing downstream
+  # can tell a PR row from an issue row.
+  # Dropped for `kind=issues` ONLY: `.pr_brs` is kind=pulls and the #1705 `has_pr` check needs those
+  # rows. Dropped here ONCE FOR THIS FILE (the gh-rest adapter drops the same rows, `gh-rest/gh:156`;
+  # that twin is why BOTH surfaces must be changed together if the rule ever moves). ⛔ `--limit` IS A RAW-ROW BUDGET AND THE PROJECTED TOTAL IS SMALLER — stated with the
   # measurement, because a review cycle "corrected" this the wrong way and a comment that lies about
   # the window is worse than none: the page budget is `ceil(limit/100)` RAW rows (the loop above), and
   # PRs are dropped only here, so a 500 window returns 500 minus however many pull requests were

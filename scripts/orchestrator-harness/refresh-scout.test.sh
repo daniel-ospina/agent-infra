@@ -348,25 +348,36 @@ esac
 # `queue=UNREADABLE` forever — the "a cell that can only merge, and looks healthy" shape this check
 # exists to refuse. One of the two guards this change added that had no assertion at all (measured:
 # deleting it left `PASS=217 FAIL=0`).
-mk_case nojq
-mk_tool "$D/tort/tools/collision_preflight.py"
-NJ="$T/bin-nojq"; mkdir -p "$NJ"
-# A PATH holding every /usr/bin entry EXCEPT jq, plus /bin (bash lives there on macOS; /bin holds
-# no jq — checked, so `command -v jq` is genuinely unsatisfiable). The script appends
-# /opt/homebrew/bin:/usr/local/bin, and neither holds a jq on a stock box. A stub named `jq` would be
-# the wrong test: it would only prove the probe reads PATH.
-for f in /usr/bin/*; do [ "$(basename "$f")" = jq ] || ln -sf "$f" "$NJ/" 2>/dev/null; done
-RF_PATH="$D/bin:$NJ:/bin" rf "$D" check TORTOISE_REPO="$D/tort"
-[ "$RC" -eq 3 ] && ok "--check: a box WITHOUT jq is REFUSED (rc=3, not the transient retry code)" \
-               || bad "--check: rc=$RC (want 3) on a box with no jq — $OUT"
-case "$OUT" in
-  *"NOT PROVISIONABLE"*jq*) ok "--check: the no-jq refusal is NOT PROVISIONABLE and names jq" ;;
-  *) bad "--check: no NOT-PROVISIONABLE/jq verdict on a box with no jq — output: $OUT" ;;
-esac
-case "$OUT" in
-  *"CHECK OK"*) bad "--check: printed CHECK OK with no jq (a cell certified to read UNREADABLE for ever)" ;;
-  *) ok "--check: no CHECK OK on a box with no jq" ;;
-esac
+# ⛔ DRIVEN AS AN EXTRACTED BLOCK, NOT through `--check`, because a fixture CANNOT build a jq-less
+# box for the shipped entrypoint: the script re-appends `/opt/homebrew/bin:/usr/local/bin` to
+# whatever PATH it is given (refresh-candidates.sh:88), and on a Homebrew Mac that is where jq lives.
+# The two host-shaped alternatives were measured and BOTH fail: a PATH farm plus the raw `/bin` finds
+# `/bin/jq` on any usrmerged distro (`/bin -> usr/bin`, so the exclusion is defeated by the second
+# segment and the CI runner is RED), and a farm alone is still outranked by the appended dirs. The
+# `uv` lens already paid for this exact trap — see SCOUT_UV / agent-infra#1748 just above. The block
+# below is the shipped guard VERBATIM, so deleting the guard fails this case; a missing extraction is
+# a FAILURE, never a skip.
+awk '/^  # ⛔ jq IS A PREREQUISITE OF THE LISTING READ/{f=1} f{print} f&&/^  echo "\[refresh\] check: jq=/{exit}' "$REFRESH" > "$T/jqguard.sh"
+if [ -s "$T/jqguard.sh" ] && grep -q 'command -v jq' "$T/jqguard.sh"; then
+  # A wrapper, because the block ends in `return` and names the script's own exit code.
+  { printf 'set -u\nEXIT_NOT_PROVISIONABLE=3\ncmd_check_jq() {\n'; cat "$T/jqguard.sh"; printf '}\ncmd_check_jq\n'; } > "$T/jqguard-run.sh"
+  # An EMPTY PATH dir: `command -v jq` is unsatisfiable for real, with nothing host-dependent in it.
+  # bash itself is invoked by absolute path, so an empty PATH cannot stop the driver running.
+  NOJQ="$T/nojq-path"; mkdir -p "$NOJQ"
+  OUTJ="$(PATH="$NOJQ" "$(command -v bash)" "$T/jqguard-run.sh" 2>&1)"; rcj=$?
+  [ "$rcj" -eq 3 ] && ok "--check: a box WITHOUT jq is REFUSED by the guard (rc=3, not the transient retry code)" \
+                  || bad "--check: the jq guard returned rc=$rcj (want 3) on a jq-less PATH — output: $OUTJ"
+  case "$OUTJ" in
+    *"NOT PROVISIONABLE"*jq*) ok "--check: the no-jq refusal is NOT PROVISIONABLE and names jq" ;;
+    *) bad "--check: no NOT-PROVISIONABLE/jq verdict on a box with no jq — output: $OUTJ" ;;
+  esac
+  case "$OUTJ" in
+    *"install jq"*) ok "--check: the no-jq refusal prescribes the fix (install jq)" ;;
+    *) bad "--check: the no-jq refusal names no remedy — output: $OUTJ" ;;
+  esac
+else
+  bad "the --check jq guard could not be extracted from the shipped refresh-candidates.sh (deleted, or its anchor moved)"
+fi
 # (run) the same interpreter on the refresh path must be PERMANENT (rc=3), so orch-loop.sh writes
 # the merge-only marker instead of the script exiting 0 with an empty backlog.
 mk_case old-python-run
