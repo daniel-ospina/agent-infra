@@ -469,6 +469,13 @@ wk_case() {
   fi
   [ "$route" = amb ] && amb="$K_AMB"
   sess="ai1711-$kind-$route-$server"
+  # agent-infra#1761: `start` now reads the CONTROLLER (the lock holder and this cell's own
+  # orch-loop.sh processes), not just the tmux session, and refuses when one is already live. The
+  # fixture's controller is a 4s stub that the tmux double leaves running after the arm's assertion
+  # completes, so without reaping it the NEXT arm's `start` (correctly) refuses and every later arm
+  # reddens for a fixture reason rather than the key-delivery rule it means to test.
+  pkill -f "$W/harness/orch-loop\.sh" 2>/dev/null || true
+  for i in $(seq 1 40); do pgrep -f "$W/harness/orch-loop\.sh" >/dev/null 2>&1 || break; sleep 0.25; done
   env AI_REVIEW_GATE_KEY="$amb" PATH="$W/bin:$bin:$PATH" AI1711_STATE="$st" AI1711_SOCK="$sock" \
       CELL_HOME="$W/cellhome" HOME="$W/cellhome" ENV_FILE="$envf" \
       SESSION="$sess" O="$W/o" REPO="$W/repo" HARNESS="$W/harness" HARNESS_REPO="$AI" HARNESS_FETCH=0 SCOPE=own \
@@ -1492,6 +1499,13 @@ qsup start "$Q/tortoise-repo" "$Q/st-explicit" OR=daniel-ospina/tortoise
 [ "$Q_RC" -eq 0 ] && ok "start ACCEPTS an explicit OR that equals the checkout's remote (the override path)" \
                   || bad "start refused an explicit OR that MATCHES the remote — a false block: $Q_OUT"
 
+# (2b) GitHub owner/repo names are CASE-INSENSITIVE: the same pair spelled in another case must be
+# accepted here too, or `check` (which folds) answers "this machine can run it" and `start` then dies
+# — the #1745 false-pass shape on the one fact the design calls single-sourced (#1856 review).
+qsup start "$Q/tortoise-repo" "$Q/st-case" OR=Daniel-Ospina/Tortoise
+[ "$Q_RC" -eq 0 ] && ok "start ACCEPTS an explicit OR that differs from the remote only in CASE (one repo, one queue)" \
+                  || bad "start false-blocked a case-only spelling of the same repo — $Q_OUT"
+
 # (3) A MISMATCH refuses, naming BOTH values, the remote it read, and the repo the machine needs.
 qsup start "$Q/agent-repo" "$Q/st-mismatch" OR=daniel-ospina/tortoise
 [ "$Q_RC" -ne 0 ] && ok "start REFUSES the measured pair (queue=tortoise standing in an agent-infra checkout)" \
@@ -1631,6 +1645,482 @@ case "$Q_OUT" in
   *"queue: daniel-ospina/tortoise @ $Q/agent-repo"*"MISMATCH"*) ok "status: the mismatch line carries both values and the verdict" ;;
   *) bad "status's mismatch line does not name both sides — $Q_OUT" ;;
 esac
+# ── (l) one owner per controller (agent-infra#1761) ───────────────────────────────────────────────
+# The cell's controller answer must come from the harness's own AUTHORITY (the pid $O/.orch.lock
+# names) and this cell's own orch-loop.sh processes — never from `tmux has-session` alone. Measured
+# the failure this pins: a controller running outside the `orch` session (a leftover harness copy —
+# #1761 contradiction 4) read STOPPED while it was merging, and `start` would launch a second one.
+# ⛔ And the read must EXCLUDE descendants: orch-loop.sh spawns short-lived CHILDREN whose command
+# line also matches (measured `93150 53696 … orch-loop.sh`), so a naive count reports a duplicate
+# that is not there.
+say_case "one owner per controller: the read is authoritative, scope-named, and descendant-aware (#1761)"
+L="$T/own"; mkdir -p "$L/home" "$L/o" "$L/bin"
+# A REAL checkout: main's queue gate (agent-infra#1901) reads `git -C $REPO remote get-url origin`
+# BEFORE any ownership branch, so a fixture repo with no origin makes `start` die on the QUEUE gate
+# and the ownership refusal is never exercised — the case would pass for the wrong reason on any
+# future reordering. Give the fixture the origin the gate reads, and keep OR equal to it, so the
+# ONLY refusal `start` can reach here is the one this case is about.
+git init -q "$L/repo" 2>/dev/null || bad "fixture: cannot git init $L/repo"
+git -C "$L/repo" remote add origin https://github.com/daniel-ospina/agent-infra.git 2>/dev/null \
+  || bad "fixture: cannot set the fixture checkout's origin"
+# The stub answers TERM (a bash waiting on a foreground child defers the trap to the child's exit),
+# and spawns ONE short-lived CHILD whose command line also matches — the measured false-positive
+# shape. The child's life is bounded because a real child exits on the lock; an eternal child would
+# model a process the harness never has.
+cat > "$L/o/orch-loop.sh" <<'STUB'
+#!/bin/bash
+trap 'exit 0' TERM INT
+if [ "${STUB_CHILD:-0}" = 1 ]; then sleep 2; exit 0; fi
+STUB_CHILD=1 bash "$0" &
+while :; do sleep 1; done
+STUB
+chmod +x "$L/o/orch-loop.sh"
+# A tmux double: no session unless the marker exists, and `new-session` RECORDS that it was called,
+# so "start refused before creating a session" is asserted rather than assumed.
+cat > "$L/bin/tmux" <<SH
+#!/bin/bash
+case "\${1:-}" in
+  has-session) [ -f "$L/tmuxup" ] && exit 0; exit 1 ;;
+  new-session) : > "$L/tmuxup"; exit 0 ;;
+  *) exit 0 ;;
+esac
+SH
+chmod +x "$L/bin/tmux"
+own_sup() { # <sub>
+  PATH="$L/bin:$PATH" CELL_HOME="$L/home" ENV_FILE="$L/keys.env" SESSION="ai1761-$$" \
+    O="$L/o" REPO="$L/repo" OR="daniel-ospina/agent-infra" SCOPE=own HARNESS="" \
+    bash "$SUP" "$1" 2>&1
+}
+AI1761_PIDS=""
+rm -f "$L/tmuxup" "$L/o/.orch.lock"
+bash "$L/o/orch-loop.sh" & ROOT=$!
+AI1761_PIDS="$ROOT"
+printf '%s\n' "$ROOT" > "$L/o/.orch.lock"
+sleep 0.6
+CHILD="$(pgrep -P "$ROOT" 2>/dev/null | head -1)"
+[ -n "$CHILD" ] && { AI1761_PIDS="$AI1761_PIDS $CHILD"; ok "fixture: the controller stub spawned a matching CHILD (pid $CHILD)"; } \
+                 || bad "fixture: the controller stub spawned no child — the exclusion cannot be exercised"
+# ⛔ COUNT NOW, NOT AFTER THE NEXT TWO SUPERVISOR CALLS. The child is deliberately short-lived
+# (`sleep 2`), and the count used to be taken after two whole invocations — measured at 2086-2382ms
+# against a child that dies at 2000ms, so the arm reddened on BYTE-IDENTICAL code (1-of-3, then
+# 3-of-5 across runs), which reads as a regression in the ownership exclusion (#1856 review).
+# Portable count: macOS `pgrep` has no `-c`, so `pgrep -cf` reads 0 on a Mac.
+NAIVE="$(pgrep -f "$L/o/orch-loop.sh" 2>/dev/null | wc -l | tr -d ' ')"
+[ "${NAIVE:-0}" -ge 2 ] && ok "fixture: a naive pgrep count sees $NAIVE (the exclusion is non-vacuous)" \
+                      || bad "fixture: the naive count is ${NAIVE:-0} — the exclusion proves nothing"
+# The read names the OWNER and its SCOPE — the #1761 verification read, not a session probe.
+OUT="$(own_sup status)"
+case "$OUT" in
+  *"controller: RUNNING"*"pid $ROOT"*) ok "status: names the controller OWNER (pid $ROOT) from the lock" ;;
+  *) bad "status: did not name the lock owner (pid $ROOT) — $OUT" ;;
+esac
+case "$OUT" in
+  *"scope=own"*"repo=daniel-ospina/agent-infra"*) ok "status: names the scope and repo the controller owns" ;;
+  *) bad "status: does not name scope/repo — $OUT" ;;
+esac
+[ -n "$CHILD" ] && { case "$OUT" in
+  *"pid $ROOT $CHILD"*|*"pid $CHILD"*) bad "status: reported the controller's CHILD as a second controller" ;;
+  *) ok "status: EXCLUDED the controller's child (a descendant is not a duplicate)" ;;
+esac; }
+# THE #1761 MECHANISM: a launcher removes the lock while the controller lives. The read must NOT
+# fall back to STOPPED, and `start` must not launch a second controller.
+rm -f "$L/o/.orch.lock"
+OUT="$(own_sup status)"
+case "$OUT" in
+  *"controller: RUNNING"*"pid $ROOT"*) ok "status: still RUNNING after the lock was REMOVED (a launcher cannot hide the owner)" ;;
+  *) bad "status: reported STOPPED while a controller ran without a lock — $OUT" ;;
+esac
+OUT="$(own_sup start)"
+# The refusal must NAME the owner: "already running" alone cannot tell an operator which process to
+# look at, and a pid-less line is what sends a reader hunting in the wrong place.
+case "$OUT" in
+  *"already running"*"pid $ROOT"*) ok "start: REFUSED while a controller owns this state dir, naming pid $ROOT" ;;
+  *"already running"*) bad "start: refused WITHOUT naming the live pid ($ROOT) — $OUT" ;;
+  *) bad "start: did NOT refuse a live controller: $OUT" ;;
+esac
+[ -f "$L/tmuxup" ] && bad "start: created a session despite a live controller" \
+                   || ok "start: no second session was created"
+# The child (a worker-shape transient) must be gone before `stop` asserts the state dir is clear.
+for i in $(seq 1 40); do [ -n "$CHILD" ] && kill -0 "$CHILD" 2>/dev/null || break; sleep 0.25; done
+# ⛔ RE-CREATE THE LOCK. The arm above removed it to prove `status` cannot be blinded by a deleted
+# lock; without restoring it, `stop`'s "released lock" arm asserted a release of a file that was not
+# there (`rm -f` succeeds on an absent path) — an assertion that cannot fail (#1856 review).
+printf '%s\n' "$ROOT" > "$L/o/.orch.lock"
+OUT="$(own_sup stop)"
+case "$OUT" in
+  *"not running"*) bad "stop: reported 'not running' over a live controller (no false STOPPED)" ;;
+  *"released lock"*) ok "stop: signalled the live controller and released the lock" ;;
+  *) bad "stop: did not complete: $OUT" ;;
+esac
+sleep 0.5
+kill -0 "$ROOT" 2>/dev/null && bad "stop: the controller SURVIVED stop (a lock left for a live owner is #1761's duplicate)" \
+                            || ok "stop: the controller is gone"
+[ -e "$L/o/.orch.lock" ] && bad "stop: left the lock behind" || ok "stop: the lock was released only after the owner died"
+OUT="$(own_sup status)"
+case "$OUT" in
+  *"controller: STOPPED"*) ok "status: STOPPED once the owner is genuinely gone" ;;
+  *) bad "status: still reports a controller after stop — $OUT" ;;
+esac
+# ── §(m) A STALE LOCK NAMING A PEER CONTROLLER MUST NEVER BE SIGNALLED ─────────────────────────
+# $LOCK is data on disk and outlives a `kill -9`, an OOM or a reboot. If the OS RECYCLES that pid to
+# a peer lane's controller — the exact argv shape every controller on this box has — then the pid is
+# alive, its command line contains `orch-loop.sh`, and a substring read makes it the owner. `stop`
+# then TERMs and KILLs another repo's controller. Measured as a P0 in review of #1856: `stop` killed
+# a peer controller from a stale lock alone.
+say_case "a STALE lock naming a PEER controller is reported, never signalled, and its dead-pid form is released (#1856 review)"
+P="$T/peer"; mkdir -p "$P/home" "$P/o" "$P/peer" "$P/bin"
+git init -q "$P/repo" 2>/dev/null || bad "fixture: cannot git init $P/repo"
+git -C "$P/repo" remote add origin https://github.com/daniel-ospina/agent-infra.git 2>/dev/null \
+  || bad "fixture: cannot set the peer checkout's origin"
+cat > "$P/bin/tmux" <<SH
+#!/bin/bash
+case "\${1:-}" in has-session) exit 1 ;; new-session) exit 0 ;; *) exit 0 ;; esac
+SH
+chmod +x "$P/bin/tmux"
+# A PEER controller: its own state dir, its own orch-loop.sh — a different repo's controller.
+cat > "$P/peer/orch-loop.sh" <<'STUB'
+#!/bin/bash
+trap 'exit 0' TERM INT
+while :; do sleep 1; done
+STUB
+chmod +x "$P/peer/orch-loop.sh"
+bash "$P/peer/orch-loop.sh" & PEER=$!
+AI1761_PIDS="${AI1761_PIDS:-} $PEER"
+# The stale lock: backdated, so the peer demonstrably began AFTER it was written.
+printf '%s\n' "$PEER" > "$P/o/.orch.lock"
+touch -t "$(date -v-5M +%Y%m%d%H%M.%S 2>/dev/null || date -d '-5 minutes' +%Y%m%d%H%M.%S)" "$P/o/.orch.lock"
+own_peer() { # <sub>
+  PATH="$P/bin:$PATH" CELL_HOME="$P/home" ENV_FILE="$P/keys.env" SESSION="ai1856-$$" \
+    O="$P/o" REPO="$P/repo" OR="daniel-ospina/agent-infra" SCOPE=own HARNESS="" \
+    bash "$SUP" "$1" 2>&1
+}
+OUT="$(own_peer status)"
+case "$OUT" in
+  *"pid $PEER"*) bad "status: reported the PEER controller (pid $PEER) as this state dir's owner — $OUT" ;;
+  *) ok "status: did not adopt the peer controller named by the stale lock" ;;
+esac
+OUT="$(own_peer stop)"
+kill -0 "$PEER" 2>/dev/null && ok "stop: the PEER controller SURVIVED a stale lock naming it (nothing unasserted was signalled)" \
+                            || bad "stop: KILLED the peer controller from a stale lock — the peer is not ours to signal"
+[ -e "$P/o/.orch.lock" ] && ok "stop: left the lock in place (a pid we cannot prove dead is not ours to release)" \
+                          || bad "stop: released a lock whose named pid is alive"
+# The provably-DEAD form: the same lock with a pid that is gone is noise the harness's acq() clears,
+# but a recycled pid makes acq() see a live process and exit 0 SILENTLY — so `stop` says so.
+kill -9 "$PEER" 2>/dev/null; sleep 0.3
+printf '999999\n' > "$P/o/.orch.lock"
+OUT="$(own_peer stop)"
+case "$OUT" in
+  *"released a stale lock"*) ok "stop: released a stale lock whose owner pid is provably gone, and said so" ;;
+  *) bad "stop: left a dead-pid lock behind without explaining it — $OUT" ;;
+esac
+[ -e "$P/o/.orch.lock" ] && bad "stop: the dead-pid lock is still there" || ok "stop: the stale lock is gone"
+
+
+# ── §(o) SESSION OWNERSHIP, THE OWNED/SEEN SPLIT, AND AN UNREADABLE `ps` (#1856 review) ─────────
+# A tmux session name is MACHINE-scoped (`orch` by default) while `$O` is per-REPO, so on a two-repo
+# machine "the session exists" is not evidence that THIS state dir's controller is in it. Measured in
+# review with a tmux double: repo B's `stop` TERMed repo A's live loop and exited 0 — a foreign
+# controller killed by a state dir that could not prove it owned it.
+say_case 'session ownership, owned-vs-seen, and an unreadable ps table (#1856 review)'
+X="$T/sess"; mkdir -p "$X/home" "$X/oB" "$X/harness" "$X/bin" "$X/repo"
+git init -q "$X/repo" 2>/dev/null || bad "fixture: cannot git init $X/repo"
+git -C "$X/repo" remote add origin https://github.com/daniel-ospina/agent-infra.git 2>/dev/null || true
+cat > "$X/harness/orch-loop.sh" <<'STUB'
+#!/bin/bash
+trap 'exit 0' TERM INT
+while :; do sleep 1; done
+STUB
+chmod +x "$X/harness/orch-loop.sh"
+# The tmux double: the session EXISTS, and kill-session is recorded so "did stop kill it" is answered
+# by evidence rather than by the absence of an error.
+cat > "$X/bin/tmux" <<SH
+#!/bin/bash
+case "\${1:-}" in
+  has-session) exit 0 ;;
+  kill-session) printf '%s\n' "\$*" >> "$X/killed"; exit 0 ;;
+  *) exit 0 ;;
+esac
+SH
+chmod +x "$X/bin/tmux"
+X_RC=0; X_OUT=''
+xs() { # <sub> [VAR=value …]
+  X_OUT="$(env -u OR "$@" PATH="$X/bin:$PATH" CELL_HOME="$X/home" ENV_FILE="$X/home/keys.env" \
+           SESSION="orch" O="$X/oB" REPO="$X/repo" OR="daniel-ospina/agent-infra" SCOPE=own \
+           HARNESS="$X/harness" bash "$SUP" "${XS_VERB:-status}" 2>&1)"; X_RC=$?
+}
+# A controller for the OTHER repo: it runs from the shared harness path and holds NO lock in $O.
+bash "$X/harness/orch-loop.sh" & X_PID=$!
+AI1761_PIDS="${AI1761_PIDS:-} $X_PID"
+sleep 0.5
+XS_VERB=stop xs
+[ "$X_RC" -ne 0 ] && ok "stop: REFUSES to kill a session it cannot prove it owns (rc=$X_RC)" \
+                   || bad "stop: reported success over a session held by a foreign controller — $X_OUT"
+case "$X_OUT" in
+  *"does NOT belong to this state dir"*) ok "stop: names the reason (the session's controller is not this state dir's)" ;;
+  *) bad "stop: does not say why it refused — $X_OUT" ;;
+esac
+[ -e "$X/killed" ] && bad "stop: KILLED the shared session anyway — $(cat "$X/killed")" \
+                   || ok "stop: never called kill-session (no foreign controller was terminated)"
+kill -0 "$X_PID" 2>/dev/null && ok "stop: the foreign controller SURVIVED" \
+                              || bad "stop: the foreign controller was killed"
+# The read that names it must say WHOSE it is not: "RUNNING" alone would attribute another repo's
+# work to this queue.
+XS_VERB=status xs
+case "$X_OUT" in
+  *"RUNNING"*"NOT this state dir's"*) ok "status: reports a harness-path controller as NOT this state dir's" ;;
+  *"controller: RUNNING (pid $X_PID)"*) bad "status: claimed the foreign controller as this state dir's owner — $X_OUT" ;;
+  *) bad "status: neither claimed nor disclaimed the visible controller — $X_OUT" ;;
+esac
+# …and the POSITIVE direction, so the refusal above is not "stop never kills anything": with a lock
+# naming a live $O controller, the session IS this state dir's and is stopped.
+rm -f "$X/killed"
+cat > "$X/oB/orch-loop.sh" <<'STUB'
+#!/bin/bash
+trap 'exit 0' TERM INT
+while :; do sleep 1; done
+STUB
+chmod +x "$X/oB/orch-loop.sh"
+bash "$X/oB/orch-loop.sh" & X_OWN=$!
+AI1761_PIDS="$AI1761_PIDS $X_OWN"
+printf '%s\n' "$X_OWN" > "$X/oB/.orch.lock"
+sleep 0.5
+XS_VERB=stop xs
+case "$X_OUT" in
+  *"controller stopped"*|*"released lock"*) ok "stop: PROCEEDS when the lock proves this state dir owns a live controller" ;;
+  *) bad "stop: refused even with a provable owner — $X_OUT" ;;
+esac
+grep -q kill-session "$X/killed" 2>/dev/null && ok "stop: killed the session it owns" \
+                                            || bad "stop: did not kill the session it owns — $(cat "$X/killed" 2>/dev/null)"
+sleep 0.5
+kill -0 "$X_OWN" 2>/dev/null && bad "stop: its own controller survived" || ok "stop: its own controller is gone"
+kill -0 "$X_PID" 2>/dev/null && ok "stop: the OTHER repo's controller is still untouched" \
+                             || bad "stop: killed the other repo's controller while stopping its own"
+# ── an unreadable process table is CANNOT-DETERMINE, never STOPPED ────────────────────────────────
+# `ps` failing (a truncated PATH, a locked /proc, a denied exec) used to yield an empty read, which is
+# indistinguishable from "no controller" — the false-STOPPED class this whole change exists to close.
+mkdir -p "$X/badbin"; printf '#!/bin/sh\nexit 1\n' > "$X/badbin/ps"; chmod +x "$X/badbin/ps"
+xs_bad() { # <sub> — the session EXISTS, so verbs act on the `has-session` branch
+  X_OUT="$(PATH="$X/badbin:$X/bin:$PATH" CELL_HOME="$X/home" ENV_FILE="$X/home/keys.env" \
+           SESSION="orch-different-$$" O="$X/oB" REPO="$X/repo" OR="daniel-ospina/agent-infra" \
+           SCOPE=own HARNESS="$X/harness" HARNESS_PIN_DIR="$X/pin" HARNESS_PIN_FILE="$X/pin.txt" \
+           bash "$SUP" "$1" 2>&1)"; X_RC=$?
+}
+for verb in status stop; do
+  xs_bad "$verb"
+  [ "$X_RC" -ne 0 ] && ok "$verb: rc=$X_RC when 'ps' cannot answer (never a silent 0)" \
+                    || bad "$verb: exited 0 on an unreadable process table — $X_OUT"
+  # THIS verb's refusal, by a suffix unique to the UNREADABLE-READ case: "cannot read the process
+  # table" appears 14 times in the supervisor, and the short forms are not unique either — stop's
+  # "nothing provable" refusal also says "refusing to kill a session", so a trimmed suffix matched a
+  # fail-open mutation (measured: it stayed green). Within one verb the two reads are a redundant
+  # pair carrying the SAME message, so which one fired is not — and need not be — distinguished.
+  case "$verb:$X_OUT" in
+    status:*"refusing to report a controller state from an unreadable read"*) ok "status: names the unreadable read it refused on" ;;
+    stop:*"refusing to kill a session on an unreadable read"*) ok "stop: names the unreadable read it refused on" ;;
+    *) bad "$verb: does not name the unreadable read it refused on — $X_OUT" ;;
+  esac
+done
+# `start` has TWO unreadable-`ps` guards, and they are DIFFERENT refusals that share a prefix. Each
+# must be asserted by its own suffix, because a prefix match cannot tell them apart: mutating one
+# pair alone would leave one arm green (measured — the first version of this block did exactly that).
+# (1) the `has-session` branch: "the session exists" must not become "it is running" over a read
+#     that failed, which is the false-RUNNING answer that makes an operator skip a stop.
+xs_bad start
+[ "$X_RC" -ne 0 ] && ok "start: rc=$X_RC on an unreadable table in the has-session branch" \
+                  || bad "start: answered 'already running' from an unreadable process table — $X_OUT"
+case "$X_OUT" in
+  *"refusing to answer 'already running'"*) ok "start: names the unreadable read instead of claiming it is running" ;;
+  *) bad "start: does not name the unreadable read it refused on — $X_OUT" ;;
+esac
+# (2) the pre-launch pair: with NO session, `start` must not launch a SECOND controller onto a queue
+#     whose first controller it cannot see (#1761 — the duplicate this change exists to close). The
+#     double below answers `has-session` 1 and everything else 0, so this verb reaches that pair.
+mkdir -p "$X/badbin2"
+printf '#!/bin/sh\ncase "$1" in has-session) exit 1 ;; *) exit 0 ;; esac\n' > "$X/badbin2/tmux"
+chmod +x "$X/badbin2/tmux"
+xs_bad2() { # <sub> — the session does NOT exist, so `start` takes its pre-launch path
+  X_OUT="$(PATH="$X/badbin:$X/badbin2:$X/bin:$PATH" CELL_HOME="$X/home" ENV_FILE="$X/home/keys.env" \
+           SESSION="orch-different-$$" O="$X/oB" REPO="$X/repo" OR="daniel-ospina/agent-infra" \
+           SCOPE=own HARNESS="$X/harness" HARNESS_PIN_DIR="$X/pin" HARNESS_PIN_FILE="$X/pin.txt" \
+           bash "$SUP" "$1" 2>&1)"; X_RC=$?
+}
+xs_bad2 start
+[ "$X_RC" -ne 0 ] && ok "start: rc=$X_RC on an unreadable table before launching (no second controller)" \
+                  || bad "start: launched with an unreadable process table — $X_OUT"
+case "$X_OUT" in
+  *"refusing to start on an unreadable read"*) ok "start: the pre-launch refusal names the unreadable read" ;;
+  *) bad "start: the pre-launch refusal does not name the unreadable read — $X_OUT" ;;
+esac
+# (3) `apply` REPLACES the machine's shared harness tree, so it carries its own refusal for the same
+#     reason: a controller is running the code it would overwrite. Its guard precedes its tmux check.
+xs_bad apply
+[ "$X_RC" -ne 0 ] && ok "apply: rc=$X_RC on an unreadable table (never replaces a harness tree blind)" \
+                  || bad "apply: replaced the harness tree on an unreadable process table — $X_OUT"
+case "$X_OUT" in
+  *"refusing to replace the harness tree"*) ok "apply: names the unreadable read it refused on" ;;
+  *) bad "apply: does not name the unreadable read — $X_OUT" ;;
+esac
+kill -9 "$X_PID" 2>/dev/null; wait "$X_PID" 2>/dev/null
+
+# ── §(p) THE TWO PINNED MIRRORS MUST NOT DRIFT (#1856 review) ───────────────────────────────────
+# cloud-cell-supervisor.sh cannot source scripts/lib/pid-identity.sh (it is deployed STANDALONE into a
+# cell's harness), so it carries `_proc_start_epoch`/`_proc_began_after` as pinned MIRRORS of
+# `pid_start_epoch`/`pid_began_after`. Two copies of a timing predicate is how the fleet ends up with
+# two different slacks — the divergence #1178 exists to prevent. Bodies are compared with the names
+# normalised, so a change made to one copy alone reddens this arm.
+say_case "the pinned pid-identity mirrors do not drift from scripts/lib/pid-identity.sh (#1178)"
+PIB="$(dirname "$SUP")/lib/pid-identity.sh"
+if [ -f "$PIB" ]; then
+  # ⛔ NEVER SOURCE the supervisor to read its functions: it is a SCRIPT, so sourcing it runs its
+  # entry point (which would start reading keys, tmux and the registry inside this arm). The text is
+  # extracted instead — and that is also the more honest check, because the duplication IS text.
+  extract_fn() { # <file> <name>  → the whole `name() { … }` block
+    awk -v n="$2" 'index($0, n"() {")==1 {p=1} p{print} p && /^}$/{exit}' "$1"
+  }
+  norm() {
+    sed -e 's/_proc_start_epoch/FN_START/g' -e 's/_proc_began_after/FN_AFTER/g' \
+        -e 's/pid_start_epoch/FN_START/g'   -e 's/pid_began_after/FN_AFTER/g' \
+        -e 's/LOCK_START_SLACK_SECONDS/SLACK/g' -e 's/PID_START_SLACK_SECONDS/SLACK/g' \
+        -e 's/[[:space:]]\+$//' -e '/^[[:space:]]*$/d' \
+        -e '/^[[:space:]]*#/d'
+  }
+  SUP_BODY="$( { extract_fn "$SUP" _proc_start_epoch; extract_fn "$SUP" _proc_began_after; } | norm )"
+  LIB_BODY="$( { extract_fn "$PIB" pid_start_epoch;    extract_fn "$PIB" pid_began_after;    } | norm )"
+  if [ -n "$SUP_BODY" ] && [ -n "$LIB_BODY" ] && [ "$SUP_BODY" = "$LIB_BODY" ]; then
+    ok "the mirror's CODE is identical to the library's (names + slack normalised, comments excluded)"
+  else
+    bad "the supervisor's pid-identity mirror has DRIFTED from $PIB"
+    diff <(printf '%s\n' "$LIB_BODY") <(printf '%s\n' "$SUP_BODY") | sed 's/^/      /' | head -20
+  fi
+  # The constants can drift independently of the bodies.
+  slack_of() { grep -oE '[0-9]+' <<<"$1" | tail -1; }
+  sup_slack="$(slack_of "$(sed -n 's/^\(LOCK_START_SLACK_SECONDS=.*\)/\1/p' "$SUP" | head -1)")"
+  lib_slack="$(slack_of "$(sed -n 's/^\(PID_START_SLACK_SECONDS=.*\)/\1/p' "$PIB" | head -1)")"
+  [ -n "$sup_slack" ] && [ "$sup_slack" = "$lib_slack" ] \
+    && ok "the two slack constants agree ($sup_slack s)" \
+    || bad "slack drifted: supervisor=${sup_slack:-<absent>} library=${lib_slack:-<absent>}"
+else
+  bad "scripts/lib/pid-identity.sh is missing next to the supervisor — the mirrors cannot be checked"
+fi
+
+
+# ── §(p2) AN OCTAL-LOOKING AGE AND A SECOND OWNERSHIP PREDICATE (#1856 review) ────────────────────
+# (a) etime ZERO-PADS, and `$((08 * 3600))` is a bash ERROR — "value too great for base". A live
+#     controller's age hits an 08/09 field a few percent of the time, and a failed age used to read as
+#     "began before the fence" = "this pid IS the owner". The stub prints exactly that age.
+say_case "an 08/09 age field is readable in BOTH copies, and one predicate owns 'is this the lock's controller'"
+mkdir -p "$T/octal"
+cat > "$T/octal/ps" <<'EOS'
+#!/bin/bash
+case "$*" in *etime*) printf '08:31\n'; exit 0 ;; esac
+exec /bin/ps "$@"
+EOS
+chmod +x "$T/octal/ps"
+octal_epoch() { # <file> <function>
+  ( . "$(dirname "$SUP")/lib/pid-identity.sh" 2>/dev/null
+    set +u
+    eval "$(extract_fn "$1" "$2")" 2>/dev/null || exit 1
+    PS_BIN="$T/octal/ps" "$2" $$ )
+}
+LIB_E="$(octal_epoch "$(dirname "$SUP")/lib/pid-identity.sh" pid_start_epoch)"
+SUP_E="$(octal_epoch "$SUP" _proc_start_epoch)"
+case "$LIB_E" in ''|*[!0-9]*) bad "pid_start_epoch: an '08:31' age is UNREADABLE (rc/''=${LIB_E:-<empty>}) — an octal parse error, which the fence reads as ownership" ;;
+                 *) ok "pid_start_epoch: parses an '08:31' age as decimal (epoch $LIB_E)" ;; esac
+case "$SUP_E" in ''|*[!0-9]*) bad "_proc_start_epoch (the standalone mirror): an '08:31' age is UNREADABLE" ;;
+                 *) ok "_proc_start_epoch (the standalone mirror): parses '08:31' as decimal too" ;; esac
+
+# (b) ONE rule for "is this pid the lock's controller". The registry predicate used to accept ANY argv
+#     token ending in orch-loop.sh, so `bash -c "sleep 300; /abs/orch-loop.sh"` — a NON-controller —
+#     was blessed as the owner by check/status and persisted into the durable registry by start_cell,
+#     while the shipped supervisor said STOPPED for the same pid.
+P2R="$T/pred"; mkdir -p "$P2R"
+printf '#!/bin/bash\nsleep 30\n' > "$P2R/orch-loop.sh"
+bash "$P2R/orch-loop.sh" & P2_TRUE=$!
+bash -c "sleep 30; $P2R/orch-loop.sh" & P2_FAKE=$!
+AI1761_PIDS="${AI1761_PIDS:-} $P2_TRUE $P2_FAKE"
+sleep 0.4
+pred() { ( . "$(dirname "$SUP")/lib/orchestrator-registry.sh"; registry_pid_is_controller "$1" ); }
+pred "$P2_TRUE" && ok "registry: ACCEPTS a real 'bash …/orch-loop.sh' invocation" \
+                || bad "registry: rejected a genuine controller invocation"
+pred "$P2_FAKE" && bad "registry: accepted a NON-controller ('bash -c …; /abs/orch-loop.sh') as the lock owner — the supervisor says STOPPED for it" \
+                || ok "registry: REJECTS the bash -c shape the supervisor also rejects (one rule, both surfaces)"
+# ⛔ AND NOT A SUPERSET: `${2##*/}` = `orch-loop.sh` is the whole rule. An arm that accepted any path
+# ENDING in `orch-loop.sh` claimed `/abs/foo-orch-loop.sh` — a non-controller — while the supervisor
+# answered STOPPED for it (#1856 review).
+printf '#!/bin/bash\nsleep 30\n' > "$P2R/foo-orch-loop.sh"
+bash "$P2R/foo-orch-loop.sh" & P2_LOOK=$!
+AI1761_PIDS="${AI1761_PIDS:-} $P2_LOOK"
+sleep 0.4
+pred "$P2_LOOK" && bad "registry: accepted '/abs/foo-orch-loop.sh' — a path only ENDING in the script name, which the supervisor rejects" \
+              || ok "registry: REJECTS a basename that merely ends in 'orch-loop.sh' (not a superset of the supervisor)"
+kill -9 "$P2_LOOK" 2>/dev/null; wait "$P2_LOOK" 2>/dev/null
+kill -9 "$P2_TRUE" "$P2_FAKE" 2>/dev/null; wait "$P2_TRUE" "$P2_FAKE" 2>/dev/null
+
+# ── §(q) AN UNDATABLE PID IS NOT AN OWNER, AND "SEEN" IS NOT "ALREADY RUNNING" (#1856 review) ───
+# Two shapes of the same mistake, both reproduced in review:
+#   (a) `_proc_began_after` returned 1 for BOTH "began before" and "cannot tell", and the lock
+#       predicate reads 1 as "this pid is the owner" — so on any box where the etime read fails
+#       (`PS_BIN` shim, a ps without `-o etime`), a stale lock naming a PEER controller became the
+#       owner and `stop` signalled it;
+#   (b) `start` answered rc=0 "already running" for a state dir that started NOTHING, because a
+#       controller for another repo was visible on the shared harness path — a success report for a
+#       repo that is not running, naming a `stop` that the same state dir refuses.
+say_case "an undatable lock owner is not signalable, and a foreign controller is not 'already running' (#1856 review)"
+Y="$T/undatable"; mkdir -p "$Y/home" "$Y/o" "$Y/peer" "$Y/bin" "$Y/etime"
+git init -q "$Y/repo" 2>/dev/null || bad "fixture: cannot git init $Y/repo"
+git -C "$Y/repo" remote add origin https://github.com/daniel-ospina/agent-infra.git 2>/dev/null || true
+cat > "$Y/bin/tmux" <<SH
+#!/bin/bash
+case "\${1:-}" in has-session) exit 1 ;; new-session) : > "$Y/started"; exit 0 ;; *) exit 0 ;; esac
+SH
+chmod +x "$Y/bin/tmux"
+cat > "$Y/peer/orch-loop.sh" <<'STUB'
+#!/bin/bash
+trap 'exit 0' TERM INT
+while :; do sleep 1; done
+STUB
+chmod +x "$Y/peer/orch-loop.sh"
+bash "$Y/peer/orch-loop.sh" & Y_PEER=$!
+AI1761_PIDS="${AI1761_PIDS:-} $Y_PEER"
+sleep 0.5
+# A lock that names the PEER, written BEFORE the peer began: the recycled/shared-lock shape the
+# fence exists for. The peer is a live orch-loop.sh invocation, so only the AGE can exclude it.
+printf '%s\n' "$Y_PEER" > "$Y/o/.orch.lock"
+touch -t "$(date -v-5M +%Y%m%d%H%M.%S 2>/dev/null || date -d '-5 minutes' +%Y%m%d%H%M.%S)" "$Y/o/.orch.lock"
+cat > "$Y/etime/ps" <<'EOS'
+#!/bin/bash
+# The table answers; the AGE does not — a ps without `-o etime`, or a PS_BIN shim.
+case "$*" in *etime*) exit 1 ;; esac
+exec /bin/ps "$@"
+EOS
+chmod +x "$Y/etime/ps"
+y_run() { # <verb> [VAR=value …]
+  Y_OUT="$(env -u OR "$@" PATH="$Y/bin:$PATH" CELL_HOME="$Y/home" ENV_FILE="$Y/keys.env" \
+           SESSION="ai1856-undate-$$" O="$Y/o" REPO="$Y/repo" OR="daniel-ospina/agent-infra" \
+           SCOPE=own HARNESS="$Y/peer" bash "$SUP" "${Y_VERB:-status}" 2>&1)"; Y_RC=$?
+}
+Y_VERB=stop PS_BIN="$Y/etime/ps" y_run
+[ "$Y_RC" -ne 0 ] && ok "stop: refuses when the lock's owner pid cannot be DATED (rc=$Y_RC)" \
+                  || bad "stop: acted on an undatable pid — $Y_OUT"
+kill -0 "$Y_PEER" 2>/dev/null && ok "stop: the undatable peer SURVIVED (an undatable pid is not ours)" \
+                              || bad "stop: KILLED the peer from a pid it could not date"
+# (non-vacuity: with a READABLE age the same lock is correctly excluded and stop says so)
+Y_VERB=stop y_run
+kill -0 "$Y_PEER" 2>/dev/null && ok "control: with a readable age the peer is excluded and survives" \
+                              || bad "control: the peer was killed even with a readable age"
+# (b) start must not answer success for a repo that started nothing. This state dir has no lock and
+# no $O/orch-loop.sh; the peer runs from the harness path this machine shares.
+Y_VERB=start y_run
+[ "$Y_RC" -ne 0 ] && ok "start: REFUSES (rc=$Y_RC) when only a FOREIGN harness-path controller is visible" \
+                  || bad "start: reported success for a repo that started nothing — $Y_OUT"
+case "$Y_OUT" in
+  *"not provably this state dir's"*) ok "start: says the visible controller is not provably this state dir's" ;;
+  *) bad "start: does not say why it refused — $Y_OUT" ;;
+esac
+[ -f "$Y/started" ] && bad "start: created a session anyway" || ok "start: created no session"
+kill -9 "$Y_PEER" 2>/dev/null; wait "$Y_PEER" 2>/dev/null
+
+trap 'ai1711_cleanup; [ -n "${AI1761_PIDS:-}" ] && kill -9 $AI1761_PIDS 2>/dev/null; rm -rf "$T"' EXIT
 
 echo
 echo "── Summary ───────────────────────────────────────────────────────"

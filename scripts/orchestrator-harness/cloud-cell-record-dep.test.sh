@@ -54,7 +54,16 @@ echo "==> #1717 cloud-cell record dependency ($HERE)"
 # installed cannot make a negative case pass — and cannot let a real `gh`/`pi` reach the network.
 # The coreutils are symlinked (they are the shells the driven scripts actually need); the tools
 # under test are trivial `exit 0` stubs.
-COREUTILS="date tr mkdir cp rm mv ls cat dirname basename env sed grep chmod head tail awk seq sleep diff stat touch true false df sha256sum shasum"
+# ⛔ `ps` belongs here: `start`/`status`/`stop` read the process table to prove a controller is THIS
+# state dir's, and an ABSENT `ps` is indistinguishable from an UNREADABLE one — the supervisor then
+# refuses to start ("cannot read the process table"), which is correct behaviour and wrong subject
+# matter for this suite (it pins the recorder dependency). Every real cell has `ps`; the
+# unreadable-`ps` refusals are pinned in scripts/cloud-cell-supervisor.test.sh §(o) — `status`, `stop`,
+# both of `start`'s guards, and `apply` — each by its own message suffix, so a mutation of one guard
+# cannot be masked by another. The read is scoped to $O/orch-loop.sh and $HARNESS/orch-loop.sh under
+# this fixture's own mktemp tree, so no process on the host can match it and the fixture stays
+# hermetic.
+COREUTILS="date tr mkdir cp rm mv ls cat dirname basename env sed grep chmod head tail awk seq sleep diff stat touch true false df sha256sum shasum ps"
 mkstubs() { # mkstubs <dir>
   local d="$1" b p
   mkdir -p "$d"
