@@ -58,7 +58,18 @@ say "claims.sh present: $(wc -c < "$H/claims.sh" | tr -d ' ') bytes"
 mkdir -p "$O" || die "cannot create $O"
 cp -p "$H"/*.sh "$O"/ || die "seed failed"
 [ -f "$O/claims.sh" ] || die "claims.sh did NOT land in $O — the registry would be silently OFF"
-say "seeded $O with $(ls "$O"/*.sh | wc -l | tr -d ' ') scripts (claims.sh present)"
+# The gh single-flight/backoff layer (#1988) is a SUBDIRECTORY, so the glob above cannot seed it.
+# Without it `ghs_run`/`ghs_mut` are undefined at every wired call site: the refresh's reads exit 127
+# every pass, `queue=UNREADABLE`, and the cell reports RUNNING with `lanes: 0` — the #1736 shape
+# (a cell that is blind and looks idle). Refuse rather than ship that.
+[ -d "$H/gh-serial" ] || die "gh-serial/ missing on main — the cell's gh calls would all fail (127)"
+mkdir -p "$O/gh-serial" || die "cannot create $O/gh-serial"
+cp -p "$H"/gh-serial/* "$O"/gh-serial/ || die "cannot seed $O/gh-serial"
+chmod +x "$O/gh-serial/gh-serial" || die "cannot chmod $O/gh-serial/gh-serial"
+[ -f "$O/gh-serial/lib.sh" ] || die "gh-serial/lib.sh did NOT land in $O — every wired gh call would exit 127"
+GHS_STATE_DIR="$O/state/gh-serial" "$O/gh-serial/gh-serial" version >/dev/null 2>&1 \
+  || die "the seeded gh-serial layer cannot run in $O (python3 missing?) — every wired gh call would fail"
+say "seeded $O with $(ls "$O"/*.sh | wc -l | tr -d ' ') scripts (claims.sh present) + gh-serial/ (gh layer present)"
 
 # ── 4. restart the controller, cold, with HOME carried into tmux ──────────────
 say "starting controller: OR=$OR REPO=$REPO SCOPE=$SCOPE MAX_LANES=$MAX_LANES"

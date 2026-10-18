@@ -946,6 +946,32 @@ seed_and_stamp() {
     n=$((n + 1))
   done
   [ "$n" -gt 0 ] || die "no *.sh scripts in $HARNESS — nothing to seed into $O"
+  # ── the gh single-flight/backoff layer (#1988) ─────────────────────────────────────────────────
+  # ⛔ A SUBDIRECTORY, so the `*.sh` loop above cannot see it — and seeding the scripts WITHOUT it is
+  # the exact failure that reads as an idle cell: `refresh-candidates.sh`/`orch-loop.sh` call
+  # `ghs_run`, which only `gh-serial/lib.sh` defines, so every wired read would be `command not
+  # found` (127) ⇒ `queue=UNREADABLE` on EVERY pass ⇒ `lanes: 0, backlog=0` forever, with the
+  # controller reporting RUNNING (the #1736 shape). Refuse to seed an incomplete layer rather than
+  # producing that cell.
+  [ -d "$HARNESS/gh-serial" ] \
+    || die "$HARNESS/gh-serial is missing — refusing to seed a cell whose gh layer would be absent (every wired gh call would exit 127)"
+  mkdir -p "$O/gh-serial" || die "cannot create $O/gh-serial"
+  for src in "$HARNESS"/gh-serial/gh-serial "$HARNESS"/gh-serial/gh_serial.py "$HARNESS"/gh-serial/lib.sh; do
+    [ -f "$src" ] || die "$(basename "$src") missing from $HARNESS/gh-serial — the layer would be seeded incomplete"
+    f="$(basename "$src")"; tmp="$O/gh-serial/.seed-$f.$$"
+    cp -p "$src" "$tmp" || die "cannot stage gh-serial/$f into $O"
+    mv -f "$tmp" "$O/gh-serial/$f" || { rm -f "$tmp"; die "cannot install gh-serial/$f into $O"; }
+  done
+  chmod +x "$O/gh-serial/gh-serial" || die "cannot chmod $O/gh-serial/gh-serial"
+  for f in "$O"/gh-serial/*; do
+    [ -f "$f" ] || continue
+    [ -f "$HARNESS/gh-serial/$(basename "$f")" ] \
+      || { rm -f "$f"; say "seed: removed stale gh-serial/$(basename "$f") — the harness no longer ships it"; }
+  done
+  # Prove the seeded ENGINE runs here, not just that the bytes moved: a broken interpreter on the
+  # cell turns every wired gh call into 127/exit-75 noise that looks like a GitHub outage.
+  GHS_STATE_DIR="$O/state/gh-serial" "$O/gh-serial/gh-serial" version >/dev/null 2>&1 \
+    || die "the seeded gh-serial layer cannot run in $O (python3 missing?) — refusing to seed a cell whose gh calls would all fail"
   # ⛔ MIRROR, do not merely overlay. `orch-loop.sh`/`merge-one.sh` invoke workers BY NAME from $O, so a
   # script RENAMED upstream would leave its old copy live in $O and still invocable — the record would
   # describe the harness while the cell ran a worker the harness no longer ships.
@@ -1109,6 +1135,15 @@ cmd_check() {
     [ -f "$O/$w" ] || missing="$missing $w"
   done
   [ -z "$missing" ] || die "worker scripts missing from $O:$missing — run 'start' (it seeds $O) or: cp '$HARNESS'/*.sh '$O'/"
+  # The gh layer is a SUBDIRECTORY, so the worker list above cannot see it — and the controller NEEDS
+  # it: refresh-candidates.sh and orch-loop.sh call `ghs_run`/`ghs_mut`, which only gh-serial/lib.sh
+  # defines. Absent, those reads exit 127 ⇒ queue=UNREADABLE every pass ⇒ a cell that reports
+  # RUNNING with `lanes: 0` while it is simply blind. This gate exists to refuse exactly that.
+  for w in gh-serial/lib.sh gh-serial/gh-serial gh-serial/gh_serial.py; do
+    [ -f "$O/$w" ] || missing="$missing $w"
+  done
+  [ -z "$missing" ] \
+    || die "the gh serialisation layer is missing from $O:$missing — run 'start' (it seeds $O), or: mkdir -p '$O/gh-serial' && cp '$HARNESS'/gh-serial/* '$O/gh-serial/'"
 
   # ── which commit is this cell running? (agent-infra#1745) ────────────────────────────────────
   # Placed BEFORE the dispatch-provisioning probe: a tree off main's line can pass every later

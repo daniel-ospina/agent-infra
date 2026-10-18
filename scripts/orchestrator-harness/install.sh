@@ -421,6 +421,11 @@ for f in "$HERE"/*.sh; do
 done
 # the gh REST adapter is a bin shim, not a *.sh — check it explicitly (#1959)
 [ -f "$HERE/gh-rest/gh" ] && { bash -n "$HERE/gh-rest/gh" || die "syntax error in gh-rest/gh"; }
+# the single-flight/backoff layer is a subdirectory, so the *.sh glob above never sees it (#1988)
+for f in "$HERE"/gh-serial/gh-serial "$HERE"/gh-serial/lib.sh; do
+  [ -f "$f" ] && { bash -n "$f" || die "syntax error in gh-serial/$(basename "$f")"; }
+done
+[ -f "$HERE/gh-serial/gh_serial.py" ] && { python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' "$HERE/gh-serial/gh_serial.py" 2>/dev/null || die "syntax error in gh-serial/gh_serial.py"; }
 ok "all shipped scripts parse"
 
 # ── state dir ────────────────────────────────────────────────────────────────────
@@ -469,6 +474,34 @@ if [ -f "$HERE/gh-rest/gh" ]; then
   esac
 else
   warn "gh-rest/gh missing from the shipped set — the daemon will reach GitHub over GraphQL only"
+fi
+
+# ── gh single-flight / backoff layer (agent-infra#1988) ─────────────────────────
+# Seeded BESIDE the harness scripts, never on PATH: the layer is named explicitly at the call sites
+# (`ghs_run` / `ghs_mut` / `ghs_rest` from gh-serial/lib.sh) and `gh` itself is never substituted.
+# Four boxes × N lanes share ONE account, and GitHub's SECONDARY limit is triggered by CONCURRENCY:
+# measured 2026-10-18 with core 2948/5000 free and every GraphQL call refused. Without this the
+# controller logs `[scope] open=UNKNOWN` and `queue=UNREADABLE` — blind, and reading as idle.
+if [ -f "$HERE/gh-serial/gh-serial" ] && [ -f "$HERE/gh-serial/gh_serial.py" ] && [ -f "$HERE/gh-serial/lib.sh" ]; then
+  mkdir -p "$O/gh-serial" || die "cannot create $O/gh-serial"
+  for f in gh-serial gh_serial.py lib.sh; do
+    [ -f "$HERE/gh-serial/$f" ] || die "gh-serial/$f missing from the shipped set — the layer would install incomplete and every wired gh call would exit 127"
+    if [ -f "$O/gh-serial/$f" ] && ! diff -q "$HERE/gh-serial/$f" "$O/gh-serial/$f" >/dev/null 2>&1; then
+      warn "replacing a DIFFERENT $O/gh-serial/$f — the installed layer was stale"
+    fi
+    cp "$HERE/gh-serial/$f" "$O/gh-serial/$f" || die "cannot install $O/gh-serial/$f"
+  done
+  chmod +x "$O/gh-serial/gh-serial" || die "cannot chmod $O/gh-serial/gh-serial"
+  # A missing ENGINE or LIB is a loud 127 at the call site (it never silently degrades to a bare gh),
+  # but prove the artifact the CALL SITES use here too — through lib.sh, not just the engine: an
+  # install that ships the wrapper without the library is a fleet whose every wired gh call exits
+  # 127, the empty-queue idle this repository has already paid for twice.
+  ( GHS_STATE_DIR="$O/state/gh-serial" . "$O/gh-serial/lib.sh" && GHS_BIN="$O/gh-serial/gh-serial" \
+      ghs_run version >/dev/null 2>&1 ) \
+    || die "the installed gh-serial layer cannot run through lib.sh (python3 missing, or a file is incomplete)"
+  ok "gh serialisation/backoff layer -> $O/gh-serial (explicit call path; gh is NOT substituted)"
+else
+  warn "gh-serial/ missing from the shipped set — refusing to install the harness: its wired gh calls would be undefined (127) and every read would look empty. This checkout is too old to install."
 fi
 
 # ── render plist ─────────────────────────────────────────────────────────────────
@@ -601,14 +634,14 @@ if [ "$PLIST_CHANGED" = "0" ]; then ok "plist unchanged and it is the render lau
 # missing AGENT_DISK_REFUSED, which under `set -u` aborts a refusal before its refund (the callers
 # are tolerant of that now, but surviving a stale helper silently is not the same as DETECTING it).
 DRIFTED=""
-for f in orch-loop.sh claims.sh repo-authority.sh spawn-gate.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh gh-rest/gh; do
+for f in orch-loop.sh claims.sh repo-authority.sh spawn-gate.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh gh-rest/gh gh-serial/gh-serial gh-serial/gh_serial.py gh-serial/lib.sh; do
   [ -f "$O/$f" ] || { DRIFTED="$DRIFTED $f(missing)"; continue; }
   diff -q "$HERE/$f" "$O/$f" >/dev/null 2>&1 || DRIFTED="$DRIFTED $f"
 done
 if [ -n "$DRIFTED" ]; then
   warn "the running copy at \$O differs from the shipped copy:$DRIFTED"
   warn "  the daemon executes \$O/<script> — sync them or the fixes here are not in effect:"
-  warn "  cp '$HERE'/*.sh '$O'/ && mkdir -p '$O/gh-rest' && cp '$HERE'/gh-rest/gh '$O/gh-rest/'";
+  warn "  cp '$HERE'/*.sh '$O'/ && mkdir -p '$O/gh-rest' '$O/gh-serial' && cp '$HERE'/gh-rest/gh '$O/gh-rest/' && cp '$HERE'/gh-serial/* '$O/gh-serial/'";
 fi
 
 # ── harness provenance (agent-infra#1745) ────────────────────────────────────────
@@ -663,9 +696,10 @@ prov_payload_hash() {
     (
       cd "$O" || exit 3
       for f in *.sh; do [ -f "$f" ] || continue; $PROV_SHA "$f" || exit 3; done
-      # ⛔ gh-rest/gh is NOT folded in here. The payload digest and check-deployed-drift.sh
-      # compute it over the shell files in $O; adding a non-shell file in one place alone
-      # makes every HEALTHY deployment read as drift. Covering the adapter, and
+      # ⛔ gh-rest/gh is NOT folded in here, and neither is gh-serial/{gh_serial.py,lib.sh}
+      # (#1988). The payload digest and check-deployed-drift.sh compute it over the shell files in
+      # $O; adding a non-shell file (or a subdirectory file) in one place alone makes every
+      # HEALTHY deployment read as drift. Covering the adapter, gh_serial.py, lib.sh and
       # launchd.plist.template which has the same gap, needs the stamp, the drift checker
       # and selftest changed together. Tracked separately; do not half-fix it here.
       # ⛔ NEVER put an open paren in a comment nested in command substitution — bash

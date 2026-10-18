@@ -85,9 +85,17 @@ rf() {
   local dir="$1" mode="$2"; shift 2
   local args=(6); [ "$mode" = check ] && args=(--check)
   local paths="${RF_PATH:-$dir/bin:$PATH}"
+  # ⛔ GHS_MAX_ATTEMPTS=1, DELIBERATELY. refresh-candidates.sh routes its gh reads through the
+  # gh-serial layer (#1988), whose backoff is >= 60 s and doubling. Several cases below stub gh
+  # with a RATE-LIMIT refusal on purpose ("the read failed" must become queue=UNREADABLE, not
+  # EMPTY), and at the shipped 4 attempts that is 420 s of backoff PER QUERY — the suite would take
+  # longer than the defect it guards. The retry SCHEDULE itself is asserted in gh-serial.test.sh
+  # (with a sleep recorder); here we only need "the call failed, bounded, and was recorded as
+  # failed", so one attempt is the faithful setting.
   OUT="$(env -u TORTOISE_REPO -u TORTOISE -u SCOUT_UV -u GH_HOST -u CELL_HOME -u SCOUT_PY \
           -u SCOUT_UV_EXTRAS -u GH_CONFIG_DIR \
-          HOME="$dir/home" PATH="$paths" REPO="$dir/repo" O="$dir/o" "$@" \
+          HOME="$dir/home" PATH="$paths" REPO="$dir/repo" O="$dir/o" \
+          GHS_MAX_ATTEMPTS=1 GHS_STATE_DIR="$dir/o/state/gh-serial" "$@" \
           bash "$REFRESH" "${args[@]}" 2>&1)"
   RC=$?
 }

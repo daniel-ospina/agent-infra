@@ -63,7 +63,10 @@ echo "==> #1717 cloud-cell record dependency ($HERE)"
 # cannot be masked by another. The read is scoped to $O/orch-loop.sh and $HARNESS/orch-loop.sh under
 # this fixture's own mktemp tree, so no process on the host can match it and the fixture stays
 # hermetic.
-COREUTILS="date tr mkdir cp rm mv ls cat dirname basename env sed grep chmod head tail awk seq sleep diff stat touch true false df sha256sum shasum ps"
+# `cut` is in the list because cloud-cell-supervisor.sh's provenance line renders the harness
+# subject with `cut -c1-68` (harness_subject); a fixture PATH without it prints
+# `cut: command not found` into `check`'s output and reddens every provenance arm (#1988 review).
+COREUTILS="date tr cut mkdir cp rm mv ls cat dirname basename env sed grep chmod head tail awk seq sleep diff stat touch true false df sha256sum shasum ps"
 mkstubs() { # mkstubs <dir>
   local d="$1" b p
   mkdir -p "$d"
@@ -154,6 +157,14 @@ env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
 env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
   git -C "$CELL_REPO" remote add origin https://github.com/acme/widget.git
 cp "$HERE"/*.sh "$CELL_HARNESS/"
+# #1988: the gh single-flight/backoff layer is a SUBDIRECTORY of the harness, so `cp *.sh` cannot
+# carry it. Seed it into the fixture harness BEFORE the commit below (untracked files would make the
+# tree DIRTY, and the provenance gate refuses a dirty harness — rightly) and into $O after the seed
+# step, because `cmd_check` refuses a cell whose $O lacks it (undefined `ghs_run` ⇒ 127 on every wired
+# read ⇒ queue=UNREADABLE forever with `lanes: 0`).
+mkdir -p "$CELL_HARNESS/gh-serial"
+cp "$HERE/gh-serial/gh-serial" "$HERE/gh-serial/gh_serial.py" "$HERE/gh-serial/lib.sh" "$CELL_HARNESS/gh-serial/"
+chmod +x "$CELL_HARNESS/gh-serial/gh-serial"
 env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
   git -C "$CELL_HARNESS" init -q
 env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
@@ -164,6 +175,9 @@ env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
   git -C "$CELL_HARNESS" update-ref refs/remotes/origin/main HEAD
 # `cmd_check` asserts the workers are in $O; production gets them from `start`'s seed of $HARNESS.
 cp "$HERE"/*.sh "$CELL_O/"
+mkdir -p "$CELL_O/gh-serial"
+cp "$HERE/gh-serial/gh-serial" "$HERE/gh-serial/gh_serial.py" "$HERE/gh-serial/lib.sh" "$CELL_O/gh-serial/"
+chmod +x "$CELL_O/gh-serial/gh-serial"
 mkstubs "$CELL_STUBS"
 RECORDER="$CELL_HOME/.pi/agent/scripts/record-review.sh"
 mkdir -p "$(dirname "$RECORDER")"

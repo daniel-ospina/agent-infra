@@ -24,6 +24,27 @@ O="${O:-$HOME/orchestrator}"
 export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
 export AGENT_SKIP_REVIEW_GATE=1 ELDATO_SKIP_VGATE=1
 
+# ── gh calls go through the EXPLICIT single-flight/backoff layer (agent-infra#1988) ─────────────
+# WHY. Four boxes × N lanes hit ONE GitHub account. GitHub's SECONDARY limit is triggered by
+# CONCURRENCY, not by quota — measured 2026-10-18: core 2948/5000 and graphql 4605/5000 free, and
+# still every GraphQL call refused with "API rate limit already exceeded for user ID 81560491".
+# That refusal is what printed `[scope] open=UNKNOWN rc=1` and `queue=UNREADABLE`: a cell that
+# cannot read the board reads as idle, not blind. `ghs_run` serialises one gh invocation per box
+# (flock) and backs off on `retry-after` / reset / >= 60 s doubling, bounded, then FAILS LOUDLY
+# with exit 75 rather than returning an empty result.
+# ⛔ NOT a PATH shim — `gh` itself is never substituted. The call sites below name the layer, so
+# every serialised call is greppable and a new bare `gh` call is visible as an omission.
+_GHS_LIB=""
+for _c in "${GHS_LIB:-}" "$O/gh-serial/lib.sh" "$(dirname "$0")/gh-serial/lib.sh"; do
+  [ -n "$_c" ] && [ -f "$_c" ] && { _GHS_LIB="$_c"; break; }
+done
+if [ -n "$_GHS_LIB" ]; then
+  # shellcheck source=/dev/null
+  . "$_GHS_LIB"
+else
+  echo "orch-loop: WARN gh-serial/lib.sh not found (looked in \$GHS_LIB, $O/gh-serial, $(dirname "$0")/gh-serial) — the layer's functions are UNDEFINED, so the wired gh calls FAIL (127): the open-PR count takes its sticky fallback and every merge/ready is a `merge fail`. This is NOT a graceful degradation — re-run install.sh (Mac) or re-seed $O (cell)." >&2
+fi
+
 MAX_FIX="${MAX_FIX:-3}"
 MAX_FIX_TRIES="${MAX_FIX_TRIES:-3}"
 # ⛔ MAX_LOAD IS A SANITY CEILING, NOT A THROUGHPUT TARGET -- and 16 was too tight for this box.
@@ -695,7 +716,7 @@ open_pr_count() { # -> echoes the open-PR count; never 0 on failure; writes stat
   # rows (drive unowned_pr_count below). `--jq` emits a SINGLE line — `<count> <pr:sha> <pr:sha>`
   # — so the split is positional and a variable-length list cannot confuse it; an empty list is
   # `0 ` (jq still prints the count), which the parse below reads as count=0, rows=none.
-  if raw="$(gh pr list --repo "$OR" --state open --limit 300 \
+  if raw="$(ghs_run -- gh pr list --repo "$OR" --state open --limit 300 \
              --json number,headRefOid \
              --jq '"\(length) \(map("\(.number):\(.headRefOid)") | join(" "))"' \
              2>"$O/state/.open-err.$$")"; then
@@ -1133,7 +1154,7 @@ while true; do
     is_num "$PR" || { echo "#${PR:-?} SKIPPED (non-numeric PR id)" >>"$LOG"; continue; }
     safe_ref "$BR" || { echo "#$PR SKIPPED (unsafe branch name: $BR)" >>"$LOG"; continue; }
     if [ "${DRAFT:-}" = "true" ]; then
-      gh pr ready "$PR" --repo "$OR" >/dev/null 2>&1 && echo "#$PR readied (was a draft)" >>"$LOG"
+      ghs_mut -- gh pr ready "$PR" --repo "$OR" >/dev/null 2>&1 && echo "#$PR readied (was a draft)" >>"$LOG"
       continue
     fi
     PR_ST="$(gh pr view "$PR" --repo "$OR" --json state --jq .state 2>/dev/null)"
@@ -1260,7 +1281,7 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
     esac
     case "$V" in
       GREEN)
-        gh pr ready "$PR" --repo "$OR" >/dev/null 2>&1 || true
+        ghs_mut -- gh pr ready "$PR" --repo "$OR" >/dev/null 2>&1 || true
         if [ "$MERGE_AUTHORITY" = "rail" ]; then
           # RAIL MODE (agent-infra#1764). The repo does NOT require the review gate, so the merge
           # authority is its own rail (scripts/admin-merge.sh), which computes head-bound evidence
@@ -1295,14 +1316,14 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
           # ANY authority that was not `rail` — INCLUDING `unknown` — reached a RAW `gh pr merge`,
           # the exact bypass this whole change exists to prevent. Allow-list polarity: a raw merge
           # happens only on an authority that NAMES the gate.
-          gh pr merge "$PR" --repo "$OR" --squash >>"$LOG" 2>&1 && echo "#$PR MERGED" >>"$LOG" || echo "#$PR merge fail" >>"$LOG"
+          ghs_mut -- gh pr merge "$PR" --repo "$OR" --squash >>"$LOG" 2>&1 && echo "#$PR MERGED" >>"$LOG" || echo "#$PR merge fail" >>"$LOG"
         else
           echo "#$PR GREEN but the merge authority is '${MERGE_AUTHORITY:-<unset>}' — NO merge (fail-closed: only an explicit 'gate' or 'rail' authority may merge)" >>"$LOG"
         fi ;;
       PENDING:*)
-        gh pr ready "$PR" --repo "$OR" >/dev/null 2>&1 || true
+        ghs_mut -- gh pr ready "$PR" --repo "$OR" >/dev/null 2>&1 || true
         if [ "$MERGE_AUTHORITY" = "gate" ]; then
-          gh pr merge "$PR" --repo "$OR" --squash --auto >>"$LOG" 2>&1 && echo "#$PR auto-armed" >>"$LOG" || true
+          ghs_mut -- gh pr merge "$PR" --repo "$OR" --squash --auto >>"$LOG" 2>&1 && echo "#$PR auto-armed" >>"$LOG" || true
         else
           # RAIL MODE: `--auto` must NOT be armed. It merges the moment the REPO'S required checks
           # pass, which on a rail-managed repo bypasses the rail entirely — the same bypass the

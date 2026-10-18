@@ -45,6 +45,18 @@ PASS=0; FAIL=0
 ok()  { PASS=$((PASS + 1)); echo "  ✅ $1"; }
 bad() { FAIL=$((FAIL + 1)); echo "  ❌ $1"; }
 
+# seed_gh_layer <dir> — #1988: the gh single-flight/backoff layer is a SUBDIRECTORY, so the fixture
+# idiom `cp <harness>/*.sh <O>/` never carries it. `seed_and_stamp` now REFUSES to seed without it and
+# `cmd_check` REFUSES a cell whose $O lacks it (undefined `ghs_run` ⇒ 127 on every wired read ⇒
+# queue=UNREADABLE forever with `lanes: 0`). Every fixture that stands in for a harness or a seeded
+# $O therefore carries the real three files, or the arm under test is decided by that refusal instead.
+seed_gh_layer() {
+  mkdir -p "$1/gh-serial"
+  cp "$HERE/orchestrator-harness/gh-serial/gh-serial" "$HERE/orchestrator-harness/gh-serial/gh_serial.py" \
+     "$HERE/orchestrator-harness/gh-serial/lib.sh" "$1/gh-serial/"
+  chmod +x "$1/gh-serial/gh-serial"
+}
+
 T="$(mktemp -d "${TMPDIR:-/tmp}/cloud-cell-test.XXXXXX")"
 # ⛔ HERMETIC means the CALLER's environment must not decide a fixture. agent-infra#1901 makes `OR`
 # (the queue's owner/repo) a VALIDATED INPUT — derived from the checkout unless declared — so an
@@ -110,6 +122,12 @@ make_ai_repo() {
   printf '#!/bin/bash\nexit 0\n' > "$AI/scripts/record-review.sh"
   mkdir -p "$AI/scripts/lib"
   printf '#!/usr/bin/env python3\n' > "$AI/scripts/lib/diff-normalize.py"
+  # #1988: the gh single-flight/backoff layer is a SUBDIRECTORY of the harness, and `start` now
+  # REFUSES to seed a cell without it (undefined `ghs_run` ⇒ 127 on every wired read ⇒
+  # queue=UNREADABLE forever with `lanes: 0`). A fixture checkout that omits it models a harness no
+  # cell can be seeded from, so carry it exactly as a real checkout does.
+  mkdir -p "$AI/scripts/orchestrator-harness/gh-serial"
+  for w in gh-serial gh_serial.py lib.sh; do : > "$AI/scripts/orchestrator-harness/gh-serial/$w"; done
   git -C "$AI" add -A
   git -C "$AI" commit -q -m base
   git -C "$AI" branch -M main
@@ -310,6 +328,10 @@ ai_worktree "$W/harness"
 # required worker script now (orch-loop.sh/merge-one.sh SOURCE it from $O), so a fixture without it
 # dies in cmd_check with "worker scripts missing from …: claims.sh".
 for f in claims.sh repo-authority.sh dispatch-merge.sh lane.sh chain-merge.sh fix-one.sh refresh-candidates.sh adopt-fix.sh; do : > "$W/harness/$f"; done
+# #1988: the gh layer is a subdirectory the seed step REFUSES to proceed without, and `cmd_check`
+# asserts its three files in $O. It must be REAL here (not empty): `seed_and_stamp` proves the
+# seeded engine runs (`gh-serial version`) before it will stamp the cell.
+seed_gh_layer "$W/harness"
 printf '#!/bin/bash\nexit 0\n' > "$W/bin/gh"; chmod +x "$W/bin/gh"
 # #1717: the shipped `start` PROVISIONS the record step from the checkout, and `cmd_check` refuses a
 # cell without it — or without its declared sibling `lib/diff-normalize.py` (the recorder resolves the
@@ -575,6 +597,11 @@ ai_worktree "$F/harness"
 for f in orch-loop.sh claims.sh repo-authority.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh adopt-fix.sh; do
   : > "$F/harness/$f"; : > "$F/o/$f"
 done
+# #1988: cmd_check also refuses a cell whose $O lacks the gh single-flight/backoff layer (a cell whose
+# wired reads would all exit 127). Carry it in BOTH the fixture harness and the seeded $O, or every
+# assertion below is decided by that refusal instead of by the provisioning probe under test.
+seed_gh_layer "$F/harness"
+seed_gh_layer "$F/o"
 printf '#!/bin/bash\nexit 0\n' > "$F/bin/gh"; chmod +x "$F/bin/gh"
 # #1717: cmd_check now also refuses a cell without the record step (and its declared sibling), so a
 # dispatch-provisioning fixture must be a cell that PASSES that earlier probe — otherwise every
@@ -685,6 +712,8 @@ ai_init_repo "$P/repo"
 for f in orch-loop.sh claims.sh repo-authority.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh; do
   : > "$P/o/$f"; : > "$P/untracked/$f"
 done
+seed_gh_layer "$P/o"
+seed_gh_layer "$P/untracked"
 printf '#!/bin/bash\nexit 0\n' > "$P/bin/gh"; chmod +x "$P/bin/gh"
 # #1717: `check` refuses a cell whose $CELL_HOME lacks the record step (and its declared sibling),
 # so seed the pair exactly where the shipped `start` lays it down. Without this every §9 arm that
@@ -1262,6 +1291,7 @@ E="$T/cannotverify"; mkdir -p "$E/home" "$E/o"
 ai_init_repo "$E/repo"
 ai_worktree "$E/h"
 cp "$E/h/scripts/orchestrator-harness"/*.sh "$E/o/"   # seed $O so cmd_check reaches the provenance gate
+seed_gh_layer "$E/o"                                      # #1988: the layer is a subdir, not a *.sh
 printf 'garbage-not-an-index' > "$(git -C "$E/h" rev-parse --git-path index)"
 if git -C "$E/h" status --porcelain >/dev/null 2>&1; then
   bad "fixture broken: 'git status' still succeeded on a corrupt index"
@@ -1428,6 +1458,7 @@ Q="$T/queue"; mkdir -p "$Q/home" "$Q/bin"
 QH="$Q/harness"
 ai_worktree "$Q/harness"
 for f in orch-loop.sh claims.sh repo-authority.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh adopt-fix.sh; do : > "$Q/harness/$f"; done
+seed_gh_layer "$Q/harness"   # #1988: start seeds $O from here and refuses a harness without it
 # The provisioning probe must answer rc=0 here: this section is about the PAIR, not about dispatch.
 # It echoes the OR it was handed, so a probe run against the wrong queue could not pass silently.
 cat > "$Q/harness/refresh-candidates.sh" <<'SH'

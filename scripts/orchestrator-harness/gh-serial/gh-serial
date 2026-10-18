@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# gh-serial — the harness's EXPLICIT gh call path: one gh invocation at a time per box, plus the
+# documented bounded backoff on a rate-limit refusal (agent-infra#1988).
+#
+# ⛔ NOT A PATH SHIM, DELIBERATELY. It is not named `gh`, it is not put on PATH ahead of the real
+# binary, and it never substitutes a different command: a caller writes
+#
+#     ghs_run  -- gh pr list --repo o/r --state open …      # reads
+#     ghs_mut  -- gh pr merge 12 --repo o/r --squash        # mutating (>= 1 s apart)
+#     ghs_rest repos/o/r/pulls?state=open --jq '.[].number'  # conditional REST (a 304 is free)
+#
+# so every call site that is serialised is greppable, and one that is not is visible as a bare `gh`.
+# (A shim that answers what it cannot answer is the #1959/#1981 defect class the harness refuses.)
+#
+# EXIT CONTRACT — the reason a caller can tell "limited" from "empty":
+#   0                 the call succeeded; stdout/stderr are gh's own bytes
+#   75 (EX_TEMPFAIL)  the bounded retry budget was exhausted (or the single-flight lock timed out);
+#                     stderr carries `RATE_LIMITED bucket=… reset=…` — NEVER an empty success
+#   64                usage error
+#   127               no real `gh` on PATH
+#   other             gh's own exit status, output replayed untouched (a permission 403, a 404, …)
+#
+# The engine is gh_serial.py beside this file; see its docstring for the knobs (GHS_MAX_ATTEMPTS,
+# GHS_BASE_WAIT, GHS_MAX_WAIT, GHS_MUTATIVE_SPACING, GHS_LOCK_TIMEOUT, GHS_STATE_DIR, GHS_GH).
+set -uo pipefail
+
+SELF="${BASH_SOURCE[0]}"
+DIR="$(cd "$(dirname "$SELF")" 2>/dev/null && pwd)" || {
+  echo "gh-serial: cannot resolve my own directory from $SELF" >&2; exit 127; }
+ENGINE="$DIR/gh_serial.py"
+[ -f "$ENGINE" ] || { echo "gh-serial: missing $ENGINE — this entry point is useless without it" >&2; exit 127; }
+
+PY="${GHS_PYTHON:-}"
+if [ -z "$PY" ]; then
+  for cand in python3 /usr/bin/python3 /usr/local/bin/python3; do
+    if command -v "$cand" >/dev/null 2>&1; then PY="$cand"; break; fi
+  done
+fi
+[ -n "$PY" ] || { echo "gh-serial: python3 is required and was not found (set GHS_PYTHON)" >&2; exit 127; }
+
+exec "$PY" "$ENGINE" "$@"

@@ -312,6 +312,84 @@ There is no scheduler, no queue service, no shared database. Two boxes running t
 the same repo work fine *because* GitHub is the coordination medium — but they will duplicate
 work unless they coordinate (see §5, "broad mode").
 
+### GitHub API surface — the serialisation/backoff layer (`gh-serial`, #1988)
+
+⚠️ **This layer is NOT a PATH shim** — and that is a DELIBERATE DEPARTURE from the implementation
+proposed in #1988's scoping comment, which planned a `gh-limit/gh` shim. The owner's dispatch
+instruction for this work requires the opposite ("Do NOT add a PATH shim that silently substitutes a
+different `gh` … make the serialisation an explicit call path that the scripts use"), and the
+reasoning is the one #1981 measured: a wrapper that answers what it cannot answer (it returned null
+for a GraphQL-only field) disabled dispatch entirely, so whether a call is served must stay visible
+at the call site. `gh-rest` below survives as an adapter on its own rule — it **delegates** anything
+it does not model — but that is a deployment concern, not a per-call decision. The departure is
+recorded with an `OVERRIDES:` line on #1988; do not "restore" the shim as a drift fix.
+
+**Why both layers exist.** They fix different halves of the same failure, and the measured numbers
+show they are not substitutes. On 2026-10-18 the fleet had
+
+    gh api rate_limit -> core remaining=2948/5000   graphql remaining=4605/5000
+    every GraphQL call -> "API rate limit already exceeded for user ID 81560491"
+    heartbeat           -> gh=RATE-LIMITED(queue) queue=UNREADABLE
+
+Quota free + calls refused is GitHub's **secondary (concurrency)** limit: four boxes × N lanes × the
+controller × `pr-doctor` all burst on ONE account. GitHub's documented remedy is a **queue**, not a
+longer sleep — and a bounded backoff *once limited*: honour `retry-after`; honour
+`x-ratelimit-reset` when `x-ratelimit-remaining` is 0; otherwise **≥ 60 s**, doubling with jitter,
+bounded, then fail. `gh-rest` makes the calls cheaper; `gh-serial` stops them colliding and refuses
+to pretend a refusal was an empty answer.
+
+| Concern | Where it lives |
+|---|---|
+| one `gh` invocation at a time **per box** | `fcntl.flock` on `$GHS_STATE_DIR/gh.lock`, held across the request and **released during the wait** (a waiter must not serialise the sleep too) |
+| backoff order | `retry-after` → reset (when remaining is 0) → `max(60 s, base × 2^(n-1))` with jitter, `GHS_MAX_ATTEMPTS=4`, `GHS_MAX_WAIT=300 s` per call |
+| a refusal is never data | exhausted budget ⇒ stderr `RATE_LIMITED bucket=<core\|graphql> reset=<epoch> … THIS IS NOT EMPTY DATA` and **exit 75** (EX_TEMPFAIL). The bucket reaches the cycle through the caller's captured stderr (`.open-err`, `.pool-err`, the merge log); `$GHS_STATE_DIR/last-limit` is the durable record, printed by `gh-serial state` **with its age**, so a past limit cannot be reported as current |
+| a hung child or a wedged lock | `GHS_CALL_TIMEOUT` (120 s) kills a gh that never returns → exit 124, transport, not retried; a lock that cannot be acquired in `GHS_LOCK_TIMEOUT` → a named 75. Neither writes `last-limit` (that would blame quota for a stuck process) |
+| mutative pacing | ≥ 1 s between merge/edit/comment (`GHS_MUTATIVE_SPACING`) |
+| free polling | `ghs_rest <path>` sends `if-none-match`; a 304 replays the cached body **byte-exactly** and costs no primary quota (GraphQL has no ETag) |
+| a permission 403 is not a limit | it is replayed once, unchanged — never slept on, never retried (the #1762 lesson) |
+
+**Using it** (source the library once per script, then name the layer at every call site):
+
+```bash
+. "$O/gh-serial/lib.sh"                                  # or <harness dir>/gh-serial/lib.sh
+ghs_run -- gh pr list --repo "$OR" --state open           # serialised read (retried, bounded)
+ghs_mut -- gh pr merge "$PR" --repo "$OR" --squash       # mutating: also paced ≥ 1 s
+ghs_rest "repos/$OR/pulls?state=open" --jq '.[].number'   # conditional REST: a 304 is free
+```
+
+Wired today: `refresh-candidates.sh` (the queue + both listings — the `queue=UNREADABLE` symptom)
+and `orch-loop.sh` (the open-PR count and the merge/ready mutations — the `[scope] open=UNKNOWN`
+symptom). **NOT yet wired**: `merge-one.sh`, `fix-one.sh`, `lane.sh`, `chain-merge.sh` (and
+`orch-loop.sh`'s per-PR `gh pr view` / `gh pr checks` / `gh run rerun` reads) still call a bare `gh`,
+so those callers keep the old silent-failure shape until they are converted. The pre-flight probes
+(`gh auth token`, `gh api rate_limit`) stay **bare** on purpose: `refresh-candidates.sh`'s allowlist
+guard in `gh-serial.test.sh` pins that list, so a NEW bare `gh` call is a red check rather than a
+silent opt-out. The sweep keeps its own conditional listing and deferral (#1762); #1978's REST
+conversions go through `ghs_rest`/`ghs_run` without changing this layer.
+
+**Exit contract** — the distinction that makes a limited cycle legible:
+
+| exit | meaning |
+|---|---|
+| 0 | the call succeeded; stdout/stderr are `gh`'s own bytes |
+| 75 | bounded retries exhausted, or the single-flight lock timed out — **distinguishable, and never an empty success** |
+| 124 | a `gh` that did not return within `GHS_CALL_TIMEOUT` — a transport failure, not retried |
+| 64 | usage error |
+| 127 | no real `gh` on PATH, or the engine is missing (it refuses to fall back to an unserialised `gh`) |
+| other | `gh`'s own status, output replayed untouched (a permission 403, a 404, a network error) |
+
+**Verify it** (offline; stub `gh` + a sleep recorder, 59 assertions):
+
+```bash
+bash gh-serial.test.sh
+```
+
+It measures overlap rather than assuming it (two concurrent callers peak at **1** in flight, and a
+CONTROL proves the same two bare calls peak at **2**), asserts the exact backoff schedule through a
+recorder instead of waiting the 420 s it describes, and carries a pre-fix CONTROL in the three
+sections where a bare `gh` has a comparable behaviour (single-flight, 429-retry, secondary limit) so
+the test cannot green-wash those into the old shape.
+
 ### GitHub API surface — the REST adapter (`gh-rest`)
 
 The harness reaches GitHub through `gh`, whose hot paths (`pr view`, `pr checks`, `pr list`,
@@ -1555,6 +1633,7 @@ algorithmic advantage. The claim worth evaluating is *utilisation*, not *efficie
 | `test-claims.sh` | the PR **and issue** claim CAS against live origin from two scratch repos (`git init` + `remote add`, not clones; random keys per run so concurrent runs cannot collide). Not the cross-box proof (one machine), but red on a defeated CAS. Not part of the loop |
 | `claim-exclusion.test.sh` | **the measurement:** N processes released at a barrier against a real (bare) origin, per operation class, answering *does a duplicate holder get refused*. Prints the table §7.2d records; hermetic, a CI shard |
 | `gh-rest.test.sh` | the `gh` REST adapter's argv-to-argv **TRANSLATION**, offline against a stub `gh`: `pr list --head` must not widen to the newest open PR and `pr comment` must print a URL (both shipped green once, as P0s, when nothing asserted them). Hermetic, a CI shard |
+| `gh-serial.test.sh` | the **single-flight + bounded-backoff** layer (#1988), offline with a stub `gh` and a sleep recorder: concurrency is MEASURED (two callers peak at 1 in flight; a control proves the same two bare calls peak at 2), `retry-after: 1` is honoured then the call succeeds, the header-less secondary limit waits ≥ 60 s and doubles, the exhausted budget exits 75 with a NAMED bucket instead of an empty result, a permission 403 is never slept on, mutative calls are ≥ 1 s apart, a 304 replays the cached body byte-exactly, and a missing engine is a loud 127. Hermetic, a CI shard |
 | `test-crossbox.sh` | drives the real `merge-one.sh` claim acquire + trap release with `gh` stubbed. Not part of the loop |
 | `refresh-scout.test.sh` | the agent-infra#1736 contract — repo-aware scout provisioning, per-repo tool resolution, the permanent/transient refresh split — plus the agent-infra#1850 issue-claim pre-flight verdict table (CLEAN/COLLISION/INCOMPLETE/NOT PROVISIONABLE/unrecognised), the dispatch-side claim, and the fenced + generation-guarded release. Not part of the loop |
 | `check-port-drift.sh` | gates the tortoise-side removal: fails if the tortoise harness moved past the pinned sync point (`port-provenance.txt`). Not part of the loop |

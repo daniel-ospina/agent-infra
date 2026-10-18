@@ -500,7 +500,13 @@ fi
 # left behind (`rm -f`), and on success the (empty) file must be present — that difference is what
 # lets the reaper tell "the read failed" from "the answer is none". The pre-fix `|| : > "$O/.pr_brs"`
 # wrote an empty file in BOTH cases, which is the fail-open being fixed here. (agent-infra#1705)
-awk '/^if ! gh issue list --repo "\$OR"/{f=1} f{print} f&&/^fi$/{c++; if(c==2) exit}' "$REFRESH" > "$TMP/acq.sh"
+# The anchor tolerates the gh-serial layer being in front of the call (#1988): the capture's SHAPE is
+# what this case pins (a failed read leaves ABSENCE), not whether the layer wraps the gh invocation.
+{
+  echo "GHS_STATE_DIR=\"$TMP/acq-state\"; export GHS_STATE_DIR"
+  echo ". \"$HERE/gh-serial/lib.sh\""
+  awk '/^if ! (ghs_run -- )?gh issue list --repo "\$OR"/{f=1} f{print} f&&/^fi$/{c++; if(c==2) exit}' "$REFRESH"
+} > "$TMP/acq.sh"
 if need "$TMP/acq.sh" "the listing capture is extracted from the shipped refresh-candidates.sh"; then
   A="$TMP/acq"; mkdir -p "$A/fail" "$A/ok"
   cat > "$A/gh" <<'SH'
@@ -1237,7 +1243,14 @@ unset -f gh pi uv tmux 2>/dev/null || true   # an exported function would shadow
 sed -n '/^open_pr_count() {/,/^}/p' "$LOOP" > "$TMP/opencount.sh"
 if need "$TMP/opencount.sh" "open_pr_count() is extracted from the shipped orch-loop.sh"; then
   OC="$TMP/opencount"; mkdir -p "$OC/state"
-  { echo 'set -u'; grep -m1 '^is_num() {' "$LOOP"; cat "$TMP/opencount.sh"; echo 'open_pr_count'; } > "$OC/drive.sh"
+  { echo 'set -u'; grep -m1 '^is_num() {' "$LOOP"; cat "$TMP/opencount.sh";
+    # open_pr_count() now routes its listing through the gh-serial layer (#1988), so the driver must
+    # carry that layer too — otherwise every case would exercise `ghs_run: command not found` (rc
+    # 127) instead of the count logic. The stub `gh` above is still what the engine resolves from
+    # PATH, and the engine's own state (locks, last-mutative, etag cache) is kept inside the case.
+    echo "GHS_STATE_DIR=\"$OC/ghs-state\"; export GHS_STATE_DIR";
+    echo ". \"$HERE/gh-serial/lib.sh\"";
+    echo 'open_pr_count'; } > "$OC/drive.sh"
   # Driver must be non-vacuous: it parses and really defines the shipped function.
   bash -n "$OC/drive.sh" && rc=0 || rc=1
   ck "the open-PR-count driver parses" $rc
@@ -1466,6 +1479,13 @@ git -C "$HFIX" config user.email selftest@test.local
 git -C "$HFIX" config user.name selftest
 git -C "$HFIX" config commit.gpgsign false
 mkdir -p "$HFIX_H"; cp "$HERE"/*.sh "$HFIX_H/"
+# #1988: the gh single-flight/backoff layer is a SUBDIRECTORY, so `cp *.sh` cannot carry it — and
+# `start` REFUSES to seed a cell whose harness lacks it (undefined `ghs_run` ⇒ 127 on every wired read
+# ⇒ queue=UNREADABLE forever with `lanes: 0`). Copy it BEFORE the commit so the fixture tree stays
+# clean (the provenance gate refuses a dirty harness).
+mkdir -p "$HFIX_H/gh-serial"
+cp "$HERE/gh-serial/gh-serial" "$HERE/gh-serial/gh_serial.py" "$HERE/gh-serial/lib.sh" "$HFIX_H/gh-serial/"
+chmod +x "$HFIX_H/gh-serial/gh-serial"
 git -C "$HFIX" add -A; git -C "$HFIX" commit -q -m "selftest fixture harness"
 git -C "$HFIX" branch -M main
 git -C "$HFIX" update-ref refs/remotes/origin/main "$(git -C "$HFIX" rev-parse HEAD)"
@@ -1757,6 +1777,15 @@ git init -q "$KC/repo"
 # decided by the queue refusal rather than by the key probe it names.
 git -C "$KC/repo" remote add origin https://github.com/acme/widget.git
 cp "$HERE"/*.sh "$KC/harness/"; cp "$HERE"/*.sh "$KC/o/"
+# #1988: the gh single-flight/backoff layer is a SUBDIRECTORY, so `cp *.sh` cannot carry it, and
+# cmd_check REFUSES a cell whose $O lacks it (undefined `ghs_run` ⇒ 127 on every wired read ⇒
+# queue=UNREADABLE forever with `lanes: 0`). Every key verdict below runs through cmd_check, so it
+# must be present or each one is decided by that refusal instead.
+for d in "$KC/harness" "$KC/o"; do
+  mkdir -p "$d/gh-serial"
+  cp "$HERE/gh-serial/gh-serial" "$HERE/gh-serial/gh_serial.py" "$HERE/gh-serial/lib.sh" "$d/gh-serial/"
+  chmod +x "$d/gh-serial/gh-serial"
+done
 # Same fixture requirement as §16e: cmd_check also judges DISPATCH PROVISIONING (#1736), so the
 # repo must carry a pre-flight tool or the key verdicts below are never reached.
 mkdir -p "$KC/repo/tools"; : > "$KC/repo/tools/collision_preflight.py"

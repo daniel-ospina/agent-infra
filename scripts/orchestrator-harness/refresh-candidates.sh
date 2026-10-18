@@ -79,6 +79,24 @@ resolve_home --create \
   || echo "[refresh] WARN: neither \$HOME ('${HOME:-<unset>}') nor CELL_HOME ('$CELL_HOME') is a writable directory — the pre-flight's gh surfaces will be unreadable and its verdicts degraded"
 
 O="${O:-$HOME/orchestrator}"
+
+# ── gh calls go through the EXPLICIT single-flight/backoff layer (agent-infra#1988) ─────────────
+# Four boxes × N lanes hit ONE GitHub account, and GitHub's SECONDARY limit is triggered by
+# CONCURRENCY, not by quota: measured 2026-10-18 with core 2948/5000 and graphql 4605/5000 free,
+# every GraphQL call was refused with "API rate limit already exceeded". The remedy is a queue plus
+# bounded backoff, which `ghs_run` provides (see gh-serial/gh_serial.py).
+# ⛔ NOT a PATH shim: `gh` itself is never substituted — the call sites below name the layer, so
+# every serialised call is greppable and a NEW bare `gh` call is visible as an omission.
+_GHS_LIB=""
+for _c in "${GHS_LIB:-}" "$O/gh-serial/lib.sh" "$(dirname "$0")/gh-serial/lib.sh"; do
+  [ -n "$_c" ] && [ -f "$_c" ] && { _GHS_LIB="$_c"; break; }
+done
+if [ -n "$_GHS_LIB" ]; then
+  # shellcheck source=/dev/null
+  . "$_GHS_LIB"
+else
+  echo "[refresh] WARN: gh-serial/lib.sh not found (looked in \$GHS_LIB, $O/gh-serial, $(dirname "$0")/gh-serial) — the layer's functions are UNDEFINED, so every wrapped gh read below FAILS (127) and the backlog becomes UNREADABLE; this is NOT a graceful degradation. Re-run install.sh (Mac) or re-seed $O (cell)." >&2
+fi
 # ⛔ APPEND, never PREPEND. These two directories are where launchd's minimal environment finds the
 # harness's tools, so they must stay on PATH — but hard-prepending them silently OUTRANKED the
 # caller's own PATH: a caller that put a pinned/stub `uv` first (the regression suite, or an
@@ -561,11 +579,11 @@ git fetch origin --quiet 2>/dev/null || true
 # list only when the listing SUCCEEDS and DELETE it when it fails, so "the read failed" (ABSENT) is
 # distinguishable from "the answer is none" (PRESENT but EMPTY). The reaper refuses the whole pass
 # unless both are present; a genuinely empty list is still a valid answer and still reaps.
-if ! gh issue list --repo "$OR" --state open --limit 500 --json number --jq '.[].number' > "$O/.open_iss" 2>/dev/null; then
+if ! ghs_run -- gh issue list --repo "$OR" --state open --limit 500 --json number --jq '.[].number' > "$O/.open_iss" 2>/dev/null; then
   rm -f "$O/.open_iss"
   echo "[refresh] WARN: open-issue listing FAILED — reaping pass will be skipped (an unreadable listing is not an empty one)"
 fi
-if ! gh pr list --repo "$OR" --state all --limit 500 --json headRefName --jq '.[].headRefName' > "$O/.pr_brs" 2>/dev/null; then
+if ! ghs_run -- gh pr list --repo "$OR" --state all --limit 500 --json headRefName --jq '.[].headRefName' > "$O/.pr_brs" 2>/dev/null; then
   rm -f "$O/.pr_brs"
   echo "[refresh] WARN: PR listing FAILED — reaping pass will be skipped (an unreadable listing is not an empty one)"
 fi
@@ -653,13 +671,13 @@ touch "$O/checked.txt" "$O/candidates.txt"
 # PARTIAL can NAME the tiers that were read instead of only the ones that failed.
 rm -f "$O/.pool-err" "$O/.pool-read"
 {
-  if gh issue list --repo "$OR" --state open --limit 300 --label P0-blocker --json number,assignees,title \
+  if ghs_run -- gh issue list --repo "$OR" --state open --limit 300 --label P0-blocker --json number,assignees,title \
     --jq '.[]|select((.assignees|length)==0)|select(.title|test("^(epic|lane|OWNER DECISION|decision|analysis|investigation)";"i")|not)|"0 \(.number)"' 2>>"$O/.pool-err"; then echo "P0-blocker" >> "$O/.pool-read"
   else echo "P0-blocker" >> "$O/.pool-err"; fi
-  if gh issue list --repo "$OR" --state open --limit 200 --label P1-severe --json number,assignees,title \
+  if ghs_run -- gh issue list --repo "$OR" --state open --limit 200 --label P1-severe --json number,assignees,title \
     --jq '.[]|select((.assignees|length)==0)|select(.title|test("^(epic|OWNER DECISION)";"i")|not)|"1 \(.number)"' 2>>"$O/.pool-err"; then echo "P1-severe" >> "$O/.pool-read"
   else echo "P1-severe" >> "$O/.pool-err"; fi
-  if gh issue list --repo "$OR" --state open --limit 200 --label P2-moderate --json number,assignees,title \
+  if ghs_run -- gh issue list --repo "$OR" --state open --limit 200 --label P2-moderate --json number,assignees,title \
     --jq '.[]|select((.assignees|length)==0)|select(.title|test("^(epic|OWNER DECISION)";"i")|not)|"2 \(.number)"' 2>>"$O/.pool-err"; then echo "P2-moderate" >> "$O/.pool-read"
   else echo "P2-moderate" >> "$O/.pool-err"; fi
 } | sort -k1,1n -k2,2n | awk '!seen[$2]++ {print $2}' > "$O/.pool"
