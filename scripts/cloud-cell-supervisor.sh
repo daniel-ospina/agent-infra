@@ -1067,8 +1067,11 @@ cmd_check() {
   #   pi      → the worker runtime (lane.sh, fix-one.sh, merge-one.sh). Absent, every review and
   #             every fixer fails 127 and the cell produces nothing.
   # All three are fatal HERE because a cell invokes each directly (above). Parity with install.sh is
-  # true for `pi` only: install.sh's fatal gate is `for bin in tmux gh pi` (install.sh:84), and it
-  # never probes git or python3. The requirement is this script's own, not a mirrored one.
+  # PARTIAL, and the difference is deliberate: install.sh's fatal gate is `for bin in tmux gh pi jq`
+  # (install.sh:136), and it never probes git or python3. (jq joined that gate with #1962 — every
+  # listing is assembled with it, so a box without it reports UNREADABLE forever; the cell's own
+  # toolchain gate names it too, cloud-cell-bringup.sh check_tools.) The requirement here is this
+  # script's own, not a mirrored one.
   local dep
   for dep in git python3 pi; do
     command -v "$dep" >/dev/null 2>&1 || die "$dep missing on PATH — the loop invokes it (harness README §3)"

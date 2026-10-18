@@ -379,6 +379,26 @@ cmd_check() {
   fi
   echo "[refresh] check: repo=$REPO"
   echo "[refresh] check: pre-flight tool=$PREFLIGHT"
+  # ⛔ jq IS A PREREQUISITE OF THE LISTING READ (#1962 review). The listings run on the REST bucket and
+  # `rest_list` assembles and projects pages with jq; without it the helper REFUSES rather than answer
+  # from a partial read, so every pass would report `queue=UNREADABLE` and the cell would be MERGE-ONLY
+  # — the exact shape this check exists to refuse. Probed BEFORE "CHECK OK", because a verdict printed
+  # after the certification is not a verdict, and `cloud-cell-bringup.sh` refuses to start a cell on
+  # NOT PROVISIONABLE. install.sh probes jq on a new box for the same reason.
+  # ⛔ PROBED BY EXECUTION, NOT BY PRESENCE (#1962 review, MEASURED). `command -v jq` answers "is a
+  # file named jq on PATH" — a DIFFERENT question from "can it run", and the message below claims the
+  # second. A jq that RESOLVES but cannot execute passes it: a shim whose tool is missing (this box
+  # resolves `gh` through ~/.pi/agent/shims and install.sh probes daemons by RUNNING them for exactly
+  # that 127), a wrong-architecture or corrupted binary. Measured with `jq` = `#!/bin/bash; exit 1`:
+  # `--check` printed `CHECK OK` rc=0, and the helper then refused every page — the certified box that
+  # reads `queue=UNREADABLE` for ever, which is the state this check exists to refuse. `py_satisfies_min`
+  # above probes its interpreter the same way, for the same reason.
+  jq --version >/dev/null 2>&1 \
+    || { echo "[refresh] check: FAIL 'jq' does not RUN on this box (absent, or present and failing) — every listing is assembled with it"
+         echo "[refresh] NOT PROVISIONABLE: the REST listings cannot be read without a WORKING jq, so a cell on this box would report queue=UNREADABLE and MERGE ONLY (#1962)"
+         echo "[refresh]   fix: install jq (apt-get install -y jq), or put a working jq on PATH"
+         return "$EXIT_NOT_PROVISIONABLE"; }
+  echo "[refresh] check: jq=$(command -v jq)"
   # ── the CROSS-BOX CLAIM REGISTRY, judged LOCALLY (agent-infra#1850 review, 2026-10-16) ──────
   # The refresh refuses every issue when `$O/claims.sh` exists but predates the issue-claim reader,
   # and that state is permanent and local — so a cell in it queues NOTHING forever. Catching it HERE
@@ -547,6 +567,275 @@ if ! py_satisfies_min "$PY"; then
 fi
 git fetch origin --quiet 2>/dev/null || true
 
+# ── THE LISTINGS RUN ON THE REST BUCKET, NOT GraphQL (agent-infra#1962 / #1959) ────────────────
+# MEASURED 2026-10-17 on all three cloud cells, for hours:
+#     [refresh]   GraphQL: API rate limit already exceeded for user ID 81560491.
+#     [refresh] queue=UNREADABLE …            candidates.txt: 0 lines
+# `gh issue list` / `gh pr list` are GraphQL, and those five calls above were the whole of this
+# script's GraphQL LISTING traffic. When GitHub refused them the pass could not READ the board at all:
+# every priority tier FAILED, it aborted `queue=UNREADABLE`, and the backlog stayed at 0 on every
+# cell. "Transient — retried next cycle" was false, and `candidates.txt: 0` did not mean "no work" —
+# it meant "the reader was starved". That is the defect this block removes.
+# TWO mechanisms produce that refusal on this account, and the fix does not depend on which one:
+#   1. REAL EXHAUSTION — one account (`daniel-ospina`, user 81560491) shared by the Mac and every
+#      cell, one GraphQL bucket. Polling less would help.
+#   2. A CACHED `RATE_LIMIT` BODY (agent-infra#1968) — GitHub answers a GraphQL rate limit with HTTP
+#      200 + `errors[type:RATE_LIMIT]`, and gh caches that body as introspection for 24 h. Measured on
+#      this account: every GraphQL call refused while `/rate_limit` reported ~4500/5000 remaining and
+#      the cached entry's `X-Ratelimit-Reset` was hours IN THE PAST. Polling less does NOT help, and
+#      "budget exhausted" is the wrong diagnosis. The tell is that past reset (or `used: 5000` inside
+#      a refusal while `remaining` reads healthy).
+# REST is a SEPARATE bucket (`gh api rate_limit` reports `core` and `graphql` independently), so the
+# listings below are `gh api` — REST — and they cost the GraphQL budget NOTHING. That is what makes
+# refusals like the two above stop mattering to the READ.
+#
+# ⛔ WHAT THIS DOES NOT FIX — stated because the difference decides what an operator does next. Only
+# the LISTINGS moved. The per-candidate pre-flight (`tools/collision_preflight.py`) still reads
+# `gh issue view` (issue state, assignee) and `gh pr list --state open`, and it is fail-closed: a
+# BLOCKING surface it cannot query makes the run INCOMPLETE, which this pass refuses to queue. On
+# these cells that is visible in the loop log — `?#N INCOMPLETE from the pre-flight (it could not
+# query every surface) — not a verdict, left unchecked`. So on a box where GraphQL is refused and
+# the `gh-rest` adapter is NOT on PATH, this change turns "the pool could not be READ" into "the pool
+# was read and the pre-flight could not CERTIFY" — a named, later failure, not dispatch. Restoring
+# dispatch there is the adapter's job (#1959/#1962, which is why it must be deployed on the cells) or
+# the tool's own (it lives in the tortoise repo).
+#
+# ⛔ WHY NOT `$O/gh-rest` HERE. That adapter translates the same commands correctly, but it is a
+# DAEMON-PATH concern, and a fail-closed read may not depend on something whose ABSENCE is silent:
+# measured the same day on pi-cell-2, `/tmp/cell-home/orchestrator/gh-rest/` DOES NOT EXIST, and
+# install.sh treats a missing adapter as a WARNING (`install.sh:380`) rather than a failure — so a
+# refresh wired to it would have gone on spending GraphQL on every cell while reading as fixed. `gh api`
+# is core gh, present exactly where `gh` is, which the provisioning check above requires.
+#
+# ⛔ FAILURE SEMANTICS ARE UNCHANGED, AND THAT IS THE POINT. These listings are load-bearing: an EMPTY
+# `.open_iss`/`.pr_brs` written on a FAILED read un-blacklists issues that already HAVE a PR (#1705),
+# and a silently short pool inverts the P0-before-P2 order (#8465). So a failed page or a failed
+# projection returns NON-ZERO — the caller then DELETES the file rather than writing an empty one —
+# and only "every page was read and the projection succeeded" is a success.
+#
+# ⛔ `--paginate` IS DELIBERATELY NOT USED. REST caps `per_page` at 100 and `gh api --paginate`
+# follows every page to the end of the collection regardless of any limit, so a 500-limit query
+# against a large repo would fetch thousands of rows — spending the shared core budget to produce
+# rows nobody reads. `rest_list` reads `ceil(limit/100)` pages and stops at the limit, so each
+# original limit stays a REAL total, not a first-page count.
+LISTS_NOTED=""
+lists_transport_note() {  # once per pass: which transport the LISTINGS use, and the bucket state
+  [ -n "$LISTS_NOTED" ] && return 0
+  LISTS_NOTED=1
+  local probe gq co
+  if probe="$(gh api rate_limit 2>/dev/null)" && [ -n "$probe" ]; then
+    gq="$(printf '%s' "$probe" | jq -r '.resources.graphql.remaining // "?"' 2>/dev/null)"
+    co="$(printf '%s' "$probe" | jq -r '.resources.core.remaining // "?"' 2>/dev/null)"
+    echo "[refresh] listings transport=REST — GraphQL remaining=${gq:-?} AS REPORTED (a cached RATE_LIMIT body can refuse every call while this reads healthy, #1968), REST core remaining=${co:-?}: the listings below are REST; the per-candidate pre-flight still asks gh issue view / gh pr list (GraphQL) unless the gh-rest adapter is on PATH"
+  else
+    echo "[refresh] listings transport=REST — the rate_limit probe did not answer, so the bucket state is UNKNOWN here; the listings below still run on REST"
+  fi
+}
+
+# rest_fail <kind> <page> <stderr-file> — ONE line the caller prefixes. It separates "starved" from
+# "broken", and it does NOT call every 403 a rate limit.
+rest_fail() {
+  local kind="$1" page="$2" errf="$3" msg core status
+  msg="$(tr '\n' ' ' < "$errf" 2>/dev/null | tr -s ' ' | cut -c1-240)"
+  case "$msg" in
+    *"rate limit"*|*"Rate limit"*|*"API rate limit"*)
+      core="$(gh api rate_limit 2>/dev/null | jq -r '.resources.core.remaining // "unknown"' 2>/dev/null)"
+      # ⛔ THE STATUS IS READ FROM THE PROVIDER'S OWN MESSAGE, NEVER ASSUMED. GitHub answers a rate
+      # limit with 403 AND with 429 (secondary limits), so a hardcoded "HTTP 403" would mislabel the
+      # one case where the provider's text is the only evidence there is — and dropping that text is
+      # the same "naming the wrong cause closes the investigation" failure the 403 branch below is
+      # written to avoid. `gh` prints the status in the same message ("… (HTTP 429)").
+      # ⛔ FROM `$errf`, NOT FROM `$msg`: `msg` is cut to 240 chars for the one-line log, and a
+      # SECONDARY-limit body carries a variable-length request-ID/timestamp tail, so the "(HTTP 429)"
+      # that identifies the case can be exactly what the truncation removes (measured with a 250-byte
+      # body: the log read `HTTP ?` and the message stopped mid-parenthesis).
+      status="$(tr '\n' ' ' < "$errf" 2>/dev/null | sed -n 's/.*(HTTP \([0-9][0-9]*\)).*/\1/p')"
+      echo "REST $kind listing FAILED — the REST bucket refused it as RATE-LIMITED (HTTP ${status:-?}, core remaining=${core:-unknown}): $msg; this is NOT an empty listing" >&2 ;;
+    # ⛔ A 403 IS NOT NECESSARILY A RATE LIMIT. `gh api` answers a PERMISSION refusal with a 403 too
+    # ("Resource not accessible by integration"), and naming the wrong cause closes the investigation
+    # — worse than naming none. The provider's own words are carried through, and both causes named.
+    *403*)
+      core="$(gh api rate_limit 2>/dev/null | jq -r '.resources.core.remaining // "unknown"' 2>/dev/null)"
+      echo "REST $kind listing FAILED — HTTP 403 with no rate-limit wording (core remaining=${core:-unknown}): a permission refusal OR an unnamed rate limit — $msg" >&2 ;;
+    *)
+      echo "REST $kind listing FAILED (page $page): ${msg:-gh api exited non-zero and said nothing}" >&2 ;;
+  esac
+}
+
+# rest_list <issues|pulls> [--repo R] [--state S] [--limit N] [--label L] [--jq PROG]
+#   The REST twin of the two `gh … list` forms this script uses. Prints the projected rows, one per
+#   line. rc 0 ONLY when every page was read AND the projection succeeded — the one property every
+#   caller below depends on. `--json` is NOT modelled on purpose: the caller's `--jq` names the
+#   fields it reads, and dropping a field an adapter does not model is the wrong-answer shape
+#   gh-rest's own header warns about. Messages go to stderr UNPREFIXED — the callers own the
+#   `[refresh]` tag (they both re-prefix what they collect, so a helper-side tag doubles it).
+rest_list() {
+  local kind="${1:-}"; [ $# -gt 0 ] && shift
+  local repo="$OR" state="open" limit=30 label="" prog='.' ep q page=1 pages n tmp pf status more
+  if [ -z "$kind" ]; then
+    echo "REST: rest_list needs a listing kind (issues|pulls)" >&2; return 1
+  fi
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --repo|--state|--limit|--label|--jq)
+        # ⛔ A FLAG WITH NO VALUE IS A BROKEN CALL, NOT A DEFAULT. `shift 2` past the end does not
+        # shift AT ALL in bash (measured: `set -- a; shift 2` → argc 1, rc 1), so the bare form spun
+        # in this loop for ever — and this pass runs BACKGROUNDED, where a hang is invisible: the
+        # controller reports RUNNING and the backlog never refreshes.
+        [ $# -ge 2 ] || { echo "REST: listing flag '$1' needs a value" >&2; return 1; }
+        case "$1" in
+          --repo)  repo="$2" ;;
+          --state) state="$2" ;;
+          --limit) limit="$2" ;;
+          --label) label="$2" ;;
+          --jq)    prog="$2" ;;
+        esac
+        shift 2 ;;
+      # ⛔ AN UNMODELLED FLAG IS AN ERROR, NOT A DROP: silently ignoring one turns a narrow query into
+      # an unbounded one, which is how a priority tier silently becomes "every issue" (#8465).
+      *) echo "REST: unsupported listing flag '$1' — refusing to answer a question this helper does not model" >&2; return 1 ;;
+    esac
+  done
+  case "$kind" in
+    issues) ep="repos/$repo/issues" ;;
+    pulls)  ep="repos/$repo/pulls" ;;
+    *) echo "REST: unknown listing kind '$kind'" >&2; return 1 ;;
+  esac
+  command -v jq >/dev/null 2>&1 || {
+    echo "REST: jq is required to assemble a paginated $kind listing and is not on PATH — refusing to answer from a partial read" >&2
+    return 1; }
+  q="state=$state&per_page=100"
+  # ⛔ THE LABEL IS URL-ENCODED. An unencoded space or `&` truncates the query and the tier then reads
+  # as EMPTY — "no work" — which is the #8465 priority inversion through another door.
+  [ -n "$label" ] && q="$q&labels=$(printf '%s' "$label" | jq -Rr @uri)"
+  case "$limit" in
+    ''|*[!0-9]*)
+      echo "REST: --limit '$limit' is not a number — refusing to page an unbounded $kind listing" >&2
+      return 1 ;;
+  esac
+  pages=$(( (limit + 99) / 100 )); [ "$pages" -ge 1 ] || pages=1
+  tmp="$(mktemp -d "${TMPDIR:-/tmp}/refresh-rest.XXXXXX")" || {
+    echo "REST: cannot create a temp dir for the $kind listing" >&2; return 1; }
+  while [ "$page" -le "$pages" ]; do
+    # ⛔ ZERO-PADDED, because the final jq is handed a GLOB and plain `p*.json` sorts `p10` BEFORE `p2`
+    # — pages then concatenate out of order, and `.[0:$limit]` truncates the wrong rows once a listing
+    # needs more than nine pages.
+    printf -v pf '%s/p%03d' "$tmp" "$page"
+    if ! gh api -i "$ep?$q&page=$page" > "$pf.raw" 2>"$pf.err"; then
+      rest_fail "$kind" "$page" "$pf.err"
+      rm -rf "$tmp"; return 1
+    fi
+    # `-i` prepends the response headers; the body is everything after the first blank line. The
+    # separator is found by LENGTH rather than by matching `/^\r?$/`. The choice is PORTABILITY, not
+    # a workaround: `\r` inside an ERE is a backslash before an ordinary character, which POSIX leaves
+    # undefined, so a match on it would be a property of the awk build rather than of the response.
+    # `length($0) <= 1` asks the question the header format actually answers — "is this line blank, or
+    # a bare CR?" — and needs no escape at all. MEASURED, both forms on both awks this fleet runs, and
+    # they agree: macOS awk 20200816 here and mawk 1.3.4 20240123 on pi-cell-2 (the cell's only awk)
+    # each return the identical body from `A`/CR/CR/`B` input, and `/^\r?$/` matches the bare-CR line
+    # on both (1 match) while `/^r?$/` matches none (0). So no build is known to fail this; the line
+    # is written to not depend on the answer.
+    # If a split ever did fail, the consequence is a REFUSAL, never a quiet undercount: the body comes
+    # back empty, and an empty body on a 200 hits the empty-body guard below (only 204/304 may be
+    # empty) and the page is refused — it cannot truncate a listing at rc 0.
+    awk 'b { print } !b && length($0) <= 1 { b = 1 }' "$pf.raw" > "$pf.json"
+    # ⛔ THE LINK HEADER IS THE PROVIDER'S OWN STATEMENT about whether another page exists, and it is
+    # the only reliable way to separate "the collection ended exactly on a page boundary" (a
+    # legitimate empty next page — 100 open issues against a 500 limit) from "the body vanished" (a
+    # truncated listing that would otherwise come back rc 0). Row counts alone cannot tell them apart.
+    more="$(grep -ci '^link:.*rel="next"' "$pf.raw" 2>/dev/null)"
+    case "$(jq -r 'type' < "$pf.json" 2>/dev/null)" in
+      array) n="$(jq 'length' < "$pf.json" 2>/dev/null)" ;;
+      *)     n="" ;;   # `null` has length 0 — an array TYPE is required, not a numeric length
+    esac
+    # ⛔ THE STATUS LINE DECIDES WHETHER AN EMPTY BODY IS AN ANSWER. Real `gh api -i` answers an
+    # empty collection with headers + `[]`; a 0-byte body on a 200 is a body that VANISHED in transit,
+    # and reading it as "no rows" writes an EMPTY `.pr_brs` at rc 0 — the #1705 trigger this block
+    # exists to shut (an empty branch list makes `has_pr` false for every issue). Only 204/304 carry
+    # no body by definition, so only they may be read as an empty answer.
+    status="$(awk 'NR==1{print $2}' "$pf.raw" 2>/dev/null)"
+    if [ -z "$n" ] && [ ! -s "$pf.json" ]; then
+      case "$status" in
+        204|304) n=0 ;;
+      esac
+    fi
+    case "$n" in
+      ''|*[!0-9]*)
+        if [ ! -s "$pf.json" ]; then
+          echo "REST: the $kind listing page $page answered HTTP ${status:-?} with an EMPTY body — a 0-byte body is 'no rows' only when the status says 204; refusing to read it as an empty listing" >&2
+        else
+          echo "REST: the $kind listing page $page did not answer with a JSON array — refusing to read it as an empty page" >&2
+        fi
+        rm -rf "$tmp"; return 1 ;;
+    esac
+    if [ "$n" -eq 0 ] && [ "${more:-0}" -ge 1 ]; then
+      echo "REST: the $kind listing page $page answered with 0 rows although the LINK header still advertises a next page — a vanished page is not the end of the collection" >&2
+      rm -rf "$tmp"; return 1
+    fi
+    # ⛔ A SHORT PAGE THAT STILL ADVERTISES A NEXT PAGE IS NOT THE END OF THE COLLECTION EITHER. GitHub
+    # returns exactly `per_page` rows on every page but the last, so `rel="next"` together with FEWER
+    # rows means the page was filtered or stripped — and returning it at rc 0 is a truncated listing: a
+    # short `.pr_brs` un-blacklists issues that already have a PR (#1705).
+    # ⛔ THE EXEMPTION IS A FILLED WINDOW, NOT A PAGE POSITION. `page < pages` is FALSE on the last
+    # page of every multi-page window, so gating on it would return 440 rows at rc 0 for `--limit 500`
+    # with 100 rows on pages 1-4 and 40 on page 5, while page 5 still advertised a next page. The
+    # question is not where the page sits but whether the caller's window was FILLED: `want` rows are still missing after this page, so a short page that
+    # has more behind it is a truncation — while `--limit 10` against a 40-row page is not (40 >= 10:
+    # the window is full, and the next page is one the caller never asked for).
+    want=$(( limit - 100 * (page - 1) ))
+    if [ "${more:-0}" -ge 1 ] && [ "$n" -lt 100 ] && [ "$n" -lt "$want" ]; then
+      echo "REST: the $kind listing page $page returned only $n rows although the LINK header advertises a next page — a short page is not a complete listing" >&2
+      rm -rf "$tmp"; return 1
+    fi
+    if [ "$n" -lt 100 ] || [ "$page" -ge "$pages" ]; then break; fi   # short page, or the window is reached
+    page=$((page + 1))
+  done
+  # ⛔ /issues RETURNS PULL REQUESTS TOO. Left in, a labelled PR becomes a DISPATCH CANDIDATE: the tier
+  # programs below only require "no assignee and a non-epic title", so it would be queued as
+  # `0 <PR#>`, land in `dispatched.txt`, and get a lane spawned for a PR number the pass never
+  # adjudicated as an issue. The REAPER is exposed to the same rows for an unrelated reason —
+  # `has_pr` (below) keys on PR head-BRANCH names, not on numbers, so a PR row whose branch does not
+  # embed its own number is un-blacklisted exactly like an issue. Issues and PRs share ONE number
+  # space per repo, and that is precisely why these rows have to be dropped HERE: nothing downstream
+  # can tell a PR row from an issue row.
+  # Dropped for `kind=issues` ONLY: `.pr_brs` is kind=pulls and the #1705 `has_pr` check needs those
+  # rows. Dropped here ONCE FOR THIS FILE (the gh-rest adapter drops the same rows, `gh-rest/gh:157`;
+  # that twin is why BOTH surfaces must be changed together if the rule ever moves). ⛔ `--limit` IS A RAW-ROW BUDGET AND THE PROJECTED TOTAL IS SMALLER — stated with the
+  # measurement, because a comment that lies about the window is worse than none: the page budget is
+  # `ceil(limit/100)` RAW rows (the loop above), and PRs are dropped only here, so a 500 window
+  # returns 500 minus however many pull requests were inside it. Driven against the real API:
+  # tortoise `--limit 500` -> 485 rows, agent-infra -> 454, where the pre-change listing returned 500
+  # (it excludes pull requests by definition).
+  # ⛔ WHAT THAT COSTS, said plainly rather than softened: the endpoint's default order is created
+  # DESCENDING (verified against the live API: a 500 read returned 1993 -> 961), so the window keeps
+  # the NEWEST rows and an issue pushed out of it does not come back on the next pass — it moves
+  # further out as the board grows. That is the opposite end from the one the pool prefers
+  # (`sort -k1,1n -k2,2n` at the tier ranking is OLDEST-FIRST), so a repo with more than 500 open
+  # issues would lose its oldest ones from `.open_iss` permanently.
+  # Accepted for `.open_iss` because that loss only NARROWS: fewer issues are visible to the reaper,
+  # so fewer un-blacklists (never more). `.pr_brs` (kind=pulls) is unfiltered, so the #1705 `has_pr`
+  # check is unaffected.
+  # ⛔ THE TIER WINDOWS HAVE THE SAME SHAPE AND THAT ARGUMENT DOES NOT COVER THEM. They carry
+  # `labels=`, so each window is one labelled subset rather than the whole backlog — but it is still a
+  # created-DESC window, so a tier with more open labelled issues than its bound puts the OLDEST ones
+  # permanently outside `.pool`, and `.pool` is ranked OLDEST-FIRST. Measured 2026-10-17: open
+  # `P2-moderate` is 430 on agent-infra against the 200 bound below, so that tier IS over its window.
+  # The BOUNDS are unchanged from the GraphQL form (`gh issue list --label … --limit 300/200/200` had
+  # the same three windows), so this change neither introduces nor widens the truncation — it is
+  # stated here because the paragraph above would otherwise read as "the tiers are complete".
+  # The alternative — fetching `limit` PROJECTED rows — means paging past the budget on the shared
+  # core bucket this change exists to protect. The gh-rest adapter makes exactly that trade the other
+  # way (`gh-rest/gh:229,238` page the whole collection, then `:157` drops PR rows and `:158` slices
+  # the projection), so the two surfaces differ deliberately: the adapter bounds its OUTPUT, this
+  # helper bounds its SPEND.
+  jq -r -s --arg kind "$kind" --argjson limit "$limit" \
+     'add // [] | (if $kind == "issues" then map(select(has("pull_request") | not)) else . end) | .[0:$limit] | '"$prog" \
+     "$tmp"/p*.json
+  n=$?
+  rm -rf "$tmp"
+  return "$n"
+}
+
 # ── reap stale dispatch bookkeeping ────────────────────────────────────────────
 # `dispatched.txt` is append-only: an issue is recorded as handled the first time it is handed
 # to a lane, and nothing re-checks whether that dispatch DELIVERED. A lane that dies (reboot,
@@ -561,14 +850,18 @@ git fetch origin --quiet 2>/dev/null || true
 # list only when the listing SUCCEEDS and DELETE it when it fails, so "the read failed" (ABSENT) is
 # distinguishable from "the answer is none" (PRESENT but EMPTY). The reaper refuses the whole pass
 # unless both are present; a genuinely empty list is still a valid answer and still reaps.
-if ! gh issue list --repo "$OR" --state open --limit 500 --json number --jq '.[].number' > "$O/.open_iss" 2>/dev/null; then
+lists_transport_note
+if ! rest_list issues --repo "$OR" --state open --limit 500 --jq '.[].number' > "$O/.open_iss" 2>"$O/.list-err"; then
   rm -f "$O/.open_iss"
   echo "[refresh] WARN: open-issue listing FAILED — reaping pass will be skipped (an unreadable listing is not an empty one)"
+  [ -s "$O/.list-err" ] && sed -n '1,2p' "$O/.list-err" | sed 's/^/[refresh]   /'
 fi
-if ! gh pr list --repo "$OR" --state all --limit 500 --json headRefName --jq '.[].headRefName' > "$O/.pr_brs" 2>/dev/null; then
+if ! rest_list pulls --repo "$OR" --state all --limit 500 --jq '.[]|.head.ref' > "$O/.pr_brs" 2>"$O/.list-err"; then
   rm -f "$O/.pr_brs"
   echo "[refresh] WARN: PR listing FAILED — reaping pass will be skipped (an unreadable listing is not an empty one)"
+  [ -s "$O/.list-err" ] && sed -n '1,2p' "$O/.list-err" | sed 's/^/[refresh]   /'
 fi
+rm -f "$O/.list-err"
 # ⛔ The reap pass REWRITES state (`dispatched.txt`, `checked.txt`) and its status used to be
 # discarded, so a failure there left a half-written blacklist or a stale suppression and the pass
 # carried on reporting success. Its status is read IMMEDIATELY below — and the invocation line stays
@@ -653,13 +946,13 @@ touch "$O/checked.txt" "$O/candidates.txt"
 # PARTIAL can NAME the tiers that were read instead of only the ones that failed.
 rm -f "$O/.pool-err" "$O/.pool-read"
 {
-  if gh issue list --repo "$OR" --state open --limit 300 --label P0-blocker --json number,assignees,title \
+  if rest_list issues --repo "$OR" --state open --limit 300 --label P0-blocker \
     --jq '.[]|select((.assignees|length)==0)|select(.title|test("^(epic|lane|OWNER DECISION|decision|analysis|investigation)";"i")|not)|"0 \(.number)"' 2>>"$O/.pool-err"; then echo "P0-blocker" >> "$O/.pool-read"
   else echo "P0-blocker" >> "$O/.pool-err"; fi
-  if gh issue list --repo "$OR" --state open --limit 200 --label P1-severe --json number,assignees,title \
+  if rest_list issues --repo "$OR" --state open --limit 200 --label P1-severe \
     --jq '.[]|select((.assignees|length)==0)|select(.title|test("^(epic|OWNER DECISION)";"i")|not)|"1 \(.number)"' 2>>"$O/.pool-err"; then echo "P1-severe" >> "$O/.pool-read"
   else echo "P1-severe" >> "$O/.pool-err"; fi
-  if gh issue list --repo "$OR" --state open --limit 200 --label P2-moderate --json number,assignees,title \
+  if rest_list issues --repo "$OR" --state open --limit 200 --label P2-moderate \
     --jq '.[]|select((.assignees|length)==0)|select(.title|test("^(epic|OWNER DECISION)";"i")|not)|"2 \(.number)"' 2>>"$O/.pool-err"; then echo "P2-moderate" >> "$O/.pool-read"
   else echo "P2-moderate" >> "$O/.pool-err"; fi
 } | sort -k1,1n -k2,2n | awk '!seen[$2]++ {print $2}' > "$O/.pool"

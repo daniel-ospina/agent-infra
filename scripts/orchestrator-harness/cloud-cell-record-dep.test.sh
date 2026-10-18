@@ -107,7 +107,12 @@ SH
   # python3/pi stay `exit 0` stubs: nothing below reads their OUTPUT, only their presence, and §4
   # removes each in turn to pin the "missing on PATH" refusal.
   p="$(command -v git 2>/dev/null)" && ln -sf "$p" "$d/git"
-  for b in python3 pi; do printf '#!/bin/bash\nexit 0\n' > "$d/$b"; chmod +x "$d/$b"; done
+  # jq joined the toolchain with agent-infra#1962: `refresh-candidates.sh --check` now REFUSES to
+  # certify a box without it (every REST listing is assembled with it, so a jq-less cell would read
+  # `queue=UNREADABLE` for ever). It is a PRESENCE probe on this path — `--check` runs no listing, so
+  # a stub cannot mask a read here, and it keeps the fixture host-independent: without it every
+  # "a complete cell is certified" assertion below fails on any host whose PATH this suite replaced.
+  for b in python3 pi jq; do printf '#!/bin/bash\nexit 0\n' > "$d/$b"; chmod +x "$d/$b"; done
   return 0
 }
 
