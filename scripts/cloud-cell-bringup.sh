@@ -232,7 +232,12 @@ setup_home() {
 # ── toolchain — all preinstalled, but verify rather than assume ──────────────────
 check_tools() {
   local missing=""
-  for c in git gh node python3 uv tmux; do
+  # ⛔ jq IS A RUNTIME DEPENDENCY OF THE HARNESS ITSELF since the listings moved to REST (#1962):
+  # `rest_list` assembles and projects every page with the jq BINARY (until then every harness jq use
+  # was the CLI's own --jq, so jq need not have been installed). A cell without it is certified here
+  # and then reports `queue=UNREADABLE` on every refresh — merge-only — which `check_dispatch` catches
+  # one step later; catching it in the toolchain step keeps the diagnostic where the operator looks.
+  for c in git gh node python3 uv tmux jq; do
     command -v "$c" >/dev/null 2>&1 || missing="$missing $c"
   done
   [ -z "$missing" ] || die "missing required tools:$missing"
