@@ -856,11 +856,24 @@ def check_queue_readable(f, c):
     # ⛔ THE AUTHORITATIVE TOKEN, not merely the newest header's: see `authoritative_queue_token`.
     tok, raw_tok, tok_src = authoritative_queue_token(f, hdr)
     state_txt = _queue_state_file_txt(f)
+    # ⛔ A FAILED READ OF THE RECORD MAY NOT BE GRADED GREEN THROUGH THE HEADER. The record exists
+    # (a readable header token proves the refresh ran and wrote it), so "I could not read it" is a
+    # missing read, not a licence for the one-refresh-old header to answer. On a `--box` run the read
+    # is a remote `cat` that returns rc 127 on timeout, and EACCES/TCC does the same locally: a
+    # permanent false green, which is the direction that must never pass.
+    qs_rec = f.get("queue_state") or {}
     if tok_src != "cycle header":
         state_txt += "\nqueue verdict graded from: %s (it is NEWER than the header token %s)" % (
             tok_src, hdr.get("queue_token") or "(absent)")
     backlog = hdr.get("backlog")
 
+    if qs_rec.get("ok") is False and tok_src == "cycle header":
+        return V("queue_readable", INCONCLUSIVE, "QUEUE_STATE_UNREADABLE",
+                 "header: %s\npool token: %s\n%s"
+                 % (hdr.get("raw"), raw_tok, state_txt),
+                 "the refresh's own record could not be read (%s), so the pool verdict rests on a "
+                 "header token that is always one refresh old. A failed read is not a successful "
+                 "read. Not green." % (qs_rec.get("error") or "no error recorded"))
     if tok["kind"] == "UNREADABLE":
         return V("queue_readable", FAIL, "QUEUE_UNREADABLE",
                  "header: %s\npool token: %s\n%s\nbacklog=%s"
@@ -1022,8 +1035,12 @@ def authoritative_queue_token(f, hdr):
     qs = f.get("queue_state") or {}
     qs_raw = (qs.get("raw") or "").strip()
     qs_tok = parse_queue_token(qs_raw) if qs_raw else None
-    if (qs.get("ok") is not False and qs_tok is not None
-            and qs_tok["kind"] != "UNPARSEABLE"):
+    # ⛔ `UNPARSEABLE` IS AUTHORITATIVE TOO — one rule for both sources. `refresh-candidates.sh`'s
+    # `queue_state_token` maps a token outside the vocabulary to UNKNOWN, and the harness's own suite
+    # writes exactly that (`garbage here`), so excluding it graded the same record two ways: as the
+    # header it was FAIL/QUEUE_NEVER_READ, as the state record it was silently dropped and the stale
+    # header decided. A RECORD THAT WAS READ IS THE VERDICT; only a FAILED READ is not.
+    if qs_tok is not None:
         hdr_age = hdr.get("age_s") if hdr else None
         qs_age = qs.get("age_s")
         # A NEWER record always wins; an UNKNOWN age is not "older" — the record still holds the
@@ -1124,7 +1141,11 @@ def check_work_dispatched(f, c):
         def _is_this_batch(e):
             if e is None:
                 return False
-            if batch_issues and str(e.get("issue")) not in batch_issues:
+            # ⛔ UNCONDITIONAL. `batch_issues and …` let an empty issue list switch the guard OFF,
+            # so a spawn for an issue in NO batch vouched for a batch that named none — measured:
+            # "0 issue(s) dispatched" + PASS/DISPATCHED + exit 0. A malformed batch line cannot
+            # spawn anything, so nothing may vouch for it.
+            if str(e.get("issue")) not in batch_issues:
                 return False
             if e.get("age_s") is None or ok_age is None:
                 return False
@@ -1215,7 +1236,7 @@ def check_work_dispatched(f, c):
                  "queue=EMPTY but the header carries no `backlog=` field: %s" % hdr,
                  "an incomplete header cannot establish that the pool was genuinely empty, so "
                  "'nothing to dispatch' is not established. Not green.")
-    if pool_kind == "EMPTY" and backlog == 0:
+    if pool_kind == "EMPTY" and backlog == 0 and (f.get("queue_state") or {}).get("ok") is not False:
         return V("work_dispatched", PASS, "IDLE_EMPTY_POOL", evidence,
                  "nothing was dispatched because the pool was read as genuinely EMPTY — the one "
                  "shape where 'no dispatch' is the correct outcome.")
@@ -1358,13 +1379,32 @@ def check_pane_daemon(f, c):
     # deprioritises the process (-1000, OOM_SCORE_ADJ_MIN, makes it immune), and treating `<= 0` as
     # protected made this check permanently green on Linux — the exact arm that must fire on
     # "cmux-tui was OOM-killed while the unit still read active" could never fire.
+    # ⛔ AN UNREAD VALUE IS NOT A NEGATIVE ONE. `known` silently drops None (EACCES on another
+    # user's /proc/<pid>/oom_score_adj, a timed-out probe — i.e. any canary not running as the
+    # daemon's owner), and with every value unread this returned FAIL/PROTECTION_ABSENT: a claim of
+    # absence built from a failed read. The doc reserves PROTECTION_UNEVALUABLE for exactly this.
+    unread = len(known) < len(adj)
     protected = [a for a in known if a < 0]
-    if not protected:
+    if not known:
+        return V("pane_daemon", INCONCLUSIVE, "PROTECTION_UNEVALUABLE",
+                 "%d live %s process(es) (pid %s)\noom_score_adj: %s — NO value could be read\n%s"
+                 % (len(pids), cmd, pid_txt, adj, prot_txt),
+                 "the daemon is alive but none of its oom_score_adj values could be READ, so "
+                 "'protected' is neither established nor refuted. Not green.")
+    if not protected and not unread:
         return V("pane_daemon", FAIL, "PROTECTION_ABSENT",
                  "%d live %s process(es) (pid %s)\noom_score_adj: %s\n%s"
                  % (len(pids), cmd, pid_txt, adj, prot_txt),
                  "the daemon is alive and NOT OOM-protected (oom_score_adj > 0 means the kernel "
                  "may kill it first). Being alive today is not protection.")
+    if unread:
+        # Some values were unreadable, so neither "all protected" nor "these are unprotected" holds.
+        return V("pane_daemon", INCONCLUSIVE, "PROTECTION_PARTIAL",
+                 "%d live %s process(es) (pid %s)\noom_score_adj: %s\nprotected: %d of %d, "
+                 "%d UNREAD\n%s" % (len(pids), cmd, pid_txt, adj, len(protected), len(pids),
+                                     len(adj) - len(known), prot_txt),
+                 "at least one protection value could not be read, so the OOM arm is not "
+                 "established for the whole daemon. Not green.")
     if len(protected) < len(pids):
         return V("pane_daemon", FAIL, "PROTECTION_PARTIAL",
                  "%d live %s process(es) (pid %s)\noom_score_adj: %s\nprotected: %d of %d\n%s"
@@ -1443,8 +1483,14 @@ def check_headroom(f, c):
     bad = []
     unknown = []
 
-    if disk.get("ok"):
-        gb = (disk.get("avail_bytes") or 0) / float(1 << 30)
+    # ⛔ AN `ok` READ WITH NO NUMBER IS NOT 0 GiB. `(avail_bytes or 0)` turned a missing field into
+    # "disk 0.0 GiB free" — a manufactured OOM emergency on the check whose FAIL must mean one. Same
+    # defect as the `vm_stat` arm; the surface is UNREAD, so it belongs in `unknown`.
+    if disk.get("ok") and not isinstance(disk.get("avail_bytes"), (int, float)):
+        lines.append("disk: READ ok but NO avail_bytes field (%r)" % (disk.get("avail_bytes"),))
+        unknown.append("disk")
+    elif disk.get("ok"):
+        gb = disk["avail_bytes"] / float(1 << 30)
         lines.append("disk: %.1f GiB free (%.1f%% used) on %s — floor %.1f GiB"
                      % (gb, disk.get("used_pct") if disk.get("used_pct") is not None else -1,
                         disk.get("mount") or "/", c.disk_floor_gb))
@@ -1533,6 +1579,19 @@ def rollup_is_green(rollup):
     return True
 
 
+RE_ACTIONS_RUN = re.compile(r"/actions/runs/(\d+)")
+
+
+def _run_id_of(url):
+    """The actions RUN id from a check-run's `details_url` — the identity a re-run does NOT change.
+
+    A re-run keeps the run and bumps its attempt, whereas each attempt may get a new CHECK SUITE, so
+    the run id groups attempts together without shattering one check per attempt.
+    """
+    m = RE_ACTIONS_RUN.search(str(url or ""))
+    return m.group(1) if m else ""
+
+
 def _check_key(chk):
     """(workflow, check name) — what makes two entries THE SAME CHECK.
 
@@ -1546,6 +1605,14 @@ def _check_key(chk):
     (an ungrouped check would escape the verdict).
     """
     wf = str(chk.get("workflowName") or "")
+    if not wf:
+        # ⛔ THE REST SURFACE HAS NO `workflowName`, so keying on `app.slug` re-introduced the exact
+        # collapse the GraphQL fix removed: measured on one commit, `changes` is published by TWO
+        # workflows (suite …05368 and …06121), both `app=github-actions`, so one group held both and
+        # a sibling's red `changes` was masked by the other's green. The actions RUN id in
+        # `details_url` distinguishes them and survives a re-run (the run is reused, the attempt is
+        # not), so the newest attempt still wins inside a group.
+        wf = _run_id_of(chk.get("details_url") or chk.get("detailsUrl") or "")
     if not wf:
         a = chk.get("app")
         if isinstance(a, dict):
@@ -2367,7 +2434,11 @@ def _controller_fingerprint(machine, cfg):
     """
     snap = machine.snapshot_controller() or {}
     log = machine.log_stat() or {}
-    return {"ok": snap.get("ok", True),
+    # ⛔ ALLOW-LIST POLARITY IN THE ACTION PATH. `snap.get("ok", True)` defaults an ABSENT read to a
+    # successful one, so the RE-MEASURE AT THE MOMENT OF ACTION degraded to "empty table = absence"
+    # and `launchctl kickstart -k` ran against a live controller. `is True` makes an absent/None `ok`
+    # abstain exactly like every other read in this file.
+    return {"ok": snap.get("ok") is True,
             "pids": [p.get("pid") for p in snap.get("pids") or []],
             "mtime": log.get("mtime"),
             "exists": log.get("exists"),
@@ -3167,6 +3238,7 @@ REQUIRED_FIXTURES = (
     "dispatch-intent-not-spawned", "dispatch-unconfirmed", "dispatch-previous-batch-spawn",
     "queue-state-unreadable-newer", "lander-from-another-repo", "merged-surface-truncated",
     "no-pr-created", "idle-no-work", "headroom-disk-only-low", "headroom-mem-only-low",
+    "queue-state-read-failed", "daemon-protection-unread",
 )
 
 

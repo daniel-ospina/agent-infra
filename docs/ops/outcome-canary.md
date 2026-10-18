@@ -30,9 +30,9 @@ outcome.
 | `work_dispatched` | a `[dispatch] … -> <issue>` line is inside the window **and the batch's lane actually started** | `NOT_DISPATCHED`, `NO_DISPATCH`, `NO_DISPATCH_GATED`, `NO_LANE_STARTED` | `NO_CYCLE_IN_WINDOW`, `DISPATCH_UNCONFIRMED` |
 | `pr_created` | ≥1 PR opened in the PR window | `NO_PR_CREATED` | `IDLE_NO_WORK` (inconclusive) |
 | `pr_merged` | ≥1 PR merged in the PR window | `NO_PR_MERGED` | `IDLE_NO_WORK`, `MERGED_SURFACE_TRUNCATED` (inconclusive) |
-| `pane_daemon` | a live `cmux-tui` **and** a readable protection value that protects it | `DAEMON_ABSENT`, `PROTECTION_ABSENT`, `PROTECTION_PARTIAL` | `PROTECTION_UNEVALUABLE` |
+| `pane_daemon` | a live `cmux-tui` **and** a readable protection value that protects it | `DAEMON_ABSENT`, `PROTECTION_ABSENT` | `PROTECTION_UNEVALUABLE`, `PROTECTION_PARTIAL` (inconclusive: an UNREAD value is not an unprotected one) |
 | `headroom` | disk and available memory above their floors, **with the numbers printed** | `BELOW_FLOOR` | `PROBE_UNREADABLE` |
-| `landers` | every green+mergeable PR is armed or railed (**a decision in the log counts only when the log's own repo matches `--repo`**) | `LANDER_MISSING` | `LANDER_EXPIRED`, `PARTIAL_POPULATION` |
+| `landers` | every green+mergeable PR is armed or railed (**a decision in the log counts only when the log's own repo matches `--repo`; a log that names NO repo is treated as this cell's — identity unknown is not a mismatch**) — see Honest gaps | `LANDER_MISSING` | `LANDER_EXPIRED`, `PARTIAL_POPULATION` |
 
 **`work_dispatched` is the one that matters most.** Everything above it can pass while it fails —
 measured 2026-10-18: controller cycling, `queue=READ(223)`, 47 candidates, and **47
@@ -221,8 +221,8 @@ shape changes, and it is pruned with the rest of its check.
 ## The suite
 
 ```bash
-python3 tools/fleet/outcome_canary.test.py              # 108 tests
-python3 tools/fleet/outcome_canary.test.py --mutations  # 95 mutations, each must go RED
+python3 tools/fleet/outcome_canary.test.py              # 114 tests
+python3 tools/fleet/outcome_canary.test.py --mutations  # 102 mutations, each must go RED
 ```
 
 The signal tests drive the **real CLI** end-to-end (`--live --facts … --capture-dir …`), so what is

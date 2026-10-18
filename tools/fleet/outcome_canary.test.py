@@ -1900,6 +1900,136 @@ def test_a_fixture_expectation_naming_an_unknown_check_is_a_mismatch():
 
 
 @test
+def test_a_FAILED_READ_of_the_queue_record_does_not_pass_through_the_stale_header():
+    """The record exists (a readable header token proves the refresh ran and wrote it), so "I could
+    not read it" is a MISSING read — not a licence for the one-refresh-old header to answer EMPTY.
+    On a `--box` run the read is a remote `cat` that returns rc 127 on timeout, and EACCES/TCC does
+    the same locally: a permanent false green, in the direction that must never pass."""
+    m = load()
+    cfg = m.cfg_from_dict({})
+    d = fx("healthy")
+    hdr = {"raw": "=== Sun Oct 18 07:47:44 EST 2026 load=10 lanes=0 backlog=0 queue=EMPTY(3m) ===",
+           "age_s": 180, "ts": 1792327000, "backlog": 0, "queue_token": "EMPTY(3m)",
+           "lanes": 0, "load": 10}
+    facts = {"log_events": {"headers": [hdr], "dispatch_ok": [], "dispatch_empty": [],
+                            "dispatch_skipped": [], "dispatch_refused": [], "armed": [],
+                            "railed": [], "lane_started": [], "lane_failed": []},
+             "queue_state": {"path": "q", "ok": False, "raw": None,
+                             "error": "cat: Permission denied"}}
+    v = [x for x in m.evaluate(facts, cfg) if x.name == "queue_readable"][0]
+    assert (v.status, v.variant) == (m.INCONCLUSIVE, "QUEUE_STATE_UNREADABLE"), (v.status, v.variant)
+    assert "Permission denied" in v.evidence, v.evidence
+    w = [x for x in m.evaluate(facts, cfg) if x.name == "work_dispatched"][0]
+    assert w.variant != "IDLE_EMPTY_POOL", (w.status, w.variant)
+    assert w.status != m.PASS, (w.status, w.variant)
+    # an UNPARSEABLE record is authoritative too (one rule, both sources): the harness maps a token
+    # outside its vocabulary to UNKNOWN, and its own suite writes exactly this shape
+    facts["queue_state"] = {"path": "q", "ok": True, "raw": "garbage here", "age_s": 30}
+    v = [x for x in m.evaluate(facts, cfg) if x.name == "queue_readable"][0]
+    assert (v.status, v.variant) == (m.FAIL, "QUEUE_NEVER_READ"), (v.status, v.variant, v.evidence)
+    # …and the SAME record as the header already answered identically (no two-door grading)
+    assert m.parse_queue_token("garbage here")["kind"] == "UNPARSEABLE"
+
+
+@test
+def test_the_RE_MEASURE_guard_abstains_when_the_read_carries_no_ok():
+    """`snap.get("ok", True)` defaults an ABSENT read to a successful one, so the guard that exists to
+    prevent `launchctl kickstart -k` against a live controller degraded to "empty table = absence"."""
+    m = load()
+    cfg = m.cfg_from_dict({"o_dir": "/O"})
+    for snap in ({}, {"ok": None}, {"ok": False}):
+        fp = m._controller_fingerprint(type("M", (), {
+            "snapshot_controller": lambda self, snap=snap: snap,
+            "log_stat": lambda self: {"age_s": 400.0, "exists": True},
+            "o_dir": "/O", "sh": lambda self, cmd, timeout=None: (0, "1")})(), cfg)
+        assert fp["ok"] is False, (snap, fp)
+
+
+@test
+def test_the_REST_rollup_does_not_collapse_two_workflows_that_share_a_job_name():
+    """The REST check-runs payload has NO `workflowName`, so keying on `app.slug` re-introduced the
+    collapse the GraphQL fix removed: measured on one commit, `changes` is published by TWO workflows
+    (suites …05368 and …06121), both `app=github-actions`, so a sibling's red `changes` was masked by
+    the other's green. The actions RUN id in `details_url` separates them and survives a re-run."""
+    m = load()
+
+    def run(name, run_id, concl, started):
+        return {"__typename": "CheckRun", "name": name, "app": {"slug": "github-actions"},
+                "status": "COMPLETED", "conclusion": concl, "startedAt": started,
+                "completedAt": started,
+                "detailsUrl": "https://github.com/o/r/actions/runs/%s/job/9" % run_id}
+
+    # two workflows, one job name, and the RED one is the OLDER attempt — the masking direction: a
+    # collapsed group would take the newer green and answer "green" over a red commit.
+    runs = [run("changes", "111", "FAILURE", "2026-10-18T10:00:00Z"),
+            run("changes", "222", "SUCCESS", "2026-10-18T11:00:00Z")]
+    assert m.rollup_is_green(runs) is False, "a red sibling workflow was masked by a green one"
+    # …and the newest is red too, which no grouping can rescue
+    runs = [run("changes", "111", "SUCCESS", "2026-10-18T10:00:00Z"),
+            run("changes", "222", "FAILURE", "2026-10-18T11:00:00Z")]
+    assert m.rollup_is_green(runs) is False, "a red newest attempt was ignored"
+    # the same workflow's re-run still groups: the NEWEST attempt decides
+    runs = [run("changes", "111", "FAILURE", "2026-10-18T10:00:00Z"),
+            run("changes", "111", "SUCCESS", "2026-10-18T11:00:00Z")]
+    assert m.rollup_is_green(runs) is True, m.rollup_is_green(runs)
+
+
+@test
+def test_an_empty_batch_line_cannot_be_vouched_for_by_any_spawn():
+    """`batch_issues and …` switched the cross-batch guard OFF for an empty issue list, so a spawn for
+    an issue in NO batch vouched for it: measured "0 issue(s) dispatched" + PASS/DISPATCHED + exit 0.
+    A batch line that names no issue cannot have spawned one."""
+    m = load()
+    cfg = m.cfg_from_dict({})
+    facts = {"log_events": {
+        "headers": [{"raw": "=== Sun Oct 18 07:47:44 EST 2026 load=40 lanes=2 backlog=9 "
+                            "queue=READ(223)(9m) ===", "age_s": 60, "ts": 1792327000,
+                     "backlog": 9, "queue_token": "READ(223)(9m)", "lanes": 2, "load": 40}],
+        "dispatch_ok": [{"raw": "[dispatch] load=40 lanes=2 ->  ", "issues": [],
+                         "issue_count": 0, "age_s": 60, "ts": 1792327000}],
+        "lane_started": [{"raw": "#9999: lane-9 (implement+PR)", "issue": 9999, "lane": 9,
+                          "age_s": 60, "ts": 1792327000}],
+        "lane_failed": [], "dispatch_refused": [], "dispatch_empty": [], "dispatch_skipped": [],
+        "armed": [], "railed": []}}
+    v = m.check_work_dispatched(facts, cfg)
+    assert v.status != m.PASS, (v.status, v.variant, v.evidence)
+    assert v.variant == "DISPATCH_UNCONFIRMED", (v.status, v.variant)
+
+
+@test
+def test_an_UNREAD_oom_protection_value_is_UNEVALUABLE_not_unprotected():
+    """`known` silently drops None (EACCES on another user's /proc/<pid>/oom_score_adj, or a
+    timed-out probe — any canary not running as the daemon's owner), so with every value unread the
+    check claimed PROTECTION_ABSENT: an absence built from a failed read."""
+    m = load()
+    cfg = m.cfg_from_dict({})
+    pane = {"ok": True, "protection_supported": True, "cmd": "cmux-tui",
+            "pids": [{"pid": 11, "oom_score_adj": None}, {"pid": 12, "oom_score_adj": None}]}
+    v = m.check_pane_daemon({"pane": pane}, cfg)
+    assert (v.status, v.variant) == (m.INCONCLUSIVE, "PROTECTION_UNEVALUABLE"), (v.status, v.variant)
+    # one readable negative + one unread is NOT "all protected": still not green
+    pane["pids"] = [{"pid": 11, "oom_score_adj": -900}, {"pid": 12, "oom_score_adj": None}]
+    v = m.check_pane_daemon({"pane": pane}, cfg)
+    assert v.status == m.INCONCLUSIVE, (v.status, v.variant)
+    # a READ value of 0 is still the failure this check exists for
+    pane["pids"] = [{"pid": 11, "oom_score_adj": 0}]
+    v = m.check_pane_daemon({"pane": pane}, cfg)
+    assert (v.status, v.variant) == (m.FAIL, "PROTECTION_ABSENT"), (v.status, v.variant)
+
+
+@test
+def test_an_ok_disk_read_with_no_number_is_UNREAD_not_zero_gib():
+    """`(avail_bytes or 0)` turned a missing field into "disk 0.0 GiB free" — a manufactured OOM
+    emergency on the check whose FAIL must mean one."""
+    m = load()
+    cfg = m.cfg_from_dict({})
+    v = m.check_headroom({"headroom": {"disk": {"ok": True, "used_pct": 40.0, "mount": "/"},
+                                       "mem": {"ok": True, "avail_mb": 9000, "source": "d"}}}, cfg)
+    assert (v.status, v.variant) == (m.INCONCLUSIVE, "PROBE_UNREADABLE"), (v.status, v.variant)
+    assert "avail_bytes" in v.evidence, v.evidence
+
+
+@test
 def test_the_WIRED_machine_carries_o_dir_so_the_heartbeat_leg_works():
     """The respawn proof is `log_advanced or hb_advanced`, and `_heartbeat_epoch` needs `machine.o_dir`.
     `main` wired `log_path`, `tail_lines` and `controller_paths` but NOT `o_dir` (only `collect_live`
@@ -2327,7 +2457,8 @@ def test_the_queue_token_AGE_is_read_with_ITS_OWN_multiplier():
     # OLD empty read beside an unreadable queue state is the only age the check has, and
     # past the limit "the pool is empty" is a claim about then — STATE_FROZEN, never READABLE.
     d = fx("healthy")
-    d["facts"]["queue_state"] = {"path": "q", "ok": False, "error": "EACCES"}
+    # the record is READ but carries no epoch of its own, so the token's suffix is the only clock
+    d["facts"]["queue_state"] = {"path": "q", "ok": True, "raw": "EMPTY", "age_s": None}
     # 120m, not 90m: 90m is EXACTLY the 5400s limit, and the boundary is deliberately inclusive
     d["facts"]["log_events"]["headers"][0]["queue_token"] = "EMPTY(120m)"
     d["facts"]["log_events"]["headers"][0]["backlog"] = 0
@@ -3095,6 +3226,34 @@ MUTATIONS = [
      "            exists = (present.strip().endswith(\"YES\")) if rc3 == 0 else None",
      "            exists = False",
      "test_a_log_that_cannot_be_stat_ed_is_unreadable_not_missing"),
+    ("a failed read of the queue record passes through the stale header",
+     "    if qs_rec.get(\"ok\") is False and tok_src == \"cycle header\":",
+     "    if False:",
+     "test_a_FAILED_READ_of_the_queue_record_does_not_pass_through_the_stale_header"),
+    ("an UNPARSEABLE queue record is demoted to the header",
+     "    if qs_tok is not None:",
+     "    if qs_tok is not None and qs_tok[\"kind\"] != \"UNPARSEABLE\":",
+     "test_a_FAILED_READ_of_the_queue_record_does_not_pass_through_the_stale_header"),
+    ("the re-measure guard defaults an absent ok to a successful read",
+     "    return {\"ok\": snap.get(\"ok\") is True,",
+     "    return {\"ok\": snap.get(\"ok\", True),",
+     "test_the_RE_MEASURE_guard_abstains_when_the_read_carries_no_ok"),
+    ("the REST rollup groups two workflows by app+name",
+     "        wf = _run_id_of(chk.get(\"details_url\") or chk.get(\"detailsUrl\") or \"\")",
+     "        wf = \"\"",
+     "test_the_REST_rollup_does_not_collapse_two_workflows_that_share_a_job_name"),
+    ("an empty batch line lets any spawn vouch for it",
+     "            if str(e.get(\"issue\")) not in batch_issues:",
+     "            if batch_issues and str(e.get(\"issue\")) not in batch_issues:",
+     "test_an_empty_batch_line_cannot_be_vouched_for_by_any_spawn"),
+    ("an unread oom_score_adj counts as unprotected",
+     "    if not known:",
+     "    if False:",
+     "test_an_UNREAD_oom_protection_value_is_UNEVALUABLE_not_unprotected"),
+    ("an ok disk read with no number reads as 0 GiB",
+     "    if disk.get(\"ok\") and not isinstance(disk.get(\"avail_bytes\"), (int, float)):",
+     "    if False:",
+     "test_an_ok_disk_read_with_no_number_is_UNREAD_not_zero_gib"),
     ("an unaged queue record forfeits its authority",
      "        if qs_age is None or hdr_age is None or qs_age < hdr_age:",
      "        if qs_age is not None and (hdr_age is None or qs_age < hdr_age):",
