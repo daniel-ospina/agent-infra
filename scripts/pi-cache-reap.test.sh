@@ -862,8 +862,10 @@ cat >"$T/bin/ps-actpoint" <<SH
 #!/bin/sh
 n=\$(cat "$T/ps.calls" 2>/dev/null || echo 0)
 echo \$((n + 1)) >"$T/ps.calls"
-# The pass takes TWO ps snapshots before the loop (one for the prune guard, one for the
-# whole-cache veto); the third is the ACT-POINT re-probe, so the holder must appear from n=2 on.
+# ONE ps snapshot runs at pass start; the first ps call of a run is the lock-acquire `lstart`
+# probe (this stub ignores its arguments, so it counts too). The ACT-POINT re-probe is the third
+# call, so the holder appears from n=2 on. Counted here, not branched on the arguments, so the
+# trigger stays visible in one line.
 if [ "\$n" -ge 2 ]; then printf '%s\n' "  7777 /usr/local/bin/uv sync"; else printf '%s\n' "    1 /sbin/init"; fi
 SH
 chmod +x "$T/bin/ps-actpoint"
@@ -919,6 +921,14 @@ rm -f "$T/df.calls"
 OUT="$(DF_STUB="$T/bin/df-flood" run_reap "$H" --apply 2>&1)"; RC=$?
 assert_eq "$RC" "0" "the pass verifies (the cache did shrink)"
 assert_contains "$OUT" "NOT attributable to this pass" "a df gain beyond what the cache gave up is named as foreign, not folded into the reclaim"
+# …and the CREDITED figure must be capped at the claim: the uncapped code prints the whole
+# foreign gain as this pass's reclaim (measured: "verified reclaim" of 1943MB for a 1.2MB cache).
+CREDITED="$(printf '%s' "$OUT" | sed -n 's/.*(+\([0-9][0-9]*\)KB verified reclaim.*/\1/p' | head -1)"
+if [ -n "$CREDITED" ] && [ "$CREDITED" -le 2000 ]; then
+    ok "the credited figure is ${CREDITED}KB — what the cache gave up, not the 1942MB foreign df delta"
+else
+    bad "the credited figure is not the cache's own reclaim (credit cap removed?): $OUT"
+fi
 
 echo
 echo "── 10. wiring: a bound no box runs is the defect ──"
@@ -942,6 +952,15 @@ assert_contains "$(cat "$SUPERVISOR" 2>/dev/null)" ".cache-reap-blocked" \
     "the supervisor surfaces that record instead of leaving an hourly failure in a log"
 assert_contains "$(cat "$SUPERVISOR" 2>/dev/null)" "pi-cache-reap.sh" \
     "the low-disk prune remedy reaches the machine-global caches too"
+
+echo
+echo "── 10c. portability pins (the launchd clock is macOS) ──"
+# `date -r <path>` is GNU-only: the BSD/macOS `date -r` takes EPOCH SECONDS, so it returns empty
+# there — every age fell back to 0, a stale lock was never broken (exit 4 = silence to both
+# callers) and the loud mis-set-lock refusal degraded to a silent skip. The family idiom is
+# `stat -f %m || stat -c %Y`.
+assert_not_contains "$(grep -v '^#' "$REAPER")" 'date -r' "no GNU-only 'date -r <path>' in EXECUTED code (it means epoch seconds on macOS)"
+assert_contains "$(cat "$REAPER")" 'stat -f %m' "mtime is read with the family's portable stat idiom"
 
 echo ""
 echo "── Summary ───────────────────────────────────────────────────────"

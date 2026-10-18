@@ -452,9 +452,11 @@ check_caches() {
   reaper=""
   # ${CACHE_REAPER:-} FIRST: the same override the cell clock and the supervisor honour, so the
   # report cannot describe a different copy than the one that runs.
+  # The same chain as the supervisor and the cell clock: ${CACHE_REAPER:-} -> the FARMED copy ->
+  # the copy beside this script, so the report describes the script that actually runs.
   for d in "${CACHE_REAPER:-}" \
-           "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/pi-cache-reap.sh" \
-           "${HOME:-}/.pi/agent/scripts/pi-cache-reap.sh"; do
+           "${HOME:-}/.pi/agent/scripts/pi-cache-reap.sh" \
+           "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/pi-cache-reap.sh"; do
     [ -n "$d" ] && [ -f "$d" ] && { reaper="$d"; break; }
   done
   cfg=""

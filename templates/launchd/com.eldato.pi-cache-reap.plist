@@ -51,7 +51,10 @@
          holds the cache — remove the largest entries, preserving anything still
          hardlinked (unlinking it frees nothing) and anything on another filesystem
          (never delete through a mount). A pass that acted must PROVE the shrink
-         (cache size down AND filesystem free space up by >=50% of the claim) or it
+         (cache size down AND filesystem free space up by >=50% of the claim, OR a
+         net free-space delta that cannot be attributed to it — other processes
+         writing — in which case at least one of its own evictions must have been
+         followed by a gain, and it credits at most what the cache gave up) or it
          exits 3; two concurrent passes are excluded by a lock.
 
          Canonical script: agent-infra/scripts/pi-cache-reap.sh

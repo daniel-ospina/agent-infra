@@ -1062,7 +1062,16 @@ while true; do
   # The hourly stamp is the same idiom as claim_prune above (this loop's clock is mtime-based).
   if [ -z "$(find "$O/state/.cache-reaped" -mmin -60 2>/dev/null)" ]; then
     touch "$O/state/.cache-reaped"
-    _cache_reaper="${CACHE_REAPER:-${HOME:-}/.pi/agent/scripts/pi-cache-reap.sh}"
+    # The same chain as the supervisor and bring-up: ${CACHE_REAPER:-} -> the FARMED copy ->
+    # the copy beside the bundle (scripts/pi-cache-reap.sh, one directory up from this harness).
+    _cache_reaper="${CACHE_REAPER:-}"
+    if [ -z "$_cache_reaper" ]; then
+      if [ -f "${HOME:-}/.pi/agent/scripts/pi-cache-reap.sh" ]; then
+        _cache_reaper="${HOME:-}/.pi/agent/scripts/pi-cache-reap.sh"
+      else
+        _cache_reaper="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." 2>/dev/null && pwd)/pi-cache-reap.sh"
+      fi
+    fi
     if [ -f "$_cache_reaper" ]; then
       # ⛔ `&` discards the exit status, and that status is the reaper's ONLY signal (the class the
       # ⛔ further down this file records for the refresh:

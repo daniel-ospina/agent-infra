@@ -62,6 +62,13 @@
 #     on pi-cell-3 while this script was being written: 914 MB of cache evicted,
 #     7 MB of disk gained. A pass that reports that as a success is exactly "a
 #     reaper reports success while freeing nothing", the failure mode #1987 names.
+#     ⚠️ ONE exception, and it is not a free pass: when OTHER processes write during the
+#     pass the net df delta can fall, or be dominated by bytes this pass never touched.
+#     The pass then accepts the delta only if at least one of ITS OWN evictions was
+#     followed by a gain (and it credits at most what the cache gave up, naming the
+#     rest as foreign); with no such sample the reclaim is unverified and it still
+#     exits 3. So the guarantee is "size down AND (>=50% gain OR an unattributable delta
+#     in which this pass was observed to free something)" — never "size down alone".
 #     For the same reason an entry that still HAS another link is PRESERVED and
 #     reported: unlinking it cannot free its bytes, so deleting it would trade a
 #     performance asset for nothing. Same for an entry on another filesystem (a
@@ -367,6 +374,9 @@ ps_matches() {
                     exe = $2; sub(/.*\//, "", exe)
                     if (exe == tool) { print; next }
                     if (tool == "uv" && exe == "uvx") { print; next }
+                    # `pip3 install …` invokes no absolute path at all (measured: a live pip3 did
+                    # not block the escalation and an entry was deleted from under it).
+                    if (tool == "pip" && exe ~ /^pip[0-9.]*$/) { print; next }
                     # npm and pip are NOT native binaries: npm runs as
                     # `node …/npm/bin/npm-cli.js`, pip as `python3 …/pip/__main__.py` or
                     # `python3 -m pip`. An argv[0] test therefore never matches them (measured: a
@@ -385,11 +395,19 @@ ps_matches() {
                         }
                         if (tool == "pip" && t == "-m" && $(i + 1) == "pip") { print; next }
                     }
+                    # `/usr/bin/env [-i] [-u NAME] [NAME=value]… TOOL …`: skip env OPTIONS and
+                    # the argument of `-u`, as well as `NAME=value` tokens. `env -u X uv` and
+                    # `env VAR=1 uvx` matched nothing because the old loop stopped on the option.
                     if (exe == "env") {
                         i = 3
-                        while (i <= NF && $i ~ /=/) i++
+                        while (i <= NF) {
+                            if ($i ~ /^(-i|--ignore-environment|-0|--null)$/) { i++; continue }
+                            if ($i ~ /^(-u|--unset|--chdir|-C)$/) { i += 2; continue }
+                            if ($i ~ /=/) { i++; continue }
+                            break
+                        }
                         e2 = $i; sub(/.*\//, "", e2)
-                        if (e2 == tool) print
+                        if (e2 == tool || (tool == "uv" && e2 == "uvx") || (tool == "pip" && e2 ~ /^pip[0-9.]*$/)) print
                     }
                 }'
             return 0 ;;
@@ -398,6 +416,21 @@ ps_matches() {
             return 0 ;;
         *) return 2 ;;
     esac
+}
+
+# mtime_of <path> — the path's mtime in epoch seconds, or rc 1 when it cannot be read.
+# ⛔ NOT `date -r <path>`: GNU `date -r` takes a REFERENCE FILE, but the BSD/macOS `date -r` takes
+# EPOCH SECONDS — the spelling this repo records as measured in
+# scripts/cleanup-stale-branches.sh:1359. On macOS it therefore returns empty, every age fell back
+# to 0, and the stale-lock recovery became inert on the ONLY platform with a launchd clock: an
+# abandoned break token wedged the lock for ever (exit 4 = "silence" to both callers) and a
+# mis-set lock path degraded from the loud exit 3 to a silent 4. `stat` is the family idiom
+# (heartbeat-loop.sh:265, lane-scan-fallback.sh:53, monitor-worker.sh:43, atomic-land.sh:289).
+mtime_of() {
+    local m
+    m="$(stat -f %m "$1" 2>/dev/null)" || m="$(stat -c %Y "$1" 2>/dev/null)" || return 1
+    is_pos_int "$m" || return 1
+    printf '%s' "$m"
 }
 
 # lstart_of <pid> — the process start time as the OS prints it, or rc 1 when ps cannot answer.
@@ -546,10 +579,6 @@ canon() {
 
 # guard_target <class> <resolved-dir> <declared-dir> — rc 0 usable · rc 1 refused (reported).
 # ⛔ The env seams are honoured, so a mis-set seam names an ARBITRARY directory — and `uv cache
-# prune` pointed at one deletes it (measured). End to end with the seam set to $HOME the pass
-# reported "$HOME 40MB -> 4KB … VERIFIED", deleted $HOME/precious, and then deleted its own state
-# dir so every later log line failed silently.
-# ⛔ The env seams are honoured, so a mis-set seam names an ARBITRARY directory — and `uv cache
 # prune` pointed at one deletes it (measured). The SHAPE test therefore runs on the RESOLVED name,
 # NOT on the declared one: the declared name is cache-shaped for every real sink by construction, so
 # an OR of the two is INERT — measured, with no seam mis-set at all,
@@ -592,7 +621,7 @@ guard_target() {
 reap_target() {
     local class="$1" dir="$2" before_kb before_free_kb now_kb new_kb after_kb after_free_kb
     local pruned=none evicted=0 kb e cur_free holders dir_holders held_entries="" keep_entries=""
-    local no_gain_stop=0 no_gain=0 any_gain=0 last_free="" claimed_kb gained_kb credited_kb min_gain_kb stop_note=""
+    local no_gain_stop=0 no_gain=0 any_gain=0 hard_stop=0 last_free="" claimed_kb gained_kb credited_kb min_gain_kb stop_note=""
     local dev_rc share_rc fresh_holders free_str parent mnt_rc resolved declared_dir
 
     case "$dir" in
@@ -691,17 +720,17 @@ reap_target() {
             # containment rule is the one the whole script promises, so it is enforced here,
             # at the point of deletion, not assumed from how the list was built.
             case "${kb:-}" in
-                ''|*[!0-9]*) fail_closed "$class: malformed eviction record ('${kb:-}' '$e') — refusing to delete from a list that cannot be trusted"; break ;;
+                ''|*[!0-9]*) fail_closed "$class: malformed eviction record ('${kb:-}' '$e') — refusing to delete from a list that cannot be trusted"; hard_stop=1; break ;;
             esac
             case "$e" in
                 "$dir"/*) ;;
-                *) fail_closed "$class: entry '$e' is NOT inside $dir — refusing to delete outside the cache"; break ;;
+                *) fail_closed "$class: entry '$e' is NOT inside $dir — refusing to delete outside the cache"; hard_stop=1; break ;;
             esac
             # ── the ACT-POINT re-probe (a resolver spawned mid-pass is invisible to the
             #    pass-start snapshot; #1105 is that class in the sibling reaper) ──
-            ps_snapshot || { fail_closed "$class: the ps probe could not answer immediately before removing $e — NOT deleting an unproven entry"; break; }
+            ps_snapshot || { fail_closed "$class: the ps probe could not answer immediately before removing $e — NOT deleting an unproven entry"; hard_stop=1; break; }
             if [ -n "$(ps_matches tool "$class" "$dir" || true)" ]; then
-                fail_closed "$class: a $class process started during this pass — stopping before $e (the entries it holds cannot be known)"
+                stop_note=" (STOPPING: a $class process started during this pass — stopped before $e, the entries it holds cannot be known)"
                 break
             fi
             fresh_holders="$(ps_matches dir "$class" "$dir" || true)"
@@ -718,7 +747,7 @@ reap_target() {
                 plog "pi-cache-reap:   preserving $e — the mount table holds a mount point at or below it; nothing is deleted THROUGH a mount"
                 continue
             elif [ "$mnt_rc" -ne 1 ]; then
-                fail_closed "$class: cannot read the mount table, so it cannot be shown that $e holds no mount — refusing to delete"
+                stop_note=" (STOPPING: cannot read the mount table, so it cannot be shown that the remaining entries hold no mount)"
                 break
             fi
             same_device "$e" "$dir"; dev_rc=$?
@@ -727,7 +756,7 @@ reap_target() {
                 plog "pi-cache-reap:   preserving $e — a different filesystem (mount point inside the cache); nothing is deleted THROUGH a mount"
                 continue
             elif [ "$dev_rc" -ne 0 ]; then
-                fail_closed "$class: cannot determine the filesystem holding $e — refusing to delete an entry that may be a mount"
+                stop_note=" (STOPPING: cannot determine the filesystem holding $e — an entry that may be a mount is not deleted)"
                 break
             fi
             shared_file_in "$e"; share_rc=$?
@@ -736,7 +765,7 @@ reap_target() {
                 plog "pi-cache-reap:   preserving $e — still hardlinked (another name holds these bytes, so unlinking this one frees nothing)"
                 continue
             elif [ "$share_rc" -ne 1 ]; then
-                fail_closed "$class: cannot determine whether $e is still hardlinked — refusing to delete an entry that may free nothing"
+                stop_note=" (STOPPING: cannot determine whether $e is still hardlinked — an entry that may free nothing is not deleted)"
                 break
             fi
             if remove_entry "$e"; then
@@ -753,7 +782,7 @@ reap_target() {
                 if [ "$kb" -ge "$now_kb" ]; then now_kb=0; else now_kb=$((now_kb - kb)); fi
                 if [ "$now_kb" -le "$MAX_KB" ]; then
                     if ! new_kb="$(kb_of "$dir")"; then
-                        fail_closed "$class: cannot re-measure $dir after evicting $e — STOPPING (no further deletion on a cache that can no longer be measured)"
+                        stop_note=" (STOPPING: cannot re-measure the cache after evicting $e — no further deletion on a cache that can no longer be measured)"
                         break
                     fi
                     now_kb="$new_kb"
@@ -763,7 +792,7 @@ reap_target() {
                 # silent let the pass empty the cache and only then report the unreadable df
                 # (reproduced: 8 of 10 entries deleted with the brake inert).
                 if [ -z "$cur_free" ]; then
-                    fail_closed "$class: df stopped answering after evicting $e — STOPPING (an unreadable df cannot show that the deletion is reclaiming)"
+                    stop_note=" (STOPPING: df stopped answering after evicting $e — an unreadable df cannot show that the deletion is reclaiming)"
                     break
                 fi
                 if [ -n "$last_free" ]; then
@@ -789,22 +818,27 @@ reap_target() {
 
     # ── (3) verify — a pass that acted must PROVE the shrink ─────────────────
     after_kb="$(kb_of "$dir")" \
-        || { fail_closed "$class: cannot measure $dir after the pass — the shrink cannot be verified"; return 0; }
+        || { fail_closed "$class: cannot measure $dir after the pass — the shrink cannot be verified${stop_note}"; return 0; }
     after_free_kb="$(free_kb "$dir")"
 
     case "${before_free_kb:-}:${after_free_kb:-}" in
         :*|*:)
-            fail_closed "$class: $dir shrank $(mb_str "$before_kb") -> $(mb_str "$after_kb") but free space could not be read before and after (df) — the bytes actually freed are NOT verified (the entries may be hardlinked into live .venv trees)"
+            fail_closed "$class: $dir shrank $(mb_str "$before_kb") -> $(mb_str "$after_kb") but free space could not be read before and after (df) — the bytes actually freed are NOT verified (the entries may be hardlinked into live .venv trees)${stop_note}"
             return 0 ;;
     esac
 
     # ⛔ ONE VERDICT PER CACHE: the still-over-bound check comes BEFORE the success line.
     # Printing "VERIFIED" and then "FAIL-CLOSED … STILL over bound" leaves a log in which
     # `grep VERIFIED` reports a cache that was never bounded.
+    if [ "$after_kb" -gt "$MAX_KB" ] && [ "$hard_stop" -eq 1 ]; then
+        # The mid-loop refusal above IS this cache's one verdict; a second line here would report one
+        # cache twice (measured: a single uv cache printed "FAILED — 2 cache(s) …").
+        return 0
+    fi
     if [ "$after_kb" -gt "$MAX_KB" ]; then
         free_str="could not be read"
         [ -n "${after_free_kb:-}" ] && free_str="$(mb_str "$after_free_kb")"
-        fail_closed "$class: $dir was $(mb_str "$before_kb") -> $(mb_str "$after_kb") after evicting every removable entry (prune=$pruned evicted=$evicted) — still over the ${MAX_MB}MB bound; free $(mb_str "${before_free_kb:-0}") -> $free_str${held_entries:+ — PRESERVED because a live process names them: $held_entries}${keep_entries:+ — preserved: $keep_entries}${stop_note}"
+        fail_closed "$class: $dir was $(mb_str "$before_kb") -> $(mb_str "$after_kb") after evicting every removable entry it could try (prune=$pruned evicted=$evicted) — still over the ${MAX_MB}MB bound; free $(mb_str "${before_free_kb:-0}") -> $free_str${held_entries:+ — PRESERVED because a live process names them: $held_entries}${keep_entries:+ — preserved: $keep_entries}${stop_note}"
         return 0
     fi
 
@@ -917,8 +951,7 @@ lock_acquire() {
         if is_pos_int "$started" && is_pos_int "$now" && [ "$now" -ge "$started" ]; then
             age=$(( now - started ))
         else
-            mtime="$(/bin/date -r "$LOCK_DIR" +%s 2>/dev/null || printf '')"
-            if is_pos_int "$mtime" && is_pos_int "$now" && [ "$now" -ge "$mtime" ]; then
+            if mtime="$(mtime_of "$LOCK_DIR")" && is_pos_int "$now" && [ "$now" -ge "$mtime" ]; then
                 age=$(( now - mtime ))
             fi
         fi
@@ -964,9 +997,10 @@ lock_acquire() {
         if ! mkdir "$LOCK_DIR.break" 2>/dev/null; then
             # ⛔ A breaker that died while holding the token wedges the lock FOR EVER, and every
             # caller reads exit 4 as silence. Age the token out on the lock's own bound.
-            bm="$(/bin/date -r "$LOCK_DIR.break" +%s 2>/dev/null || printf '')"
             break_age=""
-            if is_pos_int "$bm" && is_pos_int "$now" && [ "$now" -ge "$bm" ]; then break_age=$(( now - bm )); fi
+            if bm="$(mtime_of "$LOCK_DIR.break")" && is_pos_int "$now" && [ "$now" -ge "$bm" ]; then
+                break_age=$(( now - bm ))
+            fi
             if [ -n "$break_age" ] && [ "$break_age" -ge "$LOCK_STALE_SECONDS" ]; then
                 plog "pi-cache-reap: clearing a stale break token (age ${break_age}s)"
                 rmdir "$LOCK_DIR.break" 2>/dev/null || true

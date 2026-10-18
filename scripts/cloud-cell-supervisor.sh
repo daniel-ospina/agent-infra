@@ -1356,9 +1356,15 @@ cache_reaper_path() {
   # ${CACHE_REAPER:-} FIRST, exactly like orchestrator-harness/orch-loop.sh: one override must not
   # be honoured by the clock and ignored by the only ARMED caller, or two copies of a deletion
   # policy run on one box, chosen by two different rules.
+  # ONE chain, the same one orchestrator-harness/orch-loop.sh and cloud-cell-bringup.sh use:
+  # ${CACHE_REAPER:-} -> the FARMED copy (what the launchd job and the cell clock execute) -> the
+  # copy beside this script. Farmed BEFORE beside-this-script matters: this supervisor is never
+  # farmed (pi-bootstrap/setup.sh's fleet_srcs does not list it), so a lane running it from a
+  # checkout would otherwise arm a copy it is mid-edit on while the hourly bound the operator reads
+  # about is a different file.
   for cand in "${CACHE_REAPER:-}" \
-              "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/pi-cache-reap.sh" \
-              "${HOME:-}/.pi/agent/scripts/pi-cache-reap.sh"; do
+              "${HOME:-}/.pi/agent/scripts/pi-cache-reap.sh" \
+              "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/pi-cache-reap.sh"; do
     [ -n "$cand" ] || continue
     if [ -f "$cand" ]; then printf '%s' "$cand"; return 0; fi
   done
