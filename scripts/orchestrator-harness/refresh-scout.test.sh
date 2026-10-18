@@ -2300,12 +2300,19 @@ grep -qE '^api repos/[^ ]*/pulls\?([^ ]*[?&])?state=all(&|$)' "$D/gh-calls" 2>/d
 # suite stayed green and the pass printed the very `[reap] SKIPPED: .open_iss not readable` line
 # this case exists to prevent. `.open_iss` is DELETED by a completed pass, so it cannot be asserted
 # afterwards; the pass's OWN log is the durable evidence that the reaper read the listing.
+# ⛔ AND ANY SKIP LINE DISARMS IT, NOT JUST A SKIP NAMING `.open_iss` (review, MEASURED). The reaper
+# refuses on EITHER listing, and its skip line names the missing file(s) — so a pattern keyed on
+# `\.open_iss` scores 0 when the OTHER listing is the unreadable one: redirecting only the pulls
+# listing (`--jq '.[]|.head.ref' > /dev/null`) left the suite PASS=229 FAIL=0 while the pass printed
+# `[reap] SKIPPED: .pr_brs not readable` — reaping nothing, which is the same symptom through the
+# sibling door. The success path has no missing listing, so it prints no skip line at all: ANY skip
+# is an un-reaped pass, which makes the prefix the witness and drops the coupling to a filename.
 reaper_win="$(grep -E '^api repos/[^ ]*/issues\?' "$D/gh-calls" 2>/dev/null | grep -v 'labels=' | head -1)"
 issues_not_open="$(grep -E '^api repos/[^ ]*/issues\?' "$D/gh-calls" 2>/dev/null | grep -v 'state=open' | head -2 | tr '\n' ' ')"
-reaper_skipped="$(printf '%s' "$OUT" | grep -cE '\[reap\] SKIPPED:.*\.open_iss')"
+reaper_skipped="$(printf '%s' "$OUT" | grep -cE '\[reap\] SKIPPED:')"
 { [ -n "$reaper_win" ] && [ -z "$issues_not_open" ] && [ "${reaper_skipped:-1}" -eq 0 ]; } \
-  && ok "starved-graphql: the reaper RAN over an unlabelled state=open window, and EVERY issue listing asks state=open (the three tiers included)" \
-  || bad "the reaper skipped a missing/unreadable .open_iss, or an issue listing does not ask state=open — closed issues would be listed for dispatch (#1705/#8465): reaper_window='$reaper_win' reaper_skipped=$reaper_skipped offenders=$issues_not_open"
+  && ok "starved-graphql: the reaper RAN over an unlabelled state=open window (no skip line on any listing), and EVERY issue listing asks state=open (the three tiers included)" \
+  || bad "the reaper skipped a missing/unreadable listing, or an issue listing does not ask state=open — closed issues would be listed for dispatch (#1705/#8465): reaper_window='$reaper_win' reaper_skipped=$reaper_skipped offenders=$issues_not_open"
 
 # (b) REST ALSO FAILING (HTTP 403, rate limited) -> TRANSIENT, and NOTHING written: no `.open_iss`, no
 #     `.pr_brs`, and the seeded backlog untouched. A truncated or empty listing here is the #1705 bug
