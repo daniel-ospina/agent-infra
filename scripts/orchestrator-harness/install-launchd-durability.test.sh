@@ -439,6 +439,37 @@ assert_eq "$( . "$LIB"; lc_hb_age "$T/o" )" "" "a future heartbeat reads as EMPT
 printf '%s\n' "$(( $(date +%s) - 5 ))" > "$T/o/heartbeat"
 if [ -n "$( . "$LIB"; lc_hb_age "$T/o" )" ]; then ok "non-vacuity: a past heartbeat still reads as an age"
 else bad "lc_hb_age reports nothing for a normal heartbeat"; fi
+# ⛔ AN AGE IS SECONDS SINCE THE WRITE, SO IT CANNOT BE NEGATIVE (review finding): inside the tolerated
+# skew band the subtraction underflowed and `lc_ensure` printed "heartbeat -29s old" for a datum
+# documented as seconds SINCE the write. The band STAYS (a small future skew is a clock wobble); the
+# answer is clamped. Seeded at now+30 so the unrescaled `now - v` is ALWAYS negative (the read's own
+# `date +%s` can only move forward), which is what makes this assertion catch the unclamped mutant
+# rather than pass it on a same-second coincidence.
+printf '%s\n' "$(( $(date +%s) + 30 ))" > "$T/o/heartbeat"
+assert_eq "$( . "$LIB"; lc_hb_age "$T/o" )" "0" "a heartbeat 30s inside the skew band reads as age 0, never negative"
+
+echo "-- B4. a 20-DIGIT run wraps in bash, so it is UNKNOWN — not an instant"
+# ⛔ THE 12-DIGIT LENGTH BOUND IS LOAD-BEARING, NOT DECORATION (review finding), and bash does NOT abort
+# on the overflow: measured `10#99999999999999999999` → 7766279631452241919 with rc 0, so no `set -e`
+# anywhere in the fleet would catch it and a corrupted value can wrap onto a PLAUSIBLE instant. Two
+# shapes, and only the SECOND one pins the bound:
+#   • 2^64+4    wraps to 4 — rejected by the epoch floor with or without the bound (a belt, not the bound);
+#   • 2^64+now  wraps to NOW — indistinguishable from a fresh heartbeat. Delete `[ "${#v}" -le 12 ]`
+#               from either function and this file reads as a live instant again; the two assertions
+#               below are the ones that go red (verified by mutation).
+# The string is built by CONCATENATION on purpose: `$(( 18446744073709551616 + now ))` wraps inside the
+# arithmetic and prints 10 digits, so an arithmetic fixture could never produce the 20-digit file.
+for shape in four now; do
+  case "$shape" in
+    four) big=18446744073709551620 ;;                        # 2^64 + 4
+    now)  big="1844674407$(( 3709551616 + $(date +%s) ))" ;; # 2^64 + now, as DIGITS
+  esac
+  fresh
+  printf '%s\n' "$big" > "$T/o/heartbeat"
+  assert_eq "${#big}" "20" "($shape) the fixture really is a 20-digit run"
+  assert_eq "$( . "$LIB"; lc_hb_age "$T/o" )" "" "($shape) a 20-digit run reads as EMPTY (present, not an instant)"
+  assert_eq "$( . "$LIB"; lc_hb_value "$T/o" )" "0" "($shape) …and as baseline 0, not a wrapped instant"
+done
 
 # ── C. lc_start: order, reporting, and the load fallback ─────────────────────────────────────────
 echo "-- C. lc_start"
@@ -1131,6 +1162,24 @@ export FAKE_HB_EPOCH=1 LC_SETTLE=1
 out="$( . "$LIB"; lc_ensure "$LABEL" "$T/o/x.plist" "$T/o" 1 3 2>&1 )"; rc=$?
 assert_eq "$rc" "0" "a future-dated baseline does not make a healthy start look dead"
 assert_contains "$out" "and the heartbeat advanced" "…the start is reported as verified"
+unset FAKE_HB_EPOCH LC_SETTLE
+
+# …and the BOUNDARY of that band: a heartbeat at exactly `now + 60` must STILL prove a start.
+# ⛔ THE 60s SKEW BAND BELONGS TO THE AGE READ ONLY (review finding). `lc_hb_value` hands this value to
+# `lc_assert_running` as the baseline for `cur > before`, inside a poll whose default window is 30s —
+# HALF the tolerance — so a baseline 60s in the future can never be exceeded in time. Unfixed, a healthy
+# start is reported as "running but NOT cycling" and the printed remedy (`install.sh --restart`) boots
+# the controller out again on every retry: the remedy reproduces the failure it prescribes itself for.
+# FAKE_HB_EPOCH=1 is what makes the controller write the REAL clock after the start (the stub otherwise
+# forces an increase, which would step over a future baseline and hide the defect entirely).
+fresh
+printf '%s\n' "$(( $(date +%s) + 60 ))" > "$T/o/heartbeat"
+assert_eq "$( . "$LIB"; lc_hb_value "$T/o" )" "0" "a heartbeat at now+60 is NOT a baseline (0, not a target 30s out of reach)"
+export FAKE_HB_EPOCH=1 LC_SETTLE=1
+out="$( . "$LIB"; lc_ensure "$LABEL" "$T/o/x.plist" "$T/o" 1 3 2>&1 )"; rc=$?
+assert_eq "$rc" "0" "…and a start over that baseline still PROVES itself"
+assert_contains "$out" "and the heartbeat advanced" "…reported as verified"
+assert_not_contains "$out" "running but NOT cycling" "…and never as 'running but NOT cycling'"
 unset FAKE_HB_EPOCH LC_SETTLE
 
 # ── M. a non-numeric START_TIMEOUT must not zero the poll ────────────────────────────────────────

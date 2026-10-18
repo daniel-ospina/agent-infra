@@ -168,7 +168,7 @@ if [ "$ACTION" = uninstall ]; then
   # job. Folding it into "not loaded" made this loop break on the first iteration and delete the plist
   # over a live controller (review finding).
   # ⛔ AND THE VERDICT COMES FROM THE PROBE ITSELF (review finding): `prc=0` IS the proof that launchd
-  # still holds the label. Deriving the verdict from a SECOND read (`lc_loaded_path`) re-introduced the
+  # still holds the label. Deriving the verdict from a SECOND `path =` read re-introduced the
   # same flattening one layer down — a read that failed, or a block with no parsable `path =` line,
   # returned empty and the plist was deleted with ✅ printed over a job launchd still had.
   held=""; pid=""; unread=""; unread_diag=""; prc=0

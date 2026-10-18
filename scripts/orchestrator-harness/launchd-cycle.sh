@@ -118,14 +118,13 @@ lc_probe() {
   return 2
 }
 
-# lc_loaded_path <label> — the plist PATH launchd has the job loaded from, or empty when it is not
-# loaded (or when the read failed — callers that must tell those apart use `lc_probe`). This is the ONE
-# datum that tells us whether a loaded job is OURS.
-lc_loaded_path() {
-  local out
-  out="$(lc_probe "$1")" || return 0
-  awk '/^[[:space:]]*path = /{ sub(/^[[:space:]]*path = /, ""); print; exit }' <<<"$out"
-}
+# ⛔ THERE IS DELIBERATELY NO `lc_loaded_path` HELPER (review finding). It existed, had ZERO callers, and
+# its banner called it "the ONE datum that tells us whether a loaded job is OURS" — while
+# `lc_guard_mutate` re-implemented the same `path =` parse. TWO parsers of one line, the load-bearing one
+# unexercised: the dead one is exactly what a future editor repairs and trusts. It is DELETED rather than
+# wired in, because a helper that runs its own `lc_probe` would make the guard read launchd a SECOND time
+# and derive its verdict from that read — the stale-answer defect `--uninstall` already paid for (see
+# install.sh). The guard's parse below is therefore the ONE implementation.
 
 # lc_guard_mutate <label> <plist> — the two preconditions EVERY mutating verb must pass first.
 #
@@ -301,7 +300,7 @@ lc_pid() {
 # correction, a file written under another clock, a corrupt value — and `[ -N -le M ]` is true for every
 # negative N, so it would otherwise bless a dead controller forever. Skew up to 60s is tolerated.
 lc_hb_age() {
-  local f="$1/heartbeat" v now
+  local f="$1/heartbeat" v now age
   [ -f "$f" ] || return 0
   v="$(tr -dc '0-9' < "$f" 2>/dev/null)" || return 0
   [ -n "$v" ] || return 0
@@ -318,7 +317,14 @@ lc_hb_age() {
   [ "$v" -ge 1000000000 ] || return 0
   now="$(date +%s)"
   [ "$v" -le "$(( now + 60 ))" ] || return 0
-  printf '%s\n' "$(( now - v ))"
+  # ⛔ AN AGE IS SECONDS SINCE THE WRITE, SO IT CAN NEVER BE NEGATIVE (review finding): inside the
+  # tolerated skew band (now … now+60) `now - v` underflows and `lc_ensure` printed "heartbeat -29s old"
+  # for a value documented as seconds SINCE the write. The band STAYS — a small future skew is a clock
+  # wobble, not corruption — and the answer is clamped instead: "written within the last moment" is the
+  # honest reading of a value at the clock's own edge.
+  age=$(( now - v ))
+  [ "$age" -ge 0 ] || age=0
+  printf '%s\n' "$age"
 }
 
 # lc_hb_value <O> — the raw heartbeat value as a bare integer (0 when unknown), for "did it ADVANCE".
@@ -326,8 +332,8 @@ lc_hb_age() {
 # and the proof is `cur > before`: a future-dated file (clock correction, foreign clock, corruption)
 # makes that target unreachable, so a healthy start is reported as "running but NOT cycling" — with the
 # wrong remedy, and once per `--restart` retry, because each retry re-boots the controller out first
-# (found in review). Same 60s skew tolerance as lc_hb_age, and the same reasoning: an untrustworthy
-# reading must degrade to "unknown", never to a target nothing can exceed.
+# (found in review). An untrustworthy reading must degrade to "unknown", never to a target nothing can
+# exceed — and unlike `lc_hb_age` there is NO skew band here (see the rule at the bottom of the body).
 lc_hb_value() {
   local v now
   # ⛔ THE SAME `-f` GUARD `lc_hb_age` HAS, AND FOR A HARDER REASON (review finding): without it a
@@ -343,7 +349,14 @@ lc_hb_value() {
   v=$(( 10#$v ))
   [ "$v" -ge 1000000000 ] || { printf '0\n'; return 0; }
   now="$(date +%s)"
-  [ "$v" -le "$(( now + 60 ))" ] || v=0
+  # ⛔ NO SKEW BAND HERE, AND THE ASYMMETRY WITH `lc_hb_age` IS DELIBERATE (review finding). This value
+  # is the START-PROOF BASELINE, and that proof is `cur > before` evaluated inside a poll whose DEFAULT
+  # window is 30s (`lc_assert_running`) — HALF the 60s tolerance `lc_hb_age` allows. So a baseline even
+  # a few seconds in the future is a target nothing can reach before the poll gives up: a healthy start
+  # is reported as "running but NOT cycling", with `install.sh --restart` as the printed remedy, and each
+  # retry boots the controller out FIRST. `lc_hb_age` may tolerate a small future skew (it clamps to 0);
+  # a baseline must never be an instant that has not happened yet.
+  [ "$v" -le "$now" ] || v=0
   printf '%s\n' "$v"
 }
 
