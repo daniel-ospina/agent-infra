@@ -72,6 +72,11 @@
 #   (aa) drop `+ $FLEET_JOB_SLACK_S` from the launchd freshness bound       → §9t's job-slack OK arm
 #   (ab) hard-code the controller's bound instead of reading
 #       `FLEET_CONTROLLER_LATE_S`                                           → §9t's controller LATE arm
+#   (ac) restore the zero-tolerance fence (drop the shared 5 s slack)            → §9k's owner arm
+#       and/or §9u's fresh-lock arm — BOTH assert the same property, and the truncation race reddens
+#       whichever of the two reads on the unlucky second (measured: it reddened §9u's on the run that
+#       confirmed this mutation, §9k's on the run before it)
+#   (ad) drop the recycled-pid fence entirely (accept any live pid in the lock) → §9u only
 # A red in a section the mutation does not name means the arm is coupled to the wrong behaviour —
 # e.g. (b) reddening §2 would mean §2 is asserting the controller's duplicate logic.
 
@@ -880,6 +885,34 @@ st="$(state_of "$ROWS" controller)"
 [ "$st" = "UNKNOWN" ] && ok "§9k an UNREADABLE age abstains (UNKNOWN), it does not claim the pid" \
                       || bad "§9k an undatable lock owner must abstain, got [$st] — $(detail_of "$ROWS" controller)"
 kill9 "$HZ"; rm -f "$O/.orch.lock"
+
+# §9u (#2030) THE OTHER HALF OF §9k'S FENCE: a GENUINELY RECYCLED pid is still refused.
+# §9k pins the two abstention arms (readable age → owner, unreadable age → UNKNOWN); it does not pin
+# the RECYCLED case at all, so adding tolerance to the fence could have quietly turned the guard off.
+# A lock written long before the process now holding its pid is the whole point of the guard: the pid
+# was recycled, so it contributes NOBODY and the row reads MISSING (not a false owner). The slack is
+# 5 s, so an hour-old lock is still ~700 slacks past the tolerance.
+say_case "§9u a lock whose pid was RECYCLED contributes nobody (the guard survives the fence slack)"
+seed_quiet_box
+mkdir -p "$T/harness"
+mk_proc_script "$T/harness/orch-loop.sh"
+HR="$(spawn_component "$T/harness/orch-loop.sh")"
+printf '%s\n' "$HR" > "$O/.orch.lock"
+touch -t 202001010000 "$O/.orch.lock"          # the lock predates the process by years
+sleep 0.3
+ROWS="$(run_rows 'fleet_rows ""')"
+st="$(state_of "$ROWS" controller)"
+[ "$st" = "MISSING" ] && ok "§9u a lock naming a RECYCLED pid is not this state dir's controller" \
+                      || bad "§9u a recycled lock pid must contribute nobody, got [$st] — $(detail_of "$ROWS" controller)"
+# …and the SAME pid IS the owner once the lock is younger than the process: the only difference is
+# the fence, so the arm above cannot pass by refusing everything.
+printf '%s\n' "$HR" > "$O/.orch.lock"
+sleep 0.3
+ROWS="$(run_rows 'fleet_rows ""')"
+st="$(state_of "$ROWS" controller)"
+[ "$st" != "MISSING" ] && ok "§9u …while a FRESH lock naming the same live pid is accepted ($st)" \
+                        || bad "§9u a fresh lock naming a live orch-loop.sh must be the owner, got [$st]"
+kill9 "$HR"; rm -f "$O/.orch.lock"
 
 # §9l (issue 2) `start` MUST NOT DUPLICATE A LOOP THAT IS ALREADY RUNNING.
 # A pidfile loop reads FAILING while its process IS alive (the pidfile names a different pid). The
