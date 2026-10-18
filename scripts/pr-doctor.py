@@ -166,7 +166,19 @@ MAX_LANE_ATTEMPTS = 3     # a refused dispatch tries the next idle lane, bounded
 # present, so a cell's `keys.env`, a manual run or a test can supply them without a plist; the
 # shipped defaults are `orch-loop.sh`'s `${VAR:-…}` fallbacks (pinned equal by
 # `scripts/test_pr_doctor.py`) and are the last resort only.
-ORCH_PLIST = os.path.join(HOME, "Library", "LaunchAgents", "com.eldato.orchestrator-loop.plist")
+#
+# ⛔ ONE LABEL WAS NOT ENOUGH (#2044 review finding 3). `install.sh` now renders the label it is
+# ASKED for (`LABEL="${LABEL:-com.eldato.orchestrator-loop}"`), and `harness.sh` passes
+# `com.eldato.orchestrator-stack` — a job that runs `supervisor.sh` and the three workers. This reader
+# still opened the `-loop` path only, so on a box running the stack job it read a file that does not
+# exist and answered 3/4 for the machine's own 16/12. MEASURED on the live box 2026-10-18:
+# `~/Library/LaunchAgents` holds `com.eldato.orchestrator-stack.plist` and NO `-loop` plist — the
+# silent 3/4 was the *current* state, not a hypothetical. The labels below are the resolution ORDER,
+# most specific first; `ORCH_LABEL` is the installer's own default (pinned default-to-default by
+# `test_orch_plist_path_is_pinned_to_install_sh_label`, which is what catches a silent rename).
+ORCH_LABEL = "com.eldato.orchestrator-loop"            # install.sh's LABEL= default
+ORCH_LABEL_STACK = "com.eldato.orchestrator-stack"    # harness.sh's fallback when discovery fails
+ORCH_PLIST = os.path.join(HOME, "Library", "LaunchAgents", ORCH_LABEL + ".plist")
 DEFAULT_MAX_FIX = 3
 DEFAULT_MAX_REVIEW = 4
 
@@ -199,27 +211,63 @@ def ts() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _orchestrator_plists() -> list:
+    """Every plist that could hold THIS box's capacity block, most specific first.
+
+    An explicit `ORCH_PLIST` path (a cell, a test, a hand-placed render) wins outright and is the
+    only candidate considered. Otherwise the candidates are the label `LABEL` names — the seam
+    `install.sh` and `harness.sh` both use — then the `-stack` job, then the installer's `-loop`
+    default. **First file that EXISTS wins**, so a box that renders only one of the two labels is
+    read correctly whichever it rendered, and one stale plist cannot shadow a live one.
+
+    ⛔ THE DIRECTORY COMES FROM `ORCH_PLIST`, NOT FROM `HOME`. That is deliberate: the pool of
+    candidate labels is real, but a test (or a caller) that redirects `ORCH_PLIST` into a sandbox
+    redirects the WHOLE pool with it — otherwise a unit test on a developer's Mac would read the
+    real `~/Library/LaunchAgents` and inherit that machine's 16/12 (see `_clean_env` in
+    test_pr_doctor.py).
+    """
+    explicit = os.environ.get("ORCH_PLIST", "")
+    if explicit:
+        return [explicit]
+    names = []
+    label = (os.environ.get("LABEL") or "").strip()
+    # `install.sh` refuses a label with a `/` or a space; a value that would escape the directory is
+    # ignored here rather than joined onto a path.
+    if label and re.fullmatch(r"[A-Za-z0-9._-]+", label):
+        names.append(label)
+    names.extend([ORCH_LABEL_STACK, ORCH_LABEL])
+    out = []
+    for n in names:
+        p = os.path.join(os.path.dirname(ORCH_PLIST), n + ".plist")
+        if p not in out:
+            out.append(p)
+    return out
+
+
 def _orchestrator_env() -> dict:
     """The orchestrator's EnvironmentVariables -- the machine's capacity model, one home.
 
     `install.sh` renders this plist and launchd feeds the block to `orch-loop.sh`; reading the
     file is reading the SAME block, so this source never carries a private copy of the limits.
-    An unreadable or absent plist is NOT an error here: the environment and then the shipped
-    defaults still apply, and every read below is total.
+    An unreadable or absent plist is NOT an error here: the NEXT candidate is tried, then the
+    environment, then the shipped defaults, and every read below is total.
     """
-    try:
-        with open(ORCH_PLIST, "rb") as f:
-            pl = plistlib.load(f)
-    except Exception:
-        return {}
-    # The ROOT shape is guarded too: `plistlib.load` happily returns a list/str/int for a
-    # well-formed plist whose top level is not a mapping, and `pl.get` would then raise OUTSIDE
-    # the try -- aborting the whole pass instead of falling back. Shape-guard the root, then the
-    # EnvironmentVariables value.
-    if not isinstance(pl, dict):
-        return {}
-    env = pl.get("EnvironmentVariables")
-    return env if isinstance(env, dict) else {}
+    for path in _orchestrator_plists():
+        try:
+            with open(path, "rb") as f:
+                pl = plistlib.load(f)
+        except Exception:
+            continue
+        # The ROOT shape is guarded too: `plistlib.load` happily returns a list/str/int for a
+        # well-formed plist whose top level is not a mapping, and `pl.get` would then raise OUTSIDE
+        # the try -- aborting the whole pass instead of falling back. Shape-guard the root, then the
+        # EnvironmentVariables value, and keep looking if this candidate is not usable.
+        if not isinstance(pl, dict):
+            continue
+        env = pl.get("EnvironmentVariables")
+        if isinstance(env, dict):
+            return env
+    return {}
 
 
 def capacity() -> dict:

@@ -17,6 +17,7 @@ Run:  <venv>/bin/python -m pytest test_pr_doctor.py -q
 from __future__ import annotations
 
 import importlib.util
+import os
 import pathlib
 import re
 import sys
@@ -67,12 +68,16 @@ def _lane(n: int) -> dict:
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch):
     """A test must never inherit the developer's or the CI runner's capacity env."""
-    for k in ("MAX_FIX", "MAX_REVIEW"):
+    for k in ("MAX_FIX", "MAX_REVIEW", "LABEL", "ORCH_PLIST"):
         monkeypatch.delenv(k, raising=False)
     # Point the plist at a path that cannot exist, so a sandbox that happens to have the
     # orchestrator installed does not leak its values into a unit test. `raising=False` keeps the
     # end-to-end cap test runnable against the PRE-fix file, so its failure is behavioural (4
     # dispatches, not 10) rather than an AttributeError.
+    #
+    # ⛔ THE RESOLVER DERIVES ITS CANDIDATE POOL FROM THIS PATH'S DIRECTORY (#2044), so this stub
+    # redirects the whole pool, not just one filename: `_orchestrator_plists()` yields
+    # `/nonexistent/pr-doctor-test/{stack,loop}.plist`, neither of which can exist.
     monkeypatch.setattr(pr, "ORCH_PLIST", "/nonexistent/pr-doctor-test/loop.plist", raising=False)
 
 
@@ -99,7 +104,7 @@ def test_capacity_reads_the_orchestrator_plist(monkeypatch, tmp_path):
 
 def test_environment_wins_over_the_plist(monkeypatch, tmp_path):
     import plistlib
-    plist = tmp_path / "loop.plist"
+    plist = tmp_path / (pr.ORCH_LABEL + ".plist")
     with open(plist, "wb") as f:
         plistlib.dump({"EnvironmentVariables": {"MAX_FIX": "16", "MAX_REVIEW": "12"}}, f)
     monkeypatch.setattr(pr, "ORCH_PLIST", str(plist))
@@ -138,7 +143,7 @@ def test_capacity_tolerates_a_plist_whose_root_is_not_a_dict(monkeypatch, tmp_pa
     pre-fix code never read the plist at all) instead of using the env/defaults.
     """
     import plistlib
-    plist = tmp_path / "loop.plist"
+    plist = tmp_path / (pr.ORCH_LABEL + ".plist")
     with open(plist, "wb") as f:
         plistlib.dump([{"Label": "com.eldato.orchestrator-loop"}], f)
     monkeypatch.setattr(pr, "ORCH_PLIST", str(plist))
@@ -149,18 +154,83 @@ def test_capacity_tolerates_a_plist_whose_root_is_not_a_dict(monkeypatch, tmp_pa
 def test_orch_plist_path_is_pinned_to_install_sh_label():
     """The ONE home must not silently evaporate if the launchd label is renamed.
 
-    `install.sh` owns the label; if it changes and pr-doctor's literal does not, `capacity()`
+    `install.sh` owns the label; if it changes and pr-doctor's default does not, `capacity()`
     reads a nonexistent file and falls back to 3/4 -- the exact regression this change removes --
-    with the suite still green. Pin pr-doctor's literal to the installer's own `LABEL=`.
+    with the suite still green. Pin pr-doctor's default to the installer's own `LABEL=` default.
     (Read the source literal: the autouse fixture stubs the runtime path.)
+
+    ⛔ DEFAULT TO DEFAULT. `install.sh` renders `${LABEL:-<default>}`, so the plist it writes
+    WITHOUT an override is `<default>.plist`. Comparing the two literals is what catches a silent
+    rename of either side; comparing the *override* would be comparing a runtime choice to a
+    compile-time one, and would pin the wrong thing.
     """
     src = (_REPO / "scripts" / "pr-doctor.py").read_text()
-    lm = re.search(r'ORCH_PLIST = os\.path\.join\(HOME, "Library", "LaunchAgents", "([^"]+)"\)', src)
-    assert lm, "pr-doctor.py no longer builds ORCH_PLIST from a literal plist name"
+    lm = re.search(r'^ORCH_LABEL = "([^"]+)"', src, re.M)
+    assert lm, "pr-doctor.py no longer names the installer's label in ORCH_LABEL"
     inst = (_REPO / "scripts" / "orchestrator-harness" / "install.sh").read_text()
-    im = re.search(r'^LABEL="([^"]+)"', inst, re.M)
-    assert im, "install.sh no longer assigns LABEL with a quoted value"
-    assert lm.group(1) == im.group(1) + ".plist"
+    # `LABEL="com.x"` or `LABEL="${LABEL:-com.x}"` -- the DEFAULT is what both must agree on. The
+    # capture excludes `"`, `$` and `{`/`}` so the override wrapper is transparent to it.
+    im = re.search(r'^LABEL="(?:\$\{LABEL:-)?([^"${}]+)\}?"', inst, re.M)
+    assert im, "install.sh no longer assigns LABEL with a quoted (optionally ${LABEL:-default}) value"
+    assert lm.group(1) == im.group(1), \
+        "pr-doctor's default label must be install.sh's LABEL default"
+    # The runtime path is stubbed by the autouse fixture; what must stay TRUE is the constructor:
+    # the default plist name is built from `ORCH_LABEL`, so the label is the one home of the name.
+    assert re.search(
+        r'^ORCH_PLIST = os\.path\.join\(HOME, "Library", "LaunchAgents", ORCH_LABEL \+ "\.plist"\)$',
+        src, re.M), "pr-doctor.py no longer builds the default plist path from ORCH_LABEL"
+
+
+def _write_plist(path, env):
+    import plistlib
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "wb") as f:
+        plistlib.dump({"Label": path.stem, "EnvironmentVariables": env}, f)
+    return path
+
+
+def test_capacity_reads_the_stack_plist_when_that_is_what_the_box_runs(monkeypatch, tmp_path):
+    """THE MEASURED LIVE STATE (#2044 finding 3): `-stack` present, `-loop` ABSENT.
+
+    Before this fix `capacity()` opened the `-loop` path only, found nothing and answered 3/4 on a
+    box configured 16/12 -- the throttling this whole file exists to prevent, reintroduced by the
+    label override. The plist that EXISTS must be the one read.
+    """
+    _write_plist(tmp_path / (pr.ORCH_LABEL_STACK + ".plist"),
+                 {"MAX_FIX": "16", "MAX_REVIEW": "12"})
+    monkeypatch.setattr(pr, "ORCH_PLIST", str(tmp_path / (pr.ORCH_LABEL + ".plist")))
+    assert pr.capacity() == {"max_fix": 16, "max_review": 12}
+
+
+def test_capacity_reads_the_loop_plist_when_only_that_one_exists(monkeypatch, tmp_path):
+    """The other half: a box that renders ONLY the installer default is read just as correctly."""
+    _write_plist(tmp_path / (pr.ORCH_LABEL + ".plist"),
+                 {"MAX_FIX": "7", "MAX_REVIEW": "5"})
+    monkeypatch.setattr(pr, "ORCH_PLIST", str(tmp_path / (pr.ORCH_LABEL + ".plist")))
+    assert pr.capacity() == {"max_fix": 7, "max_review": 5}
+
+
+def test_capacity_follows_the_label_seam_install_sh_and_harness_sh_share(monkeypatch, tmp_path):
+    """`LABEL=com.example.other` renders a plist this reader must follow -- the override's whole point."""
+    _write_plist(tmp_path / "com.example.other.plist", {"MAX_FIX": "9", "MAX_REVIEW": "8"})
+    monkeypatch.setattr(pr, "ORCH_PLIST", str(tmp_path / (pr.ORCH_LABEL + ".plist")))
+    monkeypatch.setenv("LABEL", "com.example.other")
+    assert pr.capacity() == {"max_fix": 9, "max_review": 8}
+
+
+def test_a_label_that_is_not_a_label_is_ignored_not_joined(monkeypatch, tmp_path):
+    """`LABEL=../evil` must not become a path escape; the safe candidates still apply."""
+    _write_plist(tmp_path / (pr.ORCH_LABEL_STACK + ".plist"),
+                 {"MAX_FIX": "16", "MAX_REVIEW": "12"})
+    monkeypatch.setattr(pr, "ORCH_PLIST", str(tmp_path / (pr.ORCH_LABEL + ".plist")))
+    monkeypatch.setenv("LABEL", "../../escape")
+    assert pr.capacity() == {"max_fix": 16, "max_review": 12}
+
+
+def test_no_candidate_present_still_answers_the_shipped_defaults(monkeypatch, tmp_path):
+    """A total read: no plist anywhere is the defaults, never a crash and never a silent 0."""
+    monkeypatch.setattr(pr, "ORCH_PLIST", str(tmp_path / (pr.ORCH_LABEL + ".plist")))
+    assert pr.capacity() == {"max_fix": pr.DEFAULT_MAX_FIX, "max_review": pr.DEFAULT_MAX_REVIEW}
 
 
 # ── 2. the cap is consumed per class, and a stale row does not consume it ─────────────────
