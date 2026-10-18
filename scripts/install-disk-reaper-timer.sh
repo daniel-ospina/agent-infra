@@ -184,6 +184,17 @@ refuse_transient_target() {
         err "SYSTEMD_UNIT_DIR to a scratch dir when this is a test."
         return 1
     fi
+    # The unit PINS the three delegates beside $REAPER, so a missing one is a class that fails
+    # closed (exit 3, red) on every pass — name it at install time rather than after the fact.
+    for d in pi-cache-reap.sh reap-lane-venvs.sh pi-reap-worktrees.sh; do
+        [ -f "${REAPER%/*}/$d" ] || err "WARNING: ${REAPER%/*}/$d is missing — the unit pins it, so that class will fail closed (exit 3, red) every pass"
+    done
+    # The service runs as the INVOKING user, so writeability tested here is the service's own. A
+    # state dir it cannot write makes every pass exit 3 on a unit that installed cleanly.
+    if ! mkdir -p "$STATE_DIR" 2>/dev/null || [ ! -w "$STATE_DIR" ]; then
+        err "REFUSING: state dir '$STATE_DIR' is not writable by $(id -un) — the unit runs as this user and every pass would fail closed (exit 3)"
+        return 1
+    fi
     # ── Whitespace: systemd SPLITS unquoted Environment=/ExecStart= values, so a path containing a
     # space renders a unit that cannot run (measured: HOME="…/bg/my home"). Refuse, do not escape.
     for v in "HOME=$HOME" "PATH=$PATH" "STATE_DIR=$STATE_DIR" "REPOS=$REPOS" "REAPER=$REAPER"; do
@@ -214,6 +225,7 @@ render() { # render <template> <dest>
         -e "s|{{REPOS}}|$REPOS|g" \
         -e "s|{{AGED_DAYS}}|$AGED_DAYS|g" \
         -e "s|{{REAPER}}|$REAPER|g" \
+        -e "s|{{REAPER_DIR}}|${REAPER%/*}|g" \
         "$tpl" >"$dest" || return 1
     grep -q '{{' "$dest" && { err "unresolved placeholder in $tpl"; grep -n '{{' "$dest" >&2; return 1; }
     return 0

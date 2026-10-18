@@ -21,6 +21,15 @@ Environment=PATH={{PATH}}
 Environment=DISK_REAPER_STATE_DIR={{STATE_DIR}}
 Environment=DISK_REAPER_REPOS={{REPOS}}
 Environment=DISK_REAPER_WT_AGED_DAYS={{AGED_DAYS}}
+# ⛔ THE DELEGATES ARE PINNED TO THE INSTALLED COPY, not left to $HOME. find_delegate prefers
+# $HOME/.pi/agent/scripts, so a unit whose HOME happens to contain an older farmed copy silently ran
+# THAT policy instead of the one installed beside this unit — measured on pi-cell-3, where the
+# worktree class failed with "not a git repository: /tmp/cell-t3" against a stale copy while the
+# freshly-installed one was never consulted. A pin is authoritative and fails CLOSED if it is gone,
+# which is the behaviour a deletion tool wants.
+Environment=CACHE_REAPER={{REAPER_DIR}}/pi-cache-reap.sh
+Environment=VENV_REAPER={{REAPER_DIR}}/reap-lane-venvs.sh
+Environment=WORKTREE_REAPER={{REAPER_DIR}}/pi-reap-worktrees.sh
 # The worktree owner must ask GitHub which PRs are open before it may delete anything. A busy cell
 # shares one account with every other box, so the harness gh shim backs off; this timeout is above
 # that backoff window. If it still cannot answer, the class FAILS CLOSED (a checkout with an open PR
