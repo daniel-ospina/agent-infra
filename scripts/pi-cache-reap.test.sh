@@ -153,6 +153,20 @@ if [ "\$1" = cache ] && [ "\$2" = prune ]; then
 fi
 exit 0
 SH
+# The shapes that were MISSED until they were reproduced: a bare `pip3` (no absolute path at
+# all), `env -u VAR uv`, and `env VAR=1 uvx`.
+cat >"$T/bin/ps-pip3" <<'SH'
+#!/bin/sh
+printf '%s\n' "  5154 pip3 install requests"
+SH
+cat >"$T/bin/ps-envu" <<'SH'
+#!/bin/sh
+printf '%s\n' "  5155 /usr/bin/env -u TORTOISE_REPO uv sync"
+SH
+cat >"$T/bin/ps-envv" <<'SH'
+#!/bin/sh
+printf '%s\n' "  5156 /usr/bin/env UV_CACHE_DIR=/x uvx ruff check"
+SH
 cat >"$T/bin/uv-fail" <<'SH'
 #!/bin/sh
 exit 1
@@ -327,7 +341,8 @@ echo "── 4a. a live npm / pip holder is seen too (they are not native binari
 # The holder class must match the CACHE class under test: npm's cache is $HOME/.npm (the ROOT —
 # its `_cacache` child is what the matcher used to be written against), pip's is $HOME/.cache/pip
 # (a uv-class fixture would never consult the npm/pip matcher).
-for pair in "ps-npm:.npm" "ps-pip:.cache/pip" "ps-pip2:.cache/pip"; do
+for pair in "ps-npm:.npm" "ps-pip:.cache/pip" "ps-pip2:.cache/pip" \
+            "ps-pip3:.cache/pip" "ps-envu:.cache/uv" "ps-envv:.cache/uv"; do
   stub="${pair%%:*}"; cdir="${pair#*:}"
   H="$T/h4a-$stub"
   new_cache "$H/$cdir" 3000 2000

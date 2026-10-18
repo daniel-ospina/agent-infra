@@ -1281,9 +1281,9 @@ cmd_status() {
   # otherwise read exactly like a healthy cell, which is the blind spot #1987 was filed for.
   if [ -f "$O/state/.cache-reap-blocked" ]; then
     # NOT "fail-closed": exit 5 (a cache over bound on the shipped dry-run stance) is the common
-  # case on an unarmed box, and the reaper's exit vocabulary calls only 3 fail-closed. The record
-  # below already names the cause (5 = unarmed, 3 = the pass failed) — do not contradict it.
-  say "⛔ CACHE BOUND NOT ENFORCED — the package-cache reaper's last pass:"
+    # case on an unarmed box, and the reaper's exit vocabulary calls only 3 fail-closed. The record
+    # below already names the cause (5 = unarmed, 3 = the pass failed) — do not contradict it.
+    say "⛔ CACHE BOUND NOT ENFORCED — the package-cache reaper's last pass:"
     sed 's/^/    /' "$O/state/.cache-reap-blocked"
   fi
   # the loop's own view of itself

@@ -157,9 +157,11 @@
 #
 # Exit codes: 0 every present cache is under its bound (a pass that acted also verified the
 # reclaim) · 2 usage (unknown argument) · 3 fail-closed (the cache could not be measured or
-# seen, an entry name could not be represented, an entry's sharing or filesystem could not be
-# determined, a live tool run made eviction unsafe, the reclaim could not be verified, or the
-# audit log cannot be written on an armed pass) · 4 did not run (another pass holds the lock) ·
+# seen, an entry name could not be represented, the reclaim could not be verified, or the audit log
+# cannot be written on an armed pass; an entry's sharing or filesystem that cannot be determined, or
+# a tool run that starts mid-pass, STOPS the eviction and rides that cache's verdict as a STOPPING
+# note — exit 3 if the cache is still over its bound, exit 0 with the note if the pass had already
+# brought it under and verified the reclaim) · 4 did not run (another pass holds the lock) ·
 # 5 a cache is OVER its bound and nothing was done about it (dry-run — the shipped stance).
 # ⚠️ NOT the sibling reapers' vocabulary: pi-reap-worktrees.sh uses 4 for "a removal FAILED"
 # and 3 for "lock held". Here 4 is a benign skip and 3 is always fail-closed; a fleet reader
@@ -821,6 +823,15 @@ reap_target() {
         || { fail_closed "$class: cannot measure $dir after the pass — the shrink cannot be verified${stop_note}"; return 0; }
     after_free_kb="$(free_kb "$dir")"
 
+    # ⛔ A HARD STOP IS THIS CACHE'S ONE VERDICT — whatever the final size. Gating this on
+    # `after_kb > MAX_KB` left one path that reported the cache TWICE: a hard stop followed by a
+    # final measurement that landed under the bound (a concurrent prune/eviction) printed the
+    # FAIL-CLOSED line and then "… VERIFIED" for the same cache, which `grep VERIFIED` mis-reports
+    # (measured). Returning here cannot hide a real bound violation: a hard stop already exits 3.
+    if [ "$hard_stop" -eq 1 ]; then
+        return 0
+    fi
+
     case "${before_free_kb:-}:${after_free_kb:-}" in
         :*|*:)
             fail_closed "$class: $dir shrank $(mb_str "$before_kb") -> $(mb_str "$after_kb") but free space could not be read before and after (df) — the bytes actually freed are NOT verified (the entries may be hardlinked into live .venv trees)${stop_note}"
@@ -830,11 +841,6 @@ reap_target() {
     # ⛔ ONE VERDICT PER CACHE: the still-over-bound check comes BEFORE the success line.
     # Printing "VERIFIED" and then "FAIL-CLOSED … STILL over bound" leaves a log in which
     # `grep VERIFIED` reports a cache that was never bounded.
-    if [ "$after_kb" -gt "$MAX_KB" ] && [ "$hard_stop" -eq 1 ]; then
-        # The mid-loop refusal above IS this cache's one verdict; a second line here would report one
-        # cache twice (measured: a single uv cache printed "FAILED — 2 cache(s) …").
-        return 0
-    fi
     if [ "$after_kb" -gt "$MAX_KB" ]; then
         free_str="could not be read"
         [ -n "${after_free_kb:-}" ] && free_str="$(mb_str "$after_free_kb")"
@@ -986,7 +992,10 @@ lock_acquire() {
         # its CONTENT was never checked. The credential must be something only this reaper writes:
         # a `kind` marker, plus an owner and a start stamp that PARSE as positive integers.
         if ! lock_is_ours; then
-            printf '%s\n' "pi-cache-reap: $LOCK_DIR exists, is older than ${LOCK_STALE_SECONDS}s, and is not a lock this reaper made (kind/owner/started do not match) — it will not be removed (exit 3)" >&2
+            # `say`, not stderr: the launchd job deliberately captures no stderr, so a refusal
+            # written only there is dropped on the one platform where this runs unattended — the
+            # job then refuses silently, every hour, with nothing in its log.
+            say "pi-cache-reap: $LOCK_DIR exists, is older than ${LOCK_STALE_SECONDS}s, and is not a lock this reaper made (kind/owner/started do not match) — it will not be removed (exit 3)"
             return 3
         fi
         plog "pi-cache-reap: breaking a stale lock (owner=${owner:-?} age=${age}s)"

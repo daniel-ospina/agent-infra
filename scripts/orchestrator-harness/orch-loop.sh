@@ -1064,14 +1064,18 @@ while true; do
     touch "$O/state/.cache-reaped"
     # The same chain as the supervisor and bring-up: ${CACHE_REAPER:-} -> the FARMED copy ->
     # the copy beside the bundle (scripts/pi-cache-reap.sh, one directory up from this harness).
-    _cache_reaper="${CACHE_REAPER:-}"
-    if [ -z "$_cache_reaper" ]; then
-      if [ -f "${HOME:-}/.pi/agent/scripts/pi-cache-reap.sh" ]; then
-        _cache_reaper="${HOME:-}/.pi/agent/scripts/pi-cache-reap.sh"
-      else
-        _cache_reaper="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." 2>/dev/null && pwd)/pi-cache-reap.sh"
-      fi
-    fi
+    # The SAME chain, in the SAME order, as cloud-cell-supervisor.sh and cloud-cell-bringup.sh:
+    # ${CACHE_REAPER:-} -> the FARMED copy -> the copy beside the bundle. A loop, not an if/else:
+    # with an if/else a NON-EMPTY but mistyped override selected nothing and the clock went
+    # permanently silent (a log line only — `.cache-reap-blocked` was never written, so `status` said
+    # nothing) while the armed prune path on the same box ran the farmed copy.
+    _cache_reaper=""
+    for _cand in "${CACHE_REAPER:-}" \
+                 "${HOME:-}/.pi/agent/scripts/pi-cache-reap.sh" \
+                 "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." 2>/dev/null && pwd)/pi-cache-reap.sh"; do
+      [ -n "$_cand" ] && [ -f "$_cand" ] && { _cache_reaper="$_cand"; break; }
+    done
+    [ -n "$_cache_reaper" ] || _cache_reaper="${CACHE_REAPER:-${HOME:-}/.pi/agent/scripts/pi-cache-reap.sh}"
     if [ -f "$_cache_reaper" ]; then
       # ⛔ `&` discards the exit status, and that status is the reaper's ONLY signal (the class the
       # ⛔ further down this file records for the refresh:
