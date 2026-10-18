@@ -1331,6 +1331,39 @@ sweep_root_caches() {
   find "$root" -maxdepth 5 -type d -name __pycache__ -prune -exec rm -rf {} + 2>/dev/null || true
 }
 
+# The MACHINE-GLOBAL package caches (agent-infra#1987) — a sink sweep_root_caches can NEVER reach:
+# every path above is resolved from a WORKTREE root, and the space that took `pi-cell-3` to 258MB
+# free was `$HOME/.cache/uv` at 7.1GB, shared by every lane on the box. So `prune` (the low-disk
+# remedy `start` calls unattended, and the verb an operator reaches for) must bound it too, or the
+# remedy reports a freed-disk number while the largest consumer is untouched.
+# The POLICY is not re-implemented here: it is delegated to scripts/pi-cache-reap.sh, its single
+# owner (prune first; then evict only entries no live process is holding, stopping as soon as
+# deletion stops reclaiming disk; exit 3 when a shrink it acted on is unverified). This function
+# only finds that script.
+cache_reaper_path() {
+  local cand
+  for cand in "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/pi-cache-reap.sh" \
+              "${HOME:-}/.pi/agent/scripts/pi-cache-reap.sh"; do
+    [ -n "$cand" ] || continue
+    if [ -f "$cand" ]; then printf '%s' "$cand"; return 0; fi
+  done
+  return 1
+}
+
+reap_global_caches() {
+  local reaper rc
+  if ! reaper="$(cache_reaper_path)"; then
+    # NEVER silent: a prune that leaves the biggest consumer alone because a script was missing is
+    # the same false PASS this repo keeps removing. Named, with the remedy.
+    say "warn: pi-cache-reap.sh not found (looked beside this script and in \$HOME/.pi/agent/scripts) — the machine-global uv/npm/pip caches were NOT bounded. Farm it: bash pi-bootstrap/setup.sh"
+    return 0
+  fi
+  rc=0
+  bash "$reaper" --apply || rc=$?
+  [ "$rc" -eq 0 ] || say "warn: the cache reaper exited $rc — see ${CACHE_REAP_LOG:-$HOME/.pi/agent/state/pi-cache-reap.log}"
+  return 0
+}
+
 # Is <path> a worktree of $REPO or $HARNESS_REPO? Scratch deletion must never touch one — a worktree
 # may hold unmerged work, and that is the one thing this verb must not destroy.
 registered_worktree() {
@@ -1428,6 +1461,7 @@ cmd_prune() {
       < <(git -C "$r" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10)}')
     sweep_root_caches "$r"
   done
+  reap_global_caches
   [ "$caches_only" = 1 ] && { after="$(free_mb "$CELL_HOME")"; [ -n "$before" ] && [ -n "$after" ] && say "prune: free ${before}MB → ${after}MB"; return 0; }
   # (3) /tmp review scratch. REPORTED, never deleted implicitly: a scratch checkout is source, and
   # the brief is explicit that source may be unmerged work. --scratch deletes only what is (a) a git

@@ -433,6 +433,49 @@ check_operational_layer() {
   fi
 }
 
+# ── disk: the machine-global package caches (agent-infra#1987) ─────────────────────
+# REPORT ONLY, and deliberately not a refusal: a cache over its bound is the state the box is
+# in BEFORE it stops dispatching, and this check exists so that state is VISIBLE while there is
+# still room to fix it. The refusal lives where the consequence is (cloud-cell-supervisor.sh
+# cmd_check_disk's MIN_FREE_MB floor); binding a cache SIZE into `--check` would fail a cell
+# that is working fine on a large disk. Measured on pi-cell-3: 258MB free, `~/.cache/uv` alone
+# 7.1GB — every dispatch refused, and nothing on the box reported the cache as the cause.
+check_caches() {
+  local d kb total=0 listed="" maxmb bound over=0
+  maxmb="${CACHE_REAP_MAX_MB:-2048}"
+  case "$maxmb" in ''|*[!0-9]*|0*) maxmb=2048 ;; esac
+  bound=$(( 10#$maxmb * 1024 ))
+  for d in "$HOME/.cache/uv" "$HOME/.npm/_cacache" "$HOME/.cache/pip" "$HOME/Library/Caches/pip"; do
+    if [ ! -d "$d" ]; then
+      listed="$listed, $(basename "$(dirname "$d")")/$(basename "$d")=absent"
+      continue
+    fi
+    # A cache that cannot be measured is REPORTED as unmeasurable — never as 0, which would read
+    # as "nothing to see" for the one number this check exists to surface.
+    kb="$(du -sk "$d" 2>/dev/null | awk 'NR==1 {print $1}')"
+    case "${kb:-}" in
+      ''|*[!0-9]*)
+        warn "cache $d: cannot be measured (du failed) — a full disk reads healthy when nothing is measured"
+        listed="$listed, $d=unmeasurable"
+        continue ;;
+    esac
+    total=$(( total + kb ))
+    if [ "$kb" -gt "$bound" ]; then
+      over=$(( over + 1 ))
+      listed="$listed, $d=$(( kb / 1024 ))MB OVER"
+    else
+      listed="$listed, $d=$(( kb / 1024 ))MB"
+    fi
+  done
+  listed="${listed#, }"
+  ok "caches: $listed — total $(( total / 1024 ))MB (bound ${maxmb}MB per cache)"
+  if [ "$over" -gt 0 ]; then
+    warn "  $over package cache(s) exceed the ${maxmb}MB bound — this is the sink that took pi-cell-3"
+    warn "  from 7.1GB in ~/.cache/uv to 258MB free and refused every dispatch (#1987). Reclaim it now:"
+    warn "    bash $HOME/.pi/agent/scripts/pi-cache-reap.sh --apply"
+  fi
+}
+
 main() {
   export HOME_ORIG="${HOME:-}"
   say "cloud-cell bringup — mode=$MODE uid=$(id -u)"
@@ -446,12 +489,13 @@ main() {
       check_repo
       check_dispatch
       check_operational_layer
+      check_caches
       # `CELL READY` is a claim about the cell, and "no pushed credential left on disk" is part of
       # it. The EXIT trap covers every other exit path; this makes the banner's own path fail-closed
       # too, so the banner is never printed while a registered secret is still there.
       remove_secrets \
         || die "a secret file could not be removed — refusing to report readiness; delete it by hand before using this VM"
-      say "CELL READY — all links verified (home, tools, network, provider, gh auth, push, clone, dispatch pre-flight, operational layer)"
+      say "CELL READY — all links verified (home, tools, network, provider, gh auth, push, clone, dispatch pre-flight, operational layer, caches reported)"
       ;;
     *)
       say "unknown mode: $MODE (use --check)"; exit 2 ;;

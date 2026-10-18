@@ -153,6 +153,18 @@ case "$BR_OUT" in
 esac
 [ ! -e "$TOK" ] && ok "token file removed on the success path (as before the fix)" \
                 || bad "token file SURVIVED a successful run"
+# #1987 — the machine-global package caches are REPORTED by --check, so a growing disk is visible
+# BEFORE it stops dispatch (measured: pi-cell-3 refused every dispatch at 258MB free while a 7.1GB
+# ~/.cache/uv went unreported). Report-only by design: a cache over its bound must not refuse a
+# cell that has room, so this asserts the LINE, not a failure.
+case "$BR_OUT" in
+  *"caches:"*) ok "bring-up REPORTS the machine-global package caches (#1987)" ;;
+  *) bad "bring-up does not report the package caches — a disk sink is invisible again (#1987): $BR_OUT" ;;
+esac
+case "$BR_OUT" in
+  *"per cache)"*) ok "the cache report carries the bound (an operator can see what 'too big' means)" ;;
+  *) bad "the cache report does not name the bound: $BR_OUT" ;;
+esac
 
 # ── 2b) a cell that ALREADY carries the layer is a read-back, not a re-install (#1723) ───────────
 # `--check` verifies first and only installs when the read-back refuses, so a re-run against a

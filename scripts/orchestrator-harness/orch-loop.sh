@@ -1048,6 +1048,24 @@ while true; do
     fi
   fi
 
+  # ── machine-global package caches (agent-infra#1987) ───────────────────────
+  # A Linux cell has no launchd, so THIS loop is the only clock it has; on a Mac the clock is
+  # com.eldato.pi-cache-reap. Same script, same policy, two triggers — the reaper is the single
+  # owner of the bound, and a pass is idempotent and cheap when a cache is under it. The hourly
+  # stamp is deliberately the same idiom as claim_prune above (this loop's clock is mtime-based).
+  # MEASURED: on pi-cell-3 `~/.cache/uv` reached 7.1GB and the box refused EVERY dispatch at
+  # 258MB free while this controller kept beating and the queue read fine — a dispatch refusal
+  # that looks like an empty queue. Nothing on the box bounded that sink.
+  if [ -z "$(find "$O/state/.cache-reaped" -mmin -60 2>/dev/null)" ]; then
+    touch "$O/state/.cache-reaped"
+    _cache_reaper="${CACHE_REAPER:-${HOME:-}/.pi/agent/scripts/pi-cache-reap.sh}"
+    if [ -f "$_cache_reaper" ]; then
+      ( bash "$_cache_reaper" --apply >>"$LOG" 2>&1 ) &
+    else
+      echo "[cache-reap] NOT RUN — $_cache_reaper is absent, so the machine-global uv/npm/pip caches are unbounded (farm it: pi-bootstrap/setup.sh)" >> "$LOG"
+    fi
+  fi
+
   # ── ownership: the merge-priority gate's input ──────────────────────────────
   # Merge priority counts what is UNOWNED, not what is open: a PR that is mid-review, mid-fix,
   # mid-merge, or held by a claim on another box is healthy queue depth, not a reason to stop
