@@ -70,6 +70,7 @@ adopt-fix.sh
 install.sh
 check-deployed-drift.sh
 check-port-drift.sh
+cloud-cell-doctor.sh
 report.sh
 # ── launchd job templates (rendered by install.sh; a stack label rendered from the single-loop
 #    template would replace a supervised stack with a bare loop — see harness.sh's TEMPLATE rule) ──
@@ -91,6 +92,7 @@ sweep-quota.test.sh
 refresh-scout.test.sh
 claim-cwd.test.sh
 claim-exclusion.test.sh
+cloud-cell-doctor.test.sh
 cloud-cell-record-dep.test.sh
 install-launchd-durability.test.sh
 test-claims.sh
