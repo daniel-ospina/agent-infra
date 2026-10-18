@@ -202,8 +202,8 @@ shape changes, and it is pruned with the rest of its check.
 ## The suite
 
 ```bash
-python3 tools/fleet/outcome_canary.test.py              # 66 tests
-python3 tools/fleet/outcome_canary.test.py --mutations  # 39 mutations, each must go RED
+python3 tools/fleet/outcome_canary.test.py              # 67 tests
+python3 tools/fleet/outcome_canary.test.py --mutations  # 40 mutations, each must go RED
 ```
 
 The signal tests drive the **real CLI** end-to-end (`--live --facts … --capture-dir …`), so what is

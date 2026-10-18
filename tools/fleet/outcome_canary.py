@@ -841,12 +841,13 @@ def _queue_stale(f, c, require_known=False):
     which is the claim those branches make.
     """
     age, src = _queue_age(f, c)
-    limit = getattr(c, "queue_stale_s", None) or 5400.0
+    limit = getattr(c, "queue_stale_s", None)
+    limit = 5400.0 if limit is None else float(limit)
     if age is None:
         return ({"age_s": None, "source": src or "no age in the token or the state file",
                  "limit_s": limit} if require_known else None)
     if age <= limit:
-        return None
+        return None      # a limit of 0 means "any age is stale": honoured, not treated as unset
     return {"age_s": age, "source": src, "limit_s": limit}
 
 

@@ -393,7 +393,14 @@ def _live_facts_args(tmp, fixture_name, state, capture):
     # An explicit --controller-ws keeps the suite off `cmux workspace list`: the suite must run in
     # CI and on a box with no cmux, and workspace DISCOVERY is not what these tests are about.
     return ["--live", "--facts", facts, "--state", state, "--capture-dir", capture,
-            "--controller-ws", "00000000-0000-0000-0000-0000000000c1", "--json"]
+            "--controller-ws", "00000000-0000-0000-0000-0000000000c1", "--json",
+            # ⛔ THE SUITE MUST NOT TOUCH A REAL CONTROLLER. Without a dry run, `controller-absent`
+            # fixtures made `attempt_respawn` run `launchctl kickstart -k <the live label>` on the
+            # machine running the tests, then poll up to 40s. A test that can restart the fleet it is
+            # testing is worse than a flaky test: it is an action with a real side effect.
+            # `--dry-run` still reports the PLAN (which is what (a) asserts); (c) additionally passes
+            # --no-respawn to assert the suppression path.
+            "--dry-run"]
 
 
 @test
@@ -960,6 +967,33 @@ def test_the_staleness_limit_is_CONFIGURABLE_and_actually_applies():
 
 
 @test
+def test_a_ZERO_staleness_limit_means_NO_tolerance_not_unset():
+    """`x or DEFAULT` treats 0 as unset — and 0 is the value that expresses maximum strictness. A 30
+    minute old EMPTY record then passed both queue checks while the operator had asked for zero
+    tolerance, and a fixture pinning `queue_stale_s: 0` asserted nothing."""
+    m = load()
+    d = fx("healthy")
+    d["facts"]["log_events"] = {
+        "headers": [{"raw": "=== Sun Oct 18 07:47:44 EST 2026 load=12 lanes=1 queue=EMPTY(30m) ===",
+                     "age_s": 60, "ts": 0, "backlog": 0, "queue_token": "EMPTY(30m)"}],
+        "dispatch_ok": [], "dispatch_refused": [], "dispatch_empty": [], "dispatch_skipped": [],
+        "armed": [], "railed": []}
+    d["facts"]["queue_state"] = {"path": "q", "ok": True, "raw": "EMPTY", "age_s": 1800.0}
+    d["config"]["queue_stale_s"] = 0
+    cfg = m.cfg_from_dict(d["config"])
+    assert cfg.queue_stale_s == 0.0, cfg.queue_stale_s
+    got = dict((v.name, v) for v in m.evaluate(d["facts"], cfg))
+    assert got["queue_readable"].variant == "STATE_FROZEN", got["queue_readable"].variant
+    assert got["work_dispatched"].variant == "STATE_FROZEN", got["work_dispatched"].variant
+    # a zero limit must not make a CURRENT read fail either: age 0 is inside "any age is stale"? No —
+    # zero tolerance means every non-zero age is stale, and a same-instant read is the boundary.
+    d["facts"]["queue_state"]["age_s"] = 0.0
+    d["facts"]["log_events"]["headers"][0]["queue_token"] = "EMPTY(0s)"
+    got2 = dict((v.name, v) for v in m.evaluate(d["facts"], m.cfg_from_dict(d["config"])))
+    assert got2["queue_readable"].status == m.PASS, got2["queue_readable"].variant
+
+
+@test
 def test_a_future_dated_log_mtime_is_UNKNOWN_not_the_freshest_possible():
     """`max(0.0, now - mtime)` turned a clock-skewed cell's log into the freshest possible one, so
     "pid alive but the log stopped" — the state that must fire — read PASS, and since absence is the
@@ -1196,7 +1230,12 @@ def test_the_sent_message_carries_the_respawn_evidence():
             json.dump(d, fh)
         cap = os.path.join(tmp, "cap")
         rc, out, err = run_cli(["--live", "--facts", facts, "--capture-dir", cap,
-                                "--state", os.path.join(tmp, "s.json")])
+                                "--state", os.path.join(tmp, "s.json"),
+                                # an explicit ws keeps the suite off `cmux workspace list` (the suite
+                                # must be deterministic on a box with no cmux), and --dry-run reports
+                                # the RESPAWN plan without running launchctl.
+                                "--controller-ws", "00000000-0000-0000-0000-0000000000c1",
+                                "--dry-run"])
         assert rc == 1, (rc, err[-400:])
         text = "".join(open(os.path.join(cap, f)).read() for f in os.listdir(cap)
                        if f.endswith(".txt"))
@@ -1551,6 +1590,11 @@ MUTATIONS = [
     ("the census is not scoped to this cell's controller path",
      "        if paths and os.path.normpath(toks[1]) not in paths:", "        if False:",
      "test_the_census_is_scoped_to_THIS_cell_and_reports_what_it_rejected"),
+    # ── cycle-8 defect ──────────────────────────────────────────────────────────
+    ("a zero staleness limit is treated as unset, so \"no tolerance\" is silently made lenient",
+     "    limit = 5400.0 if limit is None else float(limit)",
+     "    limit = limit or 5400.0",
+     "test_a_ZERO_staleness_limit_means_NO_tolerance_not_unset"),
     # ── cycle-7 defects ──────────────────────────────────────────────────────────────
     ("an EMPTY read with NO age is graded as a current read",
      '        return ({"age_s": None, "source": src or "no age in the token or the state file",\n'
