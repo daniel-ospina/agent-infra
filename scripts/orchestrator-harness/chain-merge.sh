@@ -39,8 +39,10 @@ release_issue_claim() {
   [ -f "$csh" ] || return 0
   # CLAIM_REPO is the repo the claim was pushed to (refs/claims live in the TARGET repo's origin),
   # which is the value orch-loop.sh used when it acquired — a mismatch here would read the WRONG
-  # repo's ref and the release would be a no-op. Every git call in claims.sh is `-C "$CLAIM_REPO"`,
-  # so the cwd is irrelevant and no `cd` (a gated shape) is needed.
+  # repo's ref and the release would be a no-op. Every git call in claims.sh resolves the repo from
+  # CLAIM_REPO itself (it `cd`s into it inside a subshell, 2026-10-18 — a `git -C` there was NOT
+  # cwd-independent and returned an empty claim commit on the launchd cells), so THIS file's cwd is
+  # irrelevant and no `cd` (a gated shape) is needed here.
   # ⛔ SOURCED INTO THIS SHELL, NOT A SUBSHELL, AND ITS FAILURES ARE LOGGED (2026-10-16 review).
   # `( … ) >/dev/null 2>&1 && echo released` reported SUCCESS ONLY: a refused fence, a network
   # failure, or a registry too old to HAVE the release function left the claim running to its full

@@ -1212,6 +1212,87 @@ git show <rev>:scripts/orchestrator-harness/claims.sh > "$T/claims.sh"
 CLAIMS_SH="$T/claims.sh" bash scripts/orchestrator-harness/test-claims.sh   # 65 passed, 45 failed
 ```
 
+`claim-cwd.test.sh` pins the claim builder's **cwd independence** — the property a redeploy silently
+took away on 2026-10-18, when the launchd cell (whose WorkingDirectory is **not** a repository)
+refused every candidate in the queue while the controller looked alive:
+
+```
+[dispatch] #4513 NOT dispatched — could not build claim commit
+```
+
+The builder returned an EMPTY hash, so nothing entered the batch — a total dispatch stall that emits
+no error of its own. Two independent hunks, each with its OWN discriminator:
+
+- **`_git` must `cd` into `CLAIM_REPO` in a subshell, not hand git `-C`.** The `-C` form still STARTS
+  in the caller's cwd and has to resolve it, which is exactly what the affected cells deny
+  (`fatal: Unable to read current working directory: Operation not permitted`). The check runs the
+  SHIPPED builder with its cwd set to a directory that cannot be resolved at all, and asserts a claim
+  commit is produced and the ref lands on the target origin. **This is the hunk that unblocked
+  dispatch.**
+- **`CLAIM_REPO` must derive from `REPO`, not `.`** — hardening, not the incident's cause: the
+  controller assigns `CLAIM_REPO="$REPO"` itself (`orch-loop.sh`), and every other shipped caller
+  sets it explicitly. An ABSOLUTE `$REPO` is used as named (it needs no resolution, so no cwd can
+  make it wrong); a RELATIVE one is used only when the cwd is not already a work-tree root, and
+  otherwise `.` wins — see the six `cd` hazards below, which is why the simple form is not enough.
+
+⛔ **`cd` IS NOT A FREE SWAP FOR `-C` — six defects found in the first three versions of this fix**,
+each measured and each now pinned by the suite. `-C` treats its argument literally; `cd` is a builtin
+with its own resolution rules:
+
+- **an EMPTY `CLAIM_REPO`** — `cd ""` SUCCEEDS and leaves the cwd alone, so `|| return 1` never fired
+  and a full acquire pushed `refs/claims/…` into the **caller's** repo, a repository nobody named.
+  Closed in both orderings: the value that reaches `_git`, and an empty value that is already SET
+  when the file is sourced (kept refused instead of being coerced into a default);
+- **`$CDPATH`** — the builtin searches it for a relative path, and a same-named directory there WINS
+  over the local one (measured), so a relative `CLAIM_REPO` ran every git call — and pushed the claim
+  — in a repo the caller never named. `-C` never did that;
+- **a RELATIVE `$REPO` from a caller already inside it** — `fix-one.sh` and `merge-one.sh` `cd "$REPO"`
+  and then source this file with no `CLAIM_REPO`, so `$REPO` resolved from inside `$REPO` names
+  `$REPO/$REPO`, which does not exist: every claim refused with the SAME `could not build claim
+  commit` the fix exists to remove;
+- **a same-named SUBDIRECTORY that is itself a repo** — the same caller shape, where `$REPO/$REPO`
+  does exist. A default keyed on `[ -d "$REPO" ]` then ran every git call in the INNER repo and
+  acquired with `RESULT=acquired` on an origin nobody named — a wrong-repo claim, silently, which is
+  the duplicate dispatch this registry exists to prevent. Hence the cwd-work-tree-root test;
+- **a BARE `cd` OPTION** — `CLAIM_REPO=-P` is not a path: `cd -P` takes NO operand and SUCCEEDS into
+  `$HOME` (measured), so without the `--` a bare-option value claims into whatever repo `$HOME`
+  happens to be. `-C` read it as a directory name and failed;
+- **an ABSOLUTE `$REPO` while standing in ANOTHER repo's root** — the cwd-root test alone answers `.`
+  there, so a caller naming repo B absolutely got `RESULT=acquired` with the ref on repo A's origin,
+  silently: the same wrong-repo class one shape over. An absolute path needs no resolution, so it is
+  used as named and the heuristic is left to the relative case.
+
+Measured, which is what the suite is for (four baselines, `/tmp` copies via the `CLAIMS_SH` seam):
+
+```bash
+CLAIMS_SH=<pre-fix main>            bash …/claim-cwd.test.sh   # 19 passed, 17 FAILED (C1, C2, C5, C10)
+CLAIMS_SH=<the two hunks alone>     bash …/claim-cwd.test.sh   # 20 passed, 16 FAILED (C5–C9)
+CLAIMS_SH=<round-1 fixes, no cwd test / no SET test>          # 31 passed, 5 FAILED (C5 pre-set, C8)
+CLAIMS_SH=<round-2 fixes, no absolute-REPO branch>            # 33 passed, 3 FAILED (C10)
+CLAIMS_SH=<shipped, with `cd --` removed>                     # 33 passed, 3 FAILED (C9)
+```
+
+Each guard is pinned by exactly ONE check, so a later "simplification" of any single one of them
+reddens the suite on its own:
+
+```bash
+CLAIMS_SH=<shipped, `cd --` removed>      bash …/claim-cwd.test.sh  # C9 reds alone — fail-open into $HOME
+CLAIMS_SH=<shipped, absolute branch gone> bash …/claim-cwd.test.sh  # C10 reds alone — claims on the cwd repo
+```
+
+⛔ **The stand-in, stated**: the OS denial (TCC/EPERM on the process cwd) cannot be constructed
+hermetically, so the first check puts a `git` shim first on PATH whose only job is that read
+(`/bin/pwd -P` on the cwd it was STARTED in) before exec'ing the real git. The DENIAL is modelled;
+`claims.sh`, the commit, the acquisition and the assertion are real. Non-vacuity is measured against
+the pre-fix file, and the RED run fails with the incident's own log line:
+
+```bash
+CLAIMS_SH=<pre-fix main> bash scripts/orchestrator-harness/claim-cwd.test.sh  # 19 passed, 17 failed
+bash scripts/orchestrator-harness/claim-cwd.test.sh                           # 36 passed, 0 failed
+```
+
+To reproduce `<pre-fix main>`: `git show <main>:scripts/orchestrator-harness/claims.sh > $TMP/claims.sh`.
+
 `refresh-scout.test.sh` drives the **shipped** refresh step and the **shipped** dispatch block against
 a real local origin for the collision, unreachable, absent, stale-registry and unrecognised-status
 verdicts, plus the fenced release on the chain's exit path and the generation guard. Measured (the
