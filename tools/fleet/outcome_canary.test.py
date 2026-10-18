@@ -312,6 +312,42 @@ def test_lander_expired_is_distinguished_from_never_armed():
 
 
 @test
+def test_an_ANCIENT_or_UNAGED_rail_decision_is_not_a_lander():
+    """A decision in the log is a decision NOW — and an unaged one is not fresh.
+
+    `#900 PENDING (rail mode …)` printed last night kept a green PR reading "railed" long after the
+    rail was abandoned, and an entry carrying no `age_s` (the enclosing cycle header was unparseable,
+    so the age is UNKNOWN) was read as fresh. Both are a PASS on a lander that does not exist.
+    """
+    m = load()
+
+    def grade(entries, bucket="railed"):
+        d = fx("lander-expired")
+        d["facts"]["log_events"]["armed"] = []
+        d["facts"]["log_events"]["railed"] = []
+        d["facts"]["log_events"][bucket] = entries
+        cfg = m.cfg_from_dict(d["config"])
+        return [x for x in m.evaluate(d["facts"], cfg) if x.name == "landers"][0]
+
+    raw = "#900 PENDING (rail mode: auto-merge deliberately NOT armed)"
+    fresh = grade([{"raw": raw, "pr": 900, "age_s": 100}])
+    assert fresh.status == m.PASS, (fresh.status, fresh.variant, fresh.evidence)
+
+    old = grade([{"raw": raw, "pr": 900, "age_s": 99999}])
+    assert old.variant == "LANDER_MISSING", (old.status, old.variant, old.evidence)
+    assert "DECISION TOO OLD OR UNAGED (not counted as a lander): [900]" in old.evidence, \
+        old.evidence
+
+    unaged = grade([{"raw": raw, "pr": 900}])
+    assert unaged.variant == "LANDER_MISSING", (unaged.status, unaged.variant, unaged.evidence)
+
+    # the same rule governs an ARMED decision (the lander-expired fixture's own shape)
+    armed_old = grade([{"raw": "#900 auto-armed", "pr": 900, "age_s": 99999}], bucket="armed")
+    assert armed_old.variant == "LANDER_MISSING", (armed_old.status, armed_old.variant,
+                                                   armed_old.evidence)
+
+
+@test
 def test_rollup_polarity_unknown_and_null_conclusions_are_red():
     """AGENTS.md's rule: only success/neutral/skipped are green, cancelled/stale are non-red, and
     EVERY OTHER CONCLUSION — including an undocumented one and a null one — is RED."""
@@ -322,6 +358,38 @@ def test_rollup_polarity_unknown_and_null_conclusions_are_red():
     assert not m.rollup_is_green([{"conclusion": None}])           # in flight is not a pass
     assert not m.rollup_is_green([{"conclusion": "SOMETHING_NEW"}])
     assert not m.rollup_is_green([{"conclusion": "FAILURE"}])
+
+
+@test
+def test_a_flaky_re_run_reads_GREEN_rather_than_red():
+    """The rollup is a list of ATTEMPTS, not a list of checks. A job that failed and then passed on
+    re-run appears TWICE, so a flat "every entry must be green" walk reads that commit RED — and a
+    red-reading green PR silently leaves the `landers` population, which is a false green on the one
+    check that exists to catch a lander expiring on a PR nobody looked at. (A re-run ADDS a red; it
+    does not clear one.)
+    """
+    m = load()
+    gh_a = {"slug": "github-actions"}
+    ok = {"app": gh_a, "name": "build", "conclusion": "SUCCESS", "id": 20}
+    bad = {"app": gh_a, "name": "build", "conclusion": "FAILURE", "id": 10}
+    assert m.rollup_is_green([bad, ok])              # newest attempt (highest id) is the one graded
+    assert m.rollup_is_green([ok, bad])              # ... and list ORDER is not the ordering
+    # an id-less surface (status context) falls back to list position, the only order it has
+    assert m.rollup_is_green([{"context": "cla", "state": "FAILURE"},
+                              {"context": "cla", "state": "SUCCESS"}])
+    # a newer FAILURE on the same check is red: the newest attempt decides, not the newest green
+    assert not m.rollup_is_green([ok, dict(bad, id=40)])
+    # a different check that is red still reddens the PR
+    assert not m.rollup_is_green([bad, ok, {"app": gh_a, "name": "lint",
+                                            "conclusion": "FAILURE", "id": 30}])
+    # a check with no conclusion is IN FLIGHT, and in flight is not a pass
+    assert not m.rollup_is_green([bad, ok, {"app": gh_a, "name": "build",
+                                            "conclusion": None, "id": 50}])
+    # a legacy status context carries `state`, not `conclusion` — reading only `conclusion` graded
+    # every one of them RED and dropped that PR from the lander population
+    assert m.rollup_is_green([{"context": "cla", "state": "SUCCESS"}])
+    assert not m.rollup_is_green([{"context": "cla", "state": "PENDING"}])
+    assert not m.rollup_is_green([{"context": "cla", "state": "FAILURE"}])
 
 
 @test
@@ -1112,6 +1180,51 @@ def test_landers_grades_REST_shaped_rows():
 
 
 @test
+def test_the_REST_probe_bound_is_a_REAL_knob_not_an_internal_constant():
+    """`rest_probe_max` bounds how many open PRs the REST fallback probes; a PR beyond it becomes
+    `probed: False` and reaches `landers` as PARTIAL_POPULATION. It was read as
+    `getattr(cfg, "rest_probe_max", 25)` and declared nowhere, so the bound could not be set from a
+    fixture config or a flag — an inert setting, which is the defect class this tool exists to catch.
+    """
+    m = load()
+    assert "rest_probe_max" in m.Cfg.FIELDS
+    assert m.Cfg().rest_probe_max == 25
+    assert m.Cfg(rest_probe_max=2).rest_probe_max == 2
+    assert isinstance(m.Cfg(rest_probe_max="2").rest_probe_max, int)
+    assert m.cfg_from_dict({"rest_probe_max": 2}).rest_probe_max == 2
+    a = m.build_parser().parse_args(["--static", "--rest-probe-max", "2"])
+    assert m.cfg_from_args(a).rest_probe_max == 2
+
+    real, probes = m._run_gh, []
+
+    def fake(argv):
+        j = " ".join(argv)
+        if "pulls?state=open" in j:
+            return 0, json.dumps([{"number": 900 + i, "draft": False, "auto_merge": None,
+                                   "mergeable_state": "clean", "head": {"sha": str(i) * 10}}
+                                  for i in range(5)])
+        if "pulls?state=closed" in j:
+            return 0, "[]"
+        if "check-runs" in j:
+            return 0, json.dumps({"check_runs": [{"conclusion": "success", "name": "ci"}]})
+        mm = re.search(r"/pulls/(\d+)$", j)
+        if mm:
+            probes.append(mm.group(1))
+            return 0, json.dumps({"mergeable_state": "clean", "head": {"sha": mm.group(1)[:8]}})
+        return 0, "{}"
+
+    try:
+        m._run_gh = fake
+        gh = m.collect_github("o/r", m.Cfg(rest_probe_max=2), now=1000000.0)
+    finally:
+        m._run_gh = real
+    assert gh["ok"] is True, gh
+    assert gh["source"] == "rest", gh.get("source")
+    assert len(probes) == 2, probes                     # the bound is honoured, not defaulted
+    assert sum(1 for r in gh["open_prs"] if not r["probed"]) == 3, gh["open_prs"]
+
+
+@test
 def test_an_EMPTY_pool_without_a_backlog_field_is_not_graded_idle():
     """One completeness rule, both checks: `queue_readable` calls a header without `backlog=`
     INCONCLUSIVE, so `work_dispatched` must not bless the same line as "genuinely empty"."""
@@ -1360,8 +1473,12 @@ def test_an_unwritable_state_path_reports_and_does_not_crash_the_run():
         with open(blocker, "w") as fh:
             fh.write("not a directory\n")
         cap = os.path.join(tmp, "cap")
+        # ⛔ --controller-ws + --dry-run for the same reason as `_live_facts_args`: without them this
+        # test could discover a workspace via `cmux workspace list` and `launchctl kickstart` the REAL
+        # controller of the machine running the suite.
         rc, out, err = run_cli(["--live", "--facts", facts, "--capture-dir", cap, "--json",
-                                "--state", os.path.join(blocker, "s.json")])
+                                "--controller-ws", "00000000-0000-0000-0000-0000000000c1",
+                                "--dry-run", "--state", os.path.join(blocker, "s.json")])
         assert "Traceback" not in err, err[-400:]
         assert rc == 1, (rc, err[-300:])
         j = json.loads(out)          # the report still prints: the run did not die after sending
@@ -1564,8 +1681,8 @@ MUTATIONS = [
      '    if False:\n        return V("pr_created", INCONCLUSIVE, "GH_UNREADABLE",',
      "test_gh_unreadable_is_inconclusive_never_green_never_zero"),
     ("the check-result rule becomes a DENY-list instead of an allow-list",
-     '        if str(concl).upper() not in GREEN_CONCLUSIONS:',
-     '        if str(concl).upper() == "FAILURE":',
+     '        if concl not in GREEN_CONCLUSIONS:',
+     '        if concl == "FAILURE":',
      "test_rollup_polarity_unknown_and_null_conclusions_are_red"),
     ("the notifier speaks on every poll",
      "        if v.key in state.notified or state.is_ambiguous(v.key):",
@@ -1590,6 +1707,23 @@ MUTATIONS = [
     ("the census is not scoped to this cell's controller path",
      "        if paths and os.path.normpath(toks[1]) not in paths:", "        if False:",
      "test_the_census_is_scoped_to_THIS_cell_and_reports_what_it_rejected"),
+    # ── cycle-10 defects ────────────────────────────────────────────────────────────
+    ("a re-run attempt is judged by its OLDEST entry, so a flaky job that re-ran green reads red",
+     "        if prev is None or rank >= prev[0]:",
+     "        if prev is None:",
+     "test_a_flaky_re_run_reads_GREEN_rather_than_red"),
+    ("an armed decision in the log is a lander forever, however old or unaged",
+     '    armed_log = _in_window(events.get("armed"), c.pr_window_s)',
+     '    armed_log = _decisions(events.get("armed"))',
+     "test_an_ANCIENT_or_UNAGED_rail_decision_is_not_a_lander"),
+    ("a rail decision in the log is a lander forever, however old or unaged",
+     '    railed_log = _in_window(events.get("railed"), c.pr_window_s)',
+     '    railed_log = _decisions(events.get("railed"))',
+     "test_an_ANCIENT_or_UNAGED_rail_decision_is_not_a_lander"),
+    ("the REST probe bound is not a config field, so the bound an operator sets does nothing",
+     '        "pool_threshold",\n        "rest_probe_max",',
+     '        "pool_threshold",',
+     "test_the_REST_probe_bound_is_a_REAL_knob_not_an_internal_constant"),
     # ── cycle-8 defect ──────────────────────────────────────────────────────────
     ("a zero staleness limit is treated as unset, so \"no tolerance\" is silently made lenient",
      "    limit = 5400.0 if limit is None else float(limit)",

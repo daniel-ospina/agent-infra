@@ -202,8 +202,8 @@ shape changes, and it is pruned with the rest of its check.
 ## The suite
 
 ```bash
-python3 tools/fleet/outcome_canary.test.py              # 67 tests
-python3 tools/fleet/outcome_canary.test.py --mutations  # 40 mutations, each must go RED
+python3 tools/fleet/outcome_canary.test.py              # 70 tests
+python3 tools/fleet/outcome_canary.test.py --mutations  # 44 mutations, each must go RED
 ```
 
 The signal tests drive the **real CLI** end-to-end (`--live --facts … --capture-dir …`), so what is
@@ -217,3 +217,24 @@ prove the predicates but never the parser: one feeds the literal strings `orch-l
 (`[dispatch] skipped (…) lanes=… workers=…`, both refusal forms), the other feeds the three shapes
 `stat` returns (`stat -f %m` on BSD, `stat -c %Y` on GNU, and GNU's multi-line `-f` filesystem block).
 Both classes of defect shipped once and were caught by review, not by the suite.
+
+Three more tests exist for the same reason — an outcome read as present when it is not:
+
+- **A re-run is an ATTEMPT, not a check.** The rollup is a list in which a flaky job appears twice, so
+  a flat "every entry must be green" walk reads a commit that re-ran green as **red**, and a
+  red-reading green PR drops out of the `landers` population. Attempts are grouped on `(app, name)` —
+  the identity the merge rail itself groups on (`scripts/admin-merge.sh`) — and only the newest attempt per group is
+  graded, newest being the highest `id` (`started_at` is nullable, so a timestamp-first rank can rank
+  a stale attempt over a fresh one). A legacy status context carries `state`, not `conclusion`, and is
+  read too: reading only `conclusion` graded every one of them RED.
+- **A decision in the log is a decision NOW.** `#N PENDING (rail mode …)` from last night, or an entry
+  whose enclosing cycle header was unparseable and so carries no age at all, is not a lander: both
+  kept a green PR reading PASS after the rail was gone. Decisions are filtered by age against
+  `--pr-window-min` (not the 12-minute `--window-min`: a rail legitimately persists for hours, and a
+  3-cycle bound would fail every green PR on the box), and what was dropped is printed, so "there is
+  no lander" is distinguishable from "the log mentions one and we refused to believe it".
+- **The REST probe bound is a knob.** `rest_probe_max` (`--rest-probe-max`, default 25) bounds how
+  many open PRs the REST fallback probes; a PR past it is `probed: False` and reaches `landers` as
+  `PARTIAL_POPULATION`. It used to be read as `getattr(cfg, "rest_probe_max", 25)` and declared
+  nowhere — an inert setting, which is the defect class this tool exists to catch, so the suite
+  asserts the bound is actually honoured, not merely that the field exists.

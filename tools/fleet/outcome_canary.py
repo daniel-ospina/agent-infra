@@ -206,6 +206,10 @@ class Cfg(object):
         # A pool this large next to an EMPTY dispatch backlog is a failure of the refresh, not
         # idleness (agent-infra#1931).
         "pool_threshold": 25,
+        # How many open PRs the REST fallback probes with per-PR detail + check-runs calls. A PR
+        # beyond this bound is `probed: False` and reaches `landers` as PARTIAL_POPULATION, so the
+        # bound is a VERDICT input and a knob — not an internal constant.
+        "rest_probe_max": 25,
         # Which README/doc a failure points at is per-check (ORIENTATION), not configurable.
         "respawn_timeout_s": 40.0,
         "label": "com.eldato.orchestrator-loop",
@@ -225,6 +229,7 @@ class Cfg(object):
         "mem_floor_mb",
         "disk_floor_gb",
         "pool_threshold",
+        "rest_probe_max",
         "respawn_timeout_s",
         "label",
         "repo",
@@ -249,6 +254,7 @@ class Cfg(object):
                   "respawn_timeout_s"):
             setattr(self, k, float(getattr(self, k)))
         self.pool_threshold = int(self.pool_threshold)
+        self.rest_probe_max = int(self.rest_probe_max)
 
     def controller_paths(self):
         """The controller script(s) for THIS cell: `$O/orch-loop.sh`, plus the harness copy if a
@@ -268,6 +274,7 @@ class Cfg(object):
             "mem_floor_mb": self.mem_floor_mb,
             "disk_floor_gb": self.disk_floor_gb,
             "pool_threshold": self.pool_threshold,
+            "rest_probe_max": self.rest_probe_max,
             "label": self.label,
             "repo": self.repo,
         }
@@ -1191,7 +1198,19 @@ GREEN_CONCLUSIONS = ("SUCCESS", "NEUTRAL", "SKIPPED", "CANCELLED", "STALE")
 
 
 def rollup_is_green(rollup):
-    """The repo-wide GREEN rule, applied to one PR's rollup: non-empty, and nothing red.
+    """Is this PR's rollup green — ONE verdict per CHECK, from its NEWEST attempt.
+
+    ⛔ The rollup is a LIST OF ATTEMPTS, not a list of checks. A flaky job that failed and then
+    passed on re-run appears TWICE, so a flat "every entry must be green" walk reads that commit RED
+    — and a red-reading green PR silently drops out of the `landers` population, which is a false
+    green on the one check that exists to catch a lander expiring on a PR nobody looked at. (The
+    repo-wide rule: a re-run ADDS a red, it does not clear one.)
+    So attempts are grouped and only the newest per group is graded. Grouping matches the MERGE
+    RAIL (`scripts/admin-merge.sh`), which keys checks on `(app, name)` — two workflows can share a
+    job name, and that conflation is the rail's own declared residual, so this check reads the same
+    surface the merge decision reads instead of inventing a third notion of "green".
+    Newest attempt = highest `id` (`started_at` is nullable and `completed_at` can tie). Where a
+    surface supplies no ids (a legacy status context), later list position wins.
 
     Polarity, not vocabulary: `success`/`neutral`/`skipped` are green, `cancelled`/`stale` are
     non-red, and EVERY OTHER CONCLUSION — including one GitHub has not documented and a null one —
@@ -1199,16 +1218,61 @@ def rollup_is_green(rollup):
     """
     if not rollup:
         return False
-    for chk in rollup:
+    newest = {}
+    for pos, chk in enumerate(rollup):
         if not isinstance(chk, dict):
             return False
-        concl = chk.get("conclusion")
+        key = _check_key(chk)
+        rank = _check_rank(chk, pos)
+        prev = newest.get(key)
+        if prev is None or rank >= prev[0]:
+            newest[key] = (rank, chk)
+    for _rank, chk in newest.values():
+        concl = _check_conclusion(chk)
         if concl is None:
             # queued / in progress / no conclusion yet: NOT green (in flight is not a pass)
             return False
-        if str(concl).upper() not in GREEN_CONCLUSIONS:
+        if concl not in GREEN_CONCLUSIONS:
             return False
     return True
+
+
+def _check_key(chk):
+    """(app slug, check name) — the identity the merge rail groups by. A check run carries `name`,
+    a legacy status context carries `context`; a missing app stays EMPTY rather than being dropped,
+    because an ungrouped check would escape the verdict entirely."""
+    app = ""
+    a = chk.get("app")
+    if isinstance(a, dict):
+        app = str(a.get("slug") or "")
+    elif isinstance(a, str):
+        app = a
+    name = chk.get("name")
+    if name in (None, ""):
+        name = chk.get("context")
+    return (app, str(name) if name is not None else "")
+
+
+def _check_rank(chk, pos):
+    """Sort key for attempts of ONE check: highest `id` is newest. Ids are the honest ordering —
+    `started_at` is NULLABLE (a queued attempt has none), so a timestamp-first rank can rank a stale
+    attempt over a fresh one. An id-less surface (status context) falls back to list position, which
+    is the only ordering it has."""
+    ident = chk.get("id")
+    if isinstance(ident, int) and not isinstance(ident, bool):
+        return (1, ident, pos)
+    return (0, 0, pos)
+
+
+def _check_conclusion(chk):
+    """The conclusion, normalised across check runs (`conclusion`) and status contexts (`state`).
+    A status context has no `conclusion`, so reading only `conclusion` graded every legacy context
+    RED and dropped that PR from the lander population."""
+    for key in ("conclusion", "state"):
+        v = chk.get(key)
+        if v not in (None, ""):
+            return str(v).upper()
+    return None
 
 
 MERGEABLE_STATES = ("CLEAN",)
@@ -1230,8 +1294,17 @@ def check_landers(f, c):
 
     prs = gh.get("open_prs") or []
     events = f.get("log_events") or {}
-    armed_log = set(r.get("pr") for r in events.get("armed") or [] if r.get("pr") is not None)
-    railed_log = set(r.get("pr") for r in events.get("railed") or [] if r.get("pr") is not None)
+    # ⛔ A DECISION IN THE LOG IS A DECISION *NOW* — an unaged one is not.
+    # `#N PENDING (rail mode …)` printed last night kept a green PR reading "railed" long after the
+    # rail was abandoned, and a fixture-less event (unparseable enclosing header ⇒ no `age_s`) was
+    # read as fresh. Both are a PASS on a lander that does not exist, so decisions are filtered by
+    # age before they count. The bound is the PR-scale window (`pr_window_s`), not the 3-cycle
+    # `window_s`: a rail legitimately persists for hours, and a 12-minute bound would fail every
+    # green PR on the box.
+    armed_log = _in_window(events.get("armed"), c.pr_window_s)
+    railed_log = _in_window(events.get("railed"), c.pr_window_s)
+    stale_log = ((_decisions(events.get("armed")) | _decisions(events.get("railed")))
+                 - (armed_log | railed_log))
 
     candidates, unprobed = [], []
     for pr in prs:
@@ -1300,6 +1373,11 @@ def check_landers(f, c):
         ev.append("ARMED IN THE LOG, NOT ARMED IN GITHUB (expired): %s" % sorted(expired))
     if missing:
         ev.append("NEVER ARMED AND NOT RAILED: %s" % sorted(missing))
+    if stale_log:
+        # Not a footnote: these are the PRs whose only "lander" is an entry too old (or too
+        # un-ageable) to be a current decision. Saying so is what separates "there is no lander"
+        # from "the log mentions one and we refused to believe it".
+        ev.append("DECISION TOO OLD OR UNAGED (not counted as a lander): %s" % sorted(stale_log))
     ev.append(_prs_brief(candidates))
 
     evidence = "\n".join(ev)
@@ -1318,6 +1396,24 @@ def check_landers(f, c):
                  "armed lander' is established for the rest but NOT for the whole population. "
                  "Not green." % (len(unprobed), len(prs)))
     return V("landers", PASS, "LANDERS_ARMED", evidence)
+
+
+def _decisions(bucket):
+    """PR numbers named by a decision bucket (`armed` / `railed`)."""
+    return set(r.get("pr") for r in bucket or [] if r.get("pr") is not None)
+
+
+def _in_window(bucket, window_s):
+    """The subset of a decision bucket young enough to be a CURRENT decision.
+
+    An entry with NO `age_s` is excluded on purpose: the age is unknown (the enclosing cycle header
+    was unparseable, or the record carries no timestamp), and an unknown age is a MISSING READ, not
+    a fresh one — the same allow-list polarity the rest of this tool applies.
+    """
+    return set(r.get("pr") for r in bucket or []
+               if r.get("pr") is not None
+               and r.get("age_s") is not None
+               and r.get("age_s") <= window_s)
 
 
 def _prs_brief(prs):
@@ -2308,7 +2404,7 @@ def _collect_rest(gh, repo, cfg, now, errors):
     out["source"] = "rest"
     _fill_counts(out, open_raw, merged, cfg, now)
 
-    probe_max = int(getattr(cfg, "rest_probe_max", 25) or 25)
+    probe_max = int(cfg.rest_probe_max)
     rows, unprobed, detail_errors = [], 0, []
     for i, p in enumerate(open_raw):
         num = p.get("number")
@@ -2596,6 +2692,9 @@ def build_parser():
     ap.add_argument("--mem-floor-mb", type=float, default=None)
     ap.add_argument("--disk-floor-gb", type=float, default=None)
     ap.add_argument("--pool-threshold", type=int, default=None)
+    ap.add_argument("--rest-probe-max", type=int, default=None,
+                    help="how many open PRs the REST fallback probes with per-PR detail calls "
+                         "(default 25); a PR beyond it is UNPROBED, not green")
     ap.add_argument("--queue-stale-min", type=float, default=None,
                     help="how old an EMPTY pool read may be before it is not evidence (default 90)")
     ap.add_argument("--controller-ws", default=None, help="controller workspace UUID (live send)")
@@ -2647,6 +2746,8 @@ def cfg_from_args(a):
         kw["disk_floor_gb"] = a.disk_floor_gb
     if a.pool_threshold is not None:
         kw["pool_threshold"] = a.pool_threshold
+    if getattr(a, "rest_probe_max", None) is not None:
+        kw["rest_probe_max"] = a.rest_probe_max
     if getattr(a, "queue_stale_min", None) is not None:
         kw["queue_stale_s"] = a.queue_stale_min * 60.0
     if a.capture_dir and not a.state_path:
