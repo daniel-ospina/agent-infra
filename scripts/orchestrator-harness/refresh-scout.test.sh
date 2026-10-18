@@ -2331,7 +2331,8 @@ case "$OUT" in
   # (`HTTP ?`) left it green — a false PASS on exactly the regression it is named for (measured). The
   # old glob was also order-sensitive in the wrong direction: it demanded `HTTP 403` BEFORE
   # `REST bucket`, while the shipped line puts the label first, which is why it only ever passed through
-  # this fixture's TWO refusal lines. One refusal line alone failed it, and a reordered line passed it.
+  # this fixture's several refusal lines — the two reaper listings, then the three tier queries — so the
+  # glob matched across a line break. One refusal line alone failed it, and a reordered line passed it.
   *"REST bucket refused it as RATE-LIMITED (HTTP 403"*) ok "rest-403: the refusal NAMES the HTTP 403 on the REST bucket (starved vs broken)" ;;
   *) bad "rest-403: the 403 is not named in the log — output: $OUT" ;;
 esac
