@@ -913,9 +913,9 @@ MSG="${MSG} ⛔ PRIORITY: before dispatching, read the ranked order IN THE GRAPH
 # like a finished report. A document cannot change the behaviour a report triggers; putting the
 # order IN the report is what does. It sits beside ROLE/MAP/PRIORITY because that is the block an
 # agent already reads.
-# ⛔ UNCONDITIONAL, AND IT MUST RIDE THE SHORT FORM TOO (see the PULSE block below): a quiet beat
-# is exactly when the order is needed, and the short form is what a quiet beat receives -- the
-# short form REBUILDS MSG, so a clause appended only above it is discarded on every quiet tick.
+# ⛔ UNCONDITIONAL, AND IT MUST RIDE THE SHORT FORM TOO (the SHORT FORM block below rebuilds MSG): a
+# quiet beat is exactly when the order is needed, and the short form is what a quiet beat receives --
+# it REBUILDS MSG from scratch, so a clause appended only ABOVE it is discarded on every quiet tick.
 # ⛔ ONE ORDER, TWO LENGTHS -- AND THE ORDER ITSELF IS NEVER REPHRASED. FA1..FA4 are the three
 # instructions the owner gave plus the closing line, defined ONCE and embedded VERBATIM in both
 # bodies; only the (1)(2)(3) numbering and the one elaboration sentence below belong to the alert
@@ -936,15 +936,20 @@ MSG="${MSG} ⛔ PRIORITY: before dispatching, read the ranked order IN THE GRAPH
 # delivered alert body is ~4.3k, most of it the verdict legend). The order adds ~618 to a ~970-char
 # quiet beat -- still the largest single clause there, and deliberately so: it is the only clause
 # that tells the lane to DO something. BOTH bounds are FIXED numbers in the suite, never derived
-# from the text they bound: the order at 700 chars, the delivered quiet body at 1700 (shipped 1590)
-# -- so growth fails CI instead of silently re-inflating the pulse. Bounding only the clause left
-# the body itself unguarded (measured: an unrelated clause bloated to 2401 chars with the suite
-# green), which is why both are pinned.
-# ⛔ NOT THE DOMINANT SENDER (stated, not absorbed): scripts/cadence-nudge.sh is the cadence FLOOR
-# and, per its own header and this file's note below, the sender that SURVIVES when this tick is
-# killed at its budget -- and it carries no advance order either. That is a separate sender with its
-# own constraints (offline, one giant MSG line) and is filed as agent-infra#1993; this clause is the
-# tick's, which is what #1991 names.
+# from the text they bound, and measured in BYTES (the suite pins LC_ALL=C so they mean one thing on
+# every host): the order at 700, the quiet body WITH NO CONDITIONAL CLAUSE at 1700 (shipped 1610).
+# Bounding only the clause left the body itself unguarded (measured: an unrelated clause bloated the
+# pulse to 2401 with the suite green), which is why both are pinned. The ceiling is about
+# readability, not exhaustiveness: an ADDITION of any size is caught by the suite's exhaustive count
+# of MSG append sites, so a new clause is red whatever its length.
+# ⛔ NOT THE DOMINANT SENDER (stated, not absorbed): scripts/cadence-nudge.sh is the cadence FLOOR and,
+# per its own header and this file's note below, the sender that SURVIVES when this tick is killed at
+# its budget. It does carry nudges of its own ("CHECK EVERY LANE IS MOVING", "NEXT: ... spend spare
+# capacity on P0, then P1") -- what it does NOT carry is #1991's specific order: AUTOPILOT with its
+# gloss, the four boxes, the rail by name, cell-2's automation. A separate sender with its own
+# constraints (offline, one giant MSG line), it is filed as agent-infra#1993 so #1993's implementer
+# adds only what is missing instead of duplicating what is there. This clause is the tick's, which is
+# what #1991 names.
 # ⛔ NO BACKTICKS, NO DOUBLE QUOTES AND NO $ IN FA1..FA4 -- the same rule as the rest of MSG (see
 # the warning above): MSG is a DOUBLE-QUOTED assignment, so a backticked span is command-substituted
 # AT ASSIGNMENT TIME and silently vanishes, leaving a hole the file on disk still looks right about.

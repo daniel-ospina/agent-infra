@@ -31,6 +31,13 @@
 #   softening inside any of the four sentences is red, on either body.
 #
 # Sections:
+#   0a. EXHAUSTIVENESS — the order's symbol set may appear in EXACTLY six assignment lines and two
+#      append lines, and the beat's MSG may be assigned in exactly ten places. Sampled state points
+#      cannot prove "unconditional" (review measured four one-line mutants that dropped or duplicated
+#      the order in states the driver never visits, all green); a COUNT of the ways the order can be
+#      touched cannot be evaded by the input a mutant keys on, because clearing, gating, stripping or
+#      duplicating it needs one more line. Raising these numbers is the deliberate act of adding a
+#      clause to the beat.
 #   0. WIRING + FORMATION — the sentences and both bodies are defined exactly once; FA1..FA4
 #      carry no backtick, double quote or `$`; the composed bodies reference ONLY ${FA1}..${FA4};
 #      each append sits where it belongs. (`MSG` is a DOUBLE-QUOTED assignment, so a backticked
@@ -63,6 +70,11 @@
 #
 # Run: bash tests/heartbeat-fleet-advance/run.sh
 set -uo pipefail
+# ⛔ THE LENGTH ASSERTIONS BELOW ARE BYTES, DELIBERATELY. `${#x}` counts characters in a UTF-8 locale
+# and bytes in the C locale, and the order text carries exactly the characters that differ (⛔, —).
+# Unpinned, an edit measured on a UTF-8 dev box can pass locally and fail in a C-locale lane, or the
+# reverse. Pinning the locale makes the numbers in the failure messages mean one thing everywhere.
+export LC_ALL=C LANG=C
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
@@ -97,6 +109,30 @@ for _v in FA1 FA2 FA3 FA4 FLEETADV FLEETADV_SHORT; do
     1) pass "$_v is defined exactly once" ;;
     *) fail "$_v must be defined exactly once (found $(sed -n "s/^$_v=\".*\$/X/p" "$HB" | wc -l | tr -d ' ')) — two copies diverge" ;;
   esac
+done
+# ⛔ EXHAUSTIVE COUNTS — the class-closer for "the order became conditional". Review measured
+# one-line mutants keyed on inputs the driver never produces (N_ACT>0 with an alert; N_WAIT>0;
+# CAPTEXT non-empty; N_TOTAL>1) that dropped the order with the suite green at 48/48, and two that
+# ADDED a countermand or a duplicate append. Every one of those edits needs an extra executable line
+# that touches FLEETADV* or MSG, so the counts are pinned instead of the state space being sampled.
+_nc="$(sed 's/#.*//' "$HB")"
+_c_assign="$(printf '%s\n' "$_nc" | grep -cE '^(FA[1-4]|FLEETADV|FLEETADV_SHORT)=' || true)"
+_c_mentions="$(printf '%s\n' "$_nc" | grep -cE '(FA[1-4]|FLEETADV|FLEETADV_SHORT)' || true)"
+_c_msgs="$(printf '%s\n' "$_nc" | grep -cE '^[[:space:]]*MSG(\+)?="' || true)"
+_c_appends="$(printf '%s\n' "$_nc" | grep -cE '^[[:space:]]*MSG(\+)?="\$\{?(MSG)\}? ' || true)"
+# 6 = FA1..FA4 + the two composed bodies; 8 = those plus the two appends; 10 = every MSG
+# assignment in the file; 8 = every append to MSG.
+for _spec in "assign:$_c_assign:6:assignment lines touching the order" \
+             "mentions:$_c_mentions:8:executable lines touching the order (6 assignments + 2 appends)" \
+             "msgs:$_c_msgs:10:MSG assignment sites in the file" \
+             "appends:$_c_appends:8:appends to MSG (any addition to the beat shows up here)"; do
+  _k="${_spec%%:*}"; _rest="${_spec#*:}"; _got="${_rest%%:*}"; _rest="${_rest#*:}"
+  _want="${_rest%%:*}"; _what="${_rest#*:}"
+  if [ "$_got" = "$_want" ]; then
+    pass "exhaustive: exactly $_want $_what"
+  else
+    fail "exhaustive: $_what is now $_got (expected $_want) — the order can be gated, dropped, stripped or duplicated by a line the sampled beats never reach; if the new line is intentional, raise this number DELIBERATELY"
+  fi
 done
 # EXECUTABLE position: comments stripped BEFORE counting, and only APPEND sites counted (a count of
 # the word `FLEETADV` is satisfied by the two definition lines alone, which the define-once loop above
@@ -190,6 +226,10 @@ sandbox(){ # sandbox <dir> <ask:0|1> [lanes:empty|busy|alert]
   case "$lanes" in
     # a fleet that is running: short form, but N_TOTAL=1 (see §1b)
     busy)  _rows='[{"lane":"cell-2","ws":"s1","verdict":"WORKING"}]' ;;
+    # an idle lane with a LIVE pi record and no child: the CAPACITY clause fires (see §1c). The
+    # workspace matches the fake `cmux sessions list` row with pid_exists=yes, so the lane is
+    # offered as free capacity instead of being probed as a possibly-dead pane.
+    cap)   _rows='[{"lane":"2a","ws":"'"$__orch_ws"'","verdict":"DONE-IDLE","stale_s":3600}]' ;;
     # a lane needing attention: EMPTY is in NURT but not WEAK, so no screen is attempted and the
     # alert fires — the full body, with N_ALERT=1
     alert) _rows='[{"lane":"2b","ws":"w2","verdict":"EMPTY"}]' ;;
@@ -202,6 +242,7 @@ sandbox(){ # sandbox <dir> <ask:0|1> [lanes:empty|busy|alert]
   # send), the pane must not look mid-turn (else the idle guard withholds it), and `send` is
   # recorded verbatim into the session file the tick then greps to verify its own delivery.
   local ws; ws="$(sed -n 's/^ORCH_WS="\(.*\)"$/\1/p' "$HB")"
+  __orch_ws="$ws"
   cat > "$h/bin/cmux" <<EOF
 #!/usr/bin/env bash
 case "\${1:-}" in
@@ -210,6 +251,10 @@ case "\${1:-}" in
   send) _last=""; for _a in "\$@"; do _last="\$_a"; done
         printf '%s' "\$_last" >> "\$HOME/.pi/agent/sessions/s1/hb-11111111-1111-1111-1111-111111111111.jsonl" ;;
   surface) echo "--session' '11111111-1111-1111-1111-111111111111'" ;;
+  # ⛔ AN UNHANDLED SUB-COMMAND IS A HOLE IN THIS FIXTURE, NOT A NO-OP: the real cmux may be asked
+  # for something the tick starts depending on later, and a silent empty answer reads as "no data"
+  # (e.g. an empty fleet) while every assertion still passes. Recorded so the suite can FAIL on it.
+  *) printf '%s\n' "$*" >> "$HOME/.pi/agent/stub-unhandled.log" ;;
 esac
 exit 0
 EOF
@@ -217,6 +262,11 @@ EOF
 }
 beat(){ # beat <home> <script> -> the message the tick SENT
   ( HOME="$1" PATH="$1/bin:$PATH" bash "$2" >/dev/null 2>&1 )
+  # A cmux sub-command this fixture does not model means the tick depended on something nobody
+  # stubbed: its answer is empty, which can read as a healthy empty fleet. Fail loudly, not green.
+  if [ -s "$1/.pi/agent/stub-unhandled.log" ]; then
+    fail "the tick called cmux sub-commands the fixture does not model: $(tr '\n' ';' < "$1/.pi/agent/stub-unhandled.log") — stub them before trusting this run"
+  fi
   cat "$1/.pi/agent/sessions/s1/hb-11111111-1111-1111-1111-111111111111.jsonl" 2>/dev/null
 }
 
@@ -312,6 +362,32 @@ else
 fi
 
 echo ""
+echo "1c. the quiet beat WITH A CONDITIONAL CLAUSE (idle capacity) still carries the order, once each"
+# Review finding: with every conditional clause empty, a mutant keyed on one of them is invisible —
+# measured green: `if [ -n "${CAPTEXT}" ]; then FLEETADV_SHORT=""; fi` (the order vanishing in exactly
+# the state where "USE THE CAPACITY" matters). §1c delivers the pulse with a real CAPACITY clause, so
+# the append order (order first, detail second) and the coexistence of both are exercised.
+h="$TMP/cap"; sandbox "$h" 0 cap
+cap="$(beat "$h" "$HB")"
+if [ -z "$cap" ]; then
+  fail "the capacity beat produced NO message — the tick exited before sending"
+elif ! hasi "$cap" "capacity:"; then
+  fail "the capacity sandbox did not emit the CAPACITY clause — §1c would prove nothing"
+else
+  pass "the capacity beat really carries the CAPACITY clause (conditional path exercised)"
+  for i in 0 1 2 3; do
+    _n="$(count_of "$cap" "$(printf '%s' "${ORDER[$i]}" | tr '[:upper:]' '[:lower:]')")"
+    if [ "$_n" = "1" ]; then
+      pass "  capacity beat carries canonical sentence $((i + 1)) VERBATIM, exactly once"
+    elif [ "$_n" = "0" ]; then
+      fail "  capacity beat is MISSING (or has reworded) canonical sentence $((i + 1)) — the order vanished when a conditional clause was present"
+    else
+      fail "  capacity beat carries canonical sentence $((i + 1)) ${_n} times — a duplicate append"
+    fi
+  done
+fi
+
+echo ""
 echo "2. the FULL beat (a routed question) carries the same four sentences, verbatim"
 h="$TMP/full"; sandbox "$h" 1
 full="$(beat "$h" "$HB")"
@@ -324,10 +400,13 @@ else
     fail "the question beat did not take the full-form path — the alert body is unpinned"
   fi
   for i in 0 1 2 3; do
-    if hasi "$full" "$(printf '%s' "${ORDER[$i]}" | tr '[:upper:]' '[:lower:]')"; then
-      pass "  full beat carries canonical sentence $((i + 1)) VERBATIM"
-    else
+    _n="$(count_of "$full" "$(printf '%s' "${ORDER[$i]}" | tr '[:upper:]' '[:lower:]')")"
+    if [ "$_n" = "1" ]; then
+      pass "  full beat carries canonical sentence $((i + 1)) VERBATIM, exactly once"
+    elif [ "$_n" = "0" ]; then
       fail "  full beat is MISSING (or has reworded) canonical sentence $((i + 1)): ${ORDER[$i]}"
+    else
+      fail "  full beat carries canonical sentence $((i + 1)) ${_n} times — a duplicate append inside the question path"
     fi
   done
   if hasi "$full" "$_elab"; then
@@ -382,10 +461,13 @@ for _i in 1 2 3 4; do
 done
 _short_text="$_rend"
 # The DELIVERED quiet body itself, not just the order inside it. Review finding: bounding only the
-# variant left the pulse unbounded — a mutant adding six copies of the MAP sentence to the short-form
+# variant left the pulse unbounded — a mutant adding copies of the MAP sentence to the short-form
 # literal produced a 2316-char quiet beat with this suite green, i.e. the 2396-char wall the SHORT FORM
-# exists to prevent came back unguarded. Shipped is 1590, so 1700 leaves room for incidental growth and
-# nothing for another clause.
+# exists to prevent came back unguarded.
+# ⛔ WHAT IS BOUNDED, EXACTLY: the quiet body with NO conditional clause (1610 bytes shipped; §1c's
+# capacity variant is longer by design). A clause that adds ~200 chars can still land here — the bound
+# stops a SECOND order-sized clause, not every addition; the addition guard is the exhaustive count in
+# §0 (a new append to MSG is a red), which is why this is a readability ceiling and not the only one.
 _body_ceiling=1700
 if [ -n "$quiet" ] && [ "${#quiet}" -lt "$_body_ceiling" ]; then
   pass "the delivered quiet beat is under the fixed ${_body_ceiling}-char ceiling (${#quiet} chars)"
@@ -433,7 +515,7 @@ echo ""
 # the suite still reports green (measured in review: 30-of-36 absorbed three such deletions). At the
 # exact count any removal is red. Adding assertions is safe; REMOVING one means lowering this number
 # deliberately, which is the point.
-MIN_CHECKS=48
+MIN_CHECKS=57
 if [ "$checks" -lt "$MIN_CHECKS" ]; then
   fail "only $checks assertions ran, below the shipped floor of $MIN_CHECKS — a check was removed"
 fi
