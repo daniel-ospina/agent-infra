@@ -910,38 +910,44 @@ MSG="${MSG} ⛔ PRIORITY: before dispatching, read the ranked order IN THE GRAPH
 # nothing, and nothing on the line said that was wrong.
 # WHY HERE AND NOT AGENTS.md: AGENTS.md holds the standing rules; the beat holds what to do with
 # the NEXT TEN MINUTES. The failure was never ignorance of the rules -- it was a beat that read
-# like a finished report. A document cannot change the behaviour a report triggers; putting the
-# order IN the report is what does. It sits beside ROLE/MAP/PRIORITY because that is the block an
-# agent already reads.
+# like a finished report. HYPOTHESIS (labelled as one on purpose: it is not measured): a rule in a
+# document does not change what a report triggers, while an order IN the report does. It sits beside
+# ROLE/MAP/PRIORITY because that is the block an agent already reads, and whether it changes lane
+# behaviour is the one thing this file cannot measure -- merged_24h is where that shows up.
 # ⛔ UNCONDITIONAL, AND IT MUST RIDE THE SHORT FORM TOO (the SHORT FORM block below rebuilds MSG): a
 # quiet beat is exactly when the order is needed, and the short form is what a quiet beat receives --
 # it REBUILDS MSG from scratch, so a clause appended only ABOVE it is discarded on every quiet tick.
 # ⛔ ONE ORDER, TWO LENGTHS -- AND THE ORDER ITSELF IS NEVER REPHRASED. FA1..FA4 are the three
 # instructions the owner gave plus the closing line, defined ONCE and embedded VERBATIM in both
 # bodies; only the (1)(2)(3) numbering and the one elaboration sentence below belong to the alert
-# body alone. That is what lets the coverage assertion be COMPLETE instead of a list of tokens:
-# tests/heartbeat-fleet-advance/run.sh pins each of these sentences verbatim in the DELIVERED quiet
-# beat, the DELIVERED busy-fleet short beat and the DELIVERED alert beat, so no condensation can
-# drop, reword or soften an instruction, and pins both composed literals to their EXACT documented
-# text so nothing can be ADDED to one body either (an added clause -- even a contradictory one --
-# is a variant differing by more than elaboration). (Reviewer-driven: round after round of "delete
-# this phrase, suite stays green" mutants, each pointing at a different word, were all the same
-# defect -- a marker per phrase cannot be exhaustive; a shared sentence can.)
+# body alone. tests/heartbeat-fleet-advance/run.sh pins each of these sentences verbatim in the
+# DELIVERED body of EIGHT fleet states (no lanes / one working lane / working+waiting-child / idle
+# capacity / a routed question / an alerting lane / a queue bottleneck / an objective at risk), pins
+# both composed literals to their EXACT documented text, and pins each delivered body to its exact
+# LENGTH -- so no condensation can drop, reword or soften an instruction, and nothing can be ADDED
+# to a body either (an added clause, even a contradictory one, changes that body's length).
+# (Reviewer-driven: round after round of "delete this phrase, suite stays green" mutants, each
+# pointing at a different word, were all one defect -- a marker per phrase cannot be exhaustive; a
+# shared sentence, a fixed state matrix and an exact delivered body can.)
 # ⛔ THE ONE OWNER-ORDERED SENTENCE THAT IS ALERT-ONLY IS DELIBERATE: order (2)'s "not described in
 # a paragraph about load" rides FLEETADV alone. FA2 keeps the normative half ("USE THE CAPACITY, DO
 # NOT REPORT IT"), and the short body is where the pulse must stay short. Adding that elaborating
-# sentence to the quiet beat means raising the quiet-body ceiling in the suite DELIBERATELY, not
-# tweaking a literal until it fits.
-# MEASURED 2026-10-18: the SHORT rendering is 618 chars and the alert body's CLAUSE 707 (the
-# delivered alert body is ~4.3k, most of it the verdict legend). The order adds ~618 to a ~970-char
-# quiet beat -- still the largest single clause there, and deliberately so: it is the only clause
-# that tells the lane to DO something. BOTH bounds are FIXED numbers in the suite, never derived
-# from the text they bound, and measured in BYTES (the suite pins LC_ALL=C so they mean one thing on
-# every host): the order at 700, the quiet body WITH NO CONDITIONAL CLAUSE at 1700 (shipped 1610).
-# Bounding only the clause left the body itself unguarded (measured: an unrelated clause bloated the
-# pulse to 2401 with the suite green), which is why both are pinned. The ceiling is about
-# readability, not exhaustiveness: an ADDITION of any size is caught by the suite's exhaustive count
-# of MSG append sites, so a new clause is red whatever its length.
+# sentence to the quiet beat is not a ceiling question -- the suite asserts the elaboration ABSENT
+# from the quiet body (it is what makes the two bodies distinguishable), so that edit is red until
+# the assertion is changed deliberately.
+# MEASURED 2026-10-18, IN BYTES (the suite pins LC_ALL=C, and the order carries the characters that
+# differ between bytes and chars -- the em dash and the ⛔): the SHORT rendering is 624 and the alert
+# body's clause 713, on a base pulse of 985 -- so the order is ~39% of every quiet beat, still the
+# largest single clause there and deliberately: it is the only clause that tells the lane to DO
+# something. The delivered quiet body is 1610, the idle-capacity one 1849, the alert body ~4.3k.
+# ⛔ WHAT THE SUITE ENFORCES, AND WHAT IT DOES NOT. It enforces: the exact delivered text LENGTH in
+# each of the eight states, the four sentences exactly once each, the framing ("an ORDER, not a
+# report") in the delivered text, the order last in a plain pulse and immediately before the
+# CAPACITY clause, a fixed 700-byte ceiling on the order's own wording, and a coarse lint on the
+# number of statements touching the order or MSG. It does NOT enforce: an edit keyed on a
+# COMBINATION of states the eight do not visit, written without adding a statement (the irreducible
+# residual -- say so rather than claiming more). The lint counts statements; the length pins catch
+# text. Neither is "exhaustive by construction", and the comment should not pretend otherwise.
 # ⛔ NOT THE DOMINANT SENDER (stated, not absorbed): scripts/cadence-nudge.sh is the cadence FLOOR and,
 # per its own header and this file's note below, the sender that SURVIVES when this tick is killed at
 # its budget. It does carry nudges of its own ("CHECK EVERY LANE IS MOVING", "NEXT: ... spend spare
@@ -955,6 +961,11 @@ MSG="${MSG} ⛔ PRIORITY: before dispatching, read the ranked order IN THE GRAPH
 # AT ASSIGNMENT TIME and silently vanishes, leaving a hole the file on disk still looks right about.
 # The two composed bodies may reference ${FA1}..${FA4}, and ONLY those references -- an added $ or
 # backtick there is the same defect, so it is the composed literal that carries the check.
+# ⛔ "ALL FOUR BOXES (local + the three cloud VMs)" IS THE OWNER'S OWN WORDING, quoted verbatim: the
+# count is a fact about the fleet, not about this code, and nothing in the repo enumerates the VMs
+# (only pi-cell-2 appears by name). If a box is added or retired this sentence must be re-issued by
+# the owner, not silently edited here -- an order carrying a visibly stale fact teaches the reader
+# to skim the order.
 FA1="CHECK THE cmux LANES AND ALL FOUR BOXES (local + the three cloud VMs) and push each toward AUTOPILOT — dispatching, creating PRs, fixing them, merging them UNATTENDED."
 FA2="USE THE CAPACITY, DO NOT REPORT IT: dispatch locally if the local machine has room, on a cloud VM if it is idle."
 FA3="DRIVE THE P0/P1 PRs: name the specific PRs that should land this cycle, take each one to the rail via scripts/admin-merge.sh, and advance agent-infra (cell-2 owns it) toward automating dispatch, PR creation, fixing and merging."
