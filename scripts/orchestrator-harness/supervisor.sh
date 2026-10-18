@@ -9,6 +9,37 @@
 # harness is installable from the repo (scripts/orchestrator-harness/harness.sh) and not reproduced by
 # memory. Its launchd job is rendered from launchd-stack.plist.template by install.sh.
 #
+# ── RELATIONSHIP TO cloud-cell-supervisor.sh (they are NOT alternatives) ────────────────────────────
+# Two programs answer two DIFFERENT questions, and neither can be swapped for the other:
+#
+#   cloud-cell-supervisor.sh (scripts/, runs ON a Linux cell) owns the CELL LIFECYCLE:
+#       check|start|stop|status|logs|apply|prune. It PINS the harness to $HARNESS_REF in a detached
+#       worktree, SEEDS $O from it, WRITES $O/.agent-infra-stamp.json, and launches. Everything it
+#       does is per-invocation: a cell's `start` is a one-shot act whose supervision afterwards is
+#       tmux plus whatever re-runs it — there is no daemon holding the stack up.
+#
+#   supervisor.sh (this file, runs ON macOS) owns PROCESS SUPERVISION:
+#       it never pins, seeds or stamps. It assumes $O is already deployed (harness.sh deploy does
+#       that) and does exactly one thing on a timer: keep the controller plus the digest / watch-prs
+#       / finish workers at exactly one instance each, and report a controller that is ALIVE BUT
+#       NOT CYCLING. launchd's KeepAlive is what makes it a daemon; on a cell there is no KeepAlive,
+#       so this file would have to be re-run by something, which is what cloud-cell-supervisor's
+#       `start` already is.
+#
+# The SHARED contract is not the entry point, it is the RECORD and the CHECKER: both deployments
+# write the SAME $O/.agent-infra-stamp.json (commit + payloadSha256 + relation, folded identically)
+# and both are graded by the SAME scripts/orchestrator-harness/check-deployed-drift.sh. On macOS the
+# shared VERB SET is harness.sh (status/verify/drift/deploy/stop/restart); on a cell it is
+# cloud-cell-supervisor.sh (check/apply/start/stop/status). Same record, same verdict, different
+# lifecycle owner — that is the parity this pair is meant to have.
+#
+# ⛔ WHAT IS *NOT* DECIDED HERE: one program that runs both. That would require a platform adapter
+# (a launchd backend and a tmux/no-supervisor backend behind ONE verb set) and it is an owner
+# decision about the operating model, not something this file may assume. Until such a decision,
+# neither entry point may be deleted as "the duplicate": deleting this one leaves the Mac with a
+# KeepAlive job that exec's a missing file, and deleting the other leaves a cell unable to pin, seed
+# or stamp at all.
+#
 # WHY (measured 2026-10-16). This box crashes and reboots repeatedly (a reboot at 06:14, a crash at
 # 07:39 in one morning). Every crash killed every `nohup`'d process, and each time an agent had to
 # notice and rebuild the stack by hand. This runs under launchd (RunAtLoad + KeepAlive), so the stack

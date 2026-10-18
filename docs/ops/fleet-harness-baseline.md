@@ -83,6 +83,39 @@ tool structurally cannot report. The stamp those first two arms read still says 
 
 ---
 
+### 1.2 Re-measured 2026-10-18T21:00Z — the Mac's entrypoint is now the STACK job, and its stamp is GONE
+
+The target here is **`origin/main` = `60e765daf59f`**. Two things in §1/§3.1 changed on this box and
+both matter for "which commit is this machine running?":
+
+| Datum | Measured 2026-10-18T21:00Z | How |
+|---|---|---|
+| Active launchd job | `com.eldato.orchestrator-stack` (`~/Library/LaunchAgents/com.eldato.orchestrator-stack.plist`, mtime 2026-10-17T18:50Z) | `plutil -p` on the plist |
+| Its `ProgramArguments` | `/bin/bash` → `$O/supervisor.sh` — **not** `orch-loop.sh`, and **not** the §3.1 tmux entrypoint | same |
+| Live chain | `supervisor.sh` pid 41665 → `orch-loop.sh` pid 41679 → two `orch-loop.sh` children | `ps -o pid,ppid,command` |
+| `REPO` | `/Users/home/eldato/tortoise` — **outside `~/Documents`**, so §3.1's TCC/FDA constraint no longer applies to this box | `EnvironmentVariables` in the plist |
+| `$O/.agent-infra-stamp.json` | **ABSENT.** §1.1 recorded `a4a12497` here; it has since been deleted, so `check-deployed-drift.sh` now exits **2 UNKNOWN**, not 1 | `ls`; the check itself |
+| Retired decoy `com.eldato.orchestrator-loop.plist` | Not loaded and no longer present — only `…plist.bak-20261016-0131` remains | `ls ~/Library/LaunchAgents` |
+
+⛔ **`launchd-controller.sh` (the §3.1 tmux entrypoint) is no longer on this box at all**, and neither
+are `watchdog.sh` / `watchdog-loop.sh`. The three runtime-only scripts §2 tells you to expect are now
+just two: **`supervisor.sh`** (the entrypoint) and **`run-wrapped.sh`** (a diagnostic wrapper for the
+controller's exit). The `tmux`/FDA discussion in §3.1 is therefore **history** — keep it for the reason
+it records (a cwd-only fix is insufficient), do not read it as this box's current start path.
+
+Seven shipped scripts are BEHIND this ref (all of them pure additions upstream; none carries live-only
+content that a deploy would lose): `install.sh`, `launchd-cycle.sh`, `install-launchd-durability.test.sh`,
+`fix-one.sh`, `lane.sh`, `spawn-gate.sh`, `refresh-candidates.sh`. `claims.sh` and `orch-loop.sh`, which
+§1.1 lists as live-only, are now byte-identical to this ref.
+
+⛔ **A renderer can still recreate the retired decoy job.** `install.sh` hardcoded
+`LABEL=com.eldato.orchestrator-loop` and `scripts/orchestrator-bringup.sh` still did, so a bare-loop job
+could be rendered beside the stack job — two launchers for one controller lock, and none of the three
+workers. Both are fixed on `fix/harness-parity-20261018` (label/template are caller-supplied, and
+bringup refuses while a `*-stack` plist exists unless a label is passed explicitly).
+
+---
+
 ## 2. How to re-derive this table (do not trust a row you have not re-measured)
 
 ```bash

@@ -62,10 +62,6 @@ DEFAULT_REF="${HARNESS_REF:-origin/main}"
 # SAME/DIFF/MISSING listing an operator asks for when proving a deploy landed. It changes no verdict:
 # the exit code is still 0/1/2 from the same three checks. Added 2026-10-18 so `harness.sh drift` does
 # not re-implement the comparison to display it (one authority per question).
-# `--all` prints a line for EVERY shipped file, not only the ones that disagree — the per-file
-# SAME listing an operator asks for when proving a deploy landed. It changes no verdict: the exit code
-# is still 0/1/2 from the same three checks. Added 2026-10-18 so `harness.sh drift` does not
-# re-implement the comparison just to display it (one authority per question).
 while [ $# -gt 0 ]; do
   case "$1" in
     --o)        [ $# -ge 2 ] || { echo "check-deployed-drift: --o needs a path" >&2; exit 2; }

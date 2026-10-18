@@ -62,7 +62,17 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/orchestrator-registry.sh
 . "$HERE/lib/orchestrator-registry.sh"
 
-LABEL="com.eldato.orchestrator-loop"
+# ⛔ THE DEFAULT IS THE SINGLE-LOOP JOB, AND IT IS AN EXPLICIT CHOICE THE CALLER CAN OVERRIDE.
+# `install.sh` no longer hardcodes this label; it takes LABEL/TEMPLATE from its caller. This file must
+# do the same, or it resets that fix by calling install.sh with neither — the same defect one caller
+# up: a box that runs the supervised STACK job would get a bare `orch-loop.sh` job rendered beside it
+# (three workers never started, and two launchers racing for one controller lock).
+LABEL_EXPLICIT=0
+[ -n "${LABEL:-}" ] && LABEL_EXPLICIT=1
+LABEL="${LABEL:-com.eldato.orchestrator-loop}"
+# The template travels WITH the label: rendering a stack label from the single-loop template boots a
+# supervisor job out and leaves a bare loop in its place (see launchd-stack.plist.template).
+TEMPLATE="${TEMPLATE:-}"
 
 say()  { printf '%s\n' "$*"; }
 ok()   { printf 'ok: %s\n' "$*"; }
@@ -775,6 +785,26 @@ plist_path() { printf '%s\n' "$HOME/Library/LaunchAgents/$LABEL.plist"; }
 
 start_mac() {
   [ -f "$HARNESS_BRINGUP/install.sh" ] || unknown "no install.sh at $HARNESS_BRINGUP — this machine cannot render the launchd agent"
+  # ⛔ ONE LAUNCHER PER CONTROLLER. With no explicit LABEL this renders the SINGLE-LOOP job. If a
+  # *-stack job's plist already exists, that job is the box's launcher (it runs supervisor.sh, which
+  # owns the controller AND the digest / PR watcher / finisher). Rendering the bare-loop label beside
+  # it does not replace the stack — it ADDS a second launcher racing for the same `.orch.lock`, and
+  # the three workers stay under the supervisor. Refuse and NAME the label to pass instead of picking
+  # one: which job a box should run is the operator's fact, not this script's guess.
+  if [ "$LABEL_EXPLICIT" -eq 0 ]; then
+    local _other
+    for _other in "$HOME/Library/LaunchAgents"/*-stack.plist; do
+      [ -f "$_other" ] || continue
+      refuse "a supervised stack job is already installed ($_other) — rendering the single-loop job '$LABEL' beside it would add a SECOND launcher for the same controller and start none of the workers. Nothing was rendered. Re-run with: LABEL=$(basename "$_other" .plist)"
+    done
+  fi
+  local _tpl="$TEMPLATE"
+  if [ -z "$_tpl" ]; then
+    case "$LABEL" in
+      *-stack) _tpl="$HARNESS_BRINGUP/launchd-stack.plist.template" ;;
+      *)       _tpl="$HARNESS_BRINGUP/launchd.plist.template" ;;
+    esac
+  fi
   # install.sh renders AND validates the plist (plutil, unrendered-token check, daemon PATH probe) and
   # deliberately does not load it. Everything it needs is passed explicitly, so a value in this
   # machine's config file cannot be silently ignored by a launchd process that never sees the file.
@@ -782,6 +812,7 @@ start_mac() {
   if ! env -i \
         HOME="$HOME" PATH="$PATH" \
         O="$O" REPO="$REPO" OR="$SLUG_REPO" \
+        LABEL="$LABEL" TEMPLATE="$_tpl" \
         ${SCOPE:+SCOPE="$SCOPE"} \
         bash "$HARNESS_BRINGUP/install.sh"; then
     refuse "install.sh failed to render the launchd agent (see its output above) — no controller was started"
