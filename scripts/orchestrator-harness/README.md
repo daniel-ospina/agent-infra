@@ -437,13 +437,14 @@ export REPO=$HOME/eldato/tortoise        # REQUIRED: the target repo's local mai
                                          # three are the worst shape: $PWD is `/` under launchd,
                                          # so the default resolves to a real non-repo directory
                                          # and fails later as `not a git repository: /` instead
-                                         # of at the REPO boundary. ⛔ An EIGHTH of the same class is
-                                         # not a shell script: `goal-state.py:29` hardcodes
-                                         # `REPO = "/Users/<someone>/Documents/GitHub/tortoise"`
-                                         # with NO env override at all (it only feeds
-                                         # `sys.path.insert`), so it is the rawest form of this
-                                         # defect and is tracked separately. #1977 covers the first
-                                         # and the third; the other five are untracked. So export REPO in
+                                         # of at the REPO boundary. ⛔ TWO of the same class are not
+                                         # shell scripts, and they are the rawest form of it — a
+                                         # hardcoded home with NO env override, used only to import
+                                         # the SDK: `goal-state.py:29`
+                                         # (`REPO = "/Users/<someone>/Documents/GitHub/tortoise"`)
+                                         # and `seed-goal-map.py:29` (the same literal passed straight
+                                         # to `sys.path.insert`). Tracked separately. #1977 covers
+                                         # the first and the third; the other five are untracked. So export REPO in
                                          # the daemon AND the session env (#1935).
 export O=$HOME/orchestrator              # the harness state directory
 export SCOPE=own                         # drain scope: auto (default) | own | broad.
@@ -878,8 +879,8 @@ pass / 2 lines; and `rc=-1: TimeoutExpired` under a CommandLineTools interpreter
 lines). In the third the cached scan
 declines to vouch for a roster it cannot see whole, so it re-scans uncached, which is the read that
 times out in the first; in the second the reader refuses a snapshot it can see is degraded. Either way
-the cost grows with the number of lanes, the only bound in force is a CALLER's, and the pass dies
-instead of returning a verdict. The log keeps growing, so treat these as a dated snapshot, not a
+the cost grows with the number of lanes, the only bound on the WHOLE read is a CALLER's, and the pass
+dies instead of returning a verdict. The log keeps growing, so treat these as a dated snapshot, not a
 constant.
 
 Measured in `~/.pi/agent/state/pr-doctor.log`, read 2026-10-18T00:42Z:
