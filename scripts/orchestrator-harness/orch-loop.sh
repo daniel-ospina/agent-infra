@@ -1054,6 +1054,56 @@ while true; do
     fi
   fi
 
+  # ── machine-global package caches (agent-infra#1987) ───────────────────────
+  # The measured defect: on pi-cell-3 `~/.cache/uv` reached 7.1GB and the box refused EVERY
+  # dispatch at 258MB free while this controller kept beating and the queue read fine. The refusal
+  # itself was loud (spawn-gate names the disk and the remedy) — the REMEDY was the gap: `prune`
+  # reclaimed per-worktree `.venv`/`node_modules` only, so the largest consumer was untouched and
+  # kept growing.
+  # This loop is a CLOCK for the reaper, not the owner of its policy. Both triggers ship DRY-RUN:
+  # arming a scheduled deletion is an owner-level decision (agent-infra#1678, owner ruling
+  # 2026-10-11: "the reaper may run unattended; arming it may not"). The armed arm is reached the
+  # way the cell already reclaims under pressure — `cloud-cell-supervisor.sh`, unattended below
+  # 2x MIN_FREE_MB with no live worker, calling `prune --caches`.
+  # The hourly stamp is the same idiom as claim_prune above (this loop's clock is mtime-based).
+  if [ -z "$(find "$O/state/.cache-reaped" -mmin -60 2>/dev/null)" ]; then
+    touch "$O/state/.cache-reaped"
+    # The same chain as the supervisor and bring-up: ${CACHE_REAPER:-} -> the FARMED copy ->
+    # the copy beside the bundle (scripts/pi-cache-reap.sh, one directory up from this harness).
+    # The SAME chain, in the SAME order, as cloud-cell-supervisor.sh and cloud-cell-bringup.sh:
+    # ${CACHE_REAPER:-} -> the FARMED copy -> the copy beside the bundle. A loop, not an if/else:
+    # with an if/else a NON-EMPTY but mistyped override selected nothing and the clock went
+    # permanently silent (a log line only — `.cache-reap-blocked` was never written, so `status` said
+    # nothing) while the armed prune path on the same box ran the farmed copy.
+    _cache_reaper=""
+    for _cand in "${CACHE_REAPER:-}" \
+                 "${HOME:-}/.pi/agent/scripts/pi-cache-reap.sh" \
+                 "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." 2>/dev/null && pwd)/pi-cache-reap.sh"; do
+      [ -n "$_cand" ] && [ -f "$_cand" ] && { _cache_reaper="$_cand"; break; }
+    done
+    [ -n "$_cache_reaper" ] || _cache_reaper="${CACHE_REAPER:-${HOME:-}/.pi/agent/scripts/pi-cache-reap.sh}"
+    if [ -f "$_cache_reaper" ]; then
+      # ⛔ `&` discards the exit status, and that status is the reaper's ONLY signal (the class the
+      # ⛔ further down this file records for the refresh:
+      # "a refresh that aborts EVERY cycle reads as a healthy cell"). Record a non-zero pass where
+      # `status` prints it, and clear it on the next clean one.
+      (
+        bash "$_cache_reaper" --dry-run >>"$LOG" 2>&1
+        _rc=$?
+        case "$_rc" in
+          0) rm -f "$O/state/.cache-reap-blocked" ;;   # checked: every cache is under its bound
+          4) : ;;                                      # did not run (lock held) — touch nothing
+          5) { printf 'a package cache is OVER its bound and the reaper is not armed (dry-run):\n';
+               tail -3 "$LOG" 2>/dev/null; } >"$O/state/.cache-reap-blocked" 2>/dev/null || true ;;
+          *) { printf 'cache reaper exit %s at %s\n' "$_rc" "$(date -u +%Y-%m-%dT%H:%M:%SZ)";
+               tail -2 "$LOG" 2>/dev/null; } >"$O/state/.cache-reap-blocked" 2>/dev/null || true ;;
+        esac
+      ) &
+    else
+      echo "[cache-reap] NOT RUN — $_cache_reaper is absent, so the machine-global uv/npm/pip caches are unbounded (farm it: pi-bootstrap/setup.sh)" >> "$LOG"
+    fi
+  fi
+
   # ── ownership: the merge-priority gate's input ──────────────────────────────
   # Merge priority counts what is UNOWNED, not what is open: a PR that is mid-review, mid-fix,
   # mid-merge, or held by a claim on another box is healthy queue depth, not a reason to stop

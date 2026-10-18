@@ -1275,6 +1275,17 @@ cmd_status() {
     say "⛔ MERGE-ONLY: dispatch provisioning is BLOCKED — no implementation lane will be dispatched"
     sed 's/^/    /' "$O/.refresh-blocked"
   fi
+  # agent-infra#1987: the cache bound runs on this cell's clock as a BACKGROUND job, so its exit
+  # status is discarded at the call site (orch-loop.sh). A pass that fail-closes every hour — an
+  # unmeasurable cache, an entry that cannot be sized, a shrink it could not verify — would
+  # otherwise read exactly like a healthy cell, which is the blind spot #1987 was filed for.
+  if [ -f "$O/state/.cache-reap-blocked" ]; then
+    # NOT "fail-closed": exit 5 (a cache over bound on the shipped dry-run stance) is the common
+    # case on an unarmed box, and the reaper's exit vocabulary calls only 3 fail-closed. The record
+    # below already names the cause (5 = unarmed, 3 = the pass failed) — do not contradict it.
+    say "⛔ CACHE BOUND NOT ENFORCED — the package-cache reaper's last pass:"
+    sed 's/^/    /' "$O/state/.cache-reap-blocked"
+  fi
   # the loop's own view of itself
   tail -3 "$O/logs/orch-loop.log" 2>/dev/null | sed 's/^/  /' || say "  (no orch-loop.log yet)"
   say "lanes: $(tmux ls 2>/dev/null | grep -c '^lane-')"
@@ -1329,6 +1340,52 @@ sweep_root_caches() {
   [ -d "$root" ] || return 0
   rm_cache "$root/.venv"; rm_cache "$root/node_modules"; rm_cache "$root/.pytest_cache"
   find "$root" -maxdepth 5 -type d -name __pycache__ -prune -exec rm -rf {} + 2>/dev/null || true
+}
+
+# The MACHINE-GLOBAL package caches (agent-infra#1987) — a sink sweep_root_caches can NEVER reach:
+# every path above is resolved from a WORKTREE root, and the space that took `pi-cell-3` to 258MB
+# free was `$HOME/.cache/uv` at 7.1GB, shared by every lane on the box. So `prune` (the low-disk
+# remedy `start` calls unattended, and the verb an operator reaches for) must bound it too, or the
+# remedy reports a freed-disk number while the largest consumer is untouched.
+# The POLICY is not re-implemented here: it is delegated to scripts/pi-cache-reap.sh, its single
+# owner (prune first; then evict only entries no live process is holding, stopping as soon as
+# deletion stops reclaiming disk; exit 3 when a shrink it acted on is unverified). This function
+# only finds that script.
+cache_reaper_path() {
+  local cand
+  # ${CACHE_REAPER:-} FIRST, exactly like orchestrator-harness/orch-loop.sh: one override must not
+  # be honoured by the clock and ignored by the only ARMED caller, or two copies of a deletion
+  # policy run on one box, chosen by two different rules.
+  # ONE chain, the same one orchestrator-harness/orch-loop.sh and cloud-cell-bringup.sh use:
+  # ${CACHE_REAPER:-} -> the FARMED copy (what the launchd job and the cell clock execute) -> the
+  # copy beside this script. Farmed BEFORE beside-this-script matters: this supervisor is never
+  # farmed (pi-bootstrap/setup.sh's fleet_srcs does not list it), so a lane running it from a
+  # checkout would otherwise arm a copy it is mid-edit on while the hourly bound the operator reads
+  # about is a different file.
+  for cand in "${CACHE_REAPER:-}" \
+              "${HOME:-}/.pi/agent/scripts/pi-cache-reap.sh" \
+              "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/pi-cache-reap.sh"; do
+    [ -n "$cand" ] || continue
+    if [ -f "$cand" ]; then printf '%s' "$cand"; return 0; fi
+  done
+  return 1
+}
+
+reap_global_caches() {
+  local reaper rc
+  if ! reaper="$(cache_reaper_path)"; then
+    # NEVER silent: a prune that leaves the biggest consumer alone because a script was missing is
+    # the same false PASS this repo keeps removing. Named, with the remedy.
+    say "warn: pi-cache-reap.sh not found (looked beside this script and in \$HOME/.pi/agent/scripts) — the machine-global uv/npm/pip caches were NOT bounded. Farm it: bash pi-bootstrap/setup.sh"
+    return 0
+  fi
+  rc=0
+  bash "$reaper" --apply || rc=$?
+  # 4 = it did not run (another pass holds the lock); 5 = a cache is over its bound, which cannot
+  # happen on this --apply path but is neutral by design. Neither is a failure, and warning about
+  # them would train the reader to ignore the one line that matters.
+  [ "$rc" -eq 0 ] || [ "$rc" -eq 4 ] || [ "$rc" -eq 5 ] || say "warn: the cache reaper exited $rc — see ${CACHE_REAP_LOG:-$HOME/.pi/agent/state/pi-cache-reap.log}"
+  return 0
 }
 
 # Is <path> a worktree of $REPO or $HARNESS_REPO? Scratch deletion must never touch one — a worktree
@@ -1428,6 +1485,7 @@ cmd_prune() {
       < <(git -C "$r" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10)}')
     sweep_root_caches "$r"
   done
+  reap_global_caches
   [ "$caches_only" = 1 ] && { after="$(free_mb "$CELL_HOME")"; [ -n "$before" ] && [ -n "$after" ] && say "prune: free ${before}MB → ${after}MB"; return 0; }
   # (3) /tmp review scratch. REPORTED, never deleted implicitly: a scratch checkout is source, and
   # the brief is explicit that source may be unmerged work. --scratch deletes only what is (a) a git

@@ -433,6 +433,109 @@ check_operational_layer() {
   fi
 }
 
+# ── disk: the machine-global package caches (agent-infra#1987) ─────────────────────
+# REPORT ONLY, and deliberately not a refusal: a cache over its bound is the state the box is
+# in BEFORE it stops dispatching, and this check exists so that state is VISIBLE while there is
+# still room to fix it. The refusal lives where the consequence is (cloud-cell-supervisor.sh
+# cmd_check_disk's MIN_FREE_MB floor); binding a cache SIZE into `--check` would fail a cell
+# that is working fine on a large disk. Measured on pi-cell-3: 258MB free, `~/.cache/uv` alone
+# 7.1GB — every dispatch refused, and nothing on the box reported the cache as the cause.
+check_caches() {
+  local d kb total=0 listed="" maxmb=2048 bound over=0 measured du_rc cfg line reaper real_d
+  # A NEWLINE-SEPARATED list, not an array: bash 3.2 (the macOS default) treats `${#arr[@]}` on an
+  # empty array as an unbound-variable error under `set -u`.
+  local dirs_list="" bound_source=default
+  # The reaper is the ONE place that knows WHERE the caches are and WHAT the bound is. Two reasons
+  # (agent-infra#1987): `uv cache dir` honours XDG_CACHE_HOME, so a literal `$HOME/.cache/uv` here
+  # can report "absent" for a box whose uv cache is 3GB elsewhere; and a tuned bound must not leave
+  # this report describing a different policy than the one enforced.
+  reaper=""
+  # ${CACHE_REAPER:-} FIRST: the same override the cell clock and the supervisor honour, so the
+  # report cannot describe a different copy than the one that runs.
+  # The same chain as the supervisor and the cell clock: ${CACHE_REAPER:-} -> the FARMED copy ->
+  # the copy beside this script, so the report describes the script that actually runs.
+  for d in "${CACHE_REAPER:-}" \
+           "${HOME:-}/.pi/agent/scripts/pi-cache-reap.sh" \
+           "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/pi-cache-reap.sh"; do
+    [ -n "$d" ] && [ -f "$d" ] && { reaper="$d"; break; }
+  done
+  cfg=""
+  if [ -n "$reaper" ]; then
+    cfg="$(bash "$reaper" --print-config 2>/dev/null)" || cfg=""
+    line="$(printf '%s\n' "$cfg" | sed -n 's/^bound_mb=//p' | head -1)"
+    case "$line" in
+      ''|*[!0-9]*|0*) ;;
+      *) maxmb="$line" ;;
+    esac
+    # WHERE the bound came from, reported next to it: a bound tuned in the launchd plist does not
+    # reach a bring-up shell's environment, so the two numbers can legitimately differ — and a
+    # report that hides its source reads as the policy the armed job enforces (#1987 review).
+    bound_source="$(printf '%s\n' "$cfg" | sed -n 's/^bound_source=//p' | head -1)"
+    case "$bound_source" in env|default) ;; *) bound_source=unknown ;; esac
+    while IFS= read -r line; do
+      case "$line" in cache=*) dirs_list="$dirs_list${dirs_list:+
+}${line#cache=*:}" ;; esac
+    done <<<"$cfg"
+  fi
+  # No farmed resolver yet (a fresh box, or the script is not farmed): report the documented
+  # locations rather than nothing — a check that silently reports no caches is the blind spot this
+  # function exists to remove.
+  if [ -z "$dirs_list" ]; then
+    # The npm sink is the cache ROOT the tool reports (`npm config get cache`), not its `_cacache`
+    # child: `_npx` and `_logs` sit beside it, so naming the child reported "absent / total 0MB"
+    # for a box whose npm cache was the sink — on exactly the fresh box that has no reaper farmed.
+    dirs_list="$(printf '%s\n' "$HOME/.cache/uv" "$HOME/.npm" "$HOME/.cache/pip" "$HOME/Library/Caches/pip")"
+  fi
+  case "$maxmb" in ''|*[!0-9]*|0*) maxmb=2048 ;; esac
+  bound=$(( 10#$maxmb * 1024 ))
+  while IFS= read -r d; do
+    if [ ! -d "$d" ]; then
+      listed="$listed, $(basename "$(dirname "$d")")/$(basename "$d")=absent"
+      continue
+    fi
+    # A cache dir that is itself a SYMLINK (the "move it to a bigger disk" idiom) measures 0:
+    # `du -sk <link>` stats the link, not the tree. Resolve it first, or this report reads
+    # "0MB on a 7.1GB cache" — the very blind spot the check exists to remove.
+    if [ -L "$d" ]; then
+      real_d="$(cd "$d" 2>/dev/null && pwd -P)" || real_d=""
+      if [ -z "$real_d" ]; then
+        warn "cache $d: is a symlink that cannot be resolved — the size cannot be measured"
+        listed="$listed, $d=unresolvable"
+        continue
+      fi
+      d="$real_d"
+    fi
+    # A cache that cannot be measured is REPORTED as unmeasurable — never as 0, which would read
+    # as "nothing to see" for the one number this check exists to surface. `du`'s STATUS decides:
+    # a partially unreadable cache still prints a numeric partial total (measured: a 3016KB tree
+    # with one mode-000 subdir prints `16` and exits 1).
+    measured=1
+    kb="$(du -sk "$d" 2>/dev/null)"; du_rc=$?
+    kb="${kb%%[[:space:]]*}"
+    [ "$du_rc" -eq 0 ] || measured=0
+    case "${kb:-}" in ''|*[!0-9]*) measured=0 ;; esac
+    if [ "$measured" -eq 0 ]; then
+      warn "cache $d: cannot be measured (du failed) — a full disk reads healthy when nothing is measured"
+      listed="$listed, $d=unmeasurable"
+      continue
+    fi
+    total=$(( total + kb ))
+    if [ "$kb" -gt "$bound" ]; then
+      over=$(( over + 1 ))
+      listed="$listed, $d=$(( kb / 1024 ))MB OVER"
+    else
+      listed="$listed, $d=$(( kb / 1024 ))MB"
+    fi
+  done <<<"$dirs_list"
+  listed="${listed#, }"
+  ok "caches: $listed — total $(( total / 1024 ))MB (bound ${maxmb}MB per cache, source ${bound_source})"
+  if [ "$over" -gt 0 ]; then
+    warn "  $over package cache(s) exceed the ${maxmb}MB bound — this is the sink that took pi-cell-3"
+    warn "  from 7.1GB in ~/.cache/uv to 258MB free and refused every dispatch (#1987). Reclaim it now:"
+    warn "    bash ${reaper:-$HOME/.pi/agent/scripts/pi-cache-reap.sh} --apply"
+  fi
+}
+
 main() {
   export HOME_ORIG="${HOME:-}"
   say "cloud-cell bringup — mode=$MODE uid=$(id -u)"
@@ -446,12 +549,13 @@ main() {
       check_repo
       check_dispatch
       check_operational_layer
+      check_caches
       # `CELL READY` is a claim about the cell, and "no pushed credential left on disk" is part of
       # it. The EXIT trap covers every other exit path; this makes the banner's own path fail-closed
       # too, so the banner is never printed while a registered secret is still there.
       remove_secrets \
         || die "a secret file could not be removed — refusing to report readiness; delete it by hand before using this VM"
-      say "CELL READY — all links verified (home, tools, network, provider, gh auth, push, clone, dispatch pre-flight, operational layer)"
+      say "CELL READY — all links verified (home, tools, network, provider, gh auth, push, clone, dispatch pre-flight, operational layer, caches reported)"
       ;;
     *)
       say "unknown mode: $MODE (use --check)"; exit 2 ;;
