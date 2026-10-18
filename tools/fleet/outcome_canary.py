@@ -190,9 +190,9 @@ class Cfg(object):
     """Everything a predicate may consult. Immutable in practice; fixtures may override any field."""
 
     DEFAULTS = {
-        # how old a POOL READ may be before it stops being evidence. The refresh runs every cycle
-        # (~240s); 30 min tolerates several missed cycles while still catching a frozen refresh
-        # overnight. The harness's precedent for an equivalent bound is GH_LIMIT_STALE_S=900.
+        # How old an EMPTY pool READ may be before it stops being evidence. 90 minutes: the harness's
+        # own token formatter switches from minutes to hours at 5400s, so this is the repo's existing
+        # boundary for "this read is old enough to matter" rather than a number invented here.
         "queue_stale_s": 5400.0,
         # How long a "recent" outcome may be before it is stale. 720s = 3 cycles of a 240s cell.
         "window_s": 720.0,
@@ -221,6 +221,7 @@ class Cfg(object):
     FIELDS = (
         "window_s",
         "pr_window_s",
+        "queue_stale_s",
         "mem_floor_mb",
         "disk_floor_gb",
         "pool_threshold",
@@ -244,14 +245,10 @@ class Cfg(object):
             if k in kw and kw[k] is not None:
                 setattr(self, k, kw[k])
         # Coerce numerics: a fixture is JSON and JSON has no float width contract.
-        for k in ("window_s", "pr_window_s", "mem_floor_mb", "disk_floor_gb",
+        for k in ("window_s", "pr_window_s", "queue_stale_s", "mem_floor_mb", "disk_floor_gb",
                   "respawn_timeout_s"):
             setattr(self, k, float(getattr(self, k)))
         self.pool_threshold = int(self.pool_threshold)
-
-    # 90 minutes: the harness's own token formatter switches from minutes to hours at 5400s, so that is
-    # the repo's existing boundary for "this read is old enough to matter" — not a number invented here.
-    queue_stale_s = 5400.0
 
     def controller_paths(self):
         """The controller script(s) for THIS cell: `$O/orch-loop.sh`, plus the harness copy if a
@@ -780,16 +777,20 @@ def check_queue_readable(f, c):
     # the shape, the evidence carries the pool count and the queue token, and a human can tell the
     # two apart in one read. (Silence is not the safe default here — a blind refresh looks identical.)
     pool = tok.get("pool")
-    stale = _queue_stale(f, c)
+    stale = _queue_stale(f, c, require_known=True)
     if stale is not None and tok["kind"] == "EMPTY":
         # ⛔ EMPTINESS IS THE ONE CLAIM A FROZEN READ CANNOT SUPPORT. "Nothing to do" read from a
         # six-hour-old record is the state record acting as a stale flag — the exact failure the
         # token's age suffix exists to prevent. A stale READ(n) still supports "readable, n
         # candidates"; it is reported as evidence and does not flip the verdict.
         return V("queue_readable", INCONCLUSIVE, "STATE_FROZEN", _queue_frozen_txt(f, stale),
-                 "the pool was read as EMPTY %s ago (limit %.0fs), so 'the pool is empty' is a "
-                 "claim about then, not now. Not green." % (
-                     _age_txt(stale["age_s"]), c.queue_stale_s))
+                 ("the pool was read as EMPTY %s ago (limit %.0fs), so 'the pool is empty' is a "
+                  "claim about then, not now. Not green." % (
+                      _age_txt(stale["age_s"]), stale["limit_s"]))
+                 if stale["age_s"] is not None else
+                 ("the pool was read as EMPTY but the reading carries NO AGE, so there is no way to "
+                  "tell a current empty pool from a record frozen hours ago. A state record with no "
+                  "age is a stale flag waiting to be read as current. Not green."))
     if tok["kind"] == "EMPTY" and backlog is None:
         return V("queue_readable", INCONCLUSIVE, "HEADER_INCOMPLETE",
                  "header: %s has no backlog= field, so 'empty' cannot be checked against it"
@@ -830,11 +831,21 @@ def _queue_age(f, c):
     return age, src
 
 
-def _queue_stale(f, c):
-    """{"age_s", "source"} when the pool reading is older than the limit, else None."""
+def _queue_stale(f, c, require_known=False):
+    """{"age_s", "source", "limit_s"} when the pool reading is not usable as CURRENT, else None.
+
+    `require_known` is passed only where the claim being made is EMPTINESS ("nothing to do"). An
+    unaged read cannot support that claim — the harness itself emits a bare token when the epoch
+    field is missing or unparsable, and calls such a record "a stale flag waiting to be read as
+    current". A stale-or-unaged NON-EMPTY read is different: it still says "readable, n candidates",
+    which is the claim those branches make.
+    """
     age, src = _queue_age(f, c)
-    limit = getattr(c, "queue_stale_s", 1800.0) or 1800.0
-    if age is None or age <= limit:
+    limit = getattr(c, "queue_stale_s", None) or 5400.0
+    if age is None:
+        return ({"age_s": None, "source": src or "no age in the token or the state file",
+                 "limit_s": limit} if require_known else None)
+    if age <= limit:
         return None
     return {"age_s": age, "source": src, "limit_s": limit}
 
@@ -843,7 +854,8 @@ def _queue_frozen_txt(f, stale):
     events = f.get("log_events") or {}
     hdr = newest(events.get("headers"))
     lines = ["pool read age: %s (source: %s, limit %.0fs)"
-             % (_age_txt(stale["age_s"]), stale["source"], stale["limit_s"])]
+             % (_age_txt(stale["age_s"]) if stale["age_s"] is not None else "UNKNOWN (no age)",
+                stale["source"], stale["limit_s"])]
     if hdr:
         lines.append("cycle header: %s" % hdr.get("raw"))
     qs = f.get("queue_state") or {}
@@ -951,14 +963,17 @@ def check_work_dispatched(f, c):
     # `queue_readable` already refuses to grade it. Accepting the absence as zero here let
     # `work_dispatched` — "the one that matters most" — assert that a fleet's non-dispatch was
     # CORRECT on evidence the module had declared incomplete.
-    stale = _queue_stale(f, c)
+    stale = _queue_stale(f, c, require_known=True)
     if stale is not None and (pool_kind == "EMPTY" or backlog == 0):
         # "Nothing to dispatch" is the CORRECT outcome only on a CURRENT read. A frozen read makes it
         # unestablished, and this is the branch that would otherwise bless it.
         return V("work_dispatched", INCONCLUSIVE, "STATE_FROZEN", _queue_frozen_txt(f, stale),
-                 "the pool was read as empty %s ago (limit %.0fs), so 'there was nothing to "
-                 "dispatch' is not established. Not green." % (
-                     _age_txt(stale["age_s"]), c.queue_stale_s))
+                 ("the pool was read as empty %s ago (limit %.0fs), so 'there was nothing to "
+                  "dispatch' is not established. Not green." % (
+                      _age_txt(stale["age_s"]), stale["limit_s"]))
+                 if stale["age_s"] is not None else
+                 ("the pool was read as empty but the reading carries NO AGE, so 'there was nothing "
+                  "to dispatch' cannot be told from a record frozen hours ago. Not green."))
     if pool_kind == "EMPTY" and backlog is None:
         return V("work_dispatched", INCONCLUSIVE, "HEADER_INCOMPLETE",
                  "queue=EMPTY but the header carries no `backlog=` field: %s" % hdr,

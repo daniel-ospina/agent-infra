@@ -915,6 +915,51 @@ def test_a_FROZEN_pool_read_is_not_a_current_one():
 
 
 @test
+def test_an_EMPTY_read_with_NO_age_is_not_a_current_read():
+    """The harness EMITS an unaged token (a torn or hand-edited state file prints the bare token), and
+    its own comment calls such a record "a stale flag waiting to be read as current". The staleness
+    guard returned None for an UNKNOWN age, so `EMPTY` with no age was graded CURRENT."""
+    m = load()
+    d = fx("healthy")
+    d["facts"]["log_events"] = {
+        "headers": [{"raw": "=== Sun Oct 18 07:47:44 EST 2026 load=12 lanes=1 queue=EMPTY ===",
+                     "age_s": 60, "ts": 0, "backlog": 0, "queue_token": "EMPTY"}],
+        "dispatch_ok": [], "dispatch_refused": [], "dispatch_empty": [], "dispatch_skipped": [],
+        "armed": [], "railed": []}
+    d["facts"]["queue_state"] = {"path": "q", "ok": True, "raw": "EMPTY", "age_s": None}
+    cfg = m.cfg_from_dict(d["config"])
+    got = dict((v.name, v) for v in m.evaluate(d["facts"], cfg))
+    assert (got["queue_readable"].status, got["queue_readable"].variant) == (
+        m.INCONCLUSIVE, "STATE_FROZEN"), (got["queue_readable"].status, got["queue_readable"].variant)
+    assert "UNKNOWN (no age)" in got["queue_readable"].evidence, got["queue_readable"].evidence
+    assert got["work_dispatched"].variant == "STATE_FROZEN", got["work_dispatched"].variant
+    assert m.exit_code(list(got.values())) != 0
+
+
+@test
+def test_the_staleness_limit_is_CONFIGURABLE_and_actually_applies():
+    """`--queue-stale-min` was advertised in the CLI help and the doc but absent from Cfg.FIELDS, so
+    both the flag and a fixture's `config.queue_stale_s` were silently discarded — an inert setting."""
+    m = load()
+    assert m.Cfg(queue_stale_s=600).queue_stale_s == 600.0
+    assert m.Cfg(queue_stale_s=600.0).queue_stale_s == 600.0
+    d = fx("healthy")
+    d["facts"]["log_events"] = {
+        "headers": [{"raw": "=== Sun Oct 18 07:47:44 EST 2026 load=12 lanes=1 queue=EMPTY(2m) ===",
+                     "age_s": 60, "ts": 0, "backlog": 0, "queue_token": "EMPTY(2m)"}],
+        "dispatch_ok": [], "dispatch_refused": [], "dispatch_empty": [], "dispatch_skipped": [],
+        "armed": [], "railed": []}
+    d["facts"]["queue_state"] = {"path": "q", "ok": True, "raw": "EMPTY", "age_s": 120.0}
+    # the default (90m) tolerates a 2-minute-old read …
+    got = dict((v.name, v) for v in m.evaluate(d["facts"], m.cfg_from_dict(d["config"])))
+    assert got["queue_readable"].status == m.PASS, got["queue_readable"].variant
+    # … and a 60-second limit, which only works if FIELDS carries the field, flips it
+    d["config"]["queue_stale_s"] = 60.0
+    got2 = dict((v.name, v) for v in m.evaluate(d["facts"], m.cfg_from_dict(d["config"])))
+    assert got2["queue_readable"].variant == "STATE_FROZEN", got2["queue_readable"].variant
+
+
+@test
 def test_a_future_dated_log_mtime_is_UNKNOWN_not_the_freshest_possible():
     """`max(0.0, now - mtime)` turned a clock-skewed cell's log into the freshest possible one, so
     "pid alive but the log stopped" — the state that must fire — read PASS, and since absence is the
@@ -1506,9 +1551,19 @@ MUTATIONS = [
     ("the census is not scoped to this cell's controller path",
      "        if paths and os.path.normpath(toks[1]) not in paths:", "        if False:",
      "test_the_census_is_scoped_to_THIS_cell_and_reports_what_it_rejected"),
+    # ── cycle-7 defects ──────────────────────────────────────────────────────────────
+    ("an EMPTY read with NO age is graded as a current read",
+     '        return ({"age_s": None, "source": src or "no age in the token or the state file",\n'
+     '                 "limit_s": limit} if require_known else None)',
+     "        return None",
+     "test_an_EMPTY_read_with_NO_age_is_not_a_current_read"),
+    ("the staleness limit is not a config field, so the flag and fixture config do nothing",
+     '    FIELDS = (\n        "window_s",\n        "pr_window_s",\n        "queue_stale_s",',
+     '    FIELDS = (\n        "window_s",\n        "pr_window_s",',
+     "test_the_staleness_limit_is_CONFIGURABLE_and_actually_applies"),
     # ── cycle-6 defects ──────────────────────────────────────────────────────────────
     ("the age of the pool read is parsed and never read, so a frozen read passes as current",
-     "    if age is None or age <= limit:\n        return None",
+     "    if age <= limit:\n        return None",
      "    if True:\n        return None",
      "test_a_FROZEN_pool_read_is_not_a_current_one"),
     ("a frozen read still lets work_dispatched bless 'nothing to dispatch'",

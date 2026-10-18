@@ -142,7 +142,10 @@ reason and use the exit code + log for the signal.
   older than `--queue-stale-min` (default 90, the harness's own minutes-to-hours boundary) is
   `INCONCLUSIVE / STATE_FROZEN` for `queue_readable` and `work_dispatched`. A stale **non-empty** read
   still supports "readable, n candidates" — failing that would cry wolf on a box that is dispatching
-  from it.
+  from it. An `EMPTY` read carrying **no age at all** is also `STATE_FROZEN`: the harness emits that
+  shape from a torn state file, and an unaged record is a stale flag waiting to be read as current.
+  The limit is `--queue-stale-min` / `config.queue_stale_s`, and it is a real field — not an
+  advertised flag that `Cfg` silently discards.
 - **A future-dated log mtime is UNKNOWN, not the freshest possible.** `max(0, now - mtime)` made a
   clock-skewed cell's log read as 0s old, so "the pid is alive but the log stopped" — the state that
   must fire — read PASS.
@@ -199,8 +202,8 @@ shape changes, and it is pruned with the rest of its check.
 ## The suite
 
 ```bash
-python3 tools/fleet/outcome_canary.test.py              # 64 tests
-python3 tools/fleet/outcome_canary.test.py --mutations  # 37 mutations, each must go RED
+python3 tools/fleet/outcome_canary.test.py              # 66 tests
+python3 tools/fleet/outcome_canary.test.py --mutations  # 39 mutations, each must go RED
 ```
 
 The signal tests drive the **real CLI** end-to-end (`--live --facts … --capture-dir …`), so what is
