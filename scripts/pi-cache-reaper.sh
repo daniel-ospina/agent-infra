@@ -136,37 +136,48 @@ while [ "$#" -gt 0 ]; do
     shift
 done
 case "${MAX_MB:-}" in ''|*[!0-9]*) printf '%s: --max-mb must be a whole number of MiB (got %s)\n' "$SCRIPT_NAME" "${MAX_MB:-<empty>}" >&2; exit 2 ;; esac
-MAX_MB="$((10#$MAX_MB))"
 # ⛔ REFUSE an out-of-range bound; never silently repair it. A repaired pin acts on a bound the
-# operator did not ask for — the worst direction here (a 0 bound would empty every cache, and a
-# "bound" above 999999 MiB is a typo, not a policy). MEMORY.md [bash] records the contract: a value
-# the script accepts must be the value it uses, and a bad explicit pin is refused, not rewritten.
+# operator did not ask for, and the dangerous direction is DOWNWARD (a 0 bound would empty every
+# cache). MEMORY.md [bash] records the contract: a value the script accepts must be the value it uses.
+# ⛔ THE DIGIT COUNT IS CHECKED BEFORE ANY ARITHMETIC, deliberately: bash arithmetic is 64-bit and
+# WRAPS, so `$((10#18446744073709551617))` is `1` (measured) — a 1 MiB bound, the most destructive
+# value there is, reached while the value LOOKED implausible. Refusing on the string means no
+# arithmetic can turn a typo into a policy. Leading zeros beyond 6 digits are refused too: they are a
+# spelling nobody means, and refusing one costs an operator one retry.
+if [ "${#MAX_MB}" -gt 6 ]; then
+    printf '%s: --max-mb %s is not a plausible package-cache bound (1..999999 MiB) — refusing rather than acting on a different bound\n' "$SCRIPT_NAME" "$MAX_MB" >&2
+    exit 2
+fi
+MAX_MB="$((10#$MAX_MB))"
 if [ "$MAX_MB" -lt 1 ]; then
     printf '%s: --max-mb must be at least 1 MiB (got %s) — a 0 bound would empty every cache\n' "$SCRIPT_NAME" "$MAX_MB" >&2
     exit 2
 fi
-if [ "$MAX_MB" -gt 999999 ]; then
-    printf '%s: --max-mb %s MiB is not a plausible package-cache bound (max 999999) — refusing rather than acting on a different bound\n' "$SCRIPT_NAME" "$MAX_MB" >&2
-    exit 2
-fi
 case "${DRY_RUN:-}" in 0|1) ;; *) DRY_RUN=1 ;; esac
+# MODE is derived from DRY_RUN, not from which flag was typed: with the default (or an env-only
+# `CACHE_REAPER_DRY_RUN=0`) no flag runs, and a log line claiming `mode=act` while nothing was
+# attempted is exactly the kind of record that makes a later reader believe a reclaim happened.
+MODE="act"; [ "$DRY_RUN" = 1 ] && MODE="dry-run"
 
 # ── sinks ─────────────────────────────────────────────────────────────────────
 # resolve_paths — NEVER guess a cache path from an unset HOME. `${HOME:-}/.cache/uv` expands to
 # `/.cache/uv`, and a reaper pointed at the filesystem root is exactly the silent-destruction class
-# this repo refuses. An unset HOME requires every sink to be named explicitly.
+# this repo refuses. An unset HOME requires every sink AND the log to be named explicitly — the log
+# because the default path is derived from HOME, and `${LOG:-$HOME/…}` under `set -u` otherwise dies
+# with a bare `HOME: unbound variable` (exit 1) instead of this refusal (measured).
 resolve_paths() {
     if [ -z "${HOME:-}" ]; then
         local missing=""
         [ -n "${UV_CACHE_DIR:-}" ] || missing="$missing UV_CACHE_DIR"
         [ -n "${NPM_CACHE_DIR:-}" ] || missing="$missing NPM_CACHE_DIR"
         [ -n "${PIP_CACHE_DIR:-}" ] || missing="$missing PIP_CACHE_DIR"
-        [ -z "$missing" ] || { printf '%s: HOME is unset and%s unset — refusing to guess a cache path\n' "$SCRIPT_NAME" "$missing" >&2; exit 3; }
+        [ -n "${CACHE_REAPER_LOG:-${LOG:-}}" ] || missing="$missing CACHE_REAPER_LOG"
+        [ -z "$missing" ] || { printf '%s: HOME is unset and%s unset — refusing to guess a cache or log path\n' "$SCRIPT_NAME" "$missing" >&2; exit 3; }
     fi
     UV_CACHE_DIR="${UV_CACHE_DIR:-$HOME/.cache/uv}"
     NPM_CACHE_DIR="${NPM_CACHE_DIR:-$HOME/.npm/_cacache}"
     PIP_CACHE_DIR="${PIP_CACHE_DIR:-$HOME/.cache/pip}"
-    LOG="${LOG:-$HOME/.pi/agent/state/pi-cache-reaper.log}"
+    LOG="${LOG:-${HOME}/.pi/agent/state/pi-cache-reaper.log}"
 }
 
 sink_path() {
@@ -228,9 +239,14 @@ uv_lock_hold() {
     py="${PYTHON_BIN:-$(command -v python3 2>/dev/null)}"
     [ -n "${py:-}" ] || return 2
     dir="$(mktemp -d "${TMPDIR:-/tmp}/pi-cache-reaper-lock.XXXXXX" 2>/dev/null)" || return 2
+    # ⛔ NO TIMEOUT on the hold. A deadline silently DROPS the flock while the caller is still deleting
+    # (measured: the child exited 0 at 600 s and `uv_escalate` kept unlinking) — the same
+    # check-then-act window the hold exists to close. The holder leaves only on the release marker, or
+    # when its PARENT changes (the shell died), so it cannot outlive the operation it protects.
     "$py" - "$lock" "$dir/ready" "$dir/release" >/dev/null 2>&1 <<'PY' &
 import fcntl, os, sys, time
 lock, ready, release = sys.argv[1], sys.argv[2], sys.argv[3]
+holder_dir = os.path.dirname(ready)
 try:
     handle = open(lock, "r+b")
 except OSError:
@@ -244,11 +260,19 @@ try:
     open(ready, "w").close()
 except OSError:
     sys.exit(2)
-deadline = time.time() + 600
-while time.time() < deadline:
-    if os.path.exists(release) or os.getppid() != parent:
-        break
+while not (os.path.exists(release) or os.getppid() != parent):
     time.sleep(0.05)
+# The shell removes this dir on its normal path; a shell that was KILLED cannot, and an hourly job
+# that leaks one directory per abnormal exit has no bound of its own. So clean up here too.
+for name in (ready, release):
+    try:
+        os.unlink(name)
+    except OSError:
+        pass
+try:
+    os.rmdir(holder_dir)
+except OSError:
+    pass
 sys.exit(0)
 PY
     pid=$!

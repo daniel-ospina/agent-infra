@@ -33,6 +33,10 @@
 #      not on their own defaults.
 #   M. the uv lock is HELD for the whole escalation (a competing acquire fails while it is held), and
 #      the holder cleans up after itself.
+#   N. the lock holder leaves NOTHING behind — no marker dir on the normal path, and none after the
+#      shell holding it is KILLED (the flock is released by the holder's parent check).
+#   O. an unset HOME with every sink named refuses with the documented exit 3 and a message, rather
+#      than dying on an unbound `HOME` inside the log default (exit 1, bare bash error).
 #
 # Hermetic: temp HOME with fixture cache trees, stub `uv`/`npm`/`pip3`/`ps` on PATH, no network, no
 # real cache touched. Run: bash scripts/pi-cache-reaper.test.sh
@@ -303,6 +307,8 @@ AFTER="$(sink_mb "$H/.cache/uv")"
                            || bad "a bare invocation DELETED bytes — the fleet reaper convention is dry-run by default"
 [ "$RC" -eq 3 ] && ok "a bare pass over the bound exits 3 (a report, not a pass)" || bad "bare dry-run exited $RC (expected 3)"
 grep -qF "DRY-RUN" <<<"$OUT" && ok "the pass SAYS it was a dry run" || bad "the pass did not name the dry run"
+grep -qF "start mode=dry-run" "$H/.pi/agent/state/pi-cache-reaper.log" 2>/dev/null && ok "the LOG records mode=dry-run (a record claiming act would make a later reader believe a reclaim happened)" \
+                                                                          || bad "the log claims the wrong mode: $(cat "$H/.pi/agent/state/pi-cache-reaper.log" 2>/dev/null | head -2)"
 [ "$(stub_calls)" -eq 0 ] && ok "a bare dry-run invoked no tool" || bad "a bare dry-run invoked a tool"
 REAPER_ARGS=(--apply --max-mb 10)
 OUT="$(run_reaper "$H")"
@@ -322,7 +328,15 @@ REAPER_ARGS=(--apply --max-mb 2000000)
 OUT="$(run_reaper "$H")"; RC=$?
 [ "$RC" -eq 2 ] && ok "an implausible --max-mb is refused with exit 2" || bad "--max-mb 2000000 exited $RC (expected 2)"
 [ "$(stub_calls)" -eq 0 ] && ok "a refused bound acted on nothing" || bad "a refused bound still invoked a tool"
-[ "$(sink_mb "$H/.cache/uv")" -ge "$BEFORE" ] && ok "a refused bound deleted nothing" || bad "a refused bound deleted bytes"
+# ⛔ 64-bit WRAPAROUND: bash arithmetic turns this into 1 (`$((10#18446744073709551617))` == 1), so a
+# guard applied AFTER the conversion would accept the most destructive bound there is while the value
+# looked implausible. The digit count is checked on the STRING, so no arithmetic can reach it.
+REAPER_ARGS=(--apply --max-mb 18446744073709551617)
+OUT="$(run_reaper "$H")"; RC=$?
+[ "$RC" -eq 2 ] && ok "a 20-digit bound is refused (no arithmetic wraparound to 1 MiB)" \
+                || bad "a 20-digit bound exited $RC — it wrapped into a real bound"
+grep -qF "not a plausible" <<<"$OUT" && ok "the wraparound refusal names the bound as implausible" || bad "the refusal did not name the bound"
+[ "$(sink_mb "$H/.cache/uv")" -ge "$BEFORE" ] && ok "a wrapped bound deleted nothing" || bad "a wrapped bound deleted bytes"
 
 say_case "L. npm/pip act on the sink that was MEASURED, not on their own defaults"
 H="$T/homeL"; mkdir -p "$H"
@@ -339,11 +353,19 @@ grep -qF "pip3 cache purge --cache-dir $H/.cache/pip" "$T/stub.log" && ok "pip i
 [ "$RC" -eq 3 ] && ok "still over the bound after prune-only sinks -> exit 3" || bad "expected exit 3, got $RC"
 
 say_case "M. the uv lock is HELD across the escalation, and the holder cleans up"
+# A private TMPDIR for every holder in this suite, so "no crumbs left behind" is ASSERTED rather than
+# trusted: an hourly job that leaks a dir per abnormal exit has no bound of its own.
+HOLD_TMP="$T/locktmp"; mkdir -p "$HOLD_TMP"
 LOCKROOT="$T/lockcase"; mkdir -p "$LOCKROOT"; : > "$LOCKROOT/.lock"
 OUT="$(
     ( set +u
+      export TMPDIR="$HOLD_TMP"
       . "$REAPER"
       PYTHON_BIN="$(command -v python3)"
+      # ⛔ The holder must have NO self-expiry: a deadline would DROP the flock while the caller is
+      # still deleting (measured at 600 s in review round 2), which is the check-then-act window the
+      # hold exists to close. Pinned at the source, because waiting out a deadline is not a test.
+      echo "holder_expiry_lines=$(sed -n '/uv_lock_hold() {/,/^}/p' "$REAPER" | grep -c 'time\.time() +')"
       uv_lock_hold "$LOCKROOT"; echo "hold_rc=$?"
       python3 - "$LOCKROOT/.lock" <<'PY'
 import fcntl, sys
@@ -374,6 +396,8 @@ grep -qF "hold_rc=0" <<<"$OUT" && ok "uv_lock_hold acquires a free uv lock" || b
 grep -qF "compete_while_held=1" <<<"$OUT" && ok "a competing acquire FAILS while the reaper holds it (the deletes run under the lock)" \
                                        || bad "the lock was NOT held during the escalation window: $OUT"
 grep -qF "leftover=no" <<<"$OUT" && ok "the holder cleans up its markers" || bad "the holder leaked its marker dir: $OUT"
+grep -qF "holder_expiry_lines=0" <<<"$OUT" && ok "the holder has NO self-expiry (a deadline drops the flock mid-delete)" \
+                                           || bad "the holder carries an expiry, so the lock can be released while the caller still deletes: $OUT"
 grep -qF "compete_after_release=0" <<<"$OUT" && ok "the lock is free again after release (no wedged uv)" \
                                            || bad "the lock stayed held after release: $OUT"
 
@@ -381,16 +405,73 @@ grep -qF "compete_after_release=0" <<<"$OUT" && ok "the lock is free again after
 # reaper's own hold path in a background subshell that simply does not release until it exits.
 OUT="$(
     ( set +u
+      export TMPDIR="$HOLD_TMP"
       . "$REAPER"
       PYTHON_BIN="$(command -v python3)"
-      ( uv_lock_hold "$LOCKROOT"; sleep 4 ) >/dev/null 2>&1 &
+      ( uv_lock_hold "$LOCKROOT"; sleep 2 ) >/dev/null 2>&1 &
       sleep 1
       uv_lock_hold "$LOCKROOT"; echo "second_hold_rc=$?"
       wait
+      i=0
+      while [ "$i" -lt 60 ]; do [ -z "$(ls -1 "$HOLD_TMP" 2>/dev/null)" ] && break; sleep 0.05; i=$(( i + 1 )); done
+      echo "m_leftovers=$(ls -1 "$HOLD_TMP" 2>/dev/null | wc -l | tr -d ' ')"
     ) 2>&1
 )"
 grep -qF "second_hold_rc=1" <<<"$OUT" && ok "a lock already held by a live process is REFUSED (not stolen)" \
                                      || bad "a held lock was not refused: $OUT"
+grep -qF "m_leftovers=0" <<<"$OUT" && ok "the held-lock case leaves no marker dir either" \
+                                   || bad "the held-lock case leaked a marker dir: $OUT"
+
+say_case "N. the lock holder leaves nothing behind (normal path, and after a KILL)"
+LOCKROOT2="$T/lockcase2"; mkdir -p "$LOCKROOT2"; : > "$LOCKROOT2/.lock"
+# (i) normal path: an armed pass over an over-bound fixture leaves no marker dir
+H="$T/homeN"; mkdir -p "$H"
+mk_uv_cache N "$H" 40 0
+: > "$T/stub.log"
+REAPER_ARGS=(--apply --max-mb 10)
+OUT="$(run_reaper "$H" TMPDIR="$HOLD_TMP")"; RC=$?
+[ -z "$(ls -1 "$HOLD_TMP" 2>/dev/null)" ] && ok "a completed escalation leaves no pi-cache-reaper-lock.* dir" \
+                                          || bad "leaked marker dir(s): $(ls -1 "$HOLD_TMP")"
+# (ii) the shell holding the lock is KILLED: the flock must be released and the dir removed, or an
+# hourly job accumulates one per abnormal exit with nothing to bound it.
+OUT="$(
+    ( set +u
+      export TMPDIR="$HOLD_TMP"
+      . "$REAPER"
+      PYTHON_BIN="$(command -v python3)"
+      ( uv_lock_hold "$LOCKROOT2"; sleep 30 ) &
+      holder_sub=$!
+      sleep 1
+      echo "dirs_during=$(ls -1 "$HOLD_TMP" 2>/dev/null | wc -l | tr -d ' ')"
+      kill -9 "$holder_sub" 2>/dev/null
+      i=0
+      while [ "$i" -lt 60 ]; do [ -z "$(ls -1 "$HOLD_TMP" 2>/dev/null)" ] && break; sleep 0.05; i=$(( i + 1 )); done
+      python3 - "$LOCKROOT2/.lock" <<'PY'
+import fcntl, sys
+try:
+    handle = open(sys.argv[1], "r+b")
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+except OSError:
+    sys.exit(1)
+sys.exit(0)
+PY
+      echo "lock_after_kill=$?"
+      echo "dirs_after=$(ls -1 "$HOLD_TMP" 2>/dev/null | wc -l | tr -d ' ')"
+    ) 2>&1
+)"
+grep -qF "dirs_during=1" <<<"$OUT" && ok "the holder creates exactly one marker dir while it holds" || bad "no marker dir while holding: $OUT"
+grep -qF "lock_after_kill=0" <<<"$OUT" && ok "a KILLED shell's lock is released (the holder exits on parent death, so uv is never wedged)" \
+                                      || bad "the lock stayed held after the shell was killed: $OUT"
+grep -qF "dirs_after=0" <<<"$OUT" && ok "the killed holder's marker dir is removed too (no unbounded leak)" \
+                                  || bad "marker dir leaked after a kill: $OUT"
+
+say_case "O. an unset HOME refuses with the documented exit 3 (not a bare unbound-variable error)"
+mkdir -p "$T/homeO"
+OUT="$(env -u HOME UV_CACHE_DIR="$T/homeO/uv" NPM_CACHE_DIR="$T/homeO/npm" PIP_CACHE_DIR="$T/homeO/pip" CACHE_REAPER_LOG="" bash "$REAPER" --dry-run 2>&1)"; RC=$?
+[ "$RC" -eq 3 ] && ok "unset HOME + unset log path exits 3 (the documented fail-closed code)" \
+                || bad "unset HOME exited $RC (expected 3, a bare unbound-variable death is exit 1)"
+grep -qF "refusing to guess a cache or log path" <<<"$OUT" && ok "the refusal explains what is unset" \
+                                                      || bad "no refusal message: $OUT"
 
 say_case "H. WIRING — a timed job on BOTH surfaces, and bringup reports the size"
 TPL="$REPO_ROOT/templates/launchd/com.eldato.pi-cache-reaper.plist"
