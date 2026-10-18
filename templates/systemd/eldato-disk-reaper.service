@@ -1,5 +1,7 @@
 [Unit]
-# eldato disk reaper — the one scheduled pass over the three disk sinks (#2032).
+# eldato disk reaper — the one scheduled pass over the three disk sinks (#2032), scheduled on BOTH
+# platforms by scripts/install-disk-reaper-schedule.sh (#2048; the Darwin half is a launchd job that
+# runs this same pass with the same flags).
 #
 # WHY A TIMER AND NOT A CONTROLLER TICK. The cell's controller loop already runs the package-cache
 # pass hourly, but the venv and worktree classes were never on any clock: worktrees were reaped by a
@@ -30,6 +32,12 @@ Environment=REAP_WT_GH_TIMEOUT=300
 Nice=10
 IOSchedulingClass=idle
 # The pass writes its own bounded log under DISK_REAPER_STATE_DIR; journald keeps the exit status.
-ExecStart=/bin/bash {{REAPER}} --apply
-# A pass that exits 3 (a class failed closed) must not look like success to `systemctl start`.
+# ⛔ {{MODE_FLAG}} IS THE ARMING DECISION AND IT IS RENDERED, NOT DEFAULTED. #1678's owner ruling is
+# that a deletion tool ships report-only and arming is a separate, dated, reversible owner step; the
+# installer therefore renders the pass's DRY-RUN flag unless it was explicitly invoked with --apply,
+# and the answer is readable HERE in the installed file rather than inferred from an env default.
+ExecStart=/bin/bash {{REAPER}} {{MODE_FLAG}}
+# A pass that exits 3 (a class failed closed) must not look like success to `systemctl start`; 4 (a
+# removal failed) and 5 (a dry run that found work) are completed passes too. 3 stays a FAILURE on
+# purpose — the record says which class, and the supervisor prints it.
 SuccessExitStatus=0 4 5

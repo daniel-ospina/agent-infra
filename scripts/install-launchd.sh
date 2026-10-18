@@ -429,7 +429,11 @@ if [ "${1:-}" = "--status" ]; then
         status_job "$template"
     done
     if [ -n "$(retired_labels)" ]; then
-        echo "Retired (moved to session-checks, #432): $(retired_labels | tr '\n' ' ')"
+        # Two retirement reasons now live in one manifest: work that moved to session-checks (#432) and
+        # per-class reapers the consolidated pass replaced (#2048). Naming both keeps the list readable
+        # instead of asserting a single cause for every label.
+        echo "Retired (unloaded + removed — #432 session-checks, #2048 consolidated disk reaper):"
+        for _l in $(retired_labels); do echo "  $_l"; done
     fi
     echo "Env: AGENT_INFRA_PATH=$AGENT_INFRA_PATH"
     echo "     TORTOISE_REPO=${TORTOISE_REPO:-<unset — session-checks will use the sibling tortoise or skip the hub leg>}"

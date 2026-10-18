@@ -73,3 +73,14 @@
 # no longer exists. It has no plist (never launchd-invoked) and nothing in the repo executes
 # it, so it is declared here as the leg's first real retirement.
 scripts/check-second-model.sh
+
+# `install-disk-reaper-timer.sh` was farmed by `fleet_srcs` (#2032, the consolidated disk reaper's
+# systemd-only installer) and RENAMED to `install-disk-reaper-schedule.sh` in #2048: it now installs a
+# systemd timer on a cell AND a launchd job on a Mac, so "timer" named only half of what it does. The
+# old name is declared here because the copy leg is copy-only — every box that ran setup.sh in the
+# #2032 window keeps an executable `install-disk-reaper-timer.sh` in $DEST/scripts, and a stale copy of
+# an installer is worse than a missing one: cloud-cell-bringup.sh resolves the installer by name, and a
+# box still carrying the old file would keep scheduling through the systemd-only path while the repo
+# says the schedule is cross-platform. No plist targets it (it is invoked from shell), so edit 3 of the
+# retirement rule does not apply.
+scripts/install-disk-reaper-timer.sh

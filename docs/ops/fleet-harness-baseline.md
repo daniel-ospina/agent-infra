@@ -35,11 +35,15 @@ correct for its own phase A: that count is *all entries except `orch-loop.sh`* (
 
 **Other surfaces on the Mac that carry harness code.** `~/.pi/agent/scripts/` — `pi-cache-reap.sh`,
 `pi-reap-idle.sh`, `pi-reap-worktrees.sh`, `pi-task-session-prune.sh`, `orphan-reap.py`,
-`lane-watchdog.py` — all six byte-identical to `origin/main:scripts/<name>` at this baseline. Only four
-are actually invoked by a LaunchAgent: `pi-cache-reap.sh` → `com.eldato.pi-cache-reap`,
-`pi-reap-idle.sh` → `com.eldato.pi-session-reaper`, `pi-task-session-prune.sh` →
-`com.eldato.pi-task-session-prune`, and `pi-reap-worktrees` via the sibling wrapper
-`pi-reap-worktrees-launchd.py` → `com.tortoise.worktree-reaper` / `com.tortoise.branch-reaper`.
+`lane-watchdog.py` — all six byte-identical to `origin/main:scripts/<name>` at this baseline. Only three
+are invoked by a LaunchAgent of their own: `pi-reap-idle.sh` → `com.eldato.pi-session-reaper`,
+`pi-task-session-prune.sh` → `com.eldato.pi-task-session-prune`, and `pi-reap-worktrees` via the
+sibling wrapper `pi-reap-worktrees-launchd.py` → `com.tortoise.branch-reaper`.
+`pi-cache-reap.sh` and `pi-reap-worktrees.sh` are now reached through the **consolidated** disk reaper
+(`disk-reaper.sh`, agent-infra#2048) as its `uv` and `worktree` classes, scheduled hourly by
+`com.eldato.disk-reaper` — their own per-class LaunchAgents (`com.eldato.pi-cache-reap`,
+`com.tortoise.worktree-reaper`) are **RETIRED**, because two clocks for one class is how the Mac ended
+up with four triggers, four report formats and no single answer to "is this box being reaped".
 **`orphan-reap.py` and `lane-watchdog.py` are referenced by no LaunchAgent on this box** — they are
 armed elsewhere or not at all; do not infer that they run from their presence.
 

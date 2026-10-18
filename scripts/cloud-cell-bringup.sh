@@ -557,11 +557,16 @@ check_caches() {
 # installer is idempotent and renders from this box's HOME/PATH/repos) and then reads back its state.
 # A cell that cannot schedule the pass is REFUSED rather than certified: `CELL READY` over a box one
 # full disk away from refusing every dispatch is the false PASS this script exists to remove.
+#
+# ONE INSTALLER, BOTH PLATFORMS (#2048): `install-disk-reaper-schedule.sh` installs this systemd timer
+# on Linux and a launchd job on a Mac. This call passes `--apply` EXPLICITLY — the installer ships
+# report-only (#1678) and this feature was instructed to run unattended on the cell, so the arming is
+# stated here (one visible line) and lands in the unit's ExecStart.
 check_disk_reaper() {
   local installer="" reaper="" cand out rc next last
   for cand in "${DISK_REAPER_TIMER_INSTALLER:-}" \
-              "${HOME:-}/.pi/agent/scripts/install-disk-reaper-timer.sh" \
-              "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/install-disk-reaper-timer.sh"; do
+              "${HOME:-}/.pi/agent/scripts/install-disk-reaper-schedule.sh" \
+              "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/install-disk-reaper-schedule.sh"; do
     [ -n "$cand" ] && [ -f "$cand" ] && { installer="$cand"; break; }
   done
   for cand in "${DISK_REAPER:-}" \
@@ -570,24 +575,26 @@ check_disk_reaper() {
     [ -n "$cand" ] && [ -f "$cand" ] && { reaper="$cand"; break; }
   done
   [ -n "$reaper" ] || die "disk-reaper.sh not found (looked at \$DISK_REAPER, \$HOME/.pi/agent/scripts, and beside this script) — a cell whose disk is never reaped stops dispatching at ~97%% used"
-  [ -n "$installer" ] || die "install-disk-reaper-timer.sh not found — cannot schedule the disk reaper, and an unscheduled reaper never runs unattended"
+  [ -n "$installer" ] || die "install-disk-reaper-schedule.sh not found — cannot schedule the disk reaper, and an unscheduled reaper never runs unattended"
 
   rc=0
   # TEMPLATES_DIR from the SAME checkout the layer came from: the farmed installer copy lives at
   # $HOME/.pi/agent/scripts, whose ../templates does not exist, so without this the templates are
   # "missing" on exactly the cell that was just provisioned.
   out="$(DISK_REAPER="$reaper" TEMPLATES_DIR="${LAYER_ROOT:+$LAYER_ROOT/templates/systemd}" \
-         bash "$installer" --install 2>&1)" || rc=$?
+         bash "$installer" --install --apply 2>&1)" || rc=$?
   printf '%s\n' "$out" | sed 's/^/    /'
-  [ "$rc" -eq 0 ] || die "the disk reaper timer could not be installed (rc=$rc) — fix the reason above (a passwordless-sudo system unit, or a working systemd user manager) before this cell is used"
+  [ "$rc" -eq 0 ] || die "the disk reaper schedule could not be installed (rc=$rc) — fix the reason above (a passwordless-sudo system unit, a working systemd user manager, or launchd on a Mac) before this cell is used"
 
   rc=0
   out="$(DISK_REAPER="$reaper" TEMPLATES_DIR="${LAYER_ROOT:+$LAYER_ROOT/templates/systemd}" \
          bash "$installer" --status 2>&1)" || rc=$?
-  [ "$rc" -eq 0 ] || die "the disk reaper timer is not healthy after install (rc=$rc): $(printf '%s' "$out" | tr '\n' ' ')"
+  [ "$rc" -eq 0 ] || die "the disk reaper schedule is not healthy after install (rc=$rc): $(printf '%s' "$out" | tr '\n' ' ')"
   next="$(printf '%s\n' "$out" | sed -n 's/^next_run=//p' | head -1)"
+  armed="$(printf '%s\n' "$out" | sed -n 's/^armed=//p' | head -1)"
   last="$(printf '%s\n' "$out" | sed -n 's/^  status=//p' | head -1)"
-  ok "disk reaper scheduled — timer next=${next:-?} last_pass=${last:-never} (state: ${DISK_REAPER_STATE_DIR:-$HOME/.pi/agent/state}/disk-reaper.status)"
+  ok "disk reaper scheduled — next=${next:-?} armed=${armed:-unknown} last_pass=${last:-never} (state: ${DISK_REAPER_STATE_DIR:-$HOME/.pi/agent/state}/disk-reaper.status)"
+  [ "$armed" = "apply" ] || warn "the installed job is REPORT-ONLY (armed=$armed) — this cell was instructed to run the pass unattended; re-run with --apply if that is wrong"
 }
 
 main() {

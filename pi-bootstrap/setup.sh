@@ -325,7 +325,10 @@ fi
 # runs under launchd (com.eldato.fleet-cost-weekly plist), the pi-session reaper
 # runs hourly (com.eldato.pi-session-reaper plist), the Task 6 child-session
 # retention sweep runs hourly (com.eldato.pi-task-session-prune plist), and the
-# worktree reaper runs daily (com.tortoise.worktree-reaper plist) —
+# disk reaper runs hourly (com.eldato.disk-reaper plist, #2048 — the consolidated pass
+# over uv caches, lane venvs and worktrees; the per-class pi-cache-reap / worktree-reaper
+# jobs are retired into it), and the branch reaper daily (com.tortoise.branch-reaper
+# plist) —
 # launchd cannot read ~/Documents (same TCC wall as #427).
 # session-postmortem.sh (the shared parser), the report, the watch, the weekly
 # driver, the reaper, the prune sweep, and the worktree reaper must ALL sit in
@@ -435,10 +438,11 @@ fi
 # copy (the unit's ExecStart is rendered from this path), and the entry point resolves its three
 # delegate owners through the same farm. A unit pointed at a checkout would be pointing at a
 # directory the tool itself is allowed to reap — the farm is the stable path.
-# #1987 adds pi-cache-reap.sh: the hourly com.eldato.pi-cache-reap job (Mac) and
-# the cell controller's hourly cache bound (a cell has no launchd) both execute
-# the FARMED copy — the machine-global uv/npm/pip caches are the sink that took
-# pi-cell-3 to 258MB free, and neither the worktree reaper nor the supervisor's
+# #1987 adds pi-cache-reap.sh: the hourly com.eldato.disk-reaper job (Mac, #2048 — the
+# consolidated pass owns this script as its uv class) and the cell controller's hourly
+# cache bound (a cell has no launchd) both execute the FARMED copy — the machine-global
+# uv/npm/pip caches are the sink that took pi-cell-3 to 258MB free, and neither the
+# worktree reaper nor the supervisor's
 # prune can reach `$HOME/.cache/uv`. Same broken-target rule: absent from this
 # farm, the plist is refused.
 # ⛔ RETIRING A NAME IS TWO EDITS IN ONE COMMIT (#1924): drop it from this array AND
@@ -447,7 +451,7 @@ fi
 # it, executable, in $DEST/scripts. A name left in BOTH places is refused loudly by the
 # UNFARM leg at the end of this file (the copy leg would just re-create it); dropping
 # it here WITHOUT declaring it is caught by the snapshot check on the next sync.
-fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-cache-reap.sh pi-reap-worktrees.sh reap-lane-venvs.sh disk-reaper.sh install-disk-reaper-timer.sh pi-reap-worktrees-launchd.py cleanup-stale-branches.sh ci_runner_gate.sh ask-owner.py beta-progress.py cadence-nudge.sh cadence-timer.sh child-check.py cloud-cell-quiesce.sh deploy-crossbox.sh deploy-mac-orchestrator.sh goal-state.py lane-actions.py lane-guard.py lane-read.py lane-scan-fallback.sh lane-watchdog.py lane-wip.py live-workspaces-publisher.py merge-queue.py orch-send.sh orchestrator-heartbeat.sh orphan-reap.py pr-doctor.py objective.py probe-one.py publish-live-workspaces.py queue-dispatch.py safe-send.sh seed-goal-map.py tree-cpu.py turn-classify.py turn-end.py unblock-lane.sh undelivered-answers.py)
+fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-cache-reap.sh pi-reap-worktrees.sh reap-lane-venvs.sh disk-reaper.sh install-disk-reaper-schedule.sh pi-reap-worktrees-launchd.py cleanup-stale-branches.sh ci_runner_gate.sh ask-owner.py beta-progress.py cadence-nudge.sh cadence-timer.sh child-check.py cloud-cell-quiesce.sh deploy-crossbox.sh deploy-mac-orchestrator.sh goal-state.py lane-actions.py lane-guard.py lane-read.py lane-scan-fallback.sh lane-watchdog.py lane-wip.py live-workspaces-publisher.py merge-queue.py orch-send.sh orchestrator-heartbeat.sh orphan-reap.py pr-doctor.py objective.py probe-one.py publish-live-workspaces.py queue-dispatch.py safe-send.sh seed-goal-map.py tree-cpu.py turn-classify.py turn-end.py unblock-lane.sh undelivered-answers.py)
 mkdir -p "$DEST/scripts"
 fleet_copied=0
 for base in "${fleet_srcs[@]}"; do
@@ -792,6 +796,37 @@ if [[ "$(uname)" == "Darwin" ]] && [ -x "$INFRA_ROOT/scripts/install-launchd.sh"
   fi
 fi
 
+# The disk reaper's schedule (#2048): ONE installer, both platforms. On a Mac that means a launchd job
+# (com.eldato.disk-reaper) running the SAME pass with the SAME flags the cells' systemd timer does.
+# ⛔ REPORT-ONLY UNLESS ARMED: the installer's default is the pass's dry-run flag (#1678, owner ruling
+# 2026-10-11 — a deletion tool ships report-only and arming is an explicit, dated, reversible owner
+# step). Arming a Mac is `bash scripts/install-disk-reaper-schedule.sh --install --apply` BY THE OWNER;
+# nothing in this farm does it.
+# A box with no schedule is a FAIL reported here, not a silent absence: "scheduled" is the only state
+# in which an unattended reaper exists at all, and the alert-shaped failure (a disk at 97% with a
+# healthy controller) is exactly what #2032/#2048 exist to remove.
+reaper_real_home="$(dscl . -read "/Users/$(id -un)" NFSHomeDirectory 2>/dev/null | sed -n 's/^NFSHomeDirectory: //p' | head -1 || true)"
+if [[ "$(uname)" == "Darwin" ]] && [ -x "$INFRA_ROOT/scripts/install-disk-reaper-schedule.sh" ] \
+   && [ -z "$reaper_real_home" -o "$HOME" = "$reaper_real_home" ]; then
+  echo ""
+  echo "==> Disk reaper schedule"
+  if bash "$INFRA_ROOT/scripts/install-disk-reaper-schedule.sh" --install; then
+    echo "    disk reaper: scheduled (see: install-disk-reaper-schedule.sh --status)"
+  else
+    echo "    ⛔ WARNING: the disk reaper schedule could NOT be installed — this Mac is unscheduled and" >&2
+    echo "       will not be reaped. Diagnose with:" >&2
+    echo "         bash $INFRA_ROOT/scripts/install-disk-reaper-schedule.sh --status" >&2
+    launchd_reaper_failed=1
+  fi
+elif [[ "$(uname)" == "Darwin" ]] && [ -n "$reaper_real_home" ] && [ "$HOME" != "$reaper_real_home" ]; then
+  # A temp-HOME run (the bootstrap tests, a scratch farm) is not "the box": launchd addresses the user
+  # domain BY UID, so a job registered from a temp HOME points at a plist path that dies with it (#446).
+  # SKIPPED, and said out loud — not a silent absence, and not a failure of a run that was never about
+  # this machine.
+  echo ""
+  echo "==> Disk reaper schedule: SKIPPED (HOME=$HOME is not the real home $reaper_real_home, #446)"
+fi
+
 echo ""
 echo "Done! Next steps:"
 echo "  1. Open a NEW terminal window (so the shell profile takes effect), then run:  pi"
@@ -800,3 +835,11 @@ echo "  3. Press Ctrl+L (/model) to pick a model and confirm it works"
 echo "  4. Auto-sync: pi now pulls + refreshes this config automatically on start (Level 1)"
 echo "     - Manual refresh anytime:  cd ~/agent-infra && ./sync.sh"
 echo "  5. Read pi-bootstrap/HANDOFF.md — it tells pi what this machine is for"
+
+# The schedule failure above is reported LAST and as a non-zero exit: setup.sh has already done
+# everything it can, but "done" over an unscheduled box is the false PASS this farm keeps removing.
+if [ "${launchd_reaper_failed:-0}" = "1" ]; then
+  echo "" >&2
+  echo "⛔ Setup finished, but this Mac has NO disk-reaper schedule (see the WARNING above)." >&2
+  exit 1
+fi

@@ -16,3 +16,25 @@
 # path — both run fine under launchd.
 com.eldato.hub-state-check
 com.eldato.skill-lint-oracle
+
+# ── #2048: the per-class reapers that the CONSOLIDATED pass replaced ────────────────────────────
+# The Mac had four reaper triggers and four report formats, and no single answer to "is this box
+# being reaped, how much did the last pass free, did it succeed" — the defect #2032 consolidated on
+# the cells. `com.eldato.disk-reaper` (templates/launchd/com.eldato.disk-reaper.plist.tmpl, installed
+# by scripts/install-disk-reaper-schedule.sh) is now the ONE clock for the three disk sinks, and it
+# runs the same `disk-reaper.sh` entry point with the same flags as the cells' systemd timer.
+#   com.eldato.pi-cache-reap       → the pass's `uv`       class (owner: scripts/pi-cache-reap.sh)
+#   com.tortoise.worktree-reaper   → the pass's `worktree` class (owner: scripts/pi-reap-worktrees.sh)
+# Each retired label ran the SAME owner script the pass resolves, so nothing's delete rule changed —
+# only how many clocks ran it. Both shipped unarmed (report-only), so retiring them removes no
+# deletion capability; the replacement ships report-only too (the arming decision is unchanged and
+# still owner-only). The tuned budgets the retired worktree job carried (#1095: 1800s pass budget,
+# 120s gh timeout) moved INTO the replacement plist, or the worktree class would defer nearly every
+# candidate at the 300s default.
+#
+# ⚠️ DELIBERATELY NOT RETIRED — neither is one of the three disk sinks, so the pass does not overlap
+# them and there is exactly one owner per class:
+#   com.tortoise.branch-reaper     deletes local BRANCH REFS (scripts/cleanup-stale-branches.sh)
+#   com.eldato.pi-session-reaper   reaps idle pi PROCESSES (scripts/pi-reap-idle.sh)
+com.eldato.pi-cache-reap
+com.tortoise.worktree-reaper

@@ -34,7 +34,11 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REAPER="$SCRIPT_DIR/pi-cache-reap.sh"
-TEMPLATE="$SCRIPT_DIR/../templates/launchd/com.eldato.pi-cache-reap.plist"
+# #2048: the per-class launchd job is RETIRED — this script is now the `uv` CLASS of the consolidated
+# pass, scheduled by scripts/install-disk-reaper-schedule.sh (com.eldato.disk-reaper on the Mac, the
+# eldato-disk-reaper timer on a cell). The template checked here is the one that schedules that pass.
+TEMPLATE="$SCRIPT_DIR/../templates/launchd/com.eldato.disk-reaper.plist.tmpl"
+SCHED_INSTALLER="$SCRIPT_DIR/install-disk-reaper-schedule.sh"
 SETUP="$SCRIPT_DIR/../pi-bootstrap/setup.sh"
 ORCH="$SCRIPT_DIR/orchestrator-harness/orch-loop.sh"
 SUPERVISOR="$SCRIPT_DIR/cloud-cell-supervisor.sh"
@@ -949,16 +953,23 @@ echo
 echo "── 10. wiring: a bound no box runs is the defect ──"
 assert_contains "$(sed -n 's/^fleet_srcs=(\(.*\))$/\1/p' "$SETUP")" "pi-cache-reap.sh" \
     "pi-bootstrap/setup.sh's farm declares pi-cache-reap.sh (it is the copy the boxes execute)"
-[ -f "$TEMPLATE" ] && ok "the launchd template exists" || bad "missing $TEMPLATE"
-assert_contains "$(cat "$TEMPLATE" 2>/dev/null)" "{{HOME}}/.pi/agent/scripts/pi-cache-reap.sh" \
-    "the plist runs the FARMED script ($HOME/.pi/agent/scripts), not a ~/Documents path"
-assert_contains "$(cat "$TEMPLATE" 2>/dev/null)" "<string>--dry-run</string>" \
-    "the plist ships DRY-RUN, the stance #1678's owner ruling requires"
-assert_not_contains "$(cat "$TEMPLATE" 2>/dev/null)" "<string>--apply</string>" \
-    "the tracked template ships UNARMED (a gate does not enforce this — #1678 owns that: the installer should refuse to render an armed plist)"
+[ -f "$TEMPLATE" ] && ok "the consolidated pass has a launchd template" || bad "missing $TEMPLATE"
+# The Mac's clock now runs the PASS, and the pass resolves this script as its `uv` class — so the
+# schedule reaches the farmed copy ($HOME/.pi/agent/scripts) through disk-reaper.sh's delegate chain
+# rather than by a plist naming this file. Both halves are pinned: the pass owns the class, and the
+# template hands the pass the farmed path.
+assert_contains "$(cat "$SCRIPT_DIR/disk-reaper.sh")" "pi-cache-reap.sh" \
+    "the consolidated pass resolves pi-cache-reap.sh as its uv class (one owner of the policy)"
+assert_contains "$(cat "$TEMPLATE" 2>/dev/null)" "{{REAPER}}" \
+    "the plist runs the PASS (whose uv class is this script), not a per-class trigger"
+assert_contains "$(cat "$TEMPLATE" 2>/dev/null)" "{{MODE_FLAG}}" \
+    "the mode flag is RENDERED by the installer, never baked into the template"
+assert_contains "$(cat "$SCHED_INSTALLER" 2>/dev/null)" 'MODE_FLAG="--dry-run"' \
+    "the installer's DEFAULT is the dry-run flag, the stance #1678's owner ruling requires"
 assert_contains "$(cat "$TEMPLATE" 2>/dev/null)" "#1678" \
-    "the plist names the ruling it follows, so the next lane does not 'tidy' it either way"
-assert_contains "$(cat "$TEMPLATE" 2>/dev/null)" "<integer>3600</integer>" "the plist is hourly"
+    "the template names the ruling it follows, so the next lane does not 'tidy' it either way"
+assert_contains "$(cat "$TEMPLATE" 2>/dev/null)" "<integer>{{INTERVAL}}</integer>" \
+    "the template's interval is rendered (one hourly value for both platforms)"
 assert_contains "$(cat "$ORCH" 2>/dev/null)" "\"\$_cache_reaper\" --dry-run" \
     "the CELL's clock also runs UNARMED (the armed arm is the supervisor's low-disk prune)"
 assert_contains "$(cat "$ORCH" 2>/dev/null)" ".cache-reap-blocked" \

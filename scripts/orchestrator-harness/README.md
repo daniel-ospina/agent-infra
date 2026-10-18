@@ -957,8 +957,10 @@ the two in-tree reapers disagree; the doctor is the one this MUST is being met b
 `reap_stale_workers()` (`orch-loop.sh:420`) reaps only the controller's OWN
 `lane|merge|fix` tmux sessions, on log-mtime staleness past `STALE_MIN=40` (`orch-loop.sh:409`) —
 one signal, one population, and only while a controller is alive. The fleet-level reapers are
-launchd jobs (`templates/launchd/com.tortoise.worktree-reaper.plist`,
-`com.eldato.pi-session-reaper.plist`), i.e. **absent on a Linux cell** (agent-infra#1864, #1927).
+launchd jobs (`templates/launchd/com.tortoise.branch-reaper.plist`,
+`com.eldato.pi-session-reaper.plist`), i.e. **absent on a Linux cell** (agent-infra#1864, #1927). The
+consolidated disk reaper is the exception since #2048: ONE installer schedules it on both (a systemd
+timer on a cell, `com.eldato.disk-reaper` on a Mac, the same pass and flags).
 `tools/fleet/lane_liveness.py:68` deliberately REPORTS `dead` and files an issue, and reaps nothing.
 The worktree reaper ships **dry-run** and preserves anything with uncommitted work
 (`pi-reap-worktrees.sh:8-32,194`). What is missing is not another kill. The process reaper in §6.5.3

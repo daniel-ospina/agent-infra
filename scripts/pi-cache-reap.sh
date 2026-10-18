@@ -88,11 +88,16 @@
 #     directory the tool does not use is a report about a cache that does not exist.
 #
 # SCHEDULING (installed by default, DRY-RUN until an owner arms it)
-#   * Mac:   templates/launchd/com.eldato.pi-cache-reap.plist (hourly).
-#   * Cell:  a Linux cell has no launchd; its only scheduler is the controller loop,
-#            which runs this hourly from scripts/orchestrator-harness/orch-loop.sh
-#            (next to its hourly claim_prune). The reaper owns the POLICY on both;
-#            the triggers only decide when it runs.
+#   * Mac:   the `uv` CLASS of the consolidated pass — `disk-reaper.sh` resolves this
+#            script, and `scripts/install-disk-reaper-schedule.sh` schedules that pass
+#            hourly as com.eldato.disk-reaper (#2048; the per-class
+#            com.eldato.pi-cache-reap job is RETIRED into it, so there is ONE clock and
+#            ONE report for the three sinks instead of four).
+#   * Cell:  a Linux cell has no launchd; the same installer schedules the same pass as
+#            the eldato-disk-reaper systemd timer. The controller loop
+#            (scripts/orchestrator-harness/orch-loop.sh) still runs this script hourly
+#            as its own bound. The reaper owns the POLICY on all three; the triggers
+#            only decide when it runs.
 #   * Both triggers ship DRY-RUN. Arming a scheduled DELETION is an owner-level
 #     consequence decision — agent-infra#1678, owner ruling 2026-10-11: "the reaper
 #     may run unattended; arming it may not", and "Arming a deletion tool must not
