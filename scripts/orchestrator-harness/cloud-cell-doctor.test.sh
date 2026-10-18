@@ -858,7 +858,11 @@ printf '999999|proc:1\n' > "$T/locktest/.reap.lock/own"
   cat <<'NUMOK'
 num_ok() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; esac; return 0; }
 NUMOK
-  printf '%s\n' 'mtime_epoch() { printf "1\n"; }'
+  # ⛔ The REAL `mtime_epoch`, never a constant: `reclaim_lock` bounds a killed reclaimer's meta-lock
+  # at 60 s, so a stub that answers 1 makes EVERY meta-lock look ancient — the second racer then deletes
+  # a meta-lock created milliseconds ago and claims the lock too (measured on CI: 3 "winners" of 6).
+  # The stub was the defect; the shipped code's own age check is what keeps the reclaim to one winner.
+  sed -n '/^mtime_epoch() {/,/^}/p' "$DOCTOR"
   sed -n '/^lock_claim() {/,/^}/p' "$DOCTOR"
   sed -n '/^reclaim_lock() {/,/^}/p' "$DOCTOR"
   sed -n '/^role_lock() {/,/^}/p' "$DOCTOR"
