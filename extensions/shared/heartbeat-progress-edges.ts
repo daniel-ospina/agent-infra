@@ -736,6 +736,15 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     axis: "retention",
     guardedBy: NONE,
   },
+  {
+    name: "REAP_VENV_MIN_AGE_SECONDS",
+    owners: ["scripts/reap-lane-venvs.sh"],
+    value: "${REAP_VENV_MIN_AGE_SECONDS:-1800}",
+    axis: "retention",
+    guardedBy: NONE,
+    overrides: ['REAP_VENV_MIN_AGE_SECONDS="${1:-}"'],
+    note: "#1932 — the GC-only age FLOOR on a lane venv (30 min): a venv whose newest mtime is younger is KEPT regardless of liveness, so a lane that has not yet started work cannot lose its env to a sweep that ran between its `uv sync` and its first command. It is a floor, never a rule — the delete decision is the three live witnesses, and liveness outranks age in BOTH directions (a venv older than the floor is still kept while any witness names a holder). The `--worktree` (lane-exit) mode bypasses it by construction: there the caller declares the lane dead. The floor is registered rather than exempted because it IS a retention bound in the same family as REAP_WT_* above, and a reader must be able to see it move.",
+  },
   // — heartbeat axis: the laptop-only orchestrator heartbeat's lane-classifier
   //   bounds (scripts/orchestrator-heartbeat.sh, landed from the laptop layer in
   //   #1552). They classify a lane as idle / free capacity; they are liveness
