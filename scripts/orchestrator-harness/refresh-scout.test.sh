@@ -2279,7 +2279,7 @@ grep -qE '^api repos/.*/issues\?.*labels=P0-blocker' "$D/gh-calls" 2>/dev/null \
 # `has_pr` reads false for an issue that always had a PR, and the reaper UN-blacklists it: the
 # duplicate-dispatch class (#1705) this listing exists to prevent, at rc 0. The issue listings' own
 # `state=open` is pinned for the mirror reason — a wider window is a different pool, not a bigger one.
-grep -qE '^api repos/[^ ]*/pulls\?state=all(&|$)' "$D/gh-calls" 2>/dev/null \
+grep -qE '^api repos/[^ ]*/pulls\?([^ ]*[?&])?state=all(&|$)' "$D/gh-calls" 2>/dev/null \
   && ok "starved-graphql: .pr_brs asks for state=all — a CLOSED PR still carries the branch has_pr needs" \
   || bad "the pulls listing does not ask state=all — .pr_brs would silently lose closed-PR branches (got: $(grep -oE 'pulls\?[^ ]*' "$D/gh-calls" 2>/dev/null | head -1))"
 # ⛔ EVERY issue listing, not the FIRST one (review, MEASURED). A pattern on `issues?state=open` alone
@@ -2289,10 +2289,17 @@ grep -qE '^api repos/[^ ]*/pulls\?state=all(&|$)' "$D/gh-calls" 2>/dev/null \
 # `.open_iss` window and the labelled tiers all narrow the pool, so a wider one puts closed issues in
 # front of dispatch and the reaper (#1705, #8465). Order-independent, so a harmless reorder of the
 # query string does not red it.
+# ⛔ AND THE UNIVERSAL NEEDS A WITNESS (review, MEASURED): "every issue listing asks state=open" is
+# satisfied by the three TIERS ALONE whenever the unlabelled window is ABSENT — delete the
+# `.open_iss` block and the case still printed ✅ while the pass reaped nothing (`[reap] SKIPPED:
+# .open_iss not readable`) on every cycle, with this assertion's own text claiming that window was
+# pinned. So the reaper window must EXIST, and it is identified by being the one issue listing with
+# no `labels=`.
+reaper_win="$(grep -E '^api repos/[^ ]*/issues\?' "$D/gh-calls" 2>/dev/null | grep -v 'labels=' | head -1)"
 issues_not_open="$(grep -E '^api repos/[^ ]*/issues\?' "$D/gh-calls" 2>/dev/null | grep -v 'state=open' | head -2 | tr '\n' ' ')"
-[ -z "$issues_not_open" ] \
-  && ok "starved-graphql: EVERY issue listing asks state=open (the unlabelled reaper window AND the three tiers)" \
-  || bad "an issue listing does not ask state=open — a wider window lists closed issues for dispatch (#1705/#8465): $issues_not_open"
+{ [ -n "$reaper_win" ] && [ -z "$issues_not_open" ]; } \
+  && ok "starved-graphql: the unlabelled reaper window EXISTS and EVERY issue listing asks state=open (the three tiers included)" \
+  || bad "the unlabelled reaper window is missing, or an issue listing does not ask state=open — closed issues would be listed for dispatch (#1705/#8465): reaper_window='$reaper_win' offenders=$issues_not_open"
 
 # (b) REST ALSO FAILING (HTTP 403, rate limited) -> TRANSIENT, and NOTHING written: no `.open_iss`, no
 #     `.pr_brs`, and the seeded backlog untouched. A truncated or empty listing here is the #1705 bug
