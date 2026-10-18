@@ -85,12 +85,35 @@ O="${O:-$HOME/orchestrator}"
 # time. Six rebuilds per pass contend with the controller's own sweep; a contended GitHub read returns
 # as an UNQUERYABLE SURFACE, which is not a verdict, so every candidate is "left unchecked", the
 # backlog stays 0 and CREATE ACTIVITY STOPS with no error anywhere.
-# The tool (tortoise#8948) caches its own PARTIAL board in this private directory and never writes
-# fleet_state.DEFAULT_OUT. Measured: 16.8 s -> 3.6 s -> 3.4 s per candidate, identical verdicts.
-# Unset => the tool behaves exactly as before.
-export COLLISION_PREFLIGHT_CACHE="${COLLISION_PREFLIGHT_CACHE:-$O/state/.preflight-cache}"
-export COLLISION_PREFLIGHT_CACHE_TTL="${COLLISION_PREFLIGHT_CACHE_TTL:-300}"
-mkdir -p "$COLLISION_PREFLIGHT_CACHE" 2>/dev/null || true
+#
+# ⛔ AND IT WAS NEVER ACTUALLY ON (agent-infra#2022 follow-up, 2026-10-18). The tool (tortoise#8948)
+# caches its own PARTIAL board and never writes fleet_state.DEFAULT_OUT — but it gates that cache on
+# `COLLISION_PREFLIGHT_BOARD_CACHE`, and this script exported `COLLISION_PREFLIGHT_CACHE` (no
+# `_BOARD_`) with the directory path in it. The tool DOES NOT READ EITHER OF THOSE: the enable flag
+# was therefore never set, the cache never engaged, and every candidate paid the whole board rebuild.
+# MEASURED that day with a counting shim over one real pass: the board rebuild (`issue list
+# --limit 2000` + `pr list --limit 400`) cost 130 of the pass's ~270 core calls — 6 rebuilds of the
+# same board, 47% of everything the pass spent.
+# ⛔ THE OLD NAME IS NOT A SEAM AT ALL, AND IT IS ALSO THE NAME THE TOOL's OWN TESTS USE AS AN
+# ATTACK. It was a pure NO-OP here — nothing read it — and that is exactly why the burn survived:
+# the export LOOKED like the cache was on. It must not be reintroduced as if it were a setting.
+# Separately, tortoise's `tests/test_collision_preflight.py` plants a forged board in
+# `COLLISION_PREFLIGHT_CACHE` to prove the gate REFUSES a caller-named cache directory (a
+# caller-selectable directory is a caller-selectable BOARD: `_board_can_answer` /
+# `_board_is_for_repo` / `state_freshness` are read out of that file, so a crafted "nobody holds it"
+# would clear a live holder). So the name belongs to that refusal test — never to the harness's env.
+# (Corrected 2026-10-18: an earlier revision of this comment claimed exporting it named an untrusted
+# path on every daemon process. Nothing read it, so the export was inert; the defect was the SILENT
+# NO-OP, not an open door.)
+# The cache is ENABLED here with the tool's own seam, ON by default (the burn it removes is not an
+# option), and the directory stays DERIVED inside the tool exactly as its contract requires. TTL 300 s:
+# one pass, not two. The tool additionally refuses a cached board that its own fleet clock calls stale
+# (`fleet_state.STATE_FRESH_S`, 900 s), that cannot answer, or that was built for another repo — so a
+# hit can never turn an unmeasured board into a CLEAN, and the dispatch-time CLAIM gate remains the
+# authoritative lock either way.
+# Measured: 16.8 s -> 3.6 s -> 3.4 s per candidate, identical verdicts. `0` => behave as before.
+export COLLISION_PREFLIGHT_BOARD_CACHE="${COLLISION_PREFLIGHT_BOARD_CACHE:-1}"
+export COLLISION_PREFLIGHT_BOARD_CACHE_TTL="${COLLISION_PREFLIGHT_BOARD_CACHE_TTL:-300}"
 # ⛔ APPEND, never PREPEND. These two directories are where launchd's minimal environment finds the
 # harness's tools, so they must stay on PATH — but hard-prepending them silently OUTRANKED the
 # caller's own PATH: a caller that put a pinned/stub `uv` first (the regression suite, or an
@@ -491,6 +514,66 @@ rm -f "$O/.write-probe"
 # The same environment precondition on the RUN path — and before the scout is provisioned, so a cell
 # that cannot read GitHub refuses in a second instead of after minutes of network work.
 gh_env_verdict || exit $?
+
+# ── THE CORE BUDGET IS FINITE AND SHARED — ASK BEFORE YOU SPEND IT (#1736 follow-up) ─────────────
+# MEASURED 2026-10-18 on the live Mac, from consecutive `[refresh]` lines in
+# `~/orchestrator/logs/orch-loop.log`: REST core remaining 4459 -> 3659 -> 3054 -> 2389 -> 1784 ->
+# 1124 -> 327 -> 0. ~670 core calls per pass against a 5000/hour account budget, so the box exhausted
+# the whole bucket in ~7 passes. After that every pass judged 6 candidates against a rate-limited
+# API, all 6 came back INCOMPLETE/DEGRADED, `judged 6 / usable 0` ABORTED — CORRECTLY (#1736: an
+# empty backlog over candidates nobody judged is a false report) — and the fleet dispatched NOTHING
+# for the rest of the hour. The refusal was right. The BURN was the defect.
+# The burn is attacked at its source above (one board rebuild per pass instead of six) and in the
+# pre-flight's own surfaces. What is left is the failure SHAPE: a pass that cannot tell, before it
+# spends, that it is about to spend its last call. So the pass now reads the remaining core budget
+# (that endpoint is exempt from the budget, so reading it is free) and judges FEWER candidates when
+# the budget cannot buy another one while keeping a reserve.
+#
+# ⛔ THIS IS NOT A PERMISSION SLIP, AND IT NARROWS NOTHING. The pre-flight is invoked with exactly the
+# same arguments and its verdict is judged by exactly the same fail-closed rules below; no surface is
+# skipped, and no incompletely-queried surface can become CLEAN. Only HOW MANY candidates a pass
+# attempts changes — and it changes in the safe direction: judging 2 of 6 COMPLETELY queues work,
+# while judging 6 against a refused API queues nothing and is the #1736 abort. A pass that cannot
+# afford even ONE candidate refuses TRANSIENTLY and NAMES the budget, because "judged nothing" must
+# never be reported as "nothing to do".
+#
+# 300 is the reserve: below it, the sweep/merge/claim paths (which also spend this bucket) come first,
+# and a pass that judges nothing still leaves the box able to MERGE. 30 is the measured per-candidate
+# cost WITH the board cache on (~19-25 calls, rounded UP so the estimate errs toward stopping early),
+# and it is re-learned from each candidate's own measured spend, so a box whose pre-flight is more
+# expensive paces itself. Both are operator seams, not policy: raising the reserve makes the box
+# dispatch fewer candidates per pass; 0 disables pacing entirely (the burn protection above stays).
+core_cfg_int() {   # <value> <default> — a non-numeric or negative seam is the default, never a crash
+  case "${1:-}" in ''|*[!0-9]*) printf '%s' "$2" ;; *) printf '%s' "$1" ;; esac
+}
+CORE_RESERVE="$(core_cfg_int "${COLLISION_PREFLIGHT_CORE_RESERVE:-}" 300)"
+CORE_PER_CANDIDATE="$(core_cfg_int "${COLLISION_PREFLIGHT_CORE_PER_CANDIDATE:-}" 30)"
+CORE_PACING="$(core_cfg_int "${COLLISION_PREFLIGHT_CORE_PACING:-}" 1)"
+# Remaining core budget, or return 1 when it cannot be read. ⛔ UNREADABLE IS NOT ZERO: a probe that
+# cannot answer must not starve the pass (that would turn a metric outage into a dispatch outage) and
+# must not be reported as a healthy budget either. The caller says which it was.
+core_remaining() {
+  local r
+  r="$(gh api rate_limit 2>/dev/null | jq -r '.resources.core.remaining // empty' 2>/dev/null)"
+  case "$r" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s' "$r"
+}
+CORE_EST="$CORE_PER_CANDIDATE"
+STARVED=0
+if [ "$CORE_PACING" -eq 1 ]; then
+  if CORE_NOW="$(core_remaining)"; then
+    # One candidate AND the reserve must fit, or this pass would spend its last calls to judge a
+    # handful and produce no usable verdict at all. Refusing HERE costs zero calls; refusing after the
+    # listings below costs ~40 of the calls the next pass needs.
+    if [ "$CORE_NOW" -lt $(( CORE_RESERVE + CORE_PER_CANDIDATE )) ]; then
+      echo "[refresh] ABORT: REST core budget remaining=$CORE_NOW cannot buy one candidate without eating the reserve=$CORE_RESERVE (~$CORE_PER_CANDIDATE per candidate) — this pass ran NOTHING and judged NOTHING, so an empty backlog would be a false report (#1736). Retrying next cycle; the pool is left untouched."
+      exit "$EXIT_TRANSIENT"
+    fi
+    echo "[refresh] budget: REST core remaining=$CORE_NOW, reserve=$CORE_RESERVE, ~$CORE_PER_CANDIDATE per candidate — up to $(( (CORE_NOW - CORE_RESERVE) / CORE_PER_CANDIDATE )) candidate(s) affordable this pass (limit $LIMIT)"
+  else
+    echo "[refresh] WARN: the REST core budget could not be read — pacing is OFF for this pass (it will not be starved on an unreadable metric). The pre-flight's own fail-closed rules still decide every verdict."
+  fi
+fi
 
 # The scout is a dedicated throwaway worktree used only to run the collision pre-flight.
 # Provision it on first use: an earlier version just `cd`-ed into it, so on a fresh box the
@@ -1084,6 +1167,30 @@ while read -r N; do
   [ -z "${N:-}" ] && continue
   grep -qx "$N" "$O/checked.txt" 2>/dev/null && continue
   grep -qx "$N" "$O/dispatched.txt" 2>/dev/null && continue
+  # ── CAN THIS PASS AFFORD ANOTHER CANDIDATE? (see the budget block above `cmd_run`) ─────────────
+  # ⛔ THE CHECK IS BEFORE `judged++`, so a pass that stops here has not ATTEMPTED this candidate:
+  # it is left UNCHECKED for the next pass (no `checked.txt` entry), exactly like a COLLISION or a
+  # DEGRADED verdict. That is the #1736 contract — a candidate nobody judged is never "no work".
+  # The re-read is per candidate because the SPEND so far is the only honest estimate of the spend
+  # to come; the seam makes it free (the rate_limit endpoint is exempt from the core budget).
+  # ⛔ `${CORE_PACING:-0}`, NOT `$CORE_PACING`: selftest.sh extracts this loop body from `n=0` and
+  # runs it standalone, so the seams defined ABOVE the loop are absent there. Under the bare name
+  # the extraction printed `[: : integer expression expected` once per candidate (measured) and
+  # skipped the block by ACCIDENT — a green suite that no longer exercises this code, which is the
+  # "passes for the wrong reason" shape the extraction exists to avoid. Absent => OFF, and the
+  # shipped flow always defines it (0 or 1), so this default can only be reached by an extraction.
+  if [ "${CORE_PACING:-0}" -eq 1 ]; then
+    if CORE_NOW="$(core_remaining)"; then
+      if [ "$CORE_NOW" -lt $(( CORE_RESERVE + CORE_EST )) ]; then
+        STARVED=1
+        echo "[refresh] budget starved: REST core remaining=$CORE_NOW < reserve=$CORE_RESERVE + ~$CORE_EST for the next candidate — judged $judged of the $LIMIT slot(s) this pass and stopping HERE; the candidates not reached are left unchecked (NOT judged, so this is not an empty backlog)"
+        break
+      fi
+      CORE_AT_CANDIDATE="$CORE_NOW"
+    else
+      CORE_AT_CANDIDATE=""
+    fi
+  fi
   n=$((n+1)); [ "$n" -gt "$LIMIT" ] && break
   # ⛔ A pre-flight that ERRORED is not a verdict — and a COLLISION is not terminal. `echo "$N" >>
   # checked.txt` used to run BEFORE the verdict was read, so a pre-flight that produced no VERDICT
@@ -1235,6 +1342,17 @@ while read -r N; do
     *)
       echo "[refresh] ?#$N no verdict from the pre-flight — left unchecked for the next pass" ;;
   esac
+  # ── LEARN THIS BOX'S REAL PER-CANDIDATE COST (the pacing estimate is MEASURED, not a guess) ─────
+  # Only a LARGER observed spend raises the estimate: a pass that got cheaper must not raise it on the
+  # strength of a concurrent consumer's spend (the box shares the bucket with the sweep, the merge path
+  # and every lane), and erring HIGH is the safe direction — it stops the pass one candidate early
+  # instead of one too late. A CONCURRENT spend can only inflate this, i.e. make pacing MORE cautious.
+  if [ -n "${CORE_AT_CANDIDATE:-}" ] && CORE_AFTER="$(core_remaining)"; then
+    if [ "$CORE_AFTER" -le "$CORE_AT_CANDIDATE" ]; then
+      CORE_SPENT=$(( CORE_AT_CANDIDATE - CORE_AFTER ))
+      [ "$CORE_SPENT" -gt "$CORE_EST" ] && CORE_EST="$CORE_SPENT"
+    fi
+  fi
 done < "$O/.pool"
 # ── a pass the registry answered NOTHING for is not a healthy pass (2026-10-16 review) ──────────
 # The per-issue INCOMPLETE lines scroll away, and `lanes: 0` with `backlog=0` is exactly what a quiet
@@ -1247,6 +1365,17 @@ done < "$O/.pool"
 # whole pool is peer-owned COLLISIONs — an empty backlog for a legitimate reason (#1853 review).
 if [ "$ICR_INCOMPLETE" -gt 0 ]; then
   echo "[refresh] $ICR_INCOMPLETE of $judged pre-flighted issues INCOMPLETE — the cross-box claim registry could not answer; $QUEUED queued"
+fi
+# ⛔ A PASS THAT COULD AFFORD **NOTHING** MUST NOT FALL THROUGH TO `checked 0; backlog now M`. The
+# budget guard above can stop the loop before the first candidate (the listings in between can eat the
+# last of the bucket), and `judged=0` is DELIBERATELY not covered by the `usable -eq 0` assertion below
+# (that one requires `judged -gt 0`), so without this arm the pass would print `checked 0; backlog now
+# 0` at rc 0 — the exact "an unjudged pool reads as an empty one" false report #1736 exists to refuse,
+# arriving through the budget door instead of the API's. TRANSIENT, because a budget resets on a clock:
+# the next cycle can judge. It is also NAMED, so an operator sees `starved` and not a quiet queue.
+if [ "$STARVED" -eq 1 ] && [ "$judged" -eq 0 ]; then
+  echo "[refresh] ABORT: the REST core budget could not buy a single candidate this pass (reserve=$CORE_RESERVE, ~$CORE_EST per candidate) — NOTHING was judged, so an empty backlog would be a false report (#1736). Retrying next cycle."
+  exit "$EXIT_TRANSIENT"
 fi
 # ⛔ WHAT THIS DOES NOT COVER: the stall that leaves a HEALTHY-LOOKING NON-EMPTY backlog. A
 # persistently-colliding issue consumes the whole window while `checked N; backlog now M` still
@@ -1303,3 +1432,10 @@ mv "$O/.cand" "$O/candidates.txt" || {
   exit "$EXIT_TRANSIENT"
 }
 echo "[refresh] checked $judged; backlog now $(wc -l < "$O/candidates.txt" | tr -d ' ') issues"
+# ⛔ THE STARVED-PASS SUMMARY IS SEPARATE FROM THE COUNT ON PURPOSE. `checked 2` over a 203-issue pool
+# would otherwise read like a healthy pass that ran out of work; the pass stopped because it ran out of
+# BUDGET, and the two facts must not share one sentence (agent-infra#1736's vocabulary: READ/EMPTY are
+# statements about the queue, this is a statement about the reader's allowance).
+if [ "$STARVED" -eq 1 ]; then
+  echo "[refresh] budget: judged $judged of the $LIMIT slot(s) this pass and stopped at the reserve ($CORE_RESERVE) — the candidates not reached were left UNCHECKED, not judged; the next pass re-attempts them"
+fi
