@@ -424,9 +424,10 @@ export REPO=$HOME/eldato/tortoise        # REQUIRED: the target repo's local mai
                                          # any other machine: REPO missing -> the controller dies
                                          # at startup and crash-loops under KeepAlive; REPO wrong
                                          # but existing -> the refresh aborts every cycle while
-                                         # the controller keeps beating. ⛔ SEVEN shipped scripts
-                                         # still carry a REPO default of their own — the complete
-                                         # grep, `retired/` and `*.test.sh` excluded:
+                                         # the controller keeps beating. ⛔ SEVEN shipped SHELL
+                                         # scripts still carry a REPO default of their own — the
+                                         # complete grep over `*.sh`, `retired/` and `*.test.sh`
+                                         # excluded:
                                          # refresh-candidates.sh:18, report.sh:24,
                                          # cloud-cell-supervisor.sh:93,
                                          # deploy-crossbox.sh:23,
@@ -436,8 +437,13 @@ export REPO=$HOME/eldato/tortoise        # REQUIRED: the target repo's local mai
                                          # three are the worst shape: $PWD is `/` under launchd,
                                          # so the default resolves to a real non-repo directory
                                          # and fails later as `not a git repository: /` instead
-                                         # of at the REPO boundary. #1977 covers the first and the
-                                         # third; the other five are untracked. So export REPO in
+                                         # of at the REPO boundary. ⛔ An EIGHTH of the same class is
+                                         # not a shell script: `goal-state.py:29` hardcodes
+                                         # `REPO = "/Users/<someone>/Documents/GitHub/tortoise"`
+                                         # with NO env override at all (it only feeds
+                                         # `sys.path.insert`), so it is the rawest form of this
+                                         # defect and is tracked separately. #1977 covers the first
+                                         # and the third; the other five are untracked. So export REPO in
                                          # the daemon AND the session env (#1935).
 export O=$HOME/orchestrator              # the harness state directory
 export SCOPE=own                         # drain scope: auto (default) | own | broad.
@@ -893,10 +899,12 @@ snapshot; `queue-dispatch.py:320,377` raises `LaneReadError` naming the timeout 
 stays exit 0 on a blind read with nothing classified, because manufacturing a failure out of an idle
 beat is its own defect (`:812-819`). What does not exist is a deadline
 inside the READER, and `queue-dispatch.py:110` says so outright — *"lane-status.py has no internal
-deadline, so this is the only stop between a stalled scan and an unbounded wait"*. Every bound in
-force is a CALLER's — 300 s (`lane-actions.py:1528`), 600 s (`queue-dispatch.py:110`), 600 s
-(`pr-doctor.py:389`) — which is why the caller fails instead of getting an answer. agent-infra#1774,
-#1788.
+deadline, so this is the only stop between a stalled scan and an unbounded wait"*. Every bound on the
+WHOLE read is a CALLER's — 300 s (`lane-actions.py:1528`), 600 s (`queue-dispatch.py:110`), 600 s
+(`pr-doctor.py:389`) — which is why the caller fails instead of getting an answer. (The reader does
+hold per-CALL bounds -- 60 s, 45 s, 45 s at `lane-status.py:267,383,599` -- and that is exactly the
+shape this MUST rules out: it bounds each probe and lets their SUM grow with the fleet.)
+agent-infra#1774, #1788.
 
 ### 6.5.3 Ancestry is the safety rail
 
@@ -1558,7 +1566,8 @@ instead of reading as healthy.
 
 **Portability edits applied to the shipped loop.** Three per-box constants became overridable — with
 this box's values still the default for `OR` and `O`, and **no default in the scripts that refuse
-their own REPO**; SEVEN shipped scripts still carry one (#1935/#1977, enumerated in §4 step 2). The launchd
+their own REPO**; SEVEN shipped shell scripts still carry one, plus an eighth instance in a `.py`
+(#1935/#1977, enumerated in §4 step 2). The launchd
 `PATH` is no longer one of them: `install.sh` renders the `__PATH__` placeholder from the directories
 `tmux`/`gh`/`uv`/`pi` actually resolve to, refusing any `*/shims`, `*/shims/*` or `*/.pi/*` directory
 because macOS TCC makes such a symlink EPERM under launchd, and then probes each tool by executing it.

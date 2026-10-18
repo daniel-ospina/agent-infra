@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""orphan-reap.py — reap ORPHANED test/tooling processes, under the three gates.
+"""orphan-reap.py — reap ORPHANED test/tooling processes, under the five gates.
 
 WHY THIS EXISTS
 `orphan-scan.py` only reports (and is pinned to one lane's needle); `embedded_orphans.py` is a

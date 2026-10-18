@@ -227,6 +227,14 @@ for _d in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" "$HOME/bin" /usr/b
   [ -d "$_d" ] || continue
   case ":$DEPLOY_PATH:" in *":$_d:"*) ;; *) DEPLOY_PATH="${DEPLOY_PATH:+$DEPLOY_PATH:}$_d" ;; esac
 done
+# ⛔ The fallback list above does NOT contain the pi install on this box: `~/.local/bin/pi` does not
+# exist, `~/.local/share/pi-node/current/bin/pi` does. Without this, a deploy run from a bare PATH
+# relaunches a controller that cannot spawn a lane. install.sh:185-188 closes the same hole the same
+# way (prefer the version-independent `current` symlink).
+if [ -x "$HOME/.local/share/pi-node/current/bin/pi" ]; then
+  case ":$DEPLOY_PATH:" in *":$HOME/.local/share/pi-node/current/bin:"*) ;; *)
+    DEPLOY_PATH="${DEPLOY_PATH:+$DEPLOY_PATH:}$HOME/.local/share/pi-node/current/bin" ;; esac
+fi
 [ -n "$DEPLOY_PATH" ] || DEPLOY_PATH="/usr/bin:/bin:/usr/sbin:/sbin"
 log "relaunch PATH: $DEPLOY_PATH"
 cd "$HOME" || exit 1
