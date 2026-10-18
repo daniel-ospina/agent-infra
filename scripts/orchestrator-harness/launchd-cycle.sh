@@ -305,6 +305,17 @@ lc_hb_age() {
   [ -f "$f" ] || return 0
   v="$(tr -dc '0-9' < "$f" 2>/dev/null)" || return 0
   [ -n "$v" ] || return 0
+  # ⛔ A DIGIT RUN IS NOT NECESSARILY AN INSTANT (review finding). Three traps, all measured on bash:
+  #   * `[ "$v" -le M ]` parses a LEADING-ZERO run as DECIMAL while `$(( ))` parses it as OCTAL, so the
+  #     value that was compared is not the value that is subtracted;
+  #   * `0` (or any all-zero run) passes the future check and yields `now - 0` — a FABRICATED age of the
+  #     whole epoch (~1.79e9 s), which then asserts "running but not cycling" and prescribes
+  #     `install.sh --restart` on a perfectly healthy controller;
+  #   * a very long run overflows `$(( ))`.
+  # So: force decimal, bound the length, and require a PLAUSIBLE epoch instant (≥ 2001-09-09).
+  [ "${#v}" -le 12 ] || return 0
+  v=$(( 10#$v ))
+  [ "$v" -ge 1000000000 ] || return 0
   now="$(date +%s)"
   [ "$v" -le "$(( now + 60 ))" ] || return 0
   printf '%s\n' "$(( now - v ))"
@@ -326,6 +337,11 @@ lc_hb_value() {
   [ -f "$1/heartbeat" ] || { printf '0\n'; return 0; }
   v="$(tr -dc '0-9' < "$1/heartbeat" 2>/dev/null)" || v=""
   [ -n "$v" ] || { printf '0\n'; return 0; }
+  # Same decimal rule as `lc_hb_age`: `0010` must mean ten, and an all-zero run must not become a
+  # baseline nothing can exceed.
+  [ "${#v}" -le 12 ] || { printf '0\n'; return 0; }
+  v=$(( 10#$v ))
+  [ "$v" -ge 1000000000 ] || { printf '0\n'; return 0; }
   now="$(date +%s)"
   [ "$v" -le "$(( now + 60 ))" ] || v=0
   printf '%s\n' "$v"

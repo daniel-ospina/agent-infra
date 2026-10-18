@@ -1245,6 +1245,29 @@ for fixture in empty garbage; do
   assert_not_contains "$out" "unreadables old" "…(${fixture}) and no fabricated duration"
 done
 
+# A zeroed (or all-zero, or zero-padded) value is the nastiest shape: it PASSES a future check and then
+# makes `now - v` the whole epoch — a fabricated 1.79e9-second age that asserts "running but not cycling"
+# and prescribes `--restart` on a healthy controller. It must read as PRESENT-and-unusable, and a
+# zero-PADDED real instant must still read as fresh (decimal, not octal).
+for fixture in zero padded; do
+  fresh "$(( $(date +%s) - 5 ))"
+  ( . "$LIB"; lc_start "$LABEL" "$T/o/x.plist" >/dev/null 2>&1 )
+  case "$fixture" in
+    zero)   printf '0000000000\n' > "$T/o/heartbeat" ;;
+    padded) printf '0%s\n' "$(date +%s)" > "$T/o/heartbeat" ;;
+  esac
+  : > "$FAKE_LOG"
+  out="$( . "$LIB"; LC_SETTLE=1 lc_ensure "$LABEL" "$T/o/x.plist" "$T/o" 0 2 2>&1 )"; rc=$?
+  if [ "$fixture" = zero ]; then
+    if [ "$rc" -ne 0 ]; then ok "an all-zero heartbeat refuses (non-zero)"; else bad "a zero value became an age of the whole epoch"; fi
+    assert_contains "$out" "is PRESENT but is not a usable instant" "…(zero) named as PRESENT-and-unusable"
+    assert_not_contains "$out" "running but not cycling" "…(zero) and no fabricated 'not cycling' verdict"
+  else
+    if [ "$rc" -eq 0 ]; then ok "a zero-PADDED real instant reads as fresh (decimal, not octal)"; else bad "a valid zero-padded heartbeat was refused: $out"; fi
+    assert_not_contains "$out" "running but not cycling" "…(padded) and it does not claim the controller is wedged"
+  fi
+done
+
 # A heartbeat that is PRESENT but not a usable instant is a different operator problem (a clock step),
 # and `lc_hb_age` returns empty for it too. Naming it "missing" would send the operator to `ls -l` on a
 # file they can see.
