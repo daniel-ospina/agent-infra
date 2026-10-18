@@ -763,6 +763,19 @@ def check_controller_cycling(f, c):
 
     cycles = [h for h in (f.get("log_events") or {}).get("headers") or []
               if h.get("age_s") is not None and h["age_s"] <= win]
+    if not cycles:
+        # ⛔ A MOVING FILE IS NOT A CYCLE. `cycles` was computed, printed and never graded, so a
+        # controller wedged mid-cycle read PASS/CYCLING for as long as anything else appended to the
+        # log — `claim-prune` and the `[reap-worker]` lines do, by design. The check's own name is
+        # the claim being made, so an empty cycle list refutes it.
+        return V("controller_cycling", FAIL, "LOG_NO_CYCLE",
+                 "controller pid(s): %s IS ALIVE (launchd %s: %s)\n"
+                 "%s\n%s\n0 cycle header(s) inside the %.0fs window — the log IS advancing "
+                 "(%.0fs ago), but not by a cycle"
+                 % (pid_txt, lc, lc_txt, log_txt, _last_header_txt(f), win, log_age),
+                 "the controller's log is moving while no cycle completes: a mid-cycle wedge looks "
+                 "exactly like this, and 'a controller cycled' is the outcome this check asserts. A "
+                 "pid plus a moving file is not a cycling controller.")
     return V("controller_cycling", PASS, "CYCLING",
              "controller pid(s): %s\nlaunchd %s: %s\n%s\n%s\n%d cycle header(s) inside the %.0fs window"
              % (pid_txt, lc, lc_txt, log_txt, hb_txt, len(cycles), win))
@@ -839,19 +852,24 @@ def check_queue_readable(f, c):
     # two apart in one read. (Silence is not the safe default here — a blind refresh looks identical.)
     pool = tok.get("pool")
     stale = _queue_stale(f, c, require_known=True)
-    if stale is not None and tok["kind"] == "EMPTY":
-        # ⛔ EMPTINESS IS THE ONE CLAIM A FROZEN READ CANNOT SUPPORT. "Nothing to do" read from a
-        # six-hour-old record is the state record acting as a stale flag — the exact failure the
-        # token's age suffix exists to prevent. A stale READ(n) still supports "readable, n
-        # candidates"; it is reported as evidence and does not flip the verdict.
+    # ⛔ EMPTINESS IS THE ONE CLAIM A FROZEN READ CANNOT SUPPORT — and an UNKNOWN age supports NO
+    # claim at all. This guard used to fire only for EMPTY, so `queue=READ(223)` written without an
+    # epoch (the bare token the harness emits when its `$at` field is missing or unparsable) was
+    # graded READABLE with the age printed as "UNKNOWN": a refresh that stopped writing hours ago,
+    # having lost its epoch, read as current, and `queue_stale_s` — whose whole job is to stop that —
+    # could not fire because `_queue_age` answered None. A KNOWN-and-old NON-EMPTY read is still
+    # accepted (it does say "readable, n candidates"); an unaged one is not.
+    if stale is not None and (stale["age_s"] is None or tok["kind"] == "EMPTY"):
+        if stale["age_s"] is None:
+            return V("queue_readable", INCONCLUSIVE, "STATE_FROZEN", _queue_frozen_txt(f, stale),
+                     "the pool reading (%s) carries NO AGE — no epoch in the token, none in "
+                     "state/queue-state — so a current read cannot be told from a record frozen "
+                     "hours ago. A state record with no age is a stale flag waiting to be read as "
+                     "current, and an UNKNOWN age is not a fresh one. Not green." % (raw_tok,))
         return V("queue_readable", INCONCLUSIVE, "STATE_FROZEN", _queue_frozen_txt(f, stale),
                  ("the pool was read as EMPTY %s ago (limit %.0fs), so 'the pool is empty' is a "
                   "claim about then, not now. Not green." % (
-                      _age_txt(stale["age_s"]), stale["limit_s"]))
-                 if stale["age_s"] is not None else
-                 ("the pool was read as EMPTY but the reading carries NO AGE, so there is no way to "
-                  "tell a current empty pool from a record frozen hours ago. A state record with no "
-                  "age is a stale flag waiting to be read as current. Not green."))
+                      _age_txt(stale["age_s"]), stale["limit_s"])))
     if tok["kind"] == "EMPTY" and backlog is None:
         return V("queue_readable", INCONCLUSIVE, "HEADER_INCOMPLETE",
                  "header: %s has no backlog= field, so 'empty' cannot be checked against it"
@@ -1031,7 +1049,7 @@ def check_work_dispatched(f, c):
     # `work_dispatched` — "the one that matters most" — assert that a fleet's non-dispatch was
     # CORRECT on evidence the module had declared incomplete.
     stale = _queue_stale(f, c, require_known=True)
-    if stale is not None and (pool_kind == "EMPTY" or backlog == 0):
+    if stale is not None and (stale["age_s"] is None or pool_kind == "EMPTY" or backlog == 0):
         # "Nothing to dispatch" is the CORRECT outcome only on a CURRENT read. A frozen read makes it
         # unestablished, and this is the branch that would otherwise bless it.
         return V("work_dispatched", INCONCLUSIVE, "STATE_FROZEN", _queue_frozen_txt(f, stale),
@@ -1039,8 +1057,9 @@ def check_work_dispatched(f, c):
                   "dispatch' is not established. Not green." % (
                       _age_txt(stale["age_s"]), stale["limit_s"]))
                  if stale["age_s"] is not None else
-                 ("the pool was read as empty but the reading carries NO AGE, so 'there was nothing "
-                  "to dispatch' cannot be told from a record frozen hours ago. Not green."))
+                 ("the pool reading carries NO AGE (no epoch in the token, none in "
+                  "state/queue-state), so 'there was nothing to dispatch' cannot be told from a "
+                  "record frozen hours ago. Not green."))
     if pool_kind == "EMPTY" and backlog is None:
         return V("work_dispatched", INCONCLUSIVE, "HEADER_INCOMPLETE",
                  "queue=EMPTY but the header carries no `backlog=` field: %s" % hdr,
@@ -1096,9 +1115,12 @@ def check_pr_created(f, c):
                  "the PR population could not be read, so 'no PR was created' is not established. "
                  "Not green.")
     n = gh.get("prs_created_in_window")
+    # ⛔ The labels and the values were CROSSED: `open=` printed the merged count and `merged=` the
+    # open count, so the evidence of a PASS contradicted `pr_merged`'s own block two checks later
+    # (measured live: "PRs created in the last 3h: 25 / (open=13 merged=24)" for 24 open, 13 merged).
     ev = ("PRs created in the last %.2gh: %s\n(open=%s merged=%s in the same window)\n"
           "last created: %s\n%s"
-          % (win / 3600.0, n, gh.get("prs_merged_in_window"), gh.get("open_pr_count"),
+          % (win / 3600.0, n, gh.get("open_pr_count"), gh.get("prs_merged_in_window"),
              gh.get("last_created") or "none in the query window", _gh_surface_txt(gh)))
     if isinstance(n, int) and n > 0:
         return V("pr_created", PASS, "CREATED", ev)
@@ -1445,6 +1467,11 @@ KNOWN_NON_MERGEABLE = ("BLOCKED", "BEHIND", "DIRTY", "DRAFT", "HAS_HOOKS", "UNST
 # disappears.
 MERGEABILITY_UNKNOWN = ("", "UNKNOWN")
 
+# Review decisions known by name to mean "not landable yet". Anything else in `review_decision` is a
+# state this tool has never seen, so the PR is unprobed rather than dropped: a green, mergeable,
+# unarmed PR that vanishes from the population is exactly the failure this check exists for.
+KNOWN_NON_MERGEABLE_REVIEWS = ("CHANGES_REQUESTED", "REVIEW_REQUIRED", "DISMISSED")
+
 
 def check_landers(f, c):
     gh = f.get("github") or {}
@@ -1454,7 +1481,24 @@ def check_landers(f, c):
                  "the open-PR population could not be read, so 'every green PR has an armed "
                  "lander' is not established. Not green.")
 
-    prs = gh.get("open_prs") or []
+    prs = gh.get("open_prs")
+    # ⛔ `gh.get("open_prs") or []` turned an ABSENT key into "zero open PRs", and `ok is True` was
+    # the only gate — so a payload with `ok: true` and no rows made `landers` ASSERT "every green PR
+    # has an armed lander" over a population it never read, while the contradicting `open_pr_count`
+    # sat in the same dict unread. Missing rows, and a count that disagrees with them, are both a
+    # failed read.
+    if not isinstance(prs, list):
+        return V("landers", INCONCLUSIVE, "GH_UNREADABLE",
+                 "gh: ok but NO `open_prs` list in the payload (keys: %s)"
+                 % ", ".join(sorted(gh.keys())),
+                 "the open-PR population is absent from the payload, so 'every green PR has an armed "
+                 "lander' would be asserted over nothing. Not green.")
+    if isinstance(gh.get("open_pr_count"), int) and gh["open_pr_count"] != len(prs):
+        return V("landers", INCONCLUSIVE, "GH_UNREADABLE",
+                 "gh: open_pr_count=%d but %d row(s) were returned"
+                 % (gh["open_pr_count"], len(prs)),
+                 "the payload disagrees with itself about how many open PRs exist, so the population "
+                 "is not established. Not green.")
     events = f.get("log_events") or {}
     # ⛔ A DECISION IN THE LOG IS A DECISION *NOW* — an unaged one is not.
     # `#N PENDING (rail mode …)` printed last night kept a green PR reading "railed" long after the
@@ -1468,7 +1512,7 @@ def check_landers(f, c):
     stale_log = ((_decisions(events.get("armed")) | _decisions(events.get("railed")))
                  - (armed_log | railed_log))
 
-    candidates, unprobed = [], []
+    candidates, unprobed, skipped = [], [], []
     for pr in prs:
         if pr.get("draft"):
             continue
@@ -1482,12 +1526,31 @@ def check_landers(f, c):
             unprobed.append(pr.get("number"))
             continue
         if mss not in MERGEABLE_STATES:
+            # A KNOWN non-mergeable state is skipped — but COUNTED and printed, or `landers` reads
+            # PASS over a population it silently discarded (measured: EVERY open PR on this box was
+            # BLOCKED or DIRTY, so the check graded nothing at all while reporting health).
+            skipped.append("%s:%s" % (pr.get("number"), mss))
             continue
         if not green:
+            skipped.append("%s:red" % (pr.get("number"),))
             continue
-        if pr.get("review_decision") not in (None, "", "APPROVED"):
+        rd = pr.get("review_decision")
+        if rd not in (None, "", "APPROVED"):
+            if str(rd).upper() in KNOWN_NON_MERGEABLE_REVIEWS:
+                skipped.append("%s:%s" % (pr.get("number"), str(rd).upper()))
+                continue
+            # an UNRECOGNISED review decision is not a reason to forget the PR
+            unprobed.append(pr.get("number"))
             continue
         candidates.append(pr)
+
+    skip_txt = ""
+    if skipped:
+        # ⛔ BUILT HERE, not after the candidate block: the `NOTHING_GREEN` return below happens
+        # BEFORE that line, so a population discarded for a known reason was invisible — the check
+        # reported "no lander is expected" over PRs it had thrown away.
+        skip_txt = ("skipped (known, not landable): %d — %s"
+                    % (len(skipped), ", ".join(skipped[:12]) + (" …" if len(skipped) > 12 else "")))
 
     if gh.get("page_full"):
         # HOISTED above the no-candidate branch: a truncated population is not a population, and
@@ -1503,14 +1566,16 @@ def check_landers(f, c):
     if not candidates:
         if unprobed:
             return V("landers", INCONCLUSIVE, "PARTIAL_POPULATION",
-                     "open PRs: %d, unprobed (beyond the probe bound): %s\n%s\n%s"
-                     % (len(prs), unprobed, _gh_surface_txt(gh), _prs_brief(prs)),
+                     "open PRs: %d, unprobed (beyond the probe bound): %s\n%s\n%s%s"
+                     % (len(prs), unprobed, _gh_surface_txt(gh), _prs_brief(prs),
+                        ("\n" + skip_txt) if skip_txt else ""),
                      "%d open PR(s) could not be probed (the REST fallback is bounded), so "
                      "'every green PR has an armed lander' is not established over the whole "
                      "population. Not green." % len(unprobed))
         return V("landers", PASS, "NOTHING_GREEN",
-                 "open PRs: %d\nnone is green+mergeable (no lander is expected)\n%s\n%s"
-                 % (len(prs), _gh_surface_txt(gh), _prs_brief(prs)),
+                 "open PRs: %d\nnone is green+mergeable (no lander is expected)\n%s\n%s%s"
+                 % (len(prs), _gh_surface_txt(gh), _prs_brief(prs),
+                    ("\n" + skip_txt) if skip_txt else ""),
                  "")
 
     expired, missing, ok = [], [], []
@@ -1542,6 +1607,8 @@ def check_landers(f, c):
         ev.append("ARMED IN THE LOG, NOT ARMED IN GITHUB (expired): %s" % sorted(expired))
     if missing:
         ev.append("NEVER ARMED AND NOT RAILED: %s" % sorted(missing))
+    if skip_txt:
+        ev.append(skip_txt)
     if stale_log:
         # Not a footnote: these are the PRs whose only "lander" is an entry too old (or too
         # un-ageable) to be a current decision. Saying so is what separates "there is no lander"
@@ -1629,10 +1696,17 @@ def evaluate(facts, cfg, only=None):
     return out
 
 
-def exit_code(verdicts):
+def exit_code(verdicts, not_evaluated=()):
     if any(v.status == FAIL for v in verdicts):
         return 1
     if any(v.status == INCONCLUSIVE for v in verdicts):
+        return 2
+    if not_evaluated:
+        # ⛔ A CHECK THAT WAS NEVER EVALUATED IS NOT A PASS. `--live --only headroom` evaluated one
+        # check, printed "summary: 1 PASS · 0 FAIL · 0 INCONCLUSIVE → exit 0" and exited 0 while
+        # seven outcomes were unprobed — the contract this file states about itself ("an unevaluable
+        # check must never read as green"), and the rule `--static` already applies by listing what
+        # it did not assert.
         return 2
     return 0
 
@@ -2884,7 +2958,7 @@ def default_fixtures_dir():
 MARK = {PASS: "✅ PASS", FAIL: "⛔ FAIL", INCONCLUSIVE: "⚠️  INCONCLUSIVE"}
 
 
-def render(verdicts, cfg, header):
+def render(verdicts, cfg, header, not_evaluated=()):
     lines = [header, ""]
     for v in verdicts:
         lines.append("  %-16s %-20s %s" % (MARK[v.status], v.name, v.variant))
@@ -2895,10 +2969,13 @@ def render(verdicts, cfg, header):
     counts = {}
     for v in verdicts:
         counts[v.status] = counts.get(v.status, 0) + 1
-    code = exit_code(verdicts)
+    code = exit_code(verdicts, not_evaluated)
     lines.append("")
     lines.append("summary: %d PASS · %d FAIL · %d INCONCLUSIVE → exit %d"
                  % (counts.get(PASS, 0), counts.get(FAIL, 0), counts.get(INCONCLUSIVE, 0), code))
+    if not_evaluated:
+        lines.append("⚠️  NOT EVALUATED (excluded by --only, so NOT established): %s"
+                     % ", ".join(not_evaluated))
     return "\n".join(lines)
 
 
@@ -2907,8 +2984,19 @@ def render(verdicts, cfg, header):
 # ════════════════════════════════════════════════════════════════════════════════════════════════
 
 
+class _Parser(argparse.ArgumentParser):
+    """argparse exits 2 on a usage error, and 2 is the INCONCLUSIVE code this tool publishes — a
+    caller dispatching on the documented codes would read `--bogusflag` as "the fleet is
+    inconclusive". Usage errors are 3, everywhere."""
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        print("%s: error: %s" % (self.prog, message), file=sys.stderr)
+        raise SystemExit(3)
+
+
 def build_parser():
-    ap = argparse.ArgumentParser(
+    ap = _Parser(
         prog="outcome-canary",
         description="Assert what the fleet PRODUCES, and raise a signal when an outcome is absent.")
     mode = ap.add_mutually_exclusive_group(required=True)
@@ -3103,7 +3191,8 @@ def main(argv=None):
     else:
         facts = collect_live(cfg, machine=machine, now=now, skip=skip)
     verdicts = evaluate(facts, cfg, only=only)
-    code = exit_code(verdicts)
+    not_evaluated = [n for n in CHECK_ORDER if n not in set(v.name for v in verdicts)]
+    code = exit_code(verdicts, not_evaluated)
 
     obs_iso = _iso(now)
     header = ("outcome canary — LIVE box=%s repo=%s  %s\n"
@@ -3123,7 +3212,8 @@ def main(argv=None):
         if rr.get("took"):
             facts2 = collect_live(cfg, machine=machine, now=time.time(), skip=skip)
             verdicts = evaluate(facts2, cfg, only=only)
-            code = exit_code(verdicts)
+            not_evaluated = [n for n in CHECK_ORDER if n not in set(v.name for v in verdicts)]
+            code = exit_code(verdicts, not_evaluated)
     elif ctrl_v is not None and ctrl_v.variant in RESPAWN_TRIGGERS:
         reported["respawn"] = {"attempted": False, "took": False,
                                "detail": "suppressed by --no-respawn", "commands": []}
@@ -3199,6 +3289,7 @@ def main(argv=None):
                           "config": cfg.as_json(),
                           "verdicts": [v.as_json() for v in verdicts],
                           "exit": code,
+                          "not_evaluated": not_evaluated,
                           "signal": {
                               "respawn": reported["respawn"],
                               "sent": reported["sent"],
@@ -3209,7 +3300,7 @@ def main(argv=None):
                           }}, indent=1))
         return code
 
-    print(render(verdicts, cfg, header))
+    print(render(verdicts, cfg, header, not_evaluated))
     if reported["respawn"]:
         rr = reported["respawn"]
         print("\nrespawn: %s" % (rr.get("detail") or "not attempted"))

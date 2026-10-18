@@ -202,8 +202,8 @@ shape changes, and it is pruned with the rest of its check.
 ## The suite
 
 ```bash
-python3 tools/fleet/outcome_canary.test.py              # 83 tests
-python3 tools/fleet/outcome_canary.test.py --mutations  # 62 mutations, each must go RED
+python3 tools/fleet/outcome_canary.test.py              # 91 tests
+python3 tools/fleet/outcome_canary.test.py --mutations  # 71 mutations, each must go RED
 ```
 
 The signal tests drive the **real CLI** end-to-end (`--live --facts … --capture-dir …`), so what is
@@ -222,11 +222,14 @@ Three more tests exist for the same reason — an outcome read as present when i
 
 - **A re-run is an ATTEMPT, not a check.** The rollup is a list in which a flaky job appears twice, so
   a flat "every entry must be green" walk reads a commit that re-ran green as **red**, and a
-  red-reading green PR drops out of the `landers` population. Attempts are grouped on `(app, name)` —
-  the identity the merge rail itself groups on (`scripts/admin-merge.sh`) — and only the newest attempt per group is
-  graded, newest being the highest `id` (`started_at` is nullable, so a timestamp-first rank can rank
-  a stale attempt over a fresh one). A legacy status context carries `state`, not `conclusion`, and is
-  read too: reading only `conclusion` graded every one of them RED.
+  red-reading green PR drops out of the `landers` population. Attempts are grouped on
+  `(workflowName, name)` and ordered by the attempt's `startedAt` — NOT on `app` and NOT by `id`,
+  because the live surface (`gh pr list --json statusCheckRollup`) carries neither: it emits
+  `name, workflowName, status, conclusion, startedAt, completedAt, detailsUrl`. Grouping on `app` (or
+  on the merge rail's `(app, name)`) collapsed every workflow into one check — `changes` is published
+  by both `CI` and `Python CI` — and its list order is not chronological. `app.slug` is the fallback
+  the REST check-runs payload offers, where an `id` also exists. A group with an attempt still IN
+  FLIGHT is not green. A legacy status context carries `state`, not `conclusion`, and is read too.
 - **A decision in the log is a decision NOW.** `#N PENDING (rail mode …)` from last night, or an entry
   whose enclosing cycle header was unparseable and so carries no age at all, is not a lander: both
   kept a green PR reading PASS after the rail was gone. Decisions are filtered by age against
@@ -298,3 +301,26 @@ Four more, found by measuring the surface the tool actually reads rather than th
   DELETED fixture removes the outcome it pinned while every remaining assertion still passes. A
   partial `_expect` is a `PARTIAL_EXPECT` mismatch and a missing outcome-critical fixture is a
   `MISSING_FIXTURE` mismatch.
+
+Six more (cycle 13), each a case where a datum the tool held was not the one it graded on:
+
+- **An age-UNKNOWN pool read is not READABLE.** The staleness guard fired only for `EMPTY`, so
+  `queue=READ(223)` written without an epoch — the bare token the harness emits when its `$at` field
+  is missing or unparsable — was graded `READABLE` with the age printed as `UNKNOWN`. A known-and-old
+  non-empty read is still accepted (it does say "readable, n candidates"); an unaged one is not.
+- **A moving log is not a cycling controller.** `cycles` was computed, printed and never graded, so a
+  controller wedged mid-cycle read `PASS/CYCLING` for as long as anything appended to the log —
+  `claim-prune` and the `[reap-worker]` lines do, by design. Zero cycle headers in the window is now
+  `FAIL/LOG_NO_CYCLE`.
+- **A partial run cannot exit 0.** `--live --only headroom` evaluated one check and exited 0 while
+  seven outcomes were unprobed. The unevaluated checks are named in the report and in the JSON, and the
+  exit code is 2. (`--only` narrows; it does not certify the rest.)
+- **A payload must BE a population.** An absent `open_prs` list, or an `open_pr_count` that disagrees
+  with the rows, is `GH_UNREADABLE` — the contradicting count sits in the same dict, so it is compared.
+- **Every row is graded, skipped-for-a-known-reason, or unprobed — and the skips are PRINTED.** A
+  `BEHIND`/`DIRTY`/`BLOCKED` PR is still skipped, but counted and named; and a `CHANGES_REQUESTED` /
+  `REVIEW_REQUIRED` / `DISMISSED` review is a known skip, while an UNRECOGNISED review decision is
+  unprobed rather than dropped. Measured on this box: 53 of 53 open PRs are `BEHIND` or `DIRTY`, so
+  before this the check graded nothing at all and said `PASS`.
+- **Usage errors are exit 3, as documented.** argparse exits 2, which is this tool's INCONCLUSIVE
+  code; `--bogusflag` read to a caller as "the fleet is inconclusive".

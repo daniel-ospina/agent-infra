@@ -412,6 +412,7 @@ def test_a_PR_row_that_cannot_be_GRADED_is_UNPROBED_not_silent():
     def verdict(rows):
         d = fx("healthy")
         d["facts"]["github"]["open_prs"] = rows
+        d["facts"]["github"]["open_pr_count"] = len(rows)   # a payload that agrees with itself
         cfg = m.cfg_from_dict(d["config"])
         return [x for x in m.evaluate(d["facts"], cfg) if x.name == "landers"][0]
 
@@ -509,6 +510,193 @@ def test_static_refuses_a_PARTIAL_expectation_and_a_MISSING_fixture():
         assert m.missing_fixtures(sorted(m.glob.glob(os.path.join(FIXTURES, "*.json")))) == []
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+@test
+def test_an_AGE_UNKNOWN_pool_read_is_not_READABLE():
+    """The staleness guard fired only for EMPTY, so `queue=READ(223)` written WITHOUT an epoch (the
+    bare token the harness emits when `$at` is missing or unparsable) was graded READABLE with the age
+    printed as "UNKNOWN": a refresh that stopped writing hours ago, having lost its epoch, read as
+    current — and `queue_stale_s`, whose whole job is to stop that, could not fire."""
+    m = load()
+
+    def grade(token, qs, backlog=47):
+        d = fx("healthy")
+        d["facts"]["log_events"]["headers"] = [{
+            "raw": "=== Sun Oct 18 07:47:44 EST 2026 load=40 lanes=2 backlog=%d queue=%s ==="
+                   % (backlog, token),
+            "age_s": 42, "ts": 1792327664, "backlog": backlog, "queue_token": token, "lanes": 2}]
+        d["facts"]["log_events"]["dispatch_ok"] = []
+        d["facts"]["queue_state"] = qs
+        cfg = m.cfg_from_dict(d["config"])
+        return dict((x.name, x) for x in m.evaluate(d["facts"], cfg))
+
+    # a bare READ token with an UNREADABLE age: no epoch anywhere ⇒ not current
+    got = grade("READ(223)", {"path": "q", "ok": True, "raw": "READ(223)", "age_s": None})
+    assert got["queue_readable"].status == m.INCONCLUSIVE, got["queue_readable"].as_json()
+    assert got["queue_readable"].variant == "STATE_FROZEN", got["queue_readable"].variant
+    assert "no age" in got["queue_readable"].evidence.lower(), got["queue_readable"].evidence
+    assert "NO AGE" in got["queue_readable"].detail, got["queue_readable"].detail
+    # …and work_dispatched must not bless "nothing to do" on it either (backlog=0 is the shape
+    # where "no dispatch" would otherwise be the CORRECT outcome)
+    got = grade("READ(223)", {"path": "q", "ok": True, "raw": "READ(223)", "age_s": None},
+                backlog=0)
+    assert got["work_dispatched"].status == m.INCONCLUSIVE, got["work_dispatched"].as_json()
+    assert got["work_dispatched"].variant == "STATE_FROZEN", got["work_dispatched"].variant
+    # a KNOWN-fresh READ token is still readable (the conservative direction must not cost this)
+    got = grade("READ(223)(9m)", {"path": "q", "ok": True, "raw": "READ(223) 1792327000",
+                                  "age_s": 600})
+    assert got["queue_readable"].status == m.PASS, got["queue_readable"].as_json()
+    # a KNOWN-and-OLD READ token is still accepted: it does say "readable, n candidates"
+    got = grade("READ(223)(6h)", {"path": "q", "ok": True, "raw": "READ(223) 1792300000",
+                                  "age_s": 40000})
+    assert got["queue_readable"].status == m.PASS, got["queue_readable"].as_json()
+
+
+@test
+def test_a_MOVING_log_is_not_a_CYCLING_controller():
+    """`cycles` was computed, printed and never graded, so a controller wedged mid-cycle read
+    PASS/CYCLING for as long as anything else appended to the log — `claim-prune` and the
+    `[reap-worker]` lines do, by design. The check's own name is the claim being made."""
+    m = load()
+    d = fx("healthy")
+    d["facts"]["log_events"]["headers"] = []          # the log advances, but no cycle completes
+    d["facts"]["log_events"]["dispatch_ok"] = []
+    cfg = m.cfg_from_dict(d["config"])
+    v = [x for x in m.evaluate(d["facts"], cfg) if x.name == "controller_cycling"][0]
+    assert (v.status, v.variant) == (m.FAIL, "LOG_NO_CYCLE"), (v.status, v.variant, v.evidence)
+    assert "0 cycle header(s) inside" in v.evidence, v.evidence
+
+
+@test
+def test_a_payload_that_is_NOT_a_population_is_not_graded():
+    """`gh.get("open_prs") or []` turned an ABSENT key into "zero open PRs", and the contradicting
+    `open_pr_count` sat in the same dict unread: `landers` asserted "every green PR has an armed
+    lander" over a population it never read."""
+    m = load()
+
+    def landers(gh):
+        d = fx("healthy")
+        d["facts"]["github"] = gh
+        cfg = m.cfg_from_dict(d["config"])
+        return [x for x in m.evaluate(d["facts"], cfg) if x.name == "landers"][0]
+
+    row = {"number": 1, "merge_state_status": "CLEAN", "checks_green": True,
+           "auto_armed": True, "draft": False, "probed": True}
+    # (a) rows ABSENT, count present: not a population
+    v = landers({"ok": True, "open_pr_count": 7})
+    assert (v.status, v.variant) == (m.INCONCLUSIVE, "GH_UNREADABLE"), (v.status, v.variant)
+    assert "open_prs" in v.evidence, v.evidence
+    # (b) count disagrees with the rows: the payload contradicts itself
+    v = landers({"ok": True, "open_pr_count": 7, "open_prs": [row]})
+    assert (v.status, v.variant) == (m.INCONCLUSIVE, "GH_UNREADABLE"), (v.status, v.variant)
+    assert "open_pr_count=7" in v.evidence, v.evidence
+    # (c) a coherent payload is still graded
+    v = landers({"ok": True, "open_pr_count": 1, "open_prs": [row]})
+    assert (v.status, v.variant) == (m.PASS, "LANDERS_ARMED"), (v.status, v.variant, v.evidence)
+
+
+@test
+def test_a_PR_skipped_for_a_KNOWN_reason_is_COUNTED_and_PRINTED():
+    """Skipping a BEHIND/DIRTY PR is right; skipping it SILENTLY let `landers` read PASS over a
+    population it discarded entirely (measured: every open PR on this box was BLOCKED or DIRTY, so the
+    check graded nothing while reporting health)."""
+    m = load()
+    d = fx("healthy")
+    d["facts"]["github"] = {"ok": True, "open_pr_count": 3, "open_prs": [
+        {"number": 900, "merge_state_status": "CLEAN", "checks_green": True, "auto_armed": True,
+         "draft": False, "probed": True},
+        {"number": 901, "merge_state_status": "BEHIND", "checks_green": True, "auto_armed": False,
+         "draft": False, "probed": True},
+        {"number": 902, "merge_state_status": "CLEAN", "checks_green": False, "auto_armed": False,
+         "draft": False, "probed": True},
+    ]}
+    cfg = m.cfg_from_dict(d["config"])
+    v = [x for x in m.evaluate(d["facts"], cfg) if x.name == "landers"][0]
+    assert v.status == m.PASS, (v.status, v.variant, v.evidence)
+    assert "skipped (known, not landable): 2" in v.evidence, v.evidence
+    assert "901:BEHIND" in v.evidence and "902:red" in v.evidence, v.evidence
+
+
+@test
+def test_a_review_decision_that_is_NOT_recognised_is_UNPROBED_not_dropped():
+    """The `review_decision` filter dropped a FULLY GRADED row into neither `candidates` nor
+    `unprobed`: a green, mergeable, unarmed PR read as "no lander is expected". A known decision
+    (CHANGES_REQUESTED, REVIEW_REQUIRED, DISMISSED) is skipped and printed; an unknown one abstains."""
+    m = load()
+
+    def landers(rd):
+        d = fx("healthy")
+        d["facts"]["github"] = {"ok": True, "open_pr_count": 1, "open_prs": [
+            {"number": 910, "merge_state_status": "CLEAN", "checks_green": True,
+             "auto_armed": False, "draft": False, "probed": True, "review_decision": rd}]}
+        cfg = m.cfg_from_dict(d["config"])
+        return [x for x in m.evaluate(d["facts"], cfg) if x.name == "landers"][0]
+
+    v = landers("CHANGES_REQUESTED")
+    assert v.status == m.PASS, (v.status, v.variant, v.evidence)
+    assert "910:CHANGES_REQUESTED" in v.evidence, v.evidence
+    v = landers("SOMETHING_NEW")
+    assert (v.status, v.variant) == (m.INCONCLUSIVE, "PARTIAL_POPULATION"), (v.status, v.variant)
+    assert "910" in v.evidence, v.evidence
+    # and the healthy shape is untouched: an APPROVED, green, unarmed PR is still a lander failure
+    v = landers("APPROVED")
+    assert (v.status, v.variant) == (m.FAIL, "LANDER_MISSING"), (v.status, v.variant, v.evidence)
+
+
+@test
+def test_a_PARTIAL_run_cannot_exit_0():
+    """`--only headroom` evaluated one check, printed "summary: 1 PASS · 0 FAIL · 0 INCONCLUSIVE →
+    exit 0" and exited 0 while seven outcomes were unprobed — the contract this tool states about
+    itself. The unevaluated checks are now named, and the exit code is 2 (never 0)."""
+    m = load()
+    rc, out, err = run_cli(["--static", "--fixture", os.path.join(FIXTURES, "healthy.json")])
+    assert rc == 0, (rc, out[-300:])
+    d = fx("healthy")
+    facts = os.path.join(tempfile.mkdtemp(prefix="oc-partial-run-"), "f.json")
+    with open(facts, "w") as fh:
+        json.dump(d, fh)
+    rc, out, err = run_cli(["--live", "--facts", facts, "--json", "--dry-run", "--no-notify",
+                            "--only", "headroom", "--controller-ws",
+                            "00000000-0000-0000-0000-0000000000c1"])
+    j = json.loads(out)
+    assert j["exit"] == 2, (j["exit"], j.get("not_evaluated"))
+    assert set(j["not_evaluated"]) == set(m.CHECK_ORDER) - {"headroom"}, j["not_evaluated"]
+    assert len(j["verdicts"]) == 1, j["verdicts"]
+    # a FAIL among the evaluated checks still wins: 1, not 2
+    dr = os.path.join(os.path.dirname(facts), "dr.json")
+    with open(dr, "w") as fh:
+        json.dump(fx("dispatch-refused"), fh)
+    rc, out, err = run_cli(["--live", "--facts", dr, "--json", "--dry-run", "--no-notify",
+                            "--only", "work_dispatched", "--controller-ws",
+                            "00000000-0000-0000-0000-0000000000c1"])
+    assert json.loads(out)["exit"] == 1, out[-300:]
+
+
+@test
+def test_a_usage_error_is_exit_3_not_the_inconclusive_code():
+    """argparse exits 2 on a usage error and 2 is the INCONCLUSIVE code: a caller dispatching on the
+    documented codes read `--bogusflag` as "the fleet is inconclusive"."""
+    m = load()
+    rc, out, err = run_cli(["--bogusflag"])
+    assert rc == 3, (rc, err[-200:])
+    rc, out, err = run_cli([])                    # no mode at all
+    assert rc == 3, (rc, err[-200:])
+
+
+@test
+def test_the_pr_created_evidence_names_the_counts_it_prints():
+    """The labels and the values were crossed (`open=` printed the merged count and `merged=` the open
+    count), so a PASS's evidence contradicted `pr_merged`'s block two checks later."""
+    m = load()
+    d = fx("healthy")
+    d["facts"]["github"]["open_pr_count"] = 24
+    d["facts"]["github"]["prs_merged_in_window"] = 13
+    d["facts"]["github"]["prs_created_in_window"] = 3
+    d["facts"]["github"]["open_prs"] = d["facts"]["github"]["open_prs"] or []
+    cfg = m.cfg_from_dict(d["config"])
+    v = [x for x in m.evaluate(d["facts"], cfg) if x.name == "pr_created"][0]
+    assert "open=24 merged=13" in v.evidence, v.evidence
 
 
 @test
@@ -1533,6 +1721,7 @@ def test_a_truncated_open_PR_population_is_not_a_population():
     prs = [{"number": n, "merge_state_status": "BLOCKED", "checks_green": False,
             "auto_armed": False, "draft": False, "probed": True} for n in range(1, 101)]
     d["facts"]["github"]["open_prs"] = prs
+    d["facts"]["github"]["open_pr_count"] = len(prs)
     d["facts"]["github"]["page_full"] = True
     cfg = m.cfg_from_dict(d["config"])
     v = [x for x in m.evaluate(d["facts"], cfg) if x.name == "landers"][0]
@@ -1717,6 +1906,7 @@ def test_landers_never_reports_green_over_PR_it_did_not_read():
     prs += [{"number": n, "merge_state_status": None, "checks_green": None,
              "auto_armed": False, "draft": False, "probed": False} for n in range(2, 17)]
     d["facts"]["github"]["open_prs"] = prs
+    d["facts"]["github"]["open_pr_count"] = len(prs)
     cfg = m.cfg_from_dict(d["config"])
     v = [x for x in m.evaluate(d["facts"], cfg) if x.name == "landers"][0]
     assert v.status == m.INCONCLUSIVE, (v.status, v.variant, v.evidence)
@@ -1736,6 +1926,30 @@ def test_a_MISSING_github_surface_is_not_a_successful_read():
     for name in ("pr_created", "pr_merged", "landers"):
         assert got[name][0] == m.INCONCLUSIVE, (name, got[name])
         assert got[name][1] == "GH_UNREADABLE", (name, got[name])
+
+    # …and the SAME must hold when the surface says so EXPLICITLY: `ok: False` with a row attached is
+    # a refused read, not a population. (`is False` polarity, `is not True` — the other half of the
+    # rule: an absent key and an explicit refusal are both "no read".)
+    d2 = fx("healthy")
+    d2["facts"]["github"] = {"ok": False, "error": "rate limited", "open_pr_count": 1,
+                             "open_prs": [{"number": 1, "merge_state_status": "CLEAN",
+                                           "checks_green": True, "auto_armed": True,
+                                           "draft": False, "probed": True}]}
+    cfg2 = m.cfg_from_dict(d2["config"])
+    v2 = [x for x in m.evaluate(d2["facts"], cfg2) if x.name == "landers"][0]
+    assert (v2.status, v2.variant) == (m.INCONCLUSIVE, "GH_UNREADABLE"), (v2.status, v2.variant)
+
+    # …and an ABSENT `ok` with a perfectly good population still abstains: allow-list polarity, so a
+    # payload that never stated the surface was read is not a read. (`is not False` would grade it —
+    # which is the defect this pins.)
+    d3 = fx("healthy")
+    d3["facts"]["github"] = {"open_pr_count": 1,
+                             "open_prs": [{"number": 1, "merge_state_status": "CLEAN",
+                                           "checks_green": True, "auto_armed": True,
+                                           "draft": False, "probed": True}]}
+    cfg3 = m.cfg_from_dict(d3["config"])
+    v3 = [x for x in m.evaluate(d3["facts"], cfg3) if x.name == "landers"][0]
+    assert (v3.status, v3.variant) == (m.INCONCLUSIVE, "GH_UNREADABLE"), (v3.status, v3.variant)
 
 
 @test
@@ -2134,6 +2348,43 @@ MUTATIONS = [
     ("the census is not scoped to this cell's controller path",
      "        if paths and os.path.normpath(toks[1]) not in paths:", "        if False:",
      "test_the_census_is_scoped_to_THIS_cell_and_reports_what_it_rejected"),
+    # ── cycle-13 defects ────────────────────────────────────────────────────────────
+    ("an age-UNKNOWN non-empty pool read passes as READABLE",
+     '    if stale is not None and (stale["age_s"] is None or tok["kind"] == "EMPTY"):',
+     '    if stale is not None and tok["kind"] == "EMPTY":',
+     "test_an_AGE_UNKNOWN_pool_read_is_not_READABLE"),
+    ("a moving log counts as a cycling controller",
+     "    if not cycles:",
+     "    if False:",
+     "test_a_MOVING_log_is_not_a_CYCLING_controller"),
+    ("a partial --only run exits 0 with seven outcomes unprobed",
+     "    if not_evaluated:\n        # ⛔ A CHECK THAT WAS NEVER EVALUATED IS NOT A PASS.",
+     "    if False:\n        # ⛔ A CHECK THAT WAS NEVER EVALUATED IS NOT A PASS.",
+     "test_a_PARTIAL_run_cannot_exit_0"),
+    ("a usage error exits with the INCONCLUSIVE code",
+     "        raise SystemExit(3)",
+     "        raise SystemExit(2)",
+     "test_a_usage_error_is_exit_3_not_the_inconclusive_code"),
+    ("the pr_created evidence crosses its own labels",
+     '          % (win / 3600.0, n, gh.get("open_pr_count"), gh.get("prs_merged_in_window"),',
+     '          % (win / 3600.0, n, gh.get("prs_merged_in_window"), gh.get("open_pr_count"),',
+     "test_the_pr_created_evidence_names_the_counts_it_prints"),
+    ("a payload with no open-PR rows is graded as zero PRs",
+     "    if not isinstance(prs, list):",
+     "    if False:",
+     "test_a_payload_that_is_NOT_a_population_is_not_graded"),
+    ("a payload whose count contradicts its rows is graded anyway",
+     '    if isinstance(gh.get("open_pr_count"), int) and gh["open_pr_count"] != len(prs):',
+     "    if False:",
+     "test_a_payload_that_is_NOT_a_population_is_not_graded"),
+    ("a PR skipped for a known reason is dropped without being counted",
+     '            skipped.append("%s:%s" % (pr.get("number"), mss))',
+     '            pass',
+     "test_a_PR_skipped_for_a_KNOWN_reason_is_COUNTED_and_PRINTED"),
+    ("an unrecognised review decision silently removes a graded PR from the population",
+     '            if str(rd).upper() in KNOWN_NON_MERGEABLE_REVIEWS:',
+     '            if True:',
+     "test_a_review_decision_that_is_NOT_recognised_is_UNPROBED_not_dropped"),
     # ── cycle-12 defects ────────────────────────────────────────────────────────────
     ("the rollup is grouped on the app, which the LIVE surface does not emit, so workflows collapse",
      '    wf = str(chk.get("workflowName") or "")',
@@ -2313,7 +2564,7 @@ MUTATIONS = [
      "test_landers_never_reports_green_over_PR_it_did_not_read"),
     ("a MISSING github surface reads as a successful read",
      'def check_landers(f, c):\n    gh = f.get("github") or {}\n    if gh.get("ok") is not True:',
-     'def check_landers(f, c):\n    gh = f.get("github") or {}\n    if gh.get("ok") is False:',
+     'def check_landers(f, c):\n    gh = f.get("github") or {}\n    if gh.get("ok") is not False:',
      "test_a_MISSING_github_surface_is_not_a_successful_read"),
     ("an unrecognised send result is treated as a free retry",
      '    return "ambiguous"          # unknown rc / timeout / silence: assume the bytes may have landed',
