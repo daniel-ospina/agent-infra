@@ -63,33 +63,63 @@ fi
 # EXECUTABLE position: comments stripped BEFORE counting, so a clause that survives only in a
 # comment (or was deleted) fails here rather than being "found" in the prose that explains it.
 _live_hits="$(sed 's/#.*//' "$HB" | grep -c 'FLEETADV' || true)"
-if [ "${_live_hits:-0}" -ge 2 ]; then
+if [ "${_live_hits:-0}" -ge 4 ]; then
   pass "orchestrator-heartbeat.sh references FLEETADV in executable position (${_live_hits} sites)"
 else
   fail "FLEETADV is absent or commented out in orchestrator-heartbeat.sh — the order would never ship"
   echo "❌ heartbeat-fleet-advance suite: the clause is not wired"; exit 1
 fi
-# The definition line must be a single double-quoted literal with NOTHING inside that bash
-# would interpret: no `"` (terminates the literal early), no backtick (command substitution),
-# no `$` (expansion). This is the rule the file itself states for MSG, asserted mechanically.
-_defn="$(sed -n 's/^FLEETADV=\(.*\)$/\1/p' "$HB" | head -1)"
-case "$_defn" in
-  \"*\") _inner="${_defn#\"}"; _inner="${_inner%\"}"
-         case "$_inner" in
-           *'"'*) fail "FLEETADV contains a double quote — it would terminate the literal early" ;;
-           *'`'*) fail "FLEETADV contains a backtick — bash would command-substitute it away at assignment" ;;
-           *'$'*) fail "FLEETADV contains a dollar sign — bash would expand it at assignment" ;;
-           *) [ -n "$_inner" ] && pass "FLEETADV is one self-contained literal (no quotes, backticks or \$-expansion inside)" \
-                                || fail "FLEETADV is defined but EMPTY — the clause would never appear" ;;
-         esac ;;
-  *) fail "FLEETADV is not a single double-quoted literal on one line (got: ${_defn:0:60}…)" ;;
-esac
-# Unconditional: the append must be a top-level statement, never inside an `if`. A cheap but
-# real structural read — indentation is how every conditional in this file is written.
+# ⛔ THE ORDER MUST SAY THE SAME THING ON BOTH BODIES. Two lengths exist (full for the alert body,
+# short for the pulse), which is the file's own precedent for ROLE/MAP/PRIORITY — but two wordings
+# can silently diverge, so every ELEMENT the owner named is asserted as a marker on BOTH. A variant
+# that drops one (the four boxes, the rail, cell-2, the closing line) fails here, not in production.
+FRAGMENTS=("FLEET ADVANCE" "ALL FOUR BOXES" "AUTOPILOT" "USE THE CAPACITY" "DRIVE THE P0/P1"
+           "agent-infra" "cell-2" "scripts/admin-merge.sh" "WASTED BEAT")
+# The definition lines must each be a single double-quoted literal with NOTHING inside that bash
+# would interpret: no `"` (terminates the literal early), no backtick (command substitution), no `$`
+# (expansion). This is the rule the file itself states for MSG, asserted mechanically on each variant.
+for _v in FLEETADV FLEETADV_SHORT; do
+  _defn="$(sed -n "s/^$_v=\\(.*\\)$/\\1/p" "$HB" | head -1)"
+  case "$_defn" in
+    \"*\") _inner="${_defn#\"}"; _inner="${_inner%\"}"
+           case "$_inner" in
+             *'"'*) fail "$_v contains a double quote — it would terminate the literal early" ;;
+             *'`'*) fail "$_v contains a backtick — bash would command-substitute it away at assignment" ;;
+             *'$'*) fail "$_v contains a dollar sign — bash would expand it at assignment" ;;
+             *) if [ -z "$_inner" ]; then
+                  fail "$_v is defined but EMPTY — that body would lose the order"
+                else
+                  _miss=""
+                  for _f in "${FRAGMENTS[@]}"; do
+                    has "$_inner" "$_f" || _miss="$_miss [$_f]"
+                  done
+                  if [ -z "$_miss" ]; then
+                    pass "$_v is one self-contained literal and names every required element (${#_inner} chars)"
+                  else
+                    fail "$_v is missing required element(s):$_miss — the two bodies would diverge"
+                  fi
+                fi ;;
+           esac ;;
+    *) fail "$_v is not a single double-quoted literal on one line (got: ${_defn:0:60}…)" ;;
+  esac
+done
+# Unconditional: the FULL-body append must be a top-level statement, never inside an `if`. A cheap
+# but real structural read — indentation is how every conditional in this file is written. (The
+# short-form append is indented BY DESIGN: it lives inside the short-form branch, asserted below.)
 if [ "$(sed -n 's/^MSG="\${MSG} \${FLEETADV}"$//p' "$HB" | wc -l | tr -d ' ')" = "1" ]; then
-  pass "the append is a column-0 (unconditional) MSG statement, not an indented conditional one"
+  pass "the full-body append is a column-0 (unconditional) MSG statement, not an indented conditional one"
 else
   fail "the FLEETADV append is not a top-level, unindented MSG assignment — it could be conditional"
+fi
+# ...and the two appends must use the RIGHT variant: the full one on the alert body, the short one
+# after the short-form rebuild. Swapping them silently re-inflates (or guts) the quiet beat, which is
+# the regression this pairing exists to prevent.
+_full_use="$(sed -n 's/^MSG="\${MSG} \${FLEETADV}"$//p' "$HB" | wc -l | tr -d ' ')"
+_short_use="$(sed -n 's/^  MSG="\${MSG} \${FLEETADV_SHORT}"$//p' "$HB" | wc -l | tr -d ' ')"
+if [ "${_full_use:-0}" = "1" ] && [ "${_short_use:-0}" = "1" ]; then
+  pass "the FULL variant rides the alert body and the SHORT variant rides the short-form rebuild"
+else
+  fail "the two variants are not where they belong (full-body uses=$_full_use, short-form uses=$_short_use)"
 fi
 
 echo ""
@@ -143,8 +173,11 @@ beat(){ # beat <home> <script> -> the message the tick SENT
   ( HOME="$1" PATH="$1/bin:$PATH" bash "$2" >/dev/null 2>&1 )
   cat "$1/.pi/agent/sessions/s1/hb-11111111-1111-1111-1111-111111111111.jsonl" 2>/dev/null
 }
-FRAGMENTS=("FLEET ADVANCE" "ALL FOUR BOXES" "AUTOPILOT" "USE THE CAPACITY, DO NOT REPORT IT"
-           "DRIVE THE P0/P1 PRs" "agent-infra" "cell-2" "WASTED BEAT")
+FRAGMENTS=("FLEET ADVANCE" "ALL FOUR BOXES" "AUTOPILOT" "USE THE CAPACITY" "DRIVE THE P0/P1"
+           "agent-infra" "cell-2" "scripts/admin-merge.sh" "WASTED BEAT")
+
+# (the marker array is declared in section 0 above — one definition, so the wiring check and the
+# behavioural checks cannot assert different element sets)
 
 echo "1. a QUIET beat (short form) carries the order — with every conditional clause EMPTY"
 h="$TMP/quiet"; sandbox "$h" 0
@@ -168,6 +201,16 @@ else
   for f in "${FRAGMENTS[@]}"; do
     if has "$out" "$f"; then pass "  quiet beat names: $f"; else fail "  quiet beat is MISSING: $f"; fi
   done
+  # ⛔ PROPORTIONALITY, measured: the quiet body exists to stay readable, so the SHORT variant must
+  # ride it. If a future edit points the pulse path at the full text, the quiet beat roughly doubles
+  # — that is the regression (full text = 758 chars against a 985-char body, +77%), and it is
+  # invisible to a marker check because both variants carry every element.
+  _qlen=${#out}
+  if [ "$_qlen" -lt 2000 ]; then
+    pass "the quiet beat stays short with the order on it (${_qlen} chars — the full variant alone is ~758)"
+  else
+    fail "the quiet beat is ${_qlen} chars — the FULL variant appears to ride the pulse path"
+  fi
 fi
 
 echo ""
@@ -187,20 +230,28 @@ else
   for f in "${FRAGMENTS[@]}"; do
     if has "$out" "$f"; then pass "  full beat names: $f"; else fail "  full beat is MISSING: $f"; fi
   done
+  # The full body carries the FULL wording — the alert tick is where the specific instructions
+  # (name the PRs, the rail, the four boxes on separate lines) are worth their length.
+  if has "$out" "name the specific PRs that should land this cycle"; then
+    pass "the full beat carries the FULL wording (it names the PRs that should land this cycle)"
+  else
+    fail "the full beat does not carry the full wording — the alert body got the condensed variant"
+  fi
 fi
 
 echo ""
 echo "3. SENSITIVITY: the same driver against a mutant of the shipped script must FAIL"
-# The mutant empties the FLEETADV definition and nothing else, so the ONLY difference in the
-# delivered beat is the clause. If the fragment still appears, this suite's driver is reading
-# something other than the shipped clause and would be permanently green.
+# The mutant empties BOTH definitions and nothing else, so the ONLY difference in the delivered
+# beat is the clause. If the fragment still appears, this suite's driver is reading something
+# other than the shipped clause and would be permanently green.
 MUT="$TMP/mutant.sh"
 /usr/bin/python3 - "$HB" "$MUT" <<'PY'
 import sys
 src, dst = sys.argv[1], sys.argv[2]
 lines = open(src, encoding="utf-8").read().splitlines(True)
 open(dst, "w", encoding="utf-8").writelines(
-    'FLEETADV=""\n' if ln.startswith("FLEETADV=") else ln for ln in lines)
+    ("FLEETADV=\"\"\n" if ln.startswith("FLEETADV=") else
+     "FLEETADV_SHORT=\"\"\n" if ln.startswith("FLEETADV_SHORT=") else ln) for ln in lines)
 PY
 h="$TMP/mutant"; sandbox "$h" 0
 out="$(beat "$h" "$MUT")"

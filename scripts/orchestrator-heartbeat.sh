@@ -916,12 +916,19 @@ MSG="${MSG} ⛔ PRIORITY: before dispatching, read the ranked order IN THE GRAPH
 # ⛔ UNCONDITIONAL, AND IT MUST RIDE THE SHORT FORM TOO (see the PULSE block below): a quiet beat
 # is exactly when the order is needed, and the short form is what a quiet beat receives -- the
 # short form REBUILDS MSG, so a clause appended only above it is discarded on every quiet tick.
-# FLEETADV is a variable only so the two bodies cannot drift apart.
-# ⛔ NO BACKTICKS, NO DOUBLE QUOTES AND NO $ IN FLEETADV -- the same rule as the rest of MSG
+# ⛔ TWO LENGTHS, ONE ORDER -- THE SHORT BODY GETS THE SHORT PHRASING, which is the file's own
+# precedent for ROLE / MAP / PRIORITY. MEASURED 2026-10-18 at review: the full text is 758 chars and
+# the quiet beat is 985 chars without it, so putting the full text on the pulse path makes every
+# quiet beat 1747 chars (+77%) -- most of the very wall the SHORT FORM exists to prevent (:929-931).
+# The short phrasing is 513 chars (quiet beat ~1498, +52%) and still carries EVERY element the
+# owner named, which tests/heartbeat-fleet-advance/run.sh asserts on BOTH bodies as a marker set --
+# so a variant that silently drops one (cell-2, the rail, the four boxes) fails CI.
+# ⛔ NO BACKTICKS, NO DOUBLE QUOTES AND NO $ IN EITHER VARIANT -- the same rule as the rest of MSG
 # (see the warning above): MSG is a DOUBLE-QUOTED assignment, so a backticked span is
 # command-substituted AT ASSIGNMENT TIME and silently vanishes, leaving a hole the file on disk
-# still looks right about. tests/heartbeat-fleet-advance/run.sh asserts all three.
+# still looks right about. tests/heartbeat-fleet-advance/run.sh asserts all three, on both.
 FLEETADV="⛔ FLEET ADVANCE — this beat is an ORDER, not a report. (1) CHECK THE cmux LANES AND ALL FOUR BOXES (the local machine plus the three cloud VMs) and push every one toward AUTOPILOT — dispatching, creating PRs, fixing them, merging them UNATTENDED. (2) USE THE CAPACITY, DO NOT REPORT IT: if the local machine has room, dispatch locally; if a cloud VM is idle, dispatch there — lanes must be running on real work, not described in a paragraph about load. (3) DRIVE THE P0/P1 PRs: name the specific PRs that should land this cycle and take each one to the rail — run scripts/admin-merge.sh — and advance agent-infra (cell-2 owns it) toward automating dispatch, PR creation, fixing and merging. A beat that reports state and dispatches nothing is a WASTED BEAT. "
+FLEETADV_SHORT="⛔ FLEET ADVANCE — an ORDER, not a report: CHECK THE cmux LANES AND ALL FOUR BOXES (local + the three cloud VMs), push each to AUTOPILOT, USE THE CAPACITY instead of reporting it (dispatch locally if there is room, on an idle cloud VM otherwise), and DRIVE THE P0/P1 PRs: name this cycle's PRs, take each to the rail via scripts/admin-merge.sh, and advance agent-infra (cell-2 owns it) toward automating dispatch, PR creation, fixing and merging. A beat that reports state and dispatches nothing is a WASTED BEAT. "
 MSG="${MSG} ${FLEETADV}"
 if [ -n "${CAPTEXT:-}" ]; then MSG="${MSG} ${CAPTEXT}"; fi
 
@@ -935,8 +942,9 @@ if [ "${FORCE_SHORT:-0}" = "1" ] || { [ "$N_ALERT" -eq 0 ] && [ -z "$ASK_EV" ]; 
   MSG="[HEARTBEAT ${TS}] fleet ${N_ACT}active/${N_WAIT}waiting-child of ${N_TOTAL}. ${DELIV} ${QUEUE} ${OBJ} ⛔ ROLE: orchestrate, don't implement — dispatch and verify the artifact; never decide for the owner (their questions go through the AGENTS.md protocol to the owner-decision label, ask-owner.py). ⛔ MAP: the CI-and-merge crisis is the Tortoise graph, entered via the graph comment on #4844 — read it, keep it current. ⛔ PRIORITY: read the ranked order IN THE GRAPH (restated PRIORITY STACK + the cascade DRAIN -> MERGE -> P0/P1 -> ALPHA -> PILOTS -> REVENUE) and VERIFY each item's state (gh issue view N --json state) before dispatching — a stack entry is a hypothesis, not proof it is open. No alerts. (Verdict legend suppressed: CHILD-STUCK / WEDGED / DONE-IDLE / UNBOUND are WEAK signals — confirm against the pane or a content scan before acting. Full legend + VERDICTS known= are in ${LOG##*/}.)"
   # ⛔ THE SHORT FORM REBUILDS MSG, so the FLEET ADVANCE order must be re-appended here or every
   # quiet beat loses the one instruction that tells the lane to dispatch something. It goes BEFORE
-  # the capacity clause: the order first, the detail it acts on second.
-  MSG="${MSG} ${FLEETADV}"
+  # the capacity clause: the order first, the detail it acts on second. The SHORT phrasing, not the
+  # full one -- this body exists to stay readable (see the two-lengths note above).
+  MSG="${MSG} ${FLEETADV_SHORT}"
   if [ -n "${CAPTEXT:-}" ]; then MSG="${MSG} ${CAPTEXT}"; fi
 fi
 # -- the bottleneck clause, when the queue is the constraint -------------------
