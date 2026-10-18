@@ -1899,17 +1899,13 @@ kill -0 "$X_PID" 2>/dev/null && ok "stop: the OTHER repo's controller is still u
 # `ps` failing (a truncated PATH, a locked /proc, a denied exec) used to yield an empty read, which is
 # indistinguishable from "no controller" — the false-STOPPED class this whole change exists to close.
 mkdir -p "$X/badbin"; printf '#!/bin/sh\nexit 1\n' > "$X/badbin/ps"; chmod +x "$X/badbin/ps"
-xs_bad() { # <sub>
+xs_bad() { # <sub> — the session EXISTS, so verbs act on the `has-session` branch
   X_OUT="$(PATH="$X/badbin:$X/bin:$PATH" CELL_HOME="$X/home" ENV_FILE="$X/home/keys.env" \
            SESSION="orch-different-$$" O="$X/oB" REPO="$X/repo" OR="daniel-ospina/agent-infra" \
-           SCOPE=own HARNESS="$X/harness" bash "$SUP" "$1" 2>&1)"; X_RC=$?
+           SCOPE=own HARNESS="$X/harness" HARNESS_PIN_DIR="$X/pin" HARNESS_PIN_FILE="$X/pin.txt" \
+           bash "$SUP" "$1" 2>&1)"; X_RC=$?
 }
-for verb in status stop start; do
-  # `start` belongs in this list for the same reason as `stop`: both act on a session, and its two
-  # guards (the `has-session` branch's and the pre-launch one) are the pair whose failure is #1761's
-  # duplicate — an unreadable table reading as "no controller", so a second controller is launched
-  # onto one queue. `apply`'s guard is a separate path (it runs the loop in-process) and is not
-  # covered here; it is named in the issue's residual list rather than silently implied.
+for verb in status stop; do
   xs_bad "$verb"
   [ "$X_RC" -ne 0 ] && ok "$verb: rc=$X_RC when 'ps' cannot answer (never a silent 0)" \
                     || bad "$verb: exited 0 on an unreadable process table — $X_OUT"
@@ -1918,6 +1914,46 @@ for verb in status stop start; do
     *) bad "$verb: does not name the unreadable read — $X_OUT" ;;
   esac
 done
+# `start` has TWO unreadable-`ps` guards, and they are DIFFERENT refusals that share a prefix. Each
+# must be asserted by its own suffix, because a prefix match cannot tell them apart: mutating one
+# pair alone would leave one arm green (measured — the first version of this block did exactly that).
+# (1) the `has-session` branch: "the session exists" must not become "it is running" over a read
+#     that failed, which is the false-RUNNING answer that makes an operator skip a stop.
+xs_bad start
+[ "$X_RC" -ne 0 ] && ok "start: rc=$X_RC on an unreadable table in the has-session branch" \
+                  || bad "start: answered 'already running' from an unreadable process table — $X_OUT"
+case "$X_OUT" in
+  *"refusing to answer 'already running'"*) ok "start: names the unreadable read instead of claiming it is running" ;;
+  *) bad "start: does not name the unreadable read it refused on — $X_OUT" ;;
+esac
+# (2) the pre-launch pair: with NO session, `start` must not launch a SECOND controller onto a queue
+#     whose first controller it cannot see (#1761 — the duplicate this change exists to close). The
+#     double below answers `has-session` 1 and everything else 0, so this verb reaches that pair.
+mkdir -p "$X/badbin2"
+printf '#!/bin/sh\ncase "$1" in has-session) exit 1 ;; *) exit 0 ;; esac\n' > "$X/badbin2/tmux"
+chmod +x "$X/badbin2/tmux"
+xs_bad2() { # <sub> — the session does NOT exist, so `start` takes its pre-launch path
+  X_OUT="$(PATH="$X/badbin:$X/badbin2:$X/bin:$PATH" CELL_HOME="$X/home" ENV_FILE="$X/home/keys.env" \
+           SESSION="orch-different-$$" O="$X/oB" REPO="$X/repo" OR="daniel-ospina/agent-infra" \
+           SCOPE=own HARNESS="$X/harness" HARNESS_PIN_DIR="$X/pin" HARNESS_PIN_FILE="$X/pin.txt" \
+           bash "$SUP" "$1" 2>&1)"; X_RC=$?
+}
+xs_bad2 start
+[ "$X_RC" -ne 0 ] && ok "start: rc=$X_RC on an unreadable table before launching (no second controller)" \
+                  || bad "start: launched with an unreadable process table — $X_OUT"
+case "$X_OUT" in
+  *"refusing to start on an unreadable read"*) ok "start: the pre-launch refusal names the unreadable read" ;;
+  *) bad "start: the pre-launch refusal does not name the unreadable read — $X_OUT" ;;
+esac
+# (3) `apply` REPLACES the machine's shared harness tree, so it carries its own refusal for the same
+#     reason: a controller is running the code it would overwrite. Its guard precedes its tmux check.
+xs_bad apply
+[ "$X_RC" -ne 0 ] && ok "apply: rc=$X_RC on an unreadable table (never replaces a harness tree blind)" \
+                  || bad "apply: replaced the harness tree on an unreadable process table — $X_OUT"
+case "$X_OUT" in
+  *"refusing to replace the harness tree"*) ok "apply: names the unreadable read it refused on" ;;
+  *) bad "apply: does not name the unreadable read — $X_OUT" ;;
+esac
 kill -9 "$X_PID" 2>/dev/null; wait "$X_PID" 2>/dev/null
 
 # ── §(p) THE TWO PINNED MIRRORS MUST NOT DRIFT (#1856 review) ───────────────────────────────────
