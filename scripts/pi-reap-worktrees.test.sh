@@ -386,6 +386,7 @@ run_reaper() {
     REAP_WT_NOW_EPOCH="$nowval" \
     REAP_WT_DRY_RUN="${REAP_WT_DRY_RUN_OVERRIDE:-1}" \
     REAP_WT_AGED_DAYS="${REAP_WT_AGED_DAYS_OVERRIDE:-7}" \
+    REAP_WT_MERGED_AGE_DAYS="${REAP_WT_MERGED_AGE_DAYS_OVERRIDE:-0}" \
     REAP_WT_MAX_DAYS=1000000 \
     REAP_WT_MAIN_REF="" \
     REAP_WT_REPO_SLUG="${REAP_WT_REPO_SLUG:-}" \
@@ -607,6 +608,32 @@ OUT="$(REAP_WT_NOW_EPOCH_OVERRIDE=$((NOW + 1)) run_reaper $ENV --dry-run --repo 
 assert_contains "$(row_for "$OUT" "$WT_EDGE")" "reason=reclaimable" "G6c 7d+1s is reaped (strict >)"
 OUT="$(REAP_WT_NOW_EPOCH_OVERRIDE=$((NOW + 2)) run_reaper $ENV --dry-run --repo "$REPO")"
 assert_contains "$(row_for "$OUT" "$WT_EDGE")" "reason=reclaimable" "G6c 7d+2s is reaped (strict >)"
+
+# ── G6d: a MERGED head is exempt from the age floor (agent-infra#2032) ──
+# The floor's job is "work may still be in progress"; a merge is the proof it is not.
+# The SAME fixture is asserted BOTH ways, and the only difference is the exemption,
+# so a pass cannot come from the fixture rather than from the decision.
+ENV=G6d; REPO="$(mk_repo $ENV)"
+WT_MERGED="$(add_named_wt "$REPO" "$ENV-merged" feat/g6-merged)"
+commit_in_wt "$WT_MERGED" "$RECENT_DATE" merged
+"$REAL_GIT" -C "$REPO" merge -q --no-edit feat/g6-merged
+OUT="$(run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_MERGED")" "refs=merged" \
+    "G6d fixture really is merged (otherwise the exemption assertion is vacuous)"
+assert_contains "$(row_for "$OUT" "$WT_MERGED")" "reason=reclaimable" \
+    "G6d a MERGED head 2d old is reclaimed without waiting out the 7d floor"
+assert_contains "$(cat "$T/$ENV/reap.log")" "CLASSIFY merged-age-floor" \
+    "G6d the merged floor is RECORDED (a silent bypass of the floor is not the same thing)"
+OUT="$(REAP_WT_MERGED_AGE_DAYS_OVERRIDE=7 run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_MERGED")" "reason=too-recent" \
+    "G6d with the merged floor pinned to the blanket 7d, the same fixture is kept"
+OUT="$(run_reaper $ENV --dry-run --repo "$REPO" --aged-days 0)"
+assert_contains "$(row_for "$OUT" "$WT_MERGED")" "reason=reclaimable" \
+    "G6d --aged-days 0 is unaffected (the floor is already zero)"
+run_reaper $ENV --apply --repo "$REPO" >/dev/null
+assert_nodir "$WT_MERGED" "G6d --apply removed the merged checkout"
+assert_eq "$("$REAL_GIT" -C "$REPO" rev-parse --verify -q feat/g6-merged | wc -l | tr -d ' ')" "1" \
+    "G6d the merged branch ref survives (removal is the CHECKOUT, never the branch)"
 
 # ── G7: symlinked worktree paths in the live-process gate ─────────────
 # git records the RESOLVED path while a process's argv keeps what was typed.

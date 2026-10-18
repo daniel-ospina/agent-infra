@@ -16,9 +16,17 @@
 #   apply   fetch agent-infra main and PIN this cell's harness to it (agent-infra#1745). This is the
 #           whole of "apply the proper harness"; `start` runs it before every launch, so it is
 #           normally not needed by hand — it exists for a cell you want to fix without starting.
-#   prune   reclaim the regenerable disk the lanes leave behind (.venv per worktree, caches) and
-#           report the review scratch that accumulates under /tmp. --scratch[=DAYS] also deletes
-#           scratch checkouts older than DAYS. A full disk is what breaks a cell FIRST.
+#   prune   reclaim the regenerable disk the lanes leave behind and report the review scratch that
+#           accumulates under /tmp. --scratch[=DAYS] also deletes scratch checkouts older than DAYS.
+#           A full disk is what breaks a cell FIRST.
+#           ⛔ A per-worktree `.venv` is NOT removed here any more (agent-infra#1932). This sweep used
+#           to `rm -rf` it at every worktree root, with no idea whether the lane using it was alive;
+#           the only guard on the unattended path was a tmux NAME regex (`^(lane|fix|merge)-`) that
+#           the sessions this fleet actually runs (`ai1932`, `merge-8708` — measured on cell-2) do not
+#           match, and a manual `prune` had no guard at all. A `.venv` belongs to a RUNNING lane, so
+#           its ONLY deleter is now scripts/reap-lane-venvs.sh, which requires positive evidence that
+#           no live holder remains (a tmux pane inside the worktree, a process cwd or argv inside it)
+#           and FAILS CLOSED when it cannot prove it. `prune` runs that reaper's GC.
 #
 # ── THE QUEUE TARGET IS THE CHECKOUT (agent-infra#1901) ──────────────────────────────────────────
 # `REPO` (a path) and `OR` (an owner/repo) used to be two independent facts that nothing compared, so
@@ -1364,8 +1372,10 @@ cmd_start() {
   # `start` is the one command that applies the proper harness: fetch, pin to $HARNESS_REF in a
   # detached worktree, seed, record. A cell therefore cannot be started on a stale or hand-copied
   # tree, and the operator's manual copy step is gone. A live session already returned at the guard
-  # above, so the cache prune below cannot pull a venv out from under a running lane — which is why
-  # it is safe to run unattended here and not on the explicit `prune` path.
+  # above, so the cache prune below cannot pull a cache out from under a running lane.
+  # agent-infra#1932: `cmd_prune` no longer touches a per-worktree `.venv` at all — that delete is now
+  # the reaper's, gated on positive proof that no lane is alive — so this unattended path is safe
+  # whatever the session names are.
   local mb; mb="$(free_mb "$CELL_HOME")"
   case "${mb:-}" in
     ''|*[!0-9]*) ;;
@@ -1373,9 +1383,13 @@ cmd_start() {
          # ⛔ The controller session is NOT the only thing running: orch-loop.sh spawns its workers
          # into their OWN detached sessions (`fix-<PR>`, `merge-<PR>`), and `stop` kills only the
          # controller — so after a `stop` a worker can still be mid-review. `cmd_prune --caches`
-         # deletes `.venv` at every worktree root, which makes the lane using it re-resolve its deps
-         # (the manual `prune` path warns about exactly this). Skip the unattended delete while any
-         # worker session is alive, and report the low-space state instead of acting.
+         # deletes `node_modules` and `__pycache__` at every worktree root, and a lane's dev server can
+         # be holding the first of those. Skip the unattended delete while any worker session is alive,
+         # and report the low-space state instead of acting.
+         # ⛔ THIS NAME MATCH IS NOT THE VENV GUARD (agent-infra#1932). It never was a sound one: it
+         # matches `lane-|fix-|merge-` and the sessions this fleet actually runs on a cell are `ai1932`
+         # and `merge-8708` (measured on cell-2, 2026-10-17), so it reads "no workers" for a box full of
+         # them. The `.venv` half of the sweep no longer depends on it; the remaining entries do.
          # ⛔ `grep -c`, NOT `grep -q`. An early exit down a pipe lets the producer take SIGPIPE, and
          # under `set -o pipefail` the pipeline then reports the producer's failure — so a MATCH read
          # as "no workers" and the unattended prune deleted a LIVE worker's .venv. `-c` consumes all
@@ -1635,6 +1649,32 @@ cmd_status() {
     say "⛔ CACHE BOUND NOT ENFORCED — the package-cache reaper's last pass:"
     sed 's/^/    /' "$O/state/.cache-reap-blocked"
   fi
+  # agent-infra#2032: the scheduled DISK reaper. Its pass record is the only place that answers
+  # "did the last unattended run succeed, and how much did it free" — a failed or STALE pass is
+  # therefore a ⛔ line here, never an absence that reads like health. Disk exhaustion is the second
+  # reason cells stopped working: at ~97% a controller still beats and every dispatch is refused.
+  local _dr _drs _drc _dst _det cand
+  _dr=""
+  for cand in "${DISK_REAPER:-}" \
+              "${HOME:-}/.pi/agent/scripts/disk-reaper.sh" \
+              "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/disk-reaper.sh"; do
+    [ -n "$cand" ] && [ -f "$cand" ] && { _dr="$cand"; break; }
+  done
+  if [ -z "$_dr" ]; then
+    say "⛔ DISK REAPER NOT INSTALLED — no disk-reaper.sh found (\$DISK_REAPER, \$HOME/.pi/agent/scripts, beside this script); the uv caches, dead lane venvs and merged worktrees are unbounded"
+  else
+    _drs="$(bash "$_dr" --print-status 2>/dev/null)"; _drc=$?
+    _dst="$(printf '%s\n' "$_drs" | sed -n 's/^status=//p' | head -1)"
+    _det="$(printf '%s\n' "$_drs" | sed -n 's/^detail=//p' | head -1)"
+    if [ "$_drc" -eq 0 ]; then
+      say "disk reaper: last pass $(printf '%s\n' "$_drs" | sed -n 's/^iso=//p' | head -1) ($(printf '%s\n' "$_drs" | sed -n 's/^age_seconds=//p' | head -1)s ago) mode=$(printf '%s\n' "$_drs" | sed -n 's/^mode=//p' | head -1) freed $(printf '%s\n' "$_drs" | sed -n 's/^freed_mb=//p' | head -1)MB (uv=$(printf '%s\n' "$_drs" | sed -n 's/^freed_mb_uv=//p' | head -1)MB venv=$(printf '%s\n' "$_drs" | sed -n 's/^freed_mb_venv=//p' | head -1)MB worktree=$(printf '%s\n' "$_drs" | sed -n 's/^freed_mb_worktree=//p' | head -1)MB)"
+    elif [ "$_dst" = "never" ]; then
+      say "⛔ DISK REAPER HAS NEVER RUN — installed but no pass recorded ($_det); start it: sudo systemctl start eldato-disk-reaper.service"
+    else
+      say "⛔ DISK REAPER NOT HEALTHY — status=${_dst:-unknown} rc=$(printf '%s\n' "$_drs" | sed -n 's/^rc=//p' | head -1) last=$(printf '%s\n' "$_drs" | sed -n 's/^iso=//p' | head -1): ${_det:-no detail}"
+      say "    per class: uv=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_uv=//p' | head -1) venv=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_venv=//p' | head -1) worktree=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_worktree=//p' | head -1)"
+    fi
+  fi
   # the loop's own view of itself
   tail -3 "$O/logs/orch-loop.log" 2>/dev/null | sed 's/^/  /' || say "  (no orch-loop.log yet)"
   say "lanes: $(tmux ls 2>/dev/null | grep -c '^lane-')"
@@ -1688,6 +1728,37 @@ cmd_apply() {
   say "  record: $STAMP"
 }
 
+# ── the lane-venv reaper this cell delegates to (agent-infra#1932) ────────────────────────────────
+# Resolved from the harness checkout (`$HARNESS/..` is the agent-infra `scripts/` dir), then the farm.
+# Returns non-zero when it cannot be found, and the CALLER KEEPS the venv in that case: a fallback to
+# `rm -rf` is exactly the defect this replaced, so there is deliberately no fallback.
+venv_reaper_path() {
+  local c
+  for c in "$HARNESS/../reap-lane-venvs.sh" "${HOME:-}/.pi/agent/scripts/reap-lane-venvs.sh" \
+           "${AGENT_INFRA_PATH:-}/scripts/reap-lane-venvs.sh"; do
+    [ -n "$c" ] && [ -f "$c" ] && { printf '%s\n' "$c"; return 0; }
+  done
+  return 1
+}
+
+# reclaim_lane_venvs <repo> — run the GC over that repo's worktrees. Prints the reaper's own report
+# (including the KEPT list and the evidence for each keep). Exit statuses are NOT propagated: a
+# fail-closed abort (3) leaves every env in place, which is the safe outcome for `prune`, and a
+# `prune` that died because one probe was unavailable would leave the rest of the reclaim undone.
+reclaim_lane_venvs() {
+  local repo="$1" reaper mb_before mb_after
+  [ -n "$repo" ] && [ -d "$repo" ] || return 0
+  mb_before="$(free_mb "$CELL_HOME")"
+  if ! reaper="$(venv_reaper_path)"; then
+    say "prune: warn: reap-lane-venvs.sh not found (harness \$HARNESS, ~/.pi/agent/scripts, \$AGENT_INFRA_PATH) — every worktree .venv is KEPT. A blind rm here would delete a live lane's env; that is what #1932 removed."
+    return 0
+  fi
+  bash "$reaper" --gc --repo "$repo" --apply || say "prune: warn: the lane-venv reaper exited $? — any env it could not prove dead was kept (it fails closed)"
+  mb_after="$(free_mb "$CELL_HOME")"
+  [ -n "$mb_before" ] && [ -n "$mb_after" ] && say "prune: lane venvs: free ${mb_before}MB → ${mb_after}MB"
+  return 0
+}
+
 # ── prune: reclaim the disk the lanes regenerate (agent-infra#1745) ───────────────────────────────
 # MEASURED 2026-10-15: the live cell's /dev/root was 30G/32G used with 111MB free, and the controller
 # log carried `No space left on device` from claims.sh and orch-loop.sh. The single largest consumer
@@ -1700,10 +1771,18 @@ rm_cache() {
 }
 
 # Regenerable caches at ONE worktree root. `--maxdepth 5` keeps the pycache sweep bounded.
+# ⛔ `.venv` IS DELIBERATELY ABSENT (agent-infra#1932). It is not an anonymous cache: it belongs to the
+# lane that ran `uv sync` in this worktree, and deleting a LIVE lane's env breaks it mid-test. Reclaiming
+# it therefore needs a liveness proof, which this function does not have and must not approximate —
+# `reclaim_lane_venvs()` above is the only caller of the only tool allowed to delete one. The remaining
+# entries are pure build/test cache with no owner. `node_modules` is arguably in the SAME class as
+# `.venv` once a lane's dev server holds it — but it is NOT on the measured 7.3 GB, and widening this
+# change to cover it would need its own liveness proof and its own review; it stays as it was, visibly,
+# rather than being silently folded in here.
 sweep_root_caches() {
   local root="$1"
   [ -d "$root" ] || return 0
-  rm_cache "$root/.venv"; rm_cache "$root/node_modules"; rm_cache "$root/.pytest_cache"
+  rm_cache "$root/node_modules"; rm_cache "$root/.pytest_cache"
   find "$root" -maxdepth 5 -type d -name __pycache__ -prune -exec rm -rf {} + 2>/dev/null || true
 }
 
@@ -1837,6 +1916,11 @@ cmd_prune() {
   for r in "$REPO" "$HARNESS_REPO"; do
     [ -n "$r" ] || continue
     git -C "$r" rev-parse --git-dir >/dev/null 2>&1 || continue
+    # (0b) LANE VENVS (agent-infra#1932). Delegated, per repo, and the ONLY thing in this verb that
+    # touches a `.venv`: the reaper needs the liveness proof this file cannot make, and it reports every
+    # removal AND every keep with the evidence that decided it. It runs before the anonymous caches so a
+    # fail-closed abort (unreadable probe) is visible in the same report.
+    reclaim_lane_venvs "$r"
     # (1) ⛔ NO bare `git worktree prune` — the call this repo forbids (#1141) and this very file
     # states the ban against ~500 lines above. It has no path filter and deregisters EVERY record
     # whose working directory is missing, unrelated siblings included; for a DETACHED worktree the

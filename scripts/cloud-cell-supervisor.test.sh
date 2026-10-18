@@ -110,6 +110,10 @@ make_ai_repo() {
   printf '#!/bin/bash\nexit 0\n' > "$AI/scripts/record-review.sh"
   mkdir -p "$AI/scripts/lib"
   printf '#!/usr/bin/env python3\n' > "$AI/scripts/lib/diff-normalize.py"
+  # #1932: `prune` delegates a worktree `.venv` to this reaper, so the fixture checkout carries the
+  # REAL script — a fixture without it would make every prune arm pass for the wrong reason ("reaper
+  # not found, so nothing was removed"), which is exactly the vacuous shape this suite avoids.
+  cp "$HERE/reap-lane-venvs.sh" "$AI/scripts/reap-lane-venvs.sh"
   git -C "$AI" add -A
   git -C "$AI" commit -q -m base
   git -C "$AI" branch -M main
@@ -1038,25 +1042,45 @@ fetch_prov apply
 # detached sessions and `stop` kills only the controller — so a `merge-*` worker can still be running
 # when `start` runs, and `cmd_prune --caches` would delete the `.venv` under it.
 say_case "start does not auto-prune caches while worker sessions run (#1745)"
+# ⛔ THE MARKER MOVED OFF `.venv` (agent-infra#1932). A per-worktree `.venv` is no longer swept blindly
+# by this path at all — its only deleter is reap-lane-venvs.sh, which needs proof that no lane is alive
+# — so "the venv survived" can no longer distinguish "the guard held" from "the sweep never ran".
+# `node_modules` is still in the blind sweep and is the same hazard (a live dev server holds it), so
+# it is the non-vacuity marker: it must be PRUNED only when no worker session is live. The `.venv`
+# arms stay as the #1932 assertion — it survives in BOTH cases.
 PH="$(cat "$P/home/.harness-path" 2>/dev/null)"
-mkdir -p "$P/repo/.venv"; printf 'x\n' > "$P/repo/.venv/marker"
+mkdir -p "$P/repo/.venv" "$P/repo/node_modules"; printf 'x\n' > "$P/repo/.venv/marker"
 PROV_TMUX_SESSIONS='merge-42: 1 windows (created Thu Oct 15 21:00:00 2026) (group merge-42)' \
   PPATH="$P/prunebin" prov start
-[ -d "$P/repo/.venv" ] && ok "start did NOT prune caches while a worker session is live" \
-                       || bad "start pruned a LIVE worker's .venv (the unattended path)"
+[ -d "$P/repo/node_modules" ] && ok "start did NOT prune caches while a worker session is live" \
+                             || bad "start pruned a LIVE worker's cache (the unattended path)"
+[ -d "$P/repo/.venv" ] && ok "the lane's .venv survived (it is not this sweep's to delete, #1932)" \
+                       || bad "start deleted a .venv — the blind sweep is back"
+case "$PROV_OUT" in
+  *"worker sessions are still running"*) ok "the unattended path said WHY it stood down" ;;
+  *) bad "the stand-down is unexplained — $PROV_OUT" ;;
+esac
 unset PROV_TMUX_SESSIONS
-rm -rf "$P/repo/.venv"; mkdir -p "$P/repo/.venv"; printf 'x\n' > "$P/repo/.venv/marker"
+rm -rf "$P/repo/.venv" "$P/repo/node_modules"; mkdir -p "$P/repo/.venv" "$P/repo/node_modules"
+printf 'x\n' > "$P/repo/.venv/marker"
 PPATH="$P/prunebin" prov start
-[ -d "$P/repo/.venv" ] && bad "start did not prune even with no worker running (the arm is vacuous)" \
-                       || ok "start still auto-prunes caches when no worker session is live (non-vacuous)"
+[ -d "$P/repo/node_modules" ] && bad "start did not prune even with no worker running (the arm is vacuous)" \
+                             || ok "start still auto-prunes caches when no worker session is live (non-vacuous)"
+[ -d "$P/repo/.venv" ] && ok "the main checkout's .venv is KEPT by the unattended path too" \
+                       || bad "the unattended path deleted a .venv"
+case "$PROV_OUT" in
+  *KEEP*) ok "the venv decision was REPORTED, not a silent non-delete" ;;
+  *) bad "no KEEP line about the venv — the decision is invisible" ;;
+esac
 # ⛔ NON-VACUOUS for the pipefail hazard: the guard was `tmux ls | grep -qE`, and an early exit down a
 # pipe lets the producer take SIGPIPE — under `set -o pipefail` a MATCH then reads as no match, so the
 # unattended prune deleted a LIVE worker's .venv. A one-line stub cannot show it (it fits in the pipe
 # buffer), so this stub STREAMS: a match first, then far more than 64 KiB.
-rm -rf "$P/repo/.venv"; mkdir -p "$P/repo/.venv"; printf 'x\n' > "$P/repo/.venv/marker"
+rm -rf "$P/repo/.venv" "$P/repo/node_modules"; mkdir -p "$P/repo/.venv" "$P/repo/node_modules"
+printf 'x\n' > "$P/repo/.venv/marker"
 PROV_TMUX_STREAM=1 PPATH="$P/prunebin" prov start
-[ -d "$P/repo/.venv" ] && ok "start does NOT auto-prune when the worker listing STREAMS (no '| grep -q' SIGPIPE fail-open)" \
-                       || bad "start pruned a LIVE worker's .venv — 'tmux ls | grep -q' took SIGPIPE and read a MATCH as no match"
+[ -d "$P/repo/node_modules" ] && ok "start does NOT auto-prune when the worker listing STREAMS (no '| grep -q' SIGPIPE fail-open)" \
+                             || bad "start pruned a LIVE worker's cache — 'tmux ls | grep -q' took SIGPIPE and read a MATCH as no match"
 unset PROV_TMUX_STREAM
 PPATH=""
 
@@ -1068,6 +1092,9 @@ PPATH=""
 # that may hold unmerged work).
 say_case "prune reclaims caches in LINKED worktrees and protects registered worktrees (#1745)"
 R="$T/prune"; mkdir -p "$R/home" "$R/scratch"
+# The reaper is resolved as `$HARNESS/../reap-lane-venvs.sh`; HARNESS is `$R/repo` in this section, so
+# the shipped script goes one level up — the fixture's shape of "the cell's agent-infra checkout".
+cp "$HERE/reap-lane-venvs.sh" "$R/reap-lane-venvs.sh"
 ai_init_repo "$R/repo"
 git -C "$R/repo" worktree add -q --detach "$R/repo-wt" HEAD
 PR_OUT=''; PR_RC=0
@@ -1075,6 +1102,7 @@ prunesup() {
   PR_OUT="$(CELL_HOME="$R/home" ENV_FILE="$R/keys.env" SESSION="ai1745-prune-$$" \
             O="$R/o" REPO="$R/repo" HARNESS_REPO="$R/repo" HARNESS_FETCH=0 HARNESS="$R/repo" \
             SCRATCH_ROOT="$R/scratch" HARNESS_PIN_DIR="$R/pin" HARNESS_PIN_FILE="$R/home/.harness-path" \
+            REAP_VENV_MIN_AGE_SECONDS="${PRUNE_VENV_MIN_AGE:-1800}" \
             bash "$SUP" prune "$@" 2>&1)"
   PR_RC=$?
 }
@@ -1082,12 +1110,27 @@ mkdir -p "$R/repo/.venv" "$R/repo-wt/.venv" "$R/repo-wt/node_modules" "$R/repo-w
 printf 'x\n' > "$R/repo/.venv/marker"; printf 'x\n' > "$R/repo-wt/.venv/marker"
 printf 'x\n' > "$R/repo-wt/sub/__pycache__/x.pyc"
 prunesup --caches
-[ -e "$R/repo-wt/.venv" ] && bad "prune --caches did NOT reach the LINKED worktree's .venv (the incident's case)" \
-                          || ok "prune --caches reclaimed the LINKED worktree's .venv"
+# ⛔ THE `.venv` ASSERTIONS ARE INVERTED ON PURPOSE (agent-infra#1932). This sweep used to `rm -rf` a
+# `.venv` at every worktree root with no idea whether its lane was alive, and THIS SUITE PINNED THAT
+# BEHAVIOUR (including the main checkout's env) — i.e. the suite was the guard on the defect. A fresh
+# `.venv` (mtime = now) is now kept by the age floor, and the main checkout is never a lane's.
+[ -e "$R/repo-wt/.venv" ] && ok "a freshly synced lane .venv SURVIVES prune --caches (age floor, #1932)" \
+                          || bad "prune --caches deleted a lane's freshly synced .venv — the blind sweep is back"
+case "$PR_OUT" in
+  *too-recent*|*KEEP*) ok "the keep is REPORTED with its reason (not a silent skip)" ;;
+  *) bad "no keep/too-recent line in the prune output — the decision is invisible" ;;
+esac
+[ -e "$R/repo/.venv" ] && ok "the MAIN checkout's .venv is never a lane's, so it survives" \
+                       || bad "prune deleted the main checkout's .venv"
 [ -e "$R/repo-wt/node_modules" ] && bad "linked-worktree node_modules survived" || ok "linked-worktree node_modules reclaimed"
 [ -e "$R/repo-wt/.pytest_cache" ] && bad "linked-worktree .pytest_cache survived" || ok "linked-worktree .pytest_cache reclaimed"
 [ -e "$R/repo-wt/sub/__pycache__" ] && bad "linked-worktree __pycache__ survived" || ok "linked-worktree __pycache__ reclaimed"
-[ -e "$R/repo/.venv" ] && bad "the main checkout's .venv survived" || ok "the main checkout is still swept too"
+# The POSITIVE arm: with the age floor lifted, the SAME env IS reclaimed through the delegated reaper —
+# so the two arms above prove a decision, not a sweep that never reaches `.venv` at all.
+rm -rf "$R/repo-wt/.venv"; mkdir -p "$R/repo-wt/.venv"; printf 'x\n' > "$R/repo-wt/.venv/marker"
+PRUNE_VENV_MIN_AGE=0 prunesup --caches
+[ -e "$R/repo-wt/.venv" ] && bad "prune --caches did not reclaim a provably-dead lane's .venv (the delegation is dead)" \
+                          || ok "prune --caches reclaims a lane .venv once the reaper can prove it is dead"
 # (ii) --scratch: a registered worktree is unmerged work and must survive; an unregistered old
 # checkout is what the flag exists to reclaim.
 git -C "$R/repo" worktree add -q --detach "$R/scratch/registered" HEAD
@@ -2119,6 +2162,55 @@ case "$Y_OUT" in
 esac
 [ -f "$Y/started" ] && bad "start: created a session anyway" || ok "start: created no session"
 kill -9 "$Y_PEER" 2>/dev/null; wait "$Y_PEER" 2>/dev/null
+
+# ── §(n) the disk reaper's pass record is REPORTED, and failure is never silence (#2032) ────────
+say_case "status reports the scheduled disk reaper's last pass, and a failed/absent pass is a warning (#2032)"
+DR="$T/diskreaper"; mkdir -p "$DR/home/.pi/agent/state" "$DR/o/state" "$DR/repo"
+git init -q "$DR/repo" 2>/dev/null || bad "fixture: cannot git init $DR/repo"
+dr_sup() { # the SAME supervisor, pointed at this fixture's state dir
+  HOME="$DR/home" CELL_HOME="$DR/home" ENV_FILE="$DR/keys.env" SESSION="ai2004-$$" \
+    O="$DR/o" REPO="$DR/repo" DISK_REAPER_STATE_DIR="$DR/home/.pi/agent/state" \
+    bash "$SUP" status 2>&1
+}
+# (1) installed but never run: absence must be a ⛔, not a blank line that reads as health
+rm -f "$DR/home/.pi/agent/state/disk-reaper.status"
+OUT="$(dr_sup)"
+case "$OUT" in
+  *"DISK REAPER HAS NEVER RUN"*) ok "status: a reaper that never ran is reported, not omitted" ;;
+  *) bad "status: no warning for a reaper that never ran — $OUT" ;;
+esac
+# (2) a good pass: success is stated WITH the bytes freed, per class
+printf 'epoch=%s\niso=2026-10-18T17:00:00Z\nmode=apply\nok=1\nrc=0\nclasses=uv,venv,worktree\nfreed_mb=1234\nfreed_mb_uv=1000\nfreed_mb_venv=210\nfreed_mb_worktree=24\ncandidates_uv=0\nverdict_uv=ok\nverdict_venv=ok\nverdict_worktree=ok\ndetail=ok\n' "$(date +%s)" \
+  >"$DR/home/.pi/agent/state/disk-reaper.status"
+OUT="$(dr_sup)"
+case "$OUT" in
+  *"disk reaper: last pass"*"freed 1234MB"*) ok "status: reports the last pass and the bytes it freed" ;;
+  *) bad "status: does not report the reclaimed bytes — $OUT" ;;
+esac
+case "$OUT" in
+  *"uv=1000MB venv=210MB worktree=24MB"*) ok "status: breaks the reclaim down per class" ;;
+  *) bad "status: does not break the reclaim down — $OUT" ;;
+esac
+# (3) a failed pass: the ⛔ line names the class that failed, so the operator knows what did not run
+printf 'epoch=%s\niso=2026-10-18T17:00:00Z\nmode=apply\nok=0\nrc=3\nclasses=uv,venv,worktree\nfreed_mb=8\nfreed_mb_uv=0\nfreed_mb_venv=8\nfreed_mb_worktree=0\ncandidates_uv=0\nverdict_uv=ok\nverdict_venv=ok\nverdict_worktree=fail-closed\ndetail=pi-reap-worktrees.sh exited 3\n' "$(date +%s)" \
+  >"$DR/home/.pi/agent/state/disk-reaper.status"
+OUT="$(dr_sup)"
+case "$OUT" in
+  *"DISK REAPER NOT HEALTHY"*"worktree"*) ok "status: a failed pass is a ⛔ that names the failed class" ;;
+  *) bad "status: a failed pass is not surfaced — $OUT" ;;
+esac
+case "$OUT" in
+  *"worktree=fail-closed"*) ok "status: the per-class verdict is printed, not summarised away" ;;
+  *) bad "status: the failed class is not named — $OUT" ;;
+esac
+# (4) a STALE record (a timer that stopped firing) is not reported as healthy
+printf 'epoch=%s\niso=2026-10-17T00:00:00Z\nmode=apply\nok=1\nrc=0\nclasses=uv\nfreed_mb=5\nfreed_mb_uv=5\nfreed_mb_venv=0\nfreed_mb_worktree=0\nverdict_uv=ok\ndetail=ok\n' "$(( $(date +%s) - 86400 ))" \
+  >"$DR/home/.pi/agent/state/disk-reaper.status"
+OUT="$(dr_sup)"
+case "$OUT" in
+  *"DISK REAPER NOT HEALTHY"*"stale"*) ok "status: a stale pass record (timers stopped) is a ⛔, not health" ;;
+  *) bad "status: a day-old record still reads healthy — $OUT" ;;
+esac
 
 trap 'ai1711_cleanup; [ -n "${AI1761_PIDS:-}" ] && kill -9 $AI1761_PIDS 2>/dev/null; rm -rf "$T"' EXIT
 

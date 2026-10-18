@@ -734,6 +734,14 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     overrides: ['REAP_WT_AGED_DAYS="$2"'],
   },
   {
+    name: "REAP_WT_MERGED_AGE_DAYS",
+    owners: ["scripts/pi-reap-worktrees.sh"],
+    value: "${REAP_WT_MERGED_AGE_DAYS:-0}",
+    axis: "retention",
+    guardedBy: NONE,
+    note: "#2032 — the age floor applied to a MERGED worktree head (default 0: merged is reclaimed the same day, because the merge is the proof the work landed and the tree is separately required to be clean). It REPLACES REAP_WT_AGED_DAYS for that row only; an UNMERGED head keeps the blanket floor, where age still separates a stale scratch checkout from work in progress. Set it equal to REAP_WT_AGED_DAYS to restore the pre-exemption behaviour. Without it the measured biggest reclaimable checkout on cell-3 (5.7 GB, merged, clean, holder-free) was held for a week while the box sat at 87% used: the merge proves the work landed, and the tree is separately required to be clean, so age has nothing left to protect. Without it the measured biggest reclaimable checkout on cell-3 (5.7 GB, merged, clean, holder-free) was held for a week while the box sat at 87% used. An UNMERGED head keeps the blanket floor — there age still separates a stale scratch checkout from work in progress. 0 restores the pre-exemption behaviour, so the exemption is visible and reversible rather than baked in.",
+  },
+  {
     name: "REAP_WT_MAX_DAYS",
     owners: ["scripts/pi-reap-worktrees.sh"],
     value: "${REAP_WT_MAX_DAYS:-1000000}",
@@ -753,6 +761,24 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     value: "${REAP_WT_LOCK_STALE_SECONDS:-1800}",
     axis: "retention",
     guardedBy: NONE,
+  },
+  {
+    name: "VENV_MIN_AGE",
+    owners: ["scripts/disk-reaper.sh"],
+    value: "${DISK_REAPER_VENV_MIN_AGE:-1800}",
+    axis: "retention",
+    guardedBy: NONE,
+    overrides: ['VENV_MIN_AGE="$2"'],
+    note: "#2032 — the entry point's pass-through of the venv GC age floor to its owner (reap-lane-venvs.sh, whose own REAP_VENV_MIN_AGE_SECONDS is registered above). It exists here so the scheduled cell pass can tune the floor WITHOUT editing the owner, and it is registered because a floor that only the scheduler knows about is invisible to the audit that exists to notice exactly that. Unset means the owner's 1800 s.",
+  },
+  {
+    name: "REAP_VENV_MIN_AGE_SECONDS",
+    owners: ["scripts/reap-lane-venvs.sh"],
+    value: "${REAP_VENV_MIN_AGE_SECONDS:-1800}",
+    axis: "retention",
+    guardedBy: NONE,
+    overrides: ['REAP_VENV_MIN_AGE_SECONDS="${1:-}"'],
+    note: "#1932 — the GC-only age FLOOR on a lane venv (30 min): a venv whose newest mtime is younger is KEPT regardless of liveness, so a lane that has not yet started work cannot lose its env to a sweep that ran between its `uv sync` and its first command. It is a floor, never a rule — the delete decision is the three live witnesses, and liveness outranks age in BOTH directions (a venv older than the floor is still kept while any witness names a holder). The `--worktree` (lane-exit) mode bypasses it by construction: there the caller declares the lane dead. The floor is registered rather than exempted because it IS a retention bound in the same family as REAP_WT_* above, and a reader must be able to see it move.",
   },
   // — heartbeat axis: the laptop-only orchestrator heartbeat's lane-classifier
   //   bounds (scripts/orchestrator-heartbeat.sh, landed from the laptop layer in
