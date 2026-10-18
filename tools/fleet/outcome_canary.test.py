@@ -110,50 +110,6 @@ def assert_raises(fn, what):
     raise AssertionError(what)
 
 
-def run_cli(args, module=MODULE, env=None):
-    e = dict(os.environ)
-    e.update(env or {})
-    p = subprocess.run([sys.executable, module] + list(args), capture_output=True, text=True,
-                       env=e, timeout=180)
-    return p.returncode, p.stdout, p.stderr
-
-
-def read_capture(d):
-    out = {}
-    if not os.path.isdir(d):
-        return out
-    for f in sorted(os.listdir(d)):
-        if f.endswith(".txt"):
-            with open(os.path.join(d, f)) as fh:
-                out[f] = fh.read()
-    return out
-
-
-def assert_raises(fn, what):
-    try:
-        fn()
-    except AssertionError:
-        return
-    except Exception as exc:
-        raise AssertionError("%s raised %s: %s" % (what, type(exc).__name__, exc))
-    raise AssertionError(what)
-
-
-def _code_only(src):
-    """The source with comments and string literals removed (kept for the analysis above; the
-    launchctl guard uses quoted-form matching because a forbidden token lives INSIDE a literal)."""
-    import io
-    import tokenize
-    keep = []
-    for tok in tokenize.generate_tokens(io.StringIO(src).readline):
-        if tok.type in (tokenize.STRING, tokenize.COMMENT):
-            continue
-        keep.append(tok.string)
-    return " ".join(keep)
-
-
-
-
 # ════════════════════════════════════════════════════════════════════════════════════════════════
 # 1. The predicates — one test per outcome, and per "absent" / "stale" / "unevaluable" variant
 # ════════════════════════════════════════════════════════════════════════════════════════════════
@@ -1589,6 +1545,7 @@ def test_capture_never_writes_the_default_state_path():
     a.window_min = a.pr_window_min = a.mem_floor_mb = a.disk_floor_gb = None
     a.pool_threshold = None
     a.controller_ws = None
+    a.controller_name = None
     a.state_path = None
     a.capture_dir = os.path.join(tempfile.mkdtemp(prefix="oc-cap-"), "cap")
     cfg = m.cfg_from_args(a)
@@ -2380,6 +2337,123 @@ def test_pr_merged_abstains_when_the_activity_input_is_unread():
     got2 = dict((v.name, v) for v in m.evaluate(facts2, cfg))
     assert got2["pr_merged"].variant == "NO_PR_MERGED", (got2["pr_merged"].status,
                                                          got2["pr_merged"].variant)
+
+
+@test
+def test_an_ABSENT_pids_key_is_not_an_EMPTY_process_table():
+    """`pids = ctrl.get("pids") or []` collapsed "the read returned no list" into "nothing is
+    running" — and CONTROLLER_ABSENT is the ONE verdict that fires `launchctl kickstart -k`. A
+    partially-written facts payload (`{"controller": {"ok": true}}`) therefore reached CONTROLLER_ABSENT
+    with the process table never read, and the re-measure could not save it: the fingerprint carried
+    the same broken probe. `pane_daemon` guards this exact shape; the check that RESPAWNS did not."""
+    m = load()
+    cfg = m.cfg_from_dict({})
+    d = fx("controller-absent")
+    d["facts"]["controller"] = {"ok": True}          # ok, but no `pids` key at all
+    d["facts"].pop("launchd", None)
+    v = [x for x in m.evaluate(d["facts"], cfg) if x.name == "controller_cycling"][0]
+    assert (v.status, v.variant) == (m.INCONCLUSIVE, "PROCESS_TABLE_UNREADABLE"), (v.status,
+                                                                                   v.variant)
+    assert v.variant not in m.RESPAWN_TRIGGERS, v.variant
+    # …and a MEASURED zero is still the absence it says it is
+    d["facts"]["controller"] = {"ok": True, "pids": []}
+    v2 = [x for x in m.evaluate(d["facts"], cfg) if x.name == "controller_cycling"][0]
+    assert v2.variant in m.RESPAWN_TRIGGERS, v2.variant
+
+
+@test
+def test_the_RESPAWN_re_measure_refuses_an_absent_pids_list():
+    """The action path's fingerprint read the same broken probe, so `kickstart -k` could run against
+    a controller it could not see. The fingerprint now carries `pids_ok` and the action refuses on it."""
+    m = load()
+
+    class Blind(object):
+        remote = False
+        box = "local"
+
+        def __init__(self):
+            self.ran = []
+
+        def snapshot_controller(self):
+            return {"ok": True}        # no `pids` key
+
+        def log_stat(self):
+            return {"exists": True, "mtime": 1000, "age_s": 5.0}
+
+        def sh_argv(self, argv, timeout=None):
+            self.ran.append(argv)
+            return 0, ""
+
+    fm = Blind()
+    v = m.V("controller_cycling", m.FAIL, "CONTROLLER_ABSENT", "e")
+    rr = m.attempt_respawn(v, m.Cfg(), fm, dry_run=False, poll_deadline_s=0.1)
+    assert rr["attempted"] is False, rr
+    assert fm.ran == [], "no launchctl command may run when the process table was not returned"
+
+
+@test
+def test_a_MALFORMED_rollup_ENTRY_is_unprobed_not_RED():
+    """`rollup_is_green` returned False for a non-dict entry — a POSITIVE claim ("this PR's CI is red")
+    about an entry it could not parse. `landers` then filed the PR under known-not-landable `:red`,
+    so a CLEAN, APPROVED, UNARMED PR produced PASS/NOTHING_GREEN and exit 0: exactly the silent expiry
+    the check exists to catch. An unreadable ENTRY abstains like an unreadable SURFACE."""
+    m = load()
+    green = {"name": "ci", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"}
+    assert m.rollup_is_green([green]) is True
+    assert m.rollup_is_green([]) is None
+    assert m.rollup_is_green([green, None]) is None, "an unreadable entry must abstain"
+    # …an entry that PARSES but has no conclusion yet is "not green" (deliberate: in flight is not a
+    # pass), which `landers` counts as not-landable — disclosed in the doc, never a green
+    assert m.rollup_is_green([green, {"name": "ci2"}]) is False
+    # …and it must reach `landers` as unprobed, never as a red skip
+    cfg = m.cfg_from_dict({"repo": "o/r"})
+    v = m.check_landers({"github": {"ok": True, "source": "graphql", "open_pr_count": 1,
+                                   "open_prs": [
+        {"number": 7, "merge_state": "CLEAN", "checks_green": m.rollup_is_green([green, None]),
+         "armed": False, "review": "APPROVED", "probed": True, "draft": False}]}}, cfg)
+    assert v.variant != "GH_UNREADABLE", v.evidence
+    assert v.status == m.INCONCLUSIVE, (v.status, v.variant, v.evidence)
+    assert v.variant == "PARTIAL_POPULATION", v.variant
+
+
+@test
+def test_an_UNDISCLOSED_surface_does_not_claim_gh_was_UNREADABLE():
+    """`source` is optional in a github payload, so every `--static`/`--facts` report printed
+    "surface: none (gh unreadable)" inside PASS blocks — a claim contradicted by the verdict on the
+    line above it."""
+    m = load()
+    gh = {"ok": True, "open_pr_count": 0, "open_prs": [], "prs_created_in_window": 1,
+          "prs_merged_in_window": 1}
+    for name in ("pr_created", "pr_merged"):
+        v = (m.check_pr_created if name == "pr_created" else m.check_pr_merged)({"github": gh},
+                                                                                m.Cfg())
+        assert v.status == m.PASS, (name, v.status, v.variant)
+        assert "unreadable" not in v.evidence, (name, v.evidence)
+        assert "not disclosed" in v.evidence, (name, v.evidence)
+
+
+@test
+def test_an_UNKNOWN_probe_in_skip_is_a_usage_error_not_a_silent_no_op():
+    """`--skip githbu` was dropped with no error, no report line and no `not_evaluated` entry: the
+    operator believed a probe was suppressed and the run neither suppressed it nor said so."""
+    m = load()
+    rc, out, err = run_cli(["--static", "--skip", "githbu"])
+    assert rc == 3, (rc, out[-400:], err[-400:])
+    assert "unknown probe" in err.lower(), err[-400:]
+    rc2, _, err2 = run_cli(["--static", "--skip", "github"])
+    assert rc2 == 0, (rc2, err2[-400:])
+
+
+@test
+def test_the_CANARY_config_discloses_WHICH_pane_it_would_message():
+    """`--controller-name` was read straight from argparse and never reached `Cfg`, so two runs that
+    message two different panes emitted byte-identical config blocks."""
+    m = load()
+    a = m.build_parser().parse_args(["--static", "--controller-name", "ORCHESTRATOR"])
+    cfg = m.cfg_from_args(a)
+    assert cfg.controller_name == "ORCHESTRATOR", cfg.controller_name
+    assert cfg.as_json()["controller_name"] == "ORCHESTRATOR", cfg.as_json()
+    assert "controller_name" in m.Cfg.FIELDS, m.Cfg.FIELDS
 
 
 @test
@@ -3853,6 +3927,31 @@ def test_source_never_contains_a_forbidden_launchctl_form():
 
 MUTATIONS = [
     # (label, old, new, paired test)
+    # ── cycle-25 defects ──────────────────────────────────────────────────────────────────
+    ("an absent pids key is graded as an empty process table",
+     '    raw_pids = ctrl.get("pids")',
+     '    raw_pids = ctrl.get("pids") or []',
+     "test_an_ABSENT_pids_key_is_not_an_EMPTY_process_table"),
+    ("the respawn re-measure accepts an absent pids list",
+     '    if before.get("pids_ok") is not True:',
+     "    if False:",
+     "test_the_RESPAWN_re_measure_refuses_an_absent_pids_list"),
+    ("a malformed rollup entry is called red",
+     "        if not isinstance(chk, dict):\n            return None",
+     "        if not isinstance(chk, dict):\n            return False",
+     "test_a_MALFORMED_rollup_ENTRY_is_unprobed_not_RED"),
+    ("an undisclosed surface is reported as a failed read",
+     '        else "surface: not disclosed by this payload"',
+     '        else "surface: none (gh unreadable)"',
+     "test_an_UNDISCLOSED_surface_does_not_claim_gh_was_UNREADABLE"),
+    ("a typo in --skip is a silent no-op",
+     "    unknown_skip = [x for x in skip if x and x not in SKIPPABLE]",
+     "    unknown_skip = []",
+     "test_an_UNKNOWN_probe_in_skip_is_a_usage_error_not_a_silent_no_op"),
+    ("--controller-name is not disclosed",
+     '            "controller_name": self.controller_name,',
+     '            "controller_name": None,',
+     "test_the_CANARY_config_discloses_WHICH_pane_it_would_message"),
     # ── cycle-24 defects ──────────────────────────────────────────────────────────────────
     ("a failed tail is graded as an empty log",
      '        tail_ok = rc2 == 0',

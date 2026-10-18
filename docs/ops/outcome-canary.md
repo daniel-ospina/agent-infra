@@ -227,8 +227,8 @@ shape changes, and it is pruned with the rest of its check.
 ## The suite
 
 ```bash
-python3 tools/fleet/outcome_canary.test.py              # 145 tests
-python3 tools/fleet/outcome_canary.test.py --mutations  # 142 mutations, each must go RED
+python3 tools/fleet/outcome_canary.test.py              # 151 tests
+python3 tools/fleet/outcome_canary.test.py --mutations  # 148 mutations, each must go RED
 ```
 
 The signal tests drive the **real CLI** end-to-end (`--live --facts … --capture-dir …`), so what is
@@ -349,6 +349,25 @@ Six more (cycle 13), each a case where a datum the tool held was not the one it 
   is missing or unparsable — was graded `READABLE` with the age printed as `UNKNOWN`. An unaged one is
   `STATE_FROZEN`, and a known-and-old non-empty read is `READABLE_STALE` (see below) — it is legible,
   and it is not current.
+- **An absent `pids` KEY is not an empty process table.** `controller_cycling` read
+  `ctrl.get("pids") or []`, so a payload with no `pids` list graded `FAIL / CONTROLLER_ABSENT` — the
+  one verdict that fires `launchctl kickstart -k` — on a process table that was never returned, and
+  the re-measure could not save it because the fingerprint carried the same broken probe. It is now
+  `INCONCLUSIVE / PROCESS_TABLE_UNREADABLE`, the action path refuses on an absent list
+  (`pids_ok`), and a measured `[]` is still the absence it says it is.
+- **An unreadable rollup ENTRY is unprobed, not red.** A non-dict entry in the rollup returned
+  `False` — a positive claim that a PR's CI is red — so `landers` filed a CLEAN, APPROVED, UNARMED PR
+  under the known-not-landable skips and returned `PASS / NOTHING_GREEN`, which is the silent expiry
+  this check exists to catch. An unreadable entry now abstains exactly like an unreadable surface
+  (`PARTIAL_POPULATION`). (An entry that PARSES but has no conclusion is still "not green": in flight
+  is not a pass, so the PR is not yet landable — the skip line's `:red` over-reads that, and the
+  verdict does not.)
+- **`--skip` refuses an unknown probe (exit 3).** `--skip githbu` was dropped silently: the operator
+  believed a probe was suppressed and the run neither suppressed it nor said so. `--only` already
+  refused unknown names; `--skip` now does, against the same kind of closed list (`SKIPPABLE`).
+- **`--no-notify` suppresses MESSAGES only.** Its help said "evaluate only", which an operator reads
+  before silencing alerts on a live box — and the respawn still fired. The action is governed by
+  `--no-respawn` alone, and the help now says so.
 - **An unreadable log is not an empty log.** `read_log` discarded the `tail` exit status, so a log
   whose content could not be read (EACCES, TCC, a timed-out remote exec) came back with a fresh mtime
   and no lines, and `controller_cycling` graded that pair `FAIL / LOG_NO_CYCLE` — "the log IS

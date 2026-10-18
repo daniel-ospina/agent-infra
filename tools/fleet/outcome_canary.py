@@ -124,6 +124,9 @@ FAIL = "FAIL"
 INCONCLUSIVE = "INCONCLUSIVE"
 
 # ── the checks, in report order ──────────────────────────────────────────────────────────────────
+# The probes `--skip` may name — one, deliberately small list. A typo used to be a silent no-op.
+SKIPPABLE = ("github",)
+
 CHECK_ORDER = [
     "controller_cycling",
     "queue_readable",
@@ -223,6 +226,9 @@ class Cfg(object):
         "log_path": None,
         "box": "local",
         "controller_ws": None,
+        # WHICH pane is named as the controller — part of explaining a verdict, like `controller_ws`:
+        # two runs that message two different panes emitted byte-identical config blocks without it.
+        "controller_name": None,
         "state_path": None,
     }
 
@@ -241,6 +247,7 @@ class Cfg(object):
         "log_path",
         "box",
         "controller_ws",
+        "controller_name",
         "state_path",
     )
 
@@ -299,6 +306,7 @@ class Cfg(object):
             "log_path": self.log_path,
             "state_path": self.state_path,
             "controller_ws": self.controller_ws,
+            "controller_name": self.controller_name,
         }
 
 
@@ -735,7 +743,22 @@ def _age_txt(age):
 
 def check_controller_cycling(f, c):
     ctrl = (f.get("controller") or {})
-    pids = ctrl.get("pids") or []
+    # ⛔ AN ABSENT `pids` KEY IS A MISSING READ, NOT AN EMPTY PROCESS TABLE. `or []` collapsed the
+    # two, and `CONTROLLER_ABSENT` is the one verdict that fires `launchctl kickstart -k`: an injected
+    # or partially-written facts payload (`{"controller": {"ok": true}}`, or a `--facts` file derived
+    # from a fixture) reached CONTROLLER_ABSENT with the process table never read, and the
+    # re-measure guard could not stop it because the fingerprint read the same broken probe. A
+    # measured ZERO is a list (`[]`); anything else is unread. Allow-list polarity, as in
+    # `pane_daemon`/`landers`.
+    raw_pids = ctrl.get("pids")
+    if ctrl.get("ok") is True and not isinstance(raw_pids, list):
+        return V("controller_cycling", INCONCLUSIVE, "PROCESS_TABLE_UNREADABLE",
+                 "controller probe: ok=True but no `pids` LIST — the process table was not "
+                 "returned (%r)" % (raw_pids,),
+                 "an absent process list is not a census of zero: whether a controller is running "
+                 "cannot be told from it, and this is the one verdict that respawns. Not green, "
+                 "and NOT an absence.")
+    pids = raw_pids if isinstance(raw_pids, list) else []
     launchd = f.get("launchd") or {}
     log = f.get("log") or {}
     hb = f.get("heartbeat") or {}
@@ -1482,8 +1505,12 @@ def _activity(f, window_s=None, cfg=None):
 def _gh_surface_txt(gh):
     src = gh.get("source")
     note = gh.get("fallback_reason")
+    # ⛔ AN ABSENT `source` IS A MISSING DISCLOSURE, NOT A FAILED READ. `source` is optional in a
+    # github payload, so `--static`/`--facts` printed the assertion "gh unreadable" 87 times inside
+    # GREEN blocks — a claim contradicted by the verdict on the line above it. Say what is true: the
+    # surface did not disclose itself.
     txt = ("surface: %s%s" % (src, (" (%s)" % note) if note else "")) if src \
-        else "surface: none (gh unreadable)"
+        else "surface: not disclosed by this payload"
     # ⛔ WHICH READ PRODUCED THE MERGE COUNT IS PART OF THE EVIDENCE. The merge count comes from a
     # separate, merge-ordered read; when that read FAILED the count falls back to a creation-ordered
     # page and the bound is admitted. `merged_surface`/`fallback_note` were written by the collector
@@ -1840,8 +1867,13 @@ def rollup_is_green(rollup):
         return None
     attempts = {}
     for pos, chk in enumerate(rollup):
+        # ⛔ AN UNREADABLE ENTRY IS NOT A RED CHECK. `False` here is a POSITIVE claim ("this PR's CI
+        # is red") made about an entry that could not be parsed, and `check_landers` then reports the
+        # PR as "red" among the known-not-landable skips — so a green, approved, UNARMED PR produced
+        # PASS/NOTHING_GREEN and exit 0, which is the silent expiry this check exists to catch. An
+        # unreadable ENTRY abstains exactly like an unreadable SURFACE (`if not rollup: return None`).
         if not isinstance(chk, dict):
-            return False
+            return None
         attempts.setdefault(_check_key(chk), []).append((_check_rank(chk, pos), chk))
     for _key, entries in attempts.items():
         # ⛔ AN ATTEMPT IN FLIGHT MAKES ITS CHECK UNKNOWN, whatever the ordering says: a re-run that
@@ -2650,6 +2682,12 @@ def attempt_respawn(v, cfg, machine, dry_run=False, plist=None, uid=None, poll_d
                          "action, so a live controller cannot be ruled out — an unreadable read is "
                          "NOT absence (%s)" % (before.get("error") or "no error recorded"))
         return res
+    if before.get("pids_ok") is not True:
+        res["attempted"] = False
+        res["detail"] = ("NOT ATTEMPTED: the re-measure returned no `pids` LIST (ok=%r), so a live "
+                         "controller cannot be ruled out — an absent process list is not absence"
+                         % (before.get("ok"),))
+        return res
     if before.get("pids"):
         res["attempted"] = False
         res["detail"] = ("NOT ATTEMPTED: a controller appeared after the facts were collected "
@@ -2724,8 +2762,12 @@ def _controller_fingerprint(machine, cfg):
     # successful one, so the RE-MEASURE AT THE MOMENT OF ACTION degraded to "empty table = absence"
     # and `launchctl kickstart -k` ran against a live controller. `is True` makes an absent/None `ok`
     # abstain exactly like every other read in this file.
+    # `pids_ok` carries WHICH read produced the list: `attempt_respawn` refuses on it, so an absent
+    # process list at the moment of action cannot present as "nothing is running".
     return {"ok": snap.get("ok") is True,
-            "pids": [p.get("pid") for p in snap.get("pids") or []],
+            "pids_ok": isinstance(snap.get("pids"), list),
+            "pids": [p.get("pid") for p in snap.get("pids") or []
+                     if isinstance(p, dict)] if isinstance(snap.get("pids"), list) else [],
             "mtime": log.get("mtime"),
             "exists": log.get("exists"),
             "log_age_s": log.get("age_s"),
@@ -3693,7 +3735,9 @@ def build_parser():
     ap.add_argument("--fixtures-dir", default=None, help="a directory of fixtures")
     ap.add_argument("--json", action="store_true", help="machine-readable output")
     ap.add_argument("--dry-run", action="store_true", help="report only: never send, never respawn")
-    ap.add_argument("--no-notify", action="store_true", help="evaluate only; compose no messages")
+    ap.add_argument("--no-notify", action="store_true",
+                    help="compose no messages (does NOT suppress the respawn action — that is "
+                         "--no-respawn)")
     ap.add_argument("--no-respawn", action="store_true", help="never attempt a respawn")
     ap.add_argument("--verbose", action="store_true")
     return ap
@@ -3724,8 +3768,10 @@ def cfg_from_args(a):
         "o_dir": o_dir,
         "log_path": os.path.join(o_dir, "logs", "orch-loop.log"),
         "box": a.box or "local",
+        # Declared, so the field is disclosed and a caller can see what it suppressed.
         "state_path": a.state_path or default_state_path(),
         "controller_ws": a.controller_ws,
+        "controller_name": a.controller_name,
     }
     if a.repo:
         kw["repo"] = a.repo
@@ -3794,6 +3840,15 @@ def main(argv=None):
                   % (", ".join(unknown), ", ".join(CHECK_ORDER)), file=sys.stderr)
             return 3
     skip = [x.strip() for x in a.skip.split(",")] if a.skip else []
+    # ⛔ A TYPO IN `--skip` WAS A SILENT NO-OP. `--skip githbu` was dropped with no error, no report
+    # line and no `not_evaluated` entry: the operator believed a probe was suppressed and the run
+    # neither suppressed it nor said so. `--only` already refuses an unknown name (exit 3); `--skip`
+    # now does the same, and PRINTS what it suppressed.
+    unknown_skip = [x for x in skip if x and x not in SKIPPABLE]
+    if unknown_skip:
+        print("outcome-canary: unknown probe(s) in --skip: %s (skippable: %s)"
+              % (", ".join(unknown_skip), ", ".join(sorted(SKIPPABLE))), file=sys.stderr)
+        return 3
     now = time.time()
 
     if a.static:
@@ -3922,7 +3977,7 @@ def main(argv=None):
             if not ws:
                 # cmux discovery and the send must run on the LOCAL box: the socket lives here,
                 # and a remote `cmux workspace list` would answer for a different fleet.
-                ws, ws_why = find_controller_workspace(machine.local(), a.controller_name)
+                ws, ws_why = find_controller_workspace(machine.local(), cfg.controller_name)
             # ⛔ COMPOSE ONCE, BEFORE the send, extras included. The respawn outcome is known before
             # this loop, and it must be in the bytes the controller RECEIVES: the documented wiring is
             # launchd, where stdout is a log nobody reads and the message is the only channel. This
