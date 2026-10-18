@@ -616,7 +616,11 @@ if on_darwin; then
 FB="$TMP/pathbin"; mkdir -p "$FB" "$TMP/sb3/Library/LaunchAgents" "$TMP/sb3/.config" "$TMP/sb3/.pi/agent/scripts"
 for b in tmux gh pi; do printf '#!/bin/bash\nexit 0\n' > "$FB/$b"; chmod +x "$FB/$b"; done
 ln -s "$HOME/.config/gh" "$TMP/sb3/.config/gh" 2>/dev/null || true
-HOME="$TMP/sb3" O="$TMP/path-o" REPO="$HERE/../.." OR="acme/widget" PATH="$FB:/usr/bin:/bin" bash "$INST" > "$TMP/inst-path.out" 2>&1
+# ⛔ AND THE STUB MUST STAY ON *EVERY* PATH THIS FILE HANDS THE INSTALLER (review finding, T5): this
+# line used to be PATH="$FB:/usr/bin:/bin", which DROPPED $GSTUB, so install.sh's post-install banner read
+# the REAL domain (`launchctl print gui/<uid>/com.eldato.orchestrator-loop`). Read-only that day — and one
+# added mutating call away from the 2026-10-17 incident this whole file guards against.
+HOME="$TMP/sb3" O="$TMP/path-o" REPO="$HERE/../.." OR="acme/widget" PATH="$FB:$GSTUB:/usr/bin:/bin" bash "$INST" > "$TMP/inst-path.out" 2>&1
 PL3="$TMP/sb3/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
 [ -f "$PL3" ] && rc=0 || { rc=1; echo "      controlled-PATH install did not render: $(tail -3 "$TMP/inst-path.out")"; }
 ck "install.sh renders with a controlled PATH (uv absent stays non-fatal)" $rc

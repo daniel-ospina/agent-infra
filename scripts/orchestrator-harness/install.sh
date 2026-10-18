@@ -7,7 +7,8 @@
 #   ./install.sh                 # render + install (idempotent; NEVER touches a running job)
 #   ./install.sh --start         # render + install, then ensure it is running — and PROVE it
 #   ./install.sh --restart       # render + install, then bootout + bootstrap — and PROVE it
-#   ./install.sh --uninstall     # bootout + remove the plist (leaves state/logs alone)
+#   ./install.sh --uninstall     # bootout + remove the plist AND the loaded-render record (logs and the
+#                                # rest of state untouched)
 #
 # ⛔ THE LAUNCHCTL DISCIPLINE (agent-infra#1975). Every load/removal goes through launchd-cycle.sh,
 # which uses `bootout` + `enable` + `bootstrap` and NEVER `unload -w`/`load -w`: `-w` writes a
@@ -162,19 +163,23 @@ if [ "$ACTION" = uninstall ]; then
   # ⛔ AND "UNREADABLE" IS NOT "REMOVED": `lc_probe`'s 2 is a FAILED read, which says nothing about the
   # job. Folding it into "not loaded" made this loop break on the first iteration and delete the plist
   # over a live controller (review finding).
-  loaded=""; pid=""; unread=""; prc=0
+  # ⛔ AND THE VERDICT COMES FROM THE PROBE ITSELF (review finding): `prc=0` IS the proof that launchd
+  # still holds the label. Deriving the verdict from a SECOND read (`lc_loaded_path`) re-introduced the
+  # same flattening one layer down — a read that failed, or a block with no parsable `path =` line,
+  # returned empty and the plist was deleted with ✅ printed over a job launchd still had.
+  held=""; pid=""; unread=""; prc=0
   for _ in 1 2 3 4 5 6 7 8; do
     prc=0; block=""; block="$(lc_probe "$LABEL")" || prc=$?
     if [ "$prc" -eq 2 ]; then unread="$block"; break; fi
     [ "$prc" -eq 0 ] || break          # definitively not loaded: the removal holds
-    loaded="$(lc_loaded_path "$LABEL")"
-    pid="$(lc_pid "$LABEL")"
+    held=1
+    pid="$(awk '/^[[:space:]]*pid = [0-9]+$/ { print $3; exit }' <<<"$block")"
     sleep 1
   done
   if [ -n "$unread" ]; then
     die "launchd's state for $LABEL could not be read after 'launchctl bootout' (${unread:-no output}) — the removal cannot be VERIFIED, so the plist is kept at $PLIST. Next: launchctl print $(lc_domain)/$LABEL | head -20, then re-run this --uninstall"
   fi
-  if [ -n "$loaded" ]; then
+  if [ -n "$held" ]; then
     # The plist is KEPT: it is the only handle a verified removal has (and the only thing a human can
     # inspect), so destroying it here would leave the job loaded with nothing to retry against.
     die "$LABEL is STILL loaded${pid:+ (pid $pid)} after 'launchctl bootout' — NOT removed, and the plist is kept at $PLIST. Next: launchctl print $(lc_domain)/$LABEL | head -20"
@@ -182,7 +187,7 @@ if [ "$ACTION" = uninstall ]; then
   rm -f "$PLIST"
   rm -f "$O/state/launchd-loaded.sha256"
   echo "✅ Removed $LABEL (bootout; no persistent disable written)."
-  echo "   State and logs left intact: $O/{logs,state,wip}"
+  echo "   State and logs left intact apart from the loaded-render record: $O/{logs,state,wip}"
   exit 0
 fi
 
@@ -818,10 +823,18 @@ if [ "$ACTION" = "start" ] || [ "$ACTION" = "restart" ]; then
   mkdir -p "$O/state" 2>/dev/null || true
   printf '%s\n' "$RENDER_SHA" > "$LOADED_SHA_FILE" 2>/dev/null || warn "could not record the loaded render at $LOADED_SHA_FILE"
 fi
-# Read-only: what `launchctl print` says right now. Used only to make the closing text TRUE — the old
+# Read-only: what launchd says right now, TRI-STATE. Used only to make the closing text TRUE — the old
 # banner said "The loop is NOT running" unconditionally, so an operator reading it after a start had no
-# way to tell a live controller from a dead one.
-RUNNING_PID="$(lc_pid "$LABEL")"
+# way to tell a live controller from a dead one. ⛔ AND AN UNREADABLE READ IS NOT "NOT RUNNING" (review
+# finding): `lc_pid` alone returns empty for both "not loaded" and "the read failed", so the one run that
+# could not tell said the most. The block is read ONCE and the pid parsed from it.
+RUNNING_PID=""; LC_STATE=unknown; _blk=""; _prc=0
+_blk="$(lc_probe "$LABEL")" || _prc=$?
+case "$_prc" in
+  0) LC_STATE=loaded; RUNNING_PID="$(awk '/^[[:space:]]*pid = [0-9]+$/ { print $3; exit }' <<<"$_blk")" ;;
+  1) LC_STATE=absent ;;
+  *) LC_STATE=unknown ;;
+esac
 
 cat <<EOF
 
@@ -835,7 +848,7 @@ cat <<EOF
             merge_priority_at=${MERGE_PRIORITY_AT} UNOWNED open PRs
 EOF
 
-if [ -n "$RUNNING_PID" ]; then
+if [ "$LC_STATE" = "loaded" ] && [ -n "$RUNNING_PID" ]; then
   # ⛔ THE BANNER REPORTS WHAT THIS RUN ACTUALLY DID (review finding): on the "already running and
   # current — left untouched" branch the old text claimed "this run started it and PROVED it", which is
   # a process claim with no artifact behind it, and it made the honest branch indistinguishable from a
@@ -850,9 +863,16 @@ launchd not relaunching it. It was NOT restarted: the loaded job is on the curre
 EOF
       ;;
     started|restarted|reloaded)
+  # ⛔ NOT AN INLINE `$(case … esac)` IN THE HEREDOC (review finding): the `)` closing the `reloaded)`
+  # pattern ENDED the command substitution, so bash printed `syntax error near unexpected token` and
+  # substituted NOTHING — every successful start rendered `— this run  printf 'RELOADED' ;; *) printf
+  # 'started' ;; esac) it and PROVED it`. The suite passed it because its assertion looked for the
+  # KEYWORD `RELOADED`, which that garbage happens to contain: a false PASS on the one line an operator
+  # reads after a recovery. Computed first, printed second.
+  case "${LC_OUTCOME:-}" in reloaded) _did="RELOADED" ;; *) _did="started" ;; esac
   cat <<EOF
 
-The loop IS running (launchd pid $RUNNING_PID) — this run $(case "$LC_OUTCOME" in reloaded) printf 'RELOADED' ;; *) printf 'started' ;; esac) it and PROVED it: the pid exists, it is a NEW
+The loop IS running (launchd pid $RUNNING_PID) — this run $_did it and PROVED it: the pid exists, it is a NEW
 process, and $O/heartbeat advanced.
 
 EOF
@@ -866,6 +886,21 @@ EOF
       ;;
   esac
 else
+  if [ "$LC_STATE" = "loaded" ]; then
+  cat <<EOF
+
+$LABEL is LOADED but has no pid right now — that is what a KeepAlive job looks like inside its respawn
+throttle. Next: launchctl print $(lc_domain)/$LABEL | head -20
+
+EOF
+  elif [ "$LC_STATE" = "unknown" ]; then
+  cat <<EOF
+
+⛔ launchd's state for $LABEL could NOT be read, so whether the loop is running is UNKNOWN — this run
+cannot answer it. Next: launchctl print $(lc_domain)/$LABEL | head -20
+
+EOF
+  else
   cat <<EOF
 
 The loop is NOT running. Start it — and have the start PROVEN (pid + heartbeat), not assumed:
@@ -873,13 +908,14 @@ The loop is NOT running. Start it — and have the start PROVEN (pid + heartbeat
     $SELF --start
 
 EOF
+  fi
 fi
 
 # A loaded job that is not on this render with a live controller is the ONE case a plain run leaves
 # genuinely wrong, so it is said out loud rather than left for an operator to discover from a limits
 # value that never took effect. PLIST_CHANGED is 1 for STALE and for UNKNOWN — and the two must not
 # share a sentence, because only one of them is a measurement (see PLIST_STATE above).
-if [ "$ACTION" = "none" ] && [ "$PLIST_CHANGED" = "1" ] && [ -n "$RUNNING_PID" ]; then
+if [ "$ACTION" = "none" ] && [ "$PLIST_CHANGED" = "1" ] && [ "$LC_STATE" = "loaded" ]; then
   case "$PLIST_STATE" in
     stale)
   warn "the loaded job is NOT on the rendered plist and $LABEL is running (pid $RUNNING_PID) — it still uses the OLD settings"

@@ -99,7 +99,15 @@ lc_probe() {
   out="$(launchctl print "$d/$1" 2>&1)"; rc=$?
   if [ "$rc" -eq 0 ]; then printf '%s\n' "$out"; return 0; fi
   case "$out" in
-    *"Could not find"*|*"not find service"*|*"No such process"*|*"Bad request"*|*"service not found"*)
+    # ⛔ ONLY launchd's own SERVICE-level "no such service" answer counts as ABSENT — and the word
+    # SERVICE is load-bearing (review finding). launchd prints the SAME PREFIX for a DOMAIN-level
+    # rejection: `launchctl print gui/999/x` → `Bad request.` + `Could not find domain for user gui:
+    # 999`, measured on this box. That message says NOTHING about the service, so matching the bare
+    # `Could not find` read a broken domain as "definitively absent", `lc_bootout` then issued NO
+    # removal, the read-back saw an empty read, and `--uninstall` printed ✅ and deleted the plist over
+    # a job launchd still held — reachable as `sudo bash install.sh --uninstall` (id -u 0 → gui/0).
+    # `Bad request` alone and `No such process` belong to `bootout`'s race tolerance, not here.
+    *"Could not find service"*|*"not find service"*|*"service not found"*)
       return 1 ;;
   esac
   printf '%s\n' "$out"
@@ -134,6 +142,17 @@ lc_loaded_path() {
 lc_guard_mutate() {
   local label="$1" plist="${2:-}" real rc=0 home_real loaded mine theirs block prc=0
   if [ "${ELDATO_ALLOW_TEST_HOME:-}" != "1" ]; then
+    # ⛔ AN EMPTY `HOME` IS NOT THE REAL HOME, AND `cd ""` SUCCEEDS (review finding): bash's `cd ""`
+    # leaves $PWD unchanged and returns 0, so `home_real` became the CURRENT DIRECTORY — an operator
+    # standing in their own home PASSED the "this is the real home" comparison while $HOME was empty,
+    # and the run then acted in the real user domain (the plist resolves outside the account and the
+    # removal falls back to the label-keyed service-target form). Tested FIRST, before the account is
+    # even consulted: an empty HOME cannot be a real home on any platform, and on a box with no `dscl`
+    # the account read is skipped entirely — which is how this value slipped past the guard.
+    if [ -z "${HOME:-}" ]; then
+      lc_err "❌ refusing to change launchd state for $label: HOME is empty, so this run cannot be shown to be the real account. Next: run it from your own account, or for a test set ELDATO_ALLOW_TEST_HOME=1 with a launchctl stub on PATH (#446)"
+      return 1
+    fi
     real="$(lc_real_home)" || rc=$?
     if [ "$rc" -eq 1 ]; then
       # NOT the same as "no dscl on this box": the check exists to stop a sandboxed run from acting in
@@ -164,6 +183,13 @@ lc_guard_mutate() {
   fi
   loaded=""
   [ "$prc" -eq 0 ] && loaded="$(awk '/^[[:space:]]*path = /{ sub(/^[[:space:]]*path = /, ""); print; exit }' <<<"$block")"
+  # ⛔ LOADED BUT UNPARSABLE IS NOT "NO CLAIM TO CHECK" (review finding): a job registered by
+  # `launchctl submit`, or any print whose `path` line is absent, left `loaded` empty, so this guard was
+  # SKIPPED and the caller issued a LABEL-keyed bootout — the exact failure the guard exists to close.
+  if [ "$prc" -eq 0 ] && [ -n "$plist" ] && [ -z "$loaded" ]; then
+    lc_err "❌ refusing to touch $label: the job is LOADED but launchd reported no plist path for it, so it cannot be shown to be ours. Next: launchctl print $(lc_domain)/$label | head -20, and remove the foreign job by hand if it really is yours"
+    return 1
+  fi
   if [ -n "$loaded" ] && [ -n "$plist" ]; then
     mine="$(lc_canon "$plist")"
     theirs="$(lc_canon "$loaded")"
@@ -215,7 +241,10 @@ lc_bootout() {
     if diag="$(launchctl bootout "$d/$label" 2>&1)"; then return 0; fi
   fi
   case "$diag" in
-    *"Could not find"*|*"No such process"*|*"not find service"*|*"Bad request"*) return 0 ;;
+    # ⛔ NARROW, FOR THE SAME REASON AS `lc_probe` (review finding): the bare `Could not find` prefix also
+    # appears in the DOMAIN-level `Could not find domain for user gui: N`, so it converted a removal that
+    # never happened into a success. `No such process` is the one genuine already-gone race.
+    *"Could not find service"*|*"No such process"*|*"not find service"*) return 0 ;;
   esac
   lc_err "❌ launchctl bootout failed for $label (${diag:-no output}). Next: launchctl print $d/$label | head -20"
   return 1
@@ -271,6 +300,11 @@ lc_hb_age() {
 # reading must degrade to "unknown", never to a target nothing can exceed.
 lc_hb_value() {
   local v now
+  # ⛔ THE SAME `-f` GUARD `lc_hb_age` HAS, AND FOR A HARDER REASON (review finding): without it a
+  # NON-REGULAR `$O/heartbeat` BLOCKS ON OPEN, and this read happens BEFORE the start — so
+  # `install.sh --start`, the documented remedy while the controller is down, hung until it was killed:
+  # the operator's last lever, with no output at all. Measured with a FIFO at that path.
+  [ -f "$1/heartbeat" ] || { printf '0\n'; return 0; }
   v="$(tr -dc '0-9' < "$1/heartbeat" 2>/dev/null)" || v=""
   [ -n "$v" ] || { printf '0\n'; return 0; }
   now="$(date +%s)"
@@ -406,7 +440,7 @@ lc_runs() {
 # may LOWER it for a test, but only with a numeric value that is at least 1s — anything else falls back
 # to the safe default (`sleep abc` would otherwise be a zero-width window that always passes).
 lc_assert_stable() {
-  local label="$1" settle="${2:-}" floor r0 r1
+  local label="$1" settle="${2:-}" floor r0 r1 prc _b
   floor=$(( $(lc_min_runtime "$label") + 3 ))
   case "$settle" in ''|*[!0-9]*) settle="$floor" ;; esac
   [ "$settle" -ge 1 ] || settle="$floor"
@@ -417,7 +451,21 @@ lc_assert_stable() {
   fi
   sleep "$settle"
   r1="$(lc_runs "$label")"
-  if [ -n "$r1" ] && [ "$r0" != "$r1" ]; then
+  # ⛔ THE SECOND READ IS THE MEASUREMENT, SO AN EMPTY ONE IS UNKNOWN — NOT "STABLE" (review finding).
+  # `lc_runs` returns empty both when the job is gone and when `launchctl print` failed (EIO, exactly
+  # what this box does), so `[ -n "$r1" ] && …` fell through to `return 0` and CERTIFIED a crash loop
+  # whenever launchd was flaky — the one signal that separates cycling from crash-looping, failing open
+  # precisely when a relaunch is most likely. Classify it instead of folding it into "no pid".
+  if [ -z "$r1" ]; then
+    prc=0; _b=""; _b="$(lc_probe "$label")" || prc=$?
+    if [ "$prc" -eq 1 ]; then
+      lc_err "❌ refusing to certify $label: the job left the domain during the ${settle}s window (its 'runs' counter vanished), so this start is NOT proven. Next: launchctl print $(lc_domain)/$label | head -20; tail -40 ${O:-~/orchestrator}/logs/launchd.err 2>/dev/null"
+    else
+      lc_err "❌ refusing to certify $label: launchd's 'runs' counter could not be read a second time (${_b:-no output}), so 'not relaunching' is UNPROVEN. Next: launchctl print $(lc_domain)/$label | head -20"
+    fi
+    return 1
+  fi
+  if [ "$r0" != "$r1" ]; then
     lc_err "❌ $label is being RELAUNCHED (launchd runs $r0 → $r1 in ${settle}s) — it starts and dies, so a live pid and a fresh heartbeat prove nothing. Next: tail -40 ${O:-~/orchestrator}/logs/launchd.err 2>/dev/null; tail -40 ${O:-~/orchestrator}/logs/orch-loop.log"
     return 1
   fi
@@ -425,9 +473,11 @@ lc_assert_stable() {
 }
 
 # lc_foreign_controller <O> — the pid of a controller that is alive but was NOT started by launchd
-# (this box's documented state: README §9 describes `nohup … orch-loop.sh` from a session). Prints the
-# pid, or nothing. Exists so a start can REFUSE instead of manufacturing a restart storm: launchd's
-# copy exits immediately on the lock, and `KeepAlive=true` then relaunches it for as long as the
+# (one state README §9 names and explicitly warns NOT to record as a fact — read `launchctl print` and
+# `$O/.orch.lock` at the moment you care, because the box moves between launchd-owned and
+# session-owned during a single day). Prints the pid, or nothing. Exists so a start can REFUSE instead
+# of manufacturing a restart storm: launchd's copy exits immediately on the lock, and `KeepAlive=true`
+# then relaunches it for as long as the
 # foreign controller lives. `kill -0` is the only liveness test used — the lock's mere presence proves
 # nothing, because orch-loop.sh's EXIT trap is the only thing that removes it.
 lc_foreign_controller() {

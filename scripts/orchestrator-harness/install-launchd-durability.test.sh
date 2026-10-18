@@ -20,8 +20,10 @@
 #   C. lc_start: enable → bootout → bootstrap, and reports WHICH path ran
 #        the `load` fallback is what recovered the box; an operator debugging the next EIO must be
 #        told the job came up on the legacy path, not left to guess.
-#   D. lc_ensure leaves a healthy, unchanged controller ALONE
-#        a validation run that re-renders identical bytes must make zero mutating launchctl calls.
+#   D. lc_ensure leaves a healthy controller ALONE
+#        a validation run that re-renders identical bytes with a MATCHING loaded-render record
+#        (`$O/state/launchd-loaded.sha256`) must make zero mutating launchctl calls — an ABSENT record is
+#        UNKNOWN and reloads once, which §F asserts separately.
 #   E. THE CORE: no forbidden end state, ever
 #        for every start scenario the triple (running?, disabled?, exit code) is checked, and the
 #        cell "not running AND (disabled OR exit 0)" fails the suite. This is the regression the issue
@@ -48,6 +50,7 @@ HARNESS="$SCRIPT_DIR"
 INSTALL="$HARNESS/install.sh"
 LIB="$HARNESS/launchd-cycle.sh"
 README="$HARNESS/README.md"
+SELF="$HARNESS/selftest.sh"
 PLATFORM="$(uname)"
 LABEL="com.eldato.orchestrator-loop"
 
@@ -127,7 +130,49 @@ case "${1:-}" in
     # refuse. FAKE_PRINT_FAIL_UNLOADED models the same read breaking AFTER a successful removal — the
     # state that let `--uninstall` print ✅ and delete the plist over a job it could not read back.
     if [ -n "${FAKE_PRINT_FAIL:-}" ]; then printf 'Print failed: 5: Input/output error\n' >&2; exit 1; fi
+    # FAKE_PRINT_BADONLY: a diagnostic that is NOT launchd's not-found answer and NOT a parseable block.
+    # `Bad request` alone is a DOMAIN-level rejection — treating it as "absent" is how the tri-state
+    # would shrink back into the flattening it replaced.
+    if [ -n "${FAKE_PRINT_BADONLY:-}" ]; then printf 'Bad request.\n' >&2; exit 1; fi
+    # FAKE_PRINT_DOMAIN: launchd's DOMAIN-level rejection, verbatim as this box prints it for
+    # `print gui/999/x`. It says NOTHING about the service, so it must read as UNKNOWN, never as absent.
+    if [ -n "${FAKE_PRINT_DOMAIN:-}" ]; then printf 'Bad request.\nCould not find domain for user gui: 999\n' >&2; exit 1; fi
+    # FAKE_SERVICE_GONE_ON=N: at call N the SERVICE is genuinely gone (launchd's own service-level
+    # not-found text) — the vanish-mid-window shape, which is ABSENT and must not be read as "stable".
+    if [ -n "${FAKE_SERVICE_GONE_ON:-}" ]; then
+      n=$(( $(cat "$st/printcalls" 2>/dev/null || echo 0) + 1 ))
+      printf '%s\n' "$n" > "$st/printcalls"
+      if [ "$n" -ge "${FAKE_SERVICE_GONE_ON}" ]; then
+        printf 'Bad request.\nCould not find service "%s" in domain for user gui: 0\n' "${FAKE_LABEL:-com.eldato.orchestrator-loop}" >&2
+        exit 1
+      fi
+    fi
+    # FAKE_PRINT_NO_PATH: LOADED, but the block carries no `path =` line (a job registered by
+    # `launchctl submit`). The ownership guard must refuse rather than skip its one precondition.
+    if [ -n "${FAKE_PRINT_NO_PATH:-}" ]; then
+      printf 'gui/0/%s = {\n\tactive count = 1\n\tstate = running\n\n\truns = 1\n\tpid = 9911\n}\n' "${FAKE_LABEL:-com.eldato.orchestrator-loop}"
+      exit 0
+    fi
     if [ -n "${FAKE_PRINT_FAIL_UNLOADED:-}" ] && [ ! -f "$st/loaded" ]; then printf 'Print failed: 5: Input/output error\n' >&2; exit 1; fi
+    # FAKE_PRINT_FAIL_ON=N: exactly the Nth `print` call in this run fails and every other one succeeds.
+    # This is the shape the whole-run knob cannot express: the SECOND read of `lc_assert_stable` (or a
+    # read that flips mid-window) failing while the first succeeded — the read that must not be folded
+    # into "not relaunching".
+    if [ -n "${FAKE_PRINT_FAIL_ON:-}" ]; then
+      n=$(( $(cat "$st/printcalls" 2>/dev/null || echo 0) + 1 ))
+      printf '%s\n' "$n" > "$st/printcalls"
+      if [ "$n" -eq "${FAKE_PRINT_FAIL_ON}" ]; then printf 'Print failed: 5: Input/output error\n' >&2; exit 1; fi
+    fi
+    # FAKE_DOMAIN_GONE_ON=N: at call N launchd answers with its DOMAIN-level rejection instead of the
+    # block — the job (or the domain) vanishing mid-window. `Could not find domain for user gui: N` is
+    # what real launchd prints for `print gui/999/x` (measured), and it says NOTHING about the service.
+    if [ -n "${FAKE_DOMAIN_GONE_ON:-}" ]; then
+      n=$(( $(cat "$st/printcalls" 2>/dev/null || echo 0) + 1 ))
+      printf '%s\n' "$n" > "$st/printcalls"
+      if [ "$n" -ge "${FAKE_DOMAIN_GONE_ON}" ]; then
+        printf 'Bad request.\nCould not find domain for user gui: 999\n' >&2; exit 1
+      fi
+    fi
     if [ -n "${FAKE_PRINT_FILE:-}" ]; then cat "$FAKE_PRINT_FILE"; exit 0; fi
     # FAKE_CRASHLOOP: a job that starts and dies — launchd bumps `runs` between two reads while the pid
     # and the heartbeat stay plausible (that is exactly why pid+heartbeat cannot detect it).
@@ -175,10 +220,10 @@ fresh() { # reset the stub's world; $1 = heartbeat seed (optional)
   unset FAKE_BOOTSTRAP_FAIL FAKE_LOAD_FAIL FAKE_NO_HB FAKE_PRINT_FILE FAKE_BOOTOUT_FAIL \
     FAKE_BOOTOUT_LIE FAKE_BOOTOUT_LIE_NOPID FAKE_CRASHLOOP FAKE_PLIST FAKE_THROTTLE \
     FAKE_MIN_RUNTIME FAKE_STALE_PID FAKE_BOOTOUT_RACE FAKE_BOOTSTRAP_ALREADY_LOADED \
-    FAKE_PRINT_FAIL FAKE_PRINT_FAIL_UNLOADED FAKE_HB_EPOCH 2>/dev/null || true
+    FAKE_PRINT_FAIL FAKE_PRINT_FAIL_UNLOADED FAKE_HB_EPOCH FAKE_PRINT_BADONLY FAKE_PRINT_NO_PATH FAKE_PRINT_FAIL_ON FAKE_DOMAIN_GONE_ON FAKE_PRINT_DOMAIN FAKE_SERVICE_GONE_ON 2>/dev/null || true
 }
 calls() { cat "$FAKE_LOG" 2>/dev/null || true; }
-verbs() { awk '$1 != "print" && $1 != "kickstart" {printf "%s ", $1}' "$FAKE_LOG" 2>/dev/null; }
+verbs() { awk '$1 != "print" && $1 != "print-disabled" {printf "%s ", $1}' "$FAKE_LOG" 2>/dev/null; }
 is_loaded() { [ -f "$T/state/loaded" ]; }
 violations() { grep '^VIOLATION' "$FAKE_LOG" 2>/dev/null || true; }
 # ⛔ SERVICE-TARGET REMOVALS. `bootout gui/<uid>/<label>` resolves the label in the REAL user domain and
@@ -222,15 +267,39 @@ done
 if [ -z "$A_BAD" ]; then ok "no shipped CODE line writes a persistent disable (launchctl … -w / unload / disable)"
 else bad "a shipped code line writes a persistent disable:$A_BAD"; fi
 
-# README: every copyable launchctl command must be safe. A line STARTING with `launchctl unload` or
-# `launchctl disable` is a command an agent will run; prose that mentions the verbs does not start
-# with the binary.
-R_BAD="$(grep -nE '^[[:space:]]*launchctl[[:space:]]+(unload|disable)' "$README" 2>/dev/null || true)"
-if [ -z "$R_BAD" ]; then ok "README ships no copyable 'launchctl unload'/'launchctl disable' command"
+# README: every COPYABLE launchctl command must be safe. ⛔ A LINE THAT "STARTS WITH launchctl" IS NOT
+# WHAT AN AGENT COPIES (review finding): `sudo launchctl unload -w …`, a `$ launchctl unload -w …` line
+# inside a fenced block, and `… && launchctl unload -w …` are all copyable and were all MISSED by the
+# `^`-anchored detectors — appending the most likely thing an operator pastes left both green. Prose that
+# merely names the verbs must NOT be flagged, so the scan is limited to FENCED blocks and strips a shell
+# prompt first.
+readme_unsafe() {   # $1 = file → "<line>: <text>" for unsafe copyable commands, empty when clean
+  awk '
+    /^[[:space:]]*(```|~~~)/ { inb = !inb; next }
+    inb {
+      l = $0
+      # A COMMENT IS NOT A COMMAND — tested BEFORE the prompt strip, because `#   ` is itself in the
+      # prompt class and stripping it turned a warned-against verb in a comment into "a command".
+      if (l ~ /^[[:space:]]*#/) next
+      sub(/^[[:space:]]*[$>][[:space:]]+/, "", l)
+      if (l ~ /(^|[^[:alnum:]_-])launchctl[[:space:]]+(unload|disable)([[:space:]]|$)/ ||
+          l ~ /launchctl[[:space:]]+(load|unload)[^#]*-w/) printf "%d: %s\n", NR, $0
+    }' "$1" 2>/dev/null
+}
+R_BAD="$(readme_unsafe "$README")"
+if [ -z "$R_BAD" ]; then ok "README ships no copyable 'launchctl unload'/'launchctl disable'/'… -w' command"
 else bad "README still ships a copyable persistent-disable command: $R_BAD"; fi
-R_W="$(grep -nE '^[[:space:]]*launchctl[[:space:]]+(load|unload)[^#]*-w' "$README" 2>/dev/null || true)"
-if [ -z "$R_W" ]; then ok "README ships no copyable 'launchctl load -w' command"
-else bad "README still ships a copyable '-w' command: $R_W"; fi
+# …and the DETECTOR ITSELF is pinned: a loosening (or a re-anchoring) must go red here, not silently
+# un-guard the README. Fixture = a copy of the README plus the exact line an operator would paste.
+R_FIX="$T/readme-fixture.md"; { cat "$README"; printf '\n```\nsudo launchctl unload -w ~/Library/LaunchAgents/%s.plist\n```\n' "$LABEL"; } > "$R_FIX"
+if [ -n "$(readme_unsafe "$R_FIX")" ]; then ok "the README detector FIRES on 'sudo launchctl unload -w …' (fixture)"
+else bad "the README detector misses a pasted 'sudo launchctl unload -w …' — the pin does not protect what it claims"; fi
+# ⛔ …AND ON THE SHAPE WITHOUT `-w`, which is what the `-w` arm cannot catch (`unload` alone still
+# de-registers, and `disable` is the verb the incident wrote): a `^`-anchored detector missed this.
+R_FIX2="$T/readme-fixture2.md"; { cat "$README"; printf '\n```\nsudo launchctl unload ~/Library/LaunchAgents/%s.plist\nlaunchctl disable gui/501/%s\n```\n' "$LABEL" "$LABEL"; } > "$R_FIX2"
+if [ "$(readme_unsafe "$R_FIX2" | wc -l | tr -d ' ')" -ge 2 ]; then ok "…and on 'sudo launchctl unload …' plus 'launchctl disable …' (fixture, no -w)"
+else bad "the README detector misses an unflagged 'launchctl unload'/'launchctl disable' — prose-vs-command discrimination is not what an anchored match implements"; fi
+if [ -z "$(readme_unsafe "$README")" ]; then ok "…and stays quiet on the shipped README (no false block)"; fi
 
 # The ONE implementation, and the installer must refuse without it (fail closed, never a silent
 # degrade to the legacy verbs).
@@ -242,6 +311,14 @@ INSTALL_CODE="$(code_of "$INSTALL")"
 # asserted BEHAVIOURALLY instead, from the stub's argv log (sections C and F), which cannot be spoofed
 # by a string in a diagnostic.
 assert_contains "$INSTALL_CODE" 'launchd-cycle.sh' "install.sh has the helper's path"
+# ⛔ HERMETICITY IS A PROPERTY OF EVERY SHIPPED SUITE, NOT JUST THIS ONE (review finding, T5):
+# `selftest.sh` §6d ran `PATH="$FB:/usr/bin:/bin" bash "$INST"`, DROPPING this suite's launchctl stub, so
+# the render path read the REAL domain (`launchctl print gui/<uid>/com.eldato.orchestrator-loop`) — the
+# exact shape whose mutating sibling removed the live controller on 2026-10-17. Every installer
+# invocation that also sets a PATH must carry the stub.
+ST_BAD="$(grep -nE 'PATH="[^"]*".*bash "\$INST"|bash "\$INST".*PATH="[^"]*"' "$SELF" 2>/dev/null | grep -v 'GSTUB' || true)"
+if [ -z "$ST_BAD" ]; then ok "every installer invocation in selftest.sh that sets its own PATH keeps the launchctl stub (no real-domain read)"
+else bad "selftest.sh invokes install.sh on a PATH without the launchctl stub (real launchd reads): $ST_BAD"; fi
 if grep -q 'LC_LIB' <<<"$INSTALL_CODE" && grep -q 'die "missing \$LC_LIB' <<<"$INSTALL_CODE"; then
   ok "install.sh FAILS CLOSED when launchd-cycle.sh is missing"
 else bad "install.sh would silently proceed without launchd-cycle.sh"; fi
@@ -406,7 +483,7 @@ assert_contains "$(code_of "$INSTALL")" 'SELF="bash $(shq "$HERE/install.sh")"' 
 # has just exited sits loaded with no pid for up to its respawn throttle, so a pid-only read-back
 # calls a job launchd still holds "removed" (review finding). The behavioural case above covers the
 # lying-bootout path; this pins the datum itself, which no stub can model.
-assert_contains "$(code_of "$INSTALL")" 'loaded="$(lc_loaded_path "$LABEL")"' "the --uninstall read-back tests LOADED, not pid"
+assert_contains "$(code_of "$INSTALL")" 'held=1' "the --uninstall verdict comes from the PROBE (launchd still holds the label), not from a pid or a second path read"
 assert_contains "$(code_of "$INSTALL")" 'launchd-loaded.sha256' "the render launchd loaded is RECORDED, so 'unchanged' cannot mean 'the file did not change'"
 
 # ── G. the loaded job must be OURS, or nothing is touched ────────────────────────────────────────
@@ -601,6 +678,15 @@ echo "-- F. install.sh end to end"
 # the rest is the incident's own path (`--uninstall` and its read-back, `--start` and its proof, the
 # flag refusal, "a plain run mutates nothing"). Leaving all of §F on the developer's mac meant a
 # regression in that half shipped green through the only automated gate.
+# ⛔ BUT IT DOES NEED A USABLE CHECKOUT, and that is the INSTALLER's requirement, not this suite's:
+# install.sh stamps provenance from `REPO` and refuses anything that is not a git checkout. That holds in
+# CI (a plain clone) and in this worktree on a mac. It does NOT hold for a read-only container mount of a
+# LINKED worktree, whose `.git` is a FILE pointing outside the mount — the installer correctly refuses
+# there, so this section SKIPS (loudly, naming the reason) instead of reporting ~27 failures that are all
+# the same missing checkout. A skip is never a pass; the reason is printed.
+if ! git -C "$(cd "$HARNESS/../.." && pwd)" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  skipd "§F install.sh end to end — SKIPPED: $(cd "$HARNESS/../.." && pwd) is not a usable git checkout here (install.sh stamps provenance from it); this half runs in CI and on a normal clone"
+else
 if [ "$PLATFORM" != "Darwin" ]; then
   printf '#!/bin/sh\nexit 0\n' > "$T/bin/plutil"; chmod +x "$T/bin/plutil"
   STUBBED_PLUTIL=1
@@ -694,7 +780,8 @@ assert_contains "$out" "left untouched" "…and says so"
   out="$(MAX_LANES=7 ORUN --start 2>&1)"; rc=$?
   assert_eq "$rc" "0" "--start after a plain install exits 0"
   assert_contains "$(calls)" "bootout" "…and RELOADS the stale job (the file was unchanged, the job was not)"
-  assert_contains "$out" "RELOADED" "the banner says it reloaded rather than started"
+  assert_contains "$out" "this run RELOADED it and PROVED it" "the banner says it RELOADED rather than started"
+  assert_not_contains "$out" "printf " "no raw shell escaped into the banner text"
 
   # ⛔ AND AN ABSENT RECORD IS NOT "STALE". `$O/state/launchd-loaded.sha256` does not exist on any box
   # that has not run `--start` under this version, so the FIRST plain run of a healthy, byte-identical
@@ -707,6 +794,16 @@ assert_contains "$out" "left untouched" "…and says so"
   assert_contains "$out" "which render launchd loaded is UNKNOWN" "a MISSING record is reported as UNKNOWN"
   assert_not_contains "$out" "it still uses the OLD settings" "…and NOT as a measurement of staleness"
   assert_not_contains "$out" "--restart" "…nor does it point at a needless restart"
+
+  # ⛔ AND AN UNREADABLE READ IS NOT "NOT RUNNING" (review finding): `lc_pid` alone is empty for both
+  # "not loaded" and "the read failed", so the one run that cannot tell used to say the most.
+  fresh "$(( $(date +%s) - 5 ))"
+  ORUN --start >/dev/null 2>&1
+  export FAKE_PRINT_FAIL=1
+  out="$(ORUN 2>&1)"; rc=$?
+  assert_contains "$out" "could NOT be read" "an unreadable domain is reported as UNKNOWN in the banner"
+  assert_not_contains "$out" "The loop is NOT running" "…and NOT as 'the loop is NOT running'"
+  unset FAKE_PRINT_FAIL
 
 # an unknown flag must be REFUSED, not ignored: a typo'd --strt would otherwise install and exit 0.
 out="$(ORUN --strt 2>&1)"; rc=$?
@@ -759,6 +856,19 @@ assert_not_contains "$out" "✅ Removed" "it does not print ✅ over a live job"
   assert_not_contains "$out" "✅ Removed" "it does not print ✅ over a removal it could not read back"
   unset FAKE_PRINT_FAIL_UNLOADED
 
+  # …and where launchd holds the job but reports no `path =` for it: the ownership guard must refuse AND
+  # the read-back's verdict must still be "still loaded" (both come from the probe now).
+  fresh "$(( $(date +%s) - 5 ))"
+  ORUN --start >/dev/null 2>&1
+  export FAKE_PRINT_NO_PATH=1
+  out="$(ORUN --uninstall 2>&1)"; rc=$?
+  if [ "$rc" -ne 0 ]; then ok "a loaded-but-unattributable job makes --uninstall exit NON-ZERO"; else bad "--uninstall removed a job launchd could not attribute to our plist"; fi
+  assert_contains "$out" "no plist path" "the refusal names the missing datum"
+  [ -f "$PLIST" ] && ok "the plist is KEPT when the job cannot be shown to be ours" || bad "the plist was deleted for a job it could not attribute"
+  assert_not_contains "$out" "✅ Removed" "it does not print ✅ here either"
+  unset FAKE_PRINT_NO_PATH
+fi
+
 # ── J. an UNREADABLE launchd is NOT "not loaded" ────────────────────────────────────────────────
 # `launchctl print` failing says NOTHING about whether the job exists. Flattening the two made
 # `--uninstall` issue no bootout at all, the read-back see an empty read, and the installer print ✅ and
@@ -785,6 +895,105 @@ if [ "$rc" -ne 0 ]; then ok "an unreadable domain makes a start REFUSE (non-zero
 assert_not_contains "$(calls)" "enable" "enable was NOT issued over a job whose ownership could not be proven"
 assert_not_contains "$(calls)" "bootstrap" "nothing was bootstrapped"
 unset FAKE_PRINT_FAIL
+
+# ⛔ A LOADED JOB WITH NO PARSABLE `path =` IS NOT "NO CLAIM TO CHECK" (review finding): an empty path is
+# an absent DATUM, not a licence to skip the one precondition the guard exists for — with it skipped the
+# caller issues a LABEL-keyed bootout, which is the sandbox hazard measured on 2026-10-17. And the
+# `--uninstall` verdict must come from the PROBE, not from a second path read: `prc=0` already proves
+# launchd still holds the label, so nothing after it may erase that.
+fresh "$(( $(date +%s) - 5 ))"
+export FAKE_PRINT_NO_PATH=1
+: > "$FAKE_LOG"
+out="$( . "$LIB"; lc_bootout "$LABEL" "$T/o/x.plist" 2>&1 )"; rc=$?
+if [ "$rc" -ne 0 ]; then ok "a LOADED job with no plist path makes bootout REFUSE (non-zero)"; else bad "the ownership guard was skipped for a job launchd could not attribute to a plist"; fi
+assert_contains "$out" "no plist path" "the refusal names the missing datum"
+assert_not_contains "$(calls)" "bootout" "NO label-keyed removal was issued"
+unset FAKE_PRINT_NO_PATH
+
+# …and the same shape end to end: a loaded job whose block has no path line must make --uninstall exit
+# NON-ZERO and keep the plist.
+fresh "$(( $(date +%s) - 5 ))"
+export FAKE_PLIST="$T/o/x.plist"
+( . "$LIB"; lc_start "$LABEL" "$T/o/x.plist" >/dev/null 2>&1 )
+export FAKE_PRINT_NO_PATH=1
+out="$( . "$LIB"; lc_bootout "$LABEL" "$T/o/x.plist" 2>&1 )"; rc=$?
+if [ "$rc" -ne 0 ]; then ok "a loaded-but-unattributable job is never treated as removed"; else bad "an unattributable loaded job was reported removed"; fi
+unset FAKE_PRINT_NO_PATH
+
+# ⛔ `Bad request.` ALONE IS NOT launchd's not-found answer: it is a DOMAIN-level rejection, and widening
+# the absent set is exactly backwards for a tri-state whose rule is "unrecognised ⇒ UNKNOWN".
+fresh
+export FAKE_PRINT_BADONLY=1
+( . "$LIB"; lc_probe "$LABEL" >/dev/null 2>&1 ); assert_eq "$?" "2" "'Bad request' alone reads as UNKNOWN, not as absent"
+: > "$FAKE_LOG"
+out="$( . "$LIB"; lc_bootout "$LABEL" "$T/o/x.plist" 2>&1 )"; rc=$?
+if [ "$rc" -ne 0 ]; then ok "an unknown domain diagnostic makes bootout REFUSE (non-zero)"; else bad "an unrecognised diagnostic was read as 'not loaded'"; fi
+unset FAKE_PRINT_BADONLY
+
+# ⛔ A DOMAIN-LEVEL REJECTION IS UNKNOWN, NOT "NO SUCH SERVICE" (review finding): launchd prints the
+# SAME `Could not find` prefix for `Could not find domain for user gui: N` (measured on this box), which
+# says nothing about the service. Matching the bare prefix made `lc_probe` return "definitively absent",
+# so `bootout` issued NO removal and `--uninstall` printed ✅ and deleted the plist over a loaded job —
+# reachable as `sudo bash install.sh --uninstall` (id -u 0 → gui/0 → exactly that text).
+fresh
+export FAKE_PRINT_DOMAIN=1
+( . "$LIB"; lc_probe "$LABEL" >/dev/null 2>&1 ); assert_eq "$?" "2" "'Could not find domain for user gui' reads as UNKNOWN, not absent"
+: > "$FAKE_LOG"
+out="$( . "$LIB"; lc_bootout "$LABEL" "$T/o/x.plist" 2>&1 )"; rc=$?
+if [ "$rc" -ne 0 ]; then ok "…so a broken domain makes bootout REFUSE (non-zero)"; else bad "a domain-level rejection was converted into a successful removal"; fi
+unset FAKE_PRINT_DOMAIN
+
+# ⛔ THE SECOND 'runs' READ IS THE MEASUREMENT (review finding): `lc_runs` is empty both when the job is
+# gone and when the read FAILED (EIO — this box's normal failure), so `[ -n "$r1" ] && …` fell through to
+# `return 0` and CERTIFIED a crash loop exactly when launchd was flaky.
+fresh "$(( $(date +%s) - 5 ))"
+export FAKE_PLIST="$T/o/x.plist"
+( . "$LIB"; lc_start "$LABEL" "$T/o/x.plist" >/dev/null 2>&1 )
+unset FAKE_PRINT_FAIL_ON
+: > "$FAKE_STATE/printcalls"
+export FAKE_PRINT_FAIL_ON=3          # 1 = lc_min_runtime, 2 = r0, 3 = the second (r1) read
+out="$( . "$LIB"; LC_SETTLE=1 lc_assert_stable "$LABEL" 1 2>&1 )"; rc=$?
+if [ "$rc" -ne 0 ]; then ok "an UNREADABLE second 'runs' read is not certified as stable (non-zero)"; else bad "a failed second read was read as 'not relaunching'"; fi
+assert_contains "$out" "could not be read a second time" "…and the message names the failed READ, not a missing pid"
+unset FAKE_PRINT_FAIL_ON
+
+# …and the sibling shape: the service genuinely VANISHES mid-window (a concurrent --uninstall from another
+# pane, routine in this fleet) — also unproven, and named as disappearance rather than as a bad read.
+fresh "$(( $(date +%s) - 5 ))"
+export FAKE_PLIST="$T/o/x.plist"
+( . "$LIB"; lc_start "$LABEL" "$T/o/x.plist" >/dev/null 2>&1 )
+: > "$FAKE_STATE/printcalls"
+export FAKE_SERVICE_GONE_ON=3
+out="$( . "$LIB"; LC_SETTLE=1 lc_assert_stable "$LABEL" 1 2>&1 )"; rc=$?
+if [ "$rc" -ne 0 ]; then ok "a job that leaves the domain mid-window is not certified as stable"; else bad "a vanished job was read as 'not relaunching'"; fi
+assert_contains "$out" "left the domain" "…and the message says it VANISHED, not that a read failed"
+unset FAKE_SERVICE_GONE_ON
+
+# ⛔ AN EMPTY `HOME` IS NOT THE REAL HOME — AND `cd ""` SUCCEEDS (review finding): bash leaves $PWD
+# unchanged, so `home_real` became the CURRENT DIRECTORY and an operator standing in their own home
+# PASSED the #446 guard while $HOME was empty. Reproduced from `cd ~` — the commonest cwd there is.
+fresh
+out="$( cd "$HOME" && env -u ELDATO_ALLOW_TEST_HOME HOME= PATH="$T/bin:$PATH" \
+  bash -c '. "$1"; lc_bootout "$2" "$3"' _ "$LIB" "$LABEL" "$T/o/x.plist" 2>&1 )"; rc=$?
+if [ "$rc" -ne 0 ]; then ok "HOME='' is REFUSED even from the real home (rc non-zero)"; else bad "an empty HOME passed the #446 guard from cwd=home"; fi
+assert_contains "$out" "HOME is empty" "…by the HOME guard, named as such (not by the ownership check)"
+assert_not_contains "$(calls)" "bootout" "…and NO label-keyed removal was issued"
+
+# ⛔ THE OPERATOR'S LAST LEVER MUST NOT HANG (review finding): `lc_hb_value` had no `-f` guard, so a
+# non-regular `$O/heartbeat` BLOCKED ON OPEN — and it is read BEFORE the start, so `install.sh --start`
+# (the documented remedy while the controller is down) hung with no output at all.
+rm -f "$T/o/heartbeat"; mkfifo "$T/o/heartbeat" 2>/dev/null || true
+if [ -p "$T/o/heartbeat" ]; then
+  # ⛔ THE PROBE IS BOUNDED *AND* ITS OUTPUT NEVER GOES THROUGH A PIPE: a `$( … )` here would wait on
+  # every writer of that pipe, and a mutant that blocks inside `tr < fifo` leaves an ORPHANED tr holding
+  # it — the assertion would then hang instead of going red (measured: the suite blocked >200s). The
+  # alarm kills the probe; the file redirect keeps the orphan off the capture path.
+  perl -e 'alarm 10; exec @ARGV' bash -c '. "$1"; lc_hb_value "$2"' _ "$LIB" "$T/o" > "$T/hb.fifo.out" 2>&1
+  rc=$?; out="$(cat "$T/hb.fifo.out")"
+  assert_eq "$rc" "0" "lc_hb_value on a FIFO returns instead of blocking (a hang would be 142/124)"
+  assert_eq "$out" "0" "…and reports the value as UNKNOWN (0)"
+fi
+rm -f "$T/o/heartbeat"; printf '1\n' > "$T/o/heartbeat"
 
 # ── K. the refusal must be PRINTED under the CALLER's shell options ──────────────────────────────
 # launchd-cycle.sh is SOURCED into install.sh's `set -euo pipefail`. An unguarded `x="$(cd … && pwd -P)"`

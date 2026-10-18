@@ -450,9 +450,11 @@ tmux ls                                      # lane-*, chain-*, merge-*, fix-*
 ```
 
 `install.sh --uninstall` removes the agent (`launchctl bootout`), **reads the domain back**, and only then
-deletes the plist — if the label still has a pid it exits non-zero instead of printing ✅. It writes **no**
-persistent Disabled override, so a later `--start` is a plain start rather than a start that has to
-fight a sticky disable first.
+deletes the plist — if the label is still **LOADED** it exits non-zero and keeps the plist instead of
+printing ✅ (a `KeepAlive` job sitting inside its respawn throttle is loaded with NO pid, which is why
+the verdict is not a pid test), and if the read itself fails it exits non-zero too rather than calling an
+unreadable domain "removed". It writes **no** persistent Disabled override, so a later `--start` is a
+plain start rather than a start that has to fight a sticky disable first.
 
 Every mutating path (`--start`, `--restart`, `--uninstall`) first checks two things, and refuses with
 one line rather than acting if either fails: **`$HOME` must be the real home** (a sandboxed `$HOME`
@@ -706,8 +708,11 @@ clear about what is and is not enforced:
 The ritual, in order — the point is that **no uncommitted work is lost**:
 
 1. `bash scripts/orchestrator-harness/install.sh --uninstall` (from the checkout root, as §4): the
-   installer resolves `launchd-cycle.sh` and `launchd.plist.template` from its OWN directory, so a stale
-   copy under `$O` refuses with "missing …launchd-cycle.sh" — `bootout` + remove the plist, so it does
+   installer resolves `launchd-cycle.sh` and `launchd.plist.template` from its OWN directory, so the
+   CHECKOUT's copy is the guarded one — a copy that lacks `launchd-cycle.sh` refuses with "missing
+   …launchd-cycle.sh" (fail closed, never a silent degrade to the legacy verbs), while a pre-#1975
+   `install.sh` still sitting under `$O` has no guard at all, so never run that one — `bootout` + remove
+   the plist, so it does
    not restart on boot and no persistent Disabled override is written (which is what `unload -w` did;
    agent-infra#1975). It READS THE DOMAIN BACK afterwards — "is the label still loaded", not "does it
    have a pid", because a `KeepAlive` job inside its 10s respawn throttle is loaded with no pid — and
