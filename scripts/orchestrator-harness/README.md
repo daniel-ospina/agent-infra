@@ -1035,7 +1035,7 @@ implemented or explicitly not claimed:
 
 | requirement | where |
 |---|---|
-| never write a persistent Disabled override | no shipped line invokes `disable`, `unload`, or `-w` (asserted from the stub's argv log, not from a grep); `--uninstall` uses `bootout` only |
+| never write a persistent Disabled override | no shipped line invokes `disable`, `unload`, or `-w` (asserted from the stub's argv log wherever the path runs, **and** from a source scan of every shipped `*.sh`/`*.template` where it cannot); `--uninstall` uses `bootout` only |
 | clear a disable a previous flow already wrote | `lc_start` runs `enable` before `bootout`/`bootstrap`; the status it writes is read back with `print-disabled` |
 | actually load the job (not just PRINT the command) | `install.sh --start` / `--restart` call `lc_start`; a plain run never starts anything |
 | assert the job came back | `lc_assert_running`: new pid + heartbeat strictly advanced + `runs` did not move across the settle window |

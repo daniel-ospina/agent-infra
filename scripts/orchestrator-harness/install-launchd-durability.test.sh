@@ -211,6 +211,19 @@ case "${1:-}" in
     if [ -f "$st/print" ]; then cat "$st/print"; exit 0; fi
     printf 'Bad request.\nCould not find service in domain for user gui: 0\n' >&2; exit 1 ;;
   enable)   : > "$st/enabled"; exit 0 ;;
+  print-disabled)
+    # FAKE_PD models the four answers this verb really gives: an override for our label, none at all
+    # (the healthy box), a silent/empty answer, and a failed read. Without an arm for it the verb fell
+    # through to `exit 0` with no output, so `lc_disable_state` could only ever answer `unknown` inside
+    # the suite — and the enable read-back was UNPINNED (review finding: deleting it kept the suite green).
+    case "${FAKE_PD:-enabled}" in
+      disabled) printf '\t\t"%s" => disabled\n' "${FAKE_LABEL:-com.eldato.orchestrator-loop}" ;;
+      enabled)  printf '\t\t"%s" => enabled\n' "${FAKE_LABEL:-com.eldato.orchestrator-loop}" ;;
+      unset)    printf '\t\t"com.example.other" => disabled\n' ;;
+      fail)     printf 'Print failed: 5: Input/output error\n' >&2; exit 1 ;;
+      silent)   exit 0 ;;
+      *)        printf '\t\t"%s" => %s\n' "${FAKE_LABEL:-com.eldato.orchestrator-loop}" "$FAKE_PD" ;;
+    esac ;;
   bootout)
     [ -n "${FAKE_BOOTOUT_FAIL:-}" ] && { printf 'Bootout failed: 5: Input/output error\n' >&2; exit 1; }
     # Real launchd on an unknown service: exit 3 with this exact line (`man launchctl` territory). Modelled
@@ -261,7 +274,7 @@ fresh() { # reset the stub's world; $1 = heartbeat seed (optional)
   unset FAKE_BOOTSTRAP_FAIL FAKE_LOAD_FAIL FAKE_NO_HB FAKE_PRINT_FILE FAKE_BOOTOUT_FAIL \
     FAKE_BOOTOUT_LIE FAKE_BOOTOUT_LIE_NOPID FAKE_CRASHLOOP FAKE_PLIST FAKE_THROTTLE \
     FAKE_MIN_RUNTIME FAKE_STALE_PID FAKE_BOOTOUT_RACE FAKE_BOOTSTRAP_ALREADY_LOADED \
-    FAKE_PRINT_FAIL FAKE_PRINT_FAIL_UNLOADED FAKE_HB_EPOCH FAKE_PRINT_BADONLY FAKE_PRINT_NO_PATH FAKE_PRINT_FAIL_ON FAKE_DOMAIN_GONE_ON FAKE_PRINT_DOMAIN FAKE_SERVICE_GONE_ON FAKE_PRINT_SILENT_ON FAKE_PRINT_NO_RUNS FAKE_BOOTOUT_LIE_NOPID FAKE_BOOTOUT_LAG 2>/dev/null || true
+    FAKE_PRINT_FAIL FAKE_PRINT_FAIL_UNLOADED FAKE_HB_EPOCH FAKE_PRINT_BADONLY FAKE_PRINT_NO_PATH FAKE_PRINT_FAIL_ON FAKE_DOMAIN_GONE_ON FAKE_PRINT_DOMAIN FAKE_SERVICE_GONE_ON FAKE_PRINT_SILENT_ON FAKE_PRINT_NO_RUNS FAKE_BOOTOUT_LIE_NOPID FAKE_BOOTOUT_LAG FAKE_PD 2>/dev/null || true
 }
 calls() { cat "$FAKE_LOG" 2>/dev/null || true; }
 verbs() { awk '$1 != "print" && $1 != "print-disabled" {printf "%s ", $1}' "$FAKE_LOG" 2>/dev/null; }
@@ -471,7 +484,7 @@ else bad "the job was never enabled"; fi
 
 # ── D. lc_ensure: safe on a live box ─────────────────────────────────────────────────────────────
 echo "-- D. lc_ensure leaves a healthy controller alone"
-mutating_calls() { grep -vE '^(print|kickstart)( |$)' "$FAKE_LOG" 2>/dev/null || true; }
+mutating_calls() { grep -vE '^(print|print-disabled|kickstart)( |$)' "$FAKE_LOG" 2>/dev/null || true; }
 
 fresh "$(( $(date +%s) - 5 ))"
 ( . "$LIB"; lc_start "$LABEL" "$T/o/x.plist" >/dev/null 2>&1 )
@@ -516,7 +529,6 @@ fresh
 printf '%s\n' "$$" > "$T/o/.orch.lock"
 out="$( . "$LIB"; lc_ensure "$LABEL" "$T/o/x.plist" "$T/o" 1 2 2>&1 )"; rc=$?
 assert_contains "$out" 'pkill -f "[b]ash'  "the lc_ensure refusal keeps the quoted scoped pattern too"
-rm -f "$T/o/.orch.lock"
 rm -f "$T/o/.orch.lock"
 
 echo "-- D5. the staleness bound tracks the CELL's cycle, not a constant"
@@ -771,7 +783,7 @@ ORUN() { # <extra args…>
     PATH="$SHOME/.local/share/pi-node/current/bin:$T/bin:$PATH" \
     bash "$STAGE/install.sh" "$@"
 }
-mutating() { grep -vE '^(print|kickstart)( |$)' "$FAKE_LOG" 2>/dev/null || true; }
+mutating() { grep -vE '^(print|print-disabled|kickstart)( |$)' "$FAKE_LOG" 2>/dev/null || true; }
 
 fresh
 out="$(ORUN 2>&1)"; rc=$?
@@ -1146,6 +1158,56 @@ unset FAKE_PRINT_FAIL_ON
 if [ "$rc" -ne 0 ]; then ok "an unreadable lc_ensure read exits NON-ZERO"; else bad "an unreadable read was scored as 'not loaded' and the start went ahead"; fi
 assert_contains "$out" "could not be read" "…and names the failed read"
 assert_not_contains "$(calls)" "bootstrap" "…and NOTHING was mutated (no bootstrap over a live job)"
+
+# ── P. the ENABLE is verified: all four answers of `print-disabled` ─────────────────
+echo "-- P. the persistent Disable override is read back, and all four answers behave"
+# Five answers: two healthy (an override that reads `enabled`, and NO override at all — which a
+# successful-but-empty `print-disabled` also means), one definite refusal, and two unknowns (a failed
+# read, and an entry we cannot classify). The healthy pair must be SILENT: `unset` is the state of
+# every real box that carries no override, and reporting it as an unreadable answer is the false
+# alarm the split exists to remove.
+for pd in enabled unset silent disabled fail garbage; do
+  fresh
+  export FAKE_PD="$pd"
+  : > "$FAKE_LOG"
+  out="$( . "$LIB"; lc_start "$LABEL" "$T/o/x.plist" 2>&1 )"; rc=$?
+  case "$pd" in
+    enabled|unset|silent)
+      if [ "$rc" -eq 0 ]; then ok "print-disabled='$pd' loads the job (rc=0)"; else bad "print-disabled='$pd' refused a healthy start: $out"; fi
+      assert_not_contains "$out" "could not read whether" "…with no unreadable-answer warning"
+      assert_contains "$(calls)" "bootstrap" "…and it really bootstrapped" ;;
+    disabled)
+      if [ "$rc" -ne 0 ]; then ok "print-disabled='disabled' REFUSES the load (rc non-zero)"; else bad "an override that did not clear was loaded anyway"; fi
+      assert_contains "$out" "still reads 'disabled'" "…and the refusal names the override"
+      assert_not_contains "$(calls)" "bootstrap" "…and NOTHING was loaded"
+      assert_not_contains "$(calls)" "bootout" "…and the live job was not booted out either"
+      # `print-disabled` is READ-ONLY (launchd-cycle.sh's own doctrine). It sits on lc_start's success
+      # path, so a filter that does not exclude it makes a read look like a mutation to every future
+      # "zero mutating calls" assertion.
+      assert_not_contains "$(mutating_calls)" "print-disabled" "…and the read-back is not scored as a mutation" ;;
+    fail|garbage)
+      if [ "$rc" -eq 0 ]; then ok "print-disabled='$pd' warns and CONTINUES (the bootstrap is the proof)"; else bad "an unreadable override was a false block: $out"; fi
+      assert_contains "$out" "could not read whether" "…and it says the answer was unusable"
+      assert_contains "$(calls)" "bootstrap" "…and the start still happened" ;;
+  esac
+done
+unset FAKE_PD
+
+# ── Q. an ABSENT heartbeat is not a duration ──────────────────────────────────────────
+# `lc_hb_age` returns EMPTY when the file is missing or unparseable. Rendering that as
+# "${age:-unreadable}s old" asserted "running but not cycling" from a value never read, and pointed at
+# `--restart` — a mutating remedy — on a controller that may be healthy.
+echo "-- Q. a missing heartbeat refuses instead of claiming 'not cycling'"
+fresh "$(( $(date +%s) - 5 ))"
+export FAKE_PLIST="$T/o/x.plist"
+( . "$LIB"; lc_start "$LABEL" "$T/o/x.plist" >/dev/null 2>&1 )
+rm -f "$T/o/heartbeat"
+: > "$FAKE_LOG"
+out="$( . "$LIB"; LC_SETTLE=1 lc_ensure "$LABEL" "$T/o/x.plist" "$T/o" 0 2 2>&1 )"; rc=$?
+if [ "$rc" -ne 0 ]; then ok "a MISSING heartbeat refuses (non-zero)"; else bad "an absent datum was rendered as a staleness measurement"; fi
+assert_contains "$out" "could not be read" "…and names the missing datum"
+assert_not_contains "$out" "running but not cycling" "…and does NOT claim the controller is wedged"
+assert_not_contains "$out" "unreadables old" "…and never prints a value it did not read"
 
 # ── O. the last empty-is-falsy traps ─────────────────────────────────────────────────────────────
 echo "-- O. a SILENT unreadable read-back, a FIFO lock, hostile LC_HB_STALE, a symlinked plist"

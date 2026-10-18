@@ -350,12 +350,18 @@ lc_min_runtime() {
 # read. Used instead of asserting the state we hoped for: `enable` is allowed to fail, and the one
 # message an operator reads during an outage must be a measurement.
 lc_disable_state() {
-  local out
+  local out entry
   out="$(launchctl print-disabled "$(lc_domain)" 2>/dev/null)" || { printf 'unknown\n'; return 0; }
-  case "$(grep -F "\"$1\"" <<<"$out" 2>/dev/null)" in
+  # ⛔ "THE VERB FAILED", "NO OVERRIDE IS RECORDED" AND "AN ENTRY WE CANNOT CLASSIFY" ARE THREE
+  # DIFFERENT STATES (review finding): folding them into one `unknown` made the HEALTHY box — a
+  # `print-disabled` that answers and simply has no line for this label — report itself as an
+  # unreadable answer, at the moment an operator is already diagnosing launchd.
+  entry="$(grep -F "\"$1\"" <<<"$out" 2>/dev/null || true)"
+  case "$entry" in
     *'=> disabled'*) printf 'disabled\n' ;;
     *'=> enabled'*)  printf 'enabled\n' ;;
-    *)               printf 'unknown\n' ;;
+    '')              printf 'unset\n' ;;     # the read ANSWERED: no override for this label (healthy)
+    *)               printf 'unknown\n' ;;   # an entry we cannot classify
   esac
 }
 
@@ -376,8 +382,8 @@ lc_start() {
   # read is a WARNING and the bootstrap decides: an unknown must not become a false block either.
   case "$(lc_disable_state "$label")" in
     disabled) lc_err "❌ refusing to load $label: the persistent Disabled override still reads 'disabled' after 'launchctl enable', so loading it would not survive a reboot. Next: launchctl enable $(lc_domain)/$label; launchctl print-disabled $(lc_domain) | grep $label"; return 1 ;;
-    unknown)  printf '%s\n' "⚠️  could not read whether $label is disabled (launchctl print-disabled gave no answer) — continuing; the bootstrap below is the proof" >&2 ;;
-  esac
+    unknown)  printf '%s\n' "⚠️  could not read whether $label is disabled (launchctl print-disabled gave no usable answer) — continuing; the bootstrap below is the proof" >&2 ;;
+  esac   # `enabled` and `unset` (no override recorded — the healthy state) both proceed silently
   # A job that is still loaded cannot be bootstrapped again ("service already loaded"), so the bootout
   # belongs to the START, not to a separate restart step — and a removal that FAILS is fatal here:
   # carrying on would bootstrap over a job we could not clear, then fall through to `load`, and the
@@ -600,7 +606,15 @@ lc_ensure() {
   [ "$prc" -eq 0 ] && pid="$(awk '/^[[:space:]]*pid = [0-9]+$/ { print $3; exit }' <<<"$block")"
   if [ "$changed" = "0" ] && [ -n "$pid" ]; then
     age="$(lc_hb_age "$O")"
-    if [ -n "$age" ] && [ "$age" -le "$stale" ]; then
+    # ⛔ AN ABSENT HEARTBEAT IS NOT A MEASUREMENT (review finding): `lc_hb_age` returns EMPTY for a
+    # missing/unparseable file, and `${age:-unreadable}s old` then asserted "running but NOT cycling"
+    # from a value that was never read — and pointed at `--restart`, a mutating remedy, on a controller
+    # that may be perfectly healthy. Refuse and say which datum is missing.
+    if [ -z "$age" ]; then
+      lc_err "❌ refusing to decide on $label: $O/heartbeat could not be read (missing or unparseable), so 'not cycling' is UNPROVEN. Next: ls -l $O/heartbeat; tail -40 $O/logs/orch-loop.log"
+      return 1
+    fi
+    if [ "$age" -le "$stale" ]; then
       # ⛔ A FRESH HEARTBEAT IS NOT PROOF OF HEALTH. `orch-loop.sh` writes it as the first act of a
       # cycle and the plist is KeepAlive, so a controller that dies seconds after every start keeps the
       # age fresh forever and this branch would bless it as "already running". The relaunch counter is
@@ -610,7 +624,7 @@ lc_ensure() {
       printf '  ✓ %s already running (pid %s, heartbeat %ss old, not relaunching) and the loaded job is CURRENT — left untouched\n' "$label" "$pid" "$age"
       return 0
     fi
-    lc_err "❌ $label is loaded (pid $pid) but $O/heartbeat is ${age:-unreadable}s old (limit ${stale}s) — running but not cycling. Next: install.sh --restart"
+    lc_err "❌ $label is loaded (pid $pid) but $O/heartbeat is ${age}s old (limit ${stale}s) — running but not cycling. Next: install.sh --restart"
     return 1
   fi
   if [ -z "$pid" ]; then
