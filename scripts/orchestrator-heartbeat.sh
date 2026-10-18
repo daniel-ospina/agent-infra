@@ -916,22 +916,30 @@ MSG="${MSG} ⛔ PRIORITY: before dispatching, read the ranked order IN THE GRAPH
 # ⛔ UNCONDITIONAL, AND IT MUST RIDE THE SHORT FORM TOO (see the PULSE block below): a quiet beat
 # is exactly when the order is needed, and the short form is what a quiet beat receives -- the
 # short form REBUILDS MSG, so a clause appended only above it is discarded on every quiet tick.
-# ⛔ TWO LENGTHS, ONE ORDER -- THE SHORT BODY GETS THE SHORT PHRASING, which is the file's own
-# precedent for ROLE / MAP / PRIORITY. MEASURED 2026-10-18 at review: the full text is 758 chars,
-# which nearly DOUBLES a quiet beat (~1k without it) -- most of the very wall the SHORT FORM block
-# below exists to prevent. The short phrasing is 554 chars and still carries every ELEMENT the owner
-# named, including the gloss that defines AUTOPILOT (dispatch, PRs, fixes, merges, unattended) and
-# WHICH four boxes -- that gloss is not decoration: the word appears nowhere else in this repo, so
-# without it the quiet beat orders a lane to do something it cannot look up. The invariants are
-# carried by tests/heartbeat-fleet-advance/run.sh, which asserts the same content markers on BOTH
-# variants, asserts the quiet beat stays under its bound (so pointing the pulse path at the full
-# text fails CI instead of silently doubling it), and prints the measured quiet-beat length.
-# ⛔ NO BACKTICKS, NO DOUBLE QUOTES AND NO $ IN EITHER VARIANT -- the same rule as the rest of MSG
-# (see the warning above): MSG is a DOUBLE-QUOTED assignment, so a backticked span is
-# command-substituted AT ASSIGNMENT TIME and silently vanishes, leaving a hole the file on disk
-# still looks right about. tests/heartbeat-fleet-advance/run.sh asserts all three, on both.
-FLEETADV="⛔ FLEET ADVANCE — this beat is an ORDER, not a report. (1) CHECK THE cmux LANES AND ALL FOUR BOXES (the local machine plus the three cloud VMs) and push every one toward AUTOPILOT — dispatching, creating PRs, fixing them, merging them UNATTENDED. (2) USE THE CAPACITY, DO NOT REPORT IT: if the local machine has room, dispatch locally; if a cloud VM is idle, dispatch there — lanes must be running on real work, not described in a paragraph about load. (3) DRIVE THE P0/P1 PRs: name the specific PRs that should land this cycle and take each one to the rail — run scripts/admin-merge.sh — and advance agent-infra (cell-2 owns it) toward automating dispatch, PR creation, fixing and merging. A beat that reports state and dispatches nothing is a WASTED BEAT. "
-FLEETADV_SHORT="⛔ FLEET ADVANCE — an ORDER, not a report: CHECK THE cmux LANES AND ALL FOUR BOXES (local + the three cloud VMs), push each to AUTOPILOT — dispatch, create PRs, fix them, merge them unattended — USE THE CAPACITY instead of reporting it (local if it has room, an idle cloud VM otherwise), and DRIVE THE P0/P1 PRs: name this cycle's PRs, take each to the rail via scripts/admin-merge.sh, and advance agent-infra (cell-2 owns it) toward automating dispatch, PR creation, fixing and merging. A beat that reports state and dispatches nothing is a WASTED BEAT. "
+# ⛔ ONE ORDER, TWO LENGTHS -- AND THE ORDER ITSELF IS NEVER REPHRASED. FA1..FA4 are the three
+# instructions the owner gave plus the closing line, defined ONCE and embedded VERBATIM in both
+# bodies; only the (1)(2)(3) numbering and the one elaboration sentence below belong to the alert
+# body alone. That is what lets the coverage assertion be COMPLETE instead of a list of tokens:
+# tests/heartbeat-fleet-advance/run.sh asserts each of these sentences verbatim in the DELIVERED
+# quiet beat AND the delivered alert beat, so no condensation can drop, reword or soften an
+# instruction -- a variant can differ only by elaboration. (Reviewer-driven: three rounds of
+# "delete this phrase, suite stays green" mutants, each pointing at a different word, are all the
+# same defect -- a marker per phrase cannot be exhaustive; a shared sentence can.)
+# MEASURED 2026-10-18: the core is 618 chars and the alert body 707, so the order adds ~618 to a
+# ~970-char quiet beat -- still the largest single clause there, and deliberately so: it is the only
+# clause that tells the lane to DO something. The quiet body's ceiling is bounded on the VARIANT
+# (not derived from it), so growth of this text fails CI rather than silently re-inflating the pulse.
+# ⛔ NO BACKTICKS, NO DOUBLE QUOTES AND NO $ IN FA1..FA4 -- the same rule as the rest of MSG (see
+# the warning above): MSG is a DOUBLE-QUOTED assignment, so a backticked span is command-substituted
+# AT ASSIGNMENT TIME and silently vanishes, leaving a hole the file on disk still looks right about.
+# The two composed bodies may reference ${FA1}..${FA4}, and ONLY those references -- an added $ or
+# backtick there is the same defect, so it is the composed literal that carries the check.
+FA1="CHECK THE cmux LANES AND ALL FOUR BOXES (local + the three cloud VMs) and push each toward AUTOPILOT — dispatching, creating PRs, fixing them, merging them UNATTENDED."
+FA2="USE THE CAPACITY, DO NOT REPORT IT: dispatch locally if the local machine has room, on a cloud VM if it is idle."
+FA3="DRIVE THE P0/P1 PRs: name the specific PRs that should land this cycle, take each one to the rail via scripts/admin-merge.sh, and advance agent-infra (cell-2 owns it) toward automating dispatch, PR creation, fixing and merging."
+FA4="A beat that reports state and dispatches nothing is a WASTED BEAT."
+FLEETADV="⛔ FLEET ADVANCE — an ORDER, not a report. (1) ${FA1} (2) ${FA2} Lanes must be running on real work, not described in a paragraph about load. (3) ${FA3} ${FA4} "
+FLEETADV_SHORT="⛔ FLEET ADVANCE — an ORDER, not a report. ${FA1} ${FA2} ${FA3} ${FA4} "
 MSG="${MSG} ${FLEETADV}"
 if [ -n "${CAPTEXT:-}" ]; then MSG="${MSG} ${CAPTEXT}"; fi
 
