@@ -2293,13 +2293,19 @@ grep -qE '^api repos/[^ ]*/pulls\?([^ ]*[?&])?state=all(&|$)' "$D/gh-calls" 2>/d
 # satisfied by the three TIERS ALONE whenever the unlabelled window is ABSENT — delete the
 # `.open_iss` block and the case still printed ✅ while the pass reaped nothing (`[reap] SKIPPED:
 # .open_iss not readable`) on every cycle, with this assertion's own text claiming that window was
-# pinned. So the reaper window must EXIST, and it is identified by being the one issue listing with
-# no `labels=`.
+# pinned.
+# ⛔ THE WITNESS MUST BE THE REAPER'S OWN OUTCOME, NOT THE REQUEST (review, MEASURED). Asserting
+# that a listing was ASKED FOR pins the call, not the read: redirect its output to `/dev/null` (or
+# to `.open_iss.tmp`) and the request is still in `gh-calls` while `.open_iss` never exists — the
+# suite stayed green and the pass printed the very `[reap] SKIPPED: .open_iss not readable` line
+# this case exists to prevent. `.open_iss` is DELETED by a completed pass, so it cannot be asserted
+# afterwards; the pass's OWN log is the durable evidence that the reaper read the listing.
 reaper_win="$(grep -E '^api repos/[^ ]*/issues\?' "$D/gh-calls" 2>/dev/null | grep -v 'labels=' | head -1)"
 issues_not_open="$(grep -E '^api repos/[^ ]*/issues\?' "$D/gh-calls" 2>/dev/null | grep -v 'state=open' | head -2 | tr '\n' ' ')"
-{ [ -n "$reaper_win" ] && [ -z "$issues_not_open" ]; } \
-  && ok "starved-graphql: the unlabelled reaper window EXISTS and EVERY issue listing asks state=open (the three tiers included)" \
-  || bad "the unlabelled reaper window is missing, or an issue listing does not ask state=open — closed issues would be listed for dispatch (#1705/#8465): reaper_window='$reaper_win' offenders=$issues_not_open"
+reaper_skipped="$(printf '%s' "$OUT" | grep -cE '\[reap\] SKIPPED:.*\.open_iss')"
+{ [ -n "$reaper_win" ] && [ -z "$issues_not_open" ] && [ "${reaper_skipped:-1}" -eq 0 ]; } \
+  && ok "starved-graphql: the reaper RAN over an unlabelled state=open window, and EVERY issue listing asks state=open (the three tiers included)" \
+  || bad "the reaper skipped a missing/unreadable .open_iss, or an issue listing does not ask state=open — closed issues would be listed for dispatch (#1705/#8465): reaper_window='$reaper_win' reaper_skipped=$reaper_skipped offenders=$issues_not_open"
 
 # (b) REST ALSO FAILING (HTTP 403, rate limited) -> TRANSIENT, and NOTHING written: no `.open_iss`, no
 #     `.pr_brs`, and the seeded backlog untouched. A truncated or empty listing here is the #1705 bug
