@@ -249,11 +249,15 @@ this script reports: it cannot tell you the work succeeded.
 PR to `chain-merge.sh`, which polls for it and runs `merge-one.sh`. A background worker whose PR is
 never handed to the chain is unreviewed code by default.
 
-⚠️ `install.sh` does **not** copy it. The script only syntax-checks every `*.sh`, and its drift
-comparison lists the loop scripts **explicitly** (it does not include this one), so a stale copy here
-is never reported and `install.sh` prints no `cp` for it. What puts this file in `$O` is the manual
-copy in §4 — `cp scripts/orchestrator-harness/*.sh ~/orchestrator/`. Run it from the harness
-directory, and re-run that `cp` after editing this script.
+⚠️ `install.sh` does **not** copy it — it places no `*.sh` in `$O` at all, only `gh-rest/gh`
+(`install.sh:352`); everything else is the operator's `cp`, §4 step 1. Its `DRIFTED` warning iterates
+an explicit list of eleven `*.sh` plus `gh-rest/gh` (`install.sh:490-494`), and this file is not on
+it, so you get no named `cp` line for it. ⛔ A stale copy is
+still REPORTED, twice: the provenance stamp's `deployedMatchesSource` compares **every** shipped
+`*.sh` against `$O` (`install.sh:621-632`), and `check-deployed-drift.sh` fails on any differing
+blob. What puts this file in `$O` is the manual copy in §4 —
+`cp scripts/orchestrator-harness/*.sh ~/orchestrator/`. Run it from the harness directory, and
+re-run that `cp` after editing this script.
 
 ⚠️ This is a stopgap for an open gap, not the fix. **agent-infra#1666** lands non-blocking dispatch
 as a first-class primitive (`task({ background: true })` plus `task_status`/`task_collect`). Once that
@@ -407,9 +411,41 @@ checkout:
 mkdir -p ~/orchestrator && cp scripts/orchestrator-harness/*.sh ~/orchestrator/
 mkdir -p ~/orchestrator/logs ~/orchestrator/state ~/orchestrator/wip
 
-# 2. Point it at your box (all overridable; defaults are the original box's values)
+# 2. Point it at your box. MOST values are overridable with a default; REPO is NOT — see below.
 export OR=daniel-ospina/tortoise         # owner/repo
-export REPO=$HOME/eldato/tortoise        # the local main checkout
+export REPO=$HOME/eldato/tortoise        # REQUIRED: the target repo's local main checkout.
+                                         # FOUR scripts refuse an unset REPO by name:
+                                         # orch-loop.sh and deploy-mac-orchestrator.sh exit 78;
+                                         # install.sh exits 1 via die(); cloud-cell-quiesce.sh
+                                         # exits 1 via ${REPO:?}. deploy-mac-orchestrator.sh
+                                         # RELAUNCHES the controller, so its guard runs BEFORE it
+                                         # stops the running one. Without that, a shipped default
+                                         # naming one developer's home causes one of two things on
+                                         # any other machine: REPO missing -> the controller dies
+                                         # at startup and crash-loops under KeepAlive; REPO wrong
+                                         # but existing -> the refresh aborts every cycle while
+                                         # the controller keeps beating. ⛔ SEVEN shipped SHELL
+                                         # scripts still carry a REPO default of their own — the
+                                         # complete grep over `*.sh`, `retired/` and `*.test.sh`
+                                         # excluded:
+                                         # refresh-candidates.sh:18, report.sh:24,
+                                         # cloud-cell-supervisor.sh:93,
+                                         # deploy-crossbox.sh:23,
+                                         # pi-reap-worktrees.sh:1174 (`${REPO:-$PWD}`),
+                                         # stale-worktrees.sh:35 (`REPO="$PWD"`) and
+                                         # stale-main-triage.sh:16 (`${1:-$PWD}`). The `$PWD`
+                                         # three are the worst shape: $PWD is `/` under launchd,
+                                         # so the default resolves to a real non-repo directory
+                                         # and fails later as `not a git repository: /` instead
+                                         # of at the REPO boundary. ⛔ TWO of the same class are not
+                                         # shell scripts, and they are the rawest form of it — a
+                                         # hardcoded home with NO env override, used only to import
+                                         # the SDK: `goal-state.py:29`
+                                         # (`REPO = "/Users/<someone>/Documents/GitHub/tortoise"`)
+                                         # and `seed-goal-map.py:29` (the same literal passed straight
+                                         # to `sys.path.insert`). Tracked separately. #1977 covers
+                                         # the first and the third; the other five are untracked. So export REPO in
+                                         # the daemon AND the session env (#1935).
 export O=$HOME/orchestrator              # the harness state directory
 export SCOPE=own                         # drain scope: auto (default) | own | broad.
                                          # A fleet runs ONE broad box; the rest pin own (section 5).
@@ -421,8 +457,11 @@ export SCOPE=own                         # drain scope: auto (default) | own | b
 #    `cd ~/orchestrator && ./install.sh` dies with "missing template" — step 1 copies only *.sh.
 bash scripts/orchestrator-harness/install.sh
 
-# 4. Start it when you mean to
-launchctl load -w ~/Library/LaunchAgents/com.eldato.orchestrator-loop.plist
+# 4. Start it when you mean to — the enable/bootout/bootstrap triple, NOT `launchctl load -w`
+#    (see §9's limits-change note and §6.5.6: `unload -w` writes a persistent Disabled override)
+launchctl enable gui/$(id -u)/com.eldato.orchestrator-loop
+launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.eldato.orchestrator-loop.plist 2>/dev/null || true
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.eldato.orchestrator-loop.plist
 ```
 
 Step 3 also records **which harness commit this box runs** in `$O/.agent-infra-stamp.json`
@@ -436,6 +475,10 @@ cat ~/orchestrator/heartbeat                 # epoch seconds, should be < ~5 min
 tmux ls                                      # lane-*, chain-*, merge-*, fix-*
 launchctl unload -w ~/Library/LaunchAgents/com.eldato.orchestrator-loop.plist
 ```
+
+⛔ **A restart after that stop must use step 4's triple, not `launchctl load -w`.** The `unload -w`
+above deliberately writes the persistent Disabled override; `load -w` then depends on a bootstrap
+that failed on 2026-10-17 and left no service at all (§6.5.6).
 
 `install.sh --uninstall` unloads the agent and removes the plist.
 
@@ -471,7 +514,7 @@ secret into a world-readable plist, and launchd inherits no shell environment �
 | `MERGE_PRIORITY_AT` | `25` | above this many **unowned** open PRs (nothing currently working them — no `fix-`/`merge-` session, no live cross-box claim, no unconsumed `needsfix-*` marker), **merging takes priority**: dispatch of new lanes stops (unless none are running) and reviewer **and fixer** headroom rises to `MAX_REVIEW+2` / `MAX_FIX+2`. It was `10` against the TOTAL open count, which capped the fleet on a healthy queue (measured 2026-10-16: `lanes=1` of 32, 59-86% CPU idle, on a cell logging `merge-priority (20 open PRs — draining)` with 17 of those 20 already `BEHIND`/`DIRTY`) |
 | `MAX_FIX` | `3` | concurrent `fix-<PR>` fixers |
 | `MAX_FIX_TRIES` | `3` | per-PR fixer attempts before it is left alone |
-| `MIN_SWAP_FREE` | `600` | MB; with `MAX_LOAD` raised this and `MIN_MEM_FREE_MB` are the binding gates in practice |
+| `MIN_SWAP_FREE` | `600` | MB. ⛔ Two limits worth knowing before trusting it: on a host with **no swap at all** (`SwapTotal: 0`, i.e. a container) the gate is **INERT by design** — `swap_total=0` reads as uninitialised, not as pressure (`orch-loop.sh:1438` for the gate, `:1413-1415` and `:1431` for the rule), so capacity there is decided by load and memory only — and on a host that **has** swap the metric is a level, not a counter: swap that has been used stays used, so a past spike holds the FREE level down and the gate flaps across its own threshold (measured `swap_free=549M<=min_swap_free=600M` at load 5.4 of a 64 ceiling; agent-infra#1961). `MIN_MEM_FREE_MB` is the metric that reflects the present |
 | `MIN_MEM_FREE_MB` | `512` | MB of *available* memory (`MemAvailable` on Linux, else `MemFree`+`Cached`; `free`+`inactive` on macOS). macOS shows pressure as compression with swap flat, so swap alone does not see it |
 | `BATCH` | `2` | issues dispatched per cycle |
 | `CYC` | `240` | seconds between cycles |
@@ -539,7 +582,8 @@ of `MAX_LOAD` headroom, comfortable swap and memory) while dispatch was refused 
 which is why `MAX_LANES` is now derived from cores instead of pinned to a small literal (§4).
 `swap_total=0` right after boot is treated as
 *uninitialised*, not as pressure (that bug silently blocked all dispatch for the first minutes
-after a restart until it was fixed).
+after a restart until it was fixed) — and that same rule makes the gate **inert for ever** on a host
+that never has swap, which is a fact to know rather than a defect to fix here (agent-infra#1961).
 
 **The capacity probes are portable: Linux cell + macOS host.** `#1702`. Every probe used to be a
 macOS primitive, so on a Linux cell `load1()` returned empty (the `MAX_LOAD` gate could never bind),
@@ -677,8 +721,15 @@ clear about what is and is not enforced:
 
 The ritual, in order — the point is that **no uncommitted work is lost**:
 
-1. `launchctl unload -w …` — so it does not restart on boot.
-2. `pkill -f orch-loop.sh`, then `rm -f $O/.orch.lock`.
+1. `launchctl unload -w …` — so it does not restart on boot. (Restarting it later needs the
+   `enable`/`bootout`/`bootstrap` triple in §4 step 4, never `load -w` — §6.5.6.)
+2. `pkill -f "[b]ash $O/orch-loop.sh"` — SCOPED on purpose: an unscoped `-f orch-loop.sh` also
+   matches peer controllers, fixtures and tests (`deploy-mac-orchestrator.sh:51-56` measured four),
+   and `[b]` keeps the pattern from matching the pkill command line itself. ⛔ **Verify before you
+   delete the lock:** the scoped pattern does NOT match a `cd ~/orchestrator && ./orch-loop.sh`
+   start (`bash ./orch-loop.sh`), so run `pgrep -fl '[o]rch-loop'` and confirm YOUR controller is
+   gone. Removing the lock while it still sweeps lets the next start pass `acq()` — two autonomous
+   controllers on one PR queue, which §5.2/§5.3 assume cannot happen. Then `rm -f $O/.orch.lock`.
 3. Freeze workers: `tmux kill-server` (or kill sessions individually) and check for strays.
 4. Capture every dirty worktree: `git -C <wt> diff HEAD > $O/wip/<name>.patch`, plus a
    copy of untracked files and a `.status` file recording `git status --porcelain`.
@@ -712,6 +763,12 @@ done | sort -k3 -n -r | head
 `orch-loop.sh` now reaps these itself (`STALE_MIN`, default 40): the session is killed and the PR
 is re-dispatched on the next sweep, with `claim_live()` freeing the dead owner's claim.
 
+⛔ **That is ONE signal over ONE population** — the controller's own tmux sessions, judged on log
+mtime, and only while the controller itself is alive. It also decides on a **single** mtime sample,
+with no CPU tolerance and no second observation. A lane on a box with no controller, or a process
+that left no log, is outside it too. §6.5.1 states the requirement; do not read this paragraph as
+satisfying it.
+
 ### Reading the logs
 
 `$O/logs/orch-loop.log` is the controller's decision log; every line is prefixed by a tag:
@@ -741,6 +798,220 @@ READ state beside it, and `EMPTY` is the only form that means "no work":
 
 The age is part of the token on purpose: a value frozen by a refresh that stopped writing cannot pass
 as a fresh reading. `UNKNOWN` means no pass has EVER recorded a read — it is not `EMPTY`.
+
+---
+
+## 6.5 Self-healing: wedges
+
+> ⛔ **REQUIREMENTS, not a description of this tree.** Each item is what a conforming install MUST
+> do, with the measurement that motivates it, and each ends with the honest status of the shipped
+> code today — `IMPLEMENTED` with its `file:line`, `PARTIAL` (naming which half is missing), or
+> `GAP` with the tracker. Read it as the standard a box is judged against. A requirement nothing
+> implements must never read as a feature, because the whole class it describes is INVISIBLE: the
+> box looks alive and does nothing. Line numbers are as of this commit — a `file:line` here is a
+> pointer to the code that exists NOW, and a rewrite (agent-infra#1976 rewrites §6.5.6's) moves it.
+>
+> The owner requirement, verbatim: *"the harness must automatically un-wedge lanes, automatically fix
+> PRs, and automatically dispatch issues."* Those are one requirement seen from three sides —
+> something must NOTICE, DECIDE and ACT on a schedule that does not depend on the controller being
+> healthy. **THIS section specifies the first side — un-wedging — in full.** The other two are
+> specified where they are built and are not repeated here: fixing a PR is §5 (`merge-one.sh` marks
+> `needsfix-*`, `fix-one.sh` fixes and re-runs the chain) and dispatching issues is §2/§7.2d
+> (capacity-gated dispatch against the claimed backlog). Both are IMPLEMENTED; neither is
+> re-specified below, so do not read this section's statuses as verdicts on them.
+
+### 6.5.1 A stuck lane is reaped, on a bound that is a number
+
+**MUST.** Every lane in the fleet's own enumeration whose progress signal has not advanced for a
+stated bound is reaped with no human. The bound is a **number**; it is judged against the lane's
+**OWN** expected duration (never another class of process's); and the decision takes **two
+consecutive observations**, or an explicit CPU tolerance, never one reading — a single sample cannot
+tell a long model call from a freeze.
+
+**Why (measured).** One **4-core cell** — §4's derivation gives that box `MAX_LANES=10` — held **10
+lanes aged 17–29 hours**, each with *minutes* of CPU and no progress, plus a **5.8 GB** abandoned
+worktree. That is a box at its lane ceiling, with a full disk, producing nothing — and nothing reaped
+any of them. A human found it by reading a report, which is the gap stated exactly: the condition had
+no signal of its own.
+
+**Status: PARTIAL — the controller's own lanes ARE reaped, and even that half breaches two clauses of
+this MUST: one mtime sample with no CPU tolerance, and one 40-minute bound applied to `lane`, `merge`
+and `fix` alike rather than per class. The fleet-wide requirement is not met.**
+`reap_stale_workers()` (`orch-loop.sh:420`) reaps only the controller's OWN
+`lane|merge|fix` tmux sessions, on log-mtime staleness past `STALE_MIN=40` (`orch-loop.sh:409`) —
+one signal, one population, and only while a controller is alive. The fleet-level reapers are
+launchd jobs (`templates/launchd/com.tortoise.worktree-reaper.plist`,
+`com.eldato.pi-session-reaper.plist`), i.e. **absent on a Linux cell** (agent-infra#1864, #1927).
+`tools/fleet/lane_liveness.py:68` deliberately REPORTS `dead` and files an issue, and reaps nothing.
+The worktree reaper ships **dry-run** and preserves anything with uncommitted work
+(`pi-reap-worktrees.sh:8-32,194`). What is missing is not another kill. The process reaper in §6.5.3
+already exists — and #1859, closed 2026-10-16, found it **dead because its script had been recovered
+and was never reinstalled**: it survived only as
+`~/.pi/agent/state/recovered-1161/pi-reap-orphans.sh.with-ancestry-gate`, with no job pointing at it
+(its last run was Sep 16, as of that close). That is the same defect as §6.5.6, stated twice in three
+days: **a fix that exists is not a fix.** So the live trackers are agent-infra#1244 (the lane-level
+rule exists only as prose), #1862/#1863 (restore the orphan reaper **and schedule it**), and #1927 (a
+scheduler the cells run).
+
+### 6.5.2 The instrument that decides must itself be bounded
+
+**MUST.** The read that decides whether a lane is wedged has an **overall wall-clock budget for the
+whole read** — not a per-call one, which bounds each `cmux`/`ps` call and lets total cost grow with
+the number of lanes. When the budget expires the read returns **FAILED**. "Cannot read" and "nothing
+there" must never render identically, and a timeout must never become an empty successful result.
+
+**Why (measured).** The lane snapshot took **>60 s under load**, and its caller — `pr-doctor`, the
+pass whose whole job is un-wedging lanes — refused itself. The whole failure is ONE log line, wrapped
+here for width with the interpreter path elided (the log carries this box's home):
+
+```text
+[<ts>] pr-doctor: LANE READ FAILED -- cannot dispatch this pass: lane-actions read failed rc=1:
+  lane-actions: lane-status.py failed: TimeoutExpired(['/usr/bin/python3', '<…>/lane-status.py',
+  '--json', '--sample', '12.0'], …)
+```
+
+Five message variants carry that one line. Counted over the **distinct failed passes** in the log
+(log-LINE counts in brackets, because a wrapped line is not a second pass) at the 2026-10-18T00:42Z
+read — **800** passes, 1318 lines: `lane-status.py failed: TimeoutExpired` **483** (798), `REFUSING a
+DEGRADED snapshot` **247** (425), `snapshot UNVERIFIABLE (N of an unknown fleet size) -- re-scanning
+without the cache` **61** (80), and **9** in two rarer forms (`TIMEOUT … no answer within 300s`, 1
+pass / 2 lines; and `rc=-1: TimeoutExpired` under a CommandLineTools interpreter, 8 passes / 13
+lines). In the third the cached scan
+declines to vouch for a roster it cannot see whole, so it re-scans uncached, which is the read that
+times out in the first; in the second the reader refuses a snapshot it can see is degraded. Either way
+the cost grows with the number of lanes, the only bound on the WHOLE read is a CALLER's, and the pass
+dies instead of returning a verdict. The log keeps growing, so treat these as a dated snapshot, not a
+constant.
+
+Measured in `~/.pi/agent/state/pr-doctor.log`, read 2026-10-18T00:42Z:
+
+| day | failed passes | successful passes | share failed |
+|---|---|---|---|
+| 2026-10-16 | 148 | 192 | **44%** — the “every other run” figure |
+| 2026-10-17 | 47 | 149 | 24% |
+
+Counted as distinct timestamps, with `pass:` lines as the successes. The un-wedger could not read the
+thing it un-wedges for a large share of a day, and each failed pass dispatched nothing.
+
+**Status: PARTIAL — the polarity is IMPLEMENTED, the bound is a GAP.** `lane-status.py:1689` raises
+`SystemExit(3)` rather than publish an empty roster; `lane-actions.py:153` refuses a `degraded`
+snapshot; `queue-dispatch.py:320,377` raises `LaneReadError` naming the timeout instead of returning
+`[]`; `pr-doctor.py:809-819` refuses the pass **when it has work to place** — and deliberately
+stays exit 0 on a blind read with nothing classified, because manufacturing a failure out of an idle
+beat is its own defect (`:812-819`). What does not exist is a deadline
+inside the READER, and `queue-dispatch.py:110` says so outright — *"lane-status.py has no internal
+deadline, so this is the only stop between a stalled scan and an unbounded wait"*. Every bound on the
+WHOLE read is a CALLER's — 300 s (`lane-actions.py:1528`), 600 s (`queue-dispatch.py:110`), 600 s
+(`pr-doctor.py:389`) — which is why the caller fails instead of getting an answer. (The reader does
+hold per-CALL bounds -- 60 s, 45 s, 45 s at `lane-status.py:267,383,599` -- and that is exactly the
+shape this MUST rules out: it bounds each probe and lets their SUM grow with the fleet.)
+agent-infra#1774, #1788.
+
+### 6.5.3 Ancestry is the safety rail
+
+**MUST.** Any process whose chain reaches a human terminal (`Terminal.app`, `iTerm`, a login shell)
+is never touched, however parked it looks. `ppid 1` proves nothing on its own: a daemonising service
+reparents to 1 **by design**. If either read is ambiguous, REPORT and do not reap.
+
+**Why.** It is the one gate that stops a reaper destroying a human's work, and both failure
+directions have already been measured: too little reaping (the ≈22 CPU-hours across six undetected
+runaways recorded on #1142) and too much (#1393 deleted a live worktree). A reaper that skips this
+gate is a lane-killer, not a reaper.
+
+**Status: IMPLEMENTED** — by three carriers that do NOT carry the same gates, so say which one you
+mean. `orphan-reap.py` walks to the top (`ancestry()`, `:175`; the rule at `:17-19`) **and** adds the
+two gates `ppid 1` cannot express: launchd registration (gate 4 — a managed daemon has an owner) and
+designed-daemon (gate 5 — pidfile, daemon flag, recently-touched output, or any live holder of a
+socket it owns). Gate 5 was added AFTER a dry run passed gates 1-4 on three processes and all three
+were wrong to reap (gate 4 came earlier, after the reaper killed the owner's own UI). It ships
+**dry-run** (`:195`) and nothing schedules it today (§6.5.1).
+`lane-watchdog.py:467` (`human_above()`) has the ancestry walk only — armed by
+`heartbeat-loop.sh:365-368`, and one of the two carriers that actually RUN. `pi-reap-idle.sh` carries
+the same idea as an ADDITIVE third gate that can only REFUSE (`:55`, `:381-429`), and its hourly job
+ships armed. ⛔ Note what is NOT that guard:
+`reap_stale_workers()` (`orch-loop.sh:420`) kills by **tmux session name**, which is safe for the
+sessions the harness itself created and is not an ancestry test — do not read one as the other.
+
+### 6.5.4 Reaping releases what the lane held
+
+**MUST.** A reap returns the lane's resources: its worktree, its branches, and its test container.
+Otherwise "reaped" means "the process is gone and the disk is still full", which is the state the
+5.8 GB measurement is actually about.
+
+**Status: GAP** on all three — but for three different reasons, and only the first is by design:
+
+- **Worktree.** Removed only when it is clean, unreferenced, reachable and **7 days** old
+  (`pi-reap-worktrees.sh:8-32`, and the job ships dry-run, `:194`), so an abandoned worktree holding
+  any uncommitted work is PRESERVE by construction. Correct, and not a release.
+- **Branches.** A deleter exists and is fenced — `cleanup-stale-branches.sh` runs `git branch -d`, then
+  falls back to a compare-and-swap only for the `merged` class (`:2044`, `:102-110`), and its remote
+  leg is `git push origin --delete --force-with-lease=<ref>:<oid>` (`:1546`, again `:1657`). Nothing in
+  the harness invokes it: the reapers here never delete a branch, and its own job ships with NO
+  execute flag, so the pass "classifies and reports and deletes nothing"
+  (`templates/launchd/com.tortoise.branch-reaper.plist:40-43`).
+- **Test container.** **No harness code manages one.** On a Mac cell the heaviest disposable thing a
+  lane owns is its `.venv` — agent-infra#1949 exists to reap exactly that and is still open; a Linux
+  cell has no container lifecycle here at all.
+
+agent-infra#1858 (disk measurement), #1864/#1927 (scheduling).
+
+### 6.5.5 What is deliberately NOT automatic
+
+**MUST.** The following stay out of automation, with the reason stated rather than assumed:
+
+- **A candidate with diagnostic value stays.** Evidence beats tidiness — `orphan-reap.py:36`
+  ("Reapable != right to reap"), and `pi-reap-worktrees.sh`'s PRESERVE verdicts.
+- **Arming is a per-machine operator decision, and the shipped default DIFFERS by job — say which
+  one you mean.** The worktree reaper ships DRY-RUN (`pi-reap-worktrees.sh:194`), and so does
+  `orphan-reap.py` (`:195`) — with nothing scheduling it. The two that actually run are ARMED:
+  `heartbeat-loop.sh:365-368` passes `--apply` unless `LANE_WATCHDOG_APPLY=0`, and
+  `com.eldato.pi-session-reaper.plist:30,49-50` sets `REAP_DRY_RUN=0` "by design". The rule that
+  decides it is the same either way: a wrong reap destroys work, a wrong non-reap only costs disk.
+- **`lane_liveness.py` never acts on `wedged`/`idle`** — it escalates `dead` only (`:68`). The one kill
+  on a wedge signal is `lane-watchdog.py` (`os.kill`, `:623`), and it targets a frozen CHILD process,
+  never the lane.
+- **A P0-consequence action stays human** (data loss, deletion, spend) — the standing rule in
+  `AGENTS.md`. Automatic reaping is bounded by exactly that line.
+
+**Status: PARTIAL — three of the four exclusions are code; the fourth is prose only.** Each bullet
+names where its exclusion actually lives; there is no single file that says "these four stay human".
+`orphan-reap.py`'s five gates and `pi-reap-worktrees.sh`'s PRESERVE verdicts are real checks;
+"P0-consequence" is an instruction to whoever arms the job, and nothing verifies it.
+
+### 6.5.6 The controller must be un-removable by a routine install
+
+**MUST.** `install.sh` must **enable and load** the job (`launchctl enable` → `bootout` →
+`bootstrap`, falling back to legacy `load`, and saying which path ran), **assert** the outcome (the
+label loaded with a pid, and the heartbeat file advancing within ~30 s), and exit **non-zero** if
+either fails. A **watchdog** must restore a REMOVED service: `KeepAlive` relaunches a job that EXITS
+(a bare `<true/>` on ANY exit, not only a crash — `launchd.plist.template:15-18`), and does nothing
+for a job that is no longer loaded.
+
+**Why (measured).** `launchctl unload -w` **writes a persistent Disabled override**, and the `load -w`
+that follows has to bootstrap to clear it — and that bootstrap is what failed on 2026-10-17
+(`Bootstrap failed: 5: Input/output error`). launchd's own log:
+
+```text
+15:21:41  Setting service com.eldato.orchestrator-loop to disabled
+15:21:41  removing service: com.eldato.orchestrator-loop
+```
+
+The controller was **absent**, not crashed, and it dispatched nothing for 48 minutes and then 19,
+with the heartbeat simply gone — the only signal that it had happened. ⛔ **The safe sequence, and the
+one to copy: `launchctl enable` → `launchctl bootout` → `launchctl bootstrap`, exactly as
+`scripts/install-launchd.sh:275-285` does it (removing the plist if `bootstrap` fails) — never
+`unload -w` followed by `load -w`.** §9's limits-change note now gives the same safe sequence; what
+is still unsafe is `install.sh:698`, which PRINTS `launchctl load -w` and does not load anything at all
+(#1976).
+
+**Status: GAP.** `install.sh:698` only PRINTS the load command and never `enable`s or loads;
+`--uninstall` (`install.sh:107`) runs `launchctl unload -w`, i.e. it WRITES the override; nothing
+asserts the heartbeat; and nothing **restores a job that has been disabled or booted out, or asserts
+that it came back** — `KeepAlive`/`RunAtLoad` (`launchd.plist.template:15-18`) relaunch a job that
+EXITS, which is not the same state as one launchd no longer has, and `com.eldato.lane-liveness.plist`
+watches LANES by design with no controller alive. The correct pattern already exists in this repo — `scripts/install-launchd.sh:275-285`
+does `enable` + `bootout` + `bootstrap` and removes the plist when `bootstrap` fails.
+agent-infra#1975, #1976, #1860.
 
 ---
 
@@ -1189,10 +1460,12 @@ were deleted.
   under the label the hand-made duplicate already used (so the installer converges that machine
   rather than stranding a duplicate), and `pi-bootstrap/setup.sh` (fleet_srcs) farms the script to
   the path the plist executes.
-- **Three worker launch paths spawn ungated (agent-infra#1720).** `chain-<N>` → `merge-one.sh` (the
-  first-review path for every own-lane PR), `fix-one.sh` → `merge-one.sh` and `adopt-fix.sh` →
-  `fix-one.sh` read no `MAX_LOAD`; only the controller's five spawn *decisions* are gated, and §4
-  says so.
+- **Two worker launch paths still spawn ungated (agent-infra#1720, partly fixed).** `merge-one.sh`'s
+own `run_agent` (reached by `chain-<N>` — the first-review path for every own-lane PR — and by
+  `fix-one.sh`) and `cloud-cell-bringup.sh:278` read no `MAX_LOAD`. `lane.sh`, `fix-one.sh` and
+  (through it) `adopt-fix.sh` now call the shared `run_agent()` in `spawn-gate.sh`, which is what this
+  entry used to list as ungated; both residuals are asserted BY NAME in `spawn-gate.test.sh:125-140`
+  (§9).
 
 ---
 
@@ -1237,6 +1510,7 @@ algorithmic advantage. The claim worth evaluating is *utilisation*, not *efficie
 | `orch-loop.sh` | the controller: merge sweep → capacity-gated dispatch → backlog refresh |
 | `claims.sh` | cross-box claim registry: `refs/claims/<PR>-<head-sha12>` for PRs and `refs/claims/issue-<N>` for issues (agent-infra#1850), same CAS, lease-as-data and `--force-with-lease` fencing. Sourced by `orch-loop.sh`, `refresh-candidates.sh`, `chain-merge.sh`, `dispatch-merge.sh`, `merge-one.sh` and `fix-one.sh` |
 | `repo-authority.sh` | **the per-repo merge contract** (agent-infra#1764): reads THIS repo's required status checks and derives whether the review gate applies to it, so the controller no longer enforces tortoise's check names on every repo. Fail-closed — an unreadable or unrepresentable set refuses. Sourced by `orch-loop.sh` and `merge-one.sh` |
+| `spawn-gate.sh` | the load and disk gate (`disk_free_mb`/`disk_ok` `:193-231`, `can_spawn` `:269`) plus the ONE `run_agent()` (`:305`) used by `lane.sh` and `fix-one.sh`, so a `lane`/`fix` worker started by hand is gated exactly like one the controller spawned. ⛔ Not every spawn goes through it: `merge-one.sh` defines its own `run_agent` (`:74`, called `:461`) for the reviewer, and `cloud-cell-bringup.sh:278` invokes `pi -p` with no gate at all (`agent-infra#1720`). Both residuals are asserted **by name** in `spawn-gate.test.sh:125-140`, whose census is an EQUALITY over `scripts/` — so a new ungated invoker fails the suite instead of arriving unannounced, within that census's three declared limits (`spawn-gate.test.sh:98-106`) |
 | `dispatch-merge.sh` | creates the worktree and starts the `lane-*` + `chain-*` pair for an issue |
 | `lane.sh` | the implementation worker (prompt template included) |
 | `chain-merge.sh` | waits for the lane's PR, then runs the merge chain |
@@ -1291,21 +1565,27 @@ and over a copy whose bytes matched `main` but which carried no git identity. Th
 same class with a worse starting point — no record at all — so its absence fails the check loudly
 instead of reading as healthy.
 
-**Portability edits applied to every shipped script.** Three per-box constants became
-overridable with this box's values as defaults (the launchd `PATH` is no longer one of them —
-`install.sh` renders the `__PATH__` placeholder from the directories `tmux`/`gh`/`uv`/`pi` actually
-resolve to, refusing any `*/shims`, `*/shims/*` or `*/.pi/*` directory because macOS TCC makes such
-a symlink EPERM under launchd, and then probes each tool by executing it):
+**Portability edits applied to the shipped loop.** Three per-box constants became overridable — with
+this box's values still the default for `OR` and `O`, and **no default in the scripts that refuse
+their own REPO**; SEVEN shipped shell scripts still carry one, plus an eighth instance in a `.py`
+(#1935/#1977, enumerated in §4 step 2). The launchd
+`PATH` is no longer one of them: `install.sh` renders the `__PATH__` placeholder from the directories
+`tmux`/`gh`/`uv`/`pi` actually resolve to, refusing any `*/shims`, `*/shims/*` or `*/.pi/*` directory
+because macOS TCC makes such a symlink EPERM under launchd, and then probes each tool by executing it.
+⛔ Cite the two helper defaults by SYMBOL (`REPO="${REPO:-…}"`), not by line: #1977 deletes those
+exact lines.
 
 ```bash
 OR="${OR:-daniel-ospina/tortoise}"
-REPO="${REPO:-/Users/danielospina/Documents/GitHub/tortoise}"
+REPO="${REPO:-}"        # ⛔ REQUIRED, no default — the loop refuses it by name (above;
+                        # refresh-candidates.sh:18 and cloud-cell-supervisor.sh:93 are
+                        # #1977's; five more carry one, listed in step 2)
 O="${O:-$HOME/orchestrator}"
 ```
 
 The shipped copies are **not** byte-identical to the ones running on the original box: they are
-those copies **plus every §7.4 fix** (and the §7.4b and §7.4c ones). `install.sh` compares the scripts it invokes — the nine loop
-scripts in §9 plus the manual `adopt-fix.sh` — against the running copies at `$O` and warns loudly
+those copies **plus every §7.4 fix** (and the §7.4b and §7.4c ones). `install.sh` compares the scripts it invokes — the ten loop
+scripts in §9 plus the manual `adopt-fix.sh`, and `gh-rest/gh` — against the running copies at `$O` and warns loudly
 on drift, because the daemon executes `$O/<script>` — a fix that only lands in this directory is not
 in effect. That set is the one `install.sh`'s drift loop lists; `selftest.sh` is shipped but not
 compared, since the daemon does not run it. If you are adopting this onto an existing box, sync
@@ -1316,15 +1596,34 @@ environment block, rendered by `install.sh` from these defaults, and that enviro
 script's own**. A job already loaded with `MAX_LOAD=16` keeps `16` no matter what `orch-loop.sh` now
 defaults to. `install.sh` overwrites the plist *file* but does not reload an already-loaded job, and
 `launchctl load -w` on a job that is already loaded does not reliably re-read it. So for a limits
-change: re-run `./install.sh`, then `launchctl unload -w <plist> && launchctl load -w <plist>` — or
-reboot, which is the only thing that reliably re-reads it — before trusting the new value.
+change: **FIRST** `launchctl print gui/$(id -u)/com.eldato.orchestrator-loop` — and if a
+session-started controller holds `$O/.orch.lock`, stop it per §6 (scoped `pkill`, then verify); **ONLY
+THEN** re-run `./install.sh` and `launchctl enable gui/$(id -u)/com.eldato.orchestrator-loop`,
+`launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.eldato.orchestrator-loop.plist`,
+`launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.eldato.orchestrator-loop.plist` — or reboot,
+which is the only thing that reliably re-reads it — before trusting the new value.
+⛔ **NOT the `unload -w` / `load -w` pair this file used to prescribe.** `unload -w` writes a
+PERSISTENT Disabled override and the `load -w` that follows has to bootstrap to clear it — which is
+what failed on 2026-10-17 and left the controller ABSENT for 48 minutes (§6.5.6). The three calls
+above are what `scripts/install-launchd.sh:275-285` runs, including the plist path on `bootout` — and
+copy its two guards as well: it tolerates a failing `enable`/`bootout` and **removes the plist if
+`bootstrap` fails**, so a failed load leaves nothing half-installed. `install.sh:698` does not run any
+of them yet (#1976).
 
-⚠️ **And `launchctl unload` touches nothing when the controller was not started by launchd.** On this
-box the loop runs as `nohup … orch-loop.sh` from a session — `launchctl list | grep orchestrator` is
-empty even though the plist exists — so the unload/load pair is a no-op and the old process keeps the
-old limits: the operator believes a limits change took effect when it did not. Check with
-`launchctl list` before trusting the pair, and stop a session-started controller with
-`pkill -f orch-loop.sh` (§6) rather than with `launchctl`.
+⚠️ **And a controller that was not started by launchd is not controlled by those calls — and
+`bootstrap` makes it WORSE, not merely unchanged.** On this box the loop runs as `nohup …
+orch-loop.sh` from a session — `launchctl list | grep orchestrator` is empty even though the plist
+exists — so `enable` and `bootout` do nothing. But `bootstrap` **loads the job**: `RunAtLoad` starts a
+second `orch-loop.sh`, that one exits 0 at once on the `.orch.lock` branch (`orch-loop.sh:385`), and a
+bare `KeepAlive <true/>` relaunches on ANY exit — so launchd respawns it every ~10 s while the real
+session controller keeps running, and the operator believes a limits change took effect when it did
+not. **Check `launchctl list` first and stop the session-started controller BEFORE bootstrapping**,
+with a SCOPED match — `pkill -f "[b]ash $O/orch-loop.sh"` (§6). An unscoped `pkill -f orch-loop.sh`
+also matches peer controllers, fixtures and tests: `deploy-mac-orchestrator.sh:51-56` measured FOUR
+matches for one controller and scopes its own pgrep for exactly that reason. **Verify with
+`pgrep -fl '[o]rch-loop'` before you bootstrap** — the scoped pattern does not match a
+`cd ~/orchestrator && ./orch-loop.sh` start, and a controller that is still alive will simply win the
+lock race against the one launchd spawns.
 
 Everything else is still tortoise-shaped and must be changed on another target: the branch
 suffix (`tm`), `feat/<N>-tm` naming, `lane.sh`'s `uv sync --extra embeddings --extra parity`, the

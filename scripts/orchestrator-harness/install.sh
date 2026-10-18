@@ -14,7 +14,11 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 O="${O:-$HOME/orchestrator}"
-REPO="${REPO:-/Users/danielospina/Documents/GitHub/tortoise}"
+# ⛔ NO PATH DEFAULT (same rule as orch-loop.sh's own REPO). A default naming ONE developer's home
+# is a fleet-wide outage on every other machine: the rendered plist then points at a path that does
+# not exist there, and the daemon crash-loops under KeepAlive on a FATAL it can never satisfy.
+# Required, validated by the `git rev-parse` below, and named in the refusal.
+REPO="${REPO:-}"
 OR="${OR:-daniel-ospina/tortoise}"
 
 # sanity ceiling only; the swap/RAM gates below are the real constraint.
@@ -290,6 +294,7 @@ fi
   || warn "~/.pi/agent/scripts/record-review.sh missing — record step will fail (shipped by agent-infra)"
 
 # ── target repo ──────────────────────────────────────────────────────────────────
+[ -n "$REPO" ] || die "REPO is not set — export REPO=<the target repo's checkout> (README §4 step 2). This installer does not guess one: a default is how every box but the author's pointed at a path that does not exist."
 git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1 || die "not a git checkout: $REPO"
 git -C "$REPO" check-ignore -q .worktrees/ \
   && ok "$REPO/.worktrees is gitignored" \
