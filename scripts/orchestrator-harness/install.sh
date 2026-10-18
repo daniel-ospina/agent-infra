@@ -104,9 +104,21 @@ CYC="${CYC:-240}"
 # silently evaporate the pin — the exact failure the whole SCOPE override exists to prevent.
 [ -z "${SCOPE+x}" ] && SCOPE=auto
 
-LABEL="com.eldato.orchestrator-loop"
+# ⛔ THE LABEL AND THE TEMPLATE ARE THE SAME CHOICE (agent-infra harness cohesion, 2026-10-18).
+# Hardcoded, this installer rendered `com.eldato.orchestrator-loop` — a job that runs `$O/orch-loop.sh`
+# ALONE — while the box was running `com.eldato.orchestrator-stack`, a job that runs `$O/supervisor.sh`
+# and therefore the digest / PR watcher / finisher too. So `install.sh --restart`, the documented
+# recovery, would have booted out the supervisor stack and bootstrapped a bare loop: three workers
+# silently gone, and the command that is supposed to repair the box was the one that hollowed it out.
+# The pair is overridable so the renderer can name the job that is actually loaded, and harness.sh is
+# the caller that passes them (see launchd-stack.plist.template for which template is which).
+# ⛔ Defaults are UNCHANGED: an existing caller that passes neither still renders the single-loop job.
+LABEL="${LABEL:-com.eldato.orchestrator-loop}"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
-TEMPLATE="$HERE/launchd.plist.template"
+TEMPLATE="${TEMPLATE:-$HERE/launchd.plist.template}"
+case "$LABEL" in
+  ''|*/*|*' '*) die "LABEL must be a launchd label (no '/', no spaces): '$LABEL'" ;;
+esac
 # Seconds to wait for the label to show a pid AND for $O/heartbeat to advance after a start. The loop
 # writes the heartbeat at the TOP of every cycle, so a live controller refreshes it within seconds of
 # being launched; 30s is slack for a cold start, not a cycle's worth of work.

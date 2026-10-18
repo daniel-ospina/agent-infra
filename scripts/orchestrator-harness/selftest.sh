@@ -2903,6 +2903,26 @@ else
   ck "sweep-quota.test.sh: the #1762 suite is present" 1
 fi
 
+# ── P) ONE entry point: deploy, refuse, and report honestly ──────────────────────
+# The harness was three unrelated acts (raw `cp -R` in bg/finish.sh, install.sh rendering a DIFFERENT
+# launchd label than the box ran, and no proof the running bytes were the repo's). `harness.sh` composes
+# them; its own hermetic suite pins that a deploy is all-or-nothing, that a stale deployed file is NAMED
+# with a non-zero exit, that no provenance record is UNKNOWN and never a pass, and that a restart which
+# does not come up exits non-zero. Run it here so `./selftest.sh` stays the one command that pins the
+# harness.
+for _suite in harness.test.sh supervisor.test.sh; do
+  if [ -f "$HERE/$_suite" ]; then
+    if bash "$HERE/$_suite" > "$TMP/$_suite.out" 2>&1; then
+      ck "$_suite: the one entry point / the liveness tick behaves as pinned" 0
+    else
+      ck "$_suite: the one entry point / the liveness tick behaves as pinned" 1
+      grep -E 'FAIL|==>' "$TMP/$_suite.out" | sed 's/^/      /' | tail -20
+    fi
+  else
+    ck "$_suite: the suite is present" 1
+  fi
+done
+
 # ── 21) deployed-harness provenance and drift (#1745) ────────────────────────────
 # The cloud cells got a provenance layer in #1790; the LAPTOP stayed uncovered —
 # `cd ~/orchestrator && git rev-parse --show-toplevel` printed "fatal: not a git repository", so

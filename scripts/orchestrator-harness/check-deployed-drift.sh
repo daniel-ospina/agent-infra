@@ -2,7 +2,7 @@
 # check-deployed-drift.sh — does the DEPLOYED harness at $O match the repo?
 #
 #   ./check-deployed-drift.sh [--o <dir>] [--repo <path>] [--ref <git-ref>] [--rel <path>]
-#                             [--quiet] [--no-fetch]
+#                             [--quiet] [--no-fetch] [--all]
 #
 # Exit: 0 = match, 1 = drift, 2 = UNKNOWN (cannot verify — NEVER a pass).
 #
@@ -55,9 +55,17 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # `REPO` in particular DOES have an env convention in `install.sh`/`report.sh`/`orch-loop.sh`, and
 # this comment previously claimed none existed. File/line citations are deliberately absent: an
 # earlier revision cited a sibling line that this same change had already shifted.
-REPO=""; REF=""; REL=""; QUIET=0; FETCH=1
+REPO=""; REF=""; REL=""; QUIET=0; FETCH=1; ALL=0
 DEFAULT_REF="${HARNESS_REF:-origin/main}"
 
+# `--all` prints a line for EVERY shipped file, not only the ones that disagree — the per-file
+# SAME/DIFF/MISSING listing an operator asks for when proving a deploy landed. It changes no verdict:
+# the exit code is still 0/1/2 from the same three checks. Added 2026-10-18 so `harness.sh drift` does
+# not re-implement the comparison to display it (one authority per question).
+# `--all` prints a line for EVERY shipped file, not only the ones that disagree — the per-file
+# SAME listing an operator asks for when proving a deploy landed. It changes no verdict: the exit code
+# is still 0/1/2 from the same three checks. Added 2026-10-18 so `harness.sh drift` does not
+# re-implement the comparison just to display it (one authority per question).
 while [ $# -gt 0 ]; do
   case "$1" in
     --o)        [ $# -ge 2 ] || { echo "check-deployed-drift: --o needs a path" >&2; exit 2; }
@@ -70,6 +78,7 @@ while [ $# -gt 0 ]; do
                 REL="$2"; shift 2 ;;
     --no-fetch) FETCH=0; shift ;;
     --quiet)    QUIET=1; shift ;;
+    --all)      ALL=1; shift ;;
     -h|--help)  awk 'NR>=2 && /^set -u$/{exit} NR>=2{print}' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *)          echo "check-deployed-drift: unknown argument: $1" >&2; exit 2 ;;
   esac
@@ -212,7 +221,12 @@ while IFS= read -r f; do
   want="$(git -C "$REPO" rev-parse --verify --quiet "$TIP:$f" 2>/dev/null || true)"
   [ -n "$want" ] || unknown "cannot read $f at $TIP — cannot verify the deployed $d"
   [ -n "$have" ] || unknown "cannot read $O/$d (unreadable?) — cannot verify it"
-  [ "$have" = "$want" ] || drift "$d — the deployed copy DIFFERS from the repo at $REF ($want)"
+  if [ "$have" = "$want" ]; then
+    # An `if`, not `[ … ] && …`: the AND-OR list's status is 1 in the ordinary case.
+    if [ "$ALL" -eq 1 ]; then note "identical: $d"; fi
+  else
+    drift "$d — the deployed copy DIFFERS from the repo at $REF ($want)"
+  fi
 done < "$TMPD/repo-sh"
 
 while IFS= read -r d; do
@@ -223,8 +237,9 @@ done < "$TMPD/deployed-sh"
 if [ "$problems" -gt 0 ]; then
   bad ""
   bad "check-deployed-drift: the deployed harness at $O does NOT match $REPO@$REF ($TIP_SHORT)"
-  bad "  remedy: sync the harness into \$O and re-run install.sh so the record names the running bytes:"
-  bad "    cp '$REPO/$REL'/*.sh '$O'/   &&   O='$O' bash '$REPO/$REL/install.sh'"
+  bad "  remedy: deploy AND restart from the repo in one verified step — never a bare cp, which"
+  bad "  cannot stamp the record and can swap orch-loop.sh under a running controller:"
+  bad "    O='$O' REPO='$REPO' bash '$REPO/$REL/harness.sh' restart"
   exit 1
 fi
 note "OK: deployed $O matches $REPO@$REF ($TIP_SHORT) — recorded commit ${HAS:0:12}, payload ${LIVE:0:12}"

@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- com.eldato.orchestrator-stack — THE job a whole-box orchestrator runs under.
+
+       ⛔ WHICH TEMPLATE IS WHICH, because running the wrong one is a silent fleet change:
+         • launchd.plist.template       → the job runs `$O/orch-loop.sh` ALONE. One process. No
+                                          supervisor, so nothing restarts the controller, and the
+                                          digest / PR watcher / finisher never run at all.
+         • launchd-stack.plist.template → the job runs `$O/supervisor.sh`, which keeps the controller
+                                          AND those three workers alive at one instance each.
+       On 2026-10-18 the live box ran THIS one (com.eldato.orchestrator-stack) while install.sh
+       rendered the other: `install.sh --restart` therefore did not restart the running stack, it
+       would have replaced it with a bare loop and silently dropped three workers. harness.sh
+       passes LABEL/TEMPLATE explicitly so the renderer and the loaded job cannot disagree.
+
+       Render with:
+         LABEL=com.eldato.orchestrator-stack \
+         TEMPLATE=launchd-stack.plist.template \
+         O=… REPO=… bash install.sh
+       or, the supported way, `harness.sh deploy|restart`, which does that for you and verifies it. -->
+  <key>Label</key>
+  <string>com.eldato.orchestrator-stack</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>__O__/supervisor.sh</string>
+  </array>
+
+  <!-- RunAtLoad: start on login. KeepAlive: relaunch the SUPERVISOR if it exits. KeepAlive does NOT
+       cover a wedged controller — a live process with a frozen heartbeat is not an exit — which is
+       what supervisor.sh's own liveness tick exists to report (and, opt-in, to repair). -->
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>__O__/logs/stack.out</string>
+  <key>StandardErrorPath</key>
+  <string>__O__/logs/stack.err</string>
+
+  <!-- launchd gives no shell env, so EVERY binary the stack shells out to must be on this PATH.
+       install.sh resolves the directories the binaries ACTUALLY live in and puts the gh REST adapter
+       first; a wrong PATH here does not fail loudly — the loop reads an empty queue and idles. -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>__PATH__</string>
+    <key>HOME</key>
+    <string>__HOME__</string>
+    <key>O</key>
+    <string>__O__</string>
+    <key>REPO</key>
+    <string>__REPO__</string>
+    <key>OR</key>
+    <string>__OR__</string>
+    <key>SCOPE</key>
+    <string>__SCOPE__</string>
+    <key>CYC</key>
+    <string>__CYC__</string>
+    <key>MERGE_PRIORITY_AT</key>
+    <string>__MERGE_PRIORITY_AT__</string>
+
+    <!-- The required check the merge rail looks for. NOT a template token: install.sh has no REQ
+         override, and an EMPTY value is not neutral — orch-loop.sh reads a set-but-blank REQ as an
+         operator override and re-derives its merge authority from it. Edit here per fleet. -->
+    <key>REQ</key>
+    <string>ai-review-gate</string>
+    <key>REVIEW_GATE</key>
+    <string>ai-review-gate</string>
+  </dict>
+</dict>
+</plist>
