@@ -1900,6 +1900,87 @@ def test_a_fixture_expectation_naming_an_unknown_check_is_a_mismatch():
 
 
 @test
+def test_the_GRADED_record_cannot_borrow_the_age_of_the_record_it_beat():
+    """`_queue_age` reads both clocks and takes the OLDER, which is right when the two sources describe
+    one reading and wrong once `authoritative_queue_token` grades the newer/unaged record: the age of
+    the SUPERSEDED header token certified it. Measured: an age-UNKNOWN EMPTY record beside a
+    READ(203)(9m) header graded PASS/READABLE + PASS/IDLE_EMPTY_POOL + exit 0, printing "written age
+    UNKNOWN" in its own evidence — the documented rule says that is STATE_FROZEN."""
+    m = load()
+    cfg = m.cfg_from_dict({})
+    d = fx("healthy")
+    d["facts"]["log_events"]["headers"] = [
+        {"raw": "=== Sun Oct 18 07:47:44 EST 2026 load=40 lanes=2 backlog=0 queue=READ(203)(9m) ===",
+         "age_s": 42, "ts": 1792327000, "backlog": 0, "queue_token": "READ(203)(9m)", "lanes": 2,
+         "load": 40}]
+    d["facts"]["log_events"]["dispatch_ok"] = []
+    d["facts"]["log_events"]["lane_started"] = []
+    d["facts"]["queue_state"] = {"path": "q", "ok": True, "raw": "EMPTY", "age_s": None}
+    for name in ("queue_readable", "work_dispatched"):
+        v = [x for x in m.evaluate(d["facts"], cfg) if x.name == name][0]
+        assert (v.status, v.variant) == (m.INCONCLUSIVE, "STATE_FROZEN"), (name, v.status, v.variant)
+        assert "state/queue-state" in v.evidence, v.evidence
+    # …and the mirror shape (authoritative READ, header EMPTY(9m)) is the same defect, same answer
+    d["facts"]["queue_state"] = {"path": "q", "ok": True, "raw": "READ(203)", "age_s": 30}
+    v = [x for x in m.evaluate(d["facts"], cfg) if x.name == "queue_readable"][0]
+    # a FRESH authoritative READ is graded on its own merits (here the real backlog=0/pool=203 FAIL)
+    assert v.status != m.PASS and v.variant == "EMPTY_WITH_LARGE_POOL", (v.status, v.variant)
+
+
+@test
+def test_a_start_REFUTED_by_its_own_failure_line_is_not_a_live_lane():
+    """`dispatch-merge.sh:93` prints `#N: chain-N could NOT be started — stopping lane-N` AFTER echoing
+    the lane line, and kills it. With the emitter's literal lines for a 3-issue batch (2 worktree
+    failures + 1 started-then-killed) the check read PASS/DISPATCHED and printed "3 issue(s)
+    dispatched" off the batch INTENT count — the datum the code's own comment forbids grading."""
+    m = load()
+    cfg = m.cfg_from_dict({})
+    log = [
+        "=== Sun Oct 18 07:47:44 EST 2026 load=40 lanes=2 backlog=47 queue=READ(223)(9m) ===",
+        "[dispatch] load=40 lanes=2 -> 7001 7002 7003",
+        "#7001: worktree add failed (branch exists?) \u2014 skipping",
+        "#7002: lane-7002 (implement+PR)",
+        "#7002: chain-7002 could NOT be started \u2014 stopping lane-7002 (its PR would never be merged)",
+        "#7003: worktree add failed (branch exists?) \u2014 skipping",
+    ]
+    ev = m.parse_log(log, now=1792327664.0)
+    v = m.check_work_dispatched({"log_events": ev}, cfg)
+    assert (v.status, v.variant) == (m.FAIL, "NO_LANE_STARTED"), (v.status, v.variant, v.evidence)
+    # …and when a lane really survives, the PASS counts OUTCOMES and labels the batch line as intent
+    ev["lane_failed"] = [e for e in ev["lane_failed"] if e["issue"] != 7002]
+    v = m.check_work_dispatched({"log_events": ev}, cfg)
+    assert (v.status, v.variant) == (m.PASS, "DISPATCHED"), (v.status, v.variant, v.evidence)
+    assert "1 lane(s) STARTED" in v.evidence and "batch INTENT: 3" in v.evidence, v.evidence
+
+
+@test
+def test_a_variant_name_carries_ONE_status_or_the_notifier_silences_the_worse_one():
+    """`Verdict.key` is `name|variant` and the notifier suppresses on the key alone, so sharing
+    PROTECTION_PARTIAL between "protection could not be proven" (INCONCLUSIVE) and "the daemon is NOT
+    protected" (FAIL) delivered the first and silenced the second for good — and only a PASS clears
+    the key, which an unprotected daemon never reaches."""
+    m = load()
+    cfg = m.cfg_from_dict({})
+    unread = {"ok": True, "protection_supported": True, "cmd": "cmux-tui",
+              "pids": [{"pid": 11, "oom_score_adj": -900}, {"pid": 12, "oom_score_adj": None}]}
+    partial = {"ok": True, "protection_supported": True, "cmd": "cmux-tui",
+               "pids": [{"pid": 11, "oom_score_adj": -900}, {"pid": 12, "oom_score_adj": 0}]}
+    a = m.check_pane_daemon({"pane": unread}, cfg)
+    b = m.check_pane_daemon({"pane": partial}, cfg)
+    assert (a.status, b.status) == (m.INCONCLUSIVE, m.FAIL), (a.status, b.status)
+    assert a.key != b.key, (a.key, b.key)
+    # every variant name in the file must map to exactly one status
+    import re as _re
+    src = open(m.__file__).read()
+    pairs = {}
+    for name, status, variant in _re.findall(
+            r'V\("(\w+)", (PASS|FAIL|INCONCLUSIVE), "(\w+)"', src):
+        pairs.setdefault(variant, set()).add(status)
+    multi = dict((k, v) for k, v in pairs.items() if len(v) > 1)
+    assert not multi, "a variant name carries more than one status: %s" % (multi,)
+
+
+@test
 def test_a_TORN_queue_record_is_a_failed_read_not_a_missing_key():
     """`read_file` returns ("", None) for `cat` of an EMPTY file, and the harness writes the record with
     `>` (truncate, then write), so a full disk — the exact moment `headroom` FAILs — a kill or a reboot
@@ -2521,13 +2602,13 @@ def test_a_dispatch_INTENT_is_not_a_dispatch():
             "headers": [ev("headers", raw="=== Sun Oct 18 07:47:44 EST 2026 load=90 lanes=2 "
                                         "backlog=47 queue=READ(223)(9m) ===", backlog=47,
                            queue_token="READ(223)(9m)", lanes=2, load=90)],
-            "dispatch_ok": [dict(ev("dispatch_ok", raw="[dispatch] load=90 lanes=2 -> 1981"),
-                                 issues=[1981], issue_count=1)],
+            "dispatch_ok": [dict(ev("dispatch_ok", raw="[dispatch] load=90 lanes=2 -> 1981 1982"),
+                                 issues=[1981, 1982], issue_count=2)],
             "lane_started": lane_started, "lane_failed": lane_failed,
             "dispatch_refused": [], "dispatch_empty": [], "dispatch_skipped": [],
             "armed": [], "railed": []}}
 
-    started = [dict(ev("s", raw="#1981: lane-2 (implement+PR)"), issue=1981, lane=2)]
+    started = [dict(ev("s", raw="#1982: lane-2 (implement+PR)"), issue=1982, lane=2)]
     failed = [dict(ev("f", raw="#1981: worktree add failed (branch exists?) — skipping"),
                    issue=1981, reason="worktree add failed (branch exists?) — skipping")]
 
@@ -2541,9 +2622,19 @@ def test_a_dispatch_INTENT_is_not_a_dispatch():
     # a lane actually started → PASS, and the spawn is NAMED in the evidence
     v = m.check_work_dispatched(facts(started, failed), cfg)
     assert (v.status, v.variant) == (m.PASS, "DISPATCHED"), (v.status, v.variant)
-    assert "#1981 lane-2 (implement+PR)" in v.evidence, v.evidence
+    assert "#1982 lane-2 (implement+PR)" in v.evidence, v.evidence
     # …and a failed spawn beside a successful one is still PRINTED: a pass may not hide it
     assert "lane spawn FAILED" in v.evidence, v.evidence
+    # ⛔ A START REFUTED BY ITS OWN FAILURE LINE IS NOT A LIVE LANE: `dispatch-merge.sh` echoes the
+    # lane line and can then print `chain-N could NOT be started - stopping lane-N`, killing it. The
+    # PASS count must be the OUTCOME count, never the batch line's INTENT count.
+    assert "1 lane(s) STARTED" in v.evidence and "batch INTENT: 2" in v.evidence, v.evidence
+    killed = [dict(ev("s", raw="#1982: lane-2 (implement+PR)"), issue=1982, lane=2)]
+    refuted = [dict(ev("f", raw="#1982: chain-1982 could NOT be started — stopping lane-1982 "
+                              "(its PR would never be merged)"), issue=1982,
+                     reason="chain-1982 could NOT be started")]
+    v = m.check_work_dispatched(facts(killed, refuted), cfg)
+    assert (v.status, v.variant) == (m.FAIL, "NO_LANE_STARTED"), (v.status, v.variant, v.evidence)
 
 
 @test
@@ -2594,8 +2685,9 @@ def test_the_queue_token_AGE_is_read_with_ITS_OWN_multiplier():
     # OLD empty read beside an unreadable queue state is the only age the check has, and
     # past the limit "the pool is empty" is a claim about then — STATE_FROZEN, never READABLE.
     d = fx("healthy")
-    # the record is READ but carries no epoch of its own, so the token's suffix is the only clock
-    d["facts"]["queue_state"] = {"path": "q", "ok": True, "raw": "EMPTY", "age_s": None}
+    # a READABLE, FRESH record (so the header token is the graded source and its own `(NNm)` suffix is
+    # the clock this test is about; the two ages then differ only by the multiplier)
+    d["facts"]["queue_state"] = {"path": "q", "ok": True, "raw": "EMPTY 1792327000", "age_s": 60.0}
     # 120m, not 90m: 90m is EXACTLY the 5400s limit, and the boundary is deliberately inclusive
     d["facts"]["log_events"]["headers"][0]["queue_token"] = "EMPTY(120m)"
     d["facts"]["log_events"]["headers"][0]["backlog"] = 0
@@ -3241,14 +3333,15 @@ MUTATIONS = [
      "test_the_REST_probe_bound_is_a_REAL_knob_not_an_internal_constant"),
     # ── cycle-8 defect ──────────────────────────────────────────────────────────
     ("a zero staleness limit is treated as unset, so \"no tolerance\" is silently made lenient",
-     "    limit = 5400.0 if limit is None else float(limit)",
-     "    limit = limit or 5400.0",
+     "    return 5400.0 if limit is None else float(limit)",
+     "    return limit or 5400.0",
      "test_a_ZERO_staleness_limit_means_NO_tolerance_not_unset"),
     # ── cycle-7 defects ──────────────────────────────────────────────────────────────
     ("an EMPTY read with NO age is graded as a current read",
-     '        return ({"age_s": None, "source": src or "no age in the token or the state file",\n'
-     '                 "limit_s": limit} if require_known else None)',
-     "        return None",
+     '    if age is None:\n'
+     '        # an unaged reading cannot support ANY claim',
+     '    if False:\n'
+     '        # an unaged reading cannot support ANY claim',
      "test_an_EMPTY_read_with_NO_age_is_not_a_current_read"),
     ("the staleness limit is not a config field, so the flag and fixture config do nothing",
      '    FIELDS = (\n        "window_s",\n        "pr_window_s",\n        "queue_stale_s",',
@@ -3363,6 +3456,24 @@ MUTATIONS = [
      "            exists = (present.strip().endswith(\"YES\")) if rc3 == 0 else None",
      "            exists = False",
      "test_a_log_that_cannot_be_stat_ed_is_unreadable_not_missing"),
+    ("the graded record borrows the age of the record it beat",
+     "    if tok_src == \"state/queue-state\":\n        qs = f.get(\"queue_state\") or {}\n"
+     "        age = qs.get(\"age_s\")",
+     "    if False:\n        qs = f.get(\"queue_state\") or {}\n        age = qs.get(\"age_s\")",
+     "test_the_GRADED_record_cannot_borrow_the_age_of_the_record_it_beat"),
+    ("a start refuted by its own failure line still counts",
+     "        live = [e for e in all_started if _is_this_batch(e)\n"
+     "                and str(e.get(\"issue\")) not in failed_issues]",
+     "        live = [e for e in all_started if _is_this_batch(e)]",
+     "test_a_start_REFUTED_by_its_own_failure_line_is_not_a_live_lane"),
+    ("the PASS prints the batch INTENT count as dispatched",
+     "                    len(live), win, refused_txt, spawn_txt))",
+     "                    ok.get(\"issue_count\") or 0, win, refused_txt, spawn_txt))",
+     "test_a_start_REFUTED_by_its_own_failure_line_is_not_a_live_lane"),
+    ("two statuses share one variant name (the notifier silences the worse)",
+     "        return V(\"pane_daemon\", INCONCLUSIVE, \"PROTECTION_PARTIAL_UNREAD\",",
+     "        return V(\"pane_daemon\", INCONCLUSIVE, \"PROTECTION_PARTIAL\",",
+     "test_a_variant_name_carries_ONE_status_or_the_notifier_silences_the_worse_one"),
     ("a TORN (empty) queue record counts as a successful read",
      "        qs[\"ok\"] = False\n        qs[\"raw\"] = None\n"
      "        qs[\"error\"] = \"empty state/queue-state record (torn write)\"",
@@ -3457,8 +3568,9 @@ MUTATIONS = [
      "    if False:",
      "test_a_TRUNCATED_merged_page_does_not_read_as_nothing_merged"),
     ("a lane spawn from ANOTHER batch vouches for this one",
-     "        started = newest_with_age([e for e in all_started if _is_this_batch(e)], win)",
-     "        started = newest_with_age(all_started, win)",
+     "        live = [e for e in all_started if _is_this_batch(e)\n"
+     "                and str(e.get(\"issue\")) not in failed_issues]",
+     "        live = all_started",
      "test_a_lane_spawn_from_ANOTHER_batch_does_not_vouch_for_this_one"),
     ("a spawn that PRECEDES its batch line still counts",
      "            return e[\"age_s\"] <= ok_age + 2.0",

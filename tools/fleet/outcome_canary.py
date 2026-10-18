@@ -27,7 +27,11 @@ THE CHECKS (each an outcome; each has an ABSENT and a STALE variant)
   2. queue_readable       the last refresh produced a READABLE verdict — not `UNREADABLE`, not
                           `UNKNOWN` (never read at all), not `PARTIAL` — and not "backlog empty"
                           while the pool it just read holds a large number of issues.
-  3. work_dispatched      a `[dispatch] … -> <issue>` line exists within the window. THIS is the
+  3. work_dispatched      a `[dispatch] … -> <issue>` line exists within the window AND that
+                          batch's lane spawn (`#N: lane-N (implement+PR)`, for one of ITS issues, not
+                          refuted by its own failure line) follows it — the batch line is an INTENT,
+                          written before the spawner runs, so an intent with no outcome is
+                          INCONCLUSIVE, never a PASS. THIS is the
                           outcome that matters most: every check above can pass while it fails
                           (measured 2026-10-18: 47 candidates, 47 `could not build claim commit`
                           refusals, zero dispatches, controller cycling and queue READ(223)).
@@ -903,7 +907,7 @@ def check_queue_readable(f, c):
     # the shape, the evidence carries the pool count and the queue token, and a human can tell the
     # two apart in one read. (Silence is not the safe default here — a blind refresh looks identical.)
     pool = tok.get("pool")
-    stale = _queue_stale(f, c, require_known=True)
+    stale = _graded_stale(f, c, tok_src)
     # ⛔ EMPTINESS IS THE ONE CLAIM A FROZEN READ CANNOT SUPPORT — and an UNKNOWN age supports NO
     # claim at all. This guard used to fire only for EMPTY, so `queue=READ(223)` written without an
     # epoch (the bare token the harness emits when its `$at` field is missing or unparsable) was
@@ -1012,21 +1016,40 @@ def _queue_age(f, c):
     return age, src
 
 
-def _queue_stale(f, c, require_known=False):
-    """{"age_s", "source", "limit_s"} when the pool reading is not usable as CURRENT, else None.
-
-    `require_known` is passed only where the claim being made is EMPTINESS ("nothing to do"). An
-    unaged read cannot support that claim — the harness itself emits a bare token when the epoch
-    field is missing or unparsable, and calls such a record "a stale flag waiting to be read as
-    current". A stale-or-unaged NON-EMPTY read is different: it still says "readable, n candidates",
-    which is the claim those branches make.
-    """
-    age, src = _queue_age(f, c)
+def _queue_stale_limit(c):
+    """Seconds after which a pool reading is stale. A limit of 0 means ANY age is stale: honoured,
+    not treated as unset (`limit or 5400` silently made 'no tolerance' lenient)."""
     limit = getattr(c, "queue_stale_s", None)
-    limit = 5400.0 if limit is None else float(limit)
+    return 5400.0 if limit is None else float(limit)
+
+
+def _graded_stale(f, c, tok_src):
+    """{"age_s", "source", "limit_s"} when the GRADED pool record is not usable as CURRENT, else None.
+
+    ⛔ THE GRADED RECORD'S CURRENCY IS ITS OWN. `_queue_age` reads both clocks and takes the OLDER,
+    which is right for the header branch (there the state file IS the older clock, and a token that
+    looks fresh beside a state file nobody has rewritten for hours means the writing side is frozen).
+    It is wrong for the state-record branch: `authoritative_queue_token` grades `state/queue-state`
+    when that record is newer or unaged, and taking the max over both then certified the record with
+    the age of the SUPERSEDED header token. Measured: an age-UNKNOWN `EMPTY` record beside a
+    `READ(203)(9m)` header graded PASS/READABLE + PASS/IDLE_EMPTY_POOL and exit 0 while printing
+    "written age UNKNOWN" in its own evidence — contradicting the rule that an `EMPTY` read carrying
+    no age is STATE_FROZEN. The record that was graded answers for itself.
+    """
+    limit = _queue_stale_limit(c)
+    if tok_src == "state/queue-state":
+        qs = f.get("queue_state") or {}
+        age = qs.get("age_s") if qs.get("ok") is True else None
+        src = ("state/queue-state (no epoch, no readable mtime)" if age is None
+               else "state/queue-state")
+    else:
+        age, src = _queue_age(f, c)
+        src = src or "no age in the token or the state file"
     if age is None:
-        return ({"age_s": None, "source": src or "no age in the token or the state file",
-                 "limit_s": limit} if require_known else None)
+        # an unaged reading cannot support ANY claim, least of all EMPTINESS: the harness itself
+        # emits a bare token when its epoch field is missing or unparsable, and calls such a record
+        # "a stale flag waiting to be read as current"
+        return {"age_s": None, "source": src, "limit_s": limit}
     if age <= limit:
         return None      # a limit of 0 means "any age is stale": honoured, not treated as unset
     return {"age_s": age, "source": src, "limit_s": limit}
@@ -1074,7 +1097,7 @@ def authoritative_queue_token(f, hdr):
     an UNREADABLE record with no epoch was silently DEMOTED and the one-refresh-old header decided —
     the same PASS/READABLE + PASS/IDLE_EMPTY_POOL + exit 0, reached through the one shape the fix did
     not cover, with the contradicting `UNREADABLE` printed bare in its own evidence. The age question
-    belongs to `_queue_stale(require_known=True)`, which already answers STATE_FROZEN for an unaged
+    belongs to `_graded_stale`, which already answers STATE_FROZEN for an unaged
     EMPTINESS: an unaged record must lose its CLAIM, never its authority.
     """
     hdr_tok = parse_queue_token(hdr.get("queue_token") if hdr else "")
@@ -1090,7 +1113,7 @@ def authoritative_queue_token(f, hdr):
         hdr_age = hdr.get("age_s") if hdr else None
         qs_age = qs.get("age_s")
         # A NEWER record always wins; an UNKNOWN age is not "older" — the record still holds the
-        # verdict the fleet wrote, and only its currency is in doubt (`_queue_stale` judges that).
+        # verdict the fleet wrote, and only its currency is in doubt (`_graded_stale` judges it).
         if qs_age is None or hdr_age is None or qs_age < hdr_age:
             return qs_tok, qs_raw.split()[0] if qs_raw.split() else qs_raw, "state/queue-state"
     return hdr_tok, (hdr.get("queue_token") or "(absent)") if hdr else "(absent)", "cycle header"
@@ -1133,7 +1156,7 @@ def check_work_dispatched(f, c):
     backlog = hdr.get("backlog") if hdr else None
     # The SAME authoritative token `queue_readable` grades, so the two checks cannot disagree about
     # whether the pool was read as empty (they did: header EMPTY, state UNREADABLE).
-    _tok, _raw, _src = authoritative_queue_token(f, hdr)
+    _tok, _raw, _tok_src = authoritative_queue_token(f, hdr)
     pool = _tok.get("pool")
     pool_kind = _tok.get("kind")
     last_ok = newest(events.get("dispatch_ok"))
@@ -1201,7 +1224,16 @@ def check_work_dispatched(f, c):
 
         all_started = events.get("lane_started") or []
         all_failed = events.get("lane_failed") or []
-        started = newest_with_age([e for e in all_started if _is_this_batch(e)], win)
+        # ⛔ A START REFUTED BY ITS OWN FAILURE LINE IS NOT A LIVE LANE. `dispatch-merge.sh:93` prints
+        # `#N: chain-N could NOT be started — stopping lane-N (its PR would never be merged)` AFTER
+        # echoing the lane line, and then kills it: measured with the emitter's literal lines for a
+        # 3-issue batch (2 worktree failures + 1 started-then-killed) the check read
+        # PASS/DISPATCHED, printing "3 issue(s) dispatched" off the batch INTENT count — the very
+        # datum the comment above says must not be graded.
+        failed_issues = set(str(e.get("issue")) for e in all_failed if _is_this_batch(e))
+        live = [e for e in all_started if _is_this_batch(e)
+                and str(e.get("issue")) not in failed_issues]
+        started = newest_with_age(live, win)
         spawn_fail = newest_with_age([e for e in all_failed if _is_this_batch(e)], win)
         foreign = newest([e for e in all_started if not _is_this_batch(e)])
         spawn_txt = ""
@@ -1230,9 +1262,10 @@ def check_work_dispatched(f, c):
         # PASS is PASS by the outcome, but the refusals and the spawns are EVIDENCE and a pass that
         # hides them is the green-while-broken failure this whole file exists to end. Always printed.
         return V("work_dispatched", PASS, "DISPATCHED",
-                 "dispatch line (%s): %s\n%d issue(s) dispatched inside the %.0fs window%s%s"
-                 % (_age_txt(ok.get("age_s")), ok.get("raw"), ok.get("issue_count") or 0, win,
-                    refused_txt, spawn_txt))
+                 "dispatch line (%s): %s (batch INTENT: %d issue(s))\n%d lane(s) STARTED inside the "
+                 "%.0fs window%s%s"
+                 % (_age_txt(ok.get("age_s")), ok.get("raw"), ok.get("issue_count") or 0,
+                    len(live), win, refused_txt, spawn_txt))
 
     # POSITIVE evidence that work existed and none of it went out → FAIL. This is the check's whole
     # point; it is the branch that catches "everything is up and nothing ships".
@@ -1265,7 +1298,7 @@ def check_work_dispatched(f, c):
     # `queue_readable` already refuses to grade it. Accepting the absence as zero here let
     # `work_dispatched` — "the one that matters most" — assert that a fleet's non-dispatch was
     # CORRECT on evidence the module had declared incomplete.
-    stale = _queue_stale(f, c, require_known=True)
+    stale = _graded_stale(f, c, _tok_src)
     if stale is not None and (stale["age_s"] is None or pool_kind == "EMPTY" or backlog == 0):
         # "Nothing to dispatch" is the CORRECT outcome only on a CURRENT read. A frozen read makes it
         # unestablished, and this is the branch that would otherwise bless it.
@@ -1451,7 +1484,11 @@ def check_pane_daemon(f, c):
                  "may kill it first). Being alive today is not protection.")
     if unread:
         # Some values were unreadable, so neither "all protected" nor "these are unprotected" holds.
-        return V("pane_daemon", INCONCLUSIVE, "PROTECTION_PARTIAL",
+        # ⛔ A DISTINCT NAME, because `Verdict.key` is `name|variant` and the notifier suppresses on
+        # the key alone: sharing `PROTECTION_PARTIAL` with the FAIL below meant "protection could not
+        # be proven" was delivered once and the later, ESTABLISHED "the daemon is NOT protected" was
+        # never sent — and only a PASS clears the key, which an unprotected daemon never reaches.
+        return V("pane_daemon", INCONCLUSIVE, "PROTECTION_PARTIAL_UNREAD",
                  "%d live %s process(es) (pid %s)\noom_score_adj: %s\nprotected: %d of %d, "
                  "%d UNREAD\n%s" % (len(pids), cmd, pid_txt, adj, len(protected), len(pids),
                                      len(adj) - len(known), prot_txt),
@@ -3284,7 +3321,8 @@ REQUIRED_FIXTURES = (
     "dispatch-intent-not-spawned", "dispatch-unconfirmed", "dispatch-previous-batch-spawn",
     "queue-state-unreadable-newer", "lander-from-another-repo", "merged-surface-truncated",
     "no-pr-created", "idle-no-work", "headroom-disk-only-low", "headroom-mem-only-low",
-    "queue-state-read-failed", "queue-state-torn", "daemon-protection-unread",
+    "queue-state-read-failed", "queue-state-torn", "queue-state-unaged-authoritative",
+    "daemon-protection-unread",
 )
 
 
