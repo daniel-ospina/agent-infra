@@ -85,7 +85,13 @@ is_limit() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; 0) return 0 ;; 0*) return
 MAX_ROUNDS="${LANE_MERGE_MAX_ROUNDS:-3}"
 [ -n "$MAX_ROUNDS_OVERRIDE" ] && MAX_ROUNDS="$MAX_ROUNDS_OVERRIDE"
 is_limit "$MAX_ROUNDS" || { say_err "lane-merge: LANE_MERGE_MAX_ROUNDS='$MAX_ROUNDS' is not a bounded integer — using 3"; MAX_ROUNDS=3; }
-WAIT_S="${LANE_MERGE_WAIT:-900}";      is_limit "$WAIT_S" || WAIT_S=900      # per-round check wait
+# ⛔ SIZED TO THE CI IT WAITS FOR, NOT TO A ROUND NUMBER (measured on this change's own PR: a
+# 22-check commit on a loaded box reached 7/22 completed at 15 min and was still 15-in-flight at the
+# old 900s bound, so EVERY lane would have spent a chunk on "still in flight — re-run"). 1500s covers
+# a ~25 min CI and still leaves the rest of the lane's own budget (`LANE_TIMEOUT`, 3300s) for the
+# MERGE chain, which is where the remaining time must go. A re-run is still permitted and still
+# cheap (one PR read) — the bound is a runaway guard, never a reason to call a head green.
+WAIT_S="${LANE_MERGE_WAIT:-1500}";     is_limit "$WAIT_S" || WAIT_S=1500     # per-round check wait
 # ⛔ --watch IS BOUNDED TOO. A pid probe cannot distinguish "the chain is still working" from "the pid
 # was reused", so an unbounded --watch loop would be a lane that never ends — the same defect the
 # round cap removes, one layer down. 20 chunks x LANE_MERGE_POLL (120s) ≈ 40 minutes of supervision,
