@@ -114,7 +114,10 @@ mk_issue_claim() {
 OUT=""; RC=0
 rf() {
   local dir="$1" mode="$2"; shift 2
-  local args=(6); [ "$mode" = check ] && args=(--check)
+  # `RF_LIMIT` overrides the candidate window (argv, which the shipped script reads as `$LIMIT`).
+  # Only one case uses it, to prove a fixture's skip arm is REACHABLE when the window is wide — the
+  # non-vacuity control for “the stop outranks the walk-past”.
+  local args=("${RF_LIMIT:-6}"); [ "$mode" = check ] && args=(--check)
   local paths="${RF_PATH:-$dir/bin:$PATH}"
   OUT="$(env -u TORTOISE_REPO -u TORTOISE -u SCOUT_UV -u GH_HOST -u CELL_HOME -u SCOUT_PY \
           -u SCOUT_UV_EXTRAS -u GH_CONFIG_DIR \
@@ -997,6 +1000,10 @@ mk_case degraded-collision
 mkdir -p "$D/repo/.worktrees/dispatch-scout/tools"
 cat > "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py" <<'PY'
 #!/usr/bin/env python3
+import os
+if os.environ.get("RUNLOG"):
+    with open(os.environ["RUNLOG"], "a") as fh:
+        fh.write("ran\n")
 print("VERDICT: COLLISION (exit 1) — the pre-flight could not name a holder")
 print("  ALSO INCOMPLETE: 3 surface(s) could not be queried")
 raise SystemExit(1)
@@ -1006,7 +1013,9 @@ mk_gh_rest "$D" 42
 # A sentinel makes the "nothing queued" assertion DISCRIMINATING (see the LANDED case): an empty
 # file cannot distinguish "the degraded answer was not queued" from "the backlog was clobbered".
 echo 99 > "$D/o/candidates.txt"
-rf "$D" refresh
+# RUNLOG records every invocation, because the ledger half of this case asserts on the pre-flight's
+# OWN run record: the defect it pins is a run that never happened.
+rf "$D" refresh RUNLOG="$D/deg-runs"
 [ "$RC" -eq 1 ] && ok "degraded COLLISION: the pass aborts TRANSIENT (rc=1) instead of passing" \
                || bad "degraded COLLISION: rc=$RC (want 1) — output: $OUT"
 case "$OUT" in
@@ -1021,6 +1030,29 @@ case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
   *42*) bad "degraded COLLISION: queued candidates — $(cat "$D/o/candidates.txt" 2>/dev/null)" ;;
   *99*) ok "degraded COLLISION: nothing is queued (seed 99 intact, #42 absent)" ;;
   *) bad "degraded COLLISION: the backlog was clobbered — candidates='$(cat "$D/o/candidates.txt" 2>/dev/null)'" ;;
+esac
+# ── ... AND A DEGRADED ANSWER IS NEVER RECORDED IN THE COLLISION LEDGER (review finding #6) ────────
+# This is the ledger's third safety property, and the one that keeps contract (a) — a degraded
+# pre-flight is NEVER a verdict — intact ACROSS passes: suppressing a DEGRADED answer for a TTL would
+# hide the merge-only / starved-read defect this script exists to surface (#1736), because the passes
+# that stopped re-judging it are exactly the passes that would have SAID so. NOTHING pinned it:
+# appending `COLLIDED_NEW` to the DEGRADED arm left this whole suite green (measured).
+# ⛔ `-s`, NOT `-e`: the ledger file exists on every pass even when nothing is held (`#1729` P2), so
+# existence proves nothing; EMPTINESS is the property. And the consequence is asserted on the
+# pre-flight's own run record — the defect is a RUN THAT NEVER HAPPENED, which no log line reveals.
+[ ! -s "$D/o/state/collided" ] \
+  && ok "degraded COLLISION: state/collided is EMPTY — a degraded answer is never recorded (only a COLLISION is)" \
+  || bad "degraded COLLISION: the ledger recorded a DEGRADED answer — [$(tr '\n' ' ' < "$D/o/state/collided" 2>/dev/null)] — a TTL of suppression for an ENVIRONMENT failure, which is the property the header promises"
+[ "$(wc -l < "$D/deg-runs" 2>/dev/null | tr -d ' ')" = 1 ] \
+  && ok "degraded COLLISION: pass 1 ran the pre-flight once" \
+  || bad "degraded COLLISION: pass 1 ran the pre-flight $(wc -l < "$D/deg-runs" 2>/dev/null | tr -d ' ') time(s), want 1"
+rf "$D" refresh RUNLOG="$D/deg-runs"
+[ "$(wc -l < "$D/deg-runs" 2>/dev/null | tr -d ' ')" = 2 ] \
+  && ok "degraded COLLISION: pass 2 JUDGED it again — a degraded answer is re-judged, never suppressed for a TTL" \
+  || bad "degraded COLLISION: pass 2 did not run the pre-flight again ($(wc -l < "$D/deg-runs" 2>/dev/null | tr -d ' ') run(s) total) — the ledger suppressed a DEGRADED answer"
+case "$OUT" in
+  *"DEGRADED"*) ok "degraded COLLISION: the second pass still NAMES the degradation (a record does not silence it)" ;;
+  *) bad "degraded COLLISION: the second pass is silent about the degradation — output: $OUT" ;;
 esac
 
 # ── 1h) A NETWORK FAULT IS TRANSIENT, NOT PERMANENT (agent-infra#1853 review P1) ────────────────
@@ -2533,6 +2565,56 @@ rf "$D" refresh HELD="$HELD6" RUNLOG="$D/runs4"
 case "$(tr '\n' ' ' < "$D/runs4" 2>/dev/null)" in
   *8486*) ok "blocked head: an absurd expiry is treated as corrupt, so #8486 is judged again (never suppressed for ever)" ;;
   *) bad "blocked head: a corrupt far-future record suppressed #8486 — the ledger can wedge the fleet" ;;
+esac
+
+# ── 1l) THE STOP OUTRANKS THE WALK-PAST (agent-infra#1729 review, finding #6) ────────────────────
+# The skip `case` used to sit ABOVE the two `break` tests, so once the window was full every
+# remaining COLLIDED candidate still reached the skip arm and printed a `>#N SKIPPED` line until the
+# next non-collided candidate happened to break the loop. With a large ledger that is an unbounded
+# block of log noise on every pass, emitted after the pass had already decided to stop. The stop
+# conditions are now above the skip arm; this case pins the ORDER, not the outcome: both runs below
+# end with the same backlog, and only the ORDER decides whether the skip lines exist.
+# ⛔ NON-VACUITY IS THE CONTROL BELOW: the SAME fixture with a wider window must produce the skip
+# lines. Without it, a fixture whose ledger never matches would pass the first assertion for the
+# wrong reason (the trap the reviewer named on this suite: “a green suite that no longer exercises
+# the code”).
+_led_seed() {  # <case-dir> — three held TAIL candidates, recorded with a REAL expiry (now + 300 s)
+  mkdir -p "$1/o/state"
+  local exp; exp=$(( $(date +%s) + 300 ))
+  printf '%s 5101\n%s 5102\n%s 5103\n' "$exp" "$exp" "$exp" > "$1/o/state/collided"
+}
+echo; echo "── a full window stops BEFORE the ledger walk-past (agent-infra#1729 review) ──"
+mk_case slots-before-skip
+mk_tool_held "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_gh_tiers "$D" "5001,5002,5003" "5004,5005,5006" "5101,5102,5103"
+_led_seed "$D"
+rf "$D" refresh HELD="5101 5102 5103" RUNLOG="$D/runs-a"
+[ "$RC" -eq 0 ] && ok "slots-before-skip: the pass succeeds (rc=0)" \
+               || bad "slots-before-skip: rc=$RC (want 0) — output: $OUT"
+case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
+  "5001 5002 5003 5004 5005 5006 ") ok "slots-before-skip: the six CLEAN candidates filled the window (in tier order) and the pass STOPPED" ;;
+  *) bad "slots-before-skip: candidates='$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)' (want the six CLEAN ones)" ;;
+esac
+case "$OUT" in
+  *"SKIPPED"*) bad "slots-before-skip: a '>#N SKIPPED' line was printed AFTER the window was full — the stop must outrank the walk-past (that is the unbounded noise #1729 review P1 named): $(printf '%s\n' "$OUT" | grep -c 'SKIPPED') line(s)" ;;
+  *) ok "slots-before-skip: NO skip line is printed once the window is full — the stop fires before the ledger arm, so a full pass cannot emit a block of noise about candidates it will never reach" ;;
+esac
+[ "$(wc -l < "$D/runs-a" 2>/dev/null | tr -d ' ')" = 6 ] \
+  && ok "slots-before-skip: exactly 6 pre-flight runs — the three recorded-held tail candidates cost nothing" \
+  || bad "slots-before-skip: $(wc -l < "$D/runs-a" 2>/dev/null | tr -d ' ') pre-flight run(s) (want 6)"
+# THE CONTROL: same fixture, wider window. Now the walk reaches the recorded-held tail, so the skip
+# arm MUST fire — proving the assertion above measures the ORDER and not a fixture that never skips.
+mk_case slots-skip-control
+mk_tool_held "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_gh_tiers "$D" "5001,5002,5003" "5004,5005,5006" "5101,5102,5103"
+_led_seed "$D"
+RF_LIMIT=9 rf "$D" refresh HELD="5101 5102 5103" RUNLOG="$D/runs-b"
+n_skip_lines="$(printf '%s\n' "$OUT" | grep -c 'SKIPPED')"
+[ "${n_skip_lines:-0}" -eq 3 ] && ok "slots-skip-control: with a wider window the ledger walk-past IS reached (3 skip lines) — the assertion above is non-vacuous" \
+                            || bad "slots-skip-control: $n_skip_lines skip line(s) with a wide window (want 3) — the previous case proves nothing about the ORDER"
+case "$OUT" in
+  *"skipped 3 candidate(s)"*) ok "slots-skip-control: the walk-past is still reported in aggregate" ;;
+  *) bad "slots-skip-control: the aggregate skip line is missing — output: $OUT" ;;
 esac
 
 
