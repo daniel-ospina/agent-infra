@@ -1597,9 +1597,11 @@ cmd_apply() {
   # Only a NON-EMPTY value is a metacharacter question; `safe_argv` returns non-zero for '' too.
   # ⛔ THE LINE BELOW IS STILL BROKEN and the comment above it USED to claim otherwise: `A && B || C`
   # runs `C` when `A` FAILS, so an empty $HARNESS_REPO takes the `die` branch — and harness_apply()'s
-  # accurate "no git checkout resolved" never prints. The same shape sits on the two PIN lines (they
-  # are not even conditional). Filed with the measurement: agent-infra#2002; NOT changed here, because
-  # this PR's subject is controller ownership and the behaviour is unchanged from origin/main.
+  # accurate "no git checkout resolved" never prints. The two PIN lines below LOOK alike but are NOT
+  # exposed to that misfire: both are defaulted at load (:646-647, after source_env_file), so they
+  # cannot arrive empty and their message is only printed for a value that really is unsafe.
+  # Filed with the measurement: agent-infra#2002; NOT changed here, because this PR's subject is
+  # controller ownership and the behaviour is unchanged from origin/main.
   [ -n "$HARNESS_REPO" ] && { safe_argv "$HARNESS_REPO" || die "\$HARNESS_REPO must not contain a quote or shell metacharacter: $HARNESS_REPO"; }
   safe_argv "${HARNESS_PIN_DIR:-}" || die "\$HARNESS_PIN_DIR must not contain a quote or shell metacharacter"
   safe_argv "${HARNESS_PIN_FILE:-}" || die "\$HARNESS_PIN_FILE must not contain a quote or shell metacharacter"
