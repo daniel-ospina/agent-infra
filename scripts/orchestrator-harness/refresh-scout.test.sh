@@ -2043,8 +2043,16 @@ SH
   #    limits with 429; the branch used to print a hardcoded "HTTP 403" and drop the provider's text,
   #    which is the only evidence of the real status. Both halves are asserted: the status comes from
   #    the message, and the message is carried.
+  # ⛔ THE BODY IS LONGER THAN THE LOG'S 240-CHAR CUT ON PURPOSE. GitHub's secondary-limit text carries
+  # a variable-length request-ID/timestamp tail, so on the real thing the "(HTTP 429)" sits past the
+  # truncation — parsing the status out of the truncated copy reads `HTTP ?` and this case is the only
+  # one that can see it (a short body passes either way).
   HD429="$T/restcase-429"; mkdir -p "$HD429"
-  printf '#!/bin/bash\necho "gh: You have exceeded a secondary rate limit (HTTP 429)" >&2\nexit 1\n' > "$HD429/gh"
+  cat > "$HD429/gh" <<'GH429'
+#!/bin/bash
+echo "gh: You have exceeded a secondary rate limit. Please wait a few minutes before you try again. For more information on scraping GitHub and how it may affect your use of GitHub's features, please see https://docs.github.com/get-started/using-github/githubs-terms-of-service . request ID 5A1B:2C3D:4E5F:6789:ABCD:EF01 and timestamp 2026-10-17T22:27:11.123Z. (HTTP 429)" >&2
+exit 1
+GH429
   chmod +x "$HD429/gh"
   PATH="$HD429:$PATH"; export PATH
   drv_out issues --repo acme/widget --limit 10 > /dev/null 2>"$HD429/err"; rc=$?

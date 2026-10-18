@@ -237,9 +237,9 @@ check_tools() {
   # probes for it rather than assuming it, so a cell without it is refused instead of reading
   # `queue=UNREADABLE` for ever. (jq was already used by the gh-rest adapter, `gh-rest/gh:229,238`,
   # but install.sh never resolved it into DAEMON_PATH, so that dependence was silently unmet on a
-  # host without jq on the launchd PATH.) A cell without it is certified here
-  # and then reports `queue=UNREADABLE` on every refresh — merge-only — which `check_dispatch` catches
-  # one step later; catching it in the toolchain step keeps the diagnostic where the operator looks.
+  # host without jq on the launchd PATH.) The entry in this list is what turns that into a REFUSAL at
+  # bring-up: without it the cell would be certified and then read `queue=UNREADABLE` on every
+  # refresh — merge-only — which `check_dispatch` can only catch one step later.
   for c in git gh node python3 uv tmux jq; do
     command -v "$c" >/dev/null 2>&1 || missing="$missing $c"
   done

@@ -637,7 +637,11 @@ rest_fail() {
       # one case where the provider's text is the only evidence there is — and dropping that text is
       # the same "naming the wrong cause closes the investigation" failure the 403 branch below is
       # written to avoid. `gh` prints the status in the same message ("… (HTTP 429)").
-      status="$(printf '%s' "$msg" | sed -n 's/.*(HTTP \([0-9][0-9]*\)).*/\1/p')"
+      # ⛔ FROM `$errf`, NOT FROM `$msg`: `msg` is cut to 240 chars for the one-line log, and a
+      # SECONDARY-limit body carries a variable-length request-ID/timestamp tail, so the "(HTTP 429)"
+      # that identifies the case can be exactly what the truncation removes (measured with a 250-byte
+      # body: the log read `HTTP ?` and the message stopped mid-parenthesis).
+      status="$(tr '\n' ' ' < "$errf" 2>/dev/null | sed -n 's/.*(HTTP \([0-9][0-9]*\)).*/\1/p')"
       echo "REST $kind listing FAILED — the REST bucket refused it as RATE-LIMITED (HTTP ${status:-?}, core remaining=${core:-unknown}): $msg; this is NOT an empty listing" >&2 ;;
     # ⛔ A 403 IS NOT NECESSARILY A RATE LIMIT. `gh api` answers a PERMISSION refusal with a 403 too
     # ("Resource not accessible by integration"), and naming the wrong cause closes the investigation
@@ -799,10 +803,18 @@ rest_list() {
   # the NEWEST rows and an issue pushed out of it does not come back on the next pass — it moves
   # further out as the board grows. That is the opposite end from the one the pool prefers
   # (`sort -k1,1n -k2,2n` at the tier ranking is OLDEST-FIRST), so a repo with more than 500 open
-  # issues would lose its oldest ones from `.open_iss` permanently. Accepted here because it only
-  # NARROWS: fewer issues are visible to the reaper, so fewer un-blacklists (never more), and the
-  # three TIER queries carry `labels=`, so their window is the labelled subset, not this one.
-  # `.pr_brs` (kind=pulls) is unfiltered, so the #1705 `has_pr` check is unaffected.
+  # issues would lose its oldest ones from `.open_iss` permanently.
+  # Accepted for `.open_iss` because that loss only NARROWS: fewer issues are visible to the reaper,
+  # so fewer un-blacklists (never more). `.pr_brs` (kind=pulls) is unfiltered, so the #1705 `has_pr`
+  # check is unaffected.
+  # ⛔ THE TIER WINDOWS HAVE THE SAME SHAPE AND THAT ARGUMENT DOES NOT COVER THEM. They carry
+  # `labels=`, so each window is one labelled subset rather than the whole backlog — but it is still a
+  # created-DESC window, so a tier with more open labelled issues than its bound puts the OLDEST ones
+  # permanently outside `.pool`, and `.pool` is ranked OLDEST-FIRST. Measured 2026-10-17: open
+  # `P2-moderate` is 430 on agent-infra against the 200 bound below, so that tier IS over its window.
+  # The BOUNDS are unchanged from the GraphQL form (`gh issue list --label … --limit 300/200/200` had
+  # the same three windows), so this change neither introduces nor widens the truncation — it is
+  # stated here because the paragraph above would otherwise read as "the tiers are complete".
   # The alternative — fetching `limit` PROJECTED rows — means paging past the budget on the shared
   # core bucket this change exists to protect. The gh-rest adapter makes exactly that trade the other
   # way (`gh-rest/gh:229,238` page the whole collection, then `:157` drops PR rows and `:158` slices
