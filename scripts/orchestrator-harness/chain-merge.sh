@@ -132,7 +132,7 @@ CHAIN_CLAIM_COMMIT="${CHAIN_CLAIM_COMMIT:-}"
 # ── release the cross-box ISSUE claim (#1850) ────────────────────────────────────────────────
 # `orch-loop.sh` claimed `refs/claims/issue-<N>` when it dispatched this issue, and that claim is
 # this box's declaration that the issue is IN FLIGHT. Holding it after the chain is over would keep
-# a FREE issue undispatchable by every box until the lease ran out — up to CLAIM_ISSUE_TTL (3h) — so
+# a FREE issue undispatchable by every box until the lease ran out — up to CLAIM_ISSUE_TTL (4h) — so
 # it is released on EVERY exit path: a clean merge, a failed one, and the "no PR appeared" timeout.
 #
 # ⛔ THE RELEASE IS FENCED (`--force-with-lease=<ref>:<own>`), so it refuses to delete a ref that no
@@ -157,7 +157,7 @@ release_issue_claim() {
   # "released" line. The reason lives in CLAIM_RESULT, which a subshell discards.
   CLAIM_REPO="$REPO"
   if ! . "$csh" 2>/dev/null; then
-    echo "[chain $N] ⚠️ $csh failed to source — the issue claim is NOT released (it runs to its lease, CLAIM_ISSUE_TTL=${CLAIM_ISSUE_TTL:-10800}s)" >> "$LOG"
+    echo "[chain $N] ⚠️ $csh failed to source — the issue claim is NOT released (it runs to its lease, CLAIM_ISSUE_TTL=${CLAIM_ISSUE_TTL:-14400}s)" >> "$LOG"
     return 0
   fi
   if ! declare -f claim_issue_release_record >/dev/null 2>&1; then
@@ -174,14 +174,14 @@ release_issue_claim() {
   # box one lease; deleting the wrong claim duplicates work on two boxes, so this is the fail-closed
   # side of the same asymmetry as the pre-flight. Loud, and the lease still reaps it.
   if [ -z "${CHAIN_CLAIM_COMMIT:-}" ]; then
-    echo "[chain $N] ⚠️ no captured claim generation (the handover record was absent at chain start) — NOT releasing refs/claims/issue-$N: a stale chain must never delete a NEWER claim. It runs to its lease (CLAIM_ISSUE_TTL=${CLAIM_ISSUE_TTL:-10800}s)." >> "$LOG"
+    echo "[chain $N] ⚠️ no captured claim generation (the handover record was absent at chain start) — NOT releasing refs/claims/issue-$N: a stale chain must never delete a NEWER claim. It runs to its lease (CLAIM_ISSUE_TTL=${CLAIM_ISSUE_TTL:-14400}s)." >> "$LOG"
     return 0
   fi
   if out="$(claim_issue_release_record "$O" "$REPO" "$N" "${CHAIN_CLAIM_COMMIT:-}")"; then
     echo "[chain $N] released refs/claims/issue-$N" >> "$LOG"
   else
     rc=$?
-    echo "[chain $N] ⚠️ the issue claim was NOT released (rc=$rc): ${out:-${CLAIM_RESULT:-no reason given}} — it runs to its lease (CLAIM_ISSUE_TTL=${CLAIM_ISSUE_TTL:-10800}s)" >> "$LOG"
+    echo "[chain $N] ⚠️ the issue claim was NOT released (rc=$rc): ${out:-${CLAIM_RESULT:-no reason given}} — it runs to its lease (CLAIM_ISSUE_TTL=${CLAIM_ISSUE_TTL:-14400}s)" >> "$LOG"
   fi
   return 0
 }
@@ -229,6 +229,114 @@ if [ -z "${PR:-}" ] || [ "$PR" = "null" ]; then
   echo "[chain $N] no PR appeared for $BR after ${CHAIN_POLLS} min (CHAIN_POLLS=${CHAIN_POLLS} x CHAIN_POLL_SECS=${CHAIN_POLL_SECS}s)" >> "$LOG"; exit 1
 fi
 echo "[chain $N] PR #$PR found — starting merge chain $(date)" >> "$LOG"
+
+# ── WAIT FOR THE LANE'S MERGE PHASE (lane-owns-merge) ───────────────────────────────────────────
+# The lane now OWNS the merge: after opening this PR it drives its own checks to terminal, fixes the
+# reds, and supervises the same merge chain we are about to run (`lane-merge.sh` → $O/merge-one.sh).
+#
+# ⛔ WHY THE CHAIN MUST NOT RACE IT. merge-one.sh records the review against the head it reviewed. If
+# this chain reviews at T and the lane pushes a fix at T+1, the record binds a head that is no longer
+# the tip: the gate goes RED on an unchanged verdict, the review is paid for twice, and (in a rail
+# repo) admin-merge refuses to move a branch with a record bound to it — so the "fix" makes the PR
+# LESS mergeable. Waiting costs nothing but wall time and ZERO GitHub calls: every marker below is a
+# LOCAL file the lane writes.
+#
+# ⛔ AND IT MUST NOT DELAY A LANE THAT PREDATES THIS (the fleet is live, old-template lanes are still
+# running). So the wait is gated on the PHASE marker: a lane that never enters the merge phase writes
+# none, and the chain proceeds after a short grace exactly as it always did.
+PR_PHASE="$O/state/lanemerge-$PR.phase"; PR_VERDICT="$O/state/lanemerge-$PR.verdict"
+PHASE_GRACE="${LANE_PHASE_GRACE:-90}"; HANDOFF_WAIT="${LANE_HANDOFF_WAIT:-1800}"
+case "$PHASE_GRACE" in ''|*[!0-9]*|0[0-9]*) PHASE_GRACE=90 ;; esac
+case "$HANDOFF_WAIT" in ''|*[!0-9]*|0[0-9]*) HANDOFF_WAIT=1800 ;; esac
+# Portable mtime: GNU first, then BSD. GNU `stat -f %m` prints a filesystem block BEFORE it errors, so
+# the reverse order captures garbage — the same trap report.sh and refresh-candidates.sh document.
+_mtime() {
+  local m
+  m="$(stat -c %Y "$1" 2>/dev/null || true)"; case "$m" in ''|*[!0-9]*) m="" ;; esac
+  if [ -z "$m" ]; then m="$(stat -f %m "$1" 2>/dev/null || true)"; case "$m" in ''|*[!0-9]*) m="" ;; esac; fi
+  printf '%s' "$m"
+}
+# ⛔ 0 = "this verdict belongs to the CURRENT merge phase". A verdict older than the phase marker is a
+# PREVIOUS attempt's (the same issue re-dispatched, or this PR re-armed after a push): reading it would
+# make the chain review instantly for the NEW lane, at the head the new lane is about to change.
+_verdict_is_current() {
+  local v p
+  v="$(_mtime "$PR_VERDICT")"; p="$(_mtime "$PR_PHASE")"
+  [ -n "$v" ] || return 1
+  [ -n "$p" ] || return 0          # cannot age the phase marker: trust the verdict rather than stall
+  [ "$v" -ge "$p" ]
+}
+waited=0
+while [ ! -f "$PR_PHASE" ] && [ "$waited" -lt "$PHASE_GRACE" ]; do
+  sleep 15; waited=$((waited + 15))
+done
+# ⛔ A PHASE MARKER IS A CLAIM ABOUT THE PRESENT, AND IT CARRIES ITS OWN CLOCK. lane-merge.sh writes
+# "<issue> <epoch>"; testing only `[ -f ]` meant a lane killed at its wall limit left a marker that
+# stalled this chain for the FULL HANDOFF_WAIT (30 min) on a PR nobody was working — and that 30
+# minutes is exactly what pushes the issue claim past its lease. The epoch is right there: read it.
+_phase_age() {
+  local e; e="$(awk '{print $2}' "$PR_PHASE" 2>/dev/null)"; case "$e" in ''|*[!0-9]*) e=0 ;; esac
+  [ "$e" -gt 0 ] && printf '%s' "$(( $(date +%s) - e ))" || printf '%s' "-1"
+}
+_PHASE_AGE="$(_phase_age)"
+# The lane's own wall clock bounds how long its marker can mean anything (LANE_TIMEOUT, +60s slack).
+_PHASE_STALE_AFTER="${LANE_TIMEOUT:-3300}"
+case "$_PHASE_STALE_AFTER" in ''|*[!0-9]*|0[0-9]*) _PHASE_STALE_AFTER=3300 ;; esac
+_PHASE_STALE_AFTER=$(( _PHASE_STALE_AFTER + 60 ))
+if [ -f "$PR_PHASE" ] && [ "$_PHASE_AGE" -ge 0 ] && [ "$_PHASE_AGE" -gt "$_PHASE_STALE_AFTER" ]; then
+  echo "[chain $N] STALE merge-phase marker (age ${_PHASE_AGE}s > lane wall limit ${_PHASE_STALE_AFTER}s) — the lane is gone; reviewing at the tip now" >> "$LOG"
+  rm -f "$PR_PHASE"
+fi
+if [ -f "$PR_PHASE" ]; then
+  echo "[chain $N] the lane is in its merge phase (state/lanemerge-$PR.phase, age ${_PHASE_AGE}s) — waiting for its verdict before reviewing, so the review binds the FINAL head" >> "$LOG"
+  waited=0
+  while [ "$waited" -lt "$HANDOFF_WAIT" ]; do
+    # A lane that merges its PR leaves merge-one's own marker; stop waiting on it, not on our clock.
+    [ -f "$O/state/merged-$PR.done" ] && break
+    # ⛔ A VERDICT IS NOT NECESSARILY A HANDOFF (reviewer finding, reproduced). lane-merge.sh records
+    # EVERY loop outcome, including the mid-loop tokens that TELL THE LANE TO PUSH A FIX. Treating
+    # `FIX_REQUIRED` as "the lane handed off" reviewed at the pre-fix head and stranded the
+    # attestation — exactly what the wait exists to prevent. Only a BLOCKED_*/terminal verdict hands
+    # off; MERGED ends the chain; the rest mean "keep waiting".
+    if [ -s "$PR_VERDICT" ] && _verdict_is_current; then
+      _tok="$(cut -d' ' -f1 "$PR_VERDICT" 2>/dev/null)"
+      case "$_tok" in
+        MERGED|BLOCKED|BLOCKED_ATTESTATION|BLOCKED_ATTEMPTS|BLOCKED_CLOSED) break ;;
+        *)
+          # Anything else means the lane has not finished (FIX_*, WAITING_*): keep waiting, and say
+          # so ONCE rather than every 15 seconds.
+          if [ "${_said_waiting:-0}" = 0 ]; then
+            echo "[chain $N] the lane is still working ($_tok) — not reviewing yet; the review must bind the FINAL head" >> "$LOG"
+            _said_waiting=1
+          fi ;;
+      esac
+    fi
+    sleep 15; waited=$((waited + 15))
+  done
+  if [ -f "$O/state/merged-$PR.done" ]; then
+    echo "[chain $N] PR #$PR is MERGED by the lane's own merge phase — nothing left to review" >> "$LOG"
+    # release_issue_claim clears the EXIT/INT/TERM traps itself, so no second `trap -` is needed.
+    release_issue_claim
+    echo "[chain $N] done $(date)" >> "$LOG"
+    exit 0
+  fi
+  if [ -s "$PR_VERDICT" ]; then
+    case "$(cut -d' ' -f1 "$PR_VERDICT" 2>/dev/null)" in
+      MERGED)
+        echo "[chain $N] the lane's verdict is MERGED — nothing left to review: $(cat "$PR_VERDICT")" >> "$LOG"
+        release_issue_claim
+        echo "[chain $N] done $(date)" >> "$LOG"
+        exit 0 ;;
+      *)
+        echo "[chain $N] the lane handed off ($(cat "$PR_VERDICT")) — reviewing at the head it left behind" >> "$LOG" ;;
+    esac
+  else
+    echo "[chain $N] ⚠️ no verdict after ${HANDOFF_WAIT}s (the lane's wall limit, or it died) — reviewing now; if the lane is still alive its next push re-arms the PR" >> "$LOG"
+  fi
+else
+  echo "[chain $N] no merge-phase marker after ${PHASE_GRACE}s (a pre-merge-phase lane, or it failed before the PR) — reviewing now, as before" >> "$LOG"
+fi
+
 bash "$O/merge-one.sh" "$REPO" "$OR" "$PR" "$BR" >> "$LOG" 2>&1
 rc=$?
 # A load refusal (75) is not a failure of the work: nothing ran and nothing was consumed. Name it

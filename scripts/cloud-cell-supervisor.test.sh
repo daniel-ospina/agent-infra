@@ -39,6 +39,20 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # a new refusal is shown to be NON-VACUOUS (run the suite against the PRE-fix script and watch the new
 # arms, and only the new arms, go red). Default is the shipped script.
 SUP="${SUP:-$HERE/cloud-cell-supervisor.sh}"
+# ⛔ THE WORKER SET IS DERIVED FROM THE SHIPPED SUPERVISOR, ONCE, AND EVERY FIXTURE SEEDS *THIS* LIST.
+# Six fixtures used to mirror the list by hand, so every addition (#1997's cloud-cell-doctor.sh,
+# #2038's repo-slug.sh, #2029's lane-merge.sh/merge-rate.sh) had to be applied seven times and missed
+# on some round: adding two workers produced 52 unrelated `start` failures instead of ONE assertion
+# naming the drift. Deriving the list makes the drift IMPOSSIBLE rather than detected.
+SEED_WORKERS="$(sed -n 's/^  for w in \(.*\); do$/\1/p' "$SUP" | head -1)"
+if [ -z "$SEED_WORKERS" ]; then
+  echo "FATAL: cannot parse cmd_check's required-worker list out of $SUP — the fixtures below would"
+  echo "       seed NOTHING and every start arm would pass vacuously."
+  exit 1
+fi
+# Each seed site calls this; it records the SITE (not a counter) because several sites run inside a
+# `( … )` subshell — the #1989 arms — where an incremented variable would be discarded on exit.
+seed_site() { printf '%s\n' "${BASH_SOURCE[0]}:$1" >> "$SEED_LOG" 2>/dev/null || true; }
 BRINGUP="$HERE/cloud-cell-bringup.sh"
 
 PASS=0; FAIL=0
@@ -46,6 +60,7 @@ ok()  { PASS=$((PASS + 1)); echo "  ✅ $1"; }
 bad() { FAIL=$((FAIL + 1)); echo "  ❌ $1"; }
 
 T="$(mktemp -d "${TMPDIR:-/tmp}/cloud-cell-test.XXXXXX")"
+SEED_LOG="$T/seed-sites"; : > "$SEED_LOG"
 # ⛔ HERMETIC means the CALLER's environment must not decide a fixture. agent-infra#1901 makes `OR`
 # (the queue's owner/repo) a VALIDATED INPUT — derived from the checkout unless declared — so an
 # ambient `OR` in a developer's shell would be judged against every fixture checkout (which carries a
@@ -118,8 +133,8 @@ make_ai_repo() {
   git -C "$AI" config user.name test
   git -C "$AI" config commit.gpgsign false
   mkdir -p "$AI/scripts/orchestrator-harness"
-  for w in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do
-    : > "$AI/scripts/orchestrator-harness/$w"
+  seed_site "$LINENO"; for f in $SEED_WORKERS; do
+    : > "$AI/scripts/orchestrator-harness/$f"
   done
   # ⛔ the REAL launcher module (agent-infra#2210), not an empty placeholder: `start`'s unattended
   # prune asks it for the worker census, and an empty copy can only answer "unknown" — which makes
@@ -352,7 +367,7 @@ ai_worktree "$W/harness"
 # Mirror the shipped required-worker set (`cloud-cell-supervisor.sh` cmd_check): claims.sh is a
 # required worker script now (orch-loop.sh/merge-one.sh SOURCE it from $O), so a fixture without it
 # dies in cmd_check with "worker scripts missing from …: claims.sh".
-for f in harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do : > "$W/harness/$f"; done
+seed_site "$LINENO"; for f in $SEED_WORKERS; do : > "$W/harness/$f"; done
 write_doctor_stub "$W/harness"
 printf '#!/bin/bash\nexit 0\n' > "$W/bin/gh"; chmod +x "$W/bin/gh"
 # #1717: the shipped `start` PROVISIONS the record step from the checkout, and `cmd_check` refuses a
@@ -632,10 +647,7 @@ ai_worktree "$F/harness"
 # required worker script now, so a fixture without it dies in cmd_check with "worker scripts
 # missing from …: claims.sh" before the #1736 provisioning contract below can be exercised.
 # (P1, 2026-10-14 review round — the §7 fixture was updated, this one was missed.)
-# `harness-refresh.sh` joined the set in agent-infra#2215 (the loop spawns it from $O every cycle), for
-# the same reason — and the same failure mode is what a fixture gap produces: the FATAL upstream of the
-# assertions decides them, so the probe under test is never reached.
-for f in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh adopt-fix.sh cloud-cell-doctor.sh; do
+seed_site "$LINENO"; for f in $SEED_WORKERS; do
   : > "$F/harness/$f"; : > "$F/o/$f"
 done
 write_doctor_stub "$F/harness"; write_doctor_stub "$F/o"
@@ -746,7 +758,7 @@ say_case "harness provenance: reports, records, refuses and mends (agent-infra#1
 
 P="$T/prov"; mkdir -p "$P/home" "$P/o" "$P/bin" "$P/untracked" "$P/lowbin"
 ai_init_repo "$P/repo"
-for f in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do
+seed_site "$LINENO"; for f in $SEED_WORKERS; do
   : > "$P/o/$f"; : > "$P/untracked/$f"
 done
 write_doctor_stub "$P/o"; write_doctor_stub "$P/untracked"
@@ -1770,7 +1782,7 @@ say_case "the queue target IS the checkout's remote (agent-infra#1901)"
 Q="$T/queue"; mkdir -p "$Q/home" "$Q/bin"
 QH="$Q/harness"
 ai_worktree "$Q/harness"
-for f in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh adopt-fix.sh cloud-cell-doctor.sh; do : > "$Q/harness/$f"; done
+seed_site "$LINENO"; for f in $SEED_WORKERS; do : > "$Q/harness/$f"; done
 write_doctor_stub "$Q/harness"
 # The provisioning probe must answer rc=0 here: this section is about the PAIR, not about dispatch.
 # It echoes the OR it was handed, so a probe run against the wrong queue could not pass silently.
@@ -3284,7 +3296,7 @@ ai_init_repo "$W2/repo"
 ai_worktree "$W2/harness"
 # The harness a cell seeds is the worker DIRECTORY: the required set must be at its root (a fixture
 # without it dies in `cmd_check` with "worker scripts missing"), and the doctor stub is one of them.
-for f in harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do : > "$W2/harness/$f"; done
+seed_site "$LINENO"; for f in $SEED_WORKERS; do : > "$W2/harness/$f"; done
 write_doctor_stub "$W2/harness"
 write_doctor_stub "$W2/o"
 cat > "$W2/harness/orch-loop.sh" <<EOF
@@ -3470,6 +3482,21 @@ newdoc=0; grep -qE 'new-session.*-s cell-doctor( |$)' "$LA/st/argv" 2>/dev/null 
 [ "$LARC" -eq 0 ] && [ "$newdoc" = 0 ] \
   && ok "start: a live loop record with no session is treated as RUNNING (no second doctor session)" \
   || bad "start: a surviving loop was ignored (rc=$LARC, new doctor session=$newdoc) — $(tail -2 "$LA/out" | tr '\n' ' ') // live matches: $(ps -eo pid=,ppid=,command= 2>/dev/null | awk -v a="$LA/o/orch-loop.sh" -v h="$LA/h/orch-loop.sh" '{ c=$0; sub(/^[[:space:]]*[0-9]+[[:space:]]+[0-9]+[[:space:]]+/,"",c); n=split(c,t," "); if (n>=2 && (t[2]==a || t[2]==h)) print $1" "t[2] }' | tr '\n' ' ')"
+
+# ── the fixture's worker seed must not drift from the supervisor's requirement ─────────────────
+# Read the SHIPPED list, not a copy: six hand-written mirrors is how #2029's two workers surfaced as 52
+# unrelated `start` failures instead of one assertion naming them.
+LITERAL_SEEDS="$(grep -cE '^[[:space:]]*for [a-z]+ in [^;]*(orch-loop\.sh|claims\.sh)' "${BASH_SOURCE[0]}")"
+SEED_DECLARED="$(grep -c 'for f in \$SEED_WORKERS' "${BASH_SOURCE[0]}")"
+# The expected count is READ from this file, not written down: a hardcoded number would false-block the
+# next section that adds a fixture (a category-B cost), while the occurrence count still catches the
+# failure that matters — a site that exists but did not RUN (an early return, a moved block).
+SEED_RAN="$(sort -u "$SEED_LOG" 2>/dev/null | wc -l | tr -d ' ')"
+if [ "$LITERAL_SEEDS" -eq 0 ] && [ "$SEED_RAN" -eq "$SEED_DECLARED" ]; then
+  ok "all $SEED_DECLARED worker-seed sites ran and seeded the set DERIVED from the shipped supervisor"
+else
+  bad "a fixture hand-writes its own worker list ($LITERAL_SEEDS literal seed line(s)) or a site did not run (ran=$SEED_RAN, declared $SEED_DECLARED) — seed \$SEED_WORKERS instead"
+fi
 
 echo "── Summary ───────────────────────────────────────────────────────"
 echo "  PASS=$PASS FAIL=$FAIL"

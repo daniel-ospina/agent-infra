@@ -21,7 +21,7 @@ chmod +x "$O/lane.sh" "$O/merge-one.sh" "$O/chain-merge.sh" 2>/dev/null
 # from its EXIT trap — the NORMAL path. This is the path that never reaches that trap: the worktree
 # could not be created, so no lane and no chain are spawned and NOTHING else will ever release the
 # claim. Without this, a single failed `git worktree add` would hold a FREE issue across every box
-# until the lease ran out (CLAIM_ISSUE_TTL, 3h) — and the reaper would meanwhile return the issue to
+# until the lease ran out (CLAIM_ISSUE_TTL, 4h since #2029) — and the reaper would meanwhile return the issue to
 # the pool, where every box would read it as another box's live claim.
 # The record/fence convention is claims.sh's `claim_issue_release_record` (one implementation; see
 # its comment for why the handover file exists rather than the acquiring process doing the release).
@@ -211,7 +211,7 @@ for N in "$@"; do
   # ⚠️ The window is NOT microseconds for every member of a batch: the loop sleeps between issues, so
   # the k-th issue's record is read ~30·(k-1)s after it was written. The read is still correct because
   # the record can only be OVERWRITTEN by a re-acquire, and a re-acquire needs the current claim to be
-  # RELEASED or to reach its CLAIM_ISSUE_TTL (3h) first — not because the gap is small. Do not shorten
+  # RELEASED or to reach its CLAIM_ISSUE_TTL (4h) first — not because the gap is small. Do not shorten
   # the TTL without revisiting this line.
   chain_gen="$( . "$O/claims.sh" 2>/dev/null; claim_issue_record_commit "$O" "$N" 2>/dev/null )" || true
   if wt_spawn "chain-$N" "$REPO" "CHAIN_CLAIM_COMMIT='$chain_gen' bash '$O/chain-merge.sh' '$REPO' '$OR' $N '$BR'"; then

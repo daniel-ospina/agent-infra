@@ -1,0 +1,630 @@
+#!/usr/bin/env bash
+# lane-merge.sh — THE BOUNDED MERGE LOOP, as code. A lane runs this after it opens its PR.
+#
+#   lane-merge.sh <pr> --issue <n> [--repo OWNER/REPO] [--branch BR] [--rounds N]
+#   lane-merge.sh <pr> --watch          # continue waiting for the chain launched by the last round
+#   lane-merge.sh <pr> --status         # print the recorded verdict. No network, no writes.
+#
+# ⛔ WHY THIS FILE EXISTS. A lane is not done when it opens a PR. Measured 2026-10-18: the fleet had
+# 22 open PRs and 3 merged, because every lane treated "PR opened" as success and exited — so the
+# merge work piled up behind the running lanes and the backlog grew while the fleet looked busy.
+# The instruction alone is not enough (a brief that says "keep merging" leaves the lane to invent a
+# polling loop, and an invented loop is unbounded): this script gives the lane the loop, with the
+# cap enforced HERE, in code, so a lane stuck in round 5 is refused by the tool instead of being
+# mistaken for thoroughness.
+#
+# THE LOOP, exactly:
+#   round k:  wait for THIS head's checks to be terminal (bounded)  →  read the failing names
+#             →  FIX_REQUIRED (the lane fixes, pushes, runs again)     or green
+#             →  green: launch the harness's per-PR chain (merge-one.sh) DETACHED
+#             →  WAITING: --watch until it merges / a fix is required / it blocks
+#   cap:      LANE_MERGE_MAX_ROUNDS (default 3) FIX rounds, then BLOCKED_ATTEMPTS + a PR comment
+#
+# ⛔ WHO MERGES, AND WHY IT IS NOT A SELF-REVIEW. The merge itself is `$O/merge-one.sh` — the
+# harness's one per-PR chain, which resolves the repo's OWN merge authority (agent-infra#1764):
+#   * rail repo (agent-infra): it runs the repo's rail (`scripts/admin-merge.sh`), which posts its
+#     own head-bound evidence. The reviewer is deliberately skipped there — that repo's merge
+#     contract does not consume a review marker, and minting one would edit a PR body for no gate.
+#   * gate repo (tortoise): it dispatches a FRESH-CONTEXT reviewer, records the verdict with
+#     record-review.sh (which VERIFIES the evidence comment), and only then merges.
+# A lane must never call `record-review.sh` itself: a lane attesting to its own review is a review
+# that did not happen, and `record-review.sh` refuses an unverifiable artifact anyway. This script
+# never mints a record — it only drives the chain, and reads the result.
+#
+# ⛔ SPARSE GITHUB CALLS. 22 landers poll the same rate-limited account. This script:
+#   * uses REST (`gh api repos/…`), never GraphQL;
+#   * reads the PR ONCE per invocation and the checks at most once per poll interval;
+#   * waits on LOCAL state files (no API) while the chain runs;
+#   * posts exactly ONE handoff comment, only on a terminal block, and only if that head has not
+#     already been commented.
+#
+# EXIT CODES — the lane's brief maps each of these to one action, so the code is the contract:
+#   0   MERGED               the PR is merged (the merge sha is printed)
+#   10  FIX_REQUIRED         its own checks are RED — fix the printed names, push, run again
+#   15  FIX_CONFLICT         the PR is DIRTY — re-apply this lane's own change onto current main
+#                            and force-push its OWN branch (never pick a side on a generated file)
+#   11  WAITING              the chain is running detached — call `--watch` (burns no round)
+#   12  BLOCKED_ATTESTATION  green and mergeable, but the chain produced no signed review at this
+#                            head and did not merge: the ONE thing a lane cannot supply itself
+#   13  BLOCKED_ATTEMPTS     the round cap is spent — hand off (a PR comment states the reason)
+#   14  BLOCKED              the rail froze this head / it is closed / unreadable — hand off
+#   2   usage or environment error (nothing was attempted)
+#
+# A NAIVE TEST CANNOT PASS: `--checks-tsv` and `--pr-tsv` inject the two API reads, so the state
+# machine is driven offline from fixtures in lane-merge.test.sh. Every verdict below is asserted
+# there, including that the cap is REACHED and that a lane can never merge without the chain.
+
+set -u
+say() { printf '%s\n' "$*"; }
+say_err() { printf '%s\n' "$*" >&2; }
+
+PR=""; ISSUE=""; OR=""; BR=""; WATCH=0; STATUS=0
+CHECKS_TSV=""; PR_TSV=""; MAX_ROUNDS_OVERRIDE=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --issue)   ISSUE="${2:-}"; shift 2 ;;
+    --repo)    OR="${2:-}"; shift 2 ;;
+    --branch)  BR="${2:-}"; shift 2 ;;
+    --rounds)  MAX_ROUNDS_OVERRIDE="${2:-}"; shift 2 ;;
+    --watch)   WATCH=1; shift ;;
+    --status)  STATUS=1; shift ;;
+    # TEST SEAMS (documented, not hidden): inject the two API reads from a fixture.
+    --checks-tsv) CHECKS_TSV="${2:-}"; shift 2 ;;
+    --pr-tsv)     PR_TSV="${2:-}"; shift 2 ;;
+    -h|--help) sed -n '2,60p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    -*) say_err "lane-merge: unknown flag '$1' (see --help)"; exit 2 ;;
+    *) if [ -z "$PR" ]; then PR="$1"; else say_err "lane-merge: unexpected argument '$1'"; exit 2; fi; shift ;;
+  esac
+done
+case "${PR:-}" in ''|*[!0-9]*) say_err "lane-merge: refusing non-numeric PR '${PR:-<empty>}'"; exit 2 ;; esac
+O="${O:-$HOME/orchestrator}"; mkdir -p "$O/state" "$O/logs" 2>/dev/null || true
+# The integer tunables feed `[ -ge ]` and `$(( ))`. Reject a leading zero (octal) and an absurd
+# magnitude, exactly as fix-one.sh/merge-one.sh do — a huge value errors FALSE on bash 3.2 and the
+# cap would then be silently missed, which is the one failure this file exists to prevent.
+is_limit() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; 0) return 0 ;; 0*) return 1 ;; *) [ "${#1}" -le 9 ] ;; esac; }
+MAX_ROUNDS="${LANE_MERGE_MAX_ROUNDS:-3}"
+[ -n "$MAX_ROUNDS_OVERRIDE" ] && MAX_ROUNDS="$MAX_ROUNDS_OVERRIDE"
+is_limit "$MAX_ROUNDS" || { say_err "lane-merge: LANE_MERGE_MAX_ROUNDS='$MAX_ROUNDS' is not a bounded integer — using 3"; MAX_ROUNDS=3; }
+WAIT_S="${LANE_MERGE_WAIT:-900}";      is_limit "$WAIT_S" || WAIT_S=900      # per-round check wait
+# ⛔ --watch IS BOUNDED TOO. A pid probe cannot distinguish "the chain is still working" from "the pid
+# was reused", so an unbounded --watch loop would be a lane that never ends — the same defect the
+# round cap removes, one layer down. 20 chunks x LANE_MERGE_POLL (120s) ≈ 40 minutes of supervision,
+# after which the lane hands off instead of waiting forever.
+# ⛔ 20 CHUNKS WAS TOO SMALL TO SUPERVISE ONE CYCLE — it bounded supervision at 40 min while the cycle
+# this loop exists to wait for is CI (up to ~24 min under 22 landers) + merge-one.sh's REVIEW_TIMEOUT
+# (1800s) + the rail's own retries ≈ 55-60 min. So the HEALTHY-but-slow PR — precisely the one closest
+# to merging — would exhaust supervision and be reported as BLOCKED_ATTEMPTS with "budget spent": the
+# instrument failing the case it was written for. 35 x 120s = 70 min. It is a runaway guard, not a
+# quality gate, and it is re-armed (below) whenever the lane starts a NEW cycle.
+MAX_WATCH="${LANE_MERGE_MAX_WATCH:-35}"; is_limit "$MAX_WATCH" || MAX_WATCH=35
+POLL_S="${LANE_MERGE_POLL:-120}";      is_limit "$POLL_S" || POLL_S=120      # one --watch chunk
+INTERVAL="${LANE_MERGE_INTERVAL:-20}"; is_limit "$INTERVAL" || INTERVAL=20
+[ "$INTERVAL" -ge 5 ] || INTERVAL=20
+
+PHASE_F="$O/state/lanemerge-$PR.phase"   # "this lane IS in its merge phase" (chain-merge waits on it)
+ROUND_F="$O/state/lanemerge-$PR.round"
+VERDICT_F="$O/state/lanemerge-$PR.verdict"
+LAST_F="$O/state/lanemerge-$PR.last"
+CHAIN_F="$O/state/lanemerge-$PR.chain"     # "<pid> <head> <chain-log>"
+WATCH_F="$O/state/lanemerge-$PR.watch"     # --watch chunks spent (its own bound, see below)
+CHAIN_LOG="$O/logs/lane-merge-$PR.log"
+
+verdict() { # verdict <TOKEN> <reason…> — the ONE writer, so no exit path can skip the record
+  local tok="$1"; shift
+  printf '%s %s\n' "$tok" "$*" > "$VERDICT_F"
+  # The ISSUE-keyed copy is what chain-merge.sh waits on (it knows the issue, not the PR).
+  [ -n "$ISSUE" ] && printf '%s %s\n' "$tok" "$*" > "$O/state/lanemerge-issue-$ISSUE.verdict"
+  return 0
+}
+round_of() { local r=0; [ -f "$ROUND_F" ] && r="$(cat "$ROUND_F" 2>/dev/null || echo 0)"; is_limit "$r" || r=0; printf '%s' "$r"; }
+
+# ── --status: no network, no writes. chain-merge.sh and an operator both read this. ──────────────
+if [ "$STATUS" -eq 1 ]; then
+  if [ -f "$VERDICT_F" ]; then cat "$VERDICT_F"; else say "NONE round=$(round_of)/$MAX_ROUNDS"; fi
+  exit 0
+fi
+
+OR="${OR:-${GH_REPO:-}}"
+if [ -z "$OR" ]; then
+  # Resolve from the checkout this script is being run in, over GIT — not `gh repo view --json`,
+  # which is served by GraphQL: the transport this harness has already had refuse outright (so the
+  # header's "never GraphQL" would be a lie), and a call that costs quota for a datum git already
+  # holds locally. Only reached when the caller did not name the repo (the brief always does).
+  OR="$(git remote get-url origin 2>/dev/null | sed -E 's#^.*[:/]([^/]+/[^/]+?)(\.git)?$#\1#')"
+fi
+[ -n "$OR" ] || { say_err "lane-merge: the repo is unknown (pass --repo OWNER/REPO)"; exit 2; }
+
+# ⛔ ANNOUNCE THE PHASE BEFORE DOING ANY WORK. chain-merge.sh finds the PR the moment it is open and
+# would otherwise start its own review immediately — and a review recorded at a head this lane then
+# fixes is a STRANDED attestation (the record binds the old head, so the gate goes red and the review
+# is paid for twice). The marker is what it waits on, so it must exist before the first API read.
+# The ISSUE is what makes the issue-keyed verdict (lane.sh's post-run diagnostic) exist at all, and a
+# `--watch` call used to omit it — so a lane that BLOCKED during supervision left no issue-keyed
+# record and lane.sh then reported "no verdict" over a lane that HAD named its blocker (A6).
+# Persist the key on the first round; re-read it when a later invocation was not given one.
+[ -n "${ISSUE:-}" ] && printf '%s\n' "$ISSUE" > "$O/state/lanemerge-$PR.issue" 2>/dev/null
+[ -z "${ISSUE:-}" ] && ISSUE="$(cat "$O/state/lanemerge-$PR.issue" 2>/dev/null || true)"
+printf '%s %s\n' "${ISSUE:-}" "$(date +%s)" > "$PHASE_F" 2>/dev/null || true
+
+# ── the two reads (injectable) ───────────────────────────────────────────────────────────────────
+# pr_read → "<state>|<merged_at>|<head_sha>|<mergeable_state>"
+# ⛔ PIPE, NOT TAB. Tab is WHITESPACE to the shell, so `IFS=<tab> read` COLLAPSES empty fields — an
+# unmerged PR (merged_at empty) then shifts its head sha into the merged slot and reads as MERGED.
+# Reproduced while writing this file's own suite: `closed\t\tabc123\tclean` → "MERGED clean". A
+# non-whitespace separator preserves the empty field, which is the whole point of a fixed arity.
+pr_read() {
+  if [ -n "$PR_TSV" ]; then [ -f "$PR_TSV" ] || return 1; cat "$PR_TSV"; return 0; fi
+  gh api "repos/$OR/pulls/$PR" \
+     --jq '[(.state // ""), (.merged_at // ""), (.head.sha // ""), (.mergeable_state // "")] | join("|")' 2>/dev/null
+}
+# checks_read → TSV rows "name\tstatus\tconclusion\tid\tapp_slug", ALL attempts (filter=all is not
+# the default; the app slug is what keeps two workflows sharing a job name from masking each other).
+# ⛔ NO `--paginate` ON THE POLL. `gh-limit.py` deliberately leaves every argv containing
+# `--paginate` (or `--slurp`/`-H`/`--template`) COMPLETELY alone — its output cannot be re-created —
+# so a paginated poll is NEVER made conditional and costs primary quota on every tick: 45 polls per
+# invocation x 22 landers, on the one account that has already refused GraphQL outright. The
+# un-paginated shape answers 304 (free) when nothing changed, which is the whole point of the layer.
+# A head with MORE than one page of check-runs is rare and stable-ish; for that case only, do the one
+# full paginated read (the count comes back in the same response, so the branch costs nothing extra).
+checks_read() { # checks_read <head> [--full]
+  local head="$1" full="${2:-}"
+  if [ -n "$CHECKS_TSV" ]; then [ -f "$CHECKS_TSV" ] || return 1; cat "$CHECKS_TSV"; return 0; fi
+  local q="repos/$OR/commits/$head/check-runs?per_page=100&filter=all"
+  local rows='(.check_runs[] | [(.name // ""), (.status // ""), (.conclusion // ""), (.id // 0), (.app.slug // "")] | @tsv)'
+  if [ "$full" = "--full" ]; then
+    gh api "$q" --paginate --jq "$rows" 2>/dev/null
+    return $?
+  fi
+  # One page, plus the total as a 2-field TSV row so the caller can tell "this page is all of it"
+  # from "there is more" (the caller strips it before classifying: `NF>=4`).
+  gh api "$q" --jq "([\"TOTAL\", (.total_count | tostring)] | @tsv), $rows" 2>/dev/null
+}
+
+# classify <tsv-file> → prints exactly two lines:
+#   "INFLIGHT <n>"
+#   "RED <comma-separated names>"      (empty list = green)
+# ⛔ IT TAKES A FILE, NOT A PIPE. `python3 - <<'PY'` reads the PROGRAM from stdin, so piping rows
+# into it delivers the heredoc instead of the data and the classifier sees NOTHING — every red set
+# comes back empty and a red head reads GREEN. That is a FALSE PASS in a merge gate; it was caught by
+# this file's own suite (a `failure` conclusion classified as green) before it ever shipped.
+# ⛔ ALLOW-LIST POLARITY, the rail's own (AGENTS.md "reading verification state"): of the COMPLETED
+# attempts only success/neutral/skipped are green and cancelled/stale are non-red; EVERY OTHER
+# CONCLUSION IS RED — including one GitHub has not documented yet, and a null one. An unnamed
+# conclusion must never fall through a gap. Newest attempt per **(app, name)** by id — a job name
+# shared across two workflows must not let one mask the other; `started_at` is nullable and is only a
+# tiebreak, and grouping by check_suite would shatter one check per re-run.
+classify() {
+  python3 - "$1" <<'PY'
+import sys
+GREEN = {"success", "neutral", "skipped"}
+NONRED = GREEN | {"cancelled", "stale"}
+newest = {}
+for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
+    parts = line.rstrip("\n").split("\t")
+    if len(parts) < 4:
+        continue
+    name, status, conclusion, cid = parts[0], parts[1].lower(), parts[2].lower(), parts[3]
+    # GROUP BY (app, name), NOT NAME ALONE. A check-run's `name` is the JOB name, and two workflows
+    # can publish the same one — so keying on the name lets the newest attempt of one mask the other
+    # (this repo's own instructions record it: two `packaging-smoke` runs, one cancelled, one
+    # success). The red is printed as `app:name` so a report says which one failed.
+    app = parts[4].strip() if len(parts) > 4 else ""
+    try:
+        cid = int(cid)
+    except ValueError:
+        cid = 0
+    key = (app, name)
+    cur = newest.get(key)
+    if cur is None or cid > cur[2]:
+        newest[key] = (status, conclusion, cid)
+inflight, red = 0, []
+for (app, name), (status, conclusion, _cid) in sorted(newest.items()):
+    if status != "completed":
+        inflight += 1
+    elif conclusion not in NONRED:
+        red.append("%s:%s" % (app, name) if app else name)
+print("INFLIGHT %d" % inflight)
+print("RED %s" % ",".join(red))
+PY
+}
+
+# ── chain supervision ────────────────────────────────────────────────────────────────────────────
+chain_pid() { awk '{print $1}' "$CHAIN_F" 2>/dev/null; }
+chain_head() { awk '{print $2}' "$CHAIN_F" 2>/dev/null; }
+chain_alive() { local p; p="$(chain_pid)"; [ -n "$p" ] && kill -0 "$p" 2>/dev/null; }
+chain_log() { local l; l="$(awk '{print $3}' "$CHAIN_F" 2>/dev/null)"; printf '%s' "${l:-$CHAIN_LOG}"; }
+
+# launch_chain <head> — start the harness's per-PR chain DETACHED and return immediately.
+# ⛔ DETACHED, NOT A BLOCKING CALL. The chain pays for a fresh-context reviewer (up to REVIEW_TIMEOUT)
+# and then runs the repo's rail; a lane that blocked on that inside one shell invocation would be
+# silent for ~15-25 minutes, which reads as a wedged lane to every liveness instrument we have.
+# ⛔ AND IT WILL NOT DOUBLE-REVIEW: merge-one.sh takes state/mergeclaim-<PR>.lock first, so a chain
+# the controller already spawned owns the PR and ours exits without paying a second reviewer.
+launch_chain() {
+  local head="$1" chain="$O/merge-one.sh"
+  # ⛔ THE FALLBACK MUST RESOLVE TO THE SAME TREE AS $O, NOT WHEREVER THIS FILE WAS INVOKED. $O's copy
+# is the operator-seeded authority precisely so a lane cannot choose its own gate — and the natural
+# way for a lane to run this script is the checkout copy (`scripts/orchestrator-harness/lane-merge.sh`
+# is in its cwd), so an unconditional fallback would let a lane that edited `merge-one.sh` on its own
+# branch merge its PR through ITS version of the merge gate. Refuse instead: the lane's remedy is to
+# sync the harness, which is safe.
+if [ ! -f "$chain" ]; then
+  _d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  if [ "$_d" = "$(cd "$O" 2>/dev/null && pwd)" ]; then
+    chain="$_d/merge-one.sh"
+  else
+    say_err "lane-merge: $O/merge-one.sh is missing and the copy beside this script ($_d) is not the"
+    say_err "  harness $O — refusing to select the merge authority from a checkout that may be a lane's"
+    say_err "  own branch. Sync it: cp scripts/orchestrator-harness/*.sh $O/"
+    exit 2
+  fi
+fi
+  if [ ! -f "$chain" ]; then
+    say_err "lane-merge: merge-one.sh not found (looked in $O and beside this script) — refusing to"
+    say_err "            hand-roll a merge; sync the harness (cp scripts/orchestrator-harness/*.sh \$O/)"
+    return 1
+  fi
+  # THE LOCK IS A PID FILE, AND ITS EXISTENCE IS NOT A HOLDER (reviewer finding, reproduced). A bare
+  # `[ -f lock ]` read a STALE lock (its worker had died) as a live owner: no chain was spawned, no
+  # supervision target was recorded, and `--watch` then declared BLOCKED over a PR nobody was
+  # merging — permanently foreclosing the lane. merge-one.sh's own claim reaper clears exactly this
+  # condition, so do the same test it does: read the pid and probe it.
+  if [ -f "$O/state/mergeclaim-$PR.lock" ]; then
+    local opid; opid="$(cat "$O/state/mergeclaim-$PR.lock" 2>/dev/null || echo 0)"
+    case "${opid:-0}" in ''|*[!0-9]*) opid=0 ;; esac
+    if [ "$opid" -gt 0 ] && kill -0 "$opid" 2>/dev/null; then
+      # A LIVE owner (the controller's chain, or an earlier round of ours): never spawn a competitor.
+      # Record it as the supervision target so --watch can follow it by pid AND by its own log.
+      printf '%s %s %s\n' "$opid" "${head:-}" "$O/logs/merge-$PR.log" > "$CHAIN_F"
+      say "lane-merge: pid $opid already owns PR #$PR — supervising it (log $O/logs/merge-$PR.log)"
+      return 0
+    fi
+    say "lane-merge: a STALE merge lock (pid ${opid:-?} is not alive) — clearing it and taking the PR"
+    rm -f "$O/state/mergeclaim-$PR.lock"
+  fi
+  # ⛔ THE OUTCOME MUST OUTLIVE THE LANE (E6). This chain is launched DETACHED precisely so it keeps
+  # running when the lane's wall clock ends — and the only writer of a MERGED verdict used to be the
+  # live supervisor. So the SUCCESS case (lane killed, chain merges minutes later) left no MERGED
+  # anywhere: chain-merge read no verdict, merge-rate counted the lane as PR_OPENED/UNKNOWN, and the
+  # measured rate FELL as the change started working on the slowest PRs — an instrument punishing the
+  # behaviour it was written to reward. The wrapper below writes the verdict from the chain's own
+  # artifact (`state/merged-<PR>.done`, written by merge-one.sh) with no agent present.
+  LM_O="$O" LM_VERDICT="$VERDICT_F" nohup bash -c '
+    bash "$1" "$2" "$3" "$4" "$5"
+    rc=$?
+    # ⛔ A PR-NUMBER-KEYED MARKER IS NOT PROOF FOR *THIS* REPO (F3). `state/merged-<PR>.done` has no
+    # repo component and $O/state is shared by every repo on the box, so a marker left by
+    # tortoise#<same number> would make this wrapper declare premise-labs#<n> merged — and
+    # chain-merge.sh then exits 0 on that marker WITHOUT REVIEWING, so the PR is never merged at all
+    # while the verdict says MERGED. One REST read, on this rare path only, settles it.
+    mt=""
+    if [ -f "$LM_O/state/merged-$4.done" ]; then
+      # (single quotes cannot appear here: this whole block is one single-quoted program)
+      mt="$(gh api "repos/$3/pulls/$4" --jq ".merged_at // \"\"" 2>/dev/null)"
+    fi
+    if [ -n "$mt" ]; then
+      m="$(cat "$LM_O/state/merged-$4.done" 2>/dev/null)"
+      printf "%s\n" "MERGED ${m:-merged}" > "$LM_VERDICT" 2>/dev/null || true
+      [ -n "${6:-}" ] && printf "%s\n" "MERGED ${m:-merged}" > "$LM_O/state/lanemerge-issue-$6.verdict" 2>/dev/null
+      echo "[lane-merge] ✅ the chain merged PR #$4 at ${m:-?} (chain exit $rc)"
+    else
+      if [ -f "$LM_O/state/merged-$4.done" ]; then
+        echo "[lane-merge] ⚠️ a state/merged-$4.done marker exists but repos/$3/pulls/$4 reports no merged_at — NOT recording MERGED (the marker may belong to another repo + same PR number $4)"
+      fi
+      echo "[lane-merge] the chain did not merge PR #$4 (chain exit $rc)"
+    fi
+  ' lane-merge-wrap "$chain" "${REPO_PATH:-$(pwd)}" "$OR" "$PR" \
+      "${BR:-$(git branch --show-current 2>/dev/null)}" "${ISSUE:-}" \
+      >> "$CHAIN_LOG" 2>&1 < /dev/null &
+  printf '%s %s %s\n' "$!" "${head:-}" "$CHAIN_LOG" > "$CHAIN_F"
+  say "lane-merge: launched the merge chain (pid $!, log $CHAIN_LOG)"
+  return 0
+}
+
+# chain_verdict_from_log — classify a FINISHED merge chain, from the artifacts that ACTUALLY exist.
+#
+# ⛔ IT MUST NOT READ THE CHAIN LOG FOR THE VERDICT (reviewer finding A1, verified against the
+# shipped writers). The chain log (`lane-merge-<PR>.log`, or `chain-<N>.log`) carries only the
+# chain's own progress lines and `merge-one rc=…`. The reviewer's outcome and the rail's verdict are
+# written by merge-one.sh to ITS log — `$O/logs/merge-<PR>.log` — as `ISSUES <n>` /
+# `NOT CLEAN or reviewer failed` / `MERGED via the rail` / `PARKED`, and the durable head-keyed
+# markers are `state/needsfix-<PR>-<head>`, `state/parked-<PR>` and `state/parkreason-<PR>`.
+# A classifier that greps only the chain log can never return FIX_REQUIRED, so every "the reviewer
+# found issues" outcome would reach the lane as a terminal BLOCK — the one path that turns a paid
+# review into work. The MARKERS are checked first: machine-written, and not mistakable for prose.
+chain_verdict_from_log() { # chain_verdict_from_log <chain-log>
+  local clog="$1" mlog="$O/logs/merge-$PR.log" f seen_needsfix=0
+  [ -f "$O/state/parked-$PR" ] && { echo "BLOCKED"; return; }
+  for f in "$O/state/needsfix-$PR"-*; do [ -e "$f" ] && seen_needsfix=1; done
+  [ "$seen_needsfix" = 1 ] && { echo "FIX_REQUIRED"; return; }
+  if [ -s "$mlog" ]; then
+    tail -n 300 "$mlog" 2>/dev/null | grep -qE 'ISSUES [0-9]+|NOT CLEAN or reviewer failed' \
+      && { echo "FIX_REQUIRED"; return; }
+    tail -n 300 "$mlog" 2>/dev/null | grep -qE "MERGED via the rail|Successfully merged|is MERGED" \
+      && { echo "MERGED"; return; }
+    tail -n 300 "$mlog" 2>/dev/null | grep -q 'PARKED' && { echo "BLOCKED"; return; }
+  fi
+  if [ -s "$clog" ] && tail -n 80 "$clog" 2>/dev/null | grep -q 'reviewer NOT started\|load gate'; then
+    echo "LOAD"; return
+  fi
+  [ -s "$O/state/parkreason-$PR" ] && { echo "BLOCKED"; return; }
+  echo "UNKNOWN"
+}
+
+# ── FIX / BLOCK emitters (they own the round counter and the handoff comment) ────────────────────
+post_handoff() { # post_handoff <verdict-token> <reason>
+  local tok="$1" reason="$2" marker body
+  marker="<!-- lane-merge-handoff: ${HEAD:-unknown} -->"
+  # Dedup per HEAD, and only on the terminal path: 1 read + at most 1 write.
+  # THE NEWEST PAGE, NOT THE OLDEST. The default order is oldest-first, so on a PR with more than 100
+  # comments an existing marker was never in the page and every invocation re-posted the handoff — a
+  # write on a rate-limited account shared by 22 landers (reviewer finding).
+  if gh api "repos/$OR/issues/$PR/comments?per_page=100&sort=created&direction=desc" --jq '.[].body' 2>/dev/null | grep -qF "lane-merge-handoff: ${HEAD:-unknown}"; then
+    say "lane-merge: a handoff comment for this head already exists — not repeating it"
+    return 0
+  fi
+  body="$(mktemp "${TMPDIR:-/tmp}/lane-merge-handoff.XXXXXX")"
+  {
+    printf '%s\n' "$marker"
+    printf '## ⛔ Lane handoff — %s at head `%s`\n\n' "$tok" "${HEAD:-unknown}"
+    printf 'This lane could not take PR #%s to `merged` and is handing off. The exact blocker:\n\n' "$PR"
+    printf '    %s\n\n' "$reason"
+    printf 'What was already done for the next holder (do not redo it):\n'
+    printf -- '- The branch is pushed and this lane'"'"'s own change is applied on it.\n'
+    printf -- '- CI was driven to terminal and its failing names were read, not guessed.\n'
+    if [ -s "$LAST_F" ]; then
+      printf -- '- Last failing check names observed: `%s`\n' "$(tr '\n' ',' < "$LAST_F" | sed 's/,$//')"
+    fi
+    printf -- '- Rounds spent: %s/%s (the loop is capped by design — a lane in round 5 is a failure, not thoroughness).\n\n' "$(round_of)" "$MAX_ROUNDS"
+    printf 'The ONE thing this lane cannot supply: a signed review attestation is minted by\n'
+    printf '`merge-one.sh` from a FRESH-CONTEXT reviewer, never by the lane itself. If that is the\n'
+    printf 'blocker, the next step is `bash "$O/merge-one.sh" <repo> %s %s <branch>`.\n' "$OR" "$PR"
+    printf '\n_Re-run with `%s/lane-merge.sh %s` after a fix; a new head re-arms the PR._\n' "$O" "$PR"
+  } > "$body"
+  if gh api -X POST "repos/$OR/issues/$PR/comments" -F "body=@$body" >/dev/null 2>&1; then
+    say "lane-merge: handoff comment posted on PR #$PR (the next holder inherits a diagnosis)"
+  else
+    say_err "lane-merge: ⚠️ could not post the handoff comment (rate limit or auth) — the reason is in"
+    say_err "            $VERDICT_F and must be relayed in the lane's final message"
+  fi
+  rm -f "$body"
+}
+
+emit_fix() { # emit_fix <TOKEN> <reason…>
+  local tok="$1"; shift
+  local r; r="$(round_of)"; r=$((r + 1)); printf '%s\n' "$r" > "$ROUND_F"
+  # A new fix round is a NEW cycle: the supervision budget spent on the old head must not be inherited,
+  # or a re-armed run is refused from its first chunk (E1 — the stale-counter class AGENTS.md names).
+  : > "$WATCH_F" 2>/dev/null || true
+  if [ "$r" -gt "$MAX_ROUNDS" ]; then
+    # The cap REFUSES the next round rather than granting it: this is the bound the owner asked for.
+    # ⛔ THE VERDICT MUST SAY *WHY* IT STOPPED. Recording the fix token here would leave
+    # FIX_REQUIRED as the authoritative verdict on a lane that is handing off — chain-merge would
+    # then treat it as "still working" and merge-rate.sh would count a capped lane as a live fixer.
+    post_handoff BLOCKED_ATTEMPTS "round cap reached (${MAX_ROUNDS}/${MAX_ROUNDS}): $*"
+    verdict BLOCKED_ATTEMPTS "round cap ${MAX_ROUNDS} reached: $*"
+    say "⛔ BLOCKED_ATTEMPTS — round cap ${MAX_ROUNDS} reached. $*"
+    say "   Hand off. The exact reason is on PR #$PR as a comment."
+    exit 13
+  fi
+  verdict "$tok" "$*"
+  say "→ $tok (round ${r}/${MAX_ROUNDS}): $*"
+  case "$tok" in
+    FIX_CONFLICT) exit 15 ;;
+    *)            exit 10 ;;
+  esac
+}
+
+# review_record_at_head — is there a SIGNED review record for the CURRENT head? Reads the same store
+# record-review.sh writes; no API call. A record bound to a DIFFERENT head does NOT count: that is
+# the stranded-attestation condition, not coverage.
+review_record_at_head() {
+  local n slug f sha
+  n="$PR"; slug="$(printf '%s' "$OR" | tr '/' '-')"
+  for f in "$HOME/.pi/agent/reviews/$slug-$n.json" "$HOME/.pi/agent/reviews/$n.json"; do
+    [ -f "$f" ] || continue
+    sha="$(grep -o '"head_sha"[[:space:]]*:[[:space:]]*"[0-9a-fA-F]*"' "$f" 2>/dev/null \
+            | head -1 | grep -o '[0-9a-fA-F]\{7,\}')"
+    if [ -n "${sha:-}" ] && [ -n "${HEAD:-}" ]; then
+      case "$HEAD" in "$sha"*) return 0 ;; esac
+    fi
+  done
+  return 1
+}
+
+emit_attestation() { # emit_attestation <reason…>
+  verdict BLOCKED_ATTESTATION "$*"
+  post_handoff BLOCKED_ATTESTATION "$*"
+  say "⛔ BLOCKED_ATTESTATION — $*"
+  exit 12
+}
+
+emit_blocked() { # emit_blocked <TOKEN> <reason…>
+  local tok="$1"; shift
+  verdict "$tok" "$*"
+  post_handoff "$tok" "$*"
+  say "⛔ $tok — $*"
+  exit 14
+}
+
+# ── --watch: bounded chunks on LOCAL state; only the PR read costs an API call ───────────────────
+if [ "$WATCH" -eq 1 ]; then
+  # ⛔ HEAD IS SEEDED FROM THE LAST HEAD THIS LANE SAW, BEFORE ANY EXIT PATH (F4). The budget check
+  # below posts a handoff WITHOUT reading the PR, so with HEAD unset the marker degenerated to the
+  # constant `unknown` — collapsing per-head dedup back to per-PR and suppressing a later handoff at
+  # a new head (the exact bug an earlier round fixed for the in-loop path only). A failed read in a
+  # later chunk is the same story, so the seed covers both.
+  HEAD="$(cat "$O/state/lanemerge-$PR.head" 2>/dev/null || true)"
+  w="$(cat "$WATCH_F" 2>/dev/null || echo 0)"; is_limit "$w" || w=0
+  w=$(( w + 1 )); printf '%s\n' "$w" > "$WATCH_F"
+  if [ "$w" -gt "$MAX_WATCH" ]; then
+    post_handoff BLOCKED_ATTEMPTS "supervision budget spent (${MAX_WATCH} --watch chunks): the merge chain has not resolved this PR"
+    verdict BLOCKED_ATTEMPTS "supervision budget spent (${MAX_WATCH} chunks)"
+    say "⛔ BLOCKED_ATTEMPTS — ${MAX_WATCH} --watch chunks spent and the chain is still unresolved."
+    exit 13
+  fi
+  deadline=$(( $(date +%s) + POLL_S ))
+  # ⛔ ONE PR READ PER CHUNK, NOT PER TICK (A7). The header promises "reads the PR ONCE per
+  # invocation … waits on LOCAL state files while the chain runs"; at INTERVAL=20 a per-tick read was
+  # ~6/min per lane, across 22 landers, on one rate-limited account. Tick 0 reads, the rest poll
+  # local state (pid, log, markers); a later chunk re-reads.
+  _tick=0
+  while :; do
+    if [ "$_tick" -eq 0 ]; then
+      # ⛔ ONLY ON A GOOD READ. An empty read_up (rate-limited / failed pr_read) would blank ALL
+      # four fields, so HEAD falls back to "" and the handoff marker degenerates to the constant
+      # `unknown` — collapsing per-head dedup back to per-PR, the bug this file fixed once — and the
+      # closed/head-moved checks would be skipped for the whole chunk.
+      read_up="$(pr_read 2>/dev/null)"
+      if [ -n "${read_up:-}" ]; then
+        IFS='|' read -r ST MT HD MS <<< "$read_up"
+        # PERSIST the head: a LATER chunk that cannot reach the API would otherwise post a marker
+        # keyed `unknown`, collapsing per-head dedup back to per-PR (F4 — the state file is what makes
+        # the guard observable instead of a claim).
+        [ -n "${HD:-}" ] && printf '%s\n' "$HD" > "$O/state/lanemerge-$PR.head" 2>/dev/null
+      fi
+    fi
+    _tick=$(( _tick + 1 ))
+    # HEAD IS SET HERE TOO. post_handoff builds a HEAD-BOUND marker; with HEAD unset the marker
+    # degenerated to the constant "unknown", so the per-head dedup became per-PR and every later
+    # handoff at a NEW head was silently suppressed (reviewer finding, reproduced). A failed read
+    # falls back to the last head this lane actually saw (persisted above) — never to "unknown".
+    HEAD="${HD:-$(cat "$O/state/lanemerge-$PR.head" 2>/dev/null || true)}"
+    case "${ST:-}" in
+      closed) if [ -n "${MT:-}" ]; then
+                verdict MERGED "${HD:-}"
+                say "✅ MERGED — PR #$PR at head ${HD:-}"; exit 0
+              else
+                emit_blocked BLOCKED_CLOSED "PR #$PR is closed and was not merged by this chain"
+              fi ;;
+    esac
+    # ⛔ A LIVE PID IS NOT PROOF THAT THE CHAIN IS SUPERVISING *THIS* HEAD. A lane that pushed a fix
+    # after launching leaves a chain working the old head; its eventual "MERGED"/"BLOCKED" would then
+    # be read against the new one. The head the chain was launched for is recorded in CHAIN_F.
+    if chain_alive && [ -n "$(chain_head)" ] && [ -n "${HD:-}" ] && [ "$(chain_head)" != "$HD" ]; then
+      say "… the PR head moved past the chain's head ($(chain_head) → ${HD}) — the chain is working"
+      say "   a head that is no longer the tip. Run the loop again (no round is spent by this)."
+      : > "$WATCH_F" 2>/dev/null || true
+      verdict WAITING_HEAD_MOVED "the supervision chain is bound to an older head"
+      exit 11
+    fi
+    if ! chain_alive; then
+      cv="$(chain_verdict_from_log "$(chain_log)")"
+      case "$cv" in
+        MERGED)  verdict MERGED "${HD:-}"; say "✅ MERGED — PR #$PR at head ${HD:-}"; exit 0 ;;
+        FIX_REQUIRED)
+          # The reviewer's findings ARE the fix list; the PR comment carries them in full.
+          emit_fix FIX_REQUIRED "the fresh-context reviewer recorded ISSUES at head ${HD:-} — read the review comment on PR #$PR and fix every finding" ;;
+        LOAD)    say "… the reviewer was refused by the load gate; this is not a lane failure — re-run:"
+                 say "   lane-merge.sh $PR --issue ${ISSUE:-<n>} --repo $OR"
+                 verdict WAITING_LOAD "reviewer refused by the load gate; re-dispatch when the box quietens"
+                 exit 11 ;;
+        BLOCKED) emit_blocked BLOCKED "the merge chain parked this head: $(tail -n 3 "$O/state/parkreason-$PR" 2>/dev/null | tr '\n' ' ')" ;;
+        *)       # ⛔ THE ONE THING A LANE CANNOT SUPPLY HAS ITS OWN CODE (12): a green, mergeable PR
+                 # with no signed review at this head is not the generic "blocked" — the next holder
+                 # needs to know the ONLY missing step is the fresh-context review, which the lane
+                 # may not mint for itself (that would be a review that did not happen).
+                 if ! review_record_at_head; then
+                   emit_attestation "green and mergeable, but no signed review record exists for head ${HEAD:-?} and the chain did not merge; a lane cannot mint one for itself"
+                 fi
+                 say "… the chain exited without merging and its log names no cause — see $(chain_log)"
+                 emit_blocked BLOCKED "the merge chain exited without a merge or a named cause (log: $(chain_log))" ;;
+      esac
+    fi
+    now="$(date +%s)"
+    [ "$now" -ge "$deadline" ] && { say "… WAITING — the chain is still running (pid $(chain_pid)); call --watch again"; exit 11; }
+    sleep "$INTERVAL"
+  done
+fi
+
+# ── ONE ROUND ────────────────────────────────────────────────────────────────────────────────────
+read_up="$(pr_read)"; IFS='|' read -r ST MT HD MS <<< "${read_up:-}"
+if [ -z "${ST:-}" ]; then
+  say_err "lane-merge: could not read PR #$PR in $OR (rate limit, auth, or wrong --repo)."
+  say_err "            Nothing was attempted. Re-run when gh answers; do NOT hand-roll a merge."
+  exit 2
+fi
+HEAD="${HD:-}"
+case "$ST" in
+  closed)
+    if [ -n "${MT:-}" ]; then verdict MERGED "$HEAD"; say "✅ MERGED — PR #$PR at head $HEAD"; exit 0; fi
+    emit_blocked BLOCKED_CLOSED "PR #$PR is closed and was NOT merged" ;;
+esac
+case "${MS:-}" in
+  dirty)
+    emit_fix FIX_CONFLICT "the PR is DIRTY (conflicts with main): re-apply THIS lane's own change onto current origin/main and force-push THIS branch. Never resolve a GENERATED file's conflict by picking a side — regenerate it." ;;
+esac
+
+# NO PRE-CHECK AT THE CAP (reviewer finding, reproduced). A pre-check that refused BEFORE reading the
+# checks could never verify the LAST allowed fix: round 3 is spent (emit_fix grants it), the lane
+# pushes that fix, and the next invocation exited 13 having measured nothing — reporting "the cap is
+# spent" and quoting STALE failing names from round 2's head. The cap belongs where it is SPENT, in
+# emit_fix, which sees the CURRENT reds: a green head after round 3 proceeds to the chain (that is
+# convergence, not a violation), and a red one blocks with names read at THIS head.
+
+# Wait for THIS head's checks to be terminal, bounded, printing progress so the lane never looks
+# wedged and so a human reading the transcript can see it is making progress and not hung.
+CHECK_TMP="$(mktemp "${TMPDIR:-/tmp}/lane-merge-checks.XXXXXX")" || exit 2
+trap 'rm -f "$CHECK_TMP"' EXIT
+deadline=$(( $(date +%s) + WAIT_S ))
+while :; do
+  rows="$(checks_read "$HEAD")"
+  # The single-page read carries a TOTAL line so "this page is all of it" is distinguishable from
+  # "there is more". Only then pay for the full paginated read (the rare case), and never let the
+  # TOTAL line itself reach the classifier — a head with 0 check-runs would otherwise classify as
+  # GREEN with an empty red set, which is the "nothing measured is not green" rule this loop holds.
+  # NF==2 on the marker as well as the name: a CHECK-RUN may legitimately be named "TOTAL", and it
+  # would arrive with 5 fields — matching it here would read a status string as a count.
+  total="$(printf '%s\n' "${rows:-}" | awk -F'\t' '$1=="TOTAL" && NF==2 {print $2; exit}')"
+  rows="$(printf '%s\n' "${rows:-}" | awk -F'\t' 'NF>=4')"
+  if [ -n "${total:-}" ] && [ "$total" -gt 100 ] 2>/dev/null; then
+    rows="$(checks_read "$HEAD" --full)"
+  fi
+  if [ -z "${rows:-}" ]; then
+    # An EMPTY check-run set is not a green set: nothing has been measured. Keep polling (this is
+    # the "a queued run is not a green run" rule at its surface), and the bound below reports it.
+    say "… no check-runs reported for head ${HEAD:0:12} yet — a queued run is not a green run"
+    IF=1; RED=""
+  else
+    printf '%s\n' "$rows" > "$CHECK_TMP"
+    classified="$(classify "$CHECK_TMP")"
+    # ⛔ FAIL CLOSED ON AN UNREADABLE CLASSIFICATION. A missing/broken python3 yields EMPTY output,
+    # which would read as "no red, no inflight" — i.e. GREEN — and launch a merge on a head nobody
+    # classified. The classifier's own contract is two lines; anything else is "I cannot judge".
+    # BOTH LINES, NOT JUST THE FIRST: a truncated classification (INFLIGHT present, RED missing — a
+    # crash between the two prints, a broken pipe, a future edit) left RED empty and read as GREEN,
+    # launching a merge on a head whose red was never reported (reviewer finding). Fail closed.
+    if ! printf '%s' "$classified" | grep -q '^INFLIGHT ' || ! printf '%s' "$classified" | grep -q '^RED '; then
+      say_err "lane-merge: the check-run classifier produced no verdict (python3 missing or its"
+      say_err "            output was not understood) — refusing to call this head green."
+      verdict WAITING_CLASSIFIER "could not classify this head's check-runs"
+      exit 2
+    fi
+    IF="$(printf '%s' "$classified" | awk '/^INFLIGHT /{print $2}')"
+    RED="$(printf '%s' "$classified" | awk '/^RED /{sub(/^RED /,""); print}')"
+  fi
+  [ -n "$RED" ] && printf '%s\n' "$(printf '%s' "$RED" | tr ',' '\n')" > "$LAST_F"
+  if [ -n "${RED:-}" ]; then
+    emit_fix FIX_REQUIRED "this head's own checks are RED: $(printf '%s' "$RED" | tr ',' ' ')"
+  fi
+  [ "${IF:-0}" = "0" ] && break
+  now="$(date +%s)"
+  if [ "$now" -ge "$deadline" ]; then
+    # In flight at the bound is NOT a failure of the lane and NOT a green: it is an unexplained
+    # wait. Say so and let the caller re-run (a re-run costs one PR read).
+    say "… checks still IN FLIGHT (${IF}) after ${WAIT_S}s — re-run this script; nothing was merged"
+    verdict WAITING_CHECKS "checks still in flight after ${WAIT_S}s"
+    exit 11
+  fi
+  sleep "$INTERVAL"
+done
+
+# Green here MEANS: at least one attempt is completed and no group is red. A head with no
+# check-runs at all never reaches this point — it is held in the wait above and reported as
+# WAITING_CHECKS at the bound — so "the head was never tested" cannot masquerade as green.
+
+# Green + mergeable → launch the harness chain (fresh reviewer where the repo needs one, the repo's
+# own rail where it does not) and hand control to --watch.
+launch_chain "$HEAD" || exit 2
+say "… the merge chain owns PR #$PR now. Next: lane-merge.sh $PR --watch (bounded chunk; repeat)"
+exit 11
