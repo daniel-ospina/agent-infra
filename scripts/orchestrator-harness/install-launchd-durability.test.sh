@@ -58,7 +58,19 @@ LIB="$HARNESS/launchd-cycle.sh"
 README="$HARNESS/README.md"
 SELF="$HARNESS/selftest.sh"
 PLATFORM="$(uname)"
-LABEL="com.eldato.orchestrator-loop"
+# ⛔ THE FIXTURE INSTALLS A **TEST** LABEL (agent-infra#1996). launchd resolves a label in the user
+# domain and IGNORES `$HOME`, so a plist rendered under this sandbox home with the PRODUCTION label
+# still addresses the live controller — and `ELDATO_ALLOW_TEST_HOME=1` (which this suite must set so
+# launchd-cycle.sh's #446 guard permits a sandbox run) says nothing about WHICH job is addressed.
+# `install.sh`'s `label_guard` therefore refuses a production label outside the real `$HOME`, and
+# this suite renders its own label instead. Everything below derives its label/plist from $LABEL, so
+# the stub, the `path =` ownership guard and every assertion follow it.
+LABEL="com.eldato.orchestrator-loop-test"
+export LABEL_OVERRIDE="$LABEL"
+# The `launchctl` stub answers for THIS label (its `${FAKE_LABEL:-<production>}` defaults would
+# otherwise name the production job, and the `print-disabled` arms — which model an override written
+# for OUR label — would then report a label the installer never asked about).
+export FAKE_LABEL="$LABEL"
 
 PASS=0; FAIL=0; SKIP=0
 ok()    { PASS=$((PASS + 1)); printf '  \033[32mPASS\033[0m  %s\n' "$1"; }

@@ -183,6 +183,10 @@ export GIT_TERMINAL_PROMPT=0
 # Outputs of the last call. Globals, not stdout capture, because `$(claim_acquire …)` would run
 # it in a subshell and every one of these would be discarded by the caller.
 CLAIM_RESULT=""; CLAIM_COMMIT=""; CLAIM_REF=""; CLAIM_OWNER=""
+# Set by _claim_commit: the sha it built (also echoed, for the test seams that hand-build a lease)
+# and, when it could not, WHY. Globals for the same subshell reason as CLAIM_RESULT above — and a
+# REASON is the whole point: an empty string is what turned this into a weeks-long mystery.
+CLAIM_COMMIT_OUT=""; CLAIM_COMMIT_ERR=""
 
 # Deterministic author so claim commits do not depend on global git identity.
 #
@@ -208,13 +212,31 @@ CLAIM_RESULT=""; CLAIM_COMMIT=""; CLAIM_REF=""; CLAIM_OWNER=""
 #     for this one command keeps the resolution local; `--` stops a leading `-` being read as an
 #     OPTION — `cd -P`/`cd -L` with no operand would otherwise SUCCEED and go to $HOME (measured),
 #     so a bare-option CLAIM_REPO could claim into whatever repo $HOME happens to be.
-# NB the failure text stays the generic "could not build claim commit": making it name the repo and
-# the reason is #1990's scope (it captures stderr and validates the sha), and duplicating that here
-# would only collide with it. These guards fail CLOSED; they do not make the message better.
+# The failure TEXT is no longer generic: `_claim_repo_problem` below names the repo, the cwd and the
+# git error, and `_claim_commit` returns it to the caller (agent-infra#1990). These guards fail CLOSED
+# and now also fail LEGIBLY.
 _git() {
   ( [ -n "${CLAIM_REPO:-}" ] || return 1
     CDPATH= cd -- "${CLAIM_REPO}" 2>/dev/null || return 1
     git "$@" )
+}
+
+# _claim_repo_problem -> ONE actionable line when CLAIM_REPO cannot serve as a git work tree,
+# else the empty string. Exists because the failure it explains used to be reported as nothing at
+# all: `_claim_commit` swallowed stderr and returned an empty sha, so the caller logged
+# "could not build claim commit" with no repo, no cwd and no git error to act on.
+_claim_repo_problem() {
+  local repo="${CLAIM_REPO:-.}" cwd
+  cwd="$(pwd 2>/dev/null || printf '?')"
+  if ! ( cd "$repo" 2>/dev/null ); then
+    printf 'not a readable directory: CLAIM_REPO=%s (cwd=%s) — set CLAIM_REPO (or REPO) to the checkout of the repo being claimed' "$repo" "$cwd"
+    return 0
+  fi
+  if ! _git rev-parse --git-dir >/dev/null 2>&1; then
+    printf 'not a git work tree: CLAIM_REPO=%s (cwd=%s) — set CLAIM_REPO (or REPO) to the checkout of the repo being claimed' "$repo" "$cwd"
+    return 0
+  fi
+  printf ''
 }
 _cg() { _git -c user.name="fleet-claim" -c user.email="claims@localhost" "$@"; }
 
@@ -695,8 +717,34 @@ claim_pr_ref() { printf '%s/%s' "$CLAIM_NS" "$(claim_pr_key "$1")"; }
 # is by the same sha), but it makes cross-box atomicity untestable, so test-claims.sh's headline
 # assertion was flaky and must not be trusted as the cross-box proof. A unique object per
 # acquisition turns the loser's push into a genuine non-fast-forward rejection.
+# ⛔ IT NEVER RETURNS 0 WITH NO EXPLANATION. The old body was
+#   _cg commit-tree … 2>/dev/null
+# so EVERY failure mode — no repo, unreadable cwd, a git that is a shim, an unset EMPTY_TREE —
+# arrived at the caller as an empty string, and the caller could only say "could not build claim
+# commit". stderr is captured now and the sha is VALIDATED (a 40-hex line), so a warning on stderr
+# cannot be mistaken for a commit.
+# Emits the sha on stdout (the test seams hand-build leases with `$( _claim_commit … )`) and also
+# records it in CLAIM_COMMIT_OUT/CLAIM_COMMIT_ERR, because a caller that needs the REASON must call
+# this NOT in a command substitution — see _claim_acquire_at.
+# ⛔ THE FAILURE PATH RETURNS 2, NOT 0 (review catch, 2026-10-18). The globals are set INSIDE the
+# substitution's subshell, so a `$( )` caller only ever sees stdout + the exit status — with `return
+# 0` it saw "success, empty string", and two seams then chained `git push "$c:$ref"` on it, where an
+# empty source is a REFSPEC THAT DELETES the ref. The direct caller ignores the status and reads the
+# globals, so returning 2 changes nothing for it.
 _claim_commit() {
-  _cg commit-tree "$EMPTY_TREE" -m "claim owner=$1 lease_until=$2 nonce=$RANDOM$RANDOM$$-$(date +%s%N)" 2>/dev/null
+  local out rc sha why
+  out="$(_cg commit-tree "$EMPTY_TREE" -m "claim owner=$1 lease_until=$2 nonce=$RANDOM$RANDOM$$-$(date +%s%N)" 2>&1)"; rc=$?
+  sha="$(printf '%s\n' "$out" | grep -E '^[0-9a-f]{40}$' | head -1)"
+  if [ "$rc" -eq 0 ] && [ -n "$sha" ]; then
+    CLAIM_COMMIT_OUT="$sha"; CLAIM_COMMIT_ERR=""
+    printf '%s\n' "$sha"
+    return 0
+  fi
+  CLAIM_COMMIT_OUT=""
+  why="$(_claim_repo_problem)"
+  # Prefer the repo diagnosis (it names the fix); otherwise report git's own words.
+  CLAIM_COMMIT_ERR="${why:-git commit-tree exited $rc: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-300)}"
+  return 2
 }
 
 # _lease_of <ref> -> "owner lease_until" parsed from the claim commit message ("" if absent)
@@ -842,8 +890,16 @@ _claim_acquire_at() {
   # always means "the commit THIS attempt may have pushed".
   CLAIM_COMMIT=""
   now="$(date +%s)"; until=$(( now + ttl ))
-  commit="$(_claim_commit "$CLAIM_OWNER" "$until")"
-  if [ -z "$commit" ]; then CLAIM_RESULT="could not build claim commit"; echo "$CLAIM_RESULT"; return 2; fi
+  # ⛔ NOT `commit="$(_claim_commit …)"`: that runs in a SUBSHELL, so the reason this function sets
+  # would be discarded and the caller would be back to an empty explanation. Called directly, the
+  # globals survive; `>/dev/null` drops the echoed sha we already have in CLAIM_COMMIT_OUT.
+  CLAIM_COMMIT_OUT=""; CLAIM_COMMIT_ERR=""
+  _claim_commit "$CLAIM_OWNER" "$until" >/dev/null
+  commit="${CLAIM_COMMIT_OUT:-}"
+  if [ -z "$commit" ]; then
+    CLAIM_RESULT="could not build claim commit — ${CLAIM_COMMIT_ERR:-unknown failure building a claim commit object}"
+    echo "$CLAIM_RESULT"; return 2
+  fi
 
   # --- attempt 1: atomic create. Fails if the ref exists — and every claim commit is a ROOT
   #     commit, so a different claim can never fast-forward it, whatever the timing.
@@ -1050,7 +1106,7 @@ _claim_status_at() {
 #                  here, certifying a free issue costs duplicated work on two boxes.
 # Sets CLAIM_RESULT; echoes it, so a caller in a subshell still sees the reason.
 claim_issue_preflight() {
-  local issue="$1" ref out rc cur tmp lease owner until now
+  local issue="$1" ref out rc cur tmp lease owner until now _why
   ref="$(claim_issue_ref "$issue")"
   # ⛔ THE EXIT STATUS IS THE DISTINCTION THAT MATTERS HERE. `git ls-remote <ref>` exits 0 with
   # EMPTY output when the ref simply does not exist, and NON-ZERO only when the remote itself could
@@ -1059,7 +1115,10 @@ claim_issue_preflight() {
   # false CLEAN this gate exists to remove.
   out="$(_git ls-remote origin "$ref" 2>/dev/null)"; rc=$?
   if [ "$rc" -ne 0 ]; then
-    CLAIM_RESULT="the claim registry is UNREADABLE ($ref: git ls-remote exited $rc) — INCOMPLETE, never CLEAN"
+    # Name the repo when the repo itself is the reason: a controller pointed at a non-repo refuses
+    # EVERY issue identically, and "the registry is unreadable" alone reads as a network blip.
+    _why="$(_claim_repo_problem)"
+    CLAIM_RESULT="the claim registry is UNREADABLE ($ref: git ls-remote exited $rc)${_why:+ — $_why} — INCOMPLETE, never CLEAN"
     echo "$CLAIM_RESULT"; return 2
   fi
   cur="$(printf '%s\n' "$out" | awk '{print $1}')"
@@ -1191,10 +1250,24 @@ claim_snapshot() {
   local out="${1:-$HOME/orchestrator/state/claims-snapshot}"
   local tmp="$out.$$"
   : > "$tmp"
+  # ⛔ A FAILED FETCH MUST NOT REPLACE A GOOD SNAPSHOT WITH AN EMPTY ONE, AND MUST SAY SO (review
+  # catch, 2026-10-18). The old shape was `fetch … || true` and then an unconditional `mv`, so ANY
+  # fetch failure — a 30 s network blip, or the unreadable cwd of the 2026-10-18 incident — wrote an
+  # EMPTY file over the last good one, and `claim_live()` reads "absent from the snapshot" as "free".
+  # Measured: 3 claims on origin, 0 snapshot lines, nothing logged anywhere, while ARCHITECTURE said
+  # this path "fail-open on an unreachable store (logs it)". The prior snapshot is now KEPT (its
+  # leases are self-dating, so a stale one can only make the sweep abstain, never grant a claim), and
+  # the reason is written where the operator reads it.
   # --prune so a claim DELETED on another box (released, or pruned) does not linger here.
   # ⛔ It prunes by DESTINATION pattern, so worker-side temp refs must live in CLAIM_TMP_NS, never
   # under CLAIM_CACHE_NS — a snapshot must not delete a concurrent lease read (P2).
-  _git fetch -q --prune origin "+$CLAIM_NS/*:$CLAIM_CACHE_NS/*" 2>/dev/null || true
+  if ! _git fetch -q --prune origin "+$CLAIM_NS/*:$CLAIM_CACHE_NS/*" 2>/dev/null; then
+    rm -f "$tmp"
+    local why; why="$(_claim_repo_problem)"
+    printf 'claim_snapshot: registry refresh FAILED — %s (previous snapshot kept: %s)\n' \
+      "${why:-git fetch exited non-zero}" "$out" >&2
+    return 1
+  fi
   _git for-each-ref --format='%(refname)' "$CLAIM_CACHE_NS" 2>/dev/null | while read -r ref; do
     [ -n "$ref" ] || continue
     local lease owner until

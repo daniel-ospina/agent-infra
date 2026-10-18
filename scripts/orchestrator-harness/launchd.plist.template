@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>com.eldato.orchestrator-loop</string>
+  <string>__LABEL__</string>
   <!-- ⛔ THE JOB RUNS `launchd-controller.sh`, NOT `orch-loop.sh` DIRECTLY, AND THAT IS LOAD-BEARING
        (measured 2026-10-18, this Mac). macOS TCC denies a launchd-born process the READ of a
        protected tree, and the product checkout lives under ~/Documents. The denial is on the tree's

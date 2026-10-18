@@ -2712,9 +2712,11 @@ while true; do
   if [ -f "$O/claims.sh" ]; then
     # shellcheck source=/dev/null
     . "$O/claims.sh"
-    # REQUIRED: this loop runs from launchd with cwd=$HOME. Without CLAIM_REPO every git call
-    # inside claims.sh targets a non-repo, the fetch fails silently and the snapshot is empty
-    # even with live claims — measured: 3 claims on origin, 0 snapshot lines.
+    # ⛔ THE DEFAULT IS NO LONGER `.`, BUT THIS IS STILL REQUIRED (agent-infra#1996). launchd starts
+    # the job at cwd `/` and macOS DENIES the read of it, so a relative registry resolves against a
+    # cwd that cannot even be read: every git call inside claims.sh then fails, and the snapshot came
+    # back empty with live claims on origin — measured: 3 claims on origin, 0 snapshot lines. Setting
+    # it explicitly also means the sweep does not depend on $REPO being exported in this shell.
     CLAIM_REPO="$REPO"
     claim_snapshot "$O/state/claims-snapshot"
     # Expired refs are unbounded otherwise. Hourly, in the background, never blocking the sweep.
