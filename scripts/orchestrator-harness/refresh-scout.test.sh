@@ -163,7 +163,10 @@ case "\$1 \$2" in
      printf '[]\n' ;;
 esac
 SH
-  chmod +x "$d/bin/gh"
+  # ⛔ THE FILE JUST WRITTEN IS `gh.body`, NOT `gh` (review, measured): `chmod +x "$d/bin/gh"` here is
+  # a no-op on a file `mk_gh_wrapper` immediately OVERWRITES (and then chmods itself), so the stub
+  # escaped only by inheriting `mk_case`'s mode through `cat >`.
+  chmod +x "$d/bin/gh.body"
   mk_gh_wrapper "$1"
 }
 
@@ -347,7 +350,7 @@ esac
 # CHECK OK, cloud-cell-bringup.sh started the cell, and every refresh then reported
 # `queue=UNREADABLE` forever — the "a cell that can only merge, and looks healthy" shape this check
 # exists to refuse. One of the two guards this change added that had no assertion at all (measured:
-# deleting it left `PASS=217 FAIL=0`).
+# deleting it left the suite GREEN (measured), which is why the case exists).
 # ⛔ DRIVEN AS AN EXTRACTED BLOCK, NOT through `--check`, because a fixture CANNOT build a jq-less
 # box for the shipped entrypoint: the script re-appends `/opt/homebrew/bin:/usr/local/bin` to
 # whatever PATH it is given (refresh-candidates.sh:88), and on a Homebrew Mac that is where jq lives.
@@ -383,6 +386,17 @@ if [ -s "$T/jqguard.sh" ] && [ "$(wc -l < "$T/jqguard.sh")" -le 20 ] \
     *"install jq"*) ok "--check: the no-jq refusal prescribes the fix (install jq)" ;;
     *) bad "--check: the no-jq refusal names no remedy — output: $OUTJ" ;;
   esac
+  # ⛔ A jq THAT RESOLVES BUT DOES NOT RUN IS REFUSED TOO (#1962 review, MEASURED). The probe is by
+  # EXECUTION, so a passing `command -v` is not a verdict: driven here with a jq that exits 1 — the
+  # shape of a shim whose tool is missing (exit 127) or a wrong-architecture binary. This case exists
+  # because the PRESENCE form read green against exactly this fixture: it printed `CHECK OK` rc=0 and
+  # the helper then refused every page. Reverting the probe to `command -v` fails THIS assertion and
+  # leaves the no-jq case above green, so the two cases pin different questions.
+  BJ="$T/jqbroken"; mkdir -p "$BJ"
+  printf '#!/bin/bash\nexit 1\n' > "$BJ/jq"; chmod +x "$BJ/jq"
+  OUTB="$(PATH="$BJ" "$(command -v bash)" "$T/jqguard-run.sh" 2>&1)"; rcb=$?
+  [ "$rcb" -eq 3 ] && ok "--check: a jq that RESOLVES but cannot RUN is REFUSED (rc=3, not a transient retry) — the probe is by execution, not presence" \
+                  || bad "--check: a jq that cannot run returned rc=$rcb (want 3) — output: $OUTB"
 else
   bad "the --check jq guard could not be extracted from the shipped refresh-candidates.sh (deleted, or its anchor moved)"
 fi
@@ -2001,6 +2015,28 @@ SH
   [ ! -s "$HD2/out" ] && ok "the short-page refusal emits NO rows either" \
                       || bad "the short-page refusal still emitted $(wc -l < "$HD2/out") row(s)"
 
+  # ── the `--label` is URL-ENCODED: an unencoded `&` INJECTS a query parameter ────────────────────
+  # ⛔ PINNED BY NOTHING BEFORE THIS CASE (review, MEASURED): replacing the `jq -Rr @uri` encoding
+  # with the raw value left the suite GREEN, while the request became a DIFFERENT question —
+  # `--label 'a&b c'` sends `labels=a&b c=` and the tier reads as EMPTY, which is the #8465 priority
+  # inversion the guard's own comment names. The assertion reads the WIRE (the argv the stub received),
+  # not the flag, so it cannot pass on a label that merely looks encoded.
+  HDQ="$T/restcase-label"; mkdir -p "$HDQ"
+  cat > "$HDQ/gh" <<'SH'
+#!/bin/bash
+printf '%s\n' "$*" >> "$(dirname "$0")/url"
+printf 'HTTP/2.0 200 OK\r\n\r\n[]\n'
+SH
+  chmod +x "$HDQ/gh"
+  PATH="$HDQ:$PATH"; export PATH
+  drv_out issues --repo acme/widget --limit 10 --label 'a&b c' > /dev/null 2>"$HDQ/err"; rc=$?
+  PATH="${PATH#$HDQ:}"; export PATH
+  url="$(head -1 "$HDQ/url" 2>/dev/null)"
+  case "$url" in
+    *'labels=a%26b%20c'*) ok "the --label is URL-ENCODED on the wire (an '&' cannot inject a parameter)" ;;
+    *) bad "the label reached the API UNENCODED — a label with '&' changes the query: '$url' (rc=$rc)" ;;
+  esac
+
   # ── an EMPTY body on a 200 is a vanished body, not 'no rows' ────────────────────────────────
   # Real `gh api -i` answers an empty collection with headers + `[]`. Only 204/304 may carry no body,
   # so a 200 with nothing after the headers must be refused: read as 'no rows' it writes an EMPTY
@@ -2139,8 +2175,8 @@ SH
 
   # ── /issues RETURNS PULL REQUESTS: they must not become DISPATCH CANDIDATES ─────────────────────
   # Both kinds, because the rule is ASYMMETRIC and deleting it stayed green before these cases: the
-  # `map(select(has("pull_request") | not))` filter was the ONE guard in this helper with no
-  # assertion (measured: replacing it with `(.)` left `PASS=217 FAIL=0`). The hazard is the POOL, not
+  # `map(select(has("pull_request") | not))` filter had no assertion of its own (measured: replacing
+  # it with `(.)` left the suite GREEN). The hazard is the POOL, not
   # the reaper — a labelled PR passes the tier programs (`no assignee, non-epic title`), is queued as
   # `0 <PR#>`, enters `dispatched.txt`, and a lane is spawned for a PR number. `kind=pulls` must keep
   # every row: `.pr_brs` feeds the #1705 `has_pr` check.
@@ -2237,6 +2273,18 @@ gql_calls="$(grep -cE '^(issue list|pr list)' "$D/gh-calls" 2>/dev/null | tr -d 
 grep -qE '^api repos/.*/issues\?.*labels=P0-blocker' "$D/gh-calls" 2>/dev/null \
   && ok "starved-graphql: the tier query is a REST call carrying its --label filter" \
   || bad "starved-graphql: the tier query is not a filtered REST call — $(tr '\n' ' ' < "$D/gh-calls" 2>/dev/null)"
+# ⛔ THE `--state` IS PART OF THE QUESTION AND WAS PINNED BY NOTHING (review, MEASURED): deleting
+# `--state all` from the `.pr_brs` call left the whole suite GREEN, and `GET /repos/{o}/{r}/pulls`
+# DEFAULTS to `state=open` — so a PR closed WITHOUT merging loses its head branch from `.pr_brs`,
+# `has_pr` reads false for an issue that always had a PR, and the reaper UN-blacklists it: the
+# duplicate-dispatch class (#1705) this listing exists to prevent, at rc 0. The issue listing's
+# `state=open` is pinned for the mirror reason — a wider window is a different pool, not a bigger one.
+grep -qE '^api repos/[^ ]*/pulls\?state=all(&|$)' "$D/gh-calls" 2>/dev/null \
+  && ok "starved-graphql: .pr_brs asks for state=all — a CLOSED PR still carries the branch has_pr needs" \
+  || bad "the pulls listing does not ask state=all — .pr_brs would silently lose closed-PR branches (got: $(grep -oE 'pulls\?[^ ]*' "$D/gh-calls" 2>/dev/null | head -1))"
+grep -qE '^api repos/[^ ]*/issues\?state=open(&|$)' "$D/gh-calls" 2>/dev/null \
+  && ok "starved-graphql: the issue listings ask for state=open" \
+  || bad "the issue listing does not ask state=open (got: $(grep -oE 'issues\?[^ ]*' "$D/gh-calls" 2>/dev/null | head -1))"
 
 # (b) REST ALSO FAILING (HTTP 403, rate limited) -> TRANSIENT, and NOTHING written: no `.open_iss`, no
 #     `.pr_brs`, and the seeded backlog untouched. A truncated or empty listing here is the #1705 bug

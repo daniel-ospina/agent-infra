@@ -385,10 +385,18 @@ cmd_check() {
   # — the exact shape this check exists to refuse. Probed BEFORE "CHECK OK", because a verdict printed
   # after the certification is not a verdict, and `cloud-cell-bringup.sh` refuses to start a cell on
   # NOT PROVISIONABLE. install.sh probes jq on a new box for the same reason.
-  command -v jq >/dev/null 2>&1 \
-    || { echo "[refresh] check: FAIL 'jq' is not runnable, and every listing is assembled with it"
-         echo "[refresh] NOT PROVISIONABLE: the REST listings cannot be read without jq, so a cell on this box would report queue=UNREADABLE and MERGE ONLY (#1962)"
-         echo "[refresh]   fix: install jq (apt-get install -y jq), or put it on PATH"
+  # ⛔ PROBED BY EXECUTION, NOT BY PRESENCE (#1962 review, MEASURED). `command -v jq` answers "is a
+  # file named jq on PATH" — a DIFFERENT question from "can it run", and the message below claims the
+  # second. A jq that RESOLVES but cannot execute passes it: a shim whose tool is missing (this box
+  # resolves `gh` through ~/.pi/agent/shims and install.sh probes daemons by RUNNING them for exactly
+  # that 127), a wrong-architecture or corrupted binary. Measured with `jq` = `#!/bin/bash; exit 1`:
+  # `--check` printed `CHECK OK` rc=0, and the helper then refused every page — the certified box that
+  # reads `queue=UNREADABLE` for ever, which is the state this check exists to refuse. `py_satisfies_min`
+  # above probes its interpreter the same way, for the same reason.
+  jq --version >/dev/null 2>&1 \
+    || { echo "[refresh] check: FAIL 'jq' does not RUN on this box (absent, or present and failing) — every listing is assembled with it"
+         echo "[refresh] NOT PROVISIONABLE: the REST listings cannot be read without a WORKING jq, so a cell on this box would report queue=UNREADABLE and MERGE ONLY (#1962)"
+         echo "[refresh]   fix: install jq (apt-get install -y jq), or put a working jq on PATH"
          return "$EXIT_NOT_PROVISIONABLE"; }
   echo "[refresh] check: jq=$(command -v jq)"
   # ── the CROSS-BOX CLAIM REGISTRY, judged LOCALLY (agent-infra#1850 review, 2026-10-16) ──────
