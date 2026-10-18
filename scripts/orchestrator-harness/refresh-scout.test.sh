@@ -2272,8 +2272,10 @@ case "$OUT" in
   # ⛔ THE LABEL AND THE STATUS MUST BE ADJACENT IN ONE WORDING, because a two-needle glob let this
   # assertion pass on the ECHOED provider text: `*"HTTP 403"*"REST bucket"*` matched across lines off
   # the `… (HTTP 403)` inside the quoted stderr, so forcing the status parse to yield nothing
-  # (`HTTP ?`) left it green — a false PASS on exactly the regression it is named for (measured). It
-  # is also order-sensitive: reordering the log line made a single-line refusal fail for the format.
+  # (`HTTP ?`) left it green — a false PASS on exactly the regression it is named for (measured). The
+  # old glob was also order-sensitive in the wrong direction: it demanded `HTTP 403` BEFORE
+  # `REST bucket`, while the shipped line puts the label first, which is why it only ever passed through
+  # this fixture's TWO refusal lines. One refusal line alone failed it, and a reordered line passed it.
   *"REST bucket refused it as RATE-LIMITED (HTTP 403"*) ok "rest-403: the refusal NAMES the HTTP 403 on the REST bucket (starved vs broken)" ;;
   *) bad "rest-403: the 403 is not named in the log — output: $OUT" ;;
 esac
