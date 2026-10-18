@@ -157,6 +157,30 @@ cat >"$T/bin/uv-fail" <<'SH'
 #!/bin/sh
 exit 1
 SH
+# du that answers N times and then FAILS with a numeric partial: a du that stops answering
+# MID-pass must stop the deletion, not leave the loop believing it is still over bound.
+cat >"$T/bin/du-flaky" <<SH
+#!/bin/sh
+# Counts only the calls that measure the CACHE ROOT (the per-entry calls during enumeration are
+# unaffected), so the failure lands mid-loop: before -> after prune -> after the 1st eviction.
+case "\$*" in
+  */uv)
+    n=\$(cat "$T/du.calls" 2>/dev/null || echo 0)
+    echo \$((n + 1)) >"$T/du.calls"
+    if [ "\$n" -ge 2 ]; then printf '16\t%s\n' "\$*"; exit 1; fi
+    ;;
+esac
+exec du "\$@"
+SH
+# df that answers twice and then says NOTHING: an unreadable df is not "plenty of space".
+cat >"$T/bin/df-silent" <<SH
+#!/bin/sh
+n=\$(cat "$T/df.calls" 2>/dev/null || echo 0)
+echo \$((n + 1)) >"$T/df.calls"
+if [ "\$n" -ge 2 ]; then exit 0; fi
+echo "Filesystem 1024-blocks Used Available Capacity Mounted"
+echo "/dev/fake 100000 4000 \$(( 10000 + n * 16384 )) 4% /"
+SH
 # ps stub that answers `-o lstart=` with a FIXED string: the lock's holder-identity check reads
 # the process start time, and the other stubs answer every invocation with the same two rows.
 cat >"$T/bin/ps-lstart" <<'SH'
@@ -184,6 +208,11 @@ run_reap() { # run_reap <home> <mode> [extra env assignments...]
         CACHE_REAP_LOG="$home/reap.log" \
         CACHE_REAP_PS="${PS_STUB:-$T/bin/ps-idle}" \
         CACHE_REAP_DF="${DF_STUB:-$T/bin/df-gain}" \
+        CACHE_REAP_DU="${DU_STUB:-}" \
+        CACHE_REAP_UV_DIR="${UV_DIR:-}" \
+        CACHE_REAP_NPM_DIR="${NPM_DIR:-}" \
+        CACHE_REAP_PIP_DIR="${PIP_DIR:-}" \
+        CACHE_REAP_PIP_DIR_MAC="${PIP_DIR_MAC:-}" \
         CACHE_REAP_UV="${UV_STUB:-$T/bin/uv-noprune}" \
         CACHE_REAP_NPM="${UV_STUB:-$T/bin/uv-noprune}" \
         CACHE_REAP_MOUNTINFO="${MOUNTINFO:-}" \
@@ -649,6 +678,69 @@ for want in 0 4 5 3; do
         3)     assert_contains "$out" "warn: the cache reaper exited 3" "a fail-closed pass (exit 3) DOES warn, naming the status and the log" ;;
     esac
 done
+
+echo
+echo "── 9o. a directory that is NOT this reaper's lock is never broken ──"
+H="$T/h9o"
+new_cache "$H/.cache/uv" 3000 2000
+mkdir -p "$H/precious/state" "$H/precious/skills"
+printf 'the fleet state dir\n' >"$H/precious/state/notes.md"
+touch -t 200001010000 "$H/precious"
+OUT="$(env HOME="$H" CACHE_REAP_MAX_MB="$BOUND_MB" CACHE_REAP_LOCK="$H/precious" \
+        CACHE_REAP_LOG="$H/reap.log" CACHE_REAP_PS="$T/bin/ps-idle" CACHE_REAP_DF="$T/bin/df-gain" \
+        CACHE_REAP_UV="$T/bin/uv-noprune" CACHE_REAP_NPM="$T/bin/uv-noprune" CACHE_REAP_PIP="$T/bin/uv-noprune" \
+        bash "$REAPER" --apply 2>&1)"; RC=$?
+assert_eq "$RC" "3" "a pre-existing directory at \$CACHE_REAP_LOCK that is not a lock exits 3 (not 0)"
+[ -f "$H/precious/state/notes.md" ] && ok "the directory SURVIVED (breaking a 'stale lock' is rm -rf, so it must be provably ours)" \
+                                     || bad "an arbitrary directory was removed by the stale-lock path"
+assert_contains "$OUT" "not a lock this reaper made" "the refusal says why it will not remove it"
+
+echo
+echo "── 9p. a RELOCATED cache keeps its bound even if the target dir is not cache-named ──"
+H="$T/h9p"
+mkdir -p "$H/.cache" "$H/bigdisk"; new_cache "$H/bigdisk/data" 3000 2000
+ln -sfn "$H/bigdisk/data" "$H/.cache/uv"
+OUT="$(run_reap "$H" --apply 2>&1)"; RC=$?
+assert_eq "$RC" "0" "a relocated cache is bounded (the shape guard reads the DECLARED name too)"
+assert_le "$(kb "$H/bigdisk/data")" "$BOUND_KB" "the tree behind the symlink came under the bound"
+
+echo
+echo "── 9q. a du that stops answering MID-pass stops the deletion ──"
+H="$T/h9q"
+new_cache "$H/.cache/uv" 1000 1000 1000 1000 1000 1000 1000 1000 1000 1000
+rm -f "$T/du.calls"
+OUT="$(DU_STUB="$T/bin/du-flaky" run_reap "$H" --apply 2>&1)"; RC=$?
+assert_eq "$RC" "3" "an unmeasurable cache mid-pass fails closed"
+assert_contains "$OUT" "STOPPING" "the pass says it STOPPED rather than continuing blind"
+LEFT="$(find "$H/.cache/uv" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')"
+[ "$LEFT" -gt 2 ] && ok "the deletion STOPPED early ($LEFT of 10 entries left) — it did not empty a cache it could not measure" \
+                  || bad "the pass kept deleting after du stopped answering ($LEFT of 10 entries left)"
+
+echo
+echo "── 9r. a df that goes silent MID-pass stops the deletion (the brake cannot go blind) ──"
+H="$T/h9r"
+new_cache "$H/.cache/uv" 1000 1000 1000 1000 1000 1000 1000 1000 1000 1000
+rm -f "$T/df.calls"
+OUT="$(DF_STUB="$T/bin/df-silent" run_reap "$H" --apply 2>&1)"; RC=$?
+assert_eq "$RC" "3" "an unreadable df mid-pass fails closed"
+assert_contains "$OUT" "df stopped answering" "the refusal names the df, not a phantom reclaim"
+LEFT="$(find "$H/.cache/uv" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')"
+[ "$LEFT" -gt 2 ] && ok "the deletion STOPPED early ($LEFT of 10 entries left) — an unreadable df is not 'plenty of space'" \
+                  || bad "the pass emptied the cache while the free-space brake was blind ($LEFT left)"
+
+echo
+echo "── 9s. a BACKSLASH in the cache path does not break the live-holder guard ──"
+H="$T/h9s"
+D="$H/pa\th/uv"
+new_cache "$D" 3000 1500
+cat >"$T/bin/ps-backslash" <<SH
+#!/bin/sh
+printf '%s\n' "  999 cat $D/entry-1/blob"
+SH
+OUT="$(PS_STUB="$T/bin/ps-backslash" CACHE_REAP_UV_DIR="$D" run_reap "$H" --apply 2>&1)"; RC=$?
+assert_eq "$RC" "0" "the pass still bounds the cache around the held entry"
+[ -f "$D/entry-1/blob" ] && ok "the entry a live process names SURVIVED (awk -v unescapes the path; ENVIRON does not)" \
+                         || bad "a held entry was deleted because the path was mangled by awk -v"
 
 echo
 echo "── 10. wiring: a bound no box runs is the defect ──"

@@ -345,7 +345,12 @@ ps_matches() {
     [ -n "$PS_SNAP" ] || return 2
     case "$kind" in
         tool)
-            printf '%s\n' "$PS_SNAP" | awk -v me="$$" -v tool="$class" '
+            # ⛔ `awk -v` performs ESCAPE PROCESSING on the value: a cache path containing a
+            # backslash (`/tmp/we\\ird/uv`) arrives mangled, the literal-substring guard stops
+            # matching, and a held entry is deleted while the pass prints VERIFIED (measured:
+            # `awk -v d='/tmp/a\\tb'` yields `/tmp/a<TAB>b`). ENVIRON is passed verbatim.
+            printf '%s\n' "$PS_SNAP" | REAP_TOOL="$class" awk -v me="$$" '
+                BEGIN { tool = ENVIRON["REAP_TOOL"] }
                 $1 == me { next }
                 {
                     exe = $2; sub(/.*\//, "", exe)
@@ -369,7 +374,7 @@ ps_matches() {
                 }'
             return 0 ;;
         dir)
-            printf '%s\n' "$PS_SNAP" | awk -v me="$$" -v d="$dir" '$1 != me && index($0, d) { print }'
+            printf '%s\n' "$PS_SNAP" | REAP_DIR="$dir" awk -v me="$$" '$1 != me && index($0, ENVIRON["REAP_DIR"]) { print }'
             return 0 ;;
         *) return 2 ;;
     esac
@@ -518,8 +523,14 @@ entries_by_size() {
 # every later log line failed silently. The seams stay usable for the suite because a cache-shaped
 # directory passes; what is refused is a target that cannot be a cache at all.
 guard_target() {
-    local class="$1" dir="$2" b st
+    local class="$1" dir="$2" declared="$3" b declared_b st
+    # The SHAPE test runs against BOTH names: the declared spelling (`~/.cache/uv`) and the
+    # resolved one (`/bigdisk/data`). Applying it only to the resolved path refused the very
+    # relocation this script supports — `ln -s /bigdisk/data ~/.cache/uv` measured as
+    # "its name ('data') is not cache-shaped … mis-set seam", exit 3, cache never bounded, and the
+    # message blamed the operator. The absolute refusals below stay on the RESOLVED path.
     b="$(basename "$dir")"
+    declared_b="$(basename "${declared:-$dir}")"
     if [ "$dir" = "/" ]; then
         fail_closed "$class: refusing to bound '/' — a cache is never the filesystem root"
         return 1
@@ -540,6 +551,9 @@ guard_target() {
     case "$b" in
         uv|.uv|uv-*|npm|.npm|_npm*|_cacache|_npx|pip|.pip|pip-*|*cache*|cache|.cache) return 0 ;;
     esac
+    case "$declared_b" in
+        uv|.uv|uv-*|npm|.npm|_npm*|_cacache|_npx|pip|.pip|pip-*|*cache*|cache|.cache) return 0 ;;
+    esac
     fail_closed "$class: refusing to bound $dir — its name ('$b') is not cache-shaped, so it is almost certainly a mis-set CACHE_REAP_*_DIR/UV_CACHE_DIR/XDG_CACHE_HOME rather than a package cache (a prune on it deletes whatever is there)"
     return 1
 }
@@ -549,7 +563,7 @@ reap_target() {
     local class="$1" dir="$2" before_kb before_free_kb now_kb new_kb after_kb after_free_kb
     local pruned=none evicted=0 kb e cur_free holders dir_holders held_entries="" keep_entries=""
     local no_gain_stop=0 no_gain=0 last_free="" claimed_kb gained_kb min_gain_kb stop_note=""
-    local dev_rc share_rc fresh_holders free_str parent mnt_rc resolved
+    local dev_rc share_rc fresh_holders free_str parent mnt_rc resolved declared_dir
 
     case "$dir" in
         /*) ;;
@@ -580,8 +594,9 @@ reap_target() {
         fail_closed "$class: $dir exists but cannot be resolved to a real directory (cd failed) — refusing to size a cache at 0"
         return 0
     fi
+    declared_dir="$dir"
     dir="$resolved"
-    guard_target "$class" "$dir" || return 0
+    guard_target "$class" "$dir" "$declared_dir" || return 0
 
     before_kb="$(kb_of "$dir")" \
         || { fail_closed "$class: cannot measure $dir (du failed) — the bound cannot be enforced"; return 0; }
@@ -698,9 +713,24 @@ reap_target() {
                 evicted=$((evicted + 1))
                 # Re-measure the WHOLE cache, not the entry: an entry can be a directory
                 # holding more than `du` charged to its own top level (block rounding).
-                if new_kb="$(kb_of "$dir")"; then now_kb="$new_kb"; fi
+                # ⛔ A measurement failure MID-PASS used to be absorbed: now_kb kept its last
+                # good value, so "still over bound" stayed true and the loop kept deleting
+                # entries it could not show were reclaiming anything (reproduced: a du that
+                # dies after enumeration evicted 10 of 10 entries, then reported FAIL-CLOSED).
+                if ! new_kb="$(kb_of "$dir")"; then
+                    fail_closed "$class: cannot re-measure $dir after evicting $e — STOPPING (no further deletion on a cache that can no longer be measured)"
+                    break
+                fi
+                now_kb="$new_kb"
                 cur_free="$(free_kb "$dir")"
-                if [ -n "$last_free" ] && [ -n "$cur_free" ]; then
+                # ⛔ An unreadable df is NOT "plenty of space": skipping the brake when df went
+                # silent let the pass empty the cache and only then report the unreadable df
+                # (reproduced: 8 of 10 entries deleted with the brake inert).
+                if [ -z "$cur_free" ]; then
+                    fail_closed "$class: df stopped answering after evicting $e — STOPPING (an unreadable df cannot show that the deletion is reclaiming)"
+                    break
+                fi
+                if [ -n "$last_free" ]; then
                     if [ "$cur_free" -gt "$last_free" ]; then
                         no_gain=0
                     else
@@ -830,6 +860,16 @@ lock_acquire() {
         if [ "$age" -lt "$LOCK_STALE_SECONDS" ]; then
             say "pi-cache-reap: lock held (owner=${owner:-?} age ${age}s, owner unverifiable) — this pass does not run"
             return 1
+        fi
+        # ⛔ A DIRECTORY AT $LOCK_DIR IS NOT NECESSARILY A LOCK. Breaking one is `rm -rf`, and the
+        # seam is one word from an arbitrary tree: measured, `CACHE_REAP_LOCK=$HOME/.pi/agent`
+        # (the `.lock` suffix dropped) removed skills/, state/, audit/ and task-sessions/ and the
+        # pass exited 0 — on a DRY RUN. A real lock always writes `owner` and `started` right
+        # after mkdir, and a lock younger than the bound never reaches here, so the mkdir→write
+        # window cannot be misread as "not ours".
+        if [ ! -f "$LOCK_DIR/owner" ] && [ ! -f "$LOCK_DIR/started" ]; then
+            printf '%s\n' "pi-cache-reap: $LOCK_DIR exists, is older than ${LOCK_STALE_SECONDS}s, and holds neither 'owner' nor 'started' — it is not a lock this reaper made, so it will not be removed (exit 3)" >&2
+            return 3
         fi
         plog "pi-cache-reap: breaking a stale lock (owner=${owner:-?} age=${age}s)"
         # ⛔ The BREAK must have exactly one winner. A read-then-`rm -rf`-then-`mkdir` lets two

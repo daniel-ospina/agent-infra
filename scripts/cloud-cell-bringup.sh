@@ -476,7 +476,10 @@ check_caches() {
   # locations rather than nothing — a check that silently reports no caches is the blind spot this
   # function exists to remove.
   if [ -z "$dirs_list" ]; then
-    dirs_list="$(printf '%s\n' "$HOME/.cache/uv" "$HOME/.npm/_cacache" "$HOME/.cache/pip" "$HOME/Library/Caches/pip")"
+    # The npm sink is the cache ROOT the tool reports (`npm config get cache`), not its `_cacache`
+    # child: `_npx` and `_logs` sit beside it, so naming the child reported "absent / total 0MB"
+    # for a box whose npm cache was the sink — on exactly the fresh box that has no reaper farmed.
+    dirs_list="$(printf '%s\n' "$HOME/.cache/uv" "$HOME/.npm" "$HOME/.cache/pip" "$HOME/Library/Caches/pip")"
   fi
   case "$maxmb" in ''|*[!0-9]*|0*) maxmb=2048 ;; esac
   bound=$(( 10#$maxmb * 1024 ))
