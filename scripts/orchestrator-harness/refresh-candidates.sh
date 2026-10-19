@@ -880,7 +880,11 @@ rest_list() {
     # — pages then concatenate out of order, and `.[0:$limit]` truncates the wrong rows once a listing
     # needs more than nine pages.
     printf -v pf '%s/p%03d' "$tmp" "$page"
-    if ! gh api -i "$ep?$q&page=$page" > "$pf.raw" 2>"$pf.err"; then
+    # ⛔ AND THE SAME `GH_LIMIT_SNAPSHOT` OPT-IN AS THE CONTROLLER'S PR LISTING (#1910): every cell
+    # asks these two collection questions every pass, so within the TTL the pass (and any lane that
+    # asks the same page) is served the box's ONE fetch instead of issuing another. The bytes are
+    # cached AFTER projection, so `-i`'s header block is preserved exactly as this page expects it.
+    if ! GH_LIMIT_SNAPSHOT=1 gh api -i "$ep?$q&page=$page" > "$pf.raw" 2>"$pf.err"; then
       rest_fail "$kind" "$page" "$pf.err"
       rm -rf "$tmp"; return 1
     fi

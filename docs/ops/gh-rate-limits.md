@@ -23,9 +23,12 @@ documented policy, so this file does not restate the numbers — it names where 
 
 | Behaviour | Where |
 |---|---|
-| ONE `gh` call in flight per box (`flock` on `$GH_LIMIT_DIR/gh.lock`) — including the `/rate_limit` probe, which runs while the caller is in backoff | `acquire_lock` |
-| `retry-after`, then the bucket's `x-ratelimit-reset` when remaining is 0, then **≥ 60 s doubling** with upward jitter; **4 attempts**, then fail loudly | `plan_wait` / `dispatch` |
-| The failing **bucket** is named (`core` vs `graphql`) with its reset — never inferred from whichever counter looks healthy | `bucket_for` / `fail_loudly` |
+| A **bounded CLIENT BUDGET**: at most `GH_LIMIT_MAX_CONCURRENCY` (default 2; 1 is the strictest) `gh` invocations in flight per box (`flock` on `$GH_LIMIT_DIR/gh.slot.<i>`) — including the `/rate_limit` probe. A waiter is QUEUED and bounded; when its budget runs out the call is **REFUSED** (exit 75, `last-busy` recorded), never released into the burst | `acquire_slot` / `count_held_slots` |
+| **A secondary-limit refusal gets its OWN curve**: **2 s doubling** with upward jitter, capped at 60 s, **no `/rate_limit` probe** (the primary counters read healthy and one more request is the burst). It is also retried by `GH_LIMIT_NO_WAIT` callers while the cumulative wait stays inside `GH_LIMIT_SECONDARY_NO_WAIT_S` (8 s) | `SECONDARY_PHRASES` / `plan_wait` / `dispatch` |
+| A **primary** refusal: `retry-after`, then the bucket's `x-ratelimit-reset` when remaining is 0, then **≥ 60 s doubling** with upward jitter; **4 attempts**, then fail loudly | `plan_wait` / `dispatch` |
+| The failing **bucket** (`core` vs `graphql`) **and the KIND** (`primary` vs `secondary`) are named with the reset — never inferred from whichever counter looks healthy | `bucket_for` / `fail_loudly` |
+| **One reader per box** for COLLECTION reads: an opt-in (`GH_LIMIT_SNAPSHOT=1`) single-flight TTL snapshot (default 90 s) so lanes, the controller and the refresh pass share ONE fetch of the same question. A failure is replayed as a failure for a few seconds, never cached as data; mutations are never cached | `snapshot_*` / `_dispatch_snapshotted` |
+| The box's health as an INSTRUMENT: `gh-limit.py --status` prints `gh=clients=<held>/<max> waiters=<n> last=<kind>(bucket=… <age>s)` without touching the network, and `orch-loop.sh` puts it on the `[cap]` line | `status_token` / `gh_health_token` |
 | **≥ 1 s between mutative calls** (POST/PATCH/PUT/DELETE) | `pace_mutation` |
 | Conditional REST for polling: ETag stored per URL (host + path + credential digest), `if-none-match` sent, a **304 replayed from cache** and charged nothing. The cached body is base64 (a 304 replay is byte-exact, binary included) and the cache is bounded in ENTRIES and BYTES (`GH_LIMIT_CACHE_MAX_ENTRIES` 500, `GH_LIMIT_CACHE_MAX_BYTES` 64 MiB) | `conditional_fetch` / `cache_put` / `prune_cache` |
 | The shim stays FIRST on PATH even though every gh-calling harness script prepends `/opt/homebrew/bin:/usr/local/bin` | the `$O/gh-limit` / `$O/gh-rest` re-assert in the harness scripts that prepend and invoke `gh` |
@@ -70,21 +73,37 @@ Two properties worth knowing before you debug it:
 
 ### Known residuals (declared, not papered over)
 
-- **Cross-box concurrency is not serialised.** Boxes cannot see each other; the invariant is one
-  call in flight *per box*.
+- **Cross-box concurrency is not serialised.** Boxes cannot see each other; the invariant is at most
+  `GH_LIMIT_MAX_CONCURRENCY` calls in flight *per box* (default 2), so four boxes can still present
+  eight concurrent requests to the one account.
+- **Only calls that REACH THE LAYER are budgeted.** The controller, the cells, the lanes' harness
+  scripts and the nine heartbeat tools all resolve `$O/gh-rest/gh` or `$O/gh-limit/gh`, so they are
+  covered. A bare `gh` an agent session resolves on PATH goes through the review-enforcer's
+  admin-merge guard (`scripts/gh-shim/gh`) and then straight to the real binary — it is NOT in this
+  budget. The measured 17 concurrent clients were the harness's own, which is why the budget is the
+  fix; wiring the guard as a second seat is the next step if a burst is ever measured that the
+  harness did not issue.
+- **The SECONDARY curve deliberately refines #1910's "wait ≥ 60 s when `retry-after` is absent".**
+  That floor is kept for a PRIMARY refusal. For a secondary one the measured recovery is 0.43 s, so
+  a 60 s floor converted a 2 s burst into a 7-minute outage and, under `GH_LIMIT_NO_WAIT`, into no
+  retry at all. The owner directed the jittered retry-first behaviour on 2026-10-19 with that
+  measurement in hand; the bucket and kind are named so the distinction is legible on the line.
 - **A degraded state dir**: if `$GH_LIMIT_DIR`/`$XDG_CACHE_HOME` cannot be created, the fallback is
   a per-user temp dir (`${TMPDIR}/gh-limit-<uid>`), which still shares one lock between that user's
   processes and records the degradation in its own `events.log` — but the controller's heartbeat
   reads the *primary* path, so it will not see that box's `last-limit`.
-- **The lock timeout** (`GH_LIMIT_LOCK_TIMEOUT`, 600 s) proceeds UNSERIALISED and says so in
-  `events.log` — one slow gh call must not park a box's merge sweep for ever.
+- **The lock/budget timeout** (`GH_LIMIT_LOCK_TIMEOUT`, 600 s; `GH_LIMIT_NO_WAIT_LOCK_S`, 5 s under
+  `NO_WAIT`) now **REFUSES** the call (exit 75) instead of proceeding UNSERIALISED. A refusal is a
+  named, non-zero answer the caller reports as `UNREADABLE`; "proceed unserialised" was an unbounded
+  burst on the busiest box, which is the defect #1910 is about. The cost is a call that could have
+  run late now fails loudly instead.
 - **Interactive and streaming `gh`**: output is captured, so a human running `gh` in a harness
   session loses TTY rendering, and a long `--watch`-style command would buffer. The harness itself
   has no streaming call.
 - **`--jq` replay uses the external `jq` binary** (gh vendors its own engine); when `jq` is absent
   the call is left unintercepted rather than served by us.
-- **A layer that sleeps cannot outlive its caller, so a bounded caller gets no backoff.**
-  `GH_LIMIT_NO_WAIT=1` makes the layer record the limit and return at once; NINE heartbeat tools set
+- **A layer that sleeps cannot outlive its caller, so a bounded caller gets no PRIMARY backoff.**
+  `GH_LIMIT_NO_WAIT=1` makes the layer record a primary limit and return at once; NINE heartbeat tools set
   it (`objective.py`, `merge-queue.py`, `beta-progress.py`, `queue-dispatch.py`, `ask-owner.py`,
   `turn-classify.py`, `turn-end.py`, `undelivered-answers.py`, `pr-doctor.py`), because each one's own
   bound is a per-CALL timeout in the 60-420 s range (or a `run_bounded` step of 20-90 s) that is
@@ -129,10 +148,10 @@ Two properties worth knowing before you debug it:
   1 s, `LOCK_TIMEOUT` below 1 s: an environment that could set them to 0 would switch off the three
   guarantees the issue asks for while still looking clamped. Upper bounds are clamped too, and
   `nan`/`inf` fall back to the default.
-- **The child `gh` has no timeout.** A hung request holds the attempt lock for its whole duration;
-  other callers wait up to `GH_LIMIT_LOCK_TIMEOUT` (600 s) — or `GH_LIMIT_NO_WAIT_LOCK_S` (5 s) when
-  `GH_LIMIT_NO_WAIT=1` — then proceed UNSERIALISED with an `events.log` line. No timeout is imposed
-  on the child: a legitimate `gh` call's duration is not knowable here.
+- **The child `gh` has no timeout.** A hung request holds its slot for its whole duration; other
+  callers queue up to `GH_LIMIT_LOCK_TIMEOUT` (600 s) — or `GH_LIMIT_NO_WAIT_LOCK_S` (5 s) when
+  `GH_LIMIT_NO_WAIT=1` — and are then REFUSED (exit 75, `last-busy`) rather than run over the budget.
+  No timeout is imposed on the child: a legitimate `gh` call's duration is not knowable here.
 - **The re-entrancy opt-out is silent.** A gh child that itself runs a harness script is not
   serialised (that would deadlock) and nothing is logged, so an ambient `GH_LIMIT_LOCK_HELD=1`
   would disable serialisation on that box without a trace. It is a documented seam, not a knob.
@@ -150,11 +169,16 @@ Two properties worth knowing before you debug it:
   `gh=recovered(bucket=… <age>)`; the 15-minute age bound still applies to both forms.
 
 `$GH_LIMIT_DIR` defaults to `${XDG_CACHE_HOME:-~/.cache}/gh-limit`. Files you will find there:
-`gh.lock`, `etag/`, `last-mutation`, `last-limit`, `events.log`.
+`gh.slot.<0..N-1>` (the budget), `waiters/` (queue depth), `snapshot/` (the TTL snapshots and their
+per-key single-flight locks), `etag/`, `last-mutation`, `last-limit`, `last-busy`, `events.log`.
 
 Operator knobs (all optional): `GH_LIMIT_MAX_ATTEMPTS` (4 attempts in total), `GH_LIMIT_BASE_WAIT` (60 s),
 `GH_LIMIT_MAX_WAIT` (300 s — a reset beyond this fails FAST so the caller's own deferral takes
-over), `GH_LIMIT_LOCK_TIMEOUT` (600 s), `GH_LIMIT_MUTATION_GAP` (1 s),
+over), `GH_LIMIT_MAX_CONCURRENCY` (2 clients per box; clamped 1-8),
+`GH_LIMIT_SECONDARY_BASE_WAIT` (2 s), `GH_LIMIT_SECONDARY_MAX_WAIT` (60 s),
+`GH_LIMIT_SECONDARY_NO_WAIT_S` (8 s of burst retries inside a bounded caller),
+`GH_LIMIT_SNAPSHOT=1` (opt a COLLECTION read site in) with `GH_LIMIT_SNAPSHOT_TTL` (90 s) and
+`GH_LIMIT_SNAPSHOT_FAIL_TTL` (5 s), `GH_LIMIT_LOCK_TIMEOUT` (600 s), `GH_LIMIT_MUTATION_GAP` (1 s),
 `GH_LIMIT_CACHE_MAX_ENTRIES` (500), `GH_LIMIT_CACHE_MAX_BYTES` (67108864 — 64 MiB; the cache is
 bounded in entries AND bytes, whichever binds first), `GH_LIMIT_CONDITIONAL=0` (disable the ETag
 path), `GH_LIMIT_NO_WAIT=1` (never sleep in-process — set by callers that have their own bound) with
@@ -171,7 +195,39 @@ in production.
 | **Primary** | 5000 req/h (REST + GraphQL separate pools) | `rate limit exceeded`, `gh api rate_limit` shows `remaining: 0` |
 | **Secondary** | abuse detection (burst writes) | `API rate limit already exceeded for user ID ...` even with remaining quota — common after bulk issue closes/creates |
 
+⛔ **THE SECONDARY LIMIT IS A CONCURRENCY LIMIT, AND IT IS WHAT REFUSED THIS FLEET.** Measured
+2026-10-19 00:5xZ while the heartbeat printed `gh=RATE-LIMITED(queue)` and `queue=UNREADABLE`:
+
+| Fact | Value |
+|---|---|
+| Primary budget | core **1599/5000**, graphql **4612/5000** — untouched |
+| ONE REST call, alone | `200` in **0.43 s** |
+| Concurrent `gh` clients | **17 on the Mac**, 2 + 1 + 0 on the three cells |
+| The refusal | `API rate limit already exceeded for user ID 81560491` (13 clients, earlier the same day) |
+
+So reads were failing on **BURSTS**, not on budget — and `gh api rate_limit` is a **FALSE GREEN** for
+this question: it reports headroom, which is the opposite of "the fleet is being refused". The
+remedy is pacing and retrying, never raising a quota that was not spent (#1910).
+
 ## Detect
+
+**Ask the layer what the box is DOING, not what the counter says.** This is the question the cycle
+line and `[cap]` now answer:
+
+```bash
+python3 "$O/gh-limit.py" --status
+# gh=clients=2/2 waiters=3 last=secondary(bucket=graphql 41s)
+```
+
+- `clients=<held>/<max>` is the LIVE budget occupancy (probed from the slots the layer itself
+  enforces), and `waiters=` is the queue depth. A box at `2/2` with waiters is a box whose reads are
+  being paced — which is the healthy state under load, not a fault.
+- `last=secondary(...)` names a refusal that happened with the primary counters healthy; `last=`
+  `rate_limited(...)` names a spent bucket, with the reset. Both carry their age, so a past refusal
+  is never presented as a current one.
+- `last=… busy=Ns` means the box's OWN budget refused a call — a local, non-GitHub event.
+
+For the primary counters (still useful, and still not evidence about the secondary limit):
 
 ```bash
 gh api rate_limit --jq '.resources | {core: .core, graphql: .graphql}'
@@ -182,9 +238,9 @@ gh api rate_limit --jq '.resources | {core: .core, graphql: .graphql}'
   `4999/5000` while EVERY GraphQL call was refused (`API rate limit already exceeded for user ID
   81560491`). The pools are separate, so a healthy number here is not evidence the GraphQL path
   works. That is why the limit layer names the bucket the FAILING CALL used instead of trusting
-  this read (#1988, #1762).
-- Secondary limits: transient (typically 1–5 min); sleeping does not always clear them
-  for writes — switch transport instead.
+  this read (#1988, #1762) — and why `--status` reports the CLIENT COUNT instead.
+- Secondary limits: transient (seconds to minutes, measured 0.43 s in the clearest case); the layer
+  retries them on a jittered 2 s doubling curve rather than the primary 60 s floor.
 
 ## Fallback: REST for the operations gh uses GraphQL for
 

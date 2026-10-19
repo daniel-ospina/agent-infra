@@ -51,6 +51,7 @@ import binascii
 import fcntl
 import hashlib
 import errno
+import io
 import json
 import os
 import random
@@ -119,6 +120,48 @@ MUTATION_GAP = cfg_secs("GH_LIMIT_MUTATION_GAP", 1.0, 1.0, 60)     # ">= 1 secon
 NO_WAIT = cfg_int("GH_LIMIT_NO_WAIT", 0, 0, 1)
 # The lock budget under NO_WAIT — small enough to fit inside a 90 s caller alongside one request.
 NO_WAIT_LOCK_S = cfg_secs("GH_LIMIT_NO_WAIT_LOCK_S", 5.0, 1.0, 600)
+
+# ── THE CLIENT BUDGET (the secondary-limit fix) ─────────────────────────────────────────────────
+# ⛔ A FLEET IS REFUSED BY CONCURRENCY, NOT BY BUDGET. Measured 2026-10-19 while every counter read
+# healthy (`core 1599/5000`, `graphql 4612/5000`, one REST call in 0.43 s): 17 concurrent `gh`
+# clients on the Mac and `API rate limit already exceeded for user ID …` on the calls that lost the
+# race. That is GitHub's SECONDARY limit — it reacts to bursts, and no amount of primary headroom
+# prevents it. The old single `gh.lock` was right about the goal and wrong about the failure mode:
+# on lock timeout (or under `GH_LIMIT_NO_WAIT`, whose budget is 5 s) it PROCEEDED UNSERIALISED, so
+# the busiest box — exactly the one being refused — was the one issuing the most parallel calls, and
+# nothing but an `events.log` line said so.
+#
+# So the budget is now EXPLICIT and its violation is DECIDED, not absorbed:
+#   * at most MAX_CONCURRENCY `gh` invocations in flight per box (owner-specified default 2; 1 is
+#     available and is the strictest setting);
+#   * a waiter is QUEUED and BOUNDED — it never becomes an extra in-flight request;
+#   * a waiter that runs out of budget is REFUSED LOUDLY (exit 75, a temp failure), never released
+#     into the burst. "Refused" is honest; "proceed unserialised" is the defect.
+MAX_CONCURRENCY = cfg_int("GH_LIMIT_MAX_CONCURRENCY", 2, 1, 8)
+# ── the SECONDARY limit's own backoff ──────────────────────────────────────────────────────────
+# A secondary limit is a BURST refusal that clears in seconds (measured: the same call succeeded
+# 0.43 s later), not an hourly budget that resets. Backing it off by the primary 60 s floor turns a
+# 2 s hiccup into a 7-minute outage, and under `GH_LIMIT_NO_WAIT` it produced NO retry at all — the
+# caller saw a refusal and the queue read `UNREADABLE` while a retry would have answered. So: a
+# short, jittered, exponentially growing wait (2, 4, 8 … capped), retried even by a bounded caller
+# while the cumulative wait stays inside its own budget.
+SECONDARY_BASE_WAIT = cfg_secs("GH_LIMIT_SECONDARY_BASE_WAIT", 2, 1, 3600)
+SECONDARY_MAX_WAIT = cfg_secs("GH_LIMIT_SECONDARY_MAX_WAIT", 60, 1, 3600)
+# How much of a bounded (NO_WAIT) caller's time may be spent retrying a burst refusal. The
+# heartbeat's bounded steps allow 20-90 s; 8 s fits beside one request and still absorbs the
+# measured burst.
+SECONDARY_NO_WAIT_S = cfg_secs("GH_LIMIT_SECONDARY_NO_WAIT_S", 8, 0, 600)
+# ── ONE READER PER BOX (the snapshot) ──────────────────────────────────────────────────────────
+# Opt-in per call site, deliberately: a TTL snapshot is right for a COLLECTION read the controller
+# and every lane ask the same question about, and wrong for a single-entity read that gates an
+# action (a 90 s-old head sha is a merge-gate hazard, so those stay uncached). Callers opt in with
+# `GH_LIMIT_SNAPSHOT=1`; the default is OFF.
+SNAPSHOT_ENABLED = cfg_int("GH_LIMIT_SNAPSHOT", 0, 0, 1)
+SNAPSHOT_TTL = cfg_secs("GH_LIMIT_SNAPSHOT_TTL", 90, 0, 3600)
+# A FAILURE is cached for a few seconds only: long enough to stop ten waiters stampeding their own
+# retry, short enough that it is never mistaken for the answer. A refusal is replayed LOUDLY (rc and
+# stderr intact) — never cached as "no data".
+SNAPSHOT_FAIL_TTL = cfg_secs("GH_LIMIT_SNAPSHOT_FAIL_TTL", 5, 0, 600)
 CACHE_MAX_BODY = 1024 * 1024
 CACHE_MAX_BYTES = cfg_int("GH_LIMIT_CACHE_MAX_BYTES", 64 * 1024 * 1024, 1024, 1 << 30)  # whole cache
 CACHE_MAX_ENTRIES = cfg_int("GH_LIMIT_CACHE_MAX_ENTRIES", 500, 1, 100000)
@@ -296,12 +339,16 @@ def write_state(name, text):
         return False
 
 
-def record_limit(bucket, reset, attempts, waited, status):
-    """The durable record the controller's heartbeat reads (`gh=<bucket> reset=<epoch>`)."""
+def record_limit(bucket, reset, attempts, waited, status, kind="primary"):
+    """The durable record the controller's heartbeat reads (`gh=<bucket> reset=<epoch>`).
+
+    `kind=` separates the two limits an operator must not confuse: a `secondary` refusal happens
+    while the PRIMARY counters read healthy, so a cycle line that only says `rate_limited` sends
+    the operator to the wrong remedy (raise nothing — pace the clients)."""
     write_state("last-limit",
-                "at=%d bucket=%s reset=%s attempts=%d waited=%d status=%s"
+                "at=%d bucket=%s reset=%s attempts=%d waited=%d status=%s kind=%s"
                 % (int(clock()), bucket, ("%d" % reset) if reset else "0", attempts, int(waited),
-                   status if status is not None else "?"))
+                   status if status is not None else "?", kind))
 
 
 def record_recovery(bucket):
@@ -361,55 +408,162 @@ def log_event(line):
         pass
 
 
-# ── single flight ───────────────────────────────────────────────────────────────────────────────
-def acquire_lock():
-    """One gh call in flight per box. Returns the fd to hold (or None when re-entrant/unavailable).
+# ── the client budget (a bounded semaphore, NOT a mutex that gives up) ────────────────────────
+class BudgetExhausted(Exception):
+    """The box's gh client budget was spent for longer than the caller could wait.
 
-    `flock` is a KERNEL lock, so a holder that dies (killed worker, crashed lane) releases it —
-    there is no stale-lock state to reap. `flock(1)` is NOT portable to macOS, which is why this
-    is `fcntl` and not a shell `flock`."""
-    if os.environ.get(REENTRANCY_ENV):      # a gh child that itself runs a harness script: no deadlock
-        return None
-    path = os.path.join(state_dir(), "gh.lock")
+    ⛔ THIS IS A REFUSAL, NOT A PERMISSION SLIP. The old layer logged `proceeding UNSERIALISED`
+    and ran the call anyway: the box that was being refused for bursting answered by bursting
+    harder, and only `events.log` disagreed with the healthy-looking cycle line."""
+
+    def __init__(self, waited, maxc):
+        self.waited = waited
+        self.maxc = maxc
+        Exception.__init__(self, "gh client budget exhausted: %d/%d in flight, waited %ds"
+                           % (maxc, maxc, int(waited)))
+
+
+def _registry(dirname):
+    d = os.path.join(state_dir(), dirname)
     try:
-        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
-    except OSError as exc:
-        # ⛔ NOT SILENTLY. This is the same failure class as the timeout below — the box is fully
-        # UNSERIALISED — and returning None quietly left events.log and the heartbeat reporting a
-        # healthy serialised box (ENOSPC/EDQUOT on O_CREAT, EMFILE/ENFILE under fd pressure, or a
-        # lock the /tmp fallback left owned by another uid).
-        log_event("WARNING cannot open %s (%s) — proceeding UNSERIALISED" % (path, exc))
+        os.makedirs(d, mode=0o700, exist_ok=True)
+    except OSError:
         return None
+    return d
+
+
+def _pid_alive(pid):
+    """Same rule as `_dead_writer`: a pid we may not signal is ALIVE (do not reap it)."""
+    if not pid or not (0 < pid < 1 << 22):
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OverflowError:
+        return False
+    except OSError as exc:
+        return exc.errno == errno.EPERM
+
+
+def _register(dirname, name):
+    """Record an in-flight/queued client so `--status` can REPORT the count this budget enforces.
+
+    The registry is evidence, not the lock: the lock is `flock` on the slot file and is released by
+    the kernel when a holder dies. A registry entry whose pid is gone is pruned on read, so a
+    SIGKILLed client cannot inflate the count for ever."""
+    d = _registry(dirname)
+    if not d:
+        return None
+    p = os.path.join(d, name)
+    try:
+        with open(p, "w") as fh:
+            fh.write("%d\n" % os.getpid())
+        return p
+    except OSError:
+        return None
+
+
+def _unregister(p):
+    if not p:
+        return
+    try:
+        os.unlink(p)
+    except OSError:
+        pass
+
+
+def _live_clients(dirname):
+    """(live, stale) entries in a registry dir. Stale (dead-pid) entries are REMOVED on read."""
+    d = os.path.join(state_dir(), dirname)
+    live = 0
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return 0, 0
+    stale = 0
+    for n in names:
+        p = os.path.join(d, n)
+        try:
+            with open(p) as fh:
+                pid = as_int(fh.read().strip())
+        except OSError:
+            pid = None
+        if pid and _pid_alive(pid):
+            live += 1
+            continue
+        stale += 1
+        try:
+            os.unlink(p)
+        except OSError:
+            pass
+    return live, stale
+
+
+def acquire_slot():
+    """Reserve one of MAX_CONCURRENCY gh slots. Returns (fd, index), or (None, None) when the
+    caller is RE-ENTRANT (a gh child that itself runs a harness script must not deadlock).
+
+    Raises BudgetExhausted when every slot is held for longer than the caller's budget — the one
+    outcome this layer must never turn into "run it anyway".
+
+    `flock` is a KERNEL lock, so a holder that dies releases its slot — there is no stale-lock
+    state to reap. `flock(1)` is NOT portable to macOS, which is why this is `fcntl`."""
+    if os.environ.get(REENTRANCY_ENV):
+        return None, None
     # ⛔ A BOUNDED CALLER MUST NOT DIE IN THE QUEUE. `GH_LIMIT_NO_WAIT` bounds the BACKOFF, and the
-    # lock wait is the other wait this layer imposes: the default 600 s outlives every caller that has
-    # its own subprocess bound (the heartbeat's 90 s refresh), so a busy box turned a rate-limit
-    # verdict into a silent timeout — the same non-goal, reached from the lock. Proceed UNSERIALISED
-    # after NO_WAIT_LOCK_S and say so, rather than being killed mid-wait with no record at all.
+    # queue is the other wait this layer imposes; the default budget outlives every caller with its
+    # own subprocess bound (the heartbeat's 90 s refresh). Under NO_WAIT the queue budget is the
+    # short one, and exhausting it REFUSES rather than being killed mid-wait with no record.
     budget = min(LOCK_TIMEOUT, NO_WAIT_LOCK_S) if NO_WAIT else LOCK_TIMEOUT
     deadline = time.monotonic() + budget      # real monotonic: the fake clock is for BACKOFF
-    while True:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            break
-        except OSError as exc:
-            if exc.errno not in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES):
-                # "the lock is held" is the ONLY reason to wait. Anything else (EOPNOTSUPP/ENOLCK on a
-                # filesystem without flock — SMB/CIFS, some FUSE mounts) would spin here for the full
-                # LOCK_TIMEOUT on EVERY gh call and then proceed unserialised anyway: a 10-minute
-                # stall on the box that looks like a slow network.
-                log_event("WARNING gh.lock unusable (%s) — proceeding UNSERIALISED" % exc)
-                break
+    waiter = None
+    try:
+        while True:
+            for i in range(MAX_CONCURRENCY):
+                path = os.path.join(state_dir(), "gh.slot.%d" % i)
+                try:
+                    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+                except OSError as exc:
+                    # ⛔ NOT SILENTLY, and NOT UNSERIALISED. The old code turned an unopenable lock
+                    # into an unbounded burst; a state dir that cannot hold a slot file is a broken
+                    # box, so the call is refused as a budget failure (the caller reports it).
+                    log_event("WARNING cannot open %s (%s) — refusing (client budget unavailable)"
+                              % (path, exc))
+                    raise BudgetExhausted(0.0, MAX_CONCURRENCY)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError as exc:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                    if exc.errno not in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES):
+                        # "the slot is held" is the ONLY reason to wait. EOPNOTSUPP/ENOLCK on a
+                        # filesystem without flock would spin for the full budget and then... refuse,
+                        # which is at least bounded. Logged so the box is not silently degraded.
+                        log_event("WARNING gh.slot.%d unusable (%s) — refusing (client budget unavailable)"
+                                  % (i, exc))
+                        raise BudgetExhausted(0.0, MAX_CONCURRENCY)
+                    continue
+                os.set_inheritable(fd, False)
+                _unregister(waiter)
+                return fd, i
+            # Every slot is held: QUEUE (bounded). The waiter marker is the evidence that this
+            # budget has a queue at all, and `--status` prints the depth.
+            if waiter is None:
+                waiter = _register("waiters", "%d" % os.getpid())
             if time.monotonic() >= deadline:
-                # Bounded, and announced in the evidence log rather than blocking for ever: an
-                # unbounded wait behind one slow gh call would park the whole box's merge sweep.
-                log_event("WARNING gh.lock not acquired within %ds — proceeding UNSERIALISED" % int(budget))
-                break
+                log_event("WARNING no gh slot within %ds (max_concurrency=%d) — REFUSING this call "
+                          "(a queue that overflows must not become the burst it is queueing for)"
+                          % (int(budget), MAX_CONCURRENCY))
+                raise BudgetExhausted(time.monotonic() - (deadline - budget), MAX_CONCURRENCY)
             time.sleep(0.02)
-    os.set_inheritable(fd, False)
-    return fd
+    except BudgetExhausted:
+        _unregister(waiter)
+        raise
 
 
-def release_lock(fd):
+def release_slot(fd, index):
     if fd is None:
         return
     try:
@@ -420,6 +574,39 @@ def release_lock(fd):
         os.close(fd)
     except OSError:
         pass
+
+
+def count_held_slots():
+    """How many of the MAX_CONCURRENCY slots are HELD RIGHT NOW — the measurement, not a log.
+
+    ⛔ A REGISTRY WOULD BE A SUMMARY OF A PAST READ. The authoritative fact is the lock the budget
+    itself enforces, so this probes each slot and counts the ones it cannot take. `--status` is the
+    only caller: it needs no slot for itself and holds each probe lock for microseconds. A slot file
+    that cannot be OPENED is counted as HELD — the fail-closed direction ("unknown" must never read
+    as "idle" on the line an operator uses to decide whether the box is bursting)."""
+    held = 0
+    for i in range(MAX_CONCURRENCY):
+        path = os.path.join(state_dir(), "gh.slot.%d" % i)
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+        except OSError:
+            held += 1
+            continue
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            # Busy OR unusable — either way the slot is not free.
+            held += 1
+        else:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    return held
 
 
 # ── argv shape ─────────────────────────────────────────────────────────────────────────────────
@@ -794,16 +981,26 @@ def conditional_fetch(real_gh, plan):
 LIMIT_PHRASES = ("rate limit", "rate-limit", "abuse detection", "secondary rate")
 
 
-class Limit(object):
-    __slots__ = ("bucket", "status", "retry_after", "remaining", "reset", "message")
+# ⛔ THE SECONDARY LIMIT IS A DIFFERENT FAILURE WITH A DIFFERENT REMEDY. GitHub's secondary /
+# abuse limits refuse on BURSTS: the refusal arrives with the primary counters healthy (`core
+# 1599/5000` measured while every call was refused), it clears in seconds rather than at an hourly
+# reset, and hammering through it is what escalates to a ban. So it is CLASSIFIED separately and
+# backed off on its OWN fast, jittered curve — the primary 60 s floor turned a measured 2 s burst
+# into a 7-minute outage, and under `GH_LIMIT_NO_WAIT` into no retry at all.
+SECONDARY_PHRASES = ("already exceeded", "secondary rate limit", "secondary-rate", "abuse detection")
 
-    def __init__(self, bucket, status, retry_after, remaining, reset, message):
+
+class Limit(object):
+    __slots__ = ("bucket", "status", "retry_after", "remaining", "reset", "message", "kind")
+
+    def __init__(self, bucket, status, retry_after, remaining, reset, message, kind="primary"):
         self.bucket = bucket
         self.status = status
         self.retry_after = retry_after
         self.remaining = remaining
         self.reset = reset
         self.message = message
+        self.kind = kind
 
 
 # gh subcommands that go straight to REST. Everything else gh does for the shapes this harness
@@ -874,11 +1071,22 @@ def probe_rate_limit(real_gh, bucket):
     attempt lock (a caller must not hold the box while it sleeps 60s), so without this it would be
     the ONE gh request the layer issues unserialised — during backoff, exactly when the other boxes
     and the other lanes are most likely to be issuing their own. One invariant, no exemptions."""
-    lock = acquire_lock()
+    lock, _slot = None, None
+    try:
+        # ⛔ TAKES A CLIENT SLOT. It is called from `plan_wait`, which runs OUTSIDE the attempt slot (a
+        # caller must not hold the box while it sleeps 60s), so without this it would be the ONE gh
+        # request the layer issues unserialised — during backoff, exactly when the other boxes and the
+        # other lanes are most likely to be issuing their own.
+        lock, _slot = acquire_slot()
+    except BudgetExhausted:
+        # The box is at its client budget. A probe is diagnostic, never load-bearing: skip it rather
+        # than queue behind a burst, and let `plan_wait` fall through to the documented backoff.
+        log_event("probe: no client slot available — skipping /rate_limit (the backoff does not need it)")
+        return None, None
     try:
         r = run(real_gh, ["api", "rate_limit"])
     finally:
-        release_lock(lock)
+        release_slot(lock, _slot)
     try:
         if r.rc != 0:
             return None, None
@@ -929,14 +1137,25 @@ def classify(res, argv, headers):
     # counts only where a limit can actually arrive: 429, an unparsed status (GraphQL reports the
     # refusal in prose alone), or a 403 that already corroborates.
     if status == 429 or (status == 403 and corroborated) or (phrase and status in (None, 403, 429)):
+        kind = "secondary" if any(p in low for p in SECONDARY_PHRASES) else "primary"
         return Limit(bucket_for(argv), status, retry_after, remaining, reset, text.strip().splitlines()[0]
-                     if text.strip() else "")
+                     if text.strip() else "", kind)
     return None
 
 
 def plan_wait(limit, attempt, real_gh, now):
     """The documented order, and nothing invented: retry-after, then the bucket's reset when the
-    bucket is empty, then >= BASE_WAIT doubling. Returns (seconds, reset_epoch, why)."""
+    bucket is empty, then >= BASE_WAIT doubling. Returns (seconds, reset_epoch, why).
+
+    ⛔ A SECONDARY LIMIT TAKES ITS OWN PATH AND IS NOT PROBED. Its refusal says nothing about the
+    hourly buckets (they read healthy), and a `/rate_limit` request during a burst is one more
+    request in the burst — so the probe is skipped and the wait is the short jittered curve. The
+    PRIMARY path is unchanged."""
+    if limit.kind == "secondary":
+        base = SECONDARY_BASE_WAIT * (2 ** (attempt - 1))
+        # Jitter UPWARDS only, so the floor is never breached; capped so one stubborn burst cannot
+        # hold a caller for ever (the attempt cap bounds the total too).
+        return min(base * (1.0 + random.random() * 0.5), SECONDARY_MAX_WAIT), limit.reset, "secondary-backoff"
     if limit.retry_after is not None and limit.retry_after >= 0:
         # ⛔ A `retry-after: 0` IS NOT PERMISSION TO RETRY AT ONCE. Taken verbatim it produced four
         # back-to-back requests with zero seconds waited — the burst secondary limits react to, and
@@ -967,16 +1186,75 @@ def fail_loudly(limit, attempts, waited, reset):
     # TRANSPORT_MARKERS) to turn a refused read into `VERDICT=GH-RATE-LIMITED` instead of
     # `UNKNOWN`/`STALL`. "rate_limited" does not contain it, so the token would be lost at exactly the
     # boundary this layer exists to make honest.
+    # ⛔ AND THE KIND MATTERS: a SECONDARY refusal happens while the primary counters read healthy,
+    # so an operator told only "rate limit" is sent to raise a budget that was never spent.
     sys.stderr.write(
-        "gh-limit: gh rate limit (bucket=%s reset=%s) — FAILED after %d attempt(s), %ds waited. "
+        "gh-limit: gh rate limit (bucket=%s kind=%s reset=%s) — FAILED after %d attempt(s), %ds waited. "
         "This is a REFUSED call, not an empty answer%s\n"
-        % (limit.bucket, reset if reset else "?", attempts, int(waited),
+        % (limit.bucket, limit.kind, reset if reset else "?", attempts, int(waited),
            (" (%s)" % limit.message) if limit.message else ""))
+
+
+# ── the box's gh health, as an INSTRUMENT (the `[cap]` line reads this) ───────────────────────
+# ⛔ `gh api rate_limit` IS A FALSE GREEN FOR THIS QUESTION. Measured 2026-10-19: core 1599/5000,
+# graphql 4612/5000, one REST call in 0.43 s — and the fleet refused, because the SECONDARY limit
+# answers to CONCURRENCY, not to budget. An operator asking "is the fleet being refused?" was shown
+# a healthy counter, which is the opposite answer. This prints the facts that actually decide it:
+# how many clients this box is running, how deep the queue is, and the last refusal's KIND.
+GH_LIMIT_STALE_S = 900      # same age bound as orch-loop.sh's reader: a record is not a state
+
+
+def record_busy(waited, maxc):
+    """A LOCAL refusal (the box's own client budget), kept apart from GitHub's rate limits."""
+    write_state("last-busy", "at=%d waited=%d max=%d" % (int(clock()), int(waited), maxc))
+
+
+def _read_kv(name):
+    try:
+        with open(os.path.join(state_dir(), name)) as fh:
+            return dict(kv.split("=", 1) for kv in fh.read().split() if "=" in kv)
+    except (OSError, ValueError):
+        return {}
+
+
+def status_token():
+    """One line: `gh=clients=<live>/<max> waiters=<n> last=<kind>(bucket=.. <age>s)`.
+
+    Prints even when nothing has ever been refused (client counts are the baseline fact), and never
+    claims a limit that has aged out: a stale record is the "flag that records a past state" defect
+    this file has already been burned by.
+    """
+    live = count_held_slots()
+    waiting, _ = _live_clients("waiters")
+    now = int(clock())
+    last = "none"
+    rec = _read_kv("last-limit")
+    at = as_int(rec.get("at"))
+    if at is not None and 0 <= now - at <= GH_LIMIT_STALE_S:
+        kind = rec.get("kind") or "primary"
+        label = "secondary" if kind == "secondary" else "rate_limited"
+        if as_int(rec.get("recovered")) is not None:
+            label = "recovered"
+        last = "%s(bucket=%s %ss)" % (label, rec.get("bucket") or "?", now - at)
+    busy = _read_kv("last-busy")
+    bat = as_int(busy.get("at"))
+    if bat is not None and 0 <= now - bat < min(GH_LIMIT_STALE_S, 300):
+        last += " busy=%ss" % (now - bat)
+    return "gh=clients=%d/%d waiters=%d last=%s" % (live, MAX_CONCURRENCY, waiting, last)
 
 
 def main(argv):
     real_gh = None
     self_path = None
+    # ⛔ `--status` IS AN INSTRUMENT AND TOUCHES NO NETWORK: it must answer on a box with no gh, no
+    # token and a refusing API — that is exactly when the operator needs it.
+    if argv[:1] == ["--status"]:
+        try:
+            sys.stdout.write(status_token() + "\n")
+        except Exception as exc:                       # an instrument must not fail a cycle
+            sys.stdout.write("gh=clients=?/%d waiters=? last=unknown\n" % MAX_CONCURRENCY)
+            sys.stderr.write("gh-limit: --status failed (%s)\n" % exc)
+        return 0
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -990,7 +1268,7 @@ def main(argv):
             self_path = argv[i + 1]
             i += 2
         else:
-            sys.stderr.write("gh-limit: unknown argument %r (expected --real-gh|--self <path> -- <argv>)\n" % a)
+            sys.stderr.write("gh-limit: unknown argument %r (expected --real-gh|--self <path> -- <argv>|--status)\n" % a)
             return 2
     gh_argv = list(argv[i:])
     if real_gh is None:
@@ -1002,7 +1280,20 @@ def main(argv):
         sys.stderr.write("gh-limit: cannot locate the real gh (set GH_LIMIT_REAL_GH)\n")
         return 127
 
-    return dispatch(real_gh, gh_argv)
+    try:
+        return dispatch(real_gh, gh_argv)
+    except BudgetExhausted as exc:
+        # ⛔ THE ONE PLACE THE OLD LAYER'S FAILURE MODE WOULD COME BACK. A full queue REFUSES —
+        # loudly, non-zero, and with a record the cycle line can print. The message carries "timed
+        # out" on purpose: the harness's transport classifiers then read this as a READ FAILURE
+        # (UNREADABLE), never as an empty answer.
+        record_busy(exc.waited, exc.maxc)
+        sys.stderr.write(
+            "gh-limit: gh client budget exhausted — %d/%d clients in flight, the waiter timed out "
+            "after %ds. This is a REFUSAL by this box's own concurrency budget (NOT a GitHub rate "
+            "limit and NOT an empty answer); retry when a slot frees.\n"
+            % (exc.maxc, exc.maxc, int(exc.waited)))
+        return 75                                     # EX_TEMPFAIL
 
 
 def is_harness_shim(path):
@@ -1053,20 +1344,28 @@ def resolve_real_gh(self_path):
 
 
 def dispatch(real_gh, gh_argv):
-    """Run, back off, retry — holding the single-flight lock for each ATTEMPT and NOT for the wait.
+    """Run, back off, retry — holding a CLIENT SLOT for each ATTEMPT and NOT for the wait.
 
-    ⛔ THE LOCK IS RELEASED DURING A WAIT, deliberately. The invariant is "one gh request in flight
-    per box", not "one caller in the queue": holding it through a 60/120/240 s backoff would park
-    every other gh call on the box behind a box that is simply waiting — including the merge that is
-    the reason the harness runs. Releasing it during the wait keeps the invariant exactly (no two
-    requests overlap) while letting an independent call proceed (it will be refused and back off on
-    its own if the bucket is still empty, which is the honest behaviour)."""
+    ⛔ THE SLOT IS RELEASED DURING A WAIT, deliberately. The invariant is "at most MAX_CONCURRENCY
+    gh requests in flight per box", not "one caller in the queue": holding a slot through a
+    60/120/240 s backoff would park every other gh call on the box behind a box that is simply
+    waiting — including the merge that is the reason the harness runs. Releasing it during the wait
+    keeps the invariant exactly (no two requests overlap beyond the budget) while letting an
+    independent call proceed.
+
+    ⛔ AND AN EXHAUSTED BUDGET IS A REFUSAL, NOT A LICENCE TO BURST (see acquire_slot)."""
+    if not (SNAPSHOT_ENABLED and SNAPSHOT_TTL > 0) or is_mutating(gh_argv):
+        return _dispatch_run(real_gh, gh_argv)
+    return _dispatch_snapshotted(real_gh, gh_argv)
+
+
+def _dispatch_run(real_gh, gh_argv):
     plan = conditional_plan(gh_argv)
     attempt = 0
     waited = 0.0
     mutating = is_mutating(gh_argv)
     if mutating:
-        # The bulk of the mutation gap is waited OUTSIDE the lock (a 1 s pause under the box lock
+        # The bulk of the mutation gap is waited OUTSIDE the slot (a 1 s pause under the box budget
         # would park every unrelated gh call); the remainder is re-checked inside it, immediately
         # before the request leaves — see pace_mutation.
         w = pace_mutation()
@@ -1075,7 +1374,7 @@ def dispatch(real_gh, gh_argv):
             pause(w)
     while True:
         attempt += 1
-        lock = acquire_lock()
+        lock, slot = acquire_slot()
         try:
             if mutating:
                 w = pace_mutation()
@@ -1084,7 +1383,7 @@ def dispatch(real_gh, gh_argv):
                 mark_mutation()
             res, headers = run_attempt(real_gh, gh_argv, plan)
         finally:
-            release_lock(lock)
+            release_slot(lock, slot)
         if res.rc == 0:
             # ⛔ ON EVERY SUCCESS, not only this process's own retry: the record outlives the process
             # that wrote it, so the FIRST call that succeeds after a limit is the evidence — waiting
@@ -1125,9 +1424,9 @@ def dispatch(real_gh, gh_argv):
             # (the probe) — and this is the attempt that is about to fail, on a box that is already
             # refusing calls. `limit.reset` is what the refused response itself carried.
             reset = limit.reset or recorded_reset(limit.bucket)
-            record_limit(limit.bucket, reset, attempt, waited, limit.status)
-            log_event("GAVE UP bucket=%s status=%s attempts=%d waited=%ds reset=%s"
-                      % (limit.bucket, limit.status, attempt, int(waited), reset))
+            record_limit(limit.bucket, reset, attempt, waited, limit.status, limit.kind)
+            log_event("GAVE UP bucket=%s kind=%s status=%s attempts=%d waited=%ds reset=%s"
+                      % (limit.bucket, limit.kind, limit.status, attempt, int(waited), reset))
             fail_loudly(limit, attempt, waited, reset)
             # The failed attempt's own words still reach the caller, AFTER the announcement that
             # names the bucket and the reset — never instead of it. BOTH streams: the "never
@@ -1138,15 +1437,31 @@ def dispatch(real_gh, gh_argv):
                 sys.stderr.buffer.write(res.err if res.err.endswith(b"\n") else res.err + b"\n")
             return res.rc or 1
         if NO_WAIT:
+            # ⛔ A SECONDARY LIMIT IS RETRIED EVEN HERE. It is a burst refusal that clears in
+            # seconds; giving up on the first one is how a 2 s hiccup became `queue=UNREADABLE`
+            # while the very next call answered. The retry is bounded by the caller's own budget
+            # (`SECONDARY_NO_WAIT_S`), so it cannot outlive the caller's timeout — and it never
+            # turns a refusal into an empty answer: if it runs out of budget the loud failure below
+            # still fires.
+            if limit.kind == "secondary":
+                wait, reset, why = plan_wait(limit, attempt, real_gh, now)
+                if waited + wait <= SECONDARY_NO_WAIT_S:
+                    record_limit(limit.bucket, reset, attempt, waited, limit.status, limit.kind)
+                    log_event("secondary retry bucket=%s attempt=%d/%d why=%s waiting=%.2fs "
+                              "(inside the NO_WAIT budget %.0fs)"
+                              % (limit.bucket, attempt, MAX_ATTEMPTS, why, wait, SECONDARY_NO_WAIT_S))
+                    pause(wait)
+                    waited += wait
+                    continue
             # The caller has its own bound and its own deferral (GH_LIMIT_NO_WAIT). Report the limit
             # NOW so its verifier can say RATE-LIMITED: sleeping 60 s here would outlive its timeout
             # and the box would report a stall instead of the limit it actually hit. `plan_wait` is
             # skipped too — it may spend a `/rate_limit` probe, and this caller is not going to wait
             # for the answer anyway.
             reset = limit.reset or recorded_reset(limit.bucket)
-            record_limit(limit.bucket, reset, attempt, waited, limit.status)
-            log_event("rate_limited bucket=%s status=%s attempt=%d reset=%s — NO_WAIT, returning at once"
-                      % (limit.bucket, limit.status, attempt, reset))
+            record_limit(limit.bucket, reset, attempt, waited, limit.status, limit.kind)
+            log_event("rate_limited bucket=%s kind=%s status=%s attempt=%d reset=%s — NO_WAIT, returning at once"
+                      % (limit.bucket, limit.kind, limit.status, attempt, reset))
             fail_loudly(limit, attempt, waited, reset)
             if res.out:
                 sys.stdout.buffer.write(res.out)
@@ -1154,7 +1469,7 @@ def dispatch(real_gh, gh_argv):
                 sys.stderr.buffer.write(res.err if res.err.endswith(b"\n") else res.err + b"\n")
             return res.rc or 1
         wait, reset, why = plan_wait(limit, attempt, real_gh, now)
-        record_limit(limit.bucket, reset, attempt, waited, limit.status)
+        record_limit(limit.bucket, reset, attempt, waited, limit.status, limit.kind)
         if wait > MAX_WAIT:
             log_event("reset beyond the in-call bound bucket=%s wait=%ds reset=%s — failing fast"
                       % (limit.bucket, int(wait), reset))
@@ -1167,12 +1482,190 @@ def dispatch(real_gh, gh_argv):
             if res.err:
                 sys.stderr.buffer.write(res.err if res.err.endswith(b"\n") else res.err + b"\n")
             return res.rc or 1
-        log_event("rate_limited bucket=%s status=%s attempt=%d/%d reset=%s why=%s waiting=%ds"
-                  % (limit.bucket, limit.status, attempt, MAX_ATTEMPTS, reset, why, int(wait)))
-        # NOT under the lock: see the docstring. The wait is what the docs demand; the lock is only
+        log_event("rate_limited bucket=%s kind=%s status=%s attempt=%d/%d reset=%s why=%s waiting=%ds"
+                  % (limit.bucket, limit.kind, limit.status, attempt, MAX_ATTEMPTS, reset, why, int(wait)))
+        # NOT under the slot: see the docstring. The wait is what the docs demand; the slot is only
         # about overlap.
         pause(wait)
         waited += wait
+
+
+# ── one reader per box: the single-flight TTL snapshot ──────────────────────────────────────────
+# ⛔ A COLLECTION READ ASKED TEN TIMES IS ONE QUESTION. Every lane, the controller and the refresh
+# pass asked the same open-PR/issue question in their own request, so one box's board read became
+# ten requests — a burst by construction, and the burst is what the secondary limit refuses. The
+# first caller in a TTL window fetches; everyone inside the window is served the SAME bytes; two
+# callers that arrive together are collapsed by one per-key lock instead of stampeding.
+#
+# ⛔ OPT-IN, AND COLLECTIONS ONLY. A TTL is right for a listing and wrong for a single-entity read
+# that gates an action (a 90 s-old head sha is a merge-gate hazard), so the caller opts in with
+# `GH_LIMIT_SNAPSHOT=1` and mutations are never cached.
+class _Capture(object):
+    """A stdout/stderr stand-in that keeps the layer's byte-exact output.
+
+    The layer writes binary through `.buffer`, so the stand-in must expose one; `write()` is here
+    for the few `sys.stderr.write` calls (the refusals) so they are captured too — a refusal
+    cached as "nothing on stderr" would be the empty-read defect this file exists to prevent."""
+
+    def __init__(self):
+        self.buf = io.BytesIO()
+
+    @property
+    def buffer(self):
+        return self.buf
+
+    def write(self, s):
+        self.buf.write(s.encode("utf-8", "replace") if isinstance(s, str) else s)
+        return len(s)
+
+    def flush(self):
+        pass
+
+
+def _capture(fn):
+    out, err = _Capture(), _Capture()
+    real_out, real_err = sys.stdout, sys.stderr
+    sys.stdout, sys.stderr = out, err
+    try:
+        rc = fn()
+    finally:
+        sys.stdout, sys.stderr = real_out, real_err
+    return out.buf.getvalue(), err.buf.getvalue(), rc
+
+
+def _cred_digest():
+    tok = (os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+           or os.environ.get("GH_ENTERPRISE_TOKEN") or os.environ.get("GITHUB_ENTERPRISE_TOKEN") or "")
+    return hashlib.sha256(tok.encode("utf-8")).hexdigest()[:16] if tok else "-"
+
+
+def snapshot_key(argv):
+    """The identity of ONE logical read: host + credential + argv.
+
+    ⛔ A CALLER THAT OPTS IN MUST NAME ITS TARGET EXPLICITLY. argv carries the repo for every
+    wired call site (`repos/<owner>/<repo>/…`); two lanes in different worktrees must agree on the
+    question for a shared snapshot to be correct, and a cwd-relative `gh pr view` does not."""
+    payload = json.dumps([os.environ.get("GH_HOST") or "", _cred_digest(), list(argv)],
+                         separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
+
+
+def _snapshot_dir():
+    return _registry("snapshot")
+
+
+def snapshot_read(key):
+    """(rc, out, err) from a fresh-enough entry, or None. A FAILURE is replayed, never dropped."""
+    d = _snapshot_dir()
+    if not d:
+        return None
+    try:
+        with open(os.path.join(d, key + ".json")) as fh:
+            e = json.load(fh)
+        at = float(e.get("at"))
+        rc = int(e.get("rc"))
+        out = base64.b64decode(e.get("out", ""))
+        err = base64.b64decode(e.get("err", ""))
+    except (OSError, ValueError, TypeError, KeyError):
+        return None
+    age = clock() - at
+    ttl = SNAPSHOT_TTL if rc == 0 else min(SNAPSHOT_TTL, SNAPSHOT_FAIL_TTL)
+    # A stamp from the FUTURE is not fresh (a clock that stepped back); it must not pin an answer.
+    if age < 0 or age > ttl:
+        return None
+    return rc, out, err
+
+
+def snapshot_write(key, rc, out, err):
+    d = _snapshot_dir()
+    if not d:
+        return
+    if len(out) + len(err) > 8 * 1024 * 1024:      # a snapshot is a cache, not a copy of the API
+        return
+    p = os.path.join(d, key + ".json")
+    tmp = p + ".tmp-%d" % os.getpid()
+    try:
+        with open(tmp, "w") as fh:
+            json.dump({"at": clock(), "rc": rc,
+                       "out": base64.b64encode(out).decode("ascii"),
+                       "err": base64.b64encode(err).decode("ascii")}, fh)
+        os.replace(tmp, p)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def snapshot_lock(key):
+    """Single flight per key: the second caller WAITS for the first instead of asking too."""
+    d = _snapshot_dir()
+    if not d:
+        return None
+    try:
+        fd = os.open(os.path.join(d, key + ".lock"), os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError:
+        return None
+    budget = min(LOCK_TIMEOUT, NO_WAIT_LOCK_S) if NO_WAIT else LOCK_TIMEOUT
+    deadline = time.monotonic() + budget
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            os.set_inheritable(fd, False)
+            return fd
+        except OSError as exc:
+            if exc.errno not in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES):
+                break
+            if time.monotonic() >= deadline:
+                # Bounded: proceed. The CLIENT BUDGET still bounds the request, so this is one
+                # queued request, not a stampede.
+                log_event("WARNING snapshot lock for %s not acquired in %ds — fetching anyway "
+                          "(the client budget still bounds the request)" % (key, int(budget)))
+                break
+            time.sleep(0.02)
+    os.set_inheritable(fd, False)
+    return fd
+
+
+def snapshot_unlock(fd):
+    if fd is None:
+        return
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+
+def _replay_snapshot(rc, out, err):
+    if out:
+        sys.stdout.buffer.write(out)
+    if err:
+        sys.stderr.buffer.write(err)
+    return rc
+
+
+def _dispatch_snapshotted(real_gh, gh_argv):
+    key = snapshot_key(gh_argv)
+    hit = snapshot_read(key)
+    if hit is not None:
+        log_event("snapshot: served %s from a %.0fs window (no request issued)"
+                  % (" ".join(gh_argv[:3]), SNAPSHOT_TTL))
+        return _replay_snapshot(*hit)
+    lock = snapshot_lock(key)
+    try:
+        # Re-read under the lock: a concurrent leader may have filled it while we queued.
+        hit = snapshot_read(key)
+        if hit is not None:
+            return _replay_snapshot(*hit)
+        out, err, rc = _capture(lambda: _dispatch_run(real_gh, gh_argv))
+        snapshot_write(key, rc, out, err)
+    finally:
+        snapshot_unlock(lock)
+    return _replay_snapshot(rc, out, err)
 
 
 def run_attempt(real_gh, gh_argv, plan):

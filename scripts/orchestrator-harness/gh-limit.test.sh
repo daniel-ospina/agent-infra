@@ -184,6 +184,15 @@ case "$GH_LIMIT_SCENARIO" in
     printf 'HTTP/2.0 200 OK\r\nEtag: "bin1"\r\n\r\n'
     printf '\xff\xfe\x00binary\r\n'
     exit 0 ;;
+  secondaryonce)
+    # The MEASURED burst shape: the first call is refused with the secondary message and the very
+    # next one answers. This is what "retry first" is for — the refusal must not be reported as data.
+    if [ "$n" -le 1 ]; then
+      printf 'gh: API rate limit already exceeded for user ID 81560491. (HTTP 403)\n' >&2
+      exit 1
+    fi
+    printf '{"state":"OPEN","number":7}'
+    exit 0 ;;
   *)
     printf 'HTTP/2.0 200 OK\r\n\r\n{"ok":true}'
     exit 0 ;;
@@ -232,7 +241,11 @@ ck "retry-after: exactly two attempts" "$([ "$(calls)" -eq 2 ] && echo 0 || echo
 ck "retry-after: the streams stay clean on a call that eventually succeeded" \
    "$([ ! -s "$TMP/err-A" ] && echo 0 || echo 1)"
 
-# ── B. A secondary limit with NO headers: >=60s, doubling, bounded, then FAIL LOUDLY ──────────
+# ── B. A SECONDARY limit with NO headers: the SHORT jittered curve, bounded, then FAIL LOUDLY ──
+# ⛔ THE SECONDARY LIMIT IS NOT THE PRIMARY ONE. Its refusal arrives with the hourly counters
+# healthy, it clears in seconds (measured: the same call answered 0.43 s later), and hammering it is
+# what escalates to a ban. A 60 s floor turned a 2 s burst into a 7-minute outage — that is the
+# defect (#1910), so the waits are asserted at the SECONDARY scale, not the primary one.
 reset_env secondary
 out="$(run_helper pr comment 5 --repo o/r --body hi 2>"$TMP/err-B")"; rc=$?
 ck "secondary: the 4th attempt is not retried — exactly 4 attempts, then a loud failure" \
@@ -240,18 +253,26 @@ ck "secondary: the 4th attempt is not retried — exactly 4 attempts, then a lou
 ck "secondary: the failure is LOUD on stderr (never a silent success)" "$([ "$rc" -ne 0 ] && echo 0 || echo 1)"
 ck "secondary: the message NAMES the bucket (graphql, not the REST counter that looks healthy)" \
    "$(has 'bucket=graphql' "$(cat "$TMP/err-B")" && echo 0 || echo 1)"
-ck "secondary: the message names the reset it observed" \
-   "$(grep -qE 'rate limit \(bucket=graphql reset=[0-9]+\)' "$TMP/err-B" && echo 0 || echo 1)"
-ck "secondary: wait 1 is >= 60s"   "$(sleep_at_least 0 60 && echo 0 || echo 1)"
-ck "secondary: wait 2 is >= 120s (doubling)" "$(sleep_at_least 1 120 && echo 0 || echo 1)"
-ck "secondary: wait 3 is >= 240s (doubling)" "$(sleep_at_least 2 240 && echo 0 || echo 1)"
-ck "secondary: and jitter stays bounded (wait 1 < 80s)" "$(sleep_below 0 80 && echo 0 || echo 1)"
+ck "secondary: the message NAMES THE KIND (a secondary limit, not a spent budget)" \
+   "$(has 'kind=secondary' "$(cat "$TMP/err-B")" && echo 0 || echo 1)"
+ck "secondary: the message names the reset it observed (unknown is `?`, never invented)" \
+   "$(grep -qE 'rate limit \(bucket=graphql kind=secondary reset=(\?|[0-9]+)\)' "$TMP/err-B" && echo 0 || echo 1)"
+ck "secondary: wait 1 is >= 2s (a burst, not an hourly reset)" "$(sleep_at_least 0 2 && echo 0 || echo 1)"
+ck "secondary: wait 2 is >= 4s (doubling)" "$(sleep_at_least 1 4 && echo 0 || echo 1)"
+ck "secondary: wait 3 is >= 8s (doubling)" "$(sleep_at_least 2 8 && echo 0 || echo 1)"
+ck "secondary: and jitter stays bounded (wait 1 < 3.1s)" "$(sleep_below 0 3.1 && echo 0 || echo 1)"
+ck "secondary: the whole curve stays under the primary floor (no 60s wait on a burst)" \
+   "$(sleep_below 2 30 && echo 0 || echo 1)"
 ck "secondary: the limit is RECORDED for the caller's cycle, with a bucket and a reset" \
    "$(has 'bucket=graphql' "$(limit_record)" && echo 0 || echo 1)"
+ck "secondary: the record CARRIES the kind (the cycle line can name the remedy)" \
+   "$(has 'kind=secondary' "$(limit_record)" && echo 0 || echo 1)"
 ck "secondary: it also records the ATTEMPTS it spent" \
    "$(has 'attempts=4' "$(limit_record)" && echo 0 || echo 1)"
 ck "secondary: RETRY announcements do NOT touch the caller's stderr (it is parsed by callers)" \
    "$([ "$(grep -c 'rate limit (' "$TMP/err-B")" -eq 1 ] && echo 0 || echo 1)"
+ck "secondary: it spends NO /rate_limit probe (one more request during a burst is the burst)" \
+   "$(! grep -q 'rate_limit' "$STUB_LOG" 2>/dev/null && echo 0 || echo 1)"
 
 # ── C. A reset beyond the in-call bound: fail FAST, do not hold the box for an hour ────────────
 reset_env far-reset
@@ -378,7 +399,11 @@ run_helper api graphql -f query='{viewer{login}}' >/dev/null 2>&1
 ck "mutative: a GraphQL QUERY is not paced (its -f is the payload, not a mutation)" \
    "$([ -z "$(sleeps)" ] && echo 0 || echo 1)"
 
-# ── G. SINGLE FLIGHT: N concurrent callers, at most 1 gh call in flight ────────────────────────
+# ── G. THE CLIENT BUDGET: N concurrent callers, and the waiters QUEUE ──────────────────────────
+# ⛔ THE MEASURED INCIDENT (#1910): 17 concurrent `gh` clients on one box while the counters read
+# healthy, and `API rate limit already exceeded for user ID …` on the calls that lost the race. The
+# budget is the fix, so the measurement is the assertion: NEVER more than N in flight, and the
+# budget is actually USED (a mutex masquerading as a budget would fail the `-ge 2` half).
 reset_env converge
 : >"$STUB_LOG"
 for i in 1 2 3 4 5 6 7 8; do ( "$TMP/stub-gh" >/dev/null 2>&1 ) & done
@@ -389,26 +414,178 @@ for i in 1 2 3 4 5 6 7 8; do
   ( python3 "$HELPER" --real-gh "$TMP/stub-gh" -- api repos/o/r >/dev/null 2>&1 ) &
 done
 wait
-ck "single flight: 8 concurrent callers never exceed 1 in flight" "$([ "$(max_inflight)" -eq 1 ] && echo 0 || echo 1)"
-ck "single flight: all 8 still ran (serialised, not dropped)" \
+ck "client budget: 8 concurrent callers never exceed the default budget of 2 in flight" \
+   "$([ "$(max_inflight)" -le 2 ] && echo 0 || echo 1)"
+ck "client budget: … and the budget is USED, not silently reduced to 1 (a mutex would report 1)" \
+   "$([ "$(max_inflight)" -eq 2 ] && echo 0 || echo 1)"
+ck "client budget: all 8 still ran (queued, not dropped)" \
    "$([ "$(grep -c '^start|' "$STUB_LOG")" -eq 8 ] && echo 0 || echo 1)"
 
+# The budget is a knob with a REAL strict setting: one client, exactly as before.
+reset_env strict
+: >"$STUB_LOG"
+for i in 1 2 3 4; do
+  ( GH_LIMIT_MAX_CONCURRENCY=1 GH_LIMIT_SCENARIO=converge python3 "$HELPER" --real-gh "$TMP/stub-gh" \
+      -- api repos/o/r >/dev/null 2>&1 ) &
+done
+wait
+ck "client budget: GH_LIMIT_MAX_CONCURRENCY=1 is honoured (the strictest setting still works)" \
+   "$([ "$(max_inflight)" -eq 1 ] && echo 0 || echo 1)"
+
+# ⛔ AN EXHAUSTED BUDGET IS A REFUSAL, NEVER A LICENCE TO BURST. This is the exact defect: the old
+# layer waited for its lock, then ran the call UNSERIALISED — the busiest box answered by bursting
+# harder. Hold every slot and prove the caller is REFUSED (non-zero, no gh invocation at all).
+reset_env queuefull
+python3 - "$GH_LIMIT_DIR" <<'PY' &
+import fcntl, os, sys, time
+held = []
+for i in range(2):
+    # ⛔ KEEP EVERY FD: rebinding one name let Python GC-close slot 0, so the "full budget" was
+    # really a one-slot budget and the assertion below passed for the wrong reason.
+    fh = open(os.path.join(sys.argv[1], "gh.slot.%d" % i), "w")
+    fcntl.flock(fh, fcntl.LOCK_EX)
+    held.append(fh)
+time.sleep(20)
+PY
+_qholder=$!
+sleep 0.4
+: >"$STUB_LOG"
+_t0=$(date +%s)
+qout="$(GH_LIMIT_LOCK_TIMEOUT=1 run_helper api repos/o/r 2>"$TMP/err-Q")"; qrc=$?
+_el=$(( $(date +%s) - _t0 ))
+kill "$_qholder" 2>/dev/null; wait "$_qholder" 2>/dev/null
+ck "client budget: a full budget + a bounded wait REFUSES (rc=75, not a burst) " \
+   "$([ "$qrc" -eq 75 ] && echo 0 || echo 1)"
+ck "client budget: … within the budget (${_el}s, not for ever)" "$([ "$_el" -le 6 ] && echo 0 || echo 1)"
+ck "client budget: … and it issued NO gh request (the burst is what it refused to join)" \
+   "$([ "$(calls)" -eq 0 ] && echo 0 || echo 1)"
+ck "client budget: … the refusal is LOUD and names the budget, not GitHub" \
+   "$(has 'client budget exhausted' "$(cat "$TMP/err-Q")" && has 'REFUSAL' "$(cat "$TMP/err-Q")" && echo 0 || echo 1)"
+ck "client budget: … and it is RECORDED for the cycle line (a local refusal is not a rate limit)" \
+   "$(has 'waited=' "$(cat "$GH_LIMIT_DIR/last-busy" 2>/dev/null)" && echo 0 || echo 1)"
+
 # The PROBE is the one gh request this layer issues outside an attempt (it runs while the caller is
-# in backoff, when the rest of the box is busiest). It must be serialised too.
+# in backoff, when the rest of the box is busiest). It must obey the budget too.
 reset_env limited
 : >"$STUB_LOG"
 for i in 1 2 3 4; do
   ( python3 "$HELPER" --real-gh "$TMP/stub-gh" -- api repos/o/r >/dev/null 2>&1 ) &
 done
 wait
-ck "single flight: the /rate_limit PROBE is serialised too (it runs outside the attempt lock)" \
-   "$([ "$(max_inflight)" -eq 1 ] && echo 0 || echo 1)"
-ck "single flight: … and that measurement really saw the probe (each caller's retries ran)" \
+ck "client budget: the /rate_limit PROBE obeys the budget too (it runs outside the attempt slot)" \
+   "$([ "$(max_inflight)" -le 2 ] && echo 0 || echo 1)"
+ck "client budget: … and that measurement really ran the callers' retries" \
    "$([ "$(grep -c '^start|' "$STUB_LOG")" -gt 4 ] && echo 0 || echo 1)"
 
-# ── H. Re-entrancy: a gh child that re-enters must not deadlock on the box lock ────────────────
+# ── H. Re-entrancy: a gh child that re-enters must not deadlock on the box budget ─────────────
+# ── G2. ONE READER PER BOX: the TTL snapshot (#1910) ─────────────────────────────────────────
+# ⛔ TEN CALLERS ASKING ONE QUESTION IS TEN REQUESTS, i.e. a burst by construction. The snapshot is
+# the fix, so each property is asserted: a repeat within the TTL costs nothing, the TTL EXPIRES
+# (it is a cache, not a frozen board), a different question is a different entry, a MUTATION is
+# never cached, and a FAILURE is replayed as a failure — never as an empty answer.
+run_snap() { GH_LIMIT_SNAPSHOT=1 python3 "$HELPER" --real-gh "$TMP/stub-gh" -- "$@"; }
+reset_env snapshot
+c1="$(run_snap api repos/o/r/pulls 2>/dev/null)"
+c2="$(run_snap api repos/o/r/pulls 2>/dev/null)"
+ck "snapshot: a repeated collection read within the TTL costs ONE request" \
+   "$([ "$(calls)" -eq 1 ] && echo 0 || echo 1)"
+ck "snapshot: … and the second caller gets the SAME bytes (not an empty answer)" \
+   "$([ -n "$c1" ] && [ "$c1" = "$c2" ] && echo 0 || echo 1)"
+run_snap api repos/o/r/issues >/dev/null 2>&1
+ck "snapshot: a DIFFERENT question is a DIFFERENT entry (no cross-path replay)" \
+   "$([ "$(calls)" -eq 2 ] && echo 0 || echo 1)"
+# Past the TTL the read is issued again: the snapshot must not become a permanent board.
+"$TMP/fake-sleep" 200 >/dev/null 2>&1
+run_snap api repos/o/r/pulls >/dev/null 2>&1
+ck "snapshot: past the TTL the read is ISSUED AGAIN (a snapshot is not a frozen board)" \
+   "$([ "$(calls)" -eq 3 ] && echo 0 || echo 1)"
+reset_env snapmut
+run_snap api -X POST repos/o/r/issues -f title=x >/dev/null 2>&1
+run_snap api -X POST repos/o/r/issues -f title=x >/dev/null 2>&1
+ck "snapshot: a MUTATION is never served from the snapshot (no side effect skipped)" \
+   "$([ "$(calls)" -eq 2 ] && echo 0 || echo 1)"
+reset_env snapfail
+export GH_LIMIT_SCENARIO=notfound
+run_snap api repos/o/r/pulls/9 >"$TMP/sf-out1" 2>"$TMP/sf-err1"; _s1=$?
+run_snap api repos/o/r/pulls/9 >"$TMP/sf-out2" 2>"$TMP/sf-err2"; _s2=$?
+ck "snapshot: a FAILURE is replayed AS a failure (rc + stderr intact, never cached as data)" \
+   "$([ "$_s1" -ne 0 ] && [ "$_s2" -ne 0 ] && [ -s "$TMP/sf-err2" ] && echo 0 || echo 1)"
+unset GH_LIMIT_SCENARIO
+# ⛔ AND THE STAMPEDE IS THE POINT: six callers that arrive together must collapse to ONE request.
+reset_env snapsf
+for i in 1 2 3 4 5 6; do
+  ( GH_LIMIT_SNAPSHOT=1 GH_LIMIT_SCENARIO=converge python3 "$HELPER" --real-gh "$TMP/stub-gh" \
+      -- api repos/o/r/pulls >"$TMP/sf-snap-$i.out" 2>/dev/null ) &
+done
+wait
+ck "snapshot: 6 simultaneous callers of the SAME question collapse to ONE request [$(calls)]" \
+   "$([ "$(calls)" -eq 1 ] && echo 0 || echo 1)"
+_all=""; _ok=1
+for i in 1 2 3 4 5 6; do
+  _b="$(cat "$TMP/sf-snap-$i.out" 2>/dev/null)"
+  [ -n "$_b" ] || _ok=0
+  [ -z "$_all" ] && _all="$_b"
+  [ "$_b" = "$_all" ] || _ok=0
+done
+ck "snapshot: … and EVERY one of them still received the answer" "$([ "$_ok" -eq 1 ] && echo 0 || echo 1)"
+
+# ── G3. The `[cap]` gh HEALTH line: the CLIENT COUNT, not a healthy counter ─────────────────────
+# ⛔ `gh api rate_limit` answered "1599/5000, everything is fine" while the fleet was refused
+# (#1910). The line an operator reads must report the thing that caused it: how many clients this
+# box is running, how deep the queue is, and what the last refusal WAS.
+reset_env statusidle
+st="$(GH_LIMIT_DIR="$GH_LIMIT_DIR" python3 "$HELPER" --status 2>/dev/null)"
+ck "status: reports the CLIENT COUNT on an idle box (clients=0/2)" \
+   "$(has 'clients=0/2' "$st" && echo 0 || echo 1)"
+ck "status: reports the queue depth and says NO limit explicitly (not a blank)" \
+   "$(has 'waiters=0' "$st" && has 'last=none' "$st" && echo 0 || echo 1)"
+python3 - "$GH_LIMIT_DIR" <<'SLOTHLD' &
+import fcntl, os, sys, time
+fh = open(os.path.join(sys.argv[1], "gh.slot.0"), "w")
+fcntl.flock(fh, fcntl.LOCK_EX)
+time.sleep(6)
+SLOTHLD
+_slotpid=$!
+sleep 0.4
+st1="$(GH_LIMIT_DIR="$GH_LIMIT_DIR" python3 "$HELPER" --status 2>/dev/null)"
+kill "$_slotpid" 2>/dev/null; wait "$_slotpid" 2>/dev/null
+ck "status: the count is LIVE — 1/2 while a client is in flight [${st1}]" \
+   "$(has 'clients=1/2' "$st1" && echo 0 || echo 1)"
+# The last refusal's KIND is on the line: a secondary refusal is not a spent budget.
+reset_env statlim
+GH_LIMIT_NO_WAIT=1 GH_LIMIT_SCENARIO=limited run_helper api graphql -f query='{viewer{login}}' >/dev/null 2>&1 || true
+st2="$(GH_LIMIT_DIR="$GH_LIMIT_DIR" python3 "$HELPER" --status 2>/dev/null)"
+ck "status: names the LAST refusal's kind — a SECONDARY limit, not a spent budget [${st2}]" \
+   "$(has 'last=secondary(' "$st2" && echo 0 || echo 1)"
+# ⛔ THE WIRING, AND THAT IT IS MEASURED BEFORE THE LINE PRINTS. A token computed after the echo is
+# the previous cycle's reading on every line but the first (the bug this file documents).
+awk '/^gh_health_token\(\) \{/{f=1} f{print} f&&/^}$/{exit}' "$HERE/orch-loop.sh" > "$TMP/ghh.sh"
+ck "cap: gh_health_token is extractable from orch-loop.sh" \
+   "$([ -s "$TMP/ghh.sh" ] && grep -q 'gh-limit.py' "$TMP/ghh.sh" && echo 0 || echo 1)"
+grep -q 'GHH="$(gh_health_token)"' "$HERE/orch-loop.sh" \
+  && grep -q 'fix_slots=${MF:-?}${GHH:+ $GHH}' "$HERE/orch-loop.sh" \
+  && _capwired=0 || _capwired=1
+ck "cap: the [cap] line CARRIES the token, and the token is measured BEFORE the line" "$_capwired"
+reset_env capdrv
+capline="$( O="$HERE" GH_LIMIT_DIR="$GH_LIMIT_DIR" bash -c '. "$1"; gh_health_token' _ "$TMP/ghh.sh" )"
+ck "cap: the extracted token shows the CLIENT COUNT [${capline}]" \
+   "$(grep -qE 'gh=clients=[0-9]+/[0-9]+ waiters=[0-9]+' <<<"$capline" && echo 0 || echo 1)"
+
+# ── G4. RETRY FIRST: the measured 2-second burst must not be reported as data ──────────────────
+# Measured 2026-10-19: `API rate limit already exceeded` on the fleet WHILE a single REST call
+# answered in 0.43 s with the quota untouched. So a refusal followed by success is the NORMAL case,
+# and giving up on the first one is what turned it into an empty queue.
+reset_env secondaryonce
+out="$(GH_LIMIT_SCENARIO=secondaryonce run_helper api repos/o/r 2>"$TMP/err-G4")"; rc=$?
+ck "secondary: a refusal followed by success is RETRIED and answers (rc=0, data present)" \
+   "$([ "$rc" -eq 0 ] && has '"state":"OPEN"' "$out" && echo 0 || echo 1)"
+ck "secondary: … after exactly one jittered wait >= 2s (no 60s outage for a burst)" \
+   "$([ "$(calls)" -eq 2 ] && sleep_at_least 0 2 && sleep_below 0 3.1 && echo 0 || echo 1)"
+ck "secondary: … and NOTHING is written to the caller's stderr on a call that recovered" \
+   "$([ ! -s "$TMP/err-G4" ] && echo 0 || echo 1)"
+
 reset_env reentrant
-python3 - "$GH_LIMIT_DIR/gh.lock" <<'PY' &
+python3 - "$GH_LIMIT_DIR/gh.slot.0" <<'PY' &
 import fcntl, sys, time
 fh = open(sys.argv[1], "w")
 fcntl.flock(fh, fcntl.LOCK_EX)
@@ -581,8 +758,8 @@ out="$(TMPDIR="$TMP/tmpdir" GH_LIMIT_DIR="$TMP/blocker/sub" \
 _fb="$TMP/tmpdir/gh-limit-$(id -u)"
 ck "state dir: an unusable primary does not fail the call (rc=0, real answer)" \
    "$([ "$rc" -eq 0 ] && has '"ok":true' "$out" && echo 0 || echo 1)"
-ck "state dir: … the fallback is SHARED per user (a lock exists there, not a per-process temp dir)" \
-   "$([ -f "$_fb/gh.lock" ] && echo 0 || echo 1)"
+ck "state dir: … the fallback is SHARED per user (a slot file exists there, not a per-process temp dir)" \
+   "$([ -f "$_fb/gh.slot.0" ] && echo 0 || echo 1)"
 ck "state dir: … and the degradation is RECORDED (an operator can find out the layer is degraded)" \
    "$(has 'primary state dir unusable' "$(cat "$_fb/events.log" 2>/dev/null)" && echo 0 || echo 1)"
 
@@ -624,7 +801,7 @@ n="$(date +%s)"
 printf 'at=%s bucket=graphql reset=%s attempts=4 waited=420 status=403\n' "$n" "$(( n + 600 ))" > "$GH_LIMIT_DIR/last-limit"
 tok="$(GH_LIMIT_DIR="$GH_LIMIT_DIR" HOME="$TMP/home" "$(command -v bash)" "$TMP/token.sh")"
 ck "heartbeat: a LIMITED cycle reports bucket + reset (not a bare UNREADABLE)" \
-   "$(has 'gh=rate_limited(bucket=graphql reset=' "$tok" && echo 0 || echo 1)"
+   "$(has 'gh=rate_limited(kind=primary bucket=graphql reset=' "$tok" && echo 0 || echo 1)"
 ck "heartbeat: … and it carries the age, so a frozen value cannot pass as a fresh one" \
    "$(grep -qE ' [0-9]+s\)$' <<<"$tok" && echo 0 || echo 1)"
 printf 'at=%s bucket=graphql reset=%s attempts=4 waited=420 status=403\n' "$(( n - 1000 ))" "$(( n + 600 ))" > "$GH_LIMIT_DIR/last-limit"
@@ -676,13 +853,31 @@ ck "knobs: an over-range BASE_WAIT is CLAMPED to the documented bound, not honou
 # limit and returns at once — and the words must carry "rate limit", which is what objective.py's
 # TRANSPORT_MARKERS match to produce VERDICT=GH-RATE-LIMITED.
 reset_env nowait
+# ⛔ A SECONDARY REFUSAL IS RETRIED EVEN INSIDE THE CALLER'S OWN BOUND (#1910). It is a burst that
+# clears in seconds; returning at the FIRST refusal is how a 2 s hiccup became `queue=UNREADABLE`
+# while the very next call answered. The retry is bounded by SECONDARY_NO_WAIT_S.
 out="$(GH_LIMIT_NO_WAIT=1 GH_LIMIT_SCENARIO=limited run_helper api graphql -f query='{viewer{login}}' 2>"$TMP/err-nw")"; rc=$?
-ck "NO_WAIT: the call returns AT ONCE with the bucket named (it never sleeps in-process)" \
-   "$([ "$rc" -ne 0 ] && [ -z "$(sleeps)" ] && has 'bucket=graphql' "$(cat "$TMP/err-nw")" && echo 0 || echo 1)"
+ck "NO_WAIT: a SECONDARY refusal is retried first (bounded, jittered) before it is reported" \
+   "$([ "$(calls)" -ge 2 ] && [ -n "$(sleeps)" ] && echo 0 || echo 1)"
+ck "NO_WAIT: … and the retries stay inside the caller's own budget (<= 8s total)" \
+   "$(python3 -c 'import sys
+sys.exit(0 if sum(float(x) for x in sys.argv[1].split()) <= 8.01 else 1)' "$(sleeps)" && echo 0 || echo 1)"
+ck "NO_WAIT: … and the call still RETURNS (never a silent success, never an empty answer)" \
+   "$([ "$rc" -ne 0 ] && ! has '"ok":true' "$out" && echo 0 || echo 1)"
+ck "NO_WAIT: … with the bucket named once it gives up" \
+   "$(has 'bucket=graphql' "$(cat "$TMP/err-nw")" && echo 0 || echo 1)"
 ck "NO_WAIT: and the failure says 'rate limit', the token objective.py's classifier looks for" \
    "$(has 'rate limit' "$(cat "$TMP/err-nw")" && echo 0 || echo 1)"
 ck "NO_WAIT: the limit is still RECORDED for the heartbeat (it is not hidden by returning early)" \
    "$(has 'bucket=graphql' "$(cat "$GH_LIMIT_DIR/last-limit")" && echo 0 || echo 1)"
+# ⛔ A PRIMARY refusal is NOT retried under NO_WAIT: its documented remedy is a 60 s+ reset, which
+# outlives the caller. The distinction is the whole point of classifying the two.
+reset_env nowaitprimary
+GH_LIMIT_NO_WAIT=1 GH_LIMIT_SCENARIO=limitedout run_helper api repos/o/r 2>"$TMP/err-nwp"; prc=$?
+ck "NO_WAIT: a PRIMARY refusal returns AT ONCE (it never sleeps in-process)" \
+   "$([ "$prc" -ne 0 ] && [ -z "$(sleeps)" ] && echo 0 || echo 1)"
+ck "NO_WAIT: … and names the kind (primary) so the remedy is legible" \
+   "$(has 'kind=primary' "$(cat "$TMP/err-nwp")" && echo 0 || echo 1)"
 
 # ⛔ K4. A RECOVERED LIMIT IS NOT A CURRENT ONE. Without the recovery mark, one refused call kept the
 # heartbeat asserting `gh=rate_limited(…)` for 15 minutes while the same line showed a healthy queue
@@ -697,14 +892,18 @@ tok="$(GH_LIMIT_DIR="$GH_LIMIT_DIR" HOME="$TMP/home" "$(command -v bash)" "$TMP/
 ck "recovery: and the heartbeat says recovered, not rate_limited, for a limit already read past" \
    "$(has 'gh=recovered(bucket=core' "$tok" && ! has 'rate_limited' "$tok" && echo 0 || echo 1)"
 
-# ⛔ K5. AN UNUSABLE LOCK MUST NOT BE A SILENT UNSERIALISATION. A `gh.lock` that cannot be opened (an
-# fd-exhausted box, a /tmp fallback owned by another uid) left the box fully unserialised with
-# nothing in events.log and a heartbeat reporting a healthy serialised box.
+# ⛔ K5. AN UNUSABLE BUDGET MUST NOT BE A SILENT BURST. A slot file that cannot be opened (an
+# fd-exhausted box, a /tmp fallback owned by another uid) used to leave the box fully unserialised
+# with a note in events.log and a heartbeat reporting a healthy box; now it is REFUSED, because the
+# alternative is the unbounded parallel calls this budget exists to prevent.
 reset_env lockbroken
-mkdir -p "$GH_LIMIT_DIR/gh.lock"
-GH_LIMIT_DIR="$GH_LIMIT_DIR" python3 "$HELPER" --real-gh "$TMP/stub-gh" -- api repos/o/r/pulls/1 >/dev/null 2>&1
-ck "lock: an unopenable gh.lock still runs the call AND records that it was UNSERIALISED" \
-   "$(has 'UNSERIALISED' "$(cat "$GH_LIMIT_DIR/events.log" 2>/dev/null)" && echo 0 || echo 1)"
+mkdir -p "$GH_LIMIT_DIR/gh.slot.0"
+GH_LIMIT_DIR="$GH_LIMIT_DIR" python3 "$HELPER" --real-gh "$TMP/stub-gh" -- api repos/o/r/pulls/1 >/dev/null 2>"$TMP/err-K5"
+_k5=$?
+ck "budget: an unusable slot REFUSES the call (rc=75) instead of running it unaccounted" \
+   "$([ "$_k5" -eq 75 ] && echo 0 || echo 1)"
+ck "budget: … and the refusal is in the evidence log (the box is not silently degraded)" \
+   "$(has 'refusing (client budget unavailable)' "$(cat "$GH_LIMIT_DIR/events.log" 2>/dev/null)" && echo 0 || echo 1)"
 
 # ── L. ROUND-3: marker in BOTH entry points, lock budget, bucket scoping, floors ──────────────
 # ⛔ L1. THE SENTINEL MUST BE IN BOTH ENTRY POINTS, and inside the window the resolvers read. A
@@ -729,14 +928,18 @@ m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m); print(m.GH_
 ck "resolvers: with BOTH dirs seeded the adapter (gh-rest) wins, matching every shell call site" \
    "$([ "$_ord" = "$TMP/cell2/gh-rest/gh" ] && echo 0 || echo 1)"
 
-# ⛔ L3. A BOUNDED CALLER MUST NOT DIE IN THE LOCK QUEUE. NO_WAIT bounds the BACKOFF; the lock wait
-# is the other wait the layer imposes, and 600 s of it outlives every bounded caller (the heartbeat's
-# 90 s refresh) — a rate-limit verdict became a silent timeout with no record at all.
+# ⛔ L3. A BOUNDED CALLER MUST NOT DIE IN THE QUEUE. NO_WAIT bounds the BACKOFF; the budget wait is
+# the other wait the layer imposes, and 600 s of it outlives every bounded caller (the heartbeat's
+# 90 s refresh) — a rate-limit verdict became a silent timeout with no record at all. The outcome is
+# now a NAMED refusal at the short budget, never an unbudgeted run over the client budget.
 reset_env nowaitlock
-python3 - "$GH_LIMIT_DIR/gh.lock" <<'HLD' &
-import fcntl, sys, time
-fd = open(sys.argv[1], "a+")
-fcntl.flock(fd, fcntl.LOCK_EX)
+python3 - "$GH_LIMIT_DIR" <<'HLD' &
+import fcntl, os, sys, time
+held = []
+for i in range(2):
+    fd = open(os.path.join(sys.argv[1], "gh.slot.%d" % i), "a+")
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    held.append(fd)      # ⛔ keep every fd: rebinding one name released the other slot (see G3)
 time.sleep(20)          # far beyond NO_WAIT_LOCK_S=5, so an unbudgeted wait CANNOT pass
 HLD
 _holder=$!
@@ -746,9 +949,9 @@ out="$(GH_LIMIT_NO_WAIT=1 GH_LIMIT_LOCK_TIMEOUT=600 run_helper api repos/o/r/pul
 _el=$(( $(date +%s) - _t0 ))
 wait "$_holder" 2>/dev/null || true
 ck "NO_WAIT: a held lock does not become a 600s queue behind a 90s caller (bounded lock budget)" \
-   "$([ "$_el" -le 10 ] && [ "$_rc" -eq 0 ] && has '"ok":true' "$out" && echo 0 || echo 1)"
-ck "NO_WAIT: … and the unserialised call is RECORDED, not silently overlapping" \
-   "$(has 'UNSERIALISED' "$(cat "$GH_LIMIT_DIR/events.log" 2>/dev/null)" && echo 0 || echo 1)"
+   "$([ "$_el" -le 10 ] && [ "$_rc" -eq 75 ] && echo 0 || echo 1)"
+ck "NO_WAIT: … the queued caller is REFUSED, not run unserialised over the budget" \
+   "$(! has '"ok":true' "$out" && has 'client budget exhausted' "$out" && echo 0 || echo 1)"
 
 # ⛔ L4. A `retry-after: 0` must not become four back-to-back requests. The floor is the docs' own
 # "wait at least one minute" reduced to the smallest honest gap; the cap still bounds the total.
@@ -835,9 +1038,9 @@ ck "NO_WAIT: every bounded caller sets it for the layer AND still imports [${_po
 # Measured, three concurrent processes: 1.014 s / 1.002 s gaps. Stamping outside the lock (or before
 # it) is what let a lock-holding competitor compress two mutations below the gap.
 _disp="$(sed -n '/^def dispatch(/,/^def run_attempt/p' "$HELPER")"
-_lock_at="$(printf '%s\n' "$_disp" | grep -n 'lock = acquire_lock()' | head -1 | cut -d: -f1)"
+_lock_at="$(printf '%s\n' "$_disp" | grep -n 'lock, slot = acquire_slot()' | head -1 | cut -d: -f1)"
 _mark_at="$(printf '%s\n' "$_disp" | grep -n 'mark_mutation()' | head -1 | cut -d: -f1)"
-ck "mutative: the send stamp is written AFTER the attempt lock, inside it (not at reservation time)" \
+ck "mutative: the send stamp is written AFTER the attempt slot, inside it (not at reservation time)" \
    "$([ -n "$_lock_at" ] && [ -n "$_mark_at" ] && [ "$_lock_at" -lt "$_mark_at" ] && echo 0 || echo 1)"
 
 # ⛔ L11. THE FLOORS ARE THE ISSUE'S REQUIREMENTS. A floor of 0 on the gap or the lock, or 1 s on the
@@ -882,7 +1085,14 @@ reset_env givup
 GH_LIMIT_SCENARIO=limited run_helper api graphql -f query='{viewer{login}}' >/dev/null 2>&1 || true
 _probes="$(grep -c 'rate_limit' "$STUB_LOG" 2>/dev/null || true)"
 _probes="${_probes:-0}"
-ck "probe: 4 refusals spend exactly 3 probes — the GIVE-UP attempt spends none [${_probes}]" \
+ck "probe: a SECONDARY refusal spends NO probe (one more request during a burst is the burst) [${_probes}]" \
+   "$([ "$_probes" -eq 0 ] && echo 0 || echo 1)"
+# …and the primary path still probes for the reset it needs, but never on the give-up attempt.
+reset_env givup
+GH_LIMIT_SCENARIO=limitedout run_helper api repos/o/r >/dev/null 2>&1 || true
+_probes="$(grep -c 'rate_limit' "$STUB_LOG" 2>/dev/null || true)"
+_probes="${_probes:-0}"
+ck "probe: 4 PRIMARY refusals spend exactly 3 probes — the GIVE-UP attempt spends none [${_probes}]" \
    "$([ "$_probes" -eq 3 ] && echo 0 || echo 1)"
 reset_env nowaitprobe
 GH_LIMIT_NO_WAIT=1 GH_LIMIT_SCENARIO=limited run_helper api graphql -f query='{viewer{login}}' >/dev/null 2>&1 || true
@@ -1069,7 +1279,7 @@ ck "etag reap: a LIVE writer's staging file survives, a DEAD one is collected" \
 # when the wait was the exponential backoff (no reset involved), so an operator debugging a box with a
 # raised cap was pointed at the wrong knob.
 reset_env limited
-GH_LIMIT_MAX_WAIT=1 run_helper api repos/o/r >/dev/null 2>"$TMP/err-why"; rc=$?
+GH_LIMIT_MAX_WAIT=1 GH_LIMIT_SCENARIO=limitedout run_helper api repos/o/r >/dev/null 2>"$TMP/err-why"; rc=$?
 ck "the in-call-bound failure names WHY it would have waited (backoff, not a reset)" \
    "$(has 'in-call bound' "$(cat "$TMP/err-why")" && has '(backoff' "$(cat "$TMP/err-why")" && echo 0 || echo 1)"
 
@@ -1107,9 +1317,9 @@ _ro="$TMP/state-ro-locked"; mkdir -p "$_ro"; chmod 500 "$_ro"
 mkdir -p "$TMP/tdir"
 roout="$(TMPDIR="$TMP/tdir" GH_LIMIT_DIR="$_ro" run_helper api repos/o/r/pulls/1 2>"$TMP/err-ro")"; rorc=$?
 chmod 700 "$_ro" 2>/dev/null || true
-ck "an unwritable state dir falls back to a stable per-user dir (still serialised, still recorded)" \
+ck "an unwritable state dir falls back to a stable per-user dir (still budgeted, still recorded)" \
    "$([ "$rorc" -eq 0 ] && has '"ok":true' "$roout" \
-      && [ -e "$TMP/tdir/gh-limit-$(id -u)/gh.lock" ] \
+      && [ -e "$TMP/tdir/gh-limit-$(id -u)/gh.slot.0" ] \
       && echo 0 || echo 1)"
 
 # ⛔ L32. THE PIN IS NOT A DIRECTORY — for ALL FIVE resolvers, not just ask-owner. Round 7 hardened

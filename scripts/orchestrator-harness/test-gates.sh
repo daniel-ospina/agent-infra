@@ -1564,20 +1564,33 @@ fi
 echo
 echo "=== the PR listing feeds the age bound end-to-end (the jq is DRIVEN) ==="
 # ⛔ THE ROW FORMAT IS WHAT MAKES CLAUSE (c) ANSWERABLE (review round 8, P1). The gh stub in every
-# other suite emits PRE-BAKED `n:sha:epoch` rows, so reverting the listing's `--json` field list to
-# `number,headRefOid` (rows become `n:sha:-`, the age unmeasurable, the gate free to release forever)
-# left all four suites green. Drive the SHIPPED jq program against real JSON.
-_JQ_PROG="$(grep -o -- "--jq '[^']*'" "$ORCH" | grep 'createdAt\|fromdateiso8601' | head -1 | sed "s/^--jq '//; s/'$//")"
+# other suite emits PRE-BAKED `n:sha:epoch` rows, so reverting the listing's field list — rows become
+# `n:sha:-`, the age unmeasurable, the gate free to release forever — left all four suites green.
+# Drive the SHIPPED jq program against real JSON.
+# ⛔ AND SINCE #1910 THE LISTING IS REST (`gh api --paginate --slurp`), NOT GraphQL `gh pr list`:
+# the controller's per-cycle read was the hottest GraphQL call on the box, and GraphQL is the pool
+# the secondary limit refused. The FIXTURES therefore have REST shape (`head.sha`, `created_at`) and
+# are PAGE-ARRAYS (`--slurp`), and the assertion also pins the transport so a revert to GraphQL is a
+# red test rather than a silent regression.
+_JQ_PROG="$(grep -o -- "--jq '[^']*'" "$ORCH" | grep 'created_at|fromdateiso8601' | head -1 | sed "s/^--jq '//; s/'$//")"
 if [ -n "$_JQ_PROG" ] && command -v jq >/dev/null 2>&1; then
   eqv "the shipped --jq emits number:headOid:epoch for a normal row" "1 7:abc:1761307200" \
-      "$(printf '%s' '[{"number":7,"headRefOid":"abc","createdAt":"2025-10-24T12:00:00Z"}]' | jq -r "$_JQ_PROG")"
-  eqv "…emits '-' for a MISSING createdAt (unreadable age, never a fabricated epoch)" "1 7:abc:-" \
-      "$(printf '%s' '[{"number":7,"headRefOid":"abc"}]' | jq -r "$_JQ_PROG")"
-  eqv "…and ONE malformed createdAt degrades THAT row, not the whole listing (no failed read)" "2 7:abc:- 8:def:1761307200" \
-      "$(printf '%s' '[{"number":7,"headRefOid":"abc","createdAt":"2025-10-24T12:00:00.5Z"},{"number":8,"headRefOid":"def","createdAt":"2025-10-24T12:00:00Z"}]' | jq -r "$_JQ_PROG")"
+      "$(printf '%s' '[[{"number":7,"head":{"sha":"abc"},"created_at":"2025-10-24T12:00:00Z"}]]' | jq -r "$_JQ_PROG")"
+  eqv "…emits '-' for a MISSING created_at (unreadable age, never a fabricated epoch)" "1 7:abc:-" \
+      "$(printf '%s' '[[{"number":7,"head":{"sha":"abc"}}]]' | jq -r "$_JQ_PROG")"
+  eqv "…and ONE malformed created_at degrades THAT row, not the whole listing (no failed read)" "2 7:abc:- 8:def:1761307200" \
+      "$(printf '%s' '[[{"number":7,"head":{"sha":"abc"},"created_at":"2025-10-24T12:00:00.5Z"},{"number":8,"head":{"sha":"def"},"created_at":"2025-10-24T12:00:00Z"}]]' | jq -r "$_JQ_PROG")"
+  # Several pages must still be ONE line: `--slurp` is what keeps the count+rows contract intact.
+  eqv "…across TWO pages, the projection is still ONE `count rows…` line" "2 7:abc:1761307200 8:def:1761307200" \
+      "$(printf '%s' '[[{"number":7,"head":{"sha":"abc"},"created_at":"2025-10-24T12:00:00Z"}],[{"number":8,"head":{"sha":"def"},"created_at":"2025-10-24T12:00:00Z"}]]' | jq -r "$_JQ_PROG")"
+  if grep -q 'repos/\$OR/pulls?state=open&per_page=100' "$ORCH" && grep -q 'GH_LIMIT_SNAPSHOT=1 gh api --paginate --slurp' "$ORCH"; then
+    echo "  ok the PR listing is REST + --paginate --slurp and opts into the box snapshot (#1910)"; PASS=$((PASS+1))
+  else
+    echo "  FAIL the PR listing is not the REST+slurp+snapshot shape — the hot path went back to GraphQL"; FAIL=$((FAIL+1))
+  fi
   case "$(grep -o -- '--json number,headRefOid[,a-zA-Z]*' "$ORCH" | head -1)" in
-    *createdAt*) echo "  ok the PR listing ASKS for createdAt in the same read (no second, drifting snapshot)"; PASS=$((PASS+1)) ;;
-    *) echo "  FAIL the PR listing does not request createdAt — the age bound is unanswerable"; FAIL=$((FAIL+1)) ;;
+    *createdAt*) echo "  FAIL the PR listing went BACK to GraphQL `gh pr list` — the transport this change moved off"; FAIL=$((FAIL+1)) ;;
+    *) echo "  ok the PR listing is not GraphQL `gh pr list` (the counterfactual: a revert reddens this)"; PASS=$((PASS+1)) ;;
   esac
 else
   echo "  FAIL the shipped --jq (or jq itself) is unavailable — the age bound's input is unverifiable"; FAIL=$((FAIL+1))

@@ -694,7 +694,7 @@ dispatch_funnel() { # <dispatched_count> <queue_token> [<held_reason>] [<now_epo
 # revalidated" failure, applied to the fix that reports it.
 GH_LIMIT_STALE_S=900
 gh_limit_token() {  # -> "gh=rate_limited(…)" | "gh=recovered(…)" | EMPTY
-  local f rec kv at="" bucket="" reset="" rec_at="" now age
+  local f rec kv at="" bucket="" reset="" rec_at="" now age kind=""
   f="${GH_LIMIT_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/gh-limit}/last-limit"
   [ -f "$f" ] || return 0
   rec="$(cat "$f" 2>/dev/null)" || return 0
@@ -706,6 +706,7 @@ gh_limit_token() {  # -> "gh=rate_limited(…)" | "gh=recovered(…)" | EMPTY
       bucket=*)    bucket="${kv#bucket=}" ;;
       reset=*)     reset="${kv#reset=}" ;;
       recovered=*) rec_at="${kv#recovered=}" ;;
+      kind=*)      kind="${kv#kind=}" ;;
     esac
   done
   is_num "${at:-}" || return 0
@@ -721,7 +722,28 @@ gh_limit_token() {  # -> "gh=rate_limited(…)" | "gh=recovered(…)" | EMPTY
     printf 'gh=recovered(bucket=%s %ss)' "${bucket:-?}" "$age"
     return 0
   fi
-  printf 'gh=rate_limited(bucket=%s reset=%s %ss)' "${bucket:-?}" "$reset" "$age"
+  # ⛔ `secondary` IS NOT `rate_limited`. A secondary refusal happens while BOTH primary counters
+  # read healthy (measured 2026-10-19: core 1599/5000, graphql 4612/5000, one REST call in 0.43 s),
+  # so an operator who reads only "rate limit" raises a budget that was never spent instead of pacing
+  # the clients. The kind is in the token so the remedy is legible on the line itself.
+  [ "$kind" = "secondary" ] && kind="secondary" || kind="primary"
+  printf 'gh=rate_limited(kind=%s bucket=%s reset=%s %ss)' "$kind" "${bucket:-?}" "$reset" "$age"
+}
+
+# ── the box's gh CLIENT health (#1910) ──────────────────────────────────────────────────────────
+# `gh_limit_token` answers "was this box refused, and on which bucket". It cannot answer the question
+# that actually explained the 2026-10-19 outage — "how many gh clients is this box running?" — and
+# neither can `gh api rate_limit`, whose counters read healthy while the SECONDARY limit refused
+# every call. The layer already enforces that budget; `--status` reports the count it enforces, the
+# queue depth, and the last refusal's KIND, without touching the network.
+gh_health_token() {  # -> "gh=clients=<n>/<max> waiters=<n> last=…" | EMPTY when the layer is absent
+  [ -n "${O:-}" ] || return 0
+  local h="$O/gh-limit.py"
+  # In the repo the helper sits beside this file; on a cell it is seeded INTO `$O` by install.sh.
+  [ -f "$h" ] || h="${O%/}/../gh-limit.py"
+  [ -f "$h" ] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+  python3 "$h" --status 2>/dev/null || true
 }
 # Exact session-name test. `tmux has-session -t <name>` prefix-matches, so a guard for PR #82
 # would report "in flight" because `fix-820` exists — starving #82 while that worker lives.
@@ -1246,9 +1268,19 @@ open_pr_count() { # -> echoes the open-PR count; never 0 on failure; writes stat
   # (review round 8): without it ONE malformed value (a fractional second, a non-Z zone) makes the
   # whole `--jq` fail, `gh` exits non-zero, the listing is discarded as FAILED, and the gate goes
   # inert — releasing every cycle — for as long as that row exists.
-  if raw="$(gh pr list --repo "$OR" --state open --limit 300 \
-             --json number,headRefOid,createdAt \
-             --jq '"\(length) \(map("\(.number):\(.headRefOid):\(try (.createdAt|fromdateiso8601) catch "-")") | join(" "))"' \
+  # ⛔ THE LISTING IS REST, NOT GraphQL (agent-infra#1910). `gh pr list --json …` is GraphQL, and
+  # this is the controller's PER-CYCLE read — the hottest read on the box and one of the burst
+  # sources the secondary limit reacts to. REST has the same three facts (`number`, `head.sha`,
+  # `created_at`) on a SEPARATE bucket, which is the transport the sweep listing already moved to.
+  # `--paginate --slurp` assembles every page into ONE array so the projection still emits a SINGLE
+  # line — the shape every consumer below (and test-gates.sh) pins. `--slurp` also removes the old
+  # `--limit 300` ceiling: a count that silently truncated at 300 would under-drive the scope gate.
+  # ⛔ AND IT OPTS INTO THE BOX'S SNAPSHOT (`GH_LIMIT_SNAPSHOT=1`): lanes, the controller and the
+  # refresh pass all ask this same collection question, so one fetch per TTL serves all of them
+  # instead of one request each.
+  if raw="$(GH_LIMIT_SNAPSHOT=1 gh api --paginate --slurp \
+             --jq '"\(add|length) \((add|map("\(.number):\(.head.sha):\(try (.created_at|fromdateiso8601) catch "-")")) | join(" "))"' \
+             "repos/$OR/pulls?state=open&per_page=100" \
              2>"$O/state/.open-err.$$")"; then
     rc=0
   else
@@ -2087,7 +2119,13 @@ PY
   # `@${OR}` is part of this line on purpose: the repo the count came from is the datum whose absence
   # let a wrong-surface read run for hours. bare `$OR` is avoided for the same reason `${OR:-}` is used
   # below — selftest.sh extracts and drives parts of this file in a subshell with no OR.
-  echo "[cap] load=$L/$MAX_LOAD lanes=$LANES/$MAX_LANES mem_avail=${MEMAVAIL_MB}M/${MIN_MEM_FREE_MB}M swap_free=${SWFREE}M/${MIN_SWAP_FREE}M open=${OPEN_N:-?}@${OR:-?} unowned=${UPN:-?} youngest_unowned=${YOUNG_AGE:-?}m last_land=${LAND_AGE:-?}m blocked_since=${BLOCKED_SINCE:-none} review_slots=${MR:-?} fix_slots=${MF:-?}" >> "$LOG"
+  # ⛔ THE gh HEALTH IS MEASURED HERE, ONCE, BEFORE THE LINE THAT PRINTS IT — the same discipline the
+  # merge-priority evidence above follows (measured after it, the line prints `?` on the first cycle
+  # and the previous cycle's reading on every one after). It answers "how many gh clients is this box
+  # running, and was it refused" — the question `gh api rate_limit` cannot answer and got wrong
+  # (its counters read healthy while the SECONDARY limit refused every call).
+  GHH="$(gh_health_token)"
+  echo "[cap] load=$L/$MAX_LOAD lanes=$LANES/$MAX_LANES mem_avail=${MEMAVAIL_MB}M/${MIN_MEM_FREE_MB}M swap_free=${SWFREE}M/${MIN_SWAP_FREE}M open=${OPEN_N:-?}@${OR:-?} unowned=${UPN:-?} youngest_unowned=${YOUNG_AGE:-?}m last_land=${LAND_AGE:-?}m blocked_since=${BLOCKED_SINCE:-none} review_slots=${MR:-?} fix_slots=${MF:-?}${GHH:+ $GHH}" >> "$LOG"
   # Four gates. swap_total=0 => swap uninitialised (fresh boot), NOT pressure — allow.
   # Name the binding gate: an earlier version logged "skipped (load=…)" while load was never
   # consulted, so a lanes-bound or swap-bound stall looked like a load stall.
