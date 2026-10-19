@@ -86,7 +86,7 @@
 #      below the review window it must outlive — a mid-review expiry, the duplicate this registry
 #      exists to prevent — and leaves nothing to diagnose.
 # ⛔ LABELLING HONESTY — MEASURED, not asserted. `CLAIMS_SH=<git archive HEAD>:claims.sh bash
-# claim-orphan.test.sh` (2026-10-18, against the pre-change claims.sh) reports 52 passed, 45 FAILED.
+# claim-orphan.test.sh` (2026-10-18, against the pre-change claims.sh) reports 52 passed, 46 FAILED.
 # Every [RED→GREEN] line is in that failing set, and so is exactly ONE line that carries no such label:
 # `O7 the PR keying declares a documented ceiling` (a pre-fix reader has no ceiling to declare). The
 # converse is what keeps the labels honest: a [PINNED] line must PASS pre-fix, because PINNED means
@@ -668,6 +668,24 @@ SW3="$(printf '%s' "$SEAMW2" | grep -c 'CLAIM_OWNER_HOST=')"
 [ "$SW3" = "1" ]
 SW3_RC=$?
 ck "O18 [RED→GREEN] it fires ONCE per process through the SHIPPED mint path (two acquires, $SW3 warning(s))" $SW3_RC
+# ⛔ AND ONCE ACROSS RE-SOURCES (cycle-11 review). "Once per process" was really once per SOURCE: the
+# flag was a hard `=0` at file scope, and `orch-loop.sh` re-sources claims.sh INSIDE its main loop, so
+# the controller warned once per cycle (~2 min) forever — the exact spam the flag exists to stop. The
+# shipped controller cannot be run here, so this reproduces its shape: source, acquire, source, acquire.
+SEAMW3="$(
+  CLAIM_REPO="$T/repo"; CLAIM_STATE_DIR="$T/state18r"; CLAIM_OWNER_HOST=seamhost2
+  export CLAIM_REPO CLAIM_STATE_DIR CLAIM_OWNER_HOST
+  mkdir -p "$CLAIM_STATE_DIR"
+  i=0
+  while [ "$i" -lt 2 ]; do
+    . "$CLAIMS_SH" || exit 1
+    claim_acquire "" 920948$i 0123456789abcdef0123 >/dev/null
+    i=$((i+1))
+  done 2>&1 >/dev/null)"
+SW6="$(printf '%s' "$SEAMW3" | grep -c 'CLAIM_OWNER_HOST=')"
+[ "$SW6" = "1" ]
+SW6_RC=$?
+ck "O18 [RED→GREEN] it stays ONCE across a re-source (the controller re-sources every cycle; $SW6 warning(s))" $SW6_RC
 # Silent when the seam AGREES with the running host — a correctly configured box is not a warning.
 SEAMOK="$(as_box "" "$(hostname -s)" 'claim_owner >/dev/null' 2>&1)"
 [ -z "$SEAMOK" ]

@@ -245,7 +245,12 @@ claim_host() { printf '%s' "${CLAIM_OWNER_HOST:-$(hostname -s 2>/dev/null || ech
 # `claim_host_record`, so the box stops accumulating the names that make a RENAME self-heal, an inert
 # self-heal that reports success. It stays supported — the test harnesses and the cross-box
 # simulations need it, and refusing it would be a new hard failure — but it says what it costs.
-CLAIM_HOST_SEAM_WARNED=0
+# ⛔ DEFAULT, NOT ASSIGN (cycle-11 review). `orch-loop.sh` re-sources claims.sh INSIDE its main loop
+# (once per cycle, ~2 min), so a hard `=0` here reset the flag on every cycle and an inherited
+# `CLAIM_OWNER_HOST` warned ~720 times a day — the noise this flag exists to prevent. `:-` keeps a
+# `CLAIM_HOST_SEAM_WARNED=1` set by an earlier source in the SAME process, so "once" is once per
+# process and O18's two-acquire case still measures exactly one.
+CLAIM_HOST_SEAM_WARNED="${CLAIM_HOST_SEAM_WARNED:-0}"
 claim_host_warn_seam() {
   [ -n "${CLAIM_OWNER_HOST:-}" ] || return 0
   [ "${CLAIM_HOST_SEAM_WARNED:-0}" = "0" ] || return 0

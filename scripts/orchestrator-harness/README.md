@@ -1392,8 +1392,18 @@ be running — see the residual above), and a **PR** claim whose host was never 
 `state/claim-hosts`. On a PR claim minted by this box the pid rule answers FIRST — the name is in the
 history, so the pid is probed and a live worker returns `held-by-live` (rc=1) before the deny list is
 reached (measured at head). So the deny list is safe for PR claims this box minted, and is NOT safe
-for the ISSUE claims of a lane that is still in flight: apply it only when no lane is mid-merge, or
-prefer the pid-preserving remedy above.
+for the ISSUE claims of a lane that is still in flight: apply it only when no lane is mid-merge.
+
+⛔ **THE PID REMEDY IS THE SAFER ONE FOR *PR* KEYS ONLY — IT DOES NOT PRESERVE AN ISSUE CLAIM EITHER**
+(cycle-11 review: an earlier version of this paragraph offered it as the way to *avoid* the hazard just
+described, which sent the operator straight into it). For an **ISSUE** key the local-pid arm is
+skipped entirely — an issue claim is minted by the controller, not by the lane — so the former-name
+**host rule** is reached and fires, and a live lane's barrier is freed exactly as the deny list frees
+it (pinned by O10, which reclaims an ISSUE claim stamped `<former name>:<live pid>`). The difference is
+strictly that a **PR** claim stamped `<oldName>:<live pid>` returns `held-by-live` under the pid remedy
+and is reaped under the deny list. **Neither remedy preserves an in-flight ISSUE claim**, so the only
+mitigation for those is the condition both share: do not rename — or run the one-time cleanup — while
+lanes are in flight; otherwise let the next prune free their issue claims and let them finish.
 
 ⚠️ **THE HOST RULES RUN FOR EVERY KEYING, AND THAT HAS A CONSEQUENCE WORTH STATING PLAINLY.** They
 answer "is the holder a live LANE?", and a name that no box answers to is dead *as an identity* — but
