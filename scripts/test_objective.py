@@ -2005,8 +2005,12 @@ def test_an_unusable_PRIMARY_payload_reaches_the_second_source_and_is_ATTRIBUTED
 
     # Both sources unusable: `queue=UNREADABLE`, and (see
     # `test_an_unread_queue_is_never_cached_even_without_a_gh_claim`) never cached. The claim
-    # itself stays OFF -- `transport=False` is deliberate: GitHub ANSWERED and we mangled the
-    # answer, which is a different fact from blindness, and the file's doctrine says so.
+    # stays OFF, and the reason is NOT `transport=False` (#2138 r8, reviewer B): this fixture's
+    # fallback RAISES (the default `fake_rest_get`), so since the composite classification the
+    # note carries `transport=True` and the claim is suppressed by the `TRANSPORT_MARKERS` gate
+    # instead -- both texts are marker-free. `test_a_PARSE_failure_...` isolates the OTHER
+    # direction (a non-transport fallback with a marker-bearing primary), which is the one the
+    # marker gate cannot cover.
     install(monkeypatch, pr_list=_Result(0, "not json at all"), rest_prs=None)
     line = objective.build()
     assert "queue=UNREADABLE" in line, line
@@ -2089,6 +2093,24 @@ def test_a_PARSE_failure_does_not_claim_blindness_even_when_its_TEXT_says_transp
         assert "queue=UNREADABLE" in line, (body, line)       # the FACT is still reported
         assert "gh=" not in line, (body, line)               # ...but no blindness claim
         assert objective.GH_BLOCKED is None, (body, objective.GH_BLOCKED)
+
+    # ⛔ A FALLBACK BODY THAT FAILS TO DECODE IS NOT A TRANSPORT FAILURE EITHER (#2138 r8).
+    # `_rest_get` ends in `json.loads(...)`, so a 200 carrying an HTML interstitial or non-UTF-8
+    # raises FROM INSIDE IT — GitHub ANSWERED, which is a PARSE failure by this file's contract.
+    # Classifying by where the exception was raised made this a transport failure, and because
+    # the composite cause text CONCATENATES both halves, the PRIMARY's marker then supplied the
+    # claim: two reads that both reached GitHub published `gh=UNREADABLE(queue)` (and, with a
+    # rate-limit word in the primary, `VERDICT=GH-RATE-LIMITED`). MEASURED on the parent commit.
+    # This cell was uncovered because the only raising fallback under test is a 403 whose own
+    # text carries "rate limit", so the marker always came from the fallback itself.
+    for exc in (json.JSONDecodeError("Expecting value", "<html>", 0),
+                UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")):
+        install(monkeypatch, pr_list=_Result(0, '{"message": "read timed out"}'), rest_prs=[])
+        monkeypatch.setattr(objective, "_rest_get", lambda *a, **k: (_ for _ in ()).throw(exc))
+        line = objective.build()
+        assert "queue=UNREADABLE" in line, (exc, line)
+        assert "gh=" not in line, (exc, line)          # both sources ANSWERED
+        assert objective.GH_BLOCKED is None, (exc, objective.GH_BLOCKED)
 
     # ...and a REAL transport failure still claims, so this is not "never claim".
     install(monkeypatch, pr_list=REST_REFUSED, rest_prs=None)

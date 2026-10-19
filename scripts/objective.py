@@ -149,8 +149,8 @@ BLINDING_SURFACES = ("main", "queue")
 # `gh()`'s body-parse arm (`unparseable gh api body: …`) or `gql_commit_checks()`'s rollup arm can
 # have written — so main has no per-read fact to pass and still relies on `TRANSPORT_MARKERS`.
 # Stated rather than quietly implied by this comment: a lane reading it should not conclude the
-# heuristic is dead. Pinned as a false-blindness path on its own issue rather than fixed here,
-# because the real repair is to attribute the cause per READ, which is a main-path refactor.
+# heuristic is dead. Filed as #2151 rather than fixed here, because the real repair is to attribute
+# the cause per READ, which is a main-path refactor.
 TRANSPORT_MARKERS = ("rate limit", "http 5", "http 4", "timed out", "timeout",
                      "could not resolve", "connection", "network", "tls", "ssl",
                      "temporary failure", "gateway", "unable to access")
@@ -199,8 +199,10 @@ def _note_gh_failure(text, surface, transport=True):
 
 
 GH_LAST_ERROR = ""
-# Whether the LAST `_queue_rest()` failure was a TRANSPORT failure (GitHub unreachable/refusing)
-# rather than an unusable body. Read by `queue()` to classify the composite refusal (#2138 r7).
+# Whether the LAST `_queue_rest()` failure was a TRANSPORT failure (the exchange with GitHub did
+# not complete) rather than a body/config failure. Read by `queue()` to classify the composite
+# refusal (#2138 r7). NOTE `_rest_get` DECODES its own body, so it also raises for a 200 it could
+# not parse -- that is a body failure, and the classification below says so (#2138 r8).
 _REST_TRANSPORT = False
 
 # ⛔ THE BINARY IS RESOLVED, NOT TAKEN FROM PATH ALONE (#1872, reviewer E). `pr-doctor.py`
@@ -1418,11 +1420,12 @@ def _queue_rest(deadline=None):
     global GH_LAST_ERROR, _REST_TRANSPORT
     # ⛔ EVERY EXPLICIT `return None` BELOW IS A BODY/CONFIG FAILURE, NOT A TRANSPORT ONE
     # (#2138 r7, reviewer B). GitHub ANSWERED with something unusable, or we refused to open a
-    # socket. Only an exception escaping `_rest_get` -- an HTTP error, a connection failure, a
-    # timeout -- is the transport, and that arm sets this True. `queue()` ORs it with the
-    # primary's own flag, so the composite refusal is a transport failure if EITHER source hit
-    # one: a primary we mangled plus a fallback GitHub REFUSED is still blindness, and losing
-    # that claim degraded the verdict to `UNKNOWN` where the reader needed "wait for the limit".
+    # socket. The one classifying site is the `_rest_get` call, and it classifies by WHAT failed,
+    # not by where the exception was raised (#2138 r8 — see the note there). `queue()` ORs this
+    # with the primary's own flag, so the composite refusal is a transport failure if EITHER
+    # source hit one: a primary we mangled plus a fallback GitHub REFUSED is still blindness, and
+    # losing that claim degraded the verdict to `UNKNOWN` where the reader needed "wait for the
+    # limit".
     _REST_TRANSPORT = False
     token = _gh_token()
     if not token:
@@ -1439,10 +1442,9 @@ def _queue_rest(deadline=None):
                     GH_LAST_ERROR = (f"rest second source: page {page}: the queue read's own budget "
                                      "was spent before the fallback could fetch it")
                     return None
-            # ⛔ THE `_rest_get` CALL IS THE ONLY TRANSPORT BOUNDARY (#2138 r7, reviewer B), so
-            # its failure is classified HERE rather than in the broad `except` below -- which
-            # also catches a `_rest_pr` MAPPING error, and that is a body we did not understand,
-            # not a failure to reach GitHub.
+            # ⛔ THE `_rest_get` CALL IS THE ONE CLASSIFYING SITE (#2138 r7, reviewer B), because the
+            # broad `except` below also catches a `_rest_pr` MAPPING error -- a body we did not
+            # understand, not a failure to reach GitHub.
             try:
                 body = _rest_get(
                     f"https://api.github.com/repos/{REPO}/pulls"
@@ -1451,7 +1453,16 @@ def _queue_rest(deadline=None):
             except Exception as e:
                 # The URL is safe to name; the token never is.
                 GH_LAST_ERROR = f"rest second source failed: {type(e).__name__}: {str(e)[:180]}"
-                _REST_TRANSPORT = True
+                # ⛔ CLASSIFIED BY WHAT FAILED, NOT BY WHERE IT WAS RAISED (#2138 r8, both reviewers).
+                # `_rest_get` ends in `json.loads(...)`, so a 200 carrying HTML or non-UTF-8 raises
+                # FROM INSIDE IT -- and GitHub ANSWERED, which is a PARSE failure by this file's
+                # own contract. Treating "raised by `_rest_get`" as "the transport" made a
+                # decode-failing fallback a transport failure, and because the composite cause
+                # text CONCATENATES both halves, the PRIMARY's mangled body could then supply the
+                # `TRANSPORT_MARKERS` hit: two reads that both reached GitHub published
+                # `gh=UNREADABLE(queue)` / `VERDICT=GH-RATE-LIMITED`. Measured. A decode failure is
+                # the parser's fact, not the network's.
+                _REST_TRANSPORT = not isinstance(e, (json.JSONDecodeError, UnicodeDecodeError))
                 return None
             if not isinstance(body, list):
                 GH_LAST_ERROR = (f"rest second source returned {type(body).__name__}, not a list")
