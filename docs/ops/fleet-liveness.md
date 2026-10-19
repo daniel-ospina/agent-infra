@@ -732,14 +732,24 @@ So the starter adds the two things a read-only inventory cannot have:
 1. **An installer.** `bin/harness install` renders ONE template per platform
    (`templates/systemd/harness-unit.service.tmpl`, `templates/launchd/harness-unit.plist.tmpl`) once
    per declared component, names the units `harness-<component>.service` /
-   `com.eldato.harness.<component>`, enables them and restarts them (`Restart=always` / `KeepAlive`).
-   Every `ExecStart` is `bin/harness run <component>`, so the unit does not encode a command and
-   cannot drift from the inventory.
+   `com.eldato.harness.<component>`, and configures restart-on-death (`Restart=always` on Linux,
+   `KeepAlive` on macOS — the unit is what holds that property, and `start` is what actually launches
+   it; on Linux `install` also **enables** the unit, while launchd has no enable step and re-bootstraps
+   at `start`). Every `ExecStart` / `ProgramArguments` is `bin/harness run <component>`, so the unit
+   does not encode a command and cannot drift from the inventory.
 2. **Version discipline.** Exactly one harness sha may be active. `start` stops and NAMES any process
-   running from a different `<pin>/<sha12>/` under the active harness's own pin root before it
-   launches; `doctor` fails on two shas, on a component running from a non-active sha, on a missing
-   required component, on no supervisor, and on a service that is enabled but not running — and warns
-   when a controller is running from a pid no unit owns (the hand-launch shape above).
+   running from a different `<pin>/<sha>/` under the active harness's own pin root before it launches;
+   `doctor` fails on two shas, on a component running from a non-active sha, on a missing required
+   component, on a unit that was never installed, on no supervisor, and on a service that is enabled
+   but not running — and warns when a harness process runs from a pid no unit owns (the hand-launch
+   shape above) or from a checkout outside this box's pin root.
+
+   Three rules exist because each absence produced a false PASS: a pin token is **6–40 hex** (the live
+   cells pin with eight, and a 12-hex-only pattern collapsed every pin to `unknown`, making the
+   two-version check inert); an **undetermined** active sha never reconciles (comparing to `unknown`
+   marks the ACTIVE version foreign, so `start` would kill the box's own components); and `start`
+   **refuses units rendered from another root** (after a pin move the units still name the old bytes,
+   and starting them reports success and overwrites the recorded sha `doctor` checks against).
 
 **How the two layers relate — stated, not implied.** `fleet-inventory` remains the **breadth**
 authority on a box: the ~20 launchd jobs, the landers, the watchdog pair, the cell supervisor, each

@@ -32,9 +32,9 @@
 # `start` reconciles before it launches. Any process running from a DIFFERENT `harness/<sha>/` path
 # under the same pin root is stopped and NAMED — never silently co-run. That is precisely the check
 # whose absence produced the two-version cell above. The scope is deliberately narrow: only processes
-# under the active harness's own pin root (`<pin>/<sha12>/scripts/orchestrator-harness`) are
-# reconciled, because a `pgrep -f orch-loop.sh` across the whole box also matches a peer lane's test
-# fixture and a proof-run copy — and a kill driven by that read destroys somebody else's work.
+# under the active harness's own pin root (`<pin>/<sha>/scripts/…`) are reconciled, because a
+# `pgrep -f orch-loop.sh` across the whole box also matches a peer lane's test fixture and a
+# proof-run copy — and a kill driven by that read destroys somebody else's work.
 #
 # ── NO AD-HOC LAUNCHES ────────────────────────────────────────────────────────────────────────
 # Lanes are started by the supervisor. `doctor` WARNS when a controller is running from a pid that is
@@ -53,7 +53,7 @@
 #                                                          unless HARNESS_ALLOW_FOREIGN_PLATFORM=1)
 #   HARNESS_ACTIVE_SHA                                     pin the active sha (otherwise git HEAD, else
 #                                                          the harness's own .harness-sha file)
-#   HARNESS_PIN_ROOT                                       the `<pin>/<sha12>/…` root to reconcile
+#   HARNESS_PIN_ROOT                                       the `<pin>/<sha>/…` root to reconcile
 #   HARNESS_PS_FILE                                        read a ps snapshot from a file instead of
 #                                                          running ps (a snapshot, not a stub: the
 #                                                          parser is the shipped one)
@@ -182,26 +182,37 @@ active_sha() {
 }
 
 # sha_of_path <harness-dir> — the sha a harness directory belongs to.
-# A pinned harness is `<pin>/<sha12>/scripts/orchestrator-harness`, so the DIRECTORY NAME is the
-# answer and no git read is needed (a pin is a worktree; its bytes are the commit's bytes). Anything
-# else falls back to git, and to `unknown` — never to the active sha, because "assume it matches" is
-# the false PASS this whole verb exists to prevent.
+# A pinned harness is `<pin>/<sha>/scripts/orchestrator-harness` (or `<pin>/<sha>/scripts` for the
+# components whose entries live in `scripts/`), so the DIRECTORY NAME is the answer and no git read
+# is needed (a pin is a worktree; its bytes are the commit's bytes). Anything else falls back to git,
+# and to `unknown` — never to the active sha, because "assume it matches" is the false PASS this
+# whole verb exists to prevent.
 sha_of_path() {
   local d="$1" rest seg
   case "$d" in
-    */scripts/orchestrator-harness)
-      rest="${d%/scripts/orchestrator-harness}"
-      seg="${rest##*/}"
-      case "$seg" in
-        [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f])
-          printf '%s\n' "$seg"; return 0 ;;
-      esac ;;
+    */scripts/orchestrator-harness) rest="${d%/scripts/orchestrator-harness}" ;;
+    */scripts)                     rest="${d%/scripts}" ;;
+    *)                             rest="" ;;
   esac
+  if [ -n "$rest" ]; then
+    seg="${rest##*/}"
+    if sha_like "$seg"; then printf '%s\n' "$seg"; return 0; fi
+  fi
   seg="$(git -C "$d" rev-parse --short=12 HEAD 2>/dev/null)" && [ -n "$seg" ] && { printf '%s\n' "$seg"; return 0; }
   printf 'unknown\n'
 }
 
-# pin_root — `<pin>` when the active harness is `…/<pin>/<sha12>/scripts/orchestrator-harness`,
+# sha_like <token> — a harness pin segment: 6..40 lowercase hex, NOT exactly 12.
+# ⛔ The live cells pin with EIGHT (`/tmp/cell-home/harness/2ddd5b5a`), and matching only twelve made
+# `pin_root` empty and every pin collapse to the `unknown` sha — so two versions in two different
+# pins counted as ONE and the two-version check could never fire. The floor is 6 because that is the
+# shortest abbreviation a pin may use; the ceiling is a full sha1.
+sha_like() {
+  case "$1" in ''|*[!0-9a-f]*) return 1 ;; esac
+  [ "${#1}" -ge 6 ] && [ "${#1}" -le 40 ]
+}
+
+# pin_root — `<pin>` when the active harness is `…/<pin>/<sha>/scripts/orchestrator-harness`,
 # empty otherwise. Only processes under THIS root are reconciled by `start`; see the header.
 pin_root() {
   if [ -n "${HARNESS_PIN_ROOT:-}" ]; then printf '%s\n' "$HARNESS_PIN_ROOT"; return 0; fi
@@ -210,10 +221,7 @@ pin_root() {
     */scripts/orchestrator-harness)
       rest="${HARNESS_ROOT%/scripts/orchestrator-harness}"
       seg="${rest##*/}"
-      case "$seg" in
-        [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f])
-          printf '%s\n' "${rest%/*}"; return 0 ;;
-      esac ;;
+      if sha_like "$seg"; then printf '%s\n' "${rest%/*}"; return 0; fi ;;
   esac
   printf '\n'
 }
@@ -229,7 +237,7 @@ pin_root() {
 # ⛔ An UNRECOGNISED shape returns 1 rather than being guessed at: a process read that over-claims is
 # how a version check reports a version that is not there.
 dir_from_argv() {
-  local cmd="$1" tok dir want=0
+  local cmd="$1" tok dir want=0 p
   for tok in $cmd; do
     if [ "$want" = 1 ]; then
       [ "$tok" = "run" ] && { printf '%s\n' "$dir"; return 0; }
@@ -244,7 +252,16 @@ dir_from_argv() {
       orch-loop.sh|disk-reaper.sh|heartbeat-loop.sh|pr-doctor.py|merge-one.sh|fix-one.sh)
         dir="${tok%/*}"
         [ "$dir" = "$tok" ] && continue
-        case "$dir" in */orchestrator-harness) printf '%s\n' "$dir"; return 0 ;; esac ;;
+        case "$dir" in
+          */orchestrator-harness) printf '%s\n' "$dir"; return 0 ;;
+          # `<pin>/<sha>/scripts/<entry>` — the entries that live in `scripts/` (heartbeat, diskreaper,
+          # pr-doctor) are exec'd from there, so their argv names `…/scripts`, not
+          # `…/scripts/orchestrator-harness`. Only a sha-shaped owner is accepted, so an unrelated
+          # `scripts/x.sh` on the box is never attributed as a harness.
+          */scripts)
+            p="${dir%/scripts}"
+            if sha_like "${p##*/}"; then printf '%s\n' "$dir"; return 0; fi ;;
+        esac ;;
     esac
   done
   return 1
@@ -488,6 +505,12 @@ cmd_install() {
   esac
   mkdir -p "$UNIT_DIR" "$LOG_DIR" "$QUEUE_DIR" || refuse "cannot create $UNIT_DIR / $LOG_DIR"
   printf '%s\n' "$(active_sha)" >"$ACTIVE_SHA_FILE" 2>/dev/null || warn "cannot record the active sha in $ACTIVE_SHA_FILE"
+  # The pin directory itself is not a git checkout on a cell, so the sha has to be RECORDED next to
+  # the harness or `active_sha` answers `unknown` forever (and `start` would then refuse to reconcile
+  # — see enforce_single_version). One line, written by the verb that materialises the box.
+  if [ "$(active_sha)" != "unknown" ]; then
+    printf '%s\n' "$(active_sha)" >"$HARNESS_ROOT/.harness-sha" 2>/dev/null || warn "cannot record $HARNESS_ROOT/.harness-sha (the active sha will read unknown on a non-git pin)"
+  fi
 
   local name kind entry args dest tmp written=0 unchanged=0 enabled=0 enable_failed=0
   while IFS='|' read -r name kind entry args; do
@@ -568,6 +591,16 @@ legacy_conflict_note() {
 enforce_single_version() {
   local active pr pid dir sha stopped=0 _rows
   active="$(active_sha)"
+  # ⛔ AN UNDETERMINED ACTIVE SHA IS NEVER A REASON TO KILL. `active_sha` answers `unknown` on a box
+  # whose pin is not a git checkout and carries no .harness-sha — which is the live cloud-cell layout
+  # (`/tmp/cell-home/harness/<8hex>/` has no .git). Comparing every live sha against `unknown` marks
+  # the ACTIVE version foreign and TERM→KILLs every running component, including a pool mid-job, then
+  # reports it as reconciliation. A kill needs a MEASURED active version; otherwise it is a no-op with
+  # a named reason.
+  if [ "$active" = "unknown" ]; then
+    warn "the active harness sha could not be determined (no git HEAD under $HARNESS_ROOT and no $HARNESS_ROOT/.harness-sha) — version reconciliation SKIPPED; an undetermined active sha is never a reason to stop a running component"
+    return 0
+  fi
   pr="$(pin_root)"
   if [ -z "$pr" ]; then
     say "version-discipline: the active harness is not a pinned <pin>/<sha>/ tree — nothing outside it to reconcile"
@@ -613,6 +646,22 @@ cmd_start() {
   if [ -n "$missing" ]; then
     refuse "no supervisor: units not installed for${missing} — run 'harness install' first (start never launches a component directly)"
   fi
+  # ⛔ A UNIT IS A SNAPSHOT OF THE ROOT IT WAS RENDERED FROM. After a pin move the installed units
+  # still name the OLD `…/bin/harness`, so `start` would launch stale bytes from stale units, kill the
+  # then-running foreign sha, watch the supervisor restart HIGH FROM THE SAME STALE UNIT, report
+  # "N started", and overwrite the recorded active sha that `doctor` compares against — a false PASS
+  # that disarms its own detector. Compare a fresh render against what is installed and refuse.
+  local stale="" tmpchk
+  while IFS='|' read -r name kind entry args; do
+    [ -n "$name" ] || continue
+    dest="$(unit_path "$name")"; tmpchk="$dest.check.$$"
+    render_unit "$PLATFORM" "$name" "$tmpchk" || { rm -f "$tmpchk"; refuse "could not render the unit for $name"; }
+    cmp -s "$tmpchk" "$dest" || stale="$stale $name"
+    rm -f "$tmpchk"
+  done <<<"$(selected_components)"
+  if [ -n "$stale" ]; then
+    refuse "the installed units were rendered from a different harness root (stale:${stale}) — run 'harness install' first; start would launch the units' OLD bytes and report success"
+  fi
   printf '%s\n' "$(active_sha)" >"$ACTIVE_SHA_FILE" 2>/dev/null || warn "cannot record the active sha in $ACTIVE_SHA_FILE"
 
   enforce_single_version
@@ -626,6 +675,13 @@ cmd_start() {
     if [ "$st" = "RUN" ]; then
       say "start: $name already running (pid $pid) — no-op"
       already=$((already + 1)); continue
+    fi
+    # ⛔ MIRROR `stop`'s TRI-STATE. Anything that is not RUN used to go straight to sup_start, and on
+    # macOS that is `launchctl kickstart -k` — a KILL + restart of a component whose state a transient
+    # `launchctl print` failure merely failed to READ. An unreadable state is not an absent one.
+    if [ "$st" = "UNKNOWN" ]; then
+      warn "start: $name's supervisor state is unreadable ($det) — NOT starting it; a restart driven by an unreadable read can kill a healthy component"
+      failed=$((failed + 1)); continue
     fi
     sup_start "$name" >/dev/null 2>&1
     # `systemctl start` is ASYNC for Type=simple and launchd's bootstrap returns before the child is
@@ -728,11 +784,16 @@ cmd_status() {
     det="$(printf '%s\n' "$rec" | cut -f4)"
     case "$st" in
       RUN)
-        # The dir the component ACTUALLY runs from, attributed from its pid's argv; falling back to
-        # the harness path this entry point belongs to only when the pid is not attributable.
+        # The dir the component ACTUALLY runs from, attributed from its pid's argv. ⛔ THERE IS NO
+        # FALLBACK TO $HARNESS_ROOT: printing the active dir for a pid whose argv could not be read
+        # is a FABRICATED RUNNING(dir) — the line would claim the active bytes for a stale component,
+        # which is exactly the question `status` exists to answer. An unattributable pid says so.
         procdir="$(dir_for_pid "$pid")"
-        [ -n "$procdir" ] || procdir="$HARNESS_ROOT"
-        printf '%-11s RUNNING(%s)\n' "$name" "$procdir" ;;
+        if [ -n "$procdir" ]; then
+          printf '%-11s RUNNING(%s)\n' "$name" "$procdir"
+        else
+          printf '%-11s RUNNING(pid %s, dir UNATTRIBUTABLE — argv names no harness dir)\n' "$name" "${pid:--}"
+        fi ;;
       DOWN)
         printf '%-11s DEAD(last exit %s, "%s")\n' "$name" "${ex:--}" "$(last_log_line "$name")"
         [ "$worst" -lt 1 ] && worst=1 ;;
@@ -777,16 +838,57 @@ cmd_doctor() {
     fails=$((fails + 1))
   fi
 
-  # 2) EXACTLY ONE VERSION. Two shas running is the measured incident this file exists for.
+  # 2) EXACTLY ONE VERSION, AND IT IS THE ACTIVE ONE. Two shas running is the measured incident this
+  # file exists for. Three arms, because a COUNT alone is not a version check: `count == 1` with a
+  # foreign sha, and `count == 0`, both used to read as healthy.
   shas="$(distinct_shas)"
   local count; count="$(printf '%s\n' "$shas" | grep -c . || true)"; [ -n "$count" ] || count=0
-  if [ "$count" -gt 1 ]; then
-    printf 'DOCTOR FAIL: %s harness versions are running (active is %s):\n' "$count" "$active"
-    distinct_versions | while IFS='	' read -r sha dir; do
-      printf '             sha %s from %s\n' "$sha" "$dir"
-    done
-    printf "             run 'harness start' to reconcile them (it stops every non-active sha under %s)\n" "${pr:-<no pin root>}"
+  local allrows foreign_pin=0 foreign_out=0
+  allrows="$(distinct_versions | while IFS='	' read -r sha dir; do printf '             sha %s from %s\n' "$sha" "$dir"; done)"
+  if [ "$active" = "unknown" ]; then
+    printf 'DOCTOR FAIL: the active harness sha could not be determined (no git HEAD under %s and no %s/.harness-sha) — every version comparison would be a guess; run %s\n' \
+      "$HARNESS_ROOT" "$HARNESS_ROOT" "'harness install'"
     fails=$((fails + 1))
+  elif [ "$count" -eq 0 ]; then
+    # ⛔ A zero-row read is NOT "nothing is wrong": the whole version statement is unmeasurable (an
+    # unrelated `ps` race, a box whose harness process argv this tool cannot parse). Reporting OK over
+    # it is the same false PASS that `install`'s whitespace refusal names in its own words.
+    printf 'DOCTOR FAIL: no harness process could be attributed — the version state is unmeasurable, which is never a pass (is anything actually running?)\n'
+    fails=$((fails + 1))
+  else
+    while IFS='	' read -r sha dir; do
+      [ -n "$sha" ] || continue
+      [ "$sha" = "$active" ] && continue
+      # Scope decides the VERDICT and the REMEDY: a foreign sha under THIS box's pin root is what
+      # `start` reconciles, so it is a failure; a foreign sha in a peer lane's checkout is real but is
+      # not this box's to reconcile, so it is a warning that says so. A failure whose printed remedy
+      # cannot work is how a gate gets ignored.
+      # ⛔ `[ -n "$pr" ]` FIRST: an EMPTY pin root makes the pattern `/*`, which matches every path —
+      # that is how an unrelated checkout was read as "under this box's pin" and mis-graded.
+      if [ -n "$pr" ]; then
+        case "$dir" in "$pr"/*) foreign_pin=$((foreign_pin + 1)); continue ;; esac
+      fi
+      foreign_out=$((foreign_out + 1))
+    done <<<"$(distinct_versions)"
+    if [ "$foreign_pin" -gt 0 ]; then
+      if [ "$count" -gt 1 ]; then
+        printf 'DOCTOR FAIL: %s harness versions are running under this box'"'"'s pin root and %s of them are NOT the active sha (active is %s):\n%s\n' \
+          "$count" "$foreign_pin" "$active" "$allrows"
+      else
+        printf 'DOCTOR FAIL: the only running harness version is NOT the active one (active is %s) — a component is running different bytes:\n%s\n' \
+          "$active" "$allrows"
+      fi
+      printf "             run 'harness start' to reconcile them (it stops every non-active sha under %s)\n" "$pr"
+      fails=$((fails + 1))
+    fi
+    if [ "$foreign_out" -gt 0 ]; then
+      # ⛔ A version OUTSIDE this box's pin root is another checkout's harness (a peer lane's worktree,
+      # an operator's second copy). It is real and it is named — but it is NOT this box's to
+      # reconcile, so the remedy says the true thing instead of printing a verb that cannot reach it.
+      printf 'DOCTOR WARN: %s harness version(s) run from a checkout OUTSIDE %s — this box does not reconcile it (start only touches its own pin root):\n%s\n' \
+        "$count" "${pr:-<the pin root — this harness is not a <pin>/<sha>/ tree>}" "$allrows"
+      warns=$((warns + 1))
+    fi
   fi
 
   # 3) REQUIRED COMPONENT MISSING — the component's own code is gone, so the unit can only crash.
@@ -858,16 +960,23 @@ cmd_doctor() {
     fi
   fi
 
-  # 6) AD-HOC LAUNCH — a controller that no unit owns. WARN, not FAIL: the operator may be
+  # 6) AD-HOC LAUNCH — a harness process that no unit owns. WARN, not FAIL: the operator may be
   # mid-migration, and a check that reds on a state it cannot repair gets ignored.
+  # The shape is matched against this harness's OWN tree (`$HARNESS_ROOT`) AND the pin it belongs to,
+  # because a component exec'd from `…/scripts/` (heartbeat, diskreaper, pr-doctor) names
+  # `<pin>/<sha>/scripts` — under the pin but not under `$HARNESS_ROOT`, so a hand launch of one
+  # would have gone unnamed.
   mainpid=""
   rec="$(sup_record orch)"; [ "$(printf '%s\n' "$rec" | cut -f1)" = "RUN" ] && mainpid="$(printf '%s\n' "$rec" | cut -f2)"
   local adhoc=0 apid adir
   while IFS='	' read -r apid adir; do
     [ -n "$apid" ] || continue
-    case "$adir" in "$HARNESS_ROOT"|"$HARNESS_ROOT"/*) : ;; *) continue ;; esac
+    case "$adir" in
+      "$HARNESS_ROOT"|"$HARNESS_ROOT"/*) : ;;
+      *) if [ -n "$pr" ]; then case "$adir" in "$pr"/*) : ;; *) continue ;; esac; else continue; fi ;;
+    esac
     [ "$apid" = "$mainpid" ] && continue
-    printf 'DOCTOR WARN: a controller is running OUTSIDE the supervisor (pid %s, %s) — lanes are started by the supervisor; this one cannot be restarted or reported\n' "$apid" "$adir"
+    printf 'DOCTOR WARN: a harness process is running OUTSIDE the supervisor (pid %s, %s) — lanes are started by the supervisor; this one cannot be restarted or reported\n' "$apid" "$adir"
     warns=$((warns + 1)); adhoc=$((adhoc + 1))
   done <<<"$(harness_procs)"
 
@@ -879,7 +988,9 @@ cmd_doctor() {
   if [ "$warns" -gt 0 ]; then
     say "doctor: 0 failures, $warns warning(s)"
   else
-    say "doctor: OK — one harness version ($active), all components supervised and running"
+    # ⛔ Report ONLY what was measured: the sha set that was actually read, never the assumption that
+    # it was "one version" (a zero-row read said `one harness version (<active>)` before).
+    say "doctor: OK — $count harness version running ($(printf '%s' "$shas" | tr '\n' ' ')), all components supervised and running"
   fi
   return 0
 }
@@ -900,19 +1011,68 @@ interval_for() {
 }
 
 load_env_file() {
-  local f defs
+  local f defs dump srcstatus
   f="$(default_env_file)"
   [ -f "$f" ] || return 0
   # `set -a` == the measured hand launch (`set -a; . keys.env; set +a`), so the supervisor starts the
   # controller with the SAME environment an operator used by hand — that equivalence is what makes
   # the supervisor a replacement rather than a second, differently-configured launcher.
-  # ⛔ SOURCED IN A SUBSHELL, then replayed with `export -p`. A keys.env whose last line is `exit 0`
-  # would otherwise end the SUPERVISOR process (measured in cloud-cell-supervisor.sh's own history),
-  # and the `export -p` replay is bash's own quoting, so no value is re-expanded on the way back in.
-  defs="$( set -a; . "$f" >/dev/null 2>&1; set +a; export -p )" || {
-    warn "could not source $f — the component starts with the ambient environment"; return 0; }
+  # ⛔ SOURCED IN A SUBSHELL, then replayed. A keys.env whose last line is `exit 0` would otherwise
+  # end the SUPERVISOR process (measured in cloud-cell-supervisor.sh's own history).
+  # ⛔ THE DUMP GOES TO A FILE, NOT STDOUT — two independent leaks made stdout useless here, and both
+  # were measured:
+  #   1. `declare` run INSIDE a function is LOCAL to it, so `export -p` output eval'd in place set
+  #      variables that evaporated at `return` — the component inherited NOTHING from keys.env while
+  #      this header claimed the hand launch's environment was reproduced.
+  #   2. `. "$f" >/dev/null 2>&1` does NOT restore fd 1 when the sourced file `exit`s: the redirection
+  #      on a `source` command applies to the CALLING shell and an early exit skips its restoration —
+  #      so the shell's stdout stayed at /dev/null and an inline OR trapped `export -p` was discarded.
+  # An EXIT trap (fires on normal AND early exit, so what the file declared before stopping still
+  # applies) writing to an explicit file survives both. The status line is the witness: ABSENT = the
+  # file never finished, and that is reported rather than silently half-applied.
+  dump="${TMPDIR:-/tmp}/harness-env.$$.${RANDOM:-0}"
+  (
+    export HARNESS_ENV_DUMP="$dump"
+    set -a
+    trap 'printf "HARNESS_ENV_STATUS=%s\n" "${src:-}" >>"$HARNESS_ENV_DUMP"; export -p >>"$HARNESS_ENV_DUMP"' EXIT
+    . "$f" >/dev/null 2>&1
+    src=$?
+  )
+  if [ ! -f "$dump" ]; then
+    warn "could not source $f — the component starts with the ambient environment"; return 0
+  fi
+  defs="$(cat "$dump" 2>/dev/null)"; rm -f "$dump"
+  srcstatus="$(printf '%s\n' "$defs" | sed -n 's/^HARNESS_ENV_STATUS=//p' | tail -1)"
+  if [ -z "$srcstatus" ]; then
+    warn "$f exited before it finished (a top-level 'exit'/'return' in the file) — the variables it declares after that point were NOT applied"
+  elif [ "$srcstatus" != "0" ]; then
+    warn "sourcing $f failed (rc=$srcstatus) — the variables it declares after the failure were NOT applied"
+  fi
+  defs="$(printf '%s\n' "$defs" | grep -v '^HARNESS_ENV_STATUS=')"
+  # ⛔ `export -p` prints `declare -x NAME=value`, and `declare` RUN INSIDE A FUNCTION IS LOCAL to it
+  # (bash's own semantics). Eval'd as printed, every variable evaporated at `return`: the component
+  # inherited NOTHING from keys.env, while this function's header claimed the hand launch's
+  # environment was reproduced. Measured: `FOO=fromenvfile` in the env file read as 
+  # `FOO=[MISSING]` inside the component. Rewriting the declaration to `export` (global) is the fix;
+  # only `NAME=value` declarations are kept (any flags including `x` — `-rx` too), because an exported
+  # bash FUNCTION prints as a body rather than a NAME=value line and would be a syntax error to replay.
+  defs="$(printf '%s\n' "$defs" | sed -n 's/^declare -[a-zA-Z]*x \([A-Za-z_][A-Za-z0-9_]*=\)/export \1/p; s/^export \([A-Za-z_][A-Za-z0-9_]*=\)/export \1/p')"
+  [ -n "$defs" ] || return 0
   eval "$defs" >/dev/null 2>&1 || warn "could not apply the environment read from $f"
   return 0
+}
+
+# args_override <component> — the operator's per-component flags, from `HARNESS_ARGS_<COMPONENT>`
+# (upper-cased, `-` → `_`): e.g. `HARNESS_ARGS_DISKREAPER=--apply`.
+# ⛔ READ ONLY AFTER load_env_file. A systemd unit / launchd agent does not carry the operator's
+# interactive shell, so the knob must be settable in the SAME env file the components inherit —
+# otherwise the documented arming switch silently does nothing on every supervised box (which is
+# exactly what it did before this arm existed: the README promised it, no code read it).
+# bash 3.2: indirect expansion `${!var}`, not `${x^^}` — the name is upper-cased with `tr`.
+args_override() {
+  local name="$1" var
+  var="HARNESS_ARGS_$(printf '%s' "$name" | tr 'a-z-' 'A-Z_')"
+  printf '%s\n' "${!var:-}"
 }
 
 cmd_run() {
@@ -927,6 +1087,12 @@ cmd_run() {
   mkdir -p "$LOG_DIR" "$QUEUE_DIR/$name" 2>/dev/null
   export HARNESS_ROOT HARNESS_STATE_DIR="$STATE" PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
   load_env_file
+  # Operator flags for THIS component (the arming switch for a dry-run-by-default tool) are applied
+  # after the env file, so they can be set where a supervisor can see them. An empty value keeps the
+  # inventory's declared args — the inventory stays the default authority.
+  local over
+  over="$(args_override "$name")"
+  [ -n "$over" ] && args="$over"
   # The controller reads $O (seeded worker scripts). Default it as the platform's own supervisor
   # does, so a component started by THIS supervisor behaves exactly like one started by hand.
   if [ -z "${O:-}" ]; then
@@ -968,11 +1134,22 @@ cmd_run() {
         if [ -z "$job" ]; then sleep 15 & wait $! || exit 0; continue; fi
         rc=0
         printf '[harness] %s: worker start %s\n' "$name" "$job"
+        # ⛔ THE WORKER OWNS AND rm's ITS ARGV FILE (`merge-one.sh`/`fix-one.sh` do), so "is the job
+        # file still there" is NOT how a failure is detected: the `.failed-$rc` rename below was dead
+        # code for both pools and a failed job left no state at all. Snapshot the job first, record the
+        # outcome from rc, and retire a job a worker failed to remove so the pool cannot spin on it.
+        cp "$job" "$job.running" 2>/dev/null
         $interp "$entry" --argv "$job" $args || rc=$?
         printf '[harness] %s: worker exit %s (%s)\n' "$name" "$rc" "$job"
-        # A failed worker must not leave its job at the queue head, or the pool spins on the same
-        # file forever and reports a busy component that is making no progress.
-        [ -f "$job" ] && mv -f "$job" "$job.failed-$rc"
+        if [ "$rc" -ne 0 ]; then
+          if [ -f "$job.running" ]; then
+            mv -f "$job.running" "$job.failed-$rc" 2>/dev/null || warn "$name: could not record $job.failed-$rc"
+          fi
+          [ -f "$job" ] && mv -f "$job" "$job.failed-$rc" 2>/dev/null
+        else
+          rm -f "$job.running"
+          [ -f "$job" ] && mv -f "$job" "$job.done" 2>/dev/null
+        fi
       done ;;
     *) refuse "run: unknown kind '$kind' for component '$name'" ;;
   esac

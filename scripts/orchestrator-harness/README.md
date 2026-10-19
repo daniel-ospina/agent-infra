@@ -138,10 +138,16 @@ owned *what runs, from which bytes, and whether it is alive* on either platform.
 |---|---|---|---|
 | `orch` | daemon | `orch-loop.sh` | runs until it exits; the supervisor restarts it |
 | `heartbeat` | daemon | `scripts/heartbeat-loop.sh` | same |
-| `diskreaper` | loop | `scripts/disk-reaper.sh` | one pass per interval (default 1 h). **Dry-run by default** — arming reclamation is an operator decision (`HARNESS_DISKREAPER_ARGS=--apply`), and `eldato-disk-reaper.timer` may already own it |
+| `diskreaper` | loop | `scripts/disk-reaper.sh` | one pass per interval (default 1 h). **Dry-run by default** — arming reclamation is an operator decision: put `HARNESS_ARGS_DISKREAPER=--apply` in the env file the components inherit (the `keys.env` / `bringup.env` the unit's `EnvironmentFile` names — a systemd unit does not see your interactive shell), and `eldato-disk-reaper.timer` may already own it |
 | `pr-doctor` | loop | `scripts/pr-doctor.py` | one pass per interval (default 15 min) |
 | `merge` | pool | `merge-one.sh` | **demand-driven**, not a daemon: it takes one job from `$HARNESS_STATE_DIR/queue/merge/` per turn |
 | `fix` | pool | `fix-one.sh` | same, `queue/fix/` |
+
+**Per-component flags.** `HARNESS_ARGS_<COMPONENT>` (upper-cased, `-` → `_`, e.g.
+`HARNESS_ARGS_PR_DOCTOR`) **replaces** that row's declared args when set and non-empty; unset or
+empty keeps the inventory's args, so the inventory stays the default authority. It is read **after**
+the env file is loaded — that is what makes the knob available to a supervised component rather than
+only to an interactive shell.
 
 The queue is **empty by default**, so a pool idles: the controller (`orch`) remains the thing that
 decides what work exists. A pool gives merge/fix the two properties the starter exists for — a
@@ -151,11 +157,24 @@ second dispatcher.
 ### Version discipline — exactly one harness sha may be active
 
 `start` reconciles **before** it launches: any process running from a different
-`<pin>/<sha12>/scripts/orchestrator-harness` under the active harness's own pin root is **stopped and
-named** (`version-discipline: stopping pid N from <path> (sha X; active is Y)`), never silently
-co-run. The scope is deliberately the pin root only: a box-wide `pgrep -f orch-loop.sh` also matches a
-peer lane's test fixture and a proof-run copy, and a kill driven by that read destroys somebody else's
-work.
+`<pin>/<sha>/scripts/…` under the active harness's own pin root is **stopped and named**
+(`version-discipline: stopping pid N from <path> (sha X; active is Y)`), never silently co-run. The
+scope is deliberately the pin root only: a box-wide `pgrep -f orch-loop.sh` also matches a peer lane's
+test fixture and a proof-run copy, and a kill driven by that read destroys somebody else's work.
+
+Three harder rules, each learned from a false PASS:
+
+- **A pin token is 6–40 hex, not exactly 12.** The live cells pin with eight
+  (`/tmp/cell-home/harness/2ddd5b5a`); a 12-hex-only pattern read every pin as `unknown`, so two
+  different versions counted as one and the two-version check could never fire on the boxes it is for.
+- **An undetermined active sha never kills.** A pin that is not a git checkout and carries no
+  `.harness-sha` answers `unknown`, and comparing something to `unknown` marks the ACTIVE version
+  foreign. `start` then says so and skips reconciliation; `install` records `.harness-sha` so the
+  answer is determinable next time.
+- **`start` refuses stale units.** A unit is a snapshot of the root it was rendered from. After a pin
+  move the installed units still name the OLD `bin/harness`, so `start` would launch older bytes, report
+  success, and overwrite the recorded sha that `doctor` compares against. It compares a fresh render
+  against what is installed and refuses with `run 'harness install' first`.
 
 ### `status` — the shape of the answer
 
@@ -168,24 +187,33 @@ HARNESS VERSIONS    1 running
 ```
 
 `RUNNING(dir)` names the directory the component **actually runs from** (attributed from its pid's
-argv), not where the entry point happens to live. `DEAD` carries the supervisor's last exit code and
+argv), not where the entry point happens to live. When a pid's argv cannot be attributed the line says
+`RUNNING(pid N, dir UNATTRIBUTABLE …)` — it never falls back to the active harness dir, because that
+would claim the active bytes for a stale component, which is the question `status` exists to answer. `DEAD` carries the supervisor's last exit code and
 the component's own last log line — the two data a reader needs and the two nobody was reading. A
 state the supervisor cannot answer is `UNKNOWN`, and `status` exits 2: an unreadable read is never a
 pass. Exit codes: `0` all running · `1` a component is not OK · `2` cannot determine.
 
-### `doctor` — the five silent-death states, and one warning
+### `doctor` — the six silent-death states, and two warnings
 
 | finding | why it is a FAIL |
 |---|---|
 | **two harness versions running** | the measured incident; both drain the same queue with different code |
 | **a component running from a different sha than the active one** | the same defect, one component at a time (a stale restart) |
 | **a required component missing** (its entry is gone) | the unit can only crash-loop; nothing says so |
+| **a required component's UNIT was never installed** | code present, no supervisor record — every other row passes, and the component never runs |
 | **no supervisor** | units absent, or `systemctl --user` / launchd unreachable — nothing can start or restart anything |
 | **enabled but not running** | the state that looks installed and does nothing |
 
-and one **WARN**: a controller running from a pid that is not the supervisor's `MainPID` — the shape of
-the hand launch above. A warning rather than a failure, because a box being migrated has exactly one
-supervisor and is not broken; a check that reds on a state it cannot repair gets ignored.
+**Two versions running**, and **one running version that is not the active sha**, are both failures —
+a count alone is not a comparison. So is a read that attributed **no** harness process at all, and an
+**undeterminable** active sha: an unmeasurable version state is never a pass.
+
+Two **WARN**s: a harness process running from a pid that is not the supervisor's `MainPID` — the shape
+of the hand launch above — and a version running from a checkout **outside** this box's pin root (a
+peer lane's worktree). Both are warnings rather than failures: a box being migrated has exactly one
+supervisor and is not broken, and `start` cannot reconcile a checkout it does not own — a failure whose
+printed remedy cannot work is how a gate gets ignored.
 
 ### Lanes are started by the supervisor — never by hand
 

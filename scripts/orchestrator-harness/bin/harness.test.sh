@@ -256,15 +256,18 @@ esac
 ck "status prints how many harness versions are running" $rc
 
 # ═══ §3 — doctor: two harness versions is a FAILURE, and both are NAMED ══════════════════════
-# Non-vacuity: make distinct_shas return only the first row and this reddens (count 1, no FAIL).
+# Non-vacuity: make distinct_shas return only the first row and this reddens (count 1, no FAIL); drop
+# the active-sha comparison and the SECOND arm below reddens (one version, wrong sha, read as healthy).
 # Every component is UP first, so the ONLY possible finding in this arm is the version one — an arm
 # that reads rc=1 for an unrelated reason proves nothing about the version check.
+# HARNESS_PIN_ROOT names the pin this box OWNS: the version verdict is scoped to it, so a foreign sha
+# under it is this box's to reconcile (FAIL) while a peer checkout's is not (WARN, see §9b).
 rm -f "$STUB_STATE"/*.state
 printf 'active 4242 0\n' >"$STUB_STATE/harness-orch.service.state"
 for c in diskreaper heartbeat pr-doctor merge fix; do printf 'active 6000 0\n' >"$STUB_STATE/harness-$c.service.state"; done
 write_ps " 4242 bash $PIN/$ACTIVE/scripts/orchestrator-harness/bin/harness run orch" \
          " 9999 bash $PIN/bbbbbbbbbbbb/scripts/orchestrator-harness/orch-loop.sh"
-out="$(run_h bash "$FH/bin/harness" doctor 2>&1)"; rc=$?
+out="$(run_h env HARNESS_PIN_ROOT="$PIN" bash "$FH/bin/harness" doctor 2>&1)"; rc=$?
 [ "$rc" -eq 1 ]; rc=$?
 ck "doctor FAILS with two harness shas running" $rc
 case "$out" in
@@ -376,7 +379,7 @@ for c in diskreaper heartbeat pr-doctor merge fix; do printf 'active 6000 0\n' >
 write_ps " 7777 bash $FH/orch-loop.sh"
 out="$(run_h bash "$FH/bin/harness" doctor 2>&1)"; rc=$?
 case "$out" in
-  *"DOCTOR WARN: a controller is running OUTSIDE the supervisor (pid 7777"*) rc1=0 ;;
+  *"DOCTOR WARN: a harness process is running OUTSIDE the supervisor (pid 7777"*) rc1=0 ;;
   *) rc1=1 ;;
 esac
 ck "doctor WARNS about a controller launched outside the supervisor" $rc1
@@ -395,6 +398,28 @@ printf '#!/usr/bin/env bash\nprintf ran > %s\n' "$MARK" >"$FH/orch-loop.sh"
 out="$(run_h bash "$FH/bin/harness" run orch 2>&1)"; rc=$?
 [ -f "$MARK" ]; rc=$?
 ck "run executes the DECLARED entry for the component (the inventory is the authority)" $rc
+
+# ── §7b — the ENV FILE reaches the component, and the per-component ARGS override ────────────
+# Two arms, because the same seam produced two silent no-ops:
+#  (a) `load_env_file` eval'd `export -p`'s `declare -x …` output INSIDE a function, where bash makes
+#      it LOCAL — so the component inherited NOTHING from keys.env while the code claimed the hand
+#      launch's environment was reproduced. Measured before the fix: a `FOO=fromenvfile` env file
+#      read as `FOO=[MISSING]` in the component. Reverting the `export` rewrite reddens this arm.
+#  (b) the README promises `HARNESS_ARGS_<COMPONENT>` can arm a dry-run-by-default tool (diskreaper);
+#      delete the `args_override` application in `cmd_run` and the armed arm reddens. Read the
+#      override BEFORE `load_env_file` and it reddens too: a systemd unit does not carry the
+#      operator's shell, so the env file is the only place a supervised component could find it.
+printf 'FOO=fromenvfile\nHARNESS_ARGS_ORCH=--armed\n' >"$TMP/comp.env"
+printf '#!/usr/bin/env bash\nprintf "FOO=[%%s] args=[%%s]" "${FOO:-MISSING}" "$*" > %s\n' "$MARK" >"$FH/orch-loop.sh"
+out="$(run_h env HARNESS_ENV_FILE="$TMP/comp.env" bash "$FH/bin/harness" run orch 2>&1)"; rc=$?
+seen="$(cat "$MARK" 2>/dev/null)"
+[ "$rc" -eq 0 ] && [ "$seen" = "FOO=[fromenvfile] args=[--armed]" ]; rc=$?
+ck "the env file REACHES the component, and HARNESS_ARGS_<COMPONENT> arms it" $rc
+printf 'FOO=fromenvfile\nHARNESS_ARGS_ORCH=\n' >"$TMP/comp.env"
+out="$(run_h env HARNESS_ENV_FILE="$TMP/comp.env" bash "$FH/bin/harness" run orch 2>&1)"; rc=$?
+seen="$(cat "$MARK" 2>/dev/null)"
+[ "$rc" -eq 0 ] && [ "$seen" = "FOO=[fromenvfile] args=[]" ]; rc=$?
+ck "an EMPTY override keeps the inventory's args (the inventory stays the default authority)" $rc
 printf '#!/usr/bin/env bash\nsleep 300\n' >"$FH/orch-loop.sh"
 
 # ═══ §8 — a unit whose path would break the version read is REFUSED at install time ══════════
@@ -450,6 +475,144 @@ run_h bash "$FH/bin/harness" restart >/dev/null 2>&1; rc=$?
 ck "restart exits 0" $rc
 grep -q '^systemctl --user stop ' "$STUB_LOG" && grep -q '^systemctl --user start ' "$STUB_LOG"; rc=$?
 ck "restart stops AND starts through the supervisor" $rc
+
+# ═══ §10 — an UNDETERMINED active sha is never a reason to kill ══════════════════════════════
+# Measured shape: a cloud pin `/tmp/cell-home/harness/<8hex>/` is NOT a git checkout and carries no
+# .harness-sha, so `active_sha` answers `unknown`. Without the guard, EVERY live sha differs from
+# `unknown`, so `start` TERM→KILLs the box's own components (a pool mid-job included) and calls it
+# reconciliation. Non-vacuity: delete the `active = unknown` guard in `enforce_single_version` and the
+# sleeping process below is killed and reported as "stopping pid … (active is unknown)".
+PINU="$TMP/pin-undet"; HDU="$PINU/aaaaaaaaaaaa/scripts/orchestrator-harness"
+make_harness "$PINU/aaaaaaaaaaaa"
+printf '#!/usr/bin/env bash\nsleep 300\n' >"$HDU/orch-loop.sh"; chmod +x "$HDU/orch-loop.sh"
+bash "$HDU/orch-loop.sh" >/dev/null 2>&1 &
+LPID=$!; SPAWNED="${SPAWNED:-} $LPID"
+i=0; while [ "$i" -lt 50 ] && ! kill -0 "$LPID" 2>/dev/null; do sleep 0.05; i=$((i + 1)); done
+rm -f "$STUB_STATE"/*.state
+# install with NO usable sha: no git under $PINU and HARNESS_ACTIVE_SHA unset, so nothing records one.
+run_h env -u HARNESS_ACTIVE_SHA HARNESS_ROOT="$HDU" HARNESS_UNIT_DIR="$TMP/units-undet" \
+  bash "$HDU/bin/harness" install >/dev/null 2>&1
+out="$(run_h env -u HARNESS_ACTIVE_SHA -u HARNESS_PS_FILE HARNESS_ROOT="$HDU" HARNESS_UNIT_DIR="$TMP/units-undet" \
+        bash "$HDU/bin/harness" start 2>&1)"; rc=$?
+case "$out" in *"version reconciliation SKIPPED"*) rc1=0 ;; *) rc1=1 ;; esac
+ck "start NAMES the undetermined active sha and skips reconciliation" $rc1
+kill -0 "$LPID" 2>/dev/null; rc=$?
+[ "$rc" -eq 0 ]; rc=$?
+ck "an undetermined active sha does NOT kill a live component (a kill needs a measured version)" $rc
+kill -KILL "$LPID" 2>/dev/null
+
+# ═══ §11 — doctor: ONE running version that is not the active sha is a FAILURE ════════════════
+# Non-vacuity: go back to testing only `count -gt 1` and this arm reads rc=0 with "doctor: OK" over a
+# component running different bytes — a COUNT standing in for a comparison.
+rm -f "$STUB_STATE"/*.state
+for c in orch diskreaper heartbeat pr-doctor merge fix; do printf 'active 6000 0\n' >"$STUB_STATE/harness-$c.service.state"; done
+write_ps " 4242 bash $PIN/bbbbbbbbbbbb/scripts/orchestrator-harness/bin/harness run orch"
+out="$(run_h env HARNESS_PIN_ROOT="$PIN" bash "$FH/bin/harness" doctor 2>&1)"; rc=$?
+[ "$rc" -eq 1 ]; rc=$?
+ck "doctor FAILS when the ONLY running version is not the active sha" $rc
+case "$out" in *"the only running harness version is NOT the active one"*) rc=0 ;; *) rc=1 ;; esac
+ck "doctor says the single running version is not the active one" $rc
+case "$out" in *"sha bbbbbbbbbbbb from $PIN/bbbbbbbbbbbb"*) rc=0 ;; *) rc=1 ;; esac
+ck "doctor names the wrong sha and its path (not just a count)" $rc
+
+# ═══ §11b — ZERO attributable processes is unmeasurable, not healthy ══════════════════════════
+# Non-vacuity: drop the count==0 branch and doctor prints "OK — ... all components supervised and
+# running" off a read that measured nothing.
+rm -f "$STUB_STATE"/*.state
+for c in orch diskreaper heartbeat pr-doctor merge fix; do printf 'active 6000 0\n' >"$STUB_STATE/harness-$c.service.state"; done
+write_ps
+out="$(run_h env HARNESS_PIN_ROOT="$PIN" bash "$FH/bin/harness" doctor 2>&1)"; rc=$?
+[ "$rc" -eq 1 ]; rc=$?
+ck "doctor FAILS when no harness process could be attributed" $rc
+case "$out" in *"the version state is unmeasurable, which is never a pass"*) rc=0 ;; *) rc=1 ;; esac
+ck "doctor says the zero-row read is unmeasurable" $rc
+
+# ═══ §11c — a version from ANOTHER checkout is named, and NOT graded as this box's ═══════════
+# Non-vacuity: grade every foreign row as a FAIL and this arm reds — with a remedy ("run harness
+# start") that can never reach a peer lane's worktree, which is how a gate gets ignored.
+rm -f "$STUB_STATE"/*.state
+for c in orch diskreaper heartbeat pr-doctor merge fix; do printf 'active 6000 0\n' >"$STUB_STATE/harness-$c.service.state"; done
+write_ps " 4242 bash $PIN/$ACTIVE/scripts/orchestrator-harness/bin/harness run orch" \
+         " 9999 bash $TMP/peer-lane/scripts/orchestrator-harness/bin/harness run orch"
+out="$(run_h env HARNESS_PIN_ROOT="$PIN" bash "$FH/bin/harness" doctor 2>&1)"; rc=$?
+[ "$rc" -eq 0 ]; rc=$?
+ck "an out-of-pin checkout does not fail this box's doctor" $rc
+case "$out" in *"OUTSIDE $PIN"*"does not reconcile it"*) rc=0 ;; *) rc=1 ;; esac
+ck "doctor names the out-of-pin version and says start will not reach it" $rc
+
+# ═══ §12 — start REFUSES units rendered from a different harness root ═════════════════════════
+# After a pin move the installed units still name the OLD bin/harness. Without this refusal `start`
+# launches stale bytes, reports "6 started", and overwrites the recorded sha that doctor compares
+# against — a false PASS that disarms its own detector.
+# Non-vacuity: delete the stale-unit comparison and this arm reads rc=0.
+OTHER="$TMP/other-pin/bbbbbbbbbbbb/scripts/orchestrator-harness"
+make_harness "$TMP/other-pin/bbbbbbbbbbbb"
+run_h bash "$FH/bin/harness" install >/dev/null 2>&1         # units rendered from $FH
+rm -f "$STUB_STATE"/*.state
+out="$(run_h env HARNESS_ROOT="$OTHER" HARNESS_ACTIVE_SHA=bbbbbbbbbbbb \
+        bash "$OTHER/bin/harness" start 2>&1)"; rc=$?
+[ "$rc" -eq 1 ]; rc=$?
+ck "start REFUSES when the installed units name a different harness root" $rc
+case "$out" in *"run 'harness install' first"*) rc=0 ;; *) rc=1 ;; esac
+ck "start says the units are stale and what to run" $rc
+case "$out" in *"started"*) rc=1 ;; *) rc=0 ;; esac
+ck "start does not claim it started anything on stale units" $rc
+
+# ═══ §13 — a keys.env that EXITS part-way is named, not silently half-applied ════════════════
+# Non-vacuity: remove the HARNESS_ENV_STATUS sentinel and the warning disappears while BAR stays
+# silently unset — the silent variant of the `exit 0` class (#1713).
+printf 'FOO=one\nexit 0\nBAR=two\n' >"$TMP/exit.env"
+printf '#!/usr/bin/env bash\nprintf "FOO=[%%s] BAR=[%%s]" "${FOO:-MISS}" "${BAR:-MISS}" > %s\n' "$MARK" >"$FH/orch-loop.sh"
+out="$(run_h env HARNESS_ENV_FILE="$TMP/exit.env" bash "$FH/bin/harness" run orch 2>&1)"; rc=$?
+[ "$rc" -eq 0 ] && [ "$(cat "$MARK" 2>/dev/null)" = "FOO=[one] BAR=[MISS]" ]; rc=$?
+ck "a keys.env that exits part-way still applies what it declared BEFORE the exit" $rc
+case "$out" in *"exited before it finished"*) rc=0 ;; *) rc=1 ;; esac
+ck "run WARNS that the env file exited before it finished" $rc
+printf '#!/usr/bin/env bash\nsleep 300\n' >"$FH/orch-loop.sh"
+
+# ═══ §13b — status never FABRICATES the dir a component runs from ════════════════════════════
+# Non-vacuity: restore the `[ -n "$procdir" ] || procdir="$HARNESS_ROOT"` fallback and the second arm
+# reds: the line claims the ACTIVE harness dir for a pid whose argv was never read.
+rm -f "$STUB_STATE"/*.state
+printf 'active 4242 0\n' >"$STUB_STATE/harness-orch.service.state"
+write_ps
+out="$(run_h bash "$FH/bin/harness" status 2>&1)"; rc=$?
+case "$out" in *"RUNNING(pid 4242, dir UNATTRIBUTABLE"*) rc1=0 ;; *) rc1=1 ;; esac
+ck "status marks an unreadable pid UNATTRIBUTABLE instead of guessing" $rc1
+case "$out" in *"RUNNING($FH)"*) rc=1 ;; *) rc=0 ;; esac
+ck "status does not claim the active harness dir for a pid it could not read" $rc
+
+# ═══ §14 — a pool RECORDS a failed job (the worker owns and removes its argv file) ═══════════
+# Non-vacuity: go back to `[ -f "$job" ] && mv "$job" "$job.failed-$rc"` and no failed record appears
+# at all, because merge-one.sh/fix-one.sh `rm` the argv file themselves before they return.
+JQ="$TMP/state/queue/merge"; mkdir -p "$JQ"
+printf 'repo\nor\n1\nbranch\n' >"$JQ/1.job"
+printf '#!/usr/bin/env bash\nA="${2:-}"\n[ -f "$A" ] && rm -f "$A"\nexit 3\n' >"$FH/merge-one.sh"; chmod +x "$FH/merge-one.sh"
+run_h bash "$FH/bin/harness" run merge >/dev/null 2>&1 &
+RPID=$!; SPAWNED="${SPAWNED:-} $RPID"
+i=0; while [ "$i" -lt 60 ] && [ ! -f "$JQ/1.job.failed-3" ]; do sleep 0.05; i=$((i + 1)); done
+kill -TERM "$RPID" 2>/dev/null; wait "$RPID" 2>/dev/null
+[ -f "$JQ/1.job.failed-3" ]; rc=$?
+ck "a pool records a failed job as .failed-<rc> even though the worker removed its argv file" $rc
+printf '#!/usr/bin/env bash\nexit 0\n' >"$FH/merge-one.sh"; chmod +x "$FH/merge-one.sh"
+
+# ═══ §15 — an EIGHT-hex pin counts as two versions, and a scripts/ entry is attributable ══════
+# The live cells pin with 8 hex (`/tmp/cell-home/harness/2ddd5b5a`). A 12-hex-only pattern read every
+# pin as `unknown`, collapsing two DIFFERENT versions into one row — the two-version check inert on
+# the exact boxes it exists for. Non-vacuity: restore the 12-hex pattern and both arms red.
+# The second row is `…/<sha>/scripts/heartbeat-loop.sh`: the components living in `scripts/` are
+# exec'd from there, so their argv names `…/scripts`, not `…/scripts/orchestrator-harness`.
+PIN8="$TMP/pin8"
+rm -f "$STUB_STATE"/*.state
+for c in orch diskreaper heartbeat pr-doctor merge fix; do printf 'active 6000 0\n' >"$STUB_STATE/harness-$c.service.state"; done
+write_ps " 4242 bash $PIN8/aaaa1234/scripts/orchestrator-harness/bin/harness run orch" \
+         " 9999 bash $PIN8/bbbb5678/scripts/heartbeat-loop.sh"
+out="$(run_h env HARNESS_PIN_ROOT="$PIN8" HARNESS_ACTIVE_SHA=aaaa1234 bash "$FH/bin/harness" doctor 2>&1)"; rc=$?
+rc1=1
+[ "$rc" -eq 1 ] && case "$out" in *"2 harness versions are running"*) rc1=0 ;; esac
+ck "doctor COUNTS two versions in two EIGHT-hex pins" $rc1
+case "$out" in *"sha bbbb5678 from $PIN8/bbbb5678/scripts"*) rc=0 ;; *) rc=1 ;; esac
+ck "doctor attributes an exec'd scripts/ entry to its own pin sha" $rc
 
 echo "───────────────────────────────────────────────────────────────────"
 echo "harness.test.sh: PASS=$PASS FAIL=$FAIL"
