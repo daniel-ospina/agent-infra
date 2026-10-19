@@ -2014,12 +2014,15 @@ def test_an_unusable_PRIMARY_payload_reaches_the_second_source_and_is_ATTRIBUTED
 
     # Both sources unusable: `queue=UNREADABLE`, and (see
     # `test_an_unread_queue_is_never_cached_even_without_a_gh_claim`) never cached. The claim
-    # stays OFF, and the reason is NOT `transport=False` (#2138 r8, reviewer B): this fixture's
-    # fallback RAISES (the default `fake_rest_get`), so since the composite classification the
-    # note carries `transport=True` and the claim is suppressed by the `TRANSPORT_MARKERS` gate
-    # instead -- both texts are marker-free. `test_a_PARSE_failure_...` isolates the OTHER
-    # direction (a non-transport fallback with a marker-bearing primary), which is the one the
-    # marker gate cannot cover.
+    # stays OFF because the composite is a NON-TRANSPORT failure -- the default fixture returns a
+    # NON-LIST BODY, so `_queue_rest` returns None without setting `_REST_TRANSPORT`, and a
+    # STATED `False` suppresses the claim outright (#2138 r10, reviewers A + B).
+    # ⛔ THIS COMMENT HAS BEEN WRONG TWICE, SO IT NOW NAMES THE MECHANISM THAT CAN BE CHECKED in
+    # this very cell rather than a plausible one. It first credited `transport=False` when the
+    # fixture raised (a transport-shaped failure); then, after the r9 tri-state, it credited the
+    # `TRANSPORT_MARKERS` gate under a fixture that had already stopped raising. Suppression is
+    # the `transport is False` arm in `_note_gh_failure` -- if that arm is deleted, THIS cell
+    # fails, which is the check that keeps the sentence honest.
     install(monkeypatch, pr_list=_Result(0, "not json at all"), rest_prs=None)
     line = objective.build()
     assert "queue=UNREADABLE" in line, line
@@ -2091,9 +2094,16 @@ def test_a_PARSE_failure_does_not_claim_blindness_even_when_its_TEXT_says_transp
 
     ⛔ THE FALLBACK FAILS HERE FOR A **NON-TRANSPORT** REASON ON PURPOSE (#2138 r7, reviewer A).
     An absent token makes `_queue_rest` return None without opening a socket, so the composite
-    classification has nothing to OR in and the PRIMARY's parse failure is isolated. Using the
-    default fixture (which raises) would classify the fallback as a transport failure and the
-    composite WOULD legitimately claim — that case is the test below.
+    classification has nothing to OR in and the PRIMARY's parse failure is isolated — which is the
+    direction a marker-bearing PRIMARY has to be tested from.
+
+    ⛔ `gh_token=None` IS NO LONGER THE ONLY WAY TO GET THAT, AND THE EARLIER TEXT HERE SAID IT WAS
+    (#2138 r10, reviewers A + B). It claimed "using the default fixture (which raises) would
+    classify the fallback as a transport failure and the composite WOULD legitimately claim".
+    Since r9 the default fixture does not raise — it returns a non-list, which is non-transport —
+    so it would suppress the claim too. The explicit token still earns its place: it says WHY the
+    fallback failed, so the cell cannot drift if the default fixture ever changes again. What it
+    is NOT is the only route.
     """
     for body in ('{"message": "read timed out"}',            # a TRANSPORT_MARKER in the text
                  '{"message": "connection reset by peer"}'):
@@ -2134,7 +2144,7 @@ def test_a_PARSE_failure_does_not_claim_blindness_even_when_its_TEXT_says_transp
     assert "VERDICT=GH-RATE-LIMITED" in line, line
 
 
-def _real_http_error(code, reason, headers=None):
+def _real_http_error(code, reason, headers=None, fp=None):
     """A REAL `urllib.error.HTTPError`, exactly as `_rest_get` receives one from the wire.
 
     ⛔ BUILT, NOT INVENTED AS A STRING (#2138 r9, reviewers A + B). The previous version of the
@@ -2149,7 +2159,9 @@ def _real_http_error(code, reason, headers=None):
     h = email.message.Message()
     for k, v in (headers or {}).items():
         h[k] = v
-    return urllib.error.HTTPError(f"https://api.github.com/x", code, reason, h, None)
+    # `fp` matters: `HTTPError` only gains `.read()` when constructed WITH a file object, which is
+    # exactly how urllib raises it from the wire. Passing None models a headerless error.
+    return urllib.error.HTTPError(f"https://api.github.com/x", code, reason, h, fp)
 
 
 # The REAL `_rest_get`, captured before any test can stub it (`install()` replaces it).
@@ -2191,6 +2203,55 @@ def test_a_REFUSED_fallback_still_claims_even_when_the_primary_was_mangled(monke
     assert "gh=RATE-LIMITED(queue)" in line, line        # ...the ATTRIBUTION
     assert "VERDICT=GH-RATE-LIMITED" in line, line       # ...the actionable verdict word
     assert "x-ratelimit-remaining=0" in objective.GH_LAST_ERROR, objective.GH_LAST_ERROR
+
+
+def test_a_fallback_that_fails_WITHOUT_an_HTTP_status_still_claims(monkeypatch):
+    """⛔ "TRANSPORT" IS NOT A SYNONYM FOR "HTTPError" (#2138 r10, reviewer B).
+
+    Reviewer B measured that this PR's own fixture change DELETED the last pin on this: mutating
+    `_REST_TRANSPORT` to `type(e).__name__ == "HTTPError"` left the whole suite green, while the
+    live behaviour for a captive portal, a half-open connection or a DNS failure — none of which
+    produces an `HTTPError` — silently lost its attribution and its verdict word.
+
+    The text here is deliberately MARKER-FREE (`"closed"`), so the claim can only come from the
+    stated transport fact; a narrowing to `HTTPError` reds this cell.
+    """
+    install(monkeypatch, pr_list=_Result(0, '{"message": "Bad credentials"}'), rest_prs=None)
+    _drive_real_rest_get(monkeypatch, OSError("closed"))
+    line = objective.build()
+    assert "queue=UNREADABLE" in line, line
+    assert "gh=UNREADABLE(queue)" in line, line          # a non-HTTP transport failure still claims
+
+
+def test_the_rate_limit_KIND_follows_the_strongest_evidence_available():
+    """⛔ THE KIND IS DECIDED FROM EVIDENCE, STRONGEST FIRST, AND NEVER OVER-CLAIMS (#2138 r10).
+
+    Reviewer A measured that the `429` arm and the `retry-after` arm were both UNPINNED — deleting
+    either left the suite green — and that accepting `retry-after` on ANY status turns an ordinary
+    5xx outage into `VERDICT=GH-RATE-LIMITED`, telling the fleet to wait out a limit that never
+    existed. Under-classifying is the safe direction; over-classifying is not.
+    """
+    import io as _io
+
+    def text(code, reason, headers=None, body=b""):
+        return objective._rest_refusal_text(
+            _real_http_error(code, reason, headers, _io.BytesIO(body) if body else None))
+
+    # a 429 is the limit, with or without any header
+    assert "rate limit" in text(429, "Too Many Requests"), text(429, "Too Many Requests")
+    # GitHub's own body sentence is evidence even when no header says so
+    assert "rate limit" in text(403, "Forbidden",
+                                body=b'{"message":"API rate limit exceeded for user ID 1."}')
+    # ...and its absence does NOT manufacture one
+    assert "rate limit" not in text(403, "Forbidden", body=b'{"message":"Bad credentials"}')
+    # a retry-after on a rate-limit status is corroboration
+    assert "retry-after=60" in text(403, "Forbidden", {"retry-after": "60"})
+    # ⛔ BUT ON AN ORDINARY OUTAGE IT IS NOT A LIMIT (RFC 7231 pairs it with 503 too)
+    assert "rate limit" not in text(503, "Service Unavailable", {"retry-after": "60"})
+    assert "rate limit" not in text(503, "Service Unavailable",
+                                    {"x-ratelimit-remaining": "0"})
+    # and every spelling still names a status a human can act on
+    assert text(503, "Service Unavailable").startswith("HTTP 503")
 
 
 def test_a_REFUSAL_with_NO_limit_headers_still_claims_and_stays_UNREADABLE(monkeypatch):

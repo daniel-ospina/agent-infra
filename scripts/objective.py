@@ -1303,34 +1303,70 @@ def _gh_token():
 def _rest_refusal_text(e):
     """Name a REST refusal by its STATUS and its LIMIT EVIDENCE — never by a guess (#2138 r9).
 
-    ⛔ WHY THIS EXISTS AT ALL. `urllib` raises before the body is readable, so the text of an
-    `HTTPError` is only "HTTP Error 403: Forbidden" — the reason phrase, never the message GitHub
-    sent. That spelling misses `TRANSPORT_MARKERS` ("http 4" is not a substring of "http error
-    403"), so a REAL refusal classified as transport still published NO claim: measured, a mangled
-    primary plus a genuine 403 printed `queue=UNREADABLE` with no `gh=` and `VERDICT=UNKNOWN`. Both
-    reviewers found this independently, and the old test hid it behind a hand-built `OSError`
-    carrying a string this path can never emit.
+    ⛔ WHY THIS EXISTS AT ALL. The TEXT of an `HTTPError` is only "HTTP Error 403: Forbidden" —
+    the reason phrase, never the message GitHub sent — and that spelling misses
+    `TRANSPORT_MARKERS` ("http 4" is not a substring of "http error 403"), so a REAL refusal
+    classified as transport still published NO claim: measured, a mangled primary plus a genuine
+    403 printed `queue=UNREADABLE` with no `gh=` and `VERDICT=UNKNOWN`. Both reviewers found this
+    independently, and the old test hid it behind a hand-built `OSError` carrying a string this
+    path can never emit.
 
-    The status code IS available, and so are the response headers — so the KIND is decided from
-    evidence rather than from a word in a message we never received:
-      * 429, an `x-ratelimit-remaining: 0`, or a `retry-after` is a rate limit, and says which;
-      * any other status names the status and nothing more, so the claim stays UNREADABLE.
-    Both spellings carry "http 4"/"http 5", which is what lets the claim fire at all.
+    ⛔ AND ONE EARLIER SENTENCE HERE WAS ITSELF FALSE, WHICH IS WHY IT IS SPELLED OUT (#2138 r10,
+    reviewer A/P3). It said "`urllib` raises before the body is readable". Measured against a real
+    403, `e.read()` returns GitHub's body perfectly well — only `str()` is the reason phrase.
+    Reading it is NOT free, though: the error path has no chunk loop, so a bounded read here is
+    one `read(ERR_BODY_BYTES)` under the socket's own timeout, and a large or slow error body is
+    the hazard the chunk loop exists to remove. So it IS read, but ONCE and CAPPED, and a failure
+    to read it is silent. The old wording turned a deliberate trade-off into an impossibility and
+    kept the best evidence on the floor.
+
+    The KIND is therefore decided from evidence, strongest first:
+      * a 429 is GitHub's rate-limit status;
+      * the error body NAMING the rate limit (the exact sentence GitHub sends);
+      * on a 403/429 only, `x-ratelimit-remaining: 0` or a `retry-after`;
+      * otherwise only the status is named, so the claim stays UNREADABLE rather than inventing a
+        limit GitHub never reported.
+    ⛔ `retry-after` IS GATED ON 403/429 ON PURPOSE (#2138 r10, reviewer A residual). RFC 7231
+    pairs it with 503 as well, so an edge emitting `Retry-After` on an ordinary outage would
+    otherwise turn `VERDICT` into GH-RATE-LIMITED and tell the fleet to wait out a limit that
+    never existed. Under-classifying is the safe direction; over-classifying is not.
     """
     def _h(name):
         try:
             return (e.headers.get(name) or "").strip().lower()
         except Exception:
             return ""
+    limit_status = e.code in (403, 429)
     why = []
     if e.code == 429:
         why.append("429 is GitHub's rate-limit status")
-    if _h("x-ratelimit-remaining") == "0":
-        why.append("x-ratelimit-remaining=0")
-    if _h("retry-after"):
-        why.append("retry-after=" + _h("retry-after"))
+    if _body_names_rate_limit(e):
+        why.append("the response body names the rate limit")
+    if limit_status:
+        if _h("x-ratelimit-remaining") == "0":
+            why.append("x-ratelimit-remaining=0")
+        if _h("retry-after"):
+            why.append("retry-after=" + _h("retry-after"))
     head = "HTTP %s%s" % (e.code, " " + str(e.reason) if getattr(e, "reason", None) else "")
     return "%s (rate limit exceeded: %s)" % (head, "; ".join(why)) if why else head
+
+
+ERR_BODY_BYTES = 4096
+
+
+def _body_names_rate_limit(e):
+    """ONE capped read of the error body, purely to name the cause. Never raises.
+
+    GitHub's 403/429 body carries the sentence that settles the question ("API rate limit exceeded
+    for user ID …"), which is stronger evidence than any header. The read is bounded by
+    `ERR_BODY_BYTES` and by the socket's own timeout; anything that goes wrong is simply no
+    evidence, and the status still stands on its own.
+    """
+    try:
+        raw = e.read(ERR_BODY_BYTES) or b""
+    except Exception:
+        return False
+    return b"rate limit" in raw.lower()
 
 
 def _rest_get(url, token, timeout=QUEUE_REST_TIMEOUT_S, deadline=None):
@@ -1390,8 +1426,12 @@ def _rest_get(url, token, timeout=QUEUE_REST_TIMEOUT_S, deadline=None):
         # inspects them (the redirect guard's own test asserts the type), while the rewritten text
         # states the code and any limit evidence, so the transport/parse classifier is unchanged
         # and the marker gate can actually see a 4xx/5xx.
-        raise urllib.error.HTTPError(e.url, e.code, _rest_refusal_text(e),
-                                     e.headers, None) from e
+        _text = _rest_refusal_text(e)
+        # ⛔ `e.fp`, NOT `e` (#2138 r10). `HTTPError` only gains `.read()` when it is CONSTRUCTED
+        # with a file object -- `addinfourl.__init__` is skipped when `fp is None` -- so passing
+        # the exception itself would either drop `read` or make it recurse into itself.
+        raise urllib.error.HTTPError(e.url, e.code, _text, e.headers,
+                                     getattr(e, "fp", None)) from e
     with r:
         chunks = []
         while True:
