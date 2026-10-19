@@ -2342,13 +2342,13 @@ consolidation the same eight files existed in three places:
 
 | file | agent-infra `main` | tortoise `main` | live `~/orchestrator` | classes | fix preserved / file retired |
 |---|---|---|---|---|---|
-| `orch-loop.sh` | `e069af29` | `a1ffab3d` | `b4b89547` | (a) + (b) | (a) `P0_BYPASS_MERGE_PRIORITY` + `p0_merge_priority_override` → ported; (b) tortoise + live are older generations → replaced |
+| `orch-loop.sh` | `e069af29` | `a1ffab3d` | `b4b89547` | (a) + (b) | (a) `P0_BYPASS_MERGE_PRIORITY` + `p0_merge_priority_override` → **NOT PORTED: superseded by main's unconditional drain rule (owner ruling 2026-10-18), see the reconcile note below**; (b) tortoise + live are older generations → replaced |
 | `spawn-gate.sh` | `a7dba947` | `f7af7919` | `a7dba947` | (b) | tortoise carried no fix; it lacked the shared-gate refactor → replaced |
 | `refresh-candidates.sh` | `a3ac5019` | `facc9a1d` | `a3ac5019` | (a) + (b) | (a) `landed.txt` (skip/write/prune/report), `RETRY_MAX` → ported; (b) otherwise older → replaced |
 | `claims.sh` | `d1604686` | **absent** | `d1604686` | (b) | tortoise fork never had it → retired |
 | `nonblocking-dispatch.sh` | `5e3fe2b1` | **absent** | `5e3fe2b1` | (b) | tortoise fork never had it → retired |
 | `lane.sh` | `3dc22993` | `03400e8d` | `3dc22993` | (a) + (b) | (a) `Closes #N` required / bare `Refs` refused → ported; (b) tortoise lacked the PATH/source-order fix → replaced |
-| `install.sh` | `3c0d14a8` | `de2ce83a` | `db02dfb3` | (a) + (b) + (c) | (a) `P0_BYPASS` render + `merged-not-closed.sh`/`spawn-gate.sh` drift list → ported; (b) tortoise lacked `SCOPE`/key-file validation; (c) macOS-only **by design** — Linux names `scripts/cloud-cell-supervisor.sh` |
+| `install.sh` | `3c0d14a8` | `de2ce83a` | `db02dfb3` | (a) + (b) + (c) | (a) `merged-not-closed.sh`/`spawn-gate.sh` drift list → ported (the `P0_BYPASS` render is **NOT** ported, same reason as `orch-loop.sh`); (b) tortoise lacked `SCOPE`/key-file validation; (c) macOS-only **by design** — Linux names `scripts/cloud-cell-supervisor.sh` |
 | `selftest.sh` | `2318d1e0` | `04174f50` | `5675377c` | (a) + (b) | (a) tortoise's landed/RETRY_MAX checks → ported (adapted); (b) otherwise older → replaced |
 
 The live copy was **not** a hand-fork: it was an untracked copy of agent-infra generation
@@ -2376,8 +2376,21 @@ directory of hand-copied files.
 ./check-single-source.sh                                  # canonical completeness
 ./check-single-source.sh --fork ../tortoise/operations/orchestrator-harness
 ./check-single-source.sh --o ~/orchestrator               # deployed bytes == canonical bytes
-./check-single-source.sh --require-target --fork <dir>    # the CI form: checking nothing is a failure
+./check-single-source.sh --require-target --o ~/orchestrator # the CI form: checking nothing is a failure
 ```
+
+⚠️ `--require-target` counts a target only when at least one file was ACTUALLY compared. With
+`--fork <dir>` on the CORRECT retired state (the directory absent, or holding only a pointer README)
+nothing is compared, so `--require-target --fork <dir>` exits **2 UNKNOWN** — by design, and it says
+`ok: retired location is absent` immediately before it. The CI form therefore passes `--o` (a real
+comparison), and the fork step of that job plants a fixture without `--require-target`.
+
+**The fork arm's file list is curated and its one exclusion is named.** It looks for the `SHARED`
+set (the eight files whose divergence caused the measured incident) plus a printed note naming
+`merge-one.sh` as deliberately excluded — tortoise still holds the only copy of the unported
+#8484/#8589 fix, so a fork arm covering it would fail the real retired location. Everything else is
+covered by the deployed arm, which byte-compares EVERY `*.sh`, and by
+`check-deployed-drift.sh`'s shipped-surface half.
 
 **Scope of what is observed, stated honestly:** the check only looks where it is told. The fork arm
 observes the paths passed via `--fork` (or the colon-separated `HARNESS_FORK_PATHS` that
@@ -2396,10 +2409,37 @@ expressed as **a shared code path plus an explicit platform branch**, never as t
 
 | | macOS (darwin) | cloud cells (linux) |
 |---|---|---|
-| supervisor | launchd | systemd |
+| supervisor | launchd | systemd unit **or** a running `cloud-cell-supervisor.sh` process |
 | installer | `scripts/orchestrator-harness/install.sh` | `scripts/cloud-cell-supervisor.sh` |
-| job label/unit | `com.eldato.orchestrator-loop` | `com.eldato.*` unit |
-| status verb | `launchctl print gui/$UID/<label>` | `systemctl --user list-units` |
+| job label/unit | `com.eldato.orchestrator-loop` | an `orchestrator-*`/`com.eldato.orchestrator-*` unit |
+| status verb | `launchctl print gui/$UID/<label>` | `systemctl [--user] list-units` (the ACTIVE column) + `pgrep -f cloud-cell-supervisor.sh` |
+
+⚠️ The Linux supervisor probe is NAMED and STATE-CHECKED, not a substring match (review P1).
+Measured on a cell 2026-10-19: `systemctl list-units` contained `eldato-disk-reaper.service` in state
+`failed`, and an `eldato|orchestr` grep reported `supervisor systemd … verdict OK` for a box with no
+harness supervisor at all — a false answer to the one question the verb exists to answer. The probe
+now requires (a) an ORCHESTRATOR unit name, (b) ACTIVE state, and (c) never treats a unit FILE on
+disk as evidence that one is loaded (the macOS arm already refused that inference). A cell whose
+supervisor is the process (tmux + process table, which is how `cloud-cell-supervisor.sh` works) is
+reported as `supervisor process`, with the evidence named.
+
+### Which instrument answers which question (all three, and they DISAGREE by design)
+
+| question | instrument | what it needs | its `2` means |
+|---|---|---|---|
+| is the harness ONE source — canonical complete, no re-fork, deployed bytes equal? | `check-single-source.sh` | a repo (and optionally `--o`/`--fork`) | nothing was compared |
+| which commit is this box RUNNING, and does it match the record? | `check-deployed-drift.sh` | the deployment's `.agent-infra-stamp.json` | no record → cannot answer (the #1745 laptop state) |
+| what is this box (platform, supervisor, installer, canonical vs deployed kind)? | `bin/harness doctor` | nothing but a shell; read-only | some field could not be read |
+
+⛔ THEY DISAGREE ON PURPOSE, AND NO ONE OF THEM IS "the" answer (review P2). On an un-stamped
+symlink-into-checkout box — the shape this section recommends — `check-single-source --o` says 0,
+`doctor` says 0, and `check-deployed-drift` says **2**, because only the last one requires a RECORD
+of what was installed. On a box with no deployment at all the same three read 0 / 0 / **2**. That is
+not a contradiction to be papered over: each `2` means "this instrument cannot answer", and the
+reader must take the answer from the instrument that CAN. A future consumer should read
+`doctor` for the box's shape, `check-single-source` for the bytes, and `check-deployed-drift` for
+the audited history — and if a green verdict is needed from all three, deploy with a stamp, which is
+what `install.sh`/`harness.sh deploy` write.
 | `timeout(1)` | absent — `run_agent` uses a bash `wait` + watchdog | present, but the same fallback is used |
 
 `install.sh` is macOS-only **on purpose** and says so; on Linux it names the cell supervisor rather
@@ -2420,7 +2460,7 @@ came back. Those were ported IN, not discarded:
 
 | fix | why it mattered | where |
 |---|---|---|
-| `Closes #N` required; a bare `Refs` is refused | a finished lane writing `Refs` never closes its issue, and nothing re-reads it: 25 of 36 open P0-blockers already had merged PRs (tortoise#8468) | `lane.sh` |
+| `Closes #N` required; a bare `Refs` is refused | a finished lane writing `Refs` never closes its issue, and nothing re-reads it: 25 of 36 open P0-blockers already had merged PRs (tortoise#8468) | `lane.sh` — the brief text, i.e. an instruction to the lane, NOT a gate: `check-pipeline-compliance.sh` accepts the `Still open: <indicator>` traceability form for any diff, so the backstop is a reviewer and `merged-not-closed.sh`, not a refusal |
 | `merged-not-closed.sh` | the fleet could not answer "which open issues already have a merged PR?" — no tool existed | new file |
 | `landed.txt` (skip / write / prune / report) + `RETRY_MAX` | a LANDED verdict written to `checked.txt` retires an OPEN issue from the backlog permanently and invisibly; and an entry that never answers starves the whole pool behind it (tortoise#8560/#8625/#8629/#8469 P2) | `refresh-candidates.sh` (reaper) + `selftest.sh` |
 | `verdict_kind()` / `apply_verdict_marker()` | a verdict-LESS reviewer run (stall/crash/timeout) must not authorise a fixer: 7 of 7 cap-hits in one window were verdict-less and 4 were parked "needs a human", never reviewed | `merge-one.sh` |

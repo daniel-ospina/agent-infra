@@ -84,18 +84,40 @@ case "$PLATFORM" in
     fi ;;
   linux)
     SUP_INSTALLER="scripts/cloud-cell-supervisor.sh"
+    # ⛔ A UNIT WHOSE NAME MERELY CONTAINS `eldato` IS NOT THE HARNESS'S SUPERVISOR (review P1).
+    # Measured on a cell 2026-10-19: the only matching units were `eldato-disk-reaper.service`
+    # (state FAILED) and its timer, and doctor reported `supervisor systemd [system systemd unit
+    # matches eldato/orchestr]` with verdict OK — a false answer about the exact question the tool
+    # exists to answer. Three rules close it: the unit must be named for the ORCHESTRATOR (not any
+    # eldato unit), it must be ACTIVE, and a unit FILE on disk is never evidence that one is loaded
+    # — the macOS arm above already says so, and the same reasoning applies here.
+    HARNESS_UNIT_RE='^(com\.eldato\.)?(orchestrator|eldato-orchestrator)[-.]'
+    _units=""
     if command -v systemctl >/dev/null 2>&1; then
-      if systemctl --user list-units --all --no-legend 2>/dev/null | grep -qi 'eldato\|orchestr'; then
-        SUP="systemd"; SUP_EVIDENCE="user systemd unit matches eldato/orchestr"
-      elif systemctl list-units --all --no-legend 2>/dev/null | grep -qi 'eldato\|orchestr'; then
-        SUP="systemd"; SUP_EVIDENCE="system systemd unit matches eldato/orchestr"
+      for scope in --user ""; do
+        # `list-units` prints `NAME LOAD ACTIVE SUB DESCRIPTION`; keep the name and the ACTIVE column.
+        _u="$(systemctl $scope list-units --all --no-legend 2>/dev/null \
+              | awk -v re="$HARNESS_UNIT_RE" '$1 ~ re { print $1" "$3 }' || true)"
+        [ -n "$_u" ] || continue
+        _act="$(printf '%s\n' "$_u" | awk '$2=="active"{print $1; exit}')"
+        if [ -n "$_act" ]; then
+          SUP="systemd"; SUP_EVIDENCE="unit $_act is active${scope:+ (user scope)}"
+        else
+          SUP_EVIDENCE="an orchestrator unit is present but NOT active ($(printf '%s' "$_u" | tr '\n' ';'))"
+        fi
+        break
+      done
+    fi
+    if [ "$SUP" = none ]; then
+      # The cell supervisor is a PROCESS (tmux + a process table), not a systemd unit — install.sh
+      # names scripts/cloud-cell-supervisor.sh as this platform's owner. Bounded probe, no walk.
+      if command -v pgrep >/dev/null 2>&1 && pgrep -f 'cloud-cell-supervisor\.sh' >/dev/null 2>&1; then
+        SUP="process"; SUP_EVIDENCE="cloud-cell-supervisor.sh is running (a cell supervisor is a process, not a unit)"
+      elif [ -n "${SUP_EVIDENCE:-}" ]; then
+        : # keep the more specific "present but not active" wording
       else
-        SUP_EVIDENCE="systemctl present, no matching eldato/orchestr unit"
+        SUP_EVIDENCE="no orchestrator systemd unit and no cloud-cell-supervisor.sh process"
       fi
-    elif ls /etc/systemd/system 2>/dev/null | grep -qi 'eldato\|orchestr'; then
-      SUP="systemd"; SUP_EVIDENCE="unit file present in /etc/systemd/system"
-    else
-      SUP_EVIDENCE="systemctl not on PATH and no unit file found"; unknown_note
     fi ;;
   *) SUP_EVIDENCE="platform unknown — supervisor cannot be identified"; unknown_note ;;
 esac
@@ -157,16 +179,20 @@ if [ -d "$O_DIR" ]; then
     fi
   fi
   # Byte drift of the shared files — the check that caught a one-generation-behind gh-limit.py.
+  # ⛔ THE TWO ANSWERS ARE DIFFERENT QUESTIONS AND ONE MUST NOT OVERWRITE THE OTHER (review P2).
+  # DEPLOY_DRIFT carried the checkout's dirtiness, then this block REPLACED it with the byte verdict,
+  # so a `$O` that is a clean checkout PLUS a hand-added extra *.sh reported `bytes=identical` and a
+  # DRIFT verdict with no field naming the cause. Both are now reported, and the reason is named.
   if [ -x "$CANON/check-single-source.sh" ]; then
     if "$CANON/check-single-source.sh" --o "$O_DIR" --quiet >/dev/null 2>&1; then
-      DEPLOY_DRIFT="identical"
+      DEPLOY_DRIFT="${DEPLOY_DRIFT:-clean}+bytes=identical"
     else
       rc=$?
-      if [ "$rc" -eq 2 ]; then unknown_note; DEPLOY_DRIFT="UNVERIFIABLE"
-      else drift_note; DEPLOY_DRIFT="DIFFERS"; fi
+      if [ "$rc" -eq 2 ]; then unknown_note; DEPLOY_DRIFT="${DEPLOY_DRIFT:-clean}+bytes=UNVERIFIABLE"
+      else drift_note; DEPLOY_DRIFT="${DEPLOY_DRIFT:-clean}+bytes=DIFFERS"; fi
     fi
   else
-    DEPLOY_DRIFT="UNVERIFIABLE"; unknown_note
+    DEPLOY_DRIFT="${DEPLOY_DRIFT:-clean}+bytes=UNVERIFIABLE"; unknown_note
   fi
 fi
 [ "$DEPLOY_KIND" = orphan ] && drift_note

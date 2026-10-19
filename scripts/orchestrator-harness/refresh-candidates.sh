@@ -1785,6 +1785,12 @@ while read -r N; do
             fi
             usable=$((usable + 1))
             QUEUED=$((QUEUED + 1)); V_QUEUED=$((V_QUEUED + 1))
+            # ⛔ A VERDICT CLEARS THE RETRY STRIKE (review P1). `RETRY_MAX` bounds CONSECUTIVE
+            # non-verdicts; the counter was only cleared in the LANDED arm, so an entry that answered
+            # on most passes still accumulated strikes across them and was eventually written to
+            # `checked.txt` — permanent, invisible suppression — by three UNRELATED transient
+            # failures. Measured class: every arm that reaches a verdict must reset it.
+            rm -f "$O/state/pretry-$N" 2>/dev/null
             n=$((n + 1))     # a SLOT is filled: this candidate has left the head for good (#1729)
             echo "[refresh] +#$N CLEAN -> backlog"
             # The pre-flight said CLEAN for a claim that EXISTS: that is an ORPHANED holder being
@@ -1804,6 +1810,8 @@ while read -r N; do
              ICR_HELD=$((ICR_HELD + 1))
              # Held by a peer, so the next pass walks past it for free instead of re-buying this
              # verdict — for `POOL_COLLISION_TTL` seconds, after which it is judged again (#1729).
+             # ⛔ AND IT CLEARS THE STRIKE: a COLLISION is a verdict (review P1) — see the CLEAN arm.
+             rm -f "$O/state/pretry-$N" 2>/dev/null
              COLLIDED_NEW="$COLLIDED_NEW$N "
              echo "[refresh] =#$N COLLISION (cross-box issue claim) — $CLAIM_RESULT; retried next pass" ;;
           2) # unreadable registry: INCOMPLETE, never CLEAN. Also left unchecked, so the issue is
@@ -1835,6 +1843,8 @@ while read -r N; do
         echo "[refresh] ?#$N COLLISION is DEGRADED (the pre-flight could not query every surface) — not counted as a verdict, left unchecked for the next pass"
       else
         usable=$((usable + 1)); V_COLLISION=$((V_COLLISION + 1))
+        # A COLLISION is a verdict, so it clears the consecutive-strike counter (review P1).
+        rm -f "$O/state/pretry-$N" 2>/dev/null
         COLLIDED_NEW="$COLLIDED_NEW$N "   # a peer holds it: recorded so the next pass skips it (#1729)
         echo "[refresh] =#$N collision — a peer owns it, retried next pass"
       fi ;;
@@ -1864,9 +1874,17 @@ while read -r N; do
       pa="$(cat "$pf" 2>/dev/null || echo 0)"; case "$pa" in ''|*[!0-9]*) pa=0 ;; esac
       pa=$((pa + 1))
       if [ "$pa" -ge "$RETRY_MAX" ]; then
-        echo "$N" >> "$O/checked.txt"
-        rm -f "$pf" 2>/dev/null
-        echo "[refresh] ?#$N ${V:-no verdict} — marked checked after $RETRY_MAX attempts (a persistently non-answering entry must not starve the pool behind it)"
+        # ⛔ THE PERMANENT WRITE IS CHECKED, LIKE EVERY OTHER ONE (#1853's rule, review P1).
+        # `checked.txt` is what makes an entry invisible to LATER passes and is reclaimed only for
+        # numbers that reached `dispatched.txt` — so a FAILED append here that the pass reported as
+        # "marked checked" would be the same overstatement the CLEAN arm was fixed for.
+        if printf '%s\n' "$N" >> "$O/checked.txt"; then
+          rm -f "$pf" 2>/dev/null
+          echo "[refresh] ?#$N ${V:-no verdict} — marked checked after $RETRY_MAX consecutive attempts (a persistently non-answering entry must not starve the pool behind it)"
+        else
+          echo "[refresh] ABORT: cannot record #$N as checked in $O/checked.txt — the cursor would not advance and this pass would claim it did (#1736)"
+          exit "${EXIT_TRANSIENT:-1}"
+        fi
       else
         echo "$pa" > "$pf" 2>/dev/null || true
         echo "[refresh] ?#$N ${V:-no verdict} from the pre-flight — left unchecked for the next pass (attempt $pa/$RETRY_MAX)"

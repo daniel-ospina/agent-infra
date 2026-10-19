@@ -24,6 +24,15 @@
 #       2 when a surface could not be queried — never 1, so a caller cannot
 #       mistake "the API failed" for "nothing to drain".
 #
+# ⚠️ STATED RESIDUAL — COST AND PACING, NOT CORRECTNESS (review P2). The sweep makes ONE sequential
+# `gh` call per open issue (the header's own measurement cites ~1,020 open issues), with no per-call
+# timeout, so on a big repo it is >1k calls on the shared bucket and a slow surface makes it slow
+# rather than wrong: every unqueryable answer exits 2 with the count named, and nothing is ever
+# inferred from an absence. Batching it would be a design change (GraphQL aliasing, or a --search
+# prefilter) and is deliberately NOT done here — this tool exists because the fleet could not answer
+# the question at all, and a bounded-correct slow answer beats an unbounded-fast wrong one. If the
+# sweep ever becomes the bottleneck, bound it THEN, with the bound stated in the same place.
+#
 # ⚠️ A HIT IS A QUEUE ENTRY, NOT A VERDICT. A merged `Refs #N` says the PR
 # REFERENCED the issue; it does not say the issue is complete. On the first
 # sweep only 3 of 25 were genuinely done — the other 22 were partial, and said
