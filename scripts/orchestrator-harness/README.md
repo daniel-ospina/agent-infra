@@ -1310,9 +1310,11 @@ lanes=<live>/<total> max_lanes=<ceiling> zombie=<n> lanes_src=<census|tmux|unkno
   FALSE and **dispatches more**, so it is a fail-OPEN on capacity. An unreadable census therefore
   sets `LANES_UNKNOWN=1` and the gate REFUSES to add work with that reason (`lanes_unknown (the lane
   census could not be read -> do not add work)`), on the same doctrine as an unreadable memory
-  probe. The tmux count is still shown as a lower-bound hint and is never a licence to dispatch. A
-  `?` NUMERATOR with readable totals (`lanes=?/11 zombie=0`) is the same abstention one lane at a
-  time — a liveness age that could not be read — and `count` exits 3 for it.
+  probe. `[cap]` and both `[dispatch]` lines print `?` for that read (`LANES_DISPLAY`); the internal
+  `LANES` keeps a tmux lower bound ONLY so the numeric consumers stay numeric, and it is never
+  displayed or used as a licence to dispatch. A `?` NUMERATOR with readable totals
+  (`lanes=?/11 zombie=0`) is the same abstention one lane at a time — a liveness age that could not
+  be read — and `count` exits 3 for it.
 
 The `reap` pass in `cloud-cell-doctor.sh` runs the same tool in process mode (dry under `--dry-run`,
 armed otherwise) and puts `lanes=… zombie=…` in its own pass line, so a cell's `status` answers
