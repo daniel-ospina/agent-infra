@@ -4129,8 +4129,18 @@ def test_the_sent_message_carries_the_respawn_evidence():
         with open(facts, "w") as fh:
             json.dump(d, fh)
         cap = os.path.join(tmp, "cap")
+        # ⛔ THE SCOPE MUST EXIST AS A FIXTURE, OR THIS TEST GRADES THE MACHINE. `--dry-run` reports
+        # the PLAN only when the scope holds the controller's script; with the default `$O` a CI
+        # runner (no `~/orchestrator`) gets the scope REFUSAL instead, whose message also contains
+        # the word RESPAWN — so the old assertion passed there for the wrong reason while measuring
+        # nothing about the evidence. Measured: fake HOME → "RESPAWN" present, kickstart command
+        # absent.
+        o_dir = os.path.join(tmp, "orch")
+        os.makedirs(o_dir, exist_ok=True)
+        with open(os.path.join(o_dir, "orch-loop.sh"), "w") as fh:
+            fh.write("#!/bin/bash\n# stand-in: its EXISTENCE is what the scope check reads\n")
         rc, out, err = run_cli(["--live", "--facts", facts, "--capture-dir", cap,
-                                "--state", os.path.join(tmp, "s.json"),
+                                "--state", os.path.join(tmp, "s.json"), "--o", o_dir,
                                 # an explicit ws keeps the suite off `cmux workspace list` (the suite
                                 # must be deterministic on a box with no cmux), and --dry-run reports
                                 # the RESPAWN plan without running launchctl.
@@ -4140,6 +4150,10 @@ def test_the_sent_message_carries_the_respawn_evidence():
         text = "".join(open(os.path.join(cap, f)).read() for f in os.listdir(cap)
                        if f.endswith(".txt"))
         assert "RESPAWN" in text, text[:600]
+        # the evidence is the COMMAND the action would run, which is what the assertion above could
+        # not distinguish from a refusal
+        assert "launchctl kickstart -k" in text, text[:800]
+        assert "would run" in text, text[:800]
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
