@@ -278,14 +278,22 @@ measure_lanes
 eq "$LANES_UNKNOWN" "1" "CAP: a wholly unreadable census refuses work"
 eq "$LANES_TOTAL/$ZOMBIES" "?/?" "CAP: unknown totals stay unknown, never 0"
 # The transition arm: no lane-reap.sh at all -> the OLD tmux count, LABELLED. Re-source the block so
-# the missing-script resolution runs again (it happens at definition time).
+# the missing-script resolution runs again (it happens at definition time). The tmux double makes the
+# value DISCRIMINATING: comparing LANES_DISPLAY with LANES inside the same assignment could never fail
+# (#2163 review, P2), so the expected number is fixed by the fixture instead.
+cat > "$T/bin/tmux" <<'SH'
+#!/bin/bash
+[ "${1:-}" = "ls" ] && printf 'lane-1\nlane-2\n'
+exit 0
+SH
+chmod +x "$T/bin/tmux"
 rm -f "$T/lane-reap.sh"
 LANE_REAP_SH=""
 sed -n '/^LANE_REAP_SH=""/,/^}$/p' "$LOOP" > "$T/measure2.sh"
 . "$T/measure2.sh"
-measure_lanes
+PATH="$T/bin:$PATH" measure_lanes
 eq "$LANES_SOURCE" "tmux" "CAP: a missing tool falls back to tmux AND says so"
-eq "$LANES_DISPLAY" "$LANES" "CAP: the tmux transition shows its own (numeric) count"
+eq "$LANES_DISPLAY" "2" "CAP: the tmux transition shows the (fixtured) session count"
 eq "$LANES_UNKNOWN" "0" "CAP: the tmux fallback is not an abstention (it is a named transition)"
 
 # ── SURVIVOR: a SIGTERM-immune victim is escalated, but only while its incarnation holds ────────

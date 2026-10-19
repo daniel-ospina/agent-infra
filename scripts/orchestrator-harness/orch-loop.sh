@@ -853,8 +853,10 @@ heartbeat() { date +%s > "$O/heartbeat"; }
 #     transition, not a measurement;
 #   * the script EXISTS and the census is `?`/unreadable → `LANES_UNKNOWN=1`, and the gate refuses to
 #     add work with that reason, on the same doctrine as an unreadable memory probe (memory gate:
-#     "a failed probe is UNKNOWN, not ample"). The tmux count is still shown in `[cap]` as a
-#     lower-bound hint, never used as a licence to dispatch.
+#     "a failed probe is UNKNOWN, not ample"). `[cap]` prints `?` (never a fabricated `0`) and the
+#     internal `LANES` keeps a tmux lower bound ONLY so the numeric consumers stay numeric; the
+#     dispatch lines print `LANES_DISPLAY` too, so no line in the cycle reintroduces a `0` for a
+#     read that did not happen.
 LANES_UNKNOWN=0
 # Where the `lanes=` number CAME FROM, printed on the `[cap]` line. Without it, a tmux session count
 # and a process census are the same three letters, and a `$O` that predates `lane-reap.sh` silently
@@ -3925,7 +3927,7 @@ PY
     fi
     if [ -s "$O/.batch" ]; then
       dispatch_funnel "$K" "$(queue_state_token)" "" "" "${Y:-0}" >> "$LOG"
-      echo "[dispatch] load=$L lanes=$LANES -> $(tr '\n' ' ' < "$O/.batch")" >> "$LOG"
+      echo "[dispatch] load=$L lanes=${LANES_DISPLAY:-$LANES} -> $(tr '\n' ' ' < "$O/.batch")" >> "$LOG"
       bash "$O/dispatch-merge.sh" "$REPO" "$OR" $(tr '\n' ' ' < "$O/.batch") >> "$LOG" 2>&1
     # ⛔ "backlog empty" IS A CLAIM, NOT A NEUTRAL FACT (agent-infra#1931). On its own it reads as
     # "the fleet has nothing to do", and the SAME line was printed when 223 candidates had been READ
@@ -3946,7 +3948,7 @@ PY
     elif [ "${PRDISP_ROWS:-0}" -eq 0 ]; then _prtail="no per-PR rows this cycle — nothing could be named"
     elif [ "${PRDISP_ACTS:-0}" -gt 0 ]; then _prtail="${PRDISP_ACTS} acted, ${PRDISP_WAITS} named wait(s)"
     else _prtail="NO UNIT SPAWNED, ${PRDISP_WAITS} named wait(s) — see the [pr] line"; fi
-    dispatch_gate_line "$GATE_WHY" "$LANES" "$WORKERS" "$_prtail" >> "$LOG"
+    dispatch_gate_line "$GATE_WHY" "${LANES_DISPLAY:-$LANES}" "$WORKERS" "$_prtail" >> "$LOG"
   fi
   heartbeat
 
