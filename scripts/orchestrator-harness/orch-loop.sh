@@ -1197,8 +1197,11 @@ claim_foreign_live() {
 # `pr_owned()` dropped that PR out of the owned set: the sweep then spawned for it every cycle and
 # `claim_acquire` refused (where `box` IS correctly not an identity). Not a steal (nothing is deleted),
 # but the churn the live-ownership rewrite exists to remove. An unanswerable name now prints NOTHING,
-# the `!=` test then fails and the guard abstains, and the claim falls through to `claim_lease_live` —
-# the same "the lease decides" answer every genuinely foreign holder gets.
+# so `[ "$host" != "$(_this_host)" ]` STAYS TRUE (a non-empty `$host` is unequal to the empty string),
+# the guard does NOT fire, and the claim falls through to `claim_lease_live` — the same "the lease
+# decides" answer every genuinely foreign holder gets. (Cycle-22 correction: the first version of this
+# comment said "the `!=` test then fails and the guard abstains", which is the opposite polarity among
+# `!=` + `|| return 1` and would have read as correct to anyone not tracing the operator.)
 _this_host() { local h; h="$(hostname -s 2>/dev/null)"; case "$h" in ''|box) return 1 ;; esac; printf '%s' "$h"; }
 
 # How many OPEN PRs nothing is currently working. <open_prs>

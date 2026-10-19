@@ -92,19 +92,25 @@
 #   O14 [RED→GREEN] clamping to the ceiling is LOUD. A silent clamp shortens merge-one's derived lease
 #      below the review window it must outlive — a mid-review expiry, the duplicate this registry
 #      exists to prevent — and leaves nothing to diagnose.
-# ⛔ LABELLING HONESTY — MEASURED, not asserted. `CLAIMS_SH=<pre-change claims.sh> bash
-# claim-orphan.test.sh` (2026-10-19, origin/main's claims.sh blob d1604686) reports **57 passed, 70
-# FAILED** of 127 checks. Broken down by label, on that tree:
-#   • [RED→GREEN]  61 checks — 0 pass, 61 fail. EVERY one is red before the change. (Non-vacuity.)
-#   • [PINNED]      49 checks — 42 pass, 7 fail. The 42 pass VACUOUSLY, because the machinery is
+# ⛔ LABELLING HONESTY — MEASURED, not asserted. ⛔ AND IT TAKES **TWO** OVERRIDES, because this file
+# pins BOTH shipped files (cycle-22 review: a `CLAIMS_SH=`-only run cannot redden the four O16 checks
+# that are pinned to orch-loop.sh's `_this_host`/`claim_lease_live`, so the recipe quoted here did not
+# reproduce the numbers it claimed). The measurement, taken 2026-10-19 against origin/main's
+# `claims.sh` blob `d1604686` AND its `orch-loop.sh`:
+#
+#   CLAIMS_SH=/tmp/pre/claims.sh LOOP=/tmp/pre/orch-loop.sh bash claim-orphan.test.sh
+#
+# reports **58 passed, 73 FAILED** of 131 checks, and by label on that tree:
+#   • [RED→GREEN]  63 checks — 0 pass, 63 fail. EVERY one is red before the change. (Non-vacuity.)
+#   • [PINNED]      51 checks — 43 pass, 8 fail. The 43 pass VACUOUSLY, because the machinery is
 #     absent pre-fix (`claim_orphan_reason` does not exist, and nothing reaped by a host rule or read a
 #     deny list at all), so assertions of the form "does NOT delete" / "abstains" hold for free. They
 #     are labelled PINNED rather than RED→GREEN for exactly that reason: they guard a NEW fail-open,
-#     they are not red-to-green. The 7 that fail are controls asserting behaviour the pre-fix tree
-#     lacks (the held-by-live token, the roster arm and its control, three `rc=127` O24 controls, and
-#     O26's token assertion).
+#     they are not red-to-green. The 8 that fail are controls asserting behaviour the pre-fix tree
+#     lacks (the held-by-live token, the roster arm and its control, three `rc=127` O24 controls, the
+#     O25 deny-list control, and O26's token assertion).
 #   • unlabelled    17 checks — 15 pass, 2 fail.
-# The 9 failing checks that carry NO [RED→GREEN] label are, by section:
+# The 10 failing checks that carry NO [RED→GREEN] label are, by section:
 #     `O7 the PR keying declares a documented ceiling`           (unlabelled by design)
 #     `[PINNED]` O15 `it reads held-by-live`                     (the token itself is new)
 #     `[PINNED]` O12 `… a roster that names the RUNNING host and omits the holder DOES reap it`
@@ -112,14 +118,21 @@
 #     `[PINNED]` O24 `a DEAD pid under the same local name IS still orphaned`        (rc=127 pre-fix)
 #     `[PINNED]` O24 `a peer host the roster OMITS is still reaped`                  (rc=127 pre-fix)
 #     `[PINNED]` O24 `an explicit CLAIM_DEAD_HOSTS=box still reaps the sentinel`     (rc=127 pre-fix)
+#     `[PINNED]` O25 `… while the SAME deny-listed host with a DEAD pid is reaped` (rc=127 pre-fix)
 #     `[PINNED]` O26 `… and it names the token`                                  (the token is new)
 #     `(setup)`  O22 `the failing probe really does fall back to the sentinel`       (needs claim_host)
+# ⛔ ONE MORE DIRECTION, measured the same way: a check can be labelled [RED→GREEN] and still be green
+# pre-fix FOR THE WRONG REASON — `claim_orphan_reason` is undefined on the old tree, so a subshell that
+# calls it exits 127 and any assertion of the form "prints nothing" holds structurally. O25's reason
+# check was caught by exactly that and is now labelled [PINNED]; its discrimination comes from the rc=1
+# check beside it plus the reordering mutant, which reddens both.
 # ⛔ SO PINNED DOES **NOT** MEAN "passes pre-fix", and RED→GREEN does mean "measured red". Read PINNED
 # as: **this guards a new fail-open, it is not a regression of old behaviour**; read [RED→GREEN] as:
 # **measured red before the change, green after**. Every re-labelling in this file's history happened
 # after a measurement contradicted the label (O4's token check, three O15 lines, O17's duplicate check,
-# O18's once-per-process check, sixteen in cycle 13, O9's pair in cycle 18). Re-measure rather than
-# trusting this paragraph — it is a snapshot of one measurement, not an invariant, and the file grows.
+# O18's once-per-process check, sixteen in cycle 13, O9's pair in cycle 18, O25's reason pair in cycle
+# 22). Re-measure rather than trusting this paragraph — it is a snapshot of one measurement, not an
+# invariant, and the file grows.
 #
 # HERMETIC: every check builds its own throwaway bare origin (`git init --bare`), so no network, no
 # real origin and nothing outside $T is written — the claim refs die with the temp dir.
@@ -127,7 +140,9 @@ set -u
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # ⛔ OVERRIDABLE so the RED direction can be RE-MEASURED rather than believed:
-#   CLAIMS_SH=<git show main:scripts/orchestrator-harness/claims.sh> bash claim-orphan.test.sh
+#   CLAIMS_SH=<main:scripts/orchestrator-harness/claims.sh> LOOP=<main:.../orch-loop.sh> bash claim-orphan.test.sh
+# BOTH are needed for the full RED direction: O16 pins orch-loop.sh's readers, everything else pins
+# claims.sh. Overriding one alone produces a number that is neither the old tree nor the new one.
 CLAIMS_SH="${CLAIMS_SH:-$HERE/claims.sh}"
 [ -f "$CLAIMS_SH" ] || { echo "❌ missing $CLAIMS_SH"; exit 2; }
 # O16 drives orch-loop's `claim_live()` (the PR-keyed reader) out of the SHIPPED file, so the fourth
@@ -1261,7 +1276,11 @@ ck "O25 [RED→GREEN] a LIVE local PR pid OUTRANKS a deny list naming this box (
 # assertion here is "no reason for a live local pid", not a token match.
 # the helper prints `R=[<reason>]`, so "no reason" is the literal `[]`.
 [ "$(field "$O25H" R)" = "[]" ]; O25H2_RC=$?
-ck "O25 [RED→GREEN] ... and it reports NO orphan reason at all ('$(field "$O25H" R)')" $O25H2_RC
+# ⛔ PINNED, NOT RED→GREEN (cycle-22 review): pre-change `claim_orphan_reason` does not exist, so
+# the subshell exits 127 and `R` is empty for a reason UNRELATED to the ordering being pinned — this
+# assertion is structurally green on the old tree. It discriminates only in COMPANY (the rc=1 check
+# above it, and the reordering mutant, which reddens both), which is exactly what PINNED means.
+ck "O25 [PINNED] ... and it reports NO orphan reason at all ('$(field "$O25H" R)')" $O25H2_RC
 # control: the SAME deny-listed host with a DEAD pid IS reaped — so the ordering, not a disabled arm.
 O25I="$(
   CLAIM_REPO="$T/repo"; CLAIM_STATE_DIR="$T/cl25"; CLAIM_DEAD_HOSTS="$REAL24"

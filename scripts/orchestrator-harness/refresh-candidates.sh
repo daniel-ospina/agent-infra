@@ -1645,6 +1645,13 @@ while read -r N; do
         # push. The registry is resolved from `$O`, which the loop has already resolved: there is no
         # `CLAIMS_SH` seam (an ambient value could have half-disabled the gate).
         ICR=0
+        # ⛔ THE REASON IS RESET PER CANDIDATE, because the CLEAN arm below reads it to decide whether to
+        # print "queued because its ONLY claim is ORPHANED" and to count a reclaim. Today that read is
+        # never stale — every path that can leave a reason also sources the registry, and claims.sh
+        # resets `CLAIM_RESULT=""` at source time — but that reachability argument spans TWO FILES, and
+        # the block's own rule is that neither line may claim an action this script did not take. The
+        # reset makes the guarantee local: an empty reason can only come from THIS candidate.
+        CLAIM_RESULT=''
         # ⛔ A MISSING REGISTRY IS `ICR=0` ON PURPOSE — the documented loud fallthrough (see
         # issue_claim_verdict's STATED LIMIT), and the only case in which a box without the registry
         # keeps dispatching. It is NOT a verdict: the branch below announces it every time.

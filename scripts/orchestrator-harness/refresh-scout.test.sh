@@ -1766,6 +1766,28 @@ case "$OUT" in
   *) bad "claim-absent: the missing registry is silent — output: $OUT" ;;
 esac
 
+# (f) A REASON MUST BELONG TO THE CANDIDATE IT IS PRINTED FOR (cycle-22 review). `CLAIM_RESULT` is a
+#     shell GLOBAL that the CLEAN arm reads to decide whether to print "queued because its ONLY claim is
+#     ORPHANED" and to count a reclaim. Every path that leaves a reason also sources the registry — and
+#     claims.sh resets the global at source time — so the read was not stale in practice; but that is a
+#     reachability argument spanning TWO FILES, and this block's own rule is that neither line may claim
+#     an action the script did not take. The reset at the top of each candidate makes it local, and this
+#     case is what keeps the reset from being deleted as unreachable: with the registry ABSENT there is
+#     no source to reset the global, so an inherited value survives to the CLEAN arm.
+mk_case claim-stale-reason
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_gh_one_issue "$D"          # the pool holds issue 42
+rm -f "$D/o/claims.sh"
+rf "$D" refresh "CLAIM_RESULT=the only claim on #9999 is ORPHANED (ghostbox:1: held-by-orphan)"
+case "$OUT" in
+  *"ONLY claim is ORPHANED"*) bad "claim-stale-reason: an inherited CLAIM_RESULT was attributed to THIS candidate — output: $OUT" ;;
+  *) ok "claim-stale-reason: a leftover reason is NOT printed for a candidate that produced none" ;;
+esac
+case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
+  *42*) ok "claim-stale-reason: ... and the candidate is queued on its own CLEAN verdict (the reset does not block)" ;;
+  *) bad "claim-stale-reason: #42 was not queued — candidates='$(cat "$D/o/candidates.txt" 2>/dev/null)'" ;;
+esac
+
 # (e) A REGISTRY THAT CANNOT ANSWER THE QUESTION IS NOT EVIDENCE OF FREEDOM. `$O/claims.sh` exists
 #     but predates the issue key (install.sh reports that drift; the daemon executes the $O copy), so
 #     the reader has nothing to call. Calling the missing function would return 127 — a value the
