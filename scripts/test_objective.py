@@ -57,7 +57,7 @@ objective.STUCK_FILE = str(pathlib.Path(_STATE_SCRATCH) / "call-rail-stuck.json"
 SHA = "9c4788400" + "b" * 31
 # #1872: the class segment is STATE, not a dispatch list -- the old `DO:` token is gone by design
 # (a monitor must not instruct the fleet to do work the dispatch chain owns).
-QUEUE_SEG = "| QUEUE(state; pr-doctor dispatches):"
+QUEUE_SEG = "| QUEUE(state):"
 
 
 class _Result:
@@ -100,7 +100,13 @@ def install(monkeypatch, *, gql=None, rest=None, pr_list=None, ci_runs=None, ls_
             return gql if gql is not None else _gql_ok()
         if "/check-runs" in s:
             return rest if rest is not None else _Result(1, "", "HTTP 504")
-        if cmd[:3] == ["gh", "pr", "list"]:
+        # ⛔ MATCH THE ARGS, NOT THE BINARY'S SPELLING (2026-10-18). `objective.GH_BIN` resolves to
+        # `~/bin/gh` (GH_REAL_PIN) or a layer shim on any box where that file exists, so a stub keyed
+        # on `cmd[:3] == ["gh","pr","list"]` matched only where NO pin exists (a clean CI container)
+        # and silently fell through to the `{}` default everywhere else -- 26 tests in this file read
+        # `queue=UNREADABLE` on a development machine while CI was green. The seam is the
+        # subcommand, and the production call is the thing being mocked.
+        if list(cmd[1:3]) == ["pr", "list"]:
             seq = (list(pr_list) if isinstance(pr_list, (list, tuple))
                    else [pr_list if pr_list is not None else _Result(0, "[]")])
             i = min(queue_reads["n"], len(seq) - 1)
@@ -404,12 +410,12 @@ def test_the_FAIL_CLOSED_caveat_precedes_the_counts_it_qualifies(tmp_path, monke
                       for n in range(1, 15)])
     install(monkeypatch, pr_list=_Result(0, prs))
     line = objective.build()
-    assert "queue_read=BLIND" in line and "| QUEUE(state;" in line, line
-    assert line.index("queue_read=BLIND") < line.index("| QUEUE(state;"), line
+    assert "queue_read=BLIND" in line and QUEUE_SEG in line, line
+    assert line.index("queue_read=BLIND") < line.index(QUEUE_SEG), line
     # ...and the OWNER'S list is protected the same way: it cannot be the token a deep queue
     # severs. MEASURED before this: 60 non-draft PRs with a 20-PR overlay lost all 20 names.
     assert "ASK-USER: surface=" in line, line
-    assert line.index("ASK-USER: surface=") < line.index("| QUEUE(state;"), line
+    assert line.index("ASK-USER: surface=") < line.index(QUEUE_SEG), line
 
 
 def test_a_resolved_mergeability_read_manufactures_no_unknown_bucket(monkeypatch):
@@ -878,7 +884,7 @@ def test_the_queue_segment_is_labelled_state_and_not_an_instruction(monkeypatch,
                           "running": [(8806, None)]},
                 surface=1, surface_prs=[9001])
     line = objective.build()
-    assert "| QUEUE(state; pr-doctor dispatches): " in line, line
+    assert QUEUE_SEG + " " in line, line
     assert "DO: " not in line, line                       # the instruction token is GONE
     # ...the counts and their objects are still REPORTED -- as state
     assert "call-rail=1: #8795" in line, line
@@ -911,7 +917,7 @@ def test_REGRESSING_still_reaches_the_owner_with_the_new_segment(monkeypatch, tm
                 by_class={"fix-ci": [(9, "docs"), (8, "docs"), (7, "python-ci-gate")]})
     line = objective.build(prev=(12, 120.0))
     assert "VERDICT=REGRESSING" in line, line
-    assert "| QUEUE(state; pr-doctor dispatches): " in line, line
+    assert QUEUE_SEG + " " in line, line
     assert "IN-PROGRESS: fixing docs=2 python-ci-gate=1" in line, line
 
 
@@ -924,3 +930,104 @@ def test_a_missing_class_is_not_printed_as_a_zero(monkeypatch, tmp_path):
     assert "call-rail=0" not in line, line
     assert "record-review=0" not in line, line
     assert "running=2" in line, line
+
+
+# ── PR-DOCTOR'S OWN VERDICT IN THE BEAT (2026-10-18, owner-reported) ───────────────────────
+# The beat carried `QUEUE(state; pr-doctor dispatches): running=12..23` (now relabelled
+# `QUEUE(state):` -- the parenthetical claimed a dispatch record the token never carried) while the
+# dispatcher exited 2 on 325 consecutive launchd runs and dispatched NOTHING. Queue shape is not
+# production, so the beat now carries the last pass's own rc + reason.
+
+def _verdict_file(tmp_path, **kw):
+    import json as _json
+    import time as _time
+    d = {"rc": kw.get("rc", 0), "reason": kw.get("reason", "ok"),
+         "at_epoch": _time.time() - kw.get("age_s", 60)}
+    (tmp_path / "pr-doctor.status.json").write_text(_json.dumps(d))
+
+
+def test_a_red_pr_doctor_pass_is_VISIBLE_in_the_beat(monkeypatch, tmp_path):
+    """⛔ THE OWNER'S COMPLAINT, pinned: `running=12..23` read healthy while the dispatcher was dead."""
+    from collections import Counter
+    _stub_queue(monkeypatch, tmp_path, classes=Counter({"running": 4}),
+                by_class={"running": [(1, None), (2, None), (3, None), (4, None)]})
+    _verdict_file(tmp_path, rc=2, reason="lane roster UNREADABLE -- lane-actions read failed")
+    line = objective.build()
+    assert "PR-DOCTOR(last run): RED rc=2" in line, line
+    assert "lane roster UNREADABLE" in line, line
+    # …and the queue numbers are STILL reported: the two facts sit side by side, neither replaces
+    # the other (that is exactly how the fleet mistook queue shape for dispatcher health).
+    assert "running=4" in line, line
+
+
+def test_a_green_pass_says_ok_and_a_missing_verdict_is_UNREPORTED(monkeypatch, tmp_path):
+    """Absence is not a pass: a dispatcher that has never written a verdict must not read `ok`."""
+    from collections import Counter
+    _stub_queue(monkeypatch, tmp_path, classes=Counter({"fix-ci": 1}),
+                by_class={"fix-ci": [(9, "docs")]})
+    line = objective.build()
+    assert "PR-DOCTOR(last run): UNREPORTED" in line, line
+    _verdict_file(tmp_path, rc=0, reason="dispatched 1 of 2 queued — ok")
+    line = objective.build()
+    assert "PR-DOCTOR(last run): ok rc=0" in line, line
+    assert "dispatched 1 of 2 queued" in line, line
+
+
+def test_an_unreadable_verdict_is_reported_not_swallowed(monkeypatch, tmp_path):
+    from collections import Counter
+    _stub_queue(monkeypatch, tmp_path, classes=Counter({"fix-ci": 1}),
+                by_class={"fix-ci": [(9, "docs")]})
+    (tmp_path / "pr-doctor.status.json").write_text("{not json")
+    line = objective.build()
+    assert "UNREPORTED" in line and "unreadable verdict" in line, line
+
+
+def test_a_STALE_verdict_is_UNREPORTED_not_ok_forever(monkeypatch, tmp_path):
+    """⛔ A VERDICT THAT STOPPED BEING WRITTEN IS NOT A PASS (2026-10-18, review).
+
+    The failure this segment exists to expose is "a dead dispatcher reads healthy". An unbounded age
+    reproduces it one level up: kill the launchd job (or leave `$STATE/PR-DOCTOR-OFF` in place) and
+    the last green verdict would sit in the beat saying `ok` for a week. The bound is the same
+    freshness the roster read uses -- two 1200s dispatch intervals.
+    """
+    from collections import Counter
+    _stub_queue(monkeypatch, tmp_path, classes=Counter({"fix-ci": 1}),
+                by_class={"fix-ci": [(9, "docs")]})
+    _verdict_file(tmp_path, rc=0, reason="ok", age_s=2401)
+    line = objective.build()
+    assert "PR-DOCTOR(last run): UNREPORTED" in line, line
+    assert "STALE" in line, line
+    _verdict_file(tmp_path, rc=0, reason="ok", age_s=2399)
+    line = objective.build()
+    assert "PR-DOCTOR(last run): ok rc=0" in line, line
+
+
+def test_a_dry_run_verdict_never_reads_as_a_pass(monkeypatch, tmp_path):
+    """`--dry-run` no longer writes the record; if an old one carries the flag it still must not
+    read as production traffic."""
+    import json as _json
+    import time as _time
+    from collections import Counter
+    _stub_queue(monkeypatch, tmp_path, classes=Counter({"fix-ci": 1}),
+                by_class={"fix-ci": [(9, "docs")]})
+    (tmp_path / "pr-doctor.status.json").write_text(_json.dumps(
+        {"rc": 0, "reason": "dispatched 3 of 3 queued", "dry_run": True,
+         "at_epoch": _time.time() - 30}))
+    line = objective.build()
+    assert "DRY RUN" in line and "ok rc=0" not in line, line
+
+
+def test_the_dispatcher_verdict_SURVIVES_a_blind_queue(monkeypatch, tmp_path):
+    """⛔ IT MUST NOT DISAPPEAR WITH THE QUEUE READ (2026-10-18, review).
+
+    The segment used to be appended inside the `if _qcls:` branch, so it was omitted exactly when
+    the queue partition was unreadable -- i.e. a reader could not tell "the dispatcher is fine" from
+    "the dispatcher's verdict was not rendered". A partly-blind pass is when the verdict matters
+    most.
+    """
+    _stub_queue(monkeypatch, tmp_path, classes=None, by_class={})
+    _verdict_file(tmp_path, rc=2, reason="lane roster UNREADABLE")
+    line = objective.build()
+    # The partition is NOT rendered (that is the blind case), and the verdict is STILL there.
+    assert "| QUEUE(state):" not in line, line
+    assert "PR-DOCTOR(last run): RED rc=2" in line, line
