@@ -241,6 +241,12 @@ if [ "$ACTION" = uninstall ]; then
   # keep the plist on failure so the retry has something to act on.
   _cp=0
   for _ in 1 2 3 4 5 6 7 8 9 10; do
+    # ⛔ THE READ MUST BE GUARDED — a non-regular lock (a FIFO, a wedged network mount) makes `cat`
+    # BLOCK ON OPEN, and this runs AFTER the bootout, so the wait would hang for ever with the fleet
+    # already stopped, the plist never removed and no message (review round 2, measured: a FIFO lock
+    # still blocked the exact expression after 2s). `lc_foreign_controller` already documents and
+    # guards this same read; do not re-do it unguarded.
+    [ -f "$O/.orch.lock" ] || { _cp=0; break; }
     _cp="$(cat "$O/.orch.lock" 2>/dev/null || echo 0)"
     case "$_cp" in ''|*[!0-9]*) _cp=0 ;; esac
     [ "$_cp" -gt 0 ] && kill -0 "$_cp" 2>/dev/null || break

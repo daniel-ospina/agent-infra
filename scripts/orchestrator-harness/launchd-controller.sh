@@ -108,19 +108,35 @@ fi
 # /usr/bin/env is absolute: the pane's shell resolves it BEFORE the forwarded PATH is in effect.
 "$TMUX_BIN" new-session -d -s "$S" \
   "exec /usr/bin/env$ENV_PREFIX /bin/bash $(_shq "$O/orch-loop.sh")" || exit $?
-# ⛔ A CREATE THAT "SUCCEEDED" IS NOT A CONTROLLER (the same empty-is-healthy trap one layer down).
-# Assert the session really exists before blocking on it; otherwise a session that failed to start
-# would fall through to the wait loop and exit after 15s looking like an idle box.
-"$TMUX_BIN" has-session -t "=$S" 2>/dev/null \
+# ⛔ A CREATE THAT "SUCCEEDED" IS NOT A CONTROLLER — AND `has-session` IMMEDIATELY AFTER IS VACUOUS
+# (review round 2, measured on tmux 3.8, isolated socket). tmux tears a dead pane's session down a beat
+# later, not synchronously: `new-session -d -s S "exec /bin/bash -c 'exit 7'"` returns 0 and
+# `has-session -t =S` is TRUE right after — FALSE ~300ms later. So a single immediate check proves
+# nothing and `exit 69` would be unreachable, which is the "looks like an idle box" failure this file
+# exists to end. Settle first, then require the session to still be there.
+_ok=0
+for _n in 1 2 3 4 5 6 7 8 9 10; do
+  sleep 0.2
+  "$TMUX_BIN" has-session -t "=$S" 2>/dev/null || { echo "launchd-controller: '$S' died within $((_n * 2))00ms of starting — see the pane output above" >&2; exit 69; }
+  [ "$_n" -ge 5 ] && { _ok=1; break; }
+done
+[ "$_ok" -eq 1 ] \
   || { echo "launchd-controller: '$S' did not come up — see the pane output above" >&2; exit 69; }
 
 # Block while the controller's session lives, so KeepAlive gives real supervision: when the
 # controller exits, this script exits, and launchd starts a fresh one. Without the block the job
 # would exit immediately after creating the session and KeepAlive would spin.
+_STARTED="$(date +%s)"
 while "$TMUX_BIN" has-session -t "=$S" 2>/dev/null; do sleep 5; done
+_LIVED=$(( $(date +%s) - _STARTED ))
+# ⛔ SAY HOW LONG IT RAN (review round 2). Exiting 0 after a controller that died in two seconds is
+# indistinguishable in launchd.err from an idle box; the lifetime is the one datum that separates them.
+# It stays exit 0 because a controller that exits AT ONCE is a legitimate state — orch-loop.sh exits 0
+# when another controller holds `.orch.lock` — so this is a diagnostic, not a verdict.
 
 # Floor the restart rate. orch-loop.sh exits 0 at once when another controller holds the lock
 # (a peer in the FDA lineage, or a leftover). launchd already throttles KeepAlive to 10s; this
 # keeps the log honest instead of printing a start line every throttle window.
+echo "launchd-controller: the '$S' session ran for ${_LIVED}s and ended (exit 0)" >&2
 sleep 15
 exit 0
