@@ -221,10 +221,16 @@
 #   selftest.sh   §15 extracts run_agent() from merge-one.sh. Once that port lands it must be
 #                 repointed at spawn-gate.sh, or the wall-limit check silently stops covering the
 #                 shipped helper while still reporting green.
-# ⛔ ── NOT DONE, AND NOT BLOCKED: no lane holds these files ────────────────────────────────────
+# ⛔ ── FORMERLY "NOT DONE, AND NOT BLOCKED" — NOW DONE (2026-10-19) ─────────────────────────────
 #   refresh-candidates.sh + merged-not-closed.sh  #8469/#8565/#8629/#8645 — the SECOND pass of this
-#     reconciliation (`.prio`, landed.txt, the answered-pass budget, RETRY_MAX). NOTHING holds these
-#     two files, so this is scope this pass did not reach — not a refusal. Of the 8 post-pin commits,
+#     reconciliation (`.prio`, landed.txt, the answered-pass budget, RETRY_MAX). This note used to say
+#     NOTHING held these two files, so it was scope the earlier pass did not reach. RESOLVED 2026-10-19:
+#     `.prio` + merged-not-closed.sh were ported with the retirement; landed.txt / RETRY_MAX were ported
+#     in the SAME change after review found them STILL ABSENT while the tortoise copy was being deleted.
+#     ⛔ That ordering was the defect: the retirement's premise ("every fix was ported first") was FALSE
+#     for this file, so the first cut of it deleted the only copy of the landed.txt half. The port now
+#     precedes the deletion; `selftest.sh` drives landed.txt write/skip/report/prune and the RETRY_MAX
+#     bound so a future deletion cannot be silent again.
 #     1 is ported here (#8521, minus merge-one.sh), 3 are blocked on held files (#8518's
 #     orch-loop/selftest half, #8589 and #8612, both merge-one.sh) and 4 touch ONLY these free files
 #     (#8560, #8625, #8645, and #8468's non-install.sh half). `run-bash-shards.sh` — to run its
@@ -270,6 +276,17 @@
 #                     reviewed. Measured: 43 of 124 reviewer runs ended at the cap; 7 of 7 cap-hits
 #                     in one window were verdict-less and 4 were then parked "needs a human".
 #                     Driven by selftest.sh (clean/issues/none + marker write/no-write/no-head).
+#
+#   - refresh-candidates.sh  landed.txt + RETRY_MAX (#8560/#8625/#8629/#8469 P2), ported AFTER review
+#                     found the first retirement cut had deleted them unported. Contract preserved:
+#                     a LANDED verdict goes to landed.txt, never checked.txt (checked.txt would retire
+#                     an OPEN issue invisibly); the set is NAMED on every pass; the reaper DROPS an
+#                     entry whose issue is CLOSED, RELEASES one that is readable-OPEN, and KEEPS one
+#                     whose state cannot be read (per-entry fail-closed); the prune reads the issue's
+#                     own UNCAPPED state, never absence from the saturated 500-row `.open_iss`; and a
+#                     candidate that never answers is bounded by RETRY_MAX instead of starving the pool
+#                     behind it. Adapted, not copied: the fork's `len(open_iss) < 500` guard was
+#                     already a permanent no-op and is not carried over.
 #
 # NOT taken, deliberately: (1) the fork's `p0_merge_priority_override` cleared ANY non-empty reason
 # and relied on its call site's ordering, so a reorder would have let a P0 clear a LOAD gate — moot

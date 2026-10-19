@@ -13,6 +13,7 @@
 # that already exports them for orch-loop.sh/install.sh needs no extra setup. `REPO` defaults to
 # the tortoise checkout this box drains; override it for any other target.
 set -u
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 H="${1:-12}"
 # ⛔ `0[0-9]*` too: a leading zero is OCTAL to `$(( ))`. Measured pre-fix: `report.sh 08` printed
 # "08: value too great for base" at the `FROM=` line below and then died at the first use of `$FROM`
@@ -39,7 +40,12 @@ mtime() {
 echo "════════ orchestrator report — last ${H}h ($(date '+%Y-%m-%d %H:%M')) ════════"
 echo
 echo "── controller ──────────────────────────────────────────────"
-if command -v launchctl >/dev/null 2>&1; then
+# ⛔ BRANCH ON THE PLATFORM, NOT ON WHETHER `launchctl` IS ON PATH. A Linux cell can carry a
+# launchctl stub (this suite itself installs one for install.sh), and the macOS branch would then
+# read a job list that does not exist and print a state about the wrong supervisor. `uname` answers
+# the question the branch is actually about.
+PLATFORM="$(uname -s 2>/dev/null || echo UNKNOWN)"
+if [ "$PLATFORM" = "Darwin" ] && command -v launchctl >/dev/null 2>&1; then
   pid=$(launchctl list 2>/dev/null | awk '/orchestrator/{print $1}')
   # ⛔ `launchctl list` prints `-` in the PID column for a job that is LOADED but NOT RUNNING, so
   # `[ -n "$pid" ]` alone read a stopped job as UP (measured: a job loaded with no process printed
@@ -62,7 +68,31 @@ if command -v launchctl >/dev/null 2>&1; then
     echo "  ⚠️  NOT RUNNING (no launchd job)"
   fi
 else
-  echo "  launchd absent — not a macOS box (check the process/tmux on this host)"
+  # ── LINUX: the platform branch, not a shrug ────────────────────────────────────────────────
+  # The cloud cells are supervised by `scripts/cloud-cell-supervisor.sh` (systemd/tmux), whose OWN
+  # `status` verb is the authoritative answer — it reads the per-role pass records and can tell a
+  # dead loop from an idle one. Asking it keeps ONE definition of "is the controller up" instead of
+  # growing a second one here; `pgrep -f orch-loop.sh` is deliberately NOT used (an unscoped match
+  # counts another repo's controller that shares the harness path — the measured #1856/#1859 shape).
+  # If the supervisor is not beside this copy (a bare deployed $O), say so and name the next step
+  # rather than printing a state this script cannot see.
+  SUP=""
+  # Test seam: SUPERVISOR_SH pins the supervisor (the same idiom as the other seams in this suite,
+  # so the Linux branch can be exercised on any host rather than only on a cloud cell).
+  for _c in "${SUPERVISOR_SH:-}" "$HERE/../cloud-cell-supervisor.sh" "${REPO:-}/scripts/cloud-cell-supervisor.sh"; do
+    [ -n "$_c" ] && [ -x "$_c" ] && { SUP="$_c"; break; }
+  done
+  if [ -n "$SUP" ]; then
+    _st="$(O="$O" REPO="$REPO" "$SUP" status 2>&1 | head -4)"
+    if [ -n "$_st" ]; then
+      printf '%s\n' "$_st" | sed 's/^/  /'
+    else
+      echo "  ⚠️  UNKNOWN — cloud-cell-supervisor.sh status printed nothing (cannot verify, not a pass)"
+    fi
+  else
+    echo "  no launchd (not macOS) and no cloud-cell-supervisor.sh beside this copy — cannot ask the supervisor"
+    echo "  → on a cloud cell run: <repo>/scripts/cloud-cell-supervisor.sh status"
+  fi
 fi
 sessions=0
 command -v tmux >/dev/null 2>&1 && sessions=$(tmux ls 2>/dev/null | wc -l | tr -d ' ')

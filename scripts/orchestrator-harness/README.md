@@ -2337,23 +2337,32 @@ agent-infra#1736.
 
 ## 11. Single source of truth: this directory
 
-**This directory is the ONLY copy of the harness.** Measured 2026-10-19, before consolidation, the
-same eight files existed in three places and agreed on almost nothing:
+**This directory is the ONLY copy of the harness.** Measured 2026-10-19 (blob hashes, 8 chars), before
+consolidation the same eight files existed in three places:
 
-| file | agent-infra | tortoise | live `~/orchestrator` |
-|---|---|---|---|
-| `orch-loop.sh` | `d61f1587` | `41c50478` | `d61f1587` |
-| `spawn-gate.sh` | `f730dc87` | `99fd20a9` | `f730dc87` |
-| `refresh-candidates.sh` | `c12cadfc` | `dfedd12a` | `c12cadfc` |
-| `claims.sh` | `95a45308` | **absent** | `95a45308` |
-| `nonblocking-dispatch.sh` | `dc9d555a` | **absent** | `dc9d555a` |
-| `lane.sh` | `7aaa24d1` | `88b1a34b` | `7aaa24d1` |
-| `install.sh` | `9b9ba9f3` | `dccba135` | `9b9ba9f3` |
-| `selftest.sh` | `47189536` | `3b14e8e1` | `47189536` |
+| file | agent-infra `main` | tortoise `main` | live `~/orchestrator` | classes | fix preserved / file retired |
+|---|---|---|---|---|---|
+| `orch-loop.sh` | `e069af29` | `a1ffab3d` | `b4b89547` | (a) + (b) | (a) `P0_BYPASS_MERGE_PRIORITY` + `p0_merge_priority_override` → ported; (b) tortoise + live are older generations → replaced |
+| `spawn-gate.sh` | `a7dba947` | `f7af7919` | `a7dba947` | (b) | tortoise carried no fix; it lacked the shared-gate refactor → replaced |
+| `refresh-candidates.sh` | `a3ac5019` | `facc9a1d` | `a3ac5019` | (a) + (b) | (a) `landed.txt` (skip/write/prune/report), `RETRY_MAX` → ported; (b) otherwise older → replaced |
+| `claims.sh` | `d1604686` | **absent** | `d1604686` | (b) | tortoise fork never had it → retired |
+| `nonblocking-dispatch.sh` | `5e3fe2b1` | **absent** | `5e3fe2b1` | (b) | tortoise fork never had it → retired |
+| `lane.sh` | `3dc22993` | `03400e8d` | `3dc22993` | (a) + (b) | (a) `Closes #N` required / bare `Refs` refused → ported; (b) tortoise lacked the PATH/source-order fix → replaced |
+| `install.sh` | `3c0d14a8` | `de2ce83a` | `db02dfb3` | (a) + (b) + (c) | (a) `P0_BYPASS` render + `merged-not-closed.sh`/`spawn-gate.sh` drift list → ported; (b) tortoise lacked `SCOPE`/key-file validation; (c) macOS-only **by design** — Linux names `scripts/cloud-cell-supervisor.sh` |
+| `selftest.sh` | `2318d1e0` | `04174f50` | `5675377c` | (a) + (b) | (a) tortoise's landed/RETRY_MAX checks → ported (adapted); (b) otherwise older → replaced |
+
+The live copy was **not** a hand-fork: it was an untracked copy of agent-infra generation
+`2ddd5b5a1` (blob-identical on all eight files), one commit behind `main`. That is the same defect
+by another route — an unversioned copy cannot be updated, audited, or healed — so it was converted
+to symlinks into a git checkout rather than deleted. Its one-generation lag is what `doctor` now
+reports as `deployed bytes=DIFFERS`.
 
 The consequence was structural, not cosmetic: every fix had to be applied by hand in three places,
 each box ran a different generation, and "self-healing" was impossible because there was no authority
-to heal *toward*.
+to heal *toward*. And it was actively losing work: the `landed.txt` / `RETRY_MAX` half of
+`refresh-candidates.sh` (tortoise#8560/#8625/#8469) was **deleted** by the tortoise retirement before
+this pass ported it — the retirement's own premise, "every fix was ported first", was false for that
+file.
 
 **The rule.** A fix is ported HERE first. `operations/orchestrator-harness/` in tortoise is retired
 to a pointer, and **tortoise CI fails if a harness script reappears there** — that check lives in the
@@ -2413,6 +2422,7 @@ came back. Those were ported IN, not discarded:
 |---|---|---|
 | `Closes #N` required; a bare `Refs` is refused | a finished lane writing `Refs` never closes its issue, and nothing re-reads it: 25 of 36 open P0-blockers already had merged PRs (tortoise#8468) | `lane.sh` |
 | `merged-not-closed.sh` | the fleet could not answer "which open issues already have a merged PR?" — no tool existed | new file |
+| `landed.txt` (skip / write / prune / report) + `RETRY_MAX` | a LANDED verdict written to `checked.txt` retires an OPEN issue from the backlog permanently and invisibly; and an entry that never answers starves the whole pool behind it (tortoise#8560/#8625/#8629/#8469 P2) | `refresh-candidates.sh` (reaper) + `selftest.sh` |
 | `verdict_kind()` / `apply_verdict_marker()` | a verdict-LESS reviewer run (stall/crash/timeout) must not authorise a fixer: 7 of 7 cap-hits in one window were verdict-less and 4 were parked "needs a human", never reviewed | `merge-one.sh` |
 | ⛔ a P0-blocker outranks the merge-priority gate (BP0, `P0_BYPASS_MERGE_PRIORITY`, `.prio` map) | **NOT carried — reconciled onto main and superseded.** The fork's measurement (19 open PRs, 0 lanes, 33 P0-blockers, 0 closed in 12h) was taken against a gate that closed *below* `MERGE_PRIORITY_AT`; main's rule is unconditional (owner ruling, 2026-10-18: "while ONE un-owned PR remains, it is the work"), so a P0 exception would reopen new issue work on top of an un-worked PR queue — the defect that ruling ends. Nothing reads `.prio` on main | `orch-loop.sh` (rebase: hunk dropped), `refresh-candidates.sh`, `install.sh`, plist |
 
