@@ -1782,8 +1782,6 @@ cmd_start() {
   # Refuse a bad SCOPE before anything starts or is written (validate_scope is also the first thing
   # cmd_check does below — this call is what keeps the refusal ahead of the $O seed).
   validate_scope
-  # BEFORE the already-running early return: see scheduler_ensure's header.
-  scheduler_ensure
   # The stop generation this start is acting under (see the note above `stop_generation`). A caller
   # that LAUNCHED this start (the doctor's restart) passes the generation it observed, so a stop that
   # lands between the launch and this snapshot is still visible: without it, `cmd_start` would read the
@@ -1822,6 +1820,11 @@ cmd_start() {
   # for a pair that is wrong. Placed here, ahead of the return and of every write below, so nothing
   # is seeded and no session is created on a refusal.
   assert_queue_target
+  # BEFORE the already-running early return: see scheduler_ensure's header.
+  # ⛔ AND AFTER assert_queue_target, deliberately: --start CLEARS the OFF switch, so running this
+  # earlier meant a `start` that then REFUSED its queue target had already cleared an operator's
+  # deliberate --stop — un-stopping a schedule on a start that never started anything.
+  scheduler_ensure
   # Guard BEFORE seeding. $O is the controller's working copy and `start` on a live cell would
   # otherwise replace the worker scripts its next spawn executes (and race a half-copied script).
   # Nothing is started or written on this path, so a bad value below cannot hurt it.
