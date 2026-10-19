@@ -1150,6 +1150,11 @@ def _log_repo_of(f):
     return (e or {}).get("repo")
 
 
+def _is_count(n):
+    """A count is an int and a bool is not a count (`isinstance(True, int)` is True)."""
+    return isinstance(n, int) and not isinstance(n, bool)
+
+
 def _queue_age(f):
     """The age of THIS pool reading, and where it came from.
 
@@ -1477,14 +1482,17 @@ def check_work_dispatched(f, c):
     # reading — the exact claim the abstention exists to withhold, and a FAIL that pages someone while
     # `queue_readable`, on the same record, abstains. An abstention placed after the arm it must
     # suppress is dead code (the same structural bug as `check_pr_merged`'s in cycle 23).
-    if isinstance(backlog, int) and backlog > 0 and skipped is not None \
+    # ⛔ `isinstance(True, int)` IS TRUE. A `backlog: true` reached both arms below and FAILed with
+    # "the refresh reported 1 candidate(s)" — a count manufactured from a boolean, on the check whose
+    # FAIL delivers a message. `_activity` and `queue_readable` already guard the same field.
+    if _is_count(backlog) and backlog > 0 and skipped is not None \
             and not superseded_backlog:
         return V("work_dispatched", FAIL, "NO_DISPATCH_GATED", evidence,
                  "the refresh reported %d candidate(s) and the dispatch gate skipped every cycle "
                  "in the window (reason on the [dispatch] skipped line above). The outcome is "
                  "absent — the evidence names WHY, which distinguishes a gated fleet from a "
                  "silently dead one." % backlog)
-    if isinstance(backlog, int) and backlog > 0 and not superseded_backlog:
+    if _is_count(backlog) and backlog > 0 and not superseded_backlog:
         return V("work_dispatched", FAIL, "NO_DISPATCH", evidence,
                  "the refresh reported %d candidate(s) and no dispatch line was written in the "
                  "window. Work existed and did not move." % backlog)
@@ -1555,7 +1563,14 @@ def _activity(f, window_s=None, cfg=None):
     # "a dispatch landed 3m ago" in the evidence of a FAIL, three lines under `work_dispatched`'s
     # FAIL/NO_LANE_STARTED ("lane spawn FAILED") for the same batch. A confirmed spawn is preferred,
     # and when only the intent exists the line says so.
-    lane_ok = newest_with_age(events.get("lane_started") or [], pr_win)
+    # ⛔ A SPAWN ITS OWN FAILURE LINE REFUTES IS NOT A STARTED LANE. `work_dispatched` drops those
+    # (`#4601: chain-1 could NOT be started` → NO_LANE_STARTED) before it counts a start; reading the
+    # raw bucket here published "a lane started 3m ago" in the evidence of a FAIL, directly under the
+    # check saying the spawn failed. A refuted start leaves the INTENT as the evidence, which is what
+    # it always was.
+    refuted = set(str(e.get("issue")) for e in (events.get("lane_failed") or []))
+    lane_ok = newest_with_age([e for e in (events.get("lane_started") or [])
+                               if str(e.get("issue")) not in refuted], pr_win)
     intent = newest_with_age(events.get("dispatch_ok") or [], pr_win)
     if isinstance(gh_open, int) and not isinstance(gh_open, bool) and gh_open > 0:
         return True, "%d open PR(s) — work in hand, independent of the queue record" % gh_open
@@ -1853,6 +1868,19 @@ def check_pane_daemon(f, c):
                  % (len(pids), cmd, pid_txt, adj, prot_txt),
                  "the daemon is alive and NOT OOM-protected (oom_score_adj > 0 means the kernel "
                  "may kill it first). Being alive today is not protection.")
+    # ⛔ A MEASURED VALUE OUTRANKS AN UNREAD SIBLING. `unread` returned unconditionally, so with one
+    # pid READ as `oom_score_adj: 500` (the kernel may kill it first) and another unreadable, the
+    # check abstained — an abstention speaking about a datum it DID read. Only an abstention that
+    # has nothing measured to speak about is honest.
+    unprotected_known = [a for a in known if a >= 0]
+    if unprotected_known:
+        return V("pane_daemon", FAIL, "PROTECTION_PARTIAL",
+                 "%d live %s process(es) (pid %s)\noom_score_adj: %s\nprotected: %d of %d "
+                 "(READ as unprotected: %s)\n%s"
+                 % (len(pids), cmd, pid_txt, adj, len(protected), len(pids),
+                    unprotected_known, prot_txt),
+                 "at least one pane-daemon process was READ as unprotected (oom_score_adj >= 0), and "
+                 "the unprotected one is the one an OOM kill takes.")
     if unread:
         # Some values were unreadable, so neither "all protected" nor "these are unprotected" holds.
         # ⛔ A DISTINCT NAME, because `Verdict.key` is `name|variant` and the notifier suppresses on
@@ -1865,12 +1893,6 @@ def check_pane_daemon(f, c):
                                      len(adj) - len(known), prot_txt),
                  "at least one protection value could not be read, so the OOM arm is not "
                  "established for the whole daemon. Not green.")
-    if len(protected) < len(pids):
-        return V("pane_daemon", FAIL, "PROTECTION_PARTIAL",
-                 "%d live %s process(es) (pid %s)\noom_score_adj: %s\nprotected: %d of %d\n%s"
-                 % (len(pids), cmd, pid_txt, adj, len(protected), len(pids), prot_txt),
-                 "some pane-daemon processes are unprotected; the unprotected one is the one an "
-                 "OOM kill takes.")
     return V("pane_daemon", PASS, "ALIVE_PROTECTED",
              "%d live %s process(es) (pid %s)\noom_score_adj: %s\n%s"
              % (len(pids), cmd, pid_txt, adj, prot_txt))
@@ -2321,10 +2343,15 @@ def check_landers(f, c):
     # population — the polarity the collector states two functions away ("unprovable coverage is
     # truncated, never 'complete'"). The bound is MATERIAL only when it is reached: a 1-row payload
     # cannot have been cut by a 100-row page, so absence there is not evidence of truncation either.
-    if gh.get("page_full") is True or (gh.get("page_full") is None and len(prs) >= 100):
-        # HOISTED above the no-candidate branch: a truncated population is not a population, and
-        # "none of the PRs I saw is green" (or "the one I saw is armed") says nothing about the page
-        # that was never fetched.
+    # ⛔ TRUNCATION IS AN ABSTENTION ABOUT THE PAGE THAT WAS NEVER FETCHED, so it must not silence a
+    # fact measured on a row that WAS read: `expired` is a per-PR observation (a fresh `[armed] #N`
+    # line plus `auto_armed: false` on a row in hand). It was graded before `expired`/`missing` were
+    # even computed, so a truncated population turned the FAIL this check exists for into exit 2.
+    truncated = gh.get("page_full") is True or (gh.get("page_full") is None and len(prs) >= 100)
+
+    if not candidates and truncated:
+        # …but with NO candidate row at all there is nothing to grade, and "none of the PRs I saw is
+        # green" says nothing about the page that was never fetched.
         return V("landers", INCONCLUSIVE, "PARTIAL_POPULATION",
                  "open PRs: %d — POPULATION TRUNCATED at the gh page bound, so PRs beyond it were "
                  "never read\n%s\n%s"
@@ -2420,6 +2447,12 @@ def check_landers(f, c):
                  % (len(missing),
                     (" (the orchestrator log belongs to %s, so it could not vouch either — re-run "
                      "with the --repo this cell actually manages)" % log_repo) if repo_mismatch else ""))
+    if truncated:
+        # a measured FAIL has already been returned above; here the population is truncated and no
+        # per-PR failure was observed, which is a PARTIAL read, never a PASS.
+        return V("landers", INCONCLUSIVE, "PARTIAL_POPULATION", evidence,
+                 "the open-PR list came back full, so the population is TRUNCATED: 'every green PR "
+                 "has an armed lander' is established only for the rows that were read. Not green.")
     if unprobed:
         return V("landers", INCONCLUSIVE, "PARTIAL_POPULATION", evidence,
                  "%d of %d non-draft open PR(s) could not be probed, so 'every green PR has an "

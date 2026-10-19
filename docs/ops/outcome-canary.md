@@ -465,6 +465,21 @@ Six more (cycle 13), each a case where a datum the tool held was not the one it 
   truthy, so a surface that said its read FAILED was graded as a successful one carrying
   `avail_bytes: 0` and produced `FAIL/BELOW_FLOOR` — a fake OOM emergency on the check whose FAIL
   must mean one. A missing `used_pct` now prints as `used_pct not read`, never as `-1.0% used`.
+- **A measured per-PR failure outranks a population-level abstention.** `landers` graded the
+  truncation abstention before `expired`/`missing` were computed, so a full open-PR page turned
+  `LANDER_EXPIRED` — "the lander expired silently and the PR waits for a human", the exact failure
+  the check exists for — into exit 2, and threw away the arming analysis for the rows it HAD read.
+  Truncation now abstains only when there is no candidate row to grade, and otherwise rides below
+  the measured FAILs. The same precedence applies to `pane_daemon`: one pid READ as
+  `oom_score_adj: 500` is `PROTECTION_PARTIAL` even when a sibling value is unreadable.
+- **A bool is not a count, in `work_dispatched` either.** `isinstance(True, int)` is true, so
+  `backlog: true` produced "the refresh reported 1 candidate(s)" and a delivered FAIL;
+  `_activity` and `queue_readable` already refused the same field, and all three now share one
+  `_is_count` helper.
+- **A spawned lane its own failure line refutes is not a started lane.** `_activity` read the raw
+  `lane_started` bucket, so `#4601: chain-1 could NOT be started` plus a start line produced
+  "a lane started 3m ago" in the evidence of a FAIL sitting directly under `NO_LANE_STARTED`.
+  A refuted start falls back to the INTENT, which is what it always was.
 - **A `PARTIAL` token cannot certify an empty pool.** `parse_queue_token` sets `pool` only for
   `READ(...)`; a `PARTIAL(...)` token carries `partial` and leaves `pool` None, so admitting it let a
   shape whose pool SIZE was never read fall through to "the fleet had nothing in hand" while

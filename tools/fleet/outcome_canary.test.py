@@ -4490,6 +4490,23 @@ MUTATIONS = [
      '    if lane_ok:\n        return True, "a lane started %s (the queue record is not the only evidence)" % (\n            _age_txt(lane_ok.get("age_s")))',
      '    if intent or lane_ok:\n        return True, "a dispatch landed %s (the queue record is not the only evidence)" % (\n            _age_txt((intent or lane_ok).get("age_s")))',
      "test_the_intent_line_is_not_reported_as_a_LANDED_dispatch"),
+    # ── cycle-34 defects ─────────────────────────────────────────────────────────────────
+    ("the truncation abstention outranks a MEASURED lander expiry",
+     "    if not candidates and truncated:",
+     "    if False:",
+     "test_a_MEASURED_lander_expiry_outranks_a_truncated_population"),
+    ("an unread protection value outranks a MEASURED unprotected pid",
+     "    unprotected_known = [a for a in known if a >= 0]\n    if unprotected_known:",
+     "    unprotected_known = []\n    if unprotected_known:",
+     "test_a_MEASURED_unprotected_pid_outranks_an_unread_sibling"),
+    ("a bool backlog is read as a candidate count",
+     "    if _is_count(backlog) and backlog > 0 and not superseded_backlog:",
+     "    if isinstance(backlog, int) and backlog > 0 and not superseded_backlog:",
+     "test_a_BOOL_backlog_is_not_a_candidate_COUNT"),
+    ("a refuted lane start is reported as a started lane",
+     '                               if str(e.get("issue")) not in refuted], pr_win)',
+     '                               ], pr_win)',
+     "test_the_intent_line_is_not_reported_as_a_LANDED_dispatch"),
     # ── cycle-28 defects ──────────────────────────────────────────────────────────────────
     ("CONTROLLER_ABSENT ignores a rejected controller row",
      "    if not pids and near_ours:",
@@ -4499,10 +4516,10 @@ MUTATIONS = [
      "    if not pids and pane_near:",
      "    if False:",
      "test_a_REJECTED_daemon_row_is_not_an_ABSENT_daemon"),
-    ("an undisclosed page bound is read as a complete population",
-     '    if gh.get("page_full") is True or (gh.get("page_full") is None and len(prs) >= 100):',
-     '    if gh.get("page_full") is True:',
-     "test_an_UNDISCLOSED_page_bound_is_truncation_when_the_bound_was_actually_REACHED"),
+    ('an undisclosed page bound is read as a complete population',
+     '    truncated = gh.get("page_full") is True or (gh.get("page_full") is None and len(prs) >= 100)',
+     '    truncated = False',
+     'test_an_UNDISCLOSED_page_bound_is_truncation_when_the_bound_was_actually_REACHED'),
     ("the rollup state returns on the first in-flight group",
      "        if any(_in_flight(chk) for _r, chk in entries):\n            seen_inflight = True\n            continue",
      "        if any(_in_flight(chk) for _r, chk in entries):\n            return \"inflight\"",
@@ -4932,10 +4949,10 @@ MUTATIONS = [
      '            mism.append((path, "(fixture)", ">=1 expectation", "NO_EXPECT", None))',
      "            pass",
      "test_a_fixture_with_no_expect_asserts_nothing_and_says_so"),
-    ("a truncated open-PR page is treated as the whole population",
-     '    if gh.get("page_full") is True or (gh.get("page_full") is None and len(prs) >= 100):',
-     "    if False:",
-     "test_a_truncated_open_PR_population_is_not_a_population"),
+    ('a truncated open-PR page is treated as the whole population',
+     '    truncated = gh.get("page_full") is True or (gh.get("page_full") is None and len(prs) >= 100)',
+     '    truncated = False',
+     'test_a_truncated_open_PR_population_is_not_a_population'),
     # ── cycle-5 defects ──────────────────────────────────────────────────────────────
     ("REST's lowercase mergeability state is not normalised, so landers grades nothing",
      '        row["merge_state_status"] = (det.get("mergeable_state") or "").strip().upper()',
@@ -5499,6 +5516,62 @@ def test_a_STRING_false_headroom_ok_does_not_manufacture_an_OOM():
 
 
 @test
+def test_a_MEASURED_lander_expiry_outranks_a_truncated_population():
+    """The truncation abstention was graded before `expired`/`missing` were even computed, so a full
+    page turned the FAIL this check exists for ("the lander expired silently and the PR waits for a
+    human") into exit 2 — and discarded the arming analysis for the rows that WERE read."""
+    m = load()
+    cfg = m.cfg_from_dict({"repo": "o/r"})
+    d = fx("lander-expired")
+    d["facts"]["github"]["page_full"] = True
+    v = m.check_landers(d["facts"], cfg)
+    assert (v.status, v.variant) == (m.FAIL, "LANDER_EXPIRED"), (v.status, v.variant)
+    # …with NO candidate row there is nothing to grade, so truncation still abstains
+    d2 = fx("lander-expired")
+    d2["facts"]["github"]["page_full"] = True
+    for pr in d2["facts"]["github"]["open_prs"]:
+        pr["merge_state_status"] = "BLOCKED"
+    v2 = m.check_landers(d2["facts"], cfg)
+    assert (v2.status, v2.variant) == (m.INCONCLUSIVE, "PARTIAL_POPULATION"), (v2.status, v2.variant)
+
+
+@test
+def test_a_MEASURED_unprotected_pid_outranks_an_unread_sibling():
+    """`unread` returned unconditionally, so a pid READ as `oom_score_adj: 500` — the one an OOM kill
+    takes first — was graded INCONCLUSIVE whenever any SIBLING value was unreadable: an abstention
+    speaking about a datum it did read."""
+    m = load()
+    cfg = m.cfg_from_dict({})
+    facts = {"pane": {"ok": True, "protection_supported": True,
+                      "pids": [{"pid": 700, "oom_score_adj": 500},
+                               {"pid": 701, "oom_score_adj": None}]}}
+    v = m.check_pane_daemon(facts, cfg)
+    assert (v.status, v.variant) == (m.FAIL, "PROTECTION_PARTIAL"), (v.status, v.variant)
+    # all values READ and protected is still a PASS; all unread is still an abstention
+    facts["pane"]["pids"] = [{"pid": 700, "oom_score_adj": -900}]
+    assert m.check_pane_daemon(facts, cfg).status == m.PASS
+    facts["pane"]["pids"] = [{"pid": 700, "oom_score_adj": None}]
+    v2 = m.check_pane_daemon(facts, cfg)
+    assert (v2.status, v2.variant) == (m.INCONCLUSIVE, "PROTECTION_UNEVALUABLE"), (v2.status,
+                                                                                  v2.variant)
+
+
+@test
+def test_a_BOOL_backlog_is_not_a_candidate_COUNT():
+    """`isinstance(True, int)` is true, so `backlog: true` produced FAIL/NO_DISPATCH —
+    "the refresh reported 1 candidate(s) … Work existed and did not move" — a count manufactured from a
+    boolean, on the check whose FAIL delivers a message. `_activity` refuses the same field."""
+    m = load()
+    cfg = m.cfg_from_dict({})
+    d = fx("idle-empty-pool")
+    d["facts"]["log_events"]["headers"][0]["backlog"] = True
+    v = m.check_work_dispatched(d["facts"], cfg)
+    assert v.variant != "NO_DISPATCH", (v.status, v.variant, v.detail)
+    got = dict((x.name, x) for x in m.evaluate(d["facts"], cfg))
+    assert got["work_dispatched"].variant != "NO_DISPATCH", got["work_dispatched"].variant
+
+
+@test
 def test_an_INCOMPLETE_header_cannot_certify_an_EMPTY_pool():
     """The `state/queue-state: EMPTY` supersede shortcut returned `False` ("the fleet had nothing in
     hand") without the `HEADER_INCOMPLETE` guard its two sibling checks enforce, so a header with no
@@ -5563,10 +5636,17 @@ def test_the_intent_line_is_not_reported_as_a_LANDED_dispatch():
     busy, why = m._activity(d["facts"], cfg=cfg)
     assert busy is True, (busy, why)
     assert "ATTEMPTED" in why and "landed" not in why, why
-    # …and a CONFIRMED lane start is preferred over a fresh intent for the same batch
+    # ⛔ A SPAWN ITS OWN FAILURE LINE REFUTES IS NOT A STARTED LANE. `work_dispatched` drops that row
+    # (`#4601: chain-1 could NOT be started` → NO_LANE_STARTED); reading the raw bucket here printed
+    # "a lane started 3m ago" in the evidence of a FAIL sitting under "lane spawn FAILED".
     d["facts"]["log_events"]["lane_started"] = [{"issue": 4601, "age_s": 200}]
     busy2, why2 = m._activity(d["facts"], cfg=cfg)
-    assert busy2 is True and "a lane started" in why2, why2
+    assert busy2 is True, (busy2, why2)
+    assert "ATTEMPTED" in why2 and "a lane started" not in why2, why2
+    # …and once nothing refutes it, the confirmed start is preferred over the intent
+    d["facts"]["log_events"]["lane_failed"] = []
+    busy3, why3 = m._activity(d["facts"], cfg=cfg)
+    assert busy3 is True and "a lane started" in why3, why3
 
 
 @test
