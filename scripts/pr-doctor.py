@@ -69,6 +69,7 @@ import json
 import os
 import plistlib
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -81,9 +82,16 @@ from datetime import datetime, timezone
 # this process's own retry/report takes over. Inherited by every descendant (same bounded step).
 os.environ.setdefault("GH_LIMIT_NO_WAIT", "1")
 
+# ⛔ NO HOST LAYOUT IS A LITERAL (#1864 / #2048 / #2030). This file is farmed to the cmux cloud
+# cells by `pi-bootstrap/setup.sh` (`fleet_srcs`), and it carried `~/Documents/GitHub/tortoise` --
+# one Mac's layout. On a Linux cell that path does not exist, so `VENV_PY` did not exist, every
+# `git -C REPO_DIR` failed and the dispatcher's interpreter fell through to `uv`. The file reached
+# the cells; the layout it assumed never did. Every path below is DERIVED (env seam first), and
+# every consumer of a path it could not derive says so instead of running on an empty string.
 HOME = os.path.expanduser("~")
 HERE = os.path.dirname(os.path.realpath(__file__))
-STATE_DIR = os.path.join(HOME, ".pi", "agent", "state")
+STATE_DIR = (os.environ.get("PR_DOCTOR_STATE_DIR")
+             or os.path.join(HOME, ".pi", "agent", "state"))
 STATE = os.path.join(STATE_DIR, "pr-doctor.json")
 LOG = os.path.join(STATE_DIR, "pr-doctor.log")
 SCRIPTS = os.path.join(HOME, ".pi", "agent", "scripts")
@@ -106,24 +114,152 @@ STATUS = os.path.join(STATE_DIR, "pr-doctor.status.json")
 # ELIGIBLE` off a single owned PR). An earlier revision passed `dry_run=` from ONE exit path, so four
 # of six exits still wrote -- a guard that covers the path you tested is not a guard.
 NOT_A_FLEET_READING = ""      # "" = a real pass; else WHY this run must not be recorded
-# The lane-roster budget for the whole read (`lane-actions.py` splits it across its attempts --
-# see that tool's `load_snapshot`). MEASURED 2026-10-18: one real scan costs 147s quiet, 183s and
-# 200s at sample 12 on a busy box, and >420s under load; `idle_lanes()`'s own outer bound is this plus LANE_BUDGET_MARGIN_S, so the
-# inner attempts can always finish before the caller stops waiting.
-LANE_BUDGET_S = 420.0
-LANE_BUDGET_MARGIN_S = 120.0
-# The fleet's published roster (the heartbeat's pass-opening scan, written atomically). Reading
-# it costs 2.8s MEASURED; a scan costs 147-420s. Fresh = within one dispatch interval, after
-# which the producer is presumed dead and a scan is the honest escalation.
-SNAPSHOT = os.path.join(STATE_DIR, "lane-status.last.json")
-# The SAME freshness the heartbeat itself requires before it trusts a snapshot (it refuses one
-# older than 15 min), so the two consumers cannot disagree about what "fresh" means.
-SNAPSHOT_MAX_AGE_S = 900
+# ⛔ THE ROSTER IS MEASURED NOW, SO THERE IS NO SCAN BUDGET AND NO PUBLISHED-SNAPSHOT DEPENDENCY
+# (#2055). This file used to read `lane-actions.py --stdin $STATE/lane-status.last.json` (2.8 s) and
+# fall back to a 147-420 s `lane-status.py` scan; both answer "what do the lanes' TRANSCRIPTS say",
+# which is a derived verdict, not a live fact. `idle_lanes()` reads live processes and one `cmux`
+# call instead (measured 0.4-2.5 s on this box, and it costs no budget to manage). The snapshot is
+# still produced for the heartbeat and the fleet report; this job no longer gates dispatch on it.
+# ⚠️ `LANE_BUDGET_S` / `LANE_BUDGET_MARGIN_S` used to live here. They are GONE rather than
+# kept-but-unused: a constant nothing reads is a promise to the next reader that something does.
+
 # A DECLARED partial ownership read (e.g. the branch map is unreadable under TCC). Empty on a
 # complete read; `main()` logs it so a weaker predicate is never mistaken for a full one.
 OWNERSHIP_NOTE = ""
-REPO = "daniel-ospina/tortoise"
-REPO_DIR = os.path.join(HOME, "Documents", "GitHub", "tortoise")
+REPO = os.environ.get("PR_DOCTOR_REPO") or "daniel-ospina/tortoise"
+_REPO_NAME = REPO.split("/")[-1]
+# The bounded candidate roots, RELATIVE to $HOME, that a checkout may live under. A BOUNDED list
+# on purpose: an unbounded walk for a checkout is the fleet's most expensive habit
+# (`docs/ops/load-policy.md`), and this runs at import time on every cell.
+_REPO_ROOTS = ("Documents/GitHub", "src", "code", "repos", "git", "workspace", "projects")
+
+
+def _origin_repo(path: str, want: str):
+    """True/False when `git remote get-url origin` answers; None when the question is unaskable.
+
+    `None` is an ABSTENTION, never a False: under macOS TCC a launchd agent cannot enter
+    `~/Documents`, so `git -C <checkout>` fails there (rc=128, measured) and collapsing that into
+    "not the checkout we want" would reject the ONLY candidate on the box that runs this job.
+    """
+    try:
+        r = subprocess.run(["git", "-C", path, "remote", "get-url", "origin"],
+                           capture_output=True, text=True, timeout=5)
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    url = (r.stdout or "").strip()
+    if not url:
+        return None
+    slug = url.rstrip("/")
+    if slug.endswith(".git"):
+        slug = slug[:-4]
+    slug = slug.replace(":", "/")
+    return slug.endswith("/" + want) or slug.endswith(":" + want) or slug == want
+
+
+REPO_SEAM_REJECTED: list = []      # a named-but-unusable seam, reported instead of swallowed
+
+
+def _main_checkout(path: str, want: str | None = None) -> str:
+    """`path`, or the MAIN checkout that holds it when `path` is a linked git worktree.
+
+    ⛔ TWO MEASURED FACTS (#2055 review, P2). (1) A linked worktree's `.git` is a FILE, not a
+    directory -- verified on this very worktree -- so a `isdir(.../.git)` test rejects a valid
+    checkout with the false message "is not a git checkout". (2) The roster joins lanes on
+    `<REPO_DIR>/.worktrees/<name>`, so a REPO_DIR that is ITSELF a worktree prefixes
+    `<worktree>/.worktrees/` onto every lane path, excludes all of them, and reports `rc=0` with
+    nothing dispatched -- the false-quiet class this change removes, kept alive for a
+    worktree-shaped REPO_DIR. `git -C <a worktree> rev-parse --show-toplevel` would answer, but it
+    is one more external call on every cell; the path answers it with no process at all.
+    """
+    p = os.path.realpath(path)
+    parts = [x for x in p.split(os.sep)]
+    if ".worktrees" in parts[1:]:
+        i = parts.index(".worktrees", 1)
+        main = os.sep.join(parts[:i]) or os.sep
+        # ⛔ VERIFY THE RESULT (#2055 review). Truncating at the first `.worktrees` segment
+        # unconditionally turned a clone whose path merely CONTAINS such a directory
+        # (`~/src/.worktrees/tortoise`, not a git worktree at all) into its parent -- a path with
+        # no `.git`, while `REPO_DIR_ERROR` stayed empty, so nothing said so and every dispatch
+        # failed as `rc=3 UNDELIVERED … no lane accepted` naming the wrong cause. An unverifiable
+        # climb keeps the seam's own answer.
+        # ⛔ `.git` ALONE IS NOT ENOUGH: IT MUST BE THIS REPO (2026-10-18, review). A seam pointing
+        # at another repo's worktree (`~/src/.worktrees/tortoise`, where `~/src` clones
+        # `example/other-repo`) climbed to that OTHER checkout, with `REPO_SEAM_REJECTED` empty and
+        # `REPO_DIR_ERROR` empty -- so every git read, the branch map and the lane eligibility then
+        # described the wrong repository and orders for THIS repo's PRs were typed into its lanes.
+        # Every other arm of `resolve_repo_dir` asks `_origin_repo`; this one now does too. `None`
+        # (origin unreadable under TCC) is not a refusal -- it is an abstention, and the path wins.
+        if os.path.exists(os.path.join(main, ".git")):
+            # `want` empty means the repo SLUG could not be derived at all (`PR_DOCTOR_REPO="/"`),
+            # so provenance cannot be asked. That is an abstention, not a pass: `None`.
+            origin = _origin_repo(main, want) if want else None
+            if origin is not False:
+                return main
+            REPO_SEAM_REJECTED.append(
+                "%s's parent %s is a checkout of ANOTHER repo (%s)" % (path, main, want))
+        else:
+            REPO_SEAM_REJECTED.append(
+                "%s looks like a linked worktree but %s is not a checkout" % (path, main))
+    return p
+
+
+def resolve_repo_dir(home: str | None = None, repo_name: str | None = None) -> str:
+    """The target repo's checkout on THIS box, derived; "" when it cannot be established.
+
+    Order, each step a measurement:
+      1. `PR_DOCTOR_REPO_DIR` -- the seam an installer, a systemd unit or a test uses.
+      2. an ancestor of this file that IS a checkout of the target repo (running from the repo).
+      3. a bounded candidate root, accepted only when its `origin` names the repo -- or when
+         origin is unreadable but the directory is named for it (the TCC case above).
+      4. "", which callers must treat as "the checkout is UNKNOWN", not as a path.
+    """
+    want = repo_name or _REPO_NAME
+    # ⛔ THE CELLS KEEP THE CHECKOUT SOMEWHERE `$HOME/<root>/<repo>` CANNOT SEE (#2055 review,
+    # P1). `cloud-cell-bringup.sh` puts it under `/tmp/cell` (`WORKDIR=/tmp/cell`), so a
+    # HOME-relative candidate list found NOTHING there and `_in_repo_worktree()` then rejected
+    # every lane -- a roster of zero on a live cell, reported as `rc=0 OK`. So the seams the
+    # harness ALREADY requires win, in the order the harness itself sets them:
+    #   PR_DOCTOR_REPO_DIR  -- this file's own override
+    #   TORTOISE_REPO       -- `refresh-candidates.sh`'s seam for "where the target repo lives"
+    #   REPO                -- `install.sh` REFUSES to run without it ("export REPO=<checkout>")
+    for var in ("PR_DOCTOR_REPO_DIR", "TORTOISE_REPO", "REPO"):
+        val = (os.environ.get(var) or "").strip()
+        if val and os.path.exists(os.path.join(val, ".git")):
+            return _main_checkout(val, want)
+        if val:
+            # Named but not a checkout: say so rather than silently falling through to a HOME
+            # guess -- a mis-set seam must not read as "this box has no checkout".
+            REPO_SEAM_REJECTED.append("%s=%s is not a git checkout" % (var, val))
+    home = home or HOME
+    d = HERE
+    for _ in range(8):
+        if os.path.exists(os.path.join(d, ".git")) and _origin_repo(d, want) is True:
+            return _main_checkout(d, want)
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    for root in _REPO_ROOTS:
+        cand = os.path.join(home, *root.split("/"), want)
+        if not os.path.exists(os.path.join(cand, ".git")):
+            continue
+        if _origin_repo(cand, want) is False:
+            continue
+        return _main_checkout(cand, want)
+    return ""
+
+
+REPO_DIR = resolve_repo_dir()
+# Stated once, at the point a reader will look, so a downstream "git failed" is never mistaken for
+# a broken repo when the truth is "this box keeps the checkout somewhere this file cannot see".
+# ⛔ A REJECTED SEAM IS SAID OUT LOUD EVEN WHEN A CHECKOUT WAS FOUND (#2055 review): the note was
+# readable only on the `no checkout at all` arm, so a seam that named a worktree of ANOTHER repo
+# resolved to the wrong repo in silence -- and silence is the failure mode this whole change removes.
+REPO_DIR_ERROR = ("" if REPO_DIR else
+                  "no checkout of %s found (set PR_DOCTOR_REPO_DIR); git reads will be UNAVAILABLE"
+                  % REPO)
 
 
 # ⛔ USE THE REAL gh BINARY, NOT THE `gh` ON PATH. On this box `~/.pi/agent/shims/gh` is a
@@ -204,6 +340,46 @@ ORCH_PLIST = os.path.join(HOME, "Library", "LaunchAgents", "com.eldato.orchestra
 DEFAULT_MAX_FIX = 3
 DEFAULT_MAX_REVIEW = 4
 
+# ── ADMISSION CONTROL: MEASURED, NOT CLAIMED (#2055) ────────────────────────────────────
+# ⛔ THE MACHINE'S HEADROOM IS A MEASUREMENT. A lane roster says who is BUSY; it says nothing
+# about whether THIS BOX can take more work, and it was read as if it did -- MEASURED
+# 2026-10-18T22:14Z: `RED rc=3 -- no idle lane in the roster` while the box sat at load 52 on 10
+# cores (5.2x), 7.8 GB RAM available, and 6 PRs had no holder. The refusal was false in both
+# halves: the roster over-counted lanes (registry claims) and nothing had looked at the machine.
+#
+# ⛔ AND THE BAND IS NOT THIS FILE'S TO INVENT. The fleet's controller already gates every spawn
+# on `load < MAX_LOAD` (`orch-loop.sh`, default 10x cores) with a memory floor (`MIN_MEM_FREE_MB`,
+# default 512), read from the SAME launchd EnvironmentVariables block that supplies MAX_FIX /
+# MAX_REVIEW here. This file reads those, in that order, for the same reason it reads the budget
+# from there: two readers of one machine must not carry two models of it.
+#   * `MAX_LOAD`         -- absolute load at or above which the controller spawns nothing.
+#   * `MIN_MEM_FREE_MB`  -- its available-memory floor.
+#   * `MIN_FREE_DISK_MB` -- this file's own floor: a pass writes briefs and a state sidecar, and a
+#                           full disk turns a dispatch into a traceback nobody reads.
+# ⚠️ ONE POLARITY IS DELIBERATELY DIFFERENT FROM THE CONTROLLER'S, and the reason is mechanical:
+# the controller FORKS a process, so an unreadable memory probe is fail-closed there. This job
+# forks nothing -- it types into a lane that is already running -- so a datum it could not read
+# does NOT refuse. Blindness is not saturation, and a gate that refuses on its own blindness is
+# the mirror image of the bug this section fixes.
+LOAD_BAND_CORES_X = 10.0     # the default MAX_LOAD multiplier (orch-loop.sh: _NCPU * 10)
+MIN_FREE_RAM_MB = 512        # orch-loop.sh's MIN_MEM_FREE_MB default
+MIN_FREE_DISK_MB = 2048      # this file's own floor (state + briefs, with room)
+
+# ── IDLENESS: a lane that is currently WRITING is not available (2026-10-18, measured) ──────────
+# ⛔ "NOT HOLDING AN OPEN PR" IS NOT "IDLE" -- and the difference was visible on the first live run.
+# The roster offered `.worktrees/fix/7852-direction-storage` because no OPEN PR's head ref matched
+# its branch; `cmux read-screen` on that pane showed `⠧ Working` and a live `task` child mid-review.
+# Dispatching there does not lose the order (pi delivers a steering message at end of turn) but it
+# INTERLEAVES two jobs in one lane -- the harm rule 2 in this file's header exists to prevent.
+# So idleness is MEASURED too, from the lane's own output: a pi writes its session transcript as it
+# works and writes NOTHING while it sits at a prompt, so the age of the newest transcript write is a
+# direct observation of "is this lane producing output right now".
+# ⚠️ RESIDUAL, stated: a lane inside one long SILENT tool (a 5-minute test run) writes nothing and
+# reads idle after 10 min. It cannot be woken mid-tool by a boolean -- and the window is generous
+# for exactly that reason. The order is queued, not lost.
+LANE_QUIET_S = 600
+
+
 # A dispatch draws on the budget of the work it starts. `fix-ci` needs code/CI repair (MAX_FIX);
 # `rerun-checks` re-triggers the workflows and then runs the review+merge chain, so it is fix
 # work; `resolve-conflict` and `blocked-by-rail` are repairs (MAX_FIX); `record-review` is review
@@ -221,8 +397,13 @@ ACTION_CLASS = {"fix-ci": "fix", "rerun-checks": "fix", "resolve-conflict": "fix
 
 # ⛔ `tools/cmux_dispatch.py` REQUIRES PYTHON >= 3.12 and REFUSES to run under the system
 # `python3` (3.9.6 on this box) -- it exits 0 with a one-line complaint, so a caller that only
-# checks the exit code sees "success" while nothing was sent. Always use the repo venv.
-VENV_PY = os.path.join(REPO_DIR, ".venv", "bin", "python")
+# checks the exit code sees "success" while nothing was sent.
+#
+# And it is DERIVED, not `REPO_DIR/.venv/bin/python` (#1864): a box with no checkout has no venv,
+# and the old constant then named a RELATIVE `.venv/bin/python` -- i.e. `$PWD/.venv/bin/python`,
+# which is a different interpreter in every directory. `dispatcher_py()` resolves it, in order:
+# `PR_DOCTOR_PYTHON`, the repo's venv, this interpreter when it is already >= 3.12, then `uv`.
+VENV_PY = os.path.join(REPO_DIR, ".venv", "bin", "python") if REPO_DIR else ""
 
 
 def now() -> float:
@@ -278,6 +459,201 @@ def capacity() -> dict:
             "max_review": _limit("MAX_REVIEW", DEFAULT_MAX_REVIEW)}
 
 
+# ── MEASURED ADMISSION: is THIS box able to take another child, right now? ────────────────
+# ⛔ THE BUDGET AND THE BOX ARE TWO DIFFERENT FACTS. `capacity()` answers "may I dispatch N of
+# this class" from configuration; `machine_headroom()` answers "can this machine absorb one more
+# process" from MEASUREMENT. Until this existed, a pass with budget left and no *roster* lane
+# refused as if the box were full -- and the box was 5.2x on a 10x band with 7.8 GB free.
+#
+# The measurement is deliberately narrow, and EVERY ARM IS A ONE-SIDED REFUSAL: an unreadable
+# datum is `None`, and `None` never refuses. A gate that refuses on its own blindness trades one
+# false refusal for another, and the whole point is to stop refusing work that can be done.
+def _cores() -> int:
+    try:
+        n = os.cpu_count()
+        return int(n) if n else 0
+    except Exception:
+        return 0
+
+
+def _load1():
+    """The 1-minute load average, or None. `os.getloadavg` exists on macOS and Linux alike."""
+    try:
+        return float(os.getloadavg()[0])
+    except Exception:
+        return None
+
+
+MEMINFO = "/proc/meminfo"    # a seam, so the Linux arm can be tested on macOS
+
+
+def _free_ram_mb():
+    """AVAILABLE memory in MiB, or None -- the same figure `orch-loop.sh` gates spawns on.
+
+    ⛔ "AVAILABLE", NOT "UNUSED", AND THE MAC READER IS NOT OPTIONAL (measured 2026-10-18).
+    macOS reports almost nothing as unused (140 MiB on this box) while holding 9 GB in `inactive`
+    pages and compression; a gate on unused memory would refuse every pass on a healthy Mac --
+    the exact false refusal this change exists to remove. So: Linux `MemAvailable`
+    (`/proc/meminfo`), else macOS `vm_stat` free+inactive, with the page size taken from vm_stat's
+    OWN header (16 KiB on Apple silicon, 4 KiB on Intel -- a hardcoded 16384 over-reports 4x).
+    `free(1)` is GNU-only and is never called; `SC_AVPHYS_PAGES` does not exist on Darwin.
+    """
+    try:
+        with open(MEMINFO) as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) / 1024.0
+    except Exception:
+        pass
+    if sys.platform == "darwin":
+        out, _err, _rc = sh_err(["vm_stat"], timeout=20)
+        page, free = 0, 0
+        m = re.search(r"page size of (\d+) bytes", out or "")
+        if m:
+            page = int(m.group(1))
+        for line in (out or "").splitlines():
+            mm = re.match(r"Pages (free|inactive):\s+(\d+)\.", line.strip())
+            if mm and mm.group(1) in ("free", "inactive"):
+                free += int(mm.group(2))
+        if page and free:
+            return free * page / (1024.0 * 1024.0)
+    try:
+        pages = os.sysconf("SC_AVPHYS_PAGES")
+        size = os.sysconf("SC_PAGE_SIZE")
+        if pages > 0 and size > 0:
+            return pages * size / (1024.0 * 1024.0)
+    except Exception:
+        pass
+    return None
+
+
+def _free_disk_mb(path: str | None = None):
+    """Free space on the filesystem that holds this job's state dir, or None."""
+    try:
+        return shutil.disk_usage(path or STATE_DIR or HOME).free / (1024.0 * 1024.0)
+    except Exception:
+        return None
+
+
+# ⛔ A SENTINEL, NOT `None`, FOR "MEASURE IT" (#2055 review). `None` is ALSO the value that means
+# "this datum could not be measured", and a signature where the same value means both makes the
+# one case the gate must never refuse on -- blindness -- impossible to express. Injectable so the
+# gate can be asserted without a fleet (the same test seam `pass_budgets` uses).
+_MEASURE = object()
+
+
+def machine_headroom(load1=_MEASURE, cores=_MEASURE, ram_mb=_MEASURE, disk_mb=_MEASURE,
+                     max_load=_MEASURE) -> dict:
+    """Whether THIS box has capacity for more work -- MEASURED, never inferred from a roster.
+
+    Returns a dict whose `ok` is False ONLY when a measurement EXCEEDS its declared gate, and
+    whose `why` names that measurement and the number it read. `ok` stays True when a datum could
+    not be read (and `unmeasured` names it): blindness is not saturation.
+
+    The gate is the fleet controller's own (`MAX_LOAD`, default 10x cores; `MIN_MEM_FREE_MB`,
+    default 512), so this job and the thing that spawns lanes cannot disagree about whether the
+    box is full. `max_load` is injectable for tests and for a cell that sets it in its env.
+    """
+    load1 = _load1() if load1 is _MEASURE else load1
+    cores = _cores() if cores is _MEASURE else cores
+    ram_mb = _free_ram_mb() if ram_mb is _MEASURE else ram_mb
+    disk_mb = _free_disk_mb() if disk_mb is _MEASURE else disk_mb
+    pinned_zero = False
+    configured = False
+    if max_load is _MEASURE:
+        max_load = _limit_from_config("MAX_LOAD")
+        if max_load is None:      # ABSENT or unusable -- the band applies
+            max_load = int(cores * LOAD_BAND_CORES_X) if cores else 0
+        else:
+            configured = True
+            pinned_zero = (max_load == 0)
+    else:
+        pinned_zero = (max_load == 0)
+        configured = not pinned_zero
+    # The RAM floor comes from the SAME block (`MIN_MEM_FREE_MB`), so a box that raised the
+    # controller's floor cannot have this job dispatching underneath it (#2055 review).
+    ram_floor = _limit_from_config("MIN_MEM_FREE_MB", MIN_FREE_RAM_MB)
+    unmeasured = [k for k, v in (("load", load1), ("cores", cores), ("ram", ram_mb),
+                                 ("disk", disk_mb)) if v is None or (k == "cores" and not v)]
+    ratio = (load1 / cores) if (load1 is not None and cores) else None
+    out = {"ok": True, "why": "", "load1": load1, "cores": cores, "ratio": ratio,
+           "max_load": max_load, "ram_mb": ram_mb, "disk_mb": disk_mb,
+           # ⛔ WHERE THE CEILING CAME FROM (#2055 review). `describe_headroom()` printed
+           # "(MAX_LOAD 250, 10x band)" on every pass -- but 10 x 10 cores is 100, so the number an
+           # operator compares against `uptime` was described by a band it did not use, and under
+           # the stop switch the same clause read "(MAX_LOAD 0, 10x band)".
+           "max_load_from": ("closed" if pinned_zero else ("config" if configured else "band")),
+           "ram_floor": ram_floor, "unmeasured": unmeasured}
+    if pinned_zero:
+        # ⛔ AN OPERATOR'S STOP SWITCH, HONOURED AS ONE (#2055 review). `MAX_LOAD=0` is how
+        # `install.sh`/`orch-loop.sh` let an operator close the box; substituting `10 * cores`
+        # here made this job dispatch into a fleet its controller had deliberately shut.
+        out["ok"] = False
+        out["why"] = "MAX_LOAD=0 -- the box is closed by configuration (an operator stop switch)"
+    elif load1 is not None and max_load and load1 >= max_load:
+        # ⛔ `cores` IS `None`-ABLE AND `%d` IS NOT (#2055 review). Every other datum in this
+        # function may be unreadable; formatting the refusal with `%d` turned that into a
+        # `TypeError` -- a crash where the contract is "ok stays True and `unmeasured` names it".
+        out["ok"] = False
+        out["why"] = ("load %.1f is at or above MAX_LOAD=%d (%s on %s core(s) = %s)"
+                      % (load1, max_load, "%.1f" % load1,
+                         "?" if cores is None else "%d" % cores,
+                         "?" if ratio is None else "%.1fx" % ratio))
+    elif ram_mb is not None and ram_mb < ram_floor:
+        out["ok"] = False
+        out["why"] = ("available RAM %.0f MiB is below the %d MiB floor"
+                      % (ram_mb, ram_floor))
+    elif disk_mb is not None and disk_mb < MIN_FREE_DISK_MB:
+        out["ok"] = False
+        out["why"] = ("free disk %.0f MiB is below the %d MiB floor"
+                      % (disk_mb, MIN_FREE_DISK_MB))
+    return out
+
+
+def _limit_from_config(key: str, default=None):
+    """An integer threshold from the env, else the orchestrator plist, else `default` (None).
+
+    The SAME two sources (and the same digit guard) `capacity()` uses for MAX_FIX / MAX_REVIEW:
+    `orch-loop.sh` receives these from one launchd EnvironmentVariables block, and a second model
+    of the machine living in this file is how the two readers stop agreeing.
+
+    ⛔ `None` MEANS "NOT CONFIGURED", AND 0 MEANS ZERO (#2055 review). `MAX_LOAD=0` is the
+    controller's documented STOP SWITCH (`install.sh` accepts 0 for every limit but CYC, and
+    `orch-loop.sh` then refuses every spawn) -- so this must be able to return it. Collapsing the
+    two is what made this file silently reopen a gate an operator had closed.
+    """
+    cfg = _orchestrator_env()
+    cfg.update(os.environ)
+    raw = cfg.get(key)
+    s = "" if raw is None else str(raw)
+    if not re.fullmatch(r"0|[1-9][0-9]{0,8}", s):
+        return default
+    return int(s)
+
+
+
+def describe_headroom(h: dict) -> str:
+    """One line an operator can check against `uptime`, `vm_stat` and `df` themselves."""
+    def _n(v, fmt, dash="?"):
+        return dash if v is None else fmt % v
+    _src = h.get("max_load_from")
+    _how = {"closed": "closed by configuration",
+            "config": "from config",
+            "band": "%.0fx band" % LOAD_BAND_CORES_X}.get(_src, "%.0fx band" % LOAD_BAND_CORES_X)
+    _cores = h.get("cores")
+    bits = ["load %s on %s core(s) (MAX_LOAD %s, %s)"
+            % (_n(h.get("load1"), "%.1f"),
+               # an unmeasured core count is `?`, not a 0 an operator would read as a real number
+               "?" if not _cores else "%d" % _cores,
+               _n(h.get("max_load"), "%d"), _how),
+            "available RAM %s MiB / %s" % (_n(h.get("ram_mb"), "%.0f"),
+                                            _n(h.get("ram_floor", MIN_FREE_RAM_MB), "%d")),
+            "disk free %s MiB / %d" % (_n(h.get("disk_mb"), "%.0f"), MIN_FREE_DISK_MB)]
+    if h.get("unmeasured"):
+        bits.append("UNMEASURED: " + ",".join(h["unmeasured"]))
+    return ", ".join(bits)
+
+
 def pass_budgets(st: dict, cap: dict, total_override=None, now_epoch=None) -> dict:
     """Available dispatches this pass, per work class and in total.
 
@@ -314,7 +690,15 @@ def log(msg: str) -> None:
         pass
 
 
-def record_exit(rc: int, reason: str, **extra) -> int:
+# ⛔ EVERY EXIT PATH GETS ITS OWN NAME, AND THE NAME IS IN THE LINE (#2055). Two passes that exit
+# `2` for different reasons are two facts a reader must be able to tell apart from the log ALONE,
+# without a code table. `rc` stays the machine-readable half; `kind` is the half a human (and the
+# beat, and the queue's priority gate) can quote. The mapping is total: a new code must be added
+# here, or `record_exit` refuses to pretend it has a name for it.
+EXIT_KIND = {0: "OK", 2: "UNREADABLE", 3: "UNDELIVERED", 4: "INTERNAL", 5: "NO-CAPACITY"}
+
+
+def record_exit(rc: int, reason: str, kind: str | None = None, **extra) -> int:
     """Record the pass verdict where a reader can SEE it, then return `rc`.
 
     ⛔ THE EXIT CODE ALONE IS NOT A REPORT (2026-10-18, measured). For three days this job exited
@@ -322,7 +706,10 @@ def record_exit(rc: int, reason: str, **extra) -> int:
     the refusal reached a log file and nothing else, and the `dispatched 0` line that DID reach the
     fleet looked like a quiet queue. An operator dispatched PR owners by hand for hours.
 
-    So every exit path goes through here: one `EXIT rc=N -- <reason>` line on stdout (which is also
+    So every exit path goes through here: one `EXIT rc=N KIND -- <reason>` line on stdout (which is
+    also the launchd stdout file), and the same verdict as JSON in `STATUS`, which the heartbeat
+    and the beat read on their next pass and print as a RED line. `reason` is REQUIRED and
+    positional so a new exit path cannot forget it.
     the launchd stdout file), and the same verdict as JSON in `STATUS`, which the heartbeat reads on
     its next pass and prints as a RED line. `reason` is REQUIRED and positional so a new exit path
     cannot forget it.
@@ -332,7 +719,13 @@ def record_exit(rc: int, reason: str, **extra) -> int:
     record of what HAPPENED to the fleet, and a debug/dry invocation describes neither. `reason` is
     still logged, so the operator sees the refusal; it just does not become the fleet's record.
     """
-    payload = {"rc": int(rc), "reason": reason, "at": ts(), "at_epoch": now(),
+    kind = kind or EXIT_KIND.get(int(rc), "UNRECOGNISED-RC")
+    # ⛔ THE REASON IS ONE LINE, ENFORCED HERE (#2055 review). A reason can carry stderr, and a
+    # stderr can carry newlines: `heartbeat-loop.sh` reads this record as a `|`-separated line in
+    # bash, so an embedded newline would not print a wrong age -- it would silently DROP the
+    # reason, which is the silent failure this whole field exists to end.
+    reason = " ".join(str(reason).split())
+    payload = {"rc": int(rc), "kind": kind, "reason": reason, "at": ts(), "at_epoch": now(),
                "pid": os.getpid(), "repo": REPO}
     payload.update(extra)
     if NOT_A_FLEET_READING or payload.get("dry_run"):
@@ -353,8 +746,8 @@ def record_exit(rc: int, reason: str, **extra) -> int:
         os.replace(tmp, STATUS)
     except Exception as e:
         # A SIDECAR THAT CANNOT BE WRITTEN IS ITSELF A FINDING -- say it, never disappear.
-        log("status write failed (%s) -- this exit is now visible ONLY as rc=%d" % (e, rc))
-    log("EXIT rc=%d -- %s" % (rc, reason))
+        log("status write failed (%s) -- this exit is now visible ONLY as rc=%d %s" % (e, rc, kind))
+    log("EXIT rc=%d %s -- %s" % (rc, kind, reason))
     return int(rc)
 
 
@@ -385,6 +778,10 @@ def sh_err(args, timeout=180, cwd=None):
 # Why the last PR-list read failed, or None. Module-level because `[]` is ALSO the
 # legitimate answer for an empty queue -- the old `if not prs` could not tell the two apart.
 OPEN_PRS_ERROR = None
+# The last queue this process READ. `fleet_scan()` indexes its cache by these numbers, so the two
+# consumers of the scan (the priority predicate and the lane roster) can never be looking at
+# different queues -- and a cold `idle_lanes()` cannot mistake a BUSY lane for an idle one.
+_OPEN_PRS_LAST = []
 
 
 def open_prs() -> list[dict]:
@@ -428,6 +825,8 @@ def open_prs() -> list[dict]:
         OPEN_PRS_ERROR = "rc=%s %s" % (rc, (err or "").strip()[:200] or why or "(no stderr)")
         log("GITHUB READ FAILED (%s) | PATH=%s"
             % (OPEN_PRS_ERROR, os.environ.get("PATH", "")[:120]))
+    if rc == 0 and parsed:
+        _OPEN_PRS_LAST[:] = prs          # in place: `fleet_scan` keys its cache on these
     return prs
 
 
@@ -463,170 +862,23 @@ classify = evaluate
 
 
 # ---------------------------------------------------------------------------
-# 2. PICK A LANE — idle only, never a lane already holding a PR
+# 2. THE LANE ROSTER — built from LIVE PROCESSES, never from registry claims
 # ---------------------------------------------------------------------------
-
-def _parse_roster(out: str) -> tuple[list, str]:
-    """(idle lanes, why-not) from a `lane-actions.py --json` body -- ONE parser, both read paths.
-
-    ⛔ A FAILED READ MUST NEVER LOOK LIKE "NO IDLE LANES". Both print as zero lanes, but one
-    means "the fleet is busy" and the other means "I could not see the fleet" -- and the second
-    one, unseen, silently turns this whole job into a no-op that reports success.
-    """
-    if not (out or "").strip():
-        return [], "no output"
-    try:
-        d = json.loads(out)
-    except Exception as e:
-        return [], "lane-actions output unparseable: %s" % e
-    # ⛔ A WELL-FORMED BODY OF THE WRONG SHAPE IS ALSO A FAILED READ (#1872 review round 12).
-    # `json.loads` succeeding was treated as "readable" -- so `{"error": "rate limit"}`, `{}` and
-    # `{"idle": null}` all came back as a GOOD, EMPTY roster: `lanes=0, status=""`, which then took
-    # the readable-roster path ("no idle lanes -- nothing dispatched this pass") and exited 0,
-    # bypassing `main()`'s `if lane_err:` refusal BECAUSE THAT FIRES ONLY ON A NON-EMPTY STATUS --
-    # and this function had just returned `""`, i.e. a GOOD read. That is
-    # the exact false PASS this function's docstring forbids, and the same shape round 4 fixed in
-    # `open_prs()` ("a NON-LIST ROOT is a failed read too"). `rc` is not compared at all
-    # (`lane-actions.py` documents empty stdout as the caller's fail-closed detector), so the PAYLOAD
-    # is the only evidence there is -- and a dict without an `idle` list is not a roster.
-    if not isinstance(d, dict):
-        return [], "lane-actions body is a %s, not a roster" % type(d).__name__
-    if "idle" not in d:
-        return [], "lane-actions body has no 'idle' key: %s" % (sorted(d)[:6],)
-    if not isinstance(d.get("idle"), list):
-        return [], "lane-actions 'idle' is a %s, not a list" % type(d.get("idle")).__name__
-    lanes = []
-    for c in d.get("idle") or []:
-        ws = c.get("ws")
-        if not ws or c.get("protected"):
-            continue
-        lanes.append({"lane": c.get("lane"), "ws": ws, "verdict": c.get("verdict")})
-    return lanes, ""
-
-
-def _roster_size(out: str):
-    """How many lanes the published body CLASSIFIED, or None when it does not say.
-
-    `lane-actions.py` emits `counts` over the same partition it renders (`idle`, `wip`, `wedged`,
-    `report`, `quiet`). Its sum is the cheapest evidence that the body came from a fleet read rather
-    than from a truncated or empty scan -- and a body that does not carry it cannot answer the
-    question at all, which is reported as `None`, never as 0.
-    """
-    try:
-        d = json.loads(out)
-    except Exception:
-        return None
-    c = d.get("counts") if isinstance(d, dict) else None
-    if not isinstance(c, dict) or not c:
-        return None
-    try:
-        return sum(int(v) for v in c.values() if isinstance(v, (int, float)))
-    except Exception:
-        return None
-
-
-def idle_lanes(budget: float | None = None) -> tuple[list[dict], str]:
-    """The idle lanes, from the fleet's PUBLISHED snapshot when it is fresh, else from a scan.
-
-    `status` is "" on a good read, else WHY it failed.
-
-    ⛔ THE DISPATCHER MUST NOT PAY FOR A FLEET SCAN (2026-10-18, measured -- this is why the
-    fleet stopped dispatching). `lane-status.py` costs **147s on a quiet box and 200-420s under
-    load** (measured today: 200s at sample 0, 183s at sample 12, and >420s while the box was
-    busy), and its cache TTL is 420s while this job runs every 1200s -- so EVERY pass paid a full
-    scan. `pr-doctor` was therefore permanently one load spike away from `TimeoutExpired`, and
-    over `$STATE/pr-doctor.launchd.log`, first line 2026-10-10T22:49 -> last 2026-10-18T21:32: 382 passes, 320 `LANE READ FAILED`, 241 carrying `TimeoutExpired`, and TWO that ever dispatched (both 2026-10-11) it did exactly that.
-
-    But the fleet ALREADY publishes the roster it needs: the heartbeat's pass-opening scan writes
-    `$STATE/lane-status.last.json` atomically, and `lane-actions.py --stdin` is the PRODUCTION
-    consumer of it (the heartbeat itself calls it that way). Reading it costs **2.8s measured**.
-    So: use the published snapshot while it is fresh (within one dispatch interval), and fall back
-    to a bounded scan when it is absent, stale (the heartbeat that produces it is dead), degraded,
-    or unreadable -- and then say which one happened.
-
-    ⛔ AND THE OUTER BOUND MUST EXCEED THE INNER ONE. `lane-actions.py` spends the budget it is
-    given across its own attempts; when this call allowed 600s while the tool gave EACH of two
-    attempts its own 300s, the outer timeout fired first on exactly the slow box the retry exists
-    for. `LANE_BUDGET_S` is the tool's whole-read budget and this call waits
-    `LANE_BUDGET_S + LANE_BUDGET_MARGIN_S`, so the inner read always finishes or fails on its own
-    terms -- and when it cannot, it says so (rc -1 + the tool's stderr) instead of being killed.
-    """
-    b = float(LANE_BUDGET_S if budget is None else budget)
-    py = sys.executable or "python3"
-    # ── 1. the fleet's published snapshot -- the cheap, production read ─────────────────────
-    snap_err = ""
-    try:
-        age = int(max(0, time.time() - os.path.getmtime(SNAPSHOT)))
-    except OSError:
-        age = None
-        snap_err = "no published snapshot at %s" % SNAPSHOT
-    if age is not None and age <= SNAPSHOT_MAX_AGE_S:
-        out, err, rc = sh_err([py, os.path.join(SCRIPTS, "lane-actions.py"),
-                               "--stdin", SNAPSHOT, "--json"], timeout=180)
-        lanes, why = _parse_roster(out)
-        if not why:
-            # ⛔ THE `--stdin` PATH CARRIES NO COMPLETENESS GUARD (lane-actions.py says so verbatim:
-            # the `len(rows) >= want - REGISTRY_GRACE` re-scan is "bypassed entirely when --stdin is
-            # used"). For a REPORTING consumer that is fine; this caller SENDS BYTES to a lane, so a
-            # truncated or empty published body must not become "the fleet is quiet". The roster's
-            # own partition is the cheap evidence: `counts` sums every lane lane-status classified,
-            # so a body claiming zero of everything is not a fleet read -- fall through to the scan,
-            # which does apply the guard.
-            _n = _roster_size(out)
-            if _n is None:
-                snap_err = "published snapshot body carries no lane partition (cannot tell a quiet fleet from a truncated one)"
-            elif _n == 0:
-                snap_err = "published snapshot classifies ZERO lanes -- not a fleet read"
-            else:
-                log("lane roster: the published snapshot (%ds old, %d lane(s) classified) -- no scan paid"
-                    % (age, _n))
-                return lanes, ""
-        else:
-            snap_err = "published snapshot unusable (rc=%s: %s)" % (
-                rc, why or (err or "").strip()[:120])
-    elif age is not None:
-        snap_err = "published snapshot is STALE (%ds > %ds)" % (age, SNAPSHOT_MAX_AGE_S)
-    if snap_err:
-        log("lane roster: %s -- falling back to a bounded scan" % snap_err)
-    # ── 2. the bounded scan -- only when the snapshot cannot answer ────────────────────────
-    out, err, rc = sh_err([py, os.path.join(SCRIPTS, "lane-actions.py"), "--json",
-                           "--budget", "%g" % b],
-                          timeout=b + LANE_BUDGET_MARGIN_S)
-    if not (out or "").strip():
-        return [], "lane-actions read failed rc=%s: %s%s" % (
-            rc, (err or "").strip()[:160] or "no output",
-            (" | " + snap_err) if snap_err else "")
-    lanes, why = _parse_roster(out)
-    if why:
-        return [], "%s%s" % (why, (" | " + snap_err) if snap_err else "")
-    # ⛔ THE CAVEAT IS CARRIED TO THE READER, NOT DROPPED (#1788). `lane-actions.py` says
-    # `COMPLETENESS UNMEASURED` on stderr when it falls back to a roster it could not verify; the
-    # old code parsed stdout and discarded stderr, so a pass could dispatch on an unmeasured fleet
-    # with rc 0 and no trace. Log it: a residual, not a pass.
-    _cav = " ".join((err or "").split())[:200]
-    if _cav:
-        log("lane roster caveat: %s" % _cav)
-    return lanes, ""
-
-
-# ---------------------------------------------------------------------------
-# 2b. WHO IS ALREADY WORKING A PR — the owner's dispatch priority, as a LIVE fact
-# ---------------------------------------------------------------------------
-# ⛔ THE OWNER'S RULE (2026-10-18, verbatim): "un-owned PRs first — a PR is owned only if a LIVE
-# process has it — and only then pick issues for new work." MEASURED the same day: 25 open
-# non-draft PRs, 21 lanes reported `running`, and NOT ONE holder of a PR branch — so `running` was
-# a declaration about the past, never ownership. That is why this predicate is a CWD->PROCESS
-# probe and not a registry, a session name, or a marker file.
+# ⛔ THE ROSTER IS THE POPULATION THIS FILE SENDS BYTES TO, SO IT IS MEASURED (#2055).
+# MEASURED 2026-10-18T22:14Z: `RED rc=3 -- no idle lane in the roster; 1 order(s) no lane
+# accepted` while the box sat at load 52 on 10 cores and SIX open PRs had no live holder. The
+# roster it refused from was `lane-actions.py`'s: a DERIVED-verdict table, where a lane's state
+# comes from its transcript's mtime, its registry row and a `verdict` field. The same moment's
+# live-cwd scan found 11 owned of 17 non-draft PRs while the registry claimed 15 "running" --
+# i.e. the two populations disagreed by four lanes, and the one that gated dispatch was the
+# INFERRED one. A registry entry with no live process is NOT a running lane.
 #
-# ⛔ ONE IMPLEMENTATION, AND WHERE THE OTHER ONE LIVES. The shell sibling is
-# `scripts/orchestrator-harness/live-ownership.sh` (the `pr-first-selection` lane's module), which
-# encodes the SAME rule for the controller: "a PR is owned iff some running process's cwd is inside
-# a checkout whose checked-out branch is that PR's head ref, OR inside a worktree whose PATH carries
-# the PR number". That file is NOT landed on `origin/main` (it sits uncommitted in
-# `.worktrees/pr-first`, last touched 7h40m before this pass, with no live process on it), so this
-# file cannot import it. This function mirrors its documented rule EXACTLY — same two arms, same
-# residuals — and its module docstring is the specification. When the shell module lands, this
-# becomes the caller it already is: it does not invent a third rule.
+# So the roster is now a JOIN of three facts that are each measured, not reported:
+#      cmux workspace (id + its current_directory)   -> WHERE the bytes can go
+#   ∩  a live process whose cwd is that directory    -> that the lane EXISTS right now
+#   ∩  a checkout inside this repo's `.worktrees/`   -> that it can work OUR PRs
+# and a lane is BUSY iff the PR it is working is an OPEN PR -- proved by the SAME ownership
+# rule that ranks the queue (`live_owners`), not by a second predicate.
 #
 # ⚠️ THE RESIDUALS, STATED RATHER THAN HIDDEN (they are the shell module's too):
 #   1. A REVIEWER that reads a PR through `gh` holds no worktree branch, so it reads UN-OWNED.
@@ -648,14 +900,44 @@ def idle_lanes(budget: float | None = None) -> tuple[list[dict], str]:
 #      probe that reads nothing counts everything un-owned), and the branch arm of the LIVE
 #      `pr-first` module -- `git worktree list` + head-ref match -- is what closes this one. Until it
 #      lands, `ELIGIBLE` is a claim about the two arms this file has, not about the fleet.
+# ⛔ BOTH READERS OF THE FLEET COME FROM ONE SCAN. `live_owners()` (the priority predicate) and
+# `idle_lanes()` (the dispatch pool) used to be two separate probes of the same moment, which is
+# how two readers of one queue start disagreeing. `fleet_scan()` is that one probe; both read it.
+_SCAN = None
+
 
 def _cwd_probe() -> tuple[dict, str]:
     """{pid: cwd} for every process whose cwd is readable, else ({}, why).
 
-    ONE probe, not a per-pid loop: `lsof -d cwd` walks the table once. A process whose cwd is
-    denied (another user's, a hardened binary) is simply absent -- the probe is a FLOOR on visible
-    work, never a claim of completeness, which is exactly the residual the module docstring states.
+    ONE probe, not a per-pid loop. An unreadable cwd (another user's process, a hardened binary)
+    is simply absent: the probe is a FLOOR on visible work, never a claim of completeness.
+
+    ⛔ `/proc` FIRST, `lsof` SECOND (#2048/#2046 portability). Linux exposes every process's cwd
+    as a symlink, so the cells need no external tool at all; macOS has no `/proc` and gets one
+    `lsof` walk. The previous version called `lsof` unconditionally, which is a hard dependency
+    a minimal Linux image does not have -- and a missing `lsof` there would have read as "no
+    lanes", i.e. the exact false-quiet this file exists to remove.
     """
+    if os.path.isdir("/proc"):
+        rows = {}
+        try:
+            names = os.listdir("/proc")
+        except OSError as e:
+            return {}, "the /proc probe failed: %s" % e
+        for name in names:
+            if not name.isdigit():
+                continue
+            try:
+                p = os.readlink("/proc/%s/cwd" % name)
+            except OSError:
+                continue            # vanished, or not ours to read
+            if p.endswith(" (deleted)"):        # Linux marks an unlinked cwd
+                p = p[:-len(" (deleted)")]
+            if p.startswith("/"):
+                rows[name] = p
+        if not rows:
+            return {}, "the /proc probe read NOTHING (no process cwd was visible)"
+        return rows, ""
     out, err, rc = sh_err(["lsof", "-w", "-a", "-d", "cwd", "-Fpn"], timeout=60)
     if rc != 0 and not (out or "").strip():
         return {}, "lsof cwd probe failed rc=%s: %s" % (rc, (err or "").strip()[:120] or "no output")
@@ -667,10 +949,158 @@ def _cwd_probe() -> tuple[dict, str]:
             p = line[1:].strip()
             if p.startswith("/"):
                 rows[pid] = p
+    if not rows:
+        return {}, "the cwd probe read NOTHING (no process cwd was visible)"
     return rows, ""
 
 
+def _ps_elapsed_s(etime: str):
+    """`ps`'s [[DD-]hh:]mm:ss -> seconds, or None when unparseable.
+
+    ⛔ `etime` IS THE PORTABLE FIELD, NOT `etimes` (`ps -o etimes=` is a GNU/BSD-mac divergence:
+    procps supports it, macOS's ps says "keyword not found"). So the portable format is parsed
+    here by hand, in one place, with `None` for anything unexpected -- an unparseable age must not
+    be able to crash a pass or silently read as "long-running".
+    """
+    s = (etime or "").strip()
+    if not s:
+        return None
+    days = 0
+    if "-" in s:
+        d, _, s = s.partition("-")
+        if not d.isdigit():
+            return None
+        days = int(d)
+    parts = s.split(":")
+    if not 1 <= len(parts) <= 3 or not all(p.isdigit() for p in parts):
+        return None
+    secs = 0
+    for p in parts:
+        secs = secs * 60 + int(p)
+    return days * 86400 + secs
+
+
+PS_PROBE_ERR = ""       # non-empty: the agent/child probe could not answer this pass
+
+
+def _ps_table() -> dict:
+    """{pid: {"ppid", "etime_s", "cmd"}} -- ONE `ps` for the whole tree, or {} on failure.
+
+    ⛔ WHY THE TREE AND NOT JUST THE COMMANDS (#2055, measured). A lane holding no open PR was
+    offered for dispatch while `cmux read-screen` showed `⠧ Working` and a live `task` child
+    mid-review: "writes no PR" is not "idle". A pi that is running a tool has a CHILD; a pi at a
+    prompt has none. That, plus the transcript age, is idleness MEASURED rather than claimed.
+    `ppid` and `etime` are POSIX/BSD/GNU-common `ps` keywords, unlike `etimes`.
+    """
+    global PS_PROBE_ERR
+    out, err, rc = sh_err(["ps", "-eo", "pid=,ppid=,etime=,command="], timeout=30)
+    rows = {}
+    for line in (out or "").splitlines():
+        parts = line.split(None, 3)
+        if len(parts) < 4:
+            continue
+        pid, ppid, etime, cmd = parts
+        if pid.isdigit():
+            rows[pid] = {"ppid": ppid, "etime_s": _ps_elapsed_s(etime), "cmd": cmd.strip()}
+    # ⛔ A PROBE THAT FAILED IS NOT "EVERY LANE IS A SHELL WITH NO CHILDREN" (#2055 review). `ps`
+    # is a CORRECTNESS dependency here (the agent-alive ordering and the mid-task exclusion), so
+    # silence is not acceptable: on a box whose `ps` rejects these keywords (busybox) the roster
+    # would order by name and offer a lane that is mid-tool. Declared, never laundered.
+    if not rows:
+        PS_PROBE_ERR = ("the process table could not be read (ps rc=%s %s) -- lanes are not "
+                        "checked for a live agent or an in-flight tool"
+                        % (rc, (err or "").strip()[:100] or "no output"))
+    else:
+        PS_PROBE_ERR = ""
+    return rows
+
+
+def _is_agent(cmd: str) -> bool:
+    """Does this command line run the `pi` agent itself (not a shell that mentions it)?
+
+    ⛔ THE DISTINCTION IS THE WHOLE POINT (#2055). A dead pane keeps a LIVE shell, so a cwd alone
+    cannot distinguish "pi is at its prompt" from "pi has exited and the shell is back" -- and
+    `cmux_dispatch` refuses the second with "a shell prompt is drawn BELOW pi's footer". Checking
+    the process's OWN name (not a substring of some wrapper's arguments) is what lets the roster
+    order real lanes first, measured on this box: an idle pi is `argv[0] == "pi"`.
+    """
+    argv = (cmd or "").split()
+    if not argv:
+        return False
+    base = os.path.basename(argv[0])
+    if base in ("pi", "pi.js"):
+        return True
+    if base in ("node", "nodejs", "bun", "deno"):
+        return any(os.path.basename(a) in ("pi", "pi.js") for a in argv[1:])
+    return False
+
+
+def _cmux_bin() -> str:
+    """The `cmux` CLI on THIS box: `$CMUX_BIN`, then PATH, then the macOS bundle.
+
+    Same resolution order as `lane-status.py` (one instrument, one answer). `""` means the CLI
+    cannot be found, which the caller reports as UNREADABLE rather than as "no lanes".
+    """
+    env = (os.environ.get("CMUX_BIN") or "").strip()
+    if env:
+        return env
+    found = shutil.which("cmux")
+    if found:
+        return found
+    for p in ("/Applications/cmux.app/Contents/Resources/bin/cmux",
+              os.path.join(HOME, ".local", "bin", "cmux")):
+        if os.path.exists(p):
+            return p
+    return ""
+
+
+def _cmux_workspaces() -> tuple[list, str]:
+    """[(ws, title, cwd)] for every cmux workspace, or ([], why).
+
+    ⛔ A FAILED READ IS NEVER AN EMPTY FLEET. `cmux workspace list` is a control-socket call that
+    is measured at 13-15 s under load against a fixed CLI deadline, so it is RETRIED ONCE (the
+    transient case) and then reported as blindness (the real one). `current_directory` is the
+    pane's own cwd, maintained by cmux from the kernel -- which is why it is usable under the
+    launchd agent's TCC sandbox where `git -C ~/Documents` is not.
+    """
+    cmux = _cmux_bin()
+    if not cmux:
+        return [], "the cmux CLI was not found ($CMUX_BIN, PATH, %s)" % (
+            "/Applications/cmux.app/Contents/Resources/bin/cmux")
+    body, last = "", ""
+    for attempt in range(2):
+        out, err, rc = sh_err([cmux, "workspace", "list", "--json"], timeout=60)
+        last = "rc=%s %s" % (rc, (err or "").strip()[:140] or "no stderr")
+        if rc == 0 and (out or "").strip():
+            body = out
+            break
+    if not body:
+        return [], "cmux workspace list failed twice (%s)" % last
+    try:
+        d = json.loads(body)
+    except Exception as e:
+        return [], "cmux workspace list body unparseable: %s" % e
+    rows = d.get("workspaces") if isinstance(d, dict) else d
+    if not isinstance(rows, list):
+        return [], "cmux workspace list body is a %s, not a workspace list" % type(rows).__name__
+    out_rows = []
+    for w in rows:
+        if not isinstance(w, dict) or not w.get("id"):
+            continue
+        out_rows.append((str(w["id"]), str(w.get("custom_title") or w.get("title") or ""),
+                         str(w.get("current_directory") or "")))
+    # ⛔ `[]` IS A READABLE "NO LANES"; A WRONG SHAPE IS NOT (#2055 review). `{"workspaces": []}`
+    # on a fresh cell, or after a cmux restart dropped its workspaces, is a real state: zero lanes.
+    # Calling it "no usable workspace" made `idle_lanes()` return an ERROR, so `main()` exited
+    # 2 UNREADABLE and the heartbeat printed `PR-DOCTOR RED` -- a manufactured failure of exactly
+    # the class this change removes, in the other direction. The SHAPE guards above still refuse a
+    # body that is not a list at all (a shim/error object read as a good empty fleet).
+    return out_rows, ""
+
+
 def _git(args, timeout=60) -> tuple[str, str]:
+    if not REPO_DIR:
+        return "", REPO_DIR_ERROR
     out, err, rc = sh_err(["git", "-C", REPO_DIR] + args, timeout=timeout, cwd=HOME)
     return (out or ""), (("rc=%s %s" % (rc, (err or "").strip()[:120])) if rc != 0 else "")
 
@@ -684,7 +1114,7 @@ def _repo_worktrees() -> tuple[list, str]:
     in the job's own status record. Keying ownership on it made EVERY PR read un-owned on the
     schedule that actually runs the dispatcher, while the same probe succeeded from an interactive
     shell. So the branch map sharpens the answer when it can be read, and the caller falls back to
-    the worktree PATH (which lsof reports from kernel data, unaffected by TCC) when it cannot.
+    the worktree PATH (which the cwd probe reports from kernel data, unaffected by TCC).
     """
     out, err = _git(["worktree", "list", "--porcelain"])
     if err or not out.strip():
@@ -703,24 +1133,6 @@ def _repo_worktrees() -> tuple[list, str]:
     return seen, ""
 
 
-def _worktree_slug(cwd: str) -> str:
-    """The worktree's NAME from a live cwd, without touching the filesystem.
-
-    `.worktrees/pr-doctor-exit2/...` -> `pr-doctor-exit2`; a plain checkout -> its basename. This
-    is read from the probe's path string, so it works under TCC where `git` cannot enter
-    `~/Documents` at all.
-    """
-    parts = [x for x in (cwd or "").split(os.sep) if x]
-    # ⛔ THE **LAST** `.worktrees` COMPONENT, AND NOTHING OUTSIDE ONE (2026-10-18, review).
-    # Returning the FIRST match named the OUTER worktree for a worktree nested in another (losing
-    # the inner name and its number), and falling back to the basename made a MAIN checkout
-    # (`…/GitHub/tortoise`) answer to the directory name -- so any PR whose branch ends in
-    # `tortoise` read owned by any live process sitting in the main checkout, which SUPPRESSES
-    # dispatch of real work. A plain checkout is not a per-PR worktree: return "".
-    hits = [k for k, part in enumerate(parts[:-1]) if part == ".worktrees"]
-    return parts[hits[-1] + 1] if hits else ""
-
-
 def _num_tokens(slug: str) -> set:
     """The PR numbers a worktree name actually carries.
 
@@ -733,61 +1145,481 @@ def _num_tokens(slug: str) -> set:
     return {int(t) for t in re.findall(r"(?<![A-Za-z0-9])0*([0-9]+)(?![0-9])", slug or "")}
 
 
+def _is_lane_worktree(cand: str, main_real: str = "") -> bool:
+    """Is `cand` a per-PR worktree a lane may HOLD -- as opposed to the MAIN checkout?
+
+    ⛔ ONE RULE, BOTH ARMS (#2055 review, cycle 7). The exclusion of the hub is load-bearing in
+    both the map arm and the degraded arm, and it has THREE states to answer, in this order:
+
+      * `.git` is a FILE   -> a linked worktree. ALWAYS a lane, whatever `REPO_DIR` is: when
+                              `REPO_DIR` is itself an out-of-tree worktree (`/tmp/pr1963`), an
+                              identity comparison would wrongly exclude the very worktree a live
+                              lane is sitting in -- a FALSE un-ownership, whose cost is a second
+                              lane on one branch.
+      * `.git` is a DIR    -> the main checkout (`git init --separate-git-dir` gives a FILE, so
+                              this is a heuristic, not an identity -- see `OWNERSHIP_NOTE`).
+      * neither (unreadable, or a path this box cannot stat: the TCC case, or a fixture) ->
+                              fall back to IDENTITY, and accept when even that is unknown, because
+                              the alternative is refusing every lane on a cell.
+    """
+    g = os.path.join(cand, ".git")
+    if os.path.isfile(g):
+        return True
+    if os.path.isdir(g):
+        return False
+    return not (main_real and cand == main_real)
+
+
+def _worktree_roots(cwd: str, by_path: dict | None = None) -> list:
+    """Candidate worktree roots for a live cwd, DEEPEST FIRST -- exact when the map is available.
+
+    ⛔ A WORKTREE IS NOT ALWAYS ONE SEGMENT UNDER `.worktrees` (#2055 review, P1). `.worktrees/<name>`
+    is the common layout; the fleet also uses `.worktrees/<group>/<name>` (`fix/`, `feat/`,
+    `chore/`, `docs/`) and keeps some worktrees OUTSIDE `.worktrees/` entirely (`/tmp/pr1963`).
+    Cutting after ONE segment returned the GROUP directory -- not a worktree, so the branch arm
+    missed -- and the name then became the group (`fix`), so the number arm missed too. A lane
+    holding an open PR read IDLE and its PR UN-OWNED: rule 2 in this file's header (one order per
+    lane) defeated for every such worktree. (Re-measure before quoting a count: the layouts drift
+    weekly, and a stale integer in an always-read docstring is its own defect.)
+
+    So the root is no longer computed from the string. With the git worktree map, it is the
+    DEEPEST ancestor of the cwd that the map knows about -- exact, and O(path depth) dict hits per
+    cwd (~6), so the 17.8 s all-pairs prefix scan this replaced does not come back -- minus the
+    MAIN checkout (see below). Without the map (the TCC/degraded arm, where `git worktree list`
+    fails), a path alone cannot tell a group directory from a worktree, so BOTH layouts are offered
+    as candidates and the arms try each; that arm cannot see an out-of-tree worktree at all, and it
+    says so rather than inventing one.
+    """
+    parts = [x for x in os.path.abspath(cwd or "").split(os.sep) if x]
+    if not parts:
+        return []
+    roots = []
+    if by_path:
+        # ⛔ NEVER THE MAIN CHECKOUT -- AND "NOT THE HUB" IS SAID BY IDENTITY, NOT BY SPELLING
+        # (#2055 review, cycles 4 and 5). `git worktree list` always lists the MAIN checkout too,
+        # so accepting every map hit made the hub a candidate root: a live process sitting in
+        # `…/GitHub/tortoise` then owned any PR whose head tail is `tortoise` (the slug arm), or
+        # whose head IS the hub's branch (the branch arm) -- and `_in_repo_worktree()` guarantees
+        # the roster can never dispatch there, so that PR was neither held by a lane nor queued.
+        # Silently.
+        #
+        # The first fix tested for a `.worktrees` component in the path, which is BOTH too loose
+        # and too tight, and both halves were measured: (a) a hub that SITS at `~/.worktrees/tortoise`
+        # satisfies a substring test, so the hub came back; (b) worktrees that live OUTSIDE
+        # `.worktrees/` (`/tmp/pr1963 -> fix/1952-claim-per-pr`, …) have no other arm that can prove
+        # their ownership, so a live process working one read as `(None, "")` and its PR was queued
+        # to a SECOND lane editing the same branch. The exclusion is `_is_lane_worktree()` -- ONE
+        # rule for both arms, which answers from the `.git` kind first and falls back to identity.
+        #
+        # ⛔ NEITHER HALF IS REDUNDANT (#2055 review, cycles 6 and 7), and the reasons differ:
+        # identity alone fails when `REPO_DIR` is an OUT-OF-TREE LINKED WORKTREE (`/tmp/pr1963` is
+        # a real fleet layout; the cells keep the checkout under `/tmp/cell`), because then
+        # `main_real` is the worktree -- so identity would exclude THE LANE'S OWN WORKTREE and the
+        # hub would go unexcluded; the `.git` kind alone fails when the stat cannot be done (TCC).
+        main_real = os.path.realpath(REPO_DIR) if REPO_DIR else ""
+        for i in range(len(parts), 0, -1):
+            cand = os.sep + os.sep.join(parts[:i])
+            if cand not in by_path:
+                continue
+            if not _is_lane_worktree(cand, main_real):
+                continue
+            roots.append(cand)
+        # ⛔ THE MAP IS AUTHORITATIVE WHEN IT COULD BE READ (#2055 review, cycle 5). Falling
+        # through to the string arm on an EMPTY map hit re-derived the hub from the path spelling
+        # (`~/src/.worktrees/tortoise` -> `tortoise`), i.e. the exclusion above was undone one
+        # line later. With the map in hand, "not in it" is the answer, not a hint to guess.
+        #
+        # WHAT THIS GIVES UP, stated because it is the safe direction and not an oversight: a
+        # worktree created BETWEEN this map read and the process-table read is invisible for that
+        # pass, so its PR can read un-owned for one cycle. The window is the milliseconds between
+        # two reads in one pass, and the cost of the alternative is worse -- a guessed root is a
+        # FALSE OWNERSHIP (work hidden) or a FALSE IDLENESS (two lanes on one branch).
+        return roots
+    hits = [k for k, part in enumerate(parts[:-1]) if part == ".worktrees"]
+    if not hits:
+        return []
+    first = hits[-1] + 1                      # `.worktrees/<name>`  (one segment)
+    if first >= len(parts):
+        return []
+    # ⛔ DEEPEST FIRST, because the DEEPER candidate is the worktree the process is actually in.
+    # A cwd of `.worktrees/pr-1/pr-2` is the worktree `pr-2` NESTED in `pr-1`; offering the outer
+    # one first made the degraded arm claim #1 -- a FALSE ownership, the direction that HIDES work.
+    if first + 1 < len(parts):                # `.worktrees/<group>/<name>` (two segments)
+        roots.append(os.sep + os.sep.join(parts[:first + 2]))
+    roots.append(os.sep + os.sep.join(parts[:first + 1]))
+    # ⛔ THE DEGRADED ARM MUST STILL REFUSE THE HUB (#2055 review, cycle 6), and there are TWO
+    # states to catch, because `REPO_DIR` can be UNKNOWN here -- `_git()` short-circuits without it,
+    # so the map arm never runs at all and this arm is the only one left:
+    #   * it knows the hub's path  -> identity
+    #   * it does not              -> the `.git` KIND: a main checkout's `.git` is USUALLY a
+    #     DIRECTORY and a linked worktree's is a FILE, which needs no repo and which a
+    #     subdirectory of the hub could never satisfy. It is a HEURISTIC, not an identity --
+    #     `git init --separate-git-dir` (and a submodule-style checkout) gives a main checkout a
+    #     `.git` FILE -- so the note below says so rather than implying the arm is exact.
+    # Measured on the state that made this a defect: with `REPO_DIR=""` and a live pid in
+    # `~/.worktrees/tortoise`, `owners` claimed that hub's PR, so the PR left `un_owned`, ranked
+    # last, and could flip `issue_work` to eligible while nothing held it.
+    main_real = os.path.realpath(REPO_DIR) if REPO_DIR else ""
+    return [r for r in roots if _is_lane_worktree(r, main_real)]
+
+
+def _worktree_root(cwd: str, by_path: dict | None = None) -> str:
+    """The worktree directory a live cwd belongs to (deepest candidate), or ""."""
+    roots = _worktree_roots(cwd, by_path)
+    return roots[0] if roots else ""
+
+
+def _worktree_slug(cwd: str, by_path: dict | None = None) -> str:
+    """The worktree's own NAME from a live cwd -- the deepest candidate's basename, or ""."""
+    root = _worktree_root(cwd, by_path)
+    return os.path.basename(root) if root else ""
+
+
+def _match_pr(cwd: str, prs: list, by_path: dict, index=None) -> tuple:
+    """(pr_number, evidence) for the PR this checkout is working, else (None, "").
+
+    ⛔ ONE RULE, TWO CALLERS (#2055). This is the owner's ownership predicate, unchanged:
+    a PR is owned iff a LIVE process's cwd is inside a checkout whose checked-out branch is that
+    PR's head ref, OR inside a worktree whose PATH carries the PR number. `live_owners()` asks it
+    over every live cwd (to rank the queue); `fleet_scan()` asks it per lane (to tell a busy lane
+    from an idle one). Two spellings of "owned" would let the queue and the roster disagree, which
+    is the defect this whole section exists to remove -- so there is one function.
+    """
+    idx = index if index is not None else _pr_index(prs)
+    for root in _worktree_roots(cwd, by_path):
+        branch = by_path.get(root, "")
+        if branch and branch in idx["heads"]:
+            return idx["heads"][branch], "branch %s in %s" % (branch, root)
+        slug = os.path.basename(root)
+        if not slug:
+            continue
+        if slug in idx["heads"]:
+            return idx["heads"][slug], "worktree %s matches a head branch" % slug
+        toks = _num_tokens(slug)
+        if toks:
+            for p in prs:                 # PR order is the fleet's order: deterministic tie-break
+                if p.get("number") in toks:
+                    return p["number"], "worktree %s carries #%s" % (slug, p["number"])
+    return None, ""
+
+
+def _pr_index(prs: list) -> dict:
+    """{heads: <branch spelling -> pr>, paths} -- built ONCE per pass, not once per cwd."""
+    heads = {}
+    for p in prs:
+        head = p.get("headRefName") or ""
+        for h in (head, head.replace("/", "-"), head.split("/")[-1]):
+            if h:
+                heads.setdefault(h, p.get("number"))
+    return {"heads": heads}
+
+
+def _session_dir(cwd: str) -> str:
+    """The transcript directory pi derives from a cwd -- the SAME mangling every reader uses.
+
+    `--<cwd with "/" -> "-">--`, verified against `~/.pi/agent/sessions/` on this box:
+    `/Users/x/…/.worktrees/fix/7852-direction-storage` ->
+    `--Users-x-…-.worktrees-fix-7852-direction-storage--`.
+    """
+    return os.path.join(HOME, ".pi", "agent", "sessions",
+                        "--" + (cwd or "").strip("/").replace("/", "-") + "--")
+
+
+def _lane_quiet_s(cwds):
+    """Seconds since this lane's newest transcript write, or None when it has no transcript.
+
+    `cwds` may be one path or several: a `task` child inherits its parent's worktree cwd while the
+    parent agent can be sitting in ANOTHER directory (measured: the pane's `pi` in
+    `tortoise (main)`, its `task` child in `.worktrees/fix-2008-legs-gap`), and BOTH transcripts
+    are output from the same lane.
+
+    `None` is a lane that has NEVER been given work, which is idle BY CONSTRUCTION (the same
+    polarity `turn-classify.py` uses: "the absence of a transcript is not an unreadable turn").
+    A directory we cannot read is also `None` -- a probe we could not make never refuses a lane.
+    """
+    if isinstance(cwds, str):
+        cwds = [cwds]
+    newest = 0.0
+    for cwd in cwds:
+        d = _session_dir(cwd)
+        try:
+            names = [n for n in os.listdir(d) if n.endswith(".jsonl")]
+        except OSError:
+            continue
+        for n in names:
+            try:
+                newest = max(newest, os.path.getmtime(os.path.join(d, n)))
+            except OSError:
+                continue
+    if not newest:
+        return None
+    return max(0.0, time.time() - newest)
+
+
+def _lane_agent_pids(pids, table) -> set:
+    """Which of this lane's pids are ITS AGENT -- including a parent that is not in the worktree.
+
+    ⛔ MEASURED FAILURE THIS EXISTS FOR (2026-10-18): the pane's `pi` sat in `tortoise (main)`
+    while its `task` child ran in `.worktrees/fix-2008-legs-gap`. The child is itself `pi`, so the
+    cwd-only rule took the CHILD as the lane's agent, found no children of it, and reported the
+    lane IDLE while the pane showed `⠹ Working`. The parent hop is what closes it: a lane's agent
+    is any `pi` in its cwd set **or the `pi` that spawned one of them** (a `task` child, a tool).
+    """
+    agents = {p for p in pids if _is_agent((table.get(p) or {}).get("cmd", ""))}
+    for p in pids:
+        parent = (table.get(p) or {}).get("ppid")
+        if parent and parent != p and _is_agent((table.get(parent) or {}).get("cmd", "")):
+            agents.add(parent)
+    return agents
+
+
+TOOL_MIN_S = 3        # a child younger than this is a shell prompt redraw, not a running job
+
+
+def _lane_running_a_tool(agent_pids, table) -> str:
+    """"" when this lane's AGENT has a real child process, else a one-line reason naming it.
+
+    ⛔ THE PARENT MUST BE THE AGENT, NOT "ANY PROCESS IN THE WORKTREE" (#2055, measured). This box
+    runs a pane shell, pi, a nested `zsh` and pi's `task` child all with the SAME worktree cwd, so
+    a parent test over the whole cwd set flagged a healthy lane on its own 5-day-old login shell
+    (`-/bin/zsh`, up 5-19:08:46) -- a false "busy", i.e. the false refusal in a new costume. A
+    child OF THE AGENT is by definition work: a bash tool call, or a `task` child session (which
+    is itself `pi`, and is exactly what `⠧ Working` was showing on the lane this rule exists for).
+    """
+    if not table or not agent_pids:
+        return ""
+    for pid, row in table.items():
+        if row.get("ppid") not in agent_pids:
+            continue
+        age = row.get("etime_s")
+        if age is not None and age < TOOL_MIN_S:
+            continue          # a transient redraw, not a job
+        return "running a tool (pid %s, %s): %s" % (
+            pid, "up %ds" % age if age is not None else "age unknown",
+            (row.get("cmd") or "")[:70])
+    return ""
+
+
+def _in_repo_worktree(cwd: str) -> bool:
+    """Is `cwd` inside THIS repo's `.worktrees/`? -- the only place an order may be sent.
+
+    ⛔ TWO POPULATIONS ARE EXCLUDED ON PURPOSE, AND BOTH WERE LIVE ON 2026-10-18:
+      * the MAIN checkout (`.worktrees` absent). Dispatching PR work into the hub is what the
+        hub-discipline rule forbids, and it is also where the pane that refused the order sat
+        (`EDD0F478`, titled "Storage strategy", cwd `~/Documents/GitHub/tortoise`).
+      * another repo's checkout (DMeer, premise-labs). Those lanes cannot work a tortoise PR;
+        offering them one is a mis-delivery, not a capacity win.
+    A worktree of this repo is the unit a lane holds, so it is the unit this file sends to.
+    """
+    if not REPO_DIR:
+        # ⛔ UNKNOWN IS NOT "NO" (#2055 review, P1). Returning False here made every lane on a
+        # cell read as "not a worktree of <repo> (hub/other repo)" -- a CONFIDENT WRONG ANSWER
+        # about a fact this box could not look up -- and the pass then reported `rc=0 OK` with
+        # nothing dispatched, i.e. the silent failure this job was changed to end. The caller
+        # (`fleet_scan`) checks `REPO_DIR` first and ABSTAINS instead.
+        return False
+    root = os.path.join(os.path.realpath(REPO_DIR), ".worktrees") + os.sep
+    return os.path.realpath(cwd).startswith(root)
+
+
+def fleet_scan(prs: list | None = None, force: bool = False) -> dict:
+    """ONE measured read of the fleet: live cwds, worktrees, cmux workspaces -> lanes + owners.
+
+    Returns `{lanes, busy, excluded, owners, owners_err, roster_err, note}`:
+      * `lanes`   -- dispatchable lanes (live process, inside this repo's `.worktrees/`, no PR)
+      * `busy`    -- live lanes that ARE holding an open PR (with the evidence)
+      * `excluded`-- workspaces that were live-but-not-eligible, with the reason (never silent)
+      * `owners`  -- {pr_number: evidence}, the priority predicate
+      * `owners_err` -- non-empty: the OWNERSHIP question could not be answered
+      * `roster_err` -- non-empty: the LANE question could not be answered
+
+    ⛔ THE TWO ERRORS ARE SEPARATE ON PURPOSE (#2055, review). Collapsing them made a cmux
+    failure -- which blinds the ROSTER and nothing else -- report as "OWNERSHIP READ FAILED,
+    every PR counts as un-owned", i.e. it published a false statement about a read that had
+    actually succeeded. Two questions, two answers, two failure slots.
+    """
+    global _SCAN, OWNERSHIP_NOTE
+    # ⛔ THE ROSTER IS BUILT FROM THE RAW OPEN-PR LIST, ALWAYS (#2055 review, P1). A lane whose
+    # branch holds a DRAFT PR is busy; a draft is simply not work this pass may rank. Using the
+    # caller's (filtered) list for the roster made the same pass ask the fleet two questions at
+    # two moments -- and pay two cwd probes, two `git worktree list`s and two `cmux` calls for it.
+    roster_prs = _OPEN_PRS_LAST or (prs or [])
+    if prs is None:
+        prs = roster_prs
+    key = tuple(sorted(p.get("number") or 0 for p in roster_prs))
+    if _SCAN is not None and not force and _SCAN.get("key") == key:
+        return _SCAN
+    cwds, cerr = _cwd_probe()
+    if not cerr and not cwds:
+        # ⛔ A PROBE THAT READ NOTHING IS UNKNOWN, NOT A CLEAN FLEET (#1178's rule, same shape). The
+        # probe's own contract already reports this, but the callers depend on it being TRUE here --
+        # an empty map with no error would read as "nothing is owned and no lane is busy", i.e. the
+        # false-quiet this section exists to remove.
+        cerr = "the cwd probe read NOTHING (no process cwd was visible)"
+    wts, werr = _repo_worktrees()
+    by_path = {path: br for path, br in wts}
+    OWNERSHIP_NOTE = ""
+    if werr:
+        OWNERSHIP_NOTE = ("branch map unavailable (%s) -- %s%s"
+                          % (werr[:100],
+                             "matching worktree paths and numbers only" if cwds else "no probe",
+                             # ⛔ SAY WHAT THIS ARM CANNOT DO (#2055 review, cycle 6). Without the
+                             # map the arm refuses a main checkout by its `.git` kind, which a
+                             # checkout this box cannot stat defeats -- and an owner that reads
+                             # only "branch map unavailable" would take the predicate as complete.
+                             "; main checkouts it cannot stat, or that keep their git dir "
+                             "elsewhere, are NOT excluded" if cwds else ""))
+    owners, lanes, busy, excluded = {}, [], [], []
+    owners_err = cerr        # the cwd probe is the ownership read; cmux is not
+    roster_err = cerr
+    index = _pr_index(roster_prs)
+    wss, wserr = [], ""          # the cmux population, so "0 lanes" can be told from "0 panes"
+    if not cerr:
+        # ── the priority predicate: every live cwd, exactly as before ────────────────────
+        # ⛔ ONE PASS OVER THE PROCESS TABLE, NOT ONE PER PR (2026-10-18, measured). The PR loop
+        # around this was 17 times the work for the same answer: "is PR N owned" only needs to
+        # find SOME cwd that proves it, so the scan is inverted and the first proof of each PR
+        # wins -- the same predicate, the same evidence, one pass.
+        for pid, cwd in cwds.items():
+            hit, why = _match_pr(cwd, roster_prs, by_path, index)
+            if hit is not None and hit not in owners:
+                owners[hit] = "%s (live pid %s)" % (why, pid)
+        # ── the roster: cmux workspace ∩ live process ∩ this repo's worktree ────────────
+        wss, wserr = _cmux_workspaces()
+        if wserr:
+            roster_err = wserr
+        elif not REPO_DIR:
+            # The eligibility question NEEDS the checkout. Without it every lane would be called
+            # another repo's checkout, which is what this abstention replaces.
+            roster_err = ("the %s checkout is UNKNOWN (set PR_DOCTOR_REPO_DIR or TORTOISE_REPO)"
+                          " -- the lane roster cannot be built%s"
+                          % (REPO, (": " + "; ".join(REPO_SEAM_REJECTED)) if REPO_SEAM_REJECTED else ""))
+        else:
+            table = _ps_table()                 # ONE walk; both projections come from it
+            cmds = {p: r["cmd"] for p, r in table.items()}
+            for ws, title, cwd in wss:
+                if not cwd:
+                    excluded.append({"ws": ws, "lane": title, "why": "the workspace reports no cwd"})
+                    continue
+                if not _in_repo_worktree(cwd):
+                    excluded.append({"ws": ws, "lane": title,
+                                     "why": "not a worktree of %s (hub/other repo)" % REPO})
+                    continue
+                pids = [pid for pid, c in cwds.items()
+                        if c == cwd or c.startswith(cwd.rstrip(os.sep) + os.sep)]
+                if not pids:
+                    excluded.append({"ws": ws, "lane": title,
+                                     "why": "no live process has this cwd (the pane may be dead)"})
+                    continue
+                lane_cwds = sorted({cwds.get(p) or "" for p in pids} - {""})
+                agent_pids = _lane_agent_pids(pids, table)
+                # a parent agent can sit outside the worktree, so its own transcript counts too
+                lane_cwds += sorted({(cwds.get(p) or "") for p in agent_pids} - set(lane_cwds) - {""})
+                agent = bool(agent_pids)
+                agent_cwds = {cwds.get(p) or "" for p in agent_pids} - {""}
+                n, why = _match_pr(cwd, roster_prs, by_path, index)
+                quiet = _lane_quiet_s(lane_cwds)
+                running = _lane_running_a_tool(agent_pids, table)
+                row = {"lane": title, "ws": ws, "cwd": cwd,
+                       "slug": _worktree_slug(cwd, by_path),
+                       "pids": len(pids), "agent": bool(agent), "quiet_s": quiet}
+                if n is not None:
+                    busy.append({**row, "pr": n, "evidence": why})
+                elif running:
+                    # ⛔ WORKING, NOT IDLE -- MEASURED, twice: a live child process, and (below) a
+                    # transcript written seconds ago. Neither is a registry claim.
+                    excluded.append({"ws": ws, "lane": title, "why": running + " -- mid-task"})
+                elif agent_cwds and not any(c == cwd or c.startswith(cwd.rstrip(os.sep) + os.sep)
+                                            for c in agent_cwds):
+                    # ⛔ THE PANE'S AGENT MUST WORK IN THIS WORKTREE (measured 2026-10-18), and this
+                    # is checked AFTER "running a tool": a `task` child in the worktree whose parent
+                    # agent sits elsewhere IS work (the parent hop above), while an IDLE agent in
+                    # another directory means the pane's `current_directory` outlived its `cd` --
+                    # the "3 Onboarding" pane reported `.worktrees/fix-2008-legs-gap` while its
+                    # shell and its `pi` sat in `tortoise (main)`. Sending there would run a PR
+                    # brief in the HUB checkout, the hub-discipline violation this roster avoids.
+                    excluded.append({"ws": ws, "lane": title,
+                                     "why": "the pane's agent works in %s, not in %s -- stale cwd"
+                                            % (sorted(agent_cwds)[0], _worktree_slug(cwd, by_path))})
+                elif quiet is not None and quiet < LANE_QUIET_S:
+                    excluded.append({"ws": ws, "lane": title,
+                                     "why": "wrote its transcript %ds ago (< %ds) -- mid-task"
+                                            % (int(quiet), LANE_QUIET_S)})
+                else:
+                    lanes.append(row)
+    # Deterministic, and "the lane's own agent is alive" first: a pane whose pi exited refuses
+    # every order, and there is no point spending an attempt on it while a real lane waits.
+    # Deterministic, and the most IDLE lane first: an agent-alive lane outranks a shell, and the
+    # longest-quiet outranks a lane that wrote a minute ago (it may still be finishing a step).
+    lanes.sort(key=lambda r: (0 if r.get("agent") else 1,
+                              -(r.get("quiet_s") if r.get("quiet_s") is not None else 1e9),
+                              r.get("lane") or "", r.get("ws") or ""))
+    busy.sort(key=lambda r: (r.get("pr") or 0, r.get("lane") or ""))
+    _SCAN = {"lanes": lanes, "busy": busy, "excluded": excluded, "owners": owners,
+             "workspaces": (None if (cerr or wserr) else len(wss)),
+             "owners_err": owners_err, "roster_err": roster_err,
+             "note": OWNERSHIP_NOTE, "ps_err": PS_PROBE_ERR, "key": key}
+    return _SCAN
+
+
+def idle_lanes(budget: float | None = None) -> tuple[list[dict], str]:
+    """The dispatchable lanes, and "" -- or ([], why) when the roster could NOT be read.
+
+    `budget` is accepted for call-site compatibility and DELIBERATELY UNUSED: the measured roster
+    costs one `cmux` call plus one process walk (measured 0.4-2.5 s on this box), not the 147-420 s
+    `lane-status.py` scan the old registry path paid -- so there is no budget left to manage.
+
+    ⛔ AN UNREADABLE READ IS NOT AN EMPTY FLEET. Both print as zero lanes; one means "the fleet is
+    busy", the other means "I could not see the fleet", and the second, unseen, silently turns
+    this whole job into a no-op that reports success. `err` is what keeps them apart.
+    """
+    scan = fleet_scan()
+    if scan["roster_err"]:
+        return [], scan["roster_err"]
+    return list(scan["lanes"]), ""
+
+
+# ---------------------------------------------------------------------------
+# 2b. WHO IS ALREADY WORKING A PR — the owner's dispatch priority, as a LIVE fact
+# ---------------------------------------------------------------------------
+# ⛔ THE OWNER'S RULE (2026-10-18, verbatim): "un-owned PRs first — a PR is owned only if a LIVE
+# process has it — and only then pick issues for new work." MEASURED the same day: 25 open
+# non-draft PRs, 21 lanes reported `running`, and NOT ONE holder of a PR branch — so `running` was
+# a declaration about the past, never ownership. That is why this predicate is a CWD->PROCESS
+# probe and not a registry, a session name, or a marker file.
+#
+# ⚠️ THE RESIDUALS, STATED RATHER THAN HIDDEN:
+#   1. A REVIEWER that reads a PR through `gh` holds no worktree branch, so it reads UN-OWNED.
+#      That over-counts the work queue, which is the SAFE direction here: more PR work, never less.
+#   2. A probe that reads NOTHING is UNKNOWN, not "nothing is owned" — but the two are
+#      indistinguishable downstream, so the caller treats it as un-owned AND says `scan=UNREADABLE`.
+#      New issue work is then SKIPPED (`issue_work`), which is the direction the owner's rule asks.
+#   3. A NUMBER token can still over-claim when a worktree name carries an unrelated number
+#      (`.worktrees/wip-2026-10-18`, a date): the token `2026` is not a PR number, but neither is
+#      it distinguishable from one without a bounded upper range. This arm can therefore mark a
+#      PR owned when nothing is working it -- the SAFE direction (it under-counts the queue, never
+#      invents work).
+
+
 def live_owners(prs: list) -> tuple[dict, str]:
     """{pr_number: "<evidence>"} for PRs a LIVE process is working, plus WHY the read failed.
 
     Ownership is PROVED, never inferred from a claim: the process table is the population, and a
     PR is owned when a live process sits in a checkout holding its head branch (or in a worktree
     whose name carries its number). `err` is non-empty ONLY when the probe could not answer at all
-    -- callers must treat that as "every PR un-owned, and say so", never as a clean fleet (see the
-    module docstring's residual note).
+    -- callers must treat that as "every PR un-owned, and say so", never as a clean fleet.
 
-    Two arms, and NEITHER needs to read the repo (measured: launchd cannot):
-      * BRANCH -- exact, from `git worktree list` when git is readable, else from the worktree's
-        path slug, which this fleet derives from the branch (`fix/pr-doctor-exit2` ->
-        `.worktrees/pr-doctor-exit2`); both spellings are tried.
-      * NUMBER -- the worktree name carries the PR number as a TOKEN (never a substring: a bare
-        `str(n) in slug` makes #7 owned by `fix-17`).
+    Reads the SAME `fleet_scan()` the lane roster does: one probe of one moment, two consumers.
     """
-    global OWNERSHIP_NOTE
-    OWNERSHIP_NOTE = ""          # reset per pass: a stale note would describe a past read
-    cwds, cerr = _cwd_probe()
-    if cerr:
-        return {}, cerr
-    if not cwds:
-        return {}, "the cwd probe read NOTHING (no process cwd was visible)"
-    wts, werr = _repo_worktrees()
-    if werr:
-        OWNERSHIP_NOTE = ("branch map unavailable (%s) -- %s"
-                          % (werr[:100],
-                             "matching worktree paths and numbers only" if cwds else "no probe"))
-    by_path = {path: br for path, br in wts}
-    owners = {}
-    for p in prs:
-        n = p.get("number")
-        head = p.get("headRefName") or ""
-        heads = {h for h in (head, head.replace("/", "-"), head.split("/")[-1]) if h}
-        for pid, cwd in cwds.items():
-            # (a) exact branch, via the worktree path map when git was readable
-            for path in sorted(by_path, key=len, reverse=True):
-                if cwd == path or cwd.startswith(path + os.sep):
-                    br = by_path[path]
-                    if br and br in heads:
-                        owners[n] = "branch %s in %s (live pid %s)" % (br, path, pid)
-                        break
-            if n in owners:
-                break
-            # (b) the worktree's NAME matches the branch slug, or carries the PR number
-            slug = _worktree_slug(cwd)
-            if not slug:
-                continue
-            if head and (slug in heads or slug == head.replace("/", "-")):
-                owners[n] = "worktree %s matches head branch %s (live pid %s)" % (slug, head, pid)
-                break
-            if any(t == n for t in _num_tokens(slug)):
-                owners[n] = "worktree %s carries #%s (live pid %s)" % (slug, n, pid)
-                break
-    return owners, ""
+    scan = fleet_scan(prs)
+    # ⛔ ONE PROBE, TWO QUESTIONS -- AND A SUBSET IS NOT A SECOND PROBE (#2055 review, P1). The scan
+    # is built from the RAW open-PR list (a lane holding a DRAFT is still busy), while the priority
+    # ladder only ranks the NON-DRAFT queue this pass works. Filtering the scan's answer is what
+    # keeps those two facts one observation: keying the cache on the filtered list instead made
+    # `main()` prime with one list and `idle_lanes()` re-probe with the other, i.e. two probes per
+    # pass and two moments, which is the defect the scan exists to prevent.
+    want = {p.get("number") for p in (prs or [])}
+    return {n: ev for n, ev in scan["owners"].items() if n in want}, scan["owners_err"]
 
 
 # ---------------------------------------------------------------------------
@@ -970,9 +1802,20 @@ next step of merging. Do the work:
 # ---------------------------------------------------------------------------
 
 def dispatcher_py() -> str:
-    """The interpreter that can actually run tools/cmux_dispatch.py (needs >= 3.12)."""
-    if os.path.exists(VENV_PY):
+    """The interpreter that can actually run `tools/cmux_dispatch.py` (needs >= 3.12).
+
+    Resolved, never assumed (#1864): `PR_DOCTOR_PYTHON` -> the repo venv -> THIS interpreter when
+    it is already >= 3.12 -> `uv`. The old version checked one literal path and then returned
+    `uv`, so on a box with no venv the only interpreter this process was already running under was
+    never considered.
+    """
+    env = (os.environ.get("PR_DOCTOR_PYTHON") or "").strip()
+    if env:
+        return env
+    if VENV_PY and os.path.exists(VENV_PY):
         return VENV_PY
+    if sys.version_info >= (3, 12) and sys.executable:
+        return sys.executable
     return "uv"   # fallback: `uv run` resolves the project interpreter from pyproject
 
 
@@ -1035,6 +1878,7 @@ def save_state(st: dict) -> None:
 
 
 def main() -> int:
+    global _SCAN
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--max", type=int, default=None,
@@ -1062,8 +1906,39 @@ def main() -> int:
                 continue
             print("%-8s %-11s lane=%-10s %s" % (k, v.get("action"), (v.get("lane") or "?")[:10],
                                                 v.get("at")))
+        # ⛔ `--status` ANSWERS "IS IT WORKING", NOT "WHAT IS QUEUED" (#2055). The state file above
+        # is what this job LAST dispatched; the verdict below is whether the last pass REFUSED. An
+        # operator asking `--status` during a red spell used to get a list of old dispatches and no
+        # hint that the last three passes exited non-zero.
+        try:
+            with open(STATUS) as f:
+                last = json.load(f)
+            print("last pass: rc=%s %s at %s -- %s" % (
+                last.get("rc"), last.get("kind") or "?", last.get("at"),
+                str(last.get("reason") or "")[:200]))
+        except FileNotFoundError:
+            print("last pass: UNREPORTED (no verdict recorded at %s)" % STATUS)
+        except Exception as e:
+            print("last pass: UNREPORTED (verdict unreadable: %s)" % type(e).__name__)
+        h = machine_headroom()
+        print("machine : %s -> %s" % (describe_headroom(h),
+                                       "headroom OK" if h["ok"] else "OVER BAND: " + h["why"]))
         return 0
 
+    # ⛔ ONE PASS, ONE FLEET READ (#2055). A cached scan from an earlier pass in the same process
+    # would rank this pass's queue on a previous pass's process table; and a scan with no PR set
+    # would call every BUSY lane idle. Reset here, fill in `live_owners(prs)`, read back by
+    # `idle_lanes()` -- so the priority predicate and the dispatch pool are the SAME observation.
+    _SCAN = None
+    if REPO_DIR_ERROR:
+        log("repo: %s" % REPO_DIR_ERROR)
+    if REPO_SEAM_REJECTED:          # read LIVE, so a test (or a later pass) sees the real list
+        # ⛔ DO NOT CLAIM A DERIVATION THAT DID NOT HAPPEN (#2055 review, cycle 5): with no
+        # checkout at all, `REPO_DIR_ERROR` has just said so one line above, and the old wording
+        # then said "the checkout was derived instead" -- a datum this pass never read.
+        log("repo: a configured path was REJECTED%s: %s"
+            % (" and the checkout was derived instead" if REPO_DIR
+               else "; no checkout could be derived", "; ".join(REPO_SEAM_REJECTED)))
     prs = open_prs()
     # ⛔ AN UNREADABLE QUEUE IS NOT AN EMPTY ONE, AND THE TWO MUST NOT SHARE AN EXIT CODE. A
     # blind read that returns 0 is indistinguishable from a clean pass, and the classifier half is
@@ -1079,9 +1954,12 @@ def main() -> int:
     # all-checks-blind one, and the lane-roster one) all exit 2 so that the day a consumer exists,
     # it needs no change here -- and so a direct `--dry-run` by a lane fails loudly today.
     if OPEN_PRS_ERROR:
-        log("REFUSING: the open-PR read FAILED (%s) -- nothing dispatched" % OPEN_PRS_ERROR[:160])
-        return record_exit(2, "the open-PR read FAILED (%s) -- nothing dispatched"
-                           % OPEN_PRS_ERROR[:160], read="open_prs")
+        # ⛔ THE WORD IS `UNREADABLE`, AND IT IS THE FIRST THING ON THE LINE (#2055). "the open-PR
+        # read FAILED" was accurate and still got read as a quiet queue, because the sentence a
+        # reader scans for ("is there work?") was absent. Every refusal now names its KIND.
+        log("REFUSING: the queue is UNREADABLE (%s) -- nothing dispatched" % OPEN_PRS_ERROR[:160])
+        return record_exit(2, "queue UNREADABLE: the open-PR read FAILED (%s) -- nothing "
+                              "dispatched" % OPEN_PRS_ERROR[:160], read="open_prs")
     prs = [p for p in prs if not p.get("isDraft")]
     if args.only:
         prs = [p for p in prs if p["number"] == args.only]
@@ -1163,11 +2041,10 @@ def main() -> int:
     # this is precisely the "dead drain that reports success" the import seam calls the worst
     # outcome this file can produce. `0` is reserved for "readable, nothing to do".
     if not classified and skipped.get("unreadable") == len(prs):
-        log("REFUSING: not ONE of the %d open PR(s) had readable checks -- nothing dispatched"
+        log("REFUSING: the checks are UNREADABLE for all %d open PR(s) -- nothing dispatched"
             % len(prs))
-        return record_exit(2, "not ONE of the %d open PR(s) had readable checks -- nothing "
-                           "dispatched" % len(prs), queued=len(prs), dispatched=0,
-                           read="pr_checks")
+        return record_exit(2, "checks UNREADABLE for all %d open PR(s) -- nothing dispatched"
+                           % len(prs), queued=len(prs), dispatched=0, read="pr_checks")
 
     # Cheapest-and-highest-payoff FIRST: a landable PR costs one rail call, a repair costs lane-
     # hours. ⛔ THIS IS THIS FILE'S OWN POLICY, NOT `objective.CLASS_ORDER` -- the two differ
@@ -1178,6 +2055,11 @@ def main() -> int:
     # send a reader tuning the wrong list. `running` is absent by construction (skipped above).
     ranked = {"call-rail": 0, "rerun-checks": 1, "record-review": 2,
               "resolve-conflict": 3, "blocked-by-rail": 4, "fix-ci": 5}
+    # ⛔ ONE MEASURED READ OF THE FLEET, FILLED HERE (#2055). Both consumers below (`live_owners`
+    # for the queue's priority, `idle_lanes` for the dispatch pool) read this scan, and it is
+    # primed on the RAW list -- the same key both of them will ask for -- so the pass performs
+    # exactly ONE probe of ONE moment.
+    fleet_scan()
     # ⛔ THE OWNER'S PRIORITY IS THE OUTERMOST KEY (2026-10-18): UN-OWNED PRs FIRST, and the class
     # ranking only breaks ties among them. Before this, a PR a live lane was already fixing could
     # consume a budget slot ahead of an un-worked one, which is how the queue grew while every lane
@@ -1232,24 +2114,76 @@ def main() -> int:
          cap["max_fix"], cap["max_review"], budgets["used"],
          budgets["fix"], budgets["review"], budgets["total"]))
 
+    # ⛔ ADMISSION IS A MEASUREMENT, AND IT COMES FIRST (#2055). Two independent questions:
+    # "may I dispatch N pieces of work" (the budget, from configuration) and "can THIS box absorb
+    # another child" (headroom, from the machine). The second had never been asked; the roster was
+    # asked instead and answered a different question, which is how a pass with 15 free budget
+    # slots refused as if the fleet were full.
+    head = machine_headroom()
+    log("machine: %s -> %s" % (describe_headroom(head),
+                               "headroom OK" if head["ok"] else "OVER BAND"))
+    if not head["ok"] and classified:
+        log("REFUSING: the machine is OVER BAND and %d order(s) are waiting -- nothing "
+            "dispatched" % len(classified))
+        # ⛔ THE PRIORITY DECISION SURVIVES THE REFUSAL (#2055). `queue-dispatch.py`'s
+        # `pr_first_gate` reads `issue_work` from this record; a refusal that omitted it would let
+        # new issue work start while un-owned PRs wait -- i.e. the capacity refusal would quietly
+        # UNDO the owner's priority ladder. Every refusal that has MEASURED ownership carries it.
+        return record_exit(5, "machine OVER BAND: %s -- nothing dispatched" % head["why"],
+                           queued=len(classified), dispatched=0, read="machine",
+                           issue_work=issue_work, un_owned=len(un_owned),
+                           owned=len(owners), open_prs=len(prs),
+                           # the measured POPULATION, so the refusal can be checked against
+                           # `cmux workspace list` -- a full box with 15 live lanes and one with
+                           # NONE read identically without this field (#2055 review).
+                           lanes_dispatchable=len((_SCAN or {}).get("lanes") or []),
+                           machine={k: head.get(k) for k in ("load1", "cores", "ratio",
+                                                             "ram_mb", "disk_mb")})
+
+    # ⛔ THE ROSTER IS MEASURED, AND THE LANE-INTEL READ IS NOW THE SAME ONE READ AS THE PRIORITY.
+    # `live_owners(prs)` above already filled the pass's single `fleet_scan()`; `idle_lanes()`
+    # reads it back rather than probing the fleet a second time (one moment, two consumers).
     lanes, lane_err = idle_lanes()
+    scan = _SCAN or {"busy": [], "excluded": []}
     if lane_err:
         # NOT the same as "no idle lanes". Say which one it is.
-        log("LANE READ FAILED -- cannot dispatch this pass: %s" % lane_err)
+        log("LANE ROSTER UNREADABLE -- cannot place an order this pass: %s" % lane_err)
         # ⛔ REFUSE ONLY WHEN THERE IS WORK TO PLACE (#1872 review round 5). A blind roster with
         # nothing classified is a CLEAN pass that happens to have read nothing -- refusing there
-        # manufactures a failure signal out of an idle beat (and `lane-actions.py` timing out under
-        # load is the recorded status quo in this file). With work in hand, a blind roster is the
-        # third instance of the same fail-open and must not exit 0.
+        # manufactures a failure signal out of an idle beat. With work in hand, a blind roster is
+        # the third instance of the same fail-open and must not exit 0.
         if classified:
             return record_exit(2, "lane roster UNREADABLE -- %s" % lane_err,
-                               queued=len(classified), dispatched=0, read="lane_roster")
+                               queued=len(classified), dispatched=0, read="lane_roster",
+                               issue_work=issue_work, un_owned=len(un_owned),
+                               owned=len(owners), open_prs=len(prs))
+    else:
+        # ⛔ NAME THE POPULATION, NOT JUST THE ANSWER (#2055). `no idle lane in the roster` was a
+        # sentence about an INFERRED table; these three numbers are the measured population that
+        # produced the answer, so a reader can check them against `cmux workspace list` and `ps`.
+        log("lane roster: %d dispatchable, %d holding an open PR, %d workspace(s) excluded"
+            % (len(lanes), len(scan.get("busy") or []), len(scan.get("excluded") or [])))
+        if scan.get("workspaces") == 0:
+            # A READABLE ZERO, stated as one (#2055 review): a fresh cell, or a cmux that dropped
+            # its workspaces, has no lane to send to -- and that must not read as "the fleet is
+            # busy" or as a blind roster. Neither is true.
+            log("lane roster: cmux reports ZERO workspaces -- there is no lane on this box to "
+                "dispatch into")
+        if scan.get("ps_err"):
+            # Declared, not laundered (#2055 review): with no process table the roster can still
+            # be built from cwds, but "is this lane mid-task / is its pi alive" went unanswered.
+            log("lane roster: DEGRADED -- %s" % scan["ps_err"])
+        for row in (scan.get("busy") or [])[:6]:
+            log("  busy: %s -> #%s (%s)" % (row.get("lane"), row.get("pr"), row.get("evidence")))
+        for row in (scan.get("excluded") or [])[:6]:
+            log("  excluded: %s -- %s" % (row.get("lane"), row.get("why")))
 
     # ⛔ THE COUNTERS LIVE ABOVE `_finish`, NOT BELOW IT (2026-10-18, review). `_finish` closes over
     # them, so a definition order that put `delivered` after the early `return _finish()` made the
     # closure's cell unbound and the pass died with `NameError: free variable 'delivered'` -- on
     # the NO-IDLE-LANE path, i.e. exactly the saturated-fleet pass this change is about.
     dispatched = 0
+    lanes_initial = len(lanes)   # the measured POPULATION this pass started with, for the record
     undeliverable = 0        # legible work whose order NO lane accepted (see `_finish`)
     delivered = []           # WHICH PRs actually went out -- the record must name them
     stalled = {"cooldown": 0, "budget": 0, "no-lane": 0, "brief": 0}
@@ -1299,8 +2233,20 @@ def main() -> int:
         else:
             if lane_err:
                 parts.append("lane roster UNREADABLE: %s" % lane_err[:120])
-            if not lanes and not lane_err and budgets["total"]:
-                parts.append("no idle lane in the roster")
+            elif not lanes and budgets["total"]:
+                # ⛔ THE MEASURED POPULATION, NOT A VERDICT ABOUT A TABLE (#2055). The old line
+                # said "no idle lane in the roster" and was FALSE on the pass that motivated this
+                # change. This one states what was counted, so it can be checked.
+                # The WORKING count is separated out (#2055, measured) because "already mid-task"
+                # and "no live process at all" are different facts with different next actions.
+                rows = scan.get("excluded") or []
+                working = [r for r in rows if "mid-task" in (r.get("why") or "")]
+                parts.append("no dispatchable lane: %d live lane(s) hold an open PR, %d lane(s) "
+                             "are mid-task, %d workspace(s) were not eligible"
+                             % (len(scan.get("busy") or []), len(working),
+                                len(rows) - len(working)))
+            if not head["ok"]:
+                parts.append("machine OVER BAND: %s" % head["why"])
             if budgets["total"] == 0:
                 parts.append("no capacity budget (all of MAX_FIX+MAX_REVIEW is in flight)")
             for k, v in sorted(stalls.items()):
@@ -1314,7 +2260,12 @@ def main() -> int:
         if unread:
             parts.append("%d PR(s) with UNREADABLE checks" % unread)
         why = "; ".join(parts) or "nothing to do"
-        log("dispatched %d of %d queued — %s" % (dispatched, queued, why))
+        # ⛔ THE DENOMINATOR IS NAMED TWICE: the QUEUE's real size and the WORK's real size (#2055).
+        # `dispatched 0 of 1` was true on the pass that motivated this change and still read as a
+        # quiet queue, because 1 was the number of CLASSIFIED items, not of open PRs. Both numbers
+        # are printed so a reader never has to guess which population "of N" means.
+        log("dispatched %d of %d queued (%d open PR(s)) — %s"
+            % (dispatched, queued, len(prs), why))
         # ⛔ 2 AND 3 ARE DIFFERENT FACTS, so they get different codes: 2 = I could not read the
         # world (the PR list, the checks, an UNREADABLE ROSTER that stranded work); 3 = I read it,
         # I placed the work, and NO LANE WOULD TAKE IT. Collapsing them (both used to be 2) is why
@@ -1333,18 +2284,23 @@ def main() -> int:
                            issue_work=issue_work,
                            un_owned=len(un_owned), owned=len(owners),
                            undeliverable=undeliv, unreadable=unread,
+                           open_prs=len(prs),
+                           lanes_dispatchable=lanes_initial,
+                           lanes_busy=len(scan.get("busy") or []),
                            lane_read_failed=bool(lane_err),
+                           agent_probe_failed=bool(scan.get("ps_err")),
+                           machine_ok=head["ok"], machine_why=head["why"][:120],
                            ownership_read_failed=own_err[:160] if own_err else "",
                            ownership_note=OWNERSHIP_NOTE[:160])
 
     if budgets["total"] and not lanes:
-        # A READABLE roster with no free lane is a saturated fleet, not a failure -- but it must
+        # A MEASURED roster with no free lane is a saturated fleet, not a failure -- but it must
         # still not launder a blind read into a clean 0 (see the helper).
         # ⛔ AND A BLIND ROSTER IS NOT A BUSY ONE (#1872 review round 7): `lane_err` above already
         # said "cannot see the fleet", and this line then said "the fleet is busy" -- the exact
         # conflation `idle_lanes()`'s docstring forbids. Say it once, and say the true one.
         if not lane_err:
-            log("no idle lanes -- nothing dispatched this pass")
+            log("no dispatchable lane -- nothing dispatched this pass")
         return _finish()
 
     for p, action, why, cr in classified:

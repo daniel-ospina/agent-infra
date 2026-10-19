@@ -1022,14 +1022,26 @@ beat is its own defect (`:812-819`).
 New as of 2026-10-18: `lane-actions.py` takes **one deadline for the whole read** (`--budget`) and
 splits it across its two attempts, so the cached pass can no longer consume the retry's allowance and
 the tool cannot outlive the caller waiting on it; a failed re-scan returns the roster already read
-with `COMPLETENESS UNMEASURED` on stderr instead of discarding a readable datum. `pr-doctor.py`
-consumes the **published** roster (`$STATE/lane-status.last.json` via `lane-actions.py --stdin`,
-**2.8 s measured**) instead of paying a scan on every pass, and falls back to a bounded scan when that
-file is absent, stale, degraded, partition-less or unreadable — saying which happened.
+with `COMPLETENESS UNMEASURED` on stderr instead of discarding a readable datum.
+
+⚠️ **`pr-doctor.py` no longer consumes `lane-actions.py` at all** (2026-10-18, #2055). The published
+roster (`$STATE/lane-status.last.json`, 2.8 s) is a DERIVED VERDICT — "running", "DONE-IDLE" — and a
+derived verdict is not a lane: on the measured pass the registry claimed 15 running lanes while a
+live-cwd scan found 11 owned PRs of 17, and the drain then refused with "no idle lane" on a box that
+had capacity. Its roster is now a JOIN of three measured facts — `cmux workspace list` (each pane's
+own `current_directory`), a live process whose cwd is that directory, and that checkout being inside
+the target repo's `.worktrees/` — and it costs one `cmux` call plus one process walk (0.4–2.5 s
+measured), so there is no publication to consume and no `LANE_BUDGET_S` fallback to budget. The
+constants are gone rather than kept-but-unused. `lane-actions.py` is now consumed only by `heartbeat-loop.sh`
+and `lane-scan-fallback.sh` (both `--stdin`, for the published snapshot); `queue-dispatch.py` reads
+`lane-status.py` directly — it has never referenced `lane-actions.py`, and its own docstring records
+that claim as CORRECTED.
 
 What does NOT exist: a deadline inside `lane-status.py` itself. Every remaining bound on the whole
-read is a CALLER's — `queue-dispatch.py`'s 600 s on its direct `lane-status.py` call, `pr-doctor.py`'s
-`LANE_BUDGET_S + margin` on the fallback scan. (The reader does hold per-CALL bounds — 60 s, 45 s,
+read is a CALLER's — `queue-dispatch.py`'s 600 s on its direct `lane-status.py` call. (`pr-doctor.py`
+has no such bound because it no longer pays that scan: its measured roster's own externals are
+bounded — 60 s on `cmux`, 30 s on `ps`, 60 s on `lsof`, 60 s on `git worktree list`, 20 s on
+`vm_stat` — so its worst case is a SUM, not a deadline.) (The reader does hold per-CALL bounds — 60 s, 45 s,
 45 s — and that is exactly the shape this MUST rules out: it bounds each probe and lets their SUM grow
 with the fleet.) `queue-dispatch.py` still prints the residual: *"lane-status.py has no internal
 deadline, so this is the only stop between a stalled scan and an unbounded wait"*.

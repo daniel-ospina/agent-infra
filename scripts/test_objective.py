@@ -960,6 +960,24 @@ def test_a_red_pr_doctor_pass_is_VISIBLE_in_the_beat(monkeypatch, tmp_path):
     assert "running=4" in line, line
 
 
+def test_the_beats_verdict_names_the_KIND_not_only_the_code(monkeypatch, tmp_path):
+    """⛔ `rc=2` COVERS THREE DIFFERENT REPAIRS (#2055): the queue, the checks, or the roster is
+    unreadable. The dispatcher records WHICH in `kind`, so the beat must print it -- otherwise an
+    operator reading fleet health cannot tell what the fleet is blind to without opening the log.
+    """
+    import json as _json
+    import time as _time
+    from collections import Counter
+    _stub_queue(monkeypatch, tmp_path, classes=Counter({"running": 1}),
+                by_class={"running": [(1, None)]})
+    (tmp_path / "pr-doctor.status.json").write_text(_json.dumps(
+        {"rc": 2, "kind": "UNREADABLE", "reason": "queue UNREADABLE: the open-PR read FAILED",
+         "at_epoch": _time.time() - 30}))
+    line = objective.build()
+    assert "RED rc=2 UNREADABLE" in line, line
+    assert "queue UNREADABLE" in line, line
+
+
 def test_a_green_pass_says_ok_and_a_missing_verdict_is_UNREPORTED(monkeypatch, tmp_path):
     """Absence is not a pass: a dispatcher that has never written a verdict must not read `ok`."""
     from collections import Counter

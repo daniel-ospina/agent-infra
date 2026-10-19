@@ -1232,7 +1232,8 @@ def pr_doctor_last_run(state_dir: str | None = None) -> str:
     shows whether the thing that WORKS the queue is alive -- and says RED when it is not. A
     missing record is `UNREPORTED`, never `ok`: absence is not a pass.
     """
-    p = os.path.join(state_dir or STATE, "pr-doctor.status.json")
+    p = os.path.join(state_dir or os.environ.get("PR_DOCTOR_STATE_DIR") or STATE,
+                     "pr-doctor.status.json")
     # ⛔ A DISARMED DISPATCHER IS NOT A DEAD ONE (2026-10-18, review). `$STATE/PR-DOCTOR-OFF` is the
     # documented way to stop it (heartbeat-loop.sh honours it); the sidecar then stops being written,
     # so an age-bounded reader would print RED every beat forever with no way to tell "the operator
@@ -1246,6 +1247,10 @@ def pr_doctor_last_run(state_dir: str | None = None) -> str:
         rc = int(d.get("rc"))
         age = int(max(0, time.time() - float(d.get("at_epoch") or 0)))
         reason = str(d.get("reason") or "(no reason recorded)")[:110]
+        # ⛔ THE KIND IS PART OF THE VERDICT (#2055). `rc=2` covers "the queue is unreadable", "the
+        # checks are unreadable" and "the lane roster is unreadable" -- three different repairs. The
+        # dispatcher names which one in the record, so the beat prints it instead of a bare code.
+        kind = str(d.get("kind") or "")[:24]
         dry = bool(d.get("dry_run"))
     except FileNotFoundError:
         return "PR-DOCTOR(last run): UNREPORTED (no verdict recorded)"
@@ -1261,10 +1266,10 @@ def pr_doctor_last_run(state_dir: str | None = None) -> str:
     # `$STATE/PR-DOCTOR-OFF`, and the beat would print `ok` forever. The bound is the same
     # freshness the roster read uses (two 1200s dispatch intervals), so the two agree.
     if age > 2400:
-        return "PR-DOCTOR(last run): UNREPORTED (verdict is STALE, %dm old: %s)" % (
-            age // 60, reason)
-    return "PR-DOCTOR(last run): %s rc=%d %dm ago — %s" % (
-        "RED" if rc else "ok", rc, age // 60, reason)
+        return "PR-DOCTOR(last run): UNREPORTED (verdict is STALE, %dm old: rc=%d %s :: %s)" % (
+            age // 60, rc, kind or "?", reason)
+    return "PR-DOCTOR(last run): %s rc=%d%s %dm ago — %s" % (
+        "RED" if rc else "ok", rc, (" " + kind) if kind else "", age // 60, reason)
 
 
 def build(prev=None):

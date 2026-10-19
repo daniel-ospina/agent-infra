@@ -57,7 +57,10 @@ export CMUXTERM_CLI_RESPONSE_TIMEOUT_SEC="${CMUXTERM_CLI_RESPONSE_TIMEOUT_SEC:-6
 # — that is an owner decision (it relaxes the socket from "only processes started
 # inside cmux" to "any process by this user"), filed as an issue, not taken here.
 
-STATE="$HOME/.pi/agent/state"
+# ⛔ THE SAME SEAM THE RECORD'S WRITER HONOURS (#2055 review): `pr-doctor.py` writes to
+# `PR_DOCTOR_STATE_DIR` when it is set, so a reader that hardcodes `$HOME` reports `UNREPORTED`
+# against a relocated state dir -- a silent, fail-open "the job never ran".
+STATE="${PR_DOCTOR_STATE_DIR:-$HOME/.pi/agent/state}"
 SCRIPTS="$HOME/.pi/agent/scripts"
 LOG="$STATE/orchestrator-heartbeat.log"
 # The recap/beat PAIR rule (_mdsha + beat_pair_ok), shared with cadence-nudge.sh so the rule exists
@@ -533,24 +536,29 @@ except Exception:
     sys.exit(0)
 _rc=d.get("rc")
 _r=int(_rc) if isinstance(_rc,int) else -1
-print("%d|%d|%s|%s" % (_r, int(max(0, time.time()-float(d.get("at_epoch") or 0))),
+print("%d|%d|%s|%s|%s" % (_r, int(max(0, time.time()-float(d.get("at_epoch") or 0))),
                        "1" if d.get("dry_run") else "0",
+                       str(d.get("kind") or "?")[:24],
                        str(d.get("reason") or "")[:180]))' "$STATE/pr-doctor.status.json" 2>/dev/null)"
     if [ -n "$_pd" ]; then
       _prc="${_pd%%|*}"; _prest="${_pd#*|}"; _page="${_prest%%|*}"; _prest="${_prest#*|}"
-      _pdry="${_prest%%|*}"; _pwhy="${_prest#*|}"
+      _pdry="${_prest%%|*}"; _prest="${_prest#*|}"
+      _pkind="${_prest%%|*}"; _pwhy="${_prest#*|}"
       # ⛔ A STALE VERDICT IS NOT `ok` (2026-10-18, review). The whole point of reading a record is
       # to notice when nothing is writing it; printing `ok` from a week-old file reproduces exactly
       # the failure this block was added to end. Bound = two 1200s dispatch intervals.
       if [ "${_prc:-0}" -ne 0 ]; then
-        printf '%s PR-DOCTOR RED rc=%s (%ss ago) :: %s\n' \
-          "$(date '+%m-%d %H:%M:%S')" "$_prc" "${_page:-?}" "$_pwhy" >> "$LOG"
+        # ⛔ THE KIND IS PRINTED WITH THE CODE (#2055). `rc=2` alone cannot say whether the queue,
+        # the checks or the roster was unreadable; the verdict now names which, so an operator does
+        # not have to open the log to find out what the fleet is blind to.
+        printf '%s PR-DOCTOR RED rc=%s %s (%ss ago) :: %s\n' \
+          "$(date '+%m-%d %H:%M:%S')" "$_prc" "${_pkind:-?}" "${_page:-?}" "$_pwhy" >> "$LOG"
       elif [ "${_pdry:-0}" = "1" ]; then
         printf '%s PR-DOCTOR DRY RUN (not a pass verdict, %ss ago) :: %s\n' \
           "$(date '+%m-%d %H:%M:%S')" "${_page:-?}" "$_pwhy" >> "$LOG"
       elif [ "${_page:-0}" -gt 2400 ]; then
-        printf '%s PR-DOCTOR RED UNREPORTED (verdict is STALE: %ss old) :: %s\n' \
-          "$(date '+%m-%d %H:%M:%S')" "$_page" "$_pwhy" >> "$LOG"
+        printf '%s PR-DOCTOR RED UNREPORTED (verdict is STALE: %ss old) :: rc=%s %s :: %s\n' \
+          "$(date '+%m-%d %H:%M:%S')" "$_page" "${_prc:-?}" "${_pkind:-?}" "$_pwhy" >> "$LOG"
       else
         printf '%s PR-DOCTOR ok rc=0 (%ss ago) :: %s\n' \
           "$(date '+%m-%d %H:%M:%S')" "${_page:-?}" "$_pwhy" >> "$LOG"

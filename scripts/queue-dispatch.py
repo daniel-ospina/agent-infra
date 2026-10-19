@@ -152,7 +152,12 @@ PROTECTED = ("HANG", "DMeer", "DMer", "π - DMeer", "DMeer -")
 # past state and must not gate anything.
 PR_FIRST_MAX_AGE_S = 2400
 # `STATE` here is the QUEUES dir; the dispatcher's verdict lives one level up.
-PR_DOCTOR_STATE = os.path.join(HOME, ".pi", "agent", "state")
+# ⛔ THE SEAM THE WRITER ALREADY HONOURS (#2055 review). `pr-doctor.py` writes its verdict to
+# `PR_DOCTOR_STATE_DIR` when that is set; hardcoding `$HOME` here made a relocated state dir read
+# as "pr-doctor has recorded no pass yet" -- silence, fail-open, and indistinguishable from a
+# dispatcher that never ran.
+PR_DOCTOR_STATE = (os.environ.get("PR_DOCTOR_STATE_DIR")
+                   or os.path.join(HOME, ".pi", "agent", "state"))
 COOLDOWN_S = 15 * 60
 
 # Hard wall-clock bound (seconds) for the ONE fleet read per pass. lane-status.py has no
@@ -749,17 +754,29 @@ def pr_first_gate(state_dir=None, now_s=None):
     if age > PR_FIRST_MAX_AGE_S:
         print(f"  (priority gate not applied: the pr-doctor record is STALE, {age // 60}m old)")
         return ""
-    # ⛔ `rc != 0` IS NOT "NOTHING WAS MEASURED" (2026-10-18, review). The pass publishes `issue_work`
-    # on rc=2 (it classified the PRs and refused only the DISPATCH) and on rc=3 ("I read it, I placed
-    # the work, and NO LANE WOULD TAKE IT") -- so keying the gate on rc inverted the owner's rule
-    # exactly when the fleet was blind on some checks or every lane refused an order, and the live
-    # record on this box was `RED rc=3 … no lane accepted`, which the gate ignored. The reading is
-    # the FIELD: a record without `issue_work` came from a path that never measured ownership (the
-    # open-PR read failed, the queue was empty, checks were unreadable, no roster), and that is the
-    # only case with nothing to act on.
-    if work not in ("SKIPPED", "ELIGIBLE"):
-        print(f"  (priority gate not applied: the last pr-doctor pass measured no ownership "
-              f"verdict, rc={rc}: {reason})")
+    # ⛔ A REFUSED PASS STILL MEASURED OWNERSHIP -- AND `rc != 0` IS NOT "NOTHING WAS MEASURED"
+    # (2026-10-18, review; #2055 review, P1). The ownership probe runs BEFORE every refusal, and
+    # rc=5 (NO-CAPACITY), rc=2 (roster/queue UNREADABLE) and rc=3 (UNDELIVERED) all publish
+    # `issue_work: SKIPPED` with a real `un_owned` count. Gating on `rc == 0`, or on `issue_work`
+    # alone, threw that reading away at exactly the moment it matters most: the box over its load
+    # band, or with every lane mid-task, then dispatched NEW ISSUE WORK while un-owned PRs waited --
+    # the owner's priority inverted by the very condition that makes it matter. (The live record on
+    # this box was `RED rc=3 ... no lane accepted`, which an rc-keyed gate ignored.)
+    # So the gate keys on whether an OWNERSHIP READING EXISTS, never on the exit code:
+    # `ownership_read_failed` set (or no `un_owned` field at all) means the probe did not answer.
+    # ⛔ A REFUSED PASS STILL MEASURED OWNERSHIP (#2055 review, P1). The ownership probe runs
+    # BEFORE any refusal, and rc=5 (NO-CAPACITY), rc=2 (roster UNREADABLE) and rc=3 (UNDELIVERED)
+    # all publish `issue_work: SKIPPED` with a real `un_owned` count. Gating on `rc == 0` threw
+    # that reading away at exactly the moment it matters most: the box that is over its load band
+    # or whose lanes are all mid-task then proceeds to dispatch NEW ISSUE WORK with un-owned PRs
+    # waiting -- the owner's priority inverted by the very condition that makes it matter.
+    # So the gate keys on whether an OWNERSHIP READING EXISTS, never on the exit code:
+    # `ownership_read_failed` set (or no `un_owned` field at all) means the probe did not answer.
+    if d.get("ownership_read_failed"):
+        print("  (priority gate not applied: pr-doctor could not READ ownership this pass)")
+        return ""
+    if "un_owned" not in d:
+        print(f"  (priority gate not applied: the record carries no ownership reading, rc={rc})")
         return ""
     if rc != 0:
         # Measured, but the pass still refused: say it, because a SKIPPED decision taken under a
