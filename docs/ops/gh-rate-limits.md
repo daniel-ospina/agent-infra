@@ -6,7 +6,7 @@ doc_status: live
 subjects.team: organisation-design-team
 created: 2026-08-10
 aboutSubjects: organisation-design-team
-aboutObjects: agent-infra, issue-143, issue-1762, issue-1988, issue-2227, gh-rate-limits, gh-limit
+aboutObjects: agent-infra, issue-143, issue-1762, issue-1988, issue-2227, gh-rate-limits, gh-limit, issue-2139
 ---
 
 # GitHub API rate limits — detection & fallback runbook
@@ -90,6 +90,31 @@ documented policy, so this file does not restate the numbers — it names where 
 | Conditional REST for polling: ETag stored per URL (host + path + credential digest), `if-none-match` sent, a **304 replayed from cache** and charged nothing. The cached body is base64 (a 304 replay is byte-exact, binary included) and the cache is bounded in ENTRIES and BYTES (`GH_LIMIT_CACHE_MAX_ENTRIES` 500, `GH_LIMIT_CACHE_MAX_BYTES` 64 MiB) | `conditional_fetch` / `cache_put` / `prune_cache` |
 | The shim stays FIRST on PATH even though every gh-calling harness script prepends `/opt/homebrew/bin:/usr/local/bin` | the `$O/gh-limit` / `$O/gh-rest` re-assert in the harness scripts that prepend and invoke `gh` |
 | The heartbeat's tooling (`objective.py`, `merge-queue.py`, `beta-progress.py`, `ask-owner.py`, `turn-classify.py`, `turn-end.py`, `undelivered-answers.py`, `pr-doctor.py`) reaches the layer instead of a pinned real binary | each resolver prefers `$O/gh-rest/gh` then `$O/gh-limit/gh` (`$O`-derived, never PATH); the five that HAVE a pinned candidate also hand it through as `GH_REST_REAL_GH`/`GH_LIMIT_REAL_GH` (see the residual below for the three that never pinned). Was nine/six until agent-infra#1874 retired `retired/queue-dispatch.py` — a retired tool is not in the beat, so it is not counted here |
+
+### A reader with its OWN REST second source (#2139)
+
+`beta-progress.py` (the heartbeat's DELIVERY line) reads BOTH of its PR lists with
+`gh pr list --json` — GraphQL. Under fleet concurrency a SECONDARY-limit refusal took the line
+out entirely (`DELIVERY: unavailable (metrics read failed)` / `VERDICT=UNKNOWN (merge-rate read
+failed)`) while `core` read 1599/5000 and a single REST call answered in 0.43 s, so the fleet lost
+its own progress measurement while a readable source existed. That reader therefore keeps a REST
+fallback of its own (`_rest_prs`), and the rules it follows are the reusable ones:
+
+* **Same source or no metric.** If EITHER GraphQL list fails, BOTH are re-read over REST. A REST
+  open-count beside a GraphQL merged-count compares two differently-wrong reads.
+* **`state=closed` is not `state=merged`.** REST's closed window carries PRs closed WITHOUT
+  merging; only rows with a non-null `merged_at` may count toward `merged_today`.
+* **The window is paged, not assumed.** REST caps `per_page` at 100, so the 500/400 windows are
+  `ceil(limit/100)` requests. A page that cannot be read — or a read that spends its own budget
+  (45 s per window, so 90 s for the pair, inside the tick that runs it) —
+  refuses the WHOLE read instead of returning a short list: a silently short window under-counts
+  `merged_today`, which is the one error a fallback must not add. The window is the 400
+  most-recently-updated **closed** PRs and unmerged rows are dropped after it is read, so today's
+  updated closed PRs — not today's merges alone — must fit in 400 for `merged_today` to be exact.
+  That is a stated bound, not a promise.
+* **It goes direct (urllib + the token), not through the layer.** The layer's GraphQL path is what
+  was refused; re-entering it would queue behind the same refusal. The token is read from
+  `GH_TOKEN`/`GITHUB_TOKEN` else `~/.config/gh/hosts.yml` and is never logged.
 
 Two properties worth knowing before you debug it:
 
