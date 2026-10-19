@@ -401,13 +401,16 @@ LANE_PRODUCERS_STATE_RESIDUAL="claim.py:#1567 lane-confirm.py:#1797 lane-triage.
 # ⚠️ THE `foreign/` CLASS — a producer a farmed consumer execs from ANOTHER checkout by absolute
 # path. Delivered by that repo's own process, never by this farm, and absent from every box that
 # lacks the checkout — so it is DISCLOSED with an owner and an undisclosed one FAILS. Measured
-# 2026-10-17: TWO sites. `session-postmortem.sh:27` defaults to the eldato repo's
-# `scripts/postmortem.sh`, and that consumer then writes a postmortem whose transcript-pattern section
-# is replaced by a one-line "not found" note, on every box but the owner's (#1921). `safe-send.sh:146`
-# runs a CROSS-CHECKOUT `…/tortoise/tools/cmux_dispatch.py` — and this class's first form required the
+# 2026-10-17: TWO sites, ONE after #1921. `session-postmortem.sh:27` defaulted to the eldato repo's
+# `scripts/postmortem.sh`, and that consumer then wrote a postmortem whose transcript-pattern section
+# was replaced by a one-line "not found" note, on every box but the owner's (#1921) — #1921 VENDORED
+# that producer as `scripts/lib/transcript-patterns.sh` and the consumer now resolves it as a SIBLING,
+# so the site is gone and with it the `foreign:postmortem.sh` entry: the producer is `lib:` now, not
+# foreign. `safe-send.sh:146` runs a CROSS-CHECKOUT `…/tortoise/tools/cmux_dispatch.py` — and this
+# class's first form required the
 # parent directory to be `scripts/`, so that one was invisible while the line above claimed the class was
 # complete: the widening is #1957's, and it is why the form is directory-agnostic now.
-LANE_PRODUCERS_FOREIGN_RESIDUAL="cmux_dispatch.py:#1957 postmortem.sh:#1921"
+LANE_PRODUCERS_FOREIGN_RESIDUAL="cmux_dispatch.py:#1957"
 # ⚠️ DELIVERABLE producers still withheld from every farm array, both owned by #1553 and unchanged
 # from #1552/#1795: `lane-status.py`'s DESTINATION copy is AHEAD of the repo (1993 repo / 2005 live
 # lines at the 2026-10-15 measurement; the live copy carries the #1777 abstention text), so farming
@@ -480,10 +483,16 @@ script:objective.py script:orchestrator-heartbeat.sh script:pi-reap-worktrees.sh
 script:publish-live-workspaces.py script:queue-dispatch.py script:safe-send.sh
 script:session-postmortem.sh
 script:turn-classify.py script:turn-end.py script:undelivered-answers.py script:watch-truncation.sh
-lib:beat-pair.sh lib:bounded.sh lib:diff-normalize.py lib:pid-identity.sh
+lib:beat-pair.sh lib:bounded.sh lib:diff-normalize.py lib:pid-identity.sh lib:transcript-patterns.sh
 state:claim.py state:lane-confirm.py state:lane-triage.py state:lane-verdict.py
 state:queues/refresh-queues.py
-foreign:cmux_dispatch.py foreign:postmortem.sh"
+foreign:cmux_dispatch.py"
+# `lib:transcript-patterns.sh` joined on 2026-10-17 (#1921) and `foreign:postmortem.sh` LEFT in the
+# same landing, which is the derivation doing its job: the exec site did not vanish, it CHANGED KIND —
+# the consumer now execs a sibling that `lib_srcs` farms, and the old foreign reference is gone. A
+# REMOVED entry is normally the "exec site was lost" signal; here it was verified against the CODE
+# (`grep -n 'postmortem.sh' scripts/session-postmortem.sh` finds only the `POSTMORTEM_SH` override and
+# the sibling default), not against the pin.
 
 # An array's entries, one per line. An ABSENT array (`lane_root_srcs`, until #1553) yields nothing:
 # it is the population floor and the pin that refuse an emptied delivery set, never this reader.
@@ -2044,6 +2053,54 @@ if [[ "$(uname)" == "Darwin" ]]; then
   else
     fail "no 'SKIPPED (…not the real home)' line: the decline is not surfaced by setup.sh"
   fi
+
+fi
+
+# --- the pi spawn-point gate (#1884) --------------------------------------
+# setup.sh installs spawn-gate.sh AS `pi` in $DEST/bin — first on this fleet's PATH — because the
+# gate must sit where `pi` is born, not where a caller remembers to source it. Pinned BY ARTIFACT and
+# BY BEHAVIOUR (a byte comparison alone would pass on a copy that cannot run): the INSTALLED file is
+# driven as `pi`, with MAX_LOAD=0 as the deterministic refusal lever and a fake real pi behind it.
+# The defect this exists for: a hand-written runner that sourced nothing started lanes on a box at
+# load 258 against its own ceiling of 100, with no refusal, no log line and no count.
+echo "== the pi spawn-point gate (#1884)"
+GATE_SRC="$ROOT/scripts/orchestrator-harness/spawn-gate.sh"
+GATE_DST="$DEST/bin/pi"
+if [ -f "$GATE_DST" ] && cmp -s "$GATE_SRC" "$GATE_DST"; then
+  echo "ok: setup.sh installed the spawn-point gate byte-identical at \$DEST/bin/pi"
+else
+  fail "setup.sh did not install the spawn-point gate at $GATE_DST (missing or stale) — every \`pi\` a hand-written runner starts would be ungated and silent"
+fi
+if [ -x "$GATE_DST" ]; then
+  echo "ok: the installed gate is executable (PATH skips a non-executable entry, silently)"
+else
+  fail "$GATE_DST is not executable — PATH would resolve past the gate"
+fi
+mkdir -p "$TMP/gate-real"
+printf '#!/usr/bin/env bash\nprintf RAN > "%s"\n' "$TMP/gate-ran" > "$TMP/gate-real/pi"
+chmod +x "$TMP/gate-real/pi"
+rm -f "$TMP/gate-ran"
+HOME="$HOME_DIR" MAX_LOAD=0 PATH="$DEST/bin:$TMP/gate-real:$PATH" pi -p "gate probe" >/dev/null 2>&1 || true
+if [ ! -e "$TMP/gate-ran" ]; then
+  echo "ok: the installed gate REFUSED a spawn at MAX_LOAD=0 (the real pi never ran)"
+else
+  fail "the installed gate allowed a spawn at MAX_LOAD=0 — 'spawn nothing' is not enforced"
+fi
+HOME="$HOME_DIR" MAX_LOAD=999999999 PATH="$DEST/bin:$TMP/gate-real:$PATH" pi -p "gate probe" >/dev/null 2>&1 || true
+if [ -e "$TMP/gate-ran" ]; then
+  echo "ok: POSITIVE CONTROL — below the ceiling the installed gate EXECs the real pi"
+else
+  fail "the installed gate blocked a spawn below the ceiling: every refusal above would be vacuous"
+fi
+# A re-run must REFRESH a mutated copy: a stale gate is worse than a missing one (the missing one is
+# loud; the stale one certifies a ceiling it no longer applies).
+rm -f "$TMP/gate-ran"
+echo "# drift injected by the test" >> "$GATE_DST"
+run_setup
+if cmp -s "$GATE_SRC" "$GATE_DST"; then
+  echo "ok: a mutated spawn-point gate was REFRESHED by the re-run (the repo copy is the copy that runs)"
+else
+  fail "a cell-local mutation of the spawn-point gate survived the re-run"
 fi
 
 # --- done -----------------------------------------------------------------

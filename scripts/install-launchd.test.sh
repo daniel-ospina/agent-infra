@@ -436,8 +436,10 @@ assert_not_contains "$OUT1" "skill-lint-oracle: installed + loaded" "retired ora
 # does not. A pinned total is therefore red on one of the two surfaces whichever number is chosen,
 # and a pinned total measured here reads higher beside a checkout. So: 9 always-installable jobs pinned by
 # name, plus whichever {{TORTOISE_REPO}}-gated templates THIS run installed, derived from the
-# fixture's own template dir — with the gated inventory itself pinned at 2, so a newly added gated
-# job cannot raise both sides of the equation at once.
+# fixture's own template dir — with the gated inventory itself pinned at 3, so a newly added gated
+# job cannot raise both sides of the equation at once. The pin is the ONLY place this count is
+# stated: adding a gated template without bumping it here reds this suite on main, which is what
+# happened when worktree-hygiene (#1095/#1678) landed — the template arrived, the pin did not.
 BOOTSTRAP_COUNT1="$(grep -c 'launchctl bootstrap' "$LOG" || true)"  # grep -c exits 1 on ZERO matches; `set -e` would kill the run here
 GATED_TEMPLATES1=0
 GATED_INSTALLED1=0
@@ -465,7 +467,7 @@ else
     # invariant instead of relying on the exit code alone.
     assert_eq "$GATED_INSTALLED1" "$GATED_TEMPLATES1" "every {{TORTOISE_REPO}}-gated template installed, or none did"
 fi
-assert_eq "$BOOTSTRAP_COUNT1" "$((8 + GATED_INSTALLED1))" "fresh install bootstraps only active jobs (9 always-installable: canary + tripwire + fleet + pi-session-reaper + balance-watch + pi-task-session-prune + lane-liveness + ci-runner-gate, plus whichever {{TORTOISE_REPO}}-gated jobs this host resolves)"
+assert_eq "$BOOTSTRAP_COUNT1" "$((8 + GATED_INSTALLED1))" "fresh install bootstraps only active jobs (8 always-installable: canary + tripwire + fleet + pi-session-reaper + balance-watch + pi-task-session-prune + lane-liveness + ci-runner-gate, plus whichever {{TORTOISE_REPO}}-gated jobs this host resolves)"
 
 echo "── 2. Retirement: pre-seeded old plists get unloaded + removed ───"
 seed_retired "$HOME2"
