@@ -1615,6 +1615,53 @@ Until now it existed only as `~/orchestrator/*.sh` on one machine: no history, n
 no way to hand it to another box, and no way to know which of the 14 scripts were live. §9
 records which are live and which are retired.
 
+#### 7.3a A controller COUNT was really a subprocess count — **FIXED in agent-infra#2043**
+
+`bg/status.sh` (unversioned; see #2026) reported the number of controllers as
+`ps ax -o command | grep -c "[o]rch-loop.sh"` — an **argv** count, not a controller count. A bash
+subshell inherits its parent's argv, so `( … )` and `$( … )` inside `orch-loop.sh` appear in `ps` as
+`bash $O/orch-loop.sh`, with the CONTROLLER as their ppid. Measured 2026-10-18 with exactly one
+controller alive:
+
+```
+41679 41665  bash /Users/home/orchestrator/orch-loop.sh     # the controller, child of its supervisor
+71388 41679  bash /Users/home/orchestrator/orch-loop.sh     # a subshell: ppid IS the controller
+83157 71388  bash /Users/home/orchestrator/orch-loop.sh     # a subshell of a subshell
+```
+
+Three rows, one controller: `orch-loop-procs=3` read as "a duplicate controller is running" — the
+exact condition the supervisor's `one_instance` guard exists to prevent — and made a stale
+`.orch.lock` investigation look alarming when nothing was wrong.
+
+`controllers.sh` is the versioned reading (`bg/` is not versioned, so the call-site swap is recorded
+here, at its point of use — the same rule #2041 follows for `bg/finish.sh`):
+
+```bash
+# bg/status.sh, replacing  loop=$(ps ax -o command | grep -c "[o]rch-loop.sh")
+loop=$(bash "$O/controllers.sh" --count)      # 1, 2, or `unknown` (a broken ps is never 0)
+```
+
+It uses TWO authorities, each for what it can actually prove: the **lock** names this runtime's
+controller (re-checked against the cmdline, because a pid can be recycled), and the **process table,
+ancestry-reduced**, still sees a GENUINE second controller — one started outside launchd, which is a
+real fault this fleet has been bitten by. The lock alone cannot report that (a lock-first read
+returns one pid by construction), and argv alone cannot tell a subshell from a controller. So a match
+whose ppid chain contains another match is a child and is dropped; two matches with independent
+parents are two controllers. The reduction is the same awk the cell supervisor ships
+(`_controller_ps_awk`), and `controllers.test.sh` §13 pins the two copies byte-for-byte, because two
+copies of one process-identity rule that may drift are the #1178 defect.
+
+⛔ Every unreadable or contradictory state is NAMED on stderr instead of being silently included or
+excluded: `lock names a dead pid <pid>` (the lock outlived a `kill -9`/OOM/reboot),
+`lock names a non-controller pid <pid>` (alive, but its argv is not an `orch-loop.sh` invocation),
+`lock is empty`, `lock is not a regular file` (a FIFO would BLOCK the read), and
+`<pid> … is a subshell of controller <pid>` when a recycled pid lands on a child. A process table
+that cannot be read is `controllers=unknown` with **exit 2 — never 0**: a broken `ps` is not "no
+controller" (#1178 C3 / #1856). A readable table with nothing running is `0` with exit 1, so a
+caller can tell "nothing running" apart from "could not read".
+
+Read-only: nothing in `controllers.sh` signals, writes or removes anything.
+
 ### 7.4 Defects found in the first review of this artifact (all fixed here)
 
 These are kept as a record because each one is a *failure mode of the design*, not a typo.
@@ -1839,6 +1886,8 @@ algorithmic advantage. The claim worth evaluating is *utilisation*, not *efficie
 | `cloud-cell-record-dep.test.sh` | #1717: drives `cloud-cell-supervisor.sh check/start` and `merge-one.sh` against a stubbed toolchain — the recorder is a checked, provisioned dependency, and a record failure parks. Registered in `scripts/run-bash-shards.sh`, so both CI lanes run it |
 | `check-deployed-drift.sh` | answers whether the DEPLOYED `$O` matches the repo: the recorded commit against the live ref (`merge-base --is-ancestor`, never a commit count), the recorded payload hash against the deployed bytes, and every repo-shipped `*.sh` blob against its `$O` copy. Exit 0 match / 1 drift / **2 UNKNOWN — never a pass** (agent-infra#1745). Not part of the loop |
 | `report.sh` | read-only operator summary: merges in a window, per-kind agent wall-time and cap-hit rate from `state/walltime.tsv`, live `refs/claims/*`, queue health, and the last dispatch decisions. Safe to run while the loop is working. Not part of the loop |
+| `controllers.sh` | how many controllers own THIS runtime (agent-infra#2043): the lock names the controller and is re-checked against the cmdline, the process table is read ancestry-reduced so a SUBSHELL that inherited `orch-loop.sh`'s argv is not counted as a second controller, and a genuine second controller (independent parent) still is. `controllers.sh [--count\|--pids]`; warns by name when the lock names a dead pid or a non-controller, and answers `unknown`/rc 2 (never `0`) when `ps` cannot be read. Replaces the `bg/status.sh` argv count (§7.3a). Not part of the loop |
+| `controllers.test.sh` | #2043: the measured 3-row shape reads 1, two independent controllers read 2, a lock naming a live non-controller / a dead pid / a recycled subshell pid is NAMED, an unreadable or empty `ps` read is `unknown` rc 2 (never 0), and the descendant-exclusion awk is pinned byte-for-byte against the cell supervisor's copy. §10–§12 drive REAL synthetic controllers in a scratch `$O`. A CI shard |
 
 **Manual utility:** `adopt-fix.sh` — run `fix-one.sh` against a specific PR by hand;
 `nonblocking-dispatch.sh` — launch a headless worker in the background and return immediately (§2).
