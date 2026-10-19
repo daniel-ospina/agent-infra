@@ -2526,7 +2526,10 @@ function _wtLinePipesToInterpreter(line) {
  *     the delimiter gone it ate the next real command word, so a discard on a
  *     later line (`cat <<EOF … EOF` then `git checkout -- f`) was invisible.
  *  `carry` threads quote/arithmetic state across lines (a `<<` inside a
- *  multi-line quoted string is not a heredoc either).
+ *  multi-line quoted string is not a heredoc either). A NEWLINE is a word
+ *  boundary, so a line always BEGINS at a word start — `atWordStart` is a
+ *  per-line local, never carried. Carrying it made comment recognition depend
+ *  on the previous line's LAST character (see the bottom of this function).
  */
 function _wtScanLine(line, carry) {
   let i = 0;
@@ -2535,7 +2538,7 @@ function _wtScanLine(line, carry) {
   let arith = carry?.arith ?? 0;
   let delim = null;
   let delimQuoted = null; // the quote char when the delimiter was quoted (`<<'EOF'`)
-  let atWordStart = carry?.atWordStart ?? true;
+  let atWordStart = true;
   while (i < line.length) {
     const ch = line[i];
     if (quote) {
@@ -2578,7 +2581,31 @@ function _wtScanLine(line, carry) {
     }
     out += ch; i++; atWordStart = false;
   }
-  if (carry) { carry.quote = quote; carry.arith = arith; carry.atWordStart = atWordStart; }
+  // A NEWLINE terminates the word, so the next line always begins at a word
+  // start — bash drops the line break, it never glues two lines into one word.
+  // `atWordStart` is therefore a per-line local (see the top of this function);
+  // it is NOT part of `carry`. Carrying it made whether a line-leading `#` was
+  // a comment depend on the character the PREVIOUS line happened to END with,
+  // and on `scripts/checkout-hygiene/hub-worktree.sh` that silently disabled
+  // the M5 discard walk for most of the file (measured 2026-10-19, #1949):
+  //
+  //     line 166  fi
+  //     line 167  (blank)
+  //     line 168  # The branch-name checks are create/salvage-only: …
+  //     line 169  # advances the hub's own main.
+  //
+  // `fi` ends on a word character, so line 168's leading `#` was scanned as
+  // CODE; line 169's apostrophe then opened a single-quote state that swallowed
+  // 170–209. Later re-opens (222, 242, 463) keep the state desynced, leaving
+  // 464–509 — where BOTH `git show "HEAD:$rest"` lines (476, 488) live — inside
+  // a phantom quoted region. The extractor reported ZERO `cat-file-revert`
+  // descriptors for the whole 725-line recovery helper, so M5 read a copy of it
+  // as discard-free and ALLOWED it on a dirty checkout (the #1139 fail-open).
+  // Removing that one apostrophe does NOT restore detection (the re-opens
+  // above still desync it); the fix is the per-line word start, not the
+  // apostrophe. The mirror direction is a false BLOCK: a commented-out
+  // `git checkout -- x` on the line after a code line was harvested as live.
+  if (carry) { carry.quote = quote; carry.arith = arith; }
   return { text: out, delim, delimQuoted };
 }
 
@@ -2602,7 +2629,7 @@ function _stripQuotedHeredocBodies(text) {
   const lines = String(text ?? "").split("\n");
   const out = [];
   let pending = null; // delimiter while inside a quoted heredoc body
-  const carry = { quote: null, arith: 0, atWordStart: true };
+  const carry = { quote: null, arith: 0 };
   for (const line of lines) {
     if (pending !== null) {
       if (line.trim() === pending) { out.push(""); pending = null; continue; }
@@ -2620,7 +2647,7 @@ function _wtStripHeredocData(text, codeBodies) {
   const lines = String(text ?? "").split("\n");
   const out = [];
   let pending = null; // { delim, kind, buf }
-  const carry = { quote: null, arith: 0, atWordStart: true };
+  const carry = { quote: null, arith: 0 };
   for (const line of lines) {
     if (pending) {
       const t = line.trim();

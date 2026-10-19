@@ -260,6 +260,37 @@ for (const cmd of [
     !!d && (d.unverifiable === true || d.form === "feeder-pathspec" || d.pathspecs.some((p) => String(p).includes("{}"))), JSON.stringify(d));
 }
 
+// A2e: a NEWLINE is a word boundary, so a `#` on the line AFTER a code line is
+// still a COMMENT — and a comment cannot open a quote that hides the code below
+// it. `atWordStart` used to be part of the carried state, so whether a leading
+// `#` was a comment depended on the character the PREVIOUS line ended with.
+// Measured on `scripts/checkout-hygiene/hub-worktree.sh` (2026-10-19, #1949):
+//
+//     166  fi                 ← ends on a word character
+//     167  (blank)
+//     168  # The branch-name checks are create/salvage-only: …
+//     169  # advances the hub's own main.       ← its apostrophe opens a quote
+//     …    (further re-opens at 222 / 242 / 463 keep the state desynced)
+//     476  target="$(git -C "$MAIN_REPO" show "HEAD:$rest" …)"
+//     488  rm -f …; git -C "$MAIN_REPO" show "HEAD:$rest" > "$MAIN_REPO/$rest"
+//
+// 168–169 were scanned as CODE and the resulting phantom quote left 464–509
+// (both `git show "HEAD:$rest"` lines) inside a quoted region, so the extractor
+// reported ZERO `cat-file-revert` descriptors for that 725-line recovery helper.
+// The M5 walk then read a COPY of it as discard-free and ALLOWED it in a DIRTY
+// checkout — the #1139 fail-open whose pins (B12b2 / C1 below) are the RED that
+// caught it. Removing the one apostrophe does NOT restore detection (the later
+// re-opens still desync it): the defect is the carried word start, not the
+// apostrophe. The mirror direction is a false BLOCK — a commented-out discard
+// on the line after a code line harvested as live, which the case below pins.
+const APOS_COMMENT = "fi\n# the hub's own main.\ngit checkout -- src/x.ts";
+expectTrue("A2e (#1949): a discard below an apostrophe-bearing COMMENT is still found (the newline ends the word, so that `#` line IS a comment)",
+  extractWorkingTreeDiscards(APOS_COMMENT).length === 1 && first(APOS_COMMENT)?.pathspecs?.[0] === "src/x.ts",
+  JSON.stringify(extractWorkingTreeDiscards(APOS_COMMENT)).slice(0, 240));
+expectTrue("A2e (#1949) mirror: a COMMENTED-OUT discard on the line after a code line is NOT harvested (no false block)",
+  extractWorkingTreeDiscards("fi\n# git checkout -- src/x.ts\n").length === 0,
+  JSON.stringify(extractWorkingTreeDiscards("fi\n# git checkout -- src/x.ts\n")).slice(0, 240));
+
 // A3: effect decision — block iff uncommitted tracked work would be destroyed.
 const EFFECT = [
   [" M src/x.ts", { scope: "paths", fromTree: false }, true, "worktree-modified, index source"],
@@ -465,6 +496,20 @@ async function partB() {
       blocked(await bash(`bash ${undo}`, wt)), "was allowed");
     expectTrue("B6f: script-file discard on a CLEAN target ALLOWED",
       allowed(await bash(`bash ${undoClean}`, wt)), "was blocked");
+    // B6h (#1949): the script-file surface is walked with the SAME quote-aware
+    // scan, so a COMMENT carrying an apostrophe must not swallow the discard
+    // below it. `dirty.txt` is tracked-dirty in this worktree (B6 above).
+    const undoApos = join(tmp, "undo-apos.sh");
+    const undoAposCommented = join(tmp, "undo-apos-commented.sh");
+    write(undoApos, "set -e\n# revert the hub's own copy\ngit checkout -- dirty.txt\n");
+    write(undoAposCommented, "set -e\n# revert the hub's own copy\n# git checkout -- dirty.txt\n");
+    expectTrue("B6h (#1949): a script whose COMMENT carries an apostrophe still BLOCKS its real discard",
+      blocked(await bash(`bash ${undoApos}`, wt)),
+      "was allowed — the comment's apostrophe opened a quote that hid the discard");
+    expectTrue("B6h (#1949) control: the same script with the discard COMMENTED OUT is ALLOWED (the fix is not a blanket block)",
+      allowed(await bash(`bash ${undoAposCommented}`, wt)), "was blocked");
+    rmSync(undoApos, { force: true });
+    rmSync(undoAposCommented, { force: true });
     rmSync(undo, { force: true });
     rmSync(undoClean, { force: true });
 
