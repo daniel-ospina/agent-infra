@@ -581,6 +581,13 @@ esac
 # launchd addresses the USER domain by UID (#446): a run with a throwaway HOME bootstraps into the LIVE
 # session, registering a job whose plist path dies with the temp dir. Refuse it unless a test opts in
 # WITH a launchctl shim (same contract as install-launchd.sh).
+# ⛔ DISCLOSED RESIDUAL — this guard is PLATFORM-GATED, and its probe is `dscl`. On a host without it
+# (a Linux CI runner that FORCES DISK_REAPER_PLATFORM=darwin) the real home is UNKNOWN and the guard
+# SKIPS, i.e. it fails OPEN. That state is unreachable in production (this installer manages launchd
+# only on real Darwin, where `dscl` ships with the OS), and install-launchd.sh records the same
+# residual for the same reason — but it is why the suite supplies a `dscl` SHIM: the refusal path is
+# EXERCISED on every platform instead of being skipped on CI. A test that omits the shim gets the
+# fail-open, not the refusal.
 if [ "$PLATFORM" = darwin ] && [ "${ELDATO_ALLOW_TEST_HOME:-}" != "1" ]; then
     real_home="$(dscl . -read "/Users/$(id -un)" NFSHomeDirectory 2>/dev/null | sed -n 's/^NFSHomeDirectory: //p' | head -1 || true)"
     if [ -n "$real_home" ] && [ "$HOME" != "$real_home" ]; then

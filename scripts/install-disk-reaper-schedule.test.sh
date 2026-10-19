@@ -288,8 +288,24 @@ assert_eq "$RC" "2" "T6 a SET-but-missing pass exits 2 (never a silent different
 assert_contains "$OUT" "refusing to install a job that points at a DIFFERENT copy" "T6 and says why"
 # #446: launchctl addresses the user domain BY UID, so a throwaway HOME would bootstrap a job whose
 # plist path dies with the temp dir. Refused unless a test opts in with a launchctl shim.
+# ⛔ THE REAL-HOME PROBE IS A SHIM, NOT THE HOST'S `dscl` (CI-red 2026-10-18). The installer asks
+# `dscl . -read /Users/$(id -un) NFSHomeDirectory`; Ubuntu runners have no `dscl`, so `real_home`
+# came back EMPTY, the guard SKIPPED, the install proceeded and this section went red ON CI ONLY —
+# the mac runner (and this box) has the real binary and passed. Same idiom, and same reason, as
+# scripts/install-launchd.test.sh (#446): a deterministic `/test-real-home` never equals a temp
+# HOME, so the refusal path is exercised on EVERY platform instead of being skipped on the one
+# platform nobody watches. The assertion is unchanged and still requires rc=1, the named reason,
+# and NO plist — the shim makes the guard's INPUT deterministic; it does not soften the verdict.
+cat >"$T/bin/dscl" <<'SHIM'
+#!/usr/bin/env bash
+echo "NFSHomeDirectory: /test-real-home"
+SHIM
+chmod +x "$T/bin/dscl"
+# PATH is widened for THIS invocation only: $T/bin also holds the launchctl/systemctl shims, and a
+# global PATH change would silently redirect the installer's `command -v systemctl` probes in the
+# other sections. Only `dscl` is being supplied here.
 OUT="$(HOME="$T/home-tmp" DISK_REAPER="$PASSFILE" DISK_REAPER_PLATFORM=darwin \
-    DISK_REAPER_AGENTS_DIR="$T/agents-446" LAUNCHCTL="$T/bin/launchctl" \
+    DISK_REAPER_AGENTS_DIR="$T/agents-446" LAUNCHCTL="$T/bin/launchctl" PATH="$T/bin:$PATH" \
     DISK_REAPER_PYTHON="$T/bin/fakepython" DISK_REAPER_STATE_DIR="$T/state-x" \
     bash "$INST" --install 2>&1)"; RC=$?
 assert_eq "$RC" "1" "T6 a temp-HOME launchd run is REFUSED (#446)"
