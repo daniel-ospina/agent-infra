@@ -131,6 +131,12 @@ for _v in DOCTOR_INTERVAL MERGE_INTERVAL HYGIENE_INTERVAL LOOP_TICK REAP_MIN_S R
   num_ok "${!_v}" || { printf 'FATAL: %s must be a whole number 0..999999999 (got "%s")\n' "$_v" "${!_v}" >&2; exit 2; }
 done
 case "$HYGIENE_WORKTREES" in auto|dry-run|apply) ;; *) printf 'FATAL: HYGIENE_WORKTREES must be auto|dry-run|apply (got "%s")\n' "$HYGIENE_WORKTREES" >&2; exit 2 ;; esac
+# ⛔ A zero TIMEOUT is not "no bound configured": `timeout 0` runs the command with NO timeout at
+# all, so a `=0` here silently removes the very bound the variable exists to impose, and every read
+# in this file becomes unbounded while the configuration looks deliberate. Refuse it.
+for _v in READ_CALL_TIMEOUT REAP_TIMEOUT RAIL_TIMEOUT HYGIENE_TIMEOUT CONTROLLER_START_TIMEOUT MERGE_READ_TIMEOUT; do
+  [ "${!_v}" -gt 0 ] || { printf 'FATAL: %s must be > 0 (0 disables timeout(1) entirely, so the read becomes unbounded) — got "%s"\n' "$_v" "${!_v}" >&2; exit 2; }
+done
 # The roles run IN SEQUENCE in ONE loop, so the legitimate gap between two passes of the same role is
 # not that role's own duration — it is the sum of everything that can run in between. Building each
 # stale bound from only its own role's cost made a healthy-but-busy cell read STALE (and `status`
@@ -440,6 +446,47 @@ pane_pid() {
   out="$(printf '%s\n' "$out" | head -1)"
   case "${out:-}" in ''|*[!0-9]*) printf 'NA\n' ;; *) printf '%s\n' "$out" ;; esac
 }
+# ONE bounded read of the WHOLE session list, classified once: 0 = read (names on stdout), 1 = NO
+# SERVER (an EMPTY list — the normal state of a stopped cell), 3 = the read could not be taken
+# (CANNOT-VERIFY). `has-session` cannot make that distinction: it answers rc=1 for "no such session"
+# and for every client/server error alike, so a failed read arrives as positive evidence of ABSENCE —
+# and in `run_reap` and `run_doctor` the absence branch KILLS or RESTARTS. `tmux ls` exits non-zero
+# for both conditions too, so the tool's OWN message decides it: the two benign spellings are matched
+# at the START of the line only, which is what keeps a broken BINARY (`/nonexistent/tmux: No such
+# file or directory`, rc=127) in cannot-verify instead of turning every role on a fresh box into an
+# empty list.
+# ⛔ No logging in here: this runs inside `$( )` at every call site, so a log line would become part of
+# the answer. Callers log; this function only answers.
+tmux_session_list() {
+  local out rc err
+  err="${TMPDIR:-/tmp}/cell-doctor-tmux-ls.$$"
+  out="$(bounded "$READ_CALL_TIMEOUT" "$TMUX_BIN" ls -F '#{session_name}' 2>"$err")"; rc=$?
+  if [ "$rc" -eq 0 ]; then rm -f "$err"; printf '%s\n' "$out" | sed '/^$/d'; return 0; fi
+  if grep -qiE '^(no server running|error connecting to .*\(No such file or directory\))' "$err" 2>/dev/null; then
+    rm -f "$err"; return 1
+  fi
+  rm -f "$err"
+  return 3
+}
+
+# 0 = the session is PRESENT, 1 = ABSENT, 3 = CANNOT-VERIFY (the distinction `has-session` loses).
+# ⛔ `grep -F` (LITERAL), and grep's own answer classified: `$SESSION` is unvalidated env, so a name
+# carrying an ERE metacharacter (`orch[`) made `grep -qx` exit 2 — invalid regex — which a caller
+# reading only `-eq 0`/`-eq 1` took as ABSENT and restarted; and an unescaped `.` (`orch.2`) matched a
+# live `orchX2`, so the doctor reported RUNNING for a controller that did not exist. A pattern is not
+# a name. ⛔ A HERE-STRING, never `printf … | grep -q`: the quiet grep exits at its first match, the
+# writer takes SIGPIPE, and under `set -uo pipefail` the pipeline reads non-zero — so a session that
+# IS present would answer "absent" (scripts/check-no-sigpipe-grep.sh reds the pipe form).
+session_present() {
+  local list rc
+  list="$(tmux_session_list)"; rc=$?
+  [ "$rc" -eq 0 ] || return "$rc"
+  grep -Fqx -- "$1" <<<"$list"
+  rc=$?
+  [ "$rc" -le 1 ] && return "$rc"   # 0 = present, 1 = absent
+  return 3                          # grep could not answer -> cannot-verify, never "absent"
+}
+
 attached_clients() { # prints a count, or NA when the read could not be taken
   local out
   out="$(bounded "$READ_CALL_TIMEOUT" "$TMUX_BIN" list-clients -t "=$1" 2>/dev/null)" || { printf 'NA\n'; return 0; }
@@ -487,8 +534,20 @@ subtree_cpu_secs() {
       else             { h = 0;         m = 0;         s = a[1] + 0 }
       return d * 86400 + h * 3600 + m * 60 + s
     }
-    { ppid[$1] = $2; cpu[$1] = secs($3) }
+    {
+      rows++
+      # ⛔ EVERY row of pid, ppid and `time` must match the ps shape, or the whole answer is
+      # cannot-verify. A table this code cannot parse (a truncated row, a `??:??` sentinel, a widened
+      # field) otherwise parses to 0 seconds via the `+0` coercion on BOTH observations, and two EQUAL
+      # readings are indistinguishable from a frozen subtree — so a failed READ would arrive at the
+      # reaper as evidence of a wedge. `[0-9][0-9]`, not `[0-9]{2}`: mawk 1.3.4 (the awk on a Linux
+      # cell) PANICS on the interval form inside this alternation, and a panicking awk answers nothing
+      # at all — an inert reaper on exactly the boxes it runs on.
+      if ($1 !~ /^[0-9]+$/ || $2 !~ /^[0-9]+$/ || $3 !~ /^([0-9]+-)?([0-9]+:)?[0-9]+:[0-9][0-9](\.[0-9]+)?$/) bad = 1
+      ppid[$1] = $2; cpu[$1] = secs($3)
+    }
     END {
+      if (bad || rows == 0) { print "NA"; exit }
       if (!(root in ppid)) { print "NA"; exit }
       found[root] = 1; changed = 1
       while (changed) {
@@ -526,8 +585,8 @@ human_above() { # 0 = a human is above; 1 = none; 2 = the ancestry could not be 
 
 run_reap() {
   begin_pass
-  local dry="$1" s log m0 m1 c0 c1 age now pid clients ls0 ls1 started elapsed
-  local seen=0 skipped=0 reaped=0 would=0 unverifiable=0 result=""
+  local dry="$1" s log m0 m1 c0 c1 age now pid clients ls0 ls1 started elapsed sp ha
+  local seen=0 skipped=0 reaped=0 would=0 unverifiable=0 failed=0 result=""
   note() { log "[reap] $*"; result="${result}${result:+; }$*"; }
   started="$(date +%s)"
   local names; names="$(harness_sessions)"
@@ -549,9 +608,18 @@ run_reap() {
       return 3
     fi
     log="$WORKER_LOG_DIR/$s.log"
+    # ⛔ Two different facts, and they used to be one branch: NO LOG is the documented exclusion (a
+    # lane that tees nothing cannot be judged), while a log that EXISTS but whose mtime cannot be read
+    # (a missing or broken `stat`) is a FAILED READ — counted as an exclusion it produced a green reap
+    # row on a box whose `stat` does not work.
+    if [ ! -f "$log" ]; then
+      skipped=$((skipped + 1)); note "$s SKIP no log (no progress signal)"
+      continue
+    fi
     m0="$(mtime_epoch "$log")"
-    if [ ! -f "$log" ] || [ -z "$m0" ]; then
-      skipped=$((skipped + 1)); note "$s SKIP no readable log (no progress signal)"
+    if [ -z "$m0" ]; then
+      skipped=$((skipped + 1)); unverifiable=$((unverifiable + 1))
+      note "$s SKIP cannot read the log mtime (cannot-verify)"
       continue
     fi
     age=$(( $(date +%s) - m0 ))
@@ -562,9 +630,18 @@ run_reap() {
     pid="$(pane_pid "$s")"
     if [ "${pid:-NA}" = "NA" ]; then
       # The pane pid is what the extra TERM/KILL is fenced to: without it the kill is not
-      # attributable, so this lane was NOT judged. That is cannot-verify, never a clean skip.
-      skipped=$((skipped + 1)); unverifiable=$((unverifiable + 1))
-      note "$s SKIP cannot read the pane pid (cannot-verify)"
+      # attributable, so this lane was NOT judged. That is cannot-verify, never a clean skip — UNLESS
+      # the session is GONE, which is an ANSWER (the lane ended between the two reads, the normal way
+      # a lane ends) and not a failed read. `pane_pid` cannot arbitrate (it runs `… | head -1` under
+      # `pipefail`, so it also reports SIGPIPE for a healthy multi-pane session); one classified
+      # session read can, and it is the one this file already owns.
+      sp=0; session_present "$s" || sp=$?
+      skipped=$((skipped + 1))
+      if [ "$sp" -eq 1 ]; then
+        note "$s SKIP session is gone (no pane left)"
+      else
+        unverifiable=$((unverifiable + 1)); note "$s SKIP cannot read the pane pid (cannot-verify)"
+      fi
       continue
     fi
     if [ "${pid:-0}" -le 1 ]; then
@@ -588,7 +665,18 @@ run_reap() {
       continue
     fi
     if [ "$hrc" -ne 1 ]; then
-      skipped=$((skipped + 1)); unverifiable=$((unverifiable + 1)); note "$s SKIP cannot read the process ancestry (cannot-verify)"
+      # ⛔ `ps -p <pid>` exits 1 for "no such process", which is an ANSWER, not a failed read — and it
+      # is what the walk gets when the pane's process exited between the pid read and this one. The
+      # session read says which: gone = the lane ended mid-pass (a benign skip; recording
+      # cannot-verify for every normal lane exit is the row operators learn to ignore), still listed =
+      # the walk's own answer is unreadable, which is cannot-verify.
+      sp=0; session_present "$s" || sp=$?
+      skipped=$((skipped + 1))
+      if [ "$sp" -eq 1 ]; then
+        note "$s SKIP session is gone (the pane process exited)"
+      else
+        unverifiable=$((unverifiable + 1)); note "$s SKIP cannot read the process ancestry (cannot-verify)"
+      fi
       continue
     fi
     # ── observation 1 ──
@@ -614,6 +702,18 @@ run_reap() {
       skipped=$((skipped + 1)); note "$s SKIP child is still working (cpu ${c0}s -> ${c1}s)"
       continue
     fi
+    # ⛔ A DECREASE is not "no progress" either — it is proof the two readings are not COMPARABLE.
+    # Cumulative CPU cannot shrink for a fixed process set, so a lower second reading means the
+    # subtree changed under us: a member exited during the sample (taking its seconds with it), or the
+    # bounded read was TRUNCATED at a record boundary (the measured cause of long reads on a loaded
+    # cell). Both are cannot-verify; reading the fall as "unchanged" keeps the exact false-wedge route
+    # this pass exists to remove, one branch over from the parse check — the only comparable reading is
+    # an EQUAL one.
+    if [ "${c1:-0}" -lt "${c0:-0}" ]; then
+      skipped=$((skipped + 1)); unverifiable=$((unverifiable + 1))
+      note "$s SKIP cpu went ${c0}s -> ${c1}s (the readings are not comparable, cannot-verify)"
+      continue
+    fi
     # The sampling window is where a budget is actually spent, so it is re-checked HERE: a pass that
     # has run out of its overall budget must not act on the evidence it happened to reach (§6.5.2).
     elapsed=$(( $(date +%s) - started ))
@@ -636,6 +736,22 @@ run_reap() {
     fi
     log "[reap] $s silent ${age}s, cpu ${c0}s unchanged -> killing session (pane_pid=${pid})"
     "$TMUX_BIN" kill-session -t "=$s" 2>/dev/null || true
+    # ⛔ The kill is VERIFIED before anything is recorded or signalled. Counting a failed
+    # `kill-session` as a reap writes a fix into the state record and into `status` that did not
+    # happen: the lane is still wedged and the next pass reads "reaped" as "handled". The extra
+    # TERM/KILL is skipped on that path too — a tmux refusal is a reason to report, never to signal
+    # harder.
+    sp=0; session_present "$s" || sp=$?
+    if [ "$sp" -eq 3 ]; then
+      skipped=$((skipped + 1)); unverifiable=$((unverifiable + 1))
+      note "$s SKIP kill unverified (the tmux read failed) — cannot-verify; no signal sent, not counted as reaped"
+      continue
+    fi
+    if [ "$sp" -eq 0 ]; then
+      skipped=$((skipped + 1)); failed=$((failed + 1))
+      note "$s KILL FAILED (the session is still present after kill-session) — the action did not take, not counted as reaped"
+      continue
+    fi
     # The extra TERM/KILL is fenced: only signal the pid if it still holds the incarnation whose
     # lstart we recorded. An off-fence or absent pid is an ABSTENTION, never a kill (#1178).
     ls1="$(pid_ident "$pid")"
@@ -656,8 +772,13 @@ run_reap() {
   # stays a clean rc=0 skip.
   local pass_rc=0
   [ "$unverifiable" -gt 0 ] && pass_rc=3
-  state_write reap "$pass_rc" "seen=$seen reaped=$reaped would=$would skipped=$skipped unverifiable=$unverifiable — $result"
-  log "[reap] seen=$seen reaped=$reaped would=$would skipped=$skipped unverifiable=$unverifiable"
+  # ⛔ An action that did not take is a THIRD fact, and it is not a clean pass either: a `kill-session`
+  # tmux refused leaves the lane wedged. rc=3 as well (the header's "an action it took could not be
+  # verified to have taken effect"), named separately in the record so an operator can tell an
+  # unreadable read from a refused kill.
+  [ "$failed" -gt 0 ] && pass_rc=3
+  state_write reap "$pass_rc" "seen=$seen reaped=$reaped would=$would skipped=$skipped unverifiable=$unverifiable failed=$failed — $result"
+  log "[reap] seen=$seen reaped=$reaped would=$would skipped=$skipped unverifiable=$unverifiable failed=$failed"
   return "$pass_rc"
 }
 
@@ -925,10 +1046,21 @@ for p in d:
       log "[merge] CANNOT-VERIFY: the rail could not read the merge state for #$pr (BLOCK merge_unreadable) — not a refusal, and NOT cooled down on a guess"
       result="${result}${result:+; }cannot-verify #$pr (rail merge_unreadable)"
     else
-      attempt_record "$pr" "$head" "$rc"
       local why; why="$(tail -2 "$out" 2>/dev/null | tr '\n' ' ' | cut -c1-300)"
-      log "[merge] #$pr REFUSED by the rail rc=$rc — ${why:-no output}; recorded, not retried for ${MERGE_RETRY_S}s at this head"
-      result="${result}${result:+; }REFUSED #$pr rc=$rc"
+      # ⛔ 124 = the rail was KILLED at its own bound, 126/127 = it could not be executed at all. The
+      # merge may or may not have landed and the rail never gave a verdict, so this is NOT the rail's
+      # refusal (which is DATA on a clean pass) but an action whose OUTCOME IS UNKNOWN. Recorded as a
+      # refusal it read green in `status` and suppressed the head for MERGE_RETRY_S on a guess.
+      case "$rc" in
+        124|126|127)
+          unverifiable=$((unverifiable + 1))
+          log "[merge] CANNOT-VERIFY: the rail for #$pr did not answer (rc=$rc) — ${why:-no output}; the merge may or may not have landed"
+          result="${result}${result:+; }cannot-verify #$pr (the rail did not answer, rc=$rc)" ;;
+        *)
+          attempt_record "$pr" "$head" "$rc"
+          log "[merge] #$pr REFUSED by the rail rc=$rc — ${why:-no output}; recorded, not retried for ${MERGE_RETRY_S}s at this head"
+          result="${result}${result:+; }REFUSED #$pr rc=$rc" ;;
+      esac
     fi
   done < "$parsed"
   rm -f "$parsed"
@@ -1041,7 +1173,15 @@ run_hygiene() {
     mode="$HYGIENE_WORKTREES"
     if [ "$mode" = "auto" ]; then
       mb="$(free_mb "$CELL_HOME")"
-      if [ -n "$mb" ] && [ "$mb" -lt "$((MIN_FREE_MB * 2))" ]; then mode=apply; else mode=dry-run; fi
+      if [ -z "$mb" ]; then
+        # ⛔ `free_mb`'s own comment says an empty answer is "cannot answer — never enough", and this
+        # branch used to make it mean exactly "enough": the reaper stayed in dry-run and the pass
+        # reported itself clean for ever on a box whose disk it cannot measure. The SAFE direction is
+        # kept (dry-run, never an armed sweep); the PASS is cannot-verify.
+        mode=dry-run
+        result="${result}${result:+; }CANNOT-VERIFY: cannot read the free space (the sweep stays dry-run)"
+        h_rc=3
+      elif [ "$mb" -lt "$((MIN_FREE_MB * 2))" ]; then mode=apply; else mode=dry-run; fi
     fi
     if [ "$dry" = "--dry-run" ]; then mode=dry-run; fi
     out="$O/logs/doctor-worktrees.log"
@@ -1072,6 +1212,24 @@ run_hygiene() {
     # reaper" is not a completed hygiene pass — it is cannot-verify, and it must not read as green.
     result="${result}${result:+; }CANNOT-VERIFY: worktree reaper (pi-reap-worktrees.sh) not found"
     h_rc=3
+  fi
+  # ⛔ A REHEARSAL IS NOT A VERDICT. `--dry-run` is the verb an operator is told to run FIRST, and it
+  # performs no action at all (the prune and both sweeps are logged as WOULD), so it cannot know
+  # whether the previous failure is fixed. Recording its own rc overwrote a `cannot-verify` with a
+  # clean row, and the row-level verdict then read that as health for a whole interval (measured: a
+  # pass recording `uv prune FAILED rc=1` — status rc=1 — followed by `hygiene --dry-run` gave
+  # `last_rc=0`, status rc=0). The rehearsal is RECORDED AS ONE and keeps the WORSE of (previous
+  # verdict, its own): keeping only the previous verdict fails the other way — a rehearsal that itself
+  # hit cannot-verify (an unreadable session list, an unreadable disk) would record a clean row for the
+  # very "box is wedged, operator runs the documented first verb" case — and an unreadable previous
+  # verdict is fail-closed at rc=3.
+  if [ "$dry" = "--dry-run" ]; then
+    local prev; prev="$(state_get hygiene last_rc)"
+    case "${prev:-}" in ''|*[!0-9]*) prev=3 ;; esac
+    [ "$h_rc" -gt "$prev" ] && prev="$h_rc"
+    state_write hygiene "$prev" "dry-run (a rehearsal, no action taken): $result"
+    log "[hygiene] dry-run: $result"
+    return "$h_rc"
   fi
   state_write hygiene "$h_rc" "$result"
   log "[hygiene] $result"
@@ -1106,7 +1264,20 @@ run_doctor() {
     # a cannot-verify result (the invariant this function states four lines below).
     state_write doctor "$rrc" "not-started; $result"; return "$rrc"
   fi
-  if "$TMUX_BIN" has-session -t "=$SESSION" 2>/dev/null; then
+  # ⛔ `session_present`, not `has-session`: the ABSENT branch below RESTARTS the controller, so a
+  # failed tmux read must never become evidence of absence. `has-session` answers rc=1 both for "no
+  # such session" and for every client/server error, so a blind read restarted a live cell's
+  # controller and reported `controller RESTARTED` from a read that proved nothing.
+  local csp=0
+  session_present "$SESSION" || csp=$?
+  if [ "$csp" -eq 3 ]; then
+    log "[doctor] CANNOT-VERIFY: the controller session '$SESSION' could not be read — NOT restarting (a restart decided from a failed read answers a question nobody asked); the reap above and the independent merge role continue"
+    result="$result; controller cannot-verify (the tmux read failed)"
+    state_write doctor 3 "$result"
+    log "[doctor] $result"
+    return 3
+  fi
+  if [ "$csp" -eq 0 ]; then
     hb="$(cat "$O/heartbeat" 2>/dev/null)"
     case "${hb:-}" in ''|*[!0-9]*) hb=0 ;; esac
     if [ "$hb" -gt 0 ]; then
@@ -1225,6 +1396,13 @@ role_row() { # <role> <stale-bound-seconds>
   # the restart failed" (doctor rc=1) or "I could not read the lanes" (reap rc=3) used to print here
   # and still exit 0, which is the false green this verb exists to remove. The next CLEAN pass clears
   # it, so a transient failure reads as one failing pass, not as a dead cell.
+  # ⛔ An UNREADABLE verdict is not a clean one. `${rc:-0}` made a record whose `last_rc` is missing or
+  # non-numeric (a truncated write, a hand-edited state file) read as a CLEAN pass — the row printed
+  # `rc=?` and the verb exited 0, so a probe saw health where nothing was known. Fail closed instead:
+  # the same "cannot-verify is never a pass" direction every other read in this file takes.
+  case "${rc:-}" in
+    ''|*[!0-9]*) printf '%-8s FAILED    the record holds no readable rc (cannot-verify)\n' "$role"; return 1 ;;
+  esac
   case "${rc:-0}" in
     0) ;;
     *) printf '%-8s FAILED    last pass rc=%s (the pass did not complete)\n' "$role" "${rc:-?}"; return 1 ;;
