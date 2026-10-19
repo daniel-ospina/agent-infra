@@ -495,9 +495,12 @@ claim_orphan_reason() {
     # ⛔ AND "A HYPHEN" IS NOT THE TEST (P2, cycle-16 review): `*-*` also matched the BARE ISSUE KEY
     # `issue-<N>` that `claim_issue_key` prints, so `claim_orphan_reason "host:<dead pid>" "issue-1234"`
     # returned ORPHANED — the PR-only rule judging an ISSUE claim, i.e. exactly the shared-barrier window
-    # this arm exists to close, one caller away. The shapes are matched POSITIVELY now: an ISSUE key
-    # (with or without the `refs/claims/` prefix) abstains, and a PR ref must be `…<pr>-<sha12>`.
-    *issue-*) return 1 ;;
+    # this arm exists to close, one caller away. The shapes are matched POSITIVELY now: an ISSUE key is a
+    # PASS-THROUGH (`:`), not an abstention — it skips only the PID arm and still reaches the HOST rules
+    # below, so a prefixed and a bare issue key give the SAME verdict (cycle-17 review: `return 1` here
+    # made `issue-999` abstain where `refs/claims/issue-999` reclaimed an orphaned claim). A PR ref must
+    # be `…<pr>-<sha12>`; anything else abstains.
+    *issue-*) : ;;
     *[0-9]*-*)
       # ⛔ A FORMER NAME OF THIS BOX IS *THIS MACHINE*, SO ITS PID IS PROBEABLE TOO (P0, cycle-7
       # review). The gate used to be `host == claim_host`, so immediately after a rename a PR claim

@@ -93,10 +93,10 @@
 #      below the review window it must outlive — a mid-review expiry, the duplicate this registry
 #      exists to prevent — and leaves nothing to diagnose.
 # ⛔ LABELLING HONESTY — MEASURED, not asserted. `CLAIMS_SH=<pre-change claims.sh> bash
-# claim-orphan.test.sh` (2026-10-19, the claims.sh blob main carries — 228233d == 2ddd5b5a, blob
-# d1604686) reports **53 passed, 61 FAILED** of 114 checks. Broken down by label, on that tree:
-#   • [RED→GREEN]  53 checks — 0 pass, 53 fail. EVERY one is red before the change. (Non-vacuity.)
-#   • [PINNED]      44 checks — 38 pass, 6 fail. The 38 pass VACUOUSLY, because the machinery is
+# claim-orphan.test.sh` (2026-10-19, origin/main's claims.sh blob d1604686) reports **54 passed, 68
+# FAILED** of 122 checks. Broken down by label, on that tree:
+#   • [RED→GREEN]  60 checks — 0 pass, 60 fail. EVERY one is red before the change. (Non-vacuity.)
+#   • [PINNED]      45 checks — 39 pass, 6 fail. The 39 pass VACUOUSLY, because the machinery is
 #     absent pre-fix (`claim_orphan_reason` does not exist and nothing reaped by a host rule at all),
 #     so assertions of the form "does NOT delete" / "abstains" hold for free. They are labelled PINNED
 #     rather than RED→GREEN for exactly that reason: they guard a NEW fail-open, they are not
@@ -364,11 +364,25 @@ echo
 echo "── O9: an unparseable lease stays LIVE even when the owner host looks orphaned ─────"
 as_box "$ORIG5" localbox 'c="$(_claim_commit "localbox:999995" 0)"
   _git push -q origin "$c:refs/claims/issue-9209408" 2>/dev/null; printf "PUSHED=%s\n" "$?"' >/dev/null
-NOLEASE="$(as_box "$ORIG5" localbox 'claim_issue_acquire "" 9209408 >/dev/null 2>&1
+# ⛔ THE OWNER HOST MUST BE ONE THE RULES ACTUALLY JUDGE (P1, cycle-17 review). `localbox` is a seam
+# name with no `claim-hosts` entry, no deny-list entry and no roster, so nothing could have called this
+# claim orphaned: the case passed pre-fix, at head, AND under a mutation that let the acquire's orphan
+# arm run for an unparseable lease (measured — it reclaimed the claim with rc=0 while the suite stayed
+# green). The host is now on the DEAD list, so the ONLY thing keeping the claim LIVE is the guard this
+# case names, and the control below proves the same arm still reclaims a PARSEABLE expired lease.
+NOLEASE="$(as_box "$ORIG5" localbox 'CLAIM_DEAD_HOSTS=localbox claim_issue_acquire "" 9209408 >/dev/null 2>&1
   printf "RC=%s\nRESULT=%s\n" "$?" "${CLAIM_RESULT:-}"')"
 NOLRES="$(field "$NOLEASE" RESULT)"
 [ "$(field "$NOLEASE" RC)" = "1" ]; NOL_RC=$?
-ck "O9 [PINNED] a claim with no parseable lease reads LIVE, not orphaned ('$NOLRES')" $NOL_RC
+ck "O9 [RED→GREEN] an UNPARSEABLE lease reads LIVE even when the owner host is on the DEAD list ('$NOLRES')" $NOL_RC
+# CONTROL: the same host, the same deny list, a PARSEABLE expired lease — the orphan arm DOES reclaim it,
+# so a mutation that skips the unparseable guard for orphaned hosts reddens the pair.
+PARSEABLE="$(as_box "$ORIG5" localbox 'c="$(_claim_commit "localbox:999994" "1000000000")"
+  _git push -q --force origin "$c:refs/claims/issue-9209409" 2>/dev/null
+  CLAIM_DEAD_HOSTS=localbox claim_issue_acquire "" 9209409 >/dev/null 2>&1
+  printf "RC=%s\nRESULT=%s\n" "$?" "${CLAIM_RESULT:-}"')"
+[ "$(field "$PARSEABLE" RC)" = "0" ]; O9C_RC=$?
+ck "O9 [PINNED] ... while a PARSEABLE expired lease on the same DEAD host IS reclaimed (rc=$(field "$PARSEABLE" RC))" $O9C_RC
 
 # ══ O2/O3: claim_prune reaps by ORPHANED HOST as well as by EXPIRY ══
 echo
@@ -607,9 +621,20 @@ ck "O14 [RED→GREEN] the clamp message names the ceiling knob to raise" $?
 echo
 echo "── O16: claim_live() treats an ORPHANED PR claim as not in flight ─────────────────"
 O16="$T/cl16"; mkdir -p "$O16/state"
-sed -n '/^claim_live() {/,/^}/p' "$LOOP" > "$O16/claimlive.sh"
-[ -s "$O16/claimlive.sh" ] && grep -q 'claim_live()' "$O16/claimlive.sh"
-ck "O16 (setup) claim_live() is extractable from the shipped orch-loop.sh" $?
+# ⛔ EXTRACT EVERY FUNCTION THE READERS CALL (cycle-17 review). origin/main's #2129 split the old
+# `claim_live` into a thin spawn guard over `claim_lease_live`, and moved OWNERSHIP to
+# `claim_foreign_live`; extracting `claim_live` alone yielded a stub whose only callee did not exist,
+# so every case below measured "NOTLIVE" for the wrong reason. The orphan arm itself now lives in
+# `claim_lease_live` (the shared lease reader), which is where #2094's PR half belongs.
+{
+  sed -n '/^claim_lease_live() {/,/^}/p' "$LOOP"
+  sed -n '/^_this_host() {/,/^}/p' "$LOOP"
+  sed -n '/^claim_live() {/,/^}/p' "$LOOP"
+  sed -n '/^claim_foreign_live() {/,/^}/p' "$LOOP"
+} > "$O16/claimlive.sh"
+[ -s "$O16/claimlive.sh" ] && grep -q 'claim_lease_live()' "$O16/claimlive.sh" \
+  && grep -q 'claim_foreign_live()' "$O16/claimlive.sh"
+ck "O16 (setup) the readers are extractable from the shipped orch-loop.sh" $?
 printf '%s\n' "boxOldName" > "$O16/state/claim-hosts"
 snap() { printf '%s\t%s\t%s\n' "$1" "$2" "$3" > "$O16/state/claims-snapshot"; }
 cl() { # <pr> <sha> [KEY=VAL ...]
@@ -663,6 +688,25 @@ O16G="$( cd "$T" || exit 1; O="$O16"; export O; . "$O16/claimlive.sh"
 [ "$O16G" = "LIVE" ]
 O16G_RC=$?
 ck "O16 [PINNED] with no claims.sh loaded the orphan arm is INERT and the lease polarity decides (got '$O16G')" $O16G_RC
+# ⛔ AND THE OWNERSHIP READER MUST AGREE (agent-infra#2094 on origin/main's #2129). `pr_owned` calls
+# `claim_foreign_live`, NOT `claim_live`, so an orphan arm that only reached the spawn guard left the PR
+# half of the incident open: after a rename the box's own PR claim kept the PR OUT of the un-owned
+# queue for its whole term. `claim_foreign_live` consults `claim_orphan_reason` before the lease now.
+clf() { # <pr> <sha> — 0 when a LIVE claim is held by another box
+  ( cd "$T" || exit 1
+    O="$O16"; CLAIM_STATE_DIR="$O16/state"; CLAIM_REPO="$T/repo"
+    export O CLAIM_STATE_DIR CLAIM_REPO
+    . "$CLAIMS_SH" || exit 1
+    . "$O16/claimlive.sh" || exit 1
+    if claim_foreign_live "$1" "$2"; then echo OWNED; else echo FREE; fi ) 2>&1
+}
+snap refs/claims/9209470-0123456789ab "boxOldName:$DEADPID16" "$FUT"
+[ "$(clf 9209470 $SHA16)" = "FREE" ]
+ck "O16 [RED→GREEN] claim_foreign_live() does NOT count an ORPHANED PR claim as ownership (the PR re-enters the queue)" $?
+snap refs/claims/9209471-0123456789ab "peerBox:$DEADPID16" "$FUT"
+# (REAL24 is defined in the O24 section further down; this section runs first, so probe inline.)
+[ "$(CLAIM_KNOWN_HOSTS="$(hostname -s) peerBox" clf 9209471 $SHA16)" = "OWNED" ]
+ck "O16 [PINNED] ... while a KNOWN live peer's claim still reads OWNED (no steal from the queue)" $?
 
 # ══ O17: the RECORDER writes — the positive half of the former-name rule ══
 # ⛔ O10 SEEDS `claim-hosts` BY HAND AND `as_box` ALWAYS SETS THE SEAM, so until this section existed the
@@ -1117,6 +1161,43 @@ O24G="$(
   printf "RC=%s\n" "$?" )"
 [ "$(field "$O24G" RC)" = "0" ]; O24G_RC=$?
 ck "O24 [PINNED] an explicit CLAIM_DEAD_HOSTS=box still reaps the sentinel (rc=$(field "$O24G" RC))" $O24G_RC
+
+echo
+echo "── O25: the PID arm is matched on the ref SHAPE, and the host rules still run for issue keys ──"
+# ⛔ P1, cycle-17 review: the two shape arms were pinned by NOTHING — reverting `*[0-9]*-*` to `*-*` and
+# deleting the `*issue-*` arm left the suite green while restoring the defect: the PR-only pid rule
+# judging an ISSUE key (`issue-1234`) and opening the shared-barrier window it exists to close. The
+# three-way contrast below is what makes the shapes load-bearing.
+SHAPE() { # SHAPE <ref> [<owner>] [<CLAIM_DEAD_HOSTS>]
+  CLAIM_REPO="$T/repo"; CLAIM_STATE_DIR="$T/cl25"
+  CLAIM_DEAD_HOSTS="${3:-}"
+  export CLAIM_REPO CLAIM_STATE_DIR CLAIM_DEAD_HOSTS
+  mkdir -p "$CLAIM_STATE_DIR"
+  . "$CLAIMS_SH" || exit 1
+  r="$(claim_orphan_reason "${2:-$REAL24:$DEADPID16}" "$1")"
+  printf "RC=%s\nR=[%s]\n" "$?" "$r"
+}
+# (a) a BARE issue key must NOT take the pid arm (the host is this box, the pid is gone — the pid rule
+#     would say ORPHANED; an issue key must abstain from it and fall through to the host rules).
+O25A="$(SHAPE 'issue-9209800')"
+[ "$(field "$O25A" RC)" = "1" ]; O25A_RC=$?
+ck "O25 [RED→GREEN] a BARE issue key never takes the pid arm (rc=$(field "$O25A" RC))" $O25A_RC
+# (b) an unrecognised hyphenated ref abstains too.
+O25B="$(SHAPE 'refs/claims/pr-abc')"
+[ "$(field "$O25B" RC)" = "1" ]; O25B_RC=$?
+ck "O25 [RED→GREEN] an unrecognised hyphenated ref abstains (rc=$(field "$O25B" RC))" $O25B_RC
+# (c) the PR shape DOES take it — the control that keeps the arm alive.
+O25C="$(SHAPE 'refs/claims/9209801-0123456789ab')"
+[ "$(field "$O25C" RC)" = "0" ]; O25C_RC=$?
+ck "O25 [RED→GREEN] a PR ref DOES take the pid arm (rc=$(field "$O25C" RC))" $O25C_RC
+# (d) AND the issue key still reaches the HOST rules: both forms of the key must agree on an orphaned
+#     host (cycle-17 P2 — `return 1` in that arm made the bare form abstain where this form reclaimed).
+O25D="$(SHAPE 'refs/claims/issue-9209802' 'peerQ:4242' 'peerQ')"
+O25E="$(SHAPE 'issue-9209802' 'peerQ:4242' 'peerQ')"
+[ "$(field "$O25D" RC)" = "0" ] && [ "$(field "$O25E" RC)" = "0" ]; O25D_RC=$?
+ck "O25 [RED→GREEN] prefixed and BARE issue keys agree on an orphaned host (prefixed rc=$(field "$O25D" RC), bare rc=$(field "$O25E" RC))" $O25D_RC
+case "$(field "$O25E" R)" in *DEAD_HOSTS*) O25F_RC=0 ;; *) O25F_RC=1 ;; esac
+ck "O25 [RED→GREEN] the BARE issue key's verdict comes from the HOST rules ('$(field "$O25E" R)')" $O25F_RC
 
 echo
 echo "─────────────────────────────────────────────────────────────"
