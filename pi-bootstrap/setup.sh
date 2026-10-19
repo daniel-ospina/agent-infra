@@ -396,7 +396,8 @@ fi
 # The same applies one directory over, to the `state/`-resident dependencies of the farmed consumers.
 # The farm NEVER creates or copies into `$DEST/state/` — no `mkdir` and no `cp` target it anywhere in
 # this file (measured at #1899) — so these are broken on every fresh farm. #1899's derivation found
-# FIVE of them, not three:
+# FIVE of them; agent-infra#1874 then retired the lane-table dispatcher, which took TWO of the five
+# out of the class with their only readers. The THREE that remain are the live class:
 #   * `state/lane-confirm.py`  — read FAIL-SILENTLY (a non-zero exit is read as "screened, not
 #                                stalled"; see the filed #1797); exec'd through a hardcoded
 #                                /Users/<owner>/ absolute path at orchestrator-heartbeat.sh:336.
@@ -405,17 +406,19 @@ fi
 #   * `state/lane-verdict.py`  — the verdict-KEY LOADER (`lane-actions.py:80,1530`); absent it
 #                                degrades to `RULE` silently. Found by #1899's derivation, disclosed
 #                                to the #1552 umbrella.
-#   * `state/queues/claim.py`  — #1874 retired the lane-table dispatcher (`queue-dispatch.py`), which
-#                                was this file's ONLY LOUD reader (`claim_next()` raising
-#                                `QueueReadError`); nothing reads it now, so its RELEASE paths'
-#                                ignored result (`free`/`done`) is the whole remaining contract.
-#                                Untracked per #1567.
-#   * `state/queues/refresh-queues.py` — the queue REFRESH (`heartbeat-loop.sh:415`, non-fatal:
-#                                `|| echo "queue refresh failed (non-fatal; dispatcher uses the last
-#                                known-good queue)"`), so a fresh farm silently keeps refreshing
-#                                nothing. Untracked per #1567.
-# That leaves TWO of the five read FAIL-SILENTLY and therefore invisible when absent
-# (`lane-confirm.py`, `lane-triage.py`) — the state the #1874 review had to reason about.
+# ALL THREE of those fail SILENTLY — two by swallowing the error, one by degrading to a default — so
+# an absent file is invisible in every case. That is why this class is tracked at all.
+# RETIRED FROM THE CLASS by #1874 (the file stays on disk; nothing execs it, so nothing is owed):
+#   * `state/queues/claim.py`          — its ONLY reader was the retired dispatcher's `claim_next()`
+#                                        (`QueueReadError`, the one LOUD read in this class). Its
+#                                        RELEASE paths (`free`/`done`) always ignored their result;
+#                                        with the dispatcher gone that is the whole remaining
+#                                        contract. Was untracked per #1567.
+#   * `state/queues/refresh-queues.py` — its only exec site was the beat's queue-refresh step, removed
+#                                        in the same landing (the queue existed to feed the
+#                                        dispatcher). Was untracked per #1567.
+# Both left `LANE_PRODUCERS_STATE_RESIDUAL` with their readers: an entry there for a producer nobody
+# execs is STALE, and the guard's stale check FAILS on it (`test-setup-no-nesting.sh`).
 # None of the five is in any farm list, and `test-setup-no-nesting.sh` names each with its owning
 # issue so the class cannot grow a silent member.
 # ⛔ Keep this assignment on ONE line: `scripts/ci_runner_gate.test.sh` reads it with

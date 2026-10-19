@@ -96,6 +96,7 @@ _NON_DISPATCH_STEPS = frozenset({
     "beat-pair.sh",              # SOURCED into the beat's shell (beat-pair helpers), not launched
     "lib",                        # sourced helper directory (`$SCRIPTS/lib/...`)
 })
+_ASSIGNMENT_RUNS = re.compile(r"\$\(|`")
 _DISPATCH_STEP = "pr-doctor.py"
 # The EXACT detached launch the beat must use: a subshell, `nohup`, the absolute interpreter, the
 # script path from `$SCRIPTS`, NO ARGUMENTS, NO ENV PREFIX (`MAX_FIX=0 ...`), and the line
@@ -104,11 +105,28 @@ _DISPATCH_STEP = "pr-doctor.py"
 _DISPATCH_LAUNCH = re.compile(
     r'^\(\s*nohup\s+/usr/bin/python3\s+"\$SCRIPTS/pr-doctor\.py"\s*\\$')
 # The ARM guard, pinned in its exact polarity: the kill file ABSENT is what makes the launch
-# reachable. `-f` is the inverted form the tests must refuse (see the note on the test).
+# reachable. `-f` is the inverted polarity, refused STRUCTURALLY — on the condition that encloses
+# the launch, read from `_enclosing_constructs` — never by matching this text anywhere in the file:
+# the beat legitimately tests the same file to REPORT a disarmed dispatcher (#1933), and a text
+# match graded that status branch as an inverted launch guard (measured 2026-10-19).
 _DISPATCH_GUARD = 'if [ ! -f "$STATE/PR-DOCTOR-OFF" ]; then'
-_DISPATCH_GUARD_INVERTED = re.compile(r'^if\s+\[\s+-f\s+"\$STATE/PR-DOCTOR-OFF"\s+\];\s*then$')
+_DISPATCH_GUARD_INVERTED = re.compile(r'^\[\s*-f\s+"\$STATE/PR-DOCTOR-OFF"\s*\]$')
 # The ONLY constructs allowed to enclose the launch: the pass loop and the three guards that make
 # the launch both armed and single-instance. See `_enclosing_constructs`.
+# ⛔ AN EARLY `continue` IS THE ONE SHAPE THAT DEFEATS EVERY OTHER REACHABILITY CHECK AT ONCE
+# (measured 2026-10-19, adversarial review): `if [ -f "$STATE/pr-doctor.status.json" ]; then
+# continue; fi` inserted just BEFORE the arm guard keeps the launch byte-identical; it opens AND
+# closes its own construct (so `_enclosing_constructs` still returns exactly the pinned list), it
+# sits deeper than the pass body (so an indentation-filtered skip scan never looks at it), and its
+# condition contains a `$` (so the literal-condition check is silent). `pr-doctor.py` writes that
+# sidecar on EVERY exit path, so the branch is true from the second pass on: the beat stops
+# dispatching and keeps reporting healthy passes.
+# So the control transfers that may appear between the pass header and the launch are PINNED, each
+# with the construct it sits in. Any new `exit`/`continue`/`break`/`return` there — any
+# indentation, any construct, including a brace group — changes this list and reads as RED.
+_ALLOWED_EARLY_TRANSFERS = [
+    ("exit 0", (("loop", "while :"), ("if", '[ -f "$STATE/HEARTBEAT-OFF" ]'))),
+]
 _DISPATCH_ENCLOSING = [
     ("loop", "while :"),
     ("if", '[ ! -f "$STATE/PR-DOCTOR-OFF" ]'),
@@ -291,6 +309,58 @@ def _enclosing_constructs(path: pathlib.Path, needle: str):
     return None
 
 
+def _early_transfers(path: pathlib.Path, needle: str):
+    """Every control transfer between the pass header and `needle`, with its enclosing constructs.
+
+    The construct stack is maintained exactly as `_enclosing_constructs` does, but a transfer is
+    recorded WHEREVER it sits — including inside a construct that opens and closes before the
+    launch, which is the shape that makes the enclosing-stack assertion blind to it.
+    """
+    out = []
+    stack: list[tuple[str, str]] = []
+    started = False
+    for line in _executable_raw(path):
+        s = line.strip()
+        if not started:
+            if s != "while :; do":
+                continue
+            started = True
+            stack.append(("loop", "while :"))
+            continue
+        if needle in s:
+            return out
+        transfer = re.match(r"^(?:\{\s*)?((?:exit|continue|break|return)\b.*?)(?:;\s*\})?$", s)
+        if transfer:
+            out.append((transfer.group(1), tuple(stack)))
+        if _CLOSER.match(s):
+            if stack:
+                stack.pop()
+            continue
+        opened = None
+        m = _OPEN_CASE.match(s)
+        if m:
+            opened = ("case", m.group(1))
+        else:
+            m = _OPEN_FUNC.match(s)
+            if m and "}" not in s[m.end():]:
+                opened = ("func", m.group(1))
+            else:
+                m = _OPEN_LOOP.match(s)
+                if m:
+                    opened = ("loop", "%s %s" % (m.group(1), m.group(2)))
+                else:
+                    m = _OPEN_FOR.match(s)
+                    if m:
+                        opened = ("for", m.group(1))
+                    else:
+                        m = _OPEN_IF.match(s)
+                        if m and not re.search(r";\s*fi$", s):
+                            opened = ("if", m.group(1))
+        if opened:
+            stack.append(opened)
+    return None
+
+
 # `if`/`elif` conditions. `while`/`until` are handled separately: `while :; do` is this file's
 # main loop, so a literal condition is only suspicious there when it is `false`/`true`.
 _IF_CONDITION = re.compile(r"^(?:if|elif)\s+(.+?)(?:\s*;\s*then\b|$)")
@@ -413,7 +483,14 @@ def _rearming_files() -> list[pathlib.Path]:
                 hits.append(p)
         elif suffix in (".sh", ".bash") or not suffix:
             if p.name.endswith(".test.sh"):
-                if _invokes_retired(text):
+                # ⛔ A `.test.sh` IS A SHELL SCRIPT CI RUNS, so it is graded like one AND for a
+                # command shape. Grading it on the command shape ALONE (an earlier revision) let a
+                # test file `cp` the retired file out of `retired/` and run the copy, and let
+                # `python3 …/retired/queue-dispatch.py --apply` pass because `_invokes_retired`
+                # skips any line naming `retired/` — that skip exists so a DOC can assert the
+                # retired location, and it does not apply to a line that executes it (both
+                # measured 2026-10-19 by an adversarial review).
+                if _invokes_retired(text) or any(_mentions(l) for l in _executable_lines(p)):
                     hits.append(p)
             elif any(_mentions(l) for l in _executable_lines(p)):
                 hits.append(p)
@@ -543,11 +620,6 @@ def test_the_beat_still_runs_the_surviving_dispatcher():
         "the beat no longer contains the guard %r as its own line. That line is what ARMS the "
         "dispatch (the kill file ABSENT); pinning it is what makes the launch reachable."
         % _DISPATCH_GUARD)
-    inverted = [l for l in lines if _DISPATCH_GUARD_INVERTED.match(l)]
-    assert inverted == [], (
-        "the dispatch's disarm guard is INVERTED (%r): with `-f`, pr-doctor runs only when an "
-        "operator has disarmed it, so the beat dispatches nothing in its normal state."
-        % inverted)
     # ⛔ THE REACHABILITY ASSERTION — STRUCTURAL, NOT A SPELLING MATCH. Whatever encloses the
     # launch must be EXACTLY the pass loop and the three guards below. A new `if`/`elif`/`while`/
     # `until`/`for`/`case`/function — an env feature flag (`if [ -n "${PR_DOCTOR_ENABLE}" ]`), a
@@ -555,6 +627,19 @@ def test_the_beat_still_runs_the_surviving_dispatcher():
     # construct to this list and reds, whatever its condition says. Five cycles of denylisting
     # spellings each lost the next one; this does not have spellings.
     constructs = _enclosing_constructs(_BEAT, _DISPATCH_STEP)
+    # ⛔ THE DISARM POLARITY IS GRADED ON THE CONSTRUCT THAT ENCLOSES THE LAUNCH, NOT ON THE FILE.
+    # (Rebase onto agent-infra#1933, measured 2026-10-19.) The beat now ALSO tests `PR-DOCTOR-OFF` to
+    # REPORT a disarmed dispatcher — `if [ -f "$STATE/PR-DOCTOR-OFF" ]; then printf 'PR-DOCTOR
+    # DISARMED …'` — which is a status branch, not a launch guard. A whole-file text scan reads that
+    # reporting line as the arm guard inverted and reds a beat whose launch is correctly armed, so
+    # the reading is taken from `_enclosing_constructs` (the same source as the reachability
+    # assertion below) instead of from the file's text.
+    inverted = [c for (kind, c) in (constructs or [])
+                if kind == "if" and _DISPATCH_GUARD_INVERTED.match(c)]
+    assert inverted == [], (
+        "the dispatch's disarm guard is INVERTED (%r): with `-f`, pr-doctor runs only when an "
+        "operator has disarmed it, so the beat dispatches nothing in its normal state."
+        % inverted)
     assert constructs == _DISPATCH_ENCLOSING, (
         "the dispatch launch is enclosed by %r — expected exactly %r. Anything else here is a "
         "branch, loop, case or function that can make the launch unreachable while the pinned text "
@@ -565,20 +650,18 @@ def test_the_beat_still_runs_the_surviving_dispatcher():
         "the dispatch launch is inside the shell function(s) %r. A function that is never called "
         "keeps the pinned text and dispatches nothing — exactly the no-op this file refuses."
         % wrapped)
-    # And the pass must not be EXITED or restarted before it reaches the launch: `exit 0` /
-    # `continue` in the pass body is a control-flow skip that no branch-shaped check can see
-    # (measured: one `continue` before the PR-DOCTOR marker, 13 green, beat dispatches nothing).
-    raw = _executable_raw(_BEAT)
-    header = next(i for i, l in enumerate(raw) if l.strip() == "while :; do")
-    launch_idx = next(i for i, l in enumerate(raw) if _DISPATCH_LAUNCH.match(l.strip()))
-    base_indent = len(raw[header]) - len(raw[header].lstrip()) + 2
-    skip = [l.strip() for l in raw[header:launch_idx]
-            if (len(l) - len(l.lstrip())) == base_indent
-            and re.match(r"^(?:exit|continue|break|return)\b", l.strip())]
-    assert skip == [], (
-        "the pass body leaves before the dispatch (%r): a `continue`/`exit`/`break`/`return` at the "
-        "pass's own indentation makes the launch unreachable while every pinned string survives."
-        % skip)
+    # And the pass must not be EXITED or skipped before it reaches the launch. Graded as a PINNED
+    # LIST rather than as an indentation-filtered search: the `if …; then continue; fi` shape closes
+    # before the launch, so it never enters the enclosing stack, and its indent is not the pass's own
+    # (measured 2026-10-19 — 13 green on a beat that never dispatches again).
+    transfers = _early_transfers(_BEAT, _DISPATCH_STEP)
+    assert transfers is not None, "the launch was not found while walking the pass — see above"
+    assert transfers == _ALLOWED_EARLY_TRANSFERS, (
+        "the pass contains control transfer(s) before the dispatch that are not declared: %r — "
+        "expected exactly %r. A `continue`/`exit`/`break`/`return` anywhere between the pass header "
+        "and the launch makes it unreachable while every pinned string survives; if the new transfer "
+        "is legitimate, declare it in _ALLOWED_EARLY_TRANSFERS deliberately."
+        % (transfers, _ALLOWED_EARLY_TRANSFERS))
 
 
 def _sourced_libs() -> list[pathlib.Path]:
@@ -617,7 +700,9 @@ def test_the_beat_cannot_zero_the_dispatch_capacity_it_launches():
         "the sourced-lib scan found nothing — the beat sources its beat-pair lib, so a scan that "
         "examined only the beat must not read as clean")
     bad = ["%s: %s" % (p.name, l) for p in sources for l in _executable_lines(p)
-           if re.search(r"\bMAX_(FIX|REVIEW)\s*=", l)]
+           if re.search(r"\bMAX_(FIX|REVIEW)\s*=", l)
+           # `printf -v MAX_FIX '%s' 0` is the same assignment with no `=` (measured 2026-10-19).
+           or re.search(r"\bprintf\s+-v\s+MAX_(FIX|REVIEW)\b", l)]
     assert bad == [], (
         "the dispatch capacity is assigned on %r. pr-doctor reads MAX_FIX/MAX_REVIEW from the "
         "environment and accepts 0, so this silently empties every pass while the beat reports a "
@@ -660,8 +745,18 @@ def test_pr_doctor_is_the_only_dispatch_step_the_beat_launches():
     """
     launched = set()
     for line in _executable_lines(_BEAT):
-        if re.match(r"^[A-Z_][A-Z0-9_]*=", line):
-            continue                     # an assignment (`SCRIPTS="$HOME/.../scripts"`) is not a launch
+        if re.match(r"^(?:export\s+)?[A-Z_][A-Z0-9_]*=", line) and not _ASSIGNMENT_RUNS.search(line):
+            # An assignment (`SCRIPTS="$HOME/.../scripts"`) is not a launch. `export` is the same
+            # assignment: the beat sets `export O="${O:-$HOME/orchestrator}"` (agent-infra#1988),
+            # whose default is a DIRECTORY, and a scan that read it as a step enumerated the
+            # basename `orchestrator` as an undeclared launch (measured 2026-10-19 on the rebase).
+            #
+            # ⛔ BUT A VALUE THAT COMMANDS IS NOT AN ASSIGNMENT, and `NAME=…` is how a step hides
+            # from this enumeration: `export LANE_FEED="$(/usr/bin/python3 "$SCRIPTS/lane-feed.py"
+            # --apply)"` ran a second dispatcher with every test green (measured 2026-10-19). A
+            # command substitution or a backtick in the value means the line EXECUTES, so it is
+            # enumerated like any other line instead of skipped.
+            continue
         # Quote-strip first: `"$SCRIPTS"/"lane-feed.py"` is the same path with the quotes moved,
         # and it defeated a regex that required the basename to follow the slash directly
         # (measured). `$HOME/.pi/agent/scripts` is the same directory as `$SCRIPTS` — the beat

@@ -587,6 +587,13 @@ while :; do
   #    manual-only by design from its first commit — "run this BEFORE sending anything" — and this
   #    step never invoked it.)
   #
+  #    ⛔ ONE THING THIS RETIREMENT ORPHANS WITHOUT A CONSUMER, recorded here rather than left to be
+  #    discovered: `pr-doctor.py` still PUBLISHES `issue_work` in its status sidecar — the "owned
+  #    PRs first, then new issue work" rule, measured from live ownership — and the retired
+  #    dispatcher was its only reader (`scripts/test_queue_dispatch.py`, deleted with the dispatcher
+  #    because it tested that reader). The RULE is a product decision and stays; its enforcement
+  #    moves to agent-infra#2129 (the PR-first selection), which is where it is proved now.
+  #
   #    RETIRED WITH IT: the `refresh-queues.py` step (the queue existed to feed this step; it is
   #    gh-latency-bound and was a per-pass cost against #1910's secondary rate limit) and the dead
   #    queue-count reads in cadence-nudge.sh. The queue FILES stay on disk for the record; nothing
@@ -611,19 +618,25 @@ while :; do
   #        #   (that is `LOG` at the top of this file; there is no `heartbeat-loop.log`), then:
   #        cp scripts/heartbeat-loop.sh ~/.pi/agent/scripts/heartbeat-loop.sh.new \
   #          && mv ~/.pi/agent/scripts/heartbeat-loop.sh.new ~/.pi/agent/scripts/heartbeat-loop.sh \
-  #          && rm -f ~/.pi/agent/scripts/queue-dispatch.py \
+  #          && bash pi-bootstrap/setup.sh \
   #          && rm -f ~/.pi/agent/state/HEARTBEAT-OFF \
   #          && bash ~/.pi/agent/scripts/heartbeat-loop.sh
   #        # ⛔ WITHOUT THE `rm` OF THE KILL FILE THE RESTART IS A NO-OP: the loop re-reads it at the
   #        #   top of the pass and exits immediately after printing "heartbeat loop started" — a
-  #        #   dead fleet reported as deployed. And without the `&&` a failed `cp`/`mv` still deletes
-  #        #   the dispatcher and the kill file, then restarts the OLD beat — which still launches
-  #        #   `$SCRIPTS/queue-dispatch.py`, so every pass silently runs a dead step.
+  #        #   dead fleet reported as deployed. And without the `&&` a failed `cp`/`mv` still unfarms
+  #        #   the dispatcher and deletes the kill file, then restarts the OLD beat — which still
+  #        #   launches the retired dispatcher, so every pass silently runs a dead step.
   #        # CONFIRM IT TOOK: `tail -5 ~/.pi/agent/state/orchestrator-heartbeat.log` must show a
   #        #   fresh `LOOP started`, and a later `PASS done` must NOT be followed by a
   #        #   QUEUE-DISPATCH line (the step is gone). Start it from a cmux pane (socket attribution).
-  #    The farm's missing unfarm leg is agent-infra#1924; the recipe above is the workaround, not
-  #    the fix.
+  #    ⛔ THE DISPATCHER'S REMOVAL IS NOT IN THE RECIPE, DELIBERATELY. It is DECLARED in
+  #    `pi-bootstrap/farm-retired.txt` (`scripts/queue-dispatch.py`), so the farm's UNFARM leg
+  #    (agent-infra#1924) removes the deployed copy during the `pi-bootstrap/setup.sh` step above — declared, never
+  #    inferred from absence, and it cannot be forgotten from a hand-written chain. Two further
+  #    reasons it is not spelled here: a command in this note is an INSTRUCTION an operator runs, and
+  #    the producer-closure guard (`pi-bootstrap/tests/test-setup-no-nesting.sh`, #1899) derives the
+  #    farm's population from exactly that shape — naming the retired path as a `$SCRIPTS/…` or
+  #    `agent/scripts/…` exec form re-enters it as an undelivered producer and reds the guard.
   #
   #    ⚠️ CADENCE: `TARGET=540` was raised 480 -> 540 to fit step 1 (~300s) PLUS this step's ~240s
   #    reserve — exactly TARGET, no slack, which is why the step was later detached and then

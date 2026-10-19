@@ -623,8 +623,11 @@ _producer_scan() { # <file> -> "<kind>:<name>" lines
         esac
       done
   # F8 — the bash STATE sibling: `"$STATE/<p>"` / `"${STATE}/<p>"` / `"$STATE_DIR/<p>"`, the state
-  # class's equivalent of F1 (LIVE at `heartbeat-loop.sh:415`, `$STATE/queues/refresh-queues.py`, where
-  # `STATE="$HOME/.pi/agent/state"` is set at :54). It needs its OWN form rather than an F1 alternative:
+  # class's equivalent of F1 (STATE="$HOME/.pi/agent/state", set at heartbeat-loop.sh:54). Its last
+  # LIVE instance — `$STATE/queues/refresh-queues.py` at :415 — was retired by #1874 with the
+  # lane-table dispatcher, so no live site uses F8 today; the form is KEPT because the next
+  # `$STATE/<p>` exec site is exactly the blindness #1899 exists to refuse, and this scanner must
+  # already see it. It needs its OWN form rather than an F1 alternative:
   # F1's classify strip is generic, so a `$STATE/` line reaching it would file as `other:`, not `state:`.
   # The sub-path is KEPT (the F5 residual): `queues/<n>` and a flat `<n>` are different files.
   { grep -ohE '\$\{?(STATE|STATE_DIR)\}?/[A-Za-z0-9_./-]+\.(py|sh)' "$f" 2>/dev/null || true; } \

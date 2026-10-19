@@ -593,11 +593,15 @@ ck "state dir: … and the degradation is RECORDED (an operator can find out the
 # in a minimal environment). So the layer was inert for the reads that spend the most quota. They
 # now prefer `$O/gh-limit/gh` / `$O/gh-rest/gh` — derived from `$O`, never from PATH, so #1872
 # cannot come back through them.
+# ⛔ THE SET IS FOUR, NOT FIVE: `queue-dispatch.py` was RETIRED (agent-infra#1874) and now lives at
+# `scripts/orchestrator-harness/retired/queue-dispatch.py` — not a live caller, so it cannot carry a
+# resolver and must not be imported here. Every loop below drops it for the same reason; the counts in
+# the assertion labels were five and are four.
 reset_env resolvers
 mkdir -p "$TMP/cell/gh-limit"
 printf '#!/usr/bin/env bash\nexit 0\n' > "$TMP/cell/gh-limit/gh"; chmod +x "$TMP/cell/gh-limit/gh"
 _miss=""
-for _f in objective merge-queue beta-progress queue-dispatch; do
+for _f in objective merge-queue beta-progress; do
   _got="$(O="$TMP/cell" timeout 60 python3 -c "
 import importlib.util, sys
 spec = importlib.util.spec_from_file_location('m', sys.argv[1])
@@ -810,7 +814,7 @@ ck "deploy: both entry points staged+renamed in install.sh/deploy/supervisor, st
 # pins the other half — the essential half of the round-2 P1, which an earlier suite could lose
 # without a single assertion failing (all four `setdefault` lines deleted ⇒ 85/85 green).
 _pop=""
-for _f in "$HERE/../"{objective,merge-queue,beta-progress,queue-dispatch,turn-classify,turn-end,undelivered-answers,pr-doctor,ask-owner}.py; do
+for _f in "$HERE/../"{objective,merge-queue,beta-progress,turn-classify,turn-end,undelivered-answers,pr-doctor,ask-owner}.py; do
   # ⛔ PARSED, NOT GREPPED. A COMMENT containing the call satisfied the old grep (measured: replacing
   # pr-doctor's call with a comment kept this gate green), and reading the environment cannot
   # distinguish this file from a MODULE IT IMPORTS (`pr-doctor.py` pulls in `objective.py`, which sets
@@ -889,10 +893,11 @@ GH_LIMIT_NO_WAIT=1 GH_LIMIT_SCENARIO=limited run_helper api graphql -f query='{v
 ck "probe: a NO_WAIT caller spends NO probe (it cannot use the reset it would fetch)" \
    "$(! grep -q 'rate_limit' "$STUB_LOG" 2>/dev/null && echo 0 || echo 1)"
 
-# ⛔ L15. ALL FOUR RESOLVERS, not just objective.py: each carries its own copy of the tuple, and the
+# ⛔ L15. ALL THREE RESOLVERS, not just objective.py: each carries its own copy of the tuple, and the
 # documented order is gh-rest first (the adapter is what serves a GraphQL refusal over REST, #1959).
+# (Three, not four, since #1874 retired `queue-dispatch.py` — the fourth resolver it used to count.)
 _bad=""
-for _t in objective merge-queue beta-progress queue-dispatch; do
+for _t in objective merge-queue beta-progress; do
   python3 - "$HERE/../$_t.py" <<'ORDPY' || _bad="$_bad $_t.py"
 import re, sys
 src = open(sys.argv[1]).read()
@@ -1112,8 +1117,9 @@ ck "an unwritable state dir falls back to a stable per-user dir (still serialise
       && [ -e "$TMP/tdir/gh-limit-$(id -u)/gh.lock" ] \
       && echo 0 || echo 1)"
 
-# ⛔ L32. THE PIN IS NOT A DIRECTORY — for ALL FIVE resolvers, not just ask-owner. Round 7 hardened
-# five pins and asserted one; reverting the other four kept the suite green (review round 8).
+# ⛔ L32. THE PIN IS NOT A DIRECTORY — for ALL FOUR resolvers, not just ask-owner. Round 7 hardened
+# four pins and asserted one; reverting the other three kept the suite green (review round 8). (It
+# was five until #1874 retired `queue-dispatch.py`, which was one of the five.)
 reset_env pinall
 mkdir -p "$TMP/ph/bin/gh" "$TMP/ph/.pi/agent/shims" "$TMP/cellA/gh-rest"
 cp "$SHIM" "$TMP/cellA/gh-rest/gh"; chmod +x "$TMP/cellA/gh-rest/gh"
@@ -1122,7 +1128,7 @@ cp "$SHIM" "$TMP/cellA/gh-rest/gh"; chmod +x "$TMP/cellA/gh-rest/gh"
 # directory there it must hand over something else, never the directory. A module that fails to
 # import prints nothing, which must count as a FAILURE — not as "no directory found".
 _bad=""
-for _m in objective merge-queue beta-progress queue-dispatch ask-owner; do
+for _m in objective merge-queue beta-progress ask-owner; do
   _p="$(HOME="$TMP/ph" O="$TMP/cellA" python3 -c 'import importlib.util,sys
 s=importlib.util.spec_from_file_location("m", sys.argv[1]); m=importlib.util.module_from_spec(s)
 try: s.loader.exec_module(m)
@@ -1136,13 +1142,13 @@ print(v.get("GH_REST_REAL_GH") or "MISSING")' "$HERE/../$_m.py" 2>/dev/null)"
   [ "$_p" = "$TMP/ph/bin/gh" ] && _ok=0
   [ "$_ok" -eq 1 ] || _bad="$_bad $_m($_p)"
 done
-ck "resolvers: a DIRECTORY at ~/bin/gh is never selected by any of the five [${_bad:- none}]" \
+ck "resolvers: a DIRECTORY at ~/bin/gh is never selected by any of the four [${_bad:- none}]" \
    "$([ -z "$_bad" ] && echo 0 || echo 1)"
-# and the positive half: with a REAL file at ~/bin/gh the pin is handed through by all five
+# and the positive half: with a REAL file at ~/bin/gh the pin is handed through by all four
 rmdir "$TMP/ph/bin/gh"
 printf '#!/usr/bin/env bash\nexit 0\n' > "$TMP/ph/bin/gh"; chmod +x "$TMP/ph/bin/gh"
 _miss=""
-for _m in objective merge-queue beta-progress queue-dispatch ask-owner; do
+for _m in objective merge-queue beta-progress ask-owner; do
   _p="$(HOME="$TMP/ph" O="$TMP/cellA" python3 -c 'import importlib.util,sys
 s=importlib.util.spec_from_file_location("m", sys.argv[1]); m=importlib.util.module_from_spec(s)
 try: s.loader.exec_module(m)
@@ -1150,7 +1156,7 @@ except SystemExit: pass
 print((getattr(m, "GH_LAYER_ENV", {}) or {}).get("GH_REST_REAL_GH") or "MISSING")' "$HERE/../$_m.py" 2>/dev/null)"
   [[ "$_p" == "$TMP/ph/bin/gh" ]] || _miss="$_miss $_m"
 done
-ck "resolvers: a REAL pin is handed through by all five (#1872 survives the detour)[${_miss:- none}]" \
+ck "resolvers: a REAL pin is handed through by all four (#1872 survives the detour)[${_miss:- none}]" \
    "$([ -z "$_miss" ] && echo 0 || echo 1)"
 
 # ⛔ L33. THE HELPER VALIDATES ITS OWN --real-gh THE SAME WAY. `X_OK` is true for a directory, so a
