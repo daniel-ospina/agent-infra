@@ -106,19 +106,23 @@ follows are the reusable ones:
   open-count beside a GraphQL merged-count compares two differently-wrong reads.
 * **`state=closed` is not `state=merged`.** REST's closed window carries PRs closed WITHOUT
   merging; only rows with a non-null `merged_at` may count toward `merged_today`.
-* **The window is paged, `per_page` never shrinks, and rows are deduped by number.** REST caps
-  `per_page` at 100, so the
+* **The window is paged, `per_page` never shrinks, and a window that MOVED is refused.** REST
+  caps `per_page` at 100, so the
   500/400 windows are `ceil(limit/100)` requests. A page that cannot be read — or the pair
   spending its shared 30 s budget — refuses the WHOLE read instead of returning a short list: a
   silently short window under-counts `merged_today`, which is the one error a fallback must not
   add. `per_page` stays 100 on every page because GitHub derives a request's offset from THAT
   request's `per_page`, so a shrunk final page re-reads an earlier range and leaves a hole; the
-  final page is trimmed after it arrives. `updated desc` is a LIVE sort, so a PR updated between
-  two requests moves across the page boundary and is returned TWICE (measured: 200 rows, 198
-  distinct, rows 99 and 150 repeated) — the read dedupes by `number`, without which
-  `merged_today`/`open_prs` are inflated. The mirror case is a stated residual: the same shift can
-  drop one row off the tail, which an offset page cannot fix and dedupe does not address. The
-  window is the 400 most-recently-updated **closed**
+  final page is trimmed after it arrives. `updated desc` is a LIVE order read by offset, so a PR
+  updated between two requests jumps to the head and every row below it shifts by one — that is
+  ONE event with TWO consequences: the mover is returned TWICE (measured: 200 rows, 198 distinct,
+  rows 99 and 150 repeated) and a row that ENTERED at the head after page 1 was read is at offset
+  0 and is returned by NO page, so the just-merged PR is precisely what goes missing (simulated
+  end-to-end: one merge landing mid-read left `merged_today` at 0 where the truth was 1).
+  Deduping would hide the double-count and leave the metric short, so a repeat — which can only
+  arise from the list changing mid-read — REFUSES the whole read (`None` → `unavailable`). A
+  shift that stays INSIDE one page produces no repeat and costs nothing. The window is the 400
+  most-recently-updated **closed**
   PRs and unmerged rows are dropped after it is read, so today's updated closed PRs — not today's
   merges alone — must fit in 400 for `merged_today` to be exact. That is a stated bound, not a
   promise.
@@ -132,9 +136,13 @@ follows are the reusable ones:
   `api.github.com`; nor may a token nested under a per-account `users:` map, whose entries belong
   to other accounts and are skipped by depth. The block's own `oauth_token` is what gh itself
   uses — switching accounts moves the active user's token UP to block level — so a config with
-  both a `users:` map and a block-level token still answers with the ACTIVE account; only a file
-  with no block-level token falls through to `gh auth token`, which answers the ACTIVE account and
-  is an OFFLINE lookup the layer does not count as a request). The token is never logged — pinned
+  both a `users:` map and a block-level token still answers with the ACTIVE account. With no
+  block-level token the fall-through splits in two, and the halves are NOT the same outcome: a
+  KEYRING-BACKED config is answered the ACTIVE account by `gh auth token` (an OFFLINE lookup the
+  layer does not count as a request), while a file whose tokens are ALL nested under `users:` is
+  answered NOTHING (measured, gh 2.102.0: `no oauth token found for github.com`, empty stdout) —
+  `_token()` then returns `""` and the read refuses `unavailable`, which is the correct outcome
+  rather than a regression). The token is never logged — pinned
   at the finder as well as the transport, since a `print()` inside `_token()` is upstream of the
   value the rest of the file sees — and a box with no credential at all refuses (`unavailable`)
   rather than reading anonymously.
