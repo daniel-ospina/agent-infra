@@ -114,6 +114,7 @@ PLACEHOLDERS = (
     "SWARM_ENV_FILE",
     "PYTHON_BIN",
     "PI_BIN_DIR",
+    "WORKTREE_HYGIENE_MODE",
 )
 PLACEHOLDER_RE = re.compile(r"\{\{([A-Z_][A-Z0-9_]*)\}\}")
 
@@ -141,8 +142,31 @@ def resolve_infra_root() -> str:
     return ""
 
 
+def wt_hygiene_mode(home: str) -> str:
+    """`--apply` only when the arming record exists AND names who armed it and when — the SAME
+    two-key test scripts/install-launchd.sh's wt_hygiene_mode() applies. It ships DISARMED, so
+    the default is `--dry-run`.
+
+    ⛔ NEVER empty. install-launchd.sh MATERIALISES this value rather than leaving the job to
+    read an env default at run time, and an empty argument here would mean the sweeper runs with
+    no mode at all — neither a dry run nor an apply — which is the one shape that reads as
+    armed without being armed. The value is therefore always one of the two flags.
+    """
+    record = os.environ.get("WORKTREE_HYGIENE_ARM_FILE") or os.path.join(
+        home, ".pi", "agent", "state", "worktree-hygiene.armed"
+    )
+    try:
+        with open(record, encoding="utf-8", errors="replace") as fh:
+            body = fh.read()
+    except OSError:
+        return "--dry-run"
+    if re.search(r"^armed-by=.", body, re.M) and re.search(r"^armed-date=.", body, re.M):
+        return "--apply"
+    return "--dry-run"
+
+
 def placeholder_values() -> dict:
-    """Resolve the eight placeholders. Empty string means 'unresolved' (the job is SKIPPED)."""
+    """Resolve the nine placeholders. Empty string means 'unresolved' (the job is SKIPPED)."""
     home = os.environ.get("CELL_HOME") or os.environ.get("HOME") or ""
     infra = INFRA_ROOT
     tortoise = os.environ.get("TORTOISE_REPO", "")
@@ -182,6 +206,7 @@ def placeholder_values() -> dict:
         "SWARM_ENV_FILE": os.environ.get("SWARM_ENV_FILE") or os.path.join(home, ".swarm.env"),
         "PYTHON_BIN": python_bin,
         "PI_BIN_DIR": pi_bin_dir,
+        "WORKTREE_HYGIENE_MODE": wt_hygiene_mode(home),
     }
 
 

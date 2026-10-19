@@ -595,10 +595,9 @@ check_operational_layer() {
     die "the operational layer FAILED to install from $root (rc=$rc) — a cell without it is unguarded (no review-enforcer/verification-gate/main-worktree-guard/search-guard/audit-logger, no skills) and its merge path dies rc=127. Fix the failure above, or install it by hand: CELL_HOME=$CELL_HOME INFRA_ROOT=$root bash $installer --install"
   fi
   ok "operational layer present and verified ($CELL_HOME/.pi/agent)"
-  # Published for check_schedule() below: the scheduled layer's DECLARATIONS are read from this
-  # checkout (templates/launchd), exactly as launchd's installer reads them from
-  # $AGENT_INFRA_PATH on the Mac — one source of truth, never a hand-ported second list.
-  CELL_INFRA_ROOT="$root"
+  # check_schedule() below reads the job DECLARATIONS from this same checkout (templates/launchd),
+  # exactly as launchd's installer reads them from $AGENT_INFRA_PATH on the Mac — one source of
+  # truth, never a hand-ported second list. It uses LAYER_ROOT, which is set above (#1864).
   # A cell is Linux. Say which one, because the layer's own selection is surface-aware (no
   # cmux desktop app, no launchd) and a reviewer reading a cell log should see the surface.
   if [ -r /etc/os-release ]; then
@@ -1214,7 +1213,7 @@ check_disk_reaper() {
 # stamps — so "scheduled" is asserted from a run (a fresh log line and an rc), never from the
 # presence of a file or a loaded unit.
 check_schedule() {
-  local sched="$CELL_HOME/.pi/agent/scripts/fleet-schedule.py" root="${CELL_INFRA_ROOT:-}" out rc=0
+  local sched="$CELL_HOME/.pi/agent/scripts/fleet-schedule.py" root="${LAYER_ROOT:-}" out rc=0
   # The FARMED copy, not the checkout's: it is what the loop will execute on every tick, and
   # cell-install.sh has just byte-verified it against the checkout. A checkout copy here would
   # certify one file while a different one runs.
