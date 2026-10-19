@@ -591,8 +591,13 @@ queue_state_token() {  # -> EMPTY(12s) / READ(7)(3m) / PARTIAL(P0-blocker)(2m) /
 # per-reason counts (state/refresh-funnel, written by refresh-candidates.sh) plus the counts this
 # loop measures itself. It never invents a number: a missing record prints `UNRECORDED`, and the
 # funnel is only printed as a decomposition when the parts are actually known.
-dispatch_funnel() { # <dispatched_count> <queue_token> [<held_reason>] [<now_epoch>]
-  local k="${1:-0}" qtok="${2:-?}" held="${3:-}" now="${4:-}" f key val kv backlog=0
+dispatch_funnel() { # <dispatched_count> <queue_token> [<held_reason>] [<now_epoch>] [<gh_token>]
+  local k="${1:-0}" qtok="${2:-?}" held="${3:-}" now="${4:-}" ghtok="${5:-}" f key val kv backlog=0
+  # ⛔ `queue=` KEEPS ITS CLOSED VOCABULARY (EMPTY|READ(n)|PARTIAL(…)|UNREADABLE) and every field on
+  # this line stays comma-free (#1910 round 12). The read verdict travels as its OWN field, because
+  # welding it into the queue value put the list's own separator inside a value —
+  # `queue=EMPTY(12s) ghs=FRESH(SECONDARY-LIMITED, 40s), funnel 0m old` — which no consumer that
+  # splits on the list convention can read safely. Human-readable is not the standard here.
   # ⛔ EVERY ONE OF THESE IS INITIALISED. They are assigned only when their key is present in the
   # record, and under `set -u` a declared-but-unassigned local is UNBOUND: a record missing one key
   # (a rename, a hand-edited or half-synced $O) exited the whole controller — a KeepAlive crash loop
@@ -619,11 +624,11 @@ dispatch_funnel() { # <dispatched_count> <queue_token> [<held_reason>] [<now_epo
     # distinguished (review round 5): asserting "no pass has recorded one yet" when the file EXISTS
     # but is empty/truncated is a false statement about our own state.
     if [ -f "$O/state/refresh-funnel" ]; then
-      printf '[dispatch] %s queued of an UNRECORDED pool (state/refresh-funnel exists but is unreadable/empty) -> %s dispatched%s (queue=%s)\n' \
-        "$backlog" "$k" "${held:+ | held: $held}" "$qtok"
+      printf '[dispatch] %s queued of an UNRECORDED pool (state/refresh-funnel exists but is unreadable/empty) -> %s dispatched%s (queue=%s%s)\n' \
+        "$backlog" "$k" "${held:+ | held: $held}" "$qtok" "${ghtok:+ ghs=$ghtok}"
     else
-      printf '[dispatch] %s queued of an UNRECORDED pool (no state/refresh-funnel — no refresh pass has recorded its funnel yet) -> %s dispatched%s (queue=%s)\n' \
-        "$backlog" "$k" "${held:+ | held: $held}" "$qtok"
+      printf '[dispatch] %s queued of an UNRECORDED pool (no state/refresh-funnel — no refresh pass has recorded its funnel yet) -> %s dispatched%s (queue=%s%s)\n' \
+        "$backlog" "$k" "${held:+ | held: $held}" "$qtok" "${ghtok:+ ghs=$ghtok}"
     fi
     return 0
   fi
@@ -643,13 +648,13 @@ dispatch_funnel() { # <dispatched_count> <queue_token> [<held_reason>] [<now_epo
   if is_num "${at:-}" && [ $(( 10#$at )) -le $(( 10#$now )) ]; then
     age=$(( (now - (10#$at)) / 60 )); [ "$age" -lt 0 ] && age=0
     if [ "$age" -gt "${FUNNEL_MAX_AGE_MIN:-30}" ]; then
-      printf '[dispatch] funnel STALE(%sm > %sm) — the last recorded pass listed %s candidates; %s dispatched THIS cycle%s (backlog=%s, queue=%s)\n' \
-        "$age" "${FUNNEL_MAX_AGE_MIN:-30}" "${listed:-?}" "$k" "${held:+ | held: $held}" "$backlog" "$qtok"
+      printf '[dispatch] funnel STALE(%sm > %sm) — the last recorded pass listed %s candidates; %s dispatched THIS cycle%s (backlog=%s, queue=%s%s)\n' \
+        "$age" "${FUNNEL_MAX_AGE_MIN:-30}" "${listed:-?}" "$k" "${held:+ | held: $held}" "$backlog" "$qtok" "${ghtok:+ ghs=$ghtok}"
       return 0
     fi
   else
-    printf '[dispatch] funnel STALE(age unknown — no usable `at=` in state/refresh-funnel) — the recorded pass listed %s candidates; %s dispatched THIS cycle%s (backlog=%s, queue=%s)\n' \
-      "${listed:-?}" "$k" "${held:+ | held: $held}" "$backlog" "$qtok"
+    printf '[dispatch] funnel STALE(age unknown — no usable `at=` in state/refresh-funnel) — the recorded pass listed %s candidates; %s dispatched THIS cycle%s (backlog=%s, queue=%s%s)\n' \
+      "${listed:-?}" "$k" "${held:+ | held: $held}" "$backlog" "$qtok" "${ghtok:+ ghs=$ghtok}"
     return 0
   fi
   local -a parts
@@ -675,9 +680,9 @@ dispatch_funnel() { # <dispatched_count> <queue_token> [<held_reason>] [<now_epo
     0) joined="${joined:+$joined, }UNRECONCILED (the parts do not sum to the pool)" ;;
     *) joined="${joined:+$joined, }UNRECONCILED (no reconciliation recorded — the parts are unverified)" ;;
   esac
-  printf '[dispatch] %s candidates -> %s -> %s dispatched%s (backlog=%s, queue=%s%s)\n' \
+  printf '[dispatch] %s candidates -> %s -> %s dispatched%s (backlog=%s, queue=%s%s%s)\n' \
     "${listed:-?}" "${joined:-no reason recorded}" "$k" \
-    "${held:+ | held: $held}" "$backlog" "$qtok" "${age:+, funnel ${age}m old}"
+    "${held:+ | held: $held}" "$backlog" "$qtok" "${age:+, funnel ${age}m old}" "${ghtok:+ ghs=$ghtok}"
 }
 
 # ── the box's last gh RATE-LIMIT observation (#1988) ─────────────────────────────────────
@@ -2307,7 +2312,7 @@ PY
     # spent budget. `queue=EMPTY ghs=FRESH(SECONDARY-LIMITED, 40s)` is a bursted account with nothing
     # queued, which must never read as "nothing to do". Resolved this way (rather than a second log
     # line) when main's `dispatch_funnel` met this branch's `ghs=` in #2128.
-    else dispatch_funnel 0 "$(queue_state_token) ghs=$(gh_gate_snapshot)" >> "$LOG"; fi
+    else dispatch_funnel 0 "$(queue_state_token)" "" "" "$(gh_gate_snapshot)" >> "$LOG"; fi
   else
     dispatch_funnel 0 "$(queue_state_token)" "$GATE_WHY" >> "$LOG"
     echo "[dispatch] skipped ($GATE_WHY) lanes=$LANES workers=$WORKERS" >> "$LOG"

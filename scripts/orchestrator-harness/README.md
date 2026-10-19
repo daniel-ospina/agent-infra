@@ -764,7 +764,7 @@ comfortable. Three mechanisms hold it:
 |---|---|---|
 | per-call pacing | `gh-limit.py` (#1988) | ONE `gh` call in flight per box (including the `/rate_limit` probe), `retry-after` → bucket reset → **≥60 s doubling**, then a loud failure naming the bucket |
 | **the lander lease** | `gh-gate.py lease`, taken by `merge-one.sh` | **ONE LANDER at a time per box.** A lease held for the LANDING, not for a call: in **rail** mode it spans the whole `admin-merge.sh` run; in **gate** mode it spans the squash (`gh pr merge`) only — the fresh review and the green-wait stay concurrent, because serialising a paid review would cost `MAX_REVIEW` outright (the gate-mode `gh pr checks` polling is therefore a **stated residual**: bounded by `MAX_REVIEW` and by the per-call lock, not something this lease claims to cover; and because the gate-mode lease is taken **after** the paid review, a head that DEFERS re-pays that review on the next cycle — the deferral saves a squash, not a review, and no attempt or park is written. Serialising the review itself would cost `MAX_REVIEW` outright; skipping a re-review would need the marker check to become an entry condition on the review path, which is a separate change). Staggered starts, and a **liveness-checked holder** — pid *and* process start token, so a recycled pid is not mistaken for a live lander. A lander that cannot get the lease **DEFERS** its head (no try consumed, no park) and is retried next cycle |
-| **the shared read** | `gh-gate.py cycle` / `snapshot read` | The controller performs **ONE real read per cycle** and PUBLISHES it; every other reader takes the snapshot instead of paying for the same API call — `merge-one.sh` consumes it before it spends a review or a landing (`lander_read_blocked` → `gh-gate.py lander-check --transport <the path this box reads on>`, which defers the head only when a FRESH verdict says **that** pool is refused — a GraphQL-only refusal must not defer a box whose adapter serves every read over REST, which is the #1959 state the adapter exists for), and the controller's own `backlog empty` line reads it at zero cost. The age is part of the token: `FRESH(…)`, `STALE(…)`, or `UNKNOWN(…)` — a cached read never passes as a current one, and `--require-fresh` refuses a stale one |
+| **the shared read** | `gh-gate.py cycle` / `snapshot read` | The controller performs **ONE real read per cycle** and PUBLISHES it; every other reader takes the snapshot instead of paying for the same API call — `merge-one.sh` consumes it before it spends a review or a landing (`lander_read_blocked` → `gh-gate.py lander-check --transport <the path this box reads on>`, which defers the head only when a FRESH verdict says **that** pool is refused — a GraphQL-only refusal must not defer a box whose adapter serves every read over REST, which is the #1959 state the adapter exists for), and the controller's own no-dispatch funnel line (`dispatch_funnel 0 …`, which replaced the `backlog empty` line) reads it at zero cost. The age is part of the token: `FRESH(…)`, `STALE(…)`, or `UNKNOWN(…)` — a cached read never passes as a current one, and `--require-fresh` refuses a stale one |
 
 **And the instrument rule, which is the reason this section exists.** A command that prints
 `x/5000` remaining is **not** evidence that the fleet can read: `GET /rate_limit` is exempt from the
@@ -787,8 +787,11 @@ where GraphQL was refused for minutes while REST answered normally. Both verdict
 (`state=` GraphQL, `rest=` REST); a pool not measured this pass is `?`, never a guess and never the
 other pool's answer. A healthy pass still costs exactly one call.
 
-It is printed on every cycle line (`queue=… ghs=… gh=…`), beside `[dispatch] backlog empty`, so
-`queue=EMPTY` over a bursted account is visible as such. The controller's older `[res] gh_gql=` field
+It is printed on every cycle line (`queue=… ghs=… gh=…`) and on the **no-dispatch funnel line**
+(`dispatch_funnel 0 …` — main replaced the old `[dispatch] backlog empty` line with it, so that a
+cycle with candidates that were all filtered away names where they went), where it arrives as its
+**own `ghs=` field** with `queue=` keeping its closed vocabulary, so `queue=EMPTY ghs=FRESH(SECONDARY-
+LIMITED, 40s)` over a bursted account is visible as such. The controller's older `[res] gh_gql=` field
 is a `/rate_limit` counter and is **advisory only** — do not read a healthy `gh_gql=` as "the fleet
 can read".
 
@@ -1015,7 +1018,7 @@ The age is part of the token on purpose: a value frozen by a refresh that stoppe
 as a fresh reading. `UNKNOWN` means no pass has EVER recorded a read — it is not `EMPTY`.
 
 ⛔ **A FILTERED-TO-ZERO FUNNEL IS NOT A CLEARANCE EITHER** (agent-infra#2040). The line above used
-to read `[dispatch] backlog empty queue=READ(223)` — the pool was read (223 candidates) and the
+to read `[dispatch] 223 candidates -> … -> 0 dispatched (backlog=0, queue=READ(223)(9m))` — the pool was read (223 candidates) and the
 backlog was empty, and nothing said which step ate the 223. That contradiction idled all three cloud
 cells for hours. The dispatch line is now a DECOMPOSITION, and its parts reconcile with the pool
 (`listed = queued + peer-owned + landed + unjudged + blacklisted + already-dispatched + not-reached`):

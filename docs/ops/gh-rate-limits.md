@@ -212,7 +212,8 @@ never `EMPTY`. `gh-gate.py probe` deliberately **never calls `/rate_limit`** (as
 §2), because a probe that asks the exempt endpoint is the false green itself.
 
 Where it shows up: `orch-loop.sh`'s cycle line now carries `queue=<pool read> ghs=<read verdict and
-age> gh=<bucket/reset from gh-limit>`, and the `[dispatch] backlog empty` line carries `ghs=` beside
+age> gh=<bucket/reset from gh-limit>`, and the no-dispatch funnel line (`dispatch_funnel 0 …`, which
+replaced the old `[dispatch] backlog empty` line) carries `ghs=` as its own field beside
 it. The older `[res] gh_gql=` field remains a `/rate_limit` counter and is **advisory only**.
 
 ## Two limits, different behavior

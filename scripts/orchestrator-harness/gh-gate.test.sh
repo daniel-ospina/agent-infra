@@ -644,7 +644,7 @@ else
 fi
 has 'gh_gate_token' "$OL" && pass "5c(4) orch-loop.sh reports the gate's real-read token each cycle" \
   || fail "5c(4) orch-loop.sh no longer reports ghs= (the instrument is unwired)"
-has 'gh_gate_snapshot' "$OL" && pass "5c(5) …and the shared read is consumed on the backlog-empty line" \
+has 'gh_gate_snapshot' "$OL" && pass "5c(5) …and the shared read is consumed on the no-dispatch funnel line" \
   || fail "5c(5) orch-loop.sh no longer consumes the shared snapshot"
 # ⛔ THE CELL DOCTOR IS A LANDER TOO. Its `merge` role executes the rail directly, is DEFAULT-ON
 # (MERGE_INTERVAL, tmux `cell-doctor` on every started cell), and took only its own per-PR claim —
@@ -696,6 +696,19 @@ if [ -n "$_g_acq" ] && [ -n "$_g_sq" ] && [ -n "$_g_rel" ] && [ -z "$_g_mid" ] \
   pass "5c(7e) merge-one.sh's GATE path holds the lease ACROSS the squash (acquire < squash < release)"
 else
   fail "5c(7e) the gate-mode squash runs outside the lease (acq=$_g_acq squash=$_g_sq rel=$_g_rel mid=$_g_mid)"
+fi
+
+# 5c(7f) THE RESOLUTION'S ORDER: rail-abort guard -> lease -> squash. The guard is the only thing
+# stopping a rail repo's PR from landing on its required checks alone via a raw merge
+# (#1764/#1825), and it must decide BEFORE the lease is taken (a lease taken inside a step that
+# aborts would be released by the EXIT trap, but the guard's whole point is that this code never
+# runs in rail mode). Nothing pinned this order until the merge-resolution review.
+_guard="$(grep -n 'rail mode reached the raw merge step' "$MO" | head -1 | cut -d: -f1)"
+if [ -n "$_guard" ] && [ -n "$_g_acq" ] && [ -n "$_g_sq" ] \
+   && [ "$_guard" -lt "$_g_acq" ] && [ "$_g_acq" -lt "$_g_sq" ]; then
+  pass "5c(7f) the rail-authority abort guard runs BEFORE the gate lease, which precedes the squash"
+else
+  fail "5c(7f) the guard/lease/squash order is wrong (guard=$_guard acq=$_g_acq squash=$_g_sq) — a rail PR could land on a raw merge"
 fi
 
 # A deferral must RELEASE the per-PR claim: left behind, the doctor's own long-lived loop pid reads

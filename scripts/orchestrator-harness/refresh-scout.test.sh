@@ -825,7 +825,11 @@ grep -q 'backlog=\$(wc -l.*queue=\$(queue_state_token)' "$LOOP" \
 # caught #2040: the funnel line always carries the queue state, AND it decomposes the funnel (it
 # names where the candidates went) instead of asserting emptiness. An `==` on the funnel call alone
 # would pass on a line that printed a bare "0 dispatched".
-grep -q 'dispatch_funnel 0 "$(queue_state_token)"' "$LOOP" \
+# ⛔ ANCHORED TO THE NO-DISPATCH CALL AND TO ITS CLOSING QUOTE. Loosened to the bare prefix it also
+# matched the GATE-held call site, so welding the gh verdict back INTO the `queue=` value — the exact
+# defect the merge-resolution review found — stayed green. Measured: with the loose form only, that
+# mutation passed 272/0.
+grep -q 'else dispatch_funnel 0 "\$(queue_state_token)"' "$LOOP" \
   && ok "orch-loop: the no-dispatch line carries the queue state (through the funnel)" \
   || bad "orch-loop: the no-dispatch line does not carry the queue state"
 # Anchored on the EMITTING form (`echo "[dispatch] backlog empty…`), not on the phrase: the phrase
