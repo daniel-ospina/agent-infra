@@ -274,13 +274,18 @@ candidate is refused. (Measured before this baseline: 793 consecutive `could not
 refusals alongside healthy `[cap]` lines.) A real dispatch is:
 
 ```
-[cap] load=54/100 lanes=3/25 …                      <- the cycle runs
+[cap] load=54/100 lanes=3/11 max_lanes=25 zombie=0 …   <- the cycle runs (live/total + corpses)
 [dispatch] load=45 lanes=2 -> 4628 4643             <- candidates actually entered the batch
 + a matching `tmux ls` session per issue (lane-4628, chain-4628)
 ```
 
 Read both. `lanes=0` with a healthy `[cap]` and a non-empty backlog is the "alive but dispatching
 nothing" shape, and it is the state this audit found on the Mac.
+
+⛔ **`lanes=` is `<live>/<total>` since #2163, and the TOTAL is the half that exposes a leak.** The
+old field was live lane sessions over the ceiling; it could not show finished residents at all.
+`lanes=3/11` says three lanes are working and the box is carrying eight more — the measured shape
+was 14 working of 76 resident, and `zombie=` is in the same line so a box full of corpses says so.
 
 ---
 

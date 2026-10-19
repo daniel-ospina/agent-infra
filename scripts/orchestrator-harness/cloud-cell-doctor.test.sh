@@ -174,6 +174,19 @@ printf '%s\n' "$*" >> "$S/calls"
 exit "$(cat "$S/rc" 2>/dev/null || echo 0)"
 SH
 
+# lane-reap (#2163): a DOUBLE, so this suite asserts the DELEGATION (and the census in the pass
+# line) without letting a second reaper loose on the fixture's process table. lane-reap.sh has its
+# own hermetic suite; this file's contract is "the doctor schedules it with the right posture".
+cat > "$T/bin/lane-reap" <<'SH'
+#!/bin/bash
+S="${DOCTOR_TEST_LANE_REAP:?}"
+printf '%s\n' "$*" >> "$S/calls"
+case "${1:-}" in
+  count) printf 'lanes=1/2 zombie=0\n' ;;
+  reap)  printf 'lane-reap: lanes=1/2 zombie=0 candidates=0 reaped=0 refused=1 mode=%s\n' "${2:-dry-run}" ;;
+esac
+exit 0
+SH
 cat > "$T/bin/wt-reaper.sh" <<'SH'
 #!/bin/bash
 printf '%s\n' "$*" >> "${DOCTOR_TEST_WT:?}/calls"
@@ -192,16 +205,17 @@ export DOCTOR_TEST_TMUX="$T/tmux" DOCTOR_TEST_PS="$T/ps" DOCTOR_TEST_GH="$T/gh"
 # The `uv` double records its calls here; without it the double fails (it is `:?`-guarded), and a
 # fixture that forgot to pass it would read as "uv cache prune FAILED" — a truthy-looking false red.
 export DOCTOR_TEST_UV="$T/uv"
+export DOCTOR_LANE_REAP_BIN="$T/bin/lane-reap" DOCTOR_TEST_LANE_REAP="$T/lane-reap"
 export REAP_MIN_S=60 REAP_SAMPLE_S=2 DOCTOR_INTERVAL=1 MERGE_INTERVAL=1 HYGIENE_INTERVAL=1
 export MERGE_RETRY_S=3600 CONTROLLER_STALE_S=60
-mkdir -p "$T/gh" "$T/rail" "$T/sup" "$T/wt" "$T/uv"
+mkdir -p "$T/gh" "$T/rail" "$T/sup" "$T/wt" "$T/uv" "$T/lane-reap"
 
 doc() { # <role> [extra env assignments via env]
   OUT="$(bash "$DOCTOR" "$@" 2>&1)"; RC=$?
 }
 reset_tmux() { rm -f "$T/tmux/sessions" "$T/tmux/killed" "$T/tmux/new-session"; touch "$T/tmux/sessions"; }
 reset_ps()   { rm -f "$T/ps/calls" "$T/ps/mode" "$T/ps/args."* "$T/ps/lstart."*; }
-reset_state(){ rm -rf "$T/o/state"; mkdir -p "$T/o/state/roles"; }
+reset_state(){ rm -rf "$T/o/state"; mkdir -p "$T/o/state/roles" "$T/lane-reap"; rm -f "$T/lane-reap/calls"; }
 mk_lane() { # <name> <pid> [<log mtime, `touch -t` form; default ancient>]
   printf '%s\n' "$1" >> "$T/tmux/sessions"
   printf '%s\n' "$2" > "$T/tmux/panes/$1"
@@ -233,6 +247,10 @@ doc reap
 killed lane-42 && ok "reap: killed the exact session target (=lane-42)" || bad "reap: did NOT kill lane-42 — $OUT"
 case "$(sed -n 's/^last_result=//p' "$T/o/state/roles/reap.state")" in *"reaped lane-42"*) ok "reap: recorded 'reaped lane-42' in its state" ;; *) bad "reap: state does not record the reap — $(sed -n 's/^last_result=//p' "$T/o/state/roles/reap.state")" ;; esac
 [ "$(sed -n 's/^last_rc=//p' "$T/o/state/roles/reap.state")" = "0" ] && ok "reap: state last_rc=0" || bad "reap: state last_rc missing/wrong"
+# #2163: the same pass must SCHEDULE the process reaper, and its census must be in the pass line.
+grep -qx 'reap --apply' "$T/lane-reap/calls" 2>/dev/null && ok "reap: delegated the process pass ARMED (reap --apply)" || bad "reap: the process pass was not delegated armed — $(cat "$T/lane-reap/calls" 2>/dev/null)"
+grep -qx 'count' "$T/lane-reap/calls" 2>/dev/null && ok "reap: read the evidence census (count)" || bad "reap: the census was not read"
+result_has "lanes=1/2 zombie=0" && ok "reap: the pass line carries lanes=<live>/<total> zombie=<n>" || bad "reap: the census is missing from the pass line — $OUT"
 
 # ── 1b) a lane whose log advanced INSIDE the floor is NOT reaped ────────────────────────────────
 # REAP_MIN_S is the whole reason a SCHEDULED reap pass is safe: a lane that spoke recently is between
@@ -466,7 +484,8 @@ kill -TERM "$LOOP_PID" 2>/dev/null || true; LOOP_PID=""
 # ── 12) HYGIENE: the package cache is pruned; worktrees are armed only under pressure ───────────
 say_case "hygiene: uv cache prune runs; the worktree reaper is gated"
 reset_state; rm -f "$T/uv/uv-calls" "$T/wt/calls"
-export DOCTOR_TEST_UV="$T/uv" DOCTOR_WORKTREE_REAPER="$T/bin/wt-reaper.sh" DOCTOR_TEST_WT="$T/wt"
+export DOCTOR_TEST_UV="$T/uv"
+export DOCTOR_LANE_REAP_BIN="$T/bin/lane-reap" DOCTOR_TEST_LANE_REAP="$T/lane-reap" DOCTOR_WORKTREE_REAPER="$T/bin/wt-reaper.sh" DOCTOR_TEST_WT="$T/wt"
 # ⛔ MIN_FREE_MB=0 pins the DISK PRESSURE this arm is about: `auto` arms the reaper when free space is
 # under MIN_FREE_MB*2, so on a nearly-full runner (measured: 1 GB free, 99% used) an un-pinned "healthy
 # disk" arm asserts --dry-run against a host that is under pressure and fails for the wrong reason.
