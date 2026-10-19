@@ -38,11 +38,13 @@
 #   * the PROVIDER PROBE reads the provider, not the extension layer — a noisy layer (the measured
 #     banner-only shape: `[tortoise-capture] …`, no answer) must NOT turn a healthy provider into
 #     `FATAL: provider probe failed`. The stub `pi` reproduces that shape, and the probe's OWN
-#     two-probe contract is what is pinned: layer-loaded first, `--no-extensions` second to
-#     ATTRIBUTE. So the noisy case must (i) report no provider failure, (ii) NAME the layer as the
-#     culprit, and (iii) a broken key must still be blamed on the provider in every mode. Reordering
-#     or dropping either probe turns one of those red (the cases prove the fixture emits no
-#     LANE_READY with the layer loaded and DOES answer in isolation, so none can pass vacuously);
+#     two-check contract is what is pinned: the ISOLATED probe (`--no-extensions`) owns the provider
+#     verdict and runs first, then a LAYER-loaded lane-shaped turn (twice) proves the layer can
+#     answer. So the noisy case must (i) report no provider failure, (ii) NAME the layer and say the
+#     provider is healthy, (iii) not claim CELL READY, and (iv) a broken key must still be blamed on
+#     the provider. Dropping or reordering either check turns one of those red (the cases prove the
+#     fixture emits no LANE_READY with the layer loaded and DOES answer in isolation, so none can
+#     pass vacuously);
 #   * a cell that CARRIES `tortoise-capture` fails the installer's read-back at the named (b) call
 #     (`capture extension present on a cell: …`) and `--check` SURFACES that line — it used to
 #     discard the verify output entirely, so the reason the box kept re-breaking itself appeared
@@ -98,12 +100,14 @@ printf '#!/bin/sh\ncase "$1" in --version) echo "git version 2.39.0";; *) echo a
 # The probe stub also has to be able to reproduce the MEASURED #2100 shape: a layer that emits banner
 # lines and NEVER reaches the model, so the output carries no answer at all. It only answers when the
 # probe asks for a provider with extensions DISABLED (`--no-extensions`). That is what makes the
-# two-probe contract testable: the provider verdict comes from the ISOLATED probe, and the LAYER
-# probe goes red on this fixture — so the run must FAIL naming the layer, and must NOT report a
-# provider failure. `broken` models the other attribution: the provider itself rejects the key in
-# EVERY mode, so the run dies on the 401 arm. `echoargv` prints its own argv and never reaches a
-# model — the vacuous-pass shape the answer extractor must refuse. `PI_STUB_LOG`, when set, records
-# one line per model call, so a case can prove how many probes actually ran.
+# two-check contract testable: the provider verdict comes from the ISOLATED probe, and the LAYER turn
+# goes red on this fixture — so the run must FAIL naming the layer, and must NOT report a provider
+# failure. `broken` models the other attribution: the provider itself rejects the key in EVERY mode,
+# so the run dies on the 401 arm. `instruction` prints the INSTRUCTION ITSELF (the vacuous-pass shape
+# an extractor that accepted any matching line would take for an answer). `verbose` answers with the
+# instruction embedded in a sentence — a REAL answer, which the extractor must accept (`-xF` narrows
+# the refusal to a byte-identical line; a `-vF` version wrongly drops this one). `PI_STUB_LOG`, when
+# set, records one line per model call, so a case can prove how many calls actually ran.
 cat > "$STUB/pi" <<'STUB'
 #!/bin/sh
 [ "$1" = "--version" ] && { echo "0.85.1"; exit 0; }
@@ -114,8 +118,12 @@ if [ "${PI_STUB_MODE:-normal}" = broken ]; then
   printf '{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}\n'
   exit 0
 fi
-if [ "${PI_STUB_MODE:-normal}" = echoargv ]; then
+if [ "${PI_STUB_MODE:-normal}" = instruction ]; then
   printf 'Reply with exactly: LANE_READY\n'
+  exit 0
+fi
+if [ "${PI_STUB_MODE:-normal}" = verbose ]; then
+  printf 'Sure — the model replied: Reply with exactly: LANE_READY\n'
   exit 0
 fi
 if [ "${PI_STUB_MODE:-normal}" = noisy ] && [ "$has_ne" -eq 0 ]; then
@@ -212,6 +220,16 @@ case "$BR_OUT" in
   *"the extension layer answers a lane-shaped turn"*) ok "the layer-loaded turn is measured and reported (the detector is live on a healthy box)" ;;
   *) bad "a clean run never reports the layer-loaded turn — the layer detector is inert: $BR_OUT" ;;
 esac
+# ... and it must be measured AFTER the layer is provisioned. The first `--check` on a cell installs
+# it, and a layer probe that ran before that install would measure an EMPTY extension set and certify
+# a layer it never saw (the false PASS this PR exists to remove).
+install_ln="$(printf '%s\n' "$BR_OUT" | grep -n 'installing it from' | head -1 | cut -d: -f1)"
+layer_ln="$(printf '%s\n' "$BR_OUT" | grep -n 'the extension layer answers a lane-shaped turn' | head -1 | cut -d: -f1)"
+if [ -n "$install_ln" ] && [ -n "$layer_ln" ] && [ "$layer_ln" -gt "$install_ln" ]; then
+  ok "the layer is measured AFTER it is installed (line $layer_ln > install line $install_ln)"
+else
+  bad "the layer turn is measured BEFORE the layer is installed (install line='$install_ln', layer line='$layer_ln') — a first bring-up would certify a layer it has not installed yet"
+fi
 case "$BR_OUT" in
   *"CELL READY"*) ok "a clean run still reaches CELL READY" ;;
   *) bad "a clean run no longer reaches CELL READY — output: $BR_OUT" ;;
@@ -331,14 +349,33 @@ esac
 # The instruction itself contains the token, so a `pi` (or a wrapper) that prints its own argv would
 # answer the probe with no model call. The extractor drops a byte-identical echo line; both probes
 # must therefore read "no answer" and the run must fail as a provider failure.
-say_case "an echoed instruction cannot pass the probe (#2100)"
+say_case "the instruction printed back cannot pass the probe (#2100)"
 printf '%s\n' "$TOK_BODY" > "$TOK"
-PI_STUB_MODE=echoargv br ok normal --check
-[ "$BR_RC" -ne 0 ] && ok "the run FAILS when the only 'answer' is the echoed instruction" \
-                   || bad "an echo of the instruction satisfied the probe — vacuous pass"
+PI_STUB_MODE=instruction br ok normal --check
+[ "$BR_RC" -ne 0 ] && ok "the run FAILS when the only 'answer' is the instruction printed back" \
+                   || bad "printing the instruction back satisfied the probe — vacuous pass"
 case "$BR_OUT" in
-  *"provider probe failed"*) ok "the echoed instruction is reported as NO provider answer" ;;
-  *) bad "the echoed instruction was not classified as a missing answer: $BR_OUT" ;;
+  *"provider probe failed"*) ok "the printed-back instruction is reported as NO provider answer" ;;
+  *) bad "the printed-back instruction was not classified as a missing answer: $BR_OUT" ;;
+esac
+
+# ── 2c1b) a VERBOSE answer still counts: the echo guard must stay narrow ─────────────────────────
+# The mirror of 2c1. `grep -vF 'Reply with exactly'` (the first cut of the guard) discarded ANY line
+# containing the phrase, so a model that wrapped the token in the instruction — a correct answer —
+# read as "no answer" and a healthy box died with `FATAL: provider probe failed`. Only a
+# BYTE-IDENTICAL line is refused now; this case goes red if the guard is ever widened back.
+say_case "a verbose answer is still an answer (#2100)"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+PI_STUB_MODE=verbose br ok normal --check
+case "$BR_OUT" in
+  *"provider probe failed"*) bad "a verbose-but-correct answer was read as no answer — the echo guard is too wide: $BR_OUT" ;;
+  *) ok "a verbose answer (token wrapped in the instruction) is accepted" ;;
+esac
+[ "$BR_RC" -eq 0 ] && ok "the run still reaches a clean verdict on a verbose answer" \
+                   || bad "the run FAILED on a verbose answer (rc=$BR_RC): $BR_OUT"
+case "$BR_OUT" in
+  *"CELL READY"*) ok "a verbose answer still reaches CELL READY" ;;
+  *) bad "a verbose answer never reaches CELL READY — output: $BR_OUT" ;;
 esac
 
 # ── 2c2) a BROKEN provider is still blamed on the provider, whatever the layer does ──────────────

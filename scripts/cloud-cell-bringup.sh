@@ -268,11 +268,11 @@ check_network() {
 # ── (2) provider key, verified by a REAL call ───────────────────────────────────
 # answer_line <text> — the provider's answer, if the text carries one. LINE-based over the WHOLE
 # output, never `tail`: on the cells the last three lines were a capture banner while the answer sat
-# above them (#2100). The ONE exclusion is a byte-identical echo of the instruction — a `pi` (or a
-# wrapper) that prints its own argv would otherwise "answer" itself with no model call. A model that
-# repeats the instruction around the token has still answered, so only the exact echo line is dropped
-# (`-xF`): the earlier `grep -vF 'Reply with exactly'` discarded any line containing the phrase, which
-# turned a verbose-but-correct answer into a false `provider probe failed`.
+# above them (#2100). The ONE exclusion is a byte-identical `Reply with exactly: LANE_READY` line —
+# a `pi` or wrapper that PRINTS THE INSTRUCTION ITSELF would otherwise "answer" with no model call.
+# It is deliberately narrow (`-xF`): a model that repeats the instruction around the token has still
+# answered, and the earlier `grep -vF 'Reply with exactly'` discarded any line containing the phrase,
+# turning a verbose-but-correct answer into a false `provider probe failed`.
 answer_line() {
   printf '%s\n' "$1" | grep -F 'LANE_READY' | grep -vxF 'Reply with exactly: LANE_READY' | head -1
 }
@@ -298,32 +298,30 @@ check_provider() {
   # Probe by EXECUTION. The image's ANTHROPIC key is present-but-invalid, so the
   # presence of the variable proves nothing.
   #
-  # ⛔ TWO PROBES, AND THE ORDER IS THE CONTRACT (#2100). This function used to run ONE probe —
-  # `pi -p … 2>&1 | tail -3` with the WHOLE extension layer loaded — so whatever an extension wrote
-  # became "the provider's answer". Measured 2026-10-19 (#2100, one box unusable while two ran
-  # lanes; the extension was present on all three and the probe defect applied on all three): the
-  # affected cell's `tortoise-capture` consumed the turn with banner lines only (259-262 B), the
-  # last three lines were the banner, and the bring-up reported `FATAL: provider probe failed` for a
-  # box whose provider was healthy (`pi` returned LANE_READY as soon as the extension was gone).
+  # ⛔ SPLIT INTO TWO CHECKS ON PURPOSE (#2100). The cell's provider question and the cell's LAYER
+  # question are answered at different points in `main()`: the provider verdict here, and the layer
+  # verdict in `check_provider_layer` AFTER `check_operational_layer` has installed/verified the
+  # layer. Measuring the layer here would probe an EMPTY extension set on a first bring-up — the
+  # install lands afterwards — and then certify a layer it never saw.
   #
-  #   (1) THE PROVIDER VERDICT comes from the ISOLATED probe (`--no-extensions`) FIRST. It must be
-  #       the authoritative one, because it is the only probe the layer cannot answer for: a
-  #       spool-replaying or banner-printing extension that emits the token would otherwise satisfy
-  #       a layer-loaded probe and short-circuit this check, certifying a cell over a dead key. An
-  #       answer here proves the key; NO answer here is a provider verdict, and the classification
-  #       below (spawn-gate refusal / 401 / timeout / generic) owns it.
-  #   (2) THE LAYER is then measured, because a provider-only probe would let a layer that swallows
-  #       every turn certify a cell that cannot run a lane (the mirror of the #2100 false FATAL).
-  #       This is what a lane actually does: `pi -p` with the extension layer loaded. It is tried
-  #       TWICE before it fails, so a single cold-start miss is not read as a broken layer, and it
-  #       FAILS (naming the layer and stating the provider answered) rather than warning beside a
-  #       `CELL READY` banner — a green readiness line over a box whose turns produce no answer is
-  #       the false PASS this whole script exists to remove.
+  # This function used to run ONE probe — `pi -p … 2>&1 | tail -3` with the WHOLE extension layer
+  # loaded — so whatever an extension wrote became "the provider's answer". Measured 2026-10-19
+  # (#2100, one box unusable while two ran lanes; the extension was present on all three and the
+  # probe defect applied on all three): the affected cell's `tortoise-capture` consumed the turn
+  # with banner lines only (259-262 B), the last three lines were the banner, and the bring-up
+  # reported `FATAL: provider probe failed` for a box whose provider was healthy (`pi` returned
+  # LANE_READY as soon as the extension was gone).
+  #
+  # THE PROVIDER VERDICT comes from the ISOLATED probe (`--no-extensions`) — the only probe the
+  # layer cannot answer for, because a spool-replaying or banner-printing extension that emits the
+  # token would otherwise satisfy a layer-loaded probe and certify a cell over a dead key. An
+  # answer here proves the key; NO answer here is a provider verdict, and the classification below
+  # (spawn-gate refusal / 401 / timeout / generic) owns it.
   # `--no-extensions` also excludes `clamp-output-floor.ts` and `reflect-hook.ts`, which ship on
   # cells and print registration-time banners by design — two more writers in this very channel.
   # It does NOT disable the spawn-point gate: that is `$CELL_HOME/.pi/agent/bin/pi` on PATH, not an
-  # extension, so the #1884 refusal still fires on both probes.
-  local out answer detail rc=0 layer_out layer_detail layer_rc attempt
+  # extension, so the #1884 refusal still fires.
+  local out answer detail rc=0
   out="$(timeout 120 pi -p --no-session --no-extensions --provider deepseek --model deepseek-flash \
           'Reply with exactly: LANE_READY' 2>&1)" || rc=$?
   answer="$(answer_line "$out")"
@@ -347,8 +345,18 @@ check_provider() {
     die "provider probe failed. Last output: $detail"
   fi
   ok "provider call works (pi returned LANE_READY)"
+}
 
-  # (2) the layer, twice — a lane turn is `pi -p` WITH the layer loaded.
+# ── (2b) the layer, verified by a LANE-SHAPED turn ─────────────────────────────
+# Called from `main()` AFTER `check_operational_layer`, so what it measures is the layer the cell
+# will actually run. A provider-only probe would let a layer that swallows every turn certify a
+# cell that cannot run a lane — the mirror of the #2100 false FATAL — so this stays, and it is
+# tried TWICE: one cold-start miss is not proof of a broken layer. When it does fail it FAILS,
+# naming the layer and stating that the provider answered, rather than warning beside a
+# `CELL READY` banner: a green readiness line over a box whose turns produce no answer is exactly
+# the false PASS this script exists to remove.
+check_provider_layer() {
+  local layer_out layer_detail layer_rc attempt
   for attempt in 1 2; do
     layer_rc=0
     layer_out="$(timeout 120 pi -p --no-session --provider deepseek --model deepseek-flash \
@@ -362,7 +370,7 @@ check_provider() {
     esac
   done
   layer_detail="$(printf '%s\n' "$layer_out" | grep -v '^[[:space:]]*$' | tail -5)"
-  die "the PROVIDER is healthy (it answered with extensions disabled) but the EXTENSION LAYER produced no answer in two attempts (last exit $layer_rc) — a lane turn on this box would produce no answer, which is #2100's shape. Find the extension writing to stdout at session start / load time, or remove it from the cell. Loaded-layer output: $layer_detail"
+  die "the PROVIDER is healthy (it answered with extensions disabled) but the EXTENSION LAYER produced no answer in two attempts (last exit $layer_rc) — a lane turn on this box would produce no answer, which is #2100's shape. Find the extension that writes to stdout at registration or session start, or remove it from the cell. Loaded-layer output: $layer_detail"
 }
 
 # ── (3) gh auth, via a pushed token file ────────────────────────────────────────
@@ -679,6 +687,10 @@ main() {
       check_repo
       check_dispatch
       check_operational_layer
+      # AFTER the layer exists: this measures the cluster of extensions the cell will actually run.
+      # Measuring it earlier would probe an empty set on a first bring-up and certify a layer that
+      # had not been installed yet (#2100 review).
+      check_provider_layer
       check_caches
       check_disk_reaper
       # `CELL READY` is a claim about the cell, and "no pushed credential left on disk" is part of
