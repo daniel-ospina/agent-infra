@@ -223,7 +223,7 @@ failed/stale/never, 2 usage.
 
 ## Tests
 
-`scripts/disk-reaper.test.sh` — 106 assertions, run by the `disk-reaper` shard of
+`scripts/disk-reaper.test.sh` — 135 assertions, run by the `disk-reaper` shard of
 `run-bash-shards.sh`:
 
 | | |

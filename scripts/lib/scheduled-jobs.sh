@@ -413,7 +413,7 @@ $argv
 EOF
         printf '    </array>\n'
         printf '    <key>EnvironmentVariables</key>\n    <dict>\n'
-        printf '        <key>PATH</key>\n        <string>%s</string>\n' "$(sj_xml "$PATH")"
+        printf '        <key>PATH</key>\n        <string>%s</string>\n' "$(sj_xml "$(sj_job_path darwin)")"
         printf '        <key>HOME</key>\n        <string>%s</string>\n' "$(sj_xml "$HOME")"
         printf '        <key>SJ_JOB</key>\n        <string>%s</string>\n' "$(sj_xml "$id")"
         while IFS= read -r k; do
@@ -474,7 +474,7 @@ sj_job_path() { # sj_job_path <platform>
 sj_render_value() { # sj_render_value <string>
     local v="$1"
     v="${v//@home/$HOME}"
-    v="${v//@path/$(sj_job_path "${PLATFORM:-linux}")}"
+    v="${v//@path/$(sj_job_path "${PLATFORM:-darwin}")}"
     v="${v//@state/${SJ_STATE_DIR:-$HOME/.pi/agent/state}}"
     v="${v//@repos/${SJ_REPOS:-${SJ_TORTOISE_REPO:-${TORTOISE_REPO:-$HOME/Documents/GitHub/tortoise}}}}"
     v="${v//@tortoise/${SJ_TORTOISE_REPO:-${TORTOISE_REPO:-$HOME/Documents/GitHub/tortoise}}}"
