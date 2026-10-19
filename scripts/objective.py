@@ -1370,14 +1370,33 @@ def _body_names_rate_limit(e, deadline=None):
     i.e. a stall past `run_bounded 90 objective-refresh`, where the beat is killed with NO line
     written — the silent stall the chunk loop exists to prevent.
 
-    So: `read1()` where it exists (at most ONE recv per call, so each is bounded by the socket
-    timeout), `deadline` checked BEFORE every chunk, and `ERR_BODY_BYTES` as the cap. The worst
-    case is the deadline plus one recv — the same standard the 200 path holds itself to.
+    So: `read1()` where it exists, `deadline` checked BEFORE every chunk, and `ERR_BODY_BYTES` as
+    the cap.
 
-    ⛔ AND IT NEVER RAISES, WHICH MEANS THE MATCH IS INSIDE THE `try` TOO (#2138 r11). With the
+    ⛔ WHAT THAT ACTUALLY BUYS, STATED EXACTLY (#2138 r12, reviewer — the r11 wording here was
+    wrong three times over). `read1()` is one recv per call ONLY for a `Content-Length` body, where
+    it reduces to a plain read; for a CHUNKED body it routes through `_read1_chunked` ->
+    `_get_chunk_left` -> `readline()`, which loops recvs (measured 2.45 s against a 0.5 s
+    deadline), and if `read1` is absent the `e.read` fallback is `read(512)`, i.e. up to 512 recvs
+    (measured 5.19 s). So the operative bound is the CALLER'S DEADLINE, checked between chunks,
+    plus at most one chunk's worth of trickle — and with NO deadline supplied, the 4096-byte cap is
+    the only bound at all (measured 6.33 s against `timeout=0.5`). The one production caller always
+    passes the read's page deadline, which is what makes the deadline the bound that holds.
+
+    ⛔ AND THIS IS NOT "THE SAME STANDARD THE 200 PATH HOLDS ITSELF TO" (#2138 r12). That path reads
+    `r.read(8192)` with no `read1` at all, so its overrun is up to ONE 8 KiB CHUNK — measured
+    4.63 s against a 0.5 s budget. The accurate phrasing for both is the one already used at
+    `_queue_rest`: "a BODY costs at most one chunk past the budget". For a `Content-Length` body
+    this path is TIGHTER than the 200 path, not equal to it.
+
+    ⛔ AND IT NEVER RAISES, WHICH MEANS THE WHOLE BODY IS INSIDE THE `try` (#2138 r11). With the
     comparison outside it, a non-bytes body raised `TypeError` out of `_rest_refusal_text` and out
     of `_rest_get`'s `except` arm, which classified it as a TRANSPORT failure and threw the
-    refusal's kind away. `bytes(raw)` is what makes a non-bytes body simply no evidence.
+    refusal's kind away. What stops that is `raw += chunk`: `raw` starts as `b""` and only ever
+    accumulates, so a `str` body raises `TypeError: can't concat str to bytes` AT THE
+    CONCATENATION — inside the `try`, which is the property that matters. `bytes(raw)` is a
+    no-op belt on an already-bytes value (the r11 note credited it with the protection; it does
+    not provide it).
     """
     raw = b""
     try:
