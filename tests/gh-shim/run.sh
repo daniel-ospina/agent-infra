@@ -966,18 +966,19 @@ grep -q 'gh-gate: GitHub refused' "$TMP/gate-loud-err" \
   && pass "a call that finally FAILS still announces the retry on stderr" \
   || fail "a failing call swallowed its own announcement"
 
-# (c) SIGPIPE: `tr … | grep -Eq …` under `set -o pipefail` returns 141 once the stderr exceeds the
-#     pipe buffer, and 141 reads as "not rate limited" — so the refusal is missed and NO shared
-#     cooldown is written. 64 KB is comfortably past the buffer.
+# (c) SIGPIPE: `tr … | grep -Eq …` under `set -o pipefail` returns 141 once stderr exceeds the
+#     pipe buffer, and 141 reads as "not rate limited". ⛔ THE MATCH MUST COME FIRST and the padding
+#     AFTER: `grep -q` only exits early (and only then SIGPIPEs `tr`) while `tr` still has bytes to
+#     write — a fixture that puts the match LAST never triggers it and passes on the pre-fix code.
 GDIR="$(gate_dir big)"
 GREAL="$TMP/gate-real-big"; GFLAG="$TMP/gate-big-flag"; rm -f "$GFLAG"
 cat > "$GREAL" <<'GHEOF'
 #!/usr/bin/env bash
 if [ ! -f "$GFLAG" ]; then
   : > "$GFLAG"
-  head -c 65536 /dev/zero | tr '\0' 'x' >&2
-  echo '' >&2
   echo 'API rate limit already exceeded for user ID 1' >&2
+  head -c 4194304 /dev/zero | tr '\0' 'x' >&2
+  echo '' >&2
   exit 1
 fi
 printf '{\"ok\":true}\n'
@@ -987,11 +988,15 @@ bout="$(AGENT_GH_REAL="$GREAL" AGENT_GH_GATE_DIR="$GDIR" AGENT_GH_GATE_INTERVAL_
         AGENT_GH_GATE_RETRY_BASE=1 GFLAG="$GFLAG" \
         bash "$SHIM" api user 2>/dev/null)"
 printf '%s' "$bout" | grep -q '"ok":true' \
-  && pass "a 64 KB refusing stderr is still recognised (no SIGPIPE blind spot)" \
+  && pass "a 4 MB refusing stderr (match FIRST, so \`tr\` takes SIGPIPE) is still recognised" \
   || fail "a large refusing stderr was not recognised — the retry/cooldown is silently dead"
 
 # (d) A `retry-after` `[ ]` cannot hold must be treated as ABSENT, never clamped-and-wrapped: the
 #     wrap is written into the SHARED cooldown and parks every lane on the box for ~10^15 years.
+#     ⛔ MAX_ATTEMPTS MUST BE 2, NOT 1: the loop breaks on `tries -ge MAX_ATTEMPTS-1` at tries=0 when
+#     it is 1, so `set_cooldown_ms` is never reached and "no cooldown written" is true for a reason
+#     that has nothing to do with the overflow guard. With 2 the arm exercises the real path and
+#     discriminates (pre-fix wrote 1.86e18; post-fix a bounded 900 s).
 GDIR="$(gate_dir ovf)"
 GREAL="$TMP/gate-real-ovf"
 cat > "$GREAL" <<'GHEOF'
@@ -1002,11 +1007,13 @@ exit 1
 GHEOF
 chmod +x "$GREAL"
 AGENT_GH_REAL="$GREAL" AGENT_GH_GATE_DIR="$GDIR" AGENT_GH_GATE_INTERVAL_MS=0 \
-  AGENT_GH_GATE_MAX_ATTEMPTS=1 AGENT_GH_GATE_RETRY_BASE=1 \
+  AGENT_GH_GATE_MAX_ATTEMPTS=2 AGENT_GH_GATE_RETRY_BASE=1 \
   bash "$SHIM" api user >/dev/null 2>&1
 ovf="$(cat "$GDIR"/cooldown.* 2>/dev/null | head -1)"
+# The invariant is that the WRAPPED deadline never reaches the shared file: either it was never
+# written (treated as absent) or it was bounded. A poisoned ~1.86e18 value fails both arms.
 if [ -z "$ovf" ]; then
-  pass "an unrepresentable retry-after is ignored (no cooldown written)"
+  pass "an unrepresentable retry-after is treated as absent — no poisoned deadline written"
 else
   _now=$(( $(date +%s) * 1000 ))
   if [ "$ovf" -le $(( _now + 900000 )) ] 2>/dev/null; then
@@ -1134,6 +1141,89 @@ case "$out" in
 esac
 
 
+
+echo "== 15. cycle-2 review: no deletion, no stall, no leak, a visible degraded gate (#1910 review) =="
+
+# (a) ⛔ WORKDIR OWNERSHIP. `gate_init` falls back to the OPERATOR'S $TMPDIR when `mktemp -d`
+#     fails, and run_paced's cleanup was `[ "$GATE_DIR" = "$WORKDIR" ] || rm -rf "$WORKDIR"` —
+#     which deleted $TMPDIR WITH ITS CONTENTS on a call that then exited 0, printing nothing.
+#     Reproduced before the fix: a directory holding PRECIOUS.txt vanished.
+GDIR="$TMP/gate-unwritable"
+GREAL="$TMP/gate-real-tmpdir"
+printf '#!/usr/bin/env bash\necho \x27{"ok":true}\x27\n' > "$GREAL"; chmod +x "$GREAL"
+mkdir -p "$TMP/p0stub" "$TMP/precious"
+printf '#!/usr/bin/env bash\nexit 1\n' > "$TMP/p0stub/mktemp"; chmod +x "$TMP/p0stub/mktemp"
+echo IMPORTANT > "$TMP/precious/PRECIOUS.txt"
+PATH="$TMP/p0stub:$PATH" AGENT_GH_REAL="$GREAL" AGENT_GH_GATE_DIR="/proc/nope/gate" \
+  TMPDIR="$TMP/precious" bash "$SHIM" api user >/dev/null 2>&1
+if [ -f "$TMP/precious/PRECIOUS.txt" ]; then
+  pass "the fallback to \$TMPDIR is never deleted (the gate only removes a dir it created)"
+else
+  fail "the gate DELETED the operator's \$TMPDIR and its contents (silent destruction of work)"
+fi
+
+# (b) AN UNAVAILABLE MUTEX FAILS OPEN PROMPTLY. Re-looping to the admission deadline turned a
+#     courtesy gate into a 299 s in-shim block (measured) that consumed a bounded caller's own
+#     budget. A lock held by a LIVE pid cannot be reaped, so it is the honest fixture.
+GDIR="$(gate_dir lockbusy)"
+GREAL="$TMP/gate-real-lockbusy"
+printf '#!/usr/bin/env bash\necho \x27{"ok":true}\x27\n' > "$GREAL"; chmod +x "$GREAL"
+mkdir -p "$GDIR/admit.lock"; printf '1\n' > "$GDIR/admit.lock/pid"   # pid 1 is alive by definition
+_ls=$(date +%s)
+AGENT_GH_REAL="$GREAL" AGENT_GH_GATE_DIR="$GDIR" AGENT_GH_GATE_INTERVAL_MS=0 \
+  bash "$SHIM" api user >/dev/null 2>&1
+_le=$(date +%s)
+[ $(( _le - _ls )) -le 15 ] \
+  && pass "an uncontestable mutex fails OPEN in $(( _le - _ls ))s, not $(( ${AGENT_GH_GATE_ACQUIRE_TIMEOUT:-300} ))s" \
+  || fail "an uncontestable mutex blocked the caller for $(( _le - _ls ))s — the gate's failure mode was a stall"
+
+# (c) A DEGRADED GATE MUST STILL LEAVE A TRACE. The note says the call runs "UNGATED (announced)",
+#     and the buffered copy is discarded on success — so nothing was recorded anywhere, and the
+#     runbook's "read the log" had nothing to read.
+_degraded="${TMPDIR:-/tmp}/gh-gate-degraded.$(id -u 2>/dev/null)"
+rm -f "$_degraded"
+AGENT_GH_REAL="$GREAL" AGENT_GH_GATE_DIR="/proc/nope/gate" bash "$SHIM" api user >/dev/null 2>&1
+[ -s "$_degraded" ] \
+  && pass "a degraded gate records the fail-open in a durable file outside the gate dir" \
+  || fail "a degraded gate recorded nothing — 'announced' was untrue and the log had no entry"
+
+# (d) ONE LANE'S KNOB MUST NOT DELETE THE BOX'S WINDOW. The cooldown self-heal compared a SHARED
+#     deadline against the READING lane's per-invocation AGENT_GH_GATE_RETRY_MAX, so a lane running
+#     with a smaller value deleted a window every other lane was waiting on. The call legitimately
+#     WAITS OUT the window, so start it, give it 2 s, stop it, and ask whether the window survived.
+GDIR="$(gate_dir sharedwin)"
+_until=$(( $(date +%s) * 1000 + 800000 ))
+printf '%s\n' "$_until" > "$GDIR/cooldown.$_until.$$"
+AGENT_GH_REAL="$GREAL" AGENT_GH_GATE_DIR="$GDIR" AGENT_GH_GATE_RETRY_MAX=60 \
+  AGENT_GH_GATE_INTERVAL_MS=0 bash "$SHIM" api user >/dev/null 2>&1 &
+_sw=$!
+sleep 2
+kill -TERM "$_sw" 2>/dev/null; wait "$_sw" 2>/dev/null
+if ls "$GDIR"/cooldown.* >/dev/null 2>&1; then
+  pass "a +800 s window survives a lane running with AGENT_GH_GATE_RETRY_MAX=60"
+else
+  fail "a per-call knob deleted a shared cooldown window other lanes were waiting on"
+fi
+
+# (e) AN INTERACTIVE CALL IS NOT EXEMPT FROM THE STDERR INVARIANT. The branch used to print the
+#     pending notes BEFORE running the child, so a SUCCESSFUL call contaminated `2>&1` — and
+#     `gh-rest/gh` reaches this shim as `run_real … 2>&1 | jq` with a human's tty on stdin, so this
+#     is a real caller, not a hypothetical one. Asserted on the branch's SHAPE because the behaviour
+#     needs a pty and `python3 pty.spawn` did not return on this box even after the child exited.
+#     The shape is the whole regression: nothing may write before the child, and the notes must be
+#     flushed AFTER it, from its exit status (the same rule every other branch follows).
+_iblock="$(awk '/if \[ "\$interactive" -eq 1 \]; then/,/^    fi$/' "$SHIM")"
+if [ -z "$_iblock" ]; then
+  fail "could not locate the interactive branch in $SHIM (the shape assertion is stale)"
+else
+  _ibad=0
+  case "$_iblock" in *'cat "$NOTEF"'*) _ibad=1 ;; esac
+  case "$_iblock" in *'gate_note'*) _ibad=1 ;; esac
+  case "$_iblock" in *'flush_notes "$rc"'*) : ;; *) _ibad=1 ;; esac
+  [ "$_ibad" -eq 0 ] \
+    && pass "the interactive branch writes nothing before the child and flushes notes from its rc" \
+    || fail "the interactive branch can print before the child (contaminating a successful call)"
+fi
 
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks gh-shim test(s) failed"

@@ -471,8 +471,14 @@ gate_note() {
   # caller's stderr (bash reports it before the command runs), so an unwritable notes/log path
   # would contaminate a successful call's stderr by another route. `2>/dev/null >>` suppresses it.
   [ -n "${NOTEF:-}" ] && printf 'gh-gate: %s\n' "$*" 2>/dev/null >> "$NOTEF"
+  # A DEGRADED GATE MUST STILL LEAVE A TRACE. When the gate dir is unusable the note says the call
+  # runs "UNGATED (announced)" — and the buffered copy is discarded on success, so nothing was
+  # recorded anywhere and the runbook's "read the log" had nothing to read. Fall back to a
+  # durable per-user path outside the gate dir.
   if [ -n "${GATE_DIR:-}" ] && [ -d "$GATE_DIR" ]; then
     printf '%s gh-gate: %s\n' "$(date -u +%s 2>/dev/null)" "$*" 2>/dev/null >> "$GATE_DIR/events.log"
+  else
+    printf '%s gh-gate: %s\n' "$(date -u +%s 2>/dev/null)" "$*" 2>/dev/null >> "${TMPDIR:-/tmp}/gh-gate-degraded.$(id -u 2>/dev/null)"
   fi
   return 0
 }
@@ -481,7 +487,10 @@ gate_note() {
 # a zero rc leaves stderr byte-identical to the child's own. The buffer is CONSUMED, so the
 # EXIT trap can call this again without printing twice.
 flush_notes() {
-  [ "${1:-0}" -eq 0 ] && { [ -n "${NOTEF:-}" ] && : 2>/dev/null > "$NOTEF"; return 0; }
+  # rc=0 → do NOT touch the buffer: `flush_notes "$rc"` then the EXIT trap calls it again, and a
+  # truncating write there RECREATED the file the normal path had just removed (litter in the
+  # operator's TMPDIR whenever the gate ran degraded).
+  [ "${1:-0}" -eq 0 ] && return 0
   if [ -n "${NOTEF:-}" ] && [ -s "$NOTEF" ]; then
     cat "$NOTEF" >&2 2>/dev/null
     : 2>/dev/null > "$NOTEF"
@@ -543,7 +552,7 @@ lock_acquire() {
       # An UNRECORDED holder is not a holder: if the pid cannot be written, a later reader
       # cannot tell us from a dead lock, and two processes could sit in the critical section
       # at once. Give it back and report the mutex unavailable (the caller fails OPEN, loudly).
-      if ! printf '%s\n' "$$" > "$lock/pid" 2>/dev/null; then
+      if ! printf '%s\n' "$$" 2>/dev/null > "$lock/pid"; then
         rm -rf "$lock" 2>/dev/null
         return 1
       fi
@@ -584,10 +593,10 @@ cooldown_remaining_ms() {
     [ -e "$f" ] || continue
     v="$(cat "$f" 2>/dev/null)"
     case "$v" in ''|*[!0-9]*) rm -f "$f" 2>/dev/null; continue ;; esac
-    # A POISONED DEADLINE MUST SELF-HEAL. No real window is further ahead than RETRY_MAX; a
-    # wrapped `retry-after` (see retry_wait_ms) or a hand-edited file otherwise parks every
-    # lane on the box until someone deletes the file by hand.
-    if [ "$v" -gt $(( now + RETRY_MAX_S * 1000 )) ]; then rm -f "$f" 2>/dev/null; continue; fi
+    # A POISONED DEADLINE MUST SELF-HEAL — but against a FIXED ceiling, never the reading lane's
+    # own AGENT_GH_GATE_RETRY_MAX: that knob is per-invocation, so a lane that set it lower would
+    # delete a window the whole box is legitimately waiting on.
+    if [ "$v" -gt $(( now + COOLDOWN_ABS_MAX_S * 1000 )) ]; then rm -f "$f" 2>/dev/null; continue; fi
     if [ "$v" -le "$now" ]; then rm -f "$f" 2>/dev/null; continue; fi
     [ "$v" -gt "$max" ] && max="$v"
   done
@@ -601,7 +610,7 @@ set_cooldown_ms() {
   case "$ms" in ''|*[!0-9]*) return 0 ;; esac
   [ "$ms" -gt 0 ] || return 0
   until=$(( $(now_ms) + ms ))
-  printf '%s\n' "$until" > "$GATE_DIR/cooldown.$until.$$" 2>/dev/null
+  printf '%s\n' "$until" 2>/dev/null > "$GATE_DIR/cooldown.$until.$$"
   return 0
 }
 
@@ -645,7 +654,7 @@ admit_slot() {
       done
       if [ "$n" -lt "$MAX_INFLIGHT" ]; then
         MY_SLOT="$GATE_DIR/slots/$$.$(now_ms).$RANDOM"
-        if printf '%s\n' "$$" > "$MY_SLOT" 2>/dev/null; then
+        if printf '%s\n' "$$" 2>/dev/null > "$MY_SLOT"; then
           lock_release "$GATE_DIR/admit.lock"
           return 0
         fi
@@ -657,9 +666,12 @@ admit_slot() {
       sleep_ms 50
       continue
     fi
-    now="$(now_ms)"
-    [ "$now" -ge "$deadline" ] && return 2
-    sleep_ms 50
+    # A mutex we cannot take is not worth waiting ACQUIRE_TIMEOUT for: `mkdir` being REFUSED
+    # does not become possible with time, and `lock_acquire` has ALREADY spent LOCK_TIMEOUT_MS
+    # trying. Re-looping to the admission deadline turned a courtesy gate into a 299 s in-shim
+    # block (measured, default knobs) that consumed the bounded caller's own 60-420 s budget and
+    # produced the very STALL that `GH_LIMIT_NO_WAIT` exists to avoid. Fail open NOW.
+    return 2
   done
 }
 
@@ -692,7 +704,7 @@ pace_tick() {
   # A clock that jumped BACKWARD must not turn into an unbounded sleep.
   [ "$wait_ms" -gt "$INTERVAL_MS" ] && wait_ms="$INTERVAL_MS"
   if [ "$wait_ms" -gt 0 ]; then sleep_ms "$wait_ms"; now="$(now_ms)"; fi
-  printf '%s\n' "$now" > "$GATE_DIR/last.$$" 2>/dev/null
+  printf '%s\n' "$now" 2>/dev/null > "$GATE_DIR/last.$$"
   mv -f "$GATE_DIR/last.$$" "$GATE_DIR/last" 2>/dev/null
   lock_release "$GATE_DIR/tick.lock"
   return 0
@@ -742,7 +754,7 @@ retry_wait_ms() {
 
 gate_init() {
   local base
-  GATE_ON=1; NESTED=0; MY_SLOT=""; WORKDIR=""
+  GATE_ON=1; NESTED=0; MY_SLOT=""; WORKDIR=""; WORKDIR_OWNED=0
   base="${HOME:-${TMPDIR:-/tmp}}"
   GATE_DIR="${AGENT_GH_GATE_DIR:-$base/.pi/agent/gh-gate}"
   MAX_INFLIGHT="$(num_or "${AGENT_GH_GATE_MAX_INFLIGHT:-}" 2)"
@@ -750,6 +762,9 @@ gate_init() {
   MAX_ATTEMPTS="$(num_or "${AGENT_GH_GATE_MAX_ATTEMPTS:-}" 3)"
   RETRY_BASE_S="$(num_or "${AGENT_GH_GATE_RETRY_BASE:-}" 60)"
   RETRY_MAX_S="$(num_or "${AGENT_GH_GATE_RETRY_MAX:-}" 900)"
+  # FIXED, not a knob: the self-heal ceiling for the SHARED cooldown. A per-call knob must not
+  # decide what counts as an impossible deadline for the whole box (see cooldown_remaining_ms).
+  COOLDOWN_ABS_MAX_S=86400
   ACQUIRE_TIMEOUT_MS=$(( $(num_or "${AGENT_GH_GATE_ACQUIRE_TIMEOUT:-}" 300) * 1000 ))
   LOCK_TIMEOUT_MS="$(num_or "${AGENT_GH_GATE_LOCK_TIMEOUT_MS:-}" 2000)"
   # Coerce EVERY limit before its first arithmetic read: `[ -ge ]` on a non-number is
@@ -766,7 +781,16 @@ gate_init() {
   # must not be able to add to it (nor read who is calling what).
   if ! mkdir -p "$GATE_DIR/slots" 2>/dev/null; then GATE_ON=0; fi
   chmod 700 "$GATE_DIR" "$GATE_DIR/slots" 2>/dev/null
-  if [ "$GATE_ON" -eq 1 ]; then WORKDIR="$GATE_DIR"; else WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/gh-gate.XXXXXX" 2>/dev/null)"; fi
+  if [ "$GATE_ON" -eq 1 ]; then
+    WORKDIR="$GATE_DIR"
+  elif WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/gh-gate.XXXXXX" 2>/dev/null)" && [ -n "$WORKDIR" ]; then
+    # ⛔ OWNED MEANS WE CREATED IT AND MAY DELETE IT. Never inferred from "not equal to
+    # GATE_DIR": the fallback below is the operator's TMPDIR, and the cleanup at the end of
+    # run_paced is `rm -rf "$WORKDIR"` — so the old test DELETED $TMPDIR WITH ITS CONTENTS
+    # whenever mktemp failed (reproduced: a directory holding a file was silently removed by a
+    # call that then exited 0, with nothing printed anywhere). Silent destruction of work.
+    WORKDIR_OWNED=1
+  fi
   [ -n "$WORKDIR" ] || WORKDIR="${TMPDIR:-/tmp}"
   # A NESTED call (the evidence verifier shells out to `gh`) already runs inside the
   # parent's slot and must not take a second one — with a cap of 2, two parents each
@@ -817,12 +841,15 @@ run_paced() {
     fi
     [ -n "${MY_SLOT:-}" ] && export AGENT_GH_GATE_SLOT="$MY_SLOT"
     if [ "$interactive" -eq 1 ]; then
-      # No capture, so the child's stderr IS this terminal: replay any buffered notes straight
-      # away rather than holding them for a failure that will never be detected here.
-      [ -n "$NOTEF" ] && [ -s "$NOTEF" ] && cat "$NOTEF" >&2 2>/dev/null
+      # ⛔ NO NOTE BEFORE THE CHILD RUNS. This branch has no capture, but stderr is NOT
+      # necessarily a terminal: `gh-rest/gh` reaches here as `run_real … 2>&1 | jq` with stdin
+      # inherited from a human's tty, so printing the pending notes first contaminated a
+      # SUCCESSFUL call's merged output (reproduced with a pty on stdin). Replay them after,
+      # only if the call failed — identical to every other branch.
       "$REAL" "$@"
       rc=$?
       release_slot
+      flush_notes "$rc"
       rm -f "$NOTEF" "$errf" 2>/dev/null
       exit "$rc"
     fi
@@ -869,7 +896,7 @@ run_paced() {
   [ -s "$errf" ] && cat "$errf" >&2 2>/dev/null
   flush_notes "$rc"
   rm -f "$errf" "$NOTEF" 2>/dev/null
-  [ "$GATE_DIR" = "$WORKDIR" ] || rm -rf "$WORKDIR" 2>/dev/null
+  [ "$WORKDIR_OWNED" -eq 1 ] && rm -rf "$WORKDIR" 2>/dev/null
   exit "$rc"
 }
 

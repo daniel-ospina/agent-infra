@@ -248,6 +248,10 @@ ls ~/.pi/agent/gh-gate/slots | wc -l          # slots HELD — a stale one is re
                                               # the next admission, so this can slightly overstate
 ls ~/.pi/agent/gh-gate/cooldown.* 2>/dev/null  # an active refusal window
 tail -5 ~/.pi/agent/gh-gate/events.log         # what the gate did: paces, waits, fail-open notes
+cat "${TMPDIR:-/tmp}/gh-gate-degraded.$(id -u)"  # present only if the gate dir was UNUSABLE:
+                                              # every call then ran UNGATED, and this is the
+                                              # only place that fact is recorded (it cannot live
+                                              # in the gate dir that is unusable).
 ```
 
 - `graphql.remaining: 0` → GraphQL **primary** pool exhausted; REST (`core`) is usually still fine.
