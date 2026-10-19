@@ -866,21 +866,33 @@ grep -q 'resolving the conflict IS the task' "$HERE/fix-one.sh" && rc=0 || rc=1
 ck "the fixer prompt treats a conflict as the task" $rc
 # Drive the shipped rule rather than grepping for a comment: a regression that dropped the
 # 'lanes >= 1' exception or the headroom arithmetic must fail here.
-sed -n '/^mp_reason() {/,/^}/p;/^review_slots() {/,/^}/p' "$LOOP" > "$TMP/mp.sh"
+{ grep -E '^is_num\(\) \{' "$LOOP"; sed -n '/^mp_reason() {/,/^}/p;/^review_slots() {/,/^}/p' "$LOOP"; } > "$TMP/mp.sh"
 if need "$TMP/mp.sh" "mp_reason()/review_slots() are extracted from the shipped loop"; then
   MERGE_PRIORITY_AT=10; MAX_REVIEW=4
+  # ⛔ THE BOUND'S EVIDENCE IS PART OF THE RULE, so the shipped form is driven WITH it: a live
+  # worker, a land inside the window, and an unowned PR younger than the window. Without the last
+  # two the gate releases by design (agent-infra#2040), so passing only (count, lanes, workers)
+  # would assert the OLD rule and pass vacuously on the new one.
+  MERGE_PRIORITY_MAX_AGE_MIN=180; MP_NOW=1800000000; MP_LAND=$(( MP_NOW - 300 ))
   # shellcheck disable=SC1090
   . "$TMP/mp.sh"
-  [ -n "$(mp_reason 11 1)" ] && rc=0 || rc=1
-  ck "shipped mp_reason(): 11 open PRs with a lane running -> drain" $rc
-  [ -z "$(mp_reason 11 0)" ] && rc=0 || rc=1
+  [ -n "$(mp_reason 11 1 0 5 "$MP_LAND" 11 acme/widget "$MP_NOW")" ] && rc=0 || rc=1
+  ck "shipped mp_reason(): 11 open PRs with a lane running (land in window, young PRs) -> drain" $rc
+  [ -z "$(mp_reason 11 1 0 5 "$(( MP_NOW - 4 * 3600 ))" 11 acme/widget "$MP_NOW")" ] && rc=0 || rc=1
+  ck "shipped mp_reason(): the same backlog with NO land in the window RELEASES (the bound)" $rc
+  [ -z "$(mp_reason 11 0 0 5 "$MP_LAND" 11 acme/widget "$MP_NOW")" ] && rc=0 || rc=1
   ck "shipped mp_reason(): 11 open PRs with NO lane -> dispatch still allowed" $rc
-  [ -z "$(mp_reason 10 3)" ] && rc=0 || rc=1
+  [ -z "$(mp_reason 10 3 0 5 "$MP_LAND" 10 acme/widget "$MP_NOW")" ] && rc=0 || rc=1
   ck "shipped mp_reason(): at the threshold, no drain override" $rc
   [ "$(review_slots 11)" = "6" ] && rc=0 || rc=1
   ck "shipped review_slots(): backlog raises reviewer headroom to MAX_REVIEW+2" $rc
   [ "$(review_slots 10)" = "4" ] && rc=0 || rc=1
   ck "shipped review_slots(): below the threshold, headroom is MAX_REVIEW" $rc
+  # ⛔ The tunable must not leak into the rest of the suite: an EXPORTED MERGE_PRIORITY_AT in the
+  # caller's environment survives this plain assignment, so §16's open_pr_count driver inherited
+  # `10` and its "a first-ever failure assumes 26" assertion read 11 (measured — the failure was
+  # the ambient env, not the fallback). Unset it, so §16 grades the SHIPPED default.
+  unset MERGE_PRIORITY_AT MERGE_PRIORITY_MAX_AGE_MIN
 fi
 grep -qE 'case "\$\{PR_ST:-\}" in MERGED\|CLOSED\)' "$LOOP" && rc=0 || rc=1
 ck "sweep skips CLOSED as well as MERGED" $rc
@@ -2060,7 +2072,7 @@ fi
 # patterns (cmux's `cmux-cli-shims` is a real one on this box) resolves the tool to a wrapper that
 # exits 127, and a resolution-only probe reports install success while every lane spawn then fails.
 # Drive the SHIPPED probe block with a fixture whose `pi` resolves but cannot run.
-awk '/^for bin in tmux uv pi gh jq; do$/{f=1} f{print} f&&/^done$/{exit}' "$INST" > "$TMP/probe.sh"
+awk '/^for bin in tmux uv pi gh jq cmux; do$/{f=1} f{print} f&&/^done$/{exit}' "$INST" > "$TMP/probe.sh"
 if need "$TMP/probe.sh" "the install-time probe is extracted from the shipped install.sh"; then
   PB="$TMP/probe"; mkdir -p "$PB/bin"
   for b in tmux uv gh jq; do printf '#!/bin/bash\nexit 0\n' > "$PB/bin/$b"; chmod +x "$PB/bin/$b"; done
@@ -2078,6 +2090,21 @@ if need "$TMP/probe.sh" "the install-time probe is extracted from the shipped in
   PATH="$PB/bin:/usr/bin:/bin" DAEMON_PATH="$PB/bin" bash "$PB/drive.sh" >/dev/null 2>&1; rc=$?
   [ "$rc" = "0" ] && rc=0 || { rc=1; echo "      probe rc=$rc (expected 0 when every resolved tool runs)"; }
   ck "the probe passes when every resolved tool runs" $rc
+  # ⛔ cmux IS A PROBE ENTRY BECAUSE ITS ABSENCE IS SILENT AND TOTAL. The pre-flight's holder surface
+  # reads the fleet board's live-session store through `cmux sessions list`; an unrunnable cmux leaves
+  # `liveness_measured` False, the board carrying `orphans[kind=liveness-unmeasured]`, and EVERY
+  # candidate INCOMPLETE — so the refresh aborts by design (#1736) and the backlog drains to 0. A box
+  # with NO cmux never reaches the branch (`command -v` skips it); one that HAS it must be able to RUN
+  # it, which is the shim/wrapper case this probe exists for.
+  printf '#!/bin/bash\nexit 0\n' > "$PB/bin/cmux"; chmod +x "$PB/bin/cmux"
+  PATH="$PB/bin:/usr/bin:/bin" DAEMON_PATH="$PB/bin" bash "$PB/drive.sh" >/dev/null 2>&1; rc=$?
+  [ "$rc" = "0" ] && rc=0 || { rc=1; echo "      probe rc=$rc (expected 0 — a runnable cmux must not fail the install)"; }
+  ck "the probe passes when a resolved cmux RUNS" $rc
+  printf '#!/bin/bash\nexit 127\n' > "$PB/bin/cmux"; chmod +x "$PB/bin/cmux"
+  PATH="$PB/bin:/usr/bin:/bin" DAEMON_PATH="$PB/bin" bash "$PB/drive.sh" >/dev/null 2>&1; rc=$?
+  [ "$rc" = "9" ] && rc=0 || { rc=1; echo "      probe rc=$rc (expected 9 — a resolved-but-non-running cmux would certify nothing)"; }
+  ck "the probe fails install when a resolved cmux cannot RUN (nothing could be queued)" $rc
+  rm -f "$PB/bin/cmux"
   # An EXPORTED shell function named `gh` must NOT satisfy the probe: `command -v` reports it, but a
   # function is not what launchd execs and the daemon PATH has no gh binary at all.
   PB2="$PB/bin2"; mkdir -p "$PB2"
@@ -2463,10 +2490,12 @@ NGRD="$( { grep -F 'is_num() {' "$LOOP"; grep -F 'is_limit() {' "$LOOP"; grep -E
 # coercion lines present -- the guard could not fail while is_num() existed. Count the coercion lines,
 # and count an EXACT number: adding a coercion without adding its pin is the failure this catches.
 _ngrd_n="$(printf '%s\n' "$NGRD" | grep -cE '^is_(num|limit) "\$\{[A-Z_]+:')"
-# 12 -> 14 for agent-infra#1762 (SWEEP_MAX_AGE, SWEEP_MIN_REMAIN). The exact count is the point:
+# 12 -> 14 for agent-infra#1762 (SWEEP_MAX_AGE, SWEEP_MIN_REMAIN); 14 -> 16 for agent-infra#2040
+# (MERGE_PRIORITY_MAX_AGE_MIN + FUNNEL_MAX_AGE_MIN: the merge-priority bound and the funnel's age
+# bound). The exact count is the point:
 # a coercion added without its pin must redden this check, not pass as "more is better".
-[ "$_ngrd_n" = "14" ] && rcn=0 || { rcn=1; echo "      expected 14 shipped coercions in the extraction, got $_ngrd_n"; }
-ck "all 14 shipped limit coercions are extracted (a definition alone is not an extraction)" $rcn
+[ "$_ngrd_n" = "16" ] && rcn=0 || { rcn=1; echo "      expected 16 shipped coercions in the extraction, got $_ngrd_n"; }
+ck "all 16 shipped limit coercions are extracted (a definition alone is not an extraction)" $rcn
 # The CYC FLOOR is part of the same coercion block but is not an is_* line, so it is extracted by an
 # explicit pattern (P3, third review round, 2026-10-14). Without it in NGRD, `nlim` could not drive
 # CYC=0 and the floor assertion below would be RED on the FIXED file — a false negative that would

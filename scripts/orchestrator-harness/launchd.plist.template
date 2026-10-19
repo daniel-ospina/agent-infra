@@ -58,6 +58,10 @@
     <string>__MAX_REVIEW__</string>
     <key>MERGE_PRIORITY_AT</key>
     <string>__MERGE_PRIORITY_AT__</string>
+    <key>MERGE_PRIORITY_MAX_AGE_MIN</key>
+    <string>__MERGE_PRIORITY_MAX_AGE_MIN__</string>
+    <key>FUNNEL_MAX_AGE_MIN</key>
+    <string>__FUNNEL_MAX_AGE_MIN__</string>
     <key>MAX_FIX</key>
     <string>__MAX_FIX__</string>
     <key>MAX_FIX_TRIES</key>

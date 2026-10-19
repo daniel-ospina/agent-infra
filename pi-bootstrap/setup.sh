@@ -447,7 +447,15 @@ fi
 # it, executable, in $DEST/scripts. A name left in BOTH places is refused loudly by the
 # UNFARM leg at the end of this file (the copy leg would just re-create it); dropping
 # it here WITHOUT declaring it is caught by the snapshot check on the next sync.
-fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-cache-reap.sh pi-reap-worktrees.sh reap-lane-venvs.sh disk-reaper.sh install-disk-reaper-timer.sh pi-reap-worktrees-launchd.py cleanup-stale-branches.sh ci_runner_gate.sh ask-owner.py beta-progress.py cadence-nudge.sh cadence-timer.sh child-check.py cloud-cell-quiesce.sh deploy-crossbox.sh deploy-mac-orchestrator.sh goal-state.py lane-actions.py lane-guard.py lane-read.py lane-scan-fallback.sh lane-watchdog.py lane-wip.py live-workspaces-publisher.py merge-queue.py orch-send.sh orchestrator-heartbeat.sh orphan-reap.py pr-doctor.py objective.py probe-one.py publish-live-workspaces.py queue-dispatch.py safe-send.sh seed-goal-map.py tree-cpu.py turn-classify.py turn-end.py unblock-lane.sh undelivered-answers.py)
+# #2053 adds worktree-hygiene-sweep.sh: the 6-hourly com.tortoise.worktree-hygiene job
+# executes the FARMED copy (its ProgramArguments name that path), and
+# install-launchd.sh's broken-target guard refuses the WHOLE install — every other
+# template included — when the farmed script is absent. It ships DISARMED: the unit is
+# armed per box by `install-launchd.sh --arm-worktree-hygiene`, which itself runs the
+# sweep's `--preflight` and refuses a box whose engine prerequisites do not resolve.
+# Farming the sweep is what makes that preflight able to run at all (it is executed
+# from the farmed path), so the arming can never bless a unit pointed at nothing.
+fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-cache-reap.sh pi-reap-worktrees.sh reap-lane-venvs.sh disk-reaper.sh install-disk-reaper-timer.sh pi-reap-worktrees-launchd.py cleanup-stale-branches.sh ci_runner_gate.sh ask-owner.py beta-progress.py cadence-nudge.sh cadence-timer.sh child-check.py cloud-cell-quiesce.sh deploy-crossbox.sh deploy-mac-orchestrator.sh goal-state.py lane-actions.py lane-guard.py lane-read.py lane-scan-fallback.sh lane-watchdog.py lane-wip.py live-workspaces-publisher.py merge-queue.py orch-send.sh orchestrator-heartbeat.sh orphan-reap.py pr-doctor.py objective.py probe-one.py publish-live-workspaces.py queue-dispatch.py safe-send.sh seed-goal-map.py tree-cpu.py turn-classify.py turn-end.py unblock-lane.sh undelivered-answers.py worktree-hygiene-sweep.sh)
 mkdir -p "$DEST/scripts"
 fleet_copied=0
 for base in "${fleet_srcs[@]}"; do
@@ -494,7 +502,14 @@ echo "    scripts fleet farm: $fleet_copied copied (fleet cadence, #373 + runner
 # scripts resolve it as `$(dirname "${BASH_SOURCE[0]}")/lib/beat-pair.sh`). A
 # missing lib makes the guard FAIL CLOSED: the pair is treated as unverifiable
 # and the act clause is withheld, with a logged reason — never a silent pass.
-lib_srcs=(pid-identity.sh diff-normalize.py beat-pair.sh)
+# #2046 adds a FOURTH sibling: `scripts/lib/bounded.sh` is the ONE bounded-execution
+# helper for the reaper family. `disk-reaper.sh` and `pi-reap-worktrees.sh` both
+# source it and both REFUSE at startup (exit 3) without it, because a probe with
+# no watchdog is a probe that can hang the host they exist to unload. Farming the
+# reapers WITHOUT this sibling re-arms the hourly pass as a startup refusal; on a
+# Mac that is strictly better than the pre-#2046 behaviour it replaces (every
+# class fail-closed with `timeout: command not found` while the pass completed).
+lib_srcs=(pid-identity.sh diff-normalize.py beat-pair.sh bounded.sh)
 mkdir -p "$DEST/scripts/lib"
 lib_copied=0
 lib_failed=0
@@ -527,10 +542,10 @@ for base in "${lib_srcs[@]}"; do
   fi
 done
 if [ "$lib_failed" -gt 0 ]; then
-  echo "    scripts lib farm: $lib_copied copied, $lib_failed FAILED/MISSING (pid-identity.sh + diff-normalize.py + beat-pair.sh, #1178/#1362)" >&2
+  echo "    scripts lib farm: $lib_copied copied, $lib_failed FAILED/MISSING (pid-identity.sh + diff-normalize.py + beat-pair.sh + bounded.sh, #1178/#1362/#2046)" >&2
   farm_missing+="scripts/lib/ ($lib_failed declared sibling(s) FAILED or MISSING)"$'\n'
 else
-  echo "    scripts lib farm: $lib_copied copied (pid-identity.sh + diff-normalize.py + beat-pair.sh, #1178/#1362)"
+  echo "    scripts lib farm: $lib_copied copied (pid-identity.sh + diff-normalize.py + beat-pair.sh + bounded.sh, #1178/#1362/#2046)"
 fi
 
 # Fleet-tools farm (#1178 unit 3): the scheduled lane-liveness report
