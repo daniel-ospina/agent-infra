@@ -726,6 +726,27 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     overrides: ["SWEEP_MAX_AGE=600"],
     note: "how long a 304 may serve a cached PR listing before `If-None-Match` is DROPPED and a full sweep forced (#1762). A FRESHNESS bound, not a kill bound: a completed check run does NOT reliably bump the listing ETag (measured), so without this floor a green PR could sit unmerged behind a cached \"unchanged\" forever — the cell-cannot-merge-reads-as-idle failure the bound exists to remove. The second declaration is the is_limit coercion; it is recorded so a third assignment cannot shadow the default unnoticed.",
   },
+  // — gate axis: the merge-priority gate's measured EVIDENCE AGES (#2040) —
+  //
+  // These are not kill bounds. They are the two readings the bounded
+  // merge-priority gate compares against its age window, and the failure they
+  // exist to prevent is the gate that can never open: "drain the unowned PRs
+  // first" is a condition no unattended lane can clear, so an UNBOUNDED gate
+  // stops dispatch forever while every cycle reports success. Registering them
+  // here is what stops a future lane from re-introducing an unbounded form
+  // unnoticed: the reverse scan refuses a new stall/liveness-family
+  // declaration that nobody classified, which is exactly how an unbounded
+  // bound reappears.
+  {
+    name: "LAND_AGE",
+    owners: ["scripts/orchestrator-harness/orch-loop.sh"],
+    value: '""',
+    axis: "gate",
+    guardedBy:
+      "test-gates.sh: the value is driven from a REAL backdated state/merged-<PR>.done marker and read back through mp_recent_land (a fresh stamp yields a small age, a stale one a large age); the no-marker case is an empty value, which the [cap] line renders as '?'",
+    overrides: ["$(( (_now_a - (10#$LAND_EPOCH)) / 60 ))"],
+    note: "age (minutes) of the last LAND seen by this box; the second declaration is the derived value from LAND_EPOCH. Empty means 'no land observed'. It is DISPLAY ONLY (#2099): it feeds the `[cap] last_land=` field and the DRAIN STALLED diagnostic, and it deliberately gates NOTHING — an empty or large age must never open the issue path, because 'PRs are not landing' is a land/capacity problem to fix, not a licence to dispatch new work (the age-based RELEASE #2038 proposed was rejected as a reversal of the owner's ruling and is pinned absent in test-gates.sh).",
+  },
   // — retention axis —
   {
     name: "MAX_AGE_DAYS",

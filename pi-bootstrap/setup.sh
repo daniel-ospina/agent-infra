@@ -502,14 +502,23 @@ echo "    scripts fleet farm: $fleet_copied copied (fleet cadence, #373 + runner
 # scripts resolve it as `$(dirname "${BASH_SOURCE[0]}")/lib/beat-pair.sh`). A
 # missing lib makes the guard FAIL CLOSED: the pair is treated as unverifiable
 # and the act clause is withheld, with a logged reason — never a silent pass.
-# #2046 adds a FOURTH sibling: `scripts/lib/bounded.sh` is the ONE bounded-execution
+# #1921 adds a FOURTH sibling: the VENDORED transcript-pattern producer
+# (`scripts/lib/transcript-patterns.sh`) that the farmed `session-postmortem.sh`
+# execs for the Transcript Patterns section of every retrospective. Before this,
+# that producer was resolved from an absolute `/Users/<owner>/…/eldato/scripts/`
+# path in ANOTHER checkout — so on every box but the owner's (and on every Linux
+# cell) the section degraded to a placeholder inside a generated report. Farming
+# it beside the consumer is what makes the section exist everywhere the consumer
+# does (same `lib/` → `$DEST/scripts/lib/` layout as the three above; the
+# consumer resolves `$(dirname "${BASH_SOURCE[0]}")/lib/transcript-patterns.sh`).
+# #2046 adds a FIFTH: `scripts/lib/bounded.sh` is the ONE bounded-execution
 # helper for the reaper family. `disk-reaper.sh` and `pi-reap-worktrees.sh` both
 # source it and both REFUSE at startup (exit 3) without it, because a probe with
 # no watchdog is a probe that can hang the host they exist to unload. Farming the
 # reapers WITHOUT this sibling re-arms the hourly pass as a startup refusal; on a
 # Mac that is strictly better than the pre-#2046 behaviour it replaces (every
 # class fail-closed with `timeout: command not found` while the pass completed).
-lib_srcs=(pid-identity.sh diff-normalize.py beat-pair.sh bounded.sh)
+lib_srcs=(pid-identity.sh diff-normalize.py beat-pair.sh bounded.sh transcript-patterns.sh)
 mkdir -p "$DEST/scripts/lib"
 lib_copied=0
 lib_failed=0
@@ -541,11 +550,18 @@ for base in "${lib_srcs[@]}"; do
     lib_failed=$((lib_failed+1))
   fi
 done
+# The summary NAMES what it farmed, DERIVED from the array (#1921): a hand-kept list here drifts
+# the moment a lib is added, and test-setup-no-nesting.sh asserts every declared lib is named —
+# so a stale list turns a correct farm into a red, or worse, names a lib it did not copy.
+lib_names="$(printf '%s + ' "${lib_srcs[@]}")"; lib_names="${lib_names% + }"
 if [ "$lib_failed" -gt 0 ]; then
-  echo "    scripts lib farm: $lib_copied copied, $lib_failed FAILED/MISSING (pid-identity.sh + diff-normalize.py + beat-pair.sh + bounded.sh, #1178/#1362/#2046)" >&2
+  echo "    scripts lib farm: $lib_copied copied, $lib_failed FAILED/MISSING ($lib_names, #1178/#1362/#1897/#2046/#1921)" >&2
+  # #1924: a lib that DECLARED but did not land is an INCOMPLETE checkout, not a
+  # tolerated skip — record it so the run fails before the UNFARM leg instead of
+  # delivering consumers whose sibling is absent.
   farm_missing+="scripts/lib/ ($lib_failed declared sibling(s) FAILED or MISSING)"$'\n'
 else
-  echo "    scripts lib farm: $lib_copied copied (pid-identity.sh + diff-normalize.py + beat-pair.sh + bounded.sh, #1178/#1362/#2046)"
+  echo "    scripts lib farm: $lib_copied copied ($lib_names, #1178/#1362/#1897/#2046/#1921)"
 fi
 
 # Fleet-tools farm (#1178 unit 3): the scheduled lane-liveness report
@@ -674,6 +690,46 @@ for base in "${merge_gate_srcs[@]}"; do
   merge_gate_copied=$((merge_gate_copied+1))
 done
 echo "    scripts merge-gate farm: $merge_gate_copied copied (record-review.sh, #562)"
+
+# ── the pi spawn-point gate (#1884) ──────────────────────────────────────────
+# Installed as `pi` — not as a farmed script — because that is the whole point: `spawn-gate.sh` is
+# ALSO an executable whose invoked identity IS the gate (see "THE SPAWN POINT" in that file), and it
+# is installed under the name a caller actually types. $DEST/bin is FIRST on PATH on this fleet
+# (measured on the laptop and on a cmux cell, and install-launchd.sh keeps it in the runner-gate
+# plist PATH so the daemon and the tmux children it starts inherit it), so every `pi` invocation
+# resolves here: lane.sh, fix-one.sh, merge-one.sh, a hand-written tmux runner, an interactive
+# session. Before #1884 the gate was reachable only by callers that sourced it, and a runner that
+# did not was UNGATED AND SILENT — that is how a box reached load 258 against its own ceiling of 100.
+#
+# ONE COPY, from ONE source: the same file the harness callers source, so the ceiling a caller applies
+# and the ceiling the spawn point applies cannot drift. A real copy rather than a symlink for the
+# #427 reason (a symlink into the checkout EPERMs under launchd/TCC and dangles when a worktree is
+# reaped — a dangling `pi` on PATH breaks every lane on the box).
+SPAWN_GATE_SRC="$INFRA_ROOT/scripts/orchestrator-harness/spawn-gate.sh"
+if [ -f "$SPAWN_GATE_SRC" ]; then
+  mkdir -p "$DEST/bin"
+  if [ -e "$DEST/bin/pi" ] && ! cmp -s "$SPAWN_GATE_SRC" "$DEST/bin/pi"; then
+    # Someone else's `pi` in this directory would be silently REPLACED by the line below, and a
+    # different `pi` launcher is exactly the kind of local tooling an operator would not want
+    # clobbered unnoticed — so keep it, loudly.
+    cp -f "$DEST/bin/pi" "$DEST/bin/pi.bak-bootstrap" 2>/dev/null || true
+    echo "    backed up a pre-existing $DEST/bin/pi to pi.bak-bootstrap (it is not this repo's gate)"
+  fi
+  cp -f "$SPAWN_GATE_SRC" "$DEST/bin/pi"
+  chmod +x "$DEST/bin/pi" 2>/dev/null || true
+  echo "    pi spawn-point gate installed at $DEST/bin/pi (#1884)"
+  # A gate that is installed but NOT ahead of the real pi on PATH is a false install: it would report
+  # success here while every spawn resolved past it. Say so at install time, when it is cheap to fix.
+  case ":$PATH:" in
+    *"/.pi/agent/bin:"*) ;;
+    *) echo "    WARNING: $DEST/bin is not on this shell's PATH, so the spawn-point gate is NOT in front of \`pi\` here." >&2 ;;
+  esac
+else
+  echo "ERROR: $SPAWN_GATE_SRC is missing — the pi spawn-point gate (#1884) was NOT installed." >&2
+  echo "       Every \`pi\` a hand-written runner starts would then be ungated and silent, which is the" >&2
+  echo "       defect #1884 records. Re-clone agent-infra and re-run this script." >&2
+  exit 1
+fi
 
 # ── UNFARM leg (#1924) ────────────────────────────────────────────────────
 # Every farm above is COPY-ONLY: `cp -f` writes the names an array lists and does
