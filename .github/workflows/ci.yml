@@ -255,7 +255,7 @@ jobs:
         # blindness flag and on the objective cache's freshness were pinned by suites
         # CI could not execute. A suite the repo does not RUN is a suite it does not
         # HAVE — naming them is the half of the landing that makes the other half count.
-        run: python3.12 -m pytest scripts/test_parallel_work_check.py tests/test_ci_exemption.py tests/test_ci_exemption_producer.py scripts/test_lane_status.py scripts/test_lane_actions.py scripts/test_lane_watchdog.py scripts/test_admin_merge_head.py scripts/test_objective.py scripts/test_turn_classify_state.py scripts/test_pr_doctor.py -x --timeout=60 -q
+        run: python3.12 -m pytest scripts/test_parallel_work_check.py tests/test_ci_exemption.py tests/test_ci_exemption_producer.py scripts/test_lane_status.py scripts/test_lane_actions.py scripts/test_lane_watchdog.py scripts/test_admin_merge_head.py scripts/test_objective.py scripts/test_turn_classify_state.py scripts/test_pr_doctor.py scripts/test_ask_owner.py scripts/test_queue_dispatch.py -x --timeout=60 -q
 
   verify:
     # #1349 — the pytest half MOVED to the `test` job above, so that the PR lane
@@ -544,6 +544,23 @@ jobs:
         # step (the post-merge `extensions/*/test*.mjs` glob in ci-main.yml is
         # not PR-triggered); perf-parity with the #744 step above.
         run: node extensions/main-worktree-guard/test-discard-gate.mjs
+      - name: main-worktree-guard script-content backdoor gate (#1484, false positives #1485)
+        # #1484 gated the CONTENT of every executed path, so (a) a COMPILED
+        # EXECUTABLE was read as a script — `/Users/…/bin/gh` is a Go binary whose
+        # bytes contain the word `git`, which refused EVERY `gh issue list`/`api`/
+        # `pr list` — and (b) a COMMITTED repo script was gated on the operation it
+        # implements, so this repo's own `scripts/admin-merge.sh` could not be run
+        # from the hub. #1485 exempts opaque executables and committed repo
+        # scripts, and this suite pins BOTH that the two false positives are gone
+        # and that the #1484 threat (a fresh script written then executed against
+        # the shared main checkout) is still refused — the relaxation must not be
+        # a hole. Behavioral: loads the REAL index.ts through module-load-hooks.mjs
+        # and drives the tool_call handler against a hermetic hub.
+        # Zero-dep (`node:*` + the `git` binary), no `npm ci`, ~5s. Its own step
+        # (like #709/#744 above) because the `extensions/*/test*.mjs` glob in
+        # ci-main.yml is POST-MERGE only, and a fail-open regression in a guard
+        # must not reach main before anything reads it.
+        run: node extensions/main-worktree-guard/test-script-backdoor.mjs
       - name: task-cwd-guard shared-main spawn-cwd gate (#1240)
         # A `task` dispatch with no explicit `cwd` inherits the PARENT's cwd
         # (#1071), so ~124 dispatches/hour on the tortoise hub landed in a

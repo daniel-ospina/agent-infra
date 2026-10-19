@@ -2,19 +2,101 @@
 # orch-loop.sh — self-sustaining orchestrator loop (bash 3.2).
 # Fast, non-blocking cycle: heartbeat -> merge sweep -> capacity-gated dispatch -> background refresh.
 set -u
-OR="${OR:-daniel-ospina/tortoise}"
-# ⛔ THE OLD DEFAULT POINTED AT A PATH THAT DOES NOT EXIST ON THIS BOX
-# (/Users/home/eldato/tortoise). Under the shipped launchd job this is only a FALLBACK --
-# install.sh renders its own REPO into the plist via __REPO__, and that value overrides this one.
-# It still matters for every REPO-less run (manual starts, the runbook, a re-install without env),
-# and there a missing path is indistinguishable from "nothing to do" -- the same class as the
-# gh-shim failure (#8246). Corrected, and made to fail LOUD rather than run against a path with
-# nothing in it. (Corrected after a fresh-context verifier showed the original comment misstated
-# the mechanism -- see the review on this PR.)
-REPO="${REPO:-/Users/danielospina/Documents/GitHub/tortoise}"
+# ⛔ OR IS DERIVED FROM THE CHECKOUT BELOW, NEVER FROM A LITERAL (see "the ONE repo" block).
+# ⛔ REPO HAS NO DEFAULT, AND THAT IS THE FIX. It used to default to ONE DEVELOPER'S HOME
+# (`/Users/<user>/Documents/GitHub/tortoise`), so on any other machine it resolved to a path with
+# nothing behind it: the guard just below killed the controller at startup, and under KeepAlive that
+# is a crash loop whose only trace is launchd.err — it reads exactly like a box with nothing to do.
+# (The other shape, "the controller keeps beating while the refresh aborts every cycle", is a REPO
+# that EXISTS but is the wrong repo — refresh-candidates.sh still carries its own default of that
+# kind, #1935/#1977.) A path is not a thing this repo can guess — the daemon gets it from install.sh
+# (`__REPO__` in the plist), a cell from its keys.env/supervisor, and an operator from §4 step 2.
+# Unset is a CONFIGURATION ERROR and it is refused HERE, before any command can run against it.
+REPO="${REPO:-}"
+if [ -z "$REPO" ]; then echo "orch-loop: FATAL REPO is not set — export REPO=<the target repo's checkout> (see README §4 step 2)" >&2; exit 78; fi
 if [ ! -d "$REPO" ]; then echo "orch-loop: FATAL REPO=$REPO does not exist" >&2; exit 78; fi
+# ── the ONE repo: $OR is the dispatched checkout's origin, never an independent literal ──────────
+# ⛔ THE GUARD WAS COUNTING A SURFACE IT HAD NO REASON TO BELIEVE IN. $OR defaulted to a HARDCODED
+# `daniel-ospina/tortoise`, while the backlog is read from $REPO and the lanes work on $REPO. A cell
+# whose $REPO is a DIFFERENT checkout therefore graded its merge backlog — and the whole merge
+# sweep — against another repo's open PRs. Measured 2026-10-18: three cells logged
+# `merge-priority (52 unowned of 54 open PRs — draining before opening more)` while the repo they
+# were actually dispatching from had ~10 open PRs and agent-infra had ~55: the count came from the
+# WRONG SURFACE, and nothing in the line said which repo it had counted, so the number looked real
+# for hours. Deriving $OR from $REPO's origin makes the wrong-repo read impossible by construction;
+# an explicit `OR=` still wins (a cell that must grade another repo's queue says so out loud), and
+# an origin that cannot be parsed falls back to the old literal LOUDLY rather than silently.
+# ⛔ THE PARSE LIVES IN repo-slug.sh, SHARED WITH refresh-candidates.sh. That script reads the
+# candidate POOL from $OR, so two independent derivations could grade one repo while queueing
+# another's issues — a worse defect than the one being fixed. One function, one answer.
+# ⛔ O IS DEFAULTED BEFORE ITS FIRST USE. It used to be assigned ~30 lines below this block, so a
+# manual/tmux invocation without an exported O never preferred `$O/repo-slug.sh` and — worse — the
+# wrong-repo WARN went to stderr only, because the guard below saw an EMPTY `$O` and skipped the log
+# append. stderr on a launchd box is launchd.err: that is the invisible failure the append exists to
+# prevent (review round 3).
 O="${O:-$HOME/orchestrator}"
+_HERE_RS="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
+if [ -n "${O:-}" ] && [ -f "$O/repo-slug.sh" ]; then . "$O/repo-slug.sh"
+elif [ -f "$_HERE_RS/repo-slug.sh" ]; then . "$_HERE_RS/repo-slug.sh"
+else
+  _fatal_rs="FATAL repo-slug.sh not found (looked in $O and ${_HERE_RS:-<unresolved>}) — refusing to guess which repo to grade"
+  echo "orch-loop: $_fatal_rs" >&2
+  [ -d "${O:-}" ] && { mkdir -p "${O:-}/logs" 2>/dev/null; echo "$(date) [startup] $_fatal_rs" >> "${O:-}/logs/orch-loop.log" 2>/dev/null; }
+  exit 78
+fi
+# ⛔ THE FILE IS NOT THE FUNCTION. A present-but-STALE copy (an $O seeded from an older harness)
+# sources cleanly and defines nothing, and the caller would then fall through to the literal — the
+# exact wrong-surface defect this refuses. Same check repo-authority.sh gets, for the same reason.
+command -v derive_or >/dev/null 2>&1 \
+  || {
+    _fatal_rs="FATAL repo-slug.sh in $O is stale/partial (no derive_or) — re-seed it: cp scripts/orchestrator-harness/*.sh $O/"
+    echo "orch-loop: $_fatal_rs" >&2
+    [ -d "$O" ] && { mkdir -p "$O/logs" 2>/dev/null; echo "$(date) [startup] $_fatal_rs" >> "$O/logs/orch-loop.log" 2>/dev/null; }
+    exit 78
+  }
+OR_EXPLICIT="${OR:-}"
+OR_RC=0
+OR="$(derive_or "$REPO" "$OR_EXPLICIT")" || OR_RC=$?
+if [ "$OR_RC" = "2" ]; then
+  # The operator pinned something that is not owner/name. Refused, not silently replaced: grading the
+  # hardcoded literal is the wrong-surface defect this change exists to end (review round 7).
+  _fatal_or="FATAL OR='$OR_EXPLICIT' is not owner/name — refusing to guess which repo to grade (unset OR to derive it from REPO's origin)"
+  echo "orch-loop: $_fatal_or" >&2
+  # ⛔ ALSO TO $O/logs/orch-loop.log (review round 8): stderr on a launchd box lands in launchd.err,
+  # not the log an operator reads, so a typo'd pin becomes a KeepAlive crash loop with no trace.
+  [ -d "$O" ] && { mkdir -p "$O/logs" 2>/dev/null; echo "$(date) [startup] $_fatal_or" >> "$O/logs/orch-loop.log" 2>/dev/null; }
+  exit 78
+fi
+if [ "$OR_RC" != "0" ]; then
+  OR="daniel-ospina/tortoise"
+  # ⛔ THE WARNING GOES IN TWO PLACES ON PURPOSE. stderr on a launchd box lands in launchd.err, NOT
+  # in $O/logs/orch-loop.log — the one file an operator reads — so a wrong-repo WARN that only
+  # reached stderr was invisible for the hours this defect lasted. Not fatal: a local mirror or a
+  # `file://` origin is a legitimate checkout, and refusing to start would turn a grading mismatch
+  # into a dead cell. The line stays, loudly, in both streams.
+  _or_warn="WARN cannot derive owner/name from REPO=$REPO origin remote ('$(git -C "$REPO" remote get-url origin 2>/dev/null || echo none)') — grading $OR; set OR=<owner/name> to name the repo explicitly"
+  echo "orch-loop: $_or_warn" >&2
+  [ -d "$O" ] && echo "$(date) [startup] $_or_warn" >> "$O/logs/orch-loop.log" 2>/dev/null
+fi
+# ⛔ EXPORTED, AND THAT IS LOAD-BEARING (#2040 review). `refresh-candidates.sh` reads its LISTINGS
+# from $OR, and it runs as a CHILD (`bash "$O/refresh-candidates.sh" 6`). A DERIVED value never
+# reached this script through the environment, so without this export the child re-derives its own
+# default — the pool would come from one repo while the controller graded another. (Before this
+# change the same held true, consistently: both sides used the same literal.)
+export OR
+# ⛔ NO `export REPO` HERE, DELIBERATELY. It would be a no-op for every supported invocation: a
+# value that reached this script through the environment is ALREADY exported to the refresh and
+# every child, and a value set without `export` in the operator's shell never reaches the script at
+# all -- the guard above exits 78 first. (Sourcing this file instead of executing it is not a
+# supported entry point, and would be the one case where `export` was load-bearing.)
 export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
+# ⛔ THE gh SHIM MUST STAY FIRST (#1988). The line above prepends the tool dirs, so a REAL gh in
+# either of them outranks the seeded `$O/gh-rest` (Mac REST adapter) / `$O/gh-limit` (cell
+# serialiser) — and a shim that is never resolved is an INERT layer: it reports protection and
+# provides none. Re-assert both here, adapter last so `$O/gh-rest` (which itself calls the same
+# helper) wins where it exists. Guarded by `-d`, so a box that ships neither is unchanged.
+if [ -d "$O/gh-limit" ]; then PATH="$O/gh-limit:$PATH"; fi
+if [ -d "$O/gh-rest" ]; then PATH="$O/gh-rest:$PATH"; fi
 export AGENT_SKIP_REVIEW_GATE=1 ELDATO_SKIP_VGATE=1
 
 MAX_FIX="${MAX_FIX:-3}"
@@ -26,7 +108,6 @@ MAX_FIX_TRIES="${MAX_FIX_TRIES:-3}"
 # that it is too tight for a 17-workspace fleet on 10 cores -- NOT that it never opened. The box
 # merged 25 PRs in a day at load 17-52 and has been observed functioning at ~100; a ceiling at 16
 # leaves the dispatcher off for most of the day.
-# (Corrected after a fresh-context verifier counted the dispatch lines the first claim ignored.)
 # The REAL capacity constraint is the machine (available RAM / swap) -- see the gate chain below.
 # Derive the ceiling from the core count so it scales, and keep the env override.
 # sysctl -n hw.ncpu is macOS-only: on a Linux cell sysctl may be absent entirely (Debian's procps
@@ -87,7 +168,17 @@ is_limit "${_NCPU:-}"    || _NCPU=4
 [ "${_NCPU:-0}" -ge 1 ] || _NCPU=4
 MAX_LOAD="${MAX_LOAD:-$(( 10#$_NCPU * 10 ))}"
 is_limit "${MAX_LOAD:-}" || MAX_LOAD=$(( 10#$_NCPU * 10 )); is_limit "${MAX_LOAD:-}" || MAX_LOAD=40
-MAX_LANES="${MAX_LANES:-4}"
+# ⛔ CAPACITY, NOT A LANE COUNT (owner ruling, 2026-10-17): "dispatch should be gated on capacity,
+# not on number of lanes. max lanes 8 is too low. that needs to be configured to 2.5x the number of
+# CPUs". Both numbers in play were LANE COUNTS that no hardware decided: the shipped default was a
+# FLAT 4, and the box this was measured on had its plist PINNED at 8 —
+# `[cap] load=79/100 lanes=9/8 … [dispatch] skipped (lanes=9>=max_lanes=8)` — 21 points of load
+# headroom and comfortable swap/memory, so the NEXT dispatch was refused for a lane count while
+# capacity was available. `MAX_LOAD` above already derives from cores; same rule here.
+# Integer division, so it FLOORS (4 cores -> 10, 3 -> 7). An explicit MAX_LANES still WINS and is not
+# recomputed — with ONE exception, spelled out at the coercion block below: a present-but-INVALID
+# value (`4x`, `09`, ten digits) is repaired there to this same derived default.
+MAX_LANES="${MAX_LANES:-$(( 10#$_NCPU * 5 / 2 ))}"
 MAX_REVIEW="${MAX_REVIEW:-4}"   # keep in sync with install.sh's default and README §4
 # Above this many UNOWNED open PRs (open PRs nothing is currently working — pr_owned() below),
 # merging takes priority and new lanes stop being dispatched. The pre-fix gate counted the TOTAL
@@ -102,6 +193,35 @@ MAX_REVIEW="${MAX_REVIEW:-4}"   # keep in sync with install.sh's default and REA
 # Raised to 25 (owner ruling: "we should have something more like 10 PRs who are not being
 # processed"). MERGE_PRIORITY_AT also raises the reviewer AND fixer budgets in drain mode.
 MERGE_PRIORITY_AT="${MERGE_PRIORITY_AT:-25}"
+# ⛔ THE GATE IS BOUNDED IN TIME AND IN EVIDENCE, because a gate whose OPENING condition the
+# automation cannot meet is not a gate — it is a permanent stop. Merge priority holds dispatch
+# while unowned PRs fall; but an unowned PR on a one-account fleet is not something an unattended
+# lane can clear (every session authenticates as the same GitHub user, so ownership is not visible
+# from the PR author and nobody hand-assigns them), and the harness cannot merge what no worker is
+# touching. Measured 2026-10-18 on all three cloud cells: `merge-priority (52 unowned of 54 open
+# PRs — draining before opening more)` at `lanes=0` for HOURS, with a 219-issue candidate pool
+# behind it, i.e. the drain never started and nothing could start it. So the block now also
+# requires POSITIVE evidence that a drain is happening:
+#
+#   (a) work in flight AND a land inside the window — a merge/fix worker is live AND some PR
+#       actually landed within MERGE_PRIORITY_MAX_AGE_MIN (`state/merged-<PR>.done`), i.e. a
+#       railed PR is PROGRESSING, not merely present; and
+#   (b) the youngest UNOWNED open PR is younger than MERGE_PRIORITY_MAX_AGE_MIN — there is recently
+#       opened review work that could still be drained.
+#
+# If either is missing, the cell DISPATCHES and the log says which condition released it. Both are
+# measured, not assumed: an unreadable age or an unreadable land record RELEASES (the gate blocks
+# only on evidence it actually has), the age bound is stated in minutes in the line itself, and the
+# unowned threshold is unchanged. MAX_LANES is unchanged — this bounds a gate, it does not raise a
+# ceiling. Policy it bounds: agent-infra#1709 item 4 (the in-flight requirement) and the owner
+# ruling behind MERGE_PRIORITY_AT=25 ("we should have something more like 10 PRs who are not being
+# processed") — neither of which ever said `forever`.
+MERGE_PRIORITY_MAX_AGE_MIN="${MERGE_PRIORITY_MAX_AGE_MIN:-180}"
+# How old a `state/refresh-funnel` record may be before the funnel line says STALE instead of
+# printing it as this cycle's decomposition. Two refresh cycles (the refresh only runs while the
+# backlog is below 6, so a quiet box can legitimately go a few cycles between records); past that,
+# an old pass's numbers beside a newer `queue=` are a contradiction, not a measurement.
+FUNNEL_MAX_AGE_MIN="${FUNNEL_MAX_AGE_MIN:-30}"
 MIN_SWAP_FREE="${MIN_SWAP_FREE:-600}"
 # Available memory = free + inactive. macOS shows memory pressure as COMPRESSION with swap flat,
 # so a swap-only gate does not see it. See the gate chain below.
@@ -169,9 +289,23 @@ is_limit "${MIN_MEM_FREE_MB:-512}" || MIN_MEM_FREE_MB=512
 # attempt 10 run; and `$((MAX_REVIEW + 2))` reads a leading-zero value as OCTAL (030 -> 26, not 30),
 # which is the same trap the scope decision already normalises with `10#` below. MAX_FIX is coerced
 # for the same reason. Each is first read below this point, so coercing here is still guard-before-use.
-is_limit "${MAX_LANES:-}"         || MAX_LANES=4
+# ⛔ MAX_LANES IS REPAIRED TO ITS OWN DERIVED DEFAULT, not to a flat 4 (owner ruling, 2026-10-17):
+# a garbage plist value must leave the box with the ceiling its CORES imply (see the derivation at
+# the top), or a typo would silently pin one machine to a lane count its hardware never chose. The
+# repair is BOUNDED exactly as MAX_LOAD's is: `_NCPU` passes `is_limit` at nine digits, so
+# `* 5 / 2` can produce a ten-digit lane count that `is_limit` rejects — and only a TRUE default can
+# repair that, since re-deriving from the same probe returns the same value. 10 = a 4-core box's
+# 2.5x. `MAX_LANES=0` still passes `is_limit` and dispatches nothing — unchanged, deliberate.
+is_limit "${MAX_LANES:-}"         || { MAX_LANES=$(( 10#$_NCPU * 5 / 2 )); is_limit "${MAX_LANES:-}" || MAX_LANES=10; }
 is_limit "${MAX_REVIEW:-}"        || MAX_REVIEW=4
 is_limit "${MERGE_PRIORITY_AT:-}" || MERGE_PRIORITY_AT=25
+# ⛔ A 0 WINDOW MAKES THE GATE INERT, SILENTLY: `is_limit 0` is TRUE (0 is a valid count), and with
+# a 0-minute window `[ "$age" -lt 0 ]` and `now - land <= 0` are both false, so mp_reason can never
+# return a reason — the guard disappears with no trace in any log. Coerce on the `is_limit` line
+# itself (the same shape as every other limit, and the one the suite's coercion extraction can
+# count), rather than on a bare `[ … -ge 1 ]` test a mutation could delete unseen.
+is_limit "${MERGE_PRIORITY_MAX_AGE_MIN:-}" || MERGE_PRIORITY_MAX_AGE_MIN=180; [ "${MERGE_PRIORITY_MAX_AGE_MIN:-0}" -ge 1 ] || MERGE_PRIORITY_MAX_AGE_MIN=180
+is_limit "${FUNNEL_MAX_AGE_MIN:-}" || FUNNEL_MAX_AGE_MIN=30; [ "${FUNNEL_MAX_AGE_MIN:-0}" -ge 1 ] || FUNNEL_MAX_AGE_MIN=30
 is_limit "${MAX_FIX:-}"           || MAX_FIX=3
 is_limit "${MAX_FIX_TRIES:-}"     || MAX_FIX_TRIES=3
 is_limit "${BATCH:-}"             || BATCH=2
@@ -449,6 +583,146 @@ queue_state_token() {  # -> EMPTY(12s) / READ(7)(3m) / PARTIAL(P0-blocker)(2m) /
   elif [ "$age" -lt 5400 ]; then printf '%s(%sm)' "$tok" "$(( age / 60 ))"
   else                            printf '%s(%sh)' "$tok" "$(( age / 3600 ))"; fi
 }
+# ── THE DISPATCH FUNNEL (agent-infra#2040) ──────────────────────────────────────────────────────
+# `[dispatch] backlog empty queue=READ(223)` is a CONTRADICTION: 223 candidates were READ and zero
+# were dispatchable, and the line said "empty". Measured 2026-10-18 on all three cloud cells, for
+# hours: every cell read the pool perfectly and dispatched nothing, and no line anywhere said which
+# step removed the 223. This prints the decomposition INSTEAD of the claim, from the refresh's own
+# per-reason counts (state/refresh-funnel, written by refresh-candidates.sh) plus the counts this
+# loop measures itself. It never invents a number: a missing record prints `UNRECORDED`, and the
+# funnel is only printed as a decomposition when the parts are actually known.
+dispatch_funnel() { # <dispatched_count> <queue_token> [<held_reason>] [<now_epoch>]
+  local k="${1:-0}" qtok="${2:-?}" held="${3:-}" now="${4:-}" f key val kv backlog=0
+  # ⛔ EVERY ONE OF THESE IS INITIALISED. They are assigned only when their key is present in the
+  # record, and under `set -u` a declared-but-unassigned local is UNBOUND: a record missing one key
+  # (a rename, a hand-edited or half-synced $O) exited the whole controller — a KeepAlive crash loop
+  # on a record that persists. Measured in review round 2: `unj: unbound variable`, exit 1.
+  local listed="" judged="" queued="" col="" land="" unj="" sk_ck="" sk_dp="" notr="" at="" reconciled=""
+  local age=""
+  is_num "$now" || now="$(date +%s)"
+  [ -f "$O/state/refresh-funnel" ] && f="$(cat "$O/state/refresh-funnel" 2>/dev/null || true)"
+  for kv in ${f:-}; do
+    key="${kv%%=*}"; val="${kv#*=}"
+    case "$key" in
+      listed) listed="$val" ;; judged) judged="$val" ;; queued) queued="$val" ;;
+      collision) col="$val" ;; landed) land="$val" ;; unjudged) unj="$val" ;;
+      skipped_checked) sk_ck="$val" ;; skipped_dispatched) sk_dp="$val" ;;
+      not_reached) notr="$val" ;; at) at="$val" ;; reconciled) reconciled="$val" ;;
+    esac
+  done
+  # The queue depth is measured HERE, not taken from the refresh's record: it is this cycle's file.
+  [ -f "$O/candidates.txt" ] && backlog="$(wc -l < "$O/candidates.txt" | tr -d ' ')"
+  is_num "${backlog:-}" || backlog=0
+  if [ -z "${listed:-}" ]; then
+    # No usable record. Say so — do NOT print a decomposition that does not exist, and do NOT fall
+    # back to "backlog empty", which is the claim this function exists to stop. ⛔ The two causes are
+    # distinguished (review round 5): asserting "no pass has recorded one yet" when the file EXISTS
+    # but is empty/truncated is a false statement about our own state.
+    if [ -f "$O/state/refresh-funnel" ]; then
+      printf '[dispatch] %s queued of an UNRECORDED pool (state/refresh-funnel exists but is unreadable/empty) -> %s dispatched%s (queue=%s)\n' \
+        "$backlog" "$k" "${held:+ | held: $held}" "$qtok"
+    else
+      printf '[dispatch] %s queued of an UNRECORDED pool (no state/refresh-funnel — no refresh pass has recorded its funnel yet) -> %s dispatched%s (queue=%s)\n' \
+        "$backlog" "$k" "${held:+ | held: $held}" "$qtok"
+    fi
+    return 0
+  fi
+  # ⛔ AGE-BOUNDED, like every other record this loop reads (queue_state_token, gh_limit_token): a
+  # record is not a state. The refresh exits BEFORE writing its funnel on the pool-read and
+  # provisioning paths, so an old pass's decomposition can sit beside a NEWER `queue=READ(n)` in the
+  # same line — internally inconsistent, and indistinguishable from a fresh one. Past the bound the
+  # funnel is REPLACED by its age, never presented as this cycle's.
+  # ⛔ AN UNPARSEABLE (or absent) `at` IS NOT "FRESH" (review round 3, finding 6). Skipping the age
+  # test when the bound cannot be read made an arbitrarily old record print as THIS cycle's
+  # decomposition — the same "a record is not a state" defect the age bound exists to end, reachable
+  # by one missing field. Unknown age is bounded the only safe way: unverifiable is STALE.
+  # ⛔ A FUTURE `at=` IS NOT A FRESH RECORD (review round 5). `age=$(( now - at )); [ age -lt 0 ] &&
+  # age=0` turned a clock step-back into "funnel 0m old" with full counts — the very skew that
+  # mp_released_until and mp_blocked_since refuse to serve. Unverifiable is STALE, so it takes the
+  # unknown-age arm below.
+  if is_num "${at:-}" && [ $(( 10#$at )) -le $(( 10#$now )) ]; then
+    age=$(( (now - (10#$at)) / 60 )); [ "$age" -lt 0 ] && age=0
+    if [ "$age" -gt "${FUNNEL_MAX_AGE_MIN:-30}" ]; then
+      printf '[dispatch] funnel STALE(%sm > %sm) — the last recorded pass listed %s candidates; %s dispatched THIS cycle%s (backlog=%s, queue=%s)\n' \
+        "$age" "${FUNNEL_MAX_AGE_MIN:-30}" "${listed:-?}" "$k" "${held:+ | held: $held}" "$backlog" "$qtok"
+      return 0
+    fi
+  else
+    printf '[dispatch] funnel STALE(age unknown — no usable `at=` in state/refresh-funnel) — the recorded pass listed %s candidates; %s dispatched THIS cycle%s (backlog=%s, queue=%s)\n' \
+      "${listed:-?}" "$k" "${held:+ | held: $held}" "$backlog" "$qtok"
+    return 0
+  fi
+  local -a parts
+  parts=()
+  is_num "$queued"   && parts+=("$queued queued")
+  is_num "$col"      && parts+=("$col peer-owned (claim)")
+  is_num "$land"     && parts+=("$land already landed")
+  is_num "$unj"      && parts+=("$unj unjudged (pre-flight)")
+  is_num "$sk_ck"    && parts+=("$sk_ck blacklisted (checked)")
+  is_num "$sk_dp"    && parts+=("$sk_dp already dispatched")
+  is_num "$notr"     && parts+=("$notr not reached (limit)")
+  local joined="" p
+  for p in ${parts[@]+"${parts[@]}"}; do joined="${joined:+$joined, }$p"; done
+  # A record that does not add up is NOT printed as a clean decomposition: the parts names what
+  # could go wrong, and an operator reading "the parts are fine" is exactly the failure this line
+  # exists to prevent.
+  # ⛔ ABSENT IS NOT "RECONCILED" (review round 3, finding 6). Only a writer that records
+  # `reconciled=1` has shown the parts sum; a record with the field missing — an older pass, a
+  # hand-edited file — proves nothing, and treating it as clean is a false PASS on the one line an
+  # operator uses to decide whether the funnel is lying.
+  case "${reconciled:-}" in
+    1) : ;;
+    0) joined="${joined:+$joined, }UNRECONCILED (the parts do not sum to the pool)" ;;
+    *) joined="${joined:+$joined, }UNRECONCILED (no reconciliation recorded — the parts are unverified)" ;;
+  esac
+  printf '[dispatch] %s candidates -> %s -> %s dispatched%s (backlog=%s, queue=%s%s)\n' \
+    "${listed:-?}" "${joined:-no reason recorded}" "$k" \
+    "${held:+ | held: $held}" "$backlog" "$qtok" "${age:+, funnel ${age}m old}"
+}
+
+# ── the box's last gh RATE-LIMIT observation (#1988) ─────────────────────────────────────
+# `queue_state_token` above says WHETHER this box could see the pool. This says WHY, when the answer
+# is the shared GitHub bucket — the reason a `queue=UNREADABLE` cycle used to have none.
+# Every harness gh call passes through `gh-limit.py` (the layer under the REST adapter and under the
+# cell-side wrapper), which records the bucket the call was REFUSED on and the reset it observed.
+# Those two facts are the ones gh's error text does not carry and `gh api rate_limit` actively
+# misreports: measured, it read 4999/5000 on the REST counter while EVERY GraphQL call was refused,
+# because the two pools are separate (#1762).
+# ⛔ AGE-BOUNDED ON READ, because a record is not a state: a limit observed before the last 15
+# minutes — or one stamped by a clock that has since stepped backwards — is not evidence about THIS
+# cycle and is not printed. That is the "stale flag that records a past state and is never
+# revalidated" failure, applied to the fix that reports it.
+GH_LIMIT_STALE_S=900
+gh_limit_token() {  # -> "gh=rate_limited(…)" | "gh=recovered(…)" | EMPTY
+  local f rec kv at="" bucket="" reset="" rec_at="" now age
+  f="${GH_LIMIT_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/gh-limit}/last-limit"
+  [ -f "$f" ] || return 0
+  rec="$(cat "$f" 2>/dev/null)" || return 0
+  # The record is ONE line of `key=value` pairs with no spaces in any value, so word splitting is
+  # the parse — no sed/jq spawn on a line printed every cycle.
+  for kv in $rec; do
+    case "$kv" in
+      at=*)        at="${kv#at=}" ;;
+      bucket=*)    bucket="${kv#bucket=}" ;;
+      reset=*)     reset="${kv#reset=}" ;;
+      recovered=*) rec_at="${kv#recovered=}" ;;
+    esac
+  done
+  is_num "${at:-}" || return 0
+  is_num "${reset:-}" || reset=""
+  [ "${reset:-0}" = 0 ] && reset="?"
+  now="$(date +%s)"; age=$(( now - at ))
+  { [ "$age" -ge 0 ] && [ "$age" -le "$GH_LIMIT_STALE_S" ]; } || return 0
+  # ⛔ A RECOVERED LIMIT IS NOT A CURRENT ONE. The record outlives the process that wrote it, so
+  # without this a one-off limit kept the box asserting `gh=rate_limited(...)` for 15 minutes while
+  # the same line showed a healthy queue — a token an operator learns to ignore. The layer marks the
+  # record `recovered=<epoch>` on the first success after it (gh-limit.py record_recovery).
+  if is_num "${rec_at:-}" && [ "$rec_at" -ge "$at" ]; then
+    printf 'gh=recovered(bucket=%s %ss)' "${bucket:-?}" "$age"
+    return 0
+  fi
+  printf 'gh=rate_limited(bucket=%s reset=%s %ss)' "${bucket:-?}" "$reset" "$age"
+}
 # Exact session-name test. `tmux has-session -t <name>` prefix-matches, so a guard for PR #82
 # would report "in flight" because `fix-820` exists — starving #82 while that worker lives.
 sess() { tmux ls -F '#{session_name}' 2>/dev/null | grep -qx "$1"; }
@@ -483,25 +757,317 @@ park_ctrl() { # park_ctrl <pr> <head> <reason…>
 }
 
 # Merge priority: a merge backlog means the box's scarce capacity belongs to review+merge, not to
-# opening more PRs. These two functions hold the rule so it is directly testable (and so a
+# opening more PRs. These functions hold the rule so it is directly testable (and so a
 # regression cannot hide behind a comment):
-#   mp_reason    -> the gate reason when draining should outrank dispatching (empty otherwise)
-#   review_slots -> reviewer concurrency, with headroom once a backlog exists
-#   fix_slots    -> fixer concurrency, the SAME headroom (see the note on fix_slots)
-# ⛔ The argument is the UNOWNED count (open PRs nothing is currently working), not the total open
-# count — `unowned_pr_count` below derives it from state the loop already keeps. Passing the TOTAL
-# here is what capped the fleet (see the MERGE_PRIORITY_AT default above).
-mp_reason() { # <unowned_prs> <lanes> <workers> [<open_prs>]
-  # The condition is "the box has review/merge work IN FLIGHT", not "a lane happens to be
+#   mp_reason     -> the gate reason when draining should outrank dispatching (empty otherwise)
+#   mp_release    -> WHY the gate let dispatch through while over the threshold (empty when the
+#                    backlog is under it, i.e. when there was nothing to release)
+#   review_slots  -> reviewer concurrency, with headroom once a backlog exists
+#   fix_slots     -> fixer concurrency, the SAME headroom (see the note on fix_slots)
+#   mp_recent_land / unowned_youngest_age_min -> the two EVIDENCE probes both functions read
+#
+# ⛔ The count argument is the UNOWNED count (open PRs nothing is currently working), not the total
+# open count — `unowned_pr_count` below derives it from state the loop already keeps. Passing the
+# TOTAL here is what capped the fleet (see the MERGE_PRIORITY_AT default above).
+#
+# ⛔ AND THE BLOCK IS BOUNDED IN TIME AND EVIDENCE (see MERGE_PRIORITY_MAX_AGE_MIN). Over the
+# threshold it holds dispatch only while the drain is REAL and RECENT: a worker is live, a PR
+# actually LANDED inside the window, and the youngest unowned PR is younger than the window. When
+# any of those is missing — or cannot be measured — the gate RELEASES and `mp_release` says which
+# one released it, because a stop nobody can clear is not a guard.
+mp_reason() { # <unowned> <lanes> <workers> [age_min] [land_epoch] [open] [repo] [now] [blocked_since] [released_until]
+  # The in-flight condition is "the box has review/merge work IN FLIGHT", not "a lane happens to be
   # running". Measured 2026-10-13 (agent-infra#1709 item 4): the lanes-only form let dispatch
   # through on 4/4 sampled blocks — e.g. `lanes=0 workers=8` with 27 open PRs, i.e. eight
   # reviewers mid-flight on a box already saturated. That ADDS WIP to fixed throughput and
   # lengthens cycle time (Little's Law), which is the opposite of draining.
   # Total in-flight agents = lanes + workers; `workers` is the merge/fix session count.
-  # The 4th arg is the TOTAL open count, printed for context only; it never decides anything.
-  if [ "${1:-0}" -gt "$MERGE_PRIORITY_AT" ] && [ $(( ${2:-0} + ${3:-0} )) -ge 1 ]; then
-    echo "merge-priority (${1} unowned of ${4:-${1}} open PRs — draining before opening more)"
+  # The 6th arg is the TOTAL open count and the 7th the repo it was counted on — printed for
+  # context only; neither decides anything. The 8th is a test seam for "now", the 9th for the
+  # blocked-since stamp (both epochs).
+  local u="${1:-0}" lanes="${2:-0}" workers="${3:-0}" age="${4:-}" land="${5:-}"
+  local open="${6:-${1:-0}}" repo="${7:-${OR:-?}}" now="${8:-}" since="${9:-}" rel="${10:-}"
+  is_num "$u" || return 0                    # an unreadable count is not a backlog to drain
+  [ "$u" -gt "$MERGE_PRIORITY_AT" ] || return 0
+  is_num "$now" || now="$(date +%s)"
+  is_num "$now" || return 0
+  # (0) A BOUND-DRIVEN RELEASE HOLDS THE GATE OPEN FOR THE REST OF ITS WINDOW (review round 3).
+  # Without this, the released cycle CLEARS the stamp and the very next cycle re-arms it — (a)-(c)
+  # still hold — so the steady state is one dispatch cycle per window rather than a window of
+  # dispatch: the stop this change removes comes back as "almost nothing dispatched", which is not
+  # a drain either. `state/merge-priority-released-until` is written ONLY when the ultimate bound
+  # (d) is what released the gate, and expires on its own; it cannot extend itself.
+  _win=$(( 10#${MERGE_PRIORITY_MAX_AGE_MIN:-180} * 60 ))
+  if is_num "$rel" && [ $(( 10#$rel )) -gt $(( 10#$now )) ] && [ $(( 10#$rel )) -le $(( 10#$now + _win )) ]; then return 0; fi
+  # (a) work in flight — a lander/railer must actually be running.
+  [ $(( (10#${lanes:-0}) + (10#${workers:-0}) )) -ge 1 ] || return 0
+  # (b) PROGRESS: a PR landed inside the window. "An open queue" is not progress; a merge is.
+  is_num "$land" || return 0
+  [ $(( (10#$now) - (10#$land) )) -le $(( 10#$MERGE_PRIORITY_MAX_AGE_MIN * 60 )) ] || return 0
+  # (c) AGE: recently-opened unowned work still exists to drain. Unmeasurable age is not evidence.
+  is_num "$age" || return 0
+  [ "$age" -lt "$MERGE_PRIORITY_MAX_AGE_MIN" ] || return 0
+  # (d) THE ULTIMATE TIME BOUND: a gate held longer than the window is a stop, not a drain, whatever
+  # the instantaneous evidence says. (a)-(c) alone do not bound it in the steady state: with one
+  # merge landing every hour and any single unowned PR younger than the window, a busy box holds
+  # dispatch indefinitely while calling it "draining". `state/merge-priority-blocked-since` records
+  # the FIRST cycle of the current block (written when the gate first holds, cleared on any release);
+  # absent/unreadable means no bound has started, which is not itself a reason to release.
+  if is_num "$since" && [ $(( 10#$since )) -le $(( 10#$now )) ] \
+     && [ $(( (10#$now) - (10#$since) )) -gt $(( 10#$MERGE_PRIORITY_MAX_AGE_MIN * 60 )) ]; then
+    return 0
   fi
+  printf 'merge-priority (%s unowned of %s open PRs in %s — youngest unowned %sm < %sm bound, last land %sm ago, %s worker(s) live — draining before opening more)\n' \
+    "$u" "$open" "$repo" "$age" "$MERGE_PRIORITY_MAX_AGE_MIN" \
+    "$(( ((10#$now) - (10#$land)) / 60 ))" "$(( (10#${lanes:-0}) + (10#${workers:-0}) ))"
+}
+
+# WHY the gate let dispatch through, when it was over the threshold. Empty when the backlog is at
+# or under MERGE_PRIORITY_AT (nothing to release) — so the log line below only ever appears on a
+# cycle the bound actually decided. The wording NAMES the releasing condition, because "dispatched
+# anyway" with no reason is the same silence this bound exists to end.
+mp_release() { # <unowned> <lanes> <workers> [age] [land] [open] [repo] [now] [blocked_since] [released_until]
+  local u="${1:-0}" lanes="${2:-0}" workers="${3:-0}" age="${4:-}" land="${5:-}"
+  local open="${6:-${1:-0}}" repo="${7:-${OR:-?}}" now="${8:-}" since="${9:-}" rel="${10:-}" why=""
+  is_num "$u" || return 0
+  [ "$u" -gt "$MERGE_PRIORITY_AT" ] || return 0
+  is_num "$now" || now="$(date +%s)"
+  is_num "$now" || return 0
+  # ⛔ THE WINDOW CASE COMES FIRST (review round 4, P1). mp_reason returns early on clause (0), so on
+  # every cycle INSIDE a held-open window `since` is empty and the arms below fell through to the LAST
+  # one — printing "the youngest unowned PR is 5m old (bound 180m) — the unowned queue is not recent
+  # work" on a cycle where 5 < 180 was simultaneously the HOLD condition. A release line that states a
+  # reason it disproves is worse than no line: it is the instrument lying about its own decision.
+  if is_num "$rel" && [ $(( 10#$rel )) -gt $(( 10#$now )) ]; then
+    printf 'merge-priority RELEASED (%s unowned of %s open PRs in %s) — the time bound released this gate and it is held open until %s (%sm window): dispatching\n' \
+      "$u" "$open" "$repo" "$rel" "$(( (10#$rel - 10#$now) / 60 ))"
+    return 0
+  fi
+  if [ $(( (10#${lanes:-0}) + (10#${workers:-0}) )) -lt 1 ]; then
+    why="nothing is in flight (lanes=0 workers=0) — no drain could be happening"
+  elif ! is_num "$land"; then
+    why="no land inside the ${MERGE_PRIORITY_MAX_AGE_MIN:-180}m window is recorded in state/ (state/merged-<PR>.done), so no railed PR can be shown to be progressing"
+  elif [ $(( (10#$now) - (10#$land) )) -gt $(( 10#$MERGE_PRIORITY_MAX_AGE_MIN * 60 )) ]; then
+    why="nothing landed in ${MERGE_PRIORITY_MAX_AGE_MIN}m (last land $(( ((10#$now) - (10#$land)) / 60 ))m ago) — the drain is stalled, not draining"
+  elif ! is_num "$age"; then
+    why="the age of the unowned PRs is unreadable (a failed PR listing, or rows with no createdAt), so 'recent review work' cannot be shown"
+  elif is_num "$since" && [ $(( 10#$since )) -le $(( 10#$now )) ] \
+       && [ $(( (10#$now) - (10#$since) )) -gt $(( 10#$MERGE_PRIORITY_MAX_AGE_MIN * 60 )) ]; then
+    why="the gate has been held for $(( ((10#$now) - (10#$since)) / 60 ))m (bound ${MERGE_PRIORITY_MAX_AGE_MIN}m) without clearing — a block that long is a stop, not a drain"
+  else
+    why="the youngest unowned PR is ${age}m old (bound ${MERGE_PRIORITY_MAX_AGE_MIN}m) — the unowned queue is not recent work"
+  fi
+  printf 'merge-priority RELEASED (%s unowned of %s open PRs in %s) — %s: dispatching\n' "$u" "$open" "$repo" "$why"
+}
+
+# Did the ULTIMATE BOUND (d) — not the evidence — release the gate this cycle? True only when every
+# evidence condition (a)-(c) HOLDS and the block has outlived the window: that is the one case where
+# "draining" is real yet unbounded, and so the one case that earns a held-open window. Any other
+# release is evidence-driven (nothing in flight, no venue land, unreadable age) and must NOT extend
+# the gate: the evidence itself changed, so there is nothing to hold open.
+mp_bound_released() { # <unowned> <lanes> <workers> <age> <land> <now> <since>
+  local u="${1:-0}" lanes="${2:-0}" workers="${3:-0}" age="${4:-}" land="${5:-}" now="${6:-}" since="${7:-}"
+  is_num "$u" || return 1
+  [ "$u" -gt "$MERGE_PRIORITY_AT" ] || return 1
+  is_num "$now" || now="$(date +%s)"
+  is_num "$now" || return 1
+  [ $(( (10#${lanes:-0}) + (10#${workers:-0}) )) -ge 1 ] || return 1
+  is_num "$land" || return 1
+  [ $(( (10#$now) - (10#$land) )) -le $(( 10#${MERGE_PRIORITY_MAX_AGE_MIN:-180} * 60 )) ] || return 1
+  is_num "$age" && [ "$age" -lt "${MERGE_PRIORITY_MAX_AGE_MIN:-180}" ] || return 1
+  is_num "$since" && [ $(( 10#$since )) -le $(( 10#$now )) ] || return 1
+  [ $(( (10#$now) - (10#$since) )) -gt $(( 10#${MERGE_PRIORITY_MAX_AGE_MIN:-180} * 60 )) ] || return 1
+  return 0
+}
+mp_released_until() { # <state-dir> <now> -> epoch the gate is held open to, or empty
+  local f="$(mp_state_dir "$1")/merge-priority-released-until" v="" now="${2:-}" win
+  [ -f "$f" ] && v="$(cat "$f" 2>/dev/null || true)"
+  # ⛔ THE WINDOW GETS THE SAME SECOND MEMORY AS THE BLOCK STAMP (review round 6). On an unwritable
+  # state dir the write below fails, nothing is served, and the box degrades to one dispatch cycle
+  # per bound — measured 14 issues/24h against 354 on a writable dir — while the log still claimed
+  # "holding it open …".
+  # ⛔ AND THE MEMORY WINS WHEN IT IS LATER (review round 7, P1). "Serve the fallback only when the
+  # file yields NOTHING" was inert in the exact state it was added for: once a window had been written
+  # while the dir was writable, an EXPIRED file left behind is still numeric, so it shadowed the live
+  # in-process window — the reachable sequence (writable → dir goes unwritable → the write fails) fell
+  # straight back to one pulse per bound. Serve the later of the two; the one-window clamp below still
+  # applies to whichever is chosen, so neither can extend itself.
+  local fb="${MP_RELEASED_FALLBACK:-}"
+  if is_num "$fb" && { ! is_num "$v" || [ $(( 10#$fb )) -gt $(( 10#$v )) ]; }; then v="$fb"; fi
+  is_num "$v" || return 0
+  is_num "$now" || now="$(date +%s)"
+  win=$(( 10#${MERGE_PRIORITY_MAX_AGE_MIN:-180} * 60 ))
+  # ⛔ AT MOST ONE WINDOW AHEAD (review round 4, P2). Any future value was obeyed, so a backward
+  # clock step, a resumed VM or a copied state dir disabled the merge-priority gate for the size of
+  # the skew — while mp_blocked_since explicitly refuses a future stamp for exactly that reason. Only
+  # a value that could have been written by THIS window is served.
+  [ $(( 10#$v )) -gt $(( 10#$now )) ] && [ $(( 10#$v )) -le $(( 10#$now + win )) ] && printf '%s\n' "$v"
+  return 0
+}
+# rc 0 = RECORDED (the file says so), non-zero = only the in-process window exists. The caller prints
+# "holding it open until …" off this, so the log cannot claim a window the box does not have.
+mp_released_marker() { # <state-dir> <set|clear> [<epoch>]
+  # THIS MARKER IS NOT A BLOCK START (review round 4): a new window must REPLACE the old one, so it
+  # is written directly rather than through _stamp_set's "keep the first epoch" rule — under that rule
+  # `set` would keep an earlier, already-expiring value and the newly earned window would be lost.
+  local f rc=0
+  f="$(mp_state_dir "$1")/merge-priority-released-until"
+  case "${2:-}" in
+    set)
+      is_num "${3:-}" || return 0
+      if printf '%s\n' "$3" > "$f.$$" 2>/dev/null && mv "$f.$$" "$f" 2>/dev/null; then
+        MP_RELEASED_FALLBACK=""
+      else
+        rm -f "$f.$$" 2>/dev/null || true
+        MP_RELEASED_FALLBACK="$3"
+        echo "[state] WARN cannot write $f (unwritable state dir?) — holding the window in-process until $3" >> "${LOG:-/dev/null}" 2>/dev/null
+        rc=1
+      fi ;;
+    clear) rm -f "$f" 2>/dev/null || true; MP_RELEASED_FALLBACK="" ;;
+  esac
+  return "$rc"
+}
+
+# The blocked-since stamp: `<epoch>` of the FIRST cycle of the current block, or absent. Written by
+# the loop when mp_reason holds, removed whenever it does not, so the bound in (d) measures ONE
+# continuous block rather than an all-time total.
+# ⛔ THE STAMP MUST NEVER BE ABLE TO LATCH THE BOUND OFF (review round 2). A stamp that is EMPTY
+# (a truncated write on a full disk), non-numeric, or in the FUTURE (a clock step-back, a copied state
+# dir) reads as "no bound has started", so the ultimate bound in mp_reason(d) never fires and the
+# gate can hold forever — the permanent stop this whole change removes, reintroduced by one bad byte.
+# So: write atomically (tmp + rename), REPAIR a stamp that is not a usable past epoch, and refuse to
+# report a future one.
+mp_state_dir() { printf '%s\n' "${1:-${O:-$HOME/orchestrator}/state}"; }
+# ⛔ A FAILED WRITE MUST NOT LATCH THE BOUND OFF EITHER (review round 3, finding 5). Round 2 made a
+# bad stamp CONTENT unservable; an unwritable state dir (full disk, read-only remount) still left NO
+# stamp, so (d) never fired and the gate could hold forever by a different door. The epoch is kept in
+# the process too, and used when the file cannot be read back — and the failure is LOGGED, because a
+# silently unwritable state dir is worse than the stamp problem it causes.
+MP_SINCE_FALLBACK=""
+_stamp_set() { # <file> <epoch>  — atomic (tmp+rename), keeps the FIRST usable epoch of the block
+  local f="$1" epoch="${2:-}" t="" mine="" is_block=0
+  is_num "$epoch" || return 0
+  # ⛔ THE IN-PROCESS VALUE IS THE SECOND MEMORY, AND IT NEEDS THE SAME FIRST-EPOCH RULE (review
+  # round 4, P0). Round 3 added the fallback for an unwritable state dir but applied "keep the first
+  # epoch" only to the FILE — so on a full disk / read-only state dir every cycle overwrote the
+  # fallback with the CURRENT epoch, `now - since` stayed ~0, clause (d) could never fire, and the
+  # permanent stop this change removes survived the very case the fallback was added for. Measured:
+  # a mode-500 state dir with an hourly land held the gate for +8h with all four suites green.
+  case "$f" in
+    */merge-priority-blocked-since) mine="${MP_SINCE_FALLBACK:-}" ;;
+  esac
+  # ⛔ EVERY PATH THAT ACCEPTS AN EPOCH MUST ALSO REMEMBER IT (review round 5, P0). Round 4 kept the
+  # first epoch only in the FILE, and the in-process copy only on the FAILED-write path — so once a
+  # clear had marked a stamp INVALIDATED (an unwritable dir, once), later `set` calls early-returned
+  # on that surviving bogus file, the memory stayed empty, `mp_blocked_since` served nothing, clause
+  # (d) became unreachable, and the permanent stop came back — permanently, even after the dir became
+  # writable again. The block start is now mirrored on every acceptance path, and the file is not even
+  # consulted while it is known-invalid.
+  case "$f" in */merge-priority-blocked-since) is_block=1 ;; esac
+  if [ "$is_block" = "1" ] && [ "${MP_SINCE_INVALIDATED:-0}" = "1" ]; then
+    :                             # known-bogus this run: consult the memory, never the file
+  elif [ -f "$f" ]; then
+    t="$(cat "$f" 2>/dev/null || true)"
+    if is_num "$t" && [ $(( 10#$t )) -le $(( 10#$epoch )) ]; then
+      [ "$is_block" = "1" ] && MP_SINCE_FALLBACK="$t"
+      return 0
+    fi
+  fi
+  if is_num "$mine" && [ $(( 10#$mine )) -le $(( 10#$epoch )) ]; then
+    [ "$is_block" = "1" ] && MP_SINCE_FALLBACK="$mine"
+    return 0                      # the block already started: a write here cannot make it younger
+  fi
+  if printf '%s\n' "$epoch" > "$f.$$" 2>/dev/null && mv "$f.$$" "$f" 2>/dev/null; then
+    # A successful write means the dir IS writable again: the invalidation is spent.
+    if [ "$is_block" = "1" ]; then MP_SINCE_INVALIDATED=""; MP_SINCE_FALLBACK="$epoch"; fi
+    return 0
+  fi
+  rm -f "$f.$$" 2>/dev/null || true
+  [ "$is_block" = "1" ] && MP_SINCE_FALLBACK="$epoch"
+  echo "[state] WARN cannot write $f (unwritable state dir?) — using the in-process epoch $epoch so the time bound still applies" >> "${LOG:-/dev/null}" 2>/dev/null
+  return 0
+}
+mp_block_marker() { # <state-dir> <set|clear> [<epoch>]
+  local d="$(mp_state_dir "$1")" op="$2"
+  case "$op" in
+    set)   _stamp_set "$d/merge-priority-blocked-since" "${3:-}" ;;
+    clear)
+      MP_SINCE_FALLBACK=""
+      # ⛔ A CLEAR THAT CANNOT REMOVE THE FILE IS NOT A CLEAR (review round 4, P1). The old form was
+      # `rm -f … || true`, so on an unwritable state dir a PRE-EXISTING stamp was served forever: (d)
+      # fired every cycle, the gate never blocked again, and the release line kept claiming "held for
+      # 300m without clearing" — the opposite failure to the fallback, from the same root cause (the
+      # file treated as the only memory). Verify the removal; if the stamp survives, invalidate it for
+      # this process and say so once.
+      rm -f "$d/merge-priority-blocked-since" 2>/dev/null || true
+      if [ -e "$d/merge-priority-blocked-since" ]; then
+        MP_SINCE_INVALIDATED=1
+        echo "[state] WARN cannot remove $d/merge-priority-blocked-since (unwritable state dir?) — ignoring it for this run; the time bound will not be read from it" >> "${LOG:-/dev/null}" 2>/dev/null
+      else
+        MP_SINCE_INVALIDATED=""
+      fi
+      ;;
+  esac
+  return 0
+}
+mp_blocked_since() { # [<state-dir>] [<now>] -> epoch of the current block, or empty
+  local f="$(mp_state_dir "${1:-}")/merge-priority-blocked-since" v="" now="${2:-}"
+  # A stamp this process could not remove is not evidence of a block (see mp_block_marker clear).
+  [ "${MP_SINCE_INVALIDATED:-0}" = "1" ] && { is_num "${MP_SINCE_FALLBACK:-}" && printf '%s\n' "$MP_SINCE_FALLBACK"; return 0; }
+  [ -f "$f" ] && v="$(cat "$f" 2>/dev/null || true)"
+  is_num "$v" || { is_num "${MP_SINCE_FALLBACK:-}" && printf '%s\n' "$MP_SINCE_FALLBACK"; return 0; }
+  is_num "$now" || now="$(date +%s)"
+  # A stamp from the future cannot bound anything (now - since is negative), so it is not served —
+  # but the MEMORY is still consulted (review round 9). "Not served" used to mean "return nothing",
+  # which discarded the epoch _stamp_set had just recorded in MP_SINCE_FALLBACK because the write
+  # failed: with a FUTURE stamp file (a clock step-back, a copied state dir) AND an unwritable state
+  # dir (a full disk), clause (d) was unreachable every cycle and the gate could hold for ever — the
+  # permanent stop, re-formed by two conditions each defended on its own. Same reconciliation as
+  # mp_released_until: when the file's value cannot bound anything, the in-process value does.
+  if [ $(( 10#$v )) -gt $(( 10#$now )) ]; then
+    is_num "${MP_SINCE_FALLBACK:-}" && [ $(( 10#${MP_SINCE_FALLBACK} )) -le $(( 10#$now )) ] \
+      && printf '%s\n' "$MP_SINCE_FALLBACK"
+    return 0
+  fi
+  printf '%s\n' "$v"
+  return 0
+}
+
+# Epoch of the most recent LAND this box recorded (state/merged-<PR>.done), or empty. A test seam
+# selects another dir; unreadable mtimes are skipped, never guessed.
+mp_recent_land() { # [<state-dir>]
+  # ⛔ THE WALK IS BOUNDED. `state/merged-<PR>.done` is never pruned — merge-one.sh only ever WRITES
+  # them — so a long-lived box accumulates one per merged PR, forever, and the first form stat-ed
+  # every one of them twice (GNU `file_mtime_epoch` tries `stat -c` then `stat -f`) on EVERY cycle.
+  # Only a land inside 2x the gate's window can matter, so `find -mmin` shortlists and the loop stats
+  # only those. A land older than that reads as "no recent land" — which is exactly the gate's own
+  # question (a land outside the window releases anyway), and `[cap]`'s `last_land=` prints `?`.
+  local d="${1:-$O/state}" f m newest="" bound list
+  bound=$(( 10#${MERGE_PRIORITY_MAX_AGE_MIN:-180} * 2 ))
+  list="$(find "$d" -maxdepth 1 -name 'merged-*.done' -mmin -"$bound" 2>/dev/null || true)"
+  # A here-string, not `find … | while`: under `pipefail` the reader can exit first and make the
+  # pipeline read FAILED (#841's class), and the process substitution would lose `newest` to a
+  # subshell. `$list` is newline-delimited paths; IFS= read keeps spaces in a path intact.
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    m="$(file_mtime_epoch "$f")" || continue
+    if [ -z "$newest" ] || [ "$m" -gt "$newest" ]; then newest="$m"; fi
+  done <<MPEOF
+$list
+MPEOF
+  printf '%s\n' "$newest"
+}
+# Minutes since the YOUNGEST unowned open PR was created, from the SAME listing the ownership scan
+# reads (state/last-open-prs, `number:head:createdEpoch`). Empty when it cannot be measured — the
+# gate then RELEASES, because an unmeasured age is not evidence of a recent backlog.
+unowned_youngest_age_min() { # <open_prs> [<now_epoch>]
+  local n="${1:-}" now="${2:-$(date +%s)}" scanned newest
+  is_num "$now" || return 1
+  scanned="$(unowned_scan "$n")" || return 1
+  newest="${scanned#* }"
+  is_num "$newest" || return 1                     # `-`: no row carried a createdAt
+  [ "$newest" -gt "$now" ] && newest="$now"        # clock skew must not yield a negative age
+  printf '%s\n' "$(( (now - newest) / 60 ))"
 }
 res_line() {
   local idle pmem f i w cmp avail swapfree swaptotal dline duse procs runnable svcs rate _sw
@@ -668,13 +1234,21 @@ open_pr_count() { # -> echoes the open-PR count; never 0 on failure; writes stat
   local raw rc err sticky fc n prs
   # `if …; then` rather than `raw=$(…); rc=$?` so this stays correct if errexit is ever enabled —
   # under `set -e` the bare assignment would exit the loop BEFORE rc was read, on a transient blip.
-  # ONE listing, TWO facts: the count (drives scope + the sticky fallback) and the `number:headOid`
-  # rows (drive unowned_pr_count below). `--jq` emits a SINGLE line — `<count> <pr:sha> <pr:sha>`
-  # — so the split is positional and a variable-length list cannot confuse it; an empty list is
-  # `0 ` (jq still prints the count), which the parse below reads as count=0, rows=none.
+  # ONE listing, TWO facts: the count (drives scope + the sticky fallback) and the
+  # `number:headOid:createdEpoch` rows (drive unowned_pr_count AND the bounded merge-priority
+  # gate's AGE probe — `unowned_youngest_age_min` below). `--jq` emits a SINGLE line —
+  # `<count> <pr:sha:created> …` — so the split is positional and a variable-length list cannot
+  # confuse it; an empty list is `0 ` (jq still prints the count), which the parse below reads as
+  # count=0, rows=none. ⛔ `createdAt` is part of THIS listing on purpose: fetching it separately
+  # would be a second read of a different moment, and the age bound would then grade a snapshot
+  # the count did not come from. A missing/unparseable `createdAt` emits `-`, never a fabricated
+  # epoch (an unreadable age RELEASES the gate — see mp_reason). ⛔ `try … catch` is not decoration
+  # (review round 8): without it ONE malformed value (a fractional second, a non-Z zone) makes the
+  # whole `--jq` fail, `gh` exits non-zero, the listing is discarded as FAILED, and the gate goes
+  # inert — releasing every cycle — for as long as that row exists.
   if raw="$(gh pr list --repo "$OR" --state open --limit 300 \
-             --json number,headRefOid \
-             --jq '"\(length) \(map("\(.number):\(.headRefOid)") | join(" "))"' \
+             --json number,headRefOid,createdAt \
+             --jq '"\(length) \(map("\(.number):\(.headRefOid):\(try (.createdAt|fromdateiso8601) catch "-")") | join(" "))"' \
              2>"$O/state/.open-err.$$")"; then
     rc=0
   else
@@ -768,7 +1342,7 @@ pr_owned() { # <pr> <head-sha> -> 0 when something is currently working this PR
 
 # How many OPEN PRs nothing is currently working. <open_prs>
 unowned_pr_count() {
-  local n="${1:-}" list tok pr sha owned=0 u
+  local n="${1:-}"
   # ⛔ A malformed count must FAIL CLOSED, and failing closed here means EMIT NOTHING — never a
   # number. The first draft coerced it to 0, which is the most permissive value the gate can be
   # handed AND a perfectly valid one, so the caller's guard could not see it and the gate OPENED on
@@ -779,17 +1353,48 @@ unowned_pr_count() {
   # caller substituted its own `08`, and `[ 08 -gt 25 ]` read 8 and OPENED the gate. is_num rejects
   # leading zeros (and everything non-numeric) on purpose.
   is_num "$n" || return 1
+  local out
+  out="$(unowned_scan "$n")" || return 1
+  printf '%s\n' "${out%% *}"
+}
+
+# ── ONE scan, ONE parser, TWO facts: the unowned count and the youngest unowned PR (#2040) ───────
+# `unowned_pr_count` and the merge-priority age probe read the SAME rows, so they must read them the
+# SAME way. The first draft of the age probe re-parsed the token and the two disagreed about the
+# head — a bug that presented as one PR being counted unowned while its age was read from another
+# (measured in review: a 3-field token `number:sha:epoch` left `sha="<sha>:<epoch>"` in the count,
+# so every `needsfix-<pr>-<head>` marker stopped matching and EVERY PR read as unowned — inflating
+# the very number the gate blocks on). One function, one answer.
+#
+# Row format: `number:headOid:createdEpoch`. TWO fields is the older on-disk format and is still
+# accepted (an aged `state/last-open-prs` must not be misread); the third is absent there.
+#
+# Echoes `<unowned> <youngest_unowned_created_epoch|->`. The epoch is `-` when no row carries one
+# (older format, or `createdAt` was unreadable) — the AGE probe then reports "unmeasurable" and the
+# gate RELEASES, which is the documented polarity: block only on evidence actually held.
+# ⚠️ POLARITY, ONCE, FOR BOTH FACTS (review, #2040). No rows => NOTHING is owned, so the whole count
+# reads as unowned. That used to be "the conservative direction: more unowned CLOSES the gate" —
+# and it still is for `unowned`, `review_slots` and `fix_slots` (drain headroom). But since the gate
+# is now BOUNDED, a listing that could not be read can no longer keep dispatch shut on this count
+# alone: `unowned_youngest_age_min` cannot answer from a deleted row file either, so it returns
+# unreadable and `mp_reason` RELEASES. That is deliberate and stated: the gate blocks only on
+# evidence it actually holds, and an unpriced backlog is not evidence. The fallback above remains
+# because it is what the LOG and the budgets report — it is no longer the thing that holds the gate.
+unowned_scan() { # <open_prs>
+  local n="${1:-}" list tok pr rest sha created owned=0 u newest=""
+  is_num "$n" || return 1
   list="$(cat "$O/state/last-open-prs" 2>/dev/null || true)"
-  # No rows => assume NOTHING is owned, i.e. the whole count is unowned. That is the CONSERVATIVE
-  # direction: more unowned CLOSES the dispatch gate. Assuming they were owned would OPEN it on a
-  # listing we could not read — the same fail-open this file's is_limit discipline exists to
-  # prevent, and it is what the `rm -f` on open_pr_count's failure path guarantees here.
-  [ -n "${list// /}" ] || { echo "$n"; return 0; }
-  for tok in $list; do
-    pr="${tok%%:*}"; sha="${tok#*:}"
-    case "$pr" in ''|*[!0-9]*) continue ;; esac
-    if pr_owned "$pr" "$sha"; then owned=$(( owned + 1 )); fi
-  done
+  if [ -n "${list// /}" ]; then
+    for tok in $list; do
+      pr="${tok%%:*}"; rest="${tok#*:}"; sha="${rest%%:*}"; created="${rest#*:}"
+      case "$pr" in ''|*[!0-9]*) continue ;; esac
+      if pr_owned "$pr" "$sha"; then owned=$(( owned + 1 )); continue; fi
+      # ONLY unowned PRs age the gate — an owned PR is already being worked.
+      [ "$created" = "$rest" ] && continue          # 2-field row: no createdAt
+      is_num "$created" || continue
+      if [ -z "$newest" ] || [ "$created" -gt "$newest" ]; then newest="$created"; fi
+    done
+  fi
   # An owned count ABOVE the listing's (a race between the two reads) collapses to 0, never to a
   # negative that `[ -gt ]` would read as "not over the threshold".
   # `10#` is belt-and-braces, NOT independently test-covered: `is_num` above already rejects the
@@ -798,7 +1403,7 @@ unowned_pr_count() {
   # function is correct even if the guard is ever loosened.
   u=$(( 10#$n - owned ))
   [ "$u" -lt 0 ] && u=0
-  echo "$u"
+  printf '%s %s\n' "$u" "${newest:--}"
 }
 
 while true; do
@@ -806,7 +1411,9 @@ while true; do
   res_line   # MEASURE every resource; decide nothing from it
   reap_stale_workers
   L="$(load1)"
-  echo "=== $(date) load=$L lanes=$(tmux ls 2>/dev/null | grep -c '^lane-') backlog=$(wc -l < "$O/candidates.txt" | tr -d ' ') queue=$(queue_state_token) ===" >> "$LOG"
+  # Read the gh-limit record ONCE per cycle; the token is age-bounded inside (see gh_limit_token).
+  GHL="$(gh_limit_token)"
+  echo "=== $(date) load=$L lanes=$(tmux ls 2>/dev/null | grep -c '^lane-') backlog=$(wc -l < "$O/candidates.txt" | tr -d ' ') queue=$(queue_state_token)${GHL:+ $GHL} ===" >> "$LOG"
 
   # ---- 1) merge sweep (this box's open PRs) -------------------------------
   # scope: when the repo has >10 open PRs, help drain EVERYONE's (broad); otherwise just this box's.
@@ -1028,6 +1635,56 @@ while true; do
     if [ -z "$(find "$O/state/.claims-pruned" -mmin -60 2>/dev/null)" ]; then
       touch "$O/state/.claims-pruned"
       ( claim_prune >> "$LOG" 2>&1 ) &
+    fi
+  fi
+
+  # ── machine-global package caches (agent-infra#1987) ───────────────────────
+  # The measured defect: on pi-cell-3 `~/.cache/uv` reached 7.1GB and the box refused EVERY
+  # dispatch at 258MB free while this controller kept beating and the queue read fine. The refusal
+  # itself was loud (spawn-gate names the disk and the remedy) — the REMEDY was the gap: `prune`
+  # reclaimed per-worktree `.venv`/`node_modules` only, so the largest consumer was untouched and
+  # kept growing.
+  # This loop is a CLOCK for the reaper, not the owner of its policy. Both triggers ship DRY-RUN:
+  # arming a scheduled deletion is an owner-level decision (agent-infra#1678, owner ruling
+  # 2026-10-11: "the reaper may run unattended; arming it may not"). The armed arm is reached the
+  # way the cell already reclaims under pressure — `cloud-cell-supervisor.sh`, unattended below
+  # 2x MIN_FREE_MB with no live worker, calling `prune --caches`.
+  # The hourly stamp is the same idiom as claim_prune above (this loop's clock is mtime-based).
+  if [ -z "$(find "$O/state/.cache-reaped" -mmin -60 2>/dev/null)" ]; then
+    touch "$O/state/.cache-reaped"
+    # The same chain as the supervisor and bring-up: ${CACHE_REAPER:-} -> the FARMED copy ->
+    # the copy beside the bundle (scripts/pi-cache-reap.sh, one directory up from this harness).
+    # The SAME chain, in the SAME order, as cloud-cell-supervisor.sh and cloud-cell-bringup.sh:
+    # ${CACHE_REAPER:-} -> the FARMED copy -> the copy beside the bundle. A loop, not an if/else:
+    # with an if/else a NON-EMPTY but mistyped override selected nothing and the clock went
+    # permanently silent (a log line only — `.cache-reap-blocked` was never written, so `status` said
+    # nothing) while the armed prune path on the same box ran the farmed copy.
+    _cache_reaper=""
+    for _cand in "${CACHE_REAPER:-}" \
+                 "${HOME:-}/.pi/agent/scripts/pi-cache-reap.sh" \
+                 "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." 2>/dev/null && pwd)/pi-cache-reap.sh"; do
+      [ -n "$_cand" ] && [ -f "$_cand" ] && { _cache_reaper="$_cand"; break; }
+    done
+    [ -n "$_cache_reaper" ] || _cache_reaper="${CACHE_REAPER:-${HOME:-}/.pi/agent/scripts/pi-cache-reap.sh}"
+    if [ -f "$_cache_reaper" ]; then
+      # ⛔ `&` discards the exit status, and that status is the reaper's ONLY signal (the class the
+      # ⛔ further down this file records for the refresh:
+      # "a refresh that aborts EVERY cycle reads as a healthy cell"). Record a non-zero pass where
+      # `status` prints it, and clear it on the next clean one.
+      (
+        bash "$_cache_reaper" --dry-run >>"$LOG" 2>&1
+        _rc=$?
+        case "$_rc" in
+          0) rm -f "$O/state/.cache-reap-blocked" ;;   # checked: every cache is under its bound
+          4) : ;;                                      # did not run (lock held) — touch nothing
+          5) { printf 'a package cache is OVER its bound and the reaper is not armed (dry-run):\n';
+               tail -3 "$LOG" 2>/dev/null; } >"$O/state/.cache-reap-blocked" 2>/dev/null || true ;;
+          *) { printf 'cache reaper exit %s at %s\n' "$_rc" "$(date -u +%Y-%m-%dT%H:%M:%SZ)";
+               tail -2 "$LOG" 2>/dev/null; } >"$O/state/.cache-reap-blocked" 2>/dev/null || true ;;
+        esac
+      ) &
+    else
+      echo "[cache-reap] NOT RUN — $_cache_reaper is absent, so the machine-global uv/npm/pip caches are unbounded (farm it: pi-bootstrap/setup.sh)" >> "$LOG"
     fi
   fi
 
@@ -1404,21 +2061,115 @@ PY
     # The probe itself failed. UNKNOWN, not ample: we cannot see capacity, so we do not add work.
     MEMAVAIL_MB=0; MEM_UNKNOWN=1
   fi
-  echo "[cap] load=$L/$MAX_LOAD lanes=$LANES/$MAX_LANES mem_avail=${MEMAVAIL_MB}M/${MIN_MEM_FREE_MB}M swap_free=${SWFREE}M/${MIN_SWAP_FREE}M open=${OPEN_N:-?} unowned=${UPN:-?} review_slots=${MR:-?} fix_slots=${MF:-?}" >> "$LOG"
+  # ⛔ COERCE like L / SWFREE / SWTOTAL (#1985 review, P2). Those three are is_num-guarded; MEMAVAIL_MB
+  # was not, so an empty value reached `[ "$MEMAVAIL_MB" -le … ]` as `[: : integer expression expected`
+  # — an ERRORED test, which is FALSE, which leaves GATE_WHY empty and OPENS the gate. Unreachable
+  # through mem_avail_mb() today, but it is the one seam where a probe fault would admit work.
+  if ! is_num "${MEMAVAIL_MB:-}"; then MEMAVAIL_MB=0; MEM_UNKNOWN=1; fi
+  # ⛔ THE MERGE-PRIORITY GATE IS HANDED ITS EVIDENCE, NOT ITS CONCLUSION (see mp_reason): the age
+  # of the youngest unowned PR, the epoch of the last recorded land, and how long the current block
+  # has been held. All three are measured HERE, once, and BEFORE the [cap] line that prints them —
+  # measured after it, that line printed `?` on the first cycle and the PREVIOUS cycle's reading on
+  # every one after (a stale record presented as current: exactly what this change removes).
+  LAND_EPOCH="$(mp_recent_land)"
+  YOUNG_AGE="$(unowned_youngest_age_min "$OPEN_N" 2>/dev/null || true)"
+  BLOCKED_SINCE="$(mp_blocked_since)"
+  # A window the ULTIMATE BOUND opened (see mp_reason(0)): while it is in the future the gate does not
+  # arm, so a bound-driven release is a WINDOW of dispatch rather than the single pulse the next
+  # cycle's re-arm would otherwise leave (review round 3, finding 7).
+  RELEASED_UNTIL="$(mp_released_until "$O/state")"
+  LAND_AGE=""
+  if is_num "${LAND_EPOCH:-}"; then
+    _now_a="$(date +%s)"; is_num "$_now_a" || _now_a=0
+    [ "$LAND_EPOCH" -gt "$_now_a" ] && LAND_EPOCH="$_now_a"
+    LAND_AGE=$(( (_now_a - (10#$LAND_EPOCH)) / 60 ))
+  fi
+  # `@${OR}` is part of this line on purpose: the repo the count came from is the datum whose absence
+  # let a wrong-surface read run for hours. bare `$OR` is avoided for the same reason `${OR:-}` is used
+  # below — selftest.sh extracts and drives parts of this file in a subshell with no OR.
+  echo "[cap] load=$L/$MAX_LOAD lanes=$LANES/$MAX_LANES mem_avail=${MEMAVAIL_MB}M/${MIN_MEM_FREE_MB}M swap_free=${SWFREE}M/${MIN_SWAP_FREE}M open=${OPEN_N:-?}@${OR:-?} unowned=${UPN:-?} youngest_unowned=${YOUNG_AGE:-?}m last_land=${LAND_AGE:-?}m blocked_since=${BLOCKED_SINCE:-none} review_slots=${MR:-?} fix_slots=${MF:-?}" >> "$LOG"
   # Four gates. swap_total=0 => swap uninitialised (fresh boot), NOT pressure — allow.
   # Name the binding gate: an earlier version logged "skipped (load=…)" while load was never
   # consulted, so a lanes-bound or swap-bound stall looked like a load stall.
-  GATE_WHY="$(mp_reason "${UPN:-0}" "$LANES" "$WORKERS" "${OPEN_N:-0}")"
+  # `${OR:-}` because selftest.sh extracts this chain verbatim and drives it in a subshell with no
+  # OR: an unquoted `$OR` there is an unbound-variable error that silently skips the entry line.
+  # ⛔ THE MERGE-PRIORITY GATE IS IDENTIFIED BY A FLAG, NOT BY PARSING ITS MESSAGE (review round 3,
+  # finding 4). The stamp below is armed on this, and a wording change in mp_reason's reason — a
+  # string nobody thinks of as interface — would otherwise silently stop the ultimate bound from ever
+  # starting, with no test reddening. `MP_HELD` is set from the ONE fact the loop knows: which gate
+  # fired is decided here, where the reason is produced.
+  GATE_WHY="$(mp_reason "${UPN:-0}" "$LANES" "$WORKERS" "${YOUNG_AGE:-}" "${LAND_EPOCH:-}" "${OPEN_N:-0}" "${OR:-}" "" "${BLOCKED_SINCE:-}" "${RELEASED_UNTIL:-}")"
+  MP_HELD=""
+  case "$GATE_WHY" in merge-priority*) MP_HELD=1 ;; esac
   if [ -n "$GATE_WHY" ]; then :
   elif [ "$L" -ge "$MAX_LOAD" ]; then GATE_WHY="load=$L>=max_load=$MAX_LOAD"
   elif [ "$LANES" -ge "$MAX_LANES" ]; then GATE_WHY="lanes=$LANES>=max_lanes=$MAX_LANES"
-  elif [ "$SWTOTAL" -ne 0 ] && [ "$SWFREE" -le "${MIN_SWAP_FREE:-600}" ]; then GATE_WHY="swap_free=${SWFREE}M<=min_swap_free=${MIN_SWAP_FREE:-600}M"
+  # ⛔ SWAP IS CUMULATIVE, RAM IS PRESENT (#1985). On macOS a 1 GB swap file stays roughly half
+  # occupied for the life of the boot after ANY spike, so this arm vetoed dispatch forever while the
+  # box had 1.4 GB available RAM (53 MB free + 1297 MB inactive) and 20 of 20 lane slots idle:
+  # measured 2026-10-18, every cycle, "lanes=0/20 … swap_free=506M<=min_swap_free=600M". The metric
+  # described the PAST, and with the RAM gate PASSING underneath it, "no create activity" was
+  # indistinguishable from "nothing to do".
+  # Swap exhaustion only matters when RAM is ALSO tight, so require both. An UNKNOWN memory read
+  # keeps the veto (fail closed) — never let a probe failure open the gate.
+  elif [ "$SWTOTAL" -ne 0 ] && [ "$SWFREE" -le "${MIN_SWAP_FREE:-600}" ] \
+       && { [ "${MEM_UNKNOWN:-0}" = "1" ] || [ "${MEMAVAIL_MB:-0}" -le "$(( MIN_MEM_FREE_MB * 2 ))" ]; }; then
+    GATE_WHY="swap_free=${SWFREE}M<=min_swap_free=${MIN_SWAP_FREE:-600}M AND mem_avail=${MEMAVAIL_MB}M<=$(( MIN_MEM_FREE_MB * 2 ))M (both tight)"
   # "A failed probe is UNKNOWN, not ample" is only true if MEM_UNKNOWN can be SET, and it is set
   # from mem_avail_mb()'s EXIT STATUS (its awk `exit 1`s on absent fields) rather than from an empty
   # string: awk's END block always ran, so `printf "%d"` yielded 0 for unset fields and a test for
   # an empty MEMAVAIL_MB could never be true. The helper is therefore tested on its own, above.
   elif [ "${MEM_UNKNOWN:-0}" = "1" ]; then GATE_WHY="mem_probe_failed (capacity unknown -> do not add work)"
   elif [ "$MEMAVAIL_MB" -le "$MIN_MEM_FREE_MB" ]; then GATE_WHY="mem_avail=${MEMAVAIL_MB}M<=min_mem_free_mb=${MIN_MEM_FREE_MB}M"
+  fi
+  # A cycle the AGE/EVIDENCE BOUND decided (over the threshold, released) says so on its own line.
+  # Without it the only trace of a released gate is dispatch happening, which reads exactly like the
+  # gate never having fired — the silence that let a permanent stop look like healthy behaviour.
+  # ⛔ THIS SITS OUTSIDE THE GATE CHAIN ON PURPOSE: selftest.sh extracts the chain verbatim from the
+  # `GATE_WHY="$(mp_reason …)` line to its closing `fi`, so an `fi` here would truncate the fixture.
+  if [ -z "$GATE_WHY" ]; then
+    # ⛔ EVERY ONE OF THESE IS DEFAULTED, INCLUDING lanes/workers/OR. refresh-scout.test.sh extracts
+    # this block VERBATIM and drives it in a `set -u` subshell that defines only O/LOG/BATCH/OR/REPO/
+    # GATE_WHY — a bare `$LANES` there is an unbound-variable ABORT, which reads as "nothing was
+    # batched" and hid the whole §9 section behind a fixture detail rather than a code fact. (The
+    # same trap is why `${OR:-}` was already written this way.)
+    RELEASE_NOTE="$(mp_release "${UPN:-0}" "${LANES:-0}" "${WORKERS:-0}" "${YOUNG_AGE:-}" "${LAND_EPOCH:-}" "${OPEN_N:-0}" "${OR:-}" "" "${BLOCKED_SINCE:-}" "${RELEASED_UNTIL:-}")"
+    [ -n "$RELEASE_NOTE" ] && echo "[dispatch] $RELEASE_NOTE" >> "$LOG"
+    command -v mp_block_marker >/dev/null 2>&1 && mp_block_marker "$O/state" clear  # no block holding
+    # …and if it was the ULTIMATE BOUND that released (not the evidence), hold the gate open for one
+    # window. Only this case earns it: any other release means the evidence itself changed.
+    if command -v mp_bound_released >/dev/null 2>&1 \
+       && mp_bound_released "${UPN:-0}" "${LANES:-0}" "${WORKERS:-0}" "${YOUNG_AGE:-}" "${LAND_EPOCH:-}" "" "${BLOCKED_SINCE:-}"; then
+      _now_r="$(date +%s)"
+      is_num "$_now_r" || _now_r=0
+      _win=$(( 10#${MERGE_PRIORITY_MAX_AGE_MIN:-180} * 60 ))
+      if mp_released_marker "$O/state" set "$(( _now_r + _win ))"; then
+        echo "[dispatch] the time bound released the gate — holding it open until $(( _now_r + _win )) ($(( _win / 60 ))m) so this is a window of dispatch, not one pulse" >> "$LOG"
+      else
+        # The state dir is unwritable: the window exists only in this process. Say THAT, not the
+        # sentence above — a log line that reports a window the box does not have is the instrument
+        # lying about its own decision (review round 6).
+        echo "[dispatch] the time bound released the gate — the window could NOT be recorded in state/merge-priority-released-until; holding it IN-PROCESS until $(( _now_r + _win )) ($(( _win / 60 ))m) (check the state dir's writability)" >> "$LOG"
+      fi
+    fi
+  elif [ -n "${MP_HELD:-}" ]; then
+    # FIRST cycle of a MERGE-PRIORITY block: stamp it — the ultimate bound measures ONE continuous
+    # merge-priority block. ⛔ NOT any gate: a five-hour load or lane block would leave a stamp whose
+    # age the merge-priority gate then inherits, so the FIRST merge-priority cycle would release on a
+    # bound it never started (measured in review: a 5h stamp released immediately). A different gate
+    # means merge priority is not what is holding, so the stamp is cleared.
+    command -v mp_block_marker >/dev/null 2>&1 && mp_block_marker "$O/state" set "$(date +%s)"
+    # The gate is arming, so no window can be open (mp_reason(0) returned nothing): whatever is left
+    # in the released-until file is EXPIRED. Remove it here rather than leaving junk for the reader.
+    command -v mp_released_marker >/dev/null 2>&1 && mp_released_marker "$O/state" clear
+  else
+    command -v mp_block_marker >/dev/null 2>&1 && mp_block_marker "$O/state" clear
+    # ⛔ THE RELEASE WINDOW IS **NOT** CLEARED HERE (review round 4, P1). `load=` and `lanes=` blocks
+    # fire routinely on a draining box, and clearing the marker on one of them would end the window
+    # early — the next merge-priority cycle would then re-arm and the "window of dispatch" collapses
+    # back to one pulse per window, which is the very defect the marker exists to fix. The marker
+    # expires on its own (mp_released_until serves only a future value), so the only thing to do when
+    # a different gate holds is nothing.
   fi
   if [ -z "$GATE_WHY" ]; then
     : > "$O/.batch"; K=0
@@ -1439,13 +2190,27 @@ PY
       # ⛔ BOTH REFUSALS STOP THE DISPATCH — INCLUDING THE INFRA ONE (rc=2). claims.sh fails OPEN on
       # an unreachable remote for a PR claim, because refusing there costs one merge; here the safe
       # reading is the opposite: an UNREADABLE registry is not evidence of freedom, and dispatching
-      # on it is the exact duplicate this issue exists to remove. The cost is bounded — the same
-      # outage fails the pre-flight's `gh` surfaces, so the cell is already stalled — and it is the
-      # polarity `claim_issue_preflight` takes on the read side.
+      # on it is the exact duplicate this issue exists to remove.
+      # ⛔ ITS BLAST RADIUS IS THE FLEET, NOT THIS BOX — DO NOT SOFTEN THE REFUSAL ON THE ASSUMPTION
+      # THAT `gh` IS DOWN TOO (2026-10-16 review). This comment used to assert "the same outage fails
+      # the pre-flight's `gh` surfaces, so the cell is already stalled"; that is FALSE, and the
+      # regression case for it (`claim-unreachable`) disproves it with a WORKING gh stub: the
+      # registry read is `git ls-remote` — a GIT transport — while the pre-flight tool and the whole
+      # merge path use the `gh` REST API. A git-only failure (credentials, a ruleset, a transport
+      # block) therefore refuses every issue on EVERY box pointed at this repo, so nothing is queued
+      # and nothing is dispatched, while merges keep working. That is the intended direction (a
+      # registry outage must never become a duplicate dispatch), but it is a fleet-wide stop on
+      # dispatch and it must be visible: refresh-candidates.sh reports it in aggregate and exits
+      # non-zero, so the controller never reads it as "no work available".
       #
       # ⚠️ NO KILL-SWITCH. An ambient env var that turns this off is the "disable a gate by ambient
-      # env" shape (a bypass), so the fallback below is only for a registry that is genuinely not
-      # provisioned, and it says so in the log every time it is used.
+      # env" shape (a bypass), so the ONLY fallback is a registry that is genuinely NOT PROVISIONED
+      # (no file at all), and it says so in the log every time it is used. ⛔ A registry that EXISTS
+      # but is too old to take a claim is NOT that case (2026-10-16 review): it is local drift on
+      # THIS box, and dispatching unclaimed while this same box's pre-flight refuses every issue as
+      # INCOMPLETE is a fail-open that can duplicate a peer's work — so it stops the dispatch, names
+      # the fix, and `refresh-candidates.sh --check` refuses the cell up front. Pre-flight and
+      # dispatch now take the SAME polarity on the same condition.
       if [ -f "$O/claims.sh" ] && declare -f claim_issue_acquire >/dev/null 2>&1; then
         if claim_issue_acquire "" "$ISS"; then
           # The commit this box pushed, for the FENCED release. Written only on a successful acquire,
@@ -1453,24 +2218,47 @@ PY
           claim_issue_record "$O" "$ISS" "${CLAIM_COMMIT:-}" \
             || echo "[dispatch] ⚠️ #$ISS: could not record the claim commit — chain-merge.sh cannot FENCE the release (the claim will run to its lease)" >> "$LOG"
         else
-          echo "[dispatch] #$ISS NOT dispatched — ${CLAIM_RESULT:-issue claim refused}" >> "$LOG"
+          acq_rc=$?
+          # ⛔ rc=2 WITH A COMMIT IN HAND IS A RELEASE PATH, NOT JUST A REFUSAL (2026-10-16 review).
+          # claims.sh sets CLAIM_COMMIT on the create/reclaim paths whose push MAY have landed and
+          # only the read-back failed — its own comment says the caller can attempt a FENCED release,
+          # and merge-one.sh already does exactly that for the same condition. Discarding it here
+          # orphaned a claim THIS BOX created for the whole lease, with every peer reading the issue
+          # as taken: the abandoned-claim class this change exists to close.
+          if [ "$acq_rc" = "2" ] && [ -n "${CLAIM_COMMIT:-}" ]; then
+            claim_issue_record "$O" "$ISS" "$CLAIM_COMMIT" 2>/dev/null
+            if claim_issue_release_record "$O" "$REPO" "$ISS" "$CLAIM_COMMIT" >/dev/null 2>&1; then
+              echo "[dispatch] #$ISS NOT dispatched (claim infra error) — the claim commit this box may have pushed WAS released (fenced on $CLAIM_COMMIT)" >> "$LOG"
+            else
+              echo "[dispatch] #$ISS NOT dispatched — ${CLAIM_RESULT:-issue claim refused}; the possibly-created claim could NOT be released — it will expire with its lease" >> "$LOG"
+            fi
+          else
+            echo "[dispatch] #$ISS NOT dispatched — ${CLAIM_RESULT:-issue claim refused}" >> "$LOG"
+          fi
           continue
         fi
+      elif [ -f "$O/claims.sh" ]; then
+        # PRESENT BUT STALE — see the polarity note above. The box would have to dispatch unclaimed,
+        # which is the fail-open this branch now refuses.
+        echo "[dispatch] #$ISS NOT dispatched — \$O/claims.sh predates the issue key (no claim_issue_acquire), so this box cannot take the claim; fix: cp scripts/orchestrator-harness/*.sh ~/orchestrator/" >> "$LOG"
+        continue
       else
-        echo "[dispatch] ⚠️ #$ISS: no claim registry at \$O/claims.sh (or it predates the issue key) — dispatching WITHOUT a cross-box claim" >> "$LOG"
+        echo "[dispatch] ⚠️ #$ISS: no claim registry at \$O/claims.sh — dispatching WITHOUT a cross-box claim (seed it: cp scripts/orchestrator-harness/*.sh ~/orchestrator/)" >> "$LOG"
       fi
       echo "$ISS" >> "$O/.batch"; echo "$ISS" >> "$O/dispatched.txt"; K=$((K+1)); [ "$K" -ge "$BATCH" ] && break
     done < "$O/candidates.txt"
     if [ -s "$O/.batch" ]; then
+      dispatch_funnel "$K" "$(queue_state_token)" >> "$LOG"
       echo "[dispatch] load=$L lanes=$LANES -> $(tr '\n' ' ' < "$O/.batch")" >> "$LOG"
       bash "$O/dispatch-merge.sh" "$REPO" "$OR" $(tr '\n' ' ' < "$O/.batch") >> "$LOG" 2>&1
     # ⛔ "backlog empty" IS A CLAIM, NOT A NEUTRAL FACT (agent-infra#1931). On its own it reads as
-    # "the fleet has nothing to do", but the SAME line is printed when the refresh could not read the
-    # pool at all — that is how a blind box idled all evening looking healthy. The state travels with
-    # it, in the refresh's own vocabulary: `queue=EMPTY` is the only form that means "no work";
-    # `queue=UNREADABLE`/`PARTIAL(..)` means "the last pool read did not establish an empty pool".
-    else echo "[dispatch] backlog empty queue=$(queue_state_token)" >> "$LOG"; fi
+    # "the fleet has nothing to do", and the SAME line was printed when 223 candidates had been READ
+    # and every one of them was filtered away (#2040) — the contradiction that hid a total dispatch
+    # stop for hours. The funnel replaces it: it names where the candidates went, and `queue=EMPTY`
+    # remains the only form that means "no work".
+    else dispatch_funnel 0 "$(queue_state_token)" >> "$LOG"; fi
   else
+    dispatch_funnel 0 "$(queue_state_token)" "$GATE_WHY" >> "$LOG"
     echo "[dispatch] skipped ($GATE_WHY) lanes=$LANES workers=$WORKERS" >> "$LOG"
   fi
   heartbeat
@@ -1511,6 +2299,19 @@ PY
             echo "Those lines name the failing link; the knobs are TORTOISE_REPO=<a tortoise checkout> in keys.env (the controller session re-sources it; an ambient export does not reach a pre-existing tmux server), a vendored tools/collision_preflight.py in the repo, SCOUT_PY=<a Python >= 3.12>, or a writable, gh-authenticated HOME."
             echo "After fixing it, delete this file. The refresh re-writes it, with the current reason, if the cause persists."
           } > "$O/.refresh-blocked"
+        elif [ "$rc" -eq 78 ]; then
+          # ⛔ 78 IS A CONFIGURATION REFUSAL, NOT A TRANSIENT FAILURE (review round 3, finding 9).
+          # The refresh exits 78 when repo-slug.sh is missing or stale — the one condition where it
+          # cannot attribute the pool to a repo. Classified transient it was retried forever, and the
+          # only place that would print the remedy (the .refresh-blocked file) never fired, so the
+          # sole symptom was a `funnel STALE` line half an hour later. Same handling as rc=3: say it
+          # once, name the re-seed, and do not retry a config error every cycle.
+          echo "[refresh] BLOCKED (permanent): repo-slug.sh missing/stale in \$O — the pool cannot be attributed to a repo, so nothing may be queued. Re-seed: cp scripts/orchestrator-harness/*.sh \$O/ then delete \$O/.refresh-blocked (agent-infra#2040)" >> "$LOG"
+          {
+            echo "MERGE-ONLY: dispatch is BLOCKED — repo-slug.sh is missing or stale in \$O."
+            echo "The refresh refuses to read a candidate pool it cannot attribute to a repo (agent-infra#2040)."
+            echo "Fix: cp scripts/orchestrator-harness/*.sh <your \$O>/   then delete this file."
+          } > "$O/.refresh-blocked" 2>/dev/null
         elif [ "$rc" -ne 0 ]; then
           echo "[refresh] FAILED rc=$rc (transient — retried next cycle)" >> "$LOG"
         fi ) &
