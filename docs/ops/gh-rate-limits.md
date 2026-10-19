@@ -262,6 +262,20 @@ tail -5 ~/.pi/agent/gh-gate/events.log         # what the gate did: paces, waits
 - A bare `403` with a permissions message is NOT a rate limit; the shim does not retry it (a
   mutating command must not run twice).
 
+### When it is the merge rail refusing
+
+`scripts/admin-merge.sh` classifies the same refusal: a rate-limited read or merge carries
+`[rate_limited]` **beside** the tag it already had (`head_unreadable`,
+`merged_precheck_unreadable`, `merge_unreadable`), so existing consumers of those tags keep
+working. Do not read that tag as "the PR is unreadable" or "the token is wrong" — MEASURED
+2026-10-17 on PR #1934: two rail runs surfaced a burst refusal as `head_unreadable` whose hint
+said "check credentials, --repo, and the PR number", the credential was fine, and the operator's
+next move was a raw REST merge — a bypass of the rail rather than of the limit. A
+`[rate_limited]` refusal is **retryable**: re-run the rail once the window has cleared. The
+shim's retries (above) run first and each re-send is bounded by
+`AGENT_GH_GATE_MAX_ATTEMPTS` × the gh-limit layer's 4, so a call that exhausted both layers
+means the window outlasted that budget.
+
 ## Fallback: REST for the operations gh uses GraphQL for
 
 ⚠️ **REST shares the same concurrency cap.** Switching transport gets you out of an
