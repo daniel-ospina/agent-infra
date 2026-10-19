@@ -649,7 +649,7 @@ for repo_arg in "${REPOS[@]}"; do
   MAIN_REPO="${MAIN_REPO%/}"    # ... and its preceding slash
 
   BRANCH="$(git -C "$MAIN_REPO" symbolic-ref --short HEAD 2>/dev/null || echo "detached")"
-  PORCELAIN="$(git -C "$MAIN_REPO" status --porcelain 2>/dev/null || true)"
+  PORCELAIN="$(git -C "$MAIN_REPO" -c core.quotepath=false status --porcelain 2>/dev/null || true)"
   # #1919: a registered worktree nested inside the repo root is not dirt.
   PORCELAIN="$(printf '%s\n' "$PORCELAIN" | filter_registered_worktrees "$MAIN_REPO")"
   PORCELAIN_COUNT="$(printf '%s\n' "$PORCELAIN" | grep -c . || true)"

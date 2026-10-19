@@ -710,14 +710,21 @@ export function porcelainWithoutRegisteredWorktrees(porcelain, cwd = process.cwd
   // Porcelain paths are relative to the repo root, but `status.relativePaths`
   // (default true) makes them relative to the CWD — so both frames are tried,
   // and a path that resolves under EITHER to a registered worktree is dropped.
-  const bases = [resolve(cwd)];
-  if (!bases.includes(records[0])) bases.push(records[0]);
+  // Porcelain v1 paths are ALWAYS relative to the REPOSITORY ROOT — that is
+  // git's documented format (`status.relativePaths` affects the human-readable
+  // format only, not `--porcelain`). Trying the CWD as a second base could
+  // therefore only ever map an entry to the WRONG place: from a hub
+  // SUBDIRECTORY it silently dropped genuine dirt and `readHubDisorder`
+  // reported CLEAN on a dirty hub (#1919 review cycle 3 P1 — measured:
+  // `?? sub/x/` worktree + `?? x/GENUINE` dropped the genuine entry when the
+  // cwd was `sub`). The shell twin (hub-state-check.sh) always used the root.
+  const root = records[0];
   const kept = [];
   for (const line of text.split("\n")) {
     if (line === "") continue;
     if (!line.startsWith("?? ")) { kept.push(line); continue; }
     const rel = _porcelainRelPath(line.slice(3));
-    const isWorktree = rel !== "" && bases.some((b) => _resolvesToRegistered(join(b, rel), registered));
+    const isWorktree = rel !== "" && _resolvesToRegistered(join(root, rel), registered);
     if (!isWorktree) kept.push(line);
   }
   return kept.join("\n");
@@ -6248,6 +6255,17 @@ export function resolveTargetTopLevel(targetPath, cwd = process.cwd()) {
  * branch, `--reason <string>` accompanies `--lock`. */
 const WT_ADD_VALUE_FLAGS = new Set(["-b", "-B", "--reason"]);
 
+/** Is `t` an UNAMBIGUOUS abbreviation of `--reason` (git accepts any such
+ * prefix)? `--reason=<x>` carries its value, so it is not a value-consuming
+ * token. No other `git worktree add` long option starts with `--r`, so every
+ * `--r…` prefix names `--reason` unambiguously.
+ * @param {string} t
+ * @returns {boolean}
+ */
+function _isReasonFlag(t) {
+  return t.startsWith("--") && !t.includes("=") && "--reason".startsWith(t);
+}
+
 /** The subcommand + TARGET PATH of a `worktree add` / `worktree move`
  * invocation, or null for every other worktree form.
  *
@@ -6269,7 +6287,13 @@ function _worktreeTargetArg(args, vars, execCwd) {
     if (!endOfOpts) {
       if (t === "--") { endOfOpts = true; continue; }
       if (t.startsWith("-") && t !== "-") {
-        if (WT_ADD_VALUE_FLAGS.has(t)) i++; // value in the NEXT token
+        // Value-flag match by UNAMBIGUOUS LONG-OPTION PREFIX, not exact spelling:
+        // git accepts any unambiguous abbreviation, so `--reaso /tmp/decoy nested`
+        // read `--reaso` as a boolean and judged `/tmp/decoy` as the target —
+        // ALLOWED, and `nested` was created inside the hub (#1919 review cycle 3
+        // P1). This is the fail-open class this file already documents for M5
+        // ("Exact-spelling tests are therefore a FAIL-OPEN bypass").
+        if (WT_ADD_VALUE_FLAGS.has(t) || _isReasonFlag(t)) i++; // value in the NEXT token
         continue;                          // boolean flag, or `-bfoo`/`--reason=x` (value attached)
       }
     }
@@ -6279,8 +6303,8 @@ function _worktreeTargetArg(args, vars, execCwd) {
   let target = sub === "add" ? pos[1] : sub === "move" ? pos[2] : null;
   if (!target) return null;
   if (target === "\u0000") return null;
-  // `~` is GIT's own expansion, not the shell's — leave it unjudged.
-  if (target === "~" || target.startsWith("~/")) return null;
+  // A TILDE target is resolved by the CALLER (two readings — see
+  // nestedWorktreeTargetReason), so it is NOT expanded or dropped here.
   // A SHELL-VARIABLE target is expanded through the command's own assignments
   // plus PWD (the execution frame). Not doing it was a fail-open (#1919 review
   // P1): `D=q7; git worktree add "$D/wt"` and `git worktree add $PWD/v6` were
@@ -6398,7 +6422,29 @@ export function nestedWorktreeTargetReason(verb, args, execCwd = process.cwd(), 
   if (t.target === null) {
     return _unjudgeableTargetReason(t.sub, t.raw, execCwd, "shell variable");
   }
-  const lexical = resolve(execCwd, t.target);
+  // A TILDE target has TWO readings and the walker cannot tell them apart after
+  // quote-stripping: an UNQUOTED `~/wt` is expanded by the SHELL to `$HOME/wt`,
+  // while a QUOTED `'~/wt'` is passed through literally and git creates a
+  // `<cwd>/~/wt` directory — INSIDE the checkout (#1919 review cycle 3 P1).
+  // Both readings are judged and the first refusal wins; the remedy for the
+  // false block is to spell `"$HOME/wt"`, which expands and is allowed.
+  if (t.target === "~" || t.target.startsWith("~/")) {
+    const homeTarget = t.target === "~" ? homedir() : join(homedir(), t.target.slice(2));
+    return _judgeResolvedTarget(t.sub, t.target, execCwd)
+        ?? _judgeResolvedTarget(t.sub, homeTarget, execCwd);
+  }
+  return _judgeResolvedTarget(t.sub, t.target, execCwd);
+}
+
+/** The #1919 decision for ONE resolved target string: refuse when it lands
+ * inside a checkout where git would not ignore it.
+ * @param {string} sub — `add` | `move`
+ * @param {string} target — a shell-expanded target (no `~`)
+ * @param {string} execCwd
+ * @returns {string|null}
+ */
+function _judgeResolvedTarget(sub, target, execCwd) {
+  const lexical = resolve(execCwd, target);
   // Judge the PHYSICAL path: a target spelled through a symlinked prefix must
   // not compare as "outside" while landing inside the checkout.
   const abs = _physicalPath(lexical) ?? lexical;
@@ -6414,7 +6460,7 @@ export function nestedWorktreeTargetReason(verb, args, execCwd = process.cwd(), 
   const rel = relative(top, abs);
   if (rel !== "" && _gitIgnores(top, rel)) return null;
   return [
-    `⛔ Refused: this \`git worktree ${t.sub}\` target is INSIDE a git checkout (#1919).`,
+    `⛔ Refused: this \`git worktree ${sub}\` target is INSIDE a git checkout (#1919).`,
     `   Target:   ${abs}`,
     `   Checkout: ${top}`,
     `   A linked worktree nested in a checkout is reported by git as an untracked`,
@@ -8749,7 +8795,12 @@ export function readHubDisorder(cwd, { skipWorktree = true } = {}) {
     const branch = execSync("git branch --show-current", {
       encoding: "utf-8", cwd, timeout: 5000,
     }).trim() || null;
-    const porcelain = execSync("git status --porcelain", {
+    // `core.quotepath=false` so a non-ASCII name is returned RAW instead of
+    // C-quoted. Quoted spellings never match a worktree record, so a nested
+    // worktree named `café-wt` was counted as dirt forever — the #1919 deadlock,
+    // unfixed for exactly the names this repo's language makes ordinary
+    // (#1919 review cycle 3 P2).
+    const porcelain = execSync("git -c core.quotepath=false status --porcelain", {
       encoding: "utf-8", cwd, timeout: 5000,
     }).trim();
     // #1919: a REGISTERED worktree nested inside the repo root is not dirt —

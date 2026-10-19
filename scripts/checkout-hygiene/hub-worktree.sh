@@ -646,7 +646,7 @@ salvage() {
   # reset, so a human terminal `git -C "$MAIN_REPO" reset` is required (rare:
   # staging happened before the disorder). Warn loudly with the path list.
   local remaining remaining_dirt
-  remaining="$(git -C "$MAIN_REPO" status --porcelain=v1 2>/dev/null || true)"
+  remaining="$(git -C "$MAIN_REPO" -c core.quotepath=false status --porcelain=v1 2>/dev/null || true)"
   # #1919 — a registered worktree left in place is NOT "not yet clean": git owns
   # that entry, no hub commit can capture it, and it is deliberately not removed
   # above. Everything else on this list is still reported exactly as before.

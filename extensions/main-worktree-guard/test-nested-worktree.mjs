@@ -279,6 +279,68 @@ try {
   expect("A17: unplaceable frame + an absolute OUTSIDE target is ALLOWED",
     nestedWorktreeTargetViolation(`cd $UNSET_1941 && git worktree add ${outside}/br10 -b br10`, hub), null);
 
+  // A18 (#1919 review cycle 3 P1): porcelain v1 paths are ROOT-relative, so the
+  // exclusion must never try a CWD base. From a hub SUBDIRECTORY the CWD base
+  // mapped a genuine entry into the registered worktree's path and dropped it:
+  // `readHubDisorder` reported CLEAN on a dirty hub.
+  mkdirSync(join(hub, "sub"), { recursive: true });
+  writeFileSync(join(hub, "sub", "s.txt"), "s\n");
+  // NOTE: stage the file explicitly, never `add -A` — the hub holds a nested
+  // worktree here and `add -A` would record it as a gitlink and end the fixture.
+  gg("add sub/s.txt", hub);
+  gg("commit -qm sub", hub);
+  gg("worktree add -q sub/x -b subx-br", hub);
+  mkdirSync(join(hub, "x"), { recursive: true });
+  writeFileSync(join(hub, "x", "GENUINE-WIP.txt"), "wip\n");
+  const porcelain18 = out("git status --porcelain", hub);
+  expectTrue("A18: fixture has BOTH the worktree and genuine dirt at root level",
+    porcelain18.includes("?? sub/x/") && porcelain18.includes("?? x/"), JSON.stringify(porcelain18));
+  expect("A18: from the hub ROOT → DIRTY (genuine dirt counted)", readHubDisorder(hub).disorder, "dirty");
+  expect("A18: from the hub SUBDIRECTORY → DIRTY too (root-relative porcelain)",
+    readHubDisorder(join(hub, "sub")).disorder, "dirty");
+  expect("A18: …and the filter drops ONLY the worktree entry, from either frame",
+    porcelainWithoutRegisteredWorktrees(porcelain18, join(hub, "sub")).split("\n").filter((l) => l.length > 0).join("|"),
+    "?? x/");
+  rmSync(join(hub, "x"), { recursive: true, force: true });
+  gg("worktree remove --force sub/x", hub);
+  gg("branch -D subx-br", hub);
+
+  // A19 (#1919 review cycle 3 P1): a QUOTED `~` target is not shell-expanded, so
+  // git creates a literal `<cwd>/~/wt` INSIDE the checkout. Treating every tilde
+  // target as unjudged let that through; the unquoted spelling lands in $HOME and
+  // must stay allowed.
+  expectTrue("A19: `git worktree add '~/wt'` (literal tilde dir) is REFUSED",
+    typeof nestedWorktreeTargetViolation("git worktree add '~/wt' -b t1", hub) === "string",
+    String(nestedWorktreeTargetViolation("git worktree add '~/wt' -b t1", hub)));
+  // The UNQUOTED spelling is the same token after quote-stripping, so it is
+  // refused too (declare the accepted false block: the two readings cannot be
+  // told apart). `$HOME/wt` — the spelling a lane can actually rely on — is
+  // expanded and judged for what it is, so the outside-home case stays open.
+  expectTrue("A19: the same token unquoted is refused as well (readings indistinguishable)",
+    typeof nestedWorktreeTargetViolation("git worktree add ~/wt -b t2", hub) === "string",
+    String(nestedWorktreeTargetViolation("git worktree add ~/wt -b t2", hub)));
+  expect("A19: …while `$HOME/wt` is expanded and ALLOWED when it is outside",
+    nestedWorktreeTargetViolation('git worktree add "$HOME/wt" -b t3', hub), null);
+
+  // A20 (#1919 review cycle 3 P1): git accepts any UNAMBIGUOUS long-option
+  // prefix. `--reaso /tmp/decoy nested` made the DECOY the judged target (the
+  // real one, `nested`, was created inside the hub).
+  expectTrue("A20: `--reaso <decoy> nested` is REFUSED on the REAL target",
+    typeof nestedWorktreeTargetViolation("git worktree add --lock --reaso /tmp/decoy nested -b t3", hub) === "string",
+    String(nestedWorktreeTargetViolation("git worktree add --lock --reaso /tmp/decoy nested -b t3", hub)));
+  expect("A20: …and the exact spelling `--reason <x> <outside>` is ALLOWED",
+    nestedWorktreeTargetViolation(`git worktree add --lock --reason x ${outside}/t4 -b t4`, hub), null);
+
+  // A21 (#1919 review cycle 3 P2): a non-ASCII worktree name is C-QUOTED by git
+  // unless `core.quotepath=false`, and a quoted spelling never matches a record —
+  // so the hub read DIRTY forever (the #1919 deadlock for those names).
+  gg("worktree add -q café-wt -b cafe-br", hub);
+  expectTrue("A21: git reports the non-ASCII worktree (quoted or not)",
+    out("git -c core.quotepath=false status --porcelain", hub).includes("caf"), out("git status --porcelain", hub));
+  expect("A21: …and it is NOT hub dirt", readHubDisorder(hub).disorder, null);
+  gg("worktree remove --force café-wt", hub);
+  gg("branch -D cafe-br", hub);
+
   // ───────────────────────────────────────────────────────────────────────
   // Part B — real index.ts load + handler-driven gate
   // ───────────────────────────────────────────────────────────────────────

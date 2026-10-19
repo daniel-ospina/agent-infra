@@ -952,6 +952,17 @@ rm -rf "$HN/prunable-wt"
 out="$(bash "$CHECK" --repo "$HN" 2>&1)" && rc=0 || rc=$?
 assert_eq "$rc" 0 "…and it PASSes again once the prunable record is pruned"
 
+# SAFETY HALF 5 (#1919 review cycle 3 P2): git C-QUOTES a non-ASCII path unless
+# `core.quotepath=false`, and a quoted spelling never matches a worktree record —
+# so a nested worktree named `café-wt` counted as dirt forever: the #1919
+# deadlock, unfixed for exactly the names this repo's language makes ordinary.
+git -C "$HN" worktree add -q "$HN/café-wt" -b cafe-br HEAD
+out="$(bash "$CHECK" --repo "$HN" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 0 "a NON-ASCII worktree name is not dirt (quotepath decoded)"
+assert_contains "$out" "PASS  $HN" "…printing PASS for it"
+git -C "$HN" worktree remove --force "$HN/café-wt" 2>/dev/null || true
+git -C "$HN" branch -q -D cafe-br 2>/dev/null || true
+
 echo ""
 echo "hub-state-check.test.sh: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
