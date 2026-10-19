@@ -20,7 +20,13 @@
 #                    script (a copy run from a cell-shaped temp root with no /Users), the
 #                    consumer carries no /Users/ path in code, and an ABSENT or FAILING
 #                    producer fails the section (banner in the report, reason on stderr) and
-#                    the RUN (non-zero) instead of leaving a placeholder that reads as produced
+#                    the RUN (non-zero) instead of leaving a placeholder that reads as produced.
+#                    The three failure shapes are each fixtured: ABSENT, NON-ZERO, and the
+#                    PASS-shaped one — rc=0 with NO output (review round 2, P2: the string
+#                    'produced NO output' appeared in no assertion, so deleting that branch
+#                    reddened nothing), plus the ONE-time up-front announcement of an absent
+#                    producer (review round 2, P3: the per-session reason is a different
+#                    string, so the up-front block could be deleted with everything green).
 #   parser contract  the vendored producer's own output: friction taxonomy counts, batch
 #                    classification, skills, improvements, and survival of a transcript with
 #                    no #NNN (the vendored-as-received source died there, rc=1, truncated)
@@ -291,6 +297,10 @@ CELL_REPORT="$(cat "$CELL/out"/*.md 2>/dev/null || true)"
 assert_eq "$cell_rc" "0" "consumer exits 0 on a cell-style root (rc=0 with a missing section is the OLD bug)"
 assert_contains "$CELL_REPORT" "=== Session Postmortem ===" "producer RAN from its sibling path — the report has real patterns, not the placeholder"
 assert_contains "$CELL_REPORT" "gate/block/fail: 1 occurrence(s)" "the produced section carries the transcript's actual friction counts"
+# The up-front 'PRODUCER MISSING' announcement is for the ABSENT case only. A producer that
+# resolves is never announced as missing, so this arm pins the other side of that line.
+assert_eq "$(grep -c 'PRODUCER MISSING' "$T/cell.err" || true)" "0" \
+  "a producer that RESOLVES as a sibling is never announced as missing (no up-front line)"
 if grep -qF "DID NOT RUN" <<<"$CELL_REPORT"; then
   bad "sibling-resolved producer still reported the section as not run"
 else
@@ -332,6 +342,13 @@ fi
 assert_contains "$BARE_REPORT" "TRANSCRIPT PATTERNS SECTION DID NOT RUN" "absent producer is a banner INSIDE the report, not an italic aside"
 assert_contains "$(cat "$T/bare.err")" "producer not found" "absent producer is named on stderr with its resolved path"
 assert_contains "$(cat "$T/bare.err")" "$BARE/scripts/lib/transcript-patterns.sh" "the stderr reason names the SIBLING path it derived (not a Mac literal)"
+# The up-front line is emitted ONCE, BEFORE the loop (an operator running this by hand sees it
+# immediately). Asserted by COUNT, and against a string the per-session reason does NOT use
+# ('producer not found', asserted above): without this the whole up-front block could be deleted
+# while every assertion stayed green, and the 'announced once up front' claim would stop being
+# true with nothing to show it.
+assert_eq "$(grep -c 'TRANSCRIPT-PATTERNS PRODUCER MISSING' "$T/bare.err" || true)" "1" \
+  "an absent producer is announced ONCE up front, not once per session"
 
 # A producer that RUNS but fails must not be reported as content.
 BROKEN="$T/broken"
@@ -350,6 +367,30 @@ else
 fi
 assert_contains "$BROKEN_REPORT" "TRANSCRIPT PATTERNS SECTION DID NOT RUN" "non-zero producer is a banner inside the report"
 assert_contains "$BROKEN_REPORT" "producer exited 7" "the report names the producer's exit code"
+
+# A producer that EXITS 0 WITH NO OUTPUT is the PASS-shaped failure (#1921): the run exits 0 and
+# the section reads as produced, but there is nothing to read. Nothing to report must never mean
+# 'no patterns found' — it fails the section and the run, exactly like an absent or failing one.
+# Coverage gap this closes (review round 2, P2): 'produced NO output' appeared in NO assertion, so
+# deleting the branch at session-postmortem.sh:394-399 (and falling through to an empty section)
+# left the whole suite green and `bash-suites` clean.
+SILENT="$T/silent"
+mkdir -p "$SILENT/scripts/lib" "$SILENT/out"
+cp "$SPM" "$SILENT/scripts/"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$SILENT/scripts/lib/transcript-patterns.sh"
+silent_rc=0
+env -u POSTMORTEM_SH HOME="$T/home" PI_SESSIONS_DIR="$CELL/sessions" \
+  bash "$SILENT/scripts/session-postmortem.sh" "$CELL_SESSION" --out "$SILENT/out" \
+  >"$T/silent.out" 2>"$T/silent.err" || silent_rc=$?
+SILENT_REPORT="$(cat "$SILENT/out"/*.md 2>/dev/null || true)"
+if [ "$silent_rc" -ne 0 ]; then
+  ok "a producer that exits 0 with NO output fails the run (rc=$silent_rc)"
+else
+  bad "rc=0-with-no-output exited 0 — the PASS-shaped failure read as a section that produced"
+fi
+assert_contains "$SILENT_REPORT" "TRANSCRIPT PATTERNS SECTION DID NOT RUN" "a silent producer is a banner INSIDE the report"
+assert_contains "$SILENT_REPORT" "produced NO output" "the report names the SILENCE as the reason (not 'no patterns found')"
+assert_contains "$(cat "$T/silent.err")" "produced NO output" "the silence is on stderr too, where the cron log reads it"
 
 # The producer's OWN contract. Plain transcript, NO `#123` and no `/skill:` — the shape that
 # killed the vendored-as-received source at "## What Shipped" (grep no-match + pipefail).
