@@ -447,12 +447,25 @@ claim_former_hosts() { # -> space-separated host names this box has used, EXCLUD
 # claims each cycle is a second writer racing the chain's release (the generation guard in
 # claim_issue_release_record exists precisely for that overlap).
 claim_orphan_reason() {
-  local owner="${1:-}" ref="${2:-}" host pid roster have_pid=0
+  local owner="${1:-}" ref="${2:-}" host pid roster have_pid=0 me real
   [ -n "$owner" ] || return 1
   [ "$owner" = "?" ] && return 1                    # a snapshot reader's placeholder, not an identity
   host="${owner%%:*}"; pid="${owner##*:}"
   [ -n "$host" ] || return 1                        # `:123` names no host at all
   case "$owner" in *:*) have_pid=1 ;; esac
+  # ⛔ THIS BOX HAS TWO ANSWERABLE NAMES, AND BOTH ARE LOCAL (P1, cycle-13 review): the seam or the
+  # real `hostname -s`. Derived here, once, because `claim_host` returns the SEAM when
+  # `CLAIM_OWNER_HOST` is set while `claim_former_hosts` deliberately EXCLUDES the probed real name —
+  # so under a seam, a claim stamped with this machine's own hostname matched neither "the host" nor
+  # "a former name", skipped the pid probe, and reached the roster arm, which called it ORPHANED.
+  # Measured on a live pid: rc=0 "owner host <realHost> is not in CLAIM_KNOWN_HOSTS" (same for an
+  # `issue-` ref) against rc=1 held-by-live with the seam unset — the steal direction on a live LOCAL
+  # pid. An unanswerable probe leaves the name EMPTY, which never matches, and the fleet-wide `box`
+  # sentinel is dropped for the same reason it is dropped everywhere.
+  me="$(claim_host)"
+  real="$(hostname -s 2>/dev/null)" || real=''
+  case "$me" in ''|box) me='' ;; esac
+  case "$real" in ''|box) real='' ;; esac
   # ⛔ A PID IS NEEDED FOR THE PID RULE AND FOR NOTHING ELSE. The HOST rules below are answerable from
   # the host name alone, and a lease is DATA — a sibling writer, an older claims.sh, or a hand-pushed
   # ref can legitimately carry a bare host. Requiring `:<pid>` before consulting the host rules made
@@ -493,12 +506,26 @@ claim_orphan_reason() {
       # reaping the others' merge/fix claims: the steal direction, arriving through a probe that cannot
       # answer. `claim_former_hosts` already refuses the sentinel; this gate must too. A sentinel owner
       # falls through to the HOST rules, which abstain when they cannot judge.
-      local is_local=0 me
-      if [ "$host" != "box" ] && [ "$host" = "$(claim_host)" ]; then
-        is_local=1
-      else
-        case " $(claim_former_hosts) " in *" $host "*) is_local=1 ;; esac
-        [ "$host" != "box" ] || is_local=0
+      # ⛔ THE MACHINE'S OWN PROBED NAME IS LOCAL TOO, WITH OR WITHOUT A SEAM (P1, cycle-13 review).
+      # `claim_host` returns the SEAM when `CLAIM_OWNER_HOST` is set, and `claim_former_hosts`
+      # deliberately EXCLUDES the probed real name — so under a seam a claim stamped with this box's
+      # REAL hostname was neither "the host" nor "a former name", skipped the pid probe entirely, and
+      # reached the roster arm, which called it ORPHANED. Measured on a live pid: `claim_orphan_reason
+      # "<realHost>:<live pid>" <PR ref>` with the seam set returned rc=0 "owner host <realHost> is not
+      # in CLAIM_KNOWN_HOSTS" (and the same for an `issue-` ref), while the seam-unset control returned
+      # rc=1 held-by-live — the steal direction on a live LOCAL pid. The seam is the entry condition and
+      # no shipped artefact sets it, but an ambient inherited export is exactly the path this file's
+      # own seam warning names. So: local = the seam identity, OR the probed real hostname, OR a former
+      # name — each only when it is a real answer (never empty, never the fleet-wide `box` sentinel).
+      local is_local=0
+      if [ "$host" != "box" ]; then
+        if [ -n "$me" ] && [ "$host" = "$me" ]; then
+          is_local=1
+        elif [ -n "$real" ] && [ "$host" = "$real" ]; then
+          is_local=1
+        else
+          case " $(claim_former_hosts) " in *" $host "*) is_local=1 ;; esac
+        fi
       fi
       if [ "$have_pid" = 1 ] && [ "$is_local" = 1 ]; then
         case "$pid" in ''|*[!0-9]*) return 1 ;; esac
@@ -532,12 +559,19 @@ claim_orphan_reason() {
     # fleet-wide over-reap was bypassed by the very probe failure it is supposed to catch. An identity
     # that cannot be answered is not an identity: abstain (under-reap). `box` is excluded for the same
     # reason it is excluded everywhere — it is fleet-wide, not this box.
-    me="$(claim_host)"
     case "$me" in ''|box) return 1 ;; esac
     case "$roster" in
       *" $me "*) ;;
-      *) return 1 ;;
+      *) case "$real" in ''|box) return 1 ;; esac
+         case "$roster" in *" $real "*) ;; *) return 1 ;; esac ;;
     esac
+    # ⛔ A ROSTER IS NOT EVIDENCE ABOUT THIS BOX. The probe-derived REAL name is excluded here because
+    # the staleness guard above is satisfied by the SEAM (which is the identity `claim_host` returns
+    # under a seam), so a roster naming the seam and omitting the real name would otherwise declare the
+    # box's OWN name a stranger — measured: rc=0 for an ISSUE claim stamped `<realHost>:<pid>`.
+    # (`$host = $me` needs no guard here: the roster above already proved it CONTAINS `$me`, so the
+    # `*" $host "*` match below cannot fire for it — an unreachable guard is not worth the line.)
+    case "$real" in ''|box) ;; *) case "$host" in "$real") return 1 ;; esac ;; esac
     case "$roster" in
       *" $host "*) return 1 ;;
       *) printf 'owner host %s is not in CLAIM_KNOWN_HOSTS' "$host"; return 0 ;;

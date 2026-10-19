@@ -90,21 +90,28 @@
 #      below the review window it must outlive — a mid-review expiry, the duplicate this registry
 #      exists to prevent — and leaves nothing to diagnose.
 # ⛔ LABELLING HONESTY — MEASURED, not asserted. `CLAIMS_SH=<pre-change claims.sh> bash
-# claim-orphan.test.sh` (2026-10-18, commit 228233d's claims.sh) reports 53 passed, 52 FAILED. Every
-# [RED→GREEN] line is in that failing set. The failing lines that carry NO such label are these five,
-# all of them dependent on machinery the pre-fix tree does not have:
-#   • `O7 the PR keying declares a documented ceiling` — unlabelled by design (a capability assertion)
-#   • `[PINNED]` O15 `it reads held-by-live` — the token itself is new (pre-fix reason: `held by …`)
-#   • `[PINNED]` O12 `… a roster that names the RUNNING host and omits the holder DOES reap it` — the
-#     roster arm does not exist, so the call exits 127
-#   • `[PINNED]` O23 `with an ANSWERABLE identity the roster arm still reaps an unlisted peer` — same
-#   • `(setup)` O22 `the failing probe really does fall back to the sentinel` — needs `claim_host`
-# So PINNED means "this guards a NEW fail-open, it is not a regression of old behaviour" — NOT "it
-# passes pre-fix". Where the pinned behaviour did not exist at all, it fails pre-fix BY CONSTRUCTION,
-# and this paragraph names those lines rather than pretending the label implies a green RED direction.
-# Five assertions were RE-LABELLED after measurement showed they went the other way (O4's token check,
-# three O15 lines, O17's duplicate check, O18's once-per-process check). Re-measure rather than trusting
-# this paragraph — it is a snapshot of one measurement, not an invariant, and the file grows.
+# claim-orphan.test.sh` (2026-10-19, commit 228233d's claims.sh) reports 53 passed, 54 FAILED.
+# • EVERY [RED→GREEN] line (49 of them) is among those 54 failures — measured, not assumed: zero
+#   [RED→GREEN] assertion passes on the pre-change tree.
+# • The failing lines that carry NO such label are these five, each dependent on machinery the pre-fix
+#   tree does not have:
+#     • `O7 the PR keying declares a documented ceiling` — unlabelled by design (a capability assertion)
+#     • `[PINNED]` O15 `it reads held-by-live` — the token itself is new (pre-fix reason: `held by …`)
+#     • `[PINNED]` O12 `… a roster that names the RUNNING host and omits the holder DOES reap it`
+#     • `[PINNED]` O23 `with an ANSWERABLE identity the roster arm still reaps an unlisted peer`
+#     • `(setup)` O22 `the failing probe really does fall back to the sentinel` — needs `claim_host`
+# ⛔ AND PINNED DOES **NOT** MEAN "passes pre-fix" — measured, 38 lines carrying it PASS there and 3 FAIL.
+# The 38 pass only because the machinery is ABSENT pre-fix (nothing reaped by a host rule at all, and
+# `claim_orphan_reason` does not exist), so every "does NOT delete" / "abstains" assertion holds
+# vacuously — which is why they were RE-LABELLED from [RED→GREEN] after re-measurement: they are not
+# red-to-green, they are the guards that keep the NEW arm from creating a fail-open. The 3 that fail
+# (the held-by-live token, the roster arm, its answerable control) are controls asserting behaviour the
+# pre-fix tree lacks. Read PINNED as: **this guards a new fail-open, it is not a regression of old
+# behaviour**, and read [RED→GREEN] as: **measured red before the change, green after**. 38 assertions
+# were RE-LABELLED [RED→GREEN]→[PINNED] in the cycle that measured them against the pre-change tree;
+# earlier cycles re-labelled others for the same reason (O4's token check, three O15 lines, O17's
+# duplicate check, O18's once-per-process check). Re-measure rather than trusting this paragraph — it
+# is a snapshot of one measurement, not an invariant, and the file grows.
 #
 # HERMETIC: every check builds its own throwaway bare origin (`git init --bare`), so no network, no
 # real origin and nothing outside $T is written — the claim refs die with the temp dir.
@@ -326,9 +333,9 @@ has_ref "$ORIG15" refs/claims/issue-9209450; ck "O15 (setup) an ISSUE claim from
 # a false green on the one branch that deletes claims. Measured: acquirer-pid == prune-subshell-pid.
 PRUNE15="$(as_box "$ORIG15" ctrlbox 'claim_prune' 2>&1)"
 has_ref "$ORIG15" refs/claims/issue-9209450; P15A=$?
-ck "O15 [RED→GREEN] claim_prune does NOT delete a dead-pid ISSUE claim (ref still on the origin)" $P15A
+ck "O15 [PINNED] claim_prune does NOT delete a dead-pid ISSUE claim (ref still on the origin)" $P15A
 printf '%s' "$PRUNE15" | grep -q 'issue-9209450' && PR15=1 || PR15=0
-ck "O15 [RED→GREEN] the prune does not even NAME it as reaped" $PR15
+ck "O15 [PINNED] the prune does not even NAME it as reaped" $PR15
 # ... and the acquire agrees: the claim reads LIVE, so a peer still sees the barrier.
 RESTART="$(as_box "$ORIG15" ctrlbox 'claim_issue_acquire "" 9209450 >/dev/null 2>&1
   printf "RC=%s\nRESULT=%s\n" "$?" "${CLAIM_RESULT:-}"')"
@@ -419,7 +426,7 @@ PVAL="$(as_box "$ORIG7" tbox 'printf "%s\n" "$CLAIM_TTL"')"
 as_box "$ORIG7" tbox 'claim_acquire "" 9209431 0123456789abcdef0123 >/dev/null 2>&1' >/dev/null
 U7="$(lease_until "$ORIG7" refs/claims/9209431-0123456789ab)"; NOW7="$(now_s)"
 [ -n "$U7" ] && [ "$(( U7 - NOW7 ))" -le 1800 ] && [ "$(( U7 - NOW7 ))" -gt 1700 ]
-ck "O7 [RED→GREEN] a PR claim with no explicit ttl is stamped <= CLAIM_TTL=1800s (term=$(( ${U7:-0} - NOW7 ))s)" $?
+ck "O7 [PINNED] a PR claim with no explicit ttl is stamped <= CLAIM_TTL=1800s (term=$(( ${U7:-0} - NOW7 ))s)" $?
 # (b) the shipped merge lease (3000s) must still be HONOURED — this is the PINNED half, so the
 # ceiling cannot be implemented by clamping everything to the default.
 as_box "$ORIG7" tbox 'claim_acquire "" 9209435 0123456789abcdef0123 3000 >/dev/null 2>&1' >/dev/null
@@ -438,7 +445,7 @@ IVAL="$(as_box "$ORIG7" tbox 'printf "%s\n" "$CLAIM_ISSUE_TTL"')"
 as_box "$ORIG7" tbox 'claim_issue_acquire "" 9209432 >/dev/null 2>&1' >/dev/null
 U8="$(lease_until "$ORIG7" refs/claims/issue-9209432)"; NOW8="$(now_s)"
 [ -n "$U8" ] && [ "$(( U8 - NOW8 ))" -le 10800 ] && [ "$(( U8 - NOW8 ))" -gt 10600 ]
-ck "O7 [RED→GREEN] an ISSUE claim's stamped term is <= CLAIM_ISSUE_TTL=10800s (term=$(( ${U8:-0} - NOW8 ))s)" $?
+ck "O7 [PINNED] an ISSUE claim's stamped term is <= CLAIM_ISSUE_TTL=10800s (term=$(( ${U8:-0} - NOW8 ))s)" $?
 # ⚠️ The incident's 157-minute lease is THIS one: CLAIM_ISSUE_TTL (10800s = 180 min) on an ISSUE
 # claim, by design (its own comment derives 3h from LANE_TIMEOUT + chain-merge + review). It is
 # asserted here so the number is BOUNDED and visible, not so it is silently lowered.
@@ -486,6 +493,28 @@ as_box "$ORIG10" peerTen 'claim_issue_acquire "" 9209437 >/dev/null 2>&1' CLAIM_
 NOFALSE="$(as_box "$ORIG10" boxNewName 'claim_issue_acquire "" 9209437 >/dev/null 2>&1
   printf "RC=%s\n" "$?"' CLAIM_STATE_DIR="$CS10")"
 [ "$(field "$NOFALSE" RC)" = "1" ]; ck "O10 [PINNED] a PEER host that was never this box's name is NOT reclaimed" $?
+# ⛔ (e) THE DOCUMENTED ISSUE-KEY RESIDUAL, PINNED (P2, cycle-13 review: the README cited O10 for a
+# `<former name>:<live pid>` ISSUE claim, and O10's pid was DEAD by the time it reclaimed — so the
+# attestation overstated what was measured). Here the pid is the TEST SHELL's own, alive and local:
+#   • an ISSUE ref  → ORPHANED, because the pid rule is PR-keyed and the former-name HOST rule answers
+#   • a PR ref       → held-by-live, because the same name makes the pid probeable
+# That difference IS the residual: neither remedy preserves an in-flight ISSUE claim.
+LIVEPID10="$(
+  CLAIM_REPO="$ORIG10"; CLAIM_STATE_DIR="$CS10"; export CLAIM_REPO CLAIM_STATE_DIR
+  . "$CLAIMS_SH" || exit 1
+  r="$(claim_orphan_reason "boxOldName:$$" "refs/claims/issue-9209438")"
+  printf "%s" "$r" )"
+case "$LIVEPID10" in *FORMER*) LP10_OK=0 ;; *) LP10_OK=1 ;; esac
+ck "O10 [RED→GREEN] an ISSUE claim under a FORMER name with a LIVE pid is still orphaned ('$LIVEPID10')" $LP10_OK
+LIVEPID10P="$(
+  CLAIM_REPO="$ORIG10"; CLAIM_STATE_DIR="$CS10"; export CLAIM_REPO CLAIM_STATE_DIR
+  . "$CLAIMS_SH" || exit 1
+  r="$(claim_orphan_reason "boxOldName:$$" "refs/claims/9209439-0123456789ab")"
+  # ⛔ TWO LINES: `field` matches at LINE START, so a single-line "RC=1 R=[]" yields "1 R=[]" and the
+  # comparison against "1" fails for a reason that has nothing to do with the rule.
+  printf "RC=%s\nR=[%s]\n" "$?" "$r" )"
+[ "$(field "$LIVEPID10P" RC)" = "1" ]; LP10P_RC=$?
+ck "O10 [RED→GREEN] ... while the SAME name on a PR ref reads held-by-live ($(field "$LIVEPID10P" R))" $LP10P_RC
 
 # ══ O11: an INSTRUMENT FAILURE is not a death certificate ══
 # `ps -p` has three outcomes (found / absent / could not tell). Folding the third into "absent" turns
@@ -523,7 +552,7 @@ STALE="$(as_box "$ORIG12" renamedBox 'claim_issue_acquire "" 9209425 >/dev/null 
 # a `$(field …)` COMMAND SUBSTITUTION, which resets `$?` to the substitution's status (0). That made this
 # assertion print ✅ with `rc=0` — a false green that survived the very mutation it exists for.
 O12_RC1=$?
-ck "O12 [RED→GREEN] a roster that does not list the RUNNING host does not authorise a reap (rc=$(field "$STALE" RC))" $O12_RC1
+ck "O12 [PINNED] a roster that does not list the RUNNING host does not authorise a reap (rc=$(field "$STALE" RC))" $O12_RC1
 # ⛔ SURVIVAL MEANS THE HOLDER IS UNCHANGED, not that the ref exists: a RECLAIM leaves the ref in place
 # under a new owner, so `has_ref` passed while the peer's claim had just been taken (measured under the
 # mutation). The owner is the datum.
@@ -650,7 +679,7 @@ O17B="$T/cl17-missing"
 recdrv "$O17B" >/dev/null
 [ ! -e "$O17B" ]
 MKD_RC=$?
-ck "O17 [RED→GREEN] an ABSENT state dir is not created (recording writes nothing rather than conjuring state)" $MKD_RC
+ck "O17 [PINNED] an ABSENT state dir is not created (recording writes nothing rather than conjuring state)" $MKD_RC
 
 # ══ O18: the SEAM announces what it costs ══
 # `CLAIM_OWNER_HOST` is inherited silently by everything a cell starts. Two consequences were invisible:
@@ -716,7 +745,7 @@ case "$(field "$SEAMLEAK" STDERR)" in
   *hostname*|*"running host ()"*) SW5=1 ;;
   *) SW5=0 ;;
 esac
-ck "O18 [RED→GREEN] a blind hostname makes the seam warning ABSTAIN (no probe error leaks, no empty host)" $SW5
+ck "O18 [PINNED] a blind hostname makes the seam warning ABSTAIN (no probe error leaks, no empty host)" $SW5
 
 # ══ O19: the DESTRUCTIVE arms require positive evidence — an absent ref, or an unverifiable host ══
 # Two ways the same steal could arrive that no test pinned (agent-infra#2094 cycle-4 review):
@@ -760,7 +789,7 @@ FORMERS="$( cd "$T" || exit 1
   claim_former_hosts )"
 [ -z "${FORMERS// /}" ]
 O19C_RC=$?
-ck "O19 [RED→GREEN] a BLIND hostname probe makes claim_former_hosts ABSTAIN (got '${FORMERS}')" $O19C_RC
+ck "O19 [PINNED] a BLIND hostname probe makes claim_former_hosts ABSTAIN (got '${FORMERS}')" $O19C_RC
 # ... and with the probe working, the SAME file yields exactly the names that are NOT current.
 FORMERS2="$( cd "$T" || exit 1
   unset CLAIM_OWNER_HOST CLAIM_OWNER_ID CLAIM_KNOWN_HOSTS CLAIM_DEAD_HOSTS
@@ -791,7 +820,7 @@ FORMERS4="$( cd "$T" || exit 1
   claim_former_hosts )"
 [ -z "${FORMERS4// /}" ]
 O19F_RC=$?
-ck "O19 [RED→GREEN] a SEAM + a BLIND hostname probe abstains too (got '${FORMERS4}')" $O19F_RC
+ck "O19 [PINNED] a SEAM + a BLIND hostname probe abstains too (got '${FORMERS4}')" $O19F_RC
 # ... including a probe that SUCCEEDS and prints NOTHING (cycle-8 review): `real=""` subtracted nothing,
 # so the machine's own current name came back as FORMER — the same steal direction, one shim away.
 mkdir -p "$T/bin-emptyhost"
@@ -804,7 +833,7 @@ FORMERS5="$( cd "$T" || exit 1
   claim_former_hosts )"
 [ -z "${FORMERS5// /}" ]
 O19G_RC=$?
-ck "O19 [RED→GREEN] a probe that exits 0 with EMPTY output abstains too (got '${FORMERS5}')" $O19G_RC
+ck "O19 [PINNED] a probe that exits 0 with EMPTY output abstains too (got '${FORMERS5}')" $O19G_RC
 
 
 # ══ O20: the PRUNE's unparseable-lease skip is a DELETING branch and was untested ══
@@ -823,9 +852,9 @@ has_ref "$ORIG20" refs/claims/issue-7003 && has_ref "$ORIG20" refs/claims/issue-
 ck "O20 (setup) an UNPARSEABLE lease and an EXPIRED one are both planted" $?
 PRUNE20="$(as_box "$ORIG20" livebox 'claim_prune' CLAIM_DEAD_HOSTS=deadbox 2>&1)"
 has_ref "$ORIG20" refs/claims/issue-7003
-ck "O20 [RED→GREEN] the unparseable-lease claim SURVIVES a prune that names its host DEAD" $?
+ck "O20 [PINNED] the unparseable-lease claim SURVIVES a prune that names its host DEAD" $?
 printf '%s' "$PRUNE20" | grep -q 'issue-7003' && P20=1 || P20=0
-ck "O20 [RED→GREEN] the prune does not even NAME it as reaped" $P20
+ck "O20 [PINNED] the prune does not even NAME it as reaped" $P20
 # Non-vacuity: the SAME host's EXPIRED claim IS reaped by this prune, and so is its ORPHANED one.
 has_ref "$ORIG20" refs/claims/issue-7004 && pr20=1 || pr20=0
 ck "O20 [PINNED] the expired claim from the same dead host IS still reaped (the arm is alive)" $pr20
@@ -850,7 +879,7 @@ HELD21="$(as_box "$ORIG21" newBox21 'claim_acquire "" 9209490 0123456789abcdef01
   printf "RC=%s\nRESULT=%s\n" "$?" "${CLAIM_RESULT:-}"' CLAIM_STATE_DIR="$CS21")"
 R21="$(field "$HELD21" RC)"; R21RES="$(field "$HELD21" RESULT)"
 [ "$R21" = "1" ]; O21A=$?
-ck "O21 [RED→GREEN] the former-name owner with a LIVE pid is NOT reclaimed (rc=$R21) ('$R21RES')" $O21A
+ck "O21 [PINNED] the former-name owner with a LIVE pid is NOT reclaimed (rc=$R21) ('$R21RES')" $O21A
 case "$R21RES" in
   *held-by-live*) ok "O21 [RED→GREEN] it reads held-by-live, so a peer still sees the barrier" ;;
   *) bad "O21 [RED→GREEN] it reads held-by-live (got '$R21RES')" ;;
@@ -862,7 +891,7 @@ case "$OWN21" in
   oldBox21:*) O21B=0 ;;
   *) O21B=1 ;;
 esac
-ck "O21 [RED→GREEN] claim_prune leaves it alone (owner is still '$OWN21')" $O21B
+ck "O21 [PINNED] claim_prune leaves it alone (owner is still '$OWN21')" $O21B
 # ... while the SAME former name with a DEAD pid IS reaped — the pid, not the host name, is the datum.
 as_box "$ORIG21" oldBox21 'c="$(_claim_commit "oldBox21:999999" "'"$FUT21"'")"
   _git push -q origin "$c:refs/claims/9209491-0123456789ab" 2>/dev/null' CLAIM_STATE_DIR="$CS21" >/dev/null
@@ -909,7 +938,7 @@ case "$OWN22" in
   box:999999) S22C=0 ;;
   *) S22C=1 ;;
 esac
-ck "O22 [RED→GREEN] claim_prune leaves it alone (owner is still '$OWN22')" $S22C
+ck "O22 [PINNED] claim_prune leaves it alone (owner is still '$OWN22')" $S22C
 # … and a `box` entry that reached the history file (an OLDER claims.sh recorded it before the recorder
 # refused the sentinel) is still not an identity. ⛔ THE REAL `hostname` MUST BE IN PLAY HERE (cycle-10
 # review): the previous form of this case ran under the blind shim, where `claim_former_hosts` abstains
@@ -935,7 +964,7 @@ CS22B="$T/cl22-rec"; mkdir -p "$CS22B"
   claim_owner >/dev/null ) 2>/dev/null
 [ ! -s "$CS22B/claim-hosts" ] || ! grep -qx 'box' "$CS22B/claim-hosts"
 S22E=$?
-ck "O22 [RED→GREEN] the RECORDER refuses to write the sentinel into claim-hosts" $S22E
+ck "O22 [PINNED] the RECORDER refuses to write the sentinel into claim-hosts" $S22E
 
 echo
 echo "── O23: an UNANSWERABLE identity abstains BEFORE the roster comparison (steal direction) ─"
@@ -947,10 +976,18 @@ echo "── O23: an UNANSWERABLE identity abstains BEFORE the roster comparison
 # `claim_prune` deleted the ref and `claim_acquire` reclaimed a live peer's claim.
 mkdir -p "$T/bin-emptyh23"
 printf '#!/bin/sh\nexit 0\n' > "$T/bin-emptyh23/hostname"; chmod +x "$T/bin-emptyh23/hostname"
-EMPTYH23="$(PATH="$T/bin-emptyh23:$PATH" claim_host)"
-[ -z "$EMPTYH23" ]
+# ⛔ SOURCED, AND STDERR ASSERTED EMPTY (P1, cycle-13 review): a bare `claim_host` in a shell that
+# never sourced claims.sh printed `claim_host: command not found` and the `-z` test passed for THAT
+# reason — a setup assertion true by accident, with the error visible in the suite's own output.
+EMPTYH23="$(
+  CLAIM_REPO="$T/repo"; CLAIM_STATE_DIR="$T/cl23"; export CLAIM_REPO CLAIM_STATE_DIR
+  . "$CLAIMS_SH" || exit 1
+  PATH="$T/bin-emptyh23:$PATH"; export PATH
+  printf 'OUT=[%s]' "$(claim_host)" 2>/tmp/o23.err
+  printf ' ERRSIZE=%s' "$(wc -c < /tmp/o23.err | tr -d ' ')" )"
+[ "$EMPTYH23" = "OUT=[] ERRSIZE=0" ]
 O23PRE=$?
-ck "O23 (setup) the shim really makes claim_host print the EMPTY string" $O23PRE
+ck "O23 (setup) the shim really makes claim_host print the EMPTY string silently (got '$EMPTYH23')" $O23PRE
 n=0
 for R in 'peerA,peerB' 'peerA,peerB,' 'peerA  peerB' ',peerA' 'peerA,,peerB'; do
   n=$((n+1))
@@ -977,6 +1014,41 @@ OUT23P="$(
   printf "RC=%s\n" "$?" )"
 [ "$(field "$OUT23P" RC)" = "0" ]; O23P=$?
 ck "O23 [PINNED] with an ANSWERABLE identity the roster arm still reaps an unlisted peer (rc=$(field "$OUT23P" RC))" $O23P
+
+echo
+echo "── O24: with a SEAM set, this machine's own hostname is still LOCAL (steal direction) ─────────"
+# ⛔ `claim_host` RETURNS THE SEAM, AND `claim_former_hosts` EXCLUDES THE PROBED REAL NAME (P1, cycle-13
+# review) — so under a seam a claim stamped with THIS machine's real hostname matched neither "the host"
+# nor "a former name", skipped the pid probe, and reached the roster arm, which called it ORPHANED.
+# Measured on a live pid: rc=0 "owner host <realHost> is not in CLAIM_KNOWN_HOSTS" (and the same for an
+# `issue-` ref) against rc=1 held-by-live with the seam unset. `claim_prune` deletes on rc=0 and
+# `claim_acquire` reclaims, so that is the steal direction on a claim whose holder this box can SEE.
+REAL24="$(hostname -s)"
+o24() { # o24 <owner> <ref> <roster>
+  CLAIM_REPO="$T/repo"; CLAIM_STATE_DIR="$T/cl24"; CLAIM_OWNER_HOST=seam24
+  CLAIM_KNOWN_HOSTS="$3"; export CLAIM_REPO CLAIM_STATE_DIR CLAIM_OWNER_HOST CLAIM_KNOWN_HOSTS
+  mkdir -p "$CLAIM_STATE_DIR"
+  . "$CLAIMS_SH" || exit 1
+  r="$(claim_orphan_reason "$1" "$2")"
+  printf "RC=%s\nR=[%s]\n" "$?" "$r"
+}
+O24A="$(o24 "$REAL24:$$" 'refs/claims/9209700-0123456789ab' 'seam24 peer1')"
+[ "$(field "$O24A" RC)" = "1" ]; O24A_RC=$?
+ck "O24 [RED→GREEN] a LIVE local pid under the REAL hostname is held even with a seam set (rc=$(field "$O24A" RC))" $O24A_RC
+O24B="$(o24 "$REAL24:$$" 'refs/claims/issue-9209701' 'seam24 peer1')"
+[ "$(field "$O24B" RC)" = "1" ]; O24B_RC=$?
+ck "O24 [RED→GREEN] ... and an ISSUE key under the REAL hostname is not called a stranger (rc=$(field "$O24B" RC))" $O24B_RC
+# CONTROLS — the fix must not stop the arm from working. (a) the SAME real hostname with a pid that is
+# DEAD is still orphaned: the name is local, so the pid is probeable and its absence is evidence.
+DEAD24=999999
+while ps -p "$DEAD24" >/dev/null 2>&1; do DEAD24=$((DEAD24+1)); done
+O24C="$(o24 "$REAL24:$DEAD24" 'refs/claims/9209702-0123456789ab' 'seam24 peer1')"
+[ "$(field "$O24C" RC)" = "0" ]; O24C_RC=$?
+ck "O24 [PINNED] a DEAD pid under the same local name IS still orphaned (rc=$(field "$O24C" RC))" $O24C_RC
+# (b) a PEER host that the roster omits is still reaped — the abstention is about THIS box only.
+O24D="$(o24 "peer9:4242" 'refs/claims/9209703-0123456789ab' 'seam24 peer1')"
+[ "$(field "$O24D" RC)" = "0" ]; O24D_RC=$?
+ck "O24 [PINNED] a peer host the roster OMITS is still reaped (rc=$(field "$O24D" RC))" $O24D_RC
 
 echo
 echo "─────────────────────────────────────────────────────────────"

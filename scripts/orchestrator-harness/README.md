@@ -1454,7 +1454,8 @@ for the ISSUE claims of a lane that is still in flight: apply it only when no la
 described, which sent the operator straight into it). For an **ISSUE** key the local-pid arm is
 skipped entirely — an issue claim is minted by the controller, not by the lane — so the former-name
 **host rule** is reached and fires, and a live lane's barrier is freed exactly as the deny list frees
-it (pinned by O10, which reclaims an ISSUE claim stamped `<former name>:<live pid>`). The difference is
+it (pinned by O10(e), which measures an ISSUE claim stamped `<former name>:<live pid>` → ORPHANED and
+the same owner on a PR ref → held-by-live, in one pair; O10(b) pins the end-to-end reclaim). The difference is
 strictly that a **PR** claim stamped `<oldName>:<live pid>` returns `held-by-live` under the pid remedy
 and is reaped under the deny list. **Neither remedy preserves an in-flight ISSUE claim**, so the only
 mitigation for those is the condition both share: do not rename — or run the one-time cleanup — while

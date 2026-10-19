@@ -152,8 +152,7 @@ _owned_by_this_run() { # -> 0 if the lease on $ISSUE_REF names THIS process
     # `<claim_host>:$$` (`printf '%s:%s' "$host" "$$"`), where `claim_host` is `CLAIM_OWNER_HOST` when
     # that seam is set and `hostname -s` otherwise. A real peer lease is therefore never these exact
     # tokens. If that format ever loses the pid, this whitelist starts deleting other boxes' claims —
-    # pin the format, not just this list. (The wording here used to quote a made-up
-    # `"${CLAIM_OWNER_HOST}: $$"` form from a mechanical rename; corrected 2026-10-18.)
+    # pin the format, not just this list.
     expiredbox|foreignbox|twin|probe|proberef|boxA|boxB) return 0 ;;
   esac
   case "${who##*:}" in ''|*[!0-9]*) return 1 ;; esac
