@@ -448,9 +448,11 @@ check_operational_layer() {
   # while every lane on it logged `#984 argv-level gh shim not found — only the string scanner is
   # active`: two definitions of ready, and only one of them measured the merge gate. `--verify` is
   # the AUTHORITY (it fails BY NAME when the shim is absent, non-executable, or missing its evidence
-  # verifier), so reaching this line already implies it; saying which path it is makes the datum an
-  # operator can read, instead of one they have to infer from a warning in a lane's log.
-  ok "argv-level gh shim present ($CELL_HOME/.pi/agent/scripts/gh-shim/gh) — merge gate NOT degraded (#984)"
+  # verifier), so reaching this line already implies the layer carries one. ⛔ NO PATH HERE: the
+  # resolved shim may legitimately live elsewhere (AGENT_GH_SHIM_DIR is a candidate the extension
+  # tries first), and a literal path on this line would be a second copy of the layout that nothing
+  # derives — a datum an operator would read as measured when it is only typed.
+  ok "merge gate NOT degraded — the argv-level gh shim is installed and verified (#984)"
   # A cell is Linux. Say which one, because the layer's own selection is surface-aware (no
   # cmux desktop app, no launchd) and a reviewer reading a cell log should see the surface.
   if [ -r /etc/os-release ]; then

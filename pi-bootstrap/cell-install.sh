@@ -774,27 +774,45 @@ guard_spawn_gate() {
 # ⛔ RESOLVED THE WAY THE EXTENSION RESOLVES IT, not written as `$DEST/scripts/gh-shim`: the
 # WIRING is the claim. If the installer ever puts extensions somewhere else, this must fail LOUDLY
 # instead of certifying a shim the extension will never look at.
-# ⛔ `AGENT_GH_SHIM_DIR` IS HONOURED, because the extension honours it (it wins over the default
-# there); ignoring it here would false-block an operator who relocated the shim deliberately — and
-# the natural remedy for a false block is to weaken the gate.
+# ⛔ `AGENT_GH_SHIM_DIR` IS A **PREFERENCE**, NOT AN OVERRIDE — mirror `resolveGhShimDir()`'s
+# CANDIDATE LIST AND ORDER literally: `[AGENT_GH_SHIM_DIR, EXTENSION_DIR/../../scripts/gh-shim]`,
+# first one that holds an EXECUTABLE `gh` wins. An unusable override FALLS BACK there (that is
+# pinned by extensions/review-enforcer/index.test.ts for a nonexistent AND a non-executable
+# override), so verifying only the named directory would FAIL a cell whose gate the extension is
+# enforcing correctly — and because `--install` ends by verifying, that same false block would make
+# `cloud-cell-bringup.sh --check` die on a healthy box and prescribe `--install` as the remedy for
+# a failure `--install` just produced. Verifying the WINNER is also what keeps the verifier-sibling
+# check honest: the shim that runs is the one whose `../verify-admin-merge-evidence.sh` matters.
 # ⛔ EXECUTE BIT: required on the SHIM (a PATH entry whose `gh` is not executable is SKIPPED by
 # bash, so the real gh runs and nothing enforces — the silent fail-open `isExecutableShim` exists
 # to catch), but NOT on the verifier: the shim invokes it as `bash "$VERIFY"`, so `-x` there
 # would be a false block. It must merely be PRESENT and non-empty — the shim fails CLOSED when it
 # cannot find it, which refuses every admin merge on the cell rather than certifying one.
 guard_gh_shim() {
-  local shim_dir="${AGENT_GH_SHIM_DIR:-}" norm
-  [ -n "$shim_dir" ] || shim_dir="$DEST/extensions/review-enforcer/../../scripts/gh-shim"
+  local override="${AGENT_GH_SHIM_DIR:-}" installed norm cand chosen="" verifier
+  installed="$DEST/extensions/review-enforcer/../../scripts/gh-shim"
   # Display only: print a resolved path when the directory exists, and the unnormalised form when
   # it does not (the missing-shim message has to name the path the extension would have used).
-  if norm="$(CDPATH= cd -- "$shim_dir" 2>/dev/null && pwd)"; then shim_dir="$norm"; fi
-  local shim="$shim_dir/gh" verifier="$shim_dir/../verify-admin-merge-evidence.sh"
-  if [ ! -f "$shim" ]; then
-    fail "the argv-level gh SHIM is MISSING: $shim — the review-enforcer puts exactly that directory on PATH for every bash call and finds no \`gh\` in it, so this cell would run the merge gate DEGRADED (the string scanner only — the documented limit #984 exists to get past) while reporting itself ready. Re-run --install"
-  elif [ ! -x "$shim" ]; then
-    fail "the argv-level gh SHIM is NOT EXECUTABLE: $shim — bash SKIPS a non-executable PATH entry, so the real gh runs and the merge gate is DEGRADED with nothing on any stream (#984). Re-run --install"
-  elif [ ! -s "$verifier" ]; then
-    fail "the admin-merge EVIDENCE VERIFIER is missing or empty: $verifier — scripts/gh-shim/gh resolves it as its own ../verify-admin-merge-evidence.sh and fails CLOSED without it, so every admin merge on this cell would be refused (#984). Re-run --install"
+  if norm="$(CDPATH= cd -- "$installed" 2>/dev/null && pwd)"; then installed="$norm"; fi
+  for cand in ${override:+"$override"} "$installed"; do
+    if [ -f "$cand/gh" ] && [ -x "$cand/gh" ]; then chosen="$cand"; break; fi
+  done
+  if [ -z "$chosen" ]; then
+    # No candidate holds an executable `gh`, so the extension resolves null and the gate is
+    # DEGRADED. Diagnose the directory THIS INSTALLER owns (the override is the operator's own
+    # switch, and a broken one is reported as the extra candidate that did not qualify).
+    local also=""
+    [ -n "$override" ] && also=" (also checked AGENT_GH_SHIM_DIR=$override)"
+    if [ ! -f "$installed/gh" ]; then
+      fail "the argv-level gh SHIM is MISSING: $installed/gh$also — the review-enforcer puts exactly that directory on PATH for every bash call and finds no executable \`gh\` in it, so this cell would run the merge gate DEGRADED (the string scanner only — the documented limit #984 exists to get past) while reporting itself ready. Re-run --install"
+    else
+      fail "the argv-level gh SHIM is NOT EXECUTABLE: $installed/gh$also — bash SKIPS a non-executable PATH entry, so the real gh runs and the merge gate is DEGRADED with nothing on any stream (#984). Re-run --install"
+    fi
+    return 0
+  fi
+  verifier="$chosen/../verify-admin-merge-evidence.sh"
+  if [ ! -s "$verifier" ]; then
+    fail "the admin-merge EVIDENCE VERIFIER is missing or empty: $verifier — scripts/gh-shim/gh resolves it as its own ../verify-admin-merge-evidence.sh and fails CLOSED without it, so every admin merge through the shim this cell resolves ($chosen) would be refused (#984). Re-run --install"
   fi
 }
 

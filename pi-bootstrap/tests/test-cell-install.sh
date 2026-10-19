@@ -554,6 +554,16 @@ run_install >/dev/null 2>&1
 run_verify
 [ $? -eq 0 ] && ok "--verify passes once the shim + verifier pair is complete" \
   || fail "--verify still failed after the shim/verifier pair was restored"
+# (4) THE PREFERENCE RULE — `AGENT_GH_SHIM_DIR` is a PREFERENCE, not an override: `resolveGhShimDir()`
+# tries the named directory and FALLS BACK to `EXTENSION_DIR/../../scripts/gh-shim`, returning the
+# first one that holds an EXECUTABLE `gh`. A verifier that treated the env var as the only candidate
+# would FAIL a cell whose gate the extension is enforcing correctly — and since `--install` ends by
+# verifying, `bringup --check` would then die on a healthy box while prescribing `--install` as the
+# remedy for a failure `--install` had just produced. Pinned because the two behaviours are
+# indistinguishable from the outside when everything is healthy.
+AGENT_GH_SHIM_DIR="/nonexistent/shim" run_verify
+[ $? -eq 0 ] && ok "--verify PASSES when AGENT_GH_SHIM_DIR points nowhere — it falls back to the installed shim, exactly as the extension does" \
+  || fail "--verify failed a healthy cell because AGENT_GH_SHIM_DIR was stale — the extension would have fallen back and enforced"
 
 # `--verify` is pointed at LIVE cells, so the tools/ guard may REFUSE content but must not
 # tidy: an empty tools/ has to survive it (setup.sh removes it during INSTALL, not verify).

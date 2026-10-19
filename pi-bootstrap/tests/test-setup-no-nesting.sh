@@ -1745,7 +1745,12 @@ mg_n="$(printf '%s\n' "$mg_decl" | wc -w | tr -d ' ')"
 if [ -z "${mg_n:-}" ] || [ "$mg_n" -eq 0 ]; then
   fail "run 1: could not read the merge_gate_srcs array from setup.sh — the merge-gate farm assertion cannot be derived"
 else
-  mg_line="$(grep -m1 'scripts merge-gate farm: [0-9][0-9]* copied' "$RUNS_LOG")"
+  # ⛔ `|| true`: this file runs `set -euo pipefail`, so an UNGUARDED `grep -m1` in a command
+  # substitution ABORTS THE SUITE when the line is absent — which is exactly the case the assertion
+  # exists for: the `*)` branch never prints its diagnostic, and every assertion after this block
+  # (the lib farm, identity-lib, fleet-tools, runs 1b/2) is silently skipped. Red for the wrong
+  # reason, with the evidence gone. The `lib_line` block below carried the same latent shape.
+  mg_line="$(grep -m1 'scripts merge-gate farm: [0-9][0-9]* copied' "$RUNS_LOG" || true)"
   case "$mg_line" in
     *"scripts merge-gate farm: $mg_n copied"*) ;;
     *) fail "run 1 did not report the merge-gate farm copies (expected $mg_n copied, #562/#984): ${mg_line:-<no merge-gate line at all>}" ;;
@@ -1767,7 +1772,7 @@ lib_n="$(printf '%s\n' "$lib_decl" | wc -w | tr -d ' ')"
 if [ -z "${lib_n:-}" ] || [ "$lib_n" -eq 0 ]; then
   fail "run 1: could not read the lib_srcs array from setup.sh — the lib-farm assertion cannot be derived"
 else
-  lib_line="$(grep -m1 'scripts lib farm: [0-9][0-9]* copied' "$RUNS_LOG")"
+  lib_line="$(grep -m1 'scripts lib farm: [0-9][0-9]* copied' "$RUNS_LOG" || true)"
   case "$lib_line" in
     *"scripts lib farm: $lib_n copied"*) ;;
     *) fail "run 1 did not report the shared-library farm copies (expected $lib_n copied, #1178/#1362): ${lib_line:-<no lib-farm line at all>}" ;;
