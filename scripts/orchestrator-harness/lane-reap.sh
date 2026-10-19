@@ -156,10 +156,17 @@ bound() { # bound <seconds> <cmd...>
   local p w rc
   "$@" &
   p=$!
-  ( "$SLEEP_BIN" "$s"; kill -TERM "$p" 2>/dev/null; "$SLEEP_BIN" 1; kill -KILL "$p" 2>/dev/null ) >/dev/null 2>&1 &
+  # ⛔ THE WATCHDOG MUST KILL ITS OWN `sleep` WHEN IT IS ENDED (#2163 review, P2). `kill "$w"` ends
+  # the subshell, not the `sleep <bound>` it forked — so the fallback (the ONLY path macOS takes)
+  # orphaned one sleeper per read, i.e. ~2 per lane per controller cycle, created by the instrument
+  # that exists to make the process population visible. The TERM trap below kills the sleeper.
+  ( trap 'kill "${sp:-0}" 2>/dev/null; exit 0' TERM
+    "$SLEEP_BIN" "$s" & sp=$!
+    wait "$sp"
+    kill -TERM "$p" 2>/dev/null; "$SLEEP_BIN" 1; kill -KILL "$p" 2>/dev/null ) >/dev/null 2>&1 &
   w=$!
   wait "$p"; rc=$?
-  kill "$w" 2>/dev/null; wait "$w" 2>/dev/null
+  kill -TERM "$w" 2>/dev/null; wait "$w" 2>/dev/null
   return "$rc"
 }
 
@@ -355,9 +362,15 @@ mtime_epoch() { # prints epoch seconds, or nothing when unreadable
 # exact "never parse a command line for a name" trap this file exists to close. Gate 2 is about
 # ANCESTORS, so `tail -n +2` drops the root and the walk starts where the host app actually lives.
 host_verdict() { # <tablefile> <pid>
-  local apid acmd low
+  local apid acmd low exe
   while IFS=$'\t' read -r apid acmd; do
-    low="$(printf '%s' "$acmd" | tr '[:upper:]' '[:lower:]')"
+    # ⛔ THE EXECUTABLE, NOT THE ARGUMENT TEXT (#2163 review, P2). Matching the whole argv meant a
+    # `cmux.app` token in an ancestor's PROMPT/`-c` payload returned `fleet` and stopped the walk
+    # before a real `Terminal.app` above it was examined — the kill path decided by text a user (or
+    # a brief) wrote. A host application is identified by the program that IS the ancestor, so only
+    # the first token is classified; everything after it is an argument and decides nothing.
+    exe="${acmd%%[[:space:]]*}"
+    low="$(printf '%s' "$exe" | tr '[:upper:]' '[:lower:]')"
     case "$low" in
       *terminal.app*|*iterm*|*warp.app*|*kitty.app*|*alacritty.app*|*hyper.app*|*sshd*)
         printf 'human\n'; return 0 ;;
@@ -395,7 +408,7 @@ zombie_count() { # <tablefile> — the box's corpses, so "busy" cannot hide them
 # look" and "nothing is there" are the two readings this whole issue conflates.
 cmd_count() {
   coerce_limits
-  local table roots root live=0 total=0 z
+  local table roots root live=0 total=0 z live_unknown=0
   table="$(mktemp "${TMPDIR:-/tmp}/lane-reap-count.XXXXXX")" || return 3
   read_table > "$table"
   if ! table_readable "$table"; then
@@ -418,10 +431,9 @@ cmd_count() {
       return 3
     fi
     # The lane's OWN evidence: the root, then its direct children in pid order (see resolve_log).
-    # The whole tree is still what the CPU gate sums and what the kill loop signals — this narrowed
-    # list is only who may SUPPLY the log.
+    # The census needs no other pid: it has no CPU gate and no kill loop, so the whole-tree walk
+    # (one extra full-table awk per lane, on the every-cycle path) is not done here.
     LOG_PIDS="$root $(awk -F'\t' -v r="$root" '$2 == r { print $1 }' "$table" | sort -n | tr '\n' ' ')"
-    TREE_PIDS="$(tree_pids "$table" "$root" | cut -f1 | tr '\n' ' ')"
     local resolved path del holder age m
     resolved="$(resolve_log "$root")" || continue   # no fleet log → not a lane (a subagent/tool pi)
     path="$(printf '%s' "$resolved" | cut -f1)"
@@ -433,25 +445,35 @@ cmd_count() {
     # audiences read the same resolved log and differ only in this filter.
     case "${path##*/}" in L-*.log|lane-*.log) ;; *) continue ;; esac
     total=$((total + 1))
-    if [ "$del" = "0" ]; then
+    if [ "$del" = "1" ]; then
+      # ⛔ A DELETED LOG IS NOT EVIDENCE THAT THE LANE IS DEAD (#2163 review, P1). The reap pass says
+      # the same thing one branch over ("a live lane may have rotated its log"), and `/tmp` pruning
+      # does exactly that. For a CAPACITY gate a possibly-live lane must count as live: counting it
+      # `0` makes the ceiling test false and DISPATCHES MORE onto a box that may already be full.
+      # `total` still shows it as resident, and the reaper's 12h no-log bound decides whether it is.
+      live=$((live + 1))
+    else
       m="$(mtime_epoch "$path")"
       if is_num "${m:-}"; then
         age=$(( $(now_s) - m ))
         [ "$age" -ge 0 ] && [ "$age" -le $(( 10#$LIVE_MIN * 60 )) ] && live=$((live + 1))
       else
         # ⛔ AN UNREADABLE AGE IS NOT "NOT LIVE" (#2163 review, P2). Silently omitting this lane
-        # UNDER-COUNTS `live`, which makes `[ "$LANES" -ge "$MAX_LANES" ]` false and DISPATCHES MORE
-        # — a fail-open on the capacity gate, in the one direction that fills the box. The numerator
-        # becomes `?` and the caller falls back (refusing to add work), never a confident 0.
-        live="?"
+        # UNDER-COUNTS `live`, which makes the ceiling test false and DISPATCHES MORE — a fail-open
+        # in the one direction that fills the box. The NUMERATOR becomes `?`; `live` itself stays a
+        # NUMBER so the next lane's `live=$((live + 1))` cannot hit an arithmetic error (the earlier
+        # cut assigned the literal `?` and aborted the whole pass on the next readable lane).
+        live_unknown=1
       fi
     fi
   done
   rm -f "$table"
-  printf 'lanes=%s/%d zombie=%d\n' "$live" "$total" "$z"
+  local live_out="$live"
+  [ "$live_unknown" = "1" ] && live_out="?"
+  printf 'lanes=%s/%d zombie=%d\n' "$live_out" "$total" "$z"
   # A `?` numerator is a PARTIAL answer: the totals are real, but at least one lane's liveness could
   # not be read. Exit 3 so a caller that gates work on this treats it as cannot-verify.
-  [ "$live" = "?" ] && return 3
+  [ "$live_unknown" = "1" ] && return 3
   return 0
 }
 
@@ -508,7 +530,7 @@ cmd_reap() {
     # how a slow box turns into a reaper that signals in an unbounded window.
     if pass_expired "$deadline"; then
       rm -f "$t0" "$ident_file" "$victims_file" "$cand_file"
-      printf '%s: CANNOT-VERIFY — the pass budget (${PASS_TIMEOUT}s) was spent before the sample; nothing was signalled\n' "$PROG"
+      printf '%s: CANNOT-VERIFY — the pass budget (%ss) was spent before the sample; nothing was signalled\n' "$PROG" "$PASS_TIMEOUT"
       logline "cannot-verify pass-budget-expired"
       return 3
     fi
@@ -541,7 +563,7 @@ cmd_reap() {
   # window itself is the largest single cost of the pass.
   if pass_expired "$deadline"; then
     rm -f "$t0" "$ident_file" "$victims_file" "$cand_file"
-    printf '%s: CANNOT-VERIFY — the pass budget (${PASS_TIMEOUT}s) was spent before the CPU window; nothing was signalled\n' "$PROG"
+    printf '%s: CANNOT-VERIFY — the pass budget (%ss) was spent before the CPU window; nothing was signalled\n' "$PROG" "$PASS_TIMEOUT"
     logline "cannot-verify pass-budget-expired-before-window"
     return 3
   fi
