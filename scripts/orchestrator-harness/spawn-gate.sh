@@ -620,7 +620,7 @@ pi_gate_refusal_count() {
 # It never returns: the allow path `exec`s (so this process IS the agent, with no extra shell in the
 # tree and the caller's own signals/fds intact), and the refusal path exits PI_GATE_REFUSED.
 pi_shim_main() {
-  local self real load cwd caller n item
+  local self real load cwd caller n item lane
   self="${BASH_SOURCE[0]}"
   real="$(pi_gate_real "$self")" || {
     # FAIL CLOSED on an unresolvable pi, LOUD: running *some* pi we cannot identify is worse than
@@ -633,6 +633,13 @@ pi_shim_main() {
   }
   load="$(load1)"
   cwd="$(pwd 2>/dev/null || printf '?')"
+  # ⛔ THE LANE MARKER (agent-infra#2095, section 2 below). An agent started with its cwd inside
+  # `<checkout>/.worktrees/<name>` IS a lane, so its whole process SUBTREE is marked: every
+  # descendant — a shell, a `nohup`, a `setsid` daemon — inherits this, which is the one piece of
+  # lane evidence a reparent cannot erase. It is SET here and NEVER CLEARED: a lane agent that
+  # `cd`s to /tmp is still a lane, and clearing it on a later spawn would launder exactly the
+  # provenance the controller guard reads.
+  lane="$(sg_lane_token "$cwd")" && export ORC_AGENT_LANE="$lane"
   # The parent's command line is the only general answer to "what was not started": the harness's
   # own callers pass a label to run_agent, but the caller THIS mode exists for is a hand-written
   # runner that never heard of run_agent. Truncated so a long prompt cannot fill the ledger.
@@ -659,12 +666,348 @@ pi_shim_main() {
   exec "$real" "$@"
 }
 
+# ════════════════════════════════════════════════════════════════════════════════════════════════
+# 2. THE CONTROLLER SPAWN POINT — a LANE may not start a controller (agent-infra#2095)
+# ════════════════════════════════════════════════════════════════════════════════════════════════
+# MEASURED 2026-10-18. A proof copy of the controller, started from `/tmp/live-cycle.sh` — a script
+# run out of a lane's agent session — ran for **5 h 15 m** beside the launchd controller:
+#
+#     /tmp/live-cycle.sh                        <- a LANE's agent ran this
+#       └─ bash /tmp/orc-proof/orch-loop.sh     <- a SECOND controller, owned by a session
+#
+# Defect 1's singleton refuses a second controller on the SAME state dir, and the isolated-state
+# default keeps a proof copy off production state. NEITHER stops a lane from putting a controller on
+# the BOX: it gets its own state dir, passes the singleton, and then competes for the same CPUs, the
+# same load ceiling and the same PR queue — for ever, because nothing supervises it. A controller is
+# a SUPERVISED process: launchd/systemd owns its lifetime, its MAX_LOAD and its restart policy. A
+# lane-spawned one is owned by a session that will exit, and by a `MAX_LOAD` nobody rendered.
+#
+# THE RULE: a controller whose PARENT CHAIN is a lane is REFUSED. Two INDEPENDENT observations,
+# because each has a hole the other does not:
+#
+#   1. THE INHERITED MARKER. `pi_shim_main` below exports `ORC_AGENT_LANE=<worktree>` when it starts
+#      an agent whose cwd is inside `<repo>/.worktrees/<name>`. Every descendant inherits it, so
+#      `nohup`, `setsid`, a reparented daemon and a `cd` out of the worktree all still carry it.
+#      Its hole: an env scrub (`env -i`) drops it.
+#   2. THE PARENT-CHAIN WALK. The ancestors' cwds and command lines, read from the process table. A
+#      lane's agent, its shell and the harness's own runners are visible there even when the
+#      environment says nothing. Its hole: a process reparented to init has no chain left.
+#   3. THE CONTROLLER'S OWN CWD. A controller started with its cwd INSIDE `.worktrees/<name>` was
+#      started BY a lane — no shipped start path (launchd, systemd, the cell supervisor,
+#      `install.sh`) ever runs from a worktree. It costs one string test and closes the case where the
+#      lane `cd`s out of, or is reparented away from, the rest of its own evidence.
+#
+# Neither is trusted alone and they are never merged silently: the verdict names WHICH evidence
+# fired, the ANCESTOR pid that fired it, and the cwd/command behind it — the line an operator needs
+# to find what put a controller on the box. Both ALLOWED and REFUSED starts are written to a durable
+# ledger, for the reason the pi-gate ledger records allows: a series of refusals alone cannot answer
+# "how close did we get".
+#
+# ⛔ PORTABILITY IS THE POINT, NOT A DETAIL — both platforms are supported and neither is assumed:
+#   * macOS ships no `pgrep -c` and no `ps -o etimes`, and `hw.ncpu` is not repeated here (nothing
+#     below needs a core count). The walk is ONE `ps -Ao pid=,ppid=,command=` read, which BSD `ps`
+#     and procps BOTH provide, and never `etimes`.
+#   * macOS never has `timeout(1)` and a Linux cell may not ship it either, so every external read
+#     below is bounded by the bash watchdog `sg_bounded` — never by `timeout`.
+#   * `/proc/<pid>/cwd` is Linux-only and `lsof` is the macOS answer; the cwd read is BATCHED into
+#     one `lsof` call for the whole chain rather than one process spawn per ancestor (the same
+#     lesson `lane-census.sh` learned for the same reason).
+#
+# ⛔ WHAT THIS IS NOT: it is not a sandbox. A lane that deliberately scrubs its environment AND
+# detaches from its own process tree can still start a controller — no in-process guard can prevent
+# that, and pretending otherwise is the "a comment claiming a guard that does not exist reads exactly
+# like one that does" failure this file's header is written against. What it stops is the ACCIDENT:
+# a proof copy, a leftover test runner, a `nohup … &` from a lane session. The escape it does honour
+# (`ORC_CONTROLLER_LANE_OVERRIDE=1`) is an OPERATOR/TEST act, is written to the ledger on every use,
+# and is named here rather than hidden because a start-path gate with no escape can wedge a box.
+CONTROLLER_LANE_REFUSED=79    # distinct from 75/76/77/78: "a LANE started this controller"
+CONTROLLER_GUARD_UNJUDGED=78  # cannot read the evidence — fail CLOSED (same code as a missing guard)
+SG_CHAIN_MAX=12               # ancestors walked; tmux client->bash -c->lane.sh->pi is 4 deep
+SG_READ_SECS=5                # bound for ONE bounded external read
+SG_TMP=""
+
+# sg_hostname — the same identity vocabulary controller-state.sh uses, so an operator can join the
+# two ledgers on `host`.
+sg_hostname() { hostname 2>/dev/null || uname -n 2>/dev/null || printf 'unknown'; }
+
+# sg_bounded <secs> <outfile> <cmd…> — run a read under a hard wall-clock bound WITHOUT `timeout(1)`.
+# Same shape and same reason as lane-census.sh's census_bounded (there is no portable `timeout`), and
+# the sentinel is PER CALL: a bound that has already fired must never describe a read that has not
+# run. Returns 124 when the bound fired, so "did not answer" is distinguishable from "answered
+# nothing" — the difference this whole issue is about.
+sg_bounded() {
+  local secs="$1" out="$2" pid timer flag rc=0
+  shift 2
+  flag="$out.killed"
+  rm -f "$flag" 2>/dev/null || true
+  "$@" >"$out" 2>/dev/null &
+  pid=$!
+  ( sleep "$secs"; : > "$flag" 2>/dev/null; kill -TERM "$pid" 2>/dev/null; sleep 2; kill -KILL "$pid" 2>/dev/null ) >/dev/null 2>&1 &
+  timer=$!
+  wait "$pid" 2>/dev/null || rc=$?
+  kill "$timer" 2>/dev/null || true
+  wait "$timer" 2>/dev/null || true
+  [ -f "$flag" ] && return 124
+  return $rc
+}
+
+# sg_chain <pid> — the ancestor chain, self FIRST, as `pid<TAB>ppid<TAB>command` lines.
+# ⛔ ONE BOUNDED `ps` READ OF THE WHOLE TABLE, NOT ONE SPAWN PER ANCESTOR (portability + cost):
+# `ps -Ao pid=,ppid=,command=` exists on BSD `ps` and procps alike, `-o etimes` does NOT (macOS has
+# no such field), and a per-ancestor `ps -p` would be up to 12 process spawns on every controller
+# start. The walk itself is bounded by SG_CHAIN_MAX and cycle-safe: a ppid tree cannot contain a
+# cycle, but a recycled or stubbed table must not turn this read into a hang — the shape #2095 exists
+# to remove.
+# A pid that is NOT in the table prints NOTHING, which the caller reads as "cannot tell" (fail
+# closed), never as "no lane in the chain".
+sg_chain() {
+  local pid="${1:-0}" out
+  mkdir -p "${SG_TMP:=${TMPDIR:-/tmp}/spawn-gate.$$}" 2>/dev/null || SG_TMP="${TMPDIR:-/tmp}"
+  out="$SG_TMP/ps.$$"
+  # ⛔ CLEANED UP BY THE READER THAT CREATED IT. The guard body runs inside `$( )` (the CLI captures
+  # its verdict line), so a temp path it set would never reach a caller's cleanup — the file is
+  # removed here, and the DIRECTORY only if empty (`rmdir`, never `rm -rf`, so the `${TMPDIR:-/tmp}`
+  # fallback can never be the thing deleted).
+  if ! sg_bounded "$SG_READ_SECS" "$out" ps -Ao pid=,ppid=,command=; then
+    rm -f "$out" "$out.killed" 2>/dev/null || true
+    rmdir "$SG_TMP" 2>/dev/null || true
+    return 124
+  fi
+  awk -v start="$pid" -v max="$SG_CHAIN_MAX" '
+    { row=$0
+      p=$1; q=$2
+      sub(/^[[:space:]]*[0-9]+[[:space:]]+[0-9]+[[:space:]]*/, "", row)
+      PP[p]=q; CC[p]=row }
+    END {
+      if (!(start in PP)) exit
+      p=start; n=0; seen=" "
+      while (p != "" && p + 0 > 1 && n < max) {
+        if (index(seen, " " p " ") > 0) break
+        seen = seen p " "
+        print p "\t" PP[p] "\t" CC[p]
+        if (!(p in PP)) break
+        if (PP[p] == p) break
+        p=PP[p]; n++
+      }
+    }' "$out" 2>/dev/null
+  rm -f "$out" "$out.killed" 2>/dev/null || true
+  rmdir "$SG_TMP" 2>/dev/null || true
+  return 0
+}
+
+# sg_parse_lsof <file> — `pid<TAB>cwd` pairs from `lsof -w -a -d cwd -Fn` output.
+# ⛔ SPLIT OUT SO THE macOS HALF IS TESTABLE ON A LINUX BOX. The branch that needs this parser can
+# only run where /proc does not exist, and an unexercised parser is exactly where a platform bug
+# hides — so the format has a check of its own (spawn-gate.test.sh) instead of being trusted because
+# it reads plausibly. lsof's `-F` output is one `p<pid>` record followed by the `n<name>` entries.
+sg_parse_lsof() {
+  awk 'BEGIN{p=""} /^p/{p=substr($0,2); next} /^n/{if (p!="") {print p "\t" substr($0,2); p=""}}' "${1:-}" 2>/dev/null
+}
+
+# sg_cwds <pid…> — `pid<TAB>cwd` for every pid whose cwd can be read, in AT MOST one external call.
+# Linux reads /proc directly (no process spawn at all); macOS batches the whole chain into one `lsof`.
+# A denied cwd is simply ABSENT — a floor on what is visible, never a claim of completeness.
+sg_cwds() {
+  local p pids="" out
+  if [ -d /proc ] && [ -r /proc/self/cwd ]; then
+    for p in "$@"; do
+      [ -r "/proc/$p/cwd" ] || continue
+      printf '%s\t%s\n' "$p" "$(readlink "/proc/$p/cwd" 2>/dev/null)"
+    done
+    return 0
+  fi
+  command -v lsof >/dev/null 2>&1 || return 1
+  for p in "$@"; do pids="$pids${pids:+,}$p"; done
+  out="$SG_TMP/lsof.$$"
+  sg_bounded "$SG_READ_SECS" "$out" lsof -w -a -d cwd -Fn -p "$pids" || { rm -f "$out" "$out.killed" 2>/dev/null; rmdir "$SG_TMP" 2>/dev/null; return 1; }
+  sg_parse_lsof "$out"
+  rm -f "$out" "$out.killed" 2>/dev/null || true
+  rmdir "$SG_TMP" 2>/dev/null || true
+  return 0
+}
+
+# sg_lane_token <cwd> — the lane/worktree name when this path belongs to a harness worktree.
+# The harness's worktrees are ALWAYS `<checkout>/.worktrees/<name>` (lane.sh is started with its cwd
+# there; fix-one.sh/merge-one.sh/adopt-fix.sh create theirs the same way), so the path IS the
+# evidence — no repo argument is required, and a lane of an UNKNOWN checkout is still a lane.
+sg_lane_token() {
+  local cwd="${1:-}" rest tok
+  case "$cwd" in */.worktrees/*) ;; *) return 1 ;; esac
+  rest="${cwd##*/.worktrees/}"
+  tok="${rest%%/*}"
+  case "$tok" in ''|.|..) return 1 ;; esac
+  printf '%s' "$tok"
+}
+
+# sg_runner_name <command-line> — the harness RUNNER this command line invokes, if any.
+# ⛔ THE LIST IS THE HARNESS'S OWN LAUNCHERS, NOT A FUZZY 'lane' MATCH. `lane-status.py` and
+# `lane-census.sh` are READERS — a shell running one of those is not a lane dispatching work, and
+# matching on the substring would refuse a controller started by an operator's own status check.
+# Only the DISPATCHING runners count.
+sg_runner_name() {
+  local cmd="${1:-}" base
+  for base in lane.sh fix-one.sh merge-one.sh adopt-fix.sh chain-merge.sh nonblocking-dispatch.sh dispatch-merge.sh; do
+    case " $cmd " in
+      *"/$base "*|*" $base "*) printf '%s' "$base"; return 0 ;;
+    esac
+  done
+  return 1
+}
+
+# sg_controller_ledger <verdict> <evidence> <pid> <lane> <ancestor> <why> <repo> <override>
+# One append-only row per controller START ATTEMPT, allows included. Fields: epoch, verdict, evidence,
+# pid, ppid, host, lane, ancestor, why, repo, override. Bounded by one-generation rotation, the same
+# rule pi_gate_ledger follows — a device that fills silently is the defect #1765 exists for.
+sg_controller_ledger() {
+  local dir f
+  [ -n "${HOME:-}" ] || return 0
+  dir="$HOME/.pi/agent/state"
+  mkdir -p "$dir" 2>/dev/null || return 0
+  f="$dir/controller-spawn-gate.tsv"
+  if [ -f "$f" ] && [ "$(wc -c < "$f" 2>/dev/null || printf '0')" -ge "$PI_GATE_LEDGER_MAX_BYTES" ]; then
+    mv -f "$f" "$f.1" 2>/dev/null || :
+  fi
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$(date +%s)" "${1:-}" "${2:-}" "${3:-}" "${PPID:-0}" "$(sg_hostname)" \
+    "${4:-}" "${5:-}" "${6:-}" "${7:-}" "${8:-}" \
+    >> "$f" 2>/dev/null || return 0
+}
+
+# sg_controller_guard <pid> [<repo>] — decide whether the process <pid> may be a controller.
+# Prints ONE `key=value` line, ALWAYS, so the caller can log it verbatim; the status is the verdict:
+#   0                        allow  (no lane evidence)
+#   CONTROLLER_LANE_REFUSED  refuse (a lane's environment or ancestry is on this chain)
+#   CONTROLLER_GUARD_UNJUDGED cannot read the chain at all — fail CLOSED, as an unreadable singleton
+#                            record does. Absence of evidence is not evidence of absence here: the
+#                            caller of this function is a controller deciding whether it may exist.
+sg_controller_guard() {
+  local pid="${1:-}" repo="${2:-}" host evidence="none" lane="" ancestor="" why="" depth=0
+  local chain cwds p _pp c cwd r tok verdict="allow"
+  host="$(sg_hostname)"
+  # ── evidence 1: the INHERITED marker (survives reparenting; dies on an env scrub) ────────────
+  if [ -n "${ORC_AGENT_LANE:-}" ]; then
+    evidence="inherited_env"; lane="${ORC_AGENT_LANE}"; why="env:ORC_AGENT_LANE"
+  fi
+  # ── evidence 3 (cheapest, checked before the walk): the controller's OWN cwd ────────────────
+  if tok="$(sg_lane_token "$(pwd 2>/dev/null)")" && [ -n "$tok" ]; then
+    evidence="$([ "$evidence" = inherited_env ] && printf 'both' || printf 'own_cwd')"
+    lane="$tok"; why="own_cwd:$(pwd 2>/dev/null)"
+  fi
+
+  # ── evidence 2: the PARENT-CHAIN walk (survives an env scrub; dies on reparenting) ───────────
+  case "$pid" in ''|*[!0-9]*) pid="" ;; esac
+  if [ -z "$pid" ]; then
+    printf 'controller=unjudged pid=? host=%s evidence=%s lane=%s ancestor=%s why=no_pid depth=0\n' \
+      "$host" "$evidence" "${lane:-?}" "${ancestor:-?}"
+    return "$CONTROLLER_GUARD_UNJUDGED"
+  fi
+  mkdir -p "${SG_TMP:=${TMPDIR:-/tmp}/spawn-gate.$$}" 2>/dev/null || SG_TMP="${TMPDIR:-/tmp}"
+  chain="$(sg_chain "$pid" 2>/dev/null)"
+  if [ -z "$chain" ]; then
+    printf 'controller=unjudged pid=%s host=%s evidence=%s lane=%s ancestor=%s why=no_chain depth=0\n' \
+      "$pid" "$host" "$evidence" "${lane:-?}" "${ancestor:-?}"
+    return "$CONTROLLER_GUARD_UNJUDGED"
+  fi
+  cwds="$(sg_cwds $(printf '%s' "$chain" | cut -f1 | tr '\n' ' ') 2>/dev/null)"
+  # SELF IS EXCLUDED from the lane test: the controller's own cwd is allowed to be anything (an
+  # operator may start it from a checkout); what is refused is a LANE in its ANCESTRY.
+  while IFS="$(printf '\t')" read -r p _pp c; do
+    [ -n "${p:-}" ] || continue
+    depth=$(( depth + 1 ))
+    [ "$p" = "$pid" ] && continue
+    cwd="$(printf '%s\n' "$cwds" | awk -F"\t" -v p="$p" '$1 == p { print $2; exit }')"
+    if tok="$(sg_lane_token "$cwd")" && [ -n "$tok" ]; then
+      ancestor="$p"; lane="$tok"; why="cwd:${cwd:-?}"
+      evidence="$([ "$evidence" = inherited_env ] && printf 'both' || printf 'parent_chain')"
+      break
+    fi
+    if r="$(sg_runner_name "$c")" && [ -n "$r" ]; then
+      ancestor="$p"; why="runner:$r"
+      [ -n "$lane" ] || lane="?"
+      evidence="$([ "$evidence" = inherited_env ] && printf 'both' || printf 'parent_chain')"
+      break
+    fi
+  done <<EOF
+$chain
+EOF
+
+  case "$evidence" in
+    none) : ;;
+    *) verdict="refuse" ;;
+  esac
+
+  # ⛔ THE OVERRIDE IS AN OPERATOR/TEST ACT, AND IT IS RECORDED EVERY TIME IT IS USED. It exists
+  # because a start-path gate with no escape can wedge a box (the same posture AGENT_SKIP_REVIEW_GATE
+  # and REAP_LANE_VENV_DISABLE take), and because a test suite run INSIDE a lane is legitimately a
+  # lane. It is not a defence against a deliberate lane: see "WHAT THIS IS NOT" above.
+  if [ "$verdict" = refuse ] && [ "${ORC_CONTROLLER_LANE_OVERRIDE:-}" = "1" ]; then
+    printf 'controller=allow pid=%s host=%s evidence=%s lane=%s ancestor=%s why=%s depth=%s override=ORC_CONTROLLER_LANE_OVERRIDE\n' \
+      "$pid" "$host" "$evidence" "${lane:-?}" "${ancestor:-?}" "${why:-?}" "$depth"
+    sg_controller_ledger allow "$evidence" "$pid" "${lane:-?}" "${ancestor:-}" "${why:-?}" "$repo" \
+      ORC_CONTROLLER_LANE_OVERRIDE
+    return 0
+  fi
+
+  printf 'controller=%s pid=%s host=%s evidence=%s lane=%s ancestor=%s why=%s depth=%s\n' \
+    "$verdict" "$pid" "$host" "$evidence" "${lane:-?}" "${ancestor:-?}" "${why:--}" "$depth"
+  sg_controller_ledger "$verdict" "$evidence" "$pid" "${lane:-?}" "${ancestor:-}" "${why:-?}" "$repo" ""
+  case "$verdict" in
+    allow) return 0 ;;
+    *) return "$CONTROLLER_LANE_REFUSED" ;;
+  esac
+}
+
+# sg_controller_cli <argv…> — `spawn-gate.sh --controller-guard --pid <pid> [--repo <checkout>]`.
+# The executable form EXISTS so the controller does not have to source this file: sourcing it would
+# re-derive MAX_LOAD/DISK_MIN_FREE_MB from the module below at source time and collide with the
+# controller's own provenance logic (`[cap] src=`, #2095 item 4). One subprocess at startup, once.
+# The loud refusal goes to stderr; the one-line verdict goes to stdout, for the caller's log.
+sg_controller_cli() {
+  local pid="" repo="" out rc
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --pid)   pid="${2:-}"; shift 2 ;;
+      --pid=*) pid="${1#*=}"; shift ;;
+      --repo)  repo="${2:-}"; shift 2 ;;
+      --repo=*) repo="${1#*=}"; shift ;;
+      -h|--help)
+        printf 'usage: spawn-gate.sh --controller-guard [--pid <pid>] [--repo <checkout>]\n'
+        printf 'refuses (exit 79) a controller whose parent chain is a lane; exit 78 = cannot judge\n'
+        return 0 ;;
+      *) shift ;;
+    esac
+  done
+  [ -n "$pid" ] || pid="${PPID:-0}"
+  out="$(sg_controller_guard "$pid" "$repo")"; rc=$?
+  printf '%s\n' "$out"
+  case "$rc" in
+    0) return 0 ;;
+    "$CONTROLLER_LANE_REFUSED")
+      # ⛔ LOUD, AND WITH THE REMEDY. This is a START-path refusal: the operator has to be told what
+      # to do instead, or the gate becomes the thing that prevents the fix.
+      printf 'controller-gate: REFUSING to run a controller whose parent chain is a LANE — a controller is supervised (launchd/systemd owns its lifetime, its MAX_LOAD and its restart); a lane-spawned one is owned by a session that will exit.\n' >&2
+      printf 'controller-gate:   %s\n' "$out" >&2
+      printf 'controller-gate:   start it the supported way: launchd-cycle.sh / install.sh --start on macOS, the cell supervisor on Linux — or a shell whose ancestry is not a lane. A test or an operator rescue sets ORC_CONTROLLER_LANE_OVERRIDE=1 (recorded in %s/.pi/agent/state/controller-spawn-gate.tsv).\n' "${HOME:-<no HOME>}" >&2
+      return "$CONTROLLER_LANE_REFUSED" ;;
+    *) printf 'controller-gate: cannot read the parent chain of pid %s — failing CLOSED (an unproven controller must not run)\n' "$pid" >&2
+       return "$CONTROLLER_GUARD_UNJUDGED" ;;
+  esac
+}
+
 # ── executed, not sourced ────────────────────────────────────────────────────────
 # `BASH_SOURCE[0] == $0` means the kernel ran THIS file (the installed `pi`) rather than a caller
 # sourcing the library above. Note there is NO name-based exemption: a shim that behaved differently
 # when invoked under another name would be a one-word bypass (`ln -s …/spawn-gate.sh pilib`), and a
 # copy invoked that way would then sit ungated on PATH. Any executed invocation is the spawn point,
 # and any refused one is loud about it.
+#
+# ⛔ EXACTLY ONE ARGUMENT SHAPE IS EXEMPT FROM THE PI MODE, and it is a FLAG, not a name (#2095):
+# `--controller-guard` is the controller start path above. A name-based exemption would be the
+# one-word bypass this block exists to forbid; a flag that the real `pi` does not take is not, and
+# it is checked only as ARGV[1] so a prompt mentioning it later cannot change the mode.
 if [ "${BASH_SOURCE[0]:-}" = "$0" ]; then
-  pi_shim_main "$@"
+  case "${1:-}" in
+    --controller-guard) shift; sg_controller_cli "$@" ;;
+    *) pi_shim_main "$@" ;;
+  esac
 fi

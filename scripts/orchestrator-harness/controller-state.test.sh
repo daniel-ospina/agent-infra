@@ -200,10 +200,16 @@ for _i in 1 2 3 4 5 6 7 8 9 10; do grep -q '^acquired' "$TMP/holder2.out" 2>/dev
 # A SEPARATE copy of the controller, so this is genuinely a second instance (the deployed copy the
 # plist runs is the first). REPO must exist or the controller refuses at its own repo guard, which
 # would make this check pass for the wrong reason.
+# ⛔ `ORC_CONTROLLER_LANE_OVERRIDE=1` IS PART OF THE FIXTURE, AND IT IS NOT A BYPASS OF THIS CHECK.
+# This suite legitimately runs INSIDE A LANE on the fleet, and the controller now refuses to start at
+# all as a lane's child (#2095 — a lane may not put a controller on the box), which would return 79
+# here and prove nothing about the singleton. The lane-parent refusal is driven, with real lane
+# fixtures and through this same real `orch-loop.sh`, by `spawn-gate.test.sh` — so the arm it owns is
+# asserted there, and this one stays about the SINGLETON.
 SECOND="$TMP/second"
 mkdir -p "$SECOND"
 cp "$HERE"/*.sh "$SECOND"/ 2>/dev/null
-out="$(cd "$SECOND" && REPO="$TMP/repo" ORC_STATE_DIR="$DEPLOY" bash "$SECOND/orch-loop.sh" 2>&1)"
+out="$(cd "$SECOND" && ORC_CONTROLLER_LANE_OVERRIDE=1 REPO="$TMP/repo" ORC_STATE_DIR="$DEPLOY" bash "$SECOND/orch-loop.sh" 2>&1)"
 rc=$?
 case "$rc" in
   75) { grep -q 'REFUSING TO START' <<<"$out" && grep -q "held by instance pid=$H2" <<<"$out"; }; rc=$? ;;
@@ -240,8 +246,9 @@ CAPLN="$(grep -m1 '^\s*echo "\[cap\]' "$LOOP")"
 # nothing and this check failed on a line that carried every field.
 { grep -qF '[cap] ctl=$ORC_INSTANCE' <<<"$CAPLN" \
   && grep -qF 'src=$MAX_LOAD_SRC' <<<"$CAPLN" \
-  && grep -qF 'state_src=$ORC_STATE_SRC' <<<"$CAPLN"; }; rc=$?
-ck "[cap] prints the INSTANCE (ctl=), the MAX_LOAD source, and the state-dir source" $rc
+  && grep -qF 'state_src=$ORC_STATE_SRC' <<<"$CAPLN" \
+  && grep -qF '$(orc_census_token "$MAX_LANES")' <<<"$CAPLN"; }; rc=$?
+ck "[cap] prints the INSTANCE (ctl=), the MAX_LOAD source, the state-dir source, and the census token" $rc
 # ...and the instance id is latched once, so two lines from one run cannot disagree about WHO.
 got="$( ( . "$SUBJECT"; orc_self_describe /s >/dev/null; a="$ORC_INSTANCE"; sleep 1; orc_self_describe /s >/dev/null; [ "$a" = "$ORC_INSTANCE" ] && printf stable || printf DRIFTED ) )"
 [ "$got" = "stable" ]; rc=$?

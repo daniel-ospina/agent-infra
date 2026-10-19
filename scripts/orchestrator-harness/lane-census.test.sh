@@ -133,6 +133,13 @@ case "$CTOK" in
   *) rc=1 ;;
 esac
 ck "the token carries the value USED and the ceiling (lanes=<used>/<max>)" $rc
+# ...and a token from a COMPLETE read carries NO state marker: the marker has to MEAN something, or
+# "no marker" and "marker" are the same line and the fix is decoration.
+case "$CTOK" in
+  *PARTIAL*|*UNREADABLE*) rc=1 ;;
+  *) rc=0 ;;
+esac
+ck "a COMPLETE read carries NO PARTIAL/UNREADABLE marker — an unmarked [cap] is a MEASURED one" $rc
 
 # ── THE UNREADABLE-CONVENTION ARM: no tmux server is PARTIAL, not zero sessions ───────────────
 OUTB="$(census "$TMP/tmux-broken")"
@@ -141,6 +148,46 @@ echo "      census: $OUTB"
 ck "an unreadable tmux is state=PARTIAL why=tmux_unreadable — never 'zero sessions'" $rc
 [ "$(tok "$OUTB" used)" = "2" ] && [ "$(tok "$OUTB" src)" = "worktrees" ]; rc=$?
 ck "a partial read still answers from the process table: used=$(tok "$OUTB" used) src=$(tok "$OUTB" src)" $rc
+# ⛔ THE "CONFIDENTLY WRONG ZERO", AS A CHECK. A PARTIAL census used to print `lanes=0/25` (or any
+# bare number) in the one line an operator greps, with nothing saying which half of the read
+# answered — the same shape that reported `lanes=0` for a box running 50 agents. The token must now
+# carry `PARTIAL(taken=<n>)` AND the reason.
+BTOK="$( ( PATH="$TMP/tmux-broken:$PATH"; . "$GUARD"; orc_census "$CENSUS" "$REPO"; orc_census_token 25 ) 2>/dev/null )"
+case "$BTOK" in
+  *"PARTIAL(taken=3)"*) rc=0 ;;
+  *) rc=1 ;;
+esac
+ck "a PARTIAL read prints PARTIAL(taken=<n>) in the [cap] token: ${BTOK:0:130}" $rc
+case "$BTOK" in
+  *"why=tmux_unreadable"*) rc=0 ;;
+  *) rc=1 ;;
+esac
+ck "...and names WHICH half failed (why=tmux_unreadable), so 'partial' is actionable" $rc
+
+# ⛔ A COUNT THAT WAS NEVER READ IS `?`, NOT 0. When the process table does not answer, `taken` is
+# unknown — and an unknown rendered as a zero is exactly the confidently-wrong number this fixes.
+# Both probes are stubbed HERE (rather than reusing the slow hanging arm below) so this check stays
+# cheap: `pgrep` fails, its `ps` fallback fails, and the census therefore has NO process observation
+# while the tmux convention still answers.
+mkdir -p "$TMP/noproc"
+printf '#!/bin/sh\nexit 2\n' > "$TMP/noproc/pgrep"
+printf '#!/bin/sh\nexit 1\n' > "$TMP/noproc/ps"
+chmod +x "$TMP/noproc/pgrep" "$TMP/noproc/ps"
+HTOK="$( ( PATH="$TMP/noproc:$TMP/tmux1:$PATH"; . "$GUARD"; orc_census "$CENSUS" "$REPO"; orc_census_token 25 ) 2>/dev/null )"
+case "$HTOK" in
+  *"PARTIAL(taken=?)"*) rc=0 ;;
+  *) rc=1 ;;
+esac
+ck "an unread count prints PARTIAL(taken=?), never taken=0: ${HTOK:0:120}" $rc
+
+# A census that is not there at all is UNREADABLE, in the same vocabulary — the controller must not
+# read a missing binary as "zero lanes".
+NTOK="$( ( . "$GUARD"; orc_census "$TMP/does-not-exist/lane-census.sh" "$REPO"; orc_census_token 25 ) 2>/dev/null )"
+case "$NTOK" in
+  *"UNREADABLE(taken=?)"*) rc=0 ;;
+  *) rc=1 ;;
+esac
+ck "a MISSING census is UNREADABLE(taken=?), not a zero: ${NTOK:0:130}" $rc
 
 # ── THE BOUND: a `pgrep` that never returns must not become a hung pass ──────────────────────
 # ⛔ THIS IS THE DEFECT, NOT A HYPOTHETICAL. The roster read this replaces timed out at the fleet's

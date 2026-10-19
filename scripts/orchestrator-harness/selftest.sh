@@ -872,31 +872,41 @@ ck "the fixer prompt treats a conflict as the task" $rc
 # Drive the shipped rule rather than grepping for a comment: a regression that dropped the
 # 'lanes >= 1' exception or the headroom arithmetic must fail here.
 { grep -E '^is_num\(\) \{' "$LOOP"; sed -n '/^mp_reason() {/,/^}/p;/^review_slots() {/,/^}/p' "$LOOP"; } > "$TMP/mp.sh"
+# ⛔ is_num FIRST in the file: mp_reason's fail-closed arm calls it, and a command that never runs
+# returns non-zero, which reads as "capacity available" (fail OPEN).
 if need "$TMP/mp.sh" "mp_reason()/review_slots() are extracted from the shipped loop"; then
   MERGE_PRIORITY_AT=10; MAX_REVIEW=4
-  # ⛔ THE BOUND'S EVIDENCE IS PART OF THE RULE, so the shipped form is driven WITH it: a live
-  # worker, a land inside the window, and an unowned PR younger than the window. Without the last
-  # two the gate releases by design (agent-infra#2040), so passing only (count, lanes, workers)
-  # would assert the OLD rule and pass vacuously on the new one.
-  MERGE_PRIORITY_MAX_AGE_MIN=180; MP_NOW=1800000000; MP_LAND=$(( MP_NOW - 300 ))
+  # ⛔ THIS BRANCH HAS NO TIME BOUND AND NO EVIDENCE PREAMBLE (owner ruling, 2026-10-18): the gate
+  # blocks while ONE un-owned PR remains, and a stalled drain is NAMED (`[dispatch] DRAIN STALLED`)
+  # rather than released. Driving it therefore needs only (count, lanes, workers) — and the cases
+  # below fail if a release arm comes back, because `mp_reason 11 …` would then return empty.
   # shellcheck disable=SC1090
   . "$TMP/mp.sh"
-  [ -n "$(mp_reason 11 1 0 5 "$MP_LAND" 11 acme/widget "$MP_NOW")" ] && rc=0 || rc=1
-  ck "shipped mp_reason(): 11 open PRs with a lane running (land in window, young PRs) -> drain" $rc
-  [ -z "$(mp_reason 11 1 0 5 "$(( MP_NOW - 4 * 3600 ))" 11 acme/widget "$MP_NOW")" ] && rc=0 || rc=1
-  ck "shipped mp_reason(): the same backlog with NO land in the window RELEASES (the bound)" $rc
-  [ -z "$(mp_reason 11 0 0 5 "$MP_LAND" 11 acme/widget "$MP_NOW")" ] && rc=0 || rc=1
-  ck "shipped mp_reason(): 11 open PRs with NO lane -> dispatch still allowed" $rc
-  [ -z "$(mp_reason 10 3 0 5 "$MP_LAND" 10 acme/widget "$MP_NOW")" ] && rc=0 || rc=1
-  ck "shipped mp_reason(): at the threshold, no drain override" $rc
+  [ -n "$(mp_reason 11 1)" ] && rc=0 || rc=1
+  ck "shipped mp_reason(): 11 open PRs with a lane running -> drain" $rc
+  # ⛔ NO LANE/WORKER EXCEPTION AND NO THRESHOLD (owner ruling, 2026-10-18): 11 un-owned PRs block new
+  # work whether or not a lane is running — the lane count was never the question, and the threshold
+  # let the measured 25-un-owned queue through.
+  [ -n "$(mp_reason 11 0)" ] && rc=0 || rc=1
+  ck "shipped mp_reason(): 11 un-owned PRs with NO lane -> still drain (the lane count is irrelevant)" $rc
+  [ -z "$(mp_reason 0 3)" ] && rc=0 || rc=1
+  ck "shipped mp_reason(): 0 un-owned PRs -> no drain override" $rc
+  [ -n "$(mp_reason 1 0)" ] && rc=0 || rc=1
+  ck "shipped mp_reason(): ONE un-owned PR is enough to block new work" $rc
   [ "$(review_slots 11)" = "6" ] && rc=0 || rc=1
   ck "shipped review_slots(): backlog raises reviewer headroom to MAX_REVIEW+2" $rc
-  [ "$(review_slots 10)" = "4" ] && rc=0 || rc=1
-  ck "shipped review_slots(): below the threshold, headroom is MAX_REVIEW" $rc
+  # ⛔ THE SIZE THRESHOLD IS GONE (review R2, P3): the GATE blocks the issue path on ONE un-owned PR,
+  # so the headroom follows the same predicate. 10 used to read as "below threshold = base budget";
+  # keeping that would drain a 10-PR queue at the pre-change WIP.
+  [ "$(review_slots 10)" = "6" ] && rc=0 || rc=1
+  ck "shipped review_slots(): ANY un-owned PR raises reviewer headroom (no size threshold)" $rc
+  [ "$(review_slots 0)" = "4" ] && rc=0 || rc=1
+  ck "shipped review_slots(): 0 un-owned -> the base budget" $rc
+  [ "$(review_slots x)" = "4" ] && rc=0 || rc=1
+  ck "shipped review_slots(): a non-numeric count falls back to the base budget (not an error)" $rc
   # ⛔ The tunable must not leak into the rest of the suite: an EXPORTED MERGE_PRIORITY_AT in the
-  # caller's environment survives this plain assignment, so §16's open_pr_count driver inherited
-  # `10` and its "a first-ever failure assumes 26" assertion read 11 (measured — the failure was
-  # the ambient env, not the fallback). Unset it, so §16 grades the SHIPPED default.
+  # caller's environment survives this plain assignment, so a later §N driver inherited it and graded
+  # the ambient env instead of the shipped default (#2040's finding — kept through the merge).
   unset MERGE_PRIORITY_AT MERGE_PRIORITY_MAX_AGE_MIN
 fi
 grep -qE 'case "\$\{PR_ST:-\}" in MERGED\|CLOSED\)' "$LOOP" && rc=0 || rc=1
@@ -1048,7 +1058,9 @@ grep -q 'Prefer the live scripts' "$HERE/retired/auto-loop.sh" && rc=0 || rc=1
 ck "the retired copy's banner warns against reuse" $rc
 
 # ── 14) the controller does not treat a stale claim as in-flight ────────────────
-sed -n '/^claim_live() {/,/^}/p' "$LOOP" > "$TMP/claimlive.sh"
+# ⛔ BOTH FUNCTIONS: claim_live is the SPAWN GUARD and delegates its lease arm to claim_lease_live
+# (review R2, P1 split them so ownership cannot inherit the guard's loose local-lock test).
+{ sed -n '/^claim_live() {/,/^}/p' "$LOOP"; sed -n '/^claim_lease_live() {/,/^}/p' "$LOOP"; } > "$TMP/claimlive.sh"
 if need "$TMP/claimlive.sh" "claim_live() is extracted from the shipped orch-loop.sh"; then
   mkdir -p "$TMP/CL/state"
   O="$TMP/CL"

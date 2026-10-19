@@ -411,8 +411,23 @@ orc_census() {
 # orc_census_token — the ONE-LINE form `[cap]` prints: the value used, its source, and BOTH
 # observations when they disagree. `src` is never omitted: a value with no provenance is exactly what
 # made the incident's arithmetic-only inference necessary.
+#
+# ⛔ AND A PARTIAL READ SAYS SO, IN THE SAME TOKEN (agent-infra#2095 — the "confidently wrong zero").
+# `lanes=0` was printed for a box running 48-50 agents because the count came from a convention that
+# could not see them; the same shape comes back whenever the census fails HALF ITS READ: the process
+# table answers, tmux does not (or the reverse), and the token printed a bare number that reads as a
+# measurement. So every non-READ state now carries a state marker IN THE LINE AN OPERATOR GREPS:
+#
+#   state=READ        nothing appended — an unmarked token is a token that was MEASURED.
+#   state=PARTIAL     `PARTIAL(taken=<n>)` — one observation answered, the other did not. `taken` is
+#                     the worktree count the roster vocabulary uses, or `?` when even that is
+#                     unknown: a zero from an unread cell is printed as `?`, never as 0.
+#   state=UNREADABLE  `UNREADABLE(taken=<n|?>)` — nothing answered. `lanes=` still carries the value
+#                     the GATE used (so the line explains the decision), but it can no longer be
+#                     mistaken for a reading.
+# The `why=` token names the failing read, so "partial" is actionable rather than merely honest.
 orc_census_token() { # [max_lanes] — `lanes=<used>/<max>` keeps the shape operators already grep
-  local tok max="${1:-}"
+  local tok max="${1:-}" taken why
   tok="lanes=${ORC_LANES:-0}${max:+/$max} lanes_src=${ORC_LANES_SRC:-UNKNOWN}"
   [ -n "${ORC_LANES_TMUX:-}" ] && tok="$tok tmux=${ORC_LANES_TMUX}"
   [ -n "${ORC_LANES_WT:-}" ]   && tok="$tok worktrees=${ORC_LANES_WT}"
@@ -421,6 +436,16 @@ orc_census_token() { # [max_lanes] — `lanes=<used>/<max>` keeps the shape oper
   if [ -n "${ORC_LANES_TMUX:-}" ] && [ -n "${ORC_LANES_WT:-}" ] && [ "${ORC_LANES_TMUX}" -ne "${ORC_LANES_WT}" ]; then
     tok="$tok DISAGREE(tmux=${ORC_LANES_TMUX} worktrees=${ORC_LANES_WT} used=${ORC_LANES:-0})"
   fi
-  [ "${ORC_CENSUS_STATE:-}" = "UNREADABLE" ] && tok="$tok census_unreadable(${ORC_CENSUS_WHY:-?})"
+  # A `taken` that is not a number is `?`: an unread count must never be rendered as a zero.
+  case "${ORC_TAKEN:-}" in ''|*[!0-9]*) taken="?" ;; *) taken="$ORC_TAKEN" ;; esac
+  # `why` is sanitized to ONE space-free token: `orc_census` carries prose for a missing binary, and
+  # a space inside a `key=value` token splits it into two fields for every `for tok in $line` reader.
+  why="$(printf '%s' "${ORC_CENSUS_WHY:-}" | tr -c 'A-Za-z0-9._-' '_' 2>/dev/null)"
+  case "${ORC_CENSUS_STATE:-}" in
+    "") ;;
+    READ) ;;
+    PARTIAL) tok="$tok PARTIAL(taken=$taken)${why:+ why=$why}" ;;
+    *) tok="$tok UNREADABLE(taken=$taken)${why:+ why=$why}" ;;
+  esac
   printf '%s' "$tok"
 }

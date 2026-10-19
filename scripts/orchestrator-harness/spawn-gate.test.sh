@@ -830,7 +830,258 @@ ck "a NON-NUMERIC reading fails OPEN like an empty one — it is not a claim tha
 grep -q 'disk-gate.*WARN.*could not read free space' "$LOG"; rc=$?
 ck "...and a NON-NUMERIC reading is ANNOUNCED too — the predicates call it unreadable, so the log must agree" $rc
 
-# ── 12) a suite nothing RUNS is not a gate ──────────────────────────────
+# ── 12) THE CONTROLLER SPAWN POINT: a LANE may not start a controller (#2095) ────────────────
+# ⛔ REAL PROCESSES, NOT A STUBBED `ps`. The whole rule is a fact about the ANCESTRY (a lane's cwd,
+# a runner's argv, an inherited marker), so the fixture is a genuine process tree — a lane-named
+# runner in a `<repo>/.worktrees/<name>` tree that starts a shell which starts a "controller" — and
+# the SHIPPED guard is driven against real pids. A stubbed process table would test the parsing of a
+# fiction and would pass on a tree where nothing walks the chain at all.
+#
+# ⛔ AND EVERY REFUSAL HAS A MATCHING ALLOW. A guard that refuses everything passes a "refuses" test;
+# the incident was not "nothing was refused", it was "the wrong thing was allowed", so an ordinary
+# shell's child MUST be allowed or the gate is a fleet-wide outage in a helper's clothing.
+CG="$GATE"
+# ⛔ env -u ON THE ALLOW ARMS: this suite legitimately runs INSIDE a lane on the fleet, where our own
+# `pi` shim has exported ORC_AGENT_LANE — inherited evidence that would (correctly) refuse. The
+# variable is controlled explicitly in every arm below so each arm tests ONE kind of evidence.
+cg() { # cg <pid> — run the guard with a clean lane-marker environment
+  env -u ORC_AGENT_LANE -u ORC_CONTROLLER_LANE_OVERRIDE bash "$CG" --controller-guard --pid "$1" 2>/dev/null
+}
+cgrc() { # cgrc <pid> — the guard's exit status, clean env
+  env -u ORC_AGENT_LANE -u ORC_CONTROLLER_LANE_OVERRIDE bash "$CG" --controller-guard --pid "$1" >/dev/null 2>&1
+}
+CG_PIDS=""
+cg_stop() { for p in $CG_PIDS; do kill -TERM "$p" 2>/dev/null || true; done; CG_PIDS=""; }
+
+mkdir -p "$TMP/lrepo/.worktrees/lane-7" "$TMP/lrepo/.worktrees/fix-3" "$TMP/lrepo/plain" "$TMP/lO"
+# A LANE, as the harness starts one: cwd IS the worktree, argv IS the runner.
+cat > "$TMP/lO/lane.sh" <<'FIX'
+#!/bin/bash
+cd "$1" || exit 1
+exec sleep 300
+FIX
+chmod +x "$TMP/lO/lane.sh"
+( bash "$TMP/lO/lane.sh" "$TMP/lrepo/.worktrees/lane-7" >/dev/null 2>&1 & echo $! > "$TMP/lane.pid" )
+LANE_PID="$(cat "$TMP/lane.pid")"; CG_PIDS="$CG_PIDS $LANE_PID"
+# A plain shell (no lane in it): the ALLOW arm's parent.
+( cd "$TMP/lrepo/plain" && exec sleep 300 ) >/dev/null 2>&1 & PLAIN_PID=$!
+CG_PIDS="$CG_PIDS $PLAIN_PID"
+sleep 0.6
+
+got="$(cg "$PLAIN_PID")"; rc=$?
+case "$got" in
+  "controller=allow "*) rc=0 ;; *) rc=1 ;;
+esac
+ck "a controller whose ancestors are NOT a lane is ALLOWED (rc=0): ${got:0:100}" $rc
+
+# The controller of the incident: a CHILD of the lane. Its own cwd is irrelevant — the ancestry is
+# the evidence.
+( cd /tmp && exec sleep 300 ) >/dev/null 2>&1 & CTL_PID=$!
+CG_PIDS="$CG_PIDS $CTL_PID"
+sleep 0.3
+got="$(cg "$CTL_PID")"; rc=$?
+ck "a NON-lane process is still allowed (the refusal is not blanket): ${got:0:90}" $rc
+
+# A REAL lane ancestor: spawn a controller inside the lane's own session by asking the lane to run a
+# child shell. `sleep` cannot fork, so the controller is the lane's own child via a wrapper.
+cat > "$TMP/lO/ctl.sh" <<'FIX'
+#!/bin/bash
+# stands in for orch-loop.sh: it only has to EXIST as a descendant of the lane
+sleep 300
+FIX
+chmod +x "$TMP/lO/ctl.sh"
+cat > "$TMP/lO/lane2.sh" <<'FIX'
+#!/bin/bash
+cd "$1" || exit 1
+"$2" &
+echo $! > "$3"
+exec sleep 300
+FIX
+chmod +x "$TMP/lO/lane2.sh"
+rm -f "$TMP/ctl2.pid"
+( bash "$TMP/lO/lane2.sh" "$TMP/lrepo/.worktrees/lane-7" "$TMP/lO/ctl.sh" "$TMP/ctl2.pid" >/dev/null 2>&1 & echo $! > "$TMP/lane2.pid" )
+LANE2_PID="$(cat "$TMP/lane2.pid")"; CG_PIDS="$CG_PIDS $LANE2_PID"
+for _i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$TMP/ctl2.pid" ] && break; sleep 0.2; done
+CTL2_PID="$(cat "$TMP/ctl2.pid" 2>/dev/null)"
+CG_PIDS="$CG_PIDS $CTL2_PID"
+out="$(cg "$CTL2_PID")"; rc=$?
+case "$out" in
+  *"controller=refuse"*) rc=$([ $rc -ne 0 ] && echo 0 || echo 1) ;;
+  *) rc=1 ;;
+esac
+ck "THE DEFECT: a controller that is a CHILD of a lane is REFUSED (exit 79)" $rc
+grep -q 'evidence=parent_chain' <<<"$out" && grep -q 'lane=lane-7' <<<"$out"; rc=$?
+ck "...the verdict NAMES the evidence, the lane and its ancestor: ${out:0:120}" $rc
+grep -q "ancestor=$LANE2_PID" <<<"$out"; rc=$?
+ck "...and names the ANCESTOR pid ($LANE2_PID) that started it" $rc
+
+# THE DEPTH ARM: the lane is the GRANDparent. A `kill -0 $PPID`-shaped check would pass here and
+# leave the defect in place, so the walk is driven one level deeper than the direct parent.
+cat > "$TMP/lO/mid.sh" <<'FIX'
+#!/bin/bash
+cd "$1" || exit 1
+"$2" &
+echo $! > "$3"
+exec sleep 300
+FIX
+chmod +x "$TMP/lO/mid.sh"
+cat > "$TMP/lO/lane3.sh" <<'FIX'
+#!/bin/bash
+"$1" "$2" "$3" "$4" &
+echo $! > "$5"
+exec sleep 300
+FIX
+chmod +x "$TMP/lO/lane3.sh"
+rm -f "$TMP/mid.pid" "$TMP/grandctl.pid"
+( bash "$TMP/lO/lane3.sh" "$TMP/lO/mid.sh" "$TMP/lrepo/.worktrees/fix-3" "$TMP/lO/ctl.sh" "$TMP/grandctl.pid" "$TMP/mid.pid" >/dev/null 2>&1 & echo $! > "$TMP/lane3.pid" )
+LANE3_PID="$(cat "$TMP/lane3.pid")"; CG_PIDS="$CG_PIDS $LANE3_PID"
+for _i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do [ -s "$TMP/grandctl.pid" ] && break; sleep 0.2; done
+GRAND_PID="$(cat "$TMP/grandctl.pid" 2>/dev/null)"
+CG_PIDS="$CG_PIDS $(cat "$TMP/mid.pid" 2>/dev/null) $GRAND_PID"
+got="$(cg "$GRAND_PID")"; rc=$?
+case "$got" in
+  *"evidence=parent_chain"*"lane=fix-3"*) rc=0 ;;
+  *) rc=1 ;;
+esac
+ck "the WALK, not just \$PPID: a lane TWO levels up is still refused ($GRAND_PID -> ${got:0:110})" $rc
+
+# THE INHERITED-MARKER ARM: the evidence a `setsid`/reparented child still carries, and the only one
+# left when the process tree has been cut. Driven WITHOUT any lane on the chain, so this arm cannot
+# pass on the strength of the walk.
+out="$(ORC_AGENT_LANE=lane-4 env -u ORC_CONTROLLER_LANE_OVERRIDE bash "$CG" --controller-guard --pid "$PLAIN_PID" 2>/dev/null)"; rc=$?
+case "$out" in
+  *"controller=refuse"*"evidence=inherited_env"*"lane=lane-4"*) rc=0 ;;
+  *) rc=1 ;;
+esac
+ck "a controller carrying the INHERITED lane marker is refused even with no lane on the chain (rc=$rc)" $rc
+
+# THE OWN-CWD ARM: the controller was STARTED IN a worktree. No shipped start path (launchd,
+# systemd, the cell supervisor, install.sh) runs from one, so the cwd alone is proof.
+out="$(cd "$TMP/lrepo/.worktrees/lane-7" && env -u ORC_AGENT_LANE -u ORC_CONTROLLER_LANE_OVERRIDE bash "$CG" --controller-guard --pid "$PLAIN_PID" 2>/dev/null)"; rc=$?
+case "$out" in
+  *"controller=refuse"*"evidence=own_cwd"*) rc=0 ;;
+  *) rc=1 ;;
+esac
+ck "a controller whose OWN cwd is a worktree is refused (evidence=own_cwd)" $rc
+
+# AN UNREADABLE CHAIN FAILS CLOSED. A pid that does not exist cannot be judged, and "cannot be
+# judged" must never mean "allowed" — the singleton refuses an unreadable lock record for the same
+# reason.
+got="$(cg 999999999)"; rc=$?
+[ "$rc" -eq 78 ]; rc=$?
+ck "an UNREADABLE chain fails CLOSED (exit 78), never 'no lane found': $(printf '%s' "$got" | head -c 90)" $rc
+
+# THE BOUND: a `ps` that never returns must not become a hung controller start. The bound is
+# SG_READ_SECS (5 s) plus the kill grace; the assertion is generous but finite.
+mkdir -p "$TMP/hangps"
+cat > "$TMP/hangps/ps" <<'S'
+#!/bin/sh
+sleep 600
+S
+chmod +x "$TMP/hangps/ps"
+T0=$(date +%s)
+hout="$(PATH="$TMP/hangps:$PATH" env -u ORC_AGENT_LANE bash "$CG" --controller-guard --pid "$PLAIN_PID" 2>/dev/null)"; hrc=$?
+T1=$(date +%s)
+[ "$hrc" -eq 78 ] && [ $(( T1 - T0 )) -lt 40 ]; rc=$?
+ck "a HANGING process-table read is BOUNDED (${hrc} in $((T1-T0))s) and fails closed — never a hung start" $rc
+
+# THE OVERRIDE: an operator/test escape that is HONOURED, LOGGED, and named in the verdict. A
+# start-path gate with no escape can wedge a box (see the section header).
+out="$(ORC_CONTROLLER_LANE_OVERRIDE=1 ORC_AGENT_LANE=lane-4 bash "$CG" --controller-guard --pid "$PLAIN_PID" 2>/dev/null)"; rc=$?
+case "$out" in
+  *"controller=allow"*"override=ORC_CONTROLLER_LANE_OVERRIDE"*) rc=0 ;;
+  *) rc=1 ;;
+esac
+ck "ORC_CONTROLLER_LANE_OVERRIDE=1 is honoured AND named in the verdict (auditable, not silent)" $rc
+
+# THE LEDGER: allows and refusals both recorded, one row each — a series of refusals alone cannot
+# answer "how close did we get".
+LEDGER="${HOME:-}/.pi/agent/state/controller-spawn-gate.tsv"
+if [ -r "$LEDGER" ]; then
+  grep -q "$(printf '\t')""refuse""$(printf '\t')" "$LEDGER" && grep -q "$(printf '\t')""allow""$(printf '\t')" "$LEDGER"; rc=$?
+else rc=1; fi
+ck "the durable ledger records BOTH a refusal and an allow" $rc
+
+# ── THE OTHER PLATFORM, AS A CHECK ────────────────────────────────────────────────────────────
+# This box is Linux. macOS has no `pgrep -c`, no `ps -o etimes` and no `timeout(1)` AT ALL, so a
+# maintainer who reached for any of them would pass every check in this section HERE and break every
+# macOS controller start. The failure cannot be executed on this host, so the CODE (comment lines
+# excluded — the header names those tools on purpose) is asserted free of them.
+TP_HITS="$(grep -nE 'pgrep +-c|ps +-[A-Za-z]*o[^|]*etimes|(^|[|;&(]|&&|\|\||\$\() *timeout ' "$GATE" | grep -vE '^[0-9]+:[[:space:]]*#')"
+[ -z "${TP_HITS// /}" ]; rc=$?
+[ "$rc" -eq 0 ] || echo "      macOS-absent tools in use: $TP_HITS"
+ck "no macOS-absent tool is USED in the guard ('pgrep -c', 'ps -o etimes', 'timeout') — comments excluded" $rc
+# ...and the macOS HALF of the cwd read has its own check, because this host cannot run its branch:
+# the lsof `-Fn` record shape is driven on a fixture (the same shape macOS `lsof -w -a -d cwd -Fn`
+# prints), so a parser bug cannot hide behind "that path only runs on the other platform".
+printf 'p4242\nn/Users/x/repo/.worktrees/lane-7\np5353\nn/Users/x\np6363\nn/Users/x/orchestrator\n' > "$TMP/lsof.txt"
+LOW_OUT="$(bash -c '. "$1"; sg_parse_lsof "$2"' _ "$GATE" "$TMP/lsof.txt")"
+[ "$(printf '%s\n' "$LOW_OUT" | wc -l | tr -d ' ')" = "3" ] \
+  && grep -q "^4242	/Users/x/repo/.worktrees/lane-7\$" <<<"$LOW_OUT" \
+  && grep -q "^6363	/Users/x/orchestrator\$" <<<"$LOW_OUT"; rc=$?
+ck "the macOS lsof parser maps every p/n record to 'pid<TAB>cwd' (driven on a fixture here)" $rc
+tok_lane="$(bash -c '. "$1"; sg_lane_token "$(printf "%s\n" "$2" | awk -F"\t" "\$1==4242{print \$2}")"' _ "$GATE" "$LOW_OUT")"; rc=$?
+[ "$tok_lane" = "lane-7" ]; rc=$?
+ck "...and a cwd read that way resolves to the LANE token ($tok_lane)" $rc
+
+cg_stop
+
+# ── 13) THE WIRING: the REAL orch-loop.sh must refuse, and must still start when allowed ──────
+# ⛔ A GUARD NOBODY CALLS IS NOT A GUARD. The fixture above proves the predicate; these two arms
+# prove the CONTROLLER uses it — one by exiting 79 as a lane's child, one by reaching its own
+# `[start]` record with no lane in its ancestry.
+CGD="$TMP/cgdeploy"
+mkdir -p "$CGD/logs" "$CGD/state"
+cp "$HERE"/*.sh "$CGD"/ 2>/dev/null
+CG_REPO="$TMP/cgrepo"
+mkdir -p "$CG_REPO"
+git -C "$CG_REPO" init -q 2>/dev/null || true
+# (a) REFUSED: the real controller, started by a lane.
+rm -f "$TMP/realctl.rc"
+cat > "$TMP/lO/runreal.sh" <<FIX
+#!/bin/bash
+cd "$TMP/lrepo/.worktrees/lane-7" || exit 1
+cd /tmp || exit 1
+REPO="$CG_REPO" ORC_STATE_DIR="$CGD" env -u ORC_AGENT_LANE -u ORC_CONTROLLER_LANE_OVERRIDE \\
+  bash "$CGD/orch-loop.sh" >"$TMP/realctl.out" 2>&1
+echo \$? > "$TMP/realctl.rc"
+exec sleep 300
+FIX
+chmod +x "$TMP/lO/runreal.sh"
+rm -f "$TMP/runreal.pid"
+( bash "$TMP/lO/lane2.sh" "$TMP/lrepo/.worktrees/lane-7" "$TMP/lO/runreal.sh" "$TMP/runreal.pid" >/dev/null 2>&1 & echo $! > "$TMP/lane4.pid" )
+CG_PIDS="$CG_PIDS $(cat "$TMP/lane4.pid")"
+for _i in $(seq 1 50); do [ -s "$TMP/realctl.rc" ] && break; sleep 0.2; done
+RRC="$(cat "$TMP/realctl.rc" 2>/dev/null)"
+[ "$RRC" = "79" ]; rc=$?
+ck "the REAL orch-loop.sh REFUSES to start as a lane's child (exit 79, got '${RRC:-<no exit>}')" $rc
+grep -q 'REFUSING TO START — a LANE started this controller' "$TMP/realctl.out" 2>/dev/null; rc=$?
+ck "...loudly, on stderr, naming the lane parent" $rc
+grep -q '^\[controller-gate\] refused' "$CGD/logs/orch-loop.log" 2>/dev/null; rc=$?
+ck "...and it is RECORDED in the state dir's log (an operator reads the log, not a terminal)" $rc
+[ ! -e "$CGD/.orch.lock" ]; rc=$?
+ck "the refused instance never took the state lock (the check runs BEFORE the singleton)" $rc
+cg_stop
+
+# (b) ALLOWED: the same controller, no lane in its ancestry, reaches its own [start] record. MAX_LOAD=0
+# keeps this fixture from spawning anything; the assertion is the gate's verdict, not a cycle.
+ALOG="$TMP/cgallowed/logs/orch-loop.log"
+mkdir -p "$TMP/cgallowed/logs" "$TMP/cgallowed/state"
+cp "$HERE"/*.sh "$TMP/cgallowed"/ 2>/dev/null
+cg_allow_run() {
+  env -u ORC_AGENT_LANE -u ORC_CONTROLLER_LANE_OVERRIDE REPO="$CG_REPO" ORC_STATE_DIR="$TMP/cgallowed" \
+    MAX_LOAD=0 bash "$TMP/cgallowed/orch-loop.sh" >>"$ALOG" 2>&1 &
+  APID=$!
+  for _i in $(seq 1 60); do grep -q '^\[start\] ' "$ALOG" 2>/dev/null && break; kill -0 "$APID" 2>/dev/null || break; sleep 0.2; done
+  kill -TERM "$APID" 2>/dev/null || true; wait "$APID" 2>/dev/null || true
+}
+( cd /tmp && cg_allow_run )
+grep -q '\[controller-gate\] verdict allow ' "$ALOG" 2>/dev/null; rc=$?
+ck "an ALLOWED start RECORDS its verdict (an allow with no record cannot be told from a guard that never ran)" $rc
+grep -q '^\[start\] ' "$ALOG" 2>/dev/null; rc=$?
+ck "an ALLOWED controller reaches its own [start] record — the gate is not a blanket refusal" $rc
+
+# ── 14) a suite nothing RUNS is not a gate ──────────────────────────────
 # ⛔ THIS SUITE IS NOW A REGISTERED CI SHARD (review round 2, P1). It was not, and the block that
 # stood here said `scripts/run-bash-shards.sh` was "held by concurrent lanes (PR #1769/#1730), so the
 # entry cannot be added from here". #1769 is MERGED (a5fa100, an ancestor of this head) — and, more to
