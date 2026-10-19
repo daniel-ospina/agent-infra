@@ -153,20 +153,33 @@ bound() { # bound <seconds> <cmd...>
   if [ -n "$TIMEOUT_BIN" ] && command -v "$TIMEOUT_BIN" >/dev/null 2>&1; then
     "$TIMEOUT_BIN" "$s" "$@"; return $?
   fi
-  local p w rc
+  local p w rc pf sp
+  pf="$(mktemp "${TMPDIR:-/tmp}/lane-reap-bound.XXXXXX" 2>/dev/null)" || pf=""
   "$@" &
   p=$!
   # ⛔ THE WATCHDOG MUST KILL ITS OWN `sleep` WHEN IT IS ENDED (#2163 review, P2). `kill "$w"` ends
   # the subshell, not the `sleep <bound>` it forked — so the fallback (the ONLY path macOS takes)
   # orphaned one sleeper per read, i.e. ~2 per lane per controller cycle, created by the instrument
-  # that exists to make the process population visible. The TERM trap below kills the sleeper.
-  ( trap 'kill "${sp:-0}" 2>/dev/null; exit 0' TERM
+  # that exists to make the process population visible.
+  # TWO mechanisms, because neither alone is race-free: the subshell traps TERM and kills its
+  # sleeper, AND it records the pid in a file the PARENT reads after the subshell is gone. The trap
+  # alone lost the race when TERM arrived between the fork and `sp=$!` (measured: 2-3 of 8 reads
+  # orphaned); the parent's file read cannot (it happens after `wait "$w"`).
+  ( trap '[ -n "${sp:-}" ] && kill "$sp" 2>/dev/null; exit 0' TERM
     "$SLEEP_BIN" "$s" & sp=$!
+    [ -n "$pf" ] && printf '%s' "$sp" > "$pf" 2>/dev/null
     wait "$sp"
     kill -TERM "$p" 2>/dev/null; "$SLEEP_BIN" 1; kill -KILL "$p" 2>/dev/null ) >/dev/null 2>&1 &
   w=$!
   wait "$p"; rc=$?
   kill -TERM "$w" 2>/dev/null; wait "$w" 2>/dev/null
+  if [ -n "$pf" ]; then
+    sp="$(cat "$pf" 2>/dev/null)"
+    case "$sp" in ''|*[!0-9]*) ;; *) kill -KILL "$sp" 2>/dev/null ;; esac
+    rm -f "$pf"
+  fi
+  # STATED RESIDUAL: if `mktemp` failed, `pf` is empty and only the TERM trap protects the sleeper;
+  # a trap that loses its race leaves ONE `sleep <s>` (bounded by READ_TIMEOUT) to expire on its own.
   return "$rc"
 }
 
@@ -364,18 +377,26 @@ mtime_epoch() { # prints epoch seconds, or nothing when unreadable
 host_verdict() { # <tablefile> <pid>
   local apid acmd low exe
   while IFS=$'\t' read -r apid acmd; do
-    # ⛔ THE EXECUTABLE, NOT THE ARGUMENT TEXT (#2163 review, P2). Matching the whole argv meant a
-    # `cmux.app` token in an ancestor's PROMPT/`-c` payload returned `fleet` and stopped the walk
-    # before a real `Terminal.app` above it was examined — the kill path decided by text a user (or
-    # a brief) wrote. A host application is identified by the program that IS the ancestor, so only
-    # the first token is classified; everything after it is an argument and decides nothing.
-    exe="${acmd%%[[:space:]]*}"
-    low="$(printf '%s' "$exe" | tr '[:upper:]' '[:lower:]')"
+    low="$(printf '%s' "$acmd" | tr '[:upper:]' '[:lower:]')"
+    # ⛔ THE TWO MARKER SETS HAVE DELIBERATELY DIFFERENT POLARITIES (#2163 review, P2 — and cycle 4
+    # corrected this comment, which had claimed both were executable-only).
+    # HUMAN is matched ANYWHERE in the ancestor's argv: a prompt or `-c` payload that merely mentions
+    # `Terminal.app` then over-REFUSES (the lane is spared), which is the safe direction — and it also
+    # covers an executable PATH that contains a space (`/Applications/My Apps/Terminal.app/…`), which
+    # a first-token split would miss and turn into a fail-OPEN `unknown`.
     case "$low" in
       *terminal.app*|*iterm*|*warp.app*|*kitty.app*|*alacritty.app*|*hyper.app*|*sshd*)
         printf 'human\n'; return 0 ;;
-      *cmux.app*|*cmuxterm*)
-        printf 'fleet\n'; return 0 ;;
+    esac
+    # FLEET is decided on the EXECUTABLE ONLY (the first token): accepting a `/…cmux.app/…` path in
+    # an ARGUMENT made an ancestor's `PATH=…`/prompt text return `fleet` and `return` before a real
+    # human terminal above it was examined — the kill-path fail-open, reproduced by review. A cmux
+    # path containing a SPACE is therefore classified `unknown`, which is permissive only in the
+    # sense that it does not REFUSE (the population still requires the lane's own log evidence).
+    exe="${acmd%%[[:space:]]*}"
+    exe="$(printf '%s' "$exe" | tr '[:upper:]' '[:lower:]')"
+    case "$exe" in
+      */cmux.app/*|cmuxterm|*/cmuxterm|cmux) printf 'fleet\n'; return 0 ;;
     esac
   done < <(ancestry "$1" "$2" | tail -n +2)
   printf 'unknown\n'
