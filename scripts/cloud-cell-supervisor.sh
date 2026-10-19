@@ -1198,10 +1198,15 @@ cmd_check() {
   # contract — a false "CELL CAN RUN A CONTROLLER" (repo-authority.sh, review round 4).
   say "ok: HOME, harness, tmux, gh auth, repo, state dir"
   local missing="" w
+  # ⛔ repo-slug.sh IS IN THIS LIST (review round 3, finding 1). orch-loop.sh SOURCES it from $O and
+  # `exit 78`s without it, and refresh-candidates.sh refuses without it — so a $O missing it is a
+  # controller that crash-loops under KeepAlive. Omitting it here made `check` — the verb an operator
+  # runs BECAUSE the box looks stuck — print "CELL CAN RUN A CONTROLLER" for exactly that box. Same
+  # reasoning as repo-authority.sh: a sourced-at-startup dependency is a required worker.
   # cloud-cell-doctor.sh is launched from $O by `start` (the doctor loop), so its absence is the same
   # false "CELL CAN RUN A CONTROLLER" the rest of this list exists to prevent: the controller would
   # run, `start` would report success, and the cell would never reap or land anything.
-  for w in orch-loop.sh claims.sh repo-authority.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do
+  for w in orch-loop.sh claims.sh repo-authority.sh repo-slug.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do
     [ -f "$O/$w" ] || missing="$missing $w"
   done
   [ -z "$missing" ] || die "worker scripts missing from $O:$missing — run 'start' (it seeds $O) or: cp '$HARNESS'/*.sh '$O'/"

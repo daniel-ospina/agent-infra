@@ -42,7 +42,8 @@ is_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; 0) return 0 ;; 0*) return 1
 # fail-open policy. `is_limit` (is_num AND at most 9 digits) is the predicate orch-loop.sh applies to
 # every other tunable for exactly this reason, and 9 digits cannot overflow the sum below.
 is_limit() { is_num "${1:-}" && [ "${#1}" -le 9 ]; }
-KIND=reviewer; TAG="$PR"
+# ⛔ EXPORTED for the same reason as lane.sh: the SPAWN POINT is a child process (#1884).
+KIND=reviewer; TAG="$PR"; export KIND TAG
 O="${O:-$HOME/orchestrator}"; mkdir -p "$O/logs" "$O/state"
 L="$O/logs/merge-$PR"
 export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
@@ -586,6 +587,19 @@ Your comment MUST state the outcome plainly and MUST NOT contain an unresolved a
 Do NOT modify code, commit, or merge.
 EOF
 run_agent "${REVIEW_TIMEOUT:-1800}" "$L.log" "$L-reviewer.txt"
+AGENT_RC=$?
+# ⛔ A REFUSAL AT THE SPAWN POINT IS NOT A VERDICT (agent-infra#1884). This file carries its OWN
+# `run_agent()` with no load gate of its own (the header's named residual), so the installed `pi`
+# shim is the only load gate this path has — and its refusal arrives as rc=76. Without this arm the
+# empty verdict falls into the `*)` arm below and records `needsfix-<PR>-<head>`, authorising a FIXER
+# for a review that never happened: a MAX_FIX_TRIES attempt burnt per refusal, and the PR eventually
+# parked "needs a human" having never had a review. That is the #1716/#1720 class, one worker over.
+# So: no marker, the harness's own AGENT_LOAD_REFUSED code, and the controller re-dispatches when the
+# box quietens (75 is what adopt-fix/chain-merge already propagate for this).
+if [ "$AGENT_RC" = "${PI_GATE_REFUSED:-76}" ]; then
+  echo "[merge $PR] reviewer NOT started (pi spawn-point load gate) — no verdict, NO needsfix marker; re-dispatched when 1-min load falls below MAX_LOAD" >> "$L.log"
+  exit 75
+fi
 LAST="$(grep -aE '^(CLEAN|ISSUES) ' "$L.log" | tail -1 | tr -d '\r')"
 echo "[merge $PR] verdict: ${LAST:-<none>}" >> "$L.log"
 

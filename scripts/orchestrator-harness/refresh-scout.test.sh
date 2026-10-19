@@ -814,13 +814,28 @@ else
   bad "orch-loop: could not extract queue_state_token (or is_num) from the shipped loop"
 fi
 # The two lines a human actually reads beside `backlog=`: the per-cycle heartbeat line, and the
-# 'backlog empty' claim that used to read as "nothing to do" even when the pool was unreadable.
+# funnel line that replaced the dishonest 'backlog empty' claim.
 grep -q 'backlog=\$(wc -l.*queue=\$(queue_state_token)' "$LOOP" \
   && ok "orch-loop: the per-cycle heartbeat line carries the state beside the backlog" \
   || bad "orch-loop: the cycle line does not carry the pool state"
-grep -q '\[dispatch\] backlog empty queue=\$(queue_state_token)' "$LOOP" \
-  && ok "orch-loop: the 'backlog empty' claim carries the state, so blindness cannot read as stillness" \
-  || bad "orch-loop: 'backlog empty' is still printed without the state"
+# ⛔ THE INVARIANT MOVED WITH THE DEFECT (agent-infra#2040). `[dispatch] backlog empty` is GONE:
+# measured on all three cloud cells for hours, it printed `backlog empty queue=READ(223)` while 223
+# candidates had been read and every one was filtered away — a claim that was false every cycle.
+# The replacement must therefore satisfy TWO properties, and the second is the one that would have
+# caught #2040: the funnel line always carries the queue state, AND it decomposes the funnel (it
+# names where the candidates went) instead of asserting emptiness. An `==` on the funnel call alone
+# would pass on a line that printed a bare "0 dispatched".
+grep -q 'dispatch_funnel 0 "$(queue_state_token)"' "$LOOP" \
+  && ok "orch-loop: the no-dispatch line carries the queue state (through the funnel)" \
+  || bad "orch-loop: the no-dispatch line does not carry the queue state"
+# Anchored on the EMITTING form (`echo "[dispatch] backlog empty…`), not on the phrase: the phrase
+# still appears in the comments that record WHY it was removed, and a comment is not a claim.
+grep -q 'echo "\[dispatch\] backlog empty' "$LOOP" \
+  && bad "orch-loop: 'backlog empty' is STILL printed — that claim is what hid a 223-candidate / 0-dispatched funnel for hours" \
+  || ok "orch-loop: the false 'backlog empty' claim is gone (a filtered-to-zero funnel can no longer read as stillness)"
+grep -q '^dispatch_funnel() {' "$LOOP" && grep -q 'candidates -> ' "$LOOP" \
+  && ok "orch-loop: the dispatch funnel DECOMPOSES the pool (listed candidates -> per-reason counts -> dispatched)" \
+  || bad "orch-loop: the funnel line does not decompose the pool"
 
 # ── an unwritable state dir REFUSES, it is not absorbed ───────────────────────────────────────
 # `mkdir -p "$O"` was unchecked and every write below it was too, so a non-directory `$O` finished with
@@ -1055,7 +1070,166 @@ case "$OUT" in
   *) bad "degraded COLLISION: the second pass is silent about the degradation — output: $OUT" ;;
 esac
 
-# ── 1h) A NETWORK FAULT IS TRANSIENT, NOT PERMANENT (agent-infra#1853 review P1) ────────────────
+# ── 1i) THE PRE-FLIGHT'S HOLDER SURFACE NEEDS cmux — THE COLLECTOR MUST BE ABLE TO RUN IT ───────
+# THE DEFECT (measured 2026-10-18, the drained-backlog P0). The collision pre-flight's
+# `issue assignee/holder` surface reads lane liveness from the fleet board, and the board's ONLY
+# source for it is `cmux sessions list --json --all` (tortoise `tools/fleet_state.py`
+# `live_sessions()`). When that cannot run, `liveness_measured` is False, the board carries
+# `orphans[kind=liveness-unmeasured]`, and the pre-flight refuses to read an unmeasured liveness as a
+# dead owner (fail-closed, #8175) — so the surface is INCOMPLETE, EVERY candidate's verdict is
+# unusable, and the refresh aborts BY DESIGN (#1736) on every cycle. Measured on the Mac fleet box:
+# `candidates.txt: 0`, `checked.txt: 310`, pool READ(203), `lanes: 1`, and every pass logging
+#   [refresh] ?#1981 INCOMPLETE from the pre-flight (it could not query every surface)
+#   [refresh] ABORT: none of the 6 candidate(s) the pre-flight ran produced a usable verdict
+# with `command -v cmux` failing under the daemon PATH
+#   /Users/home/orchestrator/gh-rest:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+# (`cmux` lives in the app bundle /Applications/cmux.app/Contents/Resources/bin, which an interactive
+# LOGIN shell gets from cmux's own shim setup — launchd reads no profile, and `install.sh` never probed
+# it either, so a fresh install reproduced the same PATH).
+#
+# TWO CASES, because the repair has two halves and a host that HAS cmux would silently cover for both:
+#   (A) the SHIPPED resolver, driven as an extracted block with a PATH that really cannot resolve cmux
+#       — the only way to ask "does the repair happen?" on a box that already has the tool;
+#   (B) the END-TO-END property: an unmeasurable holder surface aborts the pass and never reports an
+#       empty backlog as "no work", while a measurable one queues the candidate.
+# ⛔ A PRE-FLIGHT STAND-IN, not the real tortoise tool: this suite is offline and hermetic. It
+# reproduces tortoise's fail-closed shape exactly (a surface that cannot be measured is INCOMPLETE, and
+# an INCOMPLETE is never a verdict), so what is asserted is the SHIPPED script's behaviour.
+echo; echo "── cmux: an unmeasurable holder surface drains the backlog, and the collector must repair it ──"
+awk '/^resolve_cmux\(\) \{/{f=1} f{print} f&&/^\}$/{exit}' "$REFRESH" > "$T/cmux-resolver.sh"
+if [ -s "$T/cmux-resolver.sh" ] && grep -q 'cmux.app/Contents/Resources/bin' "$T/cmux-resolver.sh"; then
+  mk_cmux_stub() {  # <dir> — a cmux that answers `sessions list` and nothing else
+    mkdir -p "$1"
+    cat > "$1/cmux" <<'SH'
+#!/bin/bash
+[ "$1 $2" = "sessions list" ] || exit 2
+printf '%s\n' '{"sessions":[]}'
+SH
+    chmod +x "$1/cmux"
+  }
+  CR="$T/cmuxres"; mkdir -p "$CR/bin" "$CR/home" "$CR/bare"
+  # A PATH that cannot resolve cmux: the two dirs the shipped script appends are MASKED by an empty
+  # PATH for the driver (the driver calls the function directly, so nothing else needs them).
+  { echo 'set -u'; echo 'PATH="$1"; HOME="$2"; export PATH HOME'; cat "$T/cmux-resolver.sh"
+    echo 'CMUX_HINT=""; if resolve_cmux; then printf "RESOLVED %s|%s\n" "$(command -v cmux)" "$PATH"; else echo "UNRESOLVED"; fi'
+  } > "$CR/drive.sh"
+  bash -n "$CR/drive.sh" && ok "cmux: the resolver driver parses" || bad "cmux: the resolver driver does not parse"
+  mk_cmux_stub "$CR/home/Applications/cmux.app/Contents/Resources/bin"
+  out="$(bash "$CR/drive.sh" "$CR/bare" "$CR/home")"
+  # Non-vacuity FIRST: with the bundle on no PATH, the tool really is unqueryable — this is the
+  # controller's state, and the assertion below is worthless without it.
+  ( PATH="$CR/bare" command -v cmux >/dev/null 2>&1 ) \
+    && bad "cmux: non-vacuity — 'cmux' resolves from a bare PATH, so the case cannot see the repair" \
+    || ok "cmux: non-vacuity — a bare PATH cannot resolve cmux (the controller's shape)"
+  case "$out" in
+    *"RESOLVED $CR/home/Applications/cmux.app/Contents/Resources/bin/cmux|"*)
+      ok "cmux: the SHIPPED resolver finds and uses \$HOME/Applications/cmux.app/Contents/Resources/bin" ;;
+    *) bad "cmux: the resolver did not repair PATH — output: $out" ;;
+  esac
+  case "$out" in
+    *"$CR/home/Applications/cmux.app/Contents/Resources/bin/cmux|"*) ok "cmux: 'cmux' resolves inside the app bundle afterwards" ;;
+    *) bad "cmux: cmux still does not resolve after the repair — output: $out" ;;
+  esac
+  # ⛔ APPEND, NEVER PREPEND: that bundle directory also ships `open`, `ghostty`, `grok` and `muse`,
+  # so prepending it would shadow /usr/bin/open for every child of the pass.
+  case "$out" in
+    *"|$CR/bare:$CR/home/Applications/cmux.app/Contents/Resources/bin") ok "cmux: the bundle directory is APPENDED (it cannot shadow /usr/bin/open)" ;;
+    *) bad "cmux: the bundle directory was not appended last — output: $out" ;;
+  esac
+  # ...and with the seam honoured, and with nothing anywhere, the two clear answers.
+  mk_cmux_stub "$CR/seam"
+  out="$(bash "$CR/drive.sh" "$CR/bare" "$CR/bare" )"
+  # ⛔ HOST-DEPENDENT BY NATURE, and stated rather than faked: the resolver's last candidate is the
+  # SYSTEM bundle, so on a box that has /Applications/cmux.app the "nothing anywhere" state cannot be
+  # built here. Assert the answer the host can actually give instead of skipping the case.
+  if [ -x /Applications/cmux.app/Contents/Resources/bin/cmux ]; then
+    case "$out" in
+      *"RESOLVED /Applications/cmux.app/Contents/Resources/bin/cmux|"*)
+        ok "cmux: with nothing under \$HOME the resolver falls back to the SYSTEM bundle (this host installs one)" ;;
+      *) bad "cmux: the system-bundle fallback did not fire — output: $out" ;;
+    esac
+  else
+    case "$out" in
+      UNRESOLVED*) ok "cmux: nothing to resolve anywhere -> the resolver SAYS SO (it does not claim a repair)" ;;
+      *) bad "cmux: an unresolvable cmux was reported as repaired — output: $out" ;;
+    esac
+  fi
+  { echo 'set -u'; echo 'PATH="$1"; HOME="$2"; CMUX_BIN_DIR="$3"; export PATH HOME CMUX_BIN_DIR'; cat "$T/cmux-resolver.sh"
+    echo 'CMUX_HINT=""; if resolve_cmux; then printf "RESOLVED %s\n" "$(command -v cmux)"; else echo "UNRESOLVED"; fi'
+  } > "$CR/drive-seam.sh"
+  out="$(bash "$CR/drive-seam.sh" "$CR/bare" "$CR/home" "$CR/seam")"
+  case "$out" in *"$CR/seam/cmux"*) ok "cmux: \$CMUX_BIN_DIR is honoured (the operator seam works without a bundle)" ;;
+                 *) bad "cmux: \$CMUX_BIN_DIR was ignored — output: $out" ;; esac
+else
+  bad "the cmux resolver could not be extracted from the shipped refresh-candidates.sh (deleted, or its anchor moved)"
+fi
+
+# (B) THE PROPERTY, end to end: the pass must ABORT when the holder surface cannot be measured, and
+# QUEUE when it can. `$D/bin` is first on the pass's PATH, so the sandbox's cmux decides — a host that
+# has its own cmux cannot make either case pass vacuously.
+mk_holder_preflight() {  # <case-dir> — CLEAN iff `cmux sessions list` really runs
+  mkdir -p "$1/repo/.worktrees/dispatch-scout/tools"
+  cat > "$1/repo/.worktrees/dispatch-scout/tools/collision_preflight.py" <<'PY'
+#!/usr/bin/env python3
+import shutil, subprocess, sys
+cmux = shutil.which("cmux")
+measured = bool(cmux) and subprocess.run(
+    [cmux, "sessions", "list", "--json", "--all"],
+    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+if measured:
+    print("VERDICT: CLEAN")
+    raise SystemExit(0)
+print("SURFACE  issue assignee/holder  INCOMPLETE  0  the board's live-session store could not be read")
+print("VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be queried (issue assignee/holder); NOT clean")
+raise SystemExit(2)
+PY
+  chmod +x "$1/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+}
+mk_case cmux-unmeasurable
+mk_holder_preflight "$D"
+mk_gh_rest "$D" 42
+printf '#!/bin/bash\nexit 127\n' > "$D/bin/cmux"; chmod +x "$D/bin/cmux"   # resolves, cannot run
+echo 99 > "$D/o/candidates.txt"
+rf "$D" refresh
+[ "$RC" -ne 0 ] && ok "cmux-unmeasurable: the pass ABORTS (rc=$RC) — an unjudged pool is not a success" \
+               || bad "cmux-unmeasurable: rc=0 — a pass that judged nothing reported a healthy empty backlog"
+case "$OUT" in
+  *"judged NOTHING"*) ok "cmux-unmeasurable: the abort names what happened" ;;
+  *) bad "cmux-unmeasurable: the abort does not name the cause — output: $OUT" ;;
+esac
+case "$OUT" in
+  *"checked "*"backlog now"*) bad "cmux-unmeasurable: printed \"checked N; backlog now 0\" over judgments that never happened" ;;
+  *) ok "cmux-unmeasurable: the false empty-backlog report is suppressed" ;;
+esac
+case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
+  *42*) bad "cmux-unmeasurable: queued candidates from an unmeasurable verdict" ;;
+  *99*) ok "cmux-unmeasurable: nothing is queued (seed 99 intact, #42 absent)" ;;
+  *) bad "cmux-unmeasurable: the backlog was clobbered — candidates='$(cat "$D/o/candidates.txt" 2>/dev/null)'" ;;
+esac
+
+mk_case cmux-measurable
+mk_holder_preflight "$D"
+mk_gh_rest "$D" 42
+cat > "$D/bin/cmux" <<'SH'
+#!/bin/bash
+[ "$1 $2" = "sessions list" ] || exit 2
+printf '%s\n' '{"sessions":[]}'
+SH
+chmod +x "$D/bin/cmux"
+echo 99 > "$D/o/candidates.txt"
+rf "$D" refresh
+[ "$RC" -eq 0 ] && ok "cmux-measurable: the pass SUCCEEDS (rc=0) once the surface can be measured" \
+               || bad "cmux-measurable: rc=$RC — output: $OUT"
+case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
+  *42*) ok "cmux-measurable: #42 reached the backlog — the property the drain was about" ;;
+  *) bad "cmux-measurable: nothing queued — candidates='$(cat "$D/o/candidates.txt" 2>/dev/null)'" ;;
+esac
+case "$OUT" in
+  *"judged NOTHING"*) bad "cmux-measurable: the pass still aborted with a usable verdict available" ;;
+  *) ok "cmux-measurable: no \"judged NOTHING\" abort" ;;
+esac
+
+# ── 1j) A NETWORK FAULT IS TRANSIENT, NOT PERMANENT (agent-infra#1853 review P1) ────────────────
 # The discriminator is the PRESENCE OF A STORED CREDENTIAL, not gh's prose. MEASURED on gh 2.97.0
 # behind a dead proxy (`HTTPS_PROXY=http://127.0.0.1:1`): a PURE transport fault still prints "The
 # token in ~/.config/gh/hosts.yml is invalid.", so any text match on `invalid` classes an outage as
@@ -1617,11 +1791,40 @@ esac
 # read CLEAN before either claims). The shipped batch block is extracted VERBATIM and driven against
 # a real local origin with a real claims.sh, so the assertion is about the shipped code, not a
 # re-implementation.
-awk '/if \[ -z/ && /GATE_WHY/ {f=1} f{print} f&&/^    done < /{exit}' \
+# ⛔ ANCHORED ON THE BATCH BODY, NOT ON `if [ -z …GATE_WHY` (review round 7). That pattern also
+# matches the RELEASE branch above it, so the extraction began ~40 lines early: the fixture ran code
+# this section does not describe (and a `command not found` inside it is swallowed by the harness's
+# `2>/dev/null`, which would blame "nothing was batched"). The batch body starts at `: > "$O/.batch"`,
+# so the opening `if` is SYNTHESISED and the body is copied verbatim from there.
+awk '/^    : > "\$O\/\.batch"; K=0$/ { print "  if [ -z \"$GATE_WHY\" ]; then"; f=1 } f { print } f && /^    done < / { exit }' \
   "$LOOP" > "$T/dispatchblock.sh"
 printf '\nfi\n' >> "$T/dispatchblock.sh"
 if [ -s "$T/dispatchblock.sh" ] && grep -q 'claim_issue_acquire' "$T/dispatchblock.sh"; then
   ok "orch-loop: the dispatch block (with the issue claim) is extractable from the shipped loop"
+  # ⛔ THE ANCHOR MUST START AT THE DISPATCH BLOCK (review round 7). `if [ -z … && /GATE_WHY/` also
+  # matches the RELEASE branch above it, so the extraction silently began ~40 lines early and embedded
+  # a call (`mp_release`) this fixture does not define — swallowed by `2>/dev/null`, so a future
+  # unguarded call there would report "nothing was batched" and blame the wrong block.
+  # ⛔ AND THE SYNTHESISED `if` MUST MATCH THE SHIPPED GUARD (review round 8, P1). The fixture invents
+  # its opening line, so replacing the shipped entry condition with `if true; then` — dispatch past
+  # EVERY gate — stayed green. The line immediately above the anchor IS the shipped guard; assert it.
+  _anchor_ln="$(grep -n '^    : > "\$O/\.batch"; K=0$' "$LOOP" | head -1 | cut -d: -f1)"
+  _guard_line=""
+  [ -n "$_anchor_ln" ] && _guard_line="$(sed -n "$(( _anchor_ln - 1 ))p" "$LOOP")"
+  if [ "$_guard_line" = '  if [ -z "$GATE_WHY" ]; then' ]; then
+    echo "  ok orch-loop: the batch block is guarded by [ -z \"\$GATE_WHY\" ] exactly as the fixture assumes"
+    PASS=$((PASS+1))
+  else
+    echo "  FAIL the shipped guard above the batch body is not the one the fixture synthesises: '${_guard_line}'"
+    FAIL=$((FAIL+1))
+  fi
+  if grep -q 'mp_release\|mp_block_marker\|mp_released_marker' "$T/dispatchblock.sh"; then
+    echo "  FAIL the extracted dispatch block carries the release branch — the anchor is not the batch block"
+    FAIL=$((FAIL+1))
+  else
+    echo "  ok orch-loop: the extracted block is the BATCH block, not the release branch above it"
+    PASS=$((PASS+1))
+  fi
   # db <sandbox> — run the shipped block with $O/candidates.txt = 42 and $BATCH=1. The registry is
   # the SHIPPED claims.sh, sourced from $O with CLAIM_REPO set exactly as the loop's own cycle does
   # (sourcing it here is what makes `declare -f claim_issue_acquire` true, as it is in the daemon).
