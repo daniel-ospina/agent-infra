@@ -17,9 +17,10 @@
 #      fork lacked.
 #   2. NO RESURRECTED FORK — for each --fork <dir>, NONE of the SHARED files may exist there. The
 #      retired location must stay retired; a pointer README is fine, a script is a fork.
-#   3. THE DEPLOYED COPY IS THE SAME BYTES — for the deployed dir (env O, or --o), each SHARED file
-#      must be present and hash-identical to canonical. This is the half that caught `gh-limit.py`
-#      sitting one generation behind on the live box while 36 of 37 other files matched.
+#   3. THE DEPLOYED COPY IS THE SAME BYTES — for the deployed dir (env O, or --o), the EXECUTED set
+#      (what the daemon actually sources/runs) must be PRESENT, and every `*.sh` present must be
+#      hash-identical to canonical. This is the half that caught `gh-limit.py` sitting one generation
+#      behind on the live box while 36 of 37 other files matched.
 #
 # EXIT CODES — the same vocabulary as check-deployed-drift.sh, for the same reason:
 #   0  every requested assertion passed
@@ -122,7 +123,13 @@ for fork in ${FORKS[@]+"${FORKS[@]}"}; do
     diverge "retired fork has reappeared: $fork/$f ($(hash_of "$fork/$f" | cut -c1-12))  → delete it; the canonical copy is $HERE/$f"
   done
   [ "$fork_files" -gt 0 ] && targets=$((targets + 1))
-  [ "$fork_files" -eq 0 ] && note "ok: retired location holds no harness scripts ($fork)"
+  # ⛔ THE "ok" LINE NAMES WHAT WAS ACTUALLY LOOKED FOR (review P1, cycle 2). It used to say "holds no
+  # harness scripts", which reads as "no fork here" when the arm had only looked for the curated SHARED
+  # set — 17 of the 26 *.sh were outside it, so a fork of `dispatch-merge.sh` alone printed ok and
+  # exited 0. The scope is part of the answer, on the same line, in every mode (including --quiet,
+  # which suppresses note() — hence the plain echo). The set stays curated: `merge-one.sh` is the
+  # DELIBERATE exclusion named on the same line, and the deployed arm byte-compares every `*.sh`.
+  [ "$fork_files" -eq 0 ] && echo "ok: $fork holds none of the ${checked_canon} fork-arm files ($(printf '%s\n' $SHARED | paste -sd, - 2>/dev/null || printf '%s\n' $SHARED | tr '\n' ',')) — merge-one.sh deliberately excluded (tortoise keeps the only copy of the unported #8484/#8589 fix, README §11); the other files are covered by the --o byte arm"
 done
 
 # ── 3. THE DEPLOYED COPY IS THE SAME BYTES ───────────────────────────────────────

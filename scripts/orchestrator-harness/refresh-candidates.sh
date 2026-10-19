@@ -1861,7 +1861,14 @@ while read -r N; do
       usable=$((usable + 1)); V_LANDED=$((V_LANDED + 1))
       n=$((n + 1))     # a SLOT is filled: the issue has left the pool, so the head moved (#1729)
       rm -f "$O/state/pretry-$N" 2>/dev/null
-      echo "$N" >> "$O/landed.txt"
+      # ⛔ CHECKED, LIKE EVERY OTHER STATE WRITE (review N6). The rule three hundred lines up says
+      # "EVERY STATE WRITE IS CHECKED"; this one was not. A failed append here does not lose work (the
+      # issue is CLOSED, so the pool no longer lists it) but it WOULD make the pass claim a landed
+      # record it never persisted — and landed.txt is the set the pass NAMES on stdout and the reaper
+      # settles. Recoverable: the next pass sees the closed issue again and retries the append.
+      if ! printf '%s\n' "$N" >> "$O/landed.txt"; then
+        echo "[refresh] ⚠️ #$N LANDED but the landed.txt append FAILED — the decision is real (the issue is closed); the record will be retried next pass"
+      fi
       echo "[refresh] =#$N LANDED — work already shipped; verify/close, NOT queued, NOT checked" ;;
     INCOMPLETE|*)
       V_UNJUDGED=$((V_UNJUDGED + 1))

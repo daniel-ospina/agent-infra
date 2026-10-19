@@ -2354,8 +2354,11 @@ consolidation the same eight files existed in three places:
 The live copy was **not** a hand-fork: it was an untracked copy of agent-infra generation
 `2ddd5b5a1` (blob-identical on all eight files), one commit behind `main`. That is the same defect
 by another route — an unversioned copy cannot be updated, audited, or healed — so it was converted
-to symlinks into a git checkout rather than deleted. Its one-generation lag is what `doctor` now
-reports as `deployed bytes=DIFFERS`.
+to symlinks into a git checkout rather than deleted. Its one-generation lag is what `doctor` reports
+as `deployed bytes=DIFFERS` on the SYMLINK-into-checkout arm (it reads the target checkout's git
+identity, so a lagging checkout is visible) — and NOT via the stamp arm, which needs
+`.agent-infra-stamp.json`: an un-stamped conversion reads `check-deployed-drift.sh` = 2 UNKNOWN, by
+design (see "which instrument answers which question" below).
 
 The consequence was structural, not cosmetic: every fix had to be applied by hand in three places,
 each box ran a different generation, and "self-healing" was impossible because there was no authority
@@ -2412,7 +2415,8 @@ expressed as **a shared code path plus an explicit platform branch**, never as t
 | supervisor | launchd | systemd unit **or** a running `cloud-cell-supervisor.sh` process |
 | installer | `scripts/orchestrator-harness/install.sh` | `scripts/cloud-cell-supervisor.sh` |
 | job label/unit | `com.eldato.orchestrator-loop` | an `orchestrator-*`/`com.eldato.orchestrator-*` unit |
-| status verb | `launchctl print gui/$UID/<label>` | `systemctl [--user] list-units` (the ACTIVE column) + `pgrep -f cloud-cell-supervisor.sh` |
+| status verb | `launchctl print gui/$UID/<label>` | `<repo>/scripts/cloud-cell-supervisor.sh status` (the supervisor's own verb — NOT a `pgrep -f` match) |
+| `timeout(1)` | absent — `run_agent` uses a bash `wait` + watchdog | present, but the same fallback is used |
 
 ⚠️ The Linux supervisor probe is NAMED and STATE-CHECKED, not a substring match (review P1).
 Measured on a cell 2026-10-19: `systemctl list-units` contained `eldato-disk-reaper.service` in state
