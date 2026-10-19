@@ -1,0 +1,35 @@
+[Unit]
+# eldato disk reaper — the one scheduled pass over the three disk sinks (#2032).
+#
+# WHY A TIMER AND NOT A CONTROLLER TICK. The cell's controller loop already runs the package-cache
+# pass hourly, but the venv and worktree classes were never on any clock: worktrees were reaped by a
+# launchd job that only exists on macOS, and lane venvs had no periodic owner at all (agent-infra
+# #1932). Disk exhaustion is the second reason the cloud cells stopped working — at ~97% used a
+# `git worktree add` or `uv sync` fails, so a healthy controller cannot spawn a lane. A scheduler the
+# bring-up installs is what makes the reaper run on a box nobody is logged into.
+Description=eldato disk reaper — bound uv caches, reap dead lane venvs and merged worktrees
+Documentation=https://github.com/daniel-ospina/agent-infra/blob/main/docs/ops/disk-reaper.md
+After=local-fs.target
+# A reaper must never hold up a boot or a login, and it must not be a reason to keep a box up.
+DefaultDependencies=no
+
+[Service]
+Type=oneshot
+User={{USER}}
+Environment=HOME={{HOME}}
+Environment=PATH={{PATH}}
+Environment=DISK_REAPER_STATE_DIR={{STATE_DIR}}
+Environment=DISK_REAPER_REPOS={{REPOS}}
+Environment=DISK_REAPER_WT_AGED_DAYS={{AGED_DAYS}}
+# The worktree owner must ask GitHub which PRs are open before it may delete anything. A busy cell
+# shares one account with every other box, so the harness gh shim backs off; this timeout is above
+# that backoff window. If it still cannot answer, the class FAILS CLOSED (a checkout with an open PR
+# is never guessed at) and the supervisor shows which class failed.
+Environment=REAP_WT_GH_TIMEOUT=300
+# Never compete with a lane for CPU or I/O: the pass is a background sweep, not a deadline.
+Nice=10
+IOSchedulingClass=idle
+# The pass writes its own bounded log under DISK_REAPER_STATE_DIR; journald keeps the exit status.
+ExecStart=/bin/bash {{REAPER}} --apply
+# A pass that exits 3 (a class failed closed) must not look like success to `systemctl start`.
+SuccessExitStatus=0 4 5
