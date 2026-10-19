@@ -52,7 +52,12 @@ step "supervisor: ${SW:-<none found — will start tmux directly>}"
 # 2. Stop the supervised controller, then kill EVERY session and ANY stray
 #    controller. tmux kill-server is the only reliable sweep: kill-session -t orch
 #    leaves the fix-*/merge-*/chain-* sessions (and their claim leases) behind.
-[ -n "$SW" ] && bash "$SW" stop >/dev/null 2>&1 || true
+# ⛔ --force (agent-infra#2093): this script's whole verb is "end every controller on this box", and
+# it sweeps with `tmux kill-server` + `pkill` immediately below whatever the supervisor answers. The
+# supervisor's new queue-target pre-flight refuses `stop` on a mismatch WHILE a controller is live (so
+# the documented `stop` → `start` deploy cannot strand a box), which is exactly the state this script
+# is run in — pass the flag rather than letting a guard this script does not rely on change its path.
+[ -n "$SW" ] && bash "$SW" stop --force >/dev/null 2>&1 || true
 tmux kill-server >/dev/null 2>&1 || true
 sleep 2
 # The bracket keeps this pattern from matching this script's own argv.

@@ -11,7 +11,7 @@
 # a MERGE ACTOR with incomplete back-pressure, not as a full peer of the laptop.
 #
 # Runs ON THE CELL (Linux). Usage:
-#   bash cloud-cell-supervisor.sh check|start|stop|status|logs|apply|prune
+#   bash cloud-cell-supervisor.sh check|start|stop [--force]|status|logs|apply|prune
 #                                  |doctor|merge|reap|hygiene
 #
 #   apply   fetch agent-infra main and PIN this cell's harness to it (agent-infra#1745). This is the
@@ -59,6 +59,23 @@
 # cannot be read is never blessed (cannot-verify is not a pass). `start`/`check` REFUSE with both
 # values, the remote, and the repo the machine needs; `status` prints the pair on one line.
 # ⛔ The refresh loop's own retry/starvation behaviour is #1729 and is NOT changed here.
+#
+# ── THE DEPLOY SEQUENCE IS PRE-FLIGHTED, NOT JUST ITS LAST STEP (agent-infra#2093) ───────────────
+# The gate above refuses the wrong pair in `start` and `check` — but the documented deploy for a cell
+# is `stop` → `start` (`apply` refuses while a controller runs, so `stop` has to come first). That
+# made the refusal land AFTER the one irreversible step: on the measured lane-1 the sequence would
+# have stopped the controller and then refused to start, leaving the box STOPPED with its harness
+# unrefreshed — strictly worse than the stale sha it was found on, which is exactly why it was left
+# running on an 8-day-old commit instead of repaired (§3.2 of docs/ops/fleet-harness-baseline.md).
+# So `stop` runs the SAME gate before its first irreversible act, and says so. The gate's predicate is
+# not re-implemented: `stop` calls `assert_queue_target` itself, so the verbs cannot drift into the
+# #1745 shape (one verb blesses what the next refuses).
+# ⛔ `stop` STAYS ANSWERABLE, which is the whole reason the refusal is narrow. It refuses only when
+# (a) the pair is not usable AND (b) this state dir has something a stop would actually END. Stopping
+# a cell that is already down loses nothing, and an operator who means to stop a misconfigured box
+# anyway types `stop --force` — the refusal names that flag. `status` is unchanged: it reports the
+# pair and never refuses.
+# ⛔ The gate is NOT weakened by any of this: `check`/`start` still refuse the pair outright.
 #
 # Prereqs on the cell (see cloud-cell-bringup.sh --check):
 #   HOME writable · repo cloned · gh authenticated with push · provider key valid
@@ -589,27 +606,57 @@ OR="$QUEUE_REPO"
 # a warning. A wrong pair must not be a cell that starts and looks healthy; it must be a cell that
 # does not start, with an error naming BOTH values, the remote that was read, and the repo this
 # machine needs so provisioning is unambiguous.
+#
+# $1 is the VERB asking. It changes nothing about the verdict — the predicate is single-sourced so no
+# verb can bless what the next one refuses (#1745's shape) — it only appends the sentence that verb's
+# caller needs. `stop` (agent-infra#2093) is the case that exists: it refuses here as the PRE-FLIGHT
+# for the `stop` → `start` deploy, so its refusal must say that NOTHING WAS STOPPED and how to stop
+# anyway, or an operator who meant to stop a misconfigured box has no way past a verb that has just
+# declined to act.
 assert_queue_target() {
+  local verb="${1:-}"
   case "$QUEUE_STATE" in
     derived|explicit) return 0 ;;
   esac
   local needs="the queue's repo is READ from \$REPO's 'origin' remote, so $REPO MUST BE a checkout of the repo whose pull requests this cell is supposed to work — 'git -C $REPO remote get-url origin' => <host>/<owner>/<repo>.git"
+  # The ONE-LINE fix, spelled as a command an operator can paste, because Required #3 of #2093 is a
+  # repair path that does not require reading this source. Removing the `OR` line lets the queue
+  # follow the checkout, which is the repair that cannot be wrong about which side is stale — the
+  # other direction (repointing $REPO) is a different repo on disk and is named as prose only.
+  # ⛔ The value may also arrive as an exported `OR` rather than a line in $ENV_FILE (both reach this
+  # shell: $ENV_FILE is sourced, and an ambient export is inherited). The message names BOTH, because a
+  # `sed` that silently changed nothing would send the operator back to a refusal with no new
+  # information — the exact dead end this issue is about.
+  local onefix="ONE-LINE FIX: let the queue follow the checkout — sed -i '/^OR=/d' '$ENV_FILE' (drop the OR export instead if that is where yours is set) — after which the queue derives from the checkout and targets '$QUEUE_DERIVED'; to point the cell at '$QUEUE_DECLARED' instead, $needs"
   case "$QUEUE_STATE" in
     mismatch)
-      die "the QUEUE and the CHECKOUT name DIFFERENT repos: the queue targets '$QUEUE_DECLARED' (OR) but $REPO is a checkout of '$QUEUE_DERIVED' (origin $QUEUE_REMOTE). A controller on this pair dispatches $QUEUE_DECLARED PRs from a $QUEUE_DERIVED tree: its candidate pre-flight cannot run there, every candidate comes back unqueryable, and the queue never advances while every other observable reads green (agent-infra#1901). Fix ONE of them — $needs — or remove the OR line from $ENV_FILE so it derives from the checkout, which would target $QUEUE_DERIVED."
+      die "the QUEUE and the CHECKOUT name DIFFERENT repos — this box is MERGE-INERT: the queue targets '$QUEUE_DECLARED' (OR) but $REPO is a checkout of '$QUEUE_DERIVED' (origin $QUEUE_REMOTE). A controller on this pair dispatches $QUEUE_DECLARED PRs from a $QUEUE_DERIVED tree: its candidate pre-flight cannot run there, every candidate comes back unqueryable, and every '$QUEUE_DECLARED' merge looks for that repo's merge rail inside a '$QUEUE_DERIVED' checkout and refuses — so the queue never advances while every other observable reads green (agent-infra#1901, #1764). $onefix.${verb:+ $(queue_refusal_suffix "$verb")}"
       ;;
     invalid)
-      die "OR='$QUEUE_DECLARED' is not an <owner>/<repo> (want e.g. daniel-ospina/tortoise) — a queue target must name a repo on a git host, and a typo here is a cell that dispatches nothing. $needs."
+      die "OR='$QUEUE_DECLARED' is not an <owner>/<repo> (want e.g. daniel-ospina/tortoise) — a queue target must name a repo on a git host, and a typo here is a cell that dispatches nothing. $needs.${verb:+ $(queue_refusal_suffix "$verb")}"
       ;;
     unreadable)
-      die "cannot read the QUEUE this cell would target: 'git -C $REPO remote get-url origin' returned no URL${QUEUE_DECLARED:+, so OR='$QUEUE_DECLARED' cannot be verified against the checkout}. Starting anyway is the measured agent-infra#1901 failure — the controller runs, reports lanes and a loaded queue, and judges nothing. $needs."
+      die "cannot read the QUEUE this cell would target: 'git -C $REPO remote get-url origin' returned no URL${QUEUE_DECLARED:+, so OR='$QUEUE_DECLARED' cannot be verified against the checkout}. Starting anyway is the measured agent-infra#1901 failure — the controller runs, reports lanes and a loaded queue, and judges nothing. $needs.${verb:+ $(queue_refusal_suffix "$verb")}"
       ;;
     underivable)
-      die "cannot derive the QUEUE from $REPO's origin remote '$QUEUE_REMOTE' — it does not name <owner>/<repo> in an accepted form (https://, http://, ssh://, or scp-like git@host:owner/repo.git), so there is no repo on a git host to target. $needs."
+      die "cannot derive the QUEUE from $REPO's origin remote '$QUEUE_REMOTE' — it does not name <owner>/<repo> in an accepted form (https://, http://, ssh://, or scp-like git@host:owner/repo.git), so there is no repo on a git host to target. $needs.${verb:+ $(queue_refusal_suffix "$verb")}"
       ;;
     *)
-      die "cannot determine the QUEUE this cell would target (state '${QUEUE_STATE:-unknown}') — refusing to run a controller that cannot judge the queue it names. $needs."
+      die "cannot determine the QUEUE this cell would target (state '${QUEUE_STATE:-unknown}') — refusing to run a controller that cannot judge the queue it names. $needs.${verb:+ $(queue_refusal_suffix "$verb")}"
       ;;
+  esac
+}
+
+# The verb-specific tail of a queue-target refusal. Only `stop` needs one today: every other verb
+# declines to START something, so "refused" is the whole story; `stop` declined to END something, and
+# an operator reading that must be told, in the message, both that nothing was stopped and how to
+# stop anyway (agent-infra#2093).
+queue_refusal_suffix() {
+  case "$1" in
+    stop)
+      printf '%s' "NOTHING WAS STOPPED: this is the pre-flight for the deploy sequence, because 'start' refuses this same pair and a box stopped under it cannot be refreshed — that is how lane-1 was left on an 8-day-old sha with no way forward (agent-infra#2093). Repair the pair with the fix above, then run 'stop' → 'start'. To stop this box anyway (it will not be startable until the pair is repaired): $0 stop --force"
+      ;;
+    *) printf '' ;;
   esac
 }
 
@@ -618,7 +665,7 @@ queue_state_text() {
   case "$QUEUE_STATE" in
     derived)     printf 'ok — derived from the checkout' ;;
     explicit)    printf 'ok — OR matches the checkout' ;;
-    mismatch)    printf 'MISMATCH — start/check refuse (agent-infra#1901)' ;;
+    mismatch)    printf 'MISMATCH — start/check refuse, and stop refuses while a controller is live (MERGE-INERT, agent-infra#1901)' ;;
     unreadable)  printf 'UNREADABLE — the checkout has no origin remote; start/check refuse' ;;
     underivable) printf 'UNDERIVABLE — origin is not https/http/ssh/scp-like naming <owner>/<repo>; start/check refuse' ;;
     invalid)     printf 'INVALID — OR is not <owner>/<repo>; start/check refuse' ;;
@@ -1702,8 +1749,47 @@ sup_pid_ident() {
   ps -p "$1" -o lstart= 2>/dev/null
 }
 
+# Would this `stop` actually END something? Read-only, and used ONLY by the pre-flight below.
+#
+# ⛔ WHY THIS EXISTS AT ALL (agent-infra#2093). `stop` is the verb an operator reaches for on a box
+# that is wrong — that is the doctrine this file already applies to `status` and to
+# orchestrator-bringup.sh's stop ("REPORT, never die"). So the new pre-flight is deliberately NARROW:
+# it refuses only when there is something to lose. Stopping a cell that is already down loses nothing
+# and must stay answerable, while stopping a LIVE one on an unusable pair is the exact action that
+# left lane-1 un-deployable.
+# ⛔ Conservative in the REFUSAL direction: a read that cannot be made counts as "something is
+# running". The two errors are not symmetric — a refused stop on an idle box costs one flag, a stop
+# that could not be redone costs the cell and its claim leases.
+stop_would_end_something() {
+  local p
+  [ -f "$ROLES_DIR/.desired" ] && return 0        # the marker `stop` removes FIRST
+  tmux has-session -t "$SESSION" 2>/dev/null && return 0
+  sup_loop_alive && return 0                       # doctor loop, or its in-flight restart child
+  p="$(owned_controller_pids 2>/dev/null)" || return 0   # unreadable table: assume yes
+  [ -n "$p" ] && return 0
+  return 1
+}
+
 cmd_stop() {
-  local rc=0 lpid lident rpid rident i
+  local rc=0 lpid lident rpid rident i force=0 a
+  for a in "$@"; do
+    case "$a" in
+      --force) force=1 ;;
+      *) die "usage: $0 stop [--force]" ;;
+    esac
+  done
+  # ── PRE-FLIGHT, ahead of the FIRST irreversible act (agent-infra#2093) ──────────────────────────
+  # `stop` is step one of the documented deploy (`stop` → `start`, because `apply` refuses while a
+  # controller runs), and `start` asserts the queue target before it does anything — so on an
+  # unusable pair this verb used to be the only step that SUCCEEDED: the controller was killed, the
+  # marker dropped, the generation bumped, and only then did `start` refuse. The box was left
+  # stopped with its harness unrefreshed, which is why the measured lane-1 was left running a stale
+  # sha rather than repaired. The gate below runs the SAME predicate `start`/`check` run, before the
+  # `.desired` removal on the next line and before anything is signalled.
+  # ⛔ Only for a stop that would end something, and only without --force: see stop_would_end_something.
+  if [ "$force" != 1 ] && stop_would_end_something; then
+    assert_queue_target stop
+  fi
   # FIRST: drop the desired-state marker, THEN bump the generation. Both orders matter:
   #  * `.desired` gone before anything else means a pass that starts in the window below sees a
   #    "not started" cell (the doctor supervises nothing and launches no restart), and a pass already
@@ -2344,12 +2430,12 @@ case "${1:-status}" in
   start)   cmd_start ;;
   apply)   shift; cmd_apply "$@" ;;
   prune)   shift; cmd_prune "$@" ;;
-  stop)    cmd_stop ;;
+  stop)    shift; cmd_stop "$@" ;;
   status)  cmd_status ;;
   logs)    cmd_logs ;;
   doctor)  shift; cmd_doctor "$@" ;;
   merge)   shift; cmd_merge "$@" ;;
   reap)    shift; cmd_reap "$@" ;;
   hygiene) shift; cmd_hygiene "$@" ;;
-  *)       say "usage: $0 check|start|stop|status|logs|apply|prune|doctor|merge|reap|hygiene"; exit 2 ;;
+  *)       say "usage: $0 check|start|stop [--force]|status|logs|apply|prune|doctor|merge|reap|hygiene"; exit 2 ;;
 esac

@@ -252,9 +252,53 @@ FATAL: the QUEUE and the CHECKOUT name DIFFERENT repos … (agent-infra#1901)
 **Why it was left running and un-deployed — stated precisely.** `cmd_start` calls `assert_queue_target`
 **first** (before `harness_apply`), so `start` refuses *without touching the harness tree*. But the
 documented deploy is `stop` → `start` (because `cmd_apply` refuses while a controller runs), and the
-refusal then lands *after* the stop. So the sequence would leave the box **stopped, with the harness not
-refreshed** — strictly worse than leaving it on `bed278f4`. Fix the pair first (point `REPO` at an
-agent-infra checkout, or drop the `OR` line so it derives from the checkout), then `stop` → `start`.
+refusal then landed *after* the stop. So the sequence left the box **stopped, with the harness not
+refreshed** — strictly worse than leaving it on `bed278f4`, which is why it was left there.
+
+✅ **Fixed (agent-infra#2093).** `stop` now runs the SAME queue-target gate as `start`/`check`, before its
+first irreversible act (dropping `state/roles/.desired`, bumping the stop generation, killing the doctor,
+killing the controller). On this box the refusal therefore lands at step 1, with everything still running.
+The refusal names the queue target, the checkout, the checkout's **actual origin**, and the one-line fix,
+and it is labelled **MERGE-INERT** — the state `check` and `status` report too. It is deliberately narrow:
+`stop` refuses only when the pair is unusable **and** this state dir has something a stop would end, so a
+box that is already down can still be stopped, and `stop --force` exists for an operator who means to stop
+a misconfigured box anyway (`cloud-cell-quiesce.sh` passes it: its sweep stops everything regardless).
+
+**The repair sequence — no source reading required.** From “running `bed278f4`, cannot merge” to “current
+sha, can merge”, on the box. It is the deploy recipe of §5 with the pre-flight and the repair in front of
+it; nothing here is an extra script, and `$CELL_HOME/keys.env` (`/tmp/cell-home/keys.env` on lane-1, which
+carries the `REPO`/`OR` pair) is sourced by the supervisor itself:
+
+```bash
+SNAP=/tmp/cell-home/harness/bed278f4bbb1   # the versioned snapshot the cell is running
+SUP=$SNAP/scripts/cloud-cell-supervisor.sh
+
+# 1. PRE-FLIGHT. Read-only: stops nothing, starts nothing, writes nothing.
+#    Expect the MERGE-INERT refusal here — that is the fix working, and the controller is still up.
+bash $SUP check
+
+# 2. REPAIR the pair — pick ONE. The refusal prints both, with the values filled in.
+cp /tmp/cell-home/keys.env /tmp/cell-home/keys.env.bak-$(date -u +%Y%m%dT%H%M%SZ)
+# (a) let the queue follow the checkout — the repair that cannot be wrong about WHICH side is stale:
+sed -i '/^OR=/d' /tmp/cell-home/keys.env
+# (b) …or point the CHECKOUT at the repo the queue names (a different repo on disk — here agent-infra):
+#     sed -i 's|^REPO=.*|REPO=/tmp/cell-ai|' /tmp/cell-home/keys.env
+
+# 3. PRE-FLIGHT AGAIN. Must print: ok: queue <owner/repo> == checkout <path> (origin <url>) — derived
+bash $SUP check
+
+# 4. DEPLOY — the normal sequence, now safe because step 3 passed.
+bash $SUP stop
+bash $SUP start
+
+# 5. PROVE it moved: §4 — a real `[dispatch]` line, not just `[cap]`.
+```
+
+⛔ **`sed '/^OR=/d'` is the repair for a box whose `OR` is the thing that is wrong** — lane-1's case: its
+`OR` names agent-infra while `REPO` is a tortoise tree, and that cell's work is whatever its checkout says.
+If the intent is the opposite — the box MUST work agent-infra PRs — use (b), because then the *checkout* is
+what is stale. Nothing in the supervisor can decide that for you, which is why the refusal prints both and
+the repair is not automated: `stop` refusing is the guard, and picking the direction is the operator's call.
 
 ### 3.3 Not deployed for scheduling reasons, not for correctness
 
@@ -286,9 +330,12 @@ nothing" shape, and it is the state this audit found on the Mac.
 
 ## 5. The deploy recipe each surface actually needs
 
-- **Cloud cell** — `bash <snapshot>/scripts/cloud-cell-supervisor.sh stop` → `start`. `start` runs
-  `apply` (fetch `origin/main`, write an immutable `<sha12>/` snapshot, move the pin, stamp) before
-  launching. Never hand-edit a file inside a snapshot: it destroys the per-file provenance proof.
+- **Cloud cell** — `check` → `stop` → `start`. `start` runs `apply` (fetch `origin/main`, write an
+  immutable `<sha12>/` snapshot, move the pin, stamp) before launching. Never hand-edit a file inside a
+  snapshot: it destroys the per-file provenance proof. ⛔ **`check` first, always:** it is the read-only
+  pre-flight, and since agent-infra#2093 `stop` refuses the same unusable pairs `start` refuses — so a
+  wrong `OR`/`REPO` pair now surfaces at step 1 instead of leaving the box stopped and unrefreshed. The
+  repair sequence for a mismatch box is in §3.2.
 - **Mac** — do **not** use `deploy-mac-orchestrator.sh` phase B on a launchd-loaded box. Two measured
   consequences: its `nohup bash "$O/orch-loop.sh"` child **inherits the operator shell's TCC grant**, so
   it dispatches while the durable launchd job cannot (a false PASS reported as success); and it does
