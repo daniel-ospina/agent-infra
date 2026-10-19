@@ -77,8 +77,10 @@
 #   * `lanes_headroom=N` DERIVED: how many MORE lane envs fit before free space reaches the floor,
 #                      i.e. `(free_after - floor) / lane_venv_max`, floored at 0. `?` when either input
 #                      is unknown — never a fabricated number.
-# A pass that ends BELOW the floor exits 5 (the code `disk-reaper.sh` already reads as `over-bound`,
-# so the fleet-wide entry point reports it without a second vocabulary). Reclaiming is not the remedy
+# A pass that ends BELOW the floor exits 5. ⛔ The fleet entry point does NOT surface it yet: `worst_rc()`
+# in scripts/disk-reaper.sh drops 5 (`0|5) printf '%s' "$cur"`), so the class line reads rc=0 verdict=ok
+# and only `detail=reap-lane-venvs.sh exited 5` survives (measured; see docs/ops/lane-venv-reaper-policy.md).
+# Do not claim otherwise here. Reclaiming is not the remedy
 # for a breach and the reaper does not pretend otherwise: it will not delete a live lane's env to get
 # back above the floor, so the line NAMES the breach rather than hiding it behind a green summary.
 #
@@ -117,7 +119,8 @@
 #
 # Exit codes: 0 pass completed (removals or none), 2 usage, 3 fail-closed abort (nothing removed),
 #             4 pass completed but at least one removal FAILED,
-#             5 pass completed but free space is BELOW REAP_VENV_FREE_FLOOR_MB (`over-bound`).
+#             5 pass completed but free space is BELOW REAP_VENV_FREE_FLOOR_MB (`over-bound`; NOT yet
+#               propagated by disk-reaper.sh's worst_rc — see the header note above).
 
 set -uo pipefail
 
@@ -211,7 +214,8 @@ touched — a venv hardlinks into it, and deleting it re-spends the space (see t
 
 Every pass prints a capacity line — lanes_live (measured), lane_venv_max (measured), free_after, the
 STATED floor REAP_VENV_FREE_FLOOR_MB (default 2048), the floor_ok verdict (yes|no|unknown) and
-lanes_headroom (how many more lane envs fit above the floor). Below the floor is exit 5 (over-bound).
+lanes_headroom (how many more lane envs fit above the floor). Below the floor is exit 5; note that
+`disk-reaper.sh` does not currently propagate that code (see above).
 EOF
 }
 
@@ -931,9 +935,10 @@ main() {
     report_capacity "${df_after:-}"
     [ "$APPLY" = 1 ] || say "[$SCRIPT_NAME] DRY-RUN — nothing was removed (pass --apply or REAP_VENV_DRY_RUN=0)"
 
-    # Severity order matches disk-reaper.sh's own (3 abort > 4 removal failed > 5 over-bound), so the
-    # fleet entry point's worst-code rule keeps the most severe verdict instead of this pass inventing
-    # a second ordering.
+    # Severity order matches disk-reaper.sh's own INTENT (3 abort > 4 removal failed > 5 over-bound),
+    # so the fleet entry point's worst-code rule keeps the most severe verdict instead of this pass
+    # inventing a second ordering. (disk-reaper.sh currently DROPS 5 rather than keeping it — see the
+    # header note; that gap is tracked, and this ordering is what the fix will read.)
     [ "$FAILED" -gt 0 ] && exit 4
     if [ "$CAPACITY_FLOOR_OK" = "no" ]; then
         say "[$SCRIPT_NAME] ⛔ free space is BELOW the stated floor: a lane starting now can fill the disk. Refusing nothing — a live lane's env is never deleted to make room (exit 5)"

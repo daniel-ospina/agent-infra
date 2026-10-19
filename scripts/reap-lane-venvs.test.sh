@@ -494,6 +494,20 @@ if grep -qF 'REAP_VENV_FREE_FLOOR_MB (rc=5' "$GATE"; then
 else
   bad "spawn-gate.sh would report rc=5 as '.venv may still be present' — a misleading message"
 fi
+# The cell supervisor is the OTHER caller the new exit code reaches (review of PR #1949): its one-line
+# `||` message described every non-zero as "any env it could not prove dead was kept (it fails closed)",
+# which is the OPPOSITE of an rc=5 pass that reaped correctly and merely ended below the floor. Pin that
+# rc=5 is named as the floor breach it is, and that the fail-closed wording still covers the rest.
+if grep -qF 'free disk is BELOW REAP_VENV_FREE_FLOOR_MB after the lane-venv pass' "$SUP"; then
+  ok "cloud-cell-supervisor.sh names a floor breach (rc=5) as over-bound, not as a failed reap"
+else
+  bad "cloud-cell-supervisor.sh would tell the operator a successful reap 'was kept (it fails closed)' on rc=5"
+fi
+if grep -qF 'any env it could not prove dead was kept (it fails closed)' "$SUP"; then
+  ok "cloud-cell-supervisor.sh keeps the fail-closed wording for the codes it still describes"
+else
+  bad "cloud-cell-supervisor.sh lost its fail-closed message for genuine aborts"
+fi
 
 echo "── G. the uv download cache is untouchable ──────────────────────────────────────────"
 assert_not_contains "$(cat "$REAPER")" ".cache/uv" "the reaper names no uv cache path"
@@ -620,12 +634,18 @@ else
   bad "cleanup() has no owner guard — a subshell can delete the parent's scratch dir"
 fi
 if grep -qF '[ "$BASHPID" = "$$" ] || return 0' "$REAPER"; then
-  bad "cleanup() expands $BASHPID UNGUARDED — on bash 3.2 that aborts the trap (scratch dir + watchdogs leak)"
+  bad "cleanup() expands \$BASHPID UNGUARDED — on bash 3.2 that aborts the trap (scratch dir + watchdogs leak)"
 else
   ok "cleanup() never expands BASHPID unguarded (a bash-3.2 box still cleans up)"
 fi
-if [ -n "$(awk '/trap - EXIT/{c=NR} /trap .kill "\$s"/{t=NR} END{if (c && t && c < t) print "ok"}' "$REAPER")" ]; then
-  ok "the watchdog subshell clears the inherited EXIT trap before it arms its own"
+# ⛔ COMMENT LINES ARE EXCLUDED FROM THE SCAN (review of PR #1949, P1): the plain `/trap - EXIT/` match
+# found the COMMENT that names the statement (`# … \`trap - EXIT\` in the watchdog is the other half.`)
+# long before the real one, so the pin passed with the actual `trap - EXIT` line DELETED — a false PASS on
+# the one pin that still protects a bash-3.2 box, where the BASHPID guard cannot fire (BASHPID is unset,
+# so the guarded test is false and cleanup() proceeds in a child). Measured: deleting the real line left
+# this pin green. The comment filter is what makes it discriminating.
+if [ -n "$(awk '!/^[[:space:]]*#/ && /trap - EXIT/{c=NR} !/^[[:space:]]*#/ && /trap .kill "\$s"/{t=NR} END{if (c && t && c < t) print "ok"}' "$REAPER")" ]; then
+  ok "the watchdog subshell clears the inherited EXIT trap before it arms its own (non-comment line)"
 else
   bad "the watchdog subshell inherits cleanup() — it deletes the parent's scratch dir on every probe"
 fi

@@ -125,11 +125,20 @@ capacity: lanes_live=K lane_venv_max=M MB free_after=F MB floor=L MB floor_ok=ye
 | `floor_ok` | ASSERTED | `yes` / `no` / `unknown`. **`unknown` is not a pass** — a `df` that cannot answer is never read as "enough" |
 | `lanes_headroom` | DERIVED | `(free_after - floor) / lane_venv_max`, floored at 0; `?` when an input is unreadable — never a fabricated number |
 
-A pass that ends **below the floor exits 5**, the code `disk-reaper.sh` already maps to `over-bound`,
-so the fleet entry point reports it without a second vocabulary. It **asserts, it does not reclaim**:
-the reaper never deletes a live lane's env to get back above the floor. The floor is registered in the
-`#1068` declared surface (`hygiene` axis, and in `OUT_OF_FAMILY_TERMS` because `_MB` is not a bound
-suffix — the reverse scan cannot see the name on its own).
+A pass that ends **below the floor exits 5**. It **asserts, it does not reclaim**: the reaper never
+deletes a live lane's env to get back above the floor. The floor is registered in the `#1068` declared
+surface (`hygiene` axis, and in `OUT_OF_FAMILY_TERMS` because `_MB` is not a bound suffix — the reverse
+scan cannot see the name on its own).
+
+⛔ **Exit 5 is NOT yet surfaced by the fleet entry point — measured, not assumed.** An earlier draft of
+this doc claimed `disk-reaper.sh` "already maps 5 to `over-bound`, so the fleet entry point reports it".
+It does not: `worst_rc()` in `scripts/disk-reaper.sh` drops 5 (`0|5) printf '%s' "$cur"`), so a venv pass
+that ends below the floor is recorded as `rc=0 verdict=ok`. Measured end-to-end with a stub delegate
+exiting 5 under `--only venv --apply`: `disk-reaper: class=venv rc=0 verdict=ok`, status `ok=1`, and the
+only trace is `detail=reap-lane-venvs.sh exited 5`. `class_verdict()`'s `5)` arm (also `fail-closed` in
+apply mode) is therefore unreachable for this class. The breach IS named by the reaper's own capacity
+line and its log (`over-bound`), and `spawn-gate.sh` reports it per lane exit; the pass-level plumbing is
+tracked separately. Do not restate the old claim without re-measuring it.
 
 ## ⛔ The `uv` download cache is never touched
 
