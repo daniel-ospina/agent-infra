@@ -142,15 +142,25 @@ BLINDING_SURFACES = ("main", "queue")
 # (a non-zero exit is the transport, an unparseable body is not), so it STATES it in
 # `transport=` rather than leaving this function to guess from the text.
 #
-# ⛔ THAT CONTRACT IS NOW HONOURED BY `queue()` AND STILL PARTLY NOT BY `main_health()` (#2138 r7,
-# reviewer A). `queue()` carries the fact from the point where it knows it (see `primary_transport`
-# / `_REST_TRANSPORT`). `main_health()` cannot: it calls `_note_gh_failure(GH_LAST_ERROR, "main")`
-# with the default `transport=True`, and `GH_LAST_ERROR` is SHARED module state that either
+# ⛔ `transport` IS TRI-STATE, AND THAT IS WHAT MAKES A STATEMENT AUTHORITATIVE (#2138 r9, BOTH
+# reviewers). It was a bool whose `True` was only NECESSARY, never SUFFICIENT: the gate in
+# `_note_gh_failure` still demanded one of `TRANSPORT_MARKERS` in the text, so a caller that
+# correctly stated "this was a transport failure" was overruled by a SPELLING TEST. Measured on a
+# REAL `urllib` refusal — `str` of an `HTTPError` is "HTTP Error 403: Forbidden", which contains no
+# marker, because "http 4" is not a substring of "http error 403" — so a mangled primary plus a
+# genuine 403 still published `queue=UNREADABLE` with no `gh=` and `VERDICT=UNKNOWN`: the round-7 OR
+# was INERT for exactly the input it was written for. The old test masked it by inventing an
+# `OSError("HTTP Error 403: API rate limit exceeded …")`, a string this code path cannot produce.
+# So:
+#     transport=True   the caller STATES it could not reach GitHub   -> claims
+#     transport=False  the caller STATES GitHub answered             -> no claim
+#     transport=None   the caller holds NO per-read fact             -> the text heuristic decides
+# `queue()` always passes a stated bool (`primary_transport` / `_REST_TRANSPORT`), and `_rest_get`
+# names a refusal by its real STATUS so the KIND (RATE-LIMITED vs UNREADABLE) follows evidence.
+# `main_health()` is the ONLY `None` caller: `GH_LAST_ERROR` is SHARED module state that either
 # `gh()`'s body-parse arm (`unparseable gh api body: …`) or `gql_commit_checks()`'s rollup arm can
-# have written — so main has no per-read fact to pass and still relies on `TRANSPORT_MARKERS`.
-# Stated rather than quietly implied by this comment: a lane reading it should not conclude the
-# heuristic is dead. Filed as #2151 rather than fixed here, because the real repair is to attribute
-# the cause per READ, which is a main-path refactor.
+# have written, so main has no per-read fact to pass and the heuristic still decides for it. Filed
+# as #2151 rather than fixed here: attributing main's cause per READ is a main-path refactor.
 TRANSPORT_MARKERS = ("rate limit", "http 5", "http 4", "timed out", "timeout",
                      "could not resolve", "connection", "network", "tls", "ssl",
                      "temporary failure", "gateway", "unable to access")
@@ -168,7 +178,7 @@ def _recompute_gh_blocked():
     return "RATE-LIMITED" if "RATE-LIMITED" in kinds else "UNREADABLE"
 
 
-def _note_gh_failure(text, surface, transport=True):
+def _note_gh_failure(text, surface, transport=None):
     """Record a read failure. Only a BLINDING surface, failing at the TRANSPORT, blinds.
 
     `surface` is mandatory on purpose. The earlier signature could not say which read
@@ -180,14 +190,20 @@ def _note_gh_failure(text, surface, transport=True):
     reported core 5000/5000 and every REST read succeeded -- the cause was one heavy
     `gh pr list` (GraphQL, 130+ PRs, `mergeStateStatus`) hiccuping, so the token named the
     wrong subsystem and each lane re-derived "is gh down?" from scratch.
+
+    `transport` is TRI-STATE (see the note above `TRANSPORT_MARKERS`): `True`/`False` is a fact the
+    caller OWNS and is honoured as given; `None` means the caller has no per-read fact and the text
+    heuristic decides. Only the `None` form consults `TRANSPORT_MARKERS` (#2138 r9).
     """
     global GH_BLOCKED, GH_LAST_ERROR
     GH_LAST_ERROR = text or ""
     if surface not in BLINDING_SURFACES:
         return                     # an optional read: it degrades a number, not the verdict
     low = (text or "").lower()
-    if not transport or not any(m in low for m in TRANSPORT_MARKERS):
-        return                     # GitHub answered and we mangled the answer: not blindness
+    if transport is False:
+        return                     # the caller STATES GitHub answered: not blindness
+    if transport is None and not any(m in low for m in TRANSPORT_MARKERS):
+        return                     # no per-read fact to honour: guess from the text (#2151)
     if surface not in GH_BLOCKED_BY:
         GH_BLOCKED_BY.append(surface)
     if "rate limit" in low:
@@ -425,7 +441,11 @@ def main_health(sha):
     else:
         cr = gh(f"repos/{REPO}/commits/{sha}/check-runs?per_page=100&filter=all", paginate=True)
     if cr is None:
-        _note_gh_failure(GH_LAST_ERROR, "main")
+        # ⛔ `transport=None` IS DELIBERATE, NOT AN OMISSION (#2138 r9). `cr` is None on BOTH a
+        # transport failure and an unparseable body, and the two write the SAME `GH_LAST_ERROR`
+        # from two different arms — so there is no per-read fact to state here. The heuristic
+        # decides, which is the pre-existing false-blindness #2151 tracks.
+        _note_gh_failure(GH_LAST_ERROR, "main", transport=None)
         return "UNKNOWN", []
     red, flight = rollup_checks(cr)
     req_red = [c for c in REQUIRED if c in red]
@@ -1213,8 +1233,13 @@ def _gh_token():
     (`scripts/orchestrator-harness/gh-limit.py`, `refresh-candidates.sh`: "hosts.yml / the
     keyring"). It is STATED rather than closed because the only ways to read the keyring are a
     subprocess (`gh auth token` — rejected above) or a third-party keyring import; the four boxes
-    this port came from have the token in `hosts.yml` (measured: the live fallback answers), and
-    the failure is diagnosable from the double-refusal cause string, which names the path it read.
+    this port came from have the token in `hosts.yml` (measured: the live fallback answers).
+    ⛔ AND THE EARLIER TEXT HERE CALLED IT "DIAGNOSABLE", WHICH OVERSTATED IT (#2138 r9, reviewer
+    A/P3). The double-refusal cause string does name the path it read, but that string lands in
+    `GH_LAST_ERROR`, and NOTHING on the objective path emits it (`build()`'s parts never include
+    it; `main()` prints only the line). So on a keyring box the beat says `queue=UNREADABLE`
+    WITHOUT naming the cause: the residual is RECORDED, not VISIBLE, and it is silent on the one
+    surface an operator reads. Called what it is rather than left flattering.
     A box that authenticates via the keyring needs `gh auth login --insecure-storage` or a
     `GH_TOKEN`; closing it properly is a follow-up, not a silent guess.
     """
@@ -1275,6 +1300,39 @@ def _gh_token():
         return ""
 
 
+def _rest_refusal_text(e):
+    """Name a REST refusal by its STATUS and its LIMIT EVIDENCE — never by a guess (#2138 r9).
+
+    ⛔ WHY THIS EXISTS AT ALL. `urllib` raises before the body is readable, so the text of an
+    `HTTPError` is only "HTTP Error 403: Forbidden" — the reason phrase, never the message GitHub
+    sent. That spelling misses `TRANSPORT_MARKERS` ("http 4" is not a substring of "http error
+    403"), so a REAL refusal classified as transport still published NO claim: measured, a mangled
+    primary plus a genuine 403 printed `queue=UNREADABLE` with no `gh=` and `VERDICT=UNKNOWN`. Both
+    reviewers found this independently, and the old test hid it behind a hand-built `OSError`
+    carrying a string this path can never emit.
+
+    The status code IS available, and so are the response headers — so the KIND is decided from
+    evidence rather than from a word in a message we never received:
+      * 429, an `x-ratelimit-remaining: 0`, or a `retry-after` is a rate limit, and says which;
+      * any other status names the status and nothing more, so the claim stays UNREADABLE.
+    Both spellings carry "http 4"/"http 5", which is what lets the claim fire at all.
+    """
+    def _h(name):
+        try:
+            return (e.headers.get(name) or "").strip().lower()
+        except Exception:
+            return ""
+    why = []
+    if e.code == 429:
+        why.append("429 is GitHub's rate-limit status")
+    if _h("x-ratelimit-remaining") == "0":
+        why.append("x-ratelimit-remaining=0")
+    if _h("retry-after"):
+        why.append("retry-after=" + _h("retry-after"))
+    head = "HTTP %s%s" % (e.code, " " + str(e.reason) if getattr(e, "reason", None) else "")
+    return "%s (rate limit exceeded: %s)" % (head, "; ".join(why)) if why else head
+
+
 def _rest_get(url, token, timeout=QUEUE_REST_TIMEOUT_S, deadline=None):
     """One REST GET, behind ONE seam so the fallback is provable without a network.
 
@@ -1310,6 +1368,7 @@ def _rest_get(url, token, timeout=QUEUE_REST_TIMEOUT_S, deadline=None):
     the read's cap, and a page that arrives late is discarded — with one header phase, priced in
     the socket timeout, outside it.
     """
+    import urllib.error
     import urllib.request
 
     class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -1322,7 +1381,18 @@ def _rest_get(url, token, timeout=QUEUE_REST_TIMEOUT_S, deadline=None):
         "X-GitHub-Api-Version": "2022-11-28",
         "User-Agent": "objective.py (agent-infra heartbeat)",
     })
-    with urllib.request.build_opener(_NoRedirect).open(req, timeout=timeout) as r:
+    try:
+        r = urllib.request.build_opener(_NoRedirect).open(req, timeout=timeout)
+    except urllib.error.HTTPError as e:
+        # ⛔ RE-RAISED WITH THE STATUS NAMED (#2138 r9, both reviewers). Left alone, an `HTTPError`
+        # is an `OSError` whose text is "HTTP Error 403: Forbidden" — no marker, no claim, no
+        # attribution. Re-raising as the SAME TYPE keeps `.code`/`.headers` for any caller that
+        # inspects them (the redirect guard's own test asserts the type), while the rewritten text
+        # states the code and any limit evidence, so the transport/parse classifier is unchanged
+        # and the marker gate can actually see a 4xx/5xx.
+        raise urllib.error.HTTPError(e.url, e.code, _rest_refusal_text(e),
+                                     e.headers, None) from e
+    with r:
         chunks = []
         while True:
             if deadline is not None and _monotonic() > deadline:
@@ -1405,12 +1475,24 @@ def _queue_rest(deadline=None):
 
     ⛔ HONEST BOUND, MEASURED RATHER THAN ASSUMED (#2138 r2, A). A socket timeout is a PER-RECV
     timeout, so it does NOT bound a page: a peer trickling bytes resets it on every read (`_rest_get`
-    read a complete page in 14.9 s with `timeout=0.5`). The page is therefore bounded by the CHUNK
-    LOOP inside `_rest_get` -- which re-checks this budget before each 8 KiB chunk -- and by the
-    AFTER-THE-PAGE check below, which discards a page that arrived late. What the fallback can
-    still lose is at most ONE CHUNK of trickle, not "one operation", and the caller additionally
-    clips this budget against the LIST FETCH's own cap (see `QUEUE_READ_MAX_S`), so the fallback is
-    never the reason a refresh misses its 90 s kill.
+    read a complete page in 14.9 s with `timeout=0.5`). The page's BODY is therefore bounded by the
+    CHUNK LOOP inside `_rest_get` -- which re-checks this budget before each 8 KiB chunk -- and by
+    the AFTER-THE-PAGE check below, which discards a page that arrived late. That much holds: a BODY
+    costs at most one chunk past the budget.
+
+    ⛔ AND THAT IS NOT THE WHOLE PAGE, WHICH IS WHY THIS PARAGRAPH NO LONGER PRETENDS IT IS (#2138
+    r9, reviewer B). `open()`'s STATUS LINE AND HEADERS are read under the socket timeout, BEFORE
+    the chunk loop gets control -- `_rest_get` states this itself -- so a header trickle overruns by
+    the HEADER phase, which is bounded only by the per-recv timeout and NOT by this budget. This
+    paragraph previously concluded "the fallback is never the reason a refresh misses its 90 s
+    kill"; that is not true as written, and this file's own
+    `test_a_response_that_arrives_past_the_budget_contributes_NO_chunk` demonstrates a page whose
+    `open()` alone spends 60 s against a 10 s budget. The arithmetic in `QUEUE_READ_MAX_S`
+    (12 + 45 + 12 against the 90 s kill) leaves ~21 s of headroom, which is LESS than one 30 s
+    header phase -- so a header stall can carry the tick past the kill, where NO line prints.
+    Stated rather than papered over: closing it needs a bound on the header phase (a shorter
+    per-recv timeout, or a watchdog around `open()`), which is a change to `_rest_get`'s socket
+    handling and not to this budget.
 
     PAGING: one page is 100. A deeper queue is read a page at a time; a SHORT page is the end. A
     FAILED page discards the whole read, and so does REACHING THE CAP WITH A FULL PAGE -- both are
@@ -1980,8 +2062,14 @@ def build(prev=None):
                              " compute the merge state, so the CLASS counts are NOT a clearance"
                              " (queue depth IS read)")
             else:
+                # ⛔ "REFUSED" IS A FALSE CAUSE ON HALF THE TICKS THAT REACH HERE (#2138 r9,
+                # reviewer A/P3). This branch also runs when GraphQL ANSWERED with a body this
+                # file could not read as a list, and when it hit its own row cap — so the old
+                # wording sent a reader to hunt a rate limit that never happened. Saying only
+                # what is known costs the same.
                 parts.append(f"queue_read=REST(samples={_reads}){_rsf} -- the open-PR list was"
-                             " read over REST because the GraphQL read was refused")
+                             " read over REST because the GraphQL read produced no usable list"
+                             " (refused, or an answer this file could not read as one)")
             # ⛔ THE FILE OVERLAY IS A THIRD, SEPARATE DEGRADATION, AND OMITTING ITS TOKEN IS
             # A FALSE ABSENCE (#2138 review round 1, B and A and E -- three reviewers, one
             # shape). REST's list endpoint carries no file list, so `touches_surface()` answers

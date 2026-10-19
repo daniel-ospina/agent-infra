@@ -91,13 +91,22 @@ def install(monkeypatch, *, gql=None, rest=None, pr_list=None, ci_runs=None, ls_
     instead of the fixture. `rest_prs` supplies the raw REST body (a list, or any non-list value
     to exercise the "not a queue" branch); the default `None` means "no second source", which
     is the pre-#2138 behaviour every older test asserts.
+
+    ⛔ AND "NO SECOND SOURCE" IS MODELLED AS A NON-TRANSPORT FAILURE, BECAUSE THAT IS WHAT IT IS
+    (#2138 r9). This stub used to `raise OSError("fixture: no second source")`, which is a
+    TRANSPORT-shaped failure — and once a caller's stated `transport` became authoritative, that
+    made every older "an unusable primary payload is not blindness" cell claim blindness, through
+    a fixture that had nothing to do with the network. In production "no second source" happens
+    as `_queue_rest` returning None BEFORE any request (no credential) or as a body it could not
+    read; neither is a failure to reach GitHub. Returning a non-list body says exactly that.
     """
     queue_reads = {"n": 0}
     sleeps = []
 
     def fake_rest_get(url, token, timeout=None, deadline=None):
         if rest_prs is None:
-            raise OSError("fixture: no second source")
+            # A body we could not read as a queue -- NOT a transport failure (see the docstring).
+            return {"message": "fixture: no second source"}
         # A payload shorter than one page ENDS the paging loop, so it is returned once.
         # ⛔ `&page=1`, NOT `page=1`: the URL also carries `per_page=100`, and "page=1" is a
         # SUBSTRING of "per_page=100" -- a fixture keyed on it matches EVERY page and silently
@@ -2101,13 +2110,14 @@ def test_a_PARSE_failure_does_not_claim_blindness_even_when_its_TEXT_says_transp
     # the composite cause text CONCATENATES both halves, the PRIMARY's marker then supplied the
     # claim: two reads that both reached GitHub published `gh=UNREADABLE(queue)` (and, with a
     # rate-limit word in the primary, `VERDICT=GH-RATE-LIMITED`). MEASURED on the parent commit.
-    # ⛔ THE COVERAGE REASON, STATED ACCURATELY (#2138 r9, reviewers B + VGATE). Raising fallbacks
-    # are not rare here: the default `install()` seam raises `OSError("fixture: no second source")`
-    # and its text is MARKER-FREE, so those cells suppress the claim through the GATE, never
-    # through the classifier. Scoped to fallbacks used inside a `build()` cell, the 403 below is
-    # the only raising one whose OWN text carries a marker — so no cell had ever isolated the
-    # classifier's transport/body bit; the marker always came from whichever half already looked
-    # like a transport failure.
+    # ⛔ THE COVERAGE REASON, STATED ACCURATELY (#2138 r9, reviewers B + VGATE + A). What was
+    # missing was never "a fallback that raises": it is a fallback that raises a NON-TRANSPORT
+    # failure while the PRIMARY's own text carries a marker. Every earlier raising background in a
+    # `build()` cell was either marker-free on both sides (the default seam, which is a non-list
+    # BODY failure, not a raise at all) or the hand-built 403 below — whose OWN text carries
+    # "rate limit", so the marker always came from the fallback and the PRIMARY could never be the
+    # half that supplied it. With the marker locked to the primary, the classifier's transport/body
+    # bit is the only thing left that can suppress the claim, which is what this cell isolates.
     for exc in (json.JSONDecodeError("Expecting value", "<html>", 0),
                 UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")):
         install(monkeypatch, pr_list=_Result(0, '{"message": "read timed out"}'), rest_prs=[])
@@ -2124,28 +2134,121 @@ def test_a_PARSE_failure_does_not_claim_blindness_even_when_its_TEXT_says_transp
     assert "VERDICT=GH-RATE-LIMITED" in line, line
 
 
+def _real_http_error(code, reason, headers=None):
+    """A REAL `urllib.error.HTTPError`, exactly as `_rest_get` receives one from the wire.
+
+    ⛔ BUILT, NOT INVENTED AS A STRING (#2138 r9, reviewers A + B). The previous version of the
+    test below raised a hand-written `OSError("HTTP Error 403: API rate limit exceeded for user ID
+    81560491")`. That is a string this code path CANNOT produce: `urllib` raises before the body is
+    readable, so the text is only `HTTP Error <code>: <reason>` and the reason phrase is
+    `Forbidden` — no "rate limit" anywhere. The test therefore passed while the behaviour it
+    claimed to pin was absent for every real refusal.
+    """
+    import email.message
+    import urllib.error
+    h = email.message.Message()
+    for k, v in (headers or {}).items():
+        h[k] = v
+    return urllib.error.HTTPError(f"https://api.github.com/x", code, reason, h, None)
+
+
+# The REAL `_rest_get`, captured before any test can stub it (`install()` replaces it).
+_REAL_REST_GET = objective._rest_get
+
+
+def _drive_real_rest_get(monkeypatch, exc):
+    """Make the REAL `_rest_get` raise `exc` from its own `open()`, so its arm actually runs.
+
+    ⛔ TWO STUBS HAVE TO BE UNDONE, AND THE FIRST WAS THE TRAP (#2138 r9). `install()` replaces
+    `objective._rest_get` with the fixture seam, so patching `urllib.request.build_opener` alone
+    left the fixture in place and the real `open()` arm never executed — the test passed for the
+    wrong reason, again. Call this AFTER `install()`.
+    """
+    class _Opener:
+        def open(self, *a, **k):
+            raise exc
+    import urllib.request
+    monkeypatch.setattr(objective, "_rest_get", _REAL_REST_GET)
+    monkeypatch.setattr(urllib.request, "build_opener", lambda *a, **k: _Opener())
+
+
 def test_a_REFUSED_fallback_still_claims_even_when_the_primary_was_mangled(monkeypatch):
     """⛔ THE COMPOSITE REFUSAL IS A TRANSPORT FAILURE IF **EITHER** SOURCE HIT ONE (#2138 r7, B).
 
-    Classifying the synthesised refusal by the PRIMARY's flag alone was a regression introduced by
-    the round-6 fix: a primary we mangled (`transport=False`) plus a fallback GitHub REFUSED for
-    rate limiting then printed `queue=UNREADABLE` with NO `gh=` and `VERDICT=UNKNOWN` — where the
+    Classifying the synthesised refusal by the PRIMARY's flag alone made a fallback GitHub REFUSED
+    for rate limiting print `queue=UNREADABLE` with NO `gh=` and `VERDICT=UNKNOWN` — where the
     reader needs "wait for the limit", the word `docs/ops/gh-rate-limits.md` tells lanes to expect.
-    MEASURED on the parent commit: `gh=RATE-LIMITED(queue)` / `VERDICT=GH-RATE-LIMITED`; without
-    the OR it degraded to `VERDICT=UNKNOWN` with no attribution at all.
 
-    The line is still not a false all-clear (`queue=UNREADABLE` prints either way); what was lost
-    was the ATTRIBUTION and the verdict word.
+    ⛔ AND FROM r9 THIS TEST USES A GENUINE `urllib` REFUSAL, NOT A FABRICATED STRING. It also pins
+    the OTHER half of the r9 fix: with `x-ratelimit-remaining: 0` present, the KIND is RATE-LIMITED
+    from the header evidence — not from a word in a message we never received.
     """
-    def rest_403(url, token, timeout=None, deadline=None):
-        raise OSError("HTTP Error 403: API rate limit exceeded for user ID 81560491")
-
     install(monkeypatch, pr_list=_Result(0, '{"message": "Bad credentials"}'), rest_prs=None)
-    monkeypatch.setattr(objective, "_rest_get", rest_403)
+    _drive_real_rest_get(monkeypatch, _real_http_error(
+        403, "Forbidden", {"x-ratelimit-remaining": "0"}))
     line = objective.build()
-    assert "queue=UNREADABLE" in line, line           # the fact
-    assert "gh=RATE-LIMITED(queue)" in line, line     # ...and the ATTRIBUTION
-    assert "VERDICT=GH-RATE-LIMITED" in line, line    # ...and the actionable verdict word
+    assert "queue=UNREADABLE" in line, line              # the fact
+    assert "gh=RATE-LIMITED(queue)" in line, line        # ...the ATTRIBUTION
+    assert "VERDICT=GH-RATE-LIMITED" in line, line       # ...the actionable verdict word
+    assert "x-ratelimit-remaining=0" in objective.GH_LAST_ERROR, objective.GH_LAST_ERROR
+
+
+def test_a_REFUSAL_with_NO_limit_headers_still_claims_and_stays_UNREADABLE(monkeypatch):
+    """⛔ THE STATED TRANSPORT FACT IS AUTHORITATIVE, AND THE KIND IS NOT GUESSED (#2138 r9).
+
+    BOTH reviewers found the same defect independently: `transport=True` was only NECESSARY,
+    because the gate in `_note_gh_failure` still demanded a `TRANSPORT_MARKERS` substring. A real
+    403 renders as `HTTP Error 403: Forbidden`, which contains NO marker — so a mangled primary
+    plus a genuine 403 published `queue=UNREADABLE` with no `gh=` and `VERDICT=UNKNOWN`, exactly
+    the case the round-7 OR existed for. The claim must fire on the stated fact alone.
+
+    And the KIND must follow the EVIDENCE: no limit headers means we know only that the read was
+    refused, so the claim is UNREADABLE — not RATE-LIMITED, which would send the operator to wait
+    on a limit GitHub never reported.
+    """
+    install(monkeypatch, pr_list=_Result(0, '{"message": "Bad credentials"}'), rest_prs=None)
+    _drive_real_rest_get(monkeypatch, _real_http_error(403, "Forbidden"))
+    line = objective.build()
+    assert "queue=UNREADABLE" in line, line
+    assert "gh=UNREADABLE(queue)" in line, line          # claims, on the stated transport fact
+    assert "RATE-LIMITED" not in line, line              # ...but does not invent a limit
+    assert "HTTP 403" in objective.GH_LAST_ERROR, objective.GH_LAST_ERROR
+
+
+def test_the_three_state_transport_flag_honours_a_STATED_fact_and_only_guesses_on_None():
+    """⛔ `transport` IS TRI-STATE: stated True/False is a FACT, `None` is the heuristic (#2138 r9).
+
+    The `None` arm is not vestigial — it is `main_health()`, the one caller with no per-read fact,
+    and the pre-existing false blindness #2151 tracks. Pinned so a later "simplification" to
+    `transport=False` cannot silently mute main while leaving the queue path green.
+    """
+    def fresh():
+        objective.GH_BLOCKED_BY = []
+        objective.GH_CLAIM_KIND.clear()
+        objective.GH_CLAIM_TEXT.clear()
+        objective.GH_BLOCKED = None
+
+    # marker-free text + a STATED transport failure => claims. This is the arm the old bool could
+    # not reach: the caller's fact alone, with no help from the spelling.
+    fresh()
+    objective._note_gh_failure("refused by policy", "queue", transport=True)
+    assert objective.GH_BLOCKED == "UNREADABLE", objective.GH_BLOCKED
+
+    # the same text with NO stated fact => the heuristic declines, which is main's behaviour.
+    # (`refused by policy` is marker-free on purpose: "HTTP 403 Forbidden" DOES contain "http 4".)
+    fresh()
+    objective._note_gh_failure("refused by policy", "queue", transport=None)
+    assert objective.GH_BLOCKED is None, objective.GH_BLOCKED
+
+    # a stated PARSE failure declines even when the text looks like a transport failure.
+    fresh()
+    objective._note_gh_failure("connection reset", "queue", transport=False)
+    assert objective.GH_BLOCKED is None, objective.GH_BLOCKED
+
+    # and the heuristic still fires on a marker, so main's arm is unchanged.
+    fresh()
+    objective._note_gh_failure("HTTP 504: Server Error", "queue", transport=None)
+    assert objective.GH_BLOCKED == "UNREADABLE", objective.GH_BLOCKED
 
 
 def test_the_bucket_prefers_the_ACTIONABLE_kind_when_two_surfaces_fail(monkeypatch):
