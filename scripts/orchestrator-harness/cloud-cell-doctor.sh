@@ -341,7 +341,7 @@ BOUND_TIMEOUT_BIN="${DOCTOR_TIMEOUT_BIN:-timeout}"
 BOUND_KILL_S="${DOCTOR_TIMEOUT_KILL_S:-15}"
 bounded() {
   local s="$1"; shift
-  local p w rc tmp
+  local p w rc tmp tmpe
   if [ -n "$BOUND_TIMEOUT_BIN" ] && command -v "$BOUND_TIMEOUT_BIN" >/dev/null 2>&1; then
     "$BOUND_TIMEOUT_BIN" -k "$BOUND_KILL_S" "$s" "$@"; return $?
   fi
@@ -682,9 +682,11 @@ run_reap() {
     # 60s, not the 15s per-read bound: `count` resolves each lane's log, which on a 76-lane box is a
     # per-process lsof sweep. A census killed at 15s would print `?/?` on every busy box — an
     # instrument that fails exactly when it matters.
-    census="$(bounded 60 bash "$LANE_REAP_BIN" count 2>/dev/null)"
+    # The tool's OWN budget is set BELOW the external bound, so a slow census is an abstention it
+    # reports (`lanes=?/?`, exit 3) rather than a SIGKILL that leaves the pass with no answer at all.
+    census="$(LANE_REAP_PASS_TIMEOUT=50 bounded 60 bash "$LANE_REAP_BIN" count 2>/dev/null)"
     case "$census" in
-      lanes=*/' 'zombie=*) ;;
+      lanes=*' 'zombie=*) ;;
       # ⛔ A READ THE PASS COULD NOT TAKE IS NOT A PASS (#2163 review, P2). Recording `?` in the line
       # while leaving rc=0 is the "looks alive while doing nothing" class this role exists to remove:
       # the census is the only instrument that sees the population the session pass cannot.

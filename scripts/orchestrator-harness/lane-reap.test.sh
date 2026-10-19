@@ -341,6 +341,22 @@ psrow 901 1 Z 00:00:00 05:00:00 "[bash] <defunct>" >> "$T/t-count"
 out="$(run_count "$T/t-count")"
 eq "$out" "lanes=1/2 zombie=2" "COUNT: one live of two resident lanes; two zombies"
 
+# ── FALLBACK: the no-timeout(1) path macOS takes, and an unkillable ps read ────────────────────
+echo "== FALLBACK (bound() without timeout(1), and a read that must be cut)"
+out="$(LANE_REAP_TIMEOUT_BIN=/nonexistent/tmux-timeout run_count "$T/t-count")"; rc=$?
+eq "$rc" "0" "FALLBACK: count still exits 0 through the shell watchdog"
+eq "$out" "lanes=1/2 zombie=2" "FALLBACK: the fallback runs the read and returns its OUTPUT"
+printf '#!/usr/bin/env bash\nsleep 30\n' > "$T/bin/ps-hang"
+chmod +x "$T/bin/ps-hang"
+rm -f "$T/ps.counter"
+out="$(PS_HANG=1 PS_TABLE1="$T/t-count" PS_COUNTER="$T/ps.counter" PATH="$T/bin:$PATH" \
+       LANE_REAP_PS_BIN="$T/bin/ps-hang" LANE_REAP_PROC_ROOT="$PROC" LANE_REAP_NOW="$NOW" \
+       LANE_REAP_TIMEOUT_BIN=/nonexistent/tmux-timeout LANE_REAP_READ_TIMEOUT=1 \
+       LANE_REAP_LOG="$T/state/lane-reap.log" LANE_REAP_LOCK="$T/state/lane-reap" \
+       bash "$REAPER" count)"; rc=$?
+eq "$rc" "3" "FALLBACK: a read that outlives its bound exits 3"
+eq "$out" "lanes=?/? zombie=?" "FALLBACK: and never renders as an empty fleet"
+
 # ── BUDGET: a spent pass budget is an ABSTENTION, never a partial census ───────────────────────
 echo "== BUDGET (a pass that runs out of time judges nothing and says so)"
 out="$(LANE_REAP_PASS_TIMEOUT=0 run_count "$T/t-count")"; rc=$?
