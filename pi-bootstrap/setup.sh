@@ -420,17 +420,34 @@ fi
 # membership assertion goes RED. (Loud, not silent — do not describe it as vacuous.)
 # Tests are not farmed (the farm contract above): scripts/test_objective.py and
 # scripts/test_turn_classify_state.py land in the repo and stay there.
+# #1932 adds reap-lane-venvs.sh: a lane's `.venv` is a build artifact that belongs to a RUNNING lane
+# (5 lanes held 7.3 GB on lane-1), and the RUNNERS reap it on exit — `lane.sh`/`fix-one.sh` resolve the
+# reaper through spawn-gate.sh's `reap_lane_venv_path()`, which looks in $O, the harness dir,
+# $AGENT_INFRA_PATH/scripts and THIS farm. Farming it is what makes the third-party-free lookup work on
+# a cell and on a laptop alike: a cell runs the workers from `$O` (harness scripts only), not from a
+# `scripts/` checkout, so without the farm the reaper would be "not found" and every lane would log a
+# KEPT env. It is also the operator entry point for the one-off GC (`--gc --repo <path> --apply`).
 # #1787 adds cleanup-stale-branches.sh: the daily com.tortoise.branch-reaper job
 # runs the FARMED copy through the shared launcher with an explicit --repo, and
 # install-launchd.sh's broken-target guard refuses the whole install when the
 # farmed script is absent.
+# #2032 adds disk-reaper.sh and its timer installer: the cell's HOURLY systemd pass runs the FARMED
+# copy (the unit's ExecStart is rendered from this path), and the entry point resolves its three
+# delegate owners through the same farm. A unit pointed at a checkout would be pointing at a
+# directory the tool itself is allowed to reap — the farm is the stable path.
+# #1987 adds pi-cache-reap.sh: the hourly com.eldato.pi-cache-reap job (Mac) and
+# the cell controller's hourly cache bound (a cell has no launchd) both execute
+# the FARMED copy — the machine-global uv/npm/pip caches are the sink that took
+# pi-cell-3 to 258MB free, and neither the worktree reaper nor the supervisor's
+# prune can reach `$HOME/.cache/uv`. Same broken-target rule: absent from this
+# farm, the plist is refused.
 # ⛔ RETIRING A NAME IS TWO EDITS IN ONE COMMIT (#1924): drop it from this array AND
 # declare its deployed path (`scripts/<name>`) in pi-bootstrap/farm-retired.txt.
 # Removing it here alone stops DELIVERY only — every box that already has a copy keeps
 # it, executable, in $DEST/scripts. A name left in BOTH places is refused loudly by the
 # UNFARM leg at the end of this file (the copy leg would just re-create it); dropping
 # it here WITHOUT declaring it is caught by the snapshot check on the next sync.
-fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-reap-worktrees.sh pi-reap-worktrees-launchd.py cleanup-stale-branches.sh ci_runner_gate.sh ask-owner.py beta-progress.py cadence-nudge.sh cadence-timer.sh child-check.py cloud-cell-quiesce.sh deploy-crossbox.sh deploy-mac-orchestrator.sh goal-state.py lane-actions.py lane-guard.py lane-read.py lane-scan-fallback.sh lane-watchdog.py lane-wip.py live-workspaces-publisher.py merge-queue.py orch-send.sh orchestrator-heartbeat.sh orphan-reap.py pr-doctor.py objective.py probe-one.py publish-live-workspaces.py queue-dispatch.py safe-send.sh seed-goal-map.py tree-cpu.py turn-classify.py turn-end.py unblock-lane.sh undelivered-answers.py)
+fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-cache-reap.sh pi-reap-worktrees.sh reap-lane-venvs.sh disk-reaper.sh install-disk-reaper-timer.sh pi-reap-worktrees-launchd.py cleanup-stale-branches.sh ci_runner_gate.sh ask-owner.py beta-progress.py cadence-nudge.sh cadence-timer.sh child-check.py cloud-cell-quiesce.sh deploy-crossbox.sh deploy-mac-orchestrator.sh goal-state.py lane-actions.py lane-guard.py lane-read.py lane-scan-fallback.sh lane-watchdog.py lane-wip.py live-workspaces-publisher.py merge-queue.py orch-send.sh orchestrator-heartbeat.sh orphan-reap.py pr-doctor.py objective.py probe-one.py publish-live-workspaces.py queue-dispatch.py safe-send.sh seed-goal-map.py tree-cpu.py turn-classify.py turn-end.py unblock-lane.sh undelivered-answers.py)
 mkdir -p "$DEST/scripts"
 fleet_copied=0
 for base in "${fleet_srcs[@]}"; do

@@ -23,7 +23,16 @@ Usage:
 Last line is always machine-readable: `UNDELIVERED count=N answered=M`.
 """
 import json
+import os
 import subprocess
+
+# ⛔ THE LAYER MUST NOT SLEEP INSIDE THIS PROCESS (#1988). This script is run by the heartbeat under
+# `run_bounded`, so it has a subprocess bound of its own (90 s) while the layer's first documented
+# backoff is 60 s: an in-call wait would outlive the caller and the box would report an unreadable
+# surface instead of the RATE-LIMITED verdict it can prove. NO_WAIT makes the layer record the limit
+# and return at once, so this process's own deferral takes over. Applies to CHILDREN only.
+os.environ.setdefault("GH_LIMIT_NO_WAIT", "1")
+
 import sys
 
 REPOS = ["daniel-ospina/tortoise", "daniel-ospina/premise-labs",
@@ -42,6 +51,24 @@ QUEUE = "owner-decision"         # "a decision is still owed"
 BOUNCED = "question-bounced"     # gate sent it back; the lane must clear it
 
 
+# ⛔ EVERY gh CALL MUST REACH THE LIMIT LAYER (#1988). These tools are the heartbeat's children, and
+# `heartbeat-loop.sh` pins a PATH (`~/bin`, `~/.pi/agent/shims`, `/opt/homebrew/bin`) in which the
+# real gh OUTRANKS the seeded shims — so a bare `"gh"` here is unserialised and un-backed-off against
+# the account four boxes share. The layer's path comes from `$O`, never from PATH, so the caller's
+# PATH cannot defeat it; with no `$O` the bare name keeps the old behaviour.
+def _gh_layer():
+    o = os.environ.get("O", "")
+    if not o:
+        return None
+    for c in (os.path.join(o, "gh-rest", "gh"), os.path.join(o, "gh-limit", "gh")):
+        if os.path.isfile(c) and os.access(c, os.X_OK):
+            return c
+    return None
+
+
+GH = _gh_layer() or "gh"
+
+
 def sh(args):
     try:
         p = subprocess.run(args, capture_output=True, text=True, timeout=90)
@@ -51,7 +78,7 @@ def sh(args):
 
 
 def answered_issues(repo):
-    rc, out, err = sh(["gh", "issue", "list", "--repo", repo, "--state", "open",
+    rc, out, err = sh([GH, "issue", "list", "--repo", repo, "--state", "open",
                        "--label", ANSWERED, "--limit", "100",
                        "--json", "number,title,state,labels,updatedAt"])
     if rc != 0:
@@ -63,7 +90,7 @@ def answered_issues(repo):
 
 
 def declaration_count(repo, n):
-    rc, out, _ = sh(["gh", "issue", "view", str(n), "--repo", repo,
+    rc, out, _ = sh([GH, "issue", "view", str(n), "--repo", repo,
                      "--json", "comments",
                      "--jq", '[.comments[].body|select(test("^ *RESEARCH:"))]|length'])
     return int(out.strip()) if rc == 0 and out.strip().isdigit() else None
@@ -84,7 +111,7 @@ def unlabeled_event_count(repo, n):
     would fall into the `None`/UNVERIFIED branch and silently disarm this check).
     Emitting one line per matching event and counting lines is pagination-safe.
     """
-    rc, out, _ = sh(["gh", "api",
+    rc, out, _ = sh([GH, "api",
                      "repos/%s/issues/%d/timeline?per_page=100" % (repo, n),
                      "--paginate",
                      "--jq",

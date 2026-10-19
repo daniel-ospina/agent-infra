@@ -47,7 +47,9 @@
     <string>__SCOPE__</string>
 
     <!-- concurrency limits; the swap gate, not MAX_LANES, is what throttles an 8 GB box
-         (README section 4). Do not raise MAX_LANES without checking swap headroom. -->
+         (README section 4). MAX_LANES is rendered from the installer's own core probe — 2.5x the
+         CPU count (25 on a 10-core box) — because capacity, not a lane count, is the ceiling;
+         pin it explicitly to override, and check swap headroom before raising it by hand. -->
     <key>MAX_LOAD</key>
     <string>__MAX_LOAD__</string>
     <key>MAX_LANES</key>
