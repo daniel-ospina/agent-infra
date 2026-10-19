@@ -639,6 +639,13 @@ def test_a_Minority_unread_read_is_neither_blind_nor_resampled(monkeypatch):
     assert "mergeable_state_unknown=1" in line, line
     assert "queue_read=" not in line, line
     assert sleeps == [], sleeps
+    # ⛔ TOLERATING THE READ IS NOT PERMISSION TO DERIVE A ZERO FROM IT (#2138 r3, A/P3).
+    # The same predicate decides both, so a minority-unread GraphQL pass must ALSO leave
+    # `dirty`/`unstable` unread -- otherwise `ms.get("DIRTY", 0)` publishes a false zero for a
+    # count nobody could read, and the comment on that line claims exactly this case while no
+    # test pinned it (reverting the GraphQL half to `unread and source == "rest"` left 77 green).
+    q = objective.queue()
+    assert q["dirty"] is None and q["unstable"] is None, q
 
 
 def test_the_most_resolved_sample_is_the_one_reported(monkeypatch):
@@ -1205,6 +1212,13 @@ def test_the_rest_payload_is_mapped_to_the_gh_pr_list_shape(monkeypatch):
     list, so `touches_surface()` answers False for the pass. That is a stated residual (#2138),
     and pinning `[]` here is what keeps a future `/pulls/<n>/files` fill-in a deliberate change
     rather than a silent reinterpretation of an empty list.
+
+    ⛔ AND `mergeable: false` MAPS TO `DIRTY`, NOT TO UNREAD (#2138 r3, A). `classify_pr()`'s
+    conflict arm matches only the literal `DIRTY`, so leaving a conflicted PR's empty state as
+    None made `resolve-conflict` -- the one arm that rebases it -- unreachable, and the dispatcher
+    spent a lane on `fix-ci`/`call-rail` for work that cannot land. `mergeable: false` IS the read
+    fact "cannot be merged: conflicts"; `mergeable: true` stays None because CLEAN vs BLOCKED vs
+    UNSTABLE is genuinely unstated.
     """
     monkeypatch.setattr(objective, "_gh_token", lambda: "t")
     monkeypatch.setattr(objective, "_rest_get", lambda url, token, timeout=None, deadline=None: [
@@ -1215,7 +1229,7 @@ def test_the_rest_payload_is_mapped_to_the_gh_pr_list_shape(monkeypatch):
     prs = objective._queue_rest()
     assert prs == [
         {"number": 7, "isDraft": True, "mergeable": "CONFLICTING",
-         "mergeStateStatus": None, "headRefOid": "abc123", "files": []},
+         "mergeStateStatus": "DIRTY", "headRefOid": "abc123", "files": []},
         {"number": 8, "isDraft": False, "mergeable": "MERGEABLE",
          "mergeStateStatus": "CLEAN", "headRefOid": "def456", "files": []}], prs
 
@@ -1687,3 +1701,44 @@ def test_the_body_is_read_against_the_clock_not_just_the_socket_timeout(monkeypa
     monkeypatch.setattr(urllib.request, "build_opener", lambda *a, **k: _Opener())
     with __import__("pytest").raises(TimeoutError):
         objective._rest_get("https://api.github.com/x", "t", timeout=30, deadline=8.0)
+
+
+def test_a_conflicted_row_over_REST_is_classified_as_a_conflict_not_a_failing_check(monkeypatch):
+    """⛔ `resolve-conflict` MUST STAY REACHABLE ON A RECOVERED PASS (#2138 r3, A/P2).
+
+    `classify_pr()`'s conflict arm matches the literal `DIRTY`. REST reports a conflicted PR as
+    `mergeable: false` with `mergeable_state` frequently still `""`, so mapping that empty state to
+    None made the arm unreachable: the dispatcher's `by_class` recorded the PR as a check problem
+    and spent a lane on `fix-ci`/`call-rail` for work that cannot land, with the "NOT a clearance"
+    caveat existing only on the printed line. The read fact is mapped instead of guessed.
+    """
+    assert objective._rest_pr({"mergeable": False, "mergeable_state": ""})["mergeStateStatus"] \
+        == "DIRTY"
+    # `mergeable: true` stays UNREAD: CLEAN vs BLOCKED vs UNSTABLE is genuinely unstated.
+    assert objective._rest_pr({"mergeable": True, "mergeable_state": ""})["mergeStateStatus"] \
+        is None
+    # ...and a state GitHub DID compute is passed through untouched.
+    assert objective._rest_pr(
+        {"mergeable": True, "mergeable_state": "blocked"})["mergeStateStatus"] == "BLOCKED"
+
+
+def test_a_malformed_rest_row_is_a_NAMED_failure_not_an_unattributed_blindness(monkeypatch):
+    """⛔ THE MAPPING RUNS INSIDE THE FAILURE PATH (#2138 r3, A/P3).
+
+    `[_rest_pr(p) for p in rows]` used to sit AFTER the `except`, so a row that passed the shape
+    checks but broke the mapping (e.g. `head` as a string) raised a bare `AttributeError` out of
+    `_queue_rest()`. `queue()` does not call that a transport failure, so the line printed
+    `queue=UNREADABLE` with NO `gh=` claim — the unattributed blindness this file forbids. Now it
+    is one more "no second source" with a named cause.
+    """
+    monkeypatch.setattr(objective, "_gh_token", lambda: "t")
+    monkeypatch.setattr(objective, "_rest_get",
+                        lambda *a, **k: [{"number": 1, "head": "not-a-dict"}])
+    assert objective._queue_rest() is None
+    assert objective.GH_LAST_ERROR.startswith("rest fallback failed:"), objective.GH_LAST_ERROR
+
+    # The non-object guard keeps its OWN message (a mutant that deletes it now answers with the
+    # AttributeError text instead, so this is what pins the guard rather than the try block).
+    monkeypatch.setattr(objective, "_rest_get", lambda *a, **k: ["oops"])
+    assert objective._queue_rest() is None
+    assert "non-object element" in objective.GH_LAST_ERROR, objective.GH_LAST_ERROR

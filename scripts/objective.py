@@ -1104,14 +1104,19 @@ QUEUE_REST_TIMEOUT_S = 30                     # PER-PAGE ceiling, further clippe
                                               # page (`_queue_rest(deadline=…)`), so the fallback
                                               # cannot add a 5 x 30 s tail to a beat that is killed
                                               # at 90 s
-# ⛔ THE WHOLE QUEUE READ (primary + fallback) IS CAPPED AGAINST THE TICK, NOT JUST ITSELF (#2138
-# r3, A/P1). Anchoring the fallback to `now + TIMEOUT` was right for the slow-primary case and
-# WRONG for the slow-REFUSAL one: `_gh_retry` retries a 5xx three times, so a refusal can arrive
-# having spent 60-75 s of the beat's 90 s refresh bound, and a fresh 30 s socket push the tick past
+# ⛔ THIS CAPS THE QUEUE LIST FETCH (primary + fallback), NOT THE WHOLE QUEUE READ (#2138 r3, A).
+# Anchoring the fallback to `now + TIMEOUT` was right for the slow-primary case and WRONG for the
+# slow-REFUSAL one: `_gh_retry` retries a 5xx three times, so a refusal can arrive having spent
+# 60-75 s of the beat's 90 s refresh bound, and a fresh 30 s socket push the tick past
 # `run_bounded 90 objective-refresh` (`heartbeat-loop.sh`) -- where a killed refresh writes NO line
 # at all, strictly worse than the refusal it replaces. Half the bound, measured from the START of
 # the read: the fallback gets whatever is left of it (still a full page in the ordinary case), and
 # a refusal that has already spent it gets NO socket and raises its own cause, so the line prints.
+# ⛔ WHAT IS OUTSIDE THIS BOUND, SAID PLAINLY: the ~12 s of tick work before `queue()` runs
+# (`main_sha`, `main_health`, `ci_critical_path`) and the per-PR `classify_queue()` storm AFTER the
+# list is in hand (one check-run read per open PR, ~12 s on a full recompute) are neither included
+# nor claimed to be -- 12 + 45 + 12 is still under the 90 s kill, which is why the split is safe,
+# not because the cap covers them.
 QUEUE_READ_MAX_S = 45
 
 
@@ -1235,14 +1240,25 @@ def _rest_pr(p):
     often "" while GitHub computes mergeability, so the value is mapped to `None` (unread) and
     `_queue_read_is_blind()` is told the sample's SOURCE -- otherwise the fallback would
     manufacture `queue_read=BLIND` out of a sample it did read.
+
+    ⛔ BUT `mergeable: false` IS A READ FACT, AND IT IS THE ONE THAT DISPATCHES A LANE (#2138 r3, A).
+    An empty state left every CONFLICTED PR unrecognisable: `classify_pr()`'s conflict arm matches
+    only the literal `DIRTY`, so the PR fell through to `fix-ci`/`call-rail` -- dispatching a lane
+    at work that cannot land while `resolve-conflict` (the one arm that would rebase it) was
+    unreachable. REST's `mergeable: false` means exactly "cannot be merged: conflicts", so it is
+    mapped to `DIRTY` rather than guessed at. `mergeable: true` stays UNREAD: CLEAN vs BLOCKED vs
+    UNSTABLE is genuinely unstated, and the line's `queue_read=REST(merge_state unread N/M)` says so.
     """
     m = p.get("mergeable")
+    state = (p.get("mergeable_state") or "").upper() or None
+    if state is None and m is False:
+        state = "DIRTY"          # conflicted, over REST, with the lazy state uncomputed
     return {
         "number": p.get("number"),
         "isDraft": bool(p.get("draft")),
         "mergeable": ("MERGEABLE" if m is True else
                       "CONFLICTING" if m is False else "UNKNOWN"),
-        "mergeStateStatus": (p.get("mergeable_state") or "").upper() or None,
+        "mergeStateStatus": state,
         "headRefOid": ((p.get("head") or {}).get("sha") or ""),
         "files": [],
     }
@@ -1277,8 +1293,8 @@ def _queue_rest(deadline=None):
     LOOP inside `_rest_get` -- which re-checks this budget before each 8 KiB chunk -- and by the
     AFTER-THE-PAGE check below, which discards a page that arrived late. What the fallback can
     still lose is at most ONE CHUNK of trickle, not "one operation", and the caller additionally
-    clips this budget against the whole tick (see `QUEUE_READ_MAX_S`), so the fallback is never
-    the reason a refresh misses its 90 s kill.
+    clips this budget against the LIST FETCH's own cap (see `QUEUE_READ_MAX_S`), so the fallback is
+    never the reason a refresh misses its 90 s kill.
 
     PAGING: one page is 100. A deeper queue is read a page at a time; a SHORT page is the end. A
     FAILED page discards the whole read, and so does REACHING THE CAP WITH A FULL PAGE -- both are
@@ -1326,11 +1342,17 @@ def _queue_rest(deadline=None):
             GH_LAST_ERROR = (f"rest fallback: {QUEUE_REST_MAX_PAGES} full pages "
                              f"({len(rows)} open PRs) is the cap, not the queue")
             return None
+        # ⛔ THE MAPPING IS INSIDE THE `try` (#2138 r3, A). It used to sit after the `except`, so a
+        # row that passed the shape checks but broke `_rest_pr()` (e.g. `head` as a string) raised
+        # a bare `AttributeError` out of this function -- and `queue()`'s own classifier does not
+        # call that a transport failure, so the line printed `queue=UNREADABLE` with NO `gh=` claim:
+        # the unattributed blindness this file's docstring forbids. Here it is one more "no second
+        # source" with a named cause.
+        return [_rest_pr(p) for p in rows]
     except Exception as e:
         # The URL is safe to name; the token never is.
         GH_LAST_ERROR = f"rest fallback failed: {type(e).__name__}: {str(e)[:180]}"
         return None
-    return [_rest_pr(p) for p in rows]
 
 
 def _withdraw_gh_failure(surface):
