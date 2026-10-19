@@ -247,14 +247,14 @@ eq "$(cat "$KILL_LOG" 2>/dev/null | wc -l | tr -d ' ')" "0" "FENCE: no signal re
 # ── CAP: the `[cap]` fields, driven through the loop's own measure_lanes() ─────────────────────
 echo "== CAP ([cap] prints lanes=<live>/<total> max_lanes=<n> zombie=<n>)"
 LOOP="$HERE/orch-loop.sh"
-grep -qF 'lanes=$LANES/$LANES_TOTAL' "$LOOP" && grep -qF 'zombie=$ZOMBIES' "$LOOP" && rc=0 || rc=1
+grep -qF 'lanes=${LANES_DISPLAY:-?}/$LANES_TOTAL' "$LOOP" && grep -qF 'zombie=$ZOMBIES' "$LOOP" && rc=0 || rc=1
 eq "$rc" "0" "CAP: the [cap] line carries lanes=<live>/<total> and zombie=<n>"
 grep -qF 'lanes_unknown (the lane census could not be read' "$LOOP" && rc=0 || rc=1
 eq "$rc" "0" "CAP: the dispatch gate CONSUMES LANES_UNKNOWN (a tripwire: the arm is inline in the loop)"
-grep -qF 'lanes_src=' "$LOOP" && rc=0 || rc=1
+grep -qF 'lanes_src=' "$LOOP" && grep -qF 'lanes=${LANES_DISPLAY:-?}/$LANES_TOTAL' "$LOOP" && rc=0 || rc=1
 eq "$rc" "0" "CAP: [cap] names the census SOURCE, so a tmux fallback is never printed as a census"
 is_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
-O="$T"; _HERE_RS=/nonexistent
+O="$T"; _HERE_RS=/nonexistent; LOG="$T/state/orch.log"
 printf '#!/bin/bash\necho "lanes=3/11 zombie=7"\n' > "$T/lane-reap.sh"
 chmod +x "$T/lane-reap.sh"
 LANE_REAP_SH=""
@@ -264,15 +264,29 @@ sed -n '/^LANE_REAP_SH=""/,/^}$/p' "$LOOP" > "$T/measure.sh"
 . "$T/measure.sh"
 measure_lanes
 eq "$LANES/$LANES_TOTAL/$ZOMBIES" "3/11/7" "CAP: live/total/zombie parsed from the census"
+eq "$LANES_DISPLAY" "3" "CAP: the DISPLAYED numerator is the census value"
 eq "$LANES_UNKNOWN" "0" "CAP: a clean census is not flagged unknown"
+eq "$LANES_SOURCE" "census" "CAP: the census is LABELLED as the source"
 printf '#!/bin/bash\necho "lanes=?/11 zombie=7"; exit 3\n' > "$T/lane-reap.sh"
 measure_lanes
 eq "$LANES_UNKNOWN" "1" "CAP: an unreadable numerator REFUSES work (no silent fail-open)"
 eq "$LANES_TOTAL/$ZOMBIES" "11/7" "CAP: readable totals are still reported"
+eq "$LANES_SOURCE" "unknown" "CAP: an abstaining census is labelled unknown"
+eq "$LANES_DISPLAY" "?" "CAP: and its DISPLAYED numerator is ?, never a fabricated 0"
 printf '#!/bin/bash\necho "lanes=?/? zombie=?"; exit 3\n' > "$T/lane-reap.sh"
 measure_lanes
 eq "$LANES_UNKNOWN" "1" "CAP: a wholly unreadable census refuses work"
 eq "$LANES_TOTAL/$ZOMBIES" "?/?" "CAP: unknown totals stay unknown, never 0"
+# The transition arm: no lane-reap.sh at all -> the OLD tmux count, LABELLED. Re-source the block so
+# the missing-script resolution runs again (it happens at definition time).
+rm -f "$T/lane-reap.sh"
+LANE_REAP_SH=""
+sed -n '/^LANE_REAP_SH=""/,/^}$/p' "$LOOP" > "$T/measure2.sh"
+. "$T/measure2.sh"
+measure_lanes
+eq "$LANES_SOURCE" "tmux" "CAP: a missing tool falls back to tmux AND says so"
+eq "$LANES_DISPLAY" "$LANES" "CAP: the tmux transition shows its own (numeric) count"
+eq "$LANES_UNKNOWN" "0" "CAP: the tmux fallback is not an abstention (it is a named transition)"
 
 # ── SURVIVOR: a SIGTERM-immune victim is escalated, but only while its incarnation holds ────────
 echo "== SURVIVOR (TERM followed by KILL, still fenced on the same incarnation)"
@@ -320,8 +334,8 @@ has "$out" "human-ancestor" "HUMAN: refused with a reason"
 hasnt "$out" "REAP   root=900" "HUMAN: never reaped"
 eq "$(cat "$KILL_LOG" 2>/dev/null | wc -l | tr -d ' ')" "0" "HUMAN: --apply signals nothing"
 
-# ── HUMAN-ARGV: prompt text in an ancestor's argv decides NOTHING ────────────────────────────────
-echo "== HUMAN-ARGV (host apps are matched on the executable, never on argument text)"
+# ── HUMAN-ARGV: a human marker ANYWHERE in an ancestor's argv refuses (over-refusal is safe) ─────
+echo "== HUMAN-ARGV (HUMAN is matched anywhere in an ancestor's argv — fail closed)"
 : > "$T/t-hargv"; psinit >> "$T/t-hargv"
 psrow 400 1 Ss 00:00:00 10:00:00 "/Applications/Terminal.app/Contents/MacOS/Terminal" >> "$T/t-hargv"
 psrow 401 400 Ss 00:00:00 10:00:00 "zsh -c launch --brief '/tmp/brief-mentioning-cmux.app'" >> "$T/t-hargv"
@@ -332,6 +346,31 @@ out="$(run_reap "$T/t-hargv" "" -- --apply)"
 has "$out" "human-ancestor" "HUMAN-ARGV: a Terminal.app above is found THROUGH the text"
 hasnt "$out" "REAP   root=902" "HUMAN-ARGV: never reaped"
 eq "$(cat "$KILL_LOG" 2>/dev/null | wc -l | tr -d ' ')" "0" "HUMAN-ARGV: no signal"
+
+echo "== HUMAN-SPACED (a human executable path containing a space is still a refusal)"
+: > "$T/t-space"; psinit >> "$T/t-space"
+psrow 420 1 Ss 00:00:00 10:00:00 "/Applications/My Apps/Terminal.app/Contents/MacOS/Terminal" >> "$T/t-space"
+psrow 406 420 Ss 00:00:00 05:00:00 "bash -c pi > $DEAD_LOG 2>&1 &" >> "$T/t-space"
+psrow 407 406 Sl 00:00:00 05:00:00 pi >> "$T/t-space"
+fdlink 407 1 "$DEAD_LOG"
+out="$(run_reap "$T/t-space" "" -- --apply)"
+has "$out" "human-ancestor" "HUMAN-SPACED: a space in the executable path cannot hide the host app"
+hasnt "$out" "REAP   root=406" "HUMAN-SPACED: never reaped"
+eq "$(cat "$KILL_LOG" 2>/dev/null | wc -l | tr -d ' ')" "0" "HUMAN-SPACED: no signal"
+
+# ── FLEET-PROMPT: a cmux PATH in an ancestor's ARGUMENT is not the fleet boundary ──────────────
+echo "== FLEET-PROMPT (fleet is the EXECUTABLE only; argument text decides nothing)"
+: > "$T/t-fprompt"; psinit >> "$T/t-fprompt"
+psrow 430 1 Ss 00:00:00 10:00:00 "/Applications/Terminal.app/Contents/MacOS/Terminal" >> "$T/t-fprompt"
+psrow 431 430 Ss 00:00:00 10:00:00 "zsh -c export PATH=/Applications/cmux.app/Contents/MacOS:$PATH; lane.sh /repo" >> "$T/t-fprompt"
+psrow 408 431 Ss 00:00:00 05:00:00 "bash -c pi > $DEAD_LOG 2>&1 &" >> "$T/t-fprompt"
+psrow 409 408 Sl 00:00:00 05:00:00 pi >> "$T/t-fprompt"
+fdlink 409 1 "$DEAD_LOG"
+out="$(run_reap "$T/t-fprompt" "" -- --apply)"
+has "$out" "human-ancestor" "FLEET-PROMPT: a cmux path in an ARGUMENT cannot stop the walk"
+hasnt "$out" "fleet ancestry" "FLEET-PROMPT: not classified fleet on argument text"
+hasnt "$out" "REAP   root=408" "FLEET-PROMPT: the human-owned tree is never reaped"
+eq "$(cat "$KILL_LOG" 2>/dev/null | wc -l | tr -d ' ')" "0" "FLEET-PROMPT: no signal"
 
 # ── FLEET: cmux-rooted ancestry is the fleet boundary ───────────────────────────────────────────
 echo "== FLEET (a cmux.app ancestor is the fleet, and the lane is judged)"
@@ -394,7 +433,7 @@ eq "$rc" "3" "FALLBACK: a read that outlives its bound exits 3"
 eq "$out" "lanes=?/? zombie=?" "FALLBACK: and never renders as an empty fleet"
 
 # ── COUNT-ARMS: a deleted log is possibly-live, and an unreadable age must not abort the pass ──
-echo "== COUNT-ARMS (deleted log counts as live; unreadable age is `?`, in any lane order)"
+echo "== COUNT-ARMS (deleted log counts as live; unreadable age is a ? numerator, in any lane order)"
 : > "$T/t-count2"; psinit >> "$T/t-count2"
 psrow 600 1 Ss 00:00:00 05:00:00 "bash -c pi > /tmp/L-gone.log 2>&1" >> "$T/t-count2"
 psrow 601 600 Sl 00:00:01 05:00:00 pi >> "$T/t-count2"
@@ -410,10 +449,10 @@ fdlink 501 1 "/tmp/L-ghost.log"
 psrow 700 1 Ss 00:00:00 05:00:00 "bash -c pi > $GHOST 2>&1" >> "$T/t-count3"
 psrow 701 700 Sl 00:00:01 05:00:00 pi >> "$T/t-count3"
 fdlink 701 1 "$GHOST"
-out="$(run_count "$T/t-count3")"; rc=$?
+out="$(run_count "$T/t-count3" 2>&1)"; rc=$?
 eq "$rc" "3" "COUNT-ARMS: an unreadable age exits 3"
 eq "$out" "lanes=?/2 zombie=0" "COUNT-ARMS: the numerator is ? while the TOTAL survives; no arithmetic abort"
-hasnt "$out" "syntax error" "COUNT-ARMS: the pass never aborts on `?` arithmetic"
+hasnt "$out" "syntax error" "COUNT-ARMS: the pass never aborts on a ? numerator"
 
 # ── BUDGET: a spent pass budget is an ABSTENTION, never a partial census ───────────────────────
 echo "== BUDGET (a pass that runs out of time judges nothing and says so)"

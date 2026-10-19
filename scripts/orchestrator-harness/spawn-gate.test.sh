@@ -352,7 +352,9 @@ ck "the recorded elapsed is a non-negative INTEGER, not merely present (f5='${f5
 # job-control window, which was a real cycle-1 defect.)
 cat > "$TMP/bin/pi" <<'PI'
 #!/bin/sh
-( sleep 300 ) &
+# A DIRECT background `sleep` (not a subshell), so `$!` IS the sleeper the test must see gone, and a
+# cleanup can end exactly that process.
+sleep 300 &
 printf '%s\n' "$!" > "$STRAGGLER_PID"
 exit 0
 PI
@@ -365,11 +367,19 @@ PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" STRAGGLER_PID="$TMP/straggler.pid" O="$TM
   run_agent 30 "$LOG" "$PROMPT" "straggler test" >/dev/null 2>&1
 ' _ "$GATE" "$LOG" "$PROMPT" 2>/dev/null
 sp="$(cat "$TMP/straggler.pid" 2>/dev/null)"
-if [ -n "$sp" ] && kill -0 "$sp" 2>/dev/null; then
-  kill -KILL "$sp" 2>/dev/null
-  rc=1
-else
-  rc=0
+# ⛔ AN EMPTY PID FILE IS A FAILED LEG, NOT A PASS (#2163 review, P3). The stub writes the sleeper's
+# pid; if it is absent the agent never ran, and `[ -n "$sp" ] && …` would then fall through to success
+# — making the ONLY behavioural proof of the group reap vacuously green on an inert launch.
+survivor=0
+case "$sp" in
+  ''|*[!0-9]*) rc=1 ;;
+  *) if kill -0 "$sp" 2>/dev/null; then rc=1; survivor=1; else rc=0; fi ;;
+esac
+if [ "$survivor" = "1" ]; then
+  # Cleanup, fenced on WHAT the pid is: a recycled pid must not be killed blindly.
+  case "$(ps -o args= -p "$sp" 2>/dev/null)" in
+    *"sleep 300"*) kill -KILL "$sp" 2>/dev/null ;;
+  esac
 fi
 ck "run_agent reaps the turn's straggler (pid ${sp:-<none>} is gone after the turn)" $rc
 # restore the plain stub for the cases below

@@ -278,7 +278,7 @@ candidate is refused. (Measured before this baseline: 793 consecutive `could not
 refusals alongside healthy `[cap]` lines.) A real dispatch is:
 
 ```
-[cap] load=54/100 lanes=3/11 max_lanes=25 zombie=0 …   <- the cycle runs (live/total + corpses)
+[cap] load=54/100 lanes=3/11 max_lanes=25 zombie=0 lanes_src=census …   <- the cycle runs (live/total + corpses)
 [dispatch] load=45 lanes=2 -> 4628 4643             <- candidates actually entered the batch
 + a matching `tmux ls` session per issue (lane-4628, chain-4628)
 ```
