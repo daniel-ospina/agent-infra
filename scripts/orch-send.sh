@@ -151,17 +151,44 @@ if [ -z "$_via_map" ]; then echo "$LABEL: target OK ($REPO)"; fi
 # A non-zero helper exit (unreadable pane, cmux failure, no tail) is UNVERIFIED
 # and MUST NOT be reported as a delivered order. NOTE: a message that arrives in
 # the ORCHESTRATOR'S OWN pane would also verify — the self-check above runs FIRST.
+# ⛔ IF THE CHECKER CANNOT RUN, NOTHING IS SENT — SAY SO (#1881 review P2). This used to fall into the
+# UNVERIFIED arm, which begins "SENT BUT NOT VERIFIED": false, and it prescribes "re-send", which would
+# fail identically forever. The helper OWNS the send, so a missing sibling or interpreter means no send
+# happened at all, and the operator needs the cause, not a re-send loop.
+if [ ! -f "$SCRIPTS/lib/cmux_payload.py" ] || [ ! -x /usr/bin/python3 ]; then
+  echo "$LABEL: NOT SENT — the payload-integrity checker is unavailable, so nothing was dispatched."
+  echo "$LABEL:   missing: $([ -f "$SCRIPTS/lib/cmux_payload.py" ] || echo "$SCRIPTS/lib/cmux_payload.py")$([ -x /usr/bin/python3 ] || echo " /usr/bin/python3")"
+  echo "$LABEL:   the checker is a FARMED sibling (pi-bootstrap/setup.sh lib_srcs, #1187); a copy"
+  echo "$LABEL:   without it must not report delivery it cannot verify. Re-sync and retry."
+  exit 7
+fi
+# stderr is KEPT, not discarded: a crashing checker used to vanish into /dev/null and the operator
+# only ever saw "SENT BUT NOT VERIFIED".
+_cmux_payload_err="$(mktemp "${TMPDIR:-/tmp}/orch-send-verify.XXXXXX")"
 cmux_payload_verdict="$(/usr/bin/python3 "$SCRIPTS/lib/cmux_payload.py" verify \
       --workspace "$W" --text="$MSG" --screen-lines 200 \
-      --timeout "${ORCH_SEND_VERIFY_TIMEOUT:-30}" 2>/dev/null)"
+      --timeout "${ORCH_SEND_VERIFY_TIMEOUT:-30}" 2>"$_cmux_payload_err")"
 case "$cmux_payload_verdict" in
   VERIFIED)
-    echo "$LABEL: CONSUMED (payload tail verified on the pane)"
+    rm -f "$_cmux_payload_err"
+    echo "$LABEL: CONSUMED (payload tail verified in the lane's transcript after this send)"
     exit 0 ;;
+  PANE_ONLY)
+    rm -f "$_cmux_payload_err"
+    # The tail is on the surface but nothing proves SUBMISSION. That is the dropped-Enter state: the
+    # composer renders what it holds, so a message that was typed and never submitted looks delivered.
+    echo "$LABEL: SENT BUT NOT SUBMITTED — the payload tail is VISIBLE on the pane, but the lane's"
+    echo "$LABEL:   transcript shows no such message after this send, so submission is NOT proven."
+    echo "$LABEL:   Press Enter in that pane (or re-send); do NOT treat this as delivered (#1187)."
+    exit 6 ;;
   *)
-    echo "$LABEL: SENT BUT NOT VERIFIED — the payload TAIL is not on the pane."
-    echo "$LABEL:   cmux send returns OK while delivering only a PREFIX under load (#1187),";
+    echo "$LABEL: SENT BUT NOT VERIFIED — the payload TAIL is not on the pane and not in the transcript."
+    echo "$LABEL:   cmux send returns OK while delivering only a PREFIX under load (#1187),"
     echo "$LABEL:   so this send is NOT recorded as delivered. Re-read the pane and re-send;"
     echo "$LABEL:   for a long body, write it to a file and send a short one-line pointer."
+    if [ -s "$_cmux_payload_err" ]; then
+      echo "$LABEL:   checker diagnostics: $(tr '\n' ' ' <"$_cmux_payload_err" | tail -c 300)"
+    fi
+    rm -f "$_cmux_payload_err"
     exit 6 ;;
 esac

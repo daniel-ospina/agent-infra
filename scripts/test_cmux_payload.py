@@ -139,12 +139,90 @@ def test_transcript_unreadable_is_not_a_match(P, tmp_path):
 
 # ── send_verified verdicts ────────────────────────────────────────────────────
 
-def test_send_verified_when_the_tail_is_on_the_pane(P):
+def test_pane_only_when_the_tail_is_visible_but_submission_is_unproven(P):
+    """⛔ THE P0, PINNED (#1881 review). The pane renders the COMPOSER's content, submitted or not, so
+    finding the payload there proves the text reached the input box and NOTHING more. This used to
+    return VERIFIED — so a payload typed and never submitted (a dropped Enter, swallowed by
+    `except: pass`) was reported CONSUMED, exit 0, and the lane never received the order."""
     run = _fake_cmux(f"working...\n{LONG}\n")
     verdict, _ = P.send_verified("ws-1", LONG, run=run, sleep=_noop_sleep, timeout_s=0)
-    assert verdict == P.VERIFIED
+    assert verdict == P.PANE_ONLY
+    assert verdict != P.VERIFIED
     # the payload was actually sent, then the terminating Enter
     assert run.calls["send"] == 2
+
+
+def test_a_dropped_enter_is_never_verified(P):
+    """The Enter is its own `cmux send`. If it fails, the payload sits in the composer — which is
+    exactly what the pane shows for a delivered message too. The old code swallowed the failure and
+    then read the composer as proof."""
+    def run(argv, timeout=None):
+        if argv[:2] == ["cmux", "send"]:
+            calls = getattr(run, "n", 0) + 1
+            run.n = calls
+            if calls >= 2:                      # the terminating Enter
+                raise RuntimeError("cmux send failed")
+            return _Proc("OK")
+        if argv[:2] == ["cmux", "read-screen"]:
+            return _Proc(f"working...\n{LONG}\n")
+        return _Proc("")
+
+    verdict, _ = P.send_verified("ws-1", LONG, run=run, sleep=_noop_sleep, timeout_s=0)
+    assert verdict != P.VERIFIED, "a dropped Enter must never be reported as delivered"
+
+
+def test_verified_requires_the_transcript_to_record_this_send(P, tmp_path, monkeypatch):
+    """VERIFIED needs SUBMISSION evidence: the tail appended to the lane's transcript AFTER the
+    pre-send baseline. The pane is not evidence of the act."""
+    sid = "01a0d648-4097-74b8-8cfd-3df3a071b463"
+    home = tmp_path / "home"
+    sessions = home / ".pi" / "agent" / "sessions" / "proj"
+    sessions.mkdir(parents=True)
+    sess = sessions / f"2026-09-29T12-00-00Z-{sid}.jsonl"
+    sess.write_text('{"type":"user","text":"an earlier message"}\n')
+    monkeypatch.setenv("HOME", str(home))
+
+    def run(argv, timeout=None):
+        if argv[:2] == ["cmux", "send"]:
+            payload = argv[-1]
+            if payload != "\n":           # a real submit, not the terminating Enter
+                fh = open(sess, "a", encoding="utf-8")
+                fh.write(LONG + "\n")
+                fh.close()
+            return _Proc("OK")
+        if argv[:2] == ["cmux", "read-screen"]:
+            return _Proc("pane scrolled past the message")
+        if argv[:3] == ["cmux", "surface", "resume"]:
+            return _Proc(f"{sid}\n")
+        return _Proc("")
+
+    verdict, _ = P.send_verified("ws-1", LONG, run=run, sleep=_noop_sleep, timeout_s=0)
+    assert verdict == P.VERIFIED
+
+
+def test_a_previous_identical_message_does_not_certify_a_later_send(P, tmp_path):
+    """⛔ OCCURRENCE IDENTITY (#1881 review P1). The transcript lookup was "is the marker anywhere in
+    the last 2 MB", which on a live lane spans days — so a standing order, a nudge, or the retry the
+    script's own recovery text prescribes certifies a LATER truncated send. Only bytes appended after
+    the pre-send baseline may match."""
+    f = tmp_path / "session.jsonl"
+    f.write_text('{"type":"user","text":"' + LONG + '"}\n')
+    baseline = f.stat().st_size
+    # The SAME payload is already there from long ago: with the baseline it proves nothing.
+    assert P.transcript_has_payload(str(f), LONG, since_offset=baseline) is False
+    # ...and it would still "match" without the baseline, which is the defect being closed.
+    assert P.transcript_has_payload(str(f), LONG) is True
+    with open(f, "a", encoding="utf-8") as fh:
+        fh.write(LONG + "\n")
+    assert P.transcript_has_payload(str(f), LONG, since_offset=baseline) is True
+
+
+def test_a_rolled_transcript_fails_closed(P, tmp_path):
+    f = tmp_path / "session.jsonl"
+    f.write_text(LONG + "\n")
+    # A baseline PAST the current size means the file rolled between the readings; the positions are
+    # not comparable, so nothing may be certified.
+    assert P.transcript_has_payload(str(f), LONG, since_offset=f.stat().st_size + 5000) is False
 
 
 def test_send_unverified_when_only_a_prefix_landed(P):
@@ -178,10 +256,20 @@ def test_send_verified_from_the_transcript_when_the_pane_scrolled(P, tmp_path, m
     home = tmp_path / "home"
     sessions = home / ".pi" / "agent" / "sessions" / "proj"
     sessions.mkdir(parents=True)
-    (sessions / f"2026-09-29T12-00-00Z-{sid}.jsonl").write_text(LONG + "\n")
+    sess = sessions / f"2026-09-29T12-00-00Z-{sid}.jsonl"
+    sess.write_text('{"type":"user","text":"earlier"}\n')
     monkeypatch.setenv("HOME", str(home))
 
-    run = _fake_cmux("pane scrolled past the message", surface_out=f"{sid}\n")
+    base = _fake_cmux("pane scrolled past the message", surface_out=f"{sid}\n")
+    inner = base
+
+    def run(argv, timeout=None):
+        proc = inner(argv, timeout)
+        if argv[:2] == ["cmux", "send"] and argv[-1] != "\n":
+            with open(sess, "a", encoding="utf-8") as fh:
+                fh.write(LONG + "\n")
+        return proc
+
     verdict, _ = P.send_verified("ws-1", LONG, run=run, sleep=_noop_sleep, timeout_s=0)
     assert verdict == P.VERIFIED
 
@@ -192,13 +280,44 @@ def test_empty_payload_never_reports_verified(P):
     assert verdict == P.UNVERIFIED
 
 
+def test_verify_flattens_the_payload_before_sending(P, monkeypatch):
+    """⛔ `flatten` was DEAD CODE while every caller passed the raw body (#1881 review P1). A newline
+    in a `cmux send` payload is an Enter, so a multi-line order is submitted line by line — each line
+    its own independent chance at the #1187 truncation — while the tail marker can only ever certify
+    the LAST one: a lost MIDDLE line verified. The CLI must send the flat form."""
+    sent = {}
+    pane = tmp_path_screen = None
+    marker = "TAIL-SENTINEL"
+
+    def run(argv, timeout=None):
+        if argv[:2] == ["cmux", "send"]:
+            sent.setdefault("payloads", []).append(argv[-1])
+            return _Proc("OK")
+        if argv[:2] == ["cmux", "read-screen"]:
+            return _Proc("")
+        return _Proc("")
+
+    monkeypatch.setattr(P, "_default_run", lambda argv, timeout=45: run(argv, timeout))
+    P._main(["verify", "--workspace", "ws-1", "--text", "line one\nline two\n" + marker,
+             "--timeout", "0"])
+    payloads = sent.get("payloads") or []
+    assert payloads, "nothing was sent"
+    body = payloads[0]
+    assert "\n" not in body, "the CLI sent a multi-line payload: each newline is its own Enter"
+    assert body == f"line one line two {marker}"
+
+
 # ── end-to-end: the orchestrator send path (scripts/orch-send.sh) ──────────────
 #
 # The helper is only the fix if the path that actually dispatches lanes USES it.
 # These drive the real script with a PATH-shimmed `cmux`, so the wiring (send +
 # verify + exit code) is pinned, not just the module.
 
-def _fake_cmux_path(tmp_path, screen_text):
+def _fake_cmux_path(tmp_path, screen_text, session=None, sid=None):
+    """A PATH-shimmed `cmux`. When `session` is given, a payload send APPENDS to it and
+    `surface resume show` answers `sid` — i.e. the fake SUBMITS the message, which is what a delivery
+    verdict now requires (#1881 review P0). Without it the fake only puts text on the surface, which
+    is the composer state, not a submission."""
     bindir = tmp_path / "bin"
     bindir.mkdir()
     screen = tmp_path / "screen.txt"
@@ -215,10 +334,13 @@ def _fake_cmux_path(tmp_path, screen_text):
         #!/usr/bin/env bash
         args="$*"
         case "$args" in
+          *"resume show"*) echo "${FAKE_SESSION_SID:-}" ;;
           *read-screen*"--lines 200"*) cat "${FAKE_SCREEN_FILE:-/dev/null}" ;;
           *read-screen*"--lines 10"*) cat "${FAKE_SCREEN_FILE:-/dev/null}" ;;
           *read-screen*) echo "/Users/test/Documents/GitHub/agent-infra" ;;
-          *send*) echo "OK surface:1 workspace:1" ;;
+          *send*)
+            if [ -n "${FAKE_SESSION_FILE:-}" ]; then printf '%s\\n' "$args" >>"$FAKE_SESSION_FILE"; fi
+            echo "OK surface:1 workspace:1" ;;
           *"workspace list"*) echo '{"workspaces":[]}' ;;
           *) echo "" ;;
         esac
@@ -227,23 +349,55 @@ def _fake_cmux_path(tmp_path, screen_text):
     return bindir, screen
 
 
-def _run_orch_send(bindir, screen, message):
+def _run_orch_send(bindir, screen, message, home=None, session=None, sid=None):
     env = dict(os.environ)
     env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
     env["FAKE_SCREEN_FILE"] = str(screen)
     env["ORCH_SEND_VERIFY_TIMEOUT"] = "0"
+    if home:
+        env["HOME"] = str(home)
+    if session:
+        env["FAKE_SESSION_FILE"] = str(session)
+    if sid:
+        env["FAKE_SESSION_SID"] = sid
     return subprocess.run(["bash", _ORCH_SEND, "ws-1", "TEST", message],
                           capture_output=True, text=True, env=env, timeout=60)
+
+
+def _submitting_lane(tmp_path, screen_text):
+    """A fixture whose fake cmux SUBMITS: a session transcript exists, and each payload send appends
+    to it. This is the only shape in which a delivery verdict can legitimately be CONSUMED."""
+    sid = "01a0d648-4097-74b8-8cfd-3df3a071b463"
+    home = tmp_path / "home"
+    sessions = home / ".pi" / "agent" / "sessions" / "proj"
+    sessions.mkdir(parents=True)
+    session = sessions / f"2026-09-29T12-00-00Z-{sid}.jsonl"
+    session.write_text('{"type":"user","text":"an earlier message"}\n')
+    bindir, screen = _fake_cmux_path(tmp_path, screen_text, session=session, sid=sid)
+    return bindir, screen, home, session, sid
 
 
 def test_orch_send_reports_consumed_only_when_the_tail_is_verified(tmp_path):
     # Same started-turn line as the prefix test: the difference between the two cases must
     # be the TAIL, never the turn signal (which is present in both).
-    bindir, screen = _fake_cmux_path(tmp_path, f"Working... (turn started)\n{LONG}\n")
-    r = _run_orch_send(bindir, screen, LONG)
+    # The lane SUBMITS here (its transcript records the send), which is what CONSUMED certifies.
+    bindir, screen, home, session, sid = _submitting_lane(
+        tmp_path, f"Working... (turn started)\n{LONG}\n")
+    r = _run_orch_send(bindir, screen, LONG, home=home, session=session, sid=sid)
     assert r.returncode == 0, r.stdout + r.stderr
     assert "CONSUMED" in r.stdout
     assert "NOT VERIFIED" not in r.stdout
+
+
+def test_orch_send_does_not_report_consumed_when_the_enter_was_lost(tmp_path):
+    """⛔ The P0 through the REAL script (#1881 review). The pane shows the payload because the
+    composer renders what it holds; the transcript shows NOTHING because nothing was submitted. The
+    old code grepped the pane, so this was a CONSUMED exit 0 — an order loss reported as delivered."""
+    bindir, screen = _fake_cmux_path(tmp_path, f"Working... (turn started)\n{LONG}\n")
+    r = _run_orch_send(bindir, screen, LONG)          # no session => nothing is ever appended
+    assert r.returncode == 6, r.stdout + r.stderr
+    assert "CONSUMED" not in r.stdout
+    assert "NOT SUBMITTED" in r.stdout
 
 
 def test_orch_send_does_not_report_ok_over_a_prefix(tmp_path):

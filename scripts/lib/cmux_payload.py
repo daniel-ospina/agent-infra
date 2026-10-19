@@ -61,15 +61,23 @@ DEFAULT_POLL_S = 3.0
 
 VERIFIED = "VERIFIED"
 UNVERIFIED = "UNVERIFIED"
+# ⛔ A THIRD VERDICT, because two could not express three states (#1881 review P0). The pane shows
+# the composer's CONTENT, submitted or not: a payload typed into the lane's input box and never
+# submitted renders its tail exactly like a delivered message. Reporting that as VERIFIED is the
+# false pass this module exists to prevent, so "the tail is visible but submission is not proven"
+# gets its own loud name instead of being folded into either neighbour.
+PANE_ONLY = "PANE_ONLY"
 
 
 def flatten(text: str) -> str:
     """Collapse every whitespace run to a single space.
 
     A newline in a `cmux send` payload is an Enter, so a multi-line payload is
-    submitted one line at a time and arrives as fragments (#1799). Callers that
-    want one message send a flat body; this is the same normalisation the lane
-    nudge paths already apply.
+    submitted one line at a time and arrives as FRAGMENTS (#1799) — each line its
+    own independent chance at the #1187 loss, while the tail marker can only ever
+    certify the LAST one. So `verify` FLATTENS before it sends (see `_main`): one
+    message, one submission, one thing to verify. This is the same normalisation
+    the lane nudge paths already apply.
     """
     return " ".join((text or "").split())
 
@@ -137,23 +145,47 @@ def resolve_session_file(workspace: str, run) -> str | None:
 
 def transcript_has_payload(path: str, sent_text: str,
                            tail_chars: int = DEFAULT_TAIL_CHARS,
-                           tail_bytes: int = 2_000_000) -> bool:
+                           tail_bytes: int = 2_000_000,
+                           since_offset: int | None = None) -> bool:
     """True iff the payload's tail marker appears in the session transcript.
 
-    Reads only the tail of the file: a session `.jsonl` can be tens of MB and
-    the only question here is whether the message was written recently.
+    Reads only the tail of the file: a session `.jsonl` can be tens of MB.
+
+    ⛔ `since_offset` IS THE POINT (#1881 review P1). Without it this function answered "is the marker
+    anywhere in the last 2 MB", which on a live lane can span DAYS — so an earlier message with the
+    same body (a standing order, a nudge, the retry that `orch-send.sh 165` tells the operator to
+    send) certifies a LATER, truncated send. The caller records the transcript's size BEFORE sending
+    and passes it here, so only bytes APPENDED BY THIS SEND can match. Omitting it keeps the old
+    behaviour for a caller that has no pre-send reading — which is weaker, not stronger, and says so.
     """
     marker = tail_marker(sent_text, tail_chars)
     if not marker:
         return False
     try:
         size = os.path.getsize(path)
+        start = max(0, size - tail_bytes)
+        if since_offset is not None:
+            if size < since_offset:
+                # The transcript rolled/truncated between the two readings, so the positions are
+                # not comparable. Fail CLOSED: a rewrite means this send's bytes cannot be located.
+                return False
+            start = max(start, since_offset)
         with open(path, "rb") as fh:
-            fh.seek(max(0, size - tail_bytes))
+            fh.seek(start)
             tail = fh.read().decode("utf-8", "replace")
     except Exception:                                          # noqa: BLE001
         return False
     return marker in compact(tail)
+
+
+def transcript_offset(path: str | None) -> int | None:
+    """The transcript's size right now, or None — the pre-send baseline for `since_offset`."""
+    if not path:
+        return None
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return None
 
 
 def _default_run(argv, timeout=45):
@@ -167,9 +199,14 @@ def send_verified(workspace: str, text: str, *, run=None, sleep=time.sleep,
                   poll_s: float = DEFAULT_POLL_S) -> tuple[str, str]:
     """Send `text` to `workspace`, then verify its tail on the pane.
 
-    Returns ``(VERIFIED|UNVERIFIED, last_screen)``. Never raises on a clean send
-    failure — a non-zero `cmux` exit or an unreadable surface folds into
+    Returns ``(VERIFIED|PANE_ONLY|UNVERIFIED, last_screen)``. Never raises on a clean
+    send failure — a non-zero `cmux` exit or an unreadable surface folds into
     ``UNVERIFIED``, which is the loud verdict the caller must surface.
+
+    ``VERIFIED`` requires SUBMISSION evidence (the tail marker appended to the lane's transcript after
+    the pre-send baseline). ``PANE_ONLY`` means the tail is visible on the surface but nothing proves
+    it was submitted — a dropped Enter, or a pane that still shows an earlier message with the same
+    body. It is NOT a delivery verdict, and a caller that treats it as one re-opens #1187.
 
     `run` and `sleep` are seams so the send/verify loop can be exercised without
     a live cmux.
@@ -179,24 +216,35 @@ def send_verified(workspace: str, text: str, *, run=None, sleep=time.sleep,
     def cmux(*args):
         return run(["cmux", *args], timeout=45)
 
+    # ⛔ THE TRANSCRIPT BASELINE IS TAKEN BEFORE THE SEND (#1881 review P1). Resolving it afterwards
+    # would leave the size AFTER the bytes we are trying to attribute, so `since_offset` could only
+    # certify nothing. This is the one read that must precede the act it observes.
+    session_file = resolve_session_file(workspace, run)
+    session_base = transcript_offset(session_file)
+
     try:
         cmux("send", "--workspace", workspace, text)
     except Exception:                                          # noqa: BLE001
         return UNVERIFIED, ""
 
     sleep(2)
+    entered = True
     try:
         # The terminating Enter. Sent as its own call so a payload that itself
         # ends in a newline does not submit the message twice.
         cmux("send", "--workspace", workspace, "\n")
     except Exception:                                          # noqa: BLE001
-        pass
+        # ⛔ AN ENTER THAT DID NOT HAPPEN IS NOT A DETAIL (#1881 review P0). This used to be
+        # swallowed, and the loop below then found the payload ON THE PANE — the composer renders
+        # its content whether or not it was submitted — and returned VERIFIED. The lane never got
+        # the order and the orchestrator recorded it delivered: the exact false pass this module
+        # exists to prevent. Record the failure and let it decide the verdict.
+        entered = False
     sleep(2)
 
     deadline = time.monotonic() + timeout_s
     screen = ""
-    session_file = None
-    session_checked = False
+    saw_tail = False
     while True:
         try:
             proc = cmux("read-screen", "--workspace", workspace,
@@ -205,15 +253,17 @@ def send_verified(workspace: str, text: str, *, run=None, sleep=time.sleep,
         except Exception:                                      # noqa: BLE001
             screen = ""
         if screen_has_payload(screen, text, tail_chars):
-            return VERIFIED, screen
-        # Second source, resolved once: the transcript is where a submitted
-        # message is durably written, and it survives a scrolled pane.
-        if not session_checked:
-            session_file = resolve_session_file(workspace, run)
-            session_checked = True
-        if session_file and transcript_has_payload(session_file, text, tail_chars):
+            saw_tail = True
+        # SUBMISSION EVIDENCE, in order of strength. The transcript is where a submitted message is
+        # durably written, so it is the only source that can certify the act; the pane can only show
+        # that the text reached the composer. Checking the pane FIRST (as this did) let the weaker
+        # source short-circuit the stronger one.
+        if session_file and transcript_has_payload(session_file, text, tail_chars,
+                                                   since_offset=session_base):
             return VERIFIED, screen
         if time.monotonic() >= deadline:
+            if saw_tail:
+                return PANE_ONLY, screen
             return UNVERIFIED, screen
         sleep(poll_s)
 
@@ -245,12 +295,20 @@ def _main(argv: list[str] | None = None) -> int:
         parser.error("give --text or --file")
 
     if args.cmd == "check":
+        # A saved screen answers ONLY the pane question, which is not a delivery verdict (#1881
+        # review P0): the surface cannot distinguish a submitted message from one sitting in the
+        # composer. Report PANE_ONLY for a match so the distinction is unmissable.
         with open(args.screen_file, encoding="utf-8", errors="replace") as fh:
             screen = fh.read()
         ok = screen_has_payload(screen, text, args.tail_chars)
-        print(VERIFIED if ok else UNVERIFIED)
+        print(PANE_ONLY if ok else UNVERIFIED)
         return 0 if ok else 3
 
+    # ⛔ FLATTEN BEFORE SENDING (#1881 review P1). `flatten` was dead code while every caller passed
+    # the raw body: a `cmux send` payload's newlines are individual Enters, so a multi-line order is
+    # submitted line by line, each line an independent chance at the #1187 truncation, and the tail
+    # marker certifies only the last one — a lost MIDDLE line verifies. One message, one submission.
+    text = flatten(text)
     verdict, screen = send_verified(args.workspace, text, tail_chars=args.tail_chars,
                                     screen_lines=args.screen_lines,
                                     timeout_s=args.timeout)
