@@ -3285,6 +3285,45 @@ ck "non-vacuity: the name-blind check FIRES on a bare \`-maxdepth\` that no stub
 # a P0 exception would reopen new issue work on top of an un-worked PR queue. The assertions
 # that used to drive that override (and the `.prio` writer) went with it; refresh-candidates
 # keeps its single `.pool` artifact, and that IS covered by the #8465 ordering check above.
+
+# ── the reviewer's verdict classifies into THREE outcomes, and only one authorises a fixer ────
+# Ported IN from the tortoise fork (agent-infra#8602): a verdict-less run (stall/crash/timeout) and a
+# real `ISSUES` verdict must never share an arm, because `needsfix-<PR>-<head>` is the only thing that
+# spawns a FIXER. Sharing it burnt a MAX_FIX_TRIES attempt per stall and parked PRs that had never
+# been reviewed. These drive the SHIPPED functions; a grep would stay green if an arm were deleted.
+if [ -s "$MERGE" ]; then
+  { awk '/^verdict_kind\(\) \{/{f=1} f{print} f && /^\}/{c++} f && c==1{exit}' "$MERGE"
+    awk '/^apply_verdict_marker\(\) \{/{f=1} f{print} f && /^\}/{c++} f && c==1{exit}' "$MERGE"; } > "$TMP/verdict.sh" 2>/dev/null
+  if [ -s "$TMP/verdict.sh" ] && grep -q 'verdict_kind' "$TMP/verdict.sh"; then
+    vk() { ( . "$TMP/verdict.sh"; verdict_kind "$1" ); }
+    [ "$(vk 'CLEAN https://x/1')" = clean ] && rc=0 || rc=1
+    ck "verdict_kind: a CLEAN verdict classifies as clean" $rc
+    [ "$(vk 'ISSUES 3')" = issues ] && rc=0 || rc=1
+    ck "verdict_kind: an ISSUES verdict classifies as issues" $rc
+    [ "$(vk '')" = none ] && rc=0 || rc=1
+    ck "verdict_kind: an EMPTY verdict is 'none' (a stall is not a finding)" $rc
+    [ "$(vk 'garbage without a verdict')" = none ] && rc=0 || rc=1
+    ck "verdict_kind: an unrecognised line is 'none', never 'issues'" $rc
+
+    # The marker is what authorises the fixer, so drive its WRITE behaviour, not just its name.
+    vdir="$TMP/vmark"; mkdir -p "$vdir/state"
+    # ⛔ A VAR IN FRONT OF `.` APPLIES ONLY TO THE SOURCE, not to the function called after it — so
+    # `O=… . file; fn` runs fn with O UNSET (the same per-command-env trap that bit an earlier test).
+    # The whole call is one subshell here.
+    m1="$( O="$vdir" PR=42 bash -c '. "$1"; apply_verdict_marker issues abc123' _ "$TMP/verdict.sh" )"
+    [ -n "$m1" ] && [ -f "$vdir/state/needsfix-42-abc123" ] && rc=0 || rc=1
+    ck "apply_verdict_marker: an ISSUES verdict WRITES needsfix-<PR>-<head> (the fixer's authority)" $rc
+    m2="$( O="$vdir" PR=42 bash -c '. "$1"; apply_verdict_marker none abc123' _ "$TMP/verdict.sh" )"
+    [ -z "$m2" ] && rc=0 || rc=1
+    ck "apply_verdict_marker: a verdict-LESS run writes NO marker (no burnt retry, no false park)" $rc
+    m3="$( O="$vdir" PR=43 bash -c '. "$1"; apply_verdict_marker issues ""' _ "$TMP/verdict.sh" )"
+    [ -z "$m3" ] && rc=0 || rc=1
+    ck "apply_verdict_marker: an empty head writes no marker (a marker must name a head)" $rc
+  else
+    ck "merge-one.sh carries verdict_kind/apply_verdict_marker (#8602 port)" 1
+  fi
+fi
+
 echo
 # ── platform-gate self-check (NON-VACUITY) ──────────────────────────────────────
 # A green run must never be green BECAUSE everything was skipped — that is a false PASS of the class

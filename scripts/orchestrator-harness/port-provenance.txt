@@ -264,17 +264,29 @@
 #                     (the files the loop and the anti-relapse check execute). The fork's
 #                     P0_BYPASS_MERGE_PRIORITY rendering is NOT carried — see the reconcile note
 #                     above: launchd still gets every OTHER knob rendered, unchanged.
+#   - merge-one.sh    verdict_kind()/apply_verdict_marker() (#8612, agent-infra#8602): a verdict-LESS
+#                     reviewer run (stall/crash/timeout) writes NO needsfix marker, so it cannot
+#                     authorise a fixer, burn a MAX_FIX_TRIES attempt, or park a PR that was never
+#                     reviewed. Measured: 43 of 124 reviewer runs ended at the cap; 7 of 7 cap-hits
+#                     in one window were verdict-less and 4 were then parked "needs a human".
+#                     Driven by selftest.sh (clean/issues/none + marker write/no-write/no-head).
 #
 # NOT taken, deliberately: (1) the fork's `p0_merge_priority_override` cleared ANY non-empty reason
 # and relied on its call site's ordering, so a reorder would have let a P0 clear a LOAD gate — moot
 # now that the whole override is dropped, but kept here because it is why the port was rewritten
 # rather than copied; (2) the override itself, for the owner-ruling reason stated above.
 #
+# ⛔ STILL UNPORTED, AND THE REASON THE TORTOISE COPY KEEPS ONE FILE: #8484/#8589 — the reviewer runs
+# in its own DETACHED checkout rather than the tree it reviews, and the AGENT_ALLOW_MAIN_EDITS export
+# is withdrawn. That change is larger and blocked on files other lanes hold, so
+# `tortoise/operations/orchestrator-harness/merge-one.sh` is NOT deleted; it is the only copy carrying
+# it. tortoise's `tools/check-harness-fork.sh` allows exactly that filename, by name, and says so in
+# its output. Port it, then delete it there and drop it from that guard's ALLOWED list.
+#
 # ⛔ DO NOT `--repin` YET (unchanged, and still load-bearing). The pin below names the last
-# reconciliation that was COMPLETE for every file. Three ports from this source are still blocked on
-# HELD files (merge-one.sh: #8589, #8612; orch-loop/selftest half of #8518 — see the 2026-10-15
-# entry above). Re-pinning now would assert those as reconciled and turn the guard green over a
-# source that has moved: the stale-flag false pass this file exists to prevent.
+# reconciliation that was COMPLETE for every file. merge-one.sh is still short of #8589, so a repin
+# would assert it reconciled and turn the guard green over a source that has moved — the stale-flag
+# false pass this file exists to prevent.
 #
 # pinned_ref=origin/main
 # pinned_tip=e20de606be10fc9fda96729b6cfd6277ac3ad1ec   (2026-10-13T20:17:21Z)

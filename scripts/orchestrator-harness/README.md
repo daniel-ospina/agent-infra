@@ -2413,6 +2413,7 @@ came back. Those were ported IN, not discarded:
 |---|---|---|
 | `Closes #N` required; a bare `Refs` is refused | a finished lane writing `Refs` never closes its issue, and nothing re-reads it: 25 of 36 open P0-blockers already had merged PRs (tortoise#8468) | `lane.sh` |
 | `merged-not-closed.sh` | the fleet could not answer "which open issues already have a merged PR?" — no tool existed | new file |
+| `verdict_kind()` / `apply_verdict_marker()` | a verdict-LESS reviewer run (stall/crash/timeout) must not authorise a fixer: 7 of 7 cap-hits in one window were verdict-less and 4 were parked "needs a human", never reviewed | `merge-one.sh` |
 | ⛔ a P0-blocker outranks the merge-priority gate (BP0, `P0_BYPASS_MERGE_PRIORITY`, `.prio` map) | **NOT carried — reconciled onto main and superseded.** The fork's measurement (19 open PRs, 0 lanes, 33 P0-blockers, 0 closed in 12h) was taken against a gate that closed *below* `MERGE_PRIORITY_AT`; main's rule is unconditional (owner ruling, 2026-10-18: "while ONE un-owned PR remains, it is the work"), so a P0 exception would reopen new issue work on top of an un-worked PR queue — the defect that ruling ends. Nothing reads `.prio` on main | `orch-loop.sh` (rebase: hunk dropped), `refresh-candidates.sh`, `install.sh`, plist |
 
 Everything else the fork carried is here. The BP0 override and its `.prio` rank map are the ONE
@@ -2420,3 +2421,10 @@ part of it that is not: main reached the same goal by removing the threshold out
 the override would let a P0 dispatch while un-owned PRs sit unworked — the exact behaviour the owner
 ruling forbids. If BP0 is wanted back, it is a **reopen of that ruling**, argued where the ruling
 lives — not a merge-time default.
+
+**One fix is still unported, and one file is still in tortoise because of it:** `merge-one.sh`'s
+#8484/#8589 detached-reviewer checkout (the reviewer should run in its own tree, and the
+`AGENT_ALLOW_MAIN_EDITS` export withdrawn). Deleting the only copy of an unported fix is the silent
+destruction this consolidation must not commit, so that file stays, tortoise's guard allows it **by
+name** and says so in its output, and this paragraph is the record. Port it, then delete it and drop
+it from that guard's `ALLOWED` list.
