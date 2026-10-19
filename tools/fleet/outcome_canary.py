@@ -2757,7 +2757,11 @@ class State(object):
         # `pop expected at most 1 argument` on the DELIVERED path, which runs BEFORE `state.mark` and
         # `save()` — so a message that did land was never marked, and the next poll sent the same
         # brief again: the duplicated-brief failure the AMBIGUOUS default exists to prevent.
-        for key in ("notified", "ambiguous"):
+        # `captured` is the capture-mode twin of `notified`: it records that a message was WRITTEN
+        # for this shape, never that it was SENT (see the notify loop). Kept in its own map so a
+        # capture run can de-duplicate itself without ever silencing a live run that reads the same
+        # file — the two are different claims.
+        for key in ("notified", "ambiguous", "captured"):
             if not isinstance(box_rec.get(key), dict):
                 if key in box_rec:
                     repaired = True
@@ -2782,10 +2786,20 @@ class State(object):
         for k in list(self.notified):
             if k.split("|")[0] == check:
                 del self.notified[k]
+        cap = self.data["boxes"][self.box].get("captured") or {}
+        for k in list(cap):
+            if k.split("|")[0] == check:
+                del cap[k]
         amb = self.data["boxes"][self.box].get("ambiguous") or {}
         for k in list(amb):
             if k.split("|")[0] == check:
                 del amb[k]
+
+    def mark_captured(self, key, when):
+        self.data["boxes"][self.box].setdefault("captured", {})[key] = when
+
+    def is_captured(self, key):
+        return key in (self.data["boxes"][self.box].get("captured") or {})
 
     def mark_ambiguous(self, key, when):
         """Remember that this key's last attempt was AMBIGUOUS: suppress a blind retry until the shape
@@ -2810,6 +2824,10 @@ class State(object):
         for k in list(self.notified):
             if k != keep and k.split("|")[0] == check:
                 del self.notified[k]
+        cap = self.data["boxes"][self.box].get("captured") or {}
+        for k in list(cap):
+            if k != keep and k.split("|")[0] == check:
+                del cap[k]
         # An AMBIGUOUS marker must be pruned the same way, or the suppression outlives the shape it
         # was recorded for: an attempt for NOT_DISPATCHED that may have landed would keep suppressing
         # that shape FOREVER, so the next time the fleet returns to it the alert is never sent — the
@@ -2875,7 +2893,7 @@ def compose_message(v, verdicts, box, obs_iso, extra_lines=None):
     return "\n".join(lines) + "\n"
 
 
-def plan_notifications(verdicts, state):
+def plan_notifications(verdicts, state, capturing=False):
     """Which verdicts need a message. Change-only, per (box, check, variant).
 
     Returns (to_send, suppressed). A key is only recorded once a send is CONFIRMED, so a refused
@@ -2888,7 +2906,11 @@ def plan_notifications(verdicts, state):
             state.clear(v.name)          # a recovery re-arms the alert for that check
             continue
     for v in failing:
-        if v.key in state.notified or state.is_ambiguous(v.key):
+        # ⛔ A CAPTURE AND A SEND ARE DIFFERENT CLAIMS, so they de-duplicate against different maps.
+        # Consulting `notified` in capture mode made a PREVIEW silence production; consulting
+        # `captured` in send mode would make a real run repeat a message nobody has received yet.
+        already = state.is_captured(v.key) if capturing else state.notified.get(v.key)
+        if already or state.is_ambiguous(v.key):
             suppressed.append(v)
             continue
         # ⛔ NOTHING IS COMPOSED HERE. `main` composes the bytes it sends, extras included, and threw
@@ -3114,10 +3136,27 @@ def attempt_respawn(v, cfg, machine, dry_run=False, plist=None, uid=None, poll_d
     # LAUNCHD_PID_UNRESOLVED — a member of RESPAWN_TRIGGERS.
     scope_paths = [x for x in cfg.controller_paths() if x]
     if scope_paths:
-        usable = []
+        usable, unprobed = [], []
         for cand in scope_paths:
             rc_e, out_e = machine.sh("test -e %s && echo YES || echo NO" % _q(cand))
-            usable.append(rc_e == 0 and (out_e or "").strip().endswith("YES"))
+            if rc_e != 0:
+                unprobed.append((cand, (out_e or "").strip()[:120]))
+                continue
+            usable.append((out_e or "").strip().endswith("YES"))
+        if unprobed and not any(usable):
+            # ⛔ A FAILED PROBE IS NOT A MISSING SCRIPT. `rc != 0` (a `cmux cloud exec` that could not
+            # connect, a timeout at load 115) says the scope was never READ — reporting "the scope
+            # does not contain the controller's script" from it is a claim about the world built from
+            # a read that did not happen, and it points the operator at a path that may be fine. The
+            # action is refused either way; only the SENTENCE changes.
+            res["attempted"] = False
+            res["detail"] = ("NOT ATTEMPTED: the scope could not be PROBED (%s) — so nothing is "
+                             "established about where the controller runs, and absence cannot be "
+                             "claimed" % "; ".join("%s: %s" % (c, e or "no output")
+                                                   for c, e in unprobed[:3]))
+            res["scope_unusable"] = True
+            res["scope_unreadable"] = True
+            return res
         if not any(usable):
             res["attempted"] = False
             res["detail"] = ("NOT ATTEMPTED: the scope does not contain the controller's script "
@@ -4447,6 +4486,19 @@ def main(argv=None):
             print("outcome-canary: --skip %s applies to the LIVE collection only; in --static use "
                   "--only to narrow which checks are asserted" % ",".join(skip), file=sys.stderr)
             return 3
+        # ⛔ THE SAME RULE FOR THE OTHER LIVE-ONLY KNOBS. `--static --facts X` loaded NOTHING and
+        # exited 0 over 30 passing fixtures — a green that looks like the payload was graded, and the
+        # only tells are `mode` and the fixture names. A capture directory likewise has no meaning
+        # when nothing is composed.
+        for flag, given in (("--facts", a.facts), ("--capture-dir", a.capture_dir)):
+            if given:
+                print("outcome-canary: %s applies to the LIVE path only; --static grades FIXTURES"
+                      % flag, file=sys.stderr)
+                return 3
+        if a.state_path:
+            print("outcome-canary: --state applies to the LIVE path only (nothing is notified in "
+                  "--static)", file=sys.stderr)
+            return 3
         paths = fixture_paths(a.fixture, a.fixtures_dir if a.fixtures_dir is not None
                               else (None if a.fixture else default_fixtures_dir()))
         if not paths:
@@ -4607,7 +4659,8 @@ def main(argv=None):
                  cfg.box, cfg.repo or "(unknown — pass --repo)", obs_iso, cfg.window_s,
                  cfg.pr_window_s, cfg.mem_floor_mb, cfg.disk_floor_gb, cfg.pool_threshold))
 
-    reported = {"respawn": None, "sent": [], "suppressed": [], "not_delivered": [],
+    reported = {"respawn": None, "sent": [], "captured": [], "suppressed": [],
+                "not_delivered": [],
                 "facts": ("injected: %s" % a.facts) if _injected else "live collection"}
 
     # (a) respawn — ONLY when the controller is genuinely absent
@@ -4624,18 +4677,36 @@ def main(argv=None):
             if _injected:
                 reported["facts"] = ("injected for the first read (%s); RE-COLLECTED LIVE after the "
                                      "respawn" % a.facts)
-            facts2 = collect_live(cfg, machine=machine, now=time.time(), skip=skip)
-            # ⛔ THE PROVENANCE MUST FOLLOW THE VERDICTS. These describe the payload that produced
-            # them, and the verdicts just came from a LIVE read: leaving them alone printed
-            # "FACTS INJECTED (…; not a live observation)" over live verdicts and emitted
-            # `facts_injected: true` beside a live `observed_at` — the two fields a consumer uses to
-            # judge currency, contradicting `facts_source` in the same payload.
-            prov = _post_respawn_provenance(cfg, a.facts)
-            _injected, obs_iso, header = prov["injected"], prov["observed_at"], prov["header"]
-            reported["facts"] = prov["facts"]
-            verdicts = evaluate(facts2, cfg, only=only)
-            not_evaluated = [n for n in CHECK_ORDER if n not in set(v.name for v in verdicts)]
-            code = exit_code(verdicts, not_evaluated)
+            try:
+                facts2 = collect_live(cfg, machine=machine, now=time.time(), skip=skip)
+            except Exception as exc:
+                # ⛔ THE SECOND COLLECTION IS THE ONE THAT RUNS AFTER A DESTRUCTIVE ACTION. It was
+                # the ONLY unguarded `collect_live` call, so an exception here escaped `main` with a
+                # traceback, no report, no message — and exit 1, hiding the `launchctl` action the
+                # run had just taken.
+                reported["respawn"] = dict(rr, after_collect_error="%s: %s"
+                                           % (type(exc).__name__, exc))
+                verdicts = [V(name, INCONCLUSIVE, "COLLECTOR_ERROR",
+                              "the post-respawn re-read raised %s: %s"
+                              % (type(exc).__name__, exc),
+                              "the respawn ran, but what happened afterwards was not read, so "
+                              "nothing about this check is established.")
+                            for name in CHECK_ORDER]
+                not_evaluated = []
+                code = 2
+                facts2 = None
+            if facts2 is not None:
+                # ⛔ THE PROVENANCE MUST FOLLOW THE VERDICTS. These describe the payload that
+                # produced them, and the verdicts just came from a LIVE read: leaving them alone
+                # printed "FACTS INJECTED (…; not a live observation)" over live verdicts and emitted
+                # `facts_injected: true` beside a live `observed_at` — the two fields a consumer uses
+                # to judge currency, contradicting `facts_source` in the same payload.
+                prov = _post_respawn_provenance(cfg, a.facts)
+                _injected, obs_iso, header = prov["injected"], prov["observed_at"], prov["header"]
+                reported["facts"] = prov["facts"]
+                verdicts = evaluate(facts2, cfg, only=only)
+                not_evaluated = [n for n in CHECK_ORDER if n not in set(v.name for v in verdicts)]
+                code = exit_code(verdicts, not_evaluated)
     elif ctrl_v is not None and ctrl_v.variant in RESPAWN_TRIGGERS:
         reported["respawn"] = {"attempted": False, "took": False,
                                "detail": "suppressed by --no-respawn", "commands": []}
@@ -4657,7 +4728,7 @@ def main(argv=None):
         if getattr(state, "repaired", False):
             reported["state_repaired"] = ("%s (version %s)" % (cfg.state_path,
                                                                state.data.get("version")))
-        to_send, suppressed = plan_notifications(verdicts, state)
+        to_send, suppressed = plan_notifications(verdicts, state, capturing=bool(a.capture_dir))
         reported["suppressed"] = [v.key for v in suppressed]
         # which of those are AMBIGUOUS (nothing confirmed) rather than delivered
         reported["suppressed_ambiguous"] = [v.key for v in suppressed if state.is_ambiguous(v.key)]
@@ -4699,6 +4770,21 @@ def main(argv=None):
                                                    ws=ws,
                                                    label="canary-%s-%s" % (v.name, v.variant)))
             if delivered:
+                # ⛔ A CAPTURE IS NOT A DELIVERY. `--capture-dir` writes the composed message to a
+                # directory instead of sending it, and marking it delivered records in the PERSISTENT
+                # state that somebody was told: the next real run then suppresses a real FAIL with no
+                # human involved. (Measured: capture run → state `delivered: true` → the live run
+                # printed `suppressed`.) A capture is recorded beside the sends, never as one.
+                if a.capture_dir:
+                    reported["captured"].append({"check": v.name, "variant": v.variant,
+                                                 "detail": detail})
+                    state.mark_captured(v.key, now)
+                    state.clear_others(v.name, keep=v.key)
+                    try:
+                        state.save()
+                    except Exception as exc:
+                        reported["state_error"] = "%s: %s" % (type(exc).__name__, exc)
+                    continue
                 state.clear_ambiguous(v.key)
                 state.clear_others(v.name, keep=v.key)
                 state.mark(v.key, now, delivered=True)
@@ -4748,6 +4834,7 @@ def main(argv=None):
                           "signal": {
                               "respawn": reported["respawn"],
                               "sent": reported["sent"],
+                              "captured": reported.get("captured") or [],
                               "suppressed": reported["suppressed"],
                               "suppressed_ambiguous": reported.get("suppressed_ambiguous") or [],
                               "not_delivered": reported["not_delivered"],
@@ -4783,6 +4870,12 @@ def main(argv=None):
     # OR on `state.is_ambiguous` (the bytes may be sitting in a composer and nothing is confirmed) —
     # and the report called both "already notified". An operator reading that about an AMBIGUOUS
     # marker stops looking, which is the exact silence the marker exists to make visible.
+    if reported.get("notify"):
+        print("\n%s — no message was composed or sent for this run"
+              % reported["notify"])
+    if reported.get("captured"):
+        print("\ncaptured (NOT sent — --capture-dir): %s"
+              % ", ".join("%s|%s" % (c["check"], c["variant"]) for c in reported["captured"]))
     if reported["suppressed"]:
         told = [k for k in reported["suppressed"] if k not in (reported.get("suppressed_ambiguous")
                                                                or ())]

@@ -571,6 +571,19 @@ Six more (cycle 13), each a case where a datum the tool held was not the one it 
   `not_evaluated: []` instead of 2 with a "(the other 0 checks were not asserted)" note.
 - **`log.age_s` is an age, not a truthy number**: a bool is UNREAD there too, so the "alive but
   useless" arm cannot be skipped by it and the evidence cannot print it as "(1s ago)".
+- **A CAPTURE IS NOT A DELIVERY.** `--capture-dir` writes the composed message instead of sending
+  it, and it marked the shape `delivered: true` in the PERSISTENT state file — so the next real run
+  printed `suppressed` for a real FAIL that nobody had ever been told, with no human in the loop.
+  The two claims now live in different maps (`captured` vs `notified`) and de-duplicate against the
+  mode they belong to: a repeat capture is not repeated, and a live run reading the same file still
+  sends. Both are printed in the report (`captured (NOT sent — --capture-dir): …`).
+- **A live-only knob refuses in `--static`.** `--static --facts X` loaded nothing and exited 0 over
+  30 passing fixtures — a green that looks like the payload was graded. `--facts`,
+  `--capture-dir` and `--state` are exit 3 in `--static`, like `--skip`.
+- **A scope PROBE that failed is not a measured absence.** The refusal above is the same either way,
+  but its sentence is the whole of what an operator reads: `rc != 0` (a `cmux cloud exec` that could
+  not connect, a timeout at load 115) now says the scope *could not be probed*, never that it *does
+  not contain* the script — that would be a claim about the world from a read that did not happen.
 - **A scope that cannot hold the controller's script forbids the ACTION.** The census is
   path-scoped, so `--o /tmp/typo` — or any cell whose `$O` is not the default, armed without `--o` —
   rejects the RUNNING controller as "another cell's" (`pids: []`, `near_miss: False`) and

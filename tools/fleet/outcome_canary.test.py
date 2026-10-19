@@ -1133,8 +1133,11 @@ def test_failing_run_produces_a_message_and_a_non_zero_exit():
         assert "NEXT COMMAND" in body and "$O/logs/orch-loop.log" in body   # the next command
         j = json.loads(out)
         assert j["exit"] == 1
-        got = [s["check"] for s in j["signal"]["sent"]]
+        # A CAPTURE IS NOT A DELIVERY: it lands in `captured`, which records that the bytes were
+        # WRITTEN, and `sent` stays empty — that is what keeps a preview from silencing a real run.
+        got = [s["check"] for s in j["signal"]["captured"]]
         assert got == ["work_dispatched"], got
+        assert j["signal"]["sent"] == [], j["signal"]["sent"]
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -1151,6 +1154,7 @@ def test_passing_run_produces_no_message_and_exit_zero():
         assert read_capture(cap) == {}, "a passing run must not notify"
         j = json.loads(out)
         assert j["signal"]["sent"] == [] and j["signal"]["not_delivered"] == []
+        assert j["signal"]["captured"] == []
         assert all(v["status"] == "PASS" for v in j["verdicts"]), j["verdicts"]
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -4242,7 +4246,7 @@ def test_an_unwritable_state_path_reports_and_does_not_crash_the_run():
         assert j["exit"] == 1, j["exit"]
         assert j["signal"].get("state_error"), sorted(j["signal"].keys())
             # …and the delivery is still reported, not lost
-        assert len(j["signal"]["sent"]) == 1, j["signal"]["sent"]
+        assert len(j["signal"]["captured"]) == 1, j["signal"]
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -4504,6 +4508,33 @@ MUTATIONS = [
      '    if lane_ok:\n        return True, "a lane started %s (the queue record is not the only evidence)" % (\n            _age_txt(lane_ok.get("age_s")))',
      '    if intent or lane_ok:\n        return True, "a dispatch landed %s (the queue record is not the only evidence)" % (\n            _age_txt((intent or lane_ok).get("age_s")))',
      "test_the_intent_line_is_not_reported_as_a_LANDED_dispatch"),
+    # ── cycle-44 defects ─────────────────────────────────────────────────────────────────
+    ("a capture marks the alert delivered",
+     '                    state.mark_captured(v.key, now)',
+     '                    state.mark(v.key, now, delivered=True)',
+     "test_a_CAPTURE_never_marks_the_alert_delivered_and_never_silences_a_live_run"),
+    ("a capture de-duplicates against the SENT map, silencing production",
+     '        already = state.is_captured(v.key) if capturing else state.notified.get(v.key)',
+     '        already = state.notified.get(v.key)',
+     "test_a_CAPTURE_never_marks_the_alert_delivered_and_never_silences_a_live_run"),
+    ("a failed capture is recorded as written",
+     '            if delivered:\n                # ⛔ A CAPTURE IS NOT A DELIVERY.',
+     '            if True:\n                # ⛔ A CAPTURE IS NOT A DELIVERY.',
+     "test_a_CAPTURE_that_did_not_happen_is_not_recorded"),
+    ("--static silently ignores a live-only knob",
+     '        for flag, given in (("--facts", a.facts), ("--capture-dir", a.capture_dir)):',
+     '        for flag, given in ():',
+     "test_the_STATIC_mode_refuses_a_LIVE_only_knob"),
+    ("an unprobed scope is reported as a measured absence",
+     '            if rc_e != 0:\n                unprobed.append((cand, (out_e or "").strip()[:120]))\n'
+     '                continue',
+     '            if False:\n                unprobed.append((cand, (out_e or "").strip()[:120]))\n'
+     '                continue',
+     "test_a_SCOPE_PROBE_that_FAILED_is_not_a_measured_absence"),
+    ("the post-respawn re-read is unguarded",
+     '            except Exception as exc:\n                # ⛔ THE SECOND COLLECTION IS THE ONE THAT RUNS',
+     '            except BaseException as exc:\n                raise\n                # ⛔ THE SECOND COLLECTION IS THE ONE THAT RUNS',
+     "test_a_post_RESPAWN_collector_failure_is_graded_and_keeps_the_ACTION_on_record"),
     # ── cycle-43 defects ─────────────────────────────────────────────────────────────────
     ("an unusable --o scope still kickstarts the labelled job",
      '    scope_paths = [x for x in cfg.controller_paths() if x]',
@@ -4591,7 +4622,7 @@ MUTATIONS = [
      "test_an_INJECTED_fact_set_is_disclosed_in_the_JSON_too"),
     # ── cycle-38 defects ─────────────────────────────────────────────────────────────────
     ("the ambiguous record is not shape-checked (a repair that covers one key)",
-     '        for key in ("notified", "ambiguous"):',
+     '        for key in ("notified", "ambiguous", "captured"):',
      '        for key in ("notified",):',
      "test_a_corrupt_AMBIGUOUS_record_is_REPAIRED_not_fatal"),
     ("the evidence formats a bool age as one second",
@@ -4906,7 +4937,7 @@ MUTATIONS = [
      '        if concl == "FAILURE":',
      "test_rollup_polarity_unknown_and_null_conclusions_are_red"),
     ("the notifier speaks on every poll",
-     "        if v.key in state.notified or state.is_ambiguous(v.key):",
+     "        if already or state.is_ambiguous(v.key):",
      "        if False:",
      "test_notifier_deduplicates_on_unchanged_state"),
     ("a recovery does not re-arm the alert",
@@ -5185,8 +5216,8 @@ MUTATIONS = [
      "    if a.capture_dir and not a.state_path:", "    if False:",
      "test_capture_never_writes_the_default_state_path"),
     ("an ambiguous send is blind-retried every poll",
-     "        if v.key in state.notified or state.is_ambiguous(v.key):",
-     "        if v.key in state.notified:",
+     "        if already or state.is_ambiguous(v.key):",
+     "        already = state.notified.get(v.key)\n        if already:",
      "test_an_ambiguous_send_is_not_blind_retried_but_a_refusal_is"),
     ("a failed stat is reported as a missing log",
      "            rc3, present = self.sh(\"test -e %s && echo YES || echo NO\" % _q(path))\n"
@@ -5801,6 +5832,186 @@ def test_an_INJECTED_fact_set_is_disclosed_in_the_JSON_too():
     assert payload is not None, (rc, (out or err)[-400:])
     assert payload.get("facts_injected") is True, payload.get("facts_injected")
     assert "injected" in (payload.get("facts_source") or ""), payload.get("facts_source")
+
+
+@test
+def test_a_post_RESPAWN_collector_failure_is_graded_and_keeps_the_ACTION_on_record():
+    """The second `collect_live` call is the one that runs AFTER a destructive action, and it was the
+    only unguarded one: an exception there escaped `main` with a traceback, no report, no message and
+    exit 1 — the code that says "a check FAILed" — while hiding the `launchctl` action just taken."""
+    m = load()
+    import contextlib
+    import io
+    tmp = tempfile.mkdtemp(prefix="oc-postrespawn-")
+    try:
+        facts = os.path.join(tmp, "f.json")
+        with open(facts, "w") as fh:
+            json.dump(fx("controller-absent"), fh)
+        orig_collect, orig_respawn = m.collect_live, m.attempt_respawn
+        calls = {"n": 0}
+
+        def collect(*a, **k):
+            calls["n"] += 1
+            raise RuntimeError("post-respawn read failed")
+        try:
+            m.collect_live = collect
+            m.attempt_respawn = lambda *a, **k: {"attempted": True, "took": True,
+                                                 "detail": "RESPAWN TOOK", "commands": []}
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                code = m.main(["--live", "--facts", facts, "--json", "--no-notify",
+                               "--controller-ws", "00000000-0000-0000-0000-00000000c1"])
+        finally:
+            m.collect_live, m.attempt_respawn = orig_collect, orig_respawn
+        assert code == 2, code
+        j = json.loads(buf.getvalue())
+        variants = [(v["check"], v["variant"]) for v in j["verdicts"]]
+        assert len(variants) == len(m.CHECK_ORDER), variants
+        assert all(v == "COLLECTOR_ERROR" for _, v in variants), variants
+        assert j["signal"]["respawn"]["took"] is True, j["signal"]["respawn"]
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@test
+def test_a_CAPTURE_never_marks_the_alert_delivered_and_never_silences_a_live_run():
+    """`--capture-dir` writes the composed message to a directory instead of sending it. It marked
+    the shape `delivered: true` in the state file, so the next REAL run printed `suppressed` for a
+    real FAIL and nobody had ever been told — a preview that silences production, with no human in
+    the loop and nothing in the record to say so.
+
+    The two are different claims, so they de-duplicate against different maps: a capture records
+    itself in `captured` (and a repeat capture of the same shape is not repeated), and a live run
+    reading the SAME file still sends."""
+    m = load()
+    tmp = tempfile.mkdtemp(prefix="oc-capvis-")
+    try:
+        state = os.path.join(tmp, "state.json")
+        facts = os.path.join(tmp, "f.json")
+        with open(facts, "w") as fh:
+            json.dump(fx("dispatch-refused"), fh)
+        cap = os.path.join(tmp, "cap")
+        rc, out, err = run_cli(["--live", "--facts", facts, "--state", state, "--capture-dir", cap,
+                                "--dry-run", "--controller-ws", "00000000-0000-0000-0000-00000000c1",
+                                "--json"])
+        j = json.loads(out)
+        assert len(j["signal"]["captured"]) == 1, j["signal"]
+        assert j["signal"]["sent"] == [], j["signal"]["sent"]
+        with open(state) as fh:
+            st = json.load(fh)
+        box = st["boxes"]["local"]
+        assert box["notified"] == {}, box["notified"]
+        assert list(box["captured"]) == ["work_dispatched|NOT_DISPATCHED"], box["captured"]
+        # …and the SHAPE says so in the text report, not only in JSON
+        # (the text path is only reached by the TEXT renderer, so ask for it explicitly)
+        rc_t, out_t, _ = run_cli(["--live", "--facts", facts,
+                                  "--state", os.path.join(tmp, "state-text.json"),
+                                  "--capture-dir", os.path.join(tmp, "cap2"), "--dry-run",
+                                  "--controller-ws", "00000000-0000-0000-0000-00000000c1"])
+        assert "captured (NOT sent" in out_t, out_t[-2500:]
+
+        # a second capture of the SAME shape is not repeated…
+        rc2, out2, _ = run_cli(["--live", "--facts", facts, "--state", state, "--capture-dir", cap,
+                                "--dry-run", "--controller-ws", "00000000-0000-0000-0000-00000000c1",
+                                "--json"])
+        j2 = json.loads(out2)
+        assert j2["signal"]["captured"] == [], j2["signal"]
+        assert j2["signal"]["suppressed"] == ["work_dispatched|NOT_DISPATCHED"], j2["signal"]
+
+        # …but a LIVE run against that same state file still has something to send
+        st2 = m.State(state, "local")
+        to_send, suppressed = m.plan_notifications(
+            [m.V("work_dispatched", m.FAIL, "NOT_DISPATCHED", "e")], st2, capturing=False)
+        assert [v.key for v in to_send] == ["work_dispatched|NOT_DISPATCHED"], to_send
+        assert suppressed == [], suppressed
+        # …and in capture mode the same file DOES suppress (that is what "captured" buys)
+        to_send_c, _ = m.plan_notifications(
+            [m.V("work_dispatched", m.FAIL, "NOT_DISPATCHED", "e")], st2, capturing=True)
+        assert to_send_c == [], to_send_c
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@test
+def test_a_CAPTURE_that_did_not_happen_is_not_recorded():
+    """The capture writes into a directory that may not be writable. A failed capture recorded as
+    `captured` would suppress the retry with the message never written — the same "told them" lie
+    one step earlier."""
+    m = load()
+    tmp = tempfile.mkdtemp(prefix="oc-capfail-")
+    try:
+        # a FILE where the capture directory should be: `os.makedirs` and the write both fail
+        blocker = os.path.join(tmp, "cap")
+        with open(blocker, "w") as fh:
+            fh.write("x")
+        state = os.path.join(tmp, "state.json")
+        facts = os.path.join(tmp, "f.json")
+        with open(facts, "w") as fh:
+            json.dump(fx("dispatch-refused"), fh)
+        rc, out, err = run_cli(["--live", "--facts", facts, "--state", state,
+                                "--capture-dir", blocker,
+                                "--dry-run", "--controller-ws", "00000000-0000-0000-0000-00000000c1",
+                                "--json"])
+        j = json.loads(out)
+        assert j["signal"]["captured"] == [], j["signal"]
+        assert len(j["signal"]["not_delivered"]) == 1, j["signal"]["not_delivered"]
+        if os.path.exists(state):
+            with open(state) as fh:
+                st = json.load(fh)
+            assert st["boxes"]["local"]["captured"] == {}, st["boxes"]["local"]
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@test
+def test_the_STATIC_mode_refuses_a_LIVE_only_knob():
+    """`--static --facts X` loaded NOTHING and exited 0 over 30 passing fixtures: a green that looks
+    like the payload was graded. `--capture-dir` and `--state` are the same shape — a knob that
+    cannot act in this mode must REFUSE."""
+    tmp = tempfile.mkdtemp(prefix="oc-static-knobs-")
+    try:
+        facts = os.path.join(tmp, "f.json")
+        with open(facts, "w") as fh:
+            json.dump(fx("dispatch-refused"), fh)
+        for argv in (["--static", "--facts", facts],
+                     ["--static", "--capture-dir", os.path.join(tmp, "cap")],
+                     ["--static", "--state", os.path.join(tmp, "s.json")]):
+            rc, out, err = run_cli(argv)
+            assert rc == 3, (argv[1], rc, err[-300:])
+            assert argv[1] in err, (argv[1], err[-300:])
+            assert "LIVE" in err or "live" in err, (argv[1], err[-300:])
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@test
+def test_a_SCOPE_PROBE_that_FAILED_is_not_a_measured_absence():
+    """The scope check refuses the action either way — but its SENTENCE is the only thing an operator
+    reads. A probe that could not RUN (`cmux cloud exec` at load 115, a timeout) says the scope was
+    never read; reporting "the scope does not contain the controller's script" from it is a claim
+    about the world built from a read that did not happen, and it points at a path that may be fine."""
+    m = load()
+
+    class M:
+        box = "local"
+        def sh(self, cmd, **kw):
+            return (127, "cmux: command not found\n")
+        def sh_argv(self, argv, **kw):
+            raise AssertionError("no command may run: %r" % (argv,))
+        def snapshot_controller(self):
+            return {"ok": True, "pids": [], "near_misses": []}
+        def log_stat(self):
+            return {"mtime": None, "exists": True, "age_s": 5.0}
+        def read_file(self, path):
+            raise OSError("absent")
+
+    cfg = m.cfg_from_dict({"o_dir": "/tmp/oc-scope-unprobed", "repo": "o/r"})
+    v = m.V("controller_cycling", m.FAIL, "LAUNCHD_PID_UNRESOLVED", "e")
+    res = m.attempt_respawn(v, cfg, M(), dry_run=False, poll_deadline_s=0)
+    assert res["attempted"] is False and res["commands"] == [], res
+    assert "could not be PROBED" in res["detail"], res["detail"]
+    assert "does not contain" not in res["detail"], res["detail"]
+    assert res.get("scope_unreadable") is True, res
 
 
 @test
