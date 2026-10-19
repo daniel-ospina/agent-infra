@@ -15,8 +15,12 @@
 #                    (a schedule that exists and does not fire is the false PASS this repo keeps
 #                     removing: "installed" is not "reaped")
 #   SCHEDULE-DRIFT   declared interval ≠ the interval in the installed artifact        → FAIL
+#   PAYLOAD-DRIFT    the installed artifact ≠ what the declaration renders (a second  → FAIL
+#                    ExecStart/trigger/env, a replaced program, a lost unit)
 #   STALE-REGISTER   the unmanaged register names a job that is no longer live         → FAIL
 #   NO-REASON        an unmanaged register entry carries no reason                     → FAIL
+#   CONFLICT         a job is both declared and registered, or two mechanisms clock it → FAIL
+#   NO-JOBS          the surface was readable and carried zero in-scope jobs           → FAIL
 #   UNMANAGED        live, not declared, but registered WITH a reason                  → ok, counted
 #   out-of-scope     a third-party agent (com.google.*, com.premise.*, …)             → ok, counted
 #
@@ -77,7 +81,14 @@ warn() { printf 'WARN %s\n' "$*"; }
 
 FAILS=0
 CHECKS=0
-TMPDIR_SJ_ERR="$(mktemp "${TMPDIR:-/tmp}/sj-perr.XXXXXX")" || TMPDIR_SJ_ERR=/dev/null
+# ⛔ AN UNUSABLE SCRATCH DIR IS UNMEASURABLE, NOT A VERDICT. Routing it through `fail()` made a run
+# that could read nothing at all exit 1 — the same code as "this job is missing" — so a consumer that
+# retries on 3 vs alerts on 1 was misled, and the gate published a class verdict it never earned.
+# The err-file fallback must never be `/dev/null`: the EXIT trap would `rm -f` it.
+if ! TMPDIR_SJ_ERR="$(mktemp "${TMPDIR:-/tmp}/sj-perr.XXXXXX" 2>/dev/null)"; then
+    printf 'verdict=UNMEASURABLE platform=%s mode=%s — cannot create a scratch file, so NOTHING was read\n' "${PLATFORM:-?}" "$MODE"
+    exit 3
+fi
 trap 'rm -f "$TMPDIR_SJ_ERR"' EXIT
 
 # ── static half: the declaration must be installable on BOTH platforms ────────────────────────
@@ -86,6 +97,22 @@ trap 'rm -f "$TMPDIR_SJ_ERR"' EXIT
 # produced (an unresolvable script, an unresolved placeholder, a malformed plist) is a FAILURE here —
 # before any scheduler is touched.
 SJ_FARM="${SJ_FARM:-${HOME:-}/.pi/agent/scripts}"
+
+# ⛔ A SELECTION THAT MATCHES NOTHING VERIFIES NOTHING. `--only typo-id` continue'd past every record and
+# published `verdict=OK checks=3` — a one-word typo in the installer's closing gate bought a clean bill
+# of health. The selection is validated against the declaration before anything is checked.
+if [ -n "$ONLY" ]; then
+    _sel_ok=0
+    for _sel_id in $(printf '%s' "$ONLY" | tr ',' ' '); do
+        for _decl_id in $(sj_ids); do
+            [ "$_sel_id" = "$_decl_id" ] && _sel_ok=$((_sel_ok + 1))
+        done
+    done
+    if [ "$_sel_ok" -eq 0 ]; then
+        printf 'FAIL --only names no declared record (%s) — a selection that matches nothing verifies nothing\n' "$ONLY"
+        exit 2
+    fi
+fi
 static_checks() {
     local errs id plat d out
     errs="$(sj_validate 2>&1)"; local vrc=$?
@@ -95,7 +122,7 @@ static_checks() {
 $errs
 EOF
     fi
-    d="$(mktemp -d "${TMPDIR:-/tmp}/sj-parity.XXXXXX")" || { fail "cannot create a temp dir"; return 1; }
+    d="$(mktemp -d "${TMPDIR:-/tmp}/sj-parity.XXXXXX")" || { printf 'FAIL cannot create a temp dir — NOTHING was read\n'; return 3; }
     for id in $(sj_ids); do
         if [ -n "$ONLY" ]; then
             case ",$(printf '%s' "$ONLY" | tr -d ' ')," in *",$id,"*) ;; *) continue ;; esac
@@ -180,54 +207,166 @@ cad_seconds() { # cad_seconds <cadence> -> seconds on stdout, 1 when not compara
     esac
 }
 
-# ⛔ THE PAYLOAD. A label and a cadence can be preserved while the PROGRAM is replaced — that is what
-# a hijacked agent looks like, and reading only the interval gave it the fleet's blessing. For a
-# record this command actually installs (`managed=yes`), compare what the artifact will RUN against
-# what the record renders. `managed=no` artifacts belong to another installer whose command line this
-# declaration does not model, so only their existence/cadence is asserted here.
-payload_drift() { # payload_drift <id> <rendered-expected> <installed-argv|execstart>
-    local id="$1" want="$2" got="$3"
+# ⛔ THE PAYLOAD — and the WHOLE artifact, not a projection of it. Comparing ONE field lets a
+# SECOND `ExecStart=` line (systemd runs every one for `Type=oneshot`), a second trigger
+# (`OnCalendar=`, `OnUnitActiveSec=`, or `StartCalendarInterval` beside `StartInterval`) or an added
+# `Environment=` / plist key ride along untouched: keep the declared program and cadence, append
+# `ExecStart=/bin/sh -c "curl … | sh"`, and a field-only reader reports OK. So for a record this
+# command actually installs (`managed=yes`) re-render the record and compare the ARTIFACTS. Arming is
+# the one legitimate difference — a stance, separate and visible (#1678) — so the arm token is removed
+# from both sides, and the stance itself is asserted on the artifact rather than inferred from the diff.
+strip_arm() { # strip_arm <file> — the arming flag is the artifact's stance, never its definition
+    # Both shapes: an argv WORD (`… alpha.sh --dry-run`) and a plist `<string>` that holds only the
+    # flag. Missing the second form made "the owner armed it" read as PAYLOAD-DRIFT (#1678).
+    sed -e 's/ --apply//g' -e 's/ --dry-run//g' -e 's/ "--apply"//g' -e 's/ "--dry-run"//g' \
+        -e 's|^[[:space:]]*<string>--apply</string>[[:space:]]*$||' \
+        -e 's|^[[:space:]]*<string>--dry-run</string>[[:space:]]*$||' "$1" | grep -v '^[[:space:]]*$'
+}
+
+# ⛔ MACHINE STATE IS NOT DRIFT. `HOME`, `PATH` and any declared env whose value carries a placeholder
+# (`@state`, `@repos`, …) are resolved from the BOX at INSTALL time — that is what makes one declaration
+# installable anywhere — so a parity run in a different shell (a fixture, a non-login shell, a cell whose
+# repo moved) would otherwise report every job in the declaration as tampered. Their VALUES are masked on
+# both sides; every other byte — the program argv, every trigger key, every other env, every plist key —
+# is compared exactly as installed. A tampered artifact is not machine state: it names a different program.
+state_keys() { # state_keys <id> — the env keys whose value the box supplies
+    local id="$1" k v
+    printf 'HOME\nPATH\n'
+    while IFS= read -r k; do
+        [ -n "$k" ] || continue
+        v="${k#*=}"
+        case "$v" in *@*) printf '%s\n' "${k%%=*}" ;; esac
+    done <<EOF
+$(sj_envs "$id")
+EOF
+}
+
+normalize_state() { # normalize_state <file> <state-key-below>...
+    local f="$1" keys; shift
+    # ⛔ KEYS ARE JOINED WITH SPACES INTO A SHELL VARIABLE, never inline in the awk program: a
+    # `printf '%s '` inside the single-quoted program CLOSES the quote, which truncated the filter —
+    # and a truncated filter printed nothing, so both sides compared equal and every tampered artifact
+    # went GREEN. (Found by the added-artifact tests; the symptom was a false PASS, not an error.)
+    keys="$*"
+    awk -v keys="$keys" '
+        BEGIN { n = split(keys, ka, " "); for (i = 1; i <= n; i++) if (ka[i] != "") st[ka[i]] = 1; prev = "" }
+        {
+            line = $0
+            # The service USER is a deployment decision (system vs user scope), not part of the
+            # job definition: the installer picks the scope the box supports, so comparing it would
+            # red a correct install on a box where the installer chose `user`.
+            if (line ~ /^[[:space:]]*User=/) { next }
+            if (match(line, /^[[:space:]]*Environment=[A-Za-z_][A-Za-z0-9_]*=/)) {
+                k = line; sub(/^[[:space:]]*Environment=/, "", k); sub(/=.*$/, "", k)
+                if (k in st) { sub(/=.*$/, "=@value", line); print line; prev = ""; next }
+            }
+            if (prev != "" && (prev in st) && match(line, /^[[:space:]]*<string>.*<\/string>[[:space:]]*$/)) {
+                sub(/<string>.*<\/string>/, "<string>@value</string>", line)
+                print line; prev = ""; next
+            }
+            if (match(line, /^[[:space:]]*<key>[A-Za-z_][A-Za-z0-9_]*<\/key>[[:space:]]*$/)) {
+                k = line; sub(/^[[:space:]]*<key>/, "", k); sub(/<\/key>.*$/, "", k); prev = k
+            } else if (line !~ /^[[:space:]]*$/) { prev = "" }
+            print line
+        }' "$f"
+}
+
+# ⛔ A MISSING HELPER MUST NOT READ AS GREEN. `payload_drift: command not found` inside a shell that has
+# no `set -e` prints to stderr and returns 127 — which the caller ignored, so a gate could ship with its
+# central verdict function undefined and still publish `verdict=OK`. The functions this file cannot run
+# without are asserted at startup.
+payload_drift() { # payload_drift <id> <what>
     CHECKS=$((CHECKS + 1))
-    [ "$want" = "$got" ] && return 0
-    fail "PAYLOAD-DRIFT $id — the installed job does not run what the declaration says: installed [$got], declared [$want]"
+    fail "PAYLOAD-DRIFT $1 — the installed artifact does not match what the declaration renders: $2"
     return 0
 }
 
-# Render the record's own artifact and compare the PROGRAM it would install with the one that is
-# installed. The mode flag is taken from the ARTIFACT, not from the declaration: arming is a separate,
-# visible step (#1678), so an armed job is not drift — a job running a different script is.
+require_functions() { # every helper the live half depends on must actually be defined
+    local fn missing=""
+    for fn in payload_checks payload_drift side_file normalize_state strip_arm first_diff \
+              state_keys register_applies cad_seconds sj_expect_cadence live_rows declare_line; do
+        command -v "$fn" >/dev/null 2>&1 || missing="$missing $fn"
+    done
+    if [ -n "$missing" ]; then
+        printf 'verdict=UNMEASURABLE platform=%s mode=%s — the gate is INCOMPLETE (undefined:%s), so NOTHING was verified\n' \
+            "${PLATFORM:-?}" "$MODE" "$missing"
+        exit 3
+    fi
+}
+
+# The first line that differs between two texts, so the verdict names the tamper instead of the fact.
+first_diff() { # first_diff <leftfile> <rightfile> — the installed side of the first hunk
+    # Normal diff (not -u): line 2 is `< <installed line>`, so the verdict quotes the ARTIFACT'S line
+    # rather than a `@@` header that tells a reader nothing about the tamper.
+    diff "$1" "$2" 2>/dev/null | sed -n '2p' | sed 's/^< //' | cut -c1-200
+}
+
+# One side of the comparison: the arm token removed (a stance is not a definition) and machine state
+# normalised back to its tokens (a PATH is not a definition either). Blank lines carry no meaning in
+# these artifacts and are dropped so a whitespace-only edit is not reported as drift.
+side_file() { # side_file <id> <outfile> <artifact...>
+    local id="$1" out="$2"; shift 2
+    : >"$out"
+    local f sk
+    sk="$(state_keys "$id")"
+    for f in "$@"; do
+        [ -f "$f" ] || continue
+        strip_arm "$f" >"$out.part"
+        normalize_state "$out.part" $(printf '%s' "$sk") >>"$out"
+        rm -f "$out.part"
+    done
+}
+
 payload_checks() { # payload_checks <id> <installed-name>
-    local id="$1" name="$2" d arm="" want got
+    local id="$1" name="$2" d installed installed_timer="" rendered rendered_timer="" arm line
+    d="$(mktemp -d "${TMPDIR:-/tmp}/sj-payload.XXXXXX")" || { payload_drift "$id" "cannot render the record to compare"; return 0; }
     case "$PLATFORM" in
         darwin)
-            local f; f="$(sj_launchd_dir)/$name.plist"
-            got="$(sj_launchd_argv "$f" 2>/dev/null)" || got=""
-            case "$got" in
-                *--apply*)   arm=armed ;;
-                *--dry-run*) arm=report-only ;;
-            esac
-            [ -n "$(sj_field "$id" arming)" ] || arm=""
-            want="$(sj_argv "$id" darwin "$arm" 2>/dev/null)" || { CHECKS=$((CHECKS + 1)); fail "PAYLOAD-DRIFT $id — the record cannot render an argv for this host (runner/script unresolved)"; return 0; }
-            payload_drift "$id" "$want" "$got"
+            installed="$(sj_launchd_dir)/$name.plist"
+            rendered="$d/$name.plist"
+            if ! sj_render_launchd "$id" "$rendered" >/dev/null 2>&1; then
+                rm -rf "$d"; payload_drift "$id" "the record cannot be rendered for this host (runner/script unresolved)"; return 0
+            fi
             ;;
         linux)
-            local svc; svc="$(sj_systemd_units_dir)/$name.service"
-            got="$(sj_systemd_execstart "$svc" 2>/dev/null)" || got=""
-            case "$got" in
-                *--apply*)   arm=armed ;;
-                *--dry-run*) arm=report-only ;;
-            esac
-            [ -n "$(sj_field "$id" arming)" ] || arm=""
-            d="$(mktemp -d "${TMPDIR:-/tmp}/sj-payload.XXXXXX")" || { CHECKS=$((CHECKS + 1)); fail "PAYLOAD-DRIFT $id — cannot render the record to compare"; return 0; }
-            if sj_render_systemd "$id" "$d" system "$arm" >/dev/null 2>&1; then
-                want="$(sj_systemd_execstart "$d/$name.service" 2>/dev/null)"
-            else
-                want=""
+            installed="$(sj_systemd_units_dir)/$name.service"
+            installed_timer="$(sj_systemd_units_dir)/$name.timer"
+            if ! sj_render_systemd "$id" "$d" system >/dev/null 2>&1; then
+                rm -rf "$d"; payload_drift "$id" "the record cannot be rendered for this host (runner/script unresolved)"; return 0
             fi
-            rm -rf "$d"
-            payload_drift "$id" "$want" "$got"
+            rendered="$d/$name.service"; rendered_timer="$d/$name.timer"
             ;;
     esac
+    if [ ! -f "$installed" ]; then
+        rm -rf "$d"; payload_drift "$id" "the installed artifact '$installed' is not readable"; return 0
+    fi
+    # The artifact's arming stance, asserted on the artifact (the comparison below is deliberately
+    # blind to it, so this is the only place the stance is read).
+    CHECKS=$((CHECKS + 1))
+    case "$PLATFORM" in
+        darwin) arm="$(sj_launchd_argv "$installed" 2>/dev/null)" ;;
+        linux)  arm="$(sj_systemd_execstart "$installed" 2>/dev/null)" ;;
+    esac
+    if [ -n "$(sj_field "$id" arming)" ]; then
+        case "$arm" in
+            *--apply*|*--dry-run*) ;;
+            *) fail "PAYLOAD-DRIFT $id — the record declares an arming stance but the installed artifact carries no readable mode flag" ;;
+        esac
+    fi
+    # The TIMER is part of the schedule definition: an artifact may keep the declared interval and add a
+    # second trigger key beside it, and systemd honours every trigger line.
+    side_file "$id" "$d/.installed" "$installed" ${installed_timer:+"$installed_timer"}
+    side_file "$id" "$d/.declared"  "$rendered"  ${rendered_timer:+"$rendered_timer"}
+    # A filter that produced nothing compared to nothing would be EQUAL — the false pass this check
+    # exists to prevent. An empty side against a non-empty artifact is unmeasured, never a match.
+    if [ ! -s "$d/.installed" ] || [ ! -s "$d/.declared" ]; then
+        rm -rf "$d"; payload_drift "$id" "the comparison produced nothing (the artifact could not be normalised) — UNMEASURED, not a match"; return 0
+    fi
+    if ! cmp -s "$d/.installed" "$d/.declared"; then
+        line="$(first_diff "$d/.installed" "$d/.declared")"
+        payload_drift "$id" "${line:-the artifact bodies differ}"
+    fi
+    rm -rf "$d"
     return 0
 }
 
@@ -319,6 +458,10 @@ live_checks() {
         CHECKS=$((CHECKS + 1))
         local reason rc
         reason="$(sj_unmanaged_reason "$r_name")"; rc=$?
+        # ⛔ A REGISTER ENTRY ONLY SPEAKS FOR ITS OWN PLATFORM. Applying it un-scoped LAUNDERED a live
+        # Linux unit named `com.tortoise.hidden`: the darwin line silenced the linux UNDECLARED finding.
+        # Judged on one platform, the entry must be judged only there — in BOTH directions.
+        register_applies "$r_name" || rc=1
         case "$rc" in
             0) UNMANAGED=$((UNMANAGED + 1)) ;;
             2) fail "NO-REASON $r_name — registered as unmanaged with NO reason; an unexplained exclusion is how a job disappears" ;;
@@ -346,7 +489,7 @@ EOF
     # ⛔ Its entries carry no name, so the ONLY honest test of "is this declared" is whether the line
     # runs one of the declared scripts. A cron line that does is a duplicate trigger for a declared
     # job (reported, not failed); one that runs anything else in the fleet's namespace is UNDECLARED.
-    local cron_rows cron_line cron_script matched cron_in_scope=0 cron_err
+    local cron_rows cron_line cron_script cron_resolved matched cron_in_scope=0 cron_err
     if ! cron_rows="$(sj_live_cron 2>"$TMPDIR_SJ_ERR")"; then
         # ⛔ AN UNREADABLE CRONTAB IS NOT AN EMPTY ONE. This arm used to be absent, so a reader failure
         # silently dropped the whole crontab population while the run stayed green — the "I looked at
@@ -364,10 +507,19 @@ EOF
             for id in $(sj_ids); do
                 cron_script="$(sj_field "$id" script)"
                 [ -n "$cron_script" ] || continue
-                case "$cron_line" in *"${cron_script##*/}"*) matched="$id" ;; esac
+                # ⛔ THE DECLARED SCRIPT'S PATH, NOT ITS BASENAME. A substring match on the basename
+                # accepted `/tmp/evil/eldato-alpha.sh --exfil` as "a second clock for alpha" — a NOTE,
+                # never a failure — so whether a foreign payload was waved through depended on what the
+                # attacker NAMED it. Only a line that runs the script this declaration resolves to is a
+                # second clock; anything else that looks like ours is simply UNDECLARED.
+                cron_resolved="$(sj_resolve_script "$id" 2>/dev/null)" || cron_resolved=""
+                [ -n "$cron_resolved" ] || cron_resolved="$SJ_FARM/$cron_script"
+                case " $cron_line " in
+                    *" $cron_resolved "*) matched="$id" ;;
+                esac
             done
             if [ -n "$matched" ]; then
-                say "note: crontab also triggers declared job '$matched' — a second clock for one job (not a parity failure, worth removing)"
+                fail "CONFLICT cron:$cron_line — a SECOND clock for declared job '$matched': the same job is scheduled by two mechanisms"
             else
                 fail "UNDECLARED cron:$cron_line — a crontab entry in the fleet namespace names no declared job's script"
             fi
@@ -389,7 +541,12 @@ EOF
 }
 
 UNMANAGED=0
-static_checks
+require_functions
+static_checks; STATIC_RC=$?
+if [ "$STATIC_RC" = 3 ]; then
+    echo "verdict=UNMEASURABLE platform=$PLATFORM mode=$MODE checks=$CHECKS"
+    exit 3
+fi
 if [ "$MODE" = live ]; then
     live_checks; LIVE_RC=$?
     if [ "$LIVE_RC" = 3 ]; then

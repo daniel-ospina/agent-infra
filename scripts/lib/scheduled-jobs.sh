@@ -342,7 +342,10 @@ sj_render_systemd() { # sj_render_systemd <id> <destdir> <system|user> [arming-o
         printf 'Type=oneshot\n'
         [ "$scope" = system ] && printf 'User=%s\n' "$(id -un)"
         printf 'Environment=HOME=%s\n' "$HOME"
-        printf 'Environment=PATH=%s\n' "$PATH"
+        # The renderer is called by the installer, the farm and the parity gate; the gate's `$PLATFORM`
+        # is NOT part of the library's contract. Defaulting it here keeps a standalone render working
+        # (a bare `$PLATFORM` under `set -u` aborted the render half-way through writing the unit).
+        printf 'Environment=PATH=%s\n' "$(sj_job_path "${PLATFORM:-linux}")"
         printf 'Environment=SJ_JOB=%s\n' "$id"
         while IFS= read -r k; do
             [ -n "$k" ] || continue
@@ -443,13 +446,38 @@ EOF
     return 0
 }
 
+# sj_job_path — the PATH a RENDERED DARWIN JOB gets.
+#
+# ⛔ A shim dir must never reach a launchd job (#2048 review, BLOCK; #427). `~/.pi/agent/shims/gh` is a
+# symlink into `~/Documents`, which TCC denies to a launchd-spawned process, so the job resolves `gh`,
+# gets EPERM and fails closed — the reaper's worktree class would abort every hour on the one platform
+# this PR exists for, with a message telling the operator to install a `gh` the box already has.
+# `install-launchd.sh:launchd_path` strips `*/shims` for the same reason; the shared renderer must
+# apply the same rule or the two installers disagree about the same box. Linux keeps its PATH: systemd
+# runs as the user with no TCC boundary.
+sj_job_path() { # sj_job_path <platform>
+    local out="" p glob_was_off=0
+    local IFS=:
+    case "$-" in *f*) glob_was_off=1 ;; esac
+    set -f
+    for p in $PATH; do
+        case "$p" in "") continue ;; esac
+        case "$1" in
+            darwin) case "$p" in */shims|*/shims/*) continue ;; esac ;;
+        esac
+        out="${out:+$out:}$p"
+    done
+    [ "$glob_was_off" = 1 ] || set +f
+    printf '%s' "$out"
+}
+
 # ── machine-state placeholders ──────────────────────────────────────────────────────────────
 # ONE resolver, used by both renderers, so the state dir a cell's unit exports and the one a Mac's
 # plist exports cannot drift.
 sj_render_value() { # sj_render_value <string>
     local v="$1"
     v="${v//@home/$HOME}"
-    v="${v//@path/$PATH}"
+    v="${v//@path/$(sj_job_path "${PLATFORM:-linux}")}"
     v="${v//@state/${SJ_STATE_DIR:-$HOME/.pi/agent/state}}"
     v="${v//@repos/${SJ_REPOS:-${SJ_TORTOISE_REPO:-${TORTOISE_REPO:-$HOME/Documents/GitHub/tortoise}}}}"
     v="${v//@tortoise/${SJ_TORTOISE_REPO:-${TORTOISE_REPO:-$HOME/Documents/GitHub/tortoise}}}"
@@ -634,6 +662,14 @@ sj_live_systemd() { # prints: <unit-base>|<installed>|<active>|<cadence>|<svc ye
     local dir sc u base active enabled total=0 cadence svc
     dir="$(sj_systemd_units_dir)"; sc="$(sj_systemctl)"
     [ -d "$dir" ] || { echo "sj_live_systemd: no unit directory ($dir)" >&2; return 1; }
+    # ⛔ AN UNUSABLE SCHEDULER TOOL IS A MEASUREMENT GAP — probed BEFORE the units are read, not only
+    # when nothing was found. Probing only the empty case put the guard exactly where it could not
+    # matter: with timers present, a broken `systemctl` makes every `is-active` return empty, and the
+    # gate published `INERT … it never fires` — a claim it had not measured — instead of exiting 3.
+    if ! $sc --version >/dev/null 2>&1; then
+        echo "sj_live_systemd: systemctl is unusable ($sc) — cannot enumerate timers" >&2
+        return 1
+    fi
     for u in "$dir"/*.timer; do
         [ -f "$u" ] || continue
         base="$(basename "$u" .timer)"
@@ -647,12 +683,6 @@ sj_live_systemd() { # prints: <unit-base>|<installed>|<active>|<cadence>|<svc ye
         total=$((total + 1))
         printf '%s|yes|%s|%s|%s\n' "$base" "$active:$enabled" "$cadence" "$svc"
     done
-    # A systemd surface that exists but is unreadable by the scheduler tool is a measurement gap, not
-    # an empty box: `systemctl` failing for every unit must not read as "nothing is scheduled".
-    if [ "$total" -eq 0 ] && ! $sc --version >/dev/null 2>&1; then
-        echo "sj_live_systemd: systemctl is unusable ($sc) — cannot enumerate timers" >&2
-        return 1
-    fi
     printf '#meta|dir=%s|in_scope=%s\n' "$dir" "$total"
     return 0
 }

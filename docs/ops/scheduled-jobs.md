@@ -82,9 +82,11 @@ caught the 34 undeclared components on the first run:
 | `MISSING` | the declaration names a job this host does not run | FAIL |
 | `INERT` | declared + installed but not loaded/enabled — it never fires | FAIL |
 | `SCHEDULE-DRIFT` | the installed interval is not the declared one | FAIL |
+| `PAYLOAD-DRIFT` | the installed artifact is not what the declaration renders — a **second** `ExecStart=`, a second trigger, an added `Environment=`, a replaced program, a missing unit | FAIL |
+| `NO-JOBS` | the surface was readable and carried **zero** in-scope jobs | FAIL |
 | `STALE-REGISTER` | the unmanaged register names a job that is no longer live | FAIL |
 | `NO-REASON` | an unmanaged entry carries no reason | FAIL |
-| `CONFLICT` | a job is both declared and registered as unmanaged | FAIL |
+| `CONFLICT` | a job is both declared and registered as unmanaged — or two mechanisms clock the same job (a crontab line running the declared script) | FAIL |
 | `UNMANAGED` | live, not declared, registered **with a reason** | ok, counted |
 | out-of-scope | a third-party agent (`com.google.*`, `com.premise.*`, …) | ok, counted |
 
