@@ -867,20 +867,36 @@ ck "the fixer prompt treats a conflict as the task" $rc
 # Drive the shipped rule rather than grepping for a comment: a regression that dropped the
 # 'lanes >= 1' exception or the headroom arithmetic must fail here.
 sed -n '/^mp_reason() {/,/^}/p;/^review_slots() {/,/^}/p' "$LOOP" > "$TMP/mp.sh"
+# mp_reason's fail-closed arm calls is_num(); the extraction must carry the dependency or that arm
+# dies with "command not found" — a command that never runs returns non-zero, which reads as
+# "capacity available" (fail OPEN).
+grep -E '^is_num\(\) \{' "$LOOP" >> "$TMP/mp.sh"
 if need "$TMP/mp.sh" "mp_reason()/review_slots() are extracted from the shipped loop"; then
   MERGE_PRIORITY_AT=10; MAX_REVIEW=4
   # shellcheck disable=SC1090
   . "$TMP/mp.sh"
   [ -n "$(mp_reason 11 1)" ] && rc=0 || rc=1
   ck "shipped mp_reason(): 11 open PRs with a lane running -> drain" $rc
-  [ -z "$(mp_reason 11 0)" ] && rc=0 || rc=1
-  ck "shipped mp_reason(): 11 open PRs with NO lane -> dispatch still allowed" $rc
-  [ -z "$(mp_reason 10 3)" ] && rc=0 || rc=1
-  ck "shipped mp_reason(): at the threshold, no drain override" $rc
+  # ⛔ NO LANE/WORKER EXCEPTION AND NO THRESHOLD (owner ruling, 2026-10-18): 11 un-owned PRs block new
+  # work whether or not a lane is running — the lane count was never the question, and the threshold
+  # let the measured 25-un-owned queue through.
+  [ -n "$(mp_reason 11 0)" ] && rc=0 || rc=1
+  ck "shipped mp_reason(): 11 un-owned PRs with NO lane -> still drain (the lane count is irrelevant)" $rc
+  [ -z "$(mp_reason 0 3)" ] && rc=0 || rc=1
+  ck "shipped mp_reason(): 0 un-owned PRs -> no drain override" $rc
+  [ -n "$(mp_reason 1 0)" ] && rc=0 || rc=1
+  ck "shipped mp_reason(): ONE un-owned PR is enough to block new work" $rc
   [ "$(review_slots 11)" = "6" ] && rc=0 || rc=1
   ck "shipped review_slots(): backlog raises reviewer headroom to MAX_REVIEW+2" $rc
-  [ "$(review_slots 10)" = "4" ] && rc=0 || rc=1
-  ck "shipped review_slots(): below the threshold, headroom is MAX_REVIEW" $rc
+  # ⛔ THE SIZE THRESHOLD IS GONE (review R2, P3): the GATE blocks the issue path on ONE un-owned PR,
+  # so the headroom follows the same predicate. 10 used to read as "below threshold = base budget";
+  # keeping that would drain a 10-PR queue at the pre-change WIP.
+  [ "$(review_slots 10)" = "6" ] && rc=0 || rc=1
+  ck "shipped review_slots(): ANY un-owned PR raises reviewer headroom (no size threshold)" $rc
+  [ "$(review_slots 0)" = "4" ] && rc=0 || rc=1
+  ck "shipped review_slots(): 0 un-owned -> the base budget" $rc
+  [ "$(review_slots x)" = "4" ] && rc=0 || rc=1
+  ck "shipped review_slots(): a non-numeric count falls back to the base budget (not an error)" $rc
 fi
 grep -qE 'case "\$\{PR_ST:-\}" in MERGED\|CLOSED\)' "$LOOP" && rc=0 || rc=1
 ck "sweep skips CLOSED as well as MERGED" $rc
@@ -1031,7 +1047,9 @@ grep -q 'Prefer the live scripts' "$HERE/retired/auto-loop.sh" && rc=0 || rc=1
 ck "the retired copy's banner warns against reuse" $rc
 
 # ── 14) the controller does not treat a stale claim as in-flight ────────────────
-sed -n '/^claim_live() {/,/^}/p' "$LOOP" > "$TMP/claimlive.sh"
+# ⛔ BOTH FUNCTIONS: claim_live is the SPAWN GUARD and delegates its lease arm to claim_lease_live
+# (review R2, P1 split them so ownership cannot inherit the guard's loose local-lock test).
+{ sed -n '/^claim_live() {/,/^}/p' "$LOOP"; sed -n '/^claim_lease_live() {/,/^}/p' "$LOOP"; } > "$TMP/claimlive.sh"
 if need "$TMP/claimlive.sh" "claim_live() is extracted from the shipped orch-loop.sh"; then
   mkdir -p "$TMP/CL/state"
   O="$TMP/CL"

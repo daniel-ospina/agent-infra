@@ -23,6 +23,12 @@ if [ "$(printf '%s' "$MP" | wc -l | tr -d ' ')" -lt 3 ]; then
   echo "❌ could not extract mp_reason from $ORCH — the rule moved or was reformatted"; exit 1
 fi
 eval "$MP"
+# ⛔ mp_reason's fail-closed arm calls is_num(), which the controller defines 30 lines above it. The
+# extraction must bring the dependency along or the arm dies with "command not found" — and a command
+# that never runs returns non-zero, which the gate would read as "capacity available" (fail OPEN).
+_ISNUM="$(grep -E '^is_num\(\) \{' "$ORCH")"
+[ -n "$_ISNUM" ] || { echo "❌ could not extract is_num() from $ORCH — mp_reason's guard cannot run"; exit 1; }
+eval "$_ISNUM"
 echo "extracted $(printf '%s' "$MP" | wc -l | tr -d ' ') lines of mp_reason from the live script"
 
 MERGE_PRIORITY_AT=10
@@ -34,27 +40,31 @@ ck() { # ck <label> <open_prs> <lanes> <workers> <expect: gate|open>
 }
 
 echo
-echo "=== THE FIX: workers must count, not just lanes (agent-infra#1709 item 4) ==="
-ck "27 PRs, 0 lanes, 8 reviewers in flight -> DRAIN"      27 0 8  gate
-ck "27 PRs, 0 lanes, 1 reviewer  in flight -> DRAIN"      27 0 1  gate
-ck "27 PRs, 0 lanes, 0 workers           -> dispatch ok"  27 0 0  open
+echo "=== THE RULE (owner, 2026-10-18): while ANY un-owned PR remains, issues are not opened ==="
+# ⛔ NO THRESHOLD. The first argument is the WORKABLE un-owned count (un-owned PRs the harness has
+# not already parked as needs-a-human). One is enough to block new work: that is the owner's rule,
+# and it is the whole difference between a fleet that is BUSY and a fleet that is DRAINING.
+ck "1 un-owned PR, nothing else running -> DRAIN (one is enough)"   1 0 0 gate
+ck "3 un-owned PRs, 2 lanes + 5 workers   -> DRAIN"                 3 2 5 gate
+ck "25 un-owned PRs, 0 workers (measured)  -> DRAIN"               25 0 0 gate
+ck "56 un-owned PRs, 8 reviewers          -> DRAIN"                56 0 8 gate
+ck "0 un-owned PRs, anything at all       -> issues may open"       0 2 5 open
+ck "an UNREADABLE count (non-numeric)     -> DRAIN, never open"   abc 0 0 gate
 
 echo
-echo "=== original behaviour preserved ==="
-ck "27 PRs, 2 lanes, 5 workers -> DRAIN"                  27 2 5  gate
-ck "11 PRs, 0 lanes, 1 worker  -> DRAIN (just over)"      11 0 1  gate
-ck "5 PRs,  2 lanes, 5 workers -> dispatch ok"             5 2 5  open
-ck "exactly 10 PRs -> NOT over the threshold"             10 2 5  open
-ck "11 PRs, 0 lanes, 0 workers -> dispatch ok (nothing to drain with)" 11 0 0 open
-
-echo
-echo "=== regression proof: the OLD lanes-only form would have failed the first case ==="
-mp_reason_old() { if [ "${1:-0}" -gt "$MERGE_PRIORITY_AT" ] && [ "${2:-0}" -ge 1 ]; then echo gated; fi; }
-old="$(mp_reason_old 27 0 8)"
-if [ -z "$old" ]; then echo "  ✅ old form returned EMPTY for (27,0,8) — the exact defect being fixed"; PASS=$((PASS+1))
-else echo "  ❌ old form gated it — the fix would be a no-op"; FAIL=$((FAIL+1)); fi
-new="$(mp_reason 27 0 8)"
-[ -n "$new" ] && { echo "  ✅ new form gates it: $new"; PASS=$((PASS+1)); } || { echo "  ❌ new form still lets it through"; FAIL=$((FAIL+1)); }
+echo "=== regression proof: the OLD threshold form let the MEASURED queue through ==="
+# The measured state this change exists for: 25 open PRs, 0 owned by a live process. The old rule was
+# `unowned > MERGE_PRIORITY_AT` with MERGE_PRIORITY_AT=25, so 25 un-owned PRs read as "not a backlog"
+# and the box opened MORE work from issues. This pins that the old form FAILED and the shipped form
+# does not — a revert to a threshold turns the second assertion red.
+MERGE_PRIORITY_AT=25
+mp_reason_threshold() { if [ "${1:-0}" -gt "$MERGE_PRIORITY_AT" ] && [ $(( ${2:-0} + ${3:-0} )) -ge 1 ]; then echo gated; fi; }
+old="$(mp_reason_threshold 25 0 0)"
+[ -z "$old" ] && { echo "  ✅ (fixture) the OLD threshold form returns EMPTY for the measured state (25 un-owned, nothing running)"; PASS=$((PASS+1)); } \
+  || { echo "  ❌ (fixture) the old form already gated 25 — this case no longer proves anything"; FAIL=$((FAIL+1)); }
+new="$(mp_reason 25 0 0)"
+[ -n "$new" ] && { echo "  ✅ the SHIPPED form gates it: $new"; PASS=$((PASS+1)); } \
+  || { echo "  ❌ the shipped form still lets the measured queue through — a threshold is back"; FAIL=$((FAIL+1)); }
 
 echo
 echo "=== THE REPO'S OWN ANSWERS: required checks + merge authority (agent-infra#1764) ==="
@@ -989,123 +999,176 @@ else
 fi
 
 echo
-echo "=== merge priority counts UNOWNED PRs, not the TOTAL open count (the fleet self-cap) ==="
-# WHY THIS SECTION EXISTS. `mp_reason` gated on the TOTAL open-PR count, so a queue that was
-# already being worked read as congestion and the box CAPPED ITSELF: measured 2026-10-16, two live
-# cells logged `[dispatch] skipped (merge-priority (20 open PRs — draining)) lanes=1 workers=0` at
-# `lanes=1` of a configured 32, with 59-86% CPU idle and 13.9 GB RAM free. 17 of those 20 PRs
-# carried a merge state of BEHIND/DIRTY. ⛔ Merge state is NOT an ownership signal — `pr_owned`
-# reads worker sessions, cross-box claims and findings markers only — so this measurement does not
-# show those 17 were being worked (and `workers=0` means no LOCAL worker held them). What it shows
-# is that the gate counted the wrong thing: raising the number alone still caps a cell whose whole
-# queue is owned. The gate now counts open PRs NOTHING is working, derived from state the loop
-# already keeps (worker tmux sessions, cross-box claims, the reviewer-findings marker).
-#
-# The functions are EXTRACTED from the live controller, not re-implemented — the same drift guard
-# the mp_reason table above uses, so a rename/reformat fails here instead of silently skipping.
+echo "=== ownership is a LIVE FACT (owner ruling, 2026-10-18) ==="
+# WHY THIS SECTION EXISTS. The gate's input used to be the TOTAL open-PR count, so a queue already
+# being worked read as congestion and the box CAPPED ITSELF: measured 2026-10-16, two live cells
+# logged `[dispatch] skipped (merge-priority (20 open PRs — draining)) lanes=1 workers=0` at `lanes=1`
+# of a configured 32, with 59-86% CPU idle and 13.9 GB RAM free. The count was replaced by the
+# UN-OWNED count — and then the OWNERSHIP PREDICATE was itself wrong: it read registry declarations
+# (a `fix-<PR>` tmux session, a findings marker, a local claim ref) as "someone is working this".
+# MEASURED 2026-10-18: pr-doctor reported 21 "running" lanes, a live-cwd scan found NONE of them
+# holding a PR branch, and 25 open PRs sat un-owned while the box opened more. So ownership is now
+# what the machine can observe: a RUNNING PROCESS whose cwd is a checkout of the PR's head ref (or a
+# worktree whose path carries the PR number), plus — the one thing no local probe can see — a claim
+# held by ANOTHER box.
+# The functions are EXTRACTED from the live controller and the predicate is the SHIPPED module, so a
+# rename/reformat/regression fails here instead of silently skipping.
 INST="$HERE/install.sh"
-for _fn in fix_slots pr_owned unowned_pr_count claim_live; do
+LO="$HERE/live-ownership.sh"
+for _fn in fix_slots review_slots pr_owned claim_foreign_live claim_live claim_lease_live unowned_pr_count; do
   ex "$_fn" > "$TMP/$_fn.sh"
 done
-# wsess() and is_num() are ONE-LINERS, so an `ex` sed RANGE would run past their own end pattern
-# and swallow the following functions — extract them by whole line instead (the same trap
-# test-gates documents for shq). is_num() is a dependency of the shipped unowned_pr_count().
-grep -E '^wsess\(\) \{' "$ORCH" > "$TMP/wsess.sh"
-grep -E '^is_num\(\) \{' "$ORCH" > "$TMP/is_num.sh"
+grep -E '^is_num\(\) \{'    "$ORCH" > "$TMP/is_num.sh"
+grep -E '^_this_host\(\) \{' "$ORCH" > "$TMP/this_host.sh"
 _own_ok=1
-for _fn in wsess is_num fix_slots pr_owned unowned_pr_count claim_live; do
+for _fn in fix_slots review_slots pr_owned claim_foreign_live claim_live claim_lease_live unowned_pr_count is_num this_host; do
   [ -s "$TMP/$_fn.sh" ] || { echo "  ❌ could not extract $_fn() from orch-loop.sh — the rule moved or was reformatted"; _own_ok=0; }
 done
-cat "$TMP/is_num.sh" "$TMP/wsess.sh" "$TMP/fix_slots.sh" "$TMP/pr_owned.sh" "$TMP/unowned_pr_count.sh" "$TMP/claim_live.sh" > "$TMP/ownfunctions.sh"
+[ -f "$LO" ] || { echo "  ❌ $LO is missing — the ownership predicate moved"; _own_ok=0; }
+cat "$TMP/is_num.sh" "$TMP/this_host.sh" "$TMP/fix_slots.sh" "$TMP/review_slots.sh" \
+    "$TMP/pr_owned.sh" "$TMP/claim_foreign_live.sh" "$TMP/claim_live.sh" "$TMP/claim_lease_live.sh" "$TMP/unowned_pr_count.sh" > "$TMP/ownfunctions.sh"
 if [ "$_own_ok" = "1" ] && bash -n "$TMP/ownfunctions.sh" 2>/dev/null; then
+  # the SHIPPED predicate, not a re-implementation of it
+  # shellcheck source=/dev/null
+  . "$LO"
   mkdir -p "$TMP/ownO/state"
+  # shellcheck source=/dev/null
+  . "$TMP/this_host.sh"
+  O="$TMP/ownO"
+  LO_SCAN=1
+  LO_LIVE="$O/state/live.tsv"
   # Subshell helpers: the shipped functions are sourced, never copied, and `O` points at a fixture
   # state dir so nothing here can touch a real box.
-  _own() { ( O="$TMP/ownO"; . "$TMP/is_num.sh"; . "$TMP/wsess.sh"; . "$TMP/claim_live.sh"; . "$TMP/pr_owned.sh"; . "$TMP/unowned_pr_count.sh"; unowned_pr_count "$1" ); }
-  _owned() { ( O="$TMP/ownO"; . "$TMP/is_num.sh"; . "$TMP/wsess.sh"; . "$TMP/claim_live.sh"; . "$TMP/pr_owned.sh"; if pr_owned "$1" "${2:-}"; then printf 'owned'; else printf 'unowned'; fi ); }
+  _own()    { ( . "$TMP/ownfunctions.sh"; unowned_pr_count "$1" ); }
+  _owned()  { ( . "$TMP/ownfunctions.sh"; if pr_owned "$1" "${2:-}" "${3:-}"; then printf 'owned'; else printf 'unowned'; fi ); }
+  # The live table is the MACHINE's answer: "<branch>\t<worktree>\t<pid>\t<cwd>". A fixture row here
+  # stands in for a real process — the suite that proves the PROBE really reads processes is
+  # live-ownership.test.sh, which spawns them.
+  _live() { printf '%s\n' "$@" > "$LO_LIVE"; }
 
-  # (1) wsess() is an EXACT membership test over the once-per-cycle snapshot. A substring/prefix
-  #     match would read PR #3 as owned because `fix-30` exists — the same false positive `sess`
-  #     documents, which would STARVE #3 while that worker lives.
-  ( . "$TMP/wsess.sh"; WSESS=$'fix-3\nmerge-9'
-    _w=1
-    wsess fix-3 || _w=0
-    wsess merge-9 || _w=0
-    wsess fix-30 && _w=0
-    wsess lane-1 && _w=0
-    wsess fix-3x && _w=0
-    [ "$_w" = "1" ] ) \
-    && { echo "  ✅ wsess() matches a worker session EXACTLY (fix-3 is not fix-30)"; PASS=$((PASS+1)); } \
-    || { echo "  ❌ wsess() is not an exact match — a prefix match starves one PR while another's worker lives"; FAIL=$((FAIL+1)); }
+  # (1) THE LIVE ARM. One row per holding process; the branch is the primary signal.
+  _live 'fix/7-thing	/repo/.worktrees/x	1234	/repo/.worktrees/x'
+  eqv "a live process in the branch's checkout OWNS its PR" "owned" "$(_owned 7 aaa fix/7-thing)"
+  eqv "a live process in ANOTHER branch's checkout does not own it" "unowned" "$(_owned 8 aaa fix/8-other)"
+  # the path fallback: a worktree whose PATH carries the PR number, on an unrelated branch
+  _live 'chore/no-pr-name	/tmp/aig-wt-9100	4321	/tmp/aig-wt-9100'
+  eqv "a live worktree PATH carrying the PR number OWNS it" "owned" "$(_owned 9100 bbb chore/no-pr-name)"
+  # ⛔ …without turning every DATE directory into a PR: 2026-10-17 is not PR #2026.
+  _live 'feat/other	/repo/docs/2026-10-17	999	/repo/docs/2026-10-17'
+  # the queried BRANCH must differ from every live row's branch, or the branch arm answers first and
+  # the path rule is never exercised (measured: the first version of this case did exactly that).
+  eqv "a DATE component (2026-10-17) is not read as PR #2026" "unowned" "$(_owned 2026 vvv feat/unrelated-x)"
+  # (2) ⛔ THE MEASURED BUG SHAPE: the registry SAYS owned, the process is DEAD. These two cases are
+  # the whole change — a session name and a marker are records of intent, never of work.
+  _live
+  touch "$O/state/needsfix-11-deadbeef0000"
+  eqv "a worker SESSION NAME alone is NOT ownership (nothing is holding the branch)" "unowned" "$(_owned 11 deadbeef0000 fix/11-thing)"
+  rm -f "$O/state/needsfix-11-deadbeef0000"
+  # …and a findings marker is not ownership either: it AUTHORISES a spawn, it does not prove one ran.
+  touch "$O/state/needsfix-12-deadbeef0001"
+  eqv "a findings MARKER alone is NOT ownership (it authorises a spawn, it does not prove one ran)" "unowned" "$(_owned 12 deadbeef0001 fix/12-thing)"
+  rm -f "$O/state/needsfix-12-deadbeef0001"
+  # …and a local lock whose pid is dead is a stale flag, not a worker.
+  printf '999999' > "$O/state/mergeclaim-13.lock"
+  eqv "a DEAD local lock pid is NOT ownership (a stale flag must not read as a worker)" "unowned" "$(_owned 13 "" fix/13-thing)"
+  rm -f "$O/state/mergeclaim-13.lock"
+  # (2b) REVIEW R1, P1: ⛔ A LIVE PID IS NOT A PROCESS WORKING THE PR. merge-one.sh writes nothing but
+  # `$$`, so once pids recycle the lock reads LIVE for ever and the PR leaves the un-owned queue
+  # permanently — this change's failure mode in the dangerous direction. Three cases pin the binding:
+  # an alive-but-unrelated process, a merge worker busy with a DIFFERENT PR, and the real worker.
+  ( exec sleep 300 ) & _sleepy=$!
+  printf '%s' "$_sleepy" > "$O/state/mergeclaim-14.lock"
+  eqv "a LIVE lock pid that is NOT a merge worker is NOT ownership (pid recycling)" "unowned" "$(_owned 14 "" fix/14-thing)"
+  cat > "$TMP/fake-merge-one.sh" <<'FAKE'
+#!/usr/bin/env bash
+# NOT `exec sleep`: the binding reads the COMMAND LINE, so the process image must stay bash running
+# this script (an exec would rename it to `sleep 300` and name no PR).
+sleep 300
+FAKE
+  ( exec bash "$TMP/fake-merge-one.sh" 999 ) & _other=$!
+  printf '%s' "$_other" > "$O/state/mergeclaim-15.lock"
+  eqv "a live merge worker on a DIFFERENT PR is NOT ownership" "unowned" "$(_owned 15 "" fix/15-thing)"
+  ( exec bash "$TMP/fake-merge-one.sh" 16 ) & _mine=$!
+  printf '%s' "$_mine" > "$O/state/mergeclaim-16.lock"
+  eqv "a live merge worker NAMING this PR IS ownership (the arm still works)" "owned" "$(_owned 16 "" fix/16-thing)"
+  # ⛔ THE RAIL'S OWN SPAWN FORM (review R2, P2): the controller starts a merge worker as
+  # `bash merge-one.sh --argv state/argv-<PR>`, so the PR number appears only inside a FILENAME. Matching
+  # just the positional form denied a genuinely live worker for its whole run and inflated the un-owned
+  # count the owner audits.
+  ( exec bash "$TMP/fake-merge-one.sh" --argv "$O/state/argv-17" ) & _argv=$!
+  printf '%s' "$_argv" > "$O/state/mergeclaim-17.lock"
+  eqv "the --argv spawn form IS ownership (a real rail worker)" "owned" "$(_owned 17 "" fix/17-thing)"
+  ( exec bash "$TMP/fake-merge-one.sh" --argv "$O/state/argv-170" ) & _argv2=$!
+  printf '%s' "$_argv2" > "$O/state/mergeclaim-18.lock"
+  eqv "…and argv-170 does NOT own PR 18 (no filename prefix collision)" "unowned" "$(_owned 18 "" fix/18-thing)"
+  kill "$_sleepy" "$_other" "$_mine" "$_argv" "$_argv2" 2>/dev/null || true
+  rm -f "$O/state/mergeclaim-14.lock" "$O/state/mergeclaim-15.lock" "$O/state/mergeclaim-16.lock" \
+        "$O/state/mergeclaim-17.lock" "$O/state/mergeclaim-18.lock"
+  # ⛔ (R2, P1) THE CROSS-BOX ARM MUST NOT INHERIT THE SPAWN GUARD'S LOOSE LOCK TEST. A stale local
+  # lock whose pid had been recycled made even an EXPIRED foreign lease read live — so a PR left the
+  # un-owned queue for ever, through arm 3 after arm 2 had been fixed. The lease alone decides.
+  ( exec sleep 300 ) & _stale=$!
+  printf '%s' "$_stale" > "$O/state/mergeclaim-19.lock"
+  printf 'refs/claims/19-fff000000000\totherbox:1\t1\n' > "$O/state/claims-snapshot"
+  eqv "a stale local lock + an EXPIRED foreign lease is NOT ownership (the lease alone decides)" \
+      "unowned" "$(_owned 19 fff000000000)"
+  printf 'refs/claims/19-fff000000000\totherbox:1\t9999999999\n' > "$O/state/claims-snapshot"
+  eqv "…while a LIVE foreign lease still owns (the arm is not dead)" "owned" "$(_owned 19 fff000000000)"
+  kill "$_stale" 2>/dev/null || true
+  rm -f "$O/state/mergeclaim-19.lock"
+  # (3) THE CROSS-BOX ARM — the only evidence a remote holder can leave (a lease is DATA, not
+  # liveness: claims.sh says so, and a remote pid cannot be probed). Per HEAD, never per PR.
+  printf 'refs/claims/12-ddd000000000	otherbox:1	9999999999\n' > "$O/state/claims-snapshot"
+  eqv "a claim held by ANOTHER box OWNS its PR (unobservable locally)" "owned" "$(_owned 12 ddd000000000)"
+  eqv "a claim on a DIFFERENT head does not own this one (per head, not per PR)" "unowned" "$(_owned 12 eee000000000)"
+  printf 'refs/claims/12-ddd000000000	%s:1	9999999999\n' "$(_this_host)" > "$O/state/claims-snapshot"
+  eqv "THIS box's own claim does not own a PR — only a live process can" "unowned" "$(_owned 12 ddd000000000)"
+  printf 'refs/claims/12-ddd000000000	otherbox:1	1\n' > "$O/state/claims-snapshot"
+  eqv "an EXPIRED foreign claim does not own its PR (the lease window is respected)" "unowned" "$(_owned 12 ddd000000000)"
+  rm -f "$O/state/claims-snapshot"
 
-  # (2) The four ownership signals, each driven through the SHIPPED pr_owned():
-  #       #3  a live `fix-` session        #4  nothing at all
-  #       #9  a live `merge-` session      #11 the reviewer-findings marker
-  #       #12 a live CROSS-BOX claim       #21 a session for a DIFFERENT PR (must not leak)
-  rm -f "$TMP/ownO/state"/needsfix-* "$TMP/ownO/state"/mergeclaim-*.lock
-  printf 'refs/claims/12-ddd000000000\tx\t9999999999\n' > "$TMP/ownO/state/claims-snapshot"
-  # The marker is HEAD-KEYED in the shipped reader, so the fixture must carry the SAME sha the
-  # listing row does — `11:deadbeef0000` in (3) below is the same convention.
-  SH11=deadbeef00000000000000000000000000000000
-  touch "$TMP/ownO/state/needsfix-11-$SH11"
-  eqv "a live fix- session owns its PR"        "owned"   "$(WSESS=$'fix-3' _owned 3)"
-  eqv "a live merge- session owns its PR"      "owned"   "$(WSESS=$'merge-9' _owned 9)"
-  eqv "a cross-box claim lease owns its PR"    "owned"   "$(WSESS='' _owned 12 ddd000000000)"
-  eqv "the reviewer-findings marker owns its PR (at the CURRENT head)" "owned" "$(WSESS='' _owned 11 "$SH11")"
-  # ⛔ A marker for a SUPERSEDED head is a hand-off nothing will consume — no path deletes a stale
-  # marker (only the ai-review arm deletes one at all), so a PR-wide glob read that PR as owned
-  # FOREVER and permanently under-counted `unowned` (fail OPEN on a dispatch gate).
-  eqv "a findings marker for a SUPERSEDED head does NOT own the PR" "unowned" "$(WSESS='' _owned 11 bbbb000000000000000000000000000000000000)"
-  eqv "a PR with no worker, no claim and no marker is UNOWNED" "unowned" "$(WSESS=$'fix-3' _owned 4)"
-  eqv "another PR's session does not leak ownership" "unowned" "$(WSESS=$'fix-30' _owned 3)"
-  eqv "a session for a DIFFERENT PR does not own this one" "unowned" "$(WSESS=$'fix-4' _owned 21 000000000000)"
-  # …and the cross-box arm must be LEASE-bound, not merely present: an EXPIRED lease is not a
-  # worker. (The lease is a DECLARED WINDOW, not a probe — claims.sh is explicit that a lease is
-  # "data, not liveness", because a remote pid cannot be checked. So the assertion is about the
-  # window being respected, not about liveness being observed.)
-  printf 'refs/claims/12-ddd000000000\tx\t1\n' > "$TMP/ownO/state/claims-snapshot"
-  eqv "an EXPIRED cross-box claim does not own its PR (the lease window is respected)" "unowned" "$(WSESS='' _owned 12 ddd000000000)"
-
-  # (3) The COUNT over a real listing: 5 rows, 3 owned -> 2 unowned. The listing is `number:head`.
-  # No claims-snapshot here, so the cross-box arm contributes nothing and the arithmetic is exact.
-  # The marker fixture uses the SAME head as the row — the shipped reader is head-keyed.
-  rm -f "$TMP/ownO/state"/needsfix-* "$TMP/ownO/state"/mergeclaim-*.lock "$TMP/ownO/state/claims-snapshot"
-  touch "$TMP/ownO/state/needsfix-11-deadbeef0000"
-  printf '3:aaa000000000 4:bbb000000000 9:ccc000000000 11:deadbeef0000 12:ddd000000000\n' > "$TMP/ownO/state/last-open-prs"
-  eqv "5 open PRs, 3 being worked -> 2 UNOWNED (the new gate input)" "2" "$(WSESS=$'fix-3\nmerge-9' _own 5)"
-  # the marker is CONSUMED at fixer spawn — removing it releases that PR
-  rm -f "$TMP/ownO/state/needsfix-11-deadbeef0000"
-  eqv "a consumed findings marker releases the PR (3 unowned)" "3" "$(WSESS=$'fix-3\nmerge-9' _own 5)"
+  # (4) THE COUNT over a real listing, through the SHIPPED unowned_pr_count. Rows are
+  # `number:head:branch` — the branch is in the row because ownership is per-PR and LIVE.
+  _live 'fix/3-b	/repo/.worktrees/3	11	/repo/.worktrees/3' \
+        'fix/9-b	/repo/.worktrees/9	12	/repo/.worktrees/9'
+  printf '3:aaa000000000:fix/3-b 4:bbb000000000:fix/4-b 9:ccc000000000:fix/9-b 11:ddd000000000:fix/11-b 12:eee000000000:fix/12-b\n' > "$O/state/last-open-prs"
+  eqv "5 open PRs, 2 held by live processes -> 3 UNOWNED (the gate input)" "3" "$(_own 5)"
   # ⛔ FAIL-CLOSED: no listing at all => EVERY open PR counts as unowned. The other direction
-  # (assuming they were owned) would OPEN the dispatch gate on a listing we could not read.
-  mv "$TMP/ownO/state/last-open-prs" "$TMP/ownO/state/.parked-list"
-  eqv "NO listing => the whole count is unowned (fail CLOSED, never fail open)" "7" "$(WSESS='' _own 7)"
-  mv "$TMP/ownO/state/.parked-list" "$TMP/ownO/state/last-open-prs"
+  # (assuming they were owned) would OPEN the issue path on a listing we could not read.
+  mv "$O/state/last-open-prs" "$O/state/.parked-list"
+  eqv "NO listing => the whole count is unowned (fail CLOSED, never fail open)" "7" "$(_own 7)"
+  mv "$O/state/.parked-list" "$O/state/last-open-prs"
+  # a legacy two-field row carries no branch, so it can only be owned through the local arms — and
+  # with none live it counts as unowned (fail CLOSED, the drain direction).
+  printf '3:aaa000000000\n' > "$O/state/last-open-prs"
+  eqv "a legacy row with no branch field is not read as owned (the drain direction)" "1" "$(_own 1)"
   # a malformed row is skipped, never counted as owned
-  printf '3:aaa000000000 xx:bbb000000000\n' > "$TMP/ownO/state/last-open-prs"
-  eqv "a malformed listing row is skipped, not read as ownership" "1" "$(WSESS=$'fix-3' _own 2)"
+  printf '3:aaa000000000:fix/3-b xx:bbb000000000:fix/4-b\n' > "$O/state/last-open-prs"
+  eqv "a malformed listing row is skipped, not read as ownership" "1" "$(_own 2)"
   # owned ABOVE the listing (a race between the count and the rows) collapses to 0, never negative
-  printf '3:aaa000000000 4:bbb000000000\n' > "$TMP/ownO/state/last-open-prs"
-  eqv "an owned count above the listing collapses to 0, never negative" "0" "$(WSESS=$'fix-3\nfix-4' _own 1)"
-
-  # (3b) A MALFORMED argument must FAIL CLOSED — and "fail closed" here means EMIT NOTHING, not a
-  # number. Coercing it to 0 handed the gate the most permissive value there is AND a valid-looking
-  # one, so the caller's guard could not see it and the gate OPENED on a count never read.
-  _mal=0; _out="$(WSESS='' _own abc)" || _mal=1
-  [ "$_mal" = "1" ] && [ -z "$_out" ] \
+  printf '3:aaa000000000:fix/3-b 4:bbb000000000:fix/4-b\n' > "$O/state/last-open-prs"
+  _live 'fix/3-b	/repo/w3	1	/repo/w3' 'fix/4-b	/repo/w4	2	/repo/w4' 'fix/5-b	/repo/w5	3	/repo/w5'
+  eqv "an owned count above the listing collapses to 0, never negative" "0" "$(_own 1)"
+  # (5) a MALFORMED argument must FAIL CLOSED — "fail closed" means EMIT NOTHING, never a number:
+  # coercing it to 0 hands the gate the most permissive value there is AND a valid-looking one.
+  _mal=0; _out="$(_own abc)" || _mal=1
+  { [ "$_mal" = "1" ] && [ -z "$_out" ]; } \
     && { echo "  ✅ a non-numeric count FAILS CLOSED (emits nothing, never 0)"; PASS=$((PASS+1)); } \
-    || { echo "  ❌ a non-numeric count produced '$_out' (rc=$?) — it must emit NOTHING so the caller falls back to the total"; FAIL=$((FAIL+1)); }
-  # ⛔ `08` is the second malformed form and the one a digit-only guard admits: `$(( 08 - … ))` is an
+    || { echo "  ❌ a non-numeric count produced '$_out' — it must emit NOTHING so the caller falls back to the total"; FAIL=$((FAIL+1)); }
+  # `08` is the second malformed form and the one a digit-only guard admits: `$(( 08 - … ))` is an
   # OCTAL parse error, `u` came out empty, the caller substituted its own `08`, and `[ 08 -gt 25 ]`
   # read 8 and OPENED the gate. is_num rejects leading zeros precisely so this cannot happen.
-  _mal=0; _out="$(WSESS='' _own 08)" || _mal=1
-  [ "$_mal" = "1" ] && [ -z "$_out" ] \
+  _mal=0; _out="$(_own 08)" || _mal=1
+  { [ "$_mal" = "1" ] && [ -z "$_out" ]; } \
     && { echo "  ✅ a leading-zero count (08) FAILS CLOSED (not read as octal 8)"; PASS=$((PASS+1)); } \
     || { echo "  ❌ a leading-zero count produced '$_out' — 08 must not reach the arithmetic or the gate"; FAIL=$((FAIL+1)); }
-  # …and the caller's two `is_num` arms are the only fallback there is: no guard, no digits.
-  printf '3:aaa000000000\n' > "$TMP/ownO/state/last-open-prs"
-  eqv "a valid count still passes through untouched" "1" "$(WSESS='' _own 1)"
+  # a live table the probe could not read is UNKNOWN: nothing is owned (the drain direction), never
+  # "everything is owned" (which would open the issue path on a failed probe).
+  rm -f "$LO_LIVE"
+  printf '3:aaa000000000:fix/3-b\n' > "$O/state/last-open-prs"
+  eqv "an UNREADABLE live table owns nothing (fail CLOSED)" "1" "$(_own 1)"
 
+  # (6) THE WIRING, driven from the shipped gate table below.
   # (4) The DRAIN ARITHMETIC at the shipped threshold. `MERGE_PRIORITY_AT=25` is the raised default;
   #     25 must NOT trip it and 26 must.
   MERGE_PRIORITY_AT=25; MAX_REVIEW=4; MAX_FIX=3
@@ -1113,20 +1176,29 @@ if [ "$_own_ok" = "1" ] && bash -n "$TMP/ownfunctions.sh" 2>/dev/null; then
   # review_slots is the sibling half of the same rule and must be driven here too.
   ex review_slots > "$TMP/review_slots.sh"
   . "$TMP/review_slots.sh"
-  ck "26 unowned PRs with a lane running -> DRAIN"             26 1 0  gate
-  ck "26 unowned PRs with a lane AND a worker -> DRAIN"        26 1 3  gate
-  ck "26 unowned PRs with NOTHING in flight -> dispatch ok"    26 0 0  open
-  ck "exactly 25 unowned -> NOT over the threshold"            25 2 5  open
-  # ⚠️ This is a plain below-threshold case, and `ck` hands the literal straight to `mp_reason` — it
-  # does NOT drive the ownership scan, so the label must not claim it does.
-  ck "20 unowned -> below threshold, dispatch allowed"        20 2 5  open
+  # ⛔ NO THRESHOLD: the first argument is the WORKABLE un-owned count, and 1 blocks. The old table
+  # (26 gated, 25 and 20 open) encoded the defect — the measured box sat at exactly 25 un-owned PRs
+  # with nothing working them while it opened more work from issues.
+  ck "26 unowned PRs, nothing in flight -> DRAIN (one is enough)"  26 0 0 gate
+  ck "25 unowned PRs (the measured state) -> DRAIN"                25 2 5 gate
+  ck "20 unowned PRs, 0 workers -> DRAIN"                          20 0 0 gate
+  ck "0 unowned PRs -> the issue path may open"                     0 2 5 open
   # ⛔ THE ASYMMETRY THIS FIXES: drain mode raised the REVIEWER budget only, so a backlog of
   # DIRTY/BEHIND PRs — 17 of 20 on the live cells — sent the extra capacity at reviewers while the
   # fixer spawn sites still compared against the unraised MAX_FIX.
   eqv "drain mode RAISES the fixer budget (MAX_FIX+2) — the half that was missing" "5" "$(fix_slots 26)"
-  eqv "between thresholds the fixer budget is MAX_FIX" "3" "$(fix_slots 25)"
+  # ⛔ AND THE THRESHOLD IS GONE TOO (review R2, P3): the GATE blocks the issue path on ONE un-owned
+  # PR, so the headroom must follow the same predicate — a 25-PR drain at the pre-change WIP is the
+  # "capped to a trickle" shape the owner's rule 5 forbids. Below the old size threshold is now FULL.
+  eqv "25 un-owned (the measured state) raises the fixer budget too — no size threshold" "5" "$(fix_slots 25)"
+  eqv "1 un-owned PR is enough to raise the fixer budget" "5" "$(fix_slots 1)"
+  eqv "0 un-owned -> the base fixer budget" "3" "$(fix_slots 0)"
   eqv "review_slots alongside it raises the reviewer budget (MAX_REVIEW+2)" "6" "$(review_slots 26)"
-  eqv "review_slots below the threshold is MAX_REVIEW" "4" "$(review_slots 25)"
+  eqv "25 un-owned raises the reviewer budget too (same predicate as the gate)" "6" "$(review_slots 25)"
+  eqv "0 un-owned -> the base reviewer budget" "4" "$(review_slots 0)"
+  # ⛔ A NON-NUMERIC COUNT MUST NOT ERROR INTO THE SMALLER BUDGET: `[ "x" -gt 0 ]` errors (rc 2, FALSE)
+  # and would silently pick the restrictive arm — the "errored test is FALSE" pattern this file guards.
+  eqv "a non-numeric un-owned count falls back to the BASE budget, not an error" "4" "$(review_slots x)"
   # base 10, not octal: `$(( 010 + 2 ))` is 10, `$(( 10#010 + 2 ))` is 12
   MAX_FIX=010
   eqv "fix_slots reads MAX_FIX in BASE 10 (a leading zero is not octal)" "12" "$(fix_slots 26)"
@@ -1179,14 +1251,21 @@ if [ "$_own_ok" = "1" ] && bash -n "$TMP/ownfunctions.sh" 2>/dev/null; then
 
   # (6) THE WIRING. A perfect ownership count is dead code if the gate still receives the TOTAL.
   wpin "the loop derives UPN (unowned) from the listing" "$ORCH" 'UPN="$(unowned_pr_count "$OPEN_N")"'
-  # ⛔ The CALL, not the name: `wpin` is a fixed-string grep, so pinning `wsess_snapshot` was
-  # satisfied by the function DEFINITION — deleting the call left the assertion green while WSESS
-  # was never refreshed, which re-caps the fleet exactly as before this change. Match the indented
-  # call form and require it NOT to be a definition.
-  if grep -qE '^[[:space:]]+wsess_snapshot[[:space:]]*$' "$ORCH"; then
-    echo "  ✅ the loop CALLS wsess_snapshot before the scan (not just defines it)"; PASS=$((PASS+1))
+  # ⛔ The CALL, not the name: a fixed-string grep for the function name is satisfied by its
+  # DEFINITION, so deleting the call would leave the assertion green while the snapshot was never
+  # refreshed. Match the indented call form.
+  if grep -qE '^[[:space:]]+if lo_scan "\$LO_LIVE" "\$REPO"' "$ORCH"; then
+    echo "  ✅ the loop CALLS lo_scan once per cycle (not just defines it)"; PASS=$((PASS+1))
   else
-    echo "  ❌ wsess_snapshot is defined but never CALLED in the loop body — WSESS is never refreshed"; FAIL=$((FAIL+1))
+    echo "  ❌ lo_scan is defined but never CALLED in the loop body — ownership would never be refreshed"; FAIL=$((FAIL+1))
+  fi
+  # ⛔ ABSENCE PIN: the predicate must not go back to reading worker SESSION NAMES. That is the
+  # measured defect — pr-doctor reported 21 "running" lanes while a live-cwd scan found none of them
+  # holding a PR branch, and 25 PRs sat un-owned.
+  if grep -qE '^[[:space:]]*if wsess ' "$ORCH"; then
+    echo "  ❌ pr_owned still consults worker session NAMES — a session is a declaration, not work"; FAIL=$((FAIL+1))
+  else
+    echo "  ✅ pr_owned does not count a session name as ownership (absence pin)"; PASS=$((PASS+1))
   fi
   # ⛔ ORDER, and it is load-bearing: pr_owned->claim_live reads state/claims-snapshot, so the
   # ownership scan must come AFTER the one fetch that refreshes it. Before the fix the scan ran ~220
@@ -1209,7 +1288,81 @@ if [ "$_own_ok" = "1" ] && bash -n "$TMP/ownfunctions.sh" 2>/dev/null; then
   else
     echo "  ✅ no fixer spawn site is left on the unraised MAX_FIX (absence pin)"; PASS=$((PASS+1))
   fi
-  wpin "the gate receives the UNOWNED count" "$ORCH" 'GATE_WHY="$(mp_reason "${UPN:-0}" "$LANES" "$WORKERS" "${OPEN_N:-0}")"'
+  wpin "the gate receives the WORKABLE UNOWNED count" "$ORCH" 'GATE_WHY="$(mp_reason "${UPN_WORK:-${UPN:-0}}" "$LANES" "$WORKERS" "${SEL_TOTAL:-${OPEN_N:-0}}")"'
+  # ⛔ ONE POPULATION PER CYCLE: the total and its parts are computed together from the RICHEST source
+  # that read — state/last-open-prs first, the swept REST set only as its FALLBACK (GraphQL is the
+  # listing that fails first under a rate limit, which is why OPEN_N can be a synthetic number), and
+  # OPEN_N alone last. The order is the assertion: a funnel whose parts come from different reads is
+  # one an operator learns to ignore, and the SWEPT set alone must never be the gate's primary source
+  # (SWEEP_LIST is SCOPE-FILTERED, so `SCOPE=own` would read 0 un-owned while the repo held fifty).
+  wpin "the funnel's population is the OPEN-PR row set" "$ORCH" 'OPEN_ROWS="$(cat "$O/state/last-open-prs"'
+  wpin "…and it is the PRIMARY source for the gate's count" "$ORCH" 'UPN_WORK=$(( UPN - SEL_PARKED )); [ "$UPN_WORK" -lt 0 ] && UPN_WORK=0'
+  if grep -qF 'elif [ "${SEL_UNOWNED:-0}" -gt 0 ]' "$ORCH" && grep -qF 'POP=open-rows' "$ORCH"; then
+    echo "  ✅ the scope-filtered sweep set is the FALLBACK, reached only when no open-PR rows exist"; PASS=$((PASS+1))
+  else
+    echo "  ❌ the swept set is not clearly a fallback — a scope-filtered population could be the gate's primary source"; FAIL=$((FAIL+1))
+  fi
+  # …and the source actually used is printed, so a degraded population is visible rather than inferred.
+  wpin "the cycle logs WHICH population the funnel used" "$ORCH" '[select] population=$POP'
+  # ⛔ (R2, P2) THE INTERFACE, NOT THE FILE: a `$O` copy providing lo_scan but not lo_order/
+  # lo_select_rows/lo_class_compact produced an EMPTY SEL_ROWS — the sweep then acted on ZERO PRs,
+  # silently, while `scan=ok`. One missing name must mean the registry-only degrade.
+  wpin "LO_SCAN is gated on the FULL interface the loop calls" "$ORCH" \
+       'if declare -f lo_scan lo_order lo_select_rows lo_select lo_class_compact >/dev/null 2>&1; then'
+  # ⛔ (R2, P2) a FAILED scan must stop the predicate reading a table it could not refresh.
+  wpin "a failed scan blanks LO_LIVE (the predicate cannot read a stale table)" "$ORCH" '      LO_LIVE=""'
+  # (F7) the documented `scan=` token must be an ARTIFACT, not a comment promise.
+  wpin "the population line carries the scan STATUS (a documented token that exists)" "$ORCH" '[select] population=$POP scan=$LO_STATUS'
+  # ── REVIEW R1, P1: the SCOPE-FILTERED fallback may never LOWER the gate ──────────────────────
+  # With no open-PR rows the count is the whole listing ("assume nothing is owned") and SWEEP_LIST is
+  # scope-filtered and survives a non-200 sweep — so a swept set reading fully owned is a normal state
+  # in exactly the cycle that fallback exists for. Taking its smaller number opens the issue path on
+  # the defect this change removes, so the floor is pinned, together with its own printed line.
+  wpin "the swept fallback is FLOORED by the fail-closed count" "$ORCH" 'if is_num "${UPN:-}" && [ "$UPN" -gt "$UPN_WORK" ]; then'
+  wpin "…and the floor is NAMED when it applies" "$ORCH" '⚠️ fail-closed floor: the listing answers'
+  # ── REVIEW R1, P3: the parked subtraction is over UN-OWNED PRs only ─────────────────────────
+  # UPN already excludes owned PRs; subtracting a PR that is both parked and owned removed a unit
+  # that was never in the minuend, and with one un-owned PR left that opened the issue path.
+  wpin "a parked PR is subtracted only when it is UN-OWNED" "$ORCH" 'if ! pr_owned "$_op" "$_osha" "$_obr"; then SEL_PARKED=$(( SEL_PARKED + 1 )); fi'
+  # ── REVIEW R1, P2: a LOST funnel line is a HOLD, not a re-decision ─────────────────────────
+  wpin "a funnel that printed nothing HOLDS (it never re-decides from the capacity gate)" "$ORCH" 'HOLDING: no issue work this cycle'
+  if grep -qF 'LO_SELECT_DEFINED' "$ORCH"; then
+    echo "  ✅ the fallback keys on AVAILABILITY (module present?), not on an empty line"; PASS=$((PASS+1))
+  else
+    echo "  ❌ the fallback keys on the funnel line being empty — a failed write would re-decide the cycle"; FAIL=$((FAIL+1))
+  fi
+  # ── REVIEW R1, P3: the stall tunable is normalised before it is compared ────────────────────
+  wpin "MERGE_STALL_MIN is validated (a non-numeric value must not read as 'drain alive')" "$ORCH" 'case "${MERGE_STALL_MIN:-180}" in'
+  # ── THE GATE HAS NO RELEASE ARM, AND THAT IS PINNED (owner ruling, 2026-10-18) ────────────────
+  # "Only when NO un-owned PR remains may the dispatcher create new work by picking issues." A stalled
+  # drain must therefore produce a NAME, never a release: an age-based release turns *PRs are not
+  # landing* into *dispatch more issues*, which hides the stall behind fresh activity. The PR queue IS
+  # the work, so the correct response to "nothing has landed in 4h" is to say so beside the gate.
+  wpin "a long stall is NAMED beside the gate it explains" "$ORCH" '[dispatch] DRAIN STALLED — no PR merged in ${_lage}m'
+  # ⛔ ABSENCE PIN against the release arm returning: no function here may take an AGE and return
+  # "not held". `mp_reason`'s arguments are inputs to a HOLD; nothing in the selection path may read a
+  # land age to decide that the gate should stop holding.
+  # (the tokens are the ones such an arm would introduce — `released_until`, `mp_release`, a
+  # `RELEASE_NOTE`; a bare word "released" appears in unrelated lock comments and is not a signal)
+  if grep -qE 'released_until|mp_release|RELEASE_NOTE' "$ORCH"; then
+    echo "  ❌ an age-based RELEASE of the un-owned gate is back — that reverses the owner's ruling (un-owned PRs first, no exception for a stalled drain)"; FAIL=$((FAIL+1))
+  else
+    echo "  ✅ no age-based release of the un-owned gate (absence pin — a stall is named, never released)"; PASS=$((PASS+1))
+  fi
+  # …and the stall datum is DIAGNOSTIC ONLY: it must not be handed to the gate or to lo_select.
+  if grep -E '_lage|MERGE_STALL_MIN' "$ORCH" | grep -qE 'GATE_WHY|lo_select'; then
+    echo "  ❌ the stall age reaches the gate/selection — it may only be printed"; FAIL=$((FAIL+1))
+  else
+    echo "  ✅ the stall age is printed, never handed to the gate or to lo_select"; PASS=$((PASS+1))
+  fi
+  # ⛔ Parked PRs are subtracted from the gate's number (a PR no lane may touch must not latch the
+  # issue path shut forever) — and the subtraction must be COMPUTED, not assumed.
+  wpin "the gate's count subtracts parked (needs-a-human) PRs" "$ORCH" 'UPN_WORK=$(( UPN - SEL_PARKED ))'
+  # ⛔ And the FUNNEL's verdict is authoritative over the issue path: a printed decision that the
+  # gate can ignore is exactly the "printed claim with no artifact" failure this change removes.
+  wpin "the printed funnel decision gates the issue path" "$ORCH" 'if [ "${LO_CHOICE:-issue}" != "issue" ] && [ -z "$GATE_WHY" ]; then'
+  # …and the one line that makes "busy" and "draining" different readings of the log.
+  wpin "the issue path announces the block in one line" "$ORCH" '[dispatch] issues BLOCKED'
   # ⛔ The REVERT, pinned as an ABSENCE: passing the total open count is the exact regression this
   # section exists for, and a presence-only wpin cannot see it.
   if grep -qF 'mp_reason "${OPEN_N:-0}"' "$ORCH"; then
