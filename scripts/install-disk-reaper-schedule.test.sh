@@ -857,6 +857,29 @@ grep -q -- '--dry-run' "$DEFHOME/Library/LaunchAgents/com.eldato.disk-reaper.pli
     && ok "T8m ...the artifact really is report-only now" || bad "T8m the artifact was not rewritten report-only"
 rm -rf "$T/state-m1" "$T/state-m2" "$DEFHOME" "$T/launchctl.state" "$T/launchctl.plist-path"
 
+# ── T8n: `--status` must report the arming of the job launchd RUNS, not of a stale plist ──
+# Three dirs at once: an armed install in the default dir, a seam re-install with --dry-run (which leaves
+# the default-dir copy in place), then `--status` from a state dir whose stamp cannot see either. The
+# guessed path exists, so a probe that only runs when the guess is MISSING reports the stale copy's
+# `armed=apply` — a false certificate on the one question an operator asks before trusting the box.
+DEFHOME="$T/home-n"; mkdir -p "$DEFHOME/Library/LaunchAgents"
+SEAM_N="$T/agents-n"; mkdir -p "$SEAM_N"
+HOME="$DEFHOME" DISK_REAPER="$PASSFILE" DISK_REAPER_REPOS="$REPO" DISK_REAPER_PLATFORM=darwin \
+    DISK_REAPER_STATE_DIR="$T/state-n1" LAUNCHCTL="$T/bin/launchctl" LAUNCHD_DOMAIN="gui/999" \
+    DISK_REAPER_PYTHON="$T/bin/fakepython" ELDATO_ALLOW_TEST_HOME=1 bash "$INST" --install --apply >/dev/null 2>&1
+HOME="$DEFHOME" DISK_REAPER="$PASSFILE" DISK_REAPER_REPOS="$REPO" DISK_REAPER_PLATFORM=darwin \
+    DISK_REAPER_STATE_DIR="$T/state-n1" DISK_REAPER_AGENTS_DIR="$SEAM_N" LAUNCHCTL="$T/bin/launchctl" \
+    LAUNCHD_DOMAIN="gui/999" DISK_REAPER_PYTHON="$T/bin/fakepython" ELDATO_ALLOW_TEST_HOME=1 \
+    bash "$INST" --install --dry-run >/dev/null 2>&1
+assert_file "$DEFHOME/Library/LaunchAgents/com.eldato.disk-reaper.plist" "T8n the stale default-dir plist survives the seam re-install"
+OUT="$(HOME="$DEFHOME" DISK_REAPER="$PASSFILE" DISK_REAPER_REPOS="$REPO" DISK_REAPER_PLATFORM=darwin \
+    DISK_REAPER_STATE_DIR="$T/state-n2" LAUNCHCTL="$T/bin/launchctl" LAUNCHD_DOMAIN="gui/999" \
+    DISK_REAPER_PYTHON="$T/bin/fakepython" ELDATO_ALLOW_TEST_HOME=1 bash "$INST" --status 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T8n --status still answers (the job IS loaded)"
+assert_contains "$OUT" "$SEAM_N" "T8n …job_path names the LOADED plist (the seam), not the stale default-dir copy"
+assert_contains "$OUT" "armed=dry-run" "T8n …and armed= is read off the job launchd runs, NOT the stale armed copy"
+rm -rf "$DEFHOME" "$SEAM_N" "$T/state-n1" "$T/state-n2" "$T/launchctl.state" "$T/launchctl.plist-path"
+
 echo "── T11. both systemd targets, including the two arms no test could reach ──"
 # (a) the SYSTEM unit with `SUDO=""` — the "already root / container" arm. The system unit dir is a
 # seam now, so this branch is executable without real sudo writing to /etc/systemd/system.

@@ -881,16 +881,18 @@ ld_status() {
     live_dir="$LD_DIR"; rec="$(recorded_dir)"
     [ -n "$rec" ] && LD_DIR="$rec"
     dest="$LD_DIR/$LABEL.plist"
+    # ⛔ ASK LAUNCHD FIRST, UNCONDITIONALLY — the same authoritative answer `ld_uninstall` uses (#2048
+    # review). This probe used to sit INSIDE the "the guessed path is missing" guard, so a STALE plist in
+    # the guessed dir still won: `--status` answered `installed=yes`, `enabled=enabled`, `armed=apply`
+    # (rc 0) while the LOADED plist — in a seam dir the stamp could not name — carried `--dry-run`. The
+    # one field an operator reads to know the Mac is DELETING was read off a job launchd does not run,
+    # and that stale copy is exactly what a seam install leaves behind. Guesses are the FALLBACK only.
+    _loaded="$($LC print "$LD_DOMAIN/$LABEL" 2>/dev/null | sed -n 's/^[[:space:]]*path = //p' | head -1)"
+    case "$_loaded" in /*) [ -f "$_loaded" ] && dest="$_loaded" ;; esac
     if [ ! -f "$dest" ]; then
-        # ⛔ ASK LAUNCHD FIRST — the same authoritative answer `ld_uninstall` uses (#2048 review). Guessing
-        # answered `installed=yes`, `enabled=enabled`, `armed=apply` (rc 0) while the LOADED plist — in a
-        # seam dir the stamp could not name — carried `--dry-run`: the one field an operator reads to know
-        # the Mac is DELETING was read off a plist that was not the loaded job.
-        _loaded="$($LC print "$LD_DOMAIN/$LABEL" 2>/dev/null | sed -n 's/^[[:space:]]*path = //p' | head -1)"
         for _cand in "$live_dir" "${HOME:-}/Library/LaunchAgents"; do
             [ -n "$_cand" ] && [ -f "$_cand/$LABEL.plist" ] && { dest="$_cand/$LABEL.plist"; break; }
         done
-        case "$_loaded" in /*) [ -f "$_loaded" ] && dest="$_loaded" ;; esac
     fi
     say "platform=darwin"
     say "scheduler=launchd"
@@ -1147,8 +1149,16 @@ if [ "${MODE_EXPLICIT:-0}" != 1 ]; then
     # `armed: dry-run` line every sync prints. Say the reversal out loud, in the direction that hurts.
     if [ -z "$_stamp_armed" ]; then
         _existing=""
+        # ⛔ THE PROBE MUST COVER WHERE LAUNCHD SAYS THE JOB IS (#2048 review, follow-up): probing only the
+        # dirs THIS invocation derives made the warning silent in the one shape it was added for — a seam
+        # install whose seam is not exported here, which launchd still loads.
+        _loaded_plist="$(${LC:-launchctl} print "gui/$(id -u)/$LABEL" 2>/dev/null | sed -n 's/^[[:space:]]*path = //p' | head -1)"
+        _loaded_d=""
+        case "$_loaded_plist" in /*) _loaded_d="$(dirname "$_loaded_plist")" ;; esac
         case "$PLATFORM" in
-            darwin) [ -f "${DISK_REAPER_AGENTS_DIR:-${HOME:-}/Library/LaunchAgents}/$LABEL.plist" ] && _existing="launchd job" ;;
+            darwin) for _d in "${DISK_REAPER_AGENTS_DIR:-${HOME:-}/Library/LaunchAgents}" "${HOME:-}/Library/LaunchAgents" "$_loaded_d"; do
+                        [ -n "$_d" ] && [ -f "$_d/$LABEL.plist" ] && { _existing="launchd job"; break; }
+                    done ;;
             *)      for _d in "${SYSTEMD_SYSTEM_DIR:-/etc/systemd/system}" "${HOME:-}/.config/systemd/user" "${SYSTEMD_UNIT_DIR:-}"; do
                         [ -n "$_d" ] && [ -f "$_d/eldato-disk-reaper.service" ] && { _existing="systemd unit"; break; }; done ;;
         esac
