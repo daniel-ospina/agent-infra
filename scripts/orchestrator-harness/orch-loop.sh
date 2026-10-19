@@ -1485,8 +1485,10 @@ heartbeat() { date +%s > "$O/heartbeat"; }
 #     transition, not a measurement;
 #   * the script EXISTS and the census is `?`/unreadable → `LANES_UNKNOWN=1`, and the gate refuses to
 #     add work with that reason, on the same doctrine as an unreadable memory probe (memory gate:
-#     "a failed probe is UNKNOWN, not ample"). The tmux count is still shown in `[cap]` as a
-#     lower-bound hint, never used as a licence to dispatch.
+#     "a failed probe is UNKNOWN, not ample"). `[cap]` prints `?` (never a fabricated `0`) and the
+#     internal `LANES` keeps a tmux lower bound ONLY so the numeric consumers stay numeric; the
+#     dispatch lines print `LANES_DISPLAY` too, so no line in the cycle reintroduces a `0` for a
+#     read that did not happen.
 LANES_UNKNOWN=0
 # Where the `lanes=` number CAME FROM, printed on the `[cap]` line. Without it, a tmux session count
 # and a process census are the same three letters, and a `$O` that predates `lane-reap.sh` silently
@@ -5164,7 +5166,7 @@ PY
       fi
     fi
     if [ -s "$O/.batch" ]; then
-      echo "[dispatch] load=$L lanes=$LANES -> $(tr '\n' ' ' < "$O/.batch")" >> "$LOG"
+      echo "[dispatch] load=$L lanes=${LANES_DISPLAY:-$LANES} -> $(tr '\n' ' ' < "$O/.batch")" >> "$LOG"
       # ⛔ A DEFERRED BATCH WAS NOT DISPATCHED (#2296 cycle 6, P2). `K` was incremented as each issue
       # was CLAIMED, before this call — so a batch that the CI-queue gate refused would otherwise be
       # counted here, in the funnel and in the cycle record, as work that happened. `dispatch-merge.sh`
@@ -5232,7 +5234,7 @@ PY
     # [prtail:begin] (extracted and DRIVEN by pr-dispatch.test.sh — keep the markers)
     _prtail="${_prtail}${_refsuf:-}"
     # [prtail:end]
-    dispatch_gate_line "$GATE_WHY" "$LANES" "$WORKERS" "$_prtail" >> "$LOG"
+    dispatch_gate_line "$GATE_WHY" "${LANES_DISPLAY:-$LANES}" "$WORKERS" "$_prtail" >> "$LOG"
   fi
   heartbeat
 
