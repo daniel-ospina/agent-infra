@@ -259,21 +259,34 @@ def _rest_prs(state, limit=100, deadline=None):
     is killed (see `REST_BUDGET_S`).
 
     ⛔ THE OFFSET WINDOW IS A LIVE ORDER, SO A ROW THAT MOVES DURING THE READ MAKES THE READ
-    UNCERTIFIABLE -- and the read REFUSES rather than returning the window. `updated desc` is
-    re-sorted between two requests and each page is an OFFSET into it, so a PR updated mid-read
-    jumps to the front and every row below it shifts by one. Two things follow, and they are
-    the same event seen from two sides: (i) the mover is returned by the page that read it AND
-    by the next page, i.e. twice; (ii) a row that ENTERED at the head after the first page was
-    read is at offset 0 and is returned by NO page. So a repeat is not merely a double-count to
-    be filtered -- it is a SOUND DETECTOR that the list changed between two requests, and a
-    window that has one is missing rows. Measured (200-row read, one PR re-sorted before page
-    2): 200 rows, 198 distinct, rows 99 and 150 repeated; simulated end-to-end, one merge
-    landing mid-read leaves `merged_today` at 0 where the truth is 1, and the just-merged PR is
-    returned by no page. Returning a deduped list would fix (i) and leave (ii) silently short --
-    exactly the class this file refuses to report -- so a repeat returns None for the WHOLE
-    read, the same answer as an unreadable or truncated page. A shift that stays INSIDE one page
-    produces no repeat and costs nothing, which is why this is not a blanket refusal. The
-    per-row shape check below is what makes the detector safe to rely on: any row whose
+    UNCERTIFIABLE -- and the read REFUSES rather than returning the window.
+
+    ⛔ WHAT ACTUALLY HAPPENS WHEN THE LIST MOVES, stated the way it was measured rather than the
+    way it reads before breakfast. `updated desc` is re-sorted between two requests and each page
+    is an OFFSET into it:
+      * a PR updated mid-read jumps to offset 0 -- INSIDE the page already read -- so it is
+        returned by NO page at all. The row that jumped is the row that goes MISSING.
+      * every row below it shifts down by one, so the row that sat at the END of the page just
+        read is pushed across the boundary and returned a SECOND time by the next page.
+    So the REPEAT names the boundary row, and the ABSENT row is the mover. Measured with the
+    shipped loop (400-row window, #150 bumped after page 1): `100` repeated, `150` never
+    returned. Returning a deduped list would fix the double-count and leave the missing row
+    uncounted -- the class this file refuses to report -- so a repeat returns None for the WHOLE
+    read, the same answer as an unreadable or truncated page.
+
+    ⛔ AND THE DETECTOR IS ONE-WAY -- stated, not assumed. A row that LEAVES the list mid-read (a
+    PR reopened, a PR deleted) shifts every later row UP by one: nothing repeats, and the row
+    that should sit at each later offset is skipped. Measured: 250 closed rows with #101 merged
+    today, #5 reopened after page 1 -- the read returns a window with #101 ABSENT and
+    `merged_today` 0 where the truth is 1. Offset paging cannot see that from the rows alone; the
+    successor detector is the collection's own total from the `Link: rel="last"` header compared
+    across the read (both an insertion and a removal change it, and a pure update does not), and
+    it is NOT implemented here. Until it is, the honest statement of the bound is: a repeat
+    refuses the read; a mid-read REMOVAL can leave it short by one row per removal, it is rare (a
+    reopen or delete inside a ~2 s read), and it is the one path where this fallback can
+    under-count rather than refuse. Named so the next reader weighs it instead of discovering it.
+
+    ⛔ THE PER-ROW SHAPE CHECK is what makes the detector safe to rely on: any row whose
     `number`, `head` or `merged_at` is not the documented TYPE is an unreadable page (None),
     never a row to hash, dereference or compare.
 
@@ -303,7 +316,7 @@ def _rest_prs(state, limit=100, deadline=None):
             return None
         keep = raw[:limit - seen]          # trim the FINAL page to the caller's window
         for p in keep:
-            # ⛔ ONE SHAPE CHECK, TYPES INCLUDED. Presence alone is not enough: the dedupe
+            # ⛔ ONE SHAPE CHECK, TYPES INCLUDED. Presence alone is not enough: the repeat check
             # HASHES `number`, the mapping DEREFERENCES `head`, and `compute()` compares
             # `merged_at` -- so `{"number": {}}` raised TypeError out of `sys.exit(main())`
             # and printed NO line at all, breaking the "exit 0 always" promise, while
@@ -351,6 +364,7 @@ def _rest_prs(state, limit=100, deadline=None):
         if len(raw) < REST_PER_PAGE:
             break             # last page of the collection
         page += 1
+
     return out
 
 
@@ -405,7 +419,16 @@ def main():
     try:
         with open(CACHE) as fh:
             cached = json.load(fh)
-        if time.time() - cached.get("ts", 0) < TTL:
+        # ⛔ A CACHE THIS VERSION CANNOT RENDER IS NOT A CACHE. The cache-hit path is the one
+        # taken on ~15 beats out of 16 (TTL 1800 s, heartbeat every ~2 min), and it is ABOVE the
+        # `compute()` guard below -- so a cache written by another schema, or truncated, raised
+        # KeyError 'p0' out of `sys.exit(main())` and printed NOTHING (measured), which is the
+        # very failure the guard exists to prevent. Validate the shape here and fall through to
+        # `compute()` instead: a miss costs one refresh, a wrong render costs the line.
+        if not isinstance(cached, dict) or not {
+                "ts", "p0", "p1", "open_prs", "merged_today"} <= set(cached):
+            cached = None
+        if cached is not None and time.time() - cached.get("ts", 0) < TTL:
             data = cached
     except Exception:
         pass
@@ -430,17 +453,25 @@ def main():
                 json.dump(data, fh)
         except Exception:
             pass
-    p0, p1 = data["p0"], data["p1"]
-    ts = data.get("ts", 0)
-    age_m = int((time.time() - ts) / 60)
-    stamp = time.strftime("%H:%M", time.localtime(ts)) if ts else "unknown"
-    # ⛔ Print the age ALWAYS. Omit it and a 50-minute-old figure reads as live.
-    print("DELIVERY [as of %s, %dm ago]: P0 %d open (%d with PR, %d NONE) | P1 %d open (%d with PR, %d NONE)"
-          " | %d open PRs, %d merged today"
-          % (stamp, age_m,
-             p0["open"], p0["with_pr"], p0["without"],
-             p1["open"], p1["with_pr"], p1["without"],
-             data["open_prs"], data["merged_today"]))
+    # ⛔ Print the age ALWAYS. Omit it and a 50-minute-old figure reads as live. And render
+    # inside the same guard: `%d` on a cached `"many"` raised TypeError and printed nothing, so
+    # the belt covers the FORMATTING too, not just the fetch.
+    try:
+        p0, p1 = data["p0"], data["p1"]
+        ts = data.get("ts", 0)
+        age_m = int((time.time() - ts) / 60)
+        stamp = time.strftime("%H:%M", time.localtime(ts)) if ts else "unknown"
+        line = ("DELIVERY [as of %s, %dm ago]: P0 %d open (%d with PR, %d NONE)"
+                " | P1 %d open (%d with PR, %d NONE)"
+                " | %d open PRs, %d merged today"
+                % (stamp, age_m,
+                   p0["open"], p0["with_pr"], p0["without"],
+                   p1["open"], p1["with_pr"], p1["without"],
+                   data["open_prs"], data["merged_today"]))
+    except Exception:
+        print("DELIVERY: unavailable (metrics read failed)")
+        return 0
+    print(line)
     return 0
 
 

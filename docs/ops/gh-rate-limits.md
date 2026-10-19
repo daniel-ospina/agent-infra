@@ -114,14 +114,24 @@ follows are the reusable ones:
   add. `per_page` stays 100 on every page because GitHub derives a request's offset from THAT
   request's `per_page`, so a shrunk final page re-reads an earlier range and leaves a hole; the
   final page is trimmed after it arrives. `updated desc` is a LIVE order read by offset, so a PR
-  updated between two requests jumps to the head and every row below it shifts by one — that is
-  ONE event with TWO consequences: the mover is returned TWICE (measured: 200 rows, 198 distinct,
-  rows 99 and 150 repeated) and a row that ENTERED at the head after page 1 was read is at offset
-  0 and is returned by NO page, so the just-merged PR is precisely what goes missing (simulated
-  end-to-end: one merge landing mid-read left `merged_today` at 0 where the truth was 1).
-  Deduping would hide the double-count and leave the metric short, so a repeat — which can only
-  arise from the list changing mid-read — REFUSES the whole read (`None` → `unavailable`). A
-  shift that stays INSIDE one page produces no repeat and costs nothing. The window is the 400
+  updated between two requests jumps to offset 0 — INSIDE the page already read — and every row
+  below it shifts down by one. One event, two symptoms: the row that sat at the END of the page
+  just read is pushed across the boundary and returned a SECOND time, while the mover itself is
+  behind the cursor and returned by NO page, so the just-merged PR is precisely what goes missing
+  (measured with the shipped loop: #150 bumped after page 1 → `100` repeated, `150` never
+  returned; end-to-end, one merge landing mid-read left `merged_today` at 0 where the truth was
+  1). Keeping the window would hide the missing row, so a repeat — which can only arise from the
+  list changing mid-read — REFUSES the whole read (`None` → `unavailable`). A
+  shift that stays INSIDE one page produces no repeat and costs nothing.
+  **The detector is one-way, and that is a stated residual:** a row that LEAVES the list mid-read
+  (a PR reopened or deleted) shifts every later row UP, nothing repeats, and the row that should
+  sit at each later offset is skipped — measured: 250 closed rows with #101 merged today, #5
+  reopened after page 1 → the window came back with #101 ABSENT and `merged_today` 0 where the
+  truth was 1. Offset paging cannot see that from the rows alone. The successor detector is the
+  collection total from the `Link: rel="last"` header compared across the read (an insertion and
+  a removal both change it; a pure update does not); it is NOT implemented, so a mid-read removal
+  can leave this window short by one row per removal — rare (a reopen inside a ~2 s read), and the
+  one path where the fallback under-counts instead of refusing. The window is the 400
   most-recently-updated **closed**
   PRs and unmerged rows are dropped after it is read, so today's updated closed PRs — not today's
   merges alone — must fit in 400 for `merged_today` to be exact. That is a stated bound, not a
