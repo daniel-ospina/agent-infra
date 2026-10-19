@@ -91,6 +91,15 @@ export const REPO_DIR = resolve(MODULE_DIR, "..");
 const DEFAULT_SKILL_READS_FILE = join(homedir(), ".pi", "agent", "skill-reads.json");
 let SKILL_READS_FILE = DEFAULT_SKILL_READS_FILE;
 const READ_PERSIST_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+// A stamp from the FUTURE is not evidence of a read; it is either a corrupted file, a
+// unit mistake (seconds/µs scaled), or a clock that went backwards. It must not be
+// treated as "very fresh" — the age test is one-sided, so a `readAt > now` entry always
+// restored, and `Math.max` below then kept that stamp over every later `now`, which made
+// the prune unable to fire: ONE future entry satisfied this gate FOREVER. The fleet
+// already settled this rule for the same class in
+// `extensions/main-worktree-guard/classify-git.mjs` ("far-future mtime (>60s skew) →
+// inactive (TTL-evasion bound)"), so the skew allowance is the same 60 s.
+const READ_PERSIST_FUTURE_SKEW_MS = 60 * 1000;
 
 interface SkillReadEntry {
   file: string;
@@ -122,6 +131,8 @@ function persistReadFiles(): void {
     for (const e of [...existing, ...entries]) {
       if (!e || typeof e.readAt !== "number") continue;
       if (now - e.readAt >= READ_PERSIST_TTL_MS) continue;
+      // Same skew rule as the restore path: a future stamp is dropped, never merged.
+      if (e.readAt > now + READ_PERSIST_FUTURE_SKEW_MS) continue;
       const key = skillNameFromPersistedEntry(String(e.file ?? ""));
       if (!key) continue;
       merged.set(key, Math.max(merged.get(key) ?? 0, e.readAt));
@@ -144,6 +155,11 @@ function restorePersistedReads(): number {
     for (const e of parsed) {
       if (!e || typeof e.readAt !== "number") continue;
       if (now - e.readAt >= READ_PERSIST_TTL_MS) continue;
+      // FAIL CLOSED on a stamp from the future: the age test above is one-sided, so
+      // without this an entry dated `now + n` restored on every session AND could never
+      // be pruned — one hand-written line cleared this gate permanently. Dropping it
+      // makes the gate ask again, which is the safe direction.
+      if (e.readAt > now + READ_PERSIST_FUTURE_SKEW_MS) continue;
       const name = skillNameFromPersistedEntry(String(e.file ?? ""));
       if (!name) {
         console.error(`[skill-enforcer] ⚠️  ignoring unresolvable persisted read ${JSON.stringify(e.file)} in ${SKILL_READS_FILE}`);

@@ -903,6 +903,35 @@ async function main() {
     ok(entry.readAt > seeded + 1000, "the persisted readAt must be strictly newer than the 23 h-old seed — the TTL must not measure the read's age");
   });
 
+  // ⛔ The window is pinned from BELOW by T13 (23 h restores). Without a leg from ABOVE,
+  // `READ_PERSIST_TTL_MS` could be raised to a year — or to `Infinity` — and this suite
+  // stayed green while AGENTS.md, templates/AGENTS.base.md and the dangerous-ops manifest
+  // all kept asserting "24 h": the exact doc/code divergence #1331 exists to close, one
+  // constant edit away. This is the other side.
+  await test("T13b — a persisted read OLDER than 24 h is NOT restored (the window is two-sided)", async () => {
+    const { pi, reads } = await newSession();
+    writeFileSync(reads, JSON.stringify([{ file: "commit-workflow", readAt: Date.now() - 25 * 60 * 60 * 1000 }]));
+    await pi.fire("session_start", {});
+    equal((await pi.fire("tool_call", COMMIT))?.block, true, "a 25 h-old persisted read must NOT clear the gate");
+  });
+
+  // ⛔ A stamp from the future used to restore on EVERY session and could never be pruned
+  // (the age test is one-sided and Math.max kept the future value), so one hand-written line
+  // cleared this gate permanently. Fail closed: the gate must ask again.
+  await test("T13c — a FUTURE-dated persisted read does not clear the gate (skew guard)", async () => {
+    const { pi, reads } = await newSession();
+    writeFileSync(reads, JSON.stringify([{ file: "commit-workflow", readAt: Date.now() + 365 * 24 * 60 * 60 * 1000 }]));
+    await pi.fire("session_start", {});
+    equal((await pi.fire("tool_call", COMMIT))?.block, true, "a future stamp is not evidence of a read");
+  });
+
+  await test("T13d — a stamp inside the 60 s skew allowance still restores", async () => {
+    const { pi, reads } = await newSession();
+    writeFileSync(reads, JSON.stringify([{ file: "commit-workflow", readAt: Date.now() + 30 * 1000 }]));
+    await pi.fire("session_start", {});
+    equal((await pi.fire("tool_call", COMMIT))?.block, undefined, "30 s of clock skew must not invalidate a read");
+  });
+
   section("F. #1328 — a `hard` rule fires on EVERY tool, not only bash / `mcp__*`");
   // A fixture manifest installed through the module's test seam, so the REAL
   // manifest (section B) is untouched after each leg. The pattern names BUILTIN
