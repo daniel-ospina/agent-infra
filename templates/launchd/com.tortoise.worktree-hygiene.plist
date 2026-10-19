@@ -1,0 +1,122 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- agent-infra-plist-version: 0.2.0 -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- worktree-hygiene (#1095 worktree half + #4408 branch half): the recurring
+         pass that keeps the tortoise checkout's worktree/branch sprawl bounded.
+
+         WHY A SECOND JOB WHEN com.tortoise.worktree-reaper EXISTS. It does not,
+         on this box: nothing is scheduled (measured 2026-10-18 — `launchctl
+         list` showed no reaper, `crontab -l` carried only the graph reaper). A
+         checkout reaper cannot clear a BRANCH blocker in any case: `git worktree
+         remove` never deletes a branch. This job runs both reviewed engines, in
+         order.
+
+         ⛔ SHIPS DISARMED — {{WORKTREE_HYGIENE_MODE}} RENDERS the `dry-run` flag.
+         This is a DELETION tool on a 6-hourly timer (worktree checkouts, then
+         local branch refs), and the recorded rule (#1678, owner ruling
+         2026-10-11: "the reaper may run unattended; arming it may not") is that
+         such a tool ships dry-run and arming is a SEPARATE, DATED, REVERSIBLE
+         step. Three facts make that rule load-bearing here and not ceremonial:
+           * `install-launchd.sh` with no arguments installs EVERY template in
+             this directory — that is the documented, idempotent, routine
+             invocation;
+           * `pi-bootstrap/setup.sh` runs exactly that invocation automatically
+             on every Darwin box, so a literal `apply` flag in this file would arm
+             a fleet from one merge, with no human step and no dry-run
+             observation pass;
+           * the owner's 2026-10-18 instruction authorised a bounded recurring
+             sweep on ONE box. It authorises that box, not the mechanism.
+         ARMING, therefore, is per-box and it is a command. ⛔ The exact spelling
+         is NOT written out in this comment: XML forbids a doubled hyphen inside
+         a comment, so `install-launchd.sh help` (or this file in git, where the
+         same text is a shell comment) is the copy-pasteable source. The verb is
+         `arm-worktree-hygiene` (optionally followed by its reason argument) and
+         it (a) runs the sweep's own preflight mode and REFUSES a box whose
+         engine prerequisites do not resolve — an armed job that cannot run exits
+         6 every 6h and deletes nothing, silently — and (b) writes a dated record
+         (who/when/host/repo/reason) that this placeholder renders from. The
+         reversing verb is `disarm-worktree-hygiene`.
+         ⛔ NOT AN ENVIRONMENT DEFAULT. The mode is materialised into the
+         INSTALLED unit's ProgramArguments, so `install-launchd.sh status` and
+         `cat ~/Library/LaunchAgents/com.tortoise.worktree-hygiene.plist` both
+         answer "is this box deleting anything?" — an env var would arm the job
+         from a stray export with nothing on disk to show for it, and a job reads
+         no ambient env under launchd anyway.
+         ⛔ Do NOT "tidy" this back to a literal apply/dry-run flag: a
+         literal cannot be armed (the separate step becomes an untracked
+         hand-edit of the installed plist, silently reverted by the next sync)
+         and a literal apply flag re-creates the fleet-wide arming this
+         placeholder exists to prevent.
+
+         WHY /bin/bash DIRECTLY, NOT THE CHECKOUT'S PYTHON LAUNCHER. The sibling
+         reaper templates route through pi-reap-worktrees-launchd.py because
+         macOS TCC denies a launchd-spawned bash the read of a script (and a
+         git the read of a repo) under ~/Documents. This box's repo is
+         /Users/home/eldato/tortoise and this script is under /Users/home — not
+         ~/Documents — and the already-loaded com.eldato.nightwatch agent has
+         run `/bin/bash <script>` + `git -C /Users/home/eldato/tortoise ...`
+         from launchd on this same box for a day. The workaround is therefore
+         not needed here; if the estate moves back under ~/Documents, route this
+         job through the launcher exactly as the sibling templates do.
+
+         ONE PASS IS BOUNDED. The worktree engine takes
+         REAP_WT_BUDGET_SECONDS (1800s; a 300s budget was measured to classify
+         22 of 454 rows and defer the rest, i.e. the bound defeated the job's
+         purpose) and the reaper bounds every subprocess. Deferred rows are
+         PRESERVED, never partially removed. The sweep also probes its own
+         PREREQUISITES at the top of every pass (the engine is a FARMED script
+         that sources sibling libraries from its own directory): an unresolvable
+         prerequisite exits 6 immediately, names the missing path, and writes
+         $HOME/.pi/agent/state/worktree-hygiene-blocked, so an inert job is a
+         FILE a probe can read rather than an exit code nobody reads.
+
+         WHAT IT WILL NOT REMOVE. Dirty worktrees (tracked or untracked), a
+         branch held by any worktree, trunk, an OPEN PR's head, a CLOSED-unmerged
+         tip, a tip that advanced beyond its merged PR, or anything a live
+         process holds. Remote branches are never touched. -->
+    <key>Label</key>
+    <string>com.tortoise.worktree-hygiene</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>{{HOME}}/.pi/agent/scripts/worktree-hygiene-sweep.sh</string>
+        <string>{{WORKTREE_HYGIENE_MODE}}</string>
+        <string>--repo</string>
+        <string>{{TORTOISE_REPO}}</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>{{PATH}}</string>
+        <key>HOME</key>
+        <string>{{HOME}}</string>
+        <!-- Both bounds live HERE, not in the operator's shell: launchd gets
+             neither the shell env nor its rc files, so an unset variable would
+             silently fall back to the 300s/20s defaults measured to make this
+             class of job a no-op. -->
+        <key>REAP_WT_BUDGET_SECONDS</key>
+        <string>1800</string>
+        <key>REAP_WT_GH_TIMEOUT</key>
+        <string>120</string>
+    </dict>
+    <key>Nice</key>
+    <integer>10</integer>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>StartInterval</key>
+    <!-- 21600s = 6h. The estate is measured, not guessed: the sibling reaper's
+         template records 194 -> 259 -> 294 worktrees across a few DAILY passes,
+         i.e. daily was too rare to stop growth while the removal path was
+         unusable. 6h bounds a day's accumulation to a quarter-day's growth, and
+         a pass costs minutes (332 local branches classified in under 10 min on
+         2026-10-18). -->
+    <integer>21600</integer>
+    <!-- No StandardOutPath/StandardErrorPath: the sweep writes its own capped
+         log at $HOME/.pi/agent/state/worktree-hygiene.log, which keeps a
+         launchd-owned file from growing without bound. -->
+</dict>
+</plist>

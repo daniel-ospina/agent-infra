@@ -157,25 +157,45 @@ SHIM
 cat > "$T/bin/du" <<'SHIM'
 #!/usr/bin/env bash
 for a in "$@"; do last="$a"; done
+# A per-path size TABLE is what makes "the LARGEST env, never the mean" DISCRIMINATING (review of
+# PR #1949): with one size for every path, a largest-of / first-seen / last-seen / mean
+# implementation all print the same number. Table lines are `<path-substring><TAB><KB>`; the first
+# match wins, otherwise FAKE_DU_KB applies to every path.
+if [ -n "${FAKE_DU_TABLE:-}" ] && [ -f "$FAKE_DU_TABLE" ]; then
+    while IFS="$(printf '\t')" read -r pat kb; do
+        [ -n "$pat" ] || continue
+        case "$last" in *"$pat"*) printf '%s\t%s\n' "$kb" "$last"; exit 0 ;; esac
+    done < "$FAKE_DU_TABLE"
+fi
 printf '%s\t%s\n' "${FAKE_DU_KB:-2097152}" "$last"
 SHIM
 chmod +x "$T/bin/df" "$T/bin/du"
 
-# run_shimmed <args…> — the reaper with the three shims and a throwaway log; prints stdout+stderr.
-# Extra `VAR=value` words before the flags become the environment of the ONE invocation (the shims).
+# run_shimmed <args…> — the reaper with the three liveness shims, the capacity shims and a throwaway
+# log; prints stdout+stderr. Extra `VAR=value` words before the flags become the environment of the ONE
+# invocation (the shims).
+# ⛔ `DF_BIN`/`DU_BIN` ARE PINNED HERE TOO (review of PR #1949): the reaper's new `report_capacity` reads
+# free space on EVERY pass, so leaving them unpinned made every §A–§G exit-code assertion depend on the
+# HOST's disk — on a cell below `REAP_VENV_FREE_FLOOR_MB` (the fleet's cells run at 0.6–0.8 GB free) a
+# plain "the pass completes" assertion would read rc=5 instead of 0. That is the same host-measuring
+# class #1987/#2006 closed, reintroduced through the new code path.
 run_shimmed() {
     local envs=()
     while [ $# -gt 0 ]; do
         case "$1" in *=*) envs+=("$1"); shift ;; *) break ;; esac
     done
     PS_BIN="$T/bin/ps" LSOF_BIN="$T/bin/lsof" TMUX_BIN="$T/bin/tmux" \
+    DF_BIN="$T/bin/df" DU_BIN="$T/bin/du" \
     REAP_VENV_LOG="$T/reap.log" env "${envs[@]}" bash "$REAPER" "$@" 2>&1
 }
 # run_real <args…> — REAL ps and lsof; tmux pointed at a path that does not exist, so the pass models
 # a host with no tmux server (a KNOWN zero) and the live/dead distinction rests on the real probes.
+# `df`/`du` stay shimmed: §E is REAL about LIVENESS witnesses, and the capacity line's free-space reading
+# is a property of the host that no liveness assertion is entitled to depend on (review of PR #1949).
 run_real() {
     local lsof_bin; lsof_bin="$(command -v lsof || true)"
     PS_BIN=/bin/ps LSOF_BIN="$lsof_bin" TMUX_BIN=/nonexistent/tmux \
+    DF_BIN="$T/bin/df" DU_BIN="$T/bin/du" \
     REAP_VENV_LOG="$T/reap-real.log" bash "$REAPER" "$@" 2>&1
 }
 
@@ -520,6 +540,16 @@ assert_contains "$out" "lanes_headroom=0" "no lane headroom is reported when the
 assert_contains "$out" "BELOW the stated floor" "the breach is named, not buried in a green summary"
 assert_eq "$rc" "5" "the exit code is 5 (over-bound at the disk-reaper entry point)"
 
+echo " H2b the over-bound AUDIT ROW carries the floor ACTUALLY asserted, not the raw env value"
+# An invalid floor falls back to 2048MB for the comparison, so the incident line an operator greps must
+# say 2048 — not the `abc` the environment held. Reporting the raw value is a WRONG NUMBER in the one line
+# read during a disk incident (review of PR #1949).
+out="$(run_cap FAKE_TMUX_TABLE="$T/tmux-h.tsv" FAKE_DF_FREE_KB=524288 REAP_VENV_FREE_FLOOR_MB=abc --gc --repo "$RH")"; rc=$?
+assert_contains "$out" "floor=2048MB floor_ok=no" "an unparseable floor falls back to 2048MB for the comparison"
+assert_eq "$rc" "5" "and the pass is still over-bound"
+assert_contains "$(cat "$T/reap-cap.log")" "free_below_floor_mb=2048" "the audit row records the floor that was asserted"
+assert_not_contains "$(cat "$T/reap-cap.log")" "free_below_floor_mb=abc" "the audit row never records a value that was not used"
+
 echo " H3 the floor is STATED, so it can be restated — and the headroom follows it"
 out="$(run_cap FAKE_TMUX_TABLE="$T/tmux-h.tsv" FAKE_DF_FREE_KB=524288 REAP_VENV_FREE_FLOOR_MB=0 --gc --repo "$RH")"; rc=$?
 assert_contains "$out" "floor=0MB floor_ok=yes" "floor 0 says 'no floor stated', not 'unknown'"
@@ -533,7 +563,35 @@ assert_contains "$out" "free space is UNKNOWN" "the line says why it cannot asse
 assert_contains "$out" "lanes_headroom=?" "no headroom number is invented from a missing input"
 assert_eq "$rc" "0" "an unmeasurable floor does not fail the pass (nothing was mis-deleted)"
 
-echo " H5 a reaped pass still asserts the floor AND the removal is not undone by it"
+# H1–H4 all run against ONE uniform `du` size, so they cannot tell a largest-of implementation from a
+# first-seen or average one. This pass gives each lane its own size (KILOBYTES — that is what `du -sk`
+# reports, and the shim mirrors the real tool): dead=1 GiB, live1=4 GiB, live2=2 GiB. Discovery is by
+# path, so DEAD is seen FIRST and is the SMALLEST, while the LARGEST is second — first-seen (1024 MB),
+# last-seen (2048 MB) and mean (~2389 MB) therefore all disagree with the LARGEST (4096 MB), and the
+# headroom must follow the LARGEST: (10240-2048)/4096 = 2. This MUST run before the `--apply` pass below,
+# which removes the dead lane's env and would leave the largest env adjacent to the first one seen.
+echo " H5 lane_venv_max is the LARGEST env — not the first, the last, or the mean"
+printf 'dead\t1048576\nlive1\t4194304\nlive2\t2097152\n' > "$T/du-h.tsv"
+out="$(run_cap FAKE_TMUX_TABLE="$T/tmux-h.tsv" FAKE_DU_TABLE="$T/du-h.tsv" --gc --repo "$RH")"; rc=$?
+# Exact full-line pin: a bare `lanes_headroom=2` would be satisfied by `lanes_headroom=2048` (a real
+# wrong answer when the units are misread), so assert the whole capacity line instead.
+assert_contains "$out" "capacity: lanes_live=2 lane_venv_max=4096MB free_after=10240MB floor=2048MB floor_ok=yes lanes_headroom=2" \
+    "the LARGEST env drives the line: 4096MB, not first=1024/last=2048/mean~2389, headroom=(10240-2048)/4096=2"
+assert_eq "$rc" "0" "the mixed-size pass exits 0"
+
+echo " H5b ORDER-INDEPENDENCE: the LARGEST lane is found whatever order discovery uses"
+# One table cannot prove a largest-of implementation: a first-seen reading coincides with the maximum
+# whenever the expensive lane happens to be discovered first, and `git worktree list` order is not a
+# contract. The SAME three sizes with the largest on the OTHER live lane is the pair: whichever order the
+# reaper uses, one of the two runs has the large lane in a non-first, non-last position, so first-seen
+# and last-seen cannot satisfy both.
+printf 'dead\t1048576\nlive1\t2097152\nlive2\t4194304\n' > "$T/du-h2.tsv"
+out="$(run_cap FAKE_TMUX_TABLE="$T/tmux-h.tsv" FAKE_DU_TABLE="$T/du-h2.tsv" --gc --repo "$RH")"; rc=$?
+assert_contains "$out" "capacity: lanes_live=2 lane_venv_max=4096MB free_after=10240MB floor=2048MB floor_ok=yes lanes_headroom=2" \
+    "the largest lane is found with the sizes swapped too (same exhaustive line)"
+assert_eq "$rc" "0" "the swapped-size pass exits 0"
+
+echo " H6 a reaped pass still asserts the floor AND the removal is not undone by it"
 out="$(run_cap FAKE_TMUX_TABLE="$T/tmux-h.tsv" --gc --repo "$RH" --apply)"; rc=$?
 assert_contains "$out" "reaped=1" "the dead lane's env was reaped"
 assert_contains "$out" "capacity: lanes_live=2 " "the capacity line is printed on an ARMED pass too"
@@ -550,19 +608,35 @@ echo "── I. the probe watchdog must not delete the parent's scratch dir ─�
 # (`ps probe unavailable`, `reports no worktrees at all`, exit 3) on a healthy box, ~2 runs in 3 at
 # load ~8. A reaper that randomly refuses to reap is the failure mode a fleet can only read as
 # "nothing to reap".
-# Structural pins (deterministic): the child clears the inherited trap, and cleanup() is owner-guarded.
-if grep -qF '[ "$BASHPID" = "$$" ] || return 0' "$REAPER"; then
-  ok "cleanup() only acts in the shell that owns the scratch dir (BASHPID guard)"
+# Structural pins (deterministic): cleanup() is owner-guarded, and the child clears the inherited trap.
+# ⛔ The guard must be BASH-3.2-SAFE (review of PR #1949). `BASHPID` is bash >= 4.0; macOS `/bin/bash` is
+# 3.2.57 and this reaper is invoked PATH-resolved (`bash "$reaper"`), so an UNGUARDED `$BASHPID` is an
+# unbound variable under `set -u` — and an unbound expansion inside an EXIT trap aborts the rest of the
+# trap (measured), so the kill loop and the scratch removal would silently never run. Pin BOTH halves:
+# the `:-`-guarded form present, and the unguarded form absent.
+if grep -qF '[ -n "${BASHPID:-}" ] && [ "$BASHPID" != "$$" ]' "$REAPER"; then
+  ok "cleanup() only acts in the shell that owns the scratch dir (BASHPID guard, 3.2-safe)"
 else
   bad "cleanup() has no owner guard — a subshell can delete the parent's scratch dir"
+fi
+if grep -qF '[ "$BASHPID" = "$$" ] || return 0' "$REAPER"; then
+  bad "cleanup() expands $BASHPID UNGUARDED — on bash 3.2 that aborts the trap (scratch dir + watchdogs leak)"
+else
+  ok "cleanup() never expands BASHPID unguarded (a bash-3.2 box still cleans up)"
 fi
 if [ -n "$(awk '/trap - EXIT/{c=NR} /trap .kill "\$s"/{t=NR} END{if (c && t && c < t) print "ok"}' "$REAPER")" ]; then
   ok "the watchdog subshell clears the inherited EXIT trap before it arms its own"
 else
   bad "the watchdog subshell inherits cleanup() — it deletes the parent's scratch dir on every probe"
 fi
-# Behavioural (non-vacuous): a SLOW probe arms the watchdog on every pass, which is the shape that
-# showed the race. Every pass must still classify; pre-fix these abort with exit 3 at random.
+# Behavioural smoke check (NOT the discriminator): a SLOW probe arms the watchdog on every pass, which
+# is the shape the race was seen in. ⚠️ Honest scope (review of PR #1949): on bash >= 5 a `( … ) &`
+# subshell does not run an INHERITED EXIT trap (measured: the child's TERM trap runs, the parent's
+# cleanup does not), so this loop does NOT fail against the pre-fix script and cannot be cited as proof
+# the flake is gone — the two structural pins above are the proof. The loop is kept as a smoke test that
+# an armed watchdog still classifies, and the mechanism's bash-version dependence is recorded here so the
+# next reader does not mistake it for evidence. Pre-fix these aborted with exit 3 at random ON THE BASH
+# THE FLAKE WAS MEASURED ON (~2 runs in 3 at load ~8).
 RI="$(newrepo i)"
 W_I_DEAD="$(mkwt "$RI" dead)"
 clean_passes=0
@@ -570,7 +644,7 @@ for _ in 1 2 3; do
   out="$(run_shimmed FAKE_PS_SLEEP=0.4 REAP_VENV_PS_TIMEOUT=5 --gc --repo "$RI")"; rc=$?
   [ "$rc" = 0 ] && grep -qF "REAP dead-lane" <<<"$out" && clean_passes=$((clean_passes + 1))
 done
-assert_eq "$clean_passes" "3" "3/3 passes with an armed watchdog classify the dead lane (no spurious fail-closed)"
+assert_eq "$clean_passes" "3" "3/3 passes with an armed watchdog classify the dead lane (smoke: no spurious fail-closed)"
 
 echo
 echo "──────────────────────────────────────────────────────────────────────────────────────"

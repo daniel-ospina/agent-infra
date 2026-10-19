@@ -182,6 +182,10 @@ DF_BEFORE=""
 LANES_LIVE=0
 LANE_VENV_KB_MAX=0
 CAPACITY_FLOOR_OK="unknown"
+# The floor ACTUALLY asserted by the pass (validated, defaulted). The audit row must carry this, not the
+# raw environment value: with `REAP_VENV_FREE_FLOOR_MB=abc` the comparison uses 2048 and an operator
+# grepping the incident line must not read `abc`.
+CAPACITY_FLOOR_MB=""
 ABORTED=0
 SELF_CWD_CANON=""
 MAIN_CANON=""
@@ -262,13 +266,21 @@ scratch_dir() {
 cleanup() {
     local w
     # ⛔ OWNER GUARD (#1932, found while re-running this suite under load): `cleanup` is an EXIT trap, and
-    # the watchdog subshell forked by `run_bounded` INHERITS it — measured, bash runs the parent's EXIT
-    # trap when that subshell exits, and `run_bounded` TERMs the watchdog immediately after every probe.
-    # So the child deleted the PARENT's scratch dir (`rm -rf "$SCRATCH"`) while the parent was still
+    # the watchdog subshell forked by `run_bounded` INHERITED it on the bash the flake was measured on; a
+    # child that ran it deleted the PARENT's scratch dir (`rm -rf "$SCRATCH"`) while the parent was still
     # reading the probe it had just written: `ps probe unavailable` / `reports no worktrees at all`, exit
     # 3, on a healthy box, at random (~1 run in 3 here). `$$` is the same in a subshell; `$BASHPID` is
-    # not, so this is the exact owner test. `trap - EXIT` in the watchdog is the other half.
-    [ "$BASHPID" = "$$" ] || return 0
+    # not, so BASHPID is the exact owner test. `trap - EXIT` in the watchdog is the other half.
+    #
+    # ⛔ BASH 3.2 (#1949 review): `BASHPID` is bash >= 4.0. `/bin/bash` on macOS is 3.2.57 and this
+    # reaper is invoked PATH-resolved (`bash "$reaper"`, spawn-gate.sh), so on a PATH without a newer
+    # bash an unguarded `$BASHPID` is an UNBOUND VARIABLE under `set -u` — and an unbound expansion in an
+    # EXIT trap ABORTS THE REST OF THE TRAP (measured: the watchdog kill loop and the scratch removal
+    # below would never run, leaking a scratch dir per pass). So test only what can be POSITIVELY known:
+    # skip when BASHPID EXISTS and differs from `$$`. With no BASHPID the pre-#1932 behaviour is
+    # restored, which is what a 3.2 box had before and is safe — a child that cannot be identified must
+    # not be assumed to be one.
+    if [ -n "${BASHPID:-}" ] && [ "$BASHPID" != "$$" ]; then return 0; fi
     for w in $WATCHDOGS; do kill -TERM "$w" 2>/dev/null; done
     WATCHDOGS=""
     [ -n "$SCRATCH" ] && rm -rf "$SCRATCH"
@@ -874,6 +886,7 @@ report_capacity() { # report_capacity <free_kb_after>
     log "$(printf 'capacity\tlanes_live=%s\tper_lane_mb=%s\tfree_after_mb=%s\tfloor_mb=%s\tfloor_ok=%s\tlanes_headroom=%s' \
         "$LANES_LIVE" "${per_lane_mb:-}" "${free_mb:-}" "$floor" "$floor_ok" "$headroom")"
     CAPACITY_FLOOR_OK="$floor_ok"
+    CAPACITY_FLOOR_MB="$floor"
     return 0
 }
 
@@ -924,7 +937,7 @@ main() {
     [ "$FAILED" -gt 0 ] && exit 4
     if [ "$CAPACITY_FLOOR_OK" = "no" ]; then
         say "[$SCRIPT_NAME] ⛔ free space is BELOW the stated floor: a lane starting now can fill the disk. Refusing nothing — a live lane's env is never deleted to make room (exit 5)"
-        log "over-bound\tfree_below_floor_mb=$REAP_VENV_FREE_FLOOR_MB"
+        log "over-bound\tfree_below_floor_mb=${CAPACITY_FLOOR_MB:-$REAP_VENV_FREE_FLOOR_MB}"
         exit 5
     fi
     exit 0
