@@ -411,8 +411,11 @@ render() {
 EOS
 printf 'scripts/one.sh\tdiscarded-status\t1\t#1743 — the reason that must SURVIVE a rewrite\n' > "$D/base.tsv"
 out="$(bash "$CHECK" --root "$D" --baseline "$D/base.tsv" --update-baseline 2>&1)"; rc=$?
-[ "$rc" -eq 0 ] && grep -q 'the reason that must SURVIVE a rewrite' "$D/base.tsv" \
-  && awk -F'\t' '$0 !~ /^#/ && NF == 4 && $3 == 1' "$D/base.tsv" | grep -q .
+row="$(awk -F'\t' '$0 !~ /^#/ && NF == 4 && $3 == 1' "$D/base.tsv")"
+# ⛔ a here-string, never `… | grep -q`: a quiet grep exits at its FIRST match and the still-writing
+# producer takes SIGPIPE, which `pipefail` promotes to the pipeline's status — the #841 idiom this
+# repo's own guard refuses (it flagged this very line in CI).
+[ "$rc" -eq 0 ] && grep -q 'the reason that must SURVIVE a rewrite' "$D/base.tsv" && [ -n "$row" ]
 ck $? "D6 --update-baseline keeps an existing group's justification and its count"
 
 # A NEW group must be written with an EMPTY 4th column, so the NEXT run reports it as a finding
@@ -455,7 +458,7 @@ fi
 [ "$rc" -eq 0 ]
 ck $? "F1 bash scripts/check-false-pass-shapes.sh passes on this tree"
 
-printf '%s\n' "$out" | grep -q 'PASS:'
+grep -q 'PASS:' <<<"$out"
 ck $? "F2 the verdict line is printed (silence is never a pass)"
 
 echo ""
