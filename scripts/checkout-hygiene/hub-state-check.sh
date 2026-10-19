@@ -107,6 +107,14 @@ recovery_guide() {
   local lines=()
   local repo_canon
   repo_canon="$( (cd "$repo" 2>/dev/null && pwd -P) || printf '%s' "$repo" )"
+  # #854 — a salvage does NOT only copy: it REVERTS the hub's tracked dirt to
+  # HEAD and removes untracked WIP once the capture is pushed. Say so wherever
+  # salvage is prescribed: "the hub returns to main+CLEAN" read as if the
+  # working tree were merely copied is how an unrelated uncommitted change (a
+  # sibling session's, or the dispatcher's) was destroyed with nothing in the
+  # report. The script now NAMES every path it reverses; this line tells the
+  # reader to carry that list forward instead of assuming it was scratch work.
+  local salvage_note="   (salvage REVERTS the hub's tracked dirt to HEAD + removes untracked WIP; it NAMES every path it reverses — REPORT any path you did not author: its change then lives ONLY on the branch)"
   if [[ "$branch" == "detached" || -z "$branch" ]]; then
     if [[ $dirty -eq 1 ]]; then
       lines+=("The hub is detached AND dirty. Name the stray HEAD commit first if it matters:")
@@ -114,6 +122,7 @@ recovery_guide() {
       lines+=("cd $repo && git checkout main")
       lines+=("Then capture the dirty set:")
       lines+=("bash $SCRIPT_DIR/hub-worktree.sh salvage <new-branch> $repo")
+      lines+=("$salvage_note")
     else
       lines+=("The hub is detached. Return it to main:")
       lines+=("cd $repo && git branch <name> HEAD        # only if the detached commit matters")
@@ -124,12 +133,14 @@ recovery_guide() {
       lines+=("The hub is dirty ON MAIN (the #2238 deadlock — no sanctioned hub op resolves it).")
       lines+=("Capture the dirty set into a PR-ready branch (the hub returns to main+CLEAN):")
       lines+=("bash $SCRIPT_DIR/hub-worktree.sh salvage <new-branch> $repo")
+      lines+=("$salvage_note")
     else
       lines+=("The hub is off main AND dirty. Preserve the stranded branch WIP first:")
       lines+=("cd $repo && git push origin $branch")
       lines+=("cd $repo && git checkout main && git pull --ff-only")
       lines+=("Then capture any remaining dirty-on-main leftovers:")
       lines+=("bash $SCRIPT_DIR/hub-worktree.sh salvage <new-branch> $repo")
+      lines+=("$salvage_note")
     fi
     # A dirty hub can ALSO be stale. The dirty set is the first thing to fix, so
     # the staleness step is appended rather than replacing the guidance above.

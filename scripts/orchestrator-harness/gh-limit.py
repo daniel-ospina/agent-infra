@@ -51,6 +51,7 @@ import binascii
 import fcntl
 import hashlib
 import errno
+import io
 import json
 import os
 import random
@@ -611,6 +612,16 @@ def split_http(raw):
     return int(m.group(1)), headers, body
 
 
+def _cred_digest():
+    """A digest of the credential this call will use — never the secret itself.
+
+    ⛔ ALL FOUR credential names: `gh` reads the ENTERPRISE pair for a non-github.com host, and a key
+    on GH_TOKEN alone shared an entry between two enterprise credentials (reproduced)."""
+    tok = (os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+           or os.environ.get("GH_ENTERPRISE_TOKEN") or os.environ.get("GITHUB_ENTERPRISE_TOKEN") or "")
+    return hashlib.sha256(tok.encode("utf-8")).hexdigest()[:16] if tok else "-"
+
+
 def cache_key(plan):
     """The cache identity of ONE request. The HOST is part of it, not decoration: a box configured
     for a GH Enterprise host and for github.com can issue the same path against both, and a shared
@@ -624,9 +635,7 @@ def cache_key(plan):
     reads from a keyring rather than the environment is not visible here — recorded as a residual."""
     # ⛔ ALL FOUR credential names: `gh` reads the ENTERPRISE pair for a non-github.com host, and a
     # key on GH_TOKEN alone shared an entry between two enterprise credentials (reproduced).
-    tok = (os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
-           or os.environ.get("GH_ENTERPRISE_TOKEN") or os.environ.get("GITHUB_ENTERPRISE_TOKEN") or "")
-    tdig = hashlib.sha256(tok.encode("utf-8")).hexdigest()[:16] if tok else "-"
+    tdig = _cred_digest()
     # ⛔ `GH_HOST` IS THE SAME DECORATION AS `--hostname`, AND IT WAS MISSING. gh reads the host from
     # the environment when the flag is absent, so two processes on one box with different `GH_HOST`
     # shared an entry and a 304 replayed one host's body for the other — a wrong-but-plausible answer
@@ -717,6 +726,202 @@ def cache_put(key, etag, body):
             pass
         return
     prune_cache()
+
+
+# ── PASS-SCOPED READ MEMOISATION (agent-infra#1984, cause 1) ──────────────────────────────────
+# WHY THIS LAYER, AND WHY NOT THE ETAG PATH ABOVE. A refresh pass runs the collision pre-flight
+# ONCE PER CANDIDATE, and three of the five calls each candidate makes are FLEET-WIDE CONSTANTS:
+# `gh api user` (identity), the open-PR list, and the recently-closed-PR sample. Measured on the
+# shipped script, agent-infra, 24 candidates: 72 of the pass's 134 core requests, i.e. 54%, are the
+# SAME THREE ANSWERS asked 24 times.
+#
+# The conditional (ETag) path above cannot take them: it deliberately refuses every shape whose
+# output it would have to re-create by hand (`--paginate`, `--slurp`, `-H`, `-i`, `--jq` with no
+# `jq`), and those are exactly the shapes these reads use — the timeline surface is
+# `--paginate --slurp`, the listings are `api -i`, and the PR list is a `--json` subcommand that is
+# not `gh api` at all. Adding a conditional header to a call whose body we cannot reproduce is a
+# WRONG answer, not a slow one (the rule stated where `conditional_plan` lives).
+#
+# So this is the other half of the same idea, and it needs no knowledge of gh's semantics: memoise
+# the WHOLE INVOCATION — argv in, (stdout, stderr, rc) out — for the life of ONE pass. There is no
+# re-implementation to get wrong, the bytes are the bytes the real gh produced, and the scope is
+# narrow enough that staleness is bounded by the pass itself.
+#
+# ⛔ THE SCOPE IS THE POINT, AND IT IS THE CALLER'S. `GH_LIMIT_PASS_CACHE` names a directory that
+# the refresh wipes and re-creates at the START of every pass, so an entry written by a previous
+# pass cannot be read by this one — the failure mode that makes a cache dangerous is not reachable
+# here by construction, not by a TTL that could be forgotten. Unset/empty => this function is
+# inert and every call behaves exactly as before.
+#
+# ⛔ WHAT IS NEVER MEMOISED, AND WHY EACH ONE MATTERS:
+#   * A MUTATION. It has an effect; replaying its stdout would report work it did not do.
+#   * `/rate_limit`. It is the pass's own budget METER (the refresh's pacing gate re-reads it before
+#     every candidate precisely to see what the last candidate cost). A memoised meter reports a
+#     budget that cannot move, which would hide exactly the exhaustion the gate exists to see.
+#   * `gh auth token`, WHOSE STDOUT IS THE CREDENTIAL. This directory is on disk; a token must never
+#     land in it. The whole `auth` command is excluded, not just that subcommand.
+#   * A FAILURE. `rc != 0` is replayed to the caller as-is and not stored: an error is evidence about
+#     a moment, and pinning it for the rest of the pass would turn one transient fault into a stable
+#     "unreadable" for every later candidate — an INCOMPLETE this layer manufactured.
+PASS_CACHE_ENV = "GH_LIMIT_PASS_CACHE"
+PASS_CACHE_MAX_ENTRY = cfg_int("GH_LIMIT_PASS_CACHE_MAX_ENTRY", 4 * 1024 * 1024, 1024, 1 << 30)
+PASS_CACHE_MAX_BYTES = cfg_int("GH_LIMIT_PASS_CACHE_MAX_BYTES", 64 * 1024 * 1024, 1024, 1 << 30)
+
+
+def pass_cache_enabled():
+    """Is the feature on at all? Read-only — no directory work, because this is asked once per
+    invocation on a path that also handles `gh auth token`."""
+    return bool(cfg(PASS_CACHE_ENV, ""))
+
+
+def pass_cache_dir():
+    """The pass's memo directory, or None when the feature is off. `mkdir -p` on demand so a caller
+    that only exports the name still gets a working cache; ANY inability to use it is returned as
+    None (a broken cache must never break the call)."""
+    d = cfg(PASS_CACHE_ENV, "")
+    if not d:
+        return None
+    try:
+        os.makedirs(d, mode=0o700, exist_ok=True)
+    except OSError:
+        return None
+    return d if os.path.isdir(d) else None
+
+
+def pass_cache_eligible(gh_argv):
+    """May THIS invocation be memoised? See the exclusion list above."""
+    if not pass_cache_enabled() or not gh_argv:
+        return False
+    if gh_argv[0] == "auth":
+        return False
+    if is_mutating(gh_argv):
+        return False
+    if gh_argv[0] == "api":
+        rest = [a for a in gh_argv[1:] if not a.startswith("-")]
+        if rest and rest[0].split("?")[0] in ("rate_limit", "rate_limit/"):
+            return False
+    return True
+
+
+def pass_cache_key(gh_argv):
+    """One invocation's identity. THE CWD IS PART OF IT and that is not decoration: `gh pr list`
+    with no `--repo` resolves the repository from the working directory, so two checkouts of two
+    different repos issue an IDENTICAL argv that must not share an answer — the `--repo` wrong-repo
+    class in its quietest form. The host and the credential are in it for the same reason the ETag
+    key carries them (`cache_key`): a second token, or a GHES host, yields a different
+    representation for the same argv."""
+    host = os.environ.get("GH_HOST") or ""
+    try:
+        cwd = os.getcwd()
+    except OSError:
+        cwd = ""
+    parts = [host, _cred_digest(), cwd] + list(gh_argv)
+    return hashlib.sha256("\x00".join(parts).encode("utf-8", "surrogateescape")).hexdigest()[:40]
+
+
+def pass_cache_get(gh_argv):
+    """(out, err, rc) for a memoised invocation, or None. A corrupt/partial entry is a MISS, never
+    an error: the staging write is atomic, but a half-installed cache directory must still answer
+    by asking GitHub rather than by crashing the box's gh layer."""
+    d = pass_cache_dir()
+    if d is None:
+        return None
+    try:
+        with open(os.path.join(d, pass_cache_key(gh_argv) + ".json")) as fh:
+            e = json.load(fh)
+        out = base64.b64decode(e["out_b64"].encode("ascii"))
+        err = base64.b64decode(e["err_b64"].encode("ascii"))
+        rc = int(e["rc"])
+    except (OSError, ValueError, KeyError, TypeError, binascii.Error):
+        return None
+    if rc != 0:
+        return None                     # never trust a stored failure (see the exclusion list)
+    return out, err, rc
+
+
+def pass_cache_put(gh_argv, out, err, rc):
+    d = pass_cache_dir()
+    if d is None or rc != 0:
+        return
+    size = len(out) + len(err)
+    if size > PASS_CACHE_MAX_ENTRY:
+        return
+    try:
+        used = sum(os.path.getsize(os.path.join(d, n)) for n in os.listdir(d))
+    except OSError:
+        used = 0
+    if used + size > PASS_CACHE_MAX_BYTES:
+        return
+    p = os.path.join(d, pass_cache_key(gh_argv) + ".json")
+    tmp = p + ".tmp-%d" % os.getpid()
+    try:
+        with open(tmp, "w") as fh:
+            json.dump({"rc": rc,
+                       "out_b64": base64.b64encode(out).decode("ascii"),
+                       "err_b64": base64.b64encode(err).decode("ascii")}, fh)
+        os.replace(tmp, p)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+class _StreamCapture(object):
+    """Stands in for ONE of sys.stdout / sys.stderr while an invocation runs, so the memo stores
+    exactly the bytes the caller would have received. `.buffer` is the attribute the rest of this
+    file writes to; `write()` covers the text paths (`fail_loudly`). Two of these are used — never
+    one shared object — because merging the streams here would break every caller that redirects
+    stderr to a file and parses stdout as JSON (`rest_list`, `gh-rest`'s `2>&1` projectors)."""
+
+    def __init__(self):
+        self.buffer = io.BytesIO()
+
+    def write(self, s):
+        self.buffer.write(s.encode("utf-8", "surrogateescape"))
+        return len(s)
+
+    def flush(self):
+        return None
+
+    def isatty(self):
+        return False
+
+    def getvalue(self):
+        return self.buffer.getvalue()
+
+
+def dispatch(real_gh, gh_argv):
+    """The public entry: pass-scoped memoisation (when enabled) ABOVE the real dispatch."""
+    if pass_cache_eligible(gh_argv):
+        hit = pass_cache_get(gh_argv)
+        if hit is not None:
+            out, err, rc = hit
+            if out:
+                sys.stdout.buffer.write(out)
+            if err:
+                sys.stderr.buffer.write(err)
+            log_event("pass-cache: hit for `gh %s` — served from this pass's memo, no request"
+                      % " ".join(gh_argv)[:180])
+            return rc
+        cap_out, cap_err = _StreamCapture(), _StreamCapture()
+        saved = (sys.stdout, sys.stderr)
+        sys.stdout, sys.stderr = cap_out, cap_err
+        try:
+            rc = _dispatch(real_gh, gh_argv)
+        finally:
+            sys.stdout, sys.stderr = saved
+            out, err = cap_out.getvalue(), cap_err.getvalue()
+        # ⛔ THE CALLER'S BYTES ARE WRITTEN WHATEVER HAPPENS — a memoisation that swallowed one
+        # stream on an unusual exit path would be a layer that SUBTRACTS from the child, which this
+        # file forbids in every other branch. `finally` is what guarantees it even on an exception.
+        if out:
+            saved[0].buffer.write(out)
+        if err:
+            saved[1].buffer.write(err)
+        pass_cache_put(gh_argv, out, err, rc)
+        return rc
+    return _dispatch(real_gh, gh_argv)
 
 
 def emit(body, jq, silent):
@@ -1052,7 +1257,7 @@ def resolve_real_gh(self_path):
     return None
 
 
-def dispatch(real_gh, gh_argv):
+def _dispatch(real_gh, gh_argv):
     """Run, back off, retry — holding the single-flight lock for each ATTEMPT and NOT for the wait.
 
     ⛔ THE LOCK IS RELEASED DURING A WAIT, deliberately. The invariant is "one gh request in flight

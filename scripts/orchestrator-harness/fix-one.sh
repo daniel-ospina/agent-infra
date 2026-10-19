@@ -30,7 +30,9 @@ is_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; 0) return 0 ;; 0*) return 1
 # FAIL-CLOSED, the opposite of the design's fail-open policy. `is_limit` (is_num AND at most 9
 # digits) is the predicate orch-loop.sh applies to every other tunable for exactly this reason.
 is_limit() { is_num "${1:-}" && [ "${#1}" -le 9 ]; }
-KIND=fixer; TAG="$PR"
+# ⛔ EXPORTED for the same reason as lane.sh: the SPAWN POINT is a child process (#1884), and a
+# refusal that cannot name its item is a log line an operator has to reverse-engineer.
+KIND=fixer; TAG="$PR"; export KIND TAG
 O="${O:-$HOME/orchestrator}"; mkdir -p "$O/logs" "$O/state"
 L="$O/logs/fix-$PR"
 export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
@@ -269,3 +271,10 @@ fi
 # re-run the full chain at the new head
 bash "$O/merge-one.sh" "$REPO" "$OR" "$PR" "$BR" >> "$L.log" 2>&1
 echo "[fix $PR] end $(date)" >> "$L.log"
+# ── and the fixer's `.venv` goes with it (agent-infra#1932) ─────────────────────────────────────────
+# LAST, deliberately: the re-review above is dispatched from this same worktree, so reaping before it
+# would make the reviewer re-sync. merge-one's reviewer has no venv of its own (it runs in the main
+# checkout and its prompt says testing is unavailable to it), so nothing needs this env after this
+# point. The reaper re-probes for a live holder first, so a lane still working in $WT keeps its env.
+# Best-effort and loud: a failed reap logs, and never changes this worker's exit status.
+reap_lane_venv "$WT" "fix $PR" >> "$L.log" 2>&1

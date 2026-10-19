@@ -147,6 +147,22 @@ export const OUT_OF_FAMILY_TERMS = [
   // registry entry.
   "DEFAULT_TOOL_TIMEOUT_S",
   "getToolTimeoutSeconds",
+  // #2026: four of the five bounds behind the fleet supervisor's liveness table
+  // (`scripts/lib/fleet-inventory.sh`). Their symbols' distinctive words
+  // (`CONTROLLER`/`CADENCE`/`LANDER`/`JOB`) are none of them in
+  // `SCAN_NAME_FAMILIES`, so `inFamily` cannot match them even though `_S` IS a
+  // bound suffix — the name scan never sees them. Do NOT add those words to
+  // `SCAN_NAME_FAMILIES` to "cover" them: the registration below is what covers
+  // them, and widening the family list would silently pull in unrelated bounds.
+  // The fifth, `FLEET_HEARTBEAT_LATE_S`, IS in-family (the `HEARTBEAT` token) and
+  // is registered as such, which is how this file was found at all — the scan
+  // found one declaration in it, not the file. Listed here so the whole table is
+  // declared rather than half-covered: each is a real liveness bound with
+  // seam-moving arms in `scripts/fleet-inventory.test.sh`.
+  "FLEET_CONTROLLER_LATE_S",
+  "FLEET_CADENCE_LATE_S",
+  "FLEET_LANDER_BOUND_S",
+  "FLEET_JOB_SLACK_S",
 ] as const;
 
 /** The wire marker vocabulary. Single source for the parent's `KNOWN_MARKER_KINDS`. */
@@ -490,6 +506,8 @@ const SUBAGENT_PARITY = "extensions/subagent/subagent-parity.test.ts literal pin
 const SUBAGENT_TEST = "extensions/subagent/index.test.ts value+behaviour pin";
 const BT_TEST = "extensions/builtin-tools/builtin-tools.test.ts value+behaviour pin";
 const NONE = "declared and asserted by this registry (was unguarded before #1068)";
+const FLEET_SUITE =
+  "scripts/fleet-inventory.test.sh §9t (heartbeat, controller, cadence, job-slack) + §9e (lander) — each of these five seams moved on its own, BOTH directions, so a row can only flip because the BOUND moved and not because an age tripped any bound; this registry's forward check pins the VALUE";
 
 /**
  * The stall / liveness / staleness bound vocabulary, with each term's owner
@@ -673,6 +691,24 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     guardedBy: NONE,
   },
   {
+    name: "REAP_MIN_S",
+    owners: ["scripts/orchestrator-harness/cloud-cell-doctor.sh"],
+    value: "${REAP_MIN_S:-2700}",
+    axis: "reap",
+    guardedBy:
+      "scripts/orchestrator-harness/cloud-cell-doctor.test.sh §reap — a lane younger than the floor is NOT killed, and one past it is; the value is asserted by THIS registry's forward check, since the suite drives its own REAP_MIN_S in the environment",
+    note: "how long a worker lane must have been idle before the cell's reap role may kill it (45 min). The cell reaps on a schedule, so the floor is what stops a scheduled pass from killing a lane that is merely between tool calls — the same class `REAP_IDLE_HOURS` bounds for the interactive reaper, at the far shorter cadence a cloud cell runs at.",
+  },
+  {
+    name: "REAP_SAMPLE_S",
+    owners: ["scripts/orchestrator-harness/cloud-cell-doctor.sh"],
+    value: "${REAP_SAMPLE_S:-15}",
+    axis: "reap",
+    guardedBy:
+      "scripts/orchestrator-harness/cloud-cell-doctor.test.sh §reap — the two-observation gate: a lane that is BUSY on the second sample is not reaped, and an unreadable first sample is cannot-verify rather than dead",
+    note: "the spacing between the reap role's two observations of a candidate lane's CPU. Two samples are what separate an idle lane from one that is mid-command (a single snapshot cannot), so this is the width of that gate — NOT a bound on how long work may take.",
+  },
+  {
     name: "MAX_AGE",
     owners: ["scripts/monitor-worker.sh"],
     value: "${2:-60}",
@@ -689,6 +725,36 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
       "scripts/orchestrator-harness/sweep-quota.test.sh behaviour + non-vacuity pin (fixtures 5, 11 and 13 drive the staleness floor: a stale stamp forces the fetch, a future stamp and a >10-digit stamp are both dropped); the VALUE is asserted by THIS registry's forward check, not by the suite — the suite sets its own SWEEP_MAX_AGE in the environment it drives",
     overrides: ["SWEEP_MAX_AGE=600"],
     note: "how long a 304 may serve a cached PR listing before `If-None-Match` is DROPPED and a full sweep forced (#1762). A FRESHNESS bound, not a kill bound: a completed check run does NOT reliably bump the listing ETag (measured), so without this floor a green PR could sit unmerged behind a cached \"unchanged\" forever — the cell-cannot-merge-reads-as-idle failure the bound exists to remove. The second declaration is the is_limit coercion; it is recorded so a third assignment cannot shadow the default unnoticed.",
+  },
+  // — gate axis: the merge-priority gate's measured EVIDENCE AGES (#2040) —
+  //
+  // These are not kill bounds. They are the two readings the bounded
+  // merge-priority gate compares against its age window, and the failure they
+  // exist to prevent is the gate that can never open: "drain the unowned PRs
+  // first" is a condition no unattended lane can clear, so an UNBOUNDED gate
+  // stops dispatch forever while every cycle reports success. Registering them
+  // here is what stops a future lane from re-introducing an unbounded form
+  // unnoticed: the reverse scan refuses a new stall/liveness-family
+  // declaration that nobody classified, which is exactly how an unbounded
+  // bound reappears.
+  {
+    name: "YOUNG_AGE",
+    owners: ["scripts/orchestrator-harness/orch-loop.sh"],
+    value: '"$(unowned_youngest_age_min "$OPEN_N" 2>/dev/null || true)"',
+    axis: "gate",
+    guardedBy:
+      "test-gates.sh: unowned_youngest_age_min is driven from a shipped --jq over real createdAt rows (normal/missing/malformed), and the release clauses that consume YOUNG_AGE are driven both ways — a young unowned PR HOLDS, an old one RELEASES and names its clause",
+    note: "age (minutes) of the YOUNGEST unowned open PR — the evidence that decides whether a draining lander is plausibly about to clear one. An EMPTY value is the unreadable case and RELEASES rather than holding forever; the [cap] line renders '?' for it, never 0.",
+  },
+  {
+    name: "LAND_AGE",
+    owners: ["scripts/orchestrator-harness/orch-loop.sh"],
+    value: '""',
+    axis: "gate",
+    guardedBy:
+      "test-gates.sh: the bound is driven through mp_reason/mp_bound_released with a land inside the window (HELD) and outside it (RELEASED), plus the in-process second-memory cases (unwritable state dir, future stamp, failed clear)",
+    overrides: ["$(( (_now_a - (10#$LAND_EPOCH)) / 60 ))"],
+    note: "age (minutes) of the last LAND seen by this box; the second declaration is the derived value from LAND_EPOCH. Empty means 'no land observed', which is a RELEASE reason (an empty measurement is not evidence of progress, and a gate that treats it as progress never opens).",
   },
   // — retention axis —
   {
@@ -716,6 +782,14 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     overrides: ['REAP_WT_AGED_DAYS="$2"'],
   },
   {
+    name: "REAP_WT_MERGED_AGE_DAYS",
+    owners: ["scripts/pi-reap-worktrees.sh"],
+    value: "${REAP_WT_MERGED_AGE_DAYS:-0}",
+    axis: "retention",
+    guardedBy: NONE,
+    note: "#2032 — the age floor applied to a MERGED worktree head (default 0: merged is reclaimed the same day, because the merge is the proof the work landed and the tree is separately required to be clean). It REPLACES REAP_WT_AGED_DAYS for that row only; an UNMERGED head keeps the blanket floor, where age still separates a stale scratch checkout from work in progress. Set it equal to REAP_WT_AGED_DAYS to restore the pre-exemption behaviour. Without it the measured biggest reclaimable checkout on cell-3 (5.7 GB, merged, clean, holder-free) was held for a week while the box sat at 87% used: the merge proves the work landed, and the tree is separately required to be clean, so age has nothing left to protect. Without it the measured biggest reclaimable checkout on cell-3 (5.7 GB, merged, clean, holder-free) was held for a week while the box sat at 87% used. An UNMERGED head keeps the blanket floor — there age still separates a stale scratch checkout from work in progress. 0 restores the pre-exemption behaviour, so the exemption is visible and reversible rather than baked in.",
+  },
+  {
     name: "REAP_WT_MAX_DAYS",
     owners: ["scripts/pi-reap-worktrees.sh"],
     value: "${REAP_WT_MAX_DAYS:-1000000}",
@@ -735,6 +809,24 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     value: "${REAP_WT_LOCK_STALE_SECONDS:-1800}",
     axis: "retention",
     guardedBy: NONE,
+  },
+  {
+    name: "VENV_MIN_AGE",
+    owners: ["scripts/disk-reaper.sh"],
+    value: "${DISK_REAPER_VENV_MIN_AGE:-1800}",
+    axis: "retention",
+    guardedBy: NONE,
+    overrides: ['VENV_MIN_AGE="$2"'],
+    note: "#2032 — the entry point's pass-through of the venv GC age floor to its owner (reap-lane-venvs.sh, whose own REAP_VENV_MIN_AGE_SECONDS is registered above). It exists here so the scheduled cell pass can tune the floor WITHOUT editing the owner, and it is registered because a floor that only the scheduler knows about is invisible to the audit that exists to notice exactly that. Unset means the owner's 1800 s.",
+  },
+  {
+    name: "REAP_VENV_MIN_AGE_SECONDS",
+    owners: ["scripts/reap-lane-venvs.sh"],
+    value: "${REAP_VENV_MIN_AGE_SECONDS:-1800}",
+    axis: "retention",
+    guardedBy: NONE,
+    overrides: ['REAP_VENV_MIN_AGE_SECONDS="${1:-}"'],
+    note: "#1932 — the GC-only age FLOOR on a lane venv (30 min): a venv whose newest mtime is younger is KEPT regardless of liveness, so a lane that has not yet started work cannot lose its env to a sweep that ran between its `uv sync` and its first command. It is a floor, never a rule — the delete decision is the three live witnesses, and liveness outranks age in BOTH directions (a venv older than the floor is still kept while any witness names a holder). The `--worktree` (lane-exit) mode bypasses it by construction: there the caller declares the lane dead. The floor is registered rather than exempted because it IS a retention bound in the same family as REAP_WT_* above, and a reader must be able to see it move.",
   },
   // — heartbeat axis: the laptop-only orchestrator heartbeat's lane-classifier
   //   bounds (scripts/orchestrator-heartbeat.sh, landed from the laptop layer in
@@ -781,6 +873,54 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     axis: "heartbeat",
     guardedBy: NONE,
     note: "DERIVED at runtime: now − the cache stamp, compared against SCAN_INTERVAL_S to decide cache reuse. Registered (not value-pinned) so the reuse decision's age input is in the vocabulary.",
+  },
+  // — heartbeat axis: the fleet supervisor's component-liveness table
+  //   (scripts/lib/fleet-inventory.sh, #2026). These are the bounds a `status`
+  //   row calls LATE on: the process is alive and its OWN freshness signal is
+  //   older than this, which is the "silently off" state the file exists to
+  //   name. Liveness thresholds, not kill switches — nothing here terminates a
+  //   process, so they answer to the heartbeat axis.
+  //   Only FLEET_HEARTBEAT_LATE_S is name-visible to the reverse scan; its four
+  //   siblings are declared in OUT_OF_FAMILY_TERMS for the same reason.
+  {
+    name: "FLEET_CONTROLLER_LATE_S",
+    owners: ["scripts/lib/fleet-inventory.sh"],
+    value: "${FLEET_CONTROLLER_LATE_S:-1800}",
+    axis: "heartbeat",
+    guardedBy: FLEET_SUITE,
+    note: "the controller row's freshness bound on `$O/heartbeat`. `orch-loop.sh` sleeps its `CYC` budget (240 s default, minus a jitter share) plus each cycle's own work, so 1800 s of silence is many cycles; the count is deliberately not stated as a NUMBER because a cycle's work is unbounded and nothing pins a multiple. A live controller whose heartbeat is older is WEDGED (alive, dispatching nothing), which is a LATE row, not a healthy one.",
+  },
+  {
+    name: "FLEET_HEARTBEAT_LATE_S",
+    owners: ["scripts/lib/fleet-inventory.sh"],
+    value: "${FLEET_HEARTBEAT_LATE_S:-2700}",
+    axis: "heartbeat",
+    guardedBy: FLEET_SUITE,
+    note: "the heartbeat-loop row's bound on its own log — ~45 min, about FIVE passes of the loop's own ~9 min total-pass budget (`TARGET=540`; the sleep is target-minus-elapsed, not a fixed interval added on top). Deliberately ABOVE its sibling FLEET_CONTROLLER_LATE_S (1800 s), because a loop a few passes behind is slow, not late. NOT the \"9-11 min pass\" figure `cadence-timer.sh`'s header still quotes from the pre-budget design — that figure is stale, and a bound derived from it would be wrong by minutes. THIS is the term the reverse scan found (the `HEARTBEAT` token makes it in-family), and that finding is what registered the whole table.",
+  },
+  {
+    name: "FLEET_CADENCE_LATE_S",
+    owners: ["scripts/lib/fleet-inventory.sh"],
+    value: "${FLEET_CADENCE_LATE_S:-1800}",
+    axis: "heartbeat",
+    guardedBy: FLEET_SUITE,
+    note: "the cadence-timer row's bound on `cadence-timer.beat`. At the shipped defaults this is four of the timer's own 450 s intervals (1800 s), but the RELATIONSHIP is not enforced anywhere: `CADENCE_TIMER_INTERVAL` is pinned by no gate and is not its own registry term, so moving that default silently changes the multiplier (300 s → 6x, 600 s → 3x) while every suite stays green. Named here as the unguarded input, the same way the IDLE_MIN note names its downstream divergence rather than asserting a coupling nothing enforces. Reads the timer's OWN beacon, never the sibling heartbeat loop's log (which is appended every pass and masked the one state the row exists for).",
+  },
+  {
+    name: "FLEET_LANDER_BOUND_S",
+    owners: ["scripts/lib/fleet-inventory.sh"],
+    value: "${FLEET_LANDER_BOUND_S:-9000}",
+    axis: "heartbeat",
+    guardedBy: FLEET_SUITE,
+    note: "a lander's expiry bound: `chain-merge.sh` waits at most 90 min for a PR to exist (90 x a 60 s poll) and then runs the merge, so 150 min is a PLANNING ALLOCATION on top of that wait — NOT the sum of two named bounds. The merge path's own tail (`merge-one.sh`'s 1800 s review bound, plus the rail's re-run fail-safe) is not bounded by the remaining 60 min, so a busy chain-merge can outlive this and read EXPIRED; that direction is deliberate, since over-reporting a busy lander costs a look while under-reporting IS the parked-green-PR state this row exists for. Past it a waiter is EXPIRED, not merely slow. Zero landers is normal (demand-driven), so the failure is an AGE, never an absence.",
+  },
+  {
+    name: "FLEET_JOB_SLACK_S",
+    owners: ["scripts/lib/fleet-inventory.sh"],
+    value: "${FLEET_JOB_SLACK_S:-300}",
+    axis: "heartbeat",
+    guardedBy: FLEET_SUITE,
+    note: "tolerated scheduling slack added on top of 2× a launchd job's OWN StartInterval before its output counts as stale. Asymmetric on purpose: too small false-flags a correctly-configured job as LATE, too large hides a job that stopped being scheduled.",
   },
   // — hygiene axis (idle reapers that are NOT agent-stall detectors) —
   {
