@@ -479,6 +479,26 @@ sd_install() {
 # `--uninstall` remove from a directory the install never used and still exit 0 (#2048 review, P2).
 recorded_dir() { stamp_field dir; }
 
+# retarget_from_record — re-point UNIT_DIR and the systemctl command at the install the STAMP records.
+# `choose_systemd_target` re-derives both from the sudo probe on every run, so a box whose probe moved
+# between install and uninstall sent `disable --now` and `daemon-reload` to a manager that never owned
+# the unit: the files were removed, "uninstalled" was printed, and the SYSTEM manager kept the timer
+# enabled+active in memory with its `timers.target.wants/` symlink intact — it kept firing until a
+# reboot (#2048 review, P2). Returns 1 when no location was recorded (an older install).
+retarget_from_record() {
+    local rec_target rec_dir
+    rec_target="$(stamp_field target)"; rec_dir="$(stamp_field dir)"
+    [ -n "$rec_dir" ] || return 1
+    UNIT_DIR="$rec_dir"
+    case "$rec_target" in
+        system)   SD_TARGET="system";   SC="${SYSTEMCTL:-${SUDO-sudo -n} systemctl}" ;;
+        user)     SD_TARGET="user";     SC="$SYSTEMCTL_USER" ;;
+        override) SD_TARGET="override"; SC="${SYSTEMCTL:-systemctl}" ;;
+        *)        return 1 ;;
+    esac
+    return 0
+}
+
 # dirs_to_consider <live-dir> — every directory that may hold this job: the one the install RECORDED
 # first, then the one this invocation derived. Both are checked, so a probe flip can neither hide an
 # installed unit nor make a removal look complete while the original is still on disk.
@@ -551,6 +571,11 @@ runner_from_file() {
 sd_status() {
     local next last_exit svc en act
     choose_systemd_target || { err "no systemd scheduler available"; return 1; }
+    # ⛔ AND THE SAME RE-TARGET HERE, because the EXIT CODE is the contract `cloud-cell-bringup.sh`
+    # gates on (#2048 review, P2): reading `is-enabled`/`is-active` off the wrong manager answered
+    # `disabled inactive` for a unit that was installed, enabled and armed — exit 1 on a correctly
+    # scheduled box. The artifact reads follow the same directory.
+    retarget_from_record || true
     svc="$UNIT_DIR/$UNIT_NAME.service"
     say "platform=linux"
     say "scheduler=systemd"
@@ -600,10 +625,13 @@ sd_uninstall() {
         say "preview: would disable and remove $UNIT_NAME.service/.timer from $UNIT_DIR (nothing was changed)"
         return 0
     fi
-    local dirs=() d found=0
+    local dirs=() d found=0 live_dir
     choose_systemd_target || { err "no systemd scheduler available"; return 1; }
+    live_dir="$UNIT_DIR"          # what THIS run derived, before the record is honoured
+    # The RECORDED install wins over the re-derived guess (it decides both the dir and the manager).
+    retarget_from_record || true
     # EVERY directory that may hold it: the one the install RECORDED, and the one this run derived.
-    while IFS= read -r d; do [ -n "$d" ] && dirs+=("$d"); done < <(dirs_to_consider "$UNIT_DIR")
+    while IFS= read -r d; do [ -n "$d" ] && dirs+=("$d"); done < <(dirs_to_consider "$live_dir")
     [ "${#dirs[@]}" -gt 0 ] || dirs=("$UNIT_DIR")
     $SC disable --now "$UNIT_NAME.timer" >/dev/null 2>&1 || true
     for d in "${dirs[@]}"; do
@@ -783,7 +811,6 @@ ld_uninstall() {
     dest="$LD_DIR/$LABEL.plist"
     $LC bootout "$LD_DOMAIN/$LABEL" >/dev/null 2>&1 || true
     rm -f "$dest"
-    rm -f "$STAMP"
     # READ IT BACK: a bootout that did not take, or a plist that survived the `rm`, leaves a job that
     # launchd re-loads at the next login. "uninstalled" is the claim, so the removal is what is read
     # back (#2048 review).
@@ -791,6 +818,11 @@ ld_uninstall() {
         err "uninstall INCOMPLETE: $LABEL is still $( [ -f "$dest" ] && printf 'installed at %s' "$dest" || printf 'loaded in %s' "$LD_DOMAIN" ) — nothing is claimed beyond what was read back"
         return 1
     fi
+    # ⛔ THE STAMP DIES ONLY WITH A VERIFIED REMOVAL. Deleting it first destroyed the record of the
+    # arming on a FAILED uninstall, and the next install `setup.sh`/`sync.sh` runs is no-flag — so it
+    # adopted nothing and quietly re-installed REPORT-ONLY on a box the owner had armed (#2048 review,
+    # P2). `sd_uninstall` was moved for exactly this; the launchd path was left behind.
+    rm -f "$STAMP"
     say "uninstalled $LABEL from $LD_DIR"
     return 0
 }

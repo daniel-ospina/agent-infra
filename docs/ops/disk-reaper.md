@@ -256,15 +256,20 @@ pass_drift=in-sync|CHANGED since install
 pass_status_rc=0|3
 ```
 
-`armed=`, `armed_at=`/`armed_by=` (WHEN and BY WHOM the arming was decided — carried forward unchanged
-by a re-install, re-dated only by an explicit flag, so a sync cannot re-date the deletion decision),
-`repos=` and `runner=` are all read off the **installed artifact**, never off the invoking
+`armed=`, `repos=` and `runner=` are all read off the **installed artifact**, never off the invoking
 shell: `repos=` answers "which checkouts does the scheduled job scan?", which is a different question
 from "what did this shell export" — a Mac exporting only `$AGENT_INFRA_PATH` used to point the job at
 agent-infra while `resolve_python` handed it the tortoise interpreter, and the empty-repo refusal does
 not fire on one non-empty repo. `runner=` answers it too for the Mac's TCC seam (the checkout's
 interpreter on the farmed launcher) — "there was no tortoise `.venv`, so it fell back to `python3`,
 which cannot read `~/Documents`" is the single most likely reason a Mac pass fails closed.
+
+⛔ `armed_at=`/`armed_by=` are the ONE pair read from the **stamp**
+(`$DISK_REAPER_STATE_DIR/disk-reaper.schedule`), not from the unit or the plist: they record WHEN and BY
+WHOM the arming was decided, which the installed artifact cannot know. Two consequences a reader must
+not miss — a no-flag re-install (what `setup.sh`/`sync.sh` run) carries both forward unchanged, so a
+sync cannot re-date the deletion decision; and `--uninstall` deletes the stamp, so the record of when
+and by whom does **not** survive a removal (the artifact it described is gone too).
 
 Exit codes: `0` scheduled and loaded · `1` not scheduled (the bring-up's FAIL). Whether the last pass
 was *clean* is reported in `pass_status_rc` and the record, **not** folded into this verb's exit code:

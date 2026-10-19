@@ -476,9 +476,29 @@ OUT="$(HOME="$home_lin" DISK_REAPER="$PASSFILE" DISK_REAPER_REPOS="$REPO" DISK_R
     SYSTEMCTL_USER="$T/bin/systemctl --user" SYSTEMCTL="$T/bin/systemctl" \
     SYSTEMCTL_CALLS="$T/systemctl.log" bash "$INST" --status 2>&1)"; RC=$?
 assert_contains "$OUT" "installed=yes" "T8b --status finds the job at the RECORDED location despite a probe flip"
+# ⛔ AND THE EXIT CODE, which is the contract `cloud-cell-bringup.sh` gates on: reading is-enabled /
+# is-active off the re-derived manager answered `disabled inactive` for a unit that is installed,
+# enabled and armed — exit 1 on a correctly scheduled box, and the bring-up dies on it.
+assert_eq "$RC" "0" "T8b --status exits 0 for a scheduled box even when the sudo probe flipped"
+assert_contains "$OUT" "job_path=$SYS_DIR/" "T8b …and reports the RECORDED job path, not the empty derived one"
 HOME="$home_lin" DISK_REAPER="$PASSFILE" DISK_REAPER_REPOS="$REPO" DISK_REAPER_PLATFORM=linux \
     DISK_REAPER_STATE_DIR="$T/state-flip" SYSTEMD_SYSTEM_DIR="$SYS_DIR" SUDO="" \
     SYSTEMCTL="$T/bin/systemctl" SYSTEMCTL_CALLS="$T/systemctl.log" bash "$INST" --uninstall >/dev/null 2>&1
+# ⛔ A FAILED UNINSTALL MUST NOT DESTROY THE ARMING RECORD (#2048 review, P2). The stamp is the only
+# memory that the box was armed; deleting it before the removal is verified means the next no-flag
+# install (exactly what setup.sh / sync.sh runs) adopts nothing and silently re-installs REPORT-ONLY on
+# a box the owner had armed.
+inst_mac --install --apply >/dev/null 2>&1
+assert_contains "$(cat "$PLIST")" "<string>--apply</string>" "T8d the box is armed before the failed uninstall"
+OUT="$(LAUNCHCTL_BOOTOUT_IGNORE=1 inst_mac --uninstall 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T8d a bootout that did not take fails the uninstall"
+[ -f "$T/state-mac/disk-reaper.schedule" ] && ok "T8d …and the ARMED stamp SURVIVES the failure (the arming is not forfeited)" \
+    || bad "T8d the stamp was deleted by a FAILED uninstall — the next sync would silently disarm the box"
+inst_mac --install >/dev/null 2>&1
+assert_contains "$(cat "$PLIST")" "<string>--apply</string>" \
+    "T8d …so the next no-flag install is still ARMED (no silent downgrade to report-only)"
+rm -rf "$T/launchctl.state"
+inst_mac --uninstall >/dev/null 2>&1 || true
 rm -rf "$T/launchctl.state"   # settle: the shim's loaded-state is global to this suite
 
 echo "── T8c. the TWO templates are TWO languages: XML entities for the plist, NONE for the unit ──"

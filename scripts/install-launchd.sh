@@ -328,10 +328,21 @@ PY
 # symlinks — e.g. provider-latency-tripwire.sh pointing at a not-yet-pulled checkout).
 # $1 = rendered plist FILE. Prints broken targets; exits 1 if any.
 verify_targets() {
-    local arg bad=0
+    local arg bad=0 first=1
     while IFS= read -r arg; do
         [ -n "$arg" ] || continue
-        if [ ! -e "$arg" ]; then
+        # ⛔ THE FIRST ProgramArgument IS EXEC'd, so existence is not the test — executability is. A
+        # rendered interpreter that exists but is not executable (a `.venv/bin/python` at mode 644, an
+        # un-extracted checkout) passed `-e` and produced a job launchd cannot start: installed, loaded,
+        # and dead (#2048 review). The remaining arguments are read by that program, so `-e` stays right
+        # for them (`--script <path>` is opened, not exec'd).
+        if [ "$first" -eq 1 ]; then
+            if [ ! -x "$arg" ]; then
+                echo "    broken target: $arg (not executable — this is the program launchd will exec)" >&2
+                bad=1
+            fi
+            first=0
+        elif [ ! -e "$arg" ]; then
             echo "    broken target: $arg" >&2
             bad=1
         fi
