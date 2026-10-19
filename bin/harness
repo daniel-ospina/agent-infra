@@ -128,13 +128,33 @@ if [ -d "$O_DIR" ]; then
     else
       DEPLOY_DRIFT="clean"
     fi
-  elif [ -f "$O_DIR/.agent-infra-stamp.json" ]; then
-    DEPLOY_KIND="stamp"
-    DEPLOY_COMMIT="$(sed -n 's/.*"commit"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$O_DIR/.agent-infra-stamp.json" | head -1)"
-    [ -n "$DEPLOY_COMMIT" ] || { DEPLOY_COMMIT="UNKNOWN"; unknown_note; }
   else
-    DEPLOY_KIND="orphan"
-    unknown_note
+    # ⛔ A SYMLINK FARM INTO A CHECKOUT IS ALSO A VERSIONED COPY, and doctor must say so rather than
+    # calling it an orphan stamp. `$O` stays a real directory because the daemon writes its STATE
+    # there (logs, candidates.txt, state/), while every executed script is a symlink into a git
+    # clone — so "which commit is this box running?" has a real answer. `pwd -P` (not `readlink -f`,
+    # which macOS does not ship) resolves it portably.
+    _tgt="$(readlink "$O_DIR/orch-loop.sh" 2>/dev/null || true)"
+    _tdir=""
+    if [ -n "$_tgt" ]; then
+      _tdir="$(cd "$O_DIR" 2>/dev/null && cd "$(dirname "$_tgt")" 2>/dev/null && pwd -P)"
+    fi
+    if [ -n "$_tdir" ] && git -C "$_tdir" rev-parse --git-dir >/dev/null 2>&1; then
+      DEPLOY_KIND="linked-checkout"
+      DEPLOY_COMMIT="$(git -C "$_tdir" rev-parse HEAD 2>/dev/null || echo UNKNOWN)"
+      if [ -n "$(git -C "$_tdir" status --porcelain -- '*.sh' 2>/dev/null)" ]; then
+        DEPLOY_DRIFT="dirty"; drift_note
+      else
+        DEPLOY_DRIFT="clean"
+      fi
+    elif [ -f "$O_DIR/.agent-infra-stamp.json" ]; then
+      DEPLOY_KIND="stamp"
+      DEPLOY_COMMIT="$(sed -n 's/.*"commit"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$O_DIR/.agent-infra-stamp.json" | head -1)"
+      [ -n "$DEPLOY_COMMIT" ] || { DEPLOY_COMMIT="UNKNOWN"; unknown_note; }
+    else
+      DEPLOY_KIND="orphan"
+      unknown_note
+    fi
   fi
   # Byte drift of the shared files — the check that caught a one-generation-behind gh-limit.py.
   if [ -x "$CANON/check-single-source.sh" ]; then
