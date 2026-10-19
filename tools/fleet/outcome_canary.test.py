@@ -975,16 +975,33 @@ def test_a_box_run_does_not_grade_against_THIS_machines_repo():
     against whichever cell this machine happens to run — a healthy fleet reported for a repo nobody
     is working on. Reading the box's plist is not plumbed, so an unnamed repo must abstain."""
     m = load()
-    a = m.build_parser().parse_args(["--live", "--box", "cell-2"])
-    cfg = m.cfg_from_args(a)
-    assert cfg.repo == "", cfg.repo              # not this machine's repo, and not a guess
-    facts = fx("healthy")["facts"]
-    facts["github"] = m.collect_github("", cfg)  # …which makes the three PR checks abstain
-    got = dict((v.name, v.status) for v in m.evaluate(facts, cfg))
-    for name in ("pr_created", "pr_merged", "landers"):
-        assert got[name] == m.INCONCLUSIVE, (name, got[name])
-    a2 = m.build_parser().parse_args(["--live", "--box", "cell-2", "--repo", "o/r"])
-    assert m.cfg_from_args(a2).repo == "o/r"
+    # ⛔ HERMETIC, AND THAT IS THE POINT: with no plist on the machine this test cannot tell "the box
+    # abstained" from "there was nothing to borrow", so the mutation that re-introduces the defect
+    # survived on a runner. A fixture plist makes the defect OBSERVABLE.
+    home = tempfile.mkdtemp(prefix="oc-home-")
+    old_home = os.environ.get("HOME")
+    agents = os.path.join(home, "Library", "LaunchAgents")
+    os.makedirs(agents, exist_ok=True)
+    with open(os.path.join(agents, "%s.plist" % m.Cfg.DEFAULTS["label"]), "w") as fh:
+        fh.write("<plist><dict><key>OR</key><string>this-box/this-repo</string></dict></plist>\n")
+    try:
+        os.environ["HOME"] = home
+        a = m.build_parser().parse_args(["--live", "--box", "cell-2"])
+        cfg = m.cfg_from_args(a)
+        assert cfg.repo == "", cfg.repo          # not this machine's repo, and not a guess
+        facts = fx("healthy")["facts"]
+        facts["github"] = m.collect_github("", cfg)  # …which makes the three PR checks abstain
+        got = dict((v.name, v.status) for v in m.evaluate(facts, cfg))
+        for name in ("pr_created", "pr_merged", "landers"):
+            assert got[name] == m.INCONCLUSIVE, (name, got[name])
+        a2 = m.build_parser().parse_args(["--live", "--box", "cell-2", "--repo", "o/r"])
+        assert m.cfg_from_args(a2).repo == "o/r"
+    finally:
+        if old_home is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = old_home
+        shutil.rmtree(home, ignore_errors=True)
 
 
 @test
@@ -1102,7 +1119,16 @@ def _live_facts_args(tmp, fixture_name, state, capture):
         json.dump(fx(fixture_name), fh)
     # An explicit --controller-ws keeps the suite off `cmux workspace list`: the suite must run in
     # CI and on a box with no cmux, and workspace DISCOVERY is not what these tests are about.
+    # ⛔ AND AN EXPLICIT --o THAT ACTUALLY HOLDS THE SCRIPT. The respawn path now refuses when
+    # the scope cannot hold the controller's script (the guard against killing a LIVE controller),
+    # and the default `$O` is `~/orchestrator` — which exists on the fleet box and NOT on a CI
+    # runner, so this suite passed locally and failed on the only machine that grades it.
+    o_dir = os.path.join(tmp, "orch")
+    os.makedirs(o_dir, exist_ok=True)
+    with open(os.path.join(o_dir, "orch-loop.sh"), "w") as fh:
+        fh.write("#!/bin/bash\n# stand-in: this path's EXISTENCE is what the scope check reads\n")
     return ["--live", "--facts", facts, "--state", state, "--capture-dir", capture,
+            "--o", o_dir,
             "--controller-ws", "00000000-0000-0000-0000-0000000000c1", "--json",
             # ⛔ THE SUITE MUST NOT TOUCH A REAL CONTROLLER. Without a dry run, `controller-absent`
             # fixtures made `attempt_respawn` run `launchctl kickstart -k <the live label>` on the
@@ -6528,15 +6554,33 @@ def test_box_LOCAL_is_this_box_so_the_plist_repo_still_applies():
     def cfg_for(*argv):
         return m.cfg_from_args(ap.parse_args(list(argv)))
 
-    local = cfg_for("--live", "--box", "local")
-    assert local.box == "local"
-    # the plist-derived repo is this box's, so it still applies
-    assert local.repo == (m._repo_from_plist(local.label) or ""), local.repo
-    assert local.repo, "the local box's repo must not be blanked"
-    # a REMOTE box still refuses to borrow this machine's repo
-    assert cfg_for("--live", "--box", "other-box").repo == ""
-    # …and it IS local to `Machine`, which is what makes the repo legitimate
-    assert m.Machine(local.box).remote is False, (local.box, m.Machine(local.box).remote)
+    # ⛔ HERMETIC: a CI runner has no ~/Library/LaunchAgents plist, so "the plist-derived repo still
+    # applies" was really asserting that THIS box is a fleet box — it passed locally and failed in
+    # CI. Point HOME at a fixture plist: the claim becomes testable everywhere, and it still fails if
+    # the local box's repo is blanked.
+    home = tempfile.mkdtemp(prefix="oc-home-")
+    old_home = os.environ.get("HOME")
+    agents = os.path.join(home, "Library", "LaunchAgents")
+    os.makedirs(agents, exist_ok=True)
+    with open(os.path.join(agents, "%s.plist" % m.Cfg.DEFAULTS["label"]), "w") as fh:
+        fh.write("<plist><dict><key>OR</key><string>fixture-owner/fixture-repo</string>"
+                 "</dict></plist>\n")
+    try:
+        os.environ["HOME"] = home
+        local = cfg_for("--live", "--box", "local")
+        assert local.box == "local"
+        assert local.repo == (m._repo_from_plist(local.label) or ""), local.repo
+        assert local.repo == "fixture-owner/fixture-repo", local.repo
+        # a REMOTE box still refuses to borrow this machine's repo
+        assert cfg_for("--live", "--box", "other-box").repo == ""
+        # …and it IS local to `Machine`, which is what makes the repo legitimate
+        assert m.Machine(local.box).remote is False, (local.box, m.Machine(local.box).remote)
+    finally:
+        if old_home is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = old_home
+        shutil.rmtree(home, ignore_errors=True)
 
 
 @test
