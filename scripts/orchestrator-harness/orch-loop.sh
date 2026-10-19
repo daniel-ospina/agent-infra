@@ -130,6 +130,21 @@ MIN_SWAP_FREE="${MIN_SWAP_FREE:-600}"
 # so a swap-only gate does not see it. See the gate chain below.
 MIN_MEM_FREE_MB="${MIN_MEM_FREE_MB:-512}"
 BATCH="${BATCH:-2}"
+# ── the product-work floor (agent-infra#2054) ─────────────────────────────────────────────────
+# How many slots of each `BATCH` are RESERVED for product work. Of the default BATCH=2, one. The
+# measured asymmetric failure it exists for (2026-10-18): harness work has a dispatch path that
+# BYPASSES prioritisation (`nonblocking-dispatch.sh` — no pool, no pre-flight, no tier, no lane
+# accounting) and carried 6 workers while the product channel carried 0, so the fleet could spend
+# its whole capacity on harness/docs while product P0/P1s sat idle and NOTHING said so.
+# `refresh-candidates.sh` splits the backlog into per-class queues (`candidates.product.txt` — the
+# product repo — and `candidates.harness.txt` — everything else); this loop reserves the first
+# `PRODUCT_FLOOR` admissible rows of the product queue AHEAD of the merged FIFO.
+# ⛔ IT IS A FLOOR, NOT A QUOTA: once the reserved slots are filled, product rows yield to the
+# merged FIFO, so a long product queue can never displace the rest of the batch. It is applied
+# AFTER `mp_reason` (the merge-priority gate) and inside the same `[ -z "$GATE_WHY" ]` branch, so a
+# merge backlog still wins outright and the floor can never delay a batch — it only reorders
+# WITHIN one (agent-infra#2054 contract 1).
+PRODUCT_FLOOR="${PRODUCT_FLOOR:-1}"
 CYC="${CYC:-240}"
 # ── the per-repo merge contract (agent-infra#1764) ─────────────────────────────
 # The required-check list and the review authority are REPO-DEPENDENT inputs. This line used to
@@ -205,6 +220,11 @@ is_limit "${MERGE_PRIORITY_AT:-}" || MERGE_PRIORITY_AT=25
 is_limit "${MAX_FIX:-}"           || MAX_FIX=3
 is_limit "${MAX_FIX_TRIES:-}"     || MAX_FIX_TRIES=3
 is_limit "${BATCH:-}"             || BATCH=2
+# ⛔ A GARBAGE FLOOR REPAIRS TO ITS DERIVED DEFAULT (1), NEVER TO 0. `is_limit 0` is TRUE and
+# `[ "$PROD_ADMITTED" -ge 0 ]` always holds, so a repair to 0 would OPEN the gate this value
+# configures — the same fail-open direction as MAX_LANES. `PRODUCT_FLOOR=0` written deliberately
+# still passes and disables the floor, exactly as `MAX_LANES=0` deliberately dispatches nothing.
+is_limit "${PRODUCT_FLOOR:-}"      || PRODUCT_FLOOR=1
 is_limit "${CYC:-}"               || CYC=240
 # ⛔ CYC ALSO NEEDS A FLOOR, NOT JUST A TYPE CHECK (P3, third review round, 2026-10-14). `is_limit 0`
 # is TRUE and install.sh's range loop explicitly allowed `0`, so `CYC=0` survived all the way to
@@ -1560,11 +1580,90 @@ PY
   elif [ "${MEM_UNKNOWN:-0}" = "1" ]; then GATE_WHY="mem_probe_failed (capacity unknown -> do not add work)"
   elif [ "$MEMAVAIL_MB" -le "$MIN_MEM_FREE_MB" ]; then GATE_WHY="mem_avail=${MEMAVAIL_MB}M<=min_mem_free_mb=${MIN_MEM_FREE_MB}M"
   fi
+  # BEGIN product-floor (product-floor.test.sh extracts this block verbatim — keep it self-contained)
   if [ -z "$GATE_WHY" ]; then
     : > "$O/.batch"; K=0
+    PROD_QUEUE="$O/candidates.product.txt"
+    PROD_ADMITTED=0
+    PROD_UNMET_WHY=""
+    # ── HOW MANY SLOTS THIS BATCH CAN ACTUALLY RESERVE ──────────────────────────────────────────
+    # The top-level guard has already repaired PRODUCT_FLOOR, but this block is EXTRACTED AND DRIVEN
+    # STANDALONE by the regression suite (product-floor.test.sh), so it cannot rely on that guard
+    # having run. Same polarity as there: a non-number, a leading zero or an over-long value repairs
+    # to 1 (the floor stays ON), never to 0 (which would silently disable it).
+    floor_want="${PRODUCT_FLOOR:-1}"
+    case "$floor_want" in ''|*[!0-9]*|0?*) floor_want=1 ;; esac
+    [ "${#floor_want}" -le 9 ] || floor_want=1
+    # A floor above BATCH is a reservation against a window that cannot exist; clamp it so the
+    # `unmet` arithmetic below compares against slots this batch could have used.
+    [ "$floor_want" -le "$BATCH" ] || floor_want="$BATCH"
+    # ── THE RESERVE, THEN THE MERGED FIFO, IN ONE STREAM (agent-infra#2054) ─────────────────────
+    # Two regions separated by a sentinel: the RESERVE (product rows, drawn first) and then the
+    # merged `candidates.txt` UNCHANGED. The merged file is the authority and stays exactly what the
+    # pre-#2054 loop consumed, so `K > floor` slots are filled in the FIFO's OWN order — a batch can
+    # never come out shorter than it did before, and the row in slot `floor+1` is the row the FIFO
+    # would have offered, product or not. ⛔ NOT "product rows first, then the FIFO with those rows
+    # REMOVED": that variant also applied the stand-down rule to the FIFO's own product rows, so a
+    # PRODUCT-ONLY pool — which is every row of a product cell's backlog, because a cell's class is
+    # its own repo — dispatched ONE issue per BATCH=2 cycle, i.e. it became a quota that HALVED the
+    # throughput this floor exists to protect (found in independent verification, 2026-10-19; the
+    # same construction also demoted the FIFO's second product row below a harness row).
+    # ⛔ AND THE RESERVE IS INTERSECTED WITH `candidates.txt`, because membership in the merged
+    # backlog IS this pass's pre-flight verdict (#2054 contract 2). `refresh-candidates.sh` derives
+    # the class queues as subsets of it every pass, so the intersection is normally a no-op — but a
+    # row the merged backlog does NOT hold (a refresh that aborted between the class append and the
+    # partition) has had no verdict from this pass and must not be dispatched on the floor's word.
+    # The product queue is a WRITTEN FILE, so it is deduped and order-preserving (severity rides in
+    # the producer's order) rather than trusted as a value this process computed.
+    floor_sentinel='#floor-reserve-end'
+    : > "$O/.floor-queue"; : > "$O/.refused"; floor_rows=0
+    if [ "$floor_want" -gt 0 ] && [ -f "$PROD_QUEUE" ]; then
+      awk 'NR==FNR{keep[$0]=1; next} ($0 in keep) && !seen[$0]++' \
+        "$O/candidates.txt" "$PROD_QUEUE" > "$O/.floor-queue" 2>/dev/null || :
+      floor_rows="$(wc -l < "$O/.floor-queue" 2>/dev/null | tr -d ' ')"
+      case "${floor_rows:-}" in ''|*[!0-9]*) floor_rows=0 ;; esac
+      [ "$floor_rows" -gt 0 ] && printf '%s\n' "$floor_sentinel" >> "$O/.floor-queue"
+    fi
+    cat "$O/candidates.txt" >> "$O/.floor-queue" 2>/dev/null || :
+    # Which region the next row belongs to. 0 when there is no reserve, so the stand-down rule below
+    # is inert and the stream is `candidates.txt` byte-for-byte — the pre-#2054 behaviour.
+    in_reserve=0; [ "$floor_rows" -gt 0 ] && in_reserve=1
+    # WHY the floor might go unmet, decided from the FILES rather than inferred from the outcome, so
+    # the line below can name the real cause. `EMPTY` and `ABSENT` are different facts (agent-infra
+    # #1931's rule applied to this queue): an absent queue means the producer that writes it has not
+    # run, which is a failing intake, not a fleet with no product work.
+    if [ "$floor_want" -eq 0 ]; then
+      :
+    elif [ ! -f "$PROD_QUEUE" ]; then
+      PROD_UNMET_WHY="no product queue: $(basename "$PROD_QUEUE") absent (a refresh that predates #2054 has not run)"
+    elif ! grep -q '[0-9]' "$PROD_QUEUE" 2>/dev/null; then
+      PROD_UNMET_WHY="the product queue is EMPTY — the last pool read queued no product candidate"
+    elif [ "$floor_rows" -eq 0 ]; then
+      PROD_UNMET_WHY="the product queue holds no row this pass has a VERDICT for (none of its $(basename "$PROD_QUEUE") rows are in $(basename "$O/candidates.txt"), so a refresh aborted after queueing it)"
+    fi
     while read -r ISS; do
+      # The sentinel closes the RESERVE region; every row after it is the merged FIFO, in its own
+      # order and with no stand-down rule applied — that is what keeps the batch no shorter than the
+      # pre-#2054 one (agent-infra#2054 contract 1: the floor only EVER reorders within BATCH).
+      if [ "$ISS" = "$floor_sentinel" ]; then in_reserve=0; continue; fi
       [ -z "${ISS:-}" ] && continue
+      # ⛔ THIS STAYS FIRST (agent-infra#2054 contract 4). A row already in `dispatched.txt` has been
+      # offered before — it must be skipped before anything else can act on it, the floor included,
+      # or a claimed issue would be re-offered and re-claimed every cycle.
       grep -qx "$ISS" "$O/dispatched.txt" 2>/dev/null && continue
+      # ⛔ A ROW THE CLAIM GATE ALREADY REFUSED IS NOT RE-OFFERED BY THE FIFO REGION. The FIFO region
+      # is the unchanged merged backlog, so it repeats every reserve row; without this a peer-held
+      # product issue would be claim-attempted twice per cycle and logged twice.
+      grep -qx "$ISS" "$O/.refused" 2>/dev/null && continue
+      # ── THE RESERVE IS A FLOOR, NOT A QUOTA (agent-infra#2054) ──────────────────────────────
+      # Once the floor is satisfied the RESERVE stands down, so a long product queue cannot take
+      # over the batch. Only the reserve: the FIFO region below is untouched, and a product row in
+      # it is admitted exactly as it is today — otherwise this rule also deletes the FIFO's product
+      # rows, which on a product-only pool means dispatching 1 of BATCH=2 (the quota bug above).
+      if [ "$in_reserve" = 1 ] && [ "$PROD_ADMITTED" -ge "$floor_want" ]; then continue; fi
+      # ── NEVER ADMIT THE SAME ISSUE TWICE IN ONE BATCH ────────────────────────────────────────
+      # The FIFO region repeats the reserve rows; a row already in `.batch` took its slot there.
+      grep -qx "$ISS" "$O/.batch" 2>/dev/null && continue
       # ── CLAIM THE ISSUE ACROSS BOXES BEFORE IT ENTERS THE BATCH (agent-infra#1850) ──────────
       # `refresh-candidates.sh` certifies an issue CLEAN by reading the registry, but a
       # certification is NOT a lock: it runs BEFORE the claim, so two boxes can both read CLEAN and
@@ -1574,7 +1673,9 @@ PY
       # ⛔ CLAIMED HERE, NOT IN dispatch-merge.sh, so the bookkeeping stays honest: a REFUSED issue
       # is not appended to `dispatched.txt` and not put in `.batch`, so it stays in `candidates.txt`
       # and is simply re-attempted next cycle — no blacklist for the reaper to undo, and no lane, no
-      # worktree and no chain spawned for work another box already owns.
+      # worktree and no chain spawned for work another box already owns. (`$O/.refused` below is NOT
+      # a blacklist: it is truncated to empty at the top of every cycle, and exists only so the FIFO
+      # region does not re-claim a row the reserve region already tried this cycle.)
       #
       # ⛔ BOTH REFUSALS STOP THE DISPATCH — INCLUDING THE INFRA ONE (rc=2). claims.sh fails OPEN on
       # an unreachable remote for a PR claim, because refusing there costs one merge; here the safe
@@ -1624,18 +1725,34 @@ PY
           else
             echo "[dispatch] #$ISS NOT dispatched — ${CLAIM_RESULT:-issue claim refused}" >> "$LOG"
           fi
+          # Remembered so the FIFO region, which repeats this row, does not claim it a second time.
+          printf '%s\n' "$ISS" >> "$O/.refused"
           continue
         fi
       elif [ -f "$O/claims.sh" ]; then
         # PRESENT BUT STALE — see the polarity note above. The box would have to dispatch unclaimed,
         # which is the fail-open this branch now refuses.
         echo "[dispatch] #$ISS NOT dispatched — \$O/claims.sh predates the issue key (no claim_issue_acquire), so this box cannot take the claim; fix: cp scripts/orchestrator-harness/*.sh ~/orchestrator/" >> "$LOG"
+        printf '%s\n' "$ISS" >> "$O/.refused"
         continue
       else
         echo "[dispatch] ⚠️ #$ISS: no claim registry at \$O/claims.sh — dispatching WITHOUT a cross-box claim (seed it: cp scripts/orchestrator-harness/*.sh ~/orchestrator/)" >> "$LOG"
       fi
-      echo "$ISS" >> "$O/.batch"; echo "$ISS" >> "$O/dispatched.txt"; K=$((K+1)); [ "$K" -ge "$BATCH" ] && break
-    done < "$O/candidates.txt"
+      echo "$ISS" >> "$O/.batch"; echo "$ISS" >> "$O/dispatched.txt"; K=$((K+1))
+      # Counted HERE, after the claim was taken and the row written to both files: a candidate that
+      # was refused at the claim gate is NOT an admitted product slot, whatever its class.
+      grep -qx "$ISS" "$PROD_QUEUE" 2>/dev/null && PROD_ADMITTED=$((PROD_ADMITTED+1))
+      [ "$K" -ge "$BATCH" ] && break
+    done < "$O/.floor-queue"
+    # ── AN UNMET FLOOR IS A READING, AND IT TRAVELS WITH THE QUEUE STATE (agent-infra#2054) ────────
+    # ⛔ NEVER SILENT. `READ(203)` with an empty product queue must read as a FAILING INTAKE, not as
+    # "no product work" — so the line carries `queue_state_token` in the refresh's own vocabulary,
+    # exactly as the `backlog empty` line beside it does (#1931). The batch is otherwise unchanged:
+    # this line is the whole of the degradation, and nothing here refuses or delays the dispatch.
+    if [ "$PROD_ADMITTED" -lt "$floor_want" ]; then
+      [ -n "$PROD_UNMET_WHY" ] || PROD_UNMET_WHY="queued product candidate(s) not admissible (already dispatched, or refused at the claim gate)"
+      echo "[dispatch] product-floor unmet (reserved=$floor_want admitted=$PROD_ADMITTED: $PROD_UNMET_WHY) queue=$(queue_state_token)" >> "$LOG"
+    fi
     if [ -s "$O/.batch" ]; then
       echo "[dispatch] load=$L lanes=$LANES -> $(tr '\n' ' ' < "$O/.batch")" >> "$LOG"
       bash "$O/dispatch-merge.sh" "$REPO" "$OR" $(tr '\n' ' ' < "$O/.batch") >> "$LOG" 2>&1
@@ -1648,6 +1765,7 @@ PY
   else
     echo "[dispatch] skipped ($GATE_WHY) lanes=$LANES workers=$WORKERS" >> "$LOG"
   fi
+  # END product-floor
   heartbeat
 
   # ---- 3) background backlog refresh (locked, small, non-blocking) --------

@@ -932,7 +932,7 @@ if [ "$reap_rc" -ne 0 ]; then
 fi
 for f in "$O/.open_iss" "$O/.pr_brs"; do rm -f "$f"; done
 
-touch "$O/checked.txt" "$O/candidates.txt"
+touch "$O/checked.txt" "$O/candidates.txt" "$O/candidates.product.txt" "$O/candidates.harness.txt"
 
 # pool = open unassigned P0-blocker ∪ P1-severe ∪ P2-moderate, minus epics/owner-decisions
 #
@@ -1080,6 +1080,48 @@ degraded=0
 # instead of looking like a healthy cell with an empty pool (2026-10-16 review: `lanes: 0` and an
 # unreadable registry were indistinguishable from the outside, and the per-issue lines scroll away).
 ICR_INCOMPLETE=0; QUEUED=0
+# ── PRODUCT vs HARNESS: WHICH QUEUE A CANDIDATE IS WRITTEN TO (agent-infra#2054) ──────────
+# The dispatch batch builder reserves a product-work floor (`PRODUCT_FLOOR` in orch-loop.sh), so
+# this pass has to say WHICH queued candidates are product work. It writes the merged
+# `candidates.txt` EXACTLY as before (unchanged, and the fallback the batch builder still reads)
+# and additionally appends each queued issue to its class queue.
+#
+# ⛔ CLASSIFICATION IS BY REPO, because that is the one product/harness fact the pool carries:
+# every row came from `rest_list … --repo "$OR"`, so a candidate's class is the class of the cell's
+# own target repo. `PRODUCT_REPOS` is the tunable (space/comma/colon separated; default the product
+# repo). A cell pointed at a HARNESS repo therefore queues everything into
+# `candidates.harness.txt` and the product queue stays empty — which is the true state, and is why
+# an unmet floor must be LOGGED (#2054 contract 3) instead of read as "no product work".
+# ⛔ DEFINED HERE, BELOW `n=0`, ON PURPOSE: selftest.sh extracts this loop body from that line and
+# runs it STANDALONE (see the note beside the queue append below), so a helper defined above it
+# would be missing there. A missing classifier must not silently pick a queue.
+# ⛔ GUARD-BEFORE-USE, and it repairs to the DEFAULT: a value with no valid `owner/name` token must
+# never classify everything as harness (the floor would be blind) or everything as product (the
+# floor would always read as met).
+PRODUCT_DEFAULT_REPOS="daniel-ospina/tortoise"
+repo_slug_valid() {  # <token> — one `owner/name`, no scheme, no whitespace, no empty half
+  case "${1:-}" in ''|*[!A-Za-z0-9._/-]*) return 1 ;; esac
+  case "$1" in */*) ;; *) return 1 ;; esac
+  case "$1" in /*|*/|*//*|*/*/*) return 1 ;; esac
+  return 0
+}
+candidate_class() {  # <owner/name> -> product | harness
+  local slug tok list=""
+  slug="$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')"
+  # ⛔ AN EMPTY SLUG IS NOT A MATCH. `list` carries a leading space, so `case " $list "` contains
+  # "  " (two spaces) and an empty slug would match EVERY list — an unset repo would be classified
+  # PRODUCT, which is the one direction that makes the floor silently "met" (measured while
+  # extracting this loop body standalone, where OR is unset). An unknown repo is HARNESS: the
+  # floor then reports itself unmet, which is loud, instead of certifying a product slot it never
+  # filled.
+  [ -n "$slug" ] || { printf 'harness'; return 0; }
+  for tok in $(printf '%s' "${PRODUCT_REPOS:-}" | tr ',:' '  '); do
+    repo_slug_valid "$tok" || continue
+    list="$list $(printf '%s' "$tok" | tr '[:upper:]' '[:lower:]')"
+  done
+  [ -n "$list" ] || list="$PRODUCT_DEFAULT_REPOS"
+  case " $list " in *" $slug "*) printf 'product' ;; *) printf 'harness' ;; esac
+}
 while read -r N; do
   [ -z "${N:-}" ] && continue
   grep -qx "$N" "$O/checked.txt" 2>/dev/null && continue
@@ -1174,6 +1216,17 @@ while read -r N; do
             # extraction.)
             if ! printf '%s\n' "$N" >> "$O/candidates.txt"; then
               echo "[refresh] ABORT: cannot queue #$N into $O/candidates.txt — this pass would report a backlog it did not persist (#1736)"
+              exit "${EXIT_TRANSIENT:-1}"
+            fi
+            # ⛔ THE CLASS WRITE IS CHECKED, AND IT STILL LANDS BEFORE `checked.txt` (agent-infra#2054).
+            # The class queue is what the product floor reads, so a candidate queued in the merged
+            # backlog but NOT in its class queue is invisible to the floor while the pass reports
+            # success — the masked-blindness failure #2054 exists to remove, in the one direction
+            # #1931's vocabulary cannot see (the pool read was fine; the SPLIT was not). Being
+            # recoverable only matters if it is retried: `checked.txt` is still last, so a failure
+            # here leaves the issue unchecked and the next pass re-attempts it.
+            if ! printf '%s\n' "$N" >> "$O/candidates.$(candidate_class "$OR").txt"; then
+              echo "[refresh] ABORT: cannot queue #$N into its class queue (candidates.<class>.txt) — the product floor would be blind to it (#2054)"
               exit "${EXIT_TRANSIENT:-1}"
             fi
             if ! printf '%s\n' "$N" >> "$O/checked.txt"; then
@@ -1302,4 +1355,30 @@ mv "$O/.cand" "$O/candidates.txt" || {
   echo "[refresh] ABORT: cannot replace $O/candidates.txt with the deduped backlog (#1736)"
   exit "$EXIT_TRANSIENT"
 }
+# ── THE CLASS QUEUES ARE A PARTITION OF THE MERGED BACKLOG (agent-infra#2054) ──────────────────
+# ⛔ A CLASS QUEUE IS NOT AN APPEND LOG. Left as pure appends, the product queue would keep every
+# issue it has EVER queued — including numbers the merged backlog no longer holds because the
+# dispatcher pruned them after dispatch — and a queue full of dead numbers reads to the batch
+# builder as "product work exists", which is exactly the blindness the floor's unmet line has to
+# report. So each pass re-derives every class queue as a SUBSET of `candidates.txt`: deduped,
+# order preserved, and anything not in the merged backlog dropped. The merged file is the
+# authority; the split is derived from it, never the other way round.
+# Both writes are checked, with the same atomic-mv reasoning as the merged rewrite above.
+# BEGIN product-partition (product-floor.test.sh extracts this block verbatim — keep it self-contained)
+for _cls in product harness; do
+  _cf="$O/candidates.$_cls.txt"
+  # A class this pass has never written is ABSENT, not empty — and absent is a different fact from
+  # empty (#1931's rule): leave it absent so a reader can tell "no producer yet" from "no rows".
+  [ -f "$_cf" ] || continue
+  awk 'NR==FNR{keep[$0]=1; next} ($0 in keep) && !seen[$0]++' "$O/candidates.txt" "$_cf" > "$O/.cand.$_cls" || {
+    echo "[refresh] ABORT: cannot rewrite the deduped $O/candidates.$_cls.txt (#2054)"
+    exit "$EXIT_TRANSIENT"
+  }
+  mv "$O/.cand.$_cls" "$_cf" || {
+    echo "[refresh] ABORT: cannot replace $O/candidates.$_cls.txt with the deduped queue (#2054)"
+    exit "$EXIT_TRANSIENT"
+  }
+done
+unset _cls _cf
+# END product-partition
 echo "[refresh] checked $judged; backlog now $(wc -l < "$O/candidates.txt" | tr -d ' ') issues"

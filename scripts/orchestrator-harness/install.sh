@@ -96,6 +96,14 @@ MAX_FIX_TRIES="${MAX_FIX_TRIES:-3}"
 MIN_SWAP_FREE="${MIN_SWAP_FREE:-600}"
 MIN_MEM_FREE_MB="${MIN_MEM_FREE_MB:-512}"
 BATCH="${BATCH:-2}"
+# The product-work floor (agent-infra#2054): how many slots of each BATCH are RESERVED for product
+# work. Default 1 of BATCH=2. install.sh only renders it — the rule lives in orch-loop.sh.
+PRODUCT_FLOOR="${PRODUCT_FLOOR:-1}"
+# Which repos count as PRODUCT work for that floor. `refresh-candidates.sh` classifies a queued
+# candidate by the CELL's repo (`PRODUCT_REPOS`, default the product repo), so this MUST be rendered
+# into the plist: launchd inherits no shell environment, and a tunable that is exported in a shell
+# but never reaches the daemon is a setting that silently does nothing on the production path.
+PRODUCT_REPOS="${PRODUCT_REPOS:-daniel-ospina/tortoise}"
 CYC="${CYC:-240}"
 # Drain scope (README §5): auto (count rule) | own (pin own-only) | broad (pin broad).
 # A fleet runs exactly ONE broad box; the rest pin own. Validated below, AFTER the action parse
@@ -540,7 +548,7 @@ esc() { sed_esc "$(xml_esc "$1")"; }
 # different ways: '4x' renders a plist that LIES about the ceiling and still exits 0 (only the loop's
 # own coercion saves the run), while '4&5' renders the literal `4__MAX_LANES__5` -- a syntactically
 # VALID plist (plutil -lint passes) whose value reads as non-numeric downstream.
-for _n in MAX_LOAD MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MAX_FIX MAX_FIX_TRIES MIN_SWAP_FREE MIN_MEM_FREE_MB BATCH CYC; do
+for _n in MAX_LOAD MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MAX_FIX MAX_FIX_TRIES MIN_SWAP_FREE MIN_MEM_FREE_MB BATCH PRODUCT_FLOOR CYC; do
   _v="${!_n}"
   case "${_v:-}" in
     ''|*[!0-9]*) die "$_n='${_v:-}' is not a whole number — a value here silently opens the gate it configures" ;;
@@ -603,6 +611,8 @@ sed \
   -e "s|__MIN_SWAP_FREE__|$MIN_SWAP_FREE|g" \
   -e "s|__MIN_MEM_FREE_MB__|$MIN_MEM_FREE_MB|g" \
   -e "s|__BATCH__|$BATCH|g" \
+  -e "s|__PRODUCT_FLOOR__|$PRODUCT_FLOOR|g" \
+  -e "s|__PRODUCT_REPOS__|$(esc "$PRODUCT_REPOS")|g" \
   -e "s|__CYC__|$CYC|g" \
   "$TEMPLATE" > "$RENDER"
 plutil -lint "$RENDER" >/dev/null || { rm -f "$RENDER"; die "rendered plist is invalid"; }
@@ -901,7 +911,7 @@ cat <<EOF
   provenance  $STAMP   (which harness commit this box runs — agent-infra#1745)
   repo      $REPO   ($OR)
   limits    lanes=$MAX_LANES (default: 2.5x cores unless pinned) review=$MAX_REVIEW fix=$MAX_FIX fix_tries=$MAX_FIX_TRIES
-            max_load=$MAX_LOAD min_swap_free=${MIN_SWAP_FREE}M min_mem_free_mb=${MIN_MEM_FREE_MB}M batch=$BATCH cycle=${CYC}s
+            max_load=$MAX_LOAD min_swap_free=${MIN_SWAP_FREE}M min_mem_free_mb=${MIN_MEM_FREE_MB}M batch=$BATCH product_floor=$PRODUCT_FLOOR product_repos=$PRODUCT_REPOS cycle=${CYC}s
             merge_priority_at=${MERGE_PRIORITY_AT} UNOWNED open PRs
 EOF
 
