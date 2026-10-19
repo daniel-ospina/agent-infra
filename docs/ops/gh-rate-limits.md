@@ -192,6 +192,20 @@ construction). The fix is pacing, and there are two facts that follow from it:
 
 ## The gate (do not work around it)
 
+This is the LAST hop before the real binary, and it sits *below* the #1988 helper above rather than
+replacing it: `gh-limit`/`gh-rest` apply the policy, then delegate the call through this shim, so a
+mutating call passes both layers. ⛔ **Their limits do NOT simply "compound to the tighter one".**
+The concurrency cap of 1 (that layer) makes this layer's cap of 2 redundant, and a single wait is
+bounded by both — but the RETRY **multiplies**: this gate re-runs the whole command up to 3 times and
+that layer up to 4, so one argv can execute up to 12 times, including a non-idempotent create or
+comment. A caller that declared its own per-call bound suppresses this layer's sleep
+(`GH_LIMIT_NO_WAIT=1` is honoured), which is why the two layers must agree on it. That is also why
+the shim must not resolve a harness layer as "the real gh" — see `find_real_gh`.
+
+⛔ **Nothing here writes to a successful call's stderr.** `gh-rest/gh` parses `2>&1` as JSON, so
+pacing notes go to `~/.pi/agent/gh-gate/events.log` and are replayed to stderr only when the call
+fails. If you are debugging pacing, read the log.
+
 Every `gh` call that goes through the argv-level shim (`scripts/gh-shim/gh`, installed at
 `~/.pi/agent/shims/gh`) is paced per machine:
 
@@ -214,8 +228,10 @@ a caller, you are adding an unpaced `gh` — say so in the comment, as that file
 gh api rate_limit --jq '.resources | {core: .core, graphql: .graphql}'
 
 # What the fleet is actually doing (the gate's own signal):
-ls ~/.pi/agent/gh-gate/slots | wc -l          # in flight right now
+ls ~/.pi/agent/gh-gate/slots | wc -l          # slots HELD — a stale one is reaped by PID only on
+                                              # the next admission, so this can slightly overstate
 ls ~/.pi/agent/gh-gate/cooldown.* 2>/dev/null  # an active refusal window
+tail -5 ~/.pi/agent/gh-gate/events.log         # what the gate did: paces, waits, fail-open notes
 ```
 
 - `graphql.remaining: 0` → GraphQL **primary** pool exhausted; REST (`core`) is usually still fine.

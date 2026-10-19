@@ -102,6 +102,33 @@
 #   - a mutex `mkdir` is a best-effort lock: a process killed between `mkdir` and writing
 #     its pid is stolen after the stale window below, and a steal can race a re-acquire.
 #     The failure mode is a momentary over/under-count, never a permanent deadlock.
+#     A mutex whose pid file cannot be WRITTEN is released and reported unavailable
+#     rather than entered unowned.
+#   - ⛔ NOTHING HERE MAY TOUCH A SUCCESSFUL CALL'S STDERR. The harness layer ABOVE this one
+#     (`gh-rest/gh`) captures `2>&1` and PARSES the merged bytes as JSON; a pacing banner on a
+#     good answer turns `pr view --json` into a JSONDecodeError, and on the `pr merge` path it
+#     reports FAILURE for a merge GitHub already performed. So pacing notes are appended to
+#     `$GATE_DIR/events.log` ALWAYS, and replayed to stderr only when this call finally FAILS
+#     (where the caller is already printing stderr). The same rule is stated by gh-rest/gh and
+#     gh-limit.py; it is restated here because this is the layer that violated it.
+#   - a `retry-after` that `[ ]` cannot hold (more than 9 digits) is treated as ABSENT rather
+#     than clamped: the comparison would error (an errored test reads FALSE), the `*1000` would
+#     wrap, and the wrapped value would be written into the SHARED cooldown — parking every lane
+#     on the box for ~10^15 years with no self-heal. `cooldown_remaining_ms` additionally drops
+#     any deadline further ahead than RETRY_MAX, so a poisoned file heals on the next read.
+#   - the retry is per WHOLE COMMAND. Below `gh-limit.py`'s own 4 attempts this MULTIPLIES: a
+#     call can execute up to 3 (this gate) x 4 (that layer) times, including non-idempotent
+#     creates and comments. "The tighter layer wins" is true for concurrency and for a single
+#     wait, and FALSE for attempts. A caller that declared its own bound suppresses the sleep
+#     entirely (`AGENT_GH_GATE_NO_WAIT=1`, or gh-limit's `GH_LIMIT_NO_WAIT=1`).
+#   - `AGENT_GH_GATE_SLOT` is FORGEABLE: any caller that can set its environment may point it at
+#     an existing directory and take no slot at all. It is an INTERNAL inheritance seam between
+#     this shim and the child it spawns, not a security boundary — the same class as
+#     `AGENT_GH_GATE_MAX_INFLIGHT`, which a caller can also set.
+#   - a slot whose recorded PID was later REUSED by an unrelated long-lived process is not
+#     reaped by the liveness probe, so admission waits out `AGENT_GH_GATE_ACQUIRE_TIMEOUT` and
+#     then runs the call ungated. That is a bounded per-call penalty, not a wedge — the fail-open
+#     arm is what keeps it from becoming one.
 #   - the retry is decided from the TEXT of stderr, because that is all `gh` leaves. It
 #     fires only on the rate-limit signatures below and never on a bare 403, so a
 #     permissions error is not retried (a mutating command must not run twice). A
@@ -126,6 +153,8 @@
 #   AGENT_GH_GATE_RETRY_BASE       seconds to wait when stderr carries no `retry-after` (default 60, floor 1)
 #   AGENT_GH_GATE_RETRY_MAX        ceiling on any single wait, in seconds (default 900)
 #   AGENT_GH_GATE_ACQUIRE_TIMEOUT  seconds to wait for a free slot before running UNGATED (default 300)
+#   AGENT_GH_GATE_NO_WAIT=1        never sleep in-shim: return a rate-limit refusal at once
+#                                  (gh-limit's GH_LIMIT_NO_WAIT=1 is honoured the same way)
 #   AGENT_GH_GATE_LOCK_TIMEOUT_MS  ms to wait for the gate's own mutex (default 2000)
 #   AGENT_GH_GATE_SLOT             INTERNAL: the slot a nested call inherits (never counted twice)
 set -uo pipefail
@@ -433,7 +462,58 @@ mtime_ms() {
   printf '%s' $(( s * 1000 ))
 }
 
-gate_note() { printf 'gh-gate: %s\n' "$*" >&2; }
+# ⛔ A PACING NOTE NEVER GOES TO THE CALLER'S STDERR (see STATED LIMITS). It is appended to
+# `$GATE_DIR/events.log` always, and buffered to `$NOTEF` for replay only if this call FAILS.
+# `gh-rest/gh` does `run_real … 2>&1 | jq`, so a note beside a good answer is a JSONDecodeError,
+# and beside a performed `pr merge` it is a reported failure for a merge that happened.
+gate_note() {
+  # ⛔ REDIRECT ORDER IS THE POINT: `>> file 2>/dev/null` sends a FAILED REDIRECTION to the
+  # caller's stderr (bash reports it before the command runs), so an unwritable notes/log path
+  # would contaminate a successful call's stderr by another route. `2>/dev/null >>` suppresses it.
+  [ -n "${NOTEF:-}" ] && printf 'gh-gate: %s\n' "$*" 2>/dev/null >> "$NOTEF"
+  if [ -n "${GATE_DIR:-}" ] && [ -d "$GATE_DIR" ]; then
+    printf '%s gh-gate: %s\n' "$(date -u +%s 2>/dev/null)" "$*" 2>/dev/null >> "$GATE_DIR/events.log"
+  fi
+  return 0
+}
+
+# Flush the buffered notes to stderr — ONLY when the call is failing. `$1` is the call's rc;
+# a zero rc leaves stderr byte-identical to the child's own. The buffer is CONSUMED, so the
+# EXIT trap can call this again without printing twice.
+flush_notes() {
+  [ "${1:-0}" -eq 0 ] && { [ -n "${NOTEF:-}" ] && : 2>/dev/null > "$NOTEF"; return 0; }
+  if [ -n "${NOTEF:-}" ] && [ -s "$NOTEF" ]; then
+    cat "$NOTEF" >&2 2>/dev/null
+    : 2>/dev/null > "$NOTEF"
+  fi
+  return 0
+}
+
+# A caller that declared its OWN per-call bound must not be slept inside this gate:
+# `gh-limit.py` sets GH_LIMIT_NO_WAIT precisely so a 60-420 s heartbeat tool gets the refusal
+# back at once and reports RATE-LIMITED rather than STALL.
+no_wait_wanted() {
+  [ "${GH_LIMIT_NO_WAIT:-0}" = "1" ] && return 0
+  [ "${AGENT_GH_GATE_NO_WAIT:-0}" = "1" ] && return 0
+  return 1
+}
+
+# Forward a caller's cancellation to the child we are waiting on, so a killed caller does not
+# leave `gh` running through its retries against a bucket GitHub has already refused.
+# ⛔ AND THEN STOP. `exit 143` is load-bearing: a trapped TERM interrupts the retry `sleep`,
+# and without an exit the loop simply retries — so a cancelled caller would issue the very
+# second attempt it was killed to prevent. The EXIT trap releases the slot and flushes notes.
+CHILD_PID=""
+on_signal() {
+  [ -n "${CHILD_PID:-}" ] && kill -TERM "$CHILD_PID" 2>/dev/null
+  exit 143
+}
+on_exit() {
+  local r=$?
+  release_slot
+  flush_notes "$r"
+  return 0
+}
 
 # Move an abandoned mutex aside, verifying it is still the one we judged abandoned.
 # The verify-after-move is what keeps a steal from discarding a lock a third process
@@ -443,7 +523,10 @@ reap_lock() {
   mv "$lock" "$tomb" 2>/dev/null || return 0
   got="$(cat "$tomb/pid" 2>/dev/null)"
   if [ "$got" != "$want" ]; then
-    mv "$tomb" "$lock" 2>/dev/null
+    # Judge a re-acquire by the LOCK, not by the tomb: `mv dir1 dir2` with dir2 an existing
+    # DIRECTORY moves the tomb INSIDE the new holder's lock, leaving junk in it and hiding the
+    # fact that the steal raced. If the lock is back, our tomb is simply dropped.
+    if [ -e "$lock" ]; then rm -rf "$tomb" 2>/dev/null; else mv "$tomb" "$lock" 2>/dev/null; fi
     return 0
   fi
   rm -rf "$tomb" 2>/dev/null
@@ -457,7 +540,13 @@ lock_acquire() {
   deadline=$(( $(now_ms) + LOCK_TIMEOUT_MS ))
   while :; do
     if mkdir "$lock" 2>/dev/null; then
-      printf '%s\n' "$$" > "$lock/pid" 2>/dev/null
+      # An UNRECORDED holder is not a holder: if the pid cannot be written, a later reader
+      # cannot tell us from a dead lock, and two processes could sit in the critical section
+      # at once. Give it back and report the mutex unavailable (the caller fails OPEN, loudly).
+      if ! printf '%s\n' "$$" > "$lock/pid" 2>/dev/null; then
+        rm -rf "$lock" 2>/dev/null
+        return 1
+      fi
       return 0
     fi
     now="$(now_ms)"
@@ -495,6 +584,10 @@ cooldown_remaining_ms() {
     [ -e "$f" ] || continue
     v="$(cat "$f" 2>/dev/null)"
     case "$v" in ''|*[!0-9]*) rm -f "$f" 2>/dev/null; continue ;; esac
+    # A POISONED DEADLINE MUST SELF-HEAL. No real window is further ahead than RETRY_MAX; a
+    # wrapped `retry-after` (see retry_wait_ms) or a hand-edited file otherwise parks every
+    # lane on the box until someone deletes the file by hand.
+    if [ "$v" -gt $(( now + RETRY_MAX_S * 1000 )) ]; then rm -f "$f" 2>/dev/null; continue; fi
     if [ "$v" -le "$now" ]; then rm -f "$f" 2>/dev/null; continue; fi
     [ "$v" -gt "$max" ] && max="$v"
   done
@@ -579,8 +672,12 @@ release_slot() {
 
 # Space call STARTS. The mutex is held ACROSS the sleep on purpose: that is what turns
 # "each caller sleeps a bit" into a total order, so N callers space out N*interval apart
-# rather than all waking at the same instant. Bounded because at most MAX_INFLIGHT
-# callers can be here at once (a slot is held before the spacing step).
+# rather than all waking at the same instant.
+# ⛔ BOUNDED BY `LOCK_TIMEOUT_MS`, NOT BY THE SLOT CAP. NESTED calls skip admit_slot by design,
+# and a call whose admission timed out runs ungated — so more than MAX_INFLIGHT callers CAN be
+# here at once, and at ~9 nested callers each holding the mutex for INTERVAL_MS the wait exceeds
+# LOCK_TIMEOUT_MS and the tick is skipped (announced, fail-open). Keep LOCK_TIMEOUT_MS above
+# MAX_INFLIGHT x INTERVAL_MS if you want the spacing to hold under nesting.
 pace_tick() {
   [ "$INTERVAL_MS" -gt 0 ] || return 0
   local last now wait_ms
@@ -606,8 +703,12 @@ pace_tick() {
 rate_limited() {
   local f="$1"
   [ -s "$f" ] || return 1
-  tr '[:upper:]' '[:lower:]' < "$f" 2>/dev/null \
-    | grep -Eq 'api rate limit|secondary rate limit|abuse detection|http 429|status code:? 429|retry-after:'
+  # ⛔ ONE COMMAND, NO PIPELINE. `tr … | grep -Eq …` under `set -o pipefail` returns 141: `grep -q`
+  # exits at its first match, `tr` takes SIGPIPE, and the 141 then reads as "not rate limited" —
+  # so a refusal whose stderr exceeds the pipe buffer (~16-64 KB: a `--paginate` failure, a
+  # replayed error body) would neither retry NOR write the shared cooldown, with no signal.
+  # The same construction is forbidden above in find_real_gh for exactly this reason.
+  grep -Eqi 'api rate limit|secondary rate limit|abuse detection|http 429|status code:? 429|retry-after:' "$f" 2>/dev/null
 }
 
 # The wait before retry number <attempt>, in ms. `retry-after` first (that is the server's
@@ -615,9 +716,18 @@ rate_limited() {
 # header is absent is "wait at least one minute". RETRY_MAX bounds any single wait.
 retry_wait_ms() {
   local f="$1" attempt="$2" s base i=1
-  s="$(tr '[:upper:]' '[:lower:]' < "$f" 2>/dev/null \
-        | sed -n 's/.*retry-after:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n 1)"
+  # ONE awk, NOT `tr | sed | head`. awk can stop at the first match, so there is no early-exit
+  # SIGPIPE to mis-read, and `tolower()` is POSIX (BSD awk has no IGNORECASE).
+  s="$(awk '{ l = tolower($0)
+              if (match(l, /retry-after:[ \t]*[0-9]+/)) {
+                v = substr(l, RSTART, RLENGTH); sub(/retry-after:[ \t]*/, "", v); print v; exit } }' \
+        "$f" 2>/dev/null | head -n 1)"
   case "$s" in ''|*[!0-9]*) s="" ;; esac
+  # ⛔ A VALUE `[ ]` CANNOT HOLD IS TREATED AS ABSENT, NOT CLAMPED. `[ 10^19 -gt 900 ]` ERRORS,
+  # and an errored test reads FALSE — so the clamp would be skipped, the `*1000` would wrap, and
+  # `sleep` would reject the result and fall through to an IMMEDIATE identical retry while the
+  # wrapped value parked every lane on the box. Same ≤9-digit rule num_or applies to knobs.
+  [ -n "$s" ] && { [ "${#s}" -le 9 ] || s=""; }
   if [ -n "$s" ]; then
     base="$s"
   else
@@ -671,12 +781,21 @@ gate_init() {
 run_paced() {
   local rc=0 tries=0 rem wait_ms interactive=0 errf
   gate_init
+  NOTEF="$WORKDIR/notes.$$"
   errf="$WORKDIR/err.$$"
-  trap 'release_slot' EXIT
-  # An INTERACTIVE call (a human at a terminal: `gh auth login`, a prompt on stderr) is
-  # paced like every other call but never retried and never stderr-captured — capturing
-  # the prompt would leave the human staring at a blank screen while gh waits for input.
-  if [ -t 0 ] && [ -t 2 ]; then interactive=1; fi
+  CHILD_PID=""
+  trap 'on_exit' EXIT
+  # ⛔ THE CALLER'S TERM MUST REACH `gh`. A bare fork (the obvious way to read stderr) leaves the
+  # child running when the caller kills us — through its retries, still hammering a bucket GitHub
+  # has already refused, with nobody left to read the answer (the behaviour gh-limit.py:105 cites
+  # from the API docs). Forward the signal to the child we are waiting on.
+  trap 'on_signal' TERM INT HUP
+  # An INTERACTIVE call (a human at a terminal: `gh auth login`, and `gh` prompts on STDERR while
+  # READING STDIN) is paced like every other call but never retried and never stderr-captured —
+  # capturing the prompt would leave the human staring at a blank screen while gh waits for input.
+  # Keyed on STDIN, which is what gh reads: `gh pr create 2>log` also prompts, and would render
+  # invisibly on the capture path.
+  if [ -t 0 ]; then interactive=1; fi
   if [ "$GATE_ON" -eq 0 ]; then
     gate_note "cannot use the gate directory ($GATE_DIR) — running UNGATED (announced); retries still apply"
   fi
@@ -698,29 +817,58 @@ run_paced() {
     fi
     [ -n "${MY_SLOT:-}" ] && export AGENT_GH_GATE_SLOT="$MY_SLOT"
     if [ "$interactive" -eq 1 ]; then
+      # No capture, so the child's stderr IS this terminal: replay any buffered notes straight
+      # away rather than holding them for a failure that will never be detected here.
+      [ -n "$NOTEF" ] && [ -s "$NOTEF" ] && cat "$NOTEF" >&2 2>/dev/null
       "$REAL" "$@"
       rc=$?
       release_slot
+      rm -f "$NOTEF" "$errf" 2>/dev/null
       exit "$rc"
     fi
-    : > "$errf" 2>/dev/null
-    "$REAL" "$@" 2>"$errf"
+    # ⛔ THE CAPTURE FILE MUST NOT BE ABLE TO STOP THE CALL. bash performs a redirection BEFORE
+    # exec, so `2>"$errf"` on an unusable path (read-only fs, FULL disk) means `gh` NEVER RUNS and
+    # the caller gets rc=1 — a gate that is meant to be a courtesy turning its own disk problem
+    # into a total gh outage, while the note above it claims the call ran ungated.
+    if ! : 2>/dev/null > "$errf"; then
+      gate_note "cannot create the stderr capture ($errf) — running this call UNGATED, with no retry"
+      "$REAL" "$@"
+      rc=$?
+      release_slot
+      flush_notes "$rc"
+      rm -f "$NOTEF" 2>/dev/null
+      exit "$rc"
+    fi
+    # `<&0` is REQUIRED: a background job in a non-interactive shell is handed /dev/null for stdin
+    # by POSIX, which would break `gh api --input -` (the documented REST fallback).
+    "$REAL" "$@" 2>"$errf" <&0 &
+    CHILD_PID=$!
+    wait "$CHILD_PID"
     rc=$?
+    CHILD_PID=""
     if [ "$rc" -eq 0 ] || [ "$tries" -ge $(( MAX_ATTEMPTS - 1 )) ] || ! rate_limited "$errf"; then
       break
     fi
     tries=$(( tries + 1 ))
     wait_ms="$(retry_wait_ms "$errf" "$tries")"
-    # Announce the window to the WHOLE box before sleeping: the other lanes must not walk
-    # into it while this one waits.
+    # Share the window with the WHOLE box before deciding whether to sleep in it.
     [ "$GATE_ON" -eq 1 ] && set_cooldown_ms "$wait_ms"
+    # ⛔ A CALLER THAT DECLARED ITS OWN BOUND IS NOT SLEPT INSIDE. gh-limit.py sets
+    # GH_LIMIT_NO_WAIT=1 precisely so a caller with a 60-420 s timeout gets the refusal back AT
+    # ONCE and can report RATE-LIMITED instead of STALL — a lower layer must not override the
+    # upper layer's declared policy. The cooldown above is still written, so the box benefits.
+    if no_wait_wanted; then
+      gate_note "caller set NO_WAIT — returning the refusal at once instead of sleeping $(( (wait_ms + 999) / 1000 ))s (the cooldown is shared)"
+      break
+    fi
     release_slot
     gate_note "GitHub refused this call (rate limit) — waiting $(( (wait_ms + 999) / 1000 ))s, then retrying (retry $tries of $(( MAX_ATTEMPTS - 1 )))"
     sleep_ms "$wait_ms"
   done
   release_slot
   [ -s "$errf" ] && cat "$errf" >&2 2>/dev/null
-  rm -f "$errf" 2>/dev/null
+  flush_notes "$rc"
+  rm -f "$errf" "$NOTEF" 2>/dev/null
   [ "$GATE_DIR" = "$WORKDIR" ] || rm -rf "$WORKDIR" 2>/dev/null
   exit "$rc"
 }
