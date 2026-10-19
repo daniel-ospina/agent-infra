@@ -276,6 +276,14 @@ PHASE_GRACE="${LANE_PHASE_GRACE:-90}"; HANDOFF_WAIT="${LANE_HANDOFF_WAIT:-1800}"
 # CHAIN_POLL: how often the wait loop looks at the marker/verdict (seconds). Configurable so a suite
 # can exercise several ticks without spending minutes; production leaves it at 15.
 CHAIN_POLL="${CHAIN_POLL:-15}"
+# ⛔ BOTH KNOBS ARE VALIDATED LIKE EVERY OTHER NUMERIC HERE (reviewer finding, P2, measured): a
+# non-numeric CHAIN_POLL made `waited` never advance — `$((waited + CHAIN_POLL))` reads it as unset — so
+# the HANDOFF_WAIT bound below could never fire, turning the wait into an UNBOUNDED detached process.
+# The retry window is floored at the poll: a window shorter than the tick is just "every tick".
+case "$CHAIN_POLL" in ''|*[!0-9]*|0[0-9]*) CHAIN_POLL=15 ;; esac
+CHAIN_CONFIRM_RETRY="${CHAIN_CONFIRM_RETRY:-60}"
+case "$CHAIN_CONFIRM_RETRY" in ''|*[!0-9]*|0[0-9]*) CHAIN_CONFIRM_RETRY=60 ;; esac
+[ "$CHAIN_CONFIRM_RETRY" -ge "$CHAIN_POLL" ] || CHAIN_CONFIRM_RETRY="$CHAIN_POLL"
 case "$PHASE_GRACE" in ''|*[!0-9]*|0[0-9]*) PHASE_GRACE=90 ;; esac
 case "$HANDOFF_WAIT" in ''|*[!0-9]*|0[0-9]*) HANDOFF_WAIT=1800 ;; esac
 # Portable mtime: GNU first, then BSD. GNU `stat -f %m` prints a filesystem block BEFORE it errors, so
@@ -334,7 +342,7 @@ if [ -f "$PR_PHASE" ]; then
       # and dispatched at a PR the marker said was already merged. Asking on every tick is the
       # defect the gate fixed (~120 reads per wait). A retry window is both.
       _mk_now="$(date +%s)"
-      if [ "${_marker_read:-0}" = 0 ] || [ $((_mk_now - ${_marker_read_at:-0})) -ge "${CHAIN_CONFIRM_RETRY:-60}" ]; then
+      if [ "${_marker_read:-0}" = 0 ] || [ $((_mk_now - ${_marker_read_at:-0})) -ge "$CHAIN_CONFIRM_RETRY" ]; then
         _marker_read=1; _marker_read_at="$_mk_now"   # see the contract at the top
         chain_merged_confirmed "$PR"; _cmc=$?
         case "$_cmc" in

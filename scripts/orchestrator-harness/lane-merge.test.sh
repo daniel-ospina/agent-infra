@@ -355,6 +355,59 @@ ck "…and the budget hand-off names the LOAD gate instead of claiming the merge
    $([ "$RC" = 13 ] && ! grep -q 'could not READ the merge confirmation' "$OMIT_LOG" \
       && grep -q 'LOAD GATE' "$OMIT_LOG" && echo 0 || echo 1)
 
+# ── 11c-decies. a reviewer that produced NO verdict is NOT a fix round ──────────────────────────
+# ⛔ MEASURED DEFECT (reviewer finding, P2): the chain log's `NOT CLEAN or reviewer failed` was read as
+# "the reviewer recorded ISSUES", so a reviewer that hit its cap, or whose tool failed, was handed to the
+# lane as "read the review comment on PR #N and fix every finding": a fix round spent, and a pointer to
+# a comment that does not exist. That class is 43 of 124 runs in this file's own header.
+new_o "$T/junk-q7.tsv"
+printf 'open||newhead1|clean\n' > "$T/pr-open7.tsv"
+printf '%s deadbeef %s\n' 999995 "$OT/logs/lm-54.log" > "$OT/state/lanemerge-54.chain"
+printf '[chain] reviewer NOT CLEAN or reviewer failed (no ISSUES count)\n' > "$OT/logs/merge-54.log"
+NOVERDICT_LOG="$T/gh-decies.log"; : > "$NOVERDICT_LOG"
+OUT="$(PATH="$BIN:$PATH" GH_LOG="$NOVERDICT_LOG" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
+      bash "$SCRIPT" 54 --watch --repo o/r --pr-tsv "$T/pr-open7.tsv" 2>&1)"; RC=$?
+ck "a reviewer with NO verdict → exit 11 WAITING_NO_VERDICT, NO fix round spent, and nothing sends the lane to a review that does not exist" \
+   $([ "$RC" = 11 ] && [ "$(cut -d' ' -f1 "$OT/state/lanemerge-54.verdict" 2>/dev/null)" = WAITING_NO_VERDICT ] \
+      && [ ! -s "$OT/state/lanemerge-54.round" ] && ! grep -q 'read the review comment' "$NOVERDICT_LOG" \
+      && grep -qi 'no verdict' <<<"$OUT" && echo 0 || echo 1)
+
+# ── 11c-undecies. a chain still running at the deadline stamps ITS disposition too ─────────────
+new_o "$T/junk-q8.tsv"
+printf 'open||newhead1|clean\n' > "$T/pr-open8.tsv"
+printf 'allgood\tcompleted\tsuccess\t41\n' > "$T/checks-ok.tsv"
+sleep 60 & CH_PID55=$!
+printf '%s newhead1 %s\n' "$CH_PID55" "$OT/logs/lm-55.log" > "$OT/state/lanemerge-55.chain"
+# ⛔ A LIVE CHAIN IS RECOGNISED BY ITS CLAIM LOCK, NOT ONLY BY THE RECORD (the launcher probes
+# mergeclaim-<PR>.lock before it decides to spawn a competitor); without it this case measured the
+# LAUNCH path instead of the watch path and proved nothing about the disposition.
+printf '%s\n' "$CH_PID55" > "$OT/state/mergeclaim-55.lock"
+echo "still working" > "$OT/logs/lm-55.log"
+OUT="$(PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 LANE_MERGE_WAIT=1 \
+      bash "$SCRIPT" 55 --watch --repo o/r --pr-tsv "$T/pr-open8.tsv" --checks-tsv "$T/checks-ok.tsv" 2>&1)"; RC=$?
+kill "$CH_PID55" 2>/dev/null || true
+ck "a live chain at the deadline → WAITING and it STAMPS WAITING_CHAIN_RUNNING (not a stale earlier reason)" \
+   $([ "$RC" = 11 ] && [ "$(cat "$OT/state/lanemerge-55.lastdisp" 2>/dev/null)" = "WAITING_CHAIN_RUNNING" ] && echo 0 || echo 1)
+
+# ── 11c-tredecies. the head-moved budget hand-off RENDERS the pid (not the placeholder) ────────
+# ⛔ MEASURED (reviewer finding, P2): the arm exists to NAME the chain, and it shipped the literal
+# "check pid $(chain_pid)" to the PR — because the substitution had been escaped to survive a review
+# gate and nothing asserted the rendered body. Both halves are asserted here.
+new_o "$T/junk-q9.tsv"
+printf 'open||newhead1|clean\n' > "$T/pr-open9.tsv"
+sleep 60 & CH_PID56=$!
+printf '%s newhead1 %s\n' "$CH_PID56" "$OT/logs/lm-56.log" > "$OT/state/lanemerge-56.chain"
+echo "still working" > "$OT/logs/lm-56.log"
+printf '%s\n' "15" > "$OT/state/lanemerge-56.watch"
+printf '%s\n' "WAITING_HEAD_MOVED" > "$OT/state/lanemerge-56.lastdisp"
+HEADMOVED_LOG="$T/gh-tredecies.log"; : > "$HEADMOVED_LOG"
+OUT="$(PATH="$BIN:$PATH" GH_LOG="$HEADMOVED_LOG" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
+      bash "$SCRIPT" 56 --watch --repo o/r --pr-tsv "$T/pr-open9.tsv" 2>&1)"; RC=$?
+kill "$CH_PID56" 2>/dev/null || true
+ck "the head-moved budget hand-off names the REAL pid and never ships the literal placeholder" \
+   $([ "$RC" = 13 ] && ! grep -qF '$(chain_pid)' "$HEADMOVED_LOG" \
+      && grep -qF "pid $CH_PID56" "$HEADMOVED_LOG" && echo 0 || echo 1)
+
 # ── 11d. the handoff marker is HEAD-BOUND even from --watch ────────────────────────────────────
 new_o "$T/pr18.tsv"
 printf '%s deadbeef %s\n' 999997 "$OT/logs/lane-merge-26.log" > "$OT/state/lanemerge-26.chain"
@@ -440,6 +493,10 @@ OUT="$(PATH="$BIN:$PATH" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
 disown "$SPID" 2>/dev/null; kill "$SPID" 2>/dev/null; wait "$SPID" 2>/dev/null
 ck "a live chain working an OLDER head → exit 11 WAITING_HEAD_MOVED (its verdict cannot be applied to the tip)" \
    $([ "$RC" = 11 ] && [ "$(verdict_of 23 | cut -d' ' -f1)" = WAITING_HEAD_MOVED ] && echo 0 || echo 1)
+# ⛔ AND IT MUST STAMP WHAT IT FOUND (reviewer finding): deleting `disposition WAITING_HEAD_MOVED` left
+# the whole suite green, so the arm the exhausted-budget hand-off branches on was unpinned.
+ck "…and the head-moved exit STAMPS its disposition (the budget hand-off has something true to say)" \
+   $([ "$(cat "$OT/state/lanemerge-23.lastdisp" 2>/dev/null)" = "WAITING_HEAD_MOVED" ] && echo 0 || echo 1)
 
 # ── 13b. a STALE merge lock must be cleared, not obeyed (it is a pid file, not an owner) ───────
 new_o "$T/pr20.tsv"

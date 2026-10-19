@@ -226,6 +226,32 @@ _n2="$(grep -c READ "$T/pulls-count" 2>/dev/null || true)"
 ck "a LATER retry window re-asks: a transient read failure is not permanent (≥2 reads, and the chain ends without dispatching)" \
    $([ "${_n2:-0}" -ge 2 ] && [ "$_was_alive" = 0 ] && ! ran && echo 0 || echo 1)
 
+# ── 15. a NON-NUMERIC CHAIN_POLL must not turn the wait into an unbounded (or instantly dying) run ─
+# ⛔ MEASURED (reviewer finding, P2): `$((waited + CHAIN_POLL))` reads a non-numeric value as an unset
+# VARIABLE, so the HANDOFF_WAIT bound could never fire — an unbounded detached process, the class rounds
+# 3-4 removed from the head-moved path. Measured without the guard: the chain dies in 0.2s on an
+# arithmetic error and prints a retry window of "abcs". Both are asserted here.
+rig
+printf 'open\n' > "$T/o/state/lanemerge-7.phase"; printf 'WAITING\n' > "$T/o/state/lanemerge-7.verdict"
+printf 'x\n' > "$T/o/state/merged-7.done"
+PATH="$T/bin:$PATH" O="$T/o" HOME="$T/home" CHAIN_CLAIM_COMMIT="deadbeef" MERGED_API_FAIL=1 \
+  CHAIN_POLL=abc CHAIN_CONFIRM_RETRY=1 LANE_PHASE_GRACE=0 LANE_HANDOFF_WAIT=2 \
+  bash "$SCRIPT" "$T/repo" o/r 7 feat/7-x >/dev/null 2>"$T/poll-err.log" &
+PID=$!
+_bounded=0
+for _ in $(seq 1 40); do kill -0 "$PID" 2>/dev/null || { _bounded=1; break; }; sleep 1; done
+stop
+# ⛔ THE DISCRIMINATOR IS "DID IT GET TO THE REVIEW", not a string: without the guard the chain dies in
+# 0.2s on an arithmetic error (measured) and never reaches merge-one; with it, the poll falls back to a
+# real number, the HANDOFF_WAIT bound fires, and the chain reviews. "Bounded" alone would pass on both.
+# ⛔ THE SHARP DISCRIMINATOR IS THE SHELL ITSELF (measured): with the guard removed the chain reaches
+# `sleep "$CHAIN_POLL"` / `$((waited + CHAIN_POLL))` and dies with `integer expression expected` and
+# `abc: unbound variable` on stderr. "Bounded" alone passes on that death; a clean stderr does not.
+_shellerr="$(grep -cE 'integer expression expected|unbound variable|invalid time interval' "$T/poll-err.log" 2>/dev/null || true)"
+_reviewed="$(grep -c 'merge-one rc=' "$T/o/logs/chain-7.log" 2>/dev/null || true)"
+ck "a NON-NUMERIC CHAIN_POLL is refused, not inherited: bounded, clean stderr, and it still reaches the review" \
+   $([ "$_bounded" = 1 ] && [ "${_shellerr:-1}" = 0 ] && [ "${_reviewed:-0}" = 1 ] && echo 0 || echo 1)
+
 if [ "$fail" -eq 0 ]; then
   printf '\033[32mALL %d chain-merge verdict checks passed\033[0m\n' "$pass"
 else

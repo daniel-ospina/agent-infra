@@ -426,8 +426,16 @@ chain_verdict_from_log() { # chain_verdict_from_log <chain-log> [head]
     [ "$seen_needsfix" = 1 ] && { echo "FIX_REQUIRED"; return; }
   fi
   if [ -s "$mlog" ]; then
-    tail -n 300 "$mlog" 2>/dev/null | grep -qE 'ISSUES [0-9]+|NOT CLEAN or reviewer failed' \
-      && { echo "FIX_REQUIRED"; return; }
+    # ⛔ "THE REVIEWER RECORDED ISSUES" AND "THE REVIEWER FAILED TO PRODUCE A VERDICT" ARE DIFFERENT
+    # FACTS (reviewer finding, P2, measured). merge-one.sh's `*)` arm collapses them into one log line,
+    # and this read then told the lane "read the review comment on PR #N and fix every finding" about a
+    # run that posted NO comment at all — a fix round spent, rc=10, and nothing on the PR to read. The
+    # header of this file measures that class at 43 of 124 runs, so it is not a corner case. Only an
+    # ACTUAL issue count is a fix list; a failed/unrunnable reviewer gets its own token.
+    if tail -n 300 "$mlog" 2>/dev/null | grep -qE 'ISSUES [0-9]+'; then echo "FIX_REQUIRED"; return; fi
+    if tail -n 300 "$mlog" 2>/dev/null | grep -qE 'NOT CLEAN or reviewer failed'; then
+      echo "REVIEW_NO_VERDICT"; return
+    fi
     if tail -n 300 "$mlog" 2>/dev/null | grep -qE "MERGED via the rail|Successfully merged|is MERGED"; then
       # The log SAYS merged; only the API may confirm it (see merged_confirmed). Unconfirmed reads as
       # UNKNOWN, not MERGED — the caller then refuses to claim a merge rather than claiming a false one.
@@ -604,7 +612,10 @@ if [ "$WATCH" -eq 1 ]; then
         post_handoff BLOCKED_ATTEMPTS "supervision budget spent (${MAX_WATCH} --watch chunks), but the LAST chunk was refused by the LOAD GATE — this is not a lane failure: re-dispatch when the box quietens"
         verdict BLOCKED_ATTEMPTS "budget spent; the last chunk was refused by the load gate (not a lane failure)" ;;
       WAITING_HEAD_MOVED*)
-        post_handoff BLOCKED_ATTEMPTS "supervision budget spent (${MAX_WATCH} --watch chunks) while the chain stayed bound to an older head — check pid \$(chain_pid) before re-running"
+        # ⛔ NO ESCAPED SUBSTITUTION IN A HAND-OFF BODY (reviewer finding, P2, measured): a `\$(chain_pid)`
+# shipped the literal placeholder to the PR, so the arm that exists to NAME the chain handed over
+# "check pid $(chain_pid)". The sibling block path below already renders it.
+        post_handoff BLOCKED_ATTEMPTS "supervision budget spent (${MAX_WATCH} --watch chunks) while the chain stayed bound to an older head — check pid $(chain_pid) before re-running"
         verdict BLOCKED_ATTEMPTS "budget spent; the chain stayed bound to an older head" ;;
       *)
         post_handoff BLOCKED_ATTEMPTS "supervision budget spent (${MAX_WATCH} --watch chunks): the merge chain has not resolved this PR"
@@ -689,6 +700,16 @@ if [ "$WATCH" -eq 1 ]; then
         FIX_REQUIRED)
           # The reviewer's findings ARE the fix list; the PR comment carries them in full.
           emit_fix FIX_REQUIRED "the fresh-context reviewer recorded ISSUES at head ${HD:-} — read the review comment on PR #$PR and fix every finding" ;;
+        REVIEW_NO_VERDICT)
+          # ⛔ NO COMMENT TO POINT AT (reviewer finding, P2, measured): the reviewer hit its cap or its
+          # tool failed, so there IS no review comment — telling the lane to read one is a hand-off to
+          # nowhere, and charging it a fix round spends the lane's budget on nothing. It is re-runnable
+          # like the load gate, and it is bounded by the watch counter (it does NOT refund).
+          say "… the reviewer produced NO verdict at head ${HD:-} (cap hit or tool failure) — there is no"
+          say "   review comment to read; re-run the chain: lane-merge.sh $PR --issue ${ISSUE:-<n>} --repo $OR"
+          disposition WAITING_NO_VERDICT
+          verdict WAITING_NO_VERDICT "the reviewer produced no verdict (no comment to read); re-run the chain"
+          exit 11 ;;
         LOAD)    say "… the reviewer was refused by the load gate; this is not a lane failure — re-run:"
                  say "   lane-merge.sh $PR --issue ${ISSUE:-<n>} --repo $OR"
                  disposition WAITING_LOAD
@@ -789,6 +810,7 @@ while :; do
     if ! grep -q '^INFLIGHT ' <<<"$classified" || ! grep -q '^RED ' <<<"$classified"; then
       say_err "lane-merge: the check-run classifier produced no verdict (python3 missing or its"
       say_err "            output was not understood) — refusing to call this head green."
+      disposition WAITING_CLASSIFIER
       verdict WAITING_CLASSIFIER "could not classify this head's check-runs"
       exit 2
     fi
@@ -814,6 +836,7 @@ while :; do
     # In flight at the bound is NOT a failure of the lane and NOT a green: it is an unexplained
     # wait. Say so and let the caller re-run (a re-run costs one PR read).
     say "… checks still IN FLIGHT (${IF}) after ${WAIT_S}s — re-run this script; nothing was merged"
+    disposition WAITING_CHECKS
     verdict WAITING_CHECKS "checks still in flight after ${WAIT_S}s"
     exit 11
   fi
