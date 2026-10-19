@@ -152,6 +152,15 @@ def _token():
     `makes_request()` treats as request-free (its own `auth token` branch -- NOT `NO_REQUEST`,
     which holds only `--version`/`help`/`config`-class forms), so it cannot re-enter the refusal
     this fallback exists to escape.
+
+    ⛔ AND DEPTH-ASSOCIATED: the key must be one of the BLOCK's OWN keys, not merely indented
+    somewhere under it. gh's multi-account config nests per-user credentials under a `users:`
+    map, and the nested entry comes FIRST -- so "first `oauth_token:` inside the github.com
+    block" returns ANOTHER account's token, which answers 401/404 against api.github.com (the
+    same "REST is down" disguise) or spends a different account's quota. The block's direct
+    child depth is fixed by its first indented line; anything deeper is a nested map and is
+    skipped, which leaves a multi-account config with no file token at all -- and `gh auth
+    token` then answers with the ACTIVE account, which is the account gh itself would use.
     """
     for var in ("GH_TOKEN", "GITHUB_TOKEN"):
         if os.environ.get(var):
@@ -161,16 +170,25 @@ def _token():
     # made this fallback silently inert on a box that relocates its config.
     cfg = os.environ.get("GH_CONFIG_DIR") or os.path.expanduser("~/.config/gh")
     host = None
+    depth = None      # the current block's DIRECT-child indent (None until its first child)
     try:
         with open(os.path.join(cfg, "hosts.yml"), "r") as fh:
             for line in fh:
                 if not line.strip() or line.lstrip().startswith("#"):
                     continue
-                if not line[0].isspace():
+                indent = len(line) - len(line.lstrip())
+                if indent == 0:
                     host = line.split(":", 1)[0].strip()
+                    depth = None          # a new block: child depth is not known yet
                     continue
+                if host != "github.com":
+                    continue
+                if depth is None:
+                    depth = indent         # FIRST indented line fixes the block's own key depth
+                elif indent != depth:
+                    continue              # nested map (e.g. `users:`) -- not the block's own key
                 s = line.strip()
-                if host == "github.com" and s.startswith("oauth_token:"):
+                if s.startswith("oauth_token:"):
                     return s.split(":", 1)[1].strip().strip("'\"")
     except Exception:
         pass

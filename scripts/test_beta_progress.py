@@ -266,6 +266,22 @@ def test_rest_pages_the_requested_window_and_refuses_a_partial_read(monkeypatch)
     assert any(p["mergedAt"] == MERGED_TODAY for p in merged), (
         "the merged-today PR lived on page 4 — a single-page read would report 0")
 
+    # ⛔ THE OPEN READ IS A DIFFERENT BRANCH of the same function and gets no coverage from
+    # the assertions above: they are all made on the merged window, and `fake_get` ignores the
+    # URL. So `path = "closed"` unconditionally (open_prs would report the CLOSED count) and
+    # a cap of 100 on the open window both survived this test 10/10 — each a wrong NUMBER,
+    # which is exactly the class the fallback must not introduce. Pin the open URL and window.
+    seen_urls.clear()
+    open_rows = bp._rest_prs("open", limit=500)
+    assert open_rows is not None and len(open_rows) == 500, (
+        "a 500 window is 500 rows — a capped or single-page read under-counts open_prs")
+    assert len(seen_urls) == 5, "a 500 window is 5 requests at per_page=100, not one"
+    assert all("state=open" in u for u in seen_urls), (
+        "the open read must ask for state=open — REST's `closed` window would answer a "
+        "DIFFERENT count and `open_prs` would silently report it")
+    assert all("per_page=100" in u for u in seen_urls)
+    assert all("sort=updated&direction=desc" in u for u in seen_urls)
+
     # A page that cannot be read returns None for the WHOLE read: a partial list is
     # indistinguishable from a complete one at the call site.
     def failing_get(url, tok, timeout=None):
@@ -350,6 +366,23 @@ def test_token_prefers_env_then_hosts_yml_and_is_never_logged(monkeypatch, tmp_p
         "    oauth_token: gho_right_host\n")
     assert bp._token() == "gho_right_host"
 
+    # ⛔ AND DEPTH: gh's multi-account config nests per-user credentials under `users:`, with
+    # the nested entry FIRST. "First oauth_token inside the github.com block" therefore answers
+    # ANOTHER account's token — a 401/404 against api.github.com that reads as "REST is down",
+    # or a read spent on the wrong account's quota. Nothing at the block's OWN depth means no
+    # token from the file; here there is no credential either, so the answer is empty.
+    hosts.write_text(
+        "github.com:\n"
+        "    users:\n"
+        "        other:\n"
+        "            oauth_token: gho_OTHER_ACCOUNT\n"
+        "        active:\n"
+        "            oauth_token: gho_ACTIVE_NESTED\n"
+        "    user: active\n")
+    assert bp._token() == "", (
+        "a nested account's token is not this block's key — falling through to `gh auth "
+        "token` (the ACTIVE account) is the only correct answer")
+
     monkeypatch.setenv("GH_TOKEN", "gho_from_env")      # the fleet's own env wins
     assert bp._token() == "gho_from_env"
     monkeypatch.delenv("GH_TOKEN")
@@ -378,6 +411,19 @@ def test_token_prefers_env_then_hosts_yml_and_is_never_logged(monkeypatch, tmp_p
 
     hosts.unlink()                        # no file, no env, no gh -> falsy, not None
     assert not bp._token()
+
+    # ⛔ "NEVER LOGGED" MUST HOLD AT THE FINDER, NOT ONLY AT THE TRANSPORT. The assertion above
+    # pins the value that reaches `compute()`; a `print()` inside `_token()` itself is upstream of
+    # it and shipped GREEN under a check for one literal. Every credential literal this test
+    # plants must therefore be absent from the whole captured stream.
+    leaked = capsys.readouterr()
+    stream = leaked.out + leaked.err
+    for literal in ("gho_from_hosts_yml", "gho_relocated", "gho_right_host",
+                    "gho_from_keyring", "gho_from_env", "GHES_MUST_NOT_BE_USED",
+                    "gho_OTHER_ACCOUNT", "gho_ACTIVE_NESTED"):
+        assert literal not in stream, (
+            "_token() printed %r — the credential must never reach stdout/stderr, and "
+            "pinning it only at the transport leaves the finder free to print it" % literal)
 
     # A full failing read must not print the token anywhere.
     monkeypatch.setenv("GH_TOKEN", "gho_secret_marker")
