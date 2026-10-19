@@ -1811,6 +1811,14 @@ if [ "${_rs_sz:-0}" -gt 0 ] && [ "${_rgs_sz:-0}" -gt 0 ] \
   eqv "a CLEAN verdict keeps its own class" "CLEAN" "$(_vc 'CLEAN https://github.com/o/r/pull/1#issuecomment-9')"
   eqv "an EMPTY final line is NO-VERDICT, not ISSUES" "NO-VERDICT" "$(_vc '')"
   eqv "an unparseable final line is NO-VERDICT too" "NO-VERDICT" "$(_vc 'I read it and I think it is fine')"
+  # ⛔ THE COUNT IS PART OF THE VERDICT (review round 3, P3). `ISSUES 0` is a reviewer saying they
+  # found NOTHING — the pre-fix prefix match turned it into a fixer authorisation, spending a
+  # MAX_FIX_TRIES attempt on a head with nothing to fix. A bare `ISSUES` is unparseable, and a
+  # 10-digit count must not reach `-ge` (it errs FALSE on bash 3.2).
+  eqv "ISSUES 0 is NO-VERDICT (nothing to fix, so no fixer)" "NO-VERDICT" "$(_vc 'ISSUES 0')"
+  eqv "a bare ISSUES with no count is NO-VERDICT" "NO-VERDICT" "$(_vc 'ISSUES')"
+  eqv "a two-digit count is still ISSUES" "ISSUES" "$(_vc 'ISSUES 12')"
+  eqv "an absurd count is NO-VERDICT (no arithmetic on an unbounded value)" "NO-VERDICT" "$(_vc 'ISSUES 9999999999999')"
 
   # (1) CONTROL: findings at a head authorise a fixer and write NO stale-evidence marker.
   _clean; _rs ISSUES aaaa1111
@@ -1929,6 +1937,20 @@ GHFAIL
     *"could not read"*) echo "  ✅ an unreadable open-PR list prints <could not read> with the raw marker count, never a confident 0"; PASS=$((PASS+1)) ;;
     *) echo "  ❌ an unreadable open-PR list printed [$_rpt_fail] — a blind read must not read as a clean queue"; FAIL=$((FAIL+1)) ;;
   esac
+  # (9c2) …and a marker whose PR is PARKED at that head belongs to the line above, not this one
+  # (review round 3, P2): one PR in two queues with two different remedies is how an operator ends up
+  # re-reviewing a PR that is waiting for a human.
+  : > "$RPT/state/needsreview-6002-ddd"
+  printf '%s\n' ddd > "$RPT/state/parked-6002"
+  cat > "$TMP/ghstub/gh" <<'GHOPEN2'
+#!/bin/bash
+case "$*" in *"--state open"*) printf '6001\n6002\n' ;; esac
+exit 0
+GHOPEN2
+  chmod +x "$TMP/ghstub/gh"
+  _rpt_parked="$( O="$RPT" REPO="$RPT/repo" PATH="$TMP/ghstub:$PATH" bash "$REPORT" 2 2>/dev/null | grep 'stale evidence' )"
+  eqv "…and a PR parked at that head is counted as parked, not as stalled on evidence" "  stale evidence (needs re-review): 1" "$_rpt_parked"
+  rm -f "$RPT/state/parked-6002" "$RPT/state/needsreview-6002-ddd"
   # (9c) …and NO repo/gh at all is its OWN state, not 0 (review round 2, P1). The first form derived
   # the state from a flag only set inside the "repo AND gh present" arm, so a box without a checkout
   # printed `open PRs: 0` and `stale evidence: 0` — a blind read presented as a clean queue.
@@ -1940,6 +1962,15 @@ GHFAIL
   esac
   wpin "orch-loop.sh classifies the red gate before dispatching" "$ORCH" '_rgs="$(review_gate_state "$PR" "${HEAD_N:-}")"'
   wpin "…and authorises a fixer ONLY on NEEDS-FIX" "$ORCH" '[ "$_rgs" = "NEEDS-FIX" ]'
+  # ⛔ ONE WRITER (review round 3, P2): the controller must never WRITE the stale-evidence state — it
+  # cannot see the review store, so a marker from there asserts a property it cannot measure (it
+  # published the state for brand-new unreviewed PRs and for heads whose signed marker had just
+  # verified). It may delete it; `touch` anywhere in orch-loop.sh is the regression.
+  if grep -q 'touch "$O/state/needsreview' "$ORCH"; then
+    echo "  ❌ orch-loop.sh WRITES needsreview state — the controller cannot see whether evidence exists, so that marker asserts an unmeasured property"; FAIL=$((FAIL+1))
+  else
+    echo "  ✅ orch-loop.sh never writes the stale-evidence state (merge-one.sh is the single writer)"; PASS=$((PASS+1))
+  fi
   wpin "report.sh surfaces the stale-evidence queue (indicator b)" "$REPORT" 'stale evidence (needs re-review)'
 else
   echo "  ❌ the verdict/state functions did not extract to syntactically valid shell from merge-one.sh / orch-loop.sh"; FAIL=$((FAIL+1))

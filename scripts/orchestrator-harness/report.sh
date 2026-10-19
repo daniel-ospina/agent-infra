@@ -161,14 +161,18 @@ case "$OPEN_STATE" in
 esac
 echo "  parked (needs a human): $(ls "$O"/state/parked-* 2>/dev/null | wc -l | tr -d ' ')"
 # ⛔ THE STALE-EVIDENCE COUNT IS ITS OWN LINE (agent-infra#2132), because it is a DIFFERENT queue with
-# a DIFFERENT remedy: a parked PR needs a human, while a `needsreview-<PR>-<head>` PR only needs the
-# review re-run. Indicator (b) of that issue is "the count of open PRs stalled on stale evidence
-# stays at 0", and before this line nothing in the harness could answer it at all.
-# ⛔ OPEN PRs ONLY, COUNTED PER PR (review rounds 1 and 2, P2). The headline is a count of OPEN PRs:
-# a marker left by a merged/closed PR is bookkeeping lag, not a stall, and TWO markers for one PR
-# (written by different boxes, or by a controller cycle that ran between heads) are still ONE stalled
-# PR. Counting files published a number that only grew — it could never read the 0 the indicator asks
-# for. `seen` is the durable half: it holds even for a marker set written by a deployed peer box.
+# a DIFFERENT remedy: a parked PR needs a human, while a `needsreview-<PR>-<head>` PR needs to be
+# re-reviewed. Indicator (b) of that issue is "the count of open PRs stalled on stale evidence stays
+# at 0", and before this line nothing in the harness could answer it at all.
+# ⛔ WHAT A MARKER MEANS, EXACTLY: `merge-one.sh` writes it when a reviewer run at that head produced
+# NO usable verdict (cap hit, kill, empty final line) — the single writer, because it is the only
+# component that can see whether head-bound evidence exists (review round 3). So this counts open,
+# unparked PRs whose reviewer produced no verdict at the head the marker names; it deliberately does
+# NOT try to prove the head is still current (that needs a `gh pr view` per PR, and a marker for a
+# superseded head is cleared by the next `merge-one.sh` run for that PR).
+# ⛔ OPEN PRs ONLY, COUNTED PER PR (review rounds 1-3). A marker left by a merged/closed PR is
+# bookkeeping lag, not a stall; two markers for one PR are still ONE stalled PR. `seen` is the
+# durable half — it holds even for a marker set written by a deployed peer box.
 case "$OPEN_STATE" in
   norepo) echo "  stale evidence (needs re-review): <needs a repo checkout and gh>" ;;
   ok)
@@ -176,9 +180,15 @@ case "$OPEN_STATE" in
     for f in "$O"/state/needsreview-*; do
       [ -e "$f" ] || continue
       pr="$(basename "$f" | sed -n 's/^needsreview-\([0-9][0-9]*\)-.*/\1/p')"
+      head="${f##*-}"
       [ -n "$pr" ] || continue
       case " $seen " in *" $pr "*) continue ;; esac
       printf '%s\n' "$OPENNUMS" | grep -qx -- "$pr" || continue
+      # ⛔ A PARKED HEAD BELONGS TO THE LINE ABOVE (review round 3, P2). `parked-<PR>` holds the head
+      # it was parked AT, so a marker for that same head describes a PR whose queue is "needs a human"
+      # — the remedy printed one line up — and counting it here puts ONE PR in TWO queues with TWO
+      # different remedies. Local file read, no API cost.
+      [ "$(cat "$O/state/parked-$pr" 2>/dev/null)" = "$head" ] && continue
       seen="$seen $pr"; stale=$((stale + 1))
     done
     echo "  stale evidence (needs re-review): $stale" ;;

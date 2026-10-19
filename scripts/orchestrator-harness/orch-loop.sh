@@ -1933,26 +1933,24 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
           # marker at spawn — so restore it too (P2, second review round).
           refund_bailed_fixer "$PR" "${HEAD_N:-}" 1
           # ⛔ ONE STATE, ONE REMEDY (agent-infra#2132). The gate being red is not a diagnosis: a head
-          # with FINDINGS needs a fixer, and a head with no findings (stale/missing evidence, or a
-          # reviewer that produced no verdict) needs another REVIEW. They were the same log line and
-          # the same dispatch before this — so a stale-evidence PR was handed to a fixer whose push
-          # invalidated the signed review again, burning one attempt per cycle until the cap parked
-          # an issue nobody owned. The classifier is the ONLY input to both the log line and the
-          # dispatch decision, so the two cannot disagree.
+          # with FINDINGS needs a fixer, and a head with no findings needs another REVIEW. They were the
+          # same log line and the same dispatch before this, so a stale-evidence PR was handed to a
+          # fixer whose push invalidated the signed review again, burning one attempt per cycle until
+          # the cap parked an issue nobody owned. The classifier is the ONLY input to both the log line
+          # and the dispatch decision, so the two cannot disagree.
+          # ⛔ AND THIS ARM DOES NOT WRITE THE STALE-EVIDENCE STATE (review round 3, P2). It cannot
+          # establish the property the marker names: "no head-bound clean evidence at THIS head" is
+          # knowable only from the review store, which merge-one.sh consults and this controller does
+          # not. Writing it here published the state for every red gate with no findings marker — a
+          # brand-new PR that had simply not been reviewed, and (measured by review) a head whose
+          # SIGNED MARKER HAD JUST VERIFIED but whose gate never went green, so the log told the
+          # operator to re-record evidence that already existed. merge-one.sh is the single writer of
+          # `needsreview-*`; this arm only READS it, and the log line says only what is known here.
           _rgs="$(review_gate_state "$PR" "${HEAD_N:-}")"
           if [ "$_rgs" = "NEEDS-FIX" ]; then
             echo "#$PR NEEDS-FIX (reviewer findings at head=${HEAD_N:-?}) — a fixer is the remedy" >>"$LOG"
           else
-            echo "#$PR NEEDS-REVIEW (no findings and no head-bound clean evidence at head=${HEAD_N:-?}) — the remedy is another review, NOT a fixer" >>"$LOG"
-            # ⛔ PRUNE BEFORE WRITING (review round 2, P2). This is the only writer that used to leave
-            # the PR's previous heads in place, and it fires on EVERY red cycle — including cycles where
-            # a worker is already in flight, i.e. exactly under saturation. Two markers for one open PR
-            # made report.sh count one stall twice and falsified the "one marker per PR" invariant both
-            # docs now state. report.sh dedupes per PR as well, so a peer box's markers cannot do this.
-            if [ -n "${HEAD_N:-}" ]; then
-              rm -f "$O/state/needsreview-$PR-"* 2>/dev/null || true
-              touch "$O/state/needsreview-$PR-$HEAD_N" 2>/dev/null
-            fi
+            echo "#$PR NEEDS-REVIEW (no findings marker at head=${HEAD_N:-?}) — the remedy is another review, NOT a fixer" >>"$LOG"
           fi
           # The claim file is written by merge-one.sh itself, so it also covers the chain-<N>
           # path (which invokes merge-one.sh directly and whose session name is invisible here).

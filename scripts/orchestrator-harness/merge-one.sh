@@ -534,7 +534,7 @@ AGENT_RC=$?
 # AGENT_LOAD_REFUSED code, and the controller re-dispatches when the box quietens (75 is what
 # adopt-fix/chain-merge already propagate for this).
 if [ "$AGENT_RC" = "${PI_GATE_REFUSED:-76}" ]; then
-  echo "[merge $PR] reviewer NOT started (pi spawn-point load gate) — no verdict, NO needsfix marker; re-dispatched when 1-min load falls below MAX_LOAD" >> "$L.log"
+  echo "[merge $PR] reviewer NOT started (pi spawn-point load gate) — no verdict, NO marker written (a needsfix marker would authorise a fixer and a needsreview marker would spend one of MAX_REVIEW_TRIES for a review that never started); re-dispatched when 1-min load falls below MAX_LOAD" >> "$L.log"
   exit 75
 fi
 LAST="$(grep -aE '^(CLEAN|ISSUES) ' "$L.log" | tail -1 | tr -d '\r')"
@@ -554,9 +554,22 @@ echo "[merge $PR] verdict: ${LAST:-<none>}" >> "$L.log"
 # `FAILED:ai-review-gate` indistinguishable from a genuine rejection. A fixer cannot act on findings
 # that do not exist; only another review can.
 verdict_class() {
+  local n
   case "${1:-}" in
     CLEAN*)  printf 'CLEAN' ;;
-    ISSUES*) printf 'ISSUES' ;;
+    # ⛔ THE COUNT IS PART OF THE VERDICT (review round 3, P3). "ISSUES" alone does not mean findings
+    # exist — `ISSUES 0` says the reviewer found NONE, and the pre-fix prefix match turned that into a
+    # fixer authorisation, spending a MAX_FIX_TRIES attempt on a head with nothing to fix. This is the
+    # exact invariant #2132 exists to enforce, so the number is parsed and required to be >= 1; a bare
+    # `ISSUES` with no count is unparseable and reads NO-VERDICT (re-review, never a fixer).
+    ISSUES*)
+      n="${1#ISSUES}"
+      # shellcheck disable=SC2086   # word-split on purpose: " 3" and "3" must both yield the count
+      set -- $n
+      n="${1:-}"
+      case "$n" in ''|*[!0-9]*) printf 'NO-VERDICT' ;; *)
+        if [ "${#n}" -le 9 ] && [ "$n" -ge 1 ]; then printf 'ISSUES'; else printf 'NO-VERDICT'; fi ;;
+      esac ;;
     *)       printf 'NO-VERDICT' ;;
   esac
 }
