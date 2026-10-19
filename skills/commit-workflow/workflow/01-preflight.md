@@ -316,7 +316,7 @@ differs, because the PR diff is invisible here):
 |-------|------------------------|----------------|
 | a. linked issue | skipped — there is no PR body yet | enforced |
 | b. scoping comment (`<!-- issue-scoping:`) | **enforced** | enforced |
-| c. code-review evidence | skipped — no PR body/commits yet | enforced |
+| c. code-review evidence | skipped — no PR body/commits yet | enforced (a record-review.sh marker BOUND to this PR at its current head — a phrase is not evidence, #1825) |
 | d. plan doc | **`Wiring` branch only** — the `docs/plans/*.md` branch reads the PR diff | enforced (both branches) |
 | e. test-coverage evidence | skipped — no diff/body yet | enforced |
 

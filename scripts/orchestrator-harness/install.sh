@@ -29,7 +29,12 @@ O="${O:-$HOME/orchestrator}"
 # not exist there, and the daemon crash-loops under KeepAlive on a FATAL it can never satisfy.
 # Required, validated by the `git rev-parse` below, and named in the refusal.
 REPO="${REPO:-}"
-OR="${OR:-daniel-ospina/tortoise}"
+# ⛔ OR HAS NO DEFAULT ON PURPOSE (agent-infra#2040). It used to be rendered as a LITERAL into the
+# daemon's environment, so `orch-loop.sh`'s derived value was dead code on every launchd box: the
+# controller graded one repo's PR queue while dispatching into another (measured 2026-10-18: cells
+# logging `merge-priority (52 unowned of 54 open PRs)` for a repo whose queue was ~10). Empty here
+# means "derive it from $REPO's origin", which is what orch-loop.sh does. An explicit OR still wins.
+OR="${OR:-}"
 
 # sanity ceiling only; the swap/RAM gates below are the real constraint.
 # Portable core count, IDENTICAL to orch-loop.sh's line. install.sh itself refuses to run off macOS
@@ -91,6 +96,10 @@ MAX_LANES="${MAX_LANES:-$(( 10#$_NCPU * 5 / 2 ))}"
 if [ "$MAX_LANES" = "$(( 10#$_NCPU * 5 / 2 ))" ]; then is_limit "$MAX_LANES" || MAX_LANES=10; fi
 MAX_REVIEW="${MAX_REVIEW:-4}"
 MERGE_PRIORITY_AT="${MERGE_PRIORITY_AT:-25}"
+# The bound on the merge-priority gate, and the age limit on a `state/refresh-funnel` record
+# (agent-infra#2040). Both are whole minutes; both are validated by the range loop below.
+MERGE_PRIORITY_MAX_AGE_MIN="${MERGE_PRIORITY_MAX_AGE_MIN:-180}"
+FUNNEL_MAX_AGE_MIN="${FUNNEL_MAX_AGE_MIN:-30}"
 MAX_FIX="${MAX_FIX:-3}"
 MAX_FIX_TRIES="${MAX_FIX_TRIES:-3}"
 MIN_SWAP_FREE="${MIN_SWAP_FREE:-600}"
@@ -586,11 +595,18 @@ esc() { sed_esc "$(xml_esc "$1")"; }
 # different ways: '4x' renders a plist that LIES about the ceiling and still exits 0 (only the loop's
 # own coercion saves the run), while '4&5' renders the literal `4__MAX_LANES__5` -- a syntactically
 # VALID plist (plutil -lint passes) whose value reads as non-numeric downstream.
-for _n in MAX_LOAD MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MAX_FIX MAX_FIX_TRIES MIN_SWAP_FREE MIN_MEM_FREE_MB BATCH CYC; do
+for _n in MAX_LOAD MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MERGE_PRIORITY_MAX_AGE_MIN FUNNEL_MAX_AGE_MIN MAX_FIX MAX_FIX_TRIES MIN_SWAP_FREE MIN_MEM_FREE_MB BATCH CYC; do
   _v="${!_n}"
   case "${_v:-}" in
     ''|*[!0-9]*) die "$_n='${_v:-}' is not a whole number — a value here silently opens the gate it configures" ;;
-    0) : ;;
+    # ⛔ A WINDOW IS NOT A COUNT (review round 5). MERGE_PRIORITY_MAX_AGE_MIN / FUNNEL_MAX_AGE_MIN are
+    # accepted as 0 here and then coerced to 180/30 by the loop, so the rendered plist would state a
+    # bound the controller does not use — exactly the "a value this installer accepts must be the value
+    # the loop uses" rule the leading-zero arm below is here for. `0` would also make each gate inert
+    # (never blocking / always stale), which is never what an operator means.
+    0) case "$_n" in MERGE_PRIORITY_MAX_AGE_MIN|FUNNEL_MAX_AGE_MIN)
+         die "$_n='0' is not a usable window — the loop coerces it to the default, so the plist would lie about the bound" ;;
+       esac ;;
     # ⛔ LEADING ZEROS (P1/P2, second review round, 2026-10-14). `''|*[!0-9]*` accepted `08`, which
     # rendered into the plist and then reached the loop, where `$(( ))` parses base 0 (leading 0 =
     # OCTAL) and `08`/`09` are not octal — on /bin/bash 3.2.57 the failed arithmetic silently
@@ -644,6 +660,8 @@ sed \
   -e "s|__MAX_LANES__|$MAX_LANES|g" \
   -e "s|__MAX_REVIEW__|$MAX_REVIEW|g" \
   -e "s|__MERGE_PRIORITY_AT__|$MERGE_PRIORITY_AT|g" \
+  -e "s|__MERGE_PRIORITY_MAX_AGE_MIN__|$MERGE_PRIORITY_MAX_AGE_MIN|g" \
+  -e "s|__FUNNEL_MAX_AGE_MIN__|$FUNNEL_MAX_AGE_MIN|g" \
   -e "s|__MAX_FIX__|$MAX_FIX|g" \
   -e "s|__MAX_FIX_TRIES__|$MAX_FIX_TRIES|g" \
   -e "s|__MIN_SWAP_FREE__|$MIN_SWAP_FREE|g" \
@@ -699,7 +717,7 @@ if [ "$PLIST_CHANGED" = "0" ]; then ok "plist unchanged and it is the render lau
 # missing AGENT_DISK_REFUSED, which under `set -u` aborts a refusal before its refund (the callers
 # are tolerant of that now, but surviving a stale helper silently is not the same as DETECTING it).
 DRIFTED=""
-for f in orch-loop.sh claims.sh repo-authority.sh spawn-gate.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh gh-rest/gh gh-limit.py; do
+for f in orch-loop.sh claims.sh repo-authority.sh repo-slug.sh spawn-gate.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh gh-rest/gh gh-limit.py; do
   [ -f "$O/$f" ] || { DRIFTED="$DRIFTED $f(missing)"; continue; }
   diff -q "$HERE/$f" "$O/$f" >/dev/null 2>&1 || DRIFTED="$DRIFTED $f"
 done
@@ -1004,13 +1022,32 @@ case "$_prc" in
   *) LC_STATE=unknown ;;
 esac
 
+# ⛔ THE BANNER MUST NAME THE REPO THE BOX WILL GRADE (review round 7). OR has no default now (the loop
+# derives it), so `($OR)` printed an empty pair of parentheses — on the one line an operator reads to
+# confirm which repo this cell serves, which is the subject of the whole change. Derived here FOR
+# DISPLAY ONLY, in a subshell so the helper's functions do not leak into the installer's shell; an
+# underivable origin prints the explanation rather than a blank.
+OR_SHOW="${OR:-}"
+if [ -z "$OR_SHOW" ]; then
+  OR_SHOW="$( ( . "$HERE/repo-slug.sh" 2>/dev/null; derive_or "$REPO" "" ) 2>/dev/null || true )"
+fi
+# ⛔ THE FALLBACK IS ASSIGNED, NEVER INLINED INTO ${VAR:-...} BELOW. A single quote inside a
+# parameter expansion's word opens a quote the heredoc never closes, so bash reports
+# `bad substitution: no closing `}' at the `cat <<EOF` line, prints the WHOLE banner
+# unexpanded ($O, $REPO, $STAMP — measured), and the installer still exits 0 having
+# "installed" nothing legible. The durability suite caught it (11 failures in §F); this
+# comment is here because the failure is silent in every other direction.
+if [ -z "$OR_SHOW" ]; then
+  OR_SHOW='<derived from this checkout origin by the loop>'
+fi
+
 cat <<EOF
 
 ✅ Installed $LABEL
 
   harness   $O
   provenance  $STAMP   (which harness commit this box runs — agent-infra#1745)
-  repo      $REPO   ($OR)
+  repo      $REPO   ($OR_SHOW)
   limits    lanes=$MAX_LANES (default: 2.5x cores unless pinned) review=$MAX_REVIEW fix=$MAX_FIX fix_tries=$MAX_FIX_TRIES
             max_load=$MAX_LOAD min_swap_free=${MIN_SWAP_FREE}M min_mem_free_mb=${MIN_MEM_FREE_MB}M batch=$BATCH cycle=${CYC}s
             merge_priority_at=${MERGE_PRIORITY_AT} UNOWNED open PRs
