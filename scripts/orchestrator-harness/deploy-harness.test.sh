@@ -114,7 +114,7 @@ BEFORE_LIVE="$(shasum -a 256 < "$O1/live-only.sh" | cut -d' ' -f1)"
 notify_reset
 deploy "$SRC1" "$O1"
 if [ "$RC" -eq 0 ]; then ok "valid source -> exit 0"; else bad "valid source -> exit $RC (expected 0): $OUT"; fi
-echo "$OUT" | grep -q "VERIFIED" && ok "prints the VERIFIED verdict" || bad "no VERIFIED verdict in output"
+grep -q "VERIFIED" <<< "$OUT" && ok "prints the VERIFIED verdict" || bad "no VERIFIED verdict in output"
 if notify_success; then ok "notification is the SUCCESS one"; else bad "no success notification (got: $(notify_last))"; fi
 notify_failure && bad "a successful deploy also notified FAILURE" || ok "success path emits no failure notification"
 [ "$(notify_lines)" = "1" ] && ok "exactly one notification per run" || bad "$(notify_lines) notifications for one run"
@@ -147,7 +147,7 @@ notify_success && bad "an absent source notified SUCCESS" || ok "no success noti
 grep -qi "does not exist" <<< "$(notify_last)" && ok "notification names the cause" || bad "notification does not name the cause: $(notify_last)"
 if [ "$(snapshot "$O2")" = "$BEFORE" ]; then ok "target byte-identical after the refusal"; else bad "the refusal MODIFIED the target"; fi
 # the exact self-confirming counter from the old line 34 must not appear as evidence of anything
-echo "$OUT" | grep -q "30" && bad "output leans on the pre-existing file count" || ok "output does not cite pre-existing file counts"
+grep -q "30" <<< "$OUT" && bad "output leans on the pre-existing file count" || ok "output does not cite pre-existing file counts"
 
 # ── 3. NOTHING COPIED — a source that ships no files ─────────────────────────────────────────────
 say_case "3. source shipping zero files -> FAILURE (a deploy of nothing is not a success)"
@@ -271,8 +271,12 @@ n_success_lines="$(grep -c 'harness deploy VERIFIED' "$DEPLOY")"
 [ "$n_success_lines" = "1" ] && ok "one success-notification site" || bad "$n_success_lines success-notification sites (expected 1)"
 n_verified_print="$(grep -c 'say "\$PROG: VERIFIED' "$DEPLOY")"
 [ "$n_verified_print" = "1" ] && ok "one VERIFIED print site" || bad "$n_verified_print VERIFIED print sites (expected 1)"
-grep -v '^[[:space:]]*#' "$DEPLOY" | grep -q 'ls "\$O"' && bad "the helper counts files from the target (self-confirming evidence)" || ok "the helper never counts files from the target"
-grep -v '^[[:space:]]*#' "$DEPLOY" | grep -q 'cp -R' && bad "the helper still uses a bare recursive cp" || ok "no bare recursive copy"
+# The helper's non-comment lines are CAPTURED once and tested in the shell: a non-quiet grep piped
+# into `grep -q` is the #841/#864 SIGPIPE false-negative (the quiet grep exits early, the producer
+# dies of SIGPIPE, and under `pipefail` the assertion reports the wrong cause).
+DEPLOY_CODE="$(grep -v '^[[:space:]]*#' "$DEPLOY" || true)"
+grep -q 'ls "\$O"' <<< "$DEPLOY_CODE" && bad "the helper counts files from the target (self-confirming evidence)" || ok "the helper never counts files from the target"
+grep -q 'cp -R' <<< "$DEPLOY_CODE" && bad "the helper still uses a bare recursive cp" || ok "no bare recursive copy"
 
 echo
 echo "════════════════════════════════════════"
