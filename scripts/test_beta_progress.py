@@ -196,15 +196,33 @@ def test_a_cache_this_version_cannot_render_falls_through_to_a_real_line(monkeyp
     # THROUGH to a fresh read, not merely fail loudly. Here `compute()` answers properly, so the
     # line has to carry the FRESH numbers — if the bad cache were used, the render guard would
     # print `unavailable` and this assertion fails.
-    no_cache.write_text(_json.dumps({"ts": int(_time.time()), "open_prs": 99, "merged_today": 99}))
+    # ⛔ THE NESTED SHAPES MATTER MOST, and a key-presence test does not catch them: a fresh cache
+    # carrying all five top-level keys but a broken tier passed a shallow check, then failed
+    # `p0["with_pr"]` in the RENDER — so the beat printed `unavailable` (nothing was read) for
+    # the rest of the TTL, because the bad cache was never replaced. Measured: 3 consecutive
+    # beats, `compute()` never called. Every case below must produce the FRESH line.
     fresh = {"ts": int(_time.time()), "open_prs": 2, "merged_today": 1,
              "p0": {"open": 1, "with_pr": 1, "without": 0},
              "p1": {"open": 0, "with_pr": 0, "without": 0}}
-    monkeypatch.setattr(bp, "compute", lambda: fresh)
-    assert bp.main() == 0
-    out = capsys.readouterr().out
-    assert "unavailable" not in out, out
-    assert "2 open PRs, 1 merged today" in out, out
+    unrenderable = [
+        {"ts": int(_time.time()), "open_prs": 99, "merged_today": 99},          # top level short
+        {"ts": int(_time.time()), "open_prs": 99, "merged_today": 99,
+         "p0": {"open": 1}, "p1": {"open": 1}},                        # tier keys missing
+        {"ts": int(_time.time()), "open_prs": 99, "merged_today": 99,
+         "p0": 5, "p1": 7},                                             # tiers not dicts
+        {"ts": int(_time.time()), "open_prs": "many", "merged_today": "many",
+         "p0": {"open": 1, "with_pr": 0, "without": 1},
+         "p1": {"open": 0, "with_pr": 0, "without": 0}},              # `%d` on a str
+    ]
+    for cached in unrenderable:
+        no_cache.write_text(_json.dumps(cached))
+        monkeypatch.setattr(bp, "compute", lambda: dict(fresh))
+        assert bp.main() == 0, cached
+        out = capsys.readouterr().out
+        assert "unavailable" not in out, (cached, out)
+        assert "2 open PRs, 1 merged today" in out, (cached, out)
+        assert _json.loads(no_cache.read_text())["open_prs"] == 2, (
+            "the bad cache must be REPLACED by the fresh read, or it poisons the next beat")
 
 
 # ── (c) REST `closed` also carries unmerged PRs -> excluded ──────────────────
@@ -401,9 +419,12 @@ def test_a_row_that_moves_across_a_page_boundary_refuses_the_window(monkeypatch)
         if page == 1:
             # Served BEFORE the bump: the natural order 1..100.
             return [rest_row(n, merged_at=MERGED_TODAY) for n in range(1, 101)]
-        # Served AFTER #150 bumped to the head: offset 100 now lands on 100 (already read),
-        # and #150 itself is at offset 0 — behind the cursor, never returned.
-        return [rest_row(n) for n in range(100, 200)]
+        # Served AFTER #150 bumped to the head, i.e. the order a REAL API would return:
+        # `150, 1..149, 151, 152, ...`. Offset 100 therefore lands on 100 — the last row page 1
+        # already returned — and #150 itself sits at offset 0, behind the cursor, so it is
+        # served by NO page. (The earlier fixture kept #150 at its old index as well, a page
+        # sequence no offset paging can produce.)
+        return [rest_row(n) for n in list(range(100, 150)) + list(range(151, 201))]
 
     monkeypatch.setattr(bp, "_rest_get_json", shifted)
     assert bp._rest_prs("open", limit=200) is None, (
@@ -411,9 +432,8 @@ def test_a_row_that_moves_across_a_page_boundary_refuses_the_window(monkeypatch)
         "window cannot be certified, so it must not be returned (keeping the window would "
         "hide the missing row)")
 
-    # The other direction: a shift that stays INSIDE one page produces no repeat and costs
-    # nothing, so the refusal is not a blanket one — a stable read of the same window is an
-    # ANSWER, and that is what the happy-path tests rely on.
+    # The other direction: a read that does not move at all is an ANSWER. The refusal is not a
+    # blanket one — every happy-path test in this file depends on that.
     def stable(url, tok, timeout=None):
         page = int(url.rsplit("page=", 1)[1])
         return [rest_row(n) for n in range((page - 1) * 100 + 1, page * 100 + 1)]

@@ -121,8 +121,10 @@ follows are the reusable ones:
   (measured with the shipped loop: #150 bumped after page 1 → `100` repeated, `150` never
   returned; end-to-end, one merge landing mid-read left `merged_today` at 0 where the truth was
   1). Keeping the window would hide the missing row, so a repeat — which can only arise from the
-  list changing mid-read — REFUSES the whole read (`None` → `unavailable`). A
-  shift that stays INSIDE one page produces no repeat and costs nothing.
+  list changing mid-read — REFUSES the whole read (`None` → `unavailable`). A reorder that leaves
+  the identity at every later offset unchanged — a same-second tie-break swap inside one page —
+  produces no repeat and costs nothing; anything whose effect crosses a request boundary either
+  repeats (an update) or is the removal case below.
   **The detector is one-way, and that is a stated residual:** a row that LEAVES the list mid-read
   (a PR reopened or deleted) shifts every later row UP, nothing repeats, and the row that should
   sit at each later offset is skipped — measured: 250 closed rows with #101 merged today, #5
