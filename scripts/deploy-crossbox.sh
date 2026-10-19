@@ -58,12 +58,44 @@ say "claims.sh present: $(wc -c < "$H/claims.sh" | tr -d ' ') bytes"
 mkdir -p "$O" || die "cannot create $O"
 cp -p "$H"/*.sh "$O"/ || die "seed failed"
 [ -f "$O/claims.sh" ] || die "claims.sh did NOT land in $O — the registry would be silently OFF"
+# ── the gh-limit layer (#1988) ────────────────────────────────────────────────
+# Seeded with the same mirror rule as the *.sh files, because a cell without it spends the SHARED
+# account's quota unserialised: four boxes, one bucket. Not fatal — a cell that cannot find the
+# layer still merges (the wrapper fails open with a warning); what is lost is the serialisation.
+# ⛔ STAGE-THEN-RENAME. Both files are EXECUTED by every gh call on the live cell, and a plain `cp`
+# truncates before it writes — a call in that window would run `python3` on half a file. The
+# supervisor seeds the same pair this way for the same reason.
+if [ -f "$H/gh-limit/gh" ] && [ -f "$H/gh-limit.py" ]; then
+  mkdir -p "$O/gh-limit" || die "cannot create $O/gh-limit"
+  _seed_one() {  # <src> <dest>
+    local _src="$1" _dst="$2" _tmp="$O/.seed-$(basename "$2").$$"
+    cp -p "$_src" "$_tmp" || { rm -f "$_tmp"; die "cannot stage $(basename "$_dst") into $O"; }
+    chmod +x "$_tmp"      || { rm -f "$_tmp"; die "cannot chmod $(basename "$_dst")"; }
+    mv -f "$_tmp" "$_dst" || { rm -f "$_tmp"; die "cannot install $_dst"; }
+  }
+  _seed_one "$H/gh-limit/gh" "$O/gh-limit/gh"
+  _seed_one "$H/gh-limit.py" "$O/gh-limit.py"
+  say "seeded the gh-limit layer (serialised gh; path=$O/gh-limit)"
+else
+  # ⛔ MIRROR, not merely overlay — the same rule the *.sh loop above states. A stale `$O/gh-limit/gh`
+  # left by an earlier harness stays on the controller PATH (orch-loop.sh re-asserts it on `[ -d ]`)
+  # with its helper gone: a shim that cannot serialise anything, and before #1988's sentinel line the
+  # pair could even resolve into itself. A cell without the layer falls back to PATH's real gh with a
+  # warning, which is the documented fail-open.
+  if [ -e "$O/gh-limit/gh" ] || [ -e "$O/gh-limit.py" ]; then
+    rm -f "$O/gh-limit/gh" "$O/gh-limit.py" || die "cannot remove the stale gh-limit layer from $O"
+    rmdir "$O/gh-limit" 2>/dev/null || true
+    say "seed: removed the stale gh-limit layer — the harness no longer ships it"
+  fi
+  say "WARN: this harness ships no gh-limit layer — gh calls on this cell will NOT be serialised (#1988)"
+fi
 say "seeded $O with $(ls "$O"/*.sh | wc -l | tr -d ' ') scripts (claims.sh present)"
 
 # ── 4. restart the controller, cold, with HOME carried into tmux ──────────────
 say "starting controller: OR=$OR REPO=$REPO SCOPE=$SCOPE MAX_LANES=$MAX_LANES"
 tmux new-session -d -s orch -c "$H" \
   "set -a; [ ! -f '$CELL_HOME/keys.env' ] || . '$CELL_HOME/keys.env'; set +a; \
+   PATH='$O/gh-limit':\"\$PATH\" \
    HOME='$CELL_HOME' REPO='$REPO' O='$O' OR='$OR' SCOPE='$SCOPE' MAX_LANES='$MAX_LANES' \
    bash '$H/orch-loop.sh' 2>&1 | tee -a '$O/logs/controller.log'"
 sleep 8

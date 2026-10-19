@@ -61,9 +61,50 @@ CLAIM = os.path.join(STATE, "claim.py")
 # Same defect class as beta-progress.py/merge-queue.py: `gh` on PATH resolves to the
 # agent gh-shim, which refuses when it cannot find the real binary. Read-only queries
 # do not need the shim (it guards admin landing), so resolve the binary directly.
+# ⛔ BUT PREFER THE HARNESS'S OWN gh LAYER (#1988) WHEN ONE IS DEPLOYED. It is derived from `$O` —
+# never from PATH. ⛔ THE LAYER then resolves the real gh by WALKING PATH, so "#1872 cannot come back"
+# would be false (in a minimal environment the first `gh` on PATH can be a shim that refuses at
+# runtime, rc=126, with `os.access` still passing). The pin is therefore passed THROUGH the layer
+# below (`GH_REST_REAL_GH`/`GH_LIMIT_REAL_GH`): the binary #1872 chose, plus the layer.
+# ⛔ NO ABSOLUTE HOME PATH: `~/bin/gh` is the binary #1872 pinned, and expanduser builds the same
+# path without hard-coding another user's home in shipped code.
+_GH_CANDIDATES = (os.path.expanduser("~/bin/gh"), "/opt/homebrew/bin/gh", "/usr/local/bin/gh")
+
+
+def _gh_bin():
+    o = os.environ.get("O", "")
+    if o:
+        # ⛔ ORDER: `gh-rest` FIRST, matching every shell call site (`orch-loop.sh`: "adapter last so
+        # `$O/gh-rest` wins where it exists"). The adapter is what serves a GraphQL refusal over REST
+        # (#1959); preferring the non-translating wrapper here made these readers fail exactly as they
+        # did before that fix while the same box's shell calls took the other transport.
+        for c in (os.path.join(o, "gh-rest", "gh"), os.path.join(o, "gh-limit", "gh")):
+            if os.path.isfile(c) and os.access(c, os.X_OK):
+                return c
+    # `isfile` + X_OK, never `exists`: a DIRECTORY at a candidate path would be selected and then
+    # raise from `subprocess.run` (or, worse, answer as "gh not found" — the same trap the fail-open
+    # walks had; found in review round 7).
+    return next((p for p in _GH_CANDIDATES
+                 if os.path.isfile(p) and os.access(p, os.X_OK)), "gh")
+
+
+GH = _gh_bin()
+# Hand the layer the binary #1872 pinned (empty when we are not going through a layer).
+_PIN = next((p for p in _GH_CANDIDATES
+             if os.path.isfile(p) and os.access(p, os.X_OK)), None)   # a DIRECTORY is not a pin
+GH_LAYER_ENV = ({"GH_REST_REAL_GH": _PIN, "GH_LIMIT_REAL_GH": _PIN}
+                if _PIN and GH.endswith(("/gh-rest/gh", "/gh-limit/gh")) else {})
+
+
+# ⛔ THE LAYER MUST NOT SLEEP INSIDE THIS PROCESS (#1988). It may run inside a heartbeat pass or
+# DETACHED (`nohup … &`, bounded by its own lock), but its gh reads are bounded at 60 s while the
+# layer's first documented backoff is 60 s: an in-call wait alone consumes the whole budget, and the
+# caller is killed before the layer can say why — a rate-limited box then reports UNKNOWN/STALL
+# instead of the RATE-LIMITED verdict it can prove. NO_WAIT makes the layer record the limit and
+# return at once, so this process's own deferral takes over. Inherited by every DESCENDANT of this
+# process (including the `claim` calls below) — all parts of the same bounded dispatch step.
+os.environ.setdefault("GH_LIMIT_NO_WAIT", "1")
 REPO = "daniel-ospina/tortoise"
-GH = next((p for p in ("/Users/danielospina/bin/gh", "/opt/homebrew/bin/gh",
-                       "/usr/local/bin/gh") if os.path.exists(p)), "gh")
 
 
 def pr_still_open(item: str):
@@ -94,7 +135,8 @@ def pr_still_open(item: str):
     try:
         r = subprocess.run([GH, "pr", "view", pr, "--repo", REPO, "--json", "state",
                             "--jq", ".state"],
-                           capture_output=True, text=True, errors="replace", timeout=60)
+                           capture_output=True, text=True, errors="replace", timeout=60,
+                           env={**os.environ, **GH_LAYER_ENV} if GH_LAYER_ENV else None)
     except Exception:
         return None
     if r.returncode != 0 or not r.stdout.strip():
@@ -105,6 +147,12 @@ def pr_still_open(item: str):
 # HANG is the owner's park lane; the DMeer lanes are the owner's own work.
 PROTECTED = ("HANG", "DMeer", "DMer", "π - DMeer", "DMeer -")
 
+# ⛔ THE PRIORITY RECORD IS ONLY TRUSTWORTHY WHILE FRESH: two dispatch intervals of the job that
+# writes it (`com.tortoise.pr-doctor`, StartInterval 1200s), after which the measurement is a
+# past state and must not gate anything.
+PR_FIRST_MAX_AGE_S = 2400
+# `STATE` here is the QUEUES dir; the dispatcher's verdict lives one level up.
+PR_DOCTOR_STATE = os.path.join(HOME, ".pi", "agent", "state")
 COOLDOWN_S = 15 * 60
 
 # Hard wall-clock bound (seconds) for the ONE fleet read per pass. lane-status.py has no
@@ -779,6 +827,63 @@ def _env_scan_timeout() -> float:
     return v
 
 
+def pr_first_gate(state_dir=None, now_s=None):
+    """The owner's dispatch priority: NEW ISSUE WORK IS SKIPPED WHILE UN-OWNED PRs EXIST.
+
+    ⛔ WHY THIS EXISTS, AND WHY HERE (owner, 2026-10-18): "un-owned PRs first — a PR is owned only
+    if a LIVE process has it — and only then pick issues for new work." This tool is the fleet's
+    ISSUE dispatcher, so this is the only place the second half of that rule can be enforced.
+    `scripts/pr-doctor.py` measures it (a cwd/process probe, never a claim) and publishes
+    `issue_work` in `$STATE/pr-doctor.status.json`; before this gate, `pr-doctor` printed the
+    decision into its own log and NOTHING read it — a decision nobody took.
+
+    Returns "" (new issue work may proceed) or the reason to skip, ready to print.
+
+    ⛔ EVERY UNCERTAIN CASE PROCEEDS, AND SAYS SO. A missing, stale, unreadable or failed record
+    means the priority was NOT measured — and blocking all issue dispatch on a dead measurement is
+    how one broken component starves the rest of the fleet (`$STATE/PR-DOCTOR-OFF`, a broken
+    sidecar, a pr-doctor that cannot read GitHub). The gate behaves exactly like every other
+    recorder in this file: it refuses only on a POSITIVE reading, and names the evidence.
+    """
+    p = os.path.join(state_dir or PR_DOCTOR_STATE, "pr-doctor.status.json")
+    try:
+        with open(p) as fh:
+            d = json.load(fh)
+        at = float(d.get("at_epoch") or 0)
+        rc = int(d.get("rc"))
+        work = str(d.get("issue_work") or "")
+        reason = str(d.get("reason") or "")[:110]
+    except FileNotFoundError:
+        print("  (priority gate not applied: pr-doctor has recorded no pass yet)")
+        return ""
+    except Exception as e:
+        print(f"  (priority gate not applied: the pr-doctor record is unreadable: {type(e).__name__})")
+        return ""
+    age = max(0, int((now_s if now_s is not None else time.time()) - at))
+    if age > PR_FIRST_MAX_AGE_S:
+        print(f"  (priority gate not applied: the pr-doctor record is STALE, {age // 60}m old)")
+        return ""
+    # ⛔ `rc != 0` IS NOT "NOTHING WAS MEASURED" (2026-10-18, review). The pass publishes `issue_work`
+    # on rc=2 (it classified the PRs and refused only the DISPATCH) and on rc=3 ("I read it, I placed
+    # the work, and NO LANE WOULD TAKE IT") -- so keying the gate on rc inverted the owner's rule
+    # exactly when the fleet was blind on some checks or every lane refused an order, and the live
+    # record on this box was `RED rc=3 … no lane accepted`, which the gate ignored. The reading is
+    # the FIELD: a record without `issue_work` came from a path that never measured ownership (the
+    # open-PR read failed, the queue was empty, checks were unreadable, no roster), and that is the
+    # only case with nothing to act on.
+    if work not in ("SKIPPED", "ELIGIBLE"):
+        print(f"  (priority gate not applied: the last pr-doctor pass measured no ownership "
+              f"verdict, rc={rc}: {reason})")
+        return ""
+    if rc != 0:
+        # Measured, but the pass still refused: say it, because a SKIPPED decision taken under a
+        # refusal is worth knowing about (the PR side is not healthy either).
+        print(f"  (the pr-doctor pass that measured this also refused, rc={rc})")
+    if work != "SKIPPED":
+        return ""
+    return f"issues: SKIPPED (un-owned PRs exist) — pr-doctor {age // 60}m ago: {reason}"
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--apply", action="store_true", help="actually send (default: dry run)")
@@ -916,6 +1021,14 @@ def main():
         return
 
     print()
+    # ⛔ THE OWNER'S PRIORITY, ENFORCED (2026-10-18). New issue work waits while un-owned PRs exist.
+    # ⚠️ AND ONLY NEW ISSUE WORK DOES (review). `send_continue` lives INSIDE the loop below, so an
+    # early return here stopped CONTINUE nudges to lanes that had stopped mid-work -- work already
+    # claimed and in flight, the opposite of "new work". The gate now short-circuits the
+    # claim/dispatch half only; the last-turn handling always runs.
+    _gate = pr_first_gate()
+    if _gate:
+        print(f"  {_gate}")
     acted = 0
     for r in idle:
         lane = r.get("lane", "")
@@ -949,6 +1062,11 @@ def main():
             print(f"  SKIP {lane}: it asked the owner — the answer queue owns it")
             continue
         # finished_the_work -> fall through to the claim
+        # ⛔ NEW WORK ONLY FROM HERE (the owner's priority, enforced). A CONTINUE above is work this
+        # lane has already claimed; a claim below would OPEN new work.
+        if _gate:
+            print(f"  SKIP {lane}: new issue work is SKIPPED while un-owned PRs exist")
+            continue
 
         qfile = CLASS_QUEUE.get(cls, ("?",))[0]
         try:
@@ -1122,7 +1240,19 @@ def main():
             print(f"  FAILED {lane} <- {item}  rc={rc} {out.strip()[:70]} (claim released)")
 
     print()
-    print(f"{'(dry run) ' if not args.apply else ''}dispatched {acted}")
+    # ⛔ `dispatched 0` WITH NO DENOMINATOR AND NO REASON READS AS A HEALTHY EMPTY FLEET (2026-10-18,
+    # the same defect pr-doctor.py's `_finish` removes). The pass now says 0 OF WHAT and WHY, so an
+    # idle dispatch cannot be confused with a saturated fleet, a skipped gate or a blind read.
+    _why = []
+    if _gate:
+        _why.append("un-owned PRs exist, so new issue work is SKIPPED")
+    if _deferred:
+        _why.append("%d lane(s) deferred by --max-lanes" % len(_deferred))
+    if not args.apply:
+        _why.append("dry run")
+    print(f"{'(dry run) ' if not args.apply else ''}dispatched {acted} of {len(idle)} queued"
+          + (f" — {'; '.join(_why)}" if _why else
+             ("" if acted else " — no lane took an item (see the per-lane lines above)")))
 
 
 if __name__ == "__main__":

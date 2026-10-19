@@ -1,11 +1,21 @@
 #!/usr/bin/env bash
 # install.sh — render + install the launchd agent for the orchestrator harness.
 #
-# Deliberately does NOT start the loop. It writes the plist and prints the load command.
+# Deliberately does NOT start the loop unless asked. It writes the plist and prints the start command.
 # Starting an autonomous merge loop is an explicit act, not a side effect of installing.
 #
-#   ./install.sh                 # render + install (idempotent)
-#   ./install.sh --uninstall     # unload + remove the plist (leaves state/logs alone)
+#   ./install.sh                 # render + install (idempotent; NEVER touches a running job)
+#   ./install.sh --start         # render + install, then ensure it is running — and PROVE it
+#   ./install.sh --restart       # render + install, then bootout + bootstrap — and PROVE it
+#   ./install.sh --uninstall     # bootout + remove the plist AND the loaded-render record (logs and the
+#                                # rest of state untouched)
+#
+# ⛔ THE LAUNCHCTL DISCIPLINE (agent-infra#1975). Every load/removal goes through launchd-cycle.sh,
+# which uses `bootout` + `enable` + `bootstrap` and NEVER `unload -w`/`load -w`: `-w` writes a
+# PERSISTENT Disabled override, so the old unload-then-load pair was a disable whose re-enable needed a
+# bootstrap that is allowed to fail. It failed on 2026-10-17 (EIO) and left the production controller
+# removed AND disabled while this installer exited 0. `bootout` writes no override, so the worst case
+# is "not loaded" — repaired by the next start — never "disabled".
 #
 # Config comes from the environment; defaults are the values this harness was built with
 # (see README §4). Nothing is written outside ~/Library/LaunchAgents and $O.
@@ -14,7 +24,11 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 O="${O:-$HOME/orchestrator}"
-REPO="${REPO:-/Users/danielospina/Documents/GitHub/tortoise}"
+# ⛔ NO PATH DEFAULT (same rule as orch-loop.sh's own REPO). A default naming ONE developer's home
+# is a fleet-wide outage on every other machine: the rendered plist then points at a path that does
+# not exist there, and the daemon crash-loops under KeepAlive on a FATAL it can never satisfy.
+# Required, validated by the `git rev-parse` below, and named in the refusal.
+REPO="${REPO:-}"
 OR="${OR:-daniel-ospina/tortoise}"
 
 # sanity ceiling only; the swap/RAM gates below are the real constraint.
@@ -51,7 +65,30 @@ MAX_LOAD="${MAX_LOAD:-$(( 10#$_NCPU * 10 ))}"
 # that `[ -ge ]` never binds); only a true default does. `is_limit` must NOT reject `0` — it also
 # validates plist limits where 0 is legal (see the `0) : ;;` arm below).
 is_limit "${MAX_LOAD:-}" || MAX_LOAD=$(( 10#$_NCPU * 10 )); is_limit "${MAX_LOAD:-}" || MAX_LOAD=40
-MAX_LANES="${MAX_LANES:-4}"
+# ⛔ CAPACITY GATES DISPATCH, NOT A LANE COUNT (owner ruling, 2026-10-17): "dispatch should be gated
+# on capacity, not on number of lanes. max lanes 8 is too low. that needs to be configured to 2.5x
+# the number of CPUs". Both numbers in play here were LANE COUNTS, neither derived from cores: the
+# shipped default was a FLAT 4, and the box where this was measured had its plist pinned at 8 —
+# `[cap] load=79/100 lanes=9/8 … [dispatch] skipped (lanes=9>=max_lanes=8)` — 21 points of load
+# headroom and comfortable swap/memory, so the NEXT dispatch was refused for a lane count while
+# capacity was available. A 4-core box got the same 4 that the HARDWARE should have decided.
+# Same rule as MAX_LOAD above, same `_NCPU` probe, same guards (see the block above).
+# A box only picks the derived default up on a fresh render: the live plist PINS the number.
+# Integer division, so it FLOORS: 10 cores -> 25, 4 -> 10, 3 -> 7. An EXPLICIT MAX_LANES (env /
+# plist / keys.env) still WINS and is never recomputed HERE — refusing or replacing an operator's pin
+# is the loop's decision, not the renderer's. The pin reaches the controller through $ENV_FILE, and
+# cloud-cell-supervisor.sh:1198 records why it has to: the tmux SERVER supplies a new session's
+# environment, so an exported ceiling is silently dropped and would revert to its default.
+MAX_LANES="${MAX_LANES:-$(( 10#$_NCPU * 5 / 2 ))}"
+# ⛔ BOUND THE DERIVATION, NOT A PINNED VALUE — and only the derivation CAN be out of range here:
+# `_NCPU` is `is_limit`-bounded to nine digits, and `* 5 / 2` carries that to TEN (999999999 ->
+# 2499999997), which the range check below would then refuse while blaming MAX_LANES for a probe
+# that is not its fault. `MAX_LOAD` above is bounded for the identical reason. An explicit value is
+# never silently replaced: a non-number, a leading zero or a value over nine digits still reaches
+# the range loop below and is REFUSED there, because a value this installer accepts must be the
+# value the loop uses. The one explicit value this CAN touch is one identical to the derivation —
+# the same absurd probe-derived number — so bounding that is the repair, not a substitution.
+if [ "$MAX_LANES" = "$(( 10#$_NCPU * 5 / 2 ))" ]; then is_limit "$MAX_LANES" || MAX_LANES=10; fi
 MAX_REVIEW="${MAX_REVIEW:-4}"
 MERGE_PRIORITY_AT="${MERGE_PRIORITY_AT:-25}"
 MAX_FIX="${MAX_FIX:-3}"
@@ -61,8 +98,8 @@ MIN_MEM_FREE_MB="${MIN_MEM_FREE_MB:-512}"
 BATCH="${BATCH:-2}"
 CYC="${CYC:-240}"
 # Drain scope (README §5): auto (count rule) | own (pin own-only) | broad (pin broad).
-# A fleet runs exactly ONE broad box; the rest pin own. Validated below, AFTER the --uninstall
-# branch (uninstall does not render, and must never be blocked by a config typo).
+# A fleet runs exactly ONE broad box; the rest pin own. Validated below, AFTER the action parse
+# (uninstall does not render, and must never be blocked by a config typo).
 # ⛔ Presence, not emptiness: `${SCOPE:-auto}` would coerce a set-but-BLANK value to auto and
 # silently evaporate the pin — the exact failure the whole SCOPE override exists to prevent.
 [ -z "${SCOPE+x}" ] && SCOPE=auto
@@ -70,17 +107,101 @@ CYC="${CYC:-240}"
 LABEL="com.eldato.orchestrator-loop"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 TEMPLATE="$HERE/launchd.plist.template"
+# Seconds to wait for the label to show a pid AND for $O/heartbeat to advance after a start. The loop
+# writes the heartbeat at the TOP of every cycle, so a live controller refreshes it within seconds of
+# being launched; 30s is slack for a cold start, not a cycle's worth of work.
+START_TIMEOUT="${START_TIMEOUT:-30}"
+# How old $O/heartbeat may be before a LOADED job counts as "running but not cycling" (the one state
+# `--start` refuses to fix silently; un-wedging it is `--restart`). Derived from CYC, not a constant: a
+# healthy controller's heartbeat age is bounded by one cycle plus that cycle's work, so a fixed 900s
+# fails a perfectly healthy cell run at CYC=900 and points the operator at the disruptive restart.
+# LC_HB_STALE overrides it for a cell whose cycles are unusually long.
+# ELDATO_ALLOW_TEST_HOME=1 is the test-only opt-in to the #446 temp-HOME guard in launchd-cycle.sh —
+# without it, a run whose $HOME is not the real home refuses to touch launchd at all.
 
 die() { echo "❌ $*" >&2; exit 1; }
 ok()  { echo "  ✓ $*"; }
 warn(){ echo "  ⚠️  $*"; }
 
+# ── the launchd lifecycle seam ───────────────────────────────────────────────────
+# ⛔ ONE implementation for THIS job's lifecycle, sourced — never a second copy of the
+# bootout/enable/bootstrap dance in this file. (scripts/install-launchd.sh is a separate seam for the
+# template family; it shares the sequence but not the bootstrap-failure policy — see the header of
+# launchd-cycle.sh.) FAIL CLOSED if the library is missing: an installer that cannot reach the safe path
+# must refuse, not silently fall back to the legacy verbs whose `-w` is the defect (#1975).
+LC_LIB="$HERE/launchd-cycle.sh"
+[ -f "$LC_LIB" ] || die "missing $LC_LIB — refusing to install without the launchd lifecycle helper (install.sh must run from the checkout, not from a partial copy)"
+# shellcheck source=launchd-cycle.sh
+. "$LC_LIB"
+
+# ── action ───────────────────────────────────────────────────────────────────────
+# Parsed BEFORE anything renders: `--uninstall` must work on a broken config (it removes the job), and
+# an unknown flag must be REFUSED rather than silently ignored — a typo'd `--strt` would otherwise
+# install and exit 0 with the controller still down, which is the exact false PASS this fixes.
+ACTION=none
+case "${1:-}" in
+  "")        ;;
+  --start)   ACTION=start ;;
+  --restart) ACTION=restart ;;
+  --uninstall) ACTION=uninstall ;;
+  *) die "unknown argument '$1' (accepted: --start, --restart, --uninstall, or no argument)" ;;
+esac
+
 # ── uninstall ────────────────────────────────────────────────────────────────────
-if [ "${1:-}" = "--uninstall" ]; then
-  launchctl unload -w "$PLIST" 2>/dev/null || true
+if [ "$ACTION" = uninstall ]; then
+  # NO `unload -w`: `bootout` removes the job and writes NO persistent Disabled override, so a later
+  # re-install is a plain start rather than a start that has to fight a sticky disable first. A
+  # deliberate removal still leaves the job NOT RUNNING — which is the point — and the next
+  # `install.sh --start` prints an explicit refusal if anything else holds the controller lock.
+  #
+  # ⛔ AND IT IS VERIFIED. `launchctl bootout` reporting success is not proof the job is gone (this box
+  # has produced `Bootstrap failed: 5: Input/output error` in the same domain), and printing "✅ Removed"
+  # over a job that is still loaded with RunAtLoad/KeepAlive hands a human a laptop with the fleet still
+  # dispatching — README §6 step 2's `pkill` is undone by launchd a second later. So: remove, then READ
+  # the domain until the label is no longer LOADED, and fail loudly if it still is.
+  lc_bootout "$LABEL" "$PLIST" || exit 1
+  # ⛔ "IS IT STILL LOADED" — not "does it have a pid". A KeepAlive job that has just exited sits LOADED
+  # with no pid for up to its respawn throttle (`minimum runtime`, 10s by default), so a pid-only read
+  # declared a job removed that launchd still holds and will relaunch (review finding). `lc_probe` is
+  # the read that answers the question, and the pid is kept only for the diagnostic.
+  # ⛔ AND "UNREADABLE" IS NOT "REMOVED": `lc_probe`'s 2 is a FAILED read, which says nothing about the
+  # job. Folding it into "not loaded" made this loop break on the first iteration and delete the plist
+  # over a live controller (review finding).
+  # ⛔ AND THE VERDICT COMES FROM THE PROBE ITSELF (review finding): `prc=0` IS the proof that launchd
+  # still holds the label. Deriving the verdict from a SECOND `path =` read re-introduced the
+  # same flattening one layer down — a read that failed, or a block with no parsable `path =` line,
+  # returned empty and the plist was deleted with ✅ printed over a job launchd still had.
+  held=""; pid=""; unread=""; unread_diag=""; prc=0
+  for _ in 1 2 3 4 5 6 7 8; do
+    # ⛔ THE VERDICT IS THE *LAST* OBSERVATION, NOT THE FIRST (review finding): `held` was sticky, so one
+    # loaded read during the settle window decided the answer and the loop's whole point — wait for the
+    # lag between `bootout` and launchd forgetting the label — could never flip it. A job that IS gone
+    # then produced a false "STILL loaded" refusal on the operator's documented handoff command.
+    prc=0; block=""; held=""; pid=""
+    block="$(lc_probe "$LABEL")" || prc=$?
+    # ⛔ A BOOLEAN FLAG, NOT THE DATUM (review finding): an UNKNOWN read whose output is EMPTY stored ""
+    # in the flag, the `[ -n "$unread" ]` test below was then false, and the script fell straight through
+    # to `rm -f` + "✅ Removed" over a job launchd still held — the same empty-is-falsy trap one layer
+    # over from `lc_assert_stable`'s second read. `lc_probe` returns 2 with no output whenever
+    # `launchctl print` exits non-zero silently, which is exactly what a killed or re-exec'ing launchd does.
+    if [ "$prc" -eq 2 ]; then unread=1; unread_diag="$block"; break; fi
+    [ "$prc" -eq 0 ] || break          # definitively not loaded: the removal holds
+    held=1
+    pid="$(awk '/^[[:space:]]*pid = [0-9]+$/ { print $3; exit }' <<<"$block")"
+    sleep 1
+  done
+  if [ -n "$unread" ]; then
+    die "launchd's state for $LABEL could not be read after 'launchctl bootout' (${unread_diag:-no output}) — the removal cannot be VERIFIED, so the plist is kept at $PLIST. Next: launchctl print $(lc_domain)/$LABEL | head -20, then re-run this --uninstall"
+  fi
+  if [ -n "$held" ]; then
+    # The plist is KEPT: it is the only handle a verified removal has (and the only thing a human can
+    # inspect), so destroying it here would leave the job loaded with nothing to retry against.
+    die "$LABEL is STILL loaded${pid:+ (pid $pid)} after 'launchctl bootout' — NOT removed, and the plist is kept at $PLIST. Next: launchctl print $(lc_domain)/$LABEL | head -20"
+  fi
   rm -f "$PLIST"
-  echo "✅ Removed $LABEL."
-  echo "   State and logs left intact: $O/{logs,state,wip}"
+  rm -f "$O/state/launchd-loaded.sha256"
+  echo "✅ Removed $LABEL (bootout; no persistent disable written)."
+  echo "   State and logs left intact apart from the loaded-render record: $O/{logs,state,wip}"
   exit 0
 fi
 
@@ -101,12 +222,22 @@ case "$O" in
 esac
 
 # ── platform ─────────────────────────────────────────────────────────────────────
+# ⛔ THE GATE IS REAL (launchd + tmux only exist here) BUT IT IS TEST-ONLY BYPASSABLE. `--uninstall` and
+# `--start` are the incident's own path (#1975), and the only automated gate runs on Linux — without a
+# declared hatch those assertions simply cannot run in CI. Same pattern and same opt-in discipline as
+# the temp-$HOME guard (#446): a test that needs it says so, and a normal run on a Mac never sets it.
 echo "==> preflight"
-[ "$(uname)" = "Darwin" ] || die "this harness uses launchd + tmux; only macOS is supported"
+if [ "$(uname)" != "Darwin" ] && [ "${ELDATO_ALLOW_NON_DARWIN:-}" != "1" ]; then
+  die "this harness uses launchd + tmux; only macOS is supported"
+fi
 [ -f "$TEMPLATE" ] || die "missing template: $TEMPLATE"
 
 # ── dependencies ─────────────────────────────────────────────────────────────────
-for bin in tmux gh pi; do
+# ⛔ jq JOINS THE HARD DEPENDENCIES (agent-infra#1962). The listings now run on the REST bucket and
+# assemble pages with jq; without it `rest_list` REFUSES rather than answer from a partial read, so
+# every refresh would report UNREADABLE and the backlog would never build — a missing jq is a broken
+# install, not a warning.
+for bin in tmux gh pi jq; do
   command -v "$bin" >/dev/null 2>&1 && ok "$bin" || die "$bin not on PATH"
 done
 command -v uv >/dev/null 2>&1 && ok "uv" || warn "uv not found — lane.sh needs it to sync each worktree"
@@ -160,7 +291,7 @@ DAEMON_PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 if [ -x "$HOME/.local/share/pi-node/current/bin/pi" ]; then
   command -v pi >/dev/null 2>&1 && add_dir "$HOME/.local/share/pi-node/current/bin"
 fi
-for bin in tmux gh uv pi; do
+for bin in tmux gh uv pi jq; do
   # ⛔ Resolve the BINARY, not a shell function/alias. `command -v` reports an exported function
   # REGARDLESS of PATH (and a BARE name for it), so with a `gh`/`pi` function in the environment the
   # real binary's directory would never be found AND the name would be unusable. `type -P` searches
@@ -174,7 +305,7 @@ done
 # Resolve PAST a wrapper: add the first PATH entry holding a real executable of that name outside a
 # shim/.pi directory, so the shim can find it. Tested on the PHYSICAL path like add_dir(), so a
 # symlink TO a shim directory is recognised as a shim too.
-for bin in gh pi uv tmux; do
+for bin in gh pi uv tmux jq; do
   p="$(type -P "$bin" 2>/dev/null)" || continue
   case "$p" in /*) ;; *) continue ;; esac
   _pd="$(cd "$(dirname "$p")" 2>/dev/null && pwd -P)" || continue
@@ -204,7 +335,7 @@ ok "daemon PATH: $DAEMON_PATH"
 # the exclusion patterns (cmux's `cmux-cli-shims` is a real one) is caught here because its tool
 # exits 127. uv is optional (warned above): its failure WARNS, and is never fatal. Still BLIND to
 # trap (3) — TCC refuses the read only when LAUNCHD does it, not when an interactive shell does.
-for bin in tmux uv pi gh; do
+for bin in tmux uv pi gh jq; do
   command -v "$bin" >/dev/null 2>&1 || continue     # not present in this shell at all
   # ⛔ `|| true`: install.sh runs under `set -euo pipefail`, and `type -P` returns non-zero for a
   # tool that is not on $DAEMON_PATH. Unguarded, that bare assignment aborts the script AT THIS
@@ -267,6 +398,7 @@ fi
   || warn "~/.pi/agent/scripts/record-review.sh missing — record step will fail (shipped by agent-infra)"
 
 # ── target repo ──────────────────────────────────────────────────────────────────
+[ -n "$REPO" ] || die "REPO is not set — export REPO=<the target repo's checkout> (README §4 step 2). This installer does not guess one: a default is how every box but the author's pointed at a path that does not exist."
 git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1 || die "not a git checkout: $REPO"
 git -C "$REPO" check-ignore -q .worktrees/ \
   && ok "$REPO/.worktrees is gitignored" \
@@ -303,6 +435,17 @@ for f in "$HERE"/*.sh; do
 done
 # the gh REST adapter is a bin shim, not a *.sh — check it explicitly (#1959)
 [ -f "$HERE/gh-rest/gh" ] && { bash -n "$HERE/gh-rest/gh" || die "syntax error in gh-rest/gh"; }
+# the limit layer too (#1988): a python file is not covered by the `*.sh` sweep either
+[ -f "$HERE/gh-limit.py" ] && {
+  # ⛔ NAME THE INTERPRETER. The helper is EXECUTED by every gh call (`exec python3`), so without
+  # python3 the layer would 127 every call — dying is right. But `2>/dev/null` also swallows the
+  # shell's own "command not found", so a missing python3 was reported as "gh-limit.py does not
+  # parse", sending the operator to edit a file that was fine.
+  command -v python3 >/dev/null 2>&1 \
+    || die "python3 is not on PATH — the gh limit layer (gh-limit.py) cannot run without it"
+  python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' "$HERE/gh-limit.py" 2>/dev/null \
+    || die "gh-limit.py does not parse"
+}
 ok "all shipped scripts parse"
 
 # ── state dir ────────────────────────────────────────────────────────────────────
@@ -321,8 +464,35 @@ if [ -f "$HERE/gh-rest/gh" ]; then
   if [ -f "$O/gh-rest/gh" ] && ! diff -q "$HERE/gh-rest/gh" "$O/gh-rest/gh" >/dev/null 2>&1; then
     warn "replacing a DIFFERENT $O/gh-rest/gh — the installed adapter was stale"
   fi
-  cp "$HERE/gh-rest/gh" "$O/gh-rest/gh" || die "cannot install $O/gh-rest/gh"
-  chmod +x "$O/gh-rest/gh"               || die "cannot chmod $O/gh-rest/gh"
+  # ⛔ STAGE-THEN-RENAME — the adapter is the ENTRY POINT every gh call on a live daemon resolves, so
+  # a plain `cp` (which truncates before it writes) has a window in which a call reads a partially
+  # written shim. Worse than a syntax error: a truncation at a statement boundary leaves a VALID script
+  # that prints nothing and exits 0 — `pr view --json` answering "" with rc 0, which every caller reads
+  # as "no data". `mv` is atomic within the one filesystem (same rule as the helper below).
+  _ctmp="$O/.seed-gh-rest.$$"
+  cp "$HERE/gh-rest/gh" "$_ctmp" || { rm -f "$_ctmp"; die "cannot stage gh-rest/gh into $O"; }
+  chmod +x "$_ctmp"                || { rm -f "$_ctmp"; die "cannot chmod gh-rest/gh"; }
+  mv -f "$_ctmp" "$O/gh-rest/gh"   || { rm -f "$_ctmp"; die "cannot install $O/gh-rest/gh"; }
+  # ── the limit layer (#1988) ─────────────────────────────────────────────────
+  # The adapter routes EVERY gh call it makes through `../gh-limit.py` — serialisation, the
+  # documented backoff, bucket naming and conditional REST. It is installed BESIDE the adapter
+  # (`$O/gh-limit.py`, which is what `$O/gh-rest/gh`'s `$SELF_DIR/../gh-limit.py` resolves to), so a
+  # box that gets the adapter gets the layer with it and a stale pair is impossible.
+  # ⛔ A MISSING HELPER IS NOT A FATAL: `gh-rest/gh` falls back to running the real gh with a loud
+  # warning. Failing the install here would turn a missing optimisation into a box that cannot
+  # merge at all.
+  if [ -f "$HERE/gh-limit.py" ]; then
+    # ⛔ STAGE-THEN-RENAME, like the cell supervisor's seeding. A plain `cp` truncates the target
+    # before writing it, and this file is EXECUTED by every gh call on a live daemon — a call that
+    # landed in the window would run `python3` on half a file (SyntaxError) and fail. `mv` is
+    # atomic within the one filesystem, so a reader sees the old file or the new one, never neither.
+    _tmp="$O/.seed-gh-limit.py.$$"
+    cp "$HERE/gh-limit.py" "$_tmp" || { rm -f "$_tmp"; die "cannot stage gh-limit.py into $O"; }
+    chmod +x "$_tmp"                || { rm -f "$_tmp"; die "cannot chmod gh-limit.py"; }
+    mv -f "$_tmp" "$O/gh-limit.py"   || { rm -f "$_tmp"; die "cannot install $O/gh-limit.py"; }
+  else
+    warn "gh-limit.py missing from the shipped set — gh calls will NOT be serialised or backed off (#1988)"
+  fi
   # ⛔ Route the PATH entry through add_dir, NOT a bare assignment: add_dir applies the TCC guard
   # (a physical path under ~/Documents is EPERM for launchd) that no install-time probe can see.
   add_dir "$O/gh-rest"
@@ -397,8 +567,8 @@ done
 # uses. 5s, not 240, so a deliberately small cycle is not silently replaced.
 [ "$CYC" -ge 5 ] || die "CYC=$CYC is below the 5s floor — a zero (or near-zero) cycle re-hits the GitHub API with no delay"
 # Each value is substituted by its OWN sed rule and the rules run IN ORDER, so a value carrying a
-# LATER token is rewritten by that later rule: `OR=__MAX_LANES__` rendered as `4` — exit 0, plutil OK,
-# and the daemon then ran `gh --repo 4`. Refusing it at the input also means the post-render assertion
+# LATER token is rewritten by that later rule: `OR=__MAX_LANES__` rendered as the default (then a
+# literal `4`; 2.5x cores now) — exit 0, plutil OK, and the daemon then ran `gh --repo 4`. Refusing it at the input also means the post-render assertion
 # below can only fire on a genuinely unrendered TEMPLATE token, never on a value that merely looks
 # like one (a legal `O=/tmp/__DATA__host` used to be refused with a diagnostic naming the wrong cause).
 for _v in "$O" "$REPO" "$OR" "$SCOPE" "$HOME" "$DAEMON_PATH"; do
@@ -443,9 +613,32 @@ if grep -q '__[A-Z_]*__' "$RENDER"; then
   _toks="$(grep -o '__[A-Z_]*__' "$RENDER" | sort -u | tr '\n' ' ')— a template token has no substitution rule"
   rm -f "$RENDER"; die "rendered plist still contains ${_toks}"
 fi
+# ⛔ IS THE LOADED JOB ON THIS RENDER? Recorded BEFORE the mv, because that is the only moment the file
+# content exists — and it is what makes this installer safe on a live box (agent-infra#1975 item 3): a
+# validation run that renders the same bytes must not disturb a healthy production controller.
+#
+# ⛔ BUT "the FILE did not change" is NOT the question (review finding): a plain `install.sh` OVERWRITES
+# the plist without reloading the job, so after any limits change the file matches the render while
+# launchd still runs the old one — and the next `--start` would read "unchanged", skip the reload it
+# exists to perform, and exit 0 with the stale settings still in effect. So the comparison is against
+# the render launchd was last SEEN loading (recorded at every successful start), not against the file.
+# ⛔ AND THERE ARE THREE STATES, NOT TWO (review finding): current, STALE, and UNKNOWN (no record yet —
+# true of every box that has not run `--start` under this version). Unknown must not be reported as
+# stale: a missing record is not a measurement, and telling an operator "it still uses the OLD settings"
+# from an absent file is the "an absent read must not render as a signal" rule. Unknown and stale both
+# reload (safe direction); only the MESSAGE differs. Unknown is written as unknown.
+RENDER_SHA="$(shasum -a 256 "$RENDER" | awk '{print $1}')"
+LOADED_SHA_FILE="$O/state/launchd-loaded.sha256"
+LOADED_SHA="$(cat "$LOADED_SHA_FILE" 2>/dev/null || true)"
+PLIST_STATE=unknown
+if [ -n "$LOADED_SHA" ]; then
+  if [ "$RENDER_SHA" = "$LOADED_SHA" ]; then PLIST_STATE=current; else PLIST_STATE=stale; fi
+fi
+PLIST_CHANGED=1
+[ "$PLIST_STATE" = "current" ] && PLIST_CHANGED=0
 mv -f "$RENDER" "$PLIST"
 ok "plist valid"
-
+if [ "$PLIST_CHANGED" = "0" ]; then ok "plist unchanged and it is the render launchd loaded"; fi
 # launchd runs $O/<script>, not the copies in this directory — check EVERY script the daemon
 # invokes, not just orch-loop.sh. A drift here is silent and serious: a fix applied only to the
 # shipped copy (e.g. the fail-closed ai-review-gate classifier) would never reach the running box.
@@ -460,14 +653,14 @@ ok "plist valid"
 # missing AGENT_DISK_REFUSED, which under `set -u` aborts a refusal before its refund (the callers
 # are tolerant of that now, but surviving a stale helper silently is not the same as DETECTING it).
 DRIFTED=""
-for f in orch-loop.sh claims.sh repo-authority.sh spawn-gate.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh gh-rest/gh; do
+for f in orch-loop.sh claims.sh repo-authority.sh spawn-gate.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh gh-rest/gh gh-limit.py; do
   [ -f "$O/$f" ] || { DRIFTED="$DRIFTED $f(missing)"; continue; }
   diff -q "$HERE/$f" "$O/$f" >/dev/null 2>&1 || DRIFTED="$DRIFTED $f"
 done
 if [ -n "$DRIFTED" ]; then
   warn "the running copy at \$O differs from the shipped copy:$DRIFTED"
   warn "  the daemon executes \$O/<script> — sync them or the fixes here are not in effect:"
-  warn "  cp '$HERE'/*.sh '$O'/ && mkdir -p '$O/gh-rest' && cp '$HERE'/gh-rest/gh '$O/gh-rest/'";
+  warn "  cp '$HERE'/*.sh '$O'/ && mkdir -p '$O/gh-rest' && cp '$HERE'/gh-rest/gh '$O/gh-rest/' && cp '$HERE'/gh-limit.py '$O/'";
 fi
 
 # ── harness provenance (agent-infra#1745) ────────────────────────────────────────
@@ -654,6 +847,52 @@ STAMPEOF
 write_provenance
 # ── harness provenance (agent-infra#1745) END ──
 
+# ── explicit start / reload — the ONLY launchd-mutating path below the render ───────────────────
+# ⛔ ON THE RENDER PATH (ACTION=none) NOTHING MUTATES LAUNCHD, above or below this line: that is a
+# load-bearing property, not an accident — a plain `install.sh` (validation, drift check, a lane proving
+# the harness installs) must be unable to disturb a healthy production controller, because the last
+# three times it could, the fleet went unsupervised and silent (#1975). The only mutating calls in this
+# file are the `--uninstall` branch (above, which exists to touch a loaded job), `--start` and
+# `--restart`; reloading on a start is implied by a stale loaded job, and is explicit on `--restart`.
+# ⛔ A single-quote-safe spelling: `bash '$HERE/install.sh'` is unparseable when the checkout path
+# contains a `'` (review finding), and this is the string an operator pastes while recovering.
+shq() {
+  local s="$1" out="" c i
+  for (( i=0; i<${#s}; i++ )); do
+    c="${s:i:1}"
+    if [ "$c" = "'" ]; then out="$out'\\''"; else out="$out$c"; fi
+  done
+  printf "'%s'" "$out"
+}
+SELF="bash $(shq "$HERE/install.sh")"
+# How old $O/heartbeat may be before a loaded job counts as "not cycling" — derived from THIS cell's
+# cycle, so a quiet cell (CYC=900) is not declared wedged on a healthy controller. Passed down rather
+# than read from a global: the library must not depend on an unstated variable.
+LC_HB_STALE="${LC_HB_STALE:-$(( CYC * 2 + 300 ))}"
+case "$ACTION" in
+  start)   lc_ensure  "$LABEL" "$PLIST" "$O" "$PLIST_CHANGED" "$START_TIMEOUT" "$LC_HB_STALE" || exit 1 ;;
+  restart) lc_restart "$LABEL" "$PLIST" "$O" "$START_TIMEOUT"                              || exit 1 ;;
+esac
+# Record the render launchd is now running, so the NEXT run can tell "current" from "the file was
+# overwritten earlier and never reloaded" (see PLIST_CHANGED above). Written AFTER the start succeeded —
+# a failed start must leave the old record in place, or the next run would call a stale job current.
+if [ "$ACTION" = "start" ] || [ "$ACTION" = "restart" ]; then
+  mkdir -p "$O/state" 2>/dev/null || true
+  printf '%s\n' "$RENDER_SHA" > "$LOADED_SHA_FILE" 2>/dev/null || warn "could not record the loaded render at $LOADED_SHA_FILE"
+fi
+# Read-only: what launchd says right now, TRI-STATE. Used only to make the closing text TRUE — the old
+# banner said "The loop is NOT running" unconditionally, so an operator reading it after a start had no
+# way to tell a live controller from a dead one. ⛔ AND AN UNREADABLE READ IS NOT "NOT RUNNING" (review
+# finding): `lc_pid` alone returns empty for both "not loaded" and "the read failed", so the one run that
+# could not tell said the most. The block is read ONCE and the pid parsed from it.
+RUNNING_PID=""; LC_STATE=unknown; _blk=""; _prc=0
+_blk="$(lc_probe "$LABEL")" || _prc=$?
+case "$_prc" in
+  0) LC_STATE=loaded; RUNNING_PID="$(awk '/^[[:space:]]*pid = [0-9]+$/ { print $3; exit }' <<<"$_blk")" ;;
+  1) LC_STATE=absent ;;
+  *) LC_STATE=unknown ;;
+esac
+
 cat <<EOF
 
 ✅ Installed $LABEL
@@ -661,14 +900,92 @@ cat <<EOF
   harness   $O
   provenance  $STAMP   (which harness commit this box runs — agent-infra#1745)
   repo      $REPO   ($OR)
-  limits    lanes=$MAX_LANES review=$MAX_REVIEW fix=$MAX_FIX fix_tries=$MAX_FIX_TRIES
+  limits    lanes=$MAX_LANES (default: 2.5x cores unless pinned) review=$MAX_REVIEW fix=$MAX_FIX fix_tries=$MAX_FIX_TRIES
             max_load=$MAX_LOAD min_swap_free=${MIN_SWAP_FREE}M min_mem_free_mb=${MIN_MEM_FREE_MB}M batch=$BATCH cycle=${CYC}s
             merge_priority_at=${MERGE_PRIORITY_AT} UNOWNED open PRs
+EOF
 
-The loop is NOT running. To start it:
+if [ "$LC_STATE" = "loaded" ] && [ -n "$RUNNING_PID" ]; then
+  # ⛔ THE BANNER REPORTS WHAT THIS RUN ACTUALLY DID (review finding): on the "already running and
+  # current — left untouched" branch the old text claimed "this run started it and PROVED it", which is
+  # a process claim with no artifact behind it, and it made the honest branch indistinguishable from a
+  # real start.
+  case "${LC_OUTCOME:-}" in
+    left-untouched)
+  cat <<EOF
 
-    launchctl load -w "$PLIST"
+The loop IS running (launchd pid $RUNNING_PID) and this run VERIFIED it — pid present, heartbeat fresh,
+launchd not relaunching it. It was NOT restarted: the loaded job is on the current render.
 
+EOF
+      ;;
+    started|restarted|reloaded)
+  # ⛔ NOT AN INLINE `$(case … esac)` IN THE HEREDOC (review finding): the `)` closing the `reloaded)`
+  # pattern ENDED the command substitution, so bash printed `syntax error near unexpected token` and
+  # substituted NOTHING — every successful start rendered `— this run  printf 'RELOADED' ;; *) printf
+  # 'started' ;; esac) it and PROVED it`. The suite passed it because its assertion looked for the
+  # KEYWORD `RELOADED`, which that garbage happens to contain: a false PASS on the one line an operator
+  # reads after a recovery. Computed first, printed second.
+  case "${LC_OUTCOME:-}" in reloaded) _did="RELOADED" ;; *) _did="started" ;; esac
+  cat <<EOF
+
+The loop IS running (launchd pid $RUNNING_PID) — this run $_did it and PROVED it: the pid exists, it is a NEW
+process, and $O/heartbeat advanced.
+
+EOF
+      ;;
+    *)
+  cat <<EOF
+
+The loop IS running (launchd pid $RUNNING_PID).
+
+EOF
+      ;;
+  esac
+else
+  if [ "$LC_STATE" = "loaded" ]; then
+  cat <<EOF
+
+$LABEL is LOADED but has no pid right now — that is what a KeepAlive job looks like inside its respawn
+throttle. Next: launchctl print $(lc_domain)/$LABEL | head -20
+
+EOF
+  elif [ "$LC_STATE" = "unknown" ]; then
+  cat <<EOF
+
+⛔ launchd's state for $LABEL could NOT be read, so whether the loop is running is UNKNOWN — this run
+cannot answer it. Next: launchctl print $(lc_domain)/$LABEL | head -20
+
+EOF
+  else
+  cat <<EOF
+
+The loop is NOT running. Start it — and have the start PROVEN (pid + heartbeat), not assumed:
+
+    $SELF --start
+
+EOF
+  fi
+fi
+
+# A loaded job that is not on this render with a live controller is the ONE case a plain run leaves
+# genuinely wrong, so it is said out loud rather than left for an operator to discover from a limits
+# value that never took effect. PLIST_CHANGED is 1 for STALE and for UNKNOWN — and the two must not
+# share a sentence, because only one of them is a measurement (see PLIST_STATE above).
+if [ "$ACTION" = "none" ] && [ "$PLIST_CHANGED" = "1" ] && [ "$LC_STATE" = "loaded" ]; then
+  case "$PLIST_STATE" in
+    stale)
+  warn "the loaded job is NOT on the rendered plist and $LABEL is running (pid $RUNNING_PID) — it still uses the OLD settings"
+  warn "  apply them safely: $SELF --restart   (enable → bootout → bootstrap, then verifies pid + heartbeat)"
+      ;;
+    *)
+  warn "which render launchd loaded is UNKNOWN (no $LOADED_SHA_FILE record yet — one is written by a successful --start), so this run cannot tell whether $LABEL (pid $RUNNING_PID) is on the current settings"
+  warn "  prove it: $SELF --start   (reloads once, then records the render it loaded)"
+      ;;
+  esac
+fi
+
+cat <<EOF
 Watch it (the first line of the decision log each cycle):
 
     tail -f "$O/logs/orch-loop.log"
@@ -679,5 +996,6 @@ Liveness — a stale heartbeat means the controller is wedged:
 
 Stop it before handing the machine to a human, and capture dirty work (README §6):
 
-    launchctl unload -w "$PLIST"; pkill -f orch-loop.sh; rm -f "$O/.orch.lock"
+    $SELF --uninstall        # bootout + remove the plist — NO persistent disable is written
+    pkill -f "[b]ash $O/orch-loop.sh"; pgrep -fl '[o]rch-loop'   # verify YOUR controller is gone, then: rm -f "$O/.orch.lock"
 EOF
