@@ -124,6 +124,7 @@ if [ -n "${FAKE_PS_COUNT:-}" ]; then
   N=$((N + 1)); printf '%s\n' "$N" >"$FAKE_PS_COUNT"
 fi
 [ -n "${FAKE_PS_FAIL:-}" ] && exit 1
+[ -n "${FAKE_PS_SLEEP:-}" ] && sleep "$FAKE_PS_SLEEP"
 [ -n "${FAKE_PS_EMPTY:-}" ] && exit 0
 if [ -n "${FAKE_PS_SEQ_DIR:-}" ] && [ -f "$FAKE_PS_SEQ_DIR/$N" ]; then cat "$FAKE_PS_SEQ_DIR/$N"; exit 0; fi
 if [ -n "${FAKE_PS_TABLE:-}" ] && [ -f "$FAKE_PS_TABLE" ]; then cat "$FAKE_PS_TABLE"; exit 0; fi
@@ -540,6 +541,37 @@ assert_eq "$rc" "0" "and the pass still exits 0"
 absent "$W_H_DEAD/.venv" "the dead env is gone"
 exists "$W_H_LIVE1/.venv" "the live envs are untouched"
 exists "$W_H_LIVE2/.venv" "the live envs are untouched"
+
+echo "── I. the probe watchdog must not delete the parent's scratch dir ──────────────"
+# MEASURED DEFECT (pre-existing, found while re-running this suite on a loaded cell): `cleanup` is an
+# EXIT trap and `run_bounded`'s watchdog subshell INHERITS it, so when the parent TERMs the watchdog
+# after a probe (which it does after EVERY probe), the CHILD ran `rm -rf "$SCRATCH"` — deleting the
+# parent's scratch dir mid-pass. The parent then read an empty/gone file and aborted fail-closed
+# (`ps probe unavailable`, `reports no worktrees at all`, exit 3) on a healthy box, ~2 runs in 3 at
+# load ~8. A reaper that randomly refuses to reap is the failure mode a fleet can only read as
+# "nothing to reap".
+# Structural pins (deterministic): the child clears the inherited trap, and cleanup() is owner-guarded.
+if grep -qF '[ "$BASHPID" = "$$" ] || return 0' "$REAPER"; then
+  ok "cleanup() only acts in the shell that owns the scratch dir (BASHPID guard)"
+else
+  bad "cleanup() has no owner guard — a subshell can delete the parent's scratch dir"
+fi
+if [ -n "$(awk '/trap - EXIT/{c=NR} /trap .kill "\$s"/{t=NR} END{if (c && t && c < t) print "ok"}' "$REAPER")" ]; then
+  ok "the watchdog subshell clears the inherited EXIT trap before it arms its own"
+else
+  bad "the watchdog subshell inherits cleanup() — it deletes the parent's scratch dir on every probe"
+fi
+# Behavioural (non-vacuous): a SLOW probe arms the watchdog on every pass, which is the shape that
+# showed the race. Every pass must still classify; pre-fix these abort with exit 3 at random.
+RI="$(newrepo i)"
+W_I_DEAD="$(mkwt "$RI" dead)"
+clean_passes=0
+for _ in 1 2 3; do
+  out="$(run_shimmed FAKE_PS_SLEEP=0.4 REAP_VENV_PS_TIMEOUT=5 --gc --repo "$RI")"; rc=$?
+  [ "$rc" = 0 ] && grep -qF "REAP dead-lane" <<<"$out" && clean_passes=$((clean_passes + 1))
+done
+assert_eq "$clean_passes" "3" "3/3 passes with an armed watchdog classify the dead lane (no spurious fail-closed)"
+
 echo
 echo "──────────────────────────────────────────────────────────────────────────────────────"
 if [ "$FAIL" -eq 0 ]; then

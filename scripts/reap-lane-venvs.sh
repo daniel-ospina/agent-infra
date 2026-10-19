@@ -261,6 +261,14 @@ scratch_dir() {
 }
 cleanup() {
     local w
+    # ⛔ OWNER GUARD (#1932, found while re-running this suite under load): `cleanup` is an EXIT trap, and
+    # the watchdog subshell forked by `run_bounded` INHERITS it — measured, bash runs the parent's EXIT
+    # trap when that subshell exits, and `run_bounded` TERMs the watchdog immediately after every probe.
+    # So the child deleted the PARENT's scratch dir (`rm -rf "$SCRATCH"`) while the parent was still
+    # reading the probe it had just written: `ps probe unavailable` / `reports no worktrees at all`, exit
+    # 3, on a healthy box, at random (~1 run in 3 here). `$$` is the same in a subshell; `$BASHPID` is
+    # not, so this is the exact owner test. `trap - EXIT` in the watchdog is the other half.
+    [ "$BASHPID" = "$$" ] || return 0
     for w in $WATCHDOGS; do kill -TERM "$w" 2>/dev/null; done
     WATCHDOGS=""
     [ -n "$SCRATCH" ] && rm -rf "$SCRATCH"
@@ -300,6 +308,9 @@ run_bounded() {
             # so the self-tree cannot identify it, and MEASURED (cell-2) it was reported as a live lane's
             # cwd, refusing every exit-mode reap. The watchdog needs no cwd; it must not have one here.
             cd / 2>/dev/null || true
+            # ⛔ The parent's EXIT trap (`cleanup`) MUST NOT run here — this subshell exits after EVERY
+            # probe (run_bounded TERMs it), and cleanup deletes the parent's scratch dir. See cleanup().
+            trap - EXIT
             trap 'kill "$s" 2>/dev/null; exit 0' TERM INT
             sleep "$secs" &
             s=$!

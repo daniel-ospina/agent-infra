@@ -147,6 +147,16 @@ export const OUT_OF_FAMILY_TERMS = [
   // registry entry.
   "DEFAULT_TOOL_TIMEOUT_S",
   "getToolTimeoutSeconds",
+  // #1932 (review of PR #1949): the venv reaper's STATED free-disk floor. Its
+  // name carries the `REAP` family TOKEN but `_MB` is not one of
+  // `SCAN_BOUND_SUFFIXES`, so `inFamily` cannot see it and the reverse scan would
+  // never demand the entry it now has. Registered deliberately rather than left
+  // exempt: it bounds how much of the box the fleet may consume, and a bound only
+  // the reaper knows about is invisible to the audit that exists to notice exactly
+  // that. Value pinned by this registry's forward scan; BEHAVIOUR pinned by
+  // `scripts/reap-lane-venvs.test.sh` §H (below the floor ⇒ `floor_ok=no` + exit 5;
+  // unreadable `df` ⇒ `floor_ok=unknown`, never a pass).
+  "REAP_VENV_FREE_FLOOR_MB",
 ] as const;
 
 /** The wire marker vocabulary. Single source for the parent's `KNOWN_MARKER_KINDS`. */
