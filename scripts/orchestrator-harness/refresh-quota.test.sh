@@ -215,12 +215,20 @@ spent_off=$(( 1000 - $(cat "$D/core") ))
 # hour. A pass that can only afford SOME of its window must judge those completely (a CLEAN is queued,
 # a COLLISION is acted on) and STOP, naming the budget — never spend the last of the bucket and report
 # `judged NOTHING`.
-# Budget 90, reserve 40: the ~5 listing pages leave ~85, the first candidate's cold rebuild (~20) is
-# affordable and the second is not (85 - 20 = 65 < 40 + 30).
-mk_case starved 90
+# Budget 80, reserve 40, and the PER-CANDIDATE estimate PINNED at 30. The stub pre-flight spends
+# ~2 core calls per candidate and the listings cost ~5, so with the SHIPPED default (6, re-derived
+# from measurement by #1984 — the pass now also reads the fleet's slow-changing answers once per
+# pass) nothing this fixture can afford would ever starve: 80 - 5 - 6*2 stays above 40 + 6. That is
+# the default's VALUE, not this case's subject. This case is about the STARVATION MECHANISM — a pass
+# that cannot afford its whole window must stop and say so — so the seam is pinned to the estimate
+# the arithmetic was designed around (30) and the budget is sized for THAT: gate 80 >= 40 + 30,
+# listings leave ~75, each judged candidate leaves ~2 less, and the pass stops at ~70 = 40 + 30
+# having judged 2-3 of 6. Non-vacuity: unpinning it reddens `judged N (want 1..5)` here, which is how
+# this comment was verified after the merge.
+mk_case starved 80
 mk_gh "$D" "$(rows 6)"
 mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
-rf "$D" refresh COLLISION_PREFLIGHT_CORE_RESERVE=40
+rf "$D" refresh COLLISION_PREFLIGHT_CORE_RESERVE=40 COLLISION_PREFLIGHT_CORE_PER_CANDIDATE=30
 n_judged="$(printf '%s\n' "$OUT" | sed -nE 's/.*checked ([0-9]+); backlog now.*/\1/p' | head -1)"
 n_usable="$(printf '%s\n' "$OUT" | grep -cE '^\[refresh\] \+#[0-9]+ CLEAN -> backlog')"
 n_cand="$(wc -l < "$D/o/candidates.txt" 2>/dev/null | tr -d ' ')"
