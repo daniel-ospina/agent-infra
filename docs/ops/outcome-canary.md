@@ -227,8 +227,8 @@ shape changes, and it is pruned with the rest of its check.
 ## The suite
 
 ```bash
-python3 tools/fleet/outcome_canary.test.py              # 169 tests
-python3 tools/fleet/outcome_canary.test.py --mutations  # 166 mutations, each must go RED
+python3 tools/fleet/outcome_canary.test.py              # the acceptance suite
+python3 tools/fleet/outcome_canary.test.py --mutations  # every entry in MUTATIONS must go RED
 ```
 
 The signal tests drive the **real CLI** end-to-end (`--live --facts … --capture-dir …`), so what is
@@ -465,6 +465,16 @@ Six more (cycle 13), each a case where a datum the tool held was not the one it 
   truthy, so a surface that said its read FAILED was graded as a successful one carrying
   `avail_bytes: 0` and produced `FAIL/BELOW_FLOOR` — a fake OOM emergency on the check whose FAIL
   must mean one. A missing `used_pct` now prints as `used_pct not read`, never as `-1.0% used`.
+- **A `PARTIAL` token cannot certify an empty pool.** `parse_queue_token` sets `pool` only for
+  `READ(...)`; a `PARTIAL(...)` token carries `partial` and leaves `pool` None, so admitting it let a
+  shape whose pool SIZE was never read fall through to "the fleet had nothing in hand" while
+  `queue_readable` FAILed `QUEUE_PARTIAL` on the same record. And the "current `EMPTY` supersedes the
+  header" shortcut now requires the header's own `backlog=`, because `HEADER_INCOMPLETE` is the same
+  judgement its two sibling checks make.
+- **The batch INTENT line is not a landed dispatch.** `_activity` read `[dispatch] … -> N` as "a
+  dispatch landed", putting that sentence in the evidence of a FAIL three lines under
+  `work_dispatched`'s `NO_LANE_STARTED` for the same batch. A confirmed `lane_started` is preferred;
+  when only the intent exists the line says "a dispatch was ATTEMPTED … no lane spawn was confirmed".
 - **No cycle header in the window is not an empty backlog.** `_activity` answered "the fleet had
   nothing in hand" when no header was in the window — so a WEDGED controller (which writes none) was
   graded as evidence that there was nothing to do. That shape is now `ACTIVITY_UNKNOWN`, as

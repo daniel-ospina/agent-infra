@@ -1051,7 +1051,7 @@ def check_queue_readable(f, c):
                      "current, and an UNKNOWN age is not a fresh one. Not green." % (raw_tok,))
         if tok["kind"] == "EMPTY":
             return V("queue_readable", INCONCLUSIVE, "STATE_FROZEN", _queue_frozen_txt(f, stale),
-                     ("the pool was read as EMPTY %s ago (limit %.0fs), so 'the pool is empty' is a "
+                     ("the pool was read as EMPTY %s (limit %.0fs), so 'the pool is empty' is a "
                       "claim about then, not now. Not green." % (
                           _age_txt(stale["age_s"]), stale["limit_s"])))
         # ⛔ GREEN ON A FROZEN REFRESH IS THE #1931 FAILURE WEARING A PASS. A KNOWN-and-old NON-EMPTY
@@ -1061,7 +1061,7 @@ def check_queue_readable(f, c):
         # `state/queue-state` 3h old → PASS/READABLE, exit 0. The claim is legible now, and it is not
         # a pass: the pool number is a statement about three hours ago.
         return V("queue_readable", INCONCLUSIVE, "READABLE_STALE", _queue_frozen_txt(f, stale),
-                 ("the pool was read as %s %s ago (limit %.0fs): the reading is legible but not "
+                 ("the pool was read as %s %s (limit %.0fs): the reading is legible but not "
                   "CURRENT, so 'the last refresh produced a readable verdict' is a claim about %.0fs "
                   "ago. Not green." % (raw_tok, _age_txt(stale["age_s"]), stale["limit_s"],
                                        stale["age_s"])))
@@ -1550,13 +1550,21 @@ def _activity(f, window_s=None, cfg=None):
     # could not read.
     gh_open = (f.get("github") or {}).get("open_pr_count")
     pr_win = cfg.pr_window_s if cfg is not None else 10800.0
-    fresh_dispatch = newest_with_age(events.get("dispatch_ok") or [], pr_win) or \
-        newest_with_age(events.get("lane_started") or [], pr_win)
+    # ⛔ `dispatch_ok` IS THE BATCH INTENT LINE, NOT A LANDED DISPATCH — `work_dispatched` refuses to
+    # grade it as one, and the doc calls it "an INTENT, not the dispatch". Reading it here produced
+    # "a dispatch landed 3m ago" in the evidence of a FAIL, three lines under `work_dispatched`'s
+    # FAIL/NO_LANE_STARTED ("lane spawn FAILED") for the same batch. A confirmed spawn is preferred,
+    # and when only the intent exists the line says so.
+    lane_ok = newest_with_age(events.get("lane_started") or [], pr_win)
+    intent = newest_with_age(events.get("dispatch_ok") or [], pr_win)
     if isinstance(gh_open, int) and not isinstance(gh_open, bool) and gh_open > 0:
         return True, "%d open PR(s) — work in hand, independent of the queue record" % gh_open
-    if fresh_dispatch:
-        return True, "a dispatch landed %s (the queue record is not the only evidence)" % (
-            _age_txt(fresh_dispatch.get("age_s")))
+    if lane_ok:
+        return True, "a lane started %s (the queue record is not the only evidence)" % (
+            _age_txt(lane_ok.get("age_s")))
+    if intent:
+        return True, ("a dispatch was ATTEMPTED %s (the intent line — work existed even though no "
+                      "lane spawn was confirmed)" % _age_txt(intent.get("age_s")))
     # ⛔ AN ABSENT HEADER IS NOT AN EMPTY BACKLOG. `False` here means "the fleet had nothing in hand",
     # so a wedged controller (which writes no header) was graded as a measured idle — the opposite of
     # what a missing header shows. `work_dispatched` and `queue_readable` abstain on this shape.
@@ -1582,9 +1590,17 @@ def _activity(f, window_s=None, cfg=None):
     # ⛔ AN UNAGED RECORD LOSES ITS CLAIM, NEVER ITS AUTHORITY. `_graded_stale` is what decides
     # currency; without this guard an `EMPTY` with no epoch re-granted "the fleet had nothing in hand"
     # while `queue_readable` and `work_dispatched` both said STATE_FROZEN about the same record.
-    if _src == "state/queue-state" and kind == "EMPTY" and _graded_stale(f, cfg, _src) is None:
+    if (_src == "state/queue-state" and kind == "EMPTY" and _graded_stale(f, cfg, _src) is None
+            and isinstance(backlog, int) and not isinstance(backlog, bool)):
+        # ⛔ `HEADER_INCOMPLETE` APPLIES HERE TOO. Both siblings refuse to grade an incomplete header
+        # (`check_queue_readable` and `check_work_dispatched`: "an incomplete header cannot establish
+        # that the pool was genuinely empty"), and this shortcut stands in for exactly that judgement —
+        # so without the guard a header with NO `backlog=` field was blessed as a measured idle and
+        # the PR checks DELIVERED "the fleet had nothing in hand", the sentence this whole guard
+        # exists to prevent. `backlog` is also interpolated below: `backlog=None` would be a claim
+        # about a field that was never read.
         return False, ("the graded record is state/queue-state: EMPTY (%s) — it supersedes the "
-                       "%s cycle header's backlog=%s" % (age_txt, backlog_src, backlog))
+                       "%s's backlog=%s" % (age_txt, backlog_src, backlog))
     # ⛔ AND THE SAME GUARD RUNS IN THE OTHER DIRECTION. Currency was checked only where it would
     # make the fleet IDLE; the direction that makes it BUSY was unguarded, so a frozen `backlog=47`
     # (written from the PREVIOUS refresh's candidates.txt) certified "the fleet had work in hand" and
@@ -1608,9 +1624,21 @@ def _activity(f, window_s=None, cfg=None):
     # this file fixes everywhere else — was reported as benign idleness by `pr_created` while
     # `queue_readable` FAILed QUEUE_UNREADABLE in the same run. `work_dispatched` has a
     # `HEADER_INCOMPLETE` guard for exactly this; `_activity` had none.
-    if kind not in ("EMPTY", "READ", "PARTIAL") or (kind == "READ" and not isinstance(pool, int)):
-        return None, ("the pool reading is %s (source: %s, %s), so 'the fleet had nothing in hand' "
-                      "is not established" % (_tok.get("raw") or "(absent)", _src, age_txt))
+    # ⛔ `PARTIAL` IS NOT IN THE ALLOW-LIST. `parse_queue_token` sets `pool` only for `READ(...)`; a
+    # `PARTIAL(...)` token carries `partial` and leaves `pool` None, so admitting it let a shape whose
+    # pool SIZE was never read fall through to `False` ("the fleet had nothing in hand") while
+    # `queue_readable` FAILed QUEUE_PARTIAL — "only some priority tiers were read, so the pool is a
+    # SUBSET" — on the same record.
+    if (kind not in ("EMPTY", "READ")
+            or not isinstance(backlog, int) or isinstance(backlog, bool)
+            or (kind == "READ" and not isinstance(pool, int))):
+        # ⛔ BOTH HALVES OF THE PAIR ARE REQUIRED. A header with NO `backlog=` field reaches here
+        # whenever the EMPTY-supersede shortcut above declined (an incomplete header is not a measured
+        # idle), and an int `backlog=0` beside an `EMPTY` is the only shape that supports "nothing in
+        # hand" — the same `HEADER_INCOMPLETE` judgement its two sibling checks make.
+        return None, ("the pool reading is %s (source: %s, %s) with backlog=%s, so 'the fleet had "
+                      "nothing in hand' is not established"
+                      % (_tok.get("raw") or "(absent)", _src, age_txt, backlog))
     return False, "backlog=%s (source: %s, %s) pool=%s (source: %s)" % (
         backlog, backlog_src, age_txt, pool, _src)
 

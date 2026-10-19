@@ -4477,6 +4477,19 @@ MUTATIONS = [
      '    if False:\n'
      '        return True, "%d open PR(s) — work in hand, independent of the queue record" % gh_open',
      "test_open_PRs_are_work_in_hand_even_with_NO_cycle_header"),
+    # ── cycle-33 defects ─────────────────────────────────────────────────────────────────
+    ("an incomplete header is blessed as a genuinely empty pool",
+     "            and isinstance(backlog, int) and not isinstance(backlog, bool)):",
+     "            ) if False else True:",
+     "test_an_INCOMPLETE_header_cannot_certify_an_EMPTY_pool"),
+    ("a PARTIAL pool token is admitted as able to certify an empty pool",
+     '    if (kind not in ("EMPTY", "READ")\n            or not isinstance(backlog, int)',
+     '    if (kind not in ("EMPTY", "READ", "PARTIAL")\n            or not isinstance(backlog, int)',
+     "test_a_PARTIAL_pool_token_cannot_support_nothing_in_hand"),
+    ("the batch INTENT is reported as a landed dispatch",
+     '    if lane_ok:\n        return True, "a lane started %s (the queue record is not the only evidence)" % (\n            _age_txt(lane_ok.get("age_s")))',
+     '    if intent or lane_ok:\n        return True, "a dispatch landed %s (the queue record is not the only evidence)" % (\n            _age_txt((intent or lane_ok).get("age_s")))',
+     "test_the_intent_line_is_not_reported_as_a_LANDED_dispatch"),
     # ── cycle-28 defects ──────────────────────────────────────────────────────────────────
     ("CONTROLLER_ABSENT ignores a rejected controller row",
      "    if not pids and near_ours:",
@@ -4532,10 +4545,10 @@ MUTATIONS = [
      '            skipped.append("%s:%s" % (pr.get("number"), pr.get("checks_state") or "red"))',
      '            skipped.append("%s:red" % (pr.get("number"),))',
      "test_an_IN_FLIGHT_check_is_labelled_inflight_not_RED"),
-    ("an unaged EMPTY record still manufactures idleness",
-     '    if _src == "state/queue-state" and kind == "EMPTY" and _graded_stale(f, cfg, _src) is None:',
+    ('an unaged EMPTY record still manufactures idleness',
+     '    if (_src == "state/queue-state" and kind == "EMPTY" and _graded_stale(f, cfg, _src) is None\n            and isinstance(backlog, int) and not isinstance(backlog, bool)):',
      '    if _src == "state/queue-state" and kind == "EMPTY":',
-     "test_an_UNAGED_EMPTY_record_cannot_manufacture_idleness_either"),
+     'test_an_UNAGED_EMPTY_record_cannot_manufacture_idleness_either'),
     ("an in-flight rollup is reported as a red conclusion",
      '        if any(_in_flight(chk) for _r, chk in entries):\n            seen_inflight = True\n            continue',
      '        if any(_in_flight(chk) for _r, chk in entries):\n            return "inflight"',
@@ -4604,9 +4617,9 @@ MUTATIONS = [
      '    pair = tok',
      "test_an_EMPTY_backlog_is_judged_against_the_pool_from_ITS_OWN_header"),
     ("fleet activity attributes the header's backlog to a newer state record",
-     '    if _src == "state/queue-state" and kind == "EMPTY" and _graded_stale(f, cfg, _src) is None:',
-     "    if False:",
-     "test_an_EMPTY_state_record_supersedes_an_older_header_backlog"),
+     '    if (_src == "state/queue-state" and kind == "EMPTY" and _graded_stale(f, cfg, _src) is None\n            and isinstance(backlog, int) and not isinstance(backlog, bool)):',
+     '    if False:',
+     'test_an_EMPTY_state_record_supersedes_an_older_header_backlog'),
     ("pr_merged FAILs while its own activity input is unread",
      "    if busy is None:\n"
      '        # \u26d4 HOISTED ABOVE THE `open_n > 0` ARM.',
@@ -4626,11 +4639,10 @@ MUTATIONS = [
      '    stale_busy = _graded_stale(f, cfg if cfg is not None else cfg_from_dict({}), _src)',
      '    stale_busy = None',
      "test_a_FROZEN_pool_record_cannot_certify_that_work_was_IN_HAND"),
-    ("an unreadable pool token reads as benign idleness",
-     '    if kind not in ("EMPTY", "READ", "PARTIAL") or (kind == "READ" and not '
-     'isinstance(pool, int)):',
-     "    if False:",
-     "test_an_UNREADABLE_pool_is_not_reported_as_benign_idleness"),
+    ('an unreadable pool token reads as benign idleness',
+     '    if (kind not in ("EMPTY", "READ")\n',
+     '    if (kind not in ("EMPTY", "READ", "UNREADABLE")\n',
+     'test_an_UNREADABLE_pool_is_not_reported_as_benign_idleness'),
     ("the report stops disclosing which cell was read",
      '            "o_dir": self.o_dir,',
      '',
@@ -5484,6 +5496,77 @@ def test_a_STRING_false_headroom_ok_does_not_manufacture_an_OOM():
         v = m.check_headroom(facts, cfg)
         assert v.status != m.FAIL, (key, v.status, v.variant, v.detail)
         assert "BELOW_FLOOR" != v.variant, (key, v.variant, v.detail)
+
+
+@test
+def test_an_INCOMPLETE_header_cannot_certify_an_EMPTY_pool():
+    """The `state/queue-state: EMPTY` supersede shortcut returned `False` ("the fleet had nothing in
+    hand") without the `HEADER_INCOMPLETE` guard its two sibling checks enforce, so a header with no
+    `backlog=` field was blessed as a measured idle and the PR checks DELIVERED "the fleet had nothing
+    in hand" while `queue_readable`/`work_dispatched` both abstained on the same record."""
+    m = load()
+    cfg = m.cfg_from_dict({})
+    d = fx("healthy")
+    d["facts"]["github"].update({"open_pr_count": 0, "open_prs": [], "prs_created_in_window": 0,
+                                "prs_merged_in_window": 0})
+    d["facts"]["log_events"]["dispatch_ok"] = []
+    d["facts"]["log_events"]["lane_started"] = []
+    d["facts"]["log_events"]["headers"] = [{"raw": "h queue=READ(3)", "age_s": 40,
+                                            "queue_token": "READ(3)"}]
+    d["facts"]["queue_state"] = {"ok": True, "raw": "EMPTY 1792327124", "age_s": 10}
+    busy, why = m._activity(d["facts"], cfg=cfg)
+    assert busy is None, (busy, why)
+    assert "not established" in why, why
+    got = dict((v.name, v) for v in m.evaluate(d["facts"], cfg))
+    assert got["pr_created"].variant == "ACTIVITY_UNKNOWN", got["pr_created"].variant
+    assert got["pr_merged"].variant == "ACTIVITY_UNKNOWN", got["pr_merged"].variant
+
+
+@test
+def test_a_PARTIAL_pool_token_cannot_support_nothing_in_hand():
+    """`PARTIAL` was in `_activity`'s allow-list, but `parse_queue_token` sets `pool` only for
+    `READ(...)` — a PARTIAL token carries `partial` and leaves `pool` None. So a shape whose pool SIZE
+    was never read fell through to "the fleet had nothing in hand" while `queue_readable` FAILed
+    QUEUE_PARTIAL ("the pool is a SUBSET") on the same record."""
+    m = load()
+    cfg = m.cfg_from_dict({})
+    d = fx("healthy")
+    d["facts"]["github"].update({"open_pr_count": 0, "open_prs": [], "prs_created_in_window": 0,
+                                "prs_merged_in_window": 0})
+    d["facts"]["log_events"]["dispatch_ok"] = []
+    d["facts"]["log_events"]["lane_started"] = []
+    d["facts"]["log_events"]["headers"] = [{"raw": "h", "age_s": 40, "backlog": 0,
+                                            "queue_token": "READ(3)"}]
+    d["facts"]["queue_state"] = {"ok": True, "raw": "PARTIAL(P2-moderate) 1792327124", "age_s": 10}
+    busy, why = m._activity(d["facts"], cfg=cfg)
+    assert busy is None, (busy, why)
+    got = dict((v.name, v) for v in m.evaluate(d["facts"], cfg))
+    assert got["pr_created"].variant == "ACTIVITY_UNKNOWN", got["pr_created"].variant
+
+
+@test
+def test_the_intent_line_is_not_reported_as_a_LANDED_dispatch():
+    """`dispatch_ok` is the `[dispatch] … -> N` INTENT — the datum `work_dispatched` refuses to grade as
+    a dispatch. Reading it here put "a dispatch landed 3m ago" in the evidence of a FAIL sitting three
+    lines under `work_dispatched`'s FAIL/NO_LANE_STARTED for the same batch."""
+    m = load()
+    cfg = m.cfg_from_dict({})
+    d = fx("healthy")
+    d["facts"]["github"].update({"open_pr_count": 0, "open_prs": [], "prs_created_in_window": 0,
+                                "prs_merged_in_window": 0})
+    d["facts"]["log_events"]["headers"] = [{"raw": "h", "age_s": 40, "backlog": 0,
+                                            "queue_token": "EMPTY"}]
+    d["facts"]["queue_state"] = {"ok": True, "raw": "EMPTY 1792327124", "age_s": 10}
+    d["facts"]["log_events"]["lane_started"] = []
+    d["facts"]["log_events"]["dispatch_ok"] = [{"issue": 4601, "age_s": 180}]
+    d["facts"]["log_events"]["lane_failed"] = [{"issue": 4601, "age_s": 175}]
+    busy, why = m._activity(d["facts"], cfg=cfg)
+    assert busy is True, (busy, why)
+    assert "ATTEMPTED" in why and "landed" not in why, why
+    # …and a CONFIRMED lane start is preferred over a fresh intent for the same batch
+    d["facts"]["log_events"]["lane_started"] = [{"issue": 4601, "age_s": 200}]
+    busy2, why2 = m._activity(d["facts"], cfg=cfg)
+    assert busy2 is True and "a lane started" in why2, why2
 
 
 @test
