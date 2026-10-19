@@ -436,7 +436,7 @@ do_install() {
 }
 
 do_status() {
-    local id rc=0 unit label installed active enabled last armed drift sha insha sched next=
+    local id rc=0 unit label rm_ok lc_ok installed active enabled last armed drift sha insha sched next=
     case "$PLATFORM" in
         linux)  choose_systemd || { err "no systemd target to read"; return 3; } ;;
         darwin) choose_launchd || { err "no launchctl to read"; return 3; } ;;
@@ -570,19 +570,37 @@ do_uninstall() {
             continue
         fi
         if [ "$PREVIEW" = 1 ]; then say "preview: would remove $id"; continue; fi
+        # ⛔ "uninstalled" IS A MEASUREMENT, NOT AN ANNOUNCEMENT (#2048 review, BLOCK). Every step here
+        # used to discard its status (`|| true`, an unchecked `rm`), so a read-only unit dir printed
+        # `uninstalled` and exited 0 with both artifacts still present and the timer still ENABLED — a
+        # disarm that did not disarm, on a job whose whole purpose is deleting things.
         if [ "$PLATFORM" = linux ]; then
             unit="$(sj_unit "$id")"
-            $SC disable --now "$unit.timer" >/dev/null 2>&1 || true
+            rm_ok=1
+            $SC disable --now "$unit.timer" >/dev/null 2>&1 || rm_ok=0
             if [ -n "${SJ_SYSTEMD_UNIT_DIR:-}" ] || [ "$SD_SCOPE" = user ]; then
-                rm -f "$UNIT_DIR/$unit.service" "$UNIT_DIR/$unit.timer"
+                rm -f "$UNIT_DIR/$unit.service" "$UNIT_DIR/$unit.timer" || rm_ok=0
             else
-                ${SJ_SUDO:-sudo -n} rm -f "$UNIT_DIR/$unit.service" "$UNIT_DIR/$unit.timer"
+                ${SJ_SUDO:-sudo -n} rm -f "$UNIT_DIR/$unit.service" "$UNIT_DIR/$unit.timer" || rm_ok=0
             fi
+            [ -f "$UNIT_DIR/$unit.service" ] && rm_ok=0
+            [ -f "$UNIT_DIR/$unit.timer" ] && rm_ok=0
             $SC daemon-reload >/dev/null 2>&1 || true
+            if [ "$rm_ok" != 1 ]; then
+                err "uninstall INCOMPLETE: $id is still installed at $UNIT_DIR/$unit.{service,timer} (or could not be disabled) — nothing is claimed beyond what was read back"
+                rc=1
+                continue
+            fi
         else
             label="$(sj_label "$id")"
-            $LC bootout "$LD_DOMAIN/$label" >/dev/null 2>&1 || true
-            rm -f "$LD_DIR/$label.plist"
+            lc_ok=1
+            $LC bootout "$LD_DOMAIN/$label" >/dev/null 2>&1 || lc_ok=0
+            rm -f "$LD_DIR/$label.plist" || lc_ok=0
+            if [ -f "$LD_DIR/$label.plist" ]; then
+                err "uninstall INCOMPLETE: $id is still installed at $LD_DIR/$label.plist — nothing is claimed beyond what was read back"
+                rc=1
+                continue
+            fi
         fi
         # The stamp line goes with the job: a stamp for an absent job would report pass_drift=in-sync.
         grep -v "^job=$id " "$STAMP" >"$STAMP.tmp.$$" 2>/dev/null && mv -f "$STAMP.tmp.$$" "$STAMP" 2>/dev/null || true

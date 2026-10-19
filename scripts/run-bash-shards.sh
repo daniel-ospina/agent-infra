@@ -42,6 +42,7 @@ set -uo pipefail
 # exactly what the loops below iterate, so the sweep half cannot be advertised and not performed
 # (or performed and not advertised) without editing this one line.
 SWEEP_GLOBS=("scripts/*.sh" "scripts/checkout-hygiene/*.sh")
+SWEEP_GLOBS=("scripts/*.sh" "scripts/lib/*.sh" "scripts/checkout-hygiene/*.sh")
 
 if [ "${1:-}" = "--list" ]; then
   # Only `.sh` targets: the sentinel self-check below also calls run_shard, and it must not

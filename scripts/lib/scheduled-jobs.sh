@@ -342,7 +342,7 @@ sj_render_systemd() { # sj_render_systemd <id> <destdir> <system|user> [arming-o
         printf 'Type=oneshot\n'
         [ "$scope" = system ] && printf 'User=%s\n' "$(id -un)"
         printf 'Environment=HOME=%s\n' "$HOME"
-        printf 'Environment=PATH=%s\n' "$PATH"
+        printf 'Environment=PATH=%s\n' "$(sj_job_path "$PLATFORM")"
         printf 'Environment=SJ_JOB=%s\n' "$id"
         while IFS= read -r k; do
             [ -n "$k" ] || continue
@@ -443,13 +443,38 @@ EOF
     return 0
 }
 
+# sj_job_path — the PATH a RENDERED DARWIN JOB gets.
+#
+# ⛔ A shim dir must never reach a launchd job (#2048 review, BLOCK; #427). `~/.pi/agent/shims/gh` is a
+# symlink into `~/Documents`, which TCC denies to a launchd-spawned process, so the job resolves `gh`,
+# gets EPERM and fails closed — the reaper's worktree class would abort every hour on the one platform
+# this PR exists for, with a message telling the operator to install a `gh` the box already has.
+# `install-launchd.sh:launchd_path` strips `*/shims` for the same reason; the shared renderer must
+# apply the same rule or the two installers disagree about the same box. Linux keeps its PATH: systemd
+# runs as the user with no TCC boundary.
+sj_job_path() { # sj_job_path <platform>
+    local out="" p glob_was_off=0
+    local IFS=:
+    case "$-" in *f*) glob_was_off=1 ;; esac
+    set -f
+    for p in $PATH; do
+        case "$p" in "") continue ;; esac
+        case "$1" in
+            darwin) case "$p" in */shims|*/shims/*) continue ;; esac ;;
+        esac
+        out="${out:+$out:}$p"
+    done
+    [ "$glob_was_off" = 1 ] || set +f
+    printf '%s' "$out"
+}
+
 # ── machine-state placeholders ──────────────────────────────────────────────────────────────
 # ONE resolver, used by both renderers, so the state dir a cell's unit exports and the one a Mac's
 # plist exports cannot drift.
 sj_render_value() { # sj_render_value <string>
     local v="$1"
     v="${v//@home/$HOME}"
-    v="${v//@path/$PATH}"
+    v="${v//@path/$(sj_job_path "${PLATFORM:-linux}")}"
     v="${v//@state/${SJ_STATE_DIR:-$HOME/.pi/agent/state}}"
     v="${v//@repos/${SJ_REPOS:-${SJ_TORTOISE_REPO:-${TORTOISE_REPO:-$HOME/Documents/GitHub/tortoise}}}}"
     v="${v//@tortoise/${SJ_TORTOISE_REPO:-${TORTOISE_REPO:-$HOME/Documents/GitHub/tortoise}}}"
