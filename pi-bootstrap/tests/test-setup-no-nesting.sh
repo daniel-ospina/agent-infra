@@ -401,13 +401,16 @@ LANE_PRODUCERS_STATE_RESIDUAL="claim.py:#1567 lane-confirm.py:#1797 lane-triage.
 # ⚠️ THE `foreign/` CLASS — a producer a farmed consumer execs from ANOTHER checkout by absolute
 # path. Delivered by that repo's own process, never by this farm, and absent from every box that
 # lacks the checkout — so it is DISCLOSED with an owner and an undisclosed one FAILS. Measured
-# 2026-10-17: TWO sites. `session-postmortem.sh:27` defaults to the eldato repo's
-# `scripts/postmortem.sh`, and that consumer then writes a postmortem whose transcript-pattern section
-# is replaced by a one-line "not found" note, on every box but the owner's (#1921). `safe-send.sh:146`
-# runs a CROSS-CHECKOUT `…/tortoise/tools/cmux_dispatch.py` — and this class's first form required the
+# 2026-10-17: TWO sites, ONE after #1921. `session-postmortem.sh:27` defaulted to the eldato repo's
+# `scripts/postmortem.sh`, and that consumer then wrote a postmortem whose transcript-pattern section
+# was replaced by a one-line "not found" note, on every box but the owner's (#1921) — #1921 VENDORED
+# that producer as `scripts/lib/transcript-patterns.sh` and the consumer now resolves it as a SIBLING,
+# so the site is gone and with it the `foreign:postmortem.sh` entry: the producer is `lib:` now, not
+# foreign. `safe-send.sh:146` runs a CROSS-CHECKOUT `…/tortoise/tools/cmux_dispatch.py` — and this
+# class's first form required the
 # parent directory to be `scripts/`, so that one was invisible while the line above claimed the class was
 # complete: the widening is #1957's, and it is why the form is directory-agnostic now.
-LANE_PRODUCERS_FOREIGN_RESIDUAL="cmux_dispatch.py:#1957 postmortem.sh:#1921"
+LANE_PRODUCERS_FOREIGN_RESIDUAL="cmux_dispatch.py:#1957"
 # ⚠️ DELIVERABLE producers still withheld from every farm array, both owned by #1553 and unchanged
 # from #1552/#1795: `lane-status.py`'s DESTINATION copy is AHEAD of the repo (1993 repo / 2005 live
 # lines at the 2026-10-15 measurement; the live copy carries the #1777 abstention text), so farming
@@ -480,10 +483,16 @@ script:objective.py script:orchestrator-heartbeat.sh script:pi-reap-worktrees.sh
 script:publish-live-workspaces.py script:queue-dispatch.py script:safe-send.sh
 script:session-postmortem.sh
 script:turn-classify.py script:turn-end.py script:undelivered-answers.py script:watch-truncation.sh
-lib:beat-pair.sh lib:bounded.sh lib:diff-normalize.py lib:pid-identity.sh
+lib:beat-pair.sh lib:bounded.sh lib:diff-normalize.py lib:pid-identity.sh lib:transcript-patterns.sh
 state:claim.py state:lane-confirm.py state:lane-triage.py state:lane-verdict.py
 state:queues/refresh-queues.py
-foreign:cmux_dispatch.py foreign:postmortem.sh"
+foreign:cmux_dispatch.py"
+# `lib:transcript-patterns.sh` joined on 2026-10-17 (#1921) and `foreign:postmortem.sh` LEFT in the
+# same landing, which is the derivation doing its job: the exec site did not vanish, it CHANGED KIND —
+# the consumer now execs a sibling that `lib_srcs` farms, and the old foreign reference is gone. A
+# REMOVED entry is normally the "exec site was lost" signal; here it was verified against the CODE
+# (`grep -n 'postmortem.sh' scripts/session-postmortem.sh` finds only the `POSTMORTEM_SH` override and
+# the sibling default), not against the pin.
 
 # An array's entries, one per line. An ABSENT array (`lane_root_srcs`, until #1553) yields nothing:
 # it is the population floor and the pin that refuse an emptied delivery set, never this reader.
