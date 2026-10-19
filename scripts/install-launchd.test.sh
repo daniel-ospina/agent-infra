@@ -420,7 +420,28 @@ for _tpl in "$TEMPLATES"/*.plist; do
     GATED_TEMPLATES1=$((GATED_TEMPLATES1 + 1))
     case "$OUT_FRESH1" in *"$(basename "$_tpl" .plist): installed + loaded"*) GATED_INSTALLED1=$((GATED_INSTALLED1 + 1)) ;; esac
 done
-assert_eq "$GATED_TEMPLATES1" "2" "the {{TORTOISE_REPO}}-gated inventory is 2 (branch-reaper #1787 + worktree-hygiene #1095/#1678; #2048 retired the two per-class reaper templates)"
+# ⛔ THE COUNT IS 2 HERE, AND EMPHATICALLY NOT BECAUSE A PIN WAS ADJUSTED TO MAKE A RED GO GREEN.
+# main pinned 3 (branch-reaper #1787 + worktree-reaper #1311 + worktree-hygiene #1095/#1678); #2048
+# RETIRES `com.tortoise.worktree-reaper` (and `com.eldato.pi-cache-reap`) into the consolidated pass and
+# DELETES both templates, so the gated inventory on this branch is branch-reaper + worktree-hygiene.
+# The distinction matters: a pin moved to silence a failure is the defect main's own comment describes;
+# a pin moved because the population genuinely shrank is a fact about the tree. Both are asserted —
+# the count, and the retirement that causes it (§2 above).
+assert_eq "$GATED_TEMPLATES1" "2" "the {{TORTOISE_REPO}}-gated inventory is 2 (#2048 retired worktree-reaper; branch-reaper #1787 + worktree-hygiene #1095/#1678 remain)"
+# A visible checkout whose resolution produced NOTHING is a regression, not a host without one. Ask
+# the same three candidates install-launchd.sh:76-82 asks (the fixture's HOME is the fake one the run
+# used, so §13/§14's seeded checkouts cannot make this look resolved).
+GATED_VISIBLE1=0
+for _cand in "$HOME1/Documents/GitHub/tortoise" "$(cd "$SCRIPT_DIR/.." && pwd)/../tortoise" "$HOME1/tortoise"; do
+    if [ -d "$_cand" ] && [ -d "$_cand/.git" ]; then GATED_VISIBLE1=1; break; fi
+done
+# A visible checkout that installed NONE of the gated jobs is the failure mode this guards; a host with
+# no checkout at all installs none and is not at fault.
+if [ "$GATED_VISIBLE1" = 1 ] && [ "$GATED_INSTALLED1" -eq 0 ]; then
+    bad "a tortoise checkout is visible but NONE of the $GATED_TEMPLATES1 gated jobs installed — resolution regressed"
+else
+    ok "gated jobs resolved consistently with what this host has (visible checkout=$GATED_VISIBLE1, installed=$GATED_INSTALLED1 of $GATED_TEMPLATES1)"
+fi
 _always1=0
 for _j in $ALWAYS_JOBS1; do
     case "$OUT_FRESH1" in *"$_j: installed + loaded"*) _always1=$((_always1 + 1)) ;; esac  # the printed shape is "<label>: installed + loaded"
