@@ -359,8 +359,8 @@ ck "a TOTAL-only response is NOT a green head (0 check-runs = nothing measured, 
      [ "$RC2" = 11 ] && [ "$(verdict_of 31 | cut -d' ' -f1)" = WAITING_CHECKS ] && echo 0 || echo 1)
 
 # ── 18. the SUPERVISION BUDGET is sized to one documented cycle AND re-armed (E1) ───────────────
-ck "the watch budget (25 x 120s = 3000s) fits INSIDE lane.sh's 3300s wall clock — a bound the owning lane can actually reach" \
-   $(grep -q 'LANE_MERGE_MAX_WATCH:-25}' "$SCRIPT" && ! grep -q 'LANE_MERGE_MAX_WATCH:-35}' "$SCRIPT" && echo 0 || echo 1)
+ck "the watch budget (15 x 120s) plus the check wait (WAIT_S) fits INSIDE lane.sh's 3300s wall clock" \
+   $(grep -q 'LANE_MERGE_MAX_WATCH:-15}' "$SCRIPT" && ! grep -q 'LANE_MERGE_MAX_WATCH:-35}' "$SCRIPT" && ! grep -q 'LANE_MERGE_MAX_WATCH:-25}' "$SCRIPT" && echo 0 || echo 1)
 # ⛔ THE ARITHMETIC, not the literal: the shipped default x the shipped chunk length must be strictly
 # less than LANE_TIMEOUT in lane.sh, or the bound is unreachable by the lane that owns it and is only
 # ever spent by a LATER lane (the "budget spent" handoff for a budget it never had).
@@ -368,8 +368,14 @@ _mw="$(sed -n 's/.*LANE_MERGE_MAX_WATCH:-\([0-9]*\)}.*/\1/p' "$SCRIPT" | head -1
 _ps="$(sed -n 's/.*LANE_MERGE_POLL:-\([0-9]*\)}.*/\1/p' "$SCRIPT" | head -1)"
 # lane.sh invokes it as `run_agent "${LANE_TIMEOUT:-3300}" …`, so read the default out of THAT call.
 _lt="$(grep -o 'LANE_TIMEOUT:-[0-9]*' "$HERE/lane.sh" | head -1 | tr -dc '0-9')"
-ck "MAX_WATCH x POLL ($_mw x $_ps) < lane.sh LANE_TIMEOUT ($_lt) — checked by ARITHMETIC" \
-   $([ -n "$_mw" ] && [ -n "$_ps" ] && [ -n "$_lt" ] && [ $((_mw * _ps)) -lt "$_lt" ] && echo 0 || echo 1)
+# ⛔ THE INVARIANT IS `WAIT_S + MAX_WATCH x POLL <= LANE_TIMEOUT`, not `MAX_WATCH x POLL <
+# LANE_TIMEOUT`: the check wait spends WAIT_S of the SAME wall clock, so a budget that ignores it leaves
+# most of the chunks unreachable and the rest is inherited by a LATER lane — the "budget spent for a
+# budget it never had" symptom, narrowed rather than closed (reviewer finding, verified).
+_ws="$(sed -n 's/.*LANE_MERGE_WAIT:-"\([0-9]*\)".*/\1/p' "$SCRIPT" | head -1)"
+[ -n "$_ws" ] || _ws="$(grep -o 'LANE_MERGE_WAIT:-[0-9]*' "$SCRIPT" | head -1 | tr -dc '0-9')"
+ck "WAIT_S ($_ws) + MAX_WATCH x POLL ($_mw x $_ps) = $(( ${_ws:-0} + ${_mw:-0} * ${_ps:-0} )) ≤ lane.sh LANE_TIMEOUT ($_lt) — by ARITHMETIC across the two files" \
+   $([ -n "$_mw" ] && [ -n "$_ps" ] && [ -n "$_lt" ] && [ -n "$_ws" ] && [ $((_ws + _mw * _ps)) -le "$_lt" ] && echo 0 || echo 1)
 new_o "$T/pr4.tsv"
 printf '20\n' > "$OT/state/lanemerge-32.watch"
 run 32 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-red.tsv"

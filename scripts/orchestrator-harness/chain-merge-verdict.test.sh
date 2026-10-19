@@ -25,8 +25,15 @@ T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
 mkdir -p "$T/bin" "$T/repo" "$T/home"
 cat > "$T/bin/gh" <<'EOF'
 #!/usr/bin/env bash
-# the chain asks ONE question: "which open PR is on this branch?" (and must not get a wider listing)
-printf '5\n'
+# TWO different questions reach this stub, and a stub that always prints a value makes the merge
+# confirmation UNFALSIFIABLE (reviewer finding, P2, verified: mutating `chain_merged_confirmed(){ return
+# 0; }` left the suite 10/10 green). So answer them separately:
+#   `pulls/<n>`  → "is THIS repo's PR merged?"      → ${MERGED_AT_STUB-} (set-but-empty = NOT merged)
+#   anything else→ "which open PR is on this branch?" → 5
+case " $* " in
+  *"pulls/"*) [ -n "${MERGED_AT_STUB+x}" ] && printf '%s\n' "$MERGED_AT_STUB" ;;
+  *) printf '5\n' ;;
+esac
 EOF
 chmod +x "$T/bin/gh"
 
@@ -48,7 +55,7 @@ ran() { [ -f "$T/chain-ran" ]; }
 PID=""
 drive() { # drive <phase-grace> <handoff-wait> — starts the chain, sets $PID (never echoes: a caller
            # running this in $( ) would own the child in a SUBSHELL and could not wait/kill it)
-  PATH="$T/bin:$PATH" O="$T/o" HOME="$T/home" CHAIN_CLAIM_COMMIT="deadbeef" \
+  PATH="$T/bin:$PATH" O="$T/o" HOME="$T/home" CHAIN_CLAIM_COMMIT="deadbeef" MERGED_AT_STUB="${MERGED_AT_STUB-}" \
     LANE_PHASE_GRACE="$1" LANE_HANDOFF_WAIT="$2" \
     bash "$SCRIPT" "$T/repo" o/r 42 feat/42-tm >> "$T/o/logs/chain-42.log" 2>&1 &
   PID=$!
@@ -74,12 +81,29 @@ sleep 6
 GOT=0; ran && GOT=1
 ck "a CURRENT FIX_REQUIRED verdict is NOT a handoff — the chain waits instead of reviewing a head about to change" \
    $([ "$GOT" = 0 ] && grep -q "still working (FIX_REQUIRED)" "$T/o/logs/chain-42.log" && echo 0 || echo 1)
-# ...and the lane merging its PR ends the wait with no review at all.
+# ⛔ THE MARKER ALONE IS NOT A MERGE (reviewer finding, P2, verified). `state/merged-<PR>.done` is keyed
+# by PR NUMBER ONLY and `$O/state` is shared by every repo on the box, so a merge of another repo's PR
+# #5 ended this chain `exit 0` — skipping the review AND the merge. Arm (a): the marker exists but the
+# API reports no merged_at → the chain must NOT exit 0; it reviews at the tip instead.
 printf 'abc\n' > "$T/o/state/merged-5.done"
 for _ in $(seq 1 25); do kill -0 "$PID" 2>/dev/null || break; sleep 1; done
 wait "$PID" 2>/dev/null; RC=$?
-ck "…and once the lane MERGED the PR the chain exits 0 without paying for a review" \
-   $([ "$RC" = 0 ] && [ "$GOT" = 0 ] && ! ran && grep -q "MERGED by the lane" "$T/o/logs/chain-42.log" && echo 0 || echo 1)
+ck "…an UNCONFIRMED state/merged-5.done does NOT end the chain: it names the API read and reviews at the tip" \
+   $([ "$RC" = 0 ] && ran && grep -q "reports no merged_at" "$T/o/logs/chain-42.log" && echo 0 || echo 1)
+
+# Arm (b): the SAME marker WITH a confirmed merged_at → exit 0, no review — the pair is what makes the
+# confirmation discriminating rather than decorative.
+rig
+GOT=0
+printf '42 %s\n' "$(date +%s)" > "$T/o/state/lanemerge-5.phase"
+printf 'FIX_REQUIRED this head owns checks are RED: lint\n' > "$T/o/state/lanemerge-5.verdict"
+MERGED_AT_STUB='2026-10-19T00:00:00Z' drive 90 30
+sleep 3
+printf 'abc\n' > "$T/o/state/merged-5.done"
+for _ in $(seq 1 25); do kill -0 "$PID" 2>/dev/null || break; sleep 1; done
+wait "$PID" 2>/dev/null; RC=$?
+ck "…a CONFIRMED merged_at ends the wait with no review (the confirmation is what decides)" \
+   $([ "$RC" = 0 ] && ! ran && grep -q "MERGED by the lane" "$T/o/logs/chain-42.log" && echo 0 || echo 1)
 
 # ── 3. phase + a CURRENT BLOCKED_ATTESTATION verdict → the lane handed off; review now ───────────
 rig

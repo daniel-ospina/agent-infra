@@ -3507,9 +3507,18 @@ newdoc=0; grep -qE 'new-session.*-s cell-doctor( |$)' "$LA/st/argv" 2>/dev/null 
 # `seed_site "$LINENO"; for f in lane.sh chain-merge.sh; do` — anchored, that read as CLEAN (the count
 # half still matched, so the guard was green over a fixture seeding 2 of 12 workers). Verified by the
 # verifier's mutation; unanchored it is caught.
-# (comments are stripped first: this guard's own explanation quotes the shape it forbids)
-LITERAL_SEEDS="$(grep -vE '^[[:space:]]*#' "${BASH_SOURCE[0]}" \
-                 | grep -cE 'for [a-z]+ in .*[A-Za-z0-9_-]+\.sh[[:space:]].*[A-Za-z0-9_-]+\.sh')"
+# (comments are stripped first: this guard's own explanation quotes the shape it forbids, and a
+# `\`-continuation is joined so a list wrapped across lines cannot hide.) ⛔ THE SHAPE FILTER WAS
+# DODGEABLE THREE MORE WAYS — an UPPERCASE loop variable, a QUOTED list, and a list wrapped across
+# lines all read as clean (reviewer finding, measured against the shipped regex). So the test is now
+# "does any `for … in` line outside a comment name two or more `*.sh` files", which covers all three and
+# does not depend on the variable's name or on quoting.
+NOCOMMENT_SEEDS="$(grep -vE '^[[:space:]]*#' "${BASH_SOURCE[0]}" \
+                   | sed -e ':a' -e '/\\$/N; s/\\\n//' -e 'ta')"
+LITERAL_SEEDS="$(printf '%s\n' "$NOCOMMENT_SEEDS" | awk '
+  /for [A-Za-z_][A-Za-z0-9_]* in / && $0 !~ /\$SEED_WORKERS/ {
+    if (gsub(/\.sh/, ".sh") >= 2) c++
+  } END { print c + 0 }')"
 # The expected site count is READ from this file, not written down: a hardcoded number would false-block
 # the next section that adds a fixture (a category-B cost), while the occurrence count still catches
 # the failure that matters — a site that exists but did not RUN (early return, moved block).

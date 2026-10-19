@@ -104,10 +104,14 @@ WAIT_S="${LANE_MERGE_WAIT:-1500}";     is_limit "$WAIT_S" || WAIT_S=1500     # p
 # ⛔ BUT IT MUST FIT INSIDE THE LANE'S OWN WALL CLOCK (reviewer finding, P2, verified). 35 x 120s =
 # 4200s EXCEEDS lane.sh's LANE_TIMEOUT (3300s): the bound is then unreachable by the lane that owns
 # it — the process is killed first — and is only ever spent by a LATER lane that inherited the counter,
-# which then hands off with "budget spent" for a budget it never had. 25 x 120s = 3000s, inside the
-# 3300s wall clock with room for the wrap-up. A cycle that genuinely needs longer is not a lane
+# which then hands off with "budget spent" for a budget it never had.
+# ⛔ AND THE INVARIANT IS NOT `MAX_WATCH x POLL < LANE_TIMEOUT` — it is
+# `WAIT_S + MAX_WATCH x POLL <= LANE_TIMEOUT` (reviewer finding, P2, verified). The check wait above
+# spends WAIT_S (1500s) of the SAME 3300s wall clock, so 25 chunks left only ~15 reachable and the rest
+# was still inherited from a later lane — the symptom narrowed, not closed. 1500 + 15 x 120 = 3300: the
+# supervision budget is exactly what remains after the wait. A cycle that needs longer is not a lane
 # failure: it hands off as WAITING_* (exit 11) and the next invocation resumes the SAME counter.
-MAX_WATCH="${LANE_MERGE_MAX_WATCH:-25}"; is_limit "$MAX_WATCH" || MAX_WATCH=25
+MAX_WATCH="${LANE_MERGE_MAX_WATCH:-15}"; is_limit "$MAX_WATCH" || MAX_WATCH=15
 POLL_S="${LANE_MERGE_POLL:-120}";      is_limit "$POLL_S" || POLL_S=120      # one --watch chunk
 INTERVAL="${LANE_MERGE_INTERVAL:-20}"; is_limit "$INTERVAL" || INTERVAL=20
 [ "$INTERVAL" -ge 5 ] || INTERVAL=20
@@ -179,12 +183,20 @@ pr_read() {
 # "✅ MERGED — PR #<n> at head <tip>", exit 0, and record a MERGED verdict that `chain-merge.sh` then
 # treated as "nothing left to review": the review was skipped, the merge never happened, and the lane
 # read as done. One read, on this terminal path only, settles which PR was actually merged.
+# ⛔ THREE OUTCOMES, NOT TWO (reviewer finding, P2, verified). An UNREADABLE API (rate limit, DNS, a
+# failed gh) and an API that ANSWERED "not merged" are different facts, and collapsing them made a
+# rate-limited read turn a genuinely MERGED PR into a terminal BLOCKED — "stop fixing and hand off" —
+# with a comment asserting "reports no merged_at" about a read that never happened, while merge-rate.sh
+# counted the lane as `other_end` and chain-merge re-ran merge-one.sh on an already-merged PR.
+#   0 → merged (prints the merge commit)   1 → the API answered: NOT merged   2 → the read FAILED
 merged_confirmed() {
-  local mt sha
-  mt="$(gh api "repos/$OR/pulls/$PR" --jq '.merged_at // ""' 2>/dev/null)"
+  local mt rc=0 sha
+  mt="$(gh api "repos/$OR/pulls/$PR" --jq '.merged_at // ""' 2>/dev/null)" || rc=$?
+  [ "$rc" -eq 0 ] || return 2
   [ -n "${mt:-}" ] || return 1
   sha="$(gh api "repos/$OR/pulls/$PR" --jq '.merge_commit_sha // ""' 2>/dev/null)"
   printf '%s' "${sha:-$mt}"
+  return 0
 }
 
 # checks_read → TSV rows "name\tstatus\tconclusion\tid\tapp_slug", ALL attempts (filter=all is not
@@ -311,7 +323,12 @@ fi
       # head onto a chain launched for an OLDER head defeats the head-moved guard below, which exists
       # to notice exactly that. The recorded head is the one the chain is actually working.
       if [ -s "$CHAIN_F" ]; then
-        say "lane-merge: pid $opid already owns PR #$PR — keeping the recorded head $(chain_head) (log $O/logs/merge-$PR.log)"
+        # ⛔ KEEPING THE RECORDED HEAD IS ONLY HALF THE FIX (reviewer finding, P2, verified): the file is
+        # `<pid> <head> <log>`, and preserving ALL of it kept a DEAD pid too — so a live chain went
+        # unsupervised behind a dead pid, whose stale log could then name FIX_REQUIRED/PARKED and burn a
+        # round. The LIVE pid and the RECORDED head are both facts; write both.
+        printf '%s %s %s\n' "$opid" "$(chain_head)" "$(chain_log)" > "$CHAIN_F"
+        say "lane-merge: pid $opid already owns PR #$PR — supervising it at the recorded head $(chain_head) (log $(chain_log))"
       else
         printf '%s %s %s\n' "$opid" "${head:-}" "$O/logs/merge-$PR.log" > "$CHAIN_F"
         say "lane-merge: pid $opid already owns PR #$PR — supervising it (log $O/logs/merge-$PR.log)"
@@ -399,7 +416,10 @@ chain_verdict_from_log() { # chain_verdict_from_log <chain-log> [head]
     if tail -n 300 "$mlog" 2>/dev/null | grep -qE "MERGED via the rail|Successfully merged|is MERGED"; then
       # The log SAYS merged; only the API may confirm it (see merged_confirmed). Unconfirmed reads as
       # UNKNOWN, not MERGED — the caller then refuses to claim a merge rather than claiming a false one.
-      merged_confirmed >/dev/null && { echo "MERGED"; return; }
+      merged_confirmed >/dev/null; local _mc=$?
+      [ "$_mc" -eq 0 ] && { echo "MERGED"; return; }
+      # 2 = the read FAILED: re-runnable, not a verdict about the PR (see merged_confirmed).
+      [ "$_mc" -eq 2 ] && { echo "API_UNREADABLE"; return; }
       echo "UNCONFIRMED_MERGE"; return
     fi
     tail -n 300 "$mlog" 2>/dev/null | grep -q 'PARKED' && { echo "BLOCKED"; return; }
@@ -552,8 +572,12 @@ if [ "$WATCH" -eq 1 ]; then
     HEAD="${HD:-$(cat "$O/state/lanemerge-$PR.head" 2>/dev/null || true)}"
     case "${ST:-}" in
       closed) if [ -n "${MT:-}" ]; then
-                # MT is `merged_at` off THIS repo's PR read (pr_read), so it is a confirmation, not a hint.
-                verdict MERGED "$(merged_confirmed 2>/dev/null || printf '%s' "${HD:-}")"
+                # MT is `merged_at` off THIS repo's PR read (pr_read), so it is a confirmation, not a
+                # hint. ⛔ THE PAYLOAD MUST BE THE MERGE COMMIT HERE TOO (reviewer finding, P2): the
+                # other MERGED writers record `merge_commit_sha`, and the brief tells the lane to read
+                # this record back as "the merge sha" — a path-dependent payload makes that a trap. MT
+                # is the fallback when the follow-up read cannot answer.
+                verdict MERGED "$(merged_confirmed 2>/dev/null || printf '%s' "${MT:-${HD:-}}")"
                 say "✅ MERGED — PR #$PR at head ${HD:-}"; exit 0
               else
                 emit_blocked BLOCKED_CLOSED "PR #$PR is closed and was not merged by this chain"
@@ -563,8 +587,17 @@ if [ "$WATCH" -eq 1 ]; then
     # after launching leaves a chain working the old head; its eventual "MERGED"/"BLOCKED" would then
     # be read against the new one. The head the chain was launched for is recorded in CHAIN_F.
     if chain_alive && [ -n "$(chain_head)" ] && [ -n "${HD:-}" ] && [ "$(chain_head)" != "$HD" ]; then
+      # ⛔ HEAD-MOVED IS RE-RUNNABLE, NOT UNFALSIFIABLE (reviewer finding, P2, verified). Re-arming on
+      # every pass meant a chain that never died left the lane cycling WAITING_HEAD_MOVED until its 3300s
+      # wall clock ran out — a wait with no terminal state. One re-run is honest (the chain usually
+      # finishes the old head); a SECOND is a stuck chain, and that is a hand-off with a name.
+      _hm=$(( $(cat "$O/state/lanemerge-$PR.headmoved" 2>/dev/null || echo 0) + 1 ))
+      printf '%s\n' "$_hm" > "$O/state/lanemerge-$PR.headmoved" 2>/dev/null || true
       say "… the PR head moved past the chain's head ($(chain_head) → ${HD}) — the chain is working"
-      say "   a head that is no longer the tip. Run the loop again (no round is spent by this)."
+      say "   a head that is no longer the tip (pass $_hm of 2)."
+      if [ "$_hm" -ge 2 ]; then
+        emit_blocked BLOCKED "the merge chain (pid $(chain_pid)) is still bound to head $(chain_head) after 2 passes while the PR is at ${HD} — wait for it to exit, or kill pid $(chain_pid) and re-run"
+      fi
       : > "$WATCH_F" 2>/dev/null || true
       verdict WAITING_HEAD_MOVED "the supervision chain is bound to an older head"
       exit 11
@@ -577,6 +610,12 @@ if [ "$WATCH" -eq 1 ]; then
           msha="$(merged_confirmed 2>/dev/null)"
           verdict MERGED "${msha:-${HD:-}}"
           say "✅ MERGED — PR #$PR, merge commit ${msha:-?} (was head ${HD:-?})"; exit 0 ;;
+        API_UNREADABLE)
+          # The evidence we need could not be read. That is a WAIT, not a verdict: no comment, no round,
+          # and the next invocation asks again (the counter is untouched).
+          say "… the API could not be read while confirming the merge — re-run the loop (no round is spent)"
+          verdict WAITING_API "the merge confirmation read failed; not a statement about the PR"
+          exit 11 ;;
         UNCONFIRMED_MERGE)
           # ⛔ A MERGE CLAIM NOBODY CAN CONFIRM IS THE WORST OUTCOME HERE (reviewer finding, P0): the
           # log names a merge, the API says this PR is not merged. That is not "merged" and it is not
