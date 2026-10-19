@@ -467,11 +467,20 @@ claim_orphan_reason() {
       # the PR keying the README calls unaffected. A live pid is direct evidence a worker is alive, so
       # it outranks the host name — but ONLY where the pid is really local (the running host, or a name
       # this box wore), and never for an ISSUE key, whose holder and worker are different processes.
+      # ⛔ THE `box` SENTINEL IS NOT AN IDENTITY, ON EITHER SIDE OF THE COMPARISON (P0, cycle-9
+      # review). `claim_host` falls back to the literal `box` when the `hostname` probe cannot answer, and
+      # that string is THE SAME ON EVERY BOX — so `[ "$host" = "$(claim_host)" ]` matched every peer's
+      # `box:<pid>` claim, read the peer's pid as absent locally, and reclaimed (and pruned) a LIVE remote
+      # worker's claim. One shared install/PATH mistake makes every cell stamp `box:<pid>`, i.e. each box
+      # reaping the others' merge/fix claims: the steal direction, arriving through a probe that cannot
+      # answer. `claim_former_hosts` already refuses the sentinel; this gate must too. A sentinel owner
+      # falls through to the HOST rules, which abstain when they cannot judge.
       local is_local=0
-      if [ "$host" = "$(claim_host)" ]; then
+      if [ "$host" != "box" ] && [ "$host" = "$(claim_host)" ]; then
         is_local=1
       else
         case " $(claim_former_hosts) " in *" $host "*) is_local=1 ;; esac
+        [ "$host" != "box" ] || is_local=0
       fi
       if [ "$have_pid" = 1 ] && [ "$is_local" = 1 ]; then
         case "$pid" in ''|*[!0-9]*) return 1 ;; esac

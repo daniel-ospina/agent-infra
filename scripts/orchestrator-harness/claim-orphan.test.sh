@@ -45,6 +45,8 @@
 #   O19 [RED→GREEN] the destructive arms require POSITIVE evidence: an absent `ref` does not authorise
 #      the pid rule, and a `hostname` probe that cannot answer makes `claim_former_hosts` abstain
 #      (asserted on the function directly — through `claim_orphan_reason` the live-pid rule masks it).
+#   O22 [RED→GREEN] the `box` sentinel a failed `hostname` probe produces is NOT an identity: it is the
+#      same string on every box, so treating it as local let each cell reap the others' live claims.
 #   O21 [RED→GREEN] a FORMER name of this box with a LIVE local pid on a PR key is held-by-live, and the
 #      prune leaves it alone — the P0 that a rename would otherwise turn into a deleted live claim.
 #   O20 [RED→GREEN] the prune's unparseable-lease skip is a DELETING branch and is pinned here.
@@ -82,7 +84,7 @@
 #      below the review window it must outlive — a mid-review expiry, the duplicate this registry
 #      exists to prevent — and leaves nothing to diagnose.
 # ⛔ LABELLING HONESTY — MEASURED, not asserted. `CLAIMS_SH=<git archive HEAD>:claims.sh bash
-# claim-orphan.test.sh` (2026-10-18, against the pre-change claims.sh) reports 47 passed, 42 FAILED.
+# claim-orphan.test.sh` (2026-10-18, against the pre-change claims.sh) reports 49 passed, 45 FAILED.
 # Every [RED→GREEN] line is in that failing set, and so is exactly ONE line that carries no such label:
 # `O7 the PR keying declares a documented ceiling` (a pre-fix reader has no ceiling to declare). The
 # converse is what keeps the labels honest: a [PINNED] line must PASS pre-fix, because PINNED means
@@ -822,6 +824,55 @@ DEAD21="$(as_box "$ORIG21" newBox21 'claim_acquire "" 9209491 0123456789abcdef01
   printf "RC=%s\nRESULT=%s\n" "$?" "${CLAIM_RESULT:-}"' CLAIM_STATE_DIR="$CS21")"
 [ "$(field "$DEAD21" RC)" = "0" ]; O21C=$?
 ck "O21 [RED→GREEN] the SAME former name with a DEAD pid IS reclaimable (rc=$(field "$DEAD21" RC))" $O21C
+
+# ══ O22: the `box` SENTINEL from a failed `hostname` probe is NOT an identity ══
+# ⛔ P0, cycle-9 review. `claim_host` falls back to the literal `box`, and that string is THE SAME ON EVERY
+# BOX — so `[ "$host" = "$(claim_host)" ]` matched EVERY peer's `box:<pid>` claim, read the peer's pid
+# as absent on this machine, and reclaimed (and pruned) a LIVE remote worker's claim. One shared
+# install/PATH mistake makes every cell stamp `box:<pid>`, i.e. each box reaping the others' claims.
+# A sentinel owner must fall through to the host rules, which abstain when they cannot judge.
+echo
+echo "── O22: a `box:` owner is never treated as this box (the sentinel is fleet-wide) ────"
+ORIG22="$(mk_origin o22)"; ensure_work_repo "$ORIG22" || { echo "❌ fixture"; exit 2; }
+mkdir -p "$T/bin-nohost22"
+printf '#!/bin/sh\nexit 1\n' > "$T/bin-nohost22/hostname"; chmod +x "$T/bin-nohost22/hostname"
+CS22="$T/cs-o22"; mkdir -p "$CS22"
+FUT22=$(( $(date +%s) + 7200 ))
+as_box "$ORIG22" box 'c="$(_claim_commit "box:999999" "'"$FUT22"'")"
+  _git push -q origin "$c:refs/claims/9209500-0123456789ab" 2>/dev/null' CLAIM_STATE_DIR="$CS22" >/dev/null
+has_ref "$ORIG22" refs/claims/9209500-0123456789ab; ck "O22 (setup) a peer's \`box:\` PR claim is planted" $?
+SENT22="$(
+  PATH="$T/bin-nohost22:$PATH"
+  CLAIM_REPO="$T/repo"; CLAIM_STATE_DIR="$CS22"
+  export PATH CLAIM_REPO CLAIM_STATE_DIR
+  . "$CLAIMS_SH" || exit 1
+  printf "HOST=%s\n" "$(claim_host)"
+  claim_orphan_reason "box:999999" "refs/claims/9209500-0123456789ab" >/dev/null 2>&1; printf "RC=%s\n" "$?" )"
+[ "$(field "$SENT22" HOST)" = "box" ]; S22A=$?
+ck "O22 (setup) the failing probe really does fall back to the sentinel (host='$(field "$SENT22" HOST)')" $S22A
+[ "$(field "$SENT22" RC)" = "1" ]; S22B=$?
+ck "O22 [RED→GREEN] a live-unknown 'box:<pid>' PR claim is NOT orphaned (rc=$(field "$SENT22" RC))" $S22B
+# AND the prune must leave it alone — this is the arm that would delete a live REMOTE worker's claim.
+PR22="$(
+  PATH="$T/bin-nohost22:$PATH"
+  CLAIM_REPO="$T/repo"; CLAIM_STATE_DIR="$CS22"; export PATH CLAIM_REPO CLAIM_STATE_DIR
+  . "$CLAIMS_SH" || exit 1
+  claim_prune )"
+OWN22="$(lease_owner "$ORIG22" refs/claims/9209500-0123456789ab)"
+case "$OWN22" in
+  box:999999) S22C=0 ;;
+  *) S22C=1 ;;
+esac
+ck "O22 [RED→GREEN] claim_prune leaves it alone (owner is still '$OWN22')" $S22C
+# … and a `box` entry that somehow reached the history file is still not an identity.
+printf 'box\n' > "$CS22/claim-hosts"
+SENT22B="$(
+  PATH="$T/bin-nohost22:$PATH"
+  CLAIM_REPO="$T/repo"; CLAIM_STATE_DIR="$CS22"; export PATH CLAIM_REPO CLAIM_STATE_DIR
+  . "$CLAIMS_SH" || exit 1
+  claim_orphan_reason "box:999999" "refs/claims/9209500-0123456789ab" >/dev/null 2>&1; printf "RC=%s\n" "$?" )"
+[ "$(field "$SENT22B" RC)" = "1" ]; S22D=$?
+ck "O22 [RED→GREEN] 'box' in state/claim-hosts is still not an identity (rc=$(field "$SENT22B" RC))" $S22D
 
 echo
 echo "─────────────────────────────────────────────────────────────"

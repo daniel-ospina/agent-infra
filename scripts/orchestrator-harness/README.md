@@ -1386,10 +1386,14 @@ because "self-healing" reads as "retroactive".
 ⚠️ **Use the pid-preserving remedy, not `CLAIM_DEAD_HOSTS`.** Append the old name to
 `state/claim-hosts` (“this box wore it”) — the former-name rule then probes the pid, so a
 `<oldName>:<live pid>` PR claim reads held-by-live and a dead one is reclaimed. `CLAIM_DEAD_HOSTS=<old-name>`
-instead declares the name dead *outright*, so a claim minted by THIS box before the rename is reaped
-even while its `merge-one`/`fix-one` worker is alive — the same P0 (§7.2b) arriving through the
-remedy. Only use the deny list when no merge/fix is in flight (measured: with the name on the deny
-list a live local pid returns `owner host oldName is on CLAIM_DEAD_HOSTS`, rc=0).
+instead declares the name dead *outright*, and the deny list is checked on the host rules only — it
+never consults a pid. What it reaps is therefore: an **ISSUE** claim from that name (whose chain may
+be running — see the residual above), and a **PR** claim whose host was never recorded in
+`state/claim-hosts`. On a PR claim minted by this box the pid rule answers FIRST — the name is in the
+history, so the pid is probed and a live worker returns `held-by-live` (rc=1) before the deny list is
+reached (measured at head). So the deny list is safe for PR claims this box minted, and is NOT safe
+for the ISSUE claims of a lane that is still in flight: apply it only when no lane is mid-merge, or
+prefer the pid-preserving remedy above.
 
 ⚠️ **THE HOST RULES RUN FOR EVERY KEYING, AND THAT HAS A CONSEQUENCE WORTH STATING PLAINLY.** They
 answer "is the holder a live LANE?", and a name that no box answers to is dead *as an identity* — but
