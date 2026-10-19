@@ -73,7 +73,7 @@ trap 'rm -rf "$T"' EXIT
 
 # HERMETICITY (#1851 drive-by): the installer resolves {{TORTOISE_REPO}} from the AMBIENT
 # environment. On a box or cloud cell where it points at a real checkout, run_installer()
-# installs the two tortoise reaper jobs as well, so §1's fixed bootstrap count (8) becomes 10
+# installs the two tortoise reaper jobs as well, so §1's fixed bootstrap count (9) becomes 11
 # and the suite reds for a reason unrelated to the tree under test — measured on a Linux cell:
 # PASS=131 FAIL=1 with TORTOISE_REPO=/tmp/cell-t3 set, PASS=132 FAIL=0 with it unset, same tree.
 # Own the variable for the whole suite; the sections that exercise those templates (§13

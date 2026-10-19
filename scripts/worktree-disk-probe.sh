@@ -97,7 +97,10 @@ MEASURE=""
 YES=0
 
 usage() {
-    sed -n '/^# Usage:/,/^# Exit codes:/p' "$0" | sed -e 's/^# \{0,1\}//' -e '/^Exit codes:/d'
+    # The range ENDS at the first line that is not header comment, so the WHOLE contract prints —
+    # including the exit codes (#1858 review P2: the old range stopped AT `# Exit codes:` and the
+    # second sed then deleted that line, so the codes a caller depends on were never shown).
+    awk 'p && /^[^#]/ { exit } /^# Usage:/ { p=1 } p { sub(/^# ?/, ""); print }' "$0"
 }
 
 die() { # $1=code $2..=message
@@ -108,10 +111,15 @@ die() { # $1=code $2..=message
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --dir)             DIR="${2:-}"; shift 2 ;;
-        --repo)            REPO="${2:-}"; shift 2 ;;
-        --sample)          SAMPLE="${2:-}"; shift 2 ;;
-        --measure-removal) MEASURE="${2:-}"; shift 2 ;;
+        # Every value-bearing option REFUSES a missing value (#1858 review P1). `shift 2` with one
+        # word left is a silent no-op in bash, so the loop re-read the same option forever: measured
+        # `timeout 5 bash worktree-disk-probe.sh --dir` => exit 124, zero output, one core spinning —
+        # reachable from an unquoted unset variable (`--dir $ESTATE`), and a hang is the opposite of
+        # the boundedness this script promises.
+        --dir)             [ $# -ge 2 ] || die 2 "--dir requires a value"; DIR="$2"; shift 2 ;;
+        --repo)            [ $# -ge 2 ] || die 2 "--repo requires a value"; REPO="$2"; shift 2 ;;
+        --sample)          [ $# -ge 2 ] || die 2 "--sample requires a value"; SAMPLE="$2"; shift 2 ;;
+        --measure-removal) [ $# -ge 2 ] || die 2 "--measure-removal requires a value"; MEASURE="$2"; shift 2 ;;
         --no-du)           NO_DU=1; shift ;;
         --yes)             YES=1; shift ;;
         --help|-h)         usage; exit 0 ;;
@@ -157,6 +165,18 @@ canon_dir() { # canonical absolute path of an existing directory, empty on failu
     (cd "$1" 2>/dev/null && pwd -P) || true
 }
 
+# `du -sk` with its EXIT STATUS preserved, so a PARTIAL walk is distinguishable from a full one.
+# Every caller must branch on the status: du prints a partial total AND exits non-zero when a
+# subtree is unreadable, and publishing that total as an "upper bound" (report) or folding it into
+# the ratio (measure) reads a lower bound as an upper one (#1858 review P1). Prints the KiB total,
+# possibly empty; returns du's status.
+du_total() { # <dir> -> stdout KiB | nothing
+    local out
+    out="$("$DU_BIN" -sk "$1" 2>/dev/null)" || { printf '%s\n' "$out" | awk '$1 ~ /^[0-9]+$/ {print $1}'; return 1; }
+    printf '%s\n' "$out" | awk '$1 ~ /^[0-9]+$/ {print $1}'
+    return 0
+}
+
 uv_cache_dir() {
     if [ -n "${UV_CACHE_DIR:-}" ]; then
         printf '%s\n' "$UV_CACHE_DIR"
@@ -197,9 +217,20 @@ report() {
         echo "[apparent] (skipped — --no-du)"
     else
         local duk
-        duk="$("$DU_BIN" -sk "$dir_canon" 2>/dev/null | awk '$1 ~ /^[0-9]+$/ {print $1}')"
-        [ -n "$duk" ] || die 3 "\`du -sk\` gave no usable answer for '$dir_canon' — re-run with --no-du to report the regime without it"
-        printf '[apparent] %s KiB  (%s, one walk of the estate; this is an UPPER BOUND, never the real figure)\n' "$duk" "$DU_BIN -sk"
+        # `du` exits NON-ZERO and still prints a PARTIAL total when any subtree is unreadable
+        # (a root-run `uv sync`, another uid's venv — measured: 7836 KiB printed, rc=1, on a tree
+        # holding ~58 MB). Discarding that status published a LOWER bound as "an UPPER BOUND"
+        # (#1858 review P1). A partial walk is still worth showing, so print it and NAME it.
+        if duk="$(du_total "$dir_canon")"; then
+            [ -n "$duk" ] || die 3 "\`du -sk\` gave no usable answer for '$dir_canon' — re-run with --no-du to report the regime without it"
+            printf '[apparent] %s KiB  (%s, one walk of the estate; this is an UPPER BOUND, never the real figure)\n' "$duk" "$DU_BIN -sk"
+        else
+            case "$duk" in
+                '') die 3 "\`du -sk\` failed and gave no total for '$dir_canon' — re-run with --no-du to report the regime without it" ;;
+            esac
+            printf '[apparent] %s KiB  (%s -sk read a PARTIAL walk — it exited non-zero, so an\n' "$duk" "$DU_BIN"
+            echo "           unreadable subtree was skipped and this is a LOWER bound, NOT an upper bound)."
+        fi
     fi
 
     cache="$(uv_cache_dir)"
@@ -218,7 +249,13 @@ report() {
 
     links_total=0
     links_shared=0
-    for venv in "$dir_canon"/*/.venv; do
+    # A .venv lives at the ROOT of a worktree, so an estate's sits ONE level below --dir; but --dir
+    # may itself BE a worktree or a repo root (that is the DEFAULT — $PWD when $PWD/.worktrees is
+    # absent), where the .venv is AT --dir. Sampling only `<dir>/*/.venv` found nothing in that
+    # layout and then printed the affirmative "venv sharing is NOT in play here" — a claim about a
+    # path the instrument never looked at, and one that contradicts measure(), which samples
+    # `<worktree>/.venv/lib` (#1858 review P1). Both modes must agree on where a venv lives.
+    for venv in "$dir_canon"/.venv "$dir_canon"/*/.venv; do
         [ -d "$venv" ] || continue
         [ "$links_total" -lt "$SAMPLE" ] || break
         # Bounded, explicit walk: depth-limited under one venv's lib/, capped by --sample. This is
@@ -234,11 +271,17 @@ report() {
     done
 
     if [ "$links_total" = 0 ]; then
-        echo "[links]    no .venv found under the estate (or none readable) — venv sharing is NOT in play here;"
-        echo "           the estate's real cost is its checkouts. Measure it with --measure-removal."
+        echo "[links]    no .venv found at '$dir_canon/.venv' or one level below it (or none readable)" 
+        echo "           — venv sharing is NOT in play in what was EXAMINED here; the estate's real cost is"
+        echo "           its checkouts. Measure it with --measure-removal."
     elif [ "$links_shared" -gt 0 ]; then
-        printf '[links]    %s of %s sampled .venv file(s) have nlink > 1 -> HARDLINKS into the uv cache\n' "$links_shared" "$links_total"
-        echo "           (deleting a venv frees ~0 — the cache holds the blocks; do NOT rank targets by du)"
+        # nlink > 1 proves the blocks are SHARED; it does not prove WHO holds them. Nothing here
+        # compares against the cache path, and the suite's own A3 fixture hardlinks two files to
+        # EACH OTHER — so naming the cache as the holder was a provenance claim the instrument never
+        # checked (#1858 review P1→P2). Say what was measured.
+        printf '[links]    %s of %s sampled .venv file(s) have nlink > 1 -> BLOCK SHARING (a hardlink,\n' "$links_shared" "$links_total"
+        echo "           most often into the uv cache when it is on the same volume — see [uv-cache] above)"
+        echo "           (deleting such a venv frees ~0 — another holder keeps the blocks; do NOT rank targets by du)"
     else
         printf '[links]    %s sampled .venv file(s), ALL nlink = 1 -> no hardlinks\n' "$links_total"
         echo "           nlink=1 alone cannot separate CoW (clonefile) sharing from no sharing:"
@@ -267,9 +310,16 @@ measure() {
     [ -n "$p_canon" ] || die 2 "--measure-removal path is not a readable directory: '$MEASURE'"
 
     # Self-protection: never delete the tree we are running inside, nor an ancestor of it.
-    if [ "$PWD" = "$p_canon" ] || [ "${PWD#"$p_canon"/}" != "$PWD" ]; then
-        die 3 "refusing to remove '$p_canon': it contains this process's cwd"
-    fi
+    # BOTH SIDES ARE CANONICALISED (#1858 review P1). $p_canon is `pwd -P` output while $PWD is
+    # bash's LOGICAL cwd, so any symlinked path component defeated both arms — and on macOS
+    # /tmp -> /private/tmp and /var -> /private/var are symlinks, i.e. every fixture under $TMPDIR
+    # hit it. Measured: `cd $TMPDIR/lnk/wt/sub` then `--measure-removal <the real wt>` REMOVED the
+    # worktree containing the process's cwd. A guard that fails open on a path SPELLING is not a
+    # guard; canonicalise the cwd the same way the target was canonicalised.
+    pwd_canon="$(canon_dir "$PWD")" || true
+    case "$pwd_canon" in
+        ''|"$p_canon"|"$p_canon"/*) die 3 "refusing to remove '$p_canon': it contains this process's cwd" ;;
+    esac
 
     # It must be a REGISTERED worktree of --repo. `git worktree list --porcelain` is the only
     # source of that truth (the same source the reaper uses), and its paths are resolved.
@@ -287,28 +337,58 @@ measure() {
     # Anchor the df readings on the parent directory: it is on the volume that changes and it
     # still exists after the child checkout is removed.
     anchor="$(dirname "$p_canon")"
+
+    # EVERY INSTRUMENT READ THAT TAKES TIME HAPPENS BEFORE THE BASELINE (#1858 review P1).
+    # The `du` walk and the nlink sample used to sit BETWEEN the two df readings, so "real" was
+    # not "the bytes this removal freed" but "this removal PLUS however far the volume drifted
+    # during a full tree walk" — and on the shared box this file's own §3.5 decision #1 describes
+    # (~1 MB/s of other writers), a small worktree plus a few seconds of drift lands squarely in
+    # the band where the verdict prints the confident "REAL … du is a VALID instrument here".
+    # Neither the >1.1·app nor the <=0 arm catches that band. Baseline immediately before removal.
+    app=""
+    app_partial=0
+    if [ "$NO_DU" = 1 ]; then
+        :   # --no-du is honoured here too; measure() used to walk anyway (#1858 review P2).
+    else
+        if app="$(du_total "$p_canon")"; then
+            :
+        else
+            # A non-zero `du` prints a PARTIAL total: a LOWER bound. Using it as the apparent
+            # figure makes `real > 1.1·app` fire on an undercount and diagnose "other writers"
+            # for du's own missing subtree (#1858 review P1) — so no ratio is claimed from it.
+            app_partial=1
+            [ -n "$app" ] && :
+        fi
+    fi
+    n=""
+    f="$("$FIND_BIN" "$p_canon/.venv/lib" -maxdepth 6 -type f -name '*.py' 2>/dev/null | head -n 1)"
+    [ -n "$f" ] && n="$(stat_nlink "$f")"
+
     before_row="$(df_row "$anchor")"
     [ -n "$before_row" ] || die 3 "df gave no usable answer for '$anchor' BEFORE removal — nothing measured, nothing removed"
     fs="$(printf '%s' "$before_row" | cut -f1)"
     before_used="$(printf '%s' "$before_row" | cut -f3)"
 
-    app="$("$DU_BIN" -sk "$p_canon" 2>/dev/null | awk '$1 ~ /^[0-9]+$/ {print $1}')"
-
     echo "worktree-disk-probe --measure-removal — ${ISSUE_REF}"
     echo ""
     printf '[before]   %s used %s KiB  (anchor %s)\n' "$fs" "$before_used" "$anchor"
-    if [ -n "$app" ]; then
+    if [ "$NO_DU" = 1 ]; then
+        echo "[apparent] (skipped — --no-du) — the df figure below is still measured"
+    elif [ "$app_partial" = 1 ]; then
+        printf '[apparent] %s KiB  (%s -sk read a PARTIAL walk — it exited non-zero, so an unreadable\n' "${app:-?}" "$DU_BIN"
+        echo "           subtree was skipped and this is a LOWER bound, not an upper bound)."
+        echo "           No ratio is claimed from it: an undercount would make the >1.1 test fire and"
+        echo "           blame other writers for a subtree du could not read."
+        app=""
+    elif [ -n "$app" ]; then
         printf '[apparent] %s KiB  (%s -sk, an UPPER BOUND — du alone is not the real figure)\n' "$app" "$DU_BIN"
     else
         echo "[apparent] unreadable (du gave no answer) — reporting the df figure only"
     fi
-    n=""
-    f="$("$FIND_BIN" "$p_canon/.venv/lib" -maxdepth 6 -type f -name '*.py' 2>/dev/null | head -n 1)"
-    [ -n "$f" ] && n="$(stat_nlink "$f")"
     case "$n" in
         ''|*[!0-9]*) : ;;
         1)   echo '[nlink]    sample .venv file nlink = 1 (no hardlink; CoW sharing is still possible)' ;;
-        *)   printf '[nlink]    sample .venv file nlink = %s (hardlinks into the uv cache)\n' "$n" ;;
+        *)   printf '[nlink]    sample .venv file nlink = %s (block SHARING — a hardlink; who holds the other link is not what was read)\n' "$n" ;;
     esac
 
     printf '[remove]   %s -C %s worktree remove %s\n' "$GIT_BIN" "$repo_canon" "$p_canon"
@@ -325,8 +405,9 @@ measure() {
 
     real=$((before_used - after_used))
     printf '[after]    %s used %s KiB\n' "$fs" "$after_used"
-    printf '[real]     %s KiB released (df -Pk used delta: %s - %s; concurrent writes can mask a small removal)\n' \
+    printf '[real]     %s KiB released (df -Pk used delta: %s - %s; concurrent writes can MASK a small\n' \
         "$real" "$before_used" "$after_used"
+    echo "           removal — or INFLATE it; a delta above the apparent size is reported as no figure)"
 
     if [ "$real" -le 0 ]; then
         echo "[ratio]    n/a"
@@ -338,6 +419,20 @@ measure() {
     if [ -n "$app" ]; then
         ratio="$(awk -v a="$app" -v r="$real" 'BEGIN { printf "%.2f", a / r }')"
         printf '[ratio]    apparent/real = %s\n' "$ratio"
+        # A delta LARGER than the apparent size cannot have come from this removal — it is proof
+        # that other writers' bytes were counted, so the window has no attribution (#1858 review
+        # P1). Without this branch the ratio falls below 1.0, misses the `> 1.1` test and prints
+        # the CONFIDENT "REAL … du is a VALID instrument here" verdict — a false PASS, and the one
+        # the file's own §3.5 decision #1 (a shared box's df delta has no attribution) forbids.
+        # 10% slack absorbs block-accounting noise on an otherwise quiet box.
+        if awk -v a="$app" -v r="$real" 'BEGIN { exit !(r > a * 11 / 10) }'; then
+            echo "[ratio]    apparent/real = $ratio — the used delta EXCEEDS the apparent size"
+            echo "[verdict]  NO REAL FIGURE: the used delta is LARGER than what this worktree could"
+            echo "           have held, so other writers were counted in the window. Nothing here is"
+            echo "           attributable to this removal. This is NOT a pass — re-run on a quieter"
+            echo "           machine (WORKTREE_DISK_PROBE_SETTLE=N allows writeback to land)."
+            return 0
+        fi
         if awk -v r="$ratio" 'BEGIN { exit !(r > 1.1) }'; then
             echo "[verdict]  SHARED: du OVER-reports what removing this worktree frees on THIS machine"
             echo "           (apparent/real = $ratio). Reap whole worktrees; do NOT rank or shrink by du."

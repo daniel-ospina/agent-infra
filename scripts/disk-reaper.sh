@@ -1057,8 +1057,11 @@ reap_worktree() {
     VERDICT_WT="$(class_verdict "$RC_WT")"
     DF_WT_OK="$MEASURED"; RAW_WT="$raw"
     if is_dry; then FREED_WT=0; else FREED_WT="$freed"; fi
-    # The owner deliberately reports NO byte figure (its `.venv`s are hardlinked into the uv cache,
-    # measured 84 GB du delta vs 22 GB freed). The consolidation requirement is "byte counts in
+    # The owner deliberately reports NO byte figure: whether its `.venv`s share cache blocks is a
+    # PER-MACHINE property (#1851 — the old universal "84 GB du delta vs 22 GB freed" mechanism was
+    # falsified; measured regimes are APFS clonefile, hardlink, and neither, ratio 1.004). A `du`
+    # figure here would therefore be an upper bound dressed as a saving. The consolidation
+    # requirement is "byte counts in
     # dry-run", so the ENTRY POINT measures each selected checkout with a bounded `du` and labels it
     # for what it is. The owner's contract is untouched: it still never claims a saving.
     if is_dry; then

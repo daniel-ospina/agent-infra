@@ -87,9 +87,16 @@ ownership stays #1678 / #1759 and is not restated.
 
 | Command | Result |
 |---|---|
-| `bash scripts/worktree-disk-probe.test.sh` | 64 assertions, 0 failed |
-| `bash scripts/pi-reap-worktrees.test.sh` | 251 passed, 0 failed |
-| `bash scripts/install-launchd.test.sh` | PASS=132 FAIL=0 |
+Re-measured at the review-fix head — a count that carries no revision drifts (the review found
+this table still claiming 251 for a suite the tree reports at 258).
+
+| Command | Result |
+|---|---|
+| `bash scripts/worktree-disk-probe.test.sh` | 98 assertions, 0 failed (was 64 at first push; +A2b/A3b/A5b/A11b/A13b/A13c legs) |
+| `bash scripts/pi-reap-worktrees.test.sh` | 258 passed, 0 failed |
+| `bash scripts/reap-lane-venvs.test.sh` | 90 assertions, ALL PASS |
+| `bash scripts/disk-reaper.test.sh` | 94 assertions, ALL PASS |
+| `bash scripts/install-launchd.test.sh` | PASS=144 FAIL=0 |
 | `bash tests/ci-lane-parity/run.sh` | 90 assertions passed |
 | `bash pi-bootstrap/tests/test-setup-no-nesting.sh` | fleet_srcs farmed byte-identical |
 | `bash scripts/run-bash-shards.sh --list` | probe suite registered |

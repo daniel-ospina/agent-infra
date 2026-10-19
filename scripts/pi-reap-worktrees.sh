@@ -1255,7 +1255,10 @@ run() {
     say "      (Linux/overlayfs, a cache on another volume — measured 2026-10-16: du 22.0 MB vs df"
     say "      +0.6 MB when cloned; du 5,647 MiB vs df 5.90 GB real, ratio 1.004). The deliverable"
     say "      win is FILE COUNT. Real bytes are measured per machine, never inferred from du:"
-    say "      bash scripts/worktree-disk-probe.sh --help   (#1851)"
+    # The probe is FARMED (pi-bootstrap/setup.sh fleet_srcs) because cells run this reaper from
+    # $DEST/scripts, not from a checkout — so a repo-relative `scripts/...` hint would not resolve
+    # where this line is actually read. Name the SIBLING this script was invoked as (#1858 review P2).
+    say "      bash ${SELF_DIR:+$SELF_DIR/}worktree-disk-probe.sh --help   (#1851)"
     say ""
 
     local elapsed=0 crumb verdict reason detail rc

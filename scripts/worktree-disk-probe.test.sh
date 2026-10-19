@@ -14,6 +14,7 @@
 # Coverage:
 #   A1  --help                       usage text, exit 0
 #   A2  unknown arg / bad --sample   exit 2, never a silent default
+#   A2b a value-bearing option with NO value   exit 2 — never a spin (#1858 review P1)
 #   A3  nlink > 1                    the HARDLINK regime is named (du is NOT the ranking key)
 #   A4  all nlink = 1                the CoW-or-none regime is named; no false "shared" claim
 #   A4b no .venv                     the venv-sharing question is declared N/A, not guessed
@@ -24,8 +25,10 @@
 #   A9  unregistered path            refuse (exit 3), worktree intact
 #   A10 main checkout                refuse (exit 3) — the one git never removes for you
 #   A11 ancestor of cwd              refuse (exit 3), worktree intact
+#   A11b cwd reached through a SYMLINK  refused too — the guard is on the path, not its spelling
 #   A12 measured removal             BOTH du and df reported; real = df used delta; ratio = du/real
 #   A13 real delta <= 0              NO REAL FIGURE (exit 0) — a busy box is not a "shared" verdict
+#   A13b real delta > apparent       NO REAL FIGURE — a contaminated window is not a "REAL" pass
 #   A14 df unreadable before         exit 3, nothing removed
 #   A15 df unreadable after          exit 3, no invented figure (and no du-only "real")
 #   A16 real df/du end-to-end        the live path removes and reports (internal consistency)
@@ -78,11 +81,15 @@ esac
 if [ "$n" = 1 ]; then used="${DF_USED_BEFORE:-1000000}"; else used="${DF_USED_AFTER:-800000}"; fi
 printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\nfakefs 2000000 %s 500000 80%% /\n' "$used"
 SH
-# `du`: a fixed apparent figure, plus a canary so A5 can prove the walk was skipped.
+# `du`: a fixed apparent figure, plus a canary so A5 can prove the walk was skipped. DU_FAIL
+# models the REAL partial-walk contract: du prints a total AND exits non-zero when a subtree is
+# unreadable (measured: 7836 KiB with rc=1 on a tree holding ~58 MB), which is a LOWER bound.
 cat >"$BIN/du" <<'SH'
 #!/usr/bin/env bash
 [ -n "${DU_CANARY:-}" ] && : >"$DU_CANARY"
 printf '%s\t%s\n' "${DU_SHIM_KIB:-1234}" "$2"
+[ "${DU_FAIL:-none}" = "partial" ] && exit 1
+exit 0
 SH
 chmod +x "$BIN/df" "$BIN/du"
 
@@ -131,10 +138,22 @@ assert_contains "$OUT" "unknown argument" "A2 unknown arg is named"
 OUT="$(bash "$PROBE" --sample abc 2>&1)"; RC=$?
 assert_eq "$RC" "2" "A2 non-numeric --sample exits 2"
 
+# A missing value used to be re-parsed forever (`shift 2` is a silent no-op with one word left):
+# measured exit 124 under `timeout 5`, zero output. A refusal is the only acceptable answer.
+for opt in --dir --repo --sample --measure-removal; do
+  OUT="$(timeout 5 bash "$PROBE" "$opt" 2>&1)"; RC=$?
+  assert_eq "$RC" "2" "A2b $opt with no value exits 2 (not a spin)"
+  assert_contains "$OUT" "requires a value" "A2b $opt with no value names the missing value"
+done
+
 echo "── A3/A4/A4b: the link regime is classified, not assumed ──"
 OUT="$(shimmed bash "$PROBE" --dir "$T/estate-hl" --sample 50)"; RC=$?
 assert_eq "$RC" "0" "A3 report exits 0"
-assert_contains "$OUT" "HARDLINKS into the uv cache" "A3 nlink>1 is reported as the hardlink regime"
+# nlink > 1 proves the blocks are SHARED; it does NOT prove the uv cache holds the other link —
+# this very fixture hardlinks two files to EACH OTHER, so naming the cache was a provenance claim
+# the instrument never checked (#1858 review P1→P2). The message must name what was measured.
+assert_contains "$OUT" "BLOCK SHARING" "A3 nlink>1 is reported as the block-sharing regime"
+assert_absent "$OUT" "HARDLINKS into the uv cache" "A3 no unverified claim about WHO holds the blocks"
 assert_contains "$OUT" "do NOT rank targets by du" "A3 the du-ranking consequence is stated"
 assert_contains "$OUT" "[apparent] 1234 KiB" "A3 the apparent figure comes from du -sk"
 assert_contains "$OUT" "SAME volume" "A3 a same-volume cache is reported as a sharing precondition"
@@ -149,12 +168,36 @@ OUT="$(shimmed bash "$PROBE" --dir "$T/estate-none" --sample 50)"; RC=$?
 assert_eq "$RC" "0" "A4b report exits 0"
 assert_contains "$OUT" "no .venv found" "A4b a venv-less estate declares the question N/A"
 
+echo "── A3b: a .venv AT --dir is found, not reported absent ──"
+# A .venv lives at a WORKTREE ROOT, so when --dir IS the worktree (or the repo root, which is the
+# documented default: $PWD when $PWD/.worktrees is absent) the venv is at --dir, not one level
+# below it. Sampling only `<dir>/*/.venv` found nothing there and then printed the affirmative
+# "venv sharing is NOT in play here" — a claim about a path never examined (#1858 review P1).
+mkdir -p "$T/estate-at-root/.venv/lib/python3.12/site-packages"
+printf 'z = 3\n' >"$T/estate-at-root/.venv/lib/python3.12/site-packages/d.py"
+OUT="$(shimmed bash "$PROBE" --dir "$T/estate-at-root" --sample 50)"
+assert_eq "$RC" "0" "A3b report on a venv-at-root estate exits 0"
+assert_contains "$OUT" "1 sampled .venv file(s)" "A3b the .venv AT --dir is sampled"
+assert_absent "$OUT" "no .venv found" "A3b it is NOT reported as absent"
+
 echo "── A5: --no-du skips the walk and keeps the caveat ──"
 CANARY="$T/du-canary"
 OUT="$(DU_CANARY="$CANARY" shimmed bash "$PROBE" --dir "$T/estate-hl" --no-du)"; RC=$?
 assert_eq "$RC" "0" "A5 --no-du exits 0"
 assert_nofile "$CANARY" "A5 \`du\` is NOT executed under --no-du (canary untouched)"
 assert_contains "$OUT" "[apparent] (skipped — --no-du)" "A5 the skip is stated, not silent"
+
+# A5b: --no-du is documented as "skip the du -sk walk" with no mode qualifier, but measure()
+# called du unconditionally — the flag was accepted and silently dropped (#1858 review P2).
+"$REAL_GIT" -C "$T/repo" worktree add -q -b feat/m7 "$T/m7"
+CANARY2="$T/du-canary-measure"
+OUT="$(DF_SHIM_COUNT="$T/c5b" DU_CANARY="$CANARY2" shimmed bash "$PROBE" --repo "$T/repo" \
+       --measure-removal "$T/m7" --yes --no-du)"; RC=$?
+assert_eq "$RC" "0" "A5b --measure-removal --no-du exits 0"
+assert_nofile "$CANARY2" "A5b \`du\` is NOT executed in measure mode under --no-du"
+assert_contains "$OUT" "(skipped — --no-du)" "A5b the skip is stated in measure mode too"
+assert_absent "$OUT" "du is a VALID instrument here" "A5b no ratio pass is claimed without an apparent figure"
+assert_nodir "$T/m7" "A5b the named worktree was still removed and measured"
 
 echo "── A6: an unreadable df is a failure, not a number ──"
 OUT="$(DF_FAIL=always shimmed bash "$PROBE" --dir "$T/estate-hl" 2>&1)"; RC=$?
@@ -185,6 +228,17 @@ assert_eq "$RC" "3" "A11 a worktree containing the process cwd is refused"
 assert_contains "$OUT" "process's cwd" "A11 the refusal names the cwd reason"
 assert_dir "$T/m2" "A11 the worktree was not removed"
 
+# A11b: the same guard, reached through a SYMLINKED path. `$p_canon` is `pwd -P` output while $PWD is
+# bash's LOGICAL cwd, so a symlinked component used to defeat both arms and the removal PROCEEDED
+# (#1858 review P1) — on macOS /tmp and /var are symlinks, so every $TMPDIR fixture hit it.
+mkdir -p "$T/lnk"
+ln -s "$T/m2" "$T/lnk/m2-via-link"
+assert_dir "$T/lnk/m2-via-link/sub" "A11b the symlinked cwd fixture resolves"
+OUT="$(cd "$T/lnk/m2-via-link/sub" && DF_SHIM_COUNT="$T/c11b" DF_BIN="$BIN/df" DU_BIN="$BIN/du" UV_CACHE_DIR="$T/fake-cache" WORKTREE_DISK_PROBE_SETTLE=0 bash "$PROBE" --repo "$T/repo" --measure-removal "$T/m2" --yes 2>&1)"; RC=$?
+assert_eq "$RC" "3" "A11b a cwd reached through a symlink is refused"
+assert_contains "$OUT" "process's cwd" "A11b the symlink refusal names the cwd reason"
+assert_dir "$T/m2" "A11b the worktree was not removed"
+
 echo "── A12: the measured removal reports BOTH instruments ──"
 OUT="$(DF_SHIM_COUNT="$T/c12" DF_USED_BEFORE=1000000 DF_USED_AFTER=800000 DU_SHIM_KIB=1000000 \
        shimmed bash "$PROBE" --repo "$T/repo" --measure-removal "$T/m1" --yes)"; RC=$?
@@ -203,6 +257,35 @@ assert_eq "$RC" "0" "A13 a zero delta still exits 0 (the removal succeeded)"
 assert_contains "$OUT" "NO REAL FIGURE" "A13 a zero delta is reported as no figure"
 assert_absent "$OUT" "SHARED" "A13 a busy box is NOT reported as shared blocks"
 assert_nodir "$T/m2" "A13 the named worktree was removed"
+
+echo "── A13b: a delta ABOVE the apparent size is a contaminated window, not a verdict ──"
+"$REAL_GIT" -C "$T/repo" worktree add -q -b feat/m6 "$T/m6"
+# A POSITIVE delta of 500000 KiB for a tree `du` says holds 100000: only concurrent writers can
+# produce that, so nothing is attributable to this removal (#1858 review P1 — this used to take the
+# confident "REAL … du is a VALID instrument here" branch and print apparent/real = 0.20).
+OUT="$(DF_SHIM_COUNT="$T/c13b" DF_USED_BEFORE=1000000 DF_USED_AFTER=500000 DU_SHIM_KIB=100000 \
+       shimmed bash "$PROBE" --repo "$T/repo" --measure-removal "$T/m6" --yes)"; RC=$?
+assert_eq "$RC" "0" "A13b a contaminated window still exits 0 (the removal succeeded)"
+assert_contains "$OUT" "NO REAL FIGURE" "A13b a delta above the apparent size is no figure"
+assert_contains "$OUT" "EXCEEDS the apparent size" "A13b the contamination is named, not inferred"
+assert_absent "$OUT" "du is a VALID instrument here" "A13b NO 'du is valid here' pass on a contaminated window"
+assert_absent "$OUT" "SHARED:" "A13b no ratio verdict is claimed either"
+assert_nodir "$T/m6" "A13b the named worktree was removed"
+
+echo "── A13c: a PARTIAL du walk is a LOWER bound, not the apparent figure ──"
+"$REAL_GIT" -C "$T/repo" worktree add -q -b feat/m8 "$T/m8"
+# `du` exits 1 having printed a total for the part it COULD read. That total is small, so folding
+# it into the ratio makes `real > 1.1·app` fire and the verdict blame concurrent writers for a
+# subtree du could not read (#1858 review P1). No ratio may be claimed from a partial walk.
+OUT="$(DF_SHIM_COUNT="$T/c13c" DF_USED_BEFORE=1000000 DF_USED_AFTER=942000 DU_SHIM_KIB=1000 \
+       DU_FAIL=partial shimmed bash "$PROBE" --repo "$T/repo" --measure-removal "$T/m8" --yes 2>&1)"; RC=$?
+assert_eq "$RC" "0" "A13c a partial walk still measures the removal (exit 0)"
+assert_contains "$OUT" "PARTIAL walk" "A13c the partial walk is named"
+assert_contains "$OUT" "LOWER bound" "A13c it is called a lower bound, not an upper bound"
+assert_absent "$OUT" "UPPER BOUND" "A13c a partial walk is never published as an upper bound"
+assert_absent "$OUT" "other writers were counted" "A13c du's unreadable subtree is NOT blamed on other writers"
+assert_absent "$OUT" "du is a VALID instrument here" "A13c no ratio pass from an undercounted figure"
+assert_nodir "$T/m8" "A13c the named worktree was removed"
 
 echo "── A14/A15: df cannot answer before or after ──"
 "$REAL_GIT" -C "$T/repo" worktree add -q -b feat/m3 "$T/m3"
@@ -236,7 +319,11 @@ assert_nodir "$T/m4" "A16 the live path actually removed the worktree"
 # ABSOLUTE magnitude is deliberately not asserted — a busy box's writeback is not this suite's
 # subject, and A12 pins the arithmetic exactly under the shim.
 assert_contains "$OUT" "df -Pk used delta" "A16 the live real figure names its instrument"
-case "$REPORTED_REAL" in ''|*[!0-9]*) bad "A16 the live real reading is a number (got: '$REPORTED_REAL')" ;; *) ok "A16 the live real reading is a number ($REPORTED_REAL KiB)" ;; esac
+# A live delta is a DIFFERENCE between two real df readings, so a negative value is legitimate
+# ("-160 KiB released" is what this suite observed on a busy box) — the intent here is that the
+# instrument produced a NUMBER, which a `-` prefix does not contradict (#1858 review P2: the old
+# digits-only case red-ed a green tree).
+case "$REPORTED_REAL" in ''|*[!0-9-]*|-) bad "A16 the live real reading is a number (got: '$REPORTED_REAL')" ;; *) ok "A16 the live real reading is a number ($REPORTED_REAL KiB)" ;; esac
 
 echo "── A17: the measured model is the one published, not the falsified one ──"
 SRC="$(cat "$PROBE")"

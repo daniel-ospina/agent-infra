@@ -56,9 +56,12 @@
 # with `REAP_VENV_ALLOW_DEGRADED_CWD=1` set EXPLICITLY, in which case the pass says so on every line.
 #
 # BYTE ACCOUNTING — two numbers, because they answer different questions and only one is honest alone
-#   * `du` per venv: the BLOCKS THE TREE OCCUPIES. It OVER-REPORTS what removal frees, because a venv
-#     hardlinks into the `uv` cache and the same cache blocks are counted again for every venv that
-#     shares them (measured for worktrees: 84 GB `du` delta vs 22 GB actually freed, #1095).
+#   * `du` per venv: the BLOCKS THE TREE OCCUPIES — an UPPER BOUND on what removal frees, never a
+#     figure. Whether it over-reports is PER MACHINE, not universal (#1851 falsified the old claim
+#     here): a venv shares cache blocks only where the filesystem does — APFS clonefile (du 22.0 MB
+#     vs df used +0.6 MB, nlink=1), a hardlink into the cache (du 5,704 MB vs 186 MB released,
+#     nlink>1), or NEITHER (du 5,647 MiB vs df 5.90 GB, ratio 1.004 — du is accurate there). Measure
+#     it on the box in front of you with `scripts/worktree-disk-probe.sh`; never infer it.
 #   * `df` delta across the pass: what the FILESYSTEM actually got back. This is the reclamation.
 # Both are printed. Nothing here claims the `du` figure was freed.
 #
@@ -102,9 +105,10 @@
 # for a breach and the reaper does not pretend otherwise: it will not delete a live lane's env to get
 # back above the floor, so the line NAMES the breach rather than hiding it behind a green summary.
 #
-# ⛔ THE `uv` DOWNLOAD CACHE IS NEVER TOUCHED. A venv hardlinks into it; removing the cache does not
-# free the space it appears to (the links keep the blocks alive), and it forces every subsequent
-# `uv sync` to write a full copy instead of a shared one. That is the measured regression that created
+# ⛔ THE `uv` DOWNLOAD CACHE IS NEVER TOUCHED. Where a venv shares blocks with it (a hardlink, or an
+# APFS clone), removing the cache does not free the space it appears to — the links keep the blocks
+# alive — and on EVERY machine it forces the next `uv sync` to write a full copy instead of a shared
+# one, so the rule holds whether or not the sharing regime is active on this box. That is the measured regression that created
 # this situation in the first place: 6.1 GB "freed" by deleting the cache, then re-spent as duplicated
 # venvs. If the cache must be bounded, that is `uv cache prune` (which preserves live links) — a
 # different tool with different semantics, and deliberately NOT this one.
