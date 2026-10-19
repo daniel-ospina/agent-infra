@@ -88,11 +88,25 @@
 #   DISK_REAPER_DU_TIMEOUT     watchdog per dry-run `du`, secs (default 120)
 #   DISK_REAPER_STALE_SECONDS  a status older than this is STALE (default 7200)
 #   CACHE_REAPER / VENV_REAPER / WORKTREE_REAPER  explicit delegate paths
+#   BOUNDED_LIB                the bounded-execution helper (default: lib/bounded.sh beside this
+#                              script, then $HOME/.pi/agent/scripts/lib/); a SET-but-missing value is
+#                              a refusal at startup, never a silent different file (#2046)
+#   TB_TIMEOUT_BIN             pin the watchdog binary (`timeout`/`gtimeout`); unusable => refusal
+#   TB_TIMEOUT_FORCE_INTERNAL  1 = use the internal watchdog even where `timeout` exists
+#
+# BOUNDED EXECUTION (#2046). Every subprocess here runs under a wall-clock bound resolved ONCE by
+# scripts/lib/bounded.sh: `timeout` -> `gtimeout` -> an internal background watchdog (same contract,
+# 124 == timeout). macOS ships neither binary, so before #2046 every class failed closed with rc=3 and
+# the pass completed anyway. The resolved mechanism is recorded in the pass record (`watchdog=`);
+# when it is NOT GNU `timeout` the pass prints one line naming it, so the fallback is visible without
+# changing the report on a host that has the real binary.
 #
 # Exit codes: 0 pass completed, every class ok
 #             2 usage
 #             3 fail-closed: a delegate is missing, failed closed, or a class had no repo to scan —
-#               nothing is claimed for it (a skipped class is NEVER a pass)
+#               nothing is claimed for it (a skipped class is NEVER a pass); also a REFUSAL AT
+#               STARTUP when the bounded-execution library is missing or TB_TIMEOUT_BIN is unusable,
+#               in which case no per-class line is emitted at all
 #             4 a class completed but at least one removal FAILED
 #             5 dry-run only: a class reported work it would do (over budget / reapable items), so
 #               the pass is informative but the condition is still present
@@ -205,6 +219,7 @@ print_status() {
     say "iso=$iso"
     say "age_seconds=$age"
     say "mode=$mode"
+    say "watchdog=$(status_field watchdog)"
     say "rc=$rc"
     say "freed_mb=$freed"
     say "freed_mb_uv=$(status_field freed_mb_uv)"
@@ -228,6 +243,37 @@ print_status() {
 if [ "${PRINT_STATUS:-0}" = "1" ]; then
     print_status
     exit $?
+fi
+
+# ── bounded execution — the macOS half of this script (#2046) ───────────────────────────────────
+# `timeout` is GNU coreutils and macOS ships it NOWHERE (`gtimeout` only with Homebrew coreutils), so
+# every call site below used to fail with `timeout: command not found` (rc=127 -> fail-closed, rc=3)
+# while the pass completed and printed `verdict=fail-closed` per class — a false PASS that removed
+# nothing. The resolver lives in ONE place (scripts/lib/bounded.sh: `timeout` -> `gtimeout` -> an
+# internal background watchdog with the same status contract, 124 == timeout) and is shared with
+# `pi-reap-worktrees.sh`, which already carried that watchdog as `run_bounded`. A missing library is a
+# REFUSAL AT STARTUP, never a pass whose classes all quietly fail closed.
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+BOUNDED_LIB="${BOUNDED_LIB:-}"
+if [ -z "$BOUNDED_LIB" ]; then
+    for cand in "$SELF_DIR/lib/bounded.sh" \
+                "${HOME:-}/.pi/agent/scripts/lib/bounded.sh"; do
+        [ -n "$cand" ] || continue
+        [ -f "$cand" ] && { BOUNDED_LIB="$cand"; break; }
+    done
+fi
+if [ ! -f "$BOUNDED_LIB" ]; then
+    printf '%s: ⛔ FAIL-CLOSED at startup — the bounded-execution library is missing (%s).\n' \
+        "$SCRIPT_NAME" "${BOUNDED_LIB:-not beside this script ($SELF_DIR/lib/) and not in ${HOME:-}/.pi/agent/scripts/lib/}" >&2
+    printf '%s: refusing to start, because without it every class reports verdict=fail-closed and the pass completes looking like a run (#2046)\n' "$SCRIPT_NAME" >&2
+    exit 3
+fi
+# shellcheck source=lib/bounded.sh
+. "$BOUNDED_LIB"
+if [ "${TB_TIMEOUT_KIND:-}" = "invalid" ]; then
+    printf '%s: ⛔ FAIL-CLOSED at startup — TB_TIMEOUT_BIN=%s cannot be executed.\n' "$SCRIPT_NAME" "${TB_TIMEOUT_BIN:-}" >&2
+    printf '%s: refusing instead of falling back, because a pinned watchdog that is silently ignored is the defect this refusal exists to prevent\n' "$SCRIPT_NAME" >&2
+    exit 3
 fi
 
 # ── delegate resolution ──────────────────────────────────────────────────────────────────────────
@@ -260,7 +306,8 @@ WORKTREE_REAPER_PATH="$(find_delegate "${WORKTREE_REAPER:-}" pi-reap-worktrees.s
 # ── bounded probes ──────────────────────────────────────────────────────────────────────────────
 # Every subprocess that reads the filesystem runs under a watchdog: a reaper that HANGS the cell is
 # worse than the disk it was reclaiming. `du` is charged to the class watchdog, and a timeout is a
-# FAILURE of the class (never a silent 0).
+# FAILURE of the class (never a silent 0). `tb_timeout` is the ONE bounded-execution helper (#2046):
+# `timeout` -> `gtimeout` -> the internal watchdog, so the bound exists on macOS too.
 now() { date +%s; }
 
 # free_kb <path> — filesystem free KiB, or empty when df cannot answer (never read as "enough").
@@ -287,7 +334,7 @@ file_mtime() {
 # du_mb <path> — blocks occupied, MiB. Empty on failure (never 0: 0 reads as "empty").
 du_mb() {
     local kb
-    kb="$(timeout "$DU_TIMEOUT" "$DU_BIN" -sk "$1" 2>/dev/null)" || return 1
+    kb="$(tb_timeout "$DU_TIMEOUT" "$DU_BIN" -sk "$1" 2>/dev/null)" || return 1
     kb="${kb%%[[:space:]]*}"
     case "$kb" in ''|*[!0-9]*) return 1 ;; esac
     printf '%s' "$(( kb / 1024 ))"
@@ -297,7 +344,7 @@ du_mb() {
 # Sets CLASS_OUT / CLASS_RC. A timeout is rc=124, which every caller treats as fail-closed.
 CLASS_OUT=""; CLASS_RC=0
 run_class() {
-    CLASS_OUT="$(timeout "$CLASS_TIMEOUT" "$@" 2>&1)"; CLASS_RC=$?
+    CLASS_OUT="$(tb_timeout "$CLASS_TIMEOUT" "$@" 2>&1)"; CLASS_RC=$?
     return 0
 }
 
@@ -407,7 +454,7 @@ reap_uv() {
     # WHERE the cache is, and WHAT the bound is, come from the owner (`--print-config`), never from a
     # second copy of the paths here — the uv cache honours XDG_CACHE_HOME and a tuned bound must not
     # be described by a different policy than the one enforced.
-    path="$(timeout 60 bash "$CACHE_REAPER_PATH" --print-config 2>/dev/null | sed -n 's/^cache=uv://p' | head -1)"
+    path="$(tb_timeout 60 bash "$CACHE_REAPER_PATH" --print-config 2>/dev/null | sed -n 's/^cache=uv://p' | head -1)"
     [ -n "$path" ] || path="${UV_CACHE_DIR:-$HOME/.cache/uv}"
     before="$(free_kb_for_path "$path")"
     run_class bash "$CACHE_REAPER_PATH" "$(mode_flag)"
@@ -608,7 +655,15 @@ acquire_lock
 : >"$LOG" 2>/dev/null || true
 {
     say "disk-reaper: pass start mode=$MODE_TEXT only=$ONLY aged=${WT_AGED_DAYS}d venv_min_age=${VENV_MIN_AGE}s pid=$$"
+    # The bounding MECHANISM is disclosed only when it is not GNU `timeout`: on a host that has it,
+    # this pass's report is byte-for-byte what it was before #2046 (and the mechanism is in the pass
+    # record either way). On macOS this is the line that says the bound is real rather than a
+    # fail-closed no-op — the absence is visible WHERE IT MATTERS, without being fatal.
+    if [ "${TB_TIMEOUT_KIND:-}" != "timeout" ]; then
+        say "disk-reaper: watchdog=$TB_TIMEOUT_KIND — $(tb_watchdog_description); a timeout is still reported as rc=124 (fail-closed)"
+    fi
     log "==== pass start mode=$MODE_TEXT only=$ONLY repos=${REPOS:-<resolved per class>} ===="
+    log "watchdog: ${TB_TIMEOUT_KIND:-unknown} ($(tb_watchdog_description))"
     log "delegates: cache=${CACHE_REAPER_PATH:-MISSING} venv=${VENV_REAPER_PATH:-MISSING} worktree=${WORKTREE_REAPER_PATH:-MISSING}"
 } | tee -a "$LOG"
 
@@ -655,6 +710,7 @@ UTMP="$STATUS.tmp.$$"
     printf 'ok=%s\n' "$OK"
     printf 'rc=%s\n' "$verdict"
     printf 'classes=%s\n' "$ONLY"
+    printf 'watchdog=%s\n' "${TB_TIMEOUT_KIND:-unknown}"
     printf 'freed_mb=%s\n' "$TOTAL"
     printf 'freed_mb_uv=%s\n' "$FREED_UV"
     printf 'freed_mb_venv=%s\n' "$FREED_VENV"

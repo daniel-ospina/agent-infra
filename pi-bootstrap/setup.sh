@@ -498,7 +498,14 @@ echo "    scripts fleet farm: $fleet_copied copied (fleet cadence, #373 + runner
 # scripts resolve it as `$(dirname "${BASH_SOURCE[0]}")/lib/beat-pair.sh`). A
 # missing lib makes the guard FAIL CLOSED: the pair is treated as unverifiable
 # and the act clause is withheld, with a logged reason — never a silent pass.
-lib_srcs=(pid-identity.sh diff-normalize.py beat-pair.sh)
+# #2046 adds a FOURTH sibling: `scripts/lib/bounded.sh` is the ONE bounded-execution
+# helper for the reaper family. `disk-reaper.sh` and `pi-reap-worktrees.sh` both
+# source it and both REFUSE at startup (exit 3) without it, because a probe with
+# no watchdog is a probe that can hang the host they exist to unload. Farming the
+# reapers WITHOUT this sibling re-arms the hourly pass as a startup refusal; on a
+# Mac that is strictly better than the pre-#2046 behaviour it replaces (every
+# class fail-closed with `timeout: command not found` while the pass completed).
+lib_srcs=(pid-identity.sh diff-normalize.py beat-pair.sh bounded.sh)
 mkdir -p "$DEST/scripts/lib"
 lib_copied=0
 lib_failed=0
@@ -531,10 +538,10 @@ for base in "${lib_srcs[@]}"; do
   fi
 done
 if [ "$lib_failed" -gt 0 ]; then
-  echo "    scripts lib farm: $lib_copied copied, $lib_failed FAILED/MISSING (pid-identity.sh + diff-normalize.py + beat-pair.sh, #1178/#1362)" >&2
+  echo "    scripts lib farm: $lib_copied copied, $lib_failed FAILED/MISSING (pid-identity.sh + diff-normalize.py + beat-pair.sh + bounded.sh, #1178/#1362/#2046)" >&2
   farm_missing+="scripts/lib/ ($lib_failed declared sibling(s) FAILED or MISSING)"$'\n'
 else
-  echo "    scripts lib farm: $lib_copied copied (pid-identity.sh + diff-normalize.py + beat-pair.sh, #1178/#1362)"
+  echo "    scripts lib farm: $lib_copied copied (pid-identity.sh + diff-normalize.py + beat-pair.sh + bounded.sh, #1178/#1362/#2046)"
 fi
 
 # Fleet-tools farm (#1178 unit 3): the scheduled lane-liveness report

@@ -81,6 +81,43 @@ open-PR head.
 linked worktree is kept by both the worktree and venv classes, and the *same*
 fixture is reclaimed once the holder is gone.
 
+## Bounded execution — the pass cannot assume GNU `timeout` (#2046)
+
+Every subprocess that reads the filesystem runs under a wall-clock bound, because a
+reaper that hangs the box is worse than the disk it was reclaiming. That bound is
+resolved **once**, by `scripts/lib/bounded.sh`, in one order:
+
+1. `timeout` (GNU coreutils)
+2. `gtimeout` (Homebrew coreutils)
+3. an **internal background watchdog** — a `sleep`-timed subshell that SIGKILLs the
+   child and writes a sentinel, so a real kill is distinguishable from a command
+   that exited `137` on its own
+
+All three report a timeout as **rc=124**, which every caller already treats as
+fail-closed, so the class verdict does not depend on which mechanism bounded it.
+
+**Why this is recorded as a defect and not a nicety.** macOS ships neither binary.
+Before #2046 every call site in `disk-reaper.sh` died with
+`timeout: command not found` (rc=127 → fail-closed → rc=3), and the pass *completed*,
+printing `verdict=fail-closed` for all three classes with `candidates=0`. That is the
+false PASS this whole feature exists to remove: measured on the laptop 2026-10-18,
+`--dry-run` against `~/eldato/tortoise` reached `pass end verdict=3 freed_df=0MB —
+NOTHING was removed` while every delegate was present and working.
+
+**What the pass says now.** The resolved mechanism is recorded in the pass record as
+`watchdog=timeout|gtimeout|internal`, and printed as one extra report line **only when
+it is not GNU `timeout`** — so a host that has the real binary produces byte-identical
+output to before, and a Mac says out loud which watchdog it used. Absence of the
+*helper* (a partial deploy) is not a fallback: both reapers **refuse at startup** with
+exit 3 and name the missing library, because without it no probe is bounded at all.
+An explicit `TB_TIMEOUT_BIN` that cannot be executed is refused the same way rather
+than silently ignored. `TB_TIMEOUT_FORCE_INTERNAL=1` pins the fallback for tests.
+
+`pi-reap-worktrees.sh` already carried this watchdog as its `run_bounded` (#1095);
+that implementation moved into the shared library, so the two reapers cannot drift
+into bounding different probes. `reap-lane-venvs.sh` still carries its own copy — it
+already works on macOS, and folding it in is a behaviour-neutral follow-up.
+
 ## Merged heads and the age floor
 
 `pi-reap-worktrees.sh` requires a HEAD older than 7 days. For a **merged** head that
@@ -154,11 +191,15 @@ Every pass writes `$DISK_REAPER_STATE_DIR/disk-reaper.status` (default
 `$HOME/.pi/agent/state`), atomically, as `key=value`:
 
 ```
-mode=apply ok=0 rc=3 classes=uv,venv,worktree
+mode=apply ok=0 rc=3 classes=uv,venv,worktree watchdog=internal
 freed_mb=515 freed_mb_uv=1 freed_mb_venv=0 freed_mb_worktree=514
 verdict_uv=fail-closed verdict_venv=ok verdict_worktree=ok
 would_free_mb_* candidates_* detail=pi-cache-reap.sh exited 3
 ```
+
+`watchdog=` names the mechanism that bounded the pass (`timeout`, `gtimeout` or
+`internal`, see **Bounded execution** above), so "the bound was real" is answerable
+from the record on macOS too.
 
 `cloud-cell-supervisor.sh status` prints the last pass, its age and the per-class
 bytes, and prints a `⛔` line when the pass failed, is stale (older than
@@ -192,13 +233,13 @@ failed/stale/never, 2 usage.
 |---|---|
 | 0 | pass completed, every selected class ok |
 | 2 | usage |
-| 3 | fail-closed: a delegate is missing, failed closed, or a class had no repo — nothing is claimed for it |
+| 3 | fail-closed: a delegate is missing, failed closed, or a class had no repo — nothing is claimed for it; **also a refusal at startup** when `scripts/lib/bounded.sh` is missing or `TB_TIMEOUT_BIN` is unusable (no per-class line is printed in that case) |
 | 4 | a class completed but at least one removal failed (or another pass holds the lock) |
 | 5 | dry-run only: a class reported work it would do |
 
 ## Tests
 
-`scripts/disk-reaper.test.sh` — 65 assertions, run by the `disk-reaper` shard of
+`scripts/disk-reaper.test.sh` — 101 assertions, run by the `disk-reaper` shard of
 `run-bash-shards.sh`:
 
 | | |
@@ -212,6 +253,9 @@ failed/stale/never, 2 usage.
 | T10 | an `--only` list naming nothing is refused (never a healthy no-op) |
 | T11 | a dry run records 0 bytes freed (it removed nothing) |
 | T12 | the installer's `--preview` changes nothing; a set-but-missing `$DISK_REAPER` is refused |
+| T13 | the bounded-execution resolution ORDER is pinned (`timeout` -> `gtimeout` -> internal watchdog) with a PATH holding only the case's own stub (#2046) |
+| T14 | a host with neither binary still **classifies** (candidates found, rc=5) and names the fallback; a stub `timeout` on PATH is preferred, and then the report gains no provenance line (#2046) |
+| T15 | a missing `scripts/lib/bounded.sh`, or an unusable `TB_TIMEOUT_BIN`, is a **refusal at startup** (exit 3, no per-class line, no pass record) — never per-class `fail-closed` (#2046) |
 
 `scripts/install-disk-reaper-schedule.test.sh` — 120 assertions, its own `run-bash-shards.sh` shard —
 owns the SCHEDULE (`disk-reaper.test.sh` owns the pass):
