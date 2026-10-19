@@ -33,6 +33,7 @@ export type GateEventName =
   | "merge_gate_pass"
   | "review_record_collision" // #426: cross-repo PR-number registry collision (readReviewRecord)
   | "gate_block" // #516: review-enforcer dispatch-count block at 0 dispatches (uniform ≥1-dispatch floor, #485)
+  | "reviewer_preflight" // #2148: the reviewer requirement disclosed BEFORE the work (session_start → phase:"session_start", first push → phase:"first_push")
   | "bridge_clear"; // #561: scripts/vgate.sh clear — root-scoped bridge rewrite (type-documentation; vgate.sh appends raw JSONL)
 // Resolved lazily per call (not at module load) so a $HOME change — tests,
 // alternate agent dirs — takes effect. Uses os.homedir(); never hardcoded.

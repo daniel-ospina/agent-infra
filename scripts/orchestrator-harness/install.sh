@@ -705,7 +705,7 @@ if [ "$PLIST_CHANGED" = "0" ]; then ok "plist unchanged and it is the render lau
 # missing AGENT_DISK_REFUSED, which under `set -u` aborts a refusal before its refund (the callers
 # are tolerant of that now, but surviving a stale helper silently is not the same as DETECTING it).
 DRIFTED=""
-for f in orch-loop.sh claims.sh repo-authority.sh repo-slug.sh spawn-gate.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh gh-rest/gh gh-limit.py; do
+for f in orch-loop.sh claims.sh repo-authority.sh repo-slug.sh spawn-gate.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh gh-rest/gh gh-limit.py; do
   [ -f "$O/$f" ] || { DRIFTED="$DRIFTED $f(missing)"; continue; }
   diff -q "$HERE/$f" "$O/$f" >/dev/null 2>&1 || DRIFTED="$DRIFTED $f"
 done

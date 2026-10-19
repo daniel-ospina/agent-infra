@@ -56,6 +56,8 @@ import {
   hasLiteralAdminFlag,
   countMergeVerbs,
   isGitOp,
+  isPushOrPrCreateCommand,
+  reviewerRoleFor,
   extractMergePrNumber,
   extractMergeSelector,
   evidenceBodyIsCertifying,
@@ -1427,15 +1429,23 @@ section("extension factory — audited gate behavior (#60)");
 
 function mockPi() {
   const handlers = new Map<string, Function[]>();
+  // #2148: the first-push notice is delivered with `pi.sendMessage(…, {deliverAs:"steer"})`, so the
+  // double records every send — the assertion "the LANE can act on it" needs the delivery, not a
+  // console line the model may never read.
+  const sent: { message: any; options?: any }[] = [];
   const pi = {
     on: (ev: string, fn: Function) => {
       const arr = handlers.get(ev) ?? [];
       arr.push(fn);
       handlers.set(ev, arr);
     },
+    sendMessage: (message: any, options?: any) => {
+      sent.push({ message, options });
+    },
   };
   return {
     pi,
+    sent,
     fire: (ev: string, event?: any): any => {
       const arr = handlers.get(ev) ?? [];
       let last: any;
@@ -1491,12 +1501,18 @@ testAsync("session_start with SKIP_REVIEW_GATE=1 → durable gate_bypass (escape
     try {
       await fire("session_start");
       const lines = readAuditLines(auditLogPath());
-      equal(lines.length, 1);
+      // #2148 adds a SECOND session_start record: the reviewer requirement is disclosed up front,
+      // and a bypassed session is exactly the one that must still hear it (its dispatch gate never
+      // fires, so the rail is the only thing that will refuse it — and no bypass unlocks the rail).
+      equal(lines.length, 2, "gate_bypass + the #2148 pre-flight disclosure");
       const [e] = lines;
       equal(e.event, "gate_bypass");
       equal(e.extension, "review-enforcer");
       equal(e.reason, "escape_hatch");
       equal(e.session_cwd, process.cwd());
+      equal(lines[1].event, "reviewer_preflight", "the disclosure is audited, not only printed");
+      equal(lines[1].phase, "session_start");
+      equal(lines[1].bypassed, true, "the audit record states the bypass truthfully");
       // escape hatch still functions: git op not blocked with gates disabled
       const result = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
       equal(result, undefined);
@@ -6019,6 +6035,290 @@ testAsync("#1203: a real admin merge BESIDE a rail invocation is still refused e
     } finally {
       _setRunGhOverride(null);
       if (prevShim === undefined) delete process.env.AGENT_GH_SHIM; else process.env.AGENT_GH_SHIM = prevShim;
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+    }
+  });
+});
+
+// ── #2148 — the reviewer requirement disclosed BEFORE the work ───────────────
+// The defect measured 2026-10-19 on cell-2: three lanes did the whole job (rebase, implement, test,
+// push, PR) and were then refused at the finish line — "[review-enforcer] 🚫 Blocked — no reviewers
+// dispatched" / "🚫 Admin-merge evidence gate blocked" — with NOTHING before that point having told
+// them a reviewer was mandatory. These tests assert the three halves of the fix:
+//   (1) the requirement is disclosed ONCE, up front, in the session log AND in the model's context;
+//   (2) it speaks again at the FIRST PUSH, while the lane still has context, not only at the rail;
+//   (3) the rail's refusal is unchanged and NAMES the command that satisfies it.
+// ⛔ (3) is the half a "disclosure" change is most likely to break by accident, so it is asserted
+// from the BLOCK MESSAGE and from the merge gate's own reason rather than from the new line's text.
+section("#2148 pre-flight disclosure — the requirement is stated before the work");
+
+/** Capture console.log for the duration of `fn`, returning every emitted line. */
+async function withCapturedConsole(fn: () => Promise<void>): Promise<string[]> {
+  const logged: string[] = [];
+  const origLog = console.log;
+  console.log = (...args: any[]) => { logged.push(args.map(String).join(" ")); };
+  try {
+    await fn();
+  } finally {
+    console.log = origLog;
+  }
+  return logged;
+}
+
+const PREFLIGHT_MARK = "#2148 preflight";
+const EARLY_MARK = "#2148 first push";
+
+testAsync("#2148: session_start discloses the reviewer requirement ONCE, and injects it into context", async () => {
+  await withTempHome(async () => {
+    const prevMode = process.env.PI_MODE;
+    process.env.PI_MODE = "print";
+    try {
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      let injected: any = null;
+      const logged = await withCapturedConsole(async () => {
+        await fire("session_start");
+        injected = await fire("before_agent_start");
+        // a second agent start in the SAME session must NOT repeat it ("once, up front")
+        await fire("before_agent_start");
+      });
+      const disclosure = logged.filter((l) => l.includes(PREFLIGHT_MARK));
+      equal(disclosure.length, 1, "the pre-flight line is emitted exactly ONCE per session");
+      equal(disclosure[0].split("\n").length, 1, "and it is ONE line (it is printed before any work)");
+      ok(disclosure[0].includes("attestation"), "it names the attestation the rail reads");
+      ok(disclosure[0].includes("before the rail"), "it names the finish line at stake");
+      ok(disclosure[0].includes("scripts/record-review.sh"), "it names the exact record command");
+      ok(disclosure[0].includes("admin-merge.sh"), "it names the exact rail command");
+      ok(disclosure[0].includes("task(prompt='[REVIEW]"), "it names the exact dispatch command");
+      // The model-visible channel: a `pi -p` lane's prompt is its brief, so a console line alone
+      // reaches the operator's log but not necessarily the lane.
+      ok(injected && injected.message, "the first before_agent_start injects the requirement as a session message");
+      ok(injected.message.content.includes("attestation"), "…carrying the same requirement");
+      equal(injected.message.customType, "reviewer-preflight", "…attributable to this extension");
+      // Audited, so a fleet census can ask "was this lane told?" from gate-events.jsonl.
+      const pre = tempAuditLines().filter((l) => l.event === "reviewer_preflight");
+      equal(pre.length, 1, "one reviewer_preflight audit record");
+      equal(pre[0].phase, "session_start");
+      equal(pre[0].bypassed, false, "the record states the gate was in force");
+    } finally {
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+    }
+  });
+});
+
+testAsync("#2148: a BYPASSED lane is still told (its push is not stopped, so the rail is what refuses it)", async () => {
+  await withTempHome(async () => {
+    const prevMode = process.env.PI_MODE;
+    process.env.PI_MODE = "print";
+    process.env.AGENT_SKIP_REVIEW_GATE = "1";
+    try {
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      const logged = await withCapturedConsole(async () => {
+        await fire("session_start");
+        const res = await fire("tool_call", { toolName: "bash", input: { command: "git push -u origin feat/x" } });
+        equal(res, undefined, "a bypassed lane's push is NOT blocked (#285 is untouched)");
+      });
+      const disclosure = logged.filter((l) => l.includes(PREFLIGHT_MARK));
+      equal(disclosure.length, 1, "the bypassed lane still hears the requirement");
+      ok(disclosure[0].includes("STILL refuses"), "…and is told which gate a bypass does NOT unlock");
+      ok(disclosure[0].includes("scripts/record-review.sh"), "…with the command to run");
+      const early = logged.filter((l) => l.includes(EARLY_MARK));
+      equal(early.length, 1, "the first push says so again, before the rail can refuse it");
+      ok(early[0].includes("the rail is not"), "the early notice says which gate is off and which is not");
+      equal(
+        tempAuditLines().filter((l) => l.event === "reviewer_preflight" && l.phase === "first_push").length,
+        1,
+        "the early notice is audited",
+      );
+    } finally {
+      delete process.env.AGENT_SKIP_REVIEW_GATE;
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+    }
+  });
+});
+
+testAsync("#2148: the FIRST PUSH at 0 dispatches speaks up, once — and the git op is still refused", async () => {
+  await withTempHome(async () => {
+    await withMarkerIsolated(async () => {
+      const prevMode = process.env.PI_MODE;
+      process.env.PI_MODE = "print";
+      try {
+        const { pi, fire, sent } = mockPi();
+        (reviewEnforcerFactory as any)(pi);
+        let first: any = null;
+        let second: any = null;
+        const logged = await withCapturedConsole(async () => {
+          await fire("session_start");
+          first = await fire("tool_call", { toolName: "bash", input: { command: "git push -u origin feat/x" } });
+          second = await fire("tool_call", { toolName: "bash", input: { command: "git push" } });
+        });
+        const early = logged.filter((l) => l.includes(EARLY_MARK));
+        equal(early.length, 1, "the early notice is emitted ONCE, not on every push");
+        ok(early[0].includes("rail will refuse"), "it says what will happen at the finish line");
+        ok(early[0].includes("scripts/record-review.sh"), "it names the command to run while context is live");
+        // ⛔ DELIVERED TO THE MODEL, not only to the log. A fresh review measured the first version
+        // logging this while THIS FILE's own comment says a console line is not reliably in a
+        // `pi -p` lane's context — so "the lane can then fix it while it still has context" was
+        // false. `deliverAs:"steer"` queues it ahead of the next model call.
+        equal(sent.length, 1, "the notice is sent as a session message, exactly once");
+        equal(sent[0].options?.deliverAs, "steer", "…as a steer, so it lands before the next model call");
+        equal(sent[0].message?.content, early[0], "…carrying the very text that was logged");
+        equal(sent[0].message?.customType, "reviewer-preflight", "…attributable to this extension");
+        // The existing refusal is UNCHANGED — the disclosure adds a notice, never a bypass.
+        ok(first && first.block === true, "the push is still refused at 0 dispatches");
+        equal(first.reason, BLOCK_MESSAGE, "…with the existing block message");
+        ok(second && second.block === true, "and a later push is refused too (the notice is once, the gate is not)");
+        const audit = tempAuditLines();
+        equal(audit.filter((l) => l.event === "reviewer_preflight" && l.phase === "first_push").length, 1,
+          "one first_push audit record");
+        equal(audit.filter((l) => l.event === "gate_block").length, 2, "…and both refusals are still audited");
+      } finally {
+        if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+      }
+    });
+  });
+});
+
+testAsync("#2148: `git commit` is NOT the early moment — the notice waits for the push", async () => {
+  await withTempHome(async () => {
+    await withMarkerIsolated(async () => {
+      const prevMode = process.env.PI_MODE;
+      process.env.PI_MODE = "print";
+      try {
+        const { pi, fire } = mockPi();
+        (reviewEnforcerFactory as any)(pi);
+        const logged = await withCapturedConsole(async () => {
+          await fire("session_start");
+          const res = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m wip" } });
+          ok(res && res.block === true, "the commit is still refused at 0 dispatches");
+        });
+        equal(logged.filter((l) => l.includes(EARLY_MARK)).length, 0,
+          "a commit is not the first-push moment (a lane commits many times before a PR exists)");
+      } finally {
+        if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+      }
+    });
+  });
+});
+
+testAsync("#2148: the RAIL still refuses without an attestation, and the refusal NAMES the command", async () => {
+  await withTempHome(async () => {
+    const prevMode = process.env.PI_MODE;
+    process.env.PI_MODE = "print";
+    const pr = 99900031;
+    const head = "e".repeat(40);
+    _setRunGhOverride(() => head);
+    try {
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      await withCapturedConsole(async () => {
+        await fire("session_start");
+        // A dispatch satisfies the ≥1-dispatch gate; the MERGE gate is a different gate and is
+        // the one the finish line actually fails on — so this asserts UNCHANGED behaviour under
+        // the disclosure, with no reviewer-attestation record present.
+        await fire("tool_result", { toolName: "task" });
+      });
+      const res = await fire("tool_call", { toolName: "bash", input: { command: `gh pr merge ${pr}` } });
+      ok(res && res.block === true, "the merge is refused without an attestation (unchanged)");
+      ok((res.reason as string).includes("No review record"), "the refusal says what is missing");
+      ok((res.reason as string).includes("record-review.sh"), "…and NAMES the command that satisfies it");
+      ok((res.reason as string).includes(`#${pr}`), "…for THIS PR, so the lane need not guess the number");
+      ok(tempAuditLines().some((l) => l.event === "merge_gate_block"), "the refusal is still audited");
+      // The same requirement must also be on the dispatch-count block: a lane that satisfies the
+      // dispatch gate and is then refused by the merge gate has wasted the trip the message exists
+      // to prevent.
+      ok(BLOCK_MESSAGE.includes("scripts/record-review.sh"), "the 0-dispatch block names the record command too");
+      ok(MICRO_BLOCK_MESSAGE.includes("clean-micro"), "…and micro's names its own verdict");
+    } finally {
+      _setRunGhOverride(null);
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+    }
+  });
+});
+
+testAsync("#2148: a task sub-agent is NOT told — the parent owns that ceremony (#285/#825)", async () => {
+  await withTempHome(async () => {
+    const prevMode = process.env.PI_MODE;
+    const prevHb = process.env.TASK_HEARTBEAT;
+    process.env.PI_MODE = "print";
+    process.env.TASK_HEARTBEAT = "1";
+    process.env.AGENT_SKIP_REVIEW_GATE = "1";
+    try {
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      let injected: any = null;
+      const logged = await withCapturedConsole(async () => {
+        await fire("session_start");
+        injected = await fire("before_agent_start");
+      });
+      equal(logged.filter((l) => l.includes(PREFLIGHT_MARK)).length, 0,
+        "no duplicate disclosure in the child (it would be noise in the parent's tool result)");
+      equal(injected, undefined, "nothing injected into a sub-agent's context");
+      ok(readAuditLines(auditLogPath()).some((l) => l.event === "review_gate_parent_enforced"),
+        "the parent-enforced record is still written (that is the sub-agent's real story)");
+    } finally {
+      delete process.env.AGENT_SKIP_REVIEW_GATE;
+      if (prevHb === undefined) delete process.env.TASK_HEARTBEAT; else process.env.TASK_HEARTBEAT = prevHb;
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+    }
+  });
+});
+
+test("#2148: isPushOrPrCreateCommand — the early moment, and what is NOT it", () => {
+  ok(isPushOrPrCreateCommand("git push -u origin feat/x"), "a plain push");
+  ok(isPushOrPrCreateCommand("git add -A && git push"), "a chained push");
+  ok(isPushOrPrCreateCommand("gh pr create --title x --body y"), "a PR create (the push may already be done)");
+  ok(!isPushOrPrCreateCommand("git commit -m 'wip'"), "a commit is not the moment");
+  ok(!isPushOrPrCreateCommand("git status"), "a read is not the moment");
+  // ⛔ THE FALSE-FIRE CLASS, measured by a fresh review on the first version: a once-per-session
+  // NOTICE spends its budget on the first match, so a mention of a push in a quoted string would
+  // consume the notice and the REAL push would get nothing. The old single-quote fixture below
+  // passed only because the closing quote abutted the word — these are the cases that fail it.
+  ok(!isPushOrPrCreateCommand('echo "run git push now"'), "a DOUBLE-quoted mention is not a push");
+  ok(!isPushOrPrCreateCommand('git commit -m "wip: git push pending"'), "…nor a mention inside a commit message");
+  ok(!isPushOrPrCreateCommand("echo 'git push'"), "…nor the single-quoted form");
+  ok(!isPushOrPrCreateCommand("rg -n 'gh pr create' docs/"), "…nor a mention inside a search pattern");
+  // ...and the mask must not hide a REAL push that merely has a quoted argument after it.
+  ok(isPushOrPrCreateCommand('git push -u origin "feat/x"'), "a push whose ARGUMENT is quoted still fires");
+});
+
+test("#2148: reviewerRoleFor — the harness's KIND decides the audience (the two roles disagree on purpose)", () => {
+  equal(reviewerRoleFor({ KIND: "lane" }), "harness", "lane.sh's lane");
+  equal(reviewerRoleFor({ KIND: "fixer" }), "harness", "fix-one.sh's fixer");
+  equal(reviewerRoleFor({ KIND: "reviewer" }), "harness", "merge-one.sh's reviewer session");
+  equal(reviewerRoleFor({ KIND: "LANE" }), "harness", "case-insensitive (the env is not normalised by the launcher)");
+  equal(reviewerRoleFor({}), "self", "no harness marker → a self-landing session");
+  equal(reviewerRoleFor({ KIND: "something-else" }), "self", "an unrelated KIND is not claimed as a harness worker");
+});
+
+testAsync("#2148: a harness worker is told the HARNESS role (never 'dispatch'/'run the rail', which its brief forbids)", async () => {
+  await withTempHome(async () => {
+    const prevMode = process.env.PI_MODE;
+    const prevKind = process.env.KIND;
+    process.env.PI_MODE = "print";
+    process.env.KIND = "lane"; // what lane.sh exports at the spawn point
+    try {
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      let injected: any = null;
+      const logged = await withCapturedConsole(async () => {
+        await fire("session_start");
+        injected = await fire("before_agent_start");
+      });
+      const disclosure = logged.filter((l) => l.includes(PREFLIGHT_MARK));
+      equal(disclosure.length, 1, "the harness worker is told once, up front");
+      ok(disclosure[0].includes("HARNESS reviewer"), "the harness reviewer is named as the one who mints it");
+      ok(disclosure[0].includes("do NOT merge"), "the worker is kept out of the rail");
+      ok(
+        !disclosure[0].includes("dispatch: task("),
+        "⛔ it is NOT told to dispatch — lane.sh's brief says the lane has no task tool (a contradiction in one context is worse than silence)",
+      );
+      ok(injected?.message?.content?.includes("HARNESS reviewer"), "the injected message carries the same role");
+      const pre = tempAuditLines().filter((l) => l.event === "reviewer_preflight");
+      equal(pre[0].role, "harness", "the audit record says WHICH audience was told");
+    } finally {
+      if (prevKind === undefined) delete process.env.KIND; else process.env.KIND = prevKind;
       if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
     }
   });

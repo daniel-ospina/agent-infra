@@ -18,13 +18,23 @@ import {
   parseCdChains,
   unquotedMask,
   type CdChainInfo,
-} from "../shared/git-command-parse.js";
-import * as fs from "fs";
+} from "../shared/git-command-parse.js";import * as fs from "fs";
 import * as os from "os";
 import { resolve as resolvePath, dirname } from "path";
 import { fileURLToPath } from "url";
 import { appendJsonl, type GateEventName } from "../shared/audit-log.js";
 import { redactCommand } from "../shared/redact-command.js";
+// #2148 — the reviewer requirement disclosed UP FRONT. The ≥1-dispatch rule and the merge-registry
+// gate were both correct and both spoke only at the finish line, so a lane did the whole job (rebase,
+// implement, test, push, PR) and was then refused. This module holds the disclosure's ONE wording
+// (drift-pinned against the harness's bash helper in extensions/shared/reviewer-preflight.test.ts).
+import {
+  reviewerPreflightLine,
+  reviewerPreflightMessage,
+  reviewerFirstPushNotice,
+  reviewerRoleFor,
+  REVIEWER_PREFLIGHT_RECORD_CMD,
+} from "../shared/reviewer-preflight.js";
 // Re-exported public surface (tests and external consumers import from
 // ./index.js) — the DEFINITION lives only in shared/.
 export {
@@ -337,6 +347,54 @@ const ISSUE_COMPLEXITY_FILE = "/tmp/agent-issue-complexity";
 // ── Git operation patterns ────────────────────────────
 
 const GIT_COMMIT_PATTERN = /(^|\s)git\s+(commit|push)(?=\s|$)/;
+
+/**
+ * #2148 — the EARLY moment: the first `git push` (or `gh pr create`) of a session. That is where the
+ * lane has just produced the artifact a reviewer will read, so the requirement can still be acted on
+ * for the price of one dispatch instead of a whole re-run.
+ *
+ * Deliberately narrower than `isGitOp`: `git commit` is not this moment (a lane may commit many times
+ * before a PR exists), and a push is what makes the head reviewable.
+ *
+ * ⛔ QUOTED DATA IS MASKED FIRST — this is a NOTICE with a once-per-session budget, not a gate, and
+ * a false fire SPENDS that budget before the real push. The first version matched the raw text, so
+ * `echo "run git push now"` and `git commit -m "wip: git push pending"` both fired (measured by a
+ * fresh review) while the suite's single-quote fixture passed only because the closing quote abutted
+ * the word. `unquotedMask` is the shared parser's own mask (#966), so this cannot drift from what
+ * `isAdminMergeCommand` considers quoted data.
+ */
+const GIT_PUSH_PATTERN = /(^|\s)git\s+push(?=\s|$)/;
+const GH_PR_CREATE_PATTERN = /(^|[\s;&|(){!])gh\s+pr\s+create(?=\s|$)/;
+
+/** Blank out quoted spans (the mask keeps indices stable) so a mention cannot fire the notice. */
+function unquotedOnly(command: string): string {
+  const mask = unquotedMask(command);
+  let out = "";
+  for (let i = 0; i < command.length; i++) out += mask[i] ? command[i] : "\u0000";
+  return out;
+}
+
+export function isPushOrPrCreateCommand(command: string): boolean {
+  const text = unquotedOnly(command);
+  return GIT_PUSH_PATTERN.test(text) || GH_PR_CREATE_PATTERN.test(text);
+}
+
+/**
+ * #2148 — WHICH AUDIENCE the disclosure addresses. The harness exports `KIND` at every worker's
+ * spawn point (`lane.sh` → `lane`, `fix-one.sh` → `fixer`, `merge-one.sh` → `reviewer`), so a worker
+ * session is identifiable without guessing from the cwd or the brief.
+ *
+ * ⛔ This matters because the two audiences are told OPPOSITE things about who dispatches: a
+ * `lane.sh` brief says "you have NO task tool — do NOT dispatch … Do NOT merge", so a self-role
+ * disclosure injected into that same context would instruct two forbidden actions (found by two
+ * independent fresh reviewers on this change).
+ */
+export function reviewerRoleFor(
+  env: Record<string, string | undefined> = process.env,
+): "self" | "harness" {
+  const kind = String(env.KIND ?? "").toLowerCase();
+  return kind === "lane" || kind === "fixer" || kind === "reviewer" ? "harness" : "self";
+}
 
 /**
  * Remove the bash token-splicing the scanner CAN resolve, so a flag spelled
@@ -3179,6 +3237,11 @@ const BLOCK_MESSAGE = [
   "     artifact, never the send. The refused command is recorded in gate-events.jsonl.",
   "   → Read skills/code-review/SKILL.md for the review dispatch protocol (operations/skills/code-review/SKILL.md in consumer repos).",
   "   → Dispatch reviewers via task sub-agents, then retry the git operation.",
+  // #2148: name the command the RAIL will demand, not just the missing action. A lane told only
+  // "dispatch a reviewer" satisfies this gate and is then refused by the merge registry for lack of
+  // an attestation — the second refusal needs a command, and this is the moment to hand it over.
+  "   → A dispatch alone does not land the PR: the rail also needs the attestation at the FINAL head —",
+  `      ${REVIEWER_PREFLIGHT_RECORD_CMD}`,
   "   → Emergency: set AGENT_SKIP_REVIEW_GATE=1 (or ELDATO_SKIP_REVIEW_GATE=1) and restart to bypass all gates.",
 ].join("\n");
 export { BLOCK_MESSAGE };
@@ -3229,6 +3292,8 @@ export const MICRO_BLOCK_MESSAGE = [
   "   → Docs-only sets (VGATE content-shape exempt) need a lightweight reviewer dispatch that names the diff and returns a verdict on it — a one-line verdict is enough. The floor counts the dispatch; the dispatch is expected to be a real review that returns a verdict, not a sign-off:",
   "   →   task(prompt='[REVIEW] docs-only change — verify claims/consistency against the docs diff; return NO ISSUES FOUND or list issues')",
   "   → Code sets satisfy the dispatch via VGATE: its [VGATE] verification dispatch counts as the required sub-agent dispatch. With VGATE disabled/bypassed, dispatch any lightweight task sub-agent — the gate counts any sub-agent dispatch (the `task` or `subagent` tool).",
+  // #2148: micro's record command, so the refusal at the git op also names what the rail will read.
+  "   → Then record the attestation at the FINAL head (micro): scripts/record-review.sh <PR> <head_sha> clean-micro [owner/repo]",
   "   → Emergency: set AGENT_SKIP_REVIEW_GATE=1 (or ELDATO_SKIP_REVIEW_GATE=1) and restart to bypass all gates.",
 ].join("\n");
 
@@ -3259,11 +3324,22 @@ export default function (pi: ExtensionAPI) {
     // can be reaped repeatedly), so without this a repeated collect inflates
     // the ≥1-dispatch count and the durable `review_dispatch` audit total.
     const countedCollectRuns = new Set<string>();
+    // #2148 — the up-front disclosure's state. `preflightInjected` is the once-guard for the
+    // model-visible injection (the console line is emitted once by session_start itself);
+    // `earlyPushNoticePrinted` is the once-guard for the first-push notice, which must not repeat
+    // on every push. Both reset per session, so a resumed session is told again.
+    let preflightInjected = false;
+    let earlyPushNoticePrinted = false;
+    // #2148 — the audience, resolved per FACTORY INSTANCE (a session's `KIND` is exported by its
+    // launcher and never changes mid-session). See `reviewerRoleFor`.
+    const reviewerRole = reviewerRoleFor();
 
     // ── session_start ──────────────────────────────
     pi.on("session_start", async (_event, _ctx) => {
       dispatchCount = 0;
       countedCollectRuns.clear();
+      preflightInjected = false;
+      earlyPushNoticePrinted = false;
 
       // Warn about env vars that never reach Node.js from bash export
       // (these have no effect — tier is read from marker file, skip gate from escape hatch)
@@ -3315,6 +3391,46 @@ export default function (pi: ExtensionAPI) {
       } else {
         extensionEnabled = true;
       }
+
+      // ── #2148: THE REQUESTER'S EARLIEST READER ─────────────────────
+      // Whatever the branch above decided, a session that can reach the rail must hear the
+      // reviewer requirement BEFORE it does any work. Measured 2026-10-19: three lanes ran
+      // their whole job and were refused at the finish line, having never been told. This
+      // fires once per session, for EVERY non-sub-agent session — including a BYPASSED one,
+      // where it is not redundant but MORE important: the dispatch gate does not fire there,
+      // so the only thing that will refuse the lane is the merge gate, and no bypass flag
+      // unlocks that (#285).
+      //
+      // Task sub-agents are excluded by design: review dispatch is parent-enforced (#825), the
+      // parent session prints this line for the PR as a whole, and a child's console output is
+      // the parent's tool result — a second copy is noise, not disclosure.
+      //
+      // The ROLE picks the audience: a harness worker (`KIND` set by lane.sh / fix-one.sh /
+      // merge-one.sh) is told the harness reviewer mints the attestation and that it must not
+      // merge; everyone else is told how to dispatch, record and land themselves.
+      if (!isTaskSubAgent()) {
+        console.log(reviewerPreflightLine({ role: reviewerRole, bypassed: !extensionEnabled }));
+        logGateEvent("reviewer_preflight", {
+          phase: "session_start",
+          role: reviewerRole,
+          bypassed: !extensionEnabled,
+        });
+      }
+    });
+
+    // ── #2148: the same disclosure, on the MODEL-VISIBLE channel ─────────────
+    // The console line above lands in the lane's log, which is what an operator greps. It is
+    // NOT reliably in the model's context: a `pi -p` lane's prompt is the brief it was launched
+    // with, and an extension's console output does not join it. So the FIRST agent start injects
+    // the requirement as a session message — persisted, displayed, and read by the model — and
+    // later turns do not repeat it (once, up front, exactly as the issue asks).
+    pi.on("before_agent_start", async (_event, _ctx) => {
+      if (preflightInjected) return undefined;
+      preflightInjected = true;
+      if (isTaskSubAgent()) return undefined;
+      return {
+        message: reviewerPreflightMessage({ role: reviewerRole, bypassed: !extensionEnabled }),
+      };
     });
 
     // ── session_shutdown ───────────────────────────
@@ -3333,7 +3449,9 @@ export default function (pi: ExtensionAPI) {
     // ── tool_call: block git ops if no reviewers (uniform ≥1-dispatch, all tiers) ──
     pi.on("tool_call", async (event, _ctx) => {
       if (!isToolCallEventType("bash", event)) return undefined;
-      if (!extensionEnabled) return undefined;
+      // `rawCommand` is read BEFORE the `extensionEnabled` gate: the #2148 early notice below must
+      // also reach a BYPASSED lane (that is the one which reaches the rail unstopped).
+      const rawCommand = String(event.input.command ?? "");
 
       // #984: the ARGV-LEVEL layer runs FIRST and for EVERY bash call, not only
       // for git ops — the shim has to be on PATH before the command runs, and a
@@ -3344,7 +3462,53 @@ export default function (pi: ExtensionAPI) {
       // `rawCommand` is what the CALLER wrote: the injected prefix names the shim
       // path (`…/gh-shim/gh`), so scanning the MUTATED text would feed the gates a
       // `gh` word that the author never wrote.
-      const rawCommand = String(event.input.command ?? "");
+
+      // ── #2148: FAIL EARLY, NOT ONLY AT THE FINISH LINE ─────────────────────
+      // "If the enforcer can detect at first push that no reviewer was ever dispatched, it should
+      // say so at that point rather than only at merge time. The lane can then fix it while it
+      // still has context." (the issue, verbatim). This runs BEFORE the `extensionEnabled` gate
+      // below, deliberately: a BYPASSED lane is never stopped at its git op, so the FIRST notice
+      // it would otherwise get is the rail's refusal — the finish line this notice exists to move.
+      //
+      // ⛔ DELIVERED AS A SESSION MESSAGE, not only a console line — that is what makes "while it
+      // still has context" true. A fresh reviewer measured the first version: it logged the notice
+      // while this file's own comment says a console line is NOT reliably in the model's context,
+      // so the lane that most needed it (the harness worker, whose brief has no reviewer step for
+      // its own session) never saw it. `deliverAs:"steer"` queues it behind the current turn's
+      // tool calls and ahead of the next model call; the console line stays for the operator.
+      //
+      // It is a NOTICE, never a block: blocking a sub-agent's push at 0 dispatches would reverse
+      // #285/#825 (review dispatch is parent-enforced), so the decision stays where it is.
+      // Once per session: a lane that pushes five times must not be told five times.
+      if (
+        !isTaskSubAgent() &&
+        dispatchCount === 0 &&
+        !earlyPushNoticePrinted &&
+        isPushOrPrCreateCommand(rawCommand)
+      ) {
+        earlyPushNoticePrinted = true;
+        const notice = reviewerFirstPushNotice({
+          role: reviewerRole,
+          bypassed: !extensionEnabled,
+        });
+        console.log(notice);
+        // Guarded: a host without sendMessage (or a test double) must not turn a NOTICE into a
+        // thrown exception on the gate path.
+        if (typeof (pi as { sendMessage?: unknown }).sendMessage === "function") {
+          (pi as any).sendMessage(
+            { customType: "reviewer-preflight", content: notice, display: true },
+            { deliverAs: "steer" },
+          );
+        }
+        logGateEvent("reviewer_preflight", {
+          phase: "first_push",
+          role: reviewerRole,
+          bypassed: !extensionEnabled,
+          command: auditCommand(rawCommand),
+        });
+      }
+
+      if (!extensionEnabled) return undefined;
       const shimDir = activeGhShimDir();
       if (shimDir === null && !ghShimAbsenceWarned && process.env.AGENT_GH_SHIM !== "0") {
         ghShimAbsenceWarned = true;
