@@ -117,7 +117,7 @@ case "\${1:-}" in
   bootout)   [ -n "\${LAUNCHCTL_BOOTOUT_IGNORE:-}" ] && exit 0; rm -rf "\$STATE"; exit 0 ;;
   enable)    exit 0 ;;
   print)     [ -d "\$STATE" ] || exit 1
-             printf '\tstate = not running\n\truns = 2\n\tlast exit code = %s\n' "\${FAKE_LAST_EXIT:-0}"
+             printf '\tstate = %s\n\truns = 2\n\tlast exit code = %s\n' "\${LAUNCHCTL_STATE:-not running}" "\${FAKE_LAST_EXIT:-0}"
              exit 0 ;;
 esac
 exit 0
@@ -508,7 +508,23 @@ OUT="$(HOME="$home_lin" DISK_REAPER="$PASSFILE" DISK_REAPER_REPOS="$REPO" DISK_R
 chmod 700 "$ROSTATE"
 assert_eq "$RC" "0" "T10 an UNWRITABLE state dir does not fail an install that succeeded"
 assert_contains "$OUT" "could not be written" "T10 and the degradation is named out loud"
+assert_contains "$OUT" "every later install" "T10 and says what it costs (a reload every install, not 'no reload')"
 assert_file "$T/units-rostate/eldato-disk-reaper.timer" "T10 while the timer really was installed"
+# …and `--status` names the REAL cause of the missing stamp instead of prescribing the remedy that just
+# failed ("re-run --install" loops forever on an unwritable state dir — #2048 review).
+OUT="$(HOME="$home_lin" DISK_REAPER="$PASSFILE" DISK_REAPER_REPOS="$REPO" DISK_REAPER_PLATFORM=linux \
+    DISK_REAPER_STATE_DIR="$ROSTATE/nested" SYSTEMD_UNIT_DIR="$T/units-rostate" \
+    SYSTEMCTL="$T/bin/systemctl" SYSTEMCTL_CALLS="$T/systemctl.log" bash "$INST" --status 2>&1)"
+assert_contains "$OUT" "cannot write" "T10 --status names the unwritable state dir as the cause"
+assert_absent "$OUT" "older installer" "T10 and does not blame an older installer that was never involved"
+# `active=` is the launchd momentary signal, and it MUST be read: the shim's default state ("not running")
+# is exactly what hid a call to a renamed function (a `command not found` yielding inactive forever).
+"$T/bin/launchctl" bootout gui/999/com.eldato.disk-reaper >/dev/null 2>&1 || true
+inst_mac --install >/dev/null 2>&1
+OUT="$(LAUNCHCTL_STATE=running inst_mac --status 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T10 a loaded Darwin job whose pass is RUNNING still exits 0"
+assert_contains "$OUT" "active=active" "T10 and active= reports the pass as running (not a constant inactive)"
+assert_absent "$OUT" "command not found" "T10 and --status emits no shell error into its own output"
 
 inst_lin --install >/dev/null 2>&1
 echo "── T11. both systemd targets, including the two arms no test could reach ──"

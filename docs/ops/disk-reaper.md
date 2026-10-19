@@ -171,9 +171,11 @@ slash, or a `$HOME` that reaches the same directory through a symlink, is the sa
 refuses a correctly-configured machine is not safe, it is silent.
 
 The install verb's own failure modes are kept off the "is it scheduled?" answer: an unwritable
-`$DISK_REAPER_STATE_DIR` costs the stamp (so a changed pass will not force a reload, and a no-flag
-re-install falls back to report-only), and it is reported as that named degradation — never as "this
-box has no schedule", which by then is untrue.
+`$DISK_REAPER_STATE_DIR` costs the stamp, and it is reported as that named degradation — never as "this
+box has no schedule", which by then is untrue. What the missing stamp costs is stated the way it
+actually behaves: with no stamp the pass-SHA comparison can never match, so **every** later install
+reloads the job, and a no-flag re-install (`setup.sh`/`sync.sh`) falls back to report-only. `--status`
+names the state dir as the cause rather than prescribing the `--install` that just failed.
 
 ### Arming is a separate, visible step (#1678, owner ruling 2026-10-11)
 
@@ -294,7 +296,7 @@ failed/stale/never, 2 usage.
 | T14 | a host with neither binary still **classifies** (candidates found, rc=5) and names the fallback; a stub `timeout` on PATH is preferred, and then the report gains no provenance line (#2046) |
 | T15 | a missing `scripts/lib/bounded.sh`, or an unusable `TB_TIMEOUT_BIN`, is a **refusal at startup** (exit 3, no per-class line, no pass record) — never per-class `fail-closed` (#2046) |
 
-`scripts/install-disk-reaper-schedule.test.sh` — 182 assertions, its own `run-bash-shards.sh` shard —
+`scripts/install-disk-reaper-schedule.test.sh` — 188 assertions, its own `run-bash-shards.sh` shard —
 owns the SCHEDULE (`disk-reaper.test.sh` owns the pass):
 
 | | |
@@ -308,7 +310,7 @@ owns the SCHEDULE (`disk-reaper.test.sh` owns the pass):
 | T7 | the Mac does not get a second pass: the job's target is the pass, no per-class script is named, and the `*.plist.tmpl` suffix keeps the job out of `install-launchd.sh`'s glob |
 | T8 | `--uninstall` is reversible and removes the stamp; `--status` then exits 1 |
 | T9 | static pins: every `rm -rf` in the installer removes only a mktemp dir it made, and the shipped default is the report-only flag |
-| T10 | `--status`'s **exit code** is the contract: a disabled timer, an inactive timer, an `enabled-runtime`/`static`/`transient` one, and a plist left by a `bootout` each exit 1 and name the state; `enabled=` is one line even where `systemctl` prints `disabled` *and* exits 1, and the TOKEN is selected even when a diagnostic line precedes it; an installed job with an empty repo list is not "not installed"; and an unwritable state dir costs the stamp, not the install |
+| T10 | `--status`'s **exit code** is the contract: a disabled timer, an inactive timer, an `enabled-runtime`/`static`/`transient` one, and a plist left by a `bootout` each exit 1 and name the state; `enabled=` is one line even where `systemctl` prints `disabled` *and* exits 1, and the TOKEN is selected even when a diagnostic line precedes it; an installed job with an empty repo list is not "not installed"; an unwritable state dir costs the stamp (and says what that costs) but not the install; and `active=active` is read on Darwin instead of a constant `inactive` |
 | T11 | both systemd targets: the SYSTEM unit (with `SUDO=""`, i.e. already root — an arm that was dead code) and the USER unit (no `User=`, driven through `systemctl --user`), plus "neither available" as a loud failure |
 | T12 | an owner's arming survives a **no-flag** re-install — the `setup.sh`/`sync.sh` path that used to revert it — and an explicit `--dry-run` (or a fresh install after `--uninstall`) is equally durable |
 

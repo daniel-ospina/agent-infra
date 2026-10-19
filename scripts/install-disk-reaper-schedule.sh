@@ -423,7 +423,7 @@ sd_install() {
     # dir problem (#2048 review). Degrade visibly instead: no stamp = no pass-SHA reload protection and a
     # no-flag re-install falls back to report-only.
     write_stamp "$UNIT_NAME.timer" \
-        || warn "the schedule stamp $STAMP could not be written — the job IS installed and enabled, but a changed pass will not force a reload and a no-flag re-install will fall back to report-only"
+        || warn "the schedule stamp $STAMP could not be written — the job IS installed and enabled. Two things follow from the missing stamp: every later install looks like a changed pass and reloads the timer, and a no-flag re-install (setup.sh/sync.sh) falls back to report-only"
     return 0
 }
 
@@ -649,7 +649,7 @@ ld_install() {
     # Same rule as systemd: the job is installed and loaded by now, so an unwritable stamp is a named
     # degradation, never a failure that mis-describes the machine (#2048 review).
     write_stamp "$LABEL" \
-        || warn "the schedule stamp $STAMP could not be written — the job IS installed and loaded, but a changed pass will not force a reload and a no-flag re-install will fall back to report-only"
+        || warn "the schedule stamp $STAMP could not be written — the job IS installed and loaded. Two things follow from the missing stamp: every later install looks like a changed pass and rebootstraps the job, and a no-flag re-install (setup.sh/sync.sh) falls back to report-only"
     return 0
 }
 
@@ -673,7 +673,7 @@ ld_status() {
     # `active=` is the MOMENTARY state (is a pass running right now). It is not the scheduling answer:
     # a StartInterval job is idle between runs, which is healthy — so it is reported and not folded into
     # the exit code. Liveness here is LOADED (below), which is what `bootout` clears.
-    state="$(first_line "$(printf '%s\n' "$print_out" | sed -n 's/^[[:space:]]*state = //p')")"
+    state="$(first_token "$(printf '%s\n' "$print_out" | sed -n 's/^[[:space:]]*state = //p')")"
     case "$state" in running) say "active=active" ;; *) say "active=inactive" ;; esac
     last_exit="$(printf '%s\n' "$print_out" | sed -n 's/^[[:space:]]*last exit code = //p' | head -1)"
     case "$last_exit" in ''|*[!0-9]*) last_exit=unknown ;; esac
@@ -744,7 +744,16 @@ status_tail() {
     fi
     sha="$(pass_sha "$REAPER")"; stamp_sha="$(stamp_field pass_sha)"
     say "pass_sha=${sha:-unknown}"
-    if [ -z "$stamp_sha" ]; then drift="no-stamp (installed by an older installer — re-run --install)"
+    if [ -z "$stamp_sha" ]; then
+        # An absent stamp has TWO causes and they are not interchangeable (#2048 review): an older
+        # installer never wrote one, or THIS one could not (an unwritable state dir — a warn-and-install
+        # path since the same review round). Naming the wrong one and prescribing `--install` for it is a
+        # diagnostic that loops: the remedy is the one that just failed.
+        if [ -f "$job_file" ] && { [ ! -d "$STATE_DIR" ] || [ ! -w "$STATE_DIR" ]; }; then
+            drift="no-stamp (cannot write $STATE_DIR — so EVERY install reloads the job, and a no-flag install reverts to report-only; fix the state dir)"
+        else
+            drift="no-stamp (installed by an older installer — re-run --install)"
+        fi
     elif [ "$sha" = "$stamp_sha" ]; then drift="in-sync"
     else drift="CHANGED since install (re-run --install to reload the job)"; fi
     say "pass_drift=$drift"
