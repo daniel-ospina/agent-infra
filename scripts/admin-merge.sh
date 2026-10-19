@@ -1506,6 +1506,64 @@ resolve_head() {
   return 1
 }
 
+# ── IS THIS FAILURE THE ACCOUNT'S RATE LIMIT? (#1910) ─────────────────────────
+# GitHub's SECONDARY limit is a CONCURRENCY limit shared by the whole account, and
+# `GET /rate_limit` does not report it — so a refusal can arrive while the primary counter
+# reads healthy. This rail could not tell that apart from an unreadable read: it printed
+# `[head_unreadable]` and then "check credentials, --repo, and the PR number". MEASURED
+# 2026-10-17 (issue #1910, PR #1934): two rail runs failed at the final merge call with
+# `GraphQL: API rate limit already exceeded`, surfaced as `head_unreadable` /
+# `merged_precheck_unreadable`, and the hint sent the operator to the credential — while
+# `gh api rate_limit` read 4625 of 5000 remaining. The cause was neither the token nor the
+# PR number, and the "remedy" that followed was a raw REST merge that BYPASSED this rail.
+#
+# So the refusal NAMES the cause it read instead of prescribing a remedy it cannot know
+# applies. Deliberately NOT "any 403": a permissions 403 is a different cause with a
+# different remedy, and a mutating command must not be retried on it.
+#
+# ⛔ ONE VOCABULARY, TWO LAYERS. These patterns are the gh shim's own retry predicate
+# (`scripts/gh-shim/gh::rate_limited`), and `tests/admin-merge` §13h drives BOTH from one
+# fixture so a change to what GitHub prints cannot be recognised in one layer and missed in
+# the other without a test going red.
+diag_is_rate_limit() {
+  local t
+  [ -n "${1:-}" ] || return 1
+  # No `| grep` (SIGPIPE under `pipefail`, #841): `tr` reads its input to EOF, so there is
+  # no early-exiting consumer to kill the writer, and the match is a `case` on the result.
+  t="$(printf '%s\n' "$1" | tr '[:upper:]' '[:lower:]')"
+  case "$t" in
+    *'api rate limit'*|*'secondary rate limit'*|*'abuse detection'*|*'http 429'*) return 0 ;;
+    *'status code'*429*|*'retry-after'*) return 0 ;;
+  esac
+  return 1
+}
+
+# Was EITHER of the last observations a rate-limit refusal? <file-or-empty> <text>
+# The two channels a read's own words travel on: a captured stderr FILE (the merge's, the
+# state read's) and a DIAGNOSTIC variable. Both are checked because either may carry it.
+observed_rate_limit() {
+  local f="${1:-}" t="${2:-}"
+  if [ -n "$f" ] && [ -s "$f" ] && diag_is_rate_limit "$(tail -n 5 "$f" 2>/dev/null)"; then
+    return 0
+  fi
+  diag_is_rate_limit "$t"
+}
+
+# Say, in ONE place, what a rate-limit refusal does and does not mean (#1910). Prose that
+# exists in three copies drifts into three different claims; this one is stated once.
+say_rate_limit_note() {
+  say_err "   ⚠️  [rate_limited] GitHub REFUSED THE CALL on its rate limit. This is NOT a claim"
+  say_err "   about the credential, the --repo or the PR number, and it is NOT evidence that the"
+  say_err "   PR is unreadable: the secondary/concurrency limit is shared across the whole account"
+  say_err "   and is NOT visible in 'gh api rate_limit', so a healthy counter there is not evidence"
+  say_err "   to the contrary. IF the gh shim is in your PATH it already paced this call and"
+  say_err "   waited out its budget before giving up (AGENT_GH_GATE_MAX_ATTEMPTS), so the window"
+  say_err "   outlasted that budget; if it is NOT in your PATH (a human shell, launchd, a caller that"
+  say_err "   set GH_LIMIT_NO_WAIT) this call was NOT paced and the window may simply be long."
+  say_err "   A rate-limited call is RETRYABLE: re-run the rail once the limit has cleared, and do"
+  say_err "   NOT switch to a raw merge — that bypasses this rail rather than the rate limit."
+}
+
 # ── THE ONE DOOR FOR READING THE HEAD (#1690) ──────────────────────────────────
 # ⛔ THERE IS EXACTLY ONE REASON TO READ THE HEAD, SO THERE IS EXACTLY ONE PLACE
 # THAT FAILS TO. THREE call sites read the head — §4 during-re-run, §4 before-evidence,
@@ -1553,7 +1611,13 @@ require_head() {
   # `gate-events.jsonl` so block rates can be reconstructed BY REASON. `[head_unreadable]` is
   # the tag the moved-head refusals do NOT carry, so `grep -F '[head_unreadable]'` answers
   # "could the instrument read the head?" without depending on how the sentence is worded.
-  say_err "admin-merge: ✗ BLOCK [head_unreadable] — could not READ the head of PR #$pr (${HEAD_ATTEMPTS} attempts)."
+  # ⛔ A RATE-LIMIT REFUSAL GETS ITS OWN TOKEN, NOT ONLY ITS OWN PROSE (#1910). Word
+  # alone is what let a consumer classify a burst refusal as an unreadable head; the tag
+  # is `[rate_limited]`, and `[head_unreadable]` is KEPT on the same line so every existing
+  # consumer of that tag still matches.
+  local limit_tag=""
+  diag_is_rate_limit "${HEAD_READ_DIAG:-}" && limit_tag=" [rate_limited]"
+  say_err "admin-merge: ✗ BLOCK [head_unreadable]${limit_tag} — could not READ the head of PR #$pr (${HEAD_ATTEMPTS} attempts)."
   say_err "   This is NOT a claim that the branch tip changed: the read failed, or returned"
   say_err "   something that is not a commit SHA. Nothing was merged."
   # ⛔ A REFUSAL MUST NOT PRESCRIBE A REMEDY IT CANNOT KNOW APPLIES (#1690 review).
@@ -1563,8 +1627,15 @@ require_head() {
   # papered over — the operator learns which case they are in, or that we cannot say.
   if [ -n "${HEAD_READ_DIAG:-}" ]; then
     say_err "   the read reported: ${HEAD_READ_DIAG}"
-    say_err "   Re-run the rail if that looks transient; if it repeats, the cause above is"
-    say_err "   probably not transient — check credentials, --repo, and the PR number."
+    # ⛔ NAME THE CAUSE INSTEAD OF THE ONE IT CANNOT BE (#1910). The credentials hint
+    # below is actively misleading here: it points at the token, the repo and the PR
+    # number, none of which a rate-limit refusal is about.
+    if [ -n "$limit_tag" ]; then
+      say_rate_limit_note
+    else
+      say_err "   Re-run the rail if that looks transient; if it repeats, the cause above is"
+      say_err "   probably not transient — check credentials, --repo, and the PR number."
+    fi
   else
     say_err "   the read produced no diagnostic (gh exited 0 with an unusable value, or wrote"
     say_err "   nothing to stderr). Re-run the rail."
@@ -5370,11 +5441,18 @@ main() {
     exit 0
   fi
   if [ "$MERGE_ART_VERDICT" = "unreadable" ]; then
-    say_err "admin-merge: ⚠️  [merged_precheck_unreadable] — could not READ the state of PR #$PR, so this run does NOT know whether it is already merged."
+    # ⛔ CLASSIFIED, NOT JUST ANNOUNCED (#1910). The measured incident's SECOND surface:
+    # `merged_precheck_unreadable` was a rate-limit refusal, and this line said nothing about
+    # that, so the next step was to keep going rather than to wait. The tag makes the cause
+    # machine-readable; §13i pins it.
+    local pre_tag=""
+    diag_is_rate_limit "${MERGE_ART_DIAG:-}" && pre_tag=" [rate_limited]"
+    say_err "admin-merge: ⚠️  [merged_precheck_unreadable]${pre_tag} — could not READ the state of PR #$PR, so this run does NOT know whether it is already merged."
     say_err "   This is NOT a claim about the PR. Proceeding with the rail (the pre-#1709 behaviour): if the PR turns out to be"
     say_err "   already merged, a duplicate evidence comment may be posted — the post-merge state read still governs the outcome."
     if [ -n "${MERGE_ART_DIAG:-}" ]; then
       say_err "   the state read reported: ${MERGE_ART_DIAG}"
+      [ -n "$pre_tag" ] && say_rate_limit_note
     else
       say_err "   the state read wrote no non-blank message."
     fi
@@ -6885,7 +6963,9 @@ ${parity_forgiven_note}"
     # claims NEITHER outcome. The polarity is the rule `poll_merge_artifact` states: an
     # unnamed value must never fall through a gap into a claim about the repository.
     if [ "$MERGE_ART_VERDICT" != "merged" ]; then
-      say_err "⛔ admin-merge: BLOCK [merge_unreadable] — gh pr merge reported SUCCESS (exit 0), but the"
+      local mu_tag=""
+      observed_rate_limit "$TMP/merge.err" "${MERGE_ART_DIAG:-}" && mu_tag=" [rate_limited]"
+      say_err "⛔ admin-merge: BLOCK [merge_unreadable]${mu_tag} — gh pr merge reported SUCCESS (exit 0), but the"
       say_err "   state of PR #$PR could NOT be READ (${MERGE_ART_ATTEMPTS} attempt(s)), so the rail does"
       say_err "   NOT know whether it merged."
       say_err "   This is NOT a claim that the merge did not happen, and NOT a claim that it did."
@@ -6900,6 +6980,11 @@ ${parity_forgiven_note}"
         say_err "   the state read wrote no non-blank message — the read either answered with"
         say_err "   something other than the projection, or failed without saying why."
       fi
+      # ⛔ A RATE LIMIT IS NOT AN UNREADABLE STATE, AND THE REMEDY IS NOT THE SAME ONE
+      # (#1910). Left unclassified, the line below sends the operator to re-read a PR
+      # whose read was REFUSED, and the measured consequence was a raw REST merge that
+      # bypassed this rail. The classification is stated BEFORE the re-read advice.
+      [ -n "$mu_tag" ] && say_rate_limit_note
       say_err "   Determine the state and re-run: gh pr view $PR ${REPO:+--repo $REPO} --json state,mergedAt"
       exit 1
     fi
@@ -6952,7 +7037,9 @@ ${parity_forgiven_note}"
         "$TMP/merge.err" "gh pr merge said:"
       exit 1
     else
-      say_err "⛔ admin-merge: BLOCK [merge_unreadable] — gh pr merge exited $merge_status and the state of"
+      local mu2_tag=""
+      observed_rate_limit "$TMP/merge.err" "${MERGE_ART_DIAG:-}" && mu2_tag=" [rate_limited]"
+      say_err "⛔ admin-merge: BLOCK [merge_unreadable]${mu2_tag} — gh pr merge exited $merge_status and the state of"
       say_err "   PR #$PR could NOT be READ (${MERGE_ART_ATTEMPTS} attempt(s)), so the rail does NOT know"
       say_err "   whether the merge happened."
       say_err "   This is NOT a claim that the merge did not happen, and NOT a claim that it did. A"
@@ -6973,6 +7060,10 @@ ${parity_forgiven_note}"
         say_err "   the state read wrote no non-blank message — the read either answered with"
         say_err "   something other than the projection, or failed without saying why."
       fi
+      # ⛔ SAME CLASSIFICATION AS ITS SIBLING ARM (#1910): this is the arm the measured
+      # incident landed in — the merge mutation was refused on the rate limit, and the
+      # state read was refused for the same reason, so BOTH channels are checked.
+      [ -n "$mu2_tag" ] && say_rate_limit_note
       say_err "   Determine the state and re-run: gh pr view $PR ${REPO:+--repo $REPO} --json state,mergedAt"
       exit 1
     fi

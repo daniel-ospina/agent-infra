@@ -423,9 +423,10 @@ assert_not_contains "$OUT1" "skill-lint-oracle: installed + loaded" "retired ora
 # does not. A pinned total is therefore red on one of the two surfaces whichever number is chosen,
 # and a pinned 9 measured here reads 11 beside a checkout. So: 9 always-installable jobs pinned by
 # name, plus whichever {{TORTOISE_REPO}}-gated templates THIS run installed, derived from the
-# fixture's own template dir — with the gated inventory itself pinned, so a newly added gated job
-# cannot raise both sides of the equation at once. That pin is STALE-RESISTANT BY FAILING, not by
-# being forgotten: #2053 added worktree-hygiene without bumping it, and the whole shard went red.
+# fixture's own template dir — with the gated inventory itself pinned at 3, so a newly added gated
+# job cannot raise both sides of the equation at once. The pin is the ONLY place this count is
+# stated: adding a gated template without bumping it here reds this suite on main, which is what
+# happened when worktree-hygiene (#1095/#1678) landed — the template arrived, the pin did not.
 BOOTSTRAP_COUNT1="$(grep -c 'launchctl bootstrap' "$LOG" || true)"  # grep -c exits 1 on ZERO matches; `set -e` would kill the run here
 GATED_TEMPLATES1=0
 GATED_INSTALLED1=0
@@ -434,7 +435,7 @@ for _tpl in "$TEMPLATES"/*.plist; do
     GATED_TEMPLATES1=$((GATED_TEMPLATES1 + 1))
     case "$OUT1" in *"$(basename "$_tpl" .plist): installed + loaded"*) GATED_INSTALLED1=$((GATED_INSTALLED1 + 1)) ;; esac
 done
-assert_eq "$GATED_TEMPLATES1" "3" "the {{TORTOISE_REPO}}-gated inventory is accounted for (branch-reaper #1787 + worktree-reaper #1311 + worktree-hygiene #2053)"
+assert_eq "$GATED_TEMPLATES1" "3" "the {{TORTOISE_REPO}}-gated inventory is accounted for (branch-reaper #1787 + worktree-reaper #1311 + worktree-hygiene #1095/#1678)"
 # A visible checkout whose resolution produced NOTHING is a regression, not a host without one. Ask
 # the same three candidates install-launchd.sh:76-82 asks (the fixture's HOME is the fake one the run
 # used, so §13/§14's seeded checkouts cannot make this look resolved).
