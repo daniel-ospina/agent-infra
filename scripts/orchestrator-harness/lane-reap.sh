@@ -51,9 +51,12 @@
 # when its immediate parent is a shell, that one wrapper shell (the launcher). One wrapper level is
 # summed and signalled — climbing further would swallow a tool shell of a LIVE lane (measured on a
 # cell: a `pi` reviewer under `reviewer-preflight.sh` whose grandparent was another live lane's
-# `pi`), which is a lane-killer. The tree is identified by POSITIVE evidence: one of its processes
-# holds a fleet-namespace log (`L-*.log`, `lane-*.log`, `fix-*.log`, `merge-*.log`, `chain-*.log`)
-# as stdout/stderr. An interactive `pi` (fds on a tty/socket) is not in the population at all.
+# `pi`), which is a lane-killer. The tree is identified by POSITIVE evidence: the tree's ROOT or one
+# of its DIRECT CHILDREN holds a fleet-namespace log (`L-*.log`, `lane-*.log`, `fix-*.log`,
+# `merge-*.log`, `chain-*.log`) as stdout/stderr. ⛔ Not any process in the subtree — a descendant
+# holding a DIFFERENT lane's log must never supply this lane's evidence (a nested lane would
+# otherwise lend a stale file to a working parent). An interactive `pi` (fds on a tty/socket) is not
+# in the population at all.
 #
 # WHAT THIS DOES NOT COVER (stated, not silently trusted):
 #   * the owner's own interactive `pi` INSIDE cmux with stdout redirected to a lane-shaped log —
@@ -64,6 +67,9 @@
 #     conservative side of the trap above, and it is why the measured reap population is old lanes.
 #   * `--apply` is DRY RUN by default. Arming is a deliberate operator action, same as every other
 #     deletion tool in this tree.
+#   * a leaked lane whose stdout is a PTY/PIPE and whose log name is outside the fleet namespace has
+#     no artefact to judge, so it is in NEITHER the census nor the reap population. That is the same
+#     fail-closed rule as `no-log-evidence`; ending such a tree is the operator's call.
 #
 # Usage:
 #   lane-reap.sh count                 # lanes=<live>/<total> zombie=<n>   (for `[cap]`)
@@ -81,10 +87,14 @@
 #   LANE_REAP_CPU_TOL_CS   parked tolerance, centiseconds (default 10 = 0.10s)
 #   LANE_REAP_IDLE_MIN     log-untouched bound, minutes (default 120 = 2h)
 #   LANE_REAP_NO_LOG_H     no-log age bound, hours (default 12)
-#   LANE_REAP_LIVE_MIN     log-advanced window that makes a lane LIVE, minutes (default 30)
+#   LANE_REAP_LIVE_MIN     log-advanced window that makes a lane LIVE, minutes (default 45 — ABOVE
+#                          the lane wall limit, `LANE_TIMEOUT` 2400s = 40 min: a live lane inside one
+#                          long silent tool call must not read as dead to the MAX_LANES gate)
 #   LANE_REAP_LOG          durable pass log (default ~/.pi/agent/state/lane-reap.log)
 #   LANE_REAP_LOCK         single-run lock (default ~/.pi/agent/state/lane-reap.lock)
 #   LANE_REAP_READ_TIMEOUT bound for one external read, seconds (default 60)
+#   LANE_REAP_PASS_TIMEOUT budget for ONE pass, seconds (default 120; a spent budget is `?`, never a
+#                          partial census)
 set -u
 
 PROG="lane-reap"
@@ -99,8 +109,14 @@ WINDOW="${LANE_REAP_WINDOW:-30}"
 CPU_TOL_CS="${LANE_REAP_CPU_TOL_CS:-10}"
 IDLE_MIN="${LANE_REAP_IDLE_MIN:-120}"
 NO_LOG_H="${LANE_REAP_NO_LOG_H:-12}"
-LIVE_MIN="${LANE_REAP_LIVE_MIN:-30}"
+LIVE_MIN="${LANE_REAP_LIVE_MIN:-45}"
 READ_TIMEOUT="${LANE_REAP_READ_TIMEOUT:-60}"
+# The budget for ONE pass, in seconds. A controller calls `count` every cycle, and the per-read
+# bound (`READ_TIMEOUT`) bounds ONE fork, not the sweep: 76 lane roots x a slow/hung lsof is a pass
+# that outlives the cycle it is measuring. The deadline turns "slow" into a NAMED abstention
+# (`lanes=?/?` / CANNOT-VERIFY) instead of a controller that stops logging capacity. It is checked
+# between lanes, so a pass never stops in the middle of a kill.
+PASS_TIMEOUT="${LANE_REAP_PASS_TIMEOUT:-120}"
 LOG="${LANE_REAP_LOG:-${HOME:-/tmp}/.pi/agent/state/lane-reap.log}"
 LOCK="${LANE_REAP_LOCK:-${HOME:-/tmp}/.pi/agent/state/lane-reap.lock}"
 
@@ -111,25 +127,34 @@ now_s() { if is_num "${LANE_REAP_NOW:-}"; then printf '%s' "$LANE_REAP_NOW"; els
 # `set -u` or silently disables the bound it configures; both are fail-open on a gate. Repair to the
 # documented default (fail CLOSED: the bound is restored, not removed).
 coerce_limits() {
+  is_num "${PASS_TIMEOUT:-}" || PASS_TIMEOUT=120
   for _v in WINDOW CPU_TOL_CS IDLE_MIN NO_LOG_H LIVE_MIN; do
     case "$_v" in
       WINDOW)     is_num "${WINDOW:-}"     || WINDOW=30 ;;
       CPU_TOL_CS) is_num "${CPU_TOL_CS:-}" || CPU_TOL_CS=10 ;;
       IDLE_MIN)   is_num "${IDLE_MIN:-}"   || IDLE_MIN=120 ;;
       NO_LOG_H)   is_num "${NO_LOG_H:-}"   || NO_LOG_H=12 ;;
-      LIVE_MIN)   is_num "${LIVE_MIN:-}"   || LIVE_MIN=30 ;;
+      LIVE_MIN)   is_num "${LIVE_MIN:-}"   || LIVE_MIN=45 ;;
     esac
   done
 }
 
-# Bound ONE external read. `timeout`/`gtimeout` when present; an absent one must not silently drop
-# the bound, but it also must not stop the pass on a platform that ships neither — the read is then
-# unbounded and the caller's own budget is the only guard (stated, not implied).
+# Bound ONE external read. `timeout`/`gtimeout` when present; otherwise a WATCHDOG SUBSHELL, because
+# macOS ships neither and an unbounded read on that box stalls the controller's hot loop (the same
+# MUST the doctor's `bounded` obeys, and the read here feeds every cycle's `[cap]`). A read we cannot
+# bound is not silently unbounded: it is killed after the budget, and the caller sees a failed read.
 bound() { # bound <seconds> <cmd...>
   local s="$1"; shift
   if command -v timeout >/dev/null 2>&1; then timeout "$s" "$@"; return $?; fi
   if command -v gtimeout >/dev/null 2>&1; then gtimeout "$s" "$@"; return $?; fi
-  "$@"
+  local p w rc
+  "$@" &
+  p=$!
+  ( "$SLEEP_BIN" "$s"; kill -TERM "$p" 2>/dev/null; "$SLEEP_BIN" 1; kill -KILL "$p" 2>/dev/null ) >/dev/null 2>&1 &
+  w=$!
+  wait "$p"; rc=$?
+  kill "$w" 2>/dev/null; wait "$w" 2>/dev/null
+  return "$rc"
 }
 
 logline() { # one durable, bounded line per event (best effort; never fails the pass)
@@ -270,15 +295,25 @@ _log_candidate() {
   return 0
 }
 
-# resolve_log <root> — TREE_PIDS is the global pid list. Echoes "path<TAB>deleted<TAB>holder_pid".
+# resolve_log <root> — LOG_PIDS is the global pid list. Echoes "path<TAB>deleted<TAB>holder_pid".
 #
-# ⛔ THE KERNEL IS THE SOURCE, NOT THE COMMAND LINE. On Linux `/proc/<pid>/fd/{1,2}` is read
-# directly; where /proc is absent (macOS) ONE `lsof` per process answers BOTH descriptors. That
-# one-call-per-process shape is not a micro-optimisation: `count` runs every controller cycle, and
-# the measured box had ~76 lane roots — two lsof forks each is a pass that outlives the cycle.
+# ⛔ THE EVIDENCE MUST BELONG TO THIS LANE, NOT TO ANY PROCESS UNDER IT (#2163 review, P0).
+# `resolve_log` used to walk the WHOLE subtree in awk's unordered hash order, so a descendant holding
+# a DIFFERENT lane-shaped log (a nested lane, a child dispatch writing its own `L-*.log`) supplied the
+# staleness evidence — a lane whose own log advanced 60s ago could be reaped on a descendant's 5h-old
+# log. The lane's own artefacts are held by the lane ROOT and its DIRECT children:
+#   `… nohup pi > L-x.log &`        → pi (the root's child) holds it
+#   `… pi | tee L-x.log`            → tee (the root's child) holds it
+#   `run_agent` (`pi >> "$log"`)    → pi (the root's child) holds it
+# so the population is the root's own descriptors, then its direct children in pid order. Deeper
+# processes are another lane's evidence and are never consulted; a lane whose log is not in that set
+# is `no-log-evidence` (refused), not judged on somebody else's file.
+#
+# On Linux `/proc/<pid>/fd/{1,2}` is read directly; where /proc is absent (macOS) ONE `lsof` per
+# process answers BOTH descriptors (a pass runs every controller cycle; two forks per pid does not).
 resolve_log() {
   local p fd path found
-  for p in $TREE_PIDS; do
+  for p in $LOG_PIDS; do
     found=""
     if [ -n "$PROC_ROOT" ] && [ -d "$PROC_ROOT/$p/fd" ]; then
       for fd in 1 2; do
@@ -306,6 +341,13 @@ mtime_epoch() { # prints epoch seconds, or nothing when unreadable
 # ── gate 2: the first recognised HOST APPLICATION in the chain decides ────────────────────────────
 # Returns: human | fleet | unknown. `human` is a hard refusal. `unknown` is acceptable ONLY because
 # the population already requires positive in-tree evidence (the fleet log held open).
+#
+# ⛔ THE WALK STARTS AT THE FIRST ANCESTOR, NOT AT THE ROOT (#2163 review, P1). The root's OWN argv
+# is the launcher's: it carries the brief path, a `PATH=/Applications/cmux.app/...` export, even the
+# prompt. Matching that text let a `cmux.app` substring in the root's command line return `fleet`
+# BEFORE the real `Terminal.app` ancestor was ever examined — the verdict decided by prompt text, the
+# exact "never parse a command line for a name" trap this file exists to close. Gate 2 is about
+# ANCESTORS, so `tail -n +2` drops the root and the walk starts where the host app actually lives.
 host_verdict() { # <tablefile> <pid>
   local apid acmd low
   while IFS=$'\t' read -r apid acmd; do
@@ -316,7 +358,7 @@ host_verdict() { # <tablefile> <pid>
       *cmux.app*|*cmuxterm*)
         printf 'fleet\n'; return 0 ;;
     esac
-  done < <(ancestry "$1" "$2")
+  done < <(ancestry "$1" "$2" | tail -n +2)
   printf 'unknown\n'
 }
 
@@ -333,6 +375,9 @@ pid_ident() { # <pid>
   fi
   bound "$READ_TIMEOUT" "$PS_BIN" -p "$pid" -o lstart= 2>/dev/null
 }
+
+# pass_expired <deadline> — has this pass spent its budget? (0 = yes)
+pass_expired() { [ "$(now_s)" -ge "${1:-0}" ]; }
 
 zombie_count() { # <tablefile> — the box's corpses, so "busy" cannot hide them
   awk -F'\t' '$3 ~ /^Z/ { n++ } END { printf "%d\n", n+0 }' "$1"
@@ -354,7 +399,22 @@ cmd_count() {
   fi
   z="$(zombie_count "$table")"
   roots="$(lane_roots "$table")"
+  local deadline
+  deadline=$(( $(now_s) + 10#$PASS_TIMEOUT ))
   for root in $roots; do
+    # ⛔ A PARTIAL CENSUS IS NOT A CENSUS. Stopping half-way and printing the lanes seen so far
+    # would under-report `total` — the exact direction that hides a leak. Budget spent => `?`, and
+    # the caller (which gates dispatch on this) falls back conservatively.
+    if pass_expired "$deadline"; then
+      rm -f "$table"
+      printf 'lanes=?/? zombie=?\n'
+      logline "census-budget-expired after ${PASS_TIMEOUT}s"
+      return 3
+    fi
+    # The lane's OWN evidence: the root, then its direct children in pid order (see resolve_log).
+    # The whole tree is still what the CPU gate sums and what the kill loop signals — this narrowed
+    # list is only who may SUPPLY the log.
+    LOG_PIDS="$root $(awk -F'\t' -v r="$root" '$2 == r { print $1 }' "$table" | sort -n | tr '\n' ' ')"
     TREE_PIDS="$(tree_pids "$table" "$root" | cut -f1 | tr '\n' ' ')"
     local resolved path del holder age m
     resolved="$(resolve_log "$root")" || continue   # no fleet log → not a lane (a subagent/tool pi)
@@ -372,11 +432,20 @@ cmd_count() {
       if is_num "${m:-}"; then
         age=$(( $(now_s) - m ))
         [ "$age" -ge 0 ] && [ "$age" -le $(( 10#$LIVE_MIN * 60 )) ] && live=$((live + 1))
+      else
+        # ⛔ AN UNREADABLE AGE IS NOT "NOT LIVE" (#2163 review, P2). Silently omitting this lane
+        # UNDER-COUNTS `live`, which makes `[ "$LANES" -ge "$MAX_LANES" ]` false and DISPATCHES MORE
+        # — a fail-open on the capacity gate, in the one direction that fills the box. The numerator
+        # becomes `?` and the caller falls back (refusing to add work), never a confident 0.
+        live="?"
       fi
     fi
   done
   rm -f "$table"
-  printf 'lanes=%d/%d zombie=%d\n' "$live" "$total" "$z"
+  printf 'lanes=%s/%d zombie=%d\n' "$live" "$total" "$z"
+  # A `?` numerator is a PARTIAL answer: the totals are real, but at least one lane's liveness could
+  # not be read. Exit 3 so a caller that gates work on this treats it as cannot-verify.
+  [ "$live" = "?" ] && return 3
   return 0
 }
 
@@ -425,7 +494,20 @@ cmd_reap() {
   local cand_file
   cand_file="$(mktemp "${TMPDIR:-/tmp}/lane-reap-cand.XXXXXX")" || { rm -f "$t0" "$ident_file" "$victims_file"; return 3; }
   : > "$cand_file"
+  local deadline
+  deadline=$(( $(now_s) + 10#$PASS_TIMEOUT ))
   for root in $roots; do
+    # The budget is checked BETWEEN lanes and BEFORE any signal: a pass that runs out of time judges
+    # nothing further and says so. Acting on evidence it happened to reach while past its budget is
+    # how a slow box turns into a reaper that signals in an unbounded window.
+    if pass_expired "$deadline"; then
+      rm -f "$t0" "$ident_file" "$victims_file" "$cand_file"
+      printf '%s: CANNOT-VERIFY — the pass budget (${PASS_TIMEOUT}s) was spent before the sample; nothing was signalled\n' "$PROG"
+      logline "cannot-verify pass-budget-expired"
+      return 3
+    fi
+    # The lane's OWN evidence: the root, then its direct children in pid order (see resolve_log).
+    LOG_PIDS="$root $(awk -F'\t' -v r="$root" '$2 == r { print $1 }' "$t0" | sort -n | tr '\n' ' ')"
     TREE_PIDS="$(tree_pids "$t0" "$root" | cut -f1 | tr '\n' ' ')"
     logres="$(resolve_log "$root")" || {
       refused=$((refused + 1))
@@ -449,6 +531,14 @@ cmd_reap() {
       printf '%s\t%s\n' "$p" "$(pid_ident "$p")" >> "$ident_file"
     done
   done
+  # A budget already spent before the window would make the second snapshot meaningless, and the
+  # window itself is the largest single cost of the pass.
+  if pass_expired "$deadline"; then
+    rm -f "$t0" "$ident_file" "$victims_file" "$cand_file"
+    printf '%s: CANNOT-VERIFY — the pass budget (${PASS_TIMEOUT}s) was spent before the CPU window; nothing was signalled\n' "$PROG"
+    logline "cannot-verify pass-budget-expired-before-window"
+    return 3
+  fi
   # One real window, then the second snapshot.
   "$SLEEP_BIN" "$WINDOW"
   read_table > "$t1"
@@ -523,7 +613,7 @@ cmd_reap() {
     # ── act ─────────────────────────────────────────────────────────────────────────────────────
     # Deepest first (children before parents) so nothing is reparented mid-kill; each victim is
     # re-fenced at signal time against the incarnation measured in the SAME snapshot as its CPU.
-    local depth pid wanted got
+    local depth pid wanted got signalled=0
     while IFS=$'\t' read -r pid depth; do
       case " $tree " in *" $pid "*) ;; *) continue ;; esac
       wanted="$(awk -F'\t' -v p="$pid" '$1 == p { print $2 }' "$ident_file" | head -1)"
@@ -534,10 +624,20 @@ cmd_reap() {
       fi
       "$KILL_BIN" -TERM "$pid" 2>/dev/null || true
       printf '%s\n' "$pid" >> "$victims_file"
+      signalled=$((signalled + 1))
     done < <(tree_pids "$t1" "$root" | sort -k2 -r -n)
-    printf '  REAP   root=%s log=%s — %s, cpu unchanged (%ss window), %s ancestry\n' \
-      "$root" "$logpath" "$stale_reason" "$WINDOW" "$verdict"
-    reaped=$((reaped + 1))
+    # ⛔ A CANDIDATE THAT SIGNALLED NOTHING IS NOT "REAPED" (#2163 review, P2). Every victim can
+    # abstain on the fence (a recycled pid), and the summary then said `reaped=1` over a lane that
+    # is still running — the operator's only evidence of what happened, wrong in the safe direction
+    # but wrong. The lane is reported as fence-abstained and NOT counted.
+    if [ "$signalled" -gt 0 ]; then
+      printf '  REAP   root=%s log=%s — %s, cpu unchanged (%ss window), %s ancestry\n' \
+        "$root" "$logpath" "$stale_reason" "$WINDOW" "$verdict"
+      reaped=$((reaped + 1))
+    else
+      printf '  SKIP   root=%s log=%s — fence-abstained (no victim still held its measured incarnation; nothing was signalled)\n' \
+        "$root" "$logpath"
+    fi
   done < "$cand_file"
 
   if [ "$apply" = "1" ] && [ -s "$victims_file" ]; then

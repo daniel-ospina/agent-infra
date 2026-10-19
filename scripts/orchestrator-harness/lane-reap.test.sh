@@ -54,6 +54,10 @@ case " $* " in
     if [ -n "${DEAD_PIDS:-}" ] && [ -f "$DEAD_PIDS" ] && grep -qx "$pid" "$DEAD_PIDS" 2>/dev/null; then
       exit 0
     fi
+    # FENCE leg: once the switch exists, the pid reports a DIFFERENT incarnation.
+    if [ -n "${LSTART_SWITCH:-}" ] && [ -f "$LSTART_SWITCH" ]; then
+      printf 'Tue Oct 20 11:00:00 2026\n'; exit 0
+    fi
     printf 'Mon Oct 19 10:00:00 2026\n'; exit 0 ;;
 esac
 case " $* " in
@@ -75,6 +79,9 @@ chmod +x "$T/bin/ps"
 
 cat > "$T/bin/sleep" <<'SH'
 #!/usr/bin/env bash
+# The window is the only moment between pass 1 (identity recorded) and the kill loop, so it is where
+# the FENCE leg flips the pid's reported incarnation.
+[ -n "${LSTART_SWITCH:-}" ] && { : > "$LSTART_SWITCH"; }
 exit 0
 SH
 chmod +x "$T/bin/sleep"
@@ -202,6 +209,59 @@ eq "$(sed -n '1p' "$KILL_LOG")" "-TERM 601" "FINISHED: the CHILD is signalled fi
 eq "$(sed -n '2p' "$KILL_LOG")" "-TERM 600" "FINISHED: the wrapper root is signalled second"
 hasnt "$(cat "$KILL_LOG")" "-KILL" "FINISHED: both die on TERM (no escalation needed)"
 
+# ── COMPOSITION: a tree that changed shape during the window is doing something ────────────────
+echo "== COMPOSITION (a subtree that gained a child is not a freeze)"
+: > "$T/t-c1"; psinit >> "$T/t-c1"
+psrow 500 1 Ss 00:00:00 05:00:00 "bash -c pi > $DEAD_LOG 2>&1 &" >> "$T/t-c1"
+psrow 501 500 Sl 00:00:05 05:00:00 pi >> "$T/t-c1"
+fdlink 501 1 "$DEAD_LOG"
+: > "$T/t-c2"; psinit >> "$T/t-c2"
+psrow 500 1 Ss 00:00:00 05:00:00 "bash -c pi > $DEAD_LOG 2>&1 &" >> "$T/t-c2"
+psrow 501 500 Sl 00:00:05 05:00:00 pi >> "$T/t-c2"
+psrow 502 501 Sl 00:00:01 00:10:00 "bash -c claude-review" >> "$T/t-c2"
+fdlink 501 1 "$DEAD_LOG"
+out="$(run_reap "$T/t-c1" "$T/t-c2" -- --apply)"
+has "$out" "subtree-changed" "COMPOSITION: the change is named"
+hasnt "$out" "REAP   root=500" "COMPOSITION: never reaped"
+eq "$(cat "$KILL_LOG" 2>/dev/null | wc -l | tr -d ' ')" "0" "COMPOSITION: no signal"
+
+# ── FENCE: a pid whose incarnation changed between measurement and signal is not signalled ─────
+echo "== FENCE (identity re-read at signal time)"
+: > "$T/t-fence"; psinit >> "$T/t-fence"
+psrow 500 1 Ss 00:00:00 05:00:00 "bash -c pi > $DEAD_LOG 2>&1 &" >> "$T/t-fence"
+psrow 501 500 Sl 00:00:05 05:00:00 pi >> "$T/t-fence"
+fdlink 501 1 "$DEAD_LOG"
+out="$(LSTART_SWITCH="$T/fence.switch" run_reap "$T/t-fence" "" -- --apply)"
+has "$out" "FENCE-ABSTAIN" "FENCE: the changed incarnation is named"
+hasnt "$out" "REAP   root=500" "FENCE: the candidate is not reported as reaped"
+eq "$(cat "$KILL_LOG" 2>/dev/null | wc -l | tr -d ' ')" "0" "FENCE: no signal reaches a recycled pid"
+
+# ── CAP: the `[cap]` fields, driven through the loop's own measure_lanes() ─────────────────────
+echo "== CAP ([cap] prints lanes=<live>/<total> max_lanes=<n> zombie=<n>)"
+LOOP="$HERE/orch-loop.sh"
+grep -qF 'lanes=$LANES/$LANES_TOTAL' "$LOOP" && grep -qF 'zombie=$ZOMBIES' "$LOOP" && rc=0 || rc=1
+eq "$rc" "0" "CAP: the [cap] line carries lanes=<live>/<total> and zombie=<n>"
+is_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
+O="$T"; _HERE_RS=/nonexistent
+printf '#!/bin/bash\necho "lanes=3/11 zombie=7"\n' > "$T/lane-reap.sh"
+chmod +x "$T/lane-reap.sh"
+LANE_REAP_SH=""
+# The loop's own function, sourced from an extracted block rather than restated here: a copy would
+# pass this leg while the shipped loop drifted.
+sed -n '/^LANE_REAP_SH=""/,/^}$/p' "$LOOP" > "$T/measure.sh"
+. "$T/measure.sh"
+measure_lanes
+eq "$LANES/$LANES_TOTAL/$ZOMBIES" "3/11/7" "CAP: live/total/zombie parsed from the census"
+eq "$LANES_UNKNOWN" "0" "CAP: a clean census is not flagged unknown"
+printf '#!/bin/bash\necho "lanes=?/11 zombie=7"; exit 3\n' > "$T/lane-reap.sh"
+measure_lanes
+eq "$LANES_UNKNOWN" "1" "CAP: an unreadable numerator REFUSES work (no silent fail-open)"
+eq "$LANES_TOTAL/$ZOMBIES" "11/7" "CAP: readable totals are still reported"
+printf '#!/bin/bash\necho "lanes=?/? zombie=?"; exit 3\n' > "$T/lane-reap.sh"
+measure_lanes
+eq "$LANES_UNKNOWN" "1" "CAP: a wholly unreadable census refuses work"
+eq "$LANES_TOTAL/$ZOMBIES" "?/?" "CAP: unknown totals stay unknown, never 0"
+
 # ── SURVIVOR: a SIGTERM-immune victim is escalated, but only while its incarnation holds ────────
 echo "== SURVIVOR (TERM followed by KILL, still fenced on the same incarnation)"
 out="$(KILL_NO_DEATH=1 run_reap "$T/t-dead" "" -- --apply)"
@@ -280,6 +340,16 @@ psrow 900 1 Z 00:00:00 05:00:00 "[pi] <defunct>" >> "$T/t-count"
 psrow 901 1 Z 00:00:00 05:00:00 "[bash] <defunct>" >> "$T/t-count"
 out="$(run_count "$T/t-count")"
 eq "$out" "lanes=1/2 zombie=2" "COUNT: one live of two resident lanes; two zombies"
+
+# ── BUDGET: a spent pass budget is an ABSTENTION, never a partial census ───────────────────────
+echo "== BUDGET (a pass that runs out of time judges nothing and says so)"
+out="$(LANE_REAP_PASS_TIMEOUT=0 run_count "$T/t-count")"; rc=$?
+eq "$rc" "3" "BUDGET: count exits 3"
+eq "$out" "lanes=?/? zombie=?" "BUDGET: a partial census is never printed as a number"
+out="$(LANE_REAP_PASS_TIMEOUT=0 run_reap "$T/t-count" "" -- --apply)"; rc=$?
+eq "$rc" "3" "BUDGET: reap exits 3"
+has "$out" "CANNOT-VERIFY" "BUDGET: reap says the budget was spent"
+eq "$(cat "$KILL_LOG" 2>/dev/null | wc -l | tr -d ' ')" "0" "BUDGET: nothing is signalled"
 
 # ── UNREADABLE: cannot-verify is not an empty fleet ────────────────────────────────────────────
 echo "== UNREADABLE (a failed ps read never renders as 0 lanes)"
