@@ -557,6 +557,20 @@ Six more (cycle 13), each a case where a datum the tool held was not the one it 
   `_post_respawn_provenance` re-stamps the observation time, drops the injected label and records the
   re-collection, so a `--facts` run that respawned does not advertise `facts_injected: true` beside a
   live `observed_at`.
+- **A verdict's `detail` may only assert what its own predicate read.** `work_dispatched`'s
+  `NOT_DISPATCHED` said "The controller is cycling, the queue is readable" — two facts it never
+  takes — so a run whose controller was ABSENT and whose pool record was UNREADABLE carried both
+  statements inside the delivered message, one contradicting the `queue=UNREADABLE` in its own
+  evidence block. It now names only its own readings and points at the checks that own the others.
+- **A viewer is not a runner.** The `_INSPECTORS` rule covers BOTH branches of the near-miss match,
+  including the PATH branch the controller census uses: `cat`/`vim`/`grep`/`tail` of
+  `orch-loop.sh` names the file, not a running controller — otherwise an absent controller read
+  `CENSUS_NEAR_MISS` and a respawn refused for as long as anyone had the script open.
+- **Narrowing is an EXCLUSION, not a flag.** The static exit and its `not_evaluated` are derived from
+  the checks actually graded, so `--only <all eight>` (which excludes nothing) exits 0 with
+  `not_evaluated: []` instead of 2 with a "(the other 0 checks were not asserted)" note.
+- **`log.age_s` is an age, not a truthy number**: a bool is UNREAD there too, so the "alive but
+  useless" arm cannot be skipped by it and the evidence cannot print it as "(1s ago)".
 - **`_is_count` is the ONLY count guard.** `isinstance(True, int)` is true, and the same field was
   healed in one arm and re-broken in the next three times in one week: `backlog: true` FAILed in
   `work_dispatched`, then PASSed in its GREEN arm (`False == 0`), then certified a frozen pool as

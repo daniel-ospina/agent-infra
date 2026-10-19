@@ -737,18 +737,21 @@ def _names_our_program(rows, paths=(), names=()):
         if not isinstance(r, dict):
             continue
         toks = str(r.get("cmd") or "").split()
+        # ⛔ A ROW WHOSE PROGRAM IS A SEARCH OR VIEW TOOL NAMES THE PATH, NOT THE PROCESS — and the
+        # paths branch is the one the CONTROLLER census uses, so `cat /O/orch-loop.sh`,
+        # `vim /O/orch-loop.sh` and `grep -n cycle /O/orch-loop.sh` all counted as "a rejected row
+        # names this cell's controller". A genuinely absent controller then read
+        # `CENSUS_NEAR_MISS` and `attempt_respawn` refused — for as long as anyone had the script
+        # open, which is exactly the operator behaviour this rule exists to keep honest.
+        if toks and os.path.basename(toks[0]) in _INSPECTORS:
+            continue
         hit = any(t in want for t in toks)
         if not hit and names:
-            # ⛔ A ROW WHOSE PROGRAM IS A SEARCH TOOL DOES NOT NAME THE DAEMON. `pgrep -fl cmux-tui`
-            # and `grep cmux-tui` carry the name as an ARGUMENT — and `pgrep -fl cmux-tui` is this
-            # tool's OWN documented next command for this check. Matching any token made the
-            # near-miss abstention fire on the diagnostic itself: a genuinely dead daemon read
-            # `INCONCLUSIVE/DAEMON_CENSUS_NEAR_MISS` for as long as anyone ran the recommended
-            # command, so the one arm that catches "cmux-tui was OOM-killed while the unit still read
-            # active" was unreachable for the population that reads this check. A row that merely
-            # NAMES the program (through `nice`, `bash -c`, an interpreter) still counts.
-            if toks and os.path.basename(toks[0]) not in _INSPECTORS:
-                hit = any(os.path.basename(t) in names for t in toks)
+            # The inspector guard is ABOVE, shared by both branches: `pgrep -fl cmux-tui` is this
+            # tool's own documented next command, and a `cat`/`vim`/`grep` of the controller script
+            # names the PATH, not a running program. A row that really NAMES the program — behind
+            # `nice`, or an interpreter — still counts.
+            hit = any(os.path.basename(t) in names for t in toks)
         if hit:
             out.append(r)
     return out
@@ -831,7 +834,12 @@ def check_controller_cycling(f, c):
         pid_txt = "%s (deepest first; %d matched)" % (pid_txt, len(pids))
     lc = launchd.get("label") or c.label
     lc_txt = _launchd_txt(launchd)
-    log_age = log.get("age_s")
+    # ⛔ A BOOL IS NOT AN AGE HERE EITHER. `log_age > win` is False for `True` (one second), so the
+    # "alive but useless" FAIL was unreachable on an injected/partial payload, and the next arm
+    # printed the boolean as a measured "(1s ago)". A non-number is an UNREAD age: the refusal to
+    # tell "alive but useless" from "alive and working" is the abstention below, not a verdict.
+    _raw_log_age = log.get("age_s")
+    log_age = _raw_log_age if _is_age(_raw_log_age) else None
     log_txt = "%s mtime %s (%s)" % (
         log.get("path") or "<log>",
         log.get("mtime_iso") or "?",
@@ -1492,10 +1500,16 @@ def check_work_dispatched(f, c):
     # POSITIVE evidence that work existed and none of it went out → FAIL. This is the check's whole
     # point; it is the branch that catches "everything is up and nothing ships".
     if refused:
+        # ⛔ THIS PREDICATE READS THE LOG, NOT THE CONTROLLER CENSUS AND NOT THE QUEUE RECORD. It
+        # said "The controller is cycling, the queue is readable" unconditionally — so a run whose
+        # controller was ABSENT (`FAIL/CONTROLLER_ABSENT`) and whose queue record was UNREADABLE
+        # printed, inside the very message `compose_message` delivers, two facts it never took, one
+        # of them contradicting the `queue=UNREADABLE` in its own evidence block.
         return V("work_dispatched", FAIL, "NOT_DISPATCHED", evidence,
-                 "%d dispatch attempt(s) were REFUSED in the window and nothing was dispatched. "
-                 "The controller is cycling, the queue is readable, and no work is going out."
-                 % len(refused))
+                 "%d dispatch attempt(s) were REFUSED in the window and NO lane was started, so no "
+                 "work is going out. (This check reads the dispatch log; whether the controller is "
+                 "alive is `controller_cycling`'s verdict, and whether the pool is readable is "
+                 "`queue_readable`'s.)" % len(refused))
     # No dispatch, no refusals, nothing in the backlog: is that IDLE or BLIND?
     # ⛔ THE SAME AUTHORITATIVE TOKEN `queue_readable` GRADES. Reading the header's token here while
     # `queue_readable` read the newer state record let a BLIND refresh be called IDLE: header
@@ -4421,6 +4435,11 @@ def main(argv=None):
             for name in missing_fixtures(paths):
                 mism.append((a.fixtures_dir or default_fixtures_dir(), "(fixture-set)",
                              "fixture present", "MISSING_FIXTURE (%s)" % name, None))
+        # WHAT WAS ACTUALLY LEFT UNGRADED — read from the VERDICTS, so `--only` naming all eight
+        # checks is NOT a narrowed run (it excluded nothing) and an absent `--only` never is either.
+        unanswered = [n for n in CHECK_ORDER
+                      if n not in set(v.name for _p, _n, _nt, vs, _e in rows for v in vs)]
+        narrowed = bool(unanswered)
         if a.json:
             # ⛔ THE MACHINE-READABLE REPORT CARRIES THE SAME TWO DISCLOSURES AS THE LIVE ONE. An
             # `--only` run exits 2 and, without these keys, a consumer saw "every fixture matched"
@@ -4429,10 +4448,11 @@ def main(argv=None):
                               # ⛔ THE EXIT THE PROCESS ACTUALLY RETURNS (below): a drifted
                               # fixture is 1, a narrowed run 2, otherwise 0. Computing it from the
                               # verdicts instead described a code this mode never produces.
-                              "exit": (1 if mism else (2 if only else 0)),
-                              "not_evaluated": [n for n in CHECK_ORDER
-                                                if n not in set(v.name for _p, _n, _nt, vs, _e in rows
-                                                                for v in vs)],
+                              # ⛔ NARROWING IS AN EXCLUSION, NOT A FLAG. `--only` naming all eight
+                              # checks excluded nothing, so `not_evaluated: []` sat beside
+                              # `exit: 2` and a "(the other 0 check(s) were NOT asserted)" note.
+                              "exit": (1 if mism else (2 if narrowed else 0)),
+                              "not_evaluated": unanswered,
                               "fixtures": [
                 {"path": p, "name": n, "note": note,
                  "verdicts": [v.as_json() for v in vs], "expect": ex}
@@ -4470,17 +4490,18 @@ def main(argv=None):
                     if vv is not None:
                         print("      evidence: %s" % str(vv.evidence).replace("\n", " | ")[:300])
             else:
-                if only:
-                    print("✅ every fixture matched its declared _expect (note: --only %s means the "
-                          "other %d check(s) per fixture were NOT asserted)"
-                          % (",".join(only), len(CHECK_ORDER) - len(only)))
+                if narrowed:
+                    # the COUNT and the NAMES come from what was graded, not from the flag: `--only`
+                    # naming all eight excluded nothing and used to print "the other 0 check(s)".
+                    print("✅ every fixture matched its declared _expect (note: %d check(s) were NOT "
+                          "asserted: %s)" % (len(unanswered), ",".join(unanswered)))
                 else:
                     print("✅ every fixture matched its declared _expect")
         if mism:
             return 1
         # ⛔ `--only` NARROWS, IT DOES NOT CERTIFY — the same rule the live path enforces. A green
         # static run that asserted 1 of 8 checks and exited 0 would be quoted as "the suite passes".
-        return 2 if only else 0
+        return 2 if narrowed else 0
 
     # ── live ────────────────────────────────────────────────────────────────────────────────
     cfg = cfg_from_args(a)

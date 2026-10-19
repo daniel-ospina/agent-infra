@@ -4504,14 +4504,31 @@ MUTATIONS = [
      '    if lane_ok:\n        return True, "a lane started %s (the queue record is not the only evidence)" % (\n            _age_txt(lane_ok.get("age_s")))',
      '    if intent or lane_ok:\n        return True, "a dispatch landed %s (the queue record is not the only evidence)" % (\n            _age_txt((intent or lane_ok).get("age_s")))',
      "test_the_intent_line_is_not_reported_as_a_LANDED_dispatch"),
+    # ── cycle-42 defects ─────────────────────────────────────────────────────────────────
+    ("a refused-dispatch FAIL claims the controller and queue it never read",
+     '                 "%d dispatch attempt(s) were REFUSED in the window and NO lane was started, so no "\n                 "work is going out. (This check reads the dispatch log; whether the controller is "\n                 "alive is `controller_cycling`\'s verdict, and whether the pool is readable is "\n                 "`queue_readable`\'s.)" % len(refused))',
+     '                 "%d dispatch attempt(s) were REFUSED in the window and nothing was dispatched. "\n                 "The controller is cycling, the queue is readable, and no work is going out."\n                 % len(refused))',
+     "test_a_REFUSED_dispatch_FAIL_claims_only_what_it_read"),
+    ("an --only run that excluded nothing is reported as narrowed",
+     '        narrowed = bool(unanswered)',
+     '        narrowed = bool(only)',
+     "test_an_only_run_that_EXCLUDED_nothing_is_not_a_narrowed_run"),
+    ("a viewer of the controller script testifies that the controller runs",
+     '        if toks and os.path.basename(toks[0]) in _INSPECTORS:\n            continue',
+     '        if False:\n            continue',
+     "test_a_VIEWER_of_the_controller_script_does_not_testify_it_is_running"),
+    ("a bool log age reaches the SILENT arm",
+     '    log_age = _raw_log_age if _is_age(_raw_log_age) else None',
+     '    log_age = _raw_log_age',
+     "test_a_BOOL_log_age_cannot_reach_the_SILENT_or_the_ADVANCING_arm"),
     # ── cycle-41 defects ─────────────────────────────────────────────────────────────────
     ("this box has three notification identities",
      '    return "local" if _is_local_box(name) else str(name).strip()',
      '    return str(name) if name else "local"',
      "test_this_box_has_ONE_notification_identity"),
     ("a search command testifies that the program is running",
-     '            if toks and os.path.basename(toks[0]) not in _INSPECTORS:',
-     '            if toks:',
+     '        if toks and os.path.basename(toks[0]) in _INSPECTORS:\n            continue',
+     '        if False:\n            continue',
      "test_a_SEARCH_command_does_not_testify_that_the_daemon_EXISTS"),
     ("an AMBIGUOUS suppression is reported as already notified",
      '        reported["suppressed_ambiguous"] = [v.key for v in suppressed if state.is_ambiguous(v.key)]',
@@ -4552,7 +4569,7 @@ MUTATIONS = [
      "    elif a.box:",
      "test_box_LOCAL_is_this_box_so_the_plist_repo_still_applies"),
     ("the static JSON hides its exit code and its unasserted checks",
-     '                              "exit": (1 if mism else (2 if only else 0)),',
+     '                              "exit": (1 if mism else (2 if narrowed else 0)),',
      '                              "exit": 0,',
      "test_the_static_JSON_publishes_its_exit_code_and_unasserted_checks"),
     ("an injected fact set is reported as a live observation in JSON",
@@ -4861,8 +4878,8 @@ MUTATIONS = [
      "    if log_age > win:", "    if False:",
      "test_controller_alive_with_frozen_log_is_fail_but_not_respawned"),
     ("refused dispatch attempts are forgiven",
-     '    if refused:\n        return V("work_dispatched", FAIL, "NOT_DISPATCHED", evidence,',
-     '    if False:\n        return V("work_dispatched", FAIL, "NOT_DISPATCHED", evidence,',
+     '    if refused:\n        reasons = {}',
+     '    if False:\n        reasons = {}',
      "test_dispatch_refused_is_fail_not_dispatched"),
     ("an UNREADABLE pool passes as readable",
      '    if tok["kind"] == "UNREADABLE":', "    if False:",
@@ -5342,8 +5359,8 @@ MUTATIONS = [
      "        pass",
      "test_each_headroom_floor_is_graded_ON_ITS_OWN"),
     ("--static --only certifies the checks it never asserted",
-     "        return 2 if only else 0",
-     "        return 0",
+     '        return 2 if narrowed else 0',
+     '        return 0',
      "test_a_fixture_expectation_naming_an_unknown_check_is_a_mismatch"),
     ("a recovery leaves the ambiguity marker behind (a repeat failure goes silent)",
      '        amb = self.data["boxes"][self.box].get("ambiguous") or {}\n'
@@ -5771,6 +5788,83 @@ def test_an_INJECTED_fact_set_is_disclosed_in_the_JSON_too():
     assert payload is not None, (rc, (out or err)[-400:])
     assert payload.get("facts_injected") is True, payload.get("facts_injected")
     assert "injected" in (payload.get("facts_source") or ""), payload.get("facts_source")
+
+
+@test
+def test_a_REFUSED_dispatch_FAIL_claims_only_what_it_read():
+    """`NOT_DISPATCHED` said "The controller is cycling, the queue is readable" unconditionally — but
+    this predicate reads the log, not the census and not the queue record. A run whose controller was
+    ABSENT and whose queue record was UNREADABLE carried both statements inside the very message
+    `compose_message` delivers, one of them contradicting the `queue=UNREADABLE` in its own evidence."""
+    m = load()
+    cfg = m.cfg_from_dict({})
+    facts = {"controller": {"ok": True, "pids": [], "near_misses": []},
+             "launchd": {"loaded": False, "pid": None},
+             "queue_state": {"ok": False, "raw": None, "error": "permission denied"},
+             "log": {"ok": True, "tail_ok": True, "age_s": 40},
+             "log_events": {"headers": [{"raw": "h queue=UNREADABLE load=40 lanes=0 backlog=47 ===",
+                                         "age_s": 120, "queue_token": "UNREADABLE", "backlog": 47}],
+                            "dispatch_refused": [{"raw": "#1 REFUSED: claim infra error", "issue": 1,
+                                                  "age_s": 100}],
+                            "dispatch_ok": [], "lane_started": [], "lane_failed": [],
+                            "unparsed_headers": 0}}
+    got = dict((v.name, v) for v in m.evaluate(facts, cfg))
+    assert got["controller_cycling"].variant == "CONTROLLER_ABSENT", got["controller_cycling"].variant
+    assert got["queue_readable"].status == m.INCONCLUSIVE, got["queue_readable"].variant
+    v = got["work_dispatched"]
+    assert v.status == m.FAIL and v.variant == "NOT_DISPATCHED", (v.status, v.variant)
+    for claim in ("controller is cycling", "queue is readable"):
+        assert claim not in v.detail.lower(), v.detail
+
+
+@test
+def test_an_only_run_that_EXCLUDED_nothing_is_not_a_narrowed_run():
+    """The static exit was conditioned on the FLAG, so `--only <all eight>` exited 2 while its payload
+    said `not_evaluated: []`, and the text printed "(the other 0 check(s) were NOT asserted)"."""
+    rc, out, err = run_cli(["--static", "--json", "--fixtures-dir", FIXTURES, "--only",
+                            ",".join(["controller_cycling", "queue_readable", "work_dispatched",
+                                      "pr_created", "pr_merged", "pane_daemon", "headroom",
+                                      "landers"])])
+    assert rc == 0, (rc, err[-300:])
+    doc = json.loads(out)
+    assert doc["not_evaluated"] == [], doc["not_evaluated"]
+    assert doc["exit"] == 0, doc["exit"]
+    # …and a genuine narrowing still exits 2 and names what it excluded
+    rc2, out2, _ = run_cli(["--static", "--json", "--fixtures-dir", FIXTURES, "--only", "headroom"])
+    assert rc2 == 2, rc2
+    assert json.loads(out2)["exit"] == 2
+    assert "pane_daemon" in json.loads(out2)["not_evaluated"]
+
+
+@test
+def test_a_VIEWER_of_the_controller_script_does_not_testify_it_is_running():
+    """The inspector guard was applied to the `names` branch only, while the CONTROLLER census passes
+    `paths` — so `cat /O/orch-loop.sh`, `vim /O/orch-loop.sh` and `grep -n cycle /O/orch-loop.sh` all
+    counted as "a rejected row names this cell's controller", and an absent controller read
+    `CENSUS_NEAR_MISS` with `attempt_respawn` refusing for as long as anyone had the script open."""
+    m = load()
+    paths = ["/O/orch-loop.sh"]
+    for cmd in ("cat /O/orch-loop.sh", "vim /O/orch-loop.sh", "grep -n cycle /O/orch-loop.sh",
+                "tail -f /O/orch-loop.sh", "less /O/orch-loop.sh"):
+        assert m._names_our_program([{"pid": 1, "cmd": cmd}], paths=paths) == [], cmd
+    # a row that really runs it — directly, or behind nice/an interpreter — still counts
+    for cmd in ("/bin/bash /O/orch-loop.sh --once", "nice -n 5 /bin/bash /O/orch-loop.sh"):
+        assert m._names_our_program([{"pid": 2, "cmd": cmd}], paths=paths), cmd
+
+
+@test
+def test_a_BOOL_log_age_cannot_reach_the_SILENT_or_the_ADVANCING_arm():
+    """`log_age > win` is False for `True` (one second), so on an injected/partial payload the "alive
+    but useless" FAIL was unreachable — and the next arm then printed the boolean as a measured
+    "(1s ago)", the exact defect `_age_txt` exists to prevent."""
+    m = load()
+    cfg = m.cfg_from_dict({})
+    d = fx("log-silent")
+    d["facts"]["log"]["age_s"] = True
+    v = m.check_controller_cycling(d["facts"], cfg)
+    assert v.variant != "LOG_SILENT", v.variant
+    assert v.variant in ("LOG_UNREADABLE", "CENSUS_NEAR_MISS"), v.variant
+    assert "1s ago" not in v.evidence or "age UNKNOWN" in v.evidence, v.evidence
 
 
 @test
