@@ -153,33 +153,33 @@ bound() { # bound <seconds> <cmd...>
   if [ -n "$TIMEOUT_BIN" ] && command -v "$TIMEOUT_BIN" >/dev/null 2>&1; then
     "$TIMEOUT_BIN" "$s" "$@"; return $?
   fi
-  local p w rc pf sp
-  pf="$(mktemp "${TMPDIR:-/tmp}/lane-reap-bound.XXXXXX" 2>/dev/null)" || pf=""
+  local p w rc sp was_m jm
   "$@" &
   p=$!
-  # ⛔ THE WATCHDOG MUST KILL ITS OWN `sleep` WHEN IT IS ENDED (#2163 review, P2). `kill "$w"` ends
-  # the subshell, not the `sleep <bound>` it forked — so the fallback (the ONLY path macOS takes)
-  # orphaned one sleeper per read, i.e. ~2 per lane per controller cycle, created by the instrument
-  # that exists to make the process population visible.
-  # TWO mechanisms, because neither alone is race-free: the subshell traps TERM and kills its
-  # sleeper, AND it records the pid in a file the PARENT reads after the subshell is gone. The trap
-  # alone lost the race when TERM arrived between the fork and `sp=$!` (measured: 2-3 of 8 reads
-  # orphaned); the parent's file read cannot (it happens after `wait "$w"`).
-  ( trap '[ -n "${sp:-}" ] && kill "$sp" 2>/dev/null; exit 0' TERM
-    "$SLEEP_BIN" "$s" & sp=$!
-    [ -n "$pf" ] && printf '%s' "$sp" > "$pf" 2>/dev/null
+  # ⛔ THE WATCHDOG KILLS ITS SLEEPER BECAUSE IT IS A PROCESS-GROUP LEADER (#2163 review, P2 — third
+  # and final shape). The earlier attempts failed for a STRUCTURAL reason worth writing down:
+  # `wait` only sees the caller's OWN children, and a pid handed between shells (a variable, then a
+  # file) has a hand-off window in which the sleeper is orphaned. Here the watchdog is started under
+  # job control, so `-$w` names ITS group: the subshell AND the `sleep` it forked are ended by ONE
+  # signal, with no hand-off and no window. The parent knows `$w` synchronously.
+  # If job control is refused (a shell without `set -m`), the group operand matches nothing and the
+  # fallback `kill "$w"` ends the subshell; its sleeper then expires on its own, bounded by READ_TIMEOUT.
+  # STATED RESIDUAL: on such a shell, ONE `sleep <read-timeout>` may outlive a read.
+  was_m=0; case $- in *m*) was_m=1 ;; esac
+  jm=0
+  set -m 2>/dev/null && jm=1
+  ( "$SLEEP_BIN" "$s" & sp=$!
     wait "$sp"
     kill -TERM "$p" 2>/dev/null; "$SLEEP_BIN" 1; kill -KILL "$p" 2>/dev/null ) >/dev/null 2>&1 &
   w=$!
+  [ "$was_m" = "1" ] || { [ "$jm" = "1" ] && set +m 2>/dev/null; }
   wait "$p"; rc=$?
-  kill -TERM "$w" 2>/dev/null; wait "$w" 2>/dev/null
-  if [ -n "$pf" ]; then
-    sp="$(cat "$pf" 2>/dev/null)"
-    case "$sp" in ''|*[!0-9]*) ;; *) kill -KILL "$sp" 2>/dev/null ;; esac
-    rm -f "$pf"
+  if [ "$jm" = "1" ]; then
+    kill -TERM -- "-$w" 2>/dev/null || kill -TERM "$w" 2>/dev/null
+  else
+    kill -TERM "$w" 2>/dev/null
   fi
-  # STATED RESIDUAL: if `mktemp` failed, `pf` is empty and only the TERM trap protects the sleeper;
-  # a trap that loses its race leaves ONE `sleep <s>` (bounded by READ_TIMEOUT) to expire on its own.
+  wait "$w" 2>/dev/null
   return "$rc"
 }
 
