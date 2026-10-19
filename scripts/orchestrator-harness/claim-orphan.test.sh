@@ -722,6 +722,29 @@ snap refs/claims/9209471-0123456789ab "peerBox:$DEADPID16" "$FUT"
 # (REAL24 is defined in the O24 section further down; this section runs first, so probe inline.)
 [ "$(CLAIM_KNOWN_HOSTS="$(hostname -s) peerBox" clf 9209471 $SHA16)" = "OWNED" ]
 ck "O16 [PINNED] ... while a KNOWN live peer's claim still reads OWNED (no steal from the queue)" $?
+# ⛔ AND A PROBE-BLIND BOX MUST NOT READ A PEER'S `box:<pid>` CLAIM AS ITS OWN (P2, cycle-21 review).
+# `_this_host` fell back to the literal `box`, so `[ "$host" != "$(_this_host)" ]` matched a peer's
+# sentinel-stamped claim, `claim_foreign_live` answered "not foreign", and `pr_owned()` dropped that PR
+# out of the owned set — the sweep then spawned for it every cycle and `claim_acquire` refused.
+mkdir -p "$T/bin-nohost16"
+printf '#!/bin/sh\nexit 1\n' > "$T/bin-nohost16/hostname"; chmod +x "$T/bin-nohost16/hostname"
+snap refs/claims/9209472-0123456789ab "box:41234" "$FUT"
+O16BOX="$(
+  PATH="$T/bin-nohost16:$PATH"
+  CLAIM_REPO="$T/repo"; CLAIM_STATE_DIR="$O16/state"; O="$O16"; export PATH CLAIM_REPO CLAIM_STATE_DIR O
+  . "$CLAIMS_SH" || exit 1
+  . "$O16/claimlive.sh" || exit 1
+  printf "THIS=[%s] " "$(_this_host)"
+  if claim_foreign_live 9209472 "$SHA16"; then printf "OWNED"; else printf "FREE"; fi )"
+# ⛔ THE EXPECTED ANSWER IS `OWNED`, AND THAT IS THE POINT: with the identity abstaining, the claim is
+# NOT read as this box's own — the guard falls through and the LEASE decides, which is the same answer
+# every genuinely foreign holder gets (the sweep keeps counting the PR as worked, and no spawn churn is
+# produced by a refused acquire). Reading it as `not foreign` (the `box` fallback) was the bug.
+case "$O16BOX" in
+  "THIS=[] OWNED") O16BOX_RC=0 ;;
+  *) O16BOX_RC=1 ;;
+esac
+ck "O16 [RED→GREEN] a probe-blind box does not treat a peer's 'box:<pid>' claim as its own ($O16BOX)" $O16BOX_RC
 
 # ══ O17: the RECORDER writes — the positive half of the former-name rule ══
 # ⛔ O10 SEEDS `claim-hosts` BY HAND AND `as_box` ALWAYS SETS THE SEAM, so until this section existed the
@@ -1220,6 +1243,34 @@ O25G="$(SHAPE 'refs/claims/issue-9209803-0123456789ab')"
 ck "O25 [RED→GREEN] an issue ref shaped like a PR ref still abstains from the pid arm (rc=$(field "$O25G" RC))" $O25G_RC
 case "$(field "$O25E" R)" in *DEAD_HOSTS*) O25F_RC=0 ;; *) O25F_RC=1 ;; esac
 ck "O25 [RED→GREEN] the BARE issue key's verdict comes from the HOST rules ('$(field "$O25E" R)')" $O25F_RC
+# ⛔ THE PID ARM MUST OUTRANK THE DENY LIST, AND THAT ORDERING IS DOCUMENTED AS MEASURED (P2, cycle-21
+# review) while nothing pinned it: moving `CLAIM_DEAD_HOSTS` above the ref case made a DENY-listed
+# CURRENT host reap a LIVE local PR worker's claim (`720e780d`'s P0, reinstated) and the suite stayed
+# green. The guidance "the deny list is safe for PR claims this box minted" rests on exactly this.
+O25H="$(
+  CLAIM_REPO="$T/repo"; CLAIM_STATE_DIR="$T/cl25"; CLAIM_DEAD_HOSTS="$REAL24"
+  export CLAIM_REPO CLAIM_STATE_DIR CLAIM_DEAD_HOSTS
+  mkdir -p "$CLAIM_STATE_DIR"
+  . "$CLAIMS_SH" || exit 1
+  r="$(claim_orphan_reason "$REAL24:$$" 'refs/claims/9209804-0123456789ab')"
+  printf "RC=%s\nR=[%s]\n" "$?" "$r" )"
+[ "$(field "$O25H" RC)" = "1" ]; O25H_RC=$?
+ck "O25 [RED→GREEN] a LIVE local PR pid OUTRANKS a deny list naming this box (rc=$(field "$O25H" RC))" $O25H_RC
+# `claim_orphan_reason` prints NOTHING when it does not judge the claim orphaned; the `held-by-live`
+# token is produced by the CALLERS (claim_acquire/claim_status), not by this predicate — so the
+# assertion here is "no reason for a live local pid", not a token match.
+# the helper prints `R=[<reason>]`, so "no reason" is the literal `[]`.
+[ "$(field "$O25H" R)" = "[]" ]; O25H2_RC=$?
+ck "O25 [RED→GREEN] ... and it reports NO orphan reason at all ('$(field "$O25H" R)')" $O25H2_RC
+# control: the SAME deny-listed host with a DEAD pid IS reaped — so the ordering, not a disabled arm.
+O25I="$(
+  CLAIM_REPO="$T/repo"; CLAIM_STATE_DIR="$T/cl25"; CLAIM_DEAD_HOSTS="$REAL24"
+  export CLAIM_REPO CLAIM_STATE_DIR CLAIM_DEAD_HOSTS
+  . "$CLAIMS_SH" || exit 1
+  claim_orphan_reason "$REAL24:$DEADPID16" 'refs/claims/9209805-0123456789ab' >/dev/null 2>&1
+  printf "RC=%s\n" "$?" )"
+[ "$(field "$O25I" RC)" = "0" ]; O25I_RC=$?
+ck "O25 [PINNED] ... while the SAME deny-listed host with a DEAD pid is reaped (rc=$(field "$O25I" RC))" $O25I_RC
 
 echo
 echo "── O26: the PRE-FLIGHT's unparseable-lease order (a FALSE CLEAN duplicates the work) ────"

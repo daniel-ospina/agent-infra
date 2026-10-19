@@ -1191,7 +1191,15 @@ claim_foreign_live() {
   # after arm 2 was already fixed. One lease reader, no lock arm.
   claim_lease_live "$pr" "$sha"
 }
-_this_host() { hostname -s 2>/dev/null || echo box; }
+# ⛔ THE FLEET-WIDE `box` SENTINEL IS NOT AN IDENTITY HERE EITHER (cycle-21 review). Falling back to
+# the literal `box` made a probe-blind box read EVERY peer's `box:<pid>` claim as its OWN — the
+# comparison is `[ "$host" != "$(_this_host)" ]` — so `claim_foreign_live` returned "not foreign" and
+# `pr_owned()` dropped that PR out of the owned set: the sweep then spawned for it every cycle and
+# `claim_acquire` refused (where `box` IS correctly not an identity). Not a steal (nothing is deleted),
+# but the churn the live-ownership rewrite exists to remove. An unanswerable name now prints NOTHING,
+# the `!=` test then fails and the guard abstains, and the claim falls through to `claim_lease_live` —
+# the same "the lease decides" answer every genuinely foreign holder gets.
+_this_host() { local h; h="$(hostname -s 2>/dev/null)"; case "$h" in ''|box) return 1 ;; esac; printf '%s' "$h"; }
 
 # How many OPEN PRs nothing is currently working. <open_prs>
 unowned_pr_count() {
