@@ -945,3 +945,94 @@ def test_the_degraded_message_still_reports_a_real_unreadable_roster(L, monkeypa
     msg = _degraded_stderr(L, dict(kind="nonzero", rc=1, cmd="cmux", attempt=2), monkeypatch)
     assert "unreadable after" in msg and "'nonzero'" in msg, msg
     assert "KILLED BY A SIGNAL" not in msg
+
+
+# ── PARTIAL ROSTER: a load-bound read must DEGRADE, not time out (#2095 item 5) ────────────────
+# ⛔ MEASURED 2026-10-18: `lane-status.py` gave up after 100 s with NO output while load was 129
+# and 54 `pi` processes were live, so `pr-doctor` reported the roster UNREADABLE (rc 2) and
+# dispatched nothing — the dispatcher was blindest exactly when the fleet was fullest. Every caller
+# bounded this read with a subprocess timeout, and a timeout returns NOTHING by construction.
+#
+# So the bound moved INSIDE the scan: a wall-clock deadline, and on overrun the rows already
+# classified are emitted, marked PARTIAL(taken=N). These tests drive `main()` on a stubbed fleet
+# whose per-lane cost is the measured one (a screen read under load), because the property is about
+# WALL TIME, not about any single helper.
+
+def _stub_fleet(L, monkeypatch, n, per_lane_s):
+    """A fleet of `n` lanes whose per-row work costs `per_lane_s` — the load, synthetically."""
+    import time
+
+    rows = [("lane-%02d" % i, "ws-%02d" % i, "") for i in range(n)]
+    monkeypatch.setattr(L, "registry", lambda: list(rows))
+    monkeypatch.setattr(L, "resolve_session_ex", lambda ws: ("sid-" + ws, True))
+    monkeypatch.setattr(L, "session_file", lambda sid: None)
+    monkeypatch.setattr(L, "most_live_child", lambda kids, exclude=None: (None, None))
+    monkeypatch.setattr(L, "_pi_cpu_map", lambda: {})
+    monkeypatch.setattr(L, "_pi_cwd_map", lambda: {})
+    monkeypatch.setattr(L, "declared_children", lambda label: [])
+    monkeypatch.setattr(L, "_submitted_epoch", lambda ws: (None, True))
+    monkeypatch.setattr(L, "_inbound_message", lambda ws: None)
+    monkeypatch.setattr(L, "in_flight_tool", lambda f: None)
+    monkeypatch.setattr(L, "lane_cpu_busy", lambda *a, **k: False)
+
+    def slow_screen(ws):
+        time.sleep(per_lane_s)
+        return "Working"
+
+    monkeypatch.setattr(L, "read_screen", slow_screen)
+
+
+def test_a_loaded_read_returns_a_PARTIAL_roster_inside_its_budget(L, tmp_path, monkeypatch, capsys):
+    import json
+    import time
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _stub_fleet(L, monkeypatch, 12, 0.4)
+    monkeypatch.setattr(L.sys, "argv",
+                        ["lane-status.py", "--json", "--no-cache", "--sample", "0",
+                         "--budget", "1.2"])
+    t0 = time.monotonic()
+    L.main()
+    dt = time.monotonic() - t0
+    cap = capsys.readouterr()
+    out = json.loads(cap.out)
+
+    # 1. THE BUDGET IS A WALL-CLOCK BOUND, not an estimate: 12 lanes at 0.4 s would take ~5 s.
+    assert dt < 8.0, "the read ignored its budget (%.1fs for 12 lanes at 0.4s)" % dt
+    # 2. IT RETURNED DATA, not nothing — the whole point.
+    assert 0 < len(out) < 12, "expected a PARTIAL roster, got %d of 12 rows" % len(out)
+    # 3. AND IT SAYS SO, in the shape a consumer can branch on.
+    assert all(r.get("roster_partial") for r in out), out[:1]
+    assert out[0]["roster_taken"] == len(out), out[0]
+    assert out[0]["roster_want"] == 12, out[0]
+    assert "PARTIAL(taken=%d of 12)" % len(out) in cap.err, cap.err
+
+
+def test_a_read_that_fits_its_budget_is_NOT_labelled_partial(L, tmp_path, monkeypatch, capsys):
+    """THE FALSE-BLOCK CONTROL. If `PARTIAL` fired on every read, the marker would mean nothing and
+    a consumer would stop trusting a complete roster."""
+    import json
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _stub_fleet(L, monkeypatch, 4, 0.0)
+    monkeypatch.setattr(L.sys, "argv",
+                        ["lane-status.py", "--json", "--no-cache", "--sample", "0",
+                         "--budget", "30"])
+    L.main()
+    cap = capsys.readouterr()
+    out = json.loads(cap.out)
+    assert len(out) == 4, out
+    assert not any(r.get("roster_partial") for r in out), "a complete read was labelled PARTIAL"
+    assert "PARTIAL" not in cap.err, cap.err
+
+
+def test_a_partial_roster_is_never_cached(L, tmp_path):
+    """⛔ A PARTIAL READ MUST NOT BECOME THE FLEET'S PUBLISHED ROSTER for the 420 s TTL — that is
+    the `degraded` sticky-failure shape one level quieter: every later consumer in the window would
+    believe the fleet is smaller than it is."""
+    cache = tmp_path / "lane-status.cache"
+    ok = L._publish_snapshot([{"verdict": "WORKING", "degraded": False,
+                               "roster_partial": True, "roster_taken": 2, "roster_want": 9}],
+                             str(cache), "k")
+    assert ok is False
+    assert not cache.exists(), "a partial snapshot must never be cached"

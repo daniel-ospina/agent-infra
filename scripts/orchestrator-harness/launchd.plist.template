@@ -11,7 +11,9 @@
   </array>
 
   <!-- RunAtLoad: start on login. KeepAlive: relaunch if the controller exits.
-       The loop is idempotent — .orch.lock makes a second instance exit immediately. -->
+       The loop is idempotent — .orch.lock is a liveness-checked singleton record, so a second
+       instance REFUSES to start (exit 75, naming the holder) instead of co-running against the
+       same state dir and log (agent-infra#2095). -->
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
@@ -45,6 +47,15 @@
          A fleet runs exactly ONE broad box; the rest pin own (README section 5). -->
     <key>SCOPE</key>
     <string>__SCOPE__</string>
+
+    <!-- PROVENANCE, NOT CONFIGURATION (agent-infra#2095). This marker is what lets `[cap]` say
+         whether a ceiling came from THIS plist or from a stray shell export: launchd passes both
+         as ordinary environment variables, so "MAX_LOAD is set" alone cannot answer the question
+         the incident needed answered (two instances gating at 100 and 250, indistinguishable in
+         the log). `[cap]` prints `src=plist(com.eldato.orchestrator-loop)` for values rendered
+         here. Changing the Label above? Change this value with it. -->
+    <key>ORC_CONTROLLER_ORIGIN</key>
+    <string>com.eldato.orchestrator-loop</string>
 
     <!-- concurrency limits; the swap gate, not MAX_LANES, is what throttles an 8 GB box
          (README section 4). MAX_LANES is rendered from the installer's own core probe — 2.5x the

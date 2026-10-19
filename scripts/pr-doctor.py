@@ -122,6 +122,12 @@ SNAPSHOT_MAX_AGE_S = 900
 # A DECLARED partial ownership read (e.g. the branch map is unreadable under TCC). Empty on a
 # complete read; `main()` logs it so a weaker predicate is never mistaken for a full one.
 OWNERSHIP_NOTE = ""
+# A DECLARED partial LANE-ROSTER read (agent-infra#2095 item 5), in the same shape and for the same
+# reason: `PARTIAL(taken=N)` says the fleet was larger than the read, so a dispatch decision made
+# from it is a decision on known-partial data -- never a silent claim that the fleet is quiet.
+# Empty on a complete read; an UNREADABLE read is a hard error (`idle_lanes` returns it as `why`),
+# and the two must never be collapsed: one still permits dispatch, the other refuses it loudly.
+ROSTER_NOTE = ""
 REPO = "daniel-ospina/tortoise"
 REPO_DIR = os.path.join(HOME, "Documents", "GitHub", "tortoise")
 
@@ -525,6 +531,112 @@ def _roster_size(out: str):
         return None
 
 
+def cheap_census(timeout: float = 15.0) -> dict:
+    """Occupancy from CHEAP LOCAL PRIMITIVES — for the pass where the roster read cannot answer.
+
+    ⛔ ONE IMPLEMENTATION OF THE CENSUS RULE, WHERE IT EXISTS. "Which worktree is a lane" is owned by
+    `scripts/orchestrator-harness/lane-census.sh` (the controller's own reader, #2095 item 3): it
+    reads live `pi` processes' cwd and reports `taken=`/`lanes_wt=`/`procs=`. This loader CALLS it
+    and parses its tokens — it does not re-derive the rule, because two implementations of one
+    safety rule is the defect #1178 removed elsewhere.
+
+    When the script is not deployed, the PROCESS COUNT is still obtainable and is still a fact about
+    the box (`procs=`), so a pass can say how busy the machine was instead of saying nothing. That
+    fallback carries NO lane classification and says so via `state=`.
+    """
+    cands = [os.path.join(SCRIPTS, "lane-census.sh"),
+             os.path.join(SCRIPTS, "orchestrator-harness", "lane-census.sh"),
+             os.path.join(REPO_DIR, "scripts", "orchestrator-harness", "lane-census.sh")]
+    script = next((c for c in cands if os.path.isfile(c)), "")
+    out = {}
+    if script:
+        try:
+            r = subprocess.run(["bash", script, "--repo", REPO_DIR], capture_output=True,
+                               text=True, timeout=timeout)
+            for tok in (r.stdout or "").split():
+                if "=" in tok:
+                    k, v = tok.split("=", 1)
+                    out[k] = v
+            out["src"] = "lane-census"
+            return out
+        except Exception as e:                     # noqa: BLE001 — a probe fault, never a verdict
+            out = {"state": "UNREADABLE", "why": type(e).__name__, "src": "lane-census"}
+    try:
+        r = subprocess.run(["pgrep", "-x", "pi"], capture_output=True, text=True, timeout=timeout)
+        n = len([ln for ln in (r.stdout or "").split() if ln.strip()])
+        out.setdefault("state", "PARTIAL")
+        out.setdefault("why", "no_census_script")
+        out["procs"] = str(n)
+        out["src"] = out.get("src", "pgrep")
+    except Exception as e:                         # noqa: BLE001
+        out.setdefault("state", "UNREADABLE")
+        out.setdefault("why", type(e).__name__)
+        out.setdefault("src", "pgrep")
+    return out
+
+
+def _census_token(d: dict | None) -> str:
+    """`taken=N procs=M` from a census dict, omitting unknowns rather than printing a fake zero."""
+    if not isinstance(d, dict) or not d:
+        return ""
+    bits = []
+    for k in ("taken", "lanes_wt", "procs"):
+        v = d.get(k)
+        if isinstance(v, str) and v.isdigit():
+            bits.append("%s=%s" % (k, v))
+    return " ".join(bits)
+
+
+def _body_partial(out: str):
+    """`(taken, want)` when a `lane-actions.py --json` body declares a PARTIAL roster, else None.
+
+    ⛔ THE MARKER LIVES ON THE BODY, NOT ONLY ON THE ROWS. `lane-actions.py` projects lane-status's
+    rows into a DICT (`idle`/`counts`/…), so a check that only looked at list rows could never fire
+    on the shape this caller actually receives — the note would be dead code on every real read.
+    The dict carries `partial: {taken, want}` verbatim; the list shape is still accepted so a raw
+    lane-status body (or a future producer) is not silently unlabelled.
+    """
+    try:
+        d = json.loads(out or "")
+    except Exception:
+        return None
+    if isinstance(d, dict):
+        p = d.get("partial")
+        if isinstance(p, dict):
+            try:
+                return int(p.get("taken") or 0), int(p.get("want") or 0)
+            except (TypeError, ValueError):
+                return 0, 0
+        return None
+    if isinstance(d, list):
+        for r in d:
+            if isinstance(r, dict) and r.get("roster_partial"):
+                try:
+                    return int(r.get("roster_taken") or 0), int(r.get("roster_want") or 0)
+                except (TypeError, ValueError):
+                    return 0, 0
+    return None
+
+
+def _note_partial(out: str, source: str) -> None:
+    """Set/clear `ROSTER_NOTE` from a roster that WAS read — partial or complete, never failed.
+
+    ⛔ PARTIAL IS A READ, UNREADABLE IS NOT (agent-infra#2095 item 5). A partial roster still names
+    lanes, so an idle lane in it is still idle and dispatch still proceeds; what must not happen is
+    that it be *presented* as the whole fleet. The note is the honest label, and the cheap census
+    travels with it so the reader can see how much of the box the roster accounts for.
+    """
+    global ROSTER_NOTE
+    pm = _body_partial(out)
+    if pm is None:
+        ROSTER_NOTE = ""                           # a complete read needs no caveat
+        return
+    tok = _census_token(cheap_census())
+    ROSTER_NOTE = "PARTIAL(taken=%d of %d from %s)%s" % (pm[0], pm[1], source,
+                                                         (" " + tok) if tok else "")
+    log("lane roster: %s -- dispatching from the lanes it classified" % ROSTER_NOTE)
+
+
 def idle_lanes(budget: float | None = None) -> tuple[list[dict], str]:
     """The idle lanes, from the fleet's PUBLISHED snapshot when it is fresh, else from a scan.
 
@@ -553,6 +665,9 @@ def idle_lanes(budget: float | None = None) -> tuple[list[dict], str]:
     """
     b = float(LANE_BUDGET_S if budget is None else budget)
     py = sys.executable or "python3"
+    # A note describes THIS pass's read: clearing it on entry makes a stale caveat impossible.
+    global ROSTER_NOTE
+    ROSTER_NOTE = ""
     # ── 1. the fleet's published snapshot -- the cheap, production read ─────────────────────
     snap_err = ""
     try:
@@ -580,6 +695,7 @@ def idle_lanes(budget: float | None = None) -> tuple[list[dict], str]:
             else:
                 log("lane roster: the published snapshot (%ds old, %d lane(s) classified) -- no scan paid"
                     % (age, _n))
+                _note_partial(out, "snapshot")
                 return lanes, ""
         else:
             snap_err = "published snapshot unusable (rc=%s: %s)" % (
@@ -599,6 +715,11 @@ def idle_lanes(budget: float | None = None) -> tuple[list[dict], str]:
     lanes, why = _parse_roster(out)
     if why:
         return [], "%s%s" % (why, (" | " + snap_err) if snap_err else "")
+    # ⛔ A PARTIAL READ IS ACCEPTED, AND NAMED (agent-infra#2095 item 5). The scan stopped at its
+    # own deadline and returned the lanes it classified: those observations are real, so an idle
+    # lane in them is still idle and dispatch proceeds. Refusing here — or worse, reporting "no
+    # idle lane" — is what left the dispatcher blind precisely when the fleet was fullest.
+    _note_partial(out, "scan")
     # ⛔ THE CAVEAT IS CARRIED TO THE READER, NOT DROPPED (#1788). `lane-actions.py` says
     # `COMPLETENESS UNMEASURED` on stderr when it falls back to a roster it could not verify; the
     # old code parsed stdout and discarded stderr, so a pass could dispatch on an unmeasured fleet
@@ -1300,7 +1421,11 @@ def main() -> int:
             if lane_err:
                 parts.append("lane roster UNREADABLE: %s" % lane_err[:120])
             if not lanes and not lane_err and budgets["total"]:
-                parts.append("no idle lane in the roster")
+                # ⛔ NAME THE KIND OF ROSTER (agent-infra#2095 item 5): "no idle lane" off a PARTIAL
+                # read is a weaker claim than the same words off a complete one, and a reader who
+                # cannot see the difference will size capacity off a fleet nobody counted.
+                parts.append("no idle lane in the roster" +
+                             ("" if not ROSTER_NOTE else " (%s)" % ROSTER_NOTE))
             if budgets["total"] == 0:
                 parts.append("no capacity budget (all of MAX_FIX+MAX_REVIEW is in flight)")
             for k, v in sorted(stalls.items()):
@@ -1335,7 +1460,8 @@ def main() -> int:
                            undeliverable=undeliv, unreadable=unread,
                            lane_read_failed=bool(lane_err),
                            ownership_read_failed=own_err[:160] if own_err else "",
-                           ownership_note=OWNERSHIP_NOTE[:160])
+                           ownership_note=OWNERSHIP_NOTE[:160],
+                           roster_note=ROSTER_NOTE[:160])
 
     if budgets["total"] and not lanes:
         # A READABLE roster with no free lane is a saturated fleet, not a failure -- but it must

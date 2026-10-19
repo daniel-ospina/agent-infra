@@ -20,7 +20,34 @@ if [ ! -d "$REPO" ]; then echo "orch-loop: FATAL REPO=$REPO does not exist" >&2;
 # every child, and a value set without `export` in the operator's shell never reaches the script at
 # all -- the guard above exits 78 first. (Sourcing this file instead of executing it is not a
 # supported entry point, and would be the one case where `export` was load-bearing.)
-O="${O:-$HOME/orchestrator}"
+# ── WHO AM I, AND WHICH STATE DO I OWN? (agent-infra#2095) ─────────────────────────────────────
+# ⛔ THE STATE DIRECTORY IS NOT `$HOME/orchestrator` BY DEFAULT FOR EVERY COPY ANY MORE. A proof copy
+# of this script ran for 5 h 15 m beside the launchd controller, both writing that one directory and
+# one log, because `O="${O:-$HOME/orchestrator}"` is a DEFAULT every copy inherits. The resolver
+# keeps the production path for the copy that LIVES in it and gives every other copy an ISOLATED
+# state dir, so a proof run cannot reach production state. `ORC_STATE_DIR` is the canonical name;
+# `O` is honoured as the legacy one (every already-deployed plist sets it).
+_HERE_CTL="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
+ORC_GUARD=""
+for _cg in "${O:-}/controller-state.sh" "${_HERE_CTL:-.}/controller-state.sh"; do
+  [ -n "$_cg" ] && [ -f "$_cg" ] && { ORC_GUARD="$_cg"; break; }
+done
+# ⛔ FAIL CLOSED: a controller that cannot evaluate its own singleton guard is exactly the instance
+# this issue exists to stop. Same polarity as the repo-authority guard below (refuse, never guess).
+if [ -z "$ORC_GUARD" ]; then
+  echo "orch-loop: FATAL controller-state.sh not found (looked in ${O:-<unset>} and ${_HERE_CTL:-<unresolved>}) — refusing to run without the singleton/state guard (#2095)" >&2
+  exit 78
+fi
+# shellcheck source=controller-state.sh
+. "$ORC_GUARD"
+# ⛔ `orc_state_pick` SETS GLOBALS — it must never be called in `$( )`, or the provenance is lost
+# (see its header). `orc_state_resolve` is the printing form and is for tests, not for here.
+# ⛔ `O` IS NOT CLEARED FIRST: it is the LEGACY input `orc_state_pick` honours (every deployed plist
+# sets it), so blanking it here would make every production install resolve as a non-production
+# copy and write its state to a temp dir.
+orc_state_pick "${BASH_SOURCE[0]:-$0}"
+O="$ORC_STATE_RESOLVED"
+export ORC_STATE_DIR="$O"
 export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
 # ⛔ THE gh SHIM MUST STAY FIRST (#1988). The line above prepends the tool dirs, so a REAL gh in
 # either of them outranks the seeded `$O/gh-rest` (Mac REST adapter) / `$O/gh-limit` (cell
@@ -98,8 +125,18 @@ is_limit "${_NCPU:-}"    || _NCPU=4
 # `[ "$L" -ge 0 ]` is always true, so the load gate CLOSES and the box dispatches nothing, forever.
 # install.sh carries the identical line (P3, fifth review round, 2026-10-14).
 [ "${_NCPU:-0}" -ge 1 ] || _NCPU=4
+# ⛔ AND THE VALUE IN FORCE CARRIES ITS SOURCE (agent-infra#2095 item 4). The incident's two
+# instances gated at 100 and 250 and `[cap]` printed only the number, so which value came from the
+# plist and which was derived by a stray copy could only be INFERRED from arithmetic. The label is
+# resolved here, immediately beside the resolution, so it cannot describe a value that is no longer
+# in force. Sources: plist(origin) | env | derived | default, each defined in controller-state.sh.
+MAX_LOAD_SRC="$(orc_limit_src MAX_LOAD derived)"
 MAX_LOAD="${MAX_LOAD:-$(( 10#$_NCPU * 10 ))}"
-is_limit "${MAX_LOAD:-}" || MAX_LOAD=$(( 10#$_NCPU * 10 )); is_limit "${MAX_LOAD:-}" || MAX_LOAD=40
+# ⛔ THE REPAIR MUST NOT RELABEL ITS OWN OUTPUT (2026-10-19). Reading the source AFTER assigning the
+# derived value can only ever answer "it was supplied", so a repaired `4x` was published as
+# `plist(tortoise)` — a provenance line that describes a value no plist contains. The supplied
+# source is captured first and carried through the repair.
+is_limit "${MAX_LOAD:-}"  || { _MLSRC="${MAX_LOAD_SRC:-}"; MAX_LOAD=$(( 10#$_NCPU * 10 )); MAX_LOAD_SRC="derived(repaired${_MLSRC:+ from $_MLSRC})"; is_limit "${MAX_LOAD:-}" || { MAX_LOAD=40; MAX_LOAD_SRC="default(repaired)"; }; }
 # ⛔ CAPACITY, NOT A LANE COUNT (owner ruling, 2026-10-17): "dispatch should be gated on capacity,
 # not on number of lanes. max lanes 8 is too low. that needs to be configured to 2.5x the number of
 # CPUs". Both numbers in play were LANE COUNTS that no hardware decided: the shipped default was a
@@ -110,6 +147,7 @@ is_limit "${MAX_LOAD:-}" || MAX_LOAD=$(( 10#$_NCPU * 10 )); is_limit "${MAX_LOAD
 # Integer division, so it FLOORS (4 cores -> 10, 3 -> 7). An explicit MAX_LANES still WINS and is not
 # recomputed — with ONE exception, spelled out at the coercion block below: a present-but-INVALID
 # value (`4x`, `09`, ten digits) is repaired there to this same derived default.
+MAX_LANES_SRC="$(orc_limit_src MAX_LANES derived)"
 MAX_LANES="${MAX_LANES:-$(( 10#$_NCPU * 5 / 2 ))}"
 MAX_REVIEW="${MAX_REVIEW:-4}"   # keep in sync with install.sh's default and README §4
 # Above this many UNOWNED open PRs (open PRs nothing is currently working — pr_owned() below),
@@ -151,7 +189,10 @@ command -v resolve_required_checks >/dev/null 2>&1 && command -v merge_authority
 REQ_OVERRIDE="${REQ:-}"
 REQ=""
 
-mkdir -p "$O/logs" "$O/state"
+mkdir -p "$O/logs" "$O/state" 2>/dev/null || {
+  echo "orch-loop: FATAL cannot create the state dir $O (resolved by $ORC_STATE_SRC) — refusing to run without a state dir" >&2
+  exit 78
+}
 LOG="$O/logs/orch-loop.log"
 touch "$O/dispatched.txt" "$O/candidates.txt" "$O/checked.txt"
 chmod +x "$O"/*.sh 2>/dev/null
@@ -199,7 +240,7 @@ is_limit "${MIN_MEM_FREE_MB:-512}" || MIN_MEM_FREE_MB=512
 # `* 5 / 2` can produce a ten-digit lane count that `is_limit` rejects — and only a TRUE default can
 # repair that, since re-deriving from the same probe returns the same value. 10 = a 4-core box's
 # 2.5x. `MAX_LANES=0` still passes `is_limit` and dispatches nothing — unchanged, deliberate.
-is_limit "${MAX_LANES:-}"         || { MAX_LANES=$(( 10#$_NCPU * 5 / 2 )); is_limit "${MAX_LANES:-}" || MAX_LANES=10; }
+is_limit "${MAX_LANES:-}" || { _MLNSRC="${MAX_LANES_SRC:-}"; MAX_LANES=$(( 10#$_NCPU * 5 / 2 )); MAX_LANES_SRC="derived(repaired${_MLNSRC:+ from $_MLNSRC})"; is_limit "${MAX_LANES:-}" || { MAX_LANES=10; MAX_LANES_SRC="default(repaired)"; }; }
 is_limit "${MAX_REVIEW:-}"        || MAX_REVIEW=4
 is_limit "${MERGE_PRIORITY_AT:-}" || MERGE_PRIORITY_AT=25
 is_limit "${MAX_FIX:-}"           || MAX_FIX=3
@@ -384,14 +425,19 @@ refund_bailed_fixer() {
   return 0
 }
 
-# single-instance lock (atomic: noclobber create fails if the file exists)
+# single-instance lock (atomic: noclobber create fails if the file exists) — a LIVENESS-CHECKED,
+# IDENTITY-CHECKED pid record (agent-infra#2095 item 1).
+# ⛔ THE REFUSAL IS LOUD AND NON-ZERO. It used to be `exit 0` after a bare `kill -0`, which is how a
+# SECOND controller co-ran for 5 h: the evidence for "somebody else owns this" was a pid, with no
+# identity and no age, so a recycled pid read as a live controller and a quiet zero-exit read as a
+# controller that had nothing to do. `controller-state.sh` documents the three outcomes; the one that
+# may never be silent is HELD, and it names the holder instead of exiting 0.
 LOCKF="$O/.orch.lock"
-acq() { ( set -o noclobber; echo $$ > "$LOCKF" ) 2>/dev/null; }
-if ! acq; then
-  OPID="$(cat "$LOCKF" 2>/dev/null || echo 0)"
-  if [ "${OPID:-0}" -gt 0 ] && kill -0 "$OPID" 2>/dev/null; then echo "[orch-loop] already running (pid $OPID)"; exit 0; fi
-  rm -f "$LOCKF"
-  acq || { echo "[orch-loop] lock race — exiting"; exit 0; }
+if ! orc_singleton_acquire "$LOCKF" "$O"; then
+  echo "orch-loop: REFUSING TO START — state dir $O is already held by instance pid=${ORC_HOLDER_PID:-?} (started=${ORC_HOLDER_STARTED:-?} state=${ORC_HOLDER_STATE:-?}): ${ORC_HOLDER_WHY:-unreadable lock record}." >&2
+  echo "orch-loop: this instance would co-run and apply ITS OWN thresholds to the same state and log (#2095). Stop the holder, or set ORC_STATE_DIR=<another dir> for a proof/test run." >&2
+  echo "[singleton] refused me=pid=$$ host=$(orc_hostname) state=$O state_src=$ORC_STATE_SRC max_load=$MAX_LOAD src=$MAX_LOAD_SRC holder_pid=${ORC_HOLDER_PID:-?} holder_started=${ORC_HOLDER_STARTED:-?} holder_state=${ORC_HOLDER_STATE:-?} why=${ORC_HOLDER_WHY:-unknown}" >> "$LOG" 2>/dev/null || true
+  exit 75
 fi
 # ⛔ THE SIGNAL HANDLERS ONLY TERMINATE — THE LOCK IS RELEASED BY THE `EXIT` TRAP ALONE.
 # Was `trap 'rm -f "$LOCKF"' EXIT INT TERM`, and for INT/TERM a handler that RETURNS does NOT
@@ -408,7 +454,23 @@ fi
 # (measured), which is fail-closed — `acq()` reclaims a dead pid.
 trap 'exit 143' TERM
 trap 'exit 130' INT
-trap 'rm -f "$LOCKF"' EXIT
+# ⛔ RELEASE ONLY A LOCK THIS PROCESS WROTE (controller-state.sh's `orc_singleton_release`). A release
+# that removes somebody else's record is how a later instance starts believing it is the first.
+trap 'orc_singleton_release "$LOCKF"' EXIT
+
+# ── the ONE startup record: WHO, WHICH STATE, WHICH CEILING, FROM WHERE (#2095 items 1-4) ───────
+# The incident's log could not answer "which instance wrote this cycle" or "where did 100 come
+# from"; this line answers both for every run, including the proof copies, so a divergence is READ
+# rather than inferred. `census` is included because it is the same cheap read the gate uses.
+ORC_CENSUS_BIN=""
+for _cn in "${ORC_CENSUS_BIN:-}" "$O/lane-census.sh" "${_HERE_CTL:-}/lane-census.sh" "${HOME:-}/.pi/agent/scripts/lane-census.sh"; do
+  [ -n "$_cn" ] && [ -x "$_cn" ] && { ORC_CENSUS_BIN="$_cn"; break; }
+done
+orc_census "$ORC_CENSUS_BIN" "$REPO"
+# ⛔ STATEMENT, NOT `$( … )`: `orc_self_describe` latches ORC_STARTED, so wrapping it in a command
+# substitution would recompute `started=` on every line (see controller-state.sh).
+orc_self_describe "$O" >/dev/null
+echo "[start] $ORC_INSTANCE state_src=$ORC_STATE_SRC origin=${ORC_CONTROLLER_ORIGIN:-manual} ncpu=$_NCPU max_load=$MAX_LOAD src=$MAX_LOAD_SRC max_lanes=$MAX_LANES src=$MAX_LANES_SRC $(orc_census_token "$MAX_LANES") census_bin=${ORC_CENSUS_BIN:-none}" >> "$LOG"
 
 # A worker whose log has not grown in this many minutes is hung. `pi -p` has no internal
 # timeout and a runaway child it spawns (a reviewer's `find /` ran for 8 hours on 2026-10-12)
@@ -881,7 +943,7 @@ while true; do
   L="$(load1)"
   # Read the gh-limit record ONCE per cycle; the token is age-bounded inside (see gh_limit_token).
   GHL="$(gh_limit_token)"
-  echo "=== $(date) load=$L lanes=$(tmux ls 2>/dev/null | grep -c '^lane-') backlog=$(wc -l < "$O/candidates.txt" | tr -d ' ') queue=$(queue_state_token)${GHL:+ $GHL} ===" >> "$LOG"
+  echo "=== $(date) load=$L lanes_tmux=$(tmux ls 2>/dev/null | grep -c '^lane-') backlog=$(wc -l < "$O/candidates.txt" | tr -d ' ') queue=$(queue_state_token)${GHL:+ $GHL} ===" >> "$LOG"
 
   # ---- 1) merge sweep (this box's open PRs) -------------------------------
   # scope: when the repo has >10 open PRs, help drain EVERYONE's (broad); otherwise just this box's.
@@ -1498,12 +1560,23 @@ keep=[x for x in cand if x not in done]
 open(sys.argv[1],"w").write("\n".join(keep)+("\n" if keep else ""))
 PY
   fi
-  L="$(load1)"; LANES="$(tmux ls 2>/dev/null | grep -c '^lane-')"
-  # agent-infra#1709 item 4: WORKERS counts the non-lane agent sessions (reviewers + fixers)
-  # live at this instant, so the dispatch block line below can distinguish "blocked while the box
-  # was idle" (lanes=0 workers=0 -> raising the ceiling helps) from "blocked while busy" (it does
-  # not). Total in-flight agents = lanes + workers.
-  WORKERS="$(tmux ls 2>/dev/null | grep -cE '^(merge|fix)-')"
+  L="$(load1)"
+  # ── LANE COUNT FROM LIVE PROCESSES, CROSS-CHECKED (agent-infra#2095 item 3) ─────────────────
+  # ⛔ IT USED TO BE `tmux ls | grep -c '^lane-'`, WHICH READ `lanes=0` WHILE 48-50 `pi --model`
+  # PROCESSES WERE LIVE. A session NAME is a convention; a live process holding a worktree is an
+  # observation. `orc_census` reports BOTH (`tmux=`, `worktrees=`, `agent_procs=`) and the value it
+  # used, plus its source (`lanes_src=`), so a disagreement is printed rather than resolved silently.
+  # The census is CHEAP and BOUNDED by construction (two subprocess reads) — it must never become the
+  # 147-420s `lane-status.py` read whose timeout is exactly why the dispatcher went blind on the
+  # passes where the fleet was fullest.
+  orc_census "$ORC_CENSUS_BIN" "$REPO"
+  LANES="$ORC_LANES"
+  # agent-infra#1709 item 4: WORKERS counts the non-lane agents (reviewers + fixers) live at this
+  # instant, so the dispatch block line below can distinguish "blocked while the box was idle"
+  # (lanes=0 workers=0 -> raising the ceiling helps) from "blocked while busy" (it does not).
+  # Total in-flight agents = lanes + workers. Now from the SAME census (process table first), not from
+  # the session-name convention alone.
+  WORKERS="$ORC_WORKERS"
   # A load reading that is empty or non-numeric is the DOCUMENTED FAIL-OPEN (can_spawn() defaults it
   # to 0). Kept deliberately (#1702): both supported platforms are measurable now, and failing CLOSED
   # on an unreadable probe would convert "no load back-pressure" into a permanent controller outage on
@@ -1534,14 +1607,14 @@ PY
   # — an ERRORED test, which is FALSE, which leaves GATE_WHY empty and OPENS the gate. Unreachable
   # through mem_avail_mb() today, but it is the one seam where a probe fault would admit work.
   if ! is_num "${MEMAVAIL_MB:-}"; then MEMAVAIL_MB=0; MEM_UNKNOWN=1; fi
-  echo "[cap] load=$L/$MAX_LOAD lanes=$LANES/$MAX_LANES mem_avail=${MEMAVAIL_MB}M/${MIN_MEM_FREE_MB}M swap_free=${SWFREE}M/${MIN_SWAP_FREE}M open=${OPEN_N:-?} unowned=${UPN:-?} review_slots=${MR:-?} fix_slots=${MF:-?}" >> "$LOG"
+  echo "[cap] ctl=$ORC_INSTANCE state_src=$ORC_STATE_SRC max_load=$MAX_LOAD src=$MAX_LOAD_SRC max_lanes=$MAX_LANES src=$MAX_LANES_SRC load=$L/$MAX_LOAD $(orc_census_token "$MAX_LANES") workers=$WORKERS mem_avail=${MEMAVAIL_MB}M/${MIN_MEM_FREE_MB}M swap_free=${SWFREE}M/${MIN_SWAP_FREE}M open=${OPEN_N:-?} unowned=${UPN:-?} review_slots=${MR:-?} fix_slots=${MF:-?}" >> "$LOG"
   # Four gates. swap_total=0 => swap uninitialised (fresh boot), NOT pressure — allow.
   # Name the binding gate: an earlier version logged "skipped (load=…)" while load was never
   # consulted, so a lanes-bound or swap-bound stall looked like a load stall.
   GATE_WHY="$(mp_reason "${UPN:-0}" "$LANES" "$WORKERS" "${OPEN_N:-0}")"
   if [ -n "$GATE_WHY" ]; then :
-  elif [ "$L" -ge "$MAX_LOAD" ]; then GATE_WHY="load=$L>=max_load=$MAX_LOAD"
-  elif [ "$LANES" -ge "$MAX_LANES" ]; then GATE_WHY="lanes=$LANES>=max_lanes=$MAX_LANES"
+  elif [ "$L" -ge "$MAX_LOAD" ]; then GATE_WHY="load=$L>=max_load=$MAX_LOAD(src=$MAX_LOAD_SRC)"
+  elif [ "$LANES" -ge "$MAX_LANES" ]; then GATE_WHY="lanes=$LANES>=max_lanes=$MAX_LANES(src=$MAX_LANES_SRC lanes_src=$ORC_LANES_SRC)"
   # ⛔ SWAP IS CUMULATIVE, RAM IS PRESENT (#1985). On macOS a 1 GB swap file stays roughly half
   # occupied for the life of the boot after ANY spike, so this arm vetoed dispatch forever while the
   # box had 1.4 GB available RAM (53 MB free + 1297 MB inactive) and 20 of 20 lane slots idle:
@@ -1646,7 +1719,7 @@ PY
     # `queue=UNREADABLE`/`PARTIAL(..)` means "the last pool read did not establish an empty pool".
     else echo "[dispatch] backlog empty queue=$(queue_state_token)" >> "$LOG"; fi
   else
-    echo "[dispatch] skipped ($GATE_WHY) lanes=$LANES workers=$WORKERS" >> "$LOG"
+    echo "[dispatch] skipped ($GATE_WHY) lanes=$LANES workers=$WORKERS lanes_tmux=${ORC_LANES_TMUX:-?} lanes_wt=${ORC_LANES_WT:-?}" >> "$LOG"
   fi
   heartbeat
 

@@ -1731,3 +1731,69 @@ def test_a_degraded_FIRST_read_is_still_a_hard_REFUSAL(monkeypatch):
         assert "DEGRADED" in str(e), e
         return
     raise AssertionError("a degraded FIRST read must still refuse")
+
+
+# ── PARTIAL ROSTER: usable data, never re-paid for, and always named (#2095 item 5) ────────────
+def test_a_partial_roster_is_RETURNED_not_re_scanned(monkeypatch):
+    """⛔ THE DEFECT THIS CLOSES. A roster cut short by the reader's own budget used to be
+    indistinguishable from a TRUNCATED one, so the completeness guard re-ran the whole scan — paying
+    again for exactly the cost the deadline had just cut off, on the box where that cost was 250 s
+    or more. Worse, when the outer timeout fired first the caller got NOTHING, which `pr-doctor`
+    reported as `roster UNREADABLE` and then dispatched nothing.
+
+    A partial read names its own state, so it is returned as-is: the lanes it did classify are real
+    observations. The test asserts BOTH halves — the rows come back, and there is exactly ONE
+    subprocess run (no re-scan)."""
+    import subprocess as _sp
+
+    calls = []
+    rows = [{"lane": "a", "verdict": "DONE-IDLE", "roster_partial": True,
+             "roster_taken": 1, "roster_want": 9}]
+
+    class _R:
+        stdout = json.dumps(rows)
+        stderr = ""
+        returncode = 0
+
+    def _run(*a, **k):
+        calls.append({"argv": list(a[0]) if a and isinstance(a[0], list) else [],
+                      "timeout": k.get("timeout")})
+        return _R()
+
+    monkeypatch.setattr(_sp, "run", _run)
+    monkeypatch.setattr(LA, "_live_want", lambda LS=None: 9)     # a much larger fleet
+    got, _age, _ref = LA.load_snapshot(_Args(stdin=None))
+    assert got and got[0]["lane"] == "a", got
+    assert len(calls) == 1, "a PARTIAL roster must not trigger a re-scan: %r" % (calls,)
+    # ⛔ AND THE READER IS HANDED THE DEADLINE. A subprocess timeout alone returns NOTHING; the
+    # `--budget` is what lets the reader stop ITSELF and print what it classified.
+    argv = calls[0]["argv"]
+    assert "--budget" in argv, argv
+    given = float(argv[argv.index("--budget") + 1])
+    assert given < float(calls[0]["timeout"]), (
+        "--budget (%s) must sit INSIDE the timeout (%s), or the kill lands first and the partial is "
+        "lost" % (given, calls[0]["timeout"]))
+
+
+def test_a_COMPLETE_roster_is_still_completeness_checked(monkeypatch):
+    """THE FALSE-BLOCK CONTROL. Only a roster that SAYS it is partial bypasses the completeness
+    guard; a short-but-unmarked one must still be re-scanned, or a truncated fleet read would be
+    trusted as the whole fleet."""
+    import subprocess as _sp
+
+    calls = []
+
+    class _R:
+        stdout = json.dumps([{"lane": "a", "verdict": "WORKING"}])
+        stderr = ""
+        returncode = 0
+
+    def _run(*a, **k):
+        calls.append(list(a[0]) if a and isinstance(a[0], list) else [])
+        return _R()
+
+    monkeypatch.setattr(_sp, "run", _run)
+    monkeypatch.setattr(LA, "_live_want", lambda LS=None: 9)
+    LA.load_snapshot(_Args(stdin=None))
+    assert len(calls) == 2 and "--no-cache" in calls[1], (
+        "an UNMARKED short roster must still be re-scanned: %r" % (calls,))

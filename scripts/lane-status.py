@@ -1614,6 +1614,12 @@ def _publish_snapshot(out, cache_path, key):
         return False
     if any(isinstance(r, dict) and r.get("degraded") for r in out):
         return False
+    # ⛔ AND A PARTIAL READ IS NOT THE FLEET EITHER (agent-infra#2095). The snapshot is the fleet's
+    # PUBLISHED roster for the whole 420 s TTL, so caching a budget-truncated read makes every later
+    # consumer in that window believe the fleet is smaller than it is — the same sticky-failure
+    # shape as `degraded`, one level quieter. A missing cache costs one real scan.
+    if any(isinstance(r, dict) and r.get("roster_partial") for r in out):
+        return False
     _tmp = cache_path + ".tmp"
     with open(_tmp, "w") as fh:
         json.dump({"key": key, "t": time.time(), "out": out}, fh, default=str)
@@ -1638,7 +1644,29 @@ def main():
                     help="comma-separated lane labels: probe only these (bounds the cost)")
     ap.add_argument("--no-cache", action="store_true",
                     help="force a real scan (the tick's pass-opening read uses this)")
+    ap.add_argument("--budget", type=float, default=None,
+                    help="hard wall-clock seconds for the whole read; on overrun emit the rows "
+                         "already classified, marked PARTIAL(taken=N), instead of timing out")
     a = ap.parse_args()
+
+    # ── A HARD BUDGET, INDEPENDENT OF SYSTEM LOAD (agent-infra#2095 item 5) ───────────────────
+    # ⛔ WHY A DEADLINE AND NOT A TIMEOUT AT THE CALL SITE. Every caller bounded this read with a
+    # `subprocess.run(timeout=…)`, which returns NOTHING when it fires: measured on the live box at
+    # load 129 with 54 `pi` processes, `lane-actions.py` gave up before pr-doctor's own 420 s bound
+    # and pr-doctor reported the roster UNREADABLE (rc 2) — so the dispatcher was blindest on
+    # exactly the passes where the fleet was fullest, and a busy box read as an empty one.
+    # A deadline INSIDE the scan is what turns that into data: the rows already classified are real
+    # observations, and a lane known idle in the first N entries is still idle. `taken` is how many
+    # of the fleet's entries this read got through, so a reader can size the gap instead of guessing.
+    _T0 = time.monotonic()
+    _DEADLINE = (_T0 + a.budget) if (a.budget and a.budget > 0) else None
+
+    def _left():                      # seconds left in the budget, or None when unbounded
+        return None if _DEADLINE is None else _DEADLINE - time.monotonic()
+
+    def _over():                      # True only once the budget is genuinely spent
+        _l = _left()
+        return _l is not None and _l <= 0.0
 
     # ── ONE SNAPSHOT PER PASS (2026-10-05) ────────────────────────────────────────────────
     # MEASURED: this scan costs 91s at current load (17 cmux calls; the `--only` note below records
@@ -1702,7 +1730,15 @@ def main():
     # faster, profile cmux itself first; do not reintroduce threads on the strength of the
     # similarity to the loop below.
     snap = {}
+    _pre_stopped = False
     for label, ws, _il in rows:
+        # ⛔ THIS PRE-PASS IS UNBOUNDED TOO, AND IT IS THE EXPENSIVE ONE AT LOAD: one
+        # `resolve_session_ex` is a cmux round trip per row (~10-15 s each at load). A deadline
+        # that only guarded the row loop would still spend the whole budget here and then emit
+        # NOTHING — the timeout this fix removes, wearing an internal deadline's clothes.
+        if _over():
+            _pre_stopped = True
+            break
         sid, _verified = resolve_session_ex(ws)
         f = session_file(sid)
         child, cf = most_live_child(pending_children(f) if f else [], exclude=f)
@@ -1714,7 +1750,11 @@ def main():
     # probes use, so every signal in one verdict describes one interval (the doc requires two
     # samples ~25s apart; `--sample` is 18s by default and is the window this file already owns).
     cpu0 = _pi_cpu_map()
-    time.sleep(a.sample)
+    # The sample window is a DURATION, so it must fit inside the budget: `sleep 18` against a 10 s
+    # budget guarantees a PARTIAL read even on an idle box, for a reason that has nothing to do
+    # with the fleet.
+    _sl = _left()
+    time.sleep(a.sample if _sl is None else max(0.0, min(a.sample, _sl)))
     cpu1 = _pi_cpu_map()
     # Attribute pids to lanes by the sessions-dir mangling of their cwd. Built ONCE, and used
     # only through lane_cpu_busy()'s strict exactly-one-both-sides rule.
@@ -1739,7 +1779,11 @@ def main():
     # independent, so fetch them concurrently: same data, ~8x less wall time.
     _screens = {}
     _need = [ws for label, ws, ilabel in rows if snap[label]["sid"]]
-    if _need:
+    # Only prefetch when the budget can plausibly absorb it: the pool is joined on exit, so starting
+    # it with seconds left would spend the budget waiting for work we are about to abandon. The
+    # serial path in the row loop is deadline-checked and degrades cleanly.
+    _prefetch_left = _left()
+    if _need and (_prefetch_left is None or _prefetch_left > 20):
         try:
             from concurrent.futures import ThreadPoolExecutor
             with ThreadPoolExecutor(max_workers=8) as _ex:
@@ -1749,7 +1793,17 @@ def main():
             _screens = {}   # fall back to the serial path below, never to no screen
 
     out = []
+    _stopped_early = _pre_stopped
     for label, ws, ilabel in rows:
+        # ⛔ THE DEADLINE IS CHECKED BEFORE THE ROW, because one row's work (a screen read at load,
+        # a child-session walk) is the unit that overruns. A row already classified is kept.
+        if _over():
+            _stopped_early = True
+            break
+        # a row whose pre-pass never ran has no snapshot entry: stop here rather than KeyError
+        if label not in snap:
+            _stopped_early = True
+            break
         s = snap[label]
         f = s["file"]
         grew, stale = False, None
@@ -1932,6 +1986,25 @@ def main():
                         child=child, child_file=os.path.basename(child_file) if child_file else None,
                         child_stale=child_stale, child_grew=child_grew,
                         child_activity=child_act, tool=ti))
+
+    # ── PARTIAL IS A READ STATE, NOT A FAILURE (agent-infra#2095 item 5) ───────────────────────
+    # ⛔ AN OVERRUN MUST NOT DISCARD WHAT WAS READ. The rows above are real observations of real
+    # lanes; throwing them away is what made `pr-doctor` report the roster UNREADABLE and dispatch
+    # nothing on the busiest passes. Mark the set and carry the count, so every consumer can size
+    # the gap (`taken=N of M`) instead of inferring it from silence.
+    _taken = len(out)
+    _want_rows = len(rows)
+    _partial = _stopped_early or _taken < _want_rows
+    if _partial:
+        for _r in out:
+            _r["roster_partial"] = True
+            _r["roster_taken"] = _taken
+            _r["roster_want"] = _want_rows
+        sys.stderr.write(
+            "lane-status: PARTIAL(taken=%d of %d)%s -- the rows above are classified lanes; the "
+            "fleet is larger than this read\n"
+            % (_taken, _want_rows,
+               "" if a.budget is None else " within the %gs budget" % a.budget))
 
     if a.json:
         _blob = json.dumps(out, indent=2, default=str)

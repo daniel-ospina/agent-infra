@@ -200,7 +200,7 @@ processes in tmux sessions, so a killed worker cannot take the controller down w
 |---|---|
 | `heartbeat` | epoch seconds, rewritten every cycle — the liveness probe |
 | `state/queue-state` | what the last pool READ saw, with the epoch of the read — `EMPTY`, `READ(<n>)`, `PARTIAL(<tiers>)` or `UNREADABLE`. `orch-loop.sh` prints it in the cycle line as `queue=$(queue_state_token)`, so a refresh that could not read the pool (`queue=UNREADABLE`) is never mistaken for a fleet with nothing to do (`queue=EMPTY`); an absent file reads `UNKNOWN`, never `EMPTY` (agent-infra#1931) |
-| `.orch.lock` | atomic single-instance lock (noclobber create); stale locks are reclaimed |
+| `.orch.lock` | the **singleton record** — `orc-v1 pid=<pid> started=<epoch> host=<host>` + `state=<dir>`, created exclusively (noclobber) and judged on **liveness + identity + age**, not on a bare `kill -0` (§2.6). A second controller **refuses to start** (exit 75) and names the holder; a stale record is reclaimed |
 | `candidates.txt` | the dispatch backlog: issue numbers that passed collision pre-flight |
 | `dispatched.txt` | issues already handed to a lane — **pruned** when the issue is still open, no PR branch matches it and no `lane-<N>` is live (see §7.1) |
 | `checked.txt` | issues whose pre-flight returned **CLEAN** (the terminal verdict); an **errored** pre-flight and a **COLLISION** leave no entry, so the next pass re-attempts them (agent-infra#1716). A reaped number is dropped from it too, so the pre-flight re-queues the issue |
@@ -219,6 +219,53 @@ processes in tmux sessions, so a killed worker cannot take the controller down w
 | `state/roles/merge.attempts` | `PR head epoch reason` for every rail call the merge role made — the head-level cooldown that stops a REFUSED head being retried blind |
 | `logs/` | one log per worker: `lane-*.log`, `chain-*.log`, `merge-*.log`, `fix-*.log`, `orch-loop.log` |
 | `wip/` | dirty-worktree captures taken before a shutdown (see §6) |
+
+### One controller per state dir — who I am, where my state is, where my ceiling came from (#2095)
+
+MEASURED 2026-10-18: a proof copy of `orch-loop.sh` (`/tmp/orc-proof/`, parent `/tmp/live-cycle.sh`)
+ran for **5 h 15 m** beside the launchd controller. Both resolved `O="${O:-$HOME/orchestrator}"`, so
+they shared one state dir and one log, and the proof copy gated dispatch at its OWN derived
+`MAX_LOAD=100` while the plist said 250 — `[dispatch] skipped (load=158>=max_load=100)` while the
+plist said otherwise. In the same window `tmux ls | grep -c '^lane-'` reported `lanes=0` while
+48-50 `pi --model` processes were live. Four rules came out of it, all enforced by
+`controller-state.sh` (sourced by the loop) and `lane-census.sh`:
+
+**1. The singleton is a liveness-checked record, and the refusal is loud.** A second instance whose
+state dir is already held exits **75** and says who holds it (`pid=`, `started=`, `state=`, why),
+and writes the same line to `$O/logs/orch-loop.log` as `[singleton] refused …`. The old refusal was
+`exit 0` after a bare `kill -0` on a pid with no identity — a recycled pid read as a live controller
+forever, and a refusal that exited 0 looked like a controller with nothing to do. Three outcomes:
+acquired, **HELD** (live holder → refuse), **UNJUDGED** (record unreadable → refuse, *fail closed*).
+Release is ownership-scoped: a process removes only a record it wrote.
+
+**2. State is isolated by default for every copy that is not the production install.** The
+resolver takes `ORC_STATE_DIR` (canonical) → `O` (legacy, which every deployed plist sets) → the
+production path **only when the script lives in it** → otherwise
+`${TMPDIR:-/tmp}/orc-state-<dirname of the copy>`. So a proof run cannot reach production state by
+default; it would have to say so. The source of the resolved dir is printed on every `[start]` and
+`[cap]` line (`state_src=env:ORC_STATE_DIR | env:O(legacy) | default:production-install |
+derived:isolated(…)`).
+
+**3. The lane count is an OBSERVATION, cross-checked against the convention.** `lane-census.sh`
+reads every live `pi` process's cwd (one bounded `lsof` on macOS, `/proc/<pid>/cwd` on Linux) and
+counts distinct worktrees under `<repo>/.worktrees/<name>`; it reports that alongside
+`tmux ls`'s `^lane-` count, plus `procs=` as the cross-check. The value USED is the **larger** of the
+two independent observations (the failure being fixed is UNDER-counting; a larger count can only
+refuse a dispatch), and `[cap]` prints both, with `DISAGREE(tmux=N worktrees=M used=X)` when they
+differ. An unreadable read is `UNREADABLE`, never `0`.
+
+**4. Every ceiling carries its provenance.** `[start]` and `[cap]` print the instance
+(`ctl=pid=… host=… started=… state=…`), `max_load=<v> src=plist(<origin>)|env|derived(default)`,
+and the same for `max_lanes`. `plist(...)` is distinguishable from `env` only because
+`launchd.plist.template` exports `ORC_CONTROLLER_ORIGIN` — launchd passes both as ordinary
+environment variables, so "it is in the env" cannot answer "did the plist say so?". A supplied value
+that fails validation is repaired and labelled `<source>(repaired)`; the source is captured BEFORE
+the repair, so the line never names a plist that does not contain the value.
+
+**Reading it:** `grep -E '^\[(start|cap|singleton)\]' $O/logs/orch-loop.log` answers, for any
+cycle: which instance ran it, which state directory and log it owned, and where each ceiling came
+from. `bash scripts/orchestrator-harness/controller-state.test.sh` and `lane-census.test.sh` drive
+both files (hermetic: stub holders, real processes and worktrees, a hanging `pgrep`).
 
 ### Why the *reviewer* is a separate process from the *controller*
 

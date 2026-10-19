@@ -210,6 +210,28 @@ def _live_want(LS=None):
         return None
 
 
+def _partial_marker(rows):
+    """(taken, want) when this roster was cut short by the reader's own budget, else None.
+
+    ⛔ A PARTIAL ROSTER IS DATA, NOT A FAILURE (agent-infra#2095 item 5). The reader
+    (`lane-status.py --budget`) stops at a deadline and marks the rows it did classify. Before this,
+    the only way to bound the read was a subprocess timeout at the call site, and a timeout returns
+    NOTHING — that is how `pr-doctor` came to report the roster UNREADABLE and dispatch nothing on
+    exactly the passes where the fleet was fullest. Re-scanning a partial (what the completeness
+    guard below does for a TRUNCATED snapshot) would re-pay the cost that was just cut off, so this
+    answer is returned as-is and NAMED; the caller carries the caveat to its own log.
+    """
+    if not isinstance(rows, list):
+        return None
+    for r in rows:
+        if isinstance(r, dict) and r.get("roster_partial"):
+            try:
+                return int(r.get("roster_taken") or 0), int(r.get("roster_want") or 0)
+            except (TypeError, ValueError):
+                return 0, 0
+    return None
+
+
 def _registry_labels():
     out = []
     try:
@@ -1422,6 +1444,12 @@ def load_snapshot(args, LS=None):
         # below (`len(rows) >= want - REGISTRY_GRACE`) is bypassed entirely when --stdin is used,
         # which is exactly how heartbeat-loop.sh calls this tool. So the refusal lives HERE too.
         _refuse_if_degraded(rows, args.stdin)
+        # A published snapshot is never partial (`_publish_snapshot` refuses to cache one), but a
+        # caller may pipe one in by hand. Name it rather than pretending it is the fleet.
+        _pm = _partial_marker(rows)
+        if _pm is not None:
+            sys.stderr.write("lane-actions: roster is PARTIAL(taken=%d of %d) -- acting on the "
+                             "lanes it did classify; COMPLETENESS UNMEASURED\n" % _pm)
         # The header must state the DATA's age, not the run time: a snapshot published by an earlier
         # pass (a killed tick leaves the last good one in place) is still usable, but the reader has
         # to be able to see how old it is.
@@ -1466,7 +1494,14 @@ def load_snapshot(args, LS=None):
                                 else "the --no-cache re-scan could start"))
             break
         allowance = min(remaining, budget * FIRST_SHARE) if attempt == 0 else remaining
-        cmd = ["/usr/bin/python3", LS_PATH, "--json", "--sample", str(args.sample)]
+        # ⛔ THE READER GETS THE DEADLINE, NOT JUST A TIMEOUT AROUND IT (agent-infra#2095 item 5).
+        # A subprocess timeout returns NOTHING when it fires, which is why the roster came back
+        # UNREADABLE at exactly the loads where dispatch mattered. `--budget` is strictly inside
+        # the timeout (5 s of headroom for the JSON write and interpreter start), so lane-status
+        # stops ITSELF and prints the rows it classified, marked PARTIAL, before anyone kills it.
+        _reader_budget = max(1.0, allowance - 5.0)
+        cmd = ["/usr/bin/python3", LS_PATH, "--json", "--sample", str(args.sample),
+               "--budget", "%g" % _reader_budget]
         if attempt:
             cmd.append("--no-cache")
         try:
@@ -1501,6 +1536,14 @@ def load_snapshot(args, LS=None):
             ref = os.path.getmtime(os.path.join(STATE, "lane-status.cache"))
         except OSError:
             age, ref = 0, time.time()
+        # ⛔ A PARTIAL READ IS RETURNED AS-IS (agent-infra#2095 item 5): it is the strongest read
+        # obtainable inside the caller's budget, and the guard below would otherwise treat its size
+        # as "truncated" and re-scan — re-paying exactly the cost the deadline just cut off.
+        _pm = _partial_marker(rows)
+        if _pm is not None:
+            sys.stderr.write("lane-actions: roster is PARTIAL(taken=%d of %d) -- acting on the "
+                             "lanes it did classify; COMPLETENESS UNMEASURED\n" % _pm)
+            return rows, age, ref
         complete = want is not None and len(rows) >= want - REGISTRY_GRACE
         rec = (rows, age, ref, complete)
         best = rec                                   # a SUCCESSFUL read always supersedes
@@ -1623,9 +1666,15 @@ def main():
     if rc:
         return rc
     if a.json:
+        # ⛔ THE ROSTER'S OWN READ-QUALITY TRAVELS WITH THE BODY (agent-infra#2095 item 5). The
+        # rows' `roster_partial` flags are projected away by `build()`, so a caller that only sees
+        # this document could not tell a partial read from a quiet fleet — the same defect class as
+        # collapsing UNREADABLE into "no idle lanes". `partial` names it once, with the count.
+        _pm = _partial_marker(rows)
         print(json.dumps({
             "beat": beat, "jev": res["meta"], "jev_down": res["jev_down"],
             "words_read": res["words_read"],
+            "partial": (None if _pm is None else {"taken": _pm[0], "want": _pm[1]}),
             "counts": {k: len(res[k]) for k in ("idle", "wip", "wedged", "report", "quiet")},
             "idle": res["idle"], "wip": res["wip"], "wedged": res["wedged"],
             "report": res["report"], "quiet": res["quiet"],

@@ -1349,3 +1349,77 @@ def test_only_N_is_not_a_fleet_reading(monkeypatch, tmp_path):
     assert rc == 0, joined
     assert "not a fleet reading" in joined, joined
     assert payload == {} and not _os.path.exists(pr.STATUS), payload
+
+
+# ── PARTIAL ROSTER (#2095 item 5): accept it, name it, never read it as a quiet fleet ──────────
+def test_a_partial_roster_still_yields_idle_lanes_and_is_NAMED(monkeypatch):
+    """⛔ THE ACCEPTANCE CRITERION THAT MATTERS: "a partial roster still permits dispatch (a lane
+    known idle in the first N entries is still idle)".
+
+    Driven at the REAL decision points: `_parse_roster` must return the lane, and `_note_partial`
+    must label the read `PARTIAL(taken=N of M)` so a reader can size the gap. The cheap census
+    travels with the note; it is stubbed here because the SUBJECT is the labelling, not the box.
+    """
+    body = json.dumps({
+        "counts": {"idle": 1, "wip": 2, "wedged": 0, "report": 0, "quiet": 0},
+        "idle": [{"lane": "lane-01", "ws": "ws-01", "verdict": "DONE-IDLE"}],
+        "partial": {"taken": 3, "want": 12},
+    })
+    lanes, why = pr._parse_roster(body)
+    assert why == "", why
+    assert [l["lane"] for l in lanes] == ["lane-01"], lanes
+    monkeypatch.setattr(pr, "cheap_census",
+                        lambda timeout=15.0: {"taken": "3", "procs": "54", "state": "READ"})
+    monkeypatch.setattr(pr, "log", lambda m: None)
+    pr._note_partial(body, "scan")
+    assert pr.ROSTER_NOTE.startswith("PARTIAL(taken=3 of 12 from scan)"), pr.ROSTER_NOTE
+    assert "taken=3" in pr.ROSTER_NOTE and "procs=54" in pr.ROSTER_NOTE, pr.ROSTER_NOTE
+
+
+def test_a_COMPLETE_roster_carries_NO_note(monkeypatch):
+    """THE FALSE-BLOCK CONTROL: the label must be absent on a complete read, or it stops meaning
+    anything."""
+    body = json.dumps({"counts": {"idle": 1}, "idle": [{"lane": "a", "ws": "w"}],
+                       "partial": None})
+    monkeypatch.setattr(pr, "cheap_census", lambda timeout=15.0: {"procs": "3"})
+    monkeypatch.setattr(pr, "log", lambda m: None)
+    pr._note_partial(body, "scan")
+    assert pr.ROSTER_NOTE == "", pr.ROSTER_NOTE
+
+
+def test_an_UNREADABLE_roster_is_never_labelled_partial(monkeypatch):
+    """⛔ THE TWO STATES MUST NOT COLLAPSE (acceptance 3). `UNREADABLE` = nothing was read, so the
+    pass refuses; `PARTIAL` = some of the fleet was read, so the pass proceeds. If the labeller
+    treated a junk/absent body as partial, a blind pass would silently become a partial one — and
+    the dispatcher would send work off data it never received."""
+    monkeypatch.setattr(pr, "cheap_census", lambda timeout=15.0: {"procs": "3"})
+    monkeypatch.setattr(pr, "log", lambda m: None)
+    for junk in ("", "not json", "[]", json.dumps({"error": "rate limited"})):
+        pr.ROSTER_NOTE = "sentinel"
+        pr._note_partial(junk, "scan")
+        assert pr.ROSTER_NOTE == "", "junk body %r was labelled: %r" % (junk, pr.ROSTER_NOTE)
+
+
+def test_the_cheap_census_prefers_the_shipped_lane_census(monkeypatch, tmp_path):
+    """⛔ ONE IMPLEMENTATION OF THE CENSUS RULE. `scripts/orchestrator-harness/lane-census.sh` owns
+    "which worktree is a lane"; this loader CALLS it rather than re-deriving the rule in Python.
+    Asserted on the argv actually run, so a future inlining shows up here."""
+    script = tmp_path / "lane-census.sh"
+    script.write_text("#!/bin/sh\nprintf 'state=READ procs=54 taken=25 lanes_wt=21 used=25 src=worktrees\\n'\n")
+    script.chmod(0o755)
+    monkeypatch.setattr(pr, "SCRIPTS", str(tmp_path))
+    calls = []
+
+    class _R:
+        stdout = "state=READ procs=54 taken=25 lanes_wt=21 used=25 src=worktrees\n"
+        stderr = ""
+        returncode = 0
+
+    def _run(argv, **k):
+        calls.append(list(argv))
+        return _R()
+
+    monkeypatch.setattr(pr.subprocess, "run", _run)
+    d = pr.cheap_census()
+    assert calls and calls[0][0] == "bash" and calls[0][1] == str(script), calls
+    assert d.get("taken") == "25" and d.get("procs") == "54", d

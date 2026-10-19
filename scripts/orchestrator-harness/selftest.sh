@@ -755,7 +755,12 @@ ck "every host-independent limit default matches README §4 (two files cannot dr
 # A vacuous extraction cannot pass: an empty range leaves `MAX_LANES` unset and every case fails.
 lane_drv() { # <file> <probe-output> [explicit MAX_LANES] -> resolved MAX_LANES
   local f="$1" p="$2"
+  # ⛔ `orc_limit_src` IS STUBBED, because the extracted range now carries the PROVENANCE lines
+  # (agent-infra#2095) and that helper lives in controller-state.sh, which a driver does not source.
+  # Its own behaviour is pinned by controller-state.test.sh; what this driver measures is the
+  # derivation and coercion, so the label is subordinate to it here.
   { echo 'set -uo pipefail'
+    echo 'orc_limit_src() { printf "%s" derived; }'
     grep -F 'is_num() {' "$f"; grep -F 'is_limit() {' "$f"
     printf 'sysctl() { printf "%%s\\n" %s; }\n' "'$p'"
     sed -n '/^_NCPU=/,/^MAX_REVIEW=/p' "$f"
@@ -2497,6 +2502,9 @@ ck "the shipped CYC floor is extracted too (CYC=0 cannot be driven without it)" 
 # and does not coerce, and the assertion then measures the wrong thing while still passing its shape.
 nlim() { ( _NCPU=10; MAX_LOAD="$1"; MAX_LANES="$2"; MERGE_PRIORITY_AT="$3"; BATCH="$4"; CYC="${5:-abc}"
            MAX_REVIEW=; MAX_FIX=; MAX_FIX_TRIES=; STALE_MIN=
+           # the coercion lines now carry MAX_LOAD_SRC/MAX_LANES_SRC provenance (#2095); the
+           # helper is stubbed as in lane_drv, and the label is not what this driver measures
+           orc_limit_src() { printf '%s' derived; }
            eval "$NGRD"; printf 'load=%s lanes=%s mpa=%s batch=%s cyc=%s review=%s fix=%s fixtries=%s stale=%s' "$MAX_LOAD" "$MAX_LANES" "$MERGE_PRIORITY_AT" "$BATCH" "$CYC" "$MAX_REVIEW" "$MAX_FIX" "$MAX_FIX_TRIES" "$STALE_MIN" ); }
 [ "$(nlim abc abc notanum two)" = "load=100 lanes=25 mpa=25 batch=2 cyc=240 review=4 fix=3 fixtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim abc abc notanum two)'"; }
 ck "non-numeric plist limits are coerced to their defaults, not left to fail OPEN" $rc
@@ -2520,7 +2528,7 @@ ck "an absurd-but-numeric MAX_LOAD (>= 2**63) is coerced, not left to error the 
 # The block always carries the two is_* DEFINITIONS, so a non-empty extraction proves nothing; the
 # `a sane _NCPU still derives MAX_LOAD=cores*10` assertion below IS the non-vacuity guard (it can
 # only pass if the derivation line was evaluated).
-{ grep -F 'is_num() {' "$LOOP"; grep -F 'is_limit() {' "$LOOP"; sed -n '/^is_limit "\${_NCPU:-}"/,/^[[:space:]]*is_limit "\${MAX_LOAD:-}"/p' "$LOOP"; } > "$TMP/maxb.sh"
+{ echo 'orc_limit_src() { printf "%s" derived; }'; grep -F 'is_num() {' "$LOOP"; grep -F 'is_limit() {' "$LOOP"; sed -n '/^is_limit "\${_NCPU:-}"/,/^[[:space:]]*is_limit "\${MAX_LOAD:-}"/p' "$LOOP"; } > "$TMP/maxb.sh"
 if need "$TMP/maxb.sh" "the shipped _NCPU guard + MAX_LOAD derivation are extracted"; then
   MAXB="$(cat "$TMP/maxb.sh")"
   maxload_probe() { ( _NCPU="$1"; MAX_LOAD="$2"; eval "$MAXB"; printf '%s' "$MAX_LOAD" ); }
@@ -2711,19 +2719,34 @@ fi
 # on one PR queue. Driven against the SHIPPED lock+trap block (extracted, not re-implemented) with a
 # stub loop, so it fails on the pre-fix copy. The invariant asserted is "the lock and the process
 # go away together": a released lock may only ever be observed as the process is leaving.
-sed -n '/^# single-instance lock/,/^trap .rm -f "\$LOCKF".*$/p' "$LOOP" > "$TMP/lockblock.sh"
+# ⛔ THE SINGLETON IS A LIVENESS-CHECKED RECORD NOW (agent-infra#2095), so the extraction follows
+# the SHIPPED block — from the lock path through the release trap — and the driver SOURCES
+# controller-state.sh, because the acquire/release rules live there. An extraction anchored on the
+# old `trap 'rm -f "$LOCKF"'` line matched nothing after the change and silently extracted the rest
+# of the file, which is how this check went red instead of quietly measuring the wrong bytes.
+sed -n '/^LOCKF="\$O\/\.orch\.lock"/,/^trap .orc_singleton_release/p' "$LOOP" > "$TMP/lockblock.sh"
+# The driver's shape, in ONE place: it must own a state dir, a log (the refusal appends to it) and
+# the guard's own helper functions.
+lock_prelude() {
+  printf 'set -u\nO=%s\nLOG=%s\nORC_STATE_SRC=test\n' "'$LK'" "'$LK/log'"
+  printf '. %s\n' "'$SUBJ_CTL'"
+}
 if need "$TMP/lockblock.sh" "the lock+trap block is extracted from the shipped orch-loop.sh"; then
   LK="$TMP/LK"; mkdir -p "$LK/state"
-  { echo 'set -u'; echo "O='$LK'"; cat "$TMP/lockblock.sh"; echo 'while :; do sleep 0.2; done'; } > "$LK/drive.sh"
+  SUBJ_CTL="$HERE/controller-state.sh"
+  { lock_prelude; cat "$TMP/lockblock.sh"; echo 'while :; do sleep 0.2; done'; } > "$LK/drive.sh"
   bash -n "$LK/drive.sh" && rc=0 || rc=1
   ck "the lock-trap driver parses" $rc
+  lock_pid() { sed -n 's/^orc-v1 pid=\([0-9][0-9]*\).*/\1/p' "$LK/.orch.lock" 2>/dev/null | head -1; }
   rm -f "$LK/.orch.lock"
   bash "$LK/drive.sh" & cpid=$!
   i=0; while [ ! -f "$LK/.orch.lock" ] && [ $i -lt 20 ]; do sleep 0.1; i=$((i+1)); done
   [ -f "$LK/.orch.lock" ] && rc=0 || { rc=1; echo "      the stub controller never took the lock"; }
   ck "the controller takes the single-instance lock" $rc
-  [ "$(cat "$LK/.orch.lock" 2>/dev/null)" = "$cpid" ] && rc=0 || rc=1
-  ck "the lock records the controller's pid" $rc
+  # ⛔ THE RECORD MUST CARRY IDENTITY, NOT A BARE PID — a recycled pid read as a live controller
+  # forever, which is how a second instance co-ran for 5h15m. Assert the record's SHAPE too.
+  [ "$(lock_pid)" = "$cpid" ] && grep -q "^orc-v1 pid=$cpid started=[0-9][0-9]* host=" "$LK/.orch.lock" && [ -s "$LK/state/.nope" -o -n "$(sed -n 's/^state=//p' "$LK/.orch.lock")" ] && rc=0 || { rc=1; echo "      lock record: $(cat "$LK/.orch.lock" 2>/dev/null)"; }
+  ck "the lock records the controller's pid AND its identity (pid+started+host+state)" $rc
 
   kill -TERM "$cpid" 2>/dev/null
   released_while_alive=0; dead=0; i=0
@@ -2791,7 +2814,7 @@ if need "$TMP/lockblock.sh" "the lock+trap block is extracted from the shipped o
     # interruptibility check below while re-introducing the thundering herd it exists to prevent.
     grep -q 'RANDOM' "$TMP/cycsleep.sh" && rc=0 || rc=1
     ck "the shipped cycle sleep is jittered (±20% of CYC), not a fixed interval" $rc
-    { echo 'set -u'; echo "O='$LK'"; cat "$TMP/lockblock.sh"; echo 'CYC=8'; cat "$TMP/cycsleep.sh"; } > "$LK/cyc.sh"
+    { lock_prelude; cat "$TMP/lockblock.sh"; echo 'CYC=8'; cat "$TMP/cycsleep.sh"; } > "$LK/cyc.sh"
     bash -n "$LK/cyc.sh" && rc=0 || rc=1
     ck "the cycle-sleep driver parses" $rc
     # Non-vacuity: the driver must OWN the lock (a leftover lock would make it refuse the lock and
@@ -2799,7 +2822,7 @@ if need "$TMP/lockblock.sh" "the lock+trap block is extracted from the shipped o
     rm -f "$LK/.orch.lock"
     bash "$LK/cyc.sh" & ypid=$!
     i=0; while [ ! -f "$LK/.orch.lock" ] && [ $i -lt 20 ]; do sleep 0.1; i=$((i+1)); done
-    [ "$(cat "$LK/.orch.lock" 2>/dev/null)" = "$ypid" ] && rc=0 || { rc=1; echo "      lock='$(cat "$LK/.orch.lock" 2>/dev/null)' != driver pid $ypid"; }
+    [ "$(lock_pid)" = "$ypid" ] && rc=0 || { rc=1; echo "      lock='$(cat "$LK/.orch.lock" 2>/dev/null)' != driver pid $ypid"; }
     ck "the cycle-sleep driver acquired the lock (it really is in the CYC sleep)" $rc
     sleep 0.5
     kill -0 "$ypid" 2>/dev/null && rc=0 || rc=1
@@ -2834,17 +2857,27 @@ if need "$TMP/lockblock.sh" "the lock+trap block is extracted from the shipped o
   # next start (the SIGKILL/reboot path), while one held by a LIVE pid is refused. Without the
   # negative control, "reclaimed" and "silently overwritten" would be the same test. Deliberately
   # LAST in this section: the live-pid case intentionally leaves a lock in place.
-  { echo 'set -u'; echo "O='$LK'"; cat "$TMP/lockblock.sh"; echo 'echo ACQUIRED'; } > "$LK/acquire.sh"
+  { lock_prelude; cat "$TMP/lockblock.sh"; echo 'echo ACQUIRED'; } > "$LK/acquire.sh"
   bash -n "$LK/acquire.sh" && rc=0 || rc=1
   ck "the stale-lock driver parses" $rc
-  printf '999999\n' > "$LK/.orch.lock"
+  # The record shape the SHIPPED guard writes (orc-v1), with a pid that is gone.
+  printf 'orc-v1 pid=999999 started=1 host=x\nstate=%s' "$LK" > "$LK/.orch.lock"
   out="$(bash "$LK/acquire.sh" 2>&1)"
   case "$out" in *ACQUIRED*) rc=0;; *) rc=1; echo "      got '$out'";; esac
   ck "a stale lock (dead pid) is reclaimed by the next start" $rc
-  printf '%s\n' "$$" > "$LK/.orch.lock"
+  # ...and one held by a LIVE pid is refused. `started` is RECENT on purpose: that makes the age
+  # test unable to prove recycling, which is the fail-CLOSED arm the incident needed.
+  printf 'orc-v1 pid=%s started=%s host=x\nstate=%s' "$$" "$(date +%s)" "$LK" > "$LK/.orch.lock"
   out="$(bash "$LK/acquire.sh" 2>&1)"
   case "$out" in *ACQUIRED*) rc=1; echo "      a live lock was stolen";; *) rc=0;; esac
   ck "a lock held by a LIVE pid is NOT stolen (reclamation is not a silent overwrite)" $rc
+  # ⛔ AND AN UNJUDGEABLE RECORD IS NOT A FREE ONE. A garbage/empty lock used to look like an
+  # existing lock to reclaim; it must now REFUSE, because "I could not read the evidence" is not
+  # evidence the lock is free — that polarity is what keeps two controllers off one state dir.
+  : > "$LK/.orch.lock"
+  out="$(bash "$LK/acquire.sh" 2>&1)"
+  case "$out" in *ACQUIRED*) rc=1; echo "      an UNREADABLE lock was reclaimed";; *) rc=0;; esac
+  ck "an unreadable lock record is REFUSED, not reclaimed (fail closed)" $rc
 fi
 
 # ── 20) the port-drift check detects that the tortoise source moved (#1712) ──────
