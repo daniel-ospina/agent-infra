@@ -92,6 +92,7 @@
 #                          long silent tool call must not read as dead to the MAX_LANES gate)
 #   LANE_REAP_LOG          durable pass log (default ~/.pi/agent/state/lane-reap.log)
 #   LANE_REAP_LOCK         single-run lock (default ~/.pi/agent/state/lane-reap.lock)
+#   LANE_REAP_TIMEOUT_BIN  timeout(1) (default: timeout; unresolvable ⇒ shell fallback, as on macOS)
 #   LANE_REAP_READ_TIMEOUT bound for one external read, seconds (default 60)
 #   LANE_REAP_PASS_TIMEOUT budget for ONE pass, seconds (default 120; a spent budget is `?`, never a
 #                          partial census)
@@ -143,10 +144,15 @@ coerce_limits() {
 # macOS ships neither and an unbounded read on that box stalls the controller's hot loop (the same
 # MUST the doctor's `bounded` obeys, and the read here feeds every cycle's `[cap]`). A read we cannot
 # bound is not silently unbounded: it is killed after the budget, and the caller sees a failed read.
+# `LANE_REAP_TIMEOUT_BIN` is the tool seam (default `timeout`): pointing it at an unresolvable name
+# forces the shell fallback, which is the ONLY path macOS takes and which CI would otherwise never
+# execute. Same idiom as the doctor's `DOCTOR_TIMEOUT_BIN`.
+TIMEOUT_BIN="${LANE_REAP_TIMEOUT_BIN:-timeout}"
 bound() { # bound <seconds> <cmd...>
   local s="$1"; shift
-  if command -v timeout >/dev/null 2>&1; then timeout "$s" "$@"; return $?; fi
-  if command -v gtimeout >/dev/null 2>&1; then gtimeout "$s" "$@"; return $?; fi
+  if [ -n "$TIMEOUT_BIN" ] && command -v "$TIMEOUT_BIN" >/dev/null 2>&1; then
+    "$TIMEOUT_BIN" "$s" "$@"; return $?
+  fi
   local p w rc
   "$@" &
   p=$!
