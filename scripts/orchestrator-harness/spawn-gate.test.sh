@@ -343,6 +343,43 @@ ck "a started run appends one 6-field row to walltime.tsv carrying the ASKED-FOR
 case "$f5" in ''|*[!0-9]*) rc=1 ;; *) rc=0 ;; esac
 ck "the recorded elapsed is a non-negative INTEGER, not merely present (f5='${f5:-<empty>}')" $rc
 
+# ── 7b) A TURN'S STRAGGLERS DO NOT OUTLIVE run_agent (#2163) ────────────────────
+# The group the agent runs in is the whole reason the launch is under job control: a `pi` that
+# finished its turn can leave a tool child behind, and a wrapper that only `wait`s for pi then exits
+# lets it be reparented to init. Measured on the box that motivated #2163: 76 pi-shaped processes for
+# 14 working lanes. The stub forks a long sleeper and exits; after run_agent returns the sleeper must
+# be GONE. (A red here means the group reap is inert — e.g. the watchdog was launched outside the
+# job-control window, which was a real cycle-1 defect.)
+cat > "$TMP/bin/pi" <<'PI'
+#!/bin/sh
+( sleep 300 ) &
+printf '%s\n' "$!" > "$STRAGGLER_PID"
+exit 0
+PI
+chmod +x "$TMP/bin/pi"
+: > "$TMP/straggler.pid"
+PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" STRAGGLER_PID="$TMP/straggler.pid" O="$TMP/O" DISK_MIN_FREE_MB=1 bash -c '
+  . "$1"
+  LOG="$2"; PROMPT="$3"
+  load1() { printf "1"; }
+  run_agent 30 "$LOG" "$PROMPT" "straggler test" >/dev/null 2>&1
+' _ "$GATE" "$LOG" "$PROMPT" 2>/dev/null
+sp="$(cat "$TMP/straggler.pid" 2>/dev/null)"
+if [ -n "$sp" ] && kill -0 "$sp" 2>/dev/null; then
+  kill -KILL "$sp" 2>/dev/null
+  rc=1
+else
+  rc=0
+fi
+ck "run_agent reaps the turn's straggler (pid ${sp:-<none>} is gone after the turn)" $rc
+# restore the plain stub for the cases below
+cat > "$TMP/bin/pi" <<'PI'
+#!/bin/sh
+echo "PI_RAN" >> "$PI_LOG"
+exit 0
+PI
+chmod +x "$TMP/bin/pi"
+
 # ── 8) the gate RE-READS at the spawn, and a refusal is not a `pi` exit status ───
 # This is the whole point of the port: a chain-<N> worker dispatched on a quiet box may open its PR
 # 90 minutes later, and the reading that governs is the one taken at the spawn.

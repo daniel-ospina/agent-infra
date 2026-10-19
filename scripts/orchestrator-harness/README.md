@@ -1287,18 +1287,23 @@ plus its tmux server (agent-infra#2159).
 `[cap]` now carries the census, measured by `lane-reap.sh count`:
 
 ```text
-lanes=<live>/<total> max_lanes=<ceiling> zombie=<n>
+lanes=<live>/<total> max_lanes=<ceiling> zombie=<n> lanes_src=<census|tmux|unknown>
 ```
 
 * **live** — the process tree exists AND its log/turn advanced inside `LANE_REAP_LIVE_MIN` (45 min,
   deliberately ABOVE `lane.sh`'s 2400 s wall limit: a live lane inside one long silent tool call must
-  not read as dead and license extra dispatch). This is the number `MAX_LANES` gates.
+  not read as dead and license extra dispatch). A lane whose log was **deleted** (a `/tmp` prune can
+  do that to a working lane) also counts as live: it may still be working, and for a capacity gate
+  "possibly live" must never be counted `0`. This is the number `MAX_LANES` gates.
 * **total** — every resident lane tree THE CENSUS CAN ATTRIBUTE: a `pi` tree whose root or a direct
   child holds a fleet-namespace log open. `lanes=14/76` is the reading that makes 62 finished
   residents visible; `lanes=14/25` could not. ⛔ A leaked lane whose stdout is a pty/pipe (no log
   name in the fleet namespace) is outside BOTH numbers — it has no artefact to judge, which is the
   same fail-closed rule as `no-log-evidence`, and the reason the census never claims to be total.
 * **zombie** — the box's `Z`-state processes. A box full of corpses otherwise reads as busy.
+* **`lanes_src=`** — where the number came from: `census` (this instrument), `unknown` (it ran but
+  could not answer), `tmux` (the OLD session count, used only while a `$O` predates `lane-reap.sh`;
+  named once in the controller log and labelled here, never printed as if it were a census).
 * **`lanes=?/?`** — the census could not be read. `?` is not `0`: "ps is broken" and "nothing is
   running" must not render identically. ⛔ The polarity here is the OPPOSITE of what an earlier
   version of this section said: an under-count of live lanes makes the `lanes >= max_lanes` gate
