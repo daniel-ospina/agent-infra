@@ -1076,14 +1076,24 @@ plus its tmux server (agent-infra#2159).
 lanes=<live>/<total> max_lanes=<ceiling> zombie=<n>
 ```
 
-* **live** — the process tree exists AND its log/turn advanced inside `LANE_REAP_LIVE_MIN` (30 min).
-  This is the number `MAX_LANES` gates, so its meaning is unchanged.
-* **total** — every resident lane tree. `lanes=14/76` is the reading that makes 62 finished residents
-  visible; `lanes=14/25` could not.
+* **live** — the process tree exists AND its log/turn advanced inside `LANE_REAP_LIVE_MIN` (45 min,
+  deliberately ABOVE `lane.sh`'s 2400 s wall limit: a live lane inside one long silent tool call must
+  not read as dead and license extra dispatch). This is the number `MAX_LANES` gates.
+* **total** — every resident lane tree THE CENSUS CAN ATTRIBUTE: a `pi` tree whose root or a direct
+  child holds a fleet-namespace log open. `lanes=14/76` is the reading that makes 62 finished
+  residents visible; `lanes=14/25` could not. ⛔ A leaked lane whose stdout is a pty/pipe (no log
+  name in the fleet namespace) is outside BOTH numbers — it has no artefact to judge, which is the
+  same fail-closed rule as `no-log-evidence`, and the reason the census never claims to be total.
 * **zombie** — the box's `Z`-state processes. A box full of corpses otherwise reads as busy.
 * **`lanes=?/?`** — the census could not be read. `?` is not `0`: "ps is broken" and "nothing is
-  running" must not render identically. The dispatch gate then falls back to the old tmux count
-  (a conservative under-count refuses work, which costs a cycle; over-dispatch costs the box).
+  running" must not render identically. ⛔ The polarity here is the OPPOSITE of what an earlier
+  version of this section said: an under-count of live lanes makes the `lanes >= max_lanes` gate
+  FALSE and **dispatches more**, so it is a fail-OPEN on capacity. An unreadable census therefore
+  sets `LANES_UNKNOWN=1` and the gate REFUSES to add work with that reason (`lanes_unknown (the lane
+  census could not be read -> do not add work)`), on the same doctrine as an unreadable memory
+  probe. The tmux count is still shown as a lower-bound hint and is never a licence to dispatch. A
+  `?` NUMERATOR with readable totals (`lanes=?/11 zombie=0`) is the same abstention one lane at a
+  time — a liveness age that could not be read — and `count` exits 3 for it.
 
 The `reap` pass in `cloud-cell-doctor.sh` runs the same tool in process mode (dry under `--dry-run`,
 armed otherwise) and puts `lanes=… zombie=…` in its own pass line, so a cell's `status` answers
@@ -2132,7 +2142,7 @@ algorithmic advantage. The claim worth evaluating is *utilisation*, not *efficie
 | `refresh-scout.test.sh` | the agent-infra#1736 contract — repo-aware scout provisioning, per-repo tool resolution, the permanent/transient refresh split — plus the agent-infra#1850 issue-claim pre-flight verdict table (CLEAN/COLLISION/INCOMPLETE/NOT PROVISIONABLE/unrecognised), the dispatch-side claim, and the fenced + generation-guarded release. Also the agent-infra#1729 pass budget: a blocked pool HEAD does not consume the window, the collision ledger defers (never drops) a held candidate, and ONLY a COLLISION is recorded — a DEGRADED answer never is. Not part of the loop |
 | `refresh-quota.test.sh` | the per-pass API **spend** contract (agent-infra#2022 / #1736 follow-up): the board cache is enabled under the TOOL's own seam (`COLLISION_PREFLIGHT_BOARD_CACHE`, not the legacy no-op name the tool treats as a caller-named-cache attack), so one pass rebuilds the board once instead of once per candidate; a pass that can only afford SOME of its window judges those completely, queues work and NAMES the stop; a pass that can afford none refuses TRANSIENTLY — after the `dispatched.txt` reaper has run — rather than reporting an empty backlog. Charges a modeled core budget from a stub `gh`, so it needs no network. A CI shard |
 | `check-port-drift.sh` | gates the tortoise-side removal: fails if the tortoise harness moved past the pinned sync point (`port-provenance.txt`). Not part of the loop |
-| `lane-reap.sh` | the EVIDENCE census (`count` → `lanes=<live>/<total> zombie=<n>`, §6.5.1b) and the conservative finished-lane process reaper (zero CPU over a sampled window + no human ancestor + a stale log, dry run by default). One population for both, so the `[cap]` number and the reaper cannot disagree. Called by `orch-loop.sh` and the doctor's `reap` role |
+| `lane-reap.sh` | the EVIDENCE census (`count` → `lanes=<live>/<total> zombie=<n>`, §6.5.1b) and the conservative finished-lane process reaper (zero CPU over a sampled window + no human ancestor + a stale log, dry run by default). ONE population PREDICATE for both (a `pi` tree holding a fleet log open on its root or a direct child), so the `[cap]` number and the reaper cannot disagree about what a lane IS; the two audiences differ only in their filters — `count` excludes `fix-`/`merge-`/`chain-` workers (they are `workers=`) and applies no human gate, while `reap` refuses a human-ancestor tree BEFORE it is counted. Called by `orch-loop.sh` and the doctor's `reap` role |
 | `lane-exec.sh` | the wrapper-free launcher (#2163): `exec pi …`, so a finished lane leaves NO process behind. The canonical replacement for an ad-hoc `bash -c '… nohup pi … &'`; the persistent-wrapper case is `lane.sh`, which `wait`s and exits on child exit |
 | `lane-reap.test.sh` | the #2163 contract, hermetic (fake `ps`/`kill`/`sleep`, fake `/proc`, pinned clock): a LIVE lane is never signalled, a FINISHED one always is (children first, TERM then KILL), an unresolvable log is REFUSED, a deleted log is judged by the 12h bound only, a human ancestor refuses, a working subtree is spared, the census counts by evidence, and an unreadable table is `?`/exit 3. A CI shard |
 | `cloud-cell-doctor.sh` | the cell's scheduled roles — `reap` / `doctor` / `merge` / `hygiene` / `status` (§6.5.7). Launched as tmux `cell-doctor` by `cloud-cell-supervisor.sh start`; `merge` EXECUTES `scripts/admin-merge.sh` and never re-implements it |

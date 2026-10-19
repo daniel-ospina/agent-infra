@@ -683,7 +683,16 @@ run_reap() {
     # per-process lsof sweep. A census killed at 15s would print `?/?` on every busy box — an
     # instrument that fails exactly when it matters.
     census="$(bounded 60 bash "$LANE_REAP_BIN" count 2>/dev/null)"
-    case "$census" in lanes=*/' 'zombie=*) ;; *) census="lanes=?/? zombie=?" ;; esac
+    case "$census" in
+      lanes=*/' 'zombie=*) ;;
+      # ⛔ A READ THE PASS COULD NOT TAKE IS NOT A PASS (#2163 review, P2). Recording `?` in the line
+      # while leaving rc=0 is the "looks alive while doing nothing" class this role exists to remove:
+      # the census is the only instrument that sees the population the session pass cannot.
+      *) census="lanes=?/? zombie=?"; unverifiable=$((unverifiable + 1)); pass_rc=3 ;;
+    esac
+    # A `?` NUMERATOR with readable totals is the same abstention one lane at a time (`count` exits 3
+    # when a liveness age could not be read); it must not read as a clean pass either.
+    case "$census" in lanes='?'/*) unverifiable=$((unverifiable + 1)); pass_rc=3 ;; esac
     # ── the PROCESS pass: the population the session pass above cannot see ─────────────────────────
     # Armed with the SAME dry/apply posture as this pass: `--dry-run` reports, the armed role acts.
     # The reaper keeps its own gates and its own default (dry run); this call only decides whether

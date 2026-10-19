@@ -182,8 +182,11 @@ cat > "$T/bin/lane-reap" <<'SH'
 S="${DOCTOR_TEST_LANE_REAP:?}"
 printf '%s\n' "$*" >> "$S/calls"
 case "${1:-}" in
-  count) printf 'lanes=1/2 zombie=0\n' ;;
-  reap)  printf 'lane-reap: lanes=1/2 zombie=0 candidates=0 reaped=0 refused=1 mode=%s\n' "${2:-dry-run}" ;;
+  # ⛔ The two answers carry DIFFERENT tokens (#2163 review, P2). When both printed
+  # `lanes=1/2 zombie=0`, deleting the `count` call would still leave the census assertion green —
+  # a check that could not go red. `count` is the only producer of `lanes=`; `reap` says `trees=`.
+  count) printf 'lanes=3/7 zombie=2\n' ;;
+  reap)  printf 'lane-reap: trees=1/2 zombie=0 candidates=0 reaped=0 refused=1 mode=%s\n' "${2:-dry-run}" ;;
 esac
 exit 0
 SH
@@ -250,7 +253,8 @@ case "$(sed -n 's/^last_result=//p' "$T/o/state/roles/reap.state")" in *"reaped 
 # #2163: the same pass must SCHEDULE the process reaper, and its census must be in the pass line.
 grep -qx 'reap --apply' "$T/lane-reap/calls" 2>/dev/null && ok "reap: delegated the process pass ARMED (reap --apply)" || bad "reap: the process pass was not delegated armed — $(cat "$T/lane-reap/calls" 2>/dev/null)"
 grep -qx 'count' "$T/lane-reap/calls" 2>/dev/null && ok "reap: read the evidence census (count)" || bad "reap: the census was not read"
-result_has "lanes=1/2 zombie=0" && ok "reap: the pass line carries lanes=<live>/<total> zombie=<n>" || bad "reap: the census is missing from the pass line — $OUT"
+result_has "lanes=3/7 zombie=2" && ok "reap: the pass line carries the CENSUS (lanes=<live>/<total> zombie=<n>)" || bad "reap: the census is missing from the pass line — $OUT"
+result_has "trees=1/2" && ok "reap: the process pass's own line is in the pass line too" || bad "reap: the process pass result is missing — $OUT"
 
 # ── 1b) a lane whose log advanced INSIDE the floor is NOT reaped ────────────────────────────────
 # REAP_MIN_S is the whole reason a SCHEDULED reap pass is safe: a lane that spoke recently is between

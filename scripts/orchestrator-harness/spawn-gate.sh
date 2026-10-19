@@ -389,11 +389,21 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   # launchd interpreter) and by the cells' bash. If it is refused, the launch is byte-identical and
   # the group kill below simply finds nothing — a refused `set` must never be a refused spawn.
   set -m 2>/dev/null || true
-  pi -p --provider deepseek --model deepseek-v4-flash --no-session "$(cat "$prompt")" >> "$log" 2>&1 &
+  # ⛔ `< /dev/null` IS PART OF THE JOB-CONTROL CHANGE (#2163 review, P2). With job control ON, bash
+  # no longer redirects an async command's stdin from /dev/null (it hands over the terminal/pipe), so
+  # a tool child could read the pane's pty — typed input stolen from a human — or, under
+  # `nonblocking-dispatch.sh`'s closed stdin, inherit a CLOSED fd 0. The agent is headless: it never
+  # reads stdin, so binding it to /dev/null restores the pre-change behaviour explicitly.
+  pi -p --provider deepseek --model deepseek-v4-flash --no-session "$(cat "$prompt")" >> "$log" 2>&1 < /dev/null &
   pid=$!
-  set +m 2>/dev/null || true
+  # ⛔ THE WATCHDOG IS LAUNCHED UNDER THE SAME JOB CONTROL, and that is not cosmetic: `set +m`
+  # between the two launches left the watchdog in the CALLER's process group, so `-${w}` named a
+  # group that did not exist and its `sleep "$t"` child (up to the lane's 40-minute wall limit) was
+  # never reached by the group kill below — a no-op dressed as a reap. Both children are group
+  # leaders only if both are started while `set -m` is ON.
   ( sleep "$t"; kill -TERM "$pid" 2>/dev/null; sleep 15; kill -KILL "$pid" 2>/dev/null ) >/dev/null 2>&1 &
   w=$!
+  set +m 2>/dev/null || true
   wait "$pid" 2>/dev/null; rc=$?
   # ⛔ KILL THE WATCHDOG'S WHOLE GROUP, not just its shell (#2163). `kill $w` ends the subshell but
   # leaves its `sleep "$t"` child (up to the lane's 40-minute wall limit) reparented to init — a
