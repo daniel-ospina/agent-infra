@@ -885,10 +885,19 @@ def check_controller_cycling(f, c):
                            log.get("error") or "no error recorded"),
                  "the log age is unknown, so 'alive but useless' cannot be told from 'alive and "
                  "working'. Not green.")
-    # ⛔ AN ABSENT `tail_ok` IS A MISSING READ TOO. `is False` catches a tail that FAILED but lets a
-    # payload that never said — the `--facts` injection mode, any producer that loses the field — fall
-    # through to the content arms, where `FAIL/LOG_NO_CYCLE` then claims "the log is advancing, but not
-    # by a cycle" about lines nobody read. Allow-list polarity, like `pids`/`probed`/`page_full`.
+    if log_age > win:
+        return V("controller_cycling", FAIL, "LOG_SILENT",
+                 "controller pid(s): %s IS ALIVE (launchd %s: %s)\n"
+                 "%s — frozen for %.0fs, window is %.0fs\n"
+                 "%s\n"
+                 "%s" % (pid_txt, lc, lc_txt, log_txt, log_age, win, hb_txt, _last_header_txt(f)),
+                 "the exact shape of 'alive but useless': a running pid whose log has stopped "
+                 "advancing. Nothing is being decided.")
+
+    # ⛔ THE MTIME VERDICT OUTRANKS THE CONTENT ONE. The frozen-log FAIL below is established by
+    # `log_age` alone; asking the tail guard first published `INCONCLUSIVE/LOG_UNREADABLE` for a live
+    # pid whose log had been frozen for 3h — reporting an unread content where a measured FAIL was
+    # available. The abstention belongs to a log that IS moving and whose content nobody read.
     if log.get("tail_ok") is not True:
         # a fresh mtime proves the file is MOVING; it says nothing about WHAT is in it. Without this
         # arm the failed read fell through to LOG_NO_CYCLE — "the log IS advancing, but not by a
@@ -903,15 +912,6 @@ def check_controller_cycling(f, c):
                     else "result NOT REPORTED by this payload"),
                  "the log's mtime is readable but its CONTENT was not read, so 'no cycle completes' "
                  "cannot be told from 'the tail was refused'. Not green.")
-    if log_age > win:
-        return V("controller_cycling", FAIL, "LOG_SILENT",
-                 "controller pid(s): %s IS ALIVE (launchd %s: %s)\n"
-                 "%s — frozen for %.0fs, window is %.0fs\n"
-                 "%s\n"
-                 "%s" % (pid_txt, lc, lc_txt, log_txt, log_age, win, hb_txt, _last_header_txt(f)),
-                 "the exact shape of 'alive but useless': a running pid whose log has stopped "
-                 "advancing. Nothing is being decided.")
-
     cycles = [h for h in (f.get("log_events") or {}).get("headers") or []
               if h.get("age_s") is not None and h["age_s"] <= win]
     # ⛔ AN UNPARSEABLE HEADER IS NOT AN ABSENT ONE. `parse_log` counts a header it cannot parse
@@ -1150,7 +1150,7 @@ def _log_repo_of(f):
     return (e or {}).get("repo")
 
 
-def _queue_age(f, c):
+def _queue_age(f):
     """The age of THIS pool reading, and where it came from.
 
     Two independent clocks carry it, and BOTH are read rather than trusting the header alone: the
@@ -1198,7 +1198,7 @@ def _graded_stale(f, c, tok_src):
         src = ("state/queue-state (no epoch, no readable mtime)" if age is None
                else "state/queue-state")
     else:
-        age, src = _queue_age(f, c)
+        age, src = _queue_age(f)
         src = src or "no age in the token or the state file"
     if age is None:
         # an unaged reading cannot support ANY claim, least of all EMPTINESS: the harness itself
@@ -1496,11 +1496,11 @@ def check_work_dispatched(f, c):
         return V("work_dispatched", PASS, "IDLE_EMPTY_POOL", evidence,
                  "nothing was dispatched because the pool was read as genuinely EMPTY — the one "
                  "shape where 'no dispatch' is the correct outcome.")
-    # ⛔ THE PAIR COMES FROM ONE RECORD. `pool` is the graded token's (possibly the NEWER
-    # state/queue-state) while `backlog` is the header's, so comparing them compared two refreshes and
-    # reported the difference as a defect "upstream (queue_readable owns it)" — a defect
-    # `queue_readable`'s own `EMPTY_WITH_LARGE_POOL` arm can never report, because it deliberately
-    # pairs the pool with ITS OWN header. Use the header's own pair here, and say only what it shows.
+    # ⛔ THE PAIR COMES FROM ONE RECORD. Comparing the GRADED token's pool (possibly the NEWER
+    # state/queue-state) against the header's `backlog=` compared two refreshes and reported the
+    # difference as a defect "upstream (queue_readable owns it)" — a defect `queue_readable`'s own
+    # `EMPTY_WITH_LARGE_POOL` arm can never report, because it deliberately pairs the pool with ITS
+    # OWN header. This function reads the header's own pair, and says only what that pair shows.
     _pair = parse_queue_token(hdr.get("queue_token") or "") if hdr else {}
     if isinstance(_pair.get("pool"), int) and _pair.get("pool") >= c.pool_threshold \
             and backlog == 0 and not superseded_backlog:
@@ -1573,6 +1573,19 @@ def _activity(f, window_s=None, cfg=None):
     if _src == "state/queue-state" and kind == "EMPTY" and _graded_stale(f, cfg, _src) is None:
         return False, ("the graded record is state/queue-state: EMPTY (%s) — it supersedes the "
                        "%s cycle header's backlog=%s" % (age_txt, backlog_src, backlog))
+    # ⛔ AND THE SAME GUARD RUNS IN THE OTHER DIRECTION. Currency was checked only where it would
+    # make the fleet IDLE; the direction that makes it BUSY was unguarded, so a frozen `backlog=47`
+    # (written from the PREVIOUS refresh's candidates.txt) certified "the fleet had work in hand" and
+    # turned `pr_created`/`pr_merged` into FAIL/NO_PR_CREATED + FAIL/NO_PR_MERGED + two pages —
+    # while `queue_readable` said READABLE_STALE and `work_dispatched` said STATE_FROZEN about the
+    # same record in the same run. One world, graded two ways, and the FAIL is the one that pages.
+    stale_busy = _graded_stale(f, cfg if cfg is not None else cfg_from_dict({}), _src)
+    if stale_busy is not None:
+        return None, ("the graded pool record (%s: %s) was read %s ago (limit %ss, %s), which is "
+                      "not CURRENT, so 'work was in hand' is not established (and neither is "
+                      "'the fleet was idle')"
+                      % (_src, kind, _age_txt(stale_busy.get("age_s")),
+                         stale_busy.get("limit_s"), stale_busy.get("source")))
     busy = bool((isinstance(backlog, int) and not isinstance(backlog, bool) and backlog > 0)
                 or (isinstance(pool, int) and not isinstance(pool, bool) and pool > 0))
     if busy:
@@ -2187,14 +2200,26 @@ def check_landers(f, c):
                  - (armed_log | railed_log))
 
     candidates, unprobed, skipped, unprobed_reasons = [], [], [], []
+    non_draft = 0
     for pr in prs:
-        if pr.get("draft"):
+        # ⛔ A NON-BOOL `draft` IS AN UNREAD BIT, NOT A DRAFT. `if pr.get("draft")` reads the string
+        # "false" (or `"no"`, or `1`) as DRAFT-or-not by truthiness, so a collector regression or a
+        # hand-written facts file silently removed a live PR from the population — the same polarity
+        # defect `checks_green` and `auto_armed` below were fixed for.
+        draft = pr.get("draft", False)
+        if not isinstance(draft, bool):
+            unprobed.append(pr.get("number"))
+            unprobed_reasons.append("%s: the draft bit is %r, not a bool"
+                                    % (pr.get("number"), draft))
+            continue
+        if draft:
             # ⛔ COUNTED like every other known skip. A draft was dropped with no line at all, so the
             # population arithmetic did not reconcile (measured: `open PRs: 54`, `skipped: 25`,
             # `unprobed: 28` — one row unaccounted for) and `DRAFT` in KNOWN_NON_MERGEABLE was
             # unreachable, because this `continue` fired first.
             skipped.append("%s:DRAFT" % (pr.get("number"),))
             continue
+        non_draft += 1
         mss, green = pr.get("merge_state_status"), pr.get("checks_green")
         # ⛔ "GRADED OR UNPROBED, NEVER NEITHER" — enforced HERE, not only in the collectors.
         # `pr.get("probed", True)` read an ABSENT key as `True` (every fixture omitted it), and a row
@@ -2275,13 +2300,21 @@ def check_landers(f, c):
     expired, missing, ok = [], [], []
     for pr in candidates:
         n = pr.get("number")
-        # ⛔ AN ABSENT `auto_armed` KEY IS NOT "NOT ARMED". `pr.get("auto_armed")` reads a missing
-        # read as a negative and produced `FAIL/LANDER_MISSING` from a value the payload never
-        # carried — indistinguishable from a real read of `autoMergeRequest: null`.
-        if "auto_armed" not in pr:
+        # ⛔ ONLY `True` IS ARMED, AND AN ABSENT KEY IS NOT `False`. Two defects in one line:
+        # `pr.get("auto_armed")` read a MISSING key as a negative and produced `FAIL/LANDER_MISSING`
+        # from a value the payload never carried — indistinguishable from a real read of
+        # `autoMergeRequest: null` — while the string "false" was TRUTHY and published
+        # `PASS/LANDERS_ARMED` for a PR whose own evidence line printed `armed=false`. That is the
+        # polarity defect fixed directly above for `checks_green`, in the ONE check whose purpose is
+        # catching a silent lander expiry, so ONE allow-list test covers both shapes: a bool or an
+        # abstention, never a guess.
+        armed_bit = pr.get("auto_armed")
+        if not isinstance(armed_bit, bool):
             unprobed.append(n)
+            unprobed_reasons.append("%s: auto_armed is %s, which is not a bool"
+                                    % (n, "ABSENT" if "auto_armed" not in pr else repr(armed_bit)))
             continue
-        if pr.get("auto_armed"):
+        if armed_bit:
             ok.append(n)
         elif n in railed_log and not repo_mismatch:
             ok.append(n)          # rail mode: `--auto` is deliberately NOT armed by design
@@ -2339,7 +2372,7 @@ def check_landers(f, c):
         return V("landers", INCONCLUSIVE, "PARTIAL_POPULATION", evidence,
                  "%d of %d non-draft open PR(s) could not be probed, so 'every green PR has an "
                  "armed lander' is established for the rest but NOT for the whole population. "
-                 "Not green." % (len(unprobed), len(prs)))
+                 "Not green." % (len(unprobed), non_draft))
     return V("landers", PASS, "LANDERS_ARMED", evidence)
 
 
@@ -2461,9 +2494,25 @@ class State(object):
                 self.data = d
         except Exception:
             pass
+        # ⛔ VALIDATE ONE LEVEL DEEPER. `isinstance(d.get("boxes"), dict)` checked only the outer
+        # map, so a per-box value that is not a dict (a hand-edited file, an older format, a merged
+        # state file, a `--state` pointed at the wrong path) raised `AttributeError: 'int' object has
+        # no attribute 'setdefault'` AFTER the verdicts and BEFORE the report — exit 1 with 0 bytes
+        # of output, which a scheduler reads as "a check FAILed" and the JSON is lost. That is the
+        # exact failure the `save()` guard exists for; the reader had none.
         self.data.setdefault("boxes", {})
-        self.data["boxes"].setdefault(box, {"notified": {}})
-        self.data["boxes"][box].setdefault("notified", {})
+        repaired = False
+        box_rec = self.data["boxes"].get(box)
+        if not isinstance(box_rec, dict):
+            if box_rec is not None:
+                repaired = True
+            box_rec = {}
+            self.data["boxes"][box] = box_rec
+        if not isinstance(box_rec.get("notified"), dict):
+            if "notified" in box_rec:
+                repaired = True
+            box_rec["notified"] = {}
+        self.repaired = repaired
 
     @property
     def notified(self):
@@ -2576,7 +2625,7 @@ def compose_message(v, verdicts, box, obs_iso, extra_lines=None):
     return "\n".join(lines) + "\n"
 
 
-def plan_notifications(verdicts, state, box=None, obs_iso=None, now=None):
+def plan_notifications(verdicts, state):
     """Which verdicts need a message. Change-only, per (box, check, variant).
 
     Returns (to_send, suppressed). A key is only recorded once a send is CONFIRMED, so a refused
@@ -3846,7 +3895,7 @@ def default_fixtures_dir():
 MARK = {PASS: "✅ PASS", FAIL: "⛔ FAIL", INCONCLUSIVE: "⚠️  INCONCLUSIVE"}
 
 
-def render(verdicts, cfg, header, not_evaluated=()):
+def render(verdicts, header, not_evaluated=()):
     lines = [header, ""]
     for v in verdicts:
         lines.append("  %-16s %-20s %s" % (MARK[v.status], v.name, v.variant))
@@ -4071,7 +4120,7 @@ def main(argv=None):
         else:
             for p, n, note, vs, ex in rows:
                 hdr = "fixture %s (%s)%s" % (n, os.path.basename(p), (" — " + note) if note else "")
-                print(render(vs, cfg_from_dict({}), hdr))
+                print(render(vs, hdr))
                 print()
             if skipped:
                 print("⚠️  %d expectation(s) NOT ASSERTED because --only %s excluded them:"
@@ -4169,7 +4218,10 @@ def main(argv=None):
         # bare `--dry-run` mutating the state file the NEXT REAL POLL reads.
         state = State(cfg.state_path, cfg.box,
                       persist=not (a.dry_run and not (a.state_path or a.capture_dir)))
-        to_send, suppressed = plan_notifications(verdicts, state, cfg.box, obs_iso, now)
+        if getattr(state, "repaired", False):
+            reported["state_repaired"] = ("%s (version %s)" % (cfg.state_path,
+                                                               state.data.get("version")))
+        to_send, suppressed = plan_notifications(verdicts, state)
         reported["suppressed"] = [v.key for v in suppressed]
         extra = None
         if reported["respawn"]:
@@ -4252,11 +4304,18 @@ def main(argv=None):
                               "suppressed": reported["suppressed"],
                               "not_delivered": reported["not_delivered"],
                               "state_error": reported.get("state_error"),
+                              "state_repaired": reported.get("state_repaired"),
                               "state_persisted": reported.get("state_persisted"),
                           }}, indent=1))
         return code
 
-    print(render(verdicts, cfg, header, not_evaluated))
+    print(render(verdicts, header, not_evaluated))
+    if reported.get("state_repaired"):
+        # An unreadable state record is REPAIRED and disclosed, never a crash and never silence: the
+        # dedup keys it should have carried are gone, so the next message may repeat.
+        print("\n\u26a0\ufe0f NOTIFICATION STATE REPAIRED (%s) — the record for this box was not a "
+              "map and was replaced; delivery de-duplication restarted empty."
+              % reported["state_repaired"])
     if reported["respawn"]:
         rr = reported["respawn"]
         print("\nrespawn: %s" % (rr.get("detail") or "not attempted"))

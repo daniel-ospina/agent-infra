@@ -443,6 +443,25 @@ Six more (cycle 13), each a case where a datum the tool held was not the one it 
   and no lines, and `controller_cycling` graded that pair `FAIL / LOG_NO_CYCLE` — "the log IS
   advancing, but not by a cycle": a measured claim about content nobody read, on the first check an
   operator looks at. A failed tail is `INCONCLUSIVE / LOG_UNREADABLE` with the error in the evidence.
+  **The mtime verdict outranks the content one**, because `LOG_SILENT` is measured from the mtime
+  alone and needs no bytes: asked the tail first, a live pid whose log had been frozen for three
+  hours reported "the content was not read" instead of the measured FAIL that was available.
+- **A frozen pool record cannot certify work in hand either.** Currency was guarded only in the
+  direction that makes the fleet IDLE; a frozen `backlog=47` (written from the previous refresh's
+  `candidates.txt`) certified "the fleet had work in hand" and turned `pr_created`/`pr_merged` into
+  `FAIL/NO_PR_CREATED` + `FAIL/NO_PR_MERGED` and two pages — while `queue_readable` said
+  `READABLE_STALE` and `work_dispatched` said `STATE_FROZEN` about the same record in the same run.
+  One world, graded two ways, and the FAIL was the one that paged someone. A non-current record is
+  `INCONCLUSIVE/ACTIVITY_UNKNOWN` in both directions.
+- **Only `True` is armed, and only a `bool` is a draft bit.** `if pr.get("auto_armed")` read the
+  string `"false"` as ARMED and published `PASS/LANDERS_ARMED` for a PR whose own evidence line
+  printed `armed=false` — in the one check whose purpose is catching a silent lander expiry — while
+  `if pr.get("draft")` read `"false"` as a draft and silently removed a live PR from the population.
+  The same allow-list polarity already required for `checks_green`: a non-bool is an unread bit.
+- **A corrupt notification state file is repaired and disclosed, never a crash.** Only the outer
+  `boxes` map was validated, so a per-box value that was not a dict raised after the verdicts and
+  before the report — exit 1 with no output, which a scheduler reads as "a check FAILed" while the
+  JSON is lost. The record is replaced, and the run says de-duplication restarted empty.
 - **A current `state/queue-state: EMPTY` supersedes the header's pair.** The header's `queue=` and
   `backlog=` are one refresh old; when the newer record says the pool is now empty, grading the
   header's pair anyway produced `queue_readable FAIL / EMPTY_WITH_LARGE_POOL` beside

@@ -1569,18 +1569,18 @@ def test_an_ambiguous_send_is_not_blind_retried_but_a_refusal_is():
     assert m._send_rc_is_ambiguous(m.SAFE_SEND_RC[4]) is True
     assert m._send_rc_is_ambiguous(m.SAFE_SEND_RC[3]) is False
     st.mark_ambiguous(v.key, 1.0)
-    to_send, suppressed = m.plan_notifications([v], st, "local", "iso", 2.0)
+    to_send, suppressed = m.plan_notifications([v], st)
     assert to_send == [] and [x.key for x in suppressed] == [v.key], (to_send, suppressed)
     # a DIFFERENT shape re-arms automatically, because the key carries the variant
     v2 = m.V("work_dispatched", m.FAIL, "NO_DISPATCH", "e")
-    to_send, _ = m.plan_notifications([v2], st, "local", "iso", 2.0)
+    to_send, _ = m.plan_notifications([v2], st)
     assert [x.key for x in to_send] == [v2.key], to_send
     # …and when v2 is DELIVERED the stale marker for v1 must go with it, or a return to v1 is
     # suppressed by an attempt recorded for a shape that no longer exists.
     st.clear_others("work_dispatched", keep=v2.key)
     st.mark(v2.key, 2.0, delivered=True)
     assert st.is_ambiguous(v.key) is False, "a delivered sibling must clear the stale marker"
-    to_send, _ = m.plan_notifications([v], st, "local", "iso", 3.0)
+    to_send, _ = m.plan_notifications([v], st)
     assert [x.key for x in to_send] == [v.key], ("a return to the first shape went silent", to_send)
 
 
@@ -2909,7 +2909,9 @@ def test_a_FAILED_TAIL_is_a_MISSING_read_not_an_empty_log():
     def fake_sh(cmd, timeout=None):
         calls.append(cmd)
         if cmd.startswith("stat"):
-            return 0, "1792327000\n"
+            # a FRESH mtime: the abstention this test is about is a log that IS advancing whose
+            # content nobody read. (An OLD mtime is a measured LOG_SILENT and is tested separately.)
+            return 0, "%.0f\n" % time.time()
         if cmd.startswith("tail"):
             return 1, "tail: Permission denied"
         return 0, ""
@@ -3159,6 +3161,25 @@ def test_an_UNREADABLE_pool_is_not_reported_as_benign_idleness():
     assert got["pr_merged"].variant in ("ACTIVITY_UNKNOWN", "NO_PR_MERGED"), got["pr_merged"].variant
     busy, why = m._activity(d["facts"], cfg.window_s)
     assert busy is None and "not established" in why, (busy, why)
+    # ⛔ TWO RECORDS, TWO GUARDS. The unaged token above is refused by the CURRENCY guard; a token
+    # that carries an age but an UNREADABLE kind is current and still says nothing about work in
+    # hand, so the KIND guard has to answer for it — otherwise "no age" and "unreadable kind" are one
+    # shape, and disabling either guard leaves the other silently covering for it.
+    d3 = fx("healthy")
+    d3["facts"]["log_events"]["headers"] = [{"raw": "=== same load=4 lanes=0 backlog=0 "
+                                                     "queue=UNREADABLE(5m) ===",
+                                             "age_s": 60, "ts": 0, "backlog": 0,
+                                             "queue_token": "UNREADABLE(5m)"}]
+    d3["facts"]["queue_state"] = {"path": "q", "ok": False, "error": "permission denied"}
+    d3["facts"]["github"]["prs_created_in_window"] = 0
+    d3["facts"]["github"]["prs_merged_in_window"] = 0
+    d3["facts"]["github"]["open_pr_count"] = 0
+    d3["facts"]["github"]["open_prs"] = []
+    d3["facts"]["log_events"]["dispatch_ok"] = []
+    d3["facts"]["log_events"]["lane_started"] = []
+    busy3, why3 = m._activity(d3["facts"], cfg=m.cfg_from_dict(d3["config"]))
+    assert busy3 is None, (busy3, why3)
+    assert "nothing in hand" in why3 or "not established" in why3, why3
     # a genuinely EMPTY pool is still a measured idle, not an abstention
     d2 = fx("healthy")
     d2["facts"]["github"]["prs_created_in_window"] = 0
@@ -4198,7 +4219,7 @@ def test_a_recovery_rearms_an_ambiguously_sent_alert():
     st.mark_ambiguous(v.key, 1.0)
     st.clear("work_dispatched")           # the fleet recovered
     assert st.is_ambiguous(v.key) is False, "a recovery must clear the ambiguity marker"
-    to_send, _ = m.plan_notifications([v], st, "local", "iso", 2.0)
+    to_send, _ = m.plan_notifications([v], st)
     assert [x.key for x in to_send] == [v.key], ("the repeat failure went silent", to_send)
 
 
@@ -4380,6 +4401,19 @@ MUTATIONS = [
      "        if green is not True:",
      "        if not green:",
      "test_a_STRING_false_check_surface_is_not_GREEN"),
+    # ── cycle-30 defects ──────────────────────────────────────────────────────────────────
+    ("the frozen-log FAIL is swallowed by an unread tail",
+     "    if log_age > win:",
+     '    if log_age > win and log.get("tail_ok") is True:',
+     "test_a_FROZEN_log_is_FAIL_SILENT_even_when_its_tail_was_not_read"),
+    ("the PARTIAL_POPULATION denominator counts DRAFT rows as non-draft",
+     "Not green.\" % (len(unprobed), non_draft))",
+     "Not green.\" % (len(unprobed), len(prs)))",
+     "test_PARTIAL_POPULATION_counts_NON_DRAFT_rows_in_its_denominator"),
+    ("a repaired state record is not disclosed",
+     "        self.repaired = repaired",
+     "        self.repaired = False",
+     "test_a_CORRUPT_per_box_state_record_is_REPAIRED_and_disclosed_not_crashed"),
     # ── cycle-28 defects ──────────────────────────────────────────────────────────────────
     ("CONTROLLER_ABSENT ignores a rejected controller row",
      "    if not pids and near_ours:",
@@ -4526,9 +4560,13 @@ MUTATIONS = [
      "                          or isinstance(disk.get(\"avail_bytes\"), bool)):",
      "    if disk.get(\"ok\") and not isinstance(disk.get(\"avail_bytes\"), (int, float)):",
      "test_a_BOOL_headroom_number_is_UNREAD_not_a_manufactured_OOM"),
+    ("a stale pool record is read as evidence that work was in hand",
+     '    stale_busy = _graded_stale(f, cfg if cfg is not None else cfg_from_dict({}), _src)',
+     '    stale_busy = None',
+     "test_a_FROZEN_pool_record_cannot_certify_that_work_was_IN_HAND"),
     ("an unreadable pool token reads as benign idleness",
-     "    if kind not in (\"EMPTY\", \"READ\", \"PARTIAL\") or (kind == \"READ\" and not "
-     "isinstance(pool, int)):",
+     '    if kind not in ("EMPTY", "READ", "PARTIAL") or (kind == "READ" and not '
+     'isinstance(pool, int)):',
      "    if False:",
      "test_an_UNREADABLE_pool_is_not_reported_as_benign_idleness"),
     ("the report stops disclosing which cell was read",
@@ -4567,10 +4605,18 @@ MUTATIONS = [
      '    if not isinstance(n, int):\n'
      '        return V("pr_created", INCONCLUSIVE, "GH_COUNT_UNREAD",',
      "test_a_BOOL_is_not_a_count"),
-    ("an absent auto_armed key is read as unarmed",
-     '        if "auto_armed" not in pr:\n            unprobed.append(n)\n            continue',
-     "        if False:\n            unprobed.append(n)\n            continue",
+    ("an absent OR non-bool auto_armed value is read as unarmed",
+     '        if not isinstance(armed_bit, bool):',
+     '        if False:',
      "test_an_ABSENT_auto_armed_key_is_UNREAD_not_unarmed"),
+    ("a non-bool auto_armed value is graded by truthiness",
+     '        armed_bit = pr.get("auto_armed")',
+     '        armed_bit = bool(pr.get("auto_armed")) or "x"',
+     "test_auto_armed_is_ARMED_only_when_it_is_LITERALLY_True"),
+    ("a non-bool draft bit is graded by truthiness",
+     '        draft = pr.get("draft", False)\n        if not isinstance(draft, bool):',
+     '        draft = pr.get("draft", False)\n        if False:',
+     "test_a_NON_BOOL_draft_bit_is_UNREAD_not_a_draft"),
     ("the report stops disclosing a verdict input",
      '            "window_s": self.window_s,',
      '',
@@ -5204,6 +5250,155 @@ def main(argv=None):
     passed, failed = run_suite(names, quiet=a.quiet)
     print("\n%d passed · %d failed" % (passed, failed))
     return 1 if failed else 0
+
+
+
+
+@test
+def test_auto_armed_is_ARMED_only_when_it_is_LITERALLY_True():
+    """`if pr.get("auto_armed")` graded a string "false" as ARMED, so a collector regression or a
+    hand-written facts file published PASS/LANDERS_ARMED for a PR whose own evidence line printed
+    `armed=false` — in the ONE check whose purpose is catching a silent lander expiry. The sibling
+    `checks_green` was fixed for exactly this; `auto_armed` and `draft` were left on truthiness."""
+    m = load()
+    cfg = m.cfg_from_dict({"repo": "o/r"})
+    base = {"number": 5, "draft": False, "merge_state_status": "CLEAN", "checks_green": True,
+            "review_decision": "APPROVED", "probed": True}
+    facts = {"github": {"ok": True, "open_pr_count": 1, "open_prs": [dict(base, auto_armed="false")],
+                        "source": "rest", "page_full": False},
+             "log_events": {"headers": [{"raw": "h", "age_s": 5, "backlog": 0,
+                                         "queue_token": "READ(3)"}], "armed": [], "railed": [],
+                            "repo": [{"repo": "o/r", "age_s": 5}]}}
+    v = m.check_landers(facts, cfg)
+    assert (v.status, v.variant) == (m.INCONCLUSIVE, "PARTIAL_POPULATION"), (v.status, v.variant, v.evidence)
+    # a real `True` still arms
+    facts["github"]["open_prs"] = [dict(base, auto_armed=True)]
+    v2 = m.check_landers(facts, cfg)
+    assert (v2.status, v2.variant) == (m.PASS, "LANDERS_ARMED"), (v2.status, v2.variant)
+    # …and a string "false" must NOT be reported as `unarmed` either: `FAIL/LANDER_MISSING` would be
+    # a claim about a bit nobody read.
+    facts["github"]["open_prs"] = [dict(base, auto_armed="False")]
+    v3 = m.check_landers(facts, cfg)
+    assert (v3.status, v3.variant) == (m.INCONCLUSIVE, "PARTIAL_POPULATION"), (v3.status, v3.variant)
+
+
+@test
+def test_a_NON_BOOL_draft_bit_is_UNREAD_not_a_draft():
+    """`if pr.get("draft")` read the string "false" as truthy, so a live green PR was silently moved
+    to `skipped` — or, on a hand-written payload, a draft bit nobody could read was reported as
+    PASS/NOTHING_GREEN. Neither is a read."""
+    m = load()
+    cfg = m.cfg_from_dict({"repo": "o/r"})
+    row = {"number": 5, "draft": "false", "merge_state_status": "CLEAN", "checks_green": True,
+           "review_decision": "APPROVED", "probed": True, "auto_armed": True}
+    facts = {"github": {"ok": True, "open_pr_count": 1, "open_prs": [row], "source": "rest",
+                        "page_full": False},
+             "log_events": {"headers": [{"raw": "h", "age_s": 5, "backlog": 0,
+                                         "queue_token": "READ(3)"}], "armed": [], "railed": [],
+                            "repo": [{"repo": "o/r", "age_s": 5}]}}
+    v = m.check_landers(facts, cfg)
+    assert (v.status, v.variant) == (m.INCONCLUSIVE, "PARTIAL_POPULATION"), (v.status, v.variant)
+    # a real draft is still counted and skipped, not graded
+    facts["github"]["open_prs"] = [dict(row, draft=True)]
+    v2 = m.check_landers(facts, cfg)
+    assert (v2.status, v2.variant) == (m.PASS, "NOTHING_GREEN"), (v2.status, v2.variant)
+
+
+@test
+def test_a_FROZEN_pool_record_cannot_certify_that_work_was_IN_HAND():
+    """Currency was guarded only in the direction that makes the fleet IDLE. A frozen `backlog=47`
+    (written from the PREVIOUS refresh) made `pr_created`/`pr_merged` FAIL/NO_PR_CREATED + NO_PR_MERGED
+    and page the controller — while `queue_readable` said READABLE_STALE and `work_dispatched` said
+    STATE_FROZEN about the same record in the same run."""
+    m = load()
+    cfg = m.cfg_from_dict({"repo": "o/r"})
+    facts = {"github": {"ok": True, "prs_created_in_window": 0, "open_pr_count": 0, "open_prs": [],
+                        "source": "rest"},
+             "queue_state": {"ok": True, "raw": "READ(223)", "age_s": 21600},
+             "log_events": {"headers": [{"raw": "h", "age_s": 60, "backlog": 47,
+                                         "queue_token": "READ(223)"}],
+                            "dispatched": [], "lanes": [], "armed": [], "railed": [],
+                            "repo": [{"repo": "o/r", "age_s": 5}]}}
+    act = m._activity(facts, cfg=cfg)
+    assert act[0] is None, act
+    v = m.check_pr_created(facts, cfg)
+    assert v.status == m.INCONCLUSIVE, (v.status, v.variant, v.detail)
+    assert v.variant == "ACTIVITY_UNKNOWN", v.variant
+    # a FRESH record with the same numbers is still a real "work in hand"
+    facts["queue_state"] = {"ok": True, "raw": "READ(223)", "age_s": 60}
+    assert m._activity(facts, cfg=cfg)[0] is True, m._activity(facts, cfg=cfg)
+    v2 = m.check_pr_created(facts, cfg)
+    assert (v2.status, v2.variant) == (m.FAIL, "NO_PR_CREATED"), (v2.status, v2.variant)
+
+
+@test
+def test_a_CORRUPT_per_box_state_record_is_REPAIRED_and_disclosed_not_crashed():
+    """`isinstance(d.get("boxes"), dict)` validated only the outer map, so `{"boxes":{"local":5}}`
+    (hand-edited, merged, older format, or a `--state` at the wrong path) raised
+    `AttributeError: 'int' object has no attribute 'setdefault'` AFTER the verdicts and BEFORE the
+    report — exit 1 with 0 bytes of stdout, which a scheduler reads as "a check FAILed"."""
+    m = load()
+    tmp = tempfile.mkdtemp(prefix="oc-badbox-")
+    try:
+        path = os.path.join(tmp, "s.json")
+        with open(path, "w") as fh:
+            json.dump({"version": 1, "boxes": {"local": 5, "other": {"notified": 7}}}, fh)
+        st = m.State(path, "local")
+        assert st.repaired is True, "the repair must be disclosed, not silent"
+        assert isinstance(st.data["boxes"]["local"], dict)
+        assert isinstance(st.notified, dict), st.data
+        st.mark("x/y", 1.0, delivered=True)      # must not raise
+        st2 = m.State(path, "other")
+        assert st2.repaired is True and isinstance(st2.notified, dict), st2.data
+        # a HEALTHY file is not "repaired"
+        st.mark("x/y", 1.0, delivered=True)
+        assert st.save() is True
+        st3 = m.State(path, "local")
+        assert st3.repaired is False, st3.data
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@test
+def test_a_FROZEN_log_is_FAIL_SILENT_even_when_its_tail_was_not_read():
+    """`LOG_SILENT` is established by the mtime ALONE and needs no content. The tail guard was asked
+    first, so a live pid whose log had been frozen for 3h published INCONCLUSIVE/LOG_UNREADABLE —
+    an unread content reported where a measured FAIL was available."""
+    m = load()
+    cfg = m.cfg_from_dict({})
+    base = {"controller": {"ok": True, "pids": [{"pid": 1234, "cmd": "/bin/zsh /o/orch-loop.sh"}],
+                           "raw": "1234 bash orch-loop.sh"},
+            "launchd": {"ok": True, "loaded": True, "pid": 1234},
+            "log": {"exists": True, "path": "/tmp/l", "age_s": 10800},
+            "log_events": {}, "heartbeat": {"age_s": 5}, "queue_state": None}
+    v = m.check_controller_cycling(base, cfg)
+    assert (v.status, v.variant) == (m.FAIL, "LOG_SILENT"), (v.status, v.variant, v.detail)
+    # a FRESH log with an unread tail is still an abstention
+    fresh = dict(base, log={"exists": True, "path": "/tmp/l", "age_s": 30})
+    v2 = m.check_controller_cycling(fresh, cfg)
+    assert (v2.status, v2.variant) == (m.INCONCLUSIVE, "LOG_UNREADABLE"), (v2.status, v2.variant)
+
+
+@test
+def test_PARTIAL_POPULATION_counts_NON_DRAFT_rows_in_its_denominator():
+    """`len(prs)` counted DRAFT rows — already moved to `skipped` — so a payload with 5 drafts, 1
+    armed PR and 1 unprobed row reported "1 of 7 non-draft open PR(s) could not be probed"."""
+    m = load()
+    cfg = m.cfg_from_dict({"repo": "o/r"})
+    drafts = [{"number": n, "draft": True, "merge_state_status": "CLEAN", "checks_green": True,
+               "probed": True} for n in range(1, 6)]
+    armed = {"number": 10, "draft": False, "merge_state_status": "CLEAN", "checks_green": True,
+             "review_decision": "APPROVED", "probed": True, "auto_armed": True}
+    unread = {"number": 11, "draft": False, "probed": False}
+    facts = {"github": {"ok": True, "open_pr_count": 7,
+                        "open_prs": drafts + [armed, unread], "source": "rest",
+                        "page_full": False},
+             "log_events": {"headers": [{"raw": "h", "age_s": 5, "backlog": 0,
+                                         "queue_token": "READ(3)"}], "armed": [], "railed": [],
+                            "repo": [{"repo": "o/r", "age_s": 5}]}}
+    v = m.check_landers(facts, cfg)
+    assert (v.status, v.variant) == (m.INCONCLUSIVE, "PARTIAL_POPULATION"), (v.status, v.variant)
+    assert "1 of 2 non-draft" in v.detail, v.detail
 
 
 if __name__ == "__main__":
