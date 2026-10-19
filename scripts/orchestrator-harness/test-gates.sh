@@ -1350,7 +1350,11 @@ FAKE
     echo "  ✅ no age-based release of the un-owned gate (absence pin — a stall is named, never released)"; PASS=$((PASS+1))
   fi
   # …and the stall datum is DIAGNOSTIC ONLY: it must not be handed to the gate or to lo_select.
-  if grep -E '_lage|MERGE_STALL_MIN' "$ORCH" | grep -qE 'GATE_WHY|lo_select'; then
+  # ⛔ NO `producer | grep -q` (agent-infra#841/#864): `grep -q` exits at the first match, the producer
+  # takes SIGPIPE, and under `pipefail` the pipeline returns 141 — so the test would silently invert.
+  # Capture the source once, then test the capture.
+  _stalluse="$(grep -E '_lage|MERGE_STALL_MIN' "$ORCH" 2>/dev/null || true)"
+  if [ -n "$_stalluse" ] && grep -qE 'GATE_WHY|lo_select' <<<"$_stalluse"; then
     echo "  ❌ the stall age reaches the gate/selection — it may only be printed"; FAIL=$((FAIL+1))
   else
     echo "  ✅ the stall age is printed, never handed to the gate or to lo_select"; PASS=$((PASS+1))
