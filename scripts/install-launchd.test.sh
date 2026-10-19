@@ -213,6 +213,9 @@ run_installer() { # <home> [extra env assignments...]
 echo "── 1. Fresh-HOME simulation ──────────────────────────────────────"
 OUT="$(run_installer "$HOME1")"
 RC=$?
+# The §1 output is CAPTURED here: `$OUT` is reassigned by every later section, so counting jobs from it
+# after §9 would count a different run's output (measured: it read 1 of 8 and blamed the installer).
+OUT_FRESH1="$OUT"
 assert_eq "$RC" "0" "fresh install exits 0"
 assert_contains "$OUT" "corruption-canary: installed + loaded" "corruption-canary installed on fresh machine"
 assert_contains "$OUT" "provider-latency-tripwire: installed + loaded" "provider-latency-tripwire installed on fresh machine"
@@ -400,8 +403,30 @@ assert_not_contains "$OUT" "hub-state-check: installed + loaded" "retired hub jo
 assert_not_contains "$OUT" "skill-lint-oracle: installed + loaded" "retired oracle job NOT installed on fresh machine"
 [ ! -f "$HUB_RETIRED" ] && ok "no retired hub plist left behind" || bad "no retired hub plist left behind"
 [ ! -f "$ORACLE_RETIRED" ] && ok "no retired oracle plist left behind" || bad "no retired oracle plist left behind"
-BOOTSTRAP_COUNT1="$(grep -c 'launchctl bootstrap' "$LOG")"
-assert_eq "$BOOTSTRAP_COUNT1" "8" "fresh install bootstraps only active jobs (canary + tripwire + fleet + pi-session-reaper + balance-watch + pi-task-session-prune + lane-liveness + ci-runner-gate; the two retired per-class reapers are not bootstrapped, #2048)"
+# ⛔ THIS COUNT IS HOST-DERIVED, NOT PINNED — and it has to be. The installer resolves {{TORTOISE_REPO}}
+# from the environment AND from disk (install-launchd.sh:76-82), so a checkout beside this one installs the
+# {{TORTOISE_REPO}}-gated jobs and a bare CI checkout does not: a pinned total is red on one of the two
+# surfaces whichever number is chosen (measured: a pinned 9 reads 11 beside a checkout). So the
+# ALWAYS-installable jobs are pinned BY NAME, and the gated ones are counted from this run's own fixture
+# template dir. #2048 removed two templates (com.eldato.pi-cache-reap, com.tortoise.worktree-reaper —
+# both RETIRED into the consolidated pass), which is why the gated inventory is 2 here and not 3.
+BOOTSTRAP_COUNT1="$(grep -c 'launchctl bootstrap' "$LOG" || true)"  # grep -c exits 1 on ZERO matches; `set -e` would kill the run here
+# The label prefixes install-launchd prints, exactly as the per-job assertions above name them.
+ALWAYS_JOBS1="corruption-canary provider-latency-tripwire fleet-cost-weekly pi-session-reaper pi-task-session-prune lane-liveness deepseek-balance-watch ci-runner-gate"
+GATED_TEMPLATES1=0
+GATED_INSTALLED1=0
+for _tpl in "$TEMPLATES"/*.plist; do
+    grep -q '{{TORTOISE_REPO}}' "$_tpl" || continue
+    GATED_TEMPLATES1=$((GATED_TEMPLATES1 + 1))
+    case "$OUT_FRESH1" in *"$(basename "$_tpl" .plist): installed + loaded"*) GATED_INSTALLED1=$((GATED_INSTALLED1 + 1)) ;; esac
+done
+assert_eq "$GATED_TEMPLATES1" "2" "the {{TORTOISE_REPO}}-gated inventory is 2 (branch-reaper #1787 + worktree-hygiene #1095/#1678; #2048 retired the two per-class reaper templates)"
+_always1=0
+for _j in $ALWAYS_JOBS1; do
+    case "$OUT_FRESH1" in *"$_j: installed + loaded"*) _always1=$((_always1 + 1)) ;; esac  # the printed shape is "<label>: installed + loaded"
+done
+assert_eq "$_always1" "8" "all 8 always-installable jobs installed + loaded (pinned BY NAME, so the set cannot silently shrink)"
+assert_eq "$BOOTSTRAP_COUNT1" "$((_always1 + GATED_INSTALLED1))" "bootstraps == what this host can actually resolve (8 always + $GATED_INSTALLED1 of $GATED_TEMPLATES1 gated) — a pinned total would be red on the other surface"
 
 echo "── 2. Retirement: pre-seeded old plists get unloaded + removed ───"
 seed_retired "$HOME2"

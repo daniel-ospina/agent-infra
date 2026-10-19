@@ -743,14 +743,10 @@ fleet_row_pr_doctor() {
 # The reapers, one row each — a group row would hide which of them is dead, and their schedules
 # differ by two orders of magnitude (1h … 24h), so a single freshness bound would be a lie.
 # The OWN LOG each reaper writes, cited from the script that opens it — never inferred:
-#   disk-reaper.sh:121                   DISK_REAPER_LOG=${DISK_REAPER_LOG:-$STATE_DIR/disk-reaper.log}
+#   pi-reap-worktrees.sh:190            REAP_WT_LOG=$STATE_DIR/pi-reap-worktrees.log
 #   cleanup-stale-branches.sh:2411      ~/.pi/agent/state/cleanup-stale-branches.log
 #   pi-reap-idle.sh (session reaper)    ~/.pi/agent/state/pi-reap-idle.log
 #   fleet/lane_liveness.py              ~/.pi/agent/state/lane-liveness.log
-# ⛔ The consolidated pass replaced the per-class worktree row (#2048): its log is the PASS's own
-# record, so the citation above had to move with the row — leaving the retired job's log here would
-# hand the next editor of this row nothing to check the new path against, which is the
-# infer-it-and-get-it-wrong path this comment exists to prevent.
 # A missing file is LATE, not OK: the component promises to write it.
 fleet_row_reaper() { # <label> <own-log-name> <script-path>
   local label="${1:?}"
@@ -897,12 +893,9 @@ fleet_rows() {
   fleet_row_heartbeat_loop
   fleet_row_cadence_timer
   fleet_row_pr_doctor
-  # The 3rd arg is the code the job runs, CITED FROM THE INSTALLED PLIST (not guessed): the branch
-  # reaper is driven by the shared wrapper with a different --script, and the disk sinks are driven by
-  # the CONSOLIDATED pass (#2048) — com.eldato.disk-reaper replaced the per-class worktree job, so a
-  # row for the retired label would read "nothing runs it" on every healthy Mac (alarm fatigue), and
-  # leaving the replacement out would leave the reaper that actually reaps the disk unmonitored.
-  fleet_row_reaper com.eldato.disk-reaper disk-reaper.log "$FLEET_AGENT_SCRIPTS/disk-reaper.sh"
+  # The 3rd arg is the code the job runs, CITED FROM THE INSTALLED PLIST (not guessed): both the
+  # worktree and the branch reaper are driven by the same wrapper, with a different --script.
+  fleet_row_reaper com.tortoise.worktree-reaper pi-reap-worktrees.log "$FLEET_AGENT_SCRIPTS/pi-reap-worktrees-launchd.py"
   fleet_row_reaper com.tortoise.branch-reaper cleanup-stale-branches.log "$FLEET_AGENT_SCRIPTS/pi-reap-worktrees-launchd.py"
   fleet_row_reaper com.eldato.pi-session-reaper pi-reap-idle.log "$FLEET_AGENT_SCRIPTS/pi-reap-idle.sh"
   fleet_row_reaper com.eldato.lane-liveness lane-liveness.log "$FLEET_AGENT_SCRIPTS/fleet/lane_liveness.py"
@@ -983,7 +976,7 @@ _fleet_label_for() { # <name>
   case "${1:-}" in
     controller-watchdog)       printf 'com.eldato.orchestrator-watchdog\n' ;;
     pr-doctor)                 printf 'com.tortoise.pr-doctor\n' ;;
-    reaper.disk-reaper)        printf 'com.eldato.disk-reaper\n' ;;
+    reaper.worktree-reaper)    printf 'com.tortoise.worktree-reaper\n' ;;
     reaper.branch-reaper)      printf 'com.tortoise.branch-reaper\n' ;;
     reaper.pi-session-reaper)  printf 'com.eldato.pi-session-reaper\n' ;;
     reaper.lane-liveness)      printf 'com.eldato.lane-liveness\n' ;;

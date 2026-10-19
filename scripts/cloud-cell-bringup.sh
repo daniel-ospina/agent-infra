@@ -291,6 +291,8 @@ check_provider() {
           'Reply with exactly: LANE_READY' 2>&1 | tail -3)"
   case "$out" in
     *LANE_READY*) ok "provider call works (pi returned LANE_READY)" ;;
+    # ⛔ agent-infra#1884: `pi` is the SPAWN POINT now, and it refuses above the box's load ceiling —
+    # which is NOT a provider failure. Without this arm the refusal lands in the catch-all below and
     # the bring-up reports "provider probe failed" for a call that never reached a provider, sending
     # an operator to re-push a perfectly good key. The remedy for a refusal is capacity, so say that.
     *'[pi-gate] REFUSED'*)
