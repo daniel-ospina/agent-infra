@@ -885,16 +885,24 @@ def check_controller_cycling(f, c):
                            log.get("error") or "no error recorded"),
                  "the log age is unknown, so 'alive but useless' cannot be told from 'alive and "
                  "working'. Not green.")
-    if log.get("tail_ok") is False:
+    # ⛔ AN ABSENT `tail_ok` IS A MISSING READ TOO. `is False` catches a tail that FAILED but lets a
+    # payload that never said — the `--facts` injection mode, any producer that loses the field — fall
+    # through to the content arms, where `FAIL/LOG_NO_CYCLE` then claims "the log is advancing, but not
+    # by a cycle" about lines nobody read. Allow-list polarity, like `pids`/`probed`/`page_full`.
+    if log.get("tail_ok") is not True:
         # a fresh mtime proves the file is MOVING; it says nothing about WHAT is in it. Without this
         # arm the failed read fell through to LOG_NO_CYCLE — "the log IS advancing, but not by a
         # cycle" — which is a claim about content nobody read.
         return V("controller_cycling", INCONCLUSIVE, "LOG_UNREADABLE",
                  "controller pid(s): %s IS ALIVE (launchd %s: %s)\n"
                  "%s\ntail: %s"
-                 % (pid_txt, lc, lc_txt, log_txt, log.get("tail_error") or "tail failed"),
-                 "the log's mtime is readable but its CONTENT is not, so 'no cycle completes' cannot "
-                 "be told from 'the tail was refused'. Not green.")
+                 % (pid_txt, lc, lc_txt, log_txt,
+                    # an ABSENT result is not a failed one, and saying "tail failed" about a payload
+                    # that never reported would be the same unmeasured claim one level down
+                    log.get("tail_error") if log.get("tail_ok") is False
+                    else "result NOT REPORTED by this payload"),
+                 "the log's mtime is readable but its CONTENT was not read, so 'no cycle completes' "
+                 "cannot be told from 'the tail was refused'. Not green.")
     if log_age > win:
         return V("controller_cycling", FAIL, "LOG_SILENT",
                  "controller pid(s): %s IS ALIVE (launchd %s: %s)\n"
@@ -1303,8 +1311,9 @@ def check_work_dispatched(f, c):
     backlog = hdr.get("backlog") if hdr else None
     # The SAME authoritative token `queue_readable` grades, so the two checks cannot disagree about
     # whether the pool was read as empty (they did: header EMPTY, state UNREADABLE).
-    _tok, _raw, _tok_src = authoritative_queue_token(f, hdr)
-    pool = _tok.get("pool")
+    _tok, _unused_raw, _tok_src = authoritative_queue_token(f, hdr)
+    # (`_tok`'s pool is NOT read here: the pool/backlog comparison below uses the header's OWN pair,
+    # because this check's backlog comes from the header and pairing the two refreshes was the defect.)
     pool_kind = _tok.get("kind")
     last_ok = newest(events.get("dispatch_ok"))
 
@@ -1934,6 +1943,8 @@ def check_headroom(f, c):
 # Check 8 — every green, mergeable PR has an armed lander (or is railed)
 # ════════════════════════════════════════════════════════════════════════════════════════════════
 
+# ⛔ "NOT RED", NOT "PASSED" — the merge rail's polarity (`cancelled`/`stale` are non-red there).
+# Read `rollup_state`'s docstring: `checks_green` answers "may this merge on checks", never "CI passed".
 GREEN_CONCLUSIONS = ("SUCCESS", "NEUTRAL", "SKIPPED", "CANCELLED", "STALE")
 
 
@@ -1991,9 +2002,13 @@ def rollup_is_green(rollup):
     Newest attempt = highest `id` (`started_at` is nullable and `completed_at` can tie). Where a
     surface supplies no ids (a legacy status context), later list position wins.
 
-    Polarity, not vocabulary: `success`/`neutral`/`skipped` are green, `cancelled`/`stale` are
-    non-red, and EVERY OTHER CONCLUSION — including one GitHub has not documented and a null one —
-    is RED. A missing check is not a green check — and an EMPTY/absent rollup is not "not green"
+    ⛔ WHAT "GREEN" MEANS HERE: **not red**. `success`/`neutral`/`skipped` are green, and
+    `cancelled`/`stale` are treated as NON-RED — deliberately, because this predicate answers "is
+    there a failing check blocking a merge", which is the merge rail's own polarity
+    (`scripts/admin-merge.sh` treats `{success, neutral, skipped, cancelled, stale}` as non-red).
+    EVERY OTHER CONCLUSION — including one GitHub has not documented, and a null one — is RED. A
+    check that was CANCELLED therefore reads `checks_green: True`; that is "nothing here blocks a
+    merge", not "CI passed", and the two are kept distinct by this sentence rather than by a name. A missing check is not a green check — and an EMPTY/absent rollup is not "not green"
     either: it is `None`, meaning NO CHECK SURFACE WAS READ.
     """
     # ⛔ ONE GRADING IMPLEMENTATION. This function is the BOOLEAN PROJECTION of `rollup_state`, which
@@ -2197,7 +2212,11 @@ def check_landers(f, c):
             # BLOCKED or DIRTY, so the check graded nothing at all while reporting health).
             skipped.append("%s:%s" % (pr.get("number"), mss))
             continue
-        if not green:
+        # ⛔ ALLOW-LIST POLARITY: `if not green` reads the string "false" (or `"no"`, or `1`) as
+        # GREEN, so a collector regression or a hand-written facts file published `PASS/LANDERS_ARMED`
+        # for a PR whose own evidence line printed `green=false`. Only `True` is green here; `None`
+        # is already an unprobed row (handled above).
+        if green is not True:
             # ⛔ NAME THE REASON THE ROW CARRIES. A not-green PR is skipped either because a check
             # CONCLUDED red or because one is still IN FLIGHT, and `:red` asserted the first for both.
             skipped.append("%s:%s" % (pr.get("number"), pr.get("checks_state") or "red"))
@@ -3477,7 +3496,7 @@ def _collect_rest(gh, repo, cfg, now, errors):
                  merged_page_full=len(closed) >= 100 and not page_covers_window)
 
     probe_max = int(cfg.rest_probe_max)
-    rows, unprobed, detail_errors = [], 0, []
+    rows, detail_errors = [], []
     for i, p in enumerate(open_raw):
         num = p.get("number")
         row = {"number": num, "draft": bool(p.get("draft")),
@@ -3485,7 +3504,6 @@ def _collect_rest(gh, repo, cfg, now, errors):
                "merge_state_status": None, "checks_green": None, "checks_state": None,
                "review_decision": None, "probed": False}
         if row["draft"] or i >= probe_max:
-            unprobed += 1
             row["unprobed_reason"] = ("DRAFT" if row["draft"]
                                       else "beyond rest_probe_max=%d (position %d)"
                                       % (probe_max, i + 1))
@@ -4166,11 +4184,13 @@ def main(argv=None):
             # recorded `delivered` for a recipient that cannot act on cell-2. The respawn path already
             # refuses honestly for a remote box (`NOT ATTEMPTED (remote)`); the send path now does too.
             if machine.remote:
-                reported["not_delivered"].append((v.key, "NOT DELIVERED: box %s is REMOTE — the "
-                                                  "cmux socket, and therefore the controller pane, "
-                                                  "belongs to THIS machine. A remote box's "
-                                                  "controller cannot be messaged from here."
-                                                  % cfg.box))
+                detail = ("NOT DELIVERED: box %s is REMOTE — the cmux socket, and therefore the "
+                          "controller pane, belongs to THIS machine. A remote box's controller "
+                          "cannot be messaged from here." % cfg.box)
+                reported["not_delivered"].append({
+                    "check": v.name, "variant": v.variant, "detail": detail, "ws": None,
+                    "ws_resolution": "refused before discovery: the box is remote",
+                    "message": compose_message(v, verdicts, cfg.box, obs_iso, extra_lines=extra)})
                 continue
             ws = cfg.controller_ws
             ws_why = "--controller-ws"

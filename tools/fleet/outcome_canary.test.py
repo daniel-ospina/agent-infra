@@ -2449,6 +2449,75 @@ def test_an_UNKNOWN_probe_in_skip_is_a_usage_error_not_a_silent_no_op():
 
 
 @test
+def test_a_BOX_run_refuses_to_message_the_LOCAL_pane_and_says_so():
+    """`--box` scopes the FACTS and the state key, but `find_controller_workspace`/`send_message` run on
+    the LOCAL cmux socket — so a run for cell-2 discovered THIS machine's controller and delivered into
+    it, recording `delivered` for a recipient that cannot act on cell-2. The refusal also has to be
+    RENDERABLE: it is appended to `not_delivered`, which `main` reads as a dict."""
+    m = load()
+    d = tempfile.mkdtemp(prefix="oc-box-")
+    facts_path = os.path.join(d, "facts.json")
+    with open(facts_path, "w") as fh:
+        json.dump({"facts": fx("no-pr-created")["facts"]}, fh)
+    rc, out, err = run_cli(["--live", "--box", "fake-cell", "--facts", facts_path,
+                            "--state", os.path.join(d, "state.json")])
+    # rc is inherited by `run_cli` from the shell, so a traceback shows up as 1 — assert the REPORT
+    # rendered, which is what a tuple in `not_delivered` broke.
+    assert "Traceback" not in err, err[-600:]
+    assert "NOT DELIVERED" in out, out[-600:]
+    assert "is REMOTE" in out, out[-600:]
+    assert "refused before discovery" in out, out[-600:]
+    # …and the schema is the same one every other refusal uses
+    rc2, out2, err2 = run_cli(["--live", "--box", "fake-cell", "--facts", facts_path,
+                               "--state", os.path.join(d, "state2.json"), "--json"])
+    assert "Traceback" not in err2, err2[-600:]
+    rep = json.loads(out2)
+    nd = (rep.get("signal") or {}).get("not_delivered") or rep.get("not_delivered")
+    assert nd, rep.keys()
+    assert isinstance(nd[0], dict) and "detail" in nd[0], nd[0]
+
+
+@test
+def test_an_ABSENT_tail_ok_is_a_MISSING_read_not_a_readable_log():
+    """`log.get("tail_ok") is False` caught a FAILED tail but let a payload that never said — the
+    `--facts` injection mode, or any producer that loses the field — fall through to the content arms,
+    where FAIL/LOG_NO_CYCLE claims "the log is advancing, but not by a cycle" about lines nobody read."""
+    m = load()
+    cfg = m.cfg_from_dict({})
+    d = fx("healthy")
+    d["facts"]["log"].pop("tail_ok")
+    d["facts"]["log_events"] = {"headers": [], "dispatch_ok": [], "lane_started": [],
+                               "lane_failed": [], "armed": [], "railed": []}
+    v = [x for x in m.evaluate(d["facts"], cfg) if x.name == "controller_cycling"][0]
+    assert (v.status, v.variant) == (m.INCONCLUSIVE, "LOG_UNREADABLE"), (v.status, v.variant)
+    assert "not reported" in v.evidence.lower(), v.evidence
+    # a reported-successful tail still grades the content it read
+    d["facts"]["log"]["tail_ok"] = True
+    v2 = [x for x in m.evaluate(d["facts"], cfg) if x.name == "controller_cycling"][0]
+    assert v2.status == m.FAIL and v2.variant in ("LOG_NO_CYCLE", "LOG_SILENT"), (v2.status,
+                                                                                  v2.variant)
+
+
+@test
+def test_a_STRING_false_check_surface_is_not_GREEN():
+    """`if not green` reads the string "false" as GREEN — a collector regression or a hand-written
+    facts file published PASS/LANDERS_ARMED for a PR whose own evidence line printed `green=false`."""
+    m = load()
+    cfg = m.cfg_from_dict({"repo": "o/r"})
+    row = {"number": 7, "merge_state_status": "CLEAN", "auto_armed": True,
+           "review_decision": "APPROVED", "probed": True, "draft": False}
+    for bad in ("false", "no", 1, "0", []):
+        v = m.check_landers({"github": {"ok": True, "source": "graphql", "open_pr_count": 1,
+                                        "open_prs": [dict(row, checks_green=bad)]}}, cfg)
+        assert v.status == m.PASS and v.variant == "NOTHING_GREEN", (bad, v.status, v.variant)
+        assert "%s:" % 7 in v.evidence, (bad, v.evidence)
+    # …and the real booleans still decide it
+    v_ok = m.check_landers({"github": {"ok": True, "source": "graphql", "open_pr_count": 1,
+                                       "open_prs": [dict(row, checks_green=True)]}}, cfg)
+    assert (v_ok.status, v_ok.variant) == (m.PASS, "LANDERS_ARMED"), (v_ok.status, v_ok.variant)
+
+
+@test
 def test_CONTROLLER_ABSENT_also_abstains_on_a_REJECTED_controller_row():
     """The cycle-27 guard was gated on launchd holding a pid, so a cell whose launchctl read failed (or
     whose controller is a plain tmux job) still reached FAIL/CONTROLLER_ABSENT — "no controller exists
@@ -4295,6 +4364,22 @@ def test_source_never_contains_a_forbidden_launchctl_form():
 
 MUTATIONS = [
     # (label, old, new, paired test)
+    # ── cycle-29 defects ──────────────────────────────────────────────────────────────────
+    ("the remote refusal is appended in a shape the renderer cannot read",
+     '''                reported["not_delivered"].append({
+                    "check": v.name, "variant": v.variant, "detail": detail, "ws": None,''',
+     '''                reported["not_delivered"].append((v.name, detail))
+                if False:
+                    _ = ({"check": v.name, "variant": v.variant, "detail": detail, "ws": None,''',
+     "test_a_BOX_run_refuses_to_message_the_LOCAL_pane_and_says_so"),
+    ("an absent tail_ok is graded as a readable log",
+     '    if log.get("tail_ok") is not True:',
+     '    if log.get("tail_ok") is False:',
+     "test_an_ABSENT_tail_ok_is_a_MISSING_read_not_a_readable_log"),
+    ("a string-false check surface counts as green",
+     "        if green is not True:",
+     "        if not green:",
+     "test_a_STRING_false_check_surface_is_not_GREEN"),
     # ── cycle-28 defects ──────────────────────────────────────────────────────────────────
     ("CONTROLLER_ABSENT ignores a rejected controller row",
      "    if not pids and near_ours:",
@@ -4947,8 +5032,8 @@ MUTATIONS = [
      "hdr.get(\"queue_token\"), \"cycle header\"",
      "test_the_QUEUE_STATE_record_outranks_a_header_that_is_one_refresh_old"),
     ("work_dispatched reads a different pool token than queue_readable",
-     "    _tok, _raw, _tok_src = authoritative_queue_token(f, hdr)",
-     "    _tok, _raw, _tok_src = parse_queue_token(hdr.get(\"queue_token\")), None, \"cycle header\"",
+     "    _tok, _unused_raw, _tok_src = authoritative_queue_token(f, hdr)",
+     "    _tok, _unused_raw, _tok_src = parse_queue_token(hdr.get(\"queue_token\")), None, \"hdr\"",
      "test_the_QUEUE_STATE_record_outranks_a_header_that_is_one_refresh_old"),
     ("an unreadable memory probe is reported as 0 MiB free",
      "            \"if (!seen || ps == \\\"\\\" || free == \\\"\\\" || inact == \\\"\\\" || spec == "

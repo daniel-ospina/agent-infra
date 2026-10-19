@@ -227,8 +227,8 @@ shape changes, and it is pruned with the rest of its check.
 ## The suite
 
 ```bash
-python3 tools/fleet/outcome_canary.test.py              # 166 tests
-python3 tools/fleet/outcome_canary.test.py --mutations  # 163 mutations, each must go RED
+python3 tools/fleet/outcome_canary.test.py              # 169 tests
+python3 tools/fleet/outcome_canary.test.py --mutations  # 166 mutations, each must go RED
 ```
 
 The signal tests drive the **real CLI** end-to-end (`--live --facts … --capture-dir …`), so what is
@@ -363,6 +363,21 @@ Six more (cycle 13), each a case where a datum the tool held was not the one it 
   not a pass, so the PR is not landable yet) and is labelled `:inflight`, not `:red`: the verdict is
   the same, the CLAIM is true. `rollup_state()` is that three-way read; `rollup_is_green()` is the
   boolean projection the collectors use.
+- **A missing `tail_ok` is a missing read.** `is False` caught a FAILED tail but let a payload that
+  never reported one — the `--facts` injection mode, or any producer that loses the field — fall
+  through to the content arms, where `FAIL/LOG_NO_CYCLE` claims "the log is advancing, but not by a
+  cycle" about lines nobody read. All 30 fixtures now declare `tail_ok: true` explicitly.
+- **`checks_green` is graded allow-list.** `if not green` read the string `"false"` (or `"no"`, `1`)
+  as GREEN, so a collector regression or a hand-written facts file published `PASS/LANDERS_ARMED` for
+  a PR whose own evidence line printed `green=false`. Only `True` is green.
+- **"Green" here means NOT RED.** `GREEN_CONCLUSIONS` treats `cancelled`/`stale` as non-red, matching
+  the merge rail (`scripts/admin-merge.sh` does the same); a `CANCELLED` check therefore reads
+  `checks_green: True`, which answers "nothing here blocks a merge", not "CI passed". The docstring
+  said the opposite of what the code did; both now say this.
+- **A `--box` run refuses to message the LOCAL pane, in a shape the report can render.** The refusal
+  was appended as a tuple while every other producer appends a dict, so EVERY `--box` text-mode run
+  crashed in the render phase: the NOT-DELIVERED block, the composed message and the state error were
+  lost, and the exit code became the traceback's 1 (an all-INCONCLUSIVE run must exit 2).
 - **A rejected census row is not an absence — in EITHER absence arm, and for the pane daemon too.**
   `CONTROLLER_ABSENT` was still reachable when launchd reported no pid (or its read failed): the guard
   was gated on `launchd.pid is not None`, so whether the cell used launchd decided the verdict, not

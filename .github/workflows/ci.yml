@@ -370,7 +370,7 @@ jobs:
         # table, no clock.
         run: python3.12 tools/fleet/outcome_canary.py --static
       - name: Outcome-canary mutation evidence (zero-dep)
-        # The suite above is only a pin if it can FAIL. Each of the 163 mutations reintroduces a
+        # The suite above is only a pin if it can FAIL. Each of the 166 mutations reintroduces a
         # defect the canary exists to catch — a live pid graded as a cycling controller, a refused
         # dispatch forgiven, an UNREADABLE pool read as readable, a gh refusal read as zero PRs, a
         # deny-list check-result rule, an alert on every poll, no re-arm after recovery, a respawn on

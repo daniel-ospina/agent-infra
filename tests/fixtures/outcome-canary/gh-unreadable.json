@@ -59,6 +59,7 @@
    "pid": 4242
   },
   "log": {
+   "tail_ok": true,
    "age_s": 42,
    "exists": true,
    "mtime_iso": "2026-10-18T07:47:44-0400",

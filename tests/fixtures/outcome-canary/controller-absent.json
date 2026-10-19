@@ -76,6 +76,7 @@
    "pid": null
   },
   "log": {
+   "tail_ok": true,
    "age_s": 2160,
    "exists": true,
    "mtime_iso": "2026-10-18T07:47:44-0400",
