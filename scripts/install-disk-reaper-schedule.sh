@@ -23,6 +23,15 @@
 # `--apply` installs the armed job, and the flag lands INSIDE the installed unit/plist, so the arming
 # is readable from the scheduled artifact itself and is never hidden in an environment default.
 # Re-running with `--dry-run` installs the report-only job again: reversible, one copy, no drift.
+# ⛔ AND AN ARMING SURVIVES A NO-FLAG RE-INSTALL. `pi-bootstrap/setup.sh` (which `sync.sh` runs) calls
+# this installer with `--install` and NO mode flag on every run, so an arming that existed only in the
+# previous invocation was silently reverted at the next sync — the Mac could never stay armed, which is
+# the disk-fill incident #2048 exists to prevent. The arming is therefore PERSISTED in the schedule
+# stamp this installer writes ($STATE_DIR/disk-reaper.schedule, key `armed=`), and a no-flag install
+# adopts it. An EXPLICIT `--apply`/`--dry-run` always wins and rewrites the stamp. This is still not an
+# environment default: the stamp is state THIS TOOL wrote, arming still requires an explicit owner
+# invocation at least once, `--status` reads the arming off the installed artifact, and `--uninstall`
+# deletes the stamp so a fresh install starts report-only again.
 #
 # ⛔ A CHANGED PASS RELOADS ITS JOB (#1738). An edit to a script a scheduled job runs is silent until
 # the job is reloaded — the loaded job keeps the program and environment it was bootstrapped with. So
@@ -34,9 +43,14 @@
 #
 # `--status` answers the same questions on both platforms in ONE vocabulary: `platform=`,
 # `scheduler=`, `job=`, `installed=`, `enabled=`, `active=`, `armed=`, `next_run=`, `interval_seconds=`,
-# `last_exit=`, `pass_drift=`, and then the pass record itself — the SAME file, written by the SAME
-# pass, so "what did it free and did it succeed" cannot drift between a cell and a laptop. `armed=` is
-# read from the INSTALLED artifact, never from the flags this invocation was given.
+# `last_exit=`, `pass_drift=`, `repos=`, and then the pass record itself — the SAME file, written by the
+# SAME pass, so "what did it free and did it succeed" cannot drift between a cell and a laptop. `armed=`
+# is read from the INSTALLED artifact, never from the flags this invocation was given; `repos=` likewise
+# says what the SCHEDULED job will scan, not what this shell happens to export.
+# ⛔ THE EXIT CODE IS A CONTRACT, NOT DECORATION: `cloud-cell-bringup.sh` gates on it. 0 means
+# scheduled AND loaded (systemd: the timer is enabled and active; launchd: the plist exists and the job
+# is bootstrapped into the domain). A present-but-disabled timer, or a plist left behind after a
+# `bootout`, is NOT scheduled — it used to answer 0 here, which certified a box whose reaper never fires.
 #
 # Install targets:
 #   Linux   1. a SYSTEM unit via passwordless sudo (/etc/systemd/system) — the cell's normal shape;
@@ -67,8 +81,12 @@
 #   TEMPLATES_DIR            systemd template dir (default: this repo's templates/systemd)
 #   LAUNCHD_TEMPLATE         launchd template (default: templates/launchd/com.eldato.disk-reaper.plist.tmpl)
 #   SYSTEMD_UNIT_DIR         unit dir OVERRIDE (tests: a temp dir)
+#   SYSTEMD_SYSTEM_DIR       the SYSTEM unit dir (default /etc/systemd/system; a test seam for the
+#                            system branch, which was previously reachable only with real sudo)
 #   SYSTEMCTL                `systemctl` to call (default `sudo -n systemctl`)
-#   SUDO                     `sudo` probe (default `sudo -n`)
+#   SYSTEMCTL_USER           `systemctl` for the USER manager (default `systemctl --user`)
+#   SUDO                     `sudo` probe (default `sudo -n`); EMPTY means "we already are root" (so the
+#                            substitution is `${SUDO-…}`, never `${SUDO:-…}` — see choose_systemd_target)
 #   DISK_REAPER_AGENTS_DIR   launchd install dir (default $HOME/Library/LaunchAgents)
 #   LAUNCHCTL                `launchctl` to call (tests: a shim)
 #   LAUNCHD_DOMAIN           launchd domain (default gui/$(id -u))
@@ -78,7 +96,8 @@
 #   ELDATO_ALLOW_TEST_HOME   permit launchd management when $HOME is not the real home (tests ONLY;
 #                            requires a launchctl shim — same contract as install-launchd.sh, #446)
 #
-# Exit codes: 0 ok · 1 failure (named) · 2 usage.
+# Exit codes: 0 ok · 1 failure (named) · 2 usage · 3 DECLINED, this is not the box (a temp-HOME
+# launchd run, #446) — the caller must not treat a decline as a failure of the box it was handed.
 set -uo pipefail
 
 INFRA_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -110,7 +129,12 @@ say() { printf '%s\n' "$*"; }
 err() { printf '%s: %s\n' "${0##*/}" "$*" >&2; }
 warn() { printf '%s: WARNING: %s\n' "${0##*/}" "$*" >&2; }
 
-usage() { sed -n '2,81p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+usage_body() {
+    # The header IS the help text: line 2 down to the `set` line, uncommented. The end is DERIVED, not
+    # a fixed line range, so a header edit can never silently truncate --help.
+    awk 'NR > 1 { if ($0 ~ /^set -uo pipefail$/) exit; sub(/^# ?/, ""); print }' "$0"
+}
+usage() { usage_body; exit 2; }
 
 # ── resolve the pass ────────────────────────────────────────────────────────────────────────────
 # The FARMED copy first: it is what a box has after `pi-bootstrap/setup.sh`, and a job pointing at a
@@ -129,11 +153,26 @@ done
 # Rendered into the job so the scheduled pass never depends on a shell's environment. A candidate is
 # kept only when git answers for it — a job scanning a path that is not a repo fails closed every hour,
 # which is how an alarm becomes wallpaper.
+#
+# ⛔ THE CANDIDATE LIST IS NOT "WHATEVER THE INSTALLING SHELL EXPORTS" (#2048 review, P1). `setup.sh`,
+# `sync.sh`, a bring-up and a cron all invoke this installer from different shells, and a Mac that
+# exported only $AGENT_INFRA_PATH used to install a job that scanned agent-infra while
+# `resolve_python` handed it the TORTOISE checkout's interpreter — one box, two answers, and the big
+# repo never scanned (the `disk-reaper.sh` empty-list refusal does not fire on ONE non-empty repo, so
+# it exited 0 while doing it). Explicit env first, then the canonical checkouts this fleet has on both
+# platforms; BOTH resolvers read this ONE list, so the interpreter and the repos cannot disagree.
+candidate_checkouts() {
+    printf '%s\n' \
+        "${TORTOISE_REPO:-}" "${REPO:-}" "${WORKDIR:-}" "${AGENT_INFRA_PATH:-}" \
+        "${HOME:-}/Documents/GitHub/tortoise" \
+        "${HOME:-}/Documents/GitHub/agent-infra"
+}
+
 resolve_repos() {
     local r seen=" " out=""
     local list="${DISK_REAPER_REPOS:-}"
     if [ -z "$list" ]; then
-        list="$(printf '%s\n' "${REPO:-}" "${TORTOISE_REPO:-}" "${WORKDIR:-}" "${AGENT_INFRA_PATH:-}")"
+        list="$(candidate_checkouts)"
     fi
     while IFS= read -r r; do
         [ -n "$r" ] || continue
@@ -151,11 +190,15 @@ resolve_repos() {
 # tortoise checkout falls back to `python3` — the job still installs (the uv class needs no repo) and
 # --status prints the runner, so a class that fails closed is diagnosable without reading a log.
 resolve_python() {
-    local cand
+    local cand r
     if [ -n "${DISK_REAPER_PYTHON:-}" ]; then printf '%s' "$DISK_REAPER_PYTHON"; return 0; fi
-    for cand in "${TORTOISE_REPO:-}/.venv/bin/python" "${HOME:-}/Documents/GitHub/tortoise/.venv/bin/python"; do
-        [ -n "$cand" ] && [ -x "$cand" ] && { printf '%s' "$cand"; return 0; }
-    done
+    # The SAME candidate list the repos come from: an interpreter and a repo list that disagree about
+    # which box this is would scan one checkout with another one's binary.
+    while IFS= read -r r; do
+        [ -n "$r" ] || continue
+        cand="$r/.venv/bin/python"
+        [ -x "$cand" ] && { printf '%s' "$cand"; return 0; }
+    done <<<"$(candidate_checkouts)"
     command -v python3 2>/dev/null && return 0
     return 1
 }
@@ -174,6 +217,48 @@ case "${DISK_REAPER_PLATFORM:-$(uname -s 2>/dev/null)}" in
     darwin|Darwin) PLATFORM=darwin ;;
     *)             PLATFORM=unknown ;;
 esac
+
+# ── the REAL home, portably ─────────────────────────────────────────────────────────────────────
+# #446's hazard is launchd-specific, but the PROBE was not portable: `dscl` is macOS-only, so on Linux
+# this guard resolved nothing and a temp-HOME run installed into a domain it should have refused — the
+# #446 assertion in the suite was red on CI and could not be reproduced on a Mac (where dscl answers).
+# One resolver, both platforms, and an UNKNOWN answer is a REFUSAL: the probe exists to keep a job
+# whose plist path dies with a throwaway HOME out of the live domain, so "cannot tell" is not "fine".
+resolve_real_home() {
+    local u home=""
+    u="$(id -un 2>/dev/null)" || return 0
+    case "$u" in ''|*[!A-Za-z0-9._-]*) return 0 ;; esac   # never eval an unexpected name
+    # Linux / any NSS-backed box (macOS has no getent by default, hence the dscl arm below).
+    # ⛔ THE FIELD INDEX IS THE WHOLE POINT: a passwd line is name:passwd:uid:gid:GECOS:home:shell, so
+    # the home is the SIXTH field — five leading groups skipped, not four. Skipping four captures GECOS,
+    # which on every box with a full name returns "Daniel Ospina" instead of a path and makes the guard
+    # decline every correctly-configured Mac (#2048 review, P1).
+    if command -v getent >/dev/null 2>&1; then
+        home="$(getent passwd "$u" 2>/dev/null | sed -n '1s/^[^:]*:[^:]*:[^:]*:[^:]*:[^:]*:\([^:]*\):.*$/\1/p')"
+    fi
+    # macOS.
+    if [ -z "$home" ] && command -v dscl >/dev/null 2>&1; then
+        home="$(dscl . -read "/Users/$u" NFSHomeDirectory 2>/dev/null | sed -n 's/^NFSHomeDirectory: //p' | head -1)"
+    fi
+    # Last resort: the shell's own getpwnam expansion (~user). An unresolved name stays literal, and a
+    # literal token is reported as UNKNOWN rather than mistaken for a home.
+    if [ -z "$home" ]; then
+        home="$(eval printf '%s' "~$u" 2>/dev/null || true)"
+        case "$home" in "~"*) home="" ;; esac
+    fi
+    printf '%s' "$home"
+}
+
+# norm_path <path> — a comparable form of a directory path. A trailing slash and a symlinked home are
+# the two ordinary spellings that made a healthy Mac decline (HOME=/Users/x/ vs the passwd entry
+# /Users/x), and a guard that refuses a CORRECT box is not safe — it is silent under `setup.sh`, which
+# turns a decline into SKIPPED and a green exit (#2048 review).
+norm_path() {
+    local p="${1:-}"
+    while [ "${p%/}" != "$p" ] && [ "$p" != "/" ]; do p="${p%/}"; done
+    if [ -n "$p" ] && [ -d "$p" ]; then (cd "$p" 2>/dev/null && pwd -P) || printf '%s' "$p"
+    else printf '%s' "$p"; fi
+}
 
 # ── render ─────────────────────────────────────────────────────────────────────────────────────
 # sed_repl — make a value safe BOTH as the replacement half of `s|…|…|g` and inside the XML text node
@@ -214,6 +299,14 @@ render() {
 
 # ── the schedule stamp: which pass bytes the JOB was installed against (#1738) ────────────────
 no_yes() { [ "${1:-0}" = 1 ] && printf 'yes' || printf 'no'; }
+# ONE token, whatever the tool printed and whatever it exited. Two defects live here (#2048 review):
+# `systemctl is-enabled` prints `disabled` AND exits 1, so the shape `$(… || echo disabled)` emitted
+# `disabled` TWICE on a real systemd box — invisible to a test whose shim echoed the token and exited 0;
+# and a diagnostic line printed BEFORE the token (a wrapper, an override, an odd systemd) became the
+# value, so a genuinely scheduled timer read as "NOT scheduled". So: select the token, not the line.
+first_token() {
+    printf '%s\n' "${1:-}" | awk '/^[a-z][a-z-]*$/{t=$0} END{if (t != "") print t}'
+}
 stamp_field() { [ -f "$STAMP" ] || return 0; sed -n "s/^$1=//p" "$STAMP" | head -1; }
 pass_sha() {
     [ -f "$1" ] || return 0
@@ -241,17 +334,24 @@ write_stamp() { # write_stamp <job>
 
 # ── systemd backend ───────────────────────────────────────────────────────────────────────────
 SD_TARGET=""; UNIT_DIR=""; SC=""
+# The system unit dir is a SEAM, not a literal: with `SUDO=""` (root, or a test) the `install` arm below
+# writes to it unprivileged, and nothing else could reach that branch without real sudo (#2048 review).
+SYSTEMD_SYSTEM_DIR="${SYSTEMD_SYSTEM_DIR:-/etc/systemd/system}"
+SYSTEMCTL_USER="${SYSTEMCTL_USER:-systemctl --user}"
+# ⛔ `${SUDO-…}`, NOT `${SUDO:-…}`. With `:-`, a SET-BUT-EMPTY `SUDO=""` expanded to `sudo -n` anyway,
+# so the "we already are root" arm was DEAD CODE — no test could reach it and a root/container run took
+# the sudo probe's answer instead of its own (#2048 review). `SUDO=""` now means exactly what it says.
 choose_systemd_target() {
     if [ -n "${SYSTEMD_UNIT_DIR:-}" ]; then
         SD_TARGET="override"; UNIT_DIR="$SYSTEMD_UNIT_DIR"; SC="${SYSTEMCTL:-systemctl}"
         return 0
     fi
-    if [ "${SUDO:-sudo -n}" = "" ] || ${SUDO:-sudo -n} true >/dev/null 2>&1; then
-        SD_TARGET="system"; UNIT_DIR="/etc/systemd/system"; SC="${SYSTEMCTL:-sudo -n systemctl}"
+    if [ "${SUDO-sudo -n}" = "" ] || ${SUDO-sudo -n} true >/dev/null 2>&1; then
+        SD_TARGET="system"; UNIT_DIR="$SYSTEMD_SYSTEM_DIR"; SC="${SYSTEMCTL:-sudo -n systemctl}"
         return 0
     fi
-    if systemctl --user show-environment >/dev/null 2>&1; then
-        SD_TARGET="user"; UNIT_DIR="$HOME/.config/systemd/user"; SC="systemctl --user"
+    if $SYSTEMCTL_USER show-environment >/dev/null 2>&1; then
+        SD_TARGET="user"; UNIT_DIR="$HOME/.config/systemd/user"; SC="$SYSTEMCTL_USER"
         return 0
     fi
     return 1
@@ -285,11 +385,13 @@ sd_install() {
     [ -f "$UNIT_DIR/$UNIT_NAME.timer" ] || { changed=1; pass_changed=1; }   # first install
 
     mkdir -p "$UNIT_DIR" 2>/dev/null || true
-    if [ -n "${SYSTEMD_UNIT_DIR:-}" ]; then
+    # A USER unit dir is ours by definition (no privilege is involved), so it is written directly. The
+    # SYSTEM dir needs sudo — or none at all when `SUDO=""` says we are already root.
+    if [ -n "${SYSTEMD_UNIT_DIR:-}" ] || [ "$SD_TARGET" = "user" ]; then
         cp -f "$tmpd/$UNIT_NAME.service" "$tmpd/$UNIT_NAME.timer" "$UNIT_DIR/" || { err "copy failed"; rm -rf "$tmpd"; return 1; }
     else
-        ${SUDO:-sudo -n} install -m 0644 "$tmpd/$UNIT_NAME.service" "$UNIT_DIR/$UNIT_NAME.service" \
-            && ${SUDO:-sudo -n} install -m 0644 "$tmpd/$UNIT_NAME.timer" "$UNIT_DIR/$UNIT_NAME.timer" \
+        ${SUDO-sudo -n} install -m 0644 "$tmpd/$UNIT_NAME.service" "$UNIT_DIR/$UNIT_NAME.service" \
+            && ${SUDO-sudo -n} install -m 0644 "$tmpd/$UNIT_NAME.timer" "$UNIT_DIR/$UNIT_NAME.timer" \
             || { err "install failed (sudo/systemd)"; rm -rf "$tmpd"; return 1; }
     fi
     rm -rf "$tmpd"
@@ -315,7 +417,13 @@ sd_install() {
     else
         err "timer is NOT enabled after install — the reaper will not run unattended"; return 1
     fi
-    write_stamp "$UNIT_NAME.timer" || return 1
+    # ⛔ THE STAMP IS AN OPTIMISATION, NOT THE INSTALL. By the time it can fail the unit is written,
+    # enabled and read back — so failing the verb here would tell `setup.sh` "this Mac has NO disk-reaper
+    # schedule" about a Mac that IS scheduled, and (on a cell) send the bring-up hunting sudo for a state
+    # dir problem (#2048 review). Degrade visibly instead: no stamp = no pass-SHA reload protection and a
+    # no-flag re-install falls back to report-only.
+    write_stamp "$UNIT_NAME.timer" \
+        || warn "the schedule stamp $STAMP could not be written — the job IS installed and enabled, but a changed pass will not force a reload and a no-flag re-install will fall back to report-only"
     return 0
 }
 
@@ -337,8 +445,49 @@ armed_from_file() {
     esac
 }
 
+# repos_from_file <installed unit/plist> — what the SCHEDULED job will scan, read from the ARTIFACT.
+# The installing shell's exports answer a different question (what THIS invocation saw), which is how a
+# Mac that exported only $AGENT_INFRA_PATH ended up with a job pointed at the wrong repo (#2048 review,
+# P1). Answering it from the installed job makes "does this box reap the big repo?" readable.
+repos_from_file() {
+    local f="$1"
+    [ -f "$f" ] || return 0
+    case "$f" in
+        *.service) sed -n 's/^Environment=DISK_REAPER_REPOS=//p' "$f" | head -1 ;;
+        *)         awk '/<key>DISK_REAPER_REPOS<\/key>/{f=1;next} f && /<string>/{sub(/.*<string>/,"");sub(/<\/string>.*/,"");print;exit}' "$f" ;;
+    esac
+}
+
+# sd_is_scheduled <enabled> <active> — polarity, not vocabulary, and the ONLY enabled-ish state this
+# installer's own `enable --now` can produce is `enabled`. `enabled-runtime` means "until reboot",
+# `static`/`indirect` mean "no [Install] section, never pulled in at boot", `transient` is runtime-only:
+# accepting any of them would exit 0 for a timer that disappears at the next reboot, which is the
+# delayed form of the false PASS this contract exists to remove (#2048 review). Everything else,
+# including a token systemd has not documented, is NOT scheduled.
+sd_is_scheduled() {
+    [ "$1" = "enabled" ] || return 1
+    [ "$2" = "active" ]
+}
+
+# runner_from_file <installed unit/plist> — WHAT the scheduler actually starts. On macOS this is the
+# TCC seam (the checkout's interpreter on the farmed launcher), and "no tortoise .venv, so it fell back
+# to python3" is the single most likely reason a Mac pass fails closed — so the verb that exists to
+# diagnose the job has to answer it (#2048 review). Read off the artifact, like armed= and repos=.
+runner_from_file() {
+    local f="$1"
+    [ -f "$f" ] || { printf 'unknown'; return 0; }
+    case "$f" in
+        *.service)
+            awk '/^ExecStart=/{sub(/^ExecStart=/,""); split($0,a," "); print a[1]" "a[2]; exit}' "$f" ;;
+        *)
+            awk '/<key>ProgramArguments<\/key>/{f=1;next}
+                 f && /<string>/{sub(/.*<string>/,""); sub(/<\/string>.*/,"");
+                                n++; if (n<=2) printf "%s%s", (n>1?" ":""), $0; if (n==2) { print ""; exit }}' "$f" ;;
+    esac
+}
+
 sd_status() {
-    local next last_exit svc
+    local next last_exit svc en act
     choose_systemd_target || { err "no systemd scheduler available"; return 1; }
     svc="$UNIT_DIR/$UNIT_NAME.service"
     say "platform=linux"
@@ -355,8 +504,12 @@ sd_status() {
         return 1
     fi
     say "installed=yes"
-    say "enabled=$($SC is-enabled "$UNIT_NAME.timer" 2>/dev/null || echo disabled)"
-    say "active=$($SC is-active "$UNIT_NAME.timer" 2>/dev/null || echo inactive)"
+    en="$(first_token "$($SC is-enabled "$UNIT_NAME.timer" 2>/dev/null)")"
+    act="$(first_token "$($SC is-active "$UNIT_NAME.timer" 2>/dev/null)")"
+    [ -n "$en" ] || en=disabled
+    [ -n "$act" ] || act=inactive
+    say "enabled=$en"
+    say "active=$act"
     next="$($SC list-timers --all --no-pager 2>/dev/null | awk -v u="$UNIT_NAME.timer" '$0 ~ u {print $1" "$2" "$3; exit}')"
     say "next_run=${next:-unknown}"
     last_exit="$($SC show -p ExecMainStatus --value "$UNIT_NAME.service" 2>/dev/null)"
@@ -364,6 +517,13 @@ sd_status() {
     say "last_exit=$last_exit"
     say "interval_seconds=$INTERVAL_SECONDS"
     say "armed=$(armed_from_file "$svc")"
+    # THE EXIT CODE IS THE CONTRACT (`cloud-cell-bringup.sh` gates on it): 0 only when the timer is
+    # actually scheduled. A present-but-disabled timer (or a loaded-but-not-enabled one) is not
+    # scheduled in the sense being asserted, and this used to answer 0 for it — a false PASS.
+    if ! sd_is_scheduled "$en" "$act"; then
+        err "$UNIT_NAME.timer is present but NOT scheduled (enabled=$en active=$act) — it will not fire unattended. Re-run --install, or enable it by hand"
+        return 1
+    fi
     return 0
 }
 
@@ -374,13 +534,21 @@ sd_uninstall() {
     fi
     choose_systemd_target || { err "no systemd scheduler available"; return 1; }
     $SC disable --now "$UNIT_NAME.timer" >/dev/null 2>&1 || true
-    if [ -n "${SYSTEMD_UNIT_DIR:-}" ]; then
+    if [ -n "${SYSTEMD_UNIT_DIR:-}" ] || [ "$SD_TARGET" = "user" ]; then
         rm -f "$UNIT_DIR/$UNIT_NAME.service" "$UNIT_DIR/$UNIT_NAME.timer"
     else
-        ${SUDO:-sudo -n} rm -f "$UNIT_DIR/$UNIT_NAME.service" "$UNIT_DIR/$UNIT_NAME.timer"
+        ${SUDO-sudo -n} rm -f "$UNIT_DIR/$UNIT_NAME.service" "$UNIT_DIR/$UNIT_NAME.timer"
     fi
     $SC daemon-reload >/dev/null 2>&1 || true
     rm -f "$STAMP"
+    # READ IT BACK. A denied `rm` (a sudo-less user over a root-owned unit) used to print "uninstalled"
+    # and exit 0, and systemd reloads the surviving unit at the next boot — the removal is the claim, so
+    # the removal is what gets verified (#2048 review).
+    if [ -f "$UNIT_DIR/$UNIT_NAME.service" ] || [ -f "$UNIT_DIR/$UNIT_NAME.timer" ] \
+       || $SC cat "$UNIT_NAME.service" >/dev/null 2>&1; then
+        err "uninstall INCOMPLETE: $UNIT_NAME is still installed under $UNIT_DIR (and/or still known to systemd) — nothing is claimed beyond what was read back"
+        return 1
+    fi
     say "uninstalled $UNIT_NAME from $UNIT_DIR"
     return 0
 }
@@ -402,6 +570,25 @@ choose_launchd_target() {
 
 ld_loaded() { $LC print "$LD_DOMAIN/$LABEL" >/dev/null 2>&1; }
 
+# lint_plist <file> — is the rendered plist well-formed XML at all? A malformed plist is an INERT job
+# (measured in #1719: one unescaped `&` broke it), so it must be refused before it is installed.
+# ⛔ THE LINTER IS NOT "plutil OR NOTHING": CI is `ubuntu-latest`, where plutil does not exist, so a
+# plutil-gated refusal is a refusal that never runs on the platform this repo's gate lives on (#2048
+# review). python3's plistlib parses the same XML and is present on both platforms. No linter at all
+# is said out loud rather than passed silently — the render-time `{{` refusal still ran.
+lint_plist() {
+    local f="$1"
+    if command -v plutil >/dev/null 2>&1; then
+        plutil -lint "$f" >/dev/null 2>&1; return $?
+    fi
+    if command -v python3 >/dev/null 2>&1; then
+        python3 -c 'import plistlib,sys; plistlib.load(open(sys.argv[1],"rb"))' "$f" >/dev/null 2>&1
+        return $?
+    fi
+    warn "no plist linter on this box (no plutil, no python3) — the rendered plist was not linted"
+    return 0
+}
+
 ld_reload() { # (re)bootstrap the plist into the user domain
     local dest="$LD_DIR/$LABEL.plist"
     $LC enable "$LD_DOMAIN/$LABEL" >/dev/null 2>&1 || true
@@ -422,9 +609,10 @@ ld_install() {
 
     tmp="$(mktemp -d "${TMPDIR:-/tmp}/disk-reaper-plist.XXXXXX")" || { err "cannot create a temp dir"; return 1; }
     render "$LAUNCHD_TEMPLATE" "$tmp/$LABEL.plist" || { rm -rf "$tmp"; return 1; }
-    # A malformed plist is an inert job: launchd accepts nothing of it. Lint where the tool exists.
-    if command -v plutil >/dev/null 2>&1 && ! plutil -lint "$tmp/$LABEL.plist" >/dev/null 2>&1; then
-        err "rendered plist is MALFORMED — refusing to install it"; plutil -lint "$tmp/$LABEL.plist" >&2 || true
+    # A malformed plist is an inert job: launchd accepts nothing of it.
+    if ! lint_plist "$tmp/$LABEL.plist"; then
+        err "rendered plist is MALFORMED — refusing to install it"
+        command -v plutil >/dev/null 2>&1 && plutil -lint "$tmp/$LABEL.plist" >&2
         rm -rf "$tmp"; return 1
     fi
 
@@ -458,7 +646,10 @@ ld_install() {
     say "          (the TCC seam: this interpreter holds the ~/Documents access a launchd bash is denied)"
     say "  repos:  ${REPOS:-<none>}  (worktree floor ${AGED_DAYS}d)"
     say "  state:  $STATE_DIR/disk-reaper.status"
-    write_stamp "$LABEL" || return 1
+    # Same rule as systemd: the job is installed and loaded by now, so an unwritable stamp is a named
+    # degradation, never a failure that mis-describes the machine (#2048 review).
+    write_stamp "$LABEL" \
+        || warn "the schedule stamp $STAMP could not be written — the job IS installed and loaded, but a changed pass will not force a reload and a no-flag re-install will fall back to report-only"
     return 0
 }
 
@@ -479,7 +670,10 @@ ld_status() {
     say "installed=yes"
     print_out="$($LC print "$LD_DOMAIN/$LABEL" 2>/dev/null)"
     if [ -n "$print_out" ]; then say "enabled=enabled"; else say "enabled=disabled"; fi
-    state="$(printf '%s\n' "$print_out" | sed -n 's/^[[:space:]]*state = //p' | head -1)"
+    # `active=` is the MOMENTARY state (is a pass running right now). It is not the scheduling answer:
+    # a StartInterval job is idle between runs, which is healthy — so it is reported and not folded into
+    # the exit code. Liveness here is LOADED (below), which is what `bootout` clears.
+    state="$(first_line "$(printf '%s\n' "$print_out" | sed -n 's/^[[:space:]]*state = //p')")"
     case "$state" in running) say "active=active" ;; *) say "active=inactive" ;; esac
     last_exit="$(printf '%s\n' "$print_out" | sed -n 's/^[[:space:]]*last exit code = //p' | head -1)"
     case "$last_exit" in ''|*[!0-9]*) last_exit=unknown ;; esac
@@ -489,6 +683,12 @@ ld_status() {
     say "next_run=unknown"
     say "interval_seconds=$INTERVAL_SECONDS"
     say "armed=$(armed_from_file "$dest")"
+    # THE EXIT CODE IS THE CONTRACT. A plist on disk that launchd does not hold is NOT scheduled — a
+    # `launchctl bootout` (or a failed bootstrap) leaves exactly that, and it used to answer 0.
+    if [ -z "$print_out" ]; then
+        err "$LABEL is installed at $dest but NOT loaded in $LD_DOMAIN — it will not fire unattended. Re-run --install (a bootout leaves exactly this state)"
+        return 1
+    fi
     return 0
 }
 
@@ -503,6 +703,13 @@ ld_uninstall() {
     $LC bootout "$LD_DOMAIN/$LABEL" >/dev/null 2>&1 || true
     rm -f "$dest"
     rm -f "$STAMP"
+    # READ IT BACK: a bootout that did not take, or a plist that survived the `rm`, leaves a job that
+    # launchd re-loads at the next login. "uninstalled" is the claim, so the removal is what is read
+    # back (#2048 review).
+    if [ -f "$dest" ] || ld_loaded; then
+        err "uninstall INCOMPLETE: $LABEL is still $( [ -f "$dest" ] && printf 'installed at %s' "$dest" || printf 'loaded in %s' "$LD_DOMAIN" ) — nothing is claimed beyond what was read back"
+        return 1
+    fi
     say "uninstalled $LABEL from $LD_DIR"
     return 0
 }
@@ -513,9 +720,28 @@ ld_uninstall() {
 # Mac. The drift line answers #1738's question: are the bytes on disk the ones the JOB was installed
 # against?
 status_tail() {
-    local sha stamp_sha drift pass_rc
+    local sha stamp_sha drift pass_rc job_file repos_art
     say "pass=$REAPER"
     say "pass_exists=$([ -f "$REAPER" ] && echo yes || echo no)"
+    # What the SCHEDULED job scans, read off the installed artifact — the same discipline as armed=.
+    # Falls back to this invocation's resolution, named as such, so an uninstalled box still answers.
+    case "$SCHEDULER" in
+        systemd) job_file="${UNIT_DIR:-}/$UNIT_NAME.service" ;;
+        launchd) job_file="${LD_DIR:-}/$LABEL.plist" ;;
+        *)       job_file="" ;;
+    esac
+    repos_art="$(repos_from_file "$job_file")"
+    # `repos=` is decided by the ARTIFACT EXISTING, not by the extracted value being non-empty: an
+    # installed job that legitimately scans no repo (every candidate was a non-repo) carries an EMPTY
+    # value, and `[ -n "$repos_art" ]` described that box as "not installed" (#2048 review).
+    if [ -f "$job_file" ]; then
+        if [ -n "$repos_art" ]; then say "repos=$repos_art"
+        else say "repos=<none> (the installed job scans no repo — the venv/worktree classes will fail closed every pass)"; fi
+        say "runner=$(runner_from_file "$job_file")"
+    else
+        say "repos=${REPOS:-<none>} (not installed — this is what a fresh install WOULD scan)"
+        say "runner=unknown (not installed)"
+    fi
     sha="$(pass_sha "$REAPER")"; stamp_sha="$(stamp_field pass_sha)"
     say "pass_sha=${sha:-unknown}"
     if [ -z "$stamp_sha" ]; then drift="no-stamp (installed by an older installer — re-run --install)"
@@ -540,16 +766,31 @@ status_tail() {
 while [ $# -gt 0 ]; do
     case "$1" in
         --install)   MODE=--install ;;
-        --apply)     MODE_FLAG=--apply ;;
-        --dry-run)   MODE_FLAG=--dry-run ;;
+        --apply)     MODE_FLAG=--apply; MODE_EXPLICIT=1 ;;
+        --dry-run)   MODE_FLAG=--dry-run; MODE_EXPLICIT=1 ;;
         --preview)   PREVIEW=1 ;;
         --status)    MODE=--status ;;
         --uninstall) MODE=--uninstall ;;
-        --help|-h)   sed -n '2,81p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --help|-h)   usage_body; exit 0 ;;
         *) usage ;;
     esac
     shift
 done
+
+# ── the arming outlives the invocation that made it ─────────────────────────────────────────
+# `pi-bootstrap/setup.sh` — which `sync.sh` runs — re-installs with `--install` and NO mode flag on
+# every run. With the arming living only in the invocation, the next sync silently reverted an owner's
+# `--apply` to report-only and rebootstrapped the job: the Mac could never STAY armed, which is the
+# disk-fill incident #2048 exists to prevent (#2048 review, P1). The stamp this installer writes
+# records the arming, and a no-flag install adopts it. An EXPLICIT flag still wins and rewrites it, so
+# `--dry-run` remains the reversal. Nothing here reads the environment: the stamp is state WE wrote,
+# and --uninstall deletes it, so the next install starts report-only again.
+if [ "${MODE_EXPLICIT:-0}" != 1 ]; then
+    case "$(stamp_field armed)" in
+        apply)   MODE_FLAG=--apply ;;
+        dry-run) MODE_FLAG=--dry-run ;;
+    esac
+fi
 
 if [ -z "$REAPER" ]; then
     err "disk-reaper.sh not found — looked at \$DISK_REAPER, \$HOME/.pi/agent/scripts, and $INFRA_ROOT/scripts. Farm it first: bash pi-bootstrap/setup.sh"
@@ -581,13 +822,23 @@ esac
 # launchd addresses the USER domain by UID (#446): a run with a throwaway HOME bootstraps into the LIVE
 # session, registering a job whose plist path dies with the temp dir. Refuse it unless a test opts in
 # WITH a launchctl shim (same contract as install-launchd.sh).
+# ⛔ EXIT 3 IS "DECLINED — NOT THIS BOX", and it exists so a caller never has to parse prose:
+# `pi-bootstrap/setup.sh` used to duplicate this very probe with its own `dscl` call, which is how two
+# implementations of one decision drift apart. 0 = installed, 3 = not the box this run is about,
+# anything else = a real failure the caller must report.
 if [ "$PLATFORM" = darwin ] && [ "${ELDATO_ALLOW_TEST_HOME:-}" != "1" ]; then
-    real_home="$(dscl . -read "/Users/$(id -un)" NFSHomeDirectory 2>/dev/null | sed -n 's/^NFSHomeDirectory: //p' | head -1 || true)"
-    if [ -n "$real_home" ] && [ "$HOME" != "$real_home" ]; then
+    real_home="$(resolve_real_home)"
+    if [ -z "$real_home" ]; then
+        err "refusing to manage launchd jobs: cannot determine the real home for '$(id -un)' (getent, dscl and ~user all failed), so a throwaway HOME cannot be ruled out (#446)."
+        err "       A temp-HOME run registers jobs against plist paths that vanish."
+        err "       Tests: put a launchctl shim on PATH and set ELDATO_ALLOW_TEST_HOME=1"
+        exit 3
+    fi
+    if [ "$(norm_path "$HOME")" != "$(norm_path "$real_home")" ]; then
         err "refusing to manage launchd jobs: HOME=$HOME is not the real home ($real_home)."
         err "       A temp-HOME run registers jobs against plist paths that vanish (#446)."
         err "       Tests: put a launchctl shim on PATH and set ELDATO_ALLOW_TEST_HOME=1"
-        exit 1
+        exit 3
     fi
 fi
 

@@ -69,7 +69,13 @@ git fetch origin --quiet || { echo "⚠️  fetch failed (offline?) — nothing 
 git pull --ff-only origin main || { echo "⚠️  pull failed — local changes or divergence. Run: git status"; exit 1; }
 
 echo "==> refreshing pi config"
-./pi-bootstrap/setup.sh
+# ⛔ NOT `set -e`-FATAL (#2048). `setup.sh` now exits non-zero when it finishes over a Mac whose
+# disk-reaper schedule could not be installed — correct, because "Done!" over an unscheduled box is the
+# false PASS #2048 removes. But an abort HERE would skip every guard below it (#304's plist-propagation
+# re-run, #341's cost-config drift check, the #498/#502 extension-farm parity gate) on EVERY auto-sync,
+# for as long as the reaper install keeps failing — one loud failure silently disabling unrelated ones.
+# So the failure stays loud and the sync continues.
+./pi-bootstrap/setup.sh || echo "⚠️  setup.sh reported a failure (see above) — CONTINUING the sync so the guards below still run" >&2
 
 # #304 propagation trigger: setup.sh runs the installer on macOS, but
 # re-running it here makes a merged plist-template bump apply on the next

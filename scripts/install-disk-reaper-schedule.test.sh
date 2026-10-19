@@ -87,9 +87,16 @@ cat >"$T/bin/systemctl" <<'SC'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"${SYSTEMCTL_CALLS:-/dev/null}"
 case "$*" in
-  *is-enabled*) echo enabled ;;
-  *is-active*) echo active ;;
+  *is-enabled*)
+      case "${SYSTEMCTL_ENABLED:-enabled}" in
+        # REAL systemd prints `disabled` AND exits 1 (an always-0 shim is precisely why the
+        # double-line `enabled=` defect was invisible to this suite).
+        disabled) echo disabled; exit 1 ;;
+        *)        echo "${SYSTEMCTL_ENABLED:-enabled}" ;;
+      esac ;;
+  *is-active*) echo "${SYSTEMCTL_ACTIVE:-active}" ;;
   *list-timers*) echo "Mon 2026-10-19 00:30:00 UTC 1h left Sun 2026-10-18 23:30:00 UTC 3h ago eldato-disk-reaper.timer eldato-disk-reaper.service" ;;
+  *show-environment*) [ "${SYSTEMCTL_USER_MANAGER:-yes}" = yes ] || exit 1 ;;
   *show*) echo "${FAKE_EXEC_STATUS:-0}" ;;
   cat\ *) f="${SYSTEMCTL_UNITS:-}/$(printf '%s' "$*" | sed 's/^cat //')"
            [ -f "$f" ] || exit 1; cat "$f" ;;
@@ -99,22 +106,35 @@ SC
 chmod +x "$T/bin/systemctl"
 
 # launchctl shim: keeps a LOADED-STATE file, so the installer's "is it loaded?" question has a real
-# answer without touching the live GUI domain.
+# answer without touching the live GUI domain. `print` FAILS for an unloaded job, as real launchctl
+# does — a shim that exited 0 for both states made "is it loaded?" unassertable.
 cat >"$T/bin/launchctl" <<LC
 #!/usr/bin/env bash
 STATE="${T}/launchctl.state"
 printf '%s\n' "\$*" >>"${T}/launchctl.log"
 case "\${1:-}" in
   bootstrap) mkdir -p "\$STATE"; exit 0 ;;
-  bootout)   rm -rf "\$STATE"; exit 0 ;;
+  bootout)   [ -n "\${LAUNCHCTL_BOOTOUT_IGNORE:-}" ] && exit 0; rm -rf "\$STATE"; exit 0 ;;
   enable)    exit 0 ;;
-  print)     [ -d "\$STATE" ] || exit 0
+  print)     [ -d "\$STATE" ] || exit 1
              printf '\tstate = not running\n\truns = 2\n\tlast exit code = %s\n' "\${FAKE_LAST_EXIT:-0}"
              exit 0 ;;
 esac
 exit 0
 LC
 chmod +x "$T/bin/launchctl"
+
+# A passwd probe for the #446 guard: on Linux the real `getent` answers; on macOS the real `dscl` does.
+# These stubs let ONE assertion run on BOTH platforms (`getent` answering, `dscl` silent = the Linux
+# shape), which is the only way a macOS dev box can see what ubuntu-latest sees.
+# ⛔ THE STUB EMITS A REAL SEVEN-FIELD passwd LINE, GECOS INCLUDED (#2048 review, P1): the first version
+# wrote an EMPTY GECOS through a `%s` placeholder, so a field-index bug in the installer (reading GECOS
+# instead of home) fell through to the `~user` arm and the assertion passed without ever exercising
+# `getent`. A non-empty GECOS is what makes this stub able to fail.
+mkdir -p "$T/bin/probe"
+printf '#!/usr/bin/env bash\n[ "${1:-}" = passwd ] || exit 2\necho "runner:x:501:20:Real Name:${REAL_HOME_STUB}:/bin/sh"\n' >"$T/bin/probe/getent"
+printf '#!/usr/bin/env bash\nexit 1\n' >"$T/bin/probe/dscl"
+chmod +x "$T/bin/probe/getent" "$T/bin/probe/dscl"
 touch "$T/bin/fakepython"; chmod +x "$T/bin/fakepython"
 
 # ── runners: one per backend, both pointing at throwaway dirs ───────────────────────────────────
@@ -257,7 +277,7 @@ ST_LIN="$(inst_lin --status 2>&1)"; RC_LIN=$?
 ST_MAC="$(inst_mac --status 2>&1)"; RC_MAC=$?
 assert_eq "$RC_LIN" "0" "T5 a scheduled Linux box exits 0"
 assert_eq "$RC_MAC" "0" "T5 a scheduled Darwin box exits 0"
-for k in platform scheduler job job_path installed enabled active armed next_run interval_seconds last_exit; do
+for k in platform scheduler job job_path installed enabled active armed next_run interval_seconds last_exit repos runner; do
     assert_contains "$ST_LIN" "$k=" "T5 Linux answers '$k'"
     assert_contains "$ST_MAC" "$k=" "T5 Darwin answers '$k'"
 done
@@ -265,6 +285,17 @@ assert_contains "$ST_LIN" "scheduler=systemd" "T5 Linux names systemd"
 assert_contains "$ST_MAC" "scheduler=launchd" "T5 Darwin names launchd"
 assert_contains "$ST_MAC" "job=com.eldato.disk-reaper" "T5 Darwin names the job label"
 assert_contains "$ST_LIN" "job=eldato-disk-reaper.timer" "T5 Linux names the unit"
+# `repos=` answers "which repos does the SCHEDULED job scan?", read off the artifact — not "what did the
+# installing shell happen to export" (the P1 shape: a Mac exporting only $AGENT_INFRA_PATH ran the
+# tortoise venv against agent-infra, and one non-empty repo made the empty-list refusal not fire).
+assert_contains "$ST_LIN" "repos=$REPO" "T5 Linux reports the repos the JOB scans (off the installed unit)"
+assert_contains "$ST_MAC" "repos=$REPO" "T5 Darwin reports the same, off the installed plist"
+# `runner=` is the TCC seam on a Mac and `/bin/bash` on a cell — the single most likely reason a pass
+# fails closed, read off the artifact (it used to be printed by --install only, while the comment above
+# resolve_python promised --status answered it — #2048 review, P2).
+assert_contains "$ST_LIN" "runner=/bin/bash" "T5 Linux reports the runner the timer actually starts"
+assert_contains "$ST_MAC" "runner=$T/bin/fakepython" "T5 Darwin reports the interpreter+launcher the job starts"
+assert_contains "$ST_MAC" "pi-reap-worktrees-launchd.py" "T5 and names the farmed launcher, not just the interpreter"
 assert_contains "$ST_LIN" "interval_seconds=3600" "T5 both are hourly (Linux)"
 assert_contains "$ST_MAC" "interval_seconds=3600" "T5 both are hourly (Darwin)"
 # The KEY SET must be identical — one vocabulary, not two spellings of the same question.
@@ -292,9 +323,44 @@ OUT="$(HOME="$T/home-tmp" DISK_REAPER="$PASSFILE" DISK_REAPER_PLATFORM=darwin \
     DISK_REAPER_AGENTS_DIR="$T/agents-446" LAUNCHCTL="$T/bin/launchctl" \
     DISK_REAPER_PYTHON="$T/bin/fakepython" DISK_REAPER_STATE_DIR="$T/state-x" \
     bash "$INST" --install 2>&1)"; RC=$?
-assert_eq "$RC" "1" "T6 a temp-HOME launchd run is REFUSED (#446)"
+assert_eq "$RC" "3" "T6 a temp-HOME launchd run is DECLINED (#446, exit 3 — not a failure of the box)"
 assert_contains "$OUT" "is not the real home" "T6 and names the real home it compared against"
 assert_nofile "$T/agents-446/com.eldato.disk-reaper.plist" "T6 nothing was registered in that domain"
+# ⛔ THE #446 GUARD MUST FIRE ON LINUX TOO (#2048 review, P1). The probe was `dscl`, which is macOS-only,
+# so on the ubuntu-latest gate this refusal silently did nothing — and the breakage could not be
+# reproduced on a Mac, where dscl answers. Same assertion forced onto the LINUX shape (getent answers,
+# dscl silent), so one dev box can see what CI sees.
+GETENT_STUB='#!/usr/bin/env bash\n[ "${1:-}" = passwd ] || exit 2\necho "%s:x:501:20::${REAL_HOME_STUB}:/bin/sh" "${2:-}"\n'
+printf "$GETENT_STUB" >"$T/bin/probe/getent"; chmod +x "$T/bin/probe/getent"
+OUT="$(PATH="$T/bin/probe:$PATH" REAL_HOME_STUB="$T/real-home" HOME="$T/home-tmp2" \
+    DISK_REAPER="$PASSFILE" DISK_REAPER_PLATFORM=darwin DISK_REAPER_AGENTS_DIR="$T/agents-446b" \
+    LAUNCHCTL="$T/bin/launchctl" DISK_REAPER_PYTHON="$T/bin/fakepython" \
+    DISK_REAPER_STATE_DIR="$T/state-x" bash "$INST" --install 2>&1)"; RC=$?
+assert_eq "$RC" "3" "T6 the temp-HOME decline fires on the LINUX probe too (getent, no dscl) — the CI shape"
+assert_contains "$OUT" "is not the real home" "T6 and names the home it compared against"
+assert_nofile "$T/agents-446b/com.eldato.disk-reaper.plist" "T6 and registers nothing there either"
+# …and an answer NO probe can give is a REFUSAL, not a pass: "cannot tell" must never mean "fine".
+printf '#!/usr/bin/env bash\nexit 1\n' >"$T/bin/probe/getent"
+printf '#!/usr/bin/env bash\necho nosuchuser\n' >"$T/bin/probe/id"; chmod +x "$T/bin/probe/id" "$T/bin/probe/getent"
+OUT="$(PATH="$T/bin/probe:$PATH" HOME="$T/home-tmp3" DISK_REAPER="$PASSFILE" \
+    DISK_REAPER_PLATFORM=darwin DISK_REAPER_AGENTS_DIR="$T/agents-446c" LAUNCHCTL="$T/bin/launchctl" \
+    DISK_REAPER_PYTHON="$T/bin/fakepython" DISK_REAPER_STATE_DIR="$T/state-x" \
+    bash "$INST" --install 2>&1)"; RC=$?
+assert_eq "$RC" "3" "T6 an UNDETERMINABLE real home is DECLINED (fail-closed, never a silent install)"
+assert_contains "$OUT" "cannot determine the real home" "T6 and names the probe it could not answer with"
+assert_nofile "$T/agents-446c/com.eldato.disk-reaper.plist" "T6 and registers nothing"
+printf "$GETENT_STUB" >"$T/bin/probe/getent"; chmod +x "$T/bin/probe/getent"; rm -f "$T/bin/probe/id"
+# …and a HOME that differs only in SPELLING is the same home (#2048 review, P2): a trailing slash used
+# to decline a correctly-configured Mac, which setup.sh turns into SKIPPED + a green exit.
+mkdir -p "$T/real-home"
+OUT="$(PATH="$T/bin/probe:$PATH" REAL_HOME_STUB="$T/real-home" HOME="$T/real-home/" \
+    DISK_REAPER="$PASSFILE" DISK_REAPER_PLATFORM=darwin DISK_REAPER_AGENTS_DIR="$T/agents-norm" \
+    DISK_REAPER_REPOS="$REPO" LAUNCHCTL="$T/bin/launchctl" LAUNCHD_DOMAIN="gui/999" \
+    DISK_REAPER_PYTHON="$T/bin/fakepython" DISK_REAPER_STATE_DIR="$T/state-x" \
+    bash "$INST" --install 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T6 HOME with a trailing slash is the SAME home (not declined)"
+assert_file "$T/agents-norm/com.eldato.disk-reaper.plist" "T6 and the job was installed for it"
+"$T/bin/launchctl" bootout gui/999/com.eldato.disk-reaper >/dev/null 2>&1 || true
 # An unresolved placeholder must refuse, not install a job whose argument is a literal token.
 printf '<?xml version="1.0"?>\n<plist version="1.0"><dict><key>Label</key><string>{{LABEL}}</string><key>X</key><string>{{NOPE}}</string></dict></plist>\n' >"$T/bad.tmpl"
 OUT="$(HOME="$home_mac" DISK_REAPER="$PASSFILE" DISK_REAPER_PLATFORM=darwin \
@@ -305,7 +371,9 @@ assert_eq "$RC" "1" "T6 an unresolved placeholder exits 1"
 assert_contains "$OUT" "unresolved placeholder" "T6 and names it (a literal token is an inert job)"
 assert_nofile "$T/agents-bad/com.eldato.disk-reaper.plist" "T6 and installs nothing"
 # A malformed plist is an inert job too (measured in #1719: an unescaped `&` broke the XML).
-if command -v plutil >/dev/null 2>&1; then
+# NOT gated on `plutil`: CI is ubuntu-latest, where plutil does not exist, so a plutil-gated refusal is
+# a refusal that never runs on the platform the gate lives on (#2048 review). Any linter is enough.
+if command -v plutil >/dev/null 2>&1 || command -v python3 >/dev/null 2>&1; then
     printf '<?xml version="1.0"?>\n<plist version="1.0"><dict><key>Label</key><string>{{LABEL}}</string></dict>\n' >"$T/malformed.tmpl"
     OUT="$(HOME="$home_mac" DISK_REAPER="$PASSFILE" DISK_REAPER_PLATFORM=darwin \
         DISK_REAPER_AGENTS_DIR="$T/agents-mal" LAUNCHCTL="$T/bin/launchctl" LAUNCHD_DOMAIN="gui/999" \
@@ -351,6 +419,25 @@ OUT="$(inst_mac --uninstall 2>&1)"; RC=$?
 assert_eq "$RC" "0" "T8 the launchd uninstall exits 0"
 assert_nofile "$PLIST" "T8 the plist is removed"
 assert_contains "$(cat "$T/launchctl.log")" "bootout gui/999/com.eldato.disk-reaper" "T8 and the job is booted out"
+# ⛔ AN UNINSTALL THAT DID NOT TAKE MUST NOT REPORT SUCCESS (#2048 review, P2). A denied `rm` used to
+# print "uninstalled" and exit 0, and systemd reloads the surviving unit at the next boot.
+RO="$T/units-ro"; mkdir -p "$RO"
+cmp -s "$SVC" "$RO/eldato-disk-reaper.service" 2>/dev/null || inst_lin --install >/dev/null 2>&1
+cp -f "$UNIT_DIR/eldato-disk-reaper.service" "$UNIT_DIR/eldato-disk-reaper.timer" "$RO/"
+chmod 500 "$RO"
+OUT="$(HOME="$home_lin" DISK_REAPER="$PASSFILE" DISK_REAPER_REPOS="$REPO" DISK_REAPER_PLATFORM=linux \
+    DISK_REAPER_STATE_DIR="$T/state-lin" SYSTEMD_UNIT_DIR="$RO" SYSTEMCTL="$T/bin/systemctl" \
+    SYSTEMCTL_CALLS="$T/systemctl.log" bash "$INST" --uninstall 2>&1)"; RC=$?
+chmod 700 "$RO"
+assert_eq "$RC" "1" "T8 an uninstall whose rm was DENIED exits 1 (never 'uninstalled')"
+assert_contains "$OUT" "INCOMPLETE" "T8 and says the removal is incomplete"
+assert_absent "$OUT" "uninstalled eldato-disk-reaper" "T8 and does NOT claim it uninstalled anything"
+# The launchd equivalent: a bootout that did not take leaves a job launchd re-loads at the next login.
+inst_mac --install >/dev/null 2>&1
+OUT="$(LAUNCHCTL_BOOTOUT_IGNORE=1 inst_mac --uninstall 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T8 a bootout that did NOT take exits 1 (the job would come back at login)"
+assert_contains "$OUT" "INCOMPLETE" "T8 and names it"
+rm -rf "$T/launchctl.state"   # settle: the shim's loaded-state is global to this suite
 
 echo "── T9. static pins: no deletion rule here, and no sysadm-only shortcut ──"
 # Every recursive delete must be of a MKTEMP dir this script created ($tmp/$tmpd), never a path it was
@@ -361,6 +448,128 @@ assert_absent "$RMS_BAD" 'rm -rf' "T9 every rm -rf in the installer removes ONLY
 assert_absent "$(grep -n 'disk-reaper.sh.*--apply' "$INST" | grep -v 'MODE_FLAG\|--apply)' || true)" "DISK_REAPER_DRY_RUN=0" \
     "T9 the arming decision is a FLAG this verb was given, never an env default"
 assert_contains "$(cat "$INST")" 'MODE_FLAG="--dry-run"' "T9 the shipped default is the report-only flag"
+
+echo "── T10. --status: the EXIT CODE is the contract (a present file is not a scheduled job) ──"
+# `cloud-cell-bringup.sh` gates on this code, and the old code returned 0 whenever the unit/plist FILE
+# existed — so a disabled timer, or a job left behind by `launchctl bootout`, certified a box whose
+# reaper never fires (#2048 review, P1).
+inst_lin --install >/dev/null 2>&1
+ST="$(inst_lin --status 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T10 a genuinely scheduled+loaded Linux box exits 0"
+OUT="$(SYSTEMCTL_ENABLED=disabled inst_lin --status 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T10 a PRESENT but DISABLED timer exits 1 (it will not fire unattended)"
+assert_contains "$OUT" "NOT scheduled" "T10 and says which state it read"
+assert_eq "$(grep -c '^enabled=' <<<"$OUT")" "1" \
+    "T10 enabled= is ONE line even when systemctl prints 'disabled' AND exits 1"
+OUT="$(SYSTEMCTL_ACTIVE=inactive inst_lin --status 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T10 a loaded-but-INACTIVE timer is not 'scheduled' either"
+# launchd: a plist on disk that the domain does NOT hold. A bootout leaves exactly this state.
+inst_mac --install >/dev/null 2>&1
+ST="$(inst_mac --status 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T10 a genuinely loaded Darwin job exits 0"
+"$T/bin/launchctl" bootout gui/999/com.eldato.disk-reaper >/dev/null 2>&1
+OUT="$(inst_mac --status 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T10 a plist left after a BOOTOUT exits 1 (installed is not scheduled)"
+assert_contains "$OUT" "NOT loaded" "T10 and names it"
+assert_contains "$OUT" "enabled=disabled" "T10 and reports the job as disabled, not as healthy"
+# A token that means "until reboot" (or "never pulled in at boot") must NOT read as scheduled: the only
+# enabled-ish state this installer's own `enable --now` can create is `enabled` (#2048 review, P2).
+for tok in enabled-runtime static indirect transient alias generated; do
+  OUT="$(SYSTEMCTL_ENABLED=$tok inst_lin --status 2>&1)"; RC=$?
+  assert_eq "$RC" "1" "T10 enabled=$tok is NOT scheduled (it would vanish at the next reboot)"
+done
+# A diagnostic line BEFORE the state token must not become the value: select the token, not the line.
+printf '#!/usr/bin/env bash\ncase "$*" in\n *is-enabled*) echo "Failed to get unit file state: x"; echo enabled ;;\n *is-active*) echo active ;;\n *list-timers*) echo "" ;;\n *) exit 0 ;;\nesac\n' >"$T/bin/systemctl-noisy"
+chmod +x "$T/bin/systemctl-noisy"
+OUT="$(HOME="$home_lin" DISK_REAPER="$PASSFILE" DISK_REAPER_REPOS="$REPO" DISK_REAPER_PLATFORM=linux \
+    DISK_REAPER_STATE_DIR="$T/state-noisy" SYSTEMD_UNIT_DIR="$T/units-noisy" \
+    SYSTEMCTL="$T/bin/systemctl-noisy" bash "$INST" --status 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T10 a diagnostic line before the state token does not flip a scheduled box to NOT scheduled"
+assert_contains "$OUT" "enabled=enabled" "T10 and enabled= carries the TOKEN, not the warning line"
+# An INSTALLED job whose repo list is legitimately empty is not "not installed" (#2048 review, P2).
+inst_lin --install >/dev/null 2>&1
+NONREPO="$T/not-a-repo"; mkdir -p "$NONREPO"
+OUT="$(HOME="$home_lin" DISK_REAPER="$PASSFILE" DISK_REAPER_REPOS="$NONREPO" DISK_REAPER_PLATFORM=linux \
+    DISK_REAPER_STATE_DIR="$T/state-norepo" SYSTEMD_UNIT_DIR="$T/units-norepo" \
+    SYSTEMCTL="$T/bin/systemctl" SYSTEMCTL_CALLS="$T/systemctl.log" bash "$INST" --install 2>&1)"
+OUT="$(HOME="$home_lin" DISK_REAPER="$PASSFILE" DISK_REAPER_REPOS="$NONREPO" DISK_REAPER_PLATFORM=linux \
+    DISK_REAPER_STATE_DIR="$T/state-norepo" SYSTEMD_UNIT_DIR="$T/units-norepo" \
+    SYSTEMCTL="$T/bin/systemctl" SYSTEMCTL_CALLS="$T/systemctl.log" bash "$INST" --status 2>&1)"; RC=$?
+assert_contains "$OUT" "repos=<none> (the installed job scans no repo" \
+    "T10 an installed job with an EMPTY repo list is described as installed, not as 'not installed'"
+assert_absent "$OUT" "not installed — this is what a fresh install WOULD scan" \
+    "T10 and does not claim the job is missing"
+# The stamp is an optimisation, never the install: an unwritable state dir must NOT fail a job that was
+# installed, enabled and read back — that falsely told setup.sh "this Mac has NO schedule" (#2048 review).
+ROSTATE="$T/state-ro"; mkdir -p "$ROSTATE"; chmod 500 "$ROSTATE"
+OUT="$(HOME="$home_lin" DISK_REAPER="$PASSFILE" DISK_REAPER_REPOS="$REPO" DISK_REAPER_PLATFORM=linux \
+    DISK_REAPER_STATE_DIR="$ROSTATE/nested" SYSTEMD_UNIT_DIR="$T/units-rostate" \
+    SYSTEMCTL="$T/bin/systemctl" SYSTEMCTL_CALLS="$T/systemctl.log" bash "$INST" --install 2>&1)"; RC=$?
+chmod 700 "$ROSTATE"
+assert_eq "$RC" "0" "T10 an UNWRITABLE state dir does not fail an install that succeeded"
+assert_contains "$OUT" "could not be written" "T10 and the degradation is named out loud"
+assert_file "$T/units-rostate/eldato-disk-reaper.timer" "T10 while the timer really was installed"
+
+inst_lin --install >/dev/null 2>&1
+echo "── T11. both systemd targets, including the two arms no test could reach ──"
+# (a) the SYSTEM unit with `SUDO=""` — the "already root / container" arm. The system unit dir is a
+# seam now, so this branch is executable without real sudo writing to /etc/systemd/system.
+SYS="$T/etc-units"; : >"$T/systemctl.log"
+OUT="$(HOME="$home_lin" DISK_REAPER="$PASSFILE" DISK_REAPER_REPOS="$REPO" DISK_REAPER_PLATFORM=linux \
+    DISK_REAPER_STATE_DIR="$T/state-sys" SUDO= SYSTEMD_SYSTEM_DIR="$SYS" \
+    SYSTEMCTL="$T/bin/systemctl" SYSTEMCTL_CALLS="$T/systemctl.log" bash "$INST" --install 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T11 the SYSTEM target installs (SUDO empty = already root)"
+assert_contains "$OUT" "target=system" "T11 and reports the system target"
+assert_file "$SYS/eldato-disk-reaper.service" "T11 the unit landed in the SYSTEM dir"
+assert_contains "$(cat "$SYS/eldato-disk-reaper.service")" "User=" \
+    "T11 a SYSTEM unit keeps User= (it does not run as root)"
+# (b) the USER unit: no sudo, but a working user manager. `User=` MUST be dropped (systemd rejects it in
+# a user unit) and every call must go through `systemctl --user`.
+OUT="$(HOME="$home_lin" DISK_REAPER="$PASSFILE" DISK_REAPER_REPOS="$REPO" DISK_REAPER_PLATFORM=linux \
+    DISK_REAPER_STATE_DIR="$T/state-usr" SUDO=false SYSTEMCTL="$T/bin/systemctl" \
+    SYSTEMCTL_USER="$T/bin/systemctl --user" SYSTEMCTL_CALLS="$T/systemctl.log" \
+    bash "$INST" --install 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T11 the USER target installs when there is no sudo but a user manager"
+assert_contains "$OUT" "target=user" "T11 and reports the user target"
+USR="$home_lin/.config/systemd/user"
+assert_file "$USR/eldato-disk-reaper.service" "T11 the unit landed in the USER dir"
+assert_absent "$(cat "$USR/eldato-disk-reaper.service")" "User=" \
+    "T11 a USER unit carries no User= (systemd rejects it)"
+assert_contains "$(cat "$T/systemctl.log")" "--user enable --now eldato-disk-reaper.timer" \
+    "T11 and it drives the USER manager, not the system one"
+# A host with neither an armable system unit nor a user manager is still a LOUD failure, not a skip.
+OUT="$(HOME="$home_lin" DISK_REAPER="$PASSFILE" DISK_REAPER_REPOS="$REPO" DISK_REAPER_PLATFORM=linux \
+    DISK_REAPER_STATE_DIR="$T/state-non" SUDO=false SYSTEMCTL="$T/bin/systemctl" \
+    SYSTEMCTL_USER="$T/bin/systemctl --user" SYSTEMCTL_USER_MANAGER=no \
+    SYSTEMCTL_CALLS="$T/systemctl.log" bash "$INST" --install 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T11 no system unit and no user manager exits 1"
+assert_contains "$OUT" "no scheduler available" "T11 and names the reason"
+inst_lin --install >/dev/null 2>&1
+
+echo "── T12. an owner's arming survives a NO-FLAG re-install (the setup.sh / sync.sh path) ──"
+# `pi-bootstrap/setup.sh` re-installs with `--install` and NO mode flag on every run, and `sync.sh`
+# runs setup.sh — so an arming that lived only in the invocation was silently reverted to report-only,
+# and the job rebootstrapped. The Mac could never STAY armed (#2048 review, P1).
+inst_lin --install --apply >/dev/null 2>&1
+assert_contains "$(cat "$SVC")" "disk-reaper.sh --apply" "T12 armed explicitly"
+OUT="$(inst_lin --install 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T12 a NO-FLAG re-install (exactly what setup.sh does) exits 0"
+assert_contains "$(cat "$SVC")" "disk-reaper.sh --apply" "T12 …and does NOT revert the owner's arming"
+assert_contains "$(inst_lin --status 2>&1)" "armed=apply" "T12 --status agrees the installed job is still armed"
+inst_mac --install --apply >/dev/null 2>&1
+inst_mac --install >/dev/null 2>&1
+assert_contains "$(cat "$PLIST")" "<string>--apply</string>" \
+    "T12 Darwin: the same rule (a no-flag re-install keeps the arming)"
+# An EXPLICIT flag still wins, and the REVERSAL is durable too.
+inst_lin --install --dry-run >/dev/null 2>&1
+inst_lin --install >/dev/null 2>&1
+assert_contains "$(cat "$SVC")" "disk-reaper.sh --dry-run" \
+    "T12 an explicit --dry-run is not undone by the next no-flag install"
+# …and a fresh install after --uninstall starts REPORT-ONLY again: the stamp is the only memory.
+inst_lin --uninstall >/dev/null 2>&1
+inst_lin --install >/dev/null 2>&1
+assert_contains "$(cat "$SVC")" "disk-reaper.sh --dry-run" \
+    "T12 after --uninstall a fresh install is report-only again (the stamp was the memory)"
 
 echo
 echo "──────────────────────────────────────────────────────────────────────"

@@ -99,6 +99,12 @@ printf '#!/bin/sh\nmode="${GH_STUB_MODE:-ok}"\ncase "$1 $2" in\n  "auth login") 
 # scheduler cannot be armed — the bring-up must refuse that cell rather than certify it.
 export SYSTEMD_UNIT_DIR="$T/systemd-units"
 export SYSTEMCTL="$STUB/systemctl"
+# #2048 — the installer behind this check serves BOTH platforms, so it detects one from `uname`. This
+# suite is a LINUX CELL simulation (systemd units, a systemctl shim, no launchd anywhere), so the
+# platform is PINNED: without it, a run on a Mac takes the launchd arm and correctly refuses a temp HOME
+# (#446) — the cell's own gate would then look red for being run on the wrong host. Same pin, same
+# reason, as scripts/disk-reaper.test.sh.
+export DISK_REAPER_PLATFORM=linux
 printf '#!/bin/sh\ncase "$*" in\n  *is-enabled*) echo enabled ;;\n  *is-active*) echo active ;;\n  *list-timers*) echo "Mon 2026-10-19 00:30:00 UTC 1h left Sun 2026-10-18 23:30:00 UTC 3h ago eldato-disk-reaper.timer eldato-disk-reaper.service" ;;\n  *show*) echo 0 ;;\n  *enable*|*daemon-reload*) [ "${SYSTEMCTL_STUB_MODE:-ok}" = fail ] && exit 1; exit 0 ;;\n  *) exit 0 ;;\nesac\n' > "$STUB/systemctl"
 chmod +x "$STUB"/*   # glob, not an explicit "$STUB/git" "$STUB/pi" … list: the main-worktree-guard's script
                      # walker reads the literal token "$STUB/git" + a following $VAR as a NON-STATIC `git`

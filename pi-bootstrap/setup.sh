@@ -812,26 +812,27 @@ fi
 # A box with no schedule is a FAIL reported here, not a silent absence: "scheduled" is the only state
 # in which an unattended reaper exists at all, and the alert-shaped failure (a disk at 97% with a
 # healthy controller) is exactly what #2032/#2048 exist to remove.
-reaper_real_home="$(dscl . -read "/Users/$(id -un)" NFSHomeDirectory 2>/dev/null | sed -n 's/^NFSHomeDirectory: //p' | head -1 || true)"
-if [[ "$(uname)" == "Darwin" ]] && [ -x "$INFRA_ROOT/scripts/install-disk-reaper-schedule.sh" ] \
-   && [ -z "$reaper_real_home" -o "$HOME" = "$reaper_real_home" ]; then
+# ⛔ THE DECISION IS THE INSTALLER'S, NOT THIS FILE'S (#2048 review). This block used to repeat the
+# installer's `dscl` probe to decide "is this the real home?", so one decision had two implementations
+# and neither could be tested where the other ran. The installer answers it once and says so with an
+# exit code: 0 installed · 3 DECLINED, this is not the box (a temp HOME — the bootstrap tests, a scratch
+# farm; launchd addresses the user domain BY UID, so a job registered from a throwaway HOME points at a
+# plist path that dies with it, #446) · anything else is a failure.
+if [[ "$(uname)" == "Darwin" ]] && [ -x "$INFRA_ROOT/scripts/install-disk-reaper-schedule.sh" ]; then
   echo ""
   echo "==> Disk reaper schedule"
-  if bash "$INFRA_ROOT/scripts/install-disk-reaper-schedule.sh" --install; then
-    echo "    disk reaper: scheduled (see: install-disk-reaper-schedule.sh --status)"
-  else
-    echo "    ⛔ WARNING: the disk reaper schedule could NOT be installed — this Mac is unscheduled and" >&2
-    echo "       will not be reaped. Diagnose with:" >&2
-    echo "         bash $INFRA_ROOT/scripts/install-disk-reaper-schedule.sh --status" >&2
-    launchd_reaper_failed=1
-  fi
-elif [[ "$(uname)" == "Darwin" ]] && [ -n "$reaper_real_home" ] && [ "$HOME" != "$reaper_real_home" ]; then
-  # A temp-HOME run (the bootstrap tests, a scratch farm) is not "the box": launchd addresses the user
-  # domain BY UID, so a job registered from a temp HOME points at a plist path that dies with it (#446).
-  # SKIPPED, and said out loud — not a silent absence, and not a failure of a run that was never about
-  # this machine.
-  echo ""
-  echo "==> Disk reaper schedule: SKIPPED (HOME=$HOME is not the real home $reaper_real_home, #446)"
+  reaper_rc=0
+  bash "$INFRA_ROOT/scripts/install-disk-reaper-schedule.sh" --install || reaper_rc=$?
+  case "$reaper_rc" in
+    0) echo "    disk reaper: scheduled (see: install-disk-reaper-schedule.sh --status)" ;;
+    3) # SKIPPED, and said out loud — not a silent absence, and not a failure of a run that was never
+       # about this machine.
+       echo "    disk reaper: SKIPPED (this run's HOME is not the real home, #446 — the installer declined)" ;;
+    *) echo "    ⛔ WARNING: the disk reaper schedule could NOT be installed (rc=$reaper_rc) — this Mac is" >&2
+       echo "       unscheduled and will not be reaped. Diagnose with:" >&2
+       echo "         bash $INFRA_ROOT/scripts/install-disk-reaper-schedule.sh --status" >&2
+       launchd_reaper_failed=1 ;;
+  esac
 fi
 
 echo ""

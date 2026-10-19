@@ -2017,6 +2017,35 @@ run_setup
 check_content_matches "$DEST/extensions" "run6"
 check_fix_markers "$DEST/extensions" "run6"
 
+# --- #2048 indicator (c): an UNSCHEDULED Mac must FAIL setup, never report done ---------------
+# The ordinary runs above cannot reach this branch: the installer's temp-HOME guard declines (rc=3) before
+# it ever installs (#446), which is the correct production behaviour and exactly why the branch was
+# untested. This run produces a REAL install failure hermetically — `$DISK_REAPER` pointed at a missing
+# file is the installer's own "refusing to install a job that points at a DIFFERENT copy" refusal, which
+# is raised BEFORE any launchd work — so the temp-HOME guard stays in force for every job on this box and
+# nothing (the other installer included) may reach the real GUI domain.
+if [[ "$(uname)" == "Darwin" ]]; then
+  echo "---- reaper-failure probe: setup.sh whose schedule cannot be installed ----" >> "$RUNS_LOG"
+  rc=0
+  DISK_REAPER="$TMP/pass-does-not-exist.sh" \
+    bash "$CLONE/pi-bootstrap/setup.sh" >> "$RUNS_LOG" 2>&1 || rc=$?
+  if [ "$rc" -eq 1 ]; then
+    echo "ok: an UNSCHEDULED Mac FAILS setup (rc=1), instead of reporting done over a box that is never reaped"
+  else
+    fail "setup.sh returned $rc over an un-installable disk-reaper schedule (expected 1)"
+  fi
+  if grep -q 'NO disk-reaper schedule' "$RUNS_LOG" && grep -q 'could NOT be installed' "$RUNS_LOG"; then
+    echo "ok: and it names the unscheduled state, with the command that diagnoses it"
+  else
+    fail "setup.sh did not name the unscheduled state after a failed schedule install"
+  fi
+  if grep -q 'disk reaper: SKIPPED (this run.s HOME is not the real home' "$RUNS_LOG"; then
+    echo "ok: a temp-HOME run is SKIPPED out loud (the installer declined, rc=3) — never a silent absence"
+  else
+    fail "no 'SKIPPED (…not the real home)' line: the decline is not surfaced by setup.sh"
+  fi
+fi
+
 # --- done -----------------------------------------------------------------
 # #446: every setup.sh run happened under the temp HOME; the launchctl shim
 # must be SILENT (no call escaped to any launchctl) and the installer's
@@ -2032,11 +2061,26 @@ if [[ "$(uname)" == "Darwin" ]]; then
   else
     fail "no setup.sh runs recorded — cannot verify launchctl isolation"
   fi
-  guard_hits="$(grep -c 'refusing to manage launchd jobs' "$RUNS_LOG" || true)"
-  if [ "$guard_hits" -eq "$setup_runs" ] && [ "$setup_runs" -ge 1 ]; then
-    echo "ok: temp-HOME guard fired on all $setup_runs runs"
+  # ⛔ PER INSTALLER, PER RUN (#2048 review). TWO installers manage launchd (install-launchd.sh and the
+  # cross-platform schedule installer), so a single global count lets one guard go SILENT while the other
+  # keeps the number up — which is exactly what a `-ge` floor did. Each run's own log section must show
+  # BOTH: install-launchd's refusal AND the schedule decision (SKIPPED on a temp HOME, or the install
+  # failure the negative probe is about). The guard probe's section is not one of these runs.
+  missing="$(awk '
+      /^---- / {
+          if (tracked && sec != "" && (!il || !sc)) print sec
+          sec = $0; il = 0; sc = 0
+          tracked = ($0 ~ /^---- (setup\.sh run|reaper-failure probe)/)
+          next
+      }
+      /see scripts\/install-launchd\.test\.sh/ { il = 1 }
+      /disk reaper:|the disk reaper/            { sc = 1 }
+      END { if (tracked && sec != "" && (!il || !sc)) print sec }
+  ' "$RUNS_LOG")"
+  if [ -z "$missing" ] && [ "$setup_runs" -ge 1 ]; then
+    echo "ok: EVERY run saw BOTH launchd-managing installers answer (refusal + schedule decision), across $setup_runs runs"
   else
-    fail "temp-HOME guard fired $guard_hits/$setup_runs runs (expected every run)"
+    fail "a run let one installer answer alone — sections missing a decision: $(printf '%s' "$missing" | head -3 | tr '\n' ' ')"
   fi
 else
   echo "ok: launchctl-isolation assertions skipped (non-Darwin)"
