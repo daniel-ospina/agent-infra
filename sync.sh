@@ -78,14 +78,12 @@ echo "==> refreshing pi config"
 # a sync that ends "✅" over a failed setup.sh is the same false PASS one layer up.
 setup_rc=0
 ./pi-bootstrap/setup.sh || setup_rc=$?
+# ⛔ ANY non-zero from setup.sh is a FAILURE here. There is no "declined" to exempt: setup.sh maps the
+# installer's rc=3 (not this box, #446) to a SKIPPED line and exits 0 itself, so a non-zero reaching
+# this line is always a real problem — and the rc=3 arm that used to sit here could only ever have
+# masked an accidental 3 as a green sync (#2048 review).
 if [ "$setup_rc" -ne 0 ]; then
-  # rc 3 is the installer's DECLINE ("this is not the box", #446) bubbled up through setup.sh; that is
-  # not a failure of this machine. Anything else is.
-  if [ "$setup_rc" -eq 3 ]; then
-    echo "⚠️  setup.sh declined this run (rc=3 — not this box, #446); the guards below still run" >&2
-  else
-    echo "⚠️  setup.sh reported a failure (rc=$setup_rc, see above) — CONTINUING the sync so the guards below still run" >&2
-  fi
+  echo "⚠️  setup.sh reported a failure (rc=$setup_rc, see above) — CONTINUING the sync so the guards below still run" >&2
 fi
 
 # #304 propagation trigger: setup.sh runs the installer on macOS, but
@@ -121,7 +119,7 @@ if [ -x ./scripts/check-pi-config-extensions.sh ]; then
   bash ./scripts/check-pi-config-extensions.sh
 fi
 
-if [ "$setup_rc" -ne 0 ] && [ "$setup_rc" -ne 3 ]; then
+if [ "$setup_rc" -ne 0 ]; then
   echo "⛔ sync finished, but setup.sh FAILED (rc=$setup_rc) — this machine is not fully configured; see above" >&2
   exit 1
 fi

@@ -743,10 +743,14 @@ fleet_row_pr_doctor() {
 # The reapers, one row each — a group row would hide which of them is dead, and their schedules
 # differ by two orders of magnitude (1h … 24h), so a single freshness bound would be a lie.
 # The OWN LOG each reaper writes, cited from the script that opens it — never inferred:
-#   pi-reap-worktrees.sh:190            REAP_WT_LOG=$STATE_DIR/pi-reap-worktrees.log
+#   disk-reaper.sh:121                   DISK_REAPER_LOG=${DISK_REAPER_LOG:-$STATE_DIR/disk-reaper.log}
 #   cleanup-stale-branches.sh:2411      ~/.pi/agent/state/cleanup-stale-branches.log
 #   pi-reap-idle.sh (session reaper)    ~/.pi/agent/state/pi-reap-idle.log
 #   fleet/lane_liveness.py              ~/.pi/agent/state/lane-liveness.log
+# ⛔ The consolidated pass replaced the per-class worktree row (#2048): its log is the PASS's own
+# record, so the citation above had to move with the row — leaving the retired job's log here would
+# hand the next editor of this row nothing to check the new path against, which is the
+# infer-it-and-get-it-wrong path this comment exists to prevent.
 # A missing file is LATE, not OK: the component promises to write it.
 fleet_row_reaper() { # <label> <own-log-name> <script-path>
   local label="${1:?}"

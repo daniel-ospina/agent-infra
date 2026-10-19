@@ -98,7 +98,10 @@ case "$*" in
   *list-timers*) echo "Mon 2026-10-19 00:30:00 UTC 1h left Sun 2026-10-18 23:30:00 UTC 3h ago eldato-disk-reaper.timer eldato-disk-reaper.service" ;;
   *show-environment*) [ "${SYSTEMCTL_USER_MANAGER:-yes}" = yes ] || exit 1 ;;
   *show*) echo "${FAKE_EXEC_STATUS:-0}" ;;
-  cat\ *) f="${SYSTEMCTL_UNITS:-}/$(printf '%s' "$*" | sed 's/^cat //')"
+  # `*cat *`, not `cat *`: the user-manager SC is a MULTI-WORD command (`systemctl --user`), so the
+  # verb is not at the start of "$*". A start-anchored arm answered NOTHING for `--user cat <unit>`,
+  # which read as "already gone" — the shim was hiding the very question the read-back asks.
+  *cat\ *) f="${SYSTEMCTL_UNITS:-}/$(printf '%s' "$*" | sed 's/^.*cat //')"
            [ -f "$f" ] || exit 1; cat "$f" ;;
 esac
 exit 0
@@ -438,7 +441,68 @@ inst_mac --install >/dev/null 2>&1
 OUT="$(LAUNCHCTL_BOOTOUT_IGNORE=1 inst_mac --uninstall 2>&1)"; RC=$?
 assert_eq "$RC" "1" "T8 a bootout that did NOT take exits 1 (the job would come back at login)"
 assert_contains "$OUT" "INCOMPLETE" "T8 and names it"
+# ⛔ …AND A PROBE FLIP BETWEEN INSTALL AND UNINSTALL IS THE SAME FALSE PASS (#2048 review, P2). The
+# install target is RE-DERIVED on every run from the sudo probe and the user-manager answer, so a unit
+# installed as root and uninstalled by a sudo-less user (or the reverse) used to be removed from — and
+# read back in — a directory the install never wrote, printing "uninstalled" while the real unit stayed
+# ENABLED and kept deleting hourly. The stamp now records where the install actually went.
+SYS_DIR="$T/sys-units"; mkdir -p "$SYS_DIR"
+OUT="$(HOME="$home_lin" DISK_REAPER="$PASSFILE" DISK_REAPER_REPOS="$REPO" DISK_REAPER_PLATFORM=linux \
+    DISK_REAPER_STATE_DIR="$T/state-flip" SYSTEMD_SYSTEM_DIR="$SYS_DIR" SUDO="" \
+    SYSTEMCTL="$T/bin/systemctl" SYSTEMCTL_CALLS="$T/systemctl.log" bash "$INST" --install 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T8b installed into the SYSTEM dir (sudo available at install time)"
+assert_file "$SYS_DIR/eldato-disk-reaper.service" "T8b the unit really is in the system dir"
+# Now flip the probe: sudo answers NOTHING and a user manager answers instead, so `--uninstall` derives
+# the user dir. The recorded location must win.
+NO_SUDO="$T/bin/no-sudo"; printf '#!/bin/bash\nexit 1\n' >"$NO_SUDO"; chmod +x "$NO_SUDO"
+OUT="$(HOME="$home_lin" DISK_REAPER="$PASSFILE" DISK_REAPER_REPOS="$REPO" DISK_REAPER_PLATFORM=linux \
+    DISK_REAPER_STATE_DIR="$T/state-flip" SYSTEMD_SYSTEM_DIR="$SYS_DIR" SUDO="$NO_SUDO" \
+    SYSTEMCTL_USER="$T/bin/systemctl --user" SYSTEMCTL="$T/bin/systemctl" \
+    SYSTEMCTL_CALLS="$T/systemctl.log" bash "$INST" --uninstall 2>&1)"; RC=$?
+if [ -f "$SYS_DIR/eldato-disk-reaper.service" ] || [ -f "$SYS_DIR/eldato-disk-reaper.timer" ]; then
+    bad "T8b the recorded install dir was NOT removed (a probe flip left the unit behind)"
+    assert_eq "$RC" "1" "T8b …and the uninstall must NOT claim success over a surviving unit"
+else
+    ok "T8b the uninstall removed the unit from the RECORDED dir, not the re-derived one"
+    assert_eq "$RC" "0" "T8b …and exits 0 only because the unit is really gone"
+fi
+# The mirrored false NEGATIVE: `--status` must not call a scheduled box uninstalled because the probe
+# moved. Re-install to the system dir, then read status with the flipped probe.
+OUT="$(HOME="$home_lin" DISK_REAPER="$PASSFILE" DISK_REAPER_REPOS="$REPO" DISK_REAPER_PLATFORM=linux \
+    DISK_REAPER_STATE_DIR="$T/state-flip" SYSTEMD_SYSTEM_DIR="$SYS_DIR" SUDO="" \
+    SYSTEMCTL="$T/bin/systemctl" SYSTEMCTL_CALLS="$T/systemctl.log" bash "$INST" --install 2>&1)"
+OUT="$(HOME="$home_lin" DISK_REAPER="$PASSFILE" DISK_REAPER_REPOS="$REPO" DISK_REAPER_PLATFORM=linux \
+    DISK_REAPER_STATE_DIR="$T/state-flip" SYSTEMD_SYSTEM_DIR="$SYS_DIR" SUDO="$NO_SUDO" \
+    SYSTEMCTL_USER="$T/bin/systemctl --user" SYSTEMCTL="$T/bin/systemctl" \
+    SYSTEMCTL_CALLS="$T/systemctl.log" bash "$INST" --status 2>&1)"; RC=$?
+assert_contains "$OUT" "installed=yes" "T8b --status finds the job at the RECORDED location despite a probe flip"
+HOME="$home_lin" DISK_REAPER="$PASSFILE" DISK_REAPER_REPOS="$REPO" DISK_REAPER_PLATFORM=linux \
+    DISK_REAPER_STATE_DIR="$T/state-flip" SYSTEMD_SYSTEM_DIR="$SYS_DIR" SUDO="" \
+    SYSTEMCTL="$T/bin/systemctl" SYSTEMCTL_CALLS="$T/systemctl.log" bash "$INST" --uninstall >/dev/null 2>&1
 rm -rf "$T/launchctl.state"   # settle: the shim's loaded-state is global to this suite
+
+echo "── T8c. the TWO templates are TWO languages: XML entities for the plist, NONE for the unit ──"
+# systemd does not decode XML entities, so routing the unit through the plist escaper rendered a PATH
+# carrying `&` as `…/rd&amp;d` — a directory that does not exist, inside the scheduled job's PATH.
+AMP_DIR="$T/rd&d"; mkdir -p "$AMP_DIR"
+OUT="$(PATH="$T/bin:$AMP_DIR:$PATH" HOME="$home_lin" DISK_REAPER="$PASSFILE" DISK_REAPER_REPOS="$REPO" \
+    DISK_REAPER_PLATFORM=linux DISK_REAPER_STATE_DIR="$T/state-amp" SYSTEMD_UNIT_DIR="$T/units-amp" \
+    SYSTEMCTL="$T/bin/systemctl" SYSTEMCTL_CALLS="$T/systemctl.log" bash "$INST" --install 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T8c installs a unit while PATH carries an ampersand"
+assert_contains "$(cat "$T/units-amp/eldato-disk-reaper.service")" "$AMP_DIR" \
+    "T8c the systemd unit carries the RAW path (systemd does not decode entities)"
+assert_absent "$(cat "$T/units-amp/eldato-disk-reaper.service")" "&amp;" \
+    "T8c …and NOT an XML entity (a literal ampersand belongs in a unit as itself)"
+# The plist is XML: there the entity is REQUIRED, and the result must still parse.
+OUT="$(PATH="$T/bin:$AMP_DIR:$PATH" inst_mac --install 2>&1)"
+assert_contains "$(cat "$PLIST")" "&amp;" "T8c the launchd plist DOES escape the ampersand (XML)"
+if command -v plutil >/dev/null 2>&1; then
+    plutil -lint "$PLIST" >/dev/null 2>&1 && ok "T8c …and the plist still lints" || bad "T8c the plist must lint with an ampersand in PATH"
+else
+    python3 -c 'import plistlib,sys; plistlib.load(open(sys.argv[1],"rb"))' "$PLIST" >/dev/null 2>&1 \
+        && ok "T8c …and the plist still parses (python plistlib)" || bad "T8c the plist must parse with an ampersand in PATH"
+fi
+inst_mac --uninstall >/dev/null 2>&1
 
 echo "── T9. static pins: no deletion rule here, and no sysadm-only shortcut ──"
 # Every recursive delete must be of a MKTEMP dir this script created ($tmp/$tmpd), never a path it was

@@ -247,6 +247,7 @@ platforms, then prints that same record:
 platform=darwin|linux        scheduler=launchd|systemd     job=<label|unit>
 installed=yes|no             enabled=enabled|disabled      active=active|inactive
 armed=apply|dry-run          interval_seconds=3600         next_run=<...>|unknown
+armed_at=<iso8601>           armed_by=<user>@<host>
 last_exit=<n>|unknown        pass=</path/to/disk-reaper.sh>
 repos=<repo:repo>            runner=<binary> <launcher|pass>   pass_sha=<...>
 pass_drift=in-sync|CHANGED since install
@@ -255,7 +256,9 @@ pass_drift=in-sync|CHANGED since install
 pass_status_rc=0|3
 ```
 
-`armed=`, `repos=` and `runner=` are all read off the **installed artifact**, never off the invoking
+`armed=`, `armed_at=`/`armed_by=` (WHEN and BY WHOM the arming was decided — carried forward unchanged
+by a re-install, re-dated only by an explicit flag, so a sync cannot re-date the deletion decision),
+`repos=` and `runner=` are all read off the **installed artifact**, never off the invoking
 shell: `repos=` answers "which checkouts does the scheduled job scan?", which is a different question
 from "what did this shell export" — a Mac exporting only `$AGENT_INFRA_PATH` used to point the job at
 agent-infra while `resolve_python` handed it the tortoise interpreter, and the empty-repo refusal does
@@ -282,7 +285,7 @@ failed/stale/never, 2 usage.
 
 ## Tests
 
-`scripts/disk-reaper.test.sh` — 94 assertions, run by the `disk-reaper` shard of
+`scripts/disk-reaper.test.sh` — run by the `disk-reaper` shard of
 `run-bash-shards.sh`:
 
 | | |
@@ -300,7 +303,7 @@ failed/stale/never, 2 usage.
 | T14 | a host with neither binary still **classifies** (candidates found, rc=5) and names the fallback; a stub `timeout` on PATH is preferred, and then the report gains no provenance line (#2046) |
 | T15 | a missing `scripts/lib/bounded.sh`, or an unusable `TB_TIMEOUT_BIN`, is a **refusal at startup** (exit 3, no per-class line, no pass record) — never per-class `fail-closed` (#2046) |
 
-`scripts/install-disk-reaper-schedule.test.sh` — 189 assertions, its own `run-bash-shards.sh` shard —
+`scripts/install-disk-reaper-schedule.test.sh` — its own `run-bash-shards.sh` shard —
 owns the SCHEDULE (`disk-reaper.test.sh` owns the pass):
 
 | | |

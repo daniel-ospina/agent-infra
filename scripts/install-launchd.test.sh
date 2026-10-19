@@ -238,13 +238,70 @@ echo "── 1. Fresh-HOME simulation ──────────────
 # site and every bare capture that could abort the run before its Summary. (That also means a failing
 # install degrades to reported ❌ lines rather than one silent abort — which is how this file used to
 # fail, with no tally at all.)
+# ── the host state §1 must judge against (#2048 review, P2) ───────────────────────────────────
+# THREE host states are legitimate, and each has its OWN correct outcome — so the expectation is
+# derived from the host, never pinned:
+#   (a) no tortoise checkout visible                 -> nothing gated installs; the installer exits 0;
+#   (b) a checkout WITH a usable .venv/bin/python     -> both gated templates install; exits 0;
+#   (c) a checkout whose gated TARGET cannot resolve  -> the reachable gated templates install, the
+#       (a fresh clone before `uv sync`)                 broken one is REFUSED, and the installer exits
+#                                                        NON-ZERO naming the broken target.
+# The same three candidates install-launchd.sh:76-82 asks (the fixture's HOME is the fake one the run
+# used, so §13/§14's seeded checkouts cannot make this look resolved).
+GATED_VISIBLE1=0
+GATED_USABLE1=0
+for _cand in "$HOME1/Documents/GitHub/tortoise" "$(cd "$SCRIPT_DIR/.." && pwd)/../tortoise" "$HOME1/tortoise"; do
+    if [ -d "$_cand" ] && [ -d "$_cand/.git" ]; then
+        GATED_VISIBLE1=1
+        [ -x "$_cand/.venv/bin/python" ] && GATED_USABLE1=1
+        break
+    fi
+done
+# The EXPECTED gated install count, by resolvability: a gated template whose arguments name
+# {{TORTOISE_REPO}}/.venv/bin/python cannot install without that interpreter; one that names only
+# farmed scripts can. Derived from the templates, so a new gated job is classified automatically.
+GATED_EXPECTED1=0
+for _tpl in "$TEMPLATES"/*.plist; do
+    grep -q '{{TORTOISE_REPO}}' "$_tpl" || continue
+    if grep -q '\.venv/bin/python' "$_tpl"; then
+        [ "$GATED_USABLE1" -eq 1 ] && GATED_EXPECTED1=$((GATED_EXPECTED1 + 1))
+    else
+        GATED_EXPECTED1=$((GATED_EXPECTED1 + 1))
+    fi
+done
+# …but with NO visible checkout the installer skips EVERY gated template at resolution time, so nothing
+# gated can install however resolvable its arguments are.
+[ "$GATED_VISIBLE1" -eq 1 ] || GATED_EXPECTED1=0
+
+# INSTALL_RC_OK <rc> <label> — the installer's exit for THIS host. In state (c) (a checkout is visible
+# but its gated target cannot resolve) EVERY install run is expected to REFUSE, so asserting rc=0 there
+# would report a correct refusal as a suite regression — the failure #2048's review round 3 measured.
+install_rc_ok() { # <rc> <label>
+    if [ "$GATED_VISIBLE1" -eq 1 ] && [ "$GATED_USABLE1" -eq 0 ]; then
+        [ "$1" -ne 0 ] \
+            && ok "$2 — refused, as it must when a visible checkout's gated target cannot resolve (state c)" \
+            || bad "$2 — expected a refusal of the broken gated target, got rc=0"
+    else
+        assert_eq "$1" "0" "$2"
+    fi
+}
+
 set +e
-OUT="$(run_installer "$HOME1")"
+# 2>&1: a REFUSAL names its broken target on STDERR, and state (c)'s assertion needs to see it
+# (a stdout-only capture could never satisfy the "names the broken target" check).
+OUT="$(run_installer "$HOME1" 2>&1)"
 RC=$?
 set -e
 OUT1="$OUT"  # §1's own output. The all-shim PATH guard below reassigns $OUT, so a §1 assertion
              # that reads $OUT late in the section is reading a DIFFERENT run's log.
-assert_eq "$RC" "0" "fresh install exits 0"
+if [ "$GATED_VISIBLE1" -eq 1 ] && [ "$GATED_USABLE1" -eq 0 ]; then
+    # state (c): a gated target that cannot resolve MUST make the install fail loudly, naming it.
+    [ "$RC" -ne 0 ] && ok "fresh install exits NON-ZERO on a checkout whose gated target cannot resolve (state c)" \
+        || bad "a checkout with no .venv/bin/python should make the install refuse its broken target, got rc=0"
+    assert_contains "$OUT" "broken target" "…and names the broken target rather than installing a dead job"
+else
+    assert_eq "$RC" "0" "fresh install exits 0"
+fi
 assert_contains "$OUT" "corruption-canary: installed + loaded" "corruption-canary installed on fresh machine"
 assert_contains "$OUT" "provider-latency-tripwire: installed + loaded" "provider-latency-tripwire installed on fresh machine"
 assert_contains "$OUT" "fleet-cost-weekly: installed + loaded" "fleet-cost-weekly installed on fresh machine (#373)"
@@ -458,27 +515,15 @@ assert_eq "$GATED_TEMPLATES1" "2" "the {{TORTOISE_REPO}}-gated inventory is acco
 # So: a visible checkout that produced NOTHING is a regression ONLY when its interpreter is usable.
 # The three candidates are the same three install-launchd.sh:76-82 asks (the fixture's HOME is the fake
 # one the run used, so §13/§14's seeded checkouts cannot make this look resolved).
-GATED_VISIBLE1=0
-GATED_USABLE1=0
-for _cand in "$HOME1/Documents/GitHub/tortoise" "$(cd "$SCRIPT_DIR/.." && pwd)/../tortoise" "$HOME1/tortoise"; do
-    if [ -d "$_cand" ] && [ -d "$_cand/.git" ]; then
-        GATED_VISIBLE1=1
-        [ -x "$_cand/.venv/bin/python" ] && GATED_USABLE1=1
-        break
-    fi
-done
-if [ "$GATED_INSTALLED1" -eq 0 ] && [ "$GATED_VISIBLE1" -eq 0 ]; then
-    ok "no {{TORTOISE_REPO}}-gated job installed — this host resolves no tortoise checkout"
-elif [ "$GATED_INSTALLED1" -eq 0 ] && [ "$GATED_USABLE1" -eq 0 ]; then
-    ok "no {{TORTOISE_REPO}}-gated job installable — a tortoise checkout is visible but has no .venv/bin/python (pre-`uv sync`), so verify_targets refuses its target"
-elif [ "$GATED_INSTALLED1" -eq 0 ]; then
-    bad "a tortoise checkout with a usable .venv/bin/python is visible but NO {{TORTOISE_REPO}}-gated job installed — the resolution regressed"
-else
-    # A PARTIAL set is reachable, and the total alone would absorb it: with branch-reaper's target
-    # removed the installer still installs worktree-reaper, then exits non-zero at the end — so
-    # `9 + 1 == 10` matches the 10 bootstraps and only the RC assert fails the run. Name the broken
-    # invariant instead of relying on the exit code alone.
-    assert_eq "$GATED_INSTALLED1" "$GATED_TEMPLATES1" "every {{TORTOISE_REPO}}-gated template installed, or none did"
+# The claim is EQUALITY against what this host can actually resolve (never "all or none"): a partial
+# set is exactly right in state (c), and only a MISMATCH is a regression. The total alone would absorb
+# a wrong member — `8 + 1 == 9` matches whichever one installed — so the count is compared to the
+# derived expectation, not to a constant.
+assert_eq "$GATED_INSTALLED1" "$GATED_EXPECTED1" "gated installs == what this host can resolve (visible=$GATED_VISIBLE1 usable=$GATED_USABLE1 of $GATED_TEMPLATES1 gated templates)"
+if [ "$GATED_VISIBLE1" -eq 0 ]; then
+    ok "no tortoise checkout visible to the installer — no gated job is installable here"
+elif [ "$GATED_USABLE1" -eq 1 ] && [ "$GATED_INSTALLED1" -eq "$GATED_TEMPLATES1" ]; then
+    ok "a checkout WITH a usable .venv/bin/python installed every gated template (resolution works)"
 fi
 assert_eq "$BOOTSTRAP_COUNT1" "$((8 + GATED_INSTALLED1))" "fresh install bootstraps only active jobs (8 always-installable: canary + tripwire + fleet + pi-session-reaper + balance-watch + pi-task-session-prune + lane-liveness + ci-runner-gate, plus whichever {{TORTOISE_REPO}}-gated jobs this host resolves)"
 
@@ -488,7 +533,7 @@ set +e
 OUT="$(LOG="$LOG2" run_installer "$HOME2")"
 RC=$?
 set -e
-assert_eq "$RC" "0" "installer with seeded retired jobs exits 0"
+install_rc_ok "$RC" "installer with seeded retired jobs exits 0"
 assert_contains "$OUT" "com.eldato.hub-state-check: RETIRED (unloaded + removed)" "hub retired job unloaded + removed"
 assert_contains "$OUT" "com.eldato.skill-lint-oracle: RETIRED (unloaded + removed)" "oracle retired job unloaded + removed"
 # #2048 — the two per-class reaper labels the consolidated pass replaced. They must be BOOTED OUT and
@@ -504,7 +549,7 @@ set +e
 OUT="$(LOG="$LOG2" run_installer "$HOME2")"
 RC=$?
 set -e
-assert_eq "$RC" "0" "retirement is idempotent (second run exits 0)"
+install_rc_ok "$RC" "retirement is idempotent (second run exits 0)"
 assert_not_contains "$OUT" "RETIRED (unloaded + removed)" "no repeat retirement chatter"
 # A retired label that STILL has a template is a config error → loud + exit 1.
 # The `cp` is guarded: a renamed/removed template is a broken target, and under `set -e` a bare `cp`
@@ -555,7 +600,7 @@ set +e
 OUT="$(run_installer "$HOME1")"
 RC=$?
 set -e
-assert_eq "$RC" "0" "re-run exits 0"
+install_rc_ok "$RC" "re-run exits 0"
 assert_contains "$OUT" "provider-latency-tripwire: unchanged (skip)" "tripwire job skipped when identical"
 assert_contains "$OUT" "corruption-canary: unchanged (skip)" "canary job skipped when identical"
 BOOTSTRAP_COUNT2="$(grep -c 'launchctl bootstrap' "$LOG" || true)"  # grep -c exits 1 on ZERO matches; `set -e` would kill the run here
@@ -567,7 +612,7 @@ set +e
 OUT="$(run_installer "$HOME1")"
 RC=$?
 set -e
-assert_eq "$RC" "0" "change install exits 0"
+install_rc_ok "$RC" "change install exits 0"
 assert_contains "$OUT" "provider-latency-tripwire: installed + loaded" "tripwire reloaded on template change"
 assert_contains "$(cat "$TRIPWIRE_INSTALLED")" "3601" "new StartInterval applied"
 BOOTSTRAP_COUNT3="$(grep -c 'launchctl bootstrap' "$LOG" || true)"  # grep -c exits 1 on ZERO matches; `set -e` would kill the run here
@@ -618,7 +663,7 @@ OUT="$(HOME="$HOME2" PATH="$T/bin:$PATH" FAKE_LAUNCHCTL_LOG="$LOG" TEMPLATES_DIR
     bash "$INSTALLER" 2>&1)"
 RC=$?
 set -e
-assert_eq "$RC" "0" "placeholder skip exits 0 (non-swarm machine ok)"
+install_rc_ok "$RC" "placeholder skip exits 0 (non-swarm machine ok)"
 assert_contains "$OUT" "SKIP com.eldato.corruption-canary" "canary skipped without swarm root"
 assert_contains "$OUT" "provider-latency-tripwire: installed + loaded" "tripwire still installed without swarm"
 
@@ -688,7 +733,7 @@ set +e
 OUT="$(LOG="$LOG" run_installer "$HOME3" 2>&1)"
 RC=$?
 set -e
-assert_eq "$RC" "0" "override + shim → temp-HOME install proceeds (isolated)"
+install_rc_ok "$RC" "override + shim → temp-HOME install proceeds (isolated)"
 assert_contains "$OUT" "provider-latency-tripwire: installed + loaded" "override install works hermetically"
 
 echo "── 12. Template lint (plutil, when present) ──────────────────────"

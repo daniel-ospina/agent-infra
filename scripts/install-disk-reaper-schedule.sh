@@ -42,7 +42,8 @@
 # Mac-only carve-out that quietly stops applying when the pass moves.
 #
 # `--status` answers the same questions on both platforms in ONE vocabulary: `platform=`,
-# `scheduler=`, `job=`, `installed=`, `enabled=`, `active=`, `armed=`, `next_run=`, `interval_seconds=`,
+# `scheduler=`, `job=`, `installed=`, `enabled=`, `active=`, `armed=`, `armed_at=`, `armed_by=`,
+# `next_run=`, `interval_seconds=`,
 # `last_exit=`, `pass_drift=`, `repos=`, and then the pass record itself — the SAME file, written by the
 # SAME pass, so "what did it free and did it succeed" cannot drift between a cell and a laptop. `armed=`
 # is read from the INSTALLED artifact, never from the flags this invocation was given; `repos=` likewise
@@ -271,7 +272,15 @@ norm_path() {
 # it lands in. Two escapes, and the XML one is not optional: `&` is the entity introducer (an
 # unescaped one makes the plist malformed — measured in #1719, `plutil -lint` refused it) and `&`/`\`
 # are sed replacement metacharacters (a value carrying either is silently corrupted into the output).
-sed_repl() {
+# ⛔ TWO ESCAPERS, because the two templates are two languages (#2048 review, P3). XML entities are
+# NOT decoded by systemd, so routing the systemd unit through the XML escaper corrupted it: a PATH or
+# state dir carrying `&` rendered as `…/rd&amp;d`, i.e. a directory that does not exist, and a corrupted
+# `DISK_REAPER_REPOS` entry is a repo list that silently scans the wrong place. Each renderer takes the
+# escaper its target language needs.
+sed_repl_sed() { # sed replacement metacharacters only — for systemd units (plain text)
+    printf '%s' "$1" | sed -e 's/[&\\|]/\\&/g'
+}
+sed_repl() { # XML text node + sed replacement — for launchd plists
     printf '%s' "$1" \
         | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' \
         | sed -e 's/[&\\|]/\\&/g'
@@ -281,19 +290,21 @@ sed_repl() {
 # would install a job whose argument is the literal token, and the job would be inert while `--status`
 # called it scheduled.
 render() {
-    local tpl="$1" dest="$2"
-    sed -e "s|{{USER}}|$(sed_repl "$(id -un)")|g" \
-        -e "s|{{HOME}}|$(sed_repl "$HOME")|g" \
-        -e "s|{{PATH}}|$(sed_repl "$PATH")|g" \
-        -e "s|{{STATE_DIR}}|$(sed_repl "$STATE_DIR")|g" \
-        -e "s|{{REPOS}}|$(sed_repl "$REPOS")|g" \
-        -e "s|{{AGED_DAYS}}|$(sed_repl "$AGED_DAYS")|g" \
-        -e "s|{{INTERVAL}}|$(sed_repl "$INTERVAL_SECONDS")|g" \
-        -e "s|{{REAPER}}|$(sed_repl "$REAPER")|g" \
-        -e "s|{{MODE_FLAG}}|$(sed_repl "$MODE_FLAG")|g" \
-        -e "s|{{LABEL}}|$(sed_repl "$LABEL")|g" \
-        -e "s|{{PYTHON_BIN}}|$(sed_repl "${PYTHON_BIN:-}")|g" \
-        -e "s|{{LAUNCHER}}|$(sed_repl "${LAUNCHER:-}")|g" \
+    local tpl="$1" dest="$2" esc=sed_repl
+    # A plist is XML (entities required); a unit is plain text (entities would be literal garbage).
+    case "$tpl" in *.plist*) esc=sed_repl ;; *) esc=sed_repl_sed ;; esac
+    sed -e "s|{{USER}}|$($esc "$(id -un)")|g" \
+        -e "s|{{HOME}}|$($esc "$HOME")|g" \
+        -e "s|{{PATH}}|$($esc "$PATH")|g" \
+        -e "s|{{STATE_DIR}}|$($esc "$STATE_DIR")|g" \
+        -e "s|{{REPOS}}|$($esc "$REPOS")|g" \
+        -e "s|{{AGED_DAYS}}|$($esc "$AGED_DAYS")|g" \
+        -e "s|{{INTERVAL}}|$($esc "$INTERVAL_SECONDS")|g" \
+        -e "s|{{REAPER}}|$($esc "$REAPER")|g" \
+        -e "s|{{MODE_FLAG}}|$($esc "$MODE_FLAG")|g" \
+        -e "s|{{LABEL}}|$($esc "$LABEL")|g" \
+        -e "s|{{PYTHON_BIN}}|$($esc "${PYTHON_BIN:-}")|g" \
+        -e "s|{{LAUNCHER}}|$($esc "${LAUNCHER:-}")|g" \
         "$tpl" >"$dest" || return 1
     if grep -q '{{' "$dest"; then
         err "unresolved placeholder in $tpl — refusing to install a job whose argument is a literal token"
@@ -354,6 +365,13 @@ write_stamp() { # write_stamp <job>
         printf 'pass=%s\n' "$REAPER"
         printf 'pass_sha=%s\n' "$sha"
         printf 'installed_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        # ⛔ WHERE it was installed. `choose_systemd_target` re-derives the target on EVERY run from the
+        # sudo probe and the user-manager answer, so a box whose probe changed (installed as root, later
+        # uninstalled by a sudo-less user — or the reverse) made `--uninstall` remove from a directory the
+        # install never wrote and `--status` read `installed=no` for a scheduled box (#2048 review, P2).
+        # Recording the location turns both verbs into a READ of where the artifact actually went.
+        printf 'target=%s\n' "${INSTALLED_TARGET:-}"
+        printf 'dir=%s\n' "${INSTALLED_DIR:-}"
     } >"$tmp" 2>/dev/null && mv -f "$tmp" "$STAMP" 2>/dev/null \
         || { err "cannot write the schedule stamp $STAMP"; rm -f "$tmp" 2>/dev/null; return 1; }
     return 0
@@ -449,8 +467,25 @@ sd_install() {
     # schedule" about a Mac that IS scheduled, and (on a cell) send the bring-up hunting sudo for a state
     # dir problem (#2048 review). Degrade visibly instead: no stamp = no pass-SHA reload protection and a
     # no-flag re-install falls back to report-only.
+    INSTALLED_TARGET="$SD_TARGET"; INSTALLED_DIR="$UNIT_DIR"
     write_stamp "$UNIT_NAME.timer" \
         || warn "the schedule stamp $STAMP could not be written — the job IS installed and enabled. Two things follow from the missing stamp: every later install looks like a changed pass and reloads the timer, and a no-flag re-install (setup.sh/sync.sh) falls back to report-only"
+    return 0
+}
+
+# recorded_dir — the directory the INSTALL wrote its artifacts into, from the stamp; empty when the
+# stamp is absent (an older install, or after --uninstall). The verbs that must not lie use it: the
+# live `choose_systemd_target` re-derives from the sudo probe, so trusting only the probe is what made
+# `--uninstall` remove from a directory the install never used and still exit 0 (#2048 review, P2).
+recorded_dir() { stamp_field dir; }
+
+# dirs_to_consider <live-dir> — every directory that may hold this job: the one the install RECORDED
+# first, then the one this invocation derived. Both are checked, so a probe flip can neither hide an
+# installed unit nor make a removal look complete while the original is still on disk.
+dirs_to_consider() {
+    local live="${1:-}" rec; rec="$(recorded_dir)"
+    [ -n "$rec" ] && printf '%s\n' "$rec"
+    [ -n "$live" ] && [ "$live" != "$rec" ] && printf '%s\n' "$live"
     return 0
 }
 
@@ -524,7 +559,8 @@ sd_status() {
     # PRESENT means the installed file is there. When it is not readable (a sudo-installed unit on an
     # odd box) `systemctl cat` is the second opinion — it exits non-zero for an unknown unit, which is
     # what makes "installed=no" a real answer instead of a fallback that always succeeds.
-    if [ ! -f "$svc" ] && ! $SC cat "$UNIT_NAME.service" >/dev/null 2>&1; then
+    if [ ! -f "$svc" ] && ! { local _rd; _rd="$(recorded_dir)"; [ -n "$_rd" ] && [ -f "$_rd/$UNIT_NAME.service" ]; } \
+       && ! $SC cat "$UNIT_NAME.service" >/dev/null 2>&1; then
         say "installed=no"
         say "enabled=disabled"
         say "active=inactive"
@@ -564,24 +600,34 @@ sd_uninstall() {
         say "preview: would disable and remove $UNIT_NAME.service/.timer from $UNIT_DIR (nothing was changed)"
         return 0
     fi
+    local dirs=() d found=0
     choose_systemd_target || { err "no systemd scheduler available"; return 1; }
+    # EVERY directory that may hold it: the one the install RECORDED, and the one this run derived.
+    while IFS= read -r d; do [ -n "$d" ] && dirs+=("$d"); done < <(dirs_to_consider "$UNIT_DIR")
+    [ "${#dirs[@]}" -gt 0 ] || dirs=("$UNIT_DIR")
     $SC disable --now "$UNIT_NAME.timer" >/dev/null 2>&1 || true
-    if [ -n "${SYSTEMD_UNIT_DIR:-}" ] || [ "$SD_TARGET" = "user" ]; then
-        rm -f "$UNIT_DIR/$UNIT_NAME.service" "$UNIT_DIR/$UNIT_NAME.timer"
-    else
-        ${SUDO-sudo -n} rm -f "$UNIT_DIR/$UNIT_NAME.service" "$UNIT_DIR/$UNIT_NAME.timer"
-    fi
+    for d in "${dirs[@]}"; do
+        if [ -w "$d" ] || { [ -n "${SYSTEMD_UNIT_DIR:-}" ] || [ "$SD_TARGET" = "user" ]; }; then
+            rm -f "$d/$UNIT_NAME.service" "$d/$UNIT_NAME.timer"
+        else
+            ${SUDO-sudo -n} rm -f "$d/$UNIT_NAME.service" "$d/$UNIT_NAME.timer"
+        fi
+    done
     $SC daemon-reload >/dev/null 2>&1 || true
-    rm -f "$STAMP"
     # READ IT BACK. A denied `rm` (a sudo-less user over a root-owned unit) used to print "uninstalled"
     # and exit 0, and systemd reloads the surviving unit at the next boot — the removal is the claim, so
-    # the removal is what gets verified (#2048 review).
-    if [ -f "$UNIT_DIR/$UNIT_NAME.service" ] || [ -f "$UNIT_DIR/$UNIT_NAME.timer" ] \
-       || $SC cat "$UNIT_NAME.service" >/dev/null 2>&1; then
-        err "uninstall INCOMPLETE: $UNIT_NAME is still installed under $UNIT_DIR (and/or still known to systemd) — nothing is claimed beyond what was read back"
+    # the removal is what gets verified (#2048 review). The read-back covers EVERY candidate directory:
+    # a probe flip between install and uninstall used to check only the re-derived one, so a unit left
+    # enabled in the recorded directory was reported as removed while still deleting hourly.
+    for d in "${dirs[@]}"; do
+        [ -f "$d/$UNIT_NAME.service" ] || [ -f "$d/$UNIT_NAME.timer" ] && { found=1; err "uninstall INCOMPLETE: $UNIT_NAME is still installed under $d"; }
+    done
+    if [ "$found" -eq 1 ] || $SC cat "$UNIT_NAME.service" >/dev/null 2>&1; then
+        err "uninstall INCOMPLETE: $UNIT_NAME is still known to systemd — nothing is claimed beyond what was read back"
         return 1
     fi
-    say "uninstalled $UNIT_NAME from $UNIT_DIR"
+    rm -f "$STAMP"
+    say "uninstalled $UNIT_NAME from ${dirs[*]}"
     return 0
 }
 
@@ -680,6 +726,7 @@ ld_install() {
     say "  state:  $STATE_DIR/disk-reaper.status"
     # Same rule as systemd: the job is installed and loaded by now, so an unwritable stamp is a named
     # degradation, never a failure that mis-describes the machine (#2048 review).
+    INSTALLED_TARGET="launchd"; INSTALLED_DIR="$LD_DIR"
     write_stamp "$LABEL" \
         || warn "the schedule stamp $STAMP could not be written — the job IS installed and loaded. Two things follow from the missing stamp: every later install looks like a changed pass and rebootstraps the job, and a no-flag re-install (setup.sh/sync.sh) falls back to report-only"
     return 0
