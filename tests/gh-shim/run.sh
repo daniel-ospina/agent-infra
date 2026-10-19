@@ -854,6 +854,119 @@ grep -q 'Resource not accessible' "$TMP/gate-403-err" \
   && pass "  …and gh's own message still reaches the caller" \
   || fail "  …but the real error text was lost"
 
+# (h) A RATE-LIMITED **MUTATION** IS RETRIED AFTER BACKOFF, NOT TERMINAL (#1910).
+#     The measured incident (issue #1910, PR #1934) failed at the MUTATION — `gh pr merge` —
+#     with `GraphQL: API rate limit already exceeded`, and the rail surfaced that as a
+#     terminal `merge_unreadable` / `head_unreadable`. The rail's refusal now says a
+#     rate-limited call is RETRYABLE (`tests/admin-merge` §13h); THIS is the mechanism that
+#     makes that true — `run_paced` retries EVERY paced call on a rate-limit refusal,
+#     mutations included, while a permissions 403 is still never retried — arm (g).
+#     ⛔ PINNED AT THE MUTATION, not at a read: a change that restricted retries to reads
+#     would leave (c)/(d)/(g) green and turn a rate-limited merge back into a terminal
+#     failure, which is the exact shape the incident cost.
+GDIR="$(gate_dir mutretry)"; GCOUNT="$TMP/gate-mut-count"; GTIMES="$TMP/gate-mut-times"
+GARGV="$TMP/gate-mut-argv"
+rm -f "$GCOUNT"; : > "$GTIMES"; : > "$GARGV"
+GREAL="$TMP/gate-real-mut"
+cat > "$GREAL" <<'GHEOF'
+#!/usr/bin/env bash
+n=$(cat "$GCOUNT" 2>/dev/null || echo 0); n=$(( n + 1 )); printf '%s' "$n" > "$GCOUNT"
+printf '%s\n' "$*" >> "$GARGV"
+date +%s >> "$GTIMES"
+if [ "$n" -eq 1 ]; then
+  echo "GraphQL: API rate limit already exceeded for user ID 81560491. (retry-after: 1)" >&2
+  exit 1
+fi
+printf 'merged\n'
+exit 0
+GHEOF
+chmod +x "$GREAL"
+AGENT_GH_REAL="$GREAL" AGENT_GH_GATE_DIR="$GDIR" AGENT_GH_GATE_INTERVAL_MS=0 \
+  GCOUNT="$GCOUNT" GTIMES="$GTIMES" GARGV="$GARGV" \
+  bash "$SHIM" pr merge 123 --squash >"$TMP/gate-mut-out" 2>"$TMP/gate-mut-err"; rc=$?
+m1=$(sed -n '1p' "$GTIMES"); m2=$(sed -n '2p' "$GTIMES")
+if [ "$rc" -eq 0 ] && [ "$(cat "$GCOUNT" 2>/dev/null || echo 0)" -eq 2 ] && [ -n "$m2" ] \
+   && [ $(( m2 - m1 )) -ge 1 ]; then
+  pass "a rate-limited MERGE MUTATION is retried after backoff (${m1}→${m2}), then succeeds"
+else
+  fail "a rate-limited mutation was treated as TERMINAL (rc=$rc attempts=$(cat "$GCOUNT" 2>/dev/null || echo 0))"
+fi
+[ "$(wc -l < "$GARGV")" -eq 2 ] && [ "$(sort -u "$GARGV" | wc -l)" -eq 1 ] \
+  && pass "  …and the retry re-sends the ORIGINAL argv unchanged (2 attempts, one argv)" \
+  || fail "  …but the calls were not one argv sent twice: $(wc -l < "$GARGV") attempt(s) / $(sort -u "$GARGV" | wc -l) distinct argv: $(tr '\n' '|' < "$GARGV")"
+grep -q 'merged' "$TMP/gate-mut-out" \
+  && pass "  …and the retried attempt's stdout is what the caller sees" \
+  || fail "  …but the retried attempt's stdout was lost: $(cat "$TMP/gate-mut-out")"
+grep -q 'GitHub refused this call (rate limit)' "$TMP/gate-mut-err" \
+  && pass "  …and the code-named gate-note announces the wait it will take" \
+  || fail "  …but nothing announced the retry window: $(head -2 "$TMP/gate-mut-err" | tr '\n' ' ')"
+
+# ── 14. THE WRAPPER RULE: SKIP EVERY SHIM, NEVER ONLY $SELF (#1988 ↔ #1910) ──
+# `scripts/orchestrator-harness/gh-rest/gh` and `gh-limit/gh` are harness gh layers of their
+# own, and each resolves the next `gh` on PATH. MEASURED on #1988: two shims that each skip
+# ONLY themselves resolve to EACH OTHER — 1,700 processes in 6 s, ending in
+# `fork: Resource temporarily unavailable`. #1988 closed that by carrying a sentinel line
+# (`harness-gh-shim-marker`) and refusing any candidate that carries it.
+#
+# This shim is the OUTERMOST layer in a harness session (the review-enforcer puts it first),
+# so the rule it must obey is: skip ANY candidate that is a shim — its own path THROUGH
+# SYMLINKS (`-ef`, §10(a)) and the sentinel-marked harness layers — never only `$SELF_DIR`.
+# If that regressed, this shim would EXEC the harness layer, which resolves back here, and
+# the fleet would fork-loop. A hang is not a status, so the arms are bounded in time.
+echo "== 14. the resolver skips EVERY shim, never only \$SELF (#1988) =="
+
+# A fake `gh-limit/gh` carrying #1988's sentinel. It records that it RAN, on disk, so the
+# assertion is a fact about a file rather than about text that a later arm could emit.
+harness_layer_at() {  # <dir> <did-run-file>
+  mkdir -p "$1"
+  cat > "$1/gh" <<GHEOF
+#!/usr/bin/env bash
+# harness-gh-shim-marker — #1988's identity line (see gh-limit.py); the argv shim must skip it.
+printf 'HARNESS-LAYER-RAN\n'
+: > "$2"
+exit 0
+GHEOF
+  chmod +x "$1/gh"
+}
+
+# (a) a sentinel-marked harness layer sits BETWEEN this shim and the real gh.
+HRAN="$TMP/harness-layer-ran-14a"
+rm -f "$HRAN"
+harness_layer_at "$TMP/gh-limit-14a" "$HRAN"
+out="$( cd "$TMP" && env -u AGENT_GH_REAL -u SCEN \
+  PATH="$TMP/neutral:$TMP/gh-limit-14a:$TMP/bin:/usr/bin:/bin" \
+  bash "$TMP/neutral/gh" pr view 1 2>&1 &
+  p=$!
+  for _ in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$p" 2>/dev/null || break; sleep 0.5; done
+  if kill -0 "$p" 2>/dev/null; then kill -9 "$p" 2>/dev/null; printf 'HUNG'; fi )"
+case "$out" in
+  *HUNG*) fail "with a harness layer on PATH the shim HUNG — the two wrappers resolve into each other" ;;
+  *HARNESS-LAYER-RAN*) fail "the shim EXEC'd the harness gh layer (#1988) — that layer resolves back here, so the pair fork-loops" ;;
+  *REALGH-CALLED*) pass "a sentinel-marked harness layer on PATH is SKIPPED; the real gh runs" ;;
+  *) fail "with a harness layer on PATH the real gh never ran: $out" ;;
+esac
+[ -e "$HRAN" ] \
+  && fail "  …but the harness layer WAS executed (a side-effect file proves it ran, whatever the output looked like)" \
+  || pass "  …and the harness layer was never executed (no side-effect file)"
+
+# (b) THE RULE IS A SENTINEL, NOT A DIRECTORY NAME. A gh that merely looks like the harness
+#     layer but carries no marker is an ORDINARY gh and must be used — otherwise the skip
+#     over-blocks every wrapper on the box.
+mkdir -p "$TMP/plaingh"
+cat > "$TMP/plaingh/gh" <<'GHEOF'
+#!/usr/bin/env bash
+printf 'PLAIN-GH-RAN
+'
+exit 0
+GHEOF
+chmod +x "$TMP/plaingh/gh"
+out="$( cd "$TMP" && env -u AGENT_GH_REAL -u SCEN PATH="$TMP/plaingh:/usr/bin:/bin" \
+  bash "$SHIM" pr view 1 2>&1 )"
+case "$out" in
+  *PLAIN-GH-RAN*) pass "an UNMARKED gh earlier on PATH is used (the skip is a sentinel, not a name)" ;;
+  *) fail "an unmarked gh earlier on PATH was not used: $out" ;;
+esac
+
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks gh-shim test(s) failed"
   exit 1
