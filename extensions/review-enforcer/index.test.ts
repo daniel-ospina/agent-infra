@@ -80,6 +80,12 @@ import {
   resolveAdminMergeEvidenceVerifier,
   type ReviewRecord,
 } from "./index.js";
+// The wording itself is pinned by its own drift suite (extensions/shared/reviewer-preflight.test.ts);
+// this file asserts the paths/route the DISCLOSURE hands a lane, so it reads the same constants.
+import {
+  REVIEWER_PREFLIGHT_RECORD_CMD,
+  REVIEWER_PREFLIGHT_RAIL_CMD,
+} from "../shared/reviewer-preflight.js";
 // #966: the shared parser module — the drift-pin below asserts this extension's
 // exported helpers ARE these functions (one copy, not a lookalike).
 import * as sharedParse from "../shared/git-command-parse.js";
@@ -6202,7 +6208,7 @@ testAsync("#2148: `git commit` is NOT the early moment — the notice waits for 
   });
 });
 
-testAsync("#2148: the RAIL still refuses without an attestation, and the refusal NAMES the command", async () => {
+testAsync("#2148: the merge gate still refuses without an attestation, and names a command that WORKS", async () => {
   await withTempHome(async () => {
     const prevMode = process.env.PI_MODE;
     process.env.PI_MODE = "print";
@@ -6237,7 +6243,26 @@ testAsync("#2148: the RAIL still refuses without an attestation, and the refusal
       // The same requirement must also be on the dispatch-count block: a lane that satisfies the
       // dispatch gate and is then refused by the merge gate has wasted the trip the message exists
       // to prevent.
-      ok(BLOCK_MESSAGE.includes("scripts/record-review.sh"), "the 0-dispatch block names the record command too");
+      // ⛔ A PATH THAT CANNOT BE REACHED IS NOT A NAMED COMMAND (fresh review, P1). This line is
+      // printed inside a lane whose cwd is a CONTENT repo, which has no `scripts/record-review.sh`;
+      // the production copy is farmed into `~/.pi/agent/scripts/`, where `merge-one.sh` runs it from.
+      // Asserted as an INVARIANT so a path move does not need a test edit — but a repo-relative
+      // regression goes red.
+      const cmdToken = REVIEWER_PREFLIGHT_RECORD_CMD.split(" ")[0] ?? "";
+      ok(
+        cmdToken.startsWith("~/") || cmdToken.startsWith("/"),
+        `the disclosed record script is home/absolute, never repo-relative: got "${cmdToken}"`,
+      );
+      ok(BLOCK_MESSAGE.includes("clean [owner/repo] --evidence comment:"), "the 0-dispatch block names the FULL clean invocation too");
+      ok(MICRO_BLOCK_MESSAGE.includes("clean-micro"), "…and micro's names its own verdict");
+      // The rail the disclosure NAMES is the rail the compliance gate RECOGNISES: the same basename,
+      // read through the extension's own substitution. If the disclosure ever names a different
+      // script, a lane follows a route the gate does not know and the rail is never enforced.
+      const railNamed = REVIEWER_PREFLIGHT_RAIL_CMD.replace("<PR>", String(pr));
+      ok(
+        withoutMandatedRailPath(railNamed) !== railNamed,
+        `the disclosed rail (${railNamed}) is the MANDATED rail the gate recognises`,
+      );
       ok(MICRO_BLOCK_MESSAGE.includes("clean-micro"), "…and micro's names its own verdict");
     } finally {
       _setRunGhOverride(null);
@@ -6292,10 +6317,14 @@ test("#2148: isPushOrPrCreateCommand — the early moment, and what is NOT it", 
   ok(isPushOrPrCreateCommand('git push -u origin "feat/x"'), "a push whose ARGUMENT is quoted still fires");
 });
 
-test("#2148: reviewerRoleFor — the harness's KIND decides the audience (the two roles disagree on purpose)", () => {
+test("#2148: reviewerRoleFor — the harness's KIND decides the audience (the roles disagree on purpose)", () => {
   equal(reviewerRoleFor({ KIND: "lane" }), "harness", "lane.sh's lane");
   equal(reviewerRoleFor({ KIND: "fixer" }), "harness", "fix-one.sh's fixer");
-  equal(reviewerRoleFor({ KIND: "reviewer" }), "harness", "merge-one.sh's reviewer session");
+  // ⛔ THE REVIEWER IS NOT A LANE (second fresh review, P2). merge-one.sh launches it with
+  // "Report only — do not fix code … Do NOT modify code, commit, or merge" while ALSO hatching it to
+  // write the main checkout; the harness role's "push your FINAL head" is advice for code it must
+  // not touch. Its own role says what it owns (the verdict comment) and forbids push/record/merge.
+  equal(reviewerRoleFor({ KIND: "reviewer" }), "reviewer", "merge-one.sh's reviewer session is its OWN audience");
   equal(reviewerRoleFor({ KIND: "LANE" }), "harness", "case-insensitive (the env is not normalised by the launcher)");
   // ⛔ `bg` is a harness worker too (nonblocking-dispatch.sh): nothing reviews its PR — the parent
   // does — so the self-role line would tell it to dispatch and to run the rail, the exact
@@ -6330,6 +6359,38 @@ testAsync("#2148: a harness worker is told the HARNESS role (never 'dispatch'/'r
       ok(injected?.message?.content?.includes("HARNESS reviewer"), "the injected message carries the same role");
       const pre = tempAuditLines().filter((l) => l.event === "reviewer_preflight");
       equal(pre[0].role, "harness", "the audit record says WHICH audience was told");
+    } finally {
+      if (prevKind === undefined) delete process.env.KIND; else process.env.KIND = prevKind;
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+    }
+  });
+});
+
+testAsync("#2148: merge-one.sh's REVIEWER is told what it owns — and NOT to push", async () => {
+  await withTempHome(async () => {
+    const prevMode = process.env.PI_MODE;
+    const prevKind = process.env.KIND;
+    process.env.PI_MODE = "print";
+    process.env.KIND = "reviewer"; // what merge-one.sh exports for the session it dispatches
+    try {
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      let injected: any = null;
+      const logged = await withCapturedConsole(async () => {
+        await fire("session_start");
+        injected = await fire("before_agent_start");
+      });
+      const disclosure = logged.filter((l) => l.includes(PREFLIGHT_MARK));
+      equal(disclosure.length, 1, "the reviewer is told once, up front");
+      ok(disclosure[0].includes("you ARE the harness reviewer"), "it is told WHAT IT IS");
+      ok(disclosure[0].includes("post the verdict as a PR comment"), "…and what it OWNS (the verdict comment)");
+      ok(
+        !disclosure[0].includes("push your FINAL head"),
+        "⛔ …never the harness role's push advice: merge-one.sh's prompt says 'Do NOT modify code, commit, or merge'",
+      );
+      ok(injected?.message?.content?.includes("do NOT push"), "the injected message forbids the push too");
+      const pre = tempAuditLines().filter((l) => l.event === "reviewer_preflight");
+      equal(pre[0].role, "reviewer", "the audit record says WHICH audience was told");
     } finally {
       if (prevKind === undefined) delete process.env.KIND; else process.env.KIND = prevKind;
       if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;

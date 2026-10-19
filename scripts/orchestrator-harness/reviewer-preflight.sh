@@ -43,7 +43,11 @@ REVIEWER_PREFLIGHT_DISPATCH_CMD="task(prompt='[REVIEW] review the diff of PR <PR
 # REFUSES to mint a FRESH `clean` record without it (exit 3) — naming the current head is not
 # evidence that a review happened. A disclosure naming the invocation without it hands the lane a
 # command that cannot work, discovered at the moment it tries to land.
-REVIEWER_PREFLIGHT_RECORD_CMD='scripts/record-review.sh <PR> <HEAD> clean [owner/repo] --evidence comment:<review-comment-id>'
+# ⛔ THE PATH IS THE HOME COPY, NOT A REPO-RELATIVE ONE (fresh review of #2148, P1): a lane's cwd is
+# a CONTENT repo with no `scripts/record-review.sh`; the production copy lives in
+# `~/.pi/agent/scripts/`, which is where `merge-one.sh` runs it from and where the commit-workflow
+# and code-review skills point ("`~/.pi/agent/scripts` is not on PATH").
+REVIEWER_PREFLIGHT_RECORD_CMD='~/.pi/agent/scripts/record-review.sh <PR> <HEAD> clean [owner/repo] --evidence comment:<review-comment-id>'
 REVIEWER_PREFLIGHT_TAG='[gate]'
 REVIEWER_PREFLIGHT_BRIEF_TEMPLATE='templates/LANE-BRIEF.md'
 REVIEWER_HEAD_BINDING='a record bound to an older head is stale and the rail refuses it, so record AFTER the last push'
@@ -63,7 +67,7 @@ reviewer_command_trail() { # dispatch/record/rail/artifact on one line
     "$REVIEWER_ARTIFACT_RULE"
 }
 
-# reviewer_preflight_line [self|harness] — ONE line, printed once, before any work starts.
+# reviewer_preflight_line [self|harness|reviewer] — ONE line, printed once, before any work starts.
 reviewer_preflight_line() {
   local role="${1:-self}"
   case "$role" in
@@ -80,8 +84,14 @@ reviewer_preflight_line() {
         "$REVIEWER_PREFLIGHT_TAG" "$REVIEWER_PREFLIGHT_REQUIREMENT" \
         "$REVIEWER_PREFLIGHT_RECORD_CMD" "$(reviewer_rail_cmd)"
       ;;
+    reviewer)
+      # merge-one.sh's reviewer session: it OWNS the verdict comment and must not touch the three
+      # things merge-one.sh owns (push / record / merge). Same wording as the TS REVIEWER_CLAUSE.
+      printf '%s #2148 preflight: you ARE the harness reviewer — post the verdict as a PR comment and report `CLEAN <comment-url>`; do NOT push, do NOT record and do NOT merge (merge-one.sh owns the record and the rail). For reference, the record merge-one.sh will mint: %s.\n' \
+        "$REVIEWER_PREFLIGHT_TAG" "$REVIEWER_PREFLIGHT_RECORD_CMD"
+      ;;
     *)
-      printf 'reviewer-preflight.sh: unknown role "%s" (expected self|harness)\n' "$role" >&2
+      printf 'reviewer-preflight.sh: unknown role "%s" (expected self|harness|reviewer)\n' "$role" >&2
       return 2
       ;;
   esac
@@ -141,11 +151,11 @@ BRIEF
 }
 
 # CLI, for tests and for a human who wants the exact text:
-#   bash reviewer-preflight.sh --line [self|harness] | --brief [self|harness]
+#   bash reviewer-preflight.sh --line [self|harness|reviewer] | --brief [self|harness]
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   case "${1:-}" in
     --line)  shift; reviewer_preflight_line "${1:-self}" ;;
     --brief) shift; reviewer_brief_section "${1:-self}" ;;
-    *) printf 'usage: %s --line|--brief [self|harness]\n' "$0" >&2; exit 2 ;;
+    *) printf 'usage: %s --line [self|harness|reviewer] | --brief [self|harness]\n' "$0" >&2; exit 2 ;;
   esac
 fi

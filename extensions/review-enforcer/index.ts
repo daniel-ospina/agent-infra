@@ -34,6 +34,7 @@ import {
   reviewerFirstPushNotice,
   REVIEWER_PREFLIGHT_RECORD_CMD,
 } from "../shared/reviewer-preflight.js";
+import type { ReviewerRole } from "../shared/reviewer-preflight.js";
 // Re-exported public surface (tests and external consumers import from
 // ./index.js) — the DEFINITION lives only in shared/.
 export {
@@ -393,15 +394,19 @@ export function isPushOrPrCreateCommand(command: string): boolean {
  */
 export function reviewerRoleFor(
   env: Record<string, string | undefined> = process.env,
-): "self" | "harness" {
+): ReviewerRole {
   const kind = String(env.KIND ?? "").toLowerCase();
   // ⛔ `bg` IS A HARNESS WORKER TOO (agent-infra#2148 review). `nonblocking-dispatch.sh` exports
   // `KIND=bg` for a background worker it launches itself, and its own note says nothing reviews that
   // worker's PR — the parent/chain does. Leaving it out told a bg worker to dispatch and to run the
   // rail, repeating the exact contradiction this function exists to prevent, for one more audience.
-  return kind === "lane" || kind === "fixer" || kind === "reviewer" || kind === "bg"
-    ? "harness"
-    : "self";
+  //
+  // ⛔ `reviewer` IS NOT THAT AUDIENCE EITHER (second fresh review, P2). `merge-one.sh` launches it
+  // with "Report only — do not fix code … Do NOT modify code, commit, or merge", so the harness
+  // line's "push your FINAL head" is advice for code it must not touch. It gets its own role, whose
+  // line names what it OWNS (the verdict comment) and the three things it must not do.
+  if (kind === "reviewer") return "reviewer";
+  return kind === "lane" || kind === "fixer" || kind === "bg" ? "harness" : "self";
 }
 
 /**
@@ -2039,7 +2044,7 @@ export function evaluateMergeGate(
           // #2148 review: `--evidence` is part of the `clean` invocation — `record-review.sh` refuses a
           // FRESH clean without it (tortoise#7391, exit 3). A refusal that names a command which then
           // exits 3 hands the lane a second dead end at the moment it tries to land.
-          "   → Standard/complex issue: run the code-review skill, then record-review.sh <PR> <head_sha> clean [owner/repo] --evidence comment:<review-comment-id>",
+          "   → Standard/complex issue: run the code-review skill, then ~/.pi/agent/scripts/record-review.sh <PR> <head_sha> clean [owner/repo] --evidence comment:<review-comment-id>",
           "   → The bypass flag does NOT unlock sub-agent merges (#285).",
         ]
       : [
@@ -2049,7 +2054,7 @@ export function evaluateMergeGate(
           "   →   record-review.sh <PR> <head_sha> clean-micro [owner/repo]",
           "   → Content-only diff (docs/ with a content extension, or a named root prose file — any tier, no code paths): record-review.sh <PR> <head_sha> clean-low [owner/repo]",
           "   → Standard/complex issue: run the code-review skill (Step 10 records clean on convergence), post its verdict as a PR comment, then",
-          "   →   record-review.sh <PR> <head_sha> clean [owner/repo] --evidence comment:<review-comment-id>",
+          "   →   ~/.pi/agent/scripts/record-review.sh <PR> <head_sha> clean [owner/repo] --evidence comment:<review-comment-id>",
           "   → Emergency: set AGENT_SKIP_REVIEW_GATE=1 (or ELDATO_SKIP_REVIEW_GATE=1) and restart to bypass all gates.",
         ];
     return {
@@ -2066,7 +2071,7 @@ export function evaluateMergeGate(
         `❌ Review record for PR #${pr} has verdict "${record.verdict}" — only ${ACCEPTED_VERDICTS.map((v) => `"${v}"`).join(", ")} unlocks a merge.`,
         "   → Micro issue (complexity:micro): re-record via the micro flow: record-review.sh <PR> <head_sha> clean-micro [owner/repo]",
         "   → Content-only diff (docs/ with a content extension, or a named root prose file — any tier): record-review.sh <PR> <head_sha> clean-low [owner/repo]",
-        "   → Standard/complex issue with any code path: run the code-review skill, post its verdict as a PR comment, then record-review.sh <PR> <head_sha> clean [owner/repo] --evidence comment:<review-comment-id>",
+        "   → Standard/complex issue with any code path: run the code-review skill, post its verdict as a PR comment, then ~/.pi/agent/scripts/record-review.sh <PR> <head_sha> clean [owner/repo] --evidence comment:<review-comment-id>",
       ].join("\n"),
     };
   }
@@ -2171,7 +2176,7 @@ export function evaluateMergeGate(
     // The shape has to be re-derived, not carried forward.
     const reRecordAdvice =
       record.verdict === "clean-low"
-        ? "   → The branch moved — the certified diff no longer exists, so the shape must be re-derived: re-check whether the NEW head is still content-only, then re-record with the verdict named explicitly (record-review.sh <PR> <head_sha> clean-low [owner/repo]); if it is no longer content-only, run the code-review skill and record clean (record-review.sh <PR> <head_sha> clean [owner/repo] --evidence comment:<review-comment-id>)."
+        ? "   → The branch moved — the certified diff no longer exists, so the shape must be re-derived: re-check whether the NEW head is still content-only, then re-record with the verdict named explicitly (record-review.sh <PR> <head_sha> clean-low [owner/repo]); if it is no longer content-only, run the code-review skill and record clean (~/.pi/agent/scripts/record-review.sh <PR> <head_sha> clean [owner/repo] --evidence comment:<review-comment-id>)."
         : `   → The branch moved — re-review the new head, post its verdict as a PR comment, and re-record at the same verdict: record-review.sh <PR> <head_sha> ${record.verdict} [owner/repo] (a clean verdict also needs --evidence comment:<review-comment-id>; clean-low/clean-micro do not)`;
     return {
       status: "block",
@@ -3304,7 +3309,7 @@ export const MICRO_BLOCK_MESSAGE = [
   "   →   task(prompt='[REVIEW] docs-only change — verify claims/consistency against the docs diff; return NO ISSUES FOUND or list issues')",
   "   → Code sets satisfy the dispatch via VGATE: its [VGATE] verification dispatch counts as the required sub-agent dispatch. With VGATE disabled/bypassed, dispatch any lightweight task sub-agent — the gate counts any sub-agent dispatch (the `task` or `subagent` tool).",
   // #2148: micro's record command, so the refusal at the git op also names what the rail will read.
-  "   → Then record the attestation at the FINAL head (micro): scripts/record-review.sh <PR> <head_sha> clean-micro [owner/repo]",
+  "   → Then record the attestation at the FINAL head (micro): ~/.pi/agent/scripts/record-review.sh <PR> <head_sha> clean-micro [owner/repo]",
   "   → Emergency: set AGENT_SKIP_REVIEW_GATE=1 (or ELDATO_SKIP_REVIEW_GATE=1) and restart to bypass all gates.",
 ].join("\n");
 

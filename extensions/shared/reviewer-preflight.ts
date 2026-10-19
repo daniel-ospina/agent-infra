@@ -64,11 +64,22 @@ export const REVIEWER_PREFLIGHT_REQUIREMENT =
 export const REVIEWER_PREFLIGHT_TAG = "[gate]";
 
 /**
- * Who mints the attestation for this session.
- *   self     the session lands its own PR through the rail
- *   harness  a harness worker (`KIND=lane|fixer|reviewer`); `merge-one.sh` runs the reviewer
+ * Who mints the attestation for this session — the audience the disclosure is addressed to.
+ *   self      the session lands its own PR through the rail: dispatch, record, rail
+ *   harness   a harness WORKER (`KIND=lane|fixer|bg`) that pushes code; `merge-one.sh` reviews and
+ *             mints the attestation, so the worker's duty is a stable final head and NO merge
+ *   reviewer  the harness REVIEWER itself (`KIND=reviewer`, dispatched by `merge-one.sh`). It posts
+ *             the verdict as a PR comment and reports `CLEAN <comment-url>`; it must not push, must
+ *             not record, must not merge — `merge-one.sh` owns all three.
+ *
+ * ⛔ THREE audiences, not two (fresh review of #2148, P2). A `reviewer` session is a harness worker
+ * by `KIND`, but the harness line's advice ("push your FINAL head, do NOT merge") is addressed to
+ * something that pushes CODE — and `merge-one.sh` launches the reviewer with "Report only — do not
+ * fix code … Do NOT modify code, commit, or merge." Told both, the reviewer is handed a
+ * contradiction of exactly the kind this role split exists to prevent, in a session that is also
+ * hatched to write the main checkout.
  */
-export type ReviewerRole = "self" | "harness";
+export type ReviewerRole = "self" | "harness" | "reviewer";
 
 /**
  * The commands, in the order a lane runs them.
@@ -82,8 +93,16 @@ export type ReviewerRole = "self" | "harness";
  */
 export const REVIEWER_PREFLIGHT_DISPATCH_CMD =
   "task(prompt='[REVIEW] review the diff of PR <PR> at <HEAD>; return NO ISSUES FOUND or list issues')";
+// ⛔ THE PATH IS THE HOME COPY, NOT A REPO-RELATIVE ONE (fresh review of #2148, P1). This line is
+// printed inside a lane whose cwd is a CONTENT repo (tortoise/eldato), which has no
+// `scripts/record-review.sh` — the production copy is farmed into `~/.pi/agent/scripts/`, which is
+// where `merge-one.sh` runs it from (`$HOME/.pi/agent/scripts/record-review.sh`) and where both the
+// commit-workflow and code-review skills tell lanes to look ("`~/.pi/agent/scripts` is not on
+// PATH"). A repo-relative path is correct ONLY in agent-infra's own checkout, so it hands every
+// other lane a "No such file or directory" at the moment it tries to land — the same class the
+// `--evidence` fix removed, one element over.
 export const REVIEWER_PREFLIGHT_RECORD_CMD =
-  "scripts/record-review.sh <PR> <HEAD> clean [owner/repo] --evidence comment:<review-comment-id>";
+  "~/.pi/agent/scripts/record-review.sh <PR> <HEAD> clean [owner/repo] --evidence comment:<review-comment-id>";
 export const REVIEWER_PREFLIGHT_RAIL_CMD = "scripts/admin-merge.sh <PR>";
 
 /** The brief template that a controller copies instead of improvising one (#2148 part 2). */
@@ -116,6 +135,11 @@ function commandTrail(): string {
 /** The harness role's clause — the LANE does not dispatch, and does not merge. */
 const HARNESS_CLAUSE = "the HARNESS reviewer (merge-one.sh) mints it";
 
+/** The reviewer's own clause: what it OWNS, and the three things it must not touch. */
+const REVIEWER_CLAUSE =
+  "you ARE the harness reviewer — post the verdict as a PR comment and report `CLEAN <comment-url>`; " +
+  "do NOT push, do NOT record and do NOT merge (merge-one.sh owns the record and the rail)";
+
 /**
  * The up-front disclosure: ONE line, printed once per session at startup.
  *
@@ -131,6 +155,12 @@ export function reviewerPreflightLine(
   const bypass = opts.bypassed
     ? " [review-gate bypass is set — dispatch enforcement is OFF in this session, but the rail STILL refuses without an attestation]"
     : "";
+  if (role === "reviewer") {
+    return (
+      `${REVIEWER_PREFLIGHT_TAG} #2148 preflight: ${REVIEWER_CLAUSE}. ` +
+      `For reference, the record merge-one.sh will mint: ${REVIEWER_PREFLIGHT_RECORD_CMD}.${bypass}`
+    );
+  }
   if (role === "harness") {
     return (
       `${REVIEWER_PREFLIGHT_TAG} #2148 preflight: ${REVIEWER_PREFLIGHT_REQUIREMENT} — ` +
@@ -156,6 +186,12 @@ export function reviewerFirstPushNotice(
   const bypass = opts.bypassed
     ? " [dispatch enforcement is bypassed here — the rail is not]"
     : "";
+  if (role === "reviewer") {
+    // The reviewer does not push, so there is no first-push moment to warn it about; what it needs
+    // at the same moment is the SAME rule as the pre-flight (it was launched into a fresh session
+    // and may be reading nothing else). Reuse the line rather than invent a second wording.
+    return reviewerPreflightLine(opts);
+  }
   if (role === "harness") {
     return (
       `${REVIEWER_PREFLIGHT_TAG} #2148 first push: no attestation can exist yet — ` +

@@ -66,8 +66,14 @@ case "$LINE" in
   *) rc=1;;
 esac; ck $rc "…and states the requirement in the one wording the pi side uses (drift-pinned)"
 case "$LINE" in *"task(prompt='[REVIEW]"*) rc=0;; *) rc=1;; esac; ck $rc "…naming the dispatch command"
-case "$LINE" in *"scripts/record-review.sh <PR> <HEAD> clean [owner/repo] --evidence comment:"*) rc=0;; *) rc=1;; esac
+case "$LINE" in *"~/.pi/agent/scripts/record-review.sh <PR> <HEAD> clean [owner/repo] --evidence comment:"*) rc=0;; *) rc=1;; esac
 ck $rc "…naming the record command WITH --evidence (a fresh 'clean' without it is refused, tortoise#7391)"
+# ⛔ THE PATH MUST BE THE HOME COPY (fresh review, P1). This line is printed inside a lane whose cwd
+# is a CONTENT repo, which has no `scripts/record-review.sh`; the production copy is farmed into
+# ~/.pi/agent/scripts (that is where merge-one.sh runs it from). A repo-relative path is correct ONLY
+# in agent-infra's own checkout, so every other lane would copy a command that cannot run.
+case "$LINE" in *" scripts/record-review.sh"*) rc=1;; *) rc=0;; esac
+ck $rc "⛔ …and NOT a repo-relative path (a content repo has no scripts/record-review.sh)"
 case "$LINE" in *"scripts/admin-merge.sh <PR>"*) rc=0;; *) rc=1;; esac; ck $rc "…naming the rail command"
 case "$LINE" in *"AFTER the last push"*) rc=0;; *) rc=1;; esac
 ck $rc "…and WHEN to record (a stale record is refused, so 'record' alone is a trap)"
@@ -75,13 +81,25 @@ case "$LINE" in *"post the reviewer's verdict as a PR comment"*) rc=0;; *) rc=1;
 ck $rc "…and that the verdict must be POSTED as a PR comment (the --evidence artifact's referent)"
 
 echo
-echo "§B the two roles"
+echo "§B the three roles"
 HARNESS_LINE="$(reviewer_preflight_line harness)"
 case "$HARNESS_LINE" in *"HARNESS reviewer"*) rc=0;; *) rc=1;; esac; ck $rc "the harness role names WHO mints the attestation"
 case "$HARNESS_LINE" in *"do NOT merge"*) rc=0;; *) rc=1;; esac; ck $rc "the harness role keeps the lane out of the rail"
-case "$HARNESS_LINE" in *"scripts/record-review.sh"*) rc=0;; *) rc=1;; esac; ck $rc "…and still names the record command"
+case "$HARNESS_LINE" in *"~/.pi/agent/scripts/record-review.sh"*) rc=0;; *) rc=1;; esac; ck $rc "…and still names the record command"
 case "$HARNESS_LINE" in *"dispatch: task("*) rc=1;; *) rc=0;; esac
 ck $rc "⛔ the harness role does NOT instruct the lane to dispatch (its brief forbids it — the roles cannot collapse)"
+# The REVIEWER session (merge-one.sh's own) is a third audience: it posts the verdict comment and
+# must not push/record/merge. Giving it the harness line contradicts the prompt it was launched with
+# ("Report only — do not fix code … Do NOT modify code, commit, or merge").
+REVIEWER_LINE="$(reviewer_preflight_line reviewer)"
+case "$REVIEWER_LINE" in *"you ARE the harness reviewer"*) rc=0;; *) rc=1;; esac
+ck $rc "the reviewer role tells the session WHAT IT IS"
+case "$REVIEWER_LINE" in *"post the verdict as a PR comment"*) rc=0;; *) rc=1;; esac
+ck $rc "…naming the artifact it owns (the verdict comment)"
+case "$REVIEWER_LINE" in *"do NOT push"*) rc=0;; *) rc=1;; esac
+ck $rc "⛔ …forbidding the push its launcher forbids"
+case "$REVIEWER_LINE" in *"push your FINAL head"*) rc=1;; *) rc=0;; esac
+ck $rc "⛔ …and NOT carrying the harness role's 'push your FINAL head' (the contradiction this removes)"
 SELF_BRIEF="$(reviewer_brief_section self)"
 case "$SELF_BRIEF" in *"## Reviewer step"*) rc=0;; *) rc=1;; esac; ck $rc "the self brief has a findable heading"
 case "$SELF_BRIEF" in *"Only then run the rail"*) rc=0;; *) rc=1;; esac; ck $rc "the self brief orders record BEFORE the rail"

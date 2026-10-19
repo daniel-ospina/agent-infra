@@ -58,7 +58,10 @@ function repoFile(rel: string): string {
 const SHELL_HELPER = "scripts/orchestrator-harness/reviewer-preflight.sh";
 const helperPath = fileURLToPath(new URL(`../../${SHELL_HELPER}`, import.meta.url));
 /** Render the shipped bash helper — the only way to compare two languages honestly. */
-function renderShell(flag: "--line" | "--brief", role: "self" | "harness"): string {
+function renderShell(
+  flag: "--line" | "--brief",
+  role: "self" | "harness" | "reviewer",
+): string {
   return execFileSync("bash", [helperPath, flag, role], { encoding: "utf8" }).trim();
 }
 
@@ -92,6 +95,27 @@ ok(
 );
 
 // ── (b) the two roles ─────────────────────────────────────────────────────────
+// ⛔ THE RECORD COMMAND MUST NOT BE REPO-RELATIVE (fresh review, P1). The disclosure is printed
+// inside a lane whose cwd is a CONTENT repo (tortoise/eldato), which has no
+// `scripts/record-review.sh`; the production copy lives in `~/.pi/agent/scripts/`, where
+// `merge-one.sh` runs it from. A repo-relative path is correct only in agent-infra's own checkout,
+// so it handed every other lane a "No such file or directory" at landing time. Asserted as an
+// INVARIANT (absolute or home-rooted), not as a literal, so the check survives a path move.
+const recordScriptToken = REVIEWER_PREFLIGHT_RECORD_CMD.split(" ")[0] ?? "";
+ok(
+  recordScriptToken.startsWith("~/") || recordScriptToken.startsWith("/"),
+  `the record command's script is HOME/ABSOLUTE, never repo-relative: got "${recordScriptToken}"`,
+);
+ok(
+  recordScriptToken.endsWith("record-review.sh"),
+  "…and it is record-review.sh (the script that mints the signed marker)",
+);
+ok(
+  !REVIEWER_PREFLIGHT_RECORD_CMD.includes("scripts/record-review.sh") ||
+    recordScriptToken.startsWith("~/.pi/agent/scripts/"),
+  "…resolved under ~/.pi/agent/scripts, not the checkout's scripts/",
+);
+
 const harnessLine = reviewerPreflightLine({ role: "harness" });
 equal(harnessLine.split("\n").length, 1, "the harness-role line is ONE line too");
 ok(
@@ -105,6 +129,34 @@ ok(
   !harnessLine.includes("this lane " + REVIEWER_PREFLIGHT_REQUIREMENT),
   "the harness role reframes the requirement (the subject is the PR, not the lane's own dispatch)",
 );
+// ── (b2) the REVIEWER role — the third audience (fresh review, P2) ──────────
+// `merge-one.sh` launches its reviewer with "Report only — do not fix code … Do NOT modify code,
+// commit, or merge". Telling that session "push your FINAL head" (the harness line) contradicts the
+// prompt it was launched with, in a session that is also hatched to write the main checkout.
+const reviewerLine = reviewerPreflightLine({ role: "reviewer" });
+equal(reviewerLine.split("\n").length, 1, "the reviewer-role line is ONE line");
+ok(
+  reviewerLine.includes("you ARE the harness reviewer"),
+  "the reviewer role tells the session WHAT IT IS (it is the reviewer, not a lane)",
+);
+ok(
+  reviewerLine.includes("post the verdict as a PR comment"),
+  "the reviewer role names the artifact it OWNS: the verdict comment",
+);
+ok(
+  reviewerLine.includes("do NOT push"),
+  "⛔ the reviewer role forbids pushing — merge-one.sh's own prompt says 'do not commit or merge'",
+);
+ok(
+  !reviewerLine.includes("push your FINAL head"),
+  "⛔ …and it does NOT carry the harness role's 'push your FINAL head' (the contradiction this split removes)",
+);
+ok(!reviewerLine.includes("dispatch: task("), "…nor does it tell the reviewer to dispatch itself");
+ok(
+  !reviewerFirstPushNotice({ role: "reviewer" }).includes("push your FINAL head"),
+  "the reviewer's early notice reuses the rule instead of the code-pushing advice",
+);
+
 const harnessEarly = reviewerFirstPushNotice({ role: "harness" });
 ok(harnessEarly.includes("HARNESS reviewer"), "the harness early notice names the harness reviewer");
 ok(!harnessEarly.includes("dispatch: task("), "…and does not instruct the lane to dispatch");
@@ -154,6 +206,11 @@ equal(
   renderShell("--line", "harness"),
   harnessLine,
   `${SHELL_HELPER} --line harness renders the SAME disclosure as reviewerPreflightLine({role:"harness"})`,
+);
+equal(
+  renderShell("--line", "reviewer"),
+  reviewerLine,
+  `${SHELL_HELPER} --line reviewer renders the SAME disclosure as reviewerPreflightLine({role:"reviewer"})`,
 );
 
 // The constants the pin compares (both directions, verbatim): a change in the helper alone goes red

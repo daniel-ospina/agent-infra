@@ -61,7 +61,7 @@ flag does either.
 3. Record the attestation at the PR's CURRENT head — after your LAST push:
 
    ```
-   scripts/record-review.sh <PR> <HEAD> clean [owner/repo] --evidence comment:<review-comment-id>
+   ~/.pi/agent/scripts/record-review.sh <PR> <HEAD> clean [owner/repo] --evidence comment:<review-comment-id>
    ```
 
    ⛔ `--evidence` is REQUIRED for a fresh `clean` record (tortoise#7391): the script refuses
