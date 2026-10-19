@@ -107,7 +107,9 @@ fourth state and no silent absence: this table is what makes "deployed" checkabl
   and the exemption ends with that deadline, so a job killed at its ceiling cannot mask a wedge.
   That deadline is **self-declared**, so it is clamped to `started + JOB_TIMEOUT + 3 × tick`: a
   marker written under a larger budget (or left by a loop that later ran with one) cannot excuse a
-  wedged tick for longer than the ceiling this verifier would itself have enforced;
+  wedged tick for longer than the ceiling this verifier would itself have enforced. A marker with no
+  usable `started` is **dropped** rather than trusted, because an exemption that cannot be dated
+  cannot expire;
 - a job that is declared and runnable here but has **never run**;
 - a job whose calendar can **never** come due again (no occurrence found within the search window
   — a `Month`/`Day` calendar searches 400 days, including the entries of a multi-entry
@@ -128,8 +130,11 @@ fourth state and no silent absence: this table is what makes "deployed" checkabl
   whose shebang interpreter is gone, fails every run with `rc=127` and would otherwise be stamped
   as a live job), or a label that is in `RETIRED` while its template still exists. Only `argv[0]`
   is held to the execute bit — the remaining arguments are data, and a plist may legitimately point
-  one at a non-executable file. A target missing **anywhere else** — a tortoise checkout without
-  its `.venv` — is a named `SKIP`, not a failure.
+  one at a non-executable file. Like a missing target, the execute-bit refusal follows the layer
+  split: inside `<home>/.pi/agent/` it is fatal (that farm is ours to install), anywhere else it is
+  a named `SKIP` — a tortoise `.venv` that lost its mode bits must not refuse `CELL READY` on every
+  cell any more than an absent one does. A target missing **anywhere else** — a tortoise checkout
+  without its `.venv` — is a named `SKIP`, not a failure.
   On macOS the whole gate is the delegate's: `install-launchd.sh --status` must exit **0** AND
   print no `NOT INSTALLED`/`DRIFTED`/`not loaded` line (`--verify` reads its exit status too, so
   a delegate failure with unfamiliar wording is not certified green).
@@ -149,7 +154,11 @@ both rather than counting them:
   its execute bit) writes no stamp either and is logged as `NOT-RUN`, never `RAN rc=127`.
 
 A stamp already on disk whose `rc` is `null` — written by an older copy of this runtime, or by the
-old exec-failure path — is read back as `NEVER RUN` for the same reason.
+old exec-failure path — is read back as `NEVER RUN` for the same reason. A stamp whose `started` is
+in the **future** fails too: `due_at` is `last + interval`, so a clock that stepped back (a resumed
+VM, an NTP correction of a fast RTC) or a state dir restored from a skewed box would leave that job
+not-due for ever while a stamp made it look live. `--verify` names it and prints the stamp path to
+clear.
 
 `--start` reads the declarations before it spawns. No declarations at all, a remembered
 `templates-dir` that no longer resolves, and a dir holding no `*.plist` all exit **3** (the code
