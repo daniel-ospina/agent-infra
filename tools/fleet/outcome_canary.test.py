@@ -2630,6 +2630,13 @@ def test_a_CONCLUDED_red_outranks_an_IN_FLIGHT_check_in_either_order():
     assert m.rollup_state([queued]) == "inflight"
     green = {"workflowName": "CI", "name": "ci", "conclusion": "SUCCESS", "status": "COMPLETED"}
     assert m.rollup_state([green]) == "green"
+    # ⛔ THE ORDERABLE IN-FLIGHT ARM. `queued` above has no id/timestamp, so it abstains in the
+    # unorderable guard and never reaches the newest-attempt branch. With ids it does — and a RED
+    # group must still outrank it in either order.
+    red_i = dict(red, id=20)
+    queued_i = dict(queued, id=21)
+    assert m.rollup_state([red_i, queued_i]) == "red", m.rollup_state([red_i, queued_i])
+    assert m.rollup_state([queued_i, red_i]) == "red", m.rollup_state([queued_i, red_i])
 
 
 @test
@@ -4493,6 +4500,23 @@ MUTATIONS = [
      '    if lane_ok:\n        return True, "a lane started %s (the queue record is not the only evidence)" % (\n            _age_txt(lane_ok.get("age_s")))',
      '    if intent or lane_ok:\n        return True, "a dispatch landed %s (the queue record is not the only evidence)" % (\n            _age_txt((intent or lane_ok).get("age_s")))',
      "test_the_intent_line_is_not_reported_as_a_LANDED_dispatch"),
+    # ── cycle-39 defects ─────────────────────────────────────────────────────────────────
+    ("the static report's not_evaluated comes from the --only FLAG, not the verdicts",
+     '                print(render(vs, hdr, not_evaluated=[n for n in CHECK_ORDER\n                                                     if n not in set(v.name for v in vs)]))',
+     '                print(render(vs, hdr, not_evaluated=[n for n in CHECK_ORDER\n                                                     if n not in set(only or [])]))',
+     "test_the_STATIC_report_is_honest_with_NO_only_flag_too"),
+    ("--box local blanks this box's plist repo",
+     '    elif a.box and a.box.strip() not in ("local", "localhost", "."):',
+     "    elif a.box:",
+     "test_box_LOCAL_is_this_box_so_the_plist_repo_still_applies"),
+    ("the static JSON hides its exit code and its unasserted checks",
+     '                              "exit": (1 if mism else (2 if only else 0)),',
+     '                              "exit": 0,',
+     "test_the_static_JSON_publishes_its_exit_code_and_unasserted_checks"),
+    ("an injected fact set is reported as a live observation in JSON",
+     '                          "facts_injected": _injected,\n',
+     '',
+     "test_an_INJECTED_fact_set_is_disclosed_in_the_JSON_too"),
     # ── cycle-38 defects ─────────────────────────────────────────────────────────────────
     ("the ambiguous record is not shape-checked (a repair that covers one key)",
      '        for key in ("notified", "ambiguous"):',
@@ -4516,7 +4540,7 @@ MUTATIONS = [
      '    if pane.get("protection_supported"):',
      "test_the_pane_EVIDENCE_cannot_assert_a_protection_source_the_payload_DENIES"),
     ("a narrowed static run prints the exit code it does not take",
-     '                print(render(vs, hdr, not_evaluated=[n for n in CHECK_ORDER\n                                                     if n not in set(only or [])]))',
+     '                print(render(vs, hdr, not_evaluated=[n for n in CHECK_ORDER\n                                                     if n not in set(v.name for v in vs)]))',
      '                print(render(vs, hdr))',
      "test_a_static_only_run_does_not_PRINT_a_green_exit_it_does_not_take"),
     ("the collectors launder an absent landing bit into a definite false",
@@ -4584,8 +4608,8 @@ MUTATIONS = [
      '    truncated = False',
      'test_an_UNDISCLOSED_page_bound_is_truncation_when_the_bound_was_actually_REACHED'),
     ("the rollup state returns on the first in-flight group",
-     "        if any(_in_flight(chk) for _r, chk in entries):\n            seen_inflight = True\n            continue",
-     "        if any(_in_flight(chk) for _r, chk in entries):\n            return \"inflight\"",
+     "        _rank, chk = max(entries, key=lambda e: e[0])\n        if _in_flight(chk):\n            seen_inflight = True\n            continue",
+     "        _rank, chk = max(entries, key=lambda e: e[0])\n        if _in_flight(chk):\n            return \"inflight\"",
      "test_a_CONCLUDED_red_outranks_an_IN_FLIGHT_check_in_either_order"),
     ("an injected fact set is reported as a live observation",
      '              % ("FACTS INJECTED (%s; not a live observation)" % a.facts if _injected else "LIVE",',
@@ -4882,10 +4906,10 @@ MUTATIONS = [
      '        if e is not None and e > ts:\n            ts = e\n    return (0, 0.0, ts, pos)',
      '        if e is not None and e > ts:\n            ts = e\n    return (0, 0.0, 0.0, pos)',
      "test_the_rollup_is_graded_on_the_shape_the_LIVE_surface_actually_emits"),
-    ("an attempt in flight is graded on the previous attempt's verdict",
-     "        if any(_in_flight(chk) for _r, chk in entries):",
-     "        if False:",
-     "test_the_rollup_is_graded_on_the_shape_the_LIVE_surface_actually_emits"),
+    ("a superseded in-flight attempt masks a newer green",
+     '        if any(_in_flight(chk) and e[0] == 0 and e[2] == 0.0 for e, chk in entries):',
+     '        if any(_in_flight(chk) for _rank, chk in entries):',
+     "test_a_SUPERSEDED_in_flight_attempt_does_not_mask_a_newer_GREEN"),
     ("an absent `probed` key reads as probed, so an unread PR is graded",
      '        if (pr.get("probed") is not True or green is None',
      '        if (pr.get("probed", True) is not True or green is None',
@@ -4939,7 +4963,7 @@ MUTATIONS = [
      "        if False:\n            return False",
      "test_a_dry_run_does_NOT_persist_the_default_notification_state"),
     ("a --box run grades a remote cell against THIS machine's repo plist",
-     "    elif a.box:",
+     '    elif a.box and a.box.strip() not in ("local", "localhost", "."):',
      "    elif False:",
      "test_a_box_run_does_not_grade_against_THIS_machines_repo"),
     ("an unparseable header is reported as a log that contains no header",
@@ -5684,6 +5708,105 @@ def test_a_MEASURED_unprotected_pid_outranks_an_unread_sibling():
     v2 = m.check_pane_daemon(facts, cfg)
     assert (v2.status, v2.variant) == (m.INCONCLUSIVE, "PROTECTION_UNEVALUABLE"), (v2.status,
                                                                                   v2.variant)
+
+
+@test
+def test_an_INJECTED_fact_set_is_disclosed_in_the_JSON_too():
+    """`reported["facts"]` fed the text header and nothing else, so `--facts X --json` emitted
+    `"mode": "live"` with an injected fact set and no key saying so."""
+    m = load()
+    d = tempfile.mkdtemp(prefix="oc-injjson-")
+    path = os.path.join(d, "facts.json")
+    doc = fx("healthy")["facts"]
+    with open(path, "w") as fh:
+        json.dump({"facts": doc}, fh)
+    rc, out, err = run_cli(["--live", "--json", "--facts", path, "--repo", "o/r",
+                            "--no-notify", "--no-respawn", "--state", os.path.join(d, "s.json")])
+    payload = json.loads(out) if out.strip().startswith("{") else None
+    assert payload is not None, (rc, (out or err)[-400:])
+    assert payload.get("facts_injected") is True, payload.get("facts_injected")
+    assert "injected" in (payload.get("facts_source") or ""), payload.get("facts_source")
+
+
+@test
+def test_a_SUPERSEDED_in_flight_attempt_does_not_mask_a_newer_GREEN():
+    """`any(_in_flight(...))` over the WHOLE group let a stale QUEUED attempt outrank a newer
+    concluded one — and a re-run ADDS a row, it does not clear one, so co-residence is the normal
+    shape. A CLEAN APPROVED unarmed PR was then skipped as `:inflight` inside a
+    `PASS/NOTHING_GREEN`: the exact false green `landers` exists to prevent."""
+    m = load()
+    stale_q = {"__typename": "CheckRun", "name": "build", "workflowName": "CI", "status": "QUEUED",
+               "conclusion": None, "id": 11}
+    newer_ok = {"__typename": "CheckRun", "name": "build", "workflowName": "CI",
+                "status": "COMPLETED", "conclusion": "SUCCESS", "id": 12}
+    assert m.rollup_state([stale_q, newer_ok]) == "green"
+    assert m.rollup_is_green([newer_ok, stale_q])
+    # …but an attempt whose order CANNOT be established still abstains: a queued check-run carries
+    # no `startedAt` and GraphQL no `id`, so it ranks by list position and must not be assumed older.
+    unorderable = {"__typename": "CheckRun", "name": "build", "workflowName": "CI",
+                   "status": "QUEUED", "conclusion": None}
+    timed = {"__typename": "CheckRun", "name": "build", "workflowName": "CI",
+             "status": "COMPLETED", "conclusion": "SUCCESS", "startedAt": "2026-10-18T13:00:00Z"}
+    assert m.rollup_state([unorderable, timed]) == "inflight"
+    assert m.rollup_state([timed, unorderable]) == "inflight"
+    # a NEWER queued attempt is in flight, not the previous attempt's verdict
+    newer_q = dict(stale_q, id=13)
+    assert m.rollup_state([newer_ok, newer_q]) == "inflight"
+
+
+@test
+def test_the_STATIC_report_is_honest_with_NO_only_flag_too():
+    """The complement was derived from the `--only` FLAG, so without it every block printed
+    "NOT EVALUATED … NOT established: <all eight>" (the eight graded directly above it) and even the
+    all-green fixture reported `→ exit 2` while the run exited 0."""
+    rc, out, err = run_cli(["--static", "--fixture", os.path.join(FIXTURES, "healthy.json")])
+    assert rc == 0, (rc, out[-400:], err[-300:])
+    assert "NOT EVALUATED" not in out, [ln for ln in out.splitlines() if "NOT EVALUATED" in ln][:2]
+    assert "→ exit 2" not in out, [ln for ln in out.splitlines() if "→ exit 2" in ln][:2]
+    # a fixture that ABSTAINS still says exit 2 — and still must not claim its GRADED checks were
+    # not evaluated
+    rc2, out2, _ = run_cli(["--static", "--fixture",
+                            os.path.join(FIXTURES, "daemon-absent.json")])
+    assert "NOT EVALUATED" not in out2, [ln for ln in out2.splitlines()
+                                        if "NOT EVALUATED" in ln][:2]
+
+
+@test
+def test_the_static_JSON_publishes_its_exit_code_and_unasserted_checks():
+    """The live JSON carries `exit` and `not_evaluated`; the static one carried neither, so a consumer
+    read "every fixture matched" from a run that exited 2 having asserted 1 of 8 checks."""
+    rc, out, err = run_cli(["--static", "--only", "headroom", "--json", "--fixtures-dir", FIXTURES])
+    assert rc == 2, (rc, err[-300:])
+    doc = json.loads(out)
+    assert doc.get("exit") == 2, doc.get("exit")
+    ne = doc.get("not_evaluated")
+    assert isinstance(ne, list) and "pane_daemon" in ne and "headroom" not in ne, ne
+    # the un-narrowed run is exit 0 and asserts everything
+    rc2, out2, _ = run_cli(["--static", "--json", "--fixtures-dir", FIXTURES])
+    assert rc2 == 0, rc2
+    assert json.loads(out2).get("not_evaluated") == [], json.loads(out2).get("not_evaluated")
+
+
+@test
+def test_box_LOCAL_is_this_box_so_the_plist_repo_still_applies():
+    """`--box local` builds a NON-remote `Machine` (it respawns and messages here), while the config
+    blanked the repo for ANY `--box` — so the three PR checks abstained GH_UNREADABLE ("no --repo
+    given") on a run that had every input, blaming a knob the operator did not omit."""
+    m = load()
+    ap = m.build_parser()
+
+    def cfg_for(*argv):
+        return m.cfg_from_args(ap.parse_args(list(argv)))
+
+    local = cfg_for("--live", "--box", "local")
+    assert local.box == "local"
+    # the plist-derived repo is this box's, so it still applies
+    assert local.repo == (m._repo_from_plist(local.label) or ""), local.repo
+    assert local.repo, "the local box's repo must not be blanked"
+    # a REMOTE box still refuses to borrow this machine's repo
+    assert cfg_for("--live", "--box", "other-box").repo == ""
+    # …and it IS local to `Machine`, which is what makes the repo legitimate
+    assert m.Machine(local.box).remote is False, (local.box, m.Machine(local.box).remote)
 
 
 @test

@@ -2108,12 +2108,24 @@ def rollup_state(rollup):
     # verdict is unaffected (neither is landable) but the LABEL is a claim.
     seen_inflight = False
     for _key, entries in attempts.items():
-        # GROUPED, exactly like the boolean projection uses: the newest attempt PER CHECK decides
-        # that check. An ungrouped max() let a newer green attempt of a DIFFERENT workflow mask a red.
-        if any(_in_flight(chk) for _r, chk in entries):
+        # ⛔ THE NEWEST ATTEMPT PER CHECK DECIDES — AND THAT INCLUDES THE IN-FLIGHT ARM. Asking
+        # `any(_in_flight(...))` over the WHOLE group let a SUPERSEDED queued attempt outrank a newer
+        # concluded one (the repo's own rule is that a re-run ADDS a row, it does not clear one, so
+        # co-residence is the normal shape). Measured: a check with a stale QUEUED attempt beside a
+        # newer SUCCESS read "inflight"/not-green, so `landers` skipped a CLEAN, APPROVED, unarmed PR
+        # as `:inflight` and returned PASS/NOTHING_GREEN — the false green this check exists for.
+        #
+        # ⛔ BUT AN UNORDERABLE IN-FLIGHT ATTEMPT STILL ABSTAINS. A queued check-run carries no
+        # `startedAt` (and GraphQL carries no `id`), so it ranks by LIST POSITION — grading the other
+        # attempt on its timestamp would silently treat a genuinely NEWER queued attempt as the older
+        # one and publish the previous attempt's verdict. Unknown ordering is not a newer green.
+        if any(_in_flight(chk) and e[0] == 0 and e[2] == 0.0 for e, chk in entries):
             seen_inflight = True
             continue
         _rank, chk = max(entries, key=lambda e: e[0])
+        if _in_flight(chk):
+            seen_inflight = True
+            continue
         concl = _check_conclusion(chk)
         if concl is None:
             seen_inflight = True
@@ -4201,13 +4213,17 @@ def cfg_from_args(a):
     }
     if a.repo:
         kw["repo"] = a.repo
-    elif a.box:
+    elif a.box and a.box.strip() not in ("local", "localhost", "."):
         # ⛔ THE BOX'S REPO IS NOT THIS MACHINE'S REPO. `_repo_from_plist` opens the LOCAL
         # ~/Library/LaunchAgents/<label>.plist, so a `--box` run graded a remote cell against the
         # repository of whichever cell this machine happens to run — "a healthy fleet for a repo
         # nobody is working on", the outcome that reader's own docstring calls worse than no canary.
         # Reading the plist across the machine boundary is not plumbed, so the honest answer is
         # "unknown": the three PR checks then abstain (GH_UNREADABLE) instead of speaking.
+        # ⛔ `local` / `localhost` / `.` ARE THIS BOX — the same test `Machine` uses for `remote` —
+        # so the exclusion must not fire for them: it blanked the repo and graded `pr_created`,
+        # `pr_merged` and `landers` as GH_UNREADABLE ("no --repo given") on a run that had every
+        # input, while still respawning locally and messaging this machine's pane.
         kw["repo"] = ""
     else:
         kw["repo"] = _repo_from_plist(a.label or Cfg.DEFAULTS["label"]) or ""
@@ -4296,7 +4312,18 @@ def main(argv=None):
                 mism.append((a.fixtures_dir or default_fixtures_dir(), "(fixture-set)",
                              "fixture present", "MISSING_FIXTURE (%s)" % name, None))
         if a.json:
-            print(json.dumps({"mode": "static", "fixtures": [
+            # ⛔ THE MACHINE-READABLE REPORT CARRIES THE SAME TWO DISCLOSURES AS THE LIVE ONE. An
+            # `--only` run exits 2 and, without these keys, a consumer saw "every fixture matched"
+            # and had no way to know 7 of 8 checks were never asserted.
+            print(json.dumps({"mode": "static",
+                              # ⛔ THE EXIT THE PROCESS ACTUALLY RETURNS (below): a drifted
+                              # fixture is 1, a narrowed run 2, otherwise 0. Computing it from the
+                              # verdicts instead described a code this mode never produces.
+                              "exit": (1 if mism else (2 if only else 0)),
+                              "not_evaluated": [n for n in CHECK_ORDER
+                                                if n not in set(v.name for _p, _n, _nt, vs, _e in rows
+                                                                for v in vs)],
+                              "fixtures": [
                 {"path": p, "name": n, "note": note,
                  "verdicts": [v.as_json() for v in vs], "expect": ex}
                 for p, n, note, vs, ex in rows], "skipped": [
@@ -4312,11 +4339,12 @@ def main(argv=None):
                 # `render` exactly as the live path passes them. Without this every block printed
                 # "→ exit 0" while the process exited 2, and the only correction was a footnote: the
                 # line an operator quotes is the one that was wrong.
-                # `only` lists what was GRADED; `not_evaluated` must list the COMPLEMENT. Passing
-                # `only` printed "NOT EVALUATED … NOT established: headroom" directly above
-                # "✅ PASS headroom", and never named the seven checks that were truly excluded.
+                # ⛔ THE COMPLEMENT OF WHAT WAS GRADED — read from the VERDICTS, exactly as the live
+                # path does. Deriving it from the `--only` list inverted the report whenever the flag
+                # was ABSENT (`set(only or [])` is empty, so all eight were "NOT EVALUATED") and made
+                # every static block print "→ exit 2", including the all-green `healthy` fixture.
                 print(render(vs, hdr, not_evaluated=[n for n in CHECK_ORDER
-                                                     if n not in set(only or [])]))
+                                                     if n not in set(v.name for v in vs)]))
                 print()
             if skipped:
                 print("⚠️  %d expectation(s) NOT ASSERTED because --only %s excluded them:"
@@ -4491,8 +4519,14 @@ def main(argv=None):
         reported["state_persisted"] = bool(state.persist) and not reported.get("state_error")
 
     if a.json:
+        # ⛔ THE PROVENANCE IS PART OF THE PAYLOAD. `reported["facts"]` was written for the text
+        # header and then read nowhere, so `--facts X --json` emitted `"mode": "live"` with an
+        # injected fact set and NO key anywhere saying so — a JSON consumer recorded fixture facts
+        # as a live observation of `box`.
         print(json.dumps({"mode": "live", "box": cfg.box, "repo": cfg.repo,
                           "observed_at": obs_iso,
+                          "facts_source": reported.get("facts"),
+                          "facts_injected": _injected,
                           "config": cfg.as_json(),
                           "verdicts": [v.as_json() for v in verdicts],
                           "exit": code,

@@ -502,6 +502,18 @@ Six more (cycle 13), each a case where a datum the tool held was not the one it 
 - **`--only`'s report names the checks it EXCLUDED**, not the ones it graded (`not_evaluated` is the
   complement), and a refusal must print the error it read: `_controller_fingerprint` now carries the
   `ps` failure text `attempt_respawn` prints, instead of "(no error recorded)".
+- **The newest attempt per check decides — including the in-flight arm.** Asking "is ANY attempt in
+  this group in flight?" let a superseded queued attempt outrank a newer concluded one, and since a
+  re-run ADDS a row rather than clearing one, co-residence is the normal shape: a CLEAN, APPROVED,
+  unarmed PR was skipped as `:inflight` inside `PASS/NOTHING_GREEN`. An attempt whose ORDER cannot be
+  established (no `id`, no timestamp — a queued check-run on GraphQL) still abstains, because
+  position is not chronology.
+- **`--box local` is THIS box.** `Machine` already treats `local`/`localhost`/`.` as non-remote, so the
+  config must not blank the plist-derived repo for them — otherwise the three PR checks abstain
+  `GH_UNREADABLE` ("no --repo given") on a run that had every input.
+- **The machine-readable report carries the same disclosures as the text one**: static JSON publishes
+  its `exit` and the `not_evaluated` checks, and `--facts` provenance is no longer computed and
+  discarded.
 - **`_is_count` is the ONLY count guard.** `isinstance(True, int)` is true, and the same field was
   healed in one arm and re-broken in the next three times in one week: `backlog: true` FAILed in
   `work_dispatched`, then PASSed in its GREEN arm (`False == 0`), then certified a frozen pool as
