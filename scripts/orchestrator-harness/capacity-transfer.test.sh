@@ -231,8 +231,19 @@ acquire_claim() { # <issue> -> records the issue claim this "box" just pushed, f
     . "$CLAIMS"
     claim_issue_acquire "" "$1" >/dev/null 2>&1
     claim_issue_record "$O" "$1" "${CLAIM_COMMIT:-}" >/dev/null 2>&1
+    # The generation THIS box took, pinned at handover time — the value `dispatch-merge.sh` passes to
+    # the chain it spawns. See `chain_gen` below for why the chain cannot read it itself.
+    claim_issue_record_commit "$O" "$1" > "$TMP/gen-$1" 2>/dev/null
   )
 }
+# ⛔ THE GENERATION IS HANDED TO THE CHAIN, NEVER READ BY IT (agent-infra#1850's adversarial review,
+# merged in from main while this suite existed). A chain that read `state/issueclaim-<N>` at START
+# can capture the generation of a RE-ACQUIRE its own loop performed while it waited, and then delete
+# the live holder's claim on exit. So `dispatch-merge.sh` passes `CHAIN_CLAIM_COMMIT` on the tmux
+# command line — and a caller that does NOT pass it leaves the release a NO-OP (fail-closed, the
+# claim runs to its lease). This suite drives the chain the way the DISPATCHER does, which is why
+# §2 would otherwise report a release that the production shape performs and this shape skipped.
+chain_gen() { cat "$TMP/gen-$1" 2>/dev/null; }
 claim_refs() { git -C "$TMP/remote.git" for-each-ref --format='%(refname)' 2>/dev/null; }
 
 # 2a — THE PRODUCTION ORDER, and the reason it is not the obvious one. `dispatch-merge.sh` spawns the
@@ -247,6 +258,7 @@ ck "§2 setup: the issue claim exists on the remote before the chain runs" $rc
 NOW="$(date +%s)"; EP=$(( NOW - 1 ))
 printf '%s\t%s\t%s\n' "$EP" "$(( EP + 900 ))" "load" > "$O/state/capacity-refused-11"
 run_bounded 20 env O="$O" CHAIN_POLLS=6 CHAIN_POLL_SECS=5 PATH="$PATH" \
+  CHAIN_CLAIM_COMMIT="$(chain_gen 11)" \
   bash "$CHAIN" "$TMP/box" daniel-ospina/agent-infra 11 feat/11-tm
 crc="$BOUNDED_RC"
 [ "$crc" -eq 75 ]; rc=$?
@@ -255,6 +267,12 @@ ck "a refusal written 1s BEFORE the chain's start is still this dispatch's — e
 ck "…and the FENCED release really deleted refs/claims/issue-11 from the remote" $rc
 grep -q 'capacity transfer' <<<"$(cat "$O/logs/chain-11.log" 2>/dev/null)"; rc=$?
 ck "the chain log names the transfer, so the release is attributable" $rc
+# The handover is the mechanism the release above depends on, so it is pinned HERE as one claim: the
+# dispatcher passes the generation, and it is the value the acquire wrote. Without this, a merge that
+# dropped the handoff would leave every check above green on a shape production never uses.
+DISPATCH_SH="$HERE/dispatch-merge.sh"
+{ grep -q "CHAIN_CLAIM_COMMIT='\$chain_gen'" "$DISPATCH_SH" && [ -n "$(chain_gen 11)" ]; }; rc=$?
+ck "dispatch-merge.sh HANDS the chain its claim generation (the release is not a shape only this suite uses)" $rc
 
 # 2a2 — the OTHER half of the race: the chain is already alive when the lane writes the refusal. This
 # is the sequence the suite never exercised, and the one an operator actually sees.
@@ -263,6 +281,7 @@ acquire_claim 15
 ck "§2a2 setup: issue 15 is claimed before the chain starts" $rc
 rm -f "$O/state/capacity-refused-15"
 ( env O="$O" CHAIN_POLLS=6 CHAIN_POLL_SECS=5 PATH="$PATH" \
+    CHAIN_CLAIM_COMMIT="$(chain_gen 15)" \
     bash "$CHAIN" "$TMP/box" daniel-ospina/agent-infra 15 feat/15-tm ) > /dev/null 2>&1 &
 cpid=$!
 sleep 1   # the chain has read CHAIN_START; the lane's refusal is now strictly NEWER than it

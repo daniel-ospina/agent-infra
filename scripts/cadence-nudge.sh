@@ -277,7 +277,9 @@ PYAGE
 }
 # The per-class tokens NAME their PRs, so the old 150-char cut severed exactly the part that makes
 # them readable. #1872 lengthened the segment twice: the label is now
-# `QUEUE(state; pr-doctor dispatches): ` (so the counts cannot be mistaken for an instruction the
+# `QUEUE(state): ` (relabelled 2026-10-18: the old `; pr-doctor dispatches` parenthetical
+# claimed the token was a dispatch record, and it is the queue's SHAPE -- so the counts cannot
+# be mistaken for an instruction the
 # automatic dispatcher already owns) and `running` is named like every other class.
 #
 # ⛔ THIS IS A TRUNCATION POINT, NOT A WORST CASE, AND NO NUMBER BELONGS HERE. The width was raised
