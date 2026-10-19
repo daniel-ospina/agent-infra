@@ -266,7 +266,7 @@ only on macOS — see §2.1), so a killed worker cannot take the controller down
 | `state/roles/merge.attempts` | `PR head epoch reason` for every rail call the merge role made — the head-level cooldown that stops a REFUSED head being retried blind |
 | `logs/` | one log per worker: `lane-*.log`, `chain-*.log`, `merge-*.log`, `fix-*.log`, `orch-loop.log` |
 | `wip/` | dirty-worktree captures taken before a shutdown (see §6), plus one `capwip-<stamp>-<pid>/` per lane KILLED AT ITS WALL-CLOCK CAP (#2045): `tracked.patch`, `untracked.tgz`, `untracked.list`, `tracked.numstat` (the re-parse's own output, kept as evidence that the patch was verified) and `SNAPSHOT.txt`. The newest `WIP_SNAPSHOT_KEEP` (10) directories are kept — a cell's disk is the first thing that stops dispatch, so this is a bounded directory, not a log |
-| `state/capwip.tsv` | one row per cap kill — epoch, label, cap seconds, elapsed, exit status, `COMPLETE`/`PARTIAL`, snapshot dir. The companion to `state/walltime.tsv` (`report.sh` computes the cap-hit RATE there; this is what says whether the kill cost any work) and the reason a cap hit is no longer an absence in the fleet's accounting |
+| `state/capwip.tsv` | one row per cap kill **on every path** — epoch, label, cap seconds, elapsed, exit status, the verdict (`COMPLETE`/`PARTIAL`/`NOTHING-LOST`/`LOST`/`UNSNAPSHOTABLE`) and the snapshot dir (empty where no directory exists). The companion to `state/walltime.tsv` (`report.sh` computes the cap-hit RATE there; this is what says whether the kill cost any work) and the reason a cap hit is no longer an absence in the fleet's accounting |
 
 ### Why the *reviewer* is a separate process from the *controller*
 
@@ -308,8 +308,11 @@ worktree **after** the hard kill has landed — a verified `tracked.patch` + `un
 the worker publishes `$D/<name>.cap`, so `--status` says
 `failed rc=143 (cap 3000s hit — COMPLETE WIP snapshot: …)` instead of a bare exit status. A cap hit on
 a **clean** tree says `NOTHING WAS LOST` on the same line, because the two facts used to be
-indistinguishable. The snapshot never delays the kill (it runs after `wait`), never writes to the
-worker's index or branch (only `git diff HEAD`, `git ls-files`, `tar`), and calls a backup
+indistinguishable. The snapshot never delays the kill (it runs after `wait`), never CHANGES what the
+worker staged, its branch or its stash (it runs `git status --no-optional-locks`, `git diff HEAD`,
+`git ls-files`, a parsing `git apply --numstat`, and `tar` — the flag matters because a plain
+`git status` refreshes the stat cache under `.git/index.lock` and could make a surviving writer's next
+git command fail on a lock the rescue took), and it calls a backup
 `COMPLETE` only after re-parsing it.
 
 ⛔ **Nothing here reviews anything.** The worker runs with `AGENT_SKIP_REVIEW_GATE=1` (a child has no

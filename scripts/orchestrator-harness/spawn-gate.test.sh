@@ -1321,6 +1321,47 @@ cl="$(awk '/replay:/ && /untracked\.tgz/ {n++} END{print n+0}' "$FB/log15")"
 [ "$cl" -eq 0 ]; rc=$?
 ck "…and its replay line does not mention untracked.tgz at all" $rc
 
+# ⛔ A LEDGER ROW ON EVERY VERDICT (review finding, P2). `state/capwip.tsv` is the fleet's own record of
+# cap kills, and it used to gain a row only on the fall-through path: a CLEAN cap kill, a `LOST`
+# snapshot (the full-disk case) and an `UNSNAPSHOTABLE` one (a mis-pointed WIP_PATH) left NO trace, so a
+# later session reading only the ledger could not tell "cap kill, nothing lost" from "no cap kill" — the
+# absence-reads-as-fine defect this whole leg exists to remove. Each verdict is driven and its row read
+# back.
+LEDGER="$CAPRIG/ledger/O"; rm -rf "$CAPRIG/ledger"
+ledger_count() { wc -l < "$LEDGER/state/capwip.tsv" 2>/dev/null | tr -d ' '; }
+cap_clean
+PATH="$CAPRIG/bin:$PATH" O="$LEDGER" WIP_PATH="$CWT" bash -c '
+  . "$1"
+  cap_wip_snapshot "clean verdict" 5 5 143 "$2" >/dev/null 2>&1
+' _ "$GATE" "$FB/log16"
+grep -q 'NOTHING-LOST' "$LEDGER/state/capwip.tsv" 2>/dev/null; rc=$?
+ck "a CLEAN cap kill WRITES a ledger row (verdict NOTHING-LOST), so 'nothing lost' is not an absence" $rc
+mkdir -p "$CAPRIG/ledger2/O/state"; printf 'not a dir\n' > "$CAPRIG/ledger2/O/wip"; cap_dirty
+PATH="$CAPRIG/bin:$PATH" O="$CAPRIG/ledger2/O" WIP_PATH="$CWT" bash -c '
+  . "$1"
+  cap_wip_snapshot "lost verdict" 5 5 143 "$2" >/dev/null 2>&1
+' _ "$GATE" "$FB/log17"
+grep -q 'LOST' "$CAPRIG/ledger2/O/state/capwip.tsv" 2>/dev/null; rc=$?
+ck "…and so does a FAILED snapshot (verdict LOST) — the full-disk case leaves a trace, not silence" $rc
+mkdir -p "$CAPRIG/ledger3/O/state" "$CAPRIG/notarepo3"
+PATH="$CAPRIG/bin:$PATH" O="$CAPRIG/ledger3/O" WIP_PATH="$CAPRIG/notarepo3" bash -c '
+  . "$1"
+  cap_wip_snapshot "unsnapshottable verdict" 5 5 143 "$2" >/dev/null 2>&1
+' _ "$GATE" "$FB/log18"
+grep -q 'UNSNAPSHOTABLE' "$CAPRIG/ledger3/O/state/capwip.tsv" 2>/dev/null; rc=$?
+ck "…and a mis-pointed WIP_PATH leaves a row too (verdict UNSNAPSHOTABLE)" $rc
+n_rows="$(awk 'END{print NR+0}' "$LEDGER/state/capwip.tsv" 2>/dev/null)"
+[ "${n_rows:-0}" -eq 1 ]; rc=$?
+ck "…exactly one row per kill, not one per path (clean kill wrote ${n_rows:-0} row(s))" $rc
+
+# ⛔ AND THE STATE READ MUST NOT TAKE AN OPTIONAL LOCK. `git status` refreshes the stat cache under
+# `.git/index.lock`; on a worktree with a surviving orphaned writer (declared residual) that lock can
+# make the LIVE writer's next git command fail — a failure the rescue would have introduced. The read
+# carries `--no-optional-locks` (measured: the index mtime moves on a plain `git status` and not with
+# the flag). Structural, because the alternative is racing a real writer.
+grep -q -- '--no-optional-locks status --porcelain=v2' "$GATE"; rc=$?
+ck "the worktree state read carries --no-optional-locks (a rescue must not interpose a lock on a live writer)" $rc
+
 # ⛔ AND THE LAUNCHER MUST REPORT IT (#2045 indicator (b)). `nonblocking-dispatch.sh --status` used to
 # answer a cap kill with a bare exit status — and `worker finished: commits=0` in the reported line —
 # so a supervisor reading it saw a healthy quiescent lane and did NOT re-dispatch. Driven end to end:

@@ -302,9 +302,15 @@ can_spawn() { [ "${1:-0}" -lt "$MAX_LOAD" ]; }
 # change in what the cap kills, which is a different decision. The snapshot is a rescue artifact for a
 # worktree that is otherwise unrecoverable; it is not a transaction.
 #
-# ⛔ WHAT THIS MUST NOT DO. (1) It must not touch the worker's index, branch or stash: every
-# artifact comes from `git diff HEAD`, `git ls-files --others` and `tar` — all READ-ONLY on the
-# worktree — so a snapshot can never alter the state it is preserving. (2) It must not delay the
+# ⛔ WHAT THIS MUST NOT DO. (1) It must not CHANGE what the worker had staged, or its branch, or its
+# stash. The reads are `git status`, `git diff HEAD`, `git ls-files --others`, `git apply --numstat`
+# (which only PARSES) and `tar`, and none of them rewrites the index — with ONE caveat that has to be
+# stated because it is not free: `git status` refreshes the stat cache and takes `.git/index.lock`
+# unless told not to, so the read carries `--no-optional-locks`. Without it, a snapshot on a worktree
+# with a surviving orphaned writer (declared residual (c)) could make that writer's next git command
+# fail on a lock the rescue took (review finding, measured: the index mtime moves on a plain
+# `git status` and not on `--no-optional-locks`). Staged CONTENT is identical either way; the flag is
+# there so the rescue cannot interpose a lock on somebody else's process. (2) It must not delay the
 # HARD KILL: the snapshot is taken after the kill has already landed, never in front of it, so a
 # worker that ignores SIGTERM is still killed at its cap — this suite pins that, because a
 # checkpoint grace period in front of the kill is the "a hung worker is never killed" failure the
@@ -334,6 +340,19 @@ WIP_SNAPSHOT_KEEP=10   # newest N snapshot directories kept. Bounded ON PURPOSE:
 WIP_SNAPSHOT_DIR=""    # set by cap_wip_snapshot(); the caller (a launcher) publishes it
 WIP_SNAPSHOT_RESULT=""
 AGENT_CAP_HIT=0        # like AGENT_STARTED: a callers' signal, never an inference from an exit code
+
+# cap_wip_record <label> <cap> <elapsed> <rc> <result> <dir> — ONE append-only row per cap kill.
+# ⛔ ON EVERY RETURN PATH, INCLUDING THE ONES THAT WRITE NO DIRECTORY (review finding, P2). The row
+# used to be written only on the fall-through path, so a CLEAN cap kill, a `LOST` snapshot (the
+# full-disk case) and an `UNSNAPSHOTABLE` one (a mis-pointed WIP_PATH) left NO ledger trace — and a
+# later session reading only `state/capwip.tsv` could not tell "cap kill, nothing lost" from "no cap
+# kill", which is the absence-reads-as-fine defect this leg exists to remove.
+cap_wip_record() { # cap_wip_record <label> <cap> <elapsed> <rc> <result> <dir>
+  local o_root="${O:-${HOME:-$PWD}/orchestrator}"
+  mkdir -p "$o_root/state" 2>/dev/null || true
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "$1" "$2" "$3" "$4" "$5" "$6" \
+    >> "$o_root/state/capwip.tsv" 2>/dev/null
+}
 
 # cap_wip_prune <snapshot-root> — keep the newest WIP_SNAPSHOT_KEEP directories. Only names THIS
 # leg creates (`capwip-*`) are candidates, and a directory is the only thing removed.
@@ -372,6 +391,7 @@ cap_wip_snapshot() {
   root="${WIP_PATH:-$PWD}"
   if ! git -C "$root" rev-parse --git-dir >/dev/null 2>&1; then
     WIP_SNAPSHOT_RESULT=UNSNAPSHOTABLE
+    cap_wip_record "$label" "$cap" "$elapsed" "$rc" UNSNAPSHOTABLE ""
     echo "[cap] $label hit the ${cap}s cap (elapsed=${elapsed}s rc=$rc) and $root is NOT a git worktree — there was no worktree to snapshot. If this lane's work lives in another directory, pass WIP_PATH=<worktree>" >> "$log"
     return 1
   fi
@@ -400,7 +420,7 @@ cap_wip_snapshot() {
   st_nl="$(mktemp "${TMPDIR:-/tmp}/capwip-nl.XXXXXX" 2>/dev/null)"
   capf="$(mktemp "${TMPDIR:-/tmp}/capwip-cf.XXXXXX" 2>/dev/null)"
   if [ -n "$st_outf" ] && [ -n "$st_errf" ] && [ -n "$dirtyf" ] && [ -n "$capf" ] && [ -n "$st_nl" ]; then
-    git -C "$root" status --porcelain=v2 -z --ignore-submodules=none -uall > "$st_outf" 2> "$st_errf" || st_rc=$?
+    git -C "$root" --no-optional-locks status --porcelain=v2 -z --ignore-submodules=none -uall > "$st_outf" 2> "$st_errf" || st_rc=$?
     # ⛔ `grep -c` EXITS 1 WHEN IT SELECTS NOTHING — which is the HEALTHY case (git wrote no warnings).
     # Reading that as a failure made `st_ok=0` unconditional, so COMPLETE became unreachable and every
     # clean cap kill produced a spurious snapshot plus a "do NOT reap it" verdict (VGATE cycle 11,
@@ -446,6 +466,7 @@ cap_wip_snapshot() {
   if [ "${n_dirty:-0}" -eq 0 ]; then
     if [ "$st_ok" = 1 ]; then
       WIP_SNAPSHOT_RESULT=NOTHING-LOST
+      cap_wip_record "$label" "$cap" "$elapsed" "$rc" NOTHING-LOST ""
       rm -f "$dirtyf" "$capf"
       echo "[cap] $label hit the ${cap}s cap (elapsed=${elapsed}s rc=$rc) — the worktree at $root was CLEAN, so NOTHING WAS LOST. The cap still killed it: that is a cap-size problem, not a lost-work problem." >> "$log"
       # A STASH IS A FIFTH DECLARED RESIDUAL (VGATE cycle 10, F4): `git stash push -u` leaves a clean
@@ -469,6 +490,7 @@ cap_wip_snapshot() {
   dir="$O_ROOT/wip/capwip-$stamp-$$"
   if ! mkdir -p "$dir" 2>/dev/null; then
     WIP_SNAPSHOT_RESULT=LOST
+    cap_wip_record "$label" "$cap" "$elapsed" "$rc" LOST ""
     rm -f "$dirtyf" "$capf"
     echo "[cap] $label KILLED AT ITS ${cap}s CAP (elapsed=${elapsed}s rc=$rc) with $n_dirty uncommitted path(s), and the snapshot directory $dir COULD NOT BE CREATED — that work is on disk ONLY at $root and is LOST if the worktree is reaped. Recover now: git -C \"$root\" diff HEAD --binary > /tmp/capwip-\$\$.patch" >> "$log"
     return 1
@@ -479,7 +501,7 @@ cap_wip_snapshot() {
   # so `want_tracked` reads 0 while the status read above reports a modification.
   git -C "$root" diff HEAD --binary > "$dir/tracked.patch" 2>/dev/null || diff_rc=$?
   patch_bytes="$(wc -c < "$dir/tracked.patch" 2>/dev/null | tr -d ' ')"
-  git -C "$root" diff HEAD --name-only > "$dir/tracked.paths" 2>/dev/null || diff_rc=${diff_rc:-1}
+  git -C "$root" diff HEAD --name-only > "$dir/tracked.paths" 2>/dev/null || diff_rc=1
   # ⛔ 0 IS THE PERMISSIVE ANSWER, SO A COUNT THAT COULD NOT RUN IS A FAILURE, NOT A ZERO (VGATE cycle
   # 10, F2). These counts decide COMPLETE and they used to be `grep -c .` with the status discarded: a
   # broken/shadowed grep returned empty → 0 → `want_untracked=0` meant "nothing to archive" and
@@ -594,9 +616,7 @@ cap_wip_snapshot() {
     printf 'result=%s\n' "$result"
   } > "$dir/SNAPSHOT.txt" 2>/dev/null
   if [ "${uncovered_n:-0}" -gt 0 ]; then printf '%s\n' "$uncovered" > "$dir/uncovered.list" 2>/dev/null; fi
-  mkdir -p "$O_ROOT/state" 2>/dev/null || true
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "$label" "$cap" "$elapsed" "$rc" "$result" "$dir" \
-    >> "$O_ROOT/state/capwip.tsv" 2>/dev/null
+  cap_wip_record "$label" "$cap" "$elapsed" "$rc" "$result" "$dir"
   echo "[cap] $label KILLED AT ITS ${cap}s CAP (elapsed=${elapsed}s rc=$rc) with $n_dirty uncommitted path(s) — work PRESERVED ($result): $dir" >> "$log"
   echo "[cap]   tracked=${want_tracked:-0} path(s) -> tracked.patch (${patch_bytes:-0} bytes, verified=$patch_ok); untracked=${want_untracked:-0} -> untracked.tgz (${arch_bytes:-0} bytes, verified=$arch_ok); uncovered=${uncovered_n:-0}" >> "$log"
   # QUOTED, because this line is meant to be PASTED. An unquoted `git -C $root apply $dir/...` breaks
