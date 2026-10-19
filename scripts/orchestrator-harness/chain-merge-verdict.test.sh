@@ -32,9 +32,20 @@ cat > "$T/bin/gh" <<'EOF'
 #   anything else→ "which open PR is on this branch?" → 5
 case " $* " in
   *"pulls/"*)
+    printf 'READ\n' >> "${GH_PULLS_COUNT:-/dev/null}"
     # MERGED_API_FAIL=1 = the READ failed (rate limit / DNS): exit non-zero, print nothing. A failed
     # read and an answered "not merged" are DIFFERENT facts and the chain must not collapse them.
-    if [ "${MERGED_API_FAIL:-0}" = 1 ]; then exit 1; fi
+    # MERGED_API_FAIL=<n> = fail the first <n> reads, then answer. The recovery path ("a transient
+    # failure must not be permanent") needs the stub to CHANGE ITS MIND mid-run.
+    # (MERGED_API_FAIL=1 also lands here: fail the first read, answer the second — which is exactly
+    # the transient failure the "not permanent" case needs.)
+    if [ "${MERGED_API_FAIL:-0}" != 0 ]; then
+      # ⛔ `wc -l` PADS with spaces on BSD/macOS, so the numeric guard below would see "      2" and
+      # reset it to 0 — an always-failing stub, i.e. a case that cannot pass for the right reason.
+      _nr="$(wc -l < "${GH_PULLS_COUNT:-/dev/null}" 2>/dev/null | tr -d ' ' || true)"
+      case "${_nr:-0}" in ''|*[!0-9]*) _nr=0 ;; esac
+      [ "$_nr" -le "${MERGED_API_FAIL}" ] && exit 1
+    fi
     [ -n "${MERGED_AT_STUB+x}" ] && printf '%s\n' "$MERGED_AT_STUB" ;;
   *) printf '5\n' ;;
 esac
@@ -60,7 +71,8 @@ PID=""
 drive() { # drive <phase-grace> <handoff-wait> — starts the chain, sets $PID (never echoes: a caller
            # running this in $( ) would own the child in a SUBSHELL and could not wait/kill it)
   PATH="$T/bin:$PATH" O="$T/o" HOME="$T/home" CHAIN_CLAIM_COMMIT="deadbeef" MERGED_AT_STUB="${MERGED_AT_STUB-}" MERGED_API_FAIL="${MERGED_API_FAIL-0}" \
-    LANE_PHASE_GRACE="$1" LANE_HANDOFF_WAIT="$2" \
+    LANE_PHASE_GRACE="$1" LANE_HANDOFF_WAIT="$2" CHAIN_POLL="${CHAIN_POLL:-15}" \
+    CHAIN_CONFIRM_RETRY="${CHAIN_CONFIRM_RETRY:-60}" GH_PULLS_COUNT="${GH_PULLS_COUNT:-}" \
     bash "$SCRIPT" "$T/repo" o/r 42 feat/42-tm >> "$T/o/logs/chain-42.log" 2>&1 &
   PID=$!
 }
@@ -181,6 +193,39 @@ ck "the early MERGED exit still RELEASES the issue claim (the traps are installe
    $(grep -q "RELEASED 42" "$T/released" 2>/dev/null && echo 0 || echo 1)
 
 echo
+# ── 13. the confirmation is asked ONCE PER RETRY WINDOW, and a later window may still ask ───────
+# ⛔ THIS GATE WAS UNPINNED (reviewer finding, P2, measured): reverting `if [ "${_marker_read:-0}" = 0 ]`
+# to `if true` left the suite 12/12 green, so the ~120-reads-per-wait defect could come back silently.
+# And "exactly once per appearance" was itself a defect — `merged-<PR>.done` is never pruned, so ONE
+# rate-limited read meant the question was never asked again and the chain went on to review and
+# dispatch at a PR the marker said was already merged. Both halves are asserted here with a read
+# counter in the stub: several ticks inside one window cost ONE read, and a later window DOES re-ask.
+rig
+printf '42 %s\n' "$(date +%s)" > "$T/o/state/lanemerge-5.phase"; printf '1\n' > "$T/o/state/lanemerge-5.round"
+printf 'WAITING\n' > "$T/o/state/lanemerge-5.verdict"
+printf 'x\n' > "$T/o/state/merged-5.done"
+: > "$T/pulls-count"
+GH_PULLS_COUNT="$T/pulls-count" CHAIN_POLL=1 CHAIN_CONFIRM_RETRY=600 MERGED_API_FAIL=1 drive 0 8
+sleep 5; stop
+_n="$(grep -c READ "$T/pulls-count" 2>/dev/null || true)"
+ck "several wait ticks inside ONE retry window cost exactly ONE confirmation read (the gate has teeth)" \
+   $([ "${_n:-0}" = 1 ] && echo 0 || echo 1)
+
+# ── 14. …and a LATER retry window DOES re-ask, so one transient failure is not permanent ────────
+rig
+printf '42 %s\n' "$(date +%s)" > "$T/o/state/lanemerge-5.phase"; printf '1\n' > "$T/o/state/lanemerge-5.round"
+printf 'WAITING\n' > "$T/o/state/lanemerge-5.verdict"
+printf 'x\n' > "$T/o/state/merged-5.done"
+: > "$T/pulls-count"
+GH_PULLS_COUNT="$T/pulls-count" CHAIN_POLL=1 CHAIN_CONFIRM_RETRY=2 MERGED_API_FAIL=1 MERGED_AT_STUB=2026-01-01T00:00:00Z drive 0 12
+for _ in $(seq 1 12); do [ -s "$T/o/state/cell" ] && break; ! kill -0 "$PID" 2>/dev/null && break; sleep 1; done
+sleep 2
+_was_alive=0; kill -0 "$PID" 2>/dev/null && _was_alive=1
+stop
+_n2="$(grep -c READ "$T/pulls-count" 2>/dev/null || true)"
+ck "a LATER retry window re-asks: a transient read failure is not permanent (≥2 reads, and the chain ends without dispatching)" \
+   $([ "${_n2:-0}" -ge 2 ] && [ "$_was_alive" = 0 ] && ! ran && echo 0 || echo 1)
+
 if [ "$fail" -eq 0 ]; then
   printf '\033[32mALL %d chain-merge verdict checks passed\033[0m\n' "$pass"
 else

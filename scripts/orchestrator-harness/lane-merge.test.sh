@@ -325,6 +325,36 @@ ck "past the refund allowance the chunk is CHARGED (watch 3 → 4, not refunded)
       && [ "$(cat "$OT/state/lanemerge-52.watch")" = 4 ] \
       && grep -q 'STILL cannot be read' <<<"$OUT" && echo 0 || echo 1)
 
+# ── 11c-nonies. the exhausted-budget hand-off names what the LAST chunk actually found ─────────
+# ⛔ THE PREVIOUSLY-SHIPPED BEHAVIOUR WAS A MEASURED FALSEHOOD (verifier finding, P2): the disposition
+# was written only on WAITING_API, so after ONE unreadable read followed by fifteen `WAITING_LOAD`
+# chunks the hand-off still said "the LAST chunk could not READ the merge confirmation: the PR may well
+# be merged" — about fifteen chunks that had read the PR fine and been refused by the load gate, with
+# the real cause never named. Every wait exit now overwrites the disposition, and the hand-off branches
+# on it. This case drives the sequence: WAITING_API chunk, then LOAD chunks, then the budget.
+new_o "$T/junk-q6.tsv"
+printf 'open||newhead1|clean\n' > "$T/pr-open6.tsv"
+printf '%s deadbeef %s\n' 999994 "$OT/logs/lane-merge-53.log" > "$OT/state/lanemerge-53.chain"
+: > "$OT/logs/merge-53.log"
+printf 'reviewer NOT started (load gate)\n' > "$OT/logs/lane-merge-53.log"
+printf '%s\n' "1" > "$OT/state/lanemerge-53.watch"
+printf '%s\n' "WAITING_API the read failed" > "$OT/state/lanemerge-53.lastdisp"
+PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 MERGED_API_FAIL=1 \
+  bash "$SCRIPT" 53 --watch --repo o/r --pr-tsv "$T/pr-open6.tsv" >/dev/null 2>&1
+ck "a LOAD chunk OVERWRITES an older WAITING_API disposition (the hand-off may only describe the last chunk)" \
+   $([ "$(cat "$OT/state/lanemerge-53.lastdisp" 2>/dev/null)" = "WAITING_LOAD" ] && echo 0 || echo 1)
+printf '%s\n' "15" > "$OT/state/lanemerge-53.watch"
+# ⛔ A CASE-LOCAL gh LOG: `$T/gh.log` ACCUMULATES every earlier case's comments, so a negative
+# assertion on it ("must not say the read failed") is polluted by a PREVIOUS case's legitimate
+# unreadable-read hand-off — measured here as a false FAIL.
+OMIT_LOG="$T/gh-nonies.log"; : > "$OMIT_LOG"
+OUT="$(PATH="$BIN:$PATH" GH_LOG="$OMIT_LOG" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 MERGED_API_FAIL=1 \
+      bash "$SCRIPT" 53 --watch --repo o/r --pr-tsv "$T/pr-open6.tsv" 2>&1)"; RC=$?
+# the BODY goes to gh, not to stdout — assert on the recorded comment, not on the run's output
+ck "…and the budget hand-off names the LOAD gate instead of claiming the merge read failed" \
+   $([ "$RC" = 13 ] && ! grep -q 'could not READ the merge confirmation' "$OMIT_LOG" \
+      && grep -q 'LOAD GATE' "$OMIT_LOG" && echo 0 || echo 1)
+
 # ── 11d. the handoff marker is HEAD-BOUND even from --watch ────────────────────────────────────
 new_o "$T/pr18.tsv"
 printf '%s deadbeef %s\n' 999997 "$OT/logs/lane-merge-26.log" > "$OT/state/lanemerge-26.chain"
@@ -548,3 +578,4 @@ else
   printf '\033[31m%d passed, %d FAILED\033[0m\n' "$pass" "$fail"
 fi
 [ "$fail" -eq 0 ]
+

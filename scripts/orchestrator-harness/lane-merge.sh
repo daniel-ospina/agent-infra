@@ -124,6 +124,14 @@ CHAIN_F="$O/state/lanemerge-$PR.chain"     # "<pid> <head> <chain-log>"
 WATCH_F="$O/state/lanemerge-$PR.watch"     # --watch chunks spent (its own bound, see below)
 CHAIN_LOG="$O/logs/lane-merge-$PR.log"
 
+# disposition — WHAT THIS CHUNK ESTABLISHED, overwritten by every wait exit so the exhausted-budget
+# hand-off can only ever describe the chunk that just ran.
+# ⛔ IT MUST BE WRITTEN ON EVERY WAIT EXIT, NOT ONLY ON WAITING_API (reviewer finding, P2, measured):
+# a disposition from an earlier chunk survived a run of `WAITING_LOAD` chunks, and the hand-off then
+# said "the LAST chunk could not READ the merge confirmation: the PR may well be merged" about fifteen
+# chunks that had read the PR fine and been refused by the load gate. A false claim, posted as a PR
+# comment, with the real cause never named.
+disposition() { printf '%s\n' "$*" > "$O/state/lanemerge-$PR.lastdisp" 2>/dev/null || true; }
 verdict() { # verdict <TOKEN> <reason…> — the ONE writer, so no exit path can skip the record
   local tok="$1"; shift
   printf '%s %s\n' "$tok" "$*" > "$VERDICT_F"
@@ -590,8 +598,14 @@ if [ "$WATCH" -eq 1 ]; then
     rm -f "$O/state/lanemerge-$PR.lastdisp" 2>/dev/null || true   # it described the LAST chunk only
     case "${_lastd:-}" in
       WAITING_API*)
-        post_handoff BLOCKED_ATTEMPTS "supervision budget spent (${MAX_WATCH} --watch chunks) but the LAST chunk could not READ the merge confirmation: the PR may well be merged. Re-run when gh answers, or check the PR directly — do not fix code on this verdict"
-        verdict BLOCKED_ATTEMPTS "budget spent, but the merge confirmation was UNREADABLE — the PR may be merged; re-run when the API answers" ;;
+        post_handoff BLOCKED_ATTEMPTS "supervision budget spent (${MAX_WATCH} --watch chunks) and the LAST chunk could not READ the merge confirmation, so this verdict says nothing about the PR: it may well be merged. Re-run when gh answers, or check the PR directly — do not fix code on this"
+        verdict BLOCKED_ATTEMPTS "budget spent; the last chunk's merge confirmation was UNREADABLE — the PR may be merged; re-run when the API answers" ;;
+      WAITING_LOAD*)
+        post_handoff BLOCKED_ATTEMPTS "supervision budget spent (${MAX_WATCH} --watch chunks), but the LAST chunk was refused by the LOAD GATE — this is not a lane failure: re-dispatch when the box quietens"
+        verdict BLOCKED_ATTEMPTS "budget spent; the last chunk was refused by the load gate (not a lane failure)" ;;
+      WAITING_HEAD_MOVED*)
+        post_handoff BLOCKED_ATTEMPTS "supervision budget spent (${MAX_WATCH} --watch chunks) while the chain stayed bound to an older head — check pid \$(chain_pid) before re-running"
+        verdict BLOCKED_ATTEMPTS "budget spent; the chain stayed bound to an older head" ;;
       *)
         post_handoff BLOCKED_ATTEMPTS "supervision budget spent (${MAX_WATCH} --watch chunks): the merge chain has not resolved this PR"
         verdict BLOCKED_ATTEMPTS "supervision budget spent (${MAX_WATCH} chunks)" ;;
@@ -628,6 +642,7 @@ if [ "$WATCH" -eq 1 ]; then
         emit_blocked BLOCKED "the merge chain (pid $(chain_pid)) is still bound to head $(chain_head) after 2 passes while the PR is at ${HD} — wait for it to exit, or kill pid $(chain_pid) and re-run"
       fi
       : > "$WATCH_F" 2>/dev/null || true
+      disposition WAITING_HEAD_MOVED
       verdict WAITING_HEAD_MOVED "the supervision chain is bound to an older head"
       exit 11
     fi
@@ -662,7 +677,7 @@ if [ "$WATCH" -eq 1 ]; then
           else
             say "… the API STILL cannot be read after $MAX_WATCH retries this cycle — the chunk is charged"
           fi
-          printf '%s\n' "WAITING_API the read failed" > "$O/state/lanemerge-$PR.lastdisp" 2>/dev/null || true
+          disposition WAITING_API
           say "… the API could not be read while confirming the merge — re-run the loop (no round and no chunk is spent)"
           verdict WAITING_API "the merge confirmation read failed; not a statement about the PR"
           exit 11 ;;
@@ -676,6 +691,7 @@ if [ "$WATCH" -eq 1 ]; then
           emit_fix FIX_REQUIRED "the fresh-context reviewer recorded ISSUES at head ${HD:-} — read the review comment on PR #$PR and fix every finding" ;;
         LOAD)    say "… the reviewer was refused by the load gate; this is not a lane failure — re-run:"
                  say "   lane-merge.sh $PR --issue ${ISSUE:-<n>} --repo $OR"
+                 disposition WAITING_LOAD
                  verdict WAITING_LOAD "reviewer refused by the load gate; re-dispatch when the box quietens"
                  exit 11 ;;
         BLOCKED) _why="$(tail -n 3 "$O/state/parkreason-$PR" 2>/dev/null | tr '\n' ' ')"
@@ -697,7 +713,7 @@ if [ "$WATCH" -eq 1 ]; then
       esac
     fi
     now="$(date +%s)"
-    [ "$now" -ge "$deadline" ] && { say "… WAITING — the chain is still running (pid $(chain_pid)); call --watch again"; exit 11; }
+    [ "$now" -ge "$deadline" ] && { disposition WAITING_CHAIN_RUNNING; say "… WAITING — the chain is still running (pid $(chain_pid)); call --watch again"; exit 11; }
     sleep "$INTERVAL"
   done
 fi

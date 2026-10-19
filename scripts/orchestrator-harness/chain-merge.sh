@@ -200,12 +200,15 @@ PR=""
 # repo on the box, so a merge of `tortoise#<same n>` ended this chain `exit 0` ("nothing left to
 # review") — skipping the review AND the merge while the lane read as done. This is the same defect
 # `lane-merge.sh` fixed with `merged_confirmed`; the confirmation belongs on BOTH sides of the handoff.
-# ⛔ THE WAIT ITSELF MAKES NO GITHUB CALL: while the lane is working, this chain costs nothing. The ONE
-# read happens only when `state/merged-<PR>.done` APPEARS, and then only ONCE per appearance — a 15s
-# re-poll must not turn one terminal question into ~120 API reads (and ~120 identical log lines) across
-# an 1800s wait, which is what an unguarded inside-the-loop confirmation did (reviewer finding, P2,
-# measured). A failed read is therefore not retried until the marker changes; the loop keeps waiting and
-# the next appearance (or the verdict path) asks again.
+# ⛔ WHILE THE MARKER IS ABSENT THE WAIT MAKES NO GITHUB CALL: a lane that is working costs nothing.
+# The read happens only when `state/merged-<PR>.done` APPEARS — once per appearance, AND at most once
+# per retry window (`CHAIN_CONFIRM_RETRY`, default 60s). A 15s re-poll must not turn one terminal
+# question into ~120 API reads across an 1800s wait (the unguarded inside-the-loop confirmation did
+# exactly that: reviewer finding, P2, measured). But asking EXACTLY once per appearance was the other
+# error — the marker is never pruned, so a single rate-limited or DNS-failed read was permanent, and
+# the chain went on to review and dispatch at a PR the marker said was already merged (reviewer
+# finding, P2, measured). The window is the cheap middle: a bounded number of re-asks, and a
+# recovered read still ends the chain.
 # ⛔ THREE OUTCOMES, NOT TWO — the same contract the lane side now has (reviewer finding, P2,
 # verified). "The API answered: not merged" and "the read FAILED" are different facts; collapsed, a
 # rate-limited read logged `reports no merged_at` about a read that never happened and then dispatched
@@ -270,6 +273,9 @@ echo "[chain $N] PR #$PR found — starting merge chain $(date)" >> "$LOG"
 # none, and the chain proceeds after a short grace exactly as it always did.
 PR_PHASE="$O/state/lanemerge-$PR.phase"; PR_VERDICT="$O/state/lanemerge-$PR.verdict"
 PHASE_GRACE="${LANE_PHASE_GRACE:-90}"; HANDOFF_WAIT="${LANE_HANDOFF_WAIT:-1800}"
+# CHAIN_POLL: how often the wait loop looks at the marker/verdict (seconds). Configurable so a suite
+# can exercise several ticks without spending minutes; production leaves it at 15.
+CHAIN_POLL="${CHAIN_POLL:-15}"
 case "$PHASE_GRACE" in ''|*[!0-9]*|0[0-9]*) PHASE_GRACE=90 ;; esac
 case "$HANDOFF_WAIT" in ''|*[!0-9]*|0[0-9]*) HANDOFF_WAIT=1800 ;; esac
 # Portable mtime: GNU first, then BSD. GNU `stat -f %m` prints a filesystem block BEFORE it errors, so
@@ -292,7 +298,7 @@ _verdict_is_current() {
 }
 waited=0
 while [ ! -f "$PR_PHASE" ] && [ "$waited" -lt "$PHASE_GRACE" ]; do
-  sleep 15; waited=$((waited + 15))
+  sleep "$CHAIN_POLL"; waited=$((waited + CHAIN_POLL))
 done
 # ⛔ A PHASE MARKER IS A CLAIM ABOUT THE PRESENT, AND IT CARRIES ITS OWN CLOCK. lane-merge.sh writes
 # "<issue> <epoch>"; testing only `[ -f ]` meant a lane killed at its wall limit left a marker that
@@ -316,21 +322,29 @@ if [ -f "$PR_PHASE" ]; then
   waited=0
   MERGED_CONFIRMED=0
   _marker_read=0
+  _marker_read_at=0
   while [ "$waited" -lt "$HANDOFF_WAIT" ]; do
     # A lane that merges its PR leaves merge-one's own marker; stop waiting on it, not on our clock —
     # but only once the API CONFIRMS this repo's PR is merged (see chain_merged_confirmed).
     if [ -f "$O/state/merged-$PR.done" ]; then
-      if [ "${_marker_read:-0}" = 0 ]; then
-        _marker_read=1          # ONE read per marker appearance — see the contract at the top
+      # ⛔ ONE QUESTION PER APPEARANCE **OR PER RETRY WINDOW**, WHICHEVER COMES FIRST (reviewer
+      # finding, P2, measured). Asking exactly once per appearance made a SINGLE transient read
+      # failure permanent: `merged-<PR>.done` is never pruned, so after one rate-limited or
+      # DNS-failed read the chain never asked again — it waited out HANDOFF_WAIT and then reviewed
+      # and dispatched at a PR the marker said was already merged. Asking on every tick is the
+      # defect the gate fixed (~120 reads per wait). A retry window is both.
+      _mk_now="$(date +%s)"
+      if [ "${_marker_read:-0}" = 0 ] || [ $((_mk_now - ${_marker_read_at:-0})) -ge "${CHAIN_CONFIRM_RETRY:-60}" ]; then
+        _marker_read=1; _marker_read_at="$_mk_now"   # see the contract at the top
         chain_merged_confirmed "$PR"; _cmc=$?
         case "$_cmc" in
           0) MERGED_CONFIRMED=1; break ;;
           1) echo "[chain $N] state/merged-$PR.done exists but repos/$OR/pulls/$PR reports no merged_at — the marker may belong to another repo's PR #$PR; still waiting" >> "$LOG" ;;
-          2) echo "[chain $N] could not READ the merge confirmation for PR #$PR (gh failed) — the marker is not proof either way; still waiting, and not re-asking for this marker" >> "$LOG" ;;
+          2) echo "[chain $N] could not READ the merge confirmation for PR #$PR (gh failed) — the marker is not proof either way; still waiting, and re-asking in ${CHAIN_CONFIRM_RETRY:-60}s" >> "$LOG" ;;
         esac
       fi
     else
-      _marker_read=0            # the marker is gone: a NEW appearance is a new question
+      _marker_read=0; _marker_read_at=0   # the marker is gone: a NEW appearance is a new question
     fi
     # ⛔ A VERDICT IS NOT NECESSARILY A HANDOFF (reviewer finding, reproduced). lane-merge.sh records
     # EVERY loop outcome, including the mid-loop tokens that TELL THE LANE TO PUSH A FIX. Treating
@@ -350,7 +364,7 @@ if [ -f "$PR_PHASE" ]; then
           fi ;;
       esac
     fi
-    sleep 15; waited=$((waited + 15))
+    sleep "$CHAIN_POLL"; waited=$((waited + CHAIN_POLL))
   done
   if [ "${MERGED_CONFIRMED:-0}" = 1 ]; then
     echo "[chain $N] PR #$PR is MERGED by the lane's own merge phase — nothing left to review" >> "$LOG"
