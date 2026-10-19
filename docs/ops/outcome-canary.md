@@ -465,6 +465,12 @@ Six more (cycle 13), each a case where a datum the tool held was not the one it 
   truthy, so a surface that said its read FAILED was graded as a successful one carrying
   `avail_bytes: 0` and produced `FAIL/BELOW_FLOOR` — a fake OOM emergency on the check whose FAIL
   must mean one. A missing `used_pct` now prints as `used_pct not read`, never as `-1.0% used`.
+- **A bool is not a number, in `pane_daemon` either.** `is not None` treated `oom_score_adj: true` as
+  a READ value and `False >= 0` is true, so a boolean produced `FAIL/PROTECTION_ABSENT` — a claim of
+  MEASURED non-protection on the one number whose misread delivers a message. A non-number now falls
+  into `unread`, which abstains. And `protection_supported` was graded by TRUTHINESS, so a payload
+  saying the platform cannot demonstrate protection graded `PASS/ALIVE_PROTECTED` — exit 0, no
+  message — on the check whose whole reason to exist is that "alive" is not "protected".
 - **`_is_count` is the ONLY count guard.** `isinstance(True, int)` is true, and the same field was
   healed in one arm and re-broken in the next three times in one week: `backlog: true` FAILed in
   `work_dispatched`, then PASSed in its GREEN arm (`False == 0`), then certified a frozen pool as

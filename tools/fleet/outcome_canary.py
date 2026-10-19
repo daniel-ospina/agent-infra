@@ -1170,8 +1170,12 @@ def _queue_age(f):
     # ⛔ `is True`, like every other `ok` reader in this file: a string "false" is TRUTHY, so a record
     # that FAILED to read supplied its `age_s` as an age attributed to the header ("read 27.8h ago").
     qs_age = qs.get("age_s") if qs.get("ok") is True else None
-    ages = [(a, "token") for a in [tok_age] if isinstance(a, (int, float))]
-    ages += [(a, "state/queue-state") for a in [qs_age] if isinstance(a, (int, float))]
+    # `isinstance(True, int)` is True, so a bool age reads as ONE SECOND here — the sibling of the
+    # gate that `_graded_stale`'s state-record branch already refuses.
+    ages = [(a, "token") for a in [tok_age]
+            if isinstance(a, (int, float)) and not isinstance(a, bool)]
+    ages += [(a, "state/queue-state") for a in [qs_age]
+             if isinstance(a, (int, float)) and not isinstance(a, bool)]
     if not ages:
         return None, None
     age, src = max(ages, key=lambda t: t[0])
@@ -1506,9 +1510,10 @@ def check_work_dispatched(f, c):
                  "queue=EMPTY but the header carries no `backlog=` field: %s" % hdr,
                  "an incomplete header cannot establish that the pool was genuinely empty, so "
                  "'nothing to dispatch' is not established. Not green.")
-    # ⛔ `False == 0` IS TRUE. `backlog == 0` accepted a boolean and returned PASS/IDLE_EMPTY_POOL —
-    # a "genuinely EMPTY" pool at exit 0 with no message — from a field that was never a count. The
-    # FAIL arms were healed this cycle; this one, the GREEN one, was left.
+    # ⛔ `False == 0` IS TRUE. Un-guarded, this arm read a boolean `backlog` as a measured zero and
+    # returned PASS/IDLE_EMPTY_POOL — "the pool was read as genuinely EMPTY", exit 0, no message —
+    # from a field that was never a count. The FAIL arms above were healed first; this one, the GREEN
+    # one, is the one a bool can silence.
     if pool_kind == "EMPTY" and ((_is_count(backlog) and backlog == 0) or superseded_backlog) \
             and (f.get("queue_state") or {}).get("ok") is True:
         return V("work_dispatched", PASS, "IDLE_EMPTY_POOL", evidence,
@@ -1855,11 +1860,20 @@ def check_pane_daemon(f, c):
                  "supervising unit reading 'active'.")
 
     adj = [p.get("oom_score_adj") for p in pids]
-    known = [a for a in adj if a is not None]
+    # ⛔ A BOOL IS NOT A READING. `is not None` treated `False`/`True` as READ and `False >= 0` is
+    # true, so `oom_score_adj: true` produced `FAIL/PROTECTION_ABSENT` — a claim of measured
+    # non-protection built from a boolean, on the one number whose misread delivers a message.
+    # A non-number falls into `unread`, which is an abstention, never a FAIL.
+    known = [a for a in adj
+             if isinstance(a, (int, float)) and not isinstance(a, bool)]
     pid_txt = ", ".join(str(p.get("pid")) for p in pids)
     prot_txt = _pane_protection_txt(pane)
 
-    if not pane.get("protection_supported", False):
+    # ⛔ `is not True`, like every other bit in this file: `not pane.get("protection_supported")`
+    # reads the string "false" (or "no", or 1) as SUPPORTED, so a payload saying the platform cannot
+    # demonstrate protection graded `PASS/ALIVE_PROTECTED` — exit 0, no message — on the one check
+    # whose stated reason to exist is that "alive" is not "protected".
+    if pane.get("protection_supported") is not True:
         return V("pane_daemon", INCONCLUSIVE, "PROTECTION_UNEVALUABLE",
                  "%d live %s process(es) (pid %s)\n%s"
                  % (len(pids), cmd, pid_txt, prot_txt),

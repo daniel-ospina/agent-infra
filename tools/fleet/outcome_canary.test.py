@@ -2459,10 +2459,15 @@ def test_an_UNKNOWN_probe_in_skip_is_a_usage_error_not_a_silent_no_op():
     """`--skip githbu` was dropped with no error, no report line and no `not_evaluated` entry: the
     operator believed a probe was suppressed and the run neither suppressed it nor said so."""
     m = load()
-    rc, out, err = run_cli(["--static", "--skip", "githbu"])
+    # ⛔ `--fixtures-dir` IS PASSED EXPLICITLY. Without it the CLI resolves the fixtures from the
+    # MODULE's own directory, so this test failed for ANY module outside the repo (`run_mutations`
+    # writes its mutants to a temp dir) — and the mutation harness scored that missing-directory
+    # failure as "RED as required", i.e. as evidence for a defect it never discriminated. Every
+    # other CLI test already passes the flag.
+    rc, out, err = run_cli(["--static", "--skip", "githbu", "--fixtures-dir", FIXTURES])
     assert rc == 3, (rc, out[-400:], err[-400:])
     assert "unknown probe" in err.lower(), err[-400:]
-    rc2, _, err2 = run_cli(["--static", "--skip", "github"])
+    rc2, _, err2 = run_cli(["--static", "--skip", "github", "--fixtures-dir", FIXTURES])
     assert rc2 == 0, (rc2, err2[-400:])
 
 
@@ -4488,6 +4493,19 @@ MUTATIONS = [
      '    if lane_ok:\n        return True, "a lane started %s (the queue record is not the only evidence)" % (\n            _age_txt(lane_ok.get("age_s")))',
      '    if intent or lane_ok:\n        return True, "a dispatch landed %s (the queue record is not the only evidence)" % (\n            _age_txt((intent or lane_ok).get("age_s")))',
      "test_the_intent_line_is_not_reported_as_a_LANDED_dispatch"),
+    # ── cycle-36 defects ─────────────────────────────────────────────────────────────────
+    ("a bool backlog buys a GREEN idle",
+     '    if pool_kind == "EMPTY" and ((_is_count(backlog) and backlog == 0) or superseded_backlog) \\\n',
+     '    if pool_kind == "EMPTY" and ((backlog == 0) or superseded_backlog) \\\n',
+     "test_a_BOOL_backlog_cannot_buy_a_GREEN_idle"),
+    ("a bool oom_score_adj is graded as a measured unprotected value",
+     '    known = [a for a in adj\n             if isinstance(a, (int, float)) and not isinstance(a, bool)]',
+     '    known = [a for a in adj\n             if a is not None]',
+     "test_a_BOOL_oom_protection_value_is_UNREAD_not_unprotected"),
+    ("protection_supported is graded by truthiness",
+     '    if pane.get("protection_supported") is not True:',
+     '    if not pane.get("protection_supported", False):',
+     "test_a_BOOL_oom_protection_value_is_UNREAD_not_unprotected"),
     # ── cycle-35 defects ─────────────────────────────────────────────────────────────────
     ("a bool age certifies a frozen pool as current",
      '        age = _raw_age if isinstance(_raw_age, (int, float)) and not isinstance(_raw_age, bool) \\\n            else None',
@@ -5535,8 +5553,7 @@ def test_every_count_read_shares_ONE_bool_excluding_guard():
                    if "isinstance(" in ln and ", int)" in ln
                    and not ln.strip().startswith("#") and "_is_count" not in ln
                    # the helper's own body is the ONE place the rule is spelled out
-                   and ln.strip() != '"""A count is an int and a bool is not a count '
-                                     '(`isinstance(True, int)` is True)."""'[:-0 or None]
+                   and "A count is an int and a bool is not a count" not in ln
                    and "return isinstance(n, int) and not isinstance(n, bool)" not in ln]
     assert hand_rolled == [], hand_rolled
 
@@ -5561,6 +5578,17 @@ def test_a_BOOL_age_is_not_a_current_reading():
     v2 = m.check_queue_readable(d["facts"], cfg)
     assert v2.variant not in ("STATE_FROZEN", "READABLE_STALE") or v2.status == m.PASS, \
         (v2.status, v2.variant)
+    # ⛔ THE OTHER BRANCH. `_graded_stale` guards the state-record branch; when the header's own token
+    # is graded, its currency comes from `_queue_age`, which takes the NEWER of the token's age and
+    # the state record's — so a boolean `age_s` there read as one second and certified a frozen pool
+    # as CURRENT. That half was unpinned.
+    d2 = fx("idle-empty-pool")
+    d2["facts"]["log_events"]["headers"][0]["queue_token"] = "EMPTY"
+    d2["facts"]["queue_state"] = {"ok": True, "raw": "EMPTY", "age_s": True}
+    d2["facts"]["queue_state"]["path"] = "q"
+    v3 = m.check_queue_readable(d2["facts"], cfg)
+    assert v3.variant in ("STATE_FROZEN", "READABLE_STALE", "HEADER_INCOMPLETE"), (v3.status,
+                                                                                 v3.variant)
 
 
 @test
@@ -5622,6 +5650,42 @@ def test_a_MEASURED_unprotected_pid_outranks_an_unread_sibling():
     facts["pane"]["pids"] = [{"pid": 700, "oom_score_adj": -900}]
     assert m.check_pane_daemon(facts, cfg).status == m.PASS
     facts["pane"]["pids"] = [{"pid": 700, "oom_score_adj": None}]
+    v2 = m.check_pane_daemon(facts, cfg)
+    assert (v2.status, v2.variant) == (m.INCONCLUSIVE, "PROTECTION_UNEVALUABLE"), (v2.status,
+                                                                                  v2.variant)
+
+
+@test
+def test_a_BOOL_backlog_cannot_buy_a_GREEN_idle():
+    """`False == 0` is true, so an un-guarded `backlog == 0` in the IDLE arm graded a boolean as a
+    measured zero: PASS/IDLE_EMPTY_POOL — "the pool was read as genuinely EMPTY", exit 0, no message
+    — on the one arm a bool can silence. The FAIL arms were healed first; this is the GREEN one."""
+    m = load()
+    cfg = m.cfg_from_dict({})
+    d = fx("idle-no-work")
+    d["facts"]["log_events"]["headers"][0]["backlog"] = 0
+    assert m.check_work_dispatched(d["facts"], cfg).variant == "IDLE_EMPTY_POOL"
+    d["facts"]["log_events"]["headers"][0]["backlog"] = False
+    v = m.check_work_dispatched(d["facts"], cfg)
+    assert v.variant != "IDLE_EMPTY_POOL", (v.status, v.variant, v.detail)
+    assert v.status != m.PASS, (v.status, v.variant)
+
+
+@test
+def test_a_BOOL_oom_protection_value_is_UNREAD_not_unprotected():
+    """`is not None` treated `True`/`False` as READ and `False >= 0` is true, so `oom_score_adj: true`
+    produced FAIL/PROTECTION_ABSENT — a claim of MEASURED non-protection built from a boolean, on the
+    one number whose misread delivers a message."""
+    m = load()
+    cfg = m.cfg_from_dict({})
+    facts = {"pane": {"ok": True, "protection_supported": True,
+                      "pids": [{"pid": 700, "oom_score_adj": True}]}}
+    v = m.check_pane_daemon(facts, cfg)
+    assert v.status != m.FAIL, (v.status, v.variant, v.detail)
+    assert v.variant in ("PROTECTION_UNEVALUABLE", "PROTECTION_PARTIAL_UNREAD"), v.variant
+    # …and `protection_supported` graded by truthiness reported a NON-supporting platform as protected
+    facts = {"pane": {"ok": True, "protection_supported": "false",
+                      "pids": [{"pid": 700, "oom_score_adj": -900}]}}
     v2 = m.check_pane_daemon(facts, cfg)
     assert (v2.status, v2.variant) == (m.INCONCLUSIVE, "PROTECTION_UNEVALUABLE"), (v2.status,
                                                                                   v2.variant)
