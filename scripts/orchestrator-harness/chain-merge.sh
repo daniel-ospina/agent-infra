@@ -200,8 +200,12 @@ PR=""
 # repo on the box, so a merge of `tortoise#<same n>` ended this chain `exit 0` ("nothing left to
 # review") — skipping the review AND the merge while the lane read as done. This is the same defect
 # `lane-merge.sh` fixed with `merged_confirmed`; the confirmation belongs on BOTH sides of the handoff.
-# ⛔ IT IS NOT IN THE WAIT LOOP: the loop still makes ZERO GitHub calls (that is what lets a lane's
-# merge phase cost nothing while it works). Only these two terminal exits read the API, once each.
+# ⛔ THE WAIT ITSELF MAKES NO GITHUB CALL: while the lane is working, this chain costs nothing. The ONE
+# read happens only when `state/merged-<PR>.done` APPEARS, and then only ONCE per appearance — a 15s
+# re-poll must not turn one terminal question into ~120 API reads (and ~120 identical log lines) across
+# an 1800s wait, which is what an unguarded inside-the-loop confirmation did (reviewer finding, P2,
+# measured). A failed read is therefore not retried until the marker changes; the loop keeps waiting and
+# the next appearance (or the verdict path) asks again.
 # ⛔ THREE OUTCOMES, NOT TWO — the same contract the lane side now has (reviewer finding, P2,
 # verified). "The API answered: not merged" and "the read FAILED" are different facts; collapsed, a
 # rate-limited read logged `reports no merged_at` about a read that never happened and then dispatched
@@ -311,16 +315,22 @@ if [ -f "$PR_PHASE" ]; then
   echo "[chain $N] the lane is in its merge phase (state/lanemerge-$PR.phase, age ${_PHASE_AGE}s) — waiting for its verdict before reviewing, so the review binds the FINAL head" >> "$LOG"
   waited=0
   MERGED_CONFIRMED=0
+  _marker_read=0
   while [ "$waited" -lt "$HANDOFF_WAIT" ]; do
     # A lane that merges its PR leaves merge-one's own marker; stop waiting on it, not on our clock —
     # but only once the API CONFIRMS this repo's PR is merged (see chain_merged_confirmed).
     if [ -f "$O/state/merged-$PR.done" ]; then
-      chain_merged_confirmed "$PR"; _cmc=$?
-      case "$_cmc" in
-        0) MERGED_CONFIRMED=1; break ;;
-        1) echo "[chain $N] state/merged-$PR.done exists but repos/$OR/pulls/$PR reports no merged_at — the marker may belong to another repo's PR #$PR; still waiting" >> "$LOG" ;;
-        2) echo "[chain $N] could not READ the merge confirmation for PR #$PR (gh failed) — the marker is not proof either way; still waiting" >> "$LOG" ;;
-      esac
+      if [ "${_marker_read:-0}" = 0 ]; then
+        _marker_read=1          # ONE read per marker appearance — see the contract at the top
+        chain_merged_confirmed "$PR"; _cmc=$?
+        case "$_cmc" in
+          0) MERGED_CONFIRMED=1; break ;;
+          1) echo "[chain $N] state/merged-$PR.done exists but repos/$OR/pulls/$PR reports no merged_at — the marker may belong to another repo's PR #$PR; still waiting" >> "$LOG" ;;
+          2) echo "[chain $N] could not READ the merge confirmation for PR #$PR (gh failed) — the marker is not proof either way; still waiting, and not re-asking for this marker" >> "$LOG" ;;
+        esac
+      fi
+    else
+      _marker_read=0            # the marker is gone: a NEW appearance is a new question
     fi
     # ⛔ A VERDICT IS NOT NECESSARILY A HANDOFF (reviewer finding, reproduced). lane-merge.sh records
     # EVERY loop outcome, including the mid-loop tokens that TELL THE LANE TO PUSH A FIX. Treating

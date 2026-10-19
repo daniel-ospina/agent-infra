@@ -328,6 +328,11 @@ fi
         # unsupervised behind a dead pid, whose stale log could then name FIX_REQUIRED/PARKED and burn a
         # round. The LIVE pid and the RECORDED head are both facts; write both.
         printf '%s %s %s\n' "$opid" "$(chain_head)" "$(chain_log)" > "$CHAIN_F"
+        # Adopting a LIVE chain starts a new supervision lifetime: the per-chain counters describe the
+        # chain that came before, and carrying them forward is how a stale head-moved count blocked a PR
+        # on the first pass for ever (round-4 reviewer).
+        rm -f "$O/state/lanemerge-$PR.headmoved" "$O/state/lanemerge-$PR.apiretry" \
+              "$O/state/lanemerge-$PR.lastdisp" 2>/dev/null || true
         say "lane-merge: pid $opid already owns PR #$PR — supervising it at the recorded head $(chain_head) (log $(chain_log))"
       else
         printf '%s %s %s\n' "$opid" "${head:-}" "$O/logs/merge-$PR.log" > "$CHAIN_F"
@@ -373,7 +378,8 @@ fi
       "${BR:-$(git branch --show-current 2>/dev/null)}" "${ISSUE:-}" \
       >> "$CHAIN_LOG" 2>&1 < /dev/null &
   printf '%s %s %s\n' "$!" "${head:-}" "$CHAIN_LOG" > "$CHAIN_F"
-  rm -f "$O/state/lanemerge-$PR.headmoved" "$O/state/lanemerge-$PR.lastdisp" 2>/dev/null || true
+  rm -f "$O/state/lanemerge-$PR.headmoved" "$O/state/lanemerge-$PR.lastdisp" \
+        "$O/state/lanemerge-$PR.apiretry" 2>/dev/null || true
   say "lane-merge: launched the merge chain (pid $!, log $CHAIN_LOG)"
   return 0
 }
@@ -480,7 +486,8 @@ emit_fix() { # emit_fix <TOKEN> <reason…>
   # …and the head-moved counter with it: it bounds "THIS chain outlived two passes", not the PR number.
   # A cumulative counter meant a head-move in one cycle plus one in a later cycle blocked on the FIRST
   # pass for ever, permanently removing the re-runnable path from the PR (reviewer finding, P2).
-  rm -f "$O/state/lanemerge-$PR.headmoved" 2>/dev/null || true
+  rm -f "$O/state/lanemerge-$PR.headmoved" "$O/state/lanemerge-$PR.apiretry" \
+        "$O/state/lanemerge-$PR.lastdisp" 2>/dev/null || true
   if [ "$r" -gt "$MAX_ROUNDS" ]; then
     # The cap REFUSES the next round rather than granting it: this is the bound the owner asked for.
     # ⛔ THE VERDICT MUST SAY *WHY* IT STOPPED. Recording the fix token here would leave
@@ -542,24 +549,6 @@ if [ "$WATCH" -eq 1 ]; then
   HEAD="$(cat "$O/state/lanemerge-$PR.head" 2>/dev/null || true)"
   w="$(cat "$WATCH_F" 2>/dev/null || echo 0)"; is_limit "$w" || w=0
   w=$(( w + 1 )); printf '%s\n' "$w" > "$WATCH_F"
-  if [ "$w" -gt "$MAX_WATCH" ]; then
-    # ⛔ A CHUNK THAT ESTABLISHED NOTHING MUST NOT BE REPORTED AS "UNRESOLVED" (reviewer finding, P2,
-    # verified). `WAITING_API` returns in seconds and explicitly refuses to judge the PR, so a run of
-    # them could burn the whole budget and then post "the merge chain has not resolved this PR" — a
-    # false statement about a state we declined to decide, handed off as "stop". The last disposition
-    # is persisted beside the counter, and it changes what the hand-off SAYS.
-    _lastd="$(cat "$O/state/lanemerge-$PR.lastdisp" 2>/dev/null || true)"
-    case "${_lastd:-}" in
-      WAITING_API*)
-        post_handoff BLOCKED_ATTEMPTS "supervision budget spent (${MAX_WATCH} --watch chunks) but the LAST chunk could not READ the merge confirmation: the PR may well be merged. Re-run when gh answers, or check the PR directly — do not fix code on this verdict"
-        verdict BLOCKED_ATTEMPTS "budget spent, but the merge confirmation was UNREADABLE — the PR may be merged; re-run when the API answers" ;;
-      *)
-        post_handoff BLOCKED_ATTEMPTS "supervision budget spent (${MAX_WATCH} --watch chunks): the merge chain has not resolved this PR"
-        verdict BLOCKED_ATTEMPTS "supervision budget spent (${MAX_WATCH} chunks)" ;;
-    esac
-    say "⛔ BLOCKED_ATTEMPTS — ${MAX_WATCH} --watch chunks spent and the chain is still unresolved."
-    exit 13
-  fi
   deadline=$(( $(date +%s) + POLL_S ))
   # ⛔ ONE PR READ PER CHUNK, NOT PER TICK (A7). The header promises "reads the PR ONCE per
   # invocation … waits on LOCAL state files while the chain runs"; at INTERVAL=20 a per-tick read was
@@ -587,6 +576,29 @@ if [ "$WATCH" -eq 1 ]; then
     # handoff at a NEW head was silently suppressed (reviewer finding, reproduced). A failed read
     # falls back to the last head this lane actually saw (persisted above) — never to "unknown".
     HEAD="${HD:-$(cat "$O/state/lanemerge-$PR.head" 2>/dev/null || true)}"
+    # ⛔ THE BUDGET CHECK RUNS HERE, NOT AT THE TOP OF THE CHUNK (reviewer finding, P2, measured): the
+    # hand-off it posts is HEAD-BOUND, and at the top of the chunk HEAD is not yet read — so the marker
+    # carried the literal "unknown", collapsing per-head dedup back to per-PR: the exact defect F4 fixed
+    # for the review path, still open on the budget path. By now HEAD is known (or the persisted one).
+  if [ "$w" -gt "$MAX_WATCH" ]; then
+    # ⛔ A CHUNK THAT ESTABLISHED NOTHING MUST NOT BE REPORTED AS "UNRESOLVED" (reviewer finding, P2,
+    # verified). `WAITING_API` returns in seconds and explicitly refuses to judge the PR, so a run of
+    # them could burn the whole budget and then post "the merge chain has not resolved this PR" — a
+    # false statement about a state we declined to decide, handed off as "stop". The last disposition
+    # is persisted beside the counter, and it changes what the hand-off SAYS.
+    _lastd="$(cat "$O/state/lanemerge-$PR.lastdisp" 2>/dev/null || true)"
+    rm -f "$O/state/lanemerge-$PR.lastdisp" 2>/dev/null || true   # it described the LAST chunk only
+    case "${_lastd:-}" in
+      WAITING_API*)
+        post_handoff BLOCKED_ATTEMPTS "supervision budget spent (${MAX_WATCH} --watch chunks) but the LAST chunk could not READ the merge confirmation: the PR may well be merged. Re-run when gh answers, or check the PR directly — do not fix code on this verdict"
+        verdict BLOCKED_ATTEMPTS "budget spent, but the merge confirmation was UNREADABLE — the PR may be merged; re-run when the API answers" ;;
+      *)
+        post_handoff BLOCKED_ATTEMPTS "supervision budget spent (${MAX_WATCH} --watch chunks): the merge chain has not resolved this PR"
+        verdict BLOCKED_ATTEMPTS "supervision budget spent (${MAX_WATCH} chunks)" ;;
+    esac
+    say "⛔ BLOCKED_ATTEMPTS — ${MAX_WATCH} --watch chunks spent and the chain is still unresolved."
+    exit 13
+  fi
     case "${ST:-}" in
       closed) if [ -n "${MT:-}" ]; then
                 # MT is `merged_at` off THIS repo's PR read (pr_read), so it is a confirmation, not a
@@ -634,8 +646,22 @@ if [ "$WATCH" -eq 1 ]; then
           # it is how ~15 rapid re-runs against a merged-but-unreadable PR used to reach
           # BLOCKED_ATTEMPTS (reviewer finding, P2, verified). The disposition is persisted so the
           # exhausted-budget hand-off can say the truth (see above).
-          w="$(cat "$WATCH_F" 2>/dev/null || echo 0)"; is_limit "$w" || w=0
-          [ "$w" -gt 0 ] && printf '%s\n' "$(( w - 1 ))" > "$WATCH_F" 2>/dev/null
+          # ⛔ THE REFUND IS CAPPED (reviewer finding, P2, measured): an unbounded refund meant 20
+          # consecutive passes with a dead chain, a MERGED log and a failing read all refunded — the
+          # counter pinned at 0, exit 11 for ever, BLOCKED_ATTEMPTS unreachable, and the "MAY BE MERGED"
+          # hand-off could only ever fire with a FALSE "the LAST chunk could not read" (a chunk that
+          # refunds can never be the one that crosses the budget). So: at most MAX_WATCH refunds per
+          # cycle; past that, the chunk is CHARGED and the honest hand-off becomes reachable.
+          _ar="$O/state/lanemerge-$PR.apiretry"
+          _n_ar="$(cat "$_ar" 2>/dev/null || echo 0)"; is_limit "$_n_ar" || _n_ar=0
+          if [ "$_n_ar" -lt "$MAX_WATCH" ]; then
+            _n_ar=$(( _n_ar + 1 )); printf '%s\n' "$_n_ar" > "$_ar" 2>/dev/null || true
+            w="$(cat "$WATCH_F" 2>/dev/null || echo 0)"; is_limit "$w" || w=0
+            [ "$w" -gt 0 ] && printf '%s\n' "$(( w - 1 ))" > "$WATCH_F" 2>/dev/null
+            say "… the API could not be read (retry $_n_ar/$MAX_WATCH this cycle) — no round and no chunk is spent"
+          else
+            say "… the API STILL cannot be read after $MAX_WATCH retries this cycle — the chunk is charged"
+          fi
           printf '%s\n' "WAITING_API the read failed" > "$O/state/lanemerge-$PR.lastdisp" 2>/dev/null || true
           say "… the API could not be read while confirming the merge — re-run the loop (no round and no chunk is spent)"
           verdict WAITING_API "the merge confirmation read failed; not a statement about the PR"

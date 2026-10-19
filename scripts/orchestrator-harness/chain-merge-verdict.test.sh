@@ -31,7 +31,11 @@ cat > "$T/bin/gh" <<'EOF'
 #   `pulls/<n>`  → "is THIS repo's PR merged?"      → ${MERGED_AT_STUB-} (set-but-empty = NOT merged)
 #   anything else→ "which open PR is on this branch?" → 5
 case " $* " in
-  *"pulls/"*) [ -n "${MERGED_AT_STUB+x}" ] && printf '%s\n' "$MERGED_AT_STUB" ;;
+  *"pulls/"*)
+    # MERGED_API_FAIL=1 = the READ failed (rate limit / DNS): exit non-zero, print nothing. A failed
+    # read and an answered "not merged" are DIFFERENT facts and the chain must not collapse them.
+    if [ "${MERGED_API_FAIL:-0}" = 1 ]; then exit 1; fi
+    [ -n "${MERGED_AT_STUB+x}" ] && printf '%s\n' "$MERGED_AT_STUB" ;;
   *) printf '5\n' ;;
 esac
 EOF
@@ -55,7 +59,7 @@ ran() { [ -f "$T/chain-ran" ]; }
 PID=""
 drive() { # drive <phase-grace> <handoff-wait> — starts the chain, sets $PID (never echoes: a caller
            # running this in $( ) would own the child in a SUBSHELL and could not wait/kill it)
-  PATH="$T/bin:$PATH" O="$T/o" HOME="$T/home" CHAIN_CLAIM_COMMIT="deadbeef" MERGED_AT_STUB="${MERGED_AT_STUB-}" \
+  PATH="$T/bin:$PATH" O="$T/o" HOME="$T/home" CHAIN_CLAIM_COMMIT="deadbeef" MERGED_AT_STUB="${MERGED_AT_STUB-}" MERGED_API_FAIL="${MERGED_API_FAIL-0}" \
     LANE_PHASE_GRACE="$1" LANE_HANDOFF_WAIT="$2" \
     bash "$SCRIPT" "$T/repo" o/r 42 feat/42-tm >> "$T/o/logs/chain-42.log" 2>&1 &
   PID=$!
@@ -90,6 +94,21 @@ for _ in $(seq 1 25); do kill -0 "$PID" 2>/dev/null || break; sleep 1; done
 wait "$PID" 2>/dev/null; RC=$?
 ck "…an UNCONFIRMED state/merged-5.done does NOT end the chain: it names the API read and reviews at the tip" \
    $([ "$RC" = 0 ] && ran && grep -q "reports no merged_at" "$T/o/logs/chain-42.log" && echo 0 || echo 1)
+
+# Arm (a2): the read FAILED → the chain says it could not READ it (not "reports no merged_at", which
+# would be a claim about an answer that never arrived) and still reviews at the tip.
+rig
+printf '42 %s\n' "$(date +%s)" > "$T/o/state/lanemerge-5.phase"
+printf 'FIX_REQUIRED this head owns checks are RED: lint\n' > "$T/o/state/lanemerge-5.verdict"
+MERGED_API_FAIL=1 drive 90 30
+sleep 3
+printf 'abc\n' > "$T/o/state/merged-5.done"
+for _ in $(seq 1 25); do kill -0 "$PID" 2>/dev/null || break; sleep 1; done
+wait "$PID" 2>/dev/null; RC=$?
+ck "…a FAILED confirmation read is reported as UNREAD (not as 'reports no merged_at'), and the chain still reviews" \
+   $([ "$RC" = 0 ] && ran \
+      && grep -q "could not READ the merge confirmation" "$T/o/logs/chain-42.log" \
+      && ! grep -q "reports no merged_at" "$T/o/logs/chain-42.log" && echo 0 || echo 1)
 
 # Arm (b): the SAME marker WITH a confirmed merged_at → exit 0, no review — the pair is what makes the
 # confirmation discriminating rather than decorative.

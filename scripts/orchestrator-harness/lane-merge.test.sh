@@ -278,6 +278,8 @@ printf 'open||newhead1|clean\n' > "$T/pr-open3.tsv"
 sleep 60 & LIVEPID=$!
 printf '999999 oldhead %s\n' "$OT/logs/lane-merge-41.log" > "$OT/state/lanemerge-41.chain"
 printf '%s\n' "$LIVEPID" > "$OT/state/mergeclaim-41.lock"
+printf '1\n' > "$OT/state/lanemerge-41.headmoved"   # stale counters from an EARLIER cycle
+printf '1\n' > "$OT/state/lanemerge-41.apiretry"
 # ⛔ THE ADOPTION LIVES ON THE LAUNCH PATH (`launch_chain`), not in --watch — that is where a lane
 # decides whether to start a competitor. So drive the shipped entry point that reaches it, with a green
 # check fixture so it gets that far.
@@ -285,9 +287,43 @@ OUT="$(PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" \
       LANE_MERGE_WAIT=0 LANE_MERGE_POLL=0 \
       bash "$SCRIPT" 41 --repo o/r --pr-tsv "$T/pr-open3.tsv" --checks-tsv "$T/checks-green.tsv" 2>&1)"; RC=$?
 kill "$LIVEPID" 2>/dev/null || true
+ck "…and adopting a live chain RESETS the per-chain counters (a cumulative head-moved counter would block the PR for ever)" \
+   $([ ! -f "$OT/state/lanemerge-41.headmoved" ] && [ ! -f "$OT/state/lanemerge-41.apiretry" ] && echo 0 || echo 1)
 ck "a live merge lock is adopted: the record carries the LIVE pid and the RECORDED head (not the current one)" \
    $([ "$RC" = 11 ] && [ "$(awk '{print $1}' "$OT/state/lanemerge-41.chain")" = "$LIVEPID" ] \
       && [ "$(awk '{print $2}' "$OT/state/lanemerge-41.chain")" = oldhead ] && echo 0 || echo 1)
+
+# ── 11c-septies. the WAITING_API refund is CAPPED, so the spin has a terminal state ────────────
+new_o "$T/junk-q4.tsv"
+printf 'open||newhead1|clean\n' > "$T/pr-open4.tsv"
+printf '%s deadbeef %s\n' 999994 "$OT/logs/lane-merge-51.log" > "$OT/state/lanemerge-51.chain"
+printf '[merge 51] MERGED via the rail (attempt 1)\n' > "$OT/logs/merge-51.log"
+printf '%s\n' "15" > "$OT/state/lanemerge-51.watch"          # AT the budget: this pass must be charged
+printf '%s\n' "15" > "$OT/state/lanemerge-51.apiretry"       # …and the refunds are exhausted
+printf '%s\n' "WAITING_API the read failed" > "$OT/state/lanemerge-51.lastdisp"   # the last chunk
+OUT="$(PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 LANE_MERGE_MAX_WATCH=15 MERGED_API_FAIL=1 \
+      bash "$SCRIPT" 51 --watch --repo o/r --pr-tsv "$T/pr-open4.tsv" 2>&1)"; RC=$?
+ck "an EXHAUSTED refund allowance CHARGES the chunk, so the budget is reachable (exit 13) — and it says the PR may be merged" \
+   $([ "$RC" = 13 ] && [ "$(verdict_of 51 | cut -d' ' -f1)" = BLOCKED_ATTEMPTS ] \
+      && grep -q 'may be merged' "$OT/state/lanemerge-51.verdict" && echo 0 || echo 1)
+
+# ── 11c-octies. past the refund allowance the chunk is CHARGED (the cap has teeth) ─────────────
+# ⛔ THE PREVIOUS CASE COULD NOT SEE THIS: it seeded watch AT the budget, so the budget check fired
+# before the refund branch was ever reached and removing the cap left the suite green (measured by the
+# verifier). This fixture stays UNDER the budget (watch=3) with the allowance spent, so the only thing
+# that decides w is the cap itself: charged → 4, capped-refund-removed → 3.
+new_o "$T/junk-q5.tsv"
+printf 'open||newhead1|clean\n' > "$T/pr-open5.tsv"
+printf '%s deadbeef %s\n' 999993 "$OT/logs/lane-merge-52.log" > "$OT/state/lanemerge-52.chain"
+printf '[merge 52] MERGED via the rail (attempt 1)\n' > "$OT/logs/merge-52.log"
+printf '%s\n' "3" > "$OT/state/lanemerge-52.watch"
+printf '%s\n' "15" > "$OT/state/lanemerge-52.apiretry"
+OUT="$(PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 MERGED_API_FAIL=1 \
+      bash "$SCRIPT" 52 --watch --repo o/r --pr-tsv "$T/pr-open5.tsv" 2>&1)"; RC=$?
+ck "past the refund allowance the chunk is CHARGED (watch 3 → 4, not refunded) and the run says so" \
+   $([ "$RC" = 11 ] && [ "$(verdict_of 52 | cut -d' ' -f1)" = WAITING_API ] \
+      && [ "$(cat "$OT/state/lanemerge-52.watch")" = 4 ] \
+      && grep -q 'STILL cannot be read' <<<"$OUT" && echo 0 || echo 1)
 
 # ── 11d. the handoff marker is HEAD-BOUND even from --watch ────────────────────────────────────
 new_o "$T/pr18.tsv"
@@ -430,9 +466,17 @@ ck "WAIT_S ($_ws) + MAX_WATCH x POLL ($_mw x $_ps) = $(( ${_ws:-0} + ${_mw:-0} *
    $([ -n "$_mw" ] && [ -n "$_ps" ] && [ -n "$_lt" ] && [ -n "$_ws" ] && [ $((_ws + _mw * _ps)) -le "$_lt" ] && echo 0 || echo 1)
 new_o "$T/pr4.tsv"
 printf '20\n' > "$OT/state/lanemerge-32.watch"
+printf '15\n' > "$OT/state/lanemerge-32.apiretry"
+printf '%s\n' "WAITING_API the read failed" > "$OT/state/lanemerge-32.lastdisp"
+printf '1\n' > "$OT/state/lanemerge-32.headmoved"
 run 32 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-red.tsv"
 ck "a NEW fix round RE-ARMS the supervision budget (a spent counter must not refuse the next cycle)" \
    $([ "$RC" = 10 ] && [ ! -s "$OT/state/lanemerge-32.watch" ] && echo 0 || echo 1)
+# ⛔ AND IT RE-ARMS THE PER-CHAIN COUNTERS TOO (verifier finding): a surviving `lastdisp` let a later
+# chunk post "the LAST chunk could not READ the merge confirmation" about a chunk that read it fine.
+ck "a NEW fix round also clears apiretry / headmoved / lastdisp (a stale disposition must not drive the hand-off)" \
+   $([ ! -f "$OT/state/lanemerge-32.apiretry" ] && [ ! -f "$OT/state/lanemerge-32.headmoved" ] \
+      && [ ! -f "$OT/state/lanemerge-32.lastdisp" ] && echo 0 || echo 1)
 
 # ── 19. an EMPTY PR read must not blank the head or read as merged (E7) ────────────────────────
 new_o "$T/pr25.tsv"
