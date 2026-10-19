@@ -2262,6 +2262,23 @@ case "$OUT" in
   *"worktree=fail-closed"*) ok "status: the per-class verdict is printed, not summarised away" ;;
   *) bad "status: the failed class is not named — $OUT" ;;
 esac
+# (3b) a DEFERRED class is reported by name, and is NOT a ⛔ (agent-infra#2036): the pass freed real
+# bytes in the other classes while the uv sink waited for a quiet box — a reader must see BOTH.
+printf 'epoch=%s\niso=2026-10-18T17:00:00Z\nmode=apply\nok=1\nrc=0\nclasses=uv,venv,worktree\nfreed_mb=417\nfreed_mb_uv=0\nfreed_mb_venv=417\nfreed_mb_worktree=0\nverdict_uv=deferred\nverdict_venv=ok\nverdict_worktree=ok\ndeferred=uv (uv active)\nnot_armed=\nfailed=\ndetail=uv deferred (uv active)\n' "$(date +%s)" \
+  >"$DR/home/.pi/agent/state/disk-reaper.status"
+OUT="$(dr_sup)"
+case "$OUT" in
+  *"disk reaper: last pass"*"freed 417MB"*"venv=417MB"*) ok "status: a pass that deferred a class still reports the bytes the other classes freed" ;;
+  *) bad "status: the reclaim is lost when a class deferred — $OUT" ;;
+esac
+case "$OUT" in
+  *"deferred this pass: uv (uv active)"*) ok "status: the deferred class is NAMED with the owner's reason" ;;
+  *) bad "status: the deferral is silent — $OUT" ;;
+esac
+case "$OUT" in
+  *"DISK REAPER NOT HEALTHY"*) bad "status: a deferral painted a healthy pass as a ⛔ — $OUT" ;;
+  *) ok "status: a deferral is not a ⛔ (the operator action is 'wait', not 'fix')" ;;
+esac
 # (4) a STALE record (a timer that stopped firing) is not reported as healthy
 printf 'epoch=%s\niso=2026-10-17T00:00:00Z\nmode=apply\nok=1\nrc=0\nclasses=uv\nfreed_mb=5\nfreed_mb_uv=5\nfreed_mb_venv=0\nfreed_mb_worktree=0\nverdict_uv=ok\ndetail=ok\n' "$(( $(date +%s) - 86400 ))" \
   >"$DR/home/.pi/agent/state/disk-reaper.status"

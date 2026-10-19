@@ -17,7 +17,8 @@
 #   bounded     over-bound uv + npm + pip fixtures are all shrunk under the bound
 #               in ONE armed pass (exit 0); under-bound caches are untouched
 #   dry-run     the default mode mutates NOTHING and says so
-#   holder      a live `uv` process → nothing evicted, exit 3, the holder is named
+#   holder      a live `uv` process → nothing evicted, exit 7 (DEFERRED, not FAILED — agent-infra#2036),
+#               the holder is named, and a REAL failure in the same pass still outranks the deferral
 #   probe       an unusable ps probe (empty table) → nothing evicted, exit 3
 #   hardlinks   the cache shrinks but the filesystem does not gain a byte (a uv
 #               cache entry hardlinked into a .venv) → exit 3, named as such. This
@@ -326,15 +327,21 @@ assert_le "$(kb "$H/.cache/uv")" "$BOUND_KB" "the pass that broke the stale lock
 [ ! -d "$H/.pi/agent/state/pi-cache-reap.lock" ] && ok "the lock was released on exit" || bad "a lock was left behind"
 
  echo
-echo "── 4. a live holder: nothing evicted, and the pass refuses ──"
+echo "── 4. a live holder: nothing evicted, and the pass DEFERS (agent-infra#2036) ──"
 H="$T/h4"
 new_cache "$H/.cache/uv" 3000 2000
 UV_BEFORE="$(kb "$H/.cache/uv")"
 OUT="$(PS_STUB="$T/bin/ps-uv" run_reap "$H" --apply 2>&1)"; RC=$?
-assert_eq "$RC" "3" "a cache over its bound with a live uv exits 3 (the bound was not enforced)"
+assert_eq "$RC" "7" "a cache over its bound with a live uv exits 7 (DEFERRED — a busy box is not a broken reaper)"
+assert_ne "$RC" "3" "…and NOT 3: on a busy cell 3 is the hourly red unit this issue exists to remove"
 assert_eq "$(kb "$H/.cache/uv")" "$UV_BEFORE" "NOTHING was evicted while a uv process could be resolving against the cache"
+assert_contains "$OUT" "DEFERRED" "the pass names the deferral, not a failure"
+assert_contains "$OUT" "deferred: uv active" "the deferral carries the machine-readable reason the entry point lifts into its record"
+assert_not_contains "$OUT" "FAILED" "…and it does not say FAILED, which is indistinguishable from breakage"
+assert_not_contains "$OUT" "FAIL-CLOSED" "…nor fail-closed: nothing is broken, the box is in use"
 assert_contains "$OUT" "live uv process is running" "the refusal names the tool-process rule"
 assert_contains "$OUT" "uv sync" "the refusal names the actual holder process"
+assert_contains "$OUT" "NOT a failure, exit 7" "the pass-end line states the vocabulary, so a log reader is not left guessing"
 
 echo
 echo "── 4a. a live npm / pip holder is seen too (they are not native binaries) ──"
@@ -348,9 +355,32 @@ for pair in "ps-npm:.npm" "ps-pip:.cache/pip" "ps-pip2:.cache/pip" \
   new_cache "$H/$cdir" 3000 2000
   UV_BEFORE="$(kb "$H/$cdir")"
   OUT="$(PS_STUB="$T/bin/$stub" run_reap "$H" --apply 2>&1)"; RC=$?
-  assert_eq "$RC" "3" "a live holder via $stub blocks the escalation (exit 3)"
+  assert_eq "$RC" "7" "a live holder via $stub blocks the escalation (exit 7, deferred)"
   assert_eq "$(kb "$H/$cdir")" "$UV_BEFORE" "nothing was evicted while $stub was resolving against the cache"
 done
+
+echo
+echo "── 4a-bis. A REAL FAILURE OUTRANKS A DEFERRAL (never the other way) ──"
+# The point of the split is that a deferral must not swallow a failure: json cache over-bound with
+# a live uv is 7, but the SAME pass with one unmeasurable cache is 3. Anything else would let a
+# broken reaper report a busy box.
+H="$T/h4a-bis"
+new_cache "$H/.cache/uv" 3000 2000
+UV_BEFORE="$(kb "$H/.cache/uv")"
+: >"$H/not-a-dir"
+OUT="$(PS_STUB="$T/bin/ps-uv" PIP_DIR="$H/not-a-dir" run_reap "$H" --apply 2>&1)"; RC=$?
+assert_eq "$RC" "3" "a deferral PLUS a real failure exits 3 (the failure wins)"
+assert_contains "$OUT" "FAILED" "and the pass says FAILED for the broken cache"
+assert_contains "$OUT" "outrank" "it says why the deferral did not decide the code"
+assert_eq "$(kb "$H/.cache/uv")" "$UV_BEFORE" "and NOTHING was evicted under the live uv"
+
+echo
+echo "── 4a-ter. A DRY RUN over bound with a live uv is 5, not a deferral (nothing was going to be deleted) ──"
+H="$T/h4a-ter"
+new_cache "$H/.cache/uv" 3000 2000
+OUT="$(PS_STUB="$T/bin/ps-uv" run_reap "$H" --dry-run 2>&1)"; RC=$?
+assert_eq "$RC" "5" "dry-run over bound exits 5 (unchanged: there is no destructive half to defer)"
+assert_not_contains "$OUT" "DEFERRED" "a dry run never defers — it deletes nothing either way"
 
  echo
 echo "── 4b. a process naming ONE entry preserves only that entry ──"
@@ -690,12 +720,12 @@ H="$T/h10b"; mkdir -p "$H"
 awk '/^cache_reaper_path\(\)/,/^}/' "$SUPERVISOR" >"$H/fn.sh"
 awk '/^reap_global_caches\(\)/,/^}/' "$SUPERVISOR" >>"$H/fn.sh"
 grep -q 'reap_global_caches()' "$H/fn.sh" || bad "could not extract reap_global_caches() from the supervisor (the test needs the SHIPPED bytes)"
-for want in 0 4 5 3; do
+for want in 0 4 5 7 3; do
     printf '#!/bin/sh\nexit %s\n' "$want" >"$H/pi-cache-reap.sh"
     chmod +x "$H/pi-cache-reap.sh"
     out="$(env HOME="$H" bash -c 'say() { printf "%s\n" "$*"; }; . "$1"; reap_global_caches' _ "$H/fn.sh" 2>&1)"
     case "$want" in
-        0|4|5) assert_not_contains "$out" "warn:" "exit $want is NOT a failure: no warning is raised (4 = did not run, 5 = over bound and not acted on)" ;;
+        0|4|5|7) assert_not_contains "$out" "warn:" "exit $want is NOT a failure: no warning is raised (4 = did not run, 5 = over bound and not acted on, 7 = DEFERRED on a busy box — #2036)" ;;
         3)     assert_contains "$out" "warn: the cache reaper exited 3" "a fail-closed pass (exit 3) DOES warn, naming the status and the log" ;;
     esac
 done
@@ -768,7 +798,7 @@ printf '%s\n' "  4242 /usr/local/bin/uvx ruff check"
 SH
 chmod +x "$T/bin/ps-uvx"
 OUT="$(PS_STUB="$T/bin/ps-uvx" run_reap "$H" --apply 2>&1)"; RC=$?
-assert_eq "$RC" "3" "a live uvx blocks the whole-cache escalation (uvx resolves through the same uv cache)"
+assert_eq "$RC" "7" "a live uvx blocks the whole-cache escalation (uvx resolves through the same uv cache) and DEFERS it"
 assert_eq "$(kb "$H/.cache/uv")" "$UV_BEFORE" "nothing was evicted while uvx could be resolving against the cache"
 
 echo

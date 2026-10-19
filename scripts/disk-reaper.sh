@@ -83,13 +83,27 @@
 #   DISK_REAPER_STALE_SECONDS  a status older than this is STALE (default 7200)
 #   CACHE_REAPER / VENV_REAPER / WORKTREE_REAPER  explicit delegate paths
 #
-# Exit codes: 0 pass completed, every class ok
+# Exit codes: 0 pass completed, every class ok (a class may be DEFERRED — see below — and the pass
+#               is still 0: a busy box is not a failure)
 #             2 usage
-#             3 fail-closed: a delegate is missing, failed closed, or a class had no repo to scan —
-#               nothing is claimed for it (a skipped class is NEVER a pass)
-#             4 a class completed but at least one removal FAILED
+#             3 fail-closed: a delegate is missing, failed closed, had no repo to scan, or was NOT
+#               ARMED while the pass asked for --apply — nothing is claimed for it (a skipped class
+#               is NEVER a pass)
+#             4 a class completed but at least one removal FAILED (or another pass holds the lock)
 #             5 dry-run only: a class reported work it would do (over budget / reapable items), so
 #               the pass is informative but the condition is still present
+#
+# DELEGATE CONTRACT — what a class's exit code means here (agent-infra#2036)
+#   0 ok · 4 a removal failed · 5 over bound (dry-run) · 3 the delegate could not do or verify its
+#   job (MISCONFIGURED / broken: loud) · 7 DEFERRED — the delegate did every safe thing it could and
+#   deliberately did not take its destructive half because the box is in use (a live tool process
+#   holds the cache). 7 is reported by name and does NOT fail the pass. The two are different
+#   operator actions — "wait for a quiet pass" versus "fix the reaper" — so they must not collapse
+#   into one string, which is exactly what the measured defect did: the `uv` owner exits 3 whenever
+#   any `uv` process is live, so the consolidated pass printed `verdict=3` for a pass that had just
+#   reclaimed 417 MB in the venv class, every hour, on a healthy box (agent-infra#2036).
+#   ⚠️ A refusal still removes NOTHING: the fail-closed property (an unavailable probe deletes
+#   nothing) is untouched — only how a refusal is REPORTED and AGGREGATED changed.
 #
 set -uo pipefail
 
@@ -128,6 +142,22 @@ CAND_UV=0; CAND_VENV=0; CAND_WT=0
 RC_UV=0; RC_VENV=0; RC_WT=0
 VERDICT_UV="not-run"; VERDICT_VENV="not-run"; VERDICT_WT="not-run"
 NOTE_UV=""; NOTE_VENV=""; NOTE_WT=""
+# DEFERRED (agent-infra#2036) — a class may report `deferred`: it did every safe thing it could and
+# deliberately did not take its destructive half because the box is in use (a live `uv`/`npm`/`pip`
+# may be resolving against the cache; we cannot know which entries it holds). That is NOT a failure
+# and must never become the pass's verdict: the measured defect was a pass that reclaimed 417 MB
+# and printed `verdict=3`, which reads as "nothing was freed". DEFNOTE_* carries the delegate's own
+# reason (`uv active`) so the report names what waited instead of collapsing it into `fail-closed`.
+DEFNOTE_UV=""; DEFNOTE_VENV=""; DEFNOTE_WT=""
+# The two per-repo classes see one rc per repo, so a deferral has to be remembered separately from
+# the accumulated code (a later repo's failure must still win). The uv class is a single invocation
+# and keeps rc 7 as its own verdict, so it needs no flag.
+DEFER_VENV=0; DEFER_WT=0
+# `--apply` MUST REACH THE DELEGATE OR BE REPORTED BY NAME. A delegate that silently ran its own
+# dry-run while the unit asked for an armed pass is a misconfiguration (arm it), which is a
+# different operator action from a broken delegate (fix it) — so it gets its own verdict.
+UNARMED_UV=0; UNARMED_VENV=0; UNARMED_WT=0
+DEFERRED_LIST=""; NOTARMED_LIST=""; FAILED_LIST=""
 
 say() { printf '%s\n' "$*"; }
 log() { printf '%s\n' "$*" >>"$LOG" 2>/dev/null || true; }
@@ -213,6 +243,12 @@ print_status() {
     say "verdict_uv=$(status_field verdict_uv)"
     say "verdict_venv=$(status_field verdict_venv)"
     say "verdict_worktree=$(status_field verdict_worktree)"
+    # A deferral is a HEALTHY pass that left work for a quiet box, so it never changes `status`.
+    # It is printed anyway: "the uv class has deferred for six hours" is information an operator
+    # needs, and an empty field is the honest answer when nothing deferred.
+    say "deferred=$(status_field deferred)"
+    say "not_armed=$(status_field not_armed)"
+    say "failed=$(status_field failed)"
     say "detail=$(status_field detail)"
     # Exit vocabulary matches the pass: 0 ok, 3 failed/stale/never. A `[ ... ]` here would return 1,
     # which no caller's case arm handles and which reads as "usage error" to a human.
@@ -362,17 +398,87 @@ class_verdict() { # class_verdict <rc>
         0) printf 'ok' ;;
         4) printf 'removal-failed' ;;
         5) if is_dry; then printf 'over-bound'; else printf 'fail-closed'; fi ;;
+        # 7 = the owner DEFERRED: nothing is broken, the box is in use (agent-infra#2036).
+        # It stays a distinct verdict so the report can name it; it never becomes `fail-closed`.
+        7) printf 'deferred' ;;
         *) printf 'fail-closed' ;;
     esac
 }
 
+# defer_marker <delegate output> — the delegate's OWN words for why it deferred, lifted from its
+# `DEFERRED (deferred: <what>)` line, or empty. The exit code (7) decides THAT it deferred; this
+# only fills in the reason, so a format change yields a missing reason, never a wrong verdict.
+defer_marker() {
+    printf '%s\n' "$1" | sed -n 's/.*(deferred: \([^()]*\)).*/\1/p' | head -1
+}
+
+# delegate_unarmed <class> <delegate output> — did the delegate actually run in APPLY mode when the
+# pass asked for --apply? rc 1 = it POSITIVELY reported a dry-run of its own. A delegate that never
+# printed a mode line (missing, crashed, timed out, refused early) is NOT accused: its exit code
+# already says what happened, and "unknown" must never read as "misconfigured".
+#
+# WHY THIS EXISTS (#2036 property 2): `--apply` must either reach the delegate or be reported by
+# name. `delegate not armed` and `delegate failed` need different operator actions (arm it, versus
+# fix the box/the reaper), so they must not collapse into one `fail-closed` string. The markers are
+# each owner's own pass-start line — the one place it states the mode it resolved.
+delegate_unarmed() {
+    local class="$1" out="$2"
+    case "$class" in
+        uv)       case "$out" in *"pass start mode=dry-run"*) return 1 ;; esac ;;
+        venv)     case "$out" in *"apply=0"*) return 1 ;; esac ;;
+        worktree) case "$out" in *"DRY-RUN — nothing removed"*) return 1 ;; esac ;;
+    esac
+    return 0
+}
+
+# class_final_verdict <class> — the effective verdict for a class, including the codes set by an
+# early return (missing delegate, no repo) that never reached the class's own verdict assignment.
+class_final_verdict() { # class_final_verdict <class>
+    local c="$1" v rc
+    case "$c" in
+        uv)       v="$VERDICT_UV";  rc="$RC_UV" ;;
+        venv)     v="$VERDICT_VENV"; rc="$RC_VENV" ;;
+        worktree) v="$VERDICT_WT";  rc="$RC_WT" ;;
+        *)        printf 'fail-closed'; return 0 ;;
+    esac
+    # ⛔ A class that FAILED BEFORE it could record a verdict still has a CODE. The missing-delegate
+    # and no-repo paths return early, so reading VERDICT_* alone recorded `not-run` for a class that
+    # had just failed closed and the pass exited 0 (measured: T5). Map the code in that case, so an
+    # absent verdict can only ever mean "ok", never "nothing happened".
+    case "$v" in
+        ""|not-run) class_verdict "$rc" ;;
+        *) printf '%s' "$v" ;;
+    esac
+}
+
+# class_outcomes — one line answering "what did each class do, and what could it not": every
+# SELECTED class with its verdict and, when it deferred, the owner's reason. The pass summary used
+# to be the only account of a pass, and it said `verdict=3` for a pass that had reclaimed 417 MB
+# (#2036); this line is the fix for a reader who stops at the summary.
+class_outcomes() {
+    local c v d s=""
+    for c in uv venv worktree; do
+        want_class "$c" || continue
+        v="$(class_final_verdict "$c")"
+        case "$c" in
+            uv)       d="$DEFNOTE_UV" ;;
+            venv)     d="$DEFNOTE_VENV" ;;
+            worktree) d="$DEFNOTE_WT" ;;
+        esac
+        s="${s}${s:+ }${c}=${v}${d:+(${d})}"
+    done
+    printf '%s' "${s:-none}"
+}
+
 # worst_rc <current> <incoming> — the pass keeps the most severe class code, so one repo's failure
 # cannot be masked by another repo's success. 3 (fail-closed) outranks 4 (a removal failed), which
-# outranks 0/5.
+# outranks 0/5. ⛔ 7 (deferred) is handled by the CALLER, not folded in here: a deferral is not a
+# severity, so feeding it through would either mask a later real failure or invent one. Worst-case
+# if it ever arrives: it is treated as "no severity contribution" — never as a failure.
 worst_rc() {
     local cur="$1" new="$2"
     case "$new" in
-        0|5) printf '%s' "$cur" ;;
+        0|5|7) printf '%s' "$cur" ;;
         3) printf '3' ;;
         4) [ "$cur" = 3 ] && printf '3' || printf '4' ;;
         *) printf '3' ;;
@@ -406,6 +512,18 @@ reap_uv() {
     before="$(free_kb_for_path "$path")"
     run_class bash "$CACHE_REAPER_PATH" "$(mode_flag)"
     RC_UV="$CLASS_RC"
+    # ⛔ ARMED IS VERIFIED, NOT ASSUMED (#2036 property 2). We passed --apply; if the delegate's own
+    # pass-start line says it resolved a dry-run, the schedule asked for work and got a report. That
+    # is a MISCONFIGURATION (`arm it`), which must not be reported as breakage (`fix it`).
+    if ! is_dry && ! delegate_unarmed uv "$CLASS_OUT"; then
+        UNARMED_UV=1; RC_UV=3
+        NOTE_UV="pi-cache-reap.sh ran a dry-run although --apply was requested (delegate not armed)"
+    elif [ "$RC_UV" = 7 ]; then
+        # DEFERRED: the owner did every safe thing it could and refused the destructive half because
+        # a live tool process holds the cache. Nothing is broken; the pass is not failed by it.
+        DEFNOTE_UV="$(defer_marker "$CLASS_OUT")"
+        NOTE_UV="uv deferred${DEFNOTE_UV:+ ($DEFNOTE_UV)}"
+    fi
     after="$(free_kb_for_path "$path")"
     delta=""
     if [ -n "$before" ] && [ -n "$after" ]; then
@@ -439,15 +557,16 @@ reap_uv() {
     fi
     CAND_UV="$count"
     VERDICT_UV="$(class_verdict "$RC_UV")"
+    [ "$UNARMED_UV" = 1 ] && VERDICT_UV="not-armed"
     # A class that did not finish ok must say so in the record's `detail`, or the supervisor prints
     # `ok=0 detail=ok` — a self-contradicting line is worse than no line.
-    [ "$RC_UV" = 0 ] || NOTE_UV="${NOTE_UV:-pi-cache-reap.sh exited $RC_UV}"
+    [ "$RC_UV" = 0 ] && [ "$UNARMED_UV" = 0 ] || NOTE_UV="${NOTE_UV:-pi-cache-reap.sh exited $RC_UV}"
     say "$CLASS_OUT"
     [ -n "$cands" ] && say "$cands"
     if is_dry; then
-        say "disk-reaper: class=uv rc=$RC_UV verdict=$(class_verdict "$RC_UV") mode=dry-run candidates=$count would_free_du=${WOULD_UV}MB (du estimate, over-counts hardlinked blocks) freed_df=0MB"
+        say "disk-reaper: class=uv rc=$RC_UV verdict=$VERDICT_UV mode=dry-run candidates=$count would_free_du=${WOULD_UV}MB (du estimate, over-counts hardlinked blocks) freed_df=0MB"
     else
-        say "disk-reaper: class=uv rc=$RC_UV verdict=$(class_verdict "$RC_UV") mode=apply freed_df=${FREED_UV}MB (df delta on $path)"
+        say "disk-reaper: class=uv rc=$RC_UV verdict=$VERDICT_UV${DEFNOTE_UV:+ deferred=($DEFNOTE_UV)} mode=apply freed_df=${FREED_UV}MB (df delta on $path)"
     fi
     return 0
 }
@@ -496,6 +615,16 @@ reap_venv() {
         b="$(free_kb_for_path "$repo")"
         run_class bash "$VENV_REAPER_PATH" --gc --repo "$repo" --min-age "$VENV_MIN_AGE" "$(mode_flag)"
         out="$CLASS_OUT"; rc="$CLASS_RC"
+        # Same two rules as the uv class, per repo: a delegate that positively reports a dry-run while
+        # --apply was requested is `not-armed`; a delegate exit 7 is a DEFERRAL, not a failure.
+        if ! is_dry && ! delegate_unarmed venv "$out"; then
+            UNARMED_VENV=1; rc=3
+            NOTE_VENV="reap-lane-venvs.sh ran a dry-run although --apply was requested (delegate not armed)"
+        elif [ "$rc" = 7 ]; then
+            DEFER_VENV=1; [ -n "$DEFNOTE_VENV" ] || DEFNOTE_VENV="$(defer_marker "$out")"
+            NOTE_VENV="venv deferred${DEFNOTE_VENV:+ ($DEFNOTE_VENV)}"
+            rc=0
+        fi
         a="$(free_kb_for_path "$repo")"
         if [ -n "$b" ] && [ -n "$a" ]; then d=$(( (a - b) / 1024 )); [ "$d" -lt 0 ] && d=0; freed=$((freed + d)); fi
         say "$out"
@@ -504,6 +633,8 @@ reap_venv() {
         [ "$rc" -gt 0 ] && NOTE_VENV="${NOTE_VENV:-reap-lane-venvs.sh exited $rc}"
     done <<<"$REPOS"
     VERDICT_VENV="$(class_verdict "$RC_VENV")"
+    [ "$DEFER_VENV" = 1 ] && [ "$RC_VENV" = 0 ] && VERDICT_VENV="deferred"
+    [ "$UNARMED_VENV" = 1 ] && VERDICT_VENV="not-armed"
     if is_dry; then FREED_VENV=0; else FREED_VENV="$freed"; fi
     # Candidate rows are the owner's `REAP <reason> <N>MB <path>` lines (the lowercase `reap` rows are
     # its log format; the uppercase ones are the pass report). Only counted in dry-run: in apply mode
@@ -524,9 +655,9 @@ reap_venv() {
         done <<<"$rows"
         CAND_VENV="$all_c"
         [ -n "$cands" ] && say "$cands"
-        say "disk-reaper: class=venv rc=$RC_VENV verdict=$(class_verdict "$RC_VENV") mode=dry-run candidates=$all_c would_free_du=${WOULD_VENV}MB (du estimate) freed_df=0MB"
+        say "disk-reaper: class=venv rc=$RC_VENV verdict=$VERDICT_VENV mode=dry-run candidates=$all_c would_free_du=${WOULD_VENV}MB (du estimate) freed_df=0MB"
     else
-        say "disk-reaper: class=venv rc=$RC_VENV verdict=$(class_verdict "$RC_VENV") mode=apply freed_df=${FREED_VENV}MB (df delta)"
+        say "disk-reaper: class=venv rc=$RC_VENV verdict=$VERDICT_VENV${DEFNOTE_VENV:+ deferred=($DEFNOTE_VENV)} mode=apply freed_df=${FREED_VENV}MB (df delta)"
     fi
     return 0
 }
@@ -548,6 +679,16 @@ reap_worktree() {
         b="$(free_kb_for_path "$repo")"
         run_class bash "$WORKTREE_REAPER_PATH" "$(mode_flag)" --repo "$repo" --aged-days "$WT_AGED_DAYS"
         out="$CLASS_OUT"; rc="$CLASS_RC"
+        # Same two rules as the other classes (see reap_uv): arming is verified against the owner's
+        # own pass-start line, and a deferral (7) is not a failure.
+        if ! is_dry && ! delegate_unarmed worktree "$out"; then
+            UNARMED_WT=1; rc=3
+            NOTE_WT="pi-reap-worktrees.sh ran a dry-run although --apply was requested (delegate not armed)"
+        elif [ "$rc" = 7 ]; then
+            DEFER_WT=1; [ -n "$DEFNOTE_WT" ] || DEFNOTE_WT="$(defer_marker "$out")"
+            NOTE_WT="worktree deferred${DEFNOTE_WT:+ ($DEFNOTE_WT)}"
+            rc=0
+        fi
         a="$(free_kb_for_path "$repo")"
         if [ -n "$b" ] && [ -n "$a" ]; then d=$(( (a - b) / 1024 )); [ "$d" -lt 0 ] && d=0; freed=$((freed + d)); fi
         say "$out"
@@ -556,6 +697,8 @@ reap_worktree() {
         [ "$rc" -gt 0 ] && NOTE_WT="${NOTE_WT:-pi-reap-worktrees.sh exited $rc}"
     done <<<"$REPOS"
     VERDICT_WT="$(class_verdict "$RC_WT")"
+    [ "$DEFER_WT" = 1 ] && [ "$RC_WT" = 0 ] && VERDICT_WT="deferred"
+    [ "$UNARMED_WT" = 1 ] && VERDICT_WT="not-armed"
     if is_dry; then FREED_WT=0; else FREED_WT="$freed"; fi
     # The owner deliberately reports NO byte figure (its `.venv`s are hardlinked into the uv cache,
     # measured 84 GB du delta vs 22 GB freed). The consolidation requirement is "byte counts in
@@ -589,9 +732,9 @@ reap_worktree() {
         done <<<"$rows"
         CAND_WT="$all_c"
         [ -n "$cands" ] && say "$cands"
-        say "disk-reaper: class=worktree rc=$RC_WT verdict=$(class_verdict "$RC_WT") mode=dry-run candidates=$all_c would_free_du=${WOULD_WT}MB (du estimate) freed_df=0MB"
+        say "disk-reaper: class=worktree rc=$RC_WT verdict=$VERDICT_WT mode=dry-run candidates=$all_c would_free_du=${WOULD_WT}MB (du estimate) freed_df=0MB"
     else
-        say "disk-reaper: class=worktree rc=$RC_WT verdict=$(class_verdict "$RC_WT") mode=apply freed_df=${FREED_WT}MB (df delta)"
+        say "disk-reaper: class=worktree rc=$RC_WT verdict=$VERDICT_WT${DEFNOTE_WT:+ deferred=($DEFNOTE_WT)} mode=apply freed_df=${FREED_WT}MB (df delta)"
     fi
     return 0
 }
@@ -612,13 +755,17 @@ want_class venv     && { reap_venv;     heartbeat_lock; }
 want_class worktree && { reap_worktree; heartbeat_lock; }
 
 # Verdict: a fail-closed class wins over a removal failure, which wins over "dry-run found work".
+# ⛔ A DEFERRED class contributes NO severity (#2036 property 1): it did not fail, and a pass that
+# reclaimed 417 MB in the venv class must never print `verdict=3` because the uv class waited for a
+# quiet box. The deferral is carried by its own field (`deferred=`) and by the outcomes line, so it
+# is reported — it just is not the pass's verdict.
 verdict=0
-for rc in "$RC_UV" "$RC_VENV" "$RC_WT"; do
-    case "$rc" in
-        0) ;;
-        5) if is_dry; then :; else verdict=3; fi ;;
-        4) [ "$verdict" = 3 ] || verdict=4 ;;
-        *) verdict=3 ;;
+for c in uv venv worktree; do
+    case "$(class_final_verdict "$c")" in
+        deferred)      : ;;   # named below; never a severity
+        removal-failed) [ "$verdict" = 3 ] || verdict=4 ;;
+        fail-closed|not-armed) verdict=3 ;;
+        over-bound)    if is_dry; then :; else verdict=3; fi ;;
     esac
 done
 if [ "$verdict" = 0 ] && is_dry \
@@ -627,11 +774,38 @@ if [ "$verdict" = 0 ] && is_dry \
 fi
 
 TOTAL=$(( FREED_UV + FREED_VENV + FREED_WT ))
+# Build the named lists ONCE, from the verdicts, so the summary, the record and the supervisor's
+# line all name the same classes. A deferral is named WITH the owner's reason: "uv deferred (uv
+# active)" tells the operator "wait for a quiet pass", where `fail-closed` told them to investigate.
+DEFERRED_LIST=""; NOTARMED_LIST=""; FAILED_LIST=""
+for c in uv venv worktree; do
+    v="$(class_final_verdict "$c")"
+    case "$c" in
+        uv)       d="$DEFNOTE_UV" ;;
+        venv)     d="$DEFNOTE_VENV" ;;
+        worktree) d="$DEFNOTE_WT" ;;
+    esac
+    case "$v" in
+        deferred)  DEFERRED_LIST="${DEFERRED_LIST}${DEFERRED_LIST:+, }${c}${d:+ ($d)}" ;;
+        not-armed) NOTARMED_LIST="${NOTARMED_LIST}${NOTARMED_LIST:+, }${c}" ;;
+        fail-closed|removal-failed) FAILED_LIST="${FAILED_LIST}${FAILED_LIST:+, }${c}" ;;
+    esac
+done
 if is_dry; then
     say "disk-reaper: pass end mode=dry-run verdict=$verdict freed_df=0MB would_free_du=$(( WOULD_UV + WOULD_VENV + WOULD_WT ))MB candidates=$(( CAND_UV + CAND_VENV + CAND_WT )) — NOTHING was removed"
 else
-    say "disk-reaper: pass end mode=apply verdict=$verdict freed_df=${TOTAL}MB (uv=${FREED_UV}MB venv=${FREED_VENV}MB worktree=${FREED_WT}MB)"
+    # ⛔ THE SUMMARY MUST NOT READ AS "NOTHING HAPPENED" WHEN SOMETHING DID (#2036). It states the
+    # per-class df split, then THE NAME of every class that deferred, failed or was not armed — three
+    # different operator actions, never one `verdict=N`. It does NOT editorialise the total as
+    # "reclaimed": a per-class df delta is a raw measurement and a concurrent writer can move it
+    # (measured in verification: a class that removed nothing reported +35MB). The field name
+    # `freed_df` already says exactly what the number is.
+    say "disk-reaper: pass end mode=apply verdict=$verdict freed_df=${TOTAL}MB (uv=${FREED_UV}MB venv=${FREED_VENV}MB worktree=${FREED_WT}MB) — deferred: ${DEFERRED_LIST:-none}; not armed: ${NOTARMED_LIST:-none}; failed: ${FAILED_LIST:-none}"
+    # The sentence the measured reader needed: the pass DID work, a deferral is a subset of the
+    # classes, and it removed nothing rather than failing.
+    [ -n "$DEFERRED_LIST" ] && say "disk-reaper: NOTE — ${DEFERRED_LIST} deferred and evicted NOTHING this pass (a live tool process holds it); every other selected class ran normally — a deferral is not a failure (agent-infra#2036)"
 fi
+say "disk-reaper: outcomes $(class_outcomes) freed_df=${TOTAL}MB mode=$MODE_TEXT"
 
 # ── record it ───────────────────────────────────────────────────────────────────────────────────
 # Atomic write: a supervisor `status` can run while this pass is mid-write.
@@ -662,6 +836,11 @@ UTMP="$STATUS.tmp.$$"
     printf 'verdict_uv=%s\n' "$VERDICT_UV"
     printf 'verdict_venv=%s\n' "$VERDICT_VENV"
     printf 'verdict_worktree=%s\n' "$VERDICT_WT"
+    # The deferral channel, separate from `ok`/`rc` on purpose: a deferred class is a healthy pass
+    # that left work for a quiet pass, and a reader must be able to see WHICH class and WHY.
+    printf 'deferred=%s\n' "$DEFERRED_LIST"
+    printf 'not_armed=%s\n' "$NOTARMED_LIST"
+    printf 'failed=%s\n' "$FAILED_LIST"
     printf 'repos=%s\n' "$(printf '%s' "$REPOS" | tr '\n' ',')"
     printf 'detail=%s\n' "$DETAIL"
 } >"$UTMP" 2>/dev/null && mv -f "$UTMP" "$STATUS" 2>/dev/null \

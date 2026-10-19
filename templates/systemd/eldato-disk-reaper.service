@@ -32,4 +32,8 @@ IOSchedulingClass=idle
 # The pass writes its own bounded log under DISK_REAPER_STATE_DIR; journald keeps the exit status.
 ExecStart=/bin/bash {{REAPER}} --apply
 # A pass that exits 3 (a class failed closed) must not look like success to `systemctl start`.
+# agent-infra#2036: a DEFERRED class (a live `uv`/`npm`/`pip` holds the cache, so the destructive half
+# waited) is NOT a failure and the pass exits 0 for it — the unit stays green on a healthy busy host,
+# which is the state this unit spends most of its life in. The delegate's own exit 7 is consumed by
+# disk-reaper.sh and never reaches systemd, so it does not belong in this list either.
 SuccessExitStatus=0 4 5

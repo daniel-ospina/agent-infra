@@ -83,6 +83,21 @@
 #     measurability. Same for an unusable `ps` probe when escalation is needed, and
 #     for an entry whose sharing or filesystem cannot be determined. No pass may
 #     exit 0 on an unverified claim.
+#   * DEFERRED IS NOT FAILED (agent-infra#2036). A cache that is over its bound while a
+#     LIVE tool process (`uv`/`npm`/`pip`) may be resolving against it gets the safe
+#     half (the prune) and nothing else: we cannot know which entries a resolver holds,
+#     so evicting any of them is a guess. That refusal is the EXPECTED outcome on a BUSY
+#     box — the normal state of the cells this runs on — and it is exit 7 (DEFERRED),
+#     never 3. The distinction is not cosmetic: 3 is "this reaper cannot do or verify its
+#     job" (measure, log, verify, probe) and must stay loud; 7 is "the box is in use, so
+#     the destructive half waits for a quiet pass" and must NOT paint a healthy host red
+#     (measured: systemd `status=3/NOTIMPLEMENTED` hourly, and `launchctl` exit 5 unread,
+#     on boxes that were fine). BOTH remove nothing — the fail-closed property is
+#     unchanged; only the vocabulary is. Exit 3 always outranks 7.
+#     ⚠️ NOT deferred: a cache still over its bound after evicting every removable entry,
+#     even when a process merely NAMES the remaining entries. A leaked uv build backend
+#     never exits (measured, 4-8h old, ppid 1), so "deferred" there would be permanent
+#     wallpaper for a sink that is genuinely stuck.
 #   * The cache directory is whatever the OWNING TOOL says it is (`uv cache dir`,
 #     which honours XDG_CACHE_HOME) rather than a hardcoded `$HOME` guess: bounding a
 #     directory the tool does not use is a report about a cache that does not exist.
@@ -162,7 +177,11 @@
 # a tool run that starts mid-pass, STOPS the eviction and rides that cache's verdict as a STOPPING
 # note — exit 3 if the cache is still over its bound, exit 0 with the note if the pass had already
 # brought it under and verified the reclaim) · 4 did not run (another pass holds the lock) ·
-# 5 a cache is OVER its bound and nothing was done about it (dry-run — the shipped stance).
+# 5 a cache is OVER its bound and nothing was done about it (dry-run — the shipped stance) ·
+# 7 DEFERRED (agent-infra#2036): the only reason a cache stayed over its bound is that a live
+# `uv`/`npm`/`pip` process may be resolving against it, so the DESTRUCTIVE half was not run (the
+# safe prune was). Nothing is broken — a scheduled pass on a busy box is expected to report this,
+# and a caller must not treat it as a failure. Exit 3 always outranks it.
 # ⚠️ NOT the sibling reapers' vocabulary: pi-reap-worktrees.sh uses 4 for "a removal FAILED"
 # and 3 for "lock held". Here 4 is a benign skip and 3 is always fail-closed; a fleet reader
 # must not apply the other mapping.
@@ -193,6 +212,10 @@ MODE=dry-run
 MODE_SET=0
 PRINT_CONFIG=0
 FAILS=0
+# Caches whose ONLY unmet condition was a live tool process holding them (agent-infra#2036).
+# Counted apart from FAILS on purpose: a busy box is not a broken reaper. Exit 7 when the pass
+# deferred something and nothing failed; exit 3 whenever FAILS>0, whatever else deferred.
+DEFERS=0
 # Caches found OVER their bound on a pass that is not armed. Exit 5, so a caller can tell
 # "checked and over" from "checked and fine" (0) and from "did not run" (4).
 OVER_ONLY=0
@@ -218,6 +241,17 @@ plog() {
 fail_closed() {
     FAILS=$((FAILS + 1))
     say "pi-cache-reap: FAIL-CLOSED — $*"
+}
+
+# defer_closed <class> <reason> — this cache could not be bounded THIS PASS for a reason that
+# requires no action: a live <class> process may be resolving against it, so the destructive
+# half must wait (agent-infra#2036). The wording is a CONTRACT for the consolidating entry point
+# (disk-reaper.sh): the token `deferred: <class> active` is what it lifts into its record, and
+# exit 7 is what tells it "not a failure" without parsing prose. Everything else about the
+# pass is unchanged — deferring still removes NOTHING, exactly as failing closed did.
+defer_closed() {
+    DEFERS=$((DEFERS + 1))
+    say "pi-cache-reap: DEFERRED (deferred: $1 active) — $2"
 }
 
 now_epoch() { date +%s 2>/dev/null; }
@@ -701,7 +735,14 @@ reap_target() {
         holders="$(ps_matches tool "$class" "$dir")" \
             || { fail_closed "$class: $dir is $(mb_str "$now_kb") > ${MAX_MB}MB and the ps probe could not answer — NOT escalating an unproven cache"; return 0; }
         if [ -n "$holders" ]; then
-            fail_closed "$class: $dir is $(mb_str "$now_kb") > ${MAX_MB}MB and a live $class process is running, so the entries it holds cannot be known — NOT escalating; process(es): $holders (the cache is shared, so any live $class on this box may be resolving against it)"
+            # ⛔ A LIVE RESOLVER WINS THE DESTRUCTIVE HALF (#2036 investigation). The safe half
+            # (`prune`) ALREADY RAN above — that is the bounded subset that is safe while a lane
+            # works. What is refused here is the eviction, and it cannot be narrowed: argv tells
+            # you a `uv` exists, never which entries it is reading, so any subset rule would be a
+            # guess that deletes a live lane's env. So: refuse the eviction, and report it as
+            # DEFERRED (7) rather than FAILED (3) — on a busy box this is the normal outcome, and
+            # a scheduled pass that calls it a failure paints a healthy host red every hour.
+            defer_closed "$class" "$dir is $(mb_str "$now_kb") > ${MAX_MB}MB and a live $class process is running, so the entries it holds cannot be known — NOT escalating (the safe prune already ran; nothing was evicted); process(es): $holders (the cache is shared, so any live $class on this box may be resolving against it)"
             return 0
         fi
         read_mount_table || MOUNTS_RC=2   # read once per cache; rc 2 => every entry is refused
@@ -1177,7 +1218,16 @@ cap_log
 
 if [ "$FAILS" -gt 0 ]; then
     say "pi-cache-reap: FAILED — $FAILS cache(s) could not be bounded or verified this pass (exit 3)"
+    [ "$DEFERS" -gt 0 ] && say "pi-cache-reap:   and $DEFERS cache(s) were DEFERRED (a live tool process holds them) — the failures above outrank them"
     exit 3
+fi
+# ⛔ DEFERRED IS NOT FAILED (#2036). Reached only when NOTHING failed: a cache was left over its
+# bound because a live tool process holds it, which is the normal state of a busy box. Exit 7 so a
+# caller can tell "wait for a quiet pass" from "fix me" — and so the consolidating pass does not
+# report a healthy host's work as this class's verdict.
+if [ "$DEFERS" -gt 0 ]; then
+    say "pi-cache-reap: pass end mode=$MODE — $DEFERS cache(s) DEFERRED to a quiet pass (a live tool process holds them; the safe prune ran, nothing was evicted) — NOT a failure, exit 7"
+    exit 7
 fi
 # ⛔ THE PASS-END LINE MUST NOT CLAIM A BOUND THE PASS DID NOT ENFORCE. On the shipped dry-run
 # stance an over-bound cache used to print "every present cache bounded and verified" and exit 0

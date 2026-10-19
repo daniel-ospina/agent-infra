@@ -1928,6 +1928,12 @@ cmd_status() {
     _det="$(printf '%s\n' "$_drs" | sed -n 's/^detail=//p' | head -1)"
     if [ "$_drc" -eq 0 ]; then
       say "disk reaper: last pass $(printf '%s\n' "$_drs" | sed -n 's/^iso=//p' | head -1) ($(printf '%s\n' "$_drs" | sed -n 's/^age_seconds=//p' | head -1)s ago) mode=$(printf '%s\n' "$_drs" | sed -n 's/^mode=//p' | head -1) freed $(printf '%s\n' "$_drs" | sed -n 's/^freed_mb=//p' | head -1)MB (uv=$(printf '%s\n' "$_drs" | sed -n 's/^freed_mb_uv=//p' | head -1)MB venv=$(printf '%s\n' "$_drs" | sed -n 's/^freed_mb_venv=//p' | head -1)MB worktree=$(printf '%s\n' "$_drs" | sed -n 's/^freed_mb_worktree=//p' | head -1)MB)"
+      # agent-infra#2036: a DEFERRED class is a healthy pass that left work for a quiet box (a live
+      # `uv` holds the cache). It is not a ⛔ — but it must not be SILENT either: "the uv sink has
+      # waited for six hours" is the signal that the box has not been quiet, and the operator's
+      # action (wait) is different from a failure's (fix). Named from the pass record, never inferred.
+      _drdef="$(printf '%s\n' "$_drs" | sed -n 's/^deferred=//p' | head -1)"
+      [ -n "$_drdef" ] && say "  disk reaper: deferred this pass: $_drdef — not a failure; left for a pass with no live holder (per class: uv=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_uv=//p' | head -1) venv=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_venv=//p' | head -1) worktree=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_worktree=//p' | head -1))"
     elif [ "$_dst" = "never" ]; then
       say "⛔ DISK REAPER HAS NEVER RUN — installed but no pass recorded ($_det); start it: sudo systemctl start eldato-disk-reaper.service"
     else
@@ -2198,9 +2204,11 @@ reap_global_caches() {
   rc=0
   bash "$reaper" --apply || rc=$?
   # 4 = it did not run (another pass holds the lock); 5 = a cache is over its bound, which cannot
-  # happen on this --apply path but is neutral by design. Neither is a failure, and warning about
-  # them would train the reader to ignore the one line that matters.
-  [ "$rc" -eq 0 ] || [ "$rc" -eq 4 ] || [ "$rc" -eq 5 ] || say "warn: the cache reaper exited $rc — see ${CACHE_REAP_LOG:-$HOME/.pi/agent/state/pi-cache-reap.log}"
+  # happen on this --apply path but is neutral by design; 7 = DEFERRED, a live tool process holds the
+  # cache so the destructive half waited (agent-infra#2036). None is a failure, and warning about
+  # them would train the reader to ignore the one line that matters — measured: a busy box deferred
+  # every hour, and an hourly `warn:` for it is the alarm-become-wallpaper this issue exists to stop.
+  [ "$rc" -eq 0 ] || [ "$rc" -eq 4 ] || [ "$rc" -eq 5 ] || [ "$rc" -eq 7 ] || say "warn: the cache reaper exited $rc — see ${CACHE_REAP_LOG:-$HOME/.pi/agent/state/pi-cache-reap.log}"
   return 0
 }
 

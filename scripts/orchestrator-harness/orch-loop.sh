@@ -1145,6 +1145,7 @@ while true; do
         case "$_rc" in
           0) rm -f "$O/state/.cache-reap-blocked" ;;   # checked: every cache is under its bound
           4) : ;;                                      # did not run (lock held) — touch nothing
+          7) : ;;                                      # DEFERRED: a live tool process holds the cache, so the destructive half waited (agent-infra#2036) — expected on a busy box, not a finding to paint the cell with
           5) { printf 'a package cache is OVER its bound and the reaper is not armed (dry-run):\n';
                tail -3 "$LOG" 2>/dev/null; } >"$O/state/.cache-reap-blocked" 2>/dev/null || true ;;
           *) { printf 'cache reaper exit %s at %s\n' "$_rc" "$(date -u +%Y-%m-%dT%H:%M:%SZ)";

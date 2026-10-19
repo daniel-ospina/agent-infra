@@ -120,7 +120,19 @@ Every pass writes `$DISK_REAPER_STATE_DIR/disk-reaper.status` (default
 mode=apply ok=0 rc=3 classes=uv,venv,worktree
 freed_mb=515 freed_mb_uv=1 freed_mb_venv=0 freed_mb_worktree=514
 verdict_uv=fail-closed verdict_venv=ok verdict_worktree=ok
+deferred= not_armed= failed=uv
 would_free_mb_* candidates_* detail=pi-cache-reap.sh exited 3
+```
+
+A healthy pass on a busy box — the normal state of a cell — looks like this instead (measured,
+see *Deferred* below):
+
+```
+mode=apply ok=1 rc=0
+freed_mb=417 freed_mb_uv=0 freed_mb_venv=417
+verdict_uv=deferred verdict_venv=ok verdict_worktree=ok
+deferred=uv (uv active) not_armed= failed=
+detail=uv deferred (uv active)
 ```
 
 `cloud-cell-supervisor.sh status` prints the last pass, its age and the per-class
@@ -135,15 +147,53 @@ failed/stale/never, 2 usage.
 
 | code | meaning |
 |---|---|
-| 0 | pass completed, every selected class ok |
+| 0 | pass completed — every selected class is `ok` **or `deferred`** (a busy box is not a failure) |
 | 2 | usage |
-| 3 | fail-closed: a delegate is missing, failed closed, or a class had no repo — nothing is claimed for it |
+| 3 | fail-closed: a delegate is missing, failed closed, had no repo to scan, or was **not armed** while the pass asked for `--apply` — nothing is claimed for it |
 | 4 | a class completed but at least one removal failed (or another pass holds the lock) |
 | 5 | dry-run only: a class reported work it would do |
 
+A **delegate** has one code this pass understands that is not a failure (agent-infra#2036):
+
+| delegate code | this pass reports | operator action |
+|---|---|---|
+| `0` | `verdict=ok` | none |
+| `4` | `verdict=removal-failed` → pass 4 | investigate the refused removal |
+| `5` | `verdict=over-bound` (dry-run) | arm the pass, or accept the report |
+| `7` | `verdict=deferred` (+ `deferred=uv (uv active)`) → **pass stays 0** | **none — wait for a pass with no live holder** |
+| anything else (incl. `3`) | `verdict=fail-closed` → pass 3 | **fix the reaper/box** |
+| *(the delegate ran a dry-run although `--apply` was passed)* | `verdict=not-armed` → pass 3 | **arm it** (`--apply` is not reaching it) |
+
+`deferred` and `not-armed` are deliberately *different strings from* `fail-closed`: the three need
+different actions, and collapsing them is what made a healthy cell report `status=3/NOTIMPLEMENTED`
+hourly.
+
+## Deferred: a busy box is not a broken reaper (#2036)
+
+`pi-cache-reap.sh` reaps in two halves: the safe half (`uv cache prune`, safe while lanes work) and
+the destructive half (evict entries, largest first). The destructive half is refused whenever a live
+`uv`/`npm`/`pip` may be resolving against the cache, because argv cannot tell you *which* entries it
+is reading — any subset rule is a guess that deletes a live lane's env. Measured consequence on this
+box and on a cell: **the `uv` sink was never reaped on a busy box, on any platform**, and the
+consolidated pass inherited the refusal as its own verdict.
+
+**Decision: a live `uv` always wins the destructive half — but the refusal is `deferred`, not
+`FAILED`.** The owner exits **7** for it (a new code, only for this condition), and the pass reports
+it by name, keeps the pass at exit 0, and prints the deferral in the record and in
+`cloud-cell-supervisor.sh status`. Nothing about what is deleted changed: the fail-closed property
+("an unavailable probe removes nothing") is untouched, and the safe `prune` still runs on a busy box.
+
+Not deferred, on purpose: a cache **still** over its bound after evicting every removable entry
+because a process merely *names* the remaining entries. A leaked uv build backend never exits
+(measured: 4–8 h old, ppid 1), so calling that `deferred` would be permanent wallpaper for a sink
+that is genuinely stuck. It stays `fail-closed`.
+
+Also not deferred: the reclaim that cannot be *verified* (cache shrank, filesystem did not gain).
+That is "the pass cannot prove what it did", which is a real failure of the pass, not a busy box.
+
 ## Tests
 
-`scripts/disk-reaper.test.sh` — 65 assertions, run by the `disk-reaper` shard of
+`scripts/disk-reaper.test.sh` — 100 assertions, run by the `disk-reaper` shard of
 `run-bash-shards.sh`:
 
 | | |
@@ -157,9 +207,12 @@ failed/stale/never, 2 usage.
 | T10 | an `--only` list naming nothing is refused (never a healthy no-op) |
 | T11 | a dry run records 0 bytes freed (it removed nothing) |
 | T12 | the installer's `--dry-run` changes nothing; a set-but-missing `$DISK_REAPER` is refused |
+| T13 | a **deferred** class is not the pass's verdict: `uv` defers while `venv` frees real bytes → exit 0, `deferred=uv (uv active)`, record `ok=1`, `--print-status` exit 0 |
+| T14 | `--apply` that did not reach the delegate is `not-armed` (its own verdict), the pass is red, and the record does not call it a failure |
+| T15 | a genuinely broken delegate is still `fail-closed`, named, and never recorded as deferred |
 
 T9, T10 and T12 were each red on the build that preceded the fresh-context review
-that found them.
+that found them. T13–T15 pin agent-infra#2036.
 
 ## Deliberately out of scope
 
@@ -185,7 +238,7 @@ Armed pass, `--repo /tmp/cell-t3 --repo /tmp/cell-ai`:
 |---|---|---|
 | worktree | 13 checkouts removed (12 agent-infra, 1 tortoise), branch refs retained | **+514 MB** (`df`) |
 | venv | all live lanes kept (`live-cwd`), one env `too-recent` under the 30-min floor | 0 MB |
-| uv | **fail-closed**: a live `uv run pytest` held the cache, so nothing was evicted | 0 MB |
+| uv | **fail-closed** at the time; this is now reported as `deferred` (#2036) — a live `uv run pytest` held the cache, so nothing was evicted | 0 MB |
 
 `df` before `8317 MB` free → after `8833 MB` free (**+516 MB**), matching the
 `freed_mb=515` record.

@@ -348,6 +348,107 @@ OUT="$(DISK_REAPER="$T/t12/not-here.sh" HOME="$T/t12/home" DISK_REAPER_REPOS="$R
     bash "$INST" --install 2>&1)"; RC=$?
 assert_eq "$RC" "2" "T12 a SET but missing \$DISK_REAPER is refused (never a silent different copy)"
 
+# ── T13: a DEFERRED class is not the pass's verdict (#2036 property 1) ──────────────────────────
+# The measured defect: `uv` refuses because a live process holds the cache, the venv class does real
+# work in the SAME pass, and the pass printed `verdict=3` — which a reader (and --print-status, and
+# the supervisor's ⛔ line) reads as "nothing was freed". A busy box is not a broken reaper.
+ENVNAME=t13
+REPO="$(mk_repo t13)"
+WT_D="$(mk_wt "$REPO" dead13 feat/t13-dead)"
+mk_venv "$WT_D" 8
+commit_in "$WT_D" "$OLD_DATE" dead13
+mkdir -p "$T/t13"
+cat >"$T/t13/uv-deferred.sh" <<'SH'
+#!/usr/bin/env bash
+# Records the flags it RECEIVED (property 2: --apply must actually reach the delegate), then
+# reports exactly what pi-cache-reap.sh reports on a busy box: DEFERRED, exit 7.
+printf '%s\n' "$*" >>"${STUB_ARGS:?}"
+printf '%s\n' "pi-cache-reap: pass start mode=apply max=2048MB per cache (#1987)"
+printf '%s\n' "pi-cache-reap: DEFERRED (deferred: uv active) — /x/.cache/uv is 5761MB > 2048MB and a live uv process is running, so the entries it holds cannot be known — NOT escalating (the safe prune already ran; nothing was evicted); process(es): 42 uv sync"
+printf '%s\n' "pi-cache-reap: pass end mode=apply — 1 cache(s) DEFERRED to a quiet pass (a live tool process holds them; the safe prune ran, nothing was evicted) — NOT a failure, exit 7"
+exit 7
+SH
+chmod +x "$T/t13/uv-deferred.sh"
+: >"$T/t13/args.log"
+OUT="$(STUB_ARGS="$T/t13/args.log" CACHE_REAPER="$T/t13/uv-deferred.sh" \
+       run_reaper --apply --repo "$REPO" --min-age 0 --only uv,venv 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T13 a pass whose uv class deferred is NOT a failure (exit 0, not 3)"
+assert_contains "$OUT" "class=uv rc=7 verdict=deferred" "T13 the uv class reports DEFERRED, by name"
+assert_contains "$OUT" "deferred=(uv active)" "T13 …and carries the owner's own reason"
+assert_absent "$OUT" "class=uv rc=3" "T13 the uv class is not collapsed into fail-closed"
+assert_contains "$(cat "$T/t13/args.log")" "--apply" "T13 --apply really reached the delegate (it is not a dry-run in disguise)"
+assert_contains "$OUT" "freed_df=" "T13 the summary states what the filesystem got back"
+assert_contains "$OUT" "deferred and evicted NOTHING this pass" "T13 …and says in words that the deferred class removed nothing (the reader's confusion in #2036)"
+assert_contains "$OUT" "deferred: uv (uv active)" "T13 the summary NAMES the deferred class"
+assert_contains "$OUT" "failed: none" "T13 …and that nothing failed"
+assert_absent "$OUT" "pass end mode=apply verdict=3" "T13 the pass does not report a deferral as its verdict"
+assert_nodir "$WT_D/.venv" "T13 the OTHER class's work really happened in the same pass (the venv is gone)"
+assert_contains "$OUT" "class=venv rc=0 verdict=ok" "T13 the class that did the work reports ok"
+ST="$(cat "$T/$ENVNAME/state/disk-reaper.status")"
+assert_contains "$ST" "ok=1" "T13 the pass record reads healthy"
+assert_contains "$ST" "rc=0" "T13 the record's rc is 0, so the supervisor is not told the pass failed"
+assert_contains "$ST" "deferred=uv (uv active)" "T13 the deferral is a RECORDED field, not inferred from prose"
+assert_contains "$ST" "verdict_uv=deferred" "T13 the per-class verdict is readable without the log"
+assert_contains "$ST" "verdict_venv=ok" "T13 the class that worked is readable too"
+ST="$(HOME="$T/home" DISK_REAPER_STATE_DIR="$T/$ENVNAME/state" bash "$REAPER" --print-status 2>&1)"; SRC=$?
+assert_eq "$SRC" "0" "T13 --print-status exits 0 for a pass that deferred a class"
+assert_contains "$ST" "status=ok" "T13 …and says ok, so a healthy busy box is not painted red"
+assert_contains "$ST" "deferred=uv (uv active)" "T13 --print-status names the deferral"
+
+# ── T14: `--apply` that did NOT reach the delegate is named, and is red (#2036 property 2) ───────
+# `delegate not armed` (arm it) and `delegate failed` (fix it) are different operator actions, so
+# they must not collapse into one `fail-closed` string. The delegate's own pass-start line is the
+# evidence: it says which mode it resolved.
+ENVNAME=t14
+REPO="$(mk_repo t14)"
+mkdir -p "$T/t14"
+cat >"$T/t14/uv-unarmed.sh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "pi-cache-reap: pass start mode=dry-run max=2048MB per cache (#1987)"
+printf '%s\n' "pi-cache-reap: pass end mode=dry-run — every present cache is under the 2048MB bound"
+exit 0
+SH
+chmod +x "$T/t14/uv-unarmed.sh"
+OUT="$(CACHE_REAPER="$T/t14/uv-unarmed.sh" run_reaper --apply --repo "$REPO" --only uv 2>&1)"; RC=$?
+assert_eq "$RC" "3" "T14 an unarmed delegate on an armed pass exits 3 (the unit asked for work and got a report)"
+assert_contains "$OUT" "verdict=not-armed" "T14 the class says NOT ARMED — its own verdict, not fail-closed"
+assert_absent "$OUT" "class=uv rc=0 verdict=ok" "T14 a dry-run delegate is never reported as an ok armed class"
+ST="$(cat "$T/$ENVNAME/state/disk-reaper.status")"
+assert_contains "$ST" "not_armed=uv" "T14 the record names the unarmed class"
+assert_contains "$ST" "delegate not armed" "T14 …with the action an operator must take"
+assert_contains "$ST" "ok=0" "T14 an unarmed pass must not read healthy"
+assert_contains "$ST" "failed=" "T14 and it is NOT recorded as a failure (a different action)"
+case "$(sed -n 's/^failed=//p' "$T/$ENVNAME/state/disk-reaper.status")" in
+  "") ok "T14 an unarmed delegate is not also recorded as a failure (the two stay distinct)" ;;
+  *) bad "T14 an unarmed delegate was also recorded as FAILED: $(sed -n 's/^failed=//p' "$T/$ENVNAME/state/disk-reaper.status")" ;;
+esac
+
+# ── T15: a genuinely BROKEN delegate still fails loudly and by name (#2036 property 4) ──────────
+# The property that must NOT change: an unavailable/broken probe claims nothing and is loud.
+ENVNAME=t15
+REPO="$(mk_repo t15)"
+mkdir -p "$T/t15"
+cat >"$T/t15/uv-broken.sh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "pi-cache-reap: pass start mode=apply max=2048MB per cache (#1987)"
+printf '%s\n' "pi-cache-reap: FAIL-CLOSED — uv: cannot measure /x/.cache/uv (du failed) — the bound cannot be enforced"
+printf '%s\n' "pi-cache-reap: FAILED — 1 cache(s) could not be bounded or verified this pass (exit 3)"
+exit 3
+SH
+chmod +x "$T/t15/uv-broken.sh"
+OUT="$(CACHE_REAPER="$T/t15/uv-broken.sh" run_reaper --apply --repo "$REPO" --only uv 2>&1)"; RC=$?
+assert_eq "$RC" "3" "T15 a broken delegate still fails the pass (exit 3)"
+assert_contains "$OUT" "class=uv rc=3 verdict=fail-closed" "T15 the class says fail-closed"
+assert_absent "$OUT" "deferred: uv" "T15 a failure is never reported as a deferral"
+assert_absent "$OUT" "verdict=deferred" "T15 …and no class verdict is deferred"
+ST="$(cat "$T/$ENVNAME/state/disk-reaper.status")"
+assert_contains "$ST" "failed=uv" "T15 the record names the failed class"
+assert_absent "$ST" "not_armed=uv" "T15 …and does not accuse it of being unarmed"
+case "$(sed -n 's/^deferred=//p' "$T/$ENVNAME/state/disk-reaper.status")" in
+  "") ok "T15 nothing is recorded as deferred" ;;
+  *) bad "T15 a failure was ALSO recorded as deferred — the vocabularies must not overlap" ;;
+esac
+
 echo
 echo "──────────────────────────────────────────────────────────────────────"
 if [ "$FAIL" -eq 0 ]; then
