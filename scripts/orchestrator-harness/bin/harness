@@ -489,7 +489,7 @@ cmd_install() {
   mkdir -p "$UNIT_DIR" "$LOG_DIR" "$QUEUE_DIR" || refuse "cannot create $UNIT_DIR / $LOG_DIR"
   printf '%s\n' "$(active_sha)" >"$ACTIVE_SHA_FILE" 2>/dev/null || warn "cannot record the active sha in $ACTIVE_SHA_FILE"
 
-  local name kind entry args dest tmp written=0 unchanged=0 enabled=0
+  local name kind entry args dest tmp written=0 unchanged=0 enabled=0 enable_failed=0
   while IFS='|' read -r name kind entry args; do
     [ -n "$name" ] || continue
     dest="$(unit_path "$name")"
@@ -507,6 +507,7 @@ cmd_install() {
           if systemctl --user enable "${SERVICE_PREFIX}${name}.service" >/dev/null 2>&1; then
             enabled=$((enabled + 1))
           else
+            enable_failed=$((enable_failed + 1))
             warn "could not enable ${SERVICE_PREFIX}${name}.service — the unit is written but will NOT start at boot (no user systemd manager? see 'harness doctor')"
           fi
         fi ;;
@@ -519,17 +520,26 @@ cmd_install() {
     systemctl --user daemon-reload >/dev/null 2>&1 || warn "systemctl --user daemon-reload failed — the units are written but systemd may serve stale definitions"
   fi
 
-  if [ "$written" -eq 0 ] && [ "$enabled" -eq 0 ]; then
+  # ⛔ "no-op" is not printed when enabling FAILED. A box whose units are current but not enabled is
+  # not a no-op: it is a box that will not come back after a reboot, and saying "nothing to do" over
+  # that is the false PASS this file exists to prevent.
+  if [ "$written" -eq 0 ] && [ "$enabled" -eq 0 ] && [ "$enable_failed" -eq 0 ]; then
     say "install: units already current ($unchanged unchanged, 0 written) — no-op"
+  elif [ "$written" -eq 0 ] && [ "$enabled" -eq 0 ]; then
+    say "install: units current ($unchanged unchanged) but $enable_failed unit(s) are NOT ENABLED — they will not start at boot"
   else
-    say "install: $written written, $unchanged unchanged, $enabled newly enabled (units: $UNIT_DIR)"
+    say "install: $written written, $unchanged unchanged, $enabled newly enabled, $enable_failed NOT ENABLED (units: $UNIT_DIR)"
     # A written unit does not move a RUNNING process: the supervisor reloads the definition, the
     # component keeps its old bytes until it is restarted. Saying so is the difference between
     # "installed" and "the box is running it".
     say "install: run 'harness restart' to move the running components onto these units"
   fi
   say "install: start them with: harness start"
-  return 0
+  # ⛔ THE EXIT CODE CARRIES THE ENABLE HALF. A unit that is written but not enabled looks installed
+  # and does nothing after a reboot, so an install that exits 0 over it is the "enabled + Restart=always"
+  # promise made in words only.
+  [ "$enable_failed" -eq 0 ] && return 0
+  return 1
 }
 
 # legacy_conflict_note <component> <entry> — name an EXISTING unit that already runs the same entry.
@@ -785,6 +795,21 @@ cmd_doctor() {
     [ -n "$name" ] || continue
     if [ ! -e "$entry" ]; then
       printf 'DOCTOR FAIL: required component %s is MISSING — %s does not exist\n' "$name" "$entry"
+      missing=$((missing + 1))
+    fi
+  done <<<"$(selected_components)"
+  [ "$missing" -gt 0 ] && fails=$((fails + missing))
+
+  # 3b) A COMPONENT WITH NO UNIT AT ALL. `enabled but not running` cannot catch this: `is-enabled` on a
+  # nonexistent unit fails, which is read as "not enabled" and skipped — so a component whose code is
+  # present but whose unit was never installed would pass every other row. The unit FILE is the
+  # question, and it is answerable without the supervisor.
+  missing=0
+  while IFS='|' read -r name kind entry args; do
+    [ -n "$name" ] || continue
+    if [ ! -f "$(unit_path "$name")" ]; then
+      printf 'DOCTOR FAIL: required component %s has NO supervisor unit — %s does not exist (run %s)\n' \
+        "$name" "$(unit_path "$name")" "'harness install'"
       missing=$((missing + 1))
     fi
   done <<<"$(selected_components)"

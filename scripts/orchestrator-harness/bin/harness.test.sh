@@ -189,6 +189,33 @@ else
   bad "no python3 to parse the plist — the darwin half of this gate is unexecuted"
 fi
 
+# ═══ §1b — "written but NOT enabled" is not a no-op ══════════════════════════════════════════
+# Non-vacuity: fold `enable_failed` into the no-op branch and this arm reads rc=0 with "no-op" over a
+# box whose units will not come back after a reboot — the false PASS this file exists to prevent.
+mkdir -p "$TMP/bin-noenable"
+cat >"$TMP/bin-noenable/systemctl" <<'STUBEOF'
+#!/usr/bin/env bash
+[ "${1:-}" = "--user" ] && shift
+verb="${1:-}"; shift || true
+case "$verb" in
+  show-environment|daemon-reload) exit 0 ;;
+  is-enabled) exit 1 ;;            # -> unknown, so install attempts enable
+  enable) exit 1 ;;                # and the attempt fails
+  show) printf 'ActiveState=inactive\nExecMainStatus=1\nMainPID=0\n'; exit 0 ;;
+esac
+exit 0
+STUBEOF
+chmod +x "$TMP/bin-noenable/systemctl"
+rm -rf "$TMP/units-ne"; mkdir -p "$TMP/units-ne"
+out="$(run_h env PATH="$TMP/bin-noenable:/usr/local/bin:/usr/bin:/bin" HARNESS_UNIT_DIR="$TMP/units-ne" \
+        bash "$FH/bin/harness" install 2>&1)"; rc=$?
+[ "$rc" -eq 1 ]; rc=$?
+ck "install FAILS when the units are written but cannot be enabled" $rc
+case "$out" in *"NOT ENABLED"*) rc=0 ;; *) rc=1 ;; esac
+ck "install says the units will not start at boot" $rc
+case "$out" in *"no-op"*) rc=1 ;; *) rc=0 ;; esac
+ck "install never calls that a no-op" $rc
+
 # ═══ §2 — status: a DEAD component reads DEAD, not RUNNING ═══════════════════════════════════
 # Non-vacuity: collapse `DOWN)` into the `RUN)` arm in cmd_status and this reddens.
 printf 'active 4242 0\n' >"$STUB_STATE/harness-orch.service.state"
@@ -327,6 +354,19 @@ out="$(run_h bash "$FH/bin/harness" doctor 2>&1)"; rc=$?
 ck "doctor FAILS when no supervisor units are installed" $rc
 case "$out" in *"no supervisor units installed"*) rc=0 ;; *) rc=1 ;; esac
 ck "doctor says the units are not installed, and what to run" $rc
+
+# (c2) ONE component's unit gone while its code is present — `enabled but not running` cannot catch
+# this (`is-enabled` fails on a nonexistent unit, which reads as "not enabled" and is skipped).
+run_h bash "$FH/bin/harness" install >/dev/null 2>&1
+rm -f "$TMP/units/harness-fix.service"
+rm -f "$STUB_STATE"/*.state; write_ps
+for c in orch diskreaper heartbeat pr-doctor merge fix; do printf 'active 6000 0\n' >"$STUB_STATE/harness-$c.service.state"; done
+out="$(run_h bash "$FH/bin/harness" doctor 2>&1)"; rc=$?
+[ "$rc" -eq 1 ]; rc=$?
+ck "doctor FAILS a component whose unit was never installed" $rc
+case "$out" in *"required component fix has NO supervisor unit"*) rc=0 ;; *) rc=1 ;; esac
+ck "doctor names the component and the unit file that is missing" $rc
+run_h bash "$FH/bin/harness" install >/dev/null 2>&1
 
 # (d) an AD-HOC controller (running, but no unit owns it) is a WARN, not a silent pass.
 run_h bash "$FH/bin/harness" install >/dev/null 2>&1
