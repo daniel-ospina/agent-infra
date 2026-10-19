@@ -696,6 +696,7 @@ claim_pr_ref() { printf '%s/%s' "$CLAIM_NS" "$(claim_pr_key "$1")"; }
 # assertion was flaky and must not be trusted as the cross-box proof. A unique object per
 # acquisition turns the loser's push into a genuine non-fast-forward rejection.
 
+
 _claim_commit() {
   _cg commit-tree "$EMPTY_TREE" -m "claim owner=$1 lease_until=$2 nonce=$RANDOM$RANDOM$$-$(date +%s%N)" 2>/dev/null
 }

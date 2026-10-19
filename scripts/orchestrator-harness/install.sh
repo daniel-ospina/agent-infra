@@ -246,7 +246,14 @@ if [ "$ACTION" = uninstall ]; then
     # already stopped, the plist never removed and no message (review round 2, measured: a FIFO lock
     # still blocked the exact expression after 2s). `lc_foreign_controller` already documents and
     # guards this same read; do not re-do it unguarded.
-    [ -f "$O/.orch.lock" ] || { _cp=0; break; }
+    # ⛔ AND "CANNOT READ IT" IS NOT "NO CONTROLLER" (review round 3, measured: a FIFO lock was
+    # byte-identical to an ABSENT lock and printed ✅). An absent lock means no controller holds it; a
+    # PRESENT but non-regular one means the controller's state CANNOT BE VERIFIED, and this block's
+    # whole job is to refuse that — the shape `lc_probe`'s `unread=2` already models ten lines above.
+    if [ ! -e "$O/.orch.lock" ]; then _cp=0; break; fi
+    if [ ! -f "$O/.orch.lock" ]; then
+      die "$O/.orch.lock is not a regular file (a FIFO, or a wedged mount), so whether the controller is still running cannot be VERIFIED — NOT removed, and the plist is kept at $PLIST. Next: ls -l '$O/.orch.lock'; if no controller is running, rm -f it, then re-run --uninstall"
+    fi
     _cp="$(cat "$O/.orch.lock" 2>/dev/null || echo 0)"
     case "$_cp" in ''|*[!0-9]*) _cp=0 ;; esac
     [ "$_cp" -gt 0 ] && kill -0 "$_cp" 2>/dev/null || break
