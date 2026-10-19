@@ -27,10 +27,9 @@
 #   45dd16cc8  agent-infra#1705  a failed PR listing is not an empty one
 #   26f6c9488  agent-infra#1702  portable load/swap/memory/mtime probes (Linux cell)
 #
-# NOT ported, deliberately: tortoise's open branch `fix/8468-closure-linkage` (severity-ordered
-# pool, `.prio`-keyed P0 bypass, `merged-not-closed.sh`, `Closes`-not-`Refs` lane brief). It is
-# unmerged work still under review; porting it would give it a second home. The removal PR must
-# either wait for it to merge or port it.
+# FORMERLY "NOT ported, deliberately": tortoise's branch `fix/8468-closure-linkage`. It MERGED as
+# 9b249f418 (2026-10-14) and is now PORTED — see the 2026-10-19 entry below. It is recorded here as
+# taken, not excluded, so a later lane does not read this line as a refusal and re-litigate it.
 #
 # ported_through=45dd16cc8
 # repinned_at=2026-10-13T20:23:38Z
@@ -205,7 +204,9 @@
 #                 #8612 verdict_kind() — a verdict-LESS run must authorise no fixer
 #                 #8521 host spawn-gate.sh; it is the last of the three duplicate `pi` call sites
 #   orch-loop.sh  #8521 source the helper; `can_spawn "$L"` at the four decision sites
-#                 #8469 `p0_merge_priority_override` + the `.prio` tier map it reads
+#                 #8468 `p0_merge_priority_override` + the `.prio` tier map it reads — ⛔ DROPPED,
+#                 not outstanding: main's unconditional drain rule (owner ruling, 2026-10-18)
+#                 supersedes the override. See the 2026-10-19 entry below.
 #                 #8521 stop `rm -f needsfix-<PR>-<HEAD>` at DISPATCH. That delete sits UPSTREAM of
 #                 the load gate, so a refused fixer loses the reviewer's findings. It is also why
 #                 the 5th argv line (`HEAD`) and fix-one.sh's marker-consume are NOT ported here:
@@ -214,10 +215,8 @@
 #                 the marker there would INVENT a findings record — refund_bailed_fixer's own note.
 #   install.sh    #8521 register spawn-gate.sh in the DRIFTED list — DONE (review round 2, #1828);
 #                 #1769 merged, so the line PR #1769 was editing was free.
-#                 #8468 render P0_BYPASS_MERGE_PRIORITY
-#   launchd.plist.template  #8468 the P0_BYPASS_MERGE_PRIORITY key. Held back WITH install.sh on
-#                 purpose: the template and its renderer must gain the placeholder together or the
-#                 placeholder-parity check reddens and the daemon gets a literal placeholder.
+#                 #8468 render P0_BYPASS_MERGE_PRIORITY — ⛔ DROPPED with the override itself.
+#   launchd.plist.template  #8468 the P0_BYPASS_MERGE_PRIORITY key — ⛔ DROPPED with the override.
 #   README.md     the §4 / §5.3 / §7.1b prose for all of the above
 #   selftest.sh   §15 extracts run_agent() from merge-one.sh. Once that port lands it must be
 #                 repointed at spawn-gate.sh, or the wall-limit check silently stops covering the
@@ -234,12 +233,48 @@
 #     inert-enforcer shape a prior review on PR #1807 had falsified). #1730/#1812 still insert their
 #     own shard line in a different region of the same file, so the two do not overlap.
 # The pin's own note "NOT ported, deliberately: tortoise's open branch fix/8468-closure-linkage …
-# `merged-not-closed.sh`" is now STALE: that branch merged as 9b249f418 and merged-not-closed.sh is
-# on tortoise main, so it is queued for porting above rather than excluded.
+# `merged-not-closed.sh`" was STALE: that branch merged as 9b249f418 and merged-not-closed.sh is on
+# tortoise main. RESOLVED 2026-10-19 — ported (next entry), and the exclusion note above is retired.
 #
-# ⛔ DO NOT `--repin` UNTIL THE ABOVE LANDS. The pin below still names the LAST reconciliation that
-# was COMPLETE for every file; re-pinning now would assert these as reconciled and turn the guard
-# green over a source that has moved — the stale-flag false pass this file exists to prevent.
+# ══ 2026-10-19 — THE FORKS ARE RETIRED; 9b249f418's harness half ported IN ═════════════════════
+#
+# Source: tortoise `origin/main` b77d24084. `operations/orchestrator-harness/` is being RETIRED to a
+# pointer + a CI check that fails if a script reappears there (README §11), so from here the harness
+# has ONE home and this file records ports from the retired copy, not from a live sibling.
+#
+# Ported IN from 9b249f418 (tortoise#8468), each verified ABSENT from agent-infra before porting:
+#   - lane.sh         "Closes #N" required; a bare "Refs #N" refused unless the unmet indicator is
+#                     named ("Still open: <indicator>"). The prompt used to accept "Refs" for
+#                     finished work; GitHub never closes on a Refs and nothing re-reads the issue
+#                     (25 of 36 open P0-blockers already had merged PRs, 0 closed in 12h).
+#   - merged-not-closed.sh  NEW — the instrument that answers "which open issues already have a
+#                     merged PR?". Contract preserved: a hit is a QUEUE ENTRY (never an automatic
+#                     close), and an unqueryable surface exits 2, never 1. Repo resolution follows
+#                     agent-infra's convention (path-shaped $REPO = checkout to derive from) rather
+#                     than the fork's hardcoded `daniel-ospina/tortoise` (#2040's defect class).
+#   - refresh-candidates.sh / orch-loop.sh  BP0 — ⛔ NOT SHIPPED, superseded by main during this
+#                     PR's rebase onto 0bb1ab71 (agent-infra#2099/#2129). The fork's override made a
+#                     P0-blocker at the backlog head clear the merge-priority reason; main's rule is
+#                     now UNCONDITIONAL (owner ruling, 2026-10-18: "while ONE un-owned PR remains, it
+#                     is the work"), so the exception would reopen new issue work on top of an
+#                     un-worked PR queue — the defect that ruling ends. `.prio`, the plist key and its
+#                     renderer went with it; nothing on main reads them. The pool keeps its single
+#                     artifact (`$O/.pool`), and the severity ordering it depends on is unchanged.
+#   - install.sh      copies merged-not-closed.sh and check-single-source.sh into the DRIFTED list
+#                     (the files the loop and the anti-relapse check execute). The fork's
+#                     P0_BYPASS_MERGE_PRIORITY rendering is NOT carried — see the reconcile note
+#                     above: launchd still gets every OTHER knob rendered, unchanged.
+#
+# NOT taken, deliberately: (1) the fork's `p0_merge_priority_override` cleared ANY non-empty reason
+# and relied on its call site's ordering, so a reorder would have let a P0 clear a LOAD gate — moot
+# now that the whole override is dropped, but kept here because it is why the port was rewritten
+# rather than copied; (2) the override itself, for the owner-ruling reason stated above.
+#
+# ⛔ DO NOT `--repin` YET (unchanged, and still load-bearing). The pin below names the last
+# reconciliation that was COMPLETE for every file. Three ports from this source are still blocked on
+# HELD files (merge-one.sh: #8589, #8612; orch-loop/selftest half of #8518 — see the 2026-10-15
+# entry above). Re-pinning now would assert those as reconciled and turn the guard green over a
+# source that has moved: the stale-flag false pass this file exists to prevent.
 #
 # pinned_ref=origin/main
 # pinned_tip=e20de606be10fc9fda96729b6cfd6277ac3ad1ec   (2026-10-13T20:17:21Z)

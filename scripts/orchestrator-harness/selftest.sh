@@ -3268,6 +3268,12 @@ sed 's/\\`-maxdepth\\`/`-maxdepth`/' "$MERGE" > "$NB/mut-merge.sh"
 nb_ticks_escaped "$NB/mut-merge.sh" && rc=1 || rc=0
 ck "non-vacuity: the name-blind check FIRES on a bare \`-maxdepth\` that no stub can intercept" $rc
 
+# NOTE (BP0, tortoise#8468 — reconciled onto main, NOT shipped): the tortoise fork's P0
+# merge-priority override and its `.prio` rank map are NOT carried here. main's drain rule is
+# unconditional (owner ruling, 2026-10-18: "while ONE un-owned PR remains, it is the work"), so
+# a P0 exception would reopen new issue work on top of an un-worked PR queue. The assertions
+# that used to drive that override (and the `.prio` writer) went with it; refresh-candidates
+# keeps its single `.pool` artifact, and that IS covered by the #8465 ordering check above.
 echo
 # ── platform-gate self-check (NON-VACUITY) ──────────────────────────────────────
 # A green run must never be green BECAUSE everything was skipped — that is a false PASS of the class

@@ -1,0 +1,242 @@
+#!/usr/bin/env bash
+# bin/harness — the harness's own CLI. Today: `doctor`.
+#
+# WHY THIS EXISTS (agent-infra#2130). The harness runs on two platforms with two different
+# supervisors, and it was impossible to ask a box which one it was on:
+#
+#   * the MAC box is darwin + launchd, installed by scripts/orchestrator-harness/install.sh;
+#   * the CLOUD CELLS are linux + systemd, installed by scripts/cloud-cell-supervisor.sh — a
+#     DIFFERENT installer, outside the harness directory.
+#
+# That split is LEGITIMATE (systemd vs launchd is a platform difference, not a fork), but it was
+# INVISIBLE: `install.sh` dies on non-Darwin, so an operator who ran it on a cell concluded the
+# harness did not support Linux, and nothing anywhere reported which supervisor was actually live.
+# A legitimate platform difference must be NAMED, not accidental. `doctor` names it.
+#
+# It also answers the question the consolidation exists for: which COMMIT is this box running, is
+# that copy a checkout or an orphan, and has any copy forked from the canonical one.
+#
+# USAGE
+#   bin/harness doctor            # human-readable report
+#   bin/harness doctor --json     # machine-readable
+#   bin/harness doctor --quiet    # verdict line only
+#
+# EXIT: 0 healthy · 1 drift · 2 UNKNOWN (cannot verify — never a pass)
+set -u
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SELF_DIR/.." && pwd)"
+CANON="$REPO_ROOT/scripts/orchestrator-harness"
+
+usage() {
+  awk 'NR>1 && /^set -u$/{exit} NR>1{print}' "$0" | sed 's/^# \{0,1\}//'
+}
+
+cmd="${1:-}"; shift 2>/dev/null || true
+[ -n "$cmd" ] || { usage; exit 2; }
+[ "$cmd" = "doctor" ] || { echo "harness: unknown command '$cmd' (try: doctor)" >&2; exit 2; }
+
+O_DIR="${O:-$HOME/orchestrator}"
+JSON=0; QUIET=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --json) JSON=1; shift ;;
+    --quiet) QUIET=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "harness doctor: unknown argument: $1" >&2; exit 2 ;;
+  esac
+done
+
+UNKNOWN_N=0; DRIFT_N=0
+unknown_note() { UNKNOWN_N=$((UNKNOWN_N + 1)); }
+drift_note()   { DRIFT_N=$((DRIFT_N + 1)); }
+
+# ── platform ─────────────────────────────────────────────────────────────────────
+OS="$(uname -s 2>/dev/null || echo UNKNOWN)"
+case "$OS" in
+  Darwin) PLATFORM="darwin"; PLATFORM_NOTE="macOS — launchd supervisor, tmux required" ;;
+  Linux)  PLATFORM="linux";  PLATFORM_NOTE="Linux — systemd supervisor (cloud cells)" ;;
+  *)      PLATFORM="unknown"; PLATFORM_NOTE="unrecognised platform" ; unknown_note ;;
+esac
+NCPU=""
+if command -v nproc >/dev/null 2>&1; then NCPU="$(nproc 2>/dev/null)"
+elif command -v sysctl >/dev/null 2>&1; then NCPU="$(sysctl -n hw.ncpu 2>/dev/null)"; fi
+[ -n "${NCPU:-}" ] || NCPU="?"
+
+# ── supervisor: WHICH ONE, and where its installer lives ─────────────────────────
+# The two installers are BOTH legitimate; doctor's job is to say which one owns this box. Detection
+# reads the supervisor's own status verb rather than trusting a file's existence, because a plist or
+# unit file left behind by an uninstall is not a running job.
+SUP="none"; SUP_EVIDENCE=""; SUP_INSTALLER=""
+case "$PLATFORM" in
+  darwin)
+    SUP_INSTALLER="scripts/orchestrator-harness/install.sh"
+    if command -v launchctl >/dev/null 2>&1; then
+      if launchctl print "gui/$(id -u)/com.eldato.orchestrator-loop" >/dev/null 2>&1; then
+        SUP="launchd"; SUP_EVIDENCE="job com.eldato.orchestrator-loop is loaded"
+      elif launchctl list 2>/dev/null | grep -q 'com\.eldato\.'; then
+        SUP="launchd"; SUP_EVIDENCE="launchd holds a com.eldato.* job (not the default label)"
+      else
+        SUP_EVIDENCE="launchctl present, no com.eldato.* job loaded"
+      fi
+    else
+      SUP_EVIDENCE="launchctl not on PATH"; unknown_note
+    fi ;;
+  linux)
+    SUP_INSTALLER="scripts/cloud-cell-supervisor.sh"
+    if command -v systemctl >/dev/null 2>&1; then
+      if systemctl --user list-units --all --no-legend 2>/dev/null | grep -qi 'eldato\|orchestr'; then
+        SUP="systemd"; SUP_EVIDENCE="user systemd unit matches eldato/orchestr"
+      elif systemctl list-units --all --no-legend 2>/dev/null | grep -qi 'eldato\|orchestr'; then
+        SUP="systemd"; SUP_EVIDENCE="system systemd unit matches eldato/orchestr"
+      else
+        SUP_EVIDENCE="systemctl present, no matching eldato/orchestr unit"
+      fi
+    elif ls /etc/systemd/system 2>/dev/null | grep -qi 'eldato\|orchestr'; then
+      SUP="systemd"; SUP_EVIDENCE="unit file present in /etc/systemd/system"
+    else
+      SUP_EVIDENCE="systemctl not on PATH and no unit file found"; unknown_note
+    fi ;;
+  *) SUP_EVIDENCE="platform unknown — supervisor cannot be identified"; unknown_note ;;
+esac
+# ⛔ A KNOWN PLATFORM WITH NO SUPERVISOR IS A FINDING, NOT A PASS: the loop is not running, and
+# "no job loaded" is exactly the state an operator mistakes for "quiet box".
+[ "$SUP" = none ] && [ "$PLATFORM" != unknown ] && drift_note
+
+# ── canonical copy ───────────────────────────────────────────────────────────────
+CANON_COMMIT="UNKNOWN"; CANON_DIRTY="UNKNOWN"
+if [ -d "$CANON" ]; then
+  if git -C "$REPO_ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+    CANON_COMMIT="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo UNKNOWN)"
+    if [ -z "$(git -C "$REPO_ROOT" status --porcelain 2>/dev/null)" ]; then CANON_DIRTY=false; else CANON_DIRTY=true; fi
+  else
+    unknown_note
+  fi
+else
+  unknown_note
+fi
+
+# ── deployed copy: checkout or orphan? (the #1745 / #1790 question) ──────────────
+DEPLOY_KIND="absent"; DEPLOY_COMMIT="UNKNOWN"; DEPLOY_DRIFT=""
+if [ -d "$O_DIR" ]; then
+  if git -C "$O_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+    # A CHECKOUT is the strong form: identity and cleanliness come from git itself, not a stamp.
+    DEPLOY_KIND="checkout"
+    DEPLOY_COMMIT="$(git -C "$O_DIR" rev-parse HEAD 2>/dev/null || echo UNKNOWN)"
+    if [ -n "$(git -C "$O_DIR" status --porcelain -- '*.sh' 2>/dev/null)" ]; then
+      DEPLOY_DRIFT="dirty"; drift_note
+    else
+      DEPLOY_DRIFT="clean"
+    fi
+  elif [ -f "$O_DIR/.agent-infra-stamp.json" ]; then
+    DEPLOY_KIND="stamp"
+    DEPLOY_COMMIT="$(sed -n 's/.*"commit"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$O_DIR/.agent-infra-stamp.json" | head -1)"
+    [ -n "$DEPLOY_COMMIT" ] || { DEPLOY_COMMIT="UNKNOWN"; unknown_note; }
+  else
+    DEPLOY_KIND="orphan"
+    unknown_note
+  fi
+  # Byte drift of the shared files — the check that caught a one-generation-behind gh-limit.py.
+  if [ -x "$CANON/check-single-source.sh" ]; then
+    if "$CANON/check-single-source.sh" --o "$O_DIR" --quiet >/dev/null 2>&1; then
+      DEPLOY_DRIFT="identical"
+    else
+      rc=$?
+      if [ "$rc" -eq 2 ]; then unknown_note; DEPLOY_DRIFT="UNVERIFIABLE"
+      else drift_note; DEPLOY_DRIFT="DIFFERS"; fi
+    fi
+  else
+    DEPLOY_DRIFT="UNVERIFIABLE"; unknown_note
+  fi
+fi
+[ "$DEPLOY_KIND" = orphan ] && drift_note
+
+# ── retired forks ────────────────────────────────────────────────────────────────
+# Only locations the operator names are checked. Discovery by walking the filesystem is how a
+# search costs 80 minutes (#1069); a fork check must be explicit about what it looked at.
+FORK_STATE="not checked"
+if [ "${HARNESS_FORK_PATHS+set}" ]; then
+  # ⛔ SET-BUT-EMPTY IS NOT "NOT CONFIGURED" (review round 2, P2). A rendered plist/keys.env whose
+  # fork list was emptied used to fall straight through to `forks: ok` / exit 0 having compared
+  # nothing — and a whitespace-only value became `--fork " "`, a non-existent dir, which the checker
+  # reports as `ok`. Both are the "reports protection while comparing nothing" defect in the new
+  # instrument's own reporting channel, so they resolve to UNVERIFIABLE.
+  IFS=':' read -r -a _forks <<< "$HARNESS_FORK_PATHS"
+  args=()
+  for f in ${_forks[@]+"${_forks[@]}"}; do
+    # Trim surrounding whitespace before deciding a path is usable.
+    f="$(printf '%s' "$f" | tr -d '[:space:]')"
+    [ -n "$f" ] && args+=(--fork "$f")
+  done
+  if [ ${#args[@]} -eq 0 ]; then
+    FORK_STATE="UNVERIFIABLE (no usable path)"; unknown_note
+  elif [ ! -x "$CANON/check-single-source.sh" ]; then
+    FORK_STATE="UNVERIFIABLE (checker missing)"; unknown_note
+  else
+    # ⛔ NO `if ! …; then rc=$?` HERE (review finding, P2). In bash, `$?` at the top of the `then`
+    # branch of `if ! cmd` is the NEGATION's status — always 0 — so the exit-2 arm was dead code and
+    # "cannot verify" was reported as "FORK PRESENT", sending an operator after a fork that was
+    # never observed. Capture the status directly instead.
+    # ⛔ AND THE AMBIENT `O` IS DROPPED FOR THIS ARM (review round 2, P2). `orch-loop.sh` EXPORTS `O`,
+    # so an operator running doctor from a controller shell had the checker run its deployed-bytes arm
+    # too — and a deployed divergence (rc 1) was then labelled "FORK PRESENT": a fork that was never
+    # observed. The deployed arm is evaluated separately below; this arm must observe only forks.
+    env -u O "$CANON/check-single-source.sh" "${args[@]}" --quiet >/dev/null 2>&1; rc=$?
+    case "$rc" in
+      0) FORK_STATE="ok" ;;
+      2) FORK_STATE="UNVERIFIABLE"; unknown_note ;;
+      *) FORK_STATE="FORK PRESENT"; drift_note ;;
+    esac
+  fi
+fi
+
+# ── verdict ──────────────────────────────────────────────────────────────────────
+if [ "$DRIFT_N" -gt 0 ]; then VERDICT="DRIFT"; rc=1
+elif [ "$UNKNOWN_N" -gt 0 ]; then VERDICT="UNKNOWN"; rc=2
+else VERDICT="OK"; rc=0; fi
+
+if [ "$JSON" -eq 1 ]; then
+  # ⛔ REAL JSON TYPES (review finding, P2): booleans unquoted, ncpu numeric, and UNKNOWN as null.
+  # `"dirty": "false"` is TRUTHY to any consumer doing `if d["canonical"]["dirty"]`, so a machine
+  # reader would see a dirty tree on every clean one.
+  case "$CANON_DIRTY" in true) j_dirty=true ;; false) j_dirty=false ;; *) j_dirty=null ;; esac
+  case "$NCPU" in ''|*[!0-9]*) j_ncpu=null ;; *) j_ncpu="$NCPU" ;; esac
+  cat <<JSON
+{
+  "verdict": "$VERDICT",
+  "platform": "$PLATFORM",
+  "platformNote": "$PLATFORM_NOTE",
+  "ncpu": $j_ncpu,
+  "supervisor": "$SUP",
+  "supervisorEvidence": "$SUP_EVIDENCE",
+  "supervisorInstaller": "$SUP_INSTALLER",
+  "canonical": { "path": "$CANON", "commit": "$CANON_COMMIT", "dirty": $j_dirty },
+  "deployed": { "path": "$O_DIR", "kind": "$DEPLOY_KIND", "commit": "$DEPLOY_COMMIT", "bytes": "${DEPLOY_DRIFT:-n/a}" },
+  "forks": "$FORK_STATE",
+  "unknown": $UNKNOWN_N,
+  "drift": $DRIFT_N
+}
+JSON
+elif [ "$QUIET" -eq 1 ]; then
+  echo "harness doctor: $VERDICT (platform=$PLATFORM supervisor=$SUP deployed=$DEPLOY_KIND)"
+else
+  echo "harness doctor — $VERDICT"
+  echo
+  echo "  platform      $PLATFORM ($PLATFORM_NOTE), ncpu=$NCPU"
+  echo "  supervisor    $SUP${SUP_EVIDENCE:+  [$SUP_EVIDENCE]}"
+  echo "  installer     ${SUP_INSTALLER:-<none for this platform>}"
+  echo "  canonical     $CANON"
+  echo "                commit=${CANON_COMMIT:0:12} dirty=$CANON_DIRTY"
+  echo "  deployed      $O_DIR"
+  echo "                kind=$DEPLOY_KIND commit=${DEPLOY_COMMIT:0:12} bytes=$DEPLOY_DRIFT"
+  echo "  forks         $FORK_STATE${HARNESS_FORK_PATHS:+  ($HARNESS_FORK_PATHS)}"
+  echo
+  case "$VERDICT" in
+    OK)      echo "  Everything this box can verify is consistent." ;;
+    DRIFT)   echo "  The harness has forked or is not running: apply fixes to the canonical copy," ;
+             echo "  re-install (or make \$O a checkout), then re-run this command." ;;
+    UNKNOWN) echo "  Something could not be verified, which is NOT a pass (agent-infra#1745)." ;
+             echo "  Name the empty surface above before trusting this box." ;;
+  esac
+fi
+exit "$rc"

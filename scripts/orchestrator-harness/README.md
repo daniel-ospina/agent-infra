@@ -80,10 +80,10 @@ doc_status: draft
 > ⚠️ **The follow-up has a second obligation the sha list never covered.** tortoise's **open**
 > branch `fix/8468-closure-linkage` also rewrites this directory (severity-ordered pool, a
 > `.prio`-keyed P0 bypass of the merge-priority gate, `merged-not-closed.sh`, a `Closes`-not-`Refs`
-> lane brief). It is **not** on `main`, so it is deliberately not ported here — it is still under
-> review, and porting it would create a second home for work that has not landed. The live box is
-> already running an earlier revision of it. Either that branch merges first, or the removal PR
-> must port it; removing the directory while it is open orphans it.
+> lane brief). This PR ports it: `merged-not-closed.sh`, the severity-ordered pool and the
+> `Closes`-not-`Refs` lane contract are in, and **the `.prio`-keyed P0 bypass is NOT** — main's
+> merge-priority rule became unconditional (owner ruling, 2026-10-18), which supersedes it; see
+> "Ports taken from the retired fork" below.
 >
 > ⚠️ **This port is faithful EXCEPT for a declared set of fail-open / false-PASS fixes.** These are
 > agent-infra's, not tortoise's — a later diff between the two trees WILL show them, and they must not
@@ -2123,10 +2123,9 @@ were deleted.
   commits merged on tortoise `main` after the copy was taken (2026-10-13 10:50Z, `eda7df136`); all
   seven are ported here, listed in the provenance note at the top. `port-provenance.txt` pins every
   file's tortoise blob hash at that sync point and `check-port-drift.sh` fails if the tortoise tree
-  moves again. ⚠️ Still open, and not fixable from here: tortoise's **unmerged**
-  `fix/8468-closure-linkage` branch rewrites this same directory (P0 bypass, `.prio`,
-  `merged-not-closed.sh`, lane brief). The removal PR must either wait for it to merge or port it —
-  deleting the directory while that branch is open orphans that work.
+  moves again. tortoise's `fix/8468-closure-linkage` branch rewrote this same directory (P0 bypass,
+  `.prio`, `merged-not-closed.sh`, lane brief); this PR ports it, minus the P0 bypass, which main's
+  unconditional drain rule supersedes.
 - **A keys.env with a top-level `exit` disables the supervisor silently (agent-infra#1713).** The
   file is sourced in the supervisor's own shell, so `exit`/`exec` ends the script: `start` returns 0
   having created no session.
@@ -2333,3 +2332,91 @@ agent-infra#1736.
    take work must remember to acquire, and an issue claim is still no proof of life.
 3. Is a `~/`-rooted bash harness the right shape at all, or should this fold into the fleet
    rail's cmux workspaces (agent-infra#1683)?
+
+---
+
+## 11. Single source of truth: this directory
+
+**This directory is the ONLY copy of the harness.** Measured 2026-10-19, before consolidation, the
+same eight files existed in three places and agreed on almost nothing:
+
+| file | agent-infra | tortoise | live `~/orchestrator` |
+|---|---|---|---|
+| `orch-loop.sh` | `d61f1587` | `41c50478` | `d61f1587` |
+| `spawn-gate.sh` | `f730dc87` | `99fd20a9` | `f730dc87` |
+| `refresh-candidates.sh` | `c12cadfc` | `dfedd12a` | `c12cadfc` |
+| `claims.sh` | `95a45308` | **absent** | `95a45308` |
+| `nonblocking-dispatch.sh` | `dc9d555a` | **absent** | `dc9d555a` |
+| `lane.sh` | `7aaa24d1` | `88b1a34b` | `7aaa24d1` |
+| `install.sh` | `9b9ba9f3` | `dccba135` | `9b9ba9f3` |
+| `selftest.sh` | `47189536` | `3b14e8e1` | `47189536` |
+
+The consequence was structural, not cosmetic: every fix had to be applied by hand in three places,
+each box ran a different generation, and "self-healing" was impossible because there was no authority
+to heal *toward*.
+
+**The rule.** A fix is ported HERE first. `operations/orchestrator-harness/` in tortoise is retired
+to a pointer, and **tortoise CI fails if a harness script reappears there** — that check lives in the
+tortoise repo (`.github/workflows/harness-single-source.yml`), because it is tortoise's tree that
+must stay retired. The live copy is a versioned checkout of this repo rather than an orphan
+directory of hand-copied files.
+
+**The instrument.** `check-single-source.sh` asserts all three halves and FAILS on any of them:
+
+```bash
+./check-single-source.sh                                  # canonical completeness
+./check-single-source.sh --fork ../tortoise/operations/orchestrator-harness
+./check-single-source.sh --o ~/orchestrator               # deployed bytes == canonical bytes
+./check-single-source.sh --require-target --fork <dir>    # the CI form: checking nothing is a failure
+```
+
+**Scope of what is observed, stated honestly:** the check only looks where it is told. The fork arm
+observes the paths passed via `--fork` (or the colon-separated `HARNESS_FORK_PATHS` that
+`bin/harness doctor` uses), and the deployed arm observes `$O`/`--o`. Nothing walks the filesystem
+looking for copies — an ignore-blind walk is the fleet's most expensive habit (#1069), so a fork
+check must be explicit about what it looked at. The CI job proves the check is **non-vacuous** with
+a planted fixture; *watching the real tortoise path* is the tortoise-side job.
+
+Exit `2` is `UNKNOWN` — "could not verify" is never a pass, the same doctrine as
+`check-deployed-drift.sh`.
+
+### Platform differences are NAMED, not accidental
+
+The harness runs on two platforms with two supervisors. This is a legitimate difference and it is
+expressed as **a shared code path plus an explicit platform branch**, never as two drifting copies:
+
+| | macOS (darwin) | cloud cells (linux) |
+|---|---|---|
+| supervisor | launchd | systemd |
+| installer | `scripts/orchestrator-harness/install.sh` | `scripts/cloud-cell-supervisor.sh` |
+| job label/unit | `com.eldato.orchestrator-loop` | `com.eldato.*` unit |
+| status verb | `launchctl print gui/$UID/<label>` | `systemctl --user list-units` |
+| `timeout(1)` | absent — `run_agent` uses a bash `wait` + watchdog | present, but the same fallback is used |
+
+`install.sh` is macOS-only **on purpose** and says so; on Linux it names the cell supervisor rather
+than dying with no next step. Ask any box which branch it is on:
+
+```bash
+bin/harness doctor          # platform, supervisor + evidence, canonical commit, deployed kind, fork state
+bin/harness doctor --json   # the same, machine-readable
+```
+
+`doctor` exits `0` healthy, `1` drift, `2` UNKNOWN. A known platform with **no** supervisor loaded is
+reported as drift: "no job loaded" is exactly the state an operator mistakes for a quiet box.
+
+### Ports taken from the retired fork
+
+The tortoise copy was an old generation — except for fixes it received after the handover that never
+came back. Those were ported IN, not discarded:
+
+| fix | why it mattered | where |
+|---|---|---|
+| `Closes #N` required; a bare `Refs` is refused | a finished lane writing `Refs` never closes its issue, and nothing re-reads it: 25 of 36 open P0-blockers already had merged PRs (tortoise#8468) | `lane.sh` |
+| `merged-not-closed.sh` | the fleet could not answer "which open issues already have a merged PR?" — no tool existed | new file |
+| ⛔ a P0-blocker outranks the merge-priority gate (BP0, `P0_BYPASS_MERGE_PRIORITY`, `.prio` map) | **NOT carried — reconciled onto main and superseded.** The fork's measurement (19 open PRs, 0 lanes, 33 P0-blockers, 0 closed in 12h) was taken against a gate that closed *below* `MERGE_PRIORITY_AT`; main's rule is unconditional (owner ruling, 2026-10-18: "while ONE un-owned PR remains, it is the work"), so a P0 exception would reopen new issue work on top of an un-worked PR queue — the defect that ruling ends. Nothing reads `.prio` on main | `orch-loop.sh` (rebase: hunk dropped), `refresh-candidates.sh`, `install.sh`, plist |
+
+Everything else the fork carried is here. The BP0 override and its `.prio` rank map are the ONE
+part of it that is not: main reached the same goal by removing the threshold outright, and keeping
+the override would let a P0 dispatch while un-owned PRs sit unworked — the exact behaviour the owner
+ruling forbids. If BP0 is wanted back, it is a **reopen of that ruling**, argued where the ruling
+lives — not a merge-time default.

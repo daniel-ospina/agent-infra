@@ -96,6 +96,12 @@ MAX_LANES="${MAX_LANES:-$(( 10#$_NCPU * 5 / 2 ))}"
 if [ "$MAX_LANES" = "$(( 10#$_NCPU * 5 / 2 ))" ]; then is_limit "$MAX_LANES" || MAX_LANES=10; fi
 MAX_REVIEW="${MAX_REVIEW:-4}"
 MERGE_PRIORITY_AT="${MERGE_PRIORITY_AT:-25}"
+# NOTE (BP0, tortoise#8468 — NOT shipped, reconciled onto main's rule): the tortoise fork's P0
+# override (a P0-blocker at the backlog head clearing ONLY the merge-priority reason) is NOT carried
+# here. It was written against a gate that held below the threshold; main's rule is now unconditional
+# (owner ruling, 2026-10-18: "while ONE un-owned PR remains, it is the work"), and a P0 exception
+# would reopen new issue work on top of an un-worked PR queue — the exact defect that rule ends.
+# The `.prio` map and `P0_BYPASS_MERGE_PRIORITY` knob went with it; nothing on main reads them.
 # The bound on the merge-priority gate, and the age limit on a `state/refresh-funnel` record
 # (agent-infra#2040). Both are whole minutes; both are validated by the range loop below.
 MERGE_PRIORITY_MAX_AGE_MIN="${MERGE_PRIORITY_MAX_AGE_MIN:-180}"
@@ -237,7 +243,15 @@ esac
 # the temp-$HOME guard (#446): a test that needs it says so, and a normal run on a Mac never sets it.
 echo "==> preflight"
 if [ "$(uname)" != "Darwin" ] && [ "${ELDATO_ALLOW_NON_DARWIN:-}" != "1" ]; then
-  die "this harness uses launchd + tmux; only macOS is supported"
+  # ⛔ THIS REFUSAL IS A PLATFORM BRANCH, NOT A GAP (agent-infra#2130). This installer renders a
+  # LAUNCHD plist; on a Linux cell it could only produce an artifact nothing reads, so it must fail
+  # closed. But a bare "only macOS is supported" reads as "the harness does not support Linux", and
+  # the operator then hand-copies files — which is how the three-way fork happened. Name the
+  # supervisor that DOES own this platform, and the command that reports it.
+  if [ "$(uname)" = "Linux" ]; then
+    die "this installer renders a launchd job, which Linux does not run. On a Linux cloud cell the supervisor is systemd: use scripts/cloud-cell-supervisor.sh (the harness itself is shared code and runs here unchanged). Run 'bin/harness doctor' to see the platform and the supervisor found. (ELDATO_ALLOW_NON_DARWIN=1 exists only so CI can exercise the render path.)"
+  fi
+  die "this harness uses launchd + tmux; only macOS is supported by THIS installer. On another platform use the platform's own supervisor (Linux: scripts/cloud-cell-supervisor.sh) and run 'bin/harness doctor'."
 fi
 [ -f "$TEMPLATE" ] || die "missing template: $TEMPLATE"
 
@@ -710,12 +724,14 @@ if [ "$PLIST_CHANGED" = "0" ]; then ok "plist unchanged and it is the render lau
 # absent ⇒ LO_SCAN=0 ⇒ the registry fallback), which does not crash — it silently sends the fleet back
 # to opening work on top of an un-worked queue, which is the exact defect the module exists to fix.
 DRIFTED=""
-# BOTH sides of this merge, deliberately, and neither list is a superset of the other: the branch
-# added `nonblocking-dispatch.sh` (the transport pr-doctor now dispatches through, #1890) and
-# origin/main added `live-ownership.sh` (the selection predicate) and `repo-slug.sh` (the derived
-# repo surface, #2040). Taking either side alone leaves the installed $O without a file the loop or
-# the dispatcher calls -- which is a silent drift, not a loud failure.
-for f in orch-loop.sh live-ownership.sh repo-slug.sh claims.sh repo-authority.sh spawn-gate.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh nonblocking-dispatch.sh gh-rest/gh gh-limit.py; do
+# BOTH sides of this merge, deliberately, and NEITHER list is a superset of the other. This side
+# carries `nonblocking-dispatch.sh` (the transport pr-doctor now dispatches through, #1890), which
+# the other list does not have. The other side carries `merged-not-closed.sh` and
+# `check-single-source.sh` (the single-source instruments this PR ships), which this one does not.
+# `live-ownership.sh` (the selection predicate) and `repo-slug.sh` (the derived repo surface, #2040)
+# are on both. Taking either side alone leaves the installed $O without a file the loop, the
+# dispatcher, or the anti-relapse check calls -- which is a silent drift, not a loud failure.
+for f in orch-loop.sh live-ownership.sh repo-slug.sh claims.sh repo-authority.sh spawn-gate.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh nonblocking-dispatch.sh merged-not-closed.sh check-single-source.sh gh-rest/gh gh-limit.py; do
   [ -f "$O/$f" ] || { DRIFTED="$DRIFTED $f(missing)"; continue; }
   diff -q "$HERE/$f" "$O/$f" >/dev/null 2>&1 || DRIFTED="$DRIFTED $f"
 done

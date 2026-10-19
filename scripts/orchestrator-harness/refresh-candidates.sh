@@ -1220,6 +1220,9 @@ rm -f "$O/.pool-err" "$O/.pool-read"
   if rest_list issues --repo "$OR" --state open --limit 200 --label P2-moderate \
     --jq '.[]|select((.assignees|length)==0)|select(.title|test("^(epic|OWNER DECISION)";"i")|not)|"2 \(.number)"' 2>>"$O/.pool-err"; then echo "P2-moderate" >> "$O/.pool-read"
   else echo "P2-moderate" >> "$O/.pool-err"; fi
+# ⛔ ONE SORTED STREAM, ONE ARTIFACT. The rank map goes FIRST into the key (`-k1,1n`) and the
+# number is what is emitted, so the pool is priority-ordered, oldest-first inside a tier. (The fork's
+# `.prio`/`<number>TAB<rank>` second artifact existed only for BP0's P0 override; see the NOTE below.)
 } | sort -k1,1n -k2,2n | awk '!seen[$2]++ {print $2}' > "$O/.pool"
 # ⛔ AN UNWRITTEN POOL IS NOT AN EMPTY ONE, and the test for it is the redirect's STATUS, not the
 # FILE's existence: a `.pool` left behind by an earlier run satisfied a `[ -f ]` test while THIS run's
@@ -1229,6 +1232,10 @@ rm -f "$O/.pool-err" "$O/.pool-read"
 # (`grep -E '^\} \| sort '` + a sed that strips a trailing ` > "$O/.pool"`), so a suffix on that line
 # turns the extracted pipeline into a syntax error and reddens the #8465 severity-ordering check —
 # which would then stop covering the very ordering the pool depends on.
+#
+# NOTE (BP0, tortoise#8468 — reconciled onto main): the fork's `.prio` rank map existed ONLY for
+# orch-loop's P0 merge-priority override, which main's unconditional drain rule (owner ruling,
+# 2026-10-18) replaced. The pool stream therefore stays a SINGLE artifact again, as on main.
 pool_rc=$?
 
 # ── THE POOL'S READ STATE: EMPTY, PARTIAL or UNREADABLE (agent-infra#1931) ────────────────────
