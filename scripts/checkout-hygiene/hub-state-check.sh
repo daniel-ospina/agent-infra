@@ -128,6 +128,10 @@ filter_registered_worktrees() { # $1=repo-root ; stdin=porcelain ; stdout=porcel
   raw="$(git -C "$repo" worktree list --porcelain 2>/dev/null | sed -n 's/^worktree //p' | tail -n +2)"
   while IFS= read -r rec; do
     [[ -z "$rec" ]] && continue
+    # A PRUNABLE record (`.git` link gone — git's own "not a worktree" verdict) is
+    # NOT a worktree: excluding it made a genuine untracked directory PASS (#1919
+    # review P2).
+    [[ -e "$rec/.git" ]] || continue
     cand=""
     cand="$( (cd "$rec" 2>/dev/null && pwd -P) )" || cand=""
     [[ -n "$cand" ]] && registered="${registered}${cand}"$'\n'

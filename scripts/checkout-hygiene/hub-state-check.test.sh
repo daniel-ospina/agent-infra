@@ -933,6 +933,25 @@ rm -f "$HN/link-to-nested"
 out="$(bash "$CHECK" --repo "$HN" 2>&1)" && rc=0 || rc=$?
 assert_eq "$rc" 0 "…and it PASSes again once the link is gone"
 
+# SAFETY HALF 4 (#1919 review P2): a PRUNABLE record is NOT a worktree. Once its
+# `.git` link is gone git says "prunable gitdir file points to non-existent
+# location", and the directory's files are ordinary untracked content the hub
+# could commit — so the check must FAIL for it, not exclude it.
+mkdir -p "$HN/prunable-wt"
+echo wip > "$HN/prunable-wt/precious.txt"
+mkdir -p "$HN/.git/worktrees/prunable-wt"
+printf 'gitdir: %s\n' "$HN/.git/worktrees/prunable-wt" > "$HN/prunable-wt/.git"
+printf '%s\n' "$HN/prunable-wt/.git" > "$HN/.git/worktrees/prunable-wt/gitdir"
+rm -f "$HN/prunable-wt/.git"   # the link is GONE → prunable
+assert_contains "$(git -C "$HN" worktree list --porcelain)" "prunable" \
+  "fixture: git reports the record as PRUNABLE"
+out="$(bash "$CHECK" --repo "$HN" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "a PRUNABLE worktree record → exit 1 (its files are real untracked content)"
+git -C "$HN" worktree prune >/dev/null 2>&1 || true
+rm -rf "$HN/prunable-wt"
+out="$(bash "$CHECK" --repo "$HN" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 0 "…and it PASSes again once the prunable record is pruned"
+
 echo ""
 echo "hub-state-check.test.sh: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1

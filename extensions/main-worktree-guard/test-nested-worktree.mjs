@@ -204,6 +204,50 @@ try {
   rmSync(join(hub, "link-to-nested"));
   expect("A12: …and the hub reads clean again once the link is gone", readHubDisorder(hub).disorder, null);
 
+  // A13 (#1919 review P2): a PRUNABLE record is NOT a worktree. Writing a hand-
+  // built registration (a `.git` link removed) leaves git listing it as
+  // `worktree …` + `prunable gitdir file points to non-existent location`, and
+  // its files become ordinary untracked content the hub COULD commit. Excluding
+  // it made a genuine untracked directory read CLEAN.
+  mkdirSync(join(hub, "prunable-wt"), { recursive: true });
+  writeFileSync(join(hub, "prunable-wt", "precious.txt"), "wip\n");
+  writeFileSync(join(hub, "prunable-wt", ".git"), `gitdir: ${join(hub, ".git", "worktrees", "prunable-wt")}\n`);
+  mkdirSync(join(hub, ".git", "worktrees", "prunable-wt"), { recursive: true });
+  writeFileSync(join(hub, ".git", "worktrees", "prunable-wt", "gitdir"), `${join(hub, "prunable-wt", ".git")}\n`);
+  rmSync(join(hub, "prunable-wt", ".git"));   // the link is GONE → prunable
+  expectTrue("A13: git reports the record as PRUNABLE",
+    out("git worktree list --porcelain", hub).includes("prunable"), out("git worktree list --porcelain", hub));
+  expect("A13: …so its directory is real untracked content → DIRTY", readHubDisorder(hub).disorder, "dirty");
+  expect("A13: …and the filter keeps the entry",
+    porcelainWithoutRegisteredWorktrees(out("git status --porcelain", hub), hub).includes("?? prunable-wt/"),
+    true);
+  gg("worktree prune", hub);
+  rmSync(join(hub, "prunable-wt"), { recursive: true, force: true });
+  expect("A13: …and the hub is clean again after the prune", readHubDisorder(hub).disorder, null);
+
+  // A14 (#1919 review P1): a SHELL-VARIABLE target is expanded from the command's
+  // own assignment — `D=q7; git worktree add "$D/wt"` used to be ALLOWED and
+  // re-created the deadlock — while a variable nothing assigns is still NOT
+  // guessed (A9 pins that direction: a false block is not the remedy).
+  const varAssign = 'D=q7; git worktree add "$D/wt" -b q7';
+  expectTrue("A14: an assignment-spelled `$VAR` target is REFUSED",
+    typeof nestedWorktreeTargetViolation(varAssign, hub) === "string", String(nestedWorktreeTargetViolation(varAssign, hub)));
+  expectTrue("A14: …`$PWD`-relative target is REFUSED",
+    typeof nestedWorktreeTargetViolation('git worktree add "$PWD/v6" -b v6', hub) === "string",
+    String(nestedWorktreeTargetViolation('git worktree add "$PWD/v6" -b v6', hub)));
+  expect("A14: …and a var-assigned target OUTSIDE the checkout is still ALLOWED",
+    nestedWorktreeTargetViolation(`D=${outside}; git worktree add "$D/wt" -b ok`, hub), null);
+
+  // A15 (#1919 review P2): the target is judged PHYSICALLY. A path spelled through
+  // a symlinked prefix that points INTO the hub compared as "outside" lexically
+  // while landing inside — the same mistake the exclusion side fixed.
+  const linkPrefix = join(tmp, "link-into-hub");
+  execSync(`ln -s ${hub} ${linkPrefix}`);
+  expectTrue("A15: a target through a symlinked prefix INTO the hub is REFUSED",
+    typeof nestedWorktreeTargetViolation(`git worktree add ${linkPrefix}/sneaky -b s1`, hub) === "string",
+    String(nestedWorktreeTargetViolation(`git worktree add ${linkPrefix}/sneaky -b s1`, hub)));
+  rmSync(linkPrefix);
+
   // ───────────────────────────────────────────────────────────────────────
   // Part B — real index.ts load + handler-driven gate
   // ───────────────────────────────────────────────────────────────────────
@@ -303,6 +347,28 @@ try {
       expectTrue("B11: `git work\"tree\" add <relative path>` → BLOCKED", blocked(r11), JSON.stringify(r11?.reason?.slice(0, 90)));
       expectTrue("B11: …with the #1919 refusal", reasonOf(r11).includes("#1919"), reasonOf(r11).slice(0, 90));
       expectTrue("B11: …and the state was never created", !existsSync(join(hub, "nested-quoted")), "created");
+
+      // B12 (#1919 review P1): an invocation whose frame cannot be placed is no
+      // longer skipped when its target is RELATIVE. `cd $UNRESOLVABLE && git
+      // worktree add v1` starts in an undeterminable directory and this session
+      // is inside a checkout, so the target can land inside it.
+      const r12 = await bash("cd $NOPE_UNSET_1941 && git worktree add v1 -b v1", hub);
+      expectTrue("B12: `cd $UNASSIGNED && git worktree add <rel>` → BLOCKED", blocked(r12), JSON.stringify(r12?.reason?.slice(0, 90)));
+      expectTrue("B12: …naming the unplaceable frame", reasonOf(r12).includes("could not be resolved"), reasonOf(r12).slice(0, 120));
+
+      // B13 (#1919 review P1): a shell-variable target the command ASSIGNS.
+      const r13 = await bash('D=q7; git worktree add "$D/wt" -b q7', hub);
+      expectTrue("B13: assignment-spelled `$VAR` target → BLOCKED", blocked(r13), JSON.stringify(r13?.reason?.slice(0, 90)));
+      expectTrue("B13: …with the #1919 refusal", reasonOf(r13).includes("#1919"), reasonOf(r13).slice(0, 90));
+
+      // B14: the env-spelled frame is RESOLVED, not skipped — `cd $HUBX` with HUBX
+      // exported must be judged at the hub and refused (it was a one-env-var bypass).
+      process.env.HUBX_1941 = hub;
+      const r14 = await bash("cd $HUBX_1941 && git worktree add v3 -b v3", hub);
+      expectTrue("B14: `cd $EXPORTED && git worktree add <rel>` → BLOCKED", blocked(r14), JSON.stringify(r14?.reason?.slice(0, 90)));
+      const r14b = await bash("git -C $HUBX_1941 worktree add v4 -b v4", hub);
+      expectTrue("B14: `git -C $EXPORTED worktree add <rel>` → BLOCKED", blocked(r14b), JSON.stringify(r14b?.reason?.slice(0, 90)));
+      delete process.env.HUBX_1941;
 
       // B9: the env hatch still bypasses the new gate (documented in its reason).
       process.env.AGENT_ALLOW_MAIN_EDITS = "1";

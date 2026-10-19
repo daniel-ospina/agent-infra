@@ -271,6 +271,10 @@ registered_worktrees() {
   raw="$(git -C "$MAIN_REPO" worktree list --porcelain 2>/dev/null | sed -n 's/^worktree //p' | tail -n +2)" || return 2
   while IFS= read -r rec; do
     [[ -z "$rec" ]] && continue
+    # A PRUNABLE record (`.git` link gone — git's own "not a worktree" verdict) is
+    # NOT a worktree, and treating it as one would spare a genuine untracked dir
+    # from salvage while M4 (the reader) counts it dirty (#1919 review P2).
+    [[ -e "$rec/.git" ]] || continue
     cand="$( (cd "$rec" 2>/dev/null && pwd -P) )" || continue
     out="${out}${cand}"$'\n'
   done <<<"$raw"
@@ -286,12 +290,17 @@ registered_worktrees() {
 # repair path must keep working).
 contains_registered_worktree() { # $1=hub-relative path  $2=registered_worktrees output
   local rel="$1" registered="$2" cand rec par base
+  # git spells an untracked DIRECTORY as `?? dir/`. Strip the trailing slash
+  # BEFORE splitting, or the split yields par=dir / base="" and the match misses
+  # — the cleanup pass then `rm -rf`'d the live worktree (#1919 review P1).
+  rel="${rel%/}"
   [[ -z "$rel" || -z "$registered" ]] && return 1
   # PARENT realpath, entry SPELLED (#1919 review P2): following the leaf made an
   # untracked SYMLINK to a worktree look like the worktree, so the final
   # cleanliness test dropped a genuine dirt entry and reported a dirty hub clean.
   par="${rel%/*}"; [[ "$par" == "$rel" ]] && par="."
   base="${rel##*/}"
+  [[ -z "$base" ]] && return 1
   cand="$( (cd "$MAIN_REPO" 2>/dev/null && cd "$par" 2>/dev/null && printf '%s/%s' "$(pwd -P)" "$base") )" || return 1
   while IFS= read -r rec; do
     [[ -z "$rec" ]] && continue
@@ -327,10 +336,13 @@ salvage() {
   # and the cleanup pass would `rm -rf` the only copy of its uncommitted work.
   # Refuse instead of proceeding blind (fail closed on the destructive path).
   registered="$(registered_worktrees)" || {
-    echo "⛔ hub-worktree: salvage: could not list registered worktrees — \`git -C \"$MAIN_REPO\" worktree list\` failed." >&2
+    # NO git invocation in this text: the script-content walker (#1484/#444)
+    # classifies a MESSAGE that spells one as unverifiable, which would close
+    # this sanctioned recovery helper (#1919 review P1).
+    echo "⛔ hub-worktree: salvage: could not list REGISTERED WORKTREES — the hub's worktree listing failed." >&2
     echo "   Refusing to salvage: without that list a LIVE worktree in the hub cannot be" >&2
     echo "   told from scratch dirt, and the cleanup pass would delete it (#1919)." >&2
-    echo "   Fix the worktree metadata first:  git -C \"$MAIN_REPO\" worktree list" >&2
+    echo "   Repair the hub's worktree metadata first (see the header of this script), then re-run." >&2
     exit 1
   }
   # RAW porcelain (-z + quotepath=false): paths arrive verbatim, NUL-terminated

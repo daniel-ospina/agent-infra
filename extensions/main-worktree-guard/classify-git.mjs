@@ -618,7 +618,12 @@ function _worktreeListRecords(sessionCwd) {
     for (const field of out.split("\0")) {
       if (field.startsWith("worktree ")) {
         const rp = _realpathSafe(field.slice("worktree ".length));
-        if (rp !== null) records.push(rp);
+        // A PRUNABLE record (git's own "gitdir file points to non-existent
+        // location" — the #1410 unlinked-worktree class) is NOT a worktree any
+        // more: its `.git` link is gone, so git would happily let the hub commit
+        // its files. Excluding it made a genuine untracked directory read CLEAN
+        // (#1919 review P2). Requiring the link keeps the exclusion truthful.
+        if (rp !== null && existsSync(join(rp, ".git"))) records.push(rp);
       }
     }
     return records;
@@ -6247,14 +6252,15 @@ const WT_ADD_VALUE_FLAGS = new Set(["-b", "-B", "--reason"]);
  * invocation, or null for every other worktree form.
  *
  * Value-aware walk (a flag's value is not a positional), and `move`'s target is
- * its SECOND positional (`move <worktree> <new-path>`). A target git will
- * expand itself at run time — `$VAR`, `${…}`, `~` — is NOT judged: the static
- * text is not the path that will be created, and guessing there would turn a
- * refusal into a false block.
+ * its SECOND positional (`move <worktree> <new-path>`). A `~` target is git's
+ * own expansion and is not judged; a `$VAR` target IS expanded against the
+ * command's assignments plus PWD, and an unresolvable one is not guessed.
  * @param {string[]} args — invocation args INCLUDING the subcommand
+ * @param {object} [vars] — the invocation's shell assignments
+ * @param {string} [execCwd] — the invocation's execution frame (PWD)
  * @returns {{ sub: string, target: string } | null}
  */
-function _worktreeTargetArg(args) {
+function _worktreeTargetArg(args, vars, execCwd) {
   const a = args || [];
   const pos = [];
   let endOfOpts = false;
@@ -6270,10 +6276,81 @@ function _worktreeTargetArg(args) {
     pos.push(t);
   }
   const sub = pos[0];
-  const target = sub === "add" ? pos[1] : sub === "move" ? pos[2] : null;
+  let target = sub === "add" ? pos[1] : sub === "move" ? pos[2] : null;
   if (!target) return null;
-  if (target === "\u0000" || target.includes("$") || target === "~" || target.startsWith("~/")) return null;
+  if (target === "\u0000") return null;
+  // `~` is GIT's own expansion, not the shell's — leave it unjudged.
+  if (target === "~" || target.startsWith("~/")) return null;
+  // A SHELL-VARIABLE target is expanded through the command's own assignments
+  // plus PWD (the execution frame). Not doing it was a fail-open (#1919 review
+  // P1): `D=q7; git worktree add "$D/wt"` and `git worktree add $PWD/v6` were
+  // ALLOWED, created `?? q7/` in the clean hub, and re-created the deadlock.
+  // An UNRESOLVABLE variable is still not guessed — the static text is not the
+  // path, so it stays unjudged rather than becoming a false block.
+  if (target.includes("$")) {
+    target = _expandCdVars(target, { PWD: execCwd ?? process.cwd(), ...(vars || {}) });
+    if (target === null) return null;
+  }
   return { sub, target };
+}
+
+/** The PHYSICAL form of `p` — symlinks resolved in the deepest EXISTING ancestor,
+ * with the not-yet-existing tail rejoined (a worktree target normally does not
+ * exist yet). null only when no ancestor is resolvable.
+ *
+ * #1919 review P2 (refusal side): comparing a lexical target against git's
+ * PHYSICAL `--show-toplevel` let a target spelled through a symlinked prefix
+ * (`/var/tmp/link-into-hub/hub/sneaky`, or macOS `/tmp` → `/private/tmp`) read as
+ * "outside" while landing INSIDE — the mirror of the exclusion-side bug.
+ * @param {string} p
+ * @returns {string|null}
+ */
+function _physicalPath(p) {
+  let cur = resolve(p);
+  const tail = [];
+  for (let i = 0; i < 64; i++) {
+    const rp = _realpathSafe(cur);
+    if (rp !== null) return tail.length ? join(rp, ...tail.reverse()) : rp;
+    const parent = dirname(cur);
+    if (parent === cur) break;
+    tail.push(basename(cur));
+    cur = parent;
+  }
+  return null;
+}
+
+/** The deepest EXISTING directory at or above `p` (a worktree target normally
+ * does not exist yet, and `git rev-parse` must run in a directory that does).
+ * @param {string} p
+ * @returns {string|null}
+ */
+function _nearestExistingDir(p) {
+  let dir = resolve(p);
+  while (!existsSync(dir)) {
+    const parent = dirname(dir);
+    if (parent === dir) return null;
+    dir = parent;
+  }
+  return dir;
+}
+
+/** The git toplevel that OWNS directory `dir`, or null when it is not inside a
+ * checkout (or git cannot answer). Distinct from `resolveTargetTopLevel`, which
+ * takes a path RELATIVE TO a cwd and inspects its dirname — here the caller
+ * already has the absolute directory to test.
+ * @param {string|null} dir
+ * @returns {string|null}
+ */
+function _checkoutTopLevel(dir) {
+  if (!dir) return null;
+  try {
+    const top = execSync("git rev-parse --show-toplevel", {
+      encoding: "utf-8", cwd: dir, timeout: 5000, stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    return top ? resolve(top) : null;
+  } catch {
+    return null;
+  }
 }
 
 /** Does `repoTop`'s .gitignore family ignore `rel`? Exit 0 = ignored.
@@ -6303,17 +6380,23 @@ function _gitIgnores(repoTop, rel) {
  * @param {string} verb
  * @param {string[]} args
  * @param {string} [execCwd] — the invocation's execution cwd
+ * @param {object} [vars] — the invocation's shell assignments (for `$VAR` targets)
  * @returns {string|null} the block reason, or null
  */
-export function nestedWorktreeTargetReason(verb, args, execCwd = process.cwd()) {
+export function nestedWorktreeTargetReason(verb, args, execCwd = process.cwd(), vars = {}) {
   if (verb !== "worktree") return null;
-  const t = _worktreeTargetArg(args);
+  const t = _worktreeTargetArg(args, vars, execCwd);
   if (!t) return null;
-  const abs = resolve(execCwd, t.target);
+  const lexical = resolve(execCwd, t.target);
+  // Judge the PHYSICAL path: a target spelled through a symlinked prefix must
+  // not compare as "outside" while landing inside the checkout.
+  const abs = _physicalPath(lexical) ?? lexical;
   // The checkout that would RECEIVE the entry. The hub root, or any path inside
   // it, resolves to that checkout's toplevel; a path outside every repo returns
-  // null and is not this rule's business.
-  const top = resolveTargetTopLevel(abs, execCwd);
+  // null and is not this rule's business. Resolved from the deepest EXISTING
+  // directory so a not-yet-created target (the normal case) and an existing one
+  // (the checkout root itself) are both judged.
+  const top = _checkoutTopLevel(_nearestExistingDir(abs));
   if (!top) return null;
   const inTree = abs === top || abs.startsWith(top + "/");
   if (!inTree) return null;
@@ -6334,28 +6417,89 @@ export function nestedWorktreeTargetReason(verb, args, execCwd = process.cwd()) 
   ].join("\n");
 }
 
+/** `~`/`~/…` → the user's home, so a tilde cd-frame is judged rather than
+ * declared unplaceable. `_resolveCdChain` treats a tilde entry as UNRESOLVABLE
+ * (conservative for its other callers); here the value is known.
+ * @param {Array<string|null>} chain
+ * @returns {Array<string|null>}
+ */
+function _homeExpandedChain(chain) {
+  return (chain || []).map((t) => {
+    if (t === "~") return homedir();
+    if (typeof t === "string" && t.startsWith("~/")) return join(homedir(), t.slice(2));
+    return t;
+  });
+}
+
+/** #1919 — the refusal for a `worktree add|move` whose execution frame could not
+ * be placed and whose target is RELATIVE. It refuses only when the SESSION sits
+ * inside a git checkout: a relative target created from an undeterminable frame
+ * can land inside that checkout, and that is the deadlock this gate exists to
+ * prevent. A session outside every checkout is not refused — there is no
+ * checkout it could nest the worktree in, so a refusal there would be a false
+ * block with no state behind it.
+ * @param {{ sub: string, target: string }} t
+ * @param {string} sessionCwd
+ * @returns {string|null}
+ */
+function _unplaceableFrameReason(t, sessionCwd) {
+  const top = _checkoutTopLevel(_nearestExistingDir(sessionCwd));
+  if (!top) return null;
+  return [
+    `⛔ Refused: this \`git worktree ${t.sub}\` has a RELATIVE target (${t.target}) whose`,
+    `   execution directory could not be resolved, and this session is inside a git`,
+    `   checkout (${top}).`,
+    `   A relative target created from an unknown directory can land INSIDE that`,
+    `   checkout, where git reports it as an untracked directory and the hub-state`,
+    `   gate (#1484) then refuses every git op that could move it out (#1919).`,
+    `   → Spell the directory (or the target) LITERALLY so it can be judged, and`,
+    `     put the worktree OUTSIDE the checkout or under a path it IGNORES.`,
+    `   → AGENT_ALLOW_MAIN_EDITS=1 (session start) bypasses this gate, as it does M4.`,
+  ].join("\n");
+}
+
 /** #1919 — check EVERY `worktree add|move` invocation in a shell command and
  * return the first refusal reason, or null. Each invocation is judged in its
  * OWN execution frame (its resolved cd-chain plus any `-C` hints), so
  * `cd <hub> && git worktree add nested` is judged at `<hub>`, and
- * `git -C <hub> worktree add nested` likewise. An unresolvable frame is
- * skipped — M4 still gates a disordered hub, and a command this cannot place is
- * not evidence of a nested target.
+ * `git -C <hub> worktree add nested` likewise.
+ *
+ * FAIL CLOSED on an UNPLACEABLE frame with a RELATIVE target (#1919 review P1):
+ * `cd $UNKNOWN && git worktree add v1` was skipped entirely, so one unassigned
+ * variable re-created the deadlock. The frame cannot be proven outside every
+ * checkout, so the target is judged against the SESSION's checkout — the
+ * incident shape is a relative target in a hub-rooted session, and a relative
+ * target whose frame is unknown can land inside one.
  * @param {string} command
  * @param {string} [sessionCwd]
  * @returns {string|null}
  */
 export function nestedWorktreeTargetViolation(command, sessionCwd = process.cwd()) {
   let invocations;
-  try { invocations = allGitInvocations(command); } catch { return null; }
+  // Seed the walk with the PROCESS env: a `cd $DIR` / `-C $DIR` frame the command
+  // itself does not assign still resolves — the shell would see that value too,
+  // and leaving it unresolvable made every env-spelled frame skippable.
+  try { invocations = allGitInvocations(command, { ...process.env }); } catch { return null; }
   for (const inv of invocations) {
     if (inv.verb !== "worktree") continue;
-    let cwd = _resolveCdChain(inv.cdChain || [], sessionCwd);
-    if (cwd === null) continue; // unresolvable $VAR/tilde cd → cannot place the invocation
-    for (const c of inv.cHints || []) cwd = resolve(cwd, c);
-    cwd = _realpathSafe(cwd);
-    if (cwd === null) continue;
-    const reason = nestedWorktreeTargetReason(inv.verb, inv.args, cwd);
+    let cwd = _resolveCdChain(_homeExpandedChain(inv.cdChain), sessionCwd);
+    if (cwd !== null) {
+      for (const c of inv.cHints || []) {
+        const ex = _expandCdVars(c, { PWD: cwd, ...(inv.vars || {}) });
+        if (ex === null) { cwd = null; break; } // unresolvable `-C $VAR` → unplaceable
+        cwd = resolve(cwd, ex);
+      }
+    }
+    if (cwd !== null) {
+      const reason = nestedWorktreeTargetReason(inv.verb, inv.args, cwd, inv.vars);
+      if (reason) return reason;
+      continue;
+    }
+    // UNPLACEABLE frame. An absolute or `~` target carries its own frame and is
+    // still judged; a RELATIVE one cannot be proven outside every checkout.
+    const t = _worktreeTargetArg(inv.args, inv.vars, sessionCwd);
+    if (!t || isAbsolute(t.target)) continue;
+    const reason = _unplaceableFrameReason(t, sessionCwd);
     if (reason) return reason;
   }
   return null;
