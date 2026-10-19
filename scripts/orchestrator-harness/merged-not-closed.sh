@@ -73,7 +73,8 @@ command -v python3 >/dev/null 2>&1 || { echo "merged-not-closed: python3 not on 
 # In `orch-loop.sh`/`install.sh`/`refresh-candidates.sh`, `REPO` is a CHECKOUT PATH; in `gh --repo`
 # it is an `owner/name` SLUG. Handling it as one of them turned a cell with `REPO=/tmp/x` into
 # `gh api repos//tmp/x/issues`. So: a value that is an existing DIRECTORY is the checkout to derive
-# FROM; a value shaped like a slug is the answer itself; otherwise the current directory is derived.
+# FROM; a value shaped like a slug is the answer itself; anything else is REFUSED (exit 2) rather
+# than derived-from-the-cwd — a tool that guesses which repo to report on is the #2040 defect itself.
 # An unresolvable origin is a REFUSAL (exit 2), never a silent substitute and never a wrong repo at
 # exit 0.
 # ⛔ AND SHAPE IS DECIDED BEFORE THE DIRECTORY TEST (review round 2, P2). Directory-first meant a
@@ -85,8 +86,13 @@ is_pathish() { case "${1:-}" in /*|./*|../*|'~'*) return 0 ;; esac; return 1; }
 is_slug() {
   case "${1:-}" in ''|*/*/*|*:*) return 1 ;; esac
   case "$1" in */*) : ;; *) return 1 ;; esac
-  case "${1%%/*}" in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac
-  case "${1#*/}"  in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac
+  # ⛔ `.` AND `..` ARE NOT AN OWNER, AND THAT IS A REAL DEFECT, NOT A NICETY (review P2, cycle 4).
+  # The owner class admits dots, so `../tortoise` and `./tortoise` passed as SLUGS and reached
+  # `gh api repos/../tortoise/issues` and `q=repo:../tortoise` — a wrong surface reported as an API
+  # failure (exit 2 blaming github) instead of a usage refusal. `is_pathish` already names those
+  # shapes; this makes the classifier agree with the header that promised it.
+  case "${1%%/*}" in ''|.|..|*[!A-Za-z0-9._-]*) return 1 ;; esac
+  case "${1#*/}"  in ''|.|..|*[!A-Za-z0-9._-]*) return 1 ;; esac
   return 0
 }
 if [ -n "$REPO" ]; then

@@ -14,7 +14,27 @@
 # alive and can only merge. `--check` answers the provisioning question up front, WITH THE REASON,
 # so a cell is never STARTED in that state (cloud-cell-supervisor.sh `check` calls it).
 set -u
-OR="${OR:-daniel-ospina/tortoise}"
+OR_FROM_ENV="${OR:-}"
+OR="${OR_FROM_ENV:-daniel-ospina/tortoise}"
+# ⛔ THE LANDED PRUNE MUST NOT ACT ON A REPO NOBODY NAMED (review P1, cycle 4). The listings below only
+# ever READ `$OR`, and a wrong `$OR` there cost a wrong listing. The landed prune is a WRITE: it DROPS
+# entries from `landed.txt` on a CLOSED answer, which RELEASES a landed suppression and makes shipped
+# work dispatchable again — from a `gh issue view --repo <the literal>` answer about a DIFFERENT repo.
+# `repo-slug.sh` and #2040 exist because that literal was already the measured wrong-repo defect, so
+# the prune takes an EXPLICIT-or-DERIVED slug and nothing else: when neither exists it is called with an
+# EMPTY repo, which its own per-entry fail-closed arm reads as "cannot read this entry" and KEEPS it.
+# The listings keep their shipped default (unchanged by this PR).
+PRUNE_OR="$OR_FROM_ENV"
+if [ -z "$PRUNE_OR" ]; then
+  _rs="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+  for _cand in "${O:-}/repo-slug.sh" "$_rs/repo-slug.sh"; do
+    [ -n "$_cand" ] && [ -f "$_cand" ] || continue
+    # shellcheck disable=SC1090
+    . "$_cand" 2>/dev/null || continue
+    PRUNE_OR="$(derive_or "${REPO:-}" "" 2>/dev/null || true)"
+    break
+  done
+fi
 REPO="${REPO:-/Users/danielospina/Documents/GitHub/tortoise}"
 SC="$REPO/.worktrees/dispatch-scout"
 
@@ -1106,9 +1126,9 @@ rm -f "$O/.list-err"
 # discarded, so a failure there left a half-written blacklist or a stale suppression and the pass
 # carried on reporting success. Its status is read IMMEDIATELY below — and the invocation line is
 # anchored by selftest.sh, which extracts this heredoc body, so its SHAPE is load-bearing:
-# `python3 - "$O" "$OR" <<'PY'` carries the repo slug the landed prune needs for
-# `gh issue view <N> --repo <slug>`.
-python3 - "$O" "$OR" <<'PY'
+# `python3 - "$O" "$PRUNE_OR" <<'PY'` carries the EXPLICIT-OR-DERIVED repo slug the landed prune needs
+# for `gh issue view <N> --repo <slug>` — never the listings' fallback literal (review P1, cycle 4).
+python3 - "$O" "$PRUNE_OR" <<'PY'
 import json, os, re, subprocess, sys
 O = sys.argv[1]
 # The landed prune's repo slug. ABSENT means it cannot ask the authoritative question, and the

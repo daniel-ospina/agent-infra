@@ -347,9 +347,13 @@ printf '4114\n8888\n9999\n' > "$R/checked.txt"
 printf '4114\n8888\n' > "$R/.open_iss"
 printf 'feat/8888-tm\n' > "$R/.pr_brs"
 tmux() { printf 'lane-7777\nmerge-100\n'; }
-# extract the embedded reaper (the heredoc body only). The invocation carries $OR for the landed
-# prune (tortoise#8560), so the anchor tolerates it — pinned to the SHAPE, not to one argument list.
-awk '/^python3 - "\$O"( "\$OR")? <<.PY.$/{f=1;next} /^PY$/{f=0} f' "$REFRESH" > "$R/reap.py"
+# extract the embedded reaper (the heredoc body only). The invocation carries a repo slug for the
+# landed prune (tortoise#8560), so the anchor tolerates ANY second argument — pinned to the SHAPE, not
+# to one argument list. ⛔ IT WAS PINNED TO `"$OR"` AND THAT BROKE SILENTLY (review P1-adjacent, cycle
+# 4): the prune's argument became `"$PRUNE_OR"` (explicit-or-derived, never the fallback literal), the
+# regex stopped matching, the extraction produced an EMPTY file, and every landed/reaper assertion
+# below ran against nothing instead of failing. A narrow anchor here is a false PASS generator.
+awk '/^python3 - "\$O"( "[^"]*")? <<.PY.$/{f=1;next} /^PY$/{f=0} f' "$REFRESH" > "$R/reap.py"
 if need "$R/reap.py" "the reaper is extracted from the shipped refresh-candidates.sh"; then
 # the extracted body shells out to tmux; export the fake so the child sees it
 cat > "$R/tmux" <<'SH'

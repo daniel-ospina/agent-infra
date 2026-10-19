@@ -528,9 +528,14 @@ AGENT_RC=$?
 # ⛔ A REFUSAL AT THE SPAWN POINT IS NOT A VERDICT (agent-infra#1884). This file carries its OWN
 # `run_agent()` with no load gate of its own (the header's named residual), so the installed `pi`
 # shim is the only load gate this path has — and its refusal arrives as rc=76. Without this arm the
-# empty verdict falls into the `*)` arm below and records `needsfix-<PR>-<head>`, authorising a FIXER
-# for a review that never happened: a MAX_FIX_TRIES attempt burnt per refusal, and the PR eventually
-# parked "needs a human" having never had a review. That is the #1716/#1720 class, one worker over.
+# empty verdict would reach the verdict classifier and be handled as a review that produced nothing,
+# so a MAX_FIX_TRIES attempt would be burnt per refusal and the PR would eventually park "needs a
+# human" having never had a review. That is the #1716/#1720 class, one worker over.
+# ⛔ AND THE MARKER CLAIM IS NOW PRECISE (review P2, cycle 4): this comment used to say the empty
+# verdict "records `needsfix-<PR>-<head>`, authorising a FIXER" — but `verdict_kind` classifies an
+# empty reviewer output as `none` and writes NO marker (the #8602 fix, `:757` below). What this arm
+# still buys is the SPECIFIC exit code: 76 is the load-refusal signal the controller re-dispatches on,
+# where a bare empty verdict would be re-recorded as an ordinary no-verdict review.
 # So: no marker, the harness's own AGENT_LOAD_REFUSED code, and the controller re-dispatches when the
 # box quietens (75 is what adopt-fix/chain-merge already propagate for this).
 if [ "$AGENT_RC" = "${PI_GATE_REFUSED:-76}" ]; then

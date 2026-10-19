@@ -39,8 +39,10 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SHARED="orch-loop.sh spawn-gate.sh refresh-candidates.sh claims.sh nonblocking-dispatch.sh lane.sh install.sh selftest.sh"
 # ⛔ THE FORK ARM'S SCOPE IS THIS LIST, AND THE EXCLUSIONS ARE NAMED — NOT SILENT (review P1). The arm
 # can only detect a fork of a file it lists, so a file left out is a fork this check cannot see. That
-# was invisible: the output said "retired location holds no harness scripts" while 18 of 26 *.sh were
-# outside the list, and the CI non-vacuity step plants `lane.sh`, so it cannot expose the gap either.
+# was invisible: the output said "retired location holds no harness scripts" while MOST of the harness
+# scripts were outside the list (8 of 41 at this head; the exact count moves as files are added, which
+# is why it is not pinned here), and the CI non-vacuity step plants `lane.sh`, so it cannot expose the
+# gap either.
 # `merge-one.sh` is the ONE exclusion that is DELIBERATE and must stay: tortoise keeps it because it
 # carries the unported #8484/#8589 detached-reviewer fix (README §11), so listing it here would fail
 # the real retired location for holding a copy that is still the only home of that fix. Every other
@@ -125,8 +127,8 @@ for fork in ${FORKS[@]+"${FORKS[@]}"}; do
   [ "$fork_files" -gt 0 ] && targets=$((targets + 1))
   # ⛔ THE "ok" LINE NAMES WHAT WAS ACTUALLY LOOKED FOR (review P1, cycle 2). It used to say "holds no
   # harness scripts", which reads as "no fork here" when the arm had only looked for the curated SHARED
-  # set — 17 of the 26 *.sh were outside it, so a fork of `dispatch-merge.sh` alone printed ok and
-  # exited 0. The scope is part of the answer, on the same line, in every mode (including --quiet,
+  # set — most of the harness scripts were outside it (8 of 41 at this head), so a fork of
+  # `dispatch-merge.sh` alone printed ok and exited 0. The scope is part of the answer, on the same line, in every mode (including --quiet,
   # which suppresses note() — hence the plain echo). The set stays curated: `merge-one.sh` is the
   # DELIBERATE exclusion named on the same line, and the deployed arm byte-compares every `*.sh`.
   [ "$fork_files" -eq 0 ] && echo "ok: $fork holds none of the ${checked_canon} fork-arm files ($(printf '%s\n' $SHARED | paste -sd, - 2>/dev/null || printf '%s\n' $SHARED | tr '\n' ',')) — merge-one.sh deliberately excluded (tortoise keeps the only copy of the unported #8484/#8589 fix, README §11). SCOPE: this arm looks ONLY at those files, at the paths you passed; a fork of any OTHER harness script at a retired path is NOT detected by it — that needs the path named here as a --fork target too (no filesystem walk on purpose, #1069)"
@@ -153,7 +155,11 @@ if [ -n "$O_DIR" ]; then
     # Presence: the executed set. Bytes: every *.sh that is actually there.
     for f in $EXECUTED; do
       [ -f "$O_DIR/$f" ] && continue
-      diverge "the deployed copy at $O_DIR is MISSING $f — the daemon executes \$O/<script>, so this box cannot run it"
+      # ⛔ NOT EVERY ENTRY IN EXECUTED IS DAEMON-EXECUTED (review P2, cycle 4). `merged-not-closed.sh`
+      # and `check-single-source.sh` are operator instruments that `install.sh` copies into $O; nothing
+      # sources them. The presence rule still applies to them (a deployment missing them cannot be
+      # audited from the box), but the message must not claim the daemon runs them.
+      diverge "the deployed copy at $O_DIR is MISSING $f — install.sh puts it in \$O and this box has no copy, so a surface that expects it there cannot run"
     done
     for f in $DEPLOY_SET; do
       [ -f "$O_DIR/$f" ] || continue

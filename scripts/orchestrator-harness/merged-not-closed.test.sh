@@ -78,9 +78,20 @@ R=""; run "$TMP/plain" --repo ""
 ck "an unresolvable origin exits 2 — a non-answer is never a clean sweep" $rc
 
 # ── 5. a value that is neither a slug nor a directory is refused with 2 ──────────────────────────
-R=""; run "$TMP" --repo not a slug
+# ⛔ ONE TOKEN, ON PURPOSE (review P2, cycle 4). `--repo not a slug` is THREE argv words, so it exited
+# 2 from the leftover-word arm (`unknown argument: a`) and never reached the shape guard — the very
+# guard the case is named after, and where a real defect lived (`../tortoise` was classified as a
+# slug because `.`/`..` passed the owner character class). A single token exercises the arm.
+R=""; run "$TMP" --repo notaslug:thing
 [ "$RC" -eq 2 ] && rc=0 || rc=1
 ck "a --repo that is neither owner/name nor a directory exits 2" $rc
+# …and the two DOT-segment shapes that slipped through, driven individually.
+R=""; run "$TMP" --repo ../tortoise
+[ "$RC" -eq 2 ] && rc=0 || rc=1
+ck "a --repo of ../<name> is refused, never sent to gh as repos/../<name>" $rc
+R=""; run "$TMP" --repo ./tortoise
+[ "$RC" -eq 2 ] && rc=0 || rc=1
+ck "a --repo of ./<name> is refused (no gh call for a relative path)" $rc
 
 # ── 6. a FAILED listing exits 2 (the fail-closed contract) ───────────────────────────────────────
 MODE=fail; R="acme/widget"; run "$TMP" --repo acme/widget
