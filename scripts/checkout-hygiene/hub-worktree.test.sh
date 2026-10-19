@@ -320,6 +320,38 @@ git -C "$REPO" branch -q -D nested-wt-br 2>/dev/null || true
 git -C "$REPO" worktree remove --force "$wt_s2" 2>/dev/null || true
 git -C "$REPO" branch -q -D feat/salvage-nested 2>/dev/null || true
 
+# ── 7d. #1919: salvage REFUSES when the worktree list cannot be read ────────
+# An UNVERIFIABLE registered set is not an EMPTY one: with no list the capture
+# pass cannot tell a live worktree from scratch dirt, and the cleanup pass would
+# `rm -rf` the only copy of its uncommitted work. The destructive side must fail
+# CLOSED (#1919 review P2) — the two readers degrade to "exclude nothing", which
+# is safe precisely because they delete nothing.
+git -C "$REPO" worktree add -q "$REPO/nested-wt" -b nested-wt-br2 HEAD
+echo "nested-wip-2" > "$REPO/nested-wt/nested-only.txt"
+SHIM="$FIX/shim-git-noworktreelist"; mkdir -p "$SHIM"
+REAL_GIT_BIN="$(command -v git)"
+cat > "$SHIM/git" <<'SHIMEOF'
+#!/usr/bin/env bash
+# Fail ONLY `git […] worktree list`; every other invocation reaches real git.
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "worktree" ] && [ "$a" = "list" ]; then
+    echo "fatal: shimmed 'git worktree list' failure" >&2
+    exit 128
+  fi
+  prev="$a"
+done
+exec "$REAL_GIT_BIN" "$@"
+SHIMEOF
+chmod +x "$SHIM/git"
+out="$(REAL_GIT_BIN="$REAL_GIT_BIN" PATH="$SHIM:$PATH" bash "$HELPER" salvage feat/salvage-nolist "$REPO" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "salvage REFUSES when \`git worktree list\` cannot answer (fails CLOSED)"
+assert_contains "$out" "could not list registered worktrees" "…and says so, by name"
+[ -f "$REPO/nested-wt/nested-only.txt" ] && ok "the live worktree's uncommitted file SURVIVED" || bad "WORKTREE CONTENT DESTROYED on an unverifiable list"
+assert_contains "$(git -C "$REPO" status --porcelain)" "?? nested-wt/" "…and nothing was removed from the hub"
+git -C "$REPO" worktree remove --force "$REPO/nested-wt" 2>/dev/null || true
+git -C "$REPO" branch -q -D nested-wt-br2 2>/dev/null || true
+
 # ── 8. refresh (#1309): clean-but-stale hub → advance the hub to its upstream ─
 # The state with no SANCTIONED path: a CLEAN hub whose local main has DIVERGED
 # from origin/main (a merely behind hub is already covered by the M4-sanctioned

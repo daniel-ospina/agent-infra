@@ -110,6 +110,11 @@ GH_BIN="${GH_BIN:-gh}"
 # exclusion that cannot be verified must never turn a dirty hub into a PASS. A
 # worktree path carrying a newline cannot ride this line transport; it stays
 # COUNTED (dirty), which is the same safe direction.
+#
+# The entry's LAST component is compared as SPELLED and only its parent is
+# realpath'd (#1919 review P2): an untracked SYMLINK whose target is a registered
+# worktree is ordinary dirt — git would store the link as a blob — so following
+# it would print PASS on a hub `git status` does not call clean.
 filter_registered_worktrees() { # $1=repo-root ; stdin=porcelain ; stdout=porcelain
   local repo="$1" porcelain line rel cand rec raw registered=$'\n'
   porcelain="$(cat)"
@@ -138,7 +143,13 @@ filter_registered_worktrees() { # $1=repo-root ; stdin=porcelain ; stdout=porcel
         rel="${rel%/}"                       # untracked DIRECTORIES arrive with a trailing slash
         cand=""
         if [[ -n "$rel" ]]; then
-          cand="$( (cd "$repo" 2>/dev/null && cd "$rel" 2>/dev/null && pwd -P) )" || cand=""
+          # PARENT realpath, entry SPELLED (#1919 review P2): resolving the leaf
+          # would treat an untracked SYMLINK to a worktree as the worktree and
+          # print PASS on a hub whose `git status` is not empty. Parent/base are
+          # split by parameter expansion — no dirname/basename spawn per entry.
+          local _par="${rel%/*}" _base="${rel##*/}"
+          [[ "$_par" == "$rel" ]] && _par="."
+          cand="$( (cd "$repo" 2>/dev/null && cd "$_par" 2>/dev/null && printf '%s/%s' "$(pwd -P)" "$_base") )" || cand=""
         fi
         # A REGISTERED worktree is git's own state, not hub dirt (#1919).
         if [[ -n "$cand" && "$registered" == *$'\n'"$cand"$'\n'* ]]; then continue; fi

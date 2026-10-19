@@ -27,7 +27,7 @@
 //
 // Run: node extensions/main-worktree-guard/test-nested-worktree.mjs
 import { execSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -188,6 +188,22 @@ try {
   expectTrue("A11: …and the sanctioned route", reason.includes("hub-worktree.sh"), reason.slice(0, 120));
   expectTrue("A11: …and the escape hatch", reason.includes("AGENT_ALLOW_MAIN_EDITS=1"), reason.slice(0, 120));
 
+  // A12 (#1919 review P2): an untracked SYMLINK that points AT a registered
+  // worktree is ordinary hub dirt. The exclusion compares the entry as SPELLED
+  // and realpaths only its PARENT; resolving the leaf made the link
+  // indistinguishable from the worktree, so the hub read CLEAN while
+  // `git status` still reported it (a false PASS of the gate under repair).
+  execSync("ln -s nested-wt link-to-nested", { cwd: hub });
+  const porcelain12 = out("git status --porcelain", hub);
+  expectTrue("A12: git reports the symlink as its own untracked entry",
+    porcelain12.split("\n").includes("?? link-to-nested"), JSON.stringify(porcelain12));
+  expect("A12: …and it IS hub dirt (a link is not a worktree)", readHubDisorder(hub).disorder, "dirty");
+  expect("A12: …while the registered worktree BESIDE it is still not counted",
+    porcelainWithoutRegisteredWorktrees(porcelain12, hub).split("\n").filter((l) => l.length > 0).join("|"),
+    "?? link-to-nested");
+  rmSync(join(hub, "link-to-nested"));
+  expect("A12: …and the hub reads clean again once the link is gone", readHubDisorder(hub).disorder, null);
+
   // ───────────────────────────────────────────────────────────────────────
   // Part B — real index.ts load + handler-driven gate
   // ───────────────────────────────────────────────────────────────────────
@@ -277,6 +293,16 @@ try {
       const r8 = await bash(moveCmd, hub);
       expectTrue("B8: tracked modification → the SAME command BLOCKED", blocked(r8), JSON.stringify(r8));
       gg("checkout -- a.txt", hub);
+
+      // B11 (#1919 review P1): the refusal cannot be SPELLED around. The
+      // handler's cheap pre-filter was a literal `command.includes("worktree")`;
+      // shell quoting (`work"tree"`) reaches git as the same verb and slipped
+      // past it, so the nested worktree was created and the hub deadlocked —
+      // exactly the issue's state. The pre-filter is gone; the classifier decides.
+      const r11 = await bash('git work"tree" add nested-quoted -b nested-quoted', hub);
+      expectTrue("B11: `git work\"tree\" add <relative path>` → BLOCKED", blocked(r11), JSON.stringify(r11?.reason?.slice(0, 90)));
+      expectTrue("B11: …with the #1919 refusal", reasonOf(r11).includes("#1919"), reasonOf(r11).slice(0, 90));
+      expectTrue("B11: …and the state was never created", !existsSync(join(hub, "nested-quoted")), "created");
 
       // B9: the env hatch still bypasses the new gate (documented in its reason).
       process.env.AGENT_ALLOW_MAIN_EDITS = "1";

@@ -642,6 +642,27 @@ function _porcelainRelPath(raw) {
   return p;
 }
 
+/** Does `absPath` NAME a registered worktree (#1919)?
+ *
+ * SYMLINKS IN THE PARENT PATH ARE RESOLVED, THE ENTRY ITSELF IS NOT (#1919
+ * review P2). Resolving the leaf made an untracked SYMLINK whose target is a
+ * registered worktree indistinguishable from the worktree entry: it was dropped,
+ * so the hub read CLEAN with `?? link-to-nested` still in `git status` — a false
+ * PASS of the M4 gate, the exact failure this whole change is about. The parent
+ * must be realpath'd (macOS `/tmp` → `/private/tmp`, and a hub reached through a
+ * symlinked prefix), but the last path component is compared as SPELLED, because
+ * `git status` reports the link NODE — which git would happily store as a blob —
+ * not the directory it points at.
+ * @param {string} absPath — the resolved (not realpath'd) entry path
+ * @param {Set<string>} registered — realpath'd linked-worktree paths
+ * @returns {boolean}
+ */
+function _resolvesToRegistered(absPath, registered) {
+  const parent = _realpathSafe(dirname(resolve(absPath)));
+  if (parent === null) return false; // unresolvable → COUNTED (fail-safe)
+  return registered.has(join(parent, basename(resolve(absPath))));
+}
+
 /** #1919 — a REGISTERED WORKTREE is not hub dirt.
  *
  * `git worktree add 8779-optA` with a RELATIVE path puts a registered worktree
@@ -691,10 +712,7 @@ export function porcelainWithoutRegisteredWorktrees(porcelain, cwd = process.cwd
     if (line === "") continue;
     if (!line.startsWith("?? ")) { kept.push(line); continue; }
     const rel = _porcelainRelPath(line.slice(3));
-    const isWorktree = rel !== "" && bases.some((b) => {
-      const rp = _realpathSafe(resolve(b, rel));
-      return rp !== null && registered.has(rp);
-    });
+    const isWorktree = rel !== "" && bases.some((b) => _resolvesToRegistered(join(b, rel), registered));
     if (!isWorktree) kept.push(line);
   }
   return kept.join("\n");

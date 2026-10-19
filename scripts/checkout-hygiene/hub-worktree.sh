@@ -256,12 +256,19 @@ _salvage_captured() {
 # #1919 — the REGISTERED WORKTREES of the hub (canonical, newline-joined).
 # `git worktree list` prints the MAIN worktree first and its path IS the hub, so
 # it is dropped: the hub is an ancestor of everything and would exclude all dirt.
+#
+# EXIT 2 means GIT COULD NOT ANSWER, which is NOT the same as "no linked
+# worktrees" (#1919 review P2): an empty string means verified-none and lets the
+# cleanup delete freely, while a failed listing must stop the cleanup — a live
+# worktree in the hub is then indistinguishable from scratch dirt, and the delete
+# pass would `rm -rf` the only copy of its uncommitted work. Callers MUST test the
+# exit status before treating an empty result as "nothing registered".
 registered_worktrees() {
   local rec cand raw out=""
   # Command substitution + here-string, deliberately NOT `< <(...)`: the guard's
   # script surface treats a process substitution carrying git as UNVERIFIABLE and
   # refuses the whole file, which would close this sanctioned recovery helper.
-  raw="$(git -C "$MAIN_REPO" worktree list --porcelain 2>/dev/null | sed -n 's/^worktree //p' | tail -n +2)"
+  raw="$(git -C "$MAIN_REPO" worktree list --porcelain 2>/dev/null | sed -n 's/^worktree //p' | tail -n +2)" || return 2
   while IFS= read -r rec; do
     [[ -z "$rec" ]] && continue
     cand="$( (cd "$rec" 2>/dev/null && pwd -P) )" || continue
@@ -278,9 +285,14 @@ registered_worktrees() {
 # NOT skipped (an unlinked worktree's files are ordinary hub content, and #1410's
 # repair path must keep working).
 contains_registered_worktree() { # $1=hub-relative path  $2=registered_worktrees output
-  local rel="$1" registered="$2" cand rec
+  local rel="$1" registered="$2" cand rec par base
   [[ -z "$rel" || -z "$registered" ]] && return 1
-  cand="$( (cd "$MAIN_REPO" 2>/dev/null && cd "$rel" 2>/dev/null && pwd -P) )" || return 1
+  # PARENT realpath, entry SPELLED (#1919 review P2): following the leaf made an
+  # untracked SYMLINK to a worktree look like the worktree, so the final
+  # cleanliness test dropped a genuine dirt entry and reported a dirty hub clean.
+  par="${rel%/*}"; [[ "$par" == "$rel" ]] && par="."
+  base="${rel##*/}"
+  cand="$( (cd "$MAIN_REPO" 2>/dev/null && cd "$par" 2>/dev/null && printf '%s/%s' "$(pwd -P)" "$base") )" || return 1
   while IFS= read -r rec; do
     [[ -z "$rec" ]] && continue
     [[ "$rec" == "$cand" || "$rec" == "$cand"/* ]] && return 0
@@ -309,8 +321,18 @@ filter_registered_worktree_lines() { # $1=registered_worktrees output ; stdin=po
 salvage() {
   local hub_branch porcelain clean_rel registered
   hub_branch="$(git -C "$MAIN_REPO" branch --show-current 2>/dev/null || echo "detached")"
-  # #1919 — resolved ONCE, before anything is captured.
-  registered="$(registered_worktrees)"
+  # #1919 — resolved ONCE, before anything is captured. A FAILED listing is not
+  # an empty one: without the registered set the capture pass below cannot tell a
+  # live worktree from scratch dirt, so it would copy the worktree as a gitlink
+  # and the cleanup pass would `rm -rf` the only copy of its uncommitted work.
+  # Refuse instead of proceeding blind (fail closed on the destructive path).
+  registered="$(registered_worktrees)" || {
+    echo "⛔ hub-worktree: salvage: could not list registered worktrees — \`git -C \"$MAIN_REPO\" worktree list\` failed." >&2
+    echo "   Refusing to salvage: without that list a LIVE worktree in the hub cannot be" >&2
+    echo "   told from scratch dirt, and the cleanup pass would delete it (#1919)." >&2
+    echo "   Fix the worktree metadata first:  git -C \"$MAIN_REPO\" worktree list" >&2
+    exit 1
+  }
   # RAW porcelain (-z + quotepath=false): paths arrive verbatim, NUL-terminated
   # — no C-style/octal escaping, so non-ASCII (café) and spaced paths are safe.
   # tr NUL->newline for line parsing; records are always "XY <path>" (char 2 is

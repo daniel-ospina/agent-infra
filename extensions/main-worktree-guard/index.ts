@@ -590,11 +590,17 @@ function _m4CheckoutLine(st: { disorder: string | null; branch: string | null; p
 // already carry the state is `porcelainWithoutRegisteredWorktrees`; this refuses
 // to create new ones. Independent of the hub's OWN state (a clean hub creates it
 // just as well), and like M4 it stays active under the TTL marker — a stranded
-// lane may recover, it may not manufacture the deadlock. The cheap pre-filter
-// keeps every other bash command off the parse.
+// lane may recover, it may not manufacture the deadlock.
+//
+// NO literal-substring pre-filter (#1919 review P1). A `command.includes("worktree")`
+// guard was a FAIL-OPEN: shell quoting spells the verb in ways git accepts and a
+// literal check does not see — `git work"tree" add deep/x` runs `worktree`, the
+// classifier REFUSES it, and the pre-filter returned null before the classifier
+// ever ran, so the nested worktree was created and the hub deadlocked exactly as
+// the issue describes. The cost of always parsing is one string walk, which is
+// what the sibling gates in this handler already pay.
 function _nestedWorktreeBlock(command: string): string | null {
   try {
-    if (!command.includes("worktree")) return null;
     return nestedWorktreeTargetViolation(command, resolve(process.cwd()));
   } catch {
     return null; // degrade — never false-block on classifier failure

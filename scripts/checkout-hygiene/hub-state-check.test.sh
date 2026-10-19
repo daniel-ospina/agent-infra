@@ -920,6 +920,19 @@ assert_contains "$(git -C "$HN" worktree list --porcelain)" "$HN/8779-optA" \
 out="$(bash "$CHECK" --repo "$HN" 2>&1)" && rc=0 || rc=$?
 assert_eq "$rc" 0 "…and the hub PASSes again once the genuine dirt is gone"
 
+# SAFETY HALF 3 (#1919 review P2): an untracked SYMLINK that points AT the
+# registered worktree is ORDINARY DIRT. The exclusion compares the entry as
+# SPELLED and realpaths only its parent; resolving the leaf made the link look
+# like the worktree itself, so this check printed PASS for a hub whose
+# `git status` was not empty — a false PASS of the very gate being repaired.
+ln -s 8779-optA "$HN/link-to-nested"
+out="$(bash "$CHECK" --repo "$HN" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "an untracked symlink to a registered worktree → exit 1"
+assert_contains "$out" "HUB_DISORDER=dirty" "…HUB_DISORDER=dirty (a link node is not a worktree)"
+rm -f "$HN/link-to-nested"
+out="$(bash "$CHECK" --repo "$HN" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 0 "…and it PASSes again once the link is gone"
+
 echo ""
 echo "hub-state-check.test.sh: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
