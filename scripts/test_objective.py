@@ -98,8 +98,11 @@ def install(monkeypatch, *, gql=None, rest=None, pr_list=None, ci_runs=None, ls_
         if rest_prs is None:
             raise OSError("fixture: no second source")
         # A payload shorter than one page ENDS the paging loop, so it is returned once.
+        # ⛔ `&page=1`, NOT `page=1`: the URL also carries `per_page=100`, and "page=1" is a
+        # SUBSTRING of "per_page=100" -- a fixture keyed on it matches EVERY page and silently
+        # returns the same full page five times (review round 1, A).
         if isinstance(rest_prs, list) and len(rest_prs) >= objective.QUEUE_REST_PAGE \
-                and "page=1" not in url:
+                and "&page=1" not in url:
             return []
         return rest_prs
 
@@ -1151,6 +1154,7 @@ def test_a_rest_sample_with_an_EMPTY_merge_state_is_not_BLIND(monkeypatch):
     assert "CLASS counts are NOT a clearance" in line, line
     assert "mergeable_state_unknown=6" in line, line    # ...the unread count is not swallowed
     assert "waiting=6" in line and "nondraft=6" in line, line
+    assert "ASK-USER: surface=UNREAD(rest list carries no file list)" in line, line
     assert sleeps == [], sleeps         # re-reading REST cannot settle a field REST never computes
     # An unread value must never render as a zero -- not even when the read itself is accepted.
     assert q["dirty"] is None and q["unstable"] is None, q
@@ -1161,6 +1165,9 @@ def test_a_REST_sample_with_a_COMPUTED_merge_state_says_only_that_it_came_over_R
 
     Without this, the provenance sentence would be a permanent apology on every fallback pass --
     and a caveat that is always present is not a signal, it is noise a reader learns to skip.
+    ⛔ THE ONE CAVEAT THAT *IS* PERMANENT is the file overlay: the REST list never carries a file
+    list, so `ASK-USER` is UNREAD on EVERY REST pass -- and that must be printed, because an
+    omitted token reads as "nobody needs the owner" (three reviewers, one shape: #2138 r1).
     """
     _rest_queue(monkeypatch, n=2, state="dirty")
     line = objective.build()
@@ -1168,6 +1175,15 @@ def test_a_REST_sample_with_a_COMPUTED_merge_state_says_only_that_it_came_over_R
     assert "mergeable_state_unknown" not in line, line
     assert "NOT a clearance" not in line, line
     assert "resolve-conflict=2" in line, line           # REST's DIRTY is read as DIRTY
+    assert "ASK-USER: surface=UNREAD(rest list carries no file list)" in line, line
+    assert line.index("ASK-USER: surface=UNREAD") < line.index(QUEUE_SEG), line
+
+
+def test_a_GRAPHQL_read_never_claims_the_surface_is_unread(monkeypatch):
+    """...and the unread overlay is REST-only. A normal read's silence stays honest."""
+    install(monkeypatch, pr_list=_Result(0, json.dumps([_pr(1, "BLOCKED")])))
+    line = objective.build()
+    assert "ASK-USER: surface=UNREAD" not in line, line
 
 
 def test_the_rest_payload_is_mapped_to_the_gh_pr_list_shape(monkeypatch):
@@ -1202,8 +1218,23 @@ def test_the_token_comes_from_ghs_own_config_and_absence_fails_closed(tmp_path, 
     hosts = tmp_path / "hosts.yml"
     hosts.write_text("gitlab.example:\n    oauth_token: glpat_other\n"
                      "github.com:\n    oauth_token: gho_github\n    user: someone\n")
+    monkeypatch.delenv("GH_CONFIG_DIR", raising=False)
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
     monkeypatch.setattr(objective, "GH_HOSTS", str(hosts))
     assert objective._gh_token() == "gho_github"        # github.com wins over another host
+
+    # ⛔ ANOTHER HOST'S TOKEN IS NOT A GITHUB CREDENTIAL. Presenting a GitLab/enterprise token to
+    # api.github.com is a foreign credential sent to the wrong service — no request at all.
+    hosts.write_text("gitlab.example:\n    oauth_token: glpat_other\n")
+    assert objective._gh_token() == ""
+
+    # ...and gh's OWN precedence: an env token beats the config file (a token-in-env cell is a
+    # real fleet configuration), so the fallback is not silently inert there.
+    hosts.write_text("github.com:\n    oauth_token: gho_github\n")
+    monkeypatch.setenv("GITHUB_TOKEN", "gho_env")
+    assert objective._gh_token() == "gho_env"
+    monkeypatch.delenv("GITHUB_TOKEN")
 
     called = []
     monkeypatch.setattr(objective, "_rest_get", lambda *a, **k: called.append(a))
@@ -1243,3 +1274,187 @@ def test_a_deep_rest_queue_is_PAGED_and_never_truncated(monkeypatch):
 
     monkeypatch.setattr(objective, "_rest_get", fail_second_page)
     assert objective._queue_rest() is None              # never a partial queue
+
+    # ⛔ AND A CAP REACHED ON A FULL PAGE IS ALSO A FAILED READ (#2138 r1, B and E). The loop's
+    # other exits are a SHORT page and the cap; falling out of the `for` with a full last page
+    # used to return 500 rows as the measured depth — an under-count published as the queue, and
+    # the direction term then reads a 505-deep backlog as "not growing".
+    monkeypatch.setattr(objective, "_rest_get", lambda url, token, timeout=None: [
+        {"number": i, "draft": False, "mergeable": True, "mergeable_state": "clean",
+         "head": {"sha": "x"}} for i in range(1, objective.QUEUE_REST_PAGE + 1)])
+    assert objective._queue_rest() is None
+
+
+def test_a_recovered_read_WITHDRAWS_the_claim_the_refusal_recorded(monkeypatch):
+    """THE WITHDRAWAL MUST BE REAL, NOT DECORATIVE (#2138 review round 1, B and A).
+
+    Round 1 found `_withdraw_gh_failure()` inert on every reachable path — the claim was recorded
+    only in the `except`, which a successful recovery never reaches — so the function could be
+    DELETED with this file's suite still green, including its `GH_BLOCKED is None` assertion.
+    The refusal is now recorded BEFORE the fallback is tried, and the discriminating assertion is
+    the MUTANT: with the withdrawal replaced by a no-op, a recovered read must still print
+    `gh=RATE-LIMITED(queue)` and rewrite the verdict — the exact false-blindness the function
+    exists to prevent (and the failure mode of the live fix's first cut).
+    """
+    _rest_queue(monkeypatch, n=2, state="blocked")
+    assert "gh=" not in objective.build()
+    monkeypatch.setattr(objective, "_withdraw_gh_failure", lambda surface: None)
+    line = objective.build()
+    assert "gh=RATE-LIMITED(queue)" in line, line
+    assert "VERDICT=GH-RATE-LIMITED" in line, line
+
+
+def test_the_fallback_is_bounded_by_the_queue_reads_OWN_budget(monkeypatch):
+    """THE BEAT KILLS THIS READ AT 90 s, so 5 pages x 30 s is not a budget (#2138 r1, B/A/E).
+
+    `QUEUE_REST_TIMEOUT_S` is a PER-PAGE ceiling; the fallback is clipped to what is left of the
+    queue read's own deadline, and a spent budget is a FAILED read. Without this the recovery
+    could outlive `run_bounded 90 objective-refresh` — and a killed refresh writes NO line at
+    all, i.e. the fix would be strictly worse than the refusal it replaces.
+    """
+    calls = []
+    monkeypatch.setattr(objective, "_gh_token", lambda: "t")
+    monkeypatch.setattr(
+        objective, "_rest_get",
+        lambda url, token, timeout=None: (calls.append(timeout), [_rest_row(1, "clean")])[1])
+    ticks = iter([100.0, 101.0, 102.0, 103.0, 104.0])
+    monkeypatch.setattr(objective, "_monotonic", lambda: next(ticks))
+    assert objective._queue_rest(deadline=104.0) is not None
+    assert calls == [4.0], calls        # 104 - 100: the REMAINING budget, not the 30 s page cap
+
+    # A SPENT BUDGET IS A FAILED READ — and it must not even open a socket.
+    opened = []
+    monkeypatch.setattr(objective, "_rest_get", lambda *a, **k: opened.append(a))
+    monkeypatch.setattr(objective, "_monotonic", lambda: 100.0)
+    assert objective._queue_rest(deadline=100.5) is None
+    assert opened == [], opened
+
+
+def test_the_queue_read_hands_the_fallback_its_own_deadline(monkeypatch):
+    """...and the wiring at the call site is what makes that bound real (B's finding).
+
+    `queue()` already computes a wall-clock deadline for the re-sample loop; the fallback must
+    receive it. Asserted on the seam, because a `_queue_rest()` that accepts a deadline nobody
+    passes is the same unbounded read with a nicer signature.
+    """
+    seen = []
+    real = objective._queue_rest
+
+    def spy(deadline=None):
+        seen.append(deadline)
+        return real(deadline=deadline)
+
+    monkeypatch.setattr(objective, "_queue_rest", spy)
+    _rest_queue(monkeypatch, n=2, state="blocked")
+    objective.build()
+    assert seen and all(d is not None for d in seen), seen
+
+
+def test_the_transport_refuses_a_REDIRECT_so_the_token_cannot_be_forwarded():
+    """⛔ urllib FOLLOWS a 30x AND REBUILDS THE REQUEST WITH `Authorization` (#2138 r2, B).
+
+    The default handler copies the caller's headers onto the redirected request for whatever host
+    the 30x names -- so a redirect anywhere on the egress path would hand a full-scope token to a
+    third party. `_rest_get` installs a no-redirect opener, which turns a 30x into a raised
+    error, i.e. "no second source".
+
+    ⛔ THIS TEST EXECUTES THE FUNCTION'S BODY ON PURPOSE. Round 2's verifier found every other test
+    monkeypatches `_rest_get`, so the loop and the import/opener could be deleted with the suite
+    green. Two real servers (a redirector and a sink) pin the property: the sink sees ZERO
+    requests, and a plain 200 on the sink produces exactly one request carrying the header.
+    """
+    import http.server
+    import threading
+    import urllib.error
+
+    seen = []
+
+    class _Sink(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            seen.append(dict(self.headers))
+            body = b'[{"number": 1}]'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    class _Redirect(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(302)
+            self.send_header("Location", f"http://127.0.0.1:{sink.server_port}/elsewhere")
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    sink = http.server.HTTPServer(("127.0.0.1", 0), _Sink)
+    red = http.server.HTTPServer(("127.0.0.1", 0), _Redirect)
+    threads = [threading.Thread(target=s.serve_forever, daemon=True) for s in (sink, red)]
+    for t in threads:
+        t.start()
+    try:
+        with pytest.raises(urllib.error.HTTPError):
+            objective._rest_get(f"http://127.0.0.1:{red.server_port}/x", "gho_secret", timeout=5)
+        assert seen == [], seen          # the Authorization header never reached the other host
+
+        # ...and the happy path really runs: one request, the token in the header, JSON decoded.
+        assert objective._rest_get(f"http://127.0.0.1:{sink.server_port}/ok", "gho_secret",
+                                   timeout=5) == [{"number": 1}]
+        assert len(seen) == 1, seen
+        assert seen[0].get("Authorization") == "Bearer gho_secret", seen[0]
+    finally:
+        for s in (sink, red):
+            s.shutdown()
+            s.server_close()
+
+
+def test_the_transport_is_imported_LAZILY_so_a_box_without_ssl_still_writes_a_line():
+    """⛔ A MODULE-SCOPE `urllib.request` CAN TAKE THE WHOLE INSTRUMENT OUT (#2138 r2, E).
+
+    `urllib.request` pulls in `http.client` and `ssl`. On a python built without OpenSSL a
+    top-level import would make the FARMED script fail at start: no `build()`, no line, no cache
+    write, only `STALL objective-refresh` in the log. Importing it inside `_rest_get` degrades one
+    read to "no second source" instead. Pinned on the AST because no runtime test can prove an
+    import is ABSENT from module scope once other tests have imported it.
+    """
+    import ast
+    tree = ast.parse(pathlib.Path(objective.__file__).read_text())
+    def _imports_urllib(node):
+        return (isinstance(node, ast.Import)
+                and any(getattr(a, "name", "") == "urllib.request" for a in node.names))
+    assert [n for n in tree.body if _imports_urllib(n)] == [], \
+        "urllib.request must NOT be imported at module scope (a box without ssl loses the whole line)"
+    fn = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_rest_get"]
+    assert fn, "_rest_get is missing"
+    assert [n for n in ast.walk(fn[0]) if _imports_urllib(n)], \
+        "_rest_get must import urllib.request itself"
+
+
+def test_the_config_dir_is_resolved_at_CALL_time_not_at_import(tmp_path, monkeypatch):
+    """⛔ `GH_CONFIG_DIR` IS A FLEET CONFIGURATION AND THE PATH IS RESOLVED PER CALL (#2138 r2, E).
+
+    A box whose gh config does not live in `~/.config/gh` would otherwise have a silently INERT
+    fallback (`queue=UNREADABLE` with no way to tell "no second source" from "also refused"). And
+    because `pr-doctor.py` imports this module, a path resolved once at import would go stale for
+    any process that changes `HOME`/`GH_CONFIG_DIR` afterwards.
+    """
+    cfg = tmp_path / "ghcfg"
+    cfg.mkdir()
+    (cfg / "hosts.yml").write_text("github.com:\n    oauth_token: gho_from_config_dir\n")
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.setenv("GH_CONFIG_DIR", str(cfg))
+    monkeypatch.setattr(objective, "GH_HOSTS", str(tmp_path / "never-used.yml"))
+    assert objective._gh_token() == "gho_from_config_dir"
+
+    # ...and the resolved path is what the "no credential" message names, so an inert fallback is
+    # legible rather than silent.
+    monkeypatch.setenv("GH_CONFIG_DIR", str(tmp_path / "absent"))
+    monkeypatch.setattr(objective, "_rest_get", lambda *a, **k: pytest.fail("no request without a token"))
+    assert objective._gh_token() == ""
+    assert objective._queue_rest() is None
+    assert "absent" in objective.GH_LAST_ERROR, objective.GH_LAST_ERROR

@@ -61,7 +61,7 @@ Usage:  objective.py [--json] [--max-age 240]
 Output: OBJECTIVE VERDICT=... prs_waiting=N ... main=RED|GREEN|UNKNOWN@sha ...
 """
 from __future__ import annotations
-import json, os, re, subprocess, sys, time, urllib.request
+import json, os, re, subprocess, sys, time
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 
@@ -1059,47 +1059,73 @@ QUEUE_BLIND_BUDGET_S = 20                     # WALL-CLOCK bound on re-sampling,
 # about. The two limits are separate buckets, so REST is a SECOND SOURCE -- never a retry of the
 # same refusal, and never a fallback to "empty" (an empty read is a FAILED read, #1872).
 #
-# ⛔ AND IT DOES NOT GO THROUGH `GH_BIN`. The failure this exists for is the gh binary's
-# GraphQL read being refused; routing the fallback back through the same binary (or the shell
-# layer's serialisation queue) would put it behind the thing it is escaping.
+# ⛔ AND IT DOES NOT GO THROUGH `GH_BIN`, AND THAT IS A DELIBERATE DEPARTURE FROM #1959. The
+# `$O/gh-rest` adapter serves a GraphQL refusal over REST, and `_gh_layer()` prefers it — but it
+# CANNOT serve THIS read: its `PR_FIELDS` allow-list has no `files`, and its own field rule says a
+# field it does not model "DELEGATES the whole call … Dropping one is not a slow answer, it is a
+# WRONG answer". So `gh pr list --json …,files` delegates straight back to real gh, i.e. to the
+# refused transport — measured 2026-10-19, the day of the fix. This fallback is the in-file
+# equivalent for the ONE read whose field set the adapter deliberately refuses to drop, and it
+# keeps `files` as UNKNOWN (`[]`) only WHERE THE PRIMARY READ ALREADY FAILED, never on the
+# ordinary path where the adapter's objection would apply.
 GH_HOSTS = os.path.expanduser("~/.config/gh/hosts.yml")
 QUEUE_REST_PAGE = 100                         # the list endpoint's maximum page
-QUEUE_REST_MAX_PAGES = 5                      # a bound, not an expectation: >500 open PRs means
-                                              # something other than a queue is wrong
-QUEUE_REST_TIMEOUT_S = 30                     # inside the beat's 90 s refresh bound even with
-                                              # one page; a hung fallback must not outlive it
+QUEUE_REST_MAX_PAGES = 5                      # a bound on PAGES; reaching it with a FULL last page
+                                              # is a FAILED read (a truncated queue is an under-count
+                                              # published as the depth), never a 500-row answer
+QUEUE_REST_TIMEOUT_S = 30                     # PER-PAGE ceiling, further clipped to the queue read's
+                                              # own remaining budget so the fallback can never
+                                              # outlive the beat's 90 s refresh bound (see
+                                              # `_queue_rest(deadline=…)`)
+
+
+def _gh_hosts_path():
+    """Where gh keeps its config, resolved at CALL time (GH_CONFIG_DIR, then the default).
+
+    Resolved per call rather than at import: `pr-doctor.py` imports this module, and a process
+    that changes `HOME`/`GH_CONFIG_DIR` after import would otherwise read a path that no longer
+    exists and silently have no second source.
+    """
+    cfg = os.environ.get("GH_CONFIG_DIR")
+    if not cfg:
+        return GH_HOSTS
+    return os.path.join(os.path.expanduser(cfg), "hosts.yml")
 
 
 def _gh_token():
-    """gh's own `oauth_token`, read from gh's own config. NEVER logged, never printed.
+    """The credential gh itself would use. NEVER logged, never printed.
 
-    Reading the file beats asking the binary (`gh auth token`): that is another subprocess on the
-    hot path of the read that exists BECAUSE the subprocess path is refused, and it would inherit
-    the same shell/shim hazards (#1872). The parser is deliberately tiny -- hosts.yml has a
-    fixed two-level shape (`<host>:` then indented keys) -- and it fails CLOSED: no file, no
-    token, no read.
+    ORDER IS gh's OWN: `GH_TOKEN`/`GITHUB_TOKEN` beat the config file (a token-in-env cell is a
+    real fleet configuration), and only then `hosts.yml`. Reading the file beats asking the binary
+    (`gh auth token`): that is another subprocess on the hot path of the read that exists BECAUSE
+    the subprocess path is refused, and it would inherit the same shell/shim hazards (#1872).
+
+    ⛔ ONLY THE `github.com` BLOCK IS USED. This file's REPO is a github.com repo, so another
+    host's token in the same file (an enterprise or GitLab entry) is not a fallback — sending it
+    to api.github.com would present a foreign credential to the wrong service. No token ⇒ `""`,
+    and the caller makes no request at all.
     """
+    for var in ("GH_TOKEN", "GITHUB_TOKEN"):
+        tok = (os.environ.get(var) or "").strip()
+        if tok:
+            return tok
     try:
-        host, fallback = None, ""
-        with open(GH_HOSTS) as fh:
+        host = None
+        with open(_gh_hosts_path()) as fh:
             for line in fh:
                 if not line.strip() or line.lstrip().startswith("#"):
                     continue
                 if not line[0].isspace():              # `github.com:` -- a new host block
                     host = line.split(":", 1)[0].strip()
                     continue
-                if ":" not in line:
+                if host != "github.com" or ":" not in line:
                     continue
                 k, v = line.split(":", 1)
-                if k.strip() != "oauth_token":
-                    continue
-                v = v.strip().strip("'\"")
-                if not v:
-                    continue
-                if host == "github.com":
-                    return v                            # the host this file talks to wins
-                fallback = fallback or v                # else remember it, but keep looking
-        return fallback
+                if k.strip() == "oauth_token":
+                    v = v.strip().strip("'\"")
+                    if v:
+                        return v
+        return ""
     except Exception:
         return ""
 
@@ -1110,14 +1136,30 @@ def _rest_get(url, token, timeout=QUEUE_REST_TIMEOUT_S):
     Returns the decoded body and RAISES on any failure; the caller treats every raise as "no
     second source". The token is only ever placed in the header -- it must never reach a log
     line, an exception message of ours, or `GH_LAST_ERROR`.
+
+    ⛔ `urllib` IS IMPORTED HERE, NOT AT MODULE SCOPE. It pulls in `http.client` and `ssl`; on a
+    python built without OpenSSL a top-level import would kill the WHOLE farmed script at start
+    (`STALL objective-refresh`, no line, no cache) instead of degrading one read to "no second
+    source" through this function's own failure path.
+
+    ⛔ REDIRECTS ARE REFUSED. urllib's default handler follows a 30x and REBUILDS the request with
+    the caller's headers -- including `Authorization` -- for whatever host the 30x names, which
+    would hand a full-scope token to a third party. `redirect_request` returning None turns a 30x
+    into an `HTTPError`, i.e. into "no second source", which is the honest answer here.
     """
+    import urllib.request
+
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *a, **k):
+            return None
+
     req = urllib.request.Request(url, headers={
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
         "User-Agent": "objective.py (agent-infra heartbeat)",
     })
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    with urllib.request.build_opener(_NoRedirect).open(req, timeout=timeout) as r:
         return json.loads(r.read().decode("utf-8"))
 
 
@@ -1145,7 +1187,7 @@ def _rest_pr(p):
     }
 
 
-def _queue_rest():
+def _queue_rest(deadline=None):
     """The open PR list over REST, or None on ANY failure -- never an empty queue.
 
     ⛔ `[]` IS NEVER A FAILURE VALUE HERE. It is the honest answer for a repo with no open PRs,
@@ -1159,21 +1201,38 @@ def _queue_rest():
     is unread. Silently keeping the dicts we recognise would publish a LOWER BOUND as if it were
     the queue depth (the under-count direction that reads as AT-TARGET).
 
-    PAGING: one page is 100. A deeper queue is read a page at a time, bounded by
-    `QUEUE_REST_MAX_PAGES`; a SHORT page is the end. A partially-read queue is never returned --
-    the last page failing discards the whole read for the reason above.
+    ⛔ `deadline` IS A WALL-CLOCK BUDGET, NOT A SUGGESTION (`_monotonic()` seconds, the same
+    clock `queue()` uses). Every page's timeout is clipped to what is LEFT of it, and a spent
+    budget is a FAILED read -- never a shorter page, and never a wait past it. Without this the
+    fallback could spend `MAX_PAGES x TIMEOUT_S` inside a loop the beat kills at 90 s, and a
+    killed refresh writes NO line at all: the recovery would be strictly worse than the refusal
+    it replaces.
+
+    PAGING: one page is 100. A deeper queue is read a page at a time; a SHORT page is the end. A
+    FAILED page discards the whole read, and so does REACHING THE CAP WITH A FULL PAGE -- both are
+    "this is not the queue", and a truncated list printed as the depth is an under-count (ten
+    PRs of a 500+ backlog would read `waiting` as the whole queue).
     """
     global GH_LAST_ERROR
     token = _gh_token()
     if not token:
-        GH_LAST_ERROR = f"rest fallback: no oauth_token in {GH_HOSTS}"
+        GH_LAST_ERROR = (f"rest fallback: no credential (GH_TOKEN/GITHUB_TOKEN unset and no "
+                         f"github.com oauth_token in {_gh_hosts_path()})")
         return None
     rows = []
     try:
         for page in range(1, QUEUE_REST_MAX_PAGES + 1):
+            budget = QUEUE_REST_TIMEOUT_S
+            if deadline is not None:
+                budget = min(budget, deadline - _monotonic())
+                if budget < 1.0:
+                    GH_LAST_ERROR = (f"rest fallback: page {page}: the queue read's own budget "
+                                     "was spent before the fallback could fetch it")
+                    return None
             body = _rest_get(
                 f"https://api.github.com/repos/{REPO}/pulls"
-                f"?state=open&per_page={QUEUE_REST_PAGE}&page={page}", token)
+                f"?state=open&per_page={QUEUE_REST_PAGE}&page={page}", token,
+                timeout=budget)
             if not isinstance(body, list):
                 GH_LAST_ERROR = (f"rest fallback returned {type(body).__name__}, not a list")
                 return None
@@ -1183,6 +1242,12 @@ def _queue_rest():
             rows.extend(body)
             if len(body) < QUEUE_REST_PAGE:
                 break
+        else:
+            # The loop exhausted its pages WITHOUT a short one: the cap was reached on a FULL page.
+            # This is the truncation branch -- it must not fall through to `return` below.
+            GH_LAST_ERROR = (f"rest fallback: {QUEUE_REST_MAX_PAGES} full pages "
+                             f"({len(rows)} open PRs) is the cap, not the queue")
+            return None
     except Exception as e:
         # The URL is safe to name; the token never is.
         GH_LAST_ERROR = f"rest fallback failed: {type(e).__name__}: {str(e)[:180]}"
@@ -1282,14 +1347,22 @@ def queue():
             r = (_gh_retry(argv) if not attempt
                  else _gh_retry(argv, attempts=1, timeout=max(1.0, remaining)))
             if r.returncode != 0:
-                # ⛔ THE SECOND SOURCE, TRIED HERE AND ONLY HERE (#2138). A non-zero
-                # `gh pr list` is a TRANSPORT failure on the GraphQL bucket; REST is a
-                # different bucket, so it is worth one bounded attempt before this read is
-                # declared unreadable. On success the queue WITHDRAWS its own blindness claim
-                # -- a recovered read that still printed `gh=RATE-LIMITED(queue)` would report
-                # the fleet blind while the line carries the answer.
+                # ⛔ THE SECOND SOURCE, TRIED HERE AND ONLY HERE (#2138). A non-zero exit takes
+                # this branch -- in practice that is a REFUSAL (the secondary limit), which is
+                # what the incident and its tests are about; any other non-zero (e.g. a future
+                # argv/field error gh answers with rc=1) also lands here, so the second source
+                # would mask such a drift. Stated rather than hidden: the mapped field set is
+                # pinned by `test_the_rest_payload_is_mapped_to_the_gh_pr_list_shape`, so a drift
+                # shows up there rather than as a silent wrong answer.
+                #
+                # ⛔ RECORD THE CLAIM, THEN WITHDRAW IT. The failure is noted BEFORE the fallback
+                # is tried, so (a) a double refusal reports the same transport failure it always
+                # did, and (b) the withdrawal below retracts a claim that ACTUALLY EXISTS. Without
+                # the note first, `_withdraw_gh_failure()` could never change anything and the
+                # protection its docstring promises would be inert (review round 1, B and A).
                 _graphql_err = ((r.stdout or "") + (r.stderr or "")).strip()
-                prs = _queue_rest()
+                _note_gh_failure(f"queue read failed: {_graphql_err}", surface, transport=True)
+                prs = _queue_rest(deadline=deadline)
                 if prs is None:
                     # Both sources refused: raise the FIRST cause (it is the actionable one --
                     # "rate limit" says wait) and append the second so the cause line names the
@@ -1544,6 +1617,14 @@ def build(prev=None):
             else:
                 parts.append(f"queue_read=REST(samples={_reads}){_rsf} -- the open-PR list was"
                              " read over REST because the GraphQL read was refused")
+            # ⛔ THE FILE OVERLAY IS A THIRD, SEPARATE DEGRADATION, AND OMITTING ITS TOKEN IS
+            # A FALSE ABSENCE (#2138 review round 1, B and A and E -- three reviewers, one
+            # shape). REST's list endpoint carries no file list, so `touches_surface()` answers
+            # False for every row and `surface=0` -- and a reader cannot tell "nobody needs the
+            # owner" from "the diff was never read". This file's own rule is that an omitted
+            # token is honest ONLY when the value was READ; here it was not, on the one overlay
+            # `ASK-USER` exists for. So it is PRINTED as unread, before the `QUEUE(` segment.
+            parts.append("ASK-USER: surface=UNREAD(rest list carries no file list)")
         elif _reads > 1 or _rsf:
             parts.append(f"queue_read=SETTLED(samples={_reads}){_rsf}")
         if q.get("surface"):
