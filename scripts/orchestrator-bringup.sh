@@ -4,12 +4,28 @@
 #   bash scripts/orchestrator-bringup.sh check            # is this machine configured for this repo?
 #   bash scripts/orchestrator-bringup.sh start            # bring the whole stack up
 #   bash scripts/orchestrator-bringup.sh stop
-#   bash scripts/orchestrator-bringup.sh status
+#   bash scripts/orchestrator-bringup.sh restart          # stop, then start, then verify
+#   bash scripts/orchestrator-bringup.sh status           # + the FLEET COMPONENT TABLE
 #   bash scripts/orchestrator-bringup.sh --reseed [verb]  # regenerate the machine-local config, then verb
+#
+# `start`/`stop`/`status` cover the WHOLE FLEET, not only the controller: the inventory (ONE declared
+# list of components, each with its own liveness predicate) lives in lib/fleet-inventory.sh. `status`
+# prints COMPONENT | EXPECTED | ACTUAL | STATE for every one of them and EXITS with the worst row's
+# verdict, so a component that is off, missing or running twice cannot hide behind the controller
+# being healthy (owner, 2026-10-18).
+#
+# ⛔ VERB CONTRACT, unchanged and now shared by the table: 0 ok · 1 refused / a component is not ok ·
+# 2 cannot-determine. SKIPPED rows (a component that does not apply to this box) are a PASS with a
+# reason — never silently OK.
 #
 # Exit codes, for every verb:
 #   0  ok
-#   1  REFUSED — one actionable line on stderr; nothing was started
+#   1  REFUSED — one actionable line on stderr; nothing was started.
+#      For `status` and `start` it ALSO means "a component is not OK" (`status`) or "a component this
+#      verb ATTEMPTED did not come up, or a live one must be reconciled by hand" (`start`). The two
+#      meanings are distinguishable from the output — a refusal is one line on stderr and starts
+#      nothing; a component verdict is a table row — and `status` is the verb whose exit code is the
+#      FLEET's verdict, while `start`'s is about what it attempted.
 #   2  CANNOT DETERMINE — fail closed; the gate could not answer, which is never a pass
 #
 # ── WHY THIS FILE EXISTS (agent-infra#1761) ─────────────────────────────────────────────────────
@@ -85,7 +101,7 @@ usage() { # <exit-code>
 VERB=""; RESEED=0
 for a in "$@"; do
   case "$a" in
-    check|start|stop|status) VERB="$a" ;;
+    check|start|stop|restart|status) VERB="$a" ;;
     --reseed)               RESEED=1 ;;
     -h|--help)              usage 0 ;;
     *) printf 'bringup: unknown argument %s\n' "$a" >&2; usage 1 ;;
@@ -109,6 +125,7 @@ esac
 # (cloud-cell-supervisor.sh DOES honour `O=` in keys.env) — two surfaces disagreeing about which
 # directory holds the lock is the #1745 class, and it was found in review of #1856.
 O_ENV="${O:-}"
+CELL_HOME_ENV="${CELL_HOME:-}"                 # only the ENVIRONMENT value is evidence of a cell
 CELL_HOME="${CELL_HOME:-/tmp/cell-home}"
 if [ "$PLATFORM" = "cell" ]; then
   # The cell's own home. `cloud-cell-bringup.sh` documents why it is not /home/ubuntu (which does not
@@ -125,6 +142,14 @@ if [ "$PLATFORM" = "cell" ]; then
   # `check` would refuse a perfectly good cell (or worse, a `start` would launch a controller whose
   # every gh call fails). Every read below — gh, git, the registry — must run under the cell's home.
   export HOME="$CELL_HOME"
+  # A cell states its own identity for the inventory: the entry point is the ONE place that knows
+  # whether it is running as a cell (`CELL_HOME` from the environment, or a provisioned cell home).
+  # The default above is a fallback PATH, not proof — exporting it unconditionally made every Linux
+  # box look like a cell and killed the inventory's identity branch (cycle-4 review).
+  case "${CELL_HOME_ENV:-}" in
+    '') : ;;                                     # defaulted: no evidence from the environment
+    *) export FLEET_CELL_HOME="${FLEET_CELL_HOME:-$CELL_HOME}" ;;
+  esac
 else
   ENV_FILE="${ENV_FILE:-$HOME/.config/orchestrator/bringup.env}"
   O="${O:-$HOME/orchestrator}"
@@ -166,6 +191,17 @@ load_config_file() {
 O_SRC="${O_ENV:+env}"; [ -n "$O_SRC" ] || O_SRC="platform default"
 O_DEFAULT="$O"
 load_config_file
+
+# ── the fleet inventory (the ONE declared list of components) ────────────────────────────────────
+# Sourced AFTER the config resolution above, so the seams below carry THIS machine's resolved answer
+# rather than a second default: `FLEET_O` is the same `O` the controller's lock lives in, and
+# `FLEET_PLATFORM` is the platform this file already refused-or-accepted. A library that re-derived
+# either would be a second authority about which directory holds the lock — the #1745 class.
+FLEET_O="${FLEET_O:-$O}"
+FLEET_PLATFORM="${FLEET_PLATFORM:-$PLATFORM}"
+FLEET_CELL_SUPERVISOR="${FLEET_CELL_SUPERVISOR:-$SUPERVISOR}"
+# shellcheck source=lib/fleet-inventory.sh
+. "$HERE/lib/fleet-inventory.sh"
 
 # The repo identity this machine is configured for, as `<owner>/<repo>`.
 SLUG=""; SLUG_REPO=""
@@ -671,7 +707,17 @@ cmd_start() {
   PENDING_FILE=""
   ok "controller RUNNING pid $pid ($PLATFORM, state dir $O)"
   say "   stop it with: $0 stop"
-  return 0
+
+  # ── the REST of the fleet ────────────────────────────────────────────────────────────────────
+  # Start is defined as "make every MISSING component present", driven by the same inventory the
+  # table reads — so the controller coming up does not end the job while the heartbeat loop, the
+  # cadence timer and the reapers are silently absent. A LATE component is left alone (it is alive;
+  # killing a live process to "fix" lateness is a lane-killer) and a DUPLICATE is reported, never
+  # reconciled by a kill.
+  say ""
+  say "==> ensuring the rest of the fleet"
+  fleet_ensure_components "$(harness_ctl_path)"
+  return $?
 }
 
 registry_claim_or_refuse() { # <file>
@@ -855,7 +901,59 @@ cmd_stop() {
       warn "the registry entry for $SLUG_REPO names a DIFFERENT state dir ($(registry_get "$f" O)) — left in place"
     fi
   fi
+
+  # ── the REST of the fleet ────────────────────────────────────────────────────────────────────
+  # A stopped controller with a live heartbeat loop and a live pr-doctor is a HALF-stopped fleet: the
+  # loops keep nudging a lane that nothing dispatches to, and the doctor keeps dispatching work with
+  # no controller behind it.
+  #
+  # SCOPE (said out loud because it is easy to assume otherwise): the components below are
+  # MACHINE-GLOBAL — the heartbeat loop and the cadence timer live in $HOME/.pi/agent/state, and
+  # pr-doctor, the reapers and the watchdog are machine-wide launchd jobs. This entry point's identity
+  # is the PAIR (machine, repo) (#1761), so `stop` on repo B also silences the box's heartbeat and
+  # pr-doctor while repo A's controller keeps dispatching. That is intentional (a stopped controller
+  # with a live doctor is worse) and it is printed by `fleet_stop_all`, not implied.
+  #
+  # ⛔ THE INVENTORY REMOVES JOBS WITH `bootout` — never `unload -w`/`enable`, which write a
+  # persistent override; `start` puts every one of them back because nothing durable was written.
+  # The CONTROLLER above is a different path: it is stopped by the platform verb (`stop_mac` uses
+  # `launchctl unload -w`), which predates this change and is NOT made safe by it — see
+  # `orchestrator-harness/launchd-cycle.sh`, the repo's one implementation of
+  # stop/enable/(re)start that never writes a disable (#1975). Do not read this file's `bootout`
+  # discipline as covering the controller's agent.
+  say ""
+  fleet_stop_all "$(harness_ctl_path)" || warn "one or more fleet components could not be stopped (see above)"
   return 0
+}
+
+# ── restart ──────────────────────────────────────────────────────────────────────────────────
+# Stop, then start, then VERIFY — the cycle an operator wants when a component is LATE or was
+# restarted under a stale environment. It is a composition of the two verbs above, deliberately: a
+# third implementation of start would be the fourth copy this entry point exists to prevent.
+cmd_restart() {
+  say "==> restarting the $PLATFORM fleet"
+  # The stop runs in a SUBSHELL: `cmd_stop` owns an EXIT-path (`unknown …` exits 2) and must not be
+  # able to end the restart before the start has been attempted. Its verdict is reported, not obeyed:
+  # a controller that was not running is not a reason to skip starting it.
+  ( cmd_stop ) || warn "stop reported a problem — continuing to start anyway"
+  # ⛔ AND WAIT FOR THE STREET TO CLEAR BEFORE STARTING. `kill -TERM` returning 0 says the signal was
+  # queued, not that the process is gone; starting while a TERM'd loop is still alive makes `start`'s
+  # read see the OLD component as OK (never restarting it), and lets cadence-timer's own pidfile guard
+  # make the NEW timer a no-op against the still-dying one. Bounded: never hang a verb on a process
+  # that refuses to die — say so instead.
+  local i alive
+  i=0
+  while [ "$i" -lt 25 ]; do
+    alive="$(fleet_pids_for "$(harness_ctl_path)/orch-loop.sh" "$O/orch-loop.sh" \
+                               "$HOME/.pi/agent/scripts/heartbeat-loop.sh" \
+                               "$HOME/.pi/agent/scripts/cadence-timer.sh" 2>/dev/null)" || alive=""
+    alive="$(printf '%s' "$alive" | tr -d '[:space:]')"
+    [ -z "$alive" ] && break
+    sleep 0.2; i=$(( i + 1 ))
+  done
+  [ -z "${alive:-}" ] || warn "a fleet process was still alive after the stop (pid $alive) — starting anyway; if both old and new are live, 'status' reports a DUPLICATE row"
+  say ""
+  cmd_start
 }
 
 # ── status ────────────────────────────────────────────────────────────────────────────────────
@@ -890,20 +988,54 @@ cmd_status() {
   else
     [ -f "$O/.agent-infra-stamp.json" ] && say "harness:   $(sed -n 's/.*"harness": *"\([^"]*\)".*/\1/p' "$O/.agent-infra-stamp.json" | head -1)"
   fi
-  local lp live own foreign
-  lp="$(lock_pid)" || unknown "cannot determine the lock owner (ps/etime unreadable) — refusing to report a controller state from an unreadable read"
-  live="$(local_controller_pids)" || unknown "cannot read the process table (ps) — refusing to report a controller state from an unreadable read"
-  own="$(owned_pids)" || unknown "cannot determine which controllers belong to this state dir (ps/etime unreadable) — refusing to report a controller state"
+  local lp live own foreign undet=0 lp_set=0
+  # ⛔ ONE UNREADABLE DATUM MUST NOT SUPPRESS THE WHOLE DELIVERABLE. `unknown` EXITS 2, and these three
+  # reads used to call it BEFORE the fleet table — so when the lock owner's age could not be read, the
+  # other nine component verdicts printed nothing exactly when one read failed, even though the
+  # inventory has a first-class UNKNOWN state for that. The abstention is now REPORTED in place and
+  # carries the exit code at the end; the table still prints. (Reviewer 2 measured the truncation, and
+  # the mirror-image defect: this path abstained where the inventory invented an owner for the same
+  # datum — `_fleet_lock_owner` now abstains too, so both surfaces answer alike.)
+  lp_set=0
+  if ! lp="$(lock_pid)"; then
+    say "lock:      CANNOT DETERMINE (ps/etime unreadable)"
+    undet=1; lp=""
+  else
+    lp_set=1
+  fi
+  if ! live="$(local_controller_pids)"; then
+    say "controller: CANNOT DETERMINE (the process table could not be read — see the table below)"
+    undet=1; live=""
+  fi
+  if ! own="$(owned_pids)"; then
+    say "controller: CANNOT DETERMINE (which controllers belong to this state dir — see the table below)"
+    undet=1; own=""
+  fi
   foreign="$(comm -23 <(printf '%s\n' "$live" | awk 'NF' | sort -u) <(printf '%s\n' "$own" | awk 'NF' | sort -u))"
-  if [ -n "$own" ]; then
-    say "controller: RUNNING  pid $(pids_join "$own")  (lock: ${lp:-none})"
+  # ⛔ ONE ANSWER PER QUESTION. When a read abstained the controller line above already said CANNOT
+  # DETERMINE; no line below can be better, and `foreign` (= live minus own) is non-empty *because*
+  # own is empty — so falling through reported this state dir's OWN controller as "NOT attributable to
+  # this state dir" (#1856's misattribution) and asserted `lock: none` about a lock it could not read.
+  local lptxt="${lp:-none}"
+  [ "${lp_set:-0}" = 1 ] || lptxt="CANNOT DETERMINE"
+  if [ "$undet" = 1 ]; then
+    :   # reported above; the table below carries the inventory's own UNKNOWN row
+  elif [ -n "$own" ]; then
+    say "controller: RUNNING  pid $(pids_join "$own")  (lock: $lptxt)"
   elif [ -n "$foreign" ]; then
     # ⛔ SEEN IS NOT OWNED: this machine's harness is shared by every repo on it, so this pid may be
     # the other repo's controller. Naming it as this state dir's owner is the misattribution the
     # review reproduced (#1856).
-    say "controller: RUNNING  pid $(pids_join "$foreign") — NOT this state dir's (another repo on this machine's shared harness path; lock: ${lp:-none})"
-  elif tmux has-session -t "${SESSION:-orch}" 2>/dev/null; then
-    say "controller: RUNNING  (tmux session, no orch-loop.sh pid observed yet)"
+    say "controller: RUNNING  pid $(pids_join "$foreign") — NOT attributable to this state dir (the harness path is shared per box, so this may be another repo's controller; lock: $lptxt)"
+  elif tmux has-session -t "=${SESSION:-orch}" 2>/dev/null; then
+    # ⛔ NOT "RUNNING". Reviewer C measured this exact screen carrying `controller: RUNNING` beside the
+    # fleet table's `controller … MISSING` — two answers to one question, in one command. The table's
+    # predicate is the authoritative one (it also carries the harness population and the heartbeat
+    # age); a tmux session with no controller process under it is a DANGLING session, not a running
+    # controller, and saying RUNNING here is how a reader concludes the table is broken instead of the
+    # controller. `-t =name` forces an exact match: plain `-t orch` PREFIX-matched, and on this box it
+    # was satisfied by a session called `orch-controller`.
+    say "controller: NOT RUNNING  (tmux session ${SESSION:-orch} exists with no orch-loop.sh under it — see the table below; a supervisor that died can leave this)"
   else
     say "controller: STOPPED"
   fi
@@ -913,7 +1045,7 @@ cmd_status() {
   # read had it. `check` prints both; two answers to one question is the defect, and an unreported
   # population is how a reader over-reads a verdict (#1856 review; docs/ops/fleet-liveness.md §5).
   [ -z "$own" ] || [ -z "$foreign" ] \
-    || say "also seen:  pid $(pids_join "$foreign") — NOT this state dir's (another repo on this machine's shared harness path); reported, never signalled"
+    || say "also seen:  pid $(pids_join "$foreign") — NOT attributable to this state dir (the harness path is shared per box); reported, never signalled"
   if [ -n "${SLUG:-}" ]; then
     local f v; f="$(registry_file "$SLUG_REPO")"; v="$(registry_verdict "$f" | tr '\t' ' ')"
     say "registry:   $v$([ -f "$f" ] && printf '  (%s)' "$f")"
@@ -935,7 +1067,21 @@ cmd_status() {
     say "candidates: <no file at $O/candidates.txt>"
   fi
   [ -f "$O/heartbeat" ] && say "heartbeat:  $(( $(date +%s) - $(cat "$O/heartbeat" 2>/dev/null || echo 0) ))s ago"
-  return 0
+
+  # ── THE FLEET TABLE ──────────────────────────────────────────────────────────────────────────
+  # The screen above answers "is THE CONTROLLER alive". This answers the question the owner asked
+  # and no surface answered: is EVERY fleet component alive, exactly once, and on this box at all.
+  # The exit code is the worst row, so `status` stops being advice and becomes a verdict — the
+  # controller can be perfectly healthy while `pr-doctor` has exited 2 for hours and no lander lands.
+  say ""
+  say "fleet components (declared in scripts/lib/fleet-inventory.sh):"
+  local fleet_rc
+  fleet_rows "$(harness_ctl_path)" | fleet_render_table
+  fleet_rc=$?
+  # An abstaining detail read is rc=2 even when every row is green: "cannot determine" outranks
+  # "healthy", and it must not be lost because the table happened to be all-OK.
+  if [ "$fleet_rc" -eq 0 ] && [ "${undet:-0}" = 1 ]; then return 2; fi
+  return "$fleet_rc"
 }
 
 # ── main ──────────────────────────────────────────────────────────────────────────────────────
@@ -944,5 +1090,6 @@ case "$VERB" in
   check)  cmd_check ;;
   start)  cmd_start ;;
   stop)   cmd_stop ;;
+  restart) cmd_restart ;;
   status) cmd_status ;;
 esac
