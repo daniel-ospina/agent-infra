@@ -4607,6 +4607,13 @@ def main(argv=None):
             return 3
 
     machine = build_machine(cfg)
+    # ⛔ ONE INITIALISATION, BEFORE EITHER BRANCH. `collect_error` was assigned only in the
+    # collector's `except`, and the injected path reads it too — so `--facts <{"facts": null}>` (what
+    # a generator or a truncated writer produces, and a shape the WRAPPER form explicitly permits)
+    # raised `UnboundLocalError: cannot access local variable 'collect_error'` at the line that was
+    # trying to REPORT a failure: a traceback, zero verdicts, no signal, and exit 1 — the code that
+    # means "at least one check FAILED".
+    collect_error = None
     if a.facts:
         # INJECTED FACTS through the LIVE path. The predicates are the same ones `--static` runs;
         # what this adds is the SIGNAL machinery (compose → de-duplicate → send/respawn) so that
@@ -4617,6 +4624,13 @@ def main(argv=None):
             facts = inj.get("facts", inj)
         except Exception as exc:
             print("outcome-canary: cannot read --facts %s: %s" % (a.facts, exc), file=sys.stderr)
+            return 3
+        if facts is None:
+            # A null body is a MALFORMED PAYLOAD, not a collector failure: nothing was collected and
+            # nothing raised, so grading it `COLLECTOR_ERROR` would put a fabricated exception in the
+            # report. It is the same usage error as an unreadable file.
+            print("outcome-canary: --facts %s carries no fact set (its `facts` value is null); "
+                  "nothing was evaluated" % a.facts, file=sys.stderr)
             return 3
     else:
         try:

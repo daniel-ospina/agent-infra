@@ -4508,6 +4508,11 @@ MUTATIONS = [
      '    if lane_ok:\n        return True, "a lane started %s (the queue record is not the only evidence)" % (\n            _age_txt(lane_ok.get("age_s")))',
      '    if intent or lane_ok:\n        return True, "a dispatch landed %s (the queue record is not the only evidence)" % (\n            _age_txt((intent or lane_ok).get("age_s")))',
      "test_the_intent_line_is_not_reported_as_a_LANDED_dispatch"),
+    # ── cycle-45 defects ─────────────────────────────────────────────────────────────────
+    ("a null injected body is graded as a collector crash",
+     '        if facts is None:\n            # A null body is a MALFORMED PAYLOAD',
+     '        if False:\n            # A null body is a MALFORMED PAYLOAD',
+     "test_an_injected_payload_with_a_NULL_body_is_a_usage_error_not_a_crash"),
     # ── cycle-44 defects ─────────────────────────────────────────────────────────────────
     ("a capture marks the alert delivered",
      '                    state.mark_captured(v.key, now)',
@@ -5453,7 +5458,12 @@ def run_mutations():
         src = fh.read()
     tmp = tempfile.mkdtemp(prefix="oc-mut-")
     try:
+        known = set(n for n, _ in TESTS)
         for label, old, new, paired in MUTATIONS:
+            # ⛔ A MISNAMED PAIRED TEST SCORES AS "STILL GREEN", which is the right verdict but the
+            # wrong diagnosis: `--only <typo>` runs ZERO tests and exits 0. Say which it is.
+            assert paired in known, ("mutation %r names a test that does not exist: %r"
+                                    % (label, paired))
             assert src.count(old) == 1, "mutation anchor not unique (%d hits): %.60r" % (
                 src.count(old), old)
             mutated = os.path.join(tmp, "outcome_canary_mut_%d.py" % len(os.listdir(tmp)))
@@ -5832,6 +5842,29 @@ def test_an_INJECTED_fact_set_is_disclosed_in_the_JSON_too():
     assert payload is not None, (rc, (out or err)[-400:])
     assert payload.get("facts_injected") is True, payload.get("facts_injected")
     assert "injected" in (payload.get("facts_source") or ""), payload.get("facts_source")
+
+
+@test
+def test_an_injected_payload_with_a_NULL_body_is_a_usage_error_not_a_crash():
+    """`--facts` accepts the wrapper form `{"facts": …, "observed_at": …}`, so a null body is a
+    payload the CLI admits. It reached the report with `collect_error` UNASSIGNED — the injected
+    branch never sets it, only the collector's `except` does — and raised
+    `UnboundLocalError: cannot access local variable 'collect_error'` at the line trying to REPORT
+    the failure: a traceback, zero verdicts, no signal, exit 1 ("a check FAILED"). A generator or a
+    truncated writer produces exactly this."""
+    tmp = tempfile.mkdtemp(prefix="oc-nullfacts-")
+    try:
+        for body in ('{"facts": null}', 'null'):
+            facts = os.path.join(tmp, "f.json")
+            with open(facts, "w") as fh:
+                fh.write(body)
+            rc, out, err = run_cli(["--live", "--facts", facts, "--no-notify", "--no-respawn"])
+            assert rc == 3, (body, rc, out[-400:], err[-400:])
+            assert "Traceback" not in err, (body, err[-400:])
+            assert out.strip() == "", (body, out[-400:])   # no verdicts are claimed
+            assert "nothing was evaluated" in err or "cannot read --facts" in err, (body, err[-400:])
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 @test

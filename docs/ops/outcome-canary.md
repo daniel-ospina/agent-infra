@@ -571,6 +571,12 @@ Six more (cycle 13), each a case where a datum the tool held was not the one it 
   `not_evaluated: []` instead of 2 with a "(the other 0 checks were not asserted)" note.
 - **`log.age_s` is an age, not a truthy number**: a bool is UNREAD there too, so the "alive but
   useless" arm cannot be skipped by it and the evidence cannot print it as "(1s ago)".
+- **A malformed `--facts` payload is a usage error, never a crash.** `--facts` accepts the wrapper
+  form `{"facts": …, "observed_at": …}`, so `{"facts": null}` is a payload the CLI admits — and it
+  reached the report with `collect_error` unassigned (only the collector's `except` set it), raising
+  `UnboundLocalError` on the line that was trying to REPORT a failure: a traceback, zero verdicts, no
+  signal, exit **1**. A null body (or the whole file being `null`) now exits 3 with a message, which
+  is the same verdict as an unreadable file.
 - **A CAPTURE IS NOT A DELIVERY.** `--capture-dir` writes the composed message instead of sending
   it, and it marked the shape `delivered: true` in the PERSISTENT state file — so the next real run
   printed `suppressed` for a real FAIL that nobody had ever been told, with no human in the loop.
