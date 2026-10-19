@@ -45,8 +45,10 @@
 #   O19 [RED→GREEN] the destructive arms require POSITIVE evidence: an absent `ref` does not authorise
 #      the pid rule, and a `hostname` probe that cannot answer makes `claim_former_hosts` abstain
 #      (asserted on the function directly — through `claim_orphan_reason` the live-pid rule masks it).
-#   O22 [RED→GREEN] the `box` sentinel a failed `hostname` probe produces is NOT an identity: it is the
-#      same string on every box, so treating it as local let each cell reap the others' live claims.
+#   O22 [RED→GREEN] the `box` sentinel a failed `hostname` probe produces is NOT an identity — not in the
+#      local-pid gate, not in the history reader, and not in the recorder (it is the same string on
+#      every box, so treating it as local let each cell reap the others' live claims, and a recorded
+#      sentinel would outlive the probe failure that wrote it).
 #   O21 [RED→GREEN] a FORMER name of this box with a LIVE local pid on a PR key is held-by-live, and the
 #      prune leaves it alone — the P0 that a rename would otherwise turn into a deleted live claim.
 #   O20 [RED→GREEN] the prune's unparseable-lease skip is a DELETING branch and is pinned here.
@@ -84,7 +86,7 @@
 #      below the review window it must outlive — a mid-review expiry, the duplicate this registry
 #      exists to prevent — and leaves nothing to diagnose.
 # ⛔ LABELLING HONESTY — MEASURED, not asserted. `CLAIMS_SH=<git archive HEAD>:claims.sh bash
-# claim-orphan.test.sh` (2026-10-18, against the pre-change claims.sh) reports 49 passed, 45 FAILED.
+# claim-orphan.test.sh` (2026-10-18, against the pre-change claims.sh) reports 52 passed, 45 FAILED.
 # Every [RED→GREEN] line is in that failing set, and so is exactly ONE line that carries no such label:
 # `O7 the PR keying declares a documented ceiling` (a pre-fix reader has no ceiling to declare). The
 # converse is what keeps the labels honest: a [PINNED] line must PASS pre-fix, because PINNED means
@@ -671,6 +673,21 @@ SEAMOK="$(as_box "" "$(hostname -s)" 'claim_owner >/dev/null' 2>&1)"
 [ -z "$SEAMOK" ]
 SW4=$?
 ck "O18 [PINNED] no warning when the seam equals the running host" $SW4
+# ⛔ THE WARNING'S OWN PROBE ABSTAINS (cycle-10 review): a `hostname` that cannot answer used to leak its
+# error to stderr, print "overrides the running host ()", and abort the mint under a `set -e` caller.
+mkdir -p "$T/bin-nohost18"
+printf '#!/bin/sh\nexit 1\n' > "$T/bin-nohost18/hostname"; chmod +x "$T/bin-nohost18/hostname"
+SEAMLEAK="$(
+  PATH="$T/bin-nohost18:$PATH"
+  CLAIM_OWNER_HOST=seamBox; CLAIM_STATE_DIR="$T/cl18b"; export PATH CLAIM_OWNER_HOST CLAIM_STATE_DIR
+  mkdir -p "$CLAIM_STATE_DIR"
+  . "$CLAIMS_SH" || exit 1
+  out="$(claim_owner 2>&1 >/dev/null)"; printf "STDERR=[%s]\n" "$out" )"
+case "$(field "$SEAMLEAK" STDERR)" in
+  *hostname*|*"running host ()"*) SW5=1 ;;
+  *) SW5=0 ;;
+esac
+ck "O18 [RED→GREEN] a blind hostname makes the seam warning ABSTAIN (no probe error leaks, no empty host)" $SW5
 
 # ══ O19: the DESTRUCTIVE arms require positive evidence — an absent ref, or an unverifiable host ══
 # Two ways the same steal could arrive that no test pinned (agent-infra#2094 cycle-4 review):
@@ -832,7 +849,7 @@ ck "O21 [RED→GREEN] the SAME former name with a DEAD pid IS reclaimable (rc=$(
 # install/PATH mistake makes every cell stamp `box:<pid>`, i.e. each box reaping the others' claims.
 # A sentinel owner must fall through to the host rules, which abstain when they cannot judge.
 echo
-echo "── O22: a `box:` owner is never treated as this box (the sentinel is fleet-wide) ────"
+echo "── O22: a \`box:\` owner is never treated as this box (the sentinel is fleet-wide) ─"
 ORIG22="$(mk_origin o22)"; ensure_work_repo "$ORIG22" || { echo "❌ fixture"; exit 2; }
 mkdir -p "$T/bin-nohost22"
 printf '#!/bin/sh\nexit 1\n' > "$T/bin-nohost22/hostname"; chmod +x "$T/bin-nohost22/hostname"
@@ -864,15 +881,32 @@ case "$OWN22" in
   *) S22C=1 ;;
 esac
 ck "O22 [RED→GREEN] claim_prune leaves it alone (owner is still '$OWN22')" $S22C
-# … and a `box` entry that somehow reached the history file is still not an identity.
+# … and a `box` entry that reached the history file (an OLDER claims.sh recorded it before the recorder
+# refused the sentinel) is still not an identity. ⛔ THE REAL `hostname` MUST BE IN PLAY HERE (cycle-10
+# review): the previous form of this case ran under the blind shim, where `claim_former_hosts` abstains
+# at the probe guard and returns an empty roster WHATEVER the file holds — so it passed with no sentinel
+# handling at all, and the reap it was meant to catch went straight through.
+# ⛔ THE FILE MUST ACTUALLY CONTAIN THE SENTINEL — the seed line was lost in an edit, which made this
+# case vacuous in a second way (an empty file yields an empty roster whatever the reader excludes).
 printf 'box\n' > "$CS22/claim-hosts"
+grep -qx 'box' "$CS22/claim-hosts"; S22SEED=$?
+ck "O22 (setup) 'box' really is in the history file for the reader case" $S22SEED
 SENT22B="$(
-  PATH="$T/bin-nohost22:$PATH"
-  CLAIM_REPO="$T/repo"; CLAIM_STATE_DIR="$CS22"; export PATH CLAIM_REPO CLAIM_STATE_DIR
+  CLAIM_REPO="$T/repo"; CLAIM_STATE_DIR="$CS22"; export CLAIM_REPO CLAIM_STATE_DIR
   . "$CLAIMS_SH" || exit 1
   claim_orphan_reason "box:999999" "refs/claims/9209500-0123456789ab" >/dev/null 2>&1; printf "RC=%s\n" "$?" )"
 [ "$(field "$SENT22B" RC)" = "1" ]; S22D=$?
 ck "O22 [RED→GREEN] 'box' in state/claim-hosts is still not an identity (rc=$(field "$SENT22B" RC))" $S22D
+# AND the recorder must refuse to WRITE it, so a later pass cannot re-read it even after the probe
+# recovers (the record outlives the failure that created it).
+CS22B="$T/cl22-rec"; mkdir -p "$CS22B"
+( PATH="$T/bin-nohost22:$PATH"
+  unset CLAIM_OWNER_HOST; CLAIM_REPO="$T/repo"; CLAIM_STATE_DIR="$CS22B"; export PATH CLAIM_REPO CLAIM_STATE_DIR
+  . "$CLAIMS_SH" || exit 1
+  claim_owner >/dev/null ) 2>/dev/null
+[ ! -s "$CS22B/claim-hosts" ] || ! grep -qx 'box' "$CS22B/claim-hosts"
+S22E=$?
+ck "O22 [RED→GREEN] the RECORDER refuses to write the sentinel into claim-hosts" $S22E
 
 echo
 echo "─────────────────────────────────────────────────────────────"

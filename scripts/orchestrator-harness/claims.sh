@@ -250,7 +250,12 @@ claim_host_warn_seam() {
   [ -n "${CLAIM_OWNER_HOST:-}" ] || return 0
   [ "${CLAIM_HOST_SEAM_WARNED:-0}" = "0" ] || return 0
   CLAIM_HOST_SEAM_WARNED=1
-  local real; real="$(hostname -s)"
+  # ⛔ THIS PROBE FOLLOWS THE SAME RULE AS EVERY OTHER ONE IN THIS FILE — a failure ABSTAINS, it does not
+  # leak (cycle-10 review). A bare `hostname -s` printed its own error to stderr (the leak `claim_host`'s
+  # fallback exists to prevent), left `real` empty so the warning said "overrides the running host ()",
+  # and under a `set -e` caller aborted the mint outright.
+  local real; real="$(hostname -s 2>/dev/null)" || return 0
+  [ -n "$real" ] || return 0
   [ "$CLAIM_OWNER_HOST" = "$real" ] && return 0
   printf '[claims] ⚠️ CLAIM_OWNER_HOST=%s overrides the running host (%s): claims minted here are stamped with a name these orphan rules cannot judge, and this box will NOT record %s as one of its own names (the rename self-heal). Unset it unless you are a test or a cross-box simulation.\n' \
     "$CLAIM_OWNER_HOST" "$real" "$real" >&2
@@ -309,6 +314,12 @@ claim_hosts_file() { printf '%s/claim-hosts' "$CLAIM_STATE_DIR"; }
 claim_host_record() {
   local f h="${1:-}"
   [ -n "$h" ] || return 0
+  # ⛔ AND NEVER THE SENTINEL (P1, cycle-10 review). `claim_owner` calls this with `$(claim_host)`, which
+  # is the literal `box` when the probe cannot answer — so a single launchd/PATH failure could WRITE
+  # `box` into the history, after which every box reads every OTHER box's `box:<pid>` claim as "a former
+  # name of this box" and reaps it. Refusing it in the reader alone is not enough: the record outlives
+  # the failure and would be re-read by every later pass on a box whose probe works again.
+  [ "$h" != "box" ] || return 0
   [ -z "${CLAIM_OWNER_HOST:-}" ] || return 0
   f="$(claim_hosts_file)"
   # ⛔ RECORDING NEVER CONJURES STATE. A `mkdir -p` here wrote the machine's hostname into whatever
@@ -370,7 +381,9 @@ claim_former_hosts() { # -> space-separated host names this box has used, EXCLUD
   # orphaned" in every context that sets -e (measured: the refresh pre-flight reported a DEAD host
   # as held-by-live while the same call from a non-`set -e` shell reclaimed it). A query about the
   # past must answer "nothing", never fail.
-  awk -v cur="$cur" -v real="$real" 'NF && $0 != cur && $0 != real {printf "%s ", $0}' "$f" 2>/dev/null || :
+  # `$0 != "box"` is defence in depth for a history file written BEFORE the recorder refused it: the
+  # record survives the failure that created it, so the reader has to be safe on its own.
+  awk -v cur="$cur" -v real="$real" 'NF && $0 != cur && $0 != real && $0 != "box" {printf "%s ", $0}' "$f" 2>/dev/null || :
 }
 
 # ── IS THE HOLDER STILL A LIVE LANE? (agent-infra#2094) ───────────────────────────────────────
