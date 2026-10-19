@@ -1529,3 +1529,205 @@ def test_a_waiting_pr_is_never_dispatched_or_asked_about(monkeypatch, capsys):
     # a LINE PREFIX, not a substring: `ACT`/`DRY` appear inside ordinary words, and a test that
     # forbids them anywhere would fail the first time a log line mentions one.
     assert not [ln for ln in joined.splitlines() if ln.startswith(("DRY ", "ACT "))], joined
+
+
+# ── THE LANE READ MUST FINISH INSIDE ITS CALLER'S PATIENCE (2026-10-18, measured) ──────────
+# `pr-doctor.py` allowed this tool 600s while `load_snapshot` handed EACH of its two attempts the
+# tool's full 300s. A real `--no-cache` scan measured 147s on a quiet box (this module's own note
+# records 250-300s under load), so the escalate path summed to ~294s+ against a 300s inner bound
+# and BEYOND the outer one: the pass died with `TimeoutExpired` and pr-doctor refused with rc 2.
+# MEASURED, and stated narrowly because the loose version was false: the SCHEDULED path (`$STATE/pr-doctor.launchd.log`, first line 2026-10-10T22:49 -> last 2026-10-18T21:32) managed TWO dispatches ever -- 382 passes, 320 `LANE READ FAILED`, 241 of them `TimeoutExpired`. ⚠️ NOT `0 dispatches for six days`: the heartbeat's own launcher (`$STATE/pr-doctor.log`) carried the fleet intermittently (87 passes with `dispatched >0`).
+# Figures are dated -- re-measure, do not quote.
+
+def test_the_two_scan_attempts_share_ONE_budget(monkeypatch):
+    """The bounds must COMPOSE. A fresh `budget` per attempt is what outlived the caller."""
+    import subprocess as _sp
+
+    budget = 100.0
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(LA.time, "monotonic", lambda: clock["t"])
+    seen = []
+
+    class _R:
+        stderr = ""
+        returncode = 0
+
+        def __init__(self, out):
+            self.stdout = out
+
+    def _run(*a, **k):
+        seen.append(k.get("timeout"))
+        clock["t"] += 60.0          # this scan burned 60s of the SHARED budget
+        return _R(json.dumps([{"lane": "a", "verdict": "WORKING"}]))
+
+    monkeypatch.setattr(_sp, "run", _run)
+    monkeypatch.setattr(LA, "_live_want", lambda LS=None: None)   # unknown fleet size -> re-scan
+    LA.load_snapshot(_Args(stdin=None, budget=budget))
+
+    assert len(seen) == 2, seen
+    # Attempt 0 takes a bounded SLICE (40%), so the retry that exists to FIX it is never starved
+    # by it (#1788/#1774); the retry then gets the remainder of the same deadline, never a fresh
+    # budget.
+    assert abs(seen[0] - 0.4 * budget) < 0.01, seen
+    assert abs(seen[1] - (budget - 60.0)) < 0.01, (
+        "the re-scan must get the REMAINING budget, not a fresh one -- got %r" % (seen,))
+    assert seen[0] + seen[1] <= budget + 0.01, (
+        "the two attempts must fit inside ONE budget: %r" % (seen,))
+
+
+def test_a_failed_rescan_does_not_discard_the_roster_already_read(monkeypatch, capsys):
+    """⛔ AN UNREADABLE RETRY MUST NOT INVALIDATE A READABLE DATUM.
+
+    The old code let the retry's exception propagate, so a non-degraded roster that lane-status HAD
+    just read (i.e. a real cmux read) was thrown away because the second read of the same data
+    timed out. `pr-doctor` then had no roster and refused. The escalation is a completeness
+    IMPROVEMENT on `first`, never a precondition for using it.
+    """
+    import subprocess as _sp
+
+    healthy = [{"lane": "a", "verdict": "WORKING", "degraded": False}]
+    calls = []
+
+    class _R:
+        stderr = ""
+        returncode = 0
+
+        def __init__(self, out):
+            self.stdout = out
+
+    def _run(cmd, **k):
+        calls.append(list(cmd))
+        if len(calls) == 1:
+            return _R(json.dumps(healthy))
+        raise _sp.TimeoutExpired(cmd, k.get("timeout") or 0)
+
+    monkeypatch.setattr(_sp, "run", _run)
+    monkeypatch.setattr(LA, "_live_want", lambda LS=None: None)
+    rows, _age, _ref = LA.load_snapshot(_Args(stdin=None))
+
+    assert rows == healthy, "the readable roster must survive a failed re-scan"
+    assert len(calls) == 2 and "--no-cache" in calls[1], calls
+    err = capsys.readouterr().err
+    assert "re-scan did not produce a usable read" in err, err
+    assert "COMPLETENESS UNMEASURED" in err, err
+
+
+def test_a_degraded_roster_is_still_REFUSED_with_no_fallback(monkeypatch):
+    """The fallback above must not become a way to act on a DEGRADED (TSV-only) snapshot.
+
+    `first` is only kept after `_refuse_if_degraded`, so a degraded attempt 0 still raises -- this
+    pins that ordering, because moving the fallback above the guard would silently reopen the
+    fail-open the DEGRADED_MSG refusal exists to close.
+    """
+    import subprocess as _sp
+
+    class _R:
+        stderr = ""
+        returncode = 0
+
+        def __init__(self, out):
+            self.stdout = out
+
+    def _run(*a, **k):
+        return _R(json.dumps(_degraded_rows()))
+
+    monkeypatch.setattr(_sp, "run", _run)
+    monkeypatch.setattr(LA, "_live_want", lambda LS=None: None)
+    try:
+        LA.load_snapshot(_Args(stdin=None))
+    except SystemExit as e:
+        assert "DEGRADED" in str(e), e
+        return
+    raise AssertionError("a degraded roster was accepted via the re-scan fallback")
+
+
+
+def test_a_SUCCESSFUL_rescan_wins_over_the_first_read(monkeypatch):
+    """⛔ A BETTER READ MUST BE THE ONE RETURNED (2026-10-18, review).
+
+    The fallback path kept only attempt 0 (`first`), so a retry that SUCCEEDED and returned MORE
+    lanes was discarded whenever it still fell short of the roster estimate -- the caller kept the
+    worse roster and was never told. `best` tracks the newest successful read; it always supersedes.
+    """
+    import subprocess as _sp
+
+    seen = []
+
+    class _R:
+        stderr = ""
+        returncode = 0
+
+        def __init__(self, out):
+            self.stdout = out
+
+    def _run(*a, **k):
+        seen.append(list(a[0]) if a else list(k.get("args") or []))
+        rows = ([{"lane": "a"}] if len(seen) == 1
+                else [{"lane": "a"}, {"lane": "b"}, {"lane": "c"}])
+        return _R(json.dumps(rows))
+
+    monkeypatch.setattr(_sp, "run", _run)
+    # `want` is reachable by NEITHER read, so neither is "complete" and the function must fall
+    # through to its strongest-read return.
+    monkeypatch.setattr(LA, "_live_want", lambda LS=None: 99)
+    rows, _age, _ref = LA.load_snapshot(_Args(stdin=None, budget=600.0))
+    assert [r["lane"] for r in rows] == ["a", "b", "c"], (
+        "the successful re-scan must be returned, not the shorter first read: %r" % (rows,))
+
+
+def test_a_DEGRADED_rescan_does_not_discard_the_roster_already_read(monkeypatch, capsys):
+    """⛔ `SystemExit` IS NOT AN `Exception` (2026-10-18, review).
+
+    `_refuse_if_degraded` raises `SystemExit`, so the `except Exception` fallback missed it: a
+    DEGRADED re-scan escaped and threw away a non-degraded roster attempt 0 had just read. The
+    suite missed it because the sibling test fails the retry with `TimeoutExpired` (an ordinary
+    `Exception`). This is the production shape of the bug: the retry is degraded, attempt 0 is not.
+    """
+    import subprocess as _sp
+
+    healthy = [{"lane": "a", "verdict": "WORKING", "degraded": False}]
+    degraded = [{"lane": "a", "verdict": "WORKING", "degraded": True}]
+    calls = []
+
+    class _R:
+        stderr = ""
+        returncode = 0
+
+        def __init__(self, out):
+            self.stdout = out
+
+    def _run(cmd, **k):
+        calls.append(list(cmd))
+        return _R(json.dumps(healthy if len(calls) == 1 else degraded))
+
+    monkeypatch.setattr(_sp, "run", _run)
+    monkeypatch.setattr(LA, "_live_want", lambda LS=None: 99)   # neither read is "complete"
+    rows, _age, _ref = LA.load_snapshot(_Args(stdin=None))
+
+    assert rows == healthy, (
+        "a DEGRADED re-scan must not discard the non-degraded roster already read: %r" % (rows,))
+    assert len(calls) == 2 and "--no-cache" in calls[1], calls
+    err = capsys.readouterr().err
+    assert "COMPLETENESS UNMEASURED" in err, err
+
+
+def test_a_degraded_FIRST_read_is_still_a_hard_REFUSAL(monkeypatch):
+    """The fallback must not weaken the primary rule: with nothing already read, DEGRADED refuses."""
+    import subprocess as _sp
+
+    class _R:
+        stderr = ""
+        returncode = 0
+
+        def __init__(self, out):
+            self.stdout = out
+
+    monkeypatch.setattr(_sp, "run",
+                        lambda cmd, **k: _R(json.dumps([{"lane": "a", "degraded": True}])))
+    monkeypatch.setattr(LA, "_live_want", lambda LS=None: 99)
+    try:
+        LA.load_snapshot(_Args(stdin=None))
+    except SystemExit as e:
+        assert "DEGRADED" in str(e), e
+        return
+    raise AssertionError("a degraded FIRST read must still refuse")

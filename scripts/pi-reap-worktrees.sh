@@ -83,7 +83,10 @@
 #   * EVERY subprocess that can block runs under a watchdog (list / status /
 #     ps / lsof / gh / rm / git worktree remove / git worktree prune /
 #     merge-base / for-each-ref / log / symbolic-ref / rev-parse / remote
-#     get-url) — no GNU `timeout` needed on macOS.
+#     get-url) — ONE watchdog, resolved by the shared helper
+#     `scripts/lib/bounded.sh` as `timeout` -> `gtimeout` -> an internal
+#     background watchdog. macOS has no GNU `timeout` (#2046), so the fallback
+#     is what runs there; the status contract is identical (124 == timeout).
 #     The three PROPERTY PROBES per record (merge-base, for-each-ref, log) are
 #     in that list deliberately: the global budget is only checked BETWEEN
 #     records, so an unwatched probe that hangs inside one record hung the whole
@@ -329,76 +332,36 @@ now_epoch() {
 
 is_pos_int() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; esac; return 0; }
 
-# run_bounded <seconds> <outfile> <cmd...>
-# 0 = ok, 124 = timed out, other = the command's own status. `<seconds>` 0 means
-# "no watchdog". macOS has no GNU `timeout`; a watchdog subshell writes a
-# sentinel so a real SIGKILL is distinguishable from a command that exited 137.
+# ── bounded execution — the shared helper (#2046) ─────────────────────────────────────────────
+# `run_bounded`'s watchdog is NOT defined here any more: it MOVED to scripts/lib/bounded.sh, which
+# resolves the bound ONCE as `timeout` -> `gtimeout` -> that same internal watchdog, and which
+# `scripts/disk-reaper.sh` shares. Keeping the second copy is how two reapers drift into bounding
+# different probes; the only thing left here is the name this file's 30 call sites already use.
 #
-# Fork economy is a correctness property here, not a micro-optimization: this
-# tool runs ~10 bounded probes per pass on a host it exists to UNLOAD, and each
-# probe used to cost two `mktemp` forks plus a `pkill -P` (an exec plus a full
-# process-table scan). The scratch files now come from ONE per-run directory,
-# and the watchdog holds its own timer as a child so a TERM tears the timer down
-# — the `pkill` was only ever papering over the leak its predecessor created.
-WATCHDOGS=""
-BOUND_TMP=""
-BOUND_N=0
-bound_tmp() { # lazily create the per-run probe scratch dir; "" => degrade
-    [ -n "$BOUND_TMP" ] && return 0
-    BOUND_TMP="$(mktemp -d "${TMPDIR:-/tmp}/pi-reap-wt.XXXXXX" 2>/dev/null)" || BOUND_TMP=""
-    [ -n "$BOUND_TMP" ] || return 1
-    return 0
-}
-bound_cleanup() { [ -n "$BOUND_TMP" ] && rm -rf "$BOUND_TMP"; BOUND_TMP=""; return 0; }
-
-run_bounded() {
-    local secs="$1" out="$2"; shift 2
-    local pid wd="" s rc=0 sentinel="" done_flag=""
-    BOUND_N=$((BOUND_N + 1))
-    if bound_tmp; then
-        sentinel="$BOUND_TMP/s.$BOUND_N"
-        done_flag="$BOUND_TMP/d.$BOUND_N"
-    fi
-    : >"$out"
-    "$@" >"$out" 2>/dev/null &
-    pid=$!
-    if is_pos_int "$secs" && [ "$secs" -gt 0 ]; then
-        (
-            # TERM means the parent finished with this probe: kill the timer and
-            # leave without signalling anything. No orphaned `sleep`, so no
-            # `pkill -P` sweep is needed.
-            trap 'kill "$s" 2>/dev/null; exit 0' TERM INT
-            sleep "$secs" &
-            s=$!
-            wait "$s" 2>/dev/null
-            [ -n "$done_flag" ] && [ -e "$done_flag" ] && exit 0
-            if kill -0 "$pid" 2>/dev/null; then
-                [ -n "$sentinel" ] && : >"$sentinel"
-                kill -9 "$pid" 2>/dev/null
-            fi
-        ) >/dev/null 2>&1 &
-        wd=$!
-        WATCHDOGS="$WATCHDOGS $wd"
-    fi
-    wait "$pid" 2>/dev/null || rc=$?
-    if [ -n "$wd" ]; then
-        [ -n "$done_flag" ] && : >"$done_flag"
-        kill -TERM "$wd" 2>/dev/null
-        wait "$wd" 2>/dev/null
-    fi
-    # The sentinel is the only way to tell "the watchdog killed it" from "the
-    # command died with 137 on its own" — the exit status alone cannot.
-    if [ -n "$sentinel" ] && [ -e "$sentinel" ]; then rc=124; fi
-    [ -n "$sentinel" ] && rm -f "$sentinel"
-    [ -n "$done_flag" ] && rm -f "$done_flag"
-    return $rc
-}
-
-watchdogs_reap() {
-    local w
-    for w in $WATCHDOGS; do kill -TERM "$w" 2>/dev/null; done
-    WATCHDOGS=""
-}
+# Contract, unchanged: 0 = ok, 124 = timed out, other = the command's own status; `<seconds>` 0 means
+# "no watchdog"; a non-integer bound is REFUSED (125) rather than silently run unbounded.
+# A missing library is a fail-closed abort at startup — without it NO probe is bounded, and an
+# unbounded probe is what this tool exists to prevent.
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+BOUNDED_LIB="${BOUNDED_LIB:-}"
+if [ -z "$BOUNDED_LIB" ]; then
+    for cand in "$SELF_DIR/lib/bounded.sh" \
+                "${HOME:-}/.pi/agent/scripts/lib/bounded.sh"; do
+        [ -n "$cand" ] || continue
+        [ -f "$cand" ] && { BOUNDED_LIB="$cand"; break; }
+    done
+fi
+if [ ! -f "$BOUNDED_LIB" ]; then
+    echo "FAIL-CLOSED abort: bounded-execution library missing (${BOUNDED_LIB:-$SELF_DIR/lib/bounded.sh or ${HOME:-}/.pi/agent/scripts/lib/bounded.sh, exit 3)}" >&2
+    exit 3
+fi
+# shellcheck source=lib/bounded.sh
+. "$BOUNDED_LIB"
+if [ "${TB_TIMEOUT_KIND:-}" = "invalid" ]; then
+    echo "FAIL-CLOSED abort: TB_TIMEOUT_BIN=${TB_TIMEOUT_BIN:-} cannot be executed (exit 3)" >&2
+    exit 3
+fi
+run_bounded() { tb_run "$@"; }
 
 # canonicalize <path> — physical path, or "" when it cannot be resolved. Every
 # path comparison uses the canonical form: `git worktree list` reports the
@@ -1164,7 +1127,7 @@ run() {
     # it owns the probe scratch dir, the watchdog timers, the probe output files
     # and the lock. Installing it later (as it was) leaked the scratch dir on
     # every early fail-closed exit.
-    trap 'watchdogs_reap; bound_cleanup; rm -f "$PS_OUT" "$CWD_OUT" "$GIT_OUT"; lock_release' EXIT
+    trap 'tb_watchdogs_reap; tb_bound_cleanup; rm -f "$PS_OUT" "$CWD_OUT" "$GIT_OUT"; lock_release' EXIT
     if [ "$MODE" = unknown ]; then
         if [ "$REAP_WT_DRY_RUN" = "0" ]; then MODE=apply; else MODE=dry-run; fi
     fi

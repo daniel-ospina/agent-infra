@@ -1215,6 +1215,58 @@ def _queue_grew_over_window(now_nondraft, prev):
     return now_nondraft > then
 
 
+def pr_doctor_last_run(state_dir: str | None = None) -> str:
+    """The LAST pr-doctor pass's verdict, for the beat -- because QUEUE STATE IS NOT PRODUCTION.
+
+    ⛔ MEASURED 2026-10-18, owner-reported, over `$STATE/pr-doctor.launchd.log`, first line 2026-10-10T22:49 -> last 2026-10-18T21:32: 382 passes, 320 `LANE READ FAILED`, 241 carrying `TimeoutExpired`, and TWO that ever dispatched (both 2026-10-11): the beat carried
+    `QUEUE(state; pr-doctor dispatches): running=12..23` (relabelled `QUEUE(state):` -- the
+    parenthetical claimed a dispatch record the token never carried) -- the QUEUE's shape (how many PRs are
+    classified `running`), not a record of any dispatch -- so the fleet read as self-dispatching
+    while the SCHEDULED dispatcher was effectively dead, and the owner dispatched PR owners by
+    hand. ⚠️ Not "nothing dispatched for six days": the heartbeat's own `$STATE/pr-doctor.log`
+    carried the fleet intermittently (87 passes with `dispatched >0` since 2026-10-10, 48 of them
+    on 2026-10-17). The claim is about the SCHEDULED path, and it is narrower.
+
+    The dispatcher now writes `$STATE/pr-doctor.status.json` on every exit path (rc + a one-line
+    reason). This segment publishes it in the beat, so the same beat that shows the queue also
+    shows whether the thing that WORKS the queue is alive -- and says RED when it is not. A
+    missing record is `UNREPORTED`, never `ok`: absence is not a pass.
+    """
+    p = os.path.join(state_dir or STATE, "pr-doctor.status.json")
+    # ⛔ A DISARMED DISPATCHER IS NOT A DEAD ONE (2026-10-18, review). `$STATE/PR-DOCTOR-OFF` is the
+    # documented way to stop it (heartbeat-loop.sh honours it); the sidecar then stops being written,
+    # so an age-bounded reader would print RED every beat forever with no way to tell "the operator
+    # turned it off" from "it died" -- a failure manufactured out of an intentional state, on the one
+    # token a reader is told to act on. Say DISARMED instead.
+    if os.path.exists(os.path.join(state_dir or STATE, "PR-DOCTOR-OFF")):
+        return "PR-DOCTOR(last run): DISARMED (PR-DOCTOR-OFF is set)"
+    try:
+        with open(p) as fh:
+            d = json.load(fh)
+        rc = int(d.get("rc"))
+        age = int(max(0, time.time() - float(d.get("at_epoch") or 0)))
+        reason = str(d.get("reason") or "(no reason recorded)")[:110]
+        dry = bool(d.get("dry_run"))
+    except FileNotFoundError:
+        return "PR-DOCTOR(last run): UNREPORTED (no verdict recorded)"
+    except Exception as e:
+        return "PR-DOCTOR(last run): UNREPORTED (unreadable verdict: %s)" % type(e).__name__
+    if dry:
+        # A DRY RUN IS NOT A PASS: it stamps no fleet-visible verdict (pr-doctor skips the write),
+        # and if an older one ever carries the flag it must never read as production.
+        return "PR-DOCTOR(last run): DRY RUN (not a pass)"
+    # ⛔ A VERDICT THAT STOPPED BEING WRITTEN IS *UNREPORTED*, NOT `ok` (2026-10-18, review).
+    # The failure this whole segment exists to expose is "a dead dispatcher reads healthy"; an
+    # unbounded age reproduces it one level up -- kill the launchd job, or touch
+    # `$STATE/PR-DOCTOR-OFF`, and the beat would print `ok` forever. The bound is the same
+    # freshness the roster read uses (two 1200s dispatch intervals), so the two agree.
+    if age > 2400:
+        return "PR-DOCTOR(last run): UNREPORTED (verdict is STALE, %dm old: %s)" % (
+            age // 60, reason)
+    return "PR-DOCTOR(last run): %s rc=%d %dm ago — %s" % (
+        "RED" if rc else "ok", rc, age // 60, reason)
+
+
 def build(prev=None):
     sha = main_sha()
     mstate, mfails = main_health(sha) if sha else ("UNKNOWN", [])
@@ -1323,7 +1375,7 @@ def build(prev=None):
                     seg += " IN-PROGRESS: fixing " + " ".join(
                         f"{n}={c}" for n, c in sorted(_cnt.items(), key=lambda kv: (-kv[1], kv[0])))
             parts.append(f"waiting={q['nondraft']} prs: {q['nondraft']} nondraft")
-            parts.append(f"| QUEUE(state; pr-doctor dispatches): {seg}")
+            parts.append(f"| QUEUE(state): {seg}")
         else:
             # `classes` is None when ANY PR's checks were unreadable, so no partition is printed.
             parts.append(f"waiting={q['nondraft']}")
@@ -1335,6 +1387,19 @@ def build(prev=None):
     else:
         parts.append("queue=UNREADABLE")
         waiting = None
+    # ⛔ THE QUEUE'S SHAPE IS NOT THE DISPATCHER'S HEALTH, AND THE VERDICT MUST SURVIVE BOTH A BLIND
+    # QUEUE AND A LONG ONE (2026-10-18, owner-reported + review). Emitted OUTSIDE every queue branch
+    # -- a partly-blind pass is exactly when a reader most needs to know whether the thing that works
+    # the queue is alive, and a segment that disappears with the queue read is indistinguishable from
+    # "green". `pr_doctor_last_run()` reads its own file and answers its own question.
+    #
+    # ⚠️ AND IT IS EMITTED **HERE**, BEFORE `waiting=`/`QUEUE(state):`, NOT AFTER THEM. The fleet reads
+    # this line through a fixed `cut -c1-900` (`cadence-nudge.sh`), and that file's own rule says what
+    # a cut CAN sever is "the tail of the queue segment and then the CI indicators" -- so appending
+    # the one fact this change adds would have put the RED exactly in the severable region, and a long
+    # queue would cut the dispatcher's verdict first. Only latent while the line measured ~466 chars;
+    # it would not stay latent.
+    parts.append("| " + pr_doctor_last_run())
     if crit:
         # INDICATOR, not a target (see GUIDELINE_CI_MIN). MEDIAN critical path and the worst
         # seen -- the worst is what a PR actually waits for, because one slow shard is the
