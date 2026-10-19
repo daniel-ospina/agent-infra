@@ -463,8 +463,14 @@ CEIL="$(as_box "$ORIG7" tbox 'printf "%s\n" "${CLAIM_TTL_MAX:-}"')"
 [ "${CEIL:-0}" -gt 0 ]; ck "O7 the PR keying declares a documented ceiling (CLAIM_TTL_MAX=${CEIL:-unset})" $?
 as_box "$ORIG7" tbox 'claim_acquire "" 9209434 0123456789abcdef0123 999999999 >/dev/null 2>&1' >/dev/null
 U7B="$(lease_until "$ORIG7" refs/claims/9209434-0123456789ab)"; NOW7B="$(now_s)"
-[ -n "$U7B" ] && [ "$(( U7B - NOW7B ))" -le "${CEIL:-1800}" ]
-ck "O7 [RED→GREEN] a ttl ABOVE the ceiling cannot mint a term past it (term=$(( ${U7B:-0} - NOW7B ))s, ceiling=${CEIL:-?}s)" $?
+# ⛔ A TWO-SIDED BOUND (P1, cycle-19 review). The upper bound alone could not tell "clamped to the
+# CEILING" from "clamped to the DEFAULT" — and those are different behaviours, not different numbers:
+# `ttl="$dflt"` instead of `ttl="$max"` silently SHORTENS merge-one's legitimate long lease to 1800s, the
+# mid-review expiry the ceiling choice exists to prevent (measured: that one-token mutant left every
+# suite green). So the term must land AT the ceiling, not merely below it.
+U7TERM=$(( ${U7B:-0} - NOW7B ))
+[ -n "$U7B" ] && [ "$U7TERM" -le "${CEIL:-1800}" ] && [ "$U7TERM" -ge "$(( ${CEIL:-1800} - 3 ))" ]
+ck "O7 [RED→GREEN] a ttl ABOVE the ceiling is clamped TO THE CEILING, not to the shorter default (term=${U7TERM}s, ceiling=${CEIL:-?}s)" $?
 IVAL="$(as_box "$ORIG7" tbox 'printf "%s\n" "$CLAIM_ISSUE_TTL"')"
 [ "$IVAL" = "10800" ]; ck "O7 the ISSUE claim's default TTL is 10800s (got '$IVAL')" $?
 as_box "$ORIG7" tbox 'claim_issue_acquire "" 9209432 >/dev/null 2>&1' >/dev/null
@@ -476,8 +482,11 @@ ck "O7 [PINNED] an ISSUE claim's stamped term is <= CLAIM_ISSUE_TTL=10800s (term
 # asserted here so the number is BOUNDED and visible, not so it is silently lowered.
 as_box "$ORIG7" tbox 'claim_issue_acquire "" 9209436 999999999 >/dev/null 2>&1' >/dev/null
 U8B="$(lease_until "$ORIG7" refs/claims/issue-9209436)"; NOW8B="$(now_s)"
-[ -n "$U8B" ] && [ "$(( U8B - NOW8B ))" -le 10800 ]
-ck "O7 [RED→GREEN] an ISSUE ttl above CLAIM_ISSUE_TTL is clamped to it (term=$(( ${U8B:-0} - NOW8B ))s)" $?
+# two-sided for the same reason: the issue ceiling is 10800s and the issue DEFAULT is also 10800s, but a
+# slip to the PR default (1800s) must not pass.
+U8TERM=$(( ${U8B:-0} - NOW8B ))
+[ -n "$U8B" ] && [ "$U8TERM" -le 10800 ] && [ "$U8TERM" -ge 10797 ]
+ck "O7 [RED→GREEN] an ISSUE ttl above CLAIM_ISSUE_TTL is clamped TO IT, not to a shorter default (term=${U8TERM}s)" $?
 # An unparseable ttl must fall back to the keying's own default — never to the PR's shorter one.
 as_box "$ORIG7" tbox 'claim_issue_acquire "" 9209433 07 >/dev/null 2>&1' >/dev/null
 U9="$(lease_until "$ORIG7" refs/claims/issue-9209433)"; NOW9="$(now_s)"
