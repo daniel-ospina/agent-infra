@@ -61,7 +61,7 @@ Usage:  objective.py [--json] [--max-age 240]
 Output: OBJECTIVE VERDICT=... prs_waiting=N ... main=RED|GREEN|UNKNOWN@sha ...
 """
 from __future__ import annotations
-import json, os, re, subprocess, sys, time
+import json, os, re, subprocess, sys, time, urllib.request
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 
@@ -1049,13 +1049,181 @@ QUEUE_BLIND_BUDGET_S = 20                     # WALL-CLOCK bound on re-sampling,
                                               # otherwise spend on waiting
 
 
+# ⛔ THE QUEUE READ HAS A SECOND SOURCE, AND IT IS A DIFFERENT BUCKET (#2138).
+# `gh pr list --json` is GRAPHQL. Under fleet concurrency GitHub refuses it with the SECONDARY
+# limit while the primary budget is nearly untouched -- measured 2026-10-19: the call returned
+# `API rate limit already exceeded for user ID 81560491` at `core 1599/5000` / `graphql 4612/5000`,
+# and a single REST `.../pulls` call answered 200 in 0.43 s with 17 concurrent gh clients on one
+# box. The consequence was visible in this file's own output: `gh=RATE-LIMITED(queue)
+# queue=UNREADABLE` for whole cycles, so the beat could not report the ONE number its verdict is
+# about. The two limits are separate buckets, so REST is a SECOND SOURCE -- never a retry of the
+# same refusal, and never a fallback to "empty" (an empty read is a FAILED read, #1872).
+#
+# ⛔ AND IT DOES NOT GO THROUGH `GH_BIN`. The failure this exists for is the gh binary's
+# GraphQL read being refused; routing the fallback back through the same binary (or the shell
+# layer's serialisation queue) would put it behind the thing it is escaping.
+GH_HOSTS = os.path.expanduser("~/.config/gh/hosts.yml")
+QUEUE_REST_PAGE = 100                         # the list endpoint's maximum page
+QUEUE_REST_MAX_PAGES = 5                      # a bound, not an expectation: >500 open PRs means
+                                              # something other than a queue is wrong
+QUEUE_REST_TIMEOUT_S = 30                     # inside the beat's 90 s refresh bound even with
+                                              # one page; a hung fallback must not outlive it
+
+
+def _gh_token():
+    """gh's own `oauth_token`, read from gh's own config. NEVER logged, never printed.
+
+    Reading the file beats asking the binary (`gh auth token`): that is another subprocess on the
+    hot path of the read that exists BECAUSE the subprocess path is refused, and it would inherit
+    the same shell/shim hazards (#1872). The parser is deliberately tiny -- hosts.yml has a
+    fixed two-level shape (`<host>:` then indented keys) -- and it fails CLOSED: no file, no
+    token, no read.
+    """
+    try:
+        host, fallback = None, ""
+        with open(GH_HOSTS) as fh:
+            for line in fh:
+                if not line.strip() or line.lstrip().startswith("#"):
+                    continue
+                if not line[0].isspace():              # `github.com:` -- a new host block
+                    host = line.split(":", 1)[0].strip()
+                    continue
+                if ":" not in line:
+                    continue
+                k, v = line.split(":", 1)
+                if k.strip() != "oauth_token":
+                    continue
+                v = v.strip().strip("'\"")
+                if not v:
+                    continue
+                if host == "github.com":
+                    return v                            # the host this file talks to wins
+                fallback = fallback or v                # else remember it, but keep looking
+        return fallback
+    except Exception:
+        return ""
+
+
+def _rest_get(url, token, timeout=QUEUE_REST_TIMEOUT_S):
+    """One REST GET, behind ONE seam so the fallback is provable without a network.
+
+    Returns the decoded body and RAISES on any failure; the caller treats every raise as "no
+    second source". The token is only ever placed in the header -- it must never reach a log
+    line, an exception message of ours, or `GH_LAST_ERROR`.
+    """
+    req = urllib.request.Request(url, headers={
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "objective.py (agent-infra heartbeat)",
+    })
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def _rest_pr(p):
+    """One REST pull -> the `gh pr list --json` shape the rest of this file consumes.
+
+    ⛔ `files: []` MEANS *UNKNOWN*, NEVER "EMPTY DIFF". The list endpoint carries no file list
+    (that is one call per PR), so `touches_surface()` reads `[]` and answers False on a
+    REST-recovered pass: the `ASK-USER` overlay is BLIND for that pass, not clear. Recorded as a
+    residual on #2138 rather than closed here, because closing it changes this contract.
+    ⛔ `mergeStateStatus` MAY BE EMPTY, and that is the known gap: REST's `mergeable_state` is
+    often "" while GitHub computes mergeability, so the value is mapped to `None` (unread) and
+    `_queue_read_is_blind()` is told the sample's SOURCE -- otherwise the fallback would
+    manufacture `queue_read=BLIND` out of a sample it did read.
+    """
+    m = p.get("mergeable")
+    return {
+        "number": p.get("number"),
+        "isDraft": bool(p.get("draft")),
+        "mergeable": ("MERGEABLE" if m is True else
+                      "CONFLICTING" if m is False else "UNKNOWN"),
+        "mergeStateStatus": (p.get("mergeable_state") or "").upper() or None,
+        "headRefOid": ((p.get("head") or {}).get("sha") or ""),
+        "files": [],
+    }
+
+
+def _queue_rest():
+    """The open PR list over REST, or None on ANY failure -- never an empty queue.
+
+    ⛔ `[]` IS NEVER A FAILURE VALUE HERE. It is the honest answer for a repo with no open PRs,
+    which is why every failure returns None instead: the caller then raises exactly as it did
+    before, so `_note_gh_failure` records the transport failure, `queue=UNREADABLE` prints and
+    the RATE-LIMITED verdict still outranks the queue. A degraded read rendered as `waiting=0`
+    would read AT-TARGET -- the one wrong answer this instrument can give.
+
+    ⛔ A NON-LIST BODY IS A FAILURE, NOT ZERO PRs. A dict here is an error/notice body, and a
+    non-dict element inside a list is a payload we do not understand; either way the whole pass
+    is unread. Silently keeping the dicts we recognise would publish a LOWER BOUND as if it were
+    the queue depth (the under-count direction that reads as AT-TARGET).
+
+    PAGING: one page is 100. A deeper queue is read a page at a time, bounded by
+    `QUEUE_REST_MAX_PAGES`; a SHORT page is the end. A partially-read queue is never returned --
+    the last page failing discards the whole read for the reason above.
+    """
+    global GH_LAST_ERROR
+    token = _gh_token()
+    if not token:
+        GH_LAST_ERROR = f"rest fallback: no oauth_token in {GH_HOSTS}"
+        return None
+    rows = []
+    try:
+        for page in range(1, QUEUE_REST_MAX_PAGES + 1):
+            body = _rest_get(
+                f"https://api.github.com/repos/{REPO}/pulls"
+                f"?state=open&per_page={QUEUE_REST_PAGE}&page={page}", token)
+            if not isinstance(body, list):
+                GH_LAST_ERROR = (f"rest fallback returned {type(body).__name__}, not a list")
+                return None
+            if not all(isinstance(p, dict) for p in body):
+                GH_LAST_ERROR = "rest fallback returned a non-object element in the PR list"
+                return None
+            rows.extend(body)
+            if len(body) < QUEUE_REST_PAGE:
+                break
+    except Exception as e:
+        # The URL is safe to name; the token never is.
+        GH_LAST_ERROR = f"rest fallback failed: {type(e).__name__}: {str(e)[:180]}"
+        return None
+    return [_rest_pr(p) for p in rows]
+
+
+def _withdraw_gh_failure(surface):
+    """A SECOND SOURCE answered, so the claim the first one recorded is no longer true.
+
+    Mirrors `main_health()`'s own withdrawal: only the surface in question gives up its claim, so
+    a queue recovered over REST cannot un-blind a main that is still refused (and vice versa).
+    Without this, a recovered read would still print `gh=RATE-LIMITED(queue)` AND rewrite the
+    verdict to `GH-RATE-LIMITED` -- the fallback would succeed and the line would still say the
+    fleet is blind.
+    """
+    global GH_BLOCKED
+    GH_BLOCKED_BY[:] = [s for s in GH_BLOCKED_BY if s != surface]
+    if not GH_BLOCKED_BY:
+        GH_BLOCKED = None
+
+
 def _mergeable_unknown(ms):
     """How many non-draft PRs came back with an UNREAD lazy merge state (`ms` = Counter)."""
     return sum(c for k, c in ms.items() if k not in KNOWN_MERGE_STATES)
 
 
-def _queue_read_is_blind(unknown, nondraft):
+def _queue_read_is_blind(unknown, nondraft, source="graphql"):
     """True iff the lazily-computed merge state is unread for MOST of the queue.
+
+    ⛔ A REST-SOURCED SAMPLE IS NEVER BLIND (#2138), and this is a decided behaviour, not an
+    oversight. `BLIND` is this file's word for "the QUEUE read did not answer"; a REST sample
+    DID answer -- the list, its length and every row are real. What REST cannot answer is the
+    LAZY merge state (`mergeable_state` is frequently "" while GitHub computes it), and that
+    is a different, narrower fact: the queue DEPTH is read, the CLASS counts are not. So a REST
+    sample reports its unread count instead of borrowing the blindness word, and it is not
+    re-sampled either -- re-reading a field REST does not compute would only spend the beat's
+    90 s budget to learn the same thing.
+
+    The read WAS blind in the other direction (GraphQL said UNKNOWN for the whole queue) -- that
+    is the case the re-sample exists for, and it is unchanged.
 
     THE ONE DEFINITION, shared by the re-sample that tries to settle the read and by the
     report that finally declares it blind -- so the retry can never stop on a queue the line
@@ -1067,11 +1235,21 @@ def _queue_read_is_blind(unknown, nondraft):
     2 * _u >= max(1, nondraft)`). What changed is that the read is now SAMPLED AGAIN before
     that verdict is given, instead of being declared blind on the first sample.
     """
+    if source == "rest":
+        return False
     return unknown > 0 and 2 * unknown >= max(1, nondraft)
 
 
 def queue():
-    """The open PR queue, re-sampled while its LAZY merge state is unread (see above)."""
+    """The open PR queue, re-sampled while its LAZY merge state is unread (see above).
+
+    Two SOURCES, one answer: `gh pr list` (GraphQL) first, and REST only when that read FAILS
+    (#2138). The fallback is not a retry and not a second opinion -- it is the other bucket, so
+    a queue that GitHub refuses to answer over GraphQL is still reported instead of
+    `queue=UNREADABLE`. A REST-sourced sample carries its own provenance, because REST cannot
+    compute the lazy merge state and must not be read as a blind GraphQL read (nor as a
+    readable one).
+    """
     # ⛔ THE HEAVIEST READ MUST GO THROUGH THE LAYER TOO. `gh pr list` is GraphQL and this is the
     # beat's largest read; a bare `"gh"` here resolved on PATH — unserialised, un-backed-off, and
     # subject to the #1872 shim — while every other read in this file uses GH_BIN (found in review
@@ -1099,14 +1277,32 @@ def queue():
         # strictly worse than not re-reading. So the call AND the payload derivation are inside
         # the same absorb-and-keep-sample path as a failed transport.
         surface = "queue" if not attempt else "queue-resample"
+        source = "graphql"
         try:
             r = (_gh_retry(argv) if not attempt
                  else _gh_retry(argv, attempts=1, timeout=max(1.0, remaining)))
             if r.returncode != 0:
-                raise RuntimeError((r.stdout or "") + (r.stderr or ""))
-            prs = json.loads(r.stdout)
-            if not isinstance(prs, list):
-                raise ValueError(f"queue payload is not a list: {str(prs)[:200]}")
+                # ⛔ THE SECOND SOURCE, TRIED HERE AND ONLY HERE (#2138). A non-zero
+                # `gh pr list` is a TRANSPORT failure on the GraphQL bucket; REST is a
+                # different bucket, so it is worth one bounded attempt before this read is
+                # declared unreadable. On success the queue WITHDRAWS its own blindness claim
+                # -- a recovered read that still printed `gh=RATE-LIMITED(queue)` would report
+                # the fleet blind while the line carries the answer.
+                _graphql_err = ((r.stdout or "") + (r.stderr or "")).strip()
+                prs = _queue_rest()
+                if prs is None:
+                    # Both sources refused: raise the FIRST cause (it is the actionable one --
+                    # "rate limit" says wait) and append the second so the cause line names the
+                    # whole failure rather than half of it.
+                    _rest_err = GH_LAST_ERROR if "rest fallback" in (GH_LAST_ERROR or "") else ""
+                    raise RuntimeError(
+                        f"{_graphql_err} | {_rest_err or 'rest fallback failed'}")
+                source = "rest"
+                _withdraw_gh_failure(surface)
+            else:
+                prs = json.loads(r.stdout)
+                if not isinstance(prs, list):
+                    raise ValueError(f"queue payload is not a list: {str(prs)[:200]}")
             non = [p for p in prs if not p["isDraft"]]
         except Exception as e:
             # A FAILED RE-SAMPLE MUST NOT THROW AWAY A SAMPLE WE ALREADY HOLD. The first read
@@ -1126,7 +1322,7 @@ def queue():
         reads += 1
         ms = Counter(p.get("mergeStateStatus") or "?" for p in non)
         unknown = _mergeable_unknown(ms)
-        blind_now = _queue_read_is_blind(unknown, len(non))
+        blind_now = _queue_read_is_blind(unknown, len(non), source)
         # KEEP THE MOST RESOLVED SAMPLE, NOT THE LAST ONE. A later sample can land inside a
         # SECOND recompute window (the queue keeps moving while we wait) and would otherwise
         # clobber a better reading with a worse one. Ties go to the later sample, which is the
@@ -1146,7 +1342,8 @@ def queue():
                     or (not blind_now and non)
                     or (unknown <= sample["unknown"] and len(non) >= len(sample["non"])))
         if accepted:
-            sample = {"prs": prs, "non": non, "ms": ms, "unknown": unknown}
+            sample = {"prs": prs, "non": non, "ms": ms, "unknown": unknown,
+                      "source": source}
         if accepted and not blind_now:
             break
         if attempt == QUEUE_BLIND_ATTEMPTS - 1:
@@ -1155,15 +1352,24 @@ def queue():
                    max(0.0, deadline - _monotonic())))
     prs, non, ms = sample["prs"], sample["non"], sample["ms"]
     unknown = sample["unknown"]
+    source = sample.get("source") or "graphql"
     classes, surface, by_class, surface_prs = classify_queue(non)
-    blind = _queue_read_is_blind(unknown, len(non))
+    blind = _queue_read_is_blind(unknown, len(non), source)
+    # ⛔ AN UNREAD MERGE STATE IS *ALWAYS* None, not only when the whole read is blind (#2138).
+    # A REST-sourced sample is never BLIND -- the list was read -- but its `mergeable_state` is
+    # frequently uncomputed, and `ms.get("DIRTY", 0)` would then publish a FALSE ZERO for a
+    # count nobody could read. The same is true of a GraphQL sample with a MINORITY of unread
+    # PRs, which the blind predicate deliberately tolerates: tolerating the read is not
+    # permission to derive a zero from it.
+    unread = unknown > 0
     return {"open": len(prs), "drafts": len(prs) - len(non), "nondraft": len(non),
             # ⛔ None, NOT 0, WHEN THE STATE WAS UNREAD -- `ms.get("DIRTY", 0)` is the exact
             # "an unread value must never render as a zero" shape this file forbids. No consumer
             # reads these two today; making them honest is what stops the next one inheriting a
             # false zero.
-            "dirty": None if blind else ms.get("DIRTY", 0),
-            "unstable": None if blind else ms.get("UNSTABLE", 0), "unknown": unknown,
+            "dirty": None if (blind or unread) else ms.get("DIRTY", 0),
+            "unstable": None if (blind or unread) else ms.get("UNSTABLE", 0), "unknown": unknown,
+            "source": source,
             "mergeable_reads": reads, "resample_failed": resample_failed,
             "classes": classes, "by_class": by_class, "surface": surface,
             # ⛔ THE OWNER'S LIST SURVIVES THE REFUSAL (#1872): `classify_queue()` returns it in
@@ -1301,7 +1507,8 @@ def build(prev=None):
         # non-draft PRs with a 20-PR overlay loses all 20 names inside the nudge's cut).
         # To a truncating reader, ORDERING IS SEMANTICS.
         _u = q.get("unknown") or 0
-        _blind = _queue_read_is_blind(_u, q["nondraft"])
+        _src = q.get("source") or "graphql"
+        _blind = _queue_read_is_blind(_u, q["nondraft"], _src)
         # THE RE-SAMPLE IS NOT SILENT -- neither when it WORKED nor when it failed. A queue that
         # needed a second sample WAS transiently blind (#1869), and saying so is the only way that
         # frequency can be measured; a re-sample that FAILED (timeout, 5xx, garbage) is a different
@@ -1319,6 +1526,24 @@ def build(prev=None):
             # fail-closed job belongs to whatever token stands where the zeros used to.
             parts.append(f"queue_read=BLIND({_u}/{q['nondraft']} unread, samples={_reads}){_rsf}"
                          " -- the QUEUE counts are NOT a clearance")
+        elif _src == "rest":
+            # ⛔ THE FALLBACK MUST NOT MANUFACTURE BLINDNESS (#2138), AND IT MUST NOT PASS FOR A
+            # GRAPHQL READ EITHER. A REST-recovered sample DID read the queue -- open, drafts
+            # and the whole row set are real -- but REST's `mergeable_state` is frequently ""
+            # while GitHub computes mergeability, so the per-CLASS counts may be built on an
+            # unread field. Reporting BLIND would be a lie about what was read (and would
+            # suppress a real queue depth that a healthy REST call just established);
+            # reporting nothing would let an uncomputed merge state pass as a clearance.
+            # So the provenance is NAMED, the unread count stays beside it, and the sentence
+            # says exactly which half is trustworthy.
+            if _u:
+                parts.append(f"queue_read=REST(merge_state unread {_u}/{q['nondraft']},"
+                             f" samples={_reads}){_rsf} -- list read over REST; GitHub did not"
+                             " compute the merge state, so the CLASS counts are NOT a clearance"
+                             " (queue depth IS read)")
+            else:
+                parts.append(f"queue_read=REST(samples={_reads}){_rsf} -- the open-PR list was"
+                             " read over REST because the GraphQL read was refused")
         elif _reads > 1 or _rsf:
             parts.append(f"queue_read=SETTLED(samples={_reads}){_rsf}")
         if q.get("surface"):

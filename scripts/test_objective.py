@@ -74,7 +74,8 @@ def _gql_ok():
         "statusCheckRollup": {"contexts": {"nodes": nodes}}}}}}))
 
 
-def install(monkeypatch, *, gql=None, rest=None, pr_list=None, ci_runs=None, ls_remote=None):
+def install(monkeypatch, *, gql=None, rest=None, pr_list=None, ci_runs=None, ls_remote=None,
+            rest_prs=None, gh_token="test-token"):
     """Patch the ONE seam every read goes through, and dispatch on the command.
 
     `pr_list` may be a SEQUENCE of `_Result`s: one QUEUE response per read, the last one
@@ -82,9 +83,25 @@ def install(monkeypatch, *, gql=None, rest=None, pr_list=None, ci_runs=None, ls_
     than once). Returns the list the re-sample backoff appends to -- `objective._sleep` is
     patched to RECORD rather than wait, so the retry's budget is asserted instead of slept
     through (CI bounds every test at 60 s).
+
+    ⛔ THE REST SECOND SOURCE IS STUBBED TOO, AND IT DEFAULTS TO FAILING (#2138). Without this
+    seam every test whose `pr_list` refuses would reach the REAL `~/.config/gh/hosts.yml` and the
+    REAL api.github.com -- measured while landing the fix: five tests read a live 16-PR queue
+    instead of the fixture. `rest_prs` supplies the raw REST body (a list, or any non-list value
+    to exercise the "not a queue" branch); the default `None` means "no second source", which
+    is the pre-#2138 behaviour every older test asserts.
     """
     queue_reads = {"n": 0}
     sleeps = []
+
+    def fake_rest_get(url, token, timeout=None):
+        if rest_prs is None:
+            raise OSError("fixture: no second source")
+        # A payload shorter than one page ENDS the paging loop, so it is returned once.
+        if isinstance(rest_prs, list) and len(rest_prs) >= objective.QUEUE_REST_PAGE \
+                and "page=1" not in url:
+            return []
+        return rest_prs
 
     def fake_run(cmd, **kw):
         s = " ".join(cmd)
@@ -117,6 +134,8 @@ def install(monkeypatch, *, gql=None, rest=None, pr_list=None, ci_runs=None, ls_
         return _Result(0, "{}")
     monkeypatch.setattr(objective.subprocess, "run", fake_run)
     monkeypatch.setattr(objective, "_sleep", sleeps.append)
+    monkeypatch.setattr(objective, "_rest_get", fake_rest_get)
+    monkeypatch.setattr(objective, "_gh_token", lambda: gh_token or "")
     return sleeps
 
 
@@ -1031,3 +1050,196 @@ def test_the_dispatcher_verdict_SURVIVES_a_blind_queue(monkeypatch, tmp_path):
     # The partition is NOT rendered (that is the blind case), and the verdict is STILL there.
     assert "| QUEUE(state):" not in line, line
     assert "PR-DOCTOR(last run): RED rc=2" in line, line
+
+
+# --- #2138: THE QUEUE READ HAS A SECOND SOURCE (REST) -------------------------------------
+# MEASURED 2026-10-19: `gh pr list --json` (GraphQL) returned "API rate limit already exceeded
+# for user ID 81560491" while `core 1599/5000` / `graphql 4612/5000` were nearly untouched and a
+# single REST call answered in 0.43 s with 17 concurrent gh clients. The beat printed
+# `gh=RATE-LIMITED(queue) queue=UNREADABLE` for whole cycles: the instrument could not report the
+# ONE number its verdict is about. REST is a DIFFERENT bucket, so it is a second SOURCE.
+#
+# Both directions are pinned here, because each half is a way to be wrong:
+#   * a recovered read must not still report blindness (that is the fix being inert), and
+#   * a refused read must still report it (that is the honesty invariant the fix could destroy).
+REST_REFUSED = _Result(1, "", "GraphQL: API rate limit already exceeded for user ID 81560491")
+
+
+def _rest_row(n, state="", draft=False):
+    """One RAW REST pull object -- the shape the list endpoint actually returns."""
+    return {"number": n, "draft": draft, "mergeable": True if state else None,
+            "mergeable_state": state, "head": {"sha": f"{n:040d}", "ref": f"lane-{n}"}}
+
+
+def _rest_queue(monkeypatch, *, n=3, state=""):
+    """A refused GraphQL queue read, then a REST list of `n` rows."""
+    return install(monkeypatch, pr_list=REST_REFUSED,
+                   rest_prs=[_rest_row(i, state) for i in range(1, n + 1)])
+
+
+def test_graphql_refusal_recovers_the_queue_over_rest(monkeypatch):
+    """(a) THE BEHAVIOUR THE BOXES ALREADY RUN. GraphQL refused + REST healthy.
+
+    The line must carry the REAL queue, and it must NOT carry the tokens that say the fleet
+    cannot see: `queue=UNREADABLE`, `gh=`, or the RATE-LIMITED verdict. The last two matter
+    because a recovered read that leaves the blindness flag set still prints `gh=RATE-LIMITED`
+    and still rewrites the verdict -- the fallback would have worked and the line would still
+    say the fleet is blind (the failure mode of a first cut that forgets to withdraw the claim).
+    """
+    sleeps = _rest_queue(monkeypatch, n=3, state="blocked")
+    line = objective.build()
+    assert "queue=UNREADABLE" not in line, line
+    assert "open=3" in line and "nondraft=3" in line and "waiting=3" in line, line
+    assert "gh=" not in line, line
+    assert "GH-RATE-LIMITED" not in line, line
+    assert "queue_read=REST(samples=1)" in line, line   # provenance, not silence
+    assert objective.GH_BLOCKED is None, objective.GH_BLOCKED
+    assert sleeps == [], sleeps                        # one sample: REST is never re-sampled
+
+
+def test_a_double_refusal_still_reports_rate_limited_and_unreadable(monkeypatch):
+    """(b) THE HONESTY INVARIANT MUST SURVIVE THE FIX.
+
+    If REST fails too, nothing has been read: `queue=UNREADABLE` and `gh=RATE-LIMITED(queue)`
+    must appear unchanged, and the verdict must still be the rate-limit one (which outranks the
+    queue). Main was readable throughout, so it keeps saying so.
+    """
+    install(monkeypatch, pr_list=REST_REFUSED, rest_prs=None)   # no second source
+    line = objective.build()
+    assert "queue=UNREADABLE" in line, line
+    assert "gh=RATE-LIMITED(queue)" in line, line
+    assert "VERDICT=GH-RATE-LIMITED" in line, line
+    assert "main=GREEN" in line, line
+    assert "queue_read=" not in line, line
+
+
+def test_a_rest_payload_is_never_an_empty_queue(monkeypatch):
+    """(c) 14 RECOVERED PRs ARE 14 PRs -- and a body that is not a list is a FAILED read.
+
+    A REST payload is the queue, not a fallback to "empty". Both ways of getting this wrong are
+    checked: a payload of rows must keep its depth (so a recovered pass cannot read AT-TARGET),
+    and an unreadable body must take the honest failure path rather than answer `waiting=0`,
+    which is the false all-clear this instrument exists to refuse.
+    """
+    _rest_queue(monkeypatch, n=14)
+    line = objective.build()
+    assert "open=14" in line and "nondraft=14" in line and "waiting=14" in line, line
+    assert "queue=UNREADABLE" not in line, line
+    assert "VERDICT=AT-TARGET" not in line, line        # 14 > TARGET_PRS, and 14 is REAL
+
+    # An ERROR/non-list body is not "0 open PRs": it is an unread pass.
+    install(monkeypatch, pr_list=REST_REFUSED, rest_prs={"message": "Bad credentials"})
+    line = objective.build()
+    assert "queue=UNREADABLE" in line, line
+    assert "waiting=0" not in line and "nondraft=0" not in line, line
+    assert "VERDICT=AT-TARGET" not in line, line
+
+
+def test_a_rest_sample_with_an_EMPTY_merge_state_is_not_BLIND(monkeypatch):
+    """(d) THE KNOWN GAP: REST cannot compute the lazy merge state, so it must not be BLIND.
+
+    `mergeable_state` is frequently "" while GitHub computes mergeability. Read naively that is
+    "unread", and `_queue_read_is_blind()` would print `queue_read=BLIND(N/N unread)` on a sample
+    that WAS read -- the fallback manufacturing blindness. The decided behaviour: unknown-but-
+    COUNTED, provenance named, class counts explicitly not a clearance, queue depth trustworthy.
+    """
+    sleeps = _rest_queue(monkeypatch, n=6)              # mergeable_state = "" on every row
+    q = objective.queue()
+    line = objective.build()
+    assert "queue_read=BLIND" not in line, line
+    assert "queue_read=REST(merge_state unread 6/6, samples=1)" in line, line
+    assert "CLASS counts are NOT a clearance" in line, line
+    assert "mergeable_state_unknown=6" in line, line    # ...the unread count is not swallowed
+    assert "waiting=6" in line and "nondraft=6" in line, line
+    assert sleeps == [], sleeps         # re-reading REST cannot settle a field REST never computes
+    # An unread value must never render as a zero -- not even when the read itself is accepted.
+    assert q["dirty"] is None and q["unstable"] is None, q
+
+
+def test_a_REST_sample_with_a_COMPUTED_merge_state_says_only_that_it_came_over_REST(monkeypatch):
+    """THE OTHER DIRECTION: when REST DID return the state, nothing is claimed unread.
+
+    Without this, the provenance sentence would be a permanent apology on every fallback pass --
+    and a caveat that is always present is not a signal, it is noise a reader learns to skip.
+    """
+    _rest_queue(monkeypatch, n=2, state="dirty")
+    line = objective.build()
+    assert "queue_read=REST(samples=1)" in line, line
+    assert "mergeable_state_unknown" not in line, line
+    assert "NOT a clearance" not in line, line
+    assert "resolve-conflict=2" in line, line           # REST's DIRTY is read as DIRTY
+
+
+def test_the_rest_payload_is_mapped_to_the_gh_pr_list_shape(monkeypatch):
+    """`_rest_pr()` IS THE CONTRACT: the JSON keys the rest of this file already consumes.
+
+    ⛔ `files: []` MEANS UNKNOWN, NEVER "EMPTY DIFF" -- REST's list endpoint carries no file
+    list, so `touches_surface()` answers False for the pass. That is a stated residual (#2138),
+    and pinning `[]` here is what keeps a future `/pulls/<n>/files` fill-in a deliberate change
+    rather than a silent reinterpretation of an empty list.
+    """
+    monkeypatch.setattr(objective, "_gh_token", lambda: "t")
+    monkeypatch.setattr(objective, "_rest_get", lambda url, token, timeout=None: [
+        {"number": 7, "draft": True, "mergeable": False, "mergeable_state": "",
+         "head": {"sha": "abc123", "ref": "lane-7"}, "files": [{"path": "x"}]},
+        {"number": 8, "draft": False, "mergeable": True, "mergeable_state": "clean",
+         "head": {"sha": "def456", "ref": "lane-8"}}])
+    prs = objective._queue_rest()
+    assert prs == [
+        {"number": 7, "isDraft": True, "mergeable": "CONFLICTING",
+         "mergeStateStatus": None, "headRefOid": "abc123", "files": []},
+        {"number": 8, "isDraft": False, "mergeable": "MERGEABLE",
+         "mergeStateStatus": "CLEAN", "headRefOid": "def456", "files": []}], prs
+
+
+def test_the_token_comes_from_ghs_own_config_and_absence_fails_closed(tmp_path, monkeypatch):
+    """The token is gh's, read from gh's file; no token is a FAILED fallback, not a request.
+
+    Never logged is asserted by construction (the value only reaches an Authorization header),
+    and the no-token path is pinned to make NO network call at all -- an unauthenticated read
+    would be a different (lower-rate) source, silently changing what the fallback means.
+    """
+    hosts = tmp_path / "hosts.yml"
+    hosts.write_text("gitlab.example:\n    oauth_token: glpat_other\n"
+                     "github.com:\n    oauth_token: gho_github\n    user: someone\n")
+    monkeypatch.setattr(objective, "GH_HOSTS", str(hosts))
+    assert objective._gh_token() == "gho_github"        # github.com wins over another host
+
+    called = []
+    monkeypatch.setattr(objective, "_rest_get", lambda *a, **k: called.append(a))
+    monkeypatch.setattr(objective, "GH_HOSTS", str(tmp_path / "absent.yml"))
+    assert objective._gh_token() == ""
+    assert objective._queue_rest() is None
+    assert called == [], called                         # no token => no request, no invented queue
+
+
+def test_a_deep_rest_queue_is_PAGED_and_never_truncated(monkeypatch):
+    """One page is 100 rows, so a deeper queue must be read page by page.
+
+    A silently truncated queue is an UNDER-COUNT published as the depth -- the same class of
+    wrong answer as a false zero, one page up. A short page ends the read; a failed page
+    discards the whole read (a partial list is an under-count presented as a measurement).
+    """
+    monkeypatch.setattr(objective, "_gh_token", lambda: "t")
+    # ⛔ `&page=1`, NOT `page=1`: the URL also carries `per_page=100`, and
+    # "page=1" is a SUBSTRING of "per_page=100" -- a fixture keyed on it matches every page.
+    pages = {"&page=1": [{"number": i, "draft": False, "mergeable": True,
+                         "mergeable_state": "clean", "head": {"sha": "x"}}
+                        for i in range(1, 101)],
+             "&page=2": [{"number": i, "draft": False, "mergeable": True,
+                         "mergeable_state": "clean", "head": {"sha": "x"}}
+                        for i in range(101, 106)]}
+
+    def fake_get(url, token, timeout=None):
+        return next((v for k, v in pages.items() if k in url), [])
+
+    monkeypatch.setattr(objective, "_rest_get", fake_get)
+    assert len(objective._queue_rest()) == 105
+
+    def fail_second_page(url, token, timeout=None):
+        if "&page=2" in url:
+            raise OSError("connection reset")
+        return pages["&page=1"]
+
+    monkeypatch.setattr(objective, "_rest_get", fail_second_page)
+    assert objective._queue_rest() is None              # never a partial queue
