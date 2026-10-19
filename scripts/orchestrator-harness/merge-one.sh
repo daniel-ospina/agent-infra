@@ -58,6 +58,74 @@ export PI_MCP_SERVERS=none   # headless reviewer uses no MCP servers — saves ~
 export PI_SKIP_VERSION_CHECK=1 SKILL_ENFORCER_DISABLED=1 LOOP_ENFORCER_DISABLED=1 SLACK_BRIDGE_DISABLE=1 VISION_INTERCEPTOR_DISABLED=1
 cd "$REPO" || exit 1
 
+# ── ONE LANDER AT A TIME (agent-infra#1910) ──────────────────────────────────
+# Measured 2026-10-18: 4 rail-when-green landers + 2 merge loops + 13 concurrent gh clients landed
+# in the same seconds and the account was refused with `API rate limit already exceeded for user
+# ID 81560491` while `gh api rate_limit` still reported 4690/5000 points of headroom. That refusal
+# is GitHub's SECONDARY (concurrency) limit, so the answer is not to spend less — it is to STOP
+# ARRIVING TOGETHER.
+#
+# ⛔ WHY A LEASE AND NOT THE PER-CALL LOCK. gh-limit.py's lock serialises REQUESTS; it does not
+# serialise LANDERS. Six loops each grabbed and released it hundreds of times, so no loop made
+# progress and every one of them sat inside GitHub's burst window. This lease is held for a whole
+# landing: one lander per box, staggered starts, and a LIVENESS-CHECKED holder.
+#
+# ⛔ THE ANCHOR IS THIS PROCESS (`--pid $$`), NOT THE ONE-SHOT CLI. `gh-gate.py lease acquire`
+# exits the moment it has written the lease; anchored on itself the record would look dead to the
+# next lander and serialisation would silently switch itself off (reproduced in the suite).
+# Anchoring on $$ means a SIGKILLed lander's lease is broken by the next one instead of parking
+# the box, which is the failure the per-PR claim already had to fix (#1715).
+GH_GATE_PY="$O/gh-gate.py"
+if [ ! -f "$GH_GATE_PY" ]; then
+  GH_GATE_PY="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/gh-gate.py"
+fi
+LANDER_TOKEN=""
+lander_release() {
+  [ -n "${LANDER_TOKEN:-}" ] || return 0
+  python3 "$GH_GATE_PY" lease release --token "$LANDER_TOKEN" >/dev/null 2>&1 || true
+  LANDER_TOKEN=""
+}
+lander_lease() {  # <why>: take the box's lander lease, or DEFER this head (never fail it)
+  if [ ! -f "$GH_GATE_PY" ]; then
+    echo "[merge $PR] ⚠️ $GH_GATE_PY is missing — landing UNSERIALISED (this is a courtesy gate; it must never stall a merge)" >> "$L.log"
+    return 0
+  fi
+  local out _lw="${LANDER_LEASE_WAIT_S:-}"
+  # ⛔ `_lw` IS COMPUTED ONLY FROM AN `is_limit`-CLEAN VALUE, AND THAT IS A LOCAL GUARANTEE — not a
+  # consequence of where the REVIEW_TIMEOUT validator happens to sit. (It sits ABOVE both call
+  # sites today, so a `30m` value never actually reached this arithmetic; claiming otherwise put a
+  # false provenance story in a comment about ordering, which is the kind of claim a future reader
+  # trusts while moving a call site. State the guarantee, not the journey.) `is_limit` is `is_num`
+  # plus a 9-digit bound, and `is_num` rejects leading zeros — so `$(( ))` cannot abort here.
+  if [ -z "$_lw" ]; then
+    local _rw="${REVIEW_TIMEOUT:-1800}"
+    if is_limit "$_rw"; then
+      _lw=$(( _rw + 60 ))
+    else
+      echo "[merge $PR] REVIEW_TIMEOUT='${_rw}' is not an integer in range — using 1800 for the lander-lease wait" >> "$L.log"
+      _lw=1860
+    fi
+  fi
+  # The wait is bounded: a lander waits at most as long as one whole pass could take, then DEFERS —
+  # a deferred head is re-armed next cycle, so waiting past that would only starve the sweep.
+  out="$(python3 "$GH_GATE_PY" lease acquire --name "merge-$PR" --pid $$ \
+           --stagger "${LANDER_STAGGER_S:-0.8}" --wait "$_lw" 2>&1)"
+  case "$out" in
+    ACQUIRED*)
+      LANDER_TOKEN="$(printf '%s\n' "$out" | sed -n 's/.*token=\([^ ]*\).*/\1/p')"
+      echo "[merge $PR] lander lease: $out (${1:-landing})" >> "$L.log"
+      return 0 ;;
+    BUSY*)
+      # NOT a failure and NOT a park: the head is untouched, so a later cycle re-arms it.
+      echo "[merge $PR] DEFERRED at head=${HEAD:-?}: another lander holds this box's gh lease ($out) — the account's concurrency cap is a SHARED fleet resource (#1910); this head is retried next cycle, no try consumed" >> "$L.log"
+      exit 0 ;;
+    *)
+      # Fail OPEN and LOUD: the gate's own machinery must never become a fleet stall.
+      echo "[merge $PR] ⚠️ lander lease UNREADABLE ($out) — landing UNSERIALISED" >> "$L.log"
+      return 0 ;;
+  esac
+}
+
 # ── the per-repo merge contract (agent-infra#1764) ─────────────────────────────
 # The SAME home orch-loop.sh uses, so the two cannot disagree about what this repo requires or
 # which merge authority it has. REQ in the environment is an operator override; capture it ONCE
@@ -233,13 +301,60 @@ fi
 # did `rm -f "$CLAIM"` first and then an UNTIMED `claim_release` push — a black-holed connection hung
 # the exit path for minutes with the local pid lock already gone, so the controller could spawn a
 # second worker for the same PR. Release first, drop the lock last.
-trap 'release_claim_bounded; rm -f "$CLAIM"' EXIT
+# #1910: the lander lease is released FIRST — it is the scarce resource, and the cross-box claim
+# release below is a git push that can hang for up to 20s; holding the box's gh token through that
+# would idle every other lander for no reason.
+trap 'lander_release; release_claim_bounded; rm -f "$CLAIM"' EXIT
+
+# ── THE PUBLISHED READ VERDICT (#1910) — the SHARED read this worker consumes ────────────────
+# The controller performs ONE real read per cycle and publishes it; this reads that snapshot instead
+# of paying for the same API call, and it is the difference between the fleet's read state being an
+# annotation and being USED. A bursted/budget-limited account refuses this worker's OWN reads too,
+# so the review below would be PAID FOR AND UNUSABLE — the honest move is to defer the head (it is
+# untouched: no marker written, no head-keyed try consumed) and retry next cycle.
+#
+# ⛔ THE PREDICATE LIVES IN gh-gate.py, NOT IN A `case` HERE, for two reasons the review found:
+#   * THE TRANSPORT DECIDES (round 2, P1). REST and GraphQL are SEPARATE pools, and #1959 is the
+#     measured incident where GraphQL was refused for minutes while REST answered normally — which
+#     is why the gh-rest adapter exists. An inline check on the one GraphQL verdict deferred EVERY
+#     landing on such a box, for the whole outage, on a path that was working. `lander-check
+#     --transport <the path THIS box's landers read on>` asks the pool that actually matters.
+#   * IT CAN BE TESTED WITHOUT DRIVING THIS SCRIPT. This is the only code in the change that can
+#     stop every landing on a box, and a bash `case` over a token shape regresses silently (rename
+#     a verdict in one place, invert the freshness guard, make the fallback return 0). The suite
+#     exercises every arm (§4(f)).
+#
+# ⛔ STALE AND UNKNOWN ARE NEVER A DEFERRAL: an old reading is not evidence about now, and a box
+# without the gate must not stall. Only POSITIVE, FRESH evidence that THIS path is refused defers.
+lander_read_blocked() {
+  [ -f "$GH_GATE_PY" ] || return 1
+  local out _t=graphql
+  # The adapter serves every `pr`/`issue` read over REST when it is installed; without it those
+  # reads are GraphQL. That is the path this worker's own calls take, so that is the pool to ask.
+  [ -d "$O/gh-rest" ] && _t=rest
+  out="$(python3 "$GH_GATE_PY" lander-check --transport "$_t" 2>/dev/null)" || return 1
+  case "$out" in
+    DEFER*)
+      echo "[merge $PR] DEFERRED at head=${HEAD:-?}: gh on this box's read path is refused ($out) — this worker's own reads would fail, so a review here would be paid for and unusable (#1910). Retried next cycle; nothing is marked, no try consumed" >> "$L.log"
+      return 0 ;;
+  esac
+  return 1
+}
 
 # ── the repo's merge authority (agent-infra#1764) ─────────────────────────────
 # Resolved HERE, from branch protection, not assumed. On a repo that requires the review gate the
 # chain below is exactly what it always was (wait for the gate, then squash). On a repo that does
 # NOT require it, `gh pr merge` would land the PR on the required checks alone with no head-bound
 # evidence — the bypass agent-infra's AGENTS.md forbids — so the repo's OWN rail is the authority.
+# ⛔ THE READ-VERDICT CHECK COMES FIRST — above the branch-protection read below, because that read
+# IS an API-read-dependent step. It used to sit after it, so on a bursted account the fix-one /
+# chain-merge ingress (the two that are not handed a frozen contract) died at the authority guard
+# with "branch protection was UNREADABLE" — one line before the deferral could run — and blamed the
+# repo's authority for the ACCOUNT's concurrency cap, which is exactly the misdiagnosis the
+# four-verdict vocabulary exists to prevent. It needs nothing but the state dir and the published
+# snapshot, so nothing here depends on the read below. A deferral writes no terminal marker.
+lander_read_blocked && exit 0
+
 # ⛔ resolve_required_checks, NOT a command substitution around it: `REQ="$(resolve_required_checks …)"`
 # subshells the resolver and REQ_SOURCE cannot survive it (the log line below would print source=?).
 resolve_required_checks "$OR"
@@ -342,6 +457,10 @@ if [ "$MERGE_AUTHORITY" = "rail" ]; then
     echo "${HEAD:-}" > "$O/state/parked-$PR"
     exit 0
   fi
+  # ⛔ THE LEASE IS TAKEN BEFORE THE TRY IS COUNTED. A deferral is not a refusal: counting it
+  # would burn the head-keyed RAIL_TRIES budget for a head the rail never saw, and PARK a PR that
+  # nothing refused.
+  lander_lease "rail"
   RC_N=$((RC_N + 1)); printf '%s %s\n' "${HEAD:-}" "$RC_N" > "$RC_F"
   if ( cd "$REPO" && bash "$RAIL" "$PR" --repo "$OR" -- --squash ) >> "$L.log" 2>&1; then
     echo "[merge $PR] MERGED via the rail (attempt $RC_N) $(date)" >> "$L.log"
@@ -349,6 +468,7 @@ if [ "$MERGE_AUTHORITY" = "rail" ]; then
   else
     echo "[merge $PR] rail refused (attempt $RC_N/$RAIL_TRIES) at head=${HEAD:-?} — the sweep retries this head until the cap, then PARK" >> "$L.log"
   fi
+  lander_release
   exit 0
 fi
 
@@ -617,12 +737,16 @@ for c in rows:
     # stranded, which is why THAT is parked.
     if [ "$gate" != "SUCCESS" ]; then echo "[merge $PR] ABORT: gate=$gate (not green)" >> "$L.log"; exit 4; fi
     # ── 4) merge ──
+    # #1910: the SQUASH is the landing, so the lander lease covers exactly it — the review and the
+    # green-wait above stay concurrent on purpose (MAX_REVIEW is a capacity decision, not this).
+    lander_lease "gate"
     if gh pr merge "$PR" --repo "$OR" --squash >> "$L.log" 2>&1; then
       echo "[merge $PR] MERGED $(date)" >> "$L.log"
       touch "$O/state/merged-$PR.done"
     else
       echo "[merge $PR] merge command failed" >> "$L.log"
     fi
+    lander_release
     ;;
   *)
     # The reviewer found real issues (or the reviewer failed) at this exact head. Leave a

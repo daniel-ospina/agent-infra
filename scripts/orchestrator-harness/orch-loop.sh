@@ -522,6 +522,47 @@ gh_limit_token() {  # -> "gh=rate_limited(…)" | "gh=recovered(…)" | EMPTY
   fi
   printf 'gh=rate_limited(bucket=%s reset=%s %ss)' "${bucket:-?}" "$reset" "$age"
 }
+# ── the account's READ state as a REAL read attempt (agent-infra#1910) ──────────────────
+# ⛔ A COUNTER IS NOT EVIDENCE, AND THIS LINE USED TO PRINT ONE. Measured 2026-10-18:
+#
+#       gh api rate_limit  -> graphql 4690/5000 remaining, core 812/5000   ("plenty left")
+#       a REAL read        -> "API rate limit already exceeded for user ID 81560491"
+#       at that moment: 13 concurrent gh clients, 54 pi lanes, 4 rail-when-green landers,
+#                       2 merge loops, all reading the same endpoint within the same seconds
+#
+# `GET /rate_limit` is EXEMPT from the primary limit and cannot see the SECONDARY (concurrency)
+# one, so it answers "healthy" on a box whose every real call is refused. That is the same
+# false-green shape as an empty backlog over an orphaned claim, and the `[res] gh_gql=` field
+# (res_line, advisory) has exactly that shape.
+#
+# `gh-gate.py cycle` performs ONE REAL read, publishes it as the shared snapshot, and prints it
+# WITH ITS AGE. Because the answer is published, a lane that needs it reads the snapshot instead of
+# paying for another API call — and because the age is part of the token, a frozen snapshot cannot
+# pass as a current one (`STALE(...)` either way; `UNKNOWN(...)` when no pass has ever measured).
+#
+# THE VOCABULARY IS THE WHOLE POINT — a burstiness refusal must never read as an empty queue:
+#   FRESH(SECONDARY-LIMITED, 40s)  refused while the counter showed headroom: STOP ARRIVING
+#                                  TOGETHER (pause, serialise). Not a budget problem, not a
+#                                  broken PR, not "nothing to do".
+#   FRESH(BUDGET-EXHAUSTED, 3m)    the hourly pool is genuinely spent; wait for the reset.
+#   FRESH(UNREADABLE, 1m)          NOT a rate limit (auth/network/5xx) — chase the cause, do not
+#                                  defer the box for an hour.
+#   FRESH(OK, 12s)                 a real read succeeded. The only token that says we can read.
+gh_gate_token() {  # -> FRESH(<state>, <age>) | STALE(<state>, <age>) | UNKNOWN(<why>)
+  local py="$O/gh-gate.py" out
+  if [ ! -f "$py" ]; then printf 'UNKNOWN(gh-gate absent)'; return 0; fi
+  out="$(python3 "$py" cycle 2>/dev/null)" || true
+  printf '%s' "${out:-UNKNOWN(no verdict)}"
+}
+# The SAME verdict WITHOUT a new API call: lanes and the dispatch line read the PUBLISHED snapshot
+# instead of repeating the read (that is #1910's second half — N readers, one call). A snapshot past
+# its age bound prints STALE, so a cached answer never passes as a current one.
+gh_gate_snapshot() {  # -> FRESH(...) | STALE(...) | UNKNOWN(...)
+  local py="$O/gh-gate.py" out
+  if [ ! -f "$py" ]; then printf 'UNKNOWN(gh-gate absent)'; return 0; fi
+  out="$(python3 "$py" snapshot read 2>/dev/null)" || true
+  printf '%s' "${out:-UNKNOWN(no snapshot)}"
+}
 # Exact session-name test. `tmux has-session -t <name>` prefix-matches, so a guard for PR #82
 # would report "in flight" because `fix-820` exists — starving #82 while that worker lives.
 sess() { tmux ls -F '#{session_name}' 2>/dev/null | grep -qx "$1"; }
@@ -881,7 +922,11 @@ while true; do
   L="$(load1)"
   # Read the gh-limit record ONCE per cycle; the token is age-bounded inside (see gh_limit_token).
   GHL="$(gh_limit_token)"
-  echo "=== $(date) load=$L lanes=$(tmux ls 2>/dev/null | grep -c '^lane-') backlog=$(wc -l < "$O/candidates.txt" | tr -d ' ') queue=$(queue_state_token)${GHL:+ $GHL} ===" >> "$LOG"
+  # …and the READ state once per cycle, from a REAL read (#1910). One API call, published, so the
+  # lanes that need the answer read the snapshot rather than repeating the read — and printed with
+  # its age, so a frozen verdict cannot pass as a fresh one.
+  GHS="$(gh_gate_token)"
+  echo "=== $(date) load=$L lanes=$(tmux ls 2>/dev/null | grep -c '^lane-') backlog=$(wc -l < "$O/candidates.txt" | tr -d ' ') queue=$(queue_state_token) ghs=$GHS${GHL:+ $GHL} ===" >> "$LOG"
 
   # ---- 1) merge sweep (this box's open PRs) -------------------------------
   # scope: when the repo has >10 open PRs, help drain EVERYONE's (broad); otherwise just this box's.
@@ -1644,7 +1689,10 @@ PY
     # pool at all — that is how a blind box idled all evening looking healthy. The state travels with
     # it, in the refresh's own vocabulary: `queue=EMPTY` is the only form that means "no work";
     # `queue=UNREADABLE`/`PARTIAL(..)` means "the last pool read did not establish an empty pool".
-    else echo "[dispatch] backlog empty queue=$(queue_state_token)" >> "$LOG"; fi
+    # #1910: an empty backlog is only an ANSWER if the fleet could read. Print the read verdict and
+    # its age BESIDE it, so `queue=EMPTY` over a bursted account is visible as such instead of
+    # reading as "nothing to do".
+    else echo "[dispatch] backlog empty queue=$(queue_state_token) ghs=$(gh_gate_snapshot)" >> "$LOG"; fi
   else
     echo "[dispatch] skipped ($GATE_WHY) lanes=$LANES workers=$WORKERS" >> "$LOG"
   fi

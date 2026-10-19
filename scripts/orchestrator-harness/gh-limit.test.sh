@@ -802,6 +802,16 @@ has 'seed_one "$HARNESS/gh-limit/gh"' "$(cat "$_sup")" && has 'seed_one "$HARNES
   || _miss="$_miss supervisor:seed"
 has 'removed the stale gh-limit layer' "$(cat "$_sup")" && has 'removed the stale gh-limit layer' "$(cat "$_dep")" \
   || _miss="$_miss stale-layer-removal"
+# #1910 — the gh GATE is resolved from $O by name by BOTH merge-one.sh (the lease) and orch-loop.sh
+# (the cycle verdict), so the same three entry points must seed it, and a stale copy must be mirrored
+# away. Left out of this population, a deploy path could silently drop it while every check stayed green
+# (measured: deploy-crossbox.sh had none).
+grep -q 'seed-gh-gate.py' "$_inst" && grep -q 'mv -f "\$_gtmp" "\$O/gh-gate.py"' "$_inst" \
+  || _miss="$_miss install.sh:gh-gate.py"
+has '_seed_one "$H/gh-gate.py"' "$(cat "$_dep")" || _miss="$_miss deploy-crossbox.sh:gh-gate.py"
+has 'seed_one "$HARNESS/gh-gate.py" "$O/gh-gate.py"' "$(cat "$_sup")" || _miss="$_miss supervisor:gh-gate.py"
+has 'removed the stale gh-gate.py' "$(cat "$_sup")" && has 'removed the stale gh-gate.py' "$(cat "$_dep")" \
+  || _miss="$_miss stale-gh-gate-removal"
 _miss="${_miss# }"
 ck "deploy: both entry points staged+renamed in install.sh/deploy/supervisor, stale layer removed [$_miss]" \
    "$([ -z "$_miss" ] && echo 0 || echo 1)"

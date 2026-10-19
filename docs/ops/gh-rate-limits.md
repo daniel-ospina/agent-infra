@@ -6,7 +6,7 @@ doc_status: live
 subjects.team: organisation-design-team
 created: 2026-08-10
 aboutSubjects: organisation-design-team
-aboutObjects: agent-infra, issue-143, issue-1762, issue-1988, gh-rate-limits, gh-limit
+aboutObjects: agent-infra, issue-143, issue-1762, issue-1910, issue-1988, gh-rate-limits, gh-limit, gh-gate
 ---
 
 # GitHub API rate limits — detection & fallback runbook
@@ -164,6 +164,57 @@ is range-clamped, and `nan`/`inf` fall back to the documented default rather tha
 `GH_LIMIT_NOW_CMD`/`GH_LIMIT_SLEEP_CMD` are the TEST seams for the fake clock — do not set them
 in production.
 
+## The gate above the layer: loops, shared reads, and a REAL-read instrument (#1910)
+
+`gh-limit.py` paces a **call**. It cannot pace a **loop**, and that is the difference that matters:
+measured 2026-10-18, six landers (4 rail-when-green + 2 merge loops) plus 13 concurrent `gh` clients
+each grabbed and released the per-call lock hundreds of times, so no lander finished and all of them
+sat inside GitHub's burst window. `scripts/orchestrator-harness/gh-gate.py` is the second half, and
+it has three verbs:
+
+| Verb | Caller | Guarantee |
+|---|---|---|
+| `lease acquire/release/status` | `merge-one.sh` (rail **and** gate mode) **and the cell doctor's `merge` role** (`cloud-cell-doctor.sh`, which rails directly; ⚠️ its loop currently dies on its first pass — #2135 — so in loop mode it rails nothing today, and the lease makes the invariant hold as soon as that is fixed). ⛔ **NOT covered**: `orch-loop.sh`'s inline `gate`-authority merge arms, and `admin-merge.sh` itself (so `atomic-land.sh` and a hand-run rail) — filed as #2140, because those are live concurrent landers on a gate-authority repo | **ONE lander per box at a time**, held for the LANDING (rail: the whole `admin-merge.sh` run; gate: the squash only, because serialising the paid review would cost `MAX_REVIEW` outright — the gate-mode `gh pr checks` polling is a **stated residual**, bounded by `MAX_REVIEW` and the per-call lock; and a deferred gate-mode head is **re-reviewed** next cycle, because the lease is taken after the paid review — the deferral saves a squash, not a review). Staggered starts. The holder is liveness-checked by pid **and** process start token, so a killed lander's lease — or a **recycled pid** — is broken by the next one (loudly, in `events.log`) instead of parking the box. A lander that cannot get it **defers its head**: no `RAIL_TRIES` consumed, no park |
+| `cycle` | `orch-loop.sh`, once per pass | ONE **real** read, published, then printed **with its age**: `FRESH(SECONDARY-LIMITED, 40s)` |
+| `snapshot read` | the controller's own diagnostics | the PUBLISHED reading and its age, at **zero** API cost. `--require-fresh` refuses a stale one (exit 3); without it a stale reading is still printed and exits 0 — a stale reading IS a reading, just not a current one |
+| `lander-check --transport rest\|graphql` | `merge-one.sh` (`lander_read_blocked`) | the DEFERRAL predicate, and the only thing in this change that can stop a landing. `DEFER(<state>, <age>)` (exit 0) or `PROCEED(<why>)` (exit 1). ⛔ **The TRANSPORT decides**: REST and GraphQL are separate pools, and #1959 is the measured incident where GraphQL was refused for minutes while REST answered normally — so a GraphQL-only refusal must NOT defer a box whose `gh-rest` adapter serves every `pr`/`issue` read over REST. `STALE` and `UNKNOWN` never defer (an old reading is not evidence about now, and a box without the gate must not stall), so the gate can only act on positive, fresh evidence about **the path the lander uses**. Cost: the probe's **primary** read is on the pool the landers themselves use (`$O/gh-rest` present → REST first, else GraphQL), and a refused read is confirmed with **one** read on the other pool — so both verdicts are published (`state=` for GraphQL, `rest=` for REST) and a **healthy pass still costs one call**. A pool not measured this pass is published as `?` (never a guess, and never the other pool's answer: republishing a GraphQL refusal as the REST verdict is exactly the over-deferral the confirmation prevents) |
+
+⛔ **The lease's anchor is the CALLER's process (`--pid $$`), never the one-shot CLI.** `lease
+acquire` exits the instant it has written the record; anchored on itself the record would look dead
+to the very next lander and serialisation would silently switch itself off. The suite reproduces
+that (`scripts/orchestrator-harness/gh-gate.test.sh` §5).
+
+### ⛔ The instrument rule: a counter is NOT evidence that the fleet can read
+
+`GET /rate_limit` is **exempt from the primary limit** and **cannot see the secondary one**. Measured
+2026-10-18, with the fleet unable to read anything:
+
+```text
+gh api rate_limit      -> graphql 4690/5000 remaining, core 812/5000 remaining     ("healthy")
+a single gh api user   -> succeeded in 1 s
+the fleet's reads      -> "API rate limit already exceeded for user ID 81560491"
+```
+
+So `x/5000` remaining is a **false green**, and `graphql.remaining` is not a reliable read of the
+primary limit either (see the measured pair above the fallback section). The probe must therefore be
+a **real read attempt**, and its failure must be named — in FOUR terms, because collapsing them
+misdiagnoses the box:
+
+| Verdict | Evidence | What it means | What NOT to do |
+|---|---|---|---|
+| `OK` | the read returned | the fleet can read | — |
+| `SECONDARY-LIMITED` | GitHub's secondary wording (`API rate limit already exceeded for user ID …`), **or** a refusal that arrived while `x-ratelimit-remaining` was still `> 0` | **burstiness**, not spend | do not close PRs, park work, or add lanes. Serialise and back off |
+| `BUDGET-EXHAUSTED` | `x-ratelimit-remaining: 0`, or the primary wording **without** `already` | the hourly pool is spent | wait for the reset; do not treat it as a broken PR |
+| `UNREADABLE` | anything else (auth, network, 5xx) | **not** a rate limit | do not defer the box for an hour — fix the token/network |
+
+The refusal polarity is unchanged: a failed read is never an empty backlog, and `UNKNOWN`/`STALE` is
+never `EMPTY`. `gh-gate.py probe` deliberately **never calls `/rate_limit`** (asserted in the suite
+§2), because a probe that asks the exempt endpoint is the false green itself.
+
+Where it shows up: `orch-loop.sh`'s cycle line now carries `queue=<pool read> ghs=<read verdict and
+age> gh=<bucket/reset from gh-limit>`, and the `[dispatch] backlog empty` line carries `ghs=` beside
+it. The older `[res] gh_gql=` field remains a `/rate_limit` counter and is **advisory only**.
+
 ## Two limits, different behavior
 
 | Limit | Scope | Symptom |
@@ -174,8 +225,17 @@ in production.
 ## Detect
 
 ```bash
+# ⛔ NOT THIS, as a health probe: it is exempt from the primary limit and blind to the secondary one.
 gh api rate_limit --jq '.resources | {core: .core, graphql: .graphql}'
+
+# THE REAL READ, named (#1910). One call, no retry, no sleep:
+O="${O:-$HOME/orchestrator}"; python3 "$O/gh-gate.py" probe        # GH-PROBE: <VERDICT> …
+# … or read what the last pass published, at zero API cost (and its AGE, so stale is visible):
+python3 "$O/gh-gate.py" snapshot read                             # FRESH(OK, 40s) / STALE(…) / UNKNOWN(…)
 ```
+
+`probe` exits `0` (`OK`), `10` (`SECONDARY-LIMITED`), `11` (`BUDGET-EXHAUSTED`) or `12`
+(`UNREADABLE`), so a caller can branch without parsing prose.
 
 - `graphql.remaining: 0` → GraphQL pool exhausted; REST (`core`) is usually still fine.
 - ⛔ **This counter LIES about its own headroom.** Measured 2026-10-17: `gh api rate_limit` reported

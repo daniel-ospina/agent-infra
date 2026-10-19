@@ -715,6 +715,82 @@ turn "no load back-pressure" into a permanent controller outage. `install.sh` st
 off macOS (it renders a launchd plist) — the portability that matters is `orch-loop.sh`, the file
 `cloud-cell-supervisor.sh` starts.
 
+#### ⛔ 4.1 The binding ceiling is neither CPU, RAM nor disk — it is the ACCOUNT's concurrency cap
+
+Every limit in the table above is a *local* budget. The scarce resource is not local at all: every
+box, lane, lander and worker acts as **ONE GitHub account**, and GitHub's **secondary (concurrency)
+limit** is shared across all of them, across REST *and* GraphQL (agent-infra#1910). Measured
+2026-10-18, at the moment the fleet stopped reading:
+
+```text
+gh api rate_limit   ->  graphql 4690/5000 remaining   core 812/5000 remaining      ("plenty left")
+a single `gh api user` -> succeeded in 1 s
+the fleet's parallel reads -> "API rate limit already exceeded for user ID 81560491"
+that moment: 13 concurrent gh clients, 54 pi lanes, 4 rail-when-green landers, 2 merge loops
+```
+
+So **adding lanes makes this worse, not better** — each extra lane adds reads to a bucket that is
+already refusing the burst. This is the one resource where "use the capacity" is the wrong move, and
+it means the parallelism ceiling has to be honoured even when load, swap, memory and disk are all
+comfortable. Three mechanisms hold it:
+
+| Mechanism | Where | What it does |
+|---|---|---|
+| per-call pacing | `gh-limit.py` (#1988) | ONE `gh` call in flight per box (including the `/rate_limit` probe), `retry-after` → bucket reset → **≥60 s doubling**, then a loud failure naming the bucket |
+| **the lander lease** | `gh-gate.py lease`, taken by `merge-one.sh` | **ONE LANDER at a time per box.** A lease held for the LANDING, not for a call: in **rail** mode it spans the whole `admin-merge.sh` run; in **gate** mode it spans the squash (`gh pr merge`) only — the fresh review and the green-wait stay concurrent, because serialising a paid review would cost `MAX_REVIEW` outright (the gate-mode `gh pr checks` polling is therefore a **stated residual**: bounded by `MAX_REVIEW` and by the per-call lock, not something this lease claims to cover; and because the gate-mode lease is taken **after** the paid review, a head that DEFERS re-pays that review on the next cycle — the deferral saves a squash, not a review, and no attempt or park is written. Serialising the review itself would cost `MAX_REVIEW` outright; skipping a re-review would need the marker check to become an entry condition on the review path, which is a separate change). Staggered starts, and a **liveness-checked holder** — pid *and* process start token, so a recycled pid is not mistaken for a live lander. A lander that cannot get the lease **DEFERS** its head (no try consumed, no park) and is retried next cycle |
+| **the shared read** | `gh-gate.py cycle` / `snapshot read` | The controller performs **ONE real read per cycle** and PUBLISHES it; every other reader takes the snapshot instead of paying for the same API call — `merge-one.sh` consumes it before it spends a review or a landing (`lander_read_blocked` → `gh-gate.py lander-check --transport <the path this box reads on>`, which defers the head only when a FRESH verdict says **that** pool is refused — a GraphQL-only refusal must not defer a box whose adapter serves every read over REST, which is the #1959 state the adapter exists for), and the controller's own `backlog empty` line reads it at zero cost. The age is part of the token: `FRESH(…)`, `STALE(…)`, or `UNKNOWN(…)` — a cached read never passes as a current one, and `--require-fresh` refuses a stale one |
+
+**And the instrument rule, which is the reason this section exists.** A command that prints
+`x/5000` remaining is **not** evidence that the fleet can read: `GET /rate_limit` is exempt from the
+primary limit and cannot see the secondary one. The probe is therefore a **real read**, and its
+failure is named in one of four terms, so a burstiness refusal can never be reported as an empty
+backlog or a healthy queue:
+
+| Token | Meaning | What to do |
+|---|---|---|
+| `FRESH(OK, 12s)` | a real read succeeded | the only token that says we can read |
+| `FRESH(SECONDARY-LIMITED, 40s)` | refused **while the counter showed headroom** — burstiness | pause and serialise. **Not** a budget problem, **not** a broken PR, **not** "nothing to do" |
+| `FRESH(BUDGET-EXHAUSTED, 3m)` | the hourly pool is genuinely spent (remaining `0`, or GitHub's primary wording) | wait for the reset |
+| `FRESH(UNREADABLE, 1m)` | it failed for a reason that is **not** a rate limit (auth, network, 5xx) | chase the cause — do **not** defer the box for an hour |
+| `STALE(…)` / `UNKNOWN(…)` | the publication is past its age bound / nobody has measured | treat as no reading; `--require-fresh` refuses it (exit 3) |
+
+The probe reads the pool **the landers themselves use** first (`$O/gh-rest` present → REST, else
+GraphQL — the same test `merge-one.sh` uses to place its adapter), and a refused read is confirmed
+with **one** read on the other pool: the two are independent, and #1959 is the measured incident
+where GraphQL was refused for minutes while REST answered normally. Both verdicts are published
+(`state=` GraphQL, `rest=` REST); a pool not measured this pass is `?`, never a guess and never the
+other pool's answer. A healthy pass still costs exactly one call.
+
+It is printed on every cycle line (`queue=… ghs=… gh=…`), beside `[dispatch] backlog empty`, so
+`queue=EMPTY` over a bursted account is visible as such. The controller's older `[res] gh_gql=` field
+is a `/rate_limit` counter and is **advisory only** — do not read a healthy `gh_gql=` as "the fleet
+can read".
+
+Declared limits of the lease, stated rather than papered over: it is **per box** (boxes cannot see
+each other, exactly like `gh-limit.py`'s lock), and it covers **only the callers that take it**. The
+list below is the whole of it — written out so it can be checked against the code rather than
+believed:
+
+| Landing path | Takes the lease |
+|---|---|
+| `merge-one.sh` **rail** mode (`bash admin-merge.sh <PR>`) | **yes** — spans the rail run |
+| `merge-one.sh` **gate** mode (`gh pr merge --squash`) | **yes** — spans the squash |
+| `cloud-cell-doctor.sh` **`merge` role** (rails directly) | **yes** — spans the rail call |
+| **`orch-loop.sh`'s inline `gate`-authority merge arms** (GREEN squash, and `PENDING:` arming `--auto`) | **no** |
+| **`admin-merge.sh` itself** — and so `atomic-land.sh` and any hand-run rail | **no** |
+
+`gh-gate.test.sh` §5c asserts all three claim-**taking** call sites statically, and asserts the lease
+SPANS the landing (`acquire < landing < release`, with no release in between) on each path — because
+a helper nobody calls is a deployed gate nothing describes, and a lease released before the landing
+is the regression a presence check cannot see. The two paths that do **not** take it are a known
+gap, filed as **#2140**: on a gate-authority repo the controller can squash PR A while a
+`merge-one.sh` worker holds the lease on PR B — the exact burst #1910 measured, whose own problem
+statement counts those merge loops among its six landers. ⚠️ **#2135**: the cell doctor's LOOP
+currently dies on its first pass (`local dry="$1"` under `set -u`, pre-existing), so in loop mode
+that role rails nothing today and the lease is there so the invariant holds the moment it runs.
+A holder past `GH_GATE_LEASE_MAX_S` (1800 s) is broken **loudly** so one slow lander cannot park the
+box.
+
 ---
 
 ## 5. Merge policy and safety invariants

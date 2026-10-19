@@ -998,14 +998,16 @@ seed_and_stamp() {
   # adapter uses — same bytes, same backoff, so it cannot drift between the box with the REST
   # adapter and the boxes without it. Seeded with the SAME stage-then-rename as the *.sh files: a
   # running lane's `gh` may be executed at any moment, and a truncated shim would be a broken `gh`.
+  # stage-then-rename for one file; shared by every seed below (a plain `cp` truncates its target,
+  # and these files are EXECUTED — a truncated helper is a broken tool, not a stale one).
+  seed_one() {  # <src> <dest>
+    local _src="$1" _dst="$2" _tmp="$O/.seed-$(basename "$2").$$"
+    cp -p "$_src" "$_tmp" || die "cannot stage $(basename "$_dst") into $O — free space ($0 prune)"
+    chmod +x "$_tmp"     || { rm -f "$_tmp"; die "cannot chmod $(basename "$_dst")"; }
+    mv -f "$_tmp" "$_dst" || { rm -f "$_tmp"; die "cannot install $_dst into $O"; }
+  }
   if [ -f "$HARNESS/gh-limit/gh" ] && [ -f "$HARNESS/gh-limit.py" ]; then
     mkdir -p "$O/gh-limit" || die "cannot create $O/gh-limit"
-    seed_one() {  # <src> <dest>
-      local _src="$1" _dst="$2" _tmp="$O/.seed-$(basename "$2").$$"
-      cp -p "$_src" "$_tmp" || die "cannot stage $(basename "$_dst") into $O — free space ($0 prune)"
-      chmod +x "$_tmp"     || { rm -f "$_tmp"; die "cannot chmod $(basename "$_dst")"; }
-      mv -f "$_tmp" "$_dst" || { rm -f "$_tmp"; die "cannot install $_dst into $O"; }
-    }
     seed_one "$HARNESS/gh-limit/gh" "$O/gh-limit/gh"
     seed_one "$HARNESS/gh-limit.py" "$O/gh-limit.py"
   else
@@ -1019,6 +1021,20 @@ seed_and_stamp() {
       say "seed: removed the stale gh-limit layer — the harness no longer ships it"
     fi
     say "WARN: $HARNESS ships no gh-limit layer — this cell's gh calls will NOT be serialised or backed off (#1988)"
+  fi
+  # ── the gh gate (#1910) ────────────────────────────────────────────────────────────────────────
+  # The controller publishes one REAL read verdict per cycle and the landers take a lease before
+  # they merge; both resolve `$O/gh-gate.py` BY NAME, so a cell seeded without it silently loses the
+  # serialisation this file's gh-limit layer exists to complete. Mirrored both ways: a `gh-gate.py`
+  # left by an earlier harness must go too, or the cell runs a helper the harness no longer ships.
+  if [ -f "$HARNESS/gh-gate.py" ]; then
+    seed_one "$HARNESS/gh-gate.py" "$O/gh-gate.py"
+  else
+    if [ -e "$O/gh-gate.py" ]; then
+      rm -f "$O/gh-gate.py" || die "cannot remove the stale gh-gate.py from $O"
+      say "seed: removed the stale gh-gate.py — the harness no longer ships it"
+    fi
+    say "WARN: $HARNESS ships no gh-gate.py — landers on this cell are NOT serialised and the cycle line carries no real-read verdict (#1910)"
   fi
   # ⛔ MIRROR, do not merely overlay. `orch-loop.sh`/`merge-one.sh` invoke workers BY NAME from $O, so a
   # script RENAMED upstream would leave its old copy live in $O and still invocable — the record would
@@ -1202,6 +1218,18 @@ cmd_check() {
       || die "the gh-limit layer at $O/gh-limit cannot run gh — every gh call in the session would fail. Fix the layer or remove it before starting (a cell without it MERGES but is not serialised, #1988)."
   else
     say "WARN: no gh-limit layer in $O — this cell's gh calls are NOT serialised/backed off (#1988); run 'start' to seed it"
+  fi
+  # ── the gh gate (#1910): the LANDER lease and the published real-read verdict ──────────────────
+  # `merge-one.sh` and `orch-loop.sh` resolve `$O/gh-gate.py` BY NAME, so a cell without it loses
+  # both halves while `check` reports healthy. A WARN, not a die: the harness degrades
+  # loudly-but-working (landing UNSERIALISED, `UNKNOWN(gh-gate absent)` on the cycle line), and a
+  # cell that cannot merge at all is strictly worse than one that merges unserialised.
+  if [ -f "$O/gh-gate.py" ]; then
+    python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' "$O/gh-gate.py" 2>/dev/null \
+      || die "the gh gate at $O/gh-gate.py does not parse — every lander would report it UNREADABLE and land UNSERIALISED. Re-seed with '$0 start'."
+    say "ok: gh gate present ($O/gh-gate.py)"
+  else
+    say "WARN: no gh-gate.py in $O — this cell's landers are NOT serialised and the cycle line carries no real-read verdict (#1910); run 'start' to seed it"
   fi
 
   # ── which commit is this cell running? (agent-infra#1745) ────────────────────────────────────

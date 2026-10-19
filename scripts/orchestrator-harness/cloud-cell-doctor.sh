@@ -907,8 +907,40 @@ for p in d:
         skipped=$((skipped + 1)); continue
       fi
     fi
+    # ⛔ THE BOX LEASE (#1910). THIS ROLE EXECUTES THE RAIL DIRECTLY, so it is a lander: without the
+    # lease the cell's doctor and a `merge-one.sh` worker can arrive at the account together on two
+    # different PRs — the exact burst shape #1910 measured ("4 rail-when-green landers + 2 merge
+    # loops"). The per-PR claim above is NOT that guard: it serialises the SAME PR, not the ACCOUNT.
+    # ⛔ TWO GATES, not one (round 7):
+    #   * exit 75 (BUSY) means another lander holds the box -> DEFER this PR, write no cooldown, AND
+    #     RELEASE THE CLAIM FIRST: the claim is read by merge-one.sh, by orch-loop.sh's `claim_live`
+    #     and by this role's own next pass, all of which treat "that pid is alive" as "a live worker
+    #     owns this PR". Leaving it behind makes the doctor skip the PR for ever (its own long-lived
+    #     loop pid reads as a foreign worker) and suppresses the controller's spawn of it too.
+    #   * ANY OTHER failure (exit 1 UNREADABLE, exit 2 bad argument) is NOT contention: it must
+    #     fail OPEN and say so, exactly like merge-one.sh's `lander_lease`. Failing closed here
+    #     would stop the merge role permanently and diagnose a broken gate as "lease held".
+    lander_token=""
+    if [ -f "$O/gh-gate.py" ] && command -v python3 >/dev/null 2>&1; then
+      _lg_rc=0
+      _lg="$(python3 "$O/gh-gate.py" lease acquire --name "doctor-$pr" --pid $$ 2>&1)" || _lg_rc=$?
+      if [ "$_lg_rc" -eq 0 ]; then
+        lander_token="${_lg#*token=}"; lander_token="${lander_token%% *}"
+      elif [ "$_lg_rc" -eq 75 ]; then
+        [ "$(cat "$cl" 2>/dev/null)" = "$$" ] && rm -f "$cl" 2>/dev/null
+        log "[merge] #$pr DEFERRED — another lander holds this box's lease; not railing it this pass (no cooldown written, claim released)"
+        result="${result}${result:+; }deferred #$pr (box lease held)"
+        skipped=$((skipped + 1)); continue
+      else
+        log "[merge] WARN gh-gate lease acquire rc=$_lg_rc (${_lg:-no output}) — railing #$pr UNSERIALISED (courtesy gate; it must never stall a landing)"
+      fi
+    else
+      log "[merge] WARN $O/gh-gate.py is missing — railing #$pr UNSERIALISED (courtesy gate; it must never stall a landing)"
+    fi
     ( cd "$REPO" && run_bounded "$RAIL_TIMEOUT" bash "$rail" "$pr" --repo "$OR" ) >>"$out" 2>&1
     rc=$?
+    [ -n "$lander_token" ] && python3 "$O/gh-gate.py" lease release --token "$lander_token" >/dev/null 2>&1
+    lander_token=""
     # Release only what is still OURS: a rail that outlived us must not have its claim deleted.
     [ "$(cat "$cl" 2>/dev/null)" = "$$" ] && rm -f "$cl" 2>/dev/null
     attempted=$((attempted + 1))

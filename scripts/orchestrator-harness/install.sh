@@ -446,12 +446,44 @@ done
   python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' "$HERE/gh-limit.py" 2>/dev/null \
     || die "gh-limit.py does not parse"
 }
+# …and the gh-gate (#1910): the loop-lease, the shared read snapshot and the real-read probe.
+# Same rule as the layer above — a python file is not covered by the `*.sh` sweep, so a parse error
+# would reach the controller as a `python3` traceback on every cycle instead of a failed install.
+[ -f "$HERE/gh-gate.py" ] && {
+  command -v python3 >/dev/null 2>&1 \
+    || die "python3 is not on PATH — the gh gate (gh-gate.py) cannot run without it"
+  python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' "$HERE/gh-gate.py" 2>/dev/null \
+    || die "gh-gate.py does not parse"
+}
 ok "all shipped scripts parse"
 
 # ── state dir ────────────────────────────────────────────────────────────────────
 mkdir -p "$O/logs" "$O/state" "$O/wip"
 touch "$O/candidates.txt" "$O/dispatched.txt" "$O/checked.txt"
 ok "state dir $O"
+
+# ── the gh gate (#1910) ─────────────────────────────────────────────────────────
+# Landers on this box take a LEASE before they merge (merge-one.sh), the controller publishes the
+# REAL read verdict once per cycle (orch-loop.sh), and lanes read that snapshot instead of each
+# paying for the same API call. Absent, every one of those degrades to unserialised-but-working and
+# says so in its own log — a courtesy gate must never be a stall — so a missing copy is a warning,
+# not a fatal. Staged then renamed: a live controller may spawn a lander at any moment, and a
+# truncated helper would be a lander that cannot take the lease it thinks it holds.
+if [ -f "$HERE/gh-gate.py" ]; then
+  _gtmp="$O/.seed-gh-gate.py.$$"
+  cp "$HERE/gh-gate.py" "$_gtmp" || { rm -f "$_gtmp"; die "cannot stage gh-gate.py into $O"; }
+  chmod +x "$_gtmp"              || { rm -f "$_gtmp"; die "cannot chmod gh-gate.py"; }
+  mv -f "$_gtmp" "$O/gh-gate.py" || { rm -f "$_gtmp"; die "cannot install $O/gh-gate.py"; }
+else
+  # ⛔ MIRROR AWAY a stale copy, the same rule the cell supervisor applies. The daemon EXECUTES
+  # `$O/gh-gate.py` by name, so one left by an earlier harness would keep being used while the repo
+  # no longer ships it — a deployed gate nothing in the source tree describes.
+  if [ -e "$O/gh-gate.py" ]; then
+    rm -f "$O/gh-gate.py" || die "cannot remove the stale gh-gate.py from $O"
+    warn "removed the stale $O/gh-gate.py — the harness no longer ships it"
+  fi
+  warn "gh-gate.py missing from the shipped set — landers are NOT serialised and the cycle line has no real-read verdict (#1910)"
+fi
 
 # ── gh REST adapter (#1959) ─────────────────────────────────────────────────────
 # Installed FIRST on the daemon PATH so every gh call the harness makes can be served over REST when
@@ -653,14 +685,14 @@ if [ "$PLIST_CHANGED" = "0" ]; then ok "plist unchanged and it is the render lau
 # missing AGENT_DISK_REFUSED, which under `set -u` aborts a refusal before its refund (the callers
 # are tolerant of that now, but surviving a stale helper silently is not the same as DETECTING it).
 DRIFTED=""
-for f in orch-loop.sh claims.sh repo-authority.sh spawn-gate.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh gh-rest/gh gh-limit.py; do
+for f in orch-loop.sh claims.sh repo-authority.sh spawn-gate.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh gh-rest/gh gh-limit.py gh-gate.py; do
   [ -f "$O/$f" ] || { DRIFTED="$DRIFTED $f(missing)"; continue; }
   diff -q "$HERE/$f" "$O/$f" >/dev/null 2>&1 || DRIFTED="$DRIFTED $f"
 done
 if [ -n "$DRIFTED" ]; then
   warn "the running copy at \$O differs from the shipped copy:$DRIFTED"
   warn "  the daemon executes \$O/<script> — sync them or the fixes here are not in effect:"
-  warn "  cp '$HERE'/*.sh '$O'/ && mkdir -p '$O/gh-rest' && cp '$HERE'/gh-rest/gh '$O/gh-rest/' && cp '$HERE'/gh-limit.py '$O/'";
+  warn "  cp '$HERE'/*.sh '$O'/ && mkdir -p '$O/gh-rest' && cp '$HERE'/gh-rest/gh '$O/gh-rest/' && cp '$HERE'/gh-limit.py '$HERE'/gh-gate.py '$O/'";
 fi
 
 # ── harness provenance (agent-infra#1745) ────────────────────────────────────────

@@ -65,14 +65,17 @@ cp -p "$H"/*.sh "$O"/ || die "seed failed"
 # ⛔ STAGE-THEN-RENAME. Both files are EXECUTED by every gh call on the live cell, and a plain `cp`
 # truncates before it writes — a call in that window would run `python3` on half a file. The
 # supervisor seeds the same pair this way for the same reason.
+# ⛔ STAGE-THEN-RENAME, in ONE definition for every layer below (gh-limit, gh-gate). It is defined
+# here, above both branches, because a duplicate would silently shadow the first copy: an edit to
+# one and not the other applies to a single layer, with no error and no red.
+_seed_one() {  # <src> <dest>
+  local _src="$1" _dst="$2" _tmp="$O/.seed-$(basename "$2").$$"
+  cp -p "$_src" "$_tmp" || { rm -f "$_tmp"; die "cannot stage $(basename "$_dst") into $O"; }
+  chmod +x "$_tmp"      || { rm -f "$_tmp"; die "cannot chmod $(basename "$_dst")"; }
+  mv -f "$_tmp" "$_dst" || { rm -f "$_tmp"; die "cannot install $_dst"; }
+}
 if [ -f "$H/gh-limit/gh" ] && [ -f "$H/gh-limit.py" ]; then
   mkdir -p "$O/gh-limit" || die "cannot create $O/gh-limit"
-  _seed_one() {  # <src> <dest>
-    local _src="$1" _dst="$2" _tmp="$O/.seed-$(basename "$2").$$"
-    cp -p "$_src" "$_tmp" || { rm -f "$_tmp"; die "cannot stage $(basename "$_dst") into $O"; }
-    chmod +x "$_tmp"      || { rm -f "$_tmp"; die "cannot chmod $(basename "$_dst")"; }
-    mv -f "$_tmp" "$_dst" || { rm -f "$_tmp"; die "cannot install $_dst"; }
-  }
   _seed_one "$H/gh-limit/gh" "$O/gh-limit/gh"
   _seed_one "$H/gh-limit.py" "$O/gh-limit.py"
   say "seeded the gh-limit layer (serialised gh; path=$O/gh-limit)"
@@ -88,6 +91,21 @@ else
     say "seed: removed the stale gh-limit layer — the harness no longer ships it"
   fi
   say "WARN: this harness ships no gh-limit layer — gh calls on this cell will NOT be serialised (#1988)"
+fi
+# ── the gh gate (#1910) ──────────────────────────────────────────────────────
+# ⛔ THIS PATH WAS THE ONE THAT HAD NONE. `merge-one.sh` and `orch-loop.sh` resolve `$O/gh-gate.py`
+# by name, and a cell deployed through this script got only `$H/*.sh` plus the gh-limit pair — so
+# the lander lease and the real-read verdict were INERT on every cell deployed here while the deploy
+# reported success. Seeded and mirrored exactly like the layer above.
+if [ -f "$H/gh-gate.py" ]; then
+  _seed_one "$H/gh-gate.py" "$O/gh-gate.py"
+  say "seeded the gh gate (one lander at a time; published real-read verdict; #1910)"
+else
+  if [ -e "$O/gh-gate.py" ]; then
+    rm -f "$O/gh-gate.py" || die "cannot remove the stale gh-gate.py from $O"
+    say "seed: removed the stale gh-gate.py — the harness no longer ships it"
+  fi
+  say "WARN: this harness ships no gh-gate.py — landers here are NOT serialised and the cycle line carries no real-read verdict (#1910)"
 fi
 say "seeded $O with $(ls "$O"/*.sh | wc -l | tr -d ' ') scripts (claims.sh present)"
 
