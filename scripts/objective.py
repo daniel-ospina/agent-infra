@@ -141,6 +141,16 @@ BLINDING_SURFACES = ("main", "queue")
 # we could not read the answer. Only the first is blindness. The caller knows which it hit
 # (a non-zero exit is the transport, an unparseable body is not), so it STATES it in
 # `transport=` rather than leaving this function to guess from the text.
+#
+# ⛔ THAT CONTRACT IS NOW HONOURED BY `queue()` AND STILL PARTLY NOT BY `main_health()` (#2138 r7,
+# reviewer A). `queue()` carries the fact from the point where it knows it (see `primary_transport`
+# / `_REST_TRANSPORT`). `main_health()` cannot: it calls `_note_gh_failure(GH_LAST_ERROR, "main")`
+# with the default `transport=True`, and `GH_LAST_ERROR` is SHARED module state that either
+# `gh()`'s body-parse arm (`unparseable gh api body: …`) or `gql_commit_checks()`'s rollup arm can
+# have written — so main has no per-read fact to pass and still relies on `TRANSPORT_MARKERS`.
+# Stated rather than quietly implied by this comment: a lane reading it should not conclude the
+# heuristic is dead. Pinned as a false-blindness path on its own issue rather than fixed here,
+# because the real repair is to attribute the cause per READ, which is a main-path refactor.
 TRANSPORT_MARKERS = ("rate limit", "http 5", "http 4", "timed out", "timeout",
                      "could not resolve", "connection", "network", "tls", "ssl",
                      "temporary failure", "gateway", "unable to access")
@@ -189,6 +199,9 @@ def _note_gh_failure(text, surface, transport=True):
 
 
 GH_LAST_ERROR = ""
+# Whether the LAST `_queue_rest()` failure was a TRANSPORT failure (GitHub unreachable/refusing)
+# rather than an unusable body. Read by `queue()` to classify the composite refusal (#2138 r7).
+_REST_TRANSPORT = False
 
 # ⛔ THE BINARY IS RESOLVED, NOT TAKEN FROM PATH ALONE (#1872, reviewer E). `pr-doctor.py`
 # records the incident at its own `GH` constant: on the fleet box `~/.pi/agent/shims/gh` is a
@@ -1402,7 +1415,15 @@ def _queue_rest(deadline=None):
     "this is not the queue", and a truncated list printed as the depth is an under-count (ten
     PRs of a 500+ backlog would read `waiting` as the whole queue).
     """
-    global GH_LAST_ERROR
+    global GH_LAST_ERROR, _REST_TRANSPORT
+    # ⛔ EVERY EXPLICIT `return None` BELOW IS A BODY/CONFIG FAILURE, NOT A TRANSPORT ONE
+    # (#2138 r7, reviewer B). GitHub ANSWERED with something unusable, or we refused to open a
+    # socket. Only an exception escaping `_rest_get` -- an HTTP error, a connection failure, a
+    # timeout -- is the transport, and that arm sets this True. `queue()` ORs it with the
+    # primary's own flag, so the composite refusal is a transport failure if EITHER source hit
+    # one: a primary we mangled plus a fallback GitHub REFUSED is still blindness, and losing
+    # that claim degraded the verdict to `UNKNOWN` where the reader needed "wait for the limit".
+    _REST_TRANSPORT = False
     token = _gh_token()
     if not token:
         GH_LAST_ERROR = (f"rest second source: no credential (GH_TOKEN/GITHUB_TOKEN unset and no "
@@ -1418,10 +1439,20 @@ def _queue_rest(deadline=None):
                     GH_LAST_ERROR = (f"rest second source: page {page}: the queue read's own budget "
                                      "was spent before the fallback could fetch it")
                     return None
-            body = _rest_get(
-                f"https://api.github.com/repos/{REPO}/pulls"
-                f"?state=open&per_page={QUEUE_REST_PAGE}&page={page}", token,
-                timeout=budget, deadline=_monotonic() + budget)
+            # ⛔ THE `_rest_get` CALL IS THE ONLY TRANSPORT BOUNDARY (#2138 r7, reviewer B), so
+            # its failure is classified HERE rather than in the broad `except` below -- which
+            # also catches a `_rest_pr` MAPPING error, and that is a body we did not understand,
+            # not a failure to reach GitHub.
+            try:
+                body = _rest_get(
+                    f"https://api.github.com/repos/{REPO}/pulls"
+                    f"?state=open&per_page={QUEUE_REST_PAGE}&page={page}", token,
+                    timeout=budget, deadline=_monotonic() + budget)
+            except Exception as e:
+                # The URL is safe to name; the token never is.
+                GH_LAST_ERROR = f"rest second source failed: {type(e).__name__}: {str(e)[:180]}"
+                _REST_TRANSPORT = True
+                return None
             if not isinstance(body, list):
                 GH_LAST_ERROR = (f"rest second source returned {type(body).__name__}, not a list")
                 return None
@@ -1669,10 +1700,14 @@ def queue():
                         # whole failure rather than half of it.
                         _rest_err = (GH_LAST_ERROR if "rest second source" in (GH_LAST_ERROR or "")
                                      else "")
-                        # The synthesised refusal inherits the PRIMARY's transport status: if the
-                        # primary reached GitHub and we mangled the answer, this is not blindness
-                        # even though the second source also failed for its own (named) reason.
-                        refusal_transport = primary_transport
+                        # The synthesised refusal is a TRANSPORT failure if EITHER source hit
+                        # one (#2138 r7, reviewer B). Inheriting only the primary's flag dropped
+                        # a genuine rate-limit refusal from the fallback -- measured: a primary
+                        # we mangled plus a 403 on REST printed `queue=UNREADABLE` with NO `gh=`
+                        # and `VERDICT=UNKNOWN`, where the reader needed "wait for the limit".
+                        # A bare parse failure on the primary with a NON-transport fallback
+                        # failure still claims nothing, which is the fix from the round before.
+                        refusal_transport = primary_transport or _REST_TRANSPORT
                         raise RuntimeError(
                             f"{_graphql_err} | {_rest_err or 'rest second source failed'}")
                     source = "rest"

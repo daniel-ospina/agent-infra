@@ -206,8 +206,10 @@ def _isolate_gh_config(monkeypatch):
     github.com host. Clearing the tokens while leaving `GH_HOST=ent.example` in the environment
     therefore inverts gh's precedence onto the runner's identity — MEASURED: `GH_HOST=ent.example
     pytest test_objective.py` failed `test_the_token_comes_from_ghs_own_config_and_absence_fails_
-    closed` with `'' == 'gho_github'`, the same class as the `XDG_CONFIG_HOME` bug this fixture
-    was added for, one leg further along.
+    closed` at the ENV-TOKEN arm with `assert 'gho_github' == 'gho_env'` — the env token the test
+    set for a github.com host was ignored because `GH_HOST` was not one, so the config file won.
+    Same class as the `XDG_CONFIG_HOME` bug this fixture exists for, one leg further along (and a
+    DIFFERENT assertion — the `'' == 'gho_github'` signature belongs to the XDG leg).
 
     This is the repo's recorded failure mode (`MEMORY.md`: a fixture that inherits the ambient
     environment measures the host, not the installer) applied to the one seam that decides which
@@ -2038,8 +2040,9 @@ def test_a_FULL_RE_SAMPLE_page_is_a_failed_read_not_the_queue_depth(monkeypatch)
     with it. Reachable when the FIRST sample was blind, and it publishes `waiting=400` for a
     backlog of 500: the same under-count, one branch over.
 
-    Fixture: attempt 0 is blind (unread merge state, minority-unread so it re-samples); attempt 1
-    answers with a full page. The honest outcome is the BLIND line plus `resample=FAILED`, which is
+    Fixture: attempt 0 is blind — `_queue_read_is_blind` is `unknown > 0 and 2*unknown >= nondraft`,
+    i.e. AT LEAST HALF unread (200 of 399 here), so it re-samples. A MINORITY-unread sample is NOT
+    blind and is accepted immediately, so it would never reach the re-sample this test pins. The honest outcome is the BLIND line plus `resample=FAILED`, which is
     strictly better than a truncated depth printed as the queue.
     """
     limit = objective.QUEUE_PRIMARY_LIMIT
@@ -2072,10 +2075,16 @@ def test_a_PARSE_failure_does_not_claim_blindness_even_when_its_TEXT_says_transp
 
     `not json at all` (no marker) hid the bug: it passed for the wrong reason. The marker-bearing
     body is what makes this discriminating.
+
+    ⛔ THE FALLBACK FAILS HERE FOR A **NON-TRANSPORT** REASON ON PURPOSE (#2138 r7, reviewer A).
+    An absent token makes `_queue_rest` return None without opening a socket, so the composite
+    classification has nothing to OR in and the PRIMARY's parse failure is isolated. Using the
+    default fixture (which raises) would classify the fallback as a transport failure and the
+    composite WOULD legitimately claim — that case is the test below.
     """
     for body in ('{"message": "read timed out"}',            # a TRANSPORT_MARKER in the text
                  '{"message": "connection reset by peer"}'):
-        install(monkeypatch, pr_list=_Result(0, body), rest_prs=None)
+        install(monkeypatch, pr_list=_Result(0, body), rest_prs=None, gh_token=None)
         line = objective.build()
         assert "queue=UNREADABLE" in line, (body, line)       # the FACT is still reported
         assert "gh=" not in line, (body, line)               # ...but no blindness claim
@@ -2086,6 +2095,30 @@ def test_a_PARSE_failure_does_not_claim_blindness_even_when_its_TEXT_says_transp
     line = objective.build()
     assert "gh=RATE-LIMITED(queue)" in line, line
     assert "VERDICT=GH-RATE-LIMITED" in line, line
+
+
+def test_a_REFUSED_fallback_still_claims_even_when_the_primary_was_mangled(monkeypatch):
+    """⛔ THE COMPOSITE REFUSAL IS A TRANSPORT FAILURE IF **EITHER** SOURCE HIT ONE (#2138 r7, B).
+
+    Classifying the synthesised refusal by the PRIMARY's flag alone was a regression introduced by
+    the round-6 fix: a primary we mangled (`transport=False`) plus a fallback GitHub REFUSED for
+    rate limiting then printed `queue=UNREADABLE` with NO `gh=` and `VERDICT=UNKNOWN` — where the
+    reader needs "wait for the limit", the word `docs/ops/gh-rate-limits.md` tells lanes to expect.
+    MEASURED on the parent commit: `gh=RATE-LIMITED(queue)` / `VERDICT=GH-RATE-LIMITED`; without
+    the OR it degraded to `VERDICT=UNKNOWN` with no attribution at all.
+
+    The line is still not a false all-clear (`queue=UNREADABLE` prints either way); what was lost
+    was the ATTRIBUTION and the verdict word.
+    """
+    def rest_403(url, token, timeout=None, deadline=None):
+        raise OSError("HTTP Error 403: API rate limit exceeded for user ID 81560491")
+
+    install(monkeypatch, pr_list=_Result(0, '{"message": "Bad credentials"}'), rest_prs=None)
+    monkeypatch.setattr(objective, "_rest_get", rest_403)
+    line = objective.build()
+    assert "queue=UNREADABLE" in line, line           # the fact
+    assert "gh=RATE-LIMITED(queue)" in line, line     # ...and the ATTRIBUTION
+    assert "VERDICT=GH-RATE-LIMITED" in line, line    # ...and the actionable verdict word
 
 
 def test_the_bucket_prefers_the_ACTIONABLE_kind_when_two_surfaces_fail(monkeypatch):
@@ -2171,8 +2204,11 @@ def test_an_unread_queue_is_never_cached_even_without_a_gh_claim(monkeypatch, tm
     NON-transport failure, correctly NOT a claim, so the line carries `queue=UNREADABLE` with no
     `gh=` at all and the older guard matched nothing. It then FROZE the blind line.
 
-    The code carried a comment naming this test (`objective.py::main`'s cache guard) and the test
-    DID NOT EXIST, so the guard was reassurance without a pin (#2138 r6, reviewer A).
+    A SIBLING TEST'S docstring named this test (`test_an_unusable_PRIMARY_payload_...`, whose
+    comment said "see `test_an_unread_queue_is_never_cached_even_without_a_gh_claim`") and the
+    test DID NOT EXIST, so the guard was reassurance without a pin (#2138 r6/r7, reviewer A) —
+    the cross-reference pointed at a name, and a name is not a guard. (`objective.py::main`'s own
+    cache-guard comment never named it; the dangling reference was in the test file.)
 
     Part (2) is the positive control: without it, part (1) passes vacuously on a build that never
     caches anything.
