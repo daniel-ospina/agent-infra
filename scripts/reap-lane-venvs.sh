@@ -766,13 +766,27 @@ parse_args() {
     # `set -uo pipefail` (no `-e`), and fall straight through to reaping: the floor that covers the
     # window between `git worktree add` and the first process binding to the new lane was silently
     # DISABLED, in the direction that destroys a live lane's env. It failed OPEN.
-    # The fix is the check the free-disk floor already uses, applied to the final value (env or argv)
-    # so no path into this script can skip it. EXIT 2 — a misconfiguration the OPERATOR can fix —
-    # never 3: `disk-reaper.sh` maps a delegate's 3 to "a delegate refused" (a green unit), and a
-    # typo must not borrow that colour. Nothing is removed: this runs before any probe or sweep.
+    # The fix is the check `--min-age` ALREADY applied at parse time, moved to the final value (env or
+    # argv) so no path into this script can skip it. EXIT 2 — a misconfiguration the OPERATOR can fix —
+    # never 3: a delegate's 3 is the pass's fail-closed code (a RED unit), and a typo must not be able
+    # to reach any code whose meaning is other than "this is wrong, fix it". Nothing is removed: this
+    # runs before any probe or sweep.
     if ! is_pos_int "${REAP_VENV_MIN_AGE_SECONDS:-}"; then
         echo "FAIL-CLOSED abort: REAP_VENV_MIN_AGE_SECONDS='${REAP_VENV_MIN_AGE_SECONDS:-}' is not a whole number of seconds (set it from the environment or --min-age; default 1800). Nothing removed (exit 2)." >&2
         log "FAIL-CLOSED abort: invalid age floor '${REAP_VENV_MIN_AGE_SECONDS:-}'"
+        exit 2
+    fi
+    # ✅ AND BOUNDED, not just all-digits (#2158 residual). `is_pos_int` accepts any digit string, but
+    # `[ -lt ]` parses with strtoimax: a value above 2^63-1 makes the COMPARISON ITSELF error and take
+    # the else branch — the same fail-open, one size class up (measured: 99999999999999999999 passes
+    # `is_pos_int`, then `[` prints "integer expression expected" and control falls through to REAP).
+    # Leading zeros are harmless to `[` (base 10), so they are stripped before the length test rather
+    # than refused. Nine digits is 31 years: no real floor can exceed it.
+    floor_norm="${REAP_VENV_MIN_AGE_SECONDS#"${REAP_VENV_MIN_AGE_SECONDS%%[!0]*}"}"
+    [ -n "$floor_norm" ] || floor_norm=0
+    if [ "${#floor_norm}" -gt 9 ]; then
+        echo "FAIL-CLOSED abort: REAP_VENV_MIN_AGE_SECONDS='$REAP_VENV_MIN_AGE_SECONDS' is too large to compare (at most 9 digits). Nothing removed (exit 2)." >&2
+        log "FAIL-CLOSED abort: out-of-range age floor '$REAP_VENV_MIN_AGE_SECONDS'"
         exit 2
     fi
     return 0

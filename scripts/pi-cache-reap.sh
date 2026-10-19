@@ -162,10 +162,13 @@
 # a tool run that starts mid-pass, STOPS the eviction and rides that cache's verdict as a STOPPING
 # note — exit 3 if the cache is still over its bound, exit 0 with the note if the pass had already
 # brought it under and verified the reclaim) · 4 did not run (another pass holds the lock) ·
-# 5 a cache is OVER its bound and nothing was done about it (dry-run — the shipped stance).
+# 5 a cache is OVER its bound and nothing was done about it (dry-run — the shipped stance) ·
+# 7 DEFERRED: a live `uv`/`npm`/`pip` holds the cache, so the entries it keeps cannot be known — the
+# pass ran, declined to act, and claims NOTHING (#2036). Distinct from 3 on purpose: 3 is "I could not
+# do the work" and must stay loud; 7 is the routine busy-box outcome and is not a failure of anything.
 # ⚠️ NOT the sibling reapers' vocabulary: pi-reap-worktrees.sh uses 4 for "a removal FAILED"
-# and 3 for "lock held". Here 4 is a benign skip and 3 is always fail-closed; a fleet reader
-# must not apply the other mapping.
+# and 3 for "lock held". Here 4 is a benign skip, 7 is a benign deferral, and 3 is always fail-closed;
+# a fleet reader must not apply the other mapping.
 # ── usage end ──
 
 set -uo pipefail
@@ -220,6 +223,20 @@ fail_closed() {
     say "pi-cache-reap: FAIL-CLOSED — $*"
 }
 
+# ⛔ A DEFERRAL IS NOT A FAILURE, AND IT IS NOT A PASS EITHER (#2036). The one benign non-zero
+# outcome: the pass RAN, DECLINED to act, and claims nothing — a live `uv`/`npm`/`pip` holds the cache
+# so the entries it keeps cannot be known. That is the routine state of a busy box (measured: most
+# hours on a live cell), so it must not be exit 3: the scheduled unit maps 3 to "broken" and an alarm
+# that fires hourly on a healthy box is one nobody reads. It must not be exit 0 either — 0 is read by
+# the callers as "the bound was cleared", and nothing was bounded. Hence its own code, `7`, which
+# `disk-reaper.sh` maps to its own 6 = "a delegate DEFERRED the pass" (green unit, `ok=0` record).
+# Counted separately from FAILS so a real breakage on another cache still wins the pass's exit.
+DEFERRED=0
+deferred() {
+    DEFERRED=$((DEFERRED + 1))
+    say "pi-cache-reap: DEFERRED — $*"
+}
+
 now_epoch() { date +%s 2>/dev/null; }
 is_pos_int() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; esac; return 0; }
 
@@ -230,8 +247,16 @@ is_pos_int() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; esac; return 0; }
 # mistaken for a recycled pid (which would let a live owner's lock be broken).
 canon_lstart() {
     local w a b
+    # ⛔ `set -f` AROUND THE SPLIT. The argument is read from `$LOCK_DIR/lstart`, a file on disk, so an
+    # unquoted `set -- $1` would PATHNAME-EXPAND any glob metacharacter in it against the caller's cwd:
+    # the canonical key would then differ from the stored one, the holder would read as RECYCLED, and
+    # this pass would either skip (below the stale bound) or BREAK A LIVE OWNER'S LOCK (above it) — the
+    # double-pass the lock exists to prevent. `ps` never prints a metacharacter, so this is hardening,
+    # but the value is attacker-adjacent by construction (it comes from a file).
+    set -f
     # shellcheck disable=SC2086
     set -- $1
+    set +f
     [ $# -ge 3 ] || { printf '%s' "${1:-}"; return 0; }
     w="$1"; a="$2"; b="$3"
     if [ "$a" \< "$b" ] || [ "$a" = "$b" ]; then printf '%s %s %s' "$w" "$a" "$b"
@@ -652,7 +677,7 @@ guard_target() {
 reap_target() {
     local class="$1" dir="$2" before_kb before_free_kb now_kb new_kb after_kb after_free_kb
     local pruned=none evicted=0 kb e cur_free holders dir_holders held_entries="" keep_entries=""
-    local no_gain_stop=0 no_gain=0 any_gain=0 hard_stop=0 last_free="" claimed_kb gained_kb credited_kb min_gain_kb stop_note=""
+    local no_gain_stop=0 no_gain=0 any_gain=0 hard_stop=0 live_stop=0 last_free="" claimed_kb gained_kb credited_kb min_gain_kb stop_note=""
     local dev_rc share_rc fresh_holders free_str parent mnt_rc resolved declared_dir
 
     case "$dir" in
@@ -730,7 +755,10 @@ reap_target() {
         holders="$(ps_matches tool "$class" "$dir")" \
             || { fail_closed "$class: $dir is $(mb_str "$now_kb") > ${MAX_MB}MB and the ps probe could not answer — NOT escalating an unproven cache"; return 0; }
         if [ -n "$holders" ]; then
-            fail_closed "$class: $dir is $(mb_str "$now_kb") > ${MAX_MB}MB and a live $class process is running, so the entries it holds cannot be known — NOT escalating; process(es): $holders (the cache is shared, so any live $class on this box may be resolving against it)"
+            # A live tool holding the cache is a DEFERRAL, not a fault (#2036): nothing was deleted,
+            # nothing is claimed, and on a busy cell this is most hours. It used to be fail_closed
+            # (exit 3), which made a healthy cell's scheduled unit red every hour.
+            deferred "$class: $dir is $(mb_str "$now_kb") > ${MAX_MB}MB and a live $class process is running, so the entries it holds cannot be known — NOT escalating; process(es): $holders (the cache is shared, so any live $class on this box may be resolving against it)"
             return 0
         fi
         read_mount_table || MOUNTS_RC=2   # read once per cache; rc 2 => every entry is refused
@@ -762,6 +790,7 @@ reap_target() {
             ps_snapshot || { fail_closed "$class: the ps probe could not answer immediately before removing $e — NOT deleting an unproven entry"; hard_stop=1; break; }
             if [ -n "$(ps_matches tool "$class" "$dir" || true)" ]; then
                 stop_note=" (STOPPING: a $class process started during this pass — stopped before $e, the entries it holds cannot be known)"
+                live_stop=1
                 break
             fi
             fresh_holders="$(ps_matches dir "$class" "$dir" || true)"
@@ -873,6 +902,16 @@ reap_target() {
     if [ "$after_kb" -gt "$MAX_KB" ]; then
         free_str="could not be read"
         [ -n "${after_free_kb:-}" ] && free_str="$(mb_str "$after_free_kb")"
+        # ⛔ A STOP CAUSED BY A LIVE TOOL IS A DEFERRAL, NOT A FAILURE (#2036). The cache is still over
+        # bound because a live `uv`/`npm`/`pip` started holding it mid-pass — nothing was deleted by
+        # our choice, nothing is claimed, and the next pass (or the next quiet minute) will act. Every
+        # OTHER stop underneath this line (a mount table that cannot be read, an unmeasurable entry, a
+        # re-measure that failed, a df that stopped answering) means the pass could not do its job and
+        # stays fail-closed. That distinction is why 7 exists and why 3 was not simply made green.
+        if [ "$live_stop" -eq 1 ]; then
+            deferred "$class: $dir is $(mb_str "$before_kb") -> $(mb_str "$after_kb") — still over the ${MAX_MB}MB bound because a live $class process started holding it mid-pass (prune=$pruned evicted=$evicted); nothing claimed${held_entries:+ — PRESERVED because a live process names them: $held_entries}${stop_note}"
+            return 0
+        fi
         fail_closed "$class: $dir was $(mb_str "$before_kb") -> $(mb_str "$after_kb") after evicting every removable entry it could try (prune=$pruned evicted=$evicted) — still over the ${MAX_MB}MB bound; free $(mb_str "${before_free_kb:-0}") -> $free_str${held_entries:+ — PRESERVED because a live process names them: $held_entries}${keep_entries:+ — preserved: $keep_entries}${stop_note}"
         return 0
     fi
@@ -1211,6 +1250,12 @@ cap_log
 if [ "$FAILS" -gt 0 ]; then
     say "pi-cache-reap: FAILED — $FAILS cache(s) could not be bounded or verified this pass (exit 3)"
     exit 3
+fi
+# ORDER IS LOAD-BEARING: a real breakage (3) outranks a deferral (7), and a deferral outranks the
+# dry-run over-bound report (5) — a dry run never escalates, so it never defers either.
+if [ "$DEFERRED" -gt 0 ]; then
+    say "pi-cache-reap: pass end mode=$MODE — $DEFERRED cache(s) DEFERRED to a later pass because a live tool held them; nothing was acted on and NOTHING IS CLAIMED (exit 7: a deferral, not a failure)"
+    exit 7
 fi
 # ⛔ THE PASS-END LINE MUST NOT CLAIM A BOUND THE PASS DID NOT ENFORCE. On the shipped dry-run
 # stance an over-bound cache used to print "every present cache bounded and verified" and exit 0

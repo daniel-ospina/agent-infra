@@ -154,28 +154,45 @@ def find_transcript(sid):
 # tell anyone it stopped working. `launchctl list` reports that status and NOTHING read it:
 # the measured estate carried `com.eldato.pi-cache-reap` at exit 5 for days while the caches it
 # exists to bound sat at 8745MB/9479MB, `com.tortoise.worktree-reaper` loaded-and-inert, and
-# the three cloud cells died of a disk-full at 94-96%. A silent failure IS the bug (the same
+# the three cloud cells hit a disk-full at 94-96%. A silent failure IS the bug (the same
 # rule as the pr-doctor exit-2 defect), so the scan reports every reaper's last exit.
 #
 # ⛔ THE EXIT VOCABULARY IS NOT PORTABLE AND MUST NOT BE FLATTENED. Per the scripts' own exit
 # contracts: pi-cache-reap.sh 5 = "a cache is OVER its bound and nothing was done (dry-run —
 # the shipped stance)" — an ACTIONABLE ALARM, never a crash; 3 = fail-closed (real breakage);
-# 4 = did not run (lock held / benign skip). pi-reap-worktrees.sh uses 4 for "a removal FAILED"
-# and 3 for "lock held" — the OPPOSITE mapping. So each family gets its own table, and an
-# UNRECOGNISED code is reported as an alarm rather than assumed benign (allow-list polarity).
+# 4 = did not run (lock held / benign skip); 7 = DEFERRED (a live tool holds the cache — routine on a
+# busy box, not a failure). pi-reap-worktrees.sh uses 4 for "a removal FAILED" and 3 for
+# "fail-closed" — which there covers a missing library, an unlistable git, an unreachable gh, an
+# unwritable log AND (one path of seven) a held lock, so its 3 is NOT a benign skip. So each family
+# gets its own table, and an UNRECOGNISED code is reported as an alarm rather than assumed benign
+# (allow-list polarity).
+#
+# ⛔ THIS SECTION IS macOS-ONLY, AND SAYING SO IS PART OF THE INSTRUMENT. `launchctl` does not exist on
+# the Linux cells — the boxes this fleet's reaper is actually scheduled on — so the old unconditional
+# call raised FileNotFoundError there, which the `except` turned into "an alarm", which made
+# fleet-health exit 1 on every healthy Linux cell, on every run, before it looked at a single reaper.
+# A cross-platform scanner must report an inapplicable probe as inapplicable, never as a failure.
 REAPERS = [
     ("com.eldato.pi-cache-reap",       "cache"),
     ("com.eldato.pi-session-reaper",   "cache"),
     ("com.eldato.pi-task-session-prune", "cache"),
-    ("com.tortoise.embedded-reaper",   "other"),
     ("com.tortoise.worktree-reaper",   "worktree"),
     ("com.tortoise.branch-reaper",     "other"),
 ]
+# Labels this repo does NOT install are deliberately absent. `com.tortoise.embedded-reaper` used to be
+# listed here; templates/launchd/ has no plist for it (install-launchd.sh installs $TEMPLATES_DIR/*.plist),
+# so on every box provisioned from this repo the row was a guaranteed `NOT INSTALLED` alarm and a
+# non-zero exit for ever — alarm fatigue manufactured by the very instrument meant to cure it. A label
+# that only one hand-built box ever carried is not this repo's alarm to raise.
 # family -> {code: (meaning, alarm?)}
 REAPER_CODES = {
-    "cache":    {0: ("ok", False), 4: ("did not run (lock held)", False),
-                 5: ("OVER BOUND and nothing reclaimed — dry-run; arming is the owner's decision (#1678)", True)},
-    "worktree": {0: ("ok", False), 3: ("lock held (benign skip)", False),
+    "cache":    {0: ("ok", False),
+                 3: ("fail-closed (a cache could not be measured or verified, or the audit log is unwritable)", True),
+                 4: ("did not run (another pass holds the lock)", False),
+                 5: ("OVER BOUND and nothing reclaimed — dry-run; arming is the owner's decision (#1678)", True),
+                 7: ("DEFERRED — a live tool holds the cache; nothing acted on, nothing claimed", False)},
+    "worktree": {0: ("ok", False),
+                 3: ("fail-closed (library/git/gh/log, or a held lock — this code does not distinguish them)", True),
                  4: ("a removal FAILED", True)},
     "other":    {0: ("ok", False)},
 }
@@ -183,6 +200,13 @@ REAPER_CODES = {
 
 def reaper_section():
     """Print each scheduled reaper's last exit with its MEANING. Return alarm strings."""
+    if sys.platform != "darwin":
+        # Abstention, not absence and not failure: launchd is macOS-only. The scheduled pass on a Linux
+        # cell is eldato-disk-reaper.timer, whose verdict is `disk-reaper.sh --print-status`, read by
+        # cloud-cell-supervisor.sh status.
+        print("\nreapers: not applicable (launchd is macOS-only) — a Linux cell's scheduled pass is")
+        print("         eldato-disk-reaper.timer; ask `cloud-cell-supervisor.sh status` for its verdict")
+        return []
     try:
         out = subprocess.run(["launchctl", "list"], capture_output=True, text=True,
                              timeout=20).stdout

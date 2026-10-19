@@ -13,9 +13,17 @@
 # ⛔ ARMING IS THE OWNER'S DECISION, AND IT WAS MADE. The general rule (#1678, owner ruling
 # 2026-10-11) is that deletion tools ship DRY-RUN and arming is a separate, dated, reversible owner
 # step. This feature was explicitly instructed to run unattended on the cell, so the unit ExecStart
-# carries `--apply` and the arming is visible in the unit file itself. Pass `--dry-run` to install a
-# unit that only reports; re-running with `--install` flips it back. Nothing about the arming is
+# carries `--apply` and the arming is visible in the unit file itself. Nothing about the arming is
 # hidden in an environment default.
+# ⛔ `--dry-run` IS *NOT* A REPORT-ONLY INSTALL, and this header used to say it was. `--dry-run`
+# sets DRY_RUN=1, and do_install then RENDERS AND PRINTS the unit and returns without touching
+# anything — so an operator who followed the old sentence to disarm a cell's hourly DELETION pass got
+# exit 0 and an unchanged, still-armed unit (T12 pins the same no-op on the `--uninstall` path). A
+# false claim about arming on a deletion tool is the worst kind of false PASS, so it is corrected
+# here: there is no disarm flag. Disarm by hand (`systemctl disable --now
+# eldato-disk-reaper.timer`) and say so in the cell's record.
+#   TO PREVIEW WHAT WOULD BE INSTALLED: `--dry-run`. TO INSTALL: `--install` (idempotent; a second
+#   install with unchanged bytes is a no-op apart from `daemon-reload`).
 #
 # THREE INSTALL TARGETS, tried in this order, and the reason is named in the output:
 #   1. a SYSTEM unit via passwordless sudo (/etc/systemd/system) — the cell's normal shape; the
@@ -168,13 +176,22 @@ refuse_transient_target() {
     # ── The scratch heuristic: skipped ONLY for a genuine scratch override ───────────────────────
     # ⛔ The override is documented as "tests: a temp dir". Nothing used to stop it naming
     # /etc/systemd/system — which reproduced the measured defect verbatim, one env var away — and it
-    # ALSO short-circuited the existence check above. It bypasses only the HEURISTIC, never those.
+    # ALSO short-circuited the existence check above. It bypasses only the HEURISTIC, never those —
+    # and it used to bypass three MORE checks by returning HERE, above them: the whitespace refusal, the
+    # missing-delegate warning and the state-dir writability probe. Every install case in the suite
+    # passes a scratch SYSTEMD_UNIT_DIR, so those three guards had NO test that reached them at all.
+    # So the bypass is now scoped to the three `is_transient_scratch` calls below and nothing else.
+    skip_scratch_heuristic=0
     if [ -n "${SYSTEMD_UNIT_DIR:-}" ] && ! is_real_systemd_dir "$SYSTEMD_UNIT_DIR"; then
-        return 0
+        skip_scratch_heuristic=1
     fi
-    is_transient_scratch "$REAPER"      && bad="REAPER=$REAPER"
-    is_transient_scratch "$HOME"        && bad="${bad:+$bad; }HOME=$HOME"
-    is_transient_scratch "$STATE_DIR"   && bad="${bad:+$bad; }STATE_DIR=$STATE_DIR"
+    if [ "$skip_scratch_heuristic" = 1 ]; then
+        :   # a scratch override (the documented test seam): the heuristic below is not applied
+    else
+        is_transient_scratch "$REAPER"      && bad="REAPER=$REAPER"
+        is_transient_scratch "$HOME"        && bad="${bad:+$bad; }HOME=$HOME"
+        is_transient_scratch "$STATE_DIR"   && bad="${bad:+$bad; }STATE_DIR=$STATE_DIR"
+    fi
     if [ -n "$bad" ]; then
         err "REFUSING a $t install rendered from transient scratch space: $bad"
         err "The unit would point at a directory that is deleted before the first tick, so every pass"
@@ -191,7 +208,18 @@ refuse_transient_target() {
     done
     # The service runs as the INVOKING user, so writeability tested here is the service's own. A
     # state dir it cannot write makes every pass exit 3 on a unit that installed cleanly.
-    if ! mkdir -p "$STATE_DIR" 2>/dev/null || [ ! -w "$STATE_DIR" ]; then
+    # ⛔ `--dry-run` MUST NOT CREATE IT. This probe used to `mkdir -p` unconditionally, and
+    # refuse_transient_target runs before the DRY_RUN branch — so the documented "preview" wrote to the
+    # filesystem and, on a box whose HOME was scratch, refused on a path it was only supposed to
+    # describe. Under DRY_RUN the probe is read-only: an existing dir is checked for writability, and a
+    # missing one is reported as "would create" instead of created.
+    if [ "${DRY_RUN:-0}" = "1" ]; then
+        if [ -e "$STATE_DIR" ] && [ ! -w "$STATE_DIR" ]; then
+            err "REFUSING: state dir '$STATE_DIR' exists and is not writable by $(id -un) — the unit runs as this user and every pass would fail closed (exit 3)"
+            return 1
+        fi
+        [ -e "$STATE_DIR" ] || say "dry-run: would create the state dir $STATE_DIR"
+    elif ! mkdir -p "$STATE_DIR" 2>/dev/null || [ ! -w "$STATE_DIR" ]; then
         err "REFUSING: state dir '$STATE_DIR' is not writable by $(id -un) — the unit runs as this user and every pass would fail closed (exit 3)"
         return 1
     fi
@@ -238,12 +266,22 @@ choose_target() {
         TARGET="override"; UNIT_DIR="$SYSTEMD_UNIT_DIR"; SC="${SYSTEMCTL:-systemctl}"
         return 0
     fi
-    if [ "${SUDO:-sudo -n}" = "" ] || ${SUDO:-sudo -n} true >/dev/null 2>&1; then
+    # ⛔ `${SUDO:-sudo -n}` CANNOT BE EMPTY (`:-` substitutes on empty too), so the documented
+    # "SUDO= skips the sudo probe" branch was unreachable — and SUDO set to a wrapper was honoured for
+    # the file copy but not for `systemctl`, so the unit could be installed by one identity and enabled
+    # by another. Both seams now mean what they say: `${SUDO+x}` distinguishes unset from set-to-empty,
+    # and the pinned SYSTEMCTL is used on the SYSTEM target too (it used to be hardcoded away there —
+    # "a pinned path silently ignored", the defect find_delegate refuses).
+    if [ -z "${SUDO+x}" ] && sudo -n true >/dev/null 2>&1; then
         TARGET="system"; UNIT_DIR="/etc/systemd/system"; SC="${SYSTEMCTL:-sudo -n systemctl}"
         return 0
     fi
+    if [ -n "${SUDO+x}" ] && { [ -z "$SUDO" ] || $SUDO true >/dev/null 2>&1; }; then
+        TARGET="system"; UNIT_DIR="/etc/systemd/system"; SC="${SYSTEMCTL:-${SUDO:+$SUDO }systemctl}"
+        return 0
+    fi
     if systemctl --user show-environment >/dev/null 2>&1; then
-        TARGET="user"; UNIT_DIR="$HOME/.config/systemd/user"; SC="systemctl --user"
+        TARGET="user"; UNIT_DIR="$HOME/.config/systemd/user"; SC="${SYSTEMCTL:-systemctl --user}"
         return 0
     fi
     return 1
@@ -257,6 +295,17 @@ do_install() {
     [ -f "$src_svc" ] && [ -f "$src_tim" ] || { err "templates missing under $TEMPLATES_DIR"; return 1; }
     REPOS="$(resolve_repos)"
     [ -n "$REPOS" ] || err "WARNING: no repo resolved on this box — the venv and worktree classes will fail closed every pass. Set DISK_REAPER_REPOS or REPO."
+    # ⛔ RUNNING THIS AS ROOT INSTALLS A GREEN REAPER THAT REAPS NOTHING. {{USER}} is `id -un` and
+    # {{HOME}} is $HOME, so `sudo bash install-disk-reaper-timer.sh --install` — a plausible reading of
+    # the remedy this script itself prints — renders `User=root` / `Environment=HOME=/root`, and the
+    # hourly pass then looks after /root while the lane user's caches and worktrees are untouched. It
+    # exits 0 every hour, so nothing notices. Refuse and name the two working invocations.
+    if [ "$(id -u)" = "0" ] && [ -n "${SUDO_USER:-}" ]; then
+        err "REFUSING to install as root (SUDO_USER=$SUDO_USER): the unit would run as root and look after"
+        err "root's caches, not $SUDO_USER's — a green hourly pass that reclaims nothing."
+        err "Run it as the user that owns the lanes:  sudo -u $SUDO_USER -H bash $0 --install"
+        return 1
+    fi
     choose_target || { err "no scheduler available: no passwordless sudo for a system unit, and no systemd user manager. Install by hand, or give the cell sudo. NOT silently skipping — a reaper that never runs is the failure this exists to remove."; return 1; }
 
     refuse_transient_target || return 1
@@ -285,8 +334,8 @@ do_install() {
     if [ -n "${SYSTEMD_UNIT_DIR:-}" ]; then
         cp -f "$tmpd/$UNIT_NAME.service" "$tmpd/$UNIT_NAME.timer" "$UNIT_DIR/" || { err "copy failed"; rm -rf "$tmpd"; return 1; }
     else
-        ${SUDO:-sudo -n} install -m 0644 "$tmpd/$UNIT_NAME.service" "$UNIT_DIR/$UNIT_NAME.service" \
-            && ${SUDO:-sudo -n} install -m 0644 "$tmpd/$UNIT_NAME.timer" "$UNIT_DIR/$UNIT_NAME.timer" \
+        ${SUDO-sudo -n} install -m 0644 "$tmpd/$UNIT_NAME.service" "$UNIT_DIR/$UNIT_NAME.service" \
+            && ${SUDO-sudo -n} install -m 0644 "$tmpd/$UNIT_NAME.timer" "$UNIT_DIR/$UNIT_NAME.timer" \
             || { err "install failed (sudo/systemd)"; rm -rf "$tmpd"; return 1; }
     fi
     rm -rf "$tmpd"
@@ -294,6 +343,30 @@ do_install() {
     # ALWAYS re-read unit files (cheap, idempotent), then make sure the timer is enabled+started.
     $SC daemon-reload >/dev/null 2>&1 || { err "daemon-reload failed"; return 1; }
     $SC enable --now "$UNIT_NAME.timer" || { err "could not enable/start $UNIT_NAME.timer"; return 1; }
+
+    # ⛔ A USER UNIT WITHOUT LINGERING IS AN INERT ENFORCER THAT PRINTS GREEN. `user@.service` — which
+    # owns `systemctl --user` timers — is stopped when that user's last session ends unless lingering is
+    # enabled, and this installer is normally run from a bring-up ssh session on a box nobody stays
+    # logged into. `enable --now` succeeds, `--status` says `active`, the bring-up prints "disk reaper
+    # scheduled", the session ends, and the timer never fires again — the same false PASS as the
+    # transient-HOME unit and the masked exit codes, through the branch advertised as "a cell without
+    # sudo still gets a clock". So the check is part of the install, not an exercise for the reader.
+    if [ "$TARGET" = "user" ]; then
+        linger="$(loginctl show-user "$(id -un)" -p Linger --value 2>/dev/null || true)"
+        if [ "$linger" != "yes" ]; then
+            loginctl enable-linger "$(id -un)" >/dev/null 2>&1 || true
+            linger="$(loginctl show-user "$(id -un)" -p Linger --value 2>/dev/null || true)"
+        fi
+        if [ "$linger" != "yes" ]; then
+            err "REFUSING to report this as installed: a USER timer cannot fire after your session ends"
+            err "without lingering (loginctl show-user $(id -un) -p Linger -> '${linger:-unknown}')."
+            err "Enable it, then re-run:  sudo loginctl enable-linger $(id -un)"
+            err "(The timer IS enabled and will fire while you are logged in — it is the unattended case"
+            err " this box exists for that would silently do nothing.)"
+            return 1
+        fi
+        say "  linger: enabled (the user timer survives logout)"
+    fi
 
     say "installed: target=$TARGET dir=$UNIT_DIR changed=$changed"
     say "  reaper: $REAPER"
@@ -338,7 +411,7 @@ do_uninstall() {
     if [ -n "${SYSTEMD_UNIT_DIR:-}" ]; then
         rm -f "$UNIT_DIR/$UNIT_NAME.service" "$UNIT_DIR/$UNIT_NAME.timer"
     else
-        ${SUDO:-sudo -n} rm -f "$UNIT_DIR/$UNIT_NAME.service" "$UNIT_DIR/$UNIT_NAME.timer"
+        ${SUDO-sudo -n} rm -f "$UNIT_DIR/$UNIT_NAME.service" "$UNIT_DIR/$UNIT_NAME.timer"
     fi
     $SC daemon-reload >/dev/null 2>&1 || true
     say "uninstalled $UNIT_NAME from $UNIT_DIR"

@@ -87,11 +87,19 @@ argv form used to be checked; the environment form was compared raw, so any typo
 (`30m`) made `[ "$age" -lt "$REAP_VENV_MIN_AGE_SECONDS" ]` error, take the else
 branch under `set -uo pipefail` (no `-e`), and fall straight through to reaping — the
 floor silently DISABLED, in the direction that deletes a live lane's env. It failed
-open. The final value (env or argv) is now checked with the same `is_pos_int` the
-free-disk floor uses, and a non-numeric value is refused with **exit 2 and nothing
-removed**. Why `2` and not `3`: `disk-reaper.sh` maps a delegate's `3` to "a delegate
-refused" — the one non-zero code a scheduled unit accepts — and an operator's typo
-must not borrow that colour. `2` is a misconfiguration, and it stays red.
+open.
+
+The final value (env or argv) is now checked with the same `is_pos_int` the `--min-age`
+argv path already used, **and bounded in magnitude**: `is_pos_int` accepts any digit
+string, but `[ -lt ]` parses with strtoimax, so a value above 2^63-1 makes the
+COMPARISON itself error and take the else branch — the same fail-open one size class up.
+A non-numeric or out-of-range value is refused with **exit 2 and nothing removed**.
+
+Why `2` and not `3`: a delegate's `3` is the pass's **fail-closed** code — a RED unit —
+and a typo must not be reachable from any code whose meaning is anything else. `2` is
+the misconfiguration code this script already uses for a bad `--min-age`, and
+`disk-reaper.sh` maps it to a red pass. (It is emphatically not the benign deferral:
+only `pi-cache-reap.sh` `4`/`7` become that, and only for the uv class.)
 
 ## Two entry points, and why both
 

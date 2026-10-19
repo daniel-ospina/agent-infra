@@ -392,6 +392,28 @@ else
   absent "$W_R/.venv" "no .venv remains"
   exists "$W_R/f.txt" "the worktree itself is untouched"
 
+  # E1b a holder in a SUBDIRECTORY keeps the env. `inside()` decides this on a path BOUNDARY, and a
+  # regression to string equality (`[ "$cwd" = "$canon" ]`) would reap a live lane whose process is
+  # merely one level down — with every other case still green, because they all put the holder at the
+  # worktree root. Sibling-prefix is the mirror case: `/x/wt-extra` must NOT count as inside `/x/wt`.
+  echo " E1b a holder one directory DOWN keeps the env, and a sibling-prefix does not count"
+  RE_S="$(newrepo es)"
+  W_S="$(mkwt "$RE_S" sub)"
+  mkdir -p "$W_S/pkg"
+  ( cd "$W_S/pkg" && exec sleep 60 ) &
+  SUB=$!
+  sleep 1
+  out="$(run_real --worktree "$W_S" --apply)"
+  assert_contains "$out" "KEEP live-cwd" "a process cwd'd into a SUBDIRECTORY is a live holder"
+  exists "$W_S/.venv" "the env survives"
+  kill "$SUB" 2>/dev/null
+  wait "$SUB" 2>/dev/null
+  # and with that process gone the same worktree is reapable, so the KEEP above was the holder
+  sleep 1
+  out="$(run_real --worktree "$W_S" --apply)"
+  assert_contains "$out" "REAP lane-exited" "with the subdirectory holder gone, the lane reads dead"
+  absent "$W_S/.venv" "and the env is reclaimed"
+
   echo " E3 the reaper EXCLUDES its own ancestry — otherwise --worktree mode could never reap"
   W_R2="$(mkwt "$RE" self)"
   out="$( cd "$W_R2" && run_real --worktree "$W_R2" --apply )"
