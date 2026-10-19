@@ -348,6 +348,38 @@ OUT="$(run_mac status 2>&1)"; RC=$?
 assert_eq "$RC" "1" "S9 status after uninstall fails (the set is no longer scheduled)"
 run_mac install >/dev/null 2>&1
 
+# ── S9b: `uninstall` must MEASURE the removal, not announce it (#2048 review, BLOCK) ──
+# Every removal step discarded its status, so a directory that could not be written printed
+# `uninstalled` and exited 0 with the artifact still present and the timer still ENABLED — a disarm
+# that does not disarm, on a job whose whole purpose is deleting things.
+run_mac install >/dev/null 2>&1
+chmod 500 "$T/agents"
+OUT="$(run_mac uninstall 2>&1)"; RC=$?
+chmod 700 "$T/agents" 2>/dev/null
+assert_eq "$RC" "1" "S9b an uninstall whose removal FAILS exits 1, not 0"
+assert_contains "$OUT" "INCOMPLETE" "S9b …and says so instead of claiming 'uninstalled'"
+assert_absent "$OUT" "uninstalled alpha" "S9b …never printing the success line it did not earn"
+run_mac uninstall >/dev/null 2>&1
+
+# ── S13: a Darwin render must not put a shim dir on the job's PATH (#427, #2048 review) ──
+# `~/.pi/agent/shims/gh` symlinks into ~/Documents, which TCC denies to a launchd-spawned process: the
+# job resolves gh, gets EPERM and fails closed every hour. install-launchd.sh already strips `*/shims`;
+# the shared renderer must agree, or the two installers disagree about the same box.
+# ⛔ THIS TEST MUST REACH A RENDER. Without ELDATO_ALLOW_TEST_HOME the #446 temp-HOME guard aborts first
+# and the assertion passes on the ABSENCE of output — inert, which is how the plist renderer stayed
+# un-wired while this was green (#2048 review).
+mkdir -p "$T/shims"
+OUT="$(HOME="$T/home" ELDATO_ALLOW_TEST_HOME=1 PATH="$T/shims:$T/bin:/usr/bin:/bin" \
+       PORTABLE_PLATFORM=darwin SJ_LAUNCHD_DIR="$T/agents" bash "$INST" install --preview 2>&1)"; RC=$?
+assert_eq "$RC" "0" "S13 the darwin preview actually RENDERS (rc 0, not the #446 abort)"
+assert_contains "$OUT" "<key>PATH</key>" "S13 …and the plist it renders carries a PATH"
+assert_absent "$OUT" "$T/shims" "S13 a darwin render carries NO shim dir on the job PATH"
+# …and the rule is DARWIN-ONLY, deliberately: a systemd job runs as the user with no TCC boundary, so
+# stripping there would cost a Linux cell tools it can use.
+grep -q 'sj_job_path()' "$HERE/lib/scheduled-jobs.sh" \
+    && ok "S13 the PATH rule lives in ONE helper, so the two renderers cannot drift" \
+    || bad "S13 the PATH rule is duplicated"
+
 echo "── S11/S12 preview writes nothing; artifacts carry no placeholder or masking exit ──"
 fresh_all
 OUT="$(run_lin install --preview 2>&1)"; RC=$?

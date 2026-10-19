@@ -343,9 +343,9 @@ sj_render_systemd() { # sj_render_systemd <id> <destdir> <system|user> [arming-o
         [ "$scope" = system ] && printf 'User=%s\n' "$(id -un)"
         printf 'Environment=HOME=%s\n' "$HOME"
         # The renderer is called by the installer, the farm and the parity gate; the gate's `$PLATFORM`
-        # is NOT part of the library's contract. Defaulting it here keeps a standalone render working
-        # (a bare `$PLATFORM` under `set -u` aborted the render half-way through writing the unit).
-        printf 'Environment=PATH=%s\n' "$(sj_job_path "${PLATFORM:-linux}")"
+        # is NOT part of the library's contract. A bare `$PLATFORM` under `set -u` aborted the render
+        # half-way through writing the unit, so the platform is resolved by ONE helper.
+        printf 'Environment=PATH=%s\n' "$(sj_job_path "$(sj_render_platform)")"
         printf 'Environment=SJ_JOB=%s\n' "$id"
         while IFS= read -r k; do
             [ -n "$k" ] || continue
@@ -416,7 +416,7 @@ $argv
 EOF
         printf '    </array>\n'
         printf '    <key>EnvironmentVariables</key>\n    <dict>\n'
-        printf '        <key>PATH</key>\n        <string>%s</string>\n' "$(sj_xml "$PATH")"
+        printf '        <key>PATH</key>\n        <string>%s</string>\n' "$(sj_xml "$(sj_job_path darwin)")"
         printf '        <key>HOME</key>\n        <string>%s</string>\n' "$(sj_xml "$HOME")"
         printf '        <key>SJ_JOB</key>\n        <string>%s</string>\n' "$(sj_xml "$id")"
         while IFS= read -r k; do
@@ -455,6 +455,18 @@ EOF
 # `install-launchd.sh:launchd_path` strips `*/shims` for the same reason; the shared renderer must
 # apply the same rule or the two installers disagree about the same box. Linux keeps its PATH: systemd
 # runs as the user with no TCC boundary.
+# ⛔ ONE PLATFORM RESOLVER. `sj_job_path` strips the macOS shim dirs, so it must be told the platform —
+# and the renderers are called from the installer, the farm AND the gate, which do not all export
+# `PLATFORM`. Defaulting differently per call site (linux here, darwin there) meant one render embedded
+# the shims while the other stripped them, and the artifacts differed for no reason.
+sj_render_platform() { # sj_render_platform -> darwin|linux, from the caller or the box itself
+    if [ -n "${PLATFORM:-}" ]; then printf '%s\n' "$PLATFORM"; return 0; fi
+    case "$(uname -s 2>/dev/null)" in
+        Darwin) printf 'darwin\n' ;;
+        *)      printf 'linux\n' ;;
+    esac
+}
+
 sj_job_path() { # sj_job_path <platform>
     local out="" p glob_was_off=0
     local IFS=:
@@ -477,7 +489,7 @@ sj_job_path() { # sj_job_path <platform>
 sj_render_value() { # sj_render_value <string>
     local v="$1"
     v="${v//@home/$HOME}"
-    v="${v//@path/$(sj_job_path "${PLATFORM:-linux}")}"
+    v="${v//@path/$(sj_job_path "$(sj_render_platform)")}"
     v="${v//@state/${SJ_STATE_DIR:-$HOME/.pi/agent/state}}"
     v="${v//@repos/${SJ_REPOS:-${SJ_TORTOISE_REPO:-${TORTOISE_REPO:-$HOME/Documents/GitHub/tortoise}}}}"
     v="${v//@tortoise/${SJ_TORTOISE_REPO:-${TORTOISE_REPO:-$HOME/Documents/GitHub/tortoise}}}"

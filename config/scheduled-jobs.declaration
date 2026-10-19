@@ -169,7 +169,9 @@ job worktree-hygiene
   managed=no
   owner=install-launchd.sh
   label=com.tortoise.worktree-hygiene
-  env WORKTREE_HYGIENE_MODE=@state/worktree-hygiene-mode
+  # the mode reaches this job as an ARGV FLAG rendered by install-launchd.sh
+  # ({{WORKTREE_HYGIENE_MODE}} = --dry-run|--apply), not as an env var: nothing reads one.
+  args=@worktree-hygiene-mode @tortoise --repo
 
 job ci-runner-gate
   description=ci runner gate probe

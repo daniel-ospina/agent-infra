@@ -570,19 +570,45 @@ do_uninstall() {
             continue
         fi
         if [ "$PREVIEW" = 1 ]; then say "preview: would remove $id"; continue; fi
+        # ⛔ "uninstalled" IS A MEASUREMENT, NOT AN ANNOUNCEMENT (#2048 review, BLOCK). Every step here
+        # used to discard its status (`|| true`, an unchecked `rm`), so a read-only unit dir printed
+        # `uninstalled` and exited 0 with both artifacts still present and the timer still ENABLED — a
+        # disarm that did not disarm, on a job whose whole purpose is deleting things.
         if [ "$PLATFORM" = linux ]; then
             unit="$(sj_unit "$id")"
-            $SC disable --now "$unit.timer" >/dev/null 2>&1 || true
+            # ⛔ THE READ-BACK IS THE ONLY SOURCE OF THE CLAIM. A failed `disable` is NOT proof that the
+            # artifact survives: measured with a systemd stub that refuses to disable an absent unit,
+            # uninstalling a box with NOTHING installed printed `INCOMPLETE … still installed` and exited
+            # 1 over two files it had just proven absent — a false disarm-failure no re-run could clear.
+            $SC disable --now "$unit.timer" >/dev/null 2>&1 \
+                || warn "$id: 'disable --now' did not confirm — the artifact read-back below decides"
             if [ -n "${SJ_SYSTEMD_UNIT_DIR:-}" ] || [ "$SD_SCOPE" = user ]; then
-                rm -f "$UNIT_DIR/$unit.service" "$UNIT_DIR/$unit.timer"
+                rm -f "$UNIT_DIR/$unit.service" "$UNIT_DIR/$unit.timer" 2>/dev/null || true
             else
-                ${SJ_SUDO:-sudo -n} rm -f "$UNIT_DIR/$unit.service" "$UNIT_DIR/$unit.timer"
+                ${SJ_SUDO:-sudo -n} rm -f "$UNIT_DIR/$unit.service" "$UNIT_DIR/$unit.timer" 2>/dev/null || true
+            fi
+            if [ -f "$UNIT_DIR/$unit.service" ] || [ -f "$UNIT_DIR/$unit.timer" ]; then
+                err "uninstall INCOMPLETE: $id is still installed at $UNIT_DIR/$unit.{service,timer} — nothing is claimed beyond what was read back"
+                rc=1
+                continue
             fi
             $SC daemon-reload >/dev/null 2>&1 || true
         else
             label="$(sj_label "$id")"
             $LC bootout "$LD_DOMAIN/$label" >/dev/null 2>&1 || true
-            rm -f "$LD_DIR/$label.plist"
+            rm -f "$LD_DIR/$label.plist" 2>/dev/null || true
+            if [ -f "$LD_DIR/$label.plist" ]; then
+                err "uninstall INCOMPLETE: $id is still installed at $LD_DIR/$label.plist — nothing is claimed beyond what was read back"
+                rc=1
+                continue
+            fi
+            # …and a job launchd still HOLDS keeps firing on its in-memory definition even with the
+            # plist gone, so "removed from disk" is not "disarmed" until logout (#2048 review).
+            ld_loaded "$label" && {
+                err "uninstall INCOMPLETE: $id is still LOADED as $LD_DOMAIN/$label — it keeps firing until logout"
+                rc=1
+                continue
+            }
         fi
         # The stamp line goes with the job: a stamp for an absent job would report pass_drift=in-sync.
         grep -v "^job=$id " "$STAMP" >"$STAMP.tmp.$$" 2>/dev/null && mv -f "$STAMP.tmp.$$" "$STAMP" 2>/dev/null || true
