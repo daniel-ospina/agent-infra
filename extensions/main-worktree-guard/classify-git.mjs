@@ -6554,6 +6554,24 @@ function _unplaceableFrameReason(t, sessionCwd) {
   return _unjudgeableTargetReason(t.sub, t.target, sessionCwd, "execution directory");
 }
 
+/** The cd chain resolved WITHOUT existence checks — the frame the shell will be in
+ * once the command has created the directories it makes first. `_resolveCdChain`
+ * stops at the first target that does not exist yet (bash's failed-cd semantics),
+ * which is right for judging a command that FAILS but wrong for one that
+ * `mkdir`s first (#1919 final review P1). null when an entry is unresolvable.
+ * @param {Array<string|null>} chain
+ * @param {string} sessionCwd
+ * @returns {string|null}
+ */
+function _lexicalCdChain(chain, sessionCwd) {
+  let cwd = sessionCwd ? resolve(sessionCwd) : process.cwd();
+  for (const target of chain || []) {
+    if (target === null || target === "~" || target.startsWith("~/") || target === "-") return null;
+    cwd = resolve(cwd, target);
+  }
+  return cwd;
+}
+
 /** #1919 — check EVERY `worktree add|move` invocation in a shell command and
  * return the first refusal reason, or null. Each invocation is judged in its
  * OWN execution frame (its resolved cd-chain plus any `-C` hints), so
@@ -6578,20 +6596,36 @@ export function nestedWorktreeTargetViolation(command, sessionCwd = process.cwd(
   try { invocations = allGitInvocations(command, { ...process.env }); } catch { return null; }
   for (const inv of invocations) {
     if (inv.verb !== "worktree") continue;
-    let cwd = _resolveCdChain(_homeExpandedChain(inv.cdChain), sessionCwd);
-    if (cwd !== null) {
-      for (const c of inv.cHints || []) {
-        // Frame wins over the env-seeded `vars` — see the PWD note in _worktreeTargetArg.
-        const ex = _expandCdVars(c, { ...(inv.vars || {}), PWD: cwd });
-        if (ex === null) { cwd = null; break; } // unresolvable `-C $VAR` → unplaceable
-        cwd = resolve(cwd, ex);
+    const chain = _homeExpandedChain(inv.cdChain);
+    // TWO readings of the same `cd` chain, and BOTH are judged (#1919 final
+    // review P1). `_resolveCdChain` keeps the resolved PREFIX when a target does
+    // not exist yet (bash's failed-cd semantics), which is right for a command
+    // that fails — but a command that `mkdir`s the directory FIRST really runs
+    // there. Judging only the truncated frame let
+    // `mkdir -p <hub>/area && cd <hub>/area && git worktree add ../cont/inner`
+    // through: ALLOWED, and the deadlock was re-created inside the hub.
+    const truncated = _resolveCdChain(chain, sessionCwd);
+    const lexical = _lexicalCdChain(chain, sessionCwd);
+    let anyFrame = false;
+    let lastFrame = null;
+    for (const base of [truncated, lexical]) {
+      let cwd = base;
+      if (cwd !== null) {
+        for (const c of inv.cHints || []) {
+          // Frame wins over the env-seeded `vars` — see the PWD note in _worktreeTargetArg.
+          const ex = _expandCdVars(c, { ...(inv.vars || {}), PWD: cwd });
+          if (ex === null) { cwd = null; break; } // unresolvable `-C $VAR` → unplaceable
+          cwd = resolve(cwd, ex);
+        }
       }
-    }
-    if (cwd !== null) {
+      if (cwd === null) continue;
+      if (cwd === lastFrame) continue; // same frame twice
+      anyFrame = true;
+      lastFrame = cwd;
       const reason = nestedWorktreeTargetReason(inv.verb, inv.args, cwd, inv.vars);
       if (reason) return reason;
-      continue;
     }
+    if (anyFrame) continue;
     // UNPLACEABLE frame. An absolute target carries its own meaning and is still
     // judged (a frame cannot change an absolute path); a RELATIVE one is judged
     // through its literal prefix — see _unjudgeableTargetReason.

@@ -351,6 +351,20 @@ try {
   expect("A22: …while a VAR-less `worktree list` through xargs is untouched",
     nestedWorktreeTargetViolation("printf 'x' | xargs git worktree list", hub), null);
 
+  // A23 (#1919 final review P1): a `cd` into a directory the command CREATES is
+  // judged in the TRUNCATED frame by walker cd semantics, so the real target went
+  // unchecked: `mkdir -p <hub>/area && cd <hub>/area && git worktree add
+  // ../cont/inner` was ALLOWED and re-created the deadlock. BOTH readings are
+  // judged now.
+  expectTrue("A23: mkdir-then-cd-then-add (container target) is REFUSED",
+    typeof nestedWorktreeTargetViolation(`mkdir -p ${hub}/area && cd ${hub}/area && git worktree add ../cont/inner -b iw`, hub) === "string",
+    String(nestedWorktreeTargetViolation(`mkdir -p ${hub}/area && cd ${hub}/area && git worktree add ../cont/inner -b iw`, hub)));
+  expectTrue("A23: …and the plain single-level spelling is refused too",
+    typeof nestedWorktreeTargetViolation("mkdir -p .worktrees && cd .worktrees && git worktree add ../wt-x -b wx", hub) === "string",
+    String(nestedWorktreeTargetViolation("mkdir -p .worktrees && cd .worktrees && git worktree add ../wt-x -b wx", hub)));
+  expect("A23: …an EXISTING cd frame behaves as before (ignored layout stays allowed)",
+    nestedWorktreeTargetViolation(`cd ${hub} && git worktree add .worktrees/ok-cd -b okcd`, hub), null);
+
   // ───────────────────────────────────────────────────────────────────────
   // Part B — real index.ts load + handler-driven gate
   // ───────────────────────────────────────────────────────────────────────
@@ -479,6 +493,17 @@ try {
       // ALLOWED, creating the worktree inside the hub.
       const r15 = await bash(`cd ${hub} && git worktree add "$PWD/esc-pwd" -b escp`, hub);
       expectTrue("B15: `cd <hub> && git worktree add \"$PWD/x\"` → BLOCKED", blocked(r15), JSON.stringify(r15?.reason?.slice(0, 90)));
+
+      // B16 (#1919 final review P2): a DOCUMENT that merely QUOTES the incident's
+      // line is not an attempt to run it. Writing a note/README/plan containing
+      // `git worktree add 8779-optA` was BLOCKED and named a worktree that does
+      // not exist; heredoc BODIES are masked now. A real command AFTER the
+      // heredoc is still judged.
+      const doc = `cat > ${join(hub, "note.md")} <<'EOF'\nNever run: git worktree add 8779-optA\nEOF`;
+      const r16 = await bash(doc, hub);
+      expectTrue("B16: a heredoc BODY quoting the command → ALLOWED (it is data)", allowed(r16), reasonOf(r16).slice(0, 120));
+      const r16b = await bash(`cat > ${join(hub, "n2.md")} <<'EOF'\nprose\nEOF\ngit worktree add nested-after-doc -b nad`, hub);
+      expectTrue("B16: …but a REAL invocation after the heredoc is still BLOCKED", blocked(r16b), JSON.stringify(r16b?.reason?.slice(0, 90)));
 
       // B9: the env hatch still bypasses the new gate (documented in its reason).
       process.env.AGENT_ALLOW_MAIN_EDITS = "1";
