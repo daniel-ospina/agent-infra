@@ -222,9 +222,10 @@ if [ -e "$DEST/extensions/cmux-session.ts" ]; then
 else
   ok "cmux-session.ts is NOT installed (surface-absent deny holds)"
 fi
-# #2100 — a cell must not carry the capture extension. Measured 2026-10-19 on all three cells:
-# `tortoise-capture` flushes its spool SYNCHRONOUSLY at session_start, and with the quota
-# exhausted every turn ended with banner-only output (259-262 B) — the box looked dead while its
+# #2100 — a cell must not carry the capture extension. Measured 2026-10-19: on the AFFECTED cell
+# (`tortoise-capture` was present on all three, and the provider-probe half of the defect applied
+# on all three; which box lost its turns depended on its spool/quota state) the extension consumed
+# the turn and every turn ended with banner-only output (259-262 B) — the box looked dead while its
 # provider was healthy. `cell-install.sh` re-shipped it from the manifest's ship-list on every
 # bringup, so operationally disabling it did not survive; the deny is the fix, and it must hold
 # WITHOUT anyone remembering to hand-remove the cell copy.
@@ -373,6 +374,18 @@ if [ ! -e "$DEST/extensions/tortoise-capture" ]; then
   ok "a hand-pushed tortoise-capture was REMOVED by the re-run (#2100: bringup no longer re-ships it)"
 else
   fail "a hand-pushed tortoise-capture survived the re-run — bringup re-ships the box-breaking extension"
+fi
+# ... and the same removal must hold when the denied path is a DANGLING SYMLINK, not a directory.
+# `-e` follows a link, so a predicate written with `-e` alone sees nothing here: the copy survives
+# every re-run while `--verify` fails on it, so `--check` loops verify-FAIL -> install-that-cannot-
+# repair -> FATAL forever. The install half duplicates the verify half's predicate, so it can drift
+# alone; this is the case that catches that drift.
+ln -sfn "$TMP/nowhere" "$DEST/extensions/tortoise-capture"
+run_install >/dev/null 2>&1
+if [ ! -e "$DEST/extensions/tortoise-capture" ] && [ ! -L "$DEST/extensions/tortoise-capture" ]; then
+  ok "a DANGLING SYMLINK at the denied path was removed by the re-run (the deny follows the same predicate as --verify)"
+else
+  fail "a dangling symlink at the denied tortoise-capture path SURVIVED the re-run — the install half's predicate has drifted from --verify's"
 fi
 if [ ! -e "$DEST/tools/fleet" ]; then
   ok "a legacy tools/fleet/ was migrated out of pi's boot-blocking namespace (#1277)"

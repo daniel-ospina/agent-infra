@@ -62,12 +62,14 @@
 #        duplicate-payload defect — the live laptop file is v4 (+18.8 KB, #1138) while the
 #        repo snapshot is v2, so a copied one is stale the moment it lands.
 #
-#      * `tortoise-capture` — measured 2026-10-19 on all three cloud cells (#2100): with the
-#        25,000-point quota exhausted the spool reached 3.9 MB / 357 queued uploads, work it did
-#        synchronously consumed the turn, and every turn ended with banner-only output
-#        (259-262 B) — a box that looked dead while its provider was healthy. Its banner also
-#        lands on stdout/stderr, so `cloud-cell-bringup.sh --check`'s provider probe read the
-#        capture banner instead of the provider's answer and refused a healthy box.
+#      * `tortoise-capture` — measured 2026-10-19 (#2100): on the AFFECTED cell the spool reached
+#        3.9 MB / 357 queued uploads against an exhausted 25,000-point quota, the extension's
+#        synchronous work consumed the turn, and every turn ended with banner-only output
+#        (259-262 B) — a box that looked dead while its provider was healthy. The extension was
+#        present on all three cells and the provider-probe half of the defect applied on all three;
+#        which box lost its turns depended on its own spool/quota state. Its banner also lands on
+#        stdout/stderr, so `cloud-cell-bringup.sh --check`'s provider probe read the capture banner
+#        instead of the provider's answer and refused a healthy box.
 #        ⛔ THE CELL'S COPY IS NOT THIS CHECKOUT'S COPY. It emitted `[tortoise-capture] install
 #        probe recorded`, and that string exists in no file under `extensions/tortoise-capture/`
 #        — so the cell ran a payload that differs from the repo, the duplicate-payload class the
@@ -96,9 +98,10 @@
 #        registrations (custom-provider-openrouter/, custom-provider-qwen/), reflect-hook.ts,
 #        slack-bridge/. These read keys/surfaces the operator may set in
 #        the cell's keys.env, and each is documented to degrade gracefully. (reflect-hook.ts
-#        shares `tortoise-capture`'s hosted-capture path but writes no per-turn stdout line, so
-#        it keeps its documented no-op — the deny is by measured failure mode, not by directory
-#        name.) `carousel-designer.ts`
+#        shares `tortoise-capture`'s hosted-capture path but does no work on the turn path — its
+#        only hook is `session_shutdown`, with the POST bounded at 10 s — so it keeps its
+#        documented no-op; the deny is by measured failure mode, not by directory name, and a
+#        registration-time banner alone is not one.) `carousel-designer.ts`
 #        and `design-reviewer.ts` are also installed: recorded decision #45 KEEPS them in
 #        agent-infra as canonical with a graceful no-op when ELDATO_ROOT is unset, so
 #        env-gating them here would be adopting over a decision.
@@ -543,9 +546,14 @@ install_unfarm() {
 
 # ── 2. extensions ────────────────────────────────────────────────────────────
 denied_extension() {
-  local base="$1" d
+  local base="${1%/}" d
   for d in "${DENY_EXTENSIONS[@]}"; do
-    [ "$d" = "$base" ] && return 0
+    # Normalised on BOTH sides: the manifest writes `foo/` and `read_manifest_entries` strips it,
+    # while the sweeps below also accept either form. Without this, a deny entry written the way
+    # the manifest spells it (`tortoise-capture/`) matches NOTHING here — the install half ships
+    # the copy, the sweep then deletes it, and `verify_layer`'s content loop fails a CLEAN cell
+    # with `extension MISSING` on every bring-up (fails closed, but bricks provisioning).
+    [ "${d%/}" = "$base" ] && return 0
   done
   return 1
 }
@@ -580,7 +588,10 @@ install_extensions() {
     dbase="${d%/}"
     # `-e` follows a symlink, so a DANGLING link at this path is invisible to it; `-L` catches it.
     { [ -e "$DEST/extensions/$dbase" ] || [ -L "$DEST/extensions/$dbase" ]; } || continue
-    rm -rf "$DEST/extensions/$dbase"
+    # An unchecked `rm -rf` would log "removed" over a survivor. `verify_layer` runs at the end of
+    # `--install` and would still refuse the cell, so this is not a false PASS — but a log that
+    # contradicts itself two lines later is exactly what sends an operator down the wrong path.
+    rm -rf "$DEST/extensions/$dbase" || die "could not remove the denied extension at $DEST/extensions/$dbase — the cell would keep running it"
     say "removed denied extension: $dbase ($(denied_extension_note "$dbase"))"
     removed=$((removed + 1))
   done

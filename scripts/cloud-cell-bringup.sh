@@ -266,6 +266,17 @@ check_network() {
 }
 
 # ── (2) provider key, verified by a REAL call ───────────────────────────────────
+# answer_line <text> — the provider's answer, if the text carries one. LINE-based over the WHOLE
+# output, never `tail`: on the cells the last three lines were a capture banner while the answer sat
+# above them (#2100). The ONE exclusion is a byte-identical echo of the instruction — a `pi` (or a
+# wrapper) that prints its own argv would otherwise "answer" itself with no model call. A model that
+# repeats the instruction around the token has still answered, so only the exact echo line is dropped
+# (`-xF`): the earlier `grep -vF 'Reply with exactly'` discarded any line containing the phrase, which
+# turned a verbose-but-correct answer into a false `provider probe failed`.
+answer_line() {
+  printf '%s\n' "$1" | grep -F 'LANE_READY' | grep -vxF 'Reply with exactly: LANE_READY' | head -1
+}
+
 check_provider() {
   if [ -f "$ENV_FILE" ]; then
     source_env_file
@@ -287,60 +298,71 @@ check_provider() {
   # Probe by EXECUTION. The image's ANTHROPIC key is present-but-invalid, so the
   # presence of the variable proves nothing.
   #
-  # ⛔ TWO PROBES, AND THEIR ORDER IS THE CONTRACT (#2100). Measured 2026-10-19 on all three
-  # cells: this function used to run ONE probe — `pi -p … 2>&1 | tail -3` with the WHOLE extension
-  # layer loaded — so whatever an extension wrote became "the provider's answer". On a
-  # quota-exhausted box `tortoise-capture` emitted banner lines only (259-262 B), the last three
-  # lines were the banner, and the bring-up reported `FATAL: provider probe failed` for a box whose
-  # provider was healthy (`pi` returned LANE_READY as soon as the extension was gone). The opposite
-  # error is just as bad, and a single isolated probe trades one for the other: a layer that
-  # swallows every turn would sail through a `--no-extensions` probe and the box would report CELL
-  # READY while being unusable. So measure BOTH, and let each one answer the question only it can:
-  #   1. LAYER-LOADED first, because that is what a lane actually does (`pi -p` with extensions).
-  #      An answer here proves the provider AND the layer — one call, the common case.
-  #   2. If it does not answer, the ISOLATED probe (`--no-extensions`) attributes the cause. If the
-  #      provider answers there, the LAYER is the culprit and the finding NAMES the layer (a warn,
-  #      because the provider is proven healthy and a transient blip must not turn a healthy box
-  #      into the #2100 false FATAL). If it does not answer there either, the provider is at fault
-  #      and the classification below (spawn-gate refusal / 401 / generic) is authoritative.
-  # `--no-extensions` also excludes `clamp-output-floor.ts`, which ships on cells and prints a
-  # registration-time banner on stderr BY DESIGN — a second, deliberately noisy writer in this very
-  # channel. And NEITHER probe `tail`s its output: the ANSWER is extracted from the whole stream
-  # (excluding the echoed prompt), so nothing an extension, pi or the provider prints can displace
-  # or truncate it. `--no-extensions` does NOT disable the spawn-point gate: that is
-  # `$CELL_HOME/.pi/agent/bin/pi` on PATH, not an extension, so the #1884 refusal below still fires.
-  local out answer detail layer_out layer_answer layer_detail
-  layer_out="$(timeout 120 pi -p --no-session --provider deepseek --model deepseek-flash \
-                'Reply with exactly: LANE_READY' 2>&1)"
-  layer_answer="$(printf '%s\n' "$layer_out" | grep -F 'LANE_READY' | grep -vF 'Reply with exactly' | head -1)"
-  if [ -n "$layer_answer" ]; then
-    ok "provider call works (pi returned LANE_READY, extension layer loaded)"
-    return 0
-  fi
-  # The layer's own output, bounded, so a long banner cannot bury the reason in the log.
-  layer_detail="$(printf '%s\n' "$layer_out" | grep -v '^[[:space:]]*$' | tail -5)"
+  # ⛔ TWO PROBES, AND THE ORDER IS THE CONTRACT (#2100). This function used to run ONE probe —
+  # `pi -p … 2>&1 | tail -3` with the WHOLE extension layer loaded — so whatever an extension wrote
+  # became "the provider's answer". Measured 2026-10-19 (#2100, one box unusable while two ran
+  # lanes; the extension was present on all three and the probe defect applied on all three): the
+  # affected cell's `tortoise-capture` consumed the turn with banner lines only (259-262 B), the
+  # last three lines were the banner, and the bring-up reported `FATAL: provider probe failed` for a
+  # box whose provider was healthy (`pi` returned LANE_READY as soon as the extension was gone).
+  #
+  #   (1) THE PROVIDER VERDICT comes from the ISOLATED probe (`--no-extensions`) FIRST. It must be
+  #       the authoritative one, because it is the only probe the layer cannot answer for: a
+  #       spool-replaying or banner-printing extension that emits the token would otherwise satisfy
+  #       a layer-loaded probe and short-circuit this check, certifying a cell over a dead key. An
+  #       answer here proves the key; NO answer here is a provider verdict, and the classification
+  #       below (spawn-gate refusal / 401 / timeout / generic) owns it.
+  #   (2) THE LAYER is then measured, because a provider-only probe would let a layer that swallows
+  #       every turn certify a cell that cannot run a lane (the mirror of the #2100 false FATAL).
+  #       This is what a lane actually does: `pi -p` with the extension layer loaded. It is tried
+  #       TWICE before it fails, so a single cold-start miss is not read as a broken layer, and it
+  #       FAILS (naming the layer and stating the provider answered) rather than warning beside a
+  #       `CELL READY` banner — a green readiness line over a box whose turns produce no answer is
+  #       the false PASS this whole script exists to remove.
+  # `--no-extensions` also excludes `clamp-output-floor.ts` and `reflect-hook.ts`, which ship on
+  # cells and print registration-time banners by design — two more writers in this very channel.
+  # It does NOT disable the spawn-point gate: that is `$CELL_HOME/.pi/agent/bin/pi` on PATH, not an
+  # extension, so the #1884 refusal still fires on both probes.
+  local out answer detail rc=0 layer_out layer_detail layer_rc attempt
   out="$(timeout 120 pi -p --no-session --no-extensions --provider deepseek --model deepseek-flash \
-          'Reply with exactly: LANE_READY' 2>&1)"
-  answer="$(printf '%s\n' "$out" | grep -F 'LANE_READY' | grep -vF 'Reply with exactly' | head -1)"
-  if [ -n "$answer" ]; then
-    # The provider is healthy — so the layer is what swallowed the turn. WARN, never FATAL: a
-    # provider failure is unprovable here, and #2100's whole defect was a healthy box refused.
-    warn "the provider answered with extensions DISABLED but NOT with the layer loaded — an extension is swallowing the turn (#2100). Loaded-layer output: $layer_detail"
-    return 0
+          'Reply with exactly: LANE_READY' 2>&1)" || rc=$?
+  answer="$(answer_line "$out")"
+  if [ -z "$answer" ]; then
+    # Diagnostics only — the classification below decides.
+    detail="$(printf '%s\n' "$out" | grep -v '^[[:space:]]*$' | tail -5)"
+    case "$out" in
+      # ⛔ agent-infra#1884: `pi` is the SPAWN POINT now, and it refuses above the box's load ceiling —
+      # which is NOT a provider failure. Without this arm the refusal lands in the catch-all below and
+      # the bring-up reports "provider probe failed" for a call that never reached a provider, sending
+      # an operator to re-push a perfectly good key. The remedy for a refusal is capacity, so say that.
+      *'[pi-gate] REFUSED'*)
+        die "provider probe NOT RUN: the pi spawn point refused the launch (1-min load is at or above MAX_LOAD on this box). That is CAPACITY, not the provider — quieten the box (or raise MAX_LOAD deliberately) and re-run. Last output: $detail" ;;
+      *authentication_error*|*invalid*x-api-key*|*401*)
+        die "provider key REJECTED (401). The image's pre-set key is stale — push a valid one." ;;
+    esac
+    # `timeout` reports a killed child as 124; that is NOT "the provider answered nothing", and
+    # collapsing the two (the exit status was discarded before #2100's review) sends the operator
+    # after a key that may be perfectly good.
+    [ "$rc" -eq 124 ] && die "provider probe TIMED OUT after 120s (no answer, and no provider error). That is the CALL not completing — check the box's outbound network and load, then re-run. Last output: $detail"
+    die "provider probe failed. Last output: $detail"
   fi
-  # Diagnostics only — the classification below decides.
-  detail="$(printf '%s\n' "$out" | grep -v '^[[:space:]]*$' | tail -5)"
-  case "$out" in
-    # ⛔ agent-infra#1884: `pi` is the SPAWN POINT now, and it refuses above the box's load ceiling —
-    # which is NOT a provider failure. Without this arm the refusal lands in the catch-all below and
-    # the bring-up reports "provider probe failed" for a call that never reached a provider, sending
-    # an operator to re-push a perfectly good key. The remedy for a refusal is capacity, so say that.
-    *'[pi-gate] REFUSED'*)
-      die "provider probe NOT RUN: the pi spawn point refused the launch (1-min load is at or above MAX_LOAD on this box). That is CAPACITY, not the provider — quieten the box (or raise MAX_LOAD deliberately) and re-run. Last output: $detail" ;;
-    *authentication_error*|*invalid*x-api-key*|*401*)
-      die "provider key REJECTED (401). The image's pre-set key is stale — push a valid one." ;;
-  esac
-  die "provider probe failed. Last output: $detail"
+  ok "provider call works (pi returned LANE_READY)"
+
+  # (2) the layer, twice — a lane turn is `pi -p` WITH the layer loaded.
+  for attempt in 1 2; do
+    layer_rc=0
+    layer_out="$(timeout 120 pi -p --no-session --provider deepseek --model deepseek-flash \
+                  'Reply with exactly: LANE_READY' 2>&1)" || layer_rc=$?
+    [ -n "$(answer_line "$layer_out")" ] && { ok "the extension layer answers a lane-shaped turn (attempt $attempt)"; return 0; }
+    # A spawn-gate refusal is CAPACITY, not the layer — classify it before blaming the layer, or the
+    # operator is sent to bisect extensions on a box whose only problem is that it is busy (#1884).
+    case "$layer_out" in
+      *'[pi-gate] REFUSED'*)
+        die "provider probe NOT RUN: the pi spawn point refused the LAYER-LOADED probe (1-min load is at or above MAX_LOAD on this box). That is CAPACITY, not the provider and not an extension — quieten the box (or raise MAX_LOAD deliberately) and re-run. Last output: $(printf '%s\n' "$layer_out" | grep -v '^[[:space:]]*$' | tail -5)" ;;
+    esac
+  done
+  layer_detail="$(printf '%s\n' "$layer_out" | grep -v '^[[:space:]]*$' | tail -5)"
+  die "the PROVIDER is healthy (it answered with extensions disabled) but the EXTENSION LAYER produced no answer in two attempts (last exit $layer_rc) — a lane turn on this box would produce no answer, which is #2100's shape. Find the extension writing to stdout at session start / load time, or remove it from the cell. Loaded-layer output: $layer_detail"
 }
 
 # ── (3) gh auth, via a pushed token file ────────────────────────────────────────
