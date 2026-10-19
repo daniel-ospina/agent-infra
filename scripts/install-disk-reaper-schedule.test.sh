@@ -346,8 +346,9 @@ OUT="$(PATH="$T/bin/probe:$PATH" HOME="$T/home-tmp3" DISK_REAPER="$PASSFILE" \
     DISK_REAPER_PLATFORM=darwin DISK_REAPER_AGENTS_DIR="$T/agents-446c" LAUNCHCTL="$T/bin/launchctl" \
     DISK_REAPER_PYTHON="$T/bin/fakepython" DISK_REAPER_STATE_DIR="$T/state-x" \
     bash "$INST" --install 2>&1)"; RC=$?
-assert_eq "$RC" "3" "T6 an UNDETERMINABLE real home is DECLINED (fail-closed, never a silent install)"
+assert_eq "$RC" "4" "T6 an UNDETERMINABLE real home is a FAILURE (4), never a decline (fail-closed)"
 assert_contains "$OUT" "cannot determine the real home" "T6 and names the probe it could not answer with"
+assert_contains "$OUT" "NOT a decline" "T6 and says out loud that this is not the 'not this box' code (setup.sh reports it)"
 assert_nofile "$T/agents-446c/com.eldato.disk-reaper.plist" "T6 and registers nothing"
 printf "$GETENT_STUB" >"$T/bin/probe/getent"; chmod +x "$T/bin/probe/getent"; rm -f "$T/bin/probe/id"
 # …and a HOME that differs only in SPELLING is the same home (#2048 review, P2): a trailing slash used
@@ -586,6 +587,37 @@ inst_lin --uninstall >/dev/null 2>&1
 inst_lin --install >/dev/null 2>&1
 assert_contains "$(cat "$SVC")" "disk-reaper.sh --dry-run" \
     "T12 after --uninstall a fresh install is report-only again (the stamp was the memory)"
+
+# ── T12b: the ARMING has a date, and a sync does not move it (#2048 review, P3) ──────────────────
+# `installed_at=` is re-dated by EVERY install, so it cannot answer "since when has this box been
+# DELETING?". The docs call arming a dated owner step; without armed_at= the only dated artifact on
+# the box re-dates itself at each sync and the claim is prose. This discriminates: the arming date
+# must be PRESENT, must SURVIVE a no-flag re-install unchanged, and must differ from installed_at=
+# (which does move) — otherwise the field is just installed_at under another name.
+LIN_STAMP="$T/state-lin/disk-reaper.schedule"
+inst_lin --install --apply >/dev/null 2>&1
+ARMED_AT_1="$(sed -n 's/^armed_at=//p' "$LIN_STAMP")"
+ARMED_BY_1="$(sed -n 's/^armed_by=//p' "$LIN_STAMP")"
+[ -n "$ARMED_AT_1" ] && ok "T12b an explicit arming is DATED on the box (armed_at=)" \
+    || bad "T12b an explicit arming records when it was made (armed_at= was empty)"
+[ -n "$ARMED_BY_1" ] && ok "T12b …and ATTRIBUTED (armed_by=), so 'who armed this' is answerable" \
+    || bad "T12b an explicit arming records who made it (armed_by= was empty)"
+sleep 1.1   # a second of wall clock, so a re-date is visible rather than a same-second tie
+inst_lin --install >/dev/null 2>&1   # exactly what setup.sh / sync.sh does
+assert_eq "$(sed -n 's/^armed_at=//p' "$LIN_STAMP")" "$ARMED_AT_1" \
+    "T12b a NO-FLAG re-install ADOPTS the arming date — a sync does not re-date the deletion decision"
+[ "$(sed -n 's/^installed_at=//p' "$LIN_STAMP")" != "$ARMED_AT_1" ] \
+    && ok "T12b …while installed_at= DID move (so armed_at= is not just installed_at renamed)" \
+    || bad "T12b installed_at= should move on a re-install; armed_at= must not"
+assert_contains "$(inst_lin --status 2>&1)" "armed_at=$ARMED_AT_1" \
+    "T12b --status publishes the arming date (the question an operator actually asks)"
+assert_contains "$(inst_lin --status 2>&1)" "armed_by=" "T12b --status publishes the arming's attribution"
+# An EXPLICIT reversal is a NEW decision, so it re-dates (the date belongs to the current stance).
+inst_lin --install --dry-run >/dev/null 2>&1
+assert_eq "$(sed -n 's/^armed=//p' "$LIN_STAMP")" "dry-run" "T12b an explicit reversal rewrites the stance"
+[ "$(sed -n 's/^armed_at=//p' "$LIN_STAMP")" != "$ARMED_AT_1" ] \
+    && ok "T12b …and re-dates it (a reversal is a decision, not a drift)" \
+    || bad "T12b an explicit reversal should re-date the arming"
 
 echo
 echo "──────────────────────────────────────────────────────────────────────"

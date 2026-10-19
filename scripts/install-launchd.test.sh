@@ -432,9 +432,9 @@ assert_not_contains "$OUT1" "skill-lint-oracle: installed + loaded" "retired ora
 # ⛔ This count is the inventory of ACTIVE jobs, and part of it is HOST-DEPENDENT BY DESIGN: the
 # installer resolves {{TORTOISE_REPO}} from the environment AND from disk (install-launchd.sh:76-82 —
 # `$INFRA_ROOT/../tortoise`, `$HOME/Documents/GitHub/tortoise`, `$HOME/tortoise`), so a checkout
-# beside this one installs branch-reaper (#1787) + worktree-reaper (#1311) and a bare CI checkout
+# beside this one installs branch-reaper (#1787) + worktree-hygiene (#2053) and a bare CI checkout
 # does not. A pinned total is therefore red on one of the two surfaces whichever number is chosen,
-# and a pinned total measured here reads higher beside a checkout. So: 9 always-installable jobs pinned by
+# and a pinned total measured here reads higher beside a checkout. So: 8 always-installable jobs pinned by
 # name, plus whichever {{TORTOISE_REPO}}-gated templates THIS run installed, derived from the
 # fixture's own template dir — with the gated inventory itself pinned at 2, so a newly added gated
 # job cannot raise both sides of the equation at once.
@@ -447,17 +447,32 @@ for _tpl in "$TEMPLATES"/*.plist; do
     case "$OUT1" in *"$(basename "$_tpl" .plist): installed + loaded"*) GATED_INSTALLED1=$((GATED_INSTALLED1 + 1)) ;; esac
 done
 assert_eq "$GATED_TEMPLATES1" "2" "the {{TORTOISE_REPO}}-gated inventory is accounted for (branch-reaper #1787 + worktree-hygiene #2053 — the per-class reapers #2048 retired are no longer gated templates)"
-# A visible checkout whose resolution produced NOTHING is a regression, not a host without one. Ask
-# the same three candidates install-launchd.sh:76-82 asks (the fixture's HOME is the fake one the run
-# used, so §13/§14's seeded checkouts cannot make this look resolved).
+# THREE host states are legitimate here, and only two of them install anything (#2048 review):
+#   (a) no tortoise checkout visible            -> nothing gated installs, and that is not a regression;
+#   (b) a checkout WITH a usable .venv/bin/python -> both gated templates install;
+#   (c) a checkout whose gated TARGET cannot resolve (a fresh clone before `uv sync`, so no
+#       .venv/bin/python) -> the installer's verify_targets refuses the rendered target and the whole
+#       install exits 1. That is a box-level configuration state, not a suite regression: the count
+#       arithmetic below is still correct for it (0 gated installed), and the message must name the
+#       cause rather than report a broken invariant.
+# So: a visible checkout that produced NOTHING is a regression ONLY when its interpreter is usable.
+# The three candidates are the same three install-launchd.sh:76-82 asks (the fixture's HOME is the fake
+# one the run used, so §13/§14's seeded checkouts cannot make this look resolved).
 GATED_VISIBLE1=0
+GATED_USABLE1=0
 for _cand in "$HOME1/Documents/GitHub/tortoise" "$(cd "$SCRIPT_DIR/.." && pwd)/../tortoise" "$HOME1/tortoise"; do
-    if [ -d "$_cand" ] && [ -d "$_cand/.git" ]; then GATED_VISIBLE1=1; break; fi
+    if [ -d "$_cand" ] && [ -d "$_cand/.git" ]; then
+        GATED_VISIBLE1=1
+        [ -x "$_cand/.venv/bin/python" ] && GATED_USABLE1=1
+        break
+    fi
 done
 if [ "$GATED_INSTALLED1" -eq 0 ] && [ "$GATED_VISIBLE1" -eq 0 ]; then
     ok "no {{TORTOISE_REPO}}-gated job installed — this host resolves no tortoise checkout"
+elif [ "$GATED_INSTALLED1" -eq 0 ] && [ "$GATED_USABLE1" -eq 0 ]; then
+    ok "no {{TORTOISE_REPO}}-gated job installable — a tortoise checkout is visible but has no .venv/bin/python (pre-`uv sync`), so verify_targets refuses its target"
 elif [ "$GATED_INSTALLED1" -eq 0 ]; then
-    bad "a tortoise checkout is visible to the installer but NO {{TORTOISE_REPO}}-gated job installed — either the resolution regressed, or the checkout's .venv/bin/python is missing so verify_targets refused the rendered target"
+    bad "a tortoise checkout with a usable .venv/bin/python is visible but NO {{TORTOISE_REPO}}-gated job installed — the resolution regressed"
 else
     # A PARTIAL set is reachable, and the total alone would absorb it: with branch-reaper's target
     # removed the installer still installs worktree-reaper, then exits non-zero at the end — so
@@ -465,7 +480,7 @@ else
     # invariant instead of relying on the exit code alone.
     assert_eq "$GATED_INSTALLED1" "$GATED_TEMPLATES1" "every {{TORTOISE_REPO}}-gated template installed, or none did"
 fi
-assert_eq "$BOOTSTRAP_COUNT1" "$((8 + GATED_INSTALLED1))" "fresh install bootstraps only active jobs (9 always-installable: canary + tripwire + fleet + pi-session-reaper + balance-watch + pi-task-session-prune + lane-liveness + ci-runner-gate, plus whichever {{TORTOISE_REPO}}-gated jobs this host resolves)"
+assert_eq "$BOOTSTRAP_COUNT1" "$((8 + GATED_INSTALLED1))" "fresh install bootstraps only active jobs (8 always-installable: canary + tripwire + fleet + pi-session-reaper + balance-watch + pi-task-session-prune + lane-liveness + ci-runner-gate, plus whichever {{TORTOISE_REPO}}-gated jobs this host resolves)"
 
 echo "── 2. Retirement: pre-seeded old plists get unloaded + removed ───"
 seed_retired "$HOME2"

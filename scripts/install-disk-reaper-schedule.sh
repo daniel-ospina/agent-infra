@@ -97,7 +97,13 @@
 #                            requires a launchctl shim — same contract as install-launchd.sh, #446)
 #
 # Exit codes: 0 ok · 1 failure (named) · 2 usage · 3 DECLINED, this is not the box (a temp-HOME
-# launchd run, #446) — the caller must not treat a decline as a failure of the box it was handed.
+# launchd run, #446) — the caller must not treat a decline as a failure of the box it was handed ·
+# 4 the real home could not be DETERMINED (getent/dscl/~user all failed).
+# ⛔ 3 AND 4 ARE DIFFERENT FACTS (#2048 review, P2): 3 says "this run is about another machine, so
+# nothing here is a failure"; 4 says "this IS the box and I could not verify it", which the caller MUST
+# report. Folding both into 3 let an account no probe can resolve (an AD/OD-bound Mac) install nothing
+# and still end with `setup.sh` printing SKIPPED and exiting 0 — the exact false PASS this installer
+# exists to remove, one layer up.
 set -uo pipefail
 
 INFRA_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -317,6 +323,25 @@ pass_sha() {
 write_stamp() { # write_stamp <job>
     local sha tmp
     sha="$(pass_sha "$REAPER")"
+    # ⛔ ARMING PROVENANCE (#2048 review, P3). `installed_at=` is re-dated by EVERY install, including
+    # the no-flag one `setup.sh`/`sync.sh` runs, so it cannot answer "since when has this box been
+    # DELETING?". Arming is the one irreversible-ish act in this file, and the docs call it a dated
+    # owner step — so the date is recorded when the arming is DECIDED and carried forward unchanged when
+    # a later install merely adopts it (the `armed-date` discipline install-launchd.sh uses for
+    # worktree-hygiene). `armed_by=` names who/where, because the same box can be armed by a cell's
+    # bring-up or by an owner's shell.
+    local armed_at armed_by
+    if [ "${MODE_EXPLICIT:-0}" = 1 ]; then
+        # An EXPLICIT flag is the decision — a new arming (or a new reversal) re-dates it.
+        armed_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        armed_by="${SUDO_USER:-$(id -un)}@$(hostname 2>/dev/null || printf 'unknown')"
+    else
+        # A no-flag install ADOPTS the existing arming: its date and author must not move.
+        armed_at="$(stamp_field armed_at)"
+        armed_by="$(stamp_field armed_by)"
+        [ -n "$armed_at" ] || armed_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        [ -n "$armed_by" ] || armed_by="${SUDO_USER:-$(id -un)}@$(hostname 2>/dev/null || printf 'unknown')"
+    fi
     mkdir -p "$STATE_DIR" 2>/dev/null || { err "cannot create state dir $STATE_DIR"; return 1; }
     tmp="$STAMP.tmp.$$"
     {
@@ -324,6 +349,8 @@ write_stamp() { # write_stamp <job>
         printf 'scheduler=%s\n' "$SCHEDULER"
         printf 'job=%s\n' "$1"
         printf 'armed=%s\n' "${MODE_FLAG#--}"
+        printf 'armed_at=%s\n' "$armed_at"
+        printf 'armed_by=%s\n' "$armed_by"
         printf 'pass=%s\n' "$REAPER"
         printf 'pass_sha=%s\n' "$sha"
         printf 'installed_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -517,6 +544,11 @@ sd_status() {
     say "last_exit=$last_exit"
     say "interval_seconds=$INTERVAL_SECONDS"
     say "armed=$(armed_from_file "$svc")"
+    # Since WHEN, and by whom — the stamp's own record (never this invocation's flags). A no-flag
+    # re-install adopts both unchanged, so this is the date the box started deleting, not the date of
+    # the last sync (#2048 review, P3).
+    say "armed_at=$(stamp_field armed_at)"
+    say "armed_by=$(stamp_field armed_by)"
     # THE EXIT CODE IS THE CONTRACT (`cloud-cell-bringup.sh` gates on it): 0 only when the timer is
     # actually scheduled. A present-but-disabled timer (or a loaded-but-not-enabled one) is not
     # scheduled in the sense being asserted, and this used to answer 0 for it — a false PASS.
@@ -683,6 +715,8 @@ ld_status() {
     say "next_run=unknown"
     say "interval_seconds=$INTERVAL_SECONDS"
     say "armed=$(armed_from_file "$dest")"
+    say "armed_at=$(stamp_field armed_at)"
+    say "armed_by=$(stamp_field armed_by)"
     # THE EXIT CODE IS THE CONTRACT. A plist on disk that launchd does not hold is NOT scheduled — a
     # `launchctl bootout` (or a failed bootstrap) leaves exactly that, and it used to answer 0.
     if [ -z "$print_out" ]; then
@@ -834,14 +868,16 @@ esac
 # ⛔ EXIT 3 IS "DECLINED — NOT THIS BOX", and it exists so a caller never has to parse prose:
 # `pi-bootstrap/setup.sh` used to duplicate this very probe with its own `dscl` call, which is how two
 # implementations of one decision drift apart. 0 = installed, 3 = not the box this run is about,
-# anything else = a real failure the caller must report.
+# 4 = this box, but the probe could not answer (a FAILURE the caller must report), anything else = a
+# real failure.
 if [ "$PLATFORM" = darwin ] && [ "${ELDATO_ALLOW_TEST_HOME:-}" != "1" ]; then
     real_home="$(resolve_real_home)"
     if [ -z "$real_home" ]; then
         err "refusing to manage launchd jobs: cannot determine the real home for '$(id -un)' (getent, dscl and ~user all failed), so a throwaway HOME cannot be ruled out (#446)."
         err "       A temp-HOME run registers jobs against plist paths that vanish."
+        err "       ⛔ This is NOT a decline: an unanswerable probe on the real box leaves it UNSCHEDULED."
         err "       Tests: put a launchctl shim on PATH and set ELDATO_ALLOW_TEST_HOME=1"
-        exit 3
+        exit 4
     fi
     if [ "$(norm_path "$HOME")" != "$(norm_path "$real_home")" ]; then
         err "refusing to manage launchd jobs: HOME=$HOME is not the real home ($real_home)."

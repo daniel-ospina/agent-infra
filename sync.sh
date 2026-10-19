@@ -69,13 +69,24 @@ git fetch origin --quiet || { echo "⚠️  fetch failed (offline?) — nothing 
 git pull --ff-only origin main || { echo "⚠️  pull failed — local changes or divergence. Run: git status"; exit 1; }
 
 echo "==> refreshing pi config"
-# ⛔ NOT `set -e`-FATAL (#2048). `setup.sh` now exits non-zero when it finishes over a Mac whose
-# disk-reaper schedule could not be installed — correct, because "Done!" over an unscheduled box is the
-# false PASS #2048 removes. But an abort HERE would skip every guard below it (#304's plist-propagation
-# re-run, #341's cost-config drift check, the #498/#502 extension-farm parity gate) on EVERY auto-sync,
-# for as long as the reaper install keeps failing — one loud failure silently disabling unrelated ones.
-# So the failure stays loud and the sync continues.
-./pi-bootstrap/setup.sh || echo "⚠️  setup.sh reported a failure (see above) — CONTINUING the sync so the guards below still run" >&2
+# ⛔ NOT `set -e`-FATAL — but NOT swallowed either (#2048). `setup.sh` now exits non-zero when it
+# finishes over a Mac whose disk-reaper schedule could not be installed — correct, because "Done!" over an
+# unscheduled box is the false PASS #2048 removes. But an abort HERE would skip every guard below it
+# (#304's plist-propagation re-run, #341's cost-config drift check, the #498/#502 extension-farm parity
+# gate) on EVERY auto-sync, for as long as the reaper install keeps failing — one loud failure silently
+# disabling unrelated ones. So: keep going, and carry the failure to the EXIT STATUS at the end, because
+# a sync that ends "✅" over a failed setup.sh is the same false PASS one layer up.
+setup_rc=0
+./pi-bootstrap/setup.sh || setup_rc=$?
+if [ "$setup_rc" -ne 0 ]; then
+  # rc 3 is the installer's DECLINE ("this is not the box", #446) bubbled up through setup.sh; that is
+  # not a failure of this machine. Anything else is.
+  if [ "$setup_rc" -eq 3 ]; then
+    echo "⚠️  setup.sh declined this run (rc=3 — not this box, #446); the guards below still run" >&2
+  else
+    echo "⚠️  setup.sh reported a failure (rc=$setup_rc, see above) — CONTINUING the sync so the guards below still run" >&2
+  fi
+fi
 
 # #304 propagation trigger: setup.sh runs the installer on macOS, but
 # re-running it here makes a merged plist-template bump apply on the next
@@ -110,4 +121,8 @@ if [ -x ./scripts/check-pi-config-extensions.sh ]; then
   bash ./scripts/check-pi-config-extensions.sh
 fi
 
+if [ "$setup_rc" -ne 0 ] && [ "$setup_rc" -ne 3 ]; then
+  echo "⛔ sync finished, but setup.sh FAILED (rc=$setup_rc) — this machine is not fully configured; see above" >&2
+  exit 1
+fi
 echo "==> sync complete ✅"

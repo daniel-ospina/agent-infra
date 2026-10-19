@@ -164,9 +164,13 @@ survive a reboot, or never get pulled in at boot), or a plist left behind by `la
 `1` and names the state it read — a file on disk is not a job on the clock.
 
 **`setup.sh` delegates the "is this the box?" decision** instead of repeating it: the installer answers
-with an exit code (`0` installed · `3` declined, not this box — a temp-HOME run, #446 · anything else a
-real failure), so one decision has one implementation and a temp-HOME run is skipped out loud rather
-than reported as a failure of a machine it was never about. The same-home test is by *path*: a trailing
+with an exit code (`0` installed · `3` declined, not this box — a temp-HOME run, #446 · `4` this box,
+but the real home could not be **determined** (getent/dscl/`~user` all failed) · anything else a real
+failure), so one decision has one implementation and a temp-HOME run is skipped out loud rather than
+reported as a failure of a machine it was never about. ⛔ `3` and `4` are **different facts**, and
+folding them together is a false PASS: `3` says *nothing here is a failure*, `4` says *this IS the box
+and it is now UNSCHEDULED*, so `setup.sh` reports `4` as a failure (an account no probe can resolve —
+an AD/OD-bound Mac — must not install nothing and still read green). The same-home test is by *path*: a trailing
 slash, or a `$HOME` that reaches the same directory through a symlink, is the same box — a guard that
 refuses a correctly-configured machine is not safe, it is silent.
 
@@ -296,7 +300,7 @@ failed/stale/never, 2 usage.
 | T14 | a host with neither binary still **classifies** (candidates found, rc=5) and names the fallback; a stub `timeout` on PATH is preferred, and then the report gains no provenance line (#2046) |
 | T15 | a missing `scripts/lib/bounded.sh`, or an unusable `TB_TIMEOUT_BIN`, is a **refusal at startup** (exit 3, no per-class line, no pass record) — never per-class `fail-closed` (#2046) |
 
-`scripts/install-disk-reaper-schedule.test.sh` — 188 assertions, its own `run-bash-shards.sh` shard —
+`scripts/install-disk-reaper-schedule.test.sh` — 189 assertions, its own `run-bash-shards.sh` shard —
 owns the SCHEDULE (`disk-reaper.test.sh` owns the pass):
 
 | | |
