@@ -315,6 +315,34 @@ def test_rest_pages_the_requested_window_and_refuses_a_partial_read(monkeypatch)
     assert reached == [], "an unauthenticated read must be refused BEFORE any request"
 
 
+# ── a row that shifts across a page boundary is counted ONCE ────────────────
+def test_a_row_that_shifts_across_a_page_boundary_is_not_counted_twice(monkeypatch):
+    """The window is paged by OFFSET over a LIVE order (`sort=updated&direction=desc`), so a PR
+    updated between two requests jumps to the front and pushes one row across the
+    (page-1)*per_page boundary: that row is returned by BOTH pages. `compute()` counts the rows
+    it is handed, so the duplicate inflated `open_prs`/`merged_today` — the "never invent a
+    number" class this fallback must not add. Measured before the guard: a 200-row read returned
+    200 rows with only 198 distinct, rows 99 and 150 repeated.
+    """
+    monkeypatch.setattr(bp, "_token", lambda: "test-token")
+
+    def fake_get(url, tok, timeout=None):
+        page = int(url.rsplit("page=", 1)[1])
+        if page == 1:
+            # Row 150 was just updated, so it moves to the head of the live order.
+            return [rest_row(150, merged_at=MERGED_TODAY)] + [rest_row(n) for n in range(1, 100)]
+        # Page 2 now begins one row earlier: 99 was already on page 1.
+        return [rest_row(n) for n in range(99, 200)]
+
+    monkeypatch.setattr(bp, "_rest_get_json", fake_get)
+    rows = bp._rest_prs("open", limit=200)
+    assert rows is not None
+    numbers = [r["number"] for r in rows]
+    assert len(numbers) == len(set(numbers)), (
+        "a repeated row is counted twice — `open_prs` and `merged_today` are sums of these rows")
+    assert 99 in numbers and 150 in numbers, "dedupe must drop the REPEAT, not the row itself"
+
+
 # ── token: env first, then gh's hosts.yml — and never on stdout ─────────────
 def test_token_prefers_env_then_hosts_yml_and_is_never_logged(monkeypatch, tmp_path, no_cache, capsys):
     """The REST read authenticates with a token this process OWNS, and never prints it.
@@ -382,6 +410,27 @@ def test_token_prefers_env_then_hosts_yml_and_is_never_logged(monkeypatch, tmp_p
     assert bp._token() == "", (
         "a nested account's token is not this block's key — falling through to `gh auth "
         "token` (the ACTIVE account) is the only correct answer")
+
+    # ⛔ AND THE REALISTIC MIXED SHAPE, which is what gh actually WRITES: a `users:` map whose
+    # entries come first, PLUS a block-level `oauth_token`. gh moves the ACTIVE user's token up
+    # to block level when it switches accounts, so the block-level key is the active account's
+    # and the read must use it WITHOUT spawning `gh auth token` at all. Skipping the nested
+    # `gho_OTHER_ACCOUNT` is the whole point; falling through here would be a wasted subprocess,
+    # and reading the nested entry would be another account's token.
+    hosts.write_text(
+        "github.com:\n"
+        "    users:\n"
+        "        other:\n"
+        "            oauth_token: gho_OTHER_ACCOUNT\n"
+        "    user: active\n"
+        "    oauth_token: gho_ACTIVE_BLOCK\n")
+    calls = []
+    monkeypatch.setattr(bp.subprocess, "run", lambda argv, **k: calls.append(argv) or _NoAuth())
+    assert bp._token() == "gho_ACTIVE_BLOCK", (
+        "the block-level token IS the active account's — a mixed config must not reach into "
+        "the nested map, and must not need `gh auth token`")
+    assert calls == [], "the block-level token needs no subprocess"
+    monkeypatch.setattr(bp.subprocess, "run", lambda *a, **k: _NoAuth())
 
     monkeypatch.setenv("GH_TOKEN", "gho_from_env")      # the fleet's own env wins
     assert bp._token() == "gho_from_env"

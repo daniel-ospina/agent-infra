@@ -106,13 +106,19 @@ follows are the reusable ones:
   open-count beside a GraphQL merged-count compares two differently-wrong reads.
 * **`state=closed` is not `state=merged`.** REST's closed window carries PRs closed WITHOUT
   merging; only rows with a non-null `merged_at` may count toward `merged_today`.
-* **The window is paged, and `per_page` never shrinks.** REST caps `per_page` at 100, so the
+* **The window is paged, `per_page` never shrinks, and rows are deduped by number.** REST caps
+  `per_page` at 100, so the
   500/400 windows are `ceil(limit/100)` requests. A page that cannot be read — or the pair
   spending its shared 30 s budget — refuses the WHOLE read instead of returning a short list: a
   silently short window under-counts `merged_today`, which is the one error a fallback must not
   add. `per_page` stays 100 on every page because GitHub derives a request's offset from THAT
   request's `per_page`, so a shrunk final page re-reads an earlier range and leaves a hole; the
-  final page is trimmed after it arrives. The window is the 400 most-recently-updated **closed**
+  final page is trimmed after it arrives. `updated desc` is a LIVE sort, so a PR updated between
+  two requests moves across the page boundary and is returned TWICE (measured: 200 rows, 198
+  distinct, rows 99 and 150 repeated) — the read dedupes by `number`, without which
+  `merged_today`/`open_prs` are inflated. The mirror case is a stated residual: the same shift can
+  drop one row off the tail, which an offset page cannot fix and dedupe does not address. The
+  window is the 400 most-recently-updated **closed**
   PRs and unmerged rows are dropped after it is read, so today's updated closed PRs — not today's
   merges alone — must fit in 400 for `merged_today` to be exact. That is a stated bound, not a
   promise.
@@ -123,13 +129,15 @@ follows are the reusable ones:
   entry in `last-limit`. The token is read from `GH_TOKEN`/`GITHUB_TOKEN`, else the `oauth_token`
   of the **`github.com:` block** in `${GH_CONFIG_DIR:-~/.config/gh}/hosts.yml` (a `hosts.yml` that
   lists another host first must not donate that host's token — it answers 401 against
-  `api.github.com`; nor may a token nested under a per-account `users:` map, which is a different
-  account and is skipped by depth — so a multi-account config falls through to `gh auth token`,
-  i.e. the ACTIVE account), else `gh auth token` for a keyring-backed config; that lookup is
-  OFFLINE and the layer does not count it as a request. The token is never logged — pinned at the
-  finder as well as the transport, since a `print()` inside `_token()` is upstream of the value
-  the rest of the file sees — and a box with no credential at all refuses (`unavailable`) rather
-  than reading anonymously.
+  `api.github.com`; nor may a token nested under a per-account `users:` map, whose entries belong
+  to other accounts and are skipped by depth. The block's own `oauth_token` is what gh itself
+  uses — switching accounts moves the active user's token UP to block level — so a config with
+  both a `users:` map and a block-level token still answers with the ACTIVE account; only a file
+  with no block-level token falls through to `gh auth token`, which answers the ACTIVE account and
+  is an OFFLINE lookup the layer does not count as a request). The token is never logged — pinned
+  at the finder as well as the transport, since a `print()` inside `_token()` is upstream of the
+  value the rest of the file sees — and a box with no credential at all refuses (`unavailable`)
+  rather than reading anonymously.
 
 **Not covered by this fallback, stated rather than assumed:** the two `gh issue list` reads (the
 P0/P1 tiers) are still GraphQL, so where the adapter is absent a refusal there still takes the
