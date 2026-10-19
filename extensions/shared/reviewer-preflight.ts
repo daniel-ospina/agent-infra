@@ -129,7 +129,8 @@ const HEAD_BINDING =
 const ARTIFACT_RULE =
   "post the reviewer's verdict as a PR comment — that comment IS the --evidence artifact";
 
-/** "…dispatch; …record; …rail; …artifact" — shared by both roles so the lines cannot diverge. */
+/** "…dispatch; …record; …rail; …artifact" — shared by both SELF lines (pre-flight and first push)
+ * so those two cannot diverge; the harness and reviewer roles have their own framing. */
 function commandTrail(): string {
   return (
     `dispatch: ${REVIEWER_PREFLIGHT_DISPATCH_CMD}; ` +

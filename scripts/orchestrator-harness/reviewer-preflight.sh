@@ -54,7 +54,6 @@ REVIEWER_PREFLIGHT_DISPATCH_CMD="task(prompt='[REVIEW] review the diff of PR <PR
 # and code-review skills point ("`~/.pi/agent/scripts` is not on PATH").
 REVIEWER_PREFLIGHT_RECORD_CMD='~/.pi/agent/scripts/record-review.sh <PR> <HEAD> clean [owner/repo] --evidence comment:<review-comment-id>'
 REVIEWER_PREFLIGHT_TAG='[gate]'
-REVIEWER_PREFLIGHT_BRIEF_TEMPLATE='templates/LANE-BRIEF.md'
 REVIEWER_HEAD_BINDING='a record bound to an older head is stale and the rail refuses it, so record AFTER the last push'
 # ⛔ THE SELF LINE'S HEDGE (review of #2148, P1). `KIND` is exported by THIS repo's launchers, but the
 # content-repo copy (tortoise/operations/orchestrator-harness/lane.sh) exports the bypass bundle and

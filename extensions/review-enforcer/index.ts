@@ -375,8 +375,55 @@ function unquotedOnly(command: string): string {
   return out;
 }
 
+/**
+ * Blank out HEREDOC BODIES (and their terminator) so a `git push` written into a commit message or a
+ * note file cannot fire the notice.
+ *
+ * ⛔ `unquotedMask` models quotes only — a heredoc body is DATA, not a command, and the mask cannot
+ * see it. Measured on this change: `git commit -F - <<'MSG' … git push … MSG` and
+ * `cat >> NOTES.md <<'EOF' … git push … EOF` both read as a push, and because the notice has a
+ * ONCE-PER-SESSION budget, the mention SPENT it — so the lane's real push got no notice at all. That
+ * is the failure the mask was added to prevent, one construct over (fresh review, P2).
+ *
+ * Deliberately conservative: a heredoc whose terminator is not found, or an unterminated one, is
+ * left ALONE (the notice may then fire early — it is a notice, never a block, and a spurious extra
+ * line is cheaper than a spurious silence). `<<<` here-strings are not heredocs and are untouched.
+ * Gating is unaffected: this is applied by `isPushOrPrCreateCommand` only, which no gate consults.
+ */
+export function stripHeredocBodies(command: string): string {
+  const lines = command.split("\n");
+  const out: string[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    const open = /<<(-?)\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\2/.exec(lines[i]);
+    if (!open) {
+      out.push(lines[i]);
+      continue;
+    }
+    const stripTabs = open[1] === "-";
+    const word = open[3];
+    // Keep the COMMAND line (the redirect is part of it), drop the body and the terminator.
+    out.push(lines[i].slice(0, open.index) + lines[i].slice(open.index, open.index + open[0].length));
+    let j = i + 1;
+    let closed = false;
+    for (; j < lines.length; j++) {
+      const probe = stripTabs ? lines[j].replace(/^\t+/, "") : lines[j];
+      if (probe === word) {
+        closed = true;
+        break;
+      }
+    }
+    if (!closed) {
+      // Unterminated: keep the remainder as it was (never silently drop a command).
+      for (let k = i + 1; k < lines.length; k++) out.push(lines[k]);
+      return out.join("\n");
+    }
+    i = j; // skip body + terminator; the loop's ++ moves past the terminator
+  }
+  return out.join("\n");
+}
+
 export function isPushOrPrCreateCommand(command: string): boolean {
-  const text = unquotedOnly(command);
+  const text = unquotedOnly(stripHeredocBodies(command));
   return GIT_PUSH_PATTERN.test(text) || GH_PR_CREATE_PATTERN.test(text);
 }
 

@@ -18,9 +18,9 @@
  *       (#285).
  *   (d) THE DRIFT PIN — load-bearing. The same wording lives in TypeScript (this module) and in
  *       bash (scripts/orchestrator-harness/reviewer-preflight.sh, which the harness sources).
- *       Neither language can import the other, so the helper is EXECUTED and its two rendered
- *       lines are compared to this module's BYTE FOR BYTE, in both roles. A command renamed in one
- *       file and not the other goes red here, naming the helper.
+ *       Neither language can import the other, so the helper is EXECUTED and its rendered lines are
+ *       compared to this module's BYTE FOR BYTE, in all three roles. A command renamed in one file
+ *       and not the other goes red here, naming the helper.
  *   (e) THE RECORD COMMAND CAN ACTUALLY MINT A RECORD. `record-review.sh` refuses a FRESH `clean`
  *       without `--evidence` (tortoise#7391, exit 3), so the disclosed invocation must carry it —
  *       otherwise the lane is handed a command that fails exactly when it is trying to land.
@@ -103,7 +103,7 @@ ok(
   "it says the verdict must be POSTED as a PR comment (that comment is the --evidence artifact)",
 );
 
-// ── (b) the two roles ─────────────────────────────────────────────────────────
+// ── (b) the three roles ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
 // ⛔ THE RECORD COMMAND MUST NOT BE REPO-RELATIVE (fresh review, P1). The disclosure is printed
 // inside a lane whose cwd is a CONTENT repo (tortoise/eldato), which has no
 // `scripts/record-review.sh`; the production copy lives in `~/.pi/agent/scripts/`, where

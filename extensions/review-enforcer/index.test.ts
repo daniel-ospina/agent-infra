@@ -6321,6 +6321,30 @@ test("#2148: isPushOrPrCreateCommand — the early moment, and what is NOT it", 
   ok(!isPushOrPrCreateCommand("rg -n 'gh pr create' docs/"), "…nor a mention inside a search pattern");
   // ...and the mask must not hide a REAL push that merely has a quoted argument after it.
   ok(isPushOrPrCreateCommand('git push -u origin "feat/x"'), "a push whose ARGUMENT is quoted still fires");
+  // ⛔ HEREDOC BODIES ARE DATA TOO (fresh review, P2). The quote mask cannot see them, so a push
+  // written into a commit message or a note file fired the notice and SPENT its once-per-session
+  // budget — the real push then got nothing at all.
+  ok(
+    !isPushOrPrCreateCommand("git commit -F - <<'MSG'\nfeat: x\n\nlater we will git push\nMSG"),
+    "a push mentioned inside a heredoc BODY is not a push (the notice must not spend its budget)",
+  );
+  ok(
+    !isPushOrPrCreateCommand("cat >> NOTES.md <<'EOF'\nrun git push to land\nEOF"),
+    "…nor a heredoc body appended to a file",
+  );
+  ok(
+    !isPushOrPrCreateCommand('git commit -F - <<"MSG"\nlater: gh pr create\nMSG'),
+    "…nor a double-quoted heredoc delimiter",
+  );
+  // ...and the strip must not swallow a REAL push that follows the terminator.
+  ok(
+    isPushOrPrCreateCommand("cat > NOTES.md <<'EOF'\nnotes\nEOF\ngit push -u origin feat/x"),
+    "a real push AFTER a heredoc still fires (the terminator ends the body)",
+  );
+  ok(
+    isPushOrPrCreateCommand("git commit -F - <<-EOF\n\tnotes\n\tEOF\ngh pr create --title x"),
+    "…including the tab-stripping <<- form, and a chained PR create",
+  );
 });
 
 test("#2148: reviewerRoleFor — the harness's KIND decides the audience (the roles disagree on purpose)", () => {
