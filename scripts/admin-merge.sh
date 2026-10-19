@@ -1556,8 +1556,10 @@ say_rate_limit_note() {
   say_err "   about the credential, the --repo or the PR number, and it is NOT evidence that the"
   say_err "   PR is unreadable: the secondary/concurrency limit is shared across the whole account"
   say_err "   and is NOT visible in 'gh api rate_limit', so a healthy counter there is not evidence"
-  say_err "   to the contrary. The gh shim already paced this call and waited out its budget before"
-  say_err "   it gave up (AGENT_GH_GATE_MAX_ATTEMPTS), so the window outlasted that budget."
+  say_err "   to the contrary. IF the gh shim is in your PATH it already paced this call and"
+  say_err "   waited out its budget before giving up (AGENT_GH_GATE_MAX_ATTEMPTS), so the window"
+  say_err "   outlasted that budget; if it is NOT in your PATH (a human shell, launchd, a caller that"
+  say_err "   set GH_LIMIT_NO_WAIT) this call was NOT paced and the window may simply be long."
   say_err "   A rate-limited call is RETRYABLE: re-run the rail once the limit has cleared, and do"
   say_err "   NOT switch to a raw merge — that bypasses this rail rather than the rate limit."
 }

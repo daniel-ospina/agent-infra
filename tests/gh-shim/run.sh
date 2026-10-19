@@ -1142,7 +1142,7 @@ esac
 
 
 
-echo "== 15. cycle-2 review: no deletion, no stall, no leak, a visible degraded gate (#1910 review) =="
+echo "== 16. cycle-2/3 review: no deletion, no stall, no leak, a visible degraded gate (#1910 review) =="
 
 # (a) ⛔ WORKDIR OWNERSHIP. `gate_init` falls back to the OPERATOR'S $TMPDIR when `mktemp -d`
 #     fails, and run_paced's cleanup was `[ "$GATE_DIR" = "$WORKDIR" ] || rm -rf "$WORKDIR"` —
@@ -1164,23 +1164,42 @@ fi
 
 # (b) AN UNAVAILABLE MUTEX FAILS OPEN PROMPTLY. Re-looping to the admission deadline turned a
 #     courtesy gate into a 299 s in-shim block (measured) that consumed a bounded caller's own
-#     budget. A lock held by a LIVE pid cannot be reaped, so it is the honest fixture.
+#     budget. ⛔ THE HOLDER MUST BE A LIVE PROCESS THIS USER OWNS: `kill -0 1` returns EPERM for a
+#     non-root user, which the shim reads as "dead holder", reaps the lock and succeeds — so a
+#     pid-1 fixture never enters the `return 2` path and passes on the pre-fix code too.
 GDIR="$(gate_dir lockbusy)"
 GREAL="$TMP/gate-real-lockbusy"
 printf '#!/usr/bin/env bash\necho \x27{"ok":true}\x27\n' > "$GREAL"; chmod +x "$GREAL"
-mkdir -p "$GDIR/admit.lock"; printf '1\n' > "$GDIR/admit.lock/pid"   # pid 1 is alive by definition
+sleep 60 &
+_LOCKHOLDER=$!
+mkdir -p "$GDIR/admit.lock"; printf '%s\n' "$_LOCKHOLDER" > "$GDIR/admit.lock/pid"
 _ls=$(date +%s)
 AGENT_GH_REAL="$GREAL" AGENT_GH_GATE_DIR="$GDIR" AGENT_GH_GATE_INTERVAL_MS=0 \
   bash "$SHIM" api user >/dev/null 2>&1
 _le=$(date +%s)
+kill "$_LOCKHOLDER" 2>/dev/null; wait "$_LOCKHOLDER" 2>/dev/null
 [ $(( _le - _ls )) -le 15 ] \
   && pass "an uncontestable mutex fails OPEN in $(( _le - _ls ))s, not $(( ${AGENT_GH_GATE_ACQUIRE_TIMEOUT:-300} ))s" \
   || fail "an uncontestable mutex blocked the caller for $(( _le - _ls ))s — the gate's failure mode was a stall"
 
+# (b2) A CALLER THAT DECLARED ITS OWN BOUND IS NOT SLEPT OUT OF A SHARED WINDOW EITHER. This was
+#      the last path by which a NO_WAIT caller still reported STALL: the window is capped by
+#      RETRY_MAX (900 s default), and `wait_for_cooldown` ran BEFORE the NO_WAIT check.
+GDIR="$(gate_dir nowaitwin)"
+_until=$(( $(date +%s) * 1000 + 15000 ))
+printf '%s\n' "$_until" > "$GDIR/cooldown.$_until.$$"
+_ns=$(date +%s)
+GH_LIMIT_NO_WAIT=1 AGENT_GH_REAL="$GREAL" AGENT_GH_GATE_DIR="$GDIR" AGENT_GH_GATE_INTERVAL_MS=0 \
+  bash "$SHIM" api user >/dev/null 2>&1
+_ne=$(date +%s)
+[ $(( _ne - _ns )) -le 5 ] \
+  && pass "a NO_WAIT caller is not slept out of a 15 s shared window (elapsed $(( _ne - _ns ))s)" \
+  || fail "a NO_WAIT caller was slept out of a shared window ($(( _ne - _ns ))s) — STALL, not RATE-LIMITED"
+
 # (c) A DEGRADED GATE MUST STILL LEAVE A TRACE. The note says the call runs "UNGATED (announced)",
 #     and the buffered copy is discarded on success — so nothing was recorded anywhere, and the
 #     runbook's "read the log" had nothing to read.
-_degraded="${TMPDIR:-/tmp}/gh-gate-degraded.$(id -u 2>/dev/null)"
+_degraded="${HOME:-${TMPDIR:-/tmp}}/.pi/agent/gh-gate-degraded.log"
 rm -f "$_degraded"
 AGENT_GH_REAL="$GREAL" AGENT_GH_GATE_DIR="/proc/nope/gate" bash "$SHIM" api user >/dev/null 2>&1
 [ -s "$_degraded" ] \

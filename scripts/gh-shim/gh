@@ -114,8 +114,10 @@
 #   - a `retry-after` that `[ ]` cannot hold (more than 9 digits) is treated as ABSENT rather
 #     than clamped: the comparison would error (an errored test reads FALSE), the `*1000` would
 #     wrap, and the wrapped value would be written into the SHARED cooldown — parking every lane
-#     on the box for ~10^15 years with no self-heal. `cooldown_remaining_ms` additionally drops
-#     any deadline further ahead than RETRY_MAX, so a poisoned file heals on the next read.
+#     on the box. `cooldown_remaining_ms` additionally drops any deadline further ahead than
+#     `COOLDOWN_ABS_MAX_S` (**86400 s, a FIXED constant** — deliberately not a per-lane knob, so
+#     one lane's `RETRY_MAX` cannot delete a window the whole box is waiting on), so a poisoned
+#     file heals on the next read.
 #   - the retry is per WHOLE COMMAND. Below `gh-limit.py`'s own 4 attempts this MULTIPLIES: a
 #     call can execute up to 3 (this gate) x 4 (that layer) times, including non-idempotent
 #     creates and comments. "The tighter layer wins" is true for concurrency and for a single
@@ -478,7 +480,12 @@ gate_note() {
   if [ -n "${GATE_DIR:-}" ] && [ -d "$GATE_DIR" ]; then
     printf '%s gh-gate: %s\n' "$(date -u +%s 2>/dev/null)" "$*" 2>/dev/null >> "$GATE_DIR/events.log"
   else
-    printf '%s gh-gate: %s\n' "$(date -u +%s 2>/dev/null)" "$*" 2>/dev/null >> "${TMPDIR:-/tmp}/gh-gate-degraded.$(id -u 2>/dev/null)"
+    # ⛔ OWNED DIRS ONLY. The degraded trace must not be a predictable name in a world-writable
+    # directory: `>>` follows symlinks, so on a shared /tmp another user could pre-create
+    # `/tmp/gh-gate-degraded.<uid>` as a symlink and choose the file we append to. Prefer the
+    # user's own tree (the same base gate_init uses for the default gate dir).
+    printf '%s gh-gate: %s\n' "$(date -u +%s 2>/dev/null)" "$*" 2>/dev/null \
+      >> "${HOME:-${TMPDIR:-/tmp}}/.pi/agent/gh-gate-degraded.log"
   fi
   return 0
 }
@@ -495,6 +502,12 @@ flush_notes() {
     cat "$NOTEF" >&2 2>/dev/null
     : 2>/dev/null > "$NOTEF"
   fi
+  return 0
+}
+
+cleanup_workdir() {
+  rm -f "$NOTEF" "$errf" 2>/dev/null
+  [ "${WORKDIR_OWNED:-0}" -eq 1 ] && rm -rf "$WORKDIR" 2>/dev/null
   return 0
 }
 
@@ -803,7 +816,7 @@ gate_init() {
 # exec cannot inspect stderr, so it can neither honour `retry-after` nor tell a burst
 # refusal from a real failure.
 run_paced() {
-  local rc=0 tries=0 rem wait_ms interactive=0 errf
+  local rc=0 tries=0 rem wait_ms interactive=0 errf adm=0
   gate_init
   NOTEF="$WORKDIR/notes.$$"
   errf="$WORKDIR/err.$$"
@@ -825,16 +838,29 @@ run_paced() {
   fi
   while :; do
     if [ "$GATE_ON" -eq 1 ]; then
-      wait_for_cooldown
+      # ⛔ A DECLARED-BOUND CALLER IS NOT SLEPT INSIDE — NOT EVEN OUT OF A SHARED WINDOW. The
+      # window is capped by RETRY_MAX (900 s by default), which is 3x the admission bound and far
+      # past the 60-420 s budgets the NO_WAIT contract exists for, so waiting it out re-created the
+      # STALL this gate is supposed to prevent. Such a caller asks immediately and gets the refusal
+      # back; the window is still honoured by every caller that did not declare a bound.
+      if no_wait_wanted; then
+        gate_note "the account is in a shared rate-limit window — this call is NOT waiting it out (caller set NO_WAIT); it may be refused"
+      else
+        wait_for_cooldown
+      fi
       if [ "$NESTED" -eq 0 ]; then
-        if ! admit_slot; then
-          gate_note "no gh slot free within $(( ACQUIRE_TIMEOUT_MS / 1000 ))s — running this call UNGATED (announced)"
-        fi
+        admit_slot; adm=$?
+        # The two fail-open exits are NOT the same event: 1 = the slot cap was reached after
+        # ACQUIRE_TIMEOUT, 2 = the mutex itself could not be taken (~LOCK_TIMEOUT_MS). Reporting
+        # both as "no slot free within 300s" sends an operator hunting a starvation that did not
+        # happen, on the one surface (events.log) the runbook tells them to read.
+        [ "$adm" -eq 2 ] && gate_note "the gate mutex is unavailable (lock_acquire spent ${LOCK_TIMEOUT_MS}ms) — running this call UNGATED (announced)"
+        [ "$adm" -eq 1 ] && gate_note "no gh slot free within $(( ACQUIRE_TIMEOUT_MS / 1000 ))s — running this call UNGATED (announced)"
         # Another lane may have been refused while we queued for the slot. Honour its
         # window BEFORE asking: that re-check is what makes a burst one refusal, not N.
         if rem="$(cooldown_remaining_ms)"; then
           release_slot
-          continue
+          no_wait_wanted || continue
         fi
       fi
       pace_tick
@@ -850,7 +876,7 @@ run_paced() {
       rc=$?
       release_slot
       flush_notes "$rc"
-      rm -f "$NOTEF" "$errf" 2>/dev/null
+      cleanup_workdir
       exit "$rc"
     fi
     # ⛔ THE CAPTURE FILE MUST NOT BE ABLE TO STOP THE CALL. bash performs a redirection BEFORE
@@ -863,7 +889,7 @@ run_paced() {
       rc=$?
       release_slot
       flush_notes "$rc"
-      rm -f "$NOTEF" 2>/dev/null
+      cleanup_workdir
       exit "$rc"
     fi
     # `<&0` is REQUIRED: a background job in a non-interactive shell is handed /dev/null for stdin
@@ -895,8 +921,7 @@ run_paced() {
   release_slot
   [ -s "$errf" ] && cat "$errf" >&2 2>/dev/null
   flush_notes "$rc"
-  rm -f "$errf" "$NOTEF" 2>/dev/null
-  [ "$WORKDIR_OWNED" -eq 1 ] && rm -rf "$WORKDIR" 2>/dev/null
+  cleanup_workdir
   exit "$rc"
 }
 
