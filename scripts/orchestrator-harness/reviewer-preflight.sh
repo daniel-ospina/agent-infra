@@ -22,9 +22,13 @@
 #   self     the lane lands its own PR through the rail (a controller-written brief, e.g. the
 #            one this repo's controllers hand to a cell lane). The LANE dispatches, fixes, records
 #            at the current head, then runs the rail.
-#   harness  lane.sh's own lane: `merge-one.sh` runs the fresh-context reviewer for the PR and
-#            records the attestation itself. The LANE must not merge and must not amend the head
-#            casually — a moved head voids the attestation and pays for a second review.
+#   harness  a worker that pushes code (lane.sh's own lane, fix-one.sh's fixer, a bg worker):
+#            `merge-one.sh` runs the fresh-context reviewer for the PR and records the attestation
+#            itself. The LANE must not merge and must not amend the head casually — a moved head
+#            voids the attestation and pays for a second review.
+#   reviewer merge-one.sh's OWN reviewer session (`KIND=reviewer`): it posts the verdict as a PR
+#            comment and reports `CLEAN <comment-url>`; it must not push, record or merge. No brief
+#            section — merge-one.sh composes that prompt itself.
 #
 # ⛔ ONE WORDING, TWO LANGUAGES. The same requirement sentence and the same three command strings
 # live in extensions/shared/reviewer-preflight.ts (the pi-side disclosure). The drift pin in

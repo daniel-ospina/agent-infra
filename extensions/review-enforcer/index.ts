@@ -384,11 +384,11 @@ export function isPushOrPrCreateCommand(command: string): boolean {
  * #2148 — WHICH AUDIENCE the disclosure addresses. The harness exports `KIND` at every worker's
  * spawn point (`lane.sh` → `lane`, `fix-one.sh` → `fixer`, `merge-one.sh` → `reviewer`,
  * `nonblocking-dispatch.sh` → `bg`), so a worker session is identifiable without guessing from the
- * cwd or the brief. A KIND this list does not know falls back to `self` — the SAFER default here is
- * disclosure over silence: an extra line in an interactive session costs nothing, while a harness
- * worker told it must land its own PR is a contradiction in its own context.
+ * cwd or the brief. A KIND this list does not know falls back to `self`, whose line names the
+ * override for that case (a brief saying "no task tool") — disclosure over silence, and true for
+ * both audiences rather than a guess between them.
  *
- * ⛔ This matters because the two audiences are told OPPOSITE things about who dispatches: a
+ * ⛔ This matters because the audiences are told OPPOSITE things about who dispatches: a
  * `lane.sh` brief says "you have NO task tool — do NOT dispatch … Do NOT merge", so a self-role
  * disclosure injected into that same context would instruct two forbidden actions (found by two
  * independent fresh reviewers on this change).
@@ -2019,6 +2019,16 @@ export function isDiffSha256(v: unknown): v is string {
  */
 const RECORD_SH = "~/.pi/agent/scripts/record-review.sh";
 
+/**
+ * The caveat every message carries when the verdict is INTERPOLATED (`${record.verdict}`) instead of
+ * written out: the message cannot branch on the verdict without re-literalising the vocabulary the
+ * C7 pin forbids at a call site, so it names the requirement in the same sentence instead. A
+ * message that prints a `clean` invocation with no `--evidence` anywhere hands the lane a command
+ * that exits 3 — the defect this issue is about, one branch over (reviews of #2148, P1).
+ */
+const EVIDENCE_CAVEAT =
+  "(a clean verdict also needs --evidence comment:<review-comment-id>; clean-low/clean-micro do not)";
+
 export type MergeGateResult =
   | { status: "block"; reason: string; reasonTag?: string }
   | { status: "failopen"; warning: string }
@@ -2110,8 +2120,7 @@ export function evaluateMergeGate(
           `❌ Could not verify head of PR #${pr} via gh (repo context: ${ctx.source}) — head verification is mandatory for sub-agent merges.`,
           "   → The sub-agent cannot complete the merge ceremony here.",
           "   → Return to the parent session: it records the review and runs the merge interactively.",
-          `   →   ${RECORD_SH} <PR> <head_sha> ${record.verdict} [owner/repo]` +
-          " (a clean verdict also needs --evidence comment:<review-comment-id>; clean-low/clean-micro do not)",
+          `   →   ${RECORD_SH} <PR> <head_sha> ${record.verdict} [owner/repo] ` + EVIDENCE_CAVEAT,
           "   → The #138 fail-open (merge without head verification) is interactive-only; sub-agent merges are fail-closed (#285).",
         ].join("\n"),
       };
@@ -2124,11 +2133,8 @@ export function evaluateMergeGate(
     // review at micro; the reverse would downgrade a real review).
     const advice =
       ctx.source === "fallback" && !ctx.repo
-        ? "The repo could not be resolved (no --repo/GH_REPO/cd, and the session cwd is not a GitHub worktree). If this PR is in " +
-          `another repo, re-record with repo info — ${RECORD_SH} <PR> <head_sha> ${record.verdict} owner/repo — ` +
-          "or pass --repo owner/repo to gh pr merge."
-        : `If this persists, re-record with repo info — ${RECORD_SH} <PR> <head_sha> ${record.verdict} owner/repo — ` +
-          "or pass --repo owner/repo to gh pr merge.";
+        ? `The repo could not be resolved (no --repo/GH_REPO/cd, and the session cwd is not a GitHub worktree). If this PR is in another repo, re-record with repo info — ${RECORD_SH} <PR> <head_sha> ${record.verdict} owner/repo — or pass --repo owner/repo to gh pr merge. ${EVIDENCE_CAVEAT}`
+        : `If this persists, re-record with repo info — ${RECORD_SH} <PR> <head_sha> ${record.verdict} owner/repo — or pass --repo owner/repo to gh pr merge. ${EVIDENCE_CAVEAT}`;
     return {
       status: "failopen",
       warning:
@@ -2192,7 +2198,7 @@ export function evaluateMergeGate(
     const reRecordAdvice =
       record.verdict === "clean-low"
         ? `   → The branch moved — the certified diff no longer exists, so the shape must be re-derived: re-check whether the NEW head is still content-only, then re-record with the verdict named explicitly (${RECORD_SH} <PR> <head_sha> clean-low [owner/repo]); if it is no longer content-only, run the code-review skill and record clean (${RECORD_SH} <PR> <head_sha> clean [owner/repo] --evidence comment:<review-comment-id>).`
-        : `   → The branch moved — re-review the new head, post its verdict as a PR comment, and re-record at the same verdict: ${RECORD_SH} <PR> <head_sha> ${record.verdict} [owner/repo] (a clean verdict also needs --evidence comment:<review-comment-id>; clean-low/clean-micro do not)`;
+        : `   → The branch moved — re-review the new head, post its verdict as a PR comment, and re-record at the same verdict: ${RECORD_SH} <PR> <head_sha> ${record.verdict} [owner/repo] ${EVIDENCE_CAVEAT}`;
     return {
       status: "block",
       reason: [

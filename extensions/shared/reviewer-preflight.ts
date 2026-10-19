@@ -25,14 +25,20 @@
  *   3. the harness prints the same line at lane launch and carries the step in the generated
  *      brief (scripts/orchestrator-harness/reviewer-preflight.sh, lane.sh, templates/LANE-BRIEF.md).
  *
- * ⛔ TWO ROLES, because who dispatches is NOT the same on the two paths — and without this split
+ * ⛔ THREE ROLES, because who dispatches is NOT the same on every path — and without this split
  * the disclosure contradicts the brief it accompanies. A `lane.sh` lane is told by its own brief
  * "you have NO task tool — do NOT dispatch … Do NOT merge"; a `self` line in that same context
  * would instruct exactly those two forbidden things. So:
- *   self     a lane (or interactive session) that lands its own PR: dispatch → fix → record at the
- *            CURRENT head → rail.
- *   harness  a worker started by the harness (`KIND=lane|fixer|reviewer`): `merge-one.sh` mints the
- *            attestation, so the lane pushes its FINAL head and NEVER merges.
+ *   self      a lane (or interactive session) that lands its own PR: dispatch → fix → record at the
+ *             CURRENT head → rail. Carries the no-`task`-tool override for a launcher that exports
+ *             no `KIND` (see `NO_MARKER_HEDGE`).
+ *   harness   a worker that PUSHES CODE (`KIND=lane|fixer|bg`): `merge-one.sh` mints the
+ *             attestation, so the worker pushes its FINAL head and NEVER merges.
+ *   reviewer  `merge-one.sh`'s own reviewer session (`KIND=reviewer`): it OWNS the verdict comment
+ *             and must not push, record or merge — those three are merge-one.sh's.
+ *
+ * The mapping is `reviewerRoleFor` in extensions/review-enforcer/index.ts, pinned there by tests;
+ * the table below is the same mapping, and the two must not be allowed to disagree.
  *
  * ⛔ ONE WORDING, TWO LANGUAGES, AND A DRIFT PIN. The shell helper cannot import TypeScript, so
  * the requirement sentence and the command strings exist in both copies. That is a drift risk, so

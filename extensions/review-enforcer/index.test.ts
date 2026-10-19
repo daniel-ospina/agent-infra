@@ -6266,7 +6266,10 @@ testAsync("#2148: the merge gate still refuses without an attestation, and names
         withoutMandatedRailPath(railNamed) !== railNamed,
         `the disclosed rail (${railNamed}) is the MANDATED rail the gate recognises`,
       );
-      ok(MICRO_BLOCK_MESSAGE.includes("clean-micro"), "…and micro's names its own verdict");
+      ok(
+        MICRO_BLOCK_MESSAGE.includes("~/.pi/agent/scripts/record-review.sh"),
+        "…and the micro block names the recorder by its home path (a bare token is command-not-found)",
+      );
     } finally {
       _setRunGhOverride(null);
       if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
@@ -6419,6 +6422,10 @@ test("#2148: NO message this extension prints spells the recorder as a bare or r
     }) as any).reason,
     (evaluateMergeGate(138, cleanRecord, "b".repeat(40), { source: "record", repo: "owner/repo" }) as any)
       .reason,
+    // ⛔ THE FAIL-OPEN PATH IS A MESSAGE TOO (review of #2148, P2). It returns `{status:"failopen",
+    // warning}` — not `.reason` — so the six-input list above never read it, and it printed a
+    // `clean` invocation with no `--evidence` for a whole review round.
+    (evaluateMergeGate(138, cleanRecord, null, { source: "fallback" }) as any).warning,
   ] as string[];
   for (const [i, reason] of reasons.entries()) {
     ok(!BARE.test(reason), `message #${i} does not spell a bare record-review.sh: ${reason.slice(0, 90)}…`);
@@ -6464,6 +6471,12 @@ test("#2148: every record command in the SOURCE carries the home path and, for c
     });
   // Non-vacuity: the scan must actually see the record commands.
   ok(recordLines.length >= 10, `the scan sees the record-command lines (found ${recordLines.length})`);
+  // …and the shared caveat really does carry the flag the scan accepts in its place.
+  // The declaration wraps onto the next line, so read the two lines from the `=`.
+  const caveatAt = src.findIndex((l) => l.includes("EVIDENCE_CAVEAT ="));
+  ok(caveatAt >= 0, "EVIDENCE_CAVEAT is still declared");
+  const caveatText = src.slice(caveatAt, caveatAt + 2).join(" ");
+  ok(caveatText.includes("--evidence"), "EVIDENCE_CAVEAT names --evidence (the scan accepts it as the flag)");
   for (const { line, i } of recordLines) {
     if (line.includes("resolvePath") || line.includes("RECORD_SH =")) continue;
     ok(
@@ -6473,11 +6486,19 @@ test("#2148: every record command in the SOURCE carries the home path and, for c
     // A `clean` invocation needs the evidence flag — unless the verdict is interpolated, in which
     // case the SAME line must say the flag is needed for clean (the message cannot branch on it
     // without re-literalising the verdict vocabulary, which the C7 pin forbids).
-    if (/clean \[owner\/repo\]/.test(line) && !/clean-micro|clean-low/.test(line)) {
+    // A `clean` invocation needs the evidence flag. That includes a line whose verdict is
+    // INTERPOLATED (`${record.verdict}` can BE clean) — the earlier version of this scan exempted
+    // those, so the fail-open advice kept shipping a command that exits 3 (review of #2148, P2).
+    if (
+      (/clean \[owner\/repo\]/.test(line) && !/clean-micro|clean-low/.test(line)) ||
+      line.includes("${record.verdict}")
+    ) {
+      // The flag may sit in the shared caveat constant rather than on this line; then the
+      // constant's own definition is what must carry it (asserted once, below).
       ok(
-        line.includes("--evidence"),
-        `index.ts:${i} prints a clean invocation WITH --evidence (a fresh clean without it exits 3), ` +
-          `which for an interpolated verdict means naming it in the same sentence`,
+        line.includes("--evidence") || line.includes("EVIDENCE_CAVEAT"),
+        `index.ts:${i} prints a clean-capable invocation WITH --evidence ` +
+          `(a fresh clean without it exits 3, so an interpolated verdict must name it too)`,
       );
     }
   }
