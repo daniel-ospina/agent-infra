@@ -73,10 +73,14 @@ issue (open, labelled P0/P1/P2, unassigned)
   │                           → wait for the gate check to go SUCCESS → `gh pr merge --squash`
   │                   ISSUES  → state/needsfix-<PR>-<head>   (hands off to the fixer)
   │          rail mode  (the repo does NOT require it — e.g. agent-infra):
-  │               `scripts/admin-merge.sh <PR>` — the repo's own rail posts its own head-bound
-  │               evidence and merges. `gh pr merge` is NEVER called here: it would land on the
-  │               required checks alone and bypass the rail. Refused `RAIL_TRIES` (3) times at one
-  │               head → PARK that head (state/parked-<PR> holds the head).
+  │               a head-bound record already at this head → `scripts/admin-merge.sh <PR>`, the
+  │               repo's own rail, which posts its own head-bound evidence and merges.
+  │               NO record at this head → the reviewer path above runs FIRST (#1825): the rail is
+  │               the MERGE authority, not an exemption from the review one, and this repo's only
+  │               required check (`pipeline-compliance` check (c)) accepts nothing but its record.
+  │               `gh pr merge` is NEVER called here: it would land on the required checks alone
+  │               and bypass the rail. Refused `RAIL_TRIES` (3) times at one head → PARK that head
+  │               (state/parked-<PR> holds the head).
   │     5. release the cross-box claim (EXIT trap, bounded to 20s, fenced on our own commit)
   │
   ├─ fix-one.sh (fix-<PR>)   reads the reviewer's findings (and any failing required check's log)
