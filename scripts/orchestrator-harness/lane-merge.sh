@@ -100,9 +100,14 @@ WAIT_S="${LANE_MERGE_WAIT:-1500}";     is_limit "$WAIT_S" || WAIT_S=1500     # p
 # this loop exists to wait for is CI (up to ~24 min under 22 landers) + merge-one.sh's REVIEW_TIMEOUT
 # (1800s) + the rail's own retries ≈ 55-60 min. So the HEALTHY-but-slow PR — precisely the one closest
 # to merging — would exhaust supervision and be reported as BLOCKED_ATTEMPTS with "budget spent": the
-# instrument failing the case it was written for. 35 x 120s = 70 min. It is a runaway guard, not a
-# quality gate, and it is re-armed (below) whenever the lane starts a NEW cycle.
-MAX_WATCH="${LANE_MERGE_MAX_WATCH:-35}"; is_limit "$MAX_WATCH" || MAX_WATCH=35
+# instrument failing the case it was written for.
+# ⛔ BUT IT MUST FIT INSIDE THE LANE'S OWN WALL CLOCK (reviewer finding, P2, verified). 35 x 120s =
+# 4200s EXCEEDS lane.sh's LANE_TIMEOUT (3300s): the bound is then unreachable by the lane that owns
+# it — the process is killed first — and is only ever spent by a LATER lane that inherited the counter,
+# which then hands off with "budget spent" for a budget it never had. 25 x 120s = 3000s, inside the
+# 3300s wall clock with room for the wrap-up. A cycle that genuinely needs longer is not a lane
+# failure: it hands off as WAITING_* (exit 11) and the next invocation resumes the SAME counter.
+MAX_WATCH="${LANE_MERGE_MAX_WATCH:-25}"; is_limit "$MAX_WATCH" || MAX_WATCH=25
 POLL_S="${LANE_MERGE_POLL:-120}";      is_limit "$POLL_S" || POLL_S=120      # one --watch chunk
 INTERVAL="${LANE_MERGE_INTERVAL:-20}"; is_limit "$INTERVAL" || INTERVAL=20
 [ "$INTERVAL" -ge 5 ] || INTERVAL=20
@@ -118,7 +123,10 @@ CHAIN_LOG="$O/logs/lane-merge-$PR.log"
 verdict() { # verdict <TOKEN> <reason…> — the ONE writer, so no exit path can skip the record
   local tok="$1"; shift
   printf '%s %s\n' "$tok" "$*" > "$VERDICT_F"
-  # The ISSUE-keyed copy is what chain-merge.sh waits on (it knows the issue, not the PR).
+  # The ISSUE-keyed copy is lane.sh's post-run diagnostic ("no merge-phase verdict"); chain-merge.sh
+  # waits on the PR-keyed file above ($PR_VERDICT, chain-merge.sh:121). Both are written here, and
+  # neither reader falls back to the other — so a comment naming the wrong file misleads a maintainer
+  # into "fixing" the wrong write (reviewer finding, P2).
   [ -n "$ISSUE" ] && printf '%s %s\n' "$tok" "$*" > "$O/state/lanemerge-issue-$ISSUE.verdict"
   return 0
 }
@@ -163,6 +171,22 @@ pr_read() {
   gh api "repos/$OR/pulls/$PR" \
      --jq '[(.state // ""), (.merged_at // ""), (.head.sha // ""), (.mergeable_state // "")] | join("|")' 2>/dev/null
 }
+# merged_confirmed — the ONLY proof this loop accepts for MERGED. Returns 0 and prints the merge
+# commit (or the merged_at stamp) only when THIS repo's PR reports merged.
+# ⛔ A LOG LINE IS A HINT, NOT AN ARTIFACT (reviewer finding, P0, verified by measurement).
+# `$O/logs/merge-<PR>.log` and `$O/state/merged-<PR>.done` are keyed by PR NUMBER ONLY, and `$O/state`
+# is shared by every repo on the box — so a merge of `tortoise#<same n>` made this loop print
+# "✅ MERGED — PR #<n> at head <tip>", exit 0, and record a MERGED verdict that `chain-merge.sh` then
+# treated as "nothing left to review": the review was skipped, the merge never happened, and the lane
+# read as done. One read, on this terminal path only, settles which PR was actually merged.
+merged_confirmed() {
+  local mt sha
+  mt="$(gh api "repos/$OR/pulls/$PR" --jq '.merged_at // ""' 2>/dev/null)"
+  [ -n "${mt:-}" ] || return 1
+  sha="$(gh api "repos/$OR/pulls/$PR" --jq '.merge_commit_sha // ""' 2>/dev/null)"
+  printf '%s' "${sha:-$mt}"
+}
+
 # checks_read → TSV rows "name\tstatus\tconclusion\tid\tapp_slug", ALL attempts (filter=all is not
 # the default; the app slug is what keeps two workflows sharing a job name from masking each other).
 # ⛔ NO `--paginate` ON THE POLL. `gh-limit.py` deliberately leaves every argv containing
@@ -283,8 +307,15 @@ fi
     if [ "$opid" -gt 0 ] && kill -0 "$opid" 2>/dev/null; then
       # A LIVE owner (the controller's chain, or an earlier round of ours): never spawn a competitor.
       # Record it as the supervision target so --watch can follow it by pid AND by its own log.
-      printf '%s %s %s\n' "$opid" "${head:-}" "$O/logs/merge-$PR.log" > "$CHAIN_F"
-      say "lane-merge: pid $opid already owns PR #$PR — supervising it (log $O/logs/merge-$PR.log)"
+      # ⛔ DO NOT OVERWRITE AN EXISTING RECORD (reviewer finding, P1, verified): stamping the CURRENT
+      # head onto a chain launched for an OLDER head defeats the head-moved guard below, which exists
+      # to notice exactly that. The recorded head is the one the chain is actually working.
+      if [ -s "$CHAIN_F" ]; then
+        say "lane-merge: pid $opid already owns PR #$PR — keeping the recorded head $(chain_head) (log $O/logs/merge-$PR.log)"
+      else
+        printf '%s %s %s\n' "$opid" "${head:-}" "$O/logs/merge-$PR.log" > "$CHAIN_F"
+        say "lane-merge: pid $opid already owns PR #$PR — supervising it (log $O/logs/merge-$PR.log)"
+      fi
       return 0
     fi
     say "lane-merge: a STALE merge lock (pid ${opid:-?} is not alive) — clearing it and taking the PR"
@@ -340,16 +371,37 @@ fi
 # A classifier that greps only the chain log can never return FIX_REQUIRED, so every "the reviewer
 # found issues" outcome would reach the lane as a terminal BLOCK — the one path that turns a paid
 # review into work. The MARKERS are checked first: machine-written, and not mistakable for prose.
-chain_verdict_from_log() { # chain_verdict_from_log <chain-log>
-  local clog="$1" mlog="$O/logs/merge-$PR.log" f seen_needsfix=0
-  [ -f "$O/state/parked-$PR" ] && { echo "BLOCKED"; return; }
-  for f in "$O/state/needsfix-$PR"-*; do [ -e "$f" ] && seen_needsfix=1; done
-  [ "$seen_needsfix" = 1 ] && { echo "FIX_REQUIRED"; return; }
+chain_verdict_from_log() { # chain_verdict_from_log <chain-log> [head]
+  local clog="$1" mlog="$O/logs/merge-$PR.log" f seen_needsfix=0 at="${2:-${HEAD:-}}"
+  # ⛔ `parked-<PR>` IS THE HEAD ITSELF (merge-one.sh:342), so EXISTENCE IS NOT A PARK AT THIS HEAD
+  # (reviewer finding, P2, verified). Reading it by existence reported BLOCKED for a PR whose park was
+  # superseded by a later push — and with an EMPTY reason, because `parkreason-<PR>` was rewritten by a
+  # different cycle. Compare the content.
+  if [ -f "$O/state/parked-$PR" ]; then
+    case "$(cat "$O/state/parked-$PR" 2>/dev/null)" in
+      "$at") [ -n "$at" ] && { echo "BLOCKED"; return; } ;;
+      '')    echo "BLOCKED"; return ;;   # a bare marker (controller-written): no head to compare
+    esac
+  fi
+  # ⛔ THE FIX MARKER IS HEAD-KEYED (`needsfix-<PR>-<head>`, merge-one.sh). A PR-WIDE glob read a marker
+  # from a head the lane has already pushed past as "the reviewer found issues", burning a fix round on
+  # a superseded head — `orch-loop.sh:1335-1339`'s recorded "owned forever" bug, reintroduced here
+  # (reviewer finding, P1, verified). With no head to compare, fall back to the glob and say so.
+  if [ -n "$at" ]; then
+    [ -e "$O/state/needsfix-$PR-$at" ] && { echo "FIX_REQUIRED"; return; }
+  else
+    for f in "$O/state/needsfix-$PR"-*; do [ -e "$f" ] && seen_needsfix=1; done
+    [ "$seen_needsfix" = 1 ] && { echo "FIX_REQUIRED"; return; }
+  fi
   if [ -s "$mlog" ]; then
     tail -n 300 "$mlog" 2>/dev/null | grep -qE 'ISSUES [0-9]+|NOT CLEAN or reviewer failed' \
       && { echo "FIX_REQUIRED"; return; }
-    tail -n 300 "$mlog" 2>/dev/null | grep -qE "MERGED via the rail|Successfully merged|is MERGED" \
-      && { echo "MERGED"; return; }
+    if tail -n 300 "$mlog" 2>/dev/null | grep -qE "MERGED via the rail|Successfully merged|is MERGED"; then
+      # The log SAYS merged; only the API may confirm it (see merged_confirmed). Unconfirmed reads as
+      # UNKNOWN, not MERGED — the caller then refuses to claim a merge rather than claiming a false one.
+      merged_confirmed >/dev/null && { echo "MERGED"; return; }
+      echo "UNCONFIRMED_MERGE"; return
+    fi
     tail -n 300 "$mlog" 2>/dev/null | grep -q 'PARKED' && { echo "BLOCKED"; return; }
   fi
   if [ -s "$clog" ] && tail -n 80 "$clog" 2>/dev/null | grep -q 'reviewer NOT started\|load gate'; then
@@ -500,7 +552,8 @@ if [ "$WATCH" -eq 1 ]; then
     HEAD="${HD:-$(cat "$O/state/lanemerge-$PR.head" 2>/dev/null || true)}"
     case "${ST:-}" in
       closed) if [ -n "${MT:-}" ]; then
-                verdict MERGED "${HD:-}"
+                # MT is `merged_at` off THIS repo's PR read (pr_read), so it is a confirmation, not a hint.
+                verdict MERGED "$(merged_confirmed 2>/dev/null || printf '%s' "${HD:-}")"
                 say "✅ MERGED — PR #$PR at head ${HD:-}"; exit 0
               else
                 emit_blocked BLOCKED_CLOSED "PR #$PR is closed and was not merged by this chain"
@@ -517,9 +570,18 @@ if [ "$WATCH" -eq 1 ]; then
       exit 11
     fi
     if ! chain_alive; then
-      cv="$(chain_verdict_from_log "$(chain_log)")"
+      cv="$(chain_verdict_from_log "$(chain_log)" "${HD:-}")"
       case "$cv" in
-        MERGED)  verdict MERGED "${HD:-}"; say "✅ MERGED — PR #$PR at head ${HD:-}"; exit 0 ;;
+        MERGED)
+          # The classifier already confirmed with one API read; the payload is the merge commit.
+          msha="$(merged_confirmed 2>/dev/null)"
+          verdict MERGED "${msha:-${HD:-}}"
+          say "✅ MERGED — PR #$PR, merge commit ${msha:-?} (was head ${HD:-?})"; exit 0 ;;
+        UNCONFIRMED_MERGE)
+          # ⛔ A MERGE CLAIM NOBODY CAN CONFIRM IS THE WORST OUTCOME HERE (reviewer finding, P0): the
+          # log names a merge, the API says this PR is not merged. That is not "merged" and it is not
+          # "the reviewer found issues" — it is the one thing a lane must NAME and hand off.
+          emit_blocked BLOCKED "the merge log claims MERGED but repos/$OR/pulls/$PR reports no merged_at — the log may belong to another repo's PR #$PR (log: $(chain_log))" ;;
         FIX_REQUIRED)
           # The reviewer's findings ARE the fix list; the PR comment carries them in full.
           emit_fix FIX_REQUIRED "the fresh-context reviewer recorded ISSUES at head ${HD:-} — read the review comment on PR #$PR and fix every finding" ;;
@@ -527,7 +589,13 @@ if [ "$WATCH" -eq 1 ]; then
                  say "   lane-merge.sh $PR --issue ${ISSUE:-<n>} --repo $OR"
                  verdict WAITING_LOAD "reviewer refused by the load gate; re-dispatch when the box quietens"
                  exit 11 ;;
-        BLOCKED) emit_blocked BLOCKED "the merge chain parked this head: $(tail -n 3 "$O/state/parkreason-$PR" 2>/dev/null | tr '\n' ' ')" ;;
+        BLOCKED) _why="$(tail -n 3 "$O/state/parkreason-$PR" 2>/dev/null | tr '\n' ' ')"
+                 # ⛔ AN EMPTY REASON IS A BLOCKED HANDOFF WITH NOTHING TO HAND OFF (reviewer finding,
+                 # P2, verified): parkreason-<PR> may have been rewritten by another cycle, leaving the
+                 # next holder "⛔ BLOCKED" with no cause. Fall back to the chain log's last line.
+                 [ -n "${_why// /}" ] || _why="$(tail -n 1 "$(chain_log)" 2>/dev/null)"
+                 [ -n "${_why// /}" ] || _why="the chain parked this head and left no reason"
+                 emit_blocked BLOCKED "the merge chain parked this head: $_why" ;;
         *)       # ⛔ THE ONE THING A LANE CANNOT SUPPLY HAS ITS OWN CODE (12): a green, mergeable PR
                  # with no signed review at this head is not the generic "blocked" — the next holder
                  # needs to know the ONLY missing step is the fresh-context review, which the lane

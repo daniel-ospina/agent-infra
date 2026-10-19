@@ -214,13 +214,27 @@ OUT="$(PATH="$BIN:$PATH" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
 ck "a head-keyed needsfix marker alone → FIX_REQUIRED (the durable marker, not log prose, decides)" \
    $([ "$RC" = 10 ] && [ "$(verdict_of 30 | cut -d' ' -f1)" = FIX_REQUIRED ] && echo 0 || echo 1)
 
-# ── 11c-ter. the chain merged, the PR read is stale → MERGED from merge-one's own log ─────────────
+# ── 11c-ter. a "MERGED via the rail" LOG LINE is a HINT, never proof (reviewer P0) ───────────────
+# ⛔ `$O/logs/merge-<PR>.log` is keyed by PR NUMBER ONLY and `$O/state` is shared by every repo on the
+# box, so a merge of `tortoise#<same n>` used to make this loop print "✅ MERGED — PR #<n>" for an
+# UNMERGED PR and record a verdict that makes chain-merge.sh skip BOTH the review and the merge — a
+# lane reporting done over a PR nobody merged. Measured, not inferred. The arms below are the pair:
+# unconfirmed log → NOT merged (and the handoff NAMES it); confirmed merged_at → MERGED.
 new_o "$T/pr22.tsv"
 printf '%s deadbeef %s\n' 999998 "$OT/logs/lane-merge-31.log" > "$OT/state/lanemerge-31.chain"
 printf '[merge 31] MERGED via the rail (attempt 1)\n' > "$OT/logs/merge-31.log"
 OUT="$(PATH="$BIN:$PATH" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
       bash "$SCRIPT" 31 --watch --repo o/r --pr-tsv "$T/pr4.tsv" 2>&1)"; RC=$?
-ck "merge-one's own 'MERGED via the rail' line → MERGED exit 0 even before the PR read refreshes" \
+ck "an UNCONFIRMED 'MERGED via the rail' line is NOT a merge: exit 14 BLOCKED, and the reason names the API read" \
+   $([ "$RC" = 14 ] && [ "$(verdict_of 31 | cut -d' ' -f1)" = BLOCKED ] \
+      && grep -q 'reports no merged_at' "$OT/state/lanemerge-31.verdict" && echo 0 || echo 1)
+# …and the positive control: the SAME log line WITH a confirmed merged_at IS a merge.
+new_o "$T/pr22.tsv"
+printf '%s deadbeef %s\n' 999998 "$OT/logs/lane-merge-31.log" > "$OT/state/lanemerge-31.chain"
+printf '[merge 31] MERGED via the rail (attempt 1)\n' > "$OT/logs/merge-31.log"
+OUT="$(PATH="$BIN:$PATH" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 MERGED_AT_STUB='2026-10-19T00:00:00Z' \
+      bash "$SCRIPT" 31 --watch --repo o/r --pr-tsv "$T/pr4.tsv" 2>&1)"; RC=$?
+ck "the SAME log line WITH a confirmed merged_at → MERGED exit 0 (the confirmation is what decides)" \
    $([ "$RC" = 0 ] && [ "$(verdict_of 31 | cut -d' ' -f1)" = MERGED ] && echo 0 || echo 1)
 
 # ── 11d. the handoff marker is HEAD-BOUND even from --watch ────────────────────────────────────
@@ -345,8 +359,17 @@ ck "a TOTAL-only response is NOT a green head (0 check-runs = nothing measured, 
      [ "$RC2" = 11 ] && [ "$(verdict_of 31 | cut -d' ' -f1)" = WAITING_CHECKS ] && echo 0 || echo 1)
 
 # ── 18. the SUPERVISION BUDGET is sized to one documented cycle AND re-armed (E1) ───────────────
-ck "the watch budget defaults to 35 chunks (~70 min: CI 24 + REVIEW_TIMEOUT 30 + rail), not 20" \
-   $(grep -q 'LANE_MERGE_MAX_WATCH:-35}' "$SCRIPT" && ! grep -q 'is_limit "\$MAX_WATCH" || MAX_WATCH=20' "$SCRIPT" && echo 0 || echo 1)
+ck "the watch budget (25 x 120s = 3000s) fits INSIDE lane.sh's 3300s wall clock — a bound the owning lane can actually reach" \
+   $(grep -q 'LANE_MERGE_MAX_WATCH:-25}' "$SCRIPT" && ! grep -q 'LANE_MERGE_MAX_WATCH:-35}' "$SCRIPT" && echo 0 || echo 1)
+# ⛔ THE ARITHMETIC, not the literal: the shipped default x the shipped chunk length must be strictly
+# less than LANE_TIMEOUT in lane.sh, or the bound is unreachable by the lane that owns it and is only
+# ever spent by a LATER lane (the "budget spent" handoff for a budget it never had).
+_mw="$(sed -n 's/.*LANE_MERGE_MAX_WATCH:-\([0-9]*\)}.*/\1/p' "$SCRIPT" | head -1)"
+_ps="$(sed -n 's/.*LANE_MERGE_POLL:-\([0-9]*\)}.*/\1/p' "$SCRIPT" | head -1)"
+# lane.sh invokes it as `run_agent "${LANE_TIMEOUT:-3300}" …`, so read the default out of THAT call.
+_lt="$(grep -o 'LANE_TIMEOUT:-[0-9]*' "$HERE/lane.sh" | head -1 | tr -dc '0-9')"
+ck "MAX_WATCH x POLL ($_mw x $_ps) < lane.sh LANE_TIMEOUT ($_lt) — checked by ARITHMETIC" \
+   $([ -n "$_mw" ] && [ -n "$_ps" ] && [ -n "$_lt" ] && [ $((_mw * _ps)) -lt "$_lt" ] && echo 0 || echo 1)
 new_o "$T/pr4.tsv"
 printf '20\n' > "$OT/state/lanemerge-32.watch"
 run 32 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-red.tsv"

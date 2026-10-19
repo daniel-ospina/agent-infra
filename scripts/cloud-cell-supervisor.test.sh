@@ -3499,7 +3499,17 @@ newdoc=0; grep -qE 'new-session.*-s cell-doctor( |$)' "$LA/st/argv" 2>/dev/null 
 #       grep below (a `for … in <names>` line that mentions a worker);
 #   (b) the number of sites that actually ran is not the number we expect — so a site that stops
 #       executing (an early `return`, a moved block) is noticed rather than silently unvisited.
-LITERAL_SEEDS="$(grep -cE '^[[:space:]]*for [a-z]+ in [^;]*(orch-loop\.sh|claims\.sh)' "${BASH_SOURCE[0]}")"
+# ⛔ ANY hand-written worker list, not just one that happens to name orch-loop.sh/claims.sh: an
+# allow-list of two names is dodgeable by a list that omits both (reviewer finding, P2, verified) —
+# `for f in lane.sh chain-merge.sh …; do` slipped through while this guard reported green. The signature
+# of a seed list is TWO OR MORE literal `*.sh` names on one `for … in` line; globs (`"$HERE"/*.sh`) and
+# the derived form cannot match it. ⛔ NOT line-anchored: a maintainer copying the house style writes
+# `seed_site "$LINENO"; for f in lane.sh chain-merge.sh; do` — anchored, that read as CLEAN (the count
+# half still matched, so the guard was green over a fixture seeding 2 of 12 workers). Verified by the
+# verifier's mutation; unanchored it is caught.
+# (comments are stripped first: this guard's own explanation quotes the shape it forbids)
+LITERAL_SEEDS="$(grep -vE '^[[:space:]]*#' "${BASH_SOURCE[0]}" \
+                 | grep -cE 'for [a-z]+ in .*[A-Za-z0-9_-]+\.sh[[:space:]].*[A-Za-z0-9_-]+\.sh')"
 # The expected site count is READ from this file, not written down: a hardcoded number would false-block
 # the next section that adds a fixture (a category-B cost), while the occurrence count still catches
 # the failure that matters — a site that exists but did not RUN (early return, moved block).

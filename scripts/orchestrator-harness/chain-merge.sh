@@ -194,6 +194,19 @@ trap 'release_issue_claim' EXIT
 trap 'release_issue_claim; exit 130' INT
 trap 'release_issue_claim; exit 143' TERM
 PR=""
+
+# ⛔ A PR-NUMBER-KEYED MARKER IS NOT PROOF FOR *THIS* REPO (reviewer finding, P1, verified).
+# `state/merged-<PR>.done` and `logs/merge-<PR>.log` carry no repo, and `$O/state` is shared by every
+# repo on the box, so a merge of `tortoise#<same n>` ended this chain `exit 0` ("nothing left to
+# review") — skipping the review AND the merge while the lane read as done. This is the same defect
+# `lane-merge.sh` fixed with `merged_confirmed`; the confirmation belongs on BOTH sides of the handoff.
+# ⛔ IT IS NOT IN THE WAIT LOOP: the loop still makes ZERO GitHub calls (that is what lets a lane's
+# merge phase cost nothing while it works). Only these two terminal exits read the API, once each.
+chain_merged_confirmed() { # chain_merged_confirmed <pr> -> 0 when THIS repo's PR reports merged
+  local mt
+  mt="$(gh api "repos/$OR/pulls/$1" --jq '.merged_at // ""' 2>/dev/null)"
+  [ -n "${mt:-}" ]
+}
 for i in $(seq 1 "$CHAIN_POLLS"); do
   # Checked BEFORE the PR lookup every iteration: the lane's refusal is a local file read, so this
   # costs microseconds, and it caps the transfer latency at one poll interval instead of 90 minutes.
@@ -314,19 +327,30 @@ if [ -f "$PR_PHASE" ]; then
     sleep 15; waited=$((waited + 15))
   done
   if [ -f "$O/state/merged-$PR.done" ]; then
-    echo "[chain $N] PR #$PR is MERGED by the lane's own merge phase — nothing left to review" >> "$LOG"
+    if ! chain_merged_confirmed "$PR"; then
+      # The marker exists but the API says this repo's PR is not merged: do NOT exit 0. Review at the
+      # tip instead — the chain's whole job is that the PR gets reviewed and landed, and a marker from
+      # another repo's same-numbered PR must not consume it.
+      echo "[chain $N] state/merged-$PR.done exists but repos/$OR/pulls/$PR reports no merged_at — the marker may belong to another repo's PR #$PR; NOT treating it as merged" >> "$LOG"
+    else
+      echo "[chain $N] PR #$PR is MERGED by the lane's own merge phase — nothing left to review" >> "$LOG"
     # release_issue_claim clears the EXIT/INT/TERM traps itself, so no second `trap -` is needed.
-    release_issue_claim
-    echo "[chain $N] done $(date)" >> "$LOG"
-    exit 0
+      release_issue_claim
+      echo "[chain $N] done $(date)" >> "$LOG"
+      exit 0
+    fi
   fi
   if [ -s "$PR_VERDICT" ]; then
     case "$(cut -d' ' -f1 "$PR_VERDICT" 2>/dev/null)" in
       MERGED)
-        echo "[chain $N] the lane's verdict is MERGED — nothing left to review: $(cat "$PR_VERDICT")" >> "$LOG"
-        release_issue_claim
-        echo "[chain $N] done $(date)" >> "$LOG"
-        exit 0 ;;
+        # A VERDICT IS A CLAIM TOO: lane-merge writes it, but the API is what says the PR is merged.
+        if chain_merged_confirmed "$PR"; then
+          echo "[chain $N] the lane's verdict is MERGED and the API confirms it — nothing left to review: $(cat "$PR_VERDICT")" >> "$LOG"
+          release_issue_claim
+          echo "[chain $N] done $(date)" >> "$LOG"
+          exit 0
+        fi
+        echo "[chain $N] the lane's verdict says MERGED but repos/$OR/pulls/$PR reports no merged_at — reviewing at the tip instead: $(cat "$PR_VERDICT")" >> "$LOG" ;;
       *)
         echo "[chain $N] the lane handed off ($(cat "$PR_VERDICT")) — reviewing at the head it left behind" >> "$LOG" ;;
     esac

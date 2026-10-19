@@ -79,8 +79,16 @@ REVIEWER_BRIEF="$(reviewer_brief_section harness)" || {
 # only remaining options are an invented loop or a handoff). Resolve once, here, and say so in the log.
 LANE_MERGE_CMD="$O/lane-merge.sh"
 if [ ! -f "$LANE_MERGE_CMD" ]; then
-  LANE_MERGE_CMD="$SELF/lane-merge.sh"
-  echo "[lane $N] ⚠️ $O/lane-merge.sh is absent (this \$O predates the lane-owns-merge change) — the brief names $LANE_MERGE_CMD instead. Sync: cp scripts/orchestrator-harness/*.sh $O/" >> "$O/logs/lane-$N.log"
+  # ⛔ THE FALLBACK IS ONLY A FALLBACK IF IT IS A DIFFERENT PATH (reviewer finding, P2, verified). When
+  # this script was itself loaded FROM `$O` (the shipped `dispatch-merge.sh` route) `$SELF == $O`, so
+  # the "fallback" resolves to the very file that is missing: the log claimed a substitute was named
+  # while the brief pointed at nothing. Say nothing rather than something false, and name the remedy.
+  if [ "$SELF/lane-merge.sh" != "$LANE_MERGE_CMD" ] && [ -f "$SELF/lane-merge.sh" ]; then
+    LANE_MERGE_CMD="$SELF/lane-merge.sh"
+    echo "[lane $N] ⚠️ $O/lane-merge.sh is absent (this \$O predates the lane-owns-merge change) — the brief names $LANE_MERGE_CMD instead. Sync: cp scripts/orchestrator-harness/*.sh $O/" >> "$O/logs/lane-$N.log"
+  else
+    echo "[lane $N] ⛔ $O/lane-merge.sh is ABSENT and this harness was loaded FROM $SELF — there is no other copy to name. The brief will say the merge loop is unavailable; sync first: cp $SELF/*.sh $O/" >> "$O/logs/lane-$N.log"
+  fi
 fi
 cat > "$O/logs/prompt-$N.txt" <<EOF
 Autonomous engineering lane. You are ALREADY inside your own worktree (that is your cwd, on branch \`$BR\`). Do NOT create, switch, or remove worktrees, and NEVER touch the repo's main checkout.
