@@ -15,7 +15,10 @@ The rules pinned here, in both directions:
   * REST's `closed` window never counts a PR closed WITHOUT merging as merged;
   * a failed GraphQL read NEVER yields a mixed-source read (a REST open-count beside a
     GraphQL merged-count compares two differently-wrong reads);
-  * the token travels in an Authorization header and is printed nowhere, on the REAL transport
+  * the fallback is a FALLBACK — a healthy GraphQL read pays for no REST — and a failed OPEN
+    read short-circuits the merged one, because the pair shares ONE budget;
+  * the token is host-associated and keyring-capable, and travels in an Authorization header
+    printed nowhere, on the REAL transport
     path and not only where the transport is stubbed;
   * the REST path PAGES the whole requested window (REST caps `per_page` at 100, the callers
     ask for 500/400) and refuses a partial one — a silently short list under-counts
@@ -92,8 +95,11 @@ def test_graphql_failure_uses_rest_and_still_counts_merged_today(monkeypatch, no
             return None          # the SECONDARY-limit refusal this fix answers
         return []                # the P0/P1 issue reads still answer
 
-    def fake_rest(state, limit=100):
+    deadlines = []
+
+    def fake_rest(state, limit=100, deadline=None):
         rest_calls.append((state, limit))
+        deadlines.append(deadline)
         if state == "open":
             return [pr(1), pr(2)]
         return [pr(3, merged=MERGED_TODAY), pr(4, merged=LONG_AGO)]
@@ -105,9 +111,13 @@ def test_graphql_failure_uses_rest_and_still_counts_merged_today(monkeypatch, no
     assert out is not None
     assert out["open_prs"] == 2
     assert out["merged_today"] == 1
-    # BOTH lists were re-read over REST, at the windows the GraphQL calls ask for.
+    # BOTH lists were re-read over REST, at the windows the GraphQL calls ask for, and the PAIR
+    # shares ONE deadline: a per-read budget doubles the phase's worst case inside a tick that is
+    # killed (the doc states the shared budget as a rule, so the suite must hold it).
     assert ("open", 500) in rest_calls
     assert ("merged", 400) in rest_calls
+    assert deadlines[0] is not None
+    assert deadlines[0] == deadlines[1], "the pair must share one deadline"
 
     assert bp.main() == 0
     printed = capsys.readouterr().out
@@ -121,9 +131,14 @@ def test_both_sources_failing_keeps_the_unavailable_path(monkeypatch, no_cache, 
     (0 open PRs, 0 merged) would be strictly worse than the loud `unavailable` line: an
     empty list must never stand as evidence of absence."""
     monkeypatch.setattr(bp, "gh", lambda *a: None if a[:2] == ("pr", "list") else [])
-    monkeypatch.setattr(bp, "_rest_prs", lambda state, limit=100: None)
+    rest_attempts = []
+    monkeypatch.setattr(bp, "_rest_prs",
+                        lambda state, **k: rest_attempts.append(state) or None)
 
     assert bp.compute() is None
+    assert rest_attempts == ["open"], (
+        "once the OPEN REST read has failed the merged one cannot be used (the guard needs "
+        "both), so spending the shared budget on it only starves the tick")
     assert bp.main() == 0
     printed = capsys.readouterr().out
     assert "DELIVERY: unavailable (metrics read failed)" in printed
@@ -176,7 +191,7 @@ def test_a_failed_graphql_read_never_produces_a_mixed_source_read(monkeypatch):
             return [pr(n) for n in range(1, 8)]
         return None
 
-    def fake_rest(state, limit=100):
+    def fake_rest(state, limit=100, deadline=None):
         if state == "open":
             return [pr(100), pr(101)]          # REST's open window: 2, not 7
         return [pr(200, merged=LONG_AGO)]      # no PR merged today
@@ -200,7 +215,7 @@ def test_a_failed_graphql_read_never_produces_a_mixed_source_read(monkeypatch):
             return [pr(300, merged=LONG_AGO)]  # GraphQL says: 0 merged today
         return None
 
-    def fake_rest_mirror(state, limit=100):
+    def fake_rest_mirror(state, limit=100, deadline=None):
         if state == "open":
             return [pr(400), pr(401), pr(402), pr(403)]
         return [pr(500, merged=MERGED_TODAY), pr(501, merged=LONG_AGO)]   # REST says: 1
@@ -244,6 +259,10 @@ def test_rest_pages_the_requested_window_and_refuses_a_partial_read(monkeypatch)
     assert [u.rsplit("page=", 1)[1] for u in seen_urls] == ["1", "2", "3", "4"]
     assert all("per_page=100" in u for u in seen_urls)
     assert all("state=closed" in u for u in seen_urls)
+    # The ORDER is what makes the window sound: a PR merged today was updated today, so
+    # `updated desc` puts it inside the window. Without it the window is the 400
+    # most-recently-CREATED closed PRs and `merged_today` silently under-counts.
+    assert all("sort=updated&direction=desc" in u for u in seen_urls)
     assert any(p["mergedAt"] == MERGED_TODAY for p in merged), (
         "the merged-today PR lived on page 4 — a single-page read would report 0")
 
@@ -271,7 +290,7 @@ def test_rest_pages_the_requested_window_and_refuses_a_partial_read(monkeypatch)
     # No readable token is also "no read", never an empty list — and it must not reach the
     # network at all: an unauthenticated /pulls answers a 60-request anonymous bucket and
     # then refuses, which would look like a source failure instead of a missing credential.
-    monkeypatch.setattr(bp, "REST_BUDGET_S", 45)   # undo the spent budget above
+    monkeypatch.setattr(bp, "REST_BUDGET_S", 30)   # undo the spent budget above
     reached = []
     monkeypatch.setattr(bp, "_rest_get_json",
                         lambda url, tok, timeout=None: reached.append(url) or [rest_row(1)])
@@ -282,12 +301,27 @@ def test_rest_pages_the_requested_window_and_refuses_a_partial_read(monkeypatch)
 
 # ── token: env first, then gh's hosts.yml — and never on stdout ─────────────
 def test_token_prefers_env_then_hosts_yml_and_is_never_logged(monkeypatch, tmp_path, no_cache, capsys):
-    """The REST read authenticates with a token this process OWNS. Two contracts: it is
-    resolved without a `gh` subprocess (the whole point — `gh` is what is refusing), and it
-    never reaches a log line or the DELIVERY output."""
+    """The REST read authenticates with a token this process OWNS, and never prints it.
+
+    Three box shapes drive this: the plain hosts.yml, one that relocates its config
+    (`GH_CONFIG_DIR`), and one whose hosts.yml lists ANOTHER host first — reading the first
+    `oauth_token:` line in that file sends a GHES token to api.github.com, i.e. a 401 that
+    reads as "REST is down". A keyring-backed config has no `oauth_token:` at all, so
+    `gh auth token` (an OFFLINE lookup the layer does not count as a request) is the last
+    resort. An ambient `GH_CONFIG_DIR` must not leak into the first assertion.
+    """
     monkeypatch.delenv("GH_TOKEN", raising=False)
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GH_CONFIG_DIR", raising=False)
     monkeypatch.setenv("HOME", str(tmp_path))
+
+    # No credential on the box: the subprocess path must answer "no token", not raise.
+    class _NoAuth:
+        returncode = 1
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr(bp.subprocess, "run", lambda *a, **k: _NoAuth())
 
     hosts = tmp_path / ".config" / "gh" / "hosts.yml"
     hosts.parent.mkdir(parents=True)
@@ -299,11 +333,50 @@ def test_token_prefers_env_then_hosts_yml_and_is_never_logged(monkeypatch, tmp_p
 
     assert bp._token() == "gho_from_hosts_yml"          # quotes stripped
 
+    # gh's own GH_CONFIG_DIR override — the harness already honours it, and ignoring it
+    # makes the fallback silently inert on a box that relocates its config.
+    moved = tmp_path / "elsewhere"
+    (moved / "gh").mkdir(parents=True)
+    (moved / "gh" / "hosts.yml").write_text("github.com:\n    oauth_token: gho_relocated\n")
+    monkeypatch.setenv("GH_CONFIG_DIR", str(moved / "gh"))
+    assert bp._token() == "gho_relocated"
+    monkeypatch.delenv("GH_CONFIG_DIR")
+
+    # A hosts.yml that lists another host FIRST must not donate that host's token.
+    hosts.write_text(
+        "ghe.corp.example:\n"
+        "    oauth_token: GHES_MUST_NOT_BE_USED\n"
+        "github.com:\n"
+        "    oauth_token: gho_right_host\n")
+    assert bp._token() == "gho_right_host"
+
     monkeypatch.setenv("GH_TOKEN", "gho_from_env")      # the fleet's own env wins
     assert bp._token() == "gho_from_env"
-
-    hosts.unlink()                                       # no file, no env -> falsy, not None
     monkeypatch.delenv("GH_TOKEN")
+
+    # Keyring-backed config: no oauth_token line at all -> ask gh, which is offline.
+    hosts.write_text("github.com:\n    user: someone\n    git_protocol: https\n")
+
+    class _Auth:
+        returncode = 0
+        stdout = "gho_from_keyring\n"
+        stderr = ""
+
+    asked = []
+
+    def _auth(argv, **kw):
+        asked.append(list(argv))
+        return _Auth()
+
+    monkeypatch.setattr(bp.subprocess, "run", _auth)
+    assert bp._token() == "gho_from_keyring"
+    # The COMMAND is the contract, not just its stdout: `gh auth token` is what the layer
+    # classifies as an offline lookup, so it is the only subprocess this read may run.
+    assert asked and asked[0][1:3] == ["auth", "token"], asked
+    assert "--hostname" in asked[0] and "github.com" in asked[0], asked
+    monkeypatch.setattr(bp.subprocess, "run", lambda *a, **k: _NoAuth())
+
+    hosts.unlink()                        # no file, no env, no gh -> falsy, not None
     assert not bp._token()
 
     # A full failing read must not print the token anywhere.
@@ -314,6 +387,28 @@ def test_token_prefers_env_then_hosts_yml_and_is_never_logged(monkeypatch, tmp_p
     assert bp.main() == 0
     captured = capsys.readouterr()
     assert "gho_secret_marker" not in (captured.out + captured.err)
+
+
+# ── an unusable page is UNREADABLE, never an empty answer ───────────────────
+def test_a_page_of_unusable_rows_refuses_instead_of_reporting_zero(monkeypatch):
+    """`continue` on a malformed row consumed the window while `seen` advanced, so a page of
+    rows that are not `/pulls` objects returned [] — and `compute()` accepts [] because
+    `[] is not None`, printing a REAL line with `0 open PRs`. That is the false zero this
+    file's header says was fixed on 2026-10-01. The honest answer is `None` (unavailable)."""
+    monkeypatch.setattr(bp, "_token", lambda: "test-token")
+
+    for page in (
+        ["not a dict", 42, None],                            # wrong element type
+        [{"title": "no number"}, {"title": "no number"}],    # drifted shape
+    ):
+        monkeypatch.setattr(bp, "_rest_get_json",
+                            lambda url, tok, timeout=None, _p=page: list(_p))
+        assert bp._rest_prs("open", limit=500) is None, page
+
+    # The other direction still holds: a genuinely EMPTY collection is an ANSWER (0), not a
+    # failure — otherwise "no PRs" and "could not read" collapse into one signal.
+    monkeypatch.setattr(bp, "_rest_get_json", lambda url, tok, timeout=None: [])
+    assert bp._rest_prs("open", limit=500) == []
 
 
 # ── the REAL transport: the token travels in a header, never in output ──────
@@ -362,3 +457,53 @@ def test_the_real_request_path_sends_the_token_in_a_header_and_never_prints_it(m
     captured = capsys.readouterr()
     assert "gho_real_path_token" not in (captured.out + captured.err), (
         "the transport must not print the credential on either path")
+
+
+# ── the fallback is a FALLBACK: a healthy GraphQL read pays for no REST ─────
+def test_both_graphql_reads_succeeding_never_pays_for_rest(monkeypatch, no_cache):
+    """Measured mutant: making the fallback unconditional (`if True:`) left every test green.
+    The cost is not cosmetic — a refresh would then spend 9 REST requests (~4 s) on the very
+    bucket this change exists to keep free, on the happy path, ten times an hour per box."""
+    rest_calls = []
+    gql_open = [pr(1), pr(2), pr(3)]
+    gql_merged = [pr(4, merged=MERGED_TODAY)]
+
+    def fake_gh(*args):
+        if args[:2] != ("pr", "list"):
+            return []
+        return gql_open if args[args.index("--state") + 1] == "open" else gql_merged
+
+    monkeypatch.setattr(bp, "gh", fake_gh)
+    monkeypatch.setattr(bp, "_rest_prs",
+                        lambda *a, **k: rest_calls.append((a, k)) or [])
+
+    out = bp.compute()
+    assert out is not None
+    assert rest_calls == [], "REST must not be read when both GraphQL reads answered"
+    assert out["open_prs"] == 3
+    assert out["merged_today"] == 1
+
+
+# ── per_page never shrinks: GitHub's offset follows the request's per_page ──
+def test_a_limit_that_is_not_a_multiple_of_100_keeps_the_page_offsets_sound(monkeypatch):
+    """`min(100, limit - seen)` as `per_page` re-reads an earlier range on the last page,
+    because GitHub computes the offset from THAT request's per_page: measured, limit=250
+    returned rows 1-150 with 101-150 duplicated and 201-250 MISSING — a short window that
+    the loop then reports as filled. The window is trimmed after the page arrives instead."""
+    monkeypatch.setattr(bp, "_token", lambda: "test-token")
+    seen_urls = []
+
+    def fake_get(url, tok, timeout=None):
+        seen_urls.append(url)
+        per_page = int(url.split("per_page=")[1].split("&")[0])
+        page = int(url.rsplit("page=", 1)[1])
+        start = (page - 1) * per_page          # GitHub's own offset semantics
+        return [rest_row(start + n + 1, merged_at=LONG_AGO) for n in range(per_page)]
+
+    monkeypatch.setattr(bp, "_rest_get_json", fake_get)
+    rows = bp._rest_prs("merged", limit=250)
+    assert rows is not None
+    numbers = [r["number"] for r in rows]
+    assert numbers == list(range(1, 251)), "hole or duplicate: the window is not the window"
+    assert [u.split("per_page=")[1].split("&")[0] for u in seen_urls] == ["100", "100", "100"]
+    assert len(seen_urls) == 3

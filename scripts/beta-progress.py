@@ -111,40 +111,75 @@ def gh(*args):
 
 
 # ── REST SECOND SOURCE FOR THE PR LISTS (fixed 2026-10-19) ─────────────────
-# `gh pr list --json` is GRAPHQL, and under fleet concurrency GitHub refuses it on the
-# SECONDARY limit while the primary budget is nearly UNTOUCHED -- measured 2026-10-19:
-# core 1599/5000, graphql 4612/5000, and one REST call answering in 0.43 s with 17
-# concurrent gh clients on the same box. The beat then printed
-# `DELIVERY: unavailable (metrics read failed)`, i.e. the fleet lost its OWN progress
-# measurement -- the number the owner reads -- while a readable source existed.
-# The two limits are SEPARATE BUCKETS, so REST is a second SOURCE, not a retry of the
-# same refusal. It is read DIRECTLY (urllib + the token) rather than through $O's gh
-# layer: the layer's own GraphQL path is what was refused, so routing the fallback
-# through it would re-enter the queue that is refusing this read.
+# WHY. Both lists come from `gh pr list --json`. Where the workspace has the gh layer's REST
+# adapter (`$O/gh-rest`, #1959) the OPEN read is already served over REST — `number,title,headRefName`
+# are all in its PR_FIELDS — but `mergedAt` is NOT, so the MERGED read delegates to the real gh,
+# which is GRAPHQL. On the cells there is no `$O/gh-rest` (#1978), so BOTH reads are GraphQL.
+# Under fleet concurrency GraphQL is refused on the SECONDARY limit while the primary budget is
+# nearly untouched (measured 2026-10-19: core 1599/5000, graphql 4612/5000, one REST call
+# answering in 0.43 s with 17 concurrent gh clients on the same box), and the beat printed
+# `DELIVERY: unavailable (metrics read failed)` — the fleet losing its OWN progress measurement,
+# the number the owner reads — while REST answered. The two limits are SEPARATE BUCKETS, so REST
+# is a second SOURCE, not a retry of the same refusal.
+# ⛔ DELIBERATE TRADE-OFF, stated so the next reader can weigh it rather than discover it: these
+# reads go DIRECT (urllib + the token) instead of through the layer. The layer cannot serve
+# `mergedAt` at all — that needs a PR_FIELDS change (filed as its own issue) — and it does not
+# help the cells, which have no adapter, so a fallback that queues behind the refusing path would
+# not be a fallback. The cost is real: direct reads are NOT single-flight with the box's other gh
+# calls, get no ETag/304 replay, and are invisible to `$GH_LIMIT_DIR/last-limit`. That is why the
+# budget below is small and shared.
 REST_PER_PAGE = 100   # GitHub's ceiling for /pulls -- the honest bound on ONE request
-# ⛔ THIS READ IS BOUNDED BY ITS CALLER (#1988's rule, applied here). The heartbeat runs this
-# refresh inside a tick that is itself killed at a fixed bound, so a paging loop with no budget
-# could outlive it and be KILLED -- reporting nothing, instead of the `unavailable` line it can
-# prove. Exceeding the budget REFUSES the read (None), exactly like an unreadable page: a
-# truncated window would under-count `merged_today`, which is the error this fallback must not add.
+# ⛔ THIS READ IS BOUNDED BY ITS CALLER. `beta-progress.py` runs inside a tick that the loop kills
+# at `run_bounded "$((TARGET - IN_PASS_RESERVE))"` = 540-150 = 390 s (heartbeat-loop.sh:80,108,294)
+# after 300-350 s of measured work, so a paging loop with no budget can outlive the slack and be
+# KILLED -- reporting nothing, instead of the `unavailable` line it can prove. Exceeding the budget
+# REFUSES the read (None), exactly like an unreadable page: a truncated window would under-count
+# `merged_today`, which is the error this fallback must not add.
 REST_TIMEOUT_S = 15   # per request
-# ⛔ PER READ, and `compute()` makes TWO of them (open + merged): 90 s worst case for the REST
-# phase. Do not read this as one shared budget -- a single deadline threaded through both reads
-# is a different design, and these numbers would move with it.
-REST_BUDGET_S = 45
+# ⛔ ONE BUDGET FOR THE PAIR, not per read: `compute()` creates the deadline and hands it to both.
+# 30 s is ~7x the measured latency (0.43 s/call, 9 calls ~4 s) and sits well inside the tick's
+# 40-90 s of residual slack. Per-read budgets would double it to 90 s and spend the slack.
+REST_BUDGET_S = 30
 
 
 def _token():
-    """The token to read with: the fleet's env first, then gh's own hosts.yml. Never logged."""
+    """The token for api.github.com: the fleet's env first, then gh's own config. Never logged.
+
+    ⛔ HOST-ASSOCIATED, not "the first oauth_token in the file": hosts.yml may list another host
+    (GHES) first, and THAT token answers 401 against api.github.com -- a failure that looks like
+    "REST is down". Only the `github.com:` block is read. A keyring-backed config (no
+    `oauth_token:` line at all) is asked for through `gh auth token`, which `gh-limit.py`'s
+    `makes_request()` treats as request-free (its own `auth token` branch -- NOT `NO_REQUEST`,
+    which holds only `--version`/`help`/`config`-class forms), so it cannot re-enter the refusal
+    this fallback exists to escape.
+    """
     for var in ("GH_TOKEN", "GITHUB_TOKEN"):
         if os.environ.get(var):
             return os.environ[var]
+    # `GH_CONFIG_DIR` is gh's own override and the harness already honours it
+    # (`refresh-scout.test.sh`: `${GH_CONFIG_DIR:-$HOME/.config/gh}/hosts.yml`); ignoring it
+    # made this fallback silently inert on a box that relocates its config.
+    cfg = os.environ.get("GH_CONFIG_DIR") or os.path.expanduser("~/.config/gh")
+    host = None
     try:
-        with open(os.path.expanduser("~/.config/gh/hosts.yml"), "r") as fh:
+        with open(os.path.join(cfg, "hosts.yml"), "r") as fh:
             for line in fh:
+                if not line.strip() or line.lstrip().startswith("#"):
+                    continue
+                if not line[0].isspace():
+                    host = line.split(":", 1)[0].strip()
+                    continue
                 s = line.strip()
-                if s.startswith("oauth_token:"):
+                if host == "github.com" and s.startswith("oauth_token:"):
                     return s.split(":", 1)[1].strip().strip("'\"")
+    except Exception:
+        pass
+    try:
+        r = subprocess.run([GH, "auth", "token", "--hostname", "github.com"],
+                           capture_output=True, text=True, timeout=5,
+                           env={**os.environ, **GH_LAYER_ENV} if GH_LAYER_ENV else None)
+        if r.returncode == 0:
+            return (r.stdout or "").strip()
     except Exception:
         return ""
     return ""
@@ -164,7 +199,7 @@ def _rest_get_json(url, tok, timeout=REST_TIMEOUT_S):
         return None
 
 
-def _rest_prs(state, limit=100):
+def _rest_prs(state, limit=100, deadline=None):
     """The PR list over REST -- the fallback when `gh pr list` (GraphQL) is refused.
 
     Returned in the `gh pr list --json` shape this file consumes: `number`, `title`,
@@ -175,11 +210,20 @@ def _rest_prs(state, limit=100):
 
     PAGING, stated honestly: REST caps `per_page` at 100, while the callers ask for 500
     (open) and 400 (merged) -- so those windows are ceil(limit/100) REQUESTS, not one.
-    This pages until the caller's window is filled or the collection ends. It does NOT
-    return the first page as if it were the window: a silently short list would
-    under-count `merged_today`, which is the one error this fallback must not add. A page
-    that cannot be read -- or a read that spends its own budget -- returns None for the WHOLE
-    read; a partial list is indistinguishable from a complete one at the call site.
+    ⛔ `per_page` is ALWAYS 100, never `min(100, limit - seen)`: GitHub derives a request's
+    offset from THAT request's `per_page` ((page-1)*per_page), so shrinking it on the last
+    page re-reads rows an earlier page already returned and leaves a hole at the end (a
+    limit of 250 returned rows 1-200 + a duplicate of 101-150, missing 201-250 -- measured).
+    The final page is trimmed AFTER it arrives instead. This pages until the caller's window
+    is filled or the collection ends. It does NOT return the first page as if it were the
+    window: a silently short list would under-count `merged_today`, which is the one error
+    this fallback must not add. A page
+    that cannot be read -- or a read whose SHARED deadline (`deadline`, an epoch-seconds
+    instant the caller owns; None = no bound) has passed -- returns None for the WHOLE read; a
+    partial list is indistinguishable from a complete one at the call site. The deadline is a
+    caller-supplied `deadline`, not a per-read budget: `compute()` gives both reads of a pair
+    the SAME one, because a per-read budget doubles the phase's worst case inside a tick that
+    is killed (see `REST_BUDGET_S`).
 
     `sort=updated&direction=desc` is what makes the window SOUND for `merged_today`, and the
     bound is worth stating exactly: the window is the 400 most-recently-UPDATED **closed** PRs,
@@ -192,21 +236,26 @@ def _rest_prs(state, limit=100):
     if not tok:
         return None
     path = "open" if state == "open" else "closed"
+    if deadline is None:
+        deadline = time.time() + REST_BUDGET_S
     out, seen, page = [], 0, 1
-    deadline = time.time() + REST_BUDGET_S
     while seen < limit:
         remaining = deadline - time.time()
         if remaining <= 0:
             return None           # budget spent -- refuse, never return a short window
-        want = min(REST_PER_PAGE, limit - seen)
         url = ("https://api.github.com/repos/%s/pulls?state=%s&sort=updated&direction=desc"
-               "&per_page=%d&page=%d" % (REPO, path, want, page))
+               "&per_page=%d&page=%d" % (REPO, path, REST_PER_PAGE, page))
         raw = _rest_get_json(url, tok, min(REST_TIMEOUT_S, remaining))
         if not isinstance(raw, list):
             return None
-        for p in raw:
-            if not isinstance(p, dict):
-                continue
+        keep = raw[:limit - seen]          # trim the FINAL page to the caller's window
+        for p in keep:
+            if not isinstance(p, dict) or p.get("number") is None:
+                # ⛔ A page whose rows are not the documented shape is an UNREADABLE page, not an
+                # empty answer. `continue` here consumed a window of unusable rows (advancing
+                # `seen`) and then returned [] -- a REAL "0 open PRs" line, i.e. the false zero
+                # this file's own header says was fixed on 2026-10-01. Refuse the whole read.
+                return None
             if state != "open" and not p.get("merged_at"):
                 continue      # closed-without-merge is not a merged PR
             out.append({
@@ -215,8 +264,8 @@ def _rest_prs(state, limit=100):
                 "headRefName": (p.get("head") or {}).get("ref") or "",
                 "mergedAt": p.get("merged_at") or "",
             })
-        seen += len(raw)
-        if len(raw) < want:
+        seen += len(keep)
+        if len(raw) < REST_PER_PAGE:
             break             # last page of the collection
         page += 1
     return out
@@ -232,7 +281,11 @@ def compute():
     # merged-count would compare two DIFFERENTLY-WRONG reads, and `merged_today` is a
     # comparison against the open window. Same source or no metric.
     if openpr is None or merged is None:
-        ro, rm = _rest_prs("open", limit=500), _rest_prs("merged", limit=400)
+        deadline = time.time() + REST_BUDGET_S      # ONE budget for the pair (see above)
+        ro = _rest_prs("open", limit=500, deadline=deadline)
+        # Short-circuit: if the open read already failed, the merged one cannot be used by the
+        # guard below, so spending the shared budget on it only starves the tick.
+        rm = _rest_prs("merged", limit=400, deadline=deadline) if ro is not None else None
         if ro is not None and rm is not None:
             openpr, merged = ro, rm
     if openpr is None or merged is None:
@@ -250,6 +303,11 @@ def compute():
 
     out = {"ts": int(time.time()), "open_prs": len(openpr), "merged_today": merged_today}
     for tier, label in (("p0", "P0-blocker"), ("p1", "P1-severe")):
+        # ⛔ STILL GRAPHQL, and NOT covered by the fallback above: where the layer's REST adapter
+        # is absent (#1978 -- the cells) a refusal here returns None and the WHOLE line still
+        # reads `unavailable`, after the PR lists were paid for. Named as a residual on #2139
+        # rather than silently widened here; `merge-queue.py`'s own `--state merged` read is the
+        # same class (it is what prints `VERDICT=UNKNOWN (merge-rate read failed)`).
         rows = gh("issue", "list", "--repo", REPO, "--label", label, "--state", "open",
                   "--limit", "300", "--json", "number")
         if rows is None:
