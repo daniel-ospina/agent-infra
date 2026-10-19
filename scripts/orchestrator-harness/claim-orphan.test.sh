@@ -93,16 +93,18 @@
 #      below the review window it must outlive — a mid-review expiry, the duplicate this registry
 #      exists to prevent — and leaves nothing to diagnose.
 # ⛔ LABELLING HONESTY — MEASURED, not asserted. `CLAIMS_SH=<pre-change claims.sh> bash
-# claim-orphan.test.sh` (2026-10-19, origin/main's claims.sh blob d1604686) reports **54 passed, 68
-# FAILED** of 122 checks. Broken down by label, on that tree:
-#   • [RED→GREEN]  60 checks — 0 pass, 60 fail. EVERY one is red before the change. (Non-vacuity.)
-#   • [PINNED]      45 checks — 39 pass, 6 fail. The 39 pass VACUOUSLY, because the machinery is
-#     absent pre-fix (`claim_orphan_reason` does not exist and nothing reaped by a host rule at all),
-#     so assertions of the form "does NOT delete" / "abstains" hold for free. They are labelled PINNED
-#     rather than RED→GREEN for exactly that reason: they guard a NEW fail-open, they are not
-#     red-to-green. The 6 that fail are controls asserting behaviour the pre-fix tree lacks.
+# claim-orphan.test.sh` (2026-10-19, origin/main's claims.sh blob d1604686) reports **57 passed, 70
+# FAILED** of 127 checks. Broken down by label, on that tree:
+#   • [RED→GREEN]  61 checks — 0 pass, 61 fail. EVERY one is red before the change. (Non-vacuity.)
+#   • [PINNED]      49 checks — 42 pass, 7 fail. The 42 pass VACUOUSLY, because the machinery is
+#     absent pre-fix (`claim_orphan_reason` does not exist, and nothing reaped by a host rule or read a
+#     deny list at all), so assertions of the form "does NOT delete" / "abstains" hold for free. They
+#     are labelled PINNED rather than RED→GREEN for exactly that reason: they guard a NEW fail-open,
+#     they are not red-to-green. The 7 that fail are controls asserting behaviour the pre-fix tree
+#     lacks (the held-by-live token, the roster arm and its control, three `rc=127` O24 controls, and
+#     O26's token assertion).
 #   • unlabelled    17 checks — 15 pass, 2 fail.
-# The 8 failing checks that carry NO [RED→GREEN] label are, by section:
+# The 9 failing checks that carry NO [RED→GREEN] label are, by section:
 #     `O7 the PR keying declares a documented ceiling`           (unlabelled by design)
 #     `[PINNED]` O15 `it reads held-by-live`                     (the token itself is new)
 #     `[PINNED]` O12 `… a roster that names the RUNNING host and omits the holder DOES reap it`
@@ -110,13 +112,14 @@
 #     `[PINNED]` O24 `a DEAD pid under the same local name IS still orphaned`        (rc=127 pre-fix)
 #     `[PINNED]` O24 `a peer host the roster OMITS is still reaped`                  (rc=127 pre-fix)
 #     `[PINNED]` O24 `an explicit CLAIM_DEAD_HOSTS=box still reaps the sentinel`     (rc=127 pre-fix)
+#     `[PINNED]` O26 `… and it names the token`                                  (the token is new)
 #     `(setup)`  O22 `the failing probe really does fall back to the sentinel`       (needs claim_host)
 # ⛔ SO PINNED DOES **NOT** MEAN "passes pre-fix", and RED→GREEN does mean "measured red". Read PINNED
 # as: **this guards a new fail-open, it is not a regression of old behaviour**; read [RED→GREEN] as:
 # **measured red before the change, green after**. Every re-labelling in this file's history happened
 # after a measurement contradicted the label (O4's token check, three O15 lines, O17's duplicate check,
-# O18's once-per-process check, and sixteen in cycle 13). Re-measure rather than trusting this
-# paragraph — it is a snapshot of one measurement, not an invariant, and the file grows.
+# O18's once-per-process check, sixteen in cycle 13, O9's pair in cycle 18). Re-measure rather than
+# trusting this paragraph — it is a snapshot of one measurement, not an invariant, and the file grows.
 #
 # HERMETIC: every check builds its own throwaway bare origin (`git init --bare`), so no network, no
 # real origin and nothing outside $T is written — the claim refs die with the temp dir.
@@ -374,7 +377,10 @@ NOLEASE="$(as_box "$ORIG5" localbox 'CLAIM_DEAD_HOSTS=localbox claim_issue_acqui
   printf "RC=%s\nRESULT=%s\n" "$?" "${CLAIM_RESULT:-}"')"
 NOLRES="$(field "$NOLEASE" RESULT)"
 [ "$(field "$NOLEASE" RC)" = "1" ]; NOL_RC=$?
-ck "O9 [RED→GREEN] an UNPARSEABLE lease reads LIVE even when the owner host is on the DEAD list ('$NOLRES')" $NOL_RC
+# ⛔ [PINNED], NOT [RED→GREEN] (cycle-18 review, measured): on the pre-change tree nothing consults
+# `CLAIM_DEAD_HOSTS` at all, so this passes there VACUOUSLY — the deny list it relies on does not exist.
+# It is still the case that pins the ORDERING, which is why the mutation below is what gives it teeth.
+ck "O9 [PINNED] an UNPARSEABLE lease reads LIVE even when the owner host is on the DEAD list ('$NOLRES')" $NOL_RC
 # CONTROL: the same host, the same deny list, a PARSEABLE expired lease — the orphan arm DOES reclaim it,
 # so a mutation that skips the unparseable guard for orphaned hosts reddens the pair.
 PARSEABLE="$(as_box "$ORIG5" localbox 'c="$(_claim_commit "localbox:999994" "1000000000")"
@@ -1196,8 +1202,42 @@ O25D="$(SHAPE 'refs/claims/issue-9209802' 'peerQ:4242' 'peerQ')"
 O25E="$(SHAPE 'issue-9209802' 'peerQ:4242' 'peerQ')"
 [ "$(field "$O25D" RC)" = "0" ] && [ "$(field "$O25E" RC)" = "0" ]; O25D_RC=$?
 ck "O25 [RED→GREEN] prefixed and BARE issue keys agree on an orphaned host (prefixed rc=$(field "$O25D" RC), bare rc=$(field "$O25E" RC))" $O25D_RC
+# ⛔ AND THE ISSUE ARM NEEDS A SHAPE THAT WOULD OTHERWISE MATCH THE PID ARM (cycle-18 review: for a BARE
+# `issue-<N>` the `*[0-9]*-*` pattern can never fire, so deleting `*issue-*)` left the suite green and the
+# arm unpinned). This ref is `issue-` + digits + `-` + hex — exactly the PR shape — so only the issue arm
+# keeps it off the pid rule.
+O25G="$(SHAPE 'refs/claims/issue-9209803-0123456789ab')"
+[ "$(field "$O25G" RC)" = "1" ]; O25G_RC=$?
+ck "O25 [RED→GREEN] an issue ref shaped like a PR ref still abstains from the pid arm (rc=$(field "$O25G" RC))" $O25G_RC
 case "$(field "$O25E" R)" in *DEAD_HOSTS*) O25F_RC=0 ;; *) O25F_RC=1 ;; esac
 ck "O25 [RED→GREEN] the BARE issue key's verdict comes from the HOST rules ('$(field "$O25E" R)')" $O25F_RC
+
+echo
+echo "── O26: the PRE-FLIGHT's unparseable-lease order (a FALSE CLEAN duplicates the work) ────"
+# ⛔ P1, cycle-18 review: `claim_issue_preflight` is the FOURTH reader of the same decision and the only
+# one nothing pinned. A mutant that consults `claim_orphan_reason` inside its `_lease_unparseable`
+# branch returns rc=0 CLEAN for a `lease_until=0` claim whose host is on CLAIM_DEAD_HOSTS — which is
+# exactly the duplicate dispatch the pre-flight exists to prevent — while this suite and test-claims
+# both stayed green. The pair below is O9's, moved to the pre-flight.
+PRE26() { # PRE26 <issue> <owner> <lease-until> <CLAIM_DEAD_HOSTS-or-empty>
+  CLAIM_REPO="$T/repo"; CLAIM_STATE_DIR="$T/cl26"
+  CLAIM_DEAD_HOSTS="${4:-}"
+  export CLAIM_REPO CLAIM_STATE_DIR CLAIM_DEAD_HOSTS
+  mkdir -p "$CLAIM_STATE_DIR"
+  . "$CLAIMS_SH" || exit 1
+  c="$(_claim_commit "$2" "$3")"
+  _git push -q --force origin "$c:refs/claims/issue-$1" 2>/dev/null
+  r="$(claim_issue_preflight "$1")"
+  printf "RC=%s\nR=[%s]\n" "$?" "$r"
+}
+O26A="$(PRE26 9209900 'deadhostq:4242' 0 'deadhostq')"
+[ "$(field "$O26A" RC)" = "1" ]; O26A_RC=$?
+ck "O26 [PINNED] an UNPARSEABLE lease on a DEAD-listed host is NOT clean (rc=$(field "$O26A" RC))" $O26A_RC
+case "$(field "$O26A" R)" in *held-by-live*) O26B_RC=0 ;; *) O26B_RC=1 ;; esac
+ck "O26 [PINNED] ... and it names the token ('$(field "$O26A" R)')" $O26B_RC
+O26C="$(PRE26 9209901 'deadhostq:4243' 1000000000 'deadhostq')"
+[ "$(field "$O26C" RC)" = "0" ]; O26C_RC=$?
+ck "O26 [PINNED] CONTROL: a PARSEABLE expired lease on the same host IS clean (rc=$(field "$O26C" RC))" $O26C_RC
 
 echo
 echo "─────────────────────────────────────────────────────────────"

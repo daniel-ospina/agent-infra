@@ -466,6 +466,10 @@ claim_orphan_reason() {
   # `issue-` ref) against rc=1 held-by-live with the seam unset — the steal direction on a live LOCAL
   # pid. An unanswerable probe leaves the name EMPTY, which never matches, and the fleet-wide `box`
   # sentinel is dropped for the same reason it is dropped everywhere.
+  # ⛔ THESE TWO SCRUBS ARE REDUNDANT DEFENCE, NOT THE GUARD (cycle-18 review: removing them leaves the
+  # suite green, because every consumer re-guards — the roster arms do `case "…" in ''|box)`, and the
+  # pid arm's `[ "$host" != "box" ]` makes `$host = $me` unreachable). They are kept as belt-and-braces
+  # with that stated plainly, rather than carrying a comment that credits them with the protection.
   me="$(claim_host)"
   real="$(hostname -s 2>/dev/null)" || real=''
   case "$me" in ''|box) me='' ;; esac
@@ -495,12 +499,14 @@ claim_orphan_reason() {
     # ⛔ AND "A HYPHEN" IS NOT THE TEST (P2, cycle-16 review): `*-*` also matched the BARE ISSUE KEY
     # `issue-<N>` that `claim_issue_key` prints, so `claim_orphan_reason "host:<dead pid>" "issue-1234"`
     # returned ORPHANED — the PR-only rule judging an ISSUE claim, i.e. exactly the shared-barrier window
-    # this arm exists to close, one caller away. The shapes are matched POSITIVELY now: an ISSUE key is a
-    # PASS-THROUGH (`:`), not an abstention — it skips only the PID arm and still reaches the HOST rules
-    # below, so a prefixed and a bare issue key give the SAME verdict (cycle-17 review: `return 1` here
-    # made `issue-999` abstain where `refs/claims/issue-999` reclaimed an orphaned claim). A PR ref must
-    # be `…<pr>-<sha12>`; anything else abstains.
-    *issue-*) : ;;
+    # this arm exists to close, one caller away. The PR shape is therefore matched POSITIVELY: a PR ref
+    # must be `…<pr>-<sha12>`, and anything else abstains (`issue-<N>` has no digit-then-hyphen, so it
+    # falls through to the HOST rules below — bare and prefixed keys give the SAME verdict, which the
+    # `*"/issue-"*` arm above already guarantees for the prefixed form).
+    # ⛔ NO SEPARATE `*issue-*)` ARM (cycle-18 review): I added one, and it was INERT — the
+    # `*"/issue-"*` arm above matches every issue ref this code produces, and a bare `issue-<N>` cannot
+    # match the pattern below, so deleting it left every assertion green. An unpinnable duplicate is
+    # deleted rather than defended, the same call this file made for the inert `declare -f` gate.
     *[0-9]*-*)
       # ⛔ A FORMER NAME OF THIS BOX IS *THIS MACHINE*, SO ITS PID IS PROBEABLE TOO (P0, cycle-7
       # review). The gate used to be `host == claim_host`, so immediately after a rename a PR claim
