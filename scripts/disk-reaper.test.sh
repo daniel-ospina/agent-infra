@@ -461,13 +461,18 @@ assert_contains "$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null)" "ok=
 mkdir -p "$T/t14/passbin"
 cat >"$T/t14/passbin/timeout" <<'SH'
 #!/bin/bash
+# GNU `timeout` FLAGS FIRST — the shim must speak the real invocation or it answers a call nobody makes.
+# `-k <secs>` is the kill-after grace the shim adds so a TERM-ignoring delegate is still bounded.
 printf '%s\n' "$*" >>"${T14_CALLS:-/dev/null}"
-shift
+while [ "${1:-}" = "-k" ]; do shift 2; done
+shift   # the bound itself
 exec "$@"
 SH
 chmod +x "$T/t14/passbin/timeout"
 OUT="$(PATH="$T/t14/passbin:$PATH" T14_CALLS="$T/t14/calls" run_reaper --dry-run --repo "$REPO" --only worktree --aged-days 7 2>&1)"; RC=$?
 assert_eq "$RC" "5" "T14 with a timeout on PATH the same pass finds the same work"
+assert_contains "$(cat "$T/t14/calls" 2>/dev/null)" "-k 5" \
+    "T14 …and the call carries a kill-after, so a TERM-ignoring delegate is still bounded (Linux)"
 assert_contains "$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null)" "watchdog=timeout" \
     "T14 resolution prefers timeout over the internal fallback (recorded)"
 assert_absent "$OUT" "watchdog=" "T14 with a real timeout binary the report gains NO provenance line (pre-change output)"
@@ -556,13 +561,18 @@ assert_contains "$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null)" "ok=
 mkdir -p "$T/t14/passbin"
 cat >"$T/t14/passbin/timeout" <<'SH'
 #!/bin/bash
+# GNU `timeout` FLAGS FIRST — the shim must speak the real invocation or it answers a call nobody makes.
+# `-k <secs>` is the kill-after grace the shim adds so a TERM-ignoring delegate is still bounded.
 printf '%s\n' "$*" >>"${T14_CALLS:-/dev/null}"
-shift
+while [ "${1:-}" = "-k" ]; do shift 2; done
+shift   # the bound itself
 exec "$@"
 SH
 chmod +x "$T/t14/passbin/timeout"
 OUT="$(PATH="$T/t14/passbin:$PATH" T14_CALLS="$T/t14/calls" run_reaper --dry-run --repo "$REPO" --only worktree --aged-days 7 2>&1)"; RC=$?
 assert_eq "$RC" "5" "T14 with a timeout on PATH the same pass finds the same work"
+assert_contains "$(cat "$T/t14/calls" 2>/dev/null)" "-k 5" \
+    "T14 …and the call carries a kill-after, so a TERM-ignoring delegate is still bounded (Linux)"
 assert_contains "$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null)" "watchdog=timeout" \
     "T14 resolution prefers timeout over the internal fallback (recorded)"
 assert_absent "$OUT" "watchdog=" "T14 with a real timeout binary the report gains NO provenance line (pre-change output)"

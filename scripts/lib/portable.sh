@@ -71,10 +71,31 @@ if [ ! -f "${PORTABLE_BOUNDED_LIB:-}" ]; then
     # ⛔ EXIT, not `return`: a caller that continues after a failed source has NO helpers defined, and
     # every `_timeout` call in it then fails closed while the component completes — the exact #2046
     # shape. Refusing to start is the only fail-closed answer. (Tests source this in a subshell.)
-    exit 1
+    # ⛔ AND THE CODE IS 3 — the "refused at startup, nothing was measured" status every component
+    # already documents for exactly this. Exiting 1 here made a refusal indistinguishable from the
+    # component's own failure code, so `disk-reaper`'s T15 contract (3) went red on a correct refusal.
+    exit 3
 fi
 # shellcheck source=lib/bounded.sh
-. "$PORTABLE_BOUNDED_LIB"
+if ! . "$PORTABLE_BOUNDED_LIB"; then
+    printf 'portable.sh: ⛔ FAIL-CLOSED — the bounded-execution engine (%s) could not be SOURCED.\n' "$PORTABLE_BOUNDED_LIB" >&2
+    exit 3
+fi
+# ⛔ A FILE THAT EXISTS IS NOT AN ENGINE. An interrupted farm `cp` (a 0-byte copy), a `chmod 000`
+# copy, or an engine whose own probe refused (`TB_TIMEOUT_KIND=invalid`, a wrong `TB_TIMEOUT_BIN` pin)
+# loaded silently and left `_timeout` calling an undefined `tb_timeout`: every bounded call then failed
+# with 127 while the pass COMPLETED — byte-for-byte the #2046 shape this shim exists to refuse. The
+# engine is asserted callable, and its own verdict is honoured.
+if ! command -v tb_timeout >/dev/null 2>&1; then
+    printf 'portable.sh: ⛔ FAIL-CLOSED — %s loaded but defines no tb_timeout (empty, unreadable, or truncated copy).\n' "$PORTABLE_BOUNDED_LIB" >&2
+    exit 3
+fi
+if [ "${TB_TIMEOUT_KIND:-}" = invalid ]; then
+    printf 'portable.sh: ⛔ FAIL-CLOSED — the engine rejected the pinned bound tool (TB_TIMEOUT_BIN=%s).\n' \
+        "${TB_TIMEOUT_BIN:-}" >&2
+    printf 'portable.sh: a refused pin must not become an UNBOUNDED pass; fix the pin or unset it.\n' >&2
+    exit 3
+fi
 
 # _timeout <secs> <cmd…> — the ONE public name for a wall-clock bound. `tb_timeout` is the engine's
 # name and stays callable, so the #2046 call sites and their tests did not have to move.
@@ -100,17 +121,34 @@ _nproc() {
 # A leading `-` in a filename would be read as a flag by GNU stat; BSD stat has no `--` terminator.
 # Prefixing `./` is the one form both accept. Every value is validated as digits before it is
 # printed, so a locale-decorated or error-message answer is never mistaken for a measurement.
+# ⛔ A FAILING PROBE'S STDOUT IS NOT A MEASUREMENT. `stat -f %d file` on GNU is `--file-system`: it
+# prints a whole filesystem dump AND exits 1, so `$(stat -f … || stat -c …)` captured the dump and the
+# fallback never ran — the value was then rejected by the digit guard, and a box that could measure
+# perfectly reported "unmeasurable". Each spelling is probed on its own status.
+_stat_probe() { # _stat_probe <f|g> <fmt> <path>
+    local kind="$1" fmt="$2" p="$3" out
+    case "$kind" in
+        f) out="$(stat -f "$fmt" "$p" 2>/dev/null)" || return 1 ;;
+        *) out="$(stat -c "$fmt" "$p" 2>/dev/null)" || return 1 ;;
+    esac
+    case "$out" in ''|*[!0-9]*) return 1 ;; esac
+    printf '%s\n' "$out"
+}
+
 _portable_stat() { # _portable_stat <gnu-fmt> <bsd-fmt> <path>
     local gfmt="$1" bfmt="$2" p="$3" v=""
     case "$p" in '' ) return 1 ;; -*) p="./$p" ;; esac
     case "$(_portable_platform)" in
-        darwin|*bsd*) v="$(stat -f "$bfmt" "$p" 2>/dev/null || true)" ;;
-        *)            v="$(stat -c "$gfmt" "$p" 2>/dev/null || true)" ;;
+        darwin|*bsd*) v="$(_stat_probe f "$bfmt" "$p")" ;;
+        *)            v="$(_stat_probe c "$gfmt" "$p")" ;;
     esac
     # The platform guess can be wrong (a GNU stat on a BSD userland, or vice versa); fall back to the
     # other spelling rather than reporting "unmeasurable" on a box that can plainly measure.
     if [ -z "$v" ]; then
-        v="$(stat -f "$bfmt" "$p" 2>/dev/null || stat -c "$gfmt" "$p" 2>/dev/null || true)"
+        case "$(_portable_platform)" in
+            darwin|*bsd*) v="$(_stat_probe c "$gfmt" "$p")" ;;
+            *)            v="$(_stat_probe f "$bfmt" "$p")" ;;
+        esac
     fi
     case "$v" in ''|*[!0-9]*) return 1 ;; esac
     printf '%s\n' "$v"
@@ -159,7 +197,7 @@ _date() {
             local ep="${2:-}" f="${3:-}"; shift 3 2>/dev/null || true
             case "$ep" in ''|*[!0-9]*) return 1 ;; esac
             [ -n "$f" ] || f='%Y-%m-%dT%H:%M:%SZ'
-            if [ "$(_portable_platform)" = darwin ]; then
+            if _date_is_bsd; then
                 date -u -r "$ep" "+$f" 2>/dev/null
             else
                 date -u -d "@$ep" "+$f" 2>/dev/null
@@ -170,6 +208,17 @@ _date() {
 }
 
 # _date_parse <string> — epoch seconds, or empty + rc 1.
+# ⛔ THE PLATFORM STRING IS A PROXY; the question is which date(1) this box carries. `_portable_stat`
+# already supports `*bsd*`, so a FreeBSD host could measure a file but could never parse or format a
+# date — a shim gap that would only show up on a host nobody runs the suite on. One predicate, used
+# everywhere the two date(1) syntaxes differ.
+_date_is_bsd() {
+    case "$(_portable_platform)" in
+        darwin|*bsd*) return 0 ;;
+        *)            return 1 ;;
+    esac
+}
+
 _date_parse() {
     local s="${1:-}" nums units sign n u off now
     case "$s" in
@@ -180,14 +229,14 @@ _date_parse() {
             printf '%s\n' "$s"; return 0 ;;
         # "2026-10-18T17:27:01Z" and "2026-10-18T17:27:01+00:00" — the forms our records and stamps use
         ????-??-??T??:??:??Z)
-            if [ "$(_portable_platform)" = darwin ]; then
+            if _date_is_bsd; then
                 date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$s" +%s 2>/dev/null || return 1
             else
                 date -u -d "$s" +%s 2>/dev/null || return 1
             fi
             return 0 ;;
         ????-??-??T??:??:??+??:??|????-??-??T??:??:??-??:??)
-            if [ "$(_portable_platform)" = darwin ]; then
+            if _date_is_bsd; then
                 # BSD `date -f %z` wants +HHMM, not +HH:MM (measured: the colon form parses to a
                 # DIFFERENT instant, silently). Normalise the offset before handing it over.
                 off="${s: -6}"
@@ -201,7 +250,7 @@ _date_parse() {
             fi
             return 0 ;;
         ????-??-??)
-            if [ "$(_portable_platform)" = darwin ]; then
+            if _date_is_bsd; then
                 # ⛔ BSD `date -j -f '%Y-%m-%d'` fills the TIME-OF-DAY FROM THE CURRENT CLOCK — measured
                 # 2026-10-19: '1970-01-01' parsed to 4016, not 0. A date-only value must mean midnight
                 # UTC, so the time is pinned explicitly instead of inherited from "now".

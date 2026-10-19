@@ -929,6 +929,21 @@ if [[ "$(uname)" == "Darwin" ]] && [ -x "$INFRA_ROOT/scripts/scheduled-jobs.sh" 
     echo "         bash $INFRA_ROOT/scripts/scheduled-jobs.sh status" >&2
     launchd_reaper_failed=1
   fi
+elif [[ "$(uname)" == "Darwin" ]] && [ -z "$reaper_real_home" ]; then
+  # ⛔ THE FENCE HAS NO SILENT GAP. The first arm requires the command to be EXECUTABLE; a Darwin box
+  # where it exists but the exec bit is missing matched NO arm at all — no message, no failure flag, and
+  # setup.sh finished with "Done!" and rc 0 over an unscheduled Mac. An unmeasurable real home (dscl
+  # unavailable) is the same gap from the other side: it must report, not fall through.
+  echo ""
+  echo "    ⛔ WARNING: the disk reaper schedule could not be VERIFIED — the real home directory could not" >&2
+  echo "       be determined (dscl), so the launchd guard cannot tell this run from a temp-HOME test." >&2
+  launchd_reaper_failed=1
+elif [[ "$(uname)" == "Darwin" ]] && [ ! -x "$INFRA_ROOT/scripts/scheduled-jobs.sh" ]; then
+  echo ""
+  echo "    ⛔ WARNING: $INFRA_ROOT/scripts/scheduled-jobs.sh is not executable, so the disk reaper" >&2
+  echo "       schedule was NOT installed — this Mac is unscheduled and will not be reaped." >&2
+  echo "       Fix: chmod +x $INFRA_ROOT/scripts/scheduled-jobs.sh && bash $INFRA_ROOT/pi-bootstrap/setup.sh" >&2
+  launchd_reaper_failed=1
 elif [[ "$(uname)" == "Darwin" ]] && [ -n "$reaper_real_home" ] && [ "$HOME" != "$reaper_real_home" ]; then
   # A temp-HOME run (the bootstrap tests, a scratch farm) is not "the box": launchd addresses the user
   # domain BY UID, so a job registered from a temp HOME points at a plist path that dies with it (#446).

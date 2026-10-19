@@ -203,9 +203,24 @@ tb_timeout() {
     # A bound that does not parse is a REFUSAL, never "run it unbounded": the same answer GNU
     # `timeout` gives (125), so a typo'd DISK_REAPER_CLASS_TIMEOUT cannot make a pass fail OPEN.
     if ! tb_is_pos_int "$secs"; then return 125; fi
+    # ⛔ A BOUND THAT DOES NOT FIT IS A REFUSAL TOO. `$((10#18446744073709551616))` wraps to 0, which
+    # the next line reads as "no bound" — so a typo'd or injected huge timeout ran the command
+    # UNBOUNDED and reported its success (measured: a 2^64 bound returned rc 0 after a 3s command).
+    # `2^64-1` wrapped to -1 and produced an instant 124 for a command that never ran. Ten digits is
+    # ~317 years: past that the value is a mistake, and a mistake must not become an unbounded pass.
+    case "$secs" in
+        ??????????*) return 125 ;;
+    esac
     secs=$((10#$secs))
     if [ "$secs" -eq 0 ]; then "$@"; return $?; fi
-    if [ -n "$TB_TIMEOUT_BIN" ]; then "$TB_TIMEOUT_BIN" "$secs" "$@"; return $?; fi
+    if [ -n "$TB_TIMEOUT_BIN" ]; then
+        # ⛔ GNU `timeout` sends TERM and STOPS: a child that traps or ignores TERM (`trap "" TERM`, and
+        # the disposition is inherited across exec) ran to completion — measured `rc=124` after 25s
+        # against a 2s bound — while the macOS watchdog SIGKILLs on time. `-k` makes the Linux path as
+        # hard as the Mac's, which is the whole point of a shim that removes platform divergence.
+        # (Repeated to be forgiving of a `timeout` that does not know `-k`: GNU and busybox both do.)
+        "$TB_TIMEOUT_BIN" -k 5 "$secs" "$@"; return $?
+    fi
     tb_watchdog "$secs" "$@"
 }
 

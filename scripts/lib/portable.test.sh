@@ -66,6 +66,15 @@ host_nproc() {
     esac
 }
 host_size()  { wc -c < "$1" 2>/dev/null | tr -d '[:space:]'; }
+host_stat_dev() {
+    # Same rule as host_mtime: `stat -f %d file` on GNU is `--file-system` — it PRINTS a filesystem
+    # dump and exits 1, so `$(stat -f … || stat -c …)` captured the dump and the comparison could
+    # never match (this assertion was RED on the Linux runner for exactly that reason).
+    case "$HOST_PLATFORM" in
+        darwin|*bsd*) stat -f '%d' "$1" 2>/dev/null ;;
+        *)            stat -c '%d' "$1" 2>/dev/null ;;
+    esac
+}
 host_mtime() {
     # Keyed on uname, NOT on the shim's own `_portable_platform`: a probe that shares the helper's
     # detection cannot falsify it. (A `stat -f` PROBE is not usable here — GNU stat accepts -f too,
@@ -107,7 +116,11 @@ if [ "$ELAPSED" -le 3 ]; then ok "P2 …and it actually STOPPED the child (${ELA
 # ⛔ THE BOUND MUST REACH THE DESCENDANTS. `kill -9 <child>` leaves a grandchild running, so a bounded
 # delegate that shells out to `du`/`rm -rf` keeps deleting against a disk whose free-space delta the
 # next pass measures mid-deletion. GNU `timeout` signals the process group; so must this.
-_timeout 1 sh -c 'sleep 747 & wait' >/dev/null 2>&1; rc=$?
+# ⛔ THE SENTINEL IS PER-RUN. `pgrep -f 'sleep 747'` is machine-global: two concurrent runs of this
+# suite matched EACH OTHER and each reported a leak that was the other run — then `pkill`ed the other
+# run's fixture. The count is derived from this shell's pid, so a peer run cannot answer for us.
+DESC_SLEEP=$(( 7000 + ($$ % 900) ))
+_timeout 1 sh -c "sleep $DESC_SLEEP & wait" >/dev/null 2>&1; rc=$?
 assert_rc "$rc" 124 "P2 a bounded command whose CHILD holds the work still times out"
 # Poll rather than sleep-and-look: on a loaded box the group kill can land a moment after the parent
 # returns, and a 1s window would report a leak that is only a scheduling delay (measured: this pair went
@@ -115,31 +128,35 @@ assert_rc "$rc" 124 "P2 a bounded command whose CHILD holds the work still times
 # not "it dies within one second" — so give it up to 5s and report the wait actually needed.
 _gone=0
 for _i in 1 2 3 4 5 6 7 8 9 10; do
-    pgrep -f 'sleep 747' >/dev/null 2>&1 || { _gone=1; break; }
+    pgrep -f "sleep $DESC_SLEEP" >/dev/null 2>&1 || { _gone=1; break; }
     sleep 0.5
 done
 if [ "$_gone" = "1" ]; then
     ok "P2 …and the descendant did not survive the bound (the bound is a process group, not a single pid)"
 else
     bad "P2 the DESCENDANT survived the bound (a grandchild is still running after 5s)"
-    pkill -f 'sleep 747' 2>/dev/null || true
+    pkill -f "sleep $DESC_SLEEP" 2>/dev/null || true
 fi
 
 # ⛔ THE TIMER MUST NOT OUTLIVE THE PROBE. The watchdog's TERM trap can fire in the window between
 # `sleep &` and `s=$!`; the timer then survives for the WHOLE bound, reparented to pid 1 — and the
 # reaper calls this once per candidate.
-for i in 1 2 3 4 5 6 7 8; do _timeout 787 true; done
+# The internal watchdog's timer is `sleep <bound>`, so a bound no other call in this suite uses makes a
+# leak visible. Both the bound and the probe are seeded from this shell's pid, for the same reason as
+# above: a peer run must not be able to answer for us.
+LEAK_PROBE="$(( 8000 + ($$ % 900) ))"
+for i in 1 2 3 4 5 6 7 8; do _timeout "$LEAK_PROBE" true; done
 # Same polling rule as above: the watchdog's own cleanup may need a beat under load.
 _gone=0
 for _i in 1 2 3 4 5 6 7 8 9 10; do
-    pgrep -f 'sleep 787' >/dev/null 2>&1 || { _gone=1; break; }
+    pgrep -f "sleep $LEAK_PROBE" >/dev/null 2>&1 || { _gone=1; break; }
     sleep 0.5
 done
 if [ "$_gone" = "1" ]; then
     ok "P2 eight fast returns leaked no timers (the parent owns the timer's group)"
 else
-    bad "P2 a fast return LEAKED its timer (an orphaned 'sleep 787' outlived 5s)"
-    pkill -f 'sleep 787' 2>/dev/null || true
+    bad "P2 a fast return LEAKED its timer (an orphaned 'sleep $LEAK_PROBE' outlived 5s)"
+    pkill -f "sleep $LEAK_PROBE" 2>/dev/null || true
 fi
 
 # The sentinel's whole purpose: 124 means "the bound fired", 137 means "it killed itself". A caller
@@ -148,7 +165,10 @@ _timeout 5 sh -c 'kill -9 $$' >/dev/null 2>&1
 assert_rc "$?" 137 "P2 a command that SIGKILLs itself is 137, NOT reported as a timeout"
 
 # A full disk is exactly when an unwritable scratch dir happens; the bound must still answer 124 then.
-( TMPDIR=/nonexistent-dir _timeout 1 sleep 643 >/dev/null 2>&1 ); rc=$?
+# ⛔ TB_BOUND_TMP IS CLEARED: it was populated by the calls above and the engine short-circuits on it,
+# so the no-sentinel branch this assertion names was never executed (measured: the assertion passed
+# while the branch was dead). Clearing it is what makes this the real case.
+( TB_BOUND_TMP= TMPDIR=/nonexistent-dir _timeout 1 sleep 643 >/dev/null 2>&1 ); rc=$?
 assert_rc "$rc" 124 "P2 an unwritable scratch dir still reports 124 (the contract is not lost with the sentinel)"
 
 # The resolved mechanism must match what this host really has — otherwise "it works here" would be
@@ -182,6 +202,8 @@ assert_empty "$OUT" "P3 with no probe on PATH _nproc returns EMPTY (never a fabr
 # ── P4 _stat_size ─────────────────────────────────────────────────────────────────────────────
 echo "── P4 _stat_size ──"
 F="$T/plain.txt"; printf 'hello\n' >"$F"
+[ -f "$F" ] && ok "P4 the fixture exists (a comparison against a missing file would pass with BOTH sides empty)" \
+    || bad "P4 the fixture $F is MISSING — the size comparison below would be vacuous"
 assert_eq "$(_stat_size "$F")" "$(host_size "$F")" "P4 a small file: exact bytes, agreeing with wc -c"
 BIG="$T/big.bin"; dd if=/dev/zero of="$BIG" bs=1024 count=1500 >/dev/null 2>&1
 assert_eq "$(_stat_size "$BIG")" "1536000" "P4 a 1.5 MB file: exact bytes"
@@ -206,8 +228,7 @@ assert_empty "$OUT" "P4 an empty path argument is a failure, not a measurement o
 
 # _stat_dev: the mount-boundary check (`st_dev` cannot see a same-device bind mount) reads this.
 DEV="$(_stat_dev "$F")"
-assert_eq "$DEV" "$(stat -f %d "$F" 2>/dev/null || stat -c %d "$F" 2>/dev/null)" \
-    "P4 _stat_dev agrees with the platform's own stat"
+assert_eq "$DEV" "$(host_stat_dev "$F")" "P4 _stat_dev agrees with the platform's own stat"
 [ -n "$DEV" ] && ok "P4 _stat_dev returns a device id" || bad "P4 _stat_dev returned nothing"
 OUT="$(_stat_dev "$T/does-not-exist")"; rc=$?
 assert_empty "$OUT" "P4 _stat_dev of an absent path is EMPTY"
@@ -282,6 +303,61 @@ assert_eq "$(_date --fmt 1792345000 '%Y-%m-%d')" "2026-10-18" "P6 --fmt renders 
 OUT="$(_date --fmt notanepoch '%Y')"; rc=$?
 assert_empty "$OUT" "P6 --fmt of a non-epoch is EMPTY"
 [ "$rc" -ne 0 ] && ok "P6 …with a non-zero status" || bad "P6 …but it reported success"
+
+# ── P9 the engine must be CALLABLE, not merely present (adversarial round 2) ─────────────────
+# A file that exists is not an engine. An interrupted farm `cp` (0 bytes), a `chmod 000` copy, or an
+# engine that refused its own tool pin (`TB_TIMEOUT_KIND=invalid`) all LOADED silently and left every
+# `_timeout` calling an undefined `tb_timeout` — failing 127 while the pass completed, which is the
+# #2046 shape this shim exists to refuse. Each shape below read "loaded" before the fix.
+echo "── P9 an empty / unreadable / self-refusing engine is a REFUSAL ──"
+EMPTY_ENGINE="$T/engine-empty.sh"; : >"$EMPTY_ENGINE"
+OUT="$(PORTABLE_BOUNDED_LIB="$EMPTY_ENGINE" bash -c '. "'"$HERE"'/portable.sh"' 2>&1)"; rc=$?
+[ "$rc" -ne 0 ] && ok "P9 a 0-byte engine is refused at source time (rc=$rc)" || bad "P9 an EMPTY engine loaded and left _timeout undefined (rc=0)"
+assert_contains "$OUT" "defines no tb_timeout" "P9 …and names what is wrong with it"
+UNREADABLE_ENGINE="$T/engine-unreadable.sh"; cp "$HERE/bounded.sh" "$UNREADABLE_ENGINE"; chmod 000 "$UNREADABLE_ENGINE"
+OUT="$(PORTABLE_BOUNDED_LIB="$UNREADABLE_ENGINE" bash -c '. "'"$HERE"'/portable.sh"' 2>&1)"; rc=$?
+[ "$rc" -ne 0 ] && ok "P9 an UNREADABLE engine is refused (rc=$rc)" || bad "P9 a chmod-000 engine loaded silently"
+chmod 644 "$UNREADABLE_ENGINE"
+OUT="$(TB_TIMEOUT_BIN=/nonexistent/definitely-not-here bash -c '. "'"$HERE"'/portable.sh"' 2>&1)"; rc=$?
+[ "$rc" -ne 0 ] && ok "P9 a refused bound-tool pin is a STARTUP refusal (rc=$rc)" || bad "P9 an invalid TB_TIMEOUT_BIN pin loaded a shim whose every call is 127"
+assert_contains "$OUT" "rejected the pinned bound tool" "P9 …and names the pin"
+
+# ── P10 a bound that does not FIT is a refusal, never an unbounded pass ────────────────────────
+# `$((10#18446744073709551616))` wraps to 0, which the engine reads as "no bound": the command ran to
+# completion and reported its success. Reachable through the documented env seams the components pass
+# straight in (DISK_REAPER_CLASS_TIMEOUT, REAP_WT_LIST_TIMEOUT).
+echo "── P10 an out-of-range bound is refused ──"
+OUT="$(_timeout 18446744073709551616 sh -c 'echo RAN-UNBOUNDED')"; rc=$?
+[ "$rc" -eq 125 ] && ok "P10 a 2^64 bound is a REFUSAL (125), not an unbounded run" || bad "P10 a 2^64 bound returned $rc — the bind ran unbounded"
+assert_absent "$OUT" "RAN-UNBOUNDED" "P10 …and the command never ran"
+OUT="$(_timeout 999999999999999999999 true)"; rc=$?
+[ "$rc" -eq 125 ] && ok "P10 a 21-digit bound is a REFUSAL" || bad "P10 a 21-digit bound returned $rc"
+OUT="$(_timeout 999999999 true)"; rc=$?
+[ "$rc" -eq 0 ] && ok "P10 a 9-digit bound is still accepted (the guard is magnitude, not length-1)" || bad "P10 a legitimate 9-digit bound was refused (rc=$rc)"
+
+# ── P11 the bound is HARD on both platforms: a child that ignores TERM must still die ──────────
+# GNU `timeout` sends TERM and stops, so `trap "" TERM` (inherited across exec) ran to completion while
+# the macOS watchdog SIGKILLs on time — the divergence the shim exists to remove. `-k` closes it.
+echo "── P11 a TERM-ignoring child is still bounded ──"
+START=$(date +%s)
+_timeout 2 sh -c 'trap "" TERM; sleep 20' >/dev/null 2>&1; rc=$?
+ELAPSED=$(( $(date +%s) - START ))
+assert_rc "$rc" 124 "P11 a TERM-ignoring child still reports 124"
+[ "$ELAPSED" -le 12 ] && ok "P11 …and was actually killed (${ELAPSED}s, not the 20s it asked for)" \
+    || bad "P11 the child IGNORED the bound (${ELAPSED}s — TERM-only, no kill-after)"
+
+# ── P12 the stat fallback measures, instead of capturing a failing probe's stdout ─────────────
+echo "── P12 the wrong-spelling stat probe falls back correctly ──"
+# On GNU, `stat -f %d file` prints a whole filesystem dump AND exits 1. The old fallback captured that
+# dump, the digit guard rejected it, and a box that could measure plainly reported "unmeasurable".
+OUT="$(PORTABLE_PLATFORM=darwin _stat_size "$F" 2>/dev/null)"; rc=$?
+case "$HOST_PLATFORM" in
+    darwin|*bsd*) ok "P12 (skipped: this IS the BSD platform, the probe is not wrong here)" ;;
+    *)
+        [ "$rc" -eq 0 ] && assert_eq "$OUT" "$(host_size "$F")" "P12 the GNU box measures with the BSD spelling pointed at it" \
+            || bad "P12 _portable_stat reported unmeasurable on a box that can measure (rc=$rc)"
+        ;;
+esac
 
 # ── P7 a missing engine is a refusal ─────────────────────────────────────────────────────────
 echo "── P7 refusal when the engine is missing ──"

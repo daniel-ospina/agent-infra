@@ -413,6 +413,9 @@ live_checks() {
         r_svc="$(printf '%s' "$found" | cut -d'|' -f5)"
         [ "$r_inst" = yes ] || fail "MISSING $id — '$name' is not installed on this host"
         case "$r_active" in
+            # darwin reports `<loaded>:disabled` when `launchctl disable` has run: loaded and firing
+            # until logout, then silently never. Same INERT verdict as a `systemctl disable`d timer.
+            *:disabled) fail "INERT $id — '$name' is installed and loaded but DISABLED (state=$r_active): it will not fire after the next logout/reboot" ;;
             active|yes|running|active:enabled|active:static|active:enabled-runtime) ;;
             *) fail "INERT $id — '$name' is installed but NOT loaded/enabled (state=$r_active): it never fires" ;;
         esac

@@ -309,8 +309,13 @@ assert_contains "$OUT" "reload_reason=pass-changed" "S7 …and the reload reason
 OUT="$(run_lin status 2>&1)"
 assert_contains "$OUT" "pass_drift=in-sync" "S7 after the reload the job matches the script"
 printf '#!/usr/bin/env bash\necho "alpha v3 $*"\n' >"$T/farm/alpha.sh"; chmod +x "$T/farm/alpha.sh"
-OUT="$(run_lin status 2>&1)"
+OUT="$(run_lin status 2>&1)"; RC=$?
 assert_contains "$OUT" "CHANGED since install" "S7 a stale install is REPORTED, not inferred from a log"
+# ⛔ REPORTED IS NOT JUDGED. The field was published and never used in the verdict, so `status` exited 0
+# over a job that runs DIFFERENT bytes than the one that was installed.
+[ "$RC" -ne 0 ] && ok "S7 …and status FAILS on it (rc=$RC): the running job is not the job that was installed" \
+    || bad "S7 status exited 0 over a script that CHANGED since install"
+assert_contains "$OUT" "verdict=STALE-SCRIPT" "S7 …named STALE-SCRIPT, not a note"
 run_lin install >/dev/null 2>&1
 
 echo "── S8 impossible states are LOUD ──"
@@ -431,6 +436,53 @@ for f in $COMPONENTS; do
 done
 [ "$N" -ge 8 ] && ok "S10 the population is non-empty and derived from the declaration ($N components)" \
                 || bad "S10 the component population collapsed to $N — the check would be vacuous"
+
+echo "── S11 the verbs reach the LIVE domain only from the real home (#446) ──"
+# The temp-HOME guard was applied to `install` and to nothing else: `stop|restart|uninstall` reached the
+# live gui/<uid> domain from a throwaway HOME, and `restart` BOOTSTRAPPED a plist that lives inside the
+# temp dir — the exact artifact the guard exists to prevent.
+for v in stop restart uninstall status; do
+    OUT="$(HOME="$T/home" PATH="$T/bin:$PATH" PORTABLE_PLATFORM=darwin \
+           SJ_DECLARATION="$DECL" SJ_FARM="$T/farm" SJ_STATE_DIR="$T/state-mac" \
+           SJ_LAUNCHD_DIR="$T/agents" SJ_LAUNCHCTL="$T/bin/launchctl" SJ_LAUNCHD_DOMAIN="gui/999" \
+           bash "$INST" "$v" --only alpha 2>&1)"; RC=$?
+    [ "$RC" -ne 0 ] && ok "S11 '$v' from a temp HOME is refused (rc=$RC)" || bad "S11 '$v' reached the live launchd domain from a temp HOME"
+    assert_contains "$OUT" "not the real home" "S11 …and '$v' says why"
+done
+# …and an UNMEASURABLE real home is a refusal, not a pass: `dscl` is macOS-only, so on any other host the
+# old `[ -n "$real" ]` fence fell through and install bootstrapped into the LIVE domain from a temp HOME.
+mkdir -p "$T/bin-nodscl"
+for b in launchctl systemctl crontab; do [ -f "$T/bin/$b" ] && cp "$T/bin/$b" "$T/bin-nodscl/"; done
+OUT="$(HOME="$T/home" PATH="$T/bin-nodscl:/usr/bin:/bin" PORTABLE_PLATFORM=darwin \
+       SJ_DECLARATION="$DECL" SJ_FARM="$T/farm" SJ_STATE_DIR="$T/state-mac" \
+       SJ_LAUNCHD_DIR="$T/agents" SJ_LAUNCHCTL="$T/bin/launchctl" SJ_LAUNCHD_DOMAIN="gui/999" \
+       bash -c 'command -v dscl >/dev/null && exit 77; exec "$@"' _ \
+       "$BASH" "$INST" install --only alpha 2>&1)"; RC=$?
+if [ "$RC" = 77 ]; then
+    ok "S11 (skipped: dscl is on PATH — the macOS box always has it)"
+else
+    [ "$RC" -ne 0 ] && ok "S11 an UNMEASURABLE real home refuses instead of installing (rc=$RC)" \
+        || bad "S11 an unmeasurable real home installed into the live domain (#446)"
+    assert_contains "$OUT" "could not be determined" "S11 …and names the reason"
+fi
+
+echo "── S12 an unmeasurable script digest RELOADS, and `--apply` on a delegated record is announced ──"
+# An empty digest used to mean "unchanged" (`[ -n "$sha" ] &&`), so a box without sha256sum/shasum
+# installed an edited job and never reloaded it — the #1738 hole, by construction.
+mkdir -p "$T/bin-nosha"
+for b in systemctl crontab launchctl; do [ -f "$T/bin/$b" ] && cp "$T/bin/$b" "$T/bin-nosha/"; done
+printf '#!/usr/bin/env bash\nexit 1\n' >"$T/bin-nosha/sha256sum"; chmod +x "$T/bin-nosha/sha256sum"
+printf '#!/usr/bin/env bash\nexit 1\n' >"$T/bin-nosha/shasum";   chmod +x "$T/bin-nosha/shasum"
+OUT="$(HOME="$T/home" PATH="$T/bin-nosha:/usr/bin:/bin" PORTABLE_PLATFORM=linux \
+       SJ_DECLARATION="$DECL" SJ_FARM="$T/farm" SJ_STATE_DIR="$T/state-nosha" SJ_OWNER_DIR="$T/owners" \
+       SJ_SYSTEMD_UNIT_DIR="$T/units" SJ_SYSTEMCTL="$T/bin/systemctl" SC_STATE="$T/active" \
+       bash "$INST" install --only alpha 2>&1)"; RC=$?
+assert_contains "$OUT" "UNVERIFIABLE" "S12 an unavailable digest is reported as UNVERIFIABLE"
+assert_contains "$OUT" "pass_changed=1" "S12 …and the job is RELOADED rather than assumed unchanged"
+# `--apply` is rendered into the artifacts this command owns and CANNOT be applied to another owner's —
+# it used to be silently dropped for those records while the run read as a whole-set success.
+OUT="$(run_lin install --apply 2>&1)"
+assert_contains "$OUT" "arming NOT applied" "S12 --apply says which delegated records it cannot arm"
 
 echo
 echo "──────────────────────────────────────────────────────────────────────"

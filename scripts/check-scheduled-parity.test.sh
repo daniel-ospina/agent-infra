@@ -67,6 +67,7 @@ case "${1:-}" in
            printf 'PID\tStatus\tLabel\n'
            [ -f "$state" ] && while IFS= read -r l; do [ -n "$l" ] && printf -- '-\t0\t%s\n' "$l"; done <"$state"
            exit 0 ;;
+  print-disabled) cat "${LD_DISABLED:-/dev/null}" 2>/dev/null; exit 0 ;;
   bootstrap|enable|kickstart) exit 0 ;;
   bootout)  exit 0 ;;
 esac
@@ -174,8 +175,8 @@ gate_mac() { # gate_mac <decl> [args...]
     local d="$1"; shift
     HOME="$T/home" PATH="$T/bin:$PATH" PORTABLE_PLATFORM=darwin \
     SJ_DECLARATION="$d" SJ_UNMANAGED_REGISTER="${REG:-$T/none.register}" \
-    SJ_FARM="$T/farm" SJ_LAUNCHD_DIR="${AGENTS:-$T/agents}" SJ_LAUNCHCTL="$T/bin/launchctl" \
-    LC_STATE="$T/loaded" LC_LOG="$T/lc.log" LC_LIST_RC="${LC_LIST_RC:-0}" SJ_NAMESPACES="com.eldato.,com.tortoise." \
+    SJ_FARM="$T/farm" SJ_LAUNCHD_DIR="${AGENTS:-$T/agents}" SJ_LAUNCHCTL="${SJ_LAUNCHCTL_OVERRIDE:-$T/bin/launchctl}" \
+    LC_STATE="$T/loaded" LC_LOG="$T/lc.log" LC_LIST_RC="${LC_LIST_RC:-0}" LD_DISABLED="${LD_DISABLED:-/dev/null}" SJ_NAMESPACES="com.eldato.,com.tortoise." \
     bash "$GATE" "$@"
 }
 gate_lin() { # gate_lin <decl> [args...]
@@ -676,6 +677,24 @@ HOME="$T/home" SJ_DECLARATION="$DP" SJ_FARM="$T/farm" SJ_STATE_DIR="$T/home/.pi/
     bash -c '. "$0/lib/scheduled-jobs.sh" && sj_render_systemd "$1" "$2" system' "$HERE" alpha "$T/units2" >/dev/null 2>&1
 assert_absent "$(cat "$T/units2/eldato-alpha.service" 2>/dev/null)" '@tortoise' \
     "P27 an arg placeholder does not survive into the artifact as a literal"
+
+echo "── P28 a DISABLED launchd job is INERT — macOS has this state and the gate never read it ──"
+# `launchctl disable` is the Mac's equivalent of `systemctl disable`, and it was unenforced: a loaded,
+# disabled job read as healthy. Measured on this box: eight in-namespace labels are `=> disabled`.
+fresh_mac
+mkrendered_iv "$T/agents" alpha 900
+echo com.eldato.alpha >"$T/loaded"
+OUT="$(gate_mac "$D" 2>&1)"; RC=$?
+assert_eq "$RC" "0" "P28 the baseline (enabled) job is green"
+printf '    "com.eldato.alpha" => disabled\n' >"$T/disabled"
+OUT="$(LD_DISABLED="$T/disabled" gate_mac "$D" 2>&1)"; RC=$?
+assert_eq "$RC" "1" "P28 a DISABLED job FAILS (it stops firing after the next logout)"
+assert_contains "$OUT" "INERT alpha" "P28 …named INERT, the same word the systemd side uses"
+# An unreadable enablement surface is a measurement gap, not "enabled".
+printf '#!/usr/bin/env bash\nexit 1\n' >"$T/bin/launchctl-nodisabled"
+chmod +x "$T/bin/launchctl-nodisabled"
+OUT="$(SJ_LAUNCHCTL_OVERRIDE="$T/bin/launchctl-nodisabled" gate_mac "$D" 2>&1)"; RC=$?
+assert_eq "$RC" "3" "P28 an unreadable 'print-disabled' is UNMEASURABLE (3), never assumed enabled"
 
 echo
 echo "──────────────────────────────────────────────────────────────────────"

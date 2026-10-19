@@ -527,6 +527,17 @@ sj_live_launchd() { # prints: <label>|<installed yes/no>|<loaded yes/no>|<cadenc
         echo "sj_live_launchd: no agent directory ($dir) — this box has no launchd surface to read" >&2
         return 1
     fi
+    # ⛔ A DISABLED JOB IS INERT, NOT "installed and fine" — and only macOS knows this state, through
+    # `launchctl print-disabled`. The systemd reader checks enablement three times; this one checked it
+    # never, so a `launchctl disable`d job read as healthy on the Mac while the same state was INERT on
+    # a cell. Measured on this box: eight in-namespace labels are `=> disabled`. An unreadable
+    # `print-disabled` is a MEASUREMENT GAP (exit 3), exactly like an unreadable `launchctl list`.
+    local disabled_list dsrc
+    disabled_list="$("$lc" print-disabled "${SJ_LAUNCHD_DOMAIN:-gui/$(id -u)}" 2>/dev/null)"; dsrc=$?
+    if [ "$dsrc" -ne 0 ]; then
+        echo "sj_live_launchd: 'launchctl print-disabled' failed (rc=$dsrc) — whether these jobs are ENABLED cannot be read, so 'active' would be a guess" >&2
+        return 1
+    fi
     # Files first: a plist on disk is the strongest "installed" signal, and it is what survives a
     # reboot. Non-`.plist` entries (`.bak-*`, `.disabled`) are NOT jobs and are counted separately so
     # the exclusion is visible rather than silent.
@@ -536,6 +547,11 @@ sj_live_launchd() { # prints: <label>|<installed yes/no>|<loaded yes/no>|<cadenc
         if ! sj_in_namespace "$label"; then skipped=$((skipped + 1)); continue; fi
         total=$((total + 1))
         if "$lc" print "${SJ_LAUNCHD_DOMAIN:-gui/$(id -u)}/$label" >/dev/null 2>&1; then loaded=yes; else loaded=no; fi
+        # load and enablement are DIFFERENT states: a loaded-but-disabled job keeps firing from its
+        # in-memory definition until logout, then never again.
+        case "$disabled_list" in
+            *"\"$label\" => disabled"*) loaded="$loaded:disabled" ;;
+        esac
         cadence="$(sj_launchd_cadence "$f")"
         # svc=yes: on launchd the plist IS the payload, so the artifact cannot exist without one.
         printf '%s|yes|%s|%s|yes\n' "$label" "$loaded" "$cadence"
@@ -562,6 +578,11 @@ sj_live_launchd() { # prints: <label>|<installed yes/no>|<loaded yes/no>|<cadenc
         [ -n "$label" ] || continue
         sj_in_namespace "$label" || continue
         [ -f "$dir/$label.plist" ] && continue
+        # A job loaded from ANOTHER directory is held by launchd exactly like a local one, so the same
+        # enablement rule applies to it.
+        case "$disabled_list" in
+            *"\"$label\" => disabled"*) printf '%s|no|yes:disabled|unknown|no\n' "$label"; continue ;;
+        esac
         printf '%s|no|yes|unknown|no\n' "$label"
     done <<EOF
 $(printf '%s\n' "$listing" | awk 'NR>1 && NF>=3 {print $3}')

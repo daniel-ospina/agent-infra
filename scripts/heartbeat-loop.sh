@@ -128,6 +128,17 @@ IN_PASS_RESERVE=150
 #     fails to bound anything;
 #   * an overrun is WRITTEN TO THE HEARTBEAT LOG, because a stall must be readable from
 #     the log, not something only `ps` can find.
+#
+# Epoch mtime, or 0 when it cannot be measured — ONE place, so the GNU/BSD spellings cannot diverge and
+# a failed probe cannot contribute output. (`stat -f` is `--file-system` on GNU: it prints a dump and
+# exits 1, which is how a `stat -f … || stat -c …` chain silently produced an unparseable value.)
+_mtime_or_zero() {
+  local m=""
+  m="$(stat -c %Y "$1" 2>/dev/null)" || m=""
+  [ -n "$m" ] || m="$(stat -f %m "$1" 2>/dev/null)" || m=""
+  case "$m" in ''|*[!0-9]*) printf '0\n' ;; *) printf '%s\n' "$m" ;; esac
+}
+
 run_bounded() {
   local secs="$1" label="$2" logf="$3"; shift 3
   set -m
@@ -275,7 +286,12 @@ while :; do
   # ⛔ Do NOT make this live-per-read and do NOT delete the TTL gate. The `blind=` guard in objective.py
   # (which refuses to cache a FAILED read) is CORRECT and must stay.
   _obj_file="$STATE/objective.last"
-  _obj_age=$(( $(date +%s) - $(stat -f %m "$_obj_file" 2>/dev/null || stat -c %Y "$_obj_file" 2>/dev/null || echo 0) ))
+  # ⛔ A FAILING PROBE'S STDOUT IS NOT A MEASUREMENT. `stat -f %m file` on GNU is `--file-system`: it
+  # prints a whole filesystem dump AND exits 1, so `$(stat -f … || stat -c …)` captured the dump plus
+  # the real epoch, `$(( ))` failed on the multi-line value, `_obj_age` came out EMPTY — and
+  # `[ "$_obj_age" -gt 900 ]` then errored, so the TTL gate was never true and the stale objective was
+  # NEVER refreshed on Linux. GNU spelling FIRST, and each probe is used only when it succeeded.
+  _obj_age=$(( $(date +%s) - $(_mtime_or_zero "$_obj_file") ))
   if [ ! -f "$_obj_file" ] || [ "$_obj_age" -gt 900 ]; then
     # SYNCHRONOUS + BOUNDED (2026-10-10, #7871). A DETACHED refresh only bounds the NEXT read --
     # this pass's readers would still see the stale value, which is exactly the "not bounding it"
@@ -288,7 +304,7 @@ while :; do
     run_bounded 90 "objective-refresh" "$LOG" /usr/bin/python3 "$SCRIPTS/objective.py"
     printf '%s OBJECTIVE refresh DONE (cache_age now %ss)\n' \
       "$(date '+%m-%d %H:%M:%S')" \
-      "$(( $(date +%s) - $(stat -f %m "$_obj_file" 2>/dev/null || echo 0) ))" >> "$LOG"
+      "$(( $(date +%s) - $(_mtime_or_zero "$_obj_file") ))" >> "$LOG"
   fi
 
   run_bounded "$(( TARGET - IN_PASS_RESERVE ))" "orchestrator-heartbeat.sh" /dev/null \

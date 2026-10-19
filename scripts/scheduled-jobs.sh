@@ -156,12 +156,21 @@ require_ids() {
 # first space — otherwise every second install sees a "changed pass" and reloads a job that did not
 # change (measured by S3, which is why this is asserted rather than assumed).
 stamp_sha() { sed -n "s/^job=$1 sha=//p" "$STAMP" 2>/dev/null | head -1 | cut -d' ' -f1; }
-artifact_sha() { # the script this record actually runs
-    local s
+artifact_sha() { # the script this record actually runs; EMPTY + rc 1 when it cannot be measured
+    local s out
     s="$(sj_resolve_script "$1" 2>/dev/null)" || return 1
-    case "$(_portable_platform)" in
-        darwin) shasum -a 256 "$s" 2>/dev/null | cut -d' ' -f1 ;;
-        *)      sha256sum "$s" 2>/dev/null | cut -d' ' -f1 ;;
+    # ⛔ ASK THE BOX, NOT AN ENV SEAM, and try BOTH spellings. Branching on `_portable_platform` (which
+    # honours PORTABLE_PLATFORM / a forwarded DISK_REAPER_PLATFORM) called `shasum` on a slim Linux
+    # image that does not carry it — and an empty digest was read as "unchanged", so an edited script
+    # never reloaded (#1738) and the pass reported success over an inert job.
+    if command -v sha256sum >/dev/null 2>&1; then
+        out="$(sha256sum "$s" 2>/dev/null | cut -d' ' -f1)"
+    elif command -v shasum >/dev/null 2>&1; then
+        out="$(shasum -a 256 "$s" 2>/dev/null | cut -d' ' -f1)"
+    fi
+    case "$out" in
+        ????????????????????????????????????????????????????????????????) printf '%s\n' "$out"; return 0 ;;
+        *) return 1 ;;
     esac
 }
 write_stamp() { # write_stamp <id>
@@ -200,7 +209,13 @@ announce_arm_change() { # announce_arm_change <id> <installed-artifact>
     [ -n "$ARM" ] || return 0
     before="$(armed_from_file "$2")"
     case "$ARM" in armed) after=apply ;; *) after=dry-run ;; esac
-    [ "$before" = unknown ] && return 0
+    # ⛔ AN UNREADABLE STANCE IS ANNOUNCED, NOT ASSUMED AWAY. Returning quietly rewrote an artifact whose
+    # mode flag this command could not read (a legacy unit, a different flag spelling) to the DECLARED
+    # stance — a silent arming or disarming, which the comment above says must never happen one-way.
+    if [ "$before" = unknown ]; then
+        say "⛔ ARMING UNREADABLE $1: the installed artifact carries no readable mode flag; applying the DECLARED stance ($after) — verify with 'scheduled-jobs.sh status'"
+        return 0
+    fi
     [ "$before" = "$after" ] && return 0
     say "⛔ ARMING CHANGED $1: $before → $after (explicit flag; the artifact is the record)"
 }
@@ -267,7 +282,14 @@ sd_install() { # sd_install <id>
     fi
     cmp -s "$tmpd/$unit.service" "$UNIT_DIR/$unit.service" 2>/dev/null || changed=1
     cmp -s "$tmpd/$unit.timer"   "$UNIT_DIR/$unit.timer"   2>/dev/null || changed=1
-    sha="$(artifact_sha "$id")"; insha="$(stamp_sha "$id")"
+    # ⛔ AN UNMEASURABLE DIGEST IS `pass_changed`, NOT "unchanged". The old `[ -n "$sha" ] &&` test made
+    # a missing sha256 tool (or an unreadable script) mean "the script did not change", so an edited
+    # job sat inert with a success report and no reload.
+    if ! sha="$(artifact_sha "$id")"; then
+        err "$id: cannot digest the script it runs — the job is UNVERIFIABLE, so it is reloaded rather than assumed unchanged"
+        pass_changed=1; sha=""
+    fi
+    insha="$(stamp_sha "$id")"
     [ -n "$sha" ] && [ "$sha" != "$insha" ] && pass_changed=1
     [ -f "$UNIT_DIR/$unit.timer" ] || { changed=1; pass_changed=1; }
     mkdir -p "$UNIT_DIR" 2>/dev/null || true
@@ -317,7 +339,17 @@ guard_test_home() {
     [ "${ELDATO_ALLOW_TEST_HOME:-}" = 1 ] && return 0
     local real
     real="$(dscl . -read "/Users/$(id -un)" NFSHomeDirectory 2>/dev/null | sed -n 's/^NFSHomeDirectory: //p' | head -1 || true)"
-    if [ -n "$real" ] && [ "$HOME" != "$real" ]; then
+    # ⛔ AN UNMEASURABLE HOME IS A REFUSAL, NOT A PASS. `dscl` is macOS-only, so on any other host — and
+    # on a Mac where dscl fails — `$real` came back empty and the `[ -n "$real" ]` fence fell through:
+    # `install` then bootstrapped a temp-HOME plist into the LIVE `gui/<uid>` domain, which is exactly
+    # the #446 artifact this guard exists to prevent, arriving through the guard's own dependency.
+    if [ -z "$real" ]; then
+        err "refusing to manage launchd jobs: the real home directory could not be determined (dscl)."
+        err "       An unverified HOME must not reach the live launchd domain (#446)."
+        err "       Tests: put a launchctl shim on PATH and set ELDATO_ALLOW_TEST_HOME=1"
+        return 1
+    fi
+    if [ "$HOME" != "$real" ]; then
         err "refusing to manage launchd jobs: HOME=$HOME is not the real home ($real)."
         err "       A temp-HOME run registers jobs against plist paths that vanish (#446)."
         err "       Tests: put a launchctl shim on PATH and set ELDATO_ALLOW_TEST_HOME=1"
@@ -326,9 +358,14 @@ guard_test_home() {
     return 0
 }
 
-ld_last_exit() { # ld_last_exit <label>
-    local out rc
-    out="$($LC print "$LD_DOMAIN/$1" 2>/dev/null)"
+ld_last_exit() { # ld_last_exit <label> -> <n> | never | unknown
+    local out src rc
+    out="$($LC print "$LD_DOMAIN/$1" 2>/dev/null)"; src=$?
+    # ⛔ "COULD NOT ASK" IS NOT "NEVER RAN" — the same distinction the systemd reader was fixed for, and
+    # only that half was fixed: `never` sits on the HEALTHY list, so a `launchctl print` that failed
+    # published a clean-looking `last_exit=never` from a surface it never read (and `cloud-cell-bringup`
+    # scrapes this field).
+    [ "$src" -eq 0 ] || { printf 'unknown\n'; return 0; }
     rc="$(printf '%s\n' "$out" | sed -n 's/^[[:space:]]*last exit code = //p' | head -1)"
     case "$rc" in ''|*[!0-9]*) printf 'never\n' ;; *) printf '%s\n' "$rc" ;; esac
 }
@@ -354,7 +391,14 @@ ld_install() { # ld_install <id>
         return 0
     fi
     cmp -s "$tmp/$label.plist" "$dest" 2>/dev/null || changed=1
-    sha="$(artifact_sha "$id")"; insha="$(stamp_sha "$id")"
+    # ⛔ AN UNMEASURABLE DIGEST IS `pass_changed`, NOT "unchanged". The old `[ -n "$sha" ] &&` test made
+    # a missing sha256 tool (or an unreadable script) mean "the script did not change", so an edited
+    # job sat inert with a success report and no reload.
+    if ! sha="$(artifact_sha "$id")"; then
+        err "$id: cannot digest the script it runs — the job is UNVERIFIABLE, so it is reloaded rather than assumed unchanged"
+        pass_changed=1; sha=""
+    fi
+    insha="$(stamp_sha "$id")"
     [ -n "$sha" ] && [ "$sha" != "$insha" ] && pass_changed=1
     [ -f "$dest" ] || pass_changed=1
     ld_loaded "$label" || pass_changed=1
@@ -388,6 +432,12 @@ delegate_install() { # delegate_install <id>
     esac
     path="$SJ_OWNER_DIR/$owner"
     [ -f "$path" ] || { err "$id: its owner installer '$owner' was not found in $SJ_OWNER_DIR — the job is NOT installed, and this is a FAILURE, not a skip"; return 1; }
+    # ⛔ THE STANCE IS NOT OURS TO SET on a record another installer owns: `--apply` over the whole set
+    # armed this declaration's jobs and left the delegated ones at their owner's default, while the
+    # output read as a whole-set success. Say it per job.
+    if [ -n "$ARM" ]; then
+        say "$id: arming NOT applied — $owner owns this artifact; it stays at its owner's stance (use that installer for its mode)"
+    fi
     if [ "$PREVIEW" = 1 ]; then
         say "preview: $id is owned by $owner — would run: bash $path"
         return 0
@@ -439,7 +489,10 @@ do_status() {
     local id rc=0 unit label installed active enabled last armed drift sha insha sched next=
     case "$PLATFORM" in
         linux)  choose_systemd || { err "no systemd target to read"; return 3; } ;;
-        darwin) choose_launchd || { err "no launchctl to read"; return 3; } ;;
+        darwin) choose_launchd || { err "no launchctl to read"; return 3; }
+                # Reading the live domain from a temp HOME reports a DIFFERENT box's jobs as this
+                # one's — the #446 rule applies to every verb that touches launchd, not just install.
+                guard_test_home || return 1 ;;
     esac
     require_ids
     for id in $IDS; do
@@ -477,6 +530,14 @@ do_status() {
                 unknown) [ "$verdict" = OK ] && verdict=UNKNOWN ;;
                 *) verdict=FAILED ;;
             esac
+            # ⛔ A CHANGED SCRIPT IS A FAILURE, not a note. The job is loaded and active — and runs
+            # DIFFERENT bytes than the stamp recorded, so "installed" is true and "what I installed" is
+            # false. `pass_drift` was published in the row and judged nowhere, which is the shape this
+            # repo keeps removing: a measurement that cannot change a verdict.
+            case "$drift" in
+                'CHANGED since install'*) [ "$verdict" = OK ] && verdict=STALE-SCRIPT ;;
+                unknown) [ "$verdict" = OK ] && verdict=UNVERIFIABLE ;;
+            esac
         else
             label="$(sj_label "$id")"
             if [ -f "$LD_DIR/$label.plist" ]; then installed=yes; else installed=no; fi
@@ -493,6 +554,12 @@ do_status() {
                 ''|0|never) ;;
                 unknown) [ "$verdict" = OK ] && verdict=UNKNOWN ;;   # could not ask, not "healthy"
                 *) verdict=FAILED ;;
+            esac
+            # Same rule as the linux arm: the bytes on disk are not the bytes that were installed, so
+            # the job that is running is not the job that was verified.
+            case "$drift" in
+                'CHANGED since install'*) [ "$verdict" = OK ] && verdict=STALE-SCRIPT ;;
+                unknown) [ "$verdict" = OK ] && verdict=UNVERIFIABLE ;;
             esac
         fi
         say "  verdict=$verdict"
@@ -522,6 +589,10 @@ pass_drift() { # pass_drift <id> — are the bytes on disk the ones the JOB was 
 
 do_scheduler_verb() { # do_scheduler_verb start|stop|restart
     local verb="$1" id rc=0 unit label
+    # ⛔ THE TEMP-HOME GUARD IS NOT AN INSTALL-ONLY RULE. `stop|restart|uninstall` reach the same live
+    # `gui/<uid>` domain, and `restart` BOOTSTRAPS a plist that lives inside the temp HOME — the exact
+    # artifact #446 describes. Measured before this: all three ran happily from a throwaway HOME.
+    if [ "$PLATFORM" = darwin ]; then guard_test_home || return 1; fi
     case "$PLATFORM" in
         linux)  choose_systemd || { err "no systemd target"; return 3; } ;;
         darwin) choose_launchd || { err "no launchctl"; return 3; } ;;
@@ -561,7 +632,9 @@ do_uninstall() {
     local id rc=0 unit label
     case "$PLATFORM" in
         linux)  choose_systemd || { err "no systemd target"; return 3; } ;;
-        darwin) choose_launchd || { err "no launchctl"; return 3; } ;;
+        darwin) choose_launchd || { err "no launchctl"; return 3; }
+                # `bootout` from a temp HOME boots out the REAL box's jobs (#446).
+                guard_test_home || return 1 ;;
     esac
     require_ids
     for id in $IDS; do
