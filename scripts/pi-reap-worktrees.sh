@@ -1455,7 +1455,7 @@ lane_issue_of() {
 
 is_lane_branch() { # <branch-ref> -> 0 when the harness itself created this branch name
     case "$1" in refs/heads/*) : ;; *) return 1 ;; esac
-    printf '%s\n' "$1" | grep -Eq -- "$REAP_WT_LANE_BRANCH_RE"
+    grep -Eq -- "$REAP_WT_LANE_BRANCH_RE" <<<"$1"
 }
 
 # claims_load — ONE bounded fetch of the registry into this pass's own namespace.
