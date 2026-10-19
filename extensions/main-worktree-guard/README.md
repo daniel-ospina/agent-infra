@@ -95,8 +95,14 @@ switch, anything else is a path restore (`git checkout -f <ref>` keeps whole-tre
 scope because a forced switch discards everything). **Fail-closed** (effect not
 statically resolvable): `--pathspec-from-file`, `--stdin` target lists,
 `$VAR`/backtick pathspecs, xargs/find `-exec` placeholders (`{}`/`{}+`), a
-non-static git VERB (`git "$@"` behind a shell function), a `$`-bearing script
-path (`bash $S`), an unresolvable `cd` chain, and an `eval` payload that cannot
+non-static git VERB (`git "$@"` behind a shell function), a script path the
+SHELL expands at runtime — `$`/backtick, glob (`*`, `?`, `[...]`), brace
+(`{a,b}`), a leading `~`, and the extglob operator forms (`@(…)`, `?(…)`,
+`*(…)`, `+(…)`, `!(…)`) — in the script operand, in a directly-executed
+command word (`~/undo.sh`, `sub/undo.sh` is READ instead), inside an
+interpreter `-c` payload / `eval` payload / a nested script, or as a piped
+producer (`cat ./undo*.sh | bash`, `F=./undo.sh; cat $F | bash`; #1228),
+an unresolvable `cd` chain, and an `eval` payload that cannot
 be resolved. **Fail-open** (never false-block, the status probe's only
 allow-on-error arm): a target with no working tree to discard — a bare repo, or
 any directory git reports as `not a git repository` / `must be run in a work
