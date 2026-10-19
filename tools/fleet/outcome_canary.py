@@ -682,12 +682,15 @@ def newest_with_age(events, window_s, require_age=True):
     """
     best = None
     for e in events or []:
-        age = e.get("age_s")
+        raw_age = e.get("age_s")
+        age = raw_age if _is_age(raw_age) else None
         if require_age and age is None:
             continue
         if age is not None and age > window_s:
             continue
-        if best is None or (age is not None and (best.get("age_s") is None or age < best["age_s"])):
+        best_age = best.get("age_s") if best is not None else None
+        best_age = best_age if _is_age(best_age) else None
+        if best is None or (age is not None and (best_age is None or age < best_age)):
             best = e
     return best
 
@@ -696,13 +699,15 @@ def newest(events):
     """The newest event by age, fresh or not (for EVIDENCE about a stale thing)."""
     best = None
     for e in events or []:
-        age = e.get("age_s")
+        raw_age = e.get("age_s")
+        age = raw_age if _is_age(raw_age) else None
         if best is None:
             best = e
             continue
         if age is None:
             continue
-        if best.get("age_s") is None or age < best["age_s"]:
+        best_age = best.get("age_s") if _is_age(best.get("age_s")) else None
+        if best_age is None or age < best_age:
             best = e
     return best
 
@@ -913,7 +918,7 @@ def check_controller_cycling(f, c):
                  "the log's mtime is readable but its CONTENT was not read, so 'no cycle completes' "
                  "cannot be told from 'the tail was refused'. Not green.")
     cycles = [h for h in (f.get("log_events") or {}).get("headers") or []
-              if h.get("age_s") is not None and h["age_s"] <= win]
+              if _is_age(h.get("age_s")) and h["age_s"] <= win]
     # ⛔ AN UNPARSEABLE HEADER IS NOT AN ABSENT ONE. `parse_log` counts a header it cannot parse
     # in `unparsed_headers`, and `queue_readable`/`work_dispatched` both abstain on it — while this
     # check graded the same datum FAIL/LOG_NO_CYCLE ("a mid-cycle wedge"), reddening a healthy
@@ -1155,6 +1160,16 @@ def _is_count(n):
     return isinstance(n, int) and not isinstance(n, bool)
 
 
+def _is_age(a):
+    """An age is a number and a bool is not an age: `True <= 720` reads as ONE SECOND.
+
+    ⛔ THE SAME RULE AS `_is_count`, AND IT WAS APPLIED TO SOME READERS AND NOT OTHERS — a bool
+    `age_s` certified a stale lander decision as CURRENT and let a spawn from an earlier cycle vouch
+    for the newest batch. Any age compared against a window or a batch clock goes through here.
+    """
+    return isinstance(a, (int, float)) and not isinstance(a, bool)
+
+
 def _queue_age(f):
     """The age of THIS pool reading, and where it came from.
 
@@ -1172,10 +1187,8 @@ def _queue_age(f):
     qs_age = qs.get("age_s") if qs.get("ok") is True else None
     # `isinstance(True, int)` is True, so a bool age reads as ONE SECOND here — the sibling of the
     # gate that `_graded_stale`'s state-record branch already refuses.
-    ages = [(a, "token") for a in [tok_age]
-            if isinstance(a, (int, float)) and not isinstance(a, bool)]
-    ages += [(a, "state/queue-state") for a in [qs_age]
-             if isinstance(a, (int, float)) and not isinstance(a, bool)]
+    ages = [(a, "token") for a in [tok_age] if _is_age(a)]
+    ages += [(a, "state/queue-state") for a in [qs_age] if _is_age(a)]
     if not ages:
         return None, None
     age, src = max(ages, key=lambda t: t[0])
@@ -1209,8 +1222,7 @@ def _graded_stale(f, c, tok_src):
         # record whose `age_s` was a boolean certified as CURRENT — the #1931 frozen-refresh shape
         # defeated from inside the gate that exists to catch it.
         _raw_age = qs.get("age_s") if qs.get("ok") is True else None
-        age = _raw_age if isinstance(_raw_age, (int, float)) and not isinstance(_raw_age, bool) \
-            else None
+        age = _raw_age if _is_age(_raw_age) else None
         src = ("state/queue-state (no epoch, no readable mtime)" if age is None
                else "state/queue-state")
     else:
@@ -1285,7 +1297,8 @@ def authoritative_queue_token(f, hdr):
         qs_age = qs.get("age_s")
         # A NEWER record always wins; an UNKNOWN age is not "older" — the record still holds the
         # verdict the fleet wrote, and only its currency is in doubt (`_graded_stale` judges it).
-        if qs_age is None or hdr_age is None or qs_age < hdr_age:
+        # ⛔ `_is_age`, so a boolean age is UNKNOWN like an absent one instead of reading as 1s.
+        if not _is_age(qs_age) or not _is_age(hdr_age) or qs_age < hdr_age:
             return qs_tok, qs_raw.split()[0] if qs_raw.split() else qs_raw, "state/queue-state"
     return hdr_tok, (hdr.get("queue_token") or "(absent)") if hdr else "(absent)", "cycle header"
 
@@ -1308,7 +1321,7 @@ def check_work_dispatched(f, c):
     events = f.get("log_events") or {}
     win = c.window_s
     refused_all = [r for r in events.get("dispatch_refused") or []
-                   if r.get("age_s") is not None and r["age_s"] <= win]
+                   if _is_age(r.get("age_s")) and r["age_s"] <= win]
     refused_txt = ""
     if refused_all:
         reasons = {}
@@ -1388,7 +1401,10 @@ def check_work_dispatched(f, c):
             # spawn anything, so nothing may vouch for it.
             if str(e.get("issue")) not in batch_issues:
                 return False
-            if e.get("age_s") is None or ok_age is None:
+            # ⛔ `_is_age`, NOT `is None`. `age_s: true` is one second, so a spawn from an earlier
+            # cycle was credited to the NEWEST batch — `PASS/DISPATCHED`, "lane spawn (1s ago)",
+            # exit 0 — the exact measured failure this guard was written for.
+            if not _is_age(e.get("age_s")) or not _is_age(ok_age):
                 return False
             # +2s: both take their age from the same cycle header, but a per-line timestamp (or a
             # second-granularity difference) must not turn a real spawn into an abstention.
@@ -1590,10 +1606,10 @@ def _activity(f, window_s=None, cfg=None):
         if str(fail.get("issue")) != str(start.get("issue")):
             return False
         fa = fail.get("age_s")
-        if not isinstance(fa, (int, float)) or isinstance(fa, bool):
+        if not _is_age(fa):
             return False
         sa = start.get("age_s")
-        if not isinstance(sa, (int, float)) or isinstance(sa, bool):
+        if not _is_age(sa):
             return True          # an unageable start cannot outrank a failure for its issue
         return fa <= sa + 2.0    # the failure came at or after the start line
     _fails = events.get("lane_failed") or []
@@ -1864,8 +1880,7 @@ def check_pane_daemon(f, c):
     # true, so `oom_score_adj: true` produced `FAIL/PROTECTION_ABSENT` — a claim of measured
     # non-protection built from a boolean, on the one number whose misread delivers a message.
     # A non-number falls into `unread`, which is an abstention, never a FAIL.
-    known = [a for a in adj
-             if isinstance(a, (int, float)) and not isinstance(a, bool)]
+    known = [a for a in adj if _is_age(a)]      # a score is a number, and a bool is not one
     pid_txt = ", ".join(str(p.get("pid")) for p in pids)
     prot_txt = _pane_protection_txt(pane)
 
@@ -1981,7 +1996,11 @@ def _pane_protection_txt(pane):
         # looks identical to "there was nothing to look at".
         return "REJECTED (mentioned the name, is not the daemon): %s" % ", ".join(
             "%s %s" % (n.get("pid"), (n.get("cmd") or "")[:60]) for n in near[:5])
-    if pane.get("protection_supported"):
+    # ⛔ `is True`, like the verdict above it. Graded by truthiness, the string "false" — "this
+    # platform cannot demonstrate protection" — selected the oom_score_adj line, so the delivered
+    # evidence said protection WAS readable directly under a verdict saying it was not, and the
+    # payload's own `protection_note` was never printed.
+    if pane.get("protection_supported") is True:
         return ("protection source: %s (negative = deprioritised; -1000 = immune; 0 is the "
                 "DEFAULT and protects nothing)" % (pane.get("protection_source") or "oom_score_adj"))
     return "protection source: NONE READABLE (%s)" % (
@@ -2011,15 +2030,14 @@ def check_headroom(f, c):
     # read FAILED was graded as a successful one carrying `avail_bytes: 0` and manufactured
     # `FAIL/BELOW_FLOOR` ("0.0 GiB free") — the fake OOM emergency these two arms exist to prevent,
     # reached through the polarity shape they left. Every other reader in this file uses `is True`.
-    if disk.get("ok") is True and (not isinstance(disk.get("avail_bytes"), (int, float))
-                                   or isinstance(disk.get("avail_bytes"), bool)):
+    if disk.get("ok") is True and not _is_age(disk.get("avail_bytes")):
         lines.append("disk: READ ok but NO avail_bytes field (%r)" % (disk.get("avail_bytes"),))
         unknown.append("disk")
     elif disk.get("ok") is True:
         gb = disk["avail_bytes"] / float(1 << 30)
         # a MISSING `used_pct` is printed as not-measured, never as "-1.0% used"
-        used_txt = ("%.1f%% used" % disk["used_pct"]) if isinstance(disk.get("used_pct"), (int, float)) \
-            and not isinstance(disk.get("used_pct"), bool) else "used_pct not read"
+        used_txt = ("%.1f%% used" % disk["used_pct"]) if _is_age(disk.get("used_pct")) \
+            else "used_pct not read"
         lines.append("disk: %.1f GiB free (%s) on %s — floor %.1f GiB"
                      % (gb, used_txt, disk.get("mount") or "/", c.disk_floor_gb))
         if gb < c.disk_floor_gb:
@@ -2030,8 +2048,7 @@ def check_headroom(f, c):
 
     # ⛔ THE DISK ARM'S TWIN: `(avail_mb or 0)` manufactures "0 MiB available" out of a field that
     # was never read, i.e. an OOM emergency on the check whose FAIL must mean one.
-    if mem.get("ok") is True and (not isinstance(mem.get("avail_mb"), (int, float))
-                                  or isinstance(mem.get("avail_mb"), bool)):
+    if mem.get("ok") is True and not _is_age(mem.get("avail_mb")):
         lines.append("memory: READ ok but NO avail_mb field (%r)" % (mem.get("avail_mb"),))
         unknown.append("memory")
     elif mem.get("ok") is True:
@@ -2509,9 +2526,12 @@ def _in_window(bucket, window_s):
     was unparseable, or the record carries no timestamp), and an unknown age is a MISSING READ, not
     a fresh one — the same allow-list polarity the rest of this tool applies.
     """
+    # ⛔ A BOOL IS NOT AN AGE, AND `None` IS NOT THE ONLY UNUSABLE ONE. `age_s: true` read as one
+    # second and certified a stale `[armed]`/`[railed]` decision as CURRENT — `PASS/LANDERS_ARMED` on
+    # the check whose whole purpose is the silent lander expiry.
     return set(r.get("pr") for r in bucket or []
                if r.get("pr") is not None
-               and r.get("age_s") is not None
+               and _is_age(r.get("age_s"))
                and r.get("age_s") <= window_s)
 
 
@@ -3534,6 +3554,24 @@ def collect_github(repo, cfg, now=None):
     return out
 
 
+def _landing_bits(row, p, draft_key, armed_key):
+    """Copy the draft / auto-armed bits from a gh payload — ONLY WHEN THE KEY IS PRESENT.
+
+    ⛔ `bool(p.get("isDraft"))` and `p.get("autoMergeRequest") is not None` turn an ABSENT key into a
+    DEFINITE `False`/`False` — "not a draft, definitely not armed". `check_landers` deliberately
+    ABSTAINS on a non-bool draft and a non-bool `auto_armed` so a row whose bit was never read cannot
+    produce `FAIL/LANDER_MISSING` ("the lander expired"), and both collectors made that abstention
+    unreachable on the live path: they always emitted a bool. A field rename — the same class of
+    break that produced the rollup's `app`/`workflowName` defect — would have silently manufactured
+    a measured non-armed PR instead of reporting the bit as unread.
+    """
+    if draft_key in p:
+        row["draft"] = bool(p[draft_key])
+    if armed_key in p:
+        row["auto_armed"] = p[armed_key] is not None
+    return row
+
+
 def _collect_graphql(gh, repo, cfg, now, errors):
     fields = ("number,mergeStateStatus,autoMergeRequest,isDraft,statusCheckRollup,"
               "reviewDecision,createdAt,mergedAt")
@@ -3620,11 +3658,9 @@ def _collect_graphql(gh, repo, cfg, now, errors):
         else:
             green = rollup_is_green(rollup)
             state = rollup_state(rollup)
-        rows.append({
+        rows.append(_landing_bits({
             "number": p.get("number"),
             "merge_state_status": mss,
-            "auto_armed": p.get("autoMergeRequest") is not None,
-            "draft": bool(p.get("isDraft")),
             "checks_green": green,
             # WHICH not-green: a concluded red or an attempt still in flight. `landers` labels the
             # skip from this, so an in-flight check cannot be reported as "red".
@@ -3634,7 +3670,7 @@ def _collect_graphql(gh, repo, cfg, now, errors):
             # `None` rollup read answered "not green" put such a PR in NEITHER `candidates` NOR
             # `unprobed`: `landers` then spoke for a PR it never read, in the silencing direction.
             "probed": green is not None and mss not in MERGEABILITY_UNKNOWN,
-        })
+        }, p, "isDraft", "autoMergeRequest"))
         if not rows[-1]["probed"]:
             rows[-1]["unprobed_reason"] = ("rollup truncated at its page bound"
                                            if rollup_truncated(rollup)
@@ -3682,12 +3718,12 @@ def _collect_rest(gh, repo, cfg, now, errors):
     rows, detail_errors = [], []
     for i, p in enumerate(open_raw):
         num = p.get("number")
-        row = {"number": num, "draft": bool(p.get("draft")),
-               "auto_armed": p.get("auto_merge") is not None,
-               "merge_state_status": None, "checks_green": None, "checks_state": None,
-               "review_decision": None, "probed": False}
-        if row["draft"] or i >= probe_max:
-            row["unprobed_reason"] = ("DRAFT" if row["draft"]
+        row = _landing_bits({"number": num, "merge_state_status": None, "checks_green": None,
+                             "checks_state": None, "review_decision": None, "probed": False},
+                            p, "draft", "auto_merge")
+        # `is True`: an ABSENT draft is UNREAD, so it is neither a DRAFT skip reason nor a probe.
+        if row.get("draft") is True or i >= probe_max:
+            row["unprobed_reason"] = ("DRAFT" if row.get("draft") is True
                                       else "beyond rest_probe_max=%d (position %d)"
                                       % (probe_max, i + 1))
             rows.append(row)
@@ -4254,7 +4290,11 @@ def main(argv=None):
         else:
             for p, n, note, vs, ex in rows:
                 hdr = "fixture %s (%s)%s" % (n, os.path.basename(p), (" — " + note) if note else "")
-                print(render(vs, hdr))
+                # ⛔ `--only` NARROWS, IT DOES NOT CERTIFY — so the checks it EXCLUDED are passed to
+                # `render` exactly as the live path passes them. Without this every block printed
+                # "→ exit 0" while the process exited 2, and the only correction was a footnote: the
+                # line an operator quotes is the one that was wrong.
+                print(render(vs, hdr, not_evaluated=only))
                 print()
             if skipped:
                 print("⚠️  %d expectation(s) NOT ASSERTED because --only %s excluded them:"

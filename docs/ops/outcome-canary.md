@@ -471,6 +471,25 @@ Six more (cycle 13), each a case where a datum the tool held was not the one it 
   into `unread`, which abstains. And `protection_supported` was graded by TRUTHINESS, so a payload
   saying the platform cannot demonstrate protection graded `PASS/ALIVE_PROTECTED` — exit 0, no
   message — on the check whose whole reason to exist is that "alive" is not "protected".
+- **A bool is not an age either, and the rule was applied to SOME readers.** `age_s` was allow-listed
+  only against `None`, so `age_s: true` read as ONE SECOND and did two wrong things: a `[railed]`
+  decision older than the whole window certified the PR as CURRENTLY railed
+  (`PASS/LANDERS_ARMED` on the check whose purpose is the silent lander expiry), and a spawn from an
+  earlier cycle was credited to the newest batch (`PASS/DISPATCHED`, evidence "lane spawn (1s ago)").
+  `_is_age` is the single guard, and a shape test in the suite fails if a hand-rolled
+  `isinstance(x, (int, float))` reappears — the defect was a rule enforced in one place and not the
+  others, so a behaviour test alone could not have caught it.
+- **A collector must not launder an ABSENT bit into a definite one.** `bool(p.get("isDraft"))` and
+  `p.get("autoMergeRequest") is not None` made a missing key a certain `False`, so the abstentions
+  `check_landers` deliberately performs (non-bool draft, non-bool `auto_armed`) were unreachable on
+  the live path — a renamed field would have manufactured "the lander expired" instead of "this bit
+  was not read". Both collectors now copy the bits only when the key is present.
+- **The EVIDENCE must not contradict the verdict.** The `protection_supported` allow-list initially
+  reached the verdict only: the delivered message still selected the `oom_score_adj` line by
+  truthiness, so it asserted protection WAS readable directly under a verdict saying it was not.
+- **`--only` narrows the REPORT as well as the exit code.** Every static block printed "→ exit 0"
+  while the process exited 2, and the only correction was a footnote — the summary line an operator
+  quotes was the one that was wrong.
 - **`_is_count` is the ONLY count guard.** `isinstance(True, int)` is true, and the same field was
   healed in one arm and re-broken in the next three times in one week: `backlog: true` FAILed in
   `work_dispatched`, then PASSed in its GREEN arm (`False == 0`), then certified a frozen pool as

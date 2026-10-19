@@ -4493,13 +4493,34 @@ MUTATIONS = [
      '    if lane_ok:\n        return True, "a lane started %s (the queue record is not the only evidence)" % (\n            _age_txt(lane_ok.get("age_s")))',
      '    if intent or lane_ok:\n        return True, "a dispatch landed %s (the queue record is not the only evidence)" % (\n            _age_txt((intent or lane_ok).get("age_s")))',
      "test_the_intent_line_is_not_reported_as_a_LANDED_dispatch"),
+    # ── cycle-37 defects ─────────────────────────────────────────────────────────────────
+    ("a bool age certifies an expired lander decision as current",
+     '               and _is_age(r.get("age_s"))\n               and r.get("age_s") <= window_s)',
+     '               and r.get("age_s") is not None\n               and r.get("age_s") <= window_s)',
+     "test_a_BOOL_age_cannot_certify_an_EXPIRED_lander_decision_as_current"),
+    ("the pane evidence asserts a protection source the payload denies",
+     '    if pane.get("protection_supported") is True:',
+     '    if pane.get("protection_supported"):',
+     "test_the_pane_EVIDENCE_cannot_assert_a_protection_source_the_payload_DENIES"),
+    ("a narrowed static run prints the exit code it does not take",
+     '                print(render(vs, hdr, not_evaluated=only))',
+     '                print(render(vs, hdr))',
+     "test_a_static_only_run_does_not_PRINT_a_green_exit_it_does_not_take"),
+    ("the collectors launder an absent landing bit into a definite false",
+     '    if draft_key in p:\n        row["draft"] = bool(p[draft_key])\n    if armed_key in p:\n        row["auto_armed"] = p[armed_key] is not None\n    return row',
+     '    row["draft"] = bool(p.get(draft_key))\n    row["auto_armed"] = p.get(armed_key) is not None\n    return row',
+     "test_an_ABSENT_landing_bit_is_UNREAD_on_the_LIVE_path_too"),
+    ("a hand-rolled age guard reappears (the rule is applied to some readers only)",
+     '              if _is_age(h.get("age_s")) and h["age_s"] <= win]',
+     '              if h.get("age_s") is not None and isinstance(h["age_s"], (int, float))]',
+     "test_every_age_read_goes_through_the_ONE_bool_excluding_guard"),
     # ── cycle-36 defects ─────────────────────────────────────────────────────────────────
     ("a bool backlog buys a GREEN idle",
      '    if pool_kind == "EMPTY" and ((_is_count(backlog) and backlog == 0) or superseded_backlog) \\\n',
      '    if pool_kind == "EMPTY" and ((backlog == 0) or superseded_backlog) \\\n',
      "test_a_BOOL_backlog_cannot_buy_a_GREEN_idle"),
     ("a bool oom_score_adj is graded as a measured unprotected value",
-     '    known = [a for a in adj\n             if isinstance(a, (int, float)) and not isinstance(a, bool)]',
+     '    known = [a for a in adj if _is_age(a)]',
      '    known = [a for a in adj\n             if a is not None]',
      "test_a_BOOL_oom_protection_value_is_UNREAD_not_unprotected"),
     ("protection_supported is graded by truthiness",
@@ -4508,7 +4529,7 @@ MUTATIONS = [
      "test_a_BOOL_oom_protection_value_is_UNREAD_not_unprotected"),
     # ── cycle-35 defects ─────────────────────────────────────────────────────────────────
     ("a bool age certifies a frozen pool as current",
-     '        age = _raw_age if isinstance(_raw_age, (int, float)) and not isinstance(_raw_age, bool) \\\n            else None',
+     '        age = _raw_age if _is_age(_raw_age) else None',
      '        age = _raw_age',
      "test_a_BOOL_age_is_not_a_current_reading"),
     ("a refuted lane start is dropped by issue number alone, ignoring WHEN",
@@ -4675,7 +4696,7 @@ MUTATIONS = [
      "    if False:",
      "test_an_UNPARSEABLE_header_is_NOT_a_mid_cycle_wedge"),
     ('a bool headroom number is divided as a number',
-     '    if disk.get("ok") is True and (not isinstance(disk.get("avail_bytes"), (int, float))\n                                   or isinstance(disk.get("avail_bytes"), bool)):',
+     '    if disk.get("ok") is True and not _is_age(disk.get("avail_bytes")):',
      '    if disk.get("ok") is True and not isinstance(disk.get("avail_bytes"), (int, float)):',
      'test_a_BOOL_headroom_number_is_UNREAD_not_a_manufactured_OOM'),
     ("a stale pool record is read as evidence that work was in hand",
@@ -5097,7 +5118,7 @@ MUTATIONS = [
      "            and (f.get(\"queue_state\") or {}).get(\"ok\") is not False:",
      "test_the_queue_checks_use_ALLOW_LIST_polarity_on_the_record"),
     ('an ok MEMORY read with no number reads as 0 MiB',
-     '    if mem.get("ok") is True and (not isinstance(mem.get("avail_mb"), (int, float))\n                                  or isinstance(mem.get("avail_mb"), bool)):',
+     '    if mem.get("ok") is True and not _is_age(mem.get("avail_mb")):',
      '    if False:',
      'test_an_ok_MEMORY_read_with_no_number_is_UNREAD_not_zero_mib'),
     ("vm_stat sums the inactive/speculative fields without checking they were seen",
@@ -5140,15 +5161,16 @@ MUTATIONS = [
      "    if False:",
      "test_an_UNREAD_oom_protection_value_is_UNEVALUABLE_not_unprotected"),
     ('an ok disk read with no number reads as 0 GiB',
-     '    if disk.get("ok") is True and (not isinstance(disk.get("avail_bytes"), (int, float))\n                                   or isinstance(disk.get("avail_bytes"), bool)):',
+     '    if disk.get("ok") is True and not _is_age(disk.get("avail_bytes")):',
      '    if False:',
      'test_an_ok_disk_read_with_no_number_is_UNREAD_not_zero_gib'),
     ("an unaged queue record forfeits its authority",
-     "        if qs_age is None or hdr_age is None or qs_age < hdr_age:",
+     '        if not _is_age(qs_age) or not _is_age(hdr_age) or qs_age < hdr_age:',
      "        if qs_age is not None and (hdr_age is None or qs_age < hdr_age):",
      "test_the_QUEUE_STATE_record_outranks_a_header_that_is_one_refresh_old"),
     ("the wired machine does not carry o_dir",
-     "    m.o_dir = cfg.o_dir\n", "",
+     '    m.o_dir = cfg.o_dir\n',
+     '',
      "test_the_WIRED_machine_carries_o_dir_so_the_heartbeat_leg_works"),
     ("a foreign repo's rail decision counts as this repo's lander",
      "        elif n in railed_log and not repo_mismatch:",
@@ -5224,7 +5246,7 @@ MUTATIONS = [
      "RE_LANE_FAILED = re.compile(r\"^#(?P<issue>\\d+): LONG_MATCHES_NOTHING$\")",
      "test_the_spawn_line_shapes_the_harness_actually_prints_are_parsed"),
     ("the cycle-header window bound is dropped (any header ever seen counts)",
-     "              if h.get(\"age_s\") is not None and h[\"age_s\"] <= win]",
+     '              if _is_age(h.get("age_s")) and h["age_s"] <= win]',
      "              if h.get(\"age_s\") is not None]",
      "test_a_cycle_header_OLDER_than_the_window_is_not_a_cycle"),
     ("the queue token age loses its unit multiplier",
@@ -5653,6 +5675,132 @@ def test_a_MEASURED_unprotected_pid_outranks_an_unread_sibling():
     v2 = m.check_pane_daemon(facts, cfg)
     assert (v2.status, v2.variant) == (m.INCONCLUSIVE, "PROTECTION_UNEVALUABLE"), (v2.status,
                                                                                   v2.variant)
+
+
+@test
+def test_a_BOOL_age_cannot_certify_an_EXPIRED_lander_decision_as_current():
+    """`age_s` was allow-listed only against `None`, so `true` read as ONE SECOND: a `[railed]`
+    decision older than the whole window graded the PR as CURRENTLY railed → `PASS/LANDERS_ARMED`,
+    exit 0, no message — on the check whose entire purpose is the silent lander expiry."""
+    m = load()
+    cfg = m.cfg_from_dict({})
+    d = fx("lander-from-another-repo")
+    m.check_landers(d["facts"], cfg)     # the fixture's baseline must not be green by luck
+    for stale in (True, False, 10 ** 7):
+        ev = d["facts"]["log_events"]
+        ev["railed"] = [{"pr": 900, "age_s": stale}]
+        ev["armed"] = []
+        v = m.check_landers(d["facts"], cfg)
+        assert v.status != m.PASS, (stale, v.status, v.variant, v.detail)
+        assert v.variant == "LANDER_MISSING", (stale, v.variant)
+
+
+@test
+def test_a_BOOL_age_cannot_vouch_for_the_NEWEST_batch():
+    """The batch-scoping guard compared `age_s` as a number, so `true` (one second) let a spawn from
+    an EARLIER cycle be credited to the newest batch: `PASS/DISPATCHED`, evidence "lane spawn (1s
+    ago)", exit 0. Only `None` was rejected."""
+    m = load()
+    cfg = m.cfg_from_dict({})
+    # `dispatch-previous-batch-spawn` is the measured shape: the newest batch (5001/5002) spawned
+    # nothing, and the only start row belongs to the PREVIOUS batch at 540s. Its own verdict is
+    # already INCONCLUSIVE/DISPATCH_UNCONFIRMED; the probe is that a bool age does not make that
+    # stale start look one second old and turn the verdict green.
+    d = fx("dispatch-previous-batch-spawn")
+    ev = d["facts"]["log_events"]
+    assert ev["lane_started"], "fixture needs a start row"
+    newest = ev["dispatch_ok"][-1]["issues"][0]
+    # the start row must name an issue IN the newest batch, or the issue filter (not the age) decides
+    ev["lane_started"][0]["issue"] = newest
+    ev["lane_started"][0]["lane"] = newest
+    ev["lane_started"][0]["age_s"] = 900          # stale for THIS batch → abstains
+    assert m.check_work_dispatched(d["facts"], cfg).variant == "DISPATCH_UNCONFIRMED"
+    ev["lane_started"][0]["age_s"] = True         # one second, if a bool were a number
+    v = m.check_work_dispatched(d["facts"], cfg)
+    assert v.status != m.PASS, (v.status, v.variant, v.detail)
+    assert v.variant == "DISPATCH_UNCONFIRMED", v.variant
+
+
+@test
+def test_the_pane_EVIDENCE_cannot_assert_a_protection_source_the_payload_DENIES():
+    """The verdict allow-listed `protection_supported`, and the EVIDENCE line did not: graded by
+    truthiness, the string "false" ("this platform cannot demonstrate protection") selected the
+    oom_score_adj line — so a message said protection WAS readable directly under a verdict saying
+    it was not, and the payload's own note was dropped."""
+    m = load()
+    cfg = m.cfg_from_dict({})
+    facts = {"pane": {"ok": True, "protection_supported": "false", "protection_source": None,
+                      "protection_note": "no /proc/<pid>/oom_score_adj on this platform",
+                      "pids": [{"pid": 700, "oom_score_adj": -900}]}}
+    v = m.check_pane_daemon(facts, cfg)
+    assert v.status == m.INCONCLUSIVE, (v.status, v.variant)
+    assert "no /proc/<pid>/oom_score_adj" in v.evidence, v.evidence
+    assert "protection source: oom_score_adj" not in v.evidence, v.evidence
+
+
+@test
+def test_a_static_only_run_does_not_PRINT_a_green_exit_it_does_not_take():
+    """`--only` narrows and exits 2, and every rendered block said "→ exit 0" — the summary line an
+    operator quotes was the one that contradicted the process."""
+    rc, out, err = run_cli(["--static", "--only", "headroom", "--fixtures-dir", FIXTURES])
+    assert rc == 2, (rc, err[-300:])
+    assert "→ exit 0" not in out, [ln for ln in out.splitlines() if "→ exit 0" in ln][:2]
+    assert "→ exit 2" in out, out[-600:]
+
+
+@test
+def test_an_ABSENT_landing_bit_is_UNREAD_on_the_LIVE_path_too():
+    """Both collectors emitted `bool(p.get("isDraft"))` / `p.get("autoMergeRequest") is not None`, so
+    an ABSENT key became a DEFINITE false — the exact laundering `check_landers` refuses, and the
+    guard was reachable only from `--facts`. A renamed field must abstain, not manufacture a
+    measured non-armed PR."""
+    m = load()
+    row = m._landing_bits({"number": 1}, {}, "isDraft", "autoMergeRequest")
+    assert "draft" not in row and "auto_armed" not in row, row
+    row = m._landing_bits({"number": 1}, {"isDraft": False, "autoMergeRequest": {"x": 1}},
+                          "isDraft", "autoMergeRequest")
+    assert row["draft"] is False and row["auto_armed"] is True, row
+    # …and the verdict that consumes it ABSTAINS rather than FAILing on the absent bit
+    cfg = m.cfg_from_dict({})
+    facts = {"log_events": {"headers": [{"age_s": 5.0, "repo": "agent-infra"}]},
+             "log": {"ok": True, "text": "#9 auto-armed", "age_s": 5.0},
+             "merge": {"ok": True, "json_ok": True,
+                       "open_prs": [_landing_bits_of(m, {"number": 900, "merge_state_status":
+                                                         "CLEAN", "checks_green": True,
+                                                         "probed": True})],
+                       "counts": {"open": 1, "merged": 0, "created": 0}}}
+    v = m.check_landers(facts, cfg)
+    assert v.status != m.PASS, (v.status, v.variant, v.detail)
+
+
+@test
+def test_every_age_read_goes_through_the_ONE_bool_excluding_guard():
+    """The cycle-36 defect was not one line but a RULE applied to some readers and not others: the
+    lander window and the batch clock were missed. This pins the rule textually, the same way the
+    count guard is pinned — a hand-rolled `isinstance(x, (int, float))` age test fails the suite."""
+    m = load()
+    src = open(m.__file__).read().splitlines()
+    # the ONE legal occurrence is `_is_age`'s own body
+    helper = next(i for i, ln in enumerate(src) if ln.startswith("def _is_age("))
+    inside = set()
+    for j in range(helper + 1, len(src)):
+        if src[j].strip() and not src[j].startswith((" ", "\t")):
+            break                         # a top-level line ends the function
+        inside.add(j)
+    offenders = []
+    for i, ln in enumerate(src):
+        if i in inside:
+            continue                      # `_is_age`'s own body is the ONE legal occurrence
+        if "isinstance(" not in ln or "(int, float)" not in ln:
+            continue
+        offenders.append("%d: %s" % (i + 1, ln.strip()))
+    assert not offenders, (
+        "every age/number read must use `_is_age` (a bool is not a number); hand-rolled guards:\n  "
+        + "\n  ".join(offenders))
+
+
+def _landing_bits_of(m, row):
+    return row
 
 
 @test
