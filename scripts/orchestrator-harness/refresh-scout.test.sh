@@ -114,7 +114,10 @@ mk_issue_claim() {
 OUT=""; RC=0
 rf() {
   local dir="$1" mode="$2"; shift 2
-  local args=(6); [ "$mode" = check ] && args=(--check)
+  # `RF_LIMIT` overrides the candidate window (argv, which the shipped script reads as `$LIMIT`).
+  # Only one case uses it, to prove a fixture's skip arm is REACHABLE when the window is wide — the
+  # non-vacuity control for “the stop outranks the walk-past”.
+  local args=("${RF_LIMIT:-6}"); [ "$mode" = check ] && args=(--check)
   local paths="${RF_PATH:-$dir/bin:$PATH}"
   OUT="$(env -u TORTOISE_REPO -u TORTOISE -u SCOUT_UV -u GH_HOST -u CELL_HOME -u SCOUT_PY \
           -u SCOUT_UV_EXTRAS -u GH_CONFIG_DIR \
@@ -1002,6 +1005,10 @@ mk_case degraded-collision
 mkdir -p "$D/repo/.worktrees/dispatch-scout/tools"
 cat > "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py" <<'PY'
 #!/usr/bin/env python3
+import os
+if os.environ.get("RUNLOG"):
+    with open(os.environ["RUNLOG"], "a") as fh:
+        fh.write("ran\n")
 print("VERDICT: COLLISION (exit 1) — the pre-flight could not name a holder")
 print("  ALSO INCOMPLETE: 3 surface(s) could not be queried")
 raise SystemExit(1)
@@ -1011,7 +1018,9 @@ mk_gh_rest "$D" 42
 # A sentinel makes the "nothing queued" assertion DISCRIMINATING (see the LANDED case): an empty
 # file cannot distinguish "the degraded answer was not queued" from "the backlog was clobbered".
 echo 99 > "$D/o/candidates.txt"
-rf "$D" refresh
+# RUNLOG records every invocation, because the ledger half of this case asserts on the pre-flight's
+# OWN run record: the defect it pins is a run that never happened.
+rf "$D" refresh RUNLOG="$D/deg-runs"
 [ "$RC" -eq 1 ] && ok "degraded COLLISION: the pass aborts TRANSIENT (rc=1) instead of passing" \
                || bad "degraded COLLISION: rc=$RC (want 1) — output: $OUT"
 case "$OUT" in
@@ -1026,6 +1035,29 @@ case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
   *42*) bad "degraded COLLISION: queued candidates — $(cat "$D/o/candidates.txt" 2>/dev/null)" ;;
   *99*) ok "degraded COLLISION: nothing is queued (seed 99 intact, #42 absent)" ;;
   *) bad "degraded COLLISION: the backlog was clobbered — candidates='$(cat "$D/o/candidates.txt" 2>/dev/null)'" ;;
+esac
+# ── ... AND A DEGRADED ANSWER IS NEVER RECORDED IN THE COLLISION LEDGER (review finding #6) ────────
+# This is the ledger's third safety property, and the one that keeps contract (a) — a degraded
+# pre-flight is NEVER a verdict — intact ACROSS passes: suppressing a DEGRADED answer for a TTL would
+# hide the merge-only / starved-read defect this script exists to surface (#1736), because the passes
+# that stopped re-judging it are exactly the passes that would have SAID so. NOTHING pinned it:
+# appending `COLLIDED_NEW` to the DEGRADED arm left this whole suite green (measured).
+# ⛔ `-s`, NOT `-e`: the ledger file exists on every pass even when nothing is held (`#1729` P2), so
+# existence proves nothing; EMPTINESS is the property. And the consequence is asserted on the
+# pre-flight's own run record — the defect is a RUN THAT NEVER HAPPENED, which no log line reveals.
+[ ! -s "$D/o/state/collided" ] \
+  && ok "degraded COLLISION: state/collided is EMPTY — a degraded answer is never recorded (only a COLLISION is)" \
+  || bad "degraded COLLISION: the ledger recorded a DEGRADED answer — [$(tr '\n' ' ' < "$D/o/state/collided" 2>/dev/null)] — a TTL of suppression for an ENVIRONMENT failure, which is the property the header promises"
+[ "$(wc -l < "$D/deg-runs" 2>/dev/null | tr -d ' ')" = 1 ] \
+  && ok "degraded COLLISION: pass 1 ran the pre-flight once" \
+  || bad "degraded COLLISION: pass 1 ran the pre-flight $(wc -l < "$D/deg-runs" 2>/dev/null | tr -d ' ') time(s), want 1"
+rf "$D" refresh RUNLOG="$D/deg-runs"
+[ "$(wc -l < "$D/deg-runs" 2>/dev/null | tr -d ' ')" = 2 ] \
+  && ok "degraded COLLISION: pass 2 JUDGED it again — a degraded answer is re-judged, never suppressed for a TTL" \
+  || bad "degraded COLLISION: pass 2 did not run the pre-flight again ($(wc -l < "$D/deg-runs" 2>/dev/null | tr -d ' ') run(s) total) — the ledger suppressed a DEGRADED answer"
+case "$OUT" in
+  *"DEGRADED"*) ok "degraded COLLISION: the second pass still NAMES the degradation (a record does not silence it)" ;;
+  *) bad "degraded COLLISION: the second pass is silent about the degradation — output: $OUT" ;;
 esac
 
 # ── 1h) A NETWORK FAULT IS TRANSIENT, NOT PERMANENT (agent-infra#1853 review P1) ────────────────
@@ -2369,7 +2401,15 @@ chmod +x "$D/bin/gh"
 # A sentinel makes "nothing written" DISCRIMINATING: an empty file cannot distinguish "the pass
 # refused" from "the backlog was clobbered".
 echo 99 > "$D/o/candidates.txt"
-rf "$D" refresh
+# ⛔ PACING IS OFF FOR THIS CASE, DELIBERATELY (agent-infra#1736 follow-up, 2026-10-18, reconciled with
+# #1729). The fixture serves `core.remaining=0` to model a starved bucket, and the shipped script now
+# has a BUDGET gate for exactly that state: a pass that cannot buy one candidate refuses after the
+# `dispatched.txt` reaper (spending two listings instead of the ~40 the pool listing would cost). That
+# refusal is a DIFFERENT subject — it is covered by `refresh-quota.test.sh` (`unaffordable:` case) —
+# while this case's subject is what the LISTINGS do when the bucket refuses them MID-READ: the named
+# 403, no `.open_iss`/`.pr_brs`, and an untouched backlog. Leaving pacing on here would let the budget
+# gate answer for the listing gate, and the assertions below would pass without exercising it.
+rf "$D" refresh COLLISION_PREFLIGHT_CORE_PACING=0
 [ "$RC" -eq 1 ] && ok "rest-403: the pass exits TRANSIENT (rc=1) — a starved REST bucket is an outage, not 'no work'" \
                || bad "rest-403: rc=$RC (want 1) — output: $OUT"
 [ ! -e "$D/o/.open_iss" ] && ok "rest-403: a FAILED issue listing leaves NO .open_iss (absence, not an empty answer)" \
@@ -2397,6 +2437,191 @@ case "$OUT" in
   *"queue=UNREADABLE"*) ok "rest-403: the queue state is UNREADABLE, not EMPTY" ;;
   *) bad "rest-403: a blind pass was not reported as UNREADABLE — output: $OUT" ;;
 esac
+
+# mk_gh_tiers <case-dir> <P0 csv> <P1 csv> <P2 csv> — the three REST TIER answers, each a comma list
+# of issue numbers ("" = none). The reaper's two listings stay readable-and-empty and the auth /
+# rate-limit answers healthy, so nothing but the POOL varies between cases.
+mk_gh_tiers() {
+  local d="$1" p0="$2" p1="$3" p2="$4" label csv n sep rows
+  for label in P0-blocker P1-severe P2-moderate; do
+    case "$label" in P0-blocker) csv="$p0" ;; P1-severe) csv="$p1" ;; *) csv="$p2" ;; esac
+    rows="["; sep=""
+    if [ -n "$csv" ]; then
+      for n in $(printf '%s' "$csv" | tr ',' ' '); do
+        rows="$rows$sep{\"number\":$n,\"title\":\"a pool candidate\",\"assignees\":[]}"; sep=","
+      done
+    fi
+    printf '%s\n' "$rows]" > "$d/rows.$label"
+  done
+  cat > "$d/bin/gh.body" <<SH
+#!/bin/bash
+case "\$1 \$2" in
+  "auth token") exit 0 ;;
+  *" rate_limit"*) printf '%s\\n' '{"resources":{"core":{"remaining":4321},"graphql":{"remaining":0}}}' ;;
+  *"/pulls?"*) printf '[]\\n' ;;
+  *"labels=P0-blocker"*) cat "$d/rows.P0-blocker" ;;
+  *"labels=P1-severe"*) cat "$d/rows.P1-severe" ;;
+  *"labels=P2-moderate"*) cat "$d/rows.P2-moderate" ;;
+  *) printf '[]\\n' ;;
+esac
+SH
+  chmod +x "$d/bin/gh.body"
+  mk_gh_wrapper "$d"
+}
+# mk_tool_held <path> — a pre-flight that answers COLLISION for the numbers in $HELD and CLEAN for
+# every other candidate, appending every issue it was ASKED about to $RUNLOG. Two things are measured
+# from that log rather than inferred: whether a pass walked PAST the held head, and whether the next
+# pass re-bought the same verdicts.
+mk_tool_held() {
+  mkdir -p "$(dirname "$1")"
+  cat > "$1" <<'PY'
+#!/usr/bin/env python3
+import os, sys
+n = sys.argv[1]
+if os.environ.get("RUNLOG"):
+    with open(os.environ["RUNLOG"], "a") as fh:
+        fh.write(n + "\n")
+if n in os.environ.get("HELD", "").split():
+    print("VERDICT: COLLISION (exit 1) — a peer owns it")
+    raise SystemExit(1)
+print("VERDICT: CLEAN")
+PY
+  chmod +x "$1"
+}
+
+# ── 1k) A BLOCKED HEAD MUST NOT CONSUME THE PASS (agent-infra#1729) ─────────────────────────────
+# THE MEASURED DEFECT. The live controller, four consecutive passes on 2026-10-18:
+#     queue=READ(200) … =#8486 =#8488 =#8999 =#7773 =#8083 =#8084 collision … checked 6; backlog now 0
+# `$LIMIT` slots were spent on candidates the loop could not MOVE (each collision left UNCHECKED, by
+# design, so the next pass re-judged it), and the ~194 candidates behind them were never examined:
+# `candidates.txt` stayed at 0 lines while the box idled. The intake was not blind — READ(200) is
+# honest — it was starved by a cursor that could never advance, because `.pool` is rebuilt
+# `tier, then number` on every pass and nothing rotated it.
+# This case reproduces it exactly: the six POOL-HEAD candidates are held, three free ones sit behind
+# them — P1 first, then two P2 — so the same case also asserts that skip-ahead advances WITHIN the
+# pool and never reorders the tiers, and that the candidate at the TAIL (7001) is not starved.
+# Verified non-vacuous: dropped into the pre-fix script this case's first assertion FAILS — the
+# pre-fix pass runs the same six (checked 6) and leaves `candidates.txt` empty (measured).
+echo; echo "── a blocked head does not consume the pass: the walk continues behind it (agent-infra#1729) ──"
+mk_case blocked-head
+mk_tool_held "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_gh_tiers "$D" "8486,8488,8999" "7773,8083,8084,8120" "7000,7001"
+HELD6="8486 8488 8999 7773 8083 8084"
+rf "$D" refresh HELD="$HELD6" RUNLOG="$D/runs1"
+[ "$RC" -eq 0 ] && ok "blocked head: the pass still succeeds (rc=0) — collisions are a normal verdict" \
+               || bad "blocked head: rc=$RC (want 0) — output: $OUT"
+case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
+  "8120 7000 7001 ") ok "blocked head: the pass judged PAST all six held candidates and queued the three behind them, IN TIER ORDER (P1 8120 before both P2s)" ;;
+  *) bad "blocked head: the head still consumed the pass — candidates='$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)'" ;;
+esac
+# SIX runs of the pre-fix pass, NINE here: the extra allowance is spent on candidates that can MOVE.
+[ "$(wc -l < "$D/runs1" | tr -d ' ')" = 9 ] \
+  && ok "blocked head: 9 pre-flight runs (6 held + 3 reached) — the allowance buys progress, not a longer stall" \
+  || bad "blocked head: $(wc -l < "$D/runs1" | tr -d ' ') pre-flight runs (want 9 — 6 held + 3 behind them)"
+# CONTRACT: a COLLISION is DEFERRED, never dropped — it stays out of `checked.txt` and out of the
+# backlog, so a later pass re-judges it.
+case "$(tr '\n' ' ' < "$D/o/checked.txt" 2>/dev/null)" in
+  *8486*) bad "blocked head: #8486 was written to checked.txt — a collision is permanent now" ;;
+  *) ok "blocked head: the held candidates are NOT in checked.txt (deferred, not dropped)" ;;
+esac
+case "$OUT" in
+  *"=#8486 collision"*) ok "blocked head: each held candidate is still REPORTED as a collision" ;;
+  *) bad "blocked head: the collision verdicts are no longer reported — output: $OUT" ;;
+esac
+# The record set is exactly the six held candidates: nothing about a CLEAN verdict is recorded.
+[ "$(wc -l < "$D/o/state/collided" 2>/dev/null | tr -d ' ')" = 6 ] \
+  && ok "blocked head: the collision ledger records the six held candidates" \
+  || bad "blocked head: the ledger holds $(wc -l < "$D/o/state/collided" 2>/dev/null | tr -d ' ') record(s), want 6"
+# ── the NEXT pass must not re-buy the same verdicts ──────────────────────────────────────────────
+# Walking past a blocked head fixes one pass; without a record the next pass starts at the same head
+# and spends six network runs re-deriving it (on a rate-limit bucket four boxes share). The
+# collision ledger removes those runs — while EXPIRING, so the collision is still re-judged later.
+rf "$D" refresh HELD="$HELD6" RUNLOG="$D/runs2"
+[ "$RC" -eq 0 ] && ok "blocked head: the second pass succeeds (rc=0)" || bad "blocked head: second pass rc=$RC — output: $OUT"
+if [ -s "$D/runs2" ]; then
+  case "$(tr '\n' ' ' < "$D/runs2")" in
+    *8486*) bad "blocked head: the second pass re-RAN the held head ($(tr '\n' ' ' < "$D/runs2"))" ;;
+    *) ok "blocked head: the second pass spends ZERO runs on the held head (ledger: $(tr '\n' ' ' < "$D/runs2"))" ;;
+  esac
+else ok "blocked head: the second pass spends ZERO pre-flight runs on what it already knows is held"; fi
+case "$OUT" in
+  *"skipped 6 candidate(s)"*) ok "blocked head: the skips are reported in aggregate (not silently dropped)" ;;
+  *) bad "blocked head: the skips are not reported — output: $OUT" ;;
+esac
+case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
+  "8120 7000 7001 ") ok "blocked head: the queued backlog survives the second pass intact" ;;
+  *) bad "blocked head: the backlog was rewritten — candidates='$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)'" ;;
+esac
+# CONTRACT: the record EXPIRES, so the collision is retried — it is deferred, never dropped (#1716).
+# The expiry column is aged here rather than waiting `POOL_COLLISION_TTL` seconds: an epoch in the
+# past is exactly what the TTL elapsing produces, and it keeps this suite fast and deterministic.
+awk 'NF == 2 { print 1, $2 }' "$D/o/state/collided" > "$D/o/state/collided.aged" \
+  && mv "$D/o/state/collided.aged" "$D/o/state/collided"
+rf "$D" refresh HELD="$HELD6" RUNLOG="$D/runs3"
+case "$(tr '\n' ' ' < "$D/runs3" 2>/dev/null)" in
+  *8486*) ok "blocked head: once the record expires the held candidates ARE retried (a collision is never a verdict)" ;;
+  *) bad "blocked head: an expired record still suppressed #8486 — it was dropped, not deferred" ;;
+esac
+# CONTRACT: a record this script could never have written (an expiry further out than 2×TTL) is
+# CORRUPTION, and the conservative direction is to judge the candidate again — a stale flag must not
+# suppress work for ever, and the operator must not have to hand-edit the file to unwedge the fleet.
+printf '9999999999 8486\n9999999999 8488\n' > "$D/o/state/collided"
+rf "$D" refresh HELD="$HELD6" RUNLOG="$D/runs4"
+case "$(tr '\n' ' ' < "$D/runs4" 2>/dev/null)" in
+  *8486*) ok "blocked head: an absurd expiry is treated as corrupt, so #8486 is judged again (never suppressed for ever)" ;;
+  *) bad "blocked head: a corrupt far-future record suppressed #8486 — the ledger can wedge the fleet" ;;
+esac
+
+# ── 1l) THE STOP OUTRANKS THE WALK-PAST (agent-infra#1729 review, finding #6) ────────────────────
+# The skip `case` used to sit ABOVE the two `break` tests, so once the window was full every
+# remaining COLLIDED candidate still reached the skip arm and printed a `>#N SKIPPED` line until the
+# next non-collided candidate happened to break the loop. With a large ledger that is an unbounded
+# block of log noise on every pass, emitted after the pass had already decided to stop. The stop
+# conditions are now above the skip arm; this case pins the ORDER, not the outcome: both runs below
+# end with the same backlog, and only the ORDER decides whether the skip lines exist.
+# ⛔ NON-VACUITY IS THE CONTROL BELOW: the SAME fixture with a wider window must produce the skip
+# lines. Without it, a fixture whose ledger never matches would pass the first assertion for the
+# wrong reason (the trap the reviewer named on this suite: “a green suite that no longer exercises
+# the code”).
+_led_seed() {  # <case-dir> — three held TAIL candidates, recorded with a REAL expiry (now + 300 s)
+  mkdir -p "$1/o/state"
+  local exp; exp=$(( $(date +%s) + 300 ))
+  printf '%s 5101\n%s 5102\n%s 5103\n' "$exp" "$exp" "$exp" > "$1/o/state/collided"
+}
+echo; echo "── a full window stops BEFORE the ledger walk-past (agent-infra#1729 review) ──"
+mk_case slots-before-skip
+mk_tool_held "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_gh_tiers "$D" "5001,5002,5003" "5004,5005,5006" "5101,5102,5103"
+_led_seed "$D"
+rf "$D" refresh HELD="5101 5102 5103" RUNLOG="$D/runs-a"
+[ "$RC" -eq 0 ] && ok "slots-before-skip: the pass succeeds (rc=0)" \
+               || bad "slots-before-skip: rc=$RC (want 0) — output: $OUT"
+case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
+  "5001 5002 5003 5004 5005 5006 ") ok "slots-before-skip: the six CLEAN candidates filled the window (in tier order) and the pass STOPPED" ;;
+  *) bad "slots-before-skip: candidates='$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)' (want the six CLEAN ones)" ;;
+esac
+case "$OUT" in
+  *"SKIPPED"*) bad "slots-before-skip: a '>#N SKIPPED' line was printed AFTER the window was full — the stop must outrank the walk-past (that is the unbounded noise #1729 review P1 named): $(printf '%s\n' "$OUT" | grep -c 'SKIPPED') line(s)" ;;
+  *) ok "slots-before-skip: NO skip line is printed once the window is full — the stop fires before the ledger arm, so a full pass cannot emit a block of noise about candidates it will never reach" ;;
+esac
+[ "$(wc -l < "$D/runs-a" 2>/dev/null | tr -d ' ')" = 6 ] \
+  && ok "slots-before-skip: exactly 6 pre-flight runs — the three recorded-held tail candidates cost nothing" \
+  || bad "slots-before-skip: $(wc -l < "$D/runs-a" 2>/dev/null | tr -d ' ') pre-flight run(s) (want 6)"
+# THE CONTROL: same fixture, wider window. Now the walk reaches the recorded-held tail, so the skip
+# arm MUST fire — proving the assertion above measures the ORDER and not a fixture that never skips.
+mk_case slots-skip-control
+mk_tool_held "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_gh_tiers "$D" "5001,5002,5003" "5004,5005,5006" "5101,5102,5103"
+_led_seed "$D"
+RF_LIMIT=9 rf "$D" refresh HELD="5101 5102 5103" RUNLOG="$D/runs-b"
+n_skip_lines="$(printf '%s\n' "$OUT" | grep -c 'SKIPPED')"
+[ "${n_skip_lines:-0}" -eq 3 ] && ok "slots-skip-control: with a wider window the ledger walk-past IS reached (3 skip lines) — the assertion above is non-vacuous" \
+                            || bad "slots-skip-control: $n_skip_lines skip line(s) with a wide window (want 3) — the previous case proves nothing about the ORDER"
+case "$OUT" in
+  *"skipped 3 candidate(s)"*) ok "slots-skip-control: the walk-past is still reported in aggregate" ;;
+  *) bad "slots-skip-control: the aggregate skip line is missing — output: $OUT" ;;
+esac
+
 
 echo
 echo "── Summary ───────────────────────────────────────────────────────"
