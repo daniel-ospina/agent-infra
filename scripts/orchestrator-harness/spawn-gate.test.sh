@@ -1362,6 +1362,56 @@ ck "…exactly one row per kill, not one per path (clean kill wrote ${n_rows:-0}
 grep -q -- '--no-optional-locks status --porcelain=v2' "$GATE"; rc=$?
 ck "the worktree state read carries --no-optional-locks (a rescue must not interpose a lock on a live writer)" $rc
 
+# ⛔ CONTAINMENT IS A FULL-PATH TEST, NOT A BASENAME TEST (review finding, P2 — reproduced). The prune
+# list is consumed line by line, so a `capwip-*` directory whose name contains a NEWLINE arrives as two
+# fragments: the first is not a directory, and the second (`capwip-victim`) was resolved relative to the
+# CALLER'S CWD and DELETED — the only destructive primitive in this leg deleting an unrelated directory
+# outside the wip root. The victim here sits in the cwd the prune runs from, exactly the shape measured.
+PN="$CAPRIG/prune-newline"; rm -rf "$PN"; mkdir -p "$PN/wip" "$PN/cwd"
+i=0; while [ "$i" -lt 12 ]; do mkdir -p "$PN/wip/capwip-keep-$i"; i=$((i + 1)); done
+# ⛔ THE NEWLINE ENTRY MUST SORT AFTER THE KEEP BUDGET, or this arm is VACUOUS (verification finding):
+# `ls -1dt` lists a freshly created entry FIRST, so its `capwip-victim` fragment counts at n=1 — inside
+# the budget — and the pre-fix basename code never reached the rm. Backdated, the fragment is counted
+# after the budget, which is the only ordering in which the escape is reachable.
+mkdir -p "$PN/wip/capwip-a
+capwip-victim"
+touch -t 200001010000 "$PN/wip/capwip-a
+capwip-victim"
+mkdir -p "$PN/cwd/capwip-victim"
+last_line="$(ls -1dt "$PN/wip"/capwip-* 2>/dev/null | tail -1)"
+case "$last_line" in capwip-victim) rc=0 ;; *) rc=1 ;; esac
+ck "FIXTURE: the newline entry sorts LAST, so its fragment is counted after the keep budget (else this arm is vacuous)" $rc
+( cd "$PN/cwd" && bash -c '. "$1"; WIP_SNAPSHOT_KEEP=10; cap_wip_prune "$2"' _ "$GATE" "$PN/wip" )
+[ -d "$PN/cwd/capwip-victim" ]; rc=$?
+ck "a NEWLINE in a capwip name cannot make the retention rm -rf escape the wip root (victim survives)" $rc
+pkept=0
+for d in "$PN/wip"/capwip-*/; do [ -d "$d" ] && pkept=$((pkept + 1)); done
+[ "$pkept" -ge 10 ]; rc=$?
+ck "…and the ordinary snapshots are still retained (kept=$pkept of 12 + the newline-named one)" $rc
+
+# ⛔ AND THE REPLAY LINE MUST NOT PASTE A `git apply` OF AN EMPTY PATCH (review finding, P3). An
+# untracked-only tree produces a 0-byte tracked.patch, and `git apply` on it exits 128 ("No valid
+# patches in input") — an instruction that fails at the moment somebody is rescuing work, mirroring the
+# tarball that was never created (cycle 12).
+UO="$CAPRIG/untrackedonly"; rm -rf "$UO"; git init -q -b main "$UO"
+printf 'base\n' > "$UO/f.txt"; git -C "$UO" add f.txt
+git -C "$UO" -c user.email=t@t -c user.name=t commit -q -m base
+printf 'only untracked\n' > "$UO/only-untracked.txt"
+: > "$FB/log19"
+fb="$(PATH="$CAPRIG/bin:$PATH" O="$CO" WIP_PATH="$UO" bash -c '
+  . "$1"
+  cap_wip_snapshot "untracked only" 5 5 143 "$2" >/dev/null 2>&1
+  printf "rc=%s result=%s dir=%s" "$?" "$WIP_SNAPSHOT_RESULT" "${WIP_SNAPSHOT_DIR:-none}"
+' _ "$GATE" "$FB/log19")"
+grep -q 'no tracked changes were captured' "$FB/log19"; rc=$?
+ck "an UNTRACKED-ONLY tree says there is no patch to apply, instead of pasting a git-apply of 0 bytes ($fb)" $rc
+# ⛔ MATCH THE COMMAND, NOT THE WORD (verification finding): the honest wording contains "patch to
+# apply", so `/apply/` matched its own prose and the arm failed on a correct fix. `git -C` is the
+# invocation shape — that is what must be absent when there is no patch.
+ue="$(awk '/replay:/ && /git -C/ {n++} END{print n+0}' "$FB/log19")"
+[ "$ue" -eq 0 ]; rc=$?
+ck "…and its replay line contains no git-apply invocation at all" $rc
+
 # ⛔ AND THE LAUNCHER MUST REPORT IT (#2045 indicator (b)). `nonblocking-dispatch.sh --status` used to
 # answer a cap kill with a bare exit status — and `worker finished: commits=0` in the reported line —
 # so a supervisor reading it saw a healthy quiescent lane and did NOT re-dispatch. Driven end to end:

@@ -361,6 +361,17 @@ cap_wip_prune() {
   [ -n "$root" ] || return 0
   while IFS= read -r d; do
     [ -n "$d" ] || continue
+    # ⛔ CONTAINMENT IS CHECKED ON THE FULL PATH, NOT THE BASENAME (review finding, P2 — reproduced).
+    # The list is consumed LINE BY LINE, so a directory whose name contains a NEWLINE arrives as two
+    # fragments: the first matches the prefix but is not a directory, and the second (`capwip-victim`)
+    # was resolved RELATIVE TO THE CALLER'S CWD because a basename test cannot see that it is not under
+    # `$root` — measured: `rm -rf` escaped and deleted an unrelated `capwip-victim` directory in the
+    # worker's cwd. This is the only destructive primitive in the leg, so it refuses anything that is
+    # not literally `$root/capwip-*`.
+    case "$d" in
+      "$root"/capwip-*) : ;;
+      *) continue ;;
+    esac
     # ⛔ COUNT ONLY WHAT WE WOULD REMOVE. A `capwip-*` FILE (a stray, a mis-typed name) is neither a
     # snapshot nor a candidate: counting it burned a keep slot and deleted one extra LIVE snapshot
     # (VGATE cycle 3, reproduced: 12 dirs + 1 stray file → kept=9). The directory test therefore runs
@@ -368,9 +379,7 @@ cap_wip_prune() {
     [ -d "$d" ] || continue
     n=$((n + 1))
     [ "$n" -le "$WIP_SNAPSHOT_KEEP" ] && continue
-    case "${d##*/}" in
-      capwip-*) rm -rf -- "$d" ;;
-    esac
+    rm -rf -- "$d"
   done <<<"$(ls -1dt "$root"/capwip-* 2>/dev/null)"
 }
 
@@ -625,13 +634,24 @@ cap_wip_snapshot() {
   # THREE CASES, not two: "there was no untracked work" is not "the archive failed", and printing the
   # failed-archive wording over an EMPTY list (VGATE cycle 12) tells an operator to copy nonexistent
   # files by hand.
+  # ⛔ AND THE TRACKED CLAUSE IS SELECTED THE SAME WAY (review finding, P3): an untracked-only tree has
+  # a 0-byte `tracked.patch`, and `git apply` on that exits 128 ("No valid patches in input") — an
+  # instruction that fails at the moment somebody is rescuing work.
+  local tracked_clause
+  if [ "${patch_bytes:-0}" -gt 0 ] && [ "$patch_ok" = 1 ]; then
+    tracked_clause="git -C \"$root\" apply \"$dir/tracked.patch\""
+  elif [ "${want_tracked:-0}" -gt 0 ]; then
+    tracked_clause="the tracked work was NOT captured (see \"$dir/SNAPSHOT.txt\")"
+  else
+    tracked_clause="no tracked changes were captured (there is no patch to apply)"
+  fi
   if [ "${want_untracked:-0}" -eq 0 ]; then
-    echo "[cap]   replay: git -C \"$root\" apply \"$dir/tracked.patch\" (no untracked files were present, so there is no tarball)" >> "$log"
+    echo "[cap]   replay: $tracked_clause (no untracked files were present, so there is no tarball)" >> "$log"
   elif [ "$arch_ok" = 1 ]; then
-    echo "[cap]   replay: git -C \"$root\" apply \"$dir/tracked.patch\" ; untracked: tar -xzf \"$dir/untracked.tgz\" -C \"$root\"" >> "$log"
+    echo "[cap]   replay: $tracked_clause ; untracked: tar -xzf \"$dir/untracked.tgz\" -C \"$root\"" >> "$log"
   else
     # No archive exists — naming one would send an operator to a tar invocation that cannot work.
-    echo "[cap]   replay: git -C \"$root\" apply \"$dir/tracked.patch\" ; the untracked work is listed in \"$dir/untracked.list\" and was NOT archived (copy it by hand from $root)" >> "$log"
+    echo "[cap]   replay: $tracked_clause ; the untracked work is listed in \"$dir/untracked.list\" and was NOT archived (copy it by hand from $root)" >> "$log"
   fi
   if [ "$result" != COMPLETE ]; then
     echo "[cap]   INCOMPLETE SNAPSHOT: dirty=${n_dirty:-0} unmerged=${unmerged:-0} submodule=${sub_dirty:-0} uncovered=${uncovered_n:-0} status_ok=$st_ok — the worktree at $root is still the only FULL copy. Do NOT reap it." >> "$log"
