@@ -325,10 +325,7 @@ fi
 # runs under launchd (com.eldato.fleet-cost-weekly plist), the pi-session reaper
 # runs hourly (com.eldato.pi-session-reaper plist), the Task 6 child-session
 # retention sweep runs hourly (com.eldato.pi-task-session-prune plist), and the
-# disk reaper runs hourly (com.eldato.disk-reaper plist, #2048 — the consolidated pass
-# over uv caches, lane venvs and worktrees; the per-class pi-cache-reap / worktree-reaper
-# jobs are retired into it), and the branch reaper daily (com.tortoise.branch-reaper
-# plist) —
+# worktree reaper runs daily (com.tortoise.worktree-reaper plist) —
 # launchd cannot read ~/Documents (same TCC wall as #427).
 # session-postmortem.sh (the shared parser), the report, the watch, the weekly
 # driver, the reaper, the prune sweep, and the worktree reaper must ALL sit in
@@ -438,11 +435,10 @@ fi
 # copy (the unit's ExecStart is rendered from this path), and the entry point resolves its three
 # delegate owners through the same farm. A unit pointed at a checkout would be pointing at a
 # directory the tool itself is allowed to reap — the farm is the stable path.
-# #1987 adds pi-cache-reap.sh: the hourly com.eldato.disk-reaper job (Mac, #2048 — the
-# consolidated pass owns this script as its uv class) and the cell controller's hourly
-# cache bound (a cell has no launchd) both execute the FARMED copy — the machine-global
-# uv/npm/pip caches are the sink that took pi-cell-3 to 258MB free, and neither the
-# worktree reaper nor the supervisor's
+# #1987 adds pi-cache-reap.sh: the hourly com.eldato.pi-cache-reap job (Mac) and
+# the cell controller's hourly cache bound (a cell has no launchd) both execute
+# the FARMED copy — the machine-global uv/npm/pip caches are the sink that took
+# pi-cell-3 to 258MB free, and neither the worktree reaper nor the supervisor's
 # prune can reach `$HOME/.cache/uv`. Same broken-target rule: absent from this
 # farm, the plist is refused.
 # ⛔ RETIRING A NAME IS TWO EDITS IN ONE COMMIT (#1924): drop it from this array AND
@@ -459,7 +455,7 @@ fi
 # sweep's `--preflight` and refuses a box whose engine prerequisites do not resolve.
 # Farming the sweep is what makes that preflight able to run at all (it is executed
 # from the farmed path), so the arming can never bless a unit pointed at nothing.
-fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-cache-reap.sh pi-reap-worktrees.sh reap-lane-venvs.sh disk-reaper.sh install-disk-reaper-schedule.sh pi-reap-worktrees-launchd.py cleanup-stale-branches.sh ci_runner_gate.sh ask-owner.py beta-progress.py cadence-nudge.sh cadence-timer.sh child-check.py cloud-cell-quiesce.sh deploy-crossbox.sh deploy-mac-orchestrator.sh goal-state.py lane-actions.py lane-guard.py lane-read.py lane-scan-fallback.sh lane-watchdog.py lane-wip.py live-workspaces-publisher.py merge-queue.py orch-send.sh orchestrator-heartbeat.sh orphan-reap.py pr-doctor.py objective.py probe-one.py publish-live-workspaces.py queue-dispatch.py safe-send.sh seed-goal-map.py tree-cpu.py turn-classify.py turn-end.py unblock-lane.sh undelivered-answers.py worktree-hygiene-sweep.sh)
+fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-cache-reap.sh pi-reap-worktrees.sh reap-lane-venvs.sh disk-reaper.sh scheduled-jobs.sh check-scheduled-parity.sh pi-reap-worktrees-launchd.py cleanup-stale-branches.sh ci_runner_gate.sh ask-owner.py beta-progress.py cadence-nudge.sh cadence-timer.sh child-check.py cloud-cell-quiesce.sh deploy-crossbox.sh deploy-mac-orchestrator.sh goal-state.py lane-actions.py lane-guard.py lane-read.py lane-scan-fallback.sh lane-watchdog.py lane-wip.py live-workspaces-publisher.py merge-queue.py orch-send.sh orchestrator-heartbeat.sh orphan-reap.py pr-doctor.py objective.py probe-one.py publish-live-workspaces.py queue-dispatch.py safe-send.sh seed-goal-map.py tree-cpu.py turn-classify.py turn-end.py unblock-lane.sh undelivered-answers.py worktree-hygiene-sweep.sh)
 mkdir -p "$DEST/scripts"
 fleet_copied=0
 for base in "${fleet_srcs[@]}"; do
@@ -506,14 +502,30 @@ echo "    scripts fleet farm: $fleet_copied copied (fleet cadence, #373 + runner
 # scripts resolve it as `$(dirname "${BASH_SOURCE[0]}")/lib/beat-pair.sh`). A
 # missing lib makes the guard FAIL CLOSED: the pair is treated as unverifiable
 # and the act clause is withheld, with a logged reason — never a silent pass.
-# #2046 adds a FOURTH sibling: `scripts/lib/bounded.sh` is the ONE bounded-execution
+# #1921 adds a FOURTH sibling: the VENDORED transcript-pattern producer
+# (`scripts/lib/transcript-patterns.sh`) that the farmed `session-postmortem.sh`
+# execs for the Transcript Patterns section of every retrospective. Before this,
+# that producer was resolved from an absolute `/Users/<owner>/…/eldato/scripts/`
+# path in ANOTHER checkout — so on every box but the owner's (and on every Linux
+# cell) the section degraded to a placeholder inside a generated report. Farming
+# it beside the consumer is what makes the section exist everywhere the consumer
+# does (same `lib/` → `$DEST/scripts/lib/` layout as the three above; the
+# consumer resolves `$(dirname "${BASH_SOURCE[0]}")/lib/transcript-patterns.sh`).
+# #2046 adds a FIFTH: `scripts/lib/bounded.sh` is the ONE bounded-execution
 # helper for the reaper family. `disk-reaper.sh` and `pi-reap-worktrees.sh` both
 # source it and both REFUSE at startup (exit 3) without it, because a probe with
 # no watchdog is a probe that can hang the host they exist to unload. Farming the
 # reapers WITHOUT this sibling re-arms the hourly pass as a startup refusal; on a
 # Mac that is strictly better than the pre-#2046 behaviour it replaces (every
 # class fail-closed with `timeout: command not found` while the pass completed).
-lib_srcs=(pid-identity.sh diff-normalize.py beat-pair.sh bounded.sh)
+# #2048 adds a SIXTH and SEVENTH sibling: `scripts/lib/portable.sh` (the ONE portability shim —
+# `_timeout`/`_nproc`/`_stat_size`/`_date`) and `scripts/lib/scheduled-jobs.sh` (the ONE parser/
+# renderer behind the declaration). EVERY scheduled component sources the portability shim and
+# REFUSES to start without it (exit 3), because a component that runs on with no helper is exactly
+# the #2046 shape: the work silently does not happen while the component reports a considered result.
+# The declaration parser is farmed with `scheduled-jobs.sh`, which refuses to act on an unreadable
+# declaration — farming the command without its parser would arm a startup refusal on the cells.
+lib_srcs=(pid-identity.sh diff-normalize.py beat-pair.sh bounded.sh transcript-patterns.sh portable.sh scheduled-jobs.sh)
 mkdir -p "$DEST/scripts/lib"
 lib_copied=0
 lib_failed=0
@@ -545,11 +557,54 @@ for base in "${lib_srcs[@]}"; do
     lib_failed=$((lib_failed+1))
   fi
 done
+# The summary NAMES what it farmed, DERIVED from the array (#1921): a hand-kept list here drifts
+# the moment a lib is added, and test-setup-no-nesting.sh asserts every declared lib is named —
+# so a stale list turns a correct farm into a red, or worse, names a lib it did not copy.
+lib_names="$(printf '%s + ' "${lib_srcs[@]}")"; lib_names="${lib_names% + }"
 if [ "$lib_failed" -gt 0 ]; then
-  echo "    scripts lib farm: $lib_copied copied, $lib_failed FAILED/MISSING (pid-identity.sh + diff-normalize.py + beat-pair.sh + bounded.sh, #1178/#1362/#2046)" >&2
+  echo "    scripts lib farm: $lib_copied copied, $lib_failed FAILED/MISSING ($lib_names, #1178/#1362/#1897/#2046/#1921)" >&2
+  # #1924: a lib that DECLARED but did not land is an INCOMPLETE checkout, not a
+  # tolerated skip — record it so the run fails before the UNFARM leg instead of
+  # delivering consumers whose sibling is absent.
   farm_missing+="scripts/lib/ ($lib_failed declared sibling(s) FAILED or MISSING)"$'\n'
 else
-  echo "    scripts lib farm: $lib_copied copied (pid-identity.sh + diff-normalize.py + beat-pair.sh + bounded.sh, #1178/#1362/#2046)"
+  echo "    scripts lib farm: $lib_copied copied ($lib_names, #1178/#1362/#1897/#2046/#1921)"
+fi
+
+# The DECLARATION farm (#2048) — the scheduled-jobs command without its data is a command that can
+# only refuse. `scripts/scheduled-jobs.sh` resolves the declaration beside the REPO root or beside the
+# farmed copy, and on a provisioned box only the second exists; a farm that delivers the command and
+# not the declaration installs a set of verbs whose every invocation fails at startup.
+#
+# It lands under `scripts/config/` because the retirement list (pi-bootstrap/farm-retired.txt) can only
+# express `scripts/…`; a farm outside `scripts/` is a loud refusal in cell-install.sh, by design.
+# Same atomic copy/rename discipline and the same loud missing-file accounting as the farms above.
+config_srcs=(scheduled-jobs.declaration scheduled-jobs.unmanaged)
+mkdir -p "$DEST/scripts/config"
+cfg_copied=0
+cfg_failed=0
+for base in "${config_srcs[@]}"; do
+  farm_declared_rel+="scripts/config/$base"$'\n'
+  f="$INFRA_ROOT/config/$base"
+  if [ ! -f "$f" ]; then
+    echo "    config farm: MISSING $f — every scheduled-jobs verb refuses to start without its declaration" >&2
+    cfg_failed=$((cfg_failed+1))
+    continue
+  fi
+  if cp -f "$f" "$DEST/scripts/config/$base.tmp.$$" 2>/dev/null \
+     && mv -f "$DEST/scripts/config/$base.tmp.$$" "$DEST/scripts/config/$base" 2>/dev/null; then
+    cfg_copied=$((cfg_copied+1))
+  else
+    echo "    config farm: COPY/RENAME FAILED for $f — leaving any previous copy in place" >&2
+    rm -f "$DEST/scripts/config/$base.tmp.$$"
+    cfg_failed=$((cfg_failed+1))
+  fi
+done
+if [ "$cfg_failed" -gt 0 ]; then
+  echo "    config farm: $cfg_copied copied, $cfg_failed FAILED/MISSING (the scheduled-jobs declaration, #2048)" >&2
+  farm_missing+="config/ ($cfg_failed declared file(s) FAILED or MISSING)"$'\n'
+else
+  echo "    config farm: $cfg_copied copied (scheduled-jobs declaration + unmanaged register, #2048)"
 fi
 
 # Fleet-tools farm (#1178 unit 3): the scheduled lane-liveness report
@@ -678,6 +733,46 @@ for base in "${merge_gate_srcs[@]}"; do
   merge_gate_copied=$((merge_gate_copied+1))
 done
 echo "    scripts merge-gate farm: $merge_gate_copied copied (record-review.sh, #562)"
+
+# ── the pi spawn-point gate (#1884) ──────────────────────────────────────────
+# Installed as `pi` — not as a farmed script — because that is the whole point: `spawn-gate.sh` is
+# ALSO an executable whose invoked identity IS the gate (see "THE SPAWN POINT" in that file), and it
+# is installed under the name a caller actually types. $DEST/bin is FIRST on PATH on this fleet
+# (measured on the laptop and on a cmux cell, and install-launchd.sh keeps it in the runner-gate
+# plist PATH so the daemon and the tmux children it starts inherit it), so every `pi` invocation
+# resolves here: lane.sh, fix-one.sh, merge-one.sh, a hand-written tmux runner, an interactive
+# session. Before #1884 the gate was reachable only by callers that sourced it, and a runner that
+# did not was UNGATED AND SILENT — that is how a box reached load 258 against its own ceiling of 100.
+#
+# ONE COPY, from ONE source: the same file the harness callers source, so the ceiling a caller applies
+# and the ceiling the spawn point applies cannot drift. A real copy rather than a symlink for the
+# #427 reason (a symlink into the checkout EPERMs under launchd/TCC and dangles when a worktree is
+# reaped — a dangling `pi` on PATH breaks every lane on the box).
+SPAWN_GATE_SRC="$INFRA_ROOT/scripts/orchestrator-harness/spawn-gate.sh"
+if [ -f "$SPAWN_GATE_SRC" ]; then
+  mkdir -p "$DEST/bin"
+  if [ -e "$DEST/bin/pi" ] && ! cmp -s "$SPAWN_GATE_SRC" "$DEST/bin/pi"; then
+    # Someone else's `pi` in this directory would be silently REPLACED by the line below, and a
+    # different `pi` launcher is exactly the kind of local tooling an operator would not want
+    # clobbered unnoticed — so keep it, loudly.
+    cp -f "$DEST/bin/pi" "$DEST/bin/pi.bak-bootstrap" 2>/dev/null || true
+    echo "    backed up a pre-existing $DEST/bin/pi to pi.bak-bootstrap (it is not this repo's gate)"
+  fi
+  cp -f "$SPAWN_GATE_SRC" "$DEST/bin/pi"
+  chmod +x "$DEST/bin/pi" 2>/dev/null || true
+  echo "    pi spawn-point gate installed at $DEST/bin/pi (#1884)"
+  # A gate that is installed but NOT ahead of the real pi on PATH is a false install: it would report
+  # success here while every spawn resolved past it. Say so at install time, when it is cheap to fix.
+  case ":$PATH:" in
+    *"/.pi/agent/bin:"*) ;;
+    *) echo "    WARNING: $DEST/bin is not on this shell's PATH, so the spawn-point gate is NOT in front of \`pi\` here." >&2 ;;
+  esac
+else
+  echo "ERROR: $SPAWN_GATE_SRC is missing — the pi spawn-point gate (#1884) was NOT installed." >&2
+  echo "       Every \`pi\` a hand-written runner starts would then be ungated and silent, which is the" >&2
+  echo "       defect #1884 records. Re-clone agent-infra and re-run this script." >&2
+  exit 1
+fi
 
 # ── UNFARM leg (#1924) ────────────────────────────────────────────────────
 # Every farm above is COPY-ONLY: `cp -f` writes the names an array lists and does
@@ -815,32 +910,32 @@ fi
 # (com.eldato.disk-reaper) running the SAME pass with the SAME flags the cells' systemd timer does.
 # ⛔ REPORT-ONLY UNLESS ARMED: the installer's default is the pass's dry-run flag (#1678, owner ruling
 # 2026-10-11 — a deletion tool ships report-only and arming is an explicit, dated, reversible owner
-# step). Arming a Mac is `bash scripts/install-disk-reaper-schedule.sh --install --apply` BY THE OWNER;
-# nothing in this farm does it.
+# step). Arming a Mac is `bash scripts/scheduled-jobs.sh install --apply` BY THE OWNER;
+# nothing in this farm does it. A re-install PRESERVES the stance already on the box, so a convergent
+# run can neither arm nor disarm a host silently (the artifact is the decision of record).
 # A box with no schedule is a FAIL reported here, not a silent absence: "scheduled" is the only state
 # in which an unattended reaper exists at all, and the alert-shaped failure (a disk at 97% with a
 # healthy controller) is exactly what #2032/#2048 exist to remove.
-# ⛔ THE DECISION IS THE INSTALLER'S, NOT THIS FILE'S (#2048 review). This block used to repeat the
-# installer's `dscl` probe to decide "is this the real home?", so one decision had two implementations
-# and neither could be tested where the other ran. The installer answers it once and says so with an
-# exit code: 0 installed · 3 DECLINED, this is not the box (a temp HOME — the bootstrap tests, a scratch
-# farm; launchd addresses the user domain BY UID, so a job registered from a throwaway HOME points at a
-# plist path that dies with it, #446) · anything else is a failure.
-if [[ "$(uname)" == "Darwin" ]] && [ -x "$INFRA_ROOT/scripts/install-disk-reaper-schedule.sh" ]; then
+reaper_real_home="$(dscl . -read "/Users/$(id -un)" NFSHomeDirectory 2>/dev/null | sed -n 's/^NFSHomeDirectory: //p' | head -1 || true)"
+if [[ "$(uname)" == "Darwin" ]] && [ -x "$INFRA_ROOT/scripts/scheduled-jobs.sh" ] \
+   && [ -z "$reaper_real_home" -o "$HOME" = "$reaper_real_home" ]; then
   echo ""
   echo "==> Disk reaper schedule"
-  reaper_rc=0
-  bash "$INFRA_ROOT/scripts/install-disk-reaper-schedule.sh" --install || reaper_rc=$?
-  case "$reaper_rc" in
-    0) echo "    disk reaper: scheduled (see: install-disk-reaper-schedule.sh --status)" ;;
-    3) # SKIPPED, and said out loud — not a silent absence, and not a failure of a run that was never
-       # about this machine.
-       echo "    disk reaper: SKIPPED (this run's HOME is not the real home, #446 — the installer declined)" ;;
-    *) echo "    ⛔ WARNING: the disk reaper schedule could NOT be installed (rc=$reaper_rc) — this Mac is" >&2
-       echo "       unscheduled and will not be reaped. Diagnose with:" >&2
-       echo "         bash $INFRA_ROOT/scripts/install-disk-reaper-schedule.sh --status" >&2
-       launchd_reaper_failed=1 ;;
-  esac
+  if bash "$INFRA_ROOT/scripts/scheduled-jobs.sh" install; then
+    echo "    scheduled set: installed (see: scheduled-jobs.sh status)"
+  else
+    echo "    ⛔ WARNING: the disk reaper schedule could NOT be installed — this Mac is unscheduled and" >&2
+    echo "       will not be reaped. Diagnose with:" >&2
+    echo "         bash $INFRA_ROOT/scripts/scheduled-jobs.sh status" >&2
+    launchd_reaper_failed=1
+  fi
+elif [[ "$(uname)" == "Darwin" ]] && [ -n "$reaper_real_home" ] && [ "$HOME" != "$reaper_real_home" ]; then
+  # A temp-HOME run (the bootstrap tests, a scratch farm) is not "the box": launchd addresses the user
+  # domain BY UID, so a job registered from a temp HOME points at a plist path that dies with it (#446).
+  # SKIPPED, and said out loud — not a silent absence, and not a failure of a run that was never about
+  # this machine.
+  echo ""
+  echo "==> Disk reaper schedule: SKIPPED (HOME=$HOME is not the real home $reaper_real_home, #446)"
 fi
 
 echo ""

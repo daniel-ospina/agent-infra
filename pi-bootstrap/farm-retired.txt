@@ -84,3 +84,12 @@ scripts/check-second-model.sh
 # says the schedule is cross-platform. No plist targets it (it is invoked from shell), so edit 3 of the
 # retirement rule does not apply.
 scripts/install-disk-reaper-timer.sh
+
+# `install-disk-reaper-schedule.sh` was itself retired in #2048, replaced by `scheduled-jobs.sh`: the
+# installer no longer schedules ONE pass, it converges the WHOLE declared set (Linux systemd units +
+# timers, macOS launchd jobs) from `config/scheduled-jobs.declaration`, and its verbs are
+# `install|status|start|stop|restart|uninstall|parity`. The old name is declared here for the same
+# reason as above: the copy leg is copy-only, so a box that ran setup.sh in the #2048 window keeps an
+# executable copy, and `cloud-cell-bringup.sh` resolves the command BY NAME — a stale copy would keep
+# scheduling through a path the repo no longer maintains, while the declaration it cannot see drifts.
+scripts/install-disk-reaper-schedule.sh

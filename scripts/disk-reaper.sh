@@ -1,4 +1,30 @@
 #!/usr/bin/env bash
+# ── the portability shim (#2048) ────────────────────────────────────────────────────────────────
+# ONE shim for the four platform differences that made components install and then fail to EXECUTE
+# on one platform (#2046: macOS ships no `timeout`; `nproc`, `stat -c` and `date -d` are GNU-only).
+# Every scheduled component sources it, so a helper used here cannot be a GNU-only spelling. A shim
+# that cannot be loaded is a REFUSAL AT STARTUP (exit 3): running on with no helper is exactly the
+# #2046 shape — the work silently does not happen while the component reports a considered result.
+_PORTABLE_LIB="${PORTABLE_LIB:-}"
+if [ -z "$_PORTABLE_LIB" ]; then
+    _portable_self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+    # `<script dir>/lib` covers `scripts/*.sh`; `<script dir>/../lib` covers a component that lives
+    # in a subdirectory (`scripts/checkout-hygiene/`, `scripts/fleet/`); the farm copy is what a cell
+    # actually has after `pi-bootstrap/setup.sh`.
+    for _portable_cand in "$_portable_self_dir/lib/portable.sh" \
+                          "$_portable_self_dir/../lib/portable.sh" \
+                          "${HOME:-}/.pi/agent/scripts/lib/portable.sh"; do
+        [ -n "$_portable_cand" ] && [ -f "$_portable_cand" ] && { _PORTABLE_LIB="$_portable_cand"; break; }
+    done
+fi
+if [ ! -f "${_PORTABLE_LIB:-}" ]; then
+    printf '%s: FAIL-CLOSED at startup — the portability shim is missing (%s)\n' \
+        "${0##*/}" "${_PORTABLE_LIB:-not beside this script and not in ${HOME:-}/.pi/agent/scripts/lib/}" >&2
+    exit 3
+fi
+# shellcheck source=lib/portable.sh
+. "$_PORTABLE_LIB"
+
 # disk-reaper.sh — ONE entry point for the three disk sinks that stop a cell (agent-infra#2032).
 #
 # WHY THIS EXISTS (the measured defect)
@@ -45,10 +71,11 @@
 # reported as 0 with the raw delta, not hidden.
 #
 # SCHEDULING — ONE installer, TWO schedulers (agent-infra#2048)
-#   scripts/install-disk-reaper-schedule.sh installs this pass on BOTH platforms: a systemd timer on a
-#   cell (templates/systemd/eldato-disk-reaper.{service,timer}, hourly, installed and enabled by
-#   `cloud-cell-bringup.sh --check`) and a launchd job on a Mac
-#   (templates/launchd/com.eldato.disk-reaper.plist.tmpl, hourly, installed by pi-bootstrap/setup.sh).
+#   scripts/scheduled-jobs.sh renders this pass from ONE record in config/scheduled-jobs.declaration
+#   and installs it on BOTH platforms: a systemd timer on a cell (installed and enabled by
+#   `cloud-cell-bringup.sh --check`) and a launchd job on a Mac (installed by pi-bootstrap/setup.sh).
+#   Nothing about the schedule lives in a template file: the declaration is the source of truth, and
+#   `check-scheduled-parity.sh` fails when a live host disagrees with it.
 #   Same entry point, same flags, same pass record; only the scheduler differs, plus Darwin's
 #   binary-resolution seam (a launchd-spawned `bash` cannot read a repo under ~/Documents, so the Mac
 #   job starts an interpreter that can and hands it THIS file on stdin — TCC is per-binary, #427).
@@ -326,15 +353,14 @@ free_kb_for_path() {
 }
 
 # file_mtime <path> — epoch mtime, portable across GNU and BSD stat. Empty when unstatable.
-file_mtime() {
-    if stat -f '%m' "$0" >/dev/null 2>&1; then stat -f '%m' "$1" 2>/dev/null
-    else stat -c '%Y' "$1" 2>/dev/null; fi
-}
+# Portable mtime via the shim (#2048): BSD spells it `stat -f %m`, GNU `stat -c %Y`, and a caller
+# that guesses the host is how the age of a lock or a venv silently became 0 on one platform.
+file_mtime() { _stat_mtime "$1"; }
 
 # du_mb <path> — blocks occupied, MiB. Empty on failure (never 0: 0 reads as "empty").
 du_mb() {
     local kb
-    kb="$(tb_timeout "$DU_TIMEOUT" "$DU_BIN" -sk "$1" 2>/dev/null)" || return 1
+    kb="$(_timeout "$DU_TIMEOUT" "$DU_BIN" -sk "$1" 2>/dev/null)" || return 1
     kb="${kb%%[[:space:]]*}"
     case "$kb" in ''|*[!0-9]*) return 1 ;; esac
     printf '%s' "$(( kb / 1024 ))"
@@ -344,7 +370,7 @@ du_mb() {
 # Sets CLASS_OUT / CLASS_RC. A timeout is rc=124, which every caller treats as fail-closed.
 CLASS_OUT=""; CLASS_RC=0
 run_class() {
-    CLASS_OUT="$(tb_timeout "$CLASS_TIMEOUT" "$@" 2>&1)"; CLASS_RC=$?
+    CLASS_OUT="$(_timeout "$CLASS_TIMEOUT" "$@" 2>&1)"; CLASS_RC=$?
     return 0
 }
 
@@ -454,7 +480,7 @@ reap_uv() {
     # WHERE the cache is, and WHAT the bound is, come from the owner (`--print-config`), never from a
     # second copy of the paths here — the uv cache honours XDG_CACHE_HOME and a tuned bound must not
     # be described by a different policy than the one enforced.
-    path="$(tb_timeout 60 bash "$CACHE_REAPER_PATH" --print-config 2>/dev/null | sed -n 's/^cache=uv://p' | head -1)"
+    path="$(_timeout 60 bash "$CACHE_REAPER_PATH" --print-config 2>/dev/null | sed -n 's/^cache=uv://p' | head -1)"
     [ -n "$path" ] || path="${UV_CACHE_DIR:-$HOME/.cache/uv}"
     before="$(free_kb_for_path "$path")"
     run_class bash "$CACHE_REAPER_PATH" "$(mode_flag)"

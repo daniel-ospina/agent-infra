@@ -1,0 +1,50 @@
+# config/scheduled-jobs.unmanaged — schedules this machine KNOWS and this repo does NOT manage.
+#
+# ── WHY THIS FILE EXISTS ────────────────────────────────────────────────────────────────────────
+# `scripts/check-scheduled-parity.sh` fails when the live host runs a scheduled job the declaration
+# does not name. That rule is what makes 34 of the 35 measured launchd components visible at all — but
+# a gate that can only say "either declare it or be red forever" is a gate people switch off. So there
+# is exactly one sanctioned exit: name the job here WITH A REASON.
+#
+# ⛔ A REASON IS MANDATORY (a blank one is a FAILURE, `NO-REASON`). "Unmanaged" without a reason is how
+# a job becomes invisible again, which is the whole defect this feature removes.
+# ⛔ AN ENTRY MAY NOT OUTLIVE ITS JOB: once the job is gone from the host, the entry is a FAILURE
+# (`STALE-REGISTER`). The register must SHRINK as jobs are retired or declared — it is a work list,
+# not an amnesty.
+# ⛔ A JOB THAT IS BOTH DECLARED AND REGISTERED IS A FAILURE (`CONFLICT`): the two files must agree
+# about the world, and silence from one of them is how the disagreement ships.
+#
+# FORMAT:  <launchd label | systemd unit base>|<reason>
+#
+# ── WHAT IS IN HERE, AND WHAT IT IS NOT ────────────────────────────────────────────────────────
+# Everything below was MEASURED on the Mac (2026-10-19) with `launchctl list` plus the agent directory.
+# None of it is in `templates/launchd/`, so this repo cannot install it; each line names WHO does, which
+# is the fact that makes it a register entry rather than a missing declaration. Third-party agents
+# (com.google.*, com.premise.*, com.minutes.*, co.premiselabs.*) are NOT listed: they are out of
+# namespace by construction and the check COUNTS them (`out_of_scope_excluded=`) so that exclusion is
+# visible rather than assumed.
+
+# ── retired into the consolidated reaper — these must DISAPPEAR, not move in ────────────────────
+com.eldato.pi-cache-reap|RETIRED into com.eldato.disk-reaper (the `uv` class) — templates/launchd/RETIRED lists it, and install-launchd.sh boots it out and removes the plist on its next run. Until that run happens this is a SECOND pass over the same sink.
+com.tortoise.worktree-reaper|RETIRED into com.eldato.disk-reaper (the `worktree` class) — same retirement path as above; a duplicate 6-hourly worktree pass until install-launchd.sh removes it.
+
+# ── long-lived loops, not schedules (installed by the harness, not by a scheduler job) ─────────
+com.eldato.orchestrator-loop|installed by scripts/orchestrator-harness/install.sh; it is a KeepAlive supervisor LOOP, not a scheduled pass, and it has no interval to declare.
+com.eldato.orchestrator-watchdog|watchdog for that loop, installed by the same harness installer; it observes the loop rather than running a pass of its own.
+
+# ── role agents (another system installs and arms these) ───────────────────────────────────────
+com.eldato.agent-implementer|role-agent job installed by the eldato role-agent deployer (docs/teams surface), which carries its own prompt and model; this repo has no template for it.
+com.eldato.agent-strategist|role-agent job, same deployer as above.
+com.eldato.agent-verifier|role-agent job, same deployer as above.
+com.eldato.coordinator|role-agent job, same deployer as above.
+com.eldato.qa-mission-generator|role-agent job, same deployer as above.
+com.eldato.team-strategist|role-agent job, same deployer as above.
+com.eldato.pipeline-ingest|content-pipeline ingest job, installed by the eldato content pipeline; the pipeline owns its schedule, credentials and report format.
+com.eldato.swarm-watchdog|swarm watchdog for ~/swarm (the #285 swarm review gates); installed by its own deployer, not farmed from this repo.
+
+# ── tortoise-repo schedules (that repo owns its own artifacts) ─────────────────────────────────
+com.tortoise.embedded-reaper|Tortoise's embedded-graph reaper, installed from the tortoise checkout; it reaps a database, not a disk sink, and this repo does not carry its unit.
+com.tortoise.queue-reconcile|Tortoise queue reconciliation, installed from the tortoise checkout.
+com.tortoise.ci-check-repair|Tortoise CI repair loop, installed from the tortoise checkout.
+com.tortoise.pr-doctor|PR doctor dispatcher (#2056). Wired by scripts/pr-doctor*, but its launchd plist is machine state today — templating it and moving it into the declaration is the follow-up that retires this line.
+com.tortoise.watch1769|issue-1769 watchdog, installed by hand on the Mac; it has no template in any checkout, so it can only be declared once its artifact is reproducible.

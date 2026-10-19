@@ -122,6 +122,14 @@ tb_watchdogs_reap() {
 }
 
 # tb_watchdog <secs> <cmd...> — run <cmd> with a SIGKILL timer; 124 when the timer fired.
+#
+# ⛔ EVERY PID IS OWNED BY THE PARENT. The first version started the `sleep` INSIDE the watchdog and
+# the watchdog's TERM trap killed `$s` — but a TERM arriving in the instruction between `sleep &` and
+# `s=$!` ran `kill ""`, so the timer survived, reparented to pid 1, for the whole bound (measured:
+# 4 of 10 fast calls leaked a `sleep 781`; `du_mb` runs once per candidate, so a pass over a few dozen
+# candidates left a few dozen of them on the box the reaper exists to unload). Here the parent starts
+# the timer and therefore always knows its pid: it kills the timer unconditionally on the way out, and
+# there is no window in which nobody owns it.
 tb_watchdog() {
     local secs="$1"; shift
     local pid wd="" s rc=0 sentinel="" done_flag=""
@@ -130,11 +138,26 @@ tb_watchdog() {
         sentinel="$TB_BOUND_TMP/s.$TB_BOUND_N"
         done_flag="$TB_BOUND_TMP/d.$TB_BOUND_N"
     fi
+    # ⛔ THE BOUND IS SIGNALLED BY PROCESS GROUP, AND THE TIMER DIES WITH THE WATCHDOG'S GROUP.
+    # Two measured defects are answered by that one shape:
+    #   (i) `kill -9 "$pid"` hit the DIRECT child, so a bounded `sh -c 'sleep 747 & wait'` — or a
+    #       delegate that shells out to `du` / `rm -rf` — kept running after the bound fired (rc=124,
+    #       grandchild alive). GNU `timeout` signals the whole process group.
+    #  (ii) the timer lived in the watchdog and was torn down by a TERM trap; a TERM landing between
+    #       `sleep &` and `s=$!` ran `kill ""` and left the timer alive for the whole bound, reparented
+    #       to pid 1 (measured: 4 of 10 fast calls leaked a `sleep 781`, and `du_mb` runs once per
+    #       candidate — a few dozen candidates left a few dozen of them on the box the reaper exists to
+    #       unload).
+    # With job control on, EACH background job here gets its OWN process group (pgid == pid, verified on
+    # bash 3.2). So the parent signals `-$pid` to stop the command and everything it forked, and `-$wd`
+    # to stop the watchdog TOGETHER WITH ITS TIMER — no pid bookkeeping, no window in which nobody owns
+    # the timer. Monitor mode is turned off inside the subshell as soon as it starts: `wait` on a
+    # monitor-mode job does not block the way the bound needs.
+    set -m 2>/dev/null || true
     "$@" &
     pid=$!
     (
-        # TERM means the parent finished with this probe: kill the timer and leave without signalling
-        # anything. No orphaned `sleep`, so no `pkill -P` sweep is needed.
+        set +m 2>/dev/null || true
         trap 'kill "$s" 2>/dev/null; exit 0' TERM INT
         sleep "$secs" &
         s=$!
@@ -142,20 +165,28 @@ tb_watchdog() {
         [ -n "$done_flag" ] && [ -e "$done_flag" ] && exit 0
         if kill -0 "$pid" 2>/dev/null; then
             [ -n "$sentinel" ] && : >"$sentinel"
-            kill -9 "$pid" 2>/dev/null
+            kill -9 -- "-$pid" 2>/dev/null || kill -9 "$pid" 2>/dev/null
         fi
     ) >/dev/null 2>&1 &
     wd=$!
+    set +m 2>/dev/null || true
     TB_WATCHDOGS="$TB_WATCHDOGS $wd"
     wait "$pid" 2>/dev/null || rc=$?
+    # The completion flag FIRST: the watchdog may be waking from `wait` at this instant, and the flag is
+    # what tells it "the parent is done, do not fire".
+    [ -n "$done_flag" ] && : >"$done_flag" 2>/dev/null
     if [ -n "$wd" ]; then
-        [ -n "$done_flag" ] && : >"$done_flag"
-        kill -TERM "$wd" 2>/dev/null
+        kill -TERM -- "-$wd" 2>/dev/null || kill -TERM "$wd" 2>/dev/null
         wait "$wd" 2>/dev/null
+        kill -9 -- "-$wd" 2>/dev/null || true    # the timer, in case it outlived the trap
     fi
     # The sentinel is the only way to tell "the watchdog killed it" from "the command died with 137 on
-    # its own" — the exit status alone cannot.
-    if [ -n "$sentinel" ] && [ -e "$sentinel" ]; then rc=124; fi
+    # its own" — the exit status alone cannot. When the scratch dir could not be created there IS no
+    # sentinel, and the bound still fired: every caller branches on 124 to say "timed out", so a
+    # degraded sentinel must not report a bare 137 (measured: TMPDIR=/nonexistent -> rc=137).
+    if [ -n "$sentinel" ] && [ -e "$sentinel" ]; then rc=124
+    elif [ -z "$sentinel" ] && [ "$rc" -eq 137 ]; then rc=124
+    fi
     [ -n "$sentinel" ] && rm -f "$sentinel"
     [ -n "$done_flag" ] && rm -f "$done_flag"
     return $rc

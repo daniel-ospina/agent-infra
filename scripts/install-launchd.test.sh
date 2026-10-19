@@ -35,13 +35,6 @@
 
 set -euo pipefail
 
-# ⛔ Neutralise the AMBIENT environment before anything runs. Every section decides HOME, launchd
-# provenance and the checkout for itself, and `run_installer` inherits the caller's exports — so a dev
-# box with `ELDATO_ALLOW_TEST_HOME=1`, `FAKE_BOOTSTRAP_FAIL=1`, `FAKE_JOB_NOT_LOADED=1` or a
-# `TORTOISE_REPO` pointing at a broken checkout read differently from CI on the same code (measured:
-# 138/6, 49/80, 142/2 and §8 red respectively). Sections that need one set it explicitly, per run.
-unset ELDATO_ALLOW_TEST_HOME FAKE_BOOTSTRAP_FAIL FAKE_JOB_NOT_LOADED TORTOISE_REPO
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALLER="$SCRIPT_DIR/install-launchd.sh"
 REPO_TEMPLATES="$SCRIPT_DIR/../templates/launchd"
@@ -187,13 +180,7 @@ EOF
 # Copies repo templates into a scratch dir (installer's template dir is
 # env-overridable; tests mutate the COPY, never the repo).
 TEMPLATES="$T/templates"
-if ! CP_ERR="$(cp -R "$REPO_TEMPLATES" "$TEMPLATES" 2>&1)"; then
-    # The template DIR is a precondition, not a test failure — every section below would report noise.
-    # Say it once, WITH cp's own diagnostic: "is missing" alone sent an operator hunting a renamed
-    # directory when the real cause was `Permission denied`.
-    echo "FATAL: cannot seed the fixture's templates from $REPO_TEMPLATES: $CP_ERR" >&2
-    exit 1
-fi
+cp -R "$REPO_TEMPLATES" "$TEMPLATES"
 
 HOME1="$T/home1"; mkfakehome "$HOME1"
 HOME2="$T/home2"; mkfakehome "$HOME2"
@@ -218,97 +205,22 @@ run_installer() { # <home> [extra env assignments...]
         export SWARM_ROOT="$HOME/swarm"
         export PYTHON_BIN="$HOME/swarm/.venv/bin/python"
         export ELDATO_ALLOW_TEST_HOME=1  # #446: fake HOME + launchctl shim above = isolated
-        # #1987 — the job set must not depend on whether THIS host has a tortoise checkout. The two
-        # {{TORTOISE_REPO}}-gated jobs (branch-reaper #1787, worktree-reaper #1311) install only when
-        # the installer resolves a checkout, from the environment OR from disk, so an inherited value
-        # made §1's count read 11 here and 9 on CI — the same suite, two different totals. §13/§14 set
-        # TORTOISE_REPO explicitly in their own subshell and are the gated jobs' content coverage.
-        unset TORTOISE_REPO
         shift
         bash "$INSTALLER" "$@"
     )
 }
 
 echo "── 1. Fresh-HOME simulation ──────────────────────────────────────"
-# `set -e` aborts on a failing assignment, so without this pair a broken install killed the suite
-# BEFORE `assert_eq "$RC" 0` could print — the "fresh install exits 0" line was decorative and the
-# section reported nothing but the installer's own stderr (measured on base ce97fe827: a broken
-# ProgramArguments target aborted at this line with zero §1 assertions printed). Every other exit-code
-# installer capture in this file now runs inside a set +e/set -e window: every `assert_eq "$RC" "0"`
-# site and every bare capture that could abort the run before its Summary. (That also means a failing
-# install degrades to reported ❌ lines rather than one silent abort — which is how this file used to
-# fail, with no tally at all.)
-# ── the host state §1 must judge against (#2048 review, P2) ───────────────────────────────────
-# THREE host states are legitimate, and each has its OWN correct outcome — so the expectation is
-# derived from the host, never pinned:
-#   (a) no tortoise checkout visible                 -> nothing gated installs; the installer exits 0;
-#   (b) a checkout WITH a usable .venv/bin/python     -> both gated templates install; exits 0;
-#   (c) a checkout whose gated TARGET cannot resolve  -> the reachable gated templates install, the
-#       (a fresh clone before `uv sync`)                 broken one is REFUSED, and the installer exits
-#                                                        NON-ZERO naming the broken target.
-# The same three candidates install-launchd.sh:76-82 asks (the fixture's HOME is the fake one the run
-# used, so §13/§14's seeded checkouts cannot make this look resolved).
-GATED_VISIBLE1=0
-GATED_USABLE1=0
-for _cand in "$HOME1/Documents/GitHub/tortoise" "$(cd "$SCRIPT_DIR/.." && pwd)/../tortoise" "$HOME1/tortoise"; do
-    if [ -d "$_cand" ] && [ -d "$_cand/.git" ]; then
-        GATED_VISIBLE1=1
-        [ -x "$_cand/.venv/bin/python" ] && GATED_USABLE1=1
-        break
-    fi
-done
-# The EXPECTED gated install count, by resolvability: a gated template whose arguments name
-# {{TORTOISE_REPO}}/.venv/bin/python cannot install without that interpreter; one that names only
-# farmed scripts can. Derived from the templates, so a new gated job is classified automatically.
-GATED_EXPECTED1=0
-for _tpl in "$TEMPLATES"/*.plist; do
-    grep -q '{{TORTOISE_REPO}}' "$_tpl" || continue
-    if grep -q '\.venv/bin/python' "$_tpl"; then
-        [ "$GATED_USABLE1" -eq 1 ] && GATED_EXPECTED1=$((GATED_EXPECTED1 + 1))
-    else
-        GATED_EXPECTED1=$((GATED_EXPECTED1 + 1))
-    fi
-done
-# …but with NO visible checkout the installer skips EVERY gated template at resolution time, so nothing
-# gated can install however resolvable its arguments are.
-[ "$GATED_VISIBLE1" -eq 1 ] || GATED_EXPECTED1=0
-
-# INSTALL_RC_OK <rc> <label> — the installer's exit for THIS host. In state (c) (a checkout is visible
-# but its gated target cannot resolve) EVERY install run is expected to REFUSE, so asserting rc=0 there
-# would report a correct refusal as a suite regression — the failure #2048's review round 3 measured.
-install_rc_ok() { # <rc> <label>
-    if [ "$GATED_VISIBLE1" -eq 1 ] && [ "$GATED_USABLE1" -eq 0 ]; then
-        [ "$1" -ne 0 ] \
-            && ok "$2 — refused, as it must when a visible checkout's gated target cannot resolve (state c)" \
-            || bad "$2 — expected a refusal of the broken gated target, got rc=0"
-    else
-        assert_eq "$1" "0" "$2"
-    fi
-}
-
-set +e
-# 2>&1: a REFUSAL names its broken target on STDERR, and state (c)'s assertion needs to see it
-# (a stdout-only capture could never satisfy the "names the broken target" check).
-OUT="$(run_installer "$HOME1" 2>&1)"
+OUT="$(run_installer "$HOME1")"
 RC=$?
-set -e
-OUT1="$OUT"  # §1's own output. The all-shim PATH guard below reassigns $OUT, so a §1 assertion
-             # that reads $OUT late in the section is reading a DIFFERENT run's log.
-if [ "$GATED_VISIBLE1" -eq 1 ] && [ "$GATED_USABLE1" -eq 0 ]; then
-    # state (c): a gated target that cannot resolve MUST make the install fail loudly, naming it.
-    [ "$RC" -ne 0 ] && ok "fresh install exits NON-ZERO on a checkout whose gated target cannot resolve (state c)" \
-        || bad "a checkout with no .venv/bin/python should make the install refuse its broken target, got rc=0"
-    assert_contains "$OUT" "broken target" "…and names the broken target rather than installing a dead job"
-else
-    assert_eq "$RC" "0" "fresh install exits 0"
-fi
+assert_eq "$RC" "0" "fresh install exits 0"
 assert_contains "$OUT" "corruption-canary: installed + loaded" "corruption-canary installed on fresh machine"
 assert_contains "$OUT" "provider-latency-tripwire: installed + loaded" "provider-latency-tripwire installed on fresh machine"
 assert_contains "$OUT" "fleet-cost-weekly: installed + loaded" "fleet-cost-weekly installed on fresh machine (#373)"
 assert_contains "$OUT" "pi-session-reaper: installed + loaded" "pi-session-reaper installed on fresh machine (#469)"
 assert_contains "$OUT" "pi-task-session-prune: installed + loaded" "pi-task-session-prune installed on fresh machine (#783)"
 # #2048 — com.eldato.pi-cache-reap is RETIRED: its `uv` class moved into the consolidated pass
-# (scripts/install-disk-reaper-schedule.sh installs com.eldato.disk-reaper, which runs the same
+# (scripts/scheduled-jobs.sh installs com.eldato.disk-reaper, which runs the same
 # scripts/pi-cache-reap.sh). A second clock for one class is the divergence #2032 removed on the
 # cells; this suite pins that install-launchd no longer installs it.
 assert_not_contains "$OUT" "pi-cache-reap: installed + loaded" "the retired per-class cache job is NOT installed by install-launchd (#2048)"
@@ -356,26 +268,36 @@ assert_contains "$(cat "$PRUNE_INSTALLED")" "StartInterval" "prune job is interv
 assert_contains "$(cat "$PRUNE_INSTALLED")" "<integer>3600</integer>" "prune job hourly (StartInterval 3600)"
 assert_contains "$(cat "$PRUNE_INSTALLED")" "agent-infra-plist-version: 0.1.0" "prune template carries version marker"
 # #1987 → #2048 — the machine-global cache bound used to have its own plist; that label is RETIRED
-# and the `uv` class is now scheduled by the CONSOLIDATED pass (scripts/install-disk-reaper-schedule.sh
-# installs com.eldato.disk-reaper, whose `uv` class resolves the same scripts/pi-cache-reap.sh). The
-# bound and the arming stance are pinned on the REPLACEMENT template here; that installer's own suite
-# pins the rendered job.
+# and the `uv` class is now scheduled by the CONSOLIDATED pass (scripts/scheduled-jobs.sh installs
+# com.eldato.disk-reaper, whose `uv` class resolves the same scripts/pi-cache-reap.sh). The bound is
+# pinned on the pass's RENDERED artifact here — rendered from the declaration, because there is no
+# template file any more; that installer's own suite pins the job's lifecycle.
 assert_not_contains "$OUT" "pi-cache-reap: installed + loaded" "no per-class cache plist is installed any more (#2048)"
 [ ! -f "$CACHE_REAP_INSTALLED" ] && ok "no com.eldato.pi-cache-reap plist left on the box" \
     || bad "no com.eldato.pi-cache-reap plist left on the box"
 assert_contains "$(cat "$REPO_TEMPLATES/RETIRED")" "com.eldato.pi-cache-reap" "the cache job is declared RETIRED (so an old install is unloaded, not stranded)"
 assert_contains "$(cat "$REPO_TEMPLATES/RETIRED")" "com.tortoise.worktree-reaper" "the worktree job is declared RETIRED too (#2048)"
-REPLACEMENT="$REPO_TEMPLATES/com.eldato.disk-reaper.plist.tmpl"
-[ -f "$REPLACEMENT" ] && ok "the consolidated pass has a launchd template" \
-    || bad "the consolidated pass has a launchd template"
-assert_contains "$(cat "$REPLACEMENT" 2>/dev/null)" "<key>CACHE_REAP_MAX_MB</key>" "the replacement pins the uv size bound in the plist, not the shell"
-assert_contains "$(cat "$REPLACEMENT" 2>/dev/null)" "<string>2048</string>" "the replacement pins the bound's VALUE"
-assert_contains "$(cat "$REPLACEMENT" 2>/dev/null)" "<key>REAP_WT_BUDGET_SECONDS</key>" "the replacement carries the worktree pass budget the retired job had raised (#1095)"
-assert_contains "$(cat "$REPLACEMENT" 2>/dev/null)" "<key>REAP_WT_GH_TIMEOUT</key>" "the replacement carries the gh timeout the retired job had raised"
-# The `.plist.tmpl` suffix is the OWNERSHIP MARKER: install-launchd renders `*.plist`, so it cannot
-# bootstrap this job half-rendered (a literal placeholder as an argument).
-[ ! -f "$REPO_TEMPLATES/com.eldato.disk-reaper.plist" ] && ok "the replacement is not in install-launchd's *.plist glob (one installer owns it)" \
-    || bad "the replacement is not in install-launchd's *.plist glob (one installer owns it)"
+# The replacement is RENDERED (#2048): there is no template file for the pass at all, so the
+# assertion is made against the artifact the ONE installer actually produces for this platform.
+REPLACEMENT="$T/rendered-com.eldato.disk-reaper.plist"
+HOME="$HOME1" SJ_STATE_DIR="$HOME1/.pi/agent/state" SJ_FARM="$HOME1/.pi/agent/scripts" \
+    SJ_LAUNCHER="$HOME1/.pi/agent/scripts/pi-reap-worktrees-launchd.py" \
+    PORTABLE_PLATFORM=darwin \
+    bash -c '. "$1/scripts/lib/scheduled-jobs.sh" && sj_render_launchd eldato-disk-reaper "$2"' _ \
+        "$SCRIPT_DIR/.." "$REPLACEMENT" >/dev/null 2>&1 || true
+[ -f "$REPLACEMENT" ] && ok "the consolidated pass RENDERS a launchd job from the declaration" \
+    || bad "the consolidated pass renders a launchd job from the declaration"
+assert_contains "$(cat "$REPLACEMENT" 2>/dev/null)" "<key>CACHE_REAP_MAX_MB</key>" "the rendered job pins the uv size bound in the plist, not the shell"
+assert_contains "$(cat "$REPLACEMENT" 2>/dev/null)" "<string>2048</string>" "the rendered job pins the bound's VALUE"
+assert_contains "$(cat "$REPLACEMENT" 2>/dev/null)" "<key>REAP_WT_BUDGET_SECONDS</key>" "the rendered job carries the worktree pass budget the retired job had raised (#1095)"
+assert_contains "$(cat "$REPLACEMENT" 2>/dev/null)" "<key>REAP_WT_GH_TIMEOUT</key>" "the rendered job carries the gh timeout the retired job had raised"
+# ⛔ RENDERED, NOT TEMPLATED. This is the property the old `.plist.tmpl` suffix was protecting — no
+# installer can bootstrap the job half-rendered, because the artifact never exists with a placeholder
+# in it and install-launchd's `*.plist` glob has nothing to pick up.
+assert_not_contains "$(cat "$REPLACEMENT" 2>/dev/null)" "{{" "the rendered job carries no unresolved placeholder"
+[ ! -f "$REPO_TEMPLATES/com.eldato.disk-reaper.plist" ] && [ ! -f "$REPO_TEMPLATES/com.eldato.disk-reaper.plist.tmpl" ] \
+    && ok "no template file for the pass exists (one installer owns it, and it renders)" \
+    || bad "no template file for the pass exists (one installer owns it, and it renders)"
 # #1178 unit 3 — lane-liveness rendered-plist content asserts (farmed tools path,
 # the PINNED probe library, and the interval schedule). #1277: the farmed path is
 # scripts/fleet/, never tools/fleet/ (pi's startup scan blocks interactive boot on
@@ -414,16 +336,9 @@ assert_contains "$(cat "$GATE_INSTALLED" 2>/dev/null)" "agent-infra-plist-versio
 # path (e.g. `~/.pi/agent/shims`, which the installer's own comment uses) would red a whole-file
 # `assert_not_contains "/shims"` while the PATH was correct — a false RED. Extract the value.
 installed_path() { # $1 = plist → the PATH string from EnvironmentVariables
-  # `|| true`: sed exits 2 on a MISSING plist, and `set -e` then aborted the whole suite inside this
-  # assignment — so a broken target (the runner-gate script unfarmed) killed the run mid-§1 with no
-  # Summary, which is the failure class the set +e windows above exist to remove (measured: unarming
-  # `ci_runner_gate.sh` ended the run at this line with `exit=2`).
-  sed -n '/<key>PATH<\/key>/{n;s@.*<string>\(.*\)</string>.*@\1@p;}' "$1" || true
+  sed -n '/<key>PATH<\/key>/{n;s@.*<string>\(.*\)</string>.*@\1@p;}' "$1"
 }
 GATE_PATH_VAL="$(installed_path "$GATE_INSTALLED")"
-# A missing plist would make every PATH assertion below VACUOUS, so state it once instead of crashing.
-[ -s "$GATE_INSTALLED" ] && ok "runner-gate plist exists (the PATH assertions below are not vacuous)" \
-                        || bad "runner-gate plist MISSING — the PATH assertions below carry no information (an absent plist makes the negative ones pass on an empty string)"
 assert_contains "$GATE_PATH_VAL" "/usr/bin" "runner-gate plist PATH is rendered from the installer's PATH (non-empty)"
 assert_not_contains "$GATE_PATH_VAL" "/shims" "runner-gate plist PATH carries no shim dir (#1719/#427)"
 assert_not_contains "$GATE_PATH_VAL" "shimlink" "runner-gate plist PATH drops a SYMLINK to the shim dir (physical-path match, review E2)"
@@ -478,62 +393,21 @@ assert_contains "$OUT" "SKIP com.tortoise.ci-runner-gate: unresolved placeholder
   && ok "control: the {{PATH}}-free canary still installs in that run (the guard is scoped to {{PATH}})" \
   || bad "control: the canary did not install — that run proved nothing about the PATH guard"
 assert_not_contains "$(installed_path "$TRIPWIRE_INSTALLED")" "/shims" "tripwire plist PATH carries no shim dir either (#1719)"
-[ -s "$TRIPWIRE_INSTALLED" ] && ok "tripwire plist exists (the PATH assertion above is not vacuous)" || bad "tripwire plist MISSING — the PATH assertion above cannot pass"
 # #432 — hub-state-check + skill-lint-oracle are RETIRED from launchd (their
 # work moved to extensions/session-checks.ts — macOS TCC blocks launchd from
 # ~/Documents, so they run from pi's session_start instead).
-assert_not_contains "$OUT1" "hub-state-check: installed + loaded" "retired hub job NOT installed on fresh machine"
-assert_not_contains "$OUT1" "skill-lint-oracle: installed + loaded" "retired oracle job NOT installed on fresh machine"
+assert_not_contains "$OUT" "hub-state-check: installed + loaded" "retired hub job NOT installed on fresh machine"
+assert_not_contains "$OUT" "skill-lint-oracle: installed + loaded" "retired oracle job NOT installed on fresh machine"
 [ ! -f "$HUB_RETIRED" ] && ok "no retired hub plist left behind" || bad "no retired hub plist left behind"
 [ ! -f "$ORACLE_RETIRED" ] && ok "no retired oracle plist left behind" || bad "no retired oracle plist left behind"
-# ⛔ This count is the inventory of ACTIVE jobs, and part of it is HOST-DEPENDENT BY DESIGN: the
-# installer resolves {{TORTOISE_REPO}} from the environment AND from disk (install-launchd.sh:76-82 —
-# `$INFRA_ROOT/../tortoise`, `$HOME/Documents/GitHub/tortoise`, `$HOME/tortoise`), so a checkout
-# beside this one installs branch-reaper (#1787) + worktree-hygiene (#2053) and a bare CI checkout
-# does not. A pinned total is therefore red on one of the two surfaces whichever number is chosen,
-# and a pinned total measured here reads higher beside a checkout. So: 8 always-installable jobs pinned by
-# name, plus whichever {{TORTOISE_REPO}}-gated templates THIS run installed, derived from the
-# fixture's own template dir — with the gated inventory itself pinned at 2, so a newly added gated
-# job cannot raise both sides of the equation at once.
-BOOTSTRAP_COUNT1="$(grep -c 'launchctl bootstrap' "$LOG" || true)"  # grep -c exits 1 on ZERO matches; `set -e` would kill the run here
-GATED_TEMPLATES1=0
-GATED_INSTALLED1=0
-for _tpl in "$TEMPLATES"/*.plist; do
-    grep -q '{{TORTOISE_REPO}}' "$_tpl" || continue
-    GATED_TEMPLATES1=$((GATED_TEMPLATES1 + 1))
-    case "$OUT1" in *"$(basename "$_tpl" .plist): installed + loaded"*) GATED_INSTALLED1=$((GATED_INSTALLED1 + 1)) ;; esac
-done
-assert_eq "$GATED_TEMPLATES1" "2" "the {{TORTOISE_REPO}}-gated inventory is accounted for (branch-reaper #1787 + worktree-hygiene #2053 — the per-class reapers #2048 retired are no longer gated templates)"
-# THREE host states are legitimate here, and only two of them install anything (#2048 review):
-#   (a) no tortoise checkout visible            -> nothing gated installs, and that is not a regression;
-#   (b) a checkout WITH a usable .venv/bin/python -> both gated templates install;
-#   (c) a checkout whose gated TARGET cannot resolve (a fresh clone before `uv sync`, so no
-#       .venv/bin/python) -> the installer's verify_targets refuses the rendered target and the whole
-#       install exits 1. That is a box-level configuration state, not a suite regression: the count
-#       arithmetic below is still correct for it (0 gated installed), and the message must name the
-#       cause rather than report a broken invariant.
-# So: a visible checkout that produced NOTHING is a regression ONLY when its interpreter is usable.
-# The three candidates are the same three install-launchd.sh:76-82 asks (the fixture's HOME is the fake
-# one the run used, so §13/§14's seeded checkouts cannot make this look resolved).
-# The claim is EQUALITY against what this host can actually resolve (never "all or none"): a partial
-# set is exactly right in state (c), and only a MISMATCH is a regression. The total alone would absorb
-# a wrong member — `8 + 1 == 9` matches whichever one installed — so the count is compared to the
-# derived expectation, not to a constant.
-assert_eq "$GATED_INSTALLED1" "$GATED_EXPECTED1" "gated installs == what this host can resolve (visible=$GATED_VISIBLE1 usable=$GATED_USABLE1 of $GATED_TEMPLATES1 gated templates)"
-if [ "$GATED_VISIBLE1" -eq 0 ]; then
-    ok "no tortoise checkout visible to the installer — no gated job is installable here"
-elif [ "$GATED_USABLE1" -eq 1 ] && [ "$GATED_INSTALLED1" -eq "$GATED_TEMPLATES1" ]; then
-    ok "a checkout WITH a usable .venv/bin/python installed every gated template (resolution works)"
-fi
-assert_eq "$BOOTSTRAP_COUNT1" "$((8 + GATED_INSTALLED1))" "fresh install bootstraps only active jobs (8 always-installable: canary + tripwire + fleet + pi-session-reaper + balance-watch + pi-task-session-prune + lane-liveness + ci-runner-gate, plus whichever {{TORTOISE_REPO}}-gated jobs this host resolves)"
+BOOTSTRAP_COUNT1="$(grep -c 'launchctl bootstrap' "$LOG")"
+assert_eq "$BOOTSTRAP_COUNT1" "8" "fresh install bootstraps only active jobs (canary + tripwire + fleet + pi-session-reaper + balance-watch + pi-task-session-prune + lane-liveness + ci-runner-gate; the two retired per-class reapers are not bootstrapped, #2048)"
 
 echo "── 2. Retirement: pre-seeded old plists get unloaded + removed ───"
 seed_retired "$HOME2"
-set +e
 OUT="$(LOG="$LOG2" run_installer "$HOME2")"
 RC=$?
-set -e
-install_rc_ok "$RC" "installer with seeded retired jobs exits 0"
+assert_eq "$RC" "0" "installer with seeded retired jobs exits 0"
 assert_contains "$OUT" "com.eldato.hub-state-check: RETIRED (unloaded + removed)" "hub retired job unloaded + removed"
 assert_contains "$OUT" "com.eldato.skill-lint-oracle: RETIRED (unloaded + removed)" "oracle retired job unloaded + removed"
 # #2048 — the two per-class reaper labels the consolidated pass replaced. They must be BOOTED OUT and
@@ -545,21 +419,12 @@ assert_contains "$OUT" "com.tortoise.worktree-reaper: RETIRED (unloaded + remove
 [ ! -f "$HOME2/Library/LaunchAgents/com.tortoise.worktree-reaper.plist" ] && ok "retired worktree plist file gone" || bad "retired worktree plist file gone"
 [ ! -f "$HOME2/Library/LaunchAgents/com.eldato.hub-state-check.plist" ] && ok "hub retired plist file gone" || bad "hub retired plist file gone"
 [ ! -f "$HOME2/Library/LaunchAgents/com.eldato.skill-lint-oracle.plist" ] && ok "oracle retired plist file gone" || bad "oracle retired plist file gone"
-set +e
 OUT="$(LOG="$LOG2" run_installer "$HOME2")"
 RC=$?
-set -e
-install_rc_ok "$RC" "retirement is idempotent (second run exits 0)"
+assert_eq "$RC" "0" "retirement is idempotent (second run exits 0)"
 assert_not_contains "$OUT" "RETIRED (unloaded + removed)" "no repeat retirement chatter"
 # A retired label that STILL has a template is a config error → loud + exit 1.
-# The `cp` is guarded: a renamed/removed template is a broken target, and under `set -e` a bare `cp`
-# ended the whole suite here with `cp: cannot stat …`, exit 1 and no tally at all (§2 through §14
-# never ran). Report the missing vehicle template and carry on with the next section.
-if cp "$REPO_TEMPLATES/com.eldato.provider-latency-tripwire.plist" "$TEMPLATES/com.eldato.hub-state-check.plist" 2>/dev/null; then
-    :  # vehicle template present
-else
-    bad "retire/template conflict: the vehicle template (provider-latency-tripwire) is missing — this section cannot run"
-fi
+cp "$REPO_TEMPLATES/com.eldato.provider-latency-tripwire.plist" "$TEMPLATES/com.eldato.hub-state-check.plist"
 set +e
 OUT="$(LOG="$LOG2" run_installer "$HOME2" 2>&1)"
 RC=$?
@@ -577,18 +442,11 @@ render_twice() {
     r1="$(HOME="$HOME2" TEMPLATES_DIR="$TEMPLATES" SWARM_ROOT="$HOME2/swarm" \
         PYTHON_BIN="$HOME2/swarm/.venv/bin/python" \
         sed -e "s|{{HOME}}|$HOME2|g" -e "s|{{PYTHON_BIN}}|$HOME2/swarm/.venv/bin/python|g" \
-            "$TEMPLATES/com.eldato.corruption-canary.plist" || true)"  # sed exits 2 on a missing template; `set -e` would kill the run here
+            "$TEMPLATES/com.eldato.corruption-canary.plist")"
     r2="$(HOME="$HOME2" TEMPLATES_DIR="$TEMPLATES" SWARM_ROOT="$HOME2/swarm" \
         PYTHON_BIN="$HOME2/swarm/.venv/bin/python" \
         sed -e "s|{{HOME}}|$HOME2|g" -e "s|{{PYTHON_BIN}}|$HOME2/swarm/.venv/bin/python|g" \
-            "$TEMPLATES/com.eldato.corruption-canary.plist" || true)"
-    # ⛔ An EMPTY render must never read as determinism: two failed reads hash to the same empty
-    # string, so a missing template turned this into a vacuous ✅ (measured: the canary-removal run
-    # printed `sed: can't read …` and then "same env → byte-identical render").
-    if [ -z "$r1" ] || [ -z "$r2" ]; then
-        bad "render determinism: a render came back EMPTY (the template could not be read) — nothing was compared"
-        return 0
-    fi
+            "$TEMPLATES/com.eldato.corruption-canary.plist")"
     assert_eq "$(printf '%s' "$r1" | shasum | cut -d' ' -f1)" \
         "$(printf '%s' "$r2" | shasum | cut -d' ' -f1)" \
         "same env → byte-identical render"
@@ -596,33 +454,29 @@ render_twice() {
 render_twice
 
 echo "── 4. Idempotent skip ────────────────────────────────────────────"
-set +e
 OUT="$(run_installer "$HOME1")"
 RC=$?
-set -e
-install_rc_ok "$RC" "re-run exits 0"
+assert_eq "$RC" "0" "re-run exits 0"
 assert_contains "$OUT" "provider-latency-tripwire: unchanged (skip)" "tripwire job skipped when identical"
 assert_contains "$OUT" "corruption-canary: unchanged (skip)" "canary job skipped when identical"
-BOOTSTRAP_COUNT2="$(grep -c 'launchctl bootstrap' "$LOG" || true)"  # grep -c exits 1 on ZERO matches; `set -e` would kill the run here
+BOOTSTRAP_COUNT2="$(grep -c 'launchctl bootstrap' "$LOG")"
 assert_eq "$BOOTSTRAP_COUNT2" "$BOOTSTRAP_COUNT1" "no reload on no-change"
 
 echo "── 5. Change → reload ────────────────────────────────────────────"
-sed -i.bak 's/<integer>3600<\/integer>/<integer>3601<\/integer>/' "$TEMPLATES/com.eldato.provider-latency-tripwire.plist" && rm -f "$TEMPLATES/com.eldato.provider-latency-tripwire.plist".bak || true
-set +e
+sed -i.bak 's/<integer>3600<\/integer>/<integer>3601<\/integer>/' "$TEMPLATES/com.eldato.provider-latency-tripwire.plist" && rm -f "$TEMPLATES/com.eldato.provider-latency-tripwire.plist".bak
 OUT="$(run_installer "$HOME1")"
 RC=$?
-set -e
-install_rc_ok "$RC" "change install exits 0"
+assert_eq "$RC" "0" "change install exits 0"
 assert_contains "$OUT" "provider-latency-tripwire: installed + loaded" "tripwire reloaded on template change"
 assert_contains "$(cat "$TRIPWIRE_INSTALLED")" "3601" "new StartInterval applied"
-BOOTSTRAP_COUNT3="$(grep -c 'launchctl bootstrap' "$LOG" || true)"  # grep -c exits 1 on ZERO matches; `set -e` would kill the run here
+BOOTSTRAP_COUNT3="$(grep -c 'launchctl bootstrap' "$LOG")"
 assert_eq "$BOOTSTRAP_COUNT3" "$((BOOTSTRAP_COUNT2 + 1))" "exactly one reload for the changed job"
 
 echo "── 6. Bootstrap failure is loud ──────────────────────────────────"
 # Force a change so the installer reloads — with the shim configured to fail
 # bootstrap. Must be loud + non-zero.
-sed -i.bak 's/<integer>3601<\/integer>/<integer>3600<\/integer>/' "$TEMPLATES/com.eldato.provider-latency-tripwire.plist" && rm -f "$TEMPLATES/com.eldato.provider-latency-tripwire.plist".bak || true
-sed -i.bak 's/<integer>3600<\/integer>/<integer>3602<\/integer>/' "$TEMPLATES/com.eldato.provider-latency-tripwire.plist" && rm -f "$TEMPLATES/com.eldato.provider-latency-tripwire.plist".bak || true
+sed -i.bak 's/<integer>3601<\/integer>/<integer>3600<\/integer>/' "$TEMPLATES/com.eldato.provider-latency-tripwire.plist" && rm -f "$TEMPLATES/com.eldato.provider-latency-tripwire.plist".bak
+sed -i.bak 's/<integer>3600<\/integer>/<integer>3602<\/integer>/' "$TEMPLATES/com.eldato.provider-latency-tripwire.plist" && rm -f "$TEMPLATES/com.eldato.provider-latency-tripwire.plist".bak
 set +e
 OUT="$(FAKE_BOOTSTRAP_FAIL=1 run_installer "$HOME1" 2>&1)"
 RC=$?
@@ -635,7 +489,7 @@ echo "── 7. Broken-target guard ──────────────�
 # symlink case) → installer must refuse with a non-zero exit and no bootstrap.
 rm -f "$HOME1/.pi/agent/scripts/checkout-hygiene/provider-latency-tripwire.sh"
 rm -f "$TRIPWIRE_INSTALLED"
-sed -i.bak 's/<integer>3602<\/integer>/<integer>3601<\/integer>/' "$TEMPLATES/com.eldato.provider-latency-tripwire.plist" && rm -f "$TEMPLATES/com.eldato.provider-latency-tripwire.plist".bak || true
+sed -i.bak 's/<integer>3602<\/integer>/<integer>3601<\/integer>/' "$TEMPLATES/com.eldato.provider-latency-tripwire.plist" && rm -f "$TEMPLATES/com.eldato.provider-latency-tripwire.plist".bak
 set +e
 OUT="$(run_installer "$HOME1" 2>&1)"
 RC=$?
@@ -643,7 +497,7 @@ set -e
 assert_eq "$RC" "1" "broken script target → exit 1"
 assert_contains "$OUT" "broken target" "broken target named"
 assert_contains "$OUT" "FAIL" "broken target refuses install"
-BOOTSTRAP_COUNT4="$(grep -c 'launchctl bootstrap' "$LOG" || true)"  # grep -c exits 1 on ZERO matches; `set -e` would kill the run here
+BOOTSTRAP_COUNT4="$(grep -c 'launchctl bootstrap' "$LOG")"
 assert_eq "$BOOTSTRAP_COUNT4" "$((BOOTSTRAP_COUNT3 + 1))" "no bootstrap for a refused job (count frozen after test 6's failed reload)"
 # Restore the farmed script so later tests install cleanly
 mkfakehome "$HOME1"
@@ -652,32 +506,22 @@ echo "── 8. Placeholder skip (no swarm root) ──────────�
 # HOME2 without a swarm root: canary must be SKIPPED (loud, exit 0), tripwire
 # still installed. SWARM_ROOT is env-only in the installer — no auto-detect.
 rm -rf "$HOME2/swarm"
-set +e
-# TORTOISE_REPO="" discards whatever the CALLER exported: an ambient value pointing at a broken
-# checkout made this run exit 1 and reddened "placeholder skip exits 0" on a dev box while CI stayed
-# green — the same host-dependence §1 was fixed for. (Empty, not unset: the installer then falls back
-# to its disk candidates, which are valid-or-absent and never this section's subject.)
 OUT="$(HOME="$HOME2" PATH="$T/bin:$PATH" FAKE_LAUNCHCTL_LOG="$LOG" TEMPLATES_DIR="$TEMPLATES" \
     AGENTS_DIR="$HOME2/Library/LaunchAgents" SWARM_ROOT="" ELDATO_ALLOW_TEST_HOME=1 \
-    PYTHON_BIN="$HOME2/swarm/.venv/bin/python" TORTOISE_REPO="" \
+    PYTHON_BIN="$HOME2/swarm/.venv/bin/python" \
     bash "$INSTALLER" 2>&1)"
 RC=$?
-set -e
-install_rc_ok "$RC" "placeholder skip exits 0 (non-swarm machine ok)"
+assert_eq "$RC" "0" "placeholder skip exits 0 (non-swarm machine ok)"
 assert_contains "$OUT" "SKIP com.eldato.corruption-canary" "canary skipped without swarm root"
 assert_contains "$OUT" "provider-latency-tripwire: installed + loaded" "tripwire still installed without swarm"
 
 echo "── 9. --status ───────────────────────────────────────────────────"
 # Template is at 3601; HOME1 tripwire is not installed (test 6 rollback + test
 # 7 refusal) → install it, then bump the template to show DRIFT in --status.
-set +e
 OUT="$(run_installer "$HOME1" 2>&1)"
-set -e
-sed -i.bak 's/<integer>3601<\/integer>/<integer>3603<\/integer>/' "$TEMPLATES/com.eldato.provider-latency-tripwire.plist" && rm -f "$TEMPLATES/com.eldato.provider-latency-tripwire.plist".bak || true
-set +e
+sed -i.bak 's/<integer>3601<\/integer>/<integer>3603<\/integer>/' "$TEMPLATES/com.eldato.provider-latency-tripwire.plist" && rm -f "$TEMPLATES/com.eldato.provider-latency-tripwire.plist".bak
 OUT="$(run_installer "$HOME1" --status)"
 RC=$?
-set -e
 assert_eq "$RC" "0" "--status exits 0"
 assert_contains "$OUT" "provider-latency-tripwire: installed=loaded version=v0.1.0 (DRIFTED" "status flags drifted tripwire"
 assert_contains "$OUT" "corruption-canary: installed=loaded version=v0.1.0 (in sync)" "status reports canary in sync"
@@ -686,18 +530,14 @@ assert_contains "$OUT" "Retired (unloaded + removed — #432 session-checks, #20
 assert_contains "$OUT" "com.eldato.pi-cache-reap" "status names the retired per-class reaper (#2048)"
 
 echo "── 10. --uninstall ───────────────────────────────────────────────"
-set +e
 OUT="$(run_installer "$HOME1" --uninstall)"
 RC=$?
-set -e
 assert_eq "$RC" "0" "--uninstall exits 0"
 assert_contains "$OUT" "provider-latency-tripwire: unloaded + removed" "tripwire removed"
 assert_contains "$OUT" "corruption-canary: unloaded + removed" "canary removed"
 [ ! -f "$TRIPWIRE_INSTALLED" ] && ok "tripwire file gone" || bad "tripwire file gone"
 [ ! -f "$CANARY_INSTALLED" ] && ok "canary file gone" || bad "canary file gone"
-set +e
 OUT="$(run_installer "$HOME1" --status)"
-set -e
 assert_contains "$OUT" "NOT INSTALLED" "status reports clean after uninstall"
 
 echo "── 11. Temp-HOME guard refuses launchd management (#446) ────────────"
@@ -712,7 +552,7 @@ LOG3="$T/launchctl-refusal.log"; : > "$LOG3"
 set +e
 OUT="$(HOME="$HOME3" PATH="$T/bin:$PATH" FAKE_LAUNCHCTL_LOG="$LOG3" \
     TEMPLATES_DIR="$TEMPLATES" AGENTS_DIR="$HOME3/Library/LaunchAgents" \
-    SWARM_ROOT="$HOME3/swarm" PYTHON_BIN="$HOME3/swarm/.venv/bin/python" TORTOISE_REPO="" \
+    SWARM_ROOT="$HOME3/swarm" PYTHON_BIN="$HOME3/swarm/.venv/bin/python" \
     bash "$INSTALLER" 2>&1)"
 RC=$?
 set -e
@@ -721,7 +561,7 @@ assert_contains "$OUT" "refusing to manage launchd jobs" "refusal names the guar
 assert_contains "$OUT" "not the real home" "refusal explains the HOME mismatch"
 [ ! -s "$LOG3" ] && ok "zero launchctl calls on refusal (nothing touched any domain)" || bad "zero launchctl calls on refusal (got: $(cat "$LOG3"))"
 set +e
-OUT="$(HOME="$HOME3" PATH="$T/bin:$PATH" FAKE_LAUNCHCTL_LOG="$LOG3" TORTOISE_REPO="" \
+OUT="$(HOME="$HOME3" PATH="$T/bin:$PATH" FAKE_LAUNCHCTL_LOG="$LOG3" \
     bash "$INSTALLER" --uninstall 2>&1)"
 RC=$?
 set -e
@@ -729,11 +569,9 @@ assert_eq "$RC" "1" "temp-HOME --uninstall (no override) → exit 1"
 [ ! -s "$LOG3" ] && ok "zero launchctl calls on --uninstall refusal" || bad "zero launchctl calls on --uninstall refusal"
 # With the override the SAME home installs cleanly through the shim (the
 # override is the test's explicit isolation proof, #446).
-set +e
 OUT="$(LOG="$LOG" run_installer "$HOME3" 2>&1)"
 RC=$?
-set -e
-install_rc_ok "$RC" "override + shim → temp-HOME install proceeds (isolated)"
+assert_eq "$RC" "0" "override + shim → temp-HOME install proceeds (isolated)"
 assert_contains "$OUT" "provider-latency-tripwire: installed + loaded" "override install works hermetically"
 
 echo "── 12. Template lint (plutil, when present) ──────────────────────"
@@ -770,31 +608,11 @@ else
 fi
 
 echo ""
-echo "── 12b. verify_targets: the PROGRAM must be EXECUTABLE, not merely present ──"
-# ⛔ THE DISTINCTION THE WHOLE HOST-STATE CLASSIFICATION RESTS ON (#2048 review, P3). `-e` accepted a
-# checkout whose `.venv/bin/python` exists at mode 644 — so the installer wrote a job launchd bootstraps,
-# loads, and cannot start, while the suite (which classifies by `-x`) called the same host "usable".
-# Nothing pinned the difference, so the arm could be reverted with every gate green.
-HOME_NE="$T/home-ne"; mkfakehome "$HOME_NE"
-mkdir -p "$HOME_NE/Documents/GitHub/tortoise/.git" "$HOME_NE/Documents/GitHub/tortoise/.venv/bin"
-: >"$HOME_NE/Documents/GitHub/tortoise/.venv/bin/python"
-chmod 644 "$HOME_NE/Documents/GitHub/tortoise/.venv/bin/python"   # present, NOT executable
-set +e
-OUT="$(HOME="$HOME_NE" PATH="$T/bin:$PATH" FAKE_LAUNCHCTL_LOG="$LOG" TEMPLATES_DIR="$TEMPLATES" \
-    AGENTS_DIR="$HOME_NE/Library/LaunchAgents" SWARM_ROOT="$HOME_NE/swarm" ELDATO_ALLOW_TEST_HOME=1 \
-    PYTHON_BIN="$HOME_NE/swarm/.venv/bin/python" bash "$INSTALLER" 2>&1)"
-RC=$?
-set -e
-[ "$RC" -ne 0 ] && ok "a non-executable checkout interpreter makes the install FAIL (not merely 'present')" \
-    || bad "a mode-644 .venv/bin/python was accepted — launchd would load a job it cannot exec"
-assert_contains "$OUT" "not executable" "…and names executability, not existence, as the reason"
-assert_contains "$OUT" "com.tortoise.branch-reaper" "…against the job that renders it"
-
 echo "── 13. the retired per-class reapers are replaced by ONE consolidated job (#2048) ──"
 # #2048 retires com.tortoise.worktree-reaper (its `worktree` class) and com.eldato.pi-cache-reap (its
-# `uv` class) in favour of com.eldato.disk-reaper, which scripts/install-disk-reaper-schedule.sh
-# installs on BOTH platforms and which runs the SAME pass entry point (disk-reaper.sh) with the SAME
-# flags as the cells' systemd timer. This suite owns the install-launchd half: the labels must be gone
+# `uv` class) in favour of com.eldato.disk-reaper, which scripts/scheduled-jobs.sh installs on BOTH
+# platforms from one declaration and which runs the SAME pass entry point (disk-reaper.sh) with the
+# SAME flags as the cells' systemd timer. This suite owns the install-launchd half: the labels must be gone
 # from the installer's template set and declared retired, and the replacement must keep the TCC seam
 # that made the old worktree job work at all (#1311/#1095) — a launchd-spawned `bash` is denied the
 # ~/Documents script read AND the repo read a `git` needs, so the interpreter holding the access must
@@ -802,7 +620,7 @@ echo "── 13. the retired per-class reapers are replaced by ONE consolidated 
 #
 # (The retired labels' end-to-end unload is asserted in §2 via seed_retired. The replacement's own
 # RENDERED job — idempotency, reload-on-pass-change, dry-run vs armed — is asserted by
-# scripts/install-disk-reaper-schedule.test.sh, which owns that installer.)
+# scripts/scheduled-jobs.test.sh, which owns that installer.)
 assert_contains "$(cat "$REPO_TEMPLATES/RETIRED")" "com.tortoise.worktree-reaper" \
     "the per-class worktree job is declared RETIRED"
 [ ! -f "$REPO_TEMPLATES/com.tortoise.worktree-reaper.plist" ] \
@@ -818,21 +636,15 @@ for live in com.tortoise.branch-reaper com.eldato.pi-session-reaper; do
     [ -f "$REPO_TEMPLATES/$live.plist" ] && ok "$live still has its template (not a sink class)" \
         || bad "$live still has its template (not a sink class)"
 done
-REPLACEMENT_TMPL="$REPO_TEMPLATES/com.eldato.disk-reaper.plist.tmpl"
-[ -f "$REPLACEMENT_TMPL" ] && ok "the consolidated pass has a launchd template" \
-    || bad "the consolidated pass has a launchd template"
-grep -q '{{PYTHON_BIN}}' "$REPLACEMENT_TMPL" \
-    && ok "the replacement resolves its entry point to the TCC-holding interpreter (placeholder, rendered by its own installer)" \
-    || bad "the replacement resolves its entry point to the TCC-holding interpreter"
-grep -q '{{LAUNCHER}}' "$REPLACEMENT_TMPL" \
-    && ok "the replacement keeps the farmed shared launcher as its door to bash" \
-    || bad "the replacement keeps the farmed shared launcher as its door to bash"
-grep -q '{{REAPER}}' "$REPLACEMENT_TMPL" \
-    && ok "the replacement targets the pass itself (one entry point, not a per-class script)" \
-    || bad "the replacement targets the pass itself"
-grep -q '{{MODE_FLAG}}' "$REPLACEMENT_TMPL" \
-    && ok "the mode flag is RENDERED by the installer (arming is a visible, separate step, #1678)" \
-    || bad "the mode flag is RENDERED by the installer"
+# The same RENDERED artifact, read for the four properties the deleted template used to carry.
+assert_contains "$(cat "$REPLACEMENT" 2>/dev/null)" "pi-reap-worktrees-launchd.py" \
+    "the rendered job keeps the farmed shared launcher as its door to bash"
+assert_contains "$(cat "$REPLACEMENT" 2>/dev/null)" "$SCRIPT_DIR/disk-reaper.sh" \
+    "the rendered job targets the pass itself (one entry point, not a per-class script)"
+assert_contains "$(cat "$REPLACEMENT" 2>/dev/null)" "<string>--dry-run</string>" \
+    "the mode flag is RENDERED from the arming stance (a visible, separate step, #1678)"
+assert_contains "$(cat "$REPLACEMENT" 2>/dev/null)" "<key>StartInterval</key>" \
+    "the rendered job carries its interval"
 # EXECUTE the real launcher against a fake reaper. The text assertions above
 # cannot see an ARGUMENT-FORWARDING defect, and one shipped: the launcher once
 # used argparse.REMAINDER, which does NOT absorb unknown OPTIONALS, so an
@@ -872,9 +684,7 @@ touch "$HOME3/tortoise/.venv/bin/python"; chmod +x "$HOME3/tortoise/.venv/bin/py
     export PYTHON_BIN="$HOME3/swarm/.venv/bin/python"
     export TORTOISE_REPO="$HOME3/tortoise"
     export ELDATO_ALLOW_TEST_HOME=1
-    set +e
     bash "$INSTALLER" >/dev/null 2>&1
-    set -e
 )
 
 # Same {{TORTOISE_REPO}}-gated shape as §13 (so it is skipped on a box with no

@@ -99,12 +99,9 @@ printf '#!/bin/sh\nmode="${GH_STUB_MODE:-ok}"\ncase "$1 $2" in\n  "auth login") 
 # scheduler cannot be armed — the bring-up must refuse that cell rather than certify it.
 export SYSTEMD_UNIT_DIR="$T/systemd-units"
 export SYSTEMCTL="$STUB/systemctl"
-# #2048 — the installer behind this check serves BOTH platforms, so it detects one from `uname`. This
-# suite is a LINUX CELL simulation (systemd units, a systemctl shim, no launchd anywhere), so the
-# platform is PINNED: without it, a run on a Mac takes the launchd arm and correctly refuses a temp HOME
-# (#446) — the cell's own gate would then look red for being run on the wrong host. Same pin, same
-# reason, as scripts/disk-reaper.test.sh.
-export DISK_REAPER_PLATFORM=linux
+# A cell is a LINUX box; this suite runs on the developer's Mac. Declaring the platform is what makes
+# the fixture a cell instead of a Mac (the bring-up forwards both seams to scripts/scheduled-jobs.sh).
+export PORTABLE_PLATFORM=linux
 printf '#!/bin/sh\ncase "$*" in\n  *is-enabled*) echo enabled ;;\n  *is-active*) echo active ;;\n  *list-timers*) echo "Mon 2026-10-19 00:30:00 UTC 1h left Sun 2026-10-18 23:30:00 UTC 3h ago eldato-disk-reaper.timer eldato-disk-reaper.service" ;;\n  *show*) echo 0 ;;\n  *enable*|*daemon-reload*) [ "${SYSTEMCTL_STUB_MODE:-ok}" = fail ] && exit 1; exit 0 ;;\n  *) exit 0 ;;\nesac\n' > "$STUB/systemctl"
 chmod +x "$STUB"/*   # glob, not an explicit "$STUB/git" "$STUB/pi" … list: the main-worktree-guard's script
                      # walker reads the literal token "$STUB/git" + a following $VAR as a NON-STATIC `git`
@@ -198,7 +195,10 @@ if grep -q -- '--apply' "$T/systemd-units/eldato-disk-reaper.service" 2>/dev/nul
 else
   bad "the installed unit is not armed — it would only ever report"
 fi
-if grep -q 'Environment=DISK_REAPER_REPOS=' "$T/systemd-units/eldato-disk-reaper.service" 2>/dev/null; then
+# ⛔ A NON-EMPTY VALUE, not merely the key: `Environment=DISK_REAPER_REPOS=` (empty) satisfies the
+# presence test while the installed pass fails closed on every run (measured: verdict=3, rc=3), which
+# is how this assertion used to pass over a cell that reclaimed nothing.
+if grep -qE 'Environment=DISK_REAPER_REPOS=..*' "$T/systemd-units/eldato-disk-reaper.service" 2>/dev/null; then
   ok "the unit carries the repos the venv/worktree classes scan"
 else
   bad "the unit carries no DISK_REAPER_REPOS — those classes would fail closed every hour"

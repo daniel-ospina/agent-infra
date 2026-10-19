@@ -58,6 +58,10 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT="$SCRIPT_DIR/cleanup-stale-branches.sh"
+# PORTABLE_LIB (#2048): every fixture COPY of the script lives under a throwaway repo, so its own
+# sibling `lib/portable.sh` lookup cannot resolve — the same seam PID_IDENTITY_LIB and BOUNDED_LIB
+# already provide. Exported once, so every `run_script`/`env …` invocation inherits it.
+export PORTABLE_LIB="$SCRIPT_DIR/lib/portable.sh"
 
 if ! command -v jq >/dev/null 2>&1; then
     echo "ERROR: jq is required by scripts/cleanup-stale-branches.sh's PR-map parse" >&2

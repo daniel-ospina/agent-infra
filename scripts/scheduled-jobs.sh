@@ -1,0 +1,618 @@
+#!/usr/bin/env bash
+# scheduled-jobs.sh — ONE command for the WHOLE scheduled set, on BOTH platforms (agent-infra#2048).
+#
+# BEFORE THIS FILE, there was no single verb. The cells got a systemd timer from a shell function in
+# `cloud-cell-bringup.sh`; the Mac got nothing (`launchctl list | grep -i reap` was empty, and the box
+# reached 90% used / 45 GB free before anyone noticed); and the schedules that DID exist on the Mac —
+# 35 of them — were machine state, installed by four different mechanisms in four report formats. The
+# requirement is the owner's standing one: ONE system that works across the laptop and the clouds,
+# self-heals, and needs no per-platform manual step.
+#
+# THIS IS THE ONE INSTALLER. Everything about a schedule is declared once in
+# `config/scheduled-jobs.declaration`; this command renders and converges it:
+#
+#   scheduled-jobs.sh install            # render + install + enable the set for THIS platform
+#   scheduled-jobs.sh status             # is the set installed, loaded, and did its last pass succeed
+#   scheduled-jobs.sh start|stop|restart # act on the SET (every declared job for this platform)
+#   scheduled-jobs.sh uninstall          # remove only what this command installed
+#   scheduled-jobs.sh parity             # the gate: declaration vs live host, both directions
+#   scheduled-jobs.sh list               # the declaration, as this platform sees it
+#
+# IDEMPOTENT. A second `install` changes nothing and reloads nothing: a job is re-rendered only when
+# its bytes differ, and reloaded only when its artifact OR the script it runs changed (#1738 — an edit
+# to a scheduled script is INERT until the job is reloaded; the loaded job keeps the program and
+# environment it was bootstrapped with).
+#
+# ⛔ ARMING IS AN OWNER DECISION AND IT IS VISIBLE (#1678, owner ruling 2026-10-11). The declaration's
+# `arming=` is the SHIPPED stance; `--apply` arms the selected jobs for this run and the flag lands
+# INSIDE the rendered unit/plist, so "is this armed" is answered by reading the installed artifact.
+# `--report-only` puts it back. Nothing about arming hides in an environment default.
+#
+# ⛔ AN UNSCHEDULED BOX IS A FAILURE, NOT AN ABSENCE. `install` ends by running the parity gate, and
+# `status` exits non-zero when a declared job for this platform is absent, inert, or last exited
+# non-zero. There is no code path here that reports success for "nothing installed".
+#
+# ⛔ THIS COMMAND DOES NOT TAKE ANOTHER OWNER'S JOB. A `managed=no` record names the installer that
+# owns it; `install` DELEGATES to that installer (one command for the whole set — you do not have to
+# know which jobs are whose) and fails loudly if the named owner cannot be found. It never renders a
+# second artifact for a job it does not own.
+#
+# Usage:
+#   scheduled-jobs.sh [install|status|start|stop|restart|uninstall|parity|list]
+#                     [--only <id[,id]>] [--apply] [--report-only] [--preview] [--quiet]
+#
+#   --only <ids>    act on these records only (comma-separated)
+#   --apply         arm the selected jobs: the mode flag is rendered INTO the artifact
+#   --report-only   the opposite stance (the shipped default)
+#   --preview       render and show what WOULD be installed; write nothing, install nothing
+#   --no-parity     skip the closing parity gate (for a host that cannot measure its own scheduler)
+#
+# Exit codes: 0 ok · 1 failure (named) · 2 usage · 3 could not measure the scheduler.
+#
+# Env seams (tests, and a box with an unusual layout):
+#   SJ_DECLARATION / SJ_UNMANAGED_REGISTER   file overrides
+#   PORTABLE_PLATFORM                        linux | darwin
+#   SJ_FARM            farmed-script dir (default $HOME/.pi/agent/scripts)
+#   SJ_STATE_DIR       state/log/stamp dir (default $HOME/.pi/agent/state)
+#   SJ_REPOS           colon-separated repos the pass scans (rendered as @repos)
+#   SJ_TORTOISE_REPO   tortoise checkout (rendered as @tortoise)
+#   SJ_PYTHON_BIN      interpreter for `python`/`python-launcher` runners
+#   SJ_LAUNCHER        the macOS TCC launcher (default the farmed pi-reap-worktrees-launchd.py)
+#   SJ_OWNER_DIR       where a `managed=no` owner installer is resolved (default this repo's scripts/)
+#   SJ_SYSTEMD_UNIT_DIR / SJ_SYSTEMCTL       systemd surface + tool (tests: a temp dir + a shim)
+#   SJ_LAUNCHD_DIR / SJ_LAUNCHCTL / SJ_LAUNCHD_DOMAIN   launchd surface + tool + domain
+#   ELDATO_ALLOW_TEST_HOME   permit launchd management when $HOME is not the real home (#446; tests ONLY)
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/scheduled-jobs.sh
+. "$HERE/lib/scheduled-jobs.sh" || { echo "scheduled-jobs: cannot load the declaration library" >&2; exit 1; }
+
+SJ_STATE_DIR="${SJ_STATE_DIR:-${HOME:?HOME is required}/.pi/agent/state}"
+SJ_FARM="${SJ_FARM:-${HOME:-}/.pi/agent/scripts}"
+SJ_OWNER_DIR="${SJ_OWNER_DIR:-$SJ_REPO_ROOT/scripts}"
+STAMP="$SJ_STATE_DIR/scheduled-jobs.stamp"
+INTERVAL_LABEL=""
+
+VERB=""
+ONLY=""
+ARM=""
+PREVIEW=0
+QUIET=0
+RUN_PARITY=1
+PLATFORM_ARG=""
+
+say()  { [ "$QUIET" = 1 ] || printf '%s\n' "$*"; }
+err()  { printf 'scheduled-jobs: %s\n' "$*" >&2; }
+fatal() { err "$*"; exit 1; }
+
+usage() { sed -n '2,60p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        install|uninstall|start|stop|restart|status|parity|list) VERB="$1" ;;
+        # Flag aliases for the verb: the pre-#2048 installer took `--install`/`--status`, and a caller
+        # that silently did nothing because its verb was renamed would be a false PASS of its own.
+        --install)   VERB=install ;;
+        --status)    VERB=status ;;
+        --uninstall) VERB=uninstall ;;
+        --list)      VERB=list ;;
+        --only)      ONLY="${2:-}"; shift ;;
+        --apply)     ARM=armed ;;
+        --report-only) ARM=report-only ;;
+        --preview)   PREVIEW=1 ;;
+        --quiet|-q)  QUIET=1 ;;
+        --no-parity) RUN_PARITY=0 ;;
+        --platform)  PLATFORM_ARG="${2:-}"; shift ;;
+        --help|-h)   usage ;;
+        *) err "unknown argument '$1'"; usage ;;
+    esac
+    shift
+done
+[ -n "$VERB" ] || usage
+
+PLATFORM="$(_portable_platform)"
+[ -n "$PLATFORM_ARG" ] && PLATFORM="$PLATFORM_ARG"
+case "$PLATFORM" in linux|darwin) ;; *) fatal "this command knows systemd (linux) and launchd (darwin); this box reports '$PLATFORM'. NOT silently skipping — a schedule that never fires is the failure this exists to remove." ;; esac
+
+# ── selection ────────────────────────────────────────────────────────────────────────────────
+# `--only` is a typo-trap on purpose: an id that is not declared is a FAILURE, because a silently
+# empty selection would make `install` (or worse, `status`) a green no-op.
+selected_ids() {
+    local id want
+    if [ -z "$ONLY" ]; then
+        sj_ids
+        return 0
+    fi
+    for want in $(printf '%s' "$ONLY" | tr ',' ' '); do
+        [ -n "$want" ] || continue
+        id="$(sj_ids | grep -Fx -- "$want" || true)"
+        [ -n "$id" ] || { err "--only names '$want', which the declaration does not define"; return 1; }
+        printf '%s\n' "$id"
+    done
+}
+
+platform_ids() { # ids declared for this platform, filtered by --only
+    local id sel
+    sel="$(selected_ids)" || return 1
+    for id in $sel; do
+        sj_has_platform "$id" "$PLATFORM" && printf '%s\n' "$id"
+    done
+}
+
+# require_ids — the selection, or a REFUSAL. ⛔ A `for id in $(platform_ids)` silently iterates
+# NOTHING when the selection failed, which would make `install`/`status` a green no-op — the exact
+# false PASS this feature exists to remove. Every verb goes through here.
+require_ids() {
+    IDS="$(platform_ids)" || { err "no records selected — refusing to act on an empty set"; exit 1; }
+    if [ -z "$IDS" ]; then
+        err "no declared record for platform '$PLATFORM' matched the selection — refusing to report success for an empty set"
+        exit 1
+    fi
+}
+
+# ── stamp: which script bytes the JOB was installed against (#1738) ──────────────────────────
+# The stamp line carries more than the digest (platform, timestamp), so the value must be CUT at the
+# first space — otherwise every second install sees a "changed pass" and reloads a job that did not
+# change (measured by S3, which is why this is asserted rather than assumed).
+stamp_sha() { sed -n "s/^job=$1 sha=//p" "$STAMP" 2>/dev/null | head -1 | cut -d' ' -f1; }
+artifact_sha() { # the script this record actually runs
+    local s
+    s="$(sj_resolve_script "$1" 2>/dev/null)" || return 1
+    case "$(_portable_platform)" in
+        darwin) shasum -a 256 "$s" 2>/dev/null | cut -d' ' -f1 ;;
+        *)      sha256sum "$s" 2>/dev/null | cut -d' ' -f1 ;;
+    esac
+}
+write_stamp() { # write_stamp <id>
+    local id="$1" sha tmp
+    sha="$(artifact_sha "$id")"
+    mkdir -p "$SJ_STATE_DIR" 2>/dev/null || { err "cannot create the state dir $SJ_STATE_DIR"; return 1; }
+    tmp="$STAMP.tmp.$$"
+    { grep -v "^job=$id " "$STAMP" 2>/dev/null || true
+      printf 'job=%s sha=%s platform=%s installed_at=%s\n' "$id" "${sha:-unknown}" "$PLATFORM" "$(_date --iso)"
+    } >"$tmp" 2>/dev/null && mv -f "$tmp" "$STAMP" 2>/dev/null \
+        || { err "cannot write the stamp $STAMP"; rm -f "$tmp" 2>/dev/null; return 1; }
+    return 0
+}
+
+# armed_from_file — apply | dry-run | unknown, read from the INSTALLED artifact, never from the flags
+# this invocation was given. Comments are excluded on purpose: both templates explain both modes, and
+# a comment match would answer "armed" for a report-only definition.
+# The arming this run should render for a record: an explicit flag wins; otherwise the stance already
+# on the box holds (the artifact IS the decision of record, #1678); otherwise the declared stance.
+# ⛔ WITHOUT THIS, `--apply` IS NOT DURABLE: a cell armed by bring-up was silently disarmed by any
+# later convergent `install` (setup.sh, a repair, an orchestrator pass) — `changed=1 armed=dry-run` and
+# a reaper that only reports, with every instrument green.
+effective_arm() { # effective_arm <id> <installed-artifact>
+    local id="$1" cur="$2"
+    [ -n "$ARM" ] && { printf '%s\n' "$ARM"; return 0; }
+    case "$(armed_from_file "$cur")" in
+        apply)   printf 'armed\n'; return 0 ;;
+        dry-run) printf 'report-only\n'; return 0 ;;
+    esac
+    sj_field "$id" arming
+}
+
+# A stance change is ANNOUNCED, so "the reaper stopped running" is never a silent one-way door.
+announce_arm_change() { # announce_arm_change <id> <installed-artifact>
+    local before after
+    [ -n "$ARM" ] || return 0
+    before="$(armed_from_file "$2")"
+    case "$ARM" in armed) after=apply ;; *) after=dry-run ;; esac
+    [ "$before" = unknown ] && return 0
+    [ "$before" = "$after" ] && return 0
+    say "⛔ ARMING CHANGED $1: $before → $after (explicit flag; the artifact is the record)"
+}
+
+armed_from_file() {
+    local f="$1" line
+    [ -f "$f" ] || { printf 'unknown'; return 0; }
+    case "$f" in
+        *.service) line="$(sed -n 's/^ExecStart=//p' "$f")" ;;
+        *)         line="$(tr -d '\n' <"$f" | sed -nE 's/.*<string>(--apply|--dry-run)<\/string>.*/\1/p')" ;;
+    esac
+    case "$line" in
+        *--apply*)   printf 'apply' ;;
+        *--dry-run*) printf 'dry-run' ;;
+        *)           printf 'unknown' ;;
+    esac
+}
+
+# ── systemd backend ─────────────────────────────────────────────────────────────────────────
+SD_SCOPE=""; UNIT_DIR=""; SC=""
+choose_systemd() {
+    UNIT_DIR="$(sj_systemd_units_dir)"; SC="$(sj_systemctl)"
+    if [ -n "${SJ_SYSTEMD_UNIT_DIR:-}" ]; then SD_SCOPE=override; return 0; fi
+    if [ "${SJ_SUDO:-sudo -n}" = "" ] || ${SJ_SUDO:-sudo -n} true >/dev/null 2>&1; then
+        SD_SCOPE=system; UNIT_DIR=/etc/systemd/system; SC="${SJ_SYSTEMCTL:-sudo -n systemctl}"; return 0
+    fi
+    if systemctl --user show-environment >/dev/null 2>&1; then
+        SD_SCOPE=user; UNIT_DIR="$HOME/.config/systemd/user"; SC="systemctl --user"; return 0
+    fi
+    return 1
+}
+
+sd_last_exit() { # sd_last_exit <unit> -> <n> | never | unknown
+    local started rc_s rc
+    started="$($SC show -p ExecMainStartTimestamp --value "$1.service" 2>/dev/null)"; rc_s=$?
+    rc="$($SC show -p ExecMainStatus --value "$1.service" 2>/dev/null)"
+    # ⛔ "COULD NOT ASK" IS NOT "NEVER RAN". Both used to print `never`, and `never` sits on the healthy
+    # list — so a `systemctl show` that failed (a bus error, a masked unit, a broken shim) answered the
+    # question "did the last pass succeed?" with OK from a surface it never read. `unknown` is a
+    # MEASUREMENT GAP and is reported as one.
+    [ "$rc_s" -eq 0 ] || { printf 'unknown\n'; return 0; }
+    case "$rc" in ''|*[!0-9]*) printf 'unknown\n'; return 0 ;; esac
+    # A unit that has never run reports rc=0, which would read as "healthy". Say `never` instead: the
+    # question this verb answers is "did the last pass succeed", and there is no last pass.
+    case "$started" in ''|n/a|'n/a') printf 'never\n' ;; *) printf '%s\n' "$rc" ;; esac
+}
+
+sd_install() { # sd_install <id>
+    local id="$1" unit tmpd changed=0 pass_changed=0 reason=none sha insha
+    unit="$(sj_unit "$id")"
+    tmpd="$(mktemp -d "${TMPDIR:-/tmp}/sj-unit.XXXXXX")" || { err "cannot create a temp dir"; return 1; }
+    announce_arm_change "$id" "$UNIT_DIR/$(sj_unit "$id").service"
+    sj_render_systemd "$id" "$tmpd" "$SD_SCOPE" "$(effective_arm "$id" "$UNIT_DIR/$(sj_unit "$id").service")" \
+        || { err "$id: rendering failed"; rm -rf "$tmpd"; return 1; }
+    # A USER unit may not carry User= (systemd rejects it).
+    if [ "$SD_SCOPE" = user ]; then
+        sed -e '/^User=/d' "$tmpd/$unit.service" >"$tmpd/$unit.service.u" && mv "$tmpd/$unit.service.u" "$tmpd/$unit.service"
+    fi
+    if [ "$PREVIEW" = 1 ]; then
+        say "preview: $id → $UNIT_DIR (target=$SD_SCOPE)"
+        sed 's/^/  /' "$tmpd/$unit.service"; sed 's/^/  /' "$tmpd/$unit.timer"
+        rm -rf "$tmpd"
+        return 0
+    fi
+    cmp -s "$tmpd/$unit.service" "$UNIT_DIR/$unit.service" 2>/dev/null || changed=1
+    cmp -s "$tmpd/$unit.timer"   "$UNIT_DIR/$unit.timer"   2>/dev/null || changed=1
+    sha="$(artifact_sha "$id")"; insha="$(stamp_sha "$id")"
+    [ -n "$sha" ] && [ "$sha" != "$insha" ] && pass_changed=1
+    [ -f "$UNIT_DIR/$unit.timer" ] || { changed=1; pass_changed=1; }
+    mkdir -p "$UNIT_DIR" 2>/dev/null || true
+    if [ -n "${SJ_SYSTEMD_UNIT_DIR:-}" ] || [ "$SD_SCOPE" = user ]; then
+        cp -f "$tmpd/$unit.service" "$tmpd/$unit.timer" "$UNIT_DIR/" || { err "$id: copy failed"; rm -rf "$tmpd"; return 1; }
+    else
+        ${SJ_SUDO:-sudo -n} install -m 0644 "$tmpd/$unit.service" "$UNIT_DIR/$unit.service" \
+            && ${SJ_SUDO:-sudo -n} install -m 0644 "$tmpd/$unit.timer" "$UNIT_DIR/$unit.timer" \
+            || { err "$id: install failed (sudo/systemd)"; rm -rf "$tmpd"; return 1; }
+    fi
+    rm -rf "$tmpd"
+    $SC daemon-reload >/dev/null 2>&1 || { err "$id: daemon-reload failed"; return 1; }
+    $SC enable --now "$unit.timer" >/dev/null 2>&1 || { err "$id: could not enable/start $unit.timer"; return 1; }
+    [ "$changed" = 1 ] && reason=unit-changed
+    [ "$pass_changed" = 1 ] && [ "$reason" = none ] && reason=pass-changed
+    if [ "$reason" != none ]; then
+        # Restart the TIMER, not the service: the timer carries the calendar/persistent state, and a
+        # reload of an already-loaded definition is the only way to make an edited one apply.
+        $SC restart "$unit.timer" >/dev/null 2>&1 || true
+    fi
+    if ! $SC is-enabled "$unit.timer" >/dev/null 2>&1; then
+        err "$id: the timer is NOT enabled after install — it will not run unattended"; return 1
+    fi
+    write_stamp "$id" || return 1
+    say "installed $id: scheduler=systemd target=$SD_SCOPE unit=$unit.timer changed=$changed pass_changed=$pass_changed reload_reason=$reason armed=$(armed_from_file "$UNIT_DIR/$unit.service")"
+    return 0
+}
+
+# ── launchd backend ─────────────────────────────────────────────────────────────────────────
+LD_DIR=""; LC=""; LD_DOMAIN=""
+choose_launchd() {
+    LD_DIR="$(sj_launchd_dir)"
+    LC="$(sj_launchctl)"
+    LD_DOMAIN="${SJ_LAUNCHD_DOMAIN:-gui/$(id -u)}"
+    case "$LC" in
+        */*) [ -x "$LC" ] || return 1 ;;
+        *)   command -v "$LC" >/dev/null 2>&1 || return 1 ;;
+    esac
+    return 0
+}
+ld_loaded() { $LC print "$LD_DOMAIN/$1" >/dev/null 2>&1; }
+
+# launchd addresses the USER domain by UID: a run with a throwaway HOME bootstraps into the LIVE
+# session, registering a job whose plist path dies with the temp dir (#446).
+guard_test_home() {
+    [ "$PLATFORM" = darwin ] || return 0
+    [ "${ELDATO_ALLOW_TEST_HOME:-}" = 1 ] && return 0
+    local real
+    real="$(dscl . -read "/Users/$(id -un)" NFSHomeDirectory 2>/dev/null | sed -n 's/^NFSHomeDirectory: //p' | head -1 || true)"
+    if [ -n "$real" ] && [ "$HOME" != "$real" ]; then
+        err "refusing to manage launchd jobs: HOME=$HOME is not the real home ($real)."
+        err "       A temp-HOME run registers jobs against plist paths that vanish (#446)."
+        err "       Tests: put a launchctl shim on PATH and set ELDATO_ALLOW_TEST_HOME=1"
+        return 1
+    fi
+    return 0
+}
+
+ld_last_exit() { # ld_last_exit <label>
+    local out rc
+    out="$($LC print "$LD_DOMAIN/$1" 2>/dev/null)"
+    rc="$(printf '%s\n' "$out" | sed -n 's/^[[:space:]]*last exit code = //p' | head -1)"
+    case "$rc" in ''|*[!0-9]*) printf 'never\n' ;; *) printf '%s\n' "$rc" ;; esac
+}
+
+ld_install() { # ld_install <id>
+    local id="$1" label tmp dest changed=0 pass_changed=0 reason=none sha insha
+    label="$(sj_label "$id")"
+    [ -n "$label" ] || { err "$id: declared for darwin with no label"; return 1; }
+    dest="$LD_DIR/$label.plist"
+    tmp="$(mktemp -d "${TMPDIR:-/tmp}/sj-plist.XXXXXX")" || { err "cannot create a temp dir"; return 1; }
+    announce_arm_change "$id" "$dest"
+    sj_render_launchd "$id" "$tmp/$label.plist" "$(effective_arm "$id" "$dest")" \
+        || { err "$id: rendering failed"; rm -rf "$tmp"; return 1; }
+    if command -v plutil >/dev/null 2>&1 && ! plutil -lint "$tmp/$label.plist" >/dev/null 2>&1; then
+        err "$id: the rendered plist is MALFORMED — refusing to install a job launchd will ignore"
+        plutil -lint "$tmp/$label.plist" >&2 || true
+        rm -rf "$tmp"; return 1
+    fi
+    if [ "$PREVIEW" = 1 ]; then
+        say "preview: $id → $dest (domain=$LD_DOMAIN)"
+        sed 's/^/  /' "$tmp/$label.plist"
+        rm -rf "$tmp"
+        return 0
+    fi
+    cmp -s "$tmp/$label.plist" "$dest" 2>/dev/null || changed=1
+    sha="$(artifact_sha "$id")"; insha="$(stamp_sha "$id")"
+    [ -n "$sha" ] && [ "$sha" != "$insha" ] && pass_changed=1
+    [ -f "$dest" ] || pass_changed=1
+    ld_loaded "$label" || pass_changed=1
+    mkdir -p "$LD_DIR" || { err "$id: cannot create $LD_DIR"; rm -rf "$tmp"; return 1; }
+    mv "$tmp/$label.plist" "$dest" || { err "$id: cannot write $dest"; rm -rf "$tmp"; return 1; }
+    rm -rf "$tmp"
+    [ "$changed" = 1 ] && reason=unit-changed
+    [ "$pass_changed" = 1 ] && [ "$reason" = none ] && reason=pass-changed
+    if [ "$reason" != none ]; then
+        $LC enable "$LD_DOMAIN/$label" >/dev/null 2>&1 || true
+        $LC bootout "$LD_DOMAIN/$label" >/dev/null 2>&1 || true
+        if ! $LC bootstrap "$LD_DOMAIN" "$dest" >/dev/null 2>&1; then
+            rm -f "$dest"   # nothing half-installed
+            err "$id: launchctl bootstrap failed for $label (see '$LC print $LD_DOMAIN/$label')"
+            return 1
+        fi
+        ld_loaded "$label" || { err "$id: $label is not loaded after bootstrap — it will not run unattended"; return 1; }
+    fi
+    write_stamp "$id" || return 1
+    say "installed $id: scheduler=launchd label=$label changed=$changed pass_changed=$pass_changed reload_reason=$reason armed=$(armed_from_file "$dest")"
+    return 0
+}
+
+# ── the owner delegation (managed=no) ────────────────────────────────────────────────────────
+delegate_install() { # delegate_install <id>
+    local id="$1" owner path
+    owner="$(sj_field "$id" owner)"
+    [ -n "$owner" ] || { err "$id: managed=no and no owner is named — refusing to skip it silently"; return 1; }
+    case "$owner" in
+        scheduled-jobs.sh|scheduled-jobs) return 0 ;;   # this command owns it after all
+    esac
+    path="$SJ_OWNER_DIR/$owner"
+    [ -f "$path" ] || { err "$id: its owner installer '$owner' was not found in $SJ_OWNER_DIR — the job is NOT installed, and this is a FAILURE, not a skip"; return 1; }
+    if [ "$PREVIEW" = 1 ]; then
+        say "preview: $id is owned by $owner — would run: bash $path"
+        return 0
+    fi
+    local out
+    if ! out="$(bash "$path" 2>&1)"; then
+        err "$id: its owner installer '$owner' FAILED — the job is not installed"
+        # Never swallow the owner's reason: it is the only thing that says WHICH half is missing.
+        printf '%s\n' "$out" | tail -20 | sed 's/^/       │ /' >&2
+        return 1
+    fi
+    say "delegated $id → $owner"
+    return 0
+}
+
+# ── verbs ───────────────────────────────────────────────────────────────────────────────────
+do_install() {
+    local id rc=0 qflag=""
+    [ "$QUIET" = 1 ] && qflag="--quiet"
+    case "$PLATFORM" in
+        linux)  choose_systemd || fatal "no systemd target: no passwordless sudo for a system unit, and no systemd user manager. Give the box sudo, or set SJ_SYSTEMD_UNIT_DIR. NOT skipping — a reaper that never runs is the failure this exists to remove." ;;
+        darwin) choose_launchd || fatal "no launchctl ($(sj_launchctl)) — cannot install a launchd job"; guard_test_home || exit 1 ;;
+    esac
+    require_ids
+    for id in $IDS; do
+        if [ "$(sj_field "$id" managed)" = yes ]; then
+            case "$PLATFORM" in
+                linux)  sd_install "$id" || rc=1 ;;
+                darwin) ld_install "$id" || rc=1 ;;
+            esac
+        else
+            delegate_install "$id" || rc=1
+        fi
+    done
+    [ "$PREVIEW" = 1 ] && return "$rc"
+    # The set is only installed if the HOST agrees it is. One command, one verdict.
+    if [ "$rc" -eq 0 ] && [ "$RUN_PARITY" = 1 ]; then
+        # ONE SELECTION, ONE VERDICT: the gate is scoped to the records this run acted on, so a
+        # deliberately scoped install cannot be failed by a record it was never asked to touch.
+        bash "$HERE/check-scheduled-parity.sh" --platform "$PLATFORM" ${ONLY:+--only "$ONLY"} $qflag || {
+            err "install finished but the parity gate FAILED — the set on this host does not match the declaration (see above)"
+            rc=1
+        }
+    fi
+    return "$rc"
+}
+
+do_status() {
+    local id rc=0 unit label installed active enabled last armed drift sha insha sched next=
+    case "$PLATFORM" in
+        linux)  choose_systemd || { err "no systemd target to read"; return 3; } ;;
+        darwin) choose_launchd || { err "no launchctl to read"; return 3; } ;;
+    esac
+    require_ids
+    for id in $IDS; do
+        local verdict=OK
+        sched="$(sj_field "$id" schedule)"
+        if [ "$PLATFORM" = linux ]; then
+            unit="$(sj_unit "$id")"
+            # ⛔ BOTH HALVES ARE THE JOB. A timer alone fires a unit that does not exist: systemd
+            # reports the TIMER as active and enabled, and the box reclaims nothing. So `installed` is
+            # the pair, and a missing service is its own verdict.
+            if [ -f "$UNIT_DIR/$unit.timer" ] && [ -f "$UNIT_DIR/$unit.service" ]; then installed=yes
+            elif [ -f "$UNIT_DIR/$unit.timer" ]; then installed=partial
+            else installed=no; fi
+            active="$($SC is-active "$unit.timer" 2>/dev/null || true)"; [ -n "$active" ] || active=unknown
+            enabled="$($SC is-enabled "$unit.timer" 2>/dev/null || true)"; [ -n "$enabled" ] || enabled=unknown
+            last="$(sd_last_exit "$unit")"
+            next="$($SC list-timers --all --no-pager 2>/dev/null | awk -v u="$unit.timer" '$0 ~ u {print $1" "$2" "$3; exit}')"
+            armed="$(armed_from_file "$UNIT_DIR/$unit.service")"
+            drift="$(pass_drift_for "$id")"
+            say "job=$id platform=linux scheduler=systemd unit=$unit.timer installed=$installed active=$active enabled=$enabled last_exit=$last armed=$armed schedule=$sched next_run=${next:-unknown} pass_drift=$drift"
+            case "$installed" in
+                yes) ;;
+                partial) verdict=ABSENT-UNIT ;;   # the timer is there; the thing it triggers is not
+                *) verdict=ABSENT ;;
+            esac
+            [ "$active" = active ] || { [ "$verdict" = OK ] && verdict=INERT; }
+            # `systemctl disable <timer>` without `--now`, or a mask, leaves it loaded and firing until
+            # the next boot and then silent forever; `enabled` was printed and never judged.
+            case "$enabled" in
+                enabled|enabled-runtime|static|alias|indirect) ;;
+                *) [ "$verdict" = OK ] && verdict=INERT ;;
+            esac
+            case "$last" in
+                ''|0|never) ;;
+                unknown) [ "$verdict" = OK ] && verdict=UNKNOWN ;;
+                *) verdict=FAILED ;;
+            esac
+        else
+            label="$(sj_label "$id")"
+            if [ -f "$LD_DIR/$label.plist" ]; then installed=yes; else installed=no; fi
+            if ld_loaded "$label"; then active=active; else active=inactive; fi
+            last="$(ld_last_exit "$label")"
+            armed="$(armed_from_file "$LD_DIR/$label.plist")"
+            drift="$(pass_drift_for "$id")"
+            # launchd does not report the next fire time of a StartInterval job; the interval is what it
+            # gives, and inventing a "next" would be a guess in a field read as a measurement.
+            say "job=$id platform=darwin scheduler=launchd label=$label installed=$installed active=$active last_exit=$last armed=$armed schedule=$sched next_run=unknown pass_drift=$drift"
+            [ "$installed" = yes ] || verdict=ABSENT
+            [ "$active" = active ] || { [ "$verdict" = OK ] && verdict=INERT; }
+            case "$last" in
+                ''|0|never) ;;
+                unknown) [ "$verdict" = OK ] && verdict=UNKNOWN ;;   # could not ask, not "healthy"
+                *) verdict=FAILED ;;
+            esac
+        fi
+        say "  verdict=$verdict"
+        [ "$verdict" = OK ] || rc=1
+    done
+    if [ "$PLATFORM" = darwin ] && [ -f "$LD_DIR/$(sj_label eldato-disk-reaper).plist" ] && [ -f "$SJ_STATE_DIR/disk-reaper.status" ]; then
+        say "--- last pass record (the same file a cell writes) ---"
+        sed 's/^/  /' "$SJ_STATE_DIR/disk-reaper.status"
+    fi
+    if [ "$rc" -eq 0 ]; then say "verdict=OK platform=$PLATFORM"; else say "verdict=FAIL platform=$PLATFORM"; fi
+    return "$rc"
+}
+
+pass_drift_for() { # managed=no records were installed by ANOTHER owner: no stamp exists to compare
+    if [ "$(sj_field "$1" managed)" != yes ]; then printf 'n/a (owned by %s)\n' "$(sj_field "$1" owner)"; return 0; fi
+    pass_drift "$1"
+}
+
+pass_drift() { # pass_drift <id> — are the bytes on disk the ones the JOB was installed against (#1738)
+    local sha insha
+    sha="$(artifact_sha "$1" 2>/dev/null)"; insha="$(stamp_sha "$1")"
+    [ -n "$sha" ] || { printf 'unknown\n'; return 0; }
+    if [ -z "$insha" ]; then printf 'no-stamp (re-run install)\n'
+    elif [ "$sha" = "$insha" ]; then printf 'in-sync\n'
+    else printf 'CHANGED since install (re-run install to reload the job)\n'; fi
+}
+
+do_scheduler_verb() { # do_scheduler_verb start|stop|restart
+    local verb="$1" id rc=0 unit label
+    case "$PLATFORM" in
+        linux)  choose_systemd || { err "no systemd target"; return 3; } ;;
+        darwin) choose_launchd || { err "no launchctl"; return 3; } ;;
+    esac
+    require_ids
+    for id in $IDS; do
+        case "$PLATFORM" in
+            linux)
+                unit="$(sj_unit "$id")"
+                case "$verb" in
+                    start)   $SC start "$unit.timer"   >/dev/null 2>&1 || { err "$id: start failed"; rc=1; } ;;
+                    stop)    $SC stop "$unit.timer"    >/dev/null 2>&1 || { err "$id: stop failed"; rc=1; } ;;
+                    restart) $SC restart "$unit.timer" >/dev/null 2>&1 || { err "$id: restart failed"; rc=1; } ;;
+                esac
+                say "$verb $id: unit=$unit.timer"
+                ;;
+            darwin)
+                label="$(sj_label "$id")"
+                case "$verb" in
+                    stop)    $LC bootout "$LD_DOMAIN/$label" >/dev/null 2>&1 || { err "$id: bootout failed"; rc=1; } ;;
+                    start|restart)
+                        if ! ld_loaded "$label"; then
+                            $LC bootstrap "$LD_DOMAIN" "$LD_DIR/$label.plist" >/dev/null 2>&1 \
+                                || { err "$id: bootstrap failed"; rc=1; }
+                        fi
+                        $LC kickstart -k "$LD_DOMAIN/$label" >/dev/null 2>&1 || { err "$id: kickstart failed"; rc=1; }
+                        ;;
+                esac
+                say "$verb $id: label=$label"
+                ;;
+        esac
+    done
+    return "$rc"
+}
+
+do_uninstall() {
+    local id rc=0 unit label
+    case "$PLATFORM" in
+        linux)  choose_systemd || { err "no systemd target"; return 3; } ;;
+        darwin) choose_launchd || { err "no launchctl"; return 3; } ;;
+    esac
+    require_ids
+    for id in $IDS; do
+        if [ "$(sj_field "$id" managed)" != yes ]; then
+            say "skip $id: managed=no, owned by $(sj_field "$id" owner) — not ours to remove"
+            continue
+        fi
+        if [ "$PREVIEW" = 1 ]; then say "preview: would remove $id"; continue; fi
+        if [ "$PLATFORM" = linux ]; then
+            unit="$(sj_unit "$id")"
+            $SC disable --now "$unit.timer" >/dev/null 2>&1 || true
+            if [ -n "${SJ_SYSTEMD_UNIT_DIR:-}" ] || [ "$SD_SCOPE" = user ]; then
+                rm -f "$UNIT_DIR/$unit.service" "$UNIT_DIR/$unit.timer"
+            else
+                ${SJ_SUDO:-sudo -n} rm -f "$UNIT_DIR/$unit.service" "$UNIT_DIR/$unit.timer"
+            fi
+            $SC daemon-reload >/dev/null 2>&1 || true
+        else
+            label="$(sj_label "$id")"
+            $LC bootout "$LD_DOMAIN/$label" >/dev/null 2>&1 || true
+            rm -f "$LD_DIR/$label.plist"
+        fi
+        # The stamp line goes with the job: a stamp for an absent job would report pass_drift=in-sync.
+        grep -v "^job=$id " "$STAMP" >"$STAMP.tmp.$$" 2>/dev/null && mv -f "$STAMP.tmp.$$" "$STAMP" 2>/dev/null || true
+        say "uninstalled $id"
+    done
+    return "$rc"
+}
+
+do_list() {
+    local id
+    require_ids
+    for id in $IDS; do
+        printf '%s\tplatforms=%s\tschedule=%s\tmanaged=%s\towner=%s\n' \
+            "$id" "$(sj_field "$id" platforms)" "$(sj_field "$id" schedule)" \
+            "$(sj_field "$id" managed)" "$(sj_field "$id" owner)"
+    done
+}
+
+# ── main ────────────────────────────────────────────────────────────────────────────────────
+if [ "$VERB" != list ]; then
+    vout="$(sj_validate 2>&1)" || { printf '%s\n' "$vout" >&2; exit 1; }
+fi
+
+case "$VERB" in
+    install)   do_install ;;
+    status)    do_status ;;
+    start|stop|restart) do_scheduler_verb "$VERB" ;;
+    uninstall) do_uninstall ;;
+    parity)    if [ "$QUIET" = 1 ]; then exec bash "$HERE/check-scheduled-parity.sh" --platform "$PLATFORM" --quiet; fi
+               exec bash "$HERE/check-scheduled-parity.sh" --platform "$PLATFORM" ;;
+    list)      do_list ;;
+esac
+exit $?

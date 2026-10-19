@@ -726,6 +726,36 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     overrides: ["SWEEP_MAX_AGE=600"],
     note: "how long a 304 may serve a cached PR listing before `If-None-Match` is DROPPED and a full sweep forced (#1762). A FRESHNESS bound, not a kill bound: a completed check run does NOT reliably bump the listing ETag (measured), so without this floor a green PR could sit unmerged behind a cached \"unchanged\" forever — the cell-cannot-merge-reads-as-idle failure the bound exists to remove. The second declaration is the is_limit coercion; it is recorded so a third assignment cannot shadow the default unnoticed.",
   },
+  // — gate axis: the merge-priority gate's measured EVIDENCE AGES (#2040) —
+  //
+  // These are not kill bounds. They are the two readings the bounded
+  // merge-priority gate compares against its age window, and the failure they
+  // exist to prevent is the gate that can never open: "drain the unowned PRs
+  // first" is a condition no unattended lane can clear, so an UNBOUNDED gate
+  // stops dispatch forever while every cycle reports success. Registering them
+  // here is what stops a future lane from re-introducing an unbounded form
+  // unnoticed: the reverse scan refuses a new stall/liveness-family
+  // declaration that nobody classified, which is exactly how an unbounded
+  // bound reappears.
+  {
+    name: "YOUNG_AGE",
+    owners: ["scripts/orchestrator-harness/orch-loop.sh"],
+    value: '"$(unowned_youngest_age_min "$OPEN_N" 2>/dev/null || true)"',
+    axis: "gate",
+    guardedBy:
+      "test-gates.sh: unowned_youngest_age_min is driven from a shipped --jq over real createdAt rows (normal/missing/malformed), and the release clauses that consume YOUNG_AGE are driven both ways — a young unowned PR HOLDS, an old one RELEASES and names its clause",
+    note: "age (minutes) of the YOUNGEST unowned open PR — the evidence that decides whether a draining lander is plausibly about to clear one. An EMPTY value is the unreadable case and RELEASES rather than holding forever; the [cap] line renders '?' for it, never 0.",
+  },
+  {
+    name: "LAND_AGE",
+    owners: ["scripts/orchestrator-harness/orch-loop.sh"],
+    value: '""',
+    axis: "gate",
+    guardedBy:
+      "test-gates.sh: the bound is driven through mp_reason/mp_bound_released with a land inside the window (HELD) and outside it (RELEASED), plus the in-process second-memory cases (unwritable state dir, future stamp, failed clear)",
+    overrides: ["$(( (_now_a - (10#$LAND_EPOCH)) / 60 ))"],
+    note: "age (minutes) of the last LAND seen by this box; the second declaration is the derived value from LAND_EPOCH. Empty means 'no land observed', which is a RELEASE reason (an empty measurement is not evidence of progress, and a gate that treats it as progress never opens).",
+  },
   // — retention axis —
   {
     name: "MAX_AGE_DAYS",

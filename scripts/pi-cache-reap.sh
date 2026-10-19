@@ -1,4 +1,30 @@
 #!/usr/bin/env bash
+# ── the portability shim (#2048) ────────────────────────────────────────────────────────────────
+# ONE shim for the four platform differences that made components install and then fail to EXECUTE
+# on one platform (#2046: macOS ships no `timeout`; `nproc`, `stat -c` and `date -d` are GNU-only).
+# Every scheduled component sources it, so a helper used here cannot be a GNU-only spelling. A shim
+# that cannot be loaded is a REFUSAL AT STARTUP (exit 3): running on with no helper is exactly the
+# #2046 shape — the work silently does not happen while the component reports a considered result.
+_PORTABLE_LIB="${PORTABLE_LIB:-}"
+if [ -z "$_PORTABLE_LIB" ]; then
+    _portable_self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+    # `<script dir>/lib` covers `scripts/*.sh`; `<script dir>/../lib` covers a component that lives
+    # in a subdirectory (`scripts/checkout-hygiene/`, `scripts/fleet/`); the farm copy is what a cell
+    # actually has after `pi-bootstrap/setup.sh`.
+    for _portable_cand in "$_portable_self_dir/lib/portable.sh" \
+                          "$_portable_self_dir/../lib/portable.sh" \
+                          "${HOME:-}/.pi/agent/scripts/lib/portable.sh"; do
+        [ -n "$_portable_cand" ] && [ -f "$_portable_cand" ] && { _PORTABLE_LIB="$_portable_cand"; break; }
+    done
+fi
+if [ ! -f "${_PORTABLE_LIB:-}" ]; then
+    printf '%s: FAIL-CLOSED at startup — the portability shim is missing (%s)\n' \
+        "${0##*/}" "${_PORTABLE_LIB:-not beside this script and not in ${HOME:-}/.pi/agent/scripts/lib/}" >&2
+    exit 3
+fi
+# shellcheck source=lib/portable.sh
+. "$_PORTABLE_LIB"
+
 # pi-cache-reap.sh — bound the MACHINE-GLOBAL package caches (agent-infra#1987).
 #
 # WHY THIS EXISTS (the measured defect)
@@ -89,7 +115,7 @@
 #
 # SCHEDULING (installed by default, DRY-RUN until an owner arms it)
 #   * Mac:   the `uv` CLASS of the consolidated pass — `disk-reaper.sh` resolves this
-#            script, and `scripts/install-disk-reaper-schedule.sh` schedules that pass
+#            script, and `scripts/scheduled-jobs.sh` schedules that pass from the declaration
 #            hourly as com.eldato.disk-reaper (#2048; the per-class
 #            com.eldato.pi-cache-reap job is RETIRED into it, so there is ONE clock and
 #            ONE report for the three sinks instead of four).
@@ -435,7 +461,7 @@ ps_matches() {
 # (heartbeat-loop.sh:265, lane-scan-fallback.sh:53, monitor-worker.sh:43, atomic-land.sh:289).
 mtime_of() {
     local m
-    m="$(stat -f %m "$1" 2>/dev/null)" || m="$(stat -c %Y "$1" 2>/dev/null)" || return 1
+    m="$(_stat_mtime "$1")" || return 1          # one portable spelling (#2048)
     is_pos_int "$m" || return 1
     printf '%s' "$m"
 }
@@ -456,7 +482,7 @@ lstart_of() {
 # dev_of <path> — the device id owning <path> (stat's portable spelling differs by OS).
 dev_of() {
     local d
-    d="$(stat -c %d "$1" 2>/dev/null)" || d="$(stat -f %d "$1" 2>/dev/null)" || return 1
+    d="$(_stat_dev "$1")" || return 1            # `%d` on both stat(1)s — via the shim (#2048)
     case "${d:-}" in ''|*[!0-9]*) return 1 ;; esac
     printf '%s' "$d"
 }

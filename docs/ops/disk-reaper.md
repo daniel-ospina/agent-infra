@@ -127,97 +127,49 @@ that row. Unmerged heads keep the blanket floor, where age still separates a sta
 scratch checkout from work in progress. Setting it equal to `REAP_WT_AGED_DAYS`
 restores the pre-exemption behaviour.
 
-## Scheduling — ONE install verb, TWO schedulers (#2032, #2048)
+## Scheduling — ONE declaration, TWO schedulers (#2032, #2048)
 
-`scripts/install-disk-reaper-schedule.sh` installs the pass on **both** platforms the fleet runs on.
-It is one verb because the fleet is one system: a Mac and a cell differ in *what* wakes the pass, not
-in what the pass is.
+The schedule is **not** in a template file any more. It is one record in
+[`config/scheduled-jobs.declaration`](../config/scheduled-jobs.declaration), and
+[`scripts/scheduled-jobs.sh`](../../scripts/scheduled-jobs.sh) renders it for whichever platform it
+runs on:
 
-| platform | artifact | installed by | interval |
+| platform | artifact (rendered) | installed by | interval |
 |---|---|---|---|
-| Linux cell | `templates/systemd/eldato-disk-reaper.{service,timer}` → `eldato-disk-reaper.timer` | `cloud-cell-bringup.sh --check` (which passes `--apply`) | hourly, `Persistent=true` |
-| macOS | `templates/launchd/com.eldato.disk-reaper.plist.tmpl` → `~/Library/LaunchAgents/com.eldato.disk-reaper.plist` | `pi-bootstrap/setup.sh` on Darwin | hourly, `StartInterval=3600`, `RunAtLoad` |
+| Linux cell | `eldato-disk-reaper.{service,timer}` in the unit dir | `cloud-cell-bringup.sh --check` (which passes `--apply`) | hourly, `Persistent=true` |
+| macOS | `~/Library/LaunchAgents/com.eldato.disk-reaper.plist` | `pi-bootstrap/setup.sh` on Darwin | hourly, `StartInterval=3600`, `RunAtLoad` |
 
 Both run **the same entry point with the same flags** (`disk-reaper.sh` + one mode flag). The only
 other platform difference is the *binary-resolution seam*: a launchd-spawned `bash` cannot read a
 script, or a repo, under `~/Documents` (TCC is per-binary — #427, and the control experiment is in
 #1095), so the Darwin job starts the checkout's own interpreter on the farmed launcher
 `pi-reap-worktrees-launchd.py`, which hands **the same pass file** to bash on stdin. Without it the
-Mac's venv and worktree classes would fail closed on every pass.
-
-The macOS template is named `*.plist.tmpl` on purpose: `install-launchd.sh` renders
-`templates/launchd/*.plist`, and this job needs machine state that installer does not carry (the pass
-path, the mode flag, the state dir, the repos). The suffix keeps the job out of that glob, so it
-cannot be bootstrapped half-rendered with a literal placeholder as its argument — **one installer owns
-each job**.
-
-Idempotency: a second install compares the rendered artifact byte for byte and changes nothing
-(systemd additionally `daemon-reload`s, which is free). An unscheduled box is a **FAIL the bring-up
-reports** — `--status` exits 1, and on the Mac `pi-bootstrap/setup.sh` finishes with a non-zero exit
-naming the remedy. A box with neither scheduler fails loudly with the remedy; a scheduled-but-never-run
-reaper is exactly the false PASS this feature removes.
-
-**The exit code is a contract, not decoration.** `0` means *scheduled AND loaded*: on Linux the timer
-is `enabled` and `active`, on macOS the plist exists **and** the job is bootstrapped into the domain. A
-present-but-disabled timer, a timer left `enabled-runtime`/`static`/`transient` (states that do not
-survive a reboot, or never get pulled in at boot), or a plist left behind by `launchctl bootout`, exits
-`1` and names the state it read — a file on disk is not a job on the clock.
-
-**`setup.sh` delegates the "is this the box?" decision** instead of repeating it: the installer answers
-with an exit code (`0` installed · `3` declined, not this box — a temp-HOME run, #446 · `4` this box,
-but the real home could not be **determined** (getent/dscl/`~user` all failed) · anything else a real
-failure), so one decision has one implementation and a temp-HOME run is skipped out loud rather than
-reported as a failure of a machine it was never about. ⛔ `3` and `4` are **different facts**, and
-folding them together is a false PASS: `3` says *nothing here is a failure*, `4` says *this IS the box
-and it is now UNSCHEDULED*, so `setup.sh` reports `4` as a failure (an account no probe can resolve —
-an AD/OD-bound Mac — must not install nothing and still read green). The same-home test is by *path*: a trailing
-slash, or a `$HOME` that reaches the same directory through a symlink, is the same box — a guard that
-refuses a correctly-configured machine is not safe, it is silent.
-
-The install verb's own failure modes are kept off the "is it scheduled?" answer: an unwritable
-`$DISK_REAPER_STATE_DIR` costs the stamp, and it is reported as that named degradation — never as "this
-box has no schedule", which by then is untrue. What the missing stamp costs is stated the way it
-actually behaves: with no stamp the pass-SHA comparison can never match, so **every** later install
-reloads the job, and a no-flag re-install (`setup.sh`/`sync.sh`) falls back to report-only. `--status`
-names the state dir as the cause rather than prescribing the `--install` that just failed.
-
-### Arming is a separate, visible step (#1678, owner ruling 2026-10-11)
-
-The installer **ships report-only**: with no mode flag the installed job carries the pass's dry-run
-flag, and `--status` reports `armed=dry-run`. `--apply` installs the armed job, and the flag lands
-*inside* the unit/plist, so the answer is readable from the scheduled artifact — never from an
-environment default, and never inferred from the command that built it. Re-running with `--dry-run`
-puts the report-only mode back: reversible, one copy, nothing to drift.
-
-The cell's bring-up passes `--apply` **explicitly** (that feature was instructed to run unattended, and
-the arming is now one visible line in `cloud-cell-bringup.sh` plus the `ExecStart` it renders). A Mac
-ships report-only until the owner arms it.
-
-**An arming survives a no-flag re-install.** `pi-bootstrap/setup.sh` — which `sync.sh` runs —
-re-installs with `--install` and no mode flag on every run, so an arming that lived only in the previous
-invocation was silently reverted to report-only (and the job rebootstrapped) at the next sync: the Mac
-could never *stay* armed, which is the disk-fill incident #2048 exists to prevent. The arming is
-persisted in the schedule stamp the installer itself writes (`armed=` in
-`$DISK_REAPER_STATE_DIR/disk-reaper.schedule`) and a no-flag install adopts it. An explicit
-`--apply`/`--dry-run` still wins and rewrites the stamp, `--status` still reads the arming off the
-installed artifact, and `--uninstall` deletes the stamp — so a fresh install starts report-only again.
-That is state this tool wrote, not an environment default.
-
-### A changed pass reloads its job (#1738)
-
-An edit to a script a scheduled job runs is silent until that job is reloaded — the loaded job keeps
-the program and environment it was bootstrapped with, which is how an armed reaper becomes inert while
-still reporting itself installed. So the installer stamps the pass's **SHA-256** in
-`$DISK_REAPER_STATE_DIR/disk-reaper.schedule` and forces a reload when the bytes change, even when the
-unit text is byte-identical:
+Mac's venv and worktree classes would fail closed on every pass. That seam is DATA in the declaration
+(`runner=python-launcher`), not a second rendering path.
 
 ```
-pass_changed=yes reload_reason=pass-changed     # launchd: bootout + bootstrap; systemd: daemon-reload + restart
-pass_changed=no  reload_reason=none             # a true no-op
+bash scripts/scheduled-jobs.sh install        # the whole declared set for this platform
+bash scripts/scheduled-jobs.sh status         # installed? loaded? armed? last exit?
+bash scripts/scheduled-jobs.sh parity         # the gate: declaration vs live host, both directions
 ```
 
-`--status` prints `pass_sha=`, `pass_drift=in-sync|CHANGED since install|no-stamp` so a stale install
-is visible on the box instead of being inferred from a log.
+**A changed pass reloads its job (#1738).** An edit to a script a scheduled job runs is silent until
+that job is reloaded — the loaded job keeps the program and environment it was bootstrapped with,
+which is how an armed reaper becomes inert while still reporting itself installed. The installer
+stamps each script's **SHA-256** in `$SJ_STATE_DIR/scheduled-jobs.stamp` and forces a reload when the
+bytes change, even when the artifact text is byte-identical:
+
+```
+pass_changed=1 reload_reason=pass-changed     # launchd: bootout + bootstrap; systemd: daemon-reload + restart
+pass_changed=0 reload_reason=none             # a true no-op
+```
+
+`status` prints `pass_drift=in-sync|CHANGED since install|n/a (owned by …)` so a stale install is
+visible on the box instead of being inferred from a log.
+
+The full contract — the declaration format, the parity gate's failure modes, the unmanaged register,
+and the portability shim every component uses — is in
+[`docs/ops/scheduled-jobs.md`](scheduled-jobs.md).
 
 ## Status — the supervisor answers "did it succeed, and how much did it free"
 
@@ -240,40 +192,21 @@ bytes, and prints a `⛔` line when the pass failed, is stale (older than
 `DISK_REAPER_STALE_SECONDS`, default 7200) or has never run. A failure in one class
 does not hide the others' reclaim — it names the class and its verdict.
 
-`install-disk-reaper-schedule.sh --status` answers the *scheduling* half in one vocabulary on both
-platforms, then prints that same record:
+`bash scripts/scheduled-jobs.sh status` answers the *scheduling* half in one vocabulary on both
+platforms, one line per declared job:
 
 ```
-platform=darwin|linux        scheduler=launchd|systemd     job=<label|unit>
-installed=yes|no             enabled=enabled|disabled      active=active|inactive
-armed=apply|dry-run          interval_seconds=3600         next_run=<...>|unknown
-armed_at=<iso8601>           armed_by=<user>@<host>
-last_exit=<n>|unknown        pass=</path/to/disk-reaper.sh>
-repos=<repo:repo>            runner=<binary> <launcher|pass>   pass_sha=<...>
-pass_drift=in-sync|CHANGED since install
---- pass record ---
-  status=ok|stale|failed|never  mode=apply|dry-run  freed_mb=<n>  ...
-pass_status_rc=0|3
+job=eldato-disk-reaper platform=darwin scheduler=launchd label=com.eldato.disk-reaper
+   installed=yes active=active last_exit=0 armed=dry-run schedule=hourly next_run=unknown pass_drift=in-sync
+  verdict=OK
+verdict=OK platform=darwin
 ```
 
-`armed=`, `repos=` and `runner=` are all read off the **installed artifact**, never off the invoking
-shell: `repos=` answers "which checkouts does the scheduled job scan?", which is a different question
-from "what did this shell export" — a Mac exporting only `$AGENT_INFRA_PATH` used to point the job at
-agent-infra while `resolve_python` handed it the tortoise interpreter, and the empty-repo refusal does
-not fire on one non-empty repo. `runner=` answers it too for the Mac's TCC seam (the checkout's
-interpreter on the farmed launcher) — "there was no tortoise `.venv`, so it fell back to `python3`,
-which cannot read `~/Documents`" is the single most likely reason a Mac pass fails closed.
-
-⛔ `armed_at=`/`armed_by=` are the ONE pair read from the **stamp**
-(`$DISK_REAPER_STATE_DIR/disk-reaper.schedule`), not from the unit or the plist: they record WHEN and BY
-WHOM the arming was decided, which the installed artifact cannot know. Two consequences a reader must
-not miss — a no-flag re-install (what `setup.sh`/`sync.sh` run) carries both forward unchanged, so a
-sync cannot re-date the deletion decision; and `--uninstall` deletes the stamp, so the record of when
-and by whom does **not** survive a removal (the artifact it described is gone too).
-
-Exit codes: `0` scheduled and loaded · `1` not scheduled (the bring-up's FAIL). Whether the last pass
-was *clean* is reported in `pass_status_rc` and the record, **not** folded into this verb's exit code:
-a fresh box whose first pass has not fired yet is scheduled and healthy at the scheduling question.
+Exit codes: `0` every declared job installed, loaded and last-exited-zero · `1` any job ABSENT, INERT
+or FAILED (the bring-up's FAIL) · `3` the scheduler could not be measured. ⛔ A non-zero exit is a
+FAILURE, never OK: the retired unit carried `SuccessExitStatus=0 4 5`, which made a pass that failed a
+class (4) read as success to `systemctl status` — that masking is gone, and a failed pass now shows up
+as `last_exit=4` with `verdict=FAILED`.
 
 `disk-reaper.sh --print-status` prints the same record; exit 0 ok, 3
 failed/stale/never, 2 usage.
@@ -290,8 +223,7 @@ failed/stale/never, 2 usage.
 
 ## Tests
 
-`scripts/disk-reaper.test.sh` — run by the `disk-reaper` shard of
-`run-bash-shards.sh`:
+`scripts/disk-reaper.test.sh` — run by the `disk-reaper` shard of `run-bash-shards.sh`:
 
 | | |
 |---|---|
@@ -308,26 +240,9 @@ failed/stale/never, 2 usage.
 | T14 | a host with neither binary still **classifies** (candidates found, rc=5) and names the fallback; a stub `timeout` on PATH is preferred, and then the report gains no provenance line (#2046) |
 | T15 | a missing `scripts/lib/bounded.sh`, or an unusable `TB_TIMEOUT_BIN`, is a **refusal at startup** (exit 3, no per-class line, no pass record) — never per-class `fail-closed` (#2046) |
 
-`scripts/install-disk-reaper-schedule.test.sh` — its own `run-bash-shards.sh` shard —
-owns the SCHEDULE (`disk-reaper.test.sh` owns the pass):
-
-| | |
-|---|---|
-| T1 | one verb, two schedulers: both backends are rendered in one run and their **mode flags are compared**, so "same flags" is checked, not claimed |
-| T2 | idempotent on both — a second install is a no-op **and reloads nothing** (a bootstrap per bring-up would re-run the pass) |
-| T3 | report-only by default; `--apply` arms; `--status` reads the arming off the **installed** artifact; `--dry-run` reverts |
-| T4 | a changed pass reloads its job (#1738) on both backends, with `reload_reason=pass-changed` |
-| T5 | one status vocabulary: the `key=` set is identical on both platforms and the **pass record block is byte-identical** |
-| T6 | every impossible state is a loud refusal: no scheduler, temp HOME on Darwin (#446 — via the `getent` arm, the `dscl` arm and neither, and a HOME that differs only by a trailing slash is NOT a decline), missing pass, unresolved placeholder, malformed plist |
-| T7 | the Mac does not get a second pass: the job's target is the pass, no per-class script is named, and the `*.plist.tmpl` suffix keeps the job out of `install-launchd.sh`'s glob |
-| T8 | `--uninstall` is reversible and removes the stamp; `--status` then exits 1. ⛔ An uninstall that did NOT take exits 1 and keeps the stamp (the arming is not forfeited by a failure), the removal is read back in every directory in play AND through every manager that owns one, a directory this run neither recorded nor derived is never deleted from, and `--uninstall --dry-run` is REFUSED (exit 2, naming `--preview`) — a flag spelled "dry run" may not remove anything |
-| T9 | static pins: every `rm -rf` in the installer removes only a mktemp dir it made, and the shipped default is the report-only flag |
-| T10 | `--status`'s **exit code** is the contract: a disabled timer, an inactive timer, an `enabled-runtime`/`static`/`transient` one, and a plist left by a `bootout` each exit 1 and name the state; `enabled=` is one line even where `systemctl` prints `disabled` *and* exits 1, and the TOKEN is selected even when a diagnostic line precedes it; an installed job with an empty repo list is not "not installed"; an unwritable state dir costs the stamp (and says what that costs) but not the install; and `active=active` is read on Darwin instead of a constant `inactive` |
-| T11 | both systemd targets: the SYSTEM unit (with `SUDO=""`, i.e. already root — an arm that was dead code) and the USER unit (no `User=`, driven through `systemctl --user`), plus "neither available" as a loud failure |
-| T12 | an owner's arming survives a **no-flag** re-install — the `setup.sh`/`sync.sh` path that used to revert it — and an explicit `--dry-run` (or a fresh install after `--uninstall`) is equally durable |
-
-T9, T10 and T12 were each red on the build that preceded the fresh-context review
-that found them.
+The SCHEDULE half is owned by `scripts/scheduled-jobs.test.sh` (the installer and its verbs),
+`scripts/check-scheduled-parity.test.sh` (the gate) and `scripts/lib/portable.test.sh` (the shim) —
+see [`docs/ops/scheduled-jobs.md`](scheduled-jobs.md) for what each asserts.
 
 ## Deliberately out of scope
 

@@ -10,6 +10,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CHECK="$SCRIPT_DIR/provider-latency-tripwire.sh"
+# PORTABLE_LIB (#2048): the documented seam for the portability shim. The runner below uses
+# `env -i`, which wipes the environment deliberately, so the location must be stated.
+PORTABLE_LIB="$(cd "$SCRIPT_DIR/../lib" && pwd)/portable.sh"
 
 PASS=0
 FAIL=0
@@ -57,7 +60,8 @@ trip() {
   done
   local log="$TMP/run.log" stub_log="$TMP/stub.log" rc out
   : > "$stub_log"; : > "$log"
-  out="$(cd "$TMP" && env -i HOME="$HOME" PATH="$PATH" PLT_KEY=test PLT_LOG="$log" \
+  out="$(cd "$TMP" && env -i HOME="$HOME" PATH="$PATH" PORTABLE_LIB="$PORTABLE_LIB" \
+    PLT_KEY=test PLT_LOG="$log" \
     GH_BIN="$TMP/gh-stub" STUB_LOG="$stub_log" ${envs[@]+"${envs[@]}"} \
     bash "$CHECK" ${args[@]+"${args[@]}"} 2>&1)" && rc=0 || rc=$?
   LAST_OUT="$out"

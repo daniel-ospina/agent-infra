@@ -1,4 +1,30 @@
 #!/usr/bin/env bash
+# ── the portability shim (#2048) ────────────────────────────────────────────────────────────────
+# ONE shim for the four platform differences that made components install and then fail to EXECUTE
+# on one platform (#2046: macOS ships no `timeout`; `nproc`, `stat -c` and `date -d` are GNU-only).
+# Every scheduled component sources it, so a helper used here cannot be a GNU-only spelling. A shim
+# that cannot be loaded is a REFUSAL AT STARTUP (exit 3): running on with no helper is exactly the
+# #2046 shape — the work silently does not happen while the component reports a considered result.
+_PORTABLE_LIB="${PORTABLE_LIB:-}"
+if [ -z "$_PORTABLE_LIB" ]; then
+    _portable_self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+    # `<script dir>/lib` covers `scripts/*.sh`; `<script dir>/../lib` covers a component that lives
+    # in a subdirectory (`scripts/checkout-hygiene/`, `scripts/fleet/`); the farm copy is what a cell
+    # actually has after `pi-bootstrap/setup.sh`.
+    for _portable_cand in "$_portable_self_dir/lib/portable.sh" \
+                          "$_portable_self_dir/../lib/portable.sh" \
+                          "${HOME:-}/.pi/agent/scripts/lib/portable.sh"; do
+        [ -n "$_portable_cand" ] && [ -f "$_portable_cand" ] && { _PORTABLE_LIB="$_portable_cand"; break; }
+    done
+fi
+if [ ! -f "${_PORTABLE_LIB:-}" ]; then
+    printf '%s: FAIL-CLOSED at startup — the portability shim is missing (%s)\n' \
+        "${0##*/}" "${_PORTABLE_LIB:-not beside this script and not in ${HOME:-}/.pi/agent/scripts/lib/}" >&2
+    exit 3
+fi
+# shellcheck source=lib/portable.sh
+. "$_PORTABLE_LIB"
+
 # cleanup-stale-branches.sh — List (and optionally delete) stale branches.
 # Notification-first: dry-run by default.
 #
@@ -483,7 +509,9 @@ cd "$REPO_ROOT"
 # explicit validator is therefore the ONLY thing ruling on this value, in every
 # mode.
 cutoff_epoch() {
-    date -v-${CUTOFF_DAYS}d +%s 2>/dev/null || date -d "${CUTOFF_DAYS} days ago" +%s 2>/dev/null || true
+    # ONE portable spelling (#2048): the shim resolves `-N days ago` on both platforms and returns
+    # EMPTY + non-zero when it cannot, which is exactly what the validator below rules on.
+    _date --parse "${CUTOFF_DAYS} days ago" 2>/dev/null || true
 }
 
 # validate_cutoff_epoch <value> — return 0 (printing nothing) for a cutoff epoch
@@ -1365,7 +1393,7 @@ run_remote_scope() {
             # re-reads the digit string as base 10, so `date` ALWAYS receives plain
             # seconds — the helper above already bounded the normalised value to
             # ≤15 digits, so this arithmetic cannot overflow.
-            COMMIT_DATE_HR="$(date -r "$((10#$COMMIT_DATE))" '+%Y-%m-%d' 2>/dev/null || date -d "@$((10#$COMMIT_DATE))" '+%Y-%m-%d')"
+            COMMIT_DATE_HR="$(_date --fmt "$((10#$COMMIT_DATE))" '%Y-%m-%d')"
             # ⛔ `git branch -r --merged` lists EVERY remote's tracking refs, but
             # deletion is ALWAYS `git push origin --delete ${branch#origin/}`. For
             # a non-origin ref that prefix-strip removes nothing, so the premise

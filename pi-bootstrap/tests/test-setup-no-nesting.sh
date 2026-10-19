@@ -401,13 +401,16 @@ LANE_PRODUCERS_STATE_RESIDUAL="claim.py:#1567 lane-confirm.py:#1797 lane-triage.
 # ⚠️ THE `foreign/` CLASS — a producer a farmed consumer execs from ANOTHER checkout by absolute
 # path. Delivered by that repo's own process, never by this farm, and absent from every box that
 # lacks the checkout — so it is DISCLOSED with an owner and an undisclosed one FAILS. Measured
-# 2026-10-17: TWO sites. `session-postmortem.sh:27` defaults to the eldato repo's
-# `scripts/postmortem.sh`, and that consumer then writes a postmortem whose transcript-pattern section
-# is replaced by a one-line "not found" note, on every box but the owner's (#1921). `safe-send.sh:146`
-# runs a CROSS-CHECKOUT `…/tortoise/tools/cmux_dispatch.py` — and this class's first form required the
+# 2026-10-17: TWO sites, ONE after #1921. `session-postmortem.sh:27` defaulted to the eldato repo's
+# `scripts/postmortem.sh`, and that consumer then wrote a postmortem whose transcript-pattern section
+# was replaced by a one-line "not found" note, on every box but the owner's (#1921) — #1921 VENDORED
+# that producer as `scripts/lib/transcript-patterns.sh` and the consumer now resolves it as a SIBLING,
+# so the site is gone and with it the `foreign:postmortem.sh` entry: the producer is `lib:` now, not
+# foreign. `safe-send.sh:146` runs a CROSS-CHECKOUT `…/tortoise/tools/cmux_dispatch.py` — and this
+# class's first form required the
 # parent directory to be `scripts/`, so that one was invisible while the line above claimed the class was
 # complete: the widening is #1957's, and it is why the form is directory-agnostic now.
-LANE_PRODUCERS_FOREIGN_RESIDUAL="cmux_dispatch.py:#1957 postmortem.sh:#1921"
+LANE_PRODUCERS_FOREIGN_RESIDUAL="cmux_dispatch.py:#1957"
 # ⚠️ DELIVERABLE producers still withheld from every farm array, both owned by #1553 and unchanged
 # from #1552/#1795: `lane-status.py`'s DESTINATION copy is AHEAD of the repo (1993 repo / 2005 live
 # lines at the 2026-10-15 measurement; the live copy carries the #1777 abstention text), so farming
@@ -435,11 +438,15 @@ LAUNCHD_ENTRY_PRODUCERS="heartbeat-loop.sh"
 # entry list exists to pin), and (b) `pi-bootstrap/cell-install.sh`'s own `lane_srcs`/`FARM_LAYOUT`,
 # which is a DIFFERENT installer with its own destination layout. A producer exec'd only from one of
 # those is not in this population; extending here means teaching `farm_source_dir` that destination.
-FARM_ARRAYS="fleet_srcs merge_gate_srcs fleet_tools lane_root_srcs lib_srcs"
+FARM_ARRAYS="fleet_srcs merge_gate_srcs fleet_tools lane_root_srcs lib_srcs config_srcs"
 farm_source_dir() { # <array-name> -> the repo dir its entries are read from
   case "$1" in
     lib_srcs)    printf 'scripts/lib' ;;
     fleet_tools) printf 'tools/fleet' ;;
+    # #2048: the scheduled-jobs declaration and its unmanaged register are read from `config/`, not
+    # `scripts/` — a farm whose data lives elsewhere is exactly the shape this derivation must be
+    # taught, or the command that reads it looks fed while its declaration is never delivered.
+    config_srcs) printf 'config' ;;
     *)           printf 'scripts' ;;
   esac
 }
@@ -473,17 +480,33 @@ check_farm_arrays() { # <repo-root> <label>
 # green over a population that shrank — which is exactly the #1899 defect.
 # Format: `kind:name`, kind ∈ script | lib | state | foreign | other.
 LANE_PRODUCERS_CANONICAL="
-script:ask-owner.py script:beta-progress.py script:disk-reaper.sh script:cadence-nudge.sh script:fleet-cost-report.sh
+script:ask-owner.py script:beta-progress.py script:cadence-nudge.sh script:fleet-cost-report.sh
 script:goal-state.py script:heartbeat-loop.sh script:lane-actions.py script:lane-guard.py
 script:lane-scan-fallback.sh script:lane-status.py script:lane-watchdog.py script:merge-queue.py
-script:objective.py script:orchestrator-heartbeat.sh script:pi-reap-worktrees.sh script:pr-doctor.py
-script:publish-live-workspaces.py script:pi-reap-worktrees-launchd.py script:queue-dispatch.py
-script:safe-send.sh script:session-postmortem.sh
+script:objective.py script:orchestrator-heartbeat.sh script:pi-reap-worktrees.sh
+script:pi-reap-worktrees-launchd.py script:pr-doctor.py
+script:publish-live-workspaces.py script:queue-dispatch.py script:safe-send.sh
+script:session-postmortem.sh
 script:turn-classify.py script:turn-end.py script:undelivered-answers.py script:watch-truncation.sh
-lib:beat-pair.sh lib:bounded.sh lib:diff-normalize.py lib:pid-identity.sh
+lib:beat-pair.sh lib:bounded.sh lib:diff-normalize.py lib:pid-identity.sh lib:portable.sh lib:transcript-patterns.sh
 state:claim.py state:lane-confirm.py state:lane-triage.py state:lane-verdict.py
 state:queues/refresh-queues.py
-foreign:cmux_dispatch.py foreign:postmortem.sh"
+foreign:cmux_dispatch.py"
+# `lib:transcript-patterns.sh` joined on 2026-10-17 (#1921) and `foreign:postmortem.sh` LEFT in the
+# same landing, which is the derivation doing its job: the exec site did not vanish, it CHANGED KIND —
+# the consumer now execs a sibling that `lib_srcs` farms, and the old foreign reference is gone. A
+# REMOVED entry is normally the "exec site was lost" signal; here it was verified against the CODE
+# (`grep -n 'postmortem.sh' scripts/session-postmortem.sh` finds only the `POSTMORTEM_SH` override and
+# the sibling default), not against the pin.
+#
+# #2048 re-cut this pin for the SAME reason, and both moves were verified against the CODE first:
+# `script:disk-reaper.sh` LEFT because its exec site MOVED — the farmed `install-disk-reaper-timer.sh`
+# and its renamed `install-disk-reaper-schedule.sh` both executed it, both are RETIRED, and the pass is
+# now named as a `script=` target in `config/scheduled-jobs.declaration` and rendered into a unit /
+# plist by the farmed `scheduled-jobs.sh`. `script:pi-reap-worktrees-launchd.py` JOINED because that
+# same renderer resolves it as the macOS TCC launcher (`SJ_LAUNCHER`, scheduled-jobs.sh:60) and pins it
+# into the job's ProgramArguments, so a farm that delivers the renderer without the launcher renders a
+# job that cannot start.
 
 # An array's entries, one per line. An ABSENT array (`lane_root_srcs`, until #1553) yields nothing:
 # it is the population floor and the pin that refuse an emptied delivery set, never this reader.
@@ -2017,33 +2040,51 @@ run_setup
 check_content_matches "$DEST/extensions" "run6"
 check_fix_markers "$DEST/extensions" "run6"
 
-# --- #2048 indicator (c): an UNSCHEDULED Mac must FAIL setup, never report done ---------------
-# The ordinary runs above cannot reach this branch: the installer's temp-HOME guard declines (rc=3) before
-# it ever installs (#446), which is the correct production behaviour and exactly why the branch was
-# untested. This run produces a REAL install failure hermetically — `$DISK_REAPER` pointed at a missing
-# file is the installer's own "refusing to install a job that points at a DIFFERENT copy" refusal, which
-# is raised BEFORE any launchd work — so the temp-HOME guard stays in force for every job on this box and
-# nothing (the other installer included) may reach the real GUI domain.
-if [[ "$(uname)" == "Darwin" ]]; then
-  echo "---- reaper-failure probe: setup.sh whose schedule cannot be installed ----" >> "$RUNS_LOG"
-  rc=0
-  DISK_REAPER="$TMP/pass-does-not-exist.sh" \
-    bash "$CLONE/pi-bootstrap/setup.sh" >> "$RUNS_LOG" 2>&1 || rc=$?
-  if [ "$rc" -eq 1 ]; then
-    echo "ok: an UNSCHEDULED Mac FAILS setup (rc=1), instead of reporting done over a box that is never reaped"
-  else
-    fail "setup.sh returned $rc over an un-installable disk-reaper schedule (expected 1)"
-  fi
-  if grep -q 'NO disk-reaper schedule' "$RUNS_LOG" && grep -q 'could NOT be installed' "$RUNS_LOG"; then
-    echo "ok: and it names the unscheduled state, with the command that diagnoses it"
-  else
-    fail "setup.sh did not name the unscheduled state after a failed schedule install"
-  fi
-  if grep -q 'disk reaper: SKIPPED (this run.s HOME is not the real home' "$RUNS_LOG"; then
-    echo "ok: a temp-HOME run is SKIPPED out loud (the installer declined, rc=3) — never a silent absence"
-  else
-    fail "no 'SKIPPED (…not the real home)' line: the decline is not surfaced by setup.sh"
-  fi
+# --- the pi spawn-point gate (#1884) --------------------------------------
+# setup.sh installs spawn-gate.sh AS `pi` in $DEST/bin — first on this fleet's PATH — because the
+# gate must sit where `pi` is born, not where a caller remembers to source it. Pinned BY ARTIFACT and
+# BY BEHAVIOUR (a byte comparison alone would pass on a copy that cannot run): the INSTALLED file is
+# driven as `pi`, with MAX_LOAD=0 as the deterministic refusal lever and a fake real pi behind it.
+# The defect this exists for: a hand-written runner that sourced nothing started lanes on a box at
+# load 258 against its own ceiling of 100, with no refusal, no log line and no count.
+echo "== the pi spawn-point gate (#1884)"
+GATE_SRC="$ROOT/scripts/orchestrator-harness/spawn-gate.sh"
+GATE_DST="$DEST/bin/pi"
+if [ -f "$GATE_DST" ] && cmp -s "$GATE_SRC" "$GATE_DST"; then
+  echo "ok: setup.sh installed the spawn-point gate byte-identical at \$DEST/bin/pi"
+else
+  fail "setup.sh did not install the spawn-point gate at $GATE_DST (missing or stale) — every \`pi\` a hand-written runner starts would be ungated and silent"
+fi
+if [ -x "$GATE_DST" ]; then
+  echo "ok: the installed gate is executable (PATH skips a non-executable entry, silently)"
+else
+  fail "$GATE_DST is not executable — PATH would resolve past the gate"
+fi
+mkdir -p "$TMP/gate-real"
+printf '#!/usr/bin/env bash\nprintf RAN > "%s"\n' "$TMP/gate-ran" > "$TMP/gate-real/pi"
+chmod +x "$TMP/gate-real/pi"
+rm -f "$TMP/gate-ran"
+HOME="$HOME_DIR" MAX_LOAD=0 PATH="$DEST/bin:$TMP/gate-real:$PATH" pi -p "gate probe" >/dev/null 2>&1 || true
+if [ ! -e "$TMP/gate-ran" ]; then
+  echo "ok: the installed gate REFUSED a spawn at MAX_LOAD=0 (the real pi never ran)"
+else
+  fail "the installed gate allowed a spawn at MAX_LOAD=0 — 'spawn nothing' is not enforced"
+fi
+HOME="$HOME_DIR" MAX_LOAD=999999999 PATH="$DEST/bin:$TMP/gate-real:$PATH" pi -p "gate probe" >/dev/null 2>&1 || true
+if [ -e "$TMP/gate-ran" ]; then
+  echo "ok: POSITIVE CONTROL — below the ceiling the installed gate EXECs the real pi"
+else
+  fail "the installed gate blocked a spawn below the ceiling: every refusal above would be vacuous"
+fi
+# A re-run must REFRESH a mutated copy: a stale gate is worse than a missing one (the missing one is
+# loud; the stale one certifies a ceiling it no longer applies).
+rm -f "$TMP/gate-ran"
+echo "# drift injected by the test" >> "$GATE_DST"
+run_setup
+if cmp -s "$GATE_SRC" "$GATE_DST"; then
+  echo "ok: a mutated spawn-point gate was REFRESHED by the re-run (the repo copy is the copy that runs)"
+else
+  fail "a cell-local mutation of the spawn-point gate survived the re-run"
 fi
 
 # --- done -----------------------------------------------------------------
@@ -2061,26 +2102,11 @@ if [[ "$(uname)" == "Darwin" ]]; then
   else
     fail "no setup.sh runs recorded — cannot verify launchctl isolation"
   fi
-  # ⛔ PER INSTALLER, PER RUN (#2048 review). TWO installers manage launchd (install-launchd.sh and the
-  # cross-platform schedule installer), so a single global count lets one guard go SILENT while the other
-  # keeps the number up — which is exactly what a `-ge` floor did. Each run's own log section must show
-  # BOTH: install-launchd's refusal AND the schedule decision (SKIPPED on a temp HOME, or the install
-  # failure the negative probe is about). The guard probe's section is not one of these runs.
-  missing="$(awk '
-      /^---- / {
-          if (tracked && sec != "" && (!il || !sc)) print sec
-          sec = $0; il = 0; sc = 0
-          tracked = ($0 ~ /^---- (setup\.sh run|reaper-failure probe)/)
-          next
-      }
-      /see scripts\/install-launchd\.test\.sh/ { il = 1 }
-      /disk reaper:|the disk reaper/            { sc = 1 }
-      END { if (tracked && sec != "" && (!il || !sc)) print sec }
-  ' "$RUNS_LOG")"
-  if [ -z "$missing" ] && [ "$setup_runs" -ge 1 ]; then
-    echo "ok: EVERY run saw BOTH launchd-managing installers answer (refusal + schedule decision), across $setup_runs runs"
+  guard_hits="$(grep -c 'refusing to manage launchd jobs' "$RUNS_LOG" || true)"
+  if [ "$guard_hits" -eq "$setup_runs" ] && [ "$setup_runs" -ge 1 ]; then
+    echo "ok: temp-HOME guard fired on all $setup_runs runs"
   else
-    fail "a run let one installer answer alone — sections missing a decision: $(printf '%s' "$missing" | head -3 | tr '\n' ' ')"
+    fail "temp-HOME guard fired $guard_hits/$setup_runs runs (expected every run)"
   fi
 else
   echo "ok: launchctl-isolation assertions skipped (non-Darwin)"

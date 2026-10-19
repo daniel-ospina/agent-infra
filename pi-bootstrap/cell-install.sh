@@ -176,6 +176,7 @@ FARM_LAYOUT="$(printf '%s\n' \
   $'lane_root_srcs\tscripts\tscripts' \
   $'lane_srcs\tscripts/lane\tscripts' \
   $'lib_srcs\tscripts/lib\tscripts/lib' \
+  $'config_srcs\tconfig\tscripts/config' \
   $'fleet_tools\ttools/fleet\tscripts/fleet')"
 
 # Files pi itself auto-extracts into ~/.pi/agent/tools/ and therefore tolerates (#1277).
@@ -699,6 +700,52 @@ migrate_legacy_tools_farm() {
   fi
 }
 
+# ── the pi spawn-point gate (#1884) ───────────────────────────────────────────
+# Installed as `$DEST/bin/pi`, because the gate must be where `pi` is BORN rather than where a caller
+# remembers to source it: `spawn-gate.sh` is ALSO an executable whose invoked identity is the gate
+# (see "THE SPAWN POINT" in that file), and it is installed under the name a caller types. PATH on a
+# cell begins with `$CELL_HOME/.pi/agent/bin`, so every `pi` a cell starts — lane.sh, fix-one.sh,
+# merge-one.sh, a hand-written runner, an interactive session — resolves here.
+# WHY THIS IS SPECIFICALLY A CELL PROBLEM (the measured incident): a cell controller started three
+# lanes from a hand-written runner (`tmux new-session -d -s <name> "… pi -p …"`), which never sources
+# spawn-gate.sh. The box was at load 258 on 10 cores against MAX_LOAD=100 and NOTHING refused,
+# because nothing consulted the ceiling — no refusal, no log line, no count.
+# ONE COPY from ONE source (the file the harness callers source), so the ceiling a caller applies and
+# the ceiling the spawn point applies cannot drift. A real copy, not a symlink, for the #427 reason
+# (cell HOME is under a world-writable /tmp, and a symlink into a checkout dangles when a worktree is
+# reaped — a dangling `pi` on PATH breaks every lane on the box).
+# ⛔ THE TWO PATHS ARE DERIVED INSIDE EACH FUNCTION, NOT AT TOP LEVEL. `$INFRA_ROOT` and `$DEST` are
+# resolved by `main()` and the paths are unset before it (a copy of this script outside a checkout is
+# one of the states under test: `set -u` would abort at load with "INFRA_ROOT: unbound variable"
+# before the installer's own "no checkout" refusal could print — the exact false reason run 6 of
+# pi-bootstrap/tests/test-cell-install.sh exists to catch).
+install_spawn_gate() {
+  local src="$INFRA_ROOT/scripts/orchestrator-harness/spawn-gate.sh" dst="$DEST/bin/pi"
+  if [ ! -f "$src" ]; then
+    die "$src is missing from the checkout — the pi spawn-point gate (#1884) cannot be installed, so a hand-written runner's \`pi\` would be ungated and silent"
+  fi
+  install_file "$src" "$dst" || die "could not install $dst"
+  say "pi spawn-point gate installed at $dst (#1884)"
+}
+
+# Check (both modes; READ-ONLY). Byte-compared, not `[ -e ]`: a stale or hand-edited copy of a GATE
+# is worse than a missing one, because the missing one is loud while the stale one certifies a
+# ceiling it no longer applies.
+guard_spawn_gate() {
+  local src="$INFRA_ROOT/scripts/orchestrator-harness/spawn-gate.sh" dst="$DEST/bin/pi"
+  if [ ! -f "$src" ]; then
+    fail "$src is missing from the checkout — verify cannot vouch for the spawn-point gate it did not read"
+    return 0
+  fi
+  if [ ! -f "$dst" ]; then
+    fail "pi spawn-point gate MISSING: $dst — every \`pi\` started by a caller that does not source spawn-gate.sh (a hand-written runner, a tmux one-liner) would be UNGATED AND SILENT, which is #1884"
+  elif ! cmp -s "$src" "$dst"; then
+    fail "pi spawn-point gate DIFFERS from the checkout: $dst (a stale or hand-edited copy — the ceiling it applies is not the one this install reviewed)"
+  elif [ ! -x "$dst" ]; then
+    fail "pi spawn-point gate is NOT EXECUTABLE: $dst — PATH would resolve past it to the real pi, silently"
+  fi
+}
+
 # Check (both modes; READ-ONLY — it must not even remove an empty directory, because
 # `--verify` is documented as writing nothing and a reader may run it on a live cell).
 guard_tools_dir() {
@@ -1091,6 +1138,7 @@ PY
   fi
 
   guard_tools_dir
+  guard_spawn_gate
 
   if [ "$FAILURES" -eq 0 ]; then
     say "LAYER VERIFIED — $DEST carries the farmed scripts, the guards, the skills and the config"
@@ -1120,6 +1168,7 @@ main() {
     install_extension_deps
     install_skills
     install_config
+    install_spawn_gate
     migrate_legacy_tools_farm
     # LAST: the UNFARM leg can refuse (a contradiction, an unremovable artifact, a checkout
     # without the leg). Running it here means a refusal follows a COMPLETE install, so the

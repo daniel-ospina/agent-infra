@@ -1,0 +1,171 @@
+# config/scheduled-jobs.declaration — THE declaration (agent-infra#2048).
+#
+# ⛔ ONE PLACE. Every scheduled component the fleet runs is described HERE, once, and both platform
+# artifacts are RENDERED from this record — a systemd `.service`+`.timer` on Linux, a launchd
+# `.plist` on Darwin. Nothing about a schedule may live only in a unit file, a plist, or in someone's
+# `~/Library/LaunchAgents`. That is the defect this file removes: measured 2026-10-18, the Mac ran 35
+# launchd components, `install.sh` knew exactly 1, and the repo's `templates/systemd/` held ZERO
+# units — so the Linux cells received none of the scheduled harness layer at all.
+#
+# THE INVENTORY IS ENFORCED, NOT DOCUMENTED. `scripts/check-scheduled-parity.sh` compares THIS file
+# against the live host in both directions and fails on either: a scheduled job the host runs that is
+# not declared here (undeclared), and a record declared here that the host does not run (missing).
+# Nothing is silently tolerated — a job that must stay out of fleet management is listed with a REASON
+# in config/scheduled-jobs.unmanaged, and a register entry whose job is gone is itself a FAILURE.
+#
+# ── FORMAT ──────────────────────────────────────────────────────────────────────────────────────
+# A record starts with `job <id>` and continues until the next `job`. `key=value`, one per line,
+# `#` comments and blank lines ignored. Values keep their spaces; `env KEY=VALUE` is repeatable.
+#
+#   job <id>                       stable name: `--only <id>`, status rows, and the systemd unit base
+#   platforms=linux,darwin         where it must run (both platforms render from this one record)
+#   schedule=hourly|daily|weekly|<N>s|<N>m|<N>h
+#   script=<path or basename>      resolved at install: $SJ_FARM (the farm) first, then this repo
+#   runner=bash|python|python-launcher
+#                                  `python-launcher` is the macOS TCC seam (#427/#1095): a
+#                                  launchd-spawned `bash` cannot read a repo under ~/Documents, so the
+#                                  job starts an interpreter that CAN and hands it the script. On Linux
+#                                  the same record renders as a plain bash ExecStart — the seam is data,
+#                                  not a second implementation.
+#   args=<fixed arguments>         spaces are preserved; quoted in both renderings
+#   arming=report-only|armed       the SHIPPED stance (#1678). `install --apply` arms for one run and
+#                                  the flag lands INSIDE the rendered artifact, never in a default.
+#   managed=yes|no                 yes: scripts/scheduled-jobs.sh renders + installs it.
+#                                  no: another named owner installs it; the parity check still holds
+#                                      it to installed+active, and `install` delegates to `owner`.
+#   owner=<script>                 REQUIRED when managed=no. Never implied, never guessed.
+#   label=<launchd label>          REQUIRED when darwin is in platforms.
+#   unit=<systemd unit base>       default: the id.
+#   description=<one line>
+# #   env KEY=VALUE                  repeatable. `@home @path @state @repos @tortoise` are rendered from
+#                                  machine state at install time.
+#
+# ── WHAT WAS RETIRED INTO THIS DECLARATION ─────────────────────────────────────────────────────
+# The consolidated pass replaced FOUR per-class triggers on the Mac with one (templates/launchd/
+# RETIRED): `com.eldato.pi-cache-reap` became the `uv` class, `com.tortoise.worktree-reaper` became
+# the `worktree` class. `com.tortoise.branch-reaper` (deletes branch REFS — a class no disk sink owns)
+# and `com.eldato.pi-session-reaper` (reaps idle pi PROCESSES) are kept and declared below: they are
+# not disk sinks, and folding them in would be a different feature, not a consolidation.
+
+# ── the consolidated disk reaper — the ONE managed job, on BOTH platforms ──────────────────────
+job eldato-disk-reaper
+  description=eldato disk reaper — bound uv caches, reap dead lane venvs and merged worktrees
+  platforms=linux,darwin
+  schedule=hourly
+  script=disk-reaper.sh
+  runner=python-launcher
+  arming=report-only
+  managed=yes
+  owner=scheduled-jobs.sh
+  label=com.eldato.disk-reaper
+  unit=eldato-disk-reaper
+  # The worktree owner must ask GitHub which PRs are open before it may delete anything. A busy cell
+  # shares one account with every other box, so this sits above the harness shim's backoff window; if
+  # it still cannot answer, the class FAILS CLOSED (an open-PR checkout is never guessed at).
+  env DISK_REAPER_STATE_DIR=@state
+  env DISK_REAPER_REPOS=@repos
+  env DISK_REAPER_WT_AGED_DAYS=7
+  env REAP_WT_GH_TIMEOUT=300
+  # Measured budgets, not inherited defaults: at the 300s default a pass over 454 worktrees spent the
+  # whole budget classifying and reported DEFERRED=432 (#1095); the 20s gh timeout killed the probe
+  # (rc=124, fail-closed) on a loaded box; 2048MB is the per-cache bound the uv class enforces.
+  env REAP_WT_BUDGET_SECONDS=1800
+  env CACHE_REAP_MAX_MB=2048
+
+# ── declared, owned by install-launchd.sh (managed=no) ─────────────────────────────────────────
+# These are the harness jobs that already exist as templates/launchd/*.plist. They are declared so the
+# PARITY CHECK can see them — an inventory that omits them is exactly how 34 of 35 jobs stayed
+# invisible. They are NOT installed by scheduled-jobs.sh: each has machine state its own installer
+# carries (a swarm root, a tortoise checkout, a ci-runner probe), and re-rendering them here would put
+# two installers on one artifact.
+job corruption-canary
+  description=checkout corruption canary (swarm ~/swarm)
+  platforms=darwin
+  schedule=900s
+  script=checkout-hygiene/corruption_canary.py
+  runner=python
+  managed=no
+  owner=install-launchd.sh
+  label=com.eldato.corruption-canary
+  env SWARM_ROOT=@home/swarm
+
+job deepseek-balance-watch
+  description=deepseek balance watch
+  platforms=darwin
+  schedule=900s
+  script=checkout-hygiene/deepseek-balance-watch.sh
+  runner=bash
+  managed=no
+  owner=install-launchd.sh
+  label=com.eldato.deepseek-balance-watch
+
+job fleet-cost-weekly
+  description=fleet cost, weekly
+  platforms=darwin
+  schedule=weekly
+  script=fleet-cost-weekly.sh
+  runner=bash
+  managed=no
+  owner=install-launchd.sh
+  label=com.eldato.fleet-cost-weekly
+
+job lane-liveness
+  description=lane liveness sweep
+  platforms=darwin
+  schedule=1800s
+  script=fleet/lane_liveness.py
+  runner=python
+  managed=no
+  owner=install-launchd.sh
+  label=com.eldato.lane-liveness
+
+job pi-session-reaper
+  description=reap idle pi processes
+  platforms=darwin
+  schedule=hourly
+  script=pi-reap-idle.sh
+  runner=bash
+  managed=no
+  owner=install-launchd.sh
+  label=com.eldato.pi-session-reaper
+
+job pi-task-session-prune
+  description=bound the task-session retention root (#783)
+  platforms=darwin
+  schedule=hourly
+  script=pi-task-session-prune.sh
+  runner=bash
+  managed=no
+  owner=install-launchd.sh
+  label=com.eldato.pi-task-session-prune
+
+job provider-latency-tripwire
+  description=provider latency tripwire
+  platforms=darwin
+  schedule=hourly
+  script=checkout-hygiene/provider-latency-tripwire.sh
+  runner=bash
+  managed=no
+  owner=install-launchd.sh
+  label=com.eldato.provider-latency-tripwire
+
+job branch-reaper
+  description=delete merged local branch refs (not a disk sink)
+  platforms=darwin
+  schedule=86400s
+  script=cleanup-stale-branches.sh
+  runner=python-launcher
+  args=--repo @tortoise --scope local
+  managed=no
+  owner=install-launchd.sh
+  label=com.tortoise.branch-reaper
+
+job ci-runner-gate
+  description=ci runner gate probe
+  platforms=darwin
+  schedule=300s
+  script=ci_runner_gate.sh
+  runner=bash
+  managed=no
+  owner=install-launchd.sh
+  label=com.tortoise.ci-runner-gate

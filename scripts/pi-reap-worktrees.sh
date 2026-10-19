@@ -1,4 +1,30 @@
 #!/usr/bin/env bash
+# ── the portability shim (#2048) ────────────────────────────────────────────────────────────────
+# ONE shim for the four platform differences that made components install and then fail to EXECUTE
+# on one platform (#2046: macOS ships no `timeout`; `nproc`, `stat -c` and `date -d` are GNU-only).
+# Every scheduled component sources it, so a helper used here cannot be a GNU-only spelling. A shim
+# that cannot be loaded is a REFUSAL AT STARTUP (exit 3): running on with no helper is exactly the
+# #2046 shape — the work silently does not happen while the component reports a considered result.
+_PORTABLE_LIB="${PORTABLE_LIB:-}"
+if [ -z "$_PORTABLE_LIB" ]; then
+    _portable_self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+    # `<script dir>/lib` covers `scripts/*.sh`; `<script dir>/../lib` covers a component that lives
+    # in a subdirectory (`scripts/checkout-hygiene/`, `scripts/fleet/`); the farm copy is what a cell
+    # actually has after `pi-bootstrap/setup.sh`.
+    for _portable_cand in "$_portable_self_dir/lib/portable.sh" \
+                          "$_portable_self_dir/../lib/portable.sh" \
+                          "${HOME:-}/.pi/agent/scripts/lib/portable.sh"; do
+        [ -n "$_portable_cand" ] && [ -f "$_portable_cand" ] && { _PORTABLE_LIB="$_portable_cand"; break; }
+    done
+fi
+if [ ! -f "${_PORTABLE_LIB:-}" ]; then
+    printf '%s: FAIL-CLOSED at startup — the portability shim is missing (%s)\n' \
+        "${0##*/}" "${_PORTABLE_LIB:-not beside this script and not in ${HOME:-}/.pi/agent/scripts/lib/}" >&2
+    exit 3
+fi
+# shellcheck source=lib/portable.sh
+. "$_PORTABLE_LIB"
+
 # pi-reap-worktrees.sh — reap provably-reclaimable git worktree checkouts (#1095).
 #
 # Why this exists: on 2026-09-15 the `tortoise` repo had 407 worktrees and
@@ -422,7 +448,11 @@ lock_acquire() {
         if is_pos_int "$started" && is_pos_int "$now" && [ "$now" -ge "$started" ]; then
             age=$((now - started))
         else
-            mtime="$(/bin/date -r "$LOCK_DIR" +%s 2>/dev/null || printf '')"
+            # ⛔ `/bin/date -r <path>` is NOT portable: GNU `date -r` reads a REFERENCE FILE, but the
+            # BSD/macOS `date -r` takes EPOCH SECONDS — so on the laptop this line printed nothing and
+            # the lock's age read as 0 ("not stale") for ever. The shim's `_stat_mtime` is one rule on
+            # both platforms (#2048).
+            mtime="$(_stat_mtime "$LOCK_DIR" 2>/dev/null || printf '')"
             if is_pos_int "$mtime" && is_pos_int "$now" && [ "$now" -ge "$mtime" ]; then
                 age=$((now - mtime))
             fi

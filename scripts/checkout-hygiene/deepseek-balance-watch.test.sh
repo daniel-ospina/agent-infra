@@ -45,6 +45,9 @@ or_resp() { printf '%s\n%s\n0.9\n' "$2" "$1" > "$SIM/out.$OSLUG"; }  # or_resp <
 reset() { rm -f "$ST"; : > "$CONSEC"; rm -f "$CONSEC.or"; chat '{"choices":[{"message":{"content":"OK"}}]}'; }
 
 LAST_OUT=""
+# PORTABLE_LIB (#2048): the only documented seam for the portability shim. `env -i` below wipes the
+# environment on purpose, so the shim's location has to be stated here rather than inherited.
+PORTABLE_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/portable.sh"
 # watch <want_exit> <label> [VAR=val ...]
 watch() {
   local want="$1" label="$2"; shift 2
@@ -55,6 +58,7 @@ watch() {
   local log="$T/run.log" rc out
   : > "$log"
   out="$(cd "$T" && env -i HOME="$HOME" PATH="$PATH" \
+    PORTABLE_LIB="$PORTABLE_LIB" \
     DBW_KEY=test DBW_STATE_FILE="$ST" DBW_CURL_STATE="$SIM" DBW_LOG="$log" \
     DBW_LATCH_PY="$LATCH" DBW_OR_KEY=or-test DBW_CONSEC_FILE="$CONSEC" \
     ${envs[@]+"${envs[@]}"} \

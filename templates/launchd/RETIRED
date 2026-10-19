@@ -20,9 +20,10 @@ com.eldato.skill-lint-oracle
 # ── #2048: the per-class reapers that the CONSOLIDATED pass replaced ────────────────────────────
 # The Mac had four reaper triggers and four report formats, and no single answer to "is this box
 # being reaped, how much did the last pass free, did it succeed" — the defect #2032 consolidated on
-# the cells. `com.eldato.disk-reaper` (templates/launchd/com.eldato.disk-reaper.plist.tmpl, installed
-# by scripts/install-disk-reaper-schedule.sh) is now the ONE clock for the three disk sinks, and it
-# runs the same `disk-reaper.sh` entry point with the same flags as the cells' systemd timer.
+# the cells. `com.eldato.disk-reaper` — RENDERED by scripts/scheduled-jobs.sh from the
+# `eldato-disk-reaper` record in config/scheduled-jobs.declaration, not from a template file — is now
+# the ONE clock for the three disk sinks, and it runs the same `disk-reaper.sh` entry point with the
+# same flags as the cells' systemd timer.
 #   com.eldato.pi-cache-reap       → the pass's `uv`       class (owner: scripts/pi-cache-reap.sh)
 #   com.tortoise.worktree-reaper   → the pass's `worktree` class (owner: scripts/pi-reap-worktrees.sh)
 # Each retired label ran the SAME owner script the pass resolves, so nothing's delete rule changed —

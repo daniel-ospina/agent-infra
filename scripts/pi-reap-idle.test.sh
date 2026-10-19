@@ -241,15 +241,17 @@ sed 's/cmux) return 1 ;;/cmux) return 0 ;;/' "$REAPER" > "$REAPER_G3OFF"
 
 run_reaper_bin() { # <binary> <env-name> args... — reaper with full shim env
     local bin="$1" envname="$2"; shift 2
-    # PID_IDENTITY_LIB: the scenario copy lives in $T/bin, so the script's own
-    # sibling lib/pid-identity.sh lookup would miss (and the reaper FAIL-CLOSES
-    # exit 3 without it). Point the documented seam at the REAL library.
+    # PID_IDENTITY_LIB / PORTABLE_LIB: the scenario copy lives in $T/bin, so the
+    # script's own sibling lib/ lookup would miss (and the reaper FAIL-CLOSES exit 3
+    # without either). Point the documented seams at the REAL libraries — the same
+    # contract #2048 gives the portability shim.
     # NOTE: the env list below must stay ONE logical line — a comment inside a
     # backslash continuation terminates the assignment list and leaves HOME/PATH
     # assigned to the TEST shell instead of the child (and mutating PATH).
     HOME="$T/$envname/home" \
     PATH="$T/bin:$PATH" \
     PID_IDENTITY_LIB="$SCRIPT_DIR/lib/pid-identity.sh" \
+    PORTABLE_LIB="$SCRIPT_DIR/lib/portable.sh" \
     PS_BIN="$T/bin/ps" KILL_BIN="$T/bin/kill" DATE_BIN="${DATE_BIN:-$T/bin/date}" \
     FAKE_PS_SOURCE="$T/$envname/ps-source" \
     FAKE_SELF_TTY="${FAKE_SELF_TTY:-tts900}" \

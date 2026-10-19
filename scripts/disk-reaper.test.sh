@@ -253,13 +253,16 @@ assert_contains "$ST" "candidates_worktree=0" "T7 classes that did not run are r
 assert_contains "$ST" "verdict_uv=ok" "T7 the per-class verdict is readable without the log"
 
 # ── T8: the SCHEDULE is installable, idempotent, and armed ──────────────────────────────────────
-# A reaper nobody runs is the defect. The unit is rendered from machine state, so "it installs" is
-# asserted on the RENDERED FILE (armed, with the repos), not on the template's existence; the second
-# install must be a no-op (a bring-up runs this on every check).
-INST="$HERE/install-disk-reaper-schedule.sh"
+# A reaper nobody runs is the defect. Since #2048 the schedule is not a template: `scheduled-jobs.sh`
+# RENDERS it from config/scheduled-jobs.declaration, so "it installs" is asserted on the RENDERED unit
+# the box would actually run — armed with this box's repos — and a second install must be a no-op
+# (a bring-up runs this on every check). The job's lifecycle is owned by scheduled-jobs.test.sh; what
+# THIS suite owns is that the pass is the thing being scheduled, with its flags.
+INST="$HERE/scheduled-jobs.sh"
 ENVNAME=t8
 REPO="$(mk_repo t8repo)"
-mkdir -p "$T/t8/units" "$T/t8/bin" "$T/t8/home"
+mkdir -p "$T/t8/units" "$T/t8/bin" "$T/t8/home" "$T/t8/farm" "$T/t8/owners"
+: >"$T/t8/none.register"
 cat >"$T/t8/bin/systemctl" <<'SC'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"${SYSTEMCTL_CALLS:-/dev/null}"
@@ -273,50 +276,52 @@ exit 0
 SC
 chmod +x "$T/t8/bin/systemctl"
 inst() { # inst <args...>
-    # DISK_REAPER_PLATFORM=linux: this section pins the SYSTEMD backend (#2048's other backend and its
-    # own suite are exercised by install-disk-reaper-schedule.test.sh), so the assertion must not change
-    # meaning with the kernel the suite happens to run on.
-    HOME="$T/t8/home" DISK_REAPER="$REAPER" DISK_REAPER_REPOS="$REPO" \
-    DISK_REAPER_PLATFORM=linux \
-    DISK_REAPER_STATE_DIR="$T/t8/home/.pi/agent/state" \
-    SYSTEMD_UNIT_DIR="$T/t8/units" SYSTEMCTL="$T/t8/bin/systemctl" SYSTEMCTL_CALLS="$T/t8/calls.log" \
-    bash "$INST" "$@"
+    # PORTABLE_PLATFORM=linux: this section pins the SYSTEMD backend, so the assertion must not change
+    # meaning with the kernel the suite happens to run on. --no-parity: the closing gate measures the
+    # REAL host, and a test must never depend on (or report on) the machine it runs on.
+    HOME="$T/t8/home" PATH="$T/t8/bin:$PATH" PORTABLE_PLATFORM=linux \
+    SJ_DECLARATION="$HERE/../config/scheduled-jobs.declaration" \
+    SJ_UNMANAGED_REGISTER="$T/t8/none.register" SJ_FARM="$T/t8/farm" SJ_OWNER_DIR="$T/t8/owners" \
+    SJ_REPOS="$REPO" SJ_STATE_DIR="$T/t8/home/.pi/agent/state" \
+    SJ_SYSTEMD_UNIT_DIR="$T/t8/units" SJ_SYSTEMCTL="$T/t8/bin/systemctl" \
+    SYSTEMCTL_CALLS="$T/t8/calls.log" \
+    bash "$INST" --only eldato-disk-reaper --no-parity "$@"
 }
-OUT="$(inst --install 2>&1)"; RC=$?
-assert_eq "$RC" "0" "T8 the installer succeeds against the test's own unit dir"
+OUT="$(inst install 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T8 the ONE installer converges the schedule onto the test's own unit dir"
 assert_file "$T/t8/units/eldato-disk-reaper.timer" "T8 the timer unit is installed"
 assert_file "$T/t8/units/eldato-disk-reaper.service" "T8 the service unit is installed"
 # #1678's owner ruling, and the reason this default flipped in #2048: a deletion tool SHIPS report-only
 # and arming is a separate, visible step. The default is therefore the pass's dry-run flag.
-assert_contains "$(cat "$T/t8/units/eldato-disk-reaper.service")" "disk-reaper.sh --dry-run" \
+assert_contains "$(cat "$T/t8/units/eldato-disk-reaper.service")" 'disk-reaper.sh" "--dry-run"' \
     "T8 the DEFAULT install is REPORT-ONLY (the mode flag is rendered into ExecStart)"
 assert_contains "$(cat "$T/t8/units/eldato-disk-reaper.service")" "DISK_REAPER_REPOS=$REPO" \
     "T8 the rendered unit carries this box's repo (the venv/worktree classes need one)"
 assert_contains "$(cat "$T/t8/calls.log")" "enable --now eldato-disk-reaper.timer" \
     "T8 the timer is ENABLED, not just written"
-OUT="$(inst --install 2>&1)"
+assert_contains "$OUT" "pass_changed=1" "T8 a first install boots the job (nothing was loaded before)"
+OUT="$(inst install 2>&1)"
 assert_contains "$OUT" "changed=0" "T8 a second install is a no-op (the bring-up re-runs it every check)"
+assert_contains "$OUT" "pass_changed=0" "T8 …and reloads nothing (#1738: a needless reload re-runs the pass)"
 # ARMING IS EXPLICIT AND LANDS IN THE UNIT — this is the cell's shape (its bring-up passes --apply
 # because the feature was instructed to run unattended), and it is readable from the installed file.
-OUT="$(inst --install --apply 2>&1)"; RC=$?
-assert_eq "$RC" "0" "T8 --install --apply succeeds"
-assert_contains "$(cat "$T/t8/units/eldato-disk-reaper.service")" "disk-reaper.sh --apply" \
+OUT="$(inst install --apply 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T8 install --apply succeeds"
+assert_contains "$(cat "$T/t8/units/eldato-disk-reaper.service")" 'disk-reaper.sh" "--apply"' \
     "T8 --apply renders the ARMED pass into ExecStart (never an environment default)"
 assert_contains "$OUT" "changed=1" "T8 arming a report-only install is a change (it reloads the job)"
-# Re-running with --dry-run flips it back: reversible, one copy, no drift.
-OUT="$(inst --install --dry-run 2>&1)"
-assert_contains "$(cat "$T/t8/units/eldato-disk-reaper.service")" "disk-reaper.sh --dry-run" \
-    "T8 --dry-run puts the report-only mode back"
-# --preview is the no-write mode (the flag that used to be spelled --dry-run).
-OUT="$(inst --preview 2>&1)"
-assert_contains "$OUT" "would install" "T8 --preview reports without writing"
-OUT="$(inst --status 2>&1)"; RC=$?
-assert_eq "$RC" "0" "T8 --status exits 0 for a healthy install"
-assert_contains "$OUT" "installed=yes" "T8 --status reports the install"
-assert_contains "$OUT" "enabled=enabled" "T8 --status reports the timer as enabled"
-assert_contains "$OUT" "armed=dry-run" "T8 --status reads the arming off the INSTALLED unit"
-assert_contains "$OUT" "pass_drift=in-sync" "T8 --status reports whether the pass changed since install"
-assert_contains "$OUT" "scheduler=systemd" "T8 --status names the scheduler in the shared vocabulary"
+assert_contains "$OUT" "armed=apply" "T8 …and the arming is read back off the INSTALLED unit"
+# Re-running with --report-only flips it back: reversible, one copy, no drift.
+inst install --report-only >/dev/null 2>&1
+assert_contains "$(cat "$T/t8/units/eldato-disk-reaper.service")" 'disk-reaper.sh" "--dry-run"' \
+    "T8 --report-only puts the report-only mode back"
+OUT="$(inst status 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T8 status exits 0 for a healthy install"
+assert_contains "$OUT" "installed=yes" "T8 status reports the install"
+assert_contains "$OUT" "enabled=enabled" "T8 status reports the timer as enabled"
+assert_contains "$OUT" "armed=dry-run" "T8 status reads the arming off the INSTALLED unit"
+assert_contains "$OUT" "pass_drift=in-sync" "T8 status reports whether the pass changed since install"
+assert_contains "$OUT" "scheduler=systemd" "T8 status names the scheduler in the shared vocabulary"
 
 # ── T9: a contender that LOSES the lock does not release it ────────────────────────────────────
 # The EXIT trap is installed before acquire_lock runs, so the contention exit passes THROUGH it. If
@@ -354,28 +359,42 @@ ST="$(cat "$T/t11/state/disk-reaper.status" 2>/dev/null || true)"
 assert_contains "$ST" "freed_mb=0" "T11 a dry-run pass records 0 bytes freed"
 assert_contains "$ST" "mode=dry-run" "T11 and it says it was a dry run"
 
-# ── T12: the installer's dry run is a dry run, and a missing pinned reaper is refused ───────────
+# ── T12: --preview writes nothing, and a declaration that cannot render is REFUSED ──────────────
+# Two ways "it installed" can be a lie: an install that wrote despite being told to preview, and a
+# record whose script does not resolve (the job would be installed and then fail every hour). Both
+# must be loud, and neither may leave a half-installed artifact behind.
 ENVNAME=t12
 REPO="$(mk_repo t12)"
-inst() {
-    HOME="$T/t12/home" DISK_REAPER="$T/t12/reaper.sh" DISK_REAPER_REPOS="$REPO" \
-    DISK_REAPER_PLATFORM=linux \
-    SYSTEMD_UNIT_DIR="$T/t12/units" SYSTEMCTL="$T/t8/bin/systemctl" SYSTEMCTL_CALLS="$T/t12/calls.log" \
-    bash "$INST" "$@"
-}
-mkdir -p "$T/t12/unused"
-cp "$REAPER" "$T/t12/reaper.sh"
+mkdir -p "$T/t12/units" "$T/t12/home"
 : >"$T/t12/calls.log"
-OUT="$(inst --preview --uninstall 2>&1)"; RC=$?
-assert_eq "$RC" "0" "T12 --preview --uninstall succeeds"
-assert_absent "$(cat "$T/t12/calls.log")" "disable" \
-    "T12 --preview --uninstall disables NOTHING (flag order must not change the verb)"
-assert_absent "$(cat "$T/t12/calls.log")" "stop" "T12 and it stops nothing"
-OUT="$(DISK_REAPER="$T/t12/not-here.sh" HOME="$T/t12/home" DISK_REAPER_REPOS="$REPO" \
-    DISK_REAPER_PLATFORM=linux \
-    SYSTEMD_UNIT_DIR="$T/t12/units" SYSTEMCTL="$T/t8/bin/systemctl" SYSTEMCTL_CALLS="$T/t12/calls2.log" \
-    bash "$INST" --install 2>&1)"; RC=$?
-assert_eq "$RC" "2" "T12 a SET but missing \$DISK_REAPER is refused (never a silent different copy)"
+inst12() { # inst12 <declaration> <args...>
+    local decl="$1"; shift
+    HOME="$T/t12/home" PATH="$T/t8/bin:$PATH" PORTABLE_PLATFORM=linux \
+    SJ_DECLARATION="$decl" SJ_UNMANAGED_REGISTER="$T/t8/none.register" \
+    SJ_FARM="$T/t12/farm" SJ_OWNER_DIR="$T/t8/owners" SJ_REPOS="$REPO" \
+    SJ_STATE_DIR="$T/t12/home/.pi/agent/state" \
+    SJ_SYSTEMD_UNIT_DIR="$T/t12/units" SJ_SYSTEMCTL="$T/t8/bin/systemctl" \
+    SYSTEMCTL_CALLS="$T/t12/calls.log" \
+    bash "$INST" --only eldato-disk-reaper --no-parity "$@"
+}
+OUT="$(inst12 "$HERE/../config/scheduled-jobs.declaration" install --preview 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T12 install --preview succeeds"
+assert_contains "$OUT" "preview" "T12 --preview announces itself instead of pretending to install"
+[ ! -f "$T/t12/units/eldato-disk-reaper.timer" ] \
+    && ok "T12 --preview wrote NO unit (a preview that installs is the defect this pins)" \
+    || bad "T12 --preview wrote NO unit (a preview that installs is the defect this pins)"
+assert_absent "$(cat "$T/t12/calls.log")" "enable" "T12 --preview enables nothing"
+# A managed record whose script is nowhere must be refused at VALIDATION, before any artifact exists.
+BROKEN="$T/t12/broken.declaration"
+sed 's/^  script=.*/  script=no-such-pass.sh/' \
+    "$HERE/../config/scheduled-jobs.declaration" >"$BROKEN"
+OUT="$(inst12 "$BROKEN" install 2>&1)"; RC=$?
+[ "$RC" -ne 0 ] && ok "T12 a record whose script does not resolve is REFUSED (rc=$RC)" \
+    || bad "T12 a record whose script does not resolve is REFUSED (got rc=0)"
+assert_contains "$OUT" "does not resolve" "T12 …and the refusal names the unresolvable script"
+[ ! -f "$T/t12/units/eldato-disk-reaper.timer" ] \
+    && ok "T12 the refused record installed nothing (no unit for a job that cannot run)" \
+    || bad "T12 the refused record installed nothing (no unit for a job that cannot run)"
 
 # ── T13: the bounded-execution resolver's ORDER is pinned (#2046) ───────────────────────────────
 # `timeout` is GNU coreutils; macOS ships neither it nor `gtimeout`. ONE helper

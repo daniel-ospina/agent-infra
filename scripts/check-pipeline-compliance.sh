@@ -1852,7 +1852,7 @@ if [[ "${PIPELINE_COMPLIANCE_SELF_TEST:-0}" == "1" ]]; then
   # Every one of these reads `true` if the entry is widened to `templates/`.
   expect_artifact_only 'templates executable workflow (NOT .md)' $'modified\ttemplates/.github/workflows/pipeline-compliance.yml\t' false
   expect_artifact_only 'templates husky hook (NOT .md)' $'modified\ttemplates/.husky/pre-commit\t' false
-  expect_artifact_only 'templates launchd plist (NOT .md)' $'modified\ttemplates/launchd/com.eldato.disk-reaper.plist.tmpl\t' false
+  expect_artifact_only 'templates launchd plist (NOT .md)' $'modified\ttemplates/launchd/com.eldato.pi-session-reaper.plist\t' false
   expect_artifact_only 'templates .gitignore (NOT .md)' $'modified\ttemplates/.gitignore\t' false
   # The `$` end-anchor is what makes the `.md` restriction NARROW rather than
   # notational, and nothing pinned it: dropping only the trailing `$` leaves all

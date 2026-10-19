@@ -1,4 +1,30 @@
 #!/usr/bin/env bash
+# ── the portability shim (#2048) ────────────────────────────────────────────────────────────────
+# ONE shim for the four platform differences that made components install and then fail to EXECUTE
+# on one platform (#2046: macOS ships no `timeout`; `nproc`, `stat -c` and `date -d` are GNU-only).
+# Every scheduled component sources it, so a helper used here cannot be a GNU-only spelling. A shim
+# that cannot be loaded is a REFUSAL AT STARTUP (exit 3): running on with no helper is exactly the
+# #2046 shape — the work silently does not happen while the component reports a considered result.
+_PORTABLE_LIB="${PORTABLE_LIB:-}"
+if [ -z "$_PORTABLE_LIB" ]; then
+    _portable_self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+    # `<script dir>/lib` covers `scripts/*.sh`; `<script dir>/../lib` covers a component that lives
+    # in a subdirectory (`scripts/checkout-hygiene/`, `scripts/fleet/`); the farm copy is what a cell
+    # actually has after `pi-bootstrap/setup.sh`.
+    for _portable_cand in "$_portable_self_dir/lib/portable.sh" \
+                          "$_portable_self_dir/../lib/portable.sh" \
+                          "${HOME:-}/.pi/agent/scripts/lib/portable.sh"; do
+        [ -n "$_portable_cand" ] && [ -f "$_portable_cand" ] && { _PORTABLE_LIB="$_portable_cand"; break; }
+    done
+fi
+if [ ! -f "${_PORTABLE_LIB:-}" ]; then
+    printf '%s: FAIL-CLOSED at startup — the portability shim is missing (%s)\n' \
+        "${0##*/}" "${_PORTABLE_LIB:-not beside this script and not in ${HOME:-}/.pi/agent/scripts/lib/}" >&2
+    exit 3
+fi
+# shellcheck source=lib/portable.sh
+. "$_PORTABLE_LIB"
+
 # provider-latency-tripwire.sh — hourly probe of api.deepseek.com; files a
 # deduped GitHub issue when per-call latency regresses.
 #

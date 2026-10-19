@@ -35,10 +35,12 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REAPER="$SCRIPT_DIR/pi-cache-reap.sh"
 # #2048: the per-class launchd job is RETIRED — this script is now the `uv` CLASS of the consolidated
-# pass, scheduled by scripts/install-disk-reaper-schedule.sh (com.eldato.disk-reaper on the Mac, the
-# eldato-disk-reaper timer on a cell). The template checked here is the one that schedules that pass.
-TEMPLATE="$SCRIPT_DIR/../templates/launchd/com.eldato.disk-reaper.plist.tmpl"
-SCHED_INSTALLER="$SCRIPT_DIR/install-disk-reaper-schedule.sh"
+# pass. The schedule is not a template any more: `scripts/scheduled-jobs.sh` RENDERS both platform
+# artifacts from the `eldato-disk-reaper` record in config/scheduled-jobs.declaration, so the two
+# things pinned below are the declaration and the ONE renderer.
+DECLARATION="$SCRIPT_DIR/../config/scheduled-jobs.declaration"
+SCHED_INSTALLER="$SCRIPT_DIR/scheduled-jobs.sh"
+SCHED_LIB="$SCRIPT_DIR/lib/scheduled-jobs.sh"
 SETUP="$SCRIPT_DIR/../pi-bootstrap/setup.sh"
 ORCH="$SCRIPT_DIR/orchestrator-harness/orch-loop.sh"
 SUPERVISOR="$SCRIPT_DIR/cloud-cell-supervisor.sh"
@@ -953,23 +955,27 @@ echo
 echo "── 10. wiring: a bound no box runs is the defect ──"
 assert_contains "$(sed -n 's/^fleet_srcs=(\(.*\))$/\1/p' "$SETUP")" "pi-cache-reap.sh" \
     "pi-bootstrap/setup.sh's farm declares pi-cache-reap.sh (it is the copy the boxes execute)"
-[ -f "$TEMPLATE" ] && ok "the consolidated pass has a launchd template" || bad "missing $TEMPLATE"
+[ -f "$DECLARATION" ] && ok "the consolidated pass is DECLARED (config/scheduled-jobs.declaration)" || bad "missing $DECLARATION"
+assert_contains "$(cat "$DECLARATION" 2>/dev/null)" "job eldato-disk-reaper" \
+    "the pass has its own record in the declaration"
+assert_contains "$(cat "$DECLARATION" 2>/dev/null)" "label=com.eldato.disk-reaper" \
+    "…naming the Mac's label"
+assert_contains "$(cat "$DECLARATION" 2>/dev/null)" "platforms=linux,darwin" \
+    "…and BOTH platforms, so a cell renders the same pass"
 # The Mac's clock now runs the PASS, and the pass resolves this script as its `uv` class — so the
 # schedule reaches the farmed copy ($HOME/.pi/agent/scripts) through disk-reaper.sh's delegate chain
 # rather than by a plist naming this file. Both halves are pinned: the pass owns the class, and the
 # template hands the pass the farmed path.
 assert_contains "$(cat "$SCRIPT_DIR/disk-reaper.sh")" "pi-cache-reap.sh" \
     "the consolidated pass resolves pi-cache-reap.sh as its uv class (one owner of the policy)"
-assert_contains "$(cat "$TEMPLATE" 2>/dev/null)" "{{REAPER}}" \
-    "the plist runs the PASS (whose uv class is this script), not a per-class trigger"
-assert_contains "$(cat "$TEMPLATE" 2>/dev/null)" "{{MODE_FLAG}}" \
-    "the mode flag is RENDERED by the installer, never baked into the template"
-assert_contains "$(cat "$SCHED_INSTALLER" 2>/dev/null)" 'MODE_FLAG="--dry-run"' \
-    "the installer's DEFAULT is the dry-run flag, the stance #1678's owner ruling requires"
-assert_contains "$(cat "$TEMPLATE" 2>/dev/null)" "#1678" \
-    "the template names the ruling it follows, so the next lane does not 'tidy' it either way"
-assert_contains "$(cat "$TEMPLATE" 2>/dev/null)" "<integer>{{INTERVAL}}</integer>" \
-    "the template's interval is rendered (one hourly value for both platforms)"
+assert_contains "$(cat "$SCHED_LIB" 2>/dev/null)" "sj_resolve_script" \
+    "the renderer resolves the pass from the record (so the job runs the PASS, not a per-class trigger)"
+assert_contains "$(cat "$SCHED_LIB" 2>/dev/null)" "report-only) printf -- '--dry-run" \
+    "the mode flag is RENDERED from the arming stance, never a baked-in argument"
+assert_contains "$(cat "$SCHED_LIB" 2>/dev/null)" "#1678" \
+    "the renderer names the ruling it follows, so the next lane does not 'tidy' it either way"
+assert_contains "$(cat "$SCHED_LIB" 2>/dev/null)" "StartInterval" \
+    "the launchd rendering carries the interval (one hourly value for both platforms)"
 assert_contains "$(cat "$ORCH" 2>/dev/null)" "\"\$_cache_reaper\" --dry-run" \
     "the CELL's clock also runs UNARMED (the armed arm is the supervisor's low-disk prune)"
 assert_contains "$(cat "$ORCH" 2>/dev/null)" ".cache-reap-blocked" \
@@ -983,10 +989,14 @@ echo
 echo "── 10c. portability pins (the launchd clock is macOS) ──"
 # `date -r <path>` is GNU-only: the BSD/macOS `date -r` takes EPOCH SECONDS, so it returns empty
 # there — every age fell back to 0, a stale lock was never broken (exit 4 = silence to both
-# callers) and the loud mis-set-lock refusal degraded to a silent skip. The family idiom is
-# `stat -f %m || stat -c %Y`.
+# callers) and the loud mis-set-lock refusal degraded to a silent skip.
+# ⛔ The SPELLING moved into ONE place (#2048): the component sources the portability shim and asks
+# it for the age, instead of carrying its own `stat -f %m || stat -c %Y` copy (a copy is what drifts
+# between the two spellings, and the drift is invisible on one platform).
 assert_not_contains "$(grep -v '^#' "$REAPER")" 'date -r' "no GNU-only 'date -r <path>' in EXECUTED code (it means epoch seconds on macOS)"
-assert_contains "$(cat "$REAPER")" 'stat -f %m' "mtime is read with the family's portable stat idiom"
+assert_contains "$(cat "$REAPER")" 'lib/portable.sh' "the component loads the portability shim"
+assert_contains "$(cat "$REAPER")" '_stat_mtime' "mtime is read through the shim's ONE portable rule"
+assert_eq "$(grep -v '^#' "$REAPER" | grep -c 'stat -f')" "0" "no hand-rolled BSD stat spelling is left in EXECUTED code"
 
 echo ""
 echo "── Summary ───────────────────────────────────────────────────────"

@@ -107,7 +107,11 @@ export PATH="$FAKEBIN:$PATH"
 # only in the two places a real retirement edits (the farm array, the manifest). `tools/`
 # is required by cell-install.sh (it farms tools/fleet/*.py), not by setup.sh.
 mkdir -p "$COPY"
-cp -R "$ROOT/pi-bootstrap" "$ROOT/scripts" "$ROOT/extensions" "$ROOT/skills" "$ROOT/templates" "$ROOT/tools" "$COPY/"
+# `config/` joined in #2048: the scheduled-jobs declaration is a FARM SOURCE (`config_srcs`), and a
+# checkout copy without it makes setup.sh refuse the run — which is the farm's own loud failure, not a
+# fixture artifact. A source tree a farm reads from must exist in the copy for the same reason `tools/`
+# does: a farm that cannot find its source is exactly the state this fixture exists to reproduce.
+cp -R "$ROOT/pi-bootstrap" "$ROOT/scripts" "$ROOT/extensions" "$ROOT/skills" "$ROOT/templates" "$ROOT/tools" "$ROOT/config" "$COPY/"
 cp "$ROOT/manifest.json" "$COPY/manifest.json"
 
 # declared_set.py <setup.sh> <checkout-root> — print the paths a farm DECLARES, relative
@@ -129,6 +133,7 @@ LAYOUT = {
     "lane_srcs": "scripts",      # FARM_LAYOUT: src scripts/lane, DEST scripts (flat)
     "lib_srcs": "scripts/lib",
     "fleet_tools": "scripts/fleet",   # source tools/fleet, DEST scripts/fleet
+    "config_srcs": "scripts/config",  # #2048: source config/, DEST scripts/config (the declaration)
 }
 
 src = open(setup_path).read()
