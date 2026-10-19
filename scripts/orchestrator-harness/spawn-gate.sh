@@ -294,9 +294,10 @@ can_spawn() { [ "${1:-0}" -lt "$MAX_LOAD" ]; }
 # keys on 75 alone will mis-read a disk refusal, and a caller that keys on the exit status alone will
 # mis-read a `pi` that exited 75 for its own reason. That is why the early contract here named only the load gate, and
 # after #1765 it no longer can. The distinction from "the agent ran and failed" is what matters:
-# merge-one.sh records a `needsfix-<PR>-<head>` marker for the latter. Recording one for a load
-# refusal would authorise a fixer for a review that never happened, burn a MAX_FIX_TRIES attempt and
-# eventually park the PR (the same failure class as agent-infra#1716).
+# merge-one.sh records a `needsfix-<PR>-<head>` marker for a verdict WITH findings (and, since
+# agent-infra#2132, a `needsreview-<PR>-<head>` one for a verdict it could not parse). Recording a
+# FINDINGS marker for a load refusal would authorise a fixer for a review that never happened, burn a
+# MAX_FIX_TRIES attempt and eventually park the PR (the same failure class as agent-infra#1716).
 AGENT_LOAD_REFUSED=75
 # The disk gate's refusal code, and it is a SEPARATE code on purpose: the remedies are opposite. A
 # load refusal clears when the box quietens and the controller re-dispatches next cycle; a disk
@@ -388,9 +389,10 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   # ⛔ A REFUSAL AT THE SPAWN POINT IS THIS GATE'S OWN REFUSAL (agent-infra#1884). Without this arm
   # the installed `pi`'s 76 is read by every caller as "the agent ran and failed" — and the two
   # consequences are both real: fix-one.sh re-runs the merge chain for a fixer that never ran, and
-  # merge-one.sh's default verdict arm records `needsfix-<PR>-<head>`, authorising a fixer for a
-  # REVIEW that never happened, which burns a MAX_FIX_TRIES attempt and eventually parks the PR
-  # (#1716/#1720 class). The load is read twice on purpose (here, and again in the shim) — the band
+  # merge-one.sh's verdict arm would spend one of its bounded re-reviews (a `needsreview` marker since
+  # #2132; a FIXER authorisation before it) on a REVIEW that never happened, which burns a fix loop
+  # attempt and eventually parks the PR (#1716/#1720 class). The load is read twice on purpose (here,
+  # and again in the shim) — the band
   # between them is milliseconds, and closing it by trusting an env marker from the caller would
   # hand the bypass back. So the SECOND refusal is translated into the FIRST: no agent ran
   # (AGENT_STARTED=0), the caller sees AGENT_LOAD_REFUSED, and no walltime row is written.

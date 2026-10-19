@@ -148,6 +148,12 @@ else
   echo "  open PRs: <needs a repo checkout and gh>"
 fi
 echo "  parked (needs a human): $(ls "$O"/state/parked-* 2>/dev/null | wc -l | tr -d ' ')"
+# ⛔ THE STALE-EVIDENCE COUNT IS ITS OWN LINE (agent-infra#2132), because it is a DIFFERENT queue with
+# a DIFFERENT remedy: a parked PR needs a human, while a `needsreview-<PR>-<head>` PR only needs the
+# review re-run. Indicator (b) of that issue is "the count of open PRs stalled on stale evidence
+# stays at 0", and before this line nothing in the harness could answer it at all — the state lived
+# only in a merged worker's log. Read-only, dependency-free, one marker per PR+head.
+echo "  stale evidence (needs re-review): $(ls "$O"/state/needsreview-* 2>/dev/null | wc -l | tr -d ' ')"
 cap=3
 [ -n "${MAX_FIX_TRIES:-}" ] && case "$MAX_FIX_TRIES" in ''|*[!0-9]*) ;; *) cap="$MAX_FIX_TRIES" ;; esac
 atcap=0

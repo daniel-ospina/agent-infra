@@ -533,6 +533,21 @@ refund_bailed_fixer() {
   return 0
 }
 
+# review_gate_state <pr> <head-sha> — WHY the repo's review gate is red, as the CONTROLLER must act:
+#   NEEDS-FIX     a reviewer reported findings at this head  -> a FIXER is authorised
+#   NEEDS-REVIEW  no findings exist at this head (evidence stale, or no verdict was produced)
+#                 -> re-run the REVIEW; a fixer is NEVER authorised
+# ⛔ ONE VOCABULARY WITH THE PRODUCER (agent-infra#2132). merge-one.sh's review_state_record() writes
+# exactly these two markers and nothing else may authorise a fixer, so the log line and the dispatch
+# decision cannot diverge. Before this the controller logged a bare `FAILED:ai-review-gate`, which is
+# indistinguishable from a genuine rejection: a fixer dispatched on stale evidence pushes, the push
+# invalidates the signed review by design, and one MAX_FIX_TRIES attempt is burnt per cycle until the
+# PR is parked with no owner. Absent BOTH markers reads NEEDS-REVIEW — the fail-closed direction,
+# because "nothing says findings exist" must never be spent as if it did.
+review_gate_state() {
+  if [ -f "$O/state/needsfix-$1-$2" ]; then printf 'NEEDS-FIX'; else printf 'NEEDS-REVIEW'; fi
+}
+
 # single-instance lock (atomic: noclobber create fails if the file exists)
 LOCKF="$O/.orch.lock"
 acq() { ( set -o noclobber; echo $$ > "$LOCKF" ) 2>/dev/null; }
@@ -1819,6 +1834,9 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
     case "$V" in
       GREEN)
         gh pr ready "$PR" --repo "$OR" >/dev/null 2>&1 || true
+        # A green head has converged: a stale-evidence marker from an earlier state is no longer
+        # true, and report.sh counts these as "stalled on stale evidence" (agent-infra#2132).
+        rm -f "$O/state/needsreview-$PR-"* 2>/dev/null || true
         if [ "$MERGE_AUTHORITY" = "rail" ]; then
           # RAIL MODE (agent-infra#1764). The repo does NOT require the review gate, so the merge
           # authority is its own rail (scripts/admin-merge.sh), which computes head-bound evidence
@@ -1904,6 +1922,20 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
           # A bailed fixer must not have consumed an attempt, and this arm DELETED the findings
           # marker at spawn — so restore it too (P2, second review round).
           refund_bailed_fixer "$PR" "${HEAD_N:-}" 1
+          # ⛔ ONE STATE, ONE REMEDY (agent-infra#2132). The gate being red is not a diagnosis: a head
+          # with FINDINGS needs a fixer, and a head with no findings (stale/missing evidence, or a
+          # reviewer that produced no verdict) needs another REVIEW. They were the same log line and
+          # the same dispatch before this — so a stale-evidence PR was handed to a fixer whose push
+          # invalidated the signed review again, burning one attempt per cycle until the cap parked
+          # an issue nobody owned. The classifier is the ONLY input to both the log line and the
+          # dispatch decision, so the two cannot disagree.
+          _rgs="$(review_gate_state "$PR" "${HEAD_N:-}")"
+          if [ "$_rgs" = "NEEDS-FIX" ]; then
+            echo "#$PR NEEDS-FIX (reviewer findings at head=${HEAD_N:-?}) — a fixer is the remedy" >>"$LOG"
+          else
+            echo "#$PR NEEDS-REVIEW (no findings and no head-bound clean evidence at head=${HEAD_N:-?}) — the remedy is another review, NOT a fixer" >>"$LOG"
+            [ -n "${HEAD_N:-}" ] && touch "$O/state/needsreview-$PR-$HEAD_N" 2>/dev/null
+          fi
           # The claim file is written by merge-one.sh itself, so it also covers the chain-<N>
           # path (which invokes merge-one.sh directly and whose session name is invisible here).
           if claim_live "$PR" "${HEAD_N:-}" || sess "fix-$PR" || sess "merge-$PR"; then
@@ -1912,8 +1944,8 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
             FIXN="$O/state/fixcount-$PR"; NF="$(cat "$FIXN" 2>/dev/null || echo 0)"
             is_num "$NF" || NF=0
             # a reviewer already reported real issues AT THIS HEAD -> fix them and re-run the chain.
-            # otherwise the gate is probably just missing evidence -> re-record (fresh review).
-            if [ -n "${HEAD_N:-}" ] && [ -f "$O/state/needsfix-$PR-$HEAD_N" ] \
+            # otherwise the gate is missing evidence -> re-record (fresh review).
+            if [ -n "${HEAD_N:-}" ] && [ "$_rgs" = "NEEDS-FIX" ] \
                && [ "$NF" -lt "${MAX_FIX_TRIES:-3}" ] \
                && can_spawn \
                && [ "$(tmux ls 2>/dev/null | grep -c '^fix-')" -lt "$MF" ]; then
@@ -1930,7 +1962,7 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
               else
                 echo "#$PR fixer spawn FAILED (attempt not consumed, marker kept)" >>"$LOG"
               fi
-            elif [ "$NF" -ge "${MAX_FIX_TRIES:-3}" ] && [ -f "$O/state/needsfix-$PR-$HEAD_N" ]; then
+            elif [ "$NF" -ge "${MAX_FIX_TRIES:-3}" ] && [ "$_rgs" = "NEEDS-FIX" ]; then
               # Terminal state. Without this the cap just falls through to the re-record branch
               # every cycle: an unfixable PR would burn a full fresh-context review forever.
               park_ctrl "$PR" "${HEAD_N:-}" "still needs fixes after $NF attempts at head=${HEAD_N:-?} (MAX_FIX_TRIES=$MAX_FIX_TRIES) -- a human must decide; a push re-arms it, or: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"

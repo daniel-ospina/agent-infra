@@ -1756,5 +1756,105 @@ else
 fi
 
 echo
+echo "=== #2132: a head nobody reviewed is NEEDS-REVIEW, never a fixer authorisation ==="
+# ⛔ THE PRODUCER AND THE CONSUMER ARE EXTRACTED FROM THE LIVE SCRIPTS (merge-one.sh writes the
+# state, orch-loop.sh acts on it), never copied here — a copy would keep passing after the shipped
+# pair drifted apart, which is the defect this section exists to catch. Both are DRIVEN, because a
+# grep cannot tell a live arm from one neutered to `if false` (the inert-enforcer class).
+{
+  grep -m1 '^is_limit() {' "$MERGE"
+  grep -m1 '^is_num() {' "$MERGE"
+  awk '/^verdict_class\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "$MERGE"
+  awk '/^review_state_record\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "$MERGE"
+} > "$TMP/reviewstate.sh"
+ex review_gate_state > "$TMP/fn_review_gate_state.sh"
+# ⛔ NON-EMPTY AND DEFINED, not merely `bash -n`-clean (P2, first review round): `bash -n` on an EMPTY
+# file exits 0, so a renamed/moved function extracted to nothing and the whole section its `&&` guard
+# then SKIPPED its assertions — a suite that passes by testing nothing, the same false-PASS shape this
+# file's own drifts guards exist for. The definition greps make the extraction falsifiable.
+_rs_sz="$(wc -c < "$TMP/reviewstate.sh" | tr -d ' ')"; _rgs_sz="$(wc -c < "$TMP/fn_review_gate_state.sh" | tr -d ' ')"
+if [ "${_rs_sz:-0}" -gt 0 ] && [ "${_rgs_sz:-0}" -gt 0 ] \
+   && grep -q '^verdict_class() {' "$TMP/reviewstate.sh" \
+   && grep -q '^review_state_record() {' "$TMP/reviewstate.sh" \
+   && grep -q '^review_gate_state() {' "$TMP/fn_review_gate_state.sh" \
+   && bash -n "$TMP/reviewstate.sh" 2>/dev/null && bash -n "$TMP/fn_review_gate_state.sh" 2>/dev/null; then
+  RS="$TMP/rso"; mkdir -p "$RS/state"
+  _vc() { ( . "$TMP/reviewstate.sh"; verdict_class "$1" ); }
+  # _rs <class> <head> [max] — drive the PRODUCER exactly as merge-one.sh's `*)` arm calls it. The
+  # park stub mirrors the REAL park() in merge-one.sh (which writes `parked-<PR>` = the head plus the
+  # reason): a stub that wrote only the reason would let a park pass here and land nowhere in
+  # production, which is the inert-enforcer shape this section exists to catch.
+  _rs() {
+    ( O="$RS"; L="$RS/merge.log"; PR=2132; HEAD="$2"; MAX_REVIEW_TRIES="${3:-3}"
+      park() { printf '%s\n' "$*" > "$RS/parkreason"; [ -n "${HEAD:-}" ] && printf '%s\n' "$HEAD" > "$RS/state/parked-$PR"; }
+      . "$TMP/reviewstate.sh"; review_state_record "$1" )
+  }
+  # _rgs <pr> <head> — drive the CONSUMER's classifier against the same state dir.
+  _rgs() { ( O="$RS"; . "$TMP/fn_review_gate_state.sh"; review_gate_state "$1" "$2" ); }
+  _clean() { rm -f "$RS"/state/needsfix-* "$RS"/state/needsreview-* "$RS"/state/parked-* "$RS"/state/reviewcount-* "$RS/parkreason"; : > "$RS/merge.log"; }
+
+  eqv "an ISSUES verdict is a FIXER state" "ISSUES" "$(_vc 'ISSUES 3')"
+  eqv "a CLEAN verdict keeps its own class" "CLEAN" "$(_vc 'CLEAN https://github.com/o/r/pull/1#issuecomment-9')"
+  eqv "an EMPTY final line is NO-VERDICT, not ISSUES" "NO-VERDICT" "$(_vc '')"
+  eqv "an unparseable final line is NO-VERDICT too" "NO-VERDICT" "$(_vc 'I read it and I think it is fine')"
+
+  # (1) CONTROL: findings at a head authorise a fixer and write NO stale-evidence marker.
+  _clean; _rs ISSUES aaaa1111
+  done_issues=1
+  [ -f "$RS/state/needsfix-2132-aaaa1111" ] && [ ! -f "$RS/state/needsreview-2132-aaaa1111" ] || done_issues=0
+  [ "$done_issues" = "1" ] \
+    && { echo "  ✅ a reviewer's FINDINGS record the fixer marker (and no stale-evidence marker)"; PASS=$((PASS+1)); } \
+    || { echo "  ❌ ISSUES did not leave exactly the fixer marker — fixer=$( [ -f "$RS/state/needsfix-2132-aaaa1111" ] && echo yes || echo no) needsreview=$( [ -f "$RS/state/needsreview-2132-aaaa1111" ] && echo yes || echo no)"; FAIL=$((FAIL+1)); }
+  eqv "…and the controller classifies that head NEEDS-FIX" "NEEDS-FIX" "$(_rgs 2132 aaaa1111)"
+
+  # (2) THE DEFECT (#2132): a reviewer that produced NO verdict left a FIXER marker, so the
+  # controller spent a MAX_FIX_TRIES attempt on a head nobody had reviewed — the fixer pushed, the
+  # push invalidated the signed review by design, and the PR could never converge. The remedy for a
+  # no-verdict head is another REVIEW; it must never authorise a fixer.
+  _clean; _rs NO-VERDICT bbbb2222
+  if [ -f "$RS/state/needsreview-2132-bbbb2222" ] && [ ! -f "$RS/state/needsfix-2132-bbbb2222" ]; then
+    echo "  ✅ a reviewer that produced NO verdict records stale evidence — NOT a fixer authorisation"; PASS=$((PASS+1))
+  else
+    echo "  ❌ a no-verdict head wrote the FIXER marker (needsfix=$( [ -f "$RS/state/needsfix-2132-bbbb2222" ] && echo yes || echo no), needsreview=$( [ -f "$RS/state/needsreview-2132-bbbb2222" ] && echo yes || echo no)) — the controller would burn fixer attempts on an unreviewed head"; FAIL=$((FAIL+1))
+  fi
+  eqv "…and the controller classifies that head NEEDS-REVIEW" "NEEDS-REVIEW" "$(_rgs 2132 bbbb2222)"
+  # (3) INERT-BY-ABSENCE: with no marker at all the controller must NOT authorise a fixer. "Nothing
+  # says findings exist" is not "findings exist", and the fail-closed direction is the re-review.
+  eqv "no marker at all reads NEEDS-REVIEW (fail-closed, never a fixer)" "NEEDS-REVIEW" "$(_rgs 2132 cccc3333)"
+  # (4) BOUNDED: a reviewer that never returns a verdict must not buy an unbounded run of PAID
+  # reviews (the #1717 class, one input over). The count is per HEAD, so a push re-arms it.
+  _clean; _rs NO-VERDICT dddd4444; _rs NO-VERDICT dddd4444
+  [ -f "$RS/state/needsreview-2132-dddd4444" ] && [ ! -f "$RS/state/parked-2132" ] \
+    && { echo "  ✅ a second no-verdict at the SAME head is still a re-review, not yet a park"; PASS=$((PASS+1)); } \
+    || { echo "  ❌ the re-review loop did not survive its second attempt at one head (parked=$( [ -f "$RS/state/parked-2132" ] && echo yes || echo no))"; FAIL=$((FAIL+1)); }
+  _rs NO-VERDICT dddd4444
+  if [ "$(cat "$RS/state/parked-2132" 2>/dev/null)" = "dddd4444" ] && [ ! -f "$RS/state/needsreview-2132-dddd4444" ] \
+     && grep -qi 'no usable verdict' "$RS/parkreason" 2>/dev/null; then
+    echo "  ✅ MAX_REVIEW_TRIES PARKS the head — bounded, with a reason naming that NOTHING was reviewed"; PASS=$((PASS+1))
+  else
+    echo "  ❌ the no-verdict loop is UNBOUNDED (parked=[$(cat "$RS/state/parked-2132" 2>/dev/null)] marker=$( [ -f "$RS/state/needsreview-2132-dddd4444" ] && echo yes || echo no) reason=[$(cat "$RS/parkreason" 2>/dev/null | cut -c1-60)])"; FAIL=$((FAIL+1))
+  fi
+  # (5) …and the bound belongs to the HEAD: a new push retries instead of inheriting the cap.
+  _rs NO-VERDICT eeee5555
+  [ -f "$RS/state/needsreview-2132-eeee5555" ] \
+    && { echo "  ✅ a NEW head re-arms the re-review budget (it does not inherit the previous head's cap)"; PASS=$((PASS+1)); } \
+    || { echo "  ❌ a new head inherited the old head's re-review count and was parked without an attempt"; FAIL=$((FAIL+1)); }
+  # (6) WIRING: the `*)` arm must USE the classifier, and the controller's dispatch must read the
+  # STATE — a helper nothing calls would leave both scripts exactly as broken as before.
+  awk '/^  \*\)$/{f=1} f&&/^    ;;$/{print;exit} f' "$MERGE" > "$TMP/merge_star_arm.sh"
+  if grep -qF 'review_state_record "$(verdict_class "$LAST")"' "$TMP/merge_star_arm.sh" \
+     && ! grep -qF 'touch "$O/state/needsfix-$PR-$HEAD"' "$TMP/merge_star_arm.sh"; then
+    echo "  ✅ merge-one.sh's verdict arm routes through the classifier (no unconditional fixer marker)"; PASS=$((PASS+1))
+  else
+    echo "  ❌ merge-one.sh's verdict arm does not route through the classifier, or still writes the fixer marker unconditionally"; FAIL=$((FAIL+1))
+  fi
+  wpin "orch-loop.sh classifies the red gate before dispatching" "$ORCH" '_rgs="$(review_gate_state "$PR" "${HEAD_N:-}")"'
+  wpin "…and authorises a fixer ONLY on NEEDS-FIX" "$ORCH" '[ "$_rgs" = "NEEDS-FIX" ]'
+  wpin "report.sh surfaces the stale-evidence queue (indicator b)" "$HERE/report.sh" 'stale evidence (needs re-review)'
+else
+  echo "  ❌ the verdict/state functions did not extract to syntactically valid shell from merge-one.sh / orch-loop.sh"; FAIL=$((FAIL+1))
+fi
+
+echo
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
 [ "$FAIL" -eq 0 ]
