@@ -33,6 +33,14 @@
 #       the same pass with a stub `timeout` on PATH proves resolution prefers the binary (#2046).
 #   T15 a missing library, or an unusable TB_TIMEOUT_BIN, is a REFUSAL AT STARTUP (exit 3, no
 #       per-class line) — never a pass whose classes each report fail-closed and then complete.
+#   T16 the installer refuses a system unit rendered from transient scratch space (the cells' 127),
+#       and the installed unit's SuccessExitStatus is exactly {0, 6}.
+#   T17 the VENV class ALONE clears a dead lane's .venv and never a live one's — same fixture, same
+#       age, both floors out of the way, so the live holder is the only difference (#2159).
+#   T18 a delegate's exit is neither swallowed nor painted red: 3 (refused) => pass 6 with ok=0, 5
+#       (over bound) => red in apply and informative in dry-run, 2 (could not run) => red, 4
+#       outranks 6 across repos in both orders, and `detail=` names the DELEGATE's code in the uv class
+#       too (#2156, #2036).
 #
 # PRE-CHANGE BEHAVIOUR. Each assertion below fails before this change, for the reason the section
 # names: there is no entry point at all, so `bash scripts/disk-reaper.test.sh` on the pre-change tree
@@ -490,18 +498,152 @@ assert_contains "$(cat "$T/t16/calls.log")" "daemon-reload" \
 assert_contains "$(cat "$T/t16/calls.log")" "enable --now" \
     "T16 positive control: a real install DOES enable the timer"
 rm -rf "$SCRATCH"
-# A unit that only reports WORK PENDING or a FAILED removal must not read green. The template's
-# SuccessExitStatus is the thing that decides that, so assert on the rendered bytes.
-# Directive-level, not literal-string: strip comments, take only `SuccessExitStatus=` lines, and
-# require the token set to be EXACTLY {0}. A substring grep would pass on `0 4 5`, miss `0 4`, and
-# false-fail on a comment that quotes the old value.
+# A unit that only reports WORK PENDING, a FAILED removal or a MISCONFIGURATION must not read green,
+# and a delegate's stated REFUSAL must. The template's SuccessExitStatus is the thing that decides
+# that, so assert on the rendered bytes.
+# Directive-level, not literal-string: strip comments, take only `SuccessExitStatus=` lines, and require
+# the token set to be EXACTLY {0, 6}. A substring grep would pass on `0 4 5`, miss `0 4`, and false-fail
+# on a comment that quotes the old value.
 SES_LINES="$(grep -h '^SuccessExitStatus=' "$T/t16/units/eldato-disk-reaper.service" | sed 's/^[^=]*=//')"
 assert_eq "$(printf '%s\n' "$SES_LINES" | grep -c .)" "1" \
     "T16 the unit declares exactly one SuccessExitStatus directive"
-assert_eq "$(printf '%s\n' "$SES_LINES" | tr -s '[:space:]' '\n' | grep -c .)" "1" \
-    "T16 a failed removal (4) and work-pending (5) are NOT masked as success"
-assert_eq "$(printf '%s\n' "$SES_LINES" | tr -s '[:space:]' '\n' | grep '^0$' | grep -c .)" "1" \
-    "T16 only a fully-clean pass (0) is success"
+SES_TOKENS="$(printf '%s\n' "$SES_LINES" | tr -s '[:space:]' '\n' | grep . | sort -n | tr '\n' ' ')"
+assert_eq "$SES_TOKENS" "0 6 " \
+    "T16 the accepted set is EXACTLY {0, 6}: a fully-clean pass, and a delegate's refusal"
+assert_eq "$(printf '%s\n' "$SES_LINES" | tr -s '[:space:]' '\n' | grep -c '^0$')" "1" \
+    "T16 only a fully-clean pass (0) is unconditionally success"
+assert_eq "$(printf '%s\n' "$SES_LINES" | tr -s '[:space:]' '\n' | grep -c '^6$')" "1" \
+    "T16 a delegate REFUSAL (6) is accepted, so a busy cell does not go red hourly (#2036)"
+for masked in 3 4 5; do
+    assert_absent "$SES_LINES" "$masked" \
+        "T16 exit $masked is NOT masked as success (3 misconfigured, 4 removal failed, 5 over bound)"
+done
+assert_contains "SuccessExitStatus=0 4 5" "4" \
+    "T16 positive control: the assert_absent above CAN match a code in a directive's value"
+
+# ── T17: the VENV class alone clears a DEAD lane and never a LIVE one (#2159/#1949) ────────────────
+# T2 proves both classes agree on one fixture, but its second pass removes the whole WORKTREE, so it
+# cannot show that the venv class was the actor. This is the distinction #2159 asks to be proven on
+# its own, because the venv is the sink that actually holds ~1.1 GB per live lane: a reaper that clears
+# dead residue is necessary and must never touch a live lane's env. ONE fixture, TWO worktrees, both
+# `.venv`s with a 2020 mtime and `--min-age 0`, so AGE and FLOOR are eliminated as explanations — the
+# only remaining difference between the two rows is a live holder.
+LSOF_T17="$(command -v lsof || true)"
+if [ -z "$LSOF_T17" ] && [ ! -d /proc ]; then
+    echo "  ⏭ SKIP T17: neither lsof nor /proc — this host cannot take a cwd reading at all"
+else
+    ENVNAME=t17
+    REPO="$(mk_repo t17)"
+    WT_DEAD="$(mk_wt "$REPO" vdead feat/t17-vdead)"
+    WT_LIVE="$(mk_wt "$REPO" vlive feat/t17-vlive)"
+    mk_venv "$WT_DEAD" 6
+    mk_venv "$WT_LIVE" 6
+    ( cd "$WT_LIVE" && exec sleep 300 ) &
+    LIVE17=$!
+    SLEEPERS="$SLEEPERS $LIVE17"
+    sleep 1
+    OUT="$(VENV_REAPER="$HERE/reap-lane-venvs.sh" run_reaper --apply --repo "$REPO" --only venv --min-age 0 2>&1)"; RC=$?
+    assert_eq "$RC" "0" "T17 a venv-only apply pass is not a failure"
+    [ "$RC" = 0 ] || printf '%s\n' "$OUT" | grep -E 'class=|FAIL|KEEP|REAP' | sed 's/^/      /'
+    assert_nodir "$WT_DEAD/.venv" "T17 the GONE lane's .venv is cleared"
+    assert_dir "$WT_DEAD" "T17 and only its .venv — the worktree is the worktree owner's, not ours"
+    assert_dir "$WT_LIVE/.venv" "T17 the LIVE lane's .venv survives the same pass"
+    assert_contains "$OUT" "KEEP live-cwd" "T17 and the surviving row names its deciding witness"
+    assert_contains "$OUT" "reaped=1" "T17 exactly one env was reaped"
+    # The distinguishing half: the SAME env is cleared once the holder is gone.
+    kill "$LIVE17" 2>/dev/null; wait "$LIVE17" 2>/dev/null
+    sleep 1
+    OUT="$(VENV_REAPER="$HERE/reap-lane-venvs.sh" run_reaper --apply --repo "$REPO" --only venv --min-age 0 2>&1)"; RC=$?
+    assert_eq "$RC" "0" "T17 the follow-up venv pass exits 0"
+    assert_nodir "$WT_LIVE/.venv" "T17 with no holder the same .venv IS cleared"
+    assert_absent "$OUT" "KEEP live-cwd" "T17 and it is no longer reported live"
+fi
+
+# ── T18: a delegate's EXIT CODE is neither swallowed nor painted red (#2156, #2036) ──
+# Three codes, three different meanings, and the pass must keep them apart. The stubs are the
+# DELEGATE, so this is the contract between the entry point and the three owners, not a policy test.
+mkdir -p "$T/t18/repo-a" "$T/t18/repo-b"
+for r in repo-a repo-b; do
+    "$REAL_GIT" -C "$T/t18/$r" init -q -b main >/dev/null 2>&1 || "$REAL_GIT" -C "$T/t18/$r" init -q
+    printf 'base\n' >"$T/t18/$r/f.txt"
+    "$REAL_GIT" -C "$T/t18/$r" add f.txt
+    "$REAL_GIT" -C "$T/t18/$r" commit -qm init
+done
+mk_code_stub() { # mk_code_stub <path> <exit code>
+    printf '#!/bin/bash\nexit %s\n' "$2" >"$1"; chmod +x "$1"
+}
+mk_code_stub "$T/t18/refuse.sh" 3
+ENVNAME=t18
+
+# (a) A REFUSAL: the delegate ran and declined (the documented, expected outcome on a busy cell).
+#     The pass must say 6 — recorded, never claimed clean, and NOT a red unit.
+OUT="$(VENV_REAPER="$T/t18/refuse.sh" run_reaper --apply --repo "$T/t18/repo-a" --only venv 2>&1)"; RC=$?
+ST="$(cat "$T/t18/state/disk-reaper.status" 2>/dev/null || true)"
+assert_eq "$RC" "6" "T18 a delegate REFUSAL (its own exit 3) is 6, not a red unit"
+assert_contains "$ST" "ok=0" "T18 the refusal still records the pass as NOT healthy"
+assert_contains "$ST" "rc=6" "T18 and the record carries the refusal code"
+assert_contains "$ST" "verdict_venv=fail-closed" "T18 the class is fail-closed in the record"
+assert_contains "$ST" "exited 3" "T18 the detail names the DELEGATE's own code, not the pass's"
+SRC2=0; HOME="$T/home" DISK_REAPER_STATE_DIR="$T/t18/state" bash "$REAPER" --print-status >/dev/null 2>&1 || SRC2=$?
+assert_eq "$SRC2" "3" "T18 --print-status still exits 3 — the verdict channel is the record"
+
+# (b) OVER BOUND in an APPLY pass: the class reclaimed nothing for a real condition. Before #2156
+#     `worst_rc` DROPPED 5, so this pass recorded `rc=0 verdict_venv=ok` — a false PASS at exactly
+#     the condition the floor exists to make visible.
+mk_code_stub "$T/t18/over.sh" 5
+OUT="$(VENV_REAPER="$T/t18/over.sh" run_reaper --apply --repo "$T/t18/repo-a" --only venv 2>&1)"; RC=$?
+ST="$(cat "$T/t18/state/disk-reaper.status" 2>/dev/null || true)"
+assert_eq "$RC" "3" "T18 over-bound in APPLY mode is a red pass (nothing was reclaimed)"
+assert_contains "$ST" "verdict_venv=fail-closed" "T18 and the class verdict says so"
+assert_absent "$ST" "verdict_venv=ok" "T18 the exit 5 is NOT swallowed into an ok class"
+assert_contains "$ST" "ok=0" "T18 the record does not read healthy"
+# ... and in a DRY RUN the same code is INFORMATIVE, never red: the directory is unchanged, so a red
+# unit every hour would be the alarm-fatigue defect (#2036).
+OUT="$(VENV_REAPER="$T/t18/over.sh" run_reaper --dry-run --repo "$T/t18/repo-a" --only venv 2>&1)"; RC=$?
+ST="$(cat "$T/t18/state/disk-reaper.status" 2>/dev/null || true)"
+assert_eq "$RC" "5" "T18 the SAME code in a dry run is 5 (informative)"
+assert_contains "$ST" "verdict_venv=over-bound" "T18 and the class verdict says over-bound"
+assert_contains "$ST" "ok=1" "T18 a dry run that found work is a successful dry run"
+
+# (c) MISCONFIGURATION: the delegate could not run as asked (rc 2). This is 3 — red — and it must NOT
+#     be mistaken for the refusal above. Collapsing 3 and 6 either hides a breakage or teaches the
+#     operator to ignore `systemctl --failed`.
+mk_code_stub "$T/t18/badargs.sh" 2
+OUT="$(VENV_REAPER="$T/t18/badargs.sh" run_reaper --apply --repo "$T/t18/repo-a" --only venv 2>&1)"; RC=$?
+ST="$(cat "$T/t18/state/disk-reaper.status" 2>/dev/null || true)"
+assert_eq "$RC" "3" "T18 a delegate that could not run (exit 2) is a red pass, never 6"
+assert_contains "$ST" "exited 2" "T18 and the detail names the real code"
+
+# (c2) THE Uv CLASS AGREES WITH ITS SIBLINGS on what `detail=` names. It reported the MAPPED code, so a
+#      refused uv delegate wrote `detail=pi-cache-reap.sh exited 6` — a code that owner never returns —
+#      while the venv and worktree classes named the delegate's own. The record must name the DELEGATE's
+#      code in `detail` and the PASS's in `rc`, in all three classes.
+OUT="$(CACHE_REAPER="$T/t18/refuse.sh" run_reaper --apply --only uv 2>&1)"; RC=$?
+ST="$(cat "$T/t18/state/disk-reaper.status" 2>/dev/null || true)"
+assert_eq "$RC" "6" "T18 a refused UV delegate is also 6, not a red pass"
+assert_contains "$ST" "detail=pi-cache-reap.sh exited 3" "T18 and the uv detail names the delegate's own code"
+assert_absent "$ST" "pi-cache-reap.sh exited 6" "T18 never the mapped pass code"
+
+# (d) SEVERITY ACROSS REPOS: one repo's refusal must not mask another repo's REMOVAL FAILURE. The
+#     stub refuses (3) on its first call and fails a removal (4) on its second, and the assertion is
+#     made in BOTH orders — `worst_rc` must be order-independent, or which repo git lists first
+#     decides whether a real failure is visible.
+TWOSTEP="$T/t18/twostep.count"
+cat >"$T/t18/twostep.sh" <<SH
+#!/bin/bash
+n=\$(cat "$TWOSTEP" 2>/dev/null || echo 0)
+if [ "\$n" = 0 ]; then printf '1' >"$TWOSTEP"; exit 3; fi
+exit 4
+SH
+chmod +x "$T/t18/twostep.sh"
+for order in ab ba; do
+    : >"$TWOSTEP"
+    if [ "$order" = ab ]; then RA="$T/t18/repo-a"; RB="$T/t18/repo-b"; else RA="$T/t18/repo-b"; RB="$T/t18/repo-a"; fi
+    OUT="$(VENV_REAPER="$T/t18/twostep.sh" run_reaper --apply --repo "$RA" --repo "$RB" --only venv 2>&1)"; RC=$?
+    ST="$(cat "$T/t18/state/disk-reaper.status" 2>/dev/null || true)"
+    assert_eq "$RC" "4" "T18 --repo $order: a removal failure (4) outranks a refusal (6) whatever the order"
+    assert_contains "$ST" "verdict_venv=removal-failed" "T18 --repo $order: and the class says removal-failed"
+done
 
 echo
 echo "──────────────────────────────────────────────────────────────────────"

@@ -97,13 +97,27 @@
 #
 # Exit codes: 0 pass completed, every class ok
 #             2 usage
-#             3 fail-closed: a delegate is missing, failed closed, or a class had no repo to scan —
-#               nothing is claimed for it (a skipped class is NEVER a pass); also a REFUSAL AT
-#               STARTUP when the bounded-execution library is missing or TB_TIMEOUT_BIN is unusable,
-#               in which case no per-class line is emitted at all
+#             3 MISCONFIGURED — the fault is THIS reaper's, so the scheduled unit goes RED: a
+#               delegate is missing, a class had no repo to scan, the pass record could not be
+#               written, or a delegate could not run as asked (rc 2 from bad arguments, 124 from a
+#               timeout, 126/127 from a missing binary). Also a REFUSAL AT STARTUP when the
+#               bounded-execution library is missing or TB_TIMEOUT_BIN is unusable, in which case no
+#               per-class line is emitted at all
 #             4 a class completed but at least one removal FAILED
 #             5 dry-run only: a class reported work it would do (over budget / reapable items), so
 #               the pass is informative but the condition is still present
+#             6 a DELEGATE REFUSED (rc 3 from the delegate: the box was busy, a probe was
+#               unavailable) — the condition is recorded, never claimed clean, and it does NOT paint
+#               the unit red, because a refusal is the documented outcome on a busy cell and an
+#               alarm that fires hourly on a healthy box is one nobody reads. The verdict channel is
+#               the RECORD (`ok=0`, `verdict_<class>=fail-closed`), not the unit's colour.
+#               ⛔ 3 and 6 are NOT interchangeable: 3 is our misconfiguration (red), 6 is a
+#               delegate's stated refusal (green). Collapsing them either hides a real breakage or
+#               trains the operator to ignore `systemctl --failed` (#2036).
+#
+# SEVERITY ORDER for one pass: 3 > 4 > 6 > 5 > 0. The pass keeps the most severe class code, so
+# neither a refusal (6) nor an informative over-bound (5) can mask a removal failure (4), and none of
+# them can mask a misconfiguration (3) (#2156).
 #
 set -uo pipefail
 
@@ -462,8 +476,10 @@ mode_flag() { [ "$DRY_RUN" = "1" ] && printf '%s' "--dry-run" || printf '%s' "--
 is_dry() { [ "$DRY_RUN" = "1" ]; }
 
 # A delegate's exit code is mapped to the pass verdict ONCE, here, so every class agrees on what
-# "failed" means: 4 = it ran but a removal failed; anything else non-zero = fail-closed / did not
-# run (3 included: a pass that could not verify itself is not a pass).
+# "failed" means: 4 = it ran but a removal failed; 5 = over bound (informative in a dry run, a
+# fail-closed condition in apply mode, where nothing was reclaimed); 6 = it REFUSED to act; anything
+# else non-zero = fail-closed / did not run (2 included: a pass that could not verify itself is not
+# a pass).
 class_verdict() { # class_verdict <rc>
     case "$1" in
         0) printf 'ok' ;;
@@ -473,17 +489,47 @@ class_verdict() { # class_verdict <rc>
     esac
 }
 
-# worst_rc <current> <incoming> — the pass keeps the most severe class code, so one repo's failure
-# cannot be masked by another repo's success. 3 (fail-closed) outranks 4 (a removal failed), which
-# outranks 0/5.
-worst_rc() {
-    local cur="$1" new="$2"
-    case "$new" in
-        0|5) printf '%s' "$cur" ;;
-        3) printf '3' ;;
-        4) [ "$cur" = 3 ] && printf '3' || printf '4' ;;
-        *) printf '3' ;;
+# delegate_rc <delegate-exit> — translate a DELEGATE's own exit vocabulary into the pass's class code.
+# EVERY delegate rc enters the pass through here, never raw, because two of its codes mean something
+# the pass must not flatten:
+#   * 3 is the delegate's documented REFUSAL ("the box was busy", "a probe was unavailable"). It is
+#     a real condition to record and it is NOT this reaper's misconfiguration, so it becomes 6.
+#     Measured consequence of not splitting it (#2036): on a busy cell the uv class refused every
+#     hour, the unit went red every hour, and the operator learned to ignore `systemctl --failed`.
+#   * 5 must SURVIVE (#2156). `worst_rc` used to drop it, so a venv pass that ended below its stated
+#     free-disk floor was recorded `rc=0 verdict=ok`: the fleet read healthy in exactly the condition
+#     the floor exists to make visible.
+# The reaper's OWN refusals (missing delegate, no repo, unwritable record) are 3 and never come here.
+delegate_rc() {
+    case "$1" in
+        0) printf '0' ;;
+        4) printf '4' ;;
+        5) printf '5' ;;
+        3) printf '6' ;;
+        *) printf '3' ;;    # 2/124/126/127/…: it could not run as asked => misconfiguration
     esac
+}
+
+# _rc_rank <code> — the severity order in ONE place: 3 (misconfigured) > 4 (a removal FAILED) >
+# 6 (a delegate refused) > 5 (over bound) > 0 (ok). Written as ranks rather than a case lattice so
+# adding a code cannot silently fall through a gap in an arm nobody re-read (#2156).
+_rc_rank() {
+    case "$1" in
+        3) printf '4' ;;
+        4) printf '3' ;;
+        6) printf '2' ;;
+        5) printf '1' ;;
+        *) printf '0' ;;
+    esac
+}
+
+# worst_rc <current> <incoming> — the pass keeps the most severe class code, so one repo's failure
+# cannot be masked by another repo's success, and a REFUSAL in one repo cannot mask a REMOVAL FAILURE
+# in another.
+worst_rc() {
+    local cur="${1:-0}" new="${2:-0}"
+    if [ "$(_rc_rank "$new")" -gt "$(_rc_rank "$cur")" ]; then printf '%s' "$new"
+    else printf '%s' "$cur"; fi
 }
 
 # to_mb <token> — "6156KB" / "2048MB" / "1.5GB" -> MiB as an integer. Empty when unparseable, so a
@@ -512,7 +558,12 @@ reap_uv() {
     [ -n "$path" ] || path="${UV_CACHE_DIR:-$HOME/.cache/uv}"
     before="$(free_kb_for_path "$path")"
     run_class bash "$CACHE_REAPER_PATH" "$(mode_flag)"
-    RC_UV="$CLASS_RC"
+    # The record's `detail` names the DELEGATE's own code, `rc=` carries the pass's — the same split the
+    # venv and worktree classes use. Reporting the MAPPED code here (measured: a refused uv delegate
+    # produced `detail=pi-cache-reap.sh exited 6` while its sibling classes said `exited 3`) sends the
+    # reader to `pi-cache-reap.sh`'s documentation for a code it never returns.
+    local uv_delegate_rc="$CLASS_RC"
+    RC_UV="$(delegate_rc "$uv_delegate_rc")"
     after="$(free_kb_for_path "$path")"
     delta=""
     if [ -n "$before" ] && [ -n "$after" ]; then
@@ -548,7 +599,7 @@ reap_uv() {
     VERDICT_UV="$(class_verdict "$RC_UV")"
     # A class that did not finish ok must say so in the record's `detail`, or the supervisor prints
     # `ok=0 detail=ok` — a self-contradicting line is worse than no line.
-    [ "$RC_UV" = 0 ] || NOTE_UV="${NOTE_UV:-pi-cache-reap.sh exited $RC_UV}"
+    [ "$RC_UV" = 0 ] || NOTE_UV="${NOTE_UV:-pi-cache-reap.sh exited $uv_delegate_rc}"
     say "$CLASS_OUT"
     [ -n "$cands" ] && say "$cands"
     if is_dry; then
@@ -607,7 +658,7 @@ reap_venv() {
         if [ -n "$b" ] && [ -n "$a" ]; then d=$(( (a - b) / 1024 )); [ "$d" -lt 0 ] && d=0; freed=$((freed + d)); fi
         say "$out"
         rows="${rows}${rows:+$'\n'}$out"
-        RC_VENV="$(worst_rc "$RC_VENV" "$rc")"
+        RC_VENV="$(worst_rc "$RC_VENV" "$(delegate_rc "$rc")")"
         [ "$rc" -gt 0 ] && NOTE_VENV="${NOTE_VENV:-reap-lane-venvs.sh exited $rc}"
     done <<<"$REPOS"
     VERDICT_VENV="$(class_verdict "$RC_VENV")"
@@ -659,7 +710,7 @@ reap_worktree() {
         if [ -n "$b" ] && [ -n "$a" ]; then d=$(( (a - b) / 1024 )); [ "$d" -lt 0 ] && d=0; freed=$((freed + d)); fi
         say "$out"
         rows="${rows}${rows:+$'\n'}$out"
-        RC_WT="$(worst_rc "$RC_WT" "$rc")"
+        RC_WT="$(worst_rc "$RC_WT" "$(delegate_rc "$rc")")"
         [ "$rc" -gt 0 ] && NOTE_WT="${NOTE_WT:-pi-reap-worktrees.sh exited $rc}"
     done <<<"$REPOS"
     VERDICT_WT="$(class_verdict "$RC_WT")"
@@ -726,15 +777,23 @@ want_class uv       && { reap_uv;       heartbeat_lock; }
 want_class venv     && { reap_venv;     heartbeat_lock; }
 want_class worktree && { reap_worktree; heartbeat_lock; }
 
-# Verdict: a fail-closed class wins over a removal failure, which wins over "dry-run found work".
+# Class code => severity for THIS pass. `_rc_rank` is the fixed order; the one mode-dependent arm is
+# 5: "still over bound" is informative in a dry run, but in APPLY mode it means a real condition was
+# left in place and the class reclaimed nothing, so it ranks with a misconfiguration.
+_class_severity() {
+    if [ "$1" = 5 ] && ! is_dry; then printf '4'; return; fi
+    _rc_rank "$1"
+}
+_rank_code() {
+    case "$1" in 4) printf '3' ;; 3) printf '4' ;; 2) printf '6' ;; 1) printf '5' ;; *) printf '0' ;; esac
+}
+
+# Verdict: a misconfiguration wins over a removal failure, which wins over a delegate's refusal,
+# which wins over "dry-run found work".
 verdict=0
 for rc in "$RC_UV" "$RC_VENV" "$RC_WT"; do
-    case "$rc" in
-        0) ;;
-        5) if is_dry; then :; else verdict=3; fi ;;
-        4) [ "$verdict" = 3 ] || verdict=4 ;;
-        *) verdict=3 ;;
-    esac
+    rank="$(_class_severity "$rc")"
+    if [ "$rank" -gt "$(_rc_rank "$verdict")" ]; then verdict="$(_rank_code "$rank")"; fi
 done
 if [ "$verdict" = 0 ] && is_dry \
    && { [ "$CAND_UV" -gt 0 ] || [ "$CAND_VENV" -gt 0 ] || [ "$CAND_WT" -gt 0 ]; }; then
@@ -750,6 +809,8 @@ fi
 
 # ── record it ───────────────────────────────────────────────────────────────────────────────────
 # Atomic write: a supervisor `status` can run while this pass is mid-write.
+# `ok=` answers "is the CONDITION clean", not "is the unit's colour green": a refusal (6) and a
+# dry-run over-bound (5) are `ok=0`, so the supervisor shows ⛔ while systemd stays green (#2036).
 OK=1; [ "$verdict" = 0 ] || [ "$verdict" = 5 ] || OK=0
 DETAIL=""
 [ -n "$NOTE_UV" ] && DETAIL="$NOTE_UV"

@@ -154,11 +154,16 @@ Every pass writes `$DISK_REAPER_STATE_DIR/disk-reaper.status` (default
 `$HOME/.pi/agent/state`), atomically, as `key=value`:
 
 ```
-mode=apply ok=0 rc=3 classes=uv,venv,worktree watchdog=internal
+mode=apply ok=0 rc=6 classes=uv,venv,worktree watchdog=internal
 freed_mb=515 freed_mb_uv=1 freed_mb_venv=0 freed_mb_worktree=514
 verdict_uv=fail-closed verdict_venv=ok verdict_worktree=ok
 would_free_mb_* candidates_* detail=pi-cache-reap.sh exited 3
 ```
+
+`rc=6` with `detail=… exited 3` is a **delegate refusal**: the uv class declined (a live `uv`, an
+unreachable `gh`), the condition is recorded as `ok=0`, and the unit stays green — see **Exit codes**.
+`rc=` carries the PASS's code and `detail=` names the DELEGATE's own, in every class, so a refusal is
+never reported under a code its owner does not use.
 
 `watchdog=` names the mechanism that bounded the pass (`timeout`, `gtimeout` or
 `internal`, see **Bounded execution** above), so "the bound was real" is answerable
@@ -174,17 +179,34 @@ failed/stale/never, 2 usage.
 
 ## Exit codes
 
-| code | meaning |
-|---|---|
-| 0 | pass completed, every selected class ok |
-| 2 | usage |
-| 3 | fail-closed: a delegate is missing, failed closed, or a class had no repo — nothing is claimed for it; **also a refusal at startup** when `scripts/lib/bounded.sh` is missing or `TB_TIMEOUT_BIN` is unusable (no per-class line is printed in that case) |
-| 4 | a class completed but at least one removal failed (or another pass holds the lock) |
-| 5 | dry-run only: a class reported work it would do |
+| code | meaning | unit `SuccessExitStatus` |
+|---|---|---|
+| 0 | pass completed, every selected class ok | accepted |
+| 2 | usage | red |
+| 3 | **this reaper is MISCONFIGURED**: a delegate is missing, a class had no repo, the pass record could not be written, or a delegate could not run as asked (its `2` = bad arguments, `124` = timeout, `126`/`127` = no such binary) — nothing is claimed for it; **also a refusal at startup** when `scripts/lib/bounded.sh` is missing or `TB_TIMEOUT_BIN` is unusable (no per-class line is printed in that case) | red |
+| 4 | a class completed but at least one removal failed (or another pass holds the lock) | red |
+| 5 | dry-run only: a class reported work it would do | red — unreachable on the `--apply` unit by construction, and it must stay visible if that ever changes |
+| 6 | a **DELEGATE REFUSED** (its own `exit 3`: the box was busy, a probe was unavailable) — a real condition, recorded as `ok=0` / `verdict_<class>=fail-closed`, but **not** a unit failure | accepted |
+
+Severity within one pass: **3 > 4 > 6 > 5 > 0**. The pass keeps the most severe class code, so a
+refusal in one repo can never mask a removal failure in another, and an over-bound class can never be
+written down as `ok` (#2156).
+
+**Why 3 and 6 are different codes.** `3` means *we* are wrong (a delegate is missing, a class cannot
+scan). `6` means a delegate *declined* — the documented, expected outcome on a busy cell.
+Collapsing them goes wrong in both directions: treat a refusal as `3` and the unit goes red every hour
+on a healthy box, which is how an operator learns to ignore `systemctl --failed` and misses the real
+`3` (#2036); treat a misconfiguration as `6` and a broken deployment reads green. The pass **record**
+is the verdict channel in both cases (`ok=0`), so `cloud-cell-supervisor.sh status` shows ⛔ and
+`--print-status` exits 3 either way — the split changes the unit's colour only.
+
+A delegate's `exit 5` — over the class's own floor — is **kept**, never dropped: in an apply pass it
+means the condition the floor exists to surface is still present, so it is fail-closed; in a dry run
+it is informative (`ok=1`).
 
 ## Tests
 
-`scripts/disk-reaper.test.sh` — 94 assertions, run by the `disk-reaper` shard of
+`scripts/disk-reaper.test.sh` — 141 assertions, run by the `disk-reaper` shard of
 `run-bash-shards.sh`:
 
 | | |
@@ -201,6 +223,14 @@ failed/stale/never, 2 usage.
 | T13 | the bounded-execution resolution ORDER is pinned (`timeout` -> `gtimeout` -> internal watchdog) with a PATH holding only the case's own stub (#2046) |
 | T14 | a host with neither binary still **classifies** (candidates found, rc=5) and names the fallback; a stub `timeout` on PATH is preferred, and then the report gains no provenance line (#2046) |
 | T15 | a missing `scripts/lib/bounded.sh`, or an unusable `TB_TIMEOUT_BIN`, is a **refusal at startup** (exit 3, no per-class line, no pass record) — never per-class `fail-closed` (#2046) |
+| T16 | the installer REFUSES a system unit rendered from transient scratch space (the cells' hourly `127`), still installs through the explicit test override, and the installed `SuccessExitStatus` is exactly `{0, 6}` — 3, 4 and 5 are not masked |
+| T17 | the **venv class alone** clears a GONE lane's `.venv` and never a LIVE one's: one fixture, two worktrees, both envs aged, `--min-age 0`, so the only difference is a real cwd holder — and the same env is cleared once the holder is gone (#2159) |
+| T18 | a delegate's exit code is neither swallowed nor painted red: `3` → pass `6` with `ok=0`, `5` → red in apply / informative in dry-run, `2` → red, and `4` outranks `6` across repos in **both** `--repo` orders (#2156, #2036) |
+
+`scripts/reap-lane-venvs.test.sh` §H pins the age floor's validation: a non-numeric
+`REAP_VENV_MIN_AGE_SECONDS` is refused (exit 2) with nothing removed, and the same fixture is kept by
+a valid floor and reaped with the floor lifted — so the KEEP is the floor's doing rather than an
+inability to delete (#2158).
 
 T9, T10 and T12 were each red on the build that preceded the fresh-context review
 that found them.
