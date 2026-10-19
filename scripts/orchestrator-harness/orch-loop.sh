@@ -593,11 +593,13 @@ queue_state_token() {  # -> EMPTY(12s) / READ(7)(3m) / PARTIAL(P0-blocker)(2m) /
 # funnel is only printed as a decomposition when the parts are actually known.
 dispatch_funnel() { # <dispatched_count> <queue_token> [<held_reason>] [<now_epoch>] [<gh_token>]
   local k="${1:-0}" qtok="${2:-?}" held="${3:-}" now="${4:-}" ghtok="${5:-}" f key val kv backlog=0
-  # ⛔ `queue=` KEEPS ITS CLOSED VOCABULARY (EMPTY|READ(n)|PARTIAL(…)|UNREADABLE) and every field on
-  # this line stays comma-free (#1910 round 12). The read verdict travels as its OWN field, because
-  # welding it into the queue value put the list's own separator inside a value —
-  # `queue=EMPTY(12s) ghs=FRESH(SECONDARY-LIMITED, 40s), funnel 0m old` — which no consumer that
-  # splits on the list convention can read safely. Human-readable is not the standard here.
+  # ⛔ `queue=` KEEPS ITS CLOSED VOCABULARY (EMPTY|READ(n)|PARTIAL(…)|UNREADABLE) and stays
+  # comma-free, so the field list can be split safely (#1910 round 12). The read verdict travels as
+  # its OWN `ghs=` field, because welding it into the queue value put the list's own separator inside
+  # a value — `queue=EMPTY(12s) ghs=FRESH(SECONDARY-LIMITED, 40s), funnel 0m old`.
+  # ⚠️ `ghs=` itself is NOT comma-free — the token is `FRESH(<state>, <age>, …)` by construction — so
+  # it is deliberately the LAST field on the line: a consumer splits the list, and whatever follows
+  # the last `queue=`-style field is that field's value.
   # ⛔ EVERY ONE OF THESE IS INITIALISED. They are assigned only when their key is present in the
   # record, and under `set -u` a declared-but-unassigned local is UNBOUND: a record missing one key
   # (a rename, a hand-edited or half-synced $O) exited the whole controller — a KeepAlive crash loop

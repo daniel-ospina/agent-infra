@@ -644,8 +644,11 @@ else
 fi
 has 'gh_gate_token' "$OL" && pass "5c(4) orch-loop.sh reports the gate's real-read token each cycle" \
   || fail "5c(4) orch-loop.sh no longer reports ghs= (the instrument is unwired)"
-has 'gh_gate_snapshot' "$OL" && pass "5c(5) …and the shared read is consumed on the no-dispatch funnel line" \
-  || fail "5c(5) orch-loop.sh no longer consumes the shared snapshot"
+# ⛔ THE CALL SHAPE, not the definition: `has 'gh_gate_snapshot'` is satisfied by the function
+# definition alone, so dropping the argument left this green (measured, round 13).
+grep -qF 'else dispatch_funnel 0 "$(queue_state_token)" "" "" "$(gh_gate_snapshot)"' "$OL" \
+  && pass "5c(5) …and the shared read is passed as the no-dispatch funnel line's OWN ghs= field" \
+  || fail "5c(5) the shared read is not wired into the no-dispatch funnel line"
 # ⛔ THE CELL DOCTOR IS A LANDER TOO. Its `merge` role executes the rail directly, is DEFAULT-ON
 # (MERGE_INTERVAL, tmux `cell-doctor` on every started cell), and took only its own per-PR claim —
 # which serialises the SAME PR, not the ACCOUNT. Two landers on one box is the burst #1910

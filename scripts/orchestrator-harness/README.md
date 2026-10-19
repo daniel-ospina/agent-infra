@@ -1018,8 +1018,10 @@ The age is part of the token on purpose: a value frozen by a refresh that stoppe
 as a fresh reading. `UNKNOWN` means no pass has EVER recorded a read — it is not `EMPTY`.
 
 ⛔ **A FILTERED-TO-ZERO FUNNEL IS NOT A CLEARANCE EITHER** (agent-infra#2040). The line above used
-to read `[dispatch] 223 candidates -> … -> 0 dispatched (backlog=0, queue=READ(223)(9m))` — the pool was read (223 candidates) and the
-backlog was empty, and nothing said which step ate the 223. That contradiction idled all three cloud
+to read `[dispatch] backlog empty queue=READ(223)` — the pool had been read (223 candidates) and the
+backlog was empty, and nothing said which step ate the 223. (That line no longer exists: it was
+replaced by the decomposition below, which is why quoting it here is history, not a claim about the
+current output.) That contradiction idled all three cloud
 cells for hours. The dispatch line is now a DECOMPOSITION, and its parts reconcile with the pool
 (`listed = queued + peer-owned + landed + unjudged + blacklisted + already-dispatched + not-reached`):
 
