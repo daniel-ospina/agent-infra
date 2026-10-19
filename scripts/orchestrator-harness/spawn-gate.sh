@@ -414,6 +414,75 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   return "$rc"
 }
 
+# ── the lane venv teardown (agent-infra#1932) ─────────────────────────────────────────────────────
+# A `.venv` belongs to a RUNNING lane, not to a worktree that outlives it. `run_agent` above is what
+# makes the env necessary (`uv sync` writes it inside the worktree, and AGENTS.md's test line tells the
+# lane to run it), so the teardown that ends its life belongs HERE, next to the spawn — and the
+# RUNNERS call it on their way out.
+#
+# ⛔ WHY THE RUNNER AND NOT A SCAN: at the runner's exit "this lane is done" is KNOWN, not inferred.
+# The GC half of #1932 (`reap-lane-venvs.sh --gc`) exists for the lanes that never reach their exit
+# path (killed session, reboot), and it has to prove death from process evidence instead. This path
+# declares it and still requires the SAME no-live-holder proof, so a worktree shared with a second
+# live lane is never touched.
+#
+# ⛔ BEST-EFFORT, AND NEVER SILENT: a failed reap must not change a runner's exit status (the lane's
+# work is already committed and pushed, and its status is what the controller reads), but a skipped or
+# failed teardown is LOGGED with its reason — a teardown that quietly does nothing is the "fix that is
+# not live" shape #1932 is about. `REAP_LANE_VENV_DISABLE=1` is the operator escape, and it says so.
+#
+# The script is resolved rather than assumed, because a cloud cell runs these workers from `$O` (seeded
+# by `cloud-cell-supervisor.sh`) while a laptop runs them from the harness directory and, for the
+# farmed copy, from `~/.pi/agent/scripts`. A missing reaper KEEPS the venv and says where it looked —
+# the one thing that must never happen is falling back to a blind `rm`.
+REAP_LANE_VENV_SH=""
+reap_lane_venv_path() {
+  local c here
+  if [ -n "$REAP_LANE_VENV_SH" ]; then printf '%s\n' "$REAP_LANE_VENV_SH"; return 0; fi
+  here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)"
+  for c in "${O:-}/reap-lane-venvs.sh" "$here/reap-lane-venvs.sh" \
+           "${AGENT_INFRA_PATH:-}/scripts/reap-lane-venvs.sh" \
+           "${HOME:-}/.pi/agent/scripts/reap-lane-venvs.sh"; do
+    [ -n "$c" ] && [ -f "$c" ] || continue
+    REAP_LANE_VENV_SH="$c"
+    printf '%s\n' "$c"
+    return 0
+  done
+  return 1
+}
+
+# reap_lane_venv <worktree> <label> — reclaim that worktree's `.venv` if no live holder remains.
+# Callers append the output to their own log (`>> "$log" 2>&1`); nothing here writes to a caller's
+# stdout, because lane.sh's stdout is the lane's own report surface.
+reap_lane_venv() {
+  local wt="${1:-}" label="${2:-lane}" reaper rc
+  if [ "${REAP_LANE_VENV_DISABLE:-0}" = "1" ]; then
+    echo "[venv-reap] DISABLED by REAP_LANE_VENV_DISABLE=1 — $wt/.venv left in place"
+    return 0
+  fi
+  if [ -z "$wt" ] || [ ! -d "$wt" ]; then
+    echo "[venv-reap] SKIP $label: no worktree directory to reap (${wt:-<empty>})"
+    return 0
+  fi
+  if [ ! -e "$wt/.venv" ] && [ ! -L "$wt/.venv" ]; then
+    echo "[venv-reap] $label: no .venv in $wt — nothing to reap"
+    return 0
+  fi
+  if ! reaper="$(reap_lane_venv_path)"; then
+    echo "[venv-reap] SKIP $label: reap-lane-venvs.sh not found in \$O, the harness dir, \$AGENT_INFRA_PATH/scripts or ~/.pi/agent/scripts — $wt/.venv KEPT (a blind rm could delete a live lane's env)"
+    return 0
+  fi
+  echo "[venv-reap] $label: reaping $wt/.venv via $reaper"
+  REAP_VENV_LOG="${REAP_VENV_LOG:-${HOME:-}/.pi/agent/state/reap-lane-venvs.log}" \
+    bash "$reaper" --worktree "$wt" --apply
+  rc=$?
+  case "$rc" in
+    0) echo "[venv-reap] $label: done (see the reaper's line above for what was kept, and why)" ;;
+    3) echo "[venv-reap] $label: FAIL-CLOSED — the reaper could not prove the lane is dead, so the env was KEPT (rc=3). It will be collected by a later GC." ;;
+    *) echo "[venv-reap] $label: reaper exited $rc — $wt/.venv may still be present; a later GC will collect it" ;;
+  esac
+  return 0
+}
 # ── THE SPAWN POINT (agent-infra#1884) ─────────────────────────────────────────
 # Everything above is a LIBRARY: a caller reaches the gate only if it remembers to source this file
 # first. That is the defect #1884 measured. The orchestrator started three lanes by writing a runner
