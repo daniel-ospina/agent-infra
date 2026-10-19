@@ -397,6 +397,7 @@ file_mtime_epoch() { # <file> -> mtime as epoch seconds; NON-ZERO rc when unread
   is_num "$m" || return 1
   printf '%s\n' "$m"
 }
+
 # 1-min load average. THE FIELD DIFFERS: /proc field 1 IS the 1-min load, while macOS
 # `sysctl vm.loadavg` prints `{ 1.70 1.90 2.00 }`, so field 2 is. One shared awk would therefore
 # read the wrong field on one of the two platforms — the bug this function's test pins.

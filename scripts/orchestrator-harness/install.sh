@@ -184,6 +184,18 @@ if [ "$ACTION" = uninstall ]; then
   # dispatching — README §6 step 2's `pkill` is undone by launchd a second later. So: remove, then READ
   # the domain until the label is no longer LOADED, and fail loudly if it still is.
   lc_bootout "$LABEL" "$PLIST" || exit 1
+  # ⛔ BOOTOUT NO LONGER STOPS THE CONTROLLER, SO UNINSTALL MUST (2026-10-18, review round 1, measured).
+  # The job used to BE orch-loop.sh, so removing it stopped the fleet. It now runs launchd-controller.sh,
+  # which keeps the controller in a tmux session that is NOT in the job's process group (the pane's
+  # parent is the tmux server, ppid-1 lineage), so `launchctl bootout` kills only the supervisor and
+  # leaves a full controller dispatching, merging and unsupervised — with a ✅ printed over it. That is
+  # the exact inversion of the guard below: it used to be launchd resurrecting the controller; now it
+  # is tmux preserving it. The session name is the job's own (`CONTROLLER_SESSION`, default
+  # `orch-controller`), so this can only ever stop the controller this job started.
+  CTRL_SESS="${CONTROLLER_SESSION:-orch-controller}"
+  if command -v tmux >/dev/null 2>&1 && tmux has-session -t "=$CTRL_SESS" 2>/dev/null; then
+    tmux kill-session -t "=$CTRL_SESS" 2>/dev/null || true
+  fi
   # ⛔ "IS IT STILL LOADED" — not "does it have a pid". A KeepAlive job that has just exited sits LOADED
   # with no pid for up to its respawn throttle (`minimum runtime`, 10s by default), so a pid-only read
   # declared a job removed that launchd still holds and will relaunch (review finding). `lc_probe` is
@@ -221,6 +233,21 @@ if [ "$ACTION" = uninstall ]; then
     # The plist is KEPT: it is the only handle a verified removal has (and the only thing a human can
     # inspect), so destroying it here would leave the job loaded with nothing to retry against.
     die "$LABEL is STILL loaded${pid:+ (pid $pid)} after 'launchctl bootout' — NOT removed, and the plist is kept at $PLIST. Next: launchctl print $(lc_domain)/$LABEL | head -20"
+  fi
+  # ⛔ AND THE CONTROLLER MUST BE GONE BEFORE ✅ (review round 1). `kill-session` is a SIGNAL, not a
+  # proof — a pane that refuses to die, or a controller started by some other path, leaves a box that
+  # still dispatches while this command says Removed. The controller records its own pid in
+  # $O/.orch.lock, so that is the read that answers the question; give the SIGHUP a moment first, and
+  # keep the plist on failure so the retry has something to act on.
+  _cp=0
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    _cp="$(cat "$O/.orch.lock" 2>/dev/null || echo 0)"
+    case "$_cp" in ''|*[!0-9]*) _cp=0 ;; esac
+    [ "$_cp" -gt 0 ] && kill -0 "$_cp" 2>/dev/null || break
+    sleep 0.5
+  done
+  if [ "$_cp" -gt 0 ] && kill -0 "$_cp" 2>/dev/null; then
+    die "the controller is STILL running (pid $_cp, recorded in $O/.orch.lock) after removing $LABEL — NOT removed, and the plist is kept at $PLIST. Next: tmux kill-session -t =${CONTROLLER_SESSION:-orch-controller} (or kill $_cp), then re-run --uninstall"
   fi
   rm -f "$PLIST"
   rm -f "$O/state/launchd-loaded.sha256"
@@ -1029,6 +1056,16 @@ SELF="bash $(shq "$HERE/install.sh")"
 # cycle, so a quiet cell (CYC=900) is not declared wedged on a healthy controller. Passed down rather
 # than read from a global: the library must not depend on an unstated variable.
 LC_HB_STALE="${LC_HB_STALE:-$(( CYC * 2 + 300 ))}"
+# ⛔ THE PLIST NOW EXECUTES A SCRIPT THE INSTALLER NEVER COPIES, SO ITS ABSENCE IS FATAL, NOT DRIFT.
+# This installer deliberately copies nothing ($O is operator-synced) and the DRIFT block above WARNS —
+# correctly for the general list. But the entrypoint is different in kind: on an un-synced box
+# `/bin/bash $O/launchd-controller.sh` exits 127 on every run, so a `--start` would bootstrap a job
+# that crash-loops under KeepAlive, grows launchd.err, and leaves the fleet with NO controller while
+# the command reports success. It is one `-f` test away from being knowable, so it is refused here.
+case "$ACTION" in
+  start|restart)
+    [ -f "$O/launchd-controller.sh" ] || die "$O/launchd-controller.sh is missing, and $LABEL now runs it — refusing to start a job that would exit 127 on every cycle. Sync the harness into \$O first: cp '$HERE'/*.sh '$O'/"; ;;
+esac
 case "$ACTION" in
   start)   lc_ensure  "$LABEL" "$PLIST" "$O" "$PLIST_CHANGED" "$START_TIMEOUT" "$LC_HB_STALE" || exit 1 ;;
   restart) lc_restart "$LABEL" "$PLIST" "$O" "$START_TIMEOUT"                              || exit 1 ;;

@@ -269,6 +269,12 @@ fresh() { # reset the stub's world; $1 = heartbeat seed (optional)
   rm -rf "$T/state" "$T/o"; mkdir -p "$T/state" "$T/o/logs"
   printf '%s\n' "${1:-100}" > "$T/o/heartbeat"
   : > "$T/o/x.plist"   # lc_bootout needs a plist path that exists to issue a removal
+  # ⛔ A SYNCED $O IS A PRECONDITION OF --start, NOT DECORATION (2026-10-18). The rendered plist now
+  # executes `$O/launchd-controller.sh`, and install.sh refuses to start a job whose entrypoint is
+  # missing (it would exit 127 on every cycle under KeepAlive). The fixture therefore has to be an $O
+  # an operator could actually have synced; without the file every §F start/uninstall assertion below
+  # measures the refusal instead of the behaviour it names.
+  cp "$HARNESS/launchd-controller.sh" "$T/o/" 2>/dev/null || true
   export FAKE_LOG="$T/launchctl.log" FAKE_STATE="$T/state" FAKE_O="$T/o"
   : > "$FAKE_LOG"
   unset FAKE_BOOTSTRAP_FAIL FAKE_LOAD_FAIL FAKE_NO_HB FAKE_PRINT_FILE FAKE_BOOTOUT_FAIL \
