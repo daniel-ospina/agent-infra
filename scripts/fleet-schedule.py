@@ -751,7 +751,15 @@ def run_job(job):
         rc = 127
         log("ERROR %s could not be executed (%s)" % (job.label, exc))
     finally:
-        write_stamp(job.label, started, rc, time.time() - started)
+        # ⛔ ONLY A REAL rc IS A RUN. The loop's SIGTERM handler raises SystemExit (so `--stop` and
+        # the supervisor's teardown actually work), which lands here with rc still None — and the
+        # old code wrote a stamp carrying `"rc": null`. cmd_verify counts ANY stamp as "has run",
+        # so a job interrupted mid-flight certified itself as live on the strength of an
+        # interrupted run: the "a stamp with an rc" evidence claim, satisfied by a stamp with no
+        # rc. Writing nothing is the truthful record — the previous stamp stands (a real run at an
+        # earlier time), or the job is honestly still NEVER RUN.
+        if rc is not None:
+            write_stamp(job.label, started, rc, time.time() - started)
         clear_busy(job.label)
         try:
             os.unlink(lock)
@@ -761,14 +769,29 @@ def run_job(job):
     return rc
 
 
+def _stdout_is(path):
+    """True when our stdout is already this file (see log())."""
+    try:
+        return os.path.samestat(os.fstat(sys.stdout.fileno()), os.stat(path))
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
 def log(message):
     line = "%s %s" % (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), message)
-    try:
-        os.makedirs(STATE, exist_ok=True)
-        with open(os.path.join(STATE, "loop.log"), "a") as fh:
-            fh.write(line + "\n")
-    except OSError:
-        pass
+    path = os.path.join(STATE, "loop.log")
+    # ⛔ WRITE ONCE. spawn_loop points the loop's stdout at this very file, so appending here as
+    # well put every loop line in loop.log TWICE — doubling the growth of the one file an operator
+    # reads to find out what the loop is doing, and making a repeated line look like a repeated
+    # pass. When our stdout already IS that file the print() below is the write; otherwise (a
+    # foreground run, or a pipe) the file is not receiving it, so append explicitly.
+    if not _stdout_is(path):
+        try:
+            os.makedirs(STATE, exist_ok=True)
+            with open(path, "a") as fh:
+                fh.write(line + "\n")
+        except OSError:
+            pass
     print(line, flush=True)
 
 
@@ -956,6 +979,9 @@ def cmd_verify():
         )
     age = tick_age()
     stale_after = max(3 * TICK, 300)
+    # Read ONCE and shared by both arms below: a job that is running is the explanation for a stale
+    # tick AND for a job that is late, and computing it in only one arm is how the two disagreed.
+    busy = busy_jobs(now)
     if age is None:
         failures.append("the loop has never ticked (no %s/tick)" % STATE)
     elif age > stale_after:
@@ -963,7 +989,6 @@ def cmd_verify():
         # so a job that is RUNNING announces itself (state/busy/<label>.json) with an expiring
         # deadline; while one is live the old tick is explained, not failed. Past that deadline
         # the exemption is gone, so a job killed hard cannot mask a wedged loop forever.
-        busy = busy_jobs(now)
         if busy:
             print(
                 "  BUSY   the loop is running %s (%s so far) — the %s tick age is a long job, "
@@ -1008,11 +1033,39 @@ def cmd_verify():
         # LATE BY MORE THAN A COUPLE OF ITS OWN INTERVALS *and* by more than a few ticks. Both
         # halves matter: a 5-minute job 10 minutes late is a miss, while a 6-hour job 1 hour late
         # is the loop simply being busy with something else.
+        # ⛔ ...AND A BUSY LOOP IS A LATE LOOP, NOT AN IDLE ONE. The tick arm above already grants
+        # a running job its deadline; this arm did not, so a calendar job that came due while a
+        # 1800s job was executing (the loop is single-threaded) was reported OVERDUE by a --verify
+        # that ran in that window — and check_schedule turns that into a FATAL refusal of a cell
+        # whose loop is doing exactly what it was told. The exemption is the same one, and it is
+        # deadline-bounded in busy_jobs(), so a hard-killed job cannot mask a wedged loop forever.
         if overdue > max(2 * (job.interval or 0), 3 * TICK):
-            failures.append(
-                "%s: OVERDUE by %s — the loop is not running it (last run %s ago)"
-                % (job.label, human_secs(overdue), human_secs(now - stamp["started"]))
-            )
+            if busy:
+                print(
+                    "  BUSY   %s is %s past due, but the loop is running %s — a busy loop is a "
+                    "late loop, not an idle one"
+                    % (job.label, human_secs(overdue), ", ".join(label for label, _ in busy))
+                )
+            else:
+                failures.append(
+                    "%s: OVERDUE by %s — the loop is not running it (last run %s ago)"
+                    % (job.label, human_secs(overdue), human_secs(now - stamp["started"]))
+                )
+
+    # ⛔ ZERO LIVE JOBS IS A FAILURE, not a clean run — by a longer route than an empty dir.
+    # load_jobs() already refuses a declarations dir holding no *.plist, but a set where EVERY
+    # declared job is a named SKIP (a cell with no swarm root and no tortoise checkout) reached
+    # the verdict line as "SCHEDULE VERIFIED — 0 job(s) live on this machine …, N skipped for a
+    # named reason" and exited 0 — so cloud-cell-bringup.sh printed "scheduled layer live: …"
+    # and the cell reached CELL READY with nothing scheduled at all. That is the exact false PASS
+    # this runtime exists to close. Skips stay non-fatal only while at least ONE job is live.
+    if ran == 0 and not failures:
+        failures.append(
+            "%d job(s) declared and %d skipped for named reasons, but NOT ONE is live on this "
+            "machine — a schedule with zero live jobs leaves this host with no reaping, no "
+            "liveness detection and no canary, so it is refused rather than certified (#1864)"
+            % (len(jobs), len(skipped))
+        )
 
     for label, reason in skipped:
         print("  SKIP   %-38s %s" % (label, reason))
@@ -1100,6 +1153,41 @@ def cmd_start():
     if pid and pid_is_our_loop(pid):
         print("loop already running (pid %d)" % pid)
         return 0
+    # ⛔ READ THE DECLARATIONS BEFORE SPAWNING, and refuse in the terms the caller keys on.
+    # main() returns 3 only when there is no template PATH AT ALL; a remembered templates-dir
+    # pointer that resolves to a deleted checkout, or a dir holding no *.plist, fell straight
+    # through to a spawn — so `--start` printed "loop started (pid …)" and exited 0 over a loop
+    # that can never schedule anything, while cloud-cell-supervisor.sh's rc=3 warn-vs-fatal split
+    # (which exists precisely for "this cell was never installed") never fired. `start` is the ONLY
+    # thing that revives the schedule on a running cell (#1864), so that silent 0 is a cell running
+    # lanes with no reaping and no liveness detection — the defect, reported as a success.
+    try:
+        jobs = load_jobs()
+    except ScheduleError as exc:
+        print(
+            "FAIL: no job declarations to read (%s) — there is NO scheduled layer here, so no reap "
+            "job, no liveness report and no canary would ever run. Install it: "
+            "pi-bootstrap/cell-install.sh (or point INFRA_ROOT/TEMPLATES_DIR at an agent-infra "
+            "checkout its templates/launchd)." % exc,
+            file=sys.stderr,
+        )
+        return 3
+    # A set the runtime cannot run in full is not startable either: right after a `--stop` the loop
+    # is gone, so THIS is the last place that can still refuse it. `--install` already refuses, and
+    # a job that can never run must not be certified by a scheduler that keeps ticking over it.
+    # NAMED SKIPS stay non-fatal: they are this machine's ordinary state (no swarm root, no
+    # tortoise checkout), and refusing the whole layer over one optional job is what would block a
+    # cell that runs every other one.
+    broken = [j for j in jobs if j.error]
+    if broken:
+        for job in broken:
+            print("  FAIL   %s: %s" % (job.label, job.error), file=sys.stderr)
+        print(
+            "the declared job set is BROKEN — refusing to start a scheduler over a set it cannot "
+            "run in full (%d error(s))" % len(broken),
+            file=sys.stderr,
+        )
+        return 1
     off = os.path.join(STATE, "OFF")
     if os.path.exists(off):
         os.unlink(off)  # --start is the operator saying "on"; the OFF switch is cleared on purpose
