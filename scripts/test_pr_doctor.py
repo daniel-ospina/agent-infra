@@ -23,6 +23,7 @@ Run:  <venv>/bin/python -m pytest test_pr_doctor.py -q
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import pathlib
 import re
@@ -40,6 +41,9 @@ pr = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(pr)
 
 _HARNESS = _REPO / "scripts" / "orchestrator-harness"
+# The REAL ownership predicate, captured before the autouse fixture stubs it out.
+# Tests that drive the predicate itself restore this; everything else gets the stub.
+_REAL_LIVE_OWNERS = pr.live_owners
 
 
 def _pr(number: int, head: str = "a" * 40) -> dict:
@@ -176,7 +180,11 @@ def test_spawn_argv_is_the_background_dispatcher_not_cmux(monkeypatch):
     assert argv[2] == "prd-7"
     assert argv[3] == "/repo/.worktrees/prd-7"
     assert argv[4] == "/state/brief.txt"
-    assert "cmux" not in " ".join(argv)
+    # ⛔ NOT A SUBSTRING TEST OVER THE WHOLE ARGV. The brief path lives under a pytest tmp dir, and
+    # on a box whose user is `cmux` that path contains "cmux" -- so `"cmux" not in " ".join(argv)`
+    # fails on a correct argv. Assert what the property is: the PROGRAM is the harness dispatcher,
+    # and no element names the retired cmux transport.
+    assert "cmux" not in " ".join(argv[:2])
     assert "cmux_dispatch" not in " ".join(argv)
 
 
@@ -201,7 +209,8 @@ def test_dispatch_invokes_the_background_spawn_argv(monkeypatch, tmp_path):
     assert calls, "dispatch did not invoke the spawn command"
     argv, capture = calls[-1]
     assert argv[1] == "/opt/orch/nonblocking-dispatch.sh"
-    assert "cmux" not in " ".join(argv)
+    assert "cmux" not in " ".join(argv[:2])
+    assert "cmux_dispatch" not in " ".join(argv)
     # ⛔ NON-VACUITY for the P0: a CAPTURED spawn call blocks until the worker's stdout pipe
     # closes, i.e. for the worker's whole life. See
     # test_dispatch_returns_promptly_whatever_the_worker_does below (real harness, real worker).
@@ -287,9 +296,11 @@ def test_main_writes_no_state_row_for_a_refused_spawn(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["pr-doctor.py"])
     monkeypatch.setenv("MAX_FIX", "16")
     monkeypatch.setenv("MAX_REVIEW", "12")
-    # rc=2, not 0: since #1872 a pass with legible work that placed NOTHING is not a clean pass
-    # ("0 is reserved for readable, nothing to do"). The property this test pins is the STATE ROW.
-    assert pr.main() == 2
+    # rc=3, not 0: a pass with legible work that placed NOTHING is not a clean pass ("0 is reserved
+    # for readable, nothing to do"), and since 2026-10-18 the UNDELIVERABLE class has its own code
+    # (3) so a launcher can tell it from a blind read (2). The property this test pins is the STATE
+    # ROW -- a gate refusal must not be recorded.
+    assert pr.main() == 3
     assert not [k for k in saved if not k.startswith("_")], \
         "a refused spawn must not consume a state row / budget slot"
 
@@ -1732,7 +1743,7 @@ def test_dry_run_reports_the_worktree_refusal(monkeypatch, tmp_path):
 # the lane table is retired (#1890) -- and are re-expressed against the worker transport where the
 # property still exists (see the `undeliverable` cases below).
 @pytest.fixture(autouse=True)
-def _clean_module_state(monkeypatch):
+def _clean_module_state(monkeypatch, tmp_path_factory):
     """⛔ MODULE STATE LEAKS BETWEEN TESTS AND SILENTLY CHANGES THE EXIT CODE (#1872 round 5).
 
     `open_prs()` WRITES the module global `OPEN_PRS_ERROR`, and `main()` reads it before anything
@@ -1751,9 +1762,23 @@ def _clean_module_state(monkeypatch):
     teardown reset would be redundant, and claiming that "monkeypatch cannot undo a plain module
     assignment" would teach the next fixture a rule that is not true.
 
+    ⛔ TWO MORE LIVE SIDE EFFECTS (#1890/#2056). `record_exit()` writes
+    `~/.pi/agent/state/pr-doctor.status.json` -- the file the heartbeat reads to print a RED line --
+    so a test that drives `main()` would overwrite the live pass verdict with a fake one. And
+    `live_owners()` shells out to `lsof` and `git worktree list`, which makes the suite
+    environment-dependent (a worktree on branch `b` would flip a test) and slow. Both are
+    redirected here, once; the probe itself is driven directly by its own tests through injected
+    reads (`_REAL_LIVE_OWNERS`), so nothing is left untested.
+
     Same class of leak as `objective.GH_BLOCKED`: reset the state each test depends on, in one place.
     """
     monkeypatch.setattr(pr, "OPEN_PRS_ERROR", None, raising=False)
+    _sd = tmp_path_factory.mktemp("pr-doctor-state")
+    monkeypatch.setattr(pr, "STATUS", str(_sd / "status.json"), raising=False)
+    # No live probe unless a test asks for one: `({}, "")` is "nothing is owned", the direction the
+    # owner's rule treats as safe, and it keeps `main()`'s ordering deterministic.
+    monkeypatch.setattr(pr, "live_owners", lambda prs: ({}, ""), raising=False)
+    monkeypatch.setattr(pr, "OWNERSHIP_NOTE", "", raising=False)
 
 def test_a_blind_read_cause_is_captured_per_pr_not_read_after_the_loop(monkeypatch):
     """⛔ THE CAUSE MUST BELONG TO THE READ THAT FAILED (#1872 review round 3).
@@ -1832,10 +1857,6 @@ _SHAPES = {
     "conflict": (_cr(red=["python-ci-gate"]), False, "DIRTY", "resolve-conflict"),
     "nothing-ran": (_cr(absent=pr.CLASSIFIER.REQUIRED), False, "BLOCKED", "rerun-checks"),
 }
-
-
-def _pr_set(monkeypatch, shapes=None):
-    """The PR dicts, with BOTH readers pointed at the same evidence through objective's seams."""
 
 
 def _pr_set(monkeypatch, shapes=None):
@@ -1942,6 +1963,13 @@ def test_a_running_pr_is_never_dispatched(monkeypatch):
                         else ("call-rail", None, []))
     monkeypatch.setattr(pr, "brief", lambda p, a, w=None, cr=None: "brief-%s" % p["number"])
     monkeypatch.setattr(pr, "log", logs.append)
+    # ⛔ LIVENESS IS ASKED OF THE HARNESS, SO IT MUST BE STUBBED (2026-10-19). `main()` probes
+    # `worker_live()` before every spawn, and that asks `$O/nonblocking-dispatch.sh --status`.
+    # On a box with no `$O` (the CI runner: `~/orchestrator` does not exist) `--status` cannot be
+    # read, the answer is UNKNOWN, and the pass correctly refuses to spawn blind -- so an unstubbed
+    # test read `sent == []` and failed on the RUNNER while passing on a developer box that happens
+    # to have the harness installed. The test is about the CLASSIFIER's skip, not about the box.
+    monkeypatch.setattr(pr, "worker_live", lambda name: False)
     sent = []
     monkeypatch.setattr(pr, "dispatch",
                         lambda p, a, t, dry: sent.append("prd-%s" % p["number"]) or (True, "", False))
@@ -1986,6 +2014,10 @@ def test_a_partly_blind_pass_that_DID_work_is_a_clean_pass(monkeypatch):
                         lambda p: (None, None, None) if p["number"] == 1 else ("record-review", "why", []))
     monkeypatch.setattr(pr, "brief", lambda p, a, w=None, cr=None: "brief")
     monkeypatch.setattr(pr, "log", logs.append)
+    # Same reason as above: an unstubbed liveness probe asks the box's `$O`, and on the CI runner
+    # that path does not exist -- the pass would refuse to spawn BLIND (correctly) and this test
+    # would read rc 2 for the wrong reason.
+    monkeypatch.setattr(pr, "worker_live", lambda name: False)
     monkeypatch.setattr(pr, "dispatch", lambda p, a, t, dry: (True, "", False))
     monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--dry-run"])
     assert pr.main() == 0
@@ -2017,8 +2049,7 @@ def test_a_pass_whose_every_order_was_refused_is_not_a_clean_pass(monkeypatch):
     ⛔ RE-EXPRESSED FOR THE WORKER TRANSPORT (#1890). #1872 wrote this against the lane roster; this
     branch RETIRES the lane table, so the order is refused by `dispatch()` (a transient spawn
     failure: not recorded, retried next pass) rather than by every idle lane. The property under
-    test is unchanged: legible work + nothing placed + nothing recorded must not be a clean pass.
-    """
+    test is unchanged: legible work + nothing placed + nothing recorded must not be a clean pass.    """
     logs = []
     monkeypatch.setattr(pr, "load_state", lambda: {})
     monkeypatch.setattr(pr, "open_prs", lambda: [_pr(1, "a" * 40), _pr(2, "b" * 40)])
@@ -2029,11 +2060,20 @@ def test_a_pass_whose_every_order_was_refused_is_not_a_clean_pass(monkeypatch):
                         lambda p, a, t, dry: (False, "dispatcher exited rc=78", False))
     monkeypatch.setattr(pr, "log", logs.append)
     monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--dry-run"])
-    assert pr.main() == 2
+    # ⛔ 3, NOT 2 (2026-10-18). "I could not READ" and "I read, I placed, nobody took it" are
+    # different facts on different repair paths, so they now carry different exit codes: 2 for a
+    # blind read, 3 for undeliverable work. The launcher, the health line and this suite can then
+    # tell an unreadable queue from a fleet that refused the order -- the distinction the owner's
+    # report needed and the log alone could not carry.
+    assert pr.main() == 3
     joined = "\n".join(logs)
     assert "no worker accepted" in joined, joined
     assert "REFUSING" in joined and "not a clean pass" in joined, joined
-    assert "undeliverable" in joined, joined
+    assert "2 order(s) no worker accepted" in joined, joined
+    assert "dispatched 0 of 2 queued" in joined, joined
+    # ⛔ AND IT MAY NOT ALSO SAY "nothing to do": the two sentences contradict each other, and the
+    # first draft of this verdict printed both (found by this test).
+    assert "nothing to do" not in joined, joined
 
 def test_a_DELIVERED_pass_is_still_clean_when_one_order_could_not_be_placed(monkeypatch):
     """…and the same refusal must not punish a pass that DID deliver: one drop beside one success."""
@@ -2053,9 +2093,11 @@ def test_a_DELIVERED_pass_is_still_clean_when_one_order_could_not_be_placed(monk
     monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--dry-run"])
     assert pr.main() == 0
     joined = "\n".join(logs)
-    assert "not dispatched -- retried on the next pass" in joined, joined   # the drop is reported
-    assert "dispatched 1 this pass" in joined, joined                       # …the delivery is counted
-    assert "REFUSING" not in joined, joined                                 # …but not a refusal
+    assert "not dispatched -- retried on the next pass" in joined, joined  # the drop is reported
+    assert "dispatched 1 of 2 queued" in joined, joined  # …and the delivery is counted, with
+                                                          # its DENOMINATOR (the line that
+                                                          # used to read `dispatched 1 this pass`)
+    assert "REFUSING" not in joined, joined  # …but the pass is not a refusal
 
 
 def test_a_failed_pr_read_refuses_with_its_own_exit_code(monkeypatch):
@@ -2122,3 +2164,333 @@ def test_a_stale_sibling_objective_refuses_at_import(tmp_path):
                        capture_output=True, text=True, cwd=str(tmp_path), timeout=60)
     assert r.returncode != 0, "a stale sibling must NOT run: it would dispatch blind"
     assert "classify_one" in (r.stdout + r.stderr)
+
+
+
+# ── 7. THE SELF-DISPATCHER DIES SILENTLY (owner report, 2026-10-18) ────────────────────────
+# MEASURED on the live box before this section existed:
+#     com.tortoise.pr-doctor   runs=325   last exit=2   stdout=0 bytes... and, in fact, a log
+#     nobody read; ~/.pi/agent/state/queue-dispatch.log said "dispatched 0"
+#     heartbeat said "pr-doctor dispatches: running=12..23" (that is QUEUE STATE, not dispatch)
+# and, over the SCHEDULED path (`$STATE/pr-doctor.launchd.log`, first line 2026-10-10T22:49 -> last 2026-10-18T21:32) managed TWO dispatches ever -- 382 passes, 320 `LANE READ FAILED`, 241 of them `TimeoutExpired`. ⚠️ NOT `0 dispatches for six days`: the heartbeat's own launcher (`$STATE/pr-doctor.log`) carried the fleet intermittently (87 passes with `dispatched >0`).
+# Each test below pins ONE of the four exit paths the owner asked for: success, empty queue,
+# unreadable queue, and a lane that fails to start. All four must carry a DISTINCT, LOGGED reason.
+
+def _drive_pass(monkeypatch, prs, classified, launched=True, logs=None, argv=("pr-doctor.py",),
+                state=None):
+    """Run one pass against a synthetic world; return (rc, joined log, status payload).
+
+    ⛔ THE TRANSPORT IS THE WORKER ONE (#1890): `dispatch(pr, action, text, dry)` returns
+    `(launched, detail, record)`. `launched=False` with `record=False` is the TRANSIENT spawn
+    failure -- not recorded, retried next pass -- which is how a whole pass can place nothing
+    (`undeliverable`).
+
+    ⛔ THE DEFAULT IS A REAL PASS, NOT A DRY RUN (2026-10-18, review). `--dry-run` no longer writes
+    the fleet-visible verdict (a dry run must not stamp `ok` over a red record), so a helper that
+    always passed `--dry-run` would assert against an empty sidecar and test nothing. Tests that
+    need a dry run pass `argv=("pr-doctor.py", "--dry-run")` explicitly.
+    """
+    import json as _json
+    logs = logs if logs is not None else []
+    monkeypatch.setattr(pr, "load_state", lambda: dict(state or {}))
+    monkeypatch.setattr(pr, "save_state", lambda st: None)   # never touch the live state file
+    monkeypatch.setattr(pr, "open_prs", lambda: prs)
+    monkeypatch.setattr(pr, "classify", lambda p: classified)
+    monkeypatch.setattr(pr, "worker_live", lambda name: False)
+    monkeypatch.setattr(pr, "brief", lambda p, a, w=None, cr=None: "brief")
+    monkeypatch.setattr(pr, "dispatch",
+                        lambda p, a, t, dry: ((True, "spawned", False) if launched
+                                              else (False, "dispatcher exited rc=78", False)))
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(sys, "argv", list(argv))
+    rc = pr.main()
+    payload = {}
+    try:
+        with open(pr.STATUS) as fh:
+            payload = _json.load(fh)
+    except Exception:
+        pass
+    return rc, "\n".join(logs), payload
+
+
+def test_success_exits_0_and_names_the_pr_it_dispatched(monkeypatch):
+    rc, joined, payload = _drive_pass(monkeypatch, [_pr(7)], ("fix-ci", "red", []))
+    assert rc == 0, joined
+    assert "dispatched 1 of 1 queued" in joined, joined
+    # ⛔ ASSERT THE RECORD, NOT THE CONSTANT (2026-10-18, review). `"PRD-7" in pr.STATUS` was
+    # tautological -- STATUS is a path this test sets, so the assertion could never fail. The
+    # question is whether the sidecar carries the verdict a reader consumes.
+    assert payload.get("rc") == 0, payload
+    assert payload.get("dispatched") == 1, payload
+    assert payload.get("prs") == [7], "the record must NAME the PR that went out: %r" % (payload,)
+    assert "EXIT rc=0" in joined, joined
+
+
+def test_an_empty_queue_exits_0_and_says_the_queue_is_empty(monkeypatch):
+    """`dispatched 0` must never stand alone: an empty queue is a DIFFERENT fact from a refusal."""
+    rc, joined, payload = _drive_pass(monkeypatch, [], ("fix-ci", "", []))
+    assert rc == 0, joined
+    assert "queue is empty" in payload.get("reason", ""), payload
+    assert payload.get("queued") == 0 and payload.get("dispatched") == 0, payload
+
+
+def test_an_unreadable_queue_exits_2_and_is_not_an_empty_queue(monkeypatch):
+    """A failed PR read is rc 2 -- never the reassuring "no open PRs" path."""
+    logs = []
+    monkeypatch.setattr(pr, "load_state", lambda: {})
+    monkeypatch.setattr(pr, "save_state", lambda st: None)
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(pr, "open_prs", lambda: [])
+    monkeypatch.setattr(pr, "OPEN_PRS_ERROR", "rc=1 GraphQL: API rate limit already exceeded")
+    # ⛔ A REAL PASS, NOT `--dry-run` (2026-10-18, review). The refusal is recorded only for a run
+    # that speaks for the fleet; under `--dry-run` NOTHING is written, so asserting the sidecar here
+    # would pin the opposite of the rule that a dry run must not stamp a verdict.
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py"])
+    assert pr.main() == 2
+    joined = "\n".join(logs)
+    assert "REFUSING" in joined and "rate limit" in joined, joined
+    import json as _json
+    payload = _json.load(open(pr.STATUS))
+    assert payload["rc"] == 2 and "rate limit" in payload["reason"], payload
+
+
+def test_a_worker_that_fails_to_start_exits_3_and_says_no_worker_accepted(monkeypatch):
+    """The fourth path: readable queue + readable checks + NO WORKER took the order. Its own code.
+
+    RE-EXPRESSED FOR THE WORKER TRANSPORT (#1890). This was the lane-roster case ("every lane
+    REFUSED"); the lane table is retired, so the order is refused by `dispatch()` -- a transient
+    spawn failure, not recorded, retried next pass. The property is unchanged: work was legible,
+    nothing was placed, so the pass may not exit 0.
+    """
+    rc, joined, payload = _drive_pass(monkeypatch, [_pr(9)], ("fix-ci", "red", []), launched=False)
+    assert rc == 3, joined
+    assert "no worker accepted" in payload.get("reason", ""), payload
+    assert payload.get("rc") == 3 and payload.get("undeliverable") == 1, payload
+    assert "not a clean pass" in joined, joined
+
+
+def test_the_four_exit_paths_carry_four_distinct_reasons(monkeypatch):
+    """One table, so a future edit cannot collapse two of them back into bare `dispatched 0`."""
+    seen = {}
+    seen["success"] = _drive_pass(monkeypatch, [_pr(1)], ("fix-ci", "r", []))[2]
+    seen["empty"] = _drive_pass(monkeypatch, [], ("fix-ci", "r", []))[2]
+    seen["worker-fails"] = _drive_pass(monkeypatch, [_pr(2)], ("fix-ci", "r", []),
+                                       launched=False)[2]
+    # A blind CHECK read is the dispatcher's other "I could not see the world" (the lane roster is
+    # gone): every PR unreadable -> rc 2, and a reason that says so.
+    seen["unreadable-checks"] = _drive_pass(monkeypatch, [_pr(3)], (None, "", []))[2]
+    for k, v in seen.items():
+        assert v.get("reason"), "%s recorded no reason: %r" % (k, v)
+    reasons = {k: v["reason"] for k, v in seen.items()}
+    assert len(set(reasons.values())) == 4, reasons
+    # Success and an EMPTY queue are both clean (rc 0) -- they are different REASONS, not different
+    # verdicts. The two failure shapes are the ones that must never collapse into one code.
+    assert seen["success"]["rc"] == 0 and seen["empty"]["rc"] == 0, seen
+    assert {seen["worker-fails"]["rc"], seen["unreadable-checks"]["rc"]} == {2, 3}, seen
+
+
+def test_a_zero_dispatch_on_a_runnable_queue_names_why(monkeypatch):
+    """⛔ THE OWNER'S LINE: `dispatched 0 of N queued — <why>`, never a bare `dispatched 0`."""
+    # no capacity -> the reason is the budget
+    monkeypatch.setattr(pr, "capacity", lambda: {"max_fix": 0, "max_review": 0})
+    rc, joined, _p = _drive_pass(monkeypatch, [_pr(12)], ("fix-ci", "red", []))
+    assert "dispatched 0 of 1 queued" in joined, joined
+    assert "no capacity budget" in joined, joined
+    # capacity, but the PR is inside its cooldown -> the reason names the cooldown
+    monkeypatch.setattr(pr, "capacity", lambda: {"max_fix": 4, "max_review": 4})
+    head = "a" * 40
+    rc, joined, _p = _drive_pass(monkeypatch, [_pr(11, head)], ("fix-ci", "red", []),
+                                 state={"11": {"action": "fix-ci", "head": head,
+                                               "at_epoch": pr.now()}})
+    assert "dispatched 0 of 1 queued" in joined, joined
+    assert "cooldown=1" in joined, joined
+
+
+# ── 8. THE OWNER'S PRIORITY: un-owned PRs first, then (and only then) new issues ───────────
+
+def test_un_owned_prs_are_dispatched_before_owned_ones(monkeypatch):
+    """A PR a LIVE process is already working must not outrank an un-worked one.
+
+    The queue is built so the OWNED PR wins every tie-break the old ordering used (class rank
+    `call-rail`=0 beats `fix-ci`=5, and its number is lower). Only the ownership key can put the
+    un-owned PR first, so this fails if that key is dropped.
+    """
+    owned, un = _pr(3), _pr(90)
+    order = []
+
+    def classify(p):
+        return ("call-rail", "cheap", []) if p["number"] == 3 else ("fix-ci", "red", [])
+
+    monkeypatch.setattr(pr, "live_owners", lambda prs: ({3: "branch b pid 42"}, ""))
+    monkeypatch.setattr(pr, "load_state", lambda: {})
+    monkeypatch.setattr(pr, "save_state", lambda st: None)
+    monkeypatch.setattr(pr, "open_prs", lambda: [owned, un])
+    monkeypatch.setattr(pr, "classify", classify)
+    monkeypatch.setattr(pr, "worker_live", lambda name: False)
+    monkeypatch.setattr(pr, "brief", lambda p, a, w=None, cr=None: "brief")
+    monkeypatch.setattr(pr, "dispatch",
+                        lambda p, a, t, dry: order.append("prd-%s" % p["number"]) or (True, "", False))
+    monkeypatch.setattr(pr, "log", lambda m: None)
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--dry-run"])
+    assert pr.main() == 0
+    assert order and order[0] == "prd-90", order
+
+
+def test_issue_work_is_SKIPPED_while_un_owned_prs_exist(monkeypatch):
+    rc, joined, payload = _drive_pass(monkeypatch, [_pr(1), _pr(2)], ("fix-ci", "r", []))
+    assert "issues: SKIPPED (un-owned PRs exist)" in joined, joined
+    assert payload.get("un_owned") == 2 and payload.get("owned") == 0, payload
+
+
+def test_issue_work_is_ELIGIBLE_only_when_every_pr_has_a_live_holder(monkeypatch):
+    monkeypatch.setattr(pr, "live_owners", lambda prs: ({p["number"]: "live" for p in prs}, ""))
+    rc, joined, payload = _drive_pass(monkeypatch, [_pr(1), _pr(2)], ("fix-ci", "r", []))
+    assert "issues: ELIGIBLE (no un-owned PRs)" in joined, joined
+    assert payload.get("un_owned") == 0 and payload.get("owned") == 2, payload
+
+
+def test_an_unreadable_ownership_probe_counts_every_pr_as_un_owned(monkeypatch):
+    """A blind probe is NOT "nothing is owned" and NOT "everything is". The owner's rule picks the
+    safe direction: prove ownership or treat the PR as un-owned -- and SAY it was blind."""
+    monkeypatch.setattr(pr, "live_owners", lambda prs: ({}, "lsof cwd probe failed rc=1"))
+    rc, joined, payload = _drive_pass(monkeypatch, [_pr(1)], ("fix-ci", "r", []))
+    assert "OWNERSHIP READ FAILED" in joined, joined
+    assert "issues: SKIPPED" in joined and "UNREADABLE" in joined, joined
+    assert payload.get("ownership_read_failed"), payload
+
+
+def test_ownership_requires_a_live_process_in_the_pr_branch(monkeypatch):
+    """The predicate itself, driven with injected reads (no lsof, no git in the suite)."""
+    monkeypatch.setattr(pr, "live_owners", _REAL_LIVE_OWNERS)
+    monkeypatch.setattr(pr, "_cwd_probe", lambda: ({"11": "/r/.worktrees/fix-77",
+                                                   "12": "/r/.worktrees/empty"}, ""))
+    monkeypatch.setattr(pr, "_repo_worktrees", lambda: ([
+        ("/r", "main"),
+        ("/r/.worktrees/fix-77", "fix/pr-77"),
+        ("/r/.worktrees/empty", "fix/other"),
+    ], ""))
+    owners, err = pr.live_owners([
+        {"number": 77, "headRefName": "fix/pr-77"},
+        {"number": 78, "headRefName": "fix/per-78"},
+        {"number": 1, "headRefName": "fix/per-1"},     # a bare substring of nothing here
+    ])
+    assert err == "", err
+    assert list(owners) == [77], owners
+
+
+def test_ownership_by_worktree_path_is_a_TOKEN_match_not_a_substring(monkeypatch):
+    """#7 must not be "owned" by a worktree checked out for #17 (the prefix-collision class)."""
+    monkeypatch.setattr(pr, "live_owners", _REAL_LIVE_OWNERS)
+    monkeypatch.setattr(pr, "_cwd_probe", lambda: ({"11": "/r/.worktrees/fix-17"}, ""))
+    monkeypatch.setattr(pr, "_repo_worktrees", lambda: ([("/r/.worktrees/fix-17", "x")], ""))
+    owners, err = pr.live_owners([{"number": 7, "headRefName": "y"},
+                                 {"number": 17, "headRefName": "z"}])
+    assert err == "" and list(owners) == [17], owners
+
+
+def test_a_probe_that_read_nothing_is_UNKNOWN_not_a_clean_fleet(monkeypatch):
+    monkeypatch.setattr(pr, "live_owners", _REAL_LIVE_OWNERS)
+    monkeypatch.setattr(pr, "_cwd_probe", lambda: ({}, ""))
+    owners, err = pr.live_owners([{"number": 1, "headRefName": "b"}])
+    assert owners == {} and "NOTHING" in err, (owners, err)
+
+
+def test_the_ownership_predicate_still_answers_when_GIT_is_unreadable(monkeypatch):
+    """⛔ MEASURED UNDER launchd: `git -C ~/Documents/...` fails with `Operation not permitted`
+    (no Full Disk Access), so a predicate keyed on the branch map read EVERY PR as un-owned on the
+    launcher that actually runs the dispatcher -- while the same probe succeeded interactively.
+
+    `lsof` reads kernel data, so the worktree PATH is still available. This drives exactly that
+    shape: no git, one live process in `.worktrees/pr-doctor-exit2` whose PR head is
+    `fix/pr-doctor-exit2`.
+    """
+    monkeypatch.setattr(pr, "live_owners", _REAL_LIVE_OWNERS)
+    monkeypatch.setattr(pr, "_cwd_probe", lambda: (
+        {"7": "/r/.worktrees/pr-doctor-exit2/src", "8": "/r/.worktrees/fix-42"}, ""))
+    monkeypatch.setattr(pr, "_repo_worktrees", lambda: (
+        [], "git worktree list failed: rc=128 fatal: Unable to read current working directory: "
+            "Operation not permitted"))
+    owners, err = pr.live_owners([
+        {"number": 9101, "headRefName": "fix/pr-doctor-exit2"},   # branch-slug arm
+        {"number": 42, "headRefName": "fix/something-else"},      # number-token arm
+        {"number": 9102, "headRefName": "fix/not-worked"},
+    ])
+    assert err == "", err
+    assert sorted(owners) == [42, 9101], owners
+    assert "branch map unavailable" in pr.OWNERSHIP_NOTE, pr.OWNERSHIP_NOTE
+
+
+def test_a_dry_run_never_stamps_the_fleet_visible_verdict(monkeypatch, tmp_path):
+    """⛔ A LANE REPRODUCING AN ISSUE MUST NOT ERASE A RED RECORD (2026-10-18, review).
+
+    `dispatch()` returns True under `--dry`, so a dry pass used to write `{"rc":0,...,"ok"}` over the
+    last real verdict -- and the beat would then print `PR-DOCTOR(last run): ok` without a single
+    dispatch. The verdict is a record of what HAPPENED; a dry run only says what WOULD.
+    """
+    import os as _os
+    monkeypatch.setattr(pr, "STATUS", str(tmp_path / "pr-doctor.status.json"))
+    rc, joined, payload = _drive_pass(monkeypatch, [_pr(7)], ("fix-ci", "red", []),
+                                      argv=("pr-doctor.py", "--dry-run"))
+    assert rc == 0, joined
+    assert "dispatched 1 of 1 queued" in joined, joined
+    assert "NOT recorded" in joined, joined
+    assert payload == {}, "a dry run wrote a fleet-visible verdict: %r" % (payload,)
+    assert not _os.path.exists(pr.STATUS), pr.STATUS
+
+
+def test_a_dry_run_writes_NO_verdict_on_ANY_exit_path(monkeypatch, tmp_path):
+    """⛔ ONE EXIT PATH WAS NOT ENOUGH (2026-10-18, review).
+
+    The first revision suppressed the write in the pass summary only, so the open-PR-failure,
+    empty-queue and all-checks-blind exits still stamped `{"rc":…}` over a real RED -- and the
+    failure path even FABRICATED a status the scheduled job never produced. The flag is now
+    consulted by `record_exit` itself, so every caller is covered.
+    """
+    import os as _os
+    monkeypatch.setattr(pr, "STATUS", str(tmp_path / "pr-doctor.status.json"))
+    monkeypatch.setattr(pr, "load_state", lambda: {})
+    monkeypatch.setattr(pr, "save_state", lambda st: None)
+    monkeypatch.setattr(pr, "log", lambda m: None)
+    monkeypatch.setattr(pr, "open_prs", lambda: [])
+    monkeypatch.setattr(pr, "OPEN_PRS_ERROR", "rc=1 GraphQL: rate limited")
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--dry-run"])
+    assert pr.main() == 2
+    assert not _os.path.exists(pr.STATUS), "a dry run wrote the open-PR-failure verdict"
+    # …and the same flag reaches the empty-queue exit.
+    monkeypatch.setattr(pr, "OPEN_PRS_ERROR", "")
+    assert pr.main() == 0
+    assert not _os.path.exists(pr.STATUS), "a dry run wrote the empty-queue verdict"
+
+
+def test_only_N_is_not_a_fleet_reading(monkeypatch, tmp_path):
+    """`--only N` computes everything from a one-PR universe; recording it would lie about the fleet
+    (measured: with one open PR, `--only 123` wrote `queue is empty: no open non-draft PRs`)."""
+    import os as _os
+    monkeypatch.setattr(pr, "STATUS", str(tmp_path / "pr-doctor.status.json"))
+    rc, joined, payload = _drive_pass(monkeypatch, [_pr(7)], ("fix-ci", "red", []),
+                                      argv=("pr-doctor.py", "--only", "123"))
+    assert rc == 0, joined
+    assert "not a fleet reading" in joined, joined
+    assert payload == {} and not _os.path.exists(pr.STATUS), payload
+
+
+# ── 9. the classifier's own edges, pinned at the dispatcher's call sites ───────────────────
+
+def test_a_surface_pr_is_escalated_to_the_owner_not_landed(monkeypatch):
+    """The docstring has always claimed a `surface` outcome; the predicate never existed here.
+
+    `objective.touches_surface()` is the fleet's version of it (the beat's `ASK-USER: surface=N`),
+    and the dispatcher may not land a diff that changes the SDK/MCP contract on its own.
+    """
+    logs = []
+    surface = dict(_pr(1), files=[{"path": "tortoise/sdk.py"}])
+    monkeypatch.setattr(pr, "load_state", lambda: {})
+    monkeypatch.setattr(pr, "open_prs", lambda: [surface])
+    monkeypatch.setattr(pr, "classify", lambda p: ("call-rail", None, []))
+    monkeypatch.setattr(pr, "worker_live", lambda name: False)
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(pr, "dispatch",
+                        lambda *a, **k: pytest.fail("a surface change needs the OWNER, not a lane"))
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--dry-run"])
+    assert pr.main() == 0
+    assert any(m.startswith("ASK-USER #1") for m in logs), logs

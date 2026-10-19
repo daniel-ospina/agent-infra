@@ -99,11 +99,45 @@ case "${CLAIM_ISSUE_TTL:-}" in
   ''|*[!0-9]*|0*) CLAIM_ISSUE_TTL=10800 ;;
   *) [ "${#CLAIM_ISSUE_TTL}" -le 9 ] || CLAIM_ISSUE_TTL=10800 ;;
 esac
-# The repository every git call runs against. Defaults to the cwd (correct for merge-one.sh,
-# which cd's into $REPO first) but the CONTROLLER must set it: orch-loop.sh runs from launchd
-# with cwd=$HOME, where `git fetch` fails and the claim snapshot silently comes back empty —
-# which is exactly what "snapshot lines=0 while origin had 3 live claims" looked like.
-CLAIM_REPO="${CLAIM_REPO:-.}"
+# The repository every git call runs against. Resolution order:
+#   1. an explicit CLAIM_REPO — used exactly as given, SET-AND-EMPTY included: an empty claim repo is
+#      a caller bug, and `_git` REFUSES it rather than defaulting to something (see the empty-value
+#      note on `_git`);
+#   2. an ABSOLUTE `$REPO`, when it names a directory — it needs no resolution, so no cwd can make
+#      it wrong;
+#   3. a RELATIVE `$REPO`, when it names a directory AND the caller's cwd is not already a work-tree
+#      root (the caller standing in a repo root, and naming that repo relatively, is the two-worker
+#      shape below);
+#   4. `.` — the caller's cwd.
+#
+# ⛔ THE CONTROLLER SETS CLAIM_REPO ITSELF, and that is not a detail — it is why the default is NOT
+# the incident's cause. orch-loop.sh runs from launchd with cwd=$HOME (not a repository) and assigns
+# `CLAIM_REPO="$REPO"` right after sourcing this file; chain-merge.sh, dispatch-merge.sh and
+# refresh-candidates.sh also set it explicitly. What actually unblocked dispatch is `_git` below.
+# The default matters for a caller that gives only `$REPO` — which is also where `git fetch` fails
+# and the claim snapshot silently comes back empty, exactly as "snapshot lines=0 while origin had 3
+# live claims" looked (agent-infra#1850's measurement).
+#
+# ⛔ (4) IS THE PRE-FIX ANSWER AND STILL THE RIGHT ONE FOR THE TWO WORKERS THAT `cd "$REPO"` FIRST
+# (fix-one.sh:49+96, merge-one.sh:52+190). With a RELATIVE $REPO, `$REPO` resolved from inside `$REPO`
+# is `$REPO/$REPO` — which either does not exist (a stall) or is a same-named SUBDIRECTORY (a claim
+# pushed into a repo nobody named, measured). So (3)'s test is "is the cwd already a work-tree root",
+# NOT "does $REPO happen to name some directory": a bare `-d` was FALSE-POSITIVE in exactly that
+# shape, and git walks UP from a nested directory, so the claim would land on the wrong origin with
+# no error at all.
+# ⛔ And the cwd-root test ALONE is why (2) exists as a separate step: an ABSOLUTE $REPO standing in
+# some other repo's root is a caller naming a DIFFERENT repo, and answering `.` there would silently
+# claim on the cwd's origin instead (measured) — the same wrong-repo class, one shape over.
+if [ "${CLAIM_REPO+set}" = set ]; then
+  : # SET — used exactly as given, including EMPTY (which `_git` then refuses; never a default)
+elif [ -n "${REPO:-}" ] && [ -d "$REPO" ]; then
+  case "$REPO" in
+    /*) CLAIM_REPO="$REPO" ;;
+    *) if [ -e ./.git ]; then CLAIM_REPO="."; else CLAIM_REPO="$REPO"; fi ;;
+  esac
+else
+  CLAIM_REPO="."
+fi
 EMPTY_TREE=4b825dc642cb6eb9a060e54bf8d69288fbee4904
 export GIT_TERMINAL_PROMPT=0
 
@@ -112,7 +146,37 @@ export GIT_TERMINAL_PROMPT=0
 CLAIM_RESULT=""; CLAIM_COMMIT=""; CLAIM_REF=""; CLAIM_OWNER=""
 
 # Deterministic author so claim commits do not depend on global git identity.
-_git() { git -C "$CLAIM_REPO" "$@"; }
+#
+# ⛔ `cd` IN A SUBSHELL IS NOT THE SAME AS `git -C`, AND THE DIFFERENCE IS LOAD-BEARING (2026-10-18).
+# `git -C <dir>` still STARTS in the caller's cwd and must resolve it to work out its prefix; on the
+# launchd cells that read is denied (`fatal: Unable to read current working directory: Operation not
+# permitted`), so `commit-tree` produced an EMPTY hash — `_claim_commit` returned "", and
+# `_claim_acquire_at` refused every candidate with "could not build claim commit" while the
+# controller looked alive. A subshell `cd` puts git's cwd right BEFORE it is exec'd, so no read of
+# the caller's cwd happens at all; this is what made dispatch work again on the next iteration.
+#
+# ⛔ AND `cd` MUST BE MADE AS LITERAL AS `-C` WAS, OR IT INTRODUCES TWO FAIL-OPEN PATHS THAT `-C` DID
+# NOT HAVE (2026-10-18 review, both measured):
+#   • THE EMPTY VALUE. `cd ""` SUCCEEDS and leaves the cwd alone, so an empty CLAIM_REPO fell
+#     straight through to `git` in the CALLER's directory: a full acquire there built a commit and
+#     PUSHED `refs/claims/…` to that directory's origin — a repository nobody named. The `-n` test
+#     below is what makes the fail-closed promise true, for the value that reaches `_git`; the
+#     SET-and-empty case is kept from becoming a default by the `${CLAIM_REPO+set}` test above, so
+#     both orderings are refused.
+#   • `$CDPATH`. The `cd` BUILTIN searches $CDPATH for a relative path (a same-named directory the
+#     caller never named WINS over the local one — measured), which `git -C` never did; a relative
+#     CLAIM_REPO would then run every git call in that foreign repo and push there. Emptying CDPATH
+#     for this one command keeps the resolution local; `--` stops a leading `-` being read as an
+#     OPTION — `cd -P`/`cd -L` with no operand would otherwise SUCCEED and go to $HOME (measured),
+#     so a bare-option CLAIM_REPO could claim into whatever repo $HOME happens to be.
+# NB the failure text stays the generic "could not build claim commit": making it name the repo and
+# the reason is #1990's scope (it captures stderr and validates the sha), and duplicating that here
+# would only collide with it. These guards fail CLOSED; they do not make the message better.
+_git() {
+  ( [ -n "${CLAIM_REPO:-}" ] || return 1
+    CDPATH= cd -- "${CLAIM_REPO}" 2>/dev/null || return 1
+    git "$@" )
+}
 _cg() { _git -c user.name="fleet-claim" -c user.email="claims@localhost" "$@"; }
 
 # Which box holds this. Hostname + pid, so a claim names its owner human-readably in the log.

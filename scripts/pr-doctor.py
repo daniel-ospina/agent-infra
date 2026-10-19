@@ -64,6 +64,8 @@ Usage:
 from __future__ import annotations
 
 import argparse
+
+
 import importlib.util
 import json
 import os
@@ -75,13 +77,46 @@ import sys
 import tempfile
 import time
 from datetime import datetime, timezone
+# ⛔ THE LAYER MUST NOT SLEEP INSIDE THIS PROCESS (#1988). This script runs either synchronously
+# under `run_bounded` or DETACHED (`nohup … &`, reaped by its own lock), but every gh call it makes is
+# bounded at 180 s while the layer's first documented backoff is 60 s — an in-call wait would outlive
+# the call that asked for it, and the beat would report an unreadable surface instead of the
+# RATE-LIMITED verdict it can prove. NO_WAIT makes the layer record the limit and return at once, so
+# this process's own retry/report takes over. Inherited by every descendant (same bounded step).
+os.environ.setdefault("GH_LIMIT_NO_WAIT", "1")
 
 HOME = os.path.expanduser("~")
 HERE = os.path.dirname(os.path.realpath(__file__))
 STATE_DIR = os.path.join(HOME, ".pi", "agent", "state")
 STATE = os.path.join(STATE_DIR, "pr-doctor.json")
 LOG = os.path.join(STATE_DIR, "pr-doctor.log")
-
+# ⛔ THE PASS VERDICT, WHERE A READER THAT IS NOT launchd CAN SEE IT (2026-10-18).
+# `com.tortoise.pr-doctor` exits non-zero on every refusal, and that code is recorded by launchd,
+# but NOTHING in the fleet reads it: the two launchers are a detached heartbeat child (whose own
+# failure branch is unreachable -- #1933) and the launchd job (whose last exit status is visible
+# only to `launchctl list`, i.e. to a human who already suspects something). MEASURED 2026-10-18
+# over `$STATE/pr-doctor.launchd.log`, first line 2026-10-10T22:49 -> last 2026-10-18T21:32: 382 passes, 320 `LANE READ FAILED`, 241 carrying `TimeoutExpired`, and TWO that ever dispatched (both 2026-10-11)
+# -- while the beat reported `QUEUE(state): running=12..23`, which is the QUEUE's shape, not a
+# record of any dispatch. So each pass now writes its own verdict here on every exit that ENDS A
+# PASS (`--status` returns before this and is not a pass -- it dispatches nothing), and
+# `scripts/heartbeat-loop.sh` prints it as a RED line. A failure only `launchctl list` can
+# witness is a silent failure.
+STATUS = os.path.join(STATE_DIR, "pr-doctor.status.json")
+# ⛔ TWO KINDS OF RUN MUST NOT STAMP THE FLEET'S VERDICT, AND THE FLAG LIVES HERE BECAUSE ONLY THE
+# PASS CAN SET IT (2026-10-18, review). `--dry-run` writes nothing (a lane reproducing an issue would
+# otherwise replace a real RED with a synthetic `ok`), and `--only N` is a one-PR debugging view whose
+# universe is not the fleet's (it could publish `queue is empty` while PRs are open, or `issue_work=
+# ELIGIBLE` off a single owned PR). An earlier revision passed `dry_run=` from ONE exit path, so four
+# of six exits still wrote -- a guard that covers the path you tested is not a guard.
+NOT_A_FLEET_READING = ""      # "" = a real pass; else WHY this run must not be recorded
+# A DECLARED partial ownership read (e.g. the branch map is unreadable under TCC). Empty on a
+# complete read; `main()` logs it so a weaker predicate is never mistaken for a full one.
+OWNERSHIP_NOTE = ""
+# ⛔ NO LANE-ROSTER BUDGET, SNAPSHOT OR `SCRIPTS` HERE (#1890). Those constants belong to the
+# retired lane-table path: `LANE_BUDGET_S`/`LANE_BUDGET_MARGIN_S` bounded `lane-actions.py`'s scan
+# and `SNAPSHOT`/`SNAPSHOT_MAX_AGE_S` its published roster. This file spawns load-gated workers
+# instead and reads no roster at all, so the constants went with the path that used them -- a
+# constant nobody reads is how a retired path still looks alive.
 REPO = "daniel-ospina/tortoise"
 REPO_DIR = os.path.join(HOME, "Documents", "GitHub", "tortoise")
 
@@ -120,6 +155,11 @@ if _missing:
 # disagree about which `gh` they are, and the classifier is the half that knows how to degrade to
 # PATH on a box with no `~/bin/gh`.
 GH = CLASSIFIER.GH_BIN
+# ⛔ HAND THE LAYER THE BINARY #1872 PINNED (#1988). `GH` may be `$O/gh-rest/gh`, which then resolves
+# the real gh by walking PATH — the very environment (`~/.pi/agent/shims/gh`, TCC-refused, rc 126)
+# that #1872 pinned a binary for. CLASSIFIER computed the pin; pass it through so this process keeps
+# calling that binary and still gets serialisation and the documented backoff.
+GH_LAYER_ENV = dict(getattr(CLASSIFIER, "GH_LAYER_ENV", {}) or {})
 
 # Guards
 COOLDOWN_S = 45 * 60          # do not re-dispatch the same PR inside this window
@@ -315,9 +355,71 @@ def log(msg: str) -> None:
         pass
 
 
+def record_exit(rc: int, reason: str, **extra) -> int:
+    """Record the pass verdict where a reader can SEE it, then return `rc`.
+
+    ⛔ THE EXIT CODE ALONE IS NOT A REPORT (2026-10-18, measured). For three days this job exited
+    2 on every launchd tick while the fleet's own heartbeat said the PR dispatcher was running:
+    the refusal reached a log file and nothing else, and the `dispatched 0` line that DID reach the
+    fleet looked like a quiet queue. An operator dispatched PR owners by hand for hours.
+
+    So every exit path goes through here: one `EXIT rc=N -- <reason>` line on stdout (which is also
+    the launchd stdout file), and the same verdict as JSON in `STATUS`, which the heartbeat reads on
+    its next pass and prints as a RED line. `reason` is REQUIRED and positional so a new exit path
+    cannot forget it.
+
+    ⛔ EXCEPT WHEN THIS RUN IS NOT A PASS. `NOT_A_FLEET_READING` (set once in `main()` for
+    `--dry-run` and for `--only`) suppresses the write for EVERY caller, because the verdict is a
+    record of what HAPPENED to the fleet, and a debug/dry invocation describes neither. `reason` is
+    still logged, so the operator sees the refusal; it just does not become the fleet's record.
+    """
+    payload = {"rc": int(rc), "reason": reason, "at": ts(), "at_epoch": now(),
+               "pid": os.getpid(), "repo": REPO}
+    payload.update(extra)
+    if NOT_A_FLEET_READING or payload.get("dry_run"):
+        # ⛔ A DRY RUN MUST NOT STAMP THE FLEET'S VERDICT (2026-10-18, review). `dispatch()` returns
+        # True under `--dry`, so a lane reproducing an issue with `--dry-run` would write
+        # `{"rc":0,"reason":"... ok"}` over a red record and the beat would then print
+        # `PR-DOCTOR(last run): ok` without a single dispatch -- a false PASS manufactured by the
+        # instrument this whole change adds. The pass still says what it WOULD do; it just does not
+        # become the record of what HAPPENED.
+        log("EXIT rc=%d (%s -- NOT recorded as the pass verdict) -- %s"
+            % (rc, NOT_A_FLEET_READING or "dry run", reason))
+        return int(rc)
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        tmp = STATUS + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(payload, f, indent=1, sort_keys=True)
+        os.replace(tmp, STATUS)
+    except Exception as e:
+        # A SIDECAR THAT CANNOT BE WRITTEN IS ITSELF A FINDING -- say it, never disappear.
+        log("status write failed (%s) -- this exit is now visible ONLY as rc=%d" % (e, rc))
+    log("EXIT rc=%d -- %s" % (rc, reason))
+    return int(rc)
+
+
+def _call_env(env=None):
+    """The environment a `sh`/`sh_err` child gets.
+
+    A caller that passes `env` owns the whole environment (`dispatch()` hands a spawn `HOME` and
+    nothing else). Otherwise every gh call carries the #1988 layer's entry (`GH_LAYER_ENV`), so
+    the ONE serialised, bounded-backoff layer sits under every harness call -- and this process
+    does not retry inside it (`GH_LIMIT_NO_WAIT` above).
+    """
+    if env is not None:
+        return env
+    return {**os.environ, **GH_LAYER_ENV} if GH_LAYER_ENV else None
+
+
 def sh(args, timeout=180, cwd=None, env=None):
     try:
-        r = subprocess.run(args, capture_output=True, text=True, timeout=timeout, cwd=cwd, env=env)
+        r = subprocess.run(args, capture_output=True, text=True, timeout=timeout, cwd=cwd,
+                           env=_call_env(env))
+        return r.stdout
+    except Exception as e:
+        log("EXEC FAILED %s: %s" % (args[0], e))
+        return ""
         return r.stdout
     except Exception as e:
         log("EXEC FAILED %s: %s" % (args[0], e))
@@ -343,10 +445,11 @@ def sh_err(args, timeout=180, cwd=None, env=None, capture=True):
         if not capture:
             with tempfile.TemporaryFile() as errf:
                 r = subprocess.run(args, stdout=subprocess.DEVNULL, stderr=errf,
-                                   timeout=timeout, cwd=cwd, env=env)
+                                   timeout=timeout, cwd=cwd, env=_call_env(env))
                 errf.seek(0)
                 return "", errf.read().decode("utf-8", "replace"), r.returncode
-        r = subprocess.run(args, capture_output=True, text=True, timeout=timeout, cwd=cwd, env=env)
+        r = subprocess.run(args, capture_output=True, text=True, timeout=timeout, cwd=cwd,
+                           env=_call_env(env))
         return r.stdout, r.stderr, r.returncode
     except Exception as e:
         return "", "%s: %s" % (type(e).__name__, e), -1
@@ -895,6 +998,197 @@ def _drop_worktree_record(path: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# 2b. WHO IS ALREADY WORKING A PR — the owner's dispatch priority, as a LIVE fact
+# ---------------------------------------------------------------------------
+# ⛔ THE OWNER'S RULE (2026-10-18, verbatim): "un-owned PRs first — a PR is owned only if a LIVE
+# process has it — and only then pick issues for new work." MEASURED the same day: 25 open
+# non-draft PRs, 21 lanes reported `running`, and NOT ONE holder of a PR branch — so `running` was
+# a declaration about the past, never ownership. That is why this predicate is a CWD->PROCESS
+# probe and not a registry, a session name, or a marker file.
+#
+# ⛔ ONE IMPLEMENTATION, AND WHERE THE OTHER ONE LIVES. The shell sibling is
+# `scripts/orchestrator-harness/live-ownership.sh` (the `pr-first-selection` lane's module), which
+# encodes the SAME rule for the controller: "a PR is owned iff some running process's cwd is inside
+# a checkout whose checked-out branch is that PR's head ref, OR inside a worktree whose PATH carries
+# the PR number". That file is NOT landed on `origin/main` (it sits uncommitted in
+# `.worktrees/pr-first`, last touched 7h40m before this pass, with no live process on it), so this
+# file cannot import it. This function mirrors its documented rule EXACTLY — same two arms, same
+# residuals — and its module docstring is the specification. When the shell module lands, this
+# becomes the caller it already is: it does not invent a third rule.
+#
+# ⚠️ THE RESIDUALS, STATED RATHER THAN HIDDEN (they are the shell module's too):
+#   1. A REVIEWER that reads a PR through `gh` holds no worktree branch, so it reads UN-OWNED.
+#      That over-counts the work queue, which is the SAFE direction here: more PR work, never less.
+#   2. A probe that reads NOTHING is UNKNOWN, not "nothing is owned" — but the two are
+#      indistinguishable downstream, so the caller treats it as un-owned AND says `scan=UNREADABLE`.
+#      New issue work is then SKIPPED (`issue_work`), which is the direction the owner's rule asks.
+#   3. A NUMBER token can still over-claim when a worktree name carries an unrelated number
+#      (`.worktrees/wip-2026-10-18`, a date; `.worktrees/fix-42-attempt2` -> {42, 2}). Fixed only
+#      for the GLUED case (`pr-doctor-exit2` no longer reads as #2, and neither does a substring
+#      match); a standalone-but-unrelated number is not distinguishable from a PR number without
+#      reading the branch, i.e. without git. So this arm can still mark a PR owned when nothing is
+#      working it.
+#      ⛔ AND THAT IS NO LONGER THE SAFE DIRECTION (2026-10-18, review). When ownership only broke
+#      sort ties, over-claiming merely ordered the queue differently. It is now also the input to
+#      `issue_work`: an over-claimed holder SHRINKS `un_owned`, so `issue_work` flips to `ELIGIBLE`
+#      and `queue-dispatch.py` starts NEW issue work while the PR is in fact un-worked -- the exact
+#      thing the owner's priority forbids. The direction that stays safe is the other one (#2: a
+#      probe that reads nothing counts everything un-owned), and the branch arm of the LIVE
+#      `pr-first` module -- `git worktree list` + head-ref match -- is what closes this one. Until it
+#      lands, `ELIGIBLE` is a claim about the two arms this file has, not about the fleet.
+
+def _cwd_probe() -> tuple[dict, str]:
+    """{pid: cwd} for every process whose cwd is readable, else ({}, why).
+
+    ONE probe, not a per-pid loop: `lsof -d cwd` walks the table once. A process whose cwd is
+    denied (another user's, a hardened binary) is simply absent -- the probe is a FLOOR on visible
+    work, never a claim of completeness, which is exactly the residual the module docstring states.
+    """
+    out, err, rc = sh_err(["lsof", "-w", "-a", "-d", "cwd", "-Fpn"], timeout=60)
+    if rc != 0 and not (out or "").strip():
+        return {}, "lsof cwd probe failed rc=%s: %s" % (rc, (err or "").strip()[:120] or "no output")
+    rows, pid = {}, None
+    for line in (out or "").splitlines():
+        if line.startswith("p"):
+            pid = line[1:].strip()
+        elif line.startswith("n") and pid:
+            p = line[1:].strip()
+            if p.startswith("/"):
+                rows[pid] = p
+    return rows, ""
+
+
+def _ownership_git(args, timeout=60) -> tuple[str, str]:
+    """(stdout, why-it-failed) -- the ownership probe's own read, NOT the worktree one.
+
+    ⛔ TWO CALLERS, TWO SHAPES, ONE PAIR OF SEMANTICS. `_git()` (above) is the worktree path's:
+    a 3-tuple, because every caller there branches on `rc`. This one is the ownership probe's: it
+    wants the TEXT and a per-read error note, never an rc, and it pins `cwd=HOME` because a
+    launchd caller has no Full Disk Access for the tree it is asking about (the `-C` does the
+    entering). They are deliberately separate rather than one function with optional returns --
+    a shared signature that answers "failed" with a truthy string is how a caller silently reads
+    an error as output.
+    """
+    out, err, rc = sh_err(["git", "-C", REPO_DIR] + args, timeout=timeout, cwd=HOME)
+    return (out or ""), (("rc=%s %s" % (rc, (err or "").strip()[:120])) if rc != 0 else "")
+
+
+def _repo_worktrees() -> tuple[list, str]:
+    """[(path, branch)] for every worktree of REPO_DIR, or ([], why) when git cannot be read.
+
+    ⛔ THIS IS AN ENRICHMENT, NOT A PRECONDITION (2026-10-18, measured under launchd). A launchd
+    agent has no Full Disk Access for `~/Documents`, so `git -C <repo>` fails there with
+    `fatal: Unable to read current working directory: Operation not permitted` (rc=128) -- verified
+    in the job's own status record. Keying ownership on it made EVERY PR read un-owned on the
+    schedule that actually runs the dispatcher, while the same probe succeeded from an interactive
+    shell. So the branch map sharpens the answer when it can be read, and the caller falls back to
+    the worktree PATH (which lsof reports from kernel data, unaffected by TCC) when it cannot.
+    """
+    out, err = _ownership_git(["worktree", "list", "--porcelain"])
+    if err or not out.strip():
+        return [], "git worktree list failed: %s" % (err or "empty output")
+    seen, cur = [], {}
+    for line in out.splitlines() + [""]:
+        if not line.strip():
+            if cur.get("worktree"):
+                br = (cur.get("branch") or "").replace("refs/heads/", "")
+                seen.append((os.path.realpath(cur["worktree"]), br))
+            cur = {}
+            continue
+        k, _, v = line.partition(" ")
+        if k in ("worktree", "branch"):
+            cur[k] = v.strip()
+    return seen, ""
+
+
+def _worktree_slug(cwd: str) -> str:
+    """The worktree's NAME from a live cwd, without touching the filesystem.
+
+    `.worktrees/pr-doctor-exit2/...` -> `pr-doctor-exit2`; a plain checkout -> its basename. This
+    is read from the probe's path string, so it works under TCC where `git` cannot enter
+    `~/Documents` at all.
+    """
+    parts = [x for x in (cwd or "").split(os.sep) if x]
+    # ⛔ THE **LAST** `.worktrees` COMPONENT, AND NOTHING OUTSIDE ONE (2026-10-18, review).
+    # Returning the FIRST match named the OUTER worktree for a worktree nested in another (losing
+    # the inner name and its number), and falling back to the basename made a MAIN checkout
+    # (`…/GitHub/tortoise`) answer to the directory name -- so any PR whose branch ends in
+    # `tortoise` read owned by any live process sitting in the main checkout, which SUPPRESSES
+    # dispatch of real work. A plain checkout is not a per-PR worktree: return "".
+    hits = [k for k, part in enumerate(parts[:-1]) if part == ".worktrees"]
+    return parts[hits[-1] + 1] if hits else ""
+
+
+def _num_tokens(slug: str) -> set:
+    """The PR numbers a worktree name actually carries.
+
+    ⛔ A DIGIT GLUED TO LETTERS IS NOT A PR NUMBER (2026-10-18, review). `re.split` on non-digits
+    turns `pr-doctor-exit2` into the token `2`, which made PR #2 read OWNED by an unrelated
+    worktree -- the FALSE-OWNERSHIP direction, which HIDES work from the queue (the same
+    prefix-collision class as `str(n) in slug`, only inverted). A number counts only when it
+    stands alone: at the start, after a non-alphanumeric, and not followed by another digit.
+    """
+    return {int(t) for t in re.findall(r"(?<![A-Za-z0-9])0*([0-9]+)(?![0-9])", slug or "")}
+
+
+def live_owners(prs: list) -> tuple[dict, str]:
+    """{pr_number: "<evidence>"} for PRs a LIVE process is working, plus WHY the read failed.
+
+    Ownership is PROVED, never inferred from a claim: the process table is the population, and a
+    PR is owned when a live process sits in a checkout holding its head branch (or in a worktree
+    whose name carries its number). `err` is non-empty ONLY when the probe could not answer at all
+    -- callers must treat that as "every PR un-owned, and say so", never as a clean fleet (see the
+    module docstring's residual note).
+
+    Two arms, and NEITHER needs to read the repo (measured: launchd cannot):
+      * BRANCH -- exact, from `git worktree list` when git is readable, else from the worktree's
+        path slug, which this fleet derives from the branch (`fix/pr-doctor-exit2` ->
+        `.worktrees/pr-doctor-exit2`); both spellings are tried.
+      * NUMBER -- the worktree name carries the PR number as a TOKEN (never a substring: a bare
+        `str(n) in slug` makes #7 owned by `fix-17`).
+    """
+    global OWNERSHIP_NOTE
+    OWNERSHIP_NOTE = ""          # reset per pass: a stale note would describe a past read
+    cwds, cerr = _cwd_probe()
+    if cerr:
+        return {}, cerr
+    if not cwds:
+        return {}, "the cwd probe read NOTHING (no process cwd was visible)"
+    wts, werr = _repo_worktrees()
+    if werr:
+        OWNERSHIP_NOTE = ("branch map unavailable (%s) -- %s"
+                          % (werr[:100],
+                             "matching worktree paths and numbers only" if cwds else "no probe"))
+    by_path = {path: br for path, br in wts}
+    owners = {}
+    for p in prs:
+        n = p.get("number")
+        head = p.get("headRefName") or ""
+        heads = {h for h in (head, head.replace("/", "-"), head.split("/")[-1]) if h}
+        for pid, cwd in cwds.items():
+            # (a) exact branch, via the worktree path map when git was readable
+            for path in sorted(by_path, key=len, reverse=True):
+                if cwd == path or cwd.startswith(path + os.sep):
+                    br = by_path[path]
+                    if br and br in heads:
+                        owners[n] = "branch %s in %s (live pid %s)" % (br, path, pid)
+                        break
+            if n in owners:
+                break
+            # (b) the worktree's NAME matches the branch slug, or carries the PR number
+            slug = _worktree_slug(cwd)
+            if not slug:
+                continue
+            if head and (slug in heads or slug == head.replace("/", "-")):
+                owners[n] = "worktree %s matches head branch %s (live pid %s)" % (slug, head, pid)
+                break
+            if any(t == n for t in _num_tokens(slug)):
+                owners[n] = "worktree %s carries #%s (live pid %s)" % (slug, n, pid)
+                break
+    return owners, ""
+
+
+# ---------------------------------------------------------------------------
 # 3. THE BRIEF — fix -> review -> record -> rail, ONE RUN, no gap
 # ---------------------------------------------------------------------------
 
@@ -1433,6 +1727,17 @@ def main() -> int:
     ap.add_argument("--status", action="store_true")
     ap.add_argument("--only", type=int, default=0, help="limit to one PR number")
     args = ap.parse_args()
+    global NOT_A_FLEET_READING
+    # ALWAYS assigned (never only on the skip paths): this is a module global, and a stale value
+    # from an earlier in-process run would silently suppress a REAL pass's verdict.
+    NOT_A_FLEET_READING = "dry run" if args.dry_run else ""
+    if args.only:
+        # ⛔ `--only N` IS NOT A FLEET READING (2026-10-18, review). Everything downstream -- the
+        # empty-queue exit, `un_owned`, `issue_work` -- is computed from a ONE-PR universe, so
+        # recording it would publish `queue is empty` while PRs are open, or let new issue work
+        # through the gate on the strength of a single owned PR. It may dispatch (that is the point
+        # of the flag); it may not speak for the fleet.
+        NOT_A_FLEET_READING = "--only %d is not a fleet reading" % args.only
 
     st = load_state()
     if args.status:
@@ -1475,13 +1780,18 @@ def main() -> int:
         log("REFUSING: the open-PR read FAILED (%s) -- nothing dispatched" % OPEN_PRS_ERROR[:160])
         if voided and not args.dry_run:
             save_state(st)
-        return 2
+        return record_exit(2, "the open-PR read FAILED (%s) -- nothing dispatched"
+                           % OPEN_PRS_ERROR[:160], read="open_prs")
     prs = [p for p in prs if not p.get("isDraft")]
     if args.only:
         prs = [p for p in prs if p["number"] == args.only]
     if not prs:
         log("no open non-draft PRs")
-        return 0
+        # ⛔ THE EMPTY QUEUE IS A CLEAN PASS, AND IT SAYS WHICH CLEAN PASS IT IS (2026-10-18).
+        # `dispatched 0` with no denominator is the line this job printed for days while it was
+        # actually refusing; "0 of 0 queued -- queue is empty" cannot be mistaken for that.
+        return record_exit(0, "queue is empty: no open non-draft PRs",
+                           queued=0, dispatched=0)
 
     # classify everything first, then dispatch highest-value first
     classified = []
@@ -1550,7 +1860,9 @@ def main() -> int:
     if not classified and skipped.get("unreadable") == len(prs):
         log("REFUSING: not ONE of the %d open PR(s) had readable checks -- nothing dispatched"
             % len(prs))
-        return 2
+        return record_exit(2, "not ONE of the %d open PR(s) had readable checks -- nothing "
+                           "dispatched" % len(prs), queued=len(prs), dispatched=0,
+                           read="pr_checks")
 
     # Cheapest-and-highest-payoff FIRST: a landable PR costs one rail call, a repair costs lane-
     # hours. ⛔ THIS IS THIS FILE'S OWN POLICY, NOT `objective.CLASS_ORDER` -- the two differ
@@ -1559,7 +1871,43 @@ def main() -> int:
     # budget on. `running` is absent by construction (skipped above).
     ranked = {"call-rail": 0, "rerun-checks": 1, "record-review": 2,
               "resolve-conflict": 3, "blocked-by-rail": 4, "fix-ci": 5}
-    classified.sort(key=lambda t: (ranked.get(t[1], 8), t[0]["number"]))
+    # ⛔ THE OWNER'S PRIORITY IS THE OUTERMOST KEY (2026-10-18): UN-OWNED PRs FIRST, and the class
+    # ranking only breaks ties among them. Before this, a PR a live lane was already fixing could
+    # consume a budget slot ahead of an un-worked one, which is how the queue grew while every lane
+    # was "busy". Ownership is a LIVE PROCESS fact (`live_owners`), never a claim.
+    owners, own_err = live_owners(prs)
+    un_owned = [p for p in prs if p.get("number") not in owners]
+    if OWNERSHIP_NOTE:
+        # ⛔ A DECLARED DEGRADATION, NOT A SILENT ONE (measured: launchd cannot read ~/Documents, so
+        # `git worktree list` fails there while it succeeds interactively). The predicate still
+        # answers -- from the worktree paths lsof reports -- and says which arm it lost.
+        log("ownership: %s" % OWNERSHIP_NOTE)
+    if own_err:
+        # ⛔ AN UNREADABLE PROBE IS NOT "NOTHING IS OWNED", and it is not "everything is owned"
+        # either. The owner's rule makes the safe direction explicit: prove ownership or treat the
+        # PR as un-owned. Say the blindness out loud so a reader can tell this pass's ordering from
+        # a measured one.
+        log("OWNERSHIP READ FAILED -- every PR counts as UN-OWNED (the probe could not read): %s"
+            % own_err)
+    # ⛔ THE NEW-WORK GATE IS A GATE, NOT A SENTENCE IN THIS LOG (2026-10-18, review). `pr-doctor`
+    # opens no issues -- `scripts/queue-dispatch.py` does. So the decision this pass MEASURED is
+    # published as `issue_work` in the status sidecar, and `queue-dispatch.py` refuses new issue
+    # work while it reads `SKIPPED`. Printing the line here AND having the consumer read the
+    # record is what makes it true; a line alone would record a decision nobody took.
+    if un_owned:
+        issue_work = "SKIPPED"
+        log("issues: SKIPPED (un-owned PRs exist) -- %d of %d open PR(s) have no live process%s"
+            % (len(un_owned), len(prs),
+               " (ownership UNREADABLE)" if own_err else ""))
+    elif own_err:
+        issue_work = "SKIPPED"
+        log("issues: SKIPPED (ownership UNREADABLE -- un-owned PRs cannot be excluded)")
+    else:
+        issue_work = "ELIGIBLE"
+        log("issues: ELIGIBLE (no un-owned PRs) -- every one of %d open PR(s) has a live holder"
+            % len(prs))
+    classified.sort(key=lambda t: (0 if t[0].get("number") not in owners else 1,
+                                   ranked.get(t[1], 8), t[0]["number"]))
 
     # ⛔ THE CAP COMES FROM THE MACHINE, NOT FROM THIS SOURCE. `capacity()` reads MAX_FIX /
     # MAX_REVIEW from the environment or the orchestrator plist that `install.sh` renders (the
@@ -1577,58 +1925,109 @@ def main() -> int:
          cap["max_fix"], cap["max_review"], budgets["used"],
          budgets["fix"], budgets["review"], budgets["total"]))
 
-    def _exit_status(dispatched: int = 0, undeliverable: int = 0) -> int:
-        """`0` IS RESERVED FOR READABLE, NOTHING TO DO (#1872 review rounds 4-5, 15).
+    # ⛔ NO LANE-TABLE GATE. The old path read `lane-actions.py` and dispatched only to an idle
+    # lane; with the fleet busy it printed "no idle lanes -- nothing dispatched this pass" and
+    # gave up while classified work and budget sat unused. That path is RETIRED (#1890). A worker
+    # is spawned for the PR instead, and `nonblocking-dispatch.sh` -> `run_agent()` applies the
+    # load and disk gates at the moment of the spawn.
+    #
+    # ⛔ THE COUNTERS LIVE ABOVE `_finish`, NOT BELOW IT (2026-10-18, review). `_finish` closes over
+    # them, so a definition order that put `delivered` after the early `return _finish()` made the
+    # closure's cell unbound and the pass died with `NameError: free variable 'delivered'` -- on
+    # the empty-budget path, i.e. exactly the saturated-fleet pass this change is about.
+    dispatched = 0
+    undeliverable = 0        # legible work whose order NO WORKER accepted (see `_finish`)
+    delivered = []           # WHICH PRs actually went out -- the record must name them
+    stalled = {"cooldown": 0, "budget": 0, "brief": 0}
+    spent = {"fix": 0, "review": 0}
+
+    def _finish(dispatched: int = 0, undeliverable: int = 0, stalled: dict | None = None) -> int:
+        """The ONE exit: it prints `dispatched N of M queued — <why>`, records it, and returns rc.
+
+        `0` IS RESERVED FOR READABLE, NOTHING TO DO (#1872 review rounds 4-5, 15).
 
         A blind read plus zero dispatches is the same fact as an all-blind pass, one PR smaller, so
         it refuses; a blind read whose legible half was actually WORKED stays clean, and so does a
         fully readable pass with nothing to do.
 
-        ⛔ AND "NOTHING DELIVERED" IS A SECOND AXIS (#1872 r15). `undeliverable` counts the PRs
-        whose order NO WORKER ACCEPTED -- work that was legible, placed, and then dropped by the
-        transport. That leaves `dispatched == 0` with an empty `unreadable`, so the pass would
-        report the CLEAN `0` while nothing had been delivered: the same outcome as blindness, by a
-        different route, and the one path that emitted neither the `REFUSING:` line nor rc 2.
+        ⛔ AND "NOTHING DELIVERED" IS A SECOND AXIS (#1872 round 15). `undeliverable` counts the
+        PRs whose ORDER NO WORKER ACCEPTED -- work that was legible, placed, and then dropped by
+        the transport (a spawn that exited non-zero, a broker that never started). That leaves
+        `dispatched == 0` with an empty `unreadable`, so the pass would report the CLEAN `0` while
+        nothing had been delivered: the same outcome as blindness by a different route. It gets
+        its OWN exit code (3) so a launcher, a reader, or a test can tell "I could not read" (2)
+        from "I read, I placed, nobody took it" (3).
+
+        ⛔ AND THE DENOMINATOR IS THE FIX (2026-10-18, owner-reported). `dispatched 0` is what this
+        job printed on every pass for days while it was actually REFUSING at the lane read, and
+        the fleet read it as a quiet queue. "0 of 0 queued" and "0 of 17 queued -- no worker
+        accepted" are different facts, and the log now says which one happened, plus WHY.
         """
+        queued = len(classified)
+        unread, undeliv = skipped.get("unreadable") or 0, undeliverable
+        stalls = stalled or {}
         if not dispatched:
-            _unread, _undeliv = skipped.get("unreadable") or 0, undeliverable
-            if _unread and _undeliv:
+            if unread and undeliv:
                 log("REFUSING: %d PR(s) were UNREADABLE and %d order(s) no worker accepted,"
-                    " with nothing dispatched -- not a clean pass" % (_unread, _undeliv))
-                return 2
-            if _unread:
+                    " with nothing dispatched -- not a clean pass" % (unread, undeliv))
+            elif unread:
                 log("REFUSING: %d PR(s) were UNREADABLE and nothing was dispatched -- not a clean"
-                    " pass" % _unread)
-                return 2
-            if _undeliv:
+                    " pass" % unread)
+            elif undeliv:
                 log("REFUSING: %d order(s) no worker accepted and nothing was dispatched -- not"
-                    " a clean pass" % _undeliv)
-                return 2
-        return 0
-
-    # ⛔ NO LANE-TABLE GATE. The old path read `lane-actions.py` and dispatched only to an idle
-    # lane; with the fleet busy it printed "no idle lanes -- nothing dispatched this pass" and
-    # gave up while classified work and budget sat unused. That path is RETIRED. A worker is
-    # spawned for the PR instead, and `nonblocking-dispatch.sh` -> `run_agent()` applies the load
-    # and disk gates at the moment of the spawn.
-    if not budgets["total"]:
-        log("no dispatch budget this pass (capacity fix=%d review=%d, inflight=%d)"
-            % (cap["max_fix"], cap["max_review"], budgets["used"]))
-        return _exit_status()
-
-    dispatched = 0
-    undeliverable = 0        # legible work whose order the transport did not place (see helper)
-    spent = {"fix": 0, "review": 0}
+                    " a clean pass" % undeliv)
+        # WHY nothing (or something) went out. Named in the line itself, so the log answers the
+        # question an operator actually asks -- never a bare number.
+        parts = []
+        if dispatched:
+            parts.append("ok")
+        else:
+            if budgets["total"] == 0:
+                parts.append("no capacity budget (all of MAX_FIX+MAX_REVIEW is in flight)")
+            for k, v in sorted(stalls.items()):
+                if v:
+                    parts.append("%s=%d" % (k, v))
+        # These two are worth stating on a pass that DID dispatch: work was left behind, and why.
+        if undeliv:
+            parts.append("%d order(s) no worker accepted" % undeliv)
+        if unread:
+            parts.append("%d PR(s) with UNREADABLE checks" % unread)
+        # ⛔ "nothing to do" IS A CLAIM, and it may not stand beside a delivery failure: this line
+        # read `dispatched 0 of 2 queued — nothing to do; 2 order(s) no worker accepted`, i.e. two
+        # contradictory sentences in one verdict. It is the fallback ONLY when nothing else applies.
+        if not parts:
+            parts.append("nothing to do")
+        why = "; ".join(parts)
+        log("dispatched %d of %d queued — %s" % (dispatched, queued, why))
+        # ⛔ 2 AND 3 ARE DIFFERENT FACTS, so they get different codes: 2 = I could not read the
+        # world (the PR list, the checks); 3 = I read it, I placed the work, and NO WORKER WOULD
+        # TAKE IT. Collapsing them (both used to be 2) is why a launcher could not tell "the
+        # dispatcher is blind" from "the transport refused the order".
+        code = 0
+        if not dispatched and unread:
+            code = 2
+        elif not dispatched and undeliv:
+            code = 3
+        return record_exit(code, why, queued=queued, dispatched=dispatched, prs=delivered,
+                           dry_run=bool(args.dry_run),
+                           issue_work=issue_work,
+                           un_owned=len(un_owned), owned=len(owners),
+                           undeliverable=undeliv, unreadable=unread,
+                           ownership_read_failed=own_err[:160] if own_err else "",
+                           ownership_note=OWNERSHIP_NOTE[:160])
     for p, action, why, cr in classified:
         if dispatched >= budgets["total"]:
+            stalled["budget"] += 1
             break
         cls = ACTION_CLASS.get(action, "fix")
         if spent[cls] >= budgets[cls]:
+            stalled["budget"] += 1
             continue
         key = str(p["number"])
         prev = st.get(key) or {}
         # GUARD: cooldown, and never re-dispatch while the last one may still be live
         if prev and now() - prev.get("at_epoch", 0) < COOLDOWN_S and prev.get("head") == p["headRefOid"]:
+            stalled["cooldown"] += 1
             continue
         # ⛔ A LIVE WORKER IS IN FLIGHT, NOT A FREE SLOT -- REGARDLESS OF HEAD MOVEMENT. The
         # cooldown above is keyed on the head, so a worker that pushes re-arms dispatch at T+2min
@@ -1648,6 +2047,10 @@ def main() -> int:
             continue
         text = brief(p, action, why, cr)
         if not text:
+            # A legible PR we cannot render an order for is WORK WE FAILED TO DELIVER, not a quiet
+            # skip: it must reach the undeliverable count, or the pass exits 0 with work in hand.
+            stalled["brief"] += 1
+            undeliverable += 1
             continue
         ok, detail, record = dispatch(p, action, text, args.dry_run)
         if not ok:
@@ -1672,16 +2075,30 @@ def main() -> int:
                        "head": p["headRefOid"], "at": ts(), "at_epoch": now()}
         spent[cls] += 1
         dispatched += 1
+        delivered.append(p["number"])
 
     if not args.dry_run:
         save_state(st)
-    log("dispatched %d this pass%s" % (dispatched,
-                                       "" if not undeliverable else
-                                       " (%d order(s) undeliverable)" % undeliverable))
     # A partial blindness that DID dispatch stays a clean pass, because then the readable half was
     # WORKED; zero dispatches rides the same helper as the two early exits above.
-    return _exit_status(dispatched, undeliverable)
+    return _finish(dispatched, undeliverable, stalled)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # ⛔ AN UNCAUGHT EXCEPTION IS THE SILENTEST FAILURE OF ALL (2026-10-18). It exits 1 with a
+    # traceback on stderr, which under launchd is a file nobody reads -- the same shape as the
+    # measured launchd refusal. Catch it, record it, and let the traceback still land (the STATUS
+    # becomes 4 via `SystemExit(4)`, so the record and launchd agree on the code).
+    try:
+        sys.exit(main())
+    except SystemExit:
+        raise
+    except BaseException as e:
+        import traceback
+        traceback.print_exc()
+        record_exit(4, "UNCAUGHT %s: %s" % (type(e).__name__, str(e)[:200]))
+        # ⛔ `raise SystemExit(4)`, NOT a bare re-raise (2026-10-18, review): CPython exits 1 for an
+        # uncaught exception, so the sidecar said rc=4 while launchd said 1 -- the two readers this
+        # change exists to keep in agreement, disagreeing on the same pass. The traceback is already
+        # printed above, so nothing is lost by making the STATUS the exit code.
+        raise SystemExit(4)

@@ -50,6 +50,14 @@ O="${O:-$HOME/orchestrator}"; D="$O/bg"; mkdir -p "$D" "$O/state"
 # at SOURCE time (sysctl/nproc/getconf), so sourcing it under a cell's pre-export PATH pins
 # `_NCPU=4` / `MAX_LOAD=40` for every cell (agent-infra#1702). The two siblings carry the same ⛔.
 export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
+# ⛔ AND RE-ASSERT THE gh LIMIT LAYER AFTER IT (#1988) — the same rule lane.sh / fix-one.sh /
+# merge-one.sh / chain-merge.sh carry. This script does not call `gh` itself, but it SPAWNS a whole
+# worker session IN-PROCESS (`run_agent` inherits this environment), so without these two lines every
+# `gh` that worker runs resolves to `/opt/homebrew/bin/gh` — the layer would be deployed and inert,
+# which is exactly the state the issue exists to remove. Grouped so the population check in
+# `gh-limit.test.sh` sees them.
+if [ -d "$O/gh-limit" ]; then PATH="$O/gh-limit:$PATH"; fi
+if [ -d "$O/gh-rest" ]; then PATH="$O/gh-rest:$PATH"; fi
 # The RESOLUTION, though, mirrors merge-one.sh's repo-authority.sh — NOT lane.sh/fix-one.sh, which
 # source only `$SELF/spawn-gate.sh` and never consult `$O`. Prefer the daemon's copy at `$O`, fall
 # back to the copy beside THIS script; an unresolved helper must never degrade into "the worker ran".

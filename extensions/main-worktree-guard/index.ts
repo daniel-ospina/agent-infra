@@ -177,7 +177,11 @@ let trackedRelsIn: (repoTop: string, rels: string[]) => string[] = () => [];
 let hasDotGitAncestor: (p: string) => boolean = () => false;
 let extractScriptPath: (command: string) => string | null = () => null;
 let extractScriptArgs: (command: string, scriptPath: string) => string[] = () => [];
-let scriptGitVerdict: (path: string, currentBranch: string | null, executionCwd?: string, sessionCwd?: string, scriptArgs?: string[] | null) => "allow" | "block" = () => "allow";
+let scriptGitVerdict: (path: string, currentBranch: string | null, executionCwd?: string, sessionCwd?: string, scriptArgs?: string[] | null, opts?: { viaInterpreter?: boolean }) => "allow" | "block" = () => "allow";
+// #1485: does the invocation hand the file to an INTERPRETER (text) or execute
+// it directly (a binary)? Default TRUE (walk it) when the module is degraded —
+// the fail-closed direction, mirroring the other load-time defaults.
+let scriptIsInterpreted: (command: string, scriptPath: string) => boolean = () => true;
 // #627: non-shell code-interpreter payload surface (python -c / node -e / …).
 // Fail-safe defaults inert so a failed import NEVER false-blocks.
 let extractCodePayload: (command: string) => { kind: "inline" | "file" | "stdin-file" | "module" | "stdin"; value: string | null } | null = () => null;
@@ -271,7 +275,7 @@ try {
      isAllowMarkerActive, isAllowMarkerPath, isAllowMarkerCommand,
      extractMarkerReason, parseMarkerContent, isAllowMarkerRealpath,
      readAllowMarkerState, readHubDisorder,
-     extractScriptPath, scriptGitVerdict, evaluateHubGateWithTargets,
+     extractScriptPath, scriptGitVerdict, scriptIsInterpreted, evaluateHubGateWithTargets,
      extractCodePayload: _extractCodePayload, codePayloadGitVerdict: _codePayloadGitVerdict,
      commandExecutionCwd, resolveTargetTopLevel, matchHubWipPattern,
      extractBashWriteTargets, classifyUntrackedWip, branchDeleteAllowance, newFileWriteCollisionFree,
@@ -2205,6 +2209,33 @@ const SANCTIONED_SCRIPT_RELPATHS = [
   // same step gates every `blocked` row of the drain, since the rail requires a record bound to the
   // current head.
   "scripts/record-review.sh",
+  // #1485 — the MERGE RAIL itself. `bash scripts/admin-merge.sh <pr>` is the
+  // sanctioned way to land a PR and this repo's own rail. Measured git surface
+  // (the guard's own recognizer, line by line): FOUR invocations, all of them
+  // hub-recovery-allowed and none a branch/history mutation — `rev-parse
+  // --is-inside-work-tree`, `worktree add --detach --force`, and two guarded
+  // `worktree remove --force` calls. All four target a `mktemp -d` path the
+  // script creates and traps, which is why the invocation walk allows them; the
+  // merge itself goes through `gh`, and the evidence check through
+  // `record-review.sh`. ⚠️ The earlier wording here ("ZERO git invocations",
+  // "read-only") was WRONG — corrected at review cycle 2 — and it mattered: the
+  // exemption returns before the walk, so the confinement of those worktree ops
+  // is a property of the script, not something this list re-checks. Its content
+  // walk pinned `block` on the unresolvable-delegation text arm
+  // (`$(bash "$SELF_DIR/ci-workflow-pr-evaluable.sh")`), which made the rail
+  // unrunnable from a hub-rooted session — the reported #1485 false positive.
+  // Same class as #1141/#1484: a NAMED, audited path, never a directory or a
+  // content rule.
+  "scripts/admin-merge.sh",
+  // #1485 — the argv-level admin-merge shim (#984), which `command -v gh`
+  // resolves to in this fleet (`~/.pi/agent/shims/gh` → this file). Measured:
+  // ZERO git invocations in its content (it inspects argv and delegates to the
+  // evidence/rail scripts); it pinned `block` on the same unresolvable-delegation
+  // text arm (`$(bash "$VERIFY" …)`), which refused EVERY `gh` call routed
+  // through the shim — including the read-only `gh issue list` this issue
+  // reports. Exempting the path is the same trade as the rail above, and the file
+  // is why the merge evidence gate can be enforced on argv at all.
+  "scripts/gh-shim/gh",
 ];
 const _frameworkRoot: string | null = (() => {
   try {
@@ -2344,7 +2375,11 @@ function _backdoorBlock(command: string, execCwd?: string): string | null {
       } catch { /* audit is best-effort — never blocks */ }
       return null;
     }
-    if (scriptGitVerdict(resolved, branch, base, resolve(process.cwd()), scriptArgs) === "block") {
+    // #1485 (review cycle 3): a magic header does not make a file a binary when a
+    // SHELL is asked to read it — `bash x` strips the first line and runs the rest,
+    // so a `printf`-prefixed script skipped the walk entirely. The invocation decides.
+    const viaInterpreter = scriptIsInterpreted(command, scriptPath);
+    if (scriptGitVerdict(resolved, branch, base, resolve(process.cwd()), scriptArgs, { viaInterpreter }) === "block") {
       // #743: label the SCRIPT's own checkout, not the session's. A linked
       // worktree's copy is not "the shared main checkout", and the old message
       // offered hub-worktree.sh — which creates a worktree but cannot make a
