@@ -191,8 +191,9 @@ log "controller stopped"
 # Relaunch with the SAME command the live controller was started with (captured from
 # ps at deploy time): cd $HOME, fixed PATH, nohup into logs/nohup.out.
 # PATH for the relaunched controller, probed in THIS shell — the same idea as install.sh's
-# `__PATH__` render (`install.sh` probes the same four: `tmux gh uv pi`), and the reason there is no /Users/<someone>/... literal here any more: a
-# hardcoded home is the landmine class this file's REPO guard removes (#1935).
+# `__PATH__` render (`install.sh` probes the same tools, plus `jq`), and the reason there is no
+# /Users/<someone>/... literal here any more: a hardcoded home is the landmine class this file's
+# REPO guard removes (#1935).
 # ⛔ Same REFUSAL as install.sh: a directory under `.pi/` or a `shims` directory is skipped, because a
 # shim silently substitutes a different `gh`/`pi` than the one the operator means. (install.sh refuses
 # the class for a measured reason: macOS TCC makes such a symlink EPERM under launchd.)
@@ -212,7 +213,7 @@ DEPLOY_PATH=""
 # resolved to its PHYSICAL path before the refusal test, because a symlink pointing INTO a shim
 # directory passes a name-pattern check while resolving to the shim.
 _oldIFS="$IFS"; IFS=:; set -f
-for _t in pi tmux gh uv; do
+for _t in pi tmux gh uv cmux; do
   for _d in $PATH; do
     case "$_d" in ""|.) continue ;; esac
     _rd="$(cd "$_d" 2>/dev/null && pwd -P)" || continue
@@ -235,6 +236,19 @@ if [ -x "$HOME/.local/share/pi-node/current/bin/pi" ]; then
   case ":$DEPLOY_PATH:" in *":$HOME/.local/share/pi-node/current/bin:"*) ;; *)
     DEPLOY_PATH="${DEPLOY_PATH:+$DEPLOY_PATH:}$HOME/.local/share/pi-node/current/bin" ;; esac
 fi
+# ⛔ cmux LIVES IN AN APP BUNDLE, NOT ON ANY PATH ENTRY THE SCAN ABOVE CAN SEE. The relaunched
+# controller's collision pre-flight reads lane liveness through `cmux sessions list` (tortoise's
+# `fleet_state.live_sessions()`); with cmux unreachable `liveness_measured` is False, the board
+# carries `orphans[kind=liveness-unmeasured]`, and the pre-flight marks EVERY candidate INCOMPLETE —
+# the refresh then aborts by design (#1736) and the backlog drains to 0 while 203 issues sit open
+# (measured 2026-10-18). The scan above only inspects $PATH entries, and an install/relaunch run from
+# a non-login shell has no cmux there at all. Appended, never prepended: that directory also holds
+# `open`/`ghostty`, so prepending would shadow /usr/bin/open for every lane.
+for _d in /Applications/cmux.app/Contents/Resources/bin \
+          "$HOME/Applications/cmux.app/Contents/Resources/bin"; do
+  [ -x "$_d/cmux" ] || continue
+  case ":$DEPLOY_PATH:" in *":$_d:"*) ;; *) DEPLOY_PATH="${DEPLOY_PATH:+$DEPLOY_PATH:}$_d" ;; esac
+done
 [ -n "$DEPLOY_PATH" ] || DEPLOY_PATH="/usr/bin:/bin:/usr/sbin:/sbin"
 log "relaunch PATH: $DEPLOY_PATH"
 cd "$HOME" || exit 1

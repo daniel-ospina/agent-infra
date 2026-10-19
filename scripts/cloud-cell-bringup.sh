@@ -56,6 +56,10 @@
 set -uo pipefail
 
 CELL_HOME="${CELL_HOME:-/tmp/cell-home}"
+# The agent-infra checkout `check_operational_layer` trusted and installed the layer from. Global so
+# later steps (the disk-reaper timer's TEMPLATES_DIR) use the SAME checkout, rather than resolving a
+# second, possibly untrusted one.
+LAYER_ROOT=""
 REPO_SLUG="${REPO_SLUG:-daniel-ospina/tortoise}"
 WORKDIR="${WORKDIR:-/tmp/cell}"
 ENV_FILE="${ENV_FILE:-$CELL_HOME/keys.env}"
@@ -407,6 +411,7 @@ check_operational_layer() {
        so this cell would run unguarded with a rc=127 merge path. Clone agent-infra onto the cell
        and re-run:  INFRA_ROOT=<checkout> bash $0 --check"
   fi
+  LAYER_ROOT="$root"
   installer="$root/pi-bootstrap/cell-install.sh"
   # VERIFY FIRST: a re-run against a cell that already carries the layer is a READ-BACK (the
   # installer's --verify writes nothing, so it cannot repair anything either), and only a cell
@@ -544,6 +549,47 @@ check_caches() {
   fi
 }
 
+# ── disk: the SCHEDULED reaper (agent-infra#2032) ────────────────────────────────────────────────
+# Disk exhaustion is the second reason the cloud cells stopped working, and it arrives as a THRESHOLD:
+# at ~97%% used a `git worktree add` or `uv sync` fails and a healthy controller cannot spawn a lane.
+# `check_caches` below REPORTS the package caches; reporting is not reclaiming, and on a cell nobody
+# is logged into the only thing that reclaims is a scheduler. So the bring-up INSTALLS the timer (the
+# installer is idempotent and renders from this box's HOME/PATH/repos) and then reads back its state.
+# A cell that cannot schedule the pass is REFUSED rather than certified: `CELL READY` over a box one
+# full disk away from refusing every dispatch is the false PASS this script exists to remove.
+check_disk_reaper() {
+  local installer="" reaper="" cand out rc next last
+  for cand in "${DISK_REAPER_TIMER_INSTALLER:-}" \
+              "${HOME:-}/.pi/agent/scripts/install-disk-reaper-timer.sh" \
+              "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/install-disk-reaper-timer.sh"; do
+    [ -n "$cand" ] && [ -f "$cand" ] && { installer="$cand"; break; }
+  done
+  for cand in "${DISK_REAPER:-}" \
+              "${HOME:-}/.pi/agent/scripts/disk-reaper.sh" \
+              "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/disk-reaper.sh"; do
+    [ -n "$cand" ] && [ -f "$cand" ] && { reaper="$cand"; break; }
+  done
+  [ -n "$reaper" ] || die "disk-reaper.sh not found (looked at \$DISK_REAPER, \$HOME/.pi/agent/scripts, and beside this script) — a cell whose disk is never reaped stops dispatching at ~97%% used"
+  [ -n "$installer" ] || die "install-disk-reaper-timer.sh not found — cannot schedule the disk reaper, and an unscheduled reaper never runs unattended"
+
+  rc=0
+  # TEMPLATES_DIR from the SAME checkout the layer came from: the farmed installer copy lives at
+  # $HOME/.pi/agent/scripts, whose ../templates does not exist, so without this the templates are
+  # "missing" on exactly the cell that was just provisioned.
+  out="$(DISK_REAPER="$reaper" TEMPLATES_DIR="${LAYER_ROOT:+$LAYER_ROOT/templates/systemd}" \
+         bash "$installer" --install 2>&1)" || rc=$?
+  printf '%s\n' "$out" | sed 's/^/    /'
+  [ "$rc" -eq 0 ] || die "the disk reaper timer could not be installed (rc=$rc) — fix the reason above (a passwordless-sudo system unit, or a working systemd user manager) before this cell is used"
+
+  rc=0
+  out="$(DISK_REAPER="$reaper" TEMPLATES_DIR="${LAYER_ROOT:+$LAYER_ROOT/templates/systemd}" \
+         bash "$installer" --status 2>&1)" || rc=$?
+  [ "$rc" -eq 0 ] || die "the disk reaper timer is not healthy after install (rc=$rc): $(printf '%s' "$out" | tr '\n' ' ')"
+  next="$(printf '%s\n' "$out" | sed -n 's/^next_run=//p' | head -1)"
+  last="$(printf '%s\n' "$out" | sed -n 's/^  status=//p' | head -1)"
+  ok "disk reaper scheduled — timer next=${next:-?} last_pass=${last:-never} (state: ${DISK_REAPER_STATE_DIR:-$HOME/.pi/agent/state}/disk-reaper.status)"
+}
+
 main() {
   export HOME_ORIG="${HOME:-}"
   say "cloud-cell bringup — mode=$MODE uid=$(id -u)"
@@ -558,6 +604,7 @@ main() {
       check_dispatch
       check_operational_layer
       check_caches
+      check_disk_reaper
       # `CELL READY` is a claim about the cell, and "no pushed credential left on disk" is part of
       # it. The EXIT trap covers every other exit path; this makes the banner's own path fail-closed
       # too, so the banner is never printed while a registered secret is still there.

@@ -1678,18 +1678,33 @@ printf '#!/usr/bin/env python3\n' > "$TMP/tm/home/.pi/agent/scripts/lib/diff-nor
 # for the reason spelled out at $STUB_TM above: a `git` stub empties the provenance gate's rev-parse
 # and turns a current harness into an unverifiable one.
 for c in pi git python3; do command -v "$c" >/dev/null 2>&1 || { printf '#!/bin/bash\nexit 0\n' > "$TM/$c"; chmod +x "$TM/$c"; }; done
+# NAME-AWARE since #1989: `start` now creates TWO sessions (the controller, then the cell doctor),
+# and a stub whose `has-session` answers "up" for ANY name makes the second one short-circuit as
+# "already running" — so the doctor's own command string (which must carry the operator's SCOPE and
+# ENV_FILE, because it can restart the controller) would never be recorded or asserted.
 cat > "$TM/tmux" <<'STUB'
 #!/bin/bash
-case "$1" in
-  has-session) [ -f "$TM_STATE/up" ] && exit 0 || exit 1 ;;
-  new-session) shift; printf '%s\n' "$*" > "$TM_STATE/cmd"; : > "$TM_STATE/up"; exit 0 ;;
+sub="${1:-}"; shift
+args="$*"
+n=""
+while [ $# -gt 0 ]; do
+  if [ "$1" = "-s" ] || [ "$1" = "-t" ]; then n="$2"; shift 2; else shift; fi
+done
+case "$sub" in
+  has-session)
+    [ -n "$n" ] && grep -qxF -- "${n#=}" "$TM_STATE/names" 2>/dev/null && exit 0
+    exit 1 ;;
+  new-session)
+    [ -n "$n" ] && printf '%s\n' "$n" >> "$TM_STATE/names"
+    printf '%s\n' "$args" >> "$TM_STATE/cmd"
+    : > "$TM_STATE/up"; exit 0 ;;
   *) exit 0 ;;
 esac
 STUB
 printf '#!/bin/bash\nexit 0\n' > "$TM/gh"
 chmod +x "$TM/tmux" "$TM/gh"
 sup_start() {  # $1 = the SCOPE value to start with (__UNSET__ omits it)
-  rm -f "$TMP/tm/up" "$TMP/tm/cmd"
+  rm -f "$TMP/tm/up" "$TMP/tm/cmd" "$TMP/tm/names"
   if [ "$1" = "__UNSET__" ]; then
     env -u SCOPE PATH="$TM:$PATH" TM_STATE="$TMP/tm" HOME="$TMP/tm/home" CELL_HOME="$TMP/tm/home" \
       REPO="$TMP/tm/repo" O="$TMP/tm/o" HARNESS="$HFIX_H" HARNESS_REPO="$HFIX" HARNESS_REF=origin/main HARNESS_FETCH=0 \
@@ -1706,9 +1721,26 @@ for want in own broad __UNSET__; do
   grep -qF "SCOPE='$wantval'" "$TMP/tm/cmd" 2>/dev/null && rc=0 || { rc=1; echo "      forwarded: $(cat "$TMP/tm/cmd" 2>/dev/null)"; }
   ck "the cell supervisor inlines SCOPE=$wantval for '$want' into the session command" $rc
 done
+# ⛔ THE DOCTOR SESSION RESTARTS THE CONTROLLER, so its command string must carry the operator's
+# configuration too (#1989 review round 2): a loop that re-derived SCOPE from the default would bring
+# a pin-OWN cell back as AUTO (= BROAD above 10 open PRs, draining the shared queue), and a custom
+# ENV_FILE lost would silently drop the merge key. Asserted on the SECOND recorded new-session line.
+sup_start own
+docline="$(grep 'cloud-cell-doctor\.sh' "$TMP/tm/cmd" 2>/dev/null | tail -1)"
+case "$docline" in
+  *"SCOPE='own'"*) rc=0 ;;
+  *) rc=1; echo "      doctor session: ${docline:-<no doctor session recorded>}" ;;
+esac
+ck "the doctor loop's session command carries SCOPE (a restart must not re-derive it)" $rc
+case "$docline" in
+  *"ENV_FILE='"*) rc=0 ;;
+  *) rc=1; echo "      doctor session: ${docline:-<none>}" ;;
+esac
+ck "the doctor loop's session command carries ENV_FILE" $rc
+
 # UNSET must reach the controller as the auto default being absent-or-auto — but a typo/blank must
 # die BEFORE a session is created (nothing started, no tmux command recorded).
-rm -f "$TMP/tm/up" "$TMP/tm/cmd"
+rm -f "$TMP/tm/up" "$TMP/tm/cmd" "$TMP/tm/names"
 ( SCOPE= PATH="$TM:$PATH" TM_STATE="$TMP/tm" HOME="$TMP/tm/home" CELL_HOME="$TMP/tm/home" \
     REPO="$TMP/tm/repo" O="$TMP/tm/o" HARNESS="$HFIX_H" HARNESS_REPO="$HFIX" HARNESS_REF=origin/main HARNESS_FETCH=0 \
     bash "$HERE/../cloud-cell-supervisor.sh" start >/dev/null 2>&1 ); rc=$?
@@ -1721,7 +1753,7 @@ ck "a set-but-empty SCOPE is refused BEFORE any session is started" $rc
 # The payload is a quote with NO literal space (${IFS} stands in for it): a guard that kept only the
 # space alternative would accept this, so the check pins the quote member — the one that actually
 # enables the break-out — not merely the class as a whole.
-rm -f "$TMP/tm/up" "$TMP/tm/cmd" "$TMP/tm/INJECTED"
+rm -f "$TMP/tm/up" "$TMP/tm/cmd" "$TMP/tm/names" "$TMP/tm/names" "$TMP/tm/INJECTED"
 ( PATH="$TM:$PATH" TM_STATE="$TMP/tm" HOME="$TMP/tm/home" CELL_HOME="$TMP/tm/home" \
     REPO="$TMP/tm/repo" O="$TMP/tm/it';touch\${IFS}$TMP/tm/INJECTED;#" HARNESS="$HFIX_H" HARNESS_REPO="$HFIX" HARNESS_REF=origin/main HARNESS_FETCH=0 SCOPE=own \
     bash "$HERE/../cloud-cell-supervisor.sh" start >/dev/null 2>"$TMP/sup.meta.err" ); rc=$?
@@ -1731,7 +1763,7 @@ ck "a metacharacter in \$O is refused before any session is created" $rc
 
 # The session string carries OR too, and the guard must cover it — this is the value whose omission
 # was a live injection (a quote in OR broke out of the sh -c string and executed a command).
-rm -f "$TMP/tm/up" "$TMP/tm/cmd"
+rm -f "$TMP/tm/up" "$TMP/tm/cmd" "$TMP/tm/names"
 ( PATH="$TM:$PATH" TM_STATE="$TMP/tm" HOME="$TMP/tm/home" CELL_HOME="$TMP/tm/home" \
     REPO="$TMP/tm/repo" O="$TMP/tm/o" HARNESS="$HFIX_H" HARNESS_REPO="$HFIX" HARNESS_REF=origin/main HARNESS_FETCH=0 SCOPE=own OR="acme/x';touch\${IFS}$TMP/tm/ORPWN;#" \
     bash "$HERE/../cloud-cell-supervisor.sh" start >/dev/null 2>"$TMP/sup.or.err" ); rc=$?
@@ -1740,14 +1772,14 @@ rm -f "$TMP/tm/up" "$TMP/tm/cmd"
 ck "a metacharacter in \$OR is refused before any session is created" $rc
 # The QUOTE is the break-out enabler, so drive it ALONE — no $, ; or # for another alternative to
 # match: a guard that lost only the quote alternatives must still go red here.
-rm -f "$TMP/tm/up" "$TMP/tm/cmd"
+rm -f "$TMP/tm/up" "$TMP/tm/cmd" "$TMP/tm/names"
 ( PATH="$TM:$PATH" TM_STATE="$TMP/tm" HOME="$TMP/tm/home" CELL_HOME="$TMP/tm/home" \
     REPO="$TMP/tm/repo" O="$TMP/tm/it'q" HARNESS="$HFIX_H" HARNESS_REPO="$HFIX" HARNESS_REF=origin/main HARNESS_FETCH=0 SCOPE=own \
     bash "$HERE/../cloud-cell-supervisor.sh" start >/dev/null 2>&1 ); rc=$?
 [ "$rc" -ne 0 ] && [ ! -f "$TMP/tm/cmd" ] && rc=0 \
   || { rc=1; echo "      rc=$rc; session recorded: $([ -f "$TMP/tm/cmd" ] && echo yes || echo no)"; }
 ck "a QUOTE-ONLY \$O is refused (the quote is the break-out enabler)" $rc
-rm -f "$TMP/tm/up" "$TMP/tm/cmd"
+rm -f "$TMP/tm/up" "$TMP/tm/cmd" "$TMP/tm/names"
 ( PATH="$TM:$PATH" TM_STATE="$TMP/tm" HOME="$TMP/tm/home" CELL_HOME="$TMP/tm/home" \
     REPO="$TMP/tm/repo" O="$TMP/tm/o" HARNESS="$HFIX_H" HARNESS_REPO="$HFIX" HARNESS_REF=origin/main HARNESS_FETCH=0 SCOPE=own OR="acme/x'q" \
     bash "$HERE/../cloud-cell-supervisor.sh" start >/dev/null 2>&1 ); rc=$?
@@ -1828,7 +1860,7 @@ case "$out" in *'merge authority key present'*) rc=1; echo "      out: $(printf 
 ck "an EMPTY key in keys.env is NOT reported present" $rc
 # The start path is the ONLY path that starts a cell, so it must not swallow the verdict: an
 # operator who exported the key ambiently gets a keyless cell and no signal otherwise.
-rm -f "$TMP/tm/up" "$TMP/tm/cmd"
+rm -f "$TMP/tm/up" "$TMP/tm/cmd" "$TMP/tm/names"
 serr="$( AI_REVIEW_GATE_KEY=AMBIENT PATH="$TM:$PATH" TM_STATE="$TMP/tm" HOME="$KC/home" CELL_HOME="$KC/home" \
     REPO="$KC/repo" O="$KC/o" HARNESS="$HFIX_H" HARNESS_REPO="$HFIX" HARNESS_REF=origin/main HARNESS_FETCH=0 ENV_FILE="$KC/home/keys-empty.env" SCOPE=own \
     bash "$HERE/../cloud-cell-supervisor.sh" start 2>&1 >/dev/null )"
@@ -1836,7 +1868,7 @@ case "$serr" in *'will NOT receive it'*"$KC/home/.pi/agent/.ai-review-gate-key"*
 ck "the start path surfaces an ambient-only key verdict on stderr" $rc
 # ... and the OTHER branch: an empty keys.env with NO ambient key must also reach start's stderr
 # (filtering on just the two easy-to-grep verdicts left this one silent).
-rm -f "$TMP/tm/up" "$TMP/tm/cmd"
+rm -f "$TMP/tm/up" "$TMP/tm/cmd" "$TMP/tm/names"
 serr2="$( unset AI_REVIEW_GATE_KEY; PATH="$TM:$PATH" TM_STATE="$TMP/tm" HOME="$KC/home" CELL_HOME="$KC/home" \
     REPO="$KC/repo" O="$KC/o" HARNESS="$HFIX_H" HARNESS_REPO="$HFIX" HARNESS_REF=origin/main HARNESS_FETCH=0 ENV_FILE="$KC/home/keys-empty-key.env" SCOPE=own \
     bash "$HERE/../cloud-cell-supervisor.sh" start 2>&1 >/dev/null )"
@@ -1871,7 +1903,7 @@ case "$out" in *'merge authority key present'*) rc=1; echo "      out: $(printf 
 ck "a WHITESPACE-ONLY key in keys.env shadows a valid key file" $rc
 # The start path must surface that verdict too: it starts the cell either way, and it is the only
 # signal the operator gets.
-rm -f "$TMP/tm/up" "$TMP/tm/cmd"
+rm -f "$TMP/tm/up" "$TMP/tm/cmd" "$TMP/tm/names"
 serr3="$( unset AI_REVIEW_GATE_KEY; PATH="$TM:$PATH" TM_STATE="$TMP/tm" HOME="$KC/home" CELL_HOME="$KC/home" \
     REPO="$KC/repo" O="$KC/o" HARNESS="$HFIX_H" HARNESS_REPO="$HFIX" HARNESS_REF=origin/main HARNESS_FETCH=0 ENV_FILE="$KC/home/keys-ws-value.env" SCOPE=own \
     bash "$HERE/../cloud-cell-supervisor.sh" start 2>&1 >/dev/null )"
@@ -2046,7 +2078,7 @@ fi
 # patterns (cmux's `cmux-cli-shims` is a real one on this box) resolves the tool to a wrapper that
 # exits 127, and a resolution-only probe reports install success while every lane spawn then fails.
 # Drive the SHIPPED probe block with a fixture whose `pi` resolves but cannot run.
-awk '/^for bin in tmux uv pi gh jq; do$/{f=1} f{print} f&&/^done$/{exit}' "$INST" > "$TMP/probe.sh"
+awk '/^for bin in tmux uv pi gh jq cmux; do$/{f=1} f{print} f&&/^done$/{exit}' "$INST" > "$TMP/probe.sh"
 if need "$TMP/probe.sh" "the install-time probe is extracted from the shipped install.sh"; then
   PB="$TMP/probe"; mkdir -p "$PB/bin"
   for b in tmux uv gh jq; do printf '#!/bin/bash\nexit 0\n' > "$PB/bin/$b"; chmod +x "$PB/bin/$b"; done
@@ -2064,6 +2096,21 @@ if need "$TMP/probe.sh" "the install-time probe is extracted from the shipped in
   PATH="$PB/bin:/usr/bin:/bin" DAEMON_PATH="$PB/bin" bash "$PB/drive.sh" >/dev/null 2>&1; rc=$?
   [ "$rc" = "0" ] && rc=0 || { rc=1; echo "      probe rc=$rc (expected 0 when every resolved tool runs)"; }
   ck "the probe passes when every resolved tool runs" $rc
+  # ⛔ cmux IS A PROBE ENTRY BECAUSE ITS ABSENCE IS SILENT AND TOTAL. The pre-flight's holder surface
+  # reads the fleet board's live-session store through `cmux sessions list`; an unrunnable cmux leaves
+  # `liveness_measured` False, the board carrying `orphans[kind=liveness-unmeasured]`, and EVERY
+  # candidate INCOMPLETE — so the refresh aborts by design (#1736) and the backlog drains to 0. A box
+  # with NO cmux never reaches the branch (`command -v` skips it); one that HAS it must be able to RUN
+  # it, which is the shim/wrapper case this probe exists for.
+  printf '#!/bin/bash\nexit 0\n' > "$PB/bin/cmux"; chmod +x "$PB/bin/cmux"
+  PATH="$PB/bin:/usr/bin:/bin" DAEMON_PATH="$PB/bin" bash "$PB/drive.sh" >/dev/null 2>&1; rc=$?
+  [ "$rc" = "0" ] && rc=0 || { rc=1; echo "      probe rc=$rc (expected 0 — a runnable cmux must not fail the install)"; }
+  ck "the probe passes when a resolved cmux RUNS" $rc
+  printf '#!/bin/bash\nexit 127\n' > "$PB/bin/cmux"; chmod +x "$PB/bin/cmux"
+  PATH="$PB/bin:/usr/bin:/bin" DAEMON_PATH="$PB/bin" bash "$PB/drive.sh" >/dev/null 2>&1; rc=$?
+  [ "$rc" = "9" ] && rc=0 || { rc=1; echo "      probe rc=$rc (expected 9 — a resolved-but-non-running cmux would certify nothing)"; }
+  ck "the probe fails install when a resolved cmux cannot RUN (nothing could be queued)" $rc
+  rm -f "$PB/bin/cmux"
   # An EXPORTED shell function named `gh` must NOT satisfy the probe: `command -v` reports it, but a
   # function is not what launchd execs and the daemon PATH has no gh binary at all.
   PB2="$PB/bin2"; mkdir -p "$PB2"
