@@ -106,9 +106,42 @@ _DISPATCH_STEP = "pr-doctor.py"
 # a prefix of a backslash-continued command pins a prefix of it: an argument on the next line is
 # the same argument to bash and was invisible here (measured 2026-10-19). `_logical_lines` is what
 # makes the pin mean what its comment says.
-_DISPATCH_LAUNCH = re.compile(
-    r'^\(\s*nohup\s+/usr/bin/python3\s+"\$SCRIPTS/pr-doctor\.py"'
-    r'(?:\s+(?:[12]?>>?|&>>?)\s*\S+)*\s*$')
+# ⛔ STRUCTURAL, NOT A REDIRECT REGEX (cycle-2 review, P2). A pattern like `\S+` for the redirect
+# target absorbs a GLUED argument: `2>&1--dry-run` matched as `2>&1` + target, and bash rejects
+# that line at runtime (`ambiguous redirect`), so pr-doctor never starts while the pass prints
+# "launched detached" and this gate says the invocation is exactly right. So the remainder is
+# consumed token by token with a small validator instead of one permissive regex.
+_LAUNCH_PREFIX = re.compile(
+    r'^\(\s*nohup\s+/usr/bin/python3\s+"\$SCRIPTS/pr-doctor\.py"(?=\s|$)')
+# `[n]>&m` (fd duplication) must be its own token; `[n]>`/`[n]>>`/`&>`/`&>>` take a TARGET that
+# must not begin with `&` — `>&word` is an ambiguous redirect to bash, not a redirection.
+_FD_DUP = re.compile(r"^([12]?>&[0-9]+)(?=\s|$)")
+_FILE_REDIRECT = re.compile(r"^(?:[12]?>>?|&>>?)\s*(\S+)")
+
+
+def _is_pinned_launch(logical_line: str) -> bool:
+    """True when the LOGICAL line is exactly the pinned launch and nothing else.
+
+    Everything after the script path must be a well-formed redirection; any argument, env
+    assignment or glued token refuses. See `_LAUNCH_PREFIX` for why this is a validator rather
+    than a regex.
+    """
+    m = _LAUNCH_PREFIX.match(logical_line)
+    if not m:
+        return False
+    rest = logical_line[m.end():].strip()
+    while rest:
+        dup = _FD_DUP.match(rest)
+        if dup:
+            rest = rest[dup.end():].strip()
+            continue
+        redir = _FILE_REDIRECT.match(rest)
+        if not redir:
+            return False
+        if redir.group(1).startswith("&"):
+            return False
+        rest = rest[redir.end():].strip()
+    return True
 # The ARM guard, pinned in its exact polarity: the kill file ABSENT is what makes the launch
 # reachable. `-f` is the inverted polarity, refused STRUCTURALLY — on the condition that encloses
 # the launch, read from `_enclosing_constructs` — never by matching this text anywhere in the file:
@@ -238,7 +271,84 @@ def _logical_lines(path: pathlib.Path) -> list[str]:
     return out
 
 
-_HEREDOC = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][\w-]*)\1")
+# A here-doc DELIMITER is any shell word, not an identifier: bash accepts `<<'1'`, `<<\W`, `<<$X`
+# and `<<-END` alike. Matching only `[A-Za-z_][\w-]*` (an earlier revision) left `: <<'1'` and
+# `: <<\W` UNRECOGNISED — both are real heredocs, both swallow the launch, and both stayed green
+# (cycle-3 review, T4). The delimiter is therefore PARSED, not regexed.
+_DELIM_BARE_END = set(" \t;&|()<>")
+
+
+def _parse_heredoc_delimiter(line: str, i: int):
+    """Parse the delimiter starting at `i` (just past `<<[-]`). Returns `(word, next_index)`.
+
+    Handles `'…'`, `"…"`, `\\X`, and a bare word. Returns None when it is not a usable delimiter.
+    """
+    n = len(line)
+    while i < n and line[i] in " \t":
+        i += 1
+    if i >= n:
+        return None
+    if line[i] in "'\"":
+        q = line[i]
+        end = line.find(q, i + 1)
+        if end < 0:
+            return None
+        return line[i + 1:end], end + 1
+    if line[i] == "\\":
+        i += 1
+        if i >= n:
+            return None
+    j = i
+    while j < n and line[j] not in _DELIM_BARE_END:
+        j += 1
+    if j == i:
+        return None
+    return line[i:j], j
+
+
+def _heredoc_opener(line: str):
+    """`(strip_tabs, word)` when `line` opens a here-doc, else None.
+
+    ⛔ THE `<<` MUST BE AN UNQUOTED SHELL OPERATOR (measured 2026-10-19, cycle-2 adversarial
+    review — a P0 this file introduced). A naive text search for `<<WORD` treats
+    `printf '%s\n' "<<PROSE"` and `echo hi  # cat <<EOF` as openers, sets a terminator that never
+    arrives, and DELETES EVERY FOLLOWING LINE from both views. One plausible `printf` then hides
+    the whole file from every scan it feeds — the retired-name check, the second-dispatch-step
+    enumeration and the capacity check all read `_executable_lines` — so a single line re-arms
+    the retired dispatcher and every test passes (measured: 180 -> 110 executable lines, 16/16
+    green). So the operator is found by walking quotes and comments, never by regex alone.
+
+    ⛔ AND THE DELIMITER IS PARSED, NOT PATTERN-MATCHED (cycle-3 review, T4): `<<'1'` and `<<\\W`
+    are real heredocs that an identifier-shaped regex does not see, so their bodies stayed
+    scannable and the disabled launch read as live code.
+    """
+    quote = None
+    i = 0
+    while i < len(line):
+        ch = line[i]
+        if quote:
+            if ch == quote:
+                quote = None
+        elif ch in "'\"":
+            quote = ch
+        elif ch == "#":
+            # An unquoted `#` starts a comment: nothing after it is an operator.
+            return None
+        elif line.startswith("<<<", i):
+            i += 3          # a here-STRING carries no body
+            continue
+        elif line.startswith("<<", i):
+            j = i + 2
+            strip_tabs = False
+            if j < len(line) and line[j] == "-":
+                strip_tabs = True
+                j += 1
+            parsed = _parse_heredoc_delimiter(line, j)
+            if parsed is None:
+                return None
+            return strip_tabs, parsed[0]
+        i += 1
+    return None
 
 
 def _heredoc_free_lines(path: pathlib.Path) -> list[str]:
@@ -251,23 +361,27 @@ def _heredoc_free_lines(path: pathlib.Path) -> list[str]:
     launch is absent from the code view (so its ABSENCE reds) instead of being present in one
     view and absent from the other.
 
-    The `<<'WORD'` / `<<"WORD"` / `<<WORD` / `<<-` forms all terminate on a line consisting of the
-    word alone. A here-STRING (`<<<`) carries no body and is skipped.
+    ⛔ THE TERMINATOR RULE IS BASH'S, NOT `strip()`'s (cycle-2 review, P1). A plain `<<'WORD'`
+    terminates only on a line that IS the word at COLUMN 0; `<<-WORD` strips leading TABS only.
+    Matching with `strip()` ends the body EARLY on an indented copy of the word, so bash keeps
+    treating the following lines as body while this scanner treats them as code — a disabled
+    launch that the gate reads as live (measured: `: <<'PROSE'` / `  PROSE` / *launch* / `PROSE`
+    is valid bash, never dispatches, and the suite stayed green).
     """
     out: list[str] = []
-    terminator = None
+    opener = None
     for line in path.read_text().splitlines():
-        if terminator is not None:
-            if line.strip() == terminator:
-                terminator = None
+        if opener is not None:
+            strip_tabs, word = opener
+            if (line.lstrip("\t") if strip_tabs else line) == word:
+                opener = None
             continue
         out.append(line)
-        # A COMMENT is never a here-doc opener, however it is spelled.
+        # A COMMENT is never a here-doc opener, however it is spelled
+        # (`_heredoc_opener` enforces it; this cheap check keeps the common case fast).
         if line.strip().startswith("#"):
             continue
-        m = _HEREDOC.search(line)
-        if m and "<<<" not in line:
-            terminator = m.group(2)
+        opener = _heredoc_opener(line)
     return out
 
 
@@ -317,11 +431,56 @@ def _enclosing_functions(path: pathlib.Path, needle: str) -> list[str]:
 
 
 _OPEN_IF = re.compile(r"^if\s+(.+?)(?:\s*;\s*then)?$")
+# ⛔ `elif` OPENS A CONSTRUCT TOO (cycle-3 review, T3). `_OPEN_IF` matches only `^if`, so an
+# `elif [ -n "$FLAG" ]; then <the whole launch block> fi` opened NOTHING and sat at the same stack
+# depth: the guard line, the construct list, the transfer list, the function list and the launch
+# pin were ALL byte-identical, and the beat dispatched only when the flag was set — the exact
+# "added but not switched on" inversion #1890 exists to remove. `elif false` was already refused by
+# the dead-branch test; an env-flag condition contains `$`, so only the construct list can catch it.
+_OPEN_ELIF = re.compile(r"^elif\s+(.+?)(?:\s*;\s*then)?$")
 _OPEN_LOOP = re.compile(r"^(while|until)\s+(.+?)(?:\s*;\s*do)?$")
 _OPEN_FOR = re.compile(r"^for\s+(.+?)(?:\s*;\s*do)?$")
+# `select` is a `done`-terminated loop like `for`; without this it opened nothing (cycle-3 review).
+_OPEN_SELECT = re.compile(r"^select\s+(.+?)(?:\s*;\s*do)?$")
 _OPEN_CASE = re.compile(r"^case\s+(.+?)\s+in\b")
 _OPEN_FUNC = re.compile(r"^(?:function\s+)?([A-Za-z_][\w-]*)\s*(?:\(\s*\))?\s*\{")
 _CLOSER = re.compile(r"^(?:fi|done|esac)\b|^\}")
+
+
+def _opened_construct(s: str):
+    """The construct `s` opens, as `(kind, subject)`, or None.
+
+    ⛔ ONE IMPLEMENTATION FOR BOTH REACHABILITY READERS. The chain used to be copied into
+    `_enclosing_constructs` and `_early_transfers`, which is precisely how two scanners drift:
+    a construct one of them sees is a construct the other reports as pinned, so the launch can sit
+    inside it and still read as reachable. Both now call this.
+
+    A construct we did not enumerate is never silently ignored: an unrecognised line ending in `{`
+    opens an anonymous group, so it changes the list and reads RED (cycle-2 review, P0).
+    """
+    m = _OPEN_CASE.match(s)
+    if m:
+        return ("case", m.group(1))
+    m = _OPEN_FUNC.match(s)
+    if m and "}" not in s[m.end():]:
+        return ("func", m.group(1))
+    m = _OPEN_LOOP.match(s)
+    if m:
+        return ("loop", "%s %s" % (m.group(1), m.group(2)))
+    m = _OPEN_FOR.match(s)
+    if m:
+        return ("for", m.group(1))
+    m = _OPEN_SELECT.match(s)
+    if m:
+        return ("select", m.group(1))
+    for kind, pattern in (("if", _OPEN_IF), ("elif", _OPEN_ELIF)):
+        m = pattern.match(s)
+        if m:
+            # A ONE-LINER (`if …; then …; fi`) opens and closes on its own line.
+            return None if re.search(r";\s*fi$", s) else (kind, m.group(1))
+    if s.endswith("{"):
+        return ("group", s)
+    return None
 
 
 def _enclosing_constructs(path: pathlib.Path, needle: str):
@@ -345,27 +504,7 @@ def _enclosing_constructs(path: pathlib.Path, needle: str):
             if stack:
                 stack.pop()
             continue
-        opened = None
-        m = _OPEN_CASE.match(s)
-        if m:
-            opened = ("case", m.group(1))
-        else:
-            m = _OPEN_FUNC.match(s)
-            if m and "}" not in s[m.end():]:
-                opened = ("func", m.group(1))
-            else:
-                m = _OPEN_LOOP.match(s)
-                if m:
-                    opened = ("loop", "%s %s" % (m.group(1), m.group(2)))
-                else:
-                    m = _OPEN_FOR.match(s)
-                    if m:
-                        opened = ("for", m.group(1))
-                    else:
-                        m = _OPEN_IF.match(s)
-                        # A ONE-LINER (`if …; then …; fi`) opens and closes on its own line.
-                        if m and not re.search(r";\s*fi$", s):
-                            opened = ("if", m.group(1))
+        opened = _opened_construct(s)
         if found:
             return list(stack)
         if opened:
@@ -374,71 +513,99 @@ def _enclosing_constructs(path: pathlib.Path, needle: str):
 
 
 _TRANSFER_WORD = re.compile(r"(?:exit|continue|break|return)\b")
-# A statement boundary: start of line, then any of `;`, `&&`, `||`, `|`, `&`, or an opening
-# brace/paren. `then`/`do`/`else` are separators too — `if …; then continue; fi` puts the transfer
-# after `then`, and `while :; do break; done` after `do`.
-_STMT_BOUNDARY = re.compile(r"(?:^|[;&|(){}\s]|\bthen\b|\bdo\b|\belse\b)\s*")
+# A statement separator, split on OUTSIDE quotes: `;`, `&&`, `||`, `|`, `&`, brace/paren, and the
+# shell keywords that put a command in command position (`then`, `do`, `else`, `elif`).
+# ⛔ SPLIT INTO STATEMENTS, THEN TEST EACH ONE'S PREFIX. The previous revision instead scanned for
+# the word ANYWHERE and tried to decide "is this really command position?" from the preceding
+# characters — and its separator test was `stripped[-1] not in ";&|(){}then do else"`, a CHARACTER
+# test against a concatenated CHARSET, so any preceding word ending in t/h/e/n/d/o/l/s counted as a
+# separator (cycle-2 review, measured): `not continue` read as a transfer, and a log line reading
+# `… did not return` reded the gate on a correct beat. It also carried
+# `_STMT_BOUNDARY.search(head)`, whose `^` alternative is truthy at position 0, making half the
+# condition dead. Splitting first has neither failure mode: a statement's PREFIX is the command.
+_STMT_SPLIT = re.compile(r";|&&|\|\||\||&|\{|\}|\(|\)|\bthen\b|\bdo\b|\belse\b|\belif\b")
 
 
-def _leading_statement(s: str) -> str | None:
-    """The first command-position statement on `s` that is a control transfer, if any.
-
-    A transfer is only a transfer in COMMAND POSITION. `echo "continue"`, a flag named
-    `--continue`, and a message containing the word are not transfers, so matching the word
-    anywhere would red a legitimate beat — which is why the earlier revision matched only at the
-    start of the line. But that missed the ONE-LINE forms, which are exactly the shape that
-    silently ends the pass (`if [ -f "$STATE/x" ]; then continue; fi`, `[ … ] && exit 0`,
-    `{ … && continue; }`) — measured 2026-10-19: all four left the pinned transfer list, the
-    enclosing-construct list and the function list BYTE-IDENTICAL and 13/13 green.
-    So: walk the line's statements and test each one's COMMAND POSITION.
-    """
-    pos = 0
-    while pos <= len(s):
-        m = _TRANSFER_WORD.match(s, pos)
-        if m:
-            # Command position? Either the line start, or immediately after a boundary.
-            head = s[:pos]
-            if not head.strip() or _STMT_BOUNDARY.search(head) and not _word_prefixed(head):
-                end = _stmt_end(s, pos)
-                return s[pos:end].strip()
-        # Advance to the next boundary.
-        nxt = _STMT_BOUNDARY.match(s, pos)
-        pos = nxt.end() if nxt and nxt.end() > pos else pos + 1
-    return None
-
-
-def _word_prefixed(head: str) -> bool:
-    """True when the text just before a would-be transfer is a WORD, not a separator.
-
-    `not continue` / `x-continue` must not read as a transfer; `foo; continue` must."""
-    stripped = head.rstrip()
-    if not stripped:
-        return False
-    return stripped[-1] not in ";&|(){}then do else".replace(" ", "") and not stripped.endswith(
-        ("then", "do", "else"))
-
-
-def _stmt_end(s: str, pos: int) -> int:
-    """Index where the statement starting at `pos` ends — the next unquoted `;`, `&`, `|` or `}`."""
-    depth = 0
+def _statements(s: str) -> list[str]:
+    """`s` split at statement separators, with quotes and `$()` left intact."""
+    parts: list[str] = []
+    buf: list[str] = []
     quote = None
-    i = pos
+    depth = 0
+    i = 0
     while i < len(s):
         ch = s[i]
         if quote:
+            buf.append(ch)
             if ch == quote:
                 quote = None
-        elif ch in "'\"":
+            i += 1
+            continue
+        if ch in "'\"":
             quote = ch
-        elif ch == "(":
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == "$" and i + 1 < len(s) and s[i + 1] == "(":
+            # `$( … )` is one word, not a subshell statement list.
             depth += 1
-        elif ch == ")" and depth:
+            buf.append("$(")
+            i += 2
+            continue
+        if ch == ")" and depth:
             depth -= 1
-        elif ch in ";&|}" and depth == 0:
-            # `&&`/`||` continue the same command list, but the transfer ends at the operator.
-            return i
+            buf.append(ch)
+            i += 1
+            continue
+        m = None if depth else _STMT_SPLIT.match(s, i)
+        if m:
+            parts.append("".join(buf))
+            buf = []
+            i = m.end()
+            continue
+        buf.append(ch)
         i += 1
-    return len(s)
+    parts.append("".join(buf))
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _leading_statement(s: str) -> str | None:
+    """The first statement on `s` whose COMMAND is a control transfer, if any.
+
+    A transfer is a transfer only in command position. `echo "continue"`, a flag named
+    `--continue`, and a message containing the word are not transfers, so matching the word
+    anywhere would red a legitimate beat — but matching only at the START of the line missed the
+    ONE-LINE forms, which are exactly the shape that silently ends the pass
+    (`if [ -f "$STATE/x" ]; then continue; fi`, `[ … ] && exit 0`, `{ … && continue; }`) — measured
+    2026-10-19: all four left the pinned transfer list, the enclosing-construct list and the
+    function list BYTE-IDENTICAL and the suite green.
+
+    ⛔ AND A PREFIX DOES NOT STOP IT (cycle-3 review, T2). `! continue`, `\\continue`,
+    `command continue`, `builtin continue`, `eval continue`, `time continue` and
+    `PD_X=1 continue` are all real transfers — bash runs them — and an anchored match saw none of
+    them (verified behaviourally: the loop never reached the launch, transfers list byte-identical,
+    23/23 green). A prefix IS command position, so the transparent prefixes are stripped first.
+    """
+    for stmt in _statements(s):
+        if _TRANSFER_WORD.match(_strip_command_prefixes(stmt)):
+            return stmt
+    return None
+
+
+# Prefixes that do not change WHICH command runs: negation, escaping, env assignments, and the
+# shell's own transparent wrapper builtins. `eval`/`exec` are included because they still execute
+# the named command, so a transfer behind them is a transfer.
+_CMD_PREFIX = re.compile(
+    r"^(?:[!\\\\]\s*|[A-Za-z_]\w*=\S*\s*|(?:command|builtin|eval|exec|time|nohup)\s+)")
+
+
+def _strip_command_prefixes(stmt: str) -> str:
+    """Strip transparent command prefixes, repeatedly (`ENV=1 time ! continue`)."""
+    prev = None
+    while prev != stmt:
+        prev = stmt
+        stmt = _CMD_PREFIX.sub("", stmt, count=1).lstrip()
+    return stmt
 
 
 def _early_transfers(path: pathlib.Path, needle: str):
@@ -472,26 +639,7 @@ def _early_transfers(path: pathlib.Path, needle: str):
             if stack:
                 stack.pop()
             continue
-        opened = None
-        m = _OPEN_CASE.match(s)
-        if m:
-            opened = ("case", m.group(1))
-        else:
-            m = _OPEN_FUNC.match(s)
-            if m and "}" not in s[m.end():]:
-                opened = ("func", m.group(1))
-            else:
-                m = _OPEN_LOOP.match(s)
-                if m:
-                    opened = ("loop", "%s %s" % (m.group(1), m.group(2)))
-                else:
-                    m = _OPEN_FOR.match(s)
-                    if m:
-                        opened = ("for", m.group(1))
-                    else:
-                        m = _OPEN_IF.match(s)
-                        if m and not re.search(r";\s*fi$", s):
-                            opened = ("if", m.group(1))
+        opened = _opened_construct(s)
         if opened:
             stack.append(opened)
     return None
@@ -742,7 +890,7 @@ def test_the_beat_still_runs_the_surviving_dispatcher():
         "heartbeat-loop.sh no longer invokes %s. The lane-table dispatcher is retired, so if this "
         "is gone the beat has NO dispatch entry point at all — a silent green, not a removal."
         % _DISPATCH_STEP)
-    assert any(_DISPATCH_LAUNCH.match(l) for l in launches), (
+    assert any(_is_pinned_launch(l) for l in launches), (
         "the beat's dispatch launch is not the pinned detached invocation. Got: %r\n"
         "Expected exactly: ( nohup /usr/bin/python3 \"$SCRIPTS/pr-doctor.py\" ] redirects\n"
         "Arguments are a way to make the pass a no-op (`--dry-run`, `--status`, `--max 0`), and so "
@@ -1042,7 +1190,7 @@ def test_a_defeated_gate_the_continuation_line_argument_is_refused(tmp_path):
     assert mutated is not None, "anchor missing: the launch no longer backslash-continues"
     launches = [l for l in _logical_lines(mutated) if _DISPATCH_STEP in l]
     assert launches, "the mutation removed the launch; the fixture is wrong, not the gate"
-    assert not any(_DISPATCH_LAUNCH.match(l) for l in launches), (
+    assert not any(_is_pinned_launch(l) for l in launches), (
         "an argument on the launch's CONTINUATION line was graded as the pinned launch. bash joins "
         "the continuation, so that argument is the command's argument — `--dry-run` there is the "
         "beat's only dispatch entry point deciding nothing, on every pass, while this gate says "
@@ -1058,9 +1206,80 @@ _ONE_LINE_TRANSFERS = [
     ('[ -n "$PR_DOCTOR_DISABLE" ] && continue', "a && guard"),
     ('[ -f "$STATE/PR-DOCTOR-BLOCK" ] && exit 0', "a && exit"),
     ('{ [ -n "$PR_DOCTOR_DISABLE" ] && continue; }', "a brace group"),
-    ('while :; do break; done', "a one-line while"),
     ('if true; then continue; fi', "a dead-branch one-line"),
 ]
+# ⛔ NOT A DEFEAT, AND DELIBERATELY ABSENT: `while :; do break; done` was in an earlier revision of
+# this matrix because the transfer scanner reports a `break` in it. It does NOT stop the pass — the
+# pass loop is a DIFFERENT `while :; do`, so this one runs once and falls through to the guard
+# (cycle-2 review, verified). Pinning it would assert a FALSE POSITIVE, which is the opposite of
+# what this matrix is for: a matrix that demands the gate red a correct beat teaches the next lane
+# to loosen the gate.
+
+
+def test_the_transfer_scanner_does_not_red_a_correct_beat():
+    """The other half of the property: no false positives on ordinary shell text.
+
+    A reachability gate that reds correct code gets loosened by whoever hits it next — so "it
+    detects the defeat" is only half a gate. `_word_prefixed` in an earlier revision tested a
+    single CHARACTER against a concatenated CHARSET (`";&|(){}then do else"`), so any word ending in
+    t/h/e/n/d/o/l/s counted as a separator and these read as transfers (cycle-2 review, measured).
+    """
+    not_transfers = [
+        'not continue',
+        'echo "continue"',
+        '--continue',
+        'x-continue',
+        "printf '%s step did not return\\n' x",
+        'echo "no exit"',
+        'log "$rc"',
+        'continue_flag=1',
+    ]
+    wrong = [(s, _leading_statement(s)) for s in not_transfers if _leading_statement(s)]
+    assert not wrong, (
+        "these are not control transfers but were read as one, so a correct beat would be "
+        "blocked: %r" % wrong)
+    # And the shapes that ARE transfers, so the negative above is not passing by refusing all input.
+    for s in ('continue', 'exit 0', 'foo; continue', '[ -n "$X" ] && exit 3',
+              'if [ -f "$X" ]; then return 1; fi'):
+        assert _leading_statement(s) is not None, (
+            "%r is a control transfer in command position but was not detected" % s)
+
+
+def test_the_heredoc_stripper_does_not_swallow_the_file():
+    """A `<<` that is not a shell operator must not delete the rest of the file.
+
+    ⛔ A P0 THIS FILE INTRODUCED (cycle-2 review). The first stripper regexed for `<<WORD`
+    anywhere, so a quoted `printf '%s\n' "<<PROSE"` — or a comment mentioning `<<EOF` — opened a
+    body whose terminator never arrived and DELETED EVERY FOLLOWING LINE from both views. One such
+    line hid the retired dispatcher, a second dispatch step and `MAX_FIX=0` from every scan that
+    reads `_executable_lines`, and the suite stayed green (measured: 180 -> 110 lines).
+    """
+    body = "\n".join([
+        "#!/bin/bash",
+        'printf \'%s\\n\' "<<PROSE"',
+        "echo hi  # usage: cat <<EOF",
+        'echo "a <<B b"',
+        "orchestrator-launch-marker",  # the line that must survive every one of the above
+    ]) + "\n"
+    p = pathlib.Path("/tmp/_heredoc_guard.sh")
+    p.write_text(body)
+    lines = _executable_lines(p)
+    assert "orchestrator-launch-marker" in lines, (
+        "a `<<` inside a QUOTED string or a comment swallowed the rest of the file, so every scan "
+        "that reads this view is silently looking at nothing. Got: %r" % lines)
+    # The positive control: a REAL opener still strips its body.
+    real = "\n".join([
+        "#!/bin/bash",
+        ": <<'PROSE'",
+        "this-is-body",
+        "PROSE",
+        "orchestrator-launch-marker",
+    ]) + "\n"
+    p.write_text(real)
+    lines = _executable_lines(p)
+    assert "this-is-body" not in lines, "a real heredoc body is still scanned as code"
+    assert "orchestrator-launch-marker" in lines, (
+        "the terminator did not end the body, so real code after a heredoc is dropped")
 
 
 def _insert_before_guard(stmt):
@@ -1122,9 +1341,207 @@ def test_the_defeat_matrix_does_not_red_the_real_beat(tmp_path):
     baseline = tmp_path / "heartbeat-loop.sh"
     baseline.write_text(_BEAT.read_text())
     launches = [l for l in _logical_lines(baseline) if _DISPATCH_STEP in l]
-    assert any(_DISPATCH_LAUNCH.match(l) for l in launches), (
+    assert any(_is_pinned_launch(l) for l in launches), (
         "the pinned launch does not match the UNMUTATED beat — the pin is wrong, not the mutants")
     assert _early_transfers(baseline, _DISPATCH_STEP) == _ALLOWED_EARLY_TRANSFERS, (
         "the unmutated beat does not produce the pinned transfer list")
     assert [l for l in _executable_lines(baseline) if _DISPATCH_STEP in l], (
         "the unmutated beat's launch is not seen as executable code")
+
+
+# ⛔ THE INDENTED FAKE TERMINATOR (cycle-2 review, P1). Bash ends a plain `<<'WORD'` body only on a
+# line that IS the word at COLUMN 0. A stripper that matches with `strip()` ends the body early on
+# an indented copy, so it reads the launch as live code while bash keeps treating it as body.
+def _heredoc_indented_fake_terminator(text):
+    start = '    ( nohup /usr/bin/python3 "$SCRIPTS/pr-doctor.py" \\'
+    if start not in text:
+        return None
+    # opener, then an INDENTED copy of the word (not a terminator to bash), then the launch, then
+    # the real terminator at column 0 — so bash never executes the launch.
+    return text.replace(
+        start, "    : <<'PROSE'\n  PROSE\n" + start, 1).replace(
+        "        printf '%s PR-DOCTOR launched detached",
+        "PROSE\n        printf '%s PR-DOCTOR launched detached", 1)
+
+
+def test_a_defeated_gate_an_indented_fake_terminator_is_refused(tmp_path):
+    mutated = _beat_mutated(tmp_path, _heredoc_indented_fake_terminator)
+    assert mutated is not None, "anchor missing: the launch's first or printf line moved"
+    assert subprocess.run(["bash", "-n", str(mutated)]).returncode == 0, (
+        "the fixture is not valid bash, so it is not the shape it claims to test")
+    assert not [l for l in _executable_lines(mutated) if _DISPATCH_STEP in l], (
+        "an INDENTED copy of the heredoc word was accepted as the terminator, so this scanner saw "
+        "the launch as live code while bash treats it as heredoc body — the beat dispatches "
+        "nothing and this gate reports the launch present")
+
+
+# ⛔ THE ANONYMOUS BRACE GROUP (cycle-2 review, P0). `[ -n \"$X\" ] && {` opens a group no named
+# opener matches, so an env feature flag around the whole dispatch — the exact "added but not
+# switched on" inversion #1890 exists to remove — left every reachability list BYTE-IDENTICAL.
+def _brace_group_around_the_block(text):
+    if _GUARD not in text:
+        return None
+    marker = "  # ⛔ THE EXIT STATUS IS READ FROM A RECORD"
+    if marker not in text:
+        return None
+    return text.replace(
+        _GUARD, '  [ -n "${PR_DOCTOR_ENABLE}" ] && {\n  ' + _GUARD, 1).replace(
+        marker, "  }\n" + marker, 1)
+
+
+def test_a_defeated_gate_an_anonymous_brace_group_is_refused(tmp_path):
+    mutated = _beat_mutated(tmp_path, _brace_group_around_the_block)
+    assert mutated is not None, "anchor missing: the arm guard or the exit-status note moved"
+    assert subprocess.run(["bash", "-n", str(mutated)]).returncode == 0, (
+        "the fixture is not valid bash, so it is not the shape it claims to test")
+    assert _enclosing_constructs(mutated, _DISPATCH_STEP) != _DISPATCH_ENCLOSING, (
+        "the launch is inside a brace group opened by `[ -n \"$PR_DOCTOR_ENABLE\" ] && {` and the "
+        "enclosing-construct list is UNCHANGED, so an env feature flag around the whole dispatch "
+        "reads as green — the launch runs only when the flag is set, which is the inversion #1890 "
+        "exists to remove")
+
+
+# ⛔ THE GLUED REDIRECT (cycle-2 review, P2). `2>&1--dry-run` is not valid bash (ambiguous
+# redirect), so pr-doctor never starts while the pass prints "launched detached". A redirect regex
+# with a `\\S+` target absorbs the glued argument and calls the line pinned.
+def _glue_an_argument_to_the_redirect(text):
+    old = '>>"$STATE/pr-doctor.log" 2>>"$STERR"'
+    if old not in text:
+        return None
+    return text.replace(old, '2>&1--dry-run ' + old, 1)
+
+
+def test_a_defeated_gate_a_glued_redirect_argument_is_refused(tmp_path):
+    mutated = _beat_mutated(tmp_path, _glue_an_argument_to_the_redirect)
+    assert mutated is not None, "anchor missing: the launch's redirection changed"
+    launches = [l for l in _logical_lines(mutated) if _DISPATCH_STEP in l]
+    assert launches, "the mutation removed the launch; the fixture is wrong, not the gate"
+    assert not any(_is_pinned_launch(l) for l in launches), (
+        "`2>&1--dry-run` was accepted as a redirection, but bash rejects it as an ambiguous "
+        "redirect: the launch never starts and the gate says the invocation is exactly right")
+
+
+# ⛔ THE POPULATION FLOOR ON THE SCANNER ITSELF. Every assertion in this file reads one of the two
+# views, so a filter that silently drops most of the beat makes ALL of them vacuous at once. This
+# is the check that turns "the scan found nothing" into RED instead of clean.
+def test_the_beat_scans_are_not_silently_empty():
+    # Compare against NON-COMMENT lines: the beat is mostly prose (626 non-blank, 180 code), so a
+    # floor against all non-blank lines would red a healthy file and teach the next lane to delete
+    # the guard. The property is "nothing but real heredoc bodies may be dropped".
+    raw = [l for l in _BEAT.read_text().splitlines()
+           if l.strip() and not l.strip().startswith("#")]
+    assert len(_executable_lines(_BEAT)) >= 0.9 * len(raw), (
+        "the executable view kept only %d of %d non-comment lines of the beat — a filter is "
+        "swallowing the file, and every scan that reads this view is looking at almost nothing"
+        % (len(_executable_lines(_BEAT)), len(raw)))
+    assert len(_executable_raw(_BEAT)) >= 0.9 * len(raw), (
+        "the raw view kept only %d of %d non-comment lines"
+        % (len(_executable_raw(_BEAT)), len(raw)))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════════════════════
+# Cycle 3: the same property, spelled through a PREFIX, an `elif`, and an odd heredoc word
+# ═══════════════════════════════════════════════════════════════════════════════════════════════
+# Every shape below was reproduced against the cycle-2 revision: `bash -n` clean, the launch never
+# executed, and the gate's lists BYTE-IDENTICAL to their pinned values with the suite green.
+# Pinned now so the next widening of a matcher cannot quietly reopen one.
+
+# ⛔ T2 — A PREFIXED TRANSFER. Anchoring `_TRANSFER_WORD.match` at the START of a statement misses
+# `! continue`, `\continue`, `command continue`, `builtin continue`, `eval continue`,
+# `time continue` and `PD_X=1 continue` — all of which bash executes as a `continue`. A prefix IS
+# command position.
+_PREFIXED_TRANSFERS = [
+    "! continue",
+    "\\continue",
+    "command continue",
+    "builtin continue",
+    "eval continue",
+    "time continue",
+    "PR_DOCTOR_SKIP=1 continue",
+    "PR_DOCTOR_SKIP=1 time ! continue",
+]
+
+
+def test_a_defeated_gate_every_prefixed_early_transfer_is_refused(tmp_path):
+    survivors = []
+    for stmt in _PREFIXED_TRANSFERS:
+        mutated = _beat_mutated(tmp_path, _insert_before_guard(stmt))
+        assert mutated is not None, "anchor missing: the arm guard line moved"
+        assert subprocess.run(["bash", "-n", str(mutated)]).returncode == 0, (
+            "the fixture %r is not valid bash, so it is not the shape it claims to test" % stmt)
+        transfers = _early_transfers(mutated, _DISPATCH_STEP)
+        if transfers is None or transfers == _ALLOWED_EARLY_TRANSFERS:
+            survivors.append(stmt)
+    assert not survivors, (
+        "these are real `continue`s (bash runs them, so the pass ends before the launch) but were "
+        "not recorded as transfers, leaving the pinned list unchanged and this gate green: %r"
+        % survivors)
+
+
+# ⛔ T3 — AN UNPINNED `elif` BRANCH. `_OPEN_IF` matches only `^if`, so an `elif` opened nothing and
+# sat at the same stack depth; the guard line, construct list, transfer list, function list and
+# launch pin all stayed byte-identical while the launch ran only when the flag was set.
+def _elif_branch_around_the_block(text):
+    if _GUARD not in text:
+        return None
+    marker = "  # ⛔ THE EXIT STATUS IS READ FROM A RECORD"
+    if marker not in text:
+        return None
+    # Turn the arm guard into an `if` that does nothing, with the ORIGINAL block moved into an
+    # `elif` on an env flag — the "added but not switched on" inversion, spelled as an elif.
+    return text.replace(
+        _GUARD,
+        _GUARD + "\n    :\n  elif [ -n \"${PR_DOCTOR_ENABLE}\" ]; then", 1)
+
+
+def test_a_defeated_gate_an_elif_branch_around_the_block_is_refused(tmp_path):
+    mutated = _beat_mutated(tmp_path, _elif_branch_around_the_block)
+    assert mutated is not None, "anchor missing: the arm guard moved"
+    # This mutant is intended as valid bash; if the insertion does not balance its `fi`, the
+    # fixture is wrong and the test must say so rather than pass on a rejected input.
+    assert subprocess.run(["bash", "-n", str(mutated)]).returncode == 0, (
+        "the elif fixture is not valid bash — fix the fixture, not the gate")
+    assert _enclosing_constructs(mutated, _DISPATCH_STEP) != _DISPATCH_ENCLOSING, (
+        "the launch sits inside an `elif` branch and the enclosing-construct list is UNCHANGED: "
+        "the beat dispatches only when the flag is set, which is the inversion #1890 removes")
+
+
+def test_elif_and_select_open_a_construct():
+    """The opener table itself, so a new opener cannot be added for one reader and not the other."""
+    assert _opened_construct('elif [ -n "$FLAG" ]; then') == ("elif", '[ -n "$FLAG" ]')
+    assert _opened_construct('select x in 1; do') is not None
+    assert _opened_construct('if false; then') == ("if", "false")
+    # A one-liner opens AND closes on its own line, so it opens nothing.
+    assert _opened_construct('if [ -f "$X" ]; then continue; fi') is None
+    # Any unpinned `{` opener is a group, whatever precedes it.
+    assert _opened_construct('[ -n "$X" ] && {') == ("group", '[ -n "$X" ] && {')
+
+
+# ⛔ T4 — A HEREDOC DELIMITER THE REGEX COULD NOT SEE. `<<'1'` (a digit-leading word) and `<<\W`
+# (a backslash-escaped word) are both real heredocs — `bash -n` clean and the launch never runs —
+# but an identifier-shaped pattern matched neither, so the body stayed scannable and the disabled
+# launch read as live code.
+def _heredoc_with_odd_delimiter(text, delimiter):
+    start = '    ( nohup /usr/bin/python3 "$SCRIPTS/pr-doctor.py" \\'
+    end = '          rmdir "$STATE/pr-doctor.lock" 2>/dev/null ) &'
+    if start not in text or end not in text:
+        return None
+    return text.replace(
+        start, "    : <<%s\n" % delimiter + start, 1).replace(
+        end, end + "\n" + delimiter.strip("'\"\\"), 1)
+
+
+def test_a_defeated_gate_odd_heredoc_delimiters_are_refused(tmp_path):
+    survivors = []
+    for delimiter in ("'1'", "\\W", "'a-b.c'", "END_2"):
+        mutated = _beat_mutated(tmp_path, lambda t, d=delimiter: _heredoc_with_odd_delimiter(t, d))
+        assert mutated is not None, "anchor missing: the launch's first or last line moved"
+        assert subprocess.run(["bash", "-n", str(mutated)]).returncode == 0, (
+            "the fixture with delimiter %r is not valid bash, so it is not the shape it claims "
+            "to test" % delimiter)
+        if [l for l in _executable_lines(mutated) if _DISPATCH_STEP in l]:
+            survivors.append(delimiter)
+    assert not survivors, (
+        "a heredoc opened with these delimiters was NOT stripped, so this scanner treated the "
+        "launch as live code while bash treated it as heredoc body (the beat dispatches nothing): "
+        "%r" % survivors)
