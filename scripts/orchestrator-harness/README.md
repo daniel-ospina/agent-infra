@@ -565,9 +565,19 @@ passing, which is the intended fail-closed behaviour and not an install failure.
 
 ### 4.1 Redeploying an existing box — `deploy-harness.sh`, and what a success is allowed to mean
 
-**The only supported redeploy path is `deploy-harness.sh`.** Step 1's `cp scripts/orchestrator-harness/*.sh`
-is the *first* install and it has the same two gaps a redeploy used to have: it copies only depth-1
-`*.sh` (never `gh-rest/gh`, `gh-limit/gh` or `retired/`) and it checks nothing.
+**The supported *manual* redeploy path is `deploy-harness.sh`** — the one an operator runs by hand,
+and the one this section specifies. It is not the only code that writes `$O`, and saying so would be
+the same overclaim this file exists to remove. The others, named with the gap each still carries:
+
+| Path | What it still does |
+|---|---|
+| `install.sh` (step 3 above) | `cp scripts/orchestrator-harness/*.sh` — depth-1 `*.sh` only (never `gh-rest/gh`, `gh-limit/gh`, `retired/`), no per-file verdict. It is the FIRST install; use it, then `deploy-harness.sh` for every redeploy |
+| `deploy-mac-orchestrator.sh` phase A (`:107-112`) | `cp -R` for subdirectories and `install_file` for files with **both rcs unchecked**, then reports `copied $(ls "$H" | grep -vc …)` — a count of the *source listing* — and cmp-verifies **only `claims.sh`** |
+| `deploy-crossbox.sh` step 3 (`:59-105`) | depth-1 `cp -p "$H"/*.sh "$O"/`, then `seeded $O with $(ls "$O"/*.sh \| wc -l)` — success evidence read from the **target**, the exact formula #2041 names |
+| `cloud-cell-supervisor.sh seed_and_stamp` (Linux cells, `:983`) | the wired path on a cell; agent-infra#2039 tracks that it does not seed `$O/gh-rest` |
+
+Routing those through this helper is the remaining #2041 work; until then the table above is the
+honest statement of coverage.
 
 ```bash
 bash scripts/orchestrator-harness/deploy-harness.sh \
@@ -585,13 +595,36 @@ consequence: `gh-limit.py` and the `gh-limit/` shim were missing from a deployme
 current, so every harness `gh` call was unserialised and unbounded).
 
 Exit `1` = the copy or the verification failed; `78` = refused **before touching the target**
-(source absent, source is not a harness, source ships no files, target is not a directory). Every
-non-zero path emits a **failure** notification and none emits a success one; a refusal writes
-nothing at all, not even the ledger.
+(source absent, source is not a harness — all five identity anchors: `orch-loop.sh`, `claims.sh`,
+`gh-limit.py`, `gh-rest/gh`, `gh-limit/gh` — the source's inventory could not be read in full, the
+source ships a symlink, source and target overlap, the source ships no files, target is not a
+directory). **A refusal writes nothing at all, not even the ledger.**
 
-`$O/.deploy-ledger.tsv` is the per-file evidence (`copied` / `verified` / `COPY-FAIL` / `DRIFT` per
-path, plus the verdict line). It is written only once a copy has been attempted, so it is never
-present in a runtime that was refused, and `check-deployed-drift.sh` ignores it (it hashes `*.sh`).
+Notifications: every path that reaches the preflight emits a failure notification naming its cause,
+and no path emits a success one. The argument-parsing refusals (`--src` with no path, an unknown
+flag) happen *before* the notifier is resolved and exit `78` on stderr only — they never claim
+anything about a deploy.
+
+`$O/.deploy-ledger.tsv` is the per-file evidence (`copied` / `verified` / `COPY-FAIL` / `DRIFT` /
+`STALE-STAMP` per path, plus the verdict line). It is written only once a copy has been attempted, so
+it is never present in a runtime that was refused, and `check-deployed-drift.sh` ignores it (it hashes
+`*.sh`). If the ledger cannot be installed the bytes are still verified, but the verdict says the
+evidence file is missing rather than pointing at one that does not exist.
+
+**This proves the COPY. It does not prove the RELATION, or that nothing extra is running.** After a
+redeploy, `check-deployed-drift.sh` is the complement — it hashes every `*.sh` the repo ships at the
+ref, requires every one to be present in `$O` with the same git blob, and requires `$O` to carry no
+`*.sh` the repo does not ship, so a script retired two releases ago does not keep running behind a
+verified deploy. Run both.
+
+**And re-run `install.sh` afterwards if you want the box to stay attributable.** `install.sh` folds
+`$O/*.sh` into `$O/.agent-infra-stamp.json` (`payloadSha256`), and `check-deployed-drift.sh` reports
+a mismatch as *"a post-install hand edit"*. A redeploy changes those bytes and does not re-stamp —
+this helper will not write the provenance record (install.sh owns it) — so the verdict says
+`identity record STALE — run install.sh to re-stamp` and records `STALE-STAMP` in the ledger. Without
+that step every legitimate redeploy turns the drift gate's top-severity alarm into its normal state,
+and a real hand edit stops standing out. `orchestrator-bringup.sh` already does this
+(`deploy_harness`, then `install.sh`).
 
 The helper does **not** restart the controller — restart ownership stays with the caller, because a
 deploy helper that restarts cannot avoid claiming a restart. `bg/finish.sh` (unversioned; see #2026)
@@ -602,17 +635,28 @@ must call it and gate on its exit code, replacing its old lines 31–36 with:
         log "DEPLOY FAILED — main was NOT re-adopted; controller left alone"
         exit 1
       fi
-      cd "$O" && nohup bash "$O/supervisor.sh" >> "$O/logs/supervisor.out" 2>&1 & disown
-      sleep 10
+      # ⛔ The restart is a SEPARATE, PROVEN step — never `nohup … &` + `disown` and then a
+      # notification. There is no `$O/supervisor.sh`; the shipped restart path is install.sh
+      # (launchd: renders, bootout, bootstrap, then verifies pid AND a fresh heartbeat) and
+      # orchestrator-bringup.sh restart for the whole stack. Both exit non-zero when the start
+      # cannot be proven, which is what the gate below reads.
+      if ! bash "$R"/scripts/orchestrator-harness/install.sh --restart; then
+        log "DEPLOYED AND VERIFIED, but the controller was NOT restarted (install.sh --restart failed)"
+        bash "$B/notify.sh" "orchestrator: deploy verified, restart FAILED" \
+          "Re-adopted main; the deploy is VERIFIED (see $O/.deploy-ledger.tsv) but the restart was not proven. The controller is NOT running the new bytes." high
+        exit 1
+      fi
       bash "$B/notify.sh" "orchestrator: controller restarted" \
-        "Re-adopted main; the deploy is VERIFIED (see $O/.deploy-ledger.tsv). Controller restarted on those bytes." high
-      log "RE-ADOPTED main; deploy verified; controller restarted"
+        "Re-adopted main; the deploy is VERIFIED (see $O/.deploy-ledger.tsv). install.sh --restart proved the controller is up on those bytes." high
+      log "RE-ADOPTED main; deploy verified; controller restarted (proven by install.sh --restart)"
       exit 0
 ```
 
 That is the whole fix: success stops being a statement the deploy makes about itself and becomes a
-verdict reached from its own copy ledger — and the restart message can no longer speak for a deploy
-that did not happen.
+verdict reached from its own copy ledger — and neither message can speak for an event the run did not
+observe.
+
+### 4.2 Operating an existing box — liveness, uninstall, and the env-var notes
 
 ```bash
 # liveness / stop
@@ -1915,6 +1959,8 @@ algorithmic advantage. The claim worth evaluating is *utilisation*, not *efficie
 | `merge-one.sh` | fresh review → signed record → wait green → merge; marks `needsfix-*` |
 | `fix-one.sh` | fixes a reviewer's findings, pushes, re-runs the merge chain |
 | `refresh-candidates.sh` | pre-flights issues (collision check) into the backlog |
+| `deploy-harness.sh` | **the supported manual redeploy path** (§4.1) — copies every file the SOURCE ships (recursively), verifies each byte against its source, and emits success/failure from its own copy ledger. Exit `0` = deployed and verified, `1` = copy/verify failed, `78` = refused before touching the target. Refuses a truncated inventory, a source symlink, a source/target overlap, and a source missing any of the five identity anchors. Writes `$O/.deploy-ledger.tsv`. Not part of the loop, and it never restarts the controller |
+| `deploy-harness.test.sh` | the agent-infra#2041 contract — the measured false PASS (an absent source against a target pre-seeded with 30 scripts), partial-is-not-success, verification-not-the-copy decides, a truncated inventory, a stale-but-real harness, source symlinks, a self-deploy, the documented `--repo` + `$O/bg/notify.sh` call shape, destination symlinks, the ledger shape, the executable bit, and the stale identity record. Hermetic (scratch sources/runtimes, notifier and `cp` stubs), a CI shard |
 | `selftest.sh` | offline checks; each one drives the shipped code. Not part of the loop |
 | `install.sh` / `launchd-cycle.sh` | the installer, and the ONE implementation of stop/enable/(re)start/verify for the launchd job (§4). A plain `install.sh` never touches a loaded job; `--start`/`--restart` harness the loop and PROVE it started. The library never writes a persistent disable and never mutates a job that was not loaded from this plist |
 | `install-launchd-durability.test.sh` | the agent-infra#1975 contract — no persistent-disable verb in code or in a copyable README command, `bootstrap`→`load` fallback, the ownership guard, and "not running AND (disabled OR exit 0)" as a FAILURE. Hermetic (`launchctl` stub first on `PATH`, throwaway `$HOME`/`$O`), and a CI shard via `scripts/run-bash-shards.sh` |

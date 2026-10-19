@@ -46,6 +46,18 @@ bash -n "$DEPLOY" 2>/dev/null && ok "deploy helper parses" || bad "deploy helper
 
 REAL_CP="$(command -v cp)"
 REAL_CMP="$(command -v cmp)"
+# ⛔ THE HASHER IS RESOLVED ONCE AND IS MANDATORY. `shasum -a 256` was hardcoded with no fallback, so
+# on a host without it every hash slot in `snapshot()` came back EMPTY and the "target BYTE-IDENTICAL"
+# assertions degraded to a filename+mode comparison while still printing ✅ — a green verdict over no
+# evidence, the exact false-PASS class this suite exists to forbid. The repo's idiom is
+# sha256sum-first (`check-deployed-drift.sh:163`, `install.sh:745`, `cloud-cell-supervisor.sh:744`).
+SHA_CMD="sha256sum"
+command -v sha256sum >/dev/null 2>&1 || SHA_CMD="shasum -a 256"
+if ! printf 'x' | $SHA_CMD >/dev/null 2>&1; then
+  echo "FATAL: no usable sha256 tool (sha256sum / shasum -a 256) — refusing to report byte assertions as passed" >&2
+  exit 1
+fi
+sha256_of() { $SHA_CMD < "$1" | cut -d' ' -f1; }
 
 # ── fixtures ─────────────────────────────────────────────────────────────────────────────────────
 # A source that looks like the shipped harness: top-level scripts, two subdirectory shims (the pair
@@ -100,7 +112,7 @@ deploy() {
 # A byte-level snapshot of a directory, for "the target was left untouched" assertions. Sizes are
 # useless for that (the measured doc's own rule) — this hashes the bytes and the modes.
 snapshot() { ( cd "$1" 2>/dev/null && find . -type f -print | LC_ALL=C sort | while IFS= read -r f; do
-  printf '%s %s %s\n' "$f" "$(shasum -a 256 < "$f" | cut -d' ' -f1)" "$( [ -x "$f" ] && echo x || echo - )"; done ); }
+  printf '%s %s %s\n' "$f" "$(sha256_of "$f")" "$( [ -x "$f" ] && echo x || echo - )"; done ); }
 
 # ── 1. THE HAPPY PATH — and proof that it is a deploy, not a listing ────────────────────────────
 say_case "1. a valid source deploys, verifies, and notifies success"
@@ -110,7 +122,7 @@ mkdir -p "$O1/bg"
 # the source ships. A deploy that counted what is already there would call this a success before it
 # copied anything. The assertion is that success comes from the COPY, so the stale orch-loop.sh must
 # be replaced and the unrelated files must survive.
-BEFORE_LIVE="$(shasum -a 256 < "$O1/live-only.sh" | cut -d' ' -f1)"
+BEFORE_LIVE="$(sha256_of "$O1/live-only.sh")"
 notify_reset
 deploy "$SRC1" "$O1"
 if [ "$RC" -eq 0 ]; then ok "valid source -> exit 0"; else bad "valid source -> exit $RC (expected 0): $OUT"; fi
@@ -130,7 +142,7 @@ cmp -s "$SRC1/claims.sh" "$O1/claims.sh"     && ok "claims.sh present and identi
 [ -x "$O1/merge-one.sh" ] && ok "executable bit preserved" || bad "executable bit LOST on merge-one.sh"
 [ ! -x "$O1/port-provenance.txt" ] && ok "non-executable file stays non-executable" || bad "port-provenance.txt gained +x"
 # runtime state is not the harness and must not be touched
-[ "$(shasum -a 256 < "$O1/live-only.sh" | cut -d' ' -f1)" = "$BEFORE_LIVE" ] && ok "live-only runtime file untouched" || bad "deploy overwrote or removed a non-harness file"
+[ "$(sha256_of "$O1/live-only.sh")" = "$BEFORE_LIVE" ] && ok "live-only runtime file untouched" || bad "deploy overwrote or removed a non-harness file"
 [ -f "$O1/keep-state.txt" ] && ok "runtime state file preserved" || bad "runtime state file destroyed"
 grep -q "verified	gh-rest/gh" "$O1/.deploy-ledger.tsv" 2>/dev/null && ok "per-file ledger records the copy" || bad "no per-file ledger entry for gh-rest/gh"
 
@@ -155,6 +167,11 @@ SRC3="$T/src3"; O3="$T/o3"; mkdir -p "$SRC3"; make_target "$O3" 5
 BEFORE="$(snapshot "$O3")"
 notify_reset; deploy "$SRC3" "$O3"
 [ "$RC" -ne 0 ] && ok "empty source -> non-zero exit ($RC)" || bad "empty source exited 0"
+# ⛔ The EXIT CODE, not just "non-zero": without this the later internal-invariant fallback (exit 1)
+# satisfied the case, so the zero-file REFUSAL — and its "refused before touching the target"
+# contract — was never actually pinned. Deleting the N==0 block left the suite green.
+[ "$RC" = "78" ] && ok "exit 78 (the zero-file refusal, not a later invariant fallback)" || bad "exit $RC, expected 78 (refused before touching anything)"
+grep -qi "ships ZERO files" <<< "$OUT" && ok "the refusal names zero shipped files (indicator (b))" || bad "refused for some other reason: $OUT"
 notify_success && bad "empty source notified SUCCESS — indicator (b) violated" || ok "no success notification (0 files copied)"
 notify_failure && ok "failure notification emitted" || bad "no failure notification"
 [ "$(snapshot "$O3")" = "$BEFORE" ] && ok "target untouched" || bad "empty-source refusal modified the target"
@@ -196,28 +213,51 @@ grep -qi "VERIFIED" <<< "$(notify_last)" && bad "failure notification contains t
 # the count in the message must be THIS RUN's copy count, never a listing of the target (28 pre-
 # existing + 9 copied would look like "37 files, all good" — the old formula's exact failure)
 grep -q "$(ls "$O5"/*.sh 2>/dev/null | wc -l | tr -d ' ') of" <<< "$(notify_last)" && bad "notification quotes the target's file count as evidence" || ok "notification does not quote the target's file count"
+# ⛔ AND ZERO WRITTEN IS NOT "PARTIAL". The message above is right for a partial copy; asserting it
+# unconditionally told an operator their runtime was PARTIAL when nothing had been written at all,
+# which invites a restore/re-kill of a box that is exactly as it was. Branch on the count.
+if [ "$(id -u)" = "0" ]; then
+  echo "  (zero-written sub-case skipped — running as root, where a 0555 target is still writable)"
+else
+  SRC5b="$T/src5b"; O5b="$T/o5b"; make_src "$SRC5b"; make_target "$O5b" 2
+  chmod 555 "$O5b"                     # every copy fails, nothing can be written
+  notify_reset; deploy "$SRC5b" "$O5b"
+  chmod 755 "$O5b"
+  [ "$RC" = "1" ] && ok "nothing writable -> exit 1 (a copy failure, not a refusal)" || bad "exit $RC, expected 1"
+  grep -qi "NOTHING was written" <<< "$(notify_last)" && ok "0 copied says NOTHING was written" || bad "a zero-file copy did not say nothing was written: $(notify_last)"
+  grep -qi "PARTIAL" <<< "$(notify_last)" && bad "a zero-file copy claimed the runtime is PARTIAL (it is untouched)" || ok "does not claim PARTIAL when nothing was written"
+  grep -qi "unchanged" <<< "$(notify_last)" && ok "says the runtime is unchanged" || bad "does not say the runtime was left as it was: $(notify_last)"
+fi
 
 # ── 6. A COPY THAT SILENTLY DOES NOT MATCH — the verification gate is load-bearing ───────────────
 say_case "6. copy reports success but bytes differ -> FAILURE (verification, not the copy, decides)"
 SRC6="$T/src6"; O6="$T/o6"; make_src "$SRC6"; make_target "$O6"
-# A `cmp` that lies for exactly one file: the copy path is untouched, so ONLY the verification half
-# can catch this. If this case passes with a success verdict, the gate is decorative.
-mkdir -p "$T/cmpbin"
-cat > "$T/cmpbin/cmp" <<SH
+# ⛔ THE REAL DEFECT SHAPE: `cp` exits 0 and the bytes at the target are NOT the source's. A `cmp`
+# shim was NOT enough — it exits on the argument text, so `cmp a b` and `cmp b b` both matched and a
+# verify loop comparing the TARGET WITH ITSELF (a tautology: `cmp -s "$O/$rel" "$O/$rel"`) still
+# passed this case, i.e. the half the PR exists to add could have been entirely decorative. Corrupting
+# the copy instead makes the assertion direction-sensitive by construction.
+mkdir -p "$T/cpbin"
+cat > "$T/cpbin/cp" <<SH
 #!/usr/bin/env bash
+"$REAL_CP" "\$@" || exit \$?
+# append a byte to exactly one destination, reporting success — the silent-drift case
 for a in "\$@"; do
-  case "\$a" in *claims.sh) exit 1 ;; esac
+  case "\$a" in *.deploy.*) case "\$a" in *claims.sh*) printf 'CORRUPTED\n' >> "\$a" ;; esac ;; esac
 done
-exec "$REAL_CMP" "\$@"
+exit 0
 SH
-chmod +x "$T/cmpbin/cmp"
+chmod +x "$T/cpbin/cp"
 notify_reset
-OUT="$(PATH="$T/cmpbin:$PATH" bash "$DEPLOY" --src "$SRC6" --o "$O6" --notify "$NOTIFY" 2>&1)"; RC=$?
+OUT="$(PATH="$T/cpbin:$PATH" bash "$DEPLOY" --src "$SRC6" --o "$O6" --notify "$NOTIFY" 2>&1)"; RC=$?
 [ "$RC" -ne 0 ] && ok "unverified bytes -> non-zero exit ($RC)" || bad "unverified bytes exited 0"
 notify_failure && ok "failure notification emitted" || bad "no failure notification"
 notify_success && bad "unverified bytes notified SUCCESS" || ok "no success notification"
 grep -q "DRIFT	claims.sh" "$O6/.deploy-ledger.tsv" 2>/dev/null && ok "ledger records the drift" || bad "ledger does not record the drift"
 grep -qi "verification failed" <<< "$OUT" && ok "reports a VERIFICATION failure (distinct from a copy failure)" || bad "does not report a verification failure: $OUT"
+# and the comparison's DIRECTION is pinned structurally, so the tautology above cannot come back quietly
+DEPLOY_CODE0="$(grep -v '^[[:space:]]*#' "$DEPLOY" || true)"
+grep -q 'cmp -s "\$SRC/\$rel" "\$O/\$rel"' <<< "$DEPLOY_CODE0" && ok "verification compares SOURCE against target (not target against itself)" || bad "the compare is not source->target — a self-comparison cannot fail"
 
 # ── 7. A REAL UNREADABLE SOURCE FILE (the issue's own case (c), non-root only) ───────────────────
 say_case "7. an unreadable source file -> FAILURE, not partial success"
@@ -241,6 +281,9 @@ notify_reset; deploy "$SRC8" "$O8"
 [ "$RC" -ne 0 ] && ok "wrong target shape -> non-zero exit ($RC)" || bad "wrong target shape exited 0"
 notify_success && bad "wrong target shape notified SUCCESS" || ok "no success notification"
 [ -d "$O8/claims.sh" ] && ok "the directory was not silently replaced" || bad "deploy replaced a directory"
+# ⛔ AND it must fail in the COPY phase, not be caught later by `cmp` on a directory: the assertions
+# above were satisfied by the verify half alone, so deleting the shape guard left the suite green.
+grep -q "COPY-FAIL	claims.sh" "$O8/.deploy-ledger.tsv" 2>/dev/null && ok "the ledger names the COPY-FAIL (the guard fired, not the verify half)" || bad "no COPY-FAIL entry — the shape guard is not load-bearing"
 
 # ── 9. THE VERDICT IS NOT HOSTAGE TO THE NOTIFIER ───────────────────────────────────────────────
 say_case "9. an unrunnable notifier does not fake a failure, and does not fake a report"
@@ -277,6 +320,147 @@ n_verified_print="$(grep -c 'say "\$PROG: VERIFIED' "$DEPLOY")"
 DEPLOY_CODE="$(grep -v '^[[:space:]]*#' "$DEPLOY" || true)"
 grep -q 'ls "\$O"' <<< "$DEPLOY_CODE" && bad "the helper counts files from the target (self-confirming evidence)" || ok "the helper never counts files from the target"
 grep -q 'cp -R' <<< "$DEPLOY_CODE" && bad "the helper still uses a bare recursive cp" || ok "no bare recursive copy"
+
+# ── 12. A TRUNCATED INVENTORY — the walk's status must be READ, not discarded ─────────────────────
+say_case "12. an unsearchable source SUBDIRECTORY -> FAILURE (a partial inventory is not a deploy)"
+# ⛔ This was a second measured false PASS of the same #2041 class: the inventory was built inside a
+# PROCESS SUBSTITUTION, whose exit status bash never waits for, so `find` exiting 1 ("Permission
+# denied") yielded a TRUNCATED file list, every term of the verdict then agreed with itself, and the
+# run printed `VERIFIED — 2/2` + exit 0 while the source's own `gh-limit.py` was never deployed.
+if [ "$(id -u)" = "0" ]; then
+  echo "  (skipped — running as root, where chmod 000 is still searchable)"
+else
+  SRC12="$T/src12"; O12="$T/o12"; make_src "$SRC12"; make_target "$O12"
+  # ⛔ `retired/`, deliberately a NON-anchor subtree: chmod-ing `gh-limit` here made the anchor check
+  # (which stats the real path) refuse first, so the case passed against a helper whose inventory was
+  # still truncated — the assertion would have been satisfied by a different guard.
+  chmod 000 "$SRC12/retired"           # a DIRECTORY, not a file: case 7 is the unreadable-FILE shape
+  notify_reset; deploy "$SRC12" "$O12"
+  chmod 755 "$SRC12/retired"
+  [ "$RC" = "78" ] && ok "unsearchable subdirectory -> exit 78 (refused, nothing written)" || bad "exit $RC, expected 78 — a truncated inventory was deployed as if complete"
+  notify_success && bad "a truncated inventory notified SUCCESS — the #2041 false PASS, one mechanism over" || ok "no success notification"
+  notify_failure && ok "failure notification emitted" || bad "no failure notification"
+  [ -e "$O12/gh-limit/gh" ] && bad "a partial deploy still wrote files" || ok "nothing was written by the refusal"
+fi
+
+# ── 13. A STALE BUT REAL HARNESS — the anchors must cover the files #2041 measured missing ────────
+say_case "13. a source with the two old anchors but no gh-limit.py/gh-rest/gh/gh-limit/gh -> REFUSED"
+# `orch-loop.sh` and `claims.sh` exist in every checkout back to 2026-10-13; the three files whose
+# absence #2041 measured landed 2026-10-17/18. A two-anchor test therefore CERTIFIED a days-stale
+# checkout that shipped none of them — the identical measured consequence, reached through a source
+# that is days old instead of 1274 commits old. Nothing else in the fleet catches it:
+# check-deployed-drift.sh compares depth-1 `*.sh` only, and install.sh:770 excludes `gh-rest/gh` from
+# the payload fold by name.
+SRC13="$T/src13"; O13="$T/o13"; make_target "$O13"
+mkdir -p "$SRC13"; printf '#!/bin/bash\n' > "$SRC13/orch-loop.sh"; printf '#!/bin/bash\n' > "$SRC13/claims.sh"
+notify_reset; deploy "$SRC13" "$O13"
+[ "$RC" = "78" ] && ok "old-but-real harness -> exit 78 (refused)" || bad "exit $RC, expected 78 — a checkout missing gh-limit.py was certified"
+notify_success && bad "a harness missing gh-limit.py notified SUCCESS" || ok "no success notification"
+grep -qi "gh-limit.py" <<< "$(notify_last)" && ok "the notification names the missing anchor" || bad "notification does not name the cause: $(notify_last)"
+
+# ── 14. A SYMLINK THE SOURCE SHIPS — refused, never silently omitted ──────────────────────────────
+say_case "14. a symlink in the source -> REFUSAL (find -type f cannot see it; cp -R used to carry it)"
+SRC14="$T/src14"; O14="$T/o14"; make_src "$SRC14"; make_target "$O14"
+ln -s gh-limit.py "$SRC14/gh-shim"        # the shape a future `gh-*/gh` fallback would ship as
+notify_reset; deploy "$SRC14" "$O14"
+[ "$RC" = "78" ] && ok "source symlink -> exit 78 (refused, nothing written)" || bad "exit $RC, expected 78 — a symlink was silently left behind"
+notify_success && bad "a source with an undeployable symlink notified SUCCESS" || ok "no success notification"
+[ -e "$O14/gh-shim" ] && bad "the refusal still wrote to the target" || ok "nothing was written by the refusal"
+
+# ── 15. A SELF-DEPLOY — every file would compare with itself ─────────────────────────────────────
+say_case "15. --src == --o is refused (a self-comparison cannot fail, and the ledger would land in the source)"
+SRC15="$T/src15"; make_src "$SRC15"
+notify_reset; deploy "$SRC15" "$SRC15"
+[ "$RC" = "78" ] && ok "source == target -> exit 78 (refused)" || bad "exit $RC, expected 78 — a tautological VERIFIED was printed"
+notify_success && bad "a self-deploy notified SUCCESS" || ok "no success notification"
+[ -e "$SRC15/.deploy-ledger.tsv" ] && bad "the refusal wrote a ledger INTO the source tree" || ok "no deploy artefact left in the source"
+# a target nested inside the source is the same defect with a longer path
+notify_reset; deploy "$SRC15" "$SRC15/nested"
+[ "$RC" = "78" ] && ok "target nested inside the source -> exit 78" || bad "nested overlap exited $RC, expected 78"
+
+# ── 16. THE DOCUMENTED CALL SHAPE — `--repo`, and the notifier default ───────────────────────────
+say_case "16. --repo derivation + \$O/bg/notify.sh default + env O are the shape the caller actually uses"
+# The documented invocation is `--repo <checkout> --o <runtime>` with NO `--notify`; every other case
+# here passes `--src` and `--notify` explicitly, so neither the derivation nor the notifier default
+# — the block whose own comment says the ordering "is the whole point" — was exercised at all.
+CO16="$T/co16"; O16="$T/o16"; mkdir -p "$CO16/scripts"; mk_src16="$CO16/scripts/orchestrator-harness"
+make_src "$mk_src16"; make_target "$O16"; mkdir -p "$O16/bg"
+cp "$NOTIFY" "$O16/bg/notify.sh"
+notify_reset
+OUT="$(bash "$DEPLOY" --repo "$CO16" --o "$O16" 2>&1)"; RC=$?
+[ "$RC" -eq 0 ] && ok "--repo resolves the source and deploys (exit 0)" || bad "--repo invocation exited $RC: $OUT"
+notify_success && ok "the \$O/bg/notify.sh default fired the success notification" || ok "notification default: $(notify_last)"
+notify_success && ok "notifier default resolved before the preflight" || bad "the default notifier was never resolved (got: $(notify_last))"
+# and an absent source through the SAME default must notify FAILURE, not fall silent
+notify_reset
+OUT="$(bash "$DEPLOY" --src "$T/absent16" --o "$O16" 2>&1)"; RC=$?
+[ "$RC" = "78" ] && ok "absent source via the default notifier -> exit 78" || bad "exit $RC, expected 78"
+notify_failure && ok "the default notifier reported the refusal (indicator (a) of #2041)" || bad "a refusal reached nobody: $(notify_last)"
+# env `O` is honoured (the #1745-class false PASS: an explicit `O=<dir>` used to address $HOME/orchestrator)
+notify_reset
+OUT="$(O="$O16" bash "$DEPLOY" --src "$SRC1" --no-notify 2>&1)"; RC=$?
+[ "$RC" -eq 0 ] && ok "env O=<dir> is honoured without --o" || bad "env O exited $RC: $OUT"
+
+# ── 17. TWO SHAPES THAT MUST NOT WRITE OUTSIDE THE TARGET, OR LIE ABOUT EVIDENCE ────────────────
+say_case "17. a symlink at the destination, and a directory at the ledger path"
+SRC17="$T/src17"; O17="$T/o17"; EL="$T/elsewhere17"; make_src "$SRC17"; make_target "$O17"
+mkdir -p "$EL"
+rm -f "$O17/claims.sh"; ln -s "$EL" "$O17/claims.sh"   # a shipped name that is a link into another dir
+notify_reset; deploy "$SRC17" "$O17"
+[ "$RC" -ne 0 ] && ok "destination symlink -> non-zero exit ($RC)" || bad "destination symlink exited 0"
+notify_success && bad "a symlink destination notified SUCCESS" || ok "no success notification"
+[ -z "$(ls -A "$EL" 2>/dev/null)" ] && ok "nothing was written through the link, outside the target" || bad "the deploy wrote $(ls -A "$EL") OUTSIDE the target"
+grep -q "COPY-FAIL	claims.sh	(target path is a SYMLINK" "$O17/.deploy-ledger.tsv" 2>/dev/null && ok "the ledger names the SYMLINK shape (not merely \"is a directory\")" || bad "the symlink guard did not fire (masked by the directory guard?)"
+# a DIRECTORY at the ledger path: `mv` would move the temp INSIDE it and report success silently
+SRC17b="$T/src17b"; O17b="$T/o17b"; make_src "$SRC17b"; make_target "$O17b"; mkdir -p "$O17b/.deploy-ledger.tsv"
+notify_reset; deploy "$SRC17b" "$O17b"
+[ "$RC" -eq 0 ] && ok "bytes are still verified when only the ledger cannot be installed" || bad "ledger shape changed the deploy verdict (exit $RC)"
+grep -qi "ledger NOT installed" <<< "$OUT" && ok "says the ledger could NOT be installed" || bad "silently moved the temp file into the ledger directory"
+grep -qi "ledger could NOT be written" <<< "$OUT" && ok "the verdict names the missing evidence instead of pointing at it" || bad "VERIFIED still points at a ledger that does not exist"
+
+# ── 18. THE EXECUTABLE BIT IS ASSERTED, NOT INHERITED FROM `cp -p` ───────────────────────────────
+say_case "18. a copy that drops the mode is repaired (a 0644 merge-one.sh is a loop that cannot spawn)"
+# Without this case the block above was unfalsifiable: `cp -p` carried the mode, so deleting the
+# helper's own chmod left every assertion green — the comment credited code that was not load-bearing.
+SRC18="$T/src18"; O18="$T/o18"; make_src "$SRC18"; make_target "$O18"
+mkdir -p "$T/cpbin18"
+cat > "$T/cpbin18/cp" <<'SH'
+#!/usr/bin/env bash
+# a cp that ignores -p, the platform whose mode preservation we must not trust. NOTE the QUOTED
+# heredoc delimiter: backticks in an unquoted heredoc BODY are command substitution, and the word
+# `cp` in a comment ran the real cp with no operands on the first attempt.
+args=(); for a in "$@"; do [ "$a" = "-p" ] || args+=("$a"); done
+"${REAL_CP:?}" "${args[@]}" || exit $?
+# ⛔ cp WITHOUT -p still lands the source's mode minus umask, so a mode-dropping shim has to drop it
+# explicitly — otherwise the helper's own chmod +x was never load-bearing and the case proved nothing.
+for a in "${args[@]}"; do
+  case "$a" in *.deploy.*) chmod 644 "$a" 2>/dev/null || true ;; esac
+done
+exit 0
+SH
+chmod +x "$T/cpbin18/cp"
+notify_reset
+OUT="$(REAL_CP="$REAL_CP" PATH="$T/cpbin18:$PATH" bash "$DEPLOY" --src "$SRC18" --o "$O18" --notify "$NOTIFY" 2>&1)"; RC=$?
+[ "$RC" -eq 0 ] && ok "deploy without -p still verifies (exit 0)" || bad "deploy without -p exited $RC: $OUT"
+[ -x "$O18/merge-one.sh" ] && ok "the helper RESTORED the executable bit itself" || bad "the executable bit was lost (only cp -p was carrying it)"
+
+# ── 19. THE IDENTITY RECORD — a redeploy must not make the drift gate cry "hand edit" ────────────
+say_case "19. a stale .agent-infra-stamp.json is NAMED in the verdict, not hidden"
+# install.sh folds $O/*.sh into `payloadSha256`; check-deployed-drift.sh reports a mismatch as its
+# top-severity "post-install hand edit". Nothing re-stamped after a redeploy, so every legitimate
+# deploy produced that alarm and it stopped meaning anything.
+SRC19="$T/src19"; O19="$T/o19"; make_src "$SRC19"; make_target "$O19"
+printf '{"payloadSha256":"deadbeefdeadbeef"}\n' > "$O19/.agent-infra-stamp.json"
+notify_reset; deploy "$SRC19" "$O19"
+[ "$RC" -eq 0 ] && ok "the bytes still verify (the stamp is not the deploy's evidence)" || bad "a stale stamp failed the deploy (exit $RC)"
+grep -qi "identity record STALE" <<< "$OUT" && ok "the verdict names the stale identity record" || bad "silently left a stale payloadSha256 behind"
+grep -qi "STALE" <<< "$(notify_last)" && ok "the notification names it too (a caller reads only that)" || bad "the notification reads as fully current: $(notify_last)"
+grep -q "STALE-STAMP" "$O19/.deploy-ledger.tsv" 2>/dev/null && ok "the ledger records the stale stamp" || bad "the ledger does not record the stale stamp"
+# and a matching stamp is NOT reported (no false alarm on a fresh install's own record)
+STAMP_LIVE="$( ( cd "$O19" && for f in *.sh; do [ -f "$f" ] || continue; $SHA_CMD "$f"; done ) | $SHA_CMD | awk '{print $1}' )"
+printf '{"payloadSha256":"%s"}\n' "$STAMP_LIVE" > "$O19/.agent-infra-stamp.json"
+notify_reset; deploy "$SRC19" "$O19"
+grep -qi "identity record STALE" <<< "$OUT" && bad "a CURRENT stamp was reported as stale (false alarm)" || ok "a current identity record is not flagged"
 
 echo
 echo "════════════════════════════════════════"

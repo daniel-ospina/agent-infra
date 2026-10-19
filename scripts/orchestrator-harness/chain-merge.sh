@@ -61,7 +61,7 @@ release_issue_claim() {
     return 0
   fi
   if ! declare -f claim_issue_release_record >/dev/null 2>&1; then
-    echo "[chain $N] ⚠️ $csh predates the issue-claim RELEASE (no claim_issue_release_record) — the claim is NOT released; fix: cp scripts/orchestrator-harness/*.sh ~/orchestrator/" >> "$LOG"
+    echo "[chain $N] ⚠️ $csh predates the issue-claim RELEASE (no claim_issue_release_record) — the claim is NOT released; fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ~/orchestrator" >> "$LOG"
     return 0
   fi
   # ⛔ NO CAPTURED GENERATION → DO NOT RELEASE (acceptance-review finding). The capture at chain start

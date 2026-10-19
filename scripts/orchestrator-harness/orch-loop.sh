@@ -49,7 +49,7 @@ fi
 # exact wrong-surface defect this refuses. Same check repo-authority.sh gets, for the same reason.
 command -v derive_or >/dev/null 2>&1 \
   || {
-    _fatal_rs="FATAL repo-slug.sh in $O is stale/partial (no derive_or) — re-seed it: cp scripts/orchestrator-harness/*.sh $O/"
+    _fatal_rs="FATAL repo-slug.sh in $O is stale/partial (no derive_or) — re-seed it: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o $O"
     echo "orch-loop: $_fatal_rs" >&2
     [ -d "$O" ] && { mkdir -p "$O/logs" 2>/dev/null; echo "$(date) [startup] $_fatal_rs" >> "$O/logs/orch-loop.log" 2>/dev/null; }
     exit 78
@@ -2240,10 +2240,10 @@ PY
       elif [ -f "$O/claims.sh" ]; then
         # PRESENT BUT STALE — see the polarity note above. The box would have to dispatch unclaimed,
         # which is the fail-open this branch now refuses.
-        echo "[dispatch] #$ISS NOT dispatched — \$O/claims.sh predates the issue key (no claim_issue_acquire), so this box cannot take the claim; fix: cp scripts/orchestrator-harness/*.sh ~/orchestrator/" >> "$LOG"
+        echo "[dispatch] #$ISS NOT dispatched — \$O/claims.sh predates the issue key (no claim_issue_acquire), so this box cannot take the claim; fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ~/orchestrator" >> "$LOG"
         continue
       else
-        echo "[dispatch] ⚠️ #$ISS: no claim registry at \$O/claims.sh — dispatching WITHOUT a cross-box claim (seed it: cp scripts/orchestrator-harness/*.sh ~/orchestrator/)" >> "$LOG"
+        echo "[dispatch] ⚠️ #$ISS: no claim registry at \$O/claims.sh — dispatching WITHOUT a cross-box claim (seed it: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ~/orchestrator)" >> "$LOG"
       fi
       echo "$ISS" >> "$O/.batch"; echo "$ISS" >> "$O/dispatched.txt"; K=$((K+1)); [ "$K" -ge "$BATCH" ] && break
     done < "$O/candidates.txt"
@@ -2306,11 +2306,11 @@ PY
           # only place that would print the remedy (the .refresh-blocked file) never fired, so the
           # sole symptom was a `funnel STALE` line half an hour later. Same handling as rc=3: say it
           # once, name the re-seed, and do not retry a config error every cycle.
-          echo "[refresh] BLOCKED (permanent): repo-slug.sh missing/stale in \$O — the pool cannot be attributed to a repo, so nothing may be queued. Re-seed: cp scripts/orchestrator-harness/*.sh \$O/ then delete \$O/.refresh-blocked (agent-infra#2040)" >> "$LOG"
+          echo "[refresh] BLOCKED (permanent): repo-slug.sh missing/stale in \$O — the pool cannot be attributed to a repo, so nothing may be queued. Re-seed: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O then delete \$O/.refresh-blocked (agent-infra#2040)" >> "$LOG"
           {
             echo "MERGE-ONLY: dispatch is BLOCKED — repo-slug.sh is missing or stale in \$O."
             echo "The refresh refuses to read a candidate pool it cannot attribute to a repo (agent-infra#2040)."
-            echo "Fix: cp scripts/orchestrator-harness/*.sh <your \$O>/   then delete this file."
+            echo "Fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o <your \$O>   then delete this file."
           } > "$O/.refresh-blocked" 2>/dev/null
         elif [ "$rc" -ne 0 ]; then
           echo "[refresh] FAILED rc=$rc (transient — retried next cycle)" >> "$LOG"

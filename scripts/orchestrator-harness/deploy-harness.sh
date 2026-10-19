@@ -51,18 +51,20 @@
 #
 # WHAT THIS SCRIPT DOES NOT DO: it does not stop or restart the controller. Restart ownership stays
 # with the caller (a deploy helper that restarts cannot help but claim a restart, and a claim about a
-# process it did not verify is the same defect one line over). See bg/finish.sh's call site in
-# README/"deploying" and §5 of the report for agent-infra#2041.
+# process it did not verify is the same defect one line over). The gated call site is in
+# `README.md` §4.1 ("Redeploying an existing box"); the measured incident is agent-infra#2041.
 set -uo pipefail
 
 PROG="$(basename "${BASH_SOURCE[0]}")"
 usage() { awk 'NR>1 && /^set -uo pipefail$/{exit} NR>1{sub(/^# ?/,""); print}' "${BASH_SOURCE[0]}"; }
 
-SRC="" ; O="" ; NOTIFY="" ; LEDGER="" ; DO_NOTIFY=1 ; QUIET=0
-# ⛔ `O` is NOT cleared: every sibling in this directory honours an env `O=<dir>` (`install.sh`,
-# `orch-loop.sh`, `report.sh`, `check-deployed-drift.sh` all do), and clearing it made an explicit
-# `O=<dir> ...` silently address $HOME/orchestrator instead — the measured #1745-class false PASS
-# about a directory the operator never named. `SRC` has no such convention, so it is cleared.
+SRC="" ; NOTIFY="" ; LEDGER="" ; DO_NOTIFY=1 ; QUIET=0
+# ⛔ `O` is NOT initialised here — not even to "". Setting `O=""` on this line CLEARED an env
+# `O=<dir>` before the assignment below could read it, so the "honour the convention" comment was
+# false and an explicit `O=<dir> ...` silently addressed the default runtime — the measured
+# #1745-class false PASS about a directory the operator never named. Every sibling in this directory
+# honours an env `O=<dir>` (`install.sh`, `orch-loop.sh`, `report.sh`, `check-deployed-drift.sh` all
+# do), and suite case 16 pins it. `SRC` has no such convention, so it IS cleared.
 SRC="${HARNESS_SRC:-}"
 O="${O:-}"
 
@@ -118,13 +120,21 @@ fi
 # to a temp file in the target directory and renamed, so a concurrent reader sees a whole ledger or
 # none — never a half-written one. `check-deployed-drift.sh` hashes only `*.sh`, so this file is
 # invisible to it by construction and cannot perturb the drift answer.
+# Returns non-zero when the ledger could NOT be installed, so the success path can say so instead of
+# pointing an operator at evidence that does not exist. `fatal` (stderr, never `say`) so `--quiet`
+# cannot suppress the one line that matters.
 write_ledger() { # write_ledger <verdict> <line...>
   [ -n "$LEDGER" ] || return 0
   local tmp="$LEDGER.$$" v="$1"; shift
   { printf '# deploy-harness %s  src=%s  o=%s\n' "$(date -u '+%FT%TZ')" "$SRC" "$O"
     printf '# verdict\t%s\n' "$v"
-    printf '%s\n' "$@"; } > "$tmp" 2>/dev/null || { rm -f "$tmp"; say "  (ledger not writable at $LEDGER)"; return 0; }
-  mv -f "$tmp" "$LEDGER" 2>/dev/null || { rm -f "$tmp"; say "  (ledger not installable at $LEDGER)"; }
+    printf '%s\n' "$@"; } > "$tmp" 2>/dev/null || { rm -f "$tmp"; fatal "ledger NOT written — $LEDGER is not writable"; return 1; }
+  # ⛔ `mv -f` onto a DIRECTORY succeeds by moving the temp file INSIDE it, silently — so the shape is
+  # refused here rather than reported as a successful install.
+  if [ -d "$LEDGER" ] || ! mv -f "$tmp" "$LEDGER" 2>/dev/null; then
+    rm -f "$tmp"; fatal "ledger NOT installed — $LEDGER is a directory or cannot be replaced"; return 1
+  fi
+  return 0
 }
 
 # ── 0. PREFLIGHT — refuse BEFORE anything is written, so a bad deploy leaves the box as it found it ──
@@ -135,8 +145,13 @@ write_ledger() { # write_ledger <verdict> <line...>
 # make the very directory we just promised not to touch carry a deploy artefact, and a later reader
 # would find evidence of a deploy that never happened. The reason travels in the notification and on
 # stderr instead; the ledger exists only from the first attempted copy onward.
-[ -n "$O" ] || { fatal "--o <runtime dir> is required (or export O=<runtime dir>); refusing to guess a live runtime"; exit 78; }
-[ -n "$SRC" ] || { fatal "--src <harness dir> (or --repo <checkout>) is required"; exit 78; }
+# ⛔ These two refusals notify like every other one: the argument-parse refusals above cannot (the
+# notifier is resolved after the loop), so these are the last ones that could go unreported and they
+# must not. A missing `--o` is an operator typing `--src` and forgetting the runtime.
+[ -n "$O" ] || { fatal "--o <runtime dir> is required (or export O=<runtime dir>); refusing to guess a live runtime"
+  notify "orchestrator: harness deploy FAILED" "No target runtime was named (--o / \$O) — nothing was copied (#2041)." high; exit 78; }
+[ -n "$SRC" ] || { fatal "--src <harness dir> (or --repo <checkout>) is required"
+  notify "orchestrator: harness deploy FAILED" "No source harness directory was named (--src / --repo) — nothing was copied (#2041)." high; exit 78; }
 
 # (a) THE MEASURED DEFECT: the source directory did not exist and the deploy "succeeded".
 if [ ! -e "$SRC" ]; then
@@ -155,13 +170,53 @@ fi
   fatal "  this helper REDEPLOYS an existing runtime; a fresh box is install.sh's job, not a silent mkdir."
   notify "orchestrator: harness deploy FAILED" "Target runtime $O is not a directory — nothing was copied (#2041)." high; exit 78; }
 
+# (b2) THE TARGET IS NOT THE SOURCE. A self-deploy compares every file with itself, so its verdict is a
+# tautology printed as a success — and it would write the ledger INTO the source tree (an untracked
+# file in a checkout, which the next deploy then ships as harness content).
+SRC_REAL="$(cd "$SRC" && pwd -P)" || { fatal "source path cannot be resolved: $SRC"
+  notify "orchestrator: harness deploy FAILED" "Source path $SRC cannot be resolved — nothing was copied (#2041)." high; exit 78; }
+O_REAL="$(cd "$O" && pwd -P)" || { fatal "target path cannot be resolved: $O"
+  notify "orchestrator: harness deploy FAILED" "Target path $O cannot be resolved — nothing was copied (#2041)." high; exit 78; }
+case "$SRC_REAL/" in "$O_REAL"/*) SELF_OVERLAP=1 ;; *) case "$O_REAL/" in "$SRC_REAL"/*) SELF_OVERLAP=1 ;; *) SELF_OVERLAP=0 ;; esac ;; esac
+if [ "$SELF_OVERLAP" -eq 1 ]; then
+  fatal "source and target overlap ($SRC_REAL vs $O_REAL) — refusing a self-deploy"
+  fatal "  every file would compare with itself, so the verdict could not fail; nothing was written."
+  notify "orchestrator: harness deploy FAILED" "Source and target overlap ($SRC_REAL vs $O_REAL) — a self-deploy verifies nothing; nothing was copied (#2041)." high
+  exit 78
+fi
+
 # ── inventory: what the SOURCE ships, recursively ────────────────────────────────────────────────
 # ⛔ FROM THE SOURCE, never from the target. `find "$SRC"` is a bounded walk under one directory this
 # script was pointed at — not a root walk — and `-type f` recurses so `gh-rest/gh`, `gh-limit/gh` and
 # `retired/*.sh` are deployed too. The old `cp -R src/. $O/` carried them by luck; #2039 is the
 # measured case of a subdirectory that never landed.
+#
+# ⛔ THE WALK'S STATUS IS CHECKED, and this is not defensive pedantry — it was a measured FALSE PASS of
+# the same #2041 class. The inventory used to be built inside a PROCESS SUBSTITUTION
+# (`while … done < <(cd src && find …)`), whose exit status bash never waits for: an unsearchable
+# subdirectory (`find` exit 1, "Permission denied") or a path that VANISHED mid-walk produced a
+# TRUNCATED file list, N shrank to the readable subset, every term of the verdict then agreed with
+# itself, and the run printed `VERIFIED — 2/2` and exit 0 while the source's `gh-limit.py` was never
+# deployed — the exact consequence the file exists to prevent. A partial inventory is not a deploy.
+INV=""
+if ! INV="$(cd "$SRC" && find . -type f -print)"; then
+  fatal "source inventory FAILED under $SRC — a directory is unsearchable, a path vanished mid-walk, or the filesystem errored"
+  fatal "  a partial file set cannot be deployed or verified; refusing rather than certifying a subset."
+  notify "orchestrator: harness deploy FAILED" "Source inventory failed under $SRC (unsearchable directory, vanished path or I/O error) — a partial file set was NOT deployed, and nothing was written to $O (#2041)." high
+  exit 78
+fi
+# ⛔ AND A SYMLINK IS REFUSED, not silently skipped: `find -type f` cannot see one, while the `cp -R`
+# this replaces carried it — so a shim shipped as a link would go missing from a deployment that still
+# said VERIFIED. Fail closed with the reason rather than reproduce #2041 for one file class.
+if [ -n "$(cd "$SRC" && find . -type l -print -quit)" ]; then
+  LINK="$(cd "$SRC" && find . -type l -print -quit)"
+  fatal "source ships a SYMLINK (${LINK#./}) — this deploy copies and byte-verifies regular files only"
+  fatal "  dereference it (ship the file it points at) so the bytes this run lands can be compared."
+  notify "orchestrator: harness deploy FAILED" "Source $SRC ships a symlink (${LINK#./}); a symlink cannot be byte-verified by this deploy — nothing was written to $O (#2041)." high
+  exit 78
+fi
 REL=()
-while IFS= read -r f; do REL+=("$f"); done < <(cd "$SRC" && find . -type f -print | sed 's|^\./||' | LC_ALL=C sort)
+while IFS= read -r f; do [ -n "$f" ] && REL+=("${f#./}"); done < <(printf '%s\n' "$INV" | LC_ALL=C sort)
 N=${#REL[@]}
 
 if [ "$N" -eq 0 ]; then
@@ -172,9 +227,14 @@ if [ "$N" -eq 0 ]; then
   notify "orchestrator: harness deploy FAILED" "Source $SRC ships zero files — nothing to deploy, and nothing was written to $O (#2041)." high
   exit 78
 fi
-# Identity anchors, same two deploy-mac-orchestrator.sh already refuses on: a directory that has
-# neither is not the harness, and deploying it would overwrite a live runtime with the wrong bytes.
-for anchor in orch-loop.sh claims.sh; do
+# Identity anchors. A directory with neither of the first two is not the harness at all; the LAST
+# THREE are the files #2041 measured MISSING, and they are required for a second reason: a source
+# checkout dated 2026-10-14..2026-10-16 has `orch-loop.sh` and `claims.sh` but not `gh-limit.py`,
+# `gh-rest/gh` or `gh-limit/gh` (they landed 2026-10-17/18), so a two-anchor test CERTIFIED a stale
+# harness — a days-old checkout instead of a 1274-commit-old one, with the same measured consequence
+# (every harness `gh` call unserialised, the `gh-limit` PATH layer absent). A source that is genuinely
+# the current harness ships all five, so this is a strict tightening that cannot false-refuse one.
+for anchor in orch-loop.sh claims.sh gh-limit.py gh-rest/gh gh-limit/gh; do
   [ -f "$SRC/$anchor" ] || { fatal "$SRC has no $anchor — refusing to deploy a directory that is not the harness"
     notify "orchestrator: harness deploy FAILED" "$SRC has no $anchor — it is not the harness; nothing was written to $O (#2041)." high; exit 78; }
 done
@@ -197,7 +257,16 @@ for rel in "${REL[@]}"; do
   dst="$O/$rel"
   dstdir="$(dirname "$dst")"
   tmp="$dstdir/.$(basename "$rel").deploy.$$"
-  if [ -d "$dst" ] && [ ! -L "$dst" ]; then
+  # ⛔ A SYMLINK AT THE DESTINATION IS A FAILURE TOO. `[ -d ]` follows the link, so a target file that
+  # is a symlink into another directory used to pass this guard and `mv` then moved the staged file
+  # INTO that unrelated directory — writing outside the runtime we were given while the shape looked
+  # fine. A deploy writes only inside `$O`.
+  if [ -L "$dst" ]; then
+    copy_fail+=("$rel")
+    detail+=("COPY-FAIL	$rel	(target path is a SYMLINK — refusing to write through it)")
+    continue
+  fi
+  if [ -d "$dst" ]; then
     # A directory where a file belongs: staging would succeed and `mv` would move the staged file
     # INTO it, reporting success while the target kept the wrong shape. Refuse the shape.
     copy_fail+=("$rel")
@@ -230,7 +299,14 @@ if [ "${#copy_fail[@]}" -ne 0 ]; then
   fatal "copy FAILED for ${#copy_fail[@]} of $N file(s) — $COPIED written, $((N - COPIED)) not"
   for f in "${copy_fail[@]}"; do printf '  FAILED  %s\n' "$f" >&2; done
   write_ledger "FAILED: copy ($COPIED/$N written, ${#copy_fail[@]} failed)" "${detail[@]}"
-  notify "orchestrator: harness deploy FAILED" "Copy failed for ${#copy_fail[@]} of $N file(s) ($COPIED written, first: $(printf '%s' "${copy_fail[0]}")). The runtime at $O is now PARTIAL — do not treat it as current (#2041)." high
+  # ⛔ THE MESSAGE MUST MATCH WHAT WAS MEASURED. With ZERO files written the runtime is NOT "partial" —
+  # it is exactly as it was, and telling an operator it is partial invites a restore/re-kill of a
+  # healthy box. Branch on the count instead of asserting the worse case.
+  if [ "$COPIED" -eq 0 ]; then
+    notify "orchestrator: harness deploy FAILED" "Copy failed for ${#copy_fail[@]} of $N file(s) — NOTHING was written (0/$N); the runtime at $O is unchanged. First: $(printf '%s' "${copy_fail[0]}") (#2041)." high
+  else
+    notify "orchestrator: harness deploy FAILED" "Copy failed for ${#copy_fail[@]} of $N file(s) ($COPIED written, first: $(printf '%s' "${copy_fail[0]}")). The runtime at $O is now PARTIAL — do not treat it as current (#2041)." high
+  fi
   exit 1
 fi
 
@@ -272,8 +348,35 @@ if [ "$N" -lt 1 ] || [ "$COPIED" -ne "$N" ] || [ "$VERIFIED" -ne "$N" ]; then
 fi
 
 say "$PROG: VERIFIED — $VERIFIED/$N file(s) written by this run and byte-identical to $SRC"
-write_ledger "VERIFIED: $VERIFIED/$N copied and identical" "${detail[@]}"
+
+# ── 3b. THE IDENTITY RECORD — the bytes are right, but is the box's OWN record still about them? ─
+# `install.sh` folds this deployment's `$O/*.sh` into `.agent-infra-stamp.json` (`payloadSha256`), and
+# `check-deployed-drift.sh` reports a mismatch as "a post-install hand edit" — its top-severity alarm.
+# Nothing re-stamped after a redeploy, so EVERY legitimate redeploy turned into that alarm and the
+# alarm stopped meaning anything. The stamp is not this helper's to write (install.sh owns the
+# provenance record), so the verdict NAMES the staleness instead of hiding it: the deploy's own
+# evidence is still true, and the operator is told the one command that re-records it.
+STAMP_NOTE=""
+STAMP="$O/.agent-infra-stamp.json"
+if [ -f "$STAMP" ]; then
+  SHA_CMD="sha256sum"; command -v sha256sum >/dev/null 2>&1 || SHA_CMD="shasum -a 256"
+  REC="$(sed -n 's/.*"payloadSha256"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$STAMP" 2>/dev/null | head -1)"
+  LIVE="$( ( cd "$O" && for f in *.sh; do [ -f "$f" ] || continue; $SHA_CMD "$f" || exit 3; done ) 2>/dev/null | $SHA_CMD 2>/dev/null | awk '{print $1}' )"
+  if [ -n "$REC" ] && [ -n "$LIVE" ] && [ "$REC" != "$LIVE" ]; then
+    STAMP_NOTE="; identity record STALE — run install.sh to re-stamp"
+    say "  ⚠ identity record STALE: $STAMP no longer describes these bytes (payloadSha256 ${REC:0:12}… vs live ${LIVE:0:12}…)."
+    say "    Re-run install.sh to re-record it; check-deployed-drift.sh will otherwise call this deploy a hand edit."
+    detail+=("STALE-STAMP	.agent-infra-stamp.json	(payloadSha256 ${REC:0:12} vs live ${LIVE:0:12})")
+  fi
+fi
+
+if ! write_ledger "VERIFIED: $VERIFIED/$N copied and identical${STAMP_NOTE:+, identity record STALE}" "${detail[@]}"; then
+  # ⛔ A success verdict whose evidence file could not be written must SAY SO in the verdict — the
+  # notification points the operator at the ledger, and pointing at a file that does not exist is the
+  # same defect one line over. The bytes are still verified; the reporting gap is named, not hidden.
+  say "  ⚠ the ledger could NOT be written at $LEDGER — the verdict above rests on this run's counts, not on a file"
+fi
 # ⛔ NO RESTART CLAIM. This message says what was measured: N files copied and compared. It does not
 # say the controller restarted, because this script did not restart it.
-notify "orchestrator: harness deploy VERIFIED" "$VERIFIED/$N file(s) copied from $SRC and byte-identical at $O (this deploy's own ledger, not a listing of what was already there)." high
+notify "orchestrator: harness deploy VERIFIED" "$VERIFIED/$N file(s) copied from $SRC and byte-identical at $O (this deploy's own ledger, not a listing of what was already there)${STAMP_NOTE}." high
 exit 0

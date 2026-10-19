@@ -27,7 +27,7 @@ release_issue_claim_unspawned() { # <issue>
     return 0
   fi
   if ! declare -f claim_issue_release_record >/dev/null 2>&1; then
-    echo "#$n: ⚠️ $csh predates the issue-claim release (no claim_issue_release_record) — the claim is NOT released; fix: cp scripts/orchestrator-harness/*.sh ~/orchestrator/"
+    echo "#$n: ⚠️ $csh predates the issue-claim release (no claim_issue_release_record) — the claim is NOT released; fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ~/orchestrator"
     return 0
   fi
   # ⚠️ The generation guard is deliberately INERT on this path, and that is correct rather than an
