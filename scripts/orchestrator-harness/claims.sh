@@ -493,7 +493,7 @@ claim_orphan_reason() {
       # reaping the others' merge/fix claims: the steal direction, arriving through a probe that cannot
       # answer. `claim_former_hosts` already refuses the sentinel; this gate must too. A sentinel owner
       # falls through to the HOST rules, which abstain when they cannot judge.
-      local is_local=0
+      local is_local=0 me
       if [ "$host" != "box" ] && [ "$host" = "$(claim_host)" ]; then
         is_local=1
       else
@@ -524,8 +524,18 @@ claim_orphan_reason() {
     # ⛔ A ROSTER THAT DOES NOT NAME THIS BOX IS STALE ABOUT THIS BOX (a rename, or a new cell) and
     # cannot be used to declare a PEER dead: the usual trigger for that staleness IS a rename, so
     # acting on it would reap the renamed box's LIVE claims fleet-wide. Abstain instead.
+    # ⛔ AND AN UNANSWERABLE PROBE MUST ABSTAIN BEFORE THE COMPARISON, NOT INSIDE IT (P1, cycle-12
+    # review). `claim_host` prints the EMPTY STRING when `hostname -s` exits 0 printing nothing, so the
+    # pattern below was `*"  "*` — which matches any roster carrying two consecutive spaces (a trailing
+    # comma, a double space). Measured: `CLAIM_KNOWN_HOSTS=peerA,peerB,` returned rc=0 "owner host peerC
+    # is not in CLAIM_KNOWN_HOSTS" for a LIVE unlisted peer, i.e. the guard that exists solely to stop a
+    # fleet-wide over-reap was bypassed by the very probe failure it is supposed to catch. An identity
+    # that cannot be answered is not an identity: abstain (under-reap). `box` is excluded for the same
+    # reason it is excluded everywhere — it is fleet-wide, not this box.
+    me="$(claim_host)"
+    case "$me" in ''|box) return 1 ;; esac
     case "$roster" in
-      *" $(claim_host) "*) ;;
+      *" $me "*) ;;
       *) return 1 ;;
     esac
     case "$roster" in

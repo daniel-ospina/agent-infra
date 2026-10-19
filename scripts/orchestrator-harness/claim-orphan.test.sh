@@ -45,6 +45,10 @@
 #   O19 [RED→GREEN] the destructive arms require POSITIVE evidence: an absent `ref` does not authorise
 #      the pid rule, and a `hostname` probe that cannot answer makes `claim_former_hosts` abstain
 #      (asserted on the function directly — through `claim_orphan_reason` the live-pid rule masks it).
+#   O23 [RED→GREEN] an EMPTY `hostname` answer abstains BEFORE the CLAIM_KNOWN_HOSTS comparison: the
+#      pattern `*" $(claim_host) "*` degenerated to `*"  "*`, so any roster with a trailing comma or a
+#      double space made the staleness guard pass for a box whose own name it never contained — the
+#      steal direction, with the guard bypassed by the failure it exists to catch.
 #   O22 [RED→GREEN] the `box` sentinel a failed `hostname` probe produces is NOT an identity — not in the
 #      local-pid gate, not in the history reader, and not in the recorder (it is the same string on
 #      every box, so treating it as local let each cell reap the others' live claims, and a recorded
@@ -85,15 +89,22 @@
 #   O14 [RED→GREEN] clamping to the ceiling is LOUD. A silent clamp shortens merge-one's derived lease
 #      below the review window it must outlive — a mid-review expiry, the duplicate this registry
 #      exists to prevent — and leaves nothing to diagnose.
-# ⛔ LABELLING HONESTY — MEASURED, not asserted. `CLAIMS_SH=<git archive HEAD>:claims.sh bash
-# claim-orphan.test.sh` (2026-10-18, against the pre-change claims.sh) reports 52 passed, 46 FAILED.
-# Every [RED→GREEN] line is in that failing set, and so is exactly ONE line that carries no such label:
-# `O7 the PR keying declares a documented ceiling` (a pre-fix reader has no ceiling to declare). The
-# converse is what keeps the labels honest: a [PINNED] line must PASS pre-fix, because PINNED means
-# "this guards a new fail-open, it is not a regression", and five assertions were RE-LABELLED after
-# measurement showed they passed or failed the other way (O4's token check, three O15 lines, O17's
-# duplicate check, O18's once-per-process check). Re-measure rather than trusting this paragraph — it
-# is a snapshot of one measurement, not an invariant, and the file grows.
+# ⛔ LABELLING HONESTY — MEASURED, not asserted. `CLAIMS_SH=<pre-change claims.sh> bash
+# claim-orphan.test.sh` (2026-10-18, commit 228233d's claims.sh) reports 53 passed, 52 FAILED. Every
+# [RED→GREEN] line is in that failing set. The failing lines that carry NO such label are these five,
+# all of them dependent on machinery the pre-fix tree does not have:
+#   • `O7 the PR keying declares a documented ceiling` — unlabelled by design (a capability assertion)
+#   • `[PINNED]` O15 `it reads held-by-live` — the token itself is new (pre-fix reason: `held by …`)
+#   • `[PINNED]` O12 `… a roster that names the RUNNING host and omits the holder DOES reap it` — the
+#     roster arm does not exist, so the call exits 127
+#   • `[PINNED]` O23 `with an ANSWERABLE identity the roster arm still reaps an unlisted peer` — same
+#   • `(setup)` O22 `the failing probe really does fall back to the sentinel` — needs `claim_host`
+# So PINNED means "this guards a NEW fail-open, it is not a regression of old behaviour" — NOT "it
+# passes pre-fix". Where the pinned behaviour did not exist at all, it fails pre-fix BY CONSTRUCTION,
+# and this paragraph names those lines rather than pretending the label implies a green RED direction.
+# Five assertions were RE-LABELLED after measurement showed they went the other way (O4's token check,
+# three O15 lines, O17's duplicate check, O18's once-per-process check). Re-measure rather than trusting
+# this paragraph — it is a snapshot of one measurement, not an invariant, and the file grows.
 #
 # HERMETIC: every check builds its own throwaway bare origin (`git init --bare`), so no network, no
 # real origin and nothing outside $T is written — the claim refs die with the temp dir.
@@ -925,6 +936,47 @@ CS22B="$T/cl22-rec"; mkdir -p "$CS22B"
 [ ! -s "$CS22B/claim-hosts" ] || ! grep -qx 'box' "$CS22B/claim-hosts"
 S22E=$?
 ck "O22 [RED→GREEN] the RECORDER refuses to write the sentinel into claim-hosts" $S22E
+
+echo
+echo "── O23: an UNANSWERABLE identity abstains BEFORE the roster comparison (steal direction) ─"
+# ⛔ THE STALENESS GUARD MUST NOT BE BYPASSABLE BY THE PROBE FAILURE IT EXISTS TO CATCH (P1, cycle-12
+# review). `claim_host` prints the EMPTY STRING when `hostname -s` exits 0 printing nothing, so the
+# allow-list pattern `*" $(claim_host) "*` became `*"  "*` — which matches any roster carrying two
+# consecutive spaces (a trailing comma, a double space). Measured on the pre-fix code: a LIVE unlisted
+# peer returned rc=0 "owner host peerC is not in CLAIM_KNOWN_HOSTS" — the destructive verdict — so
+# `claim_prune` deleted the ref and `claim_acquire` reclaimed a live peer's claim.
+mkdir -p "$T/bin-emptyh23"
+printf '#!/bin/sh\nexit 0\n' > "$T/bin-emptyh23/hostname"; chmod +x "$T/bin-emptyh23/hostname"
+EMPTYH23="$(PATH="$T/bin-emptyh23:$PATH" claim_host)"
+[ -z "$EMPTYH23" ]
+O23PRE=$?
+ck "O23 (setup) the shim really makes claim_host print the EMPTY string" $O23PRE
+n=0
+for R in 'peerA,peerB' 'peerA,peerB,' 'peerA  peerB' ',peerA' 'peerA,,peerB'; do
+  n=$((n+1))
+  OUT23="$(
+    PATH="$T/bin-emptyh23:$PATH"
+    CLAIM_REPO="$T/repo"; CLAIM_STATE_DIR="$T/cl23"; CLAIM_KNOWN_HOSTS="$R"
+    export PATH CLAIM_REPO CLAIM_STATE_DIR CLAIM_KNOWN_HOSTS
+    mkdir -p "$CLAIM_STATE_DIR"
+    . "$CLAIMS_SH" || exit 1
+    r="$(claim_orphan_reason "peerC:4242" "refs/claims/9209600${n}-0123456789ab")"
+    printf "RC=%s\n" "$?" )"
+  [ "$(field "$OUT23" RC)" = "1" ]; O23=$?
+  ck "O23 [RED→GREEN] roster '$R' + an EMPTY hostname never declares a live peer orphaned (rc=$(field "$OUT23" RC))" $O23
+done
+# AND the control: with a working probe the SAME roster that NAMES this box still reaps — so the fix
+# abstains on the identity, not on the whole arm (a suite that stopped reaping entirely would pass the
+# five checks above and defeat the fix's purpose).
+OUT23P="$(
+  CLAIM_REPO="$T/repo"; CLAIM_STATE_DIR="$T/cl23p"; CLAIM_KNOWN_HOSTS="$(hostname -s),peerB"
+  export CLAIM_REPO CLAIM_STATE_DIR CLAIM_KNOWN_HOSTS
+  mkdir -p "$CLAIM_STATE_DIR"
+  . "$CLAIMS_SH" || exit 1
+  claim_orphan_reason "peerC:4242" "refs/claims/9209699-0123456789ab" >/dev/null 2>&1
+  printf "RC=%s\n" "$?" )"
+[ "$(field "$OUT23P" RC)" = "0" ]; O23P=$?
+ck "O23 [PINNED] with an ANSWERABLE identity the roster arm still reaps an unlisted peer (rc=$(field "$OUT23P" RC))" $O23P
 
 echo
 echo "─────────────────────────────────────────────────────────────"
