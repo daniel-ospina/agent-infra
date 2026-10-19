@@ -105,6 +105,32 @@ MEASURED on cell-2 (2026-10-17, `/tmp/cell-t`, 23 lane venvs): `du` said
 the `du` figure is labelled an over-count. Do not quote a `du` total as reclaimed
 space.
 
+## Capacity — N measured, a stated floor, both printed
+
+Byte accounting says what a pass reclaimed. It says nothing about what the box can still take, and
+the acceptance clause on this issue is the second question: **a box can run N lanes without free disk
+falling below a stated floor.** So every pass ends with one `capacity:` line carrying every input and
+the verdict:
+
+```
+capacity: lanes_live=K lane_venv_max=M MB free_after=F MB floor=L MB floor_ok=yes|no|unknown lanes_headroom=N
+```
+
+| field | kind | meaning |
+|---|---|---|
+| `lanes_live` | MEASURED | lane worktrees this pass found a live holder for (the venvs about to be re-synced) |
+| `lane_venv_max` | MEASURED | the LARGEST lane env this pass saw — the worst case, never the mean |
+| `free_after` | MEASURED | filesystem free space after the pass |
+| `floor` | STATED | `REAP_VENV_FREE_FLOOR_MB` (default 2048 = one measured lane env, ~1.85 GB) |
+| `floor_ok` | ASSERTED | `yes` / `no` / `unknown`. **`unknown` is not a pass** — a `df` that cannot answer is never read as "enough" |
+| `lanes_headroom` | DERIVED | `(free_after - floor) / lane_venv_max`, floored at 0; `?` when an input is unreadable — never a fabricated number |
+
+A pass that ends **below the floor exits 5**, the code `disk-reaper.sh` already maps to `over-bound`,
+so the fleet entry point reports it without a second vocabulary. It **asserts, it does not reclaim**:
+the reaper never deletes a live lane's env to get back above the floor. The floor is registered in the
+`#1068` declared surface (`hygiene` axis, and in `OUT_OF_FAMILY_TERMS` because `_MB` is not a bound
+suffix — the reverse scan cannot see the name on its own).
+
 ## ⛔ The `uv` download cache is never touched
 
 A venv hardlinks into the cache: removing the cache does not free the space it
@@ -152,3 +178,11 @@ cell, `REAP_VENV_LOG` defaults to `$HOME/.pi/agent/state/reap-lane-venvs.log`.
   `redis-server` processes (`orphan-reap.py` deliberately excludes that class; it
   belongs to tortoise's embedded-process reaper). Correct behaviour, visible in the
   KEPT list, and it clears when the orphan is reaped.
+* **The capacity line ASSERTS the floor, it does not enforce it.** A pass below
+  `REAP_VENV_FREE_FLOOR_MB` exits 5 and says so; nothing is deleted to get back above
+  it, and nothing stops a dispatcher from starting another lane. Enforcement (refusing
+  a dispatch under the floor) belongs to the dispatcher — #1852 holds the measured
+  gap between the dispatch floor and what one lane actually costs.
+* **`lanes_headroom` divides by the largest env seen in THAT pass.** A pass over a repo
+  with no lane venv at all prints `?` rather than assuming a size: a headroom number
+  invented from a default is the same lie as a `du` figure quoted as reclaimed space.
