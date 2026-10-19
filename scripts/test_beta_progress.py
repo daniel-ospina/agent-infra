@@ -144,6 +144,23 @@ def test_both_sources_failing_keeps_the_unavailable_path(monkeypatch, no_cache, 
     assert "DELIVERY: unavailable (metrics read failed)" in printed
 
 
+# ── the exit-0 promise survives an UNEXPECTED failure, not just a refused one ──
+def test_main_prints_the_unavailable_line_even_if_compute_raises(monkeypatch, no_cache, capsys):
+    """`main()`'s contract is "Exit 0 always — a metrics failure must never take the heartbeat
+    down with it", and the heartbeat pipes stderr away
+    (`orchestrator-heartbeat.sh:181`): an exception here prints NOTHING where the operator needs
+    the `unavailable` line. Measured before this guard: a page whose `number` was an object
+    raised TypeError out of `sys.exit(main())` and produced no line at all. The row guards make
+    that payload unreachable; this pins the belt that keeps a FUTURE one from silencing the beat.
+    """
+    def boom():
+        raise RuntimeError("a shape guard missed something")
+
+    monkeypatch.setattr(bp, "compute", boom)
+    assert bp.main() == 0
+    assert "DELIVERY: unavailable (metrics read failed)" in capsys.readouterr().out
+
+
 # ── (c) REST `closed` also carries unmerged PRs -> excluded ──────────────────
 def test_rest_closed_window_excludes_unmerged_prs(monkeypatch):
     """`gh pr list --state merged` never returned a closed-unmerged PR, so REST must not
@@ -316,31 +333,78 @@ def test_rest_pages_the_requested_window_and_refuses_a_partial_read(monkeypatch)
 
 
 # ── a row that shifts across a page boundary is counted ONCE ────────────────
-def test_a_row_that_shifts_across_a_page_boundary_is_not_counted_twice(monkeypatch):
+def test_a_row_that_moves_across_a_page_boundary_refuses_the_window(monkeypatch):
     """The window is paged by OFFSET over a LIVE order (`sort=updated&direction=desc`), so a PR
-    updated between two requests jumps to the front and pushes one row across the
-    (page-1)*per_page boundary: that row is returned by BOTH pages. `compute()` counts the rows
-    it is handed, so the duplicate inflated `open_prs`/`merged_today` — the "never invent a
-    number" class this fallback must not add. Measured before the guard: a 200-row read returned
-    200 rows with only 198 distinct, rows 99 and 150 repeated.
+    updated between two requests jumps to the head and every row below it shifts by one. That is
+    ONE event with TWO consequences, and filtering only one of them is the bug:
+
+      * the mover is returned by the page that read it AND by the next page (so `compute()`, which
+        sums these rows, double-counted it);
+      * a row that ENTERED at the head after page 1 was read sits at offset 0 and is returned by
+        NO page — so the window is also SHORT, and the just-merged PR is exactly what is missing.
+
+    A dedupe fixes the first and leaves the second silently short — the class this file refuses
+    to report. A repeat can only arise from the list changing between two requests, so it is a
+    SOUND DETECTOR: the read refuses. Measured with the real paging loop before this guard: 200
+    rows, 198 distinct, rows 99 and 150 repeated; simulated end-to-end, one merge landing mid-read
+    left `merged_today` at 0 where the truth was 1.
     """
     monkeypatch.setattr(bp, "_token", lambda: "test-token")
 
-    def fake_get(url, tok, timeout=None):
+    def shifted(url, tok, timeout=None):
         page = int(url.rsplit("page=", 1)[1])
         if page == 1:
-            # Row 150 was just updated, so it moves to the head of the live order.
             return [rest_row(150, merged_at=MERGED_TODAY)] + [rest_row(n) for n in range(1, 100)]
-        # Page 2 now begins one row earlier: 99 was already on page 1.
+        # Page 2 begins one row earlier because row 150 jumped to the head: 99 repeats, and the
+        # PR that entered at offset 0 (150 here) was already missed by page 1's read.
         return [rest_row(n) for n in range(99, 200)]
 
-    monkeypatch.setattr(bp, "_rest_get_json", fake_get)
+    monkeypatch.setattr(bp, "_rest_get_json", shifted)
+    assert bp._rest_prs("open", limit=200) is None, (
+        "a repeat proves the list moved mid-read, and a moved list is also a SHORT one — the "
+        "window cannot be certified, so it must not be returned (a dedupe would hide the "
+        "double-count and leave the metric short)")
+
+    # The other direction: a shift that stays INSIDE one page produces no repeat and costs
+    # nothing, so the refusal is not a blanket one — a stable read of the same window is an
+    # ANSWER, and that is what the happy-path tests rely on.
+    def stable(url, tok, timeout=None):
+        page = int(url.rsplit("page=", 1)[1])
+        return [rest_row(n) for n in range((page - 1) * 100 + 1, page * 100 + 1)]
+
+    monkeypatch.setattr(bp, "_rest_get_json", stable)
     rows = bp._rest_prs("open", limit=200)
-    assert rows is not None
-    numbers = [r["number"] for r in rows]
-    assert len(numbers) == len(set(numbers)), (
-        "a repeated row is counted twice — `open_prs` and `merged_today` are sums of these rows")
-    assert 99 in numbers and 150 in numbers, "dedupe must drop the REPEAT, not the row itself"
+    assert rows is not None and len(rows) == 200
+    assert len({r["number"] for r in rows}) == 200
+
+
+def test_a_repeat_from_a_NON_COUNTED_row_still_refuses_the_window(monkeypatch):
+    """The repeat is evidence about the LIST, not about which rows count. In the MERGED window the
+    closed-without-merge rows are dropped, and the row that shifts a live `updated desc` order
+    mid-read is very often one of those (closed without merging, re-labelled, superseded) — so a
+    check placed AFTER the drop never sees the only sound signal the read has. Measured before
+    this ordering fix: 100 unmerged rows on page 1, then one PR merges (now at offset 0) and
+    unmerged row 100 repeats on page 2 — the guard never fired and the read returned 0 rows, a
+    REAL "0 merged today" line while the truth was 1. That is the false zero the file header
+    says was fixed on 2026-10-01.
+    """
+    monkeypatch.setattr(bp, "_token", lambda: "test-token")
+    calls = []
+
+    def pages(url, tok, timeout=None):
+        page = int(url.rsplit("page=", 1)[1])
+        calls.append(page)
+        if page == 1:
+            return [rest_row(n) for n in range(1, 101)]              # unmerged closed rows
+        if page == 2:
+            return [rest_row(100)] + [rest_row(n) for n in range(101, 200)]   # #100 repeats
+        return [rest_row(n) for n in range(200, 205)]               # short page ends the read
+
+    monkeypatch.setattr(bp, "_rest_get_json", pages)
+    assert bp._rest_prs("merged", limit=400) is None, (
+        "the repeat was of a row the merged filter DROPS — it is still proof the list moved, and "
+        "the moved list is also the short one")
+    assert calls == [1, 2], calls
 
 
 # ── token: env first, then gh's hosts.yml — and never on stdout ─────────────
@@ -495,6 +559,17 @@ def test_a_page_of_unusable_rows_refuses_instead_of_reporting_zero(monkeypatch):
     for page in (
         ["not a dict", 42, None],                            # wrong element type
         [{"title": "no number"}, {"title": "no number"}],    # drifted shape
+        # ⛔ PRESENCE IS NOT ENOUGH — the TYPES that are hashed, dereferenced and compared must
+        # be the documented ones, or the guard reports "not malformed" and something further in
+        # raises instead. Measured before these cases: `number: {}`/`[]` raised TypeError out of
+        # the dedupe's `in numbers` and printed NO line at all; `head: "x"` raised
+        # AttributeError; a dict `merged_at` raised in `compute()`'s comparison.
+        [{"number": {"x": 1}}],                            # unhashable number
+        [{"number": [1]}],                                 # unhashable number
+        [{"number": 7, "head": "not-a-dict"}],             # head dereferenced as a mapping
+        [{"number": 7, "head": ["ref"]}],                  # head wrong type
+        [{"number": 7, "merged_at": {"at": 1}}],          # merged_at compared to a str
+        [{"number": True}],                                # bool is not a PR number
     ):
         monkeypatch.setattr(bp, "_rest_get_json",
                             lambda url, tok, timeout=None, _p=page: list(_p))

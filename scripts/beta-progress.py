@@ -165,12 +165,17 @@ def _token():
     itself uses. When it switches accounts gh MOVES the active user's token up to block level
     (`activateUser`), so a config carrying both a `users:` map and a block-level token answers
     with the ACTIVE account's token and never reaches `gh auth token` (measured: the mixed
-    shape returns the block-level token with no subprocess call). Only when the token is absent
-    from the file -- keyring-backed, or every entry nested -- does this fall through to
-    `gh auth token --hostname github.com`, which answers the ACTIVE account by its own docs.
-    The user's own `user:`/`users:` pick is not separately modelled because it does not need to
-    be: the block-level token already IS gh's answer. Neither branch can return another
-    account's token, which is the property this function has to hold.
+    shape returns the block-level token with no subprocess call, and real gh's own
+    `gh auth token` answers the same value). The fall-through is then split in two, and they
+    are NOT the same outcome: a KEYRING-BACKED config (no `oauth_token:` in the file) is
+    answered the ACTIVE account by `gh auth token --hostname github.com` (per its own docs),
+    while a file whose tokens are ALL nested under `users:` is answered NOTHING -- measured
+    with gh 2.102.0: `no oauth token found for github.com` on stderr, empty stdout, rc 1 -- so
+    `_token()` returns `""` and the REST read refuses with the honest `unavailable` line. That
+    refusal is the correct outcome, not a regression, and naming it keeps an operator from
+    chasing it as one. The user's own `user:`/`users:` pick is not separately modelled because
+    it does not need to be: the block-level token already IS gh's answer. No branch can return
+    another account's token, which is the property this function has to hold.
     """
     for var in ("GH_TOKEN", "GITHUB_TOKEN"):
         if os.environ.get(var):
@@ -253,13 +258,24 @@ def _rest_prs(state, limit=100, deadline=None):
     the SAME one, because a per-read budget doubles the phase's worst case inside a tick that
     is killed (see `REST_BUDGET_S`).
 
-    ⛔ THE OFFSET WINDOW IS BOUNDED IN BOTH DIRECTIONS, and both bounds are stated rather than
-    assumed. (i) A row updated BETWEEN two requests re-sorts across the boundary and is
-    returned twice; rows are therefore deduped by `number`, which removes the DOUBLE-COUNT.
-    (ii) The same shift can DROP one row off the tail of the window, and dedupe does not
-    address that -- an offset page cannot, which is why the window is sorted `updated desc`
-    (a PR merged today was updated today, so it stays in the head of the window) and why the
-    bound below is a bound, not a guarantee.
+    ⛔ THE OFFSET WINDOW IS A LIVE ORDER, SO A ROW THAT MOVES DURING THE READ MAKES THE READ
+    UNCERTIFIABLE -- and the read REFUSES rather than returning the window. `updated desc` is
+    re-sorted between two requests and each page is an OFFSET into it, so a PR updated mid-read
+    jumps to the front and every row below it shifts by one. Two things follow, and they are
+    the same event seen from two sides: (i) the mover is returned by the page that read it AND
+    by the next page, i.e. twice; (ii) a row that ENTERED at the head after the first page was
+    read is at offset 0 and is returned by NO page. So a repeat is not merely a double-count to
+    be filtered -- it is a SOUND DETECTOR that the list changed between two requests, and a
+    window that has one is missing rows. Measured (200-row read, one PR re-sorted before page
+    2): 200 rows, 198 distinct, rows 99 and 150 repeated; simulated end-to-end, one merge
+    landing mid-read leaves `merged_today` at 0 where the truth is 1, and the just-merged PR is
+    returned by no page. Returning a deduped list would fix (i) and leave (ii) silently short --
+    exactly the class this file refuses to report -- so a repeat returns None for the WHOLE
+    read, the same answer as an unreadable or truncated page. A shift that stays INSIDE one page
+    produces no repeat and costs nothing, which is why this is not a blanket refusal. The
+    per-row shape check below is what makes the detector safe to rely on: any row whose
+    `number`, `head` or `merged_at` is not the documented TYPE is an unreadable page (None),
+    never a row to hash, dereference or compare.
 
     `sort=updated&direction=desc` is what makes the window SOUND for `merged_today`, and the
     bound is worth stating exactly: the window is the 400 most-recently-UPDATED **closed** PRs,
@@ -275,7 +291,7 @@ def _rest_prs(state, limit=100, deadline=None):
     if deadline is None:
         deadline = time.time() + REST_BUDGET_S
     out, seen, page = [], 0, 1
-    numbers = set()      # a row updated between requests shifts across the page boundary
+    numbers = set()      # the identity both call sites count; a REPEAT means the list moved
     while seen < limit:
         remaining = deadline - time.time()
         if remaining <= 0:
@@ -287,29 +303,48 @@ def _rest_prs(state, limit=100, deadline=None):
             return None
         keep = raw[:limit - seen]          # trim the FINAL page to the caller's window
         for p in keep:
-            if not isinstance(p, dict) or p.get("number") is None:
-                # ⛔ A page whose rows are not the documented shape is an UNREADABLE page, not an
-                # empty answer. `continue` here consumed a window of unusable rows (advancing
-                # `seen`) and then returned [] -- a REAL "0 open PRs" line, i.e. the false zero
-                # this file's own header says was fixed on 2026-10-01. Refuse the whole read.
+            # ⛔ ONE SHAPE CHECK, TYPES INCLUDED. Presence alone is not enough: the dedupe
+            # HASHES `number`, the mapping DEREFERENCES `head`, and `compute()` compares
+            # `merged_at` -- so `{"number": {}}` raised TypeError out of `sys.exit(main())`
+            # and printed NO line at all, breaking the "exit 0 always" promise, while
+            # `{"head": "x"}` raised AttributeError. A page whose rows are not the documented
+            # shape is an UNREADABLE page, not an empty answer -- `continue` here once consumed
+            # a window of unusable rows and returned [], the false zero this file's header says
+            # was fixed on 2026-10-01. Refuse the whole read.
+            if not isinstance(p, dict):
                 return None
+            n = p.get("number")
+            if not isinstance(n, int) or isinstance(n, bool):
+                return None
+            head = p.get("head")
+            if head is not None and not isinstance(head, dict):
+                return None
+            if p.get("merged_at") is not None and not isinstance(p.get("merged_at"), str):
+                return None
+            # ⛔ THE REPEAT CHECK COMES FIRST -- BEFORE the closed-without-merge filter, and its
+            # set holds EVERY row's number, dropped ones included. The repeat is evidence about
+            # the LIST, not about which rows count: the row that shifts the live order mid-read
+            # is very often an unmerged closed PR (bot churn, a superseded PR closed, a
+            # re-labelled one), and filtering it out BEFORE the check hid the only sound signal
+            # the read has. Measured: 100 unmerged rows on page 1, then one PR merges (now at
+            # offset 0) and an unmerged row repeats on page 2 -- the guard never fired and the
+            # read returned 0 rows, a REAL "0 merged today" line while the truth was 1. That is
+            # the false zero this file's header says was fixed on 2026-10-01, and the one error
+            # this fallback must not add.
+            if n in numbers:
+                # ⛔ A REPEAT PROVES THE LIST MOVED DURING THE READ, and a moved list is also a
+                # SHORT one: the row that entered at the head after page 1 was read is at
+                # offset 0 and will be returned by NO page. Deduping would hide the
+                # double-count and leave `merged_today` short by every merge that landed
+                # mid-read -- so refuse the whole read instead (see the docstring).
+                return None
+            numbers.add(n)
             if state != "open" and not p.get("merged_at"):
                 continue      # closed-without-merge is not a merged PR
-            n = p.get("number")
-            if n in numbers:
-                # ⛔ OFFSET PAGING OVER A LIVE LIST CAN REPEAT A ROW. `sort=updated&direction=desc`
-                # re-sorts between two requests, so a PR updated mid-read jumps to the front and
-                # pushes one row across the (page-1)*per_page boundary: it is returned by BOTH
-                # pages. Measured (200-row read, one PR re-sorted before page 2): 200 rows, 198
-                # distinct, [99, 150] repeated -- and `compute()` COUNTS `out`, so a duplicated
-                # merged-today row inflated `merged_today` and a duplicated open row inflated
-                # `open_prs`. Dedupe by `number`, the identity both call sites count.
-                continue
-            numbers.add(n)
             out.append({
-                "number": p.get("number"),
+                "number": n,
                 "title": p.get("title") or "",
-                "headRefName": (p.get("head") or {}).get("ref") or "",
+                "headRefName": (head or {}).get("ref") or "",
                 "mergedAt": p.get("merged_at") or "",
             })
         seen += len(keep)
@@ -375,7 +410,18 @@ def main():
     except Exception:
         pass
     if data is None:
-        data = compute()
+        # ⛔ EXIT 0 ALWAYS (module header), AND A LINE ALWAYS. `compute()` is a pile of
+        # compares, hashes and dereferences over data an API returned; an unexpected shape must
+        # reach the operator as the honest `unavailable` line, not as a traceback to /dev/null.
+        # Measured before this guard: a page whose `number` was an object raised TypeError out of
+        # `sys.exit(main())` and printed NOTHING, while `orchestrator-heartbeat.sh:181` pipes
+        # stderr away -- the exact "reports nothing instead of the line it can prove" failure this
+        # file exists to avoid. The row guards above make that payload unreachable; this keeps a
+        # FUTURE one from taking the beat's measurement down silently.
+        try:
+            data = compute()
+        except Exception:
+            data = None
         if data is None:
             print("DELIVERY: unavailable (metrics read failed)")
             return 0
