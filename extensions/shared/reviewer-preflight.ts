@@ -93,12 +93,23 @@ export const REVIEWER_PREFLIGHT_BRIEF_TEMPLATE = "templates/LANE-BRIEF.md";
 const HEAD_BINDING =
   "a record bound to an older head is stale and the rail refuses it, so record AFTER the last push";
 
-/** "…dispatch; …record; …rail" — shared by both roles so the two lines cannot diverge. */
+/**
+ * The tail every self-role line carries: the three commands, plus the ARTIFACT requirement.
+ *
+ * ⛔ `--evidence comment:<id>` has no referent unless the lane is told to POST the verdict as a PR
+ * comment (fresh review of this change, P2). Without that sentence the disclosure hands over a
+ * flag whose value the lane must invent, and the missing artifact is discovered from the exit-3
+ * refusal at record time — the same "found out at the finish line" shape the issue is about.
+ */
+const ARTIFACT_RULE =
+  "post the reviewer's verdict as a PR comment — that comment IS the --evidence artifact";
+
+/** "…dispatch; …record; …rail; …artifact" — shared by both roles so the lines cannot diverge. */
 function commandTrail(): string {
   return (
     `dispatch: ${REVIEWER_PREFLIGHT_DISPATCH_CMD}; ` +
     `record: ${REVIEWER_PREFLIGHT_RECORD_CMD}; ` +
-    `rail: ${REVIEWER_PREFLIGHT_RAIL_CMD}`
+    `rail: ${REVIEWER_PREFLIGHT_RAIL_CMD}; ${ARTIFACT_RULE}`
   );
 }
 

@@ -71,6 +71,8 @@ ck $rc "…naming the record command WITH --evidence (a fresh 'clean' without it
 case "$LINE" in *"scripts/admin-merge.sh <PR>"*) rc=0;; *) rc=1;; esac; ck $rc "…naming the rail command"
 case "$LINE" in *"AFTER the last push"*) rc=0;; *) rc=1;; esac
 ck $rc "…and WHEN to record (a stale record is refused, so 'record' alone is a trap)"
+case "$LINE" in *"post the reviewer's verdict as a PR comment"*) rc=0;; *) rc=1;; esac
+ck $rc "…and that the verdict must be POSTED as a PR comment (the --evidence artifact's referent)"
 
 echo
 echo "§B the two roles"

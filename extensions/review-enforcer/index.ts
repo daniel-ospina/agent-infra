@@ -32,7 +32,6 @@ import {
   reviewerPreflightLine,
   reviewerPreflightMessage,
   reviewerFirstPushNotice,
-  reviewerRoleFor,
   REVIEWER_PREFLIGHT_RECORD_CMD,
 } from "../shared/reviewer-preflight.js";
 // Re-exported public surface (tests and external consumers import from
@@ -381,8 +380,11 @@ export function isPushOrPrCreateCommand(command: string): boolean {
 
 /**
  * #2148 — WHICH AUDIENCE the disclosure addresses. The harness exports `KIND` at every worker's
- * spawn point (`lane.sh` → `lane`, `fix-one.sh` → `fixer`, `merge-one.sh` → `reviewer`), so a worker
- * session is identifiable without guessing from the cwd or the brief.
+ * spawn point (`lane.sh` → `lane`, `fix-one.sh` → `fixer`, `merge-one.sh` → `reviewer`,
+ * `nonblocking-dispatch.sh` → `bg`), so a worker session is identifiable without guessing from the
+ * cwd or the brief. A KIND this list does not know falls back to `self` — the SAFER default here is
+ * disclosure over silence: an extra line in an interactive session costs nothing, while a harness
+ * worker told it must land its own PR is a contradiction in its own context.
  *
  * ⛔ This matters because the two audiences are told OPPOSITE things about who dispatches: a
  * `lane.sh` brief says "you have NO task tool — do NOT dispatch … Do NOT merge", so a self-role
@@ -393,7 +395,13 @@ export function reviewerRoleFor(
   env: Record<string, string | undefined> = process.env,
 ): "self" | "harness" {
   const kind = String(env.KIND ?? "").toLowerCase();
-  return kind === "lane" || kind === "fixer" || kind === "reviewer" ? "harness" : "self";
+  // ⛔ `bg` IS A HARNESS WORKER TOO (agent-infra#2148 review). `nonblocking-dispatch.sh` exports
+  // `KIND=bg` for a background worker it launches itself, and its own note says nothing reviews that
+  // worker's PR — the parent/chain does. Leaving it out told a bg worker to dispatch and to run the
+  // rail, repeating the exact contradiction this function exists to prevent, for one more audience.
+  return kind === "lane" || kind === "fixer" || kind === "reviewer" || kind === "bg"
+    ? "harness"
+    : "self";
 }
 
 /**
@@ -2028,7 +2036,10 @@ export function evaluateMergeGate(
           "   → The parent session must record the review for the PR's tier:",
           "   → Micro issue (complexity:micro): record-review.sh <PR> <head_sha> clean-micro [owner/repo]",
           "   → Content-only diff (docs/ with a content extension, or a named root prose file — any tier): record-review.sh <PR> <head_sha> clean-low [owner/repo]",
-          "   → Standard/complex issue: run the code-review skill, then record-review.sh <PR> <head_sha> clean [owner/repo]",
+          // #2148 review: `--evidence` is part of the `clean` invocation — `record-review.sh` refuses a
+          // FRESH clean without it (tortoise#7391, exit 3). A refusal that names a command which then
+          // exits 3 hands the lane a second dead end at the moment it tries to land.
+          "   → Standard/complex issue: run the code-review skill, then record-review.sh <PR> <head_sha> clean [owner/repo] --evidence comment:<review-comment-id>",
           "   → The bypass flag does NOT unlock sub-agent merges (#285).",
         ]
       : [
@@ -2037,8 +2048,8 @@ export function evaluateMergeGate(
           "   → Micro issue (complexity:micro): complete the micro flow (pre-flight + a review dispatch naming the diff), then",
           "   →   record-review.sh <PR> <head_sha> clean-micro [owner/repo]",
           "   → Content-only diff (docs/ with a content extension, or a named root prose file — any tier, no code paths): record-review.sh <PR> <head_sha> clean-low [owner/repo]",
-          "   → Standard/complex issue: run the code-review skill (Step 10 records clean on convergence), then",
-          "   →   record-review.sh <PR> <head_sha> clean [owner/repo]",
+          "   → Standard/complex issue: run the code-review skill (Step 10 records clean on convergence), post its verdict as a PR comment, then",
+          "   →   record-review.sh <PR> <head_sha> clean [owner/repo] --evidence comment:<review-comment-id>",
           "   → Emergency: set AGENT_SKIP_REVIEW_GATE=1 (or ELDATO_SKIP_REVIEW_GATE=1) and restart to bypass all gates.",
         ];
     return {
@@ -2055,7 +2066,7 @@ export function evaluateMergeGate(
         `❌ Review record for PR #${pr} has verdict "${record.verdict}" — only ${ACCEPTED_VERDICTS.map((v) => `"${v}"`).join(", ")} unlocks a merge.`,
         "   → Micro issue (complexity:micro): re-record via the micro flow: record-review.sh <PR> <head_sha> clean-micro [owner/repo]",
         "   → Content-only diff (docs/ with a content extension, or a named root prose file — any tier): record-review.sh <PR> <head_sha> clean-low [owner/repo]",
-        "   → Standard/complex issue with any code path: run the code-review skill, then record-review.sh <PR> <head_sha> clean [owner/repo]",
+        "   → Standard/complex issue with any code path: run the code-review skill, post its verdict as a PR comment, then record-review.sh <PR> <head_sha> clean [owner/repo] --evidence comment:<review-comment-id>",
       ].join("\n"),
     };
   }
@@ -2160,8 +2171,8 @@ export function evaluateMergeGate(
     // The shape has to be re-derived, not carried forward.
     const reRecordAdvice =
       record.verdict === "clean-low"
-        ? "   → The branch moved — the certified diff no longer exists, so the shape must be re-derived: re-check whether the NEW head is still content-only, then re-record with the verdict named explicitly (record-review.sh <PR> <head_sha> clean-low [owner/repo]); if it is no longer content-only, run the code-review skill and record clean (record-review.sh <PR> <head_sha> clean [owner/repo])."
-        : `   → The branch moved — re-review the new head and re-record at the same verdict: record-review.sh <PR> <head_sha> ${record.verdict} [owner/repo]`;
+        ? "   → The branch moved — the certified diff no longer exists, so the shape must be re-derived: re-check whether the NEW head is still content-only, then re-record with the verdict named explicitly (record-review.sh <PR> <head_sha> clean-low [owner/repo]); if it is no longer content-only, run the code-review skill and record clean (record-review.sh <PR> <head_sha> clean [owner/repo] --evidence comment:<review-comment-id>)."
+        : `   → The branch moved — re-review the new head, post its verdict as a PR comment, and re-record at the same verdict: record-review.sh <PR> <head_sha> ${record.verdict} [owner/repo] (a clean verdict also needs --evidence comment:<review-comment-id>; clean-low/clean-micro do not)`;
     return {
       status: "block",
       reason: [

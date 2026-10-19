@@ -83,6 +83,13 @@ ok(
   line.includes("AFTER the last push"),
   "it says WHEN to record: a record bound to an older head is stale and the refusal is otherwise a surprise",
 );
+// ⛔ `--evidence comment:<id>` needs a referent. Without "post the verdict as a PR comment" the lane
+// must invent the artifact, and the missing one is discovered from an exit-3 refusal at record time
+// — the "found out at the finish line" shape this issue exists to end (fresh review, P2).
+ok(
+  line.includes("post the reviewer's verdict as a PR comment"),
+  "it says the verdict must be POSTED as a PR comment (that comment is the --evidence artifact)",
+);
 
 // ── (b) the two roles ─────────────────────────────────────────────────────────
 const harnessLine = reviewerPreflightLine({ role: "harness" });

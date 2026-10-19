@@ -53,9 +53,14 @@ reviewer_rail_cmd() {
   printf 'scripts/%s-%s.sh <PR>' "$(printf 'a%s' 'dmin')" "$(printf 'mer%s' 'ge')"
 }
 
-reviewer_command_trail() { # dispatch/record/rail on one line
-  printf 'dispatch: %s; record: %s; rail: %s' \
-    "$REVIEWER_PREFLIGHT_DISPATCH_CMD" "$REVIEWER_PREFLIGHT_RECORD_CMD" "$(reviewer_rail_cmd)"
+# The artifact rule: `--evidence comment:<id>` has no referent unless the lane is told to POST the
+# verdict as a PR comment (fresh review of #2148, P2). Same wording as the TS `ARTIFACT_RULE`.
+REVIEWER_ARTIFACT_RULE="post the reviewer's verdict as a PR comment — that comment IS the --evidence artifact"
+
+reviewer_command_trail() { # dispatch/record/rail/artifact on one line
+  printf 'dispatch: %s; record: %s; rail: %s; %s' \
+    "$REVIEWER_PREFLIGHT_DISPATCH_CMD" "$REVIEWER_PREFLIGHT_RECORD_CMD" "$(reviewer_rail_cmd)" \
+    "$REVIEWER_ARTIFACT_RULE"
 }
 
 # reviewer_preflight_line [self|harness] — ONE line, printed once, before any work starts.

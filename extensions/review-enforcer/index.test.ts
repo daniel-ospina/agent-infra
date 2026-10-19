@@ -6223,6 +6223,15 @@ testAsync("#2148: the RAIL still refuses without an attestation, and the refusal
       ok(res && res.block === true, "the merge is refused without an attestation (unchanged)");
       ok((res.reason as string).includes("No review record"), "the refusal says what is missing");
       ok((res.reason as string).includes("record-review.sh"), "…and NAMES the command that satisfies it");
+      // Not just the script's NAME: the invocation must be one that WORKS. A fresh `clean` without
+      // `--evidence` is refused by record-review.sh (tortoise#7391, exit 3) — so a refusal that
+      // omits it hands the lane a second dead end at the finish line, which is this issue's whole
+      // shape. A fresh review measured the first version of this change doing exactly that in the
+      // MERGE-GATE messages while the block message had been fixed.
+      ok(
+        (res.reason as string).includes("clean [owner/repo] --evidence comment:"),
+        "…the invocation CARRIES --evidence (a fresh clean without it exits 3)",
+      );
       ok((res.reason as string).includes(`#${pr}`), "…for THIS PR, so the lane need not guess the number");
       ok(tempAuditLines().some((l) => l.event === "merge_gate_block"), "the refusal is still audited");
       // The same requirement must also be on the dispatch-count block: a lane that satisfies the
@@ -6288,6 +6297,10 @@ test("#2148: reviewerRoleFor — the harness's KIND decides the audience (the tw
   equal(reviewerRoleFor({ KIND: "fixer" }), "harness", "fix-one.sh's fixer");
   equal(reviewerRoleFor({ KIND: "reviewer" }), "harness", "merge-one.sh's reviewer session");
   equal(reviewerRoleFor({ KIND: "LANE" }), "harness", "case-insensitive (the env is not normalised by the launcher)");
+  // ⛔ `bg` is a harness worker too (nonblocking-dispatch.sh): nothing reviews its PR — the parent
+  // does — so the self-role line would tell it to dispatch and to run the rail, the exact
+  // contradiction the role split exists to prevent. Named so omitting it goes red.
+  equal(reviewerRoleFor({ KIND: "bg" }), "harness", "nonblocking-dispatch.sh's background worker");
   equal(reviewerRoleFor({}), "self", "no harness marker → a self-landing session");
   equal(reviewerRoleFor({ KIND: "something-else" }), "self", "an unrelated KIND is not claimed as a harness worker");
 });
