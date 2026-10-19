@@ -123,9 +123,13 @@ follows are the reusable ones:
   entry in `last-limit`. The token is read from `GH_TOKEN`/`GITHUB_TOKEN`, else the `oauth_token`
   of the **`github.com:` block** in `${GH_CONFIG_DIR:-~/.config/gh}/hosts.yml` (a `hosts.yml` that
   lists another host first must not donate that host's token — it answers 401 against
-  `api.github.com`), else `gh auth token` for a keyring-backed config; that lookup is OFFLINE and
-  the layer does not count it as a request. The token is never logged, and a box with no credential
-  at all refuses (`unavailable`) rather than reading anonymously.
+  `api.github.com`; nor may a token nested under a per-account `users:` map, which is a different
+  account and is skipped by depth — so a multi-account config falls through to `gh auth token`,
+  i.e. the ACTIVE account), else `gh auth token` for a keyring-backed config; that lookup is
+  OFFLINE and the layer does not count it as a request. The token is never logged — pinned at the
+  finder as well as the transport, since a `print()` inside `_token()` is upstream of the value
+  the rest of the file sees — and a box with no credential at all refuses (`unavailable`) rather
+  than reading anonymously.
 
 **Not covered by this fallback, stated rather than assumed:** the two `gh issue list` reads (the
 P0/P1 tiers) are still GraphQL, so where the adapter is absent a refusal there still takes the
