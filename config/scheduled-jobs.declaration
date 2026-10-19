@@ -160,6 +160,17 @@ job branch-reaper
   owner=install-launchd.sh
   label=com.tortoise.branch-reaper
 
+job worktree-hygiene
+  description=worktree-hygiene sweep (worktree + branch halves, #1095/#4408) — owned by install-launchd.sh
+  platforms=darwin
+  schedule=21600s
+  script=worktree-hygiene-sweep.sh
+  runner=bash
+  managed=no
+  owner=install-launchd.sh
+  label=com.tortoise.worktree-hygiene
+  env WORKTREE_HYGIENE_MODE=@state/worktree-hygiene-mode
+
 job ci-runner-gate
   description=ci runner gate probe
   platforms=darwin
