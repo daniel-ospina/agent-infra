@@ -155,12 +155,22 @@ def _token():
 
     ⛔ AND DEPTH-ASSOCIATED: the key must be one of the BLOCK's OWN keys, not merely indented
     somewhere under it. gh's multi-account config nests per-user credentials under a `users:`
-    map, and the nested entry comes FIRST -- so "first `oauth_token:` inside the github.com
-    block" returns ANOTHER account's token, which answers 401/404 against api.github.com (the
-    same "REST is down" disguise) or spends a different account's quota. The block's direct
-    child depth is fixed by its first indented line; anything deeper is a nested map and is
-    skipped, which leaves a multi-account config with no file token at all -- and `gh auth
-    token` then answers with the ACTIVE account, which is the account gh itself would use.
+    map, and those nested entries come FIRST -- so "first `oauth_token:` inside the github.com
+    block" can hand back ANOTHER account's token, which answers 401/404 against api.github.com
+    (the same "REST is down" disguise) or spends a different account's quota. The block's
+    direct child depth is fixed by its first indented line; anything deeper is a nested map and
+    is skipped.
+
+    ⛔ WHAT THAT LEAVES, measured rather than assumed: the block's OWN `oauth_token:` is what gh
+    itself uses. When it switches accounts gh MOVES the active user's token up to block level
+    (`activateUser`), so a config carrying both a `users:` map and a block-level token answers
+    with the ACTIVE account's token and never reaches `gh auth token` (measured: the mixed
+    shape returns the block-level token with no subprocess call). Only when the token is absent
+    from the file -- keyring-backed, or every entry nested -- does this fall through to
+    `gh auth token --hostname github.com`, which answers the ACTIVE account by its own docs.
+    The user's own `user:`/`users:` pick is not separately modelled because it does not need to
+    be: the block-level token already IS gh's answer. Neither branch can return another
+    account's token, which is the property this function has to hold.
     """
     for var in ("GH_TOKEN", "GITHUB_TOKEN"):
         if os.environ.get(var):
@@ -243,6 +253,14 @@ def _rest_prs(state, limit=100, deadline=None):
     the SAME one, because a per-read budget doubles the phase's worst case inside a tick that
     is killed (see `REST_BUDGET_S`).
 
+    ⛔ THE OFFSET WINDOW IS BOUNDED IN BOTH DIRECTIONS, and both bounds are stated rather than
+    assumed. (i) A row updated BETWEEN two requests re-sorts across the boundary and is
+    returned twice; rows are therefore deduped by `number`, which removes the DOUBLE-COUNT.
+    (ii) The same shift can DROP one row off the tail of the window, and dedupe does not
+    address that -- an offset page cannot, which is why the window is sorted `updated desc`
+    (a PR merged today was updated today, so it stays in the head of the window) and why the
+    bound below is a bound, not a guarantee.
+
     `sort=updated&direction=desc` is what makes the window SOUND for `merged_today`, and the
     bound is worth stating exactly: the window is the 400 most-recently-UPDATED **closed** PRs,
     and rows closed without merging are dropped AFTER the window is read. So it is today's
@@ -257,6 +275,7 @@ def _rest_prs(state, limit=100, deadline=None):
     if deadline is None:
         deadline = time.time() + REST_BUDGET_S
     out, seen, page = [], 0, 1
+    numbers = set()      # a row updated between requests shifts across the page boundary
     while seen < limit:
         remaining = deadline - time.time()
         if remaining <= 0:
@@ -276,6 +295,17 @@ def _rest_prs(state, limit=100, deadline=None):
                 return None
             if state != "open" and not p.get("merged_at"):
                 continue      # closed-without-merge is not a merged PR
+            n = p.get("number")
+            if n in numbers:
+                # ⛔ OFFSET PAGING OVER A LIVE LIST CAN REPEAT A ROW. `sort=updated&direction=desc`
+                # re-sorts between two requests, so a PR updated mid-read jumps to the front and
+                # pushes one row across the (page-1)*per_page boundary: it is returned by BOTH
+                # pages. Measured (200-row read, one PR re-sorted before page 2): 200 rows, 198
+                # distinct, [99, 150] repeated -- and `compute()` COUNTS `out`, so a duplicated
+                # merged-today row inflated `merged_today` and a duplicated open row inflated
+                # `open_prs`. Dedupe by `number`, the identity both call sites count.
+                continue
+            numbers.add(n)
             out.append({
                 "number": p.get("number"),
                 "title": p.get("title") or "",
