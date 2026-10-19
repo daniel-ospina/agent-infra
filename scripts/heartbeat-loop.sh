@@ -503,11 +503,81 @@ while :; do
       fi
     fi
   fi
-  rc=0
-  if [ "$rc" -ne 0 ]; then
-    printf '%s QUEUE-DISPATCH FAILED rc=%s :: %s\n' "$(date '+%m-%d %H:%M:%S')" "$rc" \
-      "$(tail -1 "$STERR" 2>/dev/null | cut -c1-200)" >> "$LOG"
+  # ⛔ THE EXIT STATUS IS READ FROM A RECORD, NOT FROM A VARIABLE THAT CANNOT HOLD IT (#1933).
+  # The launch is DETACHED, so nothing in this shell can observe `$?` -- and the old code set
+  # `rc=0` and then tested it, a branch that could never fire. MEASURED 2026-10-18 over
+  # `$STATE/pr-doctor.launchd.log` (first line 2026-10-10T22:49 -> 2026-10-18T21:32): 382 passes,
+  # 320 of them `LANE READ FAILED` (241 carrying `TimeoutExpired`), and TWO passes that ever
+  # dispatched (2026-10-11) -- while this log printed "launched detached" on every pass and the
+  # fleet's heartbeat reported `pr-doctor dispatches: running=12..23` from QUEUE STATE. (The
+  # heartbeat's own `$STATE/pr-doctor.log` carried the fleet intermittently: 87 passes with
+  # `dispatched >0` since 2026-10-10, 48 of them on 2026-10-17 alone. "Nothing dispatched for six
+  # days" is FALSE; "the SCHEDULED path dispatched twice ever" is what the record says.)
+  #
+  # So the child now records its OWN verdict (`$STATE/pr-doctor.status.json`, written on every
+  # exit path), and this pass reports it. Two readers, because the dispatcher has TWO launchers
+  # that fail independently: this loop (detached child -> sidecar) and launchd (own last-exit
+  # status). Both are printed, so "the scheduler is dead" cannot hide behind "the heartbeat is
+  # alive" -- or the reverse.
+  # A DISARMED dispatcher is a HEALTHY state, not a RED one (2026-10-18, review): the marker stops the
+  # sidecar from being written, so the age bound below would report RED on every pass forever and
+  # bury a real failure. Named here, once, in the same vocabulary `objective.py` uses.
+  if [ -f "$STATE/PR-DOCTOR-OFF" ]; then
+    printf '%s PR-DOCTOR DISARMED -- %s is set; no pass is expected (remove it to resume)\n' \
+      "$(date '+%m-%d %H:%M:%S')" "$STATE/PR-DOCTOR-OFF" >> "$LOG"
+  elif [ -f "$STATE/pr-doctor.status.json" ]; then
+    _pd="$(/usr/bin/python3 -c 'import json,sys,time
+try:
+    d=json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+_rc=d.get("rc")
+_r=int(_rc) if isinstance(_rc,int) else -1
+print("%d|%d|%s|%s" % (_r, int(max(0, time.time()-float(d.get("at_epoch") or 0))),
+                       "1" if d.get("dry_run") else "0",
+                       str(d.get("reason") or "")[:180]))' "$STATE/pr-doctor.status.json" 2>/dev/null)"
+    if [ -n "$_pd" ]; then
+      _prc="${_pd%%|*}"; _prest="${_pd#*|}"; _page="${_prest%%|*}"; _prest="${_prest#*|}"
+      _pdry="${_prest%%|*}"; _pwhy="${_prest#*|}"
+      # ⛔ A STALE VERDICT IS NOT `ok` (2026-10-18, review). The whole point of reading a record is
+      # to notice when nothing is writing it; printing `ok` from a week-old file reproduces exactly
+      # the failure this block was added to end. Bound = two 1200s dispatch intervals.
+      if [ "${_prc:-0}" -ne 0 ]; then
+        printf '%s PR-DOCTOR RED rc=%s (%ss ago) :: %s\n' \
+          "$(date '+%m-%d %H:%M:%S')" "$_prc" "${_page:-?}" "$_pwhy" >> "$LOG"
+      elif [ "${_pdry:-0}" = "1" ]; then
+        printf '%s PR-DOCTOR DRY RUN (not a pass verdict, %ss ago) :: %s\n' \
+          "$(date '+%m-%d %H:%M:%S')" "${_page:-?}" "$_pwhy" >> "$LOG"
+      elif [ "${_page:-0}" -gt 2400 ]; then
+        printf '%s PR-DOCTOR RED UNREPORTED (verdict is STALE: %ss old) :: %s\n' \
+          "$(date '+%m-%d %H:%M:%S')" "$_page" "$_pwhy" >> "$LOG"
+      else
+        printf '%s PR-DOCTOR ok rc=0 (%ss ago) :: %s\n' \
+          "$(date '+%m-%d %H:%M:%S')" "${_page:-?}" "$_pwhy" >> "$LOG"
+      fi
+    else
+      # ⛔ SILENCE IS THE DEFECT THIS WHOLE BLOCK EXISTS TO END (#1933). An unparseable record used
+      # to print NOTHING -- a broken instrument reading as a healthy pass.
+      printf '%s PR-DOCTOR RED UNREPORTED -- the status record at %s is UNREADABLE (not JSON, or no rc field); the pass cannot be classified. See %s\n' \
+        "$(date '+%m-%d %H:%M:%S')" "$STATE/pr-doctor.status.json" "$STATE/pr-doctor.log" >> "$LOG"
+    fi
+  else
+    printf '%s PR-DOCTOR UNREPORTED -- no status record at %s (the run has never exited, or it\n  died before writing one: check %s)\n' \
+      "$(date '+%m-%d %H:%M:%S')" "$STATE/pr-doctor.status.json" "$STATE/pr-doctor.log" >> "$LOG"
   fi
+  # The SCHEDULED job is a separate component: its verdict is final only when it is NOT running
+  # (a live pid's second column is the PREVIOUS run's status, so it is not a verdict yet).
+  _plline=$(launchctl list 2>/dev/null | awk -v l=com.tortoise.pr-doctor '$3==l {print $1" "$2}')
+  _plpid=${_plline%% *}
+  _plcode=${_plline#* }
+  # `-` in the status column means "not running and NO last-exit code recorded", which is not a
+  # failure to report as one -- an earlier version printed `LAUNCHD RED (last exit -)`.
+  if [ -n "$_plline" ] && [ "$_plpid" = "-" ] && [ -n "$_plcode" ] && [ "$_plcode" != "0" ] \
+     && [ "$_plcode" != "-" ] && [ "$_plcode" != "$_plline" ]; then
+    printf '%s PR-DOCTOR LAUNCHD RED (last exit %s) -- the scheduled job is failing; stdout is %s\n' \
+      "$(date '+%m-%d %H:%M:%S')" "$_plcode" "$STATE/pr-doctor.launchd.log" >> "$LOG"
+  fi
+  rc=0
   EL=$(elapsed); SLP=$(( TARGET - EL )); [ "$SLP" -lt 5 ] && SLP=5
   printf '%s PASS done in %ss (target %ss) sleeping %ss\n' \
     "$(date '+%m-%d %H:%M:%S')" "$EL" "$TARGET" "$SLP" >> "$LOG"

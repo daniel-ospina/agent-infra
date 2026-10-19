@@ -204,6 +204,7 @@ processes in tmux sessions, so a killed worker cannot take the controller down w
 | `candidates.txt` | the dispatch backlog: issue numbers that passed collision pre-flight |
 | `dispatched.txt` | issues already handed to a lane — **pruned** when the issue is still open, no PR branch matches it and no `lane-<N>` is live (see §7.1) |
 | `checked.txt` | issues whose pre-flight returned **CLEAN** (the terminal verdict); an **errored** pre-flight and a **COLLISION** leave no entry, so the next pass re-attempts them (agent-infra#1716). A reaped number is dropped from it too, so the pre-flight re-queues the issue |
+| `state/collided` | `"<expiry-epoch> <issue>"` per line — candidates a peer was holding at the last pre-flight. A pass walks PAST a fresh record without spending a pre-flight run, so a blocked pool HEAD is not re-bought on every pass; a skipped candidate stays out of `candidates.txt` and out of `checked.txt`, so it is **deferred, never dropped** — the record lapses after `POOL_COLLISION_TTL` (900 s) and the candidate is judged again (agent-infra#1729). Only a COLLISION is recorded: a DEGRADED / INCOMPLETE / verdict-less answer is an environment failure and stays visible on every pass (agent-infra#1736) |
 | `state/mergeclaim-<PR>.lock` | single-owner claim: only one worker may review/record/merge a given PR |
 | `state/needsfix-<PR>-<head>` | "a reviewer found real issues at this exact head" |
 | `state/fixcount-<PR>` | fixer attempts for that PR, capped by `MAX_FIX_TRIES` |
@@ -1061,18 +1062,38 @@ Measured in `~/.pi/agent/state/pr-doctor.log`, read 2026-10-18T00:42Z:
 Counted as distinct timestamps, with `pass:` lines as the successes. The un-wedger could not read the
 thing it un-wedges for a large share of a day, and each failed pass dispatched nothing.
 
-**Status: PARTIAL — the polarity is IMPLEMENTED, the bound is a GAP.** `lane-status.py:1689` raises
-`SystemExit(3)` rather than publish an empty roster; `lane-actions.py:153` refuses a `degraded`
-snapshot; `queue-dispatch.py:320,377` raises `LaneReadError` naming the timeout instead of returning
-`[]`; `pr-doctor.py:809-819` refuses the pass **when it has work to place** — and deliberately
+**Status: PARTIAL — a WHOLE-READ budget now exists for the lane roster, and the reader it wraps
+still has none of its own.** The polarity is IMPLEMENTED: `lane-status.py` raises `SystemExit(3)`
+rather than publish an empty roster; `lane-actions.py` refuses a `degraded` snapshot
+(`_refuse_if_degraded`); `queue-dispatch.py` raises `LaneReadError` naming the timeout instead of
+returning `[]`; `pr-doctor.py` refuses the pass **when it has work to place** — and deliberately
 stays exit 0 on a blind read with nothing classified, because manufacturing a failure out of an idle
-beat is its own defect (`:812-819`). What does not exist is a deadline
-inside the READER, and `queue-dispatch.py:110` says so outright — *"lane-status.py has no internal
-deadline, so this is the only stop between a stalled scan and an unbounded wait"*. Every bound on the
-WHOLE read is a CALLER's — 300 s (`lane-actions.py:1528`), 600 s (`queue-dispatch.py:110`), 600 s
-(`pr-doctor.py:389`) — which is why the caller fails instead of getting an answer. (The reader does
-hold per-CALL bounds -- 60 s, 45 s, 45 s at `lane-status.py:267,383,599` -- and that is exactly the
-shape this MUST rules out: it bounds each probe and lets their SUM grow with the fleet.)
+beat is its own defect (`:812-819`).
+
+New as of 2026-10-18: `lane-actions.py` takes **one deadline for the whole read** (`--budget`) and
+splits it across its two attempts, so the cached pass can no longer consume the retry's allowance and
+the tool cannot outlive the caller waiting on it; a failed re-scan returns the roster already read
+with `COMPLETENESS UNMEASURED` on stderr instead of discarding a readable datum. `pr-doctor.py`
+consumes the **published** roster (`$STATE/lane-status.last.json` via `lane-actions.py --stdin`,
+**2.8 s measured**) instead of paying a scan on every pass, and falls back to a bounded scan when that
+file is absent, stale, degraded, partition-less or unreadable — saying which happened.
+
+What does NOT exist: a deadline inside `lane-status.py` itself. Every remaining bound on the whole
+read is a CALLER's — `queue-dispatch.py`'s 600 s on its direct `lane-status.py` call, `pr-doctor.py`'s
+`LANE_BUDGET_S + margin` on the fallback scan. (The reader does hold per-CALL bounds — 60 s, 45 s,
+45 s — and that is exactly the shape this MUST rules out: it bounds each probe and lets their SUM grow
+with the fleet.) `queue-dispatch.py` still prints the residual: *"lane-status.py has no internal
+deadline, so this is the only stop between a stalled scan and an unbounded wait"*.
+
+⛔ AND THE PASS MUST SAY WHAT IT DID. A dispatcher that refuses is a failure the fleet can see: every
+exit of `pr-doctor.py` writes `$STATE/pr-doctor.status.json` (`rc`, a one-line reason, the PRs that
+went out) and prints `dispatched N of M queued — <why>`, so `dispatched 0` is never healthy while the
+queue has runnable items; `objective.py` renders the last pass's verdict as `PR-DOCTOR(last run):
+RED rc=N Nm ago — <reason>` beside the queue's own shape, and `heartbeat-loop.sh` prints the same
+verdict and launchd's last exit. `queue-dispatch.py` consumes that record's `issue_work` field as a
+**gate**: new issue work is SKIPPED while un-owned PRs exist, and the gate refuses only on a positive,
+FRESH reading (a missing, stale, unreadable or refused record blocks nothing and says so).
+
 agent-infra#1774, #1788.
 
 ### 6.5.3 Ancestry is the safety rail
@@ -1883,7 +1904,8 @@ algorithmic advantage. The claim worth evaluating is *utilisation*, not *efficie
 | `gh-limit.test.sh` | #1988 the layer UNDER every gh call: one call in flight per box — the retry path AND the `/rate_limit` probe (measured from the stub's own timestamps, with an unserialised control that MUST overlap), the documented backoff order (`retry-after` → the bucket's reset → ≥60s doubling, 4 attempts, then a loud failure), the failing bucket NAMED, `>= 1s` between mutations, conditional REST (`if-none-match` → a 304 replayed byte-exactly from a bounded cache), and the shim surviving the `/opt/homebrew` PATH prepend in every gh-calling script. Fake clock, stub gh, hermetic, a CI shard |
 | `gh-rest.test.sh` | the `gh` REST adapter's argv-to-argv **TRANSLATION**, offline against a stub `gh`: `pr list --head` must not widen to the newest open PR and `pr comment` must print a URL (both shipped green once, as P0s, when nothing asserted them). Hermetic, a CI shard |
 | `test-crossbox.sh` | drives the real `merge-one.sh` claim acquire + trap release with `gh` stubbed. Not part of the loop |
-| `refresh-scout.test.sh` | the agent-infra#1736 contract — repo-aware scout provisioning, per-repo tool resolution, the permanent/transient refresh split — plus the agent-infra#1850 issue-claim pre-flight verdict table (CLEAN/COLLISION/INCOMPLETE/NOT PROVISIONABLE/unrecognised), the dispatch-side claim, and the fenced + generation-guarded release. Not part of the loop |
+| `refresh-scout.test.sh` | the agent-infra#1736 contract — repo-aware scout provisioning, per-repo tool resolution, the permanent/transient refresh split — plus the agent-infra#1850 issue-claim pre-flight verdict table (CLEAN/COLLISION/INCOMPLETE/NOT PROVISIONABLE/unrecognised), the dispatch-side claim, and the fenced + generation-guarded release. Also the agent-infra#1729 pass budget: a blocked pool HEAD does not consume the window, the collision ledger defers (never drops) a held candidate, and ONLY a COLLISION is recorded — a DEGRADED answer never is. Not part of the loop |
+| `refresh-quota.test.sh` | the per-pass API **spend** contract (agent-infra#2022 / #1736 follow-up): the board cache is enabled under the TOOL's own seam (`COLLISION_PREFLIGHT_BOARD_CACHE`, not the legacy no-op name the tool treats as a caller-named-cache attack), so one pass rebuilds the board once instead of once per candidate; a pass that can only afford SOME of its window judges those completely, queues work and NAMES the stop; a pass that can afford none refuses TRANSIENTLY — after the `dispatched.txt` reaper has run — rather than reporting an empty backlog. Charges a modeled core budget from a stub `gh`, so it needs no network. A CI shard |
 | `check-port-drift.sh` | gates the tortoise-side removal: fails if the tortoise harness moved past the pinned sync point (`port-provenance.txt`). Not part of the loop |
 | `cloud-cell-doctor.sh` | the cell's scheduled roles — `reap` / `doctor` / `merge` / `hygiene` / `status` (§6.5.7). Launched as tmux `cell-doctor` by `cloud-cell-supervisor.sh start`; `merge` EXECUTES `scripts/admin-merge.sh` and never re-implements it |
 | `cloud-cell-doctor.test.sh` | #1989: drives the shipped doctor and the supervisor's role verbs against stubbed tmux/ps/rail — a lane whose child is still writing is NOT reaped, an attached/human-tty lane is NOT touched, the rail is gated on a clean attestation at the head, a refusal is recorded and not retried at the same head, and `status` FAILS a started cell whose roles never ran. A CI shard |
