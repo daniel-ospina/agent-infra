@@ -95,6 +95,12 @@ MAX_FIX="${MAX_FIX:-3}"
 MAX_FIX_TRIES="${MAX_FIX_TRIES:-3}"
 MIN_SWAP_FREE="${MIN_SWAP_FREE:-600}"
 MIN_MEM_FREE_MB="${MIN_MEM_FREE_MB:-512}"
+# The macOS present-pressure ceilings (agent-infra#1961): the compressor's occupancy as a PERCENT of
+# RAM, and the swapout RATE. Kept here so the plist renders the SAME defaults the loop resolves (§7
+# of selftest.sh holds the two files to one another); the reasoning behind 50 and 200 is recorded
+# beside the loop's own defaults and in README §4.
+MAX_COMPRESSOR_PCT="${MAX_COMPRESSOR_PCT:-50}"
+MAX_SWAPOUT_RATE="${MAX_SWAPOUT_RATE:-200}"
 BATCH="${BATCH:-2}"
 CYC="${CYC:-240}"
 # Drain scope (README §5): auto (count rule) | own (pin own-only) | broad (pin broad).
@@ -540,7 +546,7 @@ esc() { sed_esc "$(xml_esc "$1")"; }
 # different ways: '4x' renders a plist that LIES about the ceiling and still exits 0 (only the loop's
 # own coercion saves the run), while '4&5' renders the literal `4__MAX_LANES__5` -- a syntactically
 # VALID plist (plutil -lint passes) whose value reads as non-numeric downstream.
-for _n in MAX_LOAD MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MAX_FIX MAX_FIX_TRIES MIN_SWAP_FREE MIN_MEM_FREE_MB BATCH CYC; do
+for _n in MAX_LOAD MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MAX_FIX MAX_FIX_TRIES MIN_SWAP_FREE MIN_MEM_FREE_MB MAX_COMPRESSOR_PCT MAX_SWAPOUT_RATE BATCH CYC; do
   _v="${!_n}"
   case "${_v:-}" in
     ''|*[!0-9]*) die "$_n='${_v:-}' is not a whole number — a value here silently opens the gate it configures" ;;
@@ -602,6 +608,8 @@ sed \
   -e "s|__MAX_FIX_TRIES__|$MAX_FIX_TRIES|g" \
   -e "s|__MIN_SWAP_FREE__|$MIN_SWAP_FREE|g" \
   -e "s|__MIN_MEM_FREE_MB__|$MIN_MEM_FREE_MB|g" \
+  -e "s|__MAX_COMPRESSOR_PCT__|$MAX_COMPRESSOR_PCT|g" \
+  -e "s|__MAX_SWAPOUT_RATE__|$MAX_SWAPOUT_RATE|g" \
   -e "s|__BATCH__|$BATCH|g" \
   -e "s|__CYC__|$CYC|g" \
   "$TEMPLATE" > "$RENDER"
@@ -902,6 +910,7 @@ cat <<EOF
   repo      $REPO   ($OR)
   limits    lanes=$MAX_LANES (default: 2.5x cores unless pinned) review=$MAX_REVIEW fix=$MAX_FIX fix_tries=$MAX_FIX_TRIES
             max_load=$MAX_LOAD min_swap_free=${MIN_SWAP_FREE}M min_mem_free_mb=${MIN_MEM_FREE_MB}M batch=$BATCH cycle=${CYC}s
+            macOS pressure: max_compressor_pct=${MAX_COMPRESSOR_PCT}% of RAM max_swapout_rate=${MAX_SWAPOUT_RATE}/s (both inert on Linux, where MIN_SWAP_FREE decides)
             merge_priority_at=${MERGE_PRIORITY_AT} UNOWNED open PRs
 EOF
 

@@ -118,8 +118,9 @@ without a human in the loop:
 
 - **Fan-out:** N simultaneous implementation lanes, each in its own git worktree.
 - **Fan-in:** a per-PR chain that reviews, records the review as a gate artifact, and merges.
-- **Back-pressure:** every cycle is gated on load average and swap, so the box throttles
-  itself instead of thrashing. Above `MERGE_PRIORITY_AT` **unowned** open PRs (25) — open PRs
+- **Back-pressure:** every cycle is gated on load average and on the memory pressure that platform
+  can actually measure (`swap_free` + available RAM on a Linux cell, the compressor's occupancy and the
+  swapout RATE on macOS — agent-infra#1961), so the box throttles itself instead of thrashing. Above `MERGE_PRIORITY_AT` **unowned** open PRs (25) — open PRs
   nothing is currently working, derived from the loop's own worker sessions, cross-box claims and
   unconsumed reviewer-findings markers — the balance shifts to **draining**: new lanes stop being
   dispatched and the reviewer AND fixer headroom rises (`MAX_REVIEW+2` / `MAX_FIX+2`), because a
@@ -618,8 +619,10 @@ secret into a world-readable plist, and launchd inherits no shell environment �
 | `MERGE_PRIORITY_AT` | `25` | above this many **unowned** open PRs (nothing currently working them — no `fix-`/`merge-` session, no live cross-box claim, no unconsumed `needsfix-*` marker), **merging takes priority**: dispatch of new lanes stops (unless none are running) and reviewer **and fixer** headroom rises to `MAX_REVIEW+2` / `MAX_FIX+2`. It was `10` against the TOTAL open count, which capped the fleet on a healthy queue (measured 2026-10-16: `lanes=1` of 32, 59-86% CPU idle, on a cell logging `merge-priority (20 open PRs — draining)` with 17 of those 20 already `BEHIND`/`DIRTY`) |
 | `MAX_FIX` | `3` | concurrent `fix-<PR>` fixers |
 | `MAX_FIX_TRIES` | `3` | per-PR fixer attempts before it is left alone |
-| `MIN_SWAP_FREE` | `600` | MB. ⛔ Two limits worth knowing before trusting it: on a host with **no swap at all** (`SwapTotal: 0`, i.e. a container) the gate is **INERT by design** — `swap_total=0` reads as uninitialised, not as pressure (`orch-loop.sh:1438` for the gate, `:1413-1415` and `:1431` for the rule), so capacity there is decided by load and memory only — and on a host that **has** swap the metric is a level, not a counter: swap that has been used stays used, so a past spike holds the FREE level down and the gate flaps across its own threshold (measured `swap_free=549M<=min_swap_free=600M` at load 5.4 of a 64 ceiling; agent-infra#1961). `MIN_MEM_FREE_MB` is the metric that reflects the present |
-| `MIN_MEM_FREE_MB` | `512` | MB of *available* memory (`MemAvailable` on Linux, else `MemFree`+`Cached`; `free`+`inactive` on macOS). macOS shows pressure as compression with swap flat, so swap alone does not see it |
+| `MIN_SWAP_FREE` | `600` | MB of free swap — **the LINUX swap ceiling only** (agent-infra#1961; on macOS it is measured and logged but decides nothing, because free swap there moves in both directions without pressure changing). On a cell it means the swap pool is close to exhausted, and it only vetoes while available RAM is tight too (#1985) — free swap alone is not pressure on a box with RAM to spare. Two limits worth knowing: a host with **no swap at all** (`SwapTotal: 0`, i.e. a container) has the arm **INERT by design** — `swap_total=0` reads as uninitialised, not as pressure — so capacity there is decided by load and memory only; and on a host that **has** swap, swap that has been used stays used, so a past spike holds the FREE level down and, on macOS, the gate flapped across its own threshold (measured `swap_free=549M<=min_swap_free=600M` at load 5.4 of a 64 ceiling; agent-infra#1961 — which is why macOS no longer reads it) |
+| `MIN_MEM_FREE_MB` | `512` | MB of *available* memory (`MemAvailable` on Linux, else `MemFree`+`Cached`; `free`+`inactive` on macOS). This is the arm that catches a genuinely full box on **both** platforms. ⚠️ On macOS `free`+`inactive` is a GENEROUS figure — a box at 37% compressor occupancy with 73% of swap used still read 1.4 GB of it — which is why the macOS pressure arm below exists beside it |
+| `MAX_COMPRESSOR_PCT` | `50` | **macOS**: refuse while the compressor holds at least this PERCENT of installed RAM (`Pages occupied by compressor`, scaled by `hw.memsize`). A LEVEL, read in one sample — not a counter a past spike can spend. Evidence for 50, measured on the 8 GB box #1961 is about while the fleet was dispatching: the compressor swings **1.5 GB – 3.5 GB (18–43% of RAM)**, so a ceiling near 43% would refuse the very box the issue exists to unblock, and 50% is the first round figure above that working range at which the compressor holds the MAJORITY of RAM. It is a backstop for the case the rate cannot see — a box that has compressed everything it can and has momentarily stopped faulting. `0` disables the arm |
+| `MAX_SWAPOUT_RATE` | `200` | **macOS**: refuse at or above this many pages swapped out per second, measured as the DELTA of `vm_stat`'s `Swapouts` over the interval since the previous cycle. ⛔ The cumulative counter is never compared to anything — a total is spent by a past spike and never recovers, which is #1961's objective. Evidence for 200, same box: **0/s** over a 15 s calm window at a 3.0 GB compressor, **~1,900/s** over a 15 s window while thrashing (29,156 swapouts), and ~10,000/s when a local test suite pounds it — so 200/s sits an order above the measured quiet and an order below the measured thrash. `0` disables the arm |
 | `BATCH` | `2` | issues dispatched per cycle |
 | `CYC` | `240` | seconds between cycles |
 | `STALE_MIN` | `40` | a worker whose log has not grown in this many minutes is presumed hung and its session is killed (§6) |
@@ -630,14 +633,14 @@ secret into a world-readable plist, and launchd inherits no shell environment �
 | `SWEEP_MIN_REMAIN` | `20` | when `x-ratelimit-remaining` is at or below this, the **next** sweep is deferred to the reset rather than hammering the shared bucket (#1762) |
 
 ⛔ **`STALE_MIN`, `SWEEP_MAX_AGE`, `SWEEP_MIN_REMAIN` and the three wall-clock timeouts are NOT rendered into the plist.** The template
-carries 16 placeholders — the ten limits above them, `SCOPE`, `O`, `REPO`, `OR`, `PATH` and `HOME`
+carries 18 placeholders — the twelve limits above them, `SCOPE`, `O`, `REPO`, `OR`, `PATH` and `HOME`
 — and no `__STALE_MIN__`/`__SWEEP_MAX_AGE__`/`__SWEEP_MIN_REMAIN__`/`__LANE_TIMEOUT__`/`__REVIEW_TIMEOUT__`/`__FIX_TIMEOUT__`. So exporting one
 of these and re-running `install.sh` silently has no effect, and a hand-added plist key is
 overwritten by the next render. Set them through `$ENV_FILE` on a cell, or edit the defaults in the
 scripts.
 
 ⛔ **And every limit that IS rendered must be a whole number, in range, and not a template token.**
-The ten are substituted verbatim — deliberately not routed through the escaping path, since a whole
+The twelve are substituted verbatim — deliberately not routed through the escaping path, since a whole
 number has nothing to escape — so `install.sh` validates each before rendering: digits only, at most
 nine of them (`[` errors at or above 2**63, and an errored test reads FALSE, which OPENS the gate it
 configures), `CYC` additionally at least 5 (see below), and no `__…__` pattern, because the sed rules run in order and `OR=__MAX_LANES__`
@@ -649,7 +652,8 @@ refused at both ends, and every limit is coerced *before* its first arithmetic r
 on a non-number is FALSE and a false test in the gate chain OPENS the gate.
 
 ⚠️ **`0` is a valid integer for most limits** — for `MIN_SWAP_FREE`/`MIN_MEM_FREE_MB` it means the
-gate can never bind (disabled). Set one of those only when that is what you mean.
+gate can never bind (disabled), and for `MAX_COMPRESSOR_PCT`/`MAX_SWAPOUT_RATE` it disables that
+macOS pressure arm. Set one of those only when that is what you mean.
 ⛔ **`CYC` is the exception: it has a 5-second floor.** It is the one limit where `0` is not merely
 useless but harmful — `sleep $(( CYC - JIT + RANDOM % (2*JIT+1) ))` becomes `sleep 0` or a negative
 argument, so the controller revisits every cycle with no delay and hammers the GitHub API.
@@ -678,16 +682,23 @@ the band in which the spawn sites hold back (`16`–`99` is now permitted, where
 Closing that needs `can_spawn()` to consult memory as well, which changes the one-line shape its
 self-test extracts from the shipped file; tracked as agent-infra#1732 rather than half-done here.
 
-**Swap, not lanes, is what actually throttles an 8 GB box.** Observed at 15 concurrent workers on the
-original 8 GB host: `swap_free=588M` → dispatch correctly refused. On THAT host raising `MAX_LANES`
-alone buys nothing; it just moves the pressure into the compressor. It is not a general rule, and the
+**What actually throttles an 8 GB box is memory, and WHICH memory reading means that depends on the
+platform** (agent-infra#1961). Observed at 15 concurrent workers on the original 8 GB host:
+`swap_free=588M` → dispatch refused. That is the Linux shape: a cell's swap pool is exhausted and its
+`MemAvailable` is tight with it. On macOS neither half of that reading is trustworthy — the swap file
+GROWS to fit the workload, so free swap rose 1042M → 1432M while the same box thrashed at ~1,900
+swapouts/s with a 2.95 GB compressor — so the macOS arm reads the two present-tense figures instead:
+the compressor's occupancy as a fraction of RAM, and the swapout rate (a delta, never the cumulative
+counter). On THAT host raising `MAX_LANES` alone buys nothing; it just moves the pressure into the
+compressor. It is not a general rule, and the
 lane ceiling was a second, independent cap: on today's 32 GB host capacity was available (21 points
 of `MAX_LOAD` headroom, comfortable swap and memory) while dispatch was refused by a lane count —
 which is why `MAX_LANES` is now derived from cores instead of pinned to a small literal (§4).
 `swap_total=0` right after boot is treated as
 *uninitialised*, not as pressure (that bug silently blocked all dispatch for the first minutes
-after a restart until it was fixed) — and that same rule makes the gate **inert for ever** on a host
-that never has swap, which is a fact to know rather than a defect to fix here (agent-infra#1961).
+after a restart until it was fixed) — and that same rule makes the **Linux** arm **inert for ever** on
+a host that never has swap, which is a fact to know rather than a defect to fix here. On macOS that
+cannot arise: the arm reads `vm_stat`, which every Mac has.
 
 **The capacity probes are portable: Linux cell + macOS host.** `#1702`. Every probe used to be a
 macOS primitive, so on a Linux cell `load1()` returned empty (the `MAX_LOAD` gate could never bind),
@@ -887,15 +898,26 @@ satisfying it.
 
 ```text
 [scope] open=24 -> BROAD (auto)             ← or (pinned SCOPE=own) / (pinned SCOPE=broad)
-[cap] load=7/100 lanes=4/4 mem_avail=11761M/512M swap_free=588M/600M   ← every gate names its ceiling
+[cap] load=7/100 lanes=4/4 mem_avail=11761M/512M press=linux swap_free=588M/600M   ← every gate names its ceiling
 [dispatch] load=7 lanes=4 -> 4429 4489
 [refresh] queue=READ(7) — every priority tier was READ; 7 candidate(s) listed (agent-infra#1931)
 [refresh] +#4508 CLEAN -> backlog
 #8219 FAILED:ai-review-gate          ← per-PR verdict for the required checks
 #8192 fixer attempt 1                ← routed to a fixer, not a re-record
 ...
-[cap] load=104/100 lanes=4/4 mem_avail=11890M/512M swap_free=588M/600M
+[cap] load=104/100 lanes=4/4 mem_avail=11890M/512M press=linux swap_free=588M/600M
 [dispatch] skipped (load=104>=max_load=100)   ← and WHY, naming the binding gate
+```
+
+⛔ **The `[cap]` line carries the metric that DECIDED, and it differs by platform** (agent-infra#1961).
+On a Linux cell that is the swap pair; on macOS it is the compressor against its RAM-derived ceiling
+and the swapout rate against its own (`?` for a reading that does not exist — an unmeasurable probe,
+or the first cycle, where no rate is definable yet). A gate whose inputs are not printed cannot be
+told apart from a flapping fleet:
+
+```text
+[cap] load=5/80 lanes=1/10 mem_avail=1461M/512M press=darwin comp=3025M/4096M swapout=0/s/200
+[dispatch] skipped (swapout=1900/s>=max_swapout_rate=200/s (pages being pushed out now))
 ```
 
 ⛔ **`backlog=0` alone is never a clearance** (agent-infra#1931). The cycle line carries the pool's
@@ -1697,9 +1719,9 @@ were deleted.
 > both closed.
 
 - **`can_spawn()` gates on load only, so the memory ceiling does not cover the five controller spawn
-  sites** (agent-infra#1732). Lane dispatch is bounded by swap and available memory; the five spawn
-  sites are bounded by load alone, so raising `MAX_LOAD` widens the band in which they proceed while
-  memory is already the binding gate. §4 states the gap; this is its tracker item.
+  sites** (agent-infra#1732). Lane dispatch is bounded by memory pressure (per platform — §4); the
+  five spawn sites are bounded by load alone, so raising `MAX_LOAD` widens the band in which they
+  proceed while memory is already the binding gate. §4 states the gap; this is its tracker item.
 - **The check classifier's `(app, name)` grouping and its newest-by-`id` selection cannot take effect
   at the call site** (agent-infra#1733). `gh pr checks --json name,state,workflow` carries no `id` and
   no `app`, so the newest attempt is decided by row order, and two non-Actions checks that share a
@@ -1797,7 +1819,8 @@ Hourly histogram (00:00Z–23:00Z on 2026-10-11, merged / this-box):
 ```
 
 Observed steady state on the original 8 GB host: 15 concurrent workers (4 lanes + 4 chains + 3 fixers +
-4 reviewers), load 7–18, swap 588 M–832 M free, dispatch throttled by the swap gate.
+4 reviewers), load 7–18, swap 588 M–832 M free, dispatch throttled by the memory gate — on that box by
+`swap_free` (it predates #1961; today macOS reads the compressor and the swapout rate instead, §4).
 
 **Honest caveat on the comparison.** Two boxes running this harness against one repo
 duplicate work unless they coordinate: both may pick the same issue, and both run the merge

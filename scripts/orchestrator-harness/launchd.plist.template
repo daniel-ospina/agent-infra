@@ -66,6 +66,13 @@
     <string>__MIN_SWAP_FREE__</string>
     <key>MIN_MEM_FREE_MB</key>
     <string>__MIN_MEM_FREE_MB__</string>
+    <!-- macOS present-pressure ceilings (agent-infra#1961). MAX_COMPRESSOR_PCT is a percentage of
+         installed RAM; MAX_SWAPOUT_RATE is pages/second. Both are inert on a Linux cell, where
+         MIN_SWAP_FREE + MIN_MEM_FREE_MB decide, and either may be pinned to 0 to disable it. -->
+    <key>MAX_COMPRESSOR_PCT</key>
+    <string>__MAX_COMPRESSOR_PCT__</string>
+    <key>MAX_SWAPOUT_RATE</key>
+    <string>__MAX_SWAPOUT_RATE__</string>
     <key>BATCH</key>
     <string>__BATCH__</string>
     <key>CYC</key>

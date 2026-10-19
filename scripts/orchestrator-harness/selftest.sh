@@ -688,7 +688,7 @@ rc=0
 # either file actually uses agree", not "any conceivable bash file agrees".
 #
 # Only lines that assign a KNOWN limit var (or _NCPU, below) are evaluated -- never the whole script.
-_LIMITS="MAX_LOAD MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MAX_FIX MAX_FIX_TRIES MIN_SWAP_FREE MIN_MEM_FREE_MB BATCH CYC"
+_LIMITS="MAX_LOAD MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MAX_FIX MAX_FIX_TRIES MIN_SWAP_FREE MIN_MEM_FREE_MB MAX_COMPRESSOR_PCT MAX_SWAPOUT_RATE BATCH CYC"
 # _NCPU is evaluated but not printed: MAX_LOAD is derived from it, so pinning it here (as an earlier
 # version did) would hide a divergence in the one input the derived ceiling depends on.
 _EVAL_VARS="$_LIMITS _NCPU"
@@ -738,9 +738,9 @@ ck "every limit resolves to a real default in both files (not UNSET=UNSET)" $rcu
 # Its default is derived from `_NCPU` too now, so it cannot sit in a host-independent table — the
 # driver immediately below pins the derivation BEHAVIOURALLY, against a substituted probe instead.
 dval() { printf '%s\n' "$_db" | awk -F= -v k="$1" '$1==k{print $2}' | head -1; }
-expect_lim="BATCH=2 CYC=240 MAX_FIX=3 MAX_FIX_TRIES=3 MAX_REVIEW=4 MERGE_PRIORITY_AT=25 MIN_MEM_FREE_MB=512 MIN_SWAP_FREE=600"
+expect_lim="BATCH=2 CYC=240 MAX_COMPRESSOR_PCT=50 MAX_FIX=3 MAX_FIX_TRIES=3 MAX_REVIEW=4 MAX_SWAPOUT_RATE=200 MERGE_PRIORITY_AT=25 MIN_MEM_FREE_MB=512 MIN_SWAP_FREE=600"
 got_lim=""
-for _k in BATCH CYC MAX_FIX MAX_FIX_TRIES MAX_REVIEW MERGE_PRIORITY_AT MIN_MEM_FREE_MB MIN_SWAP_FREE; do
+for _k in BATCH CYC MAX_COMPRESSOR_PCT MAX_FIX MAX_FIX_TRIES MAX_REVIEW MAX_SWAPOUT_RATE MERGE_PRIORITY_AT MIN_MEM_FREE_MB MIN_SWAP_FREE; do
   got_lim="$got_lim $_k=$(dval "$_k")"
 done
 got_lim="${got_lim# }"
@@ -803,12 +803,14 @@ ck "dispatch skip message names the binding gate" $rc
 # Pin the documented default, then DRIVE the shipped gate chain to prove it is a comparison.
 mem_def="$(dval MIN_MEM_FREE_MB)"
 swp_def="$(dval MIN_SWAP_FREE)"
+comp_def="$(dval MAX_COMPRESSOR_PCT)"
+swo_def="$(dval MAX_SWAPOUT_RATE)"
 [ "$mem_def" = "512" ] && rcd=0 || { rcd=1; echo "      MIN_MEM_FREE_MB resolves to '$mem_def' -- README documents 512"; }
 ck "MIN_MEM_FREE_MB resolves to the documented 512MB default in the shipped files" $rcd
 GATE_BLOCK="$(sed -n '/^  GATE_WHY="\$(mp_reason/,/^  fi$/p' "$LOOP")"
 [ -n "$GATE_BLOCK" ] && rcg=0 || { rcg=1; echo "      the gate chain could not be extracted from $LOOP"; }
 ck "the dispatch gate chain is extractable from the shipped loop" $rcg
-mrw() { # L LANES SWTOTAL SWFREE MEM_UNKNOWN MEMAVAIL_MB MAX_LOAD MAX_LANES MIN_SWAP MIN_MEM [WORKERS]
+mrw() { # L LANES SWTOTAL SWFREE MEM_UNKNOWN MEMAVAIL_MB MAX_LOAD MAX_LANES MIN_SWAP MIN_MEM [WORKERS] [PLAT] [COMP_MB] [COMP_CEIL] [SWO_RATE]
   ( L=$1; LANES=$2; SWTOTAL=$3; SWFREE=$4; MEM_UNKNOWN=$5; MEMAVAIL_MB=$6
     MAX_LOAD=$7; MAX_LANES=$8; MIN_SWAP_FREE=$9; MIN_MEM_FREE_MB=${10}; OPEN_N=0
     # ⛔ WORKERS IS REQUIRED (P3.2, second review round, 2026-10-14). It was omitted, so
@@ -817,6 +819,14 @@ mrw() { # L LANES SWTOTAL SWFREE MEM_UNKNOWN MEMAVAIL_MB MAX_LOAD MAX_LANES MIN_
     # because the gates below it produced the same GATE_WHY, so the gate chain's entry line was
     # UNTESTED. The `WORKERS=${11:-0}` default and the stderr assertion below are the fix.
     WORKERS=${11:-0}
+    # ⛔ THE PRESSURE INPUTS ARE PER PLATFORM NOW (agent-infra#1961), so the fixture must set ALL of
+    # them — including the ones the platform under test does not read. A fixture that set only the
+    # macOS ones would leave the Linux cases passing on unset variables (and vice versa), which is how
+    # a platform branch gets "tested" without ever being driven.
+    PRESS_PLAT=${12:-linux}; COMP_MB=${13:-0}; COMP_CEIL_MB=${14:-0}; SWO_RATE=${15:-}
+    # The ceilings come from the environment when a case pins one (so a NON-DEFAULT ceiling is
+    # distinguishable from a hardcoded 50/200), else from the shipped default.
+    MAX_COMPRESSOR_PCT=${MAX_COMPRESSOR_PCT:-$comp_def}; MAX_SWAPOUT_RATE=${MAX_SWAPOUT_RATE:-$swo_def}
     GATE_WHY=""; mp_reason() { :; }
     eval "$GATE_BLOCK"; printf '%s' "${GATE_WHY:-}" )
 }
@@ -856,6 +866,67 @@ ck "the swap gate does NOT fire when swap is low but ram is ample (#1985)" $rcw
 ck "the swap gate honours a NON-DEFAULT MIN_SWAP_FREE (the ceiling is read, not hardcoded)" $rcw
 [ -z "$(mrw 1 0 2048 750 0 9999 100 4 700 "$mem_def")" ] && rcw=0 || rcw=1
 ck "the swap gate stays shut just above a non-default ceiling" $rcw
+# ══ agent-infra#1961: THE PRESSURE ARM IS PER PLATFORM ═════════════════════════════════════════
+# The gate used one arm reading `swap_free` on BOTH platforms, so on macOS — where the swap file
+# grows to fit the workload and its free portion flaps — it could refuse a calm box and pass a box
+# that was thrashing. These cases drive the SHIPPED chain (`$GATE_BLOCK`) with the platform the
+# production block settles, so reverting to a single unconditional swap arm reddens them.
+#
+# THE REGRESSION PIN: free swap BELOW its ceiling, on macOS, with a calm box. The fixture is chosen
+# so the OLD arm WOULD have fired — `swap_free=549 <= 600` AND `mem_avail=900 <= 2x512` — which is the
+# measured refusal this issue exists to remove (`swap_free=549M<=min_swap_free=600M` at load 5.4 of a
+# 64 ceiling); the new macOS arm does not read swap_free at all, and the box is calm, so it allows.
+# (Mutation-checked against origin/main's chain: that refusal is exactly what this case returns there.)
+[ -z "$(mrw 1 0 4096 549 0 900 100 4 600 "$mem_def" 0 darwin 1000 4096 50)" ] && rcw=0 \
+  || { rcw=1; echo "      got '$(mrw 1 0 4096 549 0 900 100 4 600 "$mem_def" 0 darwin 1000 4096 50)'"; }
+ck "macOS: free swap below its ceiling does NOT veto when the box is calm (#1961)" $rcw
+# The same four inputs while pages ARE being pushed out: it refuses, and it names the metric that
+# decided (the rate) rather than `swap_free` — requirement (b) of the issue.
+[ "$(mrw 1 0 4096 549 0 900 100 4 600 "$mem_def" 0 darwin 1000 4096 1900)" = "swapout=1900/s>=max_swapout_rate=200/s (pages being pushed out now)" ] && rcw=0 \
+  || { rcw=1; echo "      got '$(mrw 1 0 4096 549 0 900 100 4 600 "$mem_def" 0 darwin 1000 4096 1900)'"; }
+ck "macOS: the same box under real pressure refuses and names the RATE, not swap_free" $rcw
+# ...and the same inputs on LINUX still refuse, unreadable-swap-ceiling notwithstanding: the arm is
+# unchanged there (#1985), so the fix must not have disarmed the cell.
+[ "$(mrw 1 0 2048 100 0 100 100 4 700 "$mem_def" 0 linux 1000 2000 "")" = "swap_free=100M<=min_swap_free=700M AND mem_avail=100M<=$(( ${mem_def:-512} * 2 ))M (both tight)" ] && rcw=0 \
+  || { rcw=1; echo "      got '$(mrw 1 0 2048 100 0 100 100 4 700 "$mem_def" 0 linux 1000 2000 "")'"; }
+ck "Linux: the swap arm still fires on swap AND ram tight (the cell's semantics are unchanged)" $rcw
+# The macOS inputs are NOT consulted on Linux, and the Linux ones are NOT consulted on macOS — a
+# branch that leaked one platform's metric into the other would pass the two cases above and still
+# be wrong here.
+[ -z "$(mrw 1 0 2048 2000 0 9999 100 4 600 "$mem_def" 0 linux 9999 9999 9999)" ] && rcw=0 || rcw=1
+ck "Linux: the macOS compressor/rate inputs are ignored (no cross-platform leakage)" $rcw
+[ -z "$(mrw 1 0 2048 100 0 9999 100 4 700 "$mem_def" 0 darwin 0 0 0)" ] && rcw=0 || rcw=1
+ck "macOS: free swap below the ceiling is ignored even at a rate of 0 (swap_free is not an input)" $rcw
+# The RATE arm: it names the rate and its ceiling, fires AT the ceiling, and is a rate (a delta),
+# never the cumulative counter.
+[ "$(mrw 1 0 2048 9999 0 9999 100 4 600 "$mem_def" 0 darwin 0 0 200)" = "swapout=200/s>=max_swapout_rate=200/s (pages being pushed out now)" ] && rcw=0 \
+  || { rcw=1; echo "      got '$(mrw 1 0 2048 9999 0 9999 100 4 600 "$mem_def" 0 darwin 0 0 200)'"; }
+ck "macOS: a swapout rate at the ceiling refuses and NAMES the rate" $rcw
+[ -z "$(mrw 1 0 2048 9999 0 9999 100 4 600 "$mem_def" 0 darwin 0 0 199)" ] && rcw=0 || rcw=1
+ck "macOS: a swapout rate just under the ceiling does not refuse" $rcw
+# An UNDEFINED rate (empty: first cycle, or a reboot between samples) must not read as calm-and-ample
+# on its own — it simply cannot decide, so the LEVEL arms still run. Assert BOTH halves: the empty
+# rate alone allows, and the compressor level in the same fixture still refuses.
+[ -z "$(mrw 1 0 2048 9999 0 9999 100 4 600 "$mem_def" 0 darwin 1000 4000 "")" ] && rcw=0 || rcw=1
+ck "macOS: an UNDEFINED rate does not by itself veto (the level arms still run)" $rcw
+[ "$(MAX_SWAPOUT_RATE=0 mrw 1 0 2048 9999 0 9999 100 4 600 "$mem_def" 0 darwin 0 0 5000)" = "" ] && rcw=0 || rcw=1
+ck "macOS: MAX_SWAPOUT_RATE=0 disables the rate arm (the documented '0 disables' convention)" $rcw
+# The LEVEL arm, and the NON-DEFAULT ceiling that proves the ceiling is read rather than hardcoded.
+[ "$(mrw 1 0 2048 9999 0 9999 100 4 600 "$mem_def" 0 darwin 4000 4000 "")" = "compressor=4000M>=max_compressor=4000M (${comp_def}% of RAM already compressed)" ] && rcw=0 \
+  || { rcw=1; echo "      got '$(mrw 1 0 2048 9999 0 9999 100 4 600 "$mem_def" 0 darwin 4000 4000 "")'"; }
+ck "macOS: the compressor at its RAM-derived ceiling refuses and NAMES the level" $rcw
+[ -z "$(mrw 1 0 2048 9999 0 9999 100 4 600 "$mem_def" 0 darwin 3999 4000 "")" ] && rcw=0 || rcw=1
+ck "macOS: the compressor just under its ceiling does not refuse" $rcw
+[ "$(MAX_COMPRESSOR_PCT=10 mrw 1 0 2048 9999 0 9999 100 4 600 "$mem_def" 0 darwin 900 800 "")" = "compressor=900M>=max_compressor=800M (10% of RAM already compressed)" ] && rcw=0 \
+  || { rcw=1; echo "      got '$(MAX_COMPRESSOR_PCT=10 mrw 1 0 2048 9999 0 9999 100 4 600 "$mem_def" 0 darwin 900 800 "")'"; }
+ck "macOS: a NON-DEFAULT MAX_COMPRESSOR_PCT is honoured (the ceiling is read, not hardcoded)" $rcw
+[ -z "$(MAX_COMPRESSOR_PCT=0 mrw 1 0 2048 9999 0 9999 100 4 600 "$mem_def" 0 darwin 9999 4000 "")" ] && rcw=0 || rcw=1
+ck "macOS: MAX_COMPRESSOR_PCT=0 disables the level arm" $rcw
+# The fail-closed ruling applies to the pressure probes too: an unreadable vm_stat sets MEM_UNKNOWN
+# (mem_avail_mb fails on the same input), and the chain must refuse rather than treat the missing
+# compressor/rate as "no pressure" — the mirror error #1961 calls out.
+[ "$(mrw 1 0 2048 9999 1 0 100 4 600 "$mem_def" 0 darwin 0 0 "")" = "mem_probe_failed (capacity unknown -> do not add work)" ] && rcw=0 || rcw=1
+ck "macOS: an UNMEASURABLE pressure probe refuses (UNKNOWN is not ample) — never read as calm" $rcw
 grep -q 'merge-priority' "$LOOP" && rc=0 || rc=1
 ck "the loop implements merge-priority above the backlog threshold" $rc
 grep -q '= "CONFLICTING"' "$LOOP" && rc=0 || rc=1
@@ -2365,6 +2436,80 @@ if need "$TMP/mem.sh" "mem_avail_mb() is extracted from the shipped loop"; then
   [ "$got" = "NONZERO" ] && rc=0 || { rc=1; echo "      got '$got'"; }
   ck "shipped mem_avail_mb(): an unreadable probe returns non-zero (UNKNOWN), not a false 0" $rc
 fi
+# ══ the macOS PRESENT-PRESSURE probes (agent-infra#1961) ════════════════════════════════════════
+# These are the gate's inputs on macOS, and they replace a metric (`swap_free`) that was measured to
+# flap across its own ceiling while the box thrashed. Each takes a `vm_stat` transcript as a TEST SEAM
+# — the same idiom as `swap_usage_mb`/`mem_avail_mb` — so a macOS probe is exercised WITHOUT a macOS
+# host, and the Linux side of `mem_total_mb` without a Linux host. Non-vacuity is built in: the page
+# size case below fails if the probe hardcodes 16384 (the Intel-Mac over-report), and the "unreadable"
+# cases fail if a failed probe fabricates a 0 (which the gate would read as calm).
+{ grep -m1 '^is_num() {' "$LOOP"; sed -n '/^mem_total_mb() {/,/^}/p' "$LOOP"
+  sed -n '/^compressor_mb() {/,/^}/p' "$LOOP"; sed -n '/^swapouts_count() {/,/^}/p' "$LOOP"
+  sed -n '/^swapout_rate() {/,/^}/p' "$LOOP"; } > "$TMP/press.sh"
+if need "$TMP/press.sh" "the present-pressure probes are extracted from the shipped loop"; then
+  # A 16 KiB-page transcript with 182,182 compressor pages = 182182*16384/1048576 = 2846 MB.
+  printf 'Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free: 4466.\nPages occupied by compressor: 182182.\nSwapouts: 10602129.\n' > "$TMP/vm16.txt"
+  got="$(bash -c ". '$TMP/press.sh'; compressor_mb '$TMP/vm16.txt'")"
+  [ "$got" = "2846" ] && rc=0 || { rc=1; echo "      got '$got'"; }
+  ck "shipped compressor_mb(): a 16 KiB-page transcript yields MB of compressor occupancy" $rc
+  # The PAGE SIZE comes from vm_stat's header. Same page count on a 4 KiB-page Mac = 711 MB; a
+  # hardcoded 16384 would answer 2846 here, i.e. over-report memory 4x (the unsafe direction).
+  printf 'Mach Virtual Memory Statistics: (page size of 4096 bytes)\nPages occupied by compressor: 182182.\nSwapouts: 1.\n' > "$TMP/vm4.txt"
+  got="$(bash -c ". '$TMP/press.sh'; compressor_mb '$TMP/vm4.txt'")"
+  [ "$got" = "711" ] && rc=0 || { rc=1; echo "      got '$got'"; }
+  ck "shipped compressor_mb(): the page size is read from the header (an Intel Mac is not over-reported 4x)" $rc
+  got="$(bash -c ". '$TMP/press.sh'; swapouts_count '$TMP/vm16.txt'")"
+  [ "$got" = "10602129" ] && rc=0 || { rc=1; echo "      got '$got'"; }
+  ck "shipped swapouts_count(): the cumulative Swapouts figure is parsed (only ever to be differenced)" $rc
+  got="$(bash -c "vm_stat() { :; }; . '$TMP/press.sh'; compressor_mb && echo OK || echo NONZERO")"
+  [ "$got" = "NONZERO" ] && rc=0 || { rc=1; echo "      got '$got'"; }
+  ck "shipped compressor_mb(): an unreadable vm_stat returns non-zero, not a false 0 MB" $rc
+  got="$(bash -c "vm_stat() { :; }; . '$TMP/press.sh'; swapouts_count && echo OK || echo NONZERO")"
+  [ "$got" = "NONZERO" ] && rc=0 || { rc=1; echo "      got '$got'"; }
+  ck "shipped swapouts_count(): an unreadable vm_stat returns non-zero, not a false 0" $rc
+  # The RATE — the figure the gate compares, and the reason the cumulative counter is never one. A
+  # total is spent by a past spike; a delta over a measured interval recovers when the spike ends.
+  got="$(bash -c ". '$TMP/press.sh'; swapout_rate 1000 31000 15")"
+  [ "$got" = "2000" ] && rc=0 || { rc=1; echo "      got '$got'"; }
+  ck "shipped swapout_rate(): a delta over the interval yields pages/second" $rc
+  got="$(bash -c ". '$TMP/press.sh'; swapout_rate 31000 1000 15 && echo OK || echo NONZERO")"
+  [ "$got" = "NONZERO" ] && rc=0 || { rc=1; echo "      got '$got'"; }
+  ck "shipped swapout_rate(): a counter that went BACKWARDS (a reboot) yields no rate, not a negative one" $rc
+  got="$(bash -c ". '$TMP/press.sh'; swapout_rate 5 6 0 && echo OK || echo NONZERO")"
+  [ "$got" = "NONZERO" ] && rc=0 || { rc=1; echo "      got '$got'"; }
+  ck "shipped swapout_rate(): an interval under 1s yields no rate (1s resolution -> no divide by zero)" $rc
+  got="$(bash -c ". '$TMP/press.sh'; swapout_rate '' 6 5 && echo OK || echo NONZERO")"
+  [ "$got" = "NONZERO" ] && rc=0 || { rc=1; echo "      got '$got'"; }
+  ck "shipped swapout_rate(): a MISSING previous sample yields no rate (never '0/s is calm')" $rc
+  # Installed RAM scales the compressor ceiling, and it is the ONE probe with a path on both
+  # platforms: /proc/meminfo on a cell, `sysctl hw.memsize` on a Mac.
+  printf 'MemTotal:       16000000 kB\nMemFree:         2048000 kB\n' > "$TMP/meminfo4"
+  got="$(bash -c ". '$TMP/press.sh'; mem_total_mb '$TMP/meminfo4'")"
+  [ "$got" = "15625" ] && rc=0 || { rc=1; echo "      got '$got'"; }
+  ck "shipped mem_total_mb(): the Linux (/proc/meminfo MemTotal) path yields installed MB" $rc
+  got="$(bash -c "sysctl() { echo 8589934592; }; . '$TMP/press.sh'; mem_total_mb '$TMP/absent-meminfo'")"
+  [ "$got" = "8192" ] && rc=0 || { rc=1; echo "      got '$got'"; }
+  ck "shipped mem_total_mb(): the macOS (sysctl hw.memsize) path yields installed MB" $rc
+  got="$(bash -c "sysctl() { echo garbage; }; . '$TMP/press.sh'; mem_total_mb '$TMP/absent-meminfo' && echo OK || echo NONZERO")"
+  [ "$got" = "NONZERO" ] && rc=0 || { rc=1; echo "      got '$got'"; }
+  ck "shipped mem_total_mb(): a non-numeric sysctl yields non-zero, not a fabricated size" $rc
+fi
+# ⛔ OBSERVABILITY (#1961 requirement 3): `[cap]` must print the metric that DECIDED, or an operator
+# cannot tell a flapping gate from an intermittent fleet. The line is asserted to carry the
+# platform-selected field — and the macOS field is asserted to name the compressor AND the rate, the
+# Linux field the swap pair — because a line that printed `swap_free` with a ceiling nothing compares
+# against is exactly the state this issue measured.
+cap_line="$(grep -n '^  echo "\[cap\]' "$LOOP" | head -1 | cut -d: -f2-)"
+{ [ -n "$cap_line" ] && printf '%s' "$cap_line" | grep -q 'PRESS_FIELD'; } && rc=0 || rc=1
+ck "[cap] prints a platform-selected pressure field, not one platform's metric on both" $rc
+{ grep -q 'PRESS_FIELD="press=\$PRESS_PLAT comp=' "$LOOP" && grep -q 'swapout=\${_swo_v}/s/\${_swo_c}' "$LOOP" \
+  && grep -q 'PRESS_FIELD="press=\$PRESS_PLAT swap_free=' "$LOOP"; } && rc=0 || rc=1
+ck "[cap]'s macOS field names the compressor against its ceiling AND the swapout rate (#1961)" $rc
+# And the gate is driven with the ceiling the CAP prints, so the printed ceiling cannot drift from
+# the one the comparison uses: the reason strings above carry the same figures (`max_compressor=`,
+# `max_swapout_rate=`), and every one of those cases reads its ceiling from the fixture.
+grep -q 'COMP_CEIL_MB=$(( _ram \* MAX_COMPRESSOR_PCT / 100 ))' "$LOOP" && rc=0 || rc=1
+ck "the compressor ceiling is DERIVED from installed RAM x MAX_COMPRESSOR_PCT (not a fixed MB)" $rc
 # The regression guard that does not depend on any single spelling of the call site: a macOS-only
 # kernel probe anywhere OUTSIDE the portable helpers is the bug, still shipped. `vm_stat` is included
 # because it is the probe whose Linux absence was the LAST false green (the guard previously scoped
@@ -2374,7 +2519,7 @@ fi
 # mem_avail_mb(), whose call site is asserted separately below.
 outside="$(awk '
   /^[[:space:]]*#/ {next}
-  /^file_mtime_epoch\(\) \{|^load1\(\) \{|^swap_usage_mb\(\) \{|^mem_avail_mb\(\) \{|^res_line\(\) \{/ {h=1}
+  /^file_mtime_epoch\(\) \{|^load1\(\) \{|^swap_usage_mb\(\) \{|^mem_avail_mb\(\) \{|^mem_total_mb\(\) \{|^compressor_mb\(\) \{|^swapouts_count\(\) \{|^swapout_rate\(\) \{|^res_line\(\) \{/ {h=1}
   h && /^\}/ {h=0; next}
   h {next}
   /sysctl -n (vm\.loadavg|vm\.swapusage)|stat -f .%m.|vm_stat/ {print FNR": "$0}
@@ -2463,10 +2608,11 @@ NGRD="$( { grep -F 'is_num() {' "$LOOP"; grep -F 'is_limit() {' "$LOOP"; grep -E
 # coercion lines present -- the guard could not fail while is_num() existed. Count the coercion lines,
 # and count an EXACT number: adding a coercion without adding its pin is the failure this catches.
 _ngrd_n="$(printf '%s\n' "$NGRD" | grep -cE '^is_(num|limit) "\$\{[A-Z_]+:')"
-# 12 -> 14 for agent-infra#1762 (SWEEP_MAX_AGE, SWEEP_MIN_REMAIN). The exact count is the point:
-# a coercion added without its pin must redden this check, not pass as "more is better".
-[ "$_ngrd_n" = "14" ] && rcn=0 || { rcn=1; echo "      expected 14 shipped coercions in the extraction, got $_ngrd_n"; }
-ck "all 14 shipped limit coercions are extracted (a definition alone is not an extraction)" $rcn
+# 12 -> 14 for agent-infra#1762 (SWEEP_MAX_AGE, SWEEP_MIN_REMAIN), 14 -> 16 for agent-infra#1961
+# (MAX_COMPRESSOR_PCT, MAX_SWAPOUT_RATE). The exact count is the point: a coercion added without its
+# pin must redden this check, not pass as "more is better".
+[ "$_ngrd_n" = "16" ] && rcn=0 || { rcn=1; echo "      expected 16 shipped coercions in the extraction, got $_ngrd_n"; }
+ck "all 16 shipped limit coercions are extracted (a definition alone is not an extraction)" $rcn
 # The CYC FLOOR is part of the same coercion block but is not an is_* line, so it is extracted by an
 # explicit pattern (P3, third review round, 2026-10-14). Without it in NGRD, `nlim` could not drive
 # CYC=0 and the floor assertion below would be RED on the FIXED file — a false negative that would

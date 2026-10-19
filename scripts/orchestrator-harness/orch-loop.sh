@@ -125,10 +125,42 @@ MAX_REVIEW="${MAX_REVIEW:-4}"   # keep in sync with install.sh's default and REA
 # Raised to 25 (owner ruling: "we should have something more like 10 PRs who are not being
 # processed"). MERGE_PRIORITY_AT also raises the reviewer AND fixer budgets in drain mode.
 MERGE_PRIORITY_AT="${MERGE_PRIORITY_AT:-25}"
+# ⛔ `MIN_SWAP_FREE` IS THE **LINUX** SWAP CEILING (agent-infra#1961). It is inert on macOS, where
+# `swap_free` cannot see the pressure it was meant to catch — see the per-platform gate chain below
+# and the measured evidence in the probes' header. On a cell it stays exactly as it was: free swap
+# below this floor means the pool is exhausted, and it only vetoes while available RAM is tight too
+# (#1985).
 MIN_SWAP_FREE="${MIN_SWAP_FREE:-600}"
 # Available memory = free + inactive. macOS shows memory pressure as COMPRESSION with swap flat,
 # so a swap-only gate does not see it. See the gate chain below.
 MIN_MEM_FREE_MB="${MIN_MEM_FREE_MB:-512}"
+# ── the macOS present-pressure ceilings (agent-infra#1961) ─────────────────────
+# Neither is a swap-space figure, because on macOS swap space is not a measure of pressure: the swap
+# FILE GROWS to fit the workload, so its free portion moves in both directions while the box is under
+# load, and it flaps across any fixed ceiling. Measured 2026-10-17 on the 8 GB operator box while it
+# was thrashing at ~1,900 swapouts/s with a 2.95 GB compressor:
+#     vm.swapusage: total = 5120.00M  used = 3953.38M  free = 1166.62M
+#     [cap] swap_free=1042M / 600M   <- HEALTHY
+#     [cap] swap_free=1028M / 600M   <- HEALTHY
+#     [cap] swap_free=1432M / 600M   <- HEALTHY, and it rose WHILE pressure held
+# The two figures that do move with pressure are a LEVEL and a RATE, and each gets its own ceiling:
+#   MAX_COMPRESSOR_PCT — the ceiling for the compressor's occupancy, as a PERCENT of installed RAM
+#     (an absolute MB figure would be meaningless on a 64 GB box). Evidence for 50, measured on this
+#     8 GB box (2026-10-17, the box #1961 is about, fleet dispatching): the compressor swings between
+#     1.5 GB and 3.5 GB — 18% to 43% of RAM — while the box is still dispatching usefully, so a
+#     ceiling at or near 43% would refuse the very box the issue exists to unblock, and 50% is the
+#     first round figure above the observed working range at which the compressor holds the MAJORITY
+#     of RAM, i.e. the point at which adding a lane costs decompression over most of the working set.
+#     It is a BACKSTOP for the one case the rate cannot see: a box that has compressed everything it
+#     can and has momentarily stopped faulting pages out.
+#   MAX_SWAPOUT_RATE — pages/s. Evidence for 200, same box: 0/s over a 15 s calm window at a 3.0 GB
+#     compressor, then ~1,900/s over a 15 s window while thrashing (29,156 swapouts), and ~10,000/s
+#     when the box is pounded by a local test suite. An order of magnitude separates the calm reading
+#     from the lowest thrash reading, so 200/s sits in the middle: an order above the quiet and an
+#     order below the measured thrash.
+# ⛔ `0` DISABLES either arm, matching the `MIN_*` convention (both comparisons are guarded on `> 0`).
+MAX_COMPRESSOR_PCT="${MAX_COMPRESSOR_PCT:-50}"
+MAX_SWAPOUT_RATE="${MAX_SWAPOUT_RATE:-200}"
 BATCH="${BATCH:-2}"
 CYC="${CYC:-240}"
 # ── the per-repo merge contract (agent-infra#1764) ─────────────────────────────
@@ -179,8 +211,10 @@ shq() { local s="${1:-}" q="'"; printf "'%s'" "${s//$q/$q\\$q$q}"; }
 # A non-numeric threshold makes `[ -le ]` ERROR -- which returns false, and a false test in the gate
 # chain OPENS the gate. So a typo in the plist env (MIN_MEM_FREE_MB=abc) would silently remove the very
 # back-pressure these gates exist to apply. Coerce to the documented default instead of failing open.
-is_limit "${MIN_SWAP_FREE:-600}"   || MIN_SWAP_FREE=600
-is_limit "${MIN_MEM_FREE_MB:-512}" || MIN_MEM_FREE_MB=512
+is_limit "${MIN_SWAP_FREE:-600}"     || MIN_SWAP_FREE=600
+is_limit "${MIN_MEM_FREE_MB:-512}"   || MIN_MEM_FREE_MB=512
+is_limit "${MAX_COMPRESSOR_PCT:-50}" || MAX_COMPRESSOR_PCT=50
+is_limit "${MAX_SWAPOUT_RATE:-200}"  || MAX_SWAPOUT_RATE=200
 # The same rule applies to EVERY other plist-supplied limit, and these are the ones that fail in the
 # OPEN direction: MAX_LANES drops the lane cap (`[ "$LANES" -ge "$MAX_LANES" ]` errors to false, and
 # a false test ALLOWS dispatch), MERGE_PRIORITY_AT makes mp_reason() print nothing so the
@@ -299,6 +333,84 @@ mem_avail_mb() { # [<meminfo-file>]
   fi
   is_num "$mb" || return 1
   printf '%s\n' "$mb"
+}
+# ── the macOS PRESENT-PRESSURE probes (agent-infra#1961) ───────────────────────────────────────────
+# `swap_free` is not a pressure signal on macOS, and that is structural rather than a tuning problem:
+# the swap file GROWS to fit the workload, so `free` is (total - used) of a pool the kernel resizes,
+# and it moves in BOTH directions while the pressure behind it is unchanged. Measured on the 8 GB
+# operator box on 2026-10-17 with the box thrashing at ~1,900 swapouts/s and a 2.95 GB compressor:
+#     vm.swapusage: total = 5120.00M  used = 3953.38M  free = 1166.62M
+#     [cap] ... swap_free=1042M / 600M   <- the gate reads HEALTHY
+#     [cap] ... swap_free=1028M / 600M   <- the gate reads HEALTHY
+#     [cap] ... swap_free=1432M / 600M   <- the gate reads HEALTHY, and it went UP under pressure
+# So a macOS gate built on it can BOTH refuse a calm box (a past spike left the pool small) and pass a
+# box that is thrashing. The figures below are the ones that move with pressure, and they are what the
+# macOS arm of the gate chain consumes: a LEVEL (how much RAM has already been compressed away) and a
+# RATE (how fast pages are being pushed out NOW).
+# ⛔ THE RATE IS DERIVED FROM A CUMULATIVE COUNTER'S DELTA — THE COUNTER ITSELF IS NEVER COMPARED TO
+# ANYTHING, because a total is spent by a past spike and never recovers, which is exactly the defect
+# #1961 is about. That is why `swapouts_count` exists at all, and why its only caller differences it.
+# Both probes take a saved `vm_stat` transcript as a TEST SEAM (the call sites pass nothing), the same
+# idiom as `load1`/`swap_usage_mb`/`mem_avail_mb`: a macOS-only probe with no seam could only be
+# exercised on a macOS host.
+#
+# Installed RAM in MB, needed only to scale the compressor ceiling (a FRACTION of RAM). Linux:
+# `MemTotal` from /proc/meminfo; macOS: `sysctl hw.memsize` (bytes). NON-ZERO rc when unmeasurable.
+# The argument is a TEST SEAM (the call site passes nothing).
+mem_total_mb() { # [<meminfo-file>]
+  local p="${1:-/proc/meminfo}" mb
+  if [ -r "$p" ]; then
+    mb="$(awk '/^MemTotal:/{printf "%d", $2/1024; f=1} END{if (!f) exit 1}' "$p" 2>/dev/null)" || return 1
+  else
+    mb="$(sysctl -n hw.memsize 2>/dev/null)" || return 1
+    is_num "${mb:-}" || return 1
+    mb=$(( mb / 1048576 ))
+  fi
+  is_num "${mb:-}" || return 1
+  printf '%s\n' "$mb"
+}
+# MB of RAM currently held by the macOS compressor (`Pages occupied by compressor`). A LEVEL, readable
+# from a SINGLE sample — no history, so nothing a past spike spent can depress it. The page size comes
+# from vm_stat's own header (16 KiB on Apple silicon, 4 KiB on Intel): a hardcoded 16384 over-reports
+# 4x on an Intel Mac, which is the unsafe direction. NON-ZERO rc when unmeasurable, and the caller
+# must NOT read that as "no compression": an unreadable vm_stat also fails `mem_avail_mb()`, whose
+# fail-closed ruling then refuses (see the gate chain).
+# The argument is a TEST SEAM (the call site passes nothing): a saved `vm_stat` transcript.
+compressor_mb() { # [<vm_stat-transcript>]
+  local vm mb
+  if [ -r "${1:-}" ]; then vm="$(cat "$1" 2>/dev/null)"; else vm="$(vm_stat 2>/dev/null)"; fi
+  mb="$(printf '%s\n' "${vm:-}" | awk '
+    /page size of/ {ps=$8}
+    /Pages occupied by compressor/ {gsub(/[.]/,"",$5); c=$5}
+    END {if (ps=="") ps=16384; if (c=="") exit 1
+         printf "%d", c*ps/1048576}')" || return 1
+  is_num "${mb:-}" || return 1
+  printf '%s\n' "$mb"
+}
+# Cumulative swapout count (`Swapouts:` in vm_stat) — the figure `swapout_rate()` differences. ⛔ Its
+# cumulative value is NOT a gate input anywhere: only the DELTA over a measured interval is, because a
+# total is spent by a past spike and cannot recover (#1961). NON-ZERO rc when unmeasurable.
+# The argument is a TEST SEAM (the call site passes nothing): a saved `vm_stat` transcript.
+swapouts_count() { # [<vm_stat-transcript>]
+  local vm n
+  if [ -r "${1:-}" ]; then vm="$(cat "$1" 2>/dev/null)"; else vm="$(vm_stat 2>/dev/null)"; fi
+  n="$(printf '%s\n' "${vm:-}" | awk '
+    /Swapouts:/ {gsub(/[.]/,"",$2); printf "%d\n", $2; f=1}
+    END {if (!f) exit 1}')" || return 1
+  is_num "${n:-}" || return 1
+  printf '%s\n' "$n"
+}
+# Pages swapped out PER SECOND between two samples of `swapouts_count`. A RATE, not a level and not a
+# total: it returns to ~0 when the spike ends, which is what makes it safe to gate on. NON-ZERO rc
+# when no rate is definable — non-numeric input, an interval under 1 s (`date +%s` has 1 s resolution,
+# so a shorter one divides by zero), or a counter that went BACKWARDS (two samples from different
+# boots, i.e. a reboot in between — not a negative rate).
+swapout_rate() { # <prev_count> <cur_count> <elapsed_s>
+  local a="${1:-}" b="${2:-}" dt="${3:-}"
+  is_num "$a" && is_num "$b" && is_num "$dt" || return 1
+  [ "$dt" -ge 1 ] || return 1
+  [ "$b" -ge "$a" ] || return 1
+  printf '%d\n' $(( (b - a) / dt ))
 }
 # $O is operator config, not attacker input, but a quote or metacharacter here would break every
 # spawn (the tmux command string is executed via sh -c). Fail loudly instead of failing mysteriously.
@@ -873,6 +985,16 @@ unowned_pr_count() {
   [ "$u" -lt 0 ] && u=0
   echo "$u"
 }
+
+# The macOS SWAPOUT RATE needs two samples, so the previous cycle's cumulative count and the epoch it
+# was read at live ACROSS cycles here. EMPTY means "no previous sample" — the first cycle after a
+# start, or a reboot landed between two samples (the counter goes BACKWARDS and `swapout_rate`
+# refuses to invent a negative rate). The gate prints that state as `swapout=?` and does NOT read it as
+# zero pressure: the LEVEL metrics (compressor occupancy, available memory) are measured in the same
+# cycle and still decide. It is deliberately not persisted to disk — a rate measured across a restart
+# would span an interval in which the box may have been idle or thrashing, and a fresh two-sample
+# interval is one cycle (240 s) away.
+SWO_PREV_COUNT=""; SWO_PREV_EPOCH=""
 
 while true; do
   heartbeat
@@ -1512,13 +1634,46 @@ PY
   # so the gate chain cannot emit "integer expression expected", and so the logged value IS the value
   # the gate used.
   is_num "${L:-}" || L=0
+  # ⛔ THE PLATFORM DECIDES WHICH PRESSURE METRIC EXISTS, SO IT IS SETTLED ONCE, HERE (agent-infra#1961).
+  # `uname -s` is the only portable way to tell the two apart without assuming a probe exists, and an
+  # UNRECOGNISED platform takes the Linux arm deliberately: every probe that arm needs is a file read
+  # (`/proc/meminfo`) that fails CLOSED when it is absent, so an unknown box refuses rather than
+  # dispatching blind.
+  case "$(uname -s 2>/dev/null)" in Darwin) PRESS_PLAT="darwin" ;; *) PRESS_PLAT="linux" ;; esac
   # swap_total=0 => swap uninitialised (fresh boot), NOT pressure — allow. An UNREADABLE probe is
   # UNKNOWN and takes that same allow, for the reason above; unlike 0 it is a distinguishable state
   # (swap_usage_mb returns non-zero), so a future decision to fail closed there has a seam to use.
+  # ⛔ On macOS this pair is NO LONGER A GATE INPUT AT ALL (#1961) — it is still measured because
+  # `[cap]` prints it there as context and because the same probe serves the Linux arm unchanged. The
+  # macOS arm reads COMP_MB / SWO_RATE below.
   SWFREE=9999; SWTOTAL=0
   if _sw="$(swap_usage_mb)"; then SWFREE="${_sw%% *}"; SWTOTAL="${_sw##* }"; fi
   is_num "$SWFREE" || SWFREE=9999
   is_num "$SWTOTAL" || SWTOTAL=0
+  # The macOS present-pressure inputs: a LEVEL (compressor occupancy) and a RATE (swapouts/s over the
+  # interval since the previous cycle). Both are measured every cycle whether or not they bind, because
+  # a gate whose inputs are only logged when it fires cannot be distinguished from one that never
+  # looked (`res_line`'s own rule: MEASURE, decide nothing from it — this is the enforcing half).
+  # A level probe that FAILS reads `?` in the log and 0 in the arithmetic; that cannot open the gate,
+  # because the same `vm_stat` failure fails `mem_avail_mb()` -> MEM_UNKNOWN -> `mem_probe_failed`.
+  COMP_MB=0; COMP_CEIL_MB=0; COMP_KNOWN=0; SWO_RATE=""
+  if [ "$PRESS_PLAT" = "darwin" ]; then
+    if _ram="$(mem_total_mb)"; then
+      if is_num "${_ram:-}"; then COMP_CEIL_MB=$(( _ram * MAX_COMPRESSOR_PCT / 100 )); fi
+    fi
+    if _c="$(compressor_mb)"; then is_num "${_c:-}" && { COMP_MB="$_c"; COMP_KNOWN=1; }; fi
+    if _swo="$(swapouts_count)"; then
+      _now="$(date +%s)"
+      # A rate needs TWO samples. On the first cycle there is one, so the rate is UNKNOWN — printed as
+      # `?`, never as 0 (0 would claim "nothing is being swapped out", which is a measurement we do not
+      # have). `swapout_rate` also refuses a counter that went backwards (a reboot) and an interval of
+      # 0 s, leaving SWO_RATE empty rather than inventing a figure.
+      if [ -n "$SWO_PREV_COUNT" ] && [ -n "$SWO_PREV_EPOCH" ]; then
+        SWO_RATE="$(swapout_rate "$SWO_PREV_COUNT" "$_swo" "$(( _now - SWO_PREV_EPOCH ))")" || SWO_RATE=""
+      fi
+      SWO_PREV_COUNT="$_swo"; SWO_PREV_EPOCH="$_now"
+    fi
+  fi
   # Available memory through the portable helper: /proc/meminfo (MemAvailable, else MemFree+Cached)
   # on a cell; `free`+`inactive` vm_stat pages on macOS. It fails CLOSED (rc != 0 -> UNKNOWN -> do
   # not add work) -- before #1702 the probe was vm_stat-only and therefore failed closed on EVERY
@@ -1534,29 +1689,69 @@ PY
   # — an ERRORED test, which is FALSE, which leaves GATE_WHY empty and OPENS the gate. Unreachable
   # through mem_avail_mb() today, but it is the one seam where a probe fault would admit work.
   if ! is_num "${MEMAVAIL_MB:-}"; then MEMAVAIL_MB=0; MEM_UNKNOWN=1; fi
-  echo "[cap] load=$L/$MAX_LOAD lanes=$LANES/$MAX_LANES mem_avail=${MEMAVAIL_MB}M/${MIN_MEM_FREE_MB}M swap_free=${SWFREE}M/${MIN_SWAP_FREE}M open=${OPEN_N:-?} unowned=${UPN:-?} review_slots=${MR:-?} fix_slots=${MF:-?}" >> "$LOG"
-  # Four gates. swap_total=0 => swap uninitialised (fresh boot), NOT pressure — allow.
+  # ⛔ `[cap]` PRINTS THE METRIC THAT DECIDED, PER PLATFORM (agent-infra#1961 requirement 3). It used
+  # to print `swap_free=<n>M/<ceiling>M` on BOTH platforms — the ceiling that decided nothing on macOS,
+  # beside a figure that flaps across it. An operator reading a flapping gate has to see the input the
+  # gate actually consumed, or the flapping is indistinguishable from an intermittent fleet. Linux keeps
+  # its pair (swap free with its ceiling; `mem_avail` is printed for both); macOS prints the compressor
+  # against its RAM-derived ceiling and the swapout rate against its own, with `?` for a reading that
+  # does not exist (an unmeasurable probe, or the first cycle, where no rate is definable yet).
+  if [ "$PRESS_PLAT" = "darwin" ]; then
+    _comp_v="$COMP_MB"; [ "$COMP_KNOWN" = "1" ] || _comp_v="?"
+    _comp_c="$COMP_CEIL_MB"; [ "$_comp_c" -gt 0 ] || _comp_c="?"
+    _swo_v="${SWO_RATE:-?}"; _swo_c="$MAX_SWAPOUT_RATE"; [ "$_swo_c" -gt 0 ] || _swo_c="off"
+    PRESS_FIELD="press=$PRESS_PLAT comp=${_comp_v}M/${_comp_c}M swapout=${_swo_v}/s/${_swo_c}"
+  else
+    PRESS_FIELD="press=$PRESS_PLAT swap_free=${SWFREE}M/${MIN_SWAP_FREE}M"
+  fi
+  echo "[cap] load=$L/$MAX_LOAD lanes=$LANES/$MAX_LANES mem_avail=${MEMAVAIL_MB}M/${MIN_MEM_FREE_MB}M $PRESS_FIELD open=${OPEN_N:-?} unowned=${UPN:-?} review_slots=${MR:-?} fix_slots=${MF:-?}" >> "$LOG"
+  # Five gate families. swap_total=0 => swap uninitialised (fresh boot), NOT pressure — allow.
   # Name the binding gate: an earlier version logged "skipped (load=…)" while load was never
   # consulted, so a lanes-bound or swap-bound stall looked like a load stall.
   GATE_WHY="$(mp_reason "${UPN:-0}" "$LANES" "$WORKERS" "${OPEN_N:-0}")"
   if [ -n "$GATE_WHY" ]; then :
   elif [ "$L" -ge "$MAX_LOAD" ]; then GATE_WHY="load=$L>=max_load=$MAX_LOAD"
   elif [ "$LANES" -ge "$MAX_LANES" ]; then GATE_WHY="lanes=$LANES>=max_lanes=$MAX_LANES"
-  # ⛔ SWAP IS CUMULATIVE, RAM IS PRESENT (#1985). On macOS a 1 GB swap file stays roughly half
-  # occupied for the life of the boot after ANY spike, so this arm vetoed dispatch forever while the
-  # box had 1.4 GB available RAM (53 MB free + 1297 MB inactive) and 20 of 20 lane slots idle:
-  # measured 2026-10-18, every cycle, "lanes=0/20 … swap_free=506M<=min_swap_free=600M". The metric
-  # described the PAST, and with the RAM gate PASSING underneath it, "no create activity" was
-  # indistinguishable from "nothing to do".
-  # Swap exhaustion only matters when RAM is ALSO tight, so require both. An UNKNOWN memory read
-  # keeps the veto (fail closed) — never let a probe failure open the gate.
-  elif [ "$SWTOTAL" -ne 0 ] && [ "$SWFREE" -le "${MIN_SWAP_FREE:-600}" ] \
+  # ⛔ PRESSURE IS PER PLATFORM, AND THE TWO PLATFORMS SHARE NO METRIC HERE (agent-infra#1961). This
+  # was one arm reading `swap_free` on both, which is why it behaved badly on BOTH ends: see the
+  # probes' header for the measured macOS evidence (swap_free went UP 1042M -> 1432M while the box
+  # thrashed at ~1,900 swapouts/s) and #1985's for the Linux half (a 1 GB swap file left half occupied
+  # for the life of the boot, vetoing dispatch on a box with 1.4 GB of available RAM).
+  #
+  # macOS: the inputs are the ones that move with pressure — a RATE and a LEVEL, both present-tense.
+  #   * The RATE is checked FIRST because it is the direct evidence (pages are being pushed out NOW).
+  #     It is a delta over a measured interval, so it recovers when the spike ends; the cumulative
+  #     counter it is derived from is NEVER compared to a ceiling (that is #1961's objective). An
+  #     UNDEFINED rate (first cycle, a reboot between samples) is not "calm": it simply cannot decide,
+  #     and the rate arm is skipped while the level arms below still run. That is safe because the
+  #     level the rate would have confirmed is measured in the same cycle.
+  #   * The LEVEL is the compressor's occupancy against a fraction of RAM. It is a backstop for the box
+  #     that has compressed everything it can and has momentarily stopped faulting.
+  #   * `swap_free` is NOT consulted at all: the swap file grows to fit the workload, so it flags a
+  #     calm box whose pool a past spike left small and passes a box that is thrashing — both measured.
+  # Linux: the pair is unchanged from #1985 — free swap below its floor AND available RAM tight. Free
+  # swap alone is not pressure on a box with RAM to spare, and RAM tight alone is what the arm below
+  # already catches. An UNKNOWN memory read keeps the veto (fail closed) — never let a probe failure
+  # open the gate.
+  elif [ "$PRESS_PLAT" = "darwin" ] && [ "$MAX_SWAPOUT_RATE" -gt 0 ] && [ -n "${SWO_RATE:-}" ] \
+       && [ "$SWO_RATE" -ge "$MAX_SWAPOUT_RATE" ]; then
+    GATE_WHY="swapout=${SWO_RATE}/s>=max_swapout_rate=${MAX_SWAPOUT_RATE}/s (pages being pushed out now)"
+  elif [ "$PRESS_PLAT" = "darwin" ] && [ "$MAX_COMPRESSOR_PCT" -gt 0 ] \
+       && [ "$COMP_CEIL_MB" -gt 0 ] && [ "$COMP_MB" -ge "$COMP_CEIL_MB" ]; then
+    GATE_WHY="compressor=${COMP_MB}M>=max_compressor=${COMP_CEIL_MB}M (${MAX_COMPRESSOR_PCT}% of RAM already compressed)"
+  elif [ "$PRESS_PLAT" != "darwin" ] && [ "$SWTOTAL" -ne 0 ] && [ "$SWFREE" -le "${MIN_SWAP_FREE:-600}" ] \
        && { [ "${MEM_UNKNOWN:-0}" = "1" ] || [ "${MEMAVAIL_MB:-0}" -le "$(( MIN_MEM_FREE_MB * 2 ))" ]; }; then
     GATE_WHY="swap_free=${SWFREE}M<=min_swap_free=${MIN_SWAP_FREE:-600}M AND mem_avail=${MEMAVAIL_MB}M<=$(( MIN_MEM_FREE_MB * 2 ))M (both tight)"
   # "A failed probe is UNKNOWN, not ample" is only true if MEM_UNKNOWN can be SET, and it is set
   # from mem_avail_mb()'s EXIT STATUS (its awk `exit 1`s on absent fields) rather than from an empty
   # string: awk's END block always ran, so `printf "%d"` yielded 0 for unset fields and a test for
   # an empty MEMAVAIL_MB could never be true. The helper is therefore tested on its own, above.
+  # ⛔ AND IT IS THE RULING FOR THE PRESSURE PROBES TOO (#1961 asked for that decision explicitly).
+  # The mirror error of "UNKNOWN is ample" is a gate that silently reads an unmeasured metric as calm,
+  # so an unmeasurable pressure probe must not become a pass: on macOS `vm_stat` is the source of the
+  # compressor, the swapouts AND the available-memory figure, so losing it lands HERE and refuses; on
+  # Linux the swap figures and `MemAvailable` both come from `/proc/meminfo`, so the same failure lands
+  # here too. Nothing else is needed, and nothing here treats an absent reading as zero pressure.
   elif [ "${MEM_UNKNOWN:-0}" = "1" ]; then GATE_WHY="mem_probe_failed (capacity unknown -> do not add work)"
   elif [ "$MEMAVAIL_MB" -le "$MIN_MEM_FREE_MB" ]; then GATE_WHY="mem_avail=${MEMAVAIL_MB}M<=min_mem_free_mb=${MIN_MEM_FREE_MB}M"
   fi
