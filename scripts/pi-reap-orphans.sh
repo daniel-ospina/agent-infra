@@ -783,7 +783,11 @@ run() {
             [ -n "$pid" ] || continue
             [ "$ppid" = 1 ] || continue
             [ "$pid" = 1 ] && continue
-            printf '%s\tppid=1\tuid=%s\tcpu=%ss\tcwd=%s\t%s\n' \
+            # cpu is CENTISECONDS as ps_normalize emits it (`cpu stays in
+            # centiseconds: the leak detector needs that resolution`) — labelling
+            # it `s` overstated every candidate's CPU by 100x in the ONE
+            # read-only view an operator judges a kill from.
+            printf '%s\tppid=1\tuid=%s\tcpu=%scs\tcwd=%s\t%s\n' \
                 "$pid" "$uid" "${cpu:-?}" "$(cwd_describe "$pid")" "$cmd"
         done <"$NORM_A"
         exit 0
