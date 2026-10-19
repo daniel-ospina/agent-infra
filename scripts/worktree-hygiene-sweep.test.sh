@@ -300,7 +300,10 @@ chmod +x "$T/shim/launchctl"
 
 A_HOME="$T/armhome"; AGENTS="$A_HOME/Library/LaunchAgents"
 ARM_FILE="$T/state-arm/worktree-hygiene.armed"
-mkdir -p "$AGENTS" "$A_HOME/.pi/agent/scripts"
+mkdir -p "$AGENTS" "$A_HOME/.pi/agent/scripts" "$A_HOME/.pi/agent/scripts/lib"
+# The sweep loads the portability shim (S10: every declared component does), and the shim
+# refuses without its bounded-execution engine — so the farmed copy needs BOTH.
+cp "$HERE/lib/portable.sh" "$HERE/lib/bounded.sh" "$A_HOME/.pi/agent/scripts/lib/"
 # The farmed copy the unit executes, and the farmed engine the sweep resolves.
 cp "$SWEEP" "$A_HOME/.pi/agent/scripts/worktree-hygiene-sweep.sh"
 cp "$STUB_ENGINE" "$A_HOME/.pi/agent/scripts/pi-reap-worktrees.sh"
