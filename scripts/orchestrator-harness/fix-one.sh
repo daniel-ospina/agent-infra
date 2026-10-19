@@ -194,7 +194,12 @@ EOF
 # a box that splits them: a healthy main checkout would let the fixer start onto a full worktree
 # volume, which is the precise "cannot name the volume that actually fills" failure #1765 exists to
 # remove. `uv sync` writes the venv in $WT, so $WT is the reading that matters.
-DISK_GATE_PATH="$WT" run_agent "${FIX_TIMEOUT:-2400}" "$L.log" "$L-fixer.txt" "fixer for PR #$PR"
+# ⛔ AND `WIP_PATH="$WT"` FOR THE SAME REASON, ONE STEP LATER (#2045). `DISK_GATE_PATH` names the
+# volume the fixer FILLS; `WIP_PATH` names the worktree whose UNCOMMITTED WORK a cap kill would
+# destroy. This script `cd`s into $REPO, so run_agent's default (`$PWD`, the main checkout) would
+# snapshot the wrong tree and report a CLEAN worktree while the fixer's work sat unsaved one
+# directory away — the loud-but-wrong verdict, which is worse than no snapshot at all.
+DISK_GATE_PATH="$WT" WIP_PATH="$WT" run_agent "${FIX_TIMEOUT:-2400}" "$L.log" "$L-fixer.txt" "fixer for PR #$PR"
 # ⛔ THE GATE'S OWN CODE, captured immediately. It is the ONLY thing that distinguishes the two
 # refusals below, and `$?` read after any later command would be that command's status (§7.4).
 ar=$?

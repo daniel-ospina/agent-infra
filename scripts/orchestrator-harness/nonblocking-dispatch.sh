@@ -22,18 +22,34 @@ if [ "$NAME" = "--status" ]; then
   O="${O:-$HOME/orchestrator}"; D="$O/bg"
   RC="$(cat "$D/$NAME.rc" 2>/dev/null || true)"
   PID="$(cat "$D/$NAME.pid" 2>/dev/null || true)"
+  # ⛔ A CAP KILL IS ITS OWN FACT (#2045). A lane killed at its wall-clock cap used to be
+  # indistinguishable from one that finished with nothing to do: the launcher recorded a bare exit
+  # status, `pi -p`'s buffered output is lost on SIGTERM, and the work it had already done sat
+  # uncommitted in a temp worktree while the only signal was an absence. The worker now publishes a
+  # `.cap` marker (cap seconds + the verified snapshot run_agent wrote), so this line NAMES the cap
+  # and the preserved work instead of reporting a bare `rc=143` — or, worse, `commits=0`.
+  CAPNOTE=""
+  if [ -f "$D/$NAME.cap" ]; then
+    # awk, not `sed | head`: this runs on an operator's status call, and a pipeline whose reader exits
+    # early is the SIGPIPE shape `scripts/check-no-sigpipe-grep.sh` exists to keep out of the tree.
+    CAPNOTE="$(awk -F= '/^note=/{sub(/^note=/, ""); print; exit}' "$D/$NAME.cap" 2>/dev/null)"
+  fi
   # ⛔ LIVENESS IS NOT %CPU. `%CPU == 0` means WAITING, not finished — a lane blocked in a long tool
   # call sits at 0 % CPU (docs/ops/fleet-liveness.md). The authoritative signal is the worker's own
   # exit-status file, written by the subshell below; the pid probe only distinguishes
   # running from vanished.
   if [ -n "$RC" ]; then
-    [ "$RC" = "0" ] && echo "$NAME done rc=0" || echo "$NAME failed rc=$RC"
+    if [ "$RC" = "0" ]; then
+      printf '%s done rc=0%s\n' "$NAME" "${CAPNOTE:+ (${CAPNOTE})}"
+    else
+      printf '%s failed rc=%s%s\n' "$NAME" "$RC" "${CAPNOTE:+ (${CAPNOTE})}"
+    fi
   elif [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
     echo "$NAME running pid=$PID"
   else
     # No status file and no live pid: the worker is gone and its verdict was never recorded. Say so
     # rather than reporting a success that nothing produced.
-    echo "$NAME lost (no exit status recorded and pid ${PID:-<unknown>} is gone) log=$D/$NAME.log"
+    printf '%s lost (no exit status recorded and pid %s is gone) log=%s%s\n' "$NAME" "${PID:-<unknown>}" "$D/$NAME.log" "${CAPNOTE:+ (${CAPNOTE})}"
   fi
   exit 0
 fi
@@ -74,6 +90,8 @@ command -v run_agent >/dev/null 2>&1 \
 [ -f "$PROMPT" ] || { echo "nonblocking-dispatch.sh: no prompt file $PROMPT" >&2; exit 2; }
 
 LOG="$D/$NAME.log"; RC="$D/$NAME.rc"; PIDF="$D/$NAME.pid"; STAMP="$D/$NAME.started"
+CAPF="$D/$NAME.cap"   # written by the worker below when the wall-clock cap fired (#2045)
+rm -f "$CAPF"
 # The worker is a fleet lane in every respect except that nobody waits for it: the local review/VGATE
 # gates are bypassed so the PARENT owns the review ceremony, and no MCP servers are started.
 export AGENT_SKIP_REVIEW_GATE=1 ELDATO_SKIP_VGATE=1 AGENT_ALLOW_MAIN_EDITS=1 ELDATO_ALLOW_MAIN_EDITS=1
@@ -98,7 +116,39 @@ cd "$WT" || exit 2
 # dispatcher that holds its caller for the length of the job is worse than a blocking one, because
 # the caller believes it returned. run_agent writes everything it has to say to "$LOG", so
 # nothing is lost by closing these.
-( trap '' HUP; exec >/dev/null 2>&1; run_agent "$T" "$LOG" "$PROMPT" "bg $NAME"; echo "$?" > "$RC" ) <&- &
+( trap '' HUP
+  # ⛔ RESOLVED BY UNION (#2045 rebase): main's `exec` redirection (see the block above) is kept
+  # here, inside the PR's cap-marker block. Every write below is explicitly redirected to a
+  # file, so closing these fds loses nothing.
+  exec >/dev/null 2>&1
+  run_agent "$T" "$LOG" "$PROMPT" "bg $NAME"
+  rc=$?
+  # ⛔ `.cap` BEFORE `.rc` (VGATE cycle 4, nit 1): `--status` reads `.rc` FIRST, so writing the exit
+  # status before the note leaves a window in which a cap kill reads as a bare `failed rc=143` with
+  # no explanation, and a test asserting the note could flake on it. In this order a status read sees
+  # either "running" (no .rc yet) or a verdict WITH its note — never a verdict stripped of it.
+  if [ "${AGENT_CAP_HIT:-0}" = "1" ]; then
+    # ⛔ THE NOTE FOLLOWS `WIP_SNAPSHOT_RESULT`, NEVER THE PRESENCE OF A DIRECTORY (#2045, VGATE
+    # cycle 3). An earlier version keyed on `-n "$WIP_SNAPSHOT_DIR"` and fell through to
+    # "the worktree was CLEAN, nothing was lost" when the snapshot FAILED — so a cap kill on a full
+    # disk, the leading cell failure mode, would have reported that nothing was lost over work that
+    # existed only in a worktree about to be reaped. That is #2045's own defect, one layer up.
+    case "${WIP_SNAPSHOT_RESULT:-}" in
+      COMPLETE)
+        note="cap ${T}s hit — COMPLETE WIP snapshot: ${WIP_SNAPSHOT_DIR:-<unrecorded>}" ;;
+      PARTIAL)
+        # A PARTIAL snapshot is a rescue aid, NOT a licence to reap: say so here, where an operator
+        # reads it, rather than only in the log (VGATE cycle 8, P2).
+        note="cap ${T}s hit — PARTIAL WIP snapshot (INCOMPLETE: the worktree is still the only full copy, do NOT reap it): ${WIP_SNAPSHOT_DIR:-<unrecorded>}" ;;
+      NOTHING-LOST)
+        note="cap ${T}s hit — the worktree was CLEAN, nothing was lost" ;;
+      *)
+        note="cap ${T}s hit — WORK NOT PRESERVED (${WIP_SNAPSHOT_RESULT:-unknown}): it is still only in the worktree, so do NOT reap it. See $LOG" ;;
+    esac
+    printf 'cap_s=%s\nresult=%s\nsnapshot=%s\nnote=%s\n' "$T" "${WIP_SNAPSHOT_RESULT:-none}" "${WIP_SNAPSHOT_DIR:-}" "$note" > "$CAPF"
+  fi
+  echo "$rc" > "$RC"
+) <&- &
 PID=$!
 echo "$PID" > "$PIDF"
 disown "$PID" 2>/dev/null || true

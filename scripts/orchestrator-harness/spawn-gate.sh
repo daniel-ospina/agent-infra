@@ -275,6 +275,358 @@ load1() { # [<loadavg-file>]
 # is asserted rather than left to be rediscovered).
 can_spawn() { [ "${1:-0}" -lt "$MAX_LOAD" ]; }
 
+# ── the CAP-KILL WORKTREE SNAPSHOT (agent-infra#2045) ───────────────────────────
+# THE DEFECT, measured 2026-10-18. Of eight background lanes, three produced nothing at all and one
+# of them died MID-WORK: 269,237 characters of transcript, seven MODIFIED files in its worktree,
+# no report file, no `.rc`, and the launcher reported `worker finished: … commits=0 PR=none`. The
+# work survived only because a human happened to notice a dirty temp worktree. Nothing in the
+# harness could tell that lane from one that legitimately had nothing to do — the watchdog's whole
+# vocabulary was `kill -TERM; sleep 15; kill -KILL`, and a killed lane's log looks exactly like a
+# slow lane's (a SIGTERM mid-turn loses the buffered response).
+#
+# So when the cap fires, the SPAWN POINT writes a VERIFIED, replayable snapshot of the worktree and
+# says so in the log, in a ledger row and in a marker the caller reads. The spawn point is the right
+# place and the only one: `run_agent` is the single agent invocation every worker (lane.sh,
+# fix-one.sh, nonblocking-dispatch.sh) goes through — a per-caller copy would be exactly the drift
+# the #1720 port removed.
+#
+# WHY THE PARENT AND NOT THE WATCHDOG SUBSHELL. This runs AFTER `wait "$pid"` returns, so the WORKER
+# is gone — the case this leg exists for — and it cannot be truncated by the parent's own `kill "$w"`
+# (the parent reaps the watchdog the moment the worker exits, so a snapshot in flight inside the
+# watchdog would be cut off in the common case: the worker exits on SIGTERM, the parent reaps w, the
+# patch stops mid-write).
+# ⛔ IT IS NOT A RACE-FREE READ, AND SAYING SO WOULD BE WRONG. `wait` reaps the DIRECT child; a `pi`
+# that left orphaned descendants (they are not a killed process group) can still be writing while
+# `status`/`diff`/`tar` run, so a capture can be TORN even when it verifies as COMPLETE. That is a
+# declared residual, not an assumption — the alternative (a process-group kill before capturing) is a
+# change in what the cap kills, which is a different decision. The snapshot is a rescue artifact for a
+# worktree that is otherwise unrecoverable; it is not a transaction.
+#
+# ⛔ WHAT THIS MUST NOT DO. (1) It must not touch the worker's index, branch or stash: every
+# artifact comes from `git diff HEAD`, `git ls-files --others` and `tar` — all READ-ONLY on the
+# worktree — so a snapshot can never alter the state it is preserving. (2) It must not delay the
+# HARD KILL: the snapshot is taken after the kill has already landed, never in front of it, so a
+# worker that ignores SIGTERM is still killed at its cap — this suite pins that, because a
+# checkpoint grace period in front of the kill is the "a hung worker is never killed" failure the
+# cap exists to prevent.
+# (3) It must not claim a save it did not verify: the patch is re-parsed (`git apply --numstat`) and
+# the archive is re-listed before anything is called COMPLETE.
+#
+# DECLARED RESIDUALS, stated rather than implied. (a) A GITIGNORED file is never captured — the
+# artifact contract is "tracked changes + untracked non-ignored files", and a build output or a local
+# secret is deliberately out of it, so a dirty-looking tree whose only changes are ignored reads
+# COMPLETE (and correctly so under that contract). (b) A lane killed BELOW its cap (a `pi` crash, the
+# stale-worker reaper) leaves no snapshot: this leg hangs off the cap, which is the loss the issue
+# measured. (c) Orphaned descendants may still be writing during the capture (see below). (d)
+# `merge-one.sh` carries its own `run_agent()` copy — see the note at the end of this block.
+#
+# ⛔ AND IT IS LOUD WHEN THERE IS NOTHING TO SAVE. `the worktree was CLEAN` and `the work was
+# preserved` are DIFFERENT FACTS, and their being indistinguishable IS the defect: both used to
+# read as `commits=0`. Both get a `[cap]` line; only the first is quiet about artifacts.
+#
+# DECLARED RESIDUAL: `merge-one.sh` still carries its own `run_agent()` copy and therefore its own
+# cap path without this snapshot. That is deliberate, not an oversight — its agent is a REVIEWER,
+# which lands its result as a comment + a signed record and never leaves uncommitted worktree work,
+# so the loss class here does not apply to it. Uniting the two copies is a separate refactor; do not
+# read this as coverage of it.
+WIP_SNAPSHOT_KEEP=10   # newest N snapshot directories kept. Bounded ON PURPOSE: a cell's disk is
+                       # the first thing that stops dispatch, and nothing else reaps this tree.
+WIP_SNAPSHOT_DIR=""    # set by cap_wip_snapshot(); the caller (a launcher) publishes it
+WIP_SNAPSHOT_RESULT=""
+AGENT_CAP_HIT=0        # like AGENT_STARTED: a callers' signal, never an inference from an exit code
+
+# cap_wip_prune <snapshot-root> — keep the newest WIP_SNAPSHOT_KEEP directories. Only names THIS
+# leg creates (`capwip-*`) are candidates, and a directory is the only thing removed.
+cap_wip_prune() {
+  local root="${1:-}" d n=0
+  [ -n "$root" ] || return 0
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    # ⛔ COUNT ONLY WHAT WE WOULD REMOVE. A `capwip-*` FILE (a stray, a mis-typed name) is neither a
+    # snapshot nor a candidate: counting it burned a keep slot and deleted one extra LIVE snapshot
+    # (VGATE cycle 3, reproduced: 12 dirs + 1 stray file → kept=9). The directory test therefore runs
+    # BEFORE the budget, not after it.
+    [ -d "$d" ] || continue
+    n=$((n + 1))
+    [ "$n" -le "$WIP_SNAPSHOT_KEEP" ] && continue
+    case "${d##*/}" in
+      capwip-*) rm -rf -- "$d" ;;
+    esac
+  done <<<"$(ls -1dt "$root"/capwip-* 2>/dev/null)"
+}
+
+# cap_wip_snapshot <label> <cap-s> <elapsed-s> <rc> <logfile>
+# Returns 0 when nothing was lost or the work was fully captured, 1 when something could NOT be
+# captured (or there was no git worktree to read).
+# ⛔ WIP_SNAPSHOT_RESULT IS THE VERDICT AND IS SET BY EVERY BRANCH — `COMPLETE`, `PARTIAL`,
+# `NOTHING-LOST` (a clean tree), `LOST` (a dirty tree that could not be written) or
+# `UNSNAPSHOTABLE` (not a git worktree). An EMPTY value is not a verdict: a launcher that reads
+# "no directory" as "nothing to save" reports `the worktree was CLEAN, nothing was lost` over work
+# that was in fact still only on disk — which is #2045's own defect one layer up (VGATE cycle 3).
+cap_wip_snapshot() {
+  local label="$1" cap="$2" elapsed="$3" rc="$4" log="$5"
+  local root O_ROOT dir stamp result st_outf st_errf dirtyf capf st_nl
+  local st_rc=0 st_noise=0 st_ok=1 n_dirty=0 unmerged=0 sub_dirty=0
+  local want_tracked=0 have_tracked=0 want_untracked=0 patch_bytes=0 arch_bytes=0 arch_n=0
+  local patch_ok=0 arch_ok=0 diff_rc=0 uncovered="" uncovered_n=0 cmp_ok=1 count_ok=1 leading_dash=0
+  root="${WIP_PATH:-$PWD}"
+  if ! git -C "$root" rev-parse --git-dir >/dev/null 2>&1; then
+    WIP_SNAPSHOT_RESULT=UNSNAPSHOTABLE
+    echo "[cap] $label hit the ${cap}s cap (elapsed=${elapsed}s rc=$rc) and $root is NOT a git worktree — there was no worktree to snapshot. If this lane's work lives in another directory, pass WIP_PATH=<worktree>" >> "$log"
+    return 1
+  fi
+  # ── ONE read of the worktree state, and it must be able to FAIL ──────────────────────────────
+  # ⛔ A `git status` THAT CANNOT RUN IS CANNOT-VERIFY, NEVER "CLEAN" (VGATE cycle 6, and the repo's
+  # own ruling for this exact call: cloud-cell-supervisor.sh's `stamp_write` — "a `git status` that
+  # cannot run (corrupt index, ENOSPC, EACCES, safe.directory) is CANNOT-VERIFY, never clean"). The
+  # first version discarded BOTH the exit status and stderr, and two measured shapes then took the
+  # CLEAN branch while real work sat uncommitted: an unreadable `.git/index` (status exits 128 with
+  # empty stdout) and an unreadable UNTRACKED DIRECTORY (status exits 0 with only a
+  # `warning: could not open directory` and empty stdout). Both reported NOTHING-LOST — the
+  # reassuring verdict that authorises a reaper.
+  # ⛔ `--porcelain=v2 -z` FOR THREE REASONS. (i) v2 reports each SUBMODULE's own state in its
+  # `<c><m><u>` field (`S.M.` = modified content, `S..U` = untracked content) and is non-fatal on a
+  # gitlink with no `.gitmodules` mapping, where `git submodule status` is FATAL — the previous probe
+  # was built on that call and was INERT (measured: ` c1fec47 sub (heads/main)` for a submodule holding
+  # uncommitted work). (ii) `-z` makes the path fields unambiguous for names containing spaces, which
+  # the line-oriented porcelain answers cannot. (iii) `-uall` DEFEATS `status.showUntrackedFiles=no`
+  # — a legal repo/global config under which untracked work is invisible, so this read returned
+  # "clean" and the whole leg was disabled in the reassuring direction (VGATE cycle 8). One read now
+  # answers "is anything dirty", "is anything unmerged", "is a submodule holding work" and "WHICH
+  # paths", so the four can never disagree.
+  st_outf="$(mktemp "${TMPDIR:-/tmp}/capwip-st.XXXXXX" 2>/dev/null)"
+  st_errf="$(mktemp "${TMPDIR:-/tmp}/capwip-se.XXXXXX" 2>/dev/null)"
+  dirtyf="$(mktemp "${TMPDIR:-/tmp}/capwip-df.XXXXXX" 2>/dev/null)"
+  st_nl="$(mktemp "${TMPDIR:-/tmp}/capwip-nl.XXXXXX" 2>/dev/null)"
+  capf="$(mktemp "${TMPDIR:-/tmp}/capwip-cf.XXXXXX" 2>/dev/null)"
+  if [ -n "$st_outf" ] && [ -n "$st_errf" ] && [ -n "$dirtyf" ] && [ -n "$capf" ] && [ -n "$st_nl" ]; then
+    git -C "$root" status --porcelain=v2 -z --ignore-submodules=none -uall > "$st_outf" 2> "$st_errf" || st_rc=$?
+    # ⛔ `grep -c` EXITS 1 WHEN IT SELECTS NOTHING — which is the HEALTHY case (git wrote no warnings).
+    # Reading that as a failure made `st_ok=0` unconditional, so COMPLETE became unreachable and every
+    # clean cap kill produced a spurious snapshot plus a "do NOT reap it" verdict (VGATE cycle 11,
+    # reproduced: 7 arms red, `status_stderr_lines=0` beside `status_ok=0`). Only "cannot run" (>=2) or
+    # an unparseable count is a failure.
+    st_noise="$(grep -c . "$st_errf" 2>/dev/null)"; local _g=$?
+    if [ "$_g" -gt 1 ] || [ -z "$st_noise" ]; then st_ok=0; st_noise=0; fi
+    # ⛔ EVERY PARSER'S OWN STATUS COUNTS (VGATE cycle 10, F1). `n_dirty` defaults to 0 and 0 is the
+    # PERMISSIVE answer here — it short-circuits to NOTHING-LOST before any artifact is written. So a
+    # parser that cannot run (no awk, a broken build, `awk` shadowed on PATH) must not read as "the
+    # tree is clean": each awk below is checked, and a NUL-stream with BYTES that yields ZERO records
+    # is a failed parse, not an empty worktree (measured: broken awk → rc=0 result=NOTHING-LOST over a
+    # tree with two dirty paths).
+    # ⛔ PARSED AS NEWLINE RECORDS, NOT `awk -v RS='\0'` (VGATE cycle 11, portability). A regex/multi-char
+    # RS is not portable — BSD one-true-awk (macOS) does not support it, and this surface ships to
+    # macOS — so the NUL stream is converted ONCE and every parser below is plain POSIX awk. The cost
+    # is stated: a path containing a NEWLINE is split into two records, which can only ADD an uncovered
+    # entry (fail-closed ⇒ PARTIAL), never hide one.
+    tr '\0' '\n' < "$st_outf" > "$st_nl" 2>/dev/null || st_ok=0
+    n_dirty="$(awk '$0 ~ /^[12u?] /{n++} END{print n+0}' "$st_nl" 2>/dev/null)" || st_ok=0
+    unmerged="$(awk '$0 ~ /^u /{n++} END{print n+0}' "$st_nl" 2>/dev/null)" || st_ok=0
+    sub_dirty="$(awk '{ n=split($0,f," "); if (f[1]!="1" && f[1]!="2" && f[1]!="u") next; s=f[3]; if (substr(s,1,1)=="S" && (substr(s,3,1)!="." || substr(s,4,1)!=".")) c++ } END{print c+0}' "$st_nl" 2>/dev/null)" || st_ok=0
+    if [ -s "$st_outf" ] && [ "${n_dirty:-0}" -eq 0 ]; then st_ok=0; fi
+    # The DIRTY PATH SET — field offsets are the v2 grammar (`1`: 8 fields before the path, `2`: 9,
+    # `u`: 10, `?`: 1).
+    # ⛔ SLICED BY `index`, NEVER split/rejoin (VGATE cycle 9, F1). `split($0, f, " ")` inherits awk's
+    # special single-space rule, which COLLAPSES runs of spaces and DROPS leading blanks: a path with a
+    # double space or a leading space then differed from its archived form and reported a false PARTIAL
+    # over work that was fully preserved. `index`/`substr` is byte-exact.
+    awk '{ k = (substr($0,1,2)=="? ") ? 1 : (substr($0,1,2)=="1 ") ? 8 : (substr($0,1,2)=="2 ") ? 9 : (substr($0,1,2)=="u ") ? 10 : 0
+           if (k == 0) next
+           pos = 1
+           for (i = 0; i < k; i++) { sp = index(substr($0, pos), " "); if (sp == 0) { pos = 0; break } pos += sp }
+           if (pos == 0) next
+           p = substr($0, pos)
+           if (p != "") print p }' "$st_nl" > "$dirtyf" 2>/dev/null || st_ok=0
+    if [ -s "$st_outf" ] && [ ! -s "$dirtyf" ] && [ "${n_dirty:-0}" -gt 0 ]; then st_ok=0; fi
+    rm -f "$st_outf" "$st_errf" "$st_nl"
+  else
+    st_rc=1                      # no temp file ⇒ the read cannot be checked ⇒ never claim clean
+  fi
+  [ "$st_rc" -eq 0 ] && [ "${st_noise:-0}" -eq 0 ] || st_ok=0
+  if [ "${n_dirty:-0}" -eq 0 ]; then
+    if [ "$st_ok" = 1 ]; then
+      WIP_SNAPSHOT_RESULT=NOTHING-LOST
+      rm -f "$dirtyf" "$capf"
+      echo "[cap] $label hit the ${cap}s cap (elapsed=${elapsed}s rc=$rc) — the worktree at $root was CLEAN, so NOTHING WAS LOST. The cap still killed it: that is a cap-size problem, not a lost-work problem." >> "$log"
+      # A STASH IS A FIFTH DECLARED RESIDUAL (VGATE cycle 10, F4): `git stash push -u` leaves a clean
+      # worktree, so this leg correctly sees no work to capture — but the message must not be read as
+      # "this repo holds nothing". `refs/stash` lives in the COMMON git dir, so it SURVIVES the worktree
+      # being removed (the same fact using-git-worktrees warns about from the other side); say so where
+      # an operator might otherwise act on "nothing was lost".
+      if git -C "$root" rev-parse --verify -q refs/stash >/dev/null 2>&1; then
+        echo "[cap]   note: this repo has a stash (refs/stash). It is NOT part of this snapshot, and it lives in the COMMON git dir, so it survives this worktree being removed." >> "$log"
+      fi
+      return 0
+    fi
+    echo "[cap] $label hit the ${cap}s cap (elapsed=${elapsed}s rc=$rc) and the worktree state at $root COULD NOT BE READ (git status rc=$st_rc, ${st_noise:-0} stderr line(s)) — treating it as WORK AT RISK, NOT as clean. Nothing here will claim the tree was clean." >> "$log"
+  fi
+  O_ROOT="${O:-${HOME:-$root}/orchestrator}"
+  stamp="$(date +%Y%m%dT%H%M%S)"
+  # $O/wip/ IS THE HARNESS'S EXISTING DIRTY-WORKTREE CAPTURE DIRECTORY (`install.sh` creates it, the
+  # README state table documents it). The cap snapshot belongs THERE, with the other dirty-worktree
+  # captures, rather than in a second wip location nothing documents — the ledger row goes to
+  # state/ beside walltime.tsv and disk.tsv, which is where append-only series live.
+  dir="$O_ROOT/wip/capwip-$stamp-$$"
+  if ! mkdir -p "$dir" 2>/dev/null; then
+    WIP_SNAPSHOT_RESULT=LOST
+    rm -f "$dirtyf" "$capf"
+    echo "[cap] $label KILLED AT ITS ${cap}s CAP (elapsed=${elapsed}s rc=$rc) with $n_dirty uncommitted path(s), and the snapshot directory $dir COULD NOT BE CREATED — that work is on disk ONLY at $root and is LOST if the worktree is reaped. Recover now: git -C \"$root\" diff HEAD --binary > /tmp/capwip-\$\$.patch" >> "$log"
+    return 1
+  fi
+  # TRACKED (staged + unstaged) against HEAD, in one patch `git apply` can replay.
+  # ⛔ A FAILED `git diff HEAD` IS NOT "NO TRACKED CHANGES" (VGATE cycle 5, measured). On an UNBORN
+  # branch (`git init` + a staged file, no commit yet) it exits 128 with "ambiguous argument 'HEAD'",
+  # so `want_tracked` reads 0 while the status read above reports a modification.
+  git -C "$root" diff HEAD --binary > "$dir/tracked.patch" 2>/dev/null || diff_rc=$?
+  patch_bytes="$(wc -c < "$dir/tracked.patch" 2>/dev/null | tr -d ' ')"
+  git -C "$root" diff HEAD --name-only > "$dir/tracked.paths" 2>/dev/null || diff_rc=${diff_rc:-1}
+  # ⛔ 0 IS THE PERMISSIVE ANSWER, SO A COUNT THAT COULD NOT RUN IS A FAILURE, NOT A ZERO (VGATE cycle
+  # 10, F2). These counts decide COMPLETE and they used to be `grep -c .` with the status discarded: a
+  # broken/shadowed grep returned empty → 0 → `want_untracked=0` meant "nothing to archive" and
+  # `uncovered_n=0` meant "everything covered", so a snapshot with a dirty path in NO artifact read
+  # COMPLETE. `count_lines` reads a FILE that is already on disk (not a pipe) and reports the failure
+  # instead of a zero. Measured before this: rc=0 result=COMPLETE over a tree whose only dirty path
+  # appeared in no artifact, with the replay line naming a tarball that was never created.
+  count_lines() {   # count_lines <file> — print the line count, or fail when it cannot be counted
+    local f="$1" n
+    [ -f "$f" ] || return 1
+    n="$(wc -l < "$f" 2>/dev/null | tr -d ' ')" || return 1
+    case "${n:-}" in ''|*[!0-9]*) return 1 ;; esac
+    # bytes present but NOTHING counted is a failed count, not an empty set: `wc -l` under-reports a
+    # file whose last line has no newline, and every zero here is the PERMISSIVE answer.
+    if [ -s "$f" ] && [ "$n" -eq 0 ]; then return 1; fi
+    printf '%s\n' "$n"
+    return 0
+  }
+  want_tracked="$(count_lines "$dir/tracked.paths")" || { want_tracked=0; count_ok=0; }
+  if [ "${want_tracked:-0}" -gt 0 ] && [ "${patch_bytes:-0}" -gt 0 ] \
+     && git -C "$root" apply --numstat "$dir/tracked.patch" > "$dir/tracked.numstat" 2>/dev/null; then
+    have_tracked="$(count_lines "$dir/tracked.numstat")" || { have_tracked=0; count_ok=0; }
+    [ "${have_tracked:-0}" -ge "${want_tracked:-0}" ] && patch_ok=1
+  fi
+  # UNTRACKED (non-ignored) as a tarball, so an empty new file and a 200 MB fixture are both kept.
+  # ⛔ `-z` + `--null`, AND THE NAMES ARE NEVER RE-QUOTED (VGATE cycle 10, F3). The line-oriented list
+  # makes git QUOTE a non-ASCII name (`an\303\241lisis.md`), `tar -T` cannot stat that, and the file is
+  # silently MISSING from the archive — ordinary filenames in a Spanish-language repo, not an edge case.
+  # Worse, a name beginning with `-` is read by GNU tar as an OPTION from a `-T` file (`-C..` silently
+  # redirects tar's directory and the count still "verifies"). NUL-delimited names plus
+  # `--verbatim-files-from where the tar supports it` closes both; where it does not (bsdtar), the guard
+  # below turns a leading-`-` name into an honest PARTIAL instead of a redirected archive.
+  git -C "$root" ls-files --others --exclude-standard -z > "$dir/untracked.list0" 2>/dev/null
+  tr '\0' '\n' < "$dir/untracked.list0" > "$dir/untracked.list" 2>/dev/null
+  want_untracked="$(count_lines "$dir/untracked.list")" || { want_untracked=0; count_ok=0; }
+  if [ "${want_untracked:-0}" -gt 0 ]; then
+    local tar_verbatim=""
+    # awk, not `| head -1 | grep -q` — a reader that exits early is the SIGPIPE shape the tree bans.
+    if tar --version 2>/dev/null | awk 'NR==1 && /GNU tar/ {f=1} END{exit(f?0:1)}'; then tar_verbatim="--verbatim-files-from"; fi
+    # ⛔ THE GUARD THE COMMENT ABOVE USED TO CLAIM EXISTS, DOES. A tar without `--verbatim-files-from`
+    # (bsdtar) parses a leading-dash name in its -T file as an OPTION, so the archive can be built from
+    # a redirected directory and still verify by count. On such a tar, refuse the archive (PARTIAL) and
+    # let the operator take the copy by hand rather than ship a wrong one.
+    leading_dash="$(grep -c '^-' "$dir/untracked.list" 2>/dev/null)" || leading_dash=0
+    if [ "${leading_dash:-0}" -gt 0 ] && [ -z "$tar_verbatim" ]; then
+      echo "[cap]   this tar has no --verbatim-files-from and $leading_dash untracked name(s) begin with '-': the tarball is NOT built (a leading-dash name would be read as an option). Copy them by hand from $root." >> "$log"
+    # shellcheck disable=SC2086
+    elif ( cd "$root" && tar --null $tar_verbatim -czf "$dir/untracked.tgz" -T "$dir/untracked.list0" ) >/dev/null 2>&1; then
+      arch_bytes="$(wc -c < "$dir/untracked.tgz" 2>/dev/null | tr -d ' ')"
+      arch_n="$(tar -tzf "$dir/untracked.tgz" 2>/dev/null | grep -c . )"
+      [ "${arch_n:-0}" -ge "${want_untracked:-0}" ] && arch_ok=1
+    fi
+  fi
+  # ── THE VERDICT IS A SET COMPARISON, NOT A COUNT (VGATE cycle 8) ─────────────────────────────
+  # A COUNT of captured paths is masked by aggregates: one captured path from ONE artifact made the
+  # old `captured > 0` guard pass for every other dirty path — measured on a real fixture where a
+  # staged gitlink (`1 AD S... ghost`) produced a 0-byte patch, one decoy untracked file supplied the
+  # count, and the verdict said COMPLETE over a path that is in no artifact. So every dirty path must
+  # be COVERED by an artifact, and an uncovered one caps the verdict at PARTIAL. `--no-renames` makes
+  # the tracked set a SUPERSET of a rename's porcelain path (delete+add), which can never invent an
+  # uncovered path.
+  : > "$capf"
+  if [ "$patch_ok" = 1 ]; then
+    git -C "$root" diff HEAD --name-only -z --no-renames 2>/dev/null | tr '\0' '\n' >> "$capf"
+  fi
+  if [ "$arch_ok" = 1 ]; then cat "$dir/untracked.list" >> "$capf" 2>/dev/null; fi
+  # ⛔ ONE COLLATION ON BOTH SIDES, AND A COMPARATOR THAT CAN FAIL CLOSED (VGATE cycle 9, F2+F3).
+  # `sort` here once ran under the AMBIENT locale while `comm` ran under C, so a mixed-case snapshot on
+  # a `en_US.UTF-8` box made `comm` answer "file 2 is not in sorted order" — discarded by `2>/dev/null`,
+  # leaving five COVERED paths reported as uncovered. And a `comm` that cannot run at all (absent from
+  # PATH, a broken build) produced an EMPTY uncovered set, which reads as "fully covered" — the same
+  # silent false PASS this leg exists to prevent. So: pinned LC_ALL on every side, and any non-zero
+  # status from sort/comm sets `cmp_ok=0`, which caps the verdict at PARTIAL.
+  cmp_ok=1
+  LC_ALL=C sort -u -o "$capf" "$capf" 2>/dev/null || cmp_ok=0
+  if [ -s "$dirtyf" ]; then
+    LC_ALL=C sort -u -o "$dirtyf" "$dirtyf" 2>/dev/null || cmp_ok=0
+    if [ "$cmp_ok" = 1 ]; then
+      LC_ALL=C comm -23 "$dirtyf" "$capf" > "$dirtyf.uncovered" 2>/dev/null || cmp_ok=0
+      uncovered_n="$(count_lines "$dirtyf.uncovered")" || { uncovered_n=0; cmp_ok=0; }
+    fi
+  fi
+  [ -n "${uncovered_n:-}" ] || uncovered_n=0
+  [ -s "${dirtyf:-}" ] && [ -f "$dirtyf.uncovered" ] && uncovered="$(cat "$dirtyf.uncovered")" || uncovered=""
+  if [ "$st_ok" = 0 ]; then
+    result=PARTIAL                                   # the tree state could not be read at all
+  elif [ "$diff_rc" -ne 0 ]; then
+    result=PARTIAL                                   # `git diff HEAD` failed (unborn branch?)
+  elif [ "${unmerged:-0}" -gt 0 ]; then
+    result=PARTIAL                                   # conflict stages are in no artifact
+  elif [ "${sub_dirty:-0}" -gt 0 ]; then
+    result=PARTIAL                                   # submodule content is in no artifact
+  elif [ "$cmp_ok" = 0 ] || [ "$count_ok" = 0 ]; then
+    result=PARTIAL                                   # a count or the comparison could not run
+  elif [ "${uncovered_n:-0}" -gt 0 ]; then
+    result=PARTIAL                                   # a dirty path no artifact covers
+  elif { [ "${want_tracked:-0}" -eq 0 ] || [ "$patch_ok" -eq 1 ]; } \
+       && { [ "${want_untracked:-0}" -eq 0 ] || [ "$arch_ok" -eq 1 ]; }; then
+    result=COMPLETE
+  else
+    result=PARTIAL
+  fi
+  {
+    printf 'what=cap-wip-snapshot\n'
+    printf 'label=%s\nworktree=%s\nbranch=%s\nhead=%s\n' "$label" "$root" \
+      "$(git -C "$root" branch --show-current 2>/dev/null)" "$(git -C "$root" rev-parse HEAD 2>/dev/null)"
+    printf 'cap_s=%s\nelapsed_s=%s\nrc=%s\n' "$cap" "$elapsed" "$rc"
+    printf 'dirty_paths=%s\ndiff_rc=%s\nstatus_rc=%s\nstatus_stderr_lines=%s\nunmerged_paths=%s\nsubmodule_dirty=%s\nuncovered_paths=%s\ncompare_ok=%s\ncount_ok=%s\n' \
+      "${n_dirty:-0}" "$diff_rc" "$st_rc" "${st_noise:-0}" "${unmerged:-0}" "${sub_dirty:-0}" "${uncovered_n:-0}" "$cmp_ok" "$count_ok"
+    printf 'tracked_paths=%s\ntracked_in_patch=%s\ntracked_bytes=%s\n' "${want_tracked:-0}" "${have_tracked:-0}" "${patch_bytes:-0}"
+    printf 'untracked_paths=%s\nuntracked_in_archive=%s\narchive_bytes=%s\n' "${want_untracked:-0}" "${arch_n:-0}" "${arch_bytes:-0}"
+    printf 'result=%s\n' "$result"
+  } > "$dir/SNAPSHOT.txt" 2>/dev/null
+  if [ "${uncovered_n:-0}" -gt 0 ]; then printf '%s\n' "$uncovered" > "$dir/uncovered.list" 2>/dev/null; fi
+  mkdir -p "$O_ROOT/state" 2>/dev/null || true
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "$label" "$cap" "$elapsed" "$rc" "$result" "$dir" \
+    >> "$O_ROOT/state/capwip.tsv" 2>/dev/null
+  echo "[cap] $label KILLED AT ITS ${cap}s CAP (elapsed=${elapsed}s rc=$rc) with $n_dirty uncommitted path(s) — work PRESERVED ($result): $dir" >> "$log"
+  echo "[cap]   tracked=${want_tracked:-0} path(s) -> tracked.patch (${patch_bytes:-0} bytes, verified=$patch_ok); untracked=${want_untracked:-0} -> untracked.tgz (${arch_bytes:-0} bytes, verified=$arch_ok); uncovered=${uncovered_n:-0}" >> "$log"
+  # QUOTED, because this line is meant to be PASTED. An unquoted `git -C $root apply $dir/...` breaks
+  # on any path containing a space, which turns the recovery instruction into a second failure at the
+  # moment somebody is already rescuing work (VGATE finding, cycle 1).
+  # THREE CASES, not two: "there was no untracked work" is not "the archive failed", and printing the
+  # failed-archive wording over an EMPTY list (VGATE cycle 12) tells an operator to copy nonexistent
+  # files by hand.
+  if [ "${want_untracked:-0}" -eq 0 ]; then
+    echo "[cap]   replay: git -C \"$root\" apply \"$dir/tracked.patch\" (no untracked files were present, so there is no tarball)" >> "$log"
+  elif [ "$arch_ok" = 1 ]; then
+    echo "[cap]   replay: git -C \"$root\" apply \"$dir/tracked.patch\" ; untracked: tar -xzf \"$dir/untracked.tgz\" -C \"$root\"" >> "$log"
+  else
+    # No archive exists — naming one would send an operator to a tar invocation that cannot work.
+    echo "[cap]   replay: git -C \"$root\" apply \"$dir/tracked.patch\" ; the untracked work is listed in \"$dir/untracked.list\" and was NOT archived (copy it by hand from $root)" >> "$log"
+  fi
+  if [ "$result" != COMPLETE ]; then
+    echo "[cap]   INCOMPLETE SNAPSHOT: dirty=${n_dirty:-0} unmerged=${unmerged:-0} submodule=${sub_dirty:-0} uncovered=${uncovered_n:-0} status_ok=$st_ok — the worktree at $root is still the only FULL copy. Do NOT reap it." >> "$log"
+    if [ "${uncovered_n:-0}" -gt 0 ]; then
+      echo "[cap]   paths in NO artifact (see $dir/uncovered.list): $(awk 'NR<=5{printf "%s ", $0}' <<<"$uncovered")" >> "$log"
+    fi
+  fi
+  rm -f "$dirtyf" "$capf" "$dirtyf.uncovered"
+  WIP_SNAPSHOT_DIR="$dir"
+  WIP_SNAPSHOT_RESULT="$result"
+  cap_wip_prune "$O_ROOT/wip"
+  [ "$result" = COMPLETE ] && return 0
+  return 1
+}
+
 # ── the ONE agent invocation ─────────────────────────────────────────────────────
 # run_agent <seconds> <logfile> <promptfile> [label]
 #
@@ -283,6 +635,15 @@ can_spawn() { [ "${1:-0}" -lt "$MAX_LOAD" ]; }
 # `timeout`/`gtimeout`, so this is done in bash: run the agent in the background with a watchdog
 # subshell that kills it after N seconds. The stale-worker reaper in orch-loop.sh is the second line
 # of defence.
+#
+# THE CAP PRESERVES THE WORKTREE (#2045). A kill at the cap used to destroy a lane's uncommitted work
+# and report nothing — see cap_wip_snapshot() above for the measurement. On a cap hit this function
+# snapshots the worktree (tracked patch + untracked tarball, both verified), writes
+# `$O/state/capwip.tsv`, and sets AGENT_CAP_HIT / WIP_SNAPSHOT_DIR / WIP_SNAPSHOT_RESULT so the
+# caller can report it. The tree it reads is `WIP_PATH` if the caller sets it — fix-one.sh does,
+# exactly as it sets DISK_GATE_PATH, because that worker `cd`s into the MAIN checkout while its work
+# lives in the fixer's worktree — and otherwise the agent's own cwd (`$PWD`), which is where a lane
+# and a background worker work.
 #
 # Gated: a refusal does not start the agent at all, and run_agent returns THAT gate's code —
 # AGENT_DISK_REFUSED (77, evaluated FIRST: a full filesystem never clears by waiting) or
@@ -323,6 +684,9 @@ AGENT_STARTED=0
 run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   local t="$1" log="$2" prompt="$3" label="${4:-agent}" pid w rc l start elapsed
   AGENT_STARTED=0
+  # The cap signal is per-invocation state, like AGENT_STARTED: a caller that reads it after a
+  # refusal or a clean run must see 0, never a previous lane's answer.
+  AGENT_CAP_HIT=0; WIP_SNAPSHOT_DIR=""; WIP_SNAPSHOT_RESULT=""
   # ── the disk gate (#1765). Read FRESH immediately before the spawn, for the load gate's reason plus
   # one of its own: a lane can sit waiting for a claim for 90 minutes, and the filesystem it will
   # fill is not the one that was measured when it was dispatched.
@@ -415,6 +779,15 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   # sample and corrupt exactly the series #1709 exists to read.
   mkdir -p "$O/state"
   printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "${KIND:-agent}" "${TAG:-}" "$t" "$elapsed" "$rc" >> "$O/state/walltime.tsv"
+  # ── the CAP path must not destroy the work it interrupts (#2045) ────────────
+  # `elapsed >= t` IS the cap firing: the watchdog kills at exactly `t`, so anything that ran to at
+  # least `t` was killed (or finished in the same second, in which case the tree is either clean or
+  # its work genuinely needs saving — both answers are correct here). It runs AFTER `wait`, so the
+  # hard kill has already landed and this can never delay it.
+  if [ "$elapsed" -ge "$t" ]; then
+    AGENT_CAP_HIT=1
+    cap_wip_snapshot "$label" "$t" "$elapsed" "$rc" "$log" || true
+  fi
   return "$rc"
 }
 

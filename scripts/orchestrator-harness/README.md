@@ -265,7 +265,8 @@ only on macOS — see §2.1), so a killed worker cannot take the controller down
 | `state/roles/loop.ident` | `pid|<identity>` for the doctor loop, where the identity is `proc:<starttime>` from `/proc/<pid>/stat` on Linux and `ps -o lstart=` where `/proc` does not exist — `status` verifies BOTH before reporting the loop RUNNING, so a recycled pid (after a tmux server restart, an OOM kill or a crash) cannot make a dead loop read as alive |
 | `state/roles/merge.attempts` | `PR head epoch reason` for every rail call the merge role made — the head-level cooldown that stops a REFUSED head being retried blind |
 | `logs/` | one log per worker: `lane-*.log`, `chain-*.log`, `merge-*.log`, `fix-*.log`, `orch-loop.log` |
-| `wip/` | dirty-worktree captures taken before a shutdown (see §6) |
+| `wip/` | dirty-worktree captures taken before a shutdown (see §6), plus one `capwip-<stamp>-<pid>/` per lane KILLED AT ITS WALL-CLOCK CAP (#2045): `tracked.patch`, `untracked.tgz`, `untracked.list`, `tracked.numstat` (the re-parse's own output, kept as evidence that the patch was verified) and `SNAPSHOT.txt`. The newest `WIP_SNAPSHOT_KEEP` (10) directories are kept — a cell's disk is the first thing that stops dispatch, so this is a bounded directory, not a log |
+| `state/capwip.tsv` | one row per cap kill — epoch, label, cap seconds, elapsed, exit status, `COMPLETE`/`PARTIAL`, snapshot dir. The companion to `state/walltime.tsv` (`report.sh` computes the cap-hit RATE there; this is what says whether the kill cost any work) and the reason a cap hit is no longer an absence in the fleet's accounting |
 
 ### Why the *reviewer* is a separate process from the *controller*
 
@@ -296,6 +297,20 @@ bash nonblocking-dispatch.sh --status <name>     # running | done rc=0 | failed 
 Status comes from the worker's own exit-status file plus a pid probe — **never `%CPU`**, which reads
 0 for a worker that is merely WAITING (`docs/ops/fleet-liveness.md`). "launched" is the only success
 this script reports: it cannot tell you the work succeeded.
+
+⛔ **A CAP KILL IS ITS OWN FACT (#2045).** Measured 2026-10-18: of eight background lanes, three
+produced nothing, and one died mid-work at its 35-minute cap — 269,237 characters of transcript,
+seven MODIFIED files in its worktree, no report, no `.rc`, and the launcher reported
+`worker finished: … commits=0 PR=none`. A killed lane's log is a slow lane's log, so nothing in the
+harness could tell it from a lane with nothing to do. `run_agent` (`spawn-gate.sh`) now snapshots the
+worktree **after** the hard kill has landed — a verified `tracked.patch` + `untracked.tgz` under
+`$O/wip/capwip-*`, a `state/capwip.tsv` row, and a loud `[cap]` line naming the replay command — and
+the worker publishes `$D/<name>.cap`, so `--status` says
+`failed rc=143 (cap 3000s hit — COMPLETE WIP snapshot: …)` instead of a bare exit status. A cap hit on
+a **clean** tree says `NOTHING WAS LOST` on the same line, because the two facts used to be
+indistinguishable. The snapshot never delays the kill (it runs after `wait`), never writes to the
+worker's index or branch (only `git diff HEAD`, `git ls-files`, `tar`), and calls a backup
+`COMPLETE` only after re-parsing it.
 
 ⛔ **Nothing here reviews anything.** The worker runs with `AGENT_SKIP_REVIEW_GATE=1` (a child has no
 `task` tool and cannot satisfy the gates itself), so **the PARENT owns the review gate** — hand the
