@@ -161,6 +161,52 @@ def test_main_prints_the_unavailable_line_even_if_compute_raises(monkeypatch, no
     assert "DELIVERY: unavailable (metrics read failed)" in capsys.readouterr().out
 
 
+# ── the CACHE-HIT path is the one taken most beats, and it must not go silent ──
+def test_a_cache_this_version_cannot_render_falls_through_to_a_real_line(monkeypatch, no_cache, capsys):
+    """The cache-hit path is ~15 of every 16 beats (TTL 1800 s, heartbeat ~2 min) and it sits
+    ABOVE the `compute()` guard, so a cache written by another schema, or truncated, used to rise
+    out of `sys.exit(main())` and print NOTHING — measured: `{"ts": <now>}` → KeyError 'p0',
+    `{"ts": <now>, "p0": {}}` → KeyError 'open', `open_prs: "many"` → TypeError in `%d`. The
+    heartbeat pipes stderr away, so the beat simply loses the line. A cache this version cannot
+    render is not a cache: it now falls through to `compute()` (which answers or says
+    `unavailable`), and the render is guarded as well.
+    """
+    import json as _json
+    import time as _time
+
+    bad = [
+        {"ts": int(_time.time())},                                    # no p0/p1 at all
+        {"ts": int(_time.time()), "p0": {}},                         # stops one level short
+        {"ts": int(_time.time()), "p0": {"open": 1}, "p1": {"open": 1},
+         "open_prs": 1, "merged_today": 1},                           # tier keys missing
+        {"ts": int(_time.time()), "p0": {"open": "many", "with_pr": 0, "without": 0},
+         "p1": {"open": 0, "with_pr": 0, "without": 0},
+         "open_prs": 1, "merged_today": 1},                           # `%d` on a str
+        [1, 2, 3],                                                    # not even a mapping
+    ]
+    for cached in bad:
+        no_cache.write_text(_json.dumps(cached))
+        # `compute()` is stubbed to fail so the assertion is about the CACHE path, not the fetch.
+        monkeypatch.setattr(bp, "compute", lambda: None)
+        assert bp.main() == 0, cached
+        out = capsys.readouterr().out
+        assert "DELIVERY: unavailable (metrics read failed)" in out, cached
+
+    # AND THE VALIDATION ITSELF, separately from the render guard: an unusable cache must FALL
+    # THROUGH to a fresh read, not merely fail loudly. Here `compute()` answers properly, so the
+    # line has to carry the FRESH numbers — if the bad cache were used, the render guard would
+    # print `unavailable` and this assertion fails.
+    no_cache.write_text(_json.dumps({"ts": int(_time.time()), "open_prs": 99, "merged_today": 99}))
+    fresh = {"ts": int(_time.time()), "open_prs": 2, "merged_today": 1,
+             "p0": {"open": 1, "with_pr": 1, "without": 0},
+             "p1": {"open": 0, "with_pr": 0, "without": 0}}
+    monkeypatch.setattr(bp, "compute", lambda: fresh)
+    assert bp.main() == 0
+    out = capsys.readouterr().out
+    assert "unavailable" not in out, out
+    assert "2 open PRs, 1 merged today" in out, out
+
+
 # ── (c) REST `closed` also carries unmerged PRs -> excluded ──────────────────
 def test_rest_closed_window_excludes_unmerged_prs(monkeypatch):
     """`gh pr list --state merged` never returned a closed-unmerged PR, so REST must not
@@ -332,38 +378,38 @@ def test_rest_pages_the_requested_window_and_refuses_a_partial_read(monkeypatch)
     assert reached == [], "an unauthenticated read must be refused BEFORE any request"
 
 
-# ── a row that shifts across a page boundary is counted ONCE ────────────────
+# ── a row that moves across a page boundary REFUSES the window ──────────────
 def test_a_row_that_moves_across_a_page_boundary_refuses_the_window(monkeypatch):
-    """The window is paged by OFFSET over a LIVE order (`sort=updated&direction=desc`), so a PR
-    updated between two requests jumps to the head and every row below it shifts by one. That is
-    ONE event with TWO consequences, and filtering only one of them is the bug:
+    """The window is paged by OFFSET over a LIVE order (`sort=updated&direction=desc`). A PR
+    updated mid-read jumps to offset 0 — INSIDE the page already read — and every row below it
+    shifts down by one. That is ONE event, and it produces the two symptoms the guard is about:
 
-      * the mover is returned by the page that read it AND by the next page (so `compute()`, which
-        sums these rows, double-counted it);
-      * a row that ENTERED at the head after page 1 was read sits at offset 0 and is returned by
-        NO page — so the window is also SHORT, and the just-merged PR is exactly what is missing.
+      * the row that sat at the END of the page just read is pushed across the boundary and
+        returned a SECOND time by the next page (the double-count);
+      * the mover itself is at offset 0, already behind the cursor, so it is returned by NO page
+        (the missing row — for the closed window, exactly the PR that just merged).
 
-    A dedupe fixes the first and leaves the second silently short — the class this file refuses
-    to report. A repeat can only arise from the list changing between two requests, so it is a
-    SOUND DETECTOR: the read refuses. Measured with the real paging loop before this guard: 200
-    rows, 198 distinct, rows 99 and 150 repeated; simulated end-to-end, one merge landing mid-read
-    left `merged_today` at 0 where the truth was 1.
+    Filtering the duplicate fixes only the first and leaves the second silently short — the
+    class this file refuses to report. A repeat can only arise from the list changing between
+    two requests, so it is a SOUND detector for this direction: the read refuses. Measured with
+    the shipped loop: #150 bumped after page 1 → `100` repeated, `150` never returned.
     """
     monkeypatch.setattr(bp, "_token", lambda: "test-token")
 
     def shifted(url, tok, timeout=None):
         page = int(url.rsplit("page=", 1)[1])
         if page == 1:
-            return [rest_row(150, merged_at=MERGED_TODAY)] + [rest_row(n) for n in range(1, 100)]
-        # Page 2 begins one row earlier because row 150 jumped to the head: 99 repeats, and the
-        # PR that entered at offset 0 (150 here) was already missed by page 1's read.
-        return [rest_row(n) for n in range(99, 200)]
+            # Served BEFORE the bump: the natural order 1..100.
+            return [rest_row(n, merged_at=MERGED_TODAY) for n in range(1, 101)]
+        # Served AFTER #150 bumped to the head: offset 100 now lands on 100 (already read),
+        # and #150 itself is at offset 0 — behind the cursor, never returned.
+        return [rest_row(n) for n in range(100, 200)]
 
     monkeypatch.setattr(bp, "_rest_get_json", shifted)
     assert bp._rest_prs("open", limit=200) is None, (
         "a repeat proves the list moved mid-read, and a moved list is also a SHORT one — the "
-        "window cannot be certified, so it must not be returned (a dedupe would hide the "
-        "double-count and leave the metric short)")
+        "window cannot be certified, so it must not be returned (keeping the window would "
+        "hide the missing row)")
 
     # The other direction: a shift that stays INSIDE one page produces no repeat and costs
     # nothing, so the refusal is not a blanket one — a stable read of the same window is an
@@ -562,7 +608,7 @@ def test_a_page_of_unusable_rows_refuses_instead_of_reporting_zero(monkeypatch):
         # ⛔ PRESENCE IS NOT ENOUGH — the TYPES that are hashed, dereferenced and compared must
         # be the documented ones, or the guard reports "not malformed" and something further in
         # raises instead. Measured before these cases: `number: {}`/`[]` raised TypeError out of
-        # the dedupe's `in numbers` and printed NO line at all; `head: "x"` raised
+        # the repeat check's `in numbers` and printed NO line at all; `head: "x"` raised
         # AttributeError; a dict `merged_at` raised in `compute()`'s comparison.
         [{"number": {"x": 1}}],                            # unhashable number
         [{"number": [1]}],                                 # unhashable number
