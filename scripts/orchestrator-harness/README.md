@@ -1365,7 +1365,7 @@ alive**; the dispatcher printed `held by …` for each and then `backlog empty q
 | rule | when it fires | why it cannot steal a live peer |
 |---|---|---|
 | **own former names** | the owner host is a name THIS box has carried (`state/claim-hosts`) | the list only ever holds names this box answered to (written from the real `hostname -s`, never from a seam), and it requires the `hostname` probe to answer — a blind probe abstains. Nothing ships a roster, so this is what makes a rename self-heal. ⚠️ **Read the residual in the next paragraph: this rule runs for EVERY keying, so it can free an in-flight ISSUE claim.** |
-| **local pid** | the owner host IS this host and `ps -p <pid>` says the pid is gone | **PR claims ONLY.** A PR claim is minted by the worker (`merge-one`/`fix-one`), so its pid IS the worker. An ISSUE claim is minted by the CONTROLLER and released by the CHAIN, so a controller restart (every deploy) would have this delete a live lane’s barrier and re-open the duplicate — the rule is keyed, not global. It also needs a control probe (`ps -p $$`) to prove `ps` can answer at all; an instrument failure abstains, never steals |
+| **local pid** | the owner host IS this host **or one of its former names** (both are this machine) and `ps -p <pid>` says the pid is gone | **PR claims ONLY.** A PR claim is minted by the worker (`merge-one`/`fix-one`), so its pid IS the worker. An ISSUE claim is minted by the CONTROLLER and released by the CHAIN, so a controller restart (every deploy) would have this delete a live lane’s barrier and re-open the duplicate — the rule is keyed, not global. A LIVE local pid therefore OUTRANKS the host name — that ordering is the P0 fixed in `720e780d`, where the former-name rule reaped a renamed box’s own live merge/fix claim. It also needs a control probe (`ps -p $$`) to prove `ps` can answer at all; an instrument failure abstains, never steals |
 | **`CLAIM_DEAD_HOSTS`** | the owner host is listed | an explicit deny list — a mis-entry over-reaps only the host it names |
 | **`CLAIM_KNOWN_HOSTS`** | the roster is SET, **names this box**, and does not list the owner host | a roster that does not name this box is stale (its usual cause is the very rename) and **abstains**; an unset roster never means "every peer is dead" |
 
@@ -1380,8 +1380,16 @@ from the running host. Nothing in a deployed cell sets it.
 ⚠️ **The self-heal covers renames AFTER this ships, not the leases a rename already stranded.** A
 name can only be recognised as *former* if the box recorded it while that name was still current, and
 the recorder did not exist before this change — so the leases the incident measured (including the
-literal `9768s left` line above) are cleaned up ONCE by `CLAIM_DEAD_HOSTS=<old-name>` / a hand
-release, after which the mechanism holds. Stated because "self-healing" reads as "retroactive".
+literal `9768s left` line above) need a ONE-TIME cleanup, after which the mechanism holds. Stated
+because "self-healing" reads as "retroactive".
+
+⚠️ **Use the pid-preserving remedy, not `CLAIM_DEAD_HOSTS`.** Append the old name to
+`state/claim-hosts` (“this box wore it”) — the former-name rule then probes the pid, so a
+`<oldName>:<live pid>` PR claim reads held-by-live and a dead one is reclaimed. `CLAIM_DEAD_HOSTS=<old-name>`
+instead declares the name dead *outright*, so a claim minted by THIS box before the rename is reaped
+even while its `merge-one`/`fix-one` worker is alive — the same P0 (§7.2b) arriving through the
+remedy. Only use the deny list when no merge/fix is in flight (measured: with the name on the deny
+list a live local pid returns `owner host oldName is on CLAIM_DEAD_HOSTS`, rc=0).
 
 ⚠️ **THE HOST RULES RUN FOR EVERY KEYING, AND THAT HAS A CONSEQUENCE WORTH STATING PLAINLY.** They
 answer "is the holder a live LANE?", and a name that no box answers to is dead *as an identity* — but

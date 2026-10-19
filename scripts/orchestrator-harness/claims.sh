@@ -358,7 +358,11 @@ claim_former_hosts() { # -> space-separated host names this box has used, EXCLUD
   # minted by a real non-seam process ON THE SAME MACHINE. The steal direction, reached through the
   # seam, in the branch whose comment below says a probe that cannot answer abstains.
   real="$(hostname -s 2>/dev/null)" || return 0
-  [ "$real" != "box" ] || return 0
+  # ⛔ EXIT 0 WITH EMPTY OUTPUT IS ALSO AN UNANSWERABLE PROBE (cycle-8 review). Testing only the
+  # sentinel let a `hostname` that succeeds and prints nothing through: `real` was empty, nothing was
+  # subtracted, and the machine's OWN CURRENT name came back as FORMER — the same steal direction, one
+  # shim away. Non-empty AND not the sentinel, or abstain.
+  [ -n "$real" ] && [ "$real" != "box" ] || return 0
   claim_host_record "$cur"
   # ⛔ MUST RETURN 0 EVEN WITH NO FILE. It is called inside a command substitution
   # (`roster=" $(claim_former_hosts) "`) and callers run under `set -e` — a bare `awk` on a missing
@@ -372,9 +376,12 @@ claim_former_hosts() { # -> space-separated host names this box has used, EXCLUD
 # ── IS THE HOLDER STILL A LIVE LANE? (agent-infra#2094) ───────────────────────────────────────
 # `claim_orphan_reason <owner>` -> prints WHY the holder is orphaned and returns 0; returns 1 when
 # the holder may still be alive. Four rules, in increasing cost, each failing toward UNDER-reaping:
-#   1. THE LOCAL RULE, always on, needs no configuration — for a **PR** claim only. The owner's host
-#      IS this host, so the pid is directly checkable: a PR claim naming a pid that no longer exists
-#      cannot be a live worker. It is what a single-box fleet needs.
+#   1. THE LOCAL RULE, always on, needs no configuration — for a **PR** claim only. The owner host IS
+#      this host **or one of its former names** (both are THIS machine, so the pid is directly
+#      checkable: a PR claim naming a pid that no longer exists cannot be a live worker), and a LIVE
+#      local pid OUTRANKS the host name — that ordering is the P0 fixed in 720e780d, where a renamed
+#      box's own live merge/fix claim was reaped by the former-name rule. It is what a single-box fleet
+#      needs.
 #      ⚠️ IT IS NOT WHAT THE INCIDENT NEEDED, and an earlier version of this comment said it was
 #      (corrected after the cycle-3 review). The incident's 14 dead leases were ISSUE claims
 #      (`refs/claims/issue-9063` …), whose owner host was the box's OLD name and therefore NOT this

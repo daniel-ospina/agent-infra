@@ -82,7 +82,7 @@
 #      below the review window it must outlive — a mid-review expiry, the duplicate this registry
 #      exists to prevent — and leaves nothing to diagnose.
 # ⛔ LABELLING HONESTY — MEASURED, not asserted. `CLAIMS_SH=<git archive HEAD>:claims.sh bash
-# claim-orphan.test.sh` (2026-10-18, against the pre-change claims.sh) reports 46 passed, 42 FAILED.
+# claim-orphan.test.sh` (2026-10-18, against the pre-change claims.sh) reports 47 passed, 42 FAILED.
 # Every [RED→GREEN] line is in that failing set, and so is exactly ONE line that carries no such label:
 # `O7 the PR keying declares a documented ceiling` (a pre-fix reader has no ceiling to declare). The
 # converse is what keeps the labels honest: a [PINNED] line must PASS pre-fix, because PINNED means
@@ -744,6 +744,19 @@ FORMERS4="$( cd "$T" || exit 1
 [ -z "${FORMERS4// /}" ]
 O19F_RC=$?
 ck "O19 [RED→GREEN] a SEAM + a BLIND hostname probe abstains too (got '${FORMERS4}')" $O19F_RC
+# ... including a probe that SUCCEEDS and prints NOTHING (cycle-8 review): `real=""` subtracted nothing,
+# so the machine's own current name came back as FORMER — the same steal direction, one shim away.
+mkdir -p "$T/bin-emptyhost"
+printf '#!/bin/sh\nexit 0\n' > "$T/bin-emptyhost/hostname"; chmod +x "$T/bin-emptyhost/hostname"
+FORMERS5="$( cd "$T" || exit 1
+  CLAIM_REPO="$T/repo"; CLAIM_STATE_DIR="$O19H"; CLAIM_OWNER_HOST=seamBox
+  export CLAIM_REPO CLAIM_STATE_DIR CLAIM_OWNER_HOST
+  PATH="$T/bin-emptyhost:$PATH"; export PATH
+  . "$CLAIMS_SH" || exit 1
+  claim_former_hosts )"
+[ -z "${FORMERS5// /}" ]
+O19G_RC=$?
+ck "O19 [RED→GREEN] a probe that exits 0 with EMPTY output abstains too (got '${FORMERS5}')" $O19G_RC
 
 
 # ══ O20: the PRUNE's unparseable-lease skip is a DELETING branch and was untested ══
