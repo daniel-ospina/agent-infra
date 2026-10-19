@@ -866,13 +866,15 @@ grep -q 'resolving the conflict IS the task' "$HERE/fix-one.sh" && rc=0 || rc=1
 ck "the fixer prompt treats a conflict as the task" $rc
 # Drive the shipped rule rather than grepping for a comment: a regression that dropped the
 # 'lanes >= 1' exception or the headroom arithmetic must fail here.
-sed -n '/^mp_reason() {/,/^}/p;/^review_slots() {/,/^}/p' "$LOOP" > "$TMP/mp.sh"
-# mp_reason's fail-closed arm calls is_num(); the extraction must carry the dependency or that arm
-# dies with "command not found" — a command that never runs returns non-zero, which reads as
-# "capacity available" (fail OPEN).
-grep -E '^is_num\(\) \{' "$LOOP" >> "$TMP/mp.sh"
+{ grep -E '^is_num\(\) \{' "$LOOP"; sed -n '/^mp_reason() {/,/^}/p;/^review_slots() {/,/^}/p' "$LOOP"; } > "$TMP/mp.sh"
+# ⛔ is_num FIRST in the file: mp_reason's fail-closed arm calls it, and a command that never runs
+# returns non-zero, which reads as "capacity available" (fail OPEN).
 if need "$TMP/mp.sh" "mp_reason()/review_slots() are extracted from the shipped loop"; then
   MERGE_PRIORITY_AT=10; MAX_REVIEW=4
+  # ⛔ THIS BRANCH HAS NO TIME BOUND AND NO EVIDENCE PREAMBLE (owner ruling, 2026-10-18): the gate
+  # blocks while ONE un-owned PR remains, and a stalled drain is NAMED (`[dispatch] DRAIN STALLED`)
+  # rather than released. Driving it therefore needs only (count, lanes, workers) — and the cases
+  # below fail if a release arm comes back, because `mp_reason 11 …` would then return empty.
   # shellcheck disable=SC1090
   . "$TMP/mp.sh"
   [ -n "$(mp_reason 11 1)" ] && rc=0 || rc=1
@@ -897,6 +899,10 @@ if need "$TMP/mp.sh" "mp_reason()/review_slots() are extracted from the shipped 
   ck "shipped review_slots(): 0 un-owned -> the base budget" $rc
   [ "$(review_slots x)" = "4" ] && rc=0 || rc=1
   ck "shipped review_slots(): a non-numeric count falls back to the base budget (not an error)" $rc
+  # ⛔ The tunable must not leak into the rest of the suite: an EXPORTED MERGE_PRIORITY_AT in the
+  # caller's environment survives this plain assignment, so a later §N driver inherited it and graded
+  # the ambient env instead of the shipped default (#2040's finding — kept through the merge).
+  unset MERGE_PRIORITY_AT MERGE_PRIORITY_MAX_AGE_MIN
 fi
 grep -qE 'case "\$\{PR_ST:-\}" in MERGED\|CLOSED\)' "$LOOP" && rc=0 || rc=1
 ck "sweep skips CLOSED as well as MERGED" $rc
@@ -2496,10 +2502,12 @@ NGRD="$( { grep -F 'is_num() {' "$LOOP"; grep -F 'is_limit() {' "$LOOP"; grep -E
 # coercion lines present -- the guard could not fail while is_num() existed. Count the coercion lines,
 # and count an EXACT number: adding a coercion without adding its pin is the failure this catches.
 _ngrd_n="$(printf '%s\n' "$NGRD" | grep -cE '^is_(num|limit) "\$\{[A-Z_]+:')"
-# 12 -> 14 for agent-infra#1762 (SWEEP_MAX_AGE, SWEEP_MIN_REMAIN). The exact count is the point:
+# 12 -> 14 for agent-infra#1762 (SWEEP_MAX_AGE, SWEEP_MIN_REMAIN); 14 -> 16 for agent-infra#2040
+# (MERGE_PRIORITY_MAX_AGE_MIN + FUNNEL_MAX_AGE_MIN: the merge-priority bound and the funnel's age
+# bound). The exact count is the point:
 # a coercion added without its pin must redden this check, not pass as "more is better".
-[ "$_ngrd_n" = "14" ] && rcn=0 || { rcn=1; echo "      expected 14 shipped coercions in the extraction, got $_ngrd_n"; }
-ck "all 14 shipped limit coercions are extracted (a definition alone is not an extraction)" $rcn
+[ "$_ngrd_n" = "16" ] && rcn=0 || { rcn=1; echo "      expected 16 shipped coercions in the extraction, got $_ngrd_n"; }
+ck "all 16 shipped limit coercions are extracted (a definition alone is not an extraction)" $rcn
 # The CYC FLOOR is part of the same coercion block but is not an is_* line, so it is extracted by an
 # explicit pattern (P3, third review round, 2026-10-14). Without it in NGRD, `nlim` could not drive
 # CYC=0 and the floor assertion below would be RED on the FIXED file — a false negative that would

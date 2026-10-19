@@ -22,6 +22,13 @@ MP="$(ex mp_reason)"
 if [ "$(printf '%s' "$MP" | wc -l | tr -d ' ')" -lt 3 ]; then
   echo "❌ could not extract mp_reason from $ORCH — the rule moved or was reformatted"; exit 1
 fi
+# ⛔ mp_reason is no longer arithmetic-only: it validates its inputs with is_num(), the shipped
+# one-liner. Extract THAT from the same file (never re-implement it here, or the suite would grade
+# its own copy) and fail loudly if it moved — an undefined is_num makes every gate test read "no
+# gate", i.e. a suite that passes by testing nothing.
+IS_NUM_FN="$(grep -E '^is_num\(\) \{' "$ORCH")"
+[ -n "$IS_NUM_FN" ] || { echo "❌ could not extract is_num() from $ORCH — mp_reason's input validation moved"; exit 1; }
+eval "$IS_NUM_FN"
 eval "$MP"
 # ⛔ mp_reason's fail-closed arm calls is_num(), which the controller defines 30 lines above it. The
 # extraction must bring the dependency along or the arm dies with "command not found" — and a command
@@ -32,11 +39,20 @@ eval "$_ISNUM"
 echo "extracted $(printf '%s' "$MP" | wc -l | tr -d ' ') lines of mp_reason from the live script"
 
 MERGE_PRIORITY_AT=10
-ck() { # ck <label> <open_prs> <lanes> <workers> <expect: gate|open>
-  local got; got="$(mp_reason "$2" "$3" "$4")"
+MERGE_PRIORITY_MAX_AGE_MIN=180
+# A fixed clock and two land records, so the bound is exercised deterministically: the gate now needs
+# EVIDENCE that a drain is happening (a land inside the window) and YOUTH (an unowned PR inside it).
+MP_NOW=1800000000
+MP_LAND_RECENT=$(( MP_NOW - 300 ))          # a PR landed 5 minutes ago
+MP_LAND_STALE=$(( MP_NOW - 4 * 3600 ))      # the last land was 4 hours ago
+ck() { # ck <label> <unowned> <lanes> <workers> <expect: gate|open> [age] [land] [open] [blocked_since]
+  # `-` (not `:-`): an EXPLICIT empty argument is a CASE (an unreadable land record / age), and
+  # `:-` would silently substitute the healthy default — making the release cases below unprovable.
+  local got age="${6-5}" land="${7-$MP_LAND_RECENT}" open="${8-$2}" since="${9-}"
+  got="$(mp_reason "$2" "$3" "$4" "$age" "$land" "$open" "acme/widget" "$MP_NOW" "$since")"
   if [ "$5" = "gate" ] && [ -n "$got" ]; then echo "  ✅ $1  (gated)"; PASS=$((PASS+1))
   elif [ "$5" = "open" ] && [ -z "$got" ]; then echo "  ✅ $1  (dispatch allowed)"; PASS=$((PASS+1))
-  else echo "  ❌ $1 — expected $5, got [${got:-<empty>}] for (prs=$2 lanes=$3 workers=$4)"; FAIL=$((FAIL+1)); fi
+  else echo "  ❌ $1 — expected $5, got [${got:-<empty>}] for (prs=$2 lanes=$3 workers=$4 age=${6-5} land=${land:-<none>})"; FAIL=$((FAIL+1)); fi
 }
 
 echo
@@ -1015,18 +1031,18 @@ echo "=== ownership is a LIVE FACT (owner ruling, 2026-10-18) ==="
 # rename/reformat/regression fails here instead of silently skipping.
 INST="$HERE/install.sh"
 LO="$HERE/live-ownership.sh"
-for _fn in fix_slots review_slots pr_owned claim_foreign_live claim_live claim_lease_live unowned_pr_count; do
+for _fn in fix_slots review_slots pr_owned claim_foreign_live claim_live claim_lease_live unowned_pr_count unowned_scan; do
   ex "$_fn" > "$TMP/$_fn.sh"
 done
 grep -E '^is_num\(\) \{'    "$ORCH" > "$TMP/is_num.sh"
 grep -E '^_this_host\(\) \{' "$ORCH" > "$TMP/this_host.sh"
 _own_ok=1
-for _fn in fix_slots review_slots pr_owned claim_foreign_live claim_live claim_lease_live unowned_pr_count is_num this_host; do
+for _fn in fix_slots review_slots pr_owned claim_foreign_live claim_live claim_lease_live unowned_pr_count unowned_scan is_num this_host; do
   [ -s "$TMP/$_fn.sh" ] || { echo "  ❌ could not extract $_fn() from orch-loop.sh — the rule moved or was reformatted"; _own_ok=0; }
 done
 [ -f "$LO" ] || { echo "  ❌ $LO is missing — the ownership predicate moved"; _own_ok=0; }
 cat "$TMP/is_num.sh" "$TMP/this_host.sh" "$TMP/fix_slots.sh" "$TMP/review_slots.sh" \
-    "$TMP/pr_owned.sh" "$TMP/claim_foreign_live.sh" "$TMP/claim_live.sh" "$TMP/claim_lease_live.sh" "$TMP/unowned_pr_count.sh" > "$TMP/ownfunctions.sh"
+    "$TMP/pr_owned.sh" "$TMP/claim_foreign_live.sh" "$TMP/claim_live.sh" "$TMP/claim_lease_live.sh" "$TMP/unowned_pr_count.sh" "$TMP/unowned_scan.sh" > "$TMP/ownfunctions.sh"
 if [ "$_own_ok" = "1" ] && bash -n "$TMP/ownfunctions.sh" 2>/dev/null; then
   # the SHIPPED predicate, not a re-implementation of it
   # shellcheck source=/dev/null
@@ -1311,6 +1327,55 @@ FAKE
        'if declare -f lo_scan lo_order lo_select_rows lo_select lo_class_compact >/dev/null 2>&1; then'
   # ⛔ (R2, P2) a FAILED scan must stop the predicate reading a table it could not refresh.
   wpin "a failed scan blanks LO_LIVE (the predicate cannot read a stale table)" "$ORCH" '      LO_LIVE=""'
+  # ── THE DRAIN LINE IS DRIVEN, NOT PINNED (measured: an unset-variable abort inside it killed every
+  # cycle right after `[dispatch] issues BLOCKED`, and a TEXT pin stayed green through all of it).
+  # The block is delimited by [drain-health:begin|end] so it can be extracted and RUN.
+  _DRAIN_BLOCK="$(sed -n '/^ *# \[drain-health:begin\]/,/^ *# \[drain-health:end\]/p' "$ORCH")"
+  # here-string, never `printf … | grep -q` (#841/#864: the producer takes SIGPIPE and pipefail flips it)
+  if grep -q 'DRAIN STALLED' <<<"$_DRAIN_BLOCK"; then
+    echo "  ok the drain-health block was extracted from the controller"; PASS=$((PASS+1))
+  else
+    echo "  ❌ could not extract the drain-health block (markers moved?)"; FAIL=$((FAIL+1))
+  fi
+  {
+    grep -E '^is_num\(\) \{' "$ORCH"
+    sed -n '/^file_mtime_epoch() {/,/^}/p' "$ORCH"
+    sed -n '/^mp_recent_land() {/,/^}/p' "$ORCH"
+  } > "$TMP/drain_helpers.sh"
+  DO="$TMP/drainO"; mkdir -p "$DO/state"
+  _drain() { # _drain <land-age-minutes> [MERGE_STALL_MIN]
+    ( set -u
+      O="$DO"; LOG="$TMP/drain.log"; : > "$LOG"; UPN_WORK=50
+      . "$TMP/drain_helpers.sh"
+      rm -f "$DO"/state/merged-*.done
+      if [ -n "${1:-}" ]; then
+        : > "$DO/state/merged-7777.done"
+        touch -t "$(date -v-"$1"M +%Y%m%d%H%M)" "$DO/state/merged-7777.done" 2>/dev/null || true
+      fi
+      if [ -n "${2:-}" ]; then MERGE_STALL_MIN="$2"; else unset MERGE_STALL_MIN; fi
+      eval "$_DRAIN_BLOCK"   # SAME shell: the block reads O/LOG/UPN_WORK as shell vars
+      cat "$LOG" )
+  }
+  _out="$(_drain 5)"; rc=$?
+  if [ "$rc" -eq 0 ]; then
+    echo "  ok the block runs with MERGE_STALL_MIN UNSET, no abort (rc 0)"; PASS=$((PASS+1))
+  else
+    echo "  ❌ the block ABORTED with MERGE_STALL_MIN unset (rc=$rc) — a live cycle dies here: $_out"; FAIL=$((FAIL+1))
+  fi
+  case "$_out" in
+    *"drain alive"*) echo "  ok a RECENT land prints 'drain alive'"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ a recent land did not print 'drain alive': $_out"; FAIL=$((FAIL+1)) ;;
+  esac
+  _out="$(_drain 200)"
+  case "$_out" in
+    *"DRAIN STALLED"*200m*) echo "  ok a 200m-old land NAMES the stall (the age is printed)"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ a 200m-old land did not name the stall: $_out"; FAIL=$((FAIL+1)) ;;
+  esac
+  _out="$(_drain 5 abc)"
+  case "$_out" in
+    *"drain alive"*|*"DRAIN STALLED"*) echo "  ok a NON-NUMERIC MERGE_STALL_MIN falls back to 180 and still decides"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ a non-numeric MERGE_STALL_MIN produced no verdict: $_out"; FAIL=$((FAIL+1)) ;;
+  esac
   # (F7) the documented `scan=` token must be an ARTIFACT, not a comment promise.
   wpin "the population line carries the scan STATUS (a documented token that exists)" "$ORCH" '[select] population=$POP scan=$LO_STATUS'
   # ── REVIEW R1, P1: the SCOPE-FILTERED fallback may never LOWER the gate ──────────────────────
@@ -1389,6 +1454,181 @@ FAKE
   fi
 else
   echo "  ❌ the ownership functions did not extract to syntactically valid shell"; FAIL=$((FAIL+1))
+fi
+
+echo
+echo "=== NO TIME BOUND, NO AGE-BASED RELEASE (owner ruling, 2026-10-18 — #2099) ==="
+# ⛔ THIS SECTION REPLACES agent-infra#2040's bounded-gate suite. #2040 built an age/land/youngest-evidence
+# RELEASE of the merge-priority gate; the owner's ruling has no such arm ("Only when NO un-owned PR
+# remains may the dispatcher create new work by picking issues"), so the machinery — mp_reason's
+# evidence clauses, mp_release, mp_bound_released, mp_released_until/marker, mp_block_marker and
+# unowned_youngest_age_min — was removed at merge. What replaces it is a NAME for a stalled drain
+# plus an ABSENCE PIN below, so the arm cannot return silently.
+if grep -qE 'mp_release|mp_bound_released|mp_released_until|mp_released_marker|mp_block_marker|released_until' "$ORCH"; then
+  echo "  ❌ the age-based RELEASE machinery is back in the controller — that reverses #2099"; FAIL=$((FAIL+1))
+else
+  echo "  ✅ no release machinery in the controller (absence pin over the whole file)"; PASS=$((PASS+1))
+fi
+# …and the GATE ITSELF is driven with that tunable set to a pathological value: a release arm keyed on
+# it would return EMPTY here, which these two cases would catch.
+MERGE_PRIORITY_MAX_AGE_MIN=1
+ck "the tunable cannot release the gate: 3 un-owned with a 1m window -> still DRAIN" 3 1 1 gate
+ck "…and with no lane at all"                                                        3 0 0 gate
+
+echo "=== the repo surface: derived from the checkout, never a standing literal (P1 of the epilogue) ==="
+# The guard counted ANOTHER repo's PR queue for hours because `OR` was an independent literal. The
+# parse is the fix, so it is DRIVEN — every shape, including the ones that must be REFUSED.
+SLUG="$HERE/repo-slug.sh"
+if bash -n "$SLUG" 2>/dev/null; then
+  _slug() { ( . "$SLUG"; repo_slug_from_remote "$1" ); }
+  eqv "https origin -> owner/name"                    "acme/widget" "$(_slug https://github.com/acme/widget.git)"
+  eqv "https origin without .git -> owner/name"        "acme/widget" "$(_slug https://github.com/acme/widget)"
+  eqv "scp-style ssh origin -> owner/name"             "acme/widget" "$(_slug git@github.com:acme/widget.git)"
+  eqv "ssh:// origin with a user -> owner/name"        "acme/widget" "$(_slug ssh://git@github.com/acme/widget.git)"
+  eqv "a LOCAL PATH remote is REFUSED (empty)"         ""            "$(_slug /tmp/foo)"
+  eqv "a file:// remote is REFUSED (empty)"            ""            "$(_slug file:///srv/mirror.git)"
+  eqv "a remote with no owner is REFUSED (empty)"      ""            "$(_slug https://github.com/widget.git)"
+  eqv "an empty remote is REFUSED (empty)"             ""            "$(_slug '')"
+  eqv "an ssh:// origin with an explicit PORT -> owner/name" "acme/widget" "$(_slug ssh://git@github.com:22/acme/widget.git)"
+  eqv "an http origin on a self-hosted port -> owner/name"   "owner/name"  "$(_slug http://ghe.local:8080/owner/name.git)"
+  eqv "a deep path (…/owner/name/tree/main) is REFUSED"      ""           "$(_slug https://github.com/owner/name/tree/main)"
+  eqv "a QUERY string is REFUSED, never carried into gh --repo" ""        "$(_slug 'https://github.com/acme/widget?tab=1')"
+  eqv "a .git/ remote (slash AFTER .git) -> owner/name"      "acme/widget" "$(_slug https://github.com/acme/widget.git/)"
+  eqv "https with a user:token authority -> owner/name"       "acme/widget" "$(_slug https://user:tok@github.com/acme/widget.git)"
+  eqv "an explicit OR that is not owner/name is REFUSED"      ""            "$( ( . "$SLUG"; derive_or "$HERE/../.." garbage ) )"
+  # ⛔ AND THE RETURN CODE SAYS WHICH FAILURE IT IS (review round 8, P1). Conflated with "the origin
+  # cannot be parsed", an invalid pin fell back to the hardcoded literal — #2040 itself — so rc 2 is
+  # the whole difference between "refuse the operator's typo" and "grade a repo nobody named".
+  eqv "an invalid explicit OR returns rc=2 (a config error, not an underivable origin)" \
+      "rc=2" "$( ( . "$SLUG"; derive_or "$HERE/../.." garbage ) >/dev/null 2>&1; echo "rc=$?" )"
+  eqv "a valid explicit OR returns rc=0" \
+      "rc=0" "$( ( . "$SLUG"; derive_or "$HERE/../.." other/repo ) >/dev/null 2>&1; echo "rc=$?" )"
+  # …and an explicit OR still WINS over the checkout (a cell that grades another queue says so).
+  eqv "an explicit OR overrides the checkout"          "other/repo"  "$( ( . "$SLUG"; derive_or "$HERE/../.." other/repo ) )"
+else
+  echo "  FAIL repo-slug.sh does not parse"; FAIL=$((FAIL+1))
+fi
+
+echo
+echo "=== the PR listing carries the HEAD REF end-to-end (the jq is DRIVEN) ==="
+# ⛔ THE ROW FORMAT IS WHAT MAKES OWNERSHIP ANSWERABLE: the live predicate is "a process is in a
+# checkout of this PR's head ref", so the head ref has to ride the SAME listing as the count. Drive the
+# SHIPPED jq program against real JSON — a revert to `number,headRefOid` rows would leave the branch
+# empty and every PR un-owned-by-branch, which is the failure this change removes.
+_JQ_PROG="$(grep -o -- "--jq '[^']*'" "$ORCH" | grep 'headRefName' | head -1 | sed "s/^--jq '//; s/'$//")"
+if [ -n "$_JQ_PROG" ] && command -v jq >/dev/null 2>&1; then
+  eqv "the shipped --jq emits number:headOid:headRef for a normal row" "1 7:abc:feat/x" \
+      "$(printf '%s' '[{"number":7,"headRefOid":"abc","headRefName":"feat/x"}]' | jq -r "$_JQ_PROG")"
+  case "$(grep -o -- '--json number,headRefOid[,a-zA-Z]*' "$ORCH" | head -1)" in
+    *headRefName*) echo "  ok the PR listing ASKS for headRefName in the same read (no second, drifting snapshot)"; PASS=$((PASS+1)) ;;
+    *) echo "  FAIL the PR listing does not request headRefName — the predicate is unanswerable"; FAIL=$((FAIL+1)) ;;
+  esac
+else
+  echo "  FAIL the shipped --jq (or jq itself) is unavailable — the predicate's input is unverifiable"; FAIL=$((FAIL+1))
+fi
+
+echo "=== the land probe is DRIVEN, not described (the stall line reads it) ==="
+# ⛔ `unowned_youngest_age_min` was removed at merge with #2040's release arm (see the absence pin
+# above); `mp_recent_land` SURVIVES because the `DRAIN STALLED` diagnostic and `[cap] last_land=`
+# both read it, so it must stay driven rather than described.
+# ⛔ DRIVEN, NOT DESCRIBED: neither probe was executed by any suite, so a wrong default dir, a wrong
+# glob or a wrong token parse stayed green. The fixture is built from the SHIPPED functions and their
+# real dependencies (is_num, the mtime reader, the ownership arms) — a missing one makes `bash -n` or
+# the probe itself fail loudly instead of returning a plausible empty answer.
+{
+  ex file_mtime_epoch; ex pr_owned; ex claim_foreign_live; ex claim_live; ex claim_lease_live
+  ex unowned_scan; ex unowned_pr_count; ex mp_recent_land
+  grep -E '^is_num\(\) \{' "$ORCH"; grep -E '^_this_host\(\) \{' "$ORCH"
+} > "$TMP/pr_all.sh"
+if bash -n "$TMP/pr_all.sh" 2>/dev/null; then
+  PO="$TMP/probeO"; mkdir -p "$PO/state"
+  _probe() { ( O="$PO"; WSESS=""; . "$TMP/pr_all.sh"; "$@" ); }
+  # (1) a landed PR is evidence of progress; nothing else is.
+  eqv "no state/merged-*.done -> no land recorded" "" "$(_probe mp_recent_land)"
+  : > "$PO/state/merged-1.done"
+  [ -n "$(_probe mp_recent_land)" ] \
+    && { echo "  ok a state/merged-<PR>.done IS read as a land (dir default, glob, mtime)"; PASS=$((PASS+1)); } \
+    || { echo "  FAIL mp_recent_land did not see state/merged-1.done"; FAIL=$((FAIL+1)); }
+  # (2) THE ROW FORMAT (`<pr>:<head-sha>:<head-ref>`). The head REF is what makes the live predicate
+  # answerable, and the marker key is (pr, head). Both are driven here against the SHIPPED parser.
+  printf '7:aaaaaaaaaaaaaaaaaaaa:fix/7-thing 8:bbbbbbbbbbbbbbbbbbbb:fix/8-thing\n' > "$PO/state/last-open-prs"
+  # ⛔ THE 3-FIELD ROW: `needsfix-<pr>-<head>` must still match when the row carries a third field.
+  # Parsed as `sha="<head>:<ref>"` the marker never matches, so EVERY PR reads unowned and the gate's
+  # input is inflated — measured in review.
+  : > "$PO/state/needsfix-8-bbbbbbbbbbbbbbbbbbbb"
+  # ⛔ AND A MARKER IS NOT OWNERSHIP (the whole change): the 3-field row must PARSE, and the marker
+  # must still leave the PR un-owned — a marker authorises a spawn, it does not prove one ran.
+  eqv "a 3-FIELD row parses and its findings MARKER alone does not own it (both unowned)" "2" "$(_probe unowned_pr_count 2)"
+  rm -f "$PO/state/needsfix-8-bbbbbbbbbbbbbbbbbbbb"
+  # …and the HEAD REF alone owns a PR whose branch a live process holds (the whole change): the
+  # fixture's live table stands in for the process, as in the ownership section above.
+  printf 'fix/7-thing\t/repo/.worktrees/x\t1234\t/repo/.worktrees/x\n' > "$PO/state/live.tsv"
+  eqv "a 3-FIELD row whose HEAD REF is held by a live process reads OWNED" "1" \
+      "$( ( O="$PO"; LO_SCAN=1; LO_LIVE="$PO/state/live.tsv"; . "$TMP/pr_all.sh"; . "$LO"; unowned_pr_count 2 ) )"
+  rm -f "$PO/state/live.tsv"
+  # ⛔ THE OLDER-ROW TOLERANCE IS KEPT, RE-POINTED: a 2-field row has no branch, so only the local
+  # arms can own it — it must parse, never crash and never invent a branch.
+  printf '9:cccccccccccccccccccc\n' > "$PO/state/last-open-prs"
+  eqv "a 2-FIELD (older-format) row is tolerated (no branch -> both unowned)" "1" "$(_probe unowned_pr_count 1)"
+  printf '%s\n' "9" > "$PO/state/last-open-prs"
+  eqv "a 1-FIELD row is tolerated too (no crash)" "1" "$(_probe unowned_pr_count 1)"
+else
+  echo "  FAIL the probe functions did not extract to syntactically valid shell"; FAIL=$((FAIL+1))
+fi
+
+echo
+echo "=== the dispatch funnel: decomposes, bounds its record's age, and never fabricates ==="
+ex dispatch_funnel > "$TMP/fn_dispatch_funnel.sh"
+if bash -n "$TMP/fn_dispatch_funnel.sh" 2>/dev/null; then
+  FO="$TMP/funnelO"; mkdir -p "$FO/state"
+  _funnel() { ( O="$FO"; FUNNEL_MAX_AGE_MIN=30; . "$TMP/fn_dispatch_funnel.sh"; dispatch_funnel "$@" ); }
+  # (1) NO record: says UNRECORDED, never "backlog empty" and never a decomposition it lacks.
+  out="$(_funnel 0 "READ(223)(9m)" "" 1000000000)"
+  case "$out" in *UNRECORDED*) echo "  ok a missing funnel record reads UNRECORDED, not as an empty funnel"; PASS=$((PASS+1)) ;;
+    *) echo "  FAIL a missing record produced: $out"; FAIL=$((FAIL+1)) ;; esac
+  case "$out" in "[dispatch] [dispatch]"*) echo "  FAIL the line carries the [dispatch] prefix twice"; FAIL=$((FAIL+1)) ;;
+    "[dispatch] "*) echo "  ok exactly one [dispatch] prefix (the call sites no longer add their own)"; PASS=$((PASS+1)) ;;
+    *) echo "  FAIL the line is not prefixed [dispatch]: $out"; FAIL=$((FAIL+1)) ;; esac
+  # (2) a REAL record decomposes: listed -> per-reason counts -> dispatched, and names the held gate.
+  printf 'listed=223 judged=6 queued=0 collision=0 landed=0 unjudged=6 skipped_checked=0 skipped_dispatched=0 not_reached=217 limit=6 reconciled=1 at=%s\n' 1000000000 > "$FO/state/refresh-funnel"
+  printf '1\n2\n3\n' > "$FO/candidates.txt"
+  out="$(_funnel 2 "READ(223)(9m)" "load=9>=max_load=8" 1000000000)"
+  case "$out" in
+    "[dispatch] 223 candidates -> 0 queued, 0 peer-owned (claim), 0 already landed, 6 unjudged (pre-flight), 0 blacklisted (checked), 0 already dispatched, 217 not reached (limit) -> 2 dispatched | held: load=9>=max_load=8"*)
+      echo "  ok the funnel decomposes the pool and names the held gate"; PASS=$((PASS+1)) ;;
+    *) echo "  FAIL unexpected funnel line: $out"; FAIL=$((FAIL+1)) ;;
+  esac
+  # (3) an UNRECONCILED record is labelled, never rendered as a clean decomposition.
+  printf 'listed=223 judged=6 queued=1 collision=0 landed=0 unjudged=1 skipped_checked=0 skipped_dispatched=0 not_reached=217 limit=6 reconciled=0 at=%s\n' 1000000000 > "$FO/state/refresh-funnel"
+  case "$(_funnel 0 "READ(223)" "" 1000000000)" in *UNRECONCILED*) echo "  ok a record whose parts do not sum is labelled UNRECONCILED"; PASS=$((PASS+1)) ;;
+    *) echo "  FAIL an unreconciled record was rendered as clean"; FAIL=$((FAIL+1)) ;; esac
+  # (4) AGE-BOUNDED: an old record is REPLACED by its age, never presented as this cycle's numbers.
+  printf 'listed=223 judged=6 queued=0 collision=0 landed=0 unjudged=6 skipped_checked=0 skipped_dispatched=0 not_reached=217 limit=6 reconciled=1 at=%s\n' $(( 1000000000 - 3600 )) > "$FO/state/refresh-funnel"
+  out="$(_funnel 0 "READ(223)")"
+  case "$out" in *STALE*) echo "  ok a stale funnel record reads STALE(<age>), not as a fresh decomposition"; PASS=$((PASS+1)) ;;
+    *) echo "  FAIL a one-hour-old record printed as this cycle's: $out"; FAIL=$((FAIL+1)) ;; esac
+  # (5) A record with NO age field is not "fresh" either — unverifiable is STALE (review round 5).
+  printf 'listed=223 judged=6 queued=0 collision=0 landed=0 unjudged=6 skipped_checked=0 skipped_dispatched=0 not_reached=217 limit=6 reconciled=1\n' > "$FO/state/refresh-funnel"
+  out="$(_funnel 0 "READ(223)")"
+  case "$out" in *"STALE(age unknown"*) echo "  ok a record with no usable at= reads STALE(age unknown)"; PASS=$((PASS+1)) ;;
+    *) echo "  FAIL a record with no at= printed as this cycle's: $out"; FAIL=$((FAIL+1)) ;; esac
+  # (6) …and a FUTURE at= (a clock step-back) is unverifiable too, never "0m old".
+  printf 'listed=223 judged=6 queued=0 collision=0 landed=0 unjudged=6 skipped_checked=0 skipped_dispatched=0 not_reached=217 limit=6 reconciled=1 at=%s\n' 1000009999 > "$FO/state/refresh-funnel"
+  out="$(_funnel 0 "READ(223)" "" 1000000000)"
+  case "$out" in *"STALE(age unknown"*) echo "  ok a FUTURE at= is unverifiable (STALE), not a fresh 0m-old decomposition"; PASS=$((PASS+1)) ;;
+    *) echo "  FAIL a future at= was read as fresh: $out"; FAIL=$((FAIL+1)) ;; esac
+  # (7) ABSENT reconciled= is not "reconciled" — only a writer that recorded 1 has shown the sum.
+  printf 'listed=223 judged=6 queued=0 collision=0 landed=0 unjudged=6 skipped_checked=0 skipped_dispatched=0 not_reached=217 limit=6 at=%s\n' 1000000000 > "$FO/state/refresh-funnel"
+  out="$(_funnel 0 "READ(223)" "" 1000000000)"
+  case "$out" in *UNRECONCILED*) echo "  ok a record with no reconciled= field is UNRECONCILED (unverified, not clean)"; PASS=$((PASS+1)) ;;
+    *) echo "  FAIL a record with no reconciliation was rendered as clean: $out"; FAIL=$((FAIL+1)) ;; esac
+  # (8) an EXISTING but empty record is UNRECORDED(unreadable), not "no pass has recorded one yet".
+  : > "$FO/state/refresh-funnel"
+  out="$(_funnel 0 "READ(223)" "" 1000000000)"
+  case "$out" in *"exists but is unreadable"*) echo "  ok an empty record is reported as unreadable, not as 'no pass yet'"; PASS=$((PASS+1)) ;;
+    *) echo "  FAIL an empty record produced: $out"; FAIL=$((FAIL+1)) ;; esac
+else
+  echo "  FAIL dispatch_funnel did not extract to syntactically valid shell"; FAIL=$((FAIL+1))
 fi
 
 echo

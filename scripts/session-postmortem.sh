@@ -2,9 +2,22 @@
 # session-postmortem.sh — pi session JSONL → retrospective report + shared parser.
 #
 # Converts a pi session log (~/.pi/agent/sessions/<project-dir>/*.jsonl) into a
-# plain-text transcript, runs postmortem.sh pattern detection on it (when the
-# eldato postmortem script is reachable), and prepends a token/cost summary
+# plain-text transcript, runs the VENDORED transcript-pattern parser on it
+# (scripts/lib/transcript-patterns.sh, #1921), and prepends a token/cost summary
 # extracted from the session's usage data. Writes one .md file per session.
+#
+# PRODUCER PATH (#1921): the Transcript Patterns section used to default to
+# `/Users/<owner>/Documents/GitHub/eldato/scripts/postmortem.sh` — an absolute path into
+# ANOTHER checkout AND a Mac-only one. This script is farmed (`fleet_srcs`), so it lands on
+# every box while that producer did not: on every box but the owner's the section silently
+# degraded to a placeholder inside a generated report. The producer is now VENDORED beside
+# this file and resolved as a SIBLING — the contract pi-reap-idle.sh (lib/pid-identity.sh),
+# record-review.sh (lib/diff-normalize.py) and cadence-nudge.sh (lib/beat-pair.sh) already
+# use — so it resolves wherever the farm lands: a Mac, a Linux cell, a rebuilt host.
+# `POSTMORTEM_SH` still overrides the producer for a caller with its own, but there is no
+# Mac-cliteral fallback: if the resolved producer is absent (or exits non-zero) the section
+# FAILS LOUDLY — a banner in the report, the reason on stderr, and a non-zero exit for the
+# run. A section that did not run must never read as a section that produced.
 #
 # Parser contract (#341 PR-B / #373): the per-session metric extraction is the
 # SHARED parser for the fleet feedback loop. type:compaction records are
@@ -19,12 +32,18 @@
 #   bash scripts/session-postmortem.sh --latest                # newest session for $PWD
 #   bash scripts/session-postmortem.sh --since <days>          # all sessions newer than N days
 #   bash scripts/session-postmortem.sh --summary <file>...     # shared parser: JSONL to stdout
+#   POSTMORTEM_SH=<producer> bash scripts/session-postmortem.sh <file>   # override the pattern producer
 #
 # Output: <output-dir>/YYYY-MM-DD-<session-id-prefix>.md   (default docs/retrospectives/)
 set -euo pipefail
 
 SESSIONS_DIR="${PI_SESSIONS_DIR:-$HOME/.pi/agent/sessions}"
-POSTMORTEM_SH="${POSTMORTEM_SH:-/Users/danielospina/Documents/GitHub/eldato/scripts/postmortem.sh}"
+# Resolve the pattern producer from THIS script's own directory (see the header): the farm
+# copies scripts/lib/verbatim, so `lib/transcript-patterns.sh` lands beside this file.
+# Never a host-specific absolute path — `$(dirname "${BASH_SOURCE[0]}")` is the repo root's
+# scripts/ in a checkout and $DEST/scripts/ on a farmed box, so the same bytes work on both.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+POSTMORTEM_SH="${POSTMORTEM_SH:-$SCRIPT_DIR/lib/transcript-patterns.sh}"
 OUT_DIR="docs/retrospectives"
 SINCE_DAYS=""
 LATEST=0
@@ -213,7 +232,7 @@ for row in out:
 PYEOF
 }
 
-# ── --summary: shared parser mode (no files written, no postmortem.sh needed) ──
+# ── --summary: shared parser mode (no files written, no pattern producer needed) ──
 if [ "$SUMMARY" = "1" ]; then
     if [ "${#FILES[@]}" -eq 0 ]; then
         echo "usage: session-postmortem.sh --summary <session.jsonl> [more...]" >&2
@@ -255,6 +274,16 @@ else
 fi
 
 mkdir -p "$OUT_DIR"
+
+# A producer that is absent/not a file is reported ONCE up front (an operator running this by
+# hand sees it immediately) and then per-session, where it fails the section loudly.
+PATTERN_FAILURES=0
+if [ ! -f "$POSTMORTEM_SH" ]; then
+    echo "session-postmortem: TRANSCRIPT-PATTERNS PRODUCER MISSING — not a file: $POSTMORTEM_SH" >&2
+    echo "  The farm delivers it as lib/transcript-patterns.sh beside this script (#1921);" >&2
+    echo "  re-run pi-bootstrap/setup.sh on this box, or point POSTMORTEM_SH at a producer." >&2
+    echo "  The Transcript Patterns section of every report below will FAIL, not degrade silently." >&2
+fi
 
 for SESSION in "${SESSION_FILES[@]}"; do
     [ -f "$SESSION" ] || { echo "skip (not found): $SESSION" >&2; continue; }
@@ -342,6 +371,38 @@ for line in open(fp):
 PYEOF
 
     # --- 3. Assemble report ---
+    #
+    # The producer is RUN FIRST, into its own files, so a failure can be told apart from
+    # content. This is the #1921 difference: the old code exec'd it inline and wrote
+    # "_postmortem.sh not found ... transcript-only report_" INSIDE the report, so a
+    # generated report still read as "postmortem produced" while one of its two content
+    # sections had been replaced by a placeholder nobody re-reads. Now: absent producer,
+    # non-zero producer exit, and empty producer output are each a FAILURE of the section —
+    # banner in the report, reason on stderr, non-zero exit for the run.
+    PATTERN_RC=0
+    PATTERN_WHY=""
+    rm -f /tmp/pm-patterns.txt /tmp/pm-patterns.err
+    if [ ! -f "$POSTMORTEM_SH" ]; then
+        PATTERN_RC=127
+        PATTERN_WHY="producer not found: $POSTMORTEM_SH"
+    else
+        cat /tmp/pm-transcript.txt \
+            | bash "$POSTMORTEM_SH" > /tmp/pm-patterns.txt 2>/tmp/pm-patterns.err \
+            || PATTERN_RC=$?
+        if [ "$PATTERN_RC" -ne 0 ]; then
+            PATTERN_WHY="producer exited $PATTERN_RC: $POSTMORTEM_SH"
+        elif [ ! -s /tmp/pm-patterns.txt ]; then
+            # rc=0 with no output is the PASS-shaped failure: nothing to read, nothing to
+            # report. Treat it as a failure, never as "no patterns found".
+            PATTERN_RC=65
+            PATTERN_WHY="producer exited 0 but produced NO output: $POSTMORTEM_SH"
+        fi
+    fi
+    if [ "$PATTERN_RC" -ne 0 ]; then
+        PATTERN_FAILURES=$((PATTERN_FAILURES + 1))
+        echo "session-postmortem: Transcript Patterns section FAILED for $SESSION — $PATTERN_WHY" >&2
+    fi
+
     {
         echo "# Retrospective — $NAME"
         echo ""
@@ -351,11 +412,32 @@ PYEOF
         echo ""
         echo "## Transcript Patterns"
         echo ""
-        if [ -f "$POSTMORTEM_SH" ]; then
-            cat /tmp/pm-transcript.txt | bash "$POSTMORTEM_SH"
+        if [ "$PATTERN_RC" -eq 0 ]; then
+            cat /tmp/pm-patterns.txt
         else
-            echo "_postmortem.sh not found at $POSTMORTEM_SH — transcript-only report_"
+            echo "> ⚠️ **TRANSCRIPT PATTERNS SECTION DID NOT RUN — this report is INCOMPLETE.**"
+            echo ">"
+            echo "> $PATTERN_WHY"
+            echo ">"
+            echo "> The pattern producer is farmed WITH this script as \`lib/transcript-patterns.sh\` (#1921)."
+            echo "> Re-run \`pi-bootstrap/setup.sh\` on this box, or set \`POSTMORTEM_SH\` to a producer."
+            echo "> The raw transcript below is **UNPROCESSED** — no pattern detection was applied to it."
             echo ""
+            if [ -s /tmp/pm-patterns.err ]; then
+                echo "**producer stderr:**"
+                echo '```'
+                cat /tmp/pm-patterns.err
+                echo '```'
+                echo ""
+            fi
+            if [ -s /tmp/pm-patterns.txt ]; then
+                echo "**partial producer output — UNTRUSTED, the producer did not finish:**"
+                echo '```'
+                cat /tmp/pm-patterns.txt
+                echo '```'
+                echo ""
+            fi
+            echo "**raw transcript (UNPROCESSED):**"
             echo '```'
             cat /tmp/pm-transcript.txt
             echo '```'
@@ -365,4 +447,12 @@ PYEOF
     echo "wrote $OUTFILE ($(wc -c < "$OUTFILE" | tr -d ' ') bytes)"
 done
 
-rm -f /tmp/pm-summary.txt /tmp/pm-transcript.txt
+rm -f /tmp/pm-summary.txt /tmp/pm-transcript.txt /tmp/pm-patterns.txt /tmp/pm-patterns.err
+
+# Non-zero when ANY report's Transcript Patterns section failed: a caller that only checks the
+# exit status must not be able to read a batch of incomplete reports as a successful run.
+if [ "$PATTERN_FAILURES" -gt 0 ]; then
+    echo "session-postmortem: $PATTERN_FAILURES report(s) have NO Transcript Patterns section (see the ⚠️ banner in each) — exiting non-zero" >&2
+    exit 1
+fi
+exit 0
