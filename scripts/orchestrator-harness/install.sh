@@ -920,6 +920,15 @@ OR_SHOW="${OR:-}"
 if [ -z "$OR_SHOW" ]; then
   OR_SHOW="$( ( . "$HERE/repo-slug.sh" 2>/dev/null; derive_or "$REPO" "" ) 2>/dev/null || true )"
 fi
+# ⛔ THE FALLBACK IS ASSIGNED, NEVER INLINED INTO ${VAR:-...} BELOW. A single quote inside a
+# parameter expansion's word opens a quote the heredoc never closes, so bash reports
+# `bad substitution: no closing `}' at the `cat <<EOF` line, prints the WHOLE banner
+# unexpanded ($O, $REPO, $STAMP — measured), and the installer still exits 0 having
+# "installed" nothing legible. The durability suite caught it (11 failures in §F); this
+# comment is here because the failure is silent in every other direction.
+if [ -z "$OR_SHOW" ]; then
+  OR_SHOW='<derived from this checkout origin by the loop>'
+fi
 
 cat <<EOF
 
@@ -927,7 +936,7 @@ cat <<EOF
 
   harness   $O
   provenance  $STAMP   (which harness commit this box runs — agent-infra#1745)
-  repo      $REPO   (${OR_SHOW:-<derived from this checkout's origin by the loop>})
+  repo      $REPO   ($OR_SHOW)
   limits    lanes=$MAX_LANES (default: 2.5x cores unless pinned) review=$MAX_REVIEW fix=$MAX_FIX fix_tries=$MAX_FIX_TRIES
             max_load=$MAX_LOAD min_swap_free=${MIN_SWAP_FREE}M min_mem_free_mb=${MIN_MEM_FREE_MB}M batch=$BATCH cycle=${CYC}s
             merge_priority_at=${MERGE_PRIORITY_AT} UNOWNED open PRs
