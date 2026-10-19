@@ -208,10 +208,15 @@ spent_off=$(( 1000 - $(cat "$D/core") ))
 # `judged NOTHING`.
 # Budget 90, reserve 40: the ~5 listing pages leave ~85, the first candidate's cold rebuild (~20) is
 # affordable and the second is not (85 - 20 = 65 < 40 + 30).
+# ⛔ THE PER-CANDIDATE SEAM IS PINNED HERE ON PURPOSE (#1984). This case is about the STARVATION
+# MECHANISM — a pass that cannot afford its whole window must stop and say so — not about the value
+# of the default estimate, which #1984 re-derived from measurement (30 -> 6) after finding the pass
+# judged 6 of 24 affordable candidates. Left unpinned, the case would silently stop testing
+# starvation the moment the default moved, and it would look like a green suite.
 mk_case starved 90
 mk_gh "$D" "$(rows 6)"
 mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
-rf "$D" refresh COLLISION_PREFLIGHT_CORE_RESERVE=40
+rf "$D" refresh COLLISION_PREFLIGHT_CORE_RESERVE=40 COLLISION_PREFLIGHT_CORE_PER_CANDIDATE=30
 n_judged="$(printf '%s\n' "$OUT" | sed -nE 's/.*checked ([0-9]+); backlog now.*/\1/p' | head -1)"
 n_usable="$(printf '%s\n' "$OUT" | grep -cE '^\[refresh\] \+#[0-9]+ CLEAN -> backlog')"
 n_cand="$(wc -l < "$D/o/candidates.txt" 2>/dev/null | tr -d ' ')"
