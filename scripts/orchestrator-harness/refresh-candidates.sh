@@ -1080,6 +1080,23 @@ degraded=0
 # instead of looking like a healthy cell with an empty pool (2026-10-16 review: `lanes: 0` and an
 # unreadable registry were indistinguishable from the outside, and the per-issue lines scroll away).
 ICR_INCOMPLETE=0; QUEUED=0
+# ── CLAIM-DRIVEN OUTCOMES, COUNTED (agent-infra#2094) ──────────────────────────────────────────
+# Two different things a claim does to this pass, and they must never print the same line:
+#   ICR_HELD      a peer's LIVE claim withheld the candidate, so it is NOT queued — a pool full of
+#                 these ends the pass at `backlog now 0`, the healthiest-looking line this script can
+#                 print and the one the incident produced over 192 readable candidates.
+#   ICR_RECLAIMED the only claim on the candidate was ORPHANED, so it WAS queued (the registry's
+#                 pre-flight returns CLEAN for a holder that cannot be a live lane, agent-infra#2094).
+#                 That is the incident's repair happening, and it used to leave no trace at all.
+# ⛔ NEITHER LINE CLAIMS AN ACTION THIS SCRIPT DID NOT TAKE. The refresh READS the registry; the CAS is
+# won (or lost) later by orch-loop's `claim_issue_acquire`. So the wording is "queued because the only
+# claim is orphaned", never "reclaimed" — a comment reporting an effect the code did not produce is the
+# false-green class this file has been fixed for.
+# ⛔ THE ORPHAN TOKEN ONLY APPEARS ON THE CLEAN/PRE-FLIGHT-RECLAIM PATH. Counting it in the
+# COLLISION arm — which is unreachable for it, because the pre-flight returns 0 — would print a
+# column that is always 0 as though it were a measurement (#1931's rule: the absence of a
+# measurement is not a measurement of emptiness).
+ICR_HELD=0; ICR_RECLAIMED=0
 while read -r N; do
   [ -z "${N:-}" ] && continue
   grep -qx "$N" "$O/checked.txt" 2>/dev/null && continue
@@ -1182,7 +1199,13 @@ while read -r N; do
             fi
             usable=$((usable + 1))
             QUEUED=$((QUEUED + 1))
-            echo "[refresh] +#$N CLEAN -> backlog" ;;
+            echo "[refresh] +#$N CLEAN -> backlog"
+            # The pre-flight said CLEAN for a claim that EXISTS: that is an ORPHANED holder being
+            # reclaimed (a fresh issue reads "no claim on #N"). Name it, or the repair is invisible.
+            case "${CLAIM_RESULT:-}" in
+              *rphan*) ICR_RECLAIMED=$((ICR_RECLAIMED + 1))
+                       echo "[refresh] +#$N queued because its ONLY claim is ORPHANED (reclaimable — the acquire still races the CAS) — ${CLAIM_RESULT}" ;;
+            esac ;;
           1) # a live claim: a peer owns it. Leave it UNCHECKED so the next pass re-attempts it —
              # a claim is a window, not a verdict (the peer's work lands).
              # ⛔ AND IT IS USABLE — it is a COLLISION, which is one of the three verdicts the caller
@@ -1191,6 +1214,7 @@ while read -r N; do
              # state this check exists for, while the pass has already printed a verdict per candidate
              # (#1853 review). ICR=2 (INCOMPLETE) stays uncounted — that is not a verdict.
              usable=$((usable + 1))
+             ICR_HELD=$((ICR_HELD + 1))
              echo "[refresh] =#$N COLLISION (cross-box issue claim) — $CLAIM_RESULT; retried next pass" ;;
           2) # unreadable registry: INCOMPLETE, never CLEAN. Also left unchecked, so the issue is
              # re-attempted rather than lost, and NOT queued, so nothing is dispatched on a guess.
@@ -1247,6 +1271,16 @@ done < "$O/.pool"
 # whole pool is peer-owned COLLISIONs — an empty backlog for a legitimate reason (#1853 review).
 if [ "$ICR_INCOMPLETE" -gt 0 ]; then
   echo "[refresh] $ICR_INCOMPLETE of $judged pre-flighted issues INCOMPLETE — the cross-box claim registry could not answer; $QUEUED queued"
+fi
+# ⛔ THE OTHER WAY A POOL EMPTIES WITHOUT LOOKING LIKE A FAULT (agent-infra#2094). Printed only when
+# a claim actually changed this pass's outcome, so a normal pass stays quiet. The withheld count is
+# what makes `backlog now 0` readable as "claims", not as "no work"; the reclaimed count is the
+# rename repair, which is a healthy event but must be visible.
+if [ "$ICR_HELD" -gt 0 ]; then
+  echo "[refresh] $ICR_HELD of $judged candidate(s) WITHHELD by a live cross-box claim (held-by-live) — a short backlog here is claims, not an empty pool (agent-infra#2094)"
+fi
+if [ "$ICR_RECLAIMED" -gt 0 ]; then
+  echo "[refresh] $ICR_RECLAIMED of $judged candidate(s) queued although a claim EXISTS, because it is ORPHANED (held-by-orphan) — the holder host cannot be a live lane; the acquire still races the CAS (agent-infra#2094)"
 fi
 # ⛔ WHAT THIS DOES NOT COVER: the stall that leaves a HEALTHY-LOOKING NON-EMPTY backlog. A
 # persistently-colliding issue consumes the whole window while `checked N; backlog now M` still

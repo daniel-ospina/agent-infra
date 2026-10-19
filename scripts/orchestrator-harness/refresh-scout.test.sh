@@ -98,12 +98,12 @@ mk_case() {
 # sourced file defined see CLAIM_REPO UNSET — `_git` then dies with `CLAIM_REPO: unbound variable`
 # under `set -u`, `_claim_commit` returns empty (its stderr is swallowed), and an empty commit in a
 # `"$c:refs/…"` refspec is a DELETE, not a create. Assign in a SEPARATE statement.
-mk_issue_claim() {
-  local d="$1" n="$2" ttl="$3" c
+mk_issue_claim() {   # <dir> <issue> <lease-seconds-from-now> [<owner-host>]
+  local d="$1" n="$2" ttl="$3" who="${4:-peerbox}" c
   c="$( cd "$d/repo" || exit 1
-        CLAIM_REPO="$d/repo"; CLAIM_OWNER_ID=peerbox; export CLAIM_REPO CLAIM_OWNER_ID
+        CLAIM_REPO="$d/repo"; CLAIM_OWNER_HOST="$who"; export CLAIM_REPO CLAIM_OWNER_HOST
         . "$HERE/claims.sh"
-        _claim_commit peerbox "$(( $(date +%s) + ttl ))" )"
+        _claim_commit "$who" "$(( $(date +%s) + ttl ))" )"
   [ -n "$c" ] || return 1
   git -C "$d/repo" push -q origin "$c:refs/claims/issue-$n"
 }
@@ -1463,6 +1463,41 @@ case "$OUT" in
   *) ok "claim-collision: no \"judged NOTHING\" abort over a pool of peer-held issues" ;;
 esac
 
+# (a2) THE WITHHELD/ORPHAN SPLIT IS A MEASUREMENT, NOT A COLUMN OF ZEROS (agent-infra#2094).
+# The incident's pass ended at `backlog now 0` over 192 readable candidates, and that line is the
+# healthiest-looking output this script can print. The two counters added for #2094 must each be able
+# to be NON-ZERO, or the operator gets a column that always reads 0 (the absence of a measurement is
+# not a measurement of emptiness). (a) above already produced the WITHHELD case; assert it there.
+case "$OUT" in
+  *"WITHHELD by a live cross-box claim"*) ok "claim-withheld: a live peer claim is counted as WITHHELD (the short backlog is claims, not an empty pool)" ;;
+  *) bad "claim-withheld: the withheld aggregate did not print — output: $OUT" ;;
+esac
+case "$OUT" in
+  *"held-by-live"*) ok "claim-withheld: the withheld line carries the held-by-live token" ;;
+  *) bad "claim-withheld: the withheld line does not name held-by-live — output: $OUT" ;;
+esac
+# ⛔ THE ORPHAN CASE IS DRIVEN BY THE REGISTRY'S OWN HOST RULE, not by a stub: the claim is stamped by
+# a host this box names DEAD, so the pre-flight returns CLEAN and the issue is QUEUED — with the reason
+# recorded. CLAIM_DEAD_HOSTS is passed through rf's env passthrough, exactly as an operator would
+# configure a fleet box.
+mk_case claim-orphan
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_gh_one_issue "$D"
+mk_issue_claim "$D" 42 600 deadbox || bad "claim-orphan: could not seed the orphaned issue claim"
+rf "$D" refresh CLAIM_DEAD_HOSTS=deadbox
+case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
+  *42*) ok "claim-orphan: an ORPHANED claim does NOT withhold the issue — it is queued for dispatch" ;;
+  *) bad "claim-orphan: #42 was NOT queued although its only claim is orphaned — candidates='$(cat "$D/o/candidates.txt" 2>/dev/null)' output: $OUT" ;;
+esac
+case "$OUT" in
+  *"ONLY claim is ORPHANED"*) ok "claim-orphan: the pass SAYS the claim was orphaned (previously this left no trace at all)" ;;
+  *) bad "claim-orphan: the orphan reason was not reported — output: $OUT" ;;
+esac
+case "$OUT" in
+  *"held-by-orphan"*) ok "claim-orphan: the reason carries the held-by-orphan token" ;;
+  *) bad "claim-orphan: the reason does not carry held-by-orphan — output: $OUT" ;;
+esac
+
 # (b) The registry is UNREACHABLE (origin removed): INCOMPLETE — never CLEAN. A registry outage must
 #     not become a duplicate dispatch, so nothing is queued and nothing is blacklisted either.
 mk_case claim-unreachable
@@ -1676,7 +1711,7 @@ if [ -s "$T/release.sh" ] && grep -q 'claim_issue_release' "$T/release.sh"; then
     # The box's own claim, minted and pushed the way orch-loop.sh does it; its commit is the fence.
     # (Separate assignments, NOT a prefix on `.` — see mk_issue_claim's note.)
     own="$( cd "$RL1/repo" || exit 1
-            CLAIM_REPO="$RL1/repo"; CLAIM_OWNER_ID=selfbox; export CLAIM_REPO CLAIM_OWNER_ID
+            CLAIM_REPO="$RL1/repo"; CLAIM_OWNER_HOST=selfbox; export CLAIM_REPO CLAIM_OWNER_HOST
             . "$HERE/claims.sh"
             _claim_commit selfbox "$(( $(date +%s) + 600 ))" )"
     [ -n "$own" ] || bad "chain-merge: could not mint the box's own issue claim"
@@ -1701,11 +1736,11 @@ if [ -s "$T/release.sh" ] && grep -q 'claim_issue_release' "$T/release.sh"; then
     git -C "$RL2/repo" remote add origin "$RL2/origin.git"
     cp "$HERE/claims.sh" "$RL2/o/claims.sh"
     stale="$( cd "$RL2/repo" || exit 1
-              CLAIM_REPO="$RL2/repo"; CLAIM_OWNER_ID=selfbox; export CLAIM_REPO CLAIM_OWNER_ID
+              CLAIM_REPO="$RL2/repo"; CLAIM_OWNER_HOST=selfbox; export CLAIM_REPO CLAIM_OWNER_HOST
               . "$HERE/claims.sh"
               _claim_commit selfbox "$(( $(date +%s) - 5 ))" )"
     peerc="$( cd "$RL2/repo" || exit 1
-              CLAIM_REPO="$RL2/repo"; CLAIM_OWNER_ID=peerbox; export CLAIM_REPO CLAIM_OWNER_ID
+              CLAIM_REPO="$RL2/repo"; CLAIM_OWNER_HOST=peerbox; export CLAIM_REPO CLAIM_OWNER_HOST
               . "$HERE/claims.sh"
               _claim_commit peerbox "$(( $(date +%s) + 600 ))" )"
     [ -n "$peerc" ] || bad "chain-merge: could not mint the peer's claim for the fencing case"
@@ -1730,11 +1765,11 @@ if [ -s "$T/release.sh" ] && grep -q 'claim_issue_release' "$T/release.sh"; then
     git -C "$RL3/repo" remote add origin "$RL3/origin.git"
     cp "$HERE/claims.sh" "$RL3/o/claims.sh"
     older="$( cd "$RL3/repo" || exit 1
-              CLAIM_REPO="$RL3/repo"; CLAIM_OWNER_ID=selfbox; export CLAIM_REPO CLAIM_OWNER_ID
+              CLAIM_REPO="$RL3/repo"; CLAIM_OWNER_HOST=selfbox; export CLAIM_REPO CLAIM_OWNER_HOST
               . "$HERE/claims.sh"
               _claim_commit selfbox "$(( $(date +%s) - 60 ))" )"
     newer="$( cd "$RL3/repo" || exit 1
-              CLAIM_REPO="$RL3/repo"; CLAIM_OWNER_ID=selfbox; export CLAIM_REPO CLAIM_OWNER_ID
+              CLAIM_REPO="$RL3/repo"; CLAIM_OWNER_HOST=selfbox; export CLAIM_REPO CLAIM_OWNER_HOST
               . "$HERE/claims.sh"
               _claim_commit selfbox "$(( $(date +%s) + 600 ))" )"
     [ -n "$older" ] && [ -n "$newer" ] || bad "chain-merge: could not mint both generations for the guard case"
@@ -1813,7 +1848,7 @@ if [ -s "$T/unspawned.sh" ] && grep -q 'claim_issue_release_record' "$T/unspawne
   git -C "$NS/repo" remote add origin "$NS/origin.git"
   cp "$HERE/claims.sh" "$NS/o/claims.sh"
   nsown="$( cd "$NS/repo" || exit 1
-             CLAIM_REPO="$NS/repo"; CLAIM_OWNER_ID=selfbox; export CLAIM_REPO CLAIM_OWNER_ID
+             CLAIM_REPO="$NS/repo"; CLAIM_OWNER_HOST=selfbox; export CLAIM_REPO CLAIM_OWNER_HOST
              . "$HERE/claims.sh"
              _claim_commit selfbox "$(( $(date +%s) + 600 ))" )"
   git -C "$NS/repo" push -q origin "$nsown:refs/claims/issue-77"
@@ -1832,7 +1867,7 @@ if [ -s "$T/unspawned.sh" ] && grep -q 'claim_issue_release_record' "$T/unspawne
   git -C "$NS2/repo" remote add origin "$NS2/origin.git"
   cp "$HERE/claims.sh" "$NS2/o/claims.sh"
   peer2="$( cd "$NS2/repo" || exit 1
-            CLAIM_REPO="$NS2/repo"; CLAIM_OWNER_ID=peerbox; export CLAIM_REPO CLAIM_OWNER_ID
+            CLAIM_REPO="$NS2/repo"; CLAIM_OWNER_HOST=peerbox; export CLAIM_REPO CLAIM_OWNER_HOST
             . "$HERE/claims.sh"
             _claim_commit peerbox "$(( $(date +%s) + 600 ))" )"
   git -C "$NS2/repo" push -q origin "$peer2:refs/claims/issue-78"

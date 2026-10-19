@@ -129,9 +129,14 @@ without a human in the loop:
   cells logged `merge-priority (20 open PRs — draining)` at `lanes=1` of a configured 32 with
   59-86% CPU idle and 13.9 GB RAM free (agent-infra#1824; see the tuning table in §4).
   ⚠️ A cross-box claim is a **declared window**, not proof of life — `claims.sh` is explicit that a
-  lease is *data, not liveness* (a remote pid cannot be probed), so an abandoned-but-unexpired
-  claim reads as owned until the lease expires. The residuals and their direction are recorded on
-  `pr_owned()` in `orch-loop.sh`.
+  lease is *data, not liveness* (a REMOTE pid cannot be probed), so an abandoned claim reads as owned
+  until the lease expires — **unless the holder can be shown ORPHANED** (§7.2b, `agent-infra#2094`:
+  this box's own former host name, a host on `CLAIM_DEAD_HOSTS`, a host absent from a current
+  `CLAIM_KNOWN_HOSTS` roster, or a local pid that is gone for a PR claim). The residual is a claim
+  from a host none of those rules can judge — an unknown name with no roster — which still reads as
+  owned until its lease expires; it is an under-count of orphanhood on purpose, because the
+  over-count direction steals a live peer's work. The direction is recorded on `pr_owned()` in
+  `orch-loop.sh`.
 - **Self-healing:** a PR whose reviewer reports real findings is routed to a *fixer*, fixed,
   and re-reviewed — rather than being left red forever (this is the bug that stranded ~15
   PRs before it was fixed; see §7).
@@ -1327,7 +1332,53 @@ releases it before re-entering `merge-one.sh` (otherwise the reviewer-only claim
 to spawn a fixer for the same PR); `orch-loop.sh` refreshes **every** claim in **one** fetch per
 cycle into `state/claims-snapshot`, so `claim_live()` costs no per-PR network call. The lease is
 **data, not liveness** (a remote pid cannot be probed), derived as `REVIEW_TIMEOUT + 1200` for the
-reviewer and `FIX_TIMEOUT + 1200` for the fixer, and carried in the claim commit. Both tunables are
+reviewer and `FIX_TIMEOUT + 1200` for the fixer, and carried in the claim commit.
+
+**A claim can also be DEAD while its term is not (#2094).** Renaming a machine used to orphan every
+lease it held: `claim_owner()` stamped `$(hostname -s):$$`, liveness was "`lease_until` is in the
+future", and `claim_prune` reaped by expiry alone — so the old host name never matched again and a
+future-stamped lease was immune for its whole term (measured: 14 leases, **14 held by dead pids, 0
+alive**; the dispatcher printed `held by …` for each and then `backlog empty queue=READ(192)`).
+`claims.sh` now answers a second question — `claim_orphan_reason(owner[, ref])` — and `claim_acquire`,
+`claim_issue_preflight`, `claim_prune` and `orch-loop.sh`'s `claim_live()` all consult it:
+
+| rule | when it fires | why it cannot steal a live peer |
+|---|---|---|
+| **own former names** | the owner host is a name THIS box has carried (`state/claim-hosts`) | the list only ever holds names this box answered to (written from the real `hostname -s`, never from a seam) — nothing ships a roster, so this is what makes a rename self-heal |
+| **local pid** | the owner host IS this host and `ps -p <pid>` says the pid is gone | **PR claims ONLY.** A PR claim is minted by the worker (`merge-one`/`fix-one`), so its pid IS the worker. An ISSUE claim is minted by the CONTROLLER and released by the CHAIN, so a controller restart (every deploy) would have this delete a live lane’s barrier and re-open the duplicate — the rule is keyed, not global. It also needs a control probe (`ps -p $$`) to prove `ps` can answer at all; an instrument failure abstains, never steals |
+| **`CLAIM_DEAD_HOSTS`** | the owner host is listed | an explicit deny list — a mis-entry over-reaps only the host it names |
+| **`CLAIM_KNOWN_HOSTS`** | the roster is SET, **names this box**, and does not list the owner host | a roster that does not name this box is stale (its usual cause is the very rename) and **abstains**; an unset roster never means "every peer is dead" |
+
+⚠️ **The roster is an allow list, so an INCOMPLETE one over-reaps**: a roster that names this box and merely omits a live peer declares that peer dead and re-dispatches its unexpired work across two boxes — the failure this registry exists to prevent, reached from the opposite direction. It must be COMPLETE and authoritative, which is why the deny list (`CLAIM_DEAD_HOSTS`) is the safer knob for a one-off dead host and is checked first.
+
+⚠️ **`CLAIM_OWNER_HOST` (the test/simulation seam) is honest about its cost, once per process.** It
+stamps claims with a name these rules cannot judge — so the box cannot reclaim its own leases — and it
+**suppresses `state/claim-hosts` recording**, which silently disables the rename self-heal. It is still
+supported (the harnesses and cross-box simulations need it), but it warns on stderr when it differs
+from the running host. Nothing in a deployed cell sets it.
+
+⚠️ **The self-heal covers renames AFTER this ships, not the leases a rename already stranded.** A
+name can only be recognised as *former* if the box recorded it while that name was still current, and
+the recorder did not exist before this change — so the leases the incident measured (including the
+literal `9768s left` line above) are cleaned up ONCE by `CLAIM_DEAD_HOSTS=<old-name>` / a hand
+release, after which the mechanism holds. Stated because "self-healing" reads as "retroactive".
+
+An orphaned holder is reclaimable **regardless of `lease_until`**, the pre-flight reports it CLEAN
+(the CAS still has to be won), and `claim_prune` reaps it. An **unparseable** lease keeps its
+existing polarity — LIVE — and is never re-examined for orphanhood: those rules are a reason to stop
+trusting a *term*, not evidence about a *holder*. Every hold reason carries a machine-readable token,
+`held-by-live` or `held-by-orphan`, and `refresh-candidates.sh` reports how many candidates a live
+claim withheld and how many were queued *although a claim existed* (its only claim is orphaned), so a
+claim-driven empty backlog can no longer read as "no work".
+
+**The lease has a CEILING as well as a default.** `CLAIM_TTL` (1800s) and `CLAIM_ISSUE_TTL`
+(10800s) are *defaults* for their keying; `CLAIM_TTL_MAX` (7200s) and `CLAIM_ISSUE_TTL` bound what a
+caller may stamp. Above the ceiling a ttl is **clamped to the ceiling** (never to the shorter
+default — that would expire merge-one's deliberate 3000s mid-merge) and the clamp **says so on
+stderr**, because `CLAIM_LEASE = REVIEW_TIMEOUT + 1200` and `FIX_LEASE = FIX_TIMEOUT + 1200`: raising
+either timeout past `CLAIM_TTL_MAX - 1200` requires raising `CLAIM_TTL_MAX` in the same change, or
+the claim expires before the review it was taken for. The verification is `claim-orphan.test.sh`,
+which reads the stamped term back out of the **pushed claim commit**. Both tunables are
 validated with `is_limit` (digits **and** at most nine of them) **before** that arithmetic, and
 `claims.sh` clamps the ttl again at its own arithmetic site — because an overflowed lease is the
 worst kind of failure: it goes **negative**, `_lease_of`'s `[0-9]*` cannot parse the minus sign, an
@@ -1385,7 +1436,9 @@ reap. The decisions that are not obvious:
   normal path, so the lease only runs its full length when the box is gone.
 - **The pre-flight now CONSULTS it, and fails CLOSED.** `refresh-candidates.sh` calls
   `claim_issue_preflight` after a clean tool verdict and branches on its **exit code**, never on
-  output text: **0 CLEAN** (no claim, or the only claim expired) queues the issue; **1 COLLISION**
+  output text: **0 CLEAN** (no claim, the only claim expired, **or the only claim is ORPHANED** —
+  #2094: its holder cannot be a live lane, so the pre-flight reports what the acquire will do and the
+  acquire still has to win the CAS) queues the issue; **1 COLLISION**
   (a live claim, or a lease that cannot be parsed — a lease nobody can read is treated as live) is
   left unchecked, so the window is re-attempted when it closes; **2 INCOMPLETE** (the registry could
   not be READ — `git ls-remote` failed, or the local clock is unreadable) is never queued and counts
@@ -1557,7 +1610,10 @@ if a row changes polarity the suite goes red and names the row, so it cannot go 
 
 **What it actually does, and its limit.** It releases **N independent processes** (default 6) at a
 barrier against a **real `git receive-pack`**, each presenting as a different box through
-`CLAIM_OWNER_ID`, so the CAS is genuinely raced rather than replayed sequentially. Each racer waits
+`CLAIM_OWNER_HOST`, so the CAS is genuinely raced rather than replayed sequentially. (It was
+`CLAIM_OWNER_ID`; #2094 renamed the seam to the HOST so the owner's `<pid>` stays the racing
+process's own, and `claim_owner` now REJECTS a `CLAIM_OWNER_ID` whose host is not the running host —
+a claim stamped under a host that no longer exists is unreclaimable for its whole lease.) Each racer waits
 `n × 3 ms` after the barrier: released in the same microsecond, every push contends for the same
 `<ref>.lock` and the losers are refused by **git's ref lock** before they ever reach the CAS —
 measured by forcing the create push and still getting exactly one winner, which would have let a

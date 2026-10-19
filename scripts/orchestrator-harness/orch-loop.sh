@@ -319,11 +319,12 @@ claim_live() { # claim_live <pr> [<head-sha>] — local lock, then the cross-box
   # ref keyed on <PR>-<head-sha>. The pid check above CANNOT see it — a remote pid is not
   # inspectable — so the claim's LEASE is the liveness signal. Read from the snapshot refreshed
   # once at the top of this cycle, not from the network per PR.
-  local sha="${2:-}" ref until
+  local sha="${2:-}" ref until owner
   [ -n "$sha" ] || return 1
   [ -f "$O/state/claims-snapshot" ] || return 1
   if command -v claim_ref >/dev/null 2>&1; then ref="$(claim_ref "$1" "$sha")"; else ref="refs/claims/$1-${sha:0:12}"; fi
   until="$(awk -F'\t' -v r="$ref" '$1==r{print $3; exit}' "$O/state/claims-snapshot" 2>/dev/null)"
+  owner="$(awk -F'\t' -v r="$ref" '$1==r{print $2; exit}' "$O/state/claims-snapshot" 2>/dev/null)"
   # ⛔ AN OVERSIZED LEASE IS UNPARSEABLE, AND UNPARSEABLE MEANS LIVE (P2, fourth review round,
   # 2026-10-14). This reader now agrees with claim_acquire()'s, which applies the SAME 18-digit
   # bound before its comparison (claims.sh; the bound is 18, not 9, because a lease is an EPOCH
@@ -350,6 +351,16 @@ claim_live() { # claim_live <pr> [<head-sha>] — local lock, then the cross-box
   [ -n "${until:-}" ] || return 1
   [ "${#until}" -gt 18 ] || [ "$until" = "0" ] && return 0
   [ -z "${until//[0-9]/}" ] || return 0
+  # ⛔ AN ORPHANED HOLDER IS NOT IN FLIGHT, AND THIS READER MUST AGREE WITH THE REGISTRY
+  # (agent-infra#2094). `claim_acquire`/`claim_issue_preflight`/`claim_prune` all consult
+  # `claim_orphan_reason`; this PR-keyed snapshot reader did not, so after a rename a PR claim stamped
+  # by the dead host kept the PR OUT of the sweep for its whole term and merge-one's new reclaim arm
+  # was never reached — the issue path self-healed and the PR path did not. Guarded with `declare -f`
+  # because selftest.sh EXTRACTS this function standalone and drives it without claims.sh; there the
+  # guard is false and the pre-existing polarity below is what runs (unchanged, deliberately).
+  if [ -n "${owner:-}" ] && declare -f claim_orphan_reason >/dev/null 2>&1; then
+    if claim_orphan_reason "$owner" "$ref" >/dev/null 2>&1; then return 1; fi
+  fi
   [ "$(date +%s)" -le "$until" ] && return 0
   return 1
 }
@@ -818,9 +829,15 @@ open_pr_count() { # -> echoes the open-PR count; never 0 on failure; writes stat
 #      would latch the dispatch gate shut forever (the "stale flag that records a past state"
 #      failure). Revisit if parks ever become a large share of the queue.
 #   2. A cross-box claim is a DECLARED WINDOW, NOT LIVENESS — claims.sh is explicit ("LEASE = DATA,
-#      NOT LIVENESS": git refs have no TTL and a remote pid cannot be probed), which is why the
-#      lease is the accepted signal (#1709) and why an abandoned-but-unexpired claim reads as owned
-#      here. The bound is the lease, not the process.
+#      NOT LIVENESS": git refs have no TTL and a REMOTE pid cannot be probed), which is why the lease
+#      is the accepted signal (#1709). ⛔ THE BOUND IS THE LEASE ONLY FOR A CLAIM THIS BOX CANNOT
+#      CLASSIFY. Since agent-infra#2094 `claim_live` also asks `claim_orphan_reason` whether the
+#      holder can be a live lane at all, so an orphaned claim (this box's own FORMER host name, a host
+#      on CLAIM_DEAD_HOSTS, a host absent from a current CLAIM_KNOWN_HOSTS roster, or — for a PR claim
+#      — a local pid that is gone) does NOT read as owned here. What still reads as owned until its
+#      lease expires is a claim from a host none of those rules can judge: an unknown name with no
+#      roster. That is an UNDER-count of orphanhood on purpose; the over-count direction steals a live
+#      peer's work.
 pr_owned() { # <pr> <head-sha> -> 0 when something is currently working this PR
   local pr="$1" sha="${2:-}"
   case "$pr" in ''|*[!0-9]*) return 1 ;; esac
@@ -1606,6 +1623,15 @@ PY
           # so a refusal can never leave a release path pointing at someone else's claim.
           claim_issue_record "$O" "$ISS" "${CLAIM_COMMIT:-}" \
             || echo "[dispatch] ⚠️ #$ISS: could not record the claim commit — chain-merge.sh cannot FENCE the release (the claim will run to its lease)" >> "$LOG"
+          # ⛔ A RECLAIM IS AN EVENT, NOT AN ORDINARY ACQUIRE (agent-infra#2094). This path used to
+          # discard CLAIM_RESULT, so an ORPHANED claim taken over here — the incident's exact repair —
+          # left NO log line, and the operator's only evidence was the absence of a refusal. The
+          # `held-by-orphan` / `reclaimed …` token is printed when it applies, and only then, so a
+          # normal dispatch is not made chattier.
+          case "${CLAIM_RESULT:-}" in
+            *reclaim*|*rphan*)
+              echo "[dispatch] #$ISS claim $CLAIM_RESULT" >> "$LOG" ;;
+          esac
         else
           acq_rc=$?
           # ⛔ rc=2 WITH A COMMIT IN HAND IS A RELEASE PATH, NOT JUST A REFUSAL (2026-10-16 review).
