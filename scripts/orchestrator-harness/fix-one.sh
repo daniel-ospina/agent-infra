@@ -34,6 +34,13 @@ KIND=fixer; TAG="$PR"
 O="${O:-$HOME/orchestrator}"; mkdir -p "$O/logs" "$O/state"
 L="$O/logs/fix-$PR"
 export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
+# ⛔ THE gh SHIM MUST STAY FIRST (#1988). The line above prepends the tool dirs, so a REAL gh in
+# either of them outranks the seeded `$O/gh-rest` (Mac REST adapter) / `$O/gh-limit` (cell
+# serialiser) — and a shim that is never resolved is an INERT layer: it reports protection and
+# provides none. Re-assert both here, adapter last so `$O/gh-rest` (which itself calls the same
+# helper) wins where it exists. Guarded by `-d`, so a box that ships neither is unchanged.
+if [ -d "$O/gh-limit" ]; then PATH="$O/gh-limit:$PATH"; fi
+if [ -d "$O/gh-rest" ]; then PATH="$O/gh-rest:$PATH"; fi
 # The wall-clock limit AND the load gate both live in the shared helper, so this script has no
 # `pi` invocation of its own to forget to gate (agent-infra#1720). NB: L above is a LOG PATH, not a
 # load reading — the gate takes its reading as an argument for exactly that reason.
@@ -262,3 +269,10 @@ fi
 # re-run the full chain at the new head
 bash "$O/merge-one.sh" "$REPO" "$OR" "$PR" "$BR" >> "$L.log" 2>&1
 echo "[fix $PR] end $(date)" >> "$L.log"
+# ── and the fixer's `.venv` goes with it (agent-infra#1932) ─────────────────────────────────────────
+# LAST, deliberately: the re-review above is dispatched from this same worktree, so reaping before it
+# would make the reviewer re-sync. merge-one's reviewer has no venv of its own (it runs in the main
+# checkout and its prompt says testing is unavailable to it), so nothing needs this env after this
+# point. The reaper re-probes for a live holder first, so a lane still working in $WT keeps its env.
+# Best-effort and loud: a failed reap logs, and never changes this worker's exit status.
+reap_lane_venv "$WT" "fix $PR" >> "$L.log" 2>&1
