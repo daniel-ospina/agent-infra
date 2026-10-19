@@ -505,6 +505,16 @@ try {
       const r16b = await bash(`cat > ${join(hub, "n2.md")} <<'EOF'\nprose\nEOF\ngit worktree add nested-after-doc -b nad`, hub);
       expectTrue("B16: …but a REAL invocation after the heredoc is still BLOCKED", blocked(r16b), JSON.stringify(r16b?.reason?.slice(0, 90)));
 
+      // B17 (#1919 final review P2): the heredoc masking must not become a BLIND
+      // SPOT. A `<<WORD` inside a COMMENT or a quoted string does not open a
+      // heredoc, so bash still runs the following lines — a quote-blind stripper
+      // masked them and HID a real invocation (fail-open). The shared
+      // quote/comment-aware `stripHeredocData` keeps them visible.
+      const r17 = await bash(`# example: cat > f <<EOF\ngit worktree add hidden-by-comment -b hbc`, hub);
+      expectTrue("B17: a `<<EOF` inside a COMMENT does not open a heredoc → still BLOCKED", blocked(r17), JSON.stringify(r17?.reason?.slice(0, 90)));
+      const r17b = await bash(`echo "docs: cat > f <<EOF"\ngit worktree add hidden-by-string -b hbs`, hub);
+      expectTrue("B17: …nor does one inside a QUOTED string → still BLOCKED", blocked(r17b), JSON.stringify(r17b?.reason?.slice(0, 90)));
+
       // B9: the env hatch still bypasses the new gate (documented in its reason).
       process.env.AGENT_ALLOW_MAIN_EDITS = "1";
       const r9 = await bash("git worktree add nested-hatched -b nested-hatched", hub);

@@ -175,6 +175,11 @@ let resolveTargetTopLevel: (targetPath: string, cwd?: string) => string | null =
 // Fail-safe default: inert (null) — a failed import must never false-block a
 // legitimate worktree creation.
 let nestedWorktreeTargetViolation: (command: string, sessionCwd?: string) => string | null = () => null;
+// #1919: the quote/comment-AWARE heredoc stripper the M5 discard extractor already
+// uses. Fail-safe default: identity — a failed import must never HIDE a command
+// (an inert stripper means the gate inspects the raw text, i.e. today's
+// behaviour, never a blind spot).
+let stripHeredocData: (text: string, codeBodies?: unknown[] | null) => string = (t) => t;
 // #618/#621: TARGET-aware checkout classification (the shared mechanism both
 // hub-write issues consume). Fail-safe defaults: inert (null/[]) so a failed
 // import NEVER false-blocks — the write gates degrade to today's behavior.
@@ -306,6 +311,9 @@ try {
   // destructuring target list is pinned by test-module-load.mjs Part A.
   if (typeof _m5.nestedWorktreeTargetViolation === "function") {
     nestedWorktreeTargetViolation = _m5.nestedWorktreeTargetViolation;
+  }
+  if (typeof _m5.stripHeredocData === "function") {
+    stripHeredocData = _m5.stripHeredocData;
   }
   hubNewFileVolumeVerdict = _hubNewFileVolumeVerdict;
   HUB_NEW_FILE_WARN_BUDGET = _HUB_NEW_FILE_WARN_BUDGET;
@@ -601,46 +609,16 @@ function _m4CheckoutLine(st: { disorder: string | null; branch: string | null; p
 // what the sibling gates in this handler already pay.
 function _nestedWorktreeBlock(command: string): string | null {
   try {
-    return nestedWorktreeTargetViolation(_withoutHeredocBodies(command), resolve(process.cwd()));
+    // HEREDOC BODIES are data, not commands (#1919 final review P2): a note,
+    // README or plan that merely QUOTES `git worktree add 8779-optA` was refused
+    // as an attempt to run it. The stripper is the SAME quote/comment-aware one
+    // the M5 discard extractor uses (`stripHeredocData`) — a hand-rolled regex
+    // was quote-blind and could HIDE a real invocation behind a `<<EOF` that
+    // appeared in a comment or a string, which is a fail-open.
+    return nestedWorktreeTargetViolation(stripHeredocData(command) ?? command, resolve(process.cwd()));
   } catch {
     return null; // degrade — never false-block on classifier failure
   }
-}
-
-/** Blank out HEREDOC BODIES so a document that merely QUOTES a worktree command is
- * not read as one (#1919 final review P2). Writing a note, README or plan that
- * contains the incident's own line — `Never run: git worktree add 8779-optA` — was
- * BLOCKED with the #1919 refusal, naming a worktree that does not exist. The
- * body is data, not a command.
- *
- * FAILS SAFE: the masking only ever REMOVES text the caller would otherwise
- * inspect, so an unterminated heredoc (or a terminator sharing its line with a
- * real command) masks NOTHING — the worst case is today's behaviour, never a
- * hidden invocation.
- * @param {string} command
- * @returns {string}
- */
-function _withoutHeredocBodies(command: string): string {
-  const lines = command.split("\n");
-  if (lines.length < 2) return command;
-  const out: string[] = [];
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    out.push(line);
-    const m = /<<-?\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\1/.exec(line);
-    if (!m) continue;
-    const delim = m[2];
-    let end = -1;
-    for (let j = i + 1; j < lines.length; j++) {
-      // A `<<-` heredoc allows the terminator to be TAB-indented; nothing else
-      // is accepted, so a line like `EOF && git …` is NOT a terminator.
-      if (lines[j] === delim || lines[j].replace(/^\t+/, "") === delim) { end = j; break; }
-    }
-    if (end === -1) continue; // unterminated — mask nothing (fail safe)
-    for (let k = i + 1; k < end; k++) out.push("");
-    i = end;
-  }
-  return out.join("\n");
 }
 
 // #436 (B carve-out): collision-free NEW-FILE write allowance in a disordered

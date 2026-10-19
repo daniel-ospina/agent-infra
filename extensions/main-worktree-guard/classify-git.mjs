@@ -2735,7 +2735,7 @@ function _stripQuotedHeredocBodies(text) {
   return out.join("\n");
 }
 
-function _wtStripHeredocData(text, codeBodies) {
+export function stripHeredocData(text, codeBodies) {
   const lines = String(text ?? "").split("\n");
   const out = [];
   let pending = null; // { delim, kind, buf }
@@ -3077,7 +3077,7 @@ export function extractWorkingTreeDiscards(command, _depth = 0) {
     // phantom discard from data (`cat <<EOF … $(git checkout -- f) … EOF`)
     // — reviewer round-6 P2. SHELL code-heredoc bodies stay in `stripped`, so
     // real substitutions inside them remain reachable.
-    const stripped = _wtStripHeredocData(_wtAnsiDecode(joinContinuations(command)), codeBodies);
+    const stripped = stripHeredocData(_wtAnsiDecode(joinContinuations(command)), codeBodies);
     const invs = allGitInvocations(stripped);
     // Here-strings (`bash <<< 'git checkout -- f'`) and process substitution
     // (`bash <(printf 'git checkout -- f')`) feed an interpreter from a payload
