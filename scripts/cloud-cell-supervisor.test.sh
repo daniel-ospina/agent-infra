@@ -40,10 +40,11 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # arms, and only the new arms, go red). Default is the shipped script.
 SUP="${SUP:-$HERE/cloud-cell-supervisor.sh}"
 # ⛔ THE WORKER SET IS DERIVED FROM THE SHIPPED SUPERVISOR, ONCE, AND EVERY FIXTURE SEEDS *THIS* LIST.
-# Six fixtures used to mirror the list by hand, so every addition (#1997's cloud-cell-doctor.sh,
-# #2038's repo-slug.sh, #2029's lane-merge.sh/merge-rate.sh) had to be applied seven times and missed
-# on some round: adding two workers produced 52 unrelated `start` failures instead of ONE assertion
-# naming the drift. Deriving the list makes the drift IMPOSSIBLE rather than detected.
+# Four fixtures used to mirror the list by hand, so adding two workers (#2029) produced 52 unrelated
+# `start` failures — and a parity CHECK over hand-written copies was itself a false PASS (it silently
+# skipped the §7 fixture, which authored orch-loop.sh separately, and drift there still reddened 16
+# start arms while the check stayed green — proven by measurement). Deriving the list makes the drift
+# IMPOSSIBLE rather than detected.
 SEED_WORKERS="$(sed -n 's/^  for w in \(.*\); do$/\1/p' "$SUP" | head -1)"
 if [ -z "$SEED_WORKERS" ]; then
   echo "FATAL: cannot parse cmd_check's required-worker list out of $SUP — the fixtures below would"
@@ -136,6 +137,11 @@ make_ai_repo() {
   seed_site "$LINENO"; for f in $SEED_WORKERS; do
     : > "$AI/scripts/orchestrator-harness/$f"
   done
+  # $SEED_WORKERS is parsed from the SHIPPED supervisor at the top of this file, so this fixture
+  # cannot silently fall behind cmd_check's required set the way it did when #2029 added two workers
+  # (52 `start` arms died with "worker scripts missing from $O" instead of ONE assertion naming the
+  # drift). The check near the summary pins that no fixture reintroduces a hand-written list.
+
   # ⛔ the REAL launcher module (agent-infra#2210), not an empty placeholder: `start`'s unattended
   # prune asks it for the worker census, and an empty copy can only answer "unknown" — which makes
   # that arm skip the prune in BOTH cases and tests nothing.
@@ -3484,13 +3490,20 @@ newdoc=0; grep -qE 'new-session.*-s cell-doctor( |$)' "$LA/st/argv" 2>/dev/null 
   || bad "start: a surviving loop was ignored (rc=$LARC, new doctor session=$newdoc) — $(tail -2 "$LA/out" | tr '\n' ' ') // live matches: $(ps -eo pid=,ppid=,command= 2>/dev/null | awk -v a="$LA/o/orch-loop.sh" -v h="$LA/h/orch-loop.sh" '{ c=$0; sub(/^[[:space:]]*[0-9]+[[:space:]]+[0-9]+[[:space:]]+/,"",c); n=split(c,t," "); if (n>=2 && (t[2]==a || t[2]==h)) print $1" "t[2] }' | tr '\n' ' ')"
 
 # ── the fixture's worker seed must not drift from the supervisor's requirement ─────────────────
-# Read the SHIPPED list, not a copy: six hand-written mirrors is how #2029's two workers surfaced as 52
-# unrelated `start` failures instead of one assertion naming them.
+# Adding two workers (#2029: lane-merge.sh, merge-rate.sh) to cmd_check's required list surfaced as 52
+# unrelated `start` failures instead of ONE assertion naming the drift. This is that assertion: it
+# reads the list out of the SHIPPED supervisor and compares it with the fixture's seed above.
+# Every fixture seeds $SEED_WORKERS (derived at the top from the SHIPPED supervisor), so the drift is
+# impossible by construction. Two things can still go wrong, and both are asserted here:
+#   (a) a NEW fixture hand-writes its own list instead of using $SEED_WORKERS — caught by the literal
+#       grep below (a `for … in <names>` line that mentions a worker);
+#   (b) the number of sites that actually ran is not the number we expect — so a site that stops
+#       executing (an early `return`, a moved block) is noticed rather than silently unvisited.
 LITERAL_SEEDS="$(grep -cE '^[[:space:]]*for [a-z]+ in [^;]*(orch-loop\.sh|claims\.sh)' "${BASH_SOURCE[0]}")"
+# The expected site count is READ from this file, not written down: a hardcoded number would false-block
+# the next section that adds a fixture (a category-B cost), while the occurrence count still catches
+# the failure that matters — a site that exists but did not RUN (early return, moved block).
 SEED_DECLARED="$(grep -c 'for f in \$SEED_WORKERS' "${BASH_SOURCE[0]}")"
-# The expected count is READ from this file, not written down: a hardcoded number would false-block the
-# next section that adds a fixture (a category-B cost), while the occurrence count still catches the
-# failure that matters — a site that exists but did not RUN (an early return, a moved block).
 SEED_RAN="$(sort -u "$SEED_LOG" 2>/dev/null | wc -l | tr -d ' ')"
 if [ "$LITERAL_SEEDS" -eq 0 ] && [ "$SEED_RAN" -eq "$SEED_DECLARED" ]; then
   ok "all $SEED_DECLARED worker-seed sites ran and seeded the set DERIVED from the shipped supervisor"
