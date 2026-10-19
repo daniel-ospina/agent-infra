@@ -258,12 +258,17 @@ lo_order() {
   local meta="${1:-}" cls="${2:-}"
   [ -n "$meta" ] && [ -f "$meta" ] || meta=/dev/null
   [ -n "$cls" ] && [ -f "$cls" ] || cls=/dev/null
-  awk -F'\t' -v meta="$meta" -v cls="$cls" '
+  # ⛔ ONE MAPPING (review cycle 3, P2). This awk used to carry its own copy of the rank rule while
+  # `lo_class_rank` carried another, so editing the documented function changed nothing and the two
+  # could diverge silently. The three ranks now COME FROM the function; awk only compares.
+  awk -F'\t' -v meta="$meta" -v cls="$cls" \
+      -v r_conf="$(lo_class_rank CONFLICTED)" -v r_red="$(lo_class_rank RED)" \
+      -v r_green="$(lo_class_rank GREEN)" -v r_other="$(lo_class_rank '')" '
     function rank(c) {
-      if (c == "CONFLICTED") return 0
-      if (c == "RED") return 1
-      if (c == "GREEN") return 3
-      return 2
+      if (c == "CONFLICTED") return r_conf + 0
+      if (c == "RED")        return r_red + 0
+      if (c == "GREEN")      return r_green + 0
+      return r_other + 0
     }
     FILENAME == meta { if (NF >= 2) created[$1] = $2; next }
     FILENAME == cls  { if (NF >= 3) cl[$1] = $3; next }

@@ -823,97 +823,6 @@ mp_reason() { # <unowned_prs> <lanes> <workers> [<open_prs>]
     echo "merge-priority (${1} un-owned of ${4:-${1}} open PR(s) — PRs before issues)"
   fi
 }
-
-# Did the ULTIMATE BOUND (d) — not the evidence — release the gate this cycle? True only when every
-# evidence condition (a)-(c) HOLDS and the block has outlived the window: that is the one case where
-# "draining" is real yet unbounded, and so the one case that earns a held-open window. Any other
-# release is evidence-driven (nothing in flight, no venue land, unreadable age) and must NOT extend
-# the gate: the evidence itself changed, so there is nothing to hold open.
-# rc 0 = RECORDED (the file says so), non-zero = only the in-process window exists. The caller prints
-# "holding it open until …" off this, so the log cannot claim a window the box does not have.
-
-# The blocked-since stamp: `<epoch>` of the FIRST cycle of the current block, or absent. Written by
-# the loop when mp_reason holds, removed whenever it does not, so the bound in (d) measures ONE
-# continuous block rather than an all-time total.
-# ⛔ THE STAMP MUST NEVER BE ABLE TO LATCH THE BOUND OFF (review round 2). A stamp that is EMPTY
-# (a truncated write on a full disk), non-numeric, or in the FUTURE (a clock step-back, a copied state
-# dir) reads as "no bound has started", so the ultimate bound in mp_reason(d) never fires and the
-# gate can hold forever — the permanent stop this whole change removes, reintroduced by one bad byte.
-# So: write atomically (tmp + rename), REPAIR a stamp that is not a usable past epoch, and refuse to
-# report a future one.
-mp_state_dir() { printf '%s\n' "${1:-${O:-$HOME/orchestrator}/state}"; }
-# ⛔ A FAILED WRITE MUST NOT LATCH THE BOUND OFF EITHER (review round 3, finding 5). Round 2 made a
-# bad stamp CONTENT unservable; an unwritable state dir (full disk, read-only remount) still left NO
-# stamp, so (d) never fired and the gate could hold forever by a different door. The epoch is kept in
-# the process too, and used when the file cannot be read back — and the failure is LOGGED, because a
-# silently unwritable state dir is worse than the stamp problem it causes.
-MP_SINCE_FALLBACK=""
-_stamp_set() { # <file> <epoch>  — atomic (tmp+rename), keeps the FIRST usable epoch of the block
-  local f="$1" epoch="${2:-}" t="" mine="" is_block=0
-  is_num "$epoch" || return 0
-  # ⛔ THE IN-PROCESS VALUE IS THE SECOND MEMORY, AND IT NEEDS THE SAME FIRST-EPOCH RULE (review
-  # round 4, P0). Round 3 added the fallback for an unwritable state dir but applied "keep the first
-  # epoch" only to the FILE — so on a full disk / read-only state dir every cycle overwrote the
-  # fallback with the CURRENT epoch, `now - since` stayed ~0, clause (d) could never fire, and the
-  # permanent stop this change removes survived the very case the fallback was added for. Measured:
-  # a mode-500 state dir with an hourly land held the gate for +8h with all four suites green.
-  case "$f" in
-    */merge-priority-blocked-since) mine="${MP_SINCE_FALLBACK:-}" ;;
-  esac
-  # ⛔ EVERY PATH THAT ACCEPTS AN EPOCH MUST ALSO REMEMBER IT (review round 5, P0). Round 4 kept the
-  # first epoch only in the FILE, and the in-process copy only on the FAILED-write path — so once a
-  # clear had marked a stamp INVALIDATED (an unwritable dir, once), later `set` calls early-returned
-  # on that surviving bogus file, the memory stayed empty, `mp_blocked_since` served nothing, clause
-  # (d) became unreachable, and the permanent stop came back — permanently, even after the dir became
-  # writable again. The block start is now mirrored on every acceptance path, and the file is not even
-  # consulted while it is known-invalid.
-  case "$f" in */merge-priority-blocked-since) is_block=1 ;; esac
-  if [ "$is_block" = "1" ] && [ "${MP_SINCE_INVALIDATED:-0}" = "1" ]; then
-    :                             # known-bogus this run: consult the memory, never the file
-  elif [ -f "$f" ]; then
-    t="$(cat "$f" 2>/dev/null || true)"
-    if is_num "$t" && [ $(( 10#$t )) -le $(( 10#$epoch )) ]; then
-      [ "$is_block" = "1" ] && MP_SINCE_FALLBACK="$t"
-      return 0
-    fi
-  fi
-  if is_num "$mine" && [ $(( 10#$mine )) -le $(( 10#$epoch )) ]; then
-    [ "$is_block" = "1" ] && MP_SINCE_FALLBACK="$mine"
-    return 0                      # the block already started: a write here cannot make it younger
-  fi
-  if printf '%s\n' "$epoch" > "$f.$$" 2>/dev/null && mv "$f.$$" "$f" 2>/dev/null; then
-    # A successful write means the dir IS writable again: the invalidation is spent.
-    if [ "$is_block" = "1" ]; then MP_SINCE_INVALIDATED=""; MP_SINCE_FALLBACK="$epoch"; fi
-    return 0
-  fi
-  rm -f "$f.$$" 2>/dev/null || true
-  [ "$is_block" = "1" ] && MP_SINCE_FALLBACK="$epoch"
-  echo "[state] WARN cannot write $f (unwritable state dir?) — using the in-process epoch $epoch so the time bound still applies" >> "${LOG:-/dev/null}" 2>/dev/null
-  return 0
-}
-mp_blocked_since() { # [<state-dir>] [<now>] -> epoch of the current block, or empty
-  local f="$(mp_state_dir "${1:-}")/merge-priority-blocked-since" v="" now="${2:-}"
-  [ "${MP_SINCE_INVALIDATED:-0}" = "1" ] && { is_num "${MP_SINCE_FALLBACK:-}" && printf '%s\n' "$MP_SINCE_FALLBACK"; return 0; }
-  [ -f "$f" ] && v="$(cat "$f" 2>/dev/null || true)"
-  is_num "$v" || { is_num "${MP_SINCE_FALLBACK:-}" && printf '%s\n' "$MP_SINCE_FALLBACK"; return 0; }
-  is_num "$now" || now="$(date +%s)"
-  # A stamp from the future cannot bound anything (now - since is negative), so it is not served —
-  # but the MEMORY is still consulted (review round 9). "Not served" used to mean "return nothing",
-  # which discarded the epoch _stamp_set had just recorded in MP_SINCE_FALLBACK because the write
-  # failed: with a FUTURE stamp file (a clock step-back, a copied state dir) AND an unwritable state
-  # dir (a full disk), clause (d) was unreachable every cycle and the gate could hold for ever — the
-  # permanent stop, re-formed by two conditions each defended on its own. Same reconciliation as
-  if [ $(( 10#$v )) -gt $(( 10#$now )) ]; then
-    is_num "${MP_SINCE_FALLBACK:-}" && [ $(( 10#${MP_SINCE_FALLBACK} )) -le $(( 10#$now )) ] \
-      && printf '%s\n' "$MP_SINCE_FALLBACK"
-    return 0
-  fi
-  printf '%s\n' "$v"
-  return 0
-}
-
-# Epoch of the most recent LAND this box recorded (state/merged-<PR>.done), or empty. A test seam
-# selects another dir; unreadable mtimes are skipped, never guessed.
 mp_recent_land() { # [<state-dir>]
   # ⛔ THE WALK IS BOUNDED. `state/merged-<PR>.done` is never pruned — merge-one.sh only ever WRITES
   # them — so a long-lived box accumulates one per merged PR, forever, and the first form stat-ed
@@ -1683,6 +1592,7 @@ while true; do
   # own: SWEEP_LIST is SCOPE-FILTERED (`SCOPE=own` keeps only `-tm$|-cap$|^fix/`), so gating on it would
   # read 0 un-owned while the repo held fifty — and open the issue path, the exact defect this removes.
   OPEN_ROWS="$(cat "$O/state/last-open-prs" 2>/dev/null || true)"
+  # [parked-count:begin] (extracted and DRIVEN by test-gates.sh — keep the marker)
   SEL_PARKED=0
   _nrows=0
   for _tok in $OPEN_ROWS; do
@@ -1690,13 +1600,22 @@ while true; do
     _op="${_tok%%:*}"; _rest="${_tok#*:}"; _osha="${_rest%%:*}"; _obr="${_rest#*:}"
     [ "$_obr" = "$_osha" ] && _obr=""
     case "$_op" in ''|*[!0-9]*) continue ;; esac
-    [ -f "$O/state/parked-$_op" ] || continue
+    # ⛔ THE PARK IS HEAD-KEYED HERE TOO (review cycle 3, P1). This arm counted the marker's
+    # EXISTENCE while the acting path compares the head stored inside it (`parked-<PR>` = "the fixer
+    # cap was reached at THIS head; a later push re-arms the PR"). A park left behind by a PR that has
+    # since been pushed is therefore NOT parked — but it was subtracted from the minuend anyway, so
+    # `UPN_WORK` could reach 0 with a workable un-owned PR still on the queue and the issue path
+    # OPENED on it. That is the "stale flag that records a past state and is never revalidated" class,
+    # and the module's own contract says the workable count is PRs parked AT THIS HEAD.
+    # An empty/legacy head on either side reads NOT parked — fail-closed in the direction that blocks.
+    [ "$(cat "$O/state/parked-$_op" 2>/dev/null)" = "${_osha:-}" ] || continue
     # ⛔ ONLY AN UN-OWNED PARKED PR MAY BE SUBTRACTED (review P3). UPN already EXCLUDES owned PRs, so
     # subtracting a PR that is both parked and owned removes a unit that was never in the minuend —
     # and with exactly one un-owned PR left, that floored the count to 0 and opened the issue path
     # while an un-owned PR was still on the queue. One `pr_owned` per PARKED PR (rare) is the price.
     if ! pr_owned "$_op" "$_osha" "$_obr"; then SEL_PARKED=$(( SEL_PARKED + 1 )); fi
   done
+  # [parked-count:end]
   FIRST_PR="-"; SEL_OWN=0; SEL_UNOWNED=0
   while IFS="$(printf '\t')" read -r _p _b _d _o; do
     [ -z "${_p:-}" ] && continue
@@ -1746,6 +1665,12 @@ while true; do
       # `population=` line, where they belong.
       SEL_TOTAL="${OPEN_N:-$UPN}"
       OWN_N=0
+      # ⛔ AND THE PARKED PART DIES WITH THE POPULATION (review cycle 3, P2). The park count above was
+      # computed over the SWEPT set; `UPN` already excludes any parked PR. Keeping the swept count
+      # printed `26 PRs: 26 un-owned (0 owned, 5 parked/needs-human excluded)` — 26 + 0 + 5 ≠ 26, the
+      # exact arithmetic-does-not-close shape this block exists to prevent. The floor line already
+      # states that the per-PR detail (including the parked exclusion) was lost this cycle.
+      SEL_PARKED=0
       FLOOR_NOTE="[select] ⚠️ fail-closed floor: the listing answers ${UPN} un-owned (no per-PR rows this cycle) while the swept set saw ${SEL_OWN} owned — gating on ${UPN} (the drain direction)"
     fi
   fi
@@ -2237,8 +2162,16 @@ PY
     _lm="$(mp_recent_land 2>/dev/null || true)"
     if is_num "${_lm:-}"; then
       _lage=$(( ( $(date +%s) - (10#${_lm}) ) / 60 ))
-      [ "$_lage" -lt 0 ] && _lage=0
-      if [ "$_lage" -ge "$_stallmin" ]; then
+      # ⛔ A FUTURE STAMP IS NOT A FRESH LAND (review cycle 3, P2). `find -mmin -N` passes a file
+      # stamped in the future (a negative age is "less than N minutes ago"), so clamping it to 0 would
+      # render a clock step-back as "drain alive" — and after the release valve was removed this line
+      # is the ONLY signal a stall has left, so an invented fresh reading is precisely the silence the
+      # ruling removed. `dispatch_funnel` refuses the same shape for its own record ("A FUTURE at= IS
+      # NOT A FRESH RECORD"). Print the UNMEASURED
+      # case instead: it is neither a stall nor an all-clear, and it says which it is.
+      if [ "$_lage" -lt 0 ]; then
+        echo "[dispatch] DRAIN STALL UNMEASURED — the newest land marker (state/merged-*.done) is stamped ${_lage#-}m in the FUTURE, so the drain's age cannot be read. This is neither a stall nor an all-clear; ${UPN_WORK:-?} un-owned remain and the issue path stays CLOSED (un-owned PRs first)." >> "$LOG"
+      elif [ "$_lage" -ge "$_stallmin" ]; then
         echo "[dispatch] DRAIN STALLED — no PR merged in ${_lage}m while ${UPN_WORK:-?} un-owned remain. The issue path stays CLOSED (un-owned PRs first): this is a land/capacity problem to fix, not a reason to open new work." >> "$LOG"
       else
         echo "[dispatch] drain alive — last land ${_lage}m ago; ${UPN_WORK:-?} un-owned remain" >> "$LOG"

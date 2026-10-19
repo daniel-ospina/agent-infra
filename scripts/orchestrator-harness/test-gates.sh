@@ -1350,7 +1350,9 @@ FAKE
       rm -f "$DO"/state/merged-*.done
       if [ -n "${1:-}" ]; then
         : > "$DO/state/merged-7777.done"
-        touch -t "$(date -v-"$1"M +%Y%m%d%H%M)" "$DO/state/merged-7777.done" 2>/dev/null || true
+        # a bare number is "minutes AGO"; a leading '+' is minutes in the FUTURE (the clock-step case)
+        case "$1" in +*) _v="+${1#+}M" ;; -*) _v="-${1#-}M" ;; *) _v="-${1}M" ;; esac
+        touch -t "$(date -v"$_v" +%Y%m%d%H%M)" "$DO/state/merged-7777.done" 2>/dev/null || true
       fi
       if [ -n "${2:-}" ]; then MERGE_STALL_MIN="$2"; else unset MERGE_STALL_MIN; fi
       eval "$_DRAIN_BLOCK"   # SAME shell: the block reads O/LOG/UPN_WORK as shell vars
@@ -1376,6 +1378,54 @@ FAKE
     *"drain alive"*|*"DRAIN STALLED"*) echo "  ok a NON-NUMERIC MERGE_STALL_MIN falls back to 180 and still decides"; PASS=$((PASS+1)) ;;
     *) echo "  ❌ a non-numeric MERGE_STALL_MIN produced no verdict: $_out"; FAIL=$((FAIL+1)) ;;
   esac
+  # ⛔ A FUTURE LAND STAMP IS UNMEASURABLE, NOT A FRESH LAND (review cycle 3, P2). `find -mmin -N`
+  # passes a future-stamped file, so clamping the negative age to 0 rendered a clock step-back as
+  # "drain alive" — and after the release valve was removed this line is a stall's only signal.
+  _out="$(_drain +30)"   # a stamp 30 minutes in the FUTURE
+  case "$_out" in
+    *"drain alive"*) echo "  ❌ a FUTURE land stamp printed 'drain alive' — an unread reading is not an all-clear: $_out"; FAIL=$((FAIL+1)) ;;
+    *"UNMEASURED"*) echo "  ok a FUTURE land stamp is UNMEASURED — neither a stall nor an all-clear"; PASS=$((PASS+1)) ;;
+    *"DRAIN STALL"*) echo "  ❌ a FUTURE land stamp printed a stall verdict (it is unmeasured, not stalled): $_out"; FAIL=$((FAIL+1)) ;;
+    *) echo "  ❌ a FUTURE land stamp produced no verdict at all: $_out"; FAIL=$((FAIL+1)) ;;
+  esac
+
+  # ── THE PARKED EXCLUSION IS HEAD-KEYED (review cycle 3, P1) ──────────────────────────────────
+  # The gate subtracts parked PRs from the un-owned count, so an exclusion that counts a marker's
+  # EXISTENCE over-subtracts: a PR parked at an OLD head, then pushed, is WORKABLE while its marker
+  # still sits on disk — and with one un-owned PR left that floored the count to 0 and OPENED the
+  # issue path. Extract the block and DRIVE it: same head -> parked (1), different head -> not parked
+  # (0), legacy/headless marker -> not parked (0, fail-closed).
+  _PARK_BLOCK="$(sed -n '/^ *# \[parked-count:begin\]/,/^ *# \[parked-count:end\]/p' "$ORCH")"
+  if grep -q 'SEL_PARKED' <<<"$_PARK_BLOCK"; then
+    echo "  ok the parked-count block was extracted from the controller"; PASS=$((PASS+1))
+  else
+    echo "  ❌ could not extract the parked-count block (markers moved?)"; FAIL=$((FAIL+1))
+  fi
+  PO="$TMP/parkO"; mkdir -p "$PO/state"
+  _parkn() { # _parkn <marker-content|''> <row-head>  -> SEL_PARKED on stdout
+    ( set -u
+      O="$PO"; SEL_ROWS=""; LOG="$TMP/park.log"; : > "$LOG"
+      rm -f "$PO"/state/parked-*; rm -f "$PO/state/last-open-prs"
+      if [ -n "${1+set}" ]; then printf '%s\n' "$1" > "$PO/state/parked-42"; fi
+      OPEN_ROWS="42:${2:-}:2026-01-01T00:00:00Z"
+      pr_owned() { return 1; }   # an un-owned PR: only the park can exclude it
+      eval "$_PARK_BLOCK"
+      printf '%s' "$SEL_PARKED" )
+  }
+  _got="$(_parkn aaaa1111 aaaa1111)"; [ "$_got" = "1" ]     && { echo "  ok a park at THIS head excludes the PR (1)"; PASS=$((PASS+1)); }     || { echo "  ❌ a park at this head did not exclude it (got $_got, want 1)"; FAIL=$((FAIL+1)); }
+  _got="$(_parkn aaaa1111 bbbb2222)"; [ "$_got" = "0" ]     && { echo "  ok a park from an OLD head does NOT exclude the pushed PR (a stale park is not a park)"; PASS=$((PASS+1)); }     || { echo "  ❌ a STALE park still excluded a pushed, workable PR (got $_got, want 0) — the issue path opens on real work"; FAIL=$((FAIL+1)); }
+  _got="$(_parkn '' bbbb2222)"; [ "$_got" = "0" ]     && { echo "  ok a headless/legacy park marker does not exclude (fail-closed)"; PASS=$((PASS+1)); }     || { echo "  ❌ a headless park marker excluded a PR (got $_got, want 0)"; FAIL=$((FAIL+1)); }
+
+  # ── THE FUNNEL'S ARITHMETIC CLOSES IN THE FLOOR BRANCH (review cycle 3, P2) ─────────────────
+  # In the fail-closed floor the population IS the listing, so the swept set's parked count must not
+  # be printed as an extra part: `26 PRs: 26 un-owned (0 owned, 5 parked)` does not add up.
+  grep -q 'SEL_PARKED=0' <<<"$FLOOR_SRC" 2>/dev/null || true
+  _FLOOR_SRC="$(sed -n '/⛔ AND THE PARKED PART DIES WITH THE POPULATION/,/FLOOR_NOTE=/p' "$ORCH")"
+  if grep -q 'SEL_PARKED=0' <<<"$_FLOOR_SRC"; then
+    echo "  ok the fail-closed floor re-bases the parked part (funnel arithmetic closes)"; PASS=$((PASS+1))
+  else
+    echo "  ❌ the floor branch keeps the swept parked count — the funnel's parts no longer sum to its total"; FAIL=$((FAIL+1))
+  fi
   # (F7) the documented `scan=` token must be an ARTIFACT, not a comment promise.
   wpin "the population line carries the scan STATUS (a documented token that exists)" "$ORCH" '[select] population=$POP scan=$LO_STATUS'
   # ── REVIEW R1, P1: the SCOPE-FILTERED fallback may never LOWER the gate ──────────────────────
@@ -1397,7 +1447,11 @@ FAKE
     echo "  ❌ the fallback keys on the funnel line being empty — a failed write would re-decide the cycle"; FAIL=$((FAIL+1))
   fi
   # ── REVIEW R1, P3: the stall tunable is normalised before it is compared ────────────────────
-  wpin "MERGE_STALL_MIN is validated (a non-numeric value must not read as 'drain alive')" "$ORCH" 'case "${MERGE_STALL_MIN:-180}" in'
+  # ⛔ THE PIN MUST NAME THE SHIPPED LINE, NOT THE COMMENT ABOUT THE OLD ONE (review cycle 3, P2): the
+  # previous pin matched a comment quoting the BUGGY form, so deleting the real normalisation left it
+  # green. Pin the assignment and the subject it feeds; the behaviour is driven separately below.
+  wpin "MERGE_STALL_MIN is validated (a non-numeric value must not read as 'drain alive')" "$ORCH" '_stallraw="${MERGE_STALL_MIN:-180}"'
+  wpin "…and the validation case reads the NORMALISED variable, never the bare name" "$ORCH" 'case "$_stallraw" in'
   # ── THE GATE HAS NO RELEASE ARM, AND THAT IS PINNED (owner ruling, 2026-10-18) ────────────────
   # "Only when NO un-owned PR remains may the dispatcher create new work by picking issues." A stalled
   # drain must therefore produce a NAME, never a release: an age-based release turns *PRs are not
