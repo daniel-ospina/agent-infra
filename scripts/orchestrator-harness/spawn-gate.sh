@@ -388,7 +388,14 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   # `set -m` is bash's job control in a non-interactive shell: supported by /bin/bash 3.2 (the
   # launchd interpreter) and by the cells' bash. If it is refused, the launch is byte-identical and
   # the group kill below simply finds nothing — a refused `set` must never be a refused spawn.
-  set -m 2>/dev/null || true
+  # ⛔ THE CALLER'S JOB-CONTROL STATE IS RESTORED EXACTLY (#2163 review, P0). `was_m`/`jobctl` are
+  # assigned HERE, after the `local` declaration at the top of run_agent and BEFORE the first read:
+  # an earlier cut declared them and never assigned them, so under `set -u` this line aborted the
+  # function AFTER `pi` had been launched — no waiter, no group reap, no walltime row, and an
+  # orphaned agent. `jobctl` records whether `set -m` actually took effect.
+  was_m=0; case $- in *m*) was_m=1 ;; esac
+  jobctl=0
+  set -m 2>/dev/null && jobctl=1
   # ⛔ `< /dev/null` IS PART OF THE JOB-CONTROL CHANGE (#2163 review, P2). With job control ON, bash
   # no longer redirects an async command's stdin from /dev/null (it hands over the terminal/pipe), so
   # a tool child could read the pane's pty — typed input stolen from a human — or, under

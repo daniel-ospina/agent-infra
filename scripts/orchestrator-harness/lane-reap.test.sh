@@ -32,6 +32,8 @@ eq()   { if [ "$1" = "$2" ]; then ok "$3"; else bad "$3 (got: $1, want: $2)"; fi
 has()  { case "$1" in *"$2"*) ok "$3" ;; *) bad "$3 (missing: $2)" ;; esac; }
 hasnt(){ case "$1" in *"$2"*) bad "$3 (unexpected: $2)" ;; *) ok "$3" ;; esac; }
 
+REAL_SLEEP="$(command -v sleep)"
+export REAL_SLEEP
 T="$(mktemp -d "${TMPDIR:-/tmp}/lane-reap-test.XXXXXX")"
 cleanup() { rm -rf "$T"; }
 trap cleanup EXIT
@@ -82,7 +84,13 @@ cat > "$T/bin/sleep" <<'SH'
 # The window is the only moment between pass 1 (identity recorded) and the kill loop, so it is where
 # the FENCE leg flips the pid's reported incarnation.
 [ -n "${LSTART_SWITCH:-}" ] && { : > "$LSTART_SWITCH"; }
-exit 0
+# ⛔ THE WINDOW AND A READ BOUND ARE NOT THE SAME SLEEP. The window (2s) is stubbed so the suite is
+# fast; a READ BOUND must sleep for real, or `bound()`'s watchdog fires the moment it is scheduled and
+# kills the read it was protecting — a race that made the FALLBACK leg green or red by timing.
+case "${1:-}" in
+  2) exit 0 ;;
+  *) exec "${REAL_SLEEP:?}" "$@" ;;
+esac
 SH
 chmod +x "$T/bin/sleep"
 
@@ -241,6 +249,10 @@ echo "== CAP ([cap] prints lanes=<live>/<total> max_lanes=<n> zombie=<n>)"
 LOOP="$HERE/orch-loop.sh"
 grep -qF 'lanes=$LANES/$LANES_TOTAL' "$LOOP" && grep -qF 'zombie=$ZOMBIES' "$LOOP" && rc=0 || rc=1
 eq "$rc" "0" "CAP: the [cap] line carries lanes=<live>/<total> and zombie=<n>"
+grep -qF 'lanes_unknown (the lane census could not be read' "$LOOP" && rc=0 || rc=1
+eq "$rc" "0" "CAP: the dispatch gate CONSUMES LANES_UNKNOWN (a tripwire: the arm is inline in the loop)"
+grep -qF 'lanes_src=' "$LOOP" && rc=0 || rc=1
+eq "$rc" "0" "CAP: [cap] names the census SOURCE, so a tmux fallback is never printed as a census"
 is_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
 O="$T"; _HERE_RS=/nonexistent
 printf '#!/bin/bash\necho "lanes=3/11 zombie=7"\n' > "$T/lane-reap.sh"
@@ -308,6 +320,30 @@ has "$out" "human-ancestor" "HUMAN: refused with a reason"
 hasnt "$out" "REAP   root=900" "HUMAN: never reaped"
 eq "$(cat "$KILL_LOG" 2>/dev/null | wc -l | tr -d ' ')" "0" "HUMAN: --apply signals nothing"
 
+# ── HUMAN-ARGV: prompt text in an ancestor's argv decides NOTHING ────────────────────────────────
+echo "== HUMAN-ARGV (host apps are matched on the executable, never on argument text)"
+: > "$T/t-hargv"; psinit >> "$T/t-hargv"
+psrow 400 1 Ss 00:00:00 10:00:00 "/Applications/Terminal.app/Contents/MacOS/Terminal" >> "$T/t-hargv"
+psrow 401 400 Ss 00:00:00 10:00:00 "zsh -c launch --brief '/tmp/brief-mentioning-cmux.app'" >> "$T/t-hargv"
+psrow 902 401 Ss 00:00:00 05:00:00 "bash -c PATH=/Applications/cmux.app/Contents/MacOS:$PATH pi > $DEAD_LOG 2>&1 &" >> "$T/t-hargv"
+psrow 903 902 Sl 00:00:00 05:00:00 pi >> "$T/t-hargv"
+fdlink 903 1 "$DEAD_LOG"
+out="$(run_reap "$T/t-hargv" "" -- --apply)"
+has "$out" "human-ancestor" "HUMAN-ARGV: a Terminal.app above is found THROUGH the text"
+hasnt "$out" "REAP   root=902" "HUMAN-ARGV: never reaped"
+eq "$(cat "$KILL_LOG" 2>/dev/null | wc -l | tr -d ' ')" "0" "HUMAN-ARGV: no signal"
+
+# ── FLEET: cmux-rooted ancestry is the fleet boundary ───────────────────────────────────────────
+echo "== FLEET (a cmux.app ancestor is the fleet, and the lane is judged)"
+: > "$T/t-fleet"; psinit >> "$T/t-fleet"
+psrow 410 1 Ss 00:00:00 10:00:00 "/Applications/cmux.app/Contents/MacOS/cmux" >> "$T/t-fleet"
+psrow 904 410 Ss 00:00:00 05:00:00 "bash -c pi > $DEAD_LOG 2>&1 &" >> "$T/t-fleet"
+psrow 905 904 Sl 00:00:00 05:00:00 pi >> "$T/t-fleet"
+fdlink 905 1 "$DEAD_LOG"
+out="$(run_reap "$T/t-fleet" "" -- --dry-run)"
+has "$out" "fleet ancestry" "FLEET: cmux.app is recognised as the fleet boundary"
+has "$out" "WOULD REAP root=904" "FLEET: and the stale lane is a candidate"
+
 # ── ACTIVE: any CPU gain across the window spares the lane ──────────────────────────────────────
 echo "== ACTIVE (a subtree that gains CPU is working, not finished)"
 : > "$T/t-act1"; psinit >> "$T/t-act1"
@@ -356,6 +392,28 @@ out="$(PS_HANG=1 PS_TABLE1="$T/t-count" PS_COUNTER="$T/ps.counter" PATH="$T/bin:
        bash "$REAPER" count)"; rc=$?
 eq "$rc" "3" "FALLBACK: a read that outlives its bound exits 3"
 eq "$out" "lanes=?/? zombie=?" "FALLBACK: and never renders as an empty fleet"
+
+# ── COUNT-ARMS: a deleted log is possibly-live, and an unreadable age must not abort the pass ──
+echo "== COUNT-ARMS (deleted log counts as live; unreadable age is `?`, in any lane order)"
+: > "$T/t-count2"; psinit >> "$T/t-count2"
+psrow 600 1 Ss 00:00:00 05:00:00 "bash -c pi > /tmp/L-gone.log 2>&1" >> "$T/t-count2"
+psrow 601 600 Sl 00:00:01 05:00:00 pi >> "$T/t-count2"
+fdlink 601 1 "/tmp/L-gone.log (deleted)"
+out="$(run_count "$T/t-count2")"; rc=$?
+eq "$out" "lanes=1/1 zombie=0" "COUNT-ARMS: a deleted-log lane counts as LIVE (a possibly-live lane holds a slot)"
+eq "$rc" "0" "COUNT-ARMS: and the census is not an abstention"
+GHOST="$(newlog L-unreadable.log 30)"
+: > "$T/t-count3"; psinit >> "$T/t-count3"
+psrow 500 1 Ss 00:00:00 05:00:00 "bash -c pi > /tmp/L-ghost.log 2>&1" >> "$T/t-count3"
+psrow 501 500 Sl 00:00:01 05:00:00 pi >> "$T/t-count3"
+fdlink 501 1 "/tmp/L-ghost.log"
+psrow 700 1 Ss 00:00:00 05:00:00 "bash -c pi > $GHOST 2>&1" >> "$T/t-count3"
+psrow 701 700 Sl 00:00:01 05:00:00 pi >> "$T/t-count3"
+fdlink 701 1 "$GHOST"
+out="$(run_count "$T/t-count3")"; rc=$?
+eq "$rc" "3" "COUNT-ARMS: an unreadable age exits 3"
+eq "$out" "lanes=?/2 zombie=0" "COUNT-ARMS: the numerator is ? while the TOTAL survives; no arithmetic abort"
+hasnt "$out" "syntax error" "COUNT-ARMS: the pass never aborts on `?` arithmetic"
 
 # ── BUDGET: a spent pass budget is an ABSTENTION, never a partial census ───────────────────────
 echo "== BUDGET (a pass that runs out of time judges nothing and says so)"

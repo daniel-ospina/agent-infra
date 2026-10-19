@@ -764,7 +764,10 @@ lane-reap.sh reap --apply           signal the lanes that pass all three gates
 ```
 
 **live** = the tree exists AND its log advanced inside `LANE_REAP_LIVE_MIN` (45 min — above
-`lane.sh`'s 2400 s wall limit, so a long silent tool call is not read as death). **total** = every
+`lane.sh`'s 2400 s wall limit, so a long silent tool call is not read as death), OR its log was
+deleted while the tree lives (a prune can do that to a working lane; a possibly-live lane must not
+count `0` against a capacity gate). The `[cap]` line also carries `lanes_src=census|tmux|unknown`,
+so the old tmux session count (a `$O` that predates the tool) is never printed as a census. **total** = every
 resident tree the census can ATTRIBUTE: a `pi` tree whose root or a direct child holds a
 fleet-namespace log open (a `fix-`/`merge-`/`chain-` wrapper is a WORKER and is counted by
 `workers=`, not by `lanes=`; `count` and `reap` share this population predicate, and `reap` alone
