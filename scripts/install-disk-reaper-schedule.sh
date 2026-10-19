@@ -63,12 +63,14 @@
 #
 # Usage:
 #   install-disk-reaper-schedule.sh [--install] [--apply|--dry-run] [--preview]
-#                                   [--status] [--uninstall] [--help]
+#                                   [--status]
+#                                   [--uninstall [--preview]] [--help]
 #
 #   (no mode flag)  install a REPORT-ONLY job (the shipped stance, #1678)
 #   --apply         install the ARMED job (owner decision; visible in the installed unit)
 #   --dry-run       install the report-only job (the default, said explicitly)
-#   --preview       render and print what WOULD be installed; write nothing, install nothing
+#   --preview       render and print what WOULD be installed; with --uninstall: show what WOULD be
+#                   removed. Either way: write nothing, install nothing, remove nothing
 #   --status        is this box reaped, by what, when did the last pass run, what did it free, did it
 #                   succeed — exit 0 when scheduled+loaded, 1 when not scheduled
 #   --uninstall     bootout/disable and remove the job (and the schedule stamp)
@@ -722,8 +724,18 @@ sd_uninstall() {
     # disable or reload it, so it kept firing until a reboot while the verb printed "uninstalled"
     # (#2048 review, P2).
     notify_managers "$live_dir"
+    local want_priv
     for d in "${dirs[@]}"; do
-        if [ -w "$d" ] || { [ -n "${SYSTEMD_UNIT_DIR:-}" ] || [ "$SD_TARGET" = "user" ]; }; then
+        # ⛔ THE PRIVILEGE IS CHOSEN PER DIRECTORY, NOT FROM THE RECORD (#2048 review, P3). Deciding it
+        # from `SD_TARGET` meant a probe flip made a SYSTEM unit get a plain `rm -f`: the operator held
+        # the sudo the tool refused to use, the removal failed, and NO RE-RUN COULD COMPLETE IT — the
+        # record kept saying `user`, so the leftover system unit was unremovable except by hand. A
+        # directory outside the user's reach is exactly what ${SUDO-…} is for.
+        case "$d" in
+            "${SYSTEMD_UNIT_DIR:-__none__}"|"${HOME:-}/.config/systemd/user") want_priv=0 ;;
+            *) want_priv=1 ;;
+        esac
+        if [ "$want_priv" = 0 ] || [ -w "$d" ]; then
             rm -f "$d/$UNIT_NAME.service" "$d/$UNIT_NAME.timer"
         else
             ${SUDO-sudo -n} rm -f "$d/$UNIT_NAME.service" "$d/$UNIT_NAME.timer"

@@ -112,6 +112,14 @@ esac
 exit 0
 SC
 chmod +x "$T/bin/systemctl"
+# ⛔ THE USER MANAGER IS A SEPARATE MANAGER, with its own call log and its own view of "known units"
+# (#2048 review, P2). One shim for both made the question "WHICH manager was told?" unassertable — so
+# the fix that stops the armed timer firing until a reboot (a probe flip made the wrong manager get
+# `disable`/`daemon-reload`) could be reverted with the whole suite green.
+mkdir -p "$T/units-user"
+sed -e "s|\${SYSTEMCTL_CALLS:-/dev/null}|$T/systemctl-user.log|" \
+    -e "s|\${SYSTEMCTL_UNITS:-}|$T/units-user|" "$T/bin/systemctl" >"$T/bin/systemctl-user"
+chmod +x "$T/bin/systemctl-user"
 
 # launchctl shim: keeps a LOADED-STATE file, so the installer's "is it loaded?" question has a real
 # answer without touching the live GUI domain. `print` FAILS for an unloaded job, as real launchctl
@@ -161,7 +169,7 @@ inst_lin() { # inst_lin <args...>
     HOME="$home_lin" DISK_REAPER="$PASSFILE" DISK_REAPER_REPOS="$REPO" \
     DISK_REAPER_PLATFORM=linux DISK_REAPER_STATE_DIR="$T/state-lin" \
     SYSTEMD_UNIT_DIR="$T/units" SYSTEMCTL="$T/bin/systemctl" SYSTEMCTL_CALLS="$T/systemctl.log" \
-    SYSTEMCTL_UNITS="$T/units" \
+    SYSTEMCTL_UNITS="$T/units" SYSTEMCTL_USER="$T/bin/systemctl-user" \
     bash "$INST" "$@"
 }
 inst_mac() { # inst_mac <args...>
@@ -681,6 +689,73 @@ assert_file "$FOREIGN/eldato-disk-reaper.service" \
     "T8f a unit in a directory this run neither recorded nor derived is NOT deleted"
 rm -rf "$FOREIGN" "$T/state-foreign-a" "$T/state-foreign-b"
 
+# ── T8g: WHICH manager was told (#2048 review, P2) — the assertion round 6 lacked ───────────────
+# Round 6 fixed "the files went, but the manager that actually held the timer was never asked to
+# disable or reload it, so it kept firing until a reboot". With one shim for both managers that fix
+# could be reverted with every assertion still green. These pin the two observable facts.
+SYSDIR_G="$T/sys-g"; mkdir -p "$SYSDIR_G"
+: >"$T/systemctl.log"; : >"$T/systemctl-user.log"
+HOME="$home_lin" DISK_REAPER="$PASSFILE" DISK_REAPER_REPOS="$REPO" DISK_REAPER_PLATFORM=linux \
+    DISK_REAPER_STATE_DIR="$T/state-g" SYSTEMD_SYSTEM_DIR="$SYSDIR_G" SUDO="" \
+    SYSTEMCTL="$T/bin/systemctl" SYSTEMCTL_CALLS="$T/systemctl.log" SYSTEMCTL_UNITS="$T/units" \
+    SYSTEMCTL_USER="$T/bin/systemctl-user" bash "$INST" --install >/dev/null 2>&1
+NO_SUDO_G="$T/bin/no-sudo-g"; printf '#!/bin/bash\nexit 1\n' >"$NO_SUDO_G"; chmod +x "$NO_SUDO_G"
+: >"$T/systemctl.log"; : >"$T/systemctl-user.log"
+OUT="$(HOME="$home_lin" DISK_REAPER="$PASSFILE" DISK_REAPER_REPOS="$REPO" DISK_REAPER_PLATFORM=linux \
+    DISK_REAPER_STATE_DIR="$T/state-g" SYSTEMD_SYSTEM_DIR="$SYSDIR_G" SUDO="$NO_SUDO_G" \
+    SYSTEMCTL="$T/bin/systemctl" SYSTEMCTL_CALLS="$T/systemctl.log" SYSTEMCTL_UNITS="$T/units" \
+    SYSTEMCTL_USER="$T/bin/systemctl-user" bash "$INST" --uninstall 2>&1)"; RC=$?
+SYSMGR_LOG="$(cat "$T/systemctl.log" 2>/dev/null)"
+assert_contains "$SYSMGR_LOG" "disable --now eldato-disk-reaper.timer" \
+    "T8g the SYSTEM manager is told to disable the timer, not just the re-derived one"
+assert_contains "$SYSMGR_LOG" "daemon-reload" \
+    "T8g …and to forget the unit it just lost"
+assert_nofile "$SYSDIR_G/eldato-disk-reaper.service" "T8g the system unit file is gone"
+assert_eq "$RC" "0" "T8g …so the uninstall is a verified success"
+# A manager that STILL knows the unit must fail the verb, however clean the filesystem looks.
+mkdir -p "$T/units-keep"
+HOME="$home_lin" DISK_REAPER="$PASSFILE" DISK_REAPER_REPOS="$REPO" DISK_REAPER_PLATFORM=linux \
+    DISK_REAPER_STATE_DIR="$T/state-g2" SYSTEMD_SYSTEM_DIR="$T/sys-g2" SUDO="" \
+    SYSTEMCTL="$T/bin/systemctl" SYSTEMCTL_CALLS="$T/systemctl.log" SYSTEMCTL_UNITS="$T/units-keep" \
+    SYSTEMCTL_USER="$T/bin/systemctl-user" bash "$INST" --install >/dev/null 2>&1
+cp -f "$T/sys-g2/eldato-disk-reaper.service" "$T/units-keep/eldato-disk-reaper.service"
+OUT="$(HOME="$home_lin" DISK_REAPER="$PASSFILE" DISK_REAPER_REPOS="$REPO" DISK_REAPER_PLATFORM=linux \
+    DISK_REAPER_STATE_DIR="$T/state-g2" SYSTEMD_SYSTEM_DIR="$T/sys-g2" SUDO="" \
+    SYSTEMCTL="$T/bin/systemctl" SYSTEMCTL_CALLS="$T/systemctl.log" SYSTEMCTL_UNITS="$T/units-keep" \
+    SYSTEMCTL_USER="$T/bin/systemctl-user" bash "$INST" --uninstall 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T8g a manager that STILL KNOWS the unit fails the uninstall (files alone are not the claim)"
+assert_contains "$OUT" "INCOMPLETE" "T8g …and says so"
+[ -f "$T/state-g2/disk-reaper.schedule" ] && ok "T8g …and the armed stamp survives a failed uninstall" \
+    || bad "T8g a FAILED uninstall deleted the stamp — the next sync would silently disarm the box"
+rm -rf "$SYSDIR_G" "$T/sys-g2" "$T/units-keep" "$T/state-g" "$T/state-g2"
+
+# ── T8h: a root/container run has no HOME, and a truncated candidate list must never read as complete ──
+# `$HOME` inside a process substitution made `set -u` abort MID-LIST, which is indistinguishable from a
+# complete list — so the read-back that makes "uninstalled" a verified claim degraded silently.
+OUT="$(env -u HOME DISK_REAPER="$PASSFILE" DISK_REAPER_REPOS="$REPO" DISK_REAPER_PLATFORM=linux \
+    DISK_REAPER_STATE_DIR="$T/state-nohome" SYSTEMD_SYSTEM_DIR="$T/sys-nohome" SUDO="" \
+    SYSTEMCTL="$T/bin/systemctl" SYSTEMCTL_CALLS="$T/systemctl.log" SYSTEMCTL_UNITS="$T/units" \
+    SYSTEMCTL_USER="$T/bin/systemctl-user" bash "$INST" --status 2>&1)"; RC=$?
+assert_absent "$OUT" "unbound variable" "T8h --status with HOME unset is not a bash error"
+assert_contains "$OUT" "platform=linux" "T8h …and still answers the question it was asked"
+
+# ── T8i: a recorded install survives a dead probe (#2048 review, P3) ──────────────────────────
+# The gate that says "no scheduler available" fired BEFORE dispatch, so a box whose sudo probe moved
+# was told it had no scheduler — about a timer that was enabled and active — and the armed unit could
+# not be uninstalled through the tool at all.
+SYSDIR_I="$T/sys-i"; mkdir -p "$SYSDIR_I"
+HOME="$home_lin" DISK_REAPER="$PASSFILE" DISK_REAPER_REPOS="$REPO" DISK_REAPER_PLATFORM=linux \
+    DISK_REAPER_STATE_DIR="$T/state-i" SYSTEMD_SYSTEM_DIR="$SYSDIR_I" SUDO="" \
+    SYSTEMCTL="$T/bin/systemctl" SYSTEMCTL_CALLS="$T/systemctl.log" SYSTEMCTL_UNITS="$T/units" \
+    bash "$INST" --install >/dev/null 2>&1
+OUT="$(HOME="$home_lin" DISK_REAPER="$PASSFILE" DISK_REAPER_REPOS="$REPO" DISK_REAPER_PLATFORM=linux \
+    DISK_REAPER_STATE_DIR="$T/state-i" SYSTEMD_SYSTEM_DIR="$SYSDIR_I" SUDO="$NO_SUDO_G" \
+    SYSTEMCTL="$T/bin/systemctl" SYSTEMCTL_CALLS="$T/systemctl.log" SYSTEMCTL_UNITS="$T/units" \
+    SYSTEMCTL_USER="$T/bin/does-not-exist" bash "$INST" --status 2>&1)"; RC=$?
+assert_contains "$OUT" "installed=yes" "T8i --status finds the recorded install even when the probe is dead"
+assert_eq "$RC" "0" "T8i …and exits 0 (the bring-up's contract), instead of 'no scheduler available'"
+rm -rf "$SYSDIR_I" "$T/state-i"
+
 echo "── T11. both systemd targets, including the two arms no test could reach ──"
 # (a) the SYSTEM unit with `SUDO=""` — the "already root / container" arm. The system unit dir is a
 # seam now, so this branch is executable without real sudo writing to /etc/systemd/system.
@@ -785,7 +860,13 @@ assert_eq "$(sed -n 's/^armed_at=//p' "$LIN_STAMP")" "$AT_1" \
     "T12c …and does NOT re-date the arming (the date belongs to the stance, not to the restating flag)"
 # An owner's reversal, then the next `--check`: the stance follows the flag, but the override is LOUD.
 inst_lin --install --dry-run >/dev/null 2>&1
+PREV_ARMED_AT="$(sed -n 's/^armed_at=//p' "$LIN_STAMP")"
+[ -n "$PREV_ARMED_AT" ] || bad "T12c the reversal has a dated stamp to quote"
 OUT="$(inst_lin --install --apply 2>&1)"
+# ⛔ The date, not the token: the message exists so an owner learns WHEN the reversal was overridden,
+# and `armed_at=` is the one fact that install is about to overwrite (#2048 review, P3).
+assert_contains "$OUT" "since $PREV_ARMED_AT" \
+    "T12c …and quotes the DATE of the reversal (not the word 'dry-run' where a date belongs)"
 assert_contains "$OUT" "RE-ARMING" \
     "T12c a bring-up that re-arms over a recorded dry-run SAYS SO (silence is how the owner never learns)"
 assert_contains "$OUT" "the recorded stance was dry-run" "T12c …and names what it overrode"
