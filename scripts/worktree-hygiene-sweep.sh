@@ -93,10 +93,20 @@
 #       3 usage · 4 PARTIAL (>=1 engine refused a row) · 5 internal
 #       6 PREREQUISITE MISSING (the pass cannot run at all; nothing attempted)
 #
-# Boundedness: the worktree engine is bounded by REAP_WT_BUDGET_SECONDS (1800
-# here, raised from the 300 default per the estate measurement recorded in the
-# plist template) and the reaper by its own per-subprocess timeouts. Neither is
-# allowed to run unbounded: a reaper that hangs the fleet is worse than none.
+# Boundedness: the worktree engine is bounded by REAP_WT_BUDGET_SECONDS —
+# the REAPER's own bound (scripts/pi-reap-worktrees.sh, default 300s), whose
+# raised value (1800s) lives in the armed unit's EnvironmentVariables
+# (templates/launchd/com.tortoise.worktree-hygiene.plist) and is therefore
+# inherited by this pass and by the engine it invokes. ⛔ NOT re-declared here:
+# a second `${REAP_WT_BUDGET_SECONDS:-1800}` in this file is a second home for
+# a registered bound, which the declared-surface registry refuses (verify: "a
+# REGISTERED term in a file the registry does not list as an owner") — and had
+# it been allowed, the 1800 would have competed with the plist's 1800 and the
+# reaper's 300 with nothing asserting which one won. A hand-run pass that wants
+# the estate budget sets it in the environment, exactly as a manual `--aged-days`
+# is supplied:  REAP_WT_BUDGET_SECONDS=1800 worktree-hygiene-sweep.sh --dry-run
+# The engine is additionally bounded by its own per-subprocess timeouts. Neither
+# is allowed to run unbounded: a reaper that hangs the fleet is worse than none.
 set -u
 
 EXIT_OK=0
@@ -118,8 +128,9 @@ LOG="$STATE_DIR/worktree-hygiene.log"
 # 300s budget classified 22 rows and deferred 432, i.e. the bound was doing the
 # opposite of its job. Kills the pass it bounds, so it stays a bound — not a cap
 # on correctness, since deferred rows are PRESERVED.
-REAP_WT_BUDGET_SECONDS="${REAP_WT_BUDGET_SECONDS:-1800}"
-export REAP_WT_BUDGET_SECONDS
+# ⛔ THE VALUE IS NOT SET HERE (see §Boundedness in the header): the armed unit's
+# plist supplies it, the reaper owns the declaration, and the registry verifies
+# both. This file only consumes it.
 
 usage() {
     sed -n '/^# Usage:/,/^# Boundedness:/p' "$0" | sed 's/^# \{0,1\}//'
