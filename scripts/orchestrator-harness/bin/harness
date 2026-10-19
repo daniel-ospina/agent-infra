@@ -1,0 +1,983 @@
+#!/usr/bin/env bash
+# harness — ONE entry point for the orchestrator harness: install, start, stop, restart, status, doctor.
+#
+#   harness install     materialise + enable the supervisor units (systemd user units, or launchd plists)
+#   harness start       start every component THROUGH the supervisor; reconcile harness versions first
+#   harness stop        stop the supervisor (never an individual script)
+#   harness restart     stop, then start
+#   harness status      one line per component: RUNNING(dir) / DEAD(last exit, last log line)
+#   harness doctor      fail loudly on the states that leave a box silently dead
+#
+# ── WHY THIS FILE EXISTS ───────────────────────────────────────────────────────────────────────
+# Measured on a cloud cell (agent-infra#1759's delivery seam): the harness bundle on the box was
+# `scripts/` and NOTHING that could start, supervise or report on it — 0 systemd units present,
+# 0 enabled. The controller was launched by hand as
+#
+#     bash -c 'set -a; . keys.env; set +a; bash <harness>/orch-loop.sh'   (inside a tmux session)
+#
+# and 15 h later an OLDER harness was still running from a stale tmux session. Two versions, no
+# supervisor, no restart, no health signal. Every fix then required a human to re-do the launch
+# ritual, and nothing noticed when a component died. The defect is not one missing script: it is that
+# there was no single authority for "what should be running on this box, from which bytes".
+#
+# So this file owns exactly three answers, and nothing else:
+#
+#   1. WHAT RUNS          `components()` below — one declared inventory, the only list.
+#   2. WHO RUNS IT        the platform's own supervisor (systemd user units / launchd agents),
+#                         rendered from ONE template per platform by `install`. Never a hand launch.
+#   3. WHAT STATE IT IS IN `status` reads the SUPERVISOR's record (ActiveState / last exit) plus the
+#                         component's own log, and `doctor` refuses the states that are silent.
+#
+# ── VERSION DISCIPLINE: exactly one harness sha may be active ─────────────────────────────────
+# `start` reconciles before it launches. Any process running from a DIFFERENT `harness/<sha>/` path
+# under the same pin root is stopped and NAMED — never silently co-run. That is precisely the check
+# whose absence produced the two-version cell above. The scope is deliberately narrow: only processes
+# under the active harness's own pin root (`<pin>/<sha12>/scripts/orchestrator-harness`) are
+# reconciled, because a `pgrep -f orch-loop.sh` across the whole box also matches a peer lane's test
+# fixture and a proof-run copy — and a kill driven by that read destroys somebody else's work.
+#
+# ── NO AD-HOC LAUNCHES ────────────────────────────────────────────────────────────────────────
+# Lanes are started by the supervisor. `doctor` WARNS when a controller is running from a pid that is
+# not the supervisor's MainPID, because that is the shape of the hand launch above. It warns, not
+# fails: a bootstrapping operator may legitimately be mid-migration, and a gate that reds on that
+# gets ignored.
+#
+# ── VERB CONTRACT (the fleet's, unchanged) ─────────────────────────────────────────────────────
+#   0  ok
+#   1  refused, or not ok (a component is not OK / a doctor finding)
+#   2  cannot determine — a read this tool needs could not answer, which is never a pass
+#
+# ── SEAMS (used by the test suite; all are read-only overrides) ────────────────────────────────
+#   HARNESS_ROOT / HARNESS_STATE_DIR / HARNESS_UNIT_DIR   where the harness, state and units live
+#   HARNESS_PLATFORM=linux|darwin                          force a platform (foreign platforms refused
+#                                                          unless HARNESS_ALLOW_FOREIGN_PLATFORM=1)
+#   HARNESS_ACTIVE_SHA                                     pin the active sha (otherwise git HEAD, else
+#                                                          the harness's own .harness-sha file)
+#   HARNESS_PIN_ROOT                                       the `<pin>/<sha12>/…` root to reconcile
+#   HARNESS_PS_FILE                                        read a ps snapshot from a file instead of
+#                                                          running ps (a snapshot, not a stub: the
+#                                                          parser is the shipped one)
+#   HARNESS_COMPONENTS                                     restrict the inventory (default: all six)
+#   HARNESS_ENV_FILE                                       the keys.env the components inherit
+#
+# bash 3.2 compatible on purpose (macOS ships 3.2.57): no associative arrays, no `mapfile`,
+# no `${x^^}`.
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HARNESS_ROOT="${HARNESS_ROOT:-$(cd "$HERE/.." && pwd)}"
+SCRIPTS_DIR="$(cd "$HARNESS_ROOT/.." && pwd)"
+STATE="${HARNESS_STATE_DIR:-$HOME/.harness}"
+LOG_DIR="$STATE/logs"
+QUEUE_DIR="$STATE/queue"
+ACTIVE_SHA_FILE="$STATE/active-sha"
+SERVICE_PREFIX="harness-"
+LABEL_PREFIX="com.eldato.harness."
+
+say()  { printf '%s\n' "$*"; }
+warn() { printf 'harness: WARN: %s\n' "$*" >&2; }
+refuse()  { printf 'harness: REFUSED: %s\n' "$1" >&2; exit 1; }
+unknown() { printf 'harness: CANNOT DETERMINE: %s\n' "$1" >&2; exit 2; }
+
+usage() { # <exit-code>
+  sed -n '2,/^set -uo pipefail$/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//; $d'
+  exit "${1:-0}"
+}
+
+# ── platform ───────────────────────────────────────────────────────────────────────────────────
+# Two mechanisms, one entry point. Anything else is refused rather than guessed: a third branch would
+# have to invent a supervisor, and an unvalidated supervisor is how a box ends up with a component
+# nothing can stop.
+_real_platform() {
+  case "$(uname -s)" in
+    Darwin) printf 'darwin\n' ;;
+    Linux)  printf 'linux\n' ;;
+    *)      printf 'unsupported\n' ;;
+  esac
+}
+PLATFORM="${HARNESS_PLATFORM:-$(_real_platform)}"
+case "$PLATFORM" in
+  darwin|linux) : ;;
+  *) unknown "unsupported platform $(uname -s) — this entry point knows launchd (darwin) and systemd user units (linux)" ;;
+esac
+# A FOREIGN platform may be RENDERED (the template test does exactly that) but never DRIVEN: driving
+# systemd from a Mac, or launchctl from a Linux box, would either no-op silently or address the wrong
+# supervisor. Mutation verbs call require_native_platform.
+require_native_platform() {
+  local real; real="$(_real_platform)"
+  [ "$PLATFORM" = "$real" ] && return 0
+  [ "${HARNESS_ALLOW_FOREIGN_PLATFORM:-0}" = "1" ] && return 0
+  refuse "platform is $PLATFORM but this box is $real — refusing to drive a supervisor that is not here (set HARNESS_ALLOW_FOREIGN_PLATFORM=1 only in a test)"
+}
+
+UNIT_DIR="${HARNESS_UNIT_DIR:-}"
+if [ -z "$UNIT_DIR" ]; then
+  case "$PLATFORM" in
+    linux)  UNIT_DIR="$HOME/.config/systemd/user" ;;
+    darwin) UNIT_DIR="$HOME/Library/LaunchAgents" ;;
+  esac
+fi
+
+# ── the inventory: the ONE list of what runs ──────────────────────────────────────────────────
+# name | kind | entry | extra args
+#
+# kind:
+#   daemon  the entry runs until it exits (the controller, the heartbeat loop)
+#   loop    the entry is ONE PASS; run-component paces it (the reaper, pr-doctor)
+#   pool    a DEMAND-DRIVEN worker: the entry takes one job from $STATE/queue/<name>/ per turn
+#
+# ⛔ merge/fix are pools, not daemons, because they are per-PR work (`merge-one.sh <repo> <or> <pr>
+# <branch>`), not a process that lives forever. A pool gives them the two properties the starter
+# exists for — a supervisor that restarts them and a status line that says whether they are alive —
+# without inventing a second dispatcher. Their queue is empty by default, so a pool idles; the
+# CONTROLLER (orch) remains the thing that decides what work exists.
+components() {
+  printf '%s\n' \
+    "orch|daemon|$HARNESS_ROOT/orch-loop.sh|" \
+    "diskreaper|loop|$SCRIPTS_DIR/disk-reaper.sh|" \
+    "heartbeat|daemon|$SCRIPTS_DIR/heartbeat-loop.sh|" \
+    "pr-doctor|loop|$SCRIPTS_DIR/pr-doctor.py|" \
+    "merge|pool|$HARNESS_ROOT/merge-one.sh|" \
+    "fix|pool|$HARNESS_ROOT/fix-one.sh|"
+}
+
+# component_row <name> — the declared row, or rc 1. Split on purpose: a caller that iterates the
+# inventory and a caller that asks about one name must not disagree about what exists.
+component_row() {
+  local n k e a
+  while IFS='|' read -r n k e a; do
+    [ -n "$n" ] || continue
+    if [ "$n" = "$1" ]; then printf '%s|%s|%s|%s\n' "$n" "$k" "$e" "$a"; return 0; fi
+  done <<<"$(components)"
+  return 1
+}
+
+# selected_components — the inventory, honouring HARNESS_COMPONENTS (a space-separated subset).
+# An unknown name is a REFUSAL, not a silent skip: "I asked for a component that does not exist"
+# must never read as "it is running".
+selected_components() {
+  local want n
+  if [ -n "${HARNESS_COMPONENTS:-}" ]; then
+    for want in $HARNESS_COMPONENTS; do
+      component_row "$want" >/dev/null || refuse "HARNESS_COMPONENTS names an unknown component '$want' (known: $(components | cut -d'|' -f1 | tr '\n' ' '))"
+    done
+    for want in $HARNESS_COMPONENTS; do component_row "$want"; done
+    return 0
+  fi
+  components
+}
+
+entry_basename() { printf '%s\n' "${1##*/}"; }
+
+# ── the active sha, and the sha a running path belongs to ────────────────────────────────────
+active_sha() {
+  if [ -n "${HARNESS_ACTIVE_SHA:-}" ]; then printf '%s\n' "$HARNESS_ACTIVE_SHA"; return 0; fi
+  local s
+  s="$(git -C "$HARNESS_ROOT" rev-parse --short=12 HEAD 2>/dev/null)" && [ -n "$s" ] && { printf '%s\n' "$s"; return 0; }
+  if [ -f "$HARNESS_ROOT/.harness-sha" ]; then
+    s="$(head -1 "$HARNESS_ROOT/.harness-sha" 2>/dev/null)"
+    [ -n "$s" ] && { printf '%s\n' "$s"; return 0; }
+  fi
+  printf 'unknown\n'
+}
+
+# sha_of_path <harness-dir> — the sha a harness directory belongs to.
+# A pinned harness is `<pin>/<sha12>/scripts/orchestrator-harness`, so the DIRECTORY NAME is the
+# answer and no git read is needed (a pin is a worktree; its bytes are the commit's bytes). Anything
+# else falls back to git, and to `unknown` — never to the active sha, because "assume it matches" is
+# the false PASS this whole verb exists to prevent.
+sha_of_path() {
+  local d="$1" rest seg
+  case "$d" in
+    */scripts/orchestrator-harness)
+      rest="${d%/scripts/orchestrator-harness}"
+      seg="${rest##*/}"
+      case "$seg" in
+        [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f])
+          printf '%s\n' "$seg"; return 0 ;;
+      esac ;;
+  esac
+  seg="$(git -C "$d" rev-parse --short=12 HEAD 2>/dev/null)" && [ -n "$seg" ] && { printf '%s\n' "$seg"; return 0; }
+  printf 'unknown\n'
+}
+
+# pin_root — `<pin>` when the active harness is `…/<pin>/<sha12>/scripts/orchestrator-harness`,
+# empty otherwise. Only processes under THIS root are reconciled by `start`; see the header.
+pin_root() {
+  if [ -n "${HARNESS_PIN_ROOT:-}" ]; then printf '%s\n' "$HARNESS_PIN_ROOT"; return 0; fi
+  local rest seg
+  case "$HARNESS_ROOT" in
+    */scripts/orchestrator-harness)
+      rest="${HARNESS_ROOT%/scripts/orchestrator-harness}"
+      seg="${rest##*/}"
+      case "$seg" in
+        [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f])
+          printf '%s\n' "${rest%/*}"; return 0 ;;
+      esac ;;
+  esac
+  printf '\n'
+}
+
+# ── process reads ────────────────────────────────────────────────────────────────────────────
+# dir_from_argv <command-line> — the harness dir a live process is running from, or rc 1.
+# TWO shapes, because both are real:
+#   * `bash <dir>/bin/harness run <component>` — the supervisor's own ExecStart/ProgramArguments
+#   * `bash <dir>/<entry>`                    — run-component exec'd a daemon, or a hand launch
+# ⛔ The `bin/harness` shape requires the NEXT token to be `run`: a concurrent `harness status`
+# being executed by an operator (or by `doctor` from a stale copy) must never be mistaken for a
+# COMPONENT — `start`'s version reconciliation kills what this function attributes.
+# ⛔ An UNRECOGNISED shape returns 1 rather than being guessed at: a process read that over-claims is
+# how a version check reports a version that is not there.
+dir_from_argv() {
+  local cmd="$1" tok dir want=0
+  for tok in $cmd; do
+    if [ "$want" = 1 ]; then
+      [ "$tok" = "run" ] && { printf '%s\n' "$dir"; return 0; }
+      want=0
+    fi
+    case "$tok" in
+      */orchestrator-harness/bin/harness) dir="${tok%/bin/harness}"; want=1 ;;
+    esac
+  done
+  for tok in $cmd; do
+    case "$(entry_basename "$tok")" in
+      orch-loop.sh|disk-reaper.sh|heartbeat-loop.sh|pr-doctor.py|merge-one.sh|fix-one.sh)
+        dir="${tok%/*}"
+        [ "$dir" = "$tok" ] && continue
+        case "$dir" in */orchestrator-harness) printf '%s\n' "$dir"; return 0 ;; esac ;;
+    esac
+  done
+  return 1
+}
+
+# _read_procs — ONE ps read. `harness_procs` caches it for the life of the invocation: a `status`
+# with four running components would otherwise spawn four ps processes, and two rows of one table
+# could report two different worlds.
+PROC_ROWS=""
+_read_procs() {
+  local snap line pid cmd dir
+  if [ -n "${HARNESS_PS_FILE:-}" ]; then
+    snap="$(cat "$HARNESS_PS_FILE" 2>/dev/null)" || return 1
+  else
+    snap="$(ps -eo pid=,command= 2>/dev/null)" || return 1
+  fi
+  case "$snap" in *[![:space:]]*) ;; *) return 1 ;; esac
+  while IFS= read -r line; do
+    line="${line#"${line%%[![:space:]]*}"}"
+    [ -n "$line" ] || continue
+    pid="${line%% *}"
+    case "$pid" in ''|*[!0-9]*) continue ;; esac
+    [ "$pid" = "$$" ] && continue
+    cmd="${line#* }"
+    [ "$cmd" = "$line" ] && continue
+    dir="$(dir_from_argv "$cmd")" || continue
+    printf '%s\t%s\n' "$pid" "$dir"
+  done <<<"$snap"
+  return 0
+}
+
+# harness_procs — "<pid>\t<harness-dir>" for every live harness process this tool can attribute.
+# A SNAPSHOT is read ONCE and reused; HARNESS_PS_FILE supplies the same shape hermetically. The
+# tool's own pid is excluded: `ps` would otherwise match this very command line, which is the
+# `pgrep -f` bug that once counted the shell that ran it.
+harness_procs() {
+  if [ -z "$PROC_ROWS" ]; then PROC_ROWS="$(_read_procs)" || PROC_ROWS=""; fi
+  [ -n "$PROC_ROWS" ] && printf '%s\n' "$PROC_ROWS"
+  return 0
+}
+
+# dir_for_pid <pid> — the harness dir attributed to a pid in the cached snapshot, or empty.
+dir_for_pid() {
+  [ -n "$1" ] && [ "$1" != "-" ] || return 0
+  harness_procs | awk -F'\t' -v p="$1" '$1==p {print $2; exit}'
+}
+
+# distinct_versions — "<sha>\t<dir>" once per (sha, dir), sorted, from the live process set.
+distinct_versions() {
+  local pid dir sha
+  harness_procs | while IFS='	' read -r pid dir; do
+    [ -n "$dir" ] || continue
+    sha="$(sha_of_path "$dir")"
+    printf '%s\t%s\n' "$sha" "$dir"
+  done | sort -u
+}
+
+# distinct_shas — the sha column only, unique.
+distinct_shas() {
+  distinct_versions | cut -f1 | sort -u
+}
+
+# ── supervisor reads (one authority per platform) ────────────────────────────────────────────
+# sup_record <component> → "RUN|DOWN|UNKNOWN<TAB>pid<TAB>last-exit<TAB>detail"
+# ⛔ TRI-STATE on a failed read. `launchctl print` exiting non-zero is "not loaded" ONLY when
+# launchd's own text says so; any other failure is UNKNOWN, because a failed read is not an absent
+# datum (MEMORY.md, #1975: collapsing the two deleted a live job).
+sup_record() {
+  local c="$1"
+  case "$PLATFORM" in
+    linux)
+      local out rc state pid ex
+      out="$(systemctl --user show "${SERVICE_PREFIX}${c}.service" \
+             -p ActiveState -p ExecMainStatus -p MainPID 2>/dev/null)"; rc=$?
+      if [ "$rc" -ne 0 ] || [ -z "$out" ]; then
+        printf 'UNKNOWN\t-\t-\tsystemctl --user could not answer for %s%s.service (rc=%s)\n' "$SERVICE_PREFIX" "$c" "$rc"
+        return 0
+      fi
+      state="$(printf '%s\n' "$out" | sed -n 's/^ActiveState=//p')"
+      pid="$(printf '%s\n' "$out" | sed -n 's/^MainPID=//p')"
+      ex="$(printf '%s\n' "$out" | sed -n 's/^ExecMainStatus=//p')"
+      [ -n "$pid" ] || pid="-"
+      [ -n "$ex" ] || ex="-"
+      case "$state" in
+        active)                        printf 'RUN\t%s\t%s\t\n' "$pid" "$ex" ;;
+        ''|inactive|failed|deactivating|activating|reloading)
+                                       printf 'DOWN\t%s\t%s\t\n' "$pid" "$ex" ;;
+        *)                             printf 'UNKNOWN\t%s\t%s\tunrecognised ActiveState=%s\n' "$pid" "$ex" "$state" ;;
+      esac ;;
+    darwin)
+      local label="${LABEL_PREFIX}${c}" out rc pid ex
+      out="$(launchctl print "gui/$UID/$label" 2>&1)"; rc=$?
+      if [ "$rc" -ne 0 ]; then
+        case "$out" in
+          *"Could not find service"*|*"service not found"*|*"No such process"*)
+            printf 'DOWN\t-\t-\t\n' ;;
+          *) printf 'UNKNOWN\t-\t-\tlaunchctl print could not answer for %s (rc=%s): %s\n' "$label" "$rc" "$(printf '%s\n' "$out" | head -1)" ;;
+        esac
+        return 0
+      fi
+      pid="$(printf '%s\n' "$out" | sed -n 's/^[[:space:]]*pid = \([0-9][0-9]*\)$/\1/p' | head -1)"
+      ex="$(printf '%s\n' "$out" | sed -n 's/^[[:space:]]*last exit code = \([-0-9][0-9]*\)$/\1/p' | head -1)"
+      [ -n "$pid" ] || pid="-"
+      [ -n "$ex" ] || ex="-"
+      case "$out" in
+        *"state = running"*) printf 'RUN\t%s\t%s\t\n' "$pid" "$ex" ;;
+        *"state = "*)        printf 'DOWN\t%s\t%s\t\n' "$pid" "$ex" ;;
+        *)                   printf 'UNKNOWN\t%s\t%s\tlaunchctl print answered without a state line\n' "$pid" "$ex" ;;
+      esac ;;
+  esac
+}
+
+sup_enabled() { # 0 enabled · 1 disabled · 2 unknown
+  local c="$1"
+  case "$PLATFORM" in
+    linux)
+      local out rc
+      out="$(systemctl --user is-enabled "${SERVICE_PREFIX}${c}.service" 2>/dev/null)"; rc=$?
+      case "$out" in
+        enabled|enabled-runtime|static|indirect|generated) return 0 ;;
+        disabled|masked|masked-runtime) return 1 ;;
+      esac
+      [ "$rc" -eq 0 ] && return 0
+      return 2 ;;
+    darwin)
+      [ -f "$UNIT_DIR/${LABEL_PREFIX}${c}.plist" ] && return 0
+      return 1 ;;
+  esac
+}
+
+sup_available() { # 0 yes · 1 no · 2 unknown
+  case "$PLATFORM" in
+    linux)
+      systemctl --user show-environment >/dev/null 2>&1 && return 0
+      return 1 ;;
+    darwin)
+      launchctl print "gui/$UID" >/dev/null 2>&1 && return 0
+      return 1 ;;
+  esac
+}
+
+sup_start() {
+  local c="$1" plist
+  case "$PLATFORM" in
+    linux) systemctl --user start "${SERVICE_PREFIX}${c}.service" ;;
+    darwin)
+      plist="$UNIT_DIR/${LABEL_PREFIX}${c}.plist"
+      # bootstrap when not loaded; kickstart an already-loaded job. NEVER `load -w` / `unload -w`:
+      # `-w` writes a PERSISTENT Disabled override, so the "reload" is really a disable whose
+      # re-enable can fail and leave the component gone AND disabled (#1975).
+      if launchctl print "gui/$UID/${LABEL_PREFIX}${c}" >/dev/null 2>&1; then
+        launchctl kickstart -k "gui/$UID/${LABEL_PREFIX}${c}"
+      else
+        launchctl bootstrap "gui/$UID" "$plist" || launchctl kickstart "gui/$UID/${LABEL_PREFIX}${c}"
+      fi ;;
+  esac
+}
+
+sup_stop() {
+  local c="$1"
+  case "$PLATFORM" in
+    linux) systemctl --user stop "${SERVICE_PREFIX}${c}.service" ;;
+    darwin)
+      launchctl print "gui/$UID/${LABEL_PREFIX}${c}" >/dev/null 2>&1 || return 0
+      launchctl bootout "gui/$UID/${LABEL_PREFIX}${c}" ;;
+  esac
+}
+
+# ── unit rendering ──────────────────────────────────────────────────────────────────────────
+xml_escape() {
+  local s="$1"
+  s="${s//&/&amp;}"
+  s="${s//</&lt;}"
+  s="${s//>/&gt;}"
+  printf '%s' "$s"
+}
+
+# default_env_file — the keys.env the components inherit. Explicit override first, then the cell
+# home's own file, then the per-user bring-up config. The PATH is printed even when it does not exist:
+# the linux template makes it OPTIONAL (`EnvironmentFile=-`), so a missing file is not a start failure,
+# and the unit still records which file the operator was expected to provide.
+default_env_file() {
+  if [ -n "${HARNESS_ENV_FILE:-}" ]; then printf '%s\n' "$HARNESS_ENV_FILE"; return 0; fi
+  if [ -n "${CELL_HOME:-}" ] && [ -f "$CELL_HOME/keys.env" ]; then printf '%s\n' "$CELL_HOME/keys.env"; return 0; fi
+  printf '%s\n' "$HOME/.config/orchestrator/bringup.env"
+}
+
+# render_unit <platform> <component> <out-file>
+# ⛔ ONE TEMPLATE PER PLATFORM, rendered per component. A leftover `__TOKEN__` is a REFUSAL, not a
+# cosmetic wart: an unfilled `__LOG__` would make the supervisor write to a literal `__LOG__` file
+# and `status` would read the component's log from nowhere.
+render_unit() {
+  local plat="$1" name="$2" out="$3" tmpl line esc root state log bin envf label
+  case "$plat" in
+    linux)  tmpl="$HARNESS_ROOT/templates/systemd/harness-unit.service.tmpl" ;;
+    darwin) tmpl="$HARNESS_ROOT/templates/launchd/harness-unit.plist.tmpl" ;;
+    *) refuse "render_unit: unknown platform '$plat'" ;;
+  esac
+  [ -f "$tmpl" ] || refuse "unit template not found: $tmpl"
+  esc=0; [ "$plat" = darwin ] && esc=1
+  root="$HARNESS_ROOT"; state="$STATE"; log="$LOG_DIR/$name.log"; bin="$HERE/harness"
+  envf="$(default_env_file)"
+  label="${LABEL_PREFIX}${name}"
+  if [ "$esc" = 1 ]; then
+    root="$(xml_escape "$root")"; state="$(xml_escape "$state")"
+    log="$(xml_escape "$log")"; bin="$(xml_escape "$bin")"; envf="$(xml_escape "$envf")"
+    label="$(xml_escape "$label")"
+  fi
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line//__COMPONENT__/$name}"
+    line="${line//__LABEL__/$label}"
+    line="${line//__ROOT__/$root}"
+    line="${line//__STATE__/$state}"
+    line="${line//__LOG__/$log}"
+    line="${line//__BIN__/$bin}"
+    line="${line//__ENV_FILE__/$envf}"
+    printf '%s\n' "$line"
+  done <"$tmpl" >"$out" || return 1
+  if grep -q '__[A-Z_][A-Z_]*__' "$out" 2>/dev/null; then
+    refuse "render_unit: unfilled placeholder in $out — the template and the renderer disagree"
+  fi
+  return 0
+}
+
+unit_path() {
+  local name="$1"
+  case "$PLATFORM" in
+    linux)  printf '%s\n' "$UNIT_DIR/${SERVICE_PREFIX}${name}.service" ;;
+    darwin) printf '%s\n' "$UNIT_DIR/${LABEL_PREFIX}${name}.plist" ;;
+  esac
+}
+
+# ── install ────────────────────────────────────────────────────────────────────────────────
+cmd_install() {
+  require_native_platform
+  # A whitespace-bearing path is refused because the version read is argv-token based: it would
+  # silently fail to attribute any process, and a version check that cannot see a process reports a
+  # clean box. Fail closed at install time instead.
+  case "$HARNESS_ROOT" in
+    *[[:space:]]*) refuse "HARNESS_ROOT='$HARNESS_ROOT' contains whitespace — pick a path without spaces (the version read is argv-token based and would silently see nothing)" ;;
+  esac
+  mkdir -p "$UNIT_DIR" "$LOG_DIR" "$QUEUE_DIR" || refuse "cannot create $UNIT_DIR / $LOG_DIR"
+  printf '%s\n' "$(active_sha)" >"$ACTIVE_SHA_FILE" 2>/dev/null || warn "cannot record the active sha in $ACTIVE_SHA_FILE"
+
+  local name kind entry args dest tmp written=0 unchanged=0 enabled=0
+  while IFS='|' read -r name kind entry args; do
+    [ -n "$name" ] || continue
+    dest="$(unit_path "$name")"
+    tmp="$dest.tmp.$$"
+    render_unit "$PLATFORM" "$name" "$tmp" || { rm -f "$tmp"; refuse "could not render the unit for $name"; }
+    if [ -f "$dest" ] && cmp -s "$tmp" "$dest"; then
+      rm -f "$tmp"; unchanged=$((unchanged + 1))
+    else
+      mv -f "$tmp" "$dest" || { rm -f "$tmp"; refuse "could not install $dest"; }
+      written=$((written + 1))
+    fi
+    case "$PLATFORM" in
+      linux)
+        if sup_enabled "$name" 2>/dev/null; then :; else
+          if systemctl --user enable "${SERVICE_PREFIX}${name}.service" >/dev/null 2>&1; then
+            enabled=$((enabled + 1))
+          else
+            warn "could not enable ${SERVICE_PREFIX}${name}.service — the unit is written but will NOT start at boot (no user systemd manager? see 'harness doctor')"
+          fi
+        fi ;;
+      darwin) : ;;   # launchd has no enable step here; RunAtLoad + bootstrap at start
+    esac
+    legacy_conflict_note "$name" "$entry"
+  done <<<"$(selected_components)"
+
+  if [ "$PLATFORM" = linux ] && [ "$written" -gt 0 ]; then
+    systemctl --user daemon-reload >/dev/null 2>&1 || warn "systemctl --user daemon-reload failed — the units are written but systemd may serve stale definitions"
+  fi
+
+  if [ "$written" -eq 0 ] && [ "$enabled" -eq 0 ]; then
+    say "install: units already current ($unchanged unchanged, 0 written) — no-op"
+  else
+    say "install: $written written, $unchanged unchanged, $enabled newly enabled (units: $UNIT_DIR)"
+    # A written unit does not move a RUNNING process: the supervisor reloads the definition, the
+    # component keeps its old bytes until it is restarted. Saying so is the difference between
+    # "installed" and "the box is running it".
+    say "install: run 'harness restart' to move the running components onto these units"
+  fi
+  say "install: start them with: harness start"
+  return 0
+}
+
+# legacy_conflict_note <component> <entry> — name an EXISTING unit that already runs the same entry.
+# Not fatal (a migration in progress is a legitimate state) but never silent: two supervisors over
+# one entry is the duplicate-dispatch class, and the operator must see the file to retire.
+legacy_conflict_note() {
+  local name="$1" entry="$2" f base
+  base="$(entry_basename "$entry")"
+  [ -d "$UNIT_DIR" ] || return 0
+  for f in "$UNIT_DIR"/*; do
+    [ -f "$f" ] || continue
+    case "$(basename "$f")" in
+      "${SERVICE_PREFIX}${name}.service"|"${LABEL_PREFIX}${name}.plist") continue ;;
+    esac
+    grep -qF "$base" "$f" 2>/dev/null || continue
+    warn "another unit already references $base: $(basename "$f") — retire it before starting $name, or two supervisors will run the same component"
+  done
+  return 0
+}
+
+# ── start / stop / restart ──────────────────────────────────────────────────────────────────
+# enforce_single_version — the check whose absence produced two harness versions on one cell.
+# Only processes under the ACTIVE harness's pin root are reconciled (see header). Each stop is
+# enumerated, named and reported BEFORE it happens; there is no unscoped pkill, and a pid whose
+# harness dir cannot be attributed is left alone (reported as un-attributable, not guessed).
+enforce_single_version() {
+  local active pr pid dir sha stopped=0 _rows
+  active="$(active_sha)"
+  pr="$(pin_root)"
+  if [ -z "$pr" ]; then
+    say "version-discipline: the active harness is not a pinned <pin>/<sha>/ tree — nothing outside it to reconcile"
+    return 0
+  fi
+  case "$pr" in
+    *[[:space:]]*) warn "pin root '$pr' contains whitespace — the process read cannot attribute it; no version reconciliation performed"; return 0 ;;
+  esac
+  if ! _rows="$(_read_procs)"; then
+    # A box must still start on a transient ps failure, but the skip is NAMED: an unreconciled start
+    # that reported nothing would claim the single-version invariant it never checked.
+    warn "the process list could not be read — version reconciliation SKIPPED (run 'harness doctor') "
+    return 0
+  fi
+  while IFS='	' read -r pid dir; do
+    [ -n "$dir" ] || continue
+    case "$dir" in "$pr"/*) : ;; *) continue ;; esac
+    sha="$(sha_of_path "$dir")"
+    [ "$sha" = "$active" ] && continue
+    say "version-discipline: stopping pid $pid from $dir (sha $sha; active is $active)"
+    kill -TERM "$pid" 2>/dev/null || { warn "pid $pid could not be signalled — it is running a different sha and is NOT stopped"; continue; }
+    local i=0
+    while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+    kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null
+    stopped=$((stopped + 1))
+  done <<<"$_rows"
+  [ "$stopped" -gt 0 ] && say "version-discipline: stopped $stopped process(es) from a different harness sha"
+  return 0
+}
+
+cmd_start() {
+  require_native_platform
+  if ! sup_available; then
+    refuse "no supervisor — $([ "$PLATFORM" = linux ] && printf 'systemctl --user' || printf 'launchd') is not reachable on this box, so nothing could be started (start never launches a component directly)"
+  fi
+  mkdir -p "$UNIT_DIR" "$LOG_DIR" || refuse "cannot create $UNIT_DIR / $LOG_DIR"
+  local name kind entry args dest missing=""
+  while IFS='|' read -r name kind entry args; do
+    [ -n "$name" ] || continue
+    dest="$(unit_path "$name")"
+    [ -f "$dest" ] || missing="$missing $name"
+  done <<<"$(selected_components)"
+  if [ -n "$missing" ]; then
+    refuse "no supervisor: units not installed for${missing} — run 'harness install' first (start never launches a component directly)"
+  fi
+  printf '%s\n' "$(active_sha)" >"$ACTIVE_SHA_FILE" 2>/dev/null || warn "cannot record the active sha in $ACTIVE_SHA_FILE"
+
+  enforce_single_version
+
+  local failed=0 started=0 already=0 rec st pid ex det
+  while IFS='|' read -r name kind entry args; do
+    [ -n "$name" ] || continue
+    rec="$(sup_record "$name")"
+    st="$(printf '%s\n' "$rec" | cut -f1)"
+    pid="$(printf '%s\n' "$rec" | cut -f2)"
+    if [ "$st" = "RUN" ]; then
+      say "start: $name already running (pid $pid) — no-op"
+      already=$((already + 1)); continue
+    fi
+    sup_start "$name" >/dev/null 2>&1
+    # `systemctl start` is ASYNC for Type=simple and launchd's bootstrap returns before the child is
+    # running, so a single immediate read can catch a healthy component mid-start and report it as a
+    # failure. Poll a BOUNDED number of times; the bound is why a crash-looping component still
+    # reports (it never reaches `active`).
+    local i=0
+    while [ "$i" -lt 25 ]; do
+      rec="$(sup_record "$name")"; st="$(printf '%s\n' "$rec" | cut -f1)"
+      [ "$st" = "RUN" ] && break
+      sleep 0.2; i=$((i + 1))
+    done
+    pid="$(printf '%s\n' "$rec" | cut -f2)"; ex="$(printf '%s\n' "$rec" | cut -f3)"
+    if [ "$st" = "RUN" ]; then
+      say "start: $name started (pid $pid)"; started=$((started + 1))
+    else
+      printf 'harness: start: %s did NOT come up (supervisor says %s, last exit %s) — read %s\n' \
+        "$name" "$st" "$ex" "$LOG_DIR/$name.log" >&2
+      failed=$((failed + 1))
+    fi
+  done <<<"$(selected_components)"
+
+  if [ "$failed" -gt 0 ]; then
+    printf 'harness: start: %s component(s) failed to start (%s started, %s already running)\n' "$failed" "$started" "$already" >&2
+    return 1
+  fi
+  if [ "$started" -eq 0 ]; then
+    say "start: all $already component(s) already running — no-op"
+  else
+    say "start: $started started, $already already running"
+  fi
+  return 0
+}
+
+cmd_stop() {
+  require_native_platform
+  local name kind entry args rec st pid stopped=0 already=0 failed=0
+  while IFS='|' read -r name kind entry args; do
+    [ -n "$name" ] || continue
+    rec="$(sup_record "$name")"; st="$(printf '%s\n' "$rec" | cut -f1)"; pid="$(printf '%s\n' "$rec" | cut -f2)"
+    if [ "$st" = "DOWN" ]; then
+      say "stop: $name already stopped — no-op"; already=$((already + 1)); continue
+    fi
+    if [ "$st" = "UNKNOWN" ]; then
+      warn "stop: $name's supervisor state is unreadable — not stopped"; failed=$((failed + 1)); continue
+    fi
+    if sup_stop "$name" >/dev/null 2>&1; then
+      rec="$(sup_record "$name")"; st="$(printf '%s\n' "$rec" | cut -f1)"
+      if [ "$st" = "RUN" ]; then
+        warn "stop: $name is still running after stop (pid $pid)"; failed=$((failed + 1))
+      else
+        say "stop: $name stopped"; stopped=$((stopped + 1))
+      fi
+    else
+      warn "stop: $name could not be stopped by the supervisor"; failed=$((failed + 1))
+    fi
+  done <<<"$(selected_components)"
+  if [ "$failed" -gt 0 ]; then say "stop: $stopped stopped, $already already stopped, $failed failed"; return 1; fi
+  if [ "$stopped" -eq 0 ]; then say "stop: all components already stopped — no-op"; else say "stop: $stopped stopped, $already already stopped"; fi
+  return 0
+}
+
+cmd_restart() {
+  require_native_platform
+  cmd_stop || return 1
+  cmd_start
+}
+
+# ── status ─────────────────────────────────────────────────────────────────────────────────
+last_log_line() {
+  local f="$LOG_DIR/$1.log" l
+  [ -f "$f" ] || { printf '(no log yet)\n'; return 0; }
+  l="$(grep -v '^[[:space:]]*$' "$f" 2>/dev/null | tail -1)"
+  [ -n "$l" ] || { printf '(log is empty)\n'; return 0; }
+  # The status line is ONE line: a component that logs a multi-kilobyte stack trace must not turn
+  # `status` into a wall. 120 chars is enough to recognise a failure.
+  printf '%s\n' "$l" | cut -c1-120
+}
+
+cmd_status() {
+  require_native_platform
+  local active rec st pid ex det dir line worst=0 versions n
+  if ! PROC_ROWS="$(_read_procs)"; then
+    # A failed process read is NOT "nothing is running": it makes every version statement below a
+    # guess, and a guessed-honest version table is the false PASS this file exists to prevent.
+    unknown "the process list could not be read — harness versions are unmeasurable, which is never a pass"
+  fi
+  active="$(active_sha)"
+  versions="$(distinct_shas)"
+  n="$(printf '%s\n' "$versions" | grep -c . || true)"
+  [ -n "$n" ] || n=0
+
+  local name kind entry args procdir
+  while IFS='|' read -r name kind entry args; do
+    [ -n "$name" ] || continue
+    rec="$(sup_record "$name")"
+    st="$(printf '%s\n' "$rec" | cut -f1)"
+    pid="$(printf '%s\n' "$rec" | cut -f2)"
+    ex="$(printf '%s\n' "$rec" | cut -f3)"
+    det="$(printf '%s\n' "$rec" | cut -f4)"
+    case "$st" in
+      RUN)
+        # The dir the component ACTUALLY runs from, attributed from its pid's argv; falling back to
+        # the harness path this entry point belongs to only when the pid is not attributable.
+        procdir="$(dir_for_pid "$pid")"
+        [ -n "$procdir" ] || procdir="$HARNESS_ROOT"
+        printf '%-11s RUNNING(%s)\n' "$name" "$procdir" ;;
+      DOWN)
+        printf '%-11s DEAD(last exit %s, "%s")\n' "$name" "${ex:--}" "$(last_log_line "$name")"
+        [ "$worst" -lt 1 ] && worst=1 ;;
+      *)
+        printf '%-11s UNKNOWN(%s)\n' "$name" "${det:-the supervisor could not answer}"
+        [ "$worst" -lt 2 ] && worst=2 ;;
+    esac
+  done <<<"$(selected_components)"
+
+  say ""
+  say "ACTIVE HARNESS SHA  $active"
+  say "HARNESS VERSIONS    $n running"
+  if [ "$n" -gt 1 ]; then
+    say "                    ⛔ more than one version is running — 'harness doctor' names them, 'harness start' reconciles"
+  fi
+  return "$worst"
+}
+
+# ── doctor ─────────────────────────────────────────────────────────────────────────────────
+cmd_doctor() {
+  require_native_platform
+  local fails=0 warns=0 active pr versions shas name kind entry args rec st pid ex det missing dir sha
+  if ! PROC_ROWS="$(_read_procs)"; then
+    unknown "the process list could not be read — harness versions are unmeasurable, which is never a pass"
+  fi
+  active="$(active_sha)"
+  pr="$(pin_root)"
+
+  # 1) SUPERVISOR PRESENT. Without one, every other read below is a guess.
+  if ! sup_available; then
+    printf 'DOCTOR FAIL: no supervisor — %s is not reachable on this box, so nothing can start or restart a component\n' \
+      "$([ "$PLATFORM" = linux ] && printf 'systemctl --user' || printf 'launchd (gui/%s)' "$UID")"
+    fails=$((fails + 1))
+  fi
+  local anyunit=0
+  while IFS='|' read -r name kind entry args; do
+    [ -n "$name" ] || continue
+    [ -f "$(unit_path "$name")" ] && anyunit=1
+  done <<<"$(selected_components)"
+  if [ "$anyunit" -eq 0 ]; then
+    printf "DOCTOR FAIL: no supervisor units installed in %s — run 'harness install'\n" "$UNIT_DIR"
+    fails=$((fails + 1))
+  fi
+
+  # 2) EXACTLY ONE VERSION. Two shas running is the measured incident this file exists for.
+  shas="$(distinct_shas)"
+  local count; count="$(printf '%s\n' "$shas" | grep -c . || true)"; [ -n "$count" ] || count=0
+  if [ "$count" -gt 1 ]; then
+    printf 'DOCTOR FAIL: %s harness versions are running (active is %s):\n' "$count" "$active"
+    distinct_versions | while IFS='	' read -r sha dir; do
+      printf '             sha %s from %s\n' "$sha" "$dir"
+    done
+    printf "             run 'harness start' to reconcile them (it stops every non-active sha under %s)\n" "${pr:-<no pin root>}"
+    fails=$((fails + 1))
+  fi
+
+  # 3) REQUIRED COMPONENT MISSING — the component's own code is gone, so the unit can only crash.
+  missing=0
+  while IFS='|' read -r name kind entry args; do
+    [ -n "$name" ] || continue
+    if [ ! -e "$entry" ]; then
+      printf 'DOCTOR FAIL: required component %s is MISSING — %s does not exist\n' "$name" "$entry"
+      missing=$((missing + 1))
+    fi
+  done <<<"$(selected_components)"
+  [ "$missing" -gt 0 ] && fails=$((fails + missing))
+
+  # 4+5+6) per component: sha skew, enabled-but-not-running, ad-hoc launch.
+  local mainpid=""
+  while IFS='|' read -r name kind entry args; do
+    [ -n "$name" ] || continue
+    rec="$(sup_record "$name")"; st="$(printf '%s\n' "$rec" | cut -f1)"
+    pid="$(printf '%s\n' "$rec" | cut -f2)"; ex="$(printf '%s\n' "$rec" | cut -f3)"; det="$(printf '%s\n' "$rec" | cut -f4)"
+
+    if sup_enabled "$name"; then
+      if [ "$st" = "DOWN" ]; then
+        printf 'DOCTOR FAIL: %s is ENABLED but not running (last exit %s, "%s")\n' "$name" "${ex:--}" "$(last_log_line "$name")"
+        fails=$((fails + 1))
+      elif [ "$st" = "UNKNOWN" ]; then
+        printf 'DOCTOR FAIL: %s'"'"'s state cannot be determined: %s\n' "$name" "${det:-the supervisor could not answer}"
+        fails=$((fails + 1))
+      fi
+    fi
+
+    if [ "$st" = "RUN" ] && [ "$pid" != "-" ]; then
+      dir="$(dir_for_pid "$pid")"
+      if [ -n "$dir" ]; then
+        sha="$(sha_of_path "$dir")"
+        if [ "$sha" != "$active" ] && [ "$sha" != "unknown" ]; then
+          printf 'DOCTOR FAIL: component %s is running from sha %s (%s) but the active harness is %s\n' "$name" "$sha" "$dir" "$active"
+          fails=$((fails + 1))
+        fi
+      fi
+    fi
+  done <<<"$(selected_components)"
+
+  # 7) THE RECORDED START SHA vs THE HARNESS'S OWN SHA — the one skew the process read cannot see.
+  # A `git pull` (or a re-pointed pin) under a RUNNING controller moves the checkout while the
+  # process keeps its old bytes, so its argv path is unchanged and `sha_of_path` answers the NEW sha:
+  # the ps read reports agreement that is false. The boot-time record is the only witness, so it is
+  # read here — as a WARN, because a restart outside the supervisor can legitimately re-point it.
+  if [ -f "$ACTIVE_SHA_FILE" ]; then
+    rec="$(head -1 "$ACTIVE_SHA_FILE" 2>/dev/null)"
+    if [ -n "$rec" ] && [ "$rec" != "$active" ] && [ "$active" != "unknown" ]; then
+      printf 'DOCTOR WARN: the supervisor was last started from sha %s but the harness is now %s — a running component may still hold the older bytes; run %s\n' \
+        "$rec" "$active" "'harness restart'"
+      warns=$((warns + 1))
+    fi
+  fi
+
+  # 6) AD-HOC LAUNCH — a controller that no unit owns. WARN, not FAIL: the operator may be
+  # mid-migration, and a check that reds on a state it cannot repair gets ignored.
+  mainpid=""
+  rec="$(sup_record orch)"; [ "$(printf '%s\n' "$rec" | cut -f1)" = "RUN" ] && mainpid="$(printf '%s\n' "$rec" | cut -f2)"
+  local adhoc=0 apid adir
+  while IFS='	' read -r apid adir; do
+    [ -n "$apid" ] || continue
+    case "$adir" in "$HARNESS_ROOT"|"$HARNESS_ROOT"/*) : ;; *) continue ;; esac
+    [ "$apid" = "$mainpid" ] && continue
+    printf 'DOCTOR WARN: a controller is running OUTSIDE the supervisor (pid %s, %s) — lanes are started by the supervisor; this one cannot be restarted or reported\n' "$apid" "$adir"
+    warns=$((warns + 1)); adhoc=$((adhoc + 1))
+  done <<<"$(harness_procs)"
+
+  if [ "$fails" -gt 0 ]; then
+    say ""
+    say "doctor: $fails finding(s), $warns warning(s) — NOT healthy"
+    return 1
+  fi
+  if [ "$warns" -gt 0 ]; then
+    say "doctor: 0 failures, $warns warning(s)"
+  else
+    say "doctor: OK — one harness version ($active), all components supervised and running"
+  fi
+  return 0
+}
+
+# ── run: the supervisor's ExecStart/ProgramArguments target ─────────────────────────────────
+# ONE place that knows how a component is launched, so the unit files never encode a command (and
+# cannot drift from the inventory). This is also the ONLY launch path; `install`/`start` never exec
+# a component directly.
+interval_for() {
+  local n="$1" v
+  case "$n" in
+    diskreaper) v="${HARNESS_INTERVAL_DISKREAPER:-3600}" ;;
+    pr-doctor)  v="${HARNESS_INTERVAL_PR_DOCTOR:-900}" ;;
+    *)          v="${HARNESS_INTERVAL_DEFAULT:-60}" ;;
+  esac
+  case "$v" in ''|*[!0-9]*) v=60 ;; esac
+  printf '%s\n' "$v"
+}
+
+load_env_file() {
+  local f defs
+  f="$(default_env_file)"
+  [ -f "$f" ] || return 0
+  # `set -a` == the measured hand launch (`set -a; . keys.env; set +a`), so the supervisor starts the
+  # controller with the SAME environment an operator used by hand — that equivalence is what makes
+  # the supervisor a replacement rather than a second, differently-configured launcher.
+  # ⛔ SOURCED IN A SUBSHELL, then replayed with `export -p`. A keys.env whose last line is `exit 0`
+  # would otherwise end the SUPERVISOR process (measured in cloud-cell-supervisor.sh's own history),
+  # and the `export -p` replay is bash's own quoting, so no value is re-expanded on the way back in.
+  defs="$( set -a; . "$f" >/dev/null 2>&1; set +a; export -p )" || {
+    warn "could not source $f — the component starts with the ambient environment"; return 0; }
+  eval "$defs" >/dev/null 2>&1 || warn "could not apply the environment read from $f"
+  return 0
+}
+
+cmd_run() {
+  local name="${1:-}"
+  [ -n "$name" ] || refuse "run: a component name is required (one of: $(components | cut -d'|' -f1 | tr '\n' ' '))"
+  local row kind entry args
+  row="$(component_row "$name")" || refuse "run: unknown component '$name'"
+  kind="$(printf '%s\n' "$row" | cut -d'|' -f2)"
+  entry="$(printf '%s\n' "$row" | cut -d'|' -f3)"
+  args="$(printf '%s\n' "$row" | cut -d'|' -f4)"
+  [ -e "$entry" ] || { printf 'harness: run: %s — the component'"'"'s code is missing: %s\n' "$name" "$entry" >&2; exit 1; }
+  mkdir -p "$LOG_DIR" "$QUEUE_DIR/$name" 2>/dev/null
+  export HARNESS_ROOT HARNESS_STATE_DIR="$STATE" PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+  load_env_file
+  # The controller reads $O (seeded worker scripts). Default it as the platform's own supervisor
+  # does, so a component started by THIS supervisor behaves exactly like one started by hand.
+  if [ -z "${O:-}" ]; then
+    if [ -d "${CELL_HOME:-}/orchestrator" ]; then O="$CELL_HOME/orchestrator"; else O="$HOME/orchestrator"; fi
+    export O
+  fi
+  printf '[harness] %s: started (kind=%s, entry=%s, pid=%s) %s\n' "$name" "$kind" "$entry" "$$" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+  # A `.py` entry runs under python3; anything else is exec'd directly. Kept as one word (unquoted
+  # on use) rather than an array: bash 3.2 treats `"${empty[@]}"` under `set -u` as an unbound
+  # variable, and this file must run on macOS's /bin/bash.
+  local interp=""
+  case "$entry" in *.py) interp="python3" ;; esac
+
+  case "$kind" in
+    daemon)
+      # shellcheck disable=SC2086  # $interp and $args are meant to word-split (empty = no word)
+      exec $interp "$entry" $args ;;
+    loop)
+      local i rc
+      i="$(interval_for "$name")"
+      trap 'printf "[harness] %s: stop requested\n" "$name"; exit 0' TERM INT
+      while :; do
+        rc=0
+        $interp "$entry" $args || rc=$?
+        printf '[harness] %s: pass exited %s %s\n' "$name" "$rc" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        # `sleep & wait` so a TERM interrupts the wait instead of being deferred behind an hour-long
+        # sleep — a supervisor that takes an hour to stop is a supervisor nobody trusts.
+        sleep "$i" & wait $! || exit 0
+      done ;;
+    pool)
+      trap 'printf "[harness] %s: stop requested\n" "$name"; exit 0' TERM INT
+      local job
+      while :; do
+        job=""
+        for f in "$QUEUE_DIR/$name"/*.job; do
+          [ -f "$f" ] && { job="$f"; break; }
+        done
+        if [ -z "$job" ]; then sleep 15 & wait $! || exit 0; continue; fi
+        rc=0
+        printf '[harness] %s: worker start %s\n' "$name" "$job"
+        $interp "$entry" --argv "$job" $args || rc=$?
+        printf '[harness] %s: worker exit %s (%s)\n' "$name" "$rc" "$job"
+        # A failed worker must not leave its job at the queue head, or the pool spins on the same
+        # file forever and reports a busy component that is making no progress.
+        [ -f "$job" ] && mv -f "$job" "$job.failed-$rc"
+      done ;;
+    *) refuse "run: unknown kind '$kind' for component '$name'" ;;
+  esac
+}
+
+# ── main ───────────────────────────────────────────────────────────────────────────────────
+VERB=""; VERB_ARG=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    install|start|stop|restart|status|doctor)
+      [ -z "$VERB" ] || { printf 'harness: two subcommands given (%s and %s)\n' "$VERB" "$1" >&2; usage 1; }
+      VERB="$1"; shift ;;
+    run)
+      [ -z "$VERB" ] || { printf 'harness: two subcommands given (%s and run)\n' "$VERB" >&2; usage 1; }
+      VERB="run"; shift
+      VERB_ARG="${1:-}"; [ "$#" -gt 0 ] && shift ;;
+    -h|--help|help) usage 0 ;;
+    *) printf 'harness: unknown argument %s\n' "$1" >&2; usage 1 ;;
+  esac
+done
+
+case "$VERB" in
+  install) cmd_install ;;
+  start)   cmd_start ;;
+  stop)    cmd_stop ;;
+  restart) cmd_restart ;;
+  status)  cmd_status ;;
+  doctor)  cmd_doctor ;;
+  run)     cmd_run "$VERB_ARG" ;;
+  *)
+    printf 'harness: a subcommand is required (install|start|stop|restart|status|doctor)\n' >&2
+    usage 1 ;;
+esac

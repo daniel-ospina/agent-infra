@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  harness-unit.plist.tmpl — ONE template, rendered per component by `bin/harness install`.
+
+  The macOS equivalent of templates/systemd/harness-unit.service.tmpl, and the same discipline:
+  every placeholder is filled from the harness's component inventory, so nothing is hand-written per
+  box and ExecStart/ProgramArguments cannot name another machine's path.
+
+  KeepAlive + RunAtLoad == systemd's Restart=always: a component that dies is restarted, so its death
+  is a state `harness status` can report (last exit code) rather than a job that silently stays down.
+  ThrottleInterval is launchd's respawn floor; it is 5s for the same reason RestartSec is 5 in the
+  unit template — a crash loop must be visible, not a fork bomb.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>__LABEL__</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__BIN__</string>
+    <string>run</string>
+    <string>__COMPONENT__</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>__ROOT__</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HARNESS_ROOT</key>
+    <string>__ROOT__</string>
+    <key>HARNESS_STATE_DIR</key>
+    <string>__STATE__</string>
+    <key>HARNESS_ENV_FILE</key>
+    <string>__ENV_FILE__</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>5</integer>
+
+  <key>StandardOutPath</key>
+  <string>__LOG__</string>
+  <key>StandardErrorPath</key>
+  <string>__LOG__</string>
+</dict>
+</plist>

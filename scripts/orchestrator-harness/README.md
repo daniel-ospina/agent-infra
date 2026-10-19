@@ -110,6 +110,115 @@ doc_status: draft
 
 ---
 
+## 0. Start here — `bin/harness`, the ONE entry point (both platforms)
+
+Everything below describes the components. This section describes **how they are started**, and it is
+short because there is exactly one answer: **the supervisor starts them, never a human and never a
+profile.**
+
+```bash
+harness install     # materialise + enable the units (systemd user units on Linux, launchd on macOS)
+harness start       # start every component THROUGH the supervisor; reconcile harness versions first
+harness status      # one line per component + the ACTIVE HARNESS SHA + versions running
+harness doctor      # fail loudly on the states that leave a box silently dead
+harness stop | restart
+```
+
+**Why it exists (measured).** On a cloud cell the harness bundle was `scripts/` and nothing that could
+start, supervise or report on it: 0 systemd units present, 0 enabled. The controller had been launched
+by hand as `bash -c 'set -a; . keys.env; set +a; bash <harness>/orch-loop.sh'` inside a tmux session —
+and an **older** harness was still running from a stale session 15 h later. Two versions, no
+supervisor, no restart, no health signal: every fix needed a human to redo the ritual, and nothing
+noticed when a component died. `install.sh` (macOS launchd) was never the gap; the gap was that nothing
+owned *what runs, from which bytes, and whether it is alive* on either platform.
+
+### The inventory — one declared list
+
+| component | kind | entry | why this kind |
+|---|---|---|---|
+| `orch` | daemon | `orch-loop.sh` | runs until it exits; the supervisor restarts it |
+| `heartbeat` | daemon | `scripts/heartbeat-loop.sh` | same |
+| `diskreaper` | loop | `scripts/disk-reaper.sh` | one pass per interval (default 1 h). **Dry-run by default** — arming reclamation is an operator decision (`HARNESS_DISKREAPER_ARGS=--apply`), and `eldato-disk-reaper.timer` may already own it |
+| `pr-doctor` | loop | `scripts/pr-doctor.py` | one pass per interval (default 15 min) |
+| `merge` | pool | `merge-one.sh` | **demand-driven**, not a daemon: it takes one job from `$HARNESS_STATE_DIR/queue/merge/` per turn |
+| `fix` | pool | `fix-one.sh` | same, `queue/fix/` |
+
+The queue is **empty by default**, so a pool idles: the controller (`orch`) remains the thing that
+decides what work exists. A pool gives merge/fix the two properties the starter exists for — a
+supervisor that restarts them and a status line that says whether they are alive — without inventing a
+second dispatcher.
+
+### Version discipline — exactly one harness sha may be active
+
+`start` reconciles **before** it launches: any process running from a different
+`<pin>/<sha12>/scripts/orchestrator-harness` under the active harness's own pin root is **stopped and
+named** (`version-discipline: stopping pid N from <path> (sha X; active is Y)`), never silently
+co-run. The scope is deliberately the pin root only: a box-wide `pgrep -f orch-loop.sh` also matches a
+peer lane's test fixture and a proof-run copy, and a kill driven by that read destroys somebody else's
+work.
+
+### `status` — the shape of the answer
+
+```
+orch         RUNNING(/tmp/cell-home/harness/64385b254f47/scripts/orchestrator-harness)
+pr-doctor    DEAD(last exit 2, "pr-doctor: objective.py failed to import")
+
+ACTIVE HARNESS SHA  64385b254f47
+HARNESS VERSIONS    1 running
+```
+
+`RUNNING(dir)` names the directory the component **actually runs from** (attributed from its pid's
+argv), not where the entry point happens to live. `DEAD` carries the supervisor's last exit code and
+the component's own last log line — the two data a reader needs and the two nobody was reading. A
+state the supervisor cannot answer is `UNKNOWN`, and `status` exits 2: an unreadable read is never a
+pass. Exit codes: `0` all running · `1` a component is not OK · `2` cannot determine.
+
+### `doctor` — the five silent-death states, and one warning
+
+| finding | why it is a FAIL |
+|---|---|
+| **two harness versions running** | the measured incident; both drain the same queue with different code |
+| **a component running from a different sha than the active one** | the same defect, one component at a time (a stale restart) |
+| **a required component missing** (its entry is gone) | the unit can only crash-loop; nothing says so |
+| **no supervisor** | units absent, or `systemctl --user` / launchd unreachable — nothing can start or restart anything |
+| **enabled but not running** | the state that looks installed and does nothing |
+
+and one **WARN**: a controller running from a pid that is not the supervisor's `MainPID` — the shape of
+the hand launch above. A warning rather than a failure, because a box being migrated has exactly one
+supervisor and is not broken; a check that reds on a state it cannot repair gets ignored.
+
+### Lanes are started by the supervisor — never by hand
+
+An ad-hoc launch cannot be restarted, cannot be reported, and is how two versions came to run at once.
+If you need to run a component once for diagnosis, run it **in the foreground** and do not leave it
+behind; `doctor` will name it if you do.
+
+### Units are generated, never hand-written per box
+
+`install` renders `templates/systemd/harness-unit.service.tmpl` (Linux) or
+`templates/launchd/harness-unit.plist.tmpl` (macOS) once per component. The unit's `ExecStart` /
+`ProgramArguments` is `bin/harness run <component>`, so the inventory is the only place a command is
+defined and a unit cannot drift from it. `install` is **idempotent**: byte-identical renders are
+skipped, and a second `install` prints `units already current … — no-op`. Same for `start` (a second
+`start` issues no supervisor start calls) and `stop`.
+
+⛔ **Migration note.** If another unit on the box already runs the same entry (a legacy
+`com.eldato.*` plist or a distro unit), `install` **warns and names the file**: retire it before
+starting the harness component, or two supervisors will run the same thing. The starter never edits or
+removes a unit it did not write.
+
+### Test
+
+```bash
+bash scripts/orchestrator-harness/bin/harness.test.sh
+```
+
+It is hermetic (temp HOME/state/unit dirs, a stateful `systemctl` stub, a `launchctl` stub) and every
+arm is shown non-vacuous by a named mutation in its comment. It is registered in
+`scripts/run-bash-shards.sh`, so both CI lanes run it.
+
+---
+
 ## 1. Why it exists
 
 The repo's normal path is one agent, one issue, one PR, human-paced. On a box that is left

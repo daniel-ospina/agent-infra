@@ -6,7 +6,7 @@ doc_status: live
 subjects.team: organisation-design-team
 created: 2026-09-20
 aboutSubjects: organisation-design-team
-aboutObjects: agent-infra, issue-1178, issue-1254, issue-1317, session-liveness, pid-identity, lane-liveness, successor-dispatch, pi-idle-repl-reaper-policy, fleet-inventory, orchestrator-bringup
+aboutObjects: agent-infra, issue-1178, issue-1254, issue-1317, session-liveness, pid-identity, lane-liveness, successor-dispatch, pi-idle-repl-reaper-policy, fleet-inventory, orchestrator-bringup, harness-starter
 ---
 
 # Fleet session liveness (#1178)
@@ -711,3 +711,48 @@ Regression contract: `bash scripts/fleet-inventory.test.sh` (its header carries 
 recipe that proves each arm goes red when its predicate is neutered — including the read paths, the
 `stop`/`start` verb paths, and the exit-code contract). It is registered in
 `scripts/run-bash-shards.sh`, so both CI lanes run it.
+
+---
+
+## 11. The INSTALLER half — `scripts/orchestrator-harness/bin/harness`
+
+§10 answers *"is each component alive"* over the mechanisms that already exist on a box. It is
+**read-only by design**: it `bootstrap`s, `kickstart`s and `bootout`s, and it deliberately writes
+nothing durable. That is the right contract for a health screen — and it is why it could not answer
+the question that came next.
+
+**Measured on a cloud cell:** the harness bundle was `scripts/` and nothing that could start,
+supervise or report on it. `0` systemd units present, `0` enabled. The controller was launched by
+hand inside a tmux session, and an **older** harness was still running from a stale session 15 h
+later. §10 could REPORT both states; nothing could prevent or repair them, because on Linux there was
+no mechanism to report on — not one unit.
+
+So the starter adds the two things a read-only inventory cannot have:
+
+1. **An installer.** `bin/harness install` renders ONE template per platform
+   (`templates/systemd/harness-unit.service.tmpl`, `templates/launchd/harness-unit.plist.tmpl`) once
+   per declared component, names the units `harness-<component>.service` /
+   `com.eldato.harness.<component>`, enables them and restarts them (`Restart=always` / `KeepAlive`).
+   Every `ExecStart` is `bin/harness run <component>`, so the unit does not encode a command and
+   cannot drift from the inventory.
+2. **Version discipline.** Exactly one harness sha may be active. `start` stops and NAMES any process
+   running from a different `<pin>/<sha12>/` under the active harness's own pin root before it
+   launches; `doctor` fails on two shas, on a component running from a non-active sha, on a missing
+   required component, on no supervisor, and on a service that is enabled but not running — and warns
+   when a controller is running from a pid no unit owns (the hand-launch shape above).
+
+**How the two layers relate — stated, not implied.** `fleet-inventory` remains the **breadth**
+authority on a box: the ~20 launchd jobs, the landers, the watchdog pair, the cell supervisor, each
+with a predicate derived from its own behaviour. `bin/harness` is the **depth** layer for the six
+components the harness itself owns, and the only layer that can INSTALL one on Linux. They may not
+disagree: when a component appears in both, the same truth must be read (the supervisor's record plus
+the component's own log). ⛔ **Known seam, named rather than hidden:** the two declarations are
+separate today, so a component added to one is invisible to the other. Reconciling them into one
+declaration is the next step; until then, `harness status` is the line that answers "is my harness
+running, from which sha", and `orchestrator-bringup.sh status` is the table that answers "what else
+should be alive on this box".
+
+Full operator contract (units, inventory kinds, `status` shape, idempotency, migration):
+`scripts/orchestrator-harness/README.md` §0. Regression contract:
+`bash scripts/orchestrator-harness/bin/harness.test.sh`, also registered in
+`scripts/run-bash-shards.sh`.

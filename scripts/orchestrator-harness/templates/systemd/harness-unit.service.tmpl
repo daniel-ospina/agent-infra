@@ -1,0 +1,37 @@
+# harness-unit.service.tmpl — ONE template, rendered per component by `bin/harness install`.
+#
+# ⛔ NOT HAND-WRITTEN PER BOX. Every placeholder below is filled from the harness's declared
+# component inventory (bin/harness, `components()`), so a new component is a row, not a file, and a
+# box can never carry a unit whose ExecStart names a path that exists on somebody else's machine.
+#
+# `bin/harness` (the harness entry point) is what starts the component, and `run <component>` is the
+# ONE place that knows what its command is. That is deliberate: the unit does not encode the command,
+# so the inventory cannot drift from what the supervisor actually launches (one authority per
+# question).
+[Unit]
+Description=agent-infra harness component: __COMPONENT__
+Documentation=file://__ROOT__/README.md
+# A component that crash-loops is a state `status`/`doctor` must be able to SEE, not one systemd
+# gives up on: StartLimitIntervalSec=0 disables the rate limiter so Restart=always always restarts,
+# and the restart loop is what makes "DEAD(last exit N)" readable instead of "inactive (start-limit)".
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# The env file is OPTIONAL (`-`): a box with no keys.env must fail in the component's own words,
+# not with systemd's "Failed to load environment files".
+EnvironmentFile=-__ENV_FILE__
+Environment=HARNESS_ROOT=__ROOT__
+Environment=HARNESS_STATE_DIR=__STATE__
+WorkingDirectory=__ROOT__
+ExecStart="__BIN__" run __COMPONENT__
+Restart=always
+RestartSec=5
+# One log file per component, because `harness status` prints that component's LAST LOG LINE and a
+# journal query is not a file read (it needs journald, a unit name and a time window — three facts a
+# status line should not have to assemble). append: requires systemd >= 240 (Ubuntu 22.04+).
+StandardOutput=append:__LOG__
+StandardError=append:__LOG__
+
+[Install]
+WantedBy=default.target
