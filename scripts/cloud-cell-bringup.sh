@@ -359,7 +359,7 @@ check_provider() {
 # `CELL READY` banner: a green readiness line over a box whose turns produce no answer is exactly
 # the false PASS this script exists to remove.
 check_provider_layer() {
-  local layer_out layer_detail layer_rc attempt
+  local layer_out layer_detail layer_rc attempt layer_tries=0 layer_timeouts=0 layer_rcs='' layer_evidence=''
   for attempt in 1 2; do
     layer_rc=0
     layer_out="$(timeout 120 pi -p --no-session --provider deepseek --model deepseek-flash \
@@ -371,16 +371,24 @@ check_provider_layer() {
       *'[pi-gate] REFUSED'*)
         die "provider probe NOT RUN: the pi spawn point refused the LAYER-LOADED probe (1-min load is at or above MAX_LOAD on this box). That is CAPACITY, not the provider and not an extension — quieten the box (or raise MAX_LOAD deliberately) and re-run. Last output: $(printf '%s\n' "$layer_out" | grep -v '^[[:space:]]*$' | tail -5)" ;;
     esac
+    # PER-ATTEMPT bookkeeping, not just the last one: a mix (one attempt banner-only, one killed at
+    # 120 s) must not be reported as "timed out on both attempts" — that would discard the banner
+    # evidence from the completed attempt and re-create the mis-attribution this PR removes.
+    layer_tries=$((layer_tries + 1))
+    [ "$layer_rc" -eq 124 ] && layer_timeouts=$((layer_timeouts + 1))
+    layer_rcs="$layer_rcs${layer_rcs:+,}$layer_rc"
+    layer_evidence="${layer_evidence}[attempt $attempt exit $layer_rc] $(printf '%s\n' "$layer_out" | grep -v '^[[:space:]]*$' | tail -3 | tr '\n' ' ') "
   done
   layer_detail="$(printf '%s\n' "$layer_out" | grep -v '^[[:space:]]*$' | tail -5)"
   # A killed probe is NOT the layer's fault. The provider already answered in isolation, so the key
-  # is good: exit 124 on both attempts means the CALL did not complete (network/load), and blaming an
-  # extension would send the operator to delete a healthy one — the same mis-attribution the
-  # provider-side classification above exists to prevent.
-  if [ "$layer_rc" -eq 124 ]; then
-    die "the LAYER-LOADED probe TIMED OUT after 120s on both attempts (exit 124) — that is the CALL not completing (outbound network or box load), NOT an extension: the provider answered with extensions disabled, so the key is good. Quieten the box, check the network, then re-run. Last output: $layer_detail"
+  # is good: EVERY attempt killed by `timeout` (124) means the CALL did not complete (network/load),
+  # and blaming an extension would send the operator to delete a healthy one — the same
+  # mis-attribution the provider-side classification above exists to prevent. Said only when it is
+  # true of every attempt.
+  if [ "$layer_timeouts" -eq "$layer_tries" ]; then
+    die "the LAYER-LOADED probe TIMED OUT after 120s on BOTH attempts (exits $layer_rcs) — that is the CALL not completing (outbound network or box load), NOT an extension: the provider answered with extensions disabled, so the key is good. Quieten the box, check the network, then re-run. Last output: $layer_detail"
   fi
-  die "the PROVIDER is healthy (it answered with extensions disabled) but the EXTENSION LAYER produced no answer in two attempts (last exit $layer_rc) — a lane turn on this box would produce no answer, which is #2100's shape. Find the extension that writes to stdout at registration or session start, or remove it from the cell. Loaded-layer output: $layer_detail"
+  die "the PROVIDER is healthy (it answered with extensions disabled) but the EXTENSION LAYER produced no answer in two attempts (exits $layer_rcs) — a lane turn on this box would produce no answer, which is #2100's shape. Find the extension that writes to stdout at registration or session start, or remove it from the cell. Per attempt: $layer_evidence"
 }
 
 # ── (3) gh auth, via a pushed token file ────────────────────────────────────────

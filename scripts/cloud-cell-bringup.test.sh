@@ -130,6 +130,19 @@ if [ "${PI_STUB_MODE:-normal}" = slowlayer ] && [ "$has_ne" -eq 0 ]; then
   # What `timeout` leaves behind when it kills the child: no output, exit 124.
   exit 124
 fi
+if [ "${PI_STUB_MODE:-normal}" = mixedlayer ] && [ "$has_ne" -eq 0 ]; then
+  # A MIX: attempt 1 completes with banner-only output, attempt 2 is killed at 120 s. The run must
+  # NOT claim "timed out on both attempts" (it would discard attempt 1's banner evidence) and must
+  # NOT accuse an extension of a completed call.
+  _c=0
+  [ -f "${PI_STUB_COUNT:-/dev/null}" ] && _c="$(cat "${PI_STUB_COUNT:-/dev/null}" 2>/dev/null || echo 0)"
+  _c=$((_c + 1)); [ -f "${PI_STUB_COUNT:-/dev/null}" ] && printf '%s\n' "$_c" > "${PI_STUB_COUNT:-/dev/null}"
+  if [ "$_c" -eq 1 ]; then
+    printf '[tortoise-capture] install probe recorded (harness=pi)\n'
+    exit 0
+  fi
+  exit 124
+fi
 if [ "${PI_STUB_MODE:-normal}" = noisy ] && [ "$has_ne" -eq 0 ]; then
   printf '[tortoise-capture] install probe recorded (harness=pi)\n'
   printf '[tortoise-capture] spool flush (session_start): filed 0, deferred 2, skipped 320 (320 waiting on backoff)\n'
@@ -402,6 +415,29 @@ esac
 case "$BR_OUT" in
   *"Find the extension"*) bad "a killed probe was blamed on an extension — the operator would delete a healthy one" ;;
   *) ok "the failure does not accuse an extension" ;;
+esac
+
+# ── 2c1d) a MIXED layer outcome must report both attempts, not claim a double timeout ──────────
+# The reviewer's case: attempt 1 completes (banner-only, exit 0), attempt 2 is killed (124). Saying
+# "timed out on both attempts" would be false about attempt 1 AND discard the banner it produced —
+# the mis-attribution this PR exists to remove, mirrored.
+say_case "a mixed layer outcome reports BOTH attempts, not a baseline-wide claim (#2100)"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+: > "$T/mixed-attempts.cnt"
+PI_STUB_COUNT="$T/mixed-attempts.cnt" PI_STUB_MODE=mixedlayer br ok normal --check
+[ "$BR_RC" -ne 0 ] && ok "the run FAILS on a mixed layer outcome (rc=$BR_RC)" \
+                   || bad "the run passed while the layer never answered"
+case "$BR_OUT" in
+  *"on BOTH attempts"*) bad "a mixed outcome was reported as a double timeout — the completed attempt's evidence was discarded: $BR_OUT" ;;
+  *) ok "the failure does not claim a double timeout" ;;
+esac
+case "$BR_OUT" in
+  *"exits 0,124"*) ok "the per-attempt exits are reported (0,124)" ;;
+  *) bad "the per-attempt exits are not reported — the evidence is lost: $BR_OUT" ;;
+esac
+case "$BR_OUT" in
+  *"[attempt 1 exit 0]"*) ok "the completed attempt's own output is kept in the failure" ;;
+  *) bad "the completed attempt's evidence is missing from the failure: $BR_OUT" ;;
 esac
 
 # ── 2c2) a BROKEN provider is still blamed on the provider, whatever the layer does ──────────────
