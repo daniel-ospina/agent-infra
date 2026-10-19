@@ -2101,8 +2101,13 @@ def test_a_PARSE_failure_does_not_claim_blindness_even_when_its_TEXT_says_transp
     # the composite cause text CONCATENATES both halves, the PRIMARY's marker then supplied the
     # claim: two reads that both reached GitHub published `gh=UNREADABLE(queue)` (and, with a
     # rate-limit word in the primary, `VERDICT=GH-RATE-LIMITED`). MEASURED on the parent commit.
-    # This cell was uncovered because the only raising fallback under test is a 403 whose own
-    # text carries "rate limit", so the marker always came from the fallback itself.
+    # ⛔ THE COVERAGE REASON, STATED ACCURATELY (#2138 r9, reviewers B + VGATE). Raising fallbacks
+    # are not rare here: the default `install()` seam raises `OSError("fixture: no second source")`
+    # and its text is MARKER-FREE, so those cells suppress the claim through the GATE, never
+    # through the classifier. Scoped to fallbacks used inside a `build()` cell, the 403 below is
+    # the only raising one whose OWN text carries a marker — so no cell had ever isolated the
+    # classifier's transport/body bit; the marker always came from whichever half already looked
+    # like a transport failure.
     for exc in (json.JSONDecodeError("Expecting value", "<html>", 0),
                 UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")):
         install(monkeypatch, pr_list=_Result(0, '{"message": "read timed out"}'), rest_prs=[])
