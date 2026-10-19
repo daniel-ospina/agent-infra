@@ -3451,6 +3451,34 @@ else
   ck "sweep-quota.test.sh: the #1762 suite is present" 1
 fi
 
+# ── O2) the controller is RECOVERED when launchd REMOVES it, not merely when it crashes ──────────
+# KeepAlive cannot restart a service that is no longer in the domain, and `launchctl unload -w` (or a
+# `bootout` whose `bootstrap` fails) leaves a persistent disabled flag — measured five times on
+# 2026-10-17: `Setting service … to disabled` → `removing service` → dead controller, no error
+# anywhere. The full contract — a running controller is left ALONE, a removed one is reloaded exactly
+# once, a declared stop (`$O/.watchdog-off`) is never reversed, install.sh renders an install-relative
+# plist and its --uninstall stops the watchdog BEFORE the loop — lives in its own hermetic suite,
+# driven against the shipped script with a stubbed `launchctl`. Run it here so `./selftest.sh` stays
+# the one command that pins the harness.
+if [ -f "$HERE/watchdog.test.sh" ]; then
+  if bash "$HERE/watchdog.test.sh" > "$TMP/watchdog.out" 2>&1; then
+    ck "watchdog.test.sh: a REMOVED controller is recovered; a healthy one is untouched" 0
+    # ⛔ A SKIP INSIDE THE CHILD IS NOT A PASS HERE. The suite's install.sh half is Darwin-only, so off
+    # macOS it reports `SKIPPED=<n>` and still exits 0 — scoring that as a bare pass would print ✅ for
+    # a group that did not run, which is the false PASS this file's platform gate (:3140) forbids. The
+    # child's skip count is carried up so the summary can never say "all passed" over it.
+    _wskip="$(sed -n 's/.*SKIPPED=\([0-9][0-9]*\).*/\1/p' "$TMP/watchdog.out" | tail -1)"
+    if [ "${_wskip:-0}" -gt 0 ] 2>/dev/null; then
+      skipd "watchdog.test.sh: ${_wskip} install.sh assertion(s) inside it — macOS-only (launchd); skipped on $PLATFORM"
+    fi
+  else
+    ck "watchdog.test.sh: a REMOVED controller is recovered; a healthy one is untouched" 1
+    grep -E '❌|Summary|PASS=' "$TMP/watchdog.out" | sed 's/^/      /' | tail -20
+  fi
+else
+  ck "watchdog.test.sh: the controller-removal suite is present" 1
+fi
+
 # ── 21) deployed-harness provenance and drift (#1745) ────────────────────────────
 # The cloud cells got a provenance layer in #1790; the LAPTOP stayed uncovered —
 # `cd ~/orchestrator && git rev-parse --show-toplevel` printed "fatal: not a git repository", so

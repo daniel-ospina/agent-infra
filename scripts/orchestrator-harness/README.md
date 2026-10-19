@@ -243,6 +243,7 @@ only on macOS — see §2.1), so a killed worker cannot take the controller down
 | `.refresh-unrecorded` | the pass's FALLBACK marker: written into `$O` whenever a `state/refresh-last` write fails (an unwritable `state/`), removed by the next successful write. Its PRESENCE means "a pass finished and its outcome is not on disk" — the record underneath is an EARLIER pass and is not this cycle's health — so `orch-loop.sh` reads it BEFORE the record and prints `BLOCKED`, quoting the marker's own `stage=`, `rc=` and `why=` (a marker with `rc=0` is a SUCCESS whose record failed) |
 | `state/queue-state` | what the last pool READ saw, with the epoch of the read — `EMPTY`, `READ(<n>)`, `PARTIAL(<tiers>)` or `UNREADABLE`. `orch-loop.sh` prints it in the cycle line as `queue=$(queue_state_token)`, so a refresh that could not read the pool (`queue=UNREADABLE`) is never mistaken for a fleet with nothing to do (`queue=EMPTY`); an absent file reads `UNKNOWN`, never `EMPTY` (agent-infra#1931) |
 | `.orch.lock` | atomic single-instance lock (noclobber create); stale locks are reclaimed |
+| `.watchdog-off` | **a DECLARED stop** (see §4/§6). While it exists, `com.eldato.orchestrator-watchdog` does nothing — the state a deliberate `launchctl unload -w` produces is the same state the watchdog recovers from, so the stop has to be declared. Survives a reboot; `rm -f` re-arms. It is a flag with no revalidation, so `install.sh` warns when one is present at install time |
 | `candidates.txt` | the dispatch backlog: issue numbers that passed collision pre-flight. Its ORDER is the dispatch priority, with one qualification (`PRODUCT_FLOOR`, agent-infra#2054): up to that many slots of each batch are filled from `candidates.product.txt` first — entries that are ALSO in this file, always — so a product issue can jump the queue but nothing can enter it. ⛔ AND THE FLOOR YIELDS TO AN EMERGENCY: a `P0-blocker` candidate inside the batch window, a `red-tree` rail refusal that is not parked, or an emergency class that could not be read, all stand the floor down for that cycle and are reported as `product-floor OVERRIDDEN emergency=<reason>` — see the `PRODUCT_FLOOR` row in §Tuning |
 | `candidates.product.txt` / `candidates.harness.txt` | the floor's split of `candidates.txt` (agent-infra#2054), re-derived from it at the end of every refresh pass (never accumulated, so a dispatched-then-pruned issue does not go on "proving" product work exists). Membership is the class: `product` = the item's repo is in `PRODUCT_REPOS` AND it does not carry the `harness` label. Absent ⇒ no split has run on this box |
 | `candidates.emergency.txt` | the `P0-blocker` subset of `candidates.product.txt`'s parent backlog, in **backlog order** — i.e. the P0 candidates this box could dispatch, by their own label, intersected with `candidates.txt`. It is what the floor consults before reordering, so an emergency can never be displaced by a share target. ⛔ **ABSENT ≠ EMPTY**: the writer CREATES the file (possibly empty) on a completed read, so an empty file beside an `OK p0=0` record means the split RAN and saw no P0 — while an ABSENT file means no pass could classify this cycle, and the floor reads that as UNKNOWN and stands down |
@@ -268,7 +269,7 @@ only on macOS — see §2.1), so a killed worker cannot take the controller down
 | `state/roles/.desired` | the cell is SUPPOSED to be running; written by `start`, removed by `stop`, so the doctor restarts a controller that `stop` did not silence |
 | `state/roles/loop.ident` | `pid|<identity>` for the doctor loop, where the identity is `proc:<starttime>` from `/proc/<pid>/stat` on Linux and `ps -o lstart=` where `/proc` does not exist — `status` verifies BOTH before reporting the loop RUNNING, so a recycled pid (after a tmux server restart, an OOM kill or a crash) cannot make a dead loop read as alive |
 | `state/roles/merge.attempts` | `PR head epoch reason` for every rail call the merge role made — the head-level cooldown that stops a REFUSED head being retried blind |
-| `logs/` | one log per worker: `lane-*.log`, `chain-*.log`, `merge-*.log`, `fix-*.log`, `orch-loop.log` |
+| `logs/` | one log per worker: `lane-*.log`, `chain-*.log`, `merge-*.log`, `fix-*.log`, `orch-loop.log`, plus `watchdog.log` (the recovery agent's ABSENT/recovered/RECOVERY FAILED lines, with pids) |
 | `wip/` | dirty-worktree captures taken before a shutdown (see §6) |
 
 ### Why the *reviewer* is a separate process from the *controller*
@@ -873,6 +874,36 @@ unreadable domain (or an unreadable account record) makes the run refuse instead
 only automated gate runs on Linux, and `--start`/`--uninstall` are the incident's own path). It is the
 same discipline as `ELDATO_ALLOW_TEST_HOME=1` and never applies to a normal run.
 
+**Stopping by hand with the watchdog armed — declare the stop FIRST.** `install.sh --uninstall` removes
+the watchdog too, so the §6 ritual needs no declaration. But a controller stopped *in place* (`pkill`)
+is exactly the state the watchdog recovers from, so an undeclared hand-stop would be undone within a
+minute — under a human who had just been told the machine was safe. Declare it, and the watchdog leaves
+it alone:
+
+```bash
+touch ~/orchestrator/.watchdog-off           # DECLARE the stop — §6
+```
+
+Re-arm with `rm -f ~/orchestrator/.watchdog-off` when the box should dispatch again. Nothing
+revalidates that file, so a stale one silently disarms recovery — `install.sh` warns when it finds one.
+
+**The watchdog (`com.eldato.orchestrator-watchdog`).** The controller does not only crash — it gets
+**removed**: a persistent-disable verb, or a `bootout` whose following `bootstrap` then fails, takes the
+service out of the domain with the plist still on disk, and `KeepAlive` cannot restart a service that is
+no longer there. Measured five times on 2026-10-17 with no error anywhere the fleet looks, so
+`install.sh` also installs a one-minute agent that puts it back. It acts only when the service is **not
+running** — absent from the domain, or in the domain with no pid — and it first defers to the
+controller's own lock (`$O/.orch.lock`), so a controller running under `nohup` (§4) is **also** left
+alone. While `$O/.watchdog-off` exists it does nothing. Arm it with the same verbs as the loop — never
+the `-w` forms, which are what write the persistent override this whole section exists to avoid
+(agent-infra#1975):
+
+```bash
+launchctl enable "gui/$(id -u)/com.eldato.orchestrator-watchdog"
+launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.eldato.orchestrator-watchdog.plist
+tail -5 ~/orchestrator/logs/watchdog.log        # ABSENT/recovered/RECOVERY FAILED, with pids
+```
+
 Run the offline self-test first — it needs no network, tmux server or git writes. **Every check
 exercises the shipped script** (it extracts the real classifier, `sess()`, the claim block and the
 reaper, or runs `install.sh` for real) rather than re-implementing the logic — a test that
@@ -888,7 +919,9 @@ by `./selftest.sh` rather than quoted here.
                        # placeholder parity, the daemon PATH (shim exclusion + execute-probe) and
                        # the failed-count fallback, README overclaim guards, credential scan,
                        # repo-aware scout provisioning and the permanent/transient refresh split
-                       # (refresh-scout.test.sh, #1736)
+                       # (refresh-scout.test.sh, #1736), and the watchdog contract — recovery of a
+                       # REMOVED controller, a healthy one left untouched, the declared stop, and
+                       # install/uninstall ordering (watchdog.test.sh)
 ```
 
 **The gate key only reaches the daemon if it is a FILE.** `install.sh` deliberately does not copy a
@@ -1229,6 +1262,12 @@ all. A path is not failed for being a path main does not carry; it is failed for
 
 The ritual, in order — the point is that **no uncommitted work is lost**:
 
+0. **Declare the stop first: `touch $O/.watchdog-off`.** Since the watchdog exists (§4), an undeclared
+   hand-stop is indistinguishable from the removal it recovers from — it would put the controller back
+   within a minute, under a human who had just been told the machine was safe. This step is for a
+   controller stopped **in place**: step 1's `--uninstall` removes the watchdog as well, so that path
+   needs no declaration. Remove the file to re-arm, and **re-arm as part of starting the box again**
+   (the "Starting it again" paragraph below, and §4).
 1. `bash scripts/orchestrator-harness/install.sh --uninstall` (from the checkout root, as §4): the
    installer resolves `launchd-cycle.sh` and `launchd.plist.template` from its OWN directory, so the
    CHECKOUT's copy is the guarded one — a copy that lacks `launchd-cycle.sh` refuses with "missing
@@ -1250,6 +1289,10 @@ The ritual, in order — the point is that **no uncommitted work is lost**:
 4. Capture every dirty worktree: `git -C <wt> diff HEAD > $O/wip/<name>.patch`, plus a
    copy of untracked files and a `.status` file recording `git status --porcelain`.
 5. Post a note on the coordination issue naming the open PRs, so a peer box keeps draining.
+
+**Starting it again:** `rm -f $O/.watchdog-off` **first**, or the watchdog you just installed is inert
+for the life of the box — recovery is silently off, which looks exactly like the defect §7.2f fixes.
+`install.sh` prints a warning when the sentinel is present at install time; nothing else revalidates it.
 
 Durable state survives a reboot regardless: the signing key, review records, the worktrees'
 `.git`, and every PR on GitHub.
@@ -2663,6 +2706,36 @@ capacity; 0 un-owned + no capacity; registry-says-owned-but-process-dead). It wa
 disabling the branch arm, inverting the conflict rank, and removing the PR-first block each turn it
 RED (the first version of the suite did NOT catch a disabled branch arm — the fixture's worktree path
 answered through the path rule — which is why §1b of that suite isolates the branch arm).
+### 7.2g The controller is REMOVED, not crashing — the watchdog (agent-infra#1860, #1975)
+
+`KeepAlive` covers a crash. It does not cover **removal**, and removal is what actually happened: a
+persistent-disable verb, and a `bootout` whose following `bootstrap` then fails, both take the service
+out of the domain, so there is nothing left for `KeepAlive` to restart. Measured five times on
+2026-10-17, each time as `Setting service … to disabled` → `removing service` → a dead controller with
+**no error anywhere the fleet looks**; the frozen heartbeat was the only trace.
+
+**Fix:** a second launchd agent (`watchdog.sh` + `watchdog.plist.template`, installed by `install.sh`
+and seeded at `$O/watchdog.sh`) reads the service with launchd's own status verb every 60 seconds and
+restores it when it is not running: `enable` then `bootstrap` when the service has left the domain, and
+`kickstart` (no `-k`) when it is present with no pid (`load`/`bootstrap` are no-ops on a job that is already
+loaded — measured — so the two states take different verbs, and each action verb is tried against both
+`gui/` and `user/` domains, because `launchctl list` is domain-agnostic but `kickstart` is not). It uses
+the installer's verb discipline, for the installer's reason (#1975): nothing it issues writes a
+persistent Disabled override. `logs/watchdog.log` records five removals and five recoveries on
+2026-10-17, e.g. `21:26:40Z ABSENT from launchctl — reloading` / `21:26:48Z recovered: pid=54673`.
+
+Four properties make it safe to run unattended, and each is pinned by `watchdog.test.sh`: it **leaves a
+present-and-running controller alone** (no load, no `enable`, not even a log line) so it can never
+interrupt a cycle and strand that cycle's lanes, lock and claim; it **defers to `$O/.orch.lock`**, so a
+controller started outside launchd (`nohup`, a hand-run pane — §4) is not mistaken for a dead one and
+stamped with `RECOVERY FAILED` every minute; it is **idempotent** (repeated runs and repeated recoveries
+do not stack); and it **honours a declared stop** (`$O/.watchdog-off`), because the state it recovers
+from is exactly the state §6's handoff produces.
+
+The shipped plist is rendered from a template with the install dir and `HOME` substituted — no
+`/Users/<someone>` in a shipped file, which is the defect that left the cloud cells running a plist
+naming a directory that does not exist on them. `install.sh --uninstall` stops the **watchdog first**,
+then the loop: the reverse order is a race the watchdog wins a minute later.
 
 ⛔ **A BROKEN ORIGINATION IS NOT A PRIORITY DECISION (agent-infra#2229).** The ruling above closes the
 issue path *because a PR queue exists*. It says nothing about a box whose refresh **cannot run at
@@ -2985,6 +3058,8 @@ algorithmic advantage. The claim worth evaluating is *utilisation*, not *efficie
 | `cloud-cell-record-dep.test.sh` | #1717: drives `cloud-cell-supervisor.sh check/start` and `merge-one.sh` against a stubbed toolchain — the recorder is a checked, provisioned dependency, and a record failure parks. Registered in `scripts/run-bash-shards.sh`, so both CI lanes run it |
 | `check-deployed-drift.sh` | answers whether the DEPLOYED `$O` matches the repo: the recorded commit against the live ref (`merge-base --is-ancestor`, never a commit count), the recorded payload hash against the deployed bytes, and every repo-shipped `*.sh` blob against its `$O` copy. Exit 0 match / 1 drift / **2 UNKNOWN — never a pass** (agent-infra#1745). Not part of the loop |
 | `report.sh` | read-only operator summary: merges in a window, per-kind agent wall-time and cap-hit rate from `state/walltime.tsv`, live `refs/claims/*`, queue health, and the last dispatch decisions. Safe to run while the loop is working. Not part of the loop |
+| `watchdog.sh` | **not reachable from `orch-loop.sh` — launchd runs it every 60 s** (`com.eldato.orchestrator-watchdog`, installed by `install.sh`, seeded at `$O/watchdog.sh`). Puts the controller's service BACK after a removal `KeepAlive` cannot survive, defers to a running controller (launchd's pid, or `$O/.orch.lock`) and to a declared stop (`$O/.watchdog-off`), and logs every recovery to `logs/watchdog.log`. Contract: `watchdog.test.sh` |
+| `watchdog.test.sh` | the contract for `watchdog.sh` + its install wiring, driven against a stubbed `launchctl`: a REMOVED service is recovered (with the verb that can restart it), a present-and-running one is left untouched, a controller running **outside** launchd (a live `$O/.orch.lock`) is left alone, the recovery reaches the domain that holds the job, a declared stop is honoured, and `install.sh --uninstall` stops the watchdog BEFORE the loop. Hermetic, a CI shard |
 
 **Manual utility:** `adopt-fix.sh` — run `fix-one.sh` against a specific PR by hand;
 `nonblocking-dispatch.sh` — launch a headless worker in the background and return immediately (§2).
@@ -3105,6 +3180,11 @@ session-started controller with `pkill -f "[b]ash $O/orch-loop.sh"` (§6) rather
 > Do not record "on this box the loop runs under nohup" as a fact — it is a state, and it changes: on
 > 2026-10-17 this box was launchd-owned for part of the day and session-owned for another part. Read
 > the two commands above at the moment you care.
+
+⚠️ **Ask for the label, not for `grep orchestrator`.** The watchdog (§7.2g) makes a second label
+containing `orchestrator` exist, so `launchctl list | grep orchestrator` now answers about BOTH jobs —
+it prints the watchdog's row for a box whose controller is not running at all. The same substring bug
+had `report.sh` printing `UP` for a stopped controller (pinned in `watchdog.test.sh`).
 
 Everything else is still tortoise-shaped and must be changed on another target: the branch
 suffix (`tm`), `feat/<N>-tm` naming, `lane.sh`'s `uv sync --extra embeddings --extra parity`, the

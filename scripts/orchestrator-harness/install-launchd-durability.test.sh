@@ -125,6 +125,47 @@ start_ok() { # $1 = ignored; the pid is DERIVED from the launch count, because l
 }
 case "${1:-}" in
   print)
+    # ⛔ A SECOND AGENT EXISTS NOW (the watchdog, com.eldato.orchestrator-watchdog), and `install.sh
+    # --uninstall` removes it BEFORE the loop. This stub models ONE installed job: a fixture that only
+    # ever loaded the loop must answer "no such SERVICE" for any OTHER label — the truthful state of a
+    # box installed before the watchdog existed. Without this the stub reported the LOOP's plist path
+    # for the watchdog's label, and `lc_guard_mutate` correctly refused to act on a job it could not
+    # show was ours — a refusal the test then read as install.sh's failure (measured: 4 red checks).
+    # ...except the WATCHDOG label, which the installer's banner and its --uninstall read-back ask about.
+    # FAKE_WATCHDOG_LOADED models "it is in the domain" so the banner's exit-status branch can be
+    # DRIVEN — an unexercised branch is how a ✓ over a failing safety net survived review. Unset (the
+    # default) answers launchd's service-level not-found, the truthful state of a box installed before
+    # this agent existed.
+    # FAKE_USER_DOMAIN: the job was loaded from an SSH session, so it lives in `user/` — a `gui/` read
+    # says "not found" while `user/` holds it. This is the measurement the watchdog's header records, and
+    # it is why `--uninstall` must prove BOTH domains before deleting a plist.
+    if [ -n "${FAKE_USER_DOMAIN:-}" ] && [ "${2##*/}" = "${FAKE_LABEL:-com.eldato.orchestrator-loop}" ]; then
+      case "$2" in
+        gui/*)  printf 'Could not find service "%s" in domain for port\n' "${2##*/}" >&2; exit 113 ;;
+        user/*) printf 'gui/0/%s = {\n\tactive count = 1\n\tpath = %s\n\tstate = running\n\n\tminimum runtime = 10\n\tpid = 4242\n}\n' \
+                  "${2##*/}" "${FAKE_PLIST:-$FAKE_O/x.plist}"; exit 0 ;;
+      esac
+    fi
+    if [ "${2##*/}" = "${FAKE_WATCHDOG_LABEL:-com.eldato.orchestrator-watchdog}" ]; then
+      if [ -n "${FAKE_WATCHDOG_LOADED:-}" ]; then
+        if [ -n "${FAKE_WATCHDOG_NOEXIT:-}" ]; then
+          # A launchd that reports NO exit status at all: the datum is absent, so the banner must not
+          # claim health — "not measured" is not "healthy" (the empty-is-falsy trap this suite exists for).
+          printf 'gui/0/%s = {\n\tactive count = 1\n\tpath = %s\n\tstate = running\n\n\tminimum runtime = 60\n}\n' \
+            "${2##*/}" "${HOME:-/tmp}/Library/LaunchAgents/${2##*/}.plist"
+          exit 0
+        fi
+        printf 'gui/0/%s = {\n\tactive count = 1\n\tpath = %s\n\tstate = running\n\n\tminimum runtime = 60\n\tlast exit code = %s\n}\n' \
+          "${2##*/}" "${HOME:-/tmp}/Library/LaunchAgents/${2##*/}.plist" "${FAKE_LAST_EXIT:-0}"
+        exit 0
+      fi
+      printf 'Could not find service "%s" in domain for port\n' "${2##*/}" >&2
+      exit 113
+    fi
+    if [ "${2##*/}" != "${FAKE_LABEL:-com.eldato.orchestrator-loop}" ]; then
+      printf 'Could not find service "%s" in domain for port\n' "${2##*/}" >&2
+      exit 113
+    fi
     # ⛔ A READ THAT FAILS IS NOT "NO SUCH SERVICE". FAKE_PRINT_FAIL models the EIO family: launchd
     # cannot tell us anything, so "loaded" and "not loaded" are both unproven and the caller must
     # refuse. FAKE_PRINT_FAIL_UNLOADED models the same read breaking AFTER a successful removal — the
@@ -531,9 +572,14 @@ else bad "the job was never enabled"; fi
 echo "-- D. lc_ensure leaves a healthy controller alone"
 # ⛔ `kickstart` is NOT read-only — it starts (or with `-k`, restarts) the job. Excluding it would make
 # every "ZERO mutating launchctl calls" assertion below pass while a future `launchctl kickstart`
-# restarted the live controller (review finding). Only `print` and `print-disabled` are reads (`verbs()`
-# counts `kickstart` as a call for the same reason).
-mutating_calls() { grep -vE '^(print|print-disabled)( |$)' "$FAKE_LOG" 2>/dev/null || true; }
+# restarted the live controller (review finding). `print`, `print-disabled` and `list` are READS
+# (`verbs()` counts `kickstart` as a call for the same reason).
+# ⛔ `list` BELONGS ON THE READ LIST even though no shipped line uses it today: `launchctl list <label>` is
+# a READ, and a future status probe that asks a question must not redden "plain install MUTATED launchd"
+# (which is how it fired, 2 red checks in §F, when the installer used it). ⛔ AND THE STUB NEEDS NO `list`
+# ARM: that read was replaced by `launchctl print <domain>/<label>` (the shape pinned above), so an arm
+# answering it would be dead code whose rationale claimed a caller that does not exist (review finding).
+mutating_calls() { grep -vE '^(print|print-disabled|list)( |$)' "$FAKE_LOG" 2>/dev/null || true; }
 
 fresh "$(( $(date +%s) - 5 ))"
 ( . "$LIB"; lc_start "$LABEL" "$T/o/x.plist" >/dev/null 2>&1 )
@@ -811,7 +857,16 @@ fi
 # The installer is driven from a STAGE copy so it cannot reach this checkout's neighbours, and so
 # the only scripts its `bash -n` sweep sees are the ones under test.
 STAGE="$T/stage"; mkdir -p "$STAGE"
+# ⛔ THE STAGE MUST CARRY EVERY FILE install.sh SHIPS. It renders TWO agents (the loop and the
+# watchdog), and it refuses to install when either asset is missing — so a stage holding only the
+# loop's files made the installer die on the first check, which reddened 27 checks downstream of it.
+# (`2>/dev/null` is deliberately NOT relied on here: a silent copy failure is exactly how this stage
+# would go stale again. The files are asserted present below.)
 cp "$INSTALL" "$LIB" "$HARNESS/launchd.plist.template" "$STAGE/" 2>/dev/null
+cp "$HARNESS/watchdog.sh" "$HARNESS/watchdog.plist.template" "$STAGE/" 2>/dev/null
+for _needed in install.sh launchd-cycle.sh launchd.plist.template watchdog.sh watchdog.plist.template; do
+  [ -f "$STAGE/$_needed" ] || { bad "the install stage is missing $_needed — install.sh ships two agents and refuses without both"; }
+done
 SHOME="$T/home"; mkdir -p "$SHOME/Library/LaunchAgents" "$SHOME/.local/share/pi-node/current/bin" \
   "$SHOME/.pi/agent/scripts"
 # install.sh probes the real binaries: gh (network), tmux, pi, uv.
@@ -843,6 +898,25 @@ else bad "plain install MUTATED launchd: $(mutating)"; fi
 if [ -n "${STUBBED_PLUTIL:-}" ]; then
   ok "plutil was STUBBED on this platform — the XML-lint half of this section is not exercised here, the launchd half is"
 fi
+# ⛔ "LOADED" IS NOT "WORKING" (review finding). A watchdog label in the domain with a non-zero last exit
+# is a safety net that fails every 60 s — the exact state a missing or stale `$O/watchdog.sh` produces,
+# because the installer only WARNS when it replaces a differing `$O/watchdog.sh` (the copy is unconditional, so a drift-list entry for it could never fire). The ✓ must be withheld, because a ✓ on the thing that
+# catches the failure is the defect class this suite exists for.
+: > "$FAKE_STATE/loaded"
+out="$(FAKE_WATCHDOG_LOADED=1 FAKE_LAST_EXIT=7 ORUN 2>&1)"; rc=$?
+case "$out" in *"last run exited 7"*) _wa_warned=1 ;; *) _wa_warned="" ;; esac
+[ "$rc" -eq 0 ] && [ -n "$_wa_warned" ] \
+  && ok "a loaded watchdog whose last run FAILED is reported as failing, not as ✓ (install exits 0 and says so)" \
+  || bad "install printed a healthy watchdog over a failing one (rc=$rc): $(grep -i 'watchdog' <<<"$out" | head -2 | tr '\n' ' ')"
+rm -f "$FAKE_STATE/loaded"
+# ⛔ AND "NO DATUM" MUST NOT READ AS HEALTHY. A launchd that reports no exit status leaves `_wa_exit`
+# empty; printing ✓ there would be the same claim with the evidence removed, so the banner must say the
+# question is UNPROVEN. Driven, because that branch is otherwise dead code in every fixture above.
+out="$(FAKE_WATCHDOG_LOADED=1 FAKE_WATCHDOG_NOEXIT=1 ORUN 2>&1)"; rc=$?
+case "$out" in *unproven*) _wa_unproven=1 ;; *) _wa_unproven="" ;; esac
+[ "$rc" -eq 0 ] && [ -n "$_wa_unproven" ] \
+  && ok "a loaded watchdog with NO readable exit status is called UNPROVEN, not ✓ (no datum is not health)" \
+  || bad "install claimed a healthy watchdog from an absent datum (rc=$rc): $(grep -i 'watchdog' <<<"$out" | head -2 | tr '\n' ' ')"
 
 # --start with a healthy box: the job comes up and the start is PROVEN.
 fresh "$(( $(date +%s) - 5 ))"
@@ -895,7 +969,12 @@ assert_contains "$out" "left untouched" "…and says so"
   assert_eq "$rc" "0" "--start after a plain install exits 0"
   assert_contains "$(calls)" "bootout" "…and RELOADS the stale job (the file was unchanged, the job was not)"
   assert_contains "$out" "this run RELOADED it and PROVED it" "the banner says it RELOADED rather than started"
-  assert_not_contains "$out" "printf " "no raw shell escaped into the banner text"
+  # ⛔ SCOPE THE ASSERTION TO THE BANNER, not to every line install.sh printed: main's dead-key fix
+  # hint (`warn "  → fix: printf '%s' \"$AI_REVIEW_GATE_KEY\" > …"`) is a legitimate BANNER-UNRELATED
+  # warning that contains the word `printf`, so a needle over the whole stdout now fails on main's own
+  # new text rather than on a raw-shell leak. The property is about the `cat <<EOF` block.
+  _banner() { printf '%s\n' "$1" | sed -n '/✅ Installed /,$p'; }
+  assert_not_contains "$(_banner "$out")" "printf " "no raw shell escaped into the banner text"
 
   # ⛔ AND AN ABSENT RECORD IS NOT "STALE". `$O/state/launchd-loaded.sha256` does not exist on any box
   # that has not run `--start` under this version, so the FIRST plain run of a healthy, byte-identical
@@ -998,6 +1077,33 @@ fi
 # `--uninstall` issue no bootout at all, the read-back see an empty read, and the installer print ✅ and
 # DELETE the plist over a live KeepAlive controller — while the ownership guard was skipped for the same
 # reason, so even `enable` (which has no path form) no longer required proof the job was ours.
+echo "-- F2. a loop loaded in user/ is NOT reported removed (the gui/-only read-back would lie)"
+fresh
+: > "$FAKE_STATE/loaded"
+out="$(FAKE_USER_DOMAIN=1 ORUN --uninstall 2>&1)"; rc=$?
+[ "$rc" -ne 0 ] \
+  && ok "--uninstall exits NON-ZERO when the loop is loaded in user/ (a gui/-only read says 'absent')" \
+  || bad "--uninstall exited 0 over a job launchd holds in user/: $(tail -3 <<<"$out" | tr '\n' ' ')"
+[ -f "$PLIST" ] \
+  && ok "the plist is KEPT when the removal cannot be proven in every domain" \
+  || bad "the plist was deleted over a job that is still loaded in user/"
+case "$out" in
+  *"✅ Removed"*) bad "--uninstall printed ✅ over a job still loaded in user/ — the false PASS this check exists for" ;;
+  *) ok "--uninstall does NOT print ✅ when the label survives in another domain" ;;
+esac
+rm -f "$FAKE_STATE/loaded"
+
+echo "-- F3. the seeded \$O/watchdog.sh is stage-then-renamed, and leaves no staging file behind"
+fresh
+out="$(ORUN 2>&1)"; rc=$?
+_seed_leftovers="$(find "$T/o" -maxdepth 1 -name '.seed-watchdog.sh.*' 2>/dev/null | tr '\n' ' ')"
+[ "$rc" -eq 0 ] && [ -z "$_seed_leftovers" ] \
+  && ok "a plain install leaves no .seed-watchdog.sh.* staging file in \$O (an exec can never see a partial script)" \
+  || bad "staging leftovers after install: ${_seed_leftovers:-none} (rc=$rc)"
+[ -x "$T/o/watchdog.sh" ] \
+  && ok "the rename lands an EXECUTABLE \$O/watchdog.sh (chmod runs on the staging file, before the mv)" \
+  || bad "\$O/watchdog.sh is missing or not executable after the rename"
+
 echo "-- J. an unreadable domain refuses, and is never read as 'not loaded'"
 fresh "$(( $(date +%s) - 5 ))"
 export FAKE_PLIST="$T/o/x.plist"
