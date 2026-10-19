@@ -25,7 +25,7 @@ outcome.
 
 | check | passes only when | absent variant | stale variant |
 |---|---|---|---|
-| `controller_cycling` | a controller process exists **and** its log advanced within the window | `CONTROLLER_ABSENT`, `LAUNCHD_PID_UNRESOLVED` | `LOG_SILENT`, `LOG_MISSING`, `LOG_NO_CYCLE`; `LOG_UNREADABLE`, `PROCESS_TABLE_UNREADABLE` (inconclusive) |
+| `controller_cycling` | a controller process exists **and** its log advanced within the window **and** the tail was read **and** a parseable cycle header sits inside the window (a moving log with no header in it is `LOG_NO_CYCLE`, not a pass) | `CONTROLLER_ABSENT`, `LAUNCHD_PID_UNRESOLVED` | `LOG_SILENT`, `LOG_MISSING`, `LOG_NO_CYCLE`; `LOG_UNREADABLE`, `PROCESS_TABLE_UNREADABLE` (inconclusive) |
 | `queue_readable` | the last refresh produced a READABLE verdict (**from the newer of the header token and `state/queue-state`'s own verdict**) | `QUEUE_UNREADABLE`, `QUEUE_NEVER_READ`, `QUEUE_PARTIAL` | `NO_REFRESH` |
 | `work_dispatched` | a `[dispatch] … -> <issue>` line is inside the window **and the batch's lane actually started** | `NOT_DISPATCHED`, `NO_DISPATCH`, `NO_DISPATCH_GATED`, `NO_LANE_STARTED` | `NO_CYCLE_IN_WINDOW`, `DISPATCH_UNCONFIRMED` |
 | `pr_created` | ≥1 PR opened in the PR window (**the created population includes PRs opened and then CLOSED unmerged** — a superseded PR was still opened; the closed page is read for both counts, so one call carries both) | `NO_PR_CREATED` | `IDLE_NO_WORK`, `ACTIVITY_UNKNOWN`, `GH_COUNT_UNREAD` (inconclusive: the surface answered but carried no count, so "opened nothing" was never measured; `ACTIVITY_UNKNOWN` means how much work was in hand could not be read — an unreadable pool, a non-current record, or no cycle header in the window) |
