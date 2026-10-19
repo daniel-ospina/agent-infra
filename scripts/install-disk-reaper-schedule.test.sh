@@ -53,6 +53,11 @@ assert_nofile()   { if [ -f "$1" ]; then bad "$2 (present: $1)"; else ok "$2"; f
 
 T="$(mktemp -d "${TMPDIR:-/tmp}/disk-reaper-schedule-test.XXXXXX")"
 T="$(cd "$T" && pwd -P)"
+# ⛔ EXPORTED: the shims are separate processes and key their own state off $T. Unexported, every
+# `${T}/...` inside a shim expanded to `/...` — so a shim's state file landed at the filesystem root
+# (silently unwritable) and a test that depended on it read a default instead. Survivable while the
+# only consumers were relative paths; not survivable once a shim has to remember a disable override.
+export T
 trap 'rm -rf "$T"' EXIT
 
 # ── fixtures ───────────────────────────────────────────────────────────────────────────────────
@@ -118,7 +123,13 @@ printf '%s\n' "\$*" >>"${T}/launchctl.log"
 case "\${1:-}" in
   bootstrap) mkdir -p "\$STATE"; exit 0 ;;
   bootout)   [ -n "\${LAUNCHCTL_BOOTOUT_IGNORE:-}" ] && exit 0; rm -rf "\$STATE"; exit 0 ;;
-  enable)    exit 0 ;;
+  enable)    rm -f "\${T}/disabled.state"; exit 0 ;;
+  print-disabled*)
+             [ -n "\${LAUNCHCTL_NO_PRINT_DISABLED:-}" ] && exit 1
+             printf '"com.eldato.disk-reaper" => %s\n' "\$(cat "\${T}/disabled.state" 2>/dev/null || echo enabled)"
+             printf '"com.example.other" => enabled\n'
+             exit 0 ;;
+  disable*)  echo disabled >"\${T}/disabled.state"; exit 0 ;;
   print)     [ -d "\$STATE" ] || exit 1
              printf '\tstate = %s\n\truns = 2\n\tlast exit code = %s\n' "\${LAUNCHCTL_STATE:-not running}" "\${FAKE_LAST_EXIT:-0}"
              exit 0 ;;
@@ -612,6 +623,27 @@ assert_contains "$OUT" "active=active" "T10 and active= reports the pass as runn
 assert_absent "$OUT" "command not found" "T10 and --status emits no shell error into its own output"
 
 inst_lin --install >/dev/null 2>&1
+# ── T10b: launchd's DISABLE OVERRIDE is not "enabled" (#2048 review, P3) ────────────────────────
+# `launchctl print` SUCCEEDS for a disabled-but-loaded job, so deriving enabled= from it certified a
+# box that will never fire — and the remedy --status printed (--install) was a no-op for an unchanged,
+# loaded job, so the override was never cleared either.
+inst_mac --install >/dev/null 2>&1
+"$T/bin/launchctl" disable gui/999/com.eldato.disk-reaper >/dev/null 2>&1
+OUT="$(inst_mac --status 2>&1)"; RC=$?
+assert_contains "$OUT" "enabled=disabled" "T10b a DISABLED-but-loaded job reads enabled=disabled (print alone says loaded)"
+assert_eq "$RC" "1" "T10b …and is NOT certified as scheduled"
+assert_contains "$OUT" "DISABLED in gui/999" "T10b …and the failure names the override, not just a state"
+# A re-install must actually clear the override — including on the unchanged/no-op path.
+inst_mac --install >/dev/null 2>&1
+OUT="$(inst_mac --status 2>&1)"; RC=$?
+assert_contains "$OUT" "enabled=enabled" "T10b --install clears the override even when nothing else changed"
+assert_eq "$RC" "0" "T10b …so the box is scheduled again"
+# An unreadable database is left to `print` rather than guessed at.
+"$T/bin/launchctl" disable gui/999/com.eldato.disk-reaper >/dev/null 2>&1
+OUT="$(LAUNCHCTL_NO_PRINT_DISABLED=1 inst_mac --status 2>&1)"
+assert_absent "$OUT" "enabled=disabled" "T10b an unreadable override database is not guessed at (print still answers loaded)"
+"$T/bin/launchctl" enable gui/999/com.eldato.disk-reaper >/dev/null 2>&1
+
 echo "── T11. both systemd targets, including the two arms no test could reach ──"
 # (a) the SYSTEM unit with `SUDO=""` — the "already root / container" arm. The system unit dir is a
 # seam now, so this branch is executable without real sudo writing to /etc/systemd/system.
@@ -702,6 +734,25 @@ assert_eq "$(sed -n 's/^armed=//p' "$LIN_STAMP")" "dry-run" "T12b an explicit re
 [ "$(sed -n 's/^armed_at=//p' "$LIN_STAMP")" != "$ARMED_AT_1" ] \
     && ok "T12b …and re-dates it (a reversal is a decision, not a drift)" \
     || bad "T12b an explicit reversal should re-date the arming"
+
+# ── T12c: an EXPLICIT flag that RESTATES the stance is an adoption, not a new decision ─────────────
+# A cell's bring-up runs `--install --apply` on every check. If "explicit flag" alone meant "new
+# decision", armed_at would become "the last --check" — and a box whose recorded stance an owner had
+# reversed to dry-run would be silently re-armed by the next check (the destructive direction).
+inst_lin --install --apply >/dev/null 2>&1
+AT_1="$(sed -n 's/^armed_at=//p' "$LIN_STAMP")"
+sleep 1.1
+OUT="$(inst_lin --install --apply 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T12c a repeated --apply (the cell bring-up shape) exits 0"
+assert_eq "$(sed -n 's/^armed_at=//p' "$LIN_STAMP")" "$AT_1" \
+    "T12c …and does NOT re-date the arming (the date belongs to the stance, not to the restating flag)"
+# An owner's reversal, then the next `--check`: the stance follows the flag, but the override is LOUD.
+inst_lin --install --dry-run >/dev/null 2>&1
+OUT="$(inst_lin --install --apply 2>&1)"
+assert_contains "$OUT" "RE-ARMING" \
+    "T12c a bring-up that re-arms over a recorded dry-run SAYS SO (silence is how the owner never learns)"
+assert_contains "$OUT" "the recorded stance was dry-run" "T12c …and names what it overrode"
+assert_contains "$(cat "$SVC")" "disk-reaper.sh --apply" "T12c the explicit flag still wins on the stance"
 
 echo
 echo "──────────────────────────────────────────────────────────────────────"

@@ -341,13 +341,26 @@ write_stamp() { # write_stamp <job>
     # a later install merely adopts it (the `armed-date` discipline install-launchd.sh uses for
     # worktree-hygiene). `armed_by=` names who/where, because the same box can be armed by a cell's
     # bring-up or by an owner's shell.
-    local armed_at armed_by
-    if [ "${MODE_EXPLICIT:-0}" = 1 ]; then
-        # An EXPLICIT flag is the decision — a new arming (or a new reversal) re-dates it.
+    local armed_at armed_by previous_stance now_stance
+    now_stance="${MODE_FLAG#--}"
+    previous_stance="$(stamp_field armed)"
+    # ⛔ THE DATE BELONGS TO THE STANCE, NOT TO THE FLAG THAT RESTATED IT (#2048 review, P2). A cell's
+    # bring-up calls `--install --apply` on EVERY check, so "an explicit flag is a new decision" re-dated
+    # the arming at each check and turned `armed_at=` into "the last --check" — contradicting what the
+    # field exists to answer. Worse, it silently re-armed a box whose recorded stance an owner had
+    # reversed to `--dry-run`: the destructive direction of the P1 this file already fixed.
+    # The rule: the flag still WINS on the stance (an explicit flag is authoritative, and `--dry-run`
+    # remains the reversal), but the DATE moves only when the STANCE changes.
+    if [ "${MODE_EXPLICIT:-0}" = 1 ] && [ "$now_stance" != "$previous_stance" ]; then
         armed_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
         armed_by="${SUDO_USER:-$(id -un)}@$(hostname 2>/dev/null || printf 'unknown')"
+        if [ -n "$previous_stance" ] && [ "$now_stance" = "apply" ] && [ "$previous_stance" = "dry-run" ]; then
+            # Say it out loud: a caller that passes --apply unconditionally (the cell bring-up) has just
+            # overridden a recorded reversal, and silence is how the owner never learns.
+            warn "RE-ARMING: the recorded stance was dry-run (since ${previous_stance}), and this invocation passes --apply — the job will now DELETE. Pass --dry-run to keep it report-only."
+        fi
     else
-        # A no-flag install ADOPTS the existing arming: its date and author must not move.
+        # An ADOPTION (no flag, or a flag restating the recorded stance) must not move the date.
         armed_at="$(stamp_field armed_at)"
         armed_by="$(stamp_field armed_by)"
         [ -n "$armed_at" ] || armed_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -499,13 +512,25 @@ retarget_from_record() {
     return 0
 }
 
-# dirs_to_consider <live-dir> — every directory that may hold this job: the one the install RECORDED
-# first, then the one this invocation derived. Both are checked, so a probe flip can neither hide an
-# installed unit nor make a removal look complete while the original is still on disk.
+# dirs_to_consider <live-dir> — EVERY directory this installer can install into, deduplicated:
+#   * the directory the STAMP records (where the last install actually went),
+#   * the one this invocation derived,
+#   * and every other target this tool can reach (the system dir, the user dir, and any override).
+# ⛔ RECORDED + LIVE IS NOT ENOUGH (#2048 review, P2). A re-install whose probe moved OVERWRITES the
+# stamp with the new target, so the earlier target's unit becomes invisible to a caller that only
+# unions those two: install with root into the system dir, re-install as a sudo-less user, then
+# `--uninstall` → files removed from the user dir, "uninstalled", exit 0, and an ENABLED system timer
+# still deleting hourly with its stamp (the only record of both the arming and the location) deleted.
+# The read-back has to cover every place a unit could be, or "uninstalled" is a guess.
 dirs_to_consider() {
-    local live="${1:-}" rec; rec="$(recorded_dir)"
-    [ -n "$rec" ] && printf '%s\n' "$rec"
-    [ -n "$live" ] && [ "$live" != "$rec" ] && printf '%s\n' "$live"
+    local live="${1:-}" rec seen=" " d
+    rec="$(recorded_dir)"
+    for d in "$rec" "$live" "${SYSTEMD_UNIT_DIR:-}" "$SYSTEMD_SYSTEM_DIR" "$HOME/.config/systemd/user"; do
+        [ -n "$d" ] || continue
+        case "$seen" in *" $d "*) continue ;; esac
+        seen="$seen$d "
+        printf '%s\n' "$d"
+    done
     return 0
 }
 
@@ -743,6 +768,12 @@ ld_install() {
     if [ "$reason" != none ]; then
         ld_reload || return 1
         ld_loaded || { err "$LABEL is not loaded after bootstrap — the reaper will not run unattended"; return 1; }
+    else
+        # ⛔ AN UNCHANGED, LOADED JOB IS EXACTLY WHERE A DISABLE OVERRIDE HIDES (#2048 review, P3):
+        # `launchctl disable` leaves the plist and the load in place, so nothing above fires, the
+        # reload (the only caller of `$LC enable`) is skipped, and `--status` keeps reporting a box
+        # that will never fire. A re-install must repair it, so `enable` runs on the no-op path too.
+        $LC enable "$LD_DOMAIN/$LABEL" >/dev/null 2>&1 || true
     fi
 
     say "installed: platform=darwin scheduler=launchd job=$LABEL dir=$LD_DIR changed=$changed pass_changed=$(no_yes "$pass_changed") reload_reason=$reason"
@@ -761,9 +792,14 @@ ld_install() {
 }
 
 ld_status() {
-    local dest print_out last_exit state
+    local dest print_out last_exit state rec live_dir
     choose_launchd_target || { err "no launchctl available (${LC:-launchctl})"; return 1; }
+    # The RECORDED dir wins, and the live one is the fallback: reading only the live environment
+    # answered `installed=no` for an installed, loaded, armed box whenever the seam moved (#2048 review).
+    live_dir="$LD_DIR"; rec="$(recorded_dir)"
+    [ -n "$rec" ] && LD_DIR="$rec"
     dest="$LD_DIR/$LABEL.plist"
+    [ -f "$dest" ] || { [ -n "$rec" ] && [ -f "$live_dir/$LABEL.plist" ] && dest="$live_dir/$LABEL.plist"; }
     say "platform=darwin"
     say "scheduler=launchd"
     say "job=$LABEL"
@@ -776,7 +812,30 @@ ld_status() {
     fi
     say "installed=yes"
     print_out="$($LC print "$LD_DOMAIN/$LABEL" 2>/dev/null)"
-    if [ -n "$print_out" ]; then say "enabled=enabled"; else say "enabled=disabled"; fi
+    # ⛔ `launchctl print` SUCCEEDS FOR A DISABLED-BUT-LOADED JOB, so it cannot answer "is this enabled".
+    # launchd keeps that in its per-user override database (`launchctl print-disabled <domain>`), where a
+    # disabled label reads `"<label>" => disabled`. Without this read, `--status` certified a box whose
+    # label an operator had disabled: installed=yes, enabled=enabled, exit 0 — and the remedy it printed
+    # (`--install`) is a no-op for an unchanged, loaded job, so the override was never cleared
+    # (#2048 review, P3). Only a POSITIVE match on THIS label is folded in; an unreadable database (an
+    # older launchctl, a sandboxed domain) is reported and never guessed at.
+    # ⛔ NO NEW KEY: the vocabulary is IDENTICAL on both platforms (a suite pins the key set), and
+    # `enabled=` is exactly the question — a launchd label overridden to `disabled` is not enabled,
+    # whatever `print` says. An unreadable database (an older launchctl, a sandboxed domain) leaves the
+    # answer to `print` rather than guessing; the disabled state is also named in the failure below.
+    DISABLED_OVERRIDE=""
+    if disabled_out="$($LC print-disabled "$LD_DOMAIN" 2>/dev/null)"; then
+        printf '%s\n' "$disabled_out" \
+            | grep -q "\"$LABEL\"[[:space:]]*=>[[:space:]]*disabled" && DISABLED_OVERRIDE="disabled"
+    fi
+    # ONE `enabled=` line, decided after BOTH reads: a loaded-but-overridden job is not enabled, and a
+    # duplicated key would make the answer depend on which line the reader took (the defect #2048 fixed
+    # for `systemctl is-enabled` printing `disabled` twice).
+    if [ -n "$print_out" ] && [ "$DISABLED_OVERRIDE" != "disabled" ]; then
+        say "enabled=enabled"
+    else
+        say "enabled=disabled"
+    fi
     # `active=` is the MOMENTARY state (is a pass running right now). It is not the scheduling answer:
     # a StartInterval job is idle between runs, which is healthy — so it is reported and not folded into
     # the exit code. Liveness here is LOADED (below), which is what `bootout` clears.
@@ -798,23 +857,38 @@ ld_status() {
         err "$LABEL is installed at $dest but NOT loaded in $LD_DOMAIN — it will not fire unattended. Re-run --install (a bootout leaves exactly this state)"
         return 1
     fi
+    if [ "$DISABLED_OVERRIDE" = "disabled" ]; then
+        err "$LABEL is loaded but DISABLED in $LD_DOMAIN (launchctl disable) — it will not fire. Re-run --install, which clears the override"
+        return 1
+    fi
     return 0
 }
 
 ld_uninstall() {
-    local dest
+    local dest live_dir rec plist_dirs=() d
     if [ "${PREVIEW:-0}" = "1" ]; then
         say "preview: would bootout ${LAUNCHD_DOMAIN:-gui/$(id -u)}/$LABEL and remove the plist (nothing was changed)"
         return 0
     fi
     choose_launchd_target || { err "no launchctl available (${LC:-launchctl})"; return 1; }
+    # ⛔ THE RECORDED DIRECTORY, exactly as the systemd verbs do (#2048 review, P2). The plist dir is
+    # env-overridable (`DISK_REAPER_AGENTS_DIR`, the documented seam), so an uninstall that only reads
+    # the live environment removed from the DEFAULT dir, printed "uninstalled", exited 0 — and left the
+    # armed plist where the install put it, for launchd to re-load at the next login.
+    live_dir="$LD_DIR"; rec="$(recorded_dir)"
+    [ -n "$rec" ] && LD_DIR="$rec"
     dest="$LD_DIR/$LABEL.plist"
+    plist_dirs=("$LD_DIR")
+    [ -n "$live_dir" ] && [ "$live_dir" != "$LD_DIR" ] && plist_dirs+=("$live_dir")
     $LC bootout "$LD_DOMAIN/$LABEL" >/dev/null 2>&1 || true
-    rm -f "$dest"
+    for d in "${plist_dirs[@]}"; do rm -f "$d/$LABEL.plist"; done
     # READ IT BACK: a bootout that did not take, or a plist that survived the `rm`, leaves a job that
     # launchd re-loads at the next login. "uninstalled" is the claim, so the removal is what is read
-    # back (#2048 review).
-    if [ -f "$dest" ] || ld_loaded; then
+    # back (#2048 review). BOTH directories are read, so a survivor in the other one cannot hide.
+    for d in "${plist_dirs[@]}"; do
+        [ -f "$d/$LABEL.plist" ] && { err "uninstall INCOMPLETE: $LABEL is still installed at $d/$LABEL.plist — nothing is claimed beyond what was read back"; return 1; }
+    done
+    if ld_loaded; then
         err "uninstall INCOMPLETE: $LABEL is still $( [ -f "$dest" ] && printf 'installed at %s' "$dest" || printf 'loaded in %s' "$LD_DOMAIN" ) — nothing is claimed beyond what was read back"
         return 1
     fi
@@ -823,7 +897,7 @@ ld_uninstall() {
     # adopted nothing and quietly re-installed REPORT-ONLY on a box the owner had armed (#2048 review,
     # P2). `sd_uninstall` was moved for exactly this; the launchd path was left behind.
     rm -f "$STAMP"
-    say "uninstalled $LABEL from $LD_DIR"
+    say "uninstalled $LABEL from ${plist_dirs[*]}"
     return 0
 }
 

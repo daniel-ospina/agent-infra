@@ -770,6 +770,26 @@ else
 fi
 
 echo ""
+echo "── 12b. verify_targets: the PROGRAM must be EXECUTABLE, not merely present ──"
+# ⛔ THE DISTINCTION THE WHOLE HOST-STATE CLASSIFICATION RESTS ON (#2048 review, P3). `-e` accepted a
+# checkout whose `.venv/bin/python` exists at mode 644 — so the installer wrote a job launchd bootstraps,
+# loads, and cannot start, while the suite (which classifies by `-x`) called the same host "usable".
+# Nothing pinned the difference, so the arm could be reverted with every gate green.
+HOME_NE="$T/home-ne"; mkfakehome "$HOME_NE"
+mkdir -p "$HOME_NE/Documents/GitHub/tortoise/.git" "$HOME_NE/Documents/GitHub/tortoise/.venv/bin"
+: >"$HOME_NE/Documents/GitHub/tortoise/.venv/bin/python"
+chmod 644 "$HOME_NE/Documents/GitHub/tortoise/.venv/bin/python"   # present, NOT executable
+set +e
+OUT="$(HOME="$HOME_NE" PATH="$T/bin:$PATH" FAKE_LAUNCHCTL_LOG="$LOG" TEMPLATES_DIR="$TEMPLATES" \
+    AGENTS_DIR="$HOME_NE/Library/LaunchAgents" SWARM_ROOT="$HOME_NE/swarm" ELDATO_ALLOW_TEST_HOME=1 \
+    PYTHON_BIN="$HOME_NE/swarm/.venv/bin/python" bash "$INSTALLER" 2>&1)"
+RC=$?
+set -e
+[ "$RC" -ne 0 ] && ok "a non-executable checkout interpreter makes the install FAIL (not merely 'present')" \
+    || bad "a mode-644 .venv/bin/python was accepted — launchd would load a job it cannot exec"
+assert_contains "$OUT" "not executable" "…and names executability, not existence, as the reason"
+assert_contains "$OUT" "com.tortoise.branch-reaper" "…against the job that renders it"
+
 echo "── 13. the retired per-class reapers are replaced by ONE consolidated job (#2048) ──"
 # #2048 retires com.tortoise.worktree-reaper (its `worktree` class) and com.eldato.pi-cache-reap (its
 # `uv` class) in favour of com.eldato.disk-reaper, which scripts/install-disk-reaper-schedule.sh
