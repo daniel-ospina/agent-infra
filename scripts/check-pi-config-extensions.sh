@@ -154,12 +154,17 @@ fi
 # suppress the manifest report.)
 if [ "$parse_ok" -eq 1 ]; then
   # 4a — every real extension (except *.test.ts) must have a manifest row.
+  # `verified` is what THIS RUN compared; the closing verdict reports it (#2121: a count of the
+  # directory's contents is state that existed before this run, so it is not evidence that this
+  # run observed anything).
+  verified=0
   for e in "$DST"/*; do
     [ -e "$e" ] || continue
     base="$(basename "$e")"
     case "$base" in
       *.test.ts) continue ;;   # test files are not shipped; never in manifest
     esac
+    verified=$((verified + 1))
     if ! grep -Fqx "$base" <<<"$manifest_rows"; then
       echo "❌ extension $base exists in extensions/ but has no manifest.json files.extensions.entries row (bin/agent-infra.js consumers won't get it)"
       FAILURES=$((FAILURES + 1))
@@ -205,5 +210,5 @@ if [ "$FAILURES" -gt 0 ]; then
   exit 1
 fi
 
-echo "✅ pi-config/extensions = symlink farm into extensions/ (single source of truth, $(( $(ls -1 "$SRC" | wc -l | tr -d ' ') )) entries)"
+echo "✅ pi-config/extensions = symlink farm into extensions/ (single source of truth, $verified extension(s) compared to the manifest by THIS run)"
 echo "✅ manifest.json files.extensions.entries ↔ extensions/ tree parity holds (check 4)"

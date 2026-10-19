@@ -1,0 +1,12 @@
+# scripts/false-pass-baseline.tsv — grandfathered false-PASS findings (agent-infra#2121)
+#
+# WHY A BASELINE AND NOT A FIX: each group below is a KNOWN instance that belongs to its own
+# open issue (named per line). The check still reports it, and a NEW instance of the same rule
+# in the same file raises that (file, rule) count and FAILS — this file cannot swallow a
+# regression. Keyed by (path, rule, COUNT), never by line number: an unrelated edit above a
+# finding must not red a peer lane's CI.
+#
+# FORMAT: <path>	<rule>	<count>	<tracking issue + why this is still open>
+# Rewrite with: bash scripts/check-false-pass-shapes.sh --update-baseline
+# The 4th column is REQUIRED: an entry with no justification is reported as a finding.
+scripts/install-launchd.sh	empty-as-pass	2	#1743 — verify_targets() returns a success-default flag over a loop fed by plist_program_args, so a host without python3 (the PlistBuddy fallback emits nothing) verifies NOTHING and still passes; retire_pass() has the same shape over retired_labels(). Both belong to #1743's own fix (make "could not parse" distinguishable from "no arguments"), not to a silent edit here.
