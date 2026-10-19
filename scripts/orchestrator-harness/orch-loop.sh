@@ -1839,9 +1839,14 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
     case "$V" in
       GREEN)
         gh pr ready "$PR" --repo "$OR" >/dev/null 2>&1 || true
-        # A green head has converged: a stale-evidence marker from an earlier state is no longer
-        # true, and report.sh counts these as "stalled on stale evidence" (agent-infra#2132).
-        rm -f "$O/state/needsreview-$PR-"* 2>/dev/null || true
+        # ⛔ ONLY WHERE GREEN MEANS THE EVIDENCE EXISTS (review round 2, P2 — agent-infra#2132). On a
+        # RAIL repo `ai-review-gate` is not in `$REQ`, so V=GREEN means "the required checks pass",
+        # NOT "a reviewer recorded something" — the exact premise agent-infra#1825 exists to refute.
+        # Sweeping there deleted the marker `merge-one.sh`'s rail fall-through had just written, so
+        # the stale-evidence count was structurally 0 on agent-infra itself (the repo this harness
+        # ships to). The MERGED|CLOSED sweep and `review_state_clear` still give the "can return to
+        # zero" property on a rail repo, so nothing leaks.
+        [ "$MERGE_AUTHORITY" = "gate" ] && rm -f "$O/state/needsreview-$PR-"* 2>/dev/null || true
         if [ "$MERGE_AUTHORITY" = "rail" ]; then
           # RAIL MODE (agent-infra#1764). The repo does NOT require the review gate, so the merge
           # authority is its own rail (scripts/admin-merge.sh), which computes head-bound evidence
@@ -1939,7 +1944,15 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
             echo "#$PR NEEDS-FIX (reviewer findings at head=${HEAD_N:-?}) — a fixer is the remedy" >>"$LOG"
           else
             echo "#$PR NEEDS-REVIEW (no findings and no head-bound clean evidence at head=${HEAD_N:-?}) — the remedy is another review, NOT a fixer" >>"$LOG"
-            [ -n "${HEAD_N:-}" ] && touch "$O/state/needsreview-$PR-$HEAD_N" 2>/dev/null
+            # ⛔ PRUNE BEFORE WRITING (review round 2, P2). This is the only writer that used to leave
+            # the PR's previous heads in place, and it fires on EVERY red cycle — including cycles where
+            # a worker is already in flight, i.e. exactly under saturation. Two markers for one open PR
+            # made report.sh count one stall twice and falsified the "one marker per PR" invariant both
+            # docs now state. report.sh dedupes per PR as well, so a peer box's markers cannot do this.
+            if [ -n "${HEAD_N:-}" ]; then
+              rm -f "$O/state/needsreview-$PR-"* 2>/dev/null || true
+              touch "$O/state/needsreview-$PR-$HEAD_N" 2>/dev/null
+            fi
           fi
           # The claim file is written by merge-one.sh itself, so it also covers the chain-<N>
           # path (which invokes merge-one.sh directly and whose session name is invisible here).

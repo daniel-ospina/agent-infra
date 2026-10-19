@@ -20,6 +20,10 @@ ORCH="${ORCH:-$HERE/orch-loop.sh}"
 # marker unconditionally was undetectable. Both now resolve against the same tree; when ORCH is not
 # overridden this is the shipped merge-one.sh beside this test, as before.
 MERGE="${MERGE:-$(dirname "$ORCH")/merge-one.sh}"
+# ⛔ …AND SO DOES THE REPORTER (review round 2, P3). The driven `report.sh` assertions were pinned to
+# the SHIPPED copy while the producer followed ORCH, so in drift mode a deployed report.sh still
+# printing a raw file count was undetectable — the same defect one script over.
+REPORT="${REPORT:-$(dirname "$ORCH")/report.sh}"
 PASS=0; FAIL=0
 
 # --- extract the rule functions from the live controller ---
@@ -1900,15 +1904,19 @@ if [ "${_rs_sz:-0}" -gt 0 ] && [ "${_rgs_sz:-0}" -gt 0 ] \
   # report.sh run with a stub `gh`: two markers exist, only ONE belongs to an open PR, so the line must
   # read 1 — a raw file count would read 2 and could never return to the 0 indicator (b) asks for.
   RPT="$TMP/rpt"; mkdir -p "$RPT/state" "$RPT/repo" "$TMP/ghstub"
-  : > "$RPT/state/needsreview-6001-aaa"; : > "$RPT/state/needsreview-6999-bbb"
+  # ⛔ TWO markers for the SAME open PR and one for a PR that is not open (review round 2, P2): a
+  # file count would print 3, an open-PR-only count prints 2, and the correct per-PR count prints 1.
+  # The controller used to be able to leave two markers for one PR; report.sh must not report that as
+  # two stalls even if a peer box does it.
+  : > "$RPT/state/needsreview-6001-aaa"; : > "$RPT/state/needsreview-6001-bbb"; : > "$RPT/state/needsreview-6999-ccc"
   cat > "$TMP/ghstub/gh" <<'GHOPEN'
 #!/bin/bash
 case "$*" in *"--state open"*) printf '6001\n6002\n' ;; esac
 exit 0
 GHOPEN
   chmod +x "$TMP/ghstub/gh"
-  _rpt_line="$( O="$RPT" REPO="$RPT/repo" PATH="$TMP/ghstub:$PATH" bash "$HERE/report.sh" 2 2>/dev/null | grep 'stale evidence' )"
-  eqv "report.sh counts only OPEN PRs as stalled on stale evidence" "  stale evidence (needs re-review): 1" "$_rpt_line"
+  _rpt_line="$( O="$RPT" REPO="$RPT/repo" PATH="$TMP/ghstub:$PATH" bash "$REPORT" 2 2>/dev/null | grep 'stale evidence' )"
+  eqv "report.sh counts STALLED PRs — open, and one per PR (not per marker file)" "  stale evidence (needs re-review): 1" "$_rpt_line"
   # (9b) …and an UNREADABLE open-PR list must not print a confident 0. A stub that FAILS the list
   # read stands in for a rate-limited or offline box.
   cat > "$TMP/ghstub/gh" <<'GHFAIL'
@@ -1916,14 +1924,23 @@ GHOPEN
 exit 1
 GHFAIL
   chmod +x "$TMP/ghstub/gh"
-  _rpt_fail="$( O="$RPT" REPO="$RPT/repo" PATH="$TMP/ghstub:$PATH" bash "$HERE/report.sh" 2 2>/dev/null | grep 'stale evidence' )"
+  _rpt_fail="$( O="$RPT" REPO="$RPT/repo" PATH="$TMP/ghstub:$PATH" bash "$REPORT" 2 2>/dev/null | grep 'stale evidence' )"
   case "$_rpt_fail" in
     *"could not read"*) echo "  ✅ an unreadable open-PR list prints <could not read> with the raw marker count, never a confident 0"; PASS=$((PASS+1)) ;;
     *) echo "  ❌ an unreadable open-PR list printed [$_rpt_fail] — a blind read must not read as a clean queue"; FAIL=$((FAIL+1)) ;;
   esac
+  # (9c) …and NO repo/gh at all is its OWN state, not 0 (review round 2, P1). The first form derived
+  # the state from a flag only set inside the "repo AND gh present" arm, so a box without a checkout
+  # printed `open PRs: 0` and `stale evidence: 0` — a blind read presented as a clean queue.
+  _rpt_norepo="$( O="$RPT" REPO="$RPT/does-not-exist" bash "$REPORT" 2 2>/dev/null | grep -E 'open PRs|stale evidence' )"
+  case "$_rpt_norepo" in
+    *"open PRs: 0"*|*"stale evidence (needs re-review): 0"*) echo "  ❌ with no repo checkout report.sh printed a confident 0: [$_rpt_norepo]"; FAIL=$((FAIL+1)) ;;
+    *"needs a repo checkout and gh"*) echo "  ✅ with no repo checkout both lines name the missing dependency instead of printing 0"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ an unreadable environment produced [$_rpt_norepo] — expected the named missing dependency"; FAIL=$((FAIL+1)) ;;
+  esac
   wpin "orch-loop.sh classifies the red gate before dispatching" "$ORCH" '_rgs="$(review_gate_state "$PR" "${HEAD_N:-}")"'
   wpin "…and authorises a fixer ONLY on NEEDS-FIX" "$ORCH" '[ "$_rgs" = "NEEDS-FIX" ]'
-  wpin "report.sh surfaces the stale-evidence queue (indicator b)" "$HERE/report.sh" 'stale evidence (needs re-review)'
+  wpin "report.sh surfaces the stale-evidence queue (indicator b)" "$REPORT" 'stale evidence (needs re-review)'
 else
   echo "  ❌ the verdict/state functions did not extract to syntactically valid shell from merge-one.sh / orch-loop.sh"; FAIL=$((FAIL+1))
 fi
