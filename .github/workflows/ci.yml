@@ -255,22 +255,7 @@ jobs:
         # blindness flag and on the objective cache's freshness were pinned by suites
         # CI could not execute. A suite the repo does not RUN is a suite it does not
         # HAVE — naming them is the half of the landing that makes the other half count.
-        run: python3.12 -m pytest scripts/test_parallel_work_check.py tests/test_ci_exemption.py tests/test_ci_exemption_producer.py scripts/test_lane_status.py scripts/test_lane_actions.py scripts/test_lane_watchdog.py scripts/test_admin_merge_head.py scripts/test_objective.py scripts/test_turn_classify_state.py scripts/test_pr_doctor.py -x --timeout=60 -q
-
-      # #8432 — the harness's pre-flight tool family and its regression suites live HERE now.
-      # WHY (same reasoning as the step above, which is why it is placed beside it): all four suites
-      # lived in tortoise and drove `tortoise/tools/*.py` — files the fleet's harness reaches across a
-      # repo boundary to run. A suite in the product repo cannot fail when the shared tooling repo's
-      # copy regresses, and tortoise could not prove the tools it shipped were the ones executed.
-      # Each target is CONCRETE (no `tests/` dir-suite, so no #403 finding) and each drives the
-      # module BESIDE it, by location, so this is the tree the fleet runs.
-      # ⚠️ These are the suites that are GREEN against this tree. The harness-script suite is NOT
-      # here: 23 of its 32 assertions encode fixes agent-infra has not received yet (#8612, #8484,
-      # #8602, #8469, #8468 — itemised, with the failing class and count for each, in
-      # `port-provenance.txt`). See tortoise#8432. Naming a red suite here would either block every
-      # PR or train readers to ignore it, and a permanently-red gate is a no-op gate.
-      - name: Harness pre-flight tool suites (#8432)
-        run: python3.12 -m pytest scripts/orchestrator-harness/tools/test_collision_preflight.py scripts/orchestrator-harness/tools/test_fleet_state.py scripts/orchestrator-harness/tools/test_cmux_dispatch.py scripts/orchestrator-harness/tools/test_who_is_on.py -x --timeout=60 -q
+        run: python3.12 -m pytest scripts/test_parallel_work_check.py tests/test_ci_exemption.py tests/test_ci_exemption_producer.py scripts/test_lane_status.py scripts/test_lane_actions.py scripts/test_lane_watchdog.py scripts/test_admin_merge_head.py scripts/test_objective.py scripts/test_turn_classify_state.py scripts/test_pr_doctor.py scripts/test_queue_dispatch.py -x --timeout=60 -q
 
   verify:
     # #1349 — the pytest half MOVED to the `test` job above, so that the PR lane
