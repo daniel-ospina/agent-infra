@@ -2070,6 +2070,10 @@ def main() -> int:
                 # pass_budgets(), so it must not also be charged to this pass's `spent`.
                 st[key] = {"action": action, "worker": "prd-%s" % key, "kind": "refused",
                            "head": p["headRefOid"], "at": ts(), "at_epoch": now()}
+                # COUNTED for the same reason as the two liveness skips above: a pass whose only
+                # outcome was refusals must not summarize itself as "nothing to do". The row makes
+                # the refusal durable (`--status`), and this makes the PASS LINE agree with it.
+                stalled["refused-recorded"] = stalled.get("refused-recorded", 0) + 1
                 log("#%s (%s): REFUSED and RECORDED -- this will not clear by waiting, so the row "
                     "holds a %d-min cooldown; fix the cause: %s"
                     % (key, action, COOLDOWN_S // 60, detail[:160]))

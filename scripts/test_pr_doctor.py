@@ -312,7 +312,8 @@ def test_main_writes_a_state_row_for_a_persistent_refusal(monkeypatch):
     monkeypatch.setattr(pr, "open_prs", lambda: [_pr(1)])
     monkeypatch.setattr(pr, "classify", lambda p: ("fix-ci", "python-ci-gate", []))
     monkeypatch.setattr(pr, "brief", lambda p, a, why=None, cr=None: "b")
-    monkeypatch.setattr(pr, "log", lambda m: None)
+    logs = []
+    monkeypatch.setattr(pr, "log", logs.append)
     monkeypatch.setattr(pr, "worker_status", lambda name: "lost")
     monkeypatch.setattr(pr, "dispatch",
                         lambda p, a, t, d: (False, "worktree dirty -- refusing", True))
@@ -321,6 +322,12 @@ def test_main_writes_a_state_row_for_a_persistent_refusal(monkeypatch):
     monkeypatch.setenv("MAX_FIX", "16")
     monkeypatch.setenv("MAX_REVIEW", "12")
     assert pr.main() == 0
+    # ⛔ AND THE PASS LINE NAMES IT. A pass whose only outcome was a recorded refusal printed
+    # `dispatched 0 of 1 queued — nothing to do`, which contradicts the row it just wrote and reads
+    # as a quiet queue. The refusal is a stall, so it is counted and named.
+    joined = "\n".join(logs)
+    assert "refused-recorded=1" in joined, joined
+    assert "nothing to do" not in joined, joined
     assert saved.get("1", {}).get("head") == "a" * 40, "a persistent refusal must record a row"
     assert saved["1"]["kind"] == "refused", \
         "a refusal row must be stamped `refused`, or void_refused_rows will delete it on the next pass"
