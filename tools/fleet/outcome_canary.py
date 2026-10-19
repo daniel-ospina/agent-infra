@@ -712,6 +712,17 @@ def newest(events):
     return best
 
 
+# Programs whose ARGUMENTS are a search pattern, not a process. A row starting with one of these
+# cannot testify that the named program is running — it testifies that someone looked for it.
+# ⛔ "unscoped `pkill`" is a FORBIDDEN form in this file (the suite scans for the token), so the
+# search-tool family is spelled without it: `pgrep` covers the same diagnostic, and a row that runs
+# an unscoped killer is not something this predicate needs to name.
+_INSPECTORS = frozenset(("pgrep", "pidof", "ps", "grep", "egrep", "fgrep", "rg", "ag",
+                         "ack", "awk", "sed", "find", "xargs", "watch", "tail", "head", "cat",
+                         "less", "more", "vim", "nvim", "nano", "emacs", "code", "open", "echo",
+                         "printf", "man", "which", "type", "command", "lsof", "lesspipe"))
+
+
 def _names_our_program(rows, paths=(), names=()):
     """The rejected rows whose COMMAND LINE names the program we are looking for.
 
@@ -728,7 +739,16 @@ def _names_our_program(rows, paths=(), names=()):
         toks = str(r.get("cmd") or "").split()
         hit = any(t in want for t in toks)
         if not hit and names:
-            hit = any(os.path.basename(t) in names for t in toks)
+            # ⛔ A ROW WHOSE PROGRAM IS A SEARCH TOOL DOES NOT NAME THE DAEMON. `pgrep -fl cmux-tui`
+            # and `grep cmux-tui` carry the name as an ARGUMENT — and `pgrep -fl cmux-tui` is this
+            # tool's OWN documented next command for this check. Matching any token made the
+            # near-miss abstention fire on the diagnostic itself: a genuinely dead daemon read
+            # `INCONCLUSIVE/DAEMON_CENSUS_NEAR_MISS` for as long as anyone ran the recommended
+            # command, so the one arm that catches "cmux-tui was OOM-killed while the unit still read
+            # active" was unreachable for the population that reads this check. A row that merely
+            # NAMES the program (through `nice`, `bash -c`, an interpreter) still counts.
+            if toks and os.path.basename(toks[0]) not in _INSPECTORS:
+                hit = any(os.path.basename(t) in names for t in toks)
         if hit:
             out.append(r)
     return out
@@ -3229,6 +3249,46 @@ def _plist_path(label):
 # ════════════════════════════════════════════════════════════════════════════════════════════════
 
 
+def _normalize_box(name):
+    """The ONE spelling of a box name: this box is always `local`, a remote box is its stripped name.
+
+    ⛔ `_is_local_box` fixed the PROBES and the repo, and left `cfg.box` unnormalised — and `cfg.box`
+    is the NOTIFICATION IDENTITY (`State.data["boxes"][box]`, keyed per box). So `--box local`,
+    `--box "local "` and `--box localhost` were three identities for one machine: the same failure
+    was notified three times, three `box=` labels were printed, and the worst case is silent —
+    fail under `local `, recover under `local` (which clears only `boxes["local"]`), fail again under
+    `local `, and the key is still there, so the alert is suppressed forever.
+    """
+    if name is None or not str(name).strip():
+        return "local"
+    return "local" if _is_local_box(name) else str(name).strip()
+
+
+def _post_respawn_provenance(cfg, injected_path, now=None):
+    """The provenance of a report whose verdicts were RE-READ LIVE after a respawn.
+
+    ⛔ THE PROVENANCE MUST FOLLOW THE VERDICTS. `header`, `obs_iso` and the injected flag were built
+    from the payload before the action and never recomputed, so a `--facts` run whose respawn took
+    printed "FACTS INJECTED (…; not a live observation)" over LIVE verdicts and emitted
+    `facts_injected: true` beside a live `observed_at` — the two fields a consumer uses to judge
+    currency, contradicting `facts_source` in the same payload.
+    """
+    when = now if now is not None else time.time()
+    obs_iso = time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(when))
+    return {
+        "injected": False,          # these verdicts came from a live read, whatever fed the first
+        "observed_at": obs_iso,
+        "header": ("outcome canary — %s box=%s repo=%s  %s\n"
+                   "window=%.0fs  pr-window=%.0fs  mem-floor=%.0fMiB  disk-floor=%.0fGiB  "
+                   "pool-threshold=%d"
+                   % ("LIVE (re-collected after the respawn)", cfg.box,
+                      cfg.repo or "(unknown — pass --repo)", obs_iso, cfg.window_s,
+                      cfg.pr_window_s, cfg.mem_floor_mb, cfg.disk_floor_gb, cfg.pool_threshold)),
+        "facts": (("injected for the first read (%s); RE-COLLECTED LIVE after the respawn"
+                   % injected_path) if injected_path else "live collection"),
+    }
+
+
 def _is_local_box(name):
     """Is this box name THIS machine? `local`, `localhost` and `.` are, whitespace and all.
 
@@ -3253,7 +3313,7 @@ class Machine(object):
     MAX_TIMEOUT = 900
 
     def __init__(self, box=None, timeout=120):
-        self.box = box or "local"
+        self.box = _normalize_box(box)
         self.remote = not _is_local_box(self.box)
         self.timeout = timeout
         self.log_path = None
@@ -4247,7 +4307,7 @@ def cfg_from_args(a):
     kw = {
         "o_dir": o_dir,
         "log_path": os.path.join(o_dir, "logs", "orch-loop.log"),
-        "box": a.box or "local",
+        "box": _normalize_box(a.box),
         # Declared, so the field is disclosed and a caller can see what it suppressed.
         "state_path": a.state_path or default_state_path(),
         "controller_ws": a.controller_ws,
@@ -4336,6 +4396,14 @@ def main(argv=None):
     now = time.time()
 
     if a.static:
+        # ⛔ A KNOB THAT CANNOT ACT MUST REFUSE. `--skip` names a live PROBE, and the static path
+        # never consults it — so `--static --skip github` exited 0 with `not_evaluated: []` and no
+        # line saying the flag did nothing: a silent no-op on a run the operator believed had
+        # suppressed a probe. (Same class as the unknown-name check directly above it.)
+        if skip:
+            print("outcome-canary: --skip %s applies to the LIVE collection only; in --static use "
+                  "--only to narrow which checks are asserted" % ",".join(skip), file=sys.stderr)
+            return 3
         paths = fixture_paths(a.fixture, a.fixtures_dir if a.fixtures_dir is not None
                               else (None if a.fixture else default_fixtures_dir()))
         if not paths:
@@ -4468,6 +4536,14 @@ def main(argv=None):
                 reported["facts"] = ("injected for the first read (%s); RE-COLLECTED LIVE after the "
                                      "respawn" % a.facts)
             facts2 = collect_live(cfg, machine=machine, now=time.time(), skip=skip)
+            # ⛔ THE PROVENANCE MUST FOLLOW THE VERDICTS. These describe the payload that produced
+            # them, and the verdicts just came from a LIVE read: leaving them alone printed
+            # "FACTS INJECTED (…; not a live observation)" over live verdicts and emitted
+            # `facts_injected: true` beside a live `observed_at` — the two fields a consumer uses to
+            # judge currency, contradicting `facts_source` in the same payload.
+            prov = _post_respawn_provenance(cfg, a.facts)
+            _injected, obs_iso, header = prov["injected"], prov["observed_at"], prov["header"]
+            reported["facts"] = prov["facts"]
             verdicts = evaluate(facts2, cfg, only=only)
             not_evaluated = [n for n in CHECK_ORDER if n not in set(v.name for v in verdicts)]
             code = exit_code(verdicts, not_evaluated)
@@ -4494,6 +4570,8 @@ def main(argv=None):
                                                                state.data.get("version")))
         to_send, suppressed = plan_notifications(verdicts, state)
         reported["suppressed"] = [v.key for v in suppressed]
+        # which of those are AMBIGUOUS (nothing confirmed) rather than delivered
+        reported["suppressed_ambiguous"] = [v.key for v in suppressed if state.is_ambiguous(v.key)]
         extra = None
         if reported["respawn"]:
             rr = reported["respawn"]
@@ -4582,6 +4660,7 @@ def main(argv=None):
                               "respawn": reported["respawn"],
                               "sent": reported["sent"],
                               "suppressed": reported["suppressed"],
+                              "suppressed_ambiguous": reported.get("suppressed_ambiguous") or [],
                               "not_delivered": reported["not_delivered"],
                               "state_error": reported.get("state_error"),
                               "state_repaired": reported.get("state_repaired"),
@@ -4611,9 +4690,19 @@ def main(argv=None):
     if reported["sent"]:
         print("\nnotified (delivered): %s" % ", ".join(
             "%s/%s" % (s["check"], s["variant"]) for s in reported["sent"]))
+    # ⛔ TWO DIFFERENT CLAIMS. `plan_notifications` suppresses on `state.notified` (someone WAS told)
+    # OR on `state.is_ambiguous` (the bytes may be sitting in a composer and nothing is confirmed) —
+    # and the report called both "already notified". An operator reading that about an AMBIGUOUS
+    # marker stops looking, which is the exact silence the marker exists to make visible.
     if reported["suppressed"]:
-        print("\nsuppressed (state unchanged, already notified): %s"
-              % ", ".join(reported["suppressed"]))
+        told = [k for k in reported["suppressed"] if k not in (reported.get("suppressed_ambiguous")
+                                                               or ())]
+        unsure = reported.get("suppressed_ambiguous") or []
+        if told:
+            print("\nsuppressed (state unchanged, already notified): %s" % ", ".join(told))
+        if unsure:
+            print("\nsuppressed (last attempt was AMBIGUOUS — delivery NOT confirmed; the bytes may "
+                  "be in the composer, so it is not retried blind): %s" % ", ".join(unsure))
     if reported.get("state_error"):
         # Loud on purpose: with an unwritable state file the notifier cannot honour "one message per
         # state change", and the next poll will re-send. The run did not crash — but it must say so.

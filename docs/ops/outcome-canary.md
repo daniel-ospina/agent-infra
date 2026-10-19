@@ -539,6 +539,24 @@ Six more (cycle 13), each a case where a datum the tool held was not the one it 
 - **A CRASHED mutant is a failed mutation, not a catch.** The harness scored any non-zero exit as
   "RED as required", and `evaluate` converts a raising predicate into `INCONCLUSIVE/PREDICATE_ERROR` —
   so a mutant whose only effect was to raise was counted as evidence it never was.
+- **A box has ONE identity, and it is the STATE KEY.** `_is_local_box` fixed the probes and the repo
+  but left `cfg.box` unnormalised, so `local`, `"local "` and `localhost` were three notification
+  identities for one machine: the same failure notified three times, and the silent case — fail under
+  `local `, recover under `local` (which clears only `boxes["local"]`), fail again under `local ` —
+  suppresses the alert forever. `_normalize_box` is the one spelling.
+- **A search command does not testify that a program is running.** A near-miss row whose PROGRAM is
+  `pgrep`/`grep`/`ps`/`tail`/… names a pattern, not a process — and `pgrep -fl cmux-tui` is this
+  tool's own documented next command, so matching it made the near-miss abstention fire on the
+  diagnostic: a genuinely dead daemon read `DAEMON_CENSUS_NEAR_MISS` for as long as anyone ran the
+  recommended command, disabling the arm that catches an OOM kill.
+- **"Already notified" and "may have landed" are different claims.** `--no-notify`, `--skip` and the
+  AMBIGUOUS suppression are now each disclosed with their own wording (`suppressed_ambiguous` in the
+  JSON); `--skip` REFUSES in `--static` (exit 3) because it names a live probe and the static path
+  never consults it.
+- **After a respawn the provenance follows the verdicts**, not the payload that fed them:
+  `_post_respawn_provenance` re-stamps the observation time, drops the injected label and records the
+  re-collection, so a `--facts` run that respawned does not advertise `facts_injected: true` beside a
+  live `observed_at`.
 - **`_is_count` is the ONLY count guard.** `isinstance(True, int)` is true, and the same field was
   healed in one arm and re-broken in the next three times in one week: `backlog: true` FAILed in
   `work_dispatched`, then PASSed in its GREEN arm (`False == 0`), then certified a frozen pool as

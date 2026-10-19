@@ -2467,8 +2467,12 @@ def test_an_UNKNOWN_probe_in_skip_is_a_usage_error_not_a_silent_no_op():
     rc, out, err = run_cli(["--static", "--skip", "githbu", "--fixtures-dir", FIXTURES])
     assert rc == 3, (rc, out[-400:], err[-400:])
     assert "unknown probe" in err.lower(), err[-400:]
+    # ⛔ A VALID PROBE NAME IS STILL A REFUSAL IN `--static`: `--skip` names a LIVE probe, and the
+    # static path never consults it — accepting it there was the same silent no-op in the other mode
+    # (exit 0, `not_evaluated: []`, no line saying the flag did nothing).
     rc2, _, err2 = run_cli(["--static", "--skip", "github", "--fixtures-dir", FIXTURES])
-    assert rc2 == 0, (rc2, err2[-400:])
+    assert rc2 == 3, (rc2, err2[-400:])
+    assert "live" in err2.lower() and "--only" in err2, err2[-400:]
 
 
 @test
@@ -4500,6 +4504,27 @@ MUTATIONS = [
      '    if lane_ok:\n        return True, "a lane started %s (the queue record is not the only evidence)" % (\n            _age_txt(lane_ok.get("age_s")))',
      '    if intent or lane_ok:\n        return True, "a dispatch landed %s (the queue record is not the only evidence)" % (\n            _age_txt((intent or lane_ok).get("age_s")))',
      "test_the_intent_line_is_not_reported_as_a_LANDED_dispatch"),
+    # ── cycle-41 defects ─────────────────────────────────────────────────────────────────
+    ("this box has three notification identities",
+     '    return "local" if _is_local_box(name) else str(name).strip()',
+     '    return str(name) if name else "local"',
+     "test_this_box_has_ONE_notification_identity"),
+    ("a search command testifies that the program is running",
+     '            if toks and os.path.basename(toks[0]) not in _INSPECTORS:',
+     '            if toks:',
+     "test_a_SEARCH_command_does_not_testify_that_the_daemon_EXISTS"),
+    ("an AMBIGUOUS suppression is reported as already notified",
+     '        reported["suppressed_ambiguous"] = [v.key for v in suppressed if state.is_ambiguous(v.key)]',
+     '        reported["suppressed_ambiguous"] = []',
+     "test_an_AMBIGUOUS_suppression_is_not_reported_as_ALREADY_NOTIFIED"),
+    ("a post-respawn report keeps the INJECTED provenance",
+     '        "injected": False,          # these verdicts came from a live read, whatever fed the first',
+     '        "injected": bool(injected_path),',
+     "test_a_POST_RESPAWN_report_does_not_claim_INJECTED_provenance"),
+    ("--skip is a silent no-op in --static",
+     '        if skip:\n            print("outcome-canary: --skip %s applies to the LIVE collection only; in --static use "',
+     '        if False:\n            print("outcome-canary: --skip %s applies to the LIVE collection only; in --static use "',
+     "test_an_UNKNOWN_probe_in_skip_is_a_usage_error_not_a_silent_no_op"),
     # ── cycle-40 defects ─────────────────────────────────────────────────────────────────
     ("an unreported merge-coverage bit reads as a complete page",
      '    if mpf is not False and not (_is_count(n) and n > 0):',
@@ -5746,6 +5771,97 @@ def test_an_INJECTED_fact_set_is_disclosed_in_the_JSON_too():
     assert payload is not None, (rc, (out or err)[-400:])
     assert payload.get("facts_injected") is True, payload.get("facts_injected")
     assert "injected" in (payload.get("facts_source") or ""), payload.get("facts_source")
+
+
+@test
+def test_this_box_has_ONE_notification_identity():
+    """`_is_local_box` fixed the probes and the repo and left `cfg.box` unnormalised — and `cfg.box`
+    is the STATE KEY. `--box local`, `--box "local "` and `--box localhost` were three identities for
+    one machine: the same failure notified three times, and the worst case is silent — fail under
+    `local `, recover under `local` (which clears only `boxes["local"]`), fail again under `local `,
+    and the recorded key suppresses the alert forever."""
+    m = load()
+    d = tempfile.mkdtemp(prefix="oc-boxid-")
+    state = os.path.join(d, "state.json")
+    facts = os.path.join(d, "facts.json")
+    with open(facts, "w") as fh:
+        json.dump({"facts": fx("no-pr-created")["facts"]}, fh)
+    for spell in ("local", "local ", "  localhost  "):
+        run_cli(["--live", "--json", "--facts", facts, "--repo", "o/r", "--box", spell,
+                 "--no-respawn", "--state", state])
+    with open(state) as fh:
+        doc = json.load(fh)
+    # ONE identity: no second box record for a spelling of this machine. (`notified` may be empty
+    # here — a send that could not be confirmed is deliberately not recorded — so the identity claim
+    # is about the KEY, not about whether a message landed.)
+    assert list(doc["boxes"]) == ["local"], doc["boxes"]
+    # …and a REMOTE box keeps its own identity
+    assert m._normalize_box("cell-2") == "cell-2"
+    assert m._normalize_box(" local ") == "local"
+
+
+@test
+def test_a_SEARCH_command_does_not_testify_that_the_daemon_EXISTS():
+    """A rejected row whose PROGRAM is a search tool names the pattern, not the process — and
+    `pgrep -fl cmux-tui` is this tool's own documented next command. Matching any token made the
+    near-miss abstention fire on the diagnostic itself, so a genuinely dead daemon read
+    `INCONCLUSIVE/DAEMON_CENSUS_NEAR_MISS` for as long as anyone ran the recommended command."""
+    m = load()
+    names = ("cmux-tui",)
+    rows = [{"pid": 1, "cmd": "pgrep -fl cmux-tui"}, {"pid": 2, "cmd": "grep cmux-tui x"},
+            {"pid": 3, "cmd": "ps aux"}]
+    assert m._names_our_program(rows, names=names) == [], m._names_our_program(rows, names=names)
+    # …but a row that really IS the program (directly, or behind nice/an interpreter) still counts
+    for cmd in ("/Users/x/.cmux/bin/cmux-tui --serve", "nice -n 5 cmux-tui",
+                "/bin/bash -c cmux-tui"):
+        assert m._names_our_program([{"pid": 9, "cmd": cmd}], names=names), cmd
+
+
+@test
+def test_an_AMBIGUOUS_suppression_is_not_reported_as_ALREADY_NOTIFIED():
+    """`plan_notifications` suppresses on `notified` (someone WAS told) or on `is_ambiguous` (nothing
+    confirmed), and the report called both "already notified". An operator reading that about an
+    ambiguous marker stops looking — the exact silence the marker exists to make visible."""
+    m = load()
+    d = tempfile.mkdtemp(prefix="oc-ambrep-")
+    state = os.path.join(d, "state.json")
+    with open(state, "w") as fh:
+        json.dump({"version": 1, "boxes": {"local": {
+            "notified": {}, "ambiguous": {"pr_created|NO_PR_CREATED": 1760000000.0}}}}, fh)
+    facts = os.path.join(d, "facts.json")
+    with open(facts, "w") as fh:
+        json.dump({"facts": fx("no-pr-created")["facts"]}, fh)
+    rc, out, err = run_cli(["--live", "--json", "--facts", facts, "--repo", "o/r",
+                            "--no-respawn", "--state", state])
+    doc = json.loads(out) if out.strip().startswith("{") else None
+    assert doc is not None, (rc, (out or err)[-400:])
+    assert doc["signal"]["suppressed_ambiguous"] == ["pr_created|NO_PR_CREATED"], doc["signal"]
+    rc2, out2, err2 = run_cli(["--live", "--facts", facts, "--repo", "o/r", "--no-respawn",
+                               "--state", state])
+    assert "already notified" not in out2, [ln for ln in out2.splitlines()
+                                            if "already notified" in ln]
+    assert "AMBIGUOUS" in out2 and "NOT confirmed" in out2, out2[-500:]
+
+
+@test
+def test_a_POST_RESPAWN_report_does_not_claim_INJECTED_provenance():
+    """`header`, `obs_iso` and the injected flag were built from the payload BEFORE the action and
+    never recomputed, so a `--facts` run whose respawn took printed "FACTS INJECTED (…; not a live
+    observation)" over LIVE verdicts and emitted `facts_injected: true` beside a live `observed_at` —
+    the two fields a consumer uses to judge currency, contradicting `facts_source` in the same
+    payload."""
+    m = load()
+    cfg = m.cfg_from_dict({"repo": "o/r", "box": "local"})
+    prov = m._post_respawn_provenance(cfg, "/tmp/facts.json", now=1792400000.0)
+    assert prov["injected"] is False, prov["injected"]
+    assert "re-collected after the respawn" in prov["header"], prov["header"]
+    assert "FACTS INJECTED" not in prov["header"], prov["header"]
+    assert "RE-COLLECTED LIVE" in prov["facts"], prov["facts"]
+    # a non-injected run is still described as live, and says so plainly
+    prov2 = m._post_respawn_provenance(cfg, None, now=1792400000.0)
+    assert prov2["injected"] is False
+    assert "FACTS INJECTED" not in prov2["header"], prov2["header"]
+    assert prov2["facts"] == "live collection", prov2["facts"]
 
 
 @test
