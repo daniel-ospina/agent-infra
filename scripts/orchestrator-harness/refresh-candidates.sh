@@ -1680,14 +1680,17 @@ fi
 if [ "$ICR_RECLAIMED" -gt 0 ]; then
   echo "[refresh] $ICR_RECLAIMED of $judged candidate(s) queued although a claim EXISTS, because it is ORPHANED (held-by-orphan) — the holder host cannot be a live lane; the acquire still races the CAS (agent-infra#2094)"
 fi
-# ⛔ WHAT THIS DOES NOT COVER (agent-infra#1729, which this side's base predated): the stall that
-# leaves a HEALTHY-LOOKING NON-EMPTY backlog. A persistently-colliding issue used to consume the
-# whole window while `checked N; backlog now M` still printed and M > 0 — `COLLISION` counts as
-# usable, so that class was invisible here. ⛔ THE COLLISION-CONSUMES-THE-WINDOW CLASS IS NOW
-# COVERED (agent-infra#1729): a persistently
-# colliding head used to eat the whole window while `checked N; backlog now 0` printed and the pool
-# was never advanced. It is addressed by the SLOT budget + the collision ledger above, not by this
-# assertion — so what remains here is the narrower reading: a pass whose every RUN was unjudgeable.
+# ⛔ THE COLLISION-CONSUMES-THE-WINDOW CLASS IS COVERED (agent-infra#1729): a persistently colliding
+# head used to eat the whole window while `checked N; backlog now 0` printed and the pool was never
+# advanced. It is addressed by the SLOT budget + the collision ledger above, not by this assertion —
+# so what remains here is the narrower reading: a pass whose every RUN was unjudgeable.
+#
+# ⛔ THE TWO COUNTERS ABOVE ARE A DIFFERENT QUESTION, AND NEITHER IS "WHAT THIS DOES NOT COVER"
+# (agent-infra#2094, spliced into one paragraph by the merge that brought #1729 in — a reader could not
+# tell which symptom was claimed covered). The withheld/reclaimed lines answer "why is the backlog
+# short": a live cross-box claim (held-by-live) is withheld, and a claim that is ORPHANED is queued and
+# counted, so neither shape can read as "no work". Uncovered by either is only the pass whose every RUN
+# was unjudgeable, which the STARVED / `usable -eq 0` arms below refuse.
 # ⛔ A PASS THAT COULD AFFORD **NOTHING** MUST NOT FALL THROUGH TO `checked 0; backlog now M` EITHER
 # (agent-infra#1736 follow-up). The BUDGET REFUSAL is placed below the reaper, so the mid-loop guard
 # below only fires when the budget was affordable at the gate and was consumed by the listings on the

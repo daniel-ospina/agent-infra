@@ -438,26 +438,41 @@ claim_orphan_reason() {
 
   case "$ref" in
     *"/issue-"*) : ;;   # the holder is the controller, not the worker -> the pid answers nothing
-    # ⚠️ THE RESIDUAL THIS ARM ADMITS: the HOST rules run for EVERY keying, so after a rename the first
-  # hourly `claim_prune` frees the renamed box's own IN-FLIGHT ISSUE claims while their chains keep
-  # running — the "the holder is gone but the work is not" shape the pid rule refuses to infer. That is
-  # deliberate: the issue claim exists to make work MUTUALLY EXCLUSIVE, and a barrier held by a name no
-  # box answers to is indistinguishable from an abandoned one for every peer. The consequence is stated
-  # where operators read it (README §7.2b): the guarantee becomes "the next prune", not the lease, and
-  # `dispatched.txt` only protects the SAME box.
+  # ⚠️ THE RESIDUAL THIS ARM ADMITS is confined to the ISSUE key: a rename frees the renamed box's own
+  # IN-FLIGHT issue claims while their chains keep running — "the holder is gone but the work is not".
+  # That is deliberate (the issue claim exists to make work MUTUALLY EXCLUSIVE, and a barrier held by a
+  # name no box answers to is indistinguishable from an abandoned one for every peer), and a PR claim is
+  # NOT exposed to it because its pid is probeable (see the arm above). The consequence is stated where
+  # operators read it (README §7.2b): for an ISSUE claim the guarantee is "safe until the next prune",
+  # not "safe until the lease expires", and `dispatched.txt` protects only the SAME box.
   # ⛔ THE PID RULE IS OPT-IN ON AN EXPLICIT PR KEY, NOT ON "NOT AN ISSUE". `ref` is OPTIONAL, and
     # defaulting to the destructive polarity put the whole duplicate window ONE OMITTED ARGUMENT away:
     # with no ref the `*)` arm judged an issue-keyed owner by its pid and deleted a live lane's shared
     # barrier on a controller restart. A PR ref is `<ns>/<pr>-<sha12>` (a hyphen after the number), so
     # only that shape may probe a process; an absent or unrecognised ref abstains (under-reap).
     *-*)
-      if [ "$have_pid" = 1 ] && [ "$host" = "$(claim_host)" ]; then
+      # ⛔ A FORMER NAME OF THIS BOX IS *THIS MACHINE*, SO ITS PID IS PROBEABLE TOO (P0, cycle-7
+      # review). The gate used to be `host == claim_host`, so immediately after a rename a PR claim
+      # stamped `<oldName>:<live pid>` skipped the pid probe and fell through to the former-name rule,
+      # which called it ORPHANED — and the first hourly `claim_prune` deleted the box's OWN in-flight
+      # `merge-one`/`fix-one` claim. The ref then left origin, every peer's pre-flight read
+      # `no claim on #N`, and a peer won a fresh CAS and merged the same head: the STEAL direction, on
+      # the PR keying the README calls unaffected. A live pid is direct evidence a worker is alive, so
+      # it outranks the host name — but ONLY where the pid is really local (the running host, or a name
+      # this box wore), and never for an ISSUE key, whose holder and worker are different processes.
+      local is_local=0
+      if [ "$host" = "$(claim_host)" ]; then
+        is_local=1
+      else
+        case " $(claim_former_hosts) " in *" $host "*) is_local=1 ;; esac
+      fi
+      if [ "$have_pid" = 1 ] && [ "$is_local" = 1 ]; then
         case "$pid" in ''|*[!0-9]*) return 1 ;; esac
         if [ "$pid" -le 1 ] 2>/dev/null; then return 1; fi
         # the control probe: only a `ps` that can see THIS process may witness an absence.
         ps -p "$$" >/dev/null 2>&1 || return 1
         ps -p "$pid" >/dev/null 2>&1 && return 1
-        printf 'owner host is this box but the pid that took the PR claim (%s) is gone' "$pid"
+        printf 'owner host is this box (now or formerly) but the pid that took the PR claim (%s) is gone' "$pid"
         return 0
       fi ;;
   esac

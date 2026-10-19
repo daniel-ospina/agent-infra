@@ -45,6 +45,8 @@
 #   O19 [RED→GREEN] the destructive arms require POSITIVE evidence: an absent `ref` does not authorise
 #      the pid rule, and a `hostname` probe that cannot answer makes `claim_former_hosts` abstain
 #      (asserted on the function directly — through `claim_orphan_reason` the live-pid rule masks it).
+#   O21 [RED→GREEN] a FORMER name of this box with a LIVE local pid on a PR key is held-by-live, and the
+#      prune leaves it alone — the P0 that a rename would otherwise turn into a deleted live claim.
 #   O20 [RED→GREEN] the prune's unparseable-lease skip is a DELETING branch and is pinned here.
 #   O17 [RED→GREEN] the RECORDER (`claim_host_record`) is positively tested. Without it the
 #      former-name rule — the only thing that makes a rename self-heal — writes nothing at all, and
@@ -80,7 +82,7 @@
 #      below the review window it must outlive — a mid-review expiry, the duplicate this registry
 #      exists to prevent — and leaves nothing to diagnose.
 # ⛔ LABELLING HONESTY — MEASURED, not asserted. `CLAIMS_SH=<git archive HEAD>:claims.sh bash
-# claim-orphan.test.sh` (2026-10-18, against the pre-change claims.sh) reports 43 passed, 40 FAILED.
+# claim-orphan.test.sh` (2026-10-18, against the pre-change claims.sh) reports 46 passed, 42 FAILED.
 # Every [RED→GREEN] line is in that failing set, and so is exactly ONE line that carries no such label:
 # `O7 the PR keying declares a documented ceiling` (a pre-fix reader has no ceiling to declare). The
 # converse is what keeps the labels honest: a [PINNED] line must PASS pre-fix, because PINNED means
@@ -766,6 +768,47 @@ ck "O20 [RED→GREEN] the prune does not even NAME it as reaped" $P20
 # Non-vacuity: the SAME host's EXPIRED claim IS reaped by this prune, and so is its ORPHANED one.
 has_ref "$ORIG20" refs/claims/issue-7004 && pr20=1 || pr20=0
 ck "O20 [PINNED] the expired claim from the same dead host IS still reaped (the arm is alive)" $pr20
+
+# ══ O21: a PR claim from a FORMER NAME of this box with a LIVE pid is HELD-BY-LIVE ══
+# ⛔ P0, cycle-7 review. The pid gate used to be `host == claim_host`, so immediately after a rename a PR
+# claim stamped `<oldName>:<live pid>` skipped the probe and fell through to the former-name rule, which
+# called it ORPHANED — and the first hourly `claim_prune` deleted the box's OWN in-flight merge/fix
+# claim. Every peer's pre-flight then read `no claim on #N`, a peer won a fresh CAS and merged the same
+# head: the steal direction, on the keying where the minting pid IS the worker. A live pid is direct
+# evidence the worker is alive, so it outranks the host name — but only for a LOCAL pid, and never for
+# an ISSUE key (whose holder and worker are different processes; O15 pins that half).
+echo
+echo "── O21: former name + LIVE local pid on a PR key is HELD, not orphaned ─────────────"
+ORIG21="$(mk_origin o21)"; ensure_work_repo "$ORIG21" || { echo "❌ fixture"; exit 2; }
+CS21="$T/cs-o21"; mkdir -p "$CS21"; printf '%s\n' "oldBox21" > "$CS21/claim-hosts"
+FUT21=$(( $(date +%s) + 7200 ))
+as_box "$ORIG21" oldBox21 'c="$(_claim_commit "oldBox21:'"$$"'" "'"$FUT21"'")"
+  _git push -q origin "$c:refs/claims/9209490-0123456789ab" 2>/dev/null' CLAIM_STATE_DIR="$CS21" >/dev/null
+has_ref "$ORIG21" refs/claims/9209490-0123456789ab; ck "O21 (setup) a PR claim from the FORMER name with a LIVE pid is planted" $?
+HELD21="$(as_box "$ORIG21" newBox21 'claim_acquire "" 9209490 0123456789abcdef0123 >/dev/null 2>&1
+  printf "RC=%s\nRESULT=%s\n" "$?" "${CLAIM_RESULT:-}"' CLAIM_STATE_DIR="$CS21")"
+R21="$(field "$HELD21" RC)"; R21RES="$(field "$HELD21" RESULT)"
+[ "$R21" = "1" ]; O21A=$?
+ck "O21 [RED→GREEN] the former-name owner with a LIVE pid is NOT reclaimed (rc=$R21) ('$R21RES')" $O21A
+case "$R21RES" in
+  *held-by-live*) ok "O21 [RED→GREEN] it reads held-by-live, so a peer still sees the barrier" ;;
+  *) bad "O21 [RED→GREEN] it reads held-by-live (got '$R21RES')" ;;
+esac
+# AND the prune agrees — this is the arm that would DELETE the live worker's claim on a schedule.
+PR21="$(as_box "$ORIG21" newBox21 'claim_prune' CLAIM_STATE_DIR="$CS21" 2>&1)"
+OWN21="$(lease_owner "$ORIG21" refs/claims/9209490-0123456789ab)"
+case "$OWN21" in
+  oldBox21:*) O21B=0 ;;
+  *) O21B=1 ;;
+esac
+ck "O21 [RED→GREEN] claim_prune leaves it alone (owner is still '$OWN21')" $O21B
+# ... while the SAME former name with a DEAD pid IS reaped — the pid, not the host name, is the datum.
+as_box "$ORIG21" oldBox21 'c="$(_claim_commit "oldBox21:999999" "'"$FUT21"'")"
+  _git push -q origin "$c:refs/claims/9209491-0123456789ab" 2>/dev/null' CLAIM_STATE_DIR="$CS21" >/dev/null
+DEAD21="$(as_box "$ORIG21" newBox21 'claim_acquire "" 9209491 0123456789abcdef0123 >/dev/null 2>&1
+  printf "RC=%s\nRESULT=%s\n" "$?" "${CLAIM_RESULT:-}"' CLAIM_STATE_DIR="$CS21")"
+[ "$(field "$DEAD21" RC)" = "0" ]; O21C=$?
+ck "O21 [RED→GREEN] the SAME former name with a DEAD pid IS reclaimable (rc=$(field "$DEAD21" RC))" $O21C
 
 echo
 echo "─────────────────────────────────────────────────────────────"
