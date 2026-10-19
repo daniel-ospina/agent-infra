@@ -1187,6 +1187,21 @@ def _gh_token():
     right. gh's own layout puts the active account's token at the block's TOP level (depth 1) and
     the alternates deeper, so only depth 1 is accepted; if gh wrote only the `users:` form, the
     entry named by the block's own `user:` key is used.
+
+    ⛔ RESIDUAL — THE SYSTEM CREDENTIAL STORE IS NOT READ (#2138 r6, A/P2 + reviewer E). "gh's own
+    order" above is complete only through `hosts.yml`. `gh auth login` stores the token in the OS
+    KEYRING by default (plain text only under `--insecure-storage`), and on such a box `hosts.yml`
+    holds `user:`/`git_protocol:` and NO `oauth_token` — so this returns `""`, the caller makes no
+    request, and the second source this read exists for is INERT there. That is the same
+    "silently inert fallback" class `test_the_token_comes_from_ghs_own_config_and_absence_fails_
+    closed` pins for a non-standard config dir, and the fleet's own siblings describe the pair
+    (`scripts/orchestrator-harness/gh-limit.py`, `refresh-candidates.sh`: "hosts.yml / the
+    keyring"). It is STATED rather than closed because the only ways to read the keyring are a
+    subprocess (`gh auth token` — rejected above) or a third-party keyring import; the four boxes
+    this port came from have the token in `hosts.yml` (measured: the live fallback answers), and
+    the failure is diagnosable from the double-refusal cause string, which names the path it read.
+    A box that authenticates via the keyring needs `gh auth login --insecure-storage` or a
+    `GH_TOKEN`; closing it properly is a follow-up, not a silent guess.
     """
     if (os.environ.get("GH_HOST") or "github.com").strip().lower() == "github.com":
         for var in ("GH_TOKEN", "GITHUB_TOKEN"):
@@ -1196,7 +1211,6 @@ def _gh_token():
     try:
         host = None
         depth = 0                    # indent width of the FIRST key inside the host block
-        users_indent = None          # indent of a `users:` key, when the block has one
         active_user = None
         user_tokens = {}             # login -> token, from the nested `users:` entries
         nested_login = None
@@ -1206,7 +1220,7 @@ def _gh_token():
                     continue
                 if not raw[0].isspace():              # `github.com:` -- a new host block
                     host = raw.split(":", 1)[0].strip()
-                    depth, users_indent, active_user, nested_login = 0, None, None, None
+                    depth, active_user, nested_login = 0, None, None
                     continue
                 if host != "github.com" or ":" not in raw:
                     continue
@@ -1217,17 +1231,21 @@ def _gh_token():
                 k, v = k.strip(), v.strip().strip("'\"")
                 if indent > depth:
                     # INSIDE the block: `users:` -> `<login>:` -> `oauth_token:`. A login is an
-                    # empty-valued key DEEPER than `users:` -- derived from the observed nesting,
-                    # not from gh's 4-space step (#2138 r5, A/P3: hard-coding `depth + 4` made the
-                    # per-user fallback return "" on any other indentation, i.e. silently no
-                    # second source). Its token is remembered, never returned, so an alternate
-                    # account can never be presented as the active one.
+                    # empty-valued key DEEPER than the block's own key level -- derived from the
+                    # observed nesting, not from gh's 4-space step (#2138 r5, A/P3: hard-coding
+                    # `depth + 4` made the per-user fallback return "" on any other indentation,
+                    # i.e. silently no second source). Its token is remembered, never returned, so
+                    # an alternate account can never be presented as the active one.
+                    #
+                    # ⛔ AND A `users:` GUARD HERE WAS DEAD CODE (#2138 r6, A/P2). gh writes
+                    # `users:` at the block's OWN key level, and `depth` is that level, so
+                    # `indent > depth` is false for it and this branch never sees it -- a
+                    # `users_indent` test could therefore never change the answer, and a guard
+                    # that cannot run is worse than a recorded gap. Removed rather than kept as
+                    # decoration; `test_the_ACTIVE_accounts_token_wins_in_a_multi_account_hosts_
+                    # yml` pins the arm that DOES fire.
                     if v == "":
-                        if k == "users":
-                            users_indent = indent
-                            nested_login = None
-                        elif users_indent is None or indent > users_indent:
-                            nested_login = k
+                        nested_login = k
                     elif k == "oauth_token" and nested_login:
                         user_tokens[nested_login] = v
                     continue
@@ -1387,7 +1405,7 @@ def _queue_rest(deadline=None):
     global GH_LAST_ERROR
     token = _gh_token()
     if not token:
-        GH_LAST_ERROR = (f"rest fallback: no credential (GH_TOKEN/GITHUB_TOKEN unset and no "
+        GH_LAST_ERROR = (f"rest second source: no credential (GH_TOKEN/GITHUB_TOKEN unset and no "
                          f"github.com oauth_token in {_gh_hosts_path()})")
         return None
     rows = []
@@ -1397,7 +1415,7 @@ def _queue_rest(deadline=None):
             if deadline is not None:
                 budget = min(budget, deadline - _monotonic())
                 if budget < 1.0:
-                    GH_LAST_ERROR = (f"rest fallback: page {page}: the queue read's own budget "
+                    GH_LAST_ERROR = (f"rest second source: page {page}: the queue read's own budget "
                                      "was spent before the fallback could fetch it")
                     return None
             body = _rest_get(
@@ -1405,24 +1423,24 @@ def _queue_rest(deadline=None):
                 f"?state=open&per_page={QUEUE_REST_PAGE}&page={page}", token,
                 timeout=budget, deadline=_monotonic() + budget)
             if not isinstance(body, list):
-                GH_LAST_ERROR = (f"rest fallback returned {type(body).__name__}, not a list")
+                GH_LAST_ERROR = (f"rest second source returned {type(body).__name__}, not a list")
                 return None
             if not all(isinstance(p, dict) for p in body):
-                GH_LAST_ERROR = "rest fallback returned a non-object element in the PR list"
+                GH_LAST_ERROR = "rest second source returned a non-object element in the PR list"
                 return None
             rows.extend(body)
             if deadline is not None and _monotonic() > deadline:
                 # The page ARRIVED, but past the budget: a stale answer is not a measurement. (A
                 # socket timeout bounds each recv, not the page -- `_rest_get`'s chunk loop is the
                 # real per-page bound; this is the belt after it, see the honest-bound note above.)
-                GH_LAST_ERROR = "rest fallback: budget overrun during page %d" % page
+                GH_LAST_ERROR = "rest second source: budget overrun during page %d" % page
                 return None
             if len(body) < QUEUE_REST_PAGE:
                 break
         else:
             # The loop exhausted its pages WITHOUT a short one: the cap was reached on a FULL page.
             # This is the truncation branch -- it must not fall through to `return` below.
-            GH_LAST_ERROR = (f"rest fallback: {QUEUE_REST_MAX_PAGES} full pages "
+            GH_LAST_ERROR = (f"rest second source: {QUEUE_REST_MAX_PAGES} full pages "
                              f"({len(rows)} open PRs) is the cap, not the queue")
             return None
         # ⛔ THE MAPPING IS INSIDE THE `try` (#2138 r3, A). It used to sit after the `except`, so a
@@ -1434,7 +1452,7 @@ def _queue_rest(deadline=None):
         return [_rest_pr(p) for p in rows]
     except Exception as e:
         # The URL is safe to name; the token never is.
-        GH_LAST_ERROR = f"rest fallback failed: {type(e).__name__}: {str(e)[:180]}"
+        GH_LAST_ERROR = f"rest second source failed: {type(e).__name__}: {str(e)[:180]}"
         return None
 
 
@@ -1510,8 +1528,22 @@ def queue():
     """
     # ⛔ THE HEAVIEST READ MUST GO THROUGH THE LAYER TOO. `gh pr list` is GraphQL and this is the
     # beat's largest read; a bare `"gh"` here resolved on PATH — unserialised, un-backed-off, and
-    # subject to the #1872 shim — while every other read in this file uses GH_BIN (found in review
-    # round 5).
+    # subject to the #1872 shim — while every other **gh-CLI** read in this file uses GH_BIN (found
+    # in review round 5).
+    # ⛔ "gh-CLI" IS THE QUALIFIER THAT KEEPS THIS TRUE (#2138 r6, A/P2 + reviewer E). The REST
+    # second source below does NOT go through GH_BIN or the layer: `_queue_rest` -> `_rest_get` is
+    # a raw `urllib` GET. That is a DELIBERATE, PRICED departure and it is stated here rather than
+    # left for a reader to discover by grepping:
+    #   * COST — it is UNSERIALISED (no `gh-limit` flock queue), does no `retry-after`/
+    #     `x-ratelimit-reset` back-off, and keeps no ETag, so a 304 costs a full body. It fires
+    #     exactly when the shared account is being refused, i.e. potentially on every lane at once.
+    #   * WHY THE LAYER CANNOT SERVE IT — the layer routes `gh` INVOCATIONS, and the queue's own
+    #     `gh()` helper hardcodes `timeout=90` with no deadline, which cannot fit
+    #     `QUEUE_READ_MAX_S`; reusing it would make the fallback unable to answer inside the tick
+    #     it exists for. Reading the token file directly also avoids a second `gh` process on the
+    #     hot path of the read that exists BECAUSE the subprocess path was refused (#1872).
+    #   * BOUND — one page's worth per read, capped by `_queue_rest`'s page count and the read's
+    #     deadline, and never re-sampled. The residual (no serialisation) is accepted and named.
     argv = [GH_BIN, "pr", "list", "--repo", REPO, "--state", "open",
             "--limit", str(QUEUE_PRIMARY_LIMIT), "--json",
             "number,isDraft,mergeable,mergeStateStatus,headRefOid,files"]
@@ -1538,6 +1570,16 @@ def queue():
         # the same absorb-and-keep-sample path as a failed transport.
         surface = "queue" if not attempt else "queue-resample"
         source = "graphql"
+        # ⛔ THE CALLER STATES THE TRANSPORT, IT DOES NOT LEAVE `_note_gh_failure` TO GUESS
+        # (#2138 r6, A/P1). The contract at `_note_gh_failure`'s module comment says a non-zero
+        # exit IS the transport and an UNPARSEABLE BODY IS NOT, and that the caller therefore
+        # states it in `transport=` "rather than leaving this function to guess from the text".
+        # This call site passed a constant `True` for BOTH cases, so the only thing keeping a
+        # parse failure out of the blindness claim was `TRANSPORT_MARKERS` -- i.e. the guess the
+        # contract forbids. MEASURED: an rc=0 body reading `{"message": "read timed out"}` (not
+        # JSON, therefore not a queue) published `gh=UNREADABLE(queue)` while GitHub had ANSWERED.
+        primary_transport = True      # a read that failed without reaching GitHub
+        refusal_transport = None      # set only where WE synthesise the both-sources refusal
         try:
             if not attempt:
                 # ⛔ THE PRIMARY READ ANSWERS TO THE READ'S OWN CAP, RETRIES INCLUDED (#2138 r4, A).
@@ -1581,6 +1623,10 @@ def queue():
                                              f"not the queue")
                     except Exception as _exc:
                         primary_failed = True
+                        # GitHub ANSWERED and we could not read the answer: not blindness. This
+                        # is the fact the comments below and at the outer `except` already
+                        # claim; it is now carried rather than inferred from the message.
+                        primary_transport = False
                         _graphql_err = (str(_exc) if isinstance(_exc, ValueError)
                                         else f"{type(_exc).__name__}: {_exc}")
                 if primary_failed:
@@ -1605,7 +1651,8 @@ def queue():
                     # EXISTS. Without the note first, `_withdraw_gh_failure()` could never change
                     # anything and the protection its docstring promises would be inert (review
                     # round 1, B and A).
-                    _note_gh_failure(f"queue read failed: {_graphql_err}", surface, transport=True)
+                    _note_gh_failure(f"queue read failed: {_graphql_err}", surface,
+                                     transport=primary_transport)
                     # ⛔ THE FALLBACK GETS ITS OWN START-ANCHORED BOUND (#2138 r2, B), CAPPED BY THE
                     # READ'S OWN TICK BUDGET (#2138 r3, A). Passing only the re-sample deadline made
                     # the recovery INERT in the case it exists for: a slow primary read can spend
@@ -1620,10 +1667,14 @@ def queue():
                         # Both sources refused: raise the FIRST cause (it is the actionable one --
                         # "rate limit" says wait) and append the second so the cause line names the
                         # whole failure rather than half of it.
-                        _rest_err = (GH_LAST_ERROR if "rest fallback" in (GH_LAST_ERROR or "")
+                        _rest_err = (GH_LAST_ERROR if "rest second source" in (GH_LAST_ERROR or "")
                                      else "")
+                        # The synthesised refusal inherits the PRIMARY's transport status: if the
+                        # primary reached GitHub and we mangled the answer, this is not blindness
+                        # even though the second source also failed for its own (named) reason.
+                        refusal_transport = primary_transport
                         raise RuntimeError(
-                            f"{_graphql_err} | {_rest_err or 'rest fallback failed'}")
+                            f"{_graphql_err} | {_rest_err or 'rest second source failed'}")
                     source = "rest"
                     _withdraw_gh_failure(surface)
             else:
@@ -1634,6 +1685,15 @@ def queue():
                 prs = json.loads(r.stdout)
                 if not isinstance(prs, list):
                     raise ValueError(f"queue payload is not a list: {str(prs)[:200]}")
+                # ⛔ THE CAP APPLIES TO A RE-SAMPLE TOO (#2138 r6, A/P2). The guard below on the
+                # PRIMARY read exists because `--limit 400` truncates silently, so a full page
+                # published as the depth is an under-count. A re-sample had no such guard, and it
+                # is ACCEPTED rather than rejected -- a deeper sample wins and a fully-readable
+                # full page is not blind, so `queue()` breaks with it and publishes `waiting=400`
+                # for a 500-PR backlog. Reachable when the first sample was BLIND.
+                if len(prs) >= QUEUE_PRIMARY_LIMIT:
+                    raise ValueError(f"{len(prs)} open PRs is the primary read's cap, "
+                                     f"not the queue")
             non = [p for p in prs if not p["isDraft"]]
         except Exception as e:
             # A FAILED RE-SAMPLE MUST NOT THROW AWAY A SAMPLE WE ALREADY HOLD. The first read
@@ -1644,7 +1704,8 @@ def queue():
             # BLINDING_SURFACES, because the queue WAS read -- a transient failure of a RE-read
             # must not declare the fleet blind, rewrite the verdict to RATE-LIMITED, or suppress
             # the cache, all of which is worse than not having re-read.
-            transport = isinstance(e, (RuntimeError, subprocess.TimeoutExpired))
+            transport = (refusal_transport if refusal_transport is not None
+                         else isinstance(e, (RuntimeError, subprocess.TimeoutExpired)))
             _note_gh_failure(f"queue read failed: {e}", surface, transport=transport)
             if sample is None:
                 return None

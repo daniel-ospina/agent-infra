@@ -201,11 +201,19 @@ def _isolate_gh_config(monkeypatch):
     `GH_HOSTS`-patched assertion pass or fail on the runner's identity. A test that wants either
     source sets it explicitly, and `monkeypatch.setenv` is applied AFTER this fixture.
 
+    ⛔ AND `GH_HOST` IS THE FIFTH LEG, NOT AN EXTRA (#2138 r6). It is the leg that decides whether
+    the two env tokens are CONSULTED AT ALL: `_gh_token()` skips both when `GH_HOST` is any non-
+    github.com host. Clearing the tokens while leaving `GH_HOST=ent.example` in the environment
+    therefore inverts gh's precedence onto the runner's identity — MEASURED: `GH_HOST=ent.example
+    pytest test_objective.py` failed `test_the_token_comes_from_ghs_own_config_and_absence_fails_
+    closed` with `'' == 'gho_github'`, the same class as the `XDG_CONFIG_HOME` bug this fixture
+    was added for, one leg further along.
+
     This is the repo's recorded failure mode (`MEMORY.md`: a fixture that inherits the ambient
     environment measures the host, not the installer) applied to the one seam that decides which
     CREDENTIAL a read presents.
     """
-    for var in ("GH_CONFIG_DIR", "XDG_CONFIG_HOME", "GH_TOKEN", "GITHUB_TOKEN"):
+    for var in ("GH_CONFIG_DIR", "XDG_CONFIG_HOME", "GH_TOKEN", "GITHUB_TOKEN", "GH_HOST"):
         monkeypatch.delenv(var, raising=False)
 
 
@@ -218,7 +226,7 @@ def test_the_gh_config_isolation_is_IN_FORCE_not_merely_written():
     structural half fails on every host if the autouse fixture is removed, and the behavioural
     half fails on the CI surface, which is where the false green came from.
     """
-    leaked = [v for v in ("GH_CONFIG_DIR", "XDG_CONFIG_HOME", "GH_TOKEN", "GITHUB_TOKEN")
+    leaked = [v for v in ("GH_CONFIG_DIR", "XDG_CONFIG_HOME", "GH_TOKEN", "GITHUB_TOKEN", "GH_HOST")
               if v in os.environ]
     assert leaked == [], leaked
 
@@ -1220,6 +1228,31 @@ def test_a_rest_payload_is_never_an_empty_queue(monkeypatch):
     assert "VERDICT=AT-TARGET" not in line, line
 
 
+def test_an_EMPTY_rest_page_is_a_real_zero_and_still_names_its_provenance(monkeypatch):
+    """(c), THE OTHER DIRECTION: `[]` IS THE HONEST ANSWER FOR A REPO WITH NO OPEN PRs.
+
+    ⛔ `_queue_rest`'s docstring states "`[]` IS NEVER A FAILURE VALUE HERE" and nothing pinned
+    it (#2138 r6, reviewer A/test-review). The mutant that turns an empty page into `None` kept
+    the whole suite green — and that mutant is the file's core harm: a repo with no open PRs would
+    publish `queue=UNREADABLE` and a `gh=…(queue)` blindness claim. The watchdog would cry wolf on
+    the healthiest possible queue.
+
+    The second half pins the branch that prints `queue_read=REST(samples=N)` — the provenance token
+    for a REST sample whose merge state WAS computed, which is the only shape an empty recovered
+    queue can take (`unknown == 0`). Deleting that branch left the suite green, and the line then
+    carried NO `queue_read=` token at all, so a reader could not tell "REST recovered" from
+    "GraphQL was fine" — the silent-provenance-loss shape the file forbids.
+    """
+    install(monkeypatch, pr_list=REST_REFUSED, rest_prs=[])
+    assert objective._queue_rest() == [], "an empty page is [], never None"
+    line = objective.build()
+    assert "open=0" in line and "nondraft=0" in line, line
+    assert "queue=UNREADABLE" not in line, line
+    assert "gh=" not in line, line                     # no blindness claimed for a READ
+    assert "queue_read=REST(samples=" in line, line    # ...and the provenance is not silent
+    assert objective.GH_BLOCKED is None, objective.GH_BLOCKED
+
+
 def test_a_rest_sample_with_an_EMPTY_merge_state_is_not_BLIND(monkeypatch):
     """(d) THE KNOWN GAP: REST cannot compute the lazy merge state, so it must not be BLIND.
 
@@ -1333,6 +1366,17 @@ def test_the_token_comes_from_ghs_own_config_and_absence_fails_closed(tmp_path, 
     hosts.write_text("github.com:\n    oauth_token: gho_github\n")
     monkeypatch.setenv("GITHUB_TOKEN", "gho_env")
     assert objective._gh_token() == "gho_env"
+    monkeypatch.delenv("GITHUB_TOKEN")
+
+    # ⛔ AND `GH_TOKEN` BEATS `GITHUB_TOKEN` (#2138 r6, A/P2). The precedence loop is ordered for
+    # that reason and nothing set BOTH, so swapping the tuple kept the whole suite green. On a box
+    # exporting both -- a real fleet configuration -- the wrong credential would be presented and
+    # the only symptom would be a failed fallback, i.e. `queue=UNREADABLE` pointing at nothing.
+    monkeypatch.setenv("GH_TOKEN", "tok_primary")
+    monkeypatch.setenv("GITHUB_TOKEN", "tok_secondary")
+    assert objective._gh_token() == "tok_primary"
+    monkeypatch.delenv("GH_TOKEN")
+    assert objective._gh_token() == "tok_secondary"
     monkeypatch.delenv("GITHUB_TOKEN")
 
     called = []
@@ -1790,6 +1834,14 @@ def test_a_per_PR_payloads_state_is_passed_through_and_the_list_has_none(monkeyp
         == "BLOCKED"
     assert objective._rest_pr(_rest_row(1))["mergeStateStatus"] is None
     assert objective._rest_pr(_rest_row(1))["mergeable"] == "UNKNOWN"
+    # ⛔ THE `mergeable` KEY'S WHOLE MAPPING IS PINNED, NOT JUST ITS UNKNOWN ARM (#2138 r6).
+    # `MERGEABLE`/`CONFLICTING` were asserted nowhere, so the mutant that collapses `mergeable:
+    # False` to `"UNKNOWN"` kept the suite green. Nothing consumes `mergeable` TODAY, which is
+    # exactly what makes it the trap this file warns about for `dirty`/`unstable`: the next
+    # consumer inherits an unpinned arm. The spelling is GraphQL's, deliberately.
+    assert objective._rest_pr({"mergeable": True})["mergeable"] == "MERGEABLE"
+    assert objective._rest_pr({"mergeable": False})["mergeable"] == "CONFLICTING"
+    assert objective._rest_pr({})["mergeable"] == "UNKNOWN"
     # ⛔ AND NO INFERENCE IS MADE FROM A HALF-PRESENT PAIR (#2138 r5). `mergeable: false` with an
     # uncomputed state was once mapped to DIRTY so `resolve-conflict` stayed reachable; against the
     # list endpoint that could never fire, so it is gone -- and a per-PR payload that HAS the field
@@ -1812,7 +1864,7 @@ def test_a_malformed_rest_row_is_a_NAMED_failure_not_an_unattributed_blindness(m
     monkeypatch.setattr(objective, "_rest_get",
                         lambda *a, **k: [{"number": 1, "head": "not-a-dict"}])
     assert objective._queue_rest() is None
-    assert objective.GH_LAST_ERROR.startswith("rest fallback failed:"), objective.GH_LAST_ERROR
+    assert objective.GH_LAST_ERROR.startswith("rest second source failed:"), objective.GH_LAST_ERROR
 
     # The non-object guard keeps its OWN message (a mutant that deletes it now answers with the
     # AttributeError text instead, so this is what pins the guard rather than the try block).
@@ -1976,6 +2028,66 @@ def test_a_FULL_primary_page_is_a_failed_read_not_the_queue_depth(monkeypatch):
     assert "queue=UNREADABLE" in line, line
 
 
+def test_a_FULL_RE_SAMPLE_page_is_a_failed_read_not_the_queue_depth(monkeypatch):
+    """⛔ THE CAP APPLIES TO A RE-SAMPLE TOO (#2138 r6, A/P2).
+
+    The primary read's `QUEUE_PRIMARY_LIMIT` guard was added because `--limit 400` truncates
+    silently, but the re-sample branch parsed its payload with only the `isinstance(list)` guard.
+    A full re-sample page is ACCEPTED rather than rejected — it is deeper, so it wins the
+    keep-most-resolved comparison, and a fully-readable full page is not blind, so the loop breaks
+    with it. Reachable when the FIRST sample was blind, and it publishes `waiting=400` for a
+    backlog of 500: the same under-count, one branch over.
+
+    Fixture: attempt 0 is blind (unread merge state, minority-unread so it re-samples); attempt 1
+    answers with a full page. The honest outcome is the BLIND line plus `resample=FAILED`, which is
+    strictly better than a truncated depth printed as the queue.
+    """
+    limit = objective.QUEUE_PRIMARY_LIMIT
+    # A sample BELOW the primary cap (a full page is rejected as a failed read, before the
+    # re-sample is ever reached) whose merge state is MOSTLY unread, so `_queue_read_is_blind`
+    # is TRUE (`unknown > 0 and 2*unknown >= nondraft`) and the loop re-samples.
+    first = ([_pr(n, "?") for n in range(1, limit // 2 + 1)]
+             + [_pr(n, "BLOCKED") for n in range(limit // 2 + 1, limit)])
+    assert len(first) == limit - 1, len(first)
+    second = [_pr(n, "BLOCKED") for n in range(1, limit + 1)]      # a FULL page
+    install(monkeypatch, pr_list=[_Result(0, json.dumps(first)),
+                                  _Result(0, json.dumps(second))])
+    line = objective.build()
+    assert f"waiting={limit}" not in line, line      # the full page is NOT the depth
+    assert "waiting=0" not in line, line             # ...and the sample is not discarded
+    assert "resample=FAILED" in line, line           # the refusal is named, not swallowed
+    assert "queue_read=BLIND" in line, line          # and the first sample stands
+
+
+def test_a_PARSE_failure_does_not_claim_blindness_even_when_its_TEXT_says_transport(monkeypatch):
+    """⛔ THE CALLER STATES `transport=`; IT DOES NOT LET THE TEXT DECIDE (#2138 r6, A/P1).
+
+    `_note_gh_failure`'s contract says a non-zero exit IS the transport and an UNPARSEABLE BODY IS
+    NOT, and that the caller "STATES it in `transport=` rather than leaving this function to guess
+    from the text". The call site passed a constant `True` for both, so the only thing keeping a
+    parse failure out of the claim was `TRANSPORT_MARKERS`. MEASURED before the fix: an rc=0 body
+    reading `{"message": "read timed out"}` — not JSON, so not a queue — published
+    `gh=UNREADABLE(queue)` while GitHub had ANSWERED and both sources had failed for non-transport
+    reasons. That is the instrument lying in the one direction it exists to be trusted in.
+
+    `not json at all` (no marker) hid the bug: it passed for the wrong reason. The marker-bearing
+    body is what makes this discriminating.
+    """
+    for body in ('{"message": "read timed out"}',            # a TRANSPORT_MARKER in the text
+                 '{"message": "connection reset by peer"}'):
+        install(monkeypatch, pr_list=_Result(0, body), rest_prs=None)
+        line = objective.build()
+        assert "queue=UNREADABLE" in line, (body, line)       # the FACT is still reported
+        assert "gh=" not in line, (body, line)               # ...but no blindness claim
+        assert objective.GH_BLOCKED is None, (body, objective.GH_BLOCKED)
+
+    # ...and a REAL transport failure still claims, so this is not "never claim".
+    install(monkeypatch, pr_list=REST_REFUSED, rest_prs=None)
+    line = objective.build()
+    assert "gh=RATE-LIMITED(queue)" in line, line
+    assert "VERDICT=GH-RATE-LIMITED" in line, line
+
+
 def test_the_bucket_prefers_the_ACTIONABLE_kind_when_two_surfaces_fail(monkeypatch):
     """⛔ RATE-LIMITED OUTRANKS UNREADABLE, AND THAT PRECEDENCE IS DELIBERATE (#2138 r5, A/P3).
 
@@ -2048,3 +2160,38 @@ def test_a_response_that_arrives_past_the_budget_contributes_NO_chunk(monkeypatc
     monkeypatch.setattr(urllib.request, "build_opener", lambda *a, **k: _Opener())
     with __import__("pytest").raises(TimeoutError):
         objective._rest_get("https://api.github.com/x", "t", timeout=30, deadline=10.0)
+
+
+def test_an_unread_queue_is_never_cached_even_without_a_gh_claim(monkeypatch, tmp_path, capsys):
+    """⛔ A BLIND LINE WITH NO `gh=` TOKEN MUST STILL BE REFUSED BY THE CACHE (#2138 r5, A/P2).
+
+    The cache is mtime-keyed and holds ONE line, so it cannot tell a good read from a failed one:
+    a failure inherits the FULL serve window. The guard keys on the FACT (`queue=UNREADABLE`), not
+    on which token said so — a payload the primary could not use AND no second source is a
+    NON-transport failure, correctly NOT a claim, so the line carries `queue=UNREADABLE` with no
+    `gh=` at all and the older guard matched nothing. It then FROZE the blind line.
+
+    The code carried a comment naming this test (`objective.py::main`'s cache guard) and the test
+    DID NOT EXIST, so the guard was reassurance without a pin (#2138 r6, reviewer A).
+
+    Part (2) is the positive control: without it, part (1) passes vacuously on a build that never
+    caches anything.
+    """
+    cache = tmp_path / "objective.last"
+    monkeypatch.setattr(objective, "CACHE", str(cache))
+    monkeypatch.setattr(objective, "res_line", lambda *a, **k: "RES: stubbed for the cache test")
+    monkeypatch.setattr(objective.sys, "argv", ["objective.py"])
+
+    # (1) unread queue, no `gh=` claim => NOT cached.
+    install(monkeypatch, pr_list=_Result(0, "not json at all"), rest_prs=None)
+    objective.main()
+    out = capsys.readouterr().out
+    assert "queue=UNREADABLE" in out, out
+    assert "gh=" not in out, out
+    assert not cache.exists(), "an unread queue was CACHED and would be served for the whole window"
+
+    # (2) POSITIVE CONTROL: a read that answered IS cached.
+    install(monkeypatch, pr_list=_Result(0, json.dumps([_pr(1, "BLOCKED")])))
+    objective.main()
+    assert cache.exists(), "a good read must be cached, or part (1) proves nothing"
+    assert "queue=UNREADABLE" not in cache.read_text()
