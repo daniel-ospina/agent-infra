@@ -184,8 +184,14 @@ run_shimmed() {
     while [ $# -gt 0 ]; do
         case "$1" in *=*) envs+=("$1"); shift ;; *) break ;; esac
     done
+    # ⛔ `REAP_VENV_FREE_FLOOR_MB` IS PINNED HERE TOO (review of PR #1949): the floor is a documented
+    # OPERATOR-RESTATABLE value, so an exported one turns every floor assertion in §H (and §A's "the
+    # pass completes") red for a non-defect — the same host-measuring class as the `DF_BIN`/`DU_BIN`
+    # pin directly above, reintroduced through the fourth capacity input. A caller that means to
+    # exercise a floor passes it as a `VAR=value` word, which `env` applies AFTER this default, so
+    # H2b's `abc` and H3's `0` still win.
     PS_BIN="$T/bin/ps" LSOF_BIN="$T/bin/lsof" TMUX_BIN="$T/bin/tmux" \
-    DF_BIN="$T/bin/df" DU_BIN="$T/bin/du" \
+    DF_BIN="$T/bin/df" DU_BIN="$T/bin/du" REAP_VENV_FREE_FLOOR_MB=2048 \
     REAP_VENV_LOG="$T/reap.log" env "${envs[@]}" bash "$REAPER" "$@" 2>&1
 }
 # run_real <args…> — REAL ps and lsof; tmux pointed at a path that does not exist, so the pass models
@@ -195,7 +201,7 @@ run_shimmed() {
 run_real() {
     local lsof_bin; lsof_bin="$(command -v lsof || true)"
     PS_BIN=/bin/ps LSOF_BIN="$lsof_bin" TMUX_BIN=/nonexistent/tmux \
-    DF_BIN="$T/bin/df" DU_BIN="$T/bin/du" \
+    DF_BIN="$T/bin/df" DU_BIN="$T/bin/du" REAP_VENV_FREE_FLOOR_MB=2048 \
     REAP_VENV_LOG="$T/reap-real.log" bash "$REAPER" "$@" 2>&1
 }
 
@@ -508,6 +514,15 @@ if grep -qF 'any env it could not prove dead was kept (it fails closed)' "$SUP";
 else
   bad "cloud-cell-supervisor.sh lost its fail-closed message for genuine aborts"
 fi
+# ⛔ rc=4 IS NOT FAIL-CLOSED EITHER (review of PR #1949): the reaper exits 4 when a removal was ATTEMPTED
+# and FAILED — the env was PROVEN dead and the delete did not happen — which is the opposite of "kept
+# because it could not prove it dead". Left in the catch-all arm it sent an operator hunting a live-lane
+# witness that never existed. Pin the distinct arm; the fail-closed wording must remain for rc=3 only.
+if grep -qF 'a lane-venv removal FAILED (rc=4)' "$SUP"; then
+  ok "cloud-cell-supervisor.sh names rc=4 as a FAILED removal, not as a fail-closed keep"
+else
+  bad "cloud-cell-supervisor.sh describes rc=4 as 'kept (it fails closed)' — the opposite of what happened"
+fi
 
 echo "── G. the uv download cache is untouchable ──────────────────────────────────────────"
 assert_not_contains "$(cat "$REAPER")" ".cache/uv" "the reaper names no uv cache path"
@@ -534,7 +549,8 @@ run_cap() {
         case "$1" in *=*) envs+=("$1"); shift ;; *) break ;; esac
     done
     PS_BIN="$T/bin/ps" LSOF_BIN="$T/bin/lsof" TMUX_BIN="$T/bin/tmux" \
-    DF_BIN="$T/bin/df" DU_BIN="$T/bin/du" REAP_VENV_LOG="$T/reap-cap.log" \
+    DF_BIN="$T/bin/df" DU_BIN="$T/bin/du" REAP_VENV_FREE_FLOOR_MB=2048 \
+    REAP_VENV_LOG="$T/reap-cap.log" \
     env "${envs[@]}" bash "$REAPER" "$@" 2>&1
 }
 
@@ -614,6 +630,25 @@ absent "$W_H_DEAD/.venv" "the dead env is gone"
 exists "$W_H_LIVE1/.venv" "the live envs are untouched"
 exists "$W_H_LIVE2/.venv" "the live envs are untouched"
 
+echo " H7 a FLOOR BREACH is still AUDITED when a removal also failed (exit 4 must not hide it)"
+# The severity order (3 abort > 4 removal failed > 5 over-bound) means exit 4 PREEMPTS exit 5. The
+# `over-bound` audit row used to live INSIDE the `exit 5` arm (review of PR #1949), so a pass that both
+# failed a removal AND ended below the floor wrote NO audit row at all: the one degraded shape had no
+# breach record, which is a silent breach. The EXIT CODE order is unchanged — only the record survives.
+# Separate fixture repo so the failing rm cannot disturb §H's sizes/assertions.
+RH7="$(newrepo h7)"
+W_H7_DEAD="$(mkwt "$RH7" dead7)"
+: > "$T/tmux-h7.tsv"          # exists and is empty = a KNOWN zero panes, not a probe failure
+printf '#!/bin/sh\nexit 1\n' > "$T/bin/rm-fail"; chmod +x "$T/bin/rm-fail"
+out="$(run_cap FAKE_TMUX_TABLE="$T/tmux-h7.tsv" FAKE_DF_FREE_KB=524288 RM_BIN="$T/bin/rm-fail" REAP_VENV_DRY_RUN=0 REAP_VENV_LOG="$T/reap-h7.log" --gc --repo "$RH7" --apply)"; rc=$?
+assert_eq "$rc" "4" "a FAILED removal still exits 4 — it outranks the breach, and that order is unchanged"
+assert_contains "$out" "floor_ok=no" "the breach is still asserted and printed on the degraded pass"
+# ⛔ A DEDICATED LOG, because `log()` APPENDS: reading the shared `reap-cap.log` here would find H2's
+# `over-bound` row and the pin would pass with the fix reverted — the exact vacuous-pin mode this suite
+# refuses (review of PR #1949).
+assert_eq "$(grep -c "^over-bound" "$T/reap-h7.log")" "1" "exactly ONE over-bound row — the pin cannot be satisfied by another pass's appended row"
+assert_contains "$out" "REMOVE-FAILED" "the removal failure is named, so the two facts are both on the record"
+
 echo "── I. the probe watchdog must not delete the parent's scratch dir ──────────────"
 # MEASURED DEFECT (pre-existing, found while re-running this suite on a loaded cell): `cleanup` is an
 # EXIT trap and `run_bounded`'s watchdog subshell INHERITS it, so when the parent TERMs the watchdog
@@ -644,10 +679,33 @@ fi
 # the one pin that still protects a bash-3.2 box, where the BASHPID guard cannot fire (BASHPID is unset,
 # so the guarded test is false and cleanup() proceeds in a child). Measured: deleting the real line left
 # this pin green. The comment filter is what makes it discriminating.
-if [ -n "$(awk '!/^[[:space:]]*#/ && /trap - EXIT/{c=NR} !/^[[:space:]]*#/ && /trap .kill "\$s"/{t=NR} END{if (c && t && c < t) print "ok"}' "$REAPER")" ]; then
+# ⛔ FIRST-OCCURRENCE, NOT LAST (review of PR #1949): `c=NR` overwrote on EVERY match, so `c` held the
+# LAST `trap - EXIT` in the file. That worked only while the file had exactly one — and the removal
+# subshell fix added a SECOND one (in `remove_one`, which sorts AFTER the watchdog's kill-trap), so the
+# comparison `c < t` went permanently false and this pin read RED on a correct reaper (measured: c=720,
+# t=348). A pin whose verdict depends on the file having one instance of a line the codebase is
+# encouraged to add more of is measuring file layout, not the watchdog. `&& !c` / `&& !t` scope it to
+# the FIRST of each, which is the watchdog block this pin names. The count pin below then keeps that
+# scope explicit, so a third site cannot silently re-point it again.
+if [ -n "$(awk '!/^[[:space:]]*#/ && /trap - EXIT/ && !c {c=NR} !/^[[:space:]]*#/ && /trap .kill "\$s"/ && !t {t=NR} END{if (c && t && c < t) print "ok"}' "$REAPER")" ]; then
   ok "the watchdog subshell clears the inherited EXIT trap before it arms its own (non-comment line)"
 else
   bad "the watchdog subshell inherits cleanup() — it deletes the parent's scratch dir on every probe"
+fi
+# Two non-comment `trap - EXIT` sites and no more: the watchdog and the removal subshell. Pinned as a
+# COUNT so the first-occurrence scoping above cannot be re-pointed by a future third site.
+assert_eq "$(awk '!/^[[:space:]]*#/ && /trap - EXIT/{n++} END{print n+0}' "$REAPER")" "2" \
+  "exactly TWO non-comment 'trap - EXIT' sites (watchdog + removal subshell) — no more, no fewer"
+# ⛔ THE SAME RULE FOR THE REMOVAL SUBSHELL (review of PR #1949): `remove_one` runs its ONE `rm -rf` in a
+# `( … )` subshell. On bash 3.2 — exactly the bash where cleanup()'s BASHPID guard is INERT, because
+# BASHPID does not exist there — that subshell inherits `cleanup` and deletes the SHARED `$SCRATCH`
+# MID-PASS: `$out` vanishes, so every removal AFTER the first reads `REMOVE-FAILED … rc=1` and the pass
+# exits 4, reporting a reap that failed on a healthy box. The watchdog's `trap - EXIT` does NOT cover
+# this one, so pin the subshell LINE ITSELF rather than any occurrence in the file.
+if grep -qE '^[[:space:]]*if \( ?trap - EXIT; ?cd ' "$REAPER"; then
+  ok "the removal subshell clears the inherited EXIT trap too (covers bash 3.2, where the guard is inert)"
+else
+  bad "the removal subshell inherits cleanup() — on bash 3.2 it deletes the parent's scratch dir mid-pass"
 fi
 # Behavioural smoke check (NOT the discriminator): a SLOW probe arms the watchdog on every pass, which
 # is the shape the race was seen in. ⚠️ Honest scope (review of PR #1949): on bash >= 5 a `( … ) &`

@@ -118,17 +118,20 @@ capacity: lanes_live=K lane_venv_max=M MB free_after=F MB floor=L MB floor_ok=ye
 
 | field | kind | meaning |
 |---|---|---|
-| `lanes_live` | MEASURED | lane worktrees this pass found a live holder for (the venvs about to be re-synced) |
-| `lane_venv_max` | MEASURED | the LARGEST lane env this pass saw — the worst case, never the mean |
+| `lanes_live` | MEASURED | lane **envs** this pass KEPT because a live holder was found — a count of retained envs, **not** of worktrees: a live worktree with no `.venv` yet produces no row and is not counted |
+| `lane_venv_max` | MEASURED | the LARGEST lane env this pass saw — the worst case, never the mean. Its representativeness is only as good as the sample: a PARTIALLY-synced env is small and inflates `lanes_headroom`. The divisor is printed so a reader can reject the quotient |
 | `free_after` | MEASURED | filesystem free space after the pass |
 | `floor` | STATED | `REAP_VENV_FREE_FLOOR_MB` (default 2048 = one measured lane env, ~1.85 GB) |
-| `floor_ok` | ASSERTED | `yes` / `no` / `unknown`. **`unknown` is not a pass** — a `df` that cannot answer is never read as "enough" |
+| `floor_ok` | ASSERTED | `yes` / `no` / `unknown`. **`unknown` is never read as satisfied** — a `df` that cannot answer is never read as "enough", and the line names it and names why. It does **not** change the exit code: an unmeasurable `df` is not evidence of a *breach* (that is `no`, which exits 5). **Read `floor_ok`, never the pass's rc, as the floor verdict** |
 | `lanes_headroom` | DERIVED | `(free_after - floor) / lane_venv_max`, floored at 0; `?` when an input is unreadable — never a fabricated number |
 
-A pass that ends **below the floor exits 5**. It **asserts, it does not reclaim**: the reaper never
-deletes a live lane's env to get back above the floor. The floor is registered in the `#1068` declared
-surface (`hygiene` axis, and in `OUT_OF_FAMILY_TERMS` because `_MB` is not a bound suffix — the reverse
-scan cannot see the name on its own).
+A pass that ends **below the floor exits 5** — **unless a removal also FAILED, in which case it exits 4**
+(the severity order is 3 abort > 4 removal failed > 5 over-bound). The capacity line still reads
+`floor_ok=no` and the `over-bound` log row is still written **before** that branch, so a degraded pass
+never hides the breach; only the process exit code is 4. It **asserts, it does not reclaim**: the reaper
+never deletes a live lane's env to get back above the floor. The floor is registered in the `#1068`
+declared surface (`hygiene` axis, and in `OUT_OF_FAMILY_TERMS` because `_MB` is not a bound suffix — the
+reverse scan cannot see the name on its own).
 
 ⛔ **Exit 5 is NOT yet surfaced by the fleet entry point — measured, not assumed.** An earlier draft of
 this doc claimed `disk-reaper.sh` "already maps 5 to `over-bound`, so the fleet entry point reports it".

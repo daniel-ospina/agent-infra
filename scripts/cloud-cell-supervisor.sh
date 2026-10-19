@@ -2137,6 +2137,12 @@ reclaim_lane_venvs() {
   bash "$reaper" --gc --repo "$repo" --apply || rc=$?
   case "$rc" in
     0) ;;
+    # ⛔ rc=4 is NOT the fail-closed case either (review of PR #1949): the reaper exits 4 when a removal
+    # was ATTEMPTED and FAILED (`[ "$FAILED" -gt 0 ] && exit 4`), i.e. the env was PROVEN dead and the
+    # delete did not happen. Routing it to the "could not prove dead … it fails closed" arm told an
+    # operator the opposite of what happened, and sent them hunting a live-lane witness that did not
+    # exist. Name the actual condition; the fail-closed arm keeps rc=3 (the only fail-closed code).
+    4) say "prune: warn: a lane-venv removal FAILED (rc=4) — the env was proven dead but could not be deleted; see the reaper's REMOVE-FAILED lines (it did NOT keep it because it could not prove it dead)" ;;
     5) say "prune: warn: free disk is BELOW REAP_VENV_FREE_FLOOR_MB after the lane-venv pass — the reap completed, but a lane starting now can fill the disk (rc=5; see the reaper's capacity line)" ;;
     *) say "prune: warn: the lane-venv reaper exited $rc — any env it could not prove dead was kept (it fails closed)" ;;
   esac

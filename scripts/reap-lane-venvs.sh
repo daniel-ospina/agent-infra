@@ -62,18 +62,28 @@
 # CAPACITY, AND A STATED FLOOR (the acceptance test on #1932, from the review of PR #1949): "a box can
 # run N lanes without free disk falling below a stated floor — N measured, floor asserted, both printed
 # by the reaper". So every pass prints ONE capacity line:
-#   * `lanes_live=K`   MEASURED: how many lane worktrees this pass found a LIVE holder for. Every lane
-#                      on this box is one `uv sync` away from ~1.85 GB of real, non-shared disk
-#                      (measured: two lanes consumed 3.7 GB), so K is the term that says how many
-#                      venvs are about to arrive.
+#   * `lanes_live=K`   MEASURED: how many lane ENVS this pass KEPT because a live holder was found.
+#                      ⛔ It is a count of retained envs, NOT of worktrees (review of PR #1949): a live
+#                      worktree with no `.venv` yet produces no row at all (classify() returns early),
+#                      so it is not counted even though it is about to `uv sync` ~1.85 GB of real,
+#                      non-shared disk (measured: two lanes consumed 3.7 GB). Read K as "envs still on
+#                      disk because someone is using them", never as "lanes on this box".
 #   * `lane_venv_max=M` MEASURED: the LARGEST lane env this pass saw. The headroom below uses the
 #                      worst case, never the mean — a byte budget built on the average env is the same
 #                      error as a `du` figure built on the assumption that hardlinked blocks are free.
+#                      ⛔ Its representative is only as good as the sample: a PARTIALLY-synced env (a
+#                      `uv sync` in progress — the case `venv_newest_mtime` explicitly expects) is
+#                      small, and dividing by it over-states headroom by orders of magnitude. The
+#                      divisor is printed on the line so a reader can reject the quotient; it is an
+#                      input, not a verdict.
 #   * `free_after=F`   MEASURED: filesystem free space after the pass.
 #   * `floor=L`        STATED: `REAP_VENV_FREE_FLOOR_MB` (default 2048 = one measured lane env, so the
 #                      box can always start another lane).
-#   * `floor_ok=`      ASSERTED: `yes` | `no` | `unknown`. `unknown` is NOT a pass — a `df` that cannot
-#                      answer must never read as "enough", so the line says so and names why.
+#   * `floor_ok=`      ASSERTED: `yes` | `no` | `unknown`. `unknown` is NEVER READ AS SATISFIED — a `df`
+#                      that cannot answer must never read as "enough", so the line says so and names
+#                      why. It does NOT change the exit code: an unmeasurable `df` is not evidence of a
+#                      BREACH (that is the `no` verdict, which exits 5). Do not read the pass's rc as a
+#                      floor verdict — read `floor_ok`.
 #   * `lanes_headroom=N` DERIVED: how many MORE lane envs fit before free space reaches the floor,
 #                      i.e. `(free_after - floor) / lane_venv_max`, floored at 0. `?` when either input
 #                      is unknown — never a fabricated number.
@@ -282,8 +292,16 @@ cleanup() {
     # EXIT trap ABORTS THE REST OF THE TRAP (measured: the watchdog kill loop and the scratch removal
     # below would never run, leaking a scratch dir per pass). So test only what can be POSITIVELY known:
     # skip when BASHPID EXISTS and differs from `$$`. With no BASHPID the pre-#1932 behaviour is
-    # restored, which is what a 3.2 box had before and is safe — a child that cannot be identified must
-    # not be assumed to be one.
+    # restored, which is what a 3.2 box had before and leaks nothing new — a child that cannot be
+    # identified must not be assumed to be one.
+    #
+    # ⛔ THE GUARD IS INERT ON 3.2 BY CONSTRUCTION, AND THAT IS WHY EVERY DESTRUCTIVE SUBSHELL ALSO
+    # CLEARS THE TRAP (review of PR #1949): where BASHPID does not exist, no child can be identified and
+    # this test cannot fire — so the guard CANNOT be the fix on the very bash that has the problem. The
+    # load-bearing half is `trap - EXIT` inside the subshells whose exit must not run this function (the
+    # watchdog at run_bounded(), and the removal subshell in remove_one()); this guard is the redundant
+    # second half on bash >= 4. Removing the trap resets nothing on a bash that never ran an inherited
+    # EXIT trap anyway — it is the only line that covers 3.2.
     if [ -n "${BASHPID:-}" ] && [ "$BASHPID" != "$$" ]; then return 0; fi
     for w in $WATCHDOGS; do kill -TERM "$w" 2>/dev/null; done
     WATCHDOGS=""
@@ -693,7 +711,13 @@ remove_one() {
         return 2
     fi
     out="$(bound_file rmout)" || { say "SKIP $canon/.venv — no scratch dir"; return 1; }
-    if ( cd "$canon" 2>/dev/null && [ "$(pwd -P)" = "$canon" ] && run_bounded "$REAP_VENV_REMOVE_TIMEOUT" "$out" "$RM_BIN" -rf -- .venv ); then
+    # ⛔ THE REMOVAL SUBSHELL MUST NOT INHERIT THE EXIT TRAP EITHER (review of PR #1949): `cleanup`
+    # deletes the SHARED `$SCRATCH`, and on a bash that runs an inherited EXIT trap in a subshell (3.2 —
+    # exactly the bash where cleanup()'s BASHPID guard cannot fire) that would delete the parent's
+    # scratch dir MID-PASS: `$out` vanishes, so every removal AFTER the first reads
+    # `REMOVE-FAILED ... rc=1` and the pass exits 4 reporting a reap that failed. `trap - EXIT` here is
+    # the half that covers 3.2; the BASHPID guard in cleanup() is the redundant half on bash >= 4.
+    if ( trap - EXIT; cd "$canon" 2>/dev/null && [ "$(pwd -P)" = "$canon" ] && run_bounded "$REAP_VENV_REMOVE_TIMEOUT" "$out" "$RM_BIN" -rf -- .venv ); then
         rc=0
     else
         rc=$?
@@ -939,12 +963,19 @@ main() {
     # so the fleet entry point's worst-code rule keeps the most severe verdict instead of this pass
     # inventing a second ordering. (disk-reaper.sh currently DROPS 5 rather than keeping it — see the
     # header note; that gap is tracked, and this ordering is what the fix will read.)
-    [ "$FAILED" -gt 0 ] && exit 4
+    #
+    # ⛔ THE BREACH IS NAMED AND LOGGED BEFORE THE LADDER, NOT INSIDE THE `exit 5` ARM (review of PR
+    # #1949): when a removal ALSO failed, exit 4 preempts exit 5, and the old placement meant the
+    # `over-bound` audit row was never written — so the one pass shape where the floor is breached AND
+    # the pass is already degraded was the one shape with no audit record of the breach. A breach an
+    # operator cannot find because a removal failed first is a silent breach. The EXIT CODE order is
+    # unchanged (4 still wins); only the record's survival is fixed.
     if [ "$CAPACITY_FLOOR_OK" = "no" ]; then
-        say "[$SCRIPT_NAME] ⛔ free space is BELOW the stated floor: a lane starting now can fill the disk. Refusing nothing — a live lane's env is never deleted to make room (exit 5)"
+        say "[$SCRIPT_NAME] ⛔ free space is BELOW the stated floor: a lane starting now can fill the disk. Refusing nothing — a live lane's env is never deleted to make room (exit 5, or exit 4 if a removal also failed — a failed removal outranks a breach)"
         log "over-bound\tfree_below_floor_mb=${CAPACITY_FLOOR_MB:-$REAP_VENV_FREE_FLOOR_MB}"
-        exit 5
     fi
+    [ "$FAILED" -gt 0 ] && exit 4
+    [ "$CAPACITY_FLOOR_OK" = "no" ] && exit 5
     exit 0
 }
 
