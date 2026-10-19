@@ -543,6 +543,27 @@ else
 fi
 inst_mac --uninstall >/dev/null 2>&1
 
+# ── T8k: an empty HOME must be refused at install, and must not abort the read-only verbs ──
+# `{{HOME}}` is the rendered job's `Environment=HOME=`: installing with it empty schedules a job that
+# fails closed every hour while `--status` says "scheduled".
+OUT="$(env -u HOME DISK_REAPER="$PASSFILE" DISK_REAPER_REPOS="$REPO" DISK_REAPER_PLATFORM=linux \
+    DISK_REAPER_STATE_DIR="$T/state-k" SYSTEMD_SYSTEM_DIR="$T/sys-k" SUDO="" \
+    SYSTEMCTL="$T/bin/systemctl" SYSTEMCTL_CALLS="$T/systemctl.log" bash "$INST" --install --preview 2>&1)"; RC=$?
+assert_eq "$RC" "2" "T8k --install with HOME empty is REFUSED (rc 2), not rendered with an empty Environment"
+assert_contains "$OUT" "Environment=HOME would be empty" "T8k …naming the reason it would fail"
+printf '#!/bin/bash\nexit 1\n' > "$T/bin/sudo-fail"; chmod +x "$T/bin/sudo-fail"
+OUT="$(env -u HOME DISK_REAPER="$PASSFILE" DISK_REAPER_REPOS="$REPO" DISK_REAPER_PLATFORM=linux \
+    DISK_REAPER_STATE_DIR="$T/state-k" SYSTEMD_SYSTEM_DIR="$T/sys-k" SUDO="$T/bin/sudo-fail" \
+    SYSTEMCTL_USER="$T/bin/systemctl-user" SYSTEMCTL_USER_CALLS="$T/systemctl-user.log" \
+    bash "$INST" --status 2>&1)"; RC=$?
+assert_absent "$OUT" "unbound variable" "T8k --status with HOME empty (dead sudo, live user manager) does not abort"
+# …and it must reach the REPORTING stage. rc 1 here is the honest answer (nothing is installed under
+# this fresh state dir); what must never happen is an abort that answers nothing at all, which is what
+# an unbound `$HOME` mid-list produced.
+assert_contains "$OUT" "installed=" "T8k …and it reached the report (an abort answers nothing)"
+assert_eq "$RC" "1" "T8k …reporting NOT scheduled (rc 1), which is the truth for an empty state dir"
+rm -rf "$T/state-k" "$T/sys-k"
+
 echo "── T9. static pins: no deletion rule here, and no sysadm-only shortcut ──"
 # Every recursive delete must be of a MKTEMP dir this script created ($tmp/$tmpd), never a path it was
 # pointed at — an installer that cleans up its own scratch space is fine; one that deletes a unit dir or
@@ -780,6 +801,15 @@ HOME="$DEFHOME" DISK_REAPER="$PASSFILE" DISK_REAPER_REPOS="$REPO" DISK_REAPER_PL
 DEF_PLIST="$DEFHOME/Library/LaunchAgents/com.eldato.disk-reaper.plist"
 assert_file "$DEF_PLIST" "T8j the default dir holds the installed plist"
 SEAM_DIR="$T/agents-j"; mkdir -p "$SEAM_DIR"
+# ⛔ THE STEP THAT MAKES THIS TEST MEAN ANYTHING: re-install THROUGH THE SEAM, so the stamp records the
+# seam and the default-dir plist is reachable ONLY through the default-dir candidate. Without it the
+# uninstall finds the plist via `recorded_dir` and the whole assertion is vacuous (#2048 review, BLOCK).
+HOME="$DEFHOME" DISK_REAPER="$PASSFILE" DISK_REAPER_REPOS="$REPO" DISK_REAPER_PLATFORM=darwin \
+    DISK_REAPER_STATE_DIR="$T/state-j" DISK_REAPER_AGENTS_DIR="$SEAM_DIR" LAUNCHCTL="$T/bin/launchctl" \
+    LAUNCHD_DOMAIN="gui/999" DISK_REAPER_PYTHON="$T/bin/fakepython" ELDATO_ALLOW_TEST_HOME=1 \
+    bash "$INST" --install >/dev/null 2>&1
+assert_contains "$(sed -n 's/^dir=//p' "$T/state-j/disk-reaper.schedule")" "$SEAM_DIR" \
+    "T8j …the seam re-install MOVED the recorded dir off the default"
 HOME="$DEFHOME" DISK_REAPER="$PASSFILE" DISK_REAPER_REPOS="$REPO" DISK_REAPER_PLATFORM=darwin \
     DISK_REAPER_STATE_DIR="$T/state-j" DISK_REAPER_AGENTS_DIR="$SEAM_DIR" LAUNCHCTL="$T/bin/launchctl" \
     LAUNCHD_DOMAIN="gui/999" DISK_REAPER_PYTHON="$T/bin/fakepython" ELDATO_ALLOW_TEST_HOME=1 \

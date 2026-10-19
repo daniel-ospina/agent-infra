@@ -971,8 +971,17 @@ ld_uninstall() {
     # removed nor read back: `uninstalled`, exit 0, plist survives, and launchd re-loads it (armed) at
     # the next login. The systemd sibling already enumerates every reachable dir; this is the same rule.
     default_dir="${HOME:-}/Library/LaunchAgents"
+    # …and the AUTHORITATIVE answer, when launchd will give it: `launchctl print` reports the loaded
+    # job's own `path = …`. Guessing directories can never cover a seam the current invocation does not
+    # know about (a different state dir, or a stamp whose write failed — a warned, supported
+    # degradation), and that gap reported "uninstalled" over a surviving, still-loaded, armed plist
+    # (#2048 review, follow-up).
+    loaded_path=""
+    loaded_path="$($LC print "$LD_DOMAIN/$LABEL" 2>/dev/null | sed -n 's/^[[:space:]]*path = //p' | head -1)"
+    loaded_dir=""
+    [ -n "$loaded_path" ] && loaded_dir="$(dirname "$loaded_path")"
     plist_dirs=("$LD_DIR")
-    for _cand in "$live_dir" "$default_dir"; do
+    for _cand in "$live_dir" "$default_dir" "$loaded_dir"; do
         [ -n "$_cand" ] || continue
         case " ${plist_dirs[*]} " in *" $_cand "*) continue ;; esac
         plist_dirs+=("$_cand")
@@ -1080,6 +1089,17 @@ done
 if [ "$MODE" = "--uninstall" ] && [ "${MODE_EXPLICIT:-0}" = 1 ]; then
     err "--uninstall does not take a mode flag: '${MODE_FLAG}' describes how the JOB would run, not whether to remove it."
     err "       To see what would be removed without changing anything, use --uninstall --preview."
+    exit 2
+fi
+
+# ⛔ AN EMPTY HOME RENDERS A JOB THAT CANNOT REAP (#2048 review, follow-up). `{{HOME}}` is the job's
+# `Environment=HOME=`, not decoration: with it empty, every scheduled pass fails closed on its lock and
+# cache paths (`cannot create the lock directory (/.pi/agent/state)`) while `--status` still reports the
+# box as scheduled — a false PASS on the one question the verb exists to answer. Refuse at INSTALL time
+# instead; `--status`/`--uninstall` stay usable without HOME because they must be able to clean up.
+if [ -z "${HOME:-}" ] && { [ "$MODE" = "--install" ] || [ "${PREVIEW:-0}" = "1" ]; }; then
+    err "HOME is empty: the rendered job's Environment=HOME would be empty and every scheduled pass would fail closed."
+    err "       Set HOME (or provision a real home for this account) and re-run — --status/--uninstall still work without it."
     exit 2
 fi
 
