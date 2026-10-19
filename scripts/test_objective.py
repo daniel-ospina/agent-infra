@@ -787,7 +787,10 @@ def test_the_resample_bounds_the_READ_itself_not_only_its_count(monkeypatch):
     monkeypatch.setattr(objective, "_gh_retry", spy)
     objective.build()
     assert len(calls) >= 2, calls
-    assert calls[0] == {}, calls[0]                       # first read: full transport resilience
+    # ⛔ THE FIRST READ NOW CARRIES A DEADLINE TOO (#2138 r4, A). `_gh_retry(argv)` with its
+    # defaults is 3 attempts x a 120 s timeout -- the one read the trick depends on was the only
+    # unbounded thing in the tick. Full transport resilience stays; it is just priced.
+    assert set(calls[0]) == {"deadline"} and calls[0]["deadline"] is not None, calls[0]
     for kw in calls[1:]:
         assert kw.get("attempts") == 1, kw
         assert 0 < kw.get("timeout", 0) <= objective.QUEUE_BLIND_BUDGET_S, kw
@@ -1632,11 +1635,10 @@ def test_a_refusal_that_ate_the_tick_gets_NO_socket_and_the_line_still_prints(mo
     opened = []
     monkeypatch.setattr(objective, "_rest_get",
                         lambda *a, **k: opened.append(a) or (_ for _ in ()).throw(OSError("no")))
-    real_retry = objective._gh_retry
 
     def slow_refusal(argv, **kw):
         clock["t"] += objective.QUEUE_READ_MAX_S + 30      # the retried refusal ate the tick
-        return real_retry(argv, **kw)
+        return REST_REFUSED
 
     monkeypatch.setattr(objective, "_gh_retry", slow_refusal)
     line = objective.build()
@@ -1742,3 +1744,115 @@ def test_a_malformed_rest_row_is_a_NAMED_failure_not_an_unattributed_blindness(m
     monkeypatch.setattr(objective, "_rest_get", lambda *a, **k: ["oops"])
     assert objective._queue_rest() is None
     assert "non-object element" in objective.GH_LAST_ERROR, objective.GH_LAST_ERROR
+
+
+def test_the_PRIMARY_read_is_bounded_by_the_reads_own_cap(monkeypatch):
+    """⛔ THE CAP MUST COVER THE READ THE TRICK DEPENDS ON (#2138 r4, A/P2).
+
+    `QUEUE_READ_MAX_S` was applied only to the fallback, while the primary ran `_gh_retry(argv)`
+    with `attempts=3, timeout=120`: a retrying 5xx could spend 360 s and be killed by
+    `run_bounded 90`, writing NO line — the exact outcome the constant exists to prevent. The
+    retry policy survives; it is priced inside the read's budget.
+    """
+    clock = {"t": 1000.0, "timeouts": [], "sleeps": []}
+    monkeypatch.setattr(objective, "_monotonic", lambda: clock["t"])
+    monkeypatch.setattr(objective, "_sleep", lambda s: (clock.update(t=clock["t"] + s),
+                                                        clock["sleeps"].append(s)))
+
+    def run(argv, **kw):
+        clock["timeouts"].append(kw["timeout"])
+        clock["t"] += min(kw["timeout"], 20.0)          # each attempt runs long
+        return _Result(1, "", "HTTP 504: Server Error")
+
+    monkeypatch.setattr(objective.subprocess, "run", run)
+    monkeypatch.setattr(objective, "GH_LAYER_ENV", None)
+    deadline = 1045.0                                   # 45 s of budget, from t=1000
+    r = objective._gh_retry(["gh", "pr", "list"], deadline=deadline)
+    assert r.returncode == 1
+
+    # Every attempt was clipped to what was LEFT of the budget, and the whole policy fit inside it.
+    assert clock["timeouts"] and all(t <= 45.0 for t in clock["timeouts"]), clock["timeouts"]
+    assert clock["t"] <= deadline, clock
+    # ...and it never SLEEPS past the budget either.
+    assert all(s <= 45.0 for s in clock["sleeps"]), clock["sleeps"]
+
+
+def test_a_PRIMARY_TIMEOUT_raise_still_consults_the_second_source(monkeypatch):
+    """⛔ A RAISE IS A FAILED PRIMARY READ, NOT A REASON TO SKIP REST (#2138 r4, A/P2).
+
+    `subprocess.run` RAISES `TimeoutExpired` rather than returning rc!=0, so the class of failure
+    most likely under the bound never reached `_queue_rest`: the line printed `queue=UNREADABLE`
+    while REST was healthy — the fallback inert in the case it exists for. The suite could not see
+    it because the test pinning that shape installs `rest_prs=None` ("no second source").
+    """
+    install(monkeypatch, rest_prs=[_rest_row(1, "blocked")])
+
+    def boom(argv, **kw):
+        raise objective.subprocess.TimeoutExpired(cmd=argv, timeout=30)
+
+    monkeypatch.setattr(objective, "_gh_retry", boom)
+    line = objective.build()
+    assert "queue=UNREADABLE" not in line, line
+    assert "nondraft=1" in line, line
+
+    # ...and when BOTH fail, the raise is still reported as a named, ATTRIBUTED blindness.
+    install(monkeypatch, rest_prs=None)
+    monkeypatch.setattr(objective, "_gh_retry", boom)
+    line = objective.build()
+    assert "queue=UNREADABLE" in line, line
+    assert "gh=" in line, line
+
+
+def test_a_refused_RE_READ_does_not_re_source_the_list_over_REST(monkeypatch):
+    """⛔ THE PROVENANCE MUST NAME THE REFUSAL THAT HAPPENED (#2138 r4, A/P3).
+
+    The fallback also fired when a RE-sample was refused, so the line printed "the open-PR list was
+    read over REST because the GraphQL read was refused" on a tick whose FIRST read ANSWERED — and
+    it re-read a list that was already in hand, against `_queue_read_is_blind()`'s own rule that a
+    REST sample is not re-sampled.
+    """
+    install(monkeypatch, pr_list=[_Result(0, _blind_prs(14)), REST_REFUSED],
+            rest_prs=[_rest_row(1, "blocked")])
+    opened = []
+    monkeypatch.setattr(objective, "_rest_get",
+                        lambda *a, **k: (opened.append(a), [])[1])
+    line = objective.build()
+    assert opened == [], opened                 # the second source was never consulted
+    assert "REST" not in line, line             # ...and the line does not claim it was
+
+
+def test_the_ACTIVE_accounts_token_wins_in_a_multi_account_hosts_yml(tmp_path, monkeypatch):
+    """⛔ A NESTED `users:` TOKEN IS NOT THE ACTIVE CREDENTIAL (#2138 r4, A/P3).
+
+    gh writes alternates under `users:<login>:oauth_token` ABOVE the active account's keys. Taking
+    the first `oauth_token` in the block returned a DIFFERENT identity's credential, so the REST
+    read ran as the wrong user — visible only as a failed fallback. Depth 1 is the active account.
+    """
+    hosts = tmp_path / "hosts.yml"
+    hosts.write_text(
+        "github.com:\n"
+        "    user: bob\n"
+        "    users:\n"
+        "        alice:\n"
+        "            oauth_token: gho_alice\n"
+        "        bob:\n"
+        "            oauth_token: gho_bob_nested\n"
+        "    oauth_token: gho_bob_active\n"
+        "    git_protocol: https\n")
+    monkeypatch.delenv("GH_CONFIG_DIR", raising=False)
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    for var in ("GH_TOKEN", "GITHUB_TOKEN", "GH_HOST"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(objective, "GH_HOSTS", str(hosts))
+    assert objective._gh_token() == "gho_bob_active"        # NOT gho_alice
+
+    # gh sometimes writes only the per-user form: then the ACTIVE user's entry is used.
+    hosts.write_text(
+        "github.com:\n"
+        "    user: bob\n"
+        "    users:\n"
+        "        alice:\n"
+        "            oauth_token: gho_alice\n"
+        "        bob:\n"
+        "            oauth_token: gho_bob_nested\n")
+    assert objective._gh_token() == "gho_bob_nested"

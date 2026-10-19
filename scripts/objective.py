@@ -563,7 +563,7 @@ def _monotonic():
     return time.monotonic()
 
 
-def _gh_retry(argv, attempts=3, timeout=120):
+def _gh_retry(argv, attempts=3, timeout=120, deadline=None):
     """A transient 5xx from GitHub is NOT fleet blindness.
 
     MEASURED 2026-10-03 16:53: the heartbeat reported `main=UNKNOWN@? gh=UNREADABLE(queue)
@@ -580,7 +580,21 @@ def _gh_retry(argv, attempts=3, timeout=120):
     """
     last = None
     for i in range(attempts):
-        last = subprocess.run(argv, capture_output=True, text=True, timeout=timeout,
+        # ⛔ `deadline` BOUNDS THE WHOLE RETRY POLICY, NOT JUST ONE ATTEMPT (#2138 r4, A). The
+        # queue read's cap covers the read the fleet depends on -- but a retrying 5xx could spend
+        # `attempts x timeout` (3 x 120 s) and be killed by `run_bounded 90`, writing NO line at
+        # all. With a deadline, each attempt's timeout is clipped to what is left of it and the
+        # backoff sleep is clipped too, so retries still happen (the resilience this function
+        # exists for) inside a bound the caller can price into the tick.
+        tmo = timeout
+        if deadline is not None:
+            left = deadline - _monotonic()
+            if left < 1.0:
+                if last is not None:
+                    return last
+                raise TimeoutError("gh read: the read's budget was spent before the call")
+            tmo = min(timeout, left)
+        last = subprocess.run(argv, capture_output=True, text=True, timeout=tmo,
                               env={**os.environ, **GH_LAYER_ENV} if GH_LAYER_ENV else None)
         if last.returncode == 0:
             return last
@@ -590,7 +604,12 @@ def _gh_retry(argv, attempts=3, timeout=120):
             "timed out", "timeout", "503", "504", "try again", "temporarily unavailable"))
         if not transient or i == attempts - 1:
             return last
-        _sleep(2 * (i + 1))
+        # The backoff is clipped AT SLEEP TIME, not before the attempt: the attempt itself just
+        # spent real time, so a nap priced from the pre-call clock could overrun the budget.
+        nap = 2 * (i + 1)
+        if deadline is not None:
+            nap = min(nap, max(0.0, deadline - _monotonic()))
+        _sleep(nap)
     return last
 
 
@@ -1149,6 +1168,14 @@ def _gh_token():
     an `GH_TOKEN` scoped by `GH_HOST` to an enterprise host) is not a fallback — presenting it to
     api.github.com would hand a foreign credential to the wrong service. No token ⇒ `""`, and the
     caller makes no request at all.
+
+    ⛔ AND ONLY THE ACTIVE ACCOUNT'S TOKEN (#2138 r4, A). A multi-account `hosts.yml` nests other
+    logins under `users:<login>:oauth_token` ABOVE the active account's own keys, so taking the
+    first `oauth_token` inside the block returns a DIFFERENT identity's credential — the REST read
+    then runs as somebody else and fails, or acts as the wrong user, while every line of it looked
+    right. gh's own layout puts the active account's token at the block's TOP level (depth 1) and
+    the alternates deeper, so only depth 1 is accepted; if gh wrote only the `users:` form, the
+    entry named by the block's own `user:` key is used.
     """
     if (os.environ.get("GH_HOST") or "github.com").strip().lower() == "github.com":
         for var in ("GH_TOKEN", "GITHUB_TOKEN"):
@@ -1157,21 +1184,42 @@ def _gh_token():
                 return tok
     try:
         host = None
+        depth = 0                    # indent width of the FIRST key inside the host block
+        active_user = None
+        user_tokens = {}             # login -> token, from the nested `users:` entries
+        nested_login = None
         with open(_gh_hosts_path()) as fh:
-            for line in fh:
-                if not line.strip() or line.lstrip().startswith("#"):
+            for raw in fh:
+                if not raw.strip() or raw.lstrip().startswith("#"):
                     continue
-                if not line[0].isspace():              # `github.com:` -- a new host block
-                    host = line.split(":", 1)[0].strip()
+                if not raw[0].isspace():              # `github.com:` -- a new host block
+                    host = raw.split(":", 1)[0].strip()
+                    depth, active_user, nested_login = 0, None, None
                     continue
-                if host != "github.com" or ":" not in line:
+                if host != "github.com" or ":" not in raw:
                     continue
-                k, v = line.split(":", 1)
-                if k.strip() == "oauth_token":
-                    v = v.strip().strip("'\"")
-                    if v:
-                        return v
-        return ""
+                indent = len(raw) - len(raw.lstrip())
+                if not depth:
+                    depth = indent                  # the block's own key level
+                k, v = raw.split(":", 1)
+                k, v = k.strip(), v.strip().strip("'\"")
+                if indent > depth:
+                    # INSIDE the block: `users:` -> `<login>:` -> `oauth_token:`. Only the login
+                    # level is a login (an empty value at one level deeper than the block), and
+                    # its token is remembered -- never returned -- so an alternate account can
+                    # never be presented as the active one.
+                    if v == "" and indent == depth + 4:
+                        nested_login = k
+                    elif k == "oauth_token" and nested_login:
+                        user_tokens[nested_login] = v
+                    continue
+                if k == "oauth_token" and v:
+                    return v                        # the ACTIVE account's own token
+                if k == "user" and v:
+                    active_user = v
+        # No top-level token: gh wrote only the per-user form, so take the ACTIVE user's entry.
+        tok = user_tokens.get(active_user or "") or ""
+        return tok
     except Exception:
         return ""
 
@@ -1456,45 +1504,78 @@ def queue():
         surface = "queue" if not attempt else "queue-resample"
         source = "graphql"
         try:
-            r = (_gh_retry(argv) if not attempt
-                 else _gh_retry(argv, attempts=1, timeout=max(1.0, remaining)))
-            if r.returncode != 0:
-                # ⛔ THE SECOND SOURCE, TRIED HERE AND ONLY HERE (#2138). A non-zero exit takes
-                # this branch -- in practice that is a REFUSAL (the secondary limit), which is
-                # what the incident and its tests are about; any other non-zero (e.g. a future
-                # argv/field error gh answers with rc=1) also lands here, so the second source
-                # would mask such a drift. Stated rather than hidden, AND GUARDED:
-                # `test_the_graphql_field_list_matches_what_the_rest_mapping_provides` pins the
-                # argv's field list against `_rest_pr()`'s keys, so a drift on either side is red
-                # rather than a silently stale mapping behind a healthy-looking line.
+            if not attempt:
+                # ⛔ THE PRIMARY READ ANSWERS TO THE READ'S OWN CAP, RETRIES INCLUDED (#2138 r4, A).
+                # `_gh_retry(argv)` with its defaults is 3 attempts x a 120 s timeout, so the ONE
+                # read the trick depends on was the only unbounded thing in the tick. The budget
+                # is threaded in so the retry policy fits inside it.
                 #
-                # ⛔ RECORD THE CLAIM, THEN WITHDRAW IT. The failure is noted BEFORE the fallback
-                # is tried, so (a) a double refusal reports the same transport failure it always
-                # did, and (b) the withdrawal below retracts a claim that ACTUALLY EXISTS. Without
-                # the note first, `_withdraw_gh_failure()` could never change anything and the
-                # protection its docstring promises would be inert (review round 1, B and A).
-                _graphql_err = ((r.stdout or "") + (r.stderr or "")).strip()
-                _note_gh_failure(f"queue read failed: {_graphql_err}", surface, transport=True)
-                # ⛔ THE FALLBACK GETS ITS OWN START-ANCHORED BOUND (#2138 r2, B), CAPPED BY THE
-                # READ'S OWN TICK BUDGET (#2138 r3, A). Passing only the re-sample deadline made
-                # the recovery INERT in the case it exists for: `_gh_retry` retries a transient
-                # failure three times with backoff, so a slow primary read can spend the whole 20 s
-                # budget and then the fallback opens no socket at all. A single page's worth is
-                # always allowed, measured from NOW -- but never past `read_deadline`, so a refusal
-                # that already ate the tick's headroom gets no socket and raises its own cause
-                # instead of pushing the beat into `run_bounded`'s kill (where no line prints).
-                prs = _queue_rest(
-                    deadline=min(_monotonic() + QUEUE_REST_TIMEOUT_S, read_deadline))
-                if prs is None:
-                    # Both sources refused: raise the FIRST cause (it is the actionable one --
-                    # "rate limit" says wait) and append the second so the cause line names the
-                    # whole failure rather than half of it.
-                    _rest_err = GH_LAST_ERROR if "rest fallback" in (GH_LAST_ERROR or "") else ""
-                    raise RuntimeError(
-                        f"{_graphql_err} | {_rest_err or 'rest fallback failed'}")
-                source = "rest"
-                _withdraw_gh_failure(surface)
+                # ⛔ AND A TIMEOUT RAISES -- it does not return `returncode != 0`. `subprocess.run`
+                # raises `TimeoutExpired`, which is exactly the failure the bound makes most
+                # likely, so a raise is folded into the SAME "the primary read failed" path: it
+                # records the claim, tries the second source, and only raises when both refuse.
+                # Leaving it to the outer `except` made the fallback inert in one whole class of
+                # primary failure -- the class it exists for -- printing `queue=UNREADABLE` while
+                # REST was healthy (review round 4, A).
+                try:
+                    r = _gh_retry(argv, deadline=read_deadline)
+                    _graphql_err = ((r.stdout or "") + (r.stderr or "")).strip()
+                    primary_failed = r.returncode != 0
+                except Exception as _exc:
+                    r, primary_failed = None, True
+                    _graphql_err = f"{type(_exc).__name__}: {_exc}"
+                if primary_failed:
+                    # ⛔ THE SECOND SOURCE, TRIED ONLY FOR THE PRIMARY READ (#2138 r4, A). A
+                    # RE-SAMPLE's refusal must NOT come here: the list was already read, so
+                    # re-reading it over REST would (a) misstate the provenance (`the GraphQL read
+                    # was refused` on a tick whose first read ANSWERED) and (b) contradict
+                    # `_queue_read_is_blind()`'s rule that a REST sample is not re-sampled. A
+                    # re-sample that fails keeps the sample it already holds, below.
+                    #
+                    # A non-zero exit is in practice a REFUSAL (the secondary limit), which is
+                    # what the incident and its tests are about; any other non-zero (e.g. a future
+                    # argv/field error gh answers with rc=1) also lands here, so the second source
+                    # would mask such a drift. Stated rather than hidden, AND GUARDED:
+                    # `test_the_graphql_field_list_matches_what_the_rest_mapping_provides` pins the
+                    # argv's field list against `_rest_pr()`'s keys, so a drift on either side is
+                    # red rather than a silently stale mapping behind a healthy-looking line.
+                    #
+                    # ⛔ RECORD THE CLAIM, THEN WITHDRAW IT. The failure is noted BEFORE the
+                    # fallback is tried, so (a) a double refusal reports the same transport failure
+                    # it always did, and (b) the withdrawal below retracts a claim that ACTUALLY
+                    # EXISTS. Without the note first, `_withdraw_gh_failure()` could never change
+                    # anything and the protection its docstring promises would be inert (review
+                    # round 1, B and A).
+                    _note_gh_failure(f"queue read failed: {_graphql_err}", surface, transport=True)
+                    # ⛔ THE FALLBACK GETS ITS OWN START-ANCHORED BOUND (#2138 r2, B), CAPPED BY THE
+                    # READ'S OWN TICK BUDGET (#2138 r3, A). Passing only the re-sample deadline made
+                    # the recovery INERT in the case it exists for: a slow primary read can spend
+                    # the whole 20 s budget and then the fallback opens no socket at all. A single
+                    # page's worth is always allowed, measured from NOW -- but never past
+                    # `read_deadline`, so a refusal that already ate the tick's headroom gets no
+                    # socket and raises its own cause instead of pushing the beat into
+                    # `run_bounded`'s kill (where no line prints).
+                    prs = _queue_rest(
+                        deadline=min(_monotonic() + QUEUE_REST_TIMEOUT_S, read_deadline))
+                    if prs is None:
+                        # Both sources refused: raise the FIRST cause (it is the actionable one --
+                        # "rate limit" says wait) and append the second so the cause line names the
+                        # whole failure rather than half of it.
+                        _rest_err = (GH_LAST_ERROR if "rest fallback" in (GH_LAST_ERROR or "")
+                                     else "")
+                        raise RuntimeError(
+                            f"{_graphql_err} | {_rest_err or 'rest fallback failed'}")
+                    source = "rest"
+                    _withdraw_gh_failure(surface)
+                else:
+                    prs = json.loads(r.stdout)
+                    if not isinstance(prs, list):
+                        raise ValueError(f"queue payload is not a list: {str(prs)[:200]}")
             else:
+                r = _gh_retry(argv, attempts=1, timeout=max(1.0, remaining))
+                if r.returncode != 0:
+                    raise RuntimeError(((r.stdout or "") + (r.stderr or "")).strip()
+                                       or "queue re-read refused")
                 prs = json.loads(r.stdout)
                 if not isinstance(prs, list):
                     raise ValueError(f"queue payload is not a list: {str(prs)[:200]}")
