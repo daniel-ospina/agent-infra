@@ -401,8 +401,16 @@ export function stripHeredocBodies(command: string): string {
     }
     const stripTabs = open[1] === "-";
     const word = open[3];
-    // Keep the COMMAND line (the redirect is part of it), drop the body and the terminator.
-    out.push(lines[i].slice(0, open.index) + lines[i].slice(open.index, open.index + open[0].length));
+    // KEEP THE OPENING LINE WHOLE, drop the body and the terminator. The whole line is bash COMMAND
+    // syntax — text after the redirect (`<<'MSG' && git push`) is still the command — so cutting at
+    // the token dropped a real push that followed it on the same line, and a quoted `<<EOF` earlier
+    // on the line lost its closing quote, which masked away a real push further along (fresh review,
+    // P2). The truncation was a bug in the first version of this helper.
+    //
+    // STATED RESIDUAL: two heredocs opened on ONE line (`cat <<'A' > x <<'B'`) — only the first is
+    // stripped, so `B`'s body is still scanned. No lane writes that, and the failure direction is a
+    // NOTICE that may fire a little early, never a gate decision (no gate consults this function).
+    out.push(lines[i]);
     let j = i + 1;
     let closed = false;
     for (; j < lines.length; j++) {

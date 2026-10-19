@@ -42,7 +42,7 @@
  *
  * ⛔ ONE WORDING, TWO LANGUAGES, AND A DRIFT PIN. The shell helper cannot import TypeScript, so
  * the requirement sentence and the command strings exist in both copies. That is a drift risk, so
- * reviewer-preflight.test.ts renders BOTH roles through the bash helper and asserts the two lines
+ * reviewer-preflight.test.ts renders ALL THREE roles through the bash helper and asserts the lines
  * are byte-identical to this module's. This is the same shape as the #966 command-parser drift pin
  * — one definition, and a test that fails when a second copy separates from it.
  *

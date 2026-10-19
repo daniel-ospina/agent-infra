@@ -6345,6 +6345,22 @@ test("#2148: isPushOrPrCreateCommand — the early moment, and what is NOT it", 
     isPushOrPrCreateCommand("git commit -F - <<-EOF\n\tnotes\n\tEOF\ngh pr create --title x"),
     "…including the tab-stripping <<- form, and a chained PR create",
   );
+  // ⛔ TEXT AFTER THE REDIRECT IS STILL COMMAND (fresh review, P2). The first version of the strip
+  // cut the opening line at `<<WORD`, which dropped a real push that followed it on the SAME line
+  // — and, when a quoted `<<EOF` appeared earlier on the line, removed the closing quote so the
+  // quote mask then hid the real push further along.
+  ok(
+    isPushOrPrCreateCommand("git commit -F - <<'MSG' && git push\nfeat: x\nMSG"),
+    "a push on the SAME line as the redirect still fires",
+  );
+  ok(
+    isPushOrPrCreateCommand('git commit -m "use <<EOF for long messages" && git push'),
+    "…and a quoted <<EOF mention does not eat a real push beside it",
+  );
+  ok(
+    isPushOrPrCreateCommand("git push && cat > NOTES.md <<'EOF'\nbody\nEOF"),
+    "…nor does a push BEFORE the heredoc vanish",
+  );
 });
 
 test("#2148: reviewerRoleFor — the harness's KIND decides the audience (the roles disagree on purpose)", () => {

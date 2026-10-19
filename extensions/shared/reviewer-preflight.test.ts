@@ -10,7 +10,7 @@
  *       command being WRONG — only a command being removed or duplicated. The load-bearing checks
  *       for correctness are (d)'s rendered-output equality and (e)'s `--evidence` requirement,
  *       which is what the record tool actually enforces.
- *   (b) THE TWO ROLES SAY OPPOSITE THINGS, ON PURPOSE. A `lane.sh` lane must NOT be told to
+ *   (b) THE THREE ROLES SAY OPPOSITE THINGS, ON PURPOSE. A `lane.sh` lane must NOT be told to
  *       dispatch or to run the rail — its brief forbids both. This is asserted by CONTENT
  *       difference, not by constants, so collapsing the roles goes red.
  *   (c) THE BYPASS VARIANT STILL DISCLOSES. A lane whose dispatch gate is switched off is the one
@@ -222,7 +222,7 @@ equal(
   "…and the harness injection is the harness line, not the self one",
 );
 
-// ── (d) the drift pin — TS ↔ the harness's bash helper, BOTH roles, BYTE-EXACT ──
+// ── (d) the drift pin — TS ↔ the harness's bash helper, ALL THREE roles, BYTE-EXACT ──
 // The helper assembles the rail's path at runtime (a literal `admin` token next to a `$` is what
 // the enforcer's admin-merge detector reads as a fail-closed guess, #1776), so this also pins that
 // the assembly still produces the real path. Comparing RENDERED strings (not constants) keeps a

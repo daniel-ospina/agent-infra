@@ -25,7 +25,7 @@
 #       hand three times).
 #   §E  non-vacuity: the assertions above CAN fail (a stripped command, a two-line disclosure).
 #       The cross-language drift pin itself is in extensions/shared/reviewer-preflight.test.ts,
-#       which RENDERS both roles through this helper and compares them byte for byte to the
+#       which RENDERS all three roles through this helper and compares them byte for byte to the
 #       TypeScript lines; §A here pins the same constants in the bash copy.
 #
 # SCOPE: this is the harness's half. The pi-side disclosure, the unchanged rail refusal and the
