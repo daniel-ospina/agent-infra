@@ -113,7 +113,7 @@ adds the **reads**, the **writes / emits** and the failure surface.
 | `dispatch-merge.sh` | orch-loop (argv issue ids) | argv issue ids, `git worktree list` | worktree, `lane-*` + `chain-*` tmux sessions | refuses non-numeric issue ids; a failed `worktree add` skips rather than half-dispatching |
 | `lane.sh` | dispatch-merge (tmux) | issue body + comments | the worktree/branch/PR, `logs/prompt-<N>.txt`, walltime row (via `run_agent`) | the implementer; runs with local review gates bypassed because the PARENT owns the gate. Hard-requires `spawn-gate.sh` (exit 78 without it) |
 | `chain-merge.sh` | dispatch-merge (tmux) | the lane's PR | merge-one run; exits with merge-one's status | waits (≤90 min) for the PR to exist before running the chain |
-| `merge-one.sh` | chain-merge, orch-loop, fix-one | PR diff + head, `repo-authority.sh`, `claims.sh` | review comment, PR body marker, claim ref, `state/{mergeclaim-*,needsfix-*,parked-*,merged-*.done,railcount-*}`, walltime row | refuses to run at all if `repo-authority.sh` is missing or stale (fail-closed); the reviewer emits `CLEAN <url>` / `ISSUES <n>`, and **any non-CLEAN outcome (including a failed/timed-out reviewer) writes `needsfix-<PR>-<head>`** |
+| `merge-one.sh` | chain-merge, orch-loop, fix-one | PR diff + head, `repo-authority.sh`, `claims.sh` | review comment, PR body marker, claim ref, `state/{mergeclaim-*,needsfix-*,needsreview-*,reviewcount-*,parked-*,merged-*.done,railcount-*}`, walltime row | refuses to run at all if `repo-authority.sh` is missing or stale (fail-closed); the reviewer emits `CLEAN <url>` / `ISSUES <n>`, and the verdict's CLASS decides the state (agent-infra#2132): `ISSUES` → `needsfix-<PR>-<head>` (a fixer is the remedy); no usable verdict → `needsreview-<PR>-<head>` (another REVIEW is the remedy, bounded by `MAX_REVIEW_TRIES`); `CLEAN` after the signed marker VERIFIED → clears it |
 | `fix-one.sh` | orch-loop (tmux) | the reviewer's comment, `state/needsfix-*`, the failing check's log | a new commit on the branch, `state/fixbail-<PR>-<head>` (cross-box refusal), a **decrement** of `state/fixcount-<PR>` on load refusal, a fixer walltime row | the controller books the `MAX_FIX_TRIES` attempt at spawn; fix-one refunds it when no agent ran and re-runs merge-one on success |
 | `repo-authority.sh` | **sourced** by orch-loop, merge-one | this repo's required status checks | the merge contract: `REQ`, `REQ_SOURCE`, `merge_authority` (gate/rail/unknown) | **fail-closed** — an unreadable, un-normalisable, or unrepresentable check set refuses rather than guessing |
 | `spawn-gate.sh` | **sourced** by lane.sh and fix-one.sh **and EXECUTED as `pi`** (installed at `$HOME/.pi/agent/bin/pi`, first on PATH) | load / capacity, and the disk floor | the go/no-go for a `pi`, the walltime row, and `~/.pi/agent/state/spawn-gate.tsv` (one row per invocation, allowed runs included) | ⛔ **TWO MODES, ONE FILE (#1884).** Sourced, it is the helper the ported callers use; executed as `pi`, it is the SPAWN POINT, so a caller that sources nothing at all — a hand-written `tmux new-session … "pi -p …"` runner, which is exactly what started three lanes on a box at load 258 — is still refused, loudly (reading, ceiling, item, caller) and counted, with `PI_GATE_REFUSED=76` (translated to 75 + `AGENT_STARTED=0` by `run_agent`, and to `exit 75` with NO `needsfix` marker by `merge-one.sh`). `orch-loop.sh` still does not source it (it has its own `can_spawn`), and its `pi`-spawning paths now inherit the spawn-point gate. Limits are in the file's own header — above all the absolute-path/PATH-reset invocation, which is deliberately also the operator's rescue route |
@@ -147,7 +147,9 @@ applying and the PR becomes eligible again.
 |---|---|---|---|
 | `state/mergeclaim-<PR>.lock` | `merge-one.sh` | removed on clean exit (EXIT trap); a stale lock whose pid is dead is reclaimed by `claim_live()` | **local, one-box** single-owner lock (`set -o noclobber`). Holds a pid |
 | `refs/claims/<PR>-<sha12>` (remote) | `claims.sh` | released by the EXIT trap (fenced); expired by lease; `claim_prune` hourly | **cross-box** claim. Lease is DATA (`owner`, `lease_until`) because a remote pid cannot be probed |
-| `state/needsfix-<PR>-<head>` | `merge-one.sh` (any non-CLEAN outcome) | deleted when a fixer is spawned; re-created at a new head; re-touched by `refund_bailed_fixer` | "the reviewer found real issues, failed, or timed out AT THIS HEAD" |
+| `state/needsfix-<PR>-<head>` | `merge-one.sh` (verdict `ISSUES`) | deleted when a fixer is spawned; re-created at a new head; re-touched by `refund_bailed_fixer` | "the reviewer reported FINDINGS at this head" — the only thing that authorises a fixer |
+| `state/needsreview-<PR>-<head>` | `merge-one.sh` (no usable verdict), `orch-loop.sh` (a red gate with no findings marker) | cleared by `review_state_clear` once the signed marker VERIFIED, by `orch-loop.sh` when the PR is GREEN / MERGED / CLOSED, and replaced when a newer head is recorded | "this head has NO head-bound clean evidence and no findings to fix — re-run the REVIEW". Bounded by `state/reviewcount-<PR>`; one marker per PR, not per head |
+| `state/reviewcount-<PR>` | `merge-one.sh` | reset when the stored head ≠ the current head | `"<head> <n>"` — verdict-less reviewer runs at this head, capped by `MAX_REVIEW_TRIES` (3), then park |
 | `state/fixbail-<PR>-<head>` | `fix-one.sh` (cross-box CAS refusal) | consumed by `refund_bailed_fixer` (rm) | "a fixer was refused this head by another box" — proof no work happened, so the attempt is refunded |
 | `state/fixcount-<PR>` | `orch-loop.sh` (booked at spawn) | decremented by `fix-one.sh` (load refusal) and `refund_bailed_fixer`. **Not head-keyed** (⚠ see §6.2) | fixer attempts consumed for this PR |
 | `state/railcount-<PR>` | `merge-one.sh` (rail mode) | reset when the stored head ≠ the current head | `"<head> <n>"` — rail refusals at this head, capped by `RAIL_TRIES` (3) |
@@ -189,6 +191,7 @@ default**, so a job already loaded keeps the old value until it is reloaded (or 
 | (reviewer budget, not a `[dispatch]` string) | `MAX_REVIEW` | 4 | `review_slots()` returns `MAX_REVIEW` normally and `10#MAX_REVIEW + 2` while `open > MERGE_PRIORITY_AT` — the `+2` headroom is real and read base-10 deliberately (a leading-zero value would otherwise be octal) |
 | (fixer concurrency, not a `[dispatch]` string) | `MAX_FIX` | 3 | caps concurrent `fix-<PR>` sessions |
 | fixer attempts | `MAX_FIX_TRIES` | 3 | at the cap → park at this head |
+| reviewer runs without a verdict at one head (`reviewcount-<PR>`) | `MAX_REVIEW_TRIES` | 3 | at the cap → park (nothing was reviewed, so no marker can be minted and a fixer has no findings); a new push re-arms it (agent-infra#2132) |
 | dispatch batch | `BATCH` | 2 | issues per cycle |
 | cycle | `CYC` | 240s | floored at 5; jittered ±20% so several boxes stop waking together |
 
@@ -221,11 +224,13 @@ are indistinguishable in the log. `mp_reason`'s own comment records the measured
    attempts accumulated at a superseded revision carry into the new head and can park it
    immediately. (`merged-*.done` and `rerun-*` are deliberately terminal/run-keyed, not head-keyed.)
 
-3. **A verdict-less reviewer run is indistinguishable from `ISSUES` at the marker level.** The
-   `*)` arm in `merge-one.sh` writes `needsfix-<PR>-<head>` for both, so a run killed at its cap
-   causes the controller to spend a `MAX_FIX_TRIES` attempt and can produce a park caused by
-   timeouts rather than findings. The `rc=143` row in `walltime.tsv` is the only *durable* place the
-   distinction survives — the per-run `[timeout]` log line is erased when that log is re-truncated.
+3. ~~**A verdict-less reviewer run is indistinguishable from `ISSUES` at the marker level.**~~
+   **CLOSED by agent-infra#2132.** The `*)` arm used to write `needsfix-<PR>-<head>` for both, so a
+   run killed at its cap made the controller spend a `MAX_FIX_TRIES` attempt on a head nobody had
+   reviewed. It now writes `needsfix-*` only for a real `ISSUES` verdict and `needsreview-*`
+   otherwise, and the controller dispatches a fixer only on the former (`review_gate_state()`). Kept
+   here as the evidence that motivated the change. The `rc=143` row in `walltime.tsv` remains the
+   durable record of *why* a run produced no verdict.
 
 4. **`check-port-drift.sh` compares against a pin, not against reality.** It hashes the tortoise
    tree at a git ref against `port-provenance.txt`; a file in the pin that the ref no longer carries

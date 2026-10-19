@@ -1705,7 +1705,12 @@ while true; do
     # CLOSED too: a PR listed open can close between `gh pr list` and here. The retired sweep.sh
     # guarded both; the live rewrite kept only MERGED, so a closed PR fell through to
     # `gh pr ready` + `gh pr merge` every cycle and logged `#<PR> merge fail` forever.
-    case "${PR_ST:-}" in MERGED|CLOSED) continue ;; esac
+    # ⛔ AND ITS STALE-EVIDENCE MARKER GOES WITH IT (review round 1, P2 — agent-infra#2132): this
+    # `continue` runs BEFORE every other cleanup path, so a `needsreview-<PR>-<head>` marker written
+    # while the PR was open would outlive it and be counted forever by report.sh. The count is only
+    # worth publishing if it can return to zero. Kept on ONE line because selftest.sh pins this
+    # exact `case` form ("sweep skips CLOSED as well as MERGED").
+    case "${PR_ST:-}" in MERGED|CLOSED) rm -f "$O/state/needsreview-$PR-"* 2>/dev/null || true; continue ;; esac
     HEAD_N="$(gh pr view "$PR" --repo "$OR" --json headRefOid --jq .headRefOid 2>/dev/null)"
     # parked = the fixer cap was reached at THIS head; a later push re-arms the PR.
     [ -n "${HEAD_N:-}" ] && [ "$(cat "$O/state/parked-$PR" 2>/dev/null)" = "$HEAD_N" ] && continue

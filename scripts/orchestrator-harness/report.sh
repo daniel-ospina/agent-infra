@@ -4,8 +4,9 @@
 #   O=/path/to/orchestrator REPO=/path/to/tortoise ./report.sh 6
 #
 # Reads ONLY durable artifacts — state/walltime.tsv, state/merged-*.done, state/parked-*,
-# state/fixcount-*, $O/logs/orch-loop.log, the recorded harness stamp, and `origin`. It is
-# READ-ONLY (no `gh` write, no tmux, no lock), so it is safe to run while the loop is working.
+# state/fixcount-*, state/needsreview-* (the open-PR stale-evidence queue, #2132),
+# $O/logs/orch-loop.log, the recorded harness stamp, and `origin`. It is READ-ONLY (no `gh` write, no
+# tmux, no lock), so it is safe to run while the loop is working.
 # Dependency-free beyond bash + git + gh + python3 (the last two only for the sections that need
 # them; a missing one makes its section say so, never abort the report).
 #
@@ -141,19 +142,42 @@ echo "  → live: ${claims:-0}  (a claim with a live lease = a reviewer in fligh
 echo
 
 echo "── queue health ────────────────────────────────────────────"
+# ⛔ ONE `gh` READ SUPPLIES BOTH LINES BELOW (agent-infra#1984 bounds this file's API spend), and the
+# exit status is kept because "no open PRs" and "the read failed" must not print the same thing.
+OPENNUMS=""; OPEN_RC=0
 if [ -d "$REPO" ] && command -v gh >/dev/null 2>&1; then
-  open=$(cd "$REPO" && gh pr list --state open --limit 300 --json number --jq length 2>/dev/null)
-  echo "  open PRs: ${open:-<could not read>}"
-else
+  OPENNUMS="$(cd "$REPO" && gh pr list --state open --limit 300 --json number --jq '.[].number' 2>/dev/null)" || OPEN_RC=1
+fi
+if [ "$OPEN_RC" -ne 0 ] && [ ! -d "$REPO" ]; then
   echo "  open PRs: <needs a repo checkout and gh>"
+elif [ "$OPEN_RC" -ne 0 ]; then
+  echo "  open PRs: <could not read>"
+else
+  echo "  open PRs: $(printf '%s' "$OPENNUMS" | grep -c '[0-9]')"
 fi
 echo "  parked (needs a human): $(ls "$O"/state/parked-* 2>/dev/null | wc -l | tr -d ' ')"
 # ⛔ THE STALE-EVIDENCE COUNT IS ITS OWN LINE (agent-infra#2132), because it is a DIFFERENT queue with
 # a DIFFERENT remedy: a parked PR needs a human, while a `needsreview-<PR>-<head>` PR only needs the
 # review re-run. Indicator (b) of that issue is "the count of open PRs stalled on stale evidence
-# stays at 0", and before this line nothing in the harness could answer it at all — the state lived
-# only in a merged worker's log. Read-only, dependency-free, one marker per PR+head.
-echo "  stale evidence (needs re-review): $(ls "$O"/state/needsreview-* 2>/dev/null | wc -l | tr -d ' ')"
+# stays at 0", and before this line nothing in the harness could answer it at all.
+# ⛔ AND IT COUNTS OPEN PRs ONLY (review round 1, P2). The headline is a count of OPEN PRs, so a
+# marker left behind by a merged/closed PR is bookkeeping lag, not a stall — counting files would
+# publish a number that only ever grows and could never read the 0 the indicator asks for. The
+# controller also sweeps these on MERGED|CLOSED, so both sides hold the same invariant.
+if [ "$OPEN_RC" -ne 0 ] && [ ! -d "$REPO" ]; then
+  echo "  stale evidence (needs re-review): <needs a repo checkout and gh>"
+elif [ "$OPEN_RC" -ne 0 ]; then
+  echo "  stale evidence (needs re-review): <could not read, $(ls "$O"/state/needsreview-* 2>/dev/null | wc -l | tr -d ' ') marker(s) present>"
+else
+  stale=0
+  for f in "$O"/state/needsreview-*; do
+    [ -e "$f" ] || continue
+    pr="$(basename "$f" | sed -n 's/^needsreview-\([0-9][0-9]*\)-.*/\1/p')"
+    [ -n "$pr" ] || continue
+    printf '%s\n' "$OPENNUMS" | grep -qx -- "$pr" && stale=$((stale + 1))
+  done
+  echo "  stale evidence (needs re-review): $stale"
+fi
 cap=3
 [ -n "${MAX_FIX_TRIES:-}" ] && case "$MAX_FIX_TRIES" in ''|*[!0-9]*) ;; *) cap="$MAX_FIX_TRIES" ;; esac
 atcap=0

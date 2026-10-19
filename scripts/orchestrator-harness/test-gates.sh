@@ -13,7 +13,13 @@ set -u
 # guard against the DEPLOYED copy, which is its original purpose there.
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ORCH="${ORCH:-$HERE/orch-loop.sh}"
-MERGE="$HERE/merge-one.sh"
+# ⛔ THE PRODUCER FOLLOWS THE CONSUMER (review round 1, P3 — agent-infra#2132). ORCH is overridable to
+# point this suite at the DEPLOYED tree (the drift-guard mode this file's header documents), but
+# MERGE was hard-wired to the shipped copy — so in exactly that mode the #2132 section graded a
+# DEPLOYED consumer against a SHIPPED producer, and a deployed merge-one.sh still writing the fixer
+# marker unconditionally was undetectable. Both now resolve against the same tree; when ORCH is not
+# overridden this is the shipped merge-one.sh beside this test, as before.
+MERGE="${MERGE:-$(dirname "$ORCH")/merge-one.sh}"
 PASS=0; FAIL=0
 
 # --- extract the rule functions from the live controller ---
@@ -1766,6 +1772,7 @@ echo "=== #2132: a head nobody reviewed is NEEDS-REVIEW, never a fixer authorisa
   grep -m1 '^is_num() {' "$MERGE"
   awk '/^verdict_class\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "$MERGE"
   awk '/^review_state_record\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "$MERGE"
+  awk '/^review_state_clear\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "$MERGE"
 } > "$TMP/reviewstate.sh"
 ex review_gate_state > "$TMP/fn_review_gate_state.sh"
 # ⛔ NON-EMPTY AND DEFINED, not merely `bash -n`-clean (P2, first review round): `bash -n` on an EMPTY
@@ -1776,6 +1783,7 @@ _rs_sz="$(wc -c < "$TMP/reviewstate.sh" | tr -d ' ')"; _rgs_sz="$(wc -c < "$TMP/
 if [ "${_rs_sz:-0}" -gt 0 ] && [ "${_rgs_sz:-0}" -gt 0 ] \
    && grep -q '^verdict_class() {' "$TMP/reviewstate.sh" \
    && grep -q '^review_state_record() {' "$TMP/reviewstate.sh" \
+   && grep -q '^review_state_clear() {' "$TMP/reviewstate.sh" \
    && grep -q '^review_gate_state() {' "$TMP/fn_review_gate_state.sh" \
    && bash -n "$TMP/reviewstate.sh" 2>/dev/null && bash -n "$TMP/fn_review_gate_state.sh" 2>/dev/null; then
   RS="$TMP/rso"; mkdir -p "$RS/state"
@@ -1791,6 +1799,8 @@ if [ "${_rs_sz:-0}" -gt 0 ] && [ "${_rgs_sz:-0}" -gt 0 ] \
   }
   # _rgs <pr> <head> — drive the CONSUMER's classifier against the same state dir.
   _rgs() { ( O="$RS"; . "$TMP/fn_review_gate_state.sh"; review_gate_state "$1" "$2" ); }
+  # _rc <head> — drive the CLEAR path (verified evidence) against the same state dir.
+  _rc() { ( O="$RS"; L="$RS/merge.log"; PR=2132; HEAD="$1"; . "$TMP/reviewstate.sh"; review_state_clear ); }
   _clean() { rm -f "$RS"/state/needsfix-* "$RS"/state/needsreview-* "$RS"/state/parked-* "$RS"/state/reviewcount-* "$RS/parkreason"; : > "$RS/merge.log"; }
 
   eqv "an ISSUES verdict is a FIXER state" "ISSUES" "$(_vc 'ISSUES 3')"
@@ -1848,6 +1858,69 @@ if [ "${_rs_sz:-0}" -gt 0 ] && [ "${_rgs_sz:-0}" -gt 0 ] \
   else
     echo "  ❌ merge-one.sh's verdict arm does not route through the classifier, or still writes the fixer marker unconditionally"; FAIL=$((FAIL+1))
   fi
+  # (7) ⛔ THE CLEAR ARM (#2132 Required item 4): a COMPLETED review at the new head clears the
+  # state. Without this assertion the clear sites could be deleted outright and the suite stayed
+  # green — i.e. the half of the requirement that makes the state temporary was untested.
+  _clean; _rs NO-VERDICT ffff6666
+  _marker_before=$([ -f "$RS/state/needsreview-2132-ffff6666" ] && echo yes || echo no)
+  _rc ffff6666
+  if [ "$_marker_before" = "yes" ] && [ ! -e "$RS/state/needsreview-2132-ffff6666" ]; then
+    echo "  ✅ verified evidence CLEARS the stale-evidence state (a completed review at the head ends it)"; PASS=$((PASS+1))
+  else
+    echo "  ❌ the stale-evidence marker survived the clear path (present before=$_marker_before, after=$([ -e "$RS/state/needsreview-2132-ffff6666" ] && echo yes || echo no))"; FAIL=$((FAIL+1))
+  fi
+  # (7b) …and the clear is CALLED, and only AFTER the signed marker verified: a clear above the
+  # `marker_ok` guard would let a bare rc=0 (record-review ran but posted no verifiable marker) read
+  # as a satisfied head and erase the evidence queue's only record of it.
+  _guard_ln="$(grep -n 'if \[ "$marker_ok" -ne 1 \]' "$MERGE" | head -1 | cut -d: -f1)"
+  _clear_ln="$(grep -n '^    review_state_clear$' "$MERGE" | head -1 | cut -d: -f1)"
+  # ⛔ IF, NOT CASE (review round 2, P2). The first form was `case "x:y" in ''*|*:'' )`, and inside a
+  # `case` PATTERN the quotes are stripped — `''*` IS `*`, which matched every value, so the failure
+  # arm always ran: a permanent red over a correct tree, and a real ordering regression would print
+  # the same line. Two explicit emptiness tests are the only way to say "either anchor is missing".
+  if [ -z "${_guard_ln:-}" ] || [ -z "${_clear_ln:-}" ]; then
+    echo "  ❌ could not locate the marker_ok guard and the review_state_clear call site in merge-one.sh"; FAIL=$((FAIL+1))
+  elif [ "${_clear_ln}" -gt "${_guard_ln}" ]; then
+    echo "  ✅ the clear is reached only AFTER the signed marker verifies (call site line $_clear_ln > guard line $_guard_ln)"; PASS=$((PASS+1))
+  else
+    echo "  ❌ the clear is invoked at line $_clear_ln, not after the marker_ok guard at line $_guard_ln — an unverified record would read as a clean head"; FAIL=$((FAIL+1))
+  fi
+  # (8) ⛔ NO ACCUMULATION (#2132 review round 1, P2): the marker set describes NOW. One marker per
+  # PR — a head that advances must not leave the previous head's marker behind for report.sh to
+  # count, or the published number could never fall back to 0.
+  _clean; _rs NO-VERDICT 1111aaaa; _rs NO-VERDICT 2222bbbb
+  _old=$([ -f "$RS/state/needsreview-2132-1111aaaa" ] && echo yes || echo no)
+  _new=$([ -f "$RS/state/needsreview-2132-2222bbbb" ] && echo yes || echo no)
+  if [ "$_old" = "no" ] && [ "$_new" = "yes" ]; then
+    echo "  ✅ a new head REPLACES the previous head's stale-evidence marker (the set cannot only grow)"; PASS=$((PASS+1))
+  else
+    echo "  ❌ stale-evidence markers accumulate: old-head marker=$_old, current-head marker=$_new"; FAIL=$((FAIL+1))
+  fi
+  # (9) ⛔ AND THE PUBLISHED COUNT IS OPEN-PRs-ONLY (#2132 review round 1, P2). Driven against a real
+  # report.sh run with a stub `gh`: two markers exist, only ONE belongs to an open PR, so the line must
+  # read 1 — a raw file count would read 2 and could never return to the 0 indicator (b) asks for.
+  RPT="$TMP/rpt"; mkdir -p "$RPT/state" "$RPT/repo" "$TMP/ghstub"
+  : > "$RPT/state/needsreview-6001-aaa"; : > "$RPT/state/needsreview-6999-bbb"
+  cat > "$TMP/ghstub/gh" <<'GHOPEN'
+#!/bin/bash
+case "$*" in *"--state open"*) printf '6001\n6002\n' ;; esac
+exit 0
+GHOPEN
+  chmod +x "$TMP/ghstub/gh"
+  _rpt_line="$( O="$RPT" REPO="$RPT/repo" PATH="$TMP/ghstub:$PATH" bash "$HERE/report.sh" 2 2>/dev/null | grep 'stale evidence' )"
+  eqv "report.sh counts only OPEN PRs as stalled on stale evidence" "  stale evidence (needs re-review): 1" "$_rpt_line"
+  # (9b) …and an UNREADABLE open-PR list must not print a confident 0. A stub that FAILS the list
+  # read stands in for a rate-limited or offline box.
+  cat > "$TMP/ghstub/gh" <<'GHFAIL'
+#!/bin/bash
+exit 1
+GHFAIL
+  chmod +x "$TMP/ghstub/gh"
+  _rpt_fail="$( O="$RPT" REPO="$RPT/repo" PATH="$TMP/ghstub:$PATH" bash "$HERE/report.sh" 2 2>/dev/null | grep 'stale evidence' )"
+  case "$_rpt_fail" in
+    *"could not read"*) echo "  ✅ an unreadable open-PR list prints <could not read> with the raw marker count, never a confident 0"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ an unreadable open-PR list printed [$_rpt_fail] — a blind read must not read as a clean queue"; FAIL=$((FAIL+1)) ;;
+  esac
   wpin "orch-loop.sh classifies the red gate before dispatching" "$ORCH" '_rgs="$(review_gate_state "$PR" "${HEAD_N:-}")"'
   wpin "…and authorises a fixer ONLY on NEEDS-FIX" "$ORCH" '[ "$_rgs" = "NEEDS-FIX" ]'
   wpin "report.sh surfaces the stale-evidence queue (indicator b)" "$HERE/report.sh" 'stale evidence (needs re-review)'

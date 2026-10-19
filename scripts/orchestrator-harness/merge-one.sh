@@ -570,9 +570,15 @@ verdict_class() {
 review_state_record() {
   local cls="${1:-}" rc_f="$O/state/reviewcount-$PR" rc_h="" rc_n=0
   [ -n "${HEAD:-}" ] || return 0
+  # ⛔ ONE MARKER PER PR, NOT PER (PR, HEAD) (review round 1, P2). An older head's stale-evidence
+  # marker is not a fact about THIS head, and nothing swept it: the controller writes one on every red
+  # cycle, so with the per-head name alone the `needsreview-*` population only ever GREW — a counter
+  # that climbs and never falls is the false instrument report.sh's line would publish ("the count of
+  # open PRs stalled on stale evidence stays at 0" could never read 0 again). Prune the PR's other
+  # heads here, where the current state is known, so the marker set always describes NOW.
   case "$cls" in
     ISSUES)
-      rm -f "$O/state/needsreview-$PR-$HEAD"
+      rm -f "$O/state/needsreview-$PR-"* 2>/dev/null || true
       touch "$O/state/needsfix-$PR-$HEAD"
       echo "[merge $PR] NEEDS-FIX: the reviewer reported findings at head=$HEAD — a fixer is authorised" >> "$L.log"
       return 0 ;;
@@ -592,10 +598,23 @@ review_state_record() {
         return 0
       fi
       rm -f "$O/state/needsfix-$PR-$HEAD"
+      rm -f "$O/state/needsreview-$PR-"* 2>/dev/null || true
       touch "$O/state/needsreview-$PR-$HEAD"
       echo "[merge $PR] NEEDS-REVIEW: no usable verdict at head=$HEAD (${rc_n}/${MAX_REVIEW_TRIES}) — the remedy is another REVIEW; no fixer is authorised" >> "$L.log"
       return 0 ;;
   esac
+}
+
+# review_state_clear — the head now carries VERIFIED, signed evidence, so it is no longer in
+# stale-evidence state. ⛔ CALL IT ONLY AFTER THE MARKER VERIFIED, never after a bare rc=0 (#2132
+# review round 1): `record-review.sh` returning 0 is not evidence — the arm below proves the signed
+# marker is in the body before this runs, and the suite pins that ORDER (a clear placed above the
+# `marker_ok` guard would let a failed record read as a satisfied head).
+review_state_clear() {
+  [ -n "${HEAD:-}" ] || return 0
+  rm -f "$O/state/needsreview-$PR-"* 2>/dev/null || true
+  echo "[merge $PR] NEEDS-REVIEW cleared: signed evidence verified at head=$HEAD" >> "$L.log"
+  return 0
 }
 
 case "$LAST" in
@@ -716,11 +735,11 @@ case "$LAST" in
       park "record-review.sh returned rc=0, but the signed marker ai-review-gate reads is not verifiably there: $marker_why — $marker_how"
       echo "[merge $PR] ABORT: rc=0 but $marker_why" >> "$L.log"; exit 3
     fi
-    # The head now carries VERIFIED, signed evidence, so the controller's stale-evidence marker for
-    # it is no longer true — and report.sh counts exactly these (agent-infra#2132). Cleared only
-    # after the marker VERIFIED above, never after a bare rc=0 (which is not evidence).
-    rm -f "$O/state/needsreview-$PR-$HEAD" 2>/dev/null || true
-    echo "[merge $PR] NEEDS-REVIEW cleared: signed evidence verified at head=$HEAD" >> "$L.log"
+    # The head now carries VERIFIED, signed evidence (the guard above proved the marker is in the
+    # body and that its signature verifies), so the controller's stale-evidence state for it is no
+    # longer true — and report.sh counts exactly those (agent-infra#2132). This call MUST stay BELOW
+    # the guard: a clear above it would let a bare rc=0 read as a satisfied head.
+    review_state_clear
     # ── 3a) RAIL MODE: there is no review gate to wait for (agent-infra#1825) ──
     # This repo's merge authority is its rail, which is WHY we dropped out of the rail branch to
     # mint the evidence: polling `$REVIEW_GATE` here would wait 15 minutes for a check that does

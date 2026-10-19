@@ -175,6 +175,8 @@ processes in tmux sessions, so a killed worker cannot take the controller down w
                         2. CLEAN   → record-review.sh (HMAC-signed marker into the PR body)
                                      → wait for ai-review-gate SUCCESS → gh pr merge --squash
                             ISSUES  → touch state/needsfix-<PR>-<head>   ← hands off to the fixer path
+                          no verdict → touch state/needsreview-<PR>-<head>  ← re-runs the REVIEW; never
+                                     a fixer, and bounded by MAX_REVIEW_TRIES (agent-infra#2132)
                         rail mode (the repo does NOT require the gate — e.g. agent-infra):
                         1. a head-bound review RECORD already in the store at this head → straight to
                            the rail (the normal case: the lane's own review pass recorded one)
@@ -213,7 +215,9 @@ processes in tmux sessions, so a killed worker cannot take the controller down w
 | `checked.txt` | issues whose pre-flight returned **CLEAN** (the terminal verdict); an **errored** pre-flight and a **COLLISION** leave no entry, so the next pass re-attempts them (agent-infra#1716). A reaped number is dropped from it too, so the pre-flight re-queues the issue |
 | `state/collided` | `"<expiry-epoch> <issue>"` per line — candidates a peer was holding at the last pre-flight. A pass walks PAST a fresh record without spending a pre-flight run, so a blocked pool HEAD is not re-bought on every pass; a skipped candidate stays out of `candidates.txt` and out of `checked.txt`, so it is **deferred, never dropped** — the record lapses after `POOL_COLLISION_TTL` (900 s) and the candidate is judged again (agent-infra#1729). Only a COLLISION is recorded: a DEGRADED / INCOMPLETE / verdict-less answer is an environment failure and stays visible on every pass (agent-infra#1736) |
 | `state/mergeclaim-<PR>.lock` | single-owner claim: only one worker may review/record/merge a given PR |
-| `state/needsfix-<PR>-<head>` | "a reviewer found real issues at this exact head" |
+| `state/needsfix-<PR>-<head>` | "a reviewer reported real issues at this exact head" — the only state that authorises a fixer (`review_gate_state() == NEEDS-FIX`) |
+| `state/needsreview-<PR>-<head>` | "this head has no head-bound clean evidence and no findings to fix" — the remedy is another REVIEW, never a fixer (agent-infra#2132). One marker per PR; swept when the PR goes GREEN / MERGED / CLOSED and when the signed marker verifies |
+| `state/reviewcount-<PR>` | `"<head> <n>"`: verdict-less reviewer runs at this head, capped by `MAX_REVIEW_TRIES` |
 | `state/fixcount-<PR>` | fixer attempts for that PR, capped by `MAX_FIX_TRIES` |
 | `state/parked-<PR>` | terminal state: the fixer cap was reached at the head recorded inside the file, so the sweep skips it until a new push re-arms it |
 | `state/rerun-<PR>-<runid>` | CI re-run already requested for this run — prevents loops |
@@ -648,6 +652,7 @@ run has no shim. `pi-bootstrap/cell-install.sh --verify` byte-compares the insta
 | `FUNNEL_MAX_AGE_MIN` | `30` | how old a `state/refresh-funnel` record may be before the `[dispatch]` line prints `funnel STALE(<age> > <bound>)` instead of that record's decomposition. The refresh exits before writing its funnel on the pool-read and provisioning paths, so an old pass's numbers can sit beside a newer `queue=READ(n)` — a record is not a state |
 | `MAX_FIX` | `3` | concurrent `fix-<PR>` fixers |
 | `MAX_FIX_TRIES` | `3` | per-PR fixer attempts before it is left alone |
+| `MAX_REVIEW_TRIES` | `3` | verdict-less reviewer runs at ONE head before that head is parked (agent-infra#2132). Keyed on the head — `state/reviewcount-<PR>` records `"<head> <n>"` and a push resets it — so a reviewer that keeps hitting its cap cannot buy an unbounded run of paid reviews |
 | `MIN_SWAP_FREE` | `600` | MB. ⛔ Two limits worth knowing before trusting it: on a host with **no swap at all** (`SwapTotal: 0`, i.e. a container) the gate is **INERT by design** — `swap_total=0` reads as uninitialised, not as pressure (`orch-loop.sh:1438` for the gate, `:1413-1415` and `:1431` for the rule), so capacity there is decided by load and memory only — and on a host that **has** swap the metric is a level, not a counter: swap that has been used stays used, so a past spike holds the FREE level down and the gate flaps across its own threshold (measured `swap_free=549M<=min_swap_free=600M` at load 5.4 of a 64 ceiling; agent-infra#1961). `MIN_MEM_FREE_MB` is the metric that reflects the present |
 | `MIN_MEM_FREE_MB` | `512` | MB of *available* memory (`MemAvailable` on Linux, else `MemFree`+`Cached`; `free`+`inactive` on macOS). macOS shows pressure as compression with swap flat, so swap alone does not see it |
 | `BATCH` | `2` | issues dispatched per cycle |

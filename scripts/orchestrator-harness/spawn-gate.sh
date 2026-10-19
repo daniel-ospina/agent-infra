@@ -389,10 +389,11 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   # ⛔ A REFUSAL AT THE SPAWN POINT IS THIS GATE'S OWN REFUSAL (agent-infra#1884). Without this arm
   # the installed `pi`'s 76 is read by every caller as "the agent ran and failed" — and the two
   # consequences are both real: fix-one.sh re-runs the merge chain for a fixer that never ran, and
-  # merge-one.sh's verdict arm would spend one of its bounded re-reviews (a `needsreview` marker since
-  # #2132; a FIXER authorisation before it) on a REVIEW that never happened, which burns a fix loop
-  # attempt and eventually parks the PR (#1716/#1720 class). The load is read twice on purpose (here,
-  # and again in the shim) — the band
+  # merge-one.sh's verdict arm would treat the refusal as a reviewer run that produced no verdict —
+  # which since agent-infra#2132 spends one of `MAX_REVIEW_TRIES` (and, before it, authorised a
+  # FIXER) for a REVIEW that never happened, burning a fix-loop attempt and eventually parking the
+  # PR (#1716/#1720 class). The arm below therefore writes NO marker at all. The load is read twice
+  # on purpose (here, and again in the shim) — the band
   # between them is milliseconds, and closing it by trusting an env marker from the caller would
   # hand the bypass back. So the SECOND refusal is translated into the FIRST: no agent ran
   # (AGENT_STARTED=0), the caller sees AGENT_LOAD_REFUSED, and no walltime row is written.
