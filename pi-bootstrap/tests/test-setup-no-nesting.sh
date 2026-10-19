@@ -483,7 +483,7 @@ script:objective.py script:orchestrator-heartbeat.sh script:pr-doctor.py
 script:publish-live-workspaces.py script:queue-dispatch.py script:safe-send.sh
 script:session-postmortem.sh
 script:turn-classify.py script:turn-end.py script:undelivered-answers.py script:watch-truncation.sh
-lib:beat-pair.sh lib:diff-normalize.py lib:pid-identity.sh lib:transcript-patterns.sh
+lib:beat-pair.sh lib:bounded.sh lib:diff-normalize.py lib:pid-identity.sh lib:transcript-patterns.sh
 state:claim.py state:lane-confirm.py state:lane-triage.py state:lane-verdict.py
 state:queues/refresh-queues.py
 foreign:cmux_dispatch.py"

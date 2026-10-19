@@ -503,7 +503,14 @@ echo "    scripts fleet farm: $fleet_copied copied (fleet cadence, #373 + runner
 # it beside the consumer is what makes the section exist everywhere the consumer
 # does (same `lib/` → `$DEST/scripts/lib/` layout as the three above; the
 # consumer resolves `$(dirname "${BASH_SOURCE[0]}")/lib/transcript-patterns.sh`).
-lib_srcs=(pid-identity.sh diff-normalize.py beat-pair.sh transcript-patterns.sh)
+# #2046 adds a FIFTH: `scripts/lib/bounded.sh` is the ONE bounded-execution
+# helper for the reaper family. `disk-reaper.sh` and `pi-reap-worktrees.sh` both
+# source it and both REFUSE at startup (exit 3) without it, because a probe with
+# no watchdog is a probe that can hang the host they exist to unload. Farming the
+# reapers WITHOUT this sibling re-arms the hourly pass as a startup refusal; on a
+# Mac that is strictly better than the pre-#2046 behaviour it replaces (every
+# class fail-closed with `timeout: command not found` while the pass completed).
+lib_srcs=(pid-identity.sh diff-normalize.py beat-pair.sh bounded.sh transcript-patterns.sh)
 mkdir -p "$DEST/scripts/lib"
 lib_copied=0
 lib_failed=0
@@ -540,13 +547,13 @@ done
 # so a stale list turns a correct farm into a red, or worse, names a lib it did not copy.
 lib_names="$(printf '%s + ' "${lib_srcs[@]}")"; lib_names="${lib_names% + }"
 if [ "$lib_failed" -gt 0 ]; then
-  echo "    scripts lib farm: $lib_copied copied, $lib_failed FAILED/MISSING ($lib_names, #1178/#1362/#1897/#1921)" >&2
+  echo "    scripts lib farm: $lib_copied copied, $lib_failed FAILED/MISSING ($lib_names, #1178/#1362/#1897/#2046/#1921)" >&2
   # #1924: a lib that DECLARED but did not land is an INCOMPLETE checkout, not a
   # tolerated skip — record it so the run fails before the UNFARM leg instead of
   # delivering consumers whose sibling is absent.
   farm_missing+="scripts/lib/ ($lib_failed declared sibling(s) FAILED or MISSING)"$'\n'
 else
-  echo "    scripts lib farm: $lib_copied copied ($lib_names, #1178/#1362/#1897/#1921)"
+  echo "    scripts lib farm: $lib_copied copied ($lib_names, #1178/#1362/#1897/#2046/#1921)"
 fi
 
 # Fleet-tools farm (#1178 unit 3): the scheduled lane-liveness report
