@@ -341,9 +341,10 @@ write_stamp() { # write_stamp <job>
     # a later install merely adopts it (the `armed-date` discipline install-launchd.sh uses for
     # worktree-hygiene). `armed_by=` names who/where, because the same box can be armed by a cell's
     # bring-up or by an owner's shell.
-    local armed_at armed_by previous_stance now_stance
+    local armed_at armed_by previous_stance previous_armed_at now_stance
     now_stance="${MODE_FLAG#--}"
     previous_stance="$(stamp_field armed)"
+    previous_armed_at="$(stamp_field armed_at)"
     # ⛔ THE DATE BELONGS TO THE STANCE, NOT TO THE FLAG THAT RESTATED IT (#2048 review, P2). A cell's
     # bring-up calls `--install --apply` on EVERY check, so "an explicit flag is a new decision" re-dated
     # the arming at each check and turned `armed_at=` into "the last --check" — contradicting what the
@@ -357,7 +358,7 @@ write_stamp() { # write_stamp <job>
         if [ -n "$previous_stance" ] && [ "$now_stance" = "apply" ] && [ "$previous_stance" = "dry-run" ]; then
             # Say it out loud: a caller that passes --apply unconditionally (the cell bring-up) has just
             # overridden a recorded reversal, and silence is how the owner never learns.
-            warn "RE-ARMING: the recorded stance was dry-run (since ${previous_stance}), and this invocation passes --apply — the job will now DELETE. Pass --dry-run to keep it report-only."
+            warn "RE-ARMING: the recorded stance was dry-run (since ${previous_armed_at:-unknown}), and this invocation passes --apply — the job will now DELETE. Pass --dry-run to keep it report-only."
         fi
     else
         # An ADOPTION (no flag, or a flag restating the recorded stance) must not move the date.
@@ -525,13 +526,54 @@ retarget_from_record() {
 dirs_to_consider() {
     local live="${1:-}" rec seen=" " d
     rec="$(recorded_dir)"
-    for d in "$rec" "$live" "${SYSTEMD_UNIT_DIR:-}" "$SYSTEMD_SYSTEM_DIR" "$HOME/.config/systemd/user"; do
+    # `${HOME:-}` like the rest of this file: root/container runs (SUDO="", no HOME) are a supported
+    # configuration, and `$HOME` here made `set -u` abort MID-LIST inside a process substitution — a
+    # truncated candidate list is indistinguishable from a complete one, so the read-back that makes
+    # "uninstalled" a verified claim degraded silently (#2048 review, P3).
+    for d in "$rec" "$live" "${SYSTEMD_UNIT_DIR:-}" "$SYSTEMD_SYSTEM_DIR" "${HOME:-}/.config/systemd/user"; do
         [ -n "$d" ] || continue
         case "$seen" in *" $d "*) continue ;; esac
         seen="$seen$d "
         printf '%s\n' "$d"
     done
     return 0
+}
+
+# ── which MANAGER owns which candidate directory ────────────────────────────────────────────────
+# `choose_systemd_target` answers "which manager should I use", and the answer moves with the sudo
+# probe. The artifacts do not move with it: a unit installed as root lives in the system dir and is
+# owned by the SYSTEM manager whatever this run's probe says. So the verbs that remove or report on an
+# install ask this instead — one row per candidate directory, `<target> <command>`.
+managers_in_play() { # <live-dir>
+    local d rec live
+    rec="$(recorded_dir)"; live="${1:-}"
+    for d in "$rec" "$live" "${SYSTEMD_UNIT_DIR:-}" "$SYSTEMD_SYSTEM_DIR" "${HOME:-}/.config/systemd/user"; do
+        [ -n "$d" ] || continue
+        case "$d" in
+            "${SYSTEMD_UNIT_DIR:-__none__}") printf 'override %s\n' "${SYSTEMCTL:-systemctl}" ;;
+            "$SYSTEMD_SYSTEM_DIR")           printf 'system %s\n' "${SYSTEMCTL:-${SUDO-sudo -n} systemctl}" ;;
+            "${HOME:-}/.config/systemd/user") printf 'user %s\n' "$SYSTEMCTL_USER" ;;
+            *) printf 'recorded %s\n' "${SYSTEMCTL:-systemctl}" ;;
+        esac
+    done | awk '!seen[$1]++'
+}
+
+# notify_managers <live-dir> — disable the timer through every manager that could own it.
+notify_managers() {
+    local t cmd
+    while IFS=' ' read -r t cmd; do
+        [ -n "$cmd" ] || continue
+        $cmd disable --now "$UNIT_NAME.timer" >/dev/null 2>&1 || true
+    done < <(managers_in_play "${1:-}")
+}
+
+# notify_managers_reload <live-dir> — and make each of them forget the unit it just lost.
+notify_managers_reload() {
+    local t cmd
+    while IFS=' ' read -r t cmd; do
+        [ -n "$cmd" ] || continue
+        $cmd daemon-reload >/dev/null 2>&1 || true
+    done < <(managers_in_play "${1:-}")
 }
 
 # armed_from_file <installed unit/plist> — apply|dry-run|unknown, read from the ARTIFACT.
@@ -595,12 +637,12 @@ runner_from_file() {
 
 sd_status() {
     local next last_exit svc en act
-    choose_systemd_target || { err "no systemd scheduler available"; return 1; }
-    # ⛔ AND THE SAME RE-TARGET HERE, because the EXIT CODE is the contract `cloud-cell-bringup.sh`
-    # gates on (#2048 review, P2): reading `is-enabled`/`is-active` off the wrong manager answered
+    # ⛔ THE RECORD DECIDES THE MANAGER, because the EXIT CODE is the contract `cloud-cell-bringup.sh`
+    # gates on (#2048 review, P2/P3): reading `is-enabled`/`is-active` off a re-derived manager answered
     # `disabled inactive` for a unit that was installed, enabled and armed — exit 1 on a correctly
-    # scheduled box. The artifact reads follow the same directory.
-    retarget_from_record || true
+    # scheduled box — and a probe that no longer resolves refused the question entirely. The live probe
+    # is the fallback, never the first answer.
+    retarget_from_record || choose_systemd_target || { err "no systemd scheduler available"; return 1; }
     svc="$UNIT_DIR/$UNIT_NAME.service"
     say "platform=linux"
     say "scheduler=systemd"
@@ -650,15 +692,36 @@ sd_uninstall() {
         say "preview: would disable and remove $UNIT_NAME.service/.timer from $UNIT_DIR (nothing was changed)"
         return 0
     fi
-    local dirs=() d found=0 live_dir
-    choose_systemd_target || { err "no systemd scheduler available"; return 1; }
-    live_dir="$UNIT_DIR"          # what THIS run derived, before the record is honoured
-    # The RECORDED install wins over the re-derived guess (it decides both the dir and the manager).
-    retarget_from_record || true
-    # EVERY directory that may hold it: the one the install RECORDED, and the one this run derived.
-    while IFS= read -r d; do [ -n "$d" ] && dirs+=("$d"); done < <(dirs_to_consider "$live_dir")
+    local dirs=() d found=0 live_dir recorded
+    # What THIS run derives first (the probe may still answer, and its directory is a real candidate)…
+    live_dir=""
+    choose_systemd_target && live_dir="$UNIT_DIR"
+    # …then the RECORD, which decides the directory AND the manager the artifact is actually under. On a
+    # box whose probe no longer resolves the stamp is the only thing that knows either, and refusing
+    # there left an armed reaper un-uninstallable through the tool (#2048 review, P3).
+    recorded="$(recorded_dir)"
+    retarget_from_record || { [ -n "$live_dir" ] || { err "no systemd scheduler available"; return 1; }; }
+    [ -n "$live_dir" ] || live_dir="$UNIT_DIR"
+    # EVERY directory that may hold it — that is the READ-BACK's population, so a survivor anywhere
+    # still fails the verb. The DELETION population is narrower on purpose (see below).
+    local candidates=()
+    while IFS= read -r d; do [ -n "$d" ] && candidates+=("$d"); done < <(dirs_to_consider "$live_dir")
+    [ "${#candidates[@]}" -gt 0 ] || candidates=("$UNIT_DIR")
+    # ⛔ DELETE ONLY WHERE THE RECORD (or this invocation) SAYS THE INSTALL WENT (#2048 review, P3).
+    # Removing from every candidate directory turned a stamp-less run into a wildcard uninstall of the
+    # machine-global unit — a state dir with NO record of it deleted a unit some other install owned.
+    dirs=()
+    for d in "$(recorded_dir)" "$live_dir"; do
+        [ -n "$d" ] || continue
+        case " ${dirs[*]-} " in *" $d "*) continue ;; esac
+        dirs+=("$d")
+    done
     [ "${#dirs[@]}" -gt 0 ] || dirs=("$UNIT_DIR")
-    $SC disable --now "$UNIT_NAME.timer" >/dev/null 2>&1 || true
+    # …and tell EVERY manager that owns a directory in play, not just the recorded one: with the probe
+    # flipped, the files were removed but the manager that actually held the timer was never asked to
+    # disable or reload it, so it kept firing until a reboot while the verb printed "uninstalled"
+    # (#2048 review, P2).
+    notify_managers "$live_dir"
     for d in "${dirs[@]}"; do
         if [ -w "$d" ] || { [ -n "${SYSTEMD_UNIT_DIR:-}" ] || [ "$SD_TARGET" = "user" ]; }; then
             rm -f "$d/$UNIT_NAME.service" "$d/$UNIT_NAME.timer"
@@ -666,17 +729,24 @@ sd_uninstall() {
             ${SUDO-sudo -n} rm -f "$d/$UNIT_NAME.service" "$d/$UNIT_NAME.timer"
         fi
     done
-    $SC daemon-reload >/dev/null 2>&1 || true
+    notify_managers_reload "$live_dir"
     # READ IT BACK. A denied `rm` (a sudo-less user over a root-owned unit) used to print "uninstalled"
     # and exit 0, and systemd reloads the surviving unit at the next boot — the removal is the claim, so
     # the removal is what gets verified (#2048 review). The read-back covers EVERY candidate directory:
     # a probe flip between install and uninstall used to check only the re-derived one, so a unit left
     # enabled in the recorded directory was reported as removed while still deleting hourly.
-    for d in "${dirs[@]}"; do
+    for d in "${candidates[@]}"; do
         [ -f "$d/$UNIT_NAME.service" ] || [ -f "$d/$UNIT_NAME.timer" ] && { found=1; err "uninstall INCOMPLETE: $UNIT_NAME is still installed under $d"; }
     done
-    if [ "$found" -eq 1 ] || $SC cat "$UNIT_NAME.service" >/dev/null 2>&1; then
-        err "uninstall INCOMPLETE: $UNIT_NAME is still known to systemd — nothing is claimed beyond what was read back"
+    # …and every manager that owns one of them is asked too, not only `$SC`: a file removed while the
+    # manager still knows the unit is exactly the survivor this read-back exists to catch.
+    local mc mc_target
+    while IFS=' ' read -r mc_target mc; do
+        [ -n "$mc" ] || continue
+        $mc cat "$UNIT_NAME.service" >/dev/null 2>&1 && { found=1; err "uninstall INCOMPLETE: $UNIT_NAME is still known to the $mc_target manager"; }
+    done < <(managers_in_play "$live_dir")
+    if [ "$found" -eq 1 ]; then
+        err "uninstall INCOMPLETE — nothing is claimed beyond what was read back"
         return 1
     fi
     rm -f "$STAMP"
@@ -973,6 +1043,19 @@ while [ $# -gt 0 ]; do
     shift
 done
 
+# ⛔ A FLAG NAMED "DRY RUN" MAY NOT DELETE (#2048 review, P2). `--dry-run` is the MODE flag — "install
+# the report-only job" — and every other tool in this repo spells it "change nothing", so combined with
+# `--uninstall` it read as a preview while performing the real removal and destroying the arming stamp
+# (the next sync then re-installs report-only and the box silently stops deleting). The no-write spelling
+# here is `--preview`; refuse the ambiguous combination loudly rather than guessing which one was meant.
+# (MODE_EXPLICIT, not MODE_FLAG: MODE_FLAG defaults to --dry-run, so testing the value would refuse a
+# plain `--uninstall` too. Only a flag the operator actually TYPED can be ambiguous.)
+if [ "$MODE" = "--uninstall" ] && [ "${MODE_EXPLICIT:-0}" = 1 ]; then
+    err "--uninstall does not take a mode flag: '${MODE_FLAG}' describes how the JOB would run, not whether to remove it."
+    err "       To see what would be removed without changing anything, use --uninstall --preview."
+    exit 2
+fi
+
 # ── the arming outlives the invocation that made it ─────────────────────────────────────────
 # `pi-bootstrap/setup.sh` — which `sync.sh` runs — re-installs with `--install` and NO mode flag on
 # every run. With the arming living only in the invocation, the next sync silently reverted an owner's
@@ -1048,7 +1131,12 @@ if [ "$PLATFORM" = darwin ] && ! command -v timeout >/dev/null 2>&1 && ! command
     warn "no 'timeout' binary on this Mac — disk-reaper.sh cannot complete a class until agent-infra#2046 lands. The job IS installed; every pass will report fail-closed (rc=3) with a named detail until it does."
 fi
 
-if [ "${SD_UNAVAILABLE:-0}" = 1 ] && [ "$PLATFORM" = linux ]; then
+# ⛔ ONLY WHEN THE RECORD CANNOT ANSWER EITHER (#2048 review, P3). The gate exists so a box with no
+# usable manager is not told "installed" — but it used to fire BEFORE dispatch, so `--status` and
+# `--uninstall` refused on the live probe alone and never consulted the stamp's recorded target/dir.
+# A box whose sudo probe moved therefore answered "this box has no scheduler" about a timer that was
+# enabled and active, and the armed unit became un-uninstallable through the tool.
+if [ "${SD_UNAVAILABLE:-0}" = 1 ] && [ "$PLATFORM" = linux ] && [ -z "$(recorded_dir)" ]; then
     err "no scheduler available: no passwordless sudo for a system unit, and no systemd user manager."
     err "       Install by hand, or give the box sudo. NOT silently skipping — a reaper that never runs is the failure this exists to remove."
     exit 1

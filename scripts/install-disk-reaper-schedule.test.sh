@@ -644,6 +644,43 @@ OUT="$(LAUNCHCTL_NO_PRINT_DISABLED=1 inst_mac --status 2>&1)"
 assert_absent "$OUT" "enabled=disabled" "T10b an unreadable override database is not guessed at (print still answers loaded)"
 "$T/bin/launchctl" enable gui/999/com.eldato.disk-reaper >/dev/null 2>&1
 
+# ── T8e: `--uninstall --dry-run` must NOT delete anything (#2048 review, P2) ─────────────────────
+# `--dry-run` is the MODE flag ("install the report-only job") and every other tool in this repo spells
+# it "change nothing" — so the combination read as a preview while performing the real removal AND
+# destroying the arming stamp. The no-write spelling is `--preview`; the combination is refused.
+inst_lin --install --apply >/dev/null 2>&1
+OUT="$(inst_lin --uninstall --dry-run 2>&1)"; RC=$?
+assert_eq "$RC" "2" "T8e --uninstall refuses an ambiguous mode flag (usage), rather than deleting"
+assert_contains "$OUT" "--uninstall --preview" "T8e …and names the no-write spelling"
+assert_file "$SVC" "T8e the unit is still installed after the refused call"
+[ -f "$T/state-lin/disk-reaper.schedule" ] && ok "T8e …and the arming stamp survives it" \
+    || bad "T8e the stamp was destroyed by a refused invocation"
+OUT="$(inst_lin --uninstall --preview 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T8e --preview is the accepted no-write path"
+assert_file "$SVC" "T8e …and changes nothing"
+inst_lin --uninstall >/dev/null 2>&1
+
+# ── T8f: deleting is bounded to where THIS run recorded or derived the install (#2048 review, P3) ──
+# Removing from every candidate directory made `--uninstall` a wildcard over the machine-global unit:
+# a run with no record of it still deleted a unit another install owned. The READ-BACK stays wide (a
+# survivor anywhere must fail the verb); only the DELETION is bounded. Deleting from the live-derived
+# dir is still right — a lost stamp must not make the reaper un-uninstallable — so this pins the case
+# where the directory is NEITHER recorded NOR derived.
+FOREIGN="$T/sys-foreign"; mkdir -p "$FOREIGN"
+HOME="$home_lin" DISK_REAPER="$PASSFILE" DISK_REAPER_REPOS="$REPO" DISK_REAPER_PLATFORM=linux \
+    DISK_REAPER_STATE_DIR="$T/state-foreign-a" SYSTEMD_SYSTEM_DIR="$FOREIGN" SUDO="" \
+    SYSTEMCTL="$T/bin/systemctl" SYSTEMCTL_CALLS="$T/systemctl.log" bash "$INST" --install >/dev/null 2>&1
+assert_file "$FOREIGN/eldato-disk-reaper.service" "T8f a foreign install exists in the system dir"
+NO_SUDO2="$T/bin/no-sudo2"; printf '#!/bin/bash\nexit 1\n' >"$NO_SUDO2"; chmod +x "$NO_SUDO2"
+# Different state dir (no stamp), and this run derives the USER dir — so the system dir is neither.
+HOME="$home_lin" DISK_REAPER="$PASSFILE" DISK_REAPER_REPOS="$REPO" DISK_REAPER_PLATFORM=linux \
+    DISK_REAPER_STATE_DIR="$T/state-foreign-b" SYSTEMD_SYSTEM_DIR="$FOREIGN" SUDO="$NO_SUDO2" \
+    SYSTEMCTL_USER="$T/bin/systemctl --user" SYSTEMCTL="$T/bin/systemctl" \
+    SYSTEMCTL_CALLS="$T/systemctl.log" bash "$INST" --uninstall >/dev/null 2>&1
+assert_file "$FOREIGN/eldato-disk-reaper.service" \
+    "T8f a unit in a directory this run neither recorded nor derived is NOT deleted"
+rm -rf "$FOREIGN" "$T/state-foreign-a" "$T/state-foreign-b"
+
 echo "── T11. both systemd targets, including the two arms no test could reach ──"
 # (a) the SYSTEM unit with `SUDO=""` — the "already root / container" arm. The system unit dir is a
 # seam now, so this branch is executable without real sudo writing to /etc/systemd/system.
