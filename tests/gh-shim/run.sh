@@ -692,6 +692,11 @@ maxc="$(cat "$TMP/gate-conc-max" 2>/dev/null || echo 0)"
 
 # (b) SPACING. Three calls, interval 1 s (a whole second on purpose: the assertion then
 #     holds whatever the clock's granularity, and `date +%s` is portable to macOS).
+#     ⛔ ASSERT THE TOTAL, NOT EACH GAP. Three calls at interval I guarantee start3 - start1 >= 2I
+#     whatever each child costs; asserting every PAIR is margin-dependent — one child's startup
+#     jitter moves a single gap and the arm fails while the spacing actually held (observed:
+#     083, 083, 085 — a zero gap plus a double gap, total still 2 s). The total is discriminating:
+#     with no spacing it collapses to 0-1 s.
 GDIR="$(gate_dir spacing)"; GTIMES="$TMP/gate-times"; : > "$GTIMES"
 GREAL="$TMP/gate-real-time"
 cat > "$GREAL" <<'GHEOF'
@@ -705,14 +710,14 @@ for _lane in 1 2 3; do
     bash "$SHIM" api user >/dev/null 2>&1
 done
 spacing_ok=1
-prev=""
+first=""; last=""
 while read -r t; do
-  [ -z "$prev" ] && { prev="$t"; continue; }
-  [ $(( t - prev )) -ge 1 ] || spacing_ok=0
-  prev="$t"
+  [ -z "$first" ] && first="$t"
+  last="$t"
 done < "$GTIMES"
+[ -n "$first" ] && [ -n "$last" ] && [ $(( last - first )) -ge 2 ] && spacing_ok=1 || spacing_ok=0
 [ "$spacing_ok" -eq 1 ] && [ "$(wc -l < "$GTIMES")" -ge 3 ] \
-  && pass "3 sequential calls at INTERVAL_MS=1000 → every gap is a full second (serialised)" \
+  && pass "3 sequential calls at INTERVAL_MS=1000 → total span >= 2 s (serialised)" \
   || fail "the minimum interval was not enforced: starts were $(tr '\n' ' ' < "$GTIMES")"
 
 # (c) `retry-after` IS HONOURED, and the retry is NEVER immediate. The fake refuses once,
@@ -743,9 +748,16 @@ if [ "$rc" -eq 0 ] && [ "$(cat "$GCOUNT")" -eq 2 ] && [ -n "$att2" ] \
 else
   fail "the 403 retry did not honour \`retry-after\` (rc=$rc attempts=$(cat "$GCOUNT" 2>/dev/null) starts='$(tr '\n' ' ' < "$GTIMES")')"
 fi
-grep -q 'waiting 1s' "$TMP/gate-429-err" \
-  && pass "  …and it announced the wait (a silent 60 s sleep is indistinguishable from a hang)" \
-  || fail "  …but the wait was not announced: $(head -2 "$TMP/gate-429-err" | tr '\n' ' ')"
+grep -q 'waiting 1s' "$GDIR/events.log" 2>/dev/null \
+  && pass "  …and the wait was recorded in events.log (a silent 60 s sleep is indistinguishable from a hang)" \
+  || fail "  …but the wait was never announced: $(head -2 "$GDIR/events.log" 2>/dev/null | tr '\n' ' ')"
+# ⛔ …AND IT MUST NOT HAVE BEEN ANNOUNCED ON STDERR: this call SUCCEEDED, and `gh-rest/gh`
+# parses `2>&1`, so a note here is a JSONDecodeError on the caller's good answer.
+if grep -q 'gh-gate:' "$TMP/gate-429-err" 2>/dev/null; then
+  fail "  …BUT it put a pacing note on a SUCCESSFUL call's stderr: $(head -2 "$TMP/gate-429-err" | tr '\n' ' ')"
+else
+  pass "  …and a successful call's stderr stayed byte-clean (the gh-rest 2>&1 parse is safe)"
+fi
 grep -q 'attempt 2' "$TMP/gate-429-out" \
   && pass "  …and stdout of the retried attempt is what the caller sees" \
   || fail "  …but the retried attempt's stdout was lost: $(cat "$TMP/gate-429-out")"
@@ -897,11 +909,165 @@ fi
 grep -q 'merged' "$TMP/gate-mut-out" \
   && pass "  …and the retried attempt's stdout is what the caller sees" \
   || fail "  …but the retried attempt's stdout was lost: $(cat "$TMP/gate-mut-out")"
-grep -q 'GitHub refused this call (rate limit)' "$TMP/gate-mut-err" \
-  && pass "  …and the code-named gate-note announces the wait it will take" \
-  || fail "  …but nothing announced the retry window: $(head -2 "$TMP/gate-mut-err" | tr '\n' ' ')"
+# The wait is announced where cycle-1 put it — the gate's OWN log, never a successful call's
+# stderr (`gh-rest/gh` parses `2>&1` as JSON, so a note there is a JSONDecodeError on the
+# caller's good answer). Assert BOTH directions, as §13(c)/(d) do.
+grep -q 'waiting 1s' "$GDIR/events.log" 2>/dev/null \
+  && pass "  …and the wait it took is recorded in the gate's events.log" \
+  || fail "  …but the retry window was never announced: $(head -2 "$GDIR/events.log" 2>/dev/null | tr '\n' ' ')"
+if grep -q 'gh-gate:' "$TMP/gate-mut-err" 2>/dev/null; then
+  fail "  …BUT a pacing note reached the SUCCESSFUL (retried) call's stderr: $(head -2 "$TMP/gate-mut-err" | tr '\n' ' ')"
+else
+  pass "  …and the successful retried call's stderr stayed byte-clean"
+fi
 
-# ── 14. THE WRAPPER RULE: SKIP EVERY SHIM, NEVER ONLY $SELF (#1988 ↔ #1910) ──
+echo "== 14. the gate must not corrupt its callers, and must not be corrupted by them (#1910 review) =="
+
+# (a) ⛔ THE ONE THAT MATTERS MOST. A successful call's stderr must be BYTE-IDENTICAL to the
+#     child's. The layer above (`gh-rest/gh`) does `run_real … 2>&1 | jq`, so a single pacing
+#     note beside a good answer is a JSONDecodeError on `pr view --json` and a reported FAILURE
+#     for a `pr merge` GitHub already performed. The pre-fix shim announced the wait on stderr.
+GDIR="$(gate_dir quiet)"
+GREAL="$TMP/gate-real-quiet"; GFLAG="$TMP/gate-quiet-flag"; rm -f "$GFLAG"
+cat > "$GREAL" <<'GHEOF'
+#!/usr/bin/env bash
+if [ ! -f "$GFLAG" ]; then
+  : > "$GFLAG"
+  echo 'API rate limit already exceeded for user ID 1' >&2
+  exit 1
+fi
+printf '{\"number\":1,\"title\":\"ok\"}\n'
+GHEOF
+chmod +x "$GREAL"
+cout="$(AGENT_GH_REAL="$GREAL" AGENT_GH_GATE_DIR="$GDIR" AGENT_GH_GATE_INTERVAL_MS=0 \
+        AGENT_GH_GATE_RETRY_BASE=1 GFLAG="$GFLAG" \
+        bash "$SHIM" api user 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$cout" | head -1 | grep -qE '^\{'; then
+  pass "a SUCCEEDED (and retried) call leaves stderr byte-clean — the merged 2>&1 is still JSON"
+else
+  fail "a successful call contaminated stderr (the gh-rest JSONDecodeError class): $(printf '%s' "$cout" | head -1)"
+fi
+grep -q 'gh-gate: GitHub refused' "$GDIR/events.log" 2>/dev/null \
+  && pass "  …and the pacing note was still recorded, in events.log" \
+  || fail "  …but the note vanished entirely (an operator cannot see the gate working)"
+
+# (b) …while a call that finally FAILS must still announce why, on stderr.
+GDIR="$(gate_dir loud)"
+GREAL="$TMP/gate-real-loud"
+cat > "$GREAL" <<'GHEOF'
+#!/usr/bin/env bash
+echo 'API rate limit already exceeded for user ID 1' >&2
+exit 1
+GHEOF
+chmod +x "$GREAL"
+AGENT_GH_REAL="$GREAL" AGENT_GH_GATE_DIR="$GDIR" AGENT_GH_GATE_INTERVAL_MS=0 \
+  AGENT_GH_GATE_RETRY_BASE=1 bash "$SHIM" api user >/dev/null 2>"$TMP/gate-loud-err"
+grep -q 'gh-gate: GitHub refused' "$TMP/gate-loud-err" \
+  && pass "a call that finally FAILS still announces the retry on stderr" \
+  || fail "a failing call swallowed its own announcement"
+
+# (c) SIGPIPE: `tr … | grep -Eq …` under `set -o pipefail` returns 141 once the stderr exceeds the
+#     pipe buffer, and 141 reads as "not rate limited" — so the refusal is missed and NO shared
+#     cooldown is written. 64 KB is comfortably past the buffer.
+GDIR="$(gate_dir big)"
+GREAL="$TMP/gate-real-big"; GFLAG="$TMP/gate-big-flag"; rm -f "$GFLAG"
+cat > "$GREAL" <<'GHEOF'
+#!/usr/bin/env bash
+if [ ! -f "$GFLAG" ]; then
+  : > "$GFLAG"
+  head -c 65536 /dev/zero | tr '\0' 'x' >&2
+  echo '' >&2
+  echo 'API rate limit already exceeded for user ID 1' >&2
+  exit 1
+fi
+printf '{\"ok\":true}\n'
+GHEOF
+chmod +x "$GREAL"
+bout="$(AGENT_GH_REAL="$GREAL" AGENT_GH_GATE_DIR="$GDIR" AGENT_GH_GATE_INTERVAL_MS=0 \
+        AGENT_GH_GATE_RETRY_BASE=1 GFLAG="$GFLAG" \
+        bash "$SHIM" api user 2>/dev/null)"
+printf '%s' "$bout" | grep -q '"ok":true' \
+  && pass "a 64 KB refusing stderr is still recognised (no SIGPIPE blind spot)" \
+  || fail "a large refusing stderr was not recognised — the retry/cooldown is silently dead"
+
+# (d) A `retry-after` `[ ]` cannot hold must be treated as ABSENT, never clamped-and-wrapped: the
+#     wrap is written into the SHARED cooldown and parks every lane on the box for ~10^15 years.
+GDIR="$(gate_dir ovf)"
+GREAL="$TMP/gate-real-ovf"
+cat > "$GREAL" <<'GHEOF'
+#!/usr/bin/env bash
+echo 'API rate limit exceeded' >&2
+echo 'retry-after: 9999999999999999999' >&2
+exit 1
+GHEOF
+chmod +x "$GREAL"
+AGENT_GH_REAL="$GREAL" AGENT_GH_GATE_DIR="$GDIR" AGENT_GH_GATE_INTERVAL_MS=0 \
+  AGENT_GH_GATE_MAX_ATTEMPTS=1 AGENT_GH_GATE_RETRY_BASE=1 \
+  bash "$SHIM" api user >/dev/null 2>&1
+ovf="$(cat "$GDIR"/cooldown.* 2>/dev/null | head -1)"
+if [ -z "$ovf" ]; then
+  pass "an unrepresentable retry-after is ignored (no cooldown written)"
+else
+  _now=$(( $(date +%s) * 1000 ))
+  if [ "$ovf" -le $(( _now + 900000 )) ] 2>/dev/null; then
+    pass "an unrepresentable retry-after is bounded to RETRY_MAX, not wrapped"
+  else
+    fail "retry-after overflow poisoned the shared cooldown with $ovf (a fleet-wide stall)"
+  fi
+fi
+
+# (e) A caller that declared its own bound must not be slept inside this gate.
+GDIR="$(gate_dir nowait)"
+_s=$(date +%s)
+GH_LIMIT_NO_WAIT=1 AGENT_GH_REAL="$GREAL" AGENT_GH_GATE_DIR="$GDIR" AGENT_GH_GATE_INTERVAL_MS=0 \
+  AGENT_GH_GATE_RETRY_BASE=60 bash "$SHIM" api user >/dev/null 2>&1
+_e=$(date +%s)
+[ $(( _e - _s )) -le 5 ] \
+  && pass "GH_LIMIT_NO_WAIT=1 returns the refusal at once (elapsed $(( _e - _s ))s, not 60s)" \
+  || fail "NO_WAIT was ignored — the gate slept $(( _e - _s ))s inside a bounded caller"
+
+# (f) The caller's cancellation must reach `gh`: a killed caller must not leave the child running
+#     through its retries against a bucket GitHub has already refused.
+GDIR="$(gate_dir sig)"; GREAL="$TMP/gate-real-sig"; SPID="$TMP/gate-sig-pid"; rm -f "$SPID"
+cat > "$GREAL" <<'GHEOF'
+#!/usr/bin/env bash
+echo $$ > "$SPID"
+sleep 30
+GHEOF
+chmod +x "$GREAL"
+AGENT_GH_REAL="$GREAL" AGENT_GH_GATE_DIR="$GDIR" AGENT_GH_GATE_INTERVAL_MS=0 SPID="$SPID" \
+  bash "$SHIM" api user >/dev/null 2>&1 &
+_shim=$!
+_slept=0; while [ ! -s "$SPID" ] && [ "$_slept" -lt 20 ]; do sleep 0.1; _slept=$(( _slept + 1 )); done
+_child="$(cat "$SPID" 2>/dev/null)"
+kill -TERM "$_shim" 2>/dev/null
+sleep 1
+if [ -n "$_child" ] && ! kill -0 "$_child" 2>/dev/null; then
+  pass "the caller's TERM reaches the gh child (no orphaned request)"
+else
+  kill -9 "$_child" 2>/dev/null
+  fail "the gh child outlived its caller — an orphaned request against a refused bucket"
+fi
+
+# (g) An unusable gate/capture dir must not STOP the call: bash performs `2>"$errf"` BEFORE exec, so
+#     a failed redirection means `gh` never runs and the caller gets rc=1 from a courtesy gate.
+GDIR="$(mktemp -d "$TMP/gate-ro.XXXXXX")"
+GREAL="$TMP/gate-real-ro"
+printf '#!/usr/bin/env bash\nprintf %s\n' "'{\"ok\":true}'" > "$GREAL"
+chmod +x "$GREAL"
+chmod 500 "$GDIR"
+roout="$(AGENT_GH_REAL="$GREAL" AGENT_GH_GATE_DIR="$GDIR/gate" TMPDIR="$GDIR" \
+        bash "$SHIM" api user 2>&1)"; rorc=$?
+chmod 700 "$GDIR"
+if [ "$rorc" -eq 0 ] && printf '%s' "$roout" | grep -q '"ok":true'; then
+  pass "an unwritable gate/capture dir still runs the call (rc=0)"
+else
+  fail "an unwritable capture dir stopped the call (rc=$rorc) — the gate failed CLOSED"
+fi
+printf '%s' "$roout" | grep -q 'Permission denied' \
+  && fail "  …and a failed redirect leaked a shell error onto the caller's stderr" \
+  || pass "  …and left the caller's stderr clean"
+# ── 15. THE WRAPPER RULE: SKIP EVERY SHIM, NEVER ONLY $SELF (#1988 ↔ #1910) ──
 # `scripts/orchestrator-harness/gh-rest/gh` and `gh-limit/gh` are harness gh layers of their
 # own, and each resolves the next `gh` on PATH. MEASURED on #1988: two shims that each skip
 # ONLY themselves resolve to EACH OTHER — 1,700 processes in 6 s, ending in
@@ -913,7 +1079,7 @@ grep -q 'GitHub refused this call (rate limit)' "$TMP/gate-mut-err" \
 # SYMLINKS (`-ef`, §10(a)) and the sentinel-marked harness layers — never only `$SELF_DIR`.
 # If that regressed, this shim would EXEC the harness layer, which resolves back here, and
 # the fleet would fork-loop. A hang is not a status, so the arms are bounded in time.
-echo "== 14. the resolver skips EVERY shim, never only \$SELF (#1988) =="
+echo "== 15. the resolver skips EVERY shim, never only \$SELF (#1988) =="
 
 # A fake `gh-limit/gh` carrying #1988's sentinel. It records that it RAN, on disk, so the
 # assertion is a fact about a file rather than about text that a later arm could emit.
@@ -966,6 +1132,8 @@ case "$out" in
   *PLAIN-GH-RAN*) pass "an UNMARKED gh earlier on PATH is used (the skip is a sentinel, not a name)" ;;
   *) fail "an unmarked gh earlier on PATH was not used: $out" ;;
 esac
+
+
 
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks gh-shim test(s) failed"

@@ -180,6 +180,14 @@ is range-clamped, and `nan`/`inf` fall back to the documented default rather tha
 `GH_LIMIT_NOW_CMD`/`GH_LIMIT_SLEEP_CMD` are the TEST seams for the fake clock — do not set them
 in production.
 
+⛔ **Also corrected 2026-10-17 (agent-infra#1910): the section below that told you to read
+`rate_limit` for the secondary limit was WRONG, and it is the mistake that reopened this
+runbook's own incident.** `GET /rate_limit` reports the **primary** budget only; GitHub
+documents that it **does not expose proximity to secondary limits**, and a secondary
+refusal may carry no `retry-after` at all. A healthy `graphql.remaining` beside a refused
+call is therefore the documented blind spot, not a contradiction — measured 2026-10-17
+with `used: 541` of 5000 while every GraphQL call was refused.
+
 ## Two limits, different behavior
 
 | Limit | Scope | Symptom |
@@ -199,6 +207,20 @@ construction). The fix is pacing, and there are two facts that follow from it:
   proceed. The authoritative signal is the gate's own in-flight count.
 
 ## The gate (do not work around it)
+
+This is the LAST hop before the real binary, and it sits *below* the #1988 helper above rather than
+replacing it: `gh-limit`/`gh-rest` apply the policy, then delegate the call through this shim, so a
+mutating call passes both layers. ⛔ **Their limits do NOT simply "compound to the tighter one".**
+The concurrency cap of 1 (that layer) makes this layer's cap of 2 redundant, and a single wait is
+bounded by both — but the RETRY **multiplies**: this gate re-runs the whole command up to 3 times and
+that layer up to 4, so one argv can execute up to 12 times, including a non-idempotent create or
+comment. A caller that declared its own per-call bound suppresses this layer's sleep
+(`GH_LIMIT_NO_WAIT=1` is honoured), which is why the two layers must agree on it. That is also why
+the shim must not resolve a harness layer as "the real gh" — see `find_real_gh`.
+
+⛔ **Nothing here writes to a successful call's stderr.** `gh-rest/gh` parses `2>&1` as JSON, so
+pacing notes go to `~/.pi/agent/gh-gate/events.log` and are replayed to stderr only when the call
+fails. If you are debugging pacing, read the log.
 
 Every `gh` call that goes through the argv-level shim (`scripts/gh-shim/gh`, installed at
 `~/.pi/agent/shims/gh`) is paced per machine:
@@ -222,8 +244,10 @@ a caller, you are adding an unpaced `gh` — say so in the comment, as that file
 gh api rate_limit --jq '.resources | {core: .core, graphql: .graphql}'
 
 # What the fleet is actually doing (the gate's own signal):
-ls ~/.pi/agent/gh-gate/slots | wc -l          # in flight right now
+ls ~/.pi/agent/gh-gate/slots | wc -l          # slots HELD — a stale one is reaped by PID only on
+                                              # the next admission, so this can slightly overstate
 ls ~/.pi/agent/gh-gate/cooldown.* 2>/dev/null  # an active refusal window
+tail -5 ~/.pi/agent/gh-gate/events.log         # what the gate did: paces, waits, fail-open notes
 ```
 
 - `graphql.remaining: 0` → GraphQL **primary** pool exhausted; REST (`core`) is usually still fine.
@@ -237,8 +261,6 @@ ls ~/.pi/agent/gh-gate/cooldown.* 2>/dev/null  # an active refusal window
   one refusal into a fleet-wide outage.
 - A bare `403` with a permissions message is NOT a rate limit; the shim does not retry it (a
   mutating command must not run twice).
-- Secondary limits: transient (typically 1–5 min); sleeping does not always clear them
-  for writes — switch transport instead.
 
 ## Fallback: REST for the operations gh uses GraphQL for
 
