@@ -151,7 +151,6 @@ below gets a test.
   acceptance. Filed as a follow-up. **CLOSED by #1327** — the gate is now bound to the
   canonical farm's file identity (same inode or same bytes); see
   `docs/plans/2026-10-16-issue-1327-skill-provenance.md`.
-  acceptance. Filed as a follow-up.
 - **T13 residual — persisted reads satisfy a gate, bounded by 24 h of IDLENESS** (eldato #7416 by
   design, pre-existing before this change: the stored key was a path string and was equally
   forgeable). This change *narrows* it (an entry must now name a skill a trusted root actually
