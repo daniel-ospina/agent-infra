@@ -52,7 +52,8 @@
 #    ship-list, which `scripts/check-pi-config-extensions.sh` check 4 keeps in exact parity
 #    with `extensions/`), MINUS a declared deny list. The default is parity, on purpose:
 #    a new guard extension must reach a cell without anyone remembering to add it here.
-#    The deny list is entries whose operation needs a surface a Linux cell does not have:
+#    The deny list is entries that must not run ON A CELL — one whose operation needs a
+#    surface a Linux cell does not have, and one that can make the cell unusable:
 #
 #      * `cmux-session.ts` — the bridge to the **cmux desktop app** (`cmux hooks pi install`
 #        owns and upgrades this file in place, and it `spawn`s the `cmux` CLI on every
@@ -60,6 +61,24 @@
 #        spawn, so every hook would fail. Hand-copying it is additionally the #1760
 #        duplicate-payload defect — the live laptop file is v4 (+18.8 KB, #1138) while the
 #        repo snapshot is v2, so a copied one is stale the moment it lands.
+#
+#      * `tortoise-capture` — measured 2026-10-19 on all three cloud cells (#2100): with the
+#        25,000-point quota exhausted the spool reached 3.9 MB / 357 queued uploads, work it did
+#        synchronously consumed the turn, and every turn ended with banner-only output
+#        (259-262 B) — a box that looked dead while its provider was healthy. Its banner also
+#        lands on stdout/stderr, so `cloud-cell-bringup.sh --check`'s provider probe read the
+#        capture banner instead of the provider's answer and refused a healthy box.
+#        ⛔ THE CELL'S COPY IS NOT THIS CHECKOUT'S COPY. It emitted `[tortoise-capture] install
+#        probe recorded`, and that string exists in no file under `extensions/tortoise-capture/`
+#        — so the cell ran a payload that differs from the repo, the duplicate-payload class the
+#        `cmux-session.ts` entry above already documents (#1138). The deny is therefore BY NAME
+#        and not by file content: it must hold whatever version a cell happens to carry. This
+#        checkout's copy is not innocent either — it writes `[tortoise-capture] created/appended
+#        …` to stdout from `agent_end` (`index.ts:729,734`) plus egress status lines, the very
+#        channel the provider probe used to read.
+#        It is NOT a cell feature: a cell's job is to run lanes, and capture is observability
+#        that happened to be able to consume the whole turn. This is a DENY, not a default: the
+#        entry stays in the ship-list and still ships to a laptop.
 #
 #    Everything else is installed. That IS the per-entry decision:
 #      * the five guards — review-enforcer, verification-gate, main-worktree-guard,
@@ -75,8 +94,11 @@
 #        health-check/;
 #      * inert-without-a-credential, installed anyway — mcp-client/, the provider
 #        registrations (custom-provider-openrouter/, custom-provider-qwen/), reflect-hook.ts,
-#        tortoise-capture/, slack-bridge/. These read keys/surfaces the operator may set in
-#        the cell's keys.env, and each is documented to degrade gracefully. `carousel-designer.ts`
+#        slack-bridge/. These read keys/surfaces the operator may set in
+#        the cell's keys.env, and each is documented to degrade gracefully. (reflect-hook.ts
+#        shares `tortoise-capture`'s hosted-capture path but writes no per-turn stdout line, so
+#        it keeps its documented no-op — the deny is by measured failure mode, not by directory
+#        name.) `carousel-designer.ts`
 #        and `design-reviewer.ts` are also installed: recorded decision #45 KEEPS them in
 #        agent-infra as canonical with a graceful no-op when ELDATO_ROOT is unset, so
 #        env-gating them here would be adopting over a decision.
@@ -160,12 +182,43 @@ fail() { printf 'FAIL: %s\n' "$*" >&2; FAILURES=$((FAILURES + 1)); }
 die()  { printf 'FATAL: %s\n' "$*" >&2; exit 1; }
 say()  { printf '  %s\n' "$*"; }
 
-# ── the deny list: surfaces a Linux cell does not have ───────────────────────
+# ── the deny list: what must not run ON A CELL ──────────────────────────────
 # Kept as data so the deny is readable and testable, and so the DEFAULT for a new
-# manifest entry is "install" — the direction that cannot lose a guard.
+# manifest entry is "install" — the direction that cannot lose a guard. It is NOT a second
+# list of files to copy: the manifest's ship-list is still the only source of what gets
+# installed, and a denied row is simply skipped. The deny is then enforced against what is
+# ACTUALLY ON THE CELL, in BOTH halves — `install_extensions` removes a present copy, and
+# `verify_layer` fails a cell that still carries one — so a regression cannot report LAYER
+# VERIFIED for the artifact that breaks the box. Deliberately not scoped to the manifest
+# rows: bound to them, a deny would go inert the moment an entry was dropped from the
+# ship-list, and a copy left on the cell would be certified clean.
 DENY_EXTENSIONS=(
   cmux-session.ts        # bridge to the cmux DESKTOP APP (and spawns the `cmux` CLI per hook)
+  tortoise-capture       # consumed the whole turn and wrote its banner into the channel
+                         # cloud-cell-bringup.sh's provider probe reads (#2100, measured 2026-10-19
+                         # on all three cells). Denied BY NAME: the deployed cell copy differed
+                         # from this checkout's (`install probe recorded` exists in no repo file),
+                         # so a content-keyed deny would have missed it. Written without the
+                         # manifest's trailing slash because read_manifest_entries strips it.
 )
+
+# denied_extension_note <base> — WHY a denied entry must be absent, worded ONCE. Both halves
+# consume it: the install half's removal line and the verify half's failure line, so they can
+# never describe different reasons for the same entry (a removal note that says "surface absent"
+# about the capture extension would send an operator looking for a desktop app that is not the
+# problem).
+# ⛔ The capture wording is the INCIDENT'S, not a description of this checkout's file, and it is
+# pinned verbatim by BOTH suites: "it blocks session_start and corrupts the provider probe". The
+# cell ran a copy that differs from the repo (see the deny-list comment above), and an operator
+# greps a bring-up log for exactly this sentence — so re-word it only together with the tests that
+# assert it (pi-bootstrap/tests/test-cell-install.sh, scripts/cloud-cell-bringup.test.sh).
+denied_extension_note() {
+  case "${1%/}" in
+    tortoise-capture) printf 'it blocks session_start and corrupts the provider probe' ;;
+    cmux-session.ts)  printf 'its surface is absent on a Linux cell' ;;
+    *)                printf 'the cell must not run it' ;;
+  esac
+}
 
 # ── the farm layout (#1723) ──────────────────────────────────────────────────
 # <array name in setup.sh><TAB><source root under $INFRA_ROOT><TAB><destination under $DEST>
@@ -498,7 +551,7 @@ denied_extension() {
 }
 
 install_extensions() {
-  local entries base src dst n=0 removed=0 total=0
+  local entries base src dst n=0 removed=0 total=0 d dbase
   entries="$(read_manifest_entries)" || die "the extension ship-list could not be read from manifest.json (see above)"
   total="$(printf '%s\n' "$entries" | grep -c . || true)"
   if [ "$total" -lt "$MIN_SHIP_LIST" ]; then
@@ -508,15 +561,7 @@ install_extensions() {
     [ -n "$base" ] || continue
     src="$INFRA_ROOT/extensions/$base"
     dst="$DEST/extensions/$base"
-    if denied_extension "$base"; then
-      # enforce the deny, including against a previous hand-push
-      if [ -e "$dst" ] || [ -L "$dst" ]; then
-        rm -rf "$dst"
-        say "removed denied extension: $base (its surface is absent on a Linux cell)"
-        removed=$((removed + 1))
-      fi
-      continue
-    fi
+    denied_extension "$base" && continue   # enforced below, against the CELL and not the ship-list
     [ -e "$src" ] || die "manifest lists extensions/$base but it is absent from the checkout"
     if [ -L "$dst" ]; then rm -f "$dst"; fi   # a link into a checkout can dangle on a cell
     if [ -f "$src" ]; then
@@ -527,7 +572,19 @@ install_extensions() {
     fi
     n=$((n + 1))
   done <<<"$entries"
-  say "extensions: $n installed from manifest.json (ship-list: $total), $((${#DENY_EXTENSIONS[@]})) denied by surface, $removed removed"
+  # The deny is enforced against what is ON THE CELL, not only across the manifest rows — for the
+  # same reason the verify half does it: if an entry is ever dropped from manifest.json, a
+  # deny bound to the ship-list stops reaching it, and a copy left by a hand-push or by an older
+  # checkout would survive every bringup. That is exactly the #2100 re-break with a quieter cause.
+  for d in "${DENY_EXTENSIONS[@]}"; do
+    dbase="${d%/}"
+    # `-e` follows a symlink, so a DANGLING link at this path is invisible to it; `-L` catches it.
+    { [ -e "$DEST/extensions/$dbase" ] || [ -L "$DEST/extensions/$dbase" ]; } || continue
+    rm -rf "$DEST/extensions/$dbase"
+    say "removed denied extension: $dbase ($(denied_extension_note "$dbase"))"
+    removed=$((removed + 1))
+  done
+  say "extensions: $n installed from manifest.json (ship-list: $total), $((${#DENY_EXTENSIONS[@]})) denied on a cell, $removed removed"
 }
 
 # Extension runtime dependencies. Four shipped extensions import bare packages
@@ -982,14 +1039,7 @@ verify_layer() {
   fi
   while IFS= read -r base; do
     [ -n "$base" ] || continue
-    if denied_extension "$base"; then
-      # Same predicate as the install half: `-e` follows a symlink, so a DANGLING link at this
-      # path is invisible to it and the deny would certify exactly what it exists to refuse.
-      if [ -e "$DEST/extensions/$base" ] || [ -L "$DEST/extensions/$base" ]; then
-        fail "denied extension is PRESENT on the cell: extensions/$base"
-      fi
-      continue
-    fi
+    denied_extension "$base" && continue   # checked below, against the CELL and not the ship-list
     # EXISTENCE IS NOT ENOUGH. The farm loop above byte-compares every file, but this loop
     # used to accept a bare `[ -e ]` — so a stale, truncated or hand-edited guard extension
     # verified clean, and a guard that is not the reviewed one is worse than a missing one
@@ -1014,6 +1064,28 @@ verify_layer() {
       esac
     fi
   done <<<"$entries"
+
+  # The deny is enforced against the CELL, not only across the manifest rows. Bound to the
+  # ship-list it would go INERT the moment an entry is dropped from manifest.json, and a copy left
+  # on the cell (a hand-push, or an install from an older checkout) would then be certified clean.
+  # A deny that stops denying when the ship-list changes is the same fail-open it exists to catch.
+  local dname
+  for dname in "${DENY_EXTENSIONS[@]}"; do
+    dname="${dname%/}"
+    # Same predicate as the install half: `-e` follows a symlink, so a DANGLING link at this
+    # path is invisible to it and the deny would certify exactly what it exists to refuse.
+    { [ -e "$DEST/extensions/$dname" ] || [ -L "$DEST/extensions/$dname" ]; } || continue
+    # The capture entry gets its own NAMED line, because its failure mode is not "a surface is
+    # missing" — it is "the box stops running lanes and the bring-up probe lies about it". An
+    # operator grepping the log for the dead-lane cause must find that sentence; the generic
+    # "denied extension" wording would read as a cosmetic surface mismatch.
+    case "$dname" in
+      tortoise-capture)
+        fail "capture extension present on a cell: $(denied_extension_note "$dname")" ;;
+      *)
+        fail "denied extension is PRESENT on the cell: extensions/$dname ($(denied_extension_note "$dname"))" ;;
+    esac
+  done
 
   local g
   for g in "${GUARD_EXTENSIONS[@]}"; do

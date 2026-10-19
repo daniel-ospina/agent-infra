@@ -222,6 +222,39 @@ if [ -e "$DEST/extensions/cmux-session.ts" ]; then
 else
   ok "cmux-session.ts is NOT installed (surface-absent deny holds)"
 fi
+# #2100 — a cell must not carry the capture extension. Measured 2026-10-19 on all three cells:
+# `tortoise-capture` flushes its spool SYNCHRONOUSLY at session_start, and with the quota
+# exhausted every turn ended with banner-only output (259-262 B) — the box looked dead while its
+# provider was healthy. `cell-install.sh` re-shipped it from the manifest's ship-list on every
+# bringup, so operationally disabling it did not survive; the deny is the fix, and it must hold
+# WITHOUT anyone remembering to hand-remove the cell copy.
+if [ -e "$DEST/extensions/tortoise-capture" ]; then
+  fail "tortoise-capture was installed on a cell — it blocks session_start and re-breaks the box on every bringup (#2100)"
+else
+  ok "tortoise-capture is NOT installed (deny holds: it blocks session_start, #2100)"
+fi
+# ... and `--verify` must FAIL, with its own NAMED line, on a cell that carries it anyway (a
+# hand-push, or a checkout from before this deny). The generic "denied extension is PRESENT"
+# wording is not enough here: an operator grepping the bring-up log for the dead-lane cause must
+# be able to find the sentence that explains it. Asserted on the EXACT line, so a reworded or
+# softened failure goes red instead of quietly losing the diagnosis.
+CAPTURE_LINE='capture extension present on a cell: it blocks session_start and corrupts the provider probe'
+mkdir -p "$DEST/extensions/tortoise-capture"
+echo '// hand-pushed by the test' > "$DEST/extensions/tortoise-capture/index.ts"
+run_verify
+rc=$?
+[ "$rc" -eq 1 ] && grep -qF "FAIL: $CAPTURE_LINE" "$LOG" \
+  && ok "--verify FAILS on a cell carrying tortoise-capture, with the named line" \
+  || fail "--verify CERTIFIED (or mis-named) a cell carrying tortoise-capture: $(grep -F 'capture' "$LOG" | tail -1)"
+# ... and the INSTALL half must remove a present copy, because that is the direction the defect
+# ran: the artifact was re-shipped on every bringup, so a deny that only reports is the same
+# re-break with a log line. That is asserted in run 2 below, on a re-run (the exact operation that
+# used to re-ship it), so this run's npm invocation count stays one-per-install. The fixture is
+# removed here so the rest of run 1 sees a clean cell.
+rm -rf "$DEST/extensions/tortoise-capture"
+run_verify
+[ $? -eq 0 ] && ok "--verify is clean again once the capture extension is gone" \
+  || fail "--verify still fails after the capture extension was removed"
 # ... and `--verify` must enforce that same deny against a cell that already has it, with the
 # install half's predicate: `-e` FOLLOWS a symlink, so a dangling link at the denied path is
 # invisible to it and the deny would certify what it exists to refuse.
@@ -239,7 +272,10 @@ if [ -z "$ship_list" ]; then
   fail "the independent manifest reader produced nothing — the extension cross-check did not run"
 else
   while IFS= read -r base; do
-    [ "$base" = "cmux-session.ts" ] && continue
+    # The TEST's own deny contract, stated here rather than read from the installer's
+    # DENY_EXTENSIONS: a reader that agreed with the installer would pass when an entry is
+    # dropped from the deny list, which is the regression these two lines exist to catch.
+    case "$base" in cmux-session.ts|tortoise-capture) continue ;; esac
     [ -e "$DEST/extensions/$base" ] || ext_missing="$ext_missing $base"
   done <<<"$ship_list"
   [ -z "$ext_missing" ] && ok "every manifest ship-list entry except the deny is installed" \
@@ -326,6 +362,17 @@ if [ ! -e "$DEST/extensions/cmux-session.ts" ]; then
   ok "a hand-pushed cmux-session.ts was REMOVED by the re-run (the deny is enforced, not decorative)"
 else
   fail "a hand-pushed cmux-session.ts survived the re-run"
+fi
+# The #2100 re-break, replayed: the extension is on the cell (hand-pushed, or installed by an
+# older checkout) and a re-run is exactly the operation that used to re-ship it from the
+# manifest. A re-run must leave the cell WITHOUT it.
+mkdir -p "$DEST/extensions/tortoise-capture"
+echo '// hand-pushed by the test' > "$DEST/extensions/tortoise-capture/index.ts"
+run_install >/dev/null 2>&1
+if [ ! -e "$DEST/extensions/tortoise-capture" ]; then
+  ok "a hand-pushed tortoise-capture was REMOVED by the re-run (#2100: bringup no longer re-ships it)"
+else
+  fail "a hand-pushed tortoise-capture survived the re-run — bringup re-ships the box-breaking extension"
 fi
 if [ ! -e "$DEST/tools/fleet" ]; then
   ok "a legacy tools/fleet/ was migrated out of pi's boot-blocking namespace (#1277)"

@@ -286,21 +286,61 @@ check_provider() {
   fi
   # Probe by EXECUTION. The image's ANTHROPIC key is present-but-invalid, so the
   # presence of the variable proves nothing.
-  local out
-  out="$(timeout 120 pi -p --no-session --provider deepseek --model deepseek-flash \
-          'Reply with exactly: LANE_READY' 2>&1 | tail -3)"
+  #
+  # ⛔ TWO PROBES, AND THEIR ORDER IS THE CONTRACT (#2100). Measured 2026-10-19 on all three
+  # cells: this function used to run ONE probe — `pi -p … 2>&1 | tail -3` with the WHOLE extension
+  # layer loaded — so whatever an extension wrote became "the provider's answer". On a
+  # quota-exhausted box `tortoise-capture` emitted banner lines only (259-262 B), the last three
+  # lines were the banner, and the bring-up reported `FATAL: provider probe failed` for a box whose
+  # provider was healthy (`pi` returned LANE_READY as soon as the extension was gone). The opposite
+  # error is just as bad, and a single isolated probe trades one for the other: a layer that
+  # swallows every turn would sail through a `--no-extensions` probe and the box would report CELL
+  # READY while being unusable. So measure BOTH, and let each one answer the question only it can:
+  #   1. LAYER-LOADED first, because that is what a lane actually does (`pi -p` with extensions).
+  #      An answer here proves the provider AND the layer — one call, the common case.
+  #   2. If it does not answer, the ISOLATED probe (`--no-extensions`) attributes the cause. If the
+  #      provider answers there, the LAYER is the culprit and the finding NAMES the layer (a warn,
+  #      because the provider is proven healthy and a transient blip must not turn a healthy box
+  #      into the #2100 false FATAL). If it does not answer there either, the provider is at fault
+  #      and the classification below (spawn-gate refusal / 401 / generic) is authoritative.
+  # `--no-extensions` also excludes `clamp-output-floor.ts`, which ships on cells and prints a
+  # registration-time banner on stderr BY DESIGN — a second, deliberately noisy writer in this very
+  # channel. And NEITHER probe `tail`s its output: the ANSWER is extracted from the whole stream
+  # (excluding the echoed prompt), so nothing an extension, pi or the provider prints can displace
+  # or truncate it. `--no-extensions` does NOT disable the spawn-point gate: that is
+  # `$CELL_HOME/.pi/agent/bin/pi` on PATH, not an extension, so the #1884 refusal below still fires.
+  local out answer detail layer_out layer_answer layer_detail
+  layer_out="$(timeout 120 pi -p --no-session --provider deepseek --model deepseek-flash \
+                'Reply with exactly: LANE_READY' 2>&1)"
+  layer_answer="$(printf '%s\n' "$layer_out" | grep -F 'LANE_READY' | grep -vF 'Reply with exactly' | head -1)"
+  if [ -n "$layer_answer" ]; then
+    ok "provider call works (pi returned LANE_READY, extension layer loaded)"
+    return 0
+  fi
+  # The layer's own output, bounded, so a long banner cannot bury the reason in the log.
+  layer_detail="$(printf '%s\n' "$layer_out" | grep -v '^[[:space:]]*$' | tail -5)"
+  out="$(timeout 120 pi -p --no-session --no-extensions --provider deepseek --model deepseek-flash \
+          'Reply with exactly: LANE_READY' 2>&1)"
+  answer="$(printf '%s\n' "$out" | grep -F 'LANE_READY' | grep -vF 'Reply with exactly' | head -1)"
+  if [ -n "$answer" ]; then
+    # The provider is healthy — so the layer is what swallowed the turn. WARN, never FATAL: a
+    # provider failure is unprovable here, and #2100's whole defect was a healthy box refused.
+    warn "the provider answered with extensions DISABLED but NOT with the layer loaded — an extension is swallowing the turn (#2100). Loaded-layer output: $layer_detail"
+    return 0
+  fi
+  # Diagnostics only — the classification below decides.
+  detail="$(printf '%s\n' "$out" | grep -v '^[[:space:]]*$' | tail -5)"
   case "$out" in
-    *LANE_READY*) ok "provider call works (pi returned LANE_READY)" ;;
     # ⛔ agent-infra#1884: `pi` is the SPAWN POINT now, and it refuses above the box's load ceiling —
     # which is NOT a provider failure. Without this arm the refusal lands in the catch-all below and
     # the bring-up reports "provider probe failed" for a call that never reached a provider, sending
     # an operator to re-push a perfectly good key. The remedy for a refusal is capacity, so say that.
     *'[pi-gate] REFUSED'*)
-      die "provider probe NOT RUN: the pi spawn point refused the launch (1-min load is at or above MAX_LOAD on this box). That is CAPACITY, not the provider — quieten the box (or raise MAX_LOAD deliberately) and re-run. Last output: $out" ;;
+      die "provider probe NOT RUN: the pi spawn point refused the launch (1-min load is at or above MAX_LOAD on this box). That is CAPACITY, not the provider — quieten the box (or raise MAX_LOAD deliberately) and re-run. Last output: $detail" ;;
     *authentication_error*|*invalid*x-api-key*|*401*)
       die "provider key REJECTED (401). The image's pre-set key is stale — push a valid one." ;;
-    *) die "provider probe failed. Last output: $out" ;;
   esac
+  die "provider probe failed. Last output: $detail"
 }
 
 # ── (3) gh auth, via a pushed token file ────────────────────────────────────────
@@ -429,7 +469,15 @@ check_operational_layer() {
   local out rc=0
   out="$(CELL_HOME="$CELL_HOME" INFRA_ROOT="$root" bash "$installer" --verify 2>&1)" || rc=$?
   if [ "$rc" -ne 0 ]; then
-    say "  the cell does not carry a current layer (verify rc=$rc) — installing it from $root"
+    # SURFACE the read-back's own refusal before repairing. It used to be discarded — the
+    # variable is overwritten by the install below — so an operator saw "the cell does not carry a
+    # current layer" and never WHICH artifact was wrong. Measured (#2100): a cell carrying
+    # `tortoise-capture` had its verify failure silently swallowed while the next bringup
+    # re-installed the extension, so the reason the box kept re-breaking itself appeared nowhere
+    # in the log. The installer's named line ("capture extension present on a cell: …") is the
+    # evidence; print it, indented like the rest of the layer output.
+    say "  the cell does not carry a current layer (verify rc=$rc) — installing it from $root. The read-back's own reasons:"
+    printf '%s\n' "$out" | sed 's/^/    /'
     rc=0
     out="$(CELL_HOME="$CELL_HOME" INFRA_ROOT="$root" bash "$installer" --install 2>&1)" || rc=$?
     printf '%s\n' "$out" | sed 's/^/    /'

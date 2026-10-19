@@ -34,6 +34,23 @@
 #   * NON-VACUITY: a clean run still exits 0 and still prints CELL READY, and a token that is
 #     present is genuinely deleted (a suite that never had the file would pass for the wrong reason).
 #
+# #2100 (the capture extension), added here because the two mechanisms meet in `--check`:
+#   * the PROVIDER PROBE reads the provider, not the extension layer — a noisy layer (the measured
+#     banner-only shape: `[tortoise-capture] …`, no answer) must NOT turn a healthy provider into
+#     `FATAL: provider probe failed`. The stub `pi` reproduces that shape, and the probe's OWN
+#     two-probe contract is what is pinned: layer-loaded first, `--no-extensions` second to
+#     ATTRIBUTE. So the noisy case must (i) report no provider failure, (ii) NAME the layer as the
+#     culprit, and (iii) a broken key must still be blamed on the provider in every mode. Reordering
+#     or dropping either probe turns one of those red (the cases prove the fixture emits no
+#     LANE_READY with the layer loaded and DOES answer in isolation, so none can pass vacuously);
+#   * a cell that CARRIES `tortoise-capture` fails the installer's read-back at the named (b) call
+#     (`capture extension present on a cell: …`) and `--check` SURFACES that line — it used to
+#     discard the verify output entirely, so the reason the box kept re-breaking itself appeared
+#     nowhere in the log. The run then repairs the cell (that IS the fix: the deny removes it), and
+#     the evidence asserted here is the named line plus the extension's absence — never a claim of
+#     readiness over a failed read-back;
+#   * with the extension ABSENT and the provider healthy, `--check` reports NO provider failure.
+#
 # Hermetic: temp HOME/state/token path, stubbed toolchain, no network, and GH_TOKEN_FILE keeps it
 # away from the REAL /tmp/.gh-tok. Run:  bash scripts/cloud-cell-bringup.test.sh
 # ⚠️ `--check` now also provisions the operational layer (#1723) from the checkout this script
@@ -78,7 +95,29 @@ printf '#!/bin/sh\nmkdir -p node_modules\necho x > node_modules/.package-lock.js
 # `git --version` is parsed for a version; `git -C <repo> rev-parse --short HEAD` is echoed into the
 # "repo present" line. `git -C <repo> config …` output is ignored.
 printf '#!/bin/sh\ncase "$1" in --version) echo "git version 2.39.0";; *) echo abc1234;; esac\n' > "$STUB/git"
-printf '#!/bin/sh\nif [ "$1" = "--version" ]; then echo "0.85.1"; else echo "LANE_READY"; fi\n' > "$STUB/pi"
+# The probe stub also has to be able to reproduce the MEASURED #2100 shape: a layer that emits banner
+# lines and NEVER reaches the model, so the output carries no answer at all. It only answers when the
+# probe asks for a provider with extensions DISABLED (`--no-extensions`). That is what makes both
+# halves of the two-probe contract testable: the LAYER probe goes red on this fixture while the
+# ISOLATED probe answers, so the run must WARN about the layer and must NOT blame the provider.
+# `broken` models the other attribution: the provider itself rejects the key in EVERY mode, so the
+# run must die on the 401 arm even while the layer is noisy.
+cat > "$STUB/pi" <<'STUB'
+#!/bin/sh
+[ "$1" = "--version" ] && { echo "0.85.1"; exit 0; }
+has_ne=0
+for a in "$@"; do [ "$a" = "--no-extensions" ] && has_ne=1; done
+if [ "${PI_STUB_MODE:-normal}" = broken ]; then
+  printf '{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}\n'
+  exit 0
+fi
+if [ "${PI_STUB_MODE:-normal}" = noisy ] && [ "$has_ne" -eq 0 ]; then
+  printf '[tortoise-capture] install probe recorded (harness=pi)\n'
+  printf '[tortoise-capture] spool flush (session_start): filed 0, deferred 2, skipped 320 (320 waiting on backoff)\n'
+  exit 0
+fi
+echo LANE_READY
+STUB
 # check_provider wraps the probe in `timeout 120 pi …`; GNU timeout is not on every dev box (macOS
 # has none), so it is stubbed here rather than assumed.
 printf '#!/bin/sh\nshift\nexec "$@"\n' > "$STUB/timeout"
@@ -224,6 +263,99 @@ case "$BR_OUT" in
 esac
 [ ! -e "$TOK" ] && ok "the token is removed on the second run too" \
                 || bad "token file SURVIVED the second clean run"
+
+# ── 2c) a NOISY layer cannot turn a healthy provider into a provider failure (#2100) ─────────────
+# Measured 2026-10-19 on all three cells: `tortoise-capture` consumed the turn and every turn ended
+# with banner-only output (259-262 B). The provider probe read `… | tail -3` of `pi -p` with the
+# whole extension layer loaded, so those banner lines BECAME the answer and a healthy box was
+# refused with `FATAL: provider probe failed` (`pi` returned LANE_READY fine once the extension was
+# gone). The probe now runs TWO: the layer-loaded one first (what a lane does), and the isolated
+# `--no-extensions` one to ATTRIBUTE a non-answer. So a noisy layer can only produce a LAYER finding
+# — never a provider failure — and it still produces one, instead of sailing through unnoticed.
+say_case "a noisy extension layer cannot produce a provider failure (#2100)"
+# NON-VACUITY first: the fixture really is the measured shape — asked WITHOUT the isolation, it emits
+# banner lines and no answer, which is exactly what used to be read as "the provider is broken".
+probe_out="$(PATH="$STUB:$PATH" PI_STUB_MODE=noisy "$STUB/pi" -p --no-session \
+              'Reply with exactly: LANE_READY' 2>&1)"
+case "$probe_out" in
+  *LANE_READY*) bad "the noisy fixture still answers — this case would pass for the wrong reason" ;;
+  *) ok "the fixture reproduces the measured shape: banner-only output, no provider answer" ;;
+esac
+# ... and the OTHER half of the contract: the same fixture DOES answer when the probe isolates, which
+# is what makes the verdict "the layer, not the provider" (and not "everything is broken").
+probe_iso="$(PATH="$STUB:$PATH" PI_STUB_MODE=noisy "$STUB/pi" -p --no-session --no-extensions \
+              'Reply with exactly: LANE_READY' 2>&1)"
+case "$probe_iso" in
+  *LANE_READY*) ok "the same fixture answers with extensions disabled — the layer is the culprit, provably" ;;
+  *) bad "the fixture does not answer even in isolation — the attribution below would be vacuous" ;;
+esac
+printf '%s\n' "$TOK_BODY" > "$TOK"
+PI_STUB_MODE=noisy br ok normal --check
+case "$BR_OUT" in
+  *"provider probe failed"*) bad "a NOISY layer turned a healthy provider into a provider failure — the probe is not isolated: $BR_OUT" ;;
+  *) ok "the probe reports NO provider failure while the layer emits banner lines" ;;
+esac
+# The detector must be LIVE, not merely absent: the isolated probe proved the provider healthy, so the
+# run has to NAME the layer as the thing that swallowed the turn (#2100's class of defect).
+case "$BR_OUT" in
+  *"an extension is swallowing the turn"*) ok "the noisy layer is NAMED as the culprit (the layer-loaded probe is still measured)" ;;
+  *) bad "the layer swallowed the turn and nothing said so — the two-probe attribution is inert: $BR_OUT" ;;
+esac
+[ "$BR_RC" -eq 0 ] && ok "the noisy run still exits 0 (a layer finding is not a provider FATAL)" \
+                   || bad "the noisy run FAILED (rc=$BR_RC): $BR_OUT"
+case "$BR_OUT" in
+  *"CELL READY"*) ok "the noisy run still reaches CELL READY" ;;
+  *) bad "the noisy run never reaches CELL READY — output: $BR_OUT" ;;
+esac
+
+# ── 2c2) attribution survives the reorder: a BROKEN provider is still blamed on the provider ──────
+# The two-probe contract must not turn a genuinely dead key into a layer warning. With the provider
+# rejecting in EVERY mode (isolated included), the 401 arm is authoritative — this is the case that
+# goes red if the attribution ever falls back to "no isolated answer ⇒ warn about the layer".
+say_case "a rejecting provider is still a provider failure, layer or no layer (#2100)"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+PI_STUB_MODE=broken br ok normal --check
+case "$BR_OUT" in
+  *"provider key REJECTED (401)"*) ok "the run blames the PROVIDER when the key is rejected in every mode" ;;
+  *) bad "a rejecting provider was not reported as a provider failure — output: $BR_OUT" ;;
+esac
+case "$BR_OUT" in
+  *"an extension is swallowing the turn"*) bad "a dead key was mis-attributed to the extension layer" ;;
+  *) ok "no layer finding is emitted when the layer is not the culprit" ;;
+esac
+[ "$BR_RC" -ne 0 ] && ok "the run FAILS on a rejecting provider" \
+                   || bad "the run reported success over a rejecting provider"
+
+# ── 2d) a cell that CARRIES the capture extension: the read-back fails, and --check NAMES it ────
+# This is the provisioning half of #2100. The extension is still in the manifest ship-list, so a
+# bare bringup re-ships it; the deny in cell-install.sh is what keeps it off the cell, and its
+# `--verify` half must REFUSE a cell that carries it. `--check` used to DISCARD the verify output
+# (`out` was overwritten by the install) — so the operator saw "the cell does not carry a current
+# layer" and never the artifact that was wrong, while the next bringup put the extension back.
+# The line below is the whole diagnosis, and it is asserted on its EXACT wording.
+say_case "a cell carrying tortoise-capture fails the read-back, and --check names it (#2100)"
+CAPTURE_LINE='capture extension present on a cell: it blocks session_start and corrupts the provider probe'
+mkdir -p "$T/home/.pi/agent/extensions/tortoise-capture"
+echo '// hand-pushed by the test' > "$T/home/.pi/agent/extensions/tortoise-capture/index.ts"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+br ok normal --check
+case "$BR_OUT" in
+  *"$CAPTURE_LINE"*) ok "--check surfaces the (b) failure verbatim: $CAPTURE_LINE" ;;
+  *) bad "--check never names the capture extension — the read-back's refusal is still swallowed: $BR_OUT" ;;
+esac
+case "$BR_OUT" in
+  *"provider probe failed"*) bad "the run blamed the PROVIDER — the extension's banner corrupted the probe again" ;;
+  *) ok "the failure is attributable to the extension (b), not to the provider probe" ;;
+esac
+[ ! -e "$T/home/.pi/agent/extensions/tortoise-capture" ] \
+  && ok "the run REMOVED the extension (the deny repairs a cell that carries it, instead of certifying it)" \
+  || bad "the capture extension SURVIVED the bringup — it would block every lane turn again"
+[ "$BR_RC" -eq 0 ] && ok "readiness is reported only AFTER the read-back refused and the repair removed it" \
+                   || bad "the run failed after the repair (rc=$BR_RC): $BR_OUT"
+case "$BR_OUT" in
+  *"CELL READY"*) ok "the repaired cell reaches CELL READY" ;;
+  *) bad "the repaired cell never reaches CELL READY — output: $BR_OUT" ;;
+esac
 
 # ── 3) an abort BEFORE check_gh is reached — the window the pre-fix code left open ───────────────
 # The removal used to live INSIDE check_gh, and there was no trap, so a failure in check_tools or
