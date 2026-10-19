@@ -269,10 +269,13 @@ check_network() {
 # answer_line <text> — the provider's answer, if the text carries one. LINE-based over the WHOLE
 # output, never `tail`: on the cells the last three lines were a capture banner while the answer sat
 # above them (#2100). The ONE exclusion is a byte-identical `Reply with exactly: LANE_READY` line —
-# a `pi` or wrapper that PRINTS THE INSTRUCTION ITSELF would otherwise "answer" with no model call.
-# It is deliberately narrow (`-xF`): a model that repeats the instruction around the token has still
-# answered, and the earlier `grep -vF 'Reply with exactly'` discarded any line containing the phrase,
-# turning a verbose-but-correct answer into a false `provider probe failed`.
+# output that PRINTS THE INSTRUCTION LINE ITSELF would otherwise "answer" with no model call.
+# Two declared limits of keeping it narrow (`-xF`): a model that wraps the token in the instruction
+# has still answered and MUST count (the earlier `grep -vF 'Reply with exactly'` discarded any line
+# containing the phrase and turned a verbose-but-correct answer into a false `provider probe
+# failed`), and any OTHER line that happens to carry the token counts too — a wrapper echoing the
+# prompt inside a longer line would answer for the model. The second is accepted rather than closed:
+# closing it means matching the token exactly, which re-opens the first.
 answer_line() {
   printf '%s\n' "$1" | grep -F 'LANE_READY' | grep -vxF 'Reply with exactly: LANE_READY' | head -1
 }
@@ -370,6 +373,13 @@ check_provider_layer() {
     esac
   done
   layer_detail="$(printf '%s\n' "$layer_out" | grep -v '^[[:space:]]*$' | tail -5)"
+  # A killed probe is NOT the layer's fault. The provider already answered in isolation, so the key
+  # is good: exit 124 on both attempts means the CALL did not complete (network/load), and blaming an
+  # extension would send the operator to delete a healthy one — the same mis-attribution the
+  # provider-side classification above exists to prevent.
+  if [ "$layer_rc" -eq 124 ]; then
+    die "the LAYER-LOADED probe TIMED OUT after 120s on both attempts (exit 124) — that is the CALL not completing (outbound network or box load), NOT an extension: the provider answered with extensions disabled, so the key is good. Quieten the box, check the network, then re-run. Last output: $layer_detail"
+  fi
   die "the PROVIDER is healthy (it answered with extensions disabled) but the EXTENSION LAYER produced no answer in two attempts (last exit $layer_rc) — a lane turn on this box would produce no answer, which is #2100's shape. Find the extension that writes to stdout at registration or session start, or remove it from the cell. Loaded-layer output: $layer_detail"
 }
 

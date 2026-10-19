@@ -126,6 +126,10 @@ if [ "${PI_STUB_MODE:-normal}" = verbose ]; then
   printf 'Sure — the model replied: Reply with exactly: LANE_READY\n'
   exit 0
 fi
+if [ "${PI_STUB_MODE:-normal}" = slowlayer ] && [ "$has_ne" -eq 0 ]; then
+  # What `timeout` leaves behind when it kills the child: no output, exit 124.
+  exit 124
+fi
 if [ "${PI_STUB_MODE:-normal}" = noisy ] && [ "$has_ne" -eq 0 ]; then
   printf '[tortoise-capture] install probe recorded (harness=pi)\n'
   printf '[tortoise-capture] spool flush (session_start): filed 0, deferred 2, skipped 320 (320 waiting on backoff)\n'
@@ -345,10 +349,13 @@ case "$BR_OUT" in
   *) ok "no readiness banner is claimed over a layer that cannot complete a turn" ;;
 esac
 
-# ── 2c1) an ECHO cannot satisfy either probe: no vacuous pass on the instruction text ─────────────
-# The instruction itself contains the token, so a `pi` (or a wrapper) that prints its own argv would
-# answer the probe with no model call. The extractor drops a byte-identical echo line; both probes
-# must therefore read "no answer" and the run must fail as a provider failure.
+# ── 2c1) the INSTRUCTION cannot satisfy either probe: no vacuous pass on the prompt text ─────────
+# The instruction itself contains the token, so output that prints that line would answer the probe
+# with no model call. The extractor refuses a byte-identical instruction line, so both probes read
+# "no answer" and the run fails as a provider failure. DECLARED LIMIT (pinned by 2c1b, not asserted
+# away): the refusal is exact-line only — any OTHER line carrying the token counts, so a wrapper that
+# echoes the prompt inside a longer line would still answer for the model. Widening the refusal to
+# close that re-opens the false negative 2c1b pins.
 say_case "the instruction printed back cannot pass the probe (#2100)"
 printf '%s\n' "$TOK_BODY" > "$TOK"
 PI_STUB_MODE=instruction br ok normal --check
@@ -376,6 +383,25 @@ esac
 case "$BR_OUT" in
   *"CELL READY"*) ok "a verbose answer still reaches CELL READY" ;;
   *) bad "a verbose answer never reaches CELL READY — output: $BR_OUT" ;;
+esac
+
+# ── 2c1c) a KILLED layer probe is not blamed on an extension (#2100 review) ─────────────────────
+# `timeout` kills the child at 120s and reports 124. The provider already answered in isolation, so
+# the key is good and the call is what failed: reporting "find the extension and remove it" would
+# send an operator to delete a healthy extension over a network flap — the same mis-attribution the
+# provider-side arms exist to prevent.
+say_case "a timed-out layer probe names the CALL, not an extension (#2100)"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+PI_STUB_MODE=slowlayer br ok normal --check
+[ "$BR_RC" -ne 0 ] && ok "the run FAILS when the layer probe is killed on both attempts (rc=$BR_RC)" \
+                   || bad "the run passed while the layer probe never completed"
+case "$BR_OUT" in
+  *"TIMED OUT after 120s"*) ok "the failure names the TIMEOUT (exit 124)" ;;
+  *) bad "the timeout is not named — output: $BR_OUT" ;;
+esac
+case "$BR_OUT" in
+  *"Find the extension"*) bad "a killed probe was blamed on an extension — the operator would delete a healthy one" ;;
+  *) ok "the failure does not accuse an extension" ;;
 esac
 
 # ── 2c2) a BROKEN provider is still blamed on the provider, whatever the layer does ──────────────
