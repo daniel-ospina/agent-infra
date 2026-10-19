@@ -27,6 +27,56 @@ The main checkout is a **SHARED HUB** that stays on `main`. Feature work happens
 
 > **Never** start feature work in the main checkout. **Never** delete a branch without checking `git worktree list` for active checkouts.
 
+## ⛔ The stash register is SHARED by every worktree — never stash in a linked worktree (#1264)
+
+**`refs/stash` lives in the COMMON git dir** (`git rev-parse --git-common-dir`), not in the worktree's own gitdir, so **every worktree of a repo shares ONE stash list**. Consequences — none of which `git status` or `git stash list` hints at:
+
+- `git stash list` in a linked worktree shows **peer lanes'** entries as if they were yours.
+- a bare `git stash` (push) prepends YOUR entry for every lane;
+- a bare `git stash pop` / `apply` takes whichever entry is on **top** — including another lane's — and `pop`/`drop` removes that entry from the shared register. The victim sees only a missing stash entry, and nothing in their transcript explains it.
+
+**Measured** (2026-10-16, git 2.43.0, 2-worktree reproduction): lane A stashed, lane B stashed seconds later, and lane A's bare `git stash pop` applied **lane B's files** into lane A's tree and dropped lane B's ref. Canonical incident: 2026-09-19, tortoise (stash commits `534650466` / `b396d58e`).
+
+There is **no worktree-scoped stash** in git: `git stash push` has no `--ref`/per-worktree form. `git stash create -u` is **not** a substitute — measured on git 2.43.0, `-u` is consumed silently as a pathspec (the message becomes `On <branch>: -u`), untracked files are **not** captured (2-parent commit, no `^3`), the tree is not cleaned, and nothing enters `refs/stash`.
+
+**Rules** (a *linked worktree* is any worktree other than the hub):
+
+1. **Default: do not stash — make a WIP commit on your OWN branch** (`git add <paths> && git commit -m "wip: <lane>"`). It is branch- and worktree-scoped, gc-safe while the branch lives, and reversible with `git reset --soft HEAD~1` or a later `--amend`. It covers everything a stash would.
+2. **Never run a bare `git stash pop|apply|drop|clear` in a linked worktree** while another lane may be active. `git stash list` / `show` are reads (safe); the mutating verbs are not.
+3. **If a stash is genuinely required — own it by name, never by position.** Create it, resolve YOUR entry by a nonce (race-free), pin it to a lane-named ref, restore by SHA:
+
+   ```bash
+   LANE="$(git branch --show-current)"
+   NONCE="lane-wip-$(uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid)"
+   git stash push -u -m "$NONCE"                      # -u DOES capture untracked files (unlike `create -u`)
+   SHA="$(git log --walk-reflogs refs/stash --format='%H %s' \
+          | awk -v n="$NONCE" 'index($0,n){print $1; exit}')"
+   [ -n "$SHA" ] || { echo "⚠️ stash create failed — do NOT read or drop refs/stash"; exit 1; }
+   git update-ref "refs/lane/$LANE/stash/$NONCE" "$SHA"   # pin: the ref that survives gc is YOURS
+   # … do the work that needed a clean tree …
+   git stash apply "$SHA"                             # restore by SHA; `pop <sha>` is REJECTED on 2.43
+   ```
+
+   The `--walk-reflogs` scan is the race-free step: a peer's push landing between your `push` and this read makes `stash@{0}` *theirs*, while the nonce still resolves **your** commit (verified under exactly that interleaving). Drop the shared entry only after confirming it is yours:
+   `git stash drop "$(git stash list --format='%gd %gs' | awk -v n="$NONCE" 'index($0,n){print $1; exit}')"`
+4. **Before ANY restore, check whose entry is on top** — the one-line check that would have caught the incident:
+
+   ```bash
+   TOP="$(git stash list -1 --format='%gs' | sed -n 's/^\(WIP on\|On\) \([^:]*\):.*/\2/p')"
+   [ "$TOP" = "$(git branch --show-current)" ] || { echo "⛔ top stash is '$TOP', not this worktree — STOP"; exit 1; }
+   ```
+5. **Recovery after a cross-lane pop/drop.** The entry is gone from `refs/stash` (its reflog does **not** keep the dropped entry) but the commit object is still present until `git gc` — find it as an unreachable commit whose subject is `On <branch>: <message>` with ≥2 parents, then re-pin it:
+   ```bash
+   for c in $(git fsck --no-reflogs --unreachable 2>/dev/null | awk '$2=="commit"{print $3}'); do
+     s="$(git show -s --format='%s' "$c")"
+     case "$s" in On\ *:*) [ "$(git rev-list --parents -n1 "$c" | wc -w)" -ge 3 ] && echo "$c  $s";; esac
+   done
+   git update-ref "refs/lane/<lane>/stash/recovered" "$c"   # or: git stash store -m "$s" "$c"
+   ```
+   Act before the next `git gc` — afterwards an unreferenced stash commit is unrecoverable.
+
+**Hub note (different gate, same verb):** in the HUB a bare `git stash` is separately blocked by the M4 dirty-hub gate — use the `#435` salvage path. This section governs the **worktree** case, which no guard intercepts.
+
 ## Escaping the main-checkout guard (deliberate mid-session escalation)
 
 If a session is **guard-blocked but functional** — alive, issuing tool calls, stranded in the shared main checkout where the guard refuses the ops needed to un-strand (in-hub `checkout -b`, `commit`, foreign pushes, edits) — note `git checkout main` and `git pull --ff-only` are M4-sanctioned and need no window — it can open a **sanctioned, bounded, audited, session-scoped** window with one touch:
@@ -444,8 +494,10 @@ Ready to implement auth feature
 
 **Never:**
 - Launch an unbounded nested/background `pi` — always use the bounded-launch template in `## Launching Nested pi` (hard timeout + log redirect + liveness marker; abort on no-marker).
+- Use a bare `git stash pop`/`apply`/`drop` in a linked worktree — `refs/stash` is shared by every worktree of the repo, so it silently takes a peer lane's work and drops their ref (#1264). Make a WIP commit on your own branch instead.
 
 **Always:**
+- Treat the stash register as SHARED: before any restore, check the top entry's `On <branch>:` against `git branch --show-current` (using-git-worktrees → "The stash register is SHARED by every worktree")
 - Bound every nested/background pi launch (`PI_MODE=print TASK_HEARTBEAT=1`, `mktemp` log, `sleep 1800` + `kill -0` watchdog) and prefer the terminal one-liner for guard escapes.
 - Resolve `$MAIN_REPO` via `git rev-parse --git-common-dir` before anything else (Step 0)
 - Follow directory priority: existing > CLAUDE.md > ask

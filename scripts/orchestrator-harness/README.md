@@ -214,6 +214,7 @@ processes in tmux sessions, so a killed worker cannot take the controller down w
 | `state/last-open-prs` | the `number:headOid` rows from that same SUCCESSFUL listing — the **ownership scan's** input (`unowned_pr_count`). Written on success and REMOVED on a failed listing, so a fallback count is never paired with the previous listing's rows; absent rows mean **nothing is owned** (the whole count is unowned), which is the fail-closed direction. Both files come from ONE `gh pr list` call. |
 | `state/roles/<role>.state` | the cell doctor's LAST-PASS record per role (`last_pass_at`, `last_pass_epoch`, `passes`, `last_rc`, `last_result`), written atomically and only by a completed pass — `status` reads it, so "never ran" is distinguishable from "idle" (§6.5.7) |
 | `state/roles/.desired` | the cell is SUPPOSED to be running; written by `start`, removed by `stop`, so the doctor restarts a controller that `stop` did not silence |
+| `state/roles/loop.ident` | `pid|<identity>` for the doctor loop, where the identity is `proc:<starttime>` from `/proc/<pid>/stat` on Linux and `ps -o lstart=` where `/proc` does not exist — `status` verifies BOTH before reporting the loop RUNNING, so a recycled pid (after a tmux server restart, an OOM kill or a crash) cannot make a dead loop read as alive |
 | `state/roles/merge.attempts` | `PR head epoch reason` for every rail call the merge role made — the head-level cooldown that stops a REFUSED head being retried blind |
 | `logs/` | one log per worker: `lane-*.log`, `chain-*.log`, `merge-*.log`, `fix-*.log`, `orch-loop.log` |
 | `wip/` | dirty-worktree captures taken before a shutdown (see §6) |
@@ -345,6 +346,82 @@ That one asymmetry stopped both halves of the harness, and neither log line name
 | `pr merge` (incl. `--match-head-commit`) | `PUT …/pulls/{n}/merge` |
 | `pr comment --body` | `POST …/issues/{n}/comments` |
 
+### The layer underneath: `gh-limit` (#1988)
+
+Four boxes act as **one GitHub account**, so they share one REST bucket and one GraphQL bucket.
+Nothing serialised the harness's calls and nothing backed off when a box was refused, so one box's
+burst became another box's secondary limit — and the refused call was read by its caller as "no
+data", which is how a cell that could not merge looked like a cell with nothing to do.
+
+`gh-limit.py` is the one implementation of GitHub's documented policy (serialise; honour
+`retry-after`; honour the bucket's `x-ratelimit-reset` when it is empty; otherwise wait at least a
+minute and grow exponentially; fail after a bounded number of attempts). It is reached from two thin
+entry points, both of which put it FIRST on the harness's `PATH`, so no call site has to remember it
+and no new call site can forget it:
+
+| Entry point | Where | Installed by |
+|---|---|---|
+| `gh-rest/gh` (the REST adapter above) | Mac | `install.sh` → `$O/gh-rest` first on the daemon PATH |
+| `gh-limit/gh` (nothing but the layer) | cloud cells | `cloud-cell-supervisor.sh` → `$O/gh-limit` first on the controller PATH **and** published through tmux `update-environment`; `deploy-crossbox.sh` seeds the same two files and passes the PATH on the controller's `new-session` line (it does not touch `update-environment`) |
+
+⛔ **The shim has to be re-asserted after the tool-dir prepend.** Every gh-calling harness script
+opens with `export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH`, which puts a REAL `gh` ahead of the
+seeded shim on any box whose gh lives in one of those dirs (measured: on the Mac it does), leaving
+an inert layer that reports protection and provides none. `orch-loop.sh`, `merge-one.sh`,
+`fix-one.sh`, `lane.sh` and `chain-merge.sh` therefore re-prepend `$O/gh-limit`/`$O/gh-rest` after
+that line — and so does `nonblocking-dispatch.sh`, which calls no `gh` itself but spawns a whole
+worker session in-process, so its PATH becomes that worker's PATH.
+
+The predicate, exactly: **every `*.sh` in this directory that prepends those tool dirs AND invokes
+`gh` must carry BOTH stanzas** (`$O/gh-limit` and `$O/gh-rest`), plus `nonblocking-dispatch.sh` for
+the spawning reason above, and `gh-limit.test.sh` fails naming the file and the missing stanza. It is
+a per-file two-line obligation — not an unpickable one — and a new script written outside this
+directory is not covered by it. Two further entry paths exist so the common callers do not depend on
+that obligation: the Mac adapter already resolves the layer for every call it serves, and the
+heartbeat's own telemetry tools (`objective.py`, `merge-queue.py`, `beta-progress.py`,
+`queue-dispatch.py`, `ask-owner.py`, `turn-classify.py`, `turn-end.py`, `undelivered-answers.py`,
+`pr-doctor.py`) prefer `$O/gh-rest/gh` then `$O/gh-limit/gh` over their pinned real binary — derived
+from `$O`, never from PATH. ⛔ THAT DOES NOT KEEP #1872'S PIN BY ITSELF: the layer resolves the real
+`gh` by walking PATH, so the tools that have a pinned candidate hand it through as
+`GH_REST_REAL_GH`/`GH_LIMIT_REAL_GH`; the three that never had one let the layer walk.
+
+Why two entry points rather than one: moving the call sites onto REST is #1978/#1986's change, and
+mixing a REST translation into a cell with a new backoff would make a translation bug and a backoff
+bug indistinguishable. The wrapper therefore translates nothing; the REST adapter additionally
+translates, and both call the same helper.
+
+Notes worth keeping:
+
+* **Single flight is per box, not per account.** Boxes cannot see each other; what this buys is a
+  burst of 1 per box instead of 1 per lane. The lock is held per ATTEMPT and released across the
+  wait, so a sleeping caller does not park the box — the invariant is "no two requests overlap",
+  and the `/rate_limit` probe, which runs during backoff, holds it too.
+* **A successful call is invisible** (stdout/stderr replayed byte for byte) because callers parse
+  merged output. Retries are announced in `$GH_LIMIT_DIR/events.log`; only a FINAL failure writes to
+  stderr.
+* **A limited box says so**: `$GH_LIMIT_DIR/last-limit` is printed by `orch-loop.sh`'s cycle line as
+  `gh=rate_limited(bucket=graphql reset=<epoch> <age>)`, age-bounded to 15 minutes so a past limit
+  cannot pass as a current one — and as `gh=recovered(bucket=… <age>)` once a later call succeeded,
+  because a record is not a state. The failure text carries the words "rate limit", which is the
+  phrase `objective.py`'s transport markers turn into `VERDICT=GH-RATE-LIMITED`.
+* **The waits belong to the call sites that can afford them.** `GH_LIMIT_NO_WAIT=1` makes the layer
+  record the limit and return at once (and bounds the LOCK wait to `GH_LIMIT_NO_WAIT_LOCK_S`, 5 s, so
+  a busy box cannot queue a 90 s reader to death); the nine heartbeat tools set it, because they are
+  killed at 90-420 s while the first documented backoff is 60 s — sleeping there converts a
+  RATE-LIMITED verdict into a timeout. The shim is also `exec`'d, not spawned, so a caller's timeout
+  or `run_bounded`'s TERM kills the helper instead of orphaning it mid-backoff against a bucket
+  GitHub has already refused.
+* **A shim is identified by its own sentinel line** (`harness-gh-shim-marker`), not by the helper
+  beside it: the missing helper is the fail-open state, and keying identity on it made two shims
+  resolve into each other and every gh call exit 127.
+* **Conditional REST is a GET only.** `gh api <path>` (optionally `--jq`) stores its ETag per URL and
+  replays a 304 from cache — free, because a 304 is not charged to the primary limit. The cached body
+  is base64 (`byte-exact` on replay, binary included) and the cache is bounded, since every distinct
+  poll URL earns an entry. Any shape whose output this layer would have to re-create by hand
+  (`--paginate`, `--template`, `-H`, `-f`, a non-GET method) is left completely alone, and an
+  unframeable response is returned AS-IS — never re-requested (a second request on a box that is
+  being refused is exactly what the layer exists to prevent; the suite pins one request, no re-run).
+
 **Design: an adapter, not a fork.** No harness file changes, so every cell stays on one harness
 version — the convergence property this repo exists to protect — while the API surface becomes a
 deployment concern. `install.sh` copies the shim to `$O/gh-rest/gh` and puts that directory **first**
@@ -461,11 +538,21 @@ export SCOPE=own                         # drain scope: auto (default) | own | b
 #    `cd ~/orchestrator && ./install.sh` dies with "missing template" — step 1 copies only *.sh.
 bash scripts/orchestrator-harness/install.sh
 
-# 4. Start it when you mean to — the enable/bootout/bootstrap triple, NOT `launchctl load -w`
-#    (see §9's limits-change note and §6.5.6: `unload -w` writes a persistent Disabled override)
-launchctl enable gui/$(id -u)/com.eldato.orchestrator-loop
-launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.eldato.orchestrator-loop.plist 2>/dev/null || true
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.eldato.orchestrator-loop.plist
+# 4. Start it when you mean to — and have the start PROVEN, not assumed.
+#    install.sh --start renders, then `launchctl enable` → `bootout` → `bootstrap` (falling back to
+#    the legacy `load` if bootstrap fails), then verifies the label has a PID **and** that
+#    ~/orchestrator/heartbeat advanced. It exits non-zero with one actionable line if either fails.
+#
+#    Two tunables, both optional: `START_TIMEOUT` (seconds to wait for that pid+heartbeat, default
+#    30) and `LC_HB_STALE` (how old the heartbeat may be before a LOADED job counts as "not
+#    cycling", default `2*CYC + 300` — derived from this cell's cycle, because a fixed bound fails a
+#    healthy CYC=900 cell). A validation run (no flag) touches no launchd state at all.
+#
+#    ⛔ NEVER `launchctl load -w` / `unload -w` here: `-w` writes a PERSISTENT Disabled override
+#    (`man launchctl`), so an unload/load pair whose bootstrap fails leaves the controller
+#    removed AND disabled, silently. Measured 2026-10-17: 48 min of dead dispatch, then 19 more
+#    (agent-infra#1975).
+bash scripts/orchestrator-harness/install.sh --start
 ```
 
 Step 3 also records **which harness commit this box runs** in `$O/.agent-infra-stamp.json`
@@ -477,14 +564,27 @@ passing, which is the intended fail-closed behaviour and not an install failure.
 # liveness / stop
 cat ~/orchestrator/heartbeat                 # epoch seconds, should be < ~5 min old
 tmux ls                                      # lane-*, chain-*, merge-*, fix-*
-launchctl unload -w ~/Library/LaunchAgents/com.eldato.orchestrator-loop.plist
 ```
 
-⛔ **A restart after that stop must use step 4's triple, not `launchctl load -w`.** The `unload -w`
-above deliberately writes the persistent Disabled override; `load -w` then depends on a bootstrap
-that failed on 2026-10-17 and left no service at all (§6.5.6).
+`install.sh --uninstall` removes the agent (`launchctl bootout`), **reads the domain back**, and only then
+deletes the plist — if the label is still **LOADED** it exits non-zero and keeps the plist instead of
+printing ✅ (a `KeepAlive` job sitting inside its respawn throttle is loaded with NO pid, which is why
+the verdict is not a pid test), and if the read itself fails it exits non-zero too rather than calling an
+unreadable domain "removed". It writes **no** persistent Disabled override, so a later `--start` is a
+plain start rather than a start that has to fight a sticky disable first.
 
-`install.sh --uninstall` unloads the agent and removes the plist.
+Every mutating path (`--start`, `--restart`, `--uninstall`) first checks two things, and refuses with
+one line rather than acting if either fails: **`$HOME` must be the real home** (a sandboxed `$HOME`
+acts in the real user's domain — agent-infra#446; tests opt in with `ELDATO_ALLOW_TEST_HOME=1` plus a
+`launchctl` stub on PATH), and **a job already loaded under this label must be loaded from this
+plist** — `launchctl bootout <domain> <path>` resolves the removal by the LABEL it reads out of that
+plist (measured), so without that check a sandboxed run would remove the production controller. A
+third read guards both of those: `launchctl print` failing is **UNKNOWN**, never "not loaded", so an
+unreadable domain (or an unreadable account record) makes the run refuse instead of acting on a guess.
+
+`ELDATO_ALLOW_NON_DARWIN=1` is the suite's test-only bypass of the installer's macOS precondition (the
+only automated gate runs on Linux, and `--start`/`--uninstall` are the incident's own path). It is the
+same discipline as `ELDATO_ALLOW_TEST_HOME=1` and never applies to a normal run.
 
 Run the offline self-test first — it needs no network, tmux server or git writes. **Every check
 exercises the shipped script** (it extracts the real classifier, `sess()`, the claim block and the
@@ -725,8 +825,16 @@ clear about what is and is not enforced:
 
 The ritual, in order — the point is that **no uncommitted work is lost**:
 
-1. `launchctl unload -w …` — so it does not restart on boot. (Restarting it later needs the
-   `enable`/`bootout`/`bootstrap` triple in §4 step 4, never `load -w` — §6.5.6.)
+1. `bash scripts/orchestrator-harness/install.sh --uninstall` (from the checkout root, as §4): the
+   installer resolves `launchd-cycle.sh` and `launchd.plist.template` from its OWN directory, so the
+   CHECKOUT's copy is the guarded one — a copy that lacks `launchd-cycle.sh` refuses with "missing
+   …launchd-cycle.sh" (fail closed, never a silent degrade to the legacy verbs), while a pre-#1975
+   `install.sh` still sitting under `$O` has no guard at all, so never run that one — `bootout` + remove
+   the plist, so it does
+   not restart on boot and no persistent Disabled override is written (which is what `unload -w` did;
+   agent-infra#1975). It READS THE DOMAIN BACK afterwards — "is the label still loaded", not "does it
+   have a pid", because a `KeepAlive` job inside its 10s respawn throttle is loaded with no pid — and
+   fails if the job is still there.
 2. `pkill -f "[b]ash $O/orch-loop.sh"` — SCOPED on purpose: an unscoped `-f orch-loop.sh` also
    matches peer controllers, fixtures and tests (`deploy-mac-orchestrator.sh:51-56` measured four),
    and `[b]` keeps the pattern from matching the pkill command line itself. ⛔ **Verify before you
@@ -902,18 +1010,38 @@ Measured in `~/.pi/agent/state/pr-doctor.log`, read 2026-10-18T00:42Z:
 Counted as distinct timestamps, with `pass:` lines as the successes. The un-wedger could not read the
 thing it un-wedges for a large share of a day, and each failed pass dispatched nothing.
 
-**Status: PARTIAL — the polarity is IMPLEMENTED, the bound is a GAP.** `lane-status.py:1689` raises
-`SystemExit(3)` rather than publish an empty roster; `lane-actions.py:153` refuses a `degraded`
-snapshot; `queue-dispatch.py:320,377` raises `LaneReadError` naming the timeout instead of returning
-`[]`; `pr-doctor.py:809-819` refuses the pass **when it has work to place** — and deliberately
+**Status: PARTIAL — a WHOLE-READ budget now exists for the lane roster, and the reader it wraps
+still has none of its own.** The polarity is IMPLEMENTED: `lane-status.py` raises `SystemExit(3)`
+rather than publish an empty roster; `lane-actions.py` refuses a `degraded` snapshot
+(`_refuse_if_degraded`); `queue-dispatch.py` raises `LaneReadError` naming the timeout instead of
+returning `[]`; `pr-doctor.py` refuses the pass **when it has work to place** — and deliberately
 stays exit 0 on a blind read with nothing classified, because manufacturing a failure out of an idle
-beat is its own defect (`:812-819`). What does not exist is a deadline
-inside the READER, and `queue-dispatch.py:110` says so outright — *"lane-status.py has no internal
-deadline, so this is the only stop between a stalled scan and an unbounded wait"*. Every bound on the
-WHOLE read is a CALLER's — 300 s (`lane-actions.py:1528`), 600 s (`queue-dispatch.py:110`), 600 s
-(`pr-doctor.py:389`) — which is why the caller fails instead of getting an answer. (The reader does
-hold per-CALL bounds -- 60 s, 45 s, 45 s at `lane-status.py:267,383,599` -- and that is exactly the
-shape this MUST rules out: it bounds each probe and lets their SUM grow with the fleet.)
+beat is its own defect (`:812-819`).
+
+New as of 2026-10-18: `lane-actions.py` takes **one deadline for the whole read** (`--budget`) and
+splits it across its two attempts, so the cached pass can no longer consume the retry's allowance and
+the tool cannot outlive the caller waiting on it; a failed re-scan returns the roster already read
+with `COMPLETENESS UNMEASURED` on stderr instead of discarding a readable datum. `pr-doctor.py`
+consumes the **published** roster (`$STATE/lane-status.last.json` via `lane-actions.py --stdin`,
+**2.8 s measured**) instead of paying a scan on every pass, and falls back to a bounded scan when that
+file is absent, stale, degraded, partition-less or unreadable — saying which happened.
+
+What does NOT exist: a deadline inside `lane-status.py` itself. Every remaining bound on the whole
+read is a CALLER's — `queue-dispatch.py`'s 600 s on its direct `lane-status.py` call, `pr-doctor.py`'s
+`LANE_BUDGET_S + margin` on the fallback scan. (The reader does hold per-CALL bounds — 60 s, 45 s,
+45 s — and that is exactly the shape this MUST rules out: it bounds each probe and lets their SUM grow
+with the fleet.) `queue-dispatch.py` still prints the residual: *"lane-status.py has no internal
+deadline, so this is the only stop between a stalled scan and an unbounded wait"*.
+
+⛔ AND THE PASS MUST SAY WHAT IT DID. A dispatcher that refuses is a failure the fleet can see: every
+exit of `pr-doctor.py` writes `$STATE/pr-doctor.status.json` (`rc`, a one-line reason, the PRs that
+went out) and prints `dispatched N of M queued — <why>`, so `dispatched 0` is never healthy while the
+queue has runnable items; `objective.py` renders the last pass's verdict as `PR-DOCTOR(last run):
+RED rc=N Nm ago — <reason>` beside the queue's own shape, and `heartbeat-loop.sh` prints the same
+verdict and launchd's last exit. `queue-dispatch.py` consumes that record's `issue_work` field as a
+**gate**: new issue work is SKIPPED while un-owned PRs exist, and the gate refuses only on a positive,
+FRESH reading (a missing, stale, unreadable or refused record blocks nothing and says so).
+
 agent-infra#1774, #1788.
 
 ### 6.5.3 Ancestry is the safety rail
@@ -989,7 +1117,7 @@ names where its exclusion actually lives; there is no single file that says "the
 
 ### 6.5.6 The controller must be un-removable by a routine install
 
-**MUST.** `install.sh` must **enable and load** the job (`launchctl enable` → `bootout` →
+**MUST.** `install.sh --start` / `--restart` must **enable and load** the job (`launchctl enable` → `bootout` →
 `bootstrap`, falling back to legacy `load`, and saying which path ran), **assert** the outcome (the
 label loaded with a pid, and the heartbeat file advancing within ~30 s), and exit **non-zero** if
 either fails. A **watchdog** must restore a REMOVED service: `KeepAlive` relaunches a job that EXITS
@@ -1006,21 +1134,129 @@ that follows has to bootstrap to clear it — and that bootstrap is what failed 
 ```
 
 The controller was **absent**, not crashed, and it dispatched nothing for 48 minutes and then 19,
-with the heartbeat simply gone — the only signal that it had happened. ⛔ **The safe sequence, and the
-one to copy: `launchctl enable` → `launchctl bootout` → `launchctl bootstrap`, exactly as
-`scripts/install-launchd.sh:275-285` does it (removing the plist if `bootstrap` fails) — never
-`unload -w` followed by `load -w`.** §9's limits-change note now gives the same safe sequence; what
-is still unsafe is `install.sh:698`, which PRINTS `launchctl load -w` and does not load anything at all
-(#1976).
+with the heartbeat simply gone — the only signal that it had happened.
 
-**Status: GAP.** `install.sh:698` only PRINTS the load command and never `enable`s or loads;
-`--uninstall` (`install.sh:107`) runs `launchctl unload -w`, i.e. it WRITES the override; nothing
-asserts the heartbeat; and nothing **restores a job that has been disabled or booted out, or asserts
-that it came back** — `KeepAlive`/`RunAtLoad` (`launchd.plist.template:15-18`) relaunch a job that
-EXITS, which is not the same state as one launchd no longer has, and `com.eldato.lane-liveness.plist`
-watches LANES by design with no controller alive. The correct pattern already exists in this repo — `scripts/install-launchd.sh:275-285`
-does `enable` + `bootout` + `bootstrap` and removes the plist when `bootstrap` fails.
-agent-infra#1975, #1976, #1860.
+**Status: the installer half is CLOSED (#1975).** Every requirement in the list above is now either
+implemented or explicitly not claimed:
+
+| requirement | where |
+|---|---|
+| never write a persistent Disabled override | no shipped line invokes `disable`, `unload`, or `-w` (asserted from the stub's argv log wherever the path runs, **and** from a source scan of every TOP-LEVEL `*.sh`/`*.template` in `scripts/orchestrator-harness/` where it cannot (`*.test.sh` excluded — its fixtures must be free to contain those verbs; subdirectories such as `retired/` and the rest of the repo are not reached by the glob — hand-checked at the time of writing, not by a test)); `--uninstall` uses `bootout` only |
+| clear a disable a previous flow already wrote | `lc_start` runs `enable` before `bootout`/`bootstrap`; the status it writes is read back with `print-disabled` |
+| actually load the job (not just PRINT the command) | `install.sh --start` / `--restart` call `lc_start`; a plain run never starts anything |
+| assert the job came back | `lc_assert_running`: new pid + heartbeat strictly advanced + `runs` did not move across the settle window |
+| remove by proof, not by label | `lc_guard_mutate` reads the loaded job's `path =` and refuses unless it is this plist |
+| an unreadable domain is UNKNOWN | `lc_probe` is the tri-state read, and every DECISION POINT that must distinguish 'not loaded' from 'could not read' re-probes with it: `lc_ensure`, the `--uninstall` read-back in `install.sh` (`block="$(lc_probe "$LABEL")"` — its verdict is the probe's own status, not a derived second read), `lc_guard_mutate`, `lc_assert_running`, `lc_assert_stable`, and `lc_bootout` (which refuses to treat a label as 'not loaded' rather than removing by a failed read). The thin wrappers `lc_pid` and `lc_runs` fold UNKNOWN into empty, so their callers must not read empty as 'not loaded'. Those decisions re-probe — **except `lc_restart`, and that is a hole this row names rather than hides**: a restart is unconditional, so it needs no probe to decide *whether* to act, but the folded `lc_pid` read it takes BEFORE the start is passed into `lc_assert_running` as `replaced`, so when that read is UNREADABLE (rather than 'not loaded') `replaced` is empty and the "the old process survived the start" check is silently SKIPPED. Not every read in the file is tri-state: `lc_min_runtime` falls back to launchd's own 10 s default, and a successful-but-empty `print-disabled` reads as `unset` (no override), because that is exactly what it means |
+
+⛔ **What is still GAP is the reporting side, and it is the item that matters most**: nothing
+**detects** a job that has been disabled or booted out — `KeepAlive`/`RunAtLoad`
+(`launchd.plist.template:15-18`) relaunch a job that EXITS, which is not the same state as one launchd
+no longer has, and `com.eldato.lane-liveness.plist` watches LANES by design with no controller alive.
+On 2026-10-17 the label was disabled twice more *during this PR's own review* by agent sessions running
+the pre-#1975 flow from other checkouts; both times a human reading `launchctl print` found it, not an
+instrument. A watchdog that runs `enable` + `bootstrap` when the label is absent, and reports it, is
+the missing piece — agent-infra#1860.
+
+### 6.5.7 The cell's own roles run on a schedule, not when someone looks
+
+**MUST.** A cell that can dispatch must also **land**, **repair** and **un-wedge** without a human,
+and its `status` must be able to say **"this role has never run"** — because a cell that dispatched
+its backlog and then did nothing prints exactly what a working cell prints (`controller: RUNNING`,
+`lanes: 0`).
+
+**Why (measured 2026-10-18, pi-cell-2/pi-cell-3).** A cloud cell ran exactly one loop
+(`orch-loop.sh`). A green PR with a clean review record at its head sat **unlanded** until a human
+ran the rail, and a wedged `lane-*` session held its slot until someone noticed — and the supervisor
+could only answer *"is the tmux session up?"*. `status` reported `controller: RUNNING`, so the box
+looked healthy while producing nothing. This is the §6.5 opening requirement's *"something must
+NOTICE, DECIDE and ACT on a schedule that does not depend on the controller being healthy"* applied
+to the cell, and the doctor is the something.
+
+**Implementation: `cloud-cell-doctor.sh`**, launched as tmux session `cell-doctor` by
+`cloud-cell-supervisor.sh start` (removed by `stop`; `.desired` in `state/roles/` records the
+intent so a `stop` is not undone by the next pass). **A `stop` always WINS over an in-flight
+`start`**: `stop` bumps a generation counter (`state/roles/.stop-generation`) as its first action,
+and `start` snapshots it on entry and tears down whatever it created if it moved — the doctor's own
+`supervisor start` restart can take minutes, and process-group signalling cannot close that window
+(its recorded pid is a `timeout` wrapper, so killing it orphans the real child). The doctor loop's
+command string carries the operator's `DOCTOR_SESSION`, `SESSION`, `SCOPE`, `HARNESS_REF` and pin
+paths for the same reason it re-sources `ENV_FILE`: a tmux session is served from the server's
+environment, and a restart that re-derives the defaults would come back under a *second* doctor
+session (two loops on one state dir) or under the wrong scope. Roles, each idempotent with its own lock and
+its own `state/roles/<role>.state` last-pass record:
+
+| Role | Interval | What it ACTUALLY does |
+|---|---|---|
+| `reap` | 120 s | one wedged-session pass over the HARNESS namespace only (`lane-*`, `chain-*`, `merge-*`, `fix-*`); see the decision below |
+| `doctor` | 120 s | `reap` + controller supervision: restart `orch-loop.sh` when its session is **gone** and the cell is `.desired`; a **stale-but-present** controller is reported, never killed |
+| `merge` | 300 s | land PRs that already have a **clean attestation at THIS head** by EXECUTING `scripts/admin-merge.sh` — the standard rail, never a re-implementation |
+| `hygiene` | 3600 s | `uv cache prune` (not `cache clean`), worktree-root caches, and the **shipped** `pi-reap-worktrees.sh` (dry-run unless `HYGIENE_WORKTREES=apply`, or `auto` + the box is under disk pressure) |
+| `loop` | 10 s tick | the timer; every role also runs once immediately on start |
+| `status` | — | the liveness table; the stale bounds account for every role that runs BETWEEN two passes of the same role (the roles run in sequence in one loop), so a busy-but-healthy cell is not reported STALE; **exit 1** when a started cell has a role that never ran, went stale, or whose LAST pass failed (`rc≠0` — a failed controller restart, a cannot-verify read). One clean pass clears it, so a transient failure reads as one failing pass, not as a dead cell. A loop younger than `DOCTOR_GRACE_S` (300 s) — or a role whose FIRST pass is still running (`state/roles/.<role>.running`, what `run_role_pass` writes, bounded by `ALL_PASSES_S` so a killed loop's leftover cannot hide a dead role for ever) — prints `WAITING` instead — its first doctor pass samples every lane, so `start && status` must not call a healthy cell dead; a cell with no loop-age record is judged immediately (fail-closed) |
+
+**The reap decision is the safety core**, and it is the §6.5.1 rules applied to the fleet
+namespace: a session is a candidate only if its log has not grown for `REAP_MIN_S` (**2700 s**, above
+the controller's own `STALE_MIN=40` and the harness stall bound); the decision then takes **two
+observations** `REAP_SAMPLE_S` apart; and the lane's **subtree must show no CPU delta**, because a
+long model call is not a wedge. The whole read has an **overall** budget (`REAP_TIMEOUT`, 300 s) —
+a per-call bound would let the total grow with the fleet — and each `tmux`/`ps`/`gh` call is
+separately bounded (`READ_CALL_TIMEOUT` for tmux/ps, `MERGE_READ_TIMEOUT` for the queue listing;
+without `timeout(1)` the bound is enforced by the shell itself, so its absence cannot silently
+re-open an unbounded read). A pass that spends the budget STOPS at the lane it reached and
+records `rc=3 cannot-verify`; it never acts on a partial read and never reports the lanes it did not
+reach as quiet (§6.5.2, and the 800-failed-passes measurement there). Three exclusions are hard: a session with an **attached client**, a
+session whose ancestry reaches a **human terminal**, and a session with **no log** are reported and
+skipped. A read that cannot be taken is `SKIP ... cannot-verify` — never a reap, and never a pass.
+
+**A `stop` is honoured MID-PASS too.** `stop` TERMs the loop and KILLs it if it does not go, but the
+loop's destructive steps (the merge rail, `uv cache prune`, the worktree sweep/reaper) run in the
+FOREGROUND, and bash defers a TERM trap while it waits on a foreground child — so a TERM+KILL lands on
+a loop that was mid-rail and orphans that child, which then finishes (a merge that lands, a reaper
+that keeps deleting) after `stop` returned 0. Each pass therefore snapshots `.desired` and the stop
+generation on entry and re-checks them immediately before every destructive call: once a stop has
+arrived, nothing NEW is started. (A stop that lands *inside* an already-running rail still lets that
+rail finish — killing a merge mid-flight is worse — and that residual is named here, not hidden.)
+
+**An unreadable read is never an empty one.** A missing `tmux`, or a `tmux ls` that fails for any
+reason other than "no server running", makes `reap` record `rc=3 cannot-verify` instead of a clean
+pass over zero lanes; the same unreadable list makes `hygiene` SKIP the worktree-cache sweep (its
+"no workers are live" guard fails closed). `hygiene` records `rc=3` when `uv cache prune` itself fails (or is
+cut at `HYGIENE_TIMEOUT`), when it cannot run the cache sweep, and when it cannot find the
+shipped worktree reaper at all — "could not find the tool" was the silent no-op this role exists to
+remove. The loop's own liveness is identity-fenced (`state/roles/loop.ident` = `pid|<identity>`, `/proc` start time where the kernel offers one), so a
+recycled pid cannot make a dead loop read as RUNNING.
+
+**The merge role only offers a PR to the rail when the cell holds its OWN clean attestation for the
+HEAD it is looking at** (`~/.pi/agent/reviews/<owner>-<repo>-<pr>.json` at `$CELL_HOME`, so a cell's
+review state is not the Mac's). It does not review, classify checks or merge on its own evidence —
+that is `merge-one.sh`'s job, and #1872 measured two classifiers disagreeing on 4 of 11 live PRs.
+A refusal is recorded **verbatim** (with its reason), the pass still exits 0 (a refusal is data, not
+a failed read), and the same head is not retried for `MERGE_RETRY_S` (**3600 s**) — a new push moves
+the head and re-arms it. An unreadable open-PR listing is `rc=3`, never an empty queue. **It takes the same per-PR link the
+controller's `merge-one.sh` takes** (`$O/state/mergeclaim-<pr>.lock`, noclobber + a live-owner test):
+without it the doctor could rail a head that a `merge-one.sh` worker is already reviewing on the same
+box — duplicate evidence, duplicate record-review writes, one worker's needsfix landing after the
+other merged. A claim held by a live worker is a clean skip that names the holder; a stale claim is
+reclaimed; only the claim the pass took is released. **So is an
+unreadable review STORE**: a permissions failure on `~/.pi/agent/reviews`, or an attestation file
+that is present but unparseable, is `rc=3 cannot-verify` for that candidate — it used to render exactly
+like "no attestation", so every candidate was skipped and the pass reported a clean *nothing to
+land* while reviewed PRs silently never landed. A store that simply has no attestation for a PR is
+still an ordinary, clean skip. The rail runs
+FROM `$REPO` (a subshell `cd`, as `merge-one.sh` does), because its flake reproduction is
+`git -C "$PWD" worktree add … <base>` and the loop's own cwd is the harness. The whole pass is
+bounded by `MERGE_BUDGET_S` (**2400 s**), checked before each candidate: a spent budget ends the pass
+`rc=3` and names the PRs it never tried.
+
+**Status: IMPLEMENTED for a cell started by the current supervisor.** Three residuals, named:
+
+- **It runs only where `start` launched it.** The supervisor starts the loop, so a cloud cell gets it;
+  a Mac cell's `orch-loop.sh` launchd job does not, and nothing schedules the doctor there.
+- **`cmd_check` now refuses a cell without it** (it is in the required-worker list in `cmd_check`), so a cell
+  pinned to an older harness fails `check`/`start` loudly instead of silently running one loop — the
+  correct direction, but it means the pin must be moved before those cells can start again.
+- **Landing is not releasing.** The merge role gets a PR merged; it does not delete branches, reap a
+  merged PR's worktree, or manage a test container — §6.5.4 stays GAP.
 
 ### 6.5.7 The cell's own roles run on a schedule, not when someone looks
 
@@ -1253,6 +1489,87 @@ T=$(mktemp -d); cp scripts/orchestrator-harness/*.sh "$T/"
 git show <rev>:scripts/orchestrator-harness/claims.sh > "$T/claims.sh"
 CLAIMS_SH="$T/claims.sh" bash scripts/orchestrator-harness/test-claims.sh   # 65 passed, 45 failed
 ```
+
+`claim-cwd.test.sh` pins the claim builder's **cwd independence** — the property a redeploy silently
+took away on 2026-10-18, when the launchd cell (whose WorkingDirectory is **not** a repository)
+refused every candidate in the queue while the controller looked alive:
+
+```
+[dispatch] #4513 NOT dispatched — could not build claim commit
+```
+
+The builder returned an EMPTY hash, so nothing entered the batch — a total dispatch stall that emits
+no error of its own. Two independent hunks, each with its OWN discriminator:
+
+- **`_git` must `cd` into `CLAIM_REPO` in a subshell, not hand git `-C`.** The `-C` form still STARTS
+  in the caller's cwd and has to resolve it, which is exactly what the affected cells deny
+  (`fatal: Unable to read current working directory: Operation not permitted`). The check runs the
+  SHIPPED builder with its cwd set to a directory that cannot be resolved at all, and asserts a claim
+  commit is produced and the ref lands on the target origin. **This is the hunk that unblocked
+  dispatch.**
+- **`CLAIM_REPO` must derive from `REPO`, not `.`** — hardening, not the incident's cause: the
+  controller assigns `CLAIM_REPO="$REPO"` itself (`orch-loop.sh`), and every other shipped caller
+  sets it explicitly. An ABSOLUTE `$REPO` is used as named (it needs no resolution, so no cwd can
+  make it wrong); a RELATIVE one is used only when the cwd is not already a work-tree root, and
+  otherwise `.` wins — see the six `cd` hazards below, which is why the simple form is not enough.
+
+⛔ **`cd` IS NOT A FREE SWAP FOR `-C` — six defects found in the first three versions of this fix**,
+each measured and each now pinned by the suite. `-C` treats its argument literally; `cd` is a builtin
+with its own resolution rules:
+
+- **an EMPTY `CLAIM_REPO`** — `cd ""` SUCCEEDS and leaves the cwd alone, so `|| return 1` never fired
+  and a full acquire pushed `refs/claims/…` into the **caller's** repo, a repository nobody named.
+  Closed in both orderings: the value that reaches `_git`, and an empty value that is already SET
+  when the file is sourced (kept refused instead of being coerced into a default);
+- **`$CDPATH`** — the builtin searches it for a relative path, and a same-named directory there WINS
+  over the local one (measured), so a relative `CLAIM_REPO` ran every git call — and pushed the claim
+  — in a repo the caller never named. `-C` never did that;
+- **a RELATIVE `$REPO` from a caller already inside it** — `fix-one.sh` and `merge-one.sh` `cd "$REPO"`
+  and then source this file with no `CLAIM_REPO`, so `$REPO` resolved from inside `$REPO` names
+  `$REPO/$REPO`, which does not exist: every claim refused with the SAME `could not build claim
+  commit` the fix exists to remove;
+- **a same-named SUBDIRECTORY that is itself a repo** — the same caller shape, where `$REPO/$REPO`
+  does exist. A default keyed on `[ -d "$REPO" ]` then ran every git call in the INNER repo and
+  acquired with `RESULT=acquired` on an origin nobody named — a wrong-repo claim, silently, which is
+  the duplicate dispatch this registry exists to prevent. Hence the cwd-work-tree-root test;
+- **a BARE `cd` OPTION** — `CLAIM_REPO=-P` is not a path: `cd -P` takes NO operand and SUCCEEDS into
+  `$HOME` (measured), so without the `--` a bare-option value claims into whatever repo `$HOME`
+  happens to be. `-C` read it as a directory name and failed;
+- **an ABSOLUTE `$REPO` while standing in ANOTHER repo's root** — the cwd-root test alone answers `.`
+  there, so a caller naming repo B absolutely got `RESULT=acquired` with the ref on repo A's origin,
+  silently: the same wrong-repo class one shape over. An absolute path needs no resolution, so it is
+  used as named and the heuristic is left to the relative case.
+
+Measured, which is what the suite is for (four baselines, `/tmp` copies via the `CLAIMS_SH` seam):
+
+```bash
+CLAIMS_SH=<pre-fix main>            bash …/claim-cwd.test.sh   # 19 passed, 17 FAILED (C1, C2, C5, C10)
+CLAIMS_SH=<the two hunks alone>     bash …/claim-cwd.test.sh   # 20 passed, 16 FAILED (C5–C9)
+CLAIMS_SH=<round-1 fixes, no cwd test / no SET test>          # 31 passed, 5 FAILED (C5 pre-set, C8)
+CLAIMS_SH=<round-2 fixes, no absolute-REPO branch>            # 33 passed, 3 FAILED (C10)
+CLAIMS_SH=<shipped, with `cd --` removed>                     # 33 passed, 3 FAILED (C9)
+```
+
+Each guard is pinned by exactly ONE check, so a later "simplification" of any single one of them
+reddens the suite on its own:
+
+```bash
+CLAIMS_SH=<shipped, `cd --` removed>      bash …/claim-cwd.test.sh  # C9 reds alone — fail-open into $HOME
+CLAIMS_SH=<shipped, absolute branch gone> bash …/claim-cwd.test.sh  # C10 reds alone — claims on the cwd repo
+```
+
+⛔ **The stand-in, stated**: the OS denial (TCC/EPERM on the process cwd) cannot be constructed
+hermetically, so the first check puts a `git` shim first on PATH whose only job is that read
+(`/bin/pwd -P` on the cwd it was STARTED in) before exec'ing the real git. The DENIAL is modelled;
+`claims.sh`, the commit, the acquisition and the assertion are real. Non-vacuity is measured against
+the pre-fix file, and the RED run fails with the incident's own log line:
+
+```bash
+CLAIMS_SH=<pre-fix main> bash scripts/orchestrator-harness/claim-cwd.test.sh  # 19 passed, 17 failed
+bash scripts/orchestrator-harness/claim-cwd.test.sh                           # 36 passed, 0 failed
+```
+
+To reproduce `<pre-fix main>`: `git show <main>:scripts/orchestrator-harness/claims.sh > $TMP/claims.sh`.
 
 `refresh-scout.test.sh` drives the **shipped** refresh step and the **shipped** dispatch block against
 a real local origin for the collision, unreachable, absent, stale-registry and unrecognised-status
@@ -1591,9 +1908,12 @@ algorithmic advantage. The claim worth evaluating is *utilisation*, not *efficie
 | `fix-one.sh` | fixes a reviewer's findings, pushes, re-runs the merge chain |
 | `refresh-candidates.sh` | pre-flights issues (collision check) into the backlog |
 | `selftest.sh` | offline checks; each one drives the shipped code. Not part of the loop |
+| `install.sh` / `launchd-cycle.sh` | the installer, and the ONE implementation of stop/enable/(re)start/verify for the launchd job (§4). A plain `install.sh` never touches a loaded job; `--start`/`--restart` harness the loop and PROVE it started. The library never writes a persistent disable and never mutates a job that was not loaded from this plist |
+| `install-launchd-durability.test.sh` | the agent-infra#1975 contract — no persistent-disable verb in code or in a copyable README command, `bootstrap`→`load` fallback, the ownership guard, and "not running AND (disabled OR exit 0)" as a FAILURE. Hermetic (`launchctl` stub first on `PATH`, throwaway `$HOME`/`$O`), and a CI shard via `scripts/run-bash-shards.sh` |
 | `test-gates.sh` | the `mp_reason` dispatch-gate rule table, extracted from the shipped `orch-loop.sh`. Not part of the loop |
 | `test-claims.sh` | the PR **and issue** claim CAS against live origin from two scratch repos (`git init` + `remote add`, not clones; random keys per run so concurrent runs cannot collide). Not the cross-box proof (one machine), but red on a defeated CAS. Not part of the loop |
 | `claim-exclusion.test.sh` | **the measurement:** N processes released at a barrier against a real (bare) origin, per operation class, answering *does a duplicate holder get refused*. Prints the table §7.2d records; hermetic, a CI shard |
+| `gh-limit.test.sh` | #1988 the layer UNDER every gh call: one call in flight per box — the retry path AND the `/rate_limit` probe (measured from the stub's own timestamps, with an unserialised control that MUST overlap), the documented backoff order (`retry-after` → the bucket's reset → ≥60s doubling, 4 attempts, then a loud failure), the failing bucket NAMED, `>= 1s` between mutations, conditional REST (`if-none-match` → a 304 replayed byte-exactly from a bounded cache), and the shim surviving the `/opt/homebrew` PATH prepend in every gh-calling script. Fake clock, stub gh, hermetic, a CI shard |
 | `gh-rest.test.sh` | the `gh` REST adapter's argv-to-argv **TRANSLATION**, offline against a stub `gh`: `pr list --head` must not widen to the newest open PR and `pr comment` must print a URL (both shipped green once, as P0s, when nothing asserted them). Hermetic, a CI shard |
 | `test-crossbox.sh` | drives the real `merge-one.sh` claim acquire + trap release with `gh` stubbed. Not part of the loop |
 | `refresh-scout.test.sh` | the agent-infra#1736 contract — repo-aware scout provisioning, per-repo tool resolution, the permanent/transient refresh split — plus the agent-infra#1850 issue-claim pre-flight verdict table (CLEAN/COLLISION/INCOMPLETE/NOT PROVISIONABLE/unrecognised), the dispatch-side claim, and the fenced + generation-guarded release. Not part of the loop |
@@ -1671,34 +1991,29 @@ environment block, rendered by `install.sh` from these defaults, and that enviro
 script's own**. A job already loaded with `MAX_LOAD=16` keeps `16` no matter what `orch-loop.sh` now
 defaults to. `install.sh` overwrites the plist *file* but does not reload an already-loaded job, and
 `launchctl load -w` on a job that is already loaded does not reliably re-read it. So for a limits
-change: **FIRST** `launchctl print gui/$(id -u)/com.eldato.orchestrator-loop` — and if a
-session-started controller holds `$O/.orch.lock`, stop it per §6 (scoped `pkill`, then verify); **ONLY
-THEN** re-run `./install.sh` and `launchctl enable gui/$(id -u)/com.eldato.orchestrator-loop`,
-`launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.eldato.orchestrator-loop.plist`,
-`launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.eldato.orchestrator-loop.plist` — or reboot,
-which is the only thing that reliably re-reads it — before trusting the new value.
-⛔ **NOT the `unload -w` / `load -w` pair this file used to prescribe.** `unload -w` writes a
-PERSISTENT Disabled override and the `load -w` that follows has to bootstrap to clear it — which is
-what failed on 2026-10-17 and left the controller ABSENT for 48 minutes (§6.5.6). The three calls
-above are what `scripts/install-launchd.sh:275-285` runs, including the plist path on `bootout` — and
-copy its two guards as well: it tolerates a failing `enable`/`bootout` and **removes the plist if
-`bootstrap` fails**, so a failed load leaves nothing half-installed. `install.sh:698` does not run any
-of them yet (#1976).
+change: re-run `bash scripts/orchestrator-harness/install.sh --restart` — it re-renders, `bootout`s,
+`bootstrap`s and then verifies pid + heartbeat. (Plain `… install.sh --start` also reloads, but only when
+the loaded job was NOT recorded as this render — the render launchd was last seen loading is written to
+`$O/state/launchd-loaded.sha256` at every successful start, because "the file did not change" is not the
+question: a plain run overwrites the plist without reloading it. An absent record is reported as
+UNKNOWN, not as "the old settings are live", and unknown reloads once. So a validation run cannot
+disturb a healthy controller, and the first `--start` after upgrading records the render. A plain
+`… install.sh` never touches a loaded job; it warns, naming `--restart` only when it can show the loaded
+job is on an older render.)
 
-⚠️ **And a controller that was not started by launchd is not controlled by those calls — and
-`bootstrap` makes it WORSE, not merely unchanged.** On this box the loop runs as `nohup …
-orch-loop.sh` from a session — `launchctl list | grep orchestrator` is empty even though the plist
-exists — so `enable` and `bootout` do nothing. But `bootstrap` **loads the job**: `RunAtLoad` starts a
-second `orch-loop.sh`, that one exits 0 at once on the `.orch.lock` branch (`orch-loop.sh:385`), and a
-bare `KeepAlive <true/>` relaunches on ANY exit — so launchd respawns it every ~10 s while the real
-session controller keeps running, and the operator believes a limits change took effect when it did
-not. **Check `launchctl list` first and stop the session-started controller BEFORE bootstrapping**,
-with a SCOPED match — `pkill -f "[b]ash $O/orch-loop.sh"` (§6). An unscoped `pkill -f orch-loop.sh`
-also matches peer controllers, fixtures and tests: `deploy-mac-orchestrator.sh:51-56` measured FOUR
-matches for one controller and scopes its own pgrep for exactly that reason. **Verify with
-`pgrep -fl '[o]rch-loop'` before you bootstrap** — the scoped pattern does not match a
-`cd ~/orchestrator && ./orch-loop.sh` start, and a controller that is still alive will simply win the
-lock race against the one launchd spawns.
+⚠️ **And `launchctl bootout` touches nothing when the controller was not started by launchd.** A loop
+started as `nohup … orch-loop.sh` from a session has no launchd job at all, so a bootout/bootstrap pair
+is a no-op *for that process* and the old controller keeps the old limits: the operator believes a
+limits change took effect when it did not. The two reads that answer it are
+`launchctl print gui/$(id -u)/com.eldato.orchestrator-loop` (its `path` and `pid` — or `rc=113` when
+there is no job) and `cat ~/orchestrator/.orch.lock`; `install.sh --start`/`--restart` **refuse** to
+start while `$O/.orch.lock` holds a live pid that launchd is not running (launchd's copy would exit at
+once on that lock and `KeepAlive` would relaunch it forever) and tell you to stop it first. Stop a
+session-started controller with `pkill -f "[b]ash $O/orch-loop.sh"` (§6) rather than with `launchctl`.
+
+> Do not record "on this box the loop runs under nohup" as a fact — it is a state, and it changes: on
+> 2026-10-17 this box was launchd-owned for part of the day and session-owned for another part. Read
+> the two commands above at the moment you care.
 
 Everything else is still tortoise-shaped and must be changed on another target: the branch
 suffix (`tm`), `feat/<N>-tm` naming, `lane.sh`'s `uv sync --extra embeddings --extra parity`, the
