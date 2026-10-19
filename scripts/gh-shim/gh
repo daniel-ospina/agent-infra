@@ -165,6 +165,15 @@ find_real_gh() {
     # compares device+inode THROUGH symlinks, so it catches a link, a link chain and a
     # hardlink alike.
     [ "$d/gh" -ef "$SELF_DIR/$(basename "$self")" ] && continue
+    # ⛔ AND SKIP THE HARNESS'S OWN `gh` LAYERS (#1988). `$O/gh-rest`/`$O/gh-limit` are interposers
+    # that resolve the real gh themselves by walking PATH; resolving one of THEM as "the real gh"
+    # re-enters the shim chain and the harness's depth guard ends it with rc 127 for EVERY gh call in
+    # the process tree (measured: `gh pr view` → 127, so a reviewer could not post its evidence).
+    # They identify themselves with one sentinel line; this shim deliberately does NOT carry it, so
+    # the harness layers still delegate MUTATIONS through here and #984's argv-level admin-merge guard
+    # stays in force. No pipe: `head | grep -q` can report failure through SIGPIPE under `pipefail`.
+    [ -f "$d/gh" ] || continue
+    case "$(head -c 8192 "$d/gh" 2>/dev/null)" in *harness-gh-shim-marker*) continue ;; esac
     printf '%s' "$d/gh"; IFS="$old_ifs"; return 0
   done
   IFS="$old_ifs"

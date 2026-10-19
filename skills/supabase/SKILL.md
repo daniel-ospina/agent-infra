@@ -133,6 +133,9 @@ error: The following untracked working tree files would be overwritten by merge:
 ```
 
 **Recovery pattern:**
+
+> ⛔ `refs/stash` is **shared by every worktree of the repo**, so a bare `git stash pop` here can take a peer lane's entry and drop their ref (#1264 — see `using-git-worktrees`). Verify the top entry is this branch's first.
+
 ```bash
 # 1. Abort any in-progress rebase
 if git rebase --abort 2>/dev/null; then :; fi
@@ -140,9 +143,13 @@ if git rebase --abort 2>/dev/null; then :; fi
 # 2. Remove the conflicting untracked files (they exist on remote, not yet local)
 rm -f supabase/migrations/<auto-created-file>.sql
 
-# 3. Now pull + pop cleanly
+# 3. Now pull, then restore the stash ONLY if the top entry is this worktree's branch
+#    (shared register — a peer lane's stash landing on top must not be popped, #1264)
 git pull --rebase
-git stash pop
+TOP="$(git stash list -1 --format='%gs' | sed -n 's/^\(WIP on\|On\) \([^:]*\):.*/\2/p')"
+[ "$TOP" = "$(git branch --show-current)" ] \
+  && git stash pop \
+  || echo "⛔ top stash is '$TOP', not this worktree — do NOT pop (#1264)"
 ```
 
 The auto-PR migration file is already merged to main — deleting the local untracked copy just clears the path for the pull to bring it in properly.
