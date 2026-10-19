@@ -68,6 +68,7 @@ case "$path" in
   *"/pulls?state="*)      printf '%s' '[{"number":9001,"title":"unrelated newest","state":"open","merged_at":null,"mergeable":true,"mergeable_state":"clean","draft":false,"head":{"ref":"other","sha":"o1"}},{"number":3,"title":"c","state":"open","merged_at":null,"mergeable":true,"mergeable_state":"clean","draft":false,"head":{"ref":"c","sha":"c3"}},{"number":2,"title":"b","state":"open","merged_at":null,"mergeable":true,"mergeable_state":"clean","draft":false,"head":{"ref":"b","sha":"b2"}}]'; exit 0 ;;
   *"/issues?state="*)     printf '%s' '[{"number":900,"title":"a pull request","state":"open","pull_request":{"url":"x"}},{"number":8491,"title":"real issue","state":"open","labels":[{"name":"P0-blocker"}]},{"number":8492,"title":"another","state":"open","labels":[]}]'; exit 0 ;;
   *"/issues/8833/comments"*|*"/comments?per_page"*) printf '%s\n%s\n' '[{"body":"LGTM","user":{"login":"rev"},"created_at":"2026-10-17"}]' '[{"body":"second","user":{"login":"rev2"},"created_at":"2026-10-18"}]'; exit 0 ;;
+  *"/issues/9008"*)      printf '%s' '{"number":9008,"title":"dup","state":"closed","state_reason":"duplicate","assignees":[]}'; exit 0 ;;
   *"/issues/8491"*)       printf '%s' '{"number":8491,"title":"real issue","state":"open","labels":[{"name":"P0-blocker"}],"assignees":[{"login":"daniel-ospina"}]}'; exit 0 ;;
 esac
 echo "STUB: no fixture for: $*" >&2; exit 1
@@ -145,6 +146,36 @@ ck "unservable --json field (closingIssuesReferences) DELEGATES instead of answe
 run pr list --repo o/r --state open --json number >/dev/null 2>&1
 ck "a servable --json field still uses REST (no needless delegation)" \
    "$(haslog 'pulls?state=' && echo 0 || echo 1)"
+
+# ── D4. `stateReason` is SERVED (the drained-backlog P0, measured 2026-10-18) ─────────────────────
+# The collision pre-flight makes ONE gh-backed issue read —
+# `gh issue view … --json number,title,state,stateReason,assignees,url` — and computes BOTH the
+# `issue assignee/holder` surface and its `issue landed` decision from that one payload (a failed
+# read marks the landed surface `issue-metadata-unavailable` beside it). Left off the allow-list the
+# read DELEGATES to GraphQL: a needless draw on the scarce bucket, and on a refusal the tool recovers
+# only through its own REST fallback for the refusal TEXTS it classifies as budget exhaustion (#1968)
+# — any other refusal leaves the surface INCOMPLETE, which is enough to make every candidate's verdict
+# unusable, so the refresh aborts by design (#1736) and `candidates.txt` stays at 0 against 200+ open
+# issues. REST's issue object carries `state_reason`, so this is a SOURCE mapping, not a
+# re-derivation — and `gh pr view --json stateReason` is invalid, so it must stay PR-rejected.
+: >"$TMP/log"
+out="$(run issue view 8491 --repo o/r --json number,state,stateReason,assignees,url 2>&1)"
+ck "issue view --json stateReason is SERVED over REST (no GraphQL dependency for the pre-flight)" \
+   "$(haslog 'repos/o/r/issues/8491' && ! haslog 'issue view 8491' && echo 0 || echo 1)"
+ck "issue view serves stateReason as '' when REST has null (gh's own rendering)" \
+   "$(printf '%s' "$out" | json_eq 'd["stateReason"]=="" and d["state"]=="OPEN"')"
+: >"$TMP/log"
+out="$(run issue view 9008 --repo o/r --json number,stateReason 2>&1)"
+ck "issue view uppercases REST state_reason ('duplicate' -> 'DUPLICATE'), the value gh reports" \
+   "$(printf '%s' "$out" | json_eq 'd["stateReason"]=="DUPLICATE"')"
+ck "issue view state_reason read stays on REST (no delegation for a CLOSED issue either)" \
+   "$(haslog 'repos/o/r/issues/9008' && ! haslog '9008 --repo o/r' && echo 0 || echo 1)"
+# ⛔ PER-KIND, NOT GLOBAL: `gh pr view --json stateReason` is INVALID (gh 2.97.0: "Unknown JSON field:
+# \"stateReason\""), so a PR consumer must still get gh's own refusal rather than a REST-invented key.
+: >"$TMP/log"
+run pr view 8833 --repo o/r --json stateReason >/dev/null 2>&1
+ck "pr view --json stateReason still DELEGATES (gh rejects the field for PRs; REST must not invent it)" \
+   "$(haslog 'pr view 8833 --repo o/r --json stateReason' && echo 0 || echo 1)"
 
 # ── E. pr list --head must reach the API (chain-merge.sh:44 — else the WRONG PR is merged) ───────
 : >"$TMP/log"
