@@ -483,6 +483,29 @@ out="$(cd / && env -u TEMPLATES_DIR -u INFRA_ROOT -u AGENT_INFRA_PATH \
 [ "$rc" -eq 3 ] && ok "--start exits 3 when there is nothing to read (the supervisor keys on it)" \
   || bad "expected rc=3 for missing declarations, got $rc: $out"
 
+# ── 9d. ...and 3 is ALSO the answer when a pointer RESOLVES but cannot be read ──────────────
+# The 9c shape (no path at all) was the ONLY shape that produced rc=3, because main() tests the
+# template PATH, not the declarations. A remembered templates-dir pointer aimed at a deleted
+# checkout, or at a directory holding no *.plist, fell straight through to spawn: --start printed
+# "loop started (pid …)", exited 0, and the supervisor's warn-vs-fatal split — written for exactly
+# "this cell was never installed" — never fired, over a loop that could never schedule anything.
+# `start` is the only thing that revives the schedule on a running cell (#1864), so that was a
+# cell with no reaping and no liveness detection reported as a success.
+case_ "9d. --start exits 3 when the declarations it is pointed at are gone or empty"
+# Its own empty dir: case 12's EMPTY is declared FURTHER DOWN this file, and depending on it here
+# would be a forward reference that reads as a pass only because `set -u` is off.
+EMPTY9="$T/empty-decl"; mkdir -p "$EMPTY9"; printf '# no retired labels\n' > "$EMPTY9/RETIRED"
+for badroot in "$T/gone-checkout/templates/launchd" "$EMPTY9"; do
+  state_reset "$badroot"
+  out="$(run "$badroot" --start 2>&1)"; rc=$?
+  [ "$rc" -eq 3 ] && ok "--start exits 3 for ${badroot#$T/} (not a silent 0)" \
+    || bad "--start returned $rc over unusable declarations at ${badroot#$T/}: $out"
+  grep -qE 'loop started' <<<"$out" && bad "it claimed a running loop over declarations it cannot read: $out" \
+    || ok "it does not claim to have started a loop it could not feed"
+  [ ! -f "$FLEET_SCHEDULE_STATE/loop.pid" ] && ok "no loop pid was recorded for unreadable declarations" \
+    || bad "a loop pid was recorded over unreadable declarations"
+done
+
 # ── 10. macOS delegates (never a second scheduler) ──────────────────────────────────────────
 case_ "10. the launchd backend is delegated to, driven through the Darwin branch"
 # ⛔ BEHAVIOUR, NOT A GREP. The previous version asserted `grep -q 'install-launchd.sh' "$SCHED"`
@@ -605,6 +628,32 @@ out="$(run "$EMPTY" --verify)"; rc=$?
 [ "$rc" -eq 1 ] && ok "--verify also refuses the empty set" || bad "--verify passed an empty set (rc=$rc)"
 [ ! -f "$FLEET_SCHEDULE_STATE/loop.pid" ] && ok "no loop was started over an empty set" \
   || bad "a loop was started over an empty set"
+
+# ── 12b. ZERO LIVE jobs is the SAME false PASS, reached by a longer route ─────────────────────
+# An empty DIRECTORY is refused by load_jobs(). But a set where every declared job is a NAMED SKIP
+# — a cell with no swarm root and no tortoise checkout — reached the verdict line as
+#   SCHEDULE VERIFIED — 0 job(s) live on this machine …, N skipped for a named reason
+# and exited 0. cloud-cell-bringup.sh then printed "scheduled layer live: …" and the cell reached
+# CELL READY with nothing scheduled at all: the exact string the acceptance forbids, on a host with
+# no reaping and no liveness detection. Skips are non-fatal only while ONE job is live.
+case_ "12b. a job set where EVERY job is skipped is refused, not verified with 0 live"
+ALLSKIP="$FIX/allskip"; mkdir -p "$ALLSKIP"; printf '# no retired labels\n' > "$ALLSKIP/RETIRED"
+mkplist "$ALLSKIP" com.test.skipme "$T/skipme.spec"   # {{SWARM_ROOT}} is unset below → SKIP
+state_reset "$ALLSKIP"
+unset SWARM_ROOT
+out="$(run "$ALLSKIP" --install 2>&1)"; rc=$?
+[ "$rc" -eq 1 ] && ok "--install refuses a set with no live job (rc=1)" \
+  || bad "a zero-live job set was accepted (rc=$rc): $out"
+grep -q 'SCHEDULE VERIFIED' <<<"$out" && bad "it printed SCHEDULE VERIFIED over 0 live jobs: $out" \
+  || ok "nothing was certified as verified with zero live jobs"
+grep -q 'NOT ONE is live' <<<"$out" && ok "the refusal says that no job is live, not that all is well" \
+  || bad "the refusal is not diagnosable: $out"
+grep -q 'SKIP.*com.test.skipme.*{{SWARM_ROOT}}' <<<"$out" \
+  && ok "the skip is still NAMED with its reason (it is counted, not hidden)" \
+  || bad "the skip lost its name in the refusal: $out"
+out="$(run "$ALLSKIP" --verify 2>&1)"; rc=$?
+[ "$rc" -eq 1 ] && ok "--verify also refuses a zero-live set" \
+  || bad "--verify passed a set with no live job (rc=$rc): $out"
 
 # ── 13. a recycled pid must not fake a running loop (--start used to print one and exit 0) ────
 case_ "13. --start replaces a recycled pid in loop.pid instead of reporting it as the loop"

@@ -110,9 +110,14 @@ fourth state and no silent absence: this table is what makes "deployed" checkabl
   — a `Month`/`Day` calendar searches 400 days, including the entries of a multi-entry
   `StartCalendarInterval` array);
 - an **empty** declarations dir: a schedule with ZERO jobs is refused (exit 1), never certified as
-  `0 job(s) live`;
-- a job **overdue** by more than `max(2 × its interval, 3 × tick)` (the loop is alive and is not
-  running it — e.g. its lock is held by a hung run);
+  `0 job(s) live` — and the same is true, by a longer route, when **every** declared job is a
+  named `SKIP`. A host where nothing is live runs no reaper, no liveness report and no canary
+  whatever the reason, so `NOT ONE is live` is a refusal, not a verified schedule. Skips are
+  non-fatal only while **at least one** job is live;
+- a job **overdue** by more than `max(2 × its interval, 3 × tick)` while **no job is running** (the
+  loop is alive and is not running it — e.g. its lock is held by a hung run). The busy exemption
+  is the same one the tick arm uses, so a calendar job that comes due while a long job is executing
+  is reported `BUSY`, not `OVERDUE`: the loop is single-threaded, and a busy loop is a late loop;
 - a template with no schedule at all, an unknown placeholder, a `Label` that is not a safe file
   name (it names that job's stamp, lock and default log, so only letters, digits, `.`, `_` and `-`
   are accepted), a target **under `<home>/.pi/agent/`** that does not resolve (an incomplete
@@ -125,7 +130,17 @@ fourth state and no silent absence: this table is what makes "deployed" checkabl
 A `SKIP` is reported and counted, not fatal: no tortoise checkout is a legitimate per-machine
 absence, and refusing the whole layer over it would block a cell that runs every other job. The
 verdict line says both numbers — `SCHEDULE VERIFIED — N job(s) live on this machine …, M skipped
-for a named reason`.
+for a named reason`. It is only printed when `N ≥ 1`.
+
+A stamp records a **completed** run: a job interrupted by `--stop` (the loop's `SIGTERM` handler
+raises `SystemExit` through `run_job`) writes no stamp, so an interrupted job keeps its previous
+real stamp — or stays honestly `NEVER RUN` — instead of certifying itself with an `rc` of `null`.
+
+`--start` reads the declarations before it spawns. No declarations at all, a remembered
+`templates-dir` that no longer resolves, and a dir holding no `*.plist` all exit **3** (the code
+`cloud-cell-supervisor.sh start` keys on to warn rather than die), so `start` can never report a
+running loop over a schedule it could not read. A job set the runtime cannot run in full (a broken
+target inside the layer) is exit **1** there too.
 
 ## Commands
 
