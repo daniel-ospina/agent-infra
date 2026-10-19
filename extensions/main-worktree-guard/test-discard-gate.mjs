@@ -21,7 +21,7 @@
 //
 // Run: node extensions/main-worktree-guard/test-discard-gate.mjs
 import { execSync } from "node:child_process";
-import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -426,6 +426,219 @@ async function partB() {
     expectTrue("B5f: CLEAN session tree + indirection + discard against a DIFFERENT dirty worktree → BLOCKED (not silently allowed)",
       blocked(await bash(`S=${cleanUndoEarly}; bash $S; git -C ${wt2} checkout -- dirty.txt`, wt)),
       "was allowed — an unresolvable script path does not excuse an accompanying discard");
+
+    // ── B5g: #1885 — a script invoked THROUGH A VARIABLE is the same script ──
+    //
+    // The pre-fix fail-open, measured on this handler: `S=./undo.sh; bash $S` is
+    // BLOCKED (the interpreter-operand arm fails closed) while `S=./undo.sh; $S`
+    // — the SAME file, the SAME discard — was ALLOWED, because a bare `$`-word in
+    // command position is neither an interpreter operand nor a `/`-prefixed direct
+    // word, so no script path was ever extracted and the effect probe had nothing
+    // to gate. Each assertion below is a distinct clause of the arm:
+    //   * the resolved literal must be READ and gated on its EFFECT, which is why
+    //     the block must carry the #709 effect reason and NOT the
+    //     "not statically resolvable" refusal — the latter would also "block" if
+    //     the arm had merely given up, so it would pin nothing;
+    //   * the same command must be ALLOWED on a clean target (effect-based, not
+    //     shape-based) and for a script that contains no discard;
+    //   * an opaque but PATH-SHAPED value fails closed, while the ordinary
+    //     `$VAR` idioms must stay allowed — an over-block here is the same defect
+    //     in the other direction (#1776).
+    write(join(wt, "dirty.txt"), "MUTANT-1885\n");
+    const undoRel = join(wt, "undo1885.sh");
+    const noopRel = join(wt, "noop1885.sh");
+    const cleanRel = join(wt, "undo-clean1885.sh");
+    write(undoRel, "git checkout -- dirty.txt\n");
+    write(noopRel, "echo hi\n");
+    write(cleanRel, "git checkout -- clean.txt\n");
+    for (const p of [undoRel, noopRel, cleanRel]) chmodSync(p, 0o755);
+    // A two-level fixture for the dir-prefix idiom (`D=./sub; S=$D/tool.sh; $S`),
+    // which must be RESOLVED and GATED rather than refused (review P2).
+    mkdirSync(join(wt, "sub1885"), { recursive: true });
+    write(join(wt, "sub1885", "undo1885.sh"), "git checkout -- dirty.txt\n");
+    write(join(wt, "sub1885", "noop1885.sh"), "echo hi\n");
+    for (const p of [join(wt, "sub1885", "undo1885.sh"), join(wt, "sub1885", "noop1885.sh")]) chmodSync(p, 0o755);
+    const resolvedBlock = (r) => blocked(r) && /#709/.test(r?.reason ?? "") && !/not statically resolvable/.test(r?.reason ?? "");
+    for (const cmd of [
+      "S=./undo1885.sh; $S",
+      "S=./undo1885.sh; ${S}",
+      "F=./undo1885.sh; $F",
+      "S='./undo1885.sh'; $S",
+      "export S=./undo1885.sh; $S",
+      "declare S=./undo1885.sh; $S",
+      "S+=./undo1885.sh; $S",
+      "S=./undo1885.sh; exec $S",
+      "S=./undo1885.sh; env $S",
+      "S=./undo1885.sh; ! $S",
+      "S=./undo1885.sh; > /dev/null $S",
+      "true && S=./undo1885.sh; $S",
+      "S=./undo1885.sh; $S --flag",
+      "(S=./undo1885.sh; $S)",
+      "{ S=./undo1885.sh; $S; }",
+      // The arm must NOT be gated on `_scriptPath` (review P1): one innocuous
+      // script prefix used to suppress the whole scan.
+      "bash ./noop1885.sh; S=./undo1885.sh; $S",
+      "bash ./undo-clean1885.sh; S=./undo1885.sh; $S",
+      // LAST assignment wins, as the shell does (review P2).
+      "S=${X}; S=./undo1885.sh; $S",
+      "S=./noop1885.sh; S=./undo1885.sh; $S",
+      // One hop of substitution makes a dir-prefixed value readable (review P2).
+      "D=./sub1885; S=$D/undo1885.sh; $S",
+      // A literal suffix is part of the executed path.
+      "S=./undo1885; $S.sh",
+      // An UNQUOTED `$NAME` is word-split by the shell, so the FIRST field runs
+      // (review P1). The quoted spelling (one word) is covered above.
+      'S="./undo1885.sh --flag"; $S',
+      // ⚠️ KNOWN OVER-BLOCK, declared: the word-split is applied to QUOTED references too
+      // (`"$S"` is one word to the shell), so `S="./undo1885.sh --flag"; "$S"` is refused
+      // although it names no such file. The over-block direction is chosen deliberately:
+      // the fail-open it replaces ran the discarding script (review P3, documented in the
+      // README). Effect-based controls below pin that a benign value stays allowed.
+      // A heredoc BEFORE the invocation must not shift the segment indices of the two
+      // readers (review P1) — that disabled the whole arm.
+      "cat > notes1885.md <<EOF\na\nEOF\nS=./undo1885.sh; $S\n",
+      // A pipe / `||` starts a NEW command, so a reference after it is still a command word
+      // (review P1).
+      "S=./undo1885.sh; false || $S",
+      "S=./undo1885.sh; : | $S",
+      // A wrapper's option VALUE is not the command word (review P1): `nice -n 5`,
+      // `sudo -u root`, `timeout 5`, `env -u X`.
+      "S=./undo1885.sh; nice -n 5 $S",
+      "S=./undo1885.sh; sudo -u root $S",
+      "S=./undo1885.sh; timeout 5 $S",
+      "S=./undo1885.sh; env -u X -i $S",
+      // A redirection whose `&` is part of `2>&1` / `&>` is not a command separator
+      // (review P2).
+      "S=./undo1885.sh; 2>&1 $S",
+      "S=./undo1885.sh; &>/dev/null $S",
+      // A `<<` inside a QUOTED string or a `#` comment is not a heredoc (review P2): the
+      // mask used to blank the rest of the command, taking the real `$S` with it.
+      'S=./undo1885.sh; echo "a << EOF"\n$S\n',
+      "# note << EOF\nS=./undo1885.sh; $S\n",
+      // An INSPECTION command before the invocation ends its OWN segment, never the whole
+      // scan (review P1): `[ -f x ];` as a prefix used to skip every later segment.
+      "[ -f x ]; S=./undo1885.sh; $S",
+      "test -f x; S=./undo1885.sh; $S",
+      "command -v git; S=./undo1885.sh; $S",
+      // LONG-form wrapper options, and a non-literal `timeout` duration (review P2).
+      "S=./undo1885.sh; sudo --user root $S",
+      "S=./undo1885.sh; env --unset X $S",
+      "S=./undo1885.sh; timeout $T $S",
+      // `${S:+word}` expands to the WORD, so the word is what runs (review P2).
+      "S=ls; T=./undo1885.sh; ${S:+$T}",
+      // One hop through a name the arm itself resolved (review P2): the value of `T`
+      // is `$S`, and substitution must use the SHELL's map, not #1060's conservative
+      // one (which dropped `S`, assigned twice).
+      "S=$1; S=./undo1885.sh; T=$S; $T",
+      // The `eval` and `-c` payload readers take their assignment value from the SAME
+      // word reader as the command-position arm (review P1): an ad-hoc `\\S+` capture
+      // kept the trailing `;`, the stat threw, and the payload fell through to
+      // "no discard verb ⇒ allow".
+      "S=./undo1885.sh; eval $S",
+      "S=./undo1885.sh; bash -c $S",
+      // POSITION, not "last in the command" (review P1): the shell has ALREADY run
+      // `./undo1885.sh` by the time the later assignment is evaluated.
+      "S=./undo1885.sh; $S; S=./noop1885.sh",
+      // A quoted DECOY is not an assignment (review P1) - the raw-regex reader took
+      // ` S=./noop1885.sh` out of a string and laundered the value.
+      "S=./undo1885.sh; echo ' S=./noop1885.sh'; $S",
+      // The same decoy through the `eval` arm, whose posture this change must NOT narrow
+      // (review P1): `P` really holds the discard.
+      "P=./undo1885.sh; echo ' P=ls'; eval \"$P\"",
+    ]) {
+      const r = await bash(cmd, wt);
+      expectTrue(`B5g: command-position variable script — \`${cmd}\` BLOCKED on its EFFECT (read, not merely refused)`,
+        resolvedBlock(r), `reason=${JSON.stringify(r?.reason ?? "").slice(0, 240)}`);
+    }
+    // `$D` is NOT assigned here, so the value cannot be resolved at all — this is the
+    // fail-closed arm, as opposed to the dir-prefix case above which IS resolvable.
+    // ⛔ `true; ` first, deliberately: when the assignment IS the command's first word its
+    // path-shaped `$`-bearing text is refused by the PRE-EXISTING first-word arm (#1228),
+    // which would make this assertion vacuous about the new arm (review P3).
+    // ⛔ `+=` onto an UNREADABLE base concatenates onto it (`$(pwd)/undo.sh`), so
+    // folding onto nothing would gate the tail alone (review P1) — and the tail is
+    // usually a path that does not exist, which silently allowed the real script. The
+    // correct answer is FAIL CLOSED, not an effect block: the value cannot be read.
+    const appending = await bash("S=$(pwd); S+=/undo1885.sh; $S", wt);
+    expectTrue("B5g: `+=` onto an UNREADABLE base → BLOCKED (the shell concatenates; the tail alone is not the path)",
+      blocked(appending) && /not statically resolvable/.test(appending?.reason ?? ""),
+      `reason=${JSON.stringify(appending?.reason ?? "").slice(0, 240)}`);
+    const opaque = await bash("true; S=${D}/undo1885.sh; $S", wt);
+    expectTrue("B5g: opaque but PATH-SHAPED same-command assignment → BLOCKED (fail closed)",
+      blocked(opaque) && /not statically resolvable/.test(opaque?.reason ?? ""),
+      `reason=${JSON.stringify(opaque?.reason ?? "").slice(0, 240)}`);
+    expectTrue("B5g: that refusal names the assignment and does NOT assert a state it never observed",
+      /\$S/.test(opaque?.reason ?? "") && !/carries\s+uncommitted changes/.test(opaque?.reason ?? ""),
+      `reason=${JSON.stringify(opaque?.reason ?? "").slice(0, 240)}`);
+    // The command-substitution value is the arm's OWN case (a whitespace split
+    // truncated `$(printf ./undo1885.sh)` to `$(` and read it as "not path-shaped",
+    // letting it through — review P3): the refusal here comes from the #1885 arm.
+    const subst = await bash("S=$(printf ./undo1885.sh); $S", wt);
+    expectTrue("B5g: command-substitution value → BLOCKED (the whole assignment word is read, not its first token)",
+      blocked(subst) && /not statically resolvable/.test(subst?.reason ?? "") && /\$S/.test(subst?.reason ?? ""),
+      `reason=${JSON.stringify(subst?.reason ?? "").slice(0, 240)}`);
+    // `${S:?}` / `${S%%.sh}` compute a DIFFERENT string than the variable holds, so
+    // they cannot be substituted; a path-shaped assignment makes them fail closed.
+    for (const cmd of ["S=./undo1885.sh; ${S:?}", "S=./undo1885.sh; ${S%%.sh}.sh"]) {
+      expectTrue(`B5g: parameter-expansion operator — \`${cmd}\` BLOCKED (not statically determinable)`,
+        blocked(await bash(cmd, wt)), "was allowed — the expansion can re-spell the script path");
+    }
+    // ⛔ A SUBSTRING operator computes a different string and must NOT be mistaken for a
+    // value operator. `S=xxxxxxxxxxxxxxxx./undo1885.sh; ${S:16}` runs `./undo1885.sh`, and
+    // the first version of the value-operator test used the character RANGE `+-=`, which
+    // contains the digits — so `:16` slipped through as a "value" operator and the command
+    // was ALLOWED (a live fail-open, found by the verification gate).
+    for (const cmd of [
+      "S=xxxxxxxxxxxxxxxx./undo1885.sh; ${S:16}",
+      "S=./undo1885.sh; ${S:0:4}",
+      "S=./undo1885.sh; ${S#x}",
+    ]) {
+      const rr = await bash(cmd, wt);
+      expectTrue(`B5g: SUBSTRING parameter operator — \`${cmd}\` fails CLOSED (it computes a different path)`,
+        blocked(rr) && /not statically determinable|not statically resolvable/.test(rr?.reason ?? ""),
+        `reason=${JSON.stringify(rr?.reason ?? "").slice(0, 200)}`);
+    }
+    expectTrue("B5g: a LATER literal assignment governs — `S=./undo1885.sh; S=./noop1885.sh; $S` ALLOWED (the shell runs the last value)",
+      allowed(await bash("S=./undo1885.sh; S=./noop1885.sh; $S", wt)),
+      "was blocked — refusing here would refuse a command the shell runs differently");
+    expectTrue("B5g: script with NO discard invoked via a variable → ALLOWED",
+      allowed(await bash("S=./noop1885.sh; $S", wt)), "was blocked — the gate is effect-keyed");
+    expectTrue("B5g: CLEAN target via a command-position variable → ALLOWED (effect, not shape)",
+      allowed(await bash("S=./undo-clean1885.sh; $S", wt)), "was blocked — nothing to destroy");
+    expectTrue("B5g: dir-prefix via one hop of substitution, benign → ALLOWED (gated, not refused — review P2)",
+      allowed(await bash("D=./sub1885; S=$D/noop1885.sh; $S", wt)),
+      "was blocked — a resolvable value must be read, not refused");
+    for (const cmd of [
+      "CMD=ls; $CMD -la",
+      "E=${EDITOR:-vi}; $E clean.txt",
+      "$EDITOR clean.txt",
+      "S=./undo1885.sh; echo $S",
+      // `command -v` / `-V` INSPECTS its operand; it does not run it (review P2). The
+      // wrapper skip used to consume `-v` and then treat `$S` as the command.
+      "S=./undo1885.sh; command -v $S",
+      "S=./undo1885.sh; command -V $S",
+      // `command -pv` is the same INSPECTION (review P3).
+      "S=./undo1885.sh; command -pv $S",
+      // `[` / `[[` are COMMANDS whose operand is data: `[ -x "$S" ]` runs nothing
+      // (review P2 - this was refused with an effect block it never incurred).
+      'S=./undo1885.sh; [ -x "$S" ] && echo yes',
+      'S=./undo1885.sh; [ "$S" = x ] && echo eq',
+      // `command -p -v` is the same INSPECTION as `-pv` (review P2).
+      "S=./undo1885.sh; command -p -v $S",
+      "S=./undo1885.sh; [[ -n $S ]] && echo yes",
+      // A HEREDOC BODY is data, not a command word (review P3).
+      "S=./undo1885.sh; cat > notes1885.md <<'EOF'\n$S is what we run\nEOF\n",
+      // `${S:?}` / `${S:-x}` on a SET variable return its own value, so a benign script
+      // stays allowed (review P2 - refusing it blocked a determinable command).
+      "S=./noop1885.sh; ${S:?}",
+      "S=./noop1885.sh; ${S:-x}",
+      // ...and `${S+x}` expands to `x`, which is not the script at all (review P2).
+      "S=./undo1885.sh; ${S+x}",
+    ]) {
+      expectTrue(`B5g: NEGATIVE ordinary variable command — \`${cmd}\` ALLOWED`,
+        allowed(await bash(cmd, wt)), "over-blocked: the same defect in the other direction");
+    }
+    write(join(wt, "dirty.txt"), "v1\n");
 
     // ── B6: DIRTY tracked target in a LINKED WORKTREE → BLOCK (the #709 core) ──
     write(join(wt, "dirty.txt"), "MUTANT\n");
