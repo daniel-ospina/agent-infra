@@ -552,7 +552,7 @@ out="$(run_cap FAKE_TMUX_TABLE="$T/tmux-h.tsv" FAKE_DF_FREE_KB=524288 --gc --rep
 assert_contains "$out" "free_after=512MB floor=2048MB floor_ok=no" "512MB is below the stated floor"
 assert_contains "$out" "lanes_headroom=0" "no lane headroom is reported when the floor is already breached"
 assert_contains "$out" "BELOW the stated floor" "the breach is named, not buried in a green summary"
-assert_eq "$rc" "5" "the exit code is 5 (over-bound at the disk-reaper entry point)"
+assert_eq "$rc" "5" "the exit code is 5 (the reaper's own over-bound code; disk-reaper's pass level does not propagate it yet — #2156)"
 
 echo " H2b the over-bound AUDIT ROW carries the floor ACTUALLY asserted, not the raw env value"
 # An invalid floor falls back to 2048MB for the comparison, so the incident line an operator greps must
