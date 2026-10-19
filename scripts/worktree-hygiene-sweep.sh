@@ -1,4 +1,26 @@
 #!/usr/bin/env bash
+# ── the portability shim (#2048) ────────────────────────────────────────────────────────────────
+# This pass runs on the MAC as a launchd job (com.tortoise.worktree-hygiene) and on Linux, so every
+# platform difference it touches must go through the shim: macOS ships no `timeout`, `nproc`,
+# `stat -c` and `date -d` are GNU-only, and `getent` does not exist here (#2046 is exactly the
+# component that installed and then failed to EXECUTE). A shim that cannot be loaded is a REFUSAL AT
+# STARTUP (exit 3), never a silent run with no helper.
+_PORTABLE_LIB="${PORTABLE_LIB:-}"
+if [ -z "$_PORTABLE_LIB" ]; then
+    _portable_self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+    for _portable_cand in "$_portable_self_dir/lib/portable.sh" \
+                          "$_portable_self_dir/../lib/portable.sh" \
+                          "${HOME:-}/.pi/agent/scripts/lib/portable.sh"; do
+        [ -n "$_portable_cand" ] && [ -f "$_portable_cand" ] && { _PORTABLE_LIB="$_portable_cand"; break; }
+    done
+fi
+if [ ! -f "${_PORTABLE_LIB:-}" ]; then
+    printf '%s: FAIL-CLOSED at startup — the portability shim is missing (%s)\n' \
+        "${0##*/}" "${_PORTABLE_LIB:-not beside this script and not in ${HOME:-}/.pi/agent/scripts/lib/}" >&2
+    exit 3
+fi
+# shellcheck source=lib/portable.sh
+. "$_PORTABLE_LIB"
 # worktree-hygiene-sweep.sh — the periodic pass that keeps the tortoise checkout's
 # worktree + branch sprawl bounded (#8051-adjacent; measured 2026-10-18).
 #
