@@ -266,7 +266,7 @@ claim_host_warn_seam() {
   # 0, so the next acquire warns (and an equal seam host returns 0 above without consuming the flag).
   [ "$CLAIM_OWNER_HOST" = "$real" ] && return 0
   CLAIM_HOST_SEAM_WARNED=1
-  printf '[claims] ⚠️ CLAIM_OWNER_HOST=%s overrides the running host (%s): claims minted here are stamped with a name the HOST rules cannot judge \u2014 an ISSUE claim minted here cannot be reclaimed by this box (a PR claim still can, via its pid) \u2014 and %s will NOT be recorded as one of this box'"'"'s own names (the rename self-heal stays inert). Unset it unless you are a test or a cross-box simulation.\n' \
+  printf '[claims] ⚠️ CLAIM_OWNER_HOST=%s overrides the running host (%s): claims minted here are stamped with a name the HOST rules cannot judge — an ISSUE claim minted here cannot be reclaimed by this box (a PR claim still can, via its pid) — and %s will NOT be recorded as one of this box'"'"'s own names (the rename self-heal stays inert). Unset it unless you are a test or a cross-box simulation.\n' \
     "$CLAIM_OWNER_HOST" "$real" "$real" >&2
   return 0
 }
@@ -492,7 +492,13 @@ claim_orphan_reason() {
     # with no ref the `*)` arm judged an issue-keyed owner by its pid and deleted a live lane's shared
     # barrier on a controller restart. A PR ref is `<ns>/<pr>-<sha12>` (a hyphen after the number), so
     # only that shape may probe a process; an absent or unrecognised ref abstains (under-reap).
-    *-*)
+    # ⛔ AND "A HYPHEN" IS NOT THE TEST (P2, cycle-16 review): `*-*` also matched the BARE ISSUE KEY
+    # `issue-<N>` that `claim_issue_key` prints, so `claim_orphan_reason "host:<dead pid>" "issue-1234"`
+    # returned ORPHANED — the PR-only rule judging an ISSUE claim, i.e. exactly the shared-barrier window
+    # this arm exists to close, one caller away. The shapes are matched POSITIVELY now: an ISSUE key
+    # (with or without the `refs/claims/` prefix) abstains, and a PR ref must be `…<pr>-<sha12>`.
+    *issue-*) return 1 ;;
+    *[0-9]*-*)
       # ⛔ A FORMER NAME OF THIS BOX IS *THIS MACHINE*, SO ITS PID IS PROBEABLE TOO (P0, cycle-7
       # review). The gate used to be `host == claim_host`, so immediately after a rename a PR claim
       # stamped `<oldName>:<live pid>` skipped the pid probe and fell through to the former-name rule,

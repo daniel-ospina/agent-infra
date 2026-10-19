@@ -1424,6 +1424,14 @@ alive**; the dispatcher printed `held by …` for each and then `backlog empty q
 | **`CLAIM_DEAD_HOSTS`** | the owner host is listed | an explicit deny list — a mis-entry over-reaps only the host it names |
 | **`CLAIM_KNOWN_HOSTS`** | the roster is SET, **names this box**, and does not list the owner host | a roster that does not name this box is stale (its usual cause is the very rename) and **abstains**; an unset roster never means "every peer is dead" |
 
+⛔ **THE SELF-HEAL ASSUMES A FREED NAME IS NEVER REASSIGNED.** `state/claim-hosts` is a list of names
+THIS MACHINE owns, so a name handed to another box afterwards makes every claim that box mints read as
+this box's own dead claim — for every keying — and the local-pid rule then probes the foreign pid HERE,
+reads a local absence, and calls a LIVE remote worker's PR claim orphaned: the steal direction, from a
+name that is no longer ours. The self-limiting claim holds only while the name is exclusive to this
+box. Remedy: once no outstanding claim can still carry the name (after `CLAIM_TTL_MAX` / `CLAIM_ISSUE_TTL`),
+delete the line from `state/claim-hosts` before the name is reused elsewhere.
+
 ⚠️ **The roster is an allow list, so an INCOMPLETE one over-reaps**: a roster that names this box and merely omits a live peer declares that peer dead and re-dispatches its unexpired work across two boxes — the failure this registry exists to prevent, reached from the opposite direction. It must be COMPLETE and authoritative, which is why the deny list (`CLAIM_DEAD_HOSTS`) is the safer knob for a one-off dead host and is checked first.
 
 ⚠️ **`CLAIM_OWNER_HOST` (the test/simulation seam) is honest about its cost, once per process.** It

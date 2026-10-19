@@ -763,6 +763,29 @@ case "$(field "$SEAMLEAK" STDERR)" in
   *) SW5=0 ;;
 esac
 ck "O18 [PINNED] a blind hostname makes the seam warning ABSTAIN (no probe error leaks, no empty host)" $SW5
+# ⛔ AND A FAILED PROBE MUST NOT CONSUME THE ONCE (P1, cycle-16 review): the flag used to be set BEFORE
+# the `hostname` probe answered, so one transient failure silenced the seam warning for the life of the
+# process — the silent inertness the warning exists to expose. Every other case here runs in a fresh
+# process, so none could observe it; this one drives BOTH probes in ONE shell.
+# ⛔ THE WARNING IS ON STDERR, so both streams must be captured from INSIDE the subshell (a `2>&1` on
+# the assignment redirects the assignment, not the subshell — measured in an earlier cycle as "0
+# warning(s)").
+SEAMSEQ="$(
+  {
+    PATH="$T/bin-nohost18:$PATH"
+    CLAIM_OWNER_HOST=seamSeq; CLAIM_STATE_DIR="$T/cl18c"; export PATH CLAIM_OWNER_HOST CLAIM_STATE_DIR
+    mkdir -p "$CLAIM_STATE_DIR"
+    . "$CLAIMS_SH" || exit 1
+    claim_owner >/dev/null                      # the probe FAILS here, so it must not warn
+    PATH="/usr/bin:/bin:/usr/sbin:/sbin"; export PATH   # the probe RECOVERS in the SAME process
+    claim_owner >/dev/null                      # now it warns — exactly once
+    claim_owner >/dev/null                      # and not again
+  } 2>&1
+)"
+SW7="$(printf '%s' "$SEAMSEQ" | grep -c 'CLAIM_OWNER_HOST=')"
+[ "$SW7" = "1" ]
+SW7_RC=$?
+ck "O18 [RED→GREEN] a probe that could not answer does NOT consume the once — the next acquire warns ($SW7 warning(s))" $SW7_RC
 
 # ══ O19: the DESTRUCTIVE arms require positive evidence — an absent ref, or an unverifiable host ══
 # Two ways the same steal could arrive that no test pinned (agent-infra#2094 cycle-4 review):
