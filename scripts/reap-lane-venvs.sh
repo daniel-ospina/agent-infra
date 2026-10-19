@@ -221,6 +221,14 @@ scratch_dir() {
     return 0
 }
 cleanup() {
+    # ⛔ THE SCRATCH **PARENT** CREATED IS THE ONE THIS REMOVES — that is the leak fix, and it is in
+    # `probes_ready` (it now calls `scratch_dir` before any probe runs). Previously `bound_file` created
+    # the directory inside a COMMAND SUBSTITUTION, so the parent's SCRATCH stayed empty and this `rm -rf`
+    # removed only a second directory the parent made later; one `reap-lane-venvs.XXXXXX` survived every
+    # pass. (An earlier version of this comment blamed `run_bounded`'s watchdog subshell for deleting the
+    # parent's scratch. That is FALSE — bash does not run an inherited EXIT trap in a subshell — and it
+    # was removed after it was disproved by execution. The ~7.5%-under-load flake it claimed to explain
+    # is UNEXPLAINED and pre-existing; the pass fails CLOSED there, so nothing is removed.)
     local w
     for w in $WATCHDOGS; do kill -TERM "$w" 2>/dev/null; done
     WATCHDOGS=""
@@ -669,8 +677,36 @@ parse_args() {
     return 0
 }
 
+# ── config validation ──────────────────────────────────────────────────────────────────────────
+# ⛔ THE AGE FLOOR IS THE ONLY GUARD COVERING THE WINDOW between `git worktree add` and the first
+# process binding to the new lane. With a non-numeric value, `[ "$age" -lt "$REAP_VENV_MIN_AGE_SECONDS" ]`
+# errors and — under `set -uo pipefail` (no `-e`) — execution falls straight through to the ELSE
+# branch, so EVERY holder-free env is reapable regardless of age, printing only
+# `integer expression expected`. Measured semantics: `REAP_VENV_MIN_AGE_SECONDS=30m` reaps a
+# freshly-synced env (#2158).
+#
+# Only the `--min-age` ARGV form was validated; the ENV seam an operator or a unit file actually sets
+# was not. This REFUSES (exit 3) rather than falling back to 1800: a floor that silently replaces the
+# operator's typo with a different number is a floor the operator cannot reason about, and every other
+# unreadable input in this script is already a fail-closed abort — one rule, one behaviour.
+validate_config() {
+    if ! is_pos_int "${REAP_VENV_MIN_AGE_SECONDS:-}"; then
+        echo "FAIL-CLOSED abort: REAP_VENV_MIN_AGE_SECONDS='${REAP_VENV_MIN_AGE_SECONDS:-}' is not a whole number of seconds — refusing, because an unreadable age floor makes every holder-free .venv reapable regardless of age (exit 3)" >&2
+        exit 3
+    fi
+    return 0
+}
+
 # probes_ready — ONE read of each witness for the whole pass, with the fail-closed policy applied.
 probes_ready() {
+    # ⛔ CREATE THE SCRATCH DIR HERE, IN THE PARENT, BEFORE ANY PROBE RUNS. `bound_file` is called from
+    # inside COMMAND SUBSTITUTIONS (subshells), so a lazily-created SCRATCH was created in the CHILD and
+    # the parent's `cleanup` trap then removed only a SECOND dir it made later — one
+    # `reap-lane-venvs.XXXXXX` directory survived every pass (~8.7k/year at the hourly cadence), i.e. the
+    # reaper leaked unboundedly into the very sink it exists to drain. A subshell inherits the parent's
+    # variable, so making it here means every probe reuses THIS directory and `cleanup` can reap it.
+    # (Same root as the `bounded.*` leak fixed in `disk-reaper.sh`.)
+    scratch_dir || echo "warn: no writable TMPDIR — probes will run without a scratch dir" >&2
     # ⛔ ORDER IS LOAD-BEARING: the cwd and tmux probes run FIRST, the `ps` table LAST. The self-tree is
     # computed from that table, so a probe child still alive has to be IN it — and a probe that has
     # already exited cannot contribute a matching row anyway, because it ran from `/` (run_probe).
@@ -792,6 +828,7 @@ run_exit() {
 main() {
     local mode_label df_after freed_kb reclaimed_mb
     parse_args "$@"
+    validate_config
 
     SELF_CWD_CANON="$(canonicalize "$PWD")"
     if [ "$MODE" = exit ]; then mode_label="exit (lane teardown)"; else mode_label="gc"; fi

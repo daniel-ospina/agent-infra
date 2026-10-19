@@ -658,6 +658,23 @@ printf '%s\n' "Sun Jan  1 00:00:00 2023" >"$LOCK_DIR/lstart"
 OUT="$(PS_STUB="$T/bin/ps-lstart" run_reap "$H" --apply 2>&1)"; RC=$?
 assert_eq "$RC" "4" "a lock whose owner pid AND start time match is honoured (exit 4, the pass does not run)"
 
+# ── 9l-bis: the SAME live holder, spelled in the other locale's field order ──────────────────────
+# `ps -o lstart=` prints `<Wday> <M> <D>` under C and `<Wday> <D> <M>` under en_GB. The lock stores
+# the holder's stamp and a later pass compares it to its own `ps` output, so when the two disagree
+# — which is the NORM, since launchd runs with a minimal environment while an interactive shell
+# carries en_GB — a raw string compare calls every live holder RECYCLED. Measured in this box's own
+# log: "lock owner pid 83079 is a RECYCLED pid (start time 'Sun Oct 18 16:59:31 2026' != 'Sun 18 Oct
+# 16:59:31 2026')". Below the age bound that SILENTLY SKIPS the pass; above it, it breaks a LIVE
+# owner's lock (the double-pass the lock exists to prevent). The comparison must be order-insensitive.
+mkdir -p "$LOCK_DIR"
+printf '%s\n' "pi-cache-reap" >"$LOCK_DIR/kind"
+printf '%s\n' "$$" >"$LOCK_DIR/owner"; printf '%s\n' "$(( $(date +%s) - 5 ))" >"$LOCK_DIR/started"
+printf '%s\n' "Sun 1 Jan 00:00:00 2023" >"$LOCK_DIR/lstart"   # day-first spelling of the SAME lstart
+: >"$H/reap.log"
+OUT="$(PS_STUB="$T/bin/ps-lstart" run_reap "$H" --apply 2>&1)"; RC=$?
+assert_eq "$RC" "4" "a live owner is honoured even when the lock's lstart uses the other locale's field order"
+assert_not_contains "$(cat "$H/reap.log" 2>/dev/null)" "RECYCLED" "and that is NOT misread as a recycled pid (which would break a live lock)"
+
 echo
 echo "── 9m. a stale BREAK TOKEN is cleared (it used to wedge the lock for ever) ──"
 H="$T/h9m"
@@ -877,7 +894,7 @@ cat >"$T/bin/ps-actpoint" <<SH
 #!/bin/sh
 n=\$(cat "$T/ps.calls" 2>/dev/null || echo 0)
 echo \$((n + 1)) >"$T/ps.calls"
-# ONE ps snapshot runs at pass start; the first ps call of a run is the lock-acquire `lstart`
+# ONE ps snapshot runs at pass start; the first ps call of a run is the lock-acquire <lstart>
 # probe (this stub ignores its arguments, so it counts too). The ACT-POINT re-probe is the third
 # call, so the holder appears from n=2 on. Counted here, not branched on the arguments, so the
 # trigger stays visible in one line.

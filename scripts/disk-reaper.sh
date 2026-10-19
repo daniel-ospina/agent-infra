@@ -42,9 +42,9 @@
 #   * apply: the `df` delta across the class — what the filesystem ACTUALLY got back. This is the
 #     number the status line and the supervisor report; it is never derived from `du`.
 # A `du` figure is never reported as freed bytes, and a `df` delta that is negative or zero is
-# reported as 0 with the raw delta, not hidden.
+# reported as 0 for the status line while the UNCLAMPED figure is printed beside it (`df_raw=…MB`).
 #
-# SCHEDULING (installed by the cell bring-up, see cloud-cell-bringup.sh install_disk_reaper_timer)
+# SCHEDULING (installed by the cell bring-up, see cloud-cell-bringup.sh check_disk_reaper)
 #   templates/systemd/eldato-disk-reaper.{service,timer} — hourly, `--apply`, installed and enabled
 #   by `cloud-cell-bringup.sh --check` on a systemd cell. Arming is an OWNER decision (#1678 is the
 #   general rule: deletion tools ship dry-run and arming is a dated, reversible owner step). This
@@ -95,15 +95,29 @@
 # when it is NOT GNU `timeout` the pass prints one line naming it, so the fallback is visible without
 # changing the report on a host that has the real binary.
 #
-# Exit codes: 0 pass completed, every class ok
-#             2 usage
-#             3 fail-closed: a delegate is missing, failed closed, or a class had no repo to scan —
-#               nothing is claimed for it (a skipped class is NEVER a pass); also a REFUSAL AT
-#               STARTUP when the bounded-execution library is missing or TB_TIMEOUT_BIN is unusable,
-#               in which case no per-class line is emitted at all
-#             4 a class completed but at least one removal FAILED
-#             5 dry-run only: a class reported work it would do (over budget / reapable items), so
-#               the pass is informative but the condition is still present
+# Exit codes — TWO DIFFERENT OUTCOMES USED TO SHARE EXIT 3 (#2036), so the scheduled unit could not
+# tell "this reaper is misconfigured" (a human must act) from "a delegate refused because the box is
+# busy" (expected every hour on a healthy cell). They are separate codes now, and the unit's
+# SuccessExitStatus is written against this table:
+#
+#   0  pass completed, every class ok                                     unit GREEN
+#   2  usage                                                              unit RED
+#   3  MISCONFIGURED — a delegate is absent, a class had no repo to scan,   unit RED
+#      the bounded-execution library is missing, or a pinned watchdog is
+#      unusable. Nothing is claimed for that class (a skip is NEVER a pass).
+#   4  a class completed but at least one removal FAILED; also a lock         unit RED
+#      directory that cannot be created at all (a filesystem problem)
+#   5  informational — dry-run: a class reported work it would do (over      unit GREEN
+#      budget / reapable items); apply: a class is BELOW its owner's
+#      stated floor; OR another pass holds the lock, so this pass did not
+#      run (benign and routine — it may outrun the hourly interval). In
+#      APPLY mode the record carries the floor case as ok=0 (#2156); the
+#      lock case writes no record at all and the previous one stands.
+#   6  a delegate RAN and refused / failed closed (busy box, its own        unit GREEN
+#      timeout, unreachable gh). Record ok=0, per-class verdict set —
+#      again the record is the alarm, not the unit's colour.
+#
+# Severity, worst wins: 3 > 4 > 6 > 5 > 0.
 #
 set -uo pipefail
 
@@ -118,12 +132,13 @@ LOCK_DIR="$STATE_DIR/disk-reaper.lock"
 LOCK_STALE_SECONDS="${DISK_REAPER_LOCK_STALE_SECONDS:-1800}"
 
 DRY_RUN="${DISK_REAPER_DRY_RUN:-1}"
-MODE_GIVEN=0
 ONLY="${DISK_REAPER_ONLY:-uv,venv,worktree}"
 WT_AGED_DAYS="${DISK_REAPER_WT_AGED_DAYS:-7}"
 VENV_MIN_AGE="${DISK_REAPER_VENV_MIN_AGE:-1800}"
 CLASS_TIMEOUT="${DISK_REAPER_CLASS_TIMEOUT:-1800}"
 DU_TIMEOUT="${DISK_REAPER_DU_TIMEOUT:-120}"
+# One bound for the small non-delegate probes (git / ps). They are cheap; a hung mount is not.
+GIT_TIMEOUT="${DISK_REAPER_GIT_TIMEOUT:-60}"
 # One budget for the whole per-candidate sizing sweep (not per candidate): a pass over N checkouts
 # must not be able to hold the lock for N x DU_TIMEOUT and age itself out of it.
 DU_BUDGET="${DISK_REAPER_DU_BUDGET:-300}"
@@ -135,25 +150,46 @@ PS_BIN="${PS_BIN:-/bin/ps}"
 
 REPOS_ARG=""
 REPOS=""
-VERDICT=0          # 0 ok, 3 fail-closed, 4 removal failure, 5 dry-run found work
+VERDICT=0          # 0 ok, 3 misconfigured, 4 removal failure, 5 informational, 6 delegate refused
 FREED_UV=0; FREED_VENV=0; FREED_WT=0
+RAW_UV=0; RAW_VENV=0; RAW_WT=0
+# 1 = `df` answered for that class. 0 = it could not, and NOTHING may then be reported as a measured 0.
+DF_UV_OK=1; DF_VENV_OK=1; DF_WT_OK=1
 WOULD_UV=0; WOULD_VENV=0; WOULD_WT=0
 CAND_UV=0; CAND_VENV=0; CAND_WT=0
 RC_UV=0; RC_VENV=0; RC_WT=0
 VERDICT_UV="not-run"; VERDICT_VENV="not-run"; VERDICT_WT="not-run"
 NOTE_UV=""; NOTE_VENV=""; NOTE_WT=""
+# Set when a class could not be set up AT ALL (delegate absent, no repo to scan). That is the ONE
+# thing exit 3 means; a delegate that ran and refused is 6. Keeping the two apart is the whole point
+# of #2036 — see the exit-code table above.
+MISCONFIG=""
 
 say() { printf '%s\n' "$*"; }
 log() { printf '%s\n' "$*" >>"$LOG" 2>/dev/null || true; }
 die() { printf '%s: %s\n' "$SCRIPT_NAME" "$*" >&2; exit 2; }
 
-usage() { sed -n '2,120p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
+
+usage() {
+    # ⛔ `$0` IS NOT THIS SCRIPT under a piped start. The macOS agent runs the pass as
+    # `/bin/bash -s -- …` (pi-reap-worktrees-launchd.py execs exactly that argv), so `$0` is the bash
+    # BINARY's path and `${BASH_SOURCE[0]}` is empty: awk on `$0` would print a shell's header, not this
+    # one. Fall back to a synopsis that names the real doc.
+    if [ -r "${BASH_SOURCE[0]:-}" ]; then
+        awk 'NR==1{next} /^set -uo pipefail$/{exit} {sub(/^# ?/,""); print}' "${BASH_SOURCE[0]}"
+    else
+        printf '%s\n' "usage: $SCRIPT_NAME [--dry-run|--apply] [--repo PATH]... [--only uv,venv,worktree]"
+        printf '%s\n' "                        [--aged-days N] [--min-age S] [--print-status] [--help]"
+        printf '%s\n' "       full documentation: docs/ops/disk-reaper.md (this start has no script path to read the header from)"
+    fi
+    exit 0
+}
 
 # ── argv ─────────────────────────────────────────────────────────────────────────────────────────
 while [ $# -gt 0 ]; do
     case "$1" in
-        --dry-run)  DRY_RUN=1; MODE_GIVEN=1; shift ;;
-        --apply)    DRY_RUN=0; MODE_GIVEN=1; shift ;;
+        --dry-run)  DRY_RUN=1; shift ;;
+        --apply)    DRY_RUN=0; shift ;;
         --repo)     [ $# -ge 2 ] || die "--repo needs a path"; REPOS_ARG="${REPOS_ARG}${REPOS_ARG:+
 }$2"; shift 2 ;;
         --only)     [ $# -ge 2 ] || die "--only needs a list"; ONLY="$2"; shift 2 ;;
@@ -173,18 +209,23 @@ done
 
 # A class list that names nothing would run nothing and report a healthy box (a false PASS): a typo
 # silently drops a sink, and an empty list means "reap nothing, forever" while the timer says ok.
+# ⛔ VALIDATE UNCONDITIONALLY. The guard used to be `if [ -n "$ONLY" ]`, so `--only ""` skipped it
+# entirely: ZERO classes ran and the pass exited 0 with `ok=1 classes=`. (Only the ARGV form can be
+# empty: `ONLY="${DISK_REAPER_ONLY:-uv,venv,worktree}"` substitutes the default for an empty env value.)
+if [ -z "$ONLY" ]; then die "--only was given an empty list (valid: uv, venv, worktree)"; fi
 ONLY_CLASSES=""
-if [ -n "$ONLY" ]; then
-    for c in $(printf '%s' "$ONLY" | tr ',' ' '); do
-        case "$c" in
-            uv|venv|worktree) ;;
-            *) die "unknown --only class '$c' (valid: uv, venv, worktree)" ;;
-        esac
-        ONLY_CLASSES="${ONLY_CLASSES}${ONLY_CLASSES:+,}$c"
-    done
-    [ -n "$ONLY_CLASSES" ] || die "--only was given an empty list (valid: uv, venv, worktree)"
-    ONLY="$ONLY_CLASSES"
-fi
+for c in $(printf '%s' "$ONLY" | tr ',' ' '); do
+    case "$c" in
+        uv|venv|worktree) ;;
+        *) die "unknown --only class '$c' (valid: uv, venv, worktree)" ;;
+    esac
+    ONLY_CLASSES="${ONLY_CLASSES}${ONLY_CLASSES:+,}$c"
+done
+[ -n "$ONLY_CLASSES" ] || die "--only was given an empty list (valid: uv, venv, worktree)"
+ONLY="$ONLY_CLASSES"
+# A class the operator did not select did not run: its reclaim is NOT a measured zero, and the record
+# must not present it as one (the supervisor renders these per-class values verbatim).
+WANT_UV=0; WANT_VENV=0; WANT_WT=0
 
 # ── status record ────────────────────────────────────────────────────────────────────────────────
 # One key per line, so the supervisor can read it with `sed -n 's/^k=//p'` and no jq. Written to a
@@ -202,9 +243,18 @@ print_status() {
     epoch="$(status_field epoch)"; mode="$(status_field mode)"; ok="$(status_field ok)"
     rc="$(status_field rc)"; freed="$(status_field freed_mb)"
     iso="$(status_field iso)"
+    # ⛔ AN UNUSABLE EPOCH IS STALE, NOT OK. `age=-1` failed `[ "$age" -ge 0 ]` and fell through to
+    # `status=ok`, so a record with no readable timestamp read healthy — while fleet-health called the
+    # same record an alarm. One record, one verdict: cannot-age is cannot-prove-liveness.
+    # ⛔ AND AGE IS DECIDED FIRST, BEFORE `ok`. Computed only inside the ok=1 branch, an ok=0 record three
+    # weeks old was reported `failed` with its old rc — and the readiness gate that allow-lists rc 5/6
+    # then passed it, so a box certified CELL READY with no completed pass for weeks. fleet-health
+    # already computes staleness first and calls the same bytes STALE; the two readers must agree.
     case "$epoch" in ''|*[!0-9]*) age=-1 ;; *) age=$(( $(date +%s) - epoch )) ;; esac
-    if [ "$ok" = "1" ]; then
-        if [ "$age" -ge 0 ] && [ "$age" -gt "$STALE_SECONDS" ]; then status=stale; else status=ok; fi
+    if [ "$age" -lt 0 ] || [ "$age" -gt "$STALE_SECONDS" ]; then
+        status=stale
+    elif [ "$ok" = "1" ]; then
+        status=ok
     else
         status=failed
     fi
@@ -219,6 +269,7 @@ print_status() {
     say "freed_mb_uv=$(status_field freed_mb_uv)"
     say "freed_mb_venv=$(status_field freed_mb_venv)"
     say "freed_mb_worktree=$(status_field freed_mb_worktree)"
+    say "freed_mb_unmeasured=$(status_field freed_mb_unmeasured)"
     say "would_free_mb_uv=$(status_field would_free_mb_uv)"
     say "would_free_mb_venv=$(status_field would_free_mb_venv)"
     say "would_free_mb_worktree=$(status_field would_free_mb_worktree)"
@@ -234,10 +285,61 @@ print_status() {
     case "$status" in ok) return 0 ;; *) return 3 ;; esac
 }
 
+# ⛔ STALE_SECONDS IS VALIDATED *BEFORE* --print-status, because that is a READER of it. Validated with
+# the other seams further down (after the early exit), a non-numeric value made `[ "$age" -gt "$30m" ]`
+# error and — no `set -e` — the ELSE arm set status=ok, so --print-status answered 0 for a 56-year-old
+# record while cloud-cell-supervisor gates its ⛔ line on that rc. A reader must never be the one place
+# a seam is unvalidated.
+case "$STALE_SECONDS" in
+    ''|*[!0-9]*)
+        printf '%s: ⛔ FAIL-CLOSED at startup — DISK_REAPER_STALE_SECONDS must be a whole number (got %s).\n' \
+            "$SCRIPT_NAME" "'$STALE_SECONDS'" >&2
+        exit 3 ;;
+esac
+
 if [ "${PRINT_STATUS:-0}" = "1" ]; then
     print_status
     exit $?
 fi
+
+# ── config validation — AFTER argv, so a valid flag can override a stale env ────────────────────
+# ⛔ THIS RUNS AFTER ARGV AND AFTER --print-status, on purpose. Validated where the value was first
+# read, it also blocked invocations that never use it: `DISK_REAPER_VENV_MIN_AGE=30m … --print-status`
+# refused to print the record, and `… --min-age 1800` refused a VALID argv. A unit file is the most
+# likely place the typo lands, so the check is still a refusal (exit 3, misconfigured — a startup
+# condition, not a usage error) when a bad env is actually going to be USED.
+case "$VENV_MIN_AGE" in
+    ''|*[!0-9]*)
+        printf '%s: ⛔ FAIL-CLOSED at startup — DISK_REAPER_VENV_MIN_AGE must be a whole number of seconds (got %s).\n' "$SCRIPT_NAME" "'$VENV_MIN_AGE'" >&2
+        printf '%s: refusing rather than running on a different age floor than the one written in the unit; pass --min-age to override\n' "$SCRIPT_NAME" >&2
+        exit 3 ;;
+esac
+# ⛔ THE ARMING SEAM IS NOT A BOOLEAN BY FAITH. `is_dry` tests for exactly "1", so DISK_REAPER_DRY_RUN=true
+# (or yes/01/a typo) used to run the pass ARMED — a deleted-file direction, one export away. Refuse a
+# value that is neither 0 nor 1; the explicit flags still win and always set a valid one here.
+case "$DRY_RUN" in
+    0|1) ;;
+    *) die "DISK_REAPER_DRY_RUN must be 0 or 1 (got '$DRY_RUN')" ;;
+esac
+# ⛔ EVERY NUMERIC SEAM THIS SCRIPT COMPARES IS VALIDATED HERE. `[ "$age" -gt "$STALE_SECONDS" ]`
+# errors on a non-numeric value and, under `set -u` without `-e`, the error status makes the `else`
+# arm run — so `DISK_REAPER_STALE_SECONDS=30m` made a 56-year-old record print `status=ok`, exit 0,
+# and the supervisor (which gates its ⛔ line on that rc) read a dead reaper as healthy. Same shape the
+# venv floor had (#2158), same answer: refuse at startup (3) rather than compare against a number that
+# is not one.
+for _seam in "DISK_REAPER_WT_AGED_DAYS=$WT_AGED_DAYS" \
+             "DISK_REAPER_LOCK_STALE_SECONDS=$LOCK_STALE_SECONDS" \
+             "DISK_REAPER_CLASS_TIMEOUT=$CLASS_TIMEOUT" \
+             "DISK_REAPER_DU_TIMEOUT=$DU_TIMEOUT" \
+             "DISK_REAPER_DU_BUDGET=$DU_BUDGET" \
+             "DISK_REAPER_GIT_TIMEOUT=$GIT_TIMEOUT"; do
+    case "${_seam#*=}" in
+        ''|*[!0-9]*)
+            printf '%s: ⛔ FAIL-CLOSED at startup — %s must be a whole number (got %s).\n' \
+                "$SCRIPT_NAME" "${_seam%%=*}" "'${_seam#*=}'" >&2
+            exit 3 ;;
+    esac
+done
 
 # ── bounded execution — the macOS half of this script (#2046) ───────────────────────────────────
 # `timeout` is GNU coreutils and macOS ships it NOWHERE (`gtimeout` only with Homebrew coreutils), so
@@ -247,7 +349,17 @@ fi
 # internal background watchdog with the same status contract, 124 == timeout) and is shared with
 # `pi-reap-worktrees.sh`, which already carried that watchdog as `run_bounded`. A missing library is a
 # REFUSAL AT STARTUP, never a pass whose classes all quietly fail closed.
-SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+# ⛔ `${BASH_SOURCE[0]:-}` IS LOAD-BEARING, NOT DEFENSIVE TIDINESS. The macOS LaunchAgent starts this
+# script through pi-reap-worktrees-launchd.py, which pipes it into `bash -s` (TCC: a launchd-spawned
+# bash cannot read the file itself). Under `bash -s` there is NO BASH_SOURCE[0], and with `set -u` a
+# bare reference aborts the substitution, leaving SELF_DIR empty — so the beside-script arm searched
+# `/lib/bounded.sh`, the pass refused at startup, and the installed hourly job would have been inert
+# on the very platform the installer was just extended to schedule. Measured: rc=3 every pass, with
+# `BASH_SOURCE[0]: unbound variable` on stderr.
+SELF_DIR=""
+if [ -n "${BASH_SOURCE[0]:-}" ]; then
+    SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-}")" 2>/dev/null && pwd)"
+fi
 BOUNDED_LIB="${BOUNDED_LIB:-}"
 if [ -z "$BOUNDED_LIB" ]; then
     for cand in "$SELF_DIR/lib/bounded.sh" \
@@ -260,10 +372,27 @@ if [ ! -f "$BOUNDED_LIB" ]; then
     printf '%s: ⛔ FAIL-CLOSED at startup — the bounded-execution library is missing (%s).\n' \
         "$SCRIPT_NAME" "${BOUNDED_LIB:-not beside this script ($SELF_DIR/lib/) and not in ${HOME:-}/.pi/agent/scripts/lib/}" >&2
     printf '%s: refusing to start, because without it every class reports verdict=fail-closed and the pass completes looking like a run (#2046)\n' "$SCRIPT_NAME" >&2
+    printf '%s: an installer/unit must pin it: BOUNDED_LIB=<reaper dir>/lib/bounded.sh — a start that cannot derive its own path (a piped `bash -s` launch) has no other way to find it\n' "$SCRIPT_NAME" >&2
     exit 3
 fi
 # shellcheck source=lib/bounded.sh
 . "$BOUNDED_LIB"
+# ⛔ THE EXIT TRAP IS INSTALLED BEFORE ANY SCRATCH EXISTS. It used to be installed ~190 lines later, so
+# the two STARTUP REFUSALS below (an unusable TB_TIMEOUT_BIN, an uncreatable state dir) exited without
+# removing the probe scratch — one leaked `bounded.*` directory per refused start, hourly on a
+# misconfigured unit. `release_lock` is a no-op until the lock is held (LOCK_HELD defaults to 0).
+LOCK_HELD=0
+bound_cleanup_early() {
+    command -v tb_bound_cleanup >/dev/null 2>&1 && tb_bound_cleanup
+    return 0
+}
+trap bound_cleanup_early EXIT
+# ⛔ CREATE THE PROBE SCRATCH IN THE PARENT, BEFORE ANY PROBE RUNS. `tb_timeout` is called inside
+# command substitutions — i.e. SUBSHELLS — so a lazily-created `TB_BOUND_TMP` was created in the CHILD
+# and the parent's EXIT trap then had nothing to remove: one `bounded.*` directory per pass leaked on
+# every host with no GNU `timeout` (macOS). A subshell inherits the parent's variable, so creating it
+# here means every probe reuses THIS directory and `tb_bound_cleanup` can actually reap it.
+tb_bound_tmp || printf '%s: warn: no writable TMPDIR — bounded probes will run without a scratch dir\n' "$SCRIPT_NAME" >&2
 if [ "${TB_TIMEOUT_KIND:-}" = "invalid" ]; then
     printf '%s: ⛔ FAIL-CLOSED at startup — TB_TIMEOUT_BIN=%s cannot be executed.\n' "$SCRIPT_NAME" "${TB_TIMEOUT_BIN:-}" >&2
     printf '%s: refusing instead of falling back, because a pinned watchdog that is silently ignored is the defect this refusal exists to prevent\n' "$SCRIPT_NAME" >&2
@@ -285,7 +414,7 @@ find_delegate() { # find_delegate <env-value> <basename>
         return 1
     fi
     for cand in "${HOME:-}/.pi/agent/scripts/$2" \
-                "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/$2"; do
+                "${SELF_DIR:+$SELF_DIR/}$2"; do
         [ -n "$cand" ] || continue
         [ -f "$cand" ] && { printf '%s' "$cand"; return 0; }
     done
@@ -305,7 +434,10 @@ WORKTREE_REAPER_PATH="$(find_delegate "${WORKTREE_REAPER:-}" pi-reap-worktrees.s
 now() { date +%s; }
 
 # free_kb <path> — filesystem free KiB, or empty when df cannot answer (never read as "enough").
-free_kb() { "$DF_BIN" -Pk "$1" 2>/dev/null | awk 'NR==2 && $4 ~ /^[0-9]+$/ {print $4}'; }
+# ⛔ BOUNDED. The doc (and this file's own claim) says every filesystem probe runs under a watchdog; `df`
+# against a dead or degraded mount could hang the whole pass WHILE IT HOLDS THE LOCK — the "reaper that
+# hangs the cell" the bound exists to prevent.
+free_kb() { tb_timeout "$DU_TIMEOUT" "$DF_BIN" -Pk "$1" 2>/dev/null | awk 'NR==2 && $4 ~ /^[0-9]+$/ {print $4}'; }
 
 # free_kb_for_path <path> — walk up to the nearest existing ancestor, so measuring a sink that is
 # about to be created/reaped still names the filesystem it lives on.
@@ -320,9 +452,19 @@ free_kb_for_path() {
 }
 
 # file_mtime <path> — epoch mtime, portable across GNU and BSD stat. Empty when unstatable.
+# ⛔ THE TARGET DECIDES THE FLAVOUR, NOT `$0`. The old probe was `stat -f '%m' "$0"`: it used `$0` only
+# to pick the FLAVOUR and took the VALUE from the target, so on this host it happened to work — but the
+# flavour then depends on the interpreter's path existing. Under the macOS agent's `/bin/bash -s -- …`
+# start `$0` IS /bin/bash (the launcher execs that argv), so it resolved; a start where `$0` does not
+# exist (a piped `sh -s`, a deleted interpreter path) takes BSD's `stat -c`, which BSD rejects, and the
+# mtime comes back EMPTY — `age` then pins at 0 and the stale-lock reclaim never fires. (Under review
+# cycle 6 this was relabelled: the defect is a latent fail-open, not the over-firing earlier prose
+# claimed.) Probing the file we care about removes the dependency entirely.
 file_mtime() {
-    if stat -f '%m' "$0" >/dev/null 2>&1; then stat -f '%m' "$1" 2>/dev/null
-    else stat -c '%Y' "$1" 2>/dev/null; fi
+    local m
+    m="$(tb_timeout "${GIT_TIMEOUT:-$DU_TIMEOUT}" stat -f '%m' "$1" 2>/dev/null)"
+    case "$m" in ''|*[!0-9]*) ;; *) printf '%s' "$m"; return 0 ;; esac
+    tb_timeout "${GIT_TIMEOUT:-$DU_TIMEOUT}" stat -c '%Y' "$1" 2>/dev/null
 }
 
 # du_mb <path> — blocks occupied, MiB. Empty on failure (never 0: 0 reads as "empty").
@@ -345,33 +487,84 @@ run_class() {
 # ── one pass ────────────────────────────────────────────────────────────────────────────────────
 mkdir -p "$STATE_DIR" 2>/dev/null || { printf '%s: cannot create state dir %s\n' "$SCRIPT_NAME" "$STATE_DIR" >&2; exit 3; }
 
+# proc_lstart <pid> — the process's start time as `ps` prints it, pinned to C so BOTH sides of the
+# comparison are spelled the same way (en_GB prints `Sun 18 Oct …`, C prints `Sun Oct 18 …` — the same
+# defect pi-cache-reap.sh's lock fixed). Empty when it cannot be read, which is NOT "a different
+# process": an unreadable side suppresses the recycle verdict rather than inventing one.
+proc_lstart() {
+    # Bounded too: a wedged `ps` under a debugger or on a hung /proc holds the lock just as well.
+    tb_timeout "${GIT_TIMEOUT:-$DU_TIMEOUT}" env LC_ALL=C "$PS_BIN" -o lstart= -p "$1" 2>/dev/null \
+        | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+}
+
 # ⛔ MUTUAL EXCLUSION. Two concurrent passes computing `df` deltas over one filesystem credit each
 # other's reclaim — the same reason each delegate locks. A lock we cannot create is a refusal, not a
 # pass; a STALE lock (older than LOCK_STALE_SECONDS) is removed and named.
 acquire_lock() {
-    local owner
+    local owner owner_started owner_lstart now_lstart ABANDONED=0
     if mkdir "$LOCK_DIR" 2>/dev/null; then
-        printf 'pid=%s started=%s\n' "$$" "$(now)" >"$LOCK_DIR/token" 2>/dev/null || true
+        printf 'pid=%s started=%s lstart=%s\n' "$$" "$(now)" "$(proc_lstart $$)" >"$LOCK_DIR/token" 2>/dev/null || true
         LOCK_HELD=1
         return 0
     fi
-    owner="$(sed -n 's/^pid=//p' "$LOCK_DIR/token" 2>/dev/null | head -1)"
+    # ⛔ PARSE THE NUMBER, NOT THE LINE. The token is `pid=<pid> started=<epoch> lstart=<ps text>`, and
+    # the old `s/^pid=//p` returned the WHOLE TAIL (`"1234 started=1700000000"`), so `kill -0 "$owner"`
+    # was always "invalid pid" — the live-holder arm was dead code and only the age bound stood between
+    # a live pass and a contender deleting its lock. (Pre-existing; found by review on #2173.) The age
+    # bound is not enough on its own: a single class may run for CLASS_TIMEOUT=1800s with no heartbeat,
+    # which is exactly LOCK_STALE_SECONDS — a contender could then break a LIVE lock and two passes
+    # would credit each other's `df` reclaim.
+    # ⛔ AND A LIVE PID IS NOT PROOF THAT IT IS THE SAME PROCESS. pids are recycled (macOS's space is
+    # ~99k), so a dead pass's pid can be taken by an unrelated process within hours — treating that as
+    # a live holder makes every future pass exit 4 for ever and the stale reclaim unreachable. The owner
+    # is identified the way pi-cache-reap.sh's lock identifies one: by (pid, START TIME). A pid whose
+    # start time does not match the token is the RECYCLED case, which the age bound may then reclaim.
+    # ⛔ "COULD NOT CREATE THE LOCK" IS NOT "SOMEONE ELSE HOLDS IT". When `mkdir` fails for a filesystem
+    # reason (a full or read-only state dir) there is no token, `file_mtime` on a missing dir is empty so
+    # `age=0`, and the contention arm below reported it BENIGN (exit 5, unit GREEN) — a box that can never
+    # reap, certified. The lock dir's ABSENCE after a failed mkdir is the discriminator.
+    [ -e "$LOCK_DIR" ] || { say "disk-reaper: cannot create $LOCK_DIR (filesystem problem: full, read-only?) — refusing to run without mutual exclusion"; exit 4; }
+    owner="$(sed -n 's/^pid=\([0-9][0-9]*\).*/\1/p' "$LOCK_DIR/token" 2>/dev/null | head -1)"
+    owner_started="$(sed -n 's/.*started=\([0-9][0-9]*\).*/\1/p' "$LOCK_DIR/token" 2>/dev/null | head -1)"
+    owner_lstart="$(sed -n 's/.*lstart=//p' "$LOCK_DIR/token" 2>/dev/null | head -1)"
     local age lm; lm="$(file_mtime "$LOCK_DIR")"
     case "$lm" in ''|*[!0-9]*) age=0 ;; *) age=$(( $(now) - lm )) ;; esac
+    # ⛔ LOSING THE LOCK IS NOT A FAILURE. This exited 4, which every reader treats as „a human must
+    # look" — while the uv family's identical condition is deliberately benign (a pass may outrun the
+    # 3600s interval: 3 classes x CLASS_TIMEOUT=1800s). It is 5 (informational: the condition is
+    # present, there is nothing to do), and NO record is written, so the previous one stands.
     if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null; then
-        say "disk-reaper: another pass holds the lock ($LOCK_DIR, pid $owner) — not running"
-        exit 4
+        now_lstart="$(proc_lstart "$owner")"
+        # ⛔ A TOKEN WITHOUT AN `lstart=` FENCE (one written by an older release) IS TREATED AS LIVE.
+        # The alternative — reclaim it once it is older than the bound — was tried and is FAIL-OPEN: an
+        # old-release pass still running past LOCK_STALE_SECONDS (3 classes x CLASS_TIMEOUT=1800s is
+        # 5400s) would have its lock broken, and two passes would then credit each other's `df` reclaim.
+        # A permanent false block is recoverable (remove the stale lock, name it on the unit); a broken
+        # live lock is not. Recorded here because the trade is deliberate, not an oversight.
+        if [ -z "$owner_lstart" ] || [ -z "$now_lstart" ] || [ "$owner_lstart" = "$now_lstart" ]; then
+            say "disk-reaper: another pass holds the lock ($LOCK_DIR, pid $owner${owner_started:+, started $owner_started}) — not running (benign: the other pass is doing this hour's work)"
+            exit 5
+        fi
+        say "disk-reaper: lock owner pid $owner is a RECYCLED pid (start time '$now_lstart' != '$owner_lstart') — the recorded pass is gone"
+        ABANDONED=1
     fi
     if [ "$age" -gt "$LOCK_STALE_SECONDS" ]; then
         say "disk-reaper: removing STALE lock ($LOCK_DIR, ${age}s old, pid ${owner:-?} gone)"
         rm -rf "$LOCK_DIR" 2>/dev/null || true
-        mkdir "$LOCK_DIR" 2>/dev/null || { say "disk-reaper: cannot take the lock — refusing"; exit 3; }
-        printf 'pid=%s started=%s\n' "$$" "$(now)" >"$LOCK_DIR/token" 2>/dev/null || true
+        mkdir "$LOCK_DIR" 2>/dev/null || { say "disk-reaper: cannot take the lock — refusing to run without mutual exclusion"; exit 4; }
+        printf 'pid=%s started=%s lstart=%s\n' "$$" "$(now)" "$(proc_lstart $$)" >"$LOCK_DIR/token" 2>/dev/null || true
         LOCK_HELD=1
         return 0
     fi
-    say "disk-reaper: lock $LOCK_DIR is held by pid ${owner:-?} (${age}s) — not running"
-    exit 4
+    # ⛔ NAME WHAT WAS ACTUALLY PROVEN. In the recycled-pid case the arm above has just said the recorded
+    # owner is GONE, so falling through to "held by pid X" contradicted it in the next line: there is no
+    # holder, only a lock too young to break.
+    if [ "${ABANDONED:-0}" = 1 ]; then
+        say "disk-reaper: the lock at $LOCK_DIR is ABANDONED (its recorded owner is gone) and is only ${age}s old (< ${LOCK_STALE_SECONDS}s) — this pass skips; it self-heals on the next one past the bound"
+    else
+        say "disk-reaper: lock $LOCK_DIR is held by pid ${owner:-?} (${age}s) — not running (benign)"
+    fi
+    exit 5
 }
 
 # Only the pass that WON the lock may release it. The EXIT trap is installed before acquire_lock
@@ -386,7 +579,16 @@ release_lock() {
 }
 # A long but PROGRESSING pass must not age out of its own lock (a stale lock is taken by a contender).
 heartbeat_lock() { [ "${LOCK_HELD:-0}" = 1 ] && touch "$LOCK_DIR" 2>/dev/null; return 0; }
-trap release_lock EXIT
+# ⛔ THE BOUNDED-EXECUTION LIBRARY OWNS SCRATCH AND TIMER PROCESSES. scripts/lib/bounded.sh documents
+# `tb_bound_cleanup` and `tb_watchdogs_reap` as the CALLERS' EXIT-trap obligations; without them every
+# pass on a host with no GNU `timeout` (macOS — the platform this PR adds) leaks its probe scratch dirs.
+bound_cleanup() {
+    release_lock
+    command -v tb_watchdogs_reap >/dev/null 2>&1 && tb_watchdogs_reap
+    command -v tb_bound_cleanup  >/dev/null 2>&1 && tb_bound_cleanup
+    return 0
+}
+trap bound_cleanup EXIT
 
 # Class selection: a tiny membership test that cannot be fooled by substring (e.g. `venv` vs
 # `reap-lane-venvs`), because the list is split on commas.
@@ -402,27 +604,83 @@ mode_flag() { [ "$DRY_RUN" = "1" ] && printf '%s' "--dry-run" || printf '%s' "--
 is_dry() { [ "$DRY_RUN" = "1" ]; }
 
 # A delegate's exit code is mapped to the pass verdict ONCE, here, so every class agrees on what
-# "failed" means: 4 = it ran but a removal failed; anything else non-zero = fail-closed / did not
-# run (3 included: a pass that could not verify itself is not a pass).
+# "failed" means. The labels are what the supervisor and fleet-health print, so each one names a
+# DIFFERENT remedy:
+#   removal-failed  the delegate ran and could not remove something          -> look at what holds it
+#   over-bound      DRY-RUN: work present / the cache is over its bound       -> the box is short
+#   below-floor     APPLY: a class ended under its owner's stated floor       -> the box is short
+#   refused         the delegate ran and refused (busy box, no gh, ...)       -> retry later, not a bug
+#   fail-closed     the delegate ran and failed in another way              -> look at the delegate
+# ⛔ 5 IS NOT A FAIL-CLOSED. It used to be mapped to `fail-closed` in APPLY mode, which both hid the
+# below-floor condition behind a wrong label and made the label unusable for "over bound" (#2156).
+# ⛔ AND THE LABEL IS MODE-AWARE: 5 in a dry run means "this is over the bound / would be reaped", while
+# 5 on an armed pass means "the box is now UNDER its owner's stated floor". Reporting the first
+# condition's label for the second told the supervisor the opposite of what had happened.
+# ⛔ THE LABEL DESCRIBES WHAT HAPPENED, NOT WHICH DELEGATE SAID IT. Today only the uv family emits 5,
+# and only in dry-run; the venv owner's below-floor 5 arrives with #1949.
+# ⛔ A WORKTREE exit 3 IS NOT ALWAYS "LOCK HELD". That owner's 3 is its generic fail-closed code (gh
+# unavailable, git enumeration failed, ps failed, log unwritable, library missing); only ONE of its
+# arms is the lock. Special-casing it to "lock held" told the operator "retry later" for a broken box,
+# so the family is deliberately NOT special-cased here.
 class_verdict() { # class_verdict <rc>
     case "$1" in
         0) printf 'ok' ;;
         4) printf 'removal-failed' ;;
-        5) if is_dry; then printf 'over-bound'; else printf 'fail-closed'; fi ;;
+        5) if is_dry; then printf 'over-bound'; else printf 'below-floor'; fi ;;
+        3|6) printf 'refused' ;;
+        # `misconfigured` is set explicitly by the setup-failure arms (see MISCONFIG), because "refused"
+        # means the delegate RAN and said no — a different remedy from "there was nothing to run".
         *) printf 'fail-closed' ;;
     esac
 }
 
+# norm_rc <rc> — the CLASS rc space is {0,4,5,6}. ⛔ 3 IS NOT IN IT: 3 means "this reaper is
+# misconfigured" and only the pass itself may produce it (via MISCONFIG). A DELEGATE's exit 3 means the
+# delegate refused or failed closed — the box was busy, or its own probe was unavailable — which is a
+# different remedy and a different unit colour (#2036). Every unexpected status (including a
+# delegate's `exit 2`, which is USAGE in this script, and 124, a watchdog timeout) folds into 6 so an
+# arbitrary number can never reach the unit carrying a different meaning.
+norm_rc() { case "$1" in 0|4|5) printf '%s' "$1" ;; *) printf '6' ;; esac; }
+# rc_severity <rc> — in the class space: 4 removal-failed > 6 refused > 5 informational > 0.
+# (The pass-level order also has 3 > 4; 3 arrives only from MISCONFIG, so it is decided before this
+# comparison is ever reached.)
+rc_severity() {
+    case "$(norm_rc "$1")" in
+        0) printf '0' ;; 5) printf '1' ;; 6) printf '2' ;; 4) printf '3' ;;
+    esac
+}
+
 # worst_rc <current> <incoming> — the pass keeps the most severe class code, so one repo's failure
-# cannot be masked by another repo's success. 3 (fail-closed) outranks 4 (a removal failed), which
-# outranks 0/5.
+# cannot be masked by another repo's success. ⛔ THE OLD VERSION DISCARDED 5 (`0|5) printf cur`), so a
+# venv pass that ended BELOW its owner's floor was recorded rc=0 verdict=ok — the condition the floor
+# exists to make visible read `healthy` on the fleet (#2156, measured end-to-end).
 worst_rc() {
-    local cur="$1" new="$2"
-    case "$new" in
-        0|5) printf '%s' "$cur" ;;
-        3) printf '3' ;;
-        4) [ "$cur" = 3 ] && printf '3' || printf '4' ;;
-        *) printf '3' ;;
+    local cur new
+    cur="$(norm_rc "$1")"; new="$(norm_rc "$2")"
+    if [ "$(rc_severity "$new")" -gt "$(rc_severity "$cur")" ]; then printf '%s' "$new"; else printf '%s' "$cur"; fi
+}
+
+# note_for <delegate> <rc> [family] — the record's `detail`, which is what a supervisor prints when
+# ok=0. It must NAME the condition: "exited 5" leaves the reader to look up a table, "below its stated
+# floor" does not. ⛔ THE FAMILY MATTERS BECAUSE THE DELEGATES' VOCABULARIES DISAGREE: in the uv family
+# exit 4 is "another pass holds the lock" (benign, and routine — orch-loop.sh takes the same lock
+# hourly), while in venv/worktree it is "a removal FAILED"; and in the worktree family exit 3 is
+# "lock held" (benign) while in the others it is fail-closed. Each owner's header states its own
+# mapping and forbids applying a sibling's.
+note_for() { # note_for <delegate> <rc> [family]
+    case "$2" in
+        0) return 0 ;;
+        5) if is_dry; then printf '%s reports work it would do (exit 5)' "$1"
+           else printf "%s ended BELOW its owner's stated floor (exit 5)" "$1"; fi ;;
+        4) case "${3:-}" in
+               uv) printf '%s did not run — another pass holds the lock (exit 4)' "$1" ;;
+               *)  printf '%s: a removal FAILED (exit 4)' "$1" ;;
+           esac ;;
+        3) case "${3:-}" in
+               uv) printf '%s refused, or could not bound/verify a reclaim (exit 3 — see its log)' "$1" ;;
+               *)  printf '%s refused / failed closed (exit 3 — see its log)' "$1" ;;
+           esac ;;
+        *) printf '%s exited %s' "$1" "$2" ;;
     esac
 }
 
@@ -443,7 +701,11 @@ reap_uv() {
     local before after delta path would count=0 cands="" line size bound
     if [ -z "$CACHE_REAPER_PATH" ]; then
         say "disk-reaper: ⛔ class=uv FAIL-CLOSED — pi-cache-reap.sh not found (looked at \$CACHE_REAPER, \$HOME/.pi/agent/scripts, and beside this script)"
-        NOTE_UV="pi-cache-reap.sh not found"; RC_UV=3; return 3
+        NOTE_UV="pi-cache-reap.sh not found"; RC_UV=3; MISCONFIG="${MISCONFIG}${MISCONFIG:+, }uv-delegate-missing"
+        # It did not RUN: `WANT_*=0` makes the record say `not-run` (not a measured zero), the verdict
+        # says `misconfigured` (not `refused` — that word is for a delegate that RAN and said no), and
+        # `DF_*_OK` stays 1 so the detail does not blame `df` for a class that never ran.
+        WANT_UV=0; VERDICT_UV="misconfigured"; DF_UV_OK=1; return 3
     fi
     # WHERE the cache is, and WHAT the bound is, come from the owner (`--print-config`), never from a
     # second copy of the paths here — the uv cache honours XDG_CACHE_HOME and a tuned bound must not
@@ -453,12 +715,34 @@ reap_uv() {
     before="$(free_kb_for_path "$path")"
     run_class bash "$CACHE_REAPER_PATH" "$(mode_flag)"
     RC_UV="$CLASS_RC"
+    # ⛔ 4 IN THE uv FAMILY IS NOT "a removal FAILED" (#2156 review). pi-cache-reap.sh's own contract
+    # (its header, and its `*) exit 4` arm) says 4 = "did not run: another pass holds the lock" — a
+    # BENIGN skip that happens routinely, because the controller's own hourly cache pass takes the
+    # same lock. Mapping it to removal-failed put the unit RED on a healthy box: the exact #2036 shape,
+    # reintroduced for the one class that shares its lock with the controller. Normalise it to 6 (the
+    # delegate did not do its job — visible in the record, not a human-needed failure) and keep the
+    # RAW code for the detail line, which is where "lock held" must be said in words.
+    UV_RAW_RC="$CLASS_RC"
+    # Normalise through the SAME helper the other two classes use, so a status the class table does
+    # not name (124, 127, …) gets the same label and the same severity here as there — otherwise the
+    # uv class says `fail-closed` for a 124 while the venv class says `refused`, and the doc has to
+    # describe two mappings for one contract. 4 is then overridden to 6: in THIS family it means the
+    # lock was held, which is benign (see the note above).
+    RC_UV="$(worst_rc 0 "$UV_RAW_RC")"
+    [ "$UV_RAW_RC" = 4 ] && RC_UV=6
     after="$(free_kb_for_path "$path")"
     delta=""
     if [ -n "$before" ] && [ -n "$after" ]; then
-        delta=$(( (after - before) / 1024 )); [ "$delta" -lt 0 ] && delta=0
+        # RAW kept for the report: a negative or zero delta is CLAMPED to 0 for the status line, and the
+        # unclamped figure is printed beside it — a clamp that cannot be audited is indistinguishable
+        # from a measurement that never happened (the doc claimed this before the code did it).
+        DF_UV_OK=1
+        RAW_UV=$(( (after - before) / 1024 ))
+        delta="$RAW_UV"; [ "$delta" -lt 0 ] && delta=0
         # A dry-run removed nothing: whatever df moved belongs to a concurrent writer, not to us.
         if is_dry; then FREED_UV=0; else FREED_UV="$delta"; fi
+    else
+        DF_UV_OK=0
     fi
     # Per-candidate would-free, from the owner's own dry-run line. Pulled out rather than recomputed:
     # "size minus bound" is the OWNER's rule, and a second implementation could disagree with it.
@@ -488,13 +772,17 @@ reap_uv() {
     VERDICT_UV="$(class_verdict "$RC_UV")"
     # A class that did not finish ok must say so in the record's `detail`, or the supervisor prints
     # `ok=0 detail=ok` — a self-contradicting line is worse than no line.
-    [ "$RC_UV" = 0 ] || NOTE_UV="${NOTE_UV:-pi-cache-reap.sh exited $RC_UV}"
+    [ "$RC_UV" = 0 ] || NOTE_UV="${NOTE_UV:-$(note_for pi-cache-reap.sh "$UV_RAW_RC" uv)}"
     say "$CLASS_OUT"
     [ -n "$cands" ] && say "$cands"
     if is_dry; then
         say "disk-reaper: class=uv rc=$RC_UV verdict=$(class_verdict "$RC_UV") mode=dry-run candidates=$count would_free_du=${WOULD_UV}MB (du estimate, over-counts hardlinked blocks) freed_df=0MB"
     else
-        say "disk-reaper: class=uv rc=$RC_UV verdict=$(class_verdict "$RC_UV") mode=apply freed_df=${FREED_UV}MB (df delta on $path)"
+        if [ "${DF_UV_OK:-0}" = 1 ]; then
+            say "disk-reaper: class=uv rc=$RC_UV verdict=$(class_verdict "$RC_UV") mode=apply freed_df=${FREED_UV}MB df_raw=${RAW_UV}MB (df delta on $path)"
+        else
+            say "disk-reaper: class=uv rc=$RC_UV verdict=$(class_verdict "$RC_UV") mode=apply freed_df=unmeasured df_raw=? (df could not answer — this is NOT a measured zero)"
+        fi
     fi
     return 0
 }
@@ -516,7 +804,15 @@ resolve_repos() {
         [ -n "$r" ] || continue
         case "$seen" in *" $r "*) continue ;; esac
         seen="$seen$r "
-        git -C "$r" rev-parse --git-dir >/dev/null 2>&1 || continue
+        # ⛔ BOUNDED, LIKE EVERY OTHER PROBE THIS FILE MAKES. A bare `git` on a repo whose `.git` sits on a
+        # dead or hung mount blocks the pass WHILE IT HOLDS THE LOCK: the hour's reap never happens, the
+        # lock ages out, a contender breaks it, and two passes credit each other's `df` deltas.
+        if ! tb_timeout "${GIT_TIMEOUT:-$DU_TIMEOUT}" git -C "$r" rev-parse --git-dir >/dev/null 2>&1; then
+            # An explicit --repo is the operator's assertion, so a rejected one must be named (the
+            # same rule find_delegate applies to a set-but-missing delegate override).
+            say "disk-reaper: WARNING: ignoring '$r' — not a git checkout, so a class cannot scan it"
+            continue
+        fi
         REPOS="${REPOS}${REPOS:+
 }$r"
     done <<<"$list"
@@ -527,14 +823,16 @@ resolve_repos() {
 # Byte counts: the owner prints a size on every row it classifies; the entry point lifts those and
 # labels them as the owner does (du over-counts hardlinked uv-cache blocks).
 reap_venv() {
-    local before after delta repo out rc count all_c=0 cands="" rows="" freed=0 b a d
+    local before after delta repo out rc count all_c=0 cands="" rows="" freed=0 raw=0 b a d note_rc=0 MEASURED=1
     if [ -z "$VENV_REAPER_PATH" ]; then
         say "disk-reaper: ⛔ class=venv FAIL-CLOSED — reap-lane-venvs.sh not found (agent-infra PR #1949 owns this policy)"
-        NOTE_VENV="reap-lane-venvs.sh not found"; RC_VENV=3; return 3
+        NOTE_VENV="reap-lane-venvs.sh not found"; RC_VENV=3; MISCONFIG="${MISCONFIG}${MISCONFIG:+, }venv-delegate-missing"
+        WANT_VENV=0; VERDICT_VENV="misconfigured"; DF_VENV_OK=1; return 3
     fi
     if ! resolve_repos; then
         say "disk-reaper: ⛔ class=venv FAIL-CLOSED — no repo to scan (pass --repo PATH, or set DISK_REAPER_REPOS); a class that scans nothing is NOT a pass"
-        NOTE_VENV="no repo to scan"; RC_VENV=3; return 3
+        NOTE_VENV="no repo to scan"; RC_VENV=3; MISCONFIG="${MISCONFIG}${MISCONFIG:+, }venv-no-repo"
+        WANT_VENV=0; VERDICT_VENV="misconfigured"; DF_VENV_OK=1; return 3
     fi
     # df is measured PER REPO: --repo may name paths on different filesystems, and the first repo's
     # delta would then report 0MB for gigabytes removed from another mount.
@@ -544,13 +842,20 @@ reap_venv() {
         run_class bash "$VENV_REAPER_PATH" --gc --repo "$repo" --min-age "$VENV_MIN_AGE" "$(mode_flag)"
         out="$CLASS_OUT"; rc="$CLASS_RC"
         a="$(free_kb_for_path "$repo")"
-        if [ -n "$b" ] && [ -n "$a" ]; then d=$(( (a - b) / 1024 )); [ "$d" -lt 0 ] && d=0; freed=$((freed + d)); fi
+        if [ -n "$b" ] && [ -n "$a" ]; then
+            d=$(( (a - b) / 1024 )); raw=$((raw + d)); [ "$d" -lt 0 ] && d=0; freed=$((freed + d))
+        else
+            MEASURED=0
+        fi
         say "$out"
         rows="${rows}${rows:+$'\n'}$out"
         RC_VENV="$(worst_rc "$RC_VENV" "$rc")"
-        [ "$rc" -gt 0 ] && NOTE_VENV="${NOTE_VENV:-reap-lane-venvs.sh exited $rc}"
+        if [ "$rc" -gt 0 ] && { [ -z "$NOTE_VENV" ] || [ "$(rc_severity "$rc")" -gt "$(rc_severity "$note_rc")" ]; }; then
+            NOTE_VENV="$(note_for reap-lane-venvs.sh "$rc" venv)"; note_rc="$rc"
+        fi
     done <<<"$REPOS"
     VERDICT_VENV="$(class_verdict "$RC_VENV")"
+    DF_VENV_OK="$MEASURED"; RAW_VENV="$raw"
     if is_dry; then FREED_VENV=0; else FREED_VENV="$freed"; fi
     # Candidate rows are the owner's `REAP <reason> <N>MB <path>` lines (the lowercase `reap` rows are
     # its log format; the uppercase ones are the pass report). Only counted in dry-run: in apply mode
@@ -560,12 +865,27 @@ reap_venv() {
             case "$line" in
                 "REAP "*)
                     count="$(printf '%s' "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^[0-9]+MB$/) {print $i; exit}}')"
-                    path="$(printf '%s' "$line" | awk '{print $NF}')"
+                    # The owner's row is `REAP <reason> <size>  <path>` with PADDING, so `$NF` truncated a
+                    # path containing a space and the report then named a directory that does not exist
+                    # (the worktree arm had the same defect). The path is the REMAINDER of the line after
+                    # the verb, the reason and the size.
+                    path="$(printf '%s' "$line" | sed -E 's/^ *REAP +[^ ]+ +[^ ]+ +//')"
                     count="${count%MB}"
-                    case "$count" in ''|*[!0-9]*) continue ;; esac
-                    all_c=$((all_c + 1)); WOULD_VENV=$((WOULD_VENV + count))
-                    cands="${cands}${cands:+
-}disk-reaper: WOULD-REMOVE class=venv ${count}MB ${path}/.venv (du estimate, over-counts hardlinked uv-cache blocks)"
+                    # ⛔ A CANDIDATE IS A CANDIDATE EVEN WHEN ITS BYTES COULD NOT BE MEASURED. The owner
+                    # prints `REAP dead-lane  ?  <path>` whenever its own `du` fails; `continue`-ing on a
+                    # non-numeric size dropped the row entirely, so a class with a reapable env reported
+                    # `candidates=0 ok=1 detail=ok` — the unmeasured-reads-as-nothing false PASS the
+                    # worktree arm below already avoids. Count it and say the bytes are unknown.
+                    all_c=$((all_c + 1))
+                    case "$count" in
+                        ''|*[!0-9]*)
+                            cands="${cands}${cands:+
+}disk-reaper: WOULD-REMOVE class=venv (? bytes unmeasured — the owner could not size it) ${path}/.venv" ;;
+                        *)
+                            WOULD_VENV=$((WOULD_VENV + count))
+                            cands="${cands}${cands:+
+}disk-reaper: WOULD-REMOVE class=venv ${count}MB ${path}/.venv (du estimate, over-counts hardlinked uv-cache blocks)" ;;
+                    esac
                     ;;
             esac
         done <<<"$rows"
@@ -573,21 +893,27 @@ reap_venv() {
         [ -n "$cands" ] && say "$cands"
         say "disk-reaper: class=venv rc=$RC_VENV verdict=$(class_verdict "$RC_VENV") mode=dry-run candidates=$all_c would_free_du=${WOULD_VENV}MB (du estimate) freed_df=0MB"
     else
-        say "disk-reaper: class=venv rc=$RC_VENV verdict=$(class_verdict "$RC_VENV") mode=apply freed_df=${FREED_VENV}MB (df delta)"
+        if [ "${DF_VENV_OK:-0}" = 1 ]; then
+            say "disk-reaper: class=venv rc=$RC_VENV verdict=$(class_verdict "$RC_VENV") mode=apply freed_df=${FREED_VENV}MB df_raw=${RAW_VENV}MB (df delta)"
+        else
+            say "disk-reaper: class=venv rc=$RC_VENV verdict=$(class_verdict "$RC_VENV") mode=apply freed_df=unmeasured df_raw=? (df could not answer — this is NOT a measured zero)"
+        fi
     fi
     return 0
 }
 
 # ── class: worktree (clean + reachable + holder-free checkouts) ─────────────────────────────────
 reap_worktree() {
-    local before after delta repo out rc count all_c=0 cands="" rows="" path size freed=0 b a d sweep_end swept
+    local before after delta repo out rc count all_c=0 cands="" rows="" path size freed=0 raw=0 b a d sweep_end swept note_rc=0 why="" MEASURED=1
     if [ -z "$WORKTREE_REAPER_PATH" ]; then
         say "disk-reaper: ⛔ class=worktree FAIL-CLOSED — pi-reap-worktrees.sh not found"
-        NOTE_WT="pi-reap-worktrees.sh not found"; RC_WT=3; return 3
+        NOTE_WT="pi-reap-worktrees.sh not found"; RC_WT=3; MISCONFIG="${MISCONFIG}${MISCONFIG:+, }worktree-delegate-missing"
+        WANT_WT=0; VERDICT_WT="misconfigured"; DF_WT_OK=1; return 3
     fi
     if ! resolve_repos; then
         say "disk-reaper: ⛔ class=worktree FAIL-CLOSED — no repo to scan (pass --repo PATH, or set DISK_REAPER_REPOS)"
-        NOTE_WT="no repo to scan"; RC_WT=3; return 3
+        NOTE_WT="no repo to scan"; RC_WT=3; MISCONFIG="${MISCONFIG}${MISCONFIG:+, }worktree-no-repo"
+        WANT_WT=0; VERDICT_WT="misconfigured"; DF_WT_OK=1; return 3
     fi
     # df is measured PER REPO: --repo may span filesystems.
     while IFS= read -r repo; do
@@ -596,13 +922,20 @@ reap_worktree() {
         run_class bash "$WORKTREE_REAPER_PATH" "$(mode_flag)" --repo "$repo" --aged-days "$WT_AGED_DAYS"
         out="$CLASS_OUT"; rc="$CLASS_RC"
         a="$(free_kb_for_path "$repo")"
-        if [ -n "$b" ] && [ -n "$a" ]; then d=$(( (a - b) / 1024 )); [ "$d" -lt 0 ] && d=0; freed=$((freed + d)); fi
+        if [ -n "$b" ] && [ -n "$a" ]; then
+            d=$(( (a - b) / 1024 )); raw=$((raw + d)); [ "$d" -lt 0 ] && d=0; freed=$((freed + d))
+        else
+            MEASURED=0
+        fi
         say "$out"
         rows="${rows}${rows:+$'\n'}$out"
         RC_WT="$(worst_rc "$RC_WT" "$rc")"
-        [ "$rc" -gt 0 ] && NOTE_WT="${NOTE_WT:-pi-reap-worktrees.sh exited $rc}"
+        if [ "$rc" -gt 0 ] && { [ -z "$NOTE_WT" ] || [ "$(rc_severity "$rc")" -gt "$(rc_severity "$note_rc")" ]; }; then
+            NOTE_WT="$(note_for pi-reap-worktrees.sh "$rc" worktree)"; note_rc="$rc"
+        fi
     done <<<"$REPOS"
     VERDICT_WT="$(class_verdict "$RC_WT")"
+    DF_WT_OK="$MEASURED"; RAW_WT="$raw"
     if is_dry; then FREED_WT=0; else FREED_WT="$freed"; fi
     # The owner deliberately reports NO byte figure (its `.venv`s are hardlinked into the uv cache,
     # measured 84 GB du delta vs 22 GB freed). The consolidation requirement is "byte counts in
@@ -619,15 +952,19 @@ reap_worktree() {
                 # the path empty and silently produced candidates=0 for every real row.
                 path="${line#remove}"
                 path="${path#"${path%%[![:space:]]*}"}"
-                path="${path%%[[:space:]]*}"
+                # Keep the REMAINDER of the line: a checkout under a directory with a space in its
+                # name was truncated at the space, then `du` measured a path that does not exist and the
+                # row asserted the wrong cause. The path is the rest of the line, verbatim.
+                path="${path%"${path##*[![:space:]]}"}"
                 [[ "$path" == /* ]] || continue
-                if [ "$(now)" -ge "$sweep_end" ]; then size="?"
+                why="du could not read it (already gone, or unreadable)"
+                if [ "$(now)" -ge "$sweep_end" ]; then size="?"; why="du budget exhausted"
                 else size="$(du_mb "$path")" || size="?"; fi
                 swept=$((swept + 1)); [ $((swept % 25)) -eq 0 ] && heartbeat_lock
                 all_c=$((all_c + 1))
                 case "$size" in
                     ''|*[!0-9]*) cands="${cands}${cands:+
-}disk-reaper: WOULD-REMOVE class=worktree (? bytes unmeasured — du budget exhausted) ${path}" ;;
+}disk-reaper: WOULD-REMOVE class=worktree (? bytes unmeasured — ${why}) ${path}" ;;
                     *) WOULD_WT=$((WOULD_WT + size))
                        cands="${cands}${cands:+
 }disk-reaper: WOULD-REMOVE class=worktree ${size}MB ${path} (du estimate, over-counts hardlinked .venv blocks)" ;;
@@ -638,7 +975,11 @@ reap_worktree() {
         [ -n "$cands" ] && say "$cands"
         say "disk-reaper: class=worktree rc=$RC_WT verdict=$(class_verdict "$RC_WT") mode=dry-run candidates=$all_c would_free_du=${WOULD_WT}MB (du estimate) freed_df=0MB"
     else
-        say "disk-reaper: class=worktree rc=$RC_WT verdict=$(class_verdict "$RC_WT") mode=apply freed_df=${FREED_WT}MB (df delta)"
+        if [ "${DF_WT_OK:-0}" = 1 ]; then
+            say "disk-reaper: class=worktree rc=$RC_WT verdict=$(class_verdict "$RC_WT") mode=apply freed_df=${FREED_WT}MB df_raw=${RAW_WT}MB (df delta)"
+        else
+            say "disk-reaper: class=worktree rc=$RC_WT verdict=$(class_verdict "$RC_WT") mode=apply freed_df=unmeasured df_raw=? (df could not answer — this is NOT a measured zero)"
+        fi
     fi
     return 0
 }
@@ -662,39 +1003,55 @@ acquire_lock
 } | tee -a "$LOG"
 
 # Heartbeat after each class: a pass that is making progress must never be aged out of its own lock.
-want_class uv       && { reap_uv;       heartbeat_lock; }
-want_class venv     && { reap_venv;     heartbeat_lock; }
-want_class worktree && { reap_worktree; heartbeat_lock; }
+want_class uv       && { WANT_UV=1;   reap_uv;       heartbeat_lock; }
+want_class venv     && { WANT_VENV=1; reap_venv;     heartbeat_lock; }
+want_class worktree && { WANT_WT=1;   reap_worktree; heartbeat_lock; }
 
-# Verdict: a fail-closed class wins over a removal failure, which wins over "dry-run found work".
+# Verdict. ⛔ ONE ordering, expressed ONCE: 3 misconfigured > 4 removal-failed > 6 delegate refused >
+# 5 informational > 0. A class that could not be SET UP at all (MISCONFIG) is 3 regardless of what the
+# others did — an absent delegate is not a busy box. Everything else folds through worst_rc, which
+# normalises unknown statuses to 6 so a delegate's `exit 2` can never reach the unit as "usage error".
 verdict=0
-for rc in "$RC_UV" "$RC_VENV" "$RC_WT"; do
-    case "$rc" in
-        0) ;;
-        5) if is_dry; then :; else verdict=3; fi ;;
-        4) [ "$verdict" = 3 ] || verdict=4 ;;
-        *) verdict=3 ;;
-    esac
-done
-if [ "$verdict" = 0 ] && is_dry \
-   && { [ "$CAND_UV" -gt 0 ] || [ "$CAND_VENV" -gt 0 ] || [ "$CAND_WT" -gt 0 ]; }; then
-    verdict=5
+if [ -n "$MISCONFIG" ]; then
+    verdict=3
+else
+    for rc in "$RC_UV" "$RC_VENV" "$RC_WT"; do verdict="$(worst_rc "$verdict" "$rc")"; done
+    if [ "$verdict" = 0 ] && is_dry \
+       && { [ "$CAND_UV" -gt 0 ] || [ "$CAND_VENV" -gt 0 ] || [ "$CAND_WT" -gt 0 ]; }; then
+        verdict=5
+    fi
 fi
 
 TOTAL=$(( FREED_UV + FREED_VENV + FREED_WT ))
+UNMEASURED=""
+[ "${DF_UV_OK:-0}"  = 1 ] || UNMEASURED="${UNMEASURED}${UNMEASURED:+, }uv"
+[ "${DF_VENV_OK:-0}" = 1 ] || UNMEASURED="${UNMEASURED}${UNMEASURED:+, }venv"
+[ "${DF_WT_OK:-0}" = 1 ] || UNMEASURED="${UNMEASURED}${UNMEASURED:+, }worktree"
 if is_dry; then
     say "disk-reaper: pass end mode=dry-run verdict=$verdict freed_df=0MB would_free_du=$(( WOULD_UV + WOULD_VENV + WOULD_WT ))MB candidates=$(( CAND_UV + CAND_VENV + CAND_WT )) — NOTHING was removed"
 else
-    say "disk-reaper: pass end mode=apply verdict=$verdict freed_df=${TOTAL}MB (uv=${FREED_UV}MB venv=${FREED_VENV}MB worktree=${FREED_WT}MB)"
+    # third arg: was the class SELECTED at all? not-run is a third state, distinct from both
+    # "measured zero" and "unmeasured".
+    _pc() { [ "${3:-1}" = 1 ] || { printf 'not-run'; return 0; }
+            [ "${1:-0}" = 1 ] && printf '%sMB' "$2" || printf 'unmeasured'; }
+    say "disk-reaper: pass end mode=apply verdict=$verdict $([ -n "$UNMEASURED" ] && printf 'freed_df=unmeasured (measured classes: %sMB)' "$TOTAL" || printf 'freed_df=%sMB' "$TOTAL") (uv=$(_pc "${DF_UV_OK:-0}" "$FREED_UV" "$WANT_UV") venv=$(_pc "${DF_VENV_OK:-0}" "$FREED_VENV" "$WANT_VENV") worktree=$(_pc "${DF_WT_OK:-0}" "$FREED_WT" "$WANT_WT"))${UNMEASURED:+ — df could not measure: $UNMEASURED (not a measured zero)}"
 fi
 
 # ── record it ───────────────────────────────────────────────────────────────────────────────────
-# Atomic write: a supervisor `status` can run while this pass is mid-write.
-OK=1; [ "$verdict" = 0 ] || [ "$verdict" = 5 ] || OK=0
+# `ok` is the RECORD's verdict, and it is deliberately NOT "the unit is green". A dry-run that found
+# work did its job (ok=1). An APPLY pass that ended below a class's stated floor did NOT: the record
+# must say so, or the fleet reads `healthy` on a cell that is short of disk — which is exactly the
+# false PASS #2156 measured (status ok=1 rc=0 verdict_venv=ok, detail "... exited 5"). The unit may
+# still be green (SuccessExitStatus carries 5/6): the record is the alarm channel, the unit colour is
+# the "is a human needed" channel (#2036).
+OK=0
+{ [ "$verdict" = 0 ] || { [ "$verdict" = 5 ] && is_dry; }; } && OK=1
 DETAIL=""
 [ -n "$NOTE_UV" ] && DETAIL="$NOTE_UV"
 [ -n "$NOTE_VENV" ] && DETAIL="${DETAIL}${DETAIL:+; }$NOTE_VENV"
 [ -n "$NOTE_WT" ] && DETAIL="${DETAIL}${DETAIL:+; }$NOTE_WT"
+[ -n "$MISCONFIG" ] && DETAIL="${DETAIL}${DETAIL:+; }cannot run: ${MISCONFIG}"
+[ -n "$UNMEASURED" ] && DETAIL="${DETAIL}${DETAIL:+; }df could not measure the reclaim for: ${UNMEASURED} (not a measured zero)"
 [ -n "$DETAIL" ] || DETAIL="ok"
 UTMP="$STATUS.tmp.$$"
 {
@@ -706,9 +1063,13 @@ UTMP="$STATUS.tmp.$$"
     printf 'classes=%s\n' "$ONLY"
     printf 'watchdog=%s\n' "${TB_TIMEOUT_KIND:-unknown}"
     printf 'freed_mb=%s\n' "$TOTAL"
-    printf 'freed_mb_uv=%s\n' "$FREED_UV"
-    printf 'freed_mb_venv=%s\n' "$FREED_VENV"
-    printf 'freed_mb_worktree=%s\n' "$FREED_WT"
+    printf 'freed_mb_unmeasured=%s\n' "$UNMEASURED"
+    # In a dry run nothing was removed, so 0 is measured, not unmeasured.
+    _rc() { [ "${3:-1}" = 1 ] || { printf 'not-run'; return 0; }
+             { [ "${1:-0}" = 1 ] || is_dry; } && printf '%s' "$2" || printf 'unmeasured'; }
+    printf 'freed_mb_uv=%s\n' "$(_rc "${DF_UV_OK:-0}" "$FREED_UV" "$WANT_UV")"
+    printf 'freed_mb_venv=%s\n' "$(_rc "${DF_VENV_OK:-0}" "$FREED_VENV" "$WANT_VENV")"
+    printf 'freed_mb_worktree=%s\n' "$(_rc "${DF_WT_OK:-0}" "$FREED_WT" "$WANT_WT")"
     printf 'would_free_mb_uv=%s\n' "$WOULD_UV"
     printf 'would_free_mb_venv=%s\n' "$WOULD_VENV"
     printf 'would_free_mb_worktree=%s\n' "$WOULD_WT"
@@ -721,7 +1082,12 @@ UTMP="$STATUS.tmp.$$"
     printf 'repos=%s\n' "$(printf '%s' "$REPOS" | tr '\n' ',')"
     printf 'detail=%s\n' "$DETAIL"
 } >"$UTMP" 2>/dev/null && mv -f "$UTMP" "$STATUS" 2>/dev/null \
-    || { say "disk-reaper: ⛔ cannot write the pass record $STATUS — the supervisor will read this pass as NEVER RAN"; rm -f "$UTMP" 2>/dev/null; [ "$verdict" = 0 ] && verdict=3; }
+    || { say "disk-reaper: ⛔ cannot write the pass record $STATUS — the PREVIOUS record still stands (readers will keep seeing it until it goes stale); this pass's exit code is the only witness to this run"
+         rm -f "$UTMP" 2>/dev/null
+         # ⛔ 5 AND 6 ARE GREEN BECAUSE THE RECORD CARRIES THE ALARM. With no record there is no alarm
+         # channel left, so any non-3 verdict becomes 4 (a filesystem problem) instead of exiting green
+         # over an un-writable state dir.
+         [ "$verdict" = 3 ] || verdict=4; }
 log "==== pass end mode=$MODE_TEXT verdict=$verdict freed_mb=$TOTAL uv=$FREED_UV venv=$FREED_VENV worktree=$FREED_WT candidates=$(( CAND_UV + CAND_VENV + CAND_WT )) ===="
 
 exit "$verdict"

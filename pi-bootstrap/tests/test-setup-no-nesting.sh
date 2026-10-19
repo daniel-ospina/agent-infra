@@ -479,7 +479,8 @@ LANE_PRODUCERS_CANONICAL="
 script:ask-owner.py script:beta-progress.py script:disk-reaper.sh script:cadence-nudge.sh script:fleet-cost-report.sh
 script:goal-state.py script:heartbeat-loop.sh script:lane-actions.py script:lane-guard.py
 script:lane-scan-fallback.sh script:lane-status.py script:lane-watchdog.py script:merge-queue.py
-script:objective.py script:orchestrator-heartbeat.sh script:pi-reap-worktrees.sh script:pr-doctor.py
+script:objective.py script:orchestrator-heartbeat.sh script:pi-reap-worktrees-launchd.py
+script:pi-reap-worktrees.sh script:pr-doctor.py
 script:publish-live-workspaces.py script:queue-dispatch.py script:safe-send.sh
 script:session-postmortem.sh
 script:turn-classify.py script:turn-end.py script:undelivered-answers.py script:watch-truncation.sh
@@ -487,6 +488,12 @@ lib:beat-pair.sh lib:bounded.sh lib:diff-normalize.py lib:pid-identity.sh lib:tr
 state:claim.py state:lane-confirm.py state:lane-triage.py state:lane-verdict.py
 state:queues/refresh-queues.py
 foreign:cmux_dispatch.py"
+# `script:pi-reap-worktrees-launchd.py` joined on 2026-10-20 (PR #2173): the consolidated disk
+# reaper's macOS LaunchAgent execs it (a launchd-spawned `bash` cannot read a repo under ~/Documents,
+# so the checkout's interpreter reads the script and hands it to bash on stdin). It is DELIVERED —
+# `pi-bootstrap/setup.sh`'s `fleet_srcs` farms it — so this is a re-pin of the derived population,
+# not an exemption.
+#
 # `lib:transcript-patterns.sh` joined on 2026-10-17 (#1921) and `foreign:postmortem.sh` LEFT in the
 # same landing, which is the derivation doing its job: the exec site did not vanish, it CHANGED KIND —
 # the consumer now execs a sibling that `lib_srcs` farms, and the old foreign reference is gone. A
@@ -1540,12 +1547,29 @@ time.sleep(60)' "$zpid_file" &
   # replace the farmed library and make the whole layout pin vacuous. Extra NAME=value
   # arguments are applied on top — leg (d) uses that for its explicit override.
   run_promotion() {
-    env -u PI_PID_IDENTITY_LIB -u PS_BIN -u DATE_BIN HOME="$phome" "$@" python3 "$tool" 2>&1
+    # ⛔ STRIP THE suite's `launchctl` POISON FROM PATH FOR THIS LEG. The poison shim exists to prove
+    # `setup.sh` never calls the real `launchctl`; running a DIFFERENT tool under it makes
+    # `shutil.which("launchctl")` succeed on a Linux box, where fleet-health.py's "no launchd" guard
+    # would otherwise hold, and its (correct) abstention alarm then makes the tool exit 1 — an exit
+    # code this leg does not pin. Restoring a PATH without the shim lets that guard apply, so the
+    # reaper channel stays out of a lane-identity assertion.
+    local clean=""
+    local d
+    local IFS=:
+    for d in $PATH; do
+      case "$d" in "$TMP/bin") continue ;; esac
+      clean="${clean:+$clean:}$d"
+    done
+    unset IFS
+    env -u PI_PID_IDENTITY_LIB -u PS_BIN -u DATE_BIN PATH="$clean" HOME="$phome" "$@" python3 "$tool" 2>&1
   }
 
   # (a) absent pid → the dead witness still fires.
   write_prom_store 999999
-  out="$(run_promotion)"
+  # Captured, not aborting: this leg asserts on the tool's OUTPUT (a PID DEAD row), and under
+  # `set -e` a non-zero tool status would kill the suite with the explanation discarded — the trap
+  # this file already documents for a sibling call site.
+  out="$(run_promotion)" || true
   if grep -q "PID DEAD" <<<"$out"; then
     echo "ok: $label absent pid reads PID DEAD through the farmed library"
   else
@@ -1554,7 +1578,7 @@ time.sleep(60)' "$zpid_file" &
 
   # (b) pid REUSE: a live pid whose recorded start is off-fence → abstain.
   write_prom_store "$$"
-  out="$(run_promotion)"
+  out="$(run_promotion)" || true
   if grep -q "PID DEAD" <<<"$out"; then
     fail "$label: a LIVE pid with an off-fence start read PID DEAD (fence bypass)"
   elif grep -q "PID ? (off-fence)" <<<"$out"; then
@@ -1567,7 +1591,7 @@ time.sleep(60)' "$zpid_file" &
   # detail must be the ZOMBIE rule, not plain absence.
   if [[ "$zstat" == Z* ]]; then
     write_prom_store "$zpid"
-    out="$(run_promotion)"
+    out="$(run_promotion)" || true
     if grep -q "PID DEAD" <<<"$out"; then
       echo "ok: $label zombie pid ($zpid, stat=$zstat) reads PID DEAD (no bare-existence read is possible)"
     else
@@ -1580,7 +1604,11 @@ time.sleep(60)' "$zpid_file" &
 
   # (d) NEGATIVE control — the canonical library absent.
   write_prom_store 999999
-  out="$(run_promotion "PI_PID_IDENTITY_LIB=/nonexistent/pid-identity.sh")"
+  # ⛔ CAPTURED, NOT ABORTING. This leg asserts on the tool's OUTPUT; under `set -e` a non-zero tool
+  # status kills the suite with the diagnostic discarded (the trap this file documents for its
+  # siblings). fleet-health legitimately exits 1 on a box with a reaper schedule and no pass record —
+  # an unrelated channel this leg does not pin.
+  out="$(run_promotion "PI_PID_IDENTITY_LIB=/nonexistent/pid-identity.sh")" || true
   if grep -q "PID DEAD" <<<"$out"; then
     fail "$label: NEGATIVE CONTROL FAILED — with the canonical library absent fleet-health.py still printed PID DEAD (bare-existence fallback)"
   elif grep -q "PID ? (unreadable)" <<<"$out"; then
@@ -1592,7 +1620,7 @@ time.sleep(60)' "$zpid_file" &
   # (e) the `ps` READ fails (live pid, valid start) → abstain, never PID DEAD.
   # `PS_BIN` is the library's own documented injection point for exactly this shape.
   write_prom_store "$$"
-  out="$(run_promotion PS_BIN=/nonexistent/ps)"
+  out="$(run_promotion PS_BIN=/nonexistent/ps)" || true
   if grep -q "PID DEAD" <<<"$out"; then
     fail "$label: a failed ps read rendered PID DEAD (a read that did not happen is not a death witness)"
   elif grep -q "PID ? (unreadable)" <<<"$out"; then
@@ -1603,7 +1631,7 @@ time.sleep(60)' "$zpid_file" &
 
   # (f)+(g) an UNUSABLE recorded start (absent / negative) with a LIVE pid → abstain.
   write_prom_store "$$" __absent__
-  out="$(run_promotion)"
+  out="$(run_promotion)" || true
   if grep -q "PID DEAD" <<<"$out"; then
     fail "$label: a record with NO pidStartSeconds read PID DEAD (an unfenceable start must abstain)"
   elif grep -q "PID ? (unreadable)" <<<"$out"; then
@@ -1612,7 +1640,7 @@ time.sleep(60)' "$zpid_file" &
     fail "$label: missing pidStartSeconds neither abstained nor read dead: $(grep -E '^B1 ' <<<"$out")"
   fi
   write_prom_store "$$" -1
-  out="$(run_promotion)"
+  out="$(run_promotion)" || true
   if grep -q "PID DEAD" <<<"$out"; then
     fail "$label: pidStartSeconds=-1 read PID DEAD (an unusable start must abstain)"
   elif grep -q "PID ? (unreadable)" <<<"$out"; then
@@ -1630,7 +1658,7 @@ time.sleep(60)' "$zpid_file" &
 open(sys.argv[1], "a").close()
 os.utime(sys.argv[1], (time.time() - 1200, time.time() - 1200))' "$tfile"
   write_prom_store "$$"
-  out="$(run_promotion)"
+  out="$(run_promotion)" || true
   if grep -q "PID DEAD" <<<"$out"; then
     fail "$label: off-fence + stale transcript read PID DEAD"
   elif grep -q "PID ? (off-fence)" <<<"$out" && grep -q "suspect(s)" <<<"$out"; then

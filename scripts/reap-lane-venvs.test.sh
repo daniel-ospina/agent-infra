@@ -334,7 +334,12 @@ else
   echo " E1 a REAL process whose cwd is the worktree keeps its env"
   ( cd "$W_R" && exec sleep 60 ) &
   SLEEPER=$!
+  # A scheduling grace for the child to enter its cwd. The load-induced flake this suite shows is
+  # UNEXPLAINED (the reaper fails CLOSED on it, so nothing is removed); it is NOT a probing subshell
+  # deleting the scratch — that was disproved by execution. 1s is ample for `cd && exec` on an idle box;
+  # this is the fixture's only wall-clock dependence and it is a known fragility.
   sleep 1
+
   out="$(run_real --worktree "$W_R" --apply)"
   assert_contains "$out" "KEEP live-cwd" "the real cwd probe found the real process"
   exists "$W_R/.venv" "the env is intact"
@@ -342,7 +347,8 @@ else
   wait "$SLEEPER" 2>/dev/null
 
   echo " E2 the SAME fixture reaps once that process is gone — the distinguishing half"
-  sleep 1
+  # `wait` above already blocked until the child was reaped, so there is nothing left to poll here (an
+  # earlier version polled `kill -0 "$SLEEPER"` after the `wait` and could never enter its body).
   out="$(run_real --worktree "$W_R" --apply)"
   assert_contains "$out" "REAP lane-exited" "with no holder, the lane reads dead"
   assert_contains "$out" "reaped=1" "the env was reaped"

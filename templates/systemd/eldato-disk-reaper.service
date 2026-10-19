@@ -21,6 +21,20 @@ Environment=PATH={{PATH}}
 Environment=DISK_REAPER_STATE_DIR={{STATE_DIR}}
 Environment=DISK_REAPER_REPOS={{REPOS}}
 Environment=DISK_REAPER_WT_AGED_DAYS={{AGED_DAYS}}
+# The bounded-execution helper is PINNED for the same reason the delegates are: it is resolved from
+# `$(dirname $0)/lib/`, and that arm is empty when the script is fed through a pipe (the macOS
+# launcher does that, under TCC). A pin is authoritative and fails CLOSED at startup if it is gone,
+# which is what a deletion tool wants.
+Environment=BOUNDED_LIB={{BOUNDED_LIB}}
+# ⛔ THE DELEGATES ARE PINNED TO THE INSTALLED COPY, not left to $HOME. find_delegate prefers
+# $HOME/.pi/agent/scripts, so a unit whose HOME happens to contain an older farmed copy silently ran
+# THAT policy instead of the one installed beside this unit — measured on pi-cell-3, where the
+# worktree class failed with "not a git repository: /tmp/cell-t3" against a stale copy while the
+# freshly-installed one was never consulted. A pin is authoritative and fails CLOSED if it is gone,
+# which is the behaviour a deletion tool wants.
+Environment=CACHE_REAPER={{REAPER_DIR}}/pi-cache-reap.sh
+Environment=VENV_REAPER={{REAPER_DIR}}/reap-lane-venvs.sh
+Environment=WORKTREE_REAPER={{REAPER_DIR}}/pi-reap-worktrees.sh
 # The worktree owner must ask GitHub which PRs are open before it may delete anything. A busy cell
 # shares one account with every other box, so the harness gh shim backs off; this timeout is above
 # that backoff window. If it still cannot answer, the class FAILS CLOSED (a checkout with an open PR
@@ -30,6 +44,24 @@ Environment=REAP_WT_GH_TIMEOUT=300
 Nice=10
 IOSchedulingClass=idle
 # The pass writes its own bounded log under DISK_REAPER_STATE_DIR; journald keeps the exit status.
-ExecStart=/bin/bash {{REAPER}} --apply
-# A pass that exits 3 (a class failed closed) must not look like success to `systemctl start`.
-SuccessExitStatus=0 4 5
+# {{MODE_FLAG}} is the ARMING DECISION, rendered by the installer (--apply by default; --report-only
+# renders --dry-run). It is a placeholder and not a literal so that disarming this box is one
+# documented verb instead of a hand-edit of an installed unit that the next bring-up silently reverts.
+ExecStart=/bin/bash {{REAPER}} {{MODE_FLAG}}
+# ⛔ WHICH EXIT CODES ARE SUCCESS IS PART OF THE CONTRACT, not a detail (#2036). The entry point's own
+# vocabulary (see its header) is: 0 ok · 2 usage · 3 MISCONFIGURED (a delegate is absent, a class has
+# no repo to scan, the watchdog library is missing) · 4 a removal FAILED, or a lock directory that
+# cannot be created · 5 informational (dry-run found work; apply: a class is BELOW its owner's stated
+# floor; ANOTHER PASS HOLDS THE LOCK, so this one did not run) · 6 a delegate RAN and refused (the box
+# was busy — the documented, expected outcome on a healthy cell).
+#
+# 3 and 4 are NOT listed: those are the two a human must look at.
+# 5 and 6 ARE listed: they are expected states whose alarm channel is the PASS RECORD
+# (ok=0 + per-class verdict), which the supervisor and fleet-health read — not the unit's colour.
+# The earlier directive listed 4 as success (so a FAILED removal was green) and omitted 6 (so the
+# unit went RED every hour on a busy cell, for a pass that did its job: measured
+# `status=3/NOTIMPLEMENTED` on a pass that reclaimed 441 MB). Both were `systemctl --failed` lying.
+SuccessExitStatus=0 5 6
+# Auditability: journald keeps the pass's stdout/stderr with the exit status, and the pass ALSO
+# writes $DISK_REAPER_STATE_DIR/disk-reaper.status (per-class bytes reclaimed) plus its bounded log.
+# No `StandardOutput=null` and no `-` prefix on ExecStart: a reaper must never be quiet.

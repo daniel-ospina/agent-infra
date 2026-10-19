@@ -2268,6 +2268,18 @@ case "$OUT" in
   *"uv=1000MB venv=210MB worktree=24MB"*) ok "status: breaks the reclaim down per class" ;;
   *) bad "status: does not break the reclaim down — $OUT" ;;
 esac
+# (2b) an UNMEASURED class keeps its word and gets NO unit — `unmeasuredMB` would read as a byte count
+printf 'epoch=%s\niso=2026-10-18T17:00:00Z\nmode=apply\nok=1\nrc=0\nclasses=uv,venv,worktree\nfreed_mb=210\nfreed_mb_uv=unmeasured\nfreed_mb_venv=210\nfreed_mb_worktree=unmeasured\nfreed_mb_unmeasured=uv,worktree\ncandidates_uv=0\nverdict_uv=ok\nverdict_venv=ok\nverdict_worktree=ok\ndetail=df could not measure the reclaim for: uv, worktree (not a measured zero)\n' "$(date +%s)" \
+  >"$DR/home/.pi/agent/state/disk-reaper.status"
+OUT="$(dr_sup)"
+case "$OUT" in
+  *"uv=unmeasured venv=210MB worktree=unmeasured"*) ok "status: an unmeasured class keeps its word and its unit-less form" ;;
+  *) bad "status: an unmeasured class is not rendered correctly — $OUT" ;;
+esac
+case "$OUT" in
+  *"unmeasuredMB"*) bad "status: a non-numeric value was given a byte unit — $OUT" ;;
+  *) ok "status: never bolts a unit onto a non-numeric value" ;;
+esac
 # (3) a failed pass: the ⛔ line names the class that failed, so the operator knows what did not run
 printf 'epoch=%s\niso=2026-10-18T17:00:00Z\nmode=apply\nok=0\nrc=3\nclasses=uv,venv,worktree\nfreed_mb=8\nfreed_mb_uv=0\nfreed_mb_venv=8\nfreed_mb_worktree=0\ncandidates_uv=0\nverdict_uv=ok\nverdict_venv=ok\nverdict_worktree=fail-closed\ndetail=pi-reap-worktrees.sh exited 3\n' "$(date +%s)" \
   >"$DR/home/.pi/agent/state/disk-reaper.status"
