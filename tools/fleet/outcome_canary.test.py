@@ -4471,29 +4471,41 @@ MUTATIONS = [
      'else "used_pct not read"',
      'else "-1.0% used"',
      'test_a_MISSING_used_pct_is_not_printed_as_measured'),
-    ("the positive-evidence arms are asked after the absent-header abstention",
-     '    if isinstance(gh_open, int) and not isinstance(gh_open, bool) and gh_open > 0:\n'
-     '        return True, "%d open PR(s) — work in hand, independent of the queue record" % gh_open',
-     '    if False:\n'
-     '        return True, "%d open PR(s) — work in hand, independent of the queue record" % gh_open',
-     "test_open_PRs_are_work_in_hand_even_with_NO_cycle_header"),
+    ('the positive-evidence arms are asked after the absent-header abstention',
+     '    if _is_count(gh_open) and gh_open > 0:',
+     '    if False:',
+     'test_open_PRs_are_work_in_hand_even_with_NO_cycle_header'),
     # ── cycle-33 defects ─────────────────────────────────────────────────────────────────
     ("an incomplete header is blessed as a genuinely empty pool",
-     "            and isinstance(backlog, int) and not isinstance(backlog, bool)):",
-     "            ) if False else True:",
+     '            and _is_count(backlog)):',
+     '            ):',
      "test_an_INCOMPLETE_header_cannot_certify_an_EMPTY_pool"),
     ("a PARTIAL pool token is admitted as able to certify an empty pool",
-     '    if (kind not in ("EMPTY", "READ")\n            or not isinstance(backlog, int)',
-     '    if (kind not in ("EMPTY", "READ", "PARTIAL")\n            or not isinstance(backlog, int)',
+     '    if (kind not in ("EMPTY", "READ")\n',
+     '    if (kind not in ("EMPTY", "READ", "PARTIAL")\n',
      "test_a_PARTIAL_pool_token_cannot_support_nothing_in_hand"),
     ("the batch INTENT is reported as a landed dispatch",
      '    if lane_ok:\n        return True, "a lane started %s (the queue record is not the only evidence)" % (\n            _age_txt(lane_ok.get("age_s")))',
      '    if intent or lane_ok:\n        return True, "a dispatch landed %s (the queue record is not the only evidence)" % (\n            _age_txt((intent or lane_ok).get("age_s")))',
      "test_the_intent_line_is_not_reported_as_a_LANDED_dispatch"),
+    # ── cycle-35 defects ─────────────────────────────────────────────────────────────────
+    ("a bool age certifies a frozen pool as current",
+     '        age = _raw_age if isinstance(_raw_age, (int, float)) and not isinstance(_raw_age, bool) \\\n            else None',
+     '        age = _raw_age',
+     "test_a_BOOL_age_is_not_a_current_reading"),
+    ("a refuted lane start is dropped by issue number alone, ignoring WHEN",
+     '        return fa <= sa + 2.0    # the failure came at or after the start line',
+     '        return True',
+     "test_a_refutation_is_scoped_to_the_start_it_can_speak_about"),
+    ("a hand-rolled count guard returns to the GREEN arm",
+     '    if pool_kind == "EMPTY" and ((_is_count(backlog) and backlog == 0) or superseded_backlog) \\\n',
+     '    if pool_kind == "EMPTY" and ((isinstance(backlog, int) and backlog == 0) or '
+     'superseded_backlog) \\\n',
+     "test_every_count_read_shares_ONE_bool_excluding_guard"),
     # ── cycle-34 defects ─────────────────────────────────────────────────────────────────
     ("the truncation abstention outranks a MEASURED lander expiry",
      "    if not candidates and truncated:",
-     "    if False:",
+     "    if truncated and not candidates or truncated:",
      "test_a_MEASURED_lander_expiry_outranks_a_truncated_population"),
     ("an unread protection value outranks a MEASURED unprotected pid",
      "    unprotected_known = [a for a in known if a >= 0]\n    if unprotected_known:",
@@ -4504,10 +4516,9 @@ MUTATIONS = [
      "    if isinstance(backlog, int) and backlog > 0 and not superseded_backlog:",
      "test_a_BOOL_backlog_is_not_a_candidate_COUNT"),
     ("a refuted lane start is reported as a started lane",
-     '                               if str(e.get("issue")) not in refuted], pr_win)',
+     '                               if not any(_refutes(f, e) for f in _fails)], pr_win)',
      '                               ], pr_win)',
      "test_the_intent_line_is_not_reported_as_a_LANDED_dispatch"),
-    # ── cycle-28 defects ──────────────────────────────────────────────────────────────────
     ("CONTROLLER_ABSENT ignores a rejected controller row",
      "    if not pids and near_ours:",
      "    if False:",
@@ -4562,11 +4573,11 @@ MUTATIONS = [
      '            skipped.append("%s:%s" % (pr.get("number"), pr.get("checks_state") or "red"))',
      '            skipped.append("%s:red" % (pr.get("number"),))',
      "test_an_IN_FLIGHT_check_is_labelled_inflight_not_RED"),
-    ('an unaged EMPTY record still manufactures idleness',
-     '    if (_src == "state/queue-state" and kind == "EMPTY" and _graded_stale(f, cfg, _src) is None\n            and isinstance(backlog, int) and not isinstance(backlog, bool)):',
+    ("an unaged EMPTY record still manufactures idleness",
+     '    if (_src == "state/queue-state" and kind == "EMPTY" and _graded_stale(f, cfg, _src) is None\n            and _is_count(backlog)):',
      '    if _src == "state/queue-state" and kind == "EMPTY":',
-     'test_an_UNAGED_EMPTY_record_cannot_manufacture_idleness_either'),
-    ("an in-flight rollup is reported as a red conclusion",
+     "test_an_UNAGED_EMPTY_record_cannot_manufacture_idleness_either"),
+    ("the rollup state returns on the first in-flight group",
      '        if any(_in_flight(chk) for _r, chk in entries):\n            seen_inflight = True\n            continue',
      '        if any(_in_flight(chk) for _r, chk in entries):\n            return "inflight"',
      "test_a_CONCLUDED_red_outranks_an_IN_FLIGHT_check_in_either_order"),
@@ -4617,11 +4628,10 @@ MUTATIONS = [
      '    stale = _graded_stale(f, c, _tok_src)\n    if stale is not None and (stale["age_s"] is None or pool_kind == "EMPTY" or backlog == 0):\n        # "Nothing to dispatch" is the CORRECT outcome only on a CURRENT read, and "work existed and',
      "test_a_STALE_read_cannot_grade_work_as_NOT_dispatched"),
     ("fleet activity ignores open PRs and fresh dispatches",
-     "    if isinstance(gh_open, int) and not isinstance(gh_open, bool) and gh_open > 0:",
-     "    if False:",
+     '    if _is_count(gh_open) and gh_open > 0:',
+     '    if False:',
      "test_a_STALE_header_cannot_manufacture_work_in_hand"),
-    # ── cycle-23 defects ──────────────────────────────────────────────────────────────────
-    ("the merge-ordered window bound moves a window into the future",
+    ("the merge-ordered search bound moves a window into the future",
      "        now - cfg.pr_window_s, datetime.timezone.utc).strftime(\"%Y-%m-%d\")",
      "        now + cfg.pr_window_s, datetime.timezone.utc).strftime(\"%Y-%m-%d\")",
      "test_the_GRAPHQL_collector_reads_the_CLOSED_page_AND_a_MERGE_ordered_page"),
@@ -4634,15 +4644,13 @@ MUTATIONS = [
      '    pair = tok',
      "test_an_EMPTY_backlog_is_judged_against_the_pool_from_ITS_OWN_header"),
     ("fleet activity attributes the header's backlog to a newer state record",
-     '    if (_src == "state/queue-state" and kind == "EMPTY" and _graded_stale(f, cfg, _src) is None\n            and isinstance(backlog, int) and not isinstance(backlog, bool)):',
+     '    if (_src == "state/queue-state" and kind == "EMPTY" and _graded_stale(f, cfg, _src) is None\n            and _is_count(backlog)):',
      '    if False:',
-     'test_an_EMPTY_state_record_supersedes_an_older_header_backlog'),
-    ("pr_merged FAILs while its own activity input is unread",
-     "    if busy is None:\n"
-     '        # \u26d4 HOISTED ABOVE THE `open_n > 0` ARM.',
-     "    if False:\n"
-     '        # \u26d4 HOISTED ABOVE THE `open_n > 0` ARM.',
-     "test_pr_merged_abstains_when_the_activity_input_is_unread"),
+     "test_an_EMPTY_state_record_supersedes_an_older_header_backlog"),
+    ('pr_merged grades an unread activity input as nothing merged',
+     '    if busy is None:\n        # \u26d4 HOISTED ABOVE THE `open_n > 0` ARM.',
+     '    if busy is None and False:\n        # \u26d4 HOISTED ABOVE THE `open_n > 0` ARM.',
+     'test_pr_merged_abstains_when_the_activity_input_is_unread'),
     # ── cycle-22 defects ──────────────────────────────────────────────────────────────────
     ("an unparseable header is graded as a mid-cycle wedge",
      "    if not cycles and unparsed:",
@@ -4691,7 +4699,7 @@ MUTATIONS = [
      '    hdr = newest(events.get("headers")) if False \\',
      "test_a_STALE_header_cannot_manufacture_work_in_hand"),
     ("a bool counts as a PR count",
-     '    if not isinstance(n, int) or isinstance(n, bool):\n'
+     '    if not _is_count(n):\n'
      '        return V("pr_created", INCONCLUSIVE, "GH_COUNT_UNREAD",',
      '    if not isinstance(n, int):\n'
      '        return V("pr_created", INCONCLUSIVE, "GH_COUNT_UNREAD",',
@@ -4714,12 +4722,12 @@ MUTATIONS = [
      "test_the_report_DISCLOSES_every_input_that_changes_a_verdict"),
     # ── cycle-20 defects ──────────────────────────────────────────────────────────────────
     ("an `ok` gh surface with no created count is graded as a measured zero",
-     '    if not isinstance(n, int) or isinstance(n, bool):\n'
+     '    if not _is_count(n):\n'
      '        return V("pr_created", INCONCLUSIVE, "GH_COUNT_UNREAD",',
      '    if False:\n        return V("pr_created", INCONCLUSIVE, "GH_COUNT_UNREAD",',
      "test_an_ok_gh_surface_with_NO_COUNT_is_UNREAD_not_a_measured_zero"),
     ("an `ok` gh surface with no merged count is graded as a measured zero",
-     '    if not isinstance(n, int) or isinstance(n, bool):\n'
+     '    if not _is_count(n):\n'
      '        return V("pr_merged", INCONCLUSIVE, "GH_COUNT_UNREAD",',
      '    if False:\n        return V("pr_merged", INCONCLUSIVE, "GH_COUNT_UNREAD",',
      "test_an_ok_gh_surface_with_NO_COUNT_is_UNREAD_not_a_measured_zero"),
@@ -4806,7 +4814,7 @@ MUTATIONS = [
      "    if not isinstance(prs, list):\n        prs = []\n    if False:",
      "test_a_payload_that_is_NOT_a_population_is_not_graded"),
     ("a payload whose count contradicts its rows is graded anyway",
-     '    if (not isinstance(gh.get("open_pr_count"), int) or isinstance(gh.get("open_pr_count"), bool)\n            or gh["open_pr_count"] != len(prs)):',
+     '    if (not _is_count(gh.get("open_pr_count"))\n            or gh["open_pr_count"] != len(prs)):',
      "    if False:",
      "test_a_payload_that_is_NOT_a_population_is_not_graded"),
     ("a PR skipped for a known reason is dropped without being counted",
@@ -4868,7 +4876,7 @@ MUTATIONS = [
      '        return d if isinstance(d, list) else None',
      "test_an_EMPTY_gh_response_is_a_failed_read_not_zero_PRs"),
     ("a truncated check-run page is graded as a green rollup",
-     '                if isinstance(total, int) and total > len(runs["check_runs"]):',
+     '                if _is_count(total) and total > len(runs["check_runs"]):',
      '                if False:',
      "test_a_TRUNCATED_check_run_page_is_not_a_green_rollup"),
     ("the header timezone token is dropped and the reading assumes local time",
@@ -5041,16 +5049,14 @@ MUTATIONS = [
      "            exists = (present.strip().endswith(\"YES\")) if rc3 == 0 else None",
      "            exists = False",
      "test_a_log_that_cannot_be_stat_ed_is_unreadable_not_missing"),
-    ("the graded record borrows the age of the record it beat",
-     "    if tok_src == \"state/queue-state\":\n        qs = f.get(\"queue_state\") or {}\n"
-     "        age = qs.get(\"age_s\")",
-     "    if False:\n        qs = f.get(\"queue_state\") or {}\n        age = qs.get(\"age_s\")",
-     "test_the_GRADED_record_cannot_borrow_the_age_of_the_record_it_beat"),
-    ("a start refuted by its own failure line still counts",
-     "        live = [e for e in all_started if _is_this_batch(e)\n"
-     "                and str(e.get(\"issue\")) not in failed_issues]",
-     "        live = [e for e in all_started if _is_this_batch(e)]",
-     "test_a_start_REFUTED_by_its_own_failure_line_is_not_a_live_lane"),
+    ('the graded record borrows the age of the record it beat',
+     '        _raw_age = qs.get("age_s") if qs.get("ok") is True else None',
+     '        _raw_age = 1.0',
+     'test_the_GRADED_record_cannot_borrow_the_age_of_the_record_it_beat'),
+    ('a start REFUTED by its own failure line is counted as a live lane',
+     '        live = [e for e in all_started if _is_this_batch(e)\n                and str(e.get("issue")) not in failed_issues]',
+     '        live = [e for e in all_started if _is_this_batch(e)]',
+     'test_a_start_REFUTED_by_its_own_failure_line_is_not_a_live_lane'),
     ("the PASS prints the batch INTENT count as dispatched",
      "                    len(live), win, refused_txt, spawn_txt))",
      "                    ok.get(\"issue_count\") or 0, win, refused_txt, spawn_txt))",
@@ -5176,7 +5182,7 @@ MUTATIONS = [
      "            \"\"",
      "test_an_UNPARSEABLE_memory_probe_is_INCONCLUSIVE_not_zero_free_mib"),
     ("an ABSENT open_pr_count counts as agreement",
-     '    if (not isinstance(gh.get("open_pr_count"), int) or isinstance(gh.get("open_pr_count"), bool)\n            or gh["open_pr_count"] != len(prs)):',
+     '    if (not _is_count(gh.get("open_pr_count"))\n            or gh["open_pr_count"] != len(prs)):',
      '''    if (isinstance(gh.get("open_pr_count"), int)
             and not isinstance(gh.get("open_pr_count"), bool)
             and gh["open_pr_count"] != len(prs)):''',
@@ -5513,6 +5519,71 @@ def test_a_STRING_false_headroom_ok_does_not_manufacture_an_OOM():
         v = m.check_headroom(facts, cfg)
         assert v.status != m.FAIL, (key, v.status, v.variant, v.detail)
         assert "BELOW_FLOOR" != v.variant, (key, v.variant, v.detail)
+
+
+@test
+def test_every_count_read_shares_ONE_bool_excluding_guard():
+    """`isinstance(True, int)` is true, so a hand-rolled `isinstance(x, int)` at a count site reads a
+    boolean as a number. The field was healed in one arm and re-broken in the next three times
+    (`backlog: true` FAILed in `work_dispatched`, then PASSed in its GREEN arm, then certified a
+    frozen pool as current through the currency gate). This is a SHAPE assertion: every count-like
+    read in the source goes through `_is_count`, because reachability arguments kept missing one."""
+    m = load()
+    src = open(m.__file__).read()
+    assert m._is_count(0) is True and m._is_count(True) is False and m._is_count(0.0) is False
+    hand_rolled = [ln.strip() for ln in src.split("\n")
+                   if "isinstance(" in ln and ", int)" in ln
+                   and not ln.strip().startswith("#") and "_is_count" not in ln
+                   # the helper's own body is the ONE place the rule is spelled out
+                   and ln.strip() != '"""A count is an int and a bool is not a count '
+                                     '(`isinstance(True, int)` is True)."""'[:-0 or None]
+                   and "return isinstance(n, int) and not isinstance(n, bool)" not in ln]
+    assert hand_rolled == [], hand_rolled
+
+
+@test
+def test_a_BOOL_age_is_not_a_current_reading():
+    """`age <= limit` reads `True` as ONE SECOND, so a 3-hour-old `EMPTY` record whose `age_s` was a
+    boolean certified as CURRENT — the frozen-refresh shape defeated from inside the currency gate
+    that exists to catch it."""
+    m = load()
+    cfg = m.cfg_from_dict({})
+    d = fx("idle-empty-pool")
+    d["facts"]["queue_state"]["age_s"] = 3 * 3600.0
+    frozen = dict((v.name, v) for v in m.evaluate(d["facts"], cfg))
+    assert frozen["queue_readable"].variant in ("STATE_FROZEN", "READABLE_STALE"), \
+        frozen["queue_readable"].variant
+    d["facts"]["queue_state"]["age_s"] = True
+    v = m.check_queue_readable(d["facts"], cfg)
+    assert v.variant in ("STATE_FROZEN", "READABLE_STALE", "HEADER_INCOMPLETE"), (v.status, v.variant)
+    # a NON-bool numeric age is still accepted
+    d["facts"]["queue_state"]["age_s"] = 20.0
+    v2 = m.check_queue_readable(d["facts"], cfg)
+    assert v2.variant not in ("STATE_FROZEN", "READABLE_STALE") or v2.status == m.PASS, \
+        (v2.status, v2.variant)
+
+
+@test
+def test_a_refutation_is_scoped_to_the_start_it_can_speak_about():
+    """The refutation set was built from the whole tail with no age and no batch scope, so a
+    `lane_failed` for issue N refuted EVERY later start of N forever: a normal retry (failure 2h ago,
+    start 60s ago) read "no lane spawn was confirmed" while `work_dispatched` PASSed on the same
+    facts, and two delivered FAILs were suppressed into IDLE_NO_WORK."""
+    m = load()
+    cfg = m.cfg_from_dict({})
+    d = fx("healthy")
+    d["facts"]["github"].update({"open_pr_count": 0, "open_prs": [], "prs_created_in_window": 0,
+                                "prs_merged_in_window": 0})
+    d["facts"]["log_events"]["headers"] = []
+    d["facts"]["log_events"]["dispatch_ok"] = []
+    d["facts"]["log_events"]["lane_started"] = [{"issue": 4601, "age_s": 60}]
+    d["facts"]["log_events"]["lane_failed"] = [{"issue": 4601, "age_s": 7200}]
+    busy, why = m._activity(d["facts"], cfg=cfg)
+    assert busy is True and "a lane started" in why, (busy, why)
+    # …but a failure AT OR AFTER the start speaks about it
+    d["facts"]["log_events"]["lane_failed"] = [{"issue": 4601, "age_s": 30}]
+    busy2, why2 = m._activity(d["facts"], cfg=cfg)
+    assert busy2 is not True or "a lane started" not in why2, (busy2, why2)
 
 
 @test

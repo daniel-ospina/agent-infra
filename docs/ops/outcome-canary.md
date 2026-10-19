@@ -465,6 +465,19 @@ Six more (cycle 13), each a case where a datum the tool held was not the one it 
   truthy, so a surface that said its read FAILED was graded as a successful one carrying
   `avail_bytes: 0` and produced `FAIL/BELOW_FLOOR` — a fake OOM emergency on the check whose FAIL
   must mean one. A missing `used_pct` now prints as `used_pct not read`, never as `-1.0% used`.
+- **`_is_count` is the ONLY count guard.** `isinstance(True, int)` is true, and the same field was
+  healed in one arm and re-broken in the next three times in one week: `backlog: true` FAILed in
+  `work_dispatched`, then PASSed in its GREEN arm (`False == 0`), then certified a frozen pool as
+  CURRENT through the currency gate (`age <= limit` reads `True` as one second). Every count-like
+  read in the file now goes through one helper, and a SHAPE test fails the suite if a hand-rolled
+  `isinstance(x, int)` reappears — reachability arguments kept missing one, so the invariant is
+  asserted about the source, not about a chosen input.
+- **A refutation must be scoped to the start it can speak about.** `_activity`'s refutation set was
+  built from the whole log tail with no age bound, so a `lane_failed` for issue N refuted every
+  LATER start of N forever: a normal retry (failure 2h ago, start 60s ago) read "no lane spawn was
+  confirmed" while `work_dispatched` PASSed on the same facts, and two delivered FAILs were
+  suppressed into `IDLE_NO_WORK`. Only a failure for the same issue, carried no older than the
+  start, refutes it.
 - **A measured per-PR failure outranks a population-level abstention.** `landers` graded the
   truncation abstention before `expired`/`missing` were computed, so a full open-PR page turned
   `LANDER_EXPIRED` — "the lander expired silently and the PR waits for a human", the exact failure

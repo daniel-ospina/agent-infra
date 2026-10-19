@@ -1085,8 +1085,8 @@ def check_queue_readable(f, c):
     # ONE facts dict — two checks reading one world in opposite directions, with the FAIL's own
     # evidence line saying "graded from: state/queue-state (it is NEWER than the header token)".
     superseded = (tok["kind"] == "EMPTY" and tok_src == "state/queue-state" and stale is None)
-    if isinstance(backlog, int) and not isinstance(backlog, bool) and backlog == 0 \
-            and isinstance(pair_pool, int) and pair_pool >= c.pool_threshold and not superseded:
+    if _is_count(backlog) and backlog == 0 \
+            and _is_count(pair_pool) and pair_pool >= c.pool_threshold and not superseded:
         return V("queue_readable", FAIL, "EMPTY_WITH_LARGE_POOL",
                  "header: %s\nbacklog=0 while the SAME header had just READ %d issue(s) "
                  "(threshold %d)\ngraded record: %s (pool %s)\n%s"
@@ -1201,7 +1201,12 @@ def _graded_stale(f, c, tok_src):
     limit = _queue_stale_limit(c)
     if tok_src == "state/queue-state":
         qs = f.get("queue_state") or {}
-        age = qs.get("age_s") if qs.get("ok") is True else None
+        # ⛔ A BOOL IS NOT AN AGE. `age <= limit` reads `True` as ONE SECOND, so a 3-hour-old EMPTY
+        # record whose `age_s` was a boolean certified as CURRENT — the #1931 frozen-refresh shape
+        # defeated from inside the gate that exists to catch it.
+        _raw_age = qs.get("age_s") if qs.get("ok") is True else None
+        age = _raw_age if isinstance(_raw_age, (int, float)) and not isinstance(_raw_age, bool) \
+            else None
         src = ("state/queue-state (no epoch, no readable mtime)" if age is None
                else "state/queue-state")
     else:
@@ -1501,7 +1506,10 @@ def check_work_dispatched(f, c):
                  "queue=EMPTY but the header carries no `backlog=` field: %s" % hdr,
                  "an incomplete header cannot establish that the pool was genuinely empty, so "
                  "'nothing to dispatch' is not established. Not green.")
-    if pool_kind == "EMPTY" and (backlog == 0 or superseded_backlog) \
+    # ⛔ `False == 0` IS TRUE. `backlog == 0` accepted a boolean and returned PASS/IDLE_EMPTY_POOL —
+    # a "genuinely EMPTY" pool at exit 0 with no message — from a field that was never a count. The
+    # FAIL arms were healed this cycle; this one, the GREEN one, was left.
+    if pool_kind == "EMPTY" and ((_is_count(backlog) and backlog == 0) or superseded_backlog) \
             and (f.get("queue_state") or {}).get("ok") is True:
         return V("work_dispatched", PASS, "IDLE_EMPTY_POOL", evidence,
                  "nothing was dispatched because the pool was read as genuinely EMPTY — the one "
@@ -1512,8 +1520,8 @@ def check_work_dispatched(f, c):
     # `EMPTY_WITH_LARGE_POOL` arm can never report, because it deliberately pairs the pool with ITS
     # OWN header. This function reads the header's own pair, and says only what that pair shows.
     _pair = parse_queue_token(hdr.get("queue_token") or "") if hdr else {}
-    if isinstance(_pair.get("pool"), int) and _pair.get("pool") >= c.pool_threshold \
-            and backlog == 0 and not superseded_backlog:
+    if _is_count(_pair.get("pool")) and _pair.get("pool") >= c.pool_threshold \
+            and _is_count(backlog) and backlog == 0 and not superseded_backlog:
         return V("work_dispatched", INCONCLUSIVE, "NO_CANDIDATES",
                  evidence + "\nheader pair: pool=%d (above threshold %d) beside backlog=0"
                  % (_pair.get("pool"), c.pool_threshold),
@@ -1568,11 +1576,26 @@ def _activity(f, window_s=None, cfg=None):
     # raw bucket here published "a lane started 3m ago" in the evidence of a FAIL, directly under the
     # check saying the spawn failed. A refuted start leaves the INTENT as the evidence, which is what
     # it always was.
-    refuted = set(str(e.get("issue")) for e in (events.get("lane_failed") or []))
+    def _refutes(fail, start):
+        """Does `fail` refute THIS start? Only a failure for the same issue, no OLDER than the start
+        line, can speak about it — `work_dispatched` scopes the same judgement to the batch and to
+        the batch's age. An unscoped set of issue numbers refuted every LATER start of that issue
+        forever, so a normal retry (failure 2h ago, start 60s ago) read as "no lane spawn was
+        confirmed" while `work_dispatched` PASSed on the same facts."""
+        if str(fail.get("issue")) != str(start.get("issue")):
+            return False
+        fa = fail.get("age_s")
+        if not isinstance(fa, (int, float)) or isinstance(fa, bool):
+            return False
+        sa = start.get("age_s")
+        if not isinstance(sa, (int, float)) or isinstance(sa, bool):
+            return True          # an unageable start cannot outrank a failure for its issue
+        return fa <= sa + 2.0    # the failure came at or after the start line
+    _fails = events.get("lane_failed") or []
     lane_ok = newest_with_age([e for e in (events.get("lane_started") or [])
-                               if str(e.get("issue")) not in refuted], pr_win)
+                               if not any(_refutes(f, e) for f in _fails)], pr_win)
     intent = newest_with_age(events.get("dispatch_ok") or [], pr_win)
-    if isinstance(gh_open, int) and not isinstance(gh_open, bool) and gh_open > 0:
+    if _is_count(gh_open) and gh_open > 0:
         return True, "%d open PR(s) — work in hand, independent of the queue record" % gh_open
     if lane_ok:
         return True, "a lane started %s (the queue record is not the only evidence)" % (
@@ -1606,7 +1629,7 @@ def _activity(f, window_s=None, cfg=None):
     # currency; without this guard an `EMPTY` with no epoch re-granted "the fleet had nothing in hand"
     # while `queue_readable` and `work_dispatched` both said STATE_FROZEN about the same record.
     if (_src == "state/queue-state" and kind == "EMPTY" and _graded_stale(f, cfg, _src) is None
-            and isinstance(backlog, int) and not isinstance(backlog, bool)):
+            and _is_count(backlog)):
         # ⛔ `HEADER_INCOMPLETE` APPLIES HERE TOO. Both siblings refuse to grade an incomplete header
         # (`check_queue_readable` and `check_work_dispatched`: "an incomplete header cannot establish
         # that the pool was genuinely empty"), and this shortcut stands in for exactly that judgement —
@@ -1629,8 +1652,7 @@ def _activity(f, window_s=None, cfg=None):
                       "'the fleet was idle')"
                       % (_src, kind, _age_txt(stale_busy.get("age_s")),
                          stale_busy.get("limit_s"), stale_busy.get("source")))
-    busy = bool((isinstance(backlog, int) and not isinstance(backlog, bool) and backlog > 0)
-                or (isinstance(pool, int) and not isinstance(pool, bool) and pool > 0))
+    busy = bool((_is_count(backlog) and backlog > 0) or (_is_count(pool) and pool > 0))
     if busy:
         return True, "backlog=%s (source: %s, %s) pool=%s (source: %s)" % (
             backlog, backlog_src, age_txt, pool, _src)
@@ -1645,8 +1667,8 @@ def _activity(f, window_s=None, cfg=None):
     # `queue_readable` FAILed QUEUE_PARTIAL — "only some priority tiers were read, so the pool is a
     # SUBSET" — on the same record.
     if (kind not in ("EMPTY", "READ")
-            or not isinstance(backlog, int) or isinstance(backlog, bool)
-            or (kind == "READ" and not isinstance(pool, int))):
+            or not _is_count(backlog)
+            or (kind == "READ" and not _is_count(pool))):
         # ⛔ BOTH HALVES OF THE PAIR ARE REQUIRED. A header with NO `backlog=` field reaches here
         # whenever the EMPTY-supersede shortcut above declined (an incomplete header is not a measured
         # idle), and an int `backlog=0` beside an `EMPTY` is the only shape that supports "nothing in
@@ -1703,7 +1725,7 @@ def check_pr_created(f, c):
     # ⛔ `isinstance(True, int)` IS TRUE: a payload carrying `prs_created_in_window: true` graded
     # PASS/ CREATED with "PRs created in the last 3h: True". `_check_rank` already guards its `id`
     # the same way; a count is an int and a bool is not a count.
-    if not isinstance(n, int) or isinstance(n, bool):
+    if not _is_count(n):
         return V("pr_created", INCONCLUSIVE, "GH_COUNT_UNREAD",
                  "the gh surface answered but carries no prs_created_in_window (got %r)\n%s"
                  % (n, _gh_surface_txt(gh)),
@@ -1716,7 +1738,7 @@ def check_pr_created(f, c):
           "last created: %s\n%s"
           % (win / 3600.0, n, gh.get("open_pr_count"), gh.get("prs_merged_in_window"),
              gh.get("last_created") or "none in the query window", _gh_surface_txt(gh)))
-    if isinstance(n, int) and n > 0:
+    if _is_count(n) and n > 0:
         return V("pr_created", PASS, "CREATED", ev)
     busy, why = _activity(f, cfg=c)
     if busy is None:
@@ -1745,7 +1767,7 @@ def check_pr_merged(f, c):
     # ⛔ AN `ok` SURFACE WITH NO COUNT IS NOT A MEASURED ZERO — see `check_pr_created`. Without this,
     # a payload with no `prs_merged_in_window` reached the `open_n > 0` branch and reported
     # "N PR(s) are open and nothing merged in 3.0h" off a count it never read.
-    if not isinstance(n, int) or isinstance(n, bool):
+    if not _is_count(n):
         return V("pr_merged", INCONCLUSIVE, "GH_COUNT_UNREAD",
                  "the gh surface answered but carries no prs_merged_in_window (got %r)\n%s"
                  % (n, _gh_surface_txt(gh)),
@@ -1753,10 +1775,10 @@ def check_pr_merged(f, c):
     ev = ("PRs MERGED in the last %.2gh: %s\nopen PRs now: %s\nlast merged: %s\n%s"
           % (win / 3600.0, n, open_n, gh.get("last_merged") or "none in the query window",
              _gh_surface_txt(gh)))
-    if isinstance(n, int) and n > 0:
+    if _is_count(n) and n > 0:
         return V("pr_merged", PASS, "MERGED", ev)
     busy, why = _activity(f, cfg=c)
-    _n_is_int = isinstance(n, int) and not isinstance(n, bool)
+    _n_is_int = _is_count(n)
     if (gh.get("merged_page_full") is True
             or (gh.get("merged_page_full") is None and _n_is_int and n >= 100)) \
             and not (_n_is_int and n > 0):
@@ -1778,7 +1800,7 @@ def check_pr_merged(f, c):
         return V("pr_merged", INCONCLUSIVE, "ACTIVITY_UNKNOWN", ev + "\nfleet activity: %s" % why,
                  "whether the fleet had work in hand could not be read, so 'nothing merged' is "
                  "neither a failure nor an idle. Not green.")
-    if isinstance(open_n, int) and not isinstance(open_n, bool) and open_n > 0:
+    if _is_count(open_n) and open_n > 0:
         return V("pr_merged", FAIL, "NO_PR_MERGED", ev + "\nfleet activity: %s" % why,
                  "%d PR(s) are open and nothing merged in %.1fh. Every component can be 'up' while "
                  "the fleet ships nothing — that is this check's whole reason to exist."
@@ -2171,7 +2193,7 @@ def _check_rank(chk, pos):
     completed/started, else list position.
     """
     ident = chk.get("id")
-    if isinstance(ident, int) and not isinstance(ident, bool):
+    if _is_count(ident):
         return (1, float(ident), 0.0, pos)
     ts = 0.0
     for key in ("completedAt", "completed_at", "startedAt", "started_at"):
@@ -2241,7 +2263,7 @@ def check_landers(f, c):
                  % ", ".join(sorted(gh.keys())),
                  "the open-PR population is absent from the payload, so 'every green PR has an armed "
                  "lander' would be asserted over nothing. Not green.")
-    if (not isinstance(gh.get("open_pr_count"), int) or isinstance(gh.get("open_pr_count"), bool)
+    if (not _is_count(gh.get("open_pr_count"))
             or gh["open_pr_count"] != len(prs)):
         return V("landers", INCONCLUSIVE, "GH_UNREADABLE",
                  "gh: open_pr_count=%r but %d row(s) were returned"
@@ -3676,7 +3698,7 @@ def _collect_rest(gh, repo, cfg, now, errors):
             if runs is not None and isinstance(runs.get("check_runs"), list):
                 row["checks_green"] = rollup_is_green(runs["check_runs"])
                 total = runs.get("total_count")
-                if isinstance(total, int) and total > len(runs["check_runs"]):
+                if _is_count(total) and total > len(runs["check_runs"]):
                     # ⛔ A TRUNCATED ROLLUP IS NOT A ROLLUP — the doctrine `page_full` already applies
                     # to the PR list, applied to the checks. The page holds at most 100 runs; a red
                     # run past it is invisible, so page one reading `True` became LANDERS_ARMED on a
