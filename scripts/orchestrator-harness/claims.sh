@@ -547,6 +547,16 @@ claim_orphan_reason() {
   case "$roster" in *" $host "*) printf 'owner host %s is on CLAIM_DEAD_HOSTS' "$host"; return 0 ;; esac
 
   if [ -n "${CLAIM_KNOWN_HOSTS:-}" ]; then
+    # ⛔ THE SENTINEL IS NOT JUDGEABLE FROM A ROSTER EITHER (P1, cycle-14 review). `box` is what every
+    # cell stamps when its `hostname` probe fails, so a roster — even a COMPLETE one — lists the box's
+    # real NAME while that box stamped `box`, and the match below therefore never fires for it:
+    # measured `CLAIM_KNOWN_HOSTS="<realHost> peer1"; claim_orphan_reason "box:999999" <PR ref>` → rc=0
+    # "owner host box is not in CLAIM_KNOWN_HOSTS", i.e. every live claim a probe-blind cell mints is
+    # reaped by any peer with a roster. This is the promise the pid gate already makes ("a sentinel
+    # owner falls through to the HOST rules, which abstain when they cannot judge") and it was false
+    # for this arm. `CLAIM_DEAD_HOSTS` is checked ABOVE, so an explicit `CLAIM_DEAD_HOSTS=box` still
+    # reaps; only the roster's INFERENCE about a fleet-wide name is refused.
+    case "$host" in ''|box) return 1 ;; esac
     roster=" $(printf '%s' "$CLAIM_KNOWN_HOSTS" | tr ',' ' ') "
     # ⛔ A ROSTER THAT DOES NOT NAME THIS BOX IS STALE ABOUT THIS BOX (a rename, or a new cell) and
     # cannot be used to declare a PEER dead: the usual trigger for that staleness IS a rename, so
@@ -565,12 +575,15 @@ claim_orphan_reason() {
       *) case "$real" in ''|box) return 1 ;; esac
          case "$roster" in *" $real "*) ;; *) return 1 ;; esac ;;
     esac
-    # ⛔ A ROSTER IS NOT EVIDENCE ABOUT THIS BOX. The probe-derived REAL name is excluded here because
-    # the staleness guard above is satisfied by the SEAM (which is the identity `claim_host` returns
-    # under a seam), so a roster naming the seam and omitting the real name would otherwise declare the
-    # box's OWN name a stranger — measured: rc=0 for an ISSUE claim stamped `<realHost>:<pid>`.
-    # (`$host = $me` needs no guard here: the roster above already proved it CONTAINS `$me`, so the
-    # `*" $host "*` match below cannot fire for it — an unreachable guard is not worth the line.)
+    # ⛔ A ROSTER IS NOT EVIDENCE ABOUT THIS BOX — BY EITHER OF ITS ANSWERABLE NAMES (P1, cycle-14
+    # review). The staleness guard above can be satisfied by EITHER name (the seam, or the probed real
+    # host), so BOTH need an abstention here: with `CLAIM_OWNER_HOST=seamX` and a roster naming only the
+    # real host, a claim stamped `seamX:<live pid>` passed the guard, failed the `*" $host "*` match
+    # below, and was called ORPHANED — measured rc=0 while the same owner on a PR ref read held-by-live.
+    # A previous version of this comment claimed the `$host = $me` guard was unreachable "because the
+    # roster already proved it contains `$me`"; that reasoning was wrong for exactly this case, and it
+    # was removed on the strength of it. Both guards are back, each pinned by O24.
+    case "$host" in "$me") return 1 ;; esac
     case "$real" in ''|box) ;; *) case "$host" in "$real") return 1 ;; esac ;; esac
     case "$roster" in
       *" $host "*) return 1 ;;

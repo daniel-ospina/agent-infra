@@ -35,9 +35,12 @@
 #      works on a single-box fleet with no configuration at all.)
 #   O15 [partly RED→GREEN] an **ISSUE** claim is NOT reaped by that pid rule: a controller restart
 #      leaves the lane working, so a pid-based reap would delete the shared barrier and re-open the
-#      duplicate. The prune assertions are RED→GREEN (pre-fix nothing reaped on a HOST rule at all, and
-#      they now run BEFORE the acquire re-stamps the claim — see the ⛔ there), and the contrast case —
-#      the SAME dead pid on a PR claim IS pruned — is what makes the exclusion a rule, not a dead branch.
+#      duplicate. ⛔ THE TWO PRUNE ASSERTIONS ARE [PINNED], NOT RED→GREEN — measured, they PASS on the
+#      pre-change tree, vacuously (nothing reaped by a host rule at all, so "does NOT delete" holds for
+#      free); what they guard is the NEW arm not deleting a dead-pid ISSUE claim, and that the prune runs
+#      BEFORE the acquire re-stamps the claim (see the ⛔ there). Only the `held-by-live` token and the
+#      contrast case — the SAME dead pid on a PR claim IS pruned, which is what makes the exclusion a
+#      rule rather than a dead branch — are red→green.
 #   O16 [mostly RED→GREEN] orch-loop's `claim_live()` — the FOURTH call site — applies the same rules,
 #      so a renamed box stops skipping PRs it could work. Driven by sourcing the SHIPPED function
 #      alongside claims.sh; both pre-existing harnesses drive it WITHOUT claims.sh, where the arm is
@@ -90,28 +93,30 @@
 #      below the review window it must outlive — a mid-review expiry, the duplicate this registry
 #      exists to prevent — and leaves nothing to diagnose.
 # ⛔ LABELLING HONESTY — MEASURED, not asserted. `CLAIMS_SH=<pre-change claims.sh> bash
-# claim-orphan.test.sh` (2026-10-19, commit 228233d's claims.sh) reports 53 passed, 54 FAILED.
-# • EVERY [RED→GREEN] line (49 of them) is among those 54 failures — measured, not assumed: zero
-#   [RED→GREEN] assertion passes on the pre-change tree.
-# • The failing lines that carry NO such label are these five, each dependent on machinery the pre-fix
-#   tree does not have:
-#     • `O7 the PR keying declares a documented ceiling` — unlabelled by design (a capability assertion)
-#     • `[PINNED]` O15 `it reads held-by-live` — the token itself is new (pre-fix reason: `held by …`)
-#     • `[PINNED]` O12 `… a roster that names the RUNNING host and omits the holder DOES reap it`
-#     • `[PINNED]` O23 `with an ANSWERABLE identity the roster arm still reaps an unlisted peer`
-#     • `(setup)` O22 `the failing probe really does fall back to the sentinel` — needs `claim_host`
-# ⛔ AND PINNED DOES **NOT** MEAN "passes pre-fix" — measured, 38 lines carrying it PASS there and 3 FAIL.
-# The 38 pass only because the machinery is ABSENT pre-fix (nothing reaped by a host rule at all, and
-# `claim_orphan_reason` does not exist), so every "does NOT delete" / "abstains" assertion holds
-# vacuously — which is why they were RE-LABELLED from [RED→GREEN] after re-measurement: they are not
-# red-to-green, they are the guards that keep the NEW arm from creating a fail-open. The 3 that fail
-# (the held-by-live token, the roster arm, its answerable control) are controls asserting behaviour the
-# pre-fix tree lacks. Read PINNED as: **this guards a new fail-open, it is not a regression of old
-# behaviour**, and read [RED→GREEN] as: **measured red before the change, green after**. 38 assertions
-# were RE-LABELLED [RED→GREEN]→[PINNED] in the cycle that measured them against the pre-change tree;
-# earlier cycles re-labelled others for the same reason (O4's token check, three O15 lines, O17's
-# duplicate check, O18's once-per-process check). Re-measure rather than trusting this paragraph — it
-# is a snapshot of one measurement, not an invariant, and the file grows.
+# claim-orphan.test.sh` (2026-10-19, the claims.sh blob main carries — 228233d == 2ddd5b5a, blob
+# d1604686) reports **53 passed, 61 FAILED** of 114 checks. Broken down by label, on that tree:
+#   • [RED→GREEN]  53 checks — 0 pass, 53 fail. EVERY one is red before the change. (Non-vacuity.)
+#   • [PINNED]      44 checks — 38 pass, 6 fail. The 38 pass VACUOUSLY, because the machinery is
+#     absent pre-fix (`claim_orphan_reason` does not exist and nothing reaped by a host rule at all),
+#     so assertions of the form "does NOT delete" / "abstains" hold for free. They are labelled PINNED
+#     rather than RED→GREEN for exactly that reason: they guard a NEW fail-open, they are not
+#     red-to-green. The 6 that fail are controls asserting behaviour the pre-fix tree lacks.
+#   • unlabelled    17 checks — 15 pass, 2 fail.
+# The 8 failing checks that carry NO [RED→GREEN] label are, by section:
+#     `O7 the PR keying declares a documented ceiling`           (unlabelled by design)
+#     `[PINNED]` O15 `it reads held-by-live`                     (the token itself is new)
+#     `[PINNED]` O12 `… a roster that names the RUNNING host and omits the holder DOES reap it`
+#     `[PINNED]` O23 `with an ANSWERABLE identity the roster arm still reaps an unlisted peer`
+#     `[PINNED]` O24 `a DEAD pid under the same local name IS still orphaned`        (rc=127 pre-fix)
+#     `[PINNED]` O24 `a peer host the roster OMITS is still reaped`                  (rc=127 pre-fix)
+#     `[PINNED]` O24 `an explicit CLAIM_DEAD_HOSTS=box still reaps the sentinel`     (rc=127 pre-fix)
+#     `(setup)`  O22 `the failing probe really does fall back to the sentinel`       (needs claim_host)
+# ⛔ SO PINNED DOES **NOT** MEAN "passes pre-fix", and RED→GREEN does mean "measured red". Read PINNED
+# as: **this guards a new fail-open, it is not a regression of old behaviour**; read [RED→GREEN] as:
+# **measured red before the change, green after**. Every re-labelling in this file's history happened
+# after a measurement contradicted the label (O4's token check, three O15 lines, O17's duplicate check,
+# O18's once-per-process check, and sixteen in cycle 13). Re-measure rather than trusting this
+# paragraph — it is a snapshot of one measurement, not an invariant, and the file grows.
 #
 # HERMETIC: every check builds its own throwaway bare origin (`git init --bare`), so no network, no
 # real origin and nothing outside $T is written — the claim refs die with the temp dir.
@@ -1049,6 +1054,34 @@ ck "O24 [PINNED] a DEAD pid under the same local name IS still orphaned (rc=$(fi
 O24D="$(o24 "peer9:4242" 'refs/claims/9209703-0123456789ab' 'seam24 peer1')"
 [ "$(field "$O24D" RC)" = "0" ]; O24D_RC=$?
 ck "O24 [PINNED] a peer host the roster OMITS is still reaped (rc=$(field "$O24D" RC))" $O24D_RC
+# ⛔ AND THE STALENESS GUARD CAN BE SATISFIED BY EITHER NAME, SO BOTH NEED THE ABSTENTION (P1, cycle-14
+# review). With the seam set and a roster naming the REAL host only, a claim stamped `seam24:<live pid>`
+# passed the guard, failed the `*" $host "*` match, and was called ORPHANED — measured rc=0, while the
+# same owner on a PR ref read held-by-live.
+# ⛔ THE ROSTER MUST CARRY THE REAL HOSTNAME, NOT A PLACEHOLDER (measured: substituting into the OUTPUT
+# left the roster as the literal `REALHOST peer1`, which then failed the staleness guard and abstained
+# for the wrong reason — the case stayed green under the mutation that removes the guard it targets).
+O24E="$(o24 "seam24:$$" 'refs/claims/issue-9209704' "$REAL24 peer1")"
+[ "$(field "$O24E" RC)" = "1" ]; O24E_RC=$?
+ck "O24 [RED→GREEN] under a seam, a roster naming only the REAL host does not reap the seam owner (rc=$(field "$O24E" RC))" $O24E_RC
+# ⛔ AND THE `box` SENTINEL IS NOT JUDGEABLE FROM A ROSTER (P1, cycle-14 review): every cell that loses
+# its `hostname` probe stamps `box`, while any roster lists the box's real NAME — so the match never
+# fires for it and every live claim that cell mints is reaped by any peer holding a roster.
+O24F="$(o24 'box:999999' 'refs/claims/9209705-0123456789ab' "$REAL24 peer1")"
+[ "$(field "$O24F" RC)" = "1" ]; O24F_RC=$?
+ck "O24 [RED→GREEN] the 'box' sentinel is NOT reaped by a roster that names this box's real name (rc=$(field "$O24F" RC))" $O24F_RC
+# control: an explicit `CLAIM_DEAD_HOSTS=box` still reaps — the operator's own statement is not a roster
+# inference, and the deny list is checked above the roster arm.
+O24G="$(
+  CLAIM_REPO="$T/repo"; CLAIM_STATE_DIR="$T/cl24"; CLAIM_OWNER_HOST=seam24
+  CLAIM_KNOWN_HOSTS="$REAL24 peer1"; CLAIM_DEAD_HOSTS="box"
+  export CLAIM_REPO CLAIM_STATE_DIR CLAIM_OWNER_HOST CLAIM_KNOWN_HOSTS CLAIM_DEAD_HOSTS
+  mkdir -p "$CLAIM_STATE_DIR"
+  . "$CLAIMS_SH" || exit 1
+  claim_orphan_reason "box:999999" "refs/claims/9209706-0123456789ab" >/dev/null 2>&1
+  printf "RC=%s\n" "$?" )"
+[ "$(field "$O24G" RC)" = "0" ]; O24G_RC=$?
+ck "O24 [PINNED] an explicit CLAIM_DEAD_HOSTS=box still reaps the sentinel (rc=$(field "$O24G" RC))" $O24G_RC
 
 echo
 echo "─────────────────────────────────────────────────────────────"
