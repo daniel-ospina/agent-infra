@@ -1232,14 +1232,20 @@ def pr_doctor_last_run(state_dir: str | None = None) -> str:
     shows whether the thing that WORKS the queue is alive -- and says RED when it is not. A
     missing record is `UNREPORTED`, never `ok`: absence is not a pass.
     """
-    p = os.path.join(state_dir or os.environ.get("PR_DOCTOR_STATE_DIR") or STATE,
-                     "pr-doctor.status.json")
+    # ONE directory for BOTH reads below: the record AND the disarm marker. The marker arm once
+    # used `state_dir or STATE` while the record used the seam, so on a box that relocates the
+    # state dir the beat read the record from the seam and the marker from $HOME -- and rendered
+    # `RED UNREPORTED (verdict is STALE)` for a dispatcher the operator had deliberately stopped,
+    # while heartbeat-loop.sh (which derives STATE from the seam) said DISARMED. Two readers of
+    # one intentional state must not disagree (#2055 review, cycle 9).
+    state_dir = state_dir or os.environ.get("PR_DOCTOR_STATE_DIR") or STATE
+    p = os.path.join(state_dir, "pr-doctor.status.json")
     # ⛔ A DISARMED DISPATCHER IS NOT A DEAD ONE (2026-10-18, review). `$STATE/PR-DOCTOR-OFF` is the
     # documented way to stop it (heartbeat-loop.sh honours it); the sidecar then stops being written,
     # so an age-bounded reader would print RED every beat forever with no way to tell "the operator
     # turned it off" from "it died" -- a failure manufactured out of an intentional state, on the one
     # token a reader is told to act on. Say DISARMED instead.
-    if os.path.exists(os.path.join(state_dir or STATE, "PR-DOCTOR-OFF")):
+    if os.path.exists(os.path.join(state_dir, "PR-DOCTOR-OFF")):
         return "PR-DOCTOR(last run): DISARMED (PR-DOCTOR-OFF is set)"
     try:
         with open(p) as fh:

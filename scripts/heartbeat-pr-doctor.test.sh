@@ -9,7 +9,8 @@
 #
 # It extracts the block FROM the shipped script (so it tests the real code, not a copy) and drives
 # every state the block must distinguish: DISARMED / ok / RED (rc=2,3,5) / stale / unreadable /
-# missing / dry-run / a reason carrying `|`.
+# missing / dry-run / a reason carrying `|` / a failing scheduled job / a running one / a healthy
+# one / one that recorded no exit code.
 set -u
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -27,16 +28,29 @@ bad() { printf '  FAIL %s\n' "$1"; FAIL=$((FAIL + 1)); }
 # ── the two pieces of the real file under test ───────────────────────────────────────────────
 # 1. the STATE derivation (the seam), 2. the PR-DOCTOR report block, marker to marker.
 grep -E '^STATE=' "$SRC" | tail -1 > "$WORK/state_line.sh"
-# The block's opening line moved when the DISARMED arm landed (main #2056), so match the FIRST
-# conditional of the report and stop at the marker comment that follows it -- never a line number.
-awk '/^  if \[ -f "\$STATE\/PR-DOCTOR-OFF" \]; then/,/^  # The SCHEDULED job is a separate component/' \
-  "$SRC" | sed '$d' > "$WORK/block.sh"
+# ⛔ A UNIQUE MARKER PAIR, NEVER A NEARBY CONDITIONAL (#2055 review, cycle 9). The block is the
+# report only; the DISPATCH path sits a few lines above it and contains `nohup ... launched
+# detached`, so a start pattern that matched a neighbouring `PR-DOCTOR-OFF` test would silently
+# widen the capture to that code -- and sourcing it would SPAWN a real pr-doctor while this test
+# still printed PASS. Measured: that widening turned a 48-line capture into 88 and all 11
+# assertions still passed. The BEGIN/END markers cannot be matched by a neighbour, and the
+# invariant below is a second, independent check that the capture is the report.
+# The END marker sits BELOW the launchd cross-check, so the capture is the WHOLE report: the
+# sidecar verdict and the scheduled job's last-exit status. An end marker above it left that
+# printer untested (see the marker's own comment in heartbeat-loop.sh).
+BEGIN_MARK='PR-DOCTOR VERDICT REPORT (BEGIN)'
+END_MARK='PR-DOCTOR VERDICT REPORT (END)'
+awk -v b="$BEGIN_MARK" -v e="$END_MARK" 'index($0,b){f=1} f && index($0,e){exit} f' \
+  "$SRC" > "$WORK/block.sh"
 if [ ! -s "$WORK/block.sh" ]; then
-  # the pre-DISARMED shape, so this test keeps working on an older checkout
-  awk '/^  if \[ -f "\$STATE\/pr-doctor\.status\.json" \]; then/,/^  # The SCHEDULED job is a separate component/' \
-    "$SRC" | sed '$d' > "$WORK/block.sh"
+  # the pre-marker shape (an older checkout), kept so this test still works there
+  awk '/^  if \[ -f "\$STATE\/PR-DOCTOR-OFF" \]; then/,/^  rc=0$/' "$SRC" | sed '$d' > "$WORK/block.sh"
 fi
-[ -s "$WORK/state_line.sh" ] || { echo "FAIL: no STATE= line in $SRC" >&2; exit 1; }
+# comments are stripped first: the invariant is about EXECUTED code, and a comment may say "nohup"
+if grep -v '^ *#' "$WORK/block.sh" | grep -qE 'nohup|pr-doctor\.lock|launched detached'; then
+  echo "FAIL: extracted the DISPATCH block, not the PR-DOCTOR report block" >&2
+  exit 1
+fi
 [ -s "$WORK/block.sh" ] || { echo "FAIL: cannot extract the PR-DOCTOR block from $SRC" >&2; exit 1; }
 
 run_block() {                       # run_block <record-json|-> [dry]
@@ -44,7 +58,8 @@ run_block() {                       # run_block <record-json|-> [dry]
   : > "$LOG"
   SCRIPTS="$HERE"
   STERR="$WORK/state/err.log"
-  launchctl() { return 0; }         # the cross-check is a macOS-only extra
+  # the scheduled-job cross-check reads `launchctl list`; a case may set LAUNCHCTL_OUT to drive it
+  launchctl() { printf '%s\n' "${LAUNCHCTL_OUT:-}"; }
   # shellcheck disable=SC1090
   . "$WORK/state_line.sh"
   # shellcheck disable=SC1090
@@ -137,6 +152,47 @@ case "$line" in
   *) bad "pipe-reason line was: $line" ;;
 esac
 
+# ── 7b. the SCHEDULED job's last exit is a second, independent RED ─────────────────────────────
+# ⛔ HALF THE REPORT (#2055 review, cycle 10). The block prints the sidecar verdict AND the launchd
+# job's last-exit status, because the dispatcher has two launchers that fail independently -- "the
+# scheduler is dead" must not hide behind "the heartbeat is alive", or the reverse. An end marker
+# placed above this printer left it untested: replacing its printf with `:` kept the suite green.
+LAUNCHCTL_OUT='-	1	com.tortoise.pr-doctor'
+record 0 OK "dispatched 1 of 1 queued (3 open PR(s)) — ok" 30 0 "$REC"
+line="$(run_block)"
+case "$line" in
+  *"PR-DOCTOR LAUNCHD RED (last exit 1)"*) ok "a failing scheduled job prints its own RED" ;;
+  *) bad "launchd-red line was: $line" ;;
+esac
+
+# a RUNNING job's status column is the PREVIOUS run, so it is not a verdict yet -- no line. The
+# fixture carries a NON-ZERO previous status on purpose: with `0` there, the `!= "0"` guard would
+# suppress the line and the `_plpid = "-"` guard (the one this case is about) would go untested.
+LAUNCHCTL_OUT='4321	1	com.tortoise.pr-doctor'
+line="$(run_block)"
+case "$line" in
+  *LAUNCHD*) bad "a running job must not print LAUNCHD RED: $line" ;;
+  *) ok "a running scheduled job is not a verdict" ;;
+esac
+# the two STATUS-COLUMN suppressions: a healthy last exit, and no recorded code at all. The second
+# is a regression that already happened once (the source comment at heartbeat-loop.sh records it),
+# and both were unpinned until this case existed -- the suite then pinned when a line must appear
+# and the pid guard, but not the guards that keep a false RED off a healthy box.
+LAUNCHCTL_OUT='-	0	com.tortoise.pr-doctor'
+line="$(run_block)"
+case "$line" in
+  *LAUNCHD*) bad "a healthy scheduled job must not print LAUNCHD RED: $line" ;;
+  *) ok "a healthy scheduled job prints no LAUNCHD line" ;;
+esac
+
+LAUNCHCTL_OUT='-	-	com.tortoise.pr-doctor'      # `-` = not running, NO last-exit code recorded
+line="$(run_block)"
+case "$line" in
+  *LAUNCHD*) bad "a missing last-exit code must not print LAUNCHD RED: $line" ;;
+  *) ok "a missing last-exit code is not a RED" ;;
+esac
+unset LAUNCHCTL_OUT
+
 # ── 8. the state-dir SEAM: the record is found through PR_DOCTOR_STATE_DIR, not $HOME ────────
 record 3 UNDELIVERED "2 order(s) no lane accepted" 20 0 "$REC"
 line="$(run_block)"
@@ -149,4 +205,4 @@ if [ "$FAIL" -ne 0 ]; then
   echo "FAILED: $FAIL assertion(s)" >&2
   exit 1
 fi
-echo "PASS: heartbeat PR-DOCTOR report block (9 states)"
+echo "PASS: heartbeat PR-DOCTOR report block (13 states)"

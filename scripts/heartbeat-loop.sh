@@ -522,6 +522,14 @@ while :; do
   # that fail independently: this loop (detached child -> sidecar) and launchd (own last-exit
   # status). Both are printed, so "the scheduler is dead" cannot hide behind "the heartbeat is
   # alive" -- or the reverse.
+  # ── PR-DOCTOR VERDICT REPORT (BEGIN) ──────────────────────────────────────────────────────────
+  # ⛔ THE MARKER ABOVE IS AN EXTRACTION ANCHOR, not decoration (#2055 review, cycle 9).
+  # `scripts/heartbeat-pr-doctor.test.sh` sources THIS block and nothing else, and a start pattern
+  # that matched a nearby conditional could silently widen the capture to the DISPATCH path above
+  # (which contains `nohup … launched detached`) -- the test would then SPAWN a real pr-doctor and
+  # still print PASS: a false green over the wrong code, in the change whose subject is exactly
+  # that failure. A unique marker pair cannot be matched by a neighbour, and the test asserts the
+  # capture contains no dispatch verb as a second, independent check.
   # A DISARMED dispatcher is a HEALTHY state, not a RED one (2026-10-18, review): the marker stops the
   # sidecar from being written, so the age bound below would report RED on every pass forever and
   # bury a real failure. Named here, once, in the same vocabulary `objective.py` uses.
@@ -575,16 +583,28 @@ print("%d|%d|%s|%s|%s" % (_r, int(max(0, time.time()-float(d.get("at_epoch") or 
   fi
   # The SCHEDULED job is a separate component: its verdict is final only when it is NOT running
   # (a live pid's second column is the PREVIOUS run's status, so it is not a verdict yet).
+  # ⚠️ KEPT INSIDE THE TEST'S CAPTURE (#2055 review, cycle 10): this cross-check is HALF the report
+  # (the other half is the sidecar above), and an end marker placed before it made the launchd RED
+  # printer silently untested -- replacing its printf with `:` left the suite green.
   _plline=$(launchctl list 2>/dev/null | awk -v l=com.tortoise.pr-doctor '$3==l {print $1" "$2}')
   _plpid=${_plline%% *}
   _plcode=${_plline#* }
   # `-` in the status column means "not running and NO last-exit code recorded", which is not a
   # failure to report as one -- an earlier version printed `LAUNCHD RED (last exit -)`.
-  if [ -n "$_plline" ] && [ "$_plpid" = "-" ] && [ -n "$_plcode" ] && [ "$_plcode" != "0" ] \
-     && [ "$_plcode" != "-" ] && [ "$_plcode" != "$_plline" ]; then
+  #
+  # ⛔ THREE CONJUNCTS WERE REMOVED BECAUSE THEY COULD NOT BE TESTED (#2055 review, cycle 12), and
+  # the measurement is why: `_plline` is `print $1" "$2` from a row that matched `$3`, so a match
+  # always carries TWO non-empty fields -- `[ -n "$_plline" ]`, `[ -n "$_plcode" ]` and
+  # `[ "$_plcode" != "$_plline" ]` were therefore unreachable, and deleting each left the suite
+  # green (measured). A guard that reads as six conditions while only four are verified invites the
+  # next reviewer to re-run the same matrix and conclude dead code is an untested guard. Every
+  # condition below now has a mutation that reds exactly one assertion in
+  # `scripts/heartbeat-pr-doctor.test.sh`.
+  if [ "$_plpid" = "-" ] && [ "$_plcode" != "0" ] && [ "$_plcode" != "-" ]; then
     printf '%s PR-DOCTOR LAUNCHD RED (last exit %s) -- the scheduled job is failing; stdout is %s\n' \
       "$(date '+%m-%d %H:%M:%S')" "$_plcode" "$STATE/pr-doctor.launchd.log" >> "$LOG"
   fi
+  # ── PR-DOCTOR VERDICT REPORT (END) ──
   rc=0
   EL=$(elapsed); SLP=$(( TARGET - EL )); [ "$SLP" -lt 5 ] && SLP=5
   printf '%s PASS done in %ss (target %ss) sleeping %ss\n' \

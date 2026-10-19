@@ -710,9 +710,6 @@ def record_exit(rc: int, reason: str, kind: str | None = None, **extra) -> int:
     also the launchd stdout file), and the same verdict as JSON in `STATUS`, which the heartbeat
     and the beat read on their next pass and print as a RED line. `reason` is REQUIRED and
     positional so a new exit path cannot forget it.
-    the launchd stdout file), and the same verdict as JSON in `STATUS`, which the heartbeat reads on
-    its next pass and prints as a RED line. `reason` is REQUIRED and positional so a new exit path
-    cannot forget it.
 
     ⛔ EXCEPT WHEN THIS RUN IS NOT A PASS. `NOT_A_FLEET_READING` (set once in `main()` for
     `--dry-run` and for `--only`) suppresses the write for EVERY caller, because the verdict is a
@@ -1151,7 +1148,8 @@ def _is_lane_worktree(cand: str, main_real: str = "") -> bool:
     ⛔ ONE RULE, BOTH ARMS (#2055 review, cycle 7). The exclusion of the hub is load-bearing in
     both the map arm and the degraded arm, and it has THREE states to answer, in this order:
 
-      * `.git` is a FILE   -> a linked worktree. ALWAYS a lane, whatever `REPO_DIR` is: when
+      * `.git` is a FILE, or a SYMLINK to a dir -> a linked worktree. ALWAYS a lane, whatever
+                              `REPO_DIR` is: when
                               `REPO_DIR` is itself an out-of-tree worktree (`/tmp/pr1963`), an
                               identity comparison would wrongly exclude the very worktree a live
                               lane is sitting in -- a FALSE un-ownership, whose cost is a second
@@ -1163,7 +1161,14 @@ def _is_lane_worktree(cand: str, main_real: str = "") -> bool:
                               the alternative is refusing every lane on a cell.
     """
     g = os.path.join(cand, ".git")
-    if os.path.isfile(g):
+    # ⛔ A SYMLINKED `.git` IS A LINKED WORKTREE (#2055 review, cycle 8). `isdir()` follows the
+    # link, so a worktree whose `.git` was re-pointed at git's admin dir read as the MAIN checkout
+    # and was refused in BOTH arms -- a FALSE un-ownership, whose cost is a second lane on one
+    # branch. Measured: `git -C <wt> rev-parse --abbrev-ref HEAD` still answers and the worktree
+    # list still reports it, so the map knows it is a lane's worktree while this predicate did not.
+    # A main checkout keeps `.git` as a DIRECTORY (or a FILE under `--separate-git-dir`), never as a
+    # link to a dir.
+    if os.path.isfile(g) or (os.path.islink(g) and os.path.isdir(g)):
         return True
     if os.path.isdir(g):
         return False

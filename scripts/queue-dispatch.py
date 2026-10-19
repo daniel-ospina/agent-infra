@@ -754,24 +754,17 @@ def pr_first_gate(state_dir=None, now_s=None):
     if age > PR_FIRST_MAX_AGE_S:
         print(f"  (priority gate not applied: the pr-doctor record is STALE, {age // 60}m old)")
         return ""
-    # ⛔ A REFUSED PASS STILL MEASURED OWNERSHIP -- AND `rc != 0` IS NOT "NOTHING WAS MEASURED"
-    # (2026-10-18, review; #2055 review, P1). The ownership probe runs BEFORE every refusal, and
-    # rc=5 (NO-CAPACITY), rc=2 (roster/queue UNREADABLE) and rc=3 (UNDELIVERED) all publish
-    # `issue_work: SKIPPED` with a real `un_owned` count. Gating on `rc == 0`, or on `issue_work`
-    # alone, threw that reading away at exactly the moment it matters most: the box over its load
-    # band, or with every lane mid-task, then dispatched NEW ISSUE WORK while un-owned PRs waited --
-    # the owner's priority inverted by the very condition that makes it matter. (The live record on
-    # this box was `RED rc=3 ... no lane accepted`, which an rc-keyed gate ignored.)
-    # So the gate keys on whether an OWNERSHIP READING EXISTS, never on the exit code:
-    # `ownership_read_failed` set (or no `un_owned` field at all) means the probe did not answer.
-    # ⛔ A REFUSED PASS STILL MEASURED OWNERSHIP (#2055 review, P1). The ownership probe runs
-    # BEFORE any refusal, and rc=5 (NO-CAPACITY), rc=2 (roster UNREADABLE) and rc=3 (UNDELIVERED)
-    # all publish `issue_work: SKIPPED` with a real `un_owned` count. Gating on `rc == 0` threw
-    # that reading away at exactly the moment it matters most: the box that is over its load band
-    # or whose lanes are all mid-task then proceeds to dispatch NEW ISSUE WORK with un-owned PRs
-    # waiting -- the owner's priority inverted by the very condition that makes it matter.
-    # So the gate keys on whether an OWNERSHIP READING EXISTS, never on the exit code:
-    # `ownership_read_failed` set (or no `un_owned` field at all) means the probe did not answer.
+    # ⛔ THE GATE KEYS ON WHETHER AN OWNERSHIP READING EXISTS -- NEVER ON THE EXIT CODE, AND NEVER
+    # ON A LIST OF EXITS (#2055 review). When the probe answered, a refusal still carries the
+    # reading (a full box, a blind roster, an undelivered order all measured ownership first), and
+    # gating on `rc == 0` threw it away exactly when the owner's priority mattered most: new issue
+    # work proceeded while un-owned PRs waited. When the probe did NOT answer, no reading exists and
+    # the two checks below say so rather than inventing a verdict.
+    #
+    # ⚠️ DELIBERATELY NOT AN ENUMERATION OF EXITS. Two revisions of this comment listed which exits
+    # publish the reading, and each list was wrong in a different direction -- a missing exit is
+    # invisible to a reader who trusts the list, and the list re-stales on the next exit path. The
+    # durable facts are the two checks: `ownership_read_failed` set, or no `un_owned` field at all.
     if d.get("ownership_read_failed"):
         print("  (priority gate not applied: pr-doctor could not READ ownership this pass)")
         return ""

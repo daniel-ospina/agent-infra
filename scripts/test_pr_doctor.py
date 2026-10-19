@@ -1364,6 +1364,35 @@ def test_the_MAP_arm_refuses_the_hub_when_REPO_DIR_IS_ITSELF_A_WORKTREE(monkeypa
     assert pr._match_pr(str(wt), prs, by, idx)[0] == 5           # ...and the worktree still does
 
 
+def test_a_SYMLINKED_git_still_names_a_lane_worktree(monkeypatch, tmp_path):
+    """⛔ `isdir()` FOLLOWS THE LINK, SO A RE-LINKED WORKTREE READ AS THE HUB (#2055 review, cycle 8).
+
+    A worktree whose `.git` is a SYMLINK to git's admin dir is a real shape (`git worktree add`,
+    then re-point `.git`), and both `git -C <wt> rev-parse --abbrev-ref HEAD` and the worktree list
+    still answer for it -- so the map KNOWS it is a lane's worktree. But `isfile` is False and
+    `isdir` is True for a link to a directory, so it was classified as the MAIN checkout and
+    refused in BOTH arms: a FALSE un-ownership, whose cost is a second lane on one branch. The
+    identity fallback never fires, because a symlink IS stattable.
+    """
+    hub = tmp_path / "hub"
+    hub.mkdir()
+    subprocess.run(["git", "init", "-q", str(hub)], check=True)
+    admin = hub / ".git" / "worktrees" / "9002"
+    admin.mkdir(parents=True)
+    wt = tmp_path / "wt-9002"
+    wt.mkdir()
+    os.symlink(str(admin), str(wt / ".git"))
+
+    prs = [{"number": 9002, "headRefName": "fix/9002-y"}]
+    idx = pr._pr_index(prs)
+    monkeypatch.setattr(pr, "REPO_DIR", str(hub))
+    by = {str(hub): "main", str(wt): "fix/9002-y"}
+    assert pr._match_pr(str(wt), prs, by, idx)[0] == 9002       # the map arm, which is the arm
+    assert pr._match_pr(str(hub), prs, by, idx) == (None, "")    # the hub is still refused
+    # (the degraded arm cannot rebuild an OUT-OF-TREE path at all -- documented in
+    # `_worktree_roots`; the symlink rule is what the map arm needs, and it is what was broken)
+
+
 def test_the_BRANCH_MAP_alone_proves_ownership(monkeypatch):
     """⛔ THE ARM THE MAP EXISTS FOR MUST BE THE ARM THAT IS PINNED (#2055 review, cycle 4).
 
@@ -2169,6 +2198,33 @@ def test_ACCEPTANCE_c_an_unreadable_queue_is_UNREADABLE_and_reaches_health(monke
     line = obj.pr_doctor_last_run(state_dir=str(tmp_path))
     assert "RED rc=2 UNREADABLE" in line, line
     assert "rate limit" in line, line
+
+
+def test_the_SEAM_finds_the_disarm_marker_too_not_just_the_record(monkeypatch, tmp_path):
+    """⛔ TWO READS OF ONE INTENTIONAL STATE MUST NOT DISAGREE (#2055 review, cycle 9).
+
+    The marker arm used `state_dir or STATE` while the record path honoured the
+    `PR_DOCTOR_STATE_DIR` seam. On a box that relocates the state dir the beat therefore read the
+    RECORD from the seam and the MARKER from `$HOME` -- so a dispatcher the operator had
+    deliberately stopped rendered `RED UNREPORTED (verdict is STALE)` in the beat while
+    `heartbeat-loop.sh` (which derives its STATE from the seam) said DISARMED. A false RED,
+    manufactured out of an intentional state, on the one token a reader is told to act on.
+    """
+    spec = importlib.util.spec_from_file_location(
+        "objective_for_seam", pathlib.Path(pr.__file__).with_name("objective.py"))
+    obj = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(obj)
+    seam = tmp_path / "elsewhere" / "state"
+    seam.mkdir(parents=True)
+    (seam / "PR-DOCTOR-OFF").write_text("")
+    (seam / "pr-doctor.status.json").write_text(json.dumps(
+        {"rc": 0, "kind": "OK", "reason": "ok", "at_epoch": time.time() - 9000}))
+    monkeypatch.setenv("PR_DOCTOR_STATE_DIR", str(seam))
+    line = obj.pr_doctor_last_run()                 # the path `build()` actually takes
+    assert "DISARMED" in line, line
+    assert "STALE" not in line, line
+    # and the explicit-argument path agrees with it
+    assert "DISARMED" in obj.pr_doctor_last_run(state_dir=str(seam))
 
 
 def test_ACCEPTANCE_d_rc2_and_rc3_log_distinguishable_messages(monkeypatch):
