@@ -109,24 +109,37 @@ if [ "$ELAPSED" -le 3 ]; then ok "P2 …and it actually STOPPED the child (${ELA
 # next pass measures mid-deletion. GNU `timeout` signals the process group; so must this.
 _timeout 1 sh -c 'sleep 747 & wait' >/dev/null 2>&1; rc=$?
 assert_rc "$rc" 124 "P2 a bounded command whose CHILD holds the work still times out"
-sleep 1
-if pgrep -f 'sleep 747' >/dev/null 2>&1; then
-    bad "P2 the DESCENDANT survived the bound (a grandchild is still running)"
-    pkill -f 'sleep 747' 2>/dev/null || true
+# Poll rather than sleep-and-look: on a loaded box the group kill can land a moment after the parent
+# returns, and a 1s window would report a leak that is only a scheduling delay (measured: this pair went
+# red under a full shard sweep and green on a quiet box, same bytes). The claim is "it does not SURVIVE",
+# not "it dies within one second" — so give it up to 5s and report the wait actually needed.
+_gone=0
+for _i in 1 2 3 4 5 6 7 8 9 10; do
+    pgrep -f 'sleep 747' >/dev/null 2>&1 || { _gone=1; break; }
+    sleep 0.5
+done
+if [ "$_gone" = "1" ]; then
+    ok "P2 …and the descendant did not survive the bound (the bound is a process group, not a single pid)"
 else
-    ok "P2 …and the descendant died with it (the bound is a process group, not a single pid)"
+    bad "P2 the DESCENDANT survived the bound (a grandchild is still running after 5s)"
+    pkill -f 'sleep 747' 2>/dev/null || true
 fi
 
 # ⛔ THE TIMER MUST NOT OUTLIVE THE PROBE. The watchdog's TERM trap can fire in the window between
 # `sleep &` and `s=$!`; the timer then survives for the WHOLE bound, reparented to pid 1 — and the
 # reaper calls this once per candidate.
 for i in 1 2 3 4 5 6 7 8; do _timeout 787 true; done
-sleep 1
-if pgrep -f 'sleep 787' >/dev/null 2>&1; then
-    bad "P2 a fast return LEAKED its timer (orphaned 'sleep 787')"
-    pkill -f 'sleep 787' 2>/dev/null || true
-else
+# Same polling rule as above: the watchdog's own cleanup may need a beat under load.
+_gone=0
+for _i in 1 2 3 4 5 6 7 8 9 10; do
+    pgrep -f 'sleep 787' >/dev/null 2>&1 || { _gone=1; break; }
+    sleep 0.5
+done
+if [ "$_gone" = "1" ]; then
     ok "P2 eight fast returns leaked no timers (the parent owns the timer's group)"
+else
+    bad "P2 a fast return LEAKED its timer (an orphaned 'sleep 787' outlived 5s)"
+    pkill -f 'sleep 787' 2>/dev/null || true
 fi
 
 # The sentinel's whole purpose: 124 means "the bound fired", 137 means "it killed itself". A caller

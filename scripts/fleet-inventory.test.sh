@@ -538,26 +538,26 @@ kill9 $CP $HP "$SCHED" "$Manual"
 say_case "§6b a job with no declared output is judged on its OWN log, and never on silence"
 seed_quiet_box
 mk_proc_script "$O/orch-loop.sh"; CP3="$(spawn_component "$O/orch-loop.sh")"
-mk_plist "com.eldato.disk-reaper" 60 ""            # 60s interval, no StandardOutPath
-: > "$LC_LIST"; printf 'PID\tStatus\tLabel\n-\t0\tcom.eldato.disk-reaper\n' > "$LC_LIST"
+mk_plist "com.tortoise.worktree-reaper" 60 ""            # 60s interval, no StandardOutPath
+: > "$LC_LIST"; printf 'PID\tStatus\tLabel\n-\t0\tcom.tortoise.worktree-reaper\n' > "$LC_LIST"
 # The component's own log, fresh → OK (so the arm is not "always LATE").
-: > "$STATE/disk-reaper.log"
+: > "$STATE/pi-reap-worktrees.log"
 sleep 0.2
 ROWS="$(run_rows 'fleet_rows ""')"
-st="$(state_of "$ROWS" reaper.disk-reaper)"
+st="$(state_of "$ROWS" reaper.worktree-reaper)"
 [ "$st" = "OK" ] && ok "§6b a fresh own-log reads OK even with no declared StandardOutPath" \
                  || bad "§6b a fresh own-log should read OK, got [$st]"
 # …and STALE beyond its own bound → LATE. `touch -t` far in the past, so the bound cannot be luck.
-touch -t 202001010000 "$STATE/disk-reaper.log"
+touch -t 202001010000 "$STATE/pi-reap-worktrees.log"
 ROWS="$(run_rows 'fleet_rows ""')"
-st="$(state_of "$ROWS" reaper.disk-reaper)"
+st="$(state_of "$ROWS" reaper.worktree-reaper)"
 [ "$st" = "LATE" ] && ok "§6b a STALE own-log reads LATE (the 'job stopped being scheduled' state)" \
                    || bad "§6b a stale own-log should read LATE, got [$st]"
 # A job with NO declared output AND no own-log → UNKNOWN, never OK ("not checked" is not green).
 # pr-doctor is the row with no own-log seam, so a plist that declares no output leaves it unprovable.
-rm -f "$STATE/disk-reaper.log"
+rm -f "$STATE/pi-reap-worktrees.log"
 mk_plist "com.tortoise.pr-doctor" 1200 ""
-printf 'PID\tStatus\tLabel\n-\t0\tcom.eldato.disk-reaper\n-\t0\tcom.tortoise.pr-doctor\n' > "$LC_LIST"
+printf 'PID\tStatus\tLabel\n-\t0\tcom.tortoise.worktree-reaper\n-\t0\tcom.tortoise.pr-doctor\n' > "$LC_LIST"
 ROWS="$(run_rows 'fleet_rows ""')"
 st="$(state_of "$ROWS" pr-doctor)"
 [ "$st" = "UNKNOWN" ] && ok "§6b with no freshness signal at all the row is UNKNOWN, never OK" \
@@ -1299,19 +1299,19 @@ seed_quiet_box
 # A job's own freshness bound is `2 × its StartInterval + FLEET_JOB_SLACK_S`. With a 1 s interval the
 # base bound is 2 s, so a ~3 s old log is LATE at slack 0 and OK at the shipped-magnitude slack — the
 # slack is the ONLY thing that moved between the two readings.
-mk_plist "com.eldato.disk-reaper" 1 ""
-printf 'PID\tStatus\tLabel\n-\t0\tcom.eldato.disk-reaper\n' > "$LC_LIST"
-: > "$STATE/disk-reaper.log"
+mk_plist "com.tortoise.worktree-reaper" 1 ""
+printf 'PID\tStatus\tLabel\n-\t0\tcom.tortoise.worktree-reaper\n' > "$LC_LIST"
+: > "$STATE/pi-reap-worktrees.log"
 sleep 3.2
 ROWS="$(run_rows 'FLEET_JOB_SLACK_S=0; fleet_rows ""')"
-st="$(state_of "$ROWS" reaper.disk-reaper)"
+st="$(state_of "$ROWS" reaper.worktree-reaper)"
 [ "$st" = "LATE" ] && ok "§9t FLEET_JOB_SLACK_S=0 makes a 3 s old log LATE against a 2 s derived bound" \
                     || bad "§9t a 3 s old log under a 2 s bound should read LATE, got [$st]"
 ROWS="$(run_rows 'FLEET_JOB_SLACK_S=300; fleet_rows ""')"
-st="$(state_of "$ROWS" reaper.disk-reaper)"
+st="$(state_of "$ROWS" reaper.worktree-reaper)"
 [ "$st" = "OK" ] && ok "§9t …and FLEET_JOB_SLACK_S=300 reads the same log OK (the slack widened the bound)" \
                  || bad "§9t a 3 s old log under a 302 s bound should read OK, got [$st]"
-rm -f "$STATE/disk-reaper.log"
+rm -f "$STATE/pi-reap-worktrees.log"
 
 
 printf '\n%s\n' "──────────────────────────────────────────────"
