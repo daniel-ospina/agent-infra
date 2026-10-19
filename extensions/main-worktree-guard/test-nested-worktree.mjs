@@ -341,6 +341,16 @@ try {
   gg("worktree remove --force café-wt", hub);
   gg("branch -D cafe-br", hub);
 
+  // A22 (#1919 review cycle 4 P2): a `worktree add` whose path arrives at RUN
+  // TIME has no static target to judge — `printf 'e\n' | xargs git -C <hub>
+  // worktree add -b e` was ALLOWED and created the worktree inside the hub.
+  // git errors on a genuinely targetless `add`, so refusing costs nothing real.
+  expectTrue("A22: `xargs git worktree add` (no static target) is REFUSED",
+    typeof nestedWorktreeTargetViolation(`printf 'e\\n' | xargs git -C ${hub} worktree add -b e`, hub) === "string",
+    String(nestedWorktreeTargetViolation(`printf 'e\\n' | xargs git -C ${hub} worktree add -b e`, hub)));
+  expect("A22: …while a VAR-less `worktree list` through xargs is untouched",
+    nestedWorktreeTargetViolation("printf 'x' | xargs git worktree list", hub), null);
+
   // ───────────────────────────────────────────────────────────────────────
   // Part B — real index.ts load + handler-driven gate
   // ───────────────────────────────────────────────────────────────────────
@@ -462,6 +472,13 @@ try {
       const r14b = await bash("git -C $HUBX_1941 worktree add v4 -b v4", hub);
       expectTrue("B14: `git -C $EXPORTED worktree add <rel>` → BLOCKED", blocked(r14b), JSON.stringify(r14b?.reason?.slice(0, 90)));
       delete process.env.HUBX_1941;
+
+      // B15 (#1919 review cycle 4 P1): `$PWD` must be the INVOCATION's frame, not
+      // the session's. `vars` is seeded from the process env, so the env PWD
+      // overrode the frame and `cd <hub> && git worktree add "$PWD/x"` was
+      // ALLOWED, creating the worktree inside the hub.
+      const r15 = await bash(`cd ${hub} && git worktree add "$PWD/esc-pwd" -b escp`, hub);
+      expectTrue("B15: `cd <hub> && git worktree add \"$PWD/x\"` → BLOCKED", blocked(r15), JSON.stringify(r15?.reason?.slice(0, 90)));
 
       // B9: the env hatch still bypasses the new gate (documented in its reason).
       process.env.AGENT_ALLOW_MAIN_EDITS = "1";

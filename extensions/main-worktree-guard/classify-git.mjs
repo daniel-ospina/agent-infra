@@ -6301,7 +6301,14 @@ function _worktreeTargetArg(args, vars, execCwd) {
   }
   const sub = pos[0];
   let target = sub === "add" ? pos[1] : sub === "move" ? pos[2] : null;
-  if (!target) return null;
+  if (!target) {
+    // No static positionals: the path arrives at run time (`xargs`). git errors
+    // on a genuinely targetless `add`, so judging this as unjudgeable blocks no
+    // real use — and returning null here was a fail-open
+    // (`printf 'e\n' | xargs git -C <hub> worktree add -b e`, #1919 cycle 4 P2).
+    if (sub === "add" || sub === "move") return { sub, target: null, raw: "", noTarget: true };
+    return null;
+  }
   if (target === "\u0000") return null;
   // A TILDE target is resolved by the CALLER (two readings — see
   // nestedWorktreeTargetReason), so it is NOT expanded or dropped here.
@@ -6313,7 +6320,11 @@ function _worktreeTargetArg(args, vars, execCwd) {
   // path, so it stays unjudged rather than becoming a false block.
   if (target.includes("$")) {
     const raw = target;
-    const expanded = _expandCdVars(target, { PWD: execCwd ?? process.cwd(), ...(vars || {}) });
+    // PWD AFTER the spread: the walk is seeded with `{...process.env}`, so the
+    // session's PWD would otherwise OVERRIDE the execution frame —
+    // `cd <hub> && git worktree add $PWD/x` was ALLOWED because `$PWD` expanded
+    // to the session's directory instead of the hub (#1919 review cycle 4 P1).
+    const expanded = _expandCdVars(target, { ...(vars || {}), PWD: execCwd ?? process.cwd() });
     // An UNRESOLVABLE variable is NOT "not judged": `target: null` carries the raw
     // text so the caller judges the LITERAL directory prefix it can still name
     // (`./wt-$SUFFIX` is relative in the caller's frame; `.worktrees/wt-$X` is the
@@ -6420,7 +6431,7 @@ export function nestedWorktreeTargetReason(verb, args, execCwd = process.cwd(), 
   const t = _worktreeTargetArg(args, vars, execCwd);
   if (!t) return null;
   if (t.target === null) {
-    return _unjudgeableTargetReason(t.sub, t.raw, execCwd, "shell variable");
+    return _unjudgeableTargetReason(t.sub, t.raw, execCwd, t.noTarget ? "no static target" : "shell variable");
   }
   // A TILDE target has TWO readings and the walker cannot tell them apart after
   // quote-stripping: an UNQUOTED `~/wt` is expanded by the SHELL to `$HOME/wt`,
@@ -6570,7 +6581,8 @@ export function nestedWorktreeTargetViolation(command, sessionCwd = process.cwd(
     let cwd = _resolveCdChain(_homeExpandedChain(inv.cdChain), sessionCwd);
     if (cwd !== null) {
       for (const c of inv.cHints || []) {
-        const ex = _expandCdVars(c, { PWD: cwd, ...(inv.vars || {}) });
+        // Frame wins over the env-seeded `vars` — see the PWD note in _worktreeTargetArg.
+        const ex = _expandCdVars(c, { ...(inv.vars || {}), PWD: cwd });
         if (ex === null) { cwd = null; break; } // unresolvable `-C $VAR` → unplaceable
         cwd = resolve(cwd, ex);
       }
@@ -6586,7 +6598,7 @@ export function nestedWorktreeTargetViolation(command, sessionCwd = process.cwd(
     const t = _worktreeTargetArg(inv.args, inv.vars, sessionCwd);
     if (!t) continue;
     if (t.target === null) {
-      const reason = _unjudgeableTargetReason(t.sub, t.raw, sessionCwd, "shell variable");
+      const reason = _unjudgeableTargetReason(t.sub, t.raw, sessionCwd, t.noTarget ? "no static target" : "shell variable");
       if (reason) return reason;
       continue;
     }
