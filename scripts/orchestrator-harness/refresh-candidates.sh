@@ -1300,6 +1300,16 @@ COLLISION_TTL="${POOL_COLLISION_TTL:-900}"
 case "$COLLISION_TTL" in ''|*[!0-9]*) COLLISION_TTL=900 ;; esac
 COLLIDED_FRESH=" "      # space-hedged, so `case … in *" $N "*)` cannot match a substring of a number
 COLLIDED_NEW=""         # numbers THIS pass found held by a peer
+# ── THE FUNNEL'S PER-REASON COUNTS (agent-infra#2040) ───────────────────────────────────────────
+# `queue=READ(223)` beside `[dispatch] backlog empty` is a CONTRADICTION that hid a total dispatch
+# stop for hours on every cloud cell: the pool was read (223 candidates), the backlog was empty, and
+# nothing in the log said which step ate the 223. Each arm below therefore counts itself, and the
+# pass writes ONE machine-readable line (state/refresh-funnel) that orch-loop.sh prints as the
+# dispatch funnel. The counts SUM to the pool: listed = skipped_checked + skipped_dispatched +
+# judged + not_reached, and judged = queued + collision + landed + unjudged. A count that cannot be
+# reconciled is not published as a decomposition (see the assertion after the loop).
+SKIP_CHECKED=0; SKIP_DISPATCHED=0
+V_QUEUED=0; V_COLLISION=0; V_LANDED=0; V_UNJUDGED=0
 skipped=0               # candidates walked past because a recent pass already found them held
 _now="$(date +%s 2>/dev/null || echo 0)"
 # ⛔ A RECORD MAY NOT DEFER A CANDIDATE FOR LONGER THAN A TTL. This script only ever writes
@@ -1318,8 +1328,8 @@ if [ -r "$COLLISION_LEDGER" ]; then
 fi
 while read -r N; do
   [ -z "${N:-}" ] && continue
-  grep -qx "$N" "$O/checked.txt" 2>/dev/null && continue
-  grep -qx "$N" "$O/dispatched.txt" 2>/dev/null && continue
+  if grep -qx "$N" "$O/checked.txt" 2>/dev/null; then SKIP_CHECKED=$((SKIP_CHECKED + 1)); continue; fi
+  if grep -qx "$N" "$O/dispatched.txt" 2>/dev/null; then SKIP_DISPATCHED=$((SKIP_DISPATCHED + 1)); continue; fi
   # ⛔ STOP ON SLOTS FILLED, OR ON RUNS SPENT — never on "candidates touched". These are the TWO
   # budgets this pass has, and they bound DIFFERENT things: `$LIMIT` slots (a slot is filled only by
   # a verdict that MOVES the head), and `$RUN_BUDGET` pre-flight RUNS (a slot may take many runs to
@@ -1425,6 +1435,7 @@ while read -r N; do
       # A DEGRADED pre-flight short-circuits BEFORE the claim read: the verdict is not trustworthy,
       # so the issue is left unchecked and is neither queued nor certified either way.
       if [ "$degraded" -eq 1 ]; then
+        V_UNJUDGED=$((V_UNJUDGED + 1))
         echo "[refresh] ?#$N CLEAN is DEGRADED (the pre-flight could not query every surface) — not counted as a verdict, left unchecked for the next pass"
       else
         # ── the cross-box ISSUE claim is a BLOCKING surface (agent-infra#1850) ───────────────────
@@ -1471,7 +1482,7 @@ while read -r N; do
               exit "${EXIT_TRANSIENT:-1}"
             fi
             usable=$((usable + 1))
-            QUEUED=$((QUEUED + 1))
+            QUEUED=$((QUEUED + 1)); V_QUEUED=$((V_QUEUED + 1))
             n=$((n + 1))     # a SLOT is filled: this candidate has left the head for good (#1729)
             echo "[refresh] +#$N CLEAN -> backlog" ;;
           1) # a live claim: a peer owns it. Leave it UNCHECKED so the next pass re-attempts it —
@@ -1481,7 +1492,7 @@ while read -r N; do
              # as "judged NOTHING" and aborts rc=1 every cycle, in exactly the cross-box-collision
              # state this check exists for, while the pass has already printed a verdict per candidate
              # (#1853 review). ICR=2 (INCOMPLETE) stays uncounted — that is not a verdict.
-             usable=$((usable + 1))
+             usable=$((usable + 1)); V_COLLISION=$((V_COLLISION + 1))
              # Held by a peer, so the next pass walks past it for free instead of re-buying this
              # verdict — for `POOL_COLLISION_TTL` seconds, after which it is judged again (#1729).
              COLLIDED_NEW="$COLLIDED_NEW$N "
@@ -1489,6 +1500,7 @@ while read -r N; do
           2) # unreadable registry: INCOMPLETE, never CLEAN. Also left unchecked, so the issue is
              # re-attempted rather than lost, and NOT queued, so nothing is dispatched on a guess.
              ICR_INCOMPLETE=$((ICR_INCOMPLETE + 1))
+             V_UNJUDGED=$((V_UNJUDGED + 1))
              echo "[refresh] ?#$N INCOMPLETE — $CLAIM_RESULT; not queued, retried next pass" ;;
           3) # PRESENT BUT STALE: a local, PERMANENT provisioning failure. Refusing per-issue would
              # queue nothing forever while the cell still reported RUNNING (the merge-only defect this
@@ -1498,6 +1510,7 @@ while read -r N; do
              echo "[refresh]   fix: cp scripts/orchestrator-harness/*.sh ~/orchestrator/  (then re-run)"
              exit "${EXIT_NOT_PROVISIONABLE:-3}" ;;
           *) ICR_INCOMPLETE=$((ICR_INCOMPLETE + 1))
+             V_UNJUDGED=$((V_UNJUDGED + 1))
              echo "[refresh] ?#$N INCOMPLETE — the registry returned an UNRECOGNISED verdict (rc=$ICR); not queued, retried next pass" ;;
         esac
       fi ;;
@@ -1509,9 +1522,10 @@ while read -r N; do
       # environment report a healthy `checked N; backlog now 0` — the reading this pass exists to
       # refuse (#1853 review).
       if [ "$degraded" -eq 1 ]; then
+        V_UNJUDGED=$((V_UNJUDGED + 1))
         echo "[refresh] ?#$N COLLISION is DEGRADED (the pre-flight could not query every surface) — not counted as a verdict, left unchecked for the next pass"
       else
-        usable=$((usable + 1))
+        usable=$((usable + 1)); V_COLLISION=$((V_COLLISION + 1))
         COLLIDED_NEW="$COLLIDED_NEW$N "   # a peer holds it: recorded so the next pass skips it (#1729)
         echo "[refresh] =#$N collision — a peer owns it, retried next pass"
       fi ;;
@@ -1523,12 +1537,14 @@ while read -r N; do
       # (canonical arm: tortoise operations/orchestrator-harness/refresh-candidates.sh:266-274, #8560/#8625 —
       # this copy deliberately does NOT carry its landed.txt / answered-pass budget; that half is
       # port-provenance.txt:208, NOT DONE).
-      usable=$((usable + 1))
+      usable=$((usable + 1)); V_LANDED=$((V_LANDED + 1))
       n=$((n + 1))     # a SLOT is filled: the issue has left the pool, so the head moved (#1729)
       echo "[refresh] ~#$N LANDED — already resolved, not queued" ;;
     INCOMPLETE)
+      V_UNJUDGED=$((V_UNJUDGED + 1))
       echo "[refresh] ?#$N INCOMPLETE from the pre-flight (it could not query every surface) — not a verdict, left unchecked for the next pass" ;;
     *)
+      V_UNJUDGED=$((V_UNJUDGED + 1))
       echo "[refresh] ?#$N no verdict from the pre-flight — left unchecked for the next pass" ;;
   esac
   # ── LEARN THIS BOX'S REAL PER-CANDIDATE COST (the pacing estimate is MEASURED, not a guess) ─────
@@ -1543,6 +1559,53 @@ while read -r N; do
     fi
   fi
 done < "$O/.pool"
+# ── THE FUNNEL RECORD ─────────────────────────────────────────────────────────────────────────────
+# Written HERE, before the no-usable-verdict abort below, because the abort is precisely the cycle
+# that used to print `[dispatch] backlog empty queue=READ(223)` with no trace of where 223 went.
+# ONE line, `key=value` pairs, atomic (write+rename) so a reader never sees a torn record and a
+# half-written one cannot be mistaken for a measurement. The counts must RECONCILE — a record that
+# does not add up is reported as UNRECONCILED with both sides, never silently published as truth.
+# This is instrumentation: a failure to write it is logged and does NOT fail the pass (the backlog
+# is the product; the funnel explains it).
+FUNNEL_LISTED="${POOL_ROWS:-}"
+# A plain digit test, not `is_num`: this script defines no such helper and MUST NOT grow a second
+# number parser (selftest extracts it). `wc -l` output is already space-stripped at POOL_ROWS.
+case "$FUNNEL_LISTED" in ''|*[!0-9]*) FUNNEL_LISTED="-" ;; esac
+FUNNEL_NOTREACHED="-"
+if [ "$FUNNEL_LISTED" != "-" ]; then
+  FUNNEL_NOTREACHED=$(( 10#$FUNNEL_LISTED - SKIP_CHECKED - SKIP_DISPATCHED - judged ))
+  [ "$FUNNEL_NOTREACHED" -lt 0 ] && FUNNEL_NOTREACHED=0
+  if [ $(( SKIP_CHECKED + SKIP_DISPATCHED + judged + FUNNEL_NOTREACHED )) -ne "$(( 10#$FUNNEL_LISTED ))" ] \
+     || [ $(( V_QUEUED + V_COLLISION + V_LANDED + V_UNJUDGED )) -ne "$judged" ]; then
+    echo "[refresh] WARN funnel does not reconcile: listed=$FUNNEL_LISTED (skipped_checked=$SKIP_CHECKED skipped_dispatched=$SKIP_DISPATCHED judged=$judged not_reached=$FUNNEL_NOTREACHED) vs judged split (queued=$V_QUEUED collision=$V_COLLISION landed=$V_LANDED unjudged=$V_UNJUDGED)"
+  fi
+fi
+# `reconciled=0` when the parts do NOT sum to the pool. The reader then prints UNRECONCILED instead
+# of a decomposition: a record that does not add up must not be presented as one that does (the WARN
+# below is in the refresh's log, which an operator reading the dispatch line never sees).
+# ⛔ OPTIMISTIC DEFAULT REMOVED (review round 4, finding 7). FUNNEL_OK started at 1 and was only
+# recomputed when `listed` was numeric — so a pass whose pool count was unusable (listed="-")
+# published `reconciled=1` beside a decomposition nothing had checked. Unverified is not reconciled:
+# the flag now starts at 0 and only a numeric pool that passes BOTH checks sets it.
+# ⛔ AND BE HONEST ABOUT WHAT THE POOL CHECK CAN SEE. `not_reached` is DERIVED from the same three
+# numbers, so the pool half cannot detect a row that was never counted at all; what it DOES catch is
+# OVER-counting — one row landing in two skip buckets, or a verdict arm that increments nothing —
+# which is the reachable failure when someone adds a `continue` without a counter. The judged half is
+# the split invariant. Neither check can see a pool row that vanished; the reader's wording says
+# what is verified, not that the pool is provably complete.
+FUNNEL_OK=0
+if [ "$FUNNEL_LISTED" != "-" ]; then
+  [ $(( SKIP_CHECKED + SKIP_DISPATCHED + judged + FUNNEL_NOTREACHED )) -eq "$(( 10#$FUNNEL_LISTED ))" ] \
+    && [ $(( V_QUEUED + V_COLLISION + V_LANDED + V_UNJUDGED )) -eq "$judged" ] && FUNNEL_OK=1
+fi
+FUNNEL_LINE="listed=$FUNNEL_LISTED judged=$judged queued=$V_QUEUED collision=$V_COLLISION landed=$V_LANDED unjudged=$V_UNJUDGED skipped_checked=$SKIP_CHECKED skipped_dispatched=$SKIP_DISPATCHED not_reached=$FUNNEL_NOTREACHED limit=$LIMIT reconciled=$FUNNEL_OK at=$(date +%s)"
+if printf '%s\n' "$FUNNEL_LINE" > "$O/state/.refresh-funnel.$$" 2>/dev/null \
+   && mv "$O/state/.refresh-funnel.$$" "$O/state/refresh-funnel" 2>/dev/null; then
+  echo "[refresh] funnel $FUNNEL_LINE"
+else
+  rm -f "$O/state/.refresh-funnel.$$" 2>/dev/null
+  echo "[refresh] WARN could not record the funnel in $O/state/refresh-funnel — the dispatch line will say UNRECORDED rather than report a decomposition it does not have"
+fi
 # ── persist what this pass learned about HELD candidates (agent-infra#1729) ─────────────────────
 # REWRITTEN, never appended: every record that is still fresh is carried over with its ORIGINAL
 # expiry (re-stamping one this pass did not re-judge would make a held candidate's record permanent),
