@@ -2948,6 +2948,17 @@ fi
 # verdict the cell's `start` gate uses, and orch-loop.sh distinguishes PERMANENT (stop, mark, be
 # loud) from TRANSIENT (retry) — lives in its own hermetic suite. Run it here so `./selftest.sh`
 # stays the one command that pins the harness; run-bash-shards.sh runs it directly in CI too.
+if [ -f "$HERE/merged-not-closed.test.sh" ]; then
+  if bash "$HERE/merged-not-closed.test.sh" > "$TMP/mnc.out" 2>&1; then
+    ck "merged-not-closed.test.sh: repo resolution + the exit-2 fail-closed contract (#8468)" 0
+  else
+    ck "merged-not-closed.test.sh: repo resolution + the exit-2 fail-closed contract (#8468)" 1
+    grep -E 'FAIL' "$TMP/mnc.out" | sed 's/^/      /' | tail -20
+  fi
+else
+  ck "merged-not-closed.test.sh is present (the ported instrument has coverage)" 1
+fi
+
 if [ -f "$HERE/refresh-scout.test.sh" ]; then
   if bash "$HERE/refresh-scout.test.sh" > "$TMP/refresh-scout.out" 2>&1; then
     ck "refresh-scout.test.sh: repo-aware scout provisioning + no silent retry (#1736)" 0
