@@ -35,9 +35,9 @@
 #      works on a single-box fleet with no configuration at all.)
 #   O15 [partly RED→GREEN] an **ISSUE** claim is NOT reaped by that pid rule: a controller restart
 #      leaves the lane working, so a pid-based reap would delete the shared barrier and re-open the
-#      duplicate. The two "prune does not delete / does not name it" assertions are PINNED (nothing
-#      reaped at all pre-fix); the contrast case — the SAME dead pid on a PR claim IS pruned — is the
-#      RED→GREEN half, and it is what makes the exclusion a rule rather than a dead branch.
+#      duplicate. The prune assertions are RED→GREEN (pre-fix nothing reaped on a HOST rule at all, and
+#      they now run BEFORE the acquire re-stamps the claim — see the ⛔ there), and the contrast case —
+#      the SAME dead pid on a PR claim IS pruned — is what makes the exclusion a rule, not a dead branch.
 #   O16 [mostly RED→GREEN] orch-loop's `claim_live()` — the FOURTH call site — applies the same rules,
 #      so a renamed box stops skipping PRs it could work. Driven by sourcing the SHIPPED function
 #      alongside claims.sh; both pre-existing harnesses drive it WITHOUT claims.sh, where the arm is
@@ -80,7 +80,7 @@
 #      below the review window it must outlive — a mid-review expiry, the duplicate this registry
 #      exists to prevent — and leaves nothing to diagnose.
 # ⛔ LABELLING HONESTY — MEASURED, not asserted. `CLAIMS_SH=<git archive HEAD>:claims.sh bash
-# claim-orphan.test.sh` (2026-10-18, against the pre-change claims.sh) reports 42 passed, 40 FAILED.
+# claim-orphan.test.sh` (2026-10-18, against the pre-change claims.sh) reports 43 passed, 40 FAILED.
 # Every [RED→GREEN] line is in that failing set, and so is exactly ONE line that carries no such label:
 # `O7 the PR keying declares a documented ceiling` (a pre-fix reader has no ceiling to declare). The
 # converse is what keeps the labels honest: a [PINNED] line must PASS pre-fix, because PINNED means
@@ -303,20 +303,25 @@ ORIG15="$(mk_origin o15)"; ensure_work_repo "$ORIG15" || { echo "❌ fixture"; e
 as_box "$ORIG15" ctrlbox 'c="$(_claim_commit "ctrlbox:999999" "$(( $(date +%s) + 10800 ))")"
   _git push -q origin "$c:refs/claims/issue-9209450" 2>/dev/null' >/dev/null
 has_ref "$ORIG15" refs/claims/issue-9209450; ck "O15 (setup) an ISSUE claim from a DEAD local pid is planted" $?
+# ⛔ THE PRUNE MUST RUN FIRST, WHILE THE CLAIM STILL CARRIES THE SYNTHETIC DEAD PID (cycle-6 review).
+# Run AFTER the acquire below, that acquire has RE-STAMPED the claim with THIS process's own live pid,
+# so `ps -p` reads "live" and both prune assertions passed even with the issue-key exclusion DELETED —
+# a false green on the one branch that deletes claims. Measured: acquirer-pid == prune-subshell-pid.
+PRUNE15="$(as_box "$ORIG15" ctrlbox 'claim_prune' 2>&1)"
+has_ref "$ORIG15" refs/claims/issue-9209450; P15A=$?
+ck "O15 [RED→GREEN] claim_prune does NOT delete a dead-pid ISSUE claim (ref still on the origin)" $P15A
+printf '%s' "$PRUNE15" | grep -q 'issue-9209450' && PR15=1 || PR15=0
+ck "O15 [RED→GREEN] the prune does not even NAME it as reaped" $PR15
+# ... and the acquire agrees: the claim reads LIVE, so a peer still sees the barrier.
 RESTART="$(as_box "$ORIG15" ctrlbox 'claim_issue_acquire "" 9209450 >/dev/null 2>&1
   printf "RC=%s\nRESULT=%s\n" "$?" "${CLAIM_RESULT:-}"')"
 R15="$(field "$RESTART" RC)"; R15RES="$(field "$RESTART" RESULT)"
 [ "$R15" = "1" ]; R15_RC=$?
 ck "O15 [PINNED] an ISSUE claim with a DEAD local pid is still LIVE (rc=$R15 — a restart must not free the issue) ('$R15RES')" $R15_RC
 case "$R15RES" in
-  *held-by-live*) ok "O15 [RED→GREEN] it reads held-by-live, so a peer still sees the barrier" ;;
-  *) bad "O15 [RED→GREEN] it reads held-by-live (got '$R15RES')" ;;
+  *held-by-live*) ok "O15 [PINNED] it reads held-by-live, so a peer still sees the barrier" ;;
+  *) bad "O15 [PINNED] it reads held-by-live (got '$R15RES')" ;;
 esac
-# AND the prune must agree — it is the arm that actually deletes the ref on a schedule.
-PRUNE15="$(as_box "$ORIG15" ctrlbox 'claim_prune' 2>&1)"
-has_ref "$ORIG15" refs/claims/issue-9209450; ck "O15 [PINNED] claim_prune does NOT delete it (ref still on the origin)" $?
-printf '%s' "$PRUNE15" | grep -q 'issue-9209450' && PR15=1 || PR15=0
-ck "O15 [PINNED] the prune does not even NAME it as reaped" $PR15
 # Non-vacuity for this pair: the SAME dead pid on a PR claim IS reaped by that prune, so the exclusion
 # is specific to the keying and not the whole rule being dead.
 as_box "$ORIG15" ctrlbox 'c="$(_claim_commit "ctrlbox:999999" "$(( $(date +%s) + 7200 ))")"
@@ -725,6 +730,18 @@ FORMERS3="$( cd "$T" || exit 1
 [ "$(printf '%s' "$FORMERS3" | tr -d ' ')" = "boxOldName" ]
 O19E_RC=$?
 ck "O19 [RED→GREEN] under a SEAM the real current hostname is still excluded (got '${FORMERS3}')" $O19E_RC
+# ... AND a seam does NOT excuse the probe from answering (cycle-6 review): with `CLAIM_OWNER_HOST` set
+# and `hostname` blind, an empty `real` subtracted nothing and the machine's OWN current name came back
+# as FORMER — a seam-presenting process reclaiming a real process's claim on the SAME machine.
+FORMERS4="$( cd "$T" || exit 1
+  CLAIM_REPO="$T/repo"; CLAIM_STATE_DIR="$O19H"; CLAIM_OWNER_HOST=seamBox
+  export CLAIM_REPO CLAIM_STATE_DIR CLAIM_OWNER_HOST
+  PATH="$T/bin-nohost:$PATH"; export PATH
+  . "$CLAIMS_SH" || exit 1
+  claim_former_hosts )"
+[ -z "${FORMERS4// /}" ]
+O19F_RC=$?
+ck "O19 [RED→GREEN] a SEAM + a BLIND hostname probe abstains too (got '${FORMERS4}')" $O19F_RC
 
 
 # ══ O20: the PRUNE's unparseable-lease skip is a DELETING branch and was untested ══

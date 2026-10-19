@@ -351,8 +351,14 @@ claim_former_hosts() { # -> space-separated host names this box has used, EXCLUD
   # "FORMER name of this box" — a seam-presenting process would then reclaim a claim minted by a
   # non-seam process on the SAME machine, which is the steal direction this rule's comment claims to
   # close. The real name is never "former" by definition, whoever is presenting as whom.
-  real="$(hostname -s 2>/dev/null)" || real=""
-  [ "$real" != "box" ] || real=""
+  # ⛔ AND THE REAL PROBE MUST ACTUALLY ANSWER — UNDER THE SEAM TOO (agent-infra#2094 cycle-6 review).
+  # Requiring only `cur` left the seam path unguarded: with `CLAIM_OWNER_HOST` set and a `hostname` that
+  # cannot answer, `real` came out empty, so nothing was subtracted and the machine's OWN CURRENT name
+  # read as "a FORMER name of this box" — a seam-presenting process would then reclaim/prune a claim
+  # minted by a real non-seam process ON THE SAME MACHINE. The steal direction, reached through the
+  # seam, in the branch whose comment below says a probe that cannot answer abstains.
+  real="$(hostname -s 2>/dev/null)" || return 0
+  [ "$real" != "box" ] || return 0
   claim_host_record "$cur"
   # ⛔ MUST RETURN 0 EVEN WITH NO FILE. It is called inside a command substitution
   # (`roster=" $(claim_former_hosts) "`) and callers run under `set -e` — a bare `awk` on a missing
@@ -432,7 +438,14 @@ claim_orphan_reason() {
 
   case "$ref" in
     *"/issue-"*) : ;;   # the holder is the controller, not the worker -> the pid answers nothing
-    # ⛔ THE PID RULE IS OPT-IN ON AN EXPLICIT PR KEY, NOT ON "NOT AN ISSUE". `ref` is OPTIONAL, and
+    # ⚠️ THE RESIDUAL THIS ARM ADMITS: the HOST rules run for EVERY keying, so after a rename the first
+  # hourly `claim_prune` frees the renamed box's own IN-FLIGHT ISSUE claims while their chains keep
+  # running — the "the holder is gone but the work is not" shape the pid rule refuses to infer. That is
+  # deliberate: the issue claim exists to make work MUTUALLY EXCLUSIVE, and a barrier held by a name no
+  # box answers to is indistinguishable from an abandoned one for every peer. The consequence is stated
+  # where operators read it (README §7.2b): the guarantee becomes "the next prune", not the lease, and
+  # `dispatched.txt` only protects the SAME box.
+  # ⛔ THE PID RULE IS OPT-IN ON AN EXPLICIT PR KEY, NOT ON "NOT AN ISSUE". `ref` is OPTIONAL, and
     # defaulting to the destructive polarity put the whole duplicate window ONE OMITTED ARGUMENT away:
     # with no ref the `*)` arm judged an issue-keyed owner by its pid and deleted a live lane's shared
     # barrier on a controller restart. A PR ref is `<ns>/<pr>-<sha12>` (a hyphen after the number), so

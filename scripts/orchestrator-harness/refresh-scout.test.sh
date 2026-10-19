@@ -1879,6 +1879,13 @@ if [ -s "$T/dispatchblock.sh" ] && grep -q 'claim_issue_acquire' "$T/dispatchblo
     ( O="$d/o" LOG="$d/log" BATCH=1 OR="acme/widget" REPO="$d/repo" GATE_WHY="" \
       bash -c 'CLAIM_REPO="$REPO"; . "$O/claims.sh"; . "$1"' _ "$T/dispatchblock.sh" ) >/dev/null 2>&1
   }
+  # db_orph <sandbox> — the same drive with a DEAD-host roster, so an ORPHANED claim is reclaimed on the
+  # dispatch path (agent-infra#2094's own repair). Separated because the roster is the input under test.
+  db_orph() {
+    local d="$1"
+    ( O="$d/o" LOG="$d/log" BATCH=1 OR="acme/widget" REPO="$d/repo" GATE_WHY="" CLAIM_DEAD_HOSTS="$2" \
+      bash -c 'CLAIM_REPO="$REPO"; . "$O/claims.sh"; . "$1"' _ "$T/dispatchblock.sh" ) >/dev/null 2>&1
+  }
   # (i) NO claim exists: the issue is claimed, recorded in .batch/dispatched.txt, and the commit this
   #     box pushed is written to state/issueclaim-42 for chain-merge.sh's FENCED release.
   DB1="$T/db-ok"; mkdir -p "$DB1/o/state" "$DB1/repo"
@@ -1900,6 +1907,31 @@ if [ -s "$T/dispatchblock.sh" ] && grep -q 'claim_issue_acquire' "$T/dispatchblo
   one_left="$(git -C "$DB1/repo" ls-remote origin 'refs/claims/*' | wc -l | tr -d ' ')"
   [ "$one_left" = "1" ] && ok "orch-loop dispatch: the claim ref IS on origin (one box can now see it)" \
                          || bad "orch-loop dispatch: expected 1 claim ref on origin, found $one_left"
+  # (i-b) AN ORPHANED CLAIM IS RECLAIMED ON THE DISPATCH PATH, AND THE RECLAIM IS LOGGED (#2094).
+  # ⛔ THIS PIN EXISTS BECAUSE THE BRANCH WAS UNPINNED (cycle-6 review): deleting the `[dispatch] #$ISS
+  # claim $CLAIM_RESULT` line left every suite green, so the ONE signal an operator has that a rename
+  # has been repaired could vanish silently. It is also the incident's exact path: the claim's host is
+  # gone (a DEAD-host roster here), the acquire wins the CAS, and the issue must still be batched.
+  DB4="$T/db-orphan"; mkdir -p "$DB4/o/state" "$DB4/repo"
+  git init -q --bare "$DB4/origin.git"; git init -q "$DB4/repo"
+  git -C "$DB4/repo" remote add origin "$DB4/origin.git"
+  cp "$HERE/claims.sh" "$DB4/o/claims.sh"
+  mk_issue_claim "$DB4" 42 600 deadbox || bad "orch-loop dispatch: could not seed the orphaned claim"
+  printf '42\n' > "$DB4/o/candidates.txt"; : > "$DB4/o/dispatched.txt"
+  db_orph "$DB4" deadbox
+  case "$(tr '\n' ' ' < "$DB4/o/.batch" 2>/dev/null)" in
+    *42*) ok "orch-loop dispatch: an ORPHANED claim is reclaimed and the issue IS batched" ;;
+    *) bad "orch-loop dispatch: an orphaned claim blocked the issue — log: $(cat "$DB4/log" 2>/dev/null)" ;;
+  esac
+  case "$(cat "$DB4/log" 2>/dev/null)" in
+    *"[dispatch] #42 claim "*) ok "orch-loop dispatch: the RECLAIM is logged on the dispatch path (held-by-orphan is visible, not silent)" ;;
+    *) bad "orch-loop dispatch: the reclaim left no log line — log: $(cat "$DB4/log" 2>/dev/null)" ;;
+  esac
+  case "$(cat "$DB4/log" 2>/dev/null)" in
+    *rphan*|*eclaim*) ok "orch-loop dispatch: the log line carries the orphan/reclaim token" ;;
+    *) bad "orch-loop dispatch: the log line does not name the orphan reason" ;;
+  esac
+
   # (ii) a PEER already holds it: NOT batched, NOT in dispatched.txt (so the issue stays in
   #      candidates.txt for the next cycle), and no lane can be spawned for work another box owns.
   DB2="$T/db-held"; mkdir -p "$DB2/o/state" "$DB2/repo"

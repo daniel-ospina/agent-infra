@@ -1364,7 +1364,7 @@ alive**; the dispatcher printed `held by …` for each and then `backlog empty q
 
 | rule | when it fires | why it cannot steal a live peer |
 |---|---|---|
-| **own former names** | the owner host is a name THIS box has carried (`state/claim-hosts`) | the list only ever holds names this box answered to (written from the real `hostname -s`, never from a seam) — nothing ships a roster, so this is what makes a rename self-heal |
+| **own former names** | the owner host is a name THIS box has carried (`state/claim-hosts`) | the list only ever holds names this box answered to (written from the real `hostname -s`, never from a seam), and it requires the `hostname` probe to answer — a blind probe abstains. Nothing ships a roster, so this is what makes a rename self-heal. ⚠️ **Read the residual in the next paragraph: this rule runs for EVERY keying, so it can free an in-flight ISSUE claim.** |
 | **local pid** | the owner host IS this host and `ps -p <pid>` says the pid is gone | **PR claims ONLY.** A PR claim is minted by the worker (`merge-one`/`fix-one`), so its pid IS the worker. An ISSUE claim is minted by the CONTROLLER and released by the CHAIN, so a controller restart (every deploy) would have this delete a live lane’s barrier and re-open the duplicate — the rule is keyed, not global. It also needs a control probe (`ps -p $$`) to prove `ps` can answer at all; an instrument failure abstains, never steals |
 | **`CLAIM_DEAD_HOSTS`** | the owner host is listed | an explicit deny list — a mis-entry over-reaps only the host it names |
 | **`CLAIM_KNOWN_HOSTS`** | the roster is SET, **names this box**, and does not list the owner host | a roster that does not name this box is stale (its usual cause is the very rename) and **abstains**; an unset roster never means "every peer is dead" |
@@ -1382,6 +1382,18 @@ name can only be recognised as *former* if the box recorded it while that name w
 the recorder did not exist before this change — so the leases the incident measured (including the
 literal `9768s left` line above) are cleaned up ONCE by `CLAIM_DEAD_HOSTS=<old-name>` / a hand
 release, after which the mechanism holds. Stated because "self-healing" reads as "retroactive".
+
+⚠️ **THE HOST RULES RUN FOR EVERY KEYING, AND THAT HAS A CONSEQUENCE WORTH STATING PLAINLY.** They
+answer "is the holder a live LANE?", and a name that no box answers to is dead *as an identity* — but
+the holder and the work are different processes for an ISSUE claim (the controller mints it, the lane's
+chain works and releases it). So after a rename, the first hourly `claim_prune` on the renamed box
+**frees its own in-flight ISSUE claims while their chains keep running**, and a peer may then dispatch
+the same issue. That is accepted rather than fixed: a barrier held by a name nobody answers to is
+indistinguishable from an abandoned one for every peer, so the alternative is a claim nothing can ever
+reclaim (the incident). The guarantee is therefore **"the claim is safe until the next prune"**, not
+"until the lease expires" — and `dispatched.txt` protects only the box that wrote it. If you rename a
+box with lanes in flight, expect the next prune to free their issue claims and let them finish; the PR
+keying (where the minting pid IS the worker) is unaffected.
 
 An orphaned holder is reclaimable **regardless of `lease_until`**, the pre-flight reports it CLEAN
 (the CAS still has to be won), and `claim_prune` reaps it. An **unparseable** lease keeps its
