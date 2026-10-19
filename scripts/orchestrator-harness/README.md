@@ -2444,7 +2444,6 @@ reader must take the answer from the instrument that CAN. A future consumer shou
 `doctor` for the box's shape, `check-single-source` for the bytes, and `check-deployed-drift` for
 the audited history — and if a green verdict is needed from all three, deploy with a stamp, which is
 what `install.sh`/`harness.sh deploy` write.
-| `timeout(1)` | absent — `run_agent` uses a bash `wait` + watchdog | present, but the same fallback is used |
 
 `install.sh` is macOS-only **on purpose** and says so; on Linux it names the cell supervisor rather
 than dying with no next step. Ask any box which branch it is on:

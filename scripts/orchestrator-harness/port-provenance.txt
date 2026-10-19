@@ -223,10 +223,14 @@
 #                 shipped helper while still reporting green.
 # ⛔ ── FORMERLY "NOT DONE, AND NOT BLOCKED" — NOW DONE (2026-10-19) ─────────────────────────────
 #   refresh-candidates.sh + merged-not-closed.sh  #8469/#8565/#8629/#8645 — the SECOND pass of this
-#     reconciliation (`.prio`, landed.txt, the answered-pass budget, RETRY_MAX). This note used to say
-#     NOTHING held these two files, so it was scope the earlier pass did not reach. RESOLVED 2026-10-19:
-#     `.prio` + merged-not-closed.sh were ported with the retirement; landed.txt / RETRY_MAX were ported
-#     in the SAME change after review found them STILL ABSENT while the tortoise copy was being deleted.
+#     reconciliation (landed.txt, RETRY_MAX). This note used to say NOTHING held these two files, so
+#     it was scope the earlier pass did not reach. RESOLVED 2026-10-19: merged-not-closed.sh was ported
+#     with the retirement; landed.txt / RETRY_MAX were ported in the SAME change after review found
+#     them STILL ABSENT while the tortoise copy was being deleted. ⛔ `.prio` (the BP0 rank map) is NOT
+#     part of this pass — it was superseded by main's unconditional drain rule and dropped; see the
+#     2026-10-19 entry below. The "answered-pass budget" named here was never ported either and has no
+#     counterpart in the tree: it is listed so a future reader does not go looking for a fix that
+#     exists nowhere.
 #     ⛔ That ordering was the defect: the retirement's premise ("every fix was ported first") was FALSE
 #     for this file, so the first cut of it deleted the only copy of the landed.txt half. The port now
 #     precedes the deletion; `selftest.sh` drives landed.txt write/skip/report/prune and the RETRY_MAX

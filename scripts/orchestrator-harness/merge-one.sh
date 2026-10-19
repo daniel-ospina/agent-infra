@@ -757,7 +757,13 @@ for c in rows:
     KIND="$(verdict_kind "$LAST")"
     if [ "$KIND" = "issues" ]; then
       MARK="$(apply_verdict_marker "$KIND" "${HEAD:-}")"
-      echo "[merge $PR] ISSUES at head=$HEAD — needsfix marker ${MARK:-(NOT recorded; fixer still authorised by the verdict, not by the marker)}" >> "$L.log"
+      # ⛔ THE FALLBACK TEXT NAMES WHAT ACTUALLY HAPPENS WHEN THE MARKER IS MISSING (review P2,
+      # cycle 3). It said "fixer still authorised by the verdict, not by the marker" — which is not how
+      # the loop works: `orch-loop.sh` decides with a FILE TEST (`[ -f $O/state/needsfix-<PR>-<head> ]`),
+      # so a missing marker sends the PR to the RE-RECORD arm (a fresh review), never to a fixer. The
+      # old wording would have an operator believe the findings were handed to a repair lane while the
+      # PR actually sat waiting for another review.
+      echo "[merge $PR] ISSUES at head=$HEAD — needsfix marker ${MARK:-(NOT recorded — the loop\047s needsfix FILE TEST will not see it, so this PR is NOT handed to a fixer: it falls to the re-record arm, i.e. another fresh review)}" >> "$L.log"
     else
       echo "[merge $PR] NO VERDICT (stall/crash/timeout, NOT 'issues') — no needsfix marker, no fixer; re-dispatched as a review, not repaired as a defect" >> "$L.log"
     fi

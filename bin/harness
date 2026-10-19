@@ -72,12 +72,28 @@ case "$PLATFORM" in
   darwin)
     SUP_INSTALLER="scripts/orchestrator-harness/install.sh"
     if command -v launchctl >/dev/null 2>&1; then
-      if launchctl print "gui/$(id -u)/com.eldato.orchestrator-loop" >/dev/null 2>&1; then
-        SUP="launchd"; SUP_EVIDENCE="job com.eldato.orchestrator-loop is loaded"
-      elif launchctl list 2>/dev/null | grep -q 'com\.eldato\.'; then
-        SUP="launchd"; SUP_EVIDENCE="launchd holds a com.eldato.* job (not the default label)"
+      # ⛔ A `com.eldato.*` JOB IS NOT THE HARNESS'S JOB — and the bare grep was the SAME defect this
+      # file closes ten lines below for Linux (review P1, cycle 3). It does not even need an edge case
+      # to reproduce: this repo SHIPS eight `com.eldato.*` launchd templates and pi-bootstrap installs
+      # several of them hourly, so on any fleet Mac the grep matched unconditionally, SUP read
+      # `launchd`, the "no supervisor is drift" arm was skipped, and doctor could print "everything this
+      # box can verify is consistent" with `com.eldato.orchestrator-loop` not loaded at all.
+      # Three rules, the same three as the Linux arm: the label must be the ORCHESTRATOR's (report.sh
+      # scopes the same read to `/orchestrator/`), the job must be RUNNING (line 2 of `launchctl
+      # list` is the PID, and `-` means loaded-but-not-running — report.sh records that measurement),
+      # and `launchctl print` answering is LOADED, not running, so it is only the fallback evidence.
+      _ll="$(launchctl list 2>/dev/null | awk '$3 ~ /orchestrator/ { print $1" "$3 }' || true)"
+      _run="$(printf '%s\n' "$_ll" | awk '$1 ~ /^[0-9]+$/ { print; exit }')"
+      _any="$(printf '%s\n' "$_ll" | awk 'NF { print; exit }')"
+      if [ -n "$_run" ]; then
+        SUP="launchd"; SUP_EVIDENCE="job ${_run#* } is RUNNING (pid ${_run%% *})"
+      elif [ -n "$_any" ]; then
+        # LOADED BUT NOT RUNNING is the state report.sh refuses to call UP, and it is drift here too.
+        SUP_EVIDENCE="job ${_any#* } is LOADED but has NO PROCESS (launchctl shows pid '-') — the controller is not running"
+      elif launchctl print "gui/$(id -u)/com.eldato.orchestrator-loop" >/dev/null 2>&1; then
+        SUP_EVIDENCE="com.eldato.orchestrator-loop is loaded but not listed as running (launchctl print answers for it)"
       else
-        SUP_EVIDENCE="launchctl present, no com.eldato.* job loaded"
+        SUP_EVIDENCE="launchctl holds no orchestrator job"
       fi
     else
       SUP_EVIDENCE="launchctl not on PATH"; unknown_note
@@ -130,7 +146,12 @@ case "$PLATFORM" in
         [ -n "$_c" ] && [ -x "$_c" ] && { _sup_sh="$_c"; break; }
       done
       if [ -n "$_sup_sh" ]; then
-        _st="$(O="${O_DIR:-}" REPO="${REPO_ROOT:-}" "$_sup_sh" status 2>&1 | head -1 || true)"
+        # ⛔ PASS THE AMBIENT `REPO` THROUGH, DON'T SUBSTITUTE THE CANONICAL CHECKOUT'S (review P2,
+        # cycle 3). `${REPO_ROOT:-}` overrode whatever repo the operator was asking about, so a
+        # supervisor asked `O=… REPO=<agent-infra checkout>` reported on the WRONG queue while its
+        # evidence line looked authoritative. `report.sh` passes the ambient `REPO` and so does this
+        # now — the comment above claimed that sameness, and it was false.
+        _st="$(O="${O_DIR:-}" REPO="${REPO:-}" "$_sup_sh" status 2>&1 | head -1 || true)"
         case "$_st" in
           *"controller: RUNNING"*) SUP="process"; SUP_EVIDENCE="cloud-cell-supervisor.sh status → ${_st#*controller: }" ;;
           *"controller: STOPPED"*) SUP_EVIDENCE="cloud-cell-supervisor.sh status → STOPPED (the supervisor script is present, no controller running)" ;;

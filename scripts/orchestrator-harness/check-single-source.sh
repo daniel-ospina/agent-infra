@@ -129,7 +129,7 @@ for fork in ${FORKS[@]+"${FORKS[@]}"}; do
   # exited 0. The scope is part of the answer, on the same line, in every mode (including --quiet,
   # which suppresses note() — hence the plain echo). The set stays curated: `merge-one.sh` is the
   # DELIBERATE exclusion named on the same line, and the deployed arm byte-compares every `*.sh`.
-  [ "$fork_files" -eq 0 ] && echo "ok: $fork holds none of the ${checked_canon} fork-arm files ($(printf '%s\n' $SHARED | paste -sd, - 2>/dev/null || printf '%s\n' $SHARED | tr '\n' ',')) — merge-one.sh deliberately excluded (tortoise keeps the only copy of the unported #8484/#8589 fix, README §11); the other files are covered by the --o byte arm"
+  [ "$fork_files" -eq 0 ] && echo "ok: $fork holds none of the ${checked_canon} fork-arm files ($(printf '%s\n' $SHARED | paste -sd, - 2>/dev/null || printf '%s\n' $SHARED | tr '\n' ',')) — merge-one.sh deliberately excluded (tortoise keeps the only copy of the unported #8484/#8589 fix, README §11). SCOPE: this arm looks ONLY at those files, at the paths you passed; a fork of any OTHER harness script at a retired path is NOT detected by it — that needs the path named here as a --fork target too (no filesystem walk on purpose, #1069)"
 done
 
 # ── 3. THE DEPLOYED COPY IS THE SAME BYTES ───────────────────────────────────────
