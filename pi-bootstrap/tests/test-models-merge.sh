@@ -38,8 +38,11 @@
 #       state, leaves that state intact and reports it — (a)-(g) alone would not notice a
 #       setup.sh that kept the refusal but merged per-provider again.
 #
-# Hermetic: temp fixtures only, no network, no live ~/.pi. Nothing outside $TMP is
-# written (the repo is read-only here).
+# Hermetic: temp fixtures only, no network, no live ~/.pi, and no writes outside $TMP — the
+# end-to-end leg (h) stubs `pi` as well as `npm`/`launchctl` for exactly that reason: setup.sh shells
+# out to scripts/patch-pi-retry.sh, which resolves the REAL pi install through `command -v pi` /
+# `npm root -g` and rewrites its dist. Without the pi stub, running this suite patched the globally
+# installed package (#1878 review P2).
 #
 # Usage:  bash pi-bootstrap/tests/test-models-merge.sh
 # Exit:   0 = all assertions passed, 1 = at least one failure.
@@ -332,12 +335,84 @@ fi
 # pins the WIRING — a setup.sh that kept its refusal but merged per-provider again
 # would pass both. This leg runs the real setup.sh against a live file carrying a
 # live-only model, provider and override key, and reads the result back.
+# ── (i)/(j)/(k): the write is ATOMIC and unpreservable shapes are REFUSED (#1878 review) ──
+echo "== (i) a FAILED WRITE must leave the live file byte-identical (the P0) =="
+# The live file is the ONLY copy (the .bak-bootstrap snapshot is first-run-only), so a write that dies
+# part-way is the #682 loss class restored in full. `ulimit -f` makes the write fail with EFBIG, which
+# is the same code path as ENOSPC: it used to leave `open(path,"w")`'s truncation behind.
+BIG="$TMP/big.json"
+python3 - "$BIG" <<'PY_BIG'
+import json, sys
+models = [{"id": "m%04d" % i, "contextWindow": 1000 + i} for i in range(400)]
+json.dump({"providers": {"p": {"models": models}}}, open(sys.argv[1], "w"), indent=2)
+PY_BIG
+BIG_BEFORE="$(cksum < "$BIG")"
+( ulimit -f 2; python3 "$MERGE" "$SHIPPED" "$BIG" ) >"$TMP/i.out" 2>&1
+rc=$?
+if [ "$rc" -ne 0 ]; then ok "(i) a failed write exits non-zero"; else fail "(i) a failed write exited 0"; fi
+grep -q "live file is UNCHANGED" "$TMP/i.out" \
+  && ok "(i) the failure NAMES that the live file is unchanged" \
+  || { fail "(i) the failure did not say the live file is unchanged"; sed -n 1,5p "$TMP/i.out" >&2; }
+[ "$(cksum < "$BIG")" = "$BIG_BEFORE" ] \
+  && ok "(i) the live file is BYTE-IDENTICAL after a failed write" \
+  || fail "(i) the live file was MODIFIED by a failed write — this is the P0"
+python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$BIG" \
+  && ok "(i) ... and it still PARSES (a truncated file would not)" \
+  || fail "(i) the live file no longer parses after a failed write"
+if ls -a "$TMP" | grep -q '^\.models\.json\..*\.tmp$'; then
+  fail "(i) a temp file was left behind by the failed write"
+else
+  ok "(i) no temp file is left behind by the failed write"
+fi
+
+echo "== (j) a live \`models\` that is NOT an array is refused, not replaced =="
+SHAPE="$TMP/shape.json"
+printf '{"providers":{"deepseek":{"models":{"x":{"id":"x"},"y":{"id":"y"}}}}}' > "$SHAPE"
+python3 "$MERGE" "$SHIPPED" "$SHAPE" >"$TMP/j.out" 2>&1
+rc=$?
+if [ "$rc" -ne 0 ]; then ok "(j) a non-array live \`models\` exits non-zero"; else fail "(j) a non-array live \`models\` exited 0"; fi
+grep -q "cannot preserve" "$TMP/j.out" \
+  && ok "(j) the refusal says the merge cannot preserve it" \
+  || fail "(j) the refusal does not explain itself"
+grep -q 'models is dict' "$TMP/j.out" \
+  && ok "(j) the refusal NAMES the shape it found" \
+  || fail "(j) the refusal does not name the shape"
+grep -q '"x"' "$SHAPE" && grep -q '"y"' "$SHAPE" \
+  && ok "(j) the live entries were NOT dropped" \
+  || fail "(j) the live entries were dropped"
+
+echo "== (k) the happy path still writes atomically and keeps the file's mode =="
+ATOM="$TMP/atom.json"
+cp "$TMP/live.json" "$ATOM"
+chmod 640 "$ATOM"
+python3 "$MERGE" "$SHIPPED" "$ATOM" >"$TMP/k.out" 2>&1
+rc=$?
+if [ "$rc" -eq 0 ]; then ok "(k) the merge exits 0"; else fail "(k) the merge exited $rc"; fi
+python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$ATOM" \
+  && ok "(k) the result parses" || fail "(k) the result does not parse"
+[ "$(stat -c '%a' "$ATOM" 2>/dev/null || stat -f '%Lp' "$ATOM")" = "640" ] \
+  && ok "(k) the live file's MODE is preserved (mkstemp's 0600 would break other-user consumers)" \
+  || fail "(k) the live file's mode changed"
+grep -q "preserved 4 live-only model(s)" "$TMP/k.out" \
+  && ok "(k) the live-only entries are still preserved" \
+  || fail "(k) the live-only entries were not preserved"
+if ls -a "$TMP" | grep -q '^\.models\.json\..*\.tmp$'; then
+  fail "(k) a temp file was left behind by a successful write"
+else
+  ok "(k) no temp file is left behind by a successful write"
+fi
+
 echo "== (h) end-to-end: the real setup.sh preserves live-only state"
 STUB="$TMP/stub-bin"
 mkdir -p "$STUB"
 printf '#!/bin/bash\nexit 0\n' > "$STUB/npm"
 printf '#!/bin/bash\necho "UNEXPECTED launchctl call: $*" >> "${LAUNCHCTL_LOG:-/dev/null}"\nexit 99\n' > "$STUB/launchctl"
-chmod +x "$STUB/npm" "$STUB/launchctl"
+# ⛔ `pi` MUST be stubbed too. scripts/patch-pi-retry.sh resolves the real install through
+# `command -v pi` and rewrites `<pkg>/dist/core/agent-session.js`; a stub that resolves to nothing
+# makes the patch step say "pi package not found" and exit 1, which setup.sh treats as a warning — so
+# the leg stays hermetic without changing what it is testing.
+printf '#!/bin/bash\nexit 0\n' > "$STUB/pi"
+chmod +x "$STUB/npm" "$STUB/launchctl" "$STUB/pi"
 HOME5="$TMP/home5"
 mkdir -p "$HOME5/.pi/agent"
 cp "$TMP/live.json" "$HOME5/.pi/agent/models.json"

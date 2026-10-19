@@ -45,7 +45,9 @@ Exit:   0 = merged (the live path was written); 1 = refused (nothing written);
 
 import json
 import os
+import shutil
 import sys
+import tempfile
 
 
 def _str_id(entry):
@@ -179,6 +181,27 @@ def lost_entries(dst, merged):
     return lost
 
 
+def _unpreservable_shapes(live):
+    """Live provider `models` values this merge would DROP rather than extend.
+
+    A non-list `models` (an old id->definition MAP, a string, a number) is not something the merge can
+    extend, and coercing it to `[]` both drops it and hides the drop from `lost_entries`. Named
+    explicitly so the refusal says what to fix.
+    """
+    out = []
+    if not isinstance(live, dict):
+        return out
+    providers = live.get("providers")
+    if not isinstance(providers, dict):
+        return out
+    for name, dp in providers.items():
+        if not isinstance(dp, dict):
+            continue
+        if "models" in dp and dp["models"] is not None and not isinstance(dp["models"], list):
+            out.append("provider:%s: models is %s, not an array" % (name, type(dp["models"]).__name__))
+    return out
+
+
 def _read_json(path):
     with open(path) as fh:
         text = fh.read().strip()
@@ -194,6 +217,25 @@ def main(argv):
     dst = _read_json(dst_path) if os.path.exists(dst_path) else {}
     merged, report = merge(src, dst)
 
+    # ⛔ A live `models` that is not a list cannot be MERGED, only replaced — and both the merge and
+    # `lost_entries` coerced it to `[]`, so the guard re-derived the invariant with the same coercion
+    # the merge used and could never see the loss (#1878 review P2). Refuse the shape rather than
+    # silently replace it: the docstring's contract is "every model id present live is present after",
+    # and for this shape the honest answer is that the merge cannot honour it.
+    unpreservable = _unpreservable_shapes(dst)
+    if unpreservable:
+        sys.stderr.write(
+            "ERROR: refusing to write %s — the live file holds model entries this merge cannot preserve (#682):\n"
+            % dst_path
+        )
+        for item in unpreservable:
+            sys.stderr.write("  - %s\n" % item)
+        sys.stderr.write(
+            "       `models` is an ARRAY in pi's schema; this file has a different shape, so a merge\n"
+            "       would replace it rather than extend it. Nothing was written; fix the live file.\n"
+        )
+        return 1
+
     lost = lost_entries(dst, merged)
     if lost:
         sys.stderr.write(
@@ -204,8 +246,40 @@ def main(argv):
         sys.stderr.write("       Nothing was written; the live file is unchanged.\n")
         return 1
 
-    with open(dst_path, "w") as fh:
-        json.dump(merged, fh, indent=2)
+    # ⛔ ATOMIC, and this is the whole point of the guard above (#1878 review P0). `open(path, "w")`
+    # TRUNCATES: the live file is the ONLY copy (the `.bak-bootstrap` snapshot is first-run-only), so a
+    # write that dies part-way left it truncated and unparseable — after `lost_entries()` had already
+    # approved the content. Two distinct losses followed, both unrecoverable: a truncated-but-nonempty
+    # file makes every later setup.sh run abort inside `_read_json`, and a file truncated to ZERO makes
+    # the NEXT run read `{}`, find nothing to preserve, and exit 0 having dropped the live state for
+    # good. Serialise to a sibling temp, fsync, then `os.replace` — a rename is atomic within a
+    # filesystem, so a reader sees the old file or the new one, never a prefix.
+    payload = json.dumps(merged, indent=2)
+    dst_dir = os.path.dirname(os.path.abspath(dst_path)) or "."
+    tmp_path = None
+    try:
+        fd, tmp_path = tempfile.mkstemp(prefix=".models.json.", suffix=".tmp", dir=dst_dir)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        # Keep the live file's permissions: mkstemp creates 0600, and a models.json that suddenly is
+        # not group/world readable would break every consumer running as another user.
+        try:
+            shutil.copymode(dst_path, tmp_path)
+        except OSError:
+            pass
+        os.replace(tmp_path, dst_path)
+        tmp_path = None
+    except OSError as exc:
+        sys.stderr.write("ERROR: could not write %s (%s) — the live file is UNCHANGED.\n" % (dst_path, exc))
+        return 1
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
     print("    models.json merged (shipped wins per provider/model/override key; live-only entries preserved)")
     print(
