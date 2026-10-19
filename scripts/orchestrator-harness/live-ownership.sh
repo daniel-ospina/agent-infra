@@ -52,7 +52,20 @@ lo_cwd_rows() {
   local _lsof _raw
   if [ -d /proc ] && [ -L /proc/self/cwd ]; then
     # Linux: /proc/<pid>/cwd is a symlink; `ls -l` prints "<symlink> -> <target>".
-    ls -l /proc/[0-9]*/cwd 2>/dev/null | awk '
+    # ⛔ THE SEAM IS PLATFORM-INDEPENDENT (the Linux CI runner caught this): `LO_CWD_PROBE` replaces
+    # the PROBE COMMAND on BOTH arms — here `ls` is that command — so the suite's "hide the probe"
+    # fixture means the same thing on Linux as on macOS. Before this the Linux arm ignored the seam
+    # entirely: the fixture read the full /proc table, found nobody working, and returned rc=0 (a real
+    # answer) where the suite asserts rc=2 (UNKNOWN) — green on macOS, red on Linux.
+    # ⛔ AND CAPTURE FIRST, like the lsof arm: a pipeline reports AWK's status, so an absent or broken
+    # `ls` looked exactly like a successful census that found nobody — the one reading that must never
+    # be invented. A PARTIAL list is still a real census: on a shared box other users' /proc entries
+    # are unreadable and `ls` exits non-zero while listing what it could.
+    _ls="${LO_CWD_PROBE:-ls}"
+    command -v "$_ls" >/dev/null 2>&1 || return 1
+    _cwd_raw="$("$_ls" -l /proc/[0-9]*/cwd 2>/dev/null)"
+    [ -n "$_cwd_raw" ] || return 1
+    printf '%s\n' "$_cwd_raw" | awk '
       match($0, /\/proc\/[0-9]+\/cwd/) {
         pid = substr($0, RSTART + 6, RLENGTH - 10)
         i = index($0, " -> ")

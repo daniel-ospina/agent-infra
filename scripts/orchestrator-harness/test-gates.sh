@@ -1350,9 +1350,16 @@ FAKE
       rm -f "$DO"/state/merged-*.done
       if [ -n "${1:-}" ]; then
         : > "$DO/state/merged-7777.done"
-        # a bare number is "minutes AGO"; a leading '+' is minutes in the FUTURE (the clock-step case)
-        case "$1" in +*) _v="+${1#+}M" ;; -*) _v="-${1#-}M" ;; *) _v="-${1}M" ;; esac
-        touch -t "$(date -v"$_v" +%Y%m%d%H%M)" "$DO/state/merged-7777.done" 2>/dev/null || true
+        # a bare number is "minutes AGO"; a leading '+' is minutes in the FUTURE (the clock-step case).
+        # ⛔ SET THE MTIME PORTABLY: `date -v-200M` is BSD-only, so on the Linux CI runner the stamp
+        # stayed at NOW and the two age cases failed there while passing on macOS (measured). python3
+        # sits on both runners and `os.utime` cannot be read wrong.
+        # a bare number is minutes AGO (negative offset), a leading '+' is minutes in the FUTURE
+        case "$1" in +*) _min="${1#+}" ;; -*) _min="-${1#-}" ;; *) _min="-${1}" ;; esac
+        python3 - "$_min" "$DO/state/merged-7777.done" <<'PYEOF'
+import os, sys, time
+os.utime(sys.argv[2], (lambda t: (t, t))(time.time() + int(sys.argv[1]) * 60))
+PYEOF
       fi
       if [ -n "${2:-}" ]; then MERGE_STALL_MIN="$2"; else unset MERGE_STALL_MIN; fi
       eval "$_DRAIN_BLOCK"   # SAME shell: the block reads O/LOG/UPN_WORK as shell vars
