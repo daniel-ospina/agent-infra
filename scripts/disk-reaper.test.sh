@@ -27,6 +27,12 @@
 #   T11 a dry run records 0 bytes freed (it removed nothing). Guard, not a pre-change failure: in an
 #       idle fixture the old code also recorded 0, because df happened not to move.
 #   T12 the installer's --dry-run changes nothing, and a SET-but-missing $DISK_REAPER is refused.
+#   T13 the bounded-execution resolver's ORDER is pinned: `timeout` -> `gtimeout` -> the internal
+#       watchdog, proven with a PATH that contains only the case's own stub.
+#   T14 a host with NEITHER binary still CLASSIFIES (candidates found, rc=5) and names the fallback;
+#       the same pass with a stub `timeout` on PATH proves resolution prefers the binary (#2046).
+#   T15 a missing library, or an unusable TB_TIMEOUT_BIN, is a REFUSAL AT STARTUP (exit 3, no
+#       per-class line) — never a pass whose classes each report fail-closed and then complete.
 #
 # PRE-CHANGE BEHAVIOUR. Each assertion below fails before this change, for the reason the section
 # names: there is no entry point at all, so `bash scripts/disk-reaper.test.sh` on the pre-change tree
@@ -347,6 +353,101 @@ OUT="$(DISK_REAPER="$T/t12/not-here.sh" HOME="$T/t12/home" DISK_REAPER_REPOS="$R
     SYSTEMD_UNIT_DIR="$T/t12/units" SYSTEMCTL="$T/t8/bin/systemctl" SYSTEMCTL_CALLS="$T/t12/calls2.log" \
     bash "$INST" --install 2>&1)"; RC=$?
 assert_eq "$RC" "2" "T12 a SET but missing \$DISK_REAPER is refused (never a silent different copy)"
+
+# ── T13: the bounded-execution resolver's ORDER is pinned (#2046) ───────────────────────────────
+# `timeout` is GNU coreutils; macOS ships neither it nor `gtimeout`. ONE helper
+# (scripts/lib/bounded.sh) resolves `timeout` -> `gtimeout` -> the internal watchdog, and both
+# reapers call it. This is a UNIT test of that helper with a PATH holding ONLY what the case needs,
+# so it cannot pass by accident on a host that happens to have coreutils installed.
+LIB="$HERE/lib/bounded.sh"
+assert_file "$LIB" "T13 the shared bounded-execution library exists (both reapers source it)"
+for d in core with-timeout with-gtimeout bare; do mkdir -p "$T/t13/$d"; done
+for b in mktemp sleep rm; do ln -sf "$(command -v "$b")" "$T/t13/core/$b"; done
+for d in with-timeout with-gtimeout bare; do
+    for b in mktemp sleep rm; do ln -sf "$T/t13/core/$b" "$T/t13/$d/$b"; done
+done
+mk_stub() { # mk_stub <dir> <name> — records its argv and exits 7 (a chosen-binary witness)
+    cat >"$1/$2" <<'SH'
+#!/bin/bash
+printf '%s\n' "$*" >>"${T13_CALLS:-/dev/null}"
+shift   # drop the interval: the stub PROVES it was chosen, it does not enforce the bound
+exit 7
+SH
+    chmod +x "$1/$2"
+}
+mk_stub "$T/t13/with-timeout" timeout
+mk_stub "$T/t13/with-gtimeout" gtimeout
+# The control: the "bare" PATH really carries neither binary (or the case proves nothing).
+assert_eq "$(PATH="$T/t13/bare" "${BASH:-/bin/bash}" -c 'command -v timeout || command -v gtimeout || echo ABSENT')" \
+    "ABSENT" "T13 the bare PATH really has neither timeout nor gtimeout (the case is not vacuous)"
+OUT="$(PATH="$T/t13/with-timeout" T13_CALLS="$T/t13/calls-a" "${BASH:-/bin/bash}" -c \
+    '. "$1"; echo "kind=$TB_TIMEOUT_KIND"; tb_timeout 5 true; echo "rc=$?"' _ "$LIB" 2>&1)"
+assert_contains "$OUT" "kind=timeout" "T13 with timeout present, timeout is the mechanism chosen (first in order)"
+assert_contains "$OUT" "rc=7" "T13 the chosen binary's exit status is what the caller sees (not remapped)"
+assert_contains "$(cat "$T/t13/calls-a" 2>/dev/null)" "5" "T13 and it is the one that actually RAN, with the bound"
+OUT="$(PATH="$T/t13/with-gtimeout" T13_CALLS="$T/t13/calls-b" "${BASH:-/bin/bash}" -c \
+    '. "$1"; echo "kind=$TB_TIMEOUT_KIND"; tb_timeout 5 true; echo "rc=$?"' _ "$LIB" 2>&1)"
+assert_contains "$OUT" "kind=gtimeout" "T13 with no timeout but a gtimeout, gtimeout is chosen (second)"
+assert_contains "$OUT" "rc=7" "T13 gtimeout's exit status likewise reaches the caller unchanged"
+assert_contains "$(cat "$T/t13/calls-b" 2>/dev/null)" "5" "T13 gtimeout is the binary that ran"
+OUT="$(PATH="$T/t13/bare" "${BASH:-/bin/bash}" -c \
+    '. "$1"; echo "kind=$TB_TIMEOUT_KIND"; SECONDS=0; tb_timeout 1 sleep 10; echo "rc=$? elapsed=$SECONDS"' \
+    _ "$LIB" 2>&1)"
+assert_contains "$OUT" "kind=internal" "T13 with neither binary the internal watchdog is the fallback"
+assert_contains "$OUT" "rc=124" "T13 a timeout is 124 through the fallback too (the callers' fail-closed code)"
+ELAPSED="$(printf '%s' "$OUT" | sed -n 's/.*elapsed=\([0-9]*\).*/\1/p')"
+if [ -n "$ELAPSED" ] && [ "$ELAPSED" -le 5 ]; then ok "T13 the fallback RETURNS in ~1s instead of waiting out the 10s command"
+else bad "T13 the fallback did not bound the command (elapsed=${ELAPSED:-unknown}s)"; fi
+
+# ── T14: a host with NO binary still CLASSIFIES — it never silently no-ops (#2046) ──────────────
+# The measured defect: every class died with `timeout: command not found`, rc=127 -> fail-closed, and
+# the pass still completed as if it had run. The assertion is that the class now FINDS its candidate.
+ENVNAME=t14
+REPO="$(mk_repo t14)"
+WT="$(mk_wt "$REPO" dead feat/t14-dead)"
+commit_in "$WT" "$OLD_DATE" dead
+OUT="$(TB_TIMEOUT_FORCE_INTERNAL=1 run_reaper --dry-run --repo "$REPO" --only worktree --aged-days 7 2>&1)"; RC=$?
+assert_eq "$RC" "5" "T14 with no timeout/gtimeout the pass still finds work (5), not fail-closed (3)"
+assert_contains "$OUT" "watchdog=internal" "T14 the pass NAMES the fallback it used"
+assert_contains "$OUT" "WOULD-REMOVE class=worktree" "T14 the worktree class CLASSIFIED instead of failing closed"
+assert_absent "$OUT" "verdict=fail-closed" "T14 no class reports fail-closed on a host with neither binary"
+assert_contains "$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null)" "watchdog=internal" \
+    "T14 the pass record names the mechanism"
+assert_contains "$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null)" "ok=1" \
+    "T14 and the record is not a failure (the pass did its job)"
+# The other half of the order: a `timeout` on PATH is preferred over the working fallback.
+mkdir -p "$T/t14/passbin"
+cat >"$T/t14/passbin/timeout" <<'SH'
+#!/bin/bash
+printf '%s\n' "$*" >>"${T14_CALLS:-/dev/null}"
+shift
+exec "$@"
+SH
+chmod +x "$T/t14/passbin/timeout"
+OUT="$(PATH="$T/t14/passbin:$PATH" T14_CALLS="$T/t14/calls" run_reaper --dry-run --repo "$REPO" --only worktree --aged-days 7 2>&1)"; RC=$?
+assert_eq "$RC" "5" "T14 with a timeout on PATH the same pass finds the same work"
+assert_contains "$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null)" "watchdog=timeout" \
+    "T14 resolution prefers timeout over the internal fallback (recorded)"
+assert_absent "$OUT" "watchdog=" "T14 with a real timeout binary the report gains NO provenance line (pre-change output)"
+assert_contains "$(cat "$T/t14/calls" 2>/dev/null)" "1800" \
+    "T14 the binary that ran received the class watchdog (1800s default)"
+
+# ── T15: an unusable helper is a STARTUP REFUSAL, never per-class fail-closed (#2046) ───────────
+# A partial deploy that loses scripts/lib/bounded.sh must NOT reproduce the defect it fixes: with no
+# helper, no probe is bounded. Refusing at startup is the only shape that cannot read as a pass.
+ENVNAME=t15
+REPO="$(mk_repo t15)"
+OUT="$(BOUNDED_LIB=/nonexistent/bounded.sh run_reaper --dry-run --repo "$REPO" 2>&1)"; RC=$?
+assert_eq "$RC" "3" "T15 a missing bounded-execution library exits 3 at startup"
+assert_contains "$OUT" "FAIL-CLOSED at startup" "T15 the refusal says it is a startup failure"
+assert_contains "$OUT" "bounded-execution library is missing" "T15 and names what is missing"
+assert_absent "$OUT" "class=" "T15 it emits NO per-class line, so it cannot read as a completed pass"
+assert_absent "$(cat "$T/t15/state/disk-reaper.status" 2>/dev/null || true)" "ok=" \
+    "T15 and it writes no pass record at all"
+OUT="$(TB_TIMEOUT_BIN=/nonexistent/timeout run_reaper --dry-run --repo "$REPO" 2>&1)"; RC=$?
+assert_eq "$RC" "3" "T15 an unusable TB_TIMEOUT_BIN is REFUSED, not silently ignored"
+assert_contains "$OUT" "TB_TIMEOUT_BIN" "T15 and the refusal names the pin"
+assert_absent "$OUT" "class=" "T15 no per-class line for a refused pass"
 
 echo
 echo "──────────────────────────────────────────────────────────────────────"
