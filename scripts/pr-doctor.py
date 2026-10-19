@@ -2036,12 +2036,20 @@ def main() -> int:
         # This is checked even with NO state row, because a lost state file is not a dead worker.
         live = worker_live("prd-%s" % key)
         if live:
+            # COUNTED, so the pass line names it (see `_finish`): "dispatched 0 of 3 queued —
+            # nothing to do" is a false clean when the truth is "three PRs already have a worker".
+            stalled["worker-running"] = stalled.get("worker-running", 0) + 1
             log("#%s (%s): worker prd-%s is still running -- not spawning a second one"
                 % (key, action, key))
             continue
         if live is None:
             # ⛔ UNANSWERABLE IS NOT "FREE" (see worker_live): skip, loudly. It clears as soon as
             # `--status` answers again, and it costs nothing, because a spawn would fail too.
+            # ⛔ AND IT IS COUNTED FOR THE SAME REASON. Without a counter the verdict for a pass
+            # that refused EVERY spawn on an unreadable `--status` was `dispatched 0 of 3 queued —
+            # nothing to do`: a false clean manufactured by the exact instrument this file adds,
+            # and indistinguishable from a quiet queue to the operator reading the beat.
+            stalled["live-unreadable"] = stalled.get("live-unreadable", 0) + 1
             log("#%s (%s): worker prd-%s liveness could not be read -- skipping rather than "
                 "spawning blind over a possibly live worker" % (key, action, key))
             continue

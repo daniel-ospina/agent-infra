@@ -2177,7 +2177,7 @@ def test_a_stale_sibling_objective_refuses_at_import(tmp_path):
 # unreadable queue, and a lane that fails to start. All four must carry a DISTINCT, LOGGED reason.
 
 def _drive_pass(monkeypatch, prs, classified, launched=True, logs=None, argv=("pr-doctor.py",),
-                state=None):
+                state=None, live=False):
     """Run one pass against a synthetic world; return (rc, joined log, status payload).
 
     ⛔ THE TRANSPORT IS THE WORKER ONE (#1890): `dispatch(pr, action, text, dry)` returns
@@ -2196,7 +2196,7 @@ def _drive_pass(monkeypatch, prs, classified, launched=True, logs=None, argv=("p
     monkeypatch.setattr(pr, "save_state", lambda st: None)   # never touch the live state file
     monkeypatch.setattr(pr, "open_prs", lambda: prs)
     monkeypatch.setattr(pr, "classify", lambda p: classified)
-    monkeypatch.setattr(pr, "worker_live", lambda name: False)
+    monkeypatch.setattr(pr, "worker_live", lambda name: live)
     monkeypatch.setattr(pr, "brief", lambda p, a, w=None, cr=None: "brief")
     monkeypatch.setattr(pr, "dispatch",
                         lambda p, a, t, dry: ((True, "spawned", False) if launched
@@ -2287,6 +2287,26 @@ def test_the_four_exit_paths_carry_four_distinct_reasons(monkeypatch):
     # verdicts. The two failure shapes are the ones that must never collapse into one code.
     assert seen["success"]["rc"] == 0 and seen["empty"]["rc"] == 0, seen
     assert {seen["worker-fails"]["rc"], seen["unreadable-checks"]["rc"]} == {2, 3}, seen
+
+
+def test_a_pass_that_refused_every_spawn_names_the_REFUSAL_not_nothing_to_do(monkeypatch):
+    """⛔ "NOTHING TO DO" IS A CLAIM ABOUT THE QUEUE — it may not stand in for a refusal.
+
+    `worker_live()` is three-valued and `None` means DO NOT SPAWN (an unreadable `--status` over a
+    possibly live worker is how a second worker destroys the first one's log/.rc/.pid). That skip
+    was silent to the VERDICT: no counter, so a pass that refused every spawn printed
+    `dispatched 0 of 3 queued — nothing to do`, which is indistinguishable from a quiet queue in
+    the beat — the false clean this whole sidecar exists to remove. Same for a worker that is
+    simply still running: that is "already in flight", not "nothing to do".
+    """
+    rc, joined, _payload = _drive_pass(monkeypatch, [_pr(1), _pr(2)], ("fix-ci", "r", []))
+    assert "dispatched 2 of 2 queued" in joined, joined      # sanity: the pass dispatches
+    for verdict, label in ((None, "live-unreadable"), (True, "worker-running")):
+        rc, joined, _p = _drive_pass(monkeypatch, [_pr(1), _pr(2)], ("fix-ci", "r", []),
+                                     live=verdict)
+        assert "dispatched 0 of 2 queued" in joined, joined
+        assert "%s=2" % label in joined, joined
+        assert "nothing to do" not in joined, joined
 
 
 def test_a_zero_dispatch_on_a_runnable_queue_names_why(monkeypatch):
