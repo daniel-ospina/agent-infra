@@ -50,6 +50,33 @@
  *       NOT silently dropped: the exact detector is then incomplete, so the handler
  *       FAILS CLOSED and names the store. A store that is simply ABSENT is not a
  *       degradation — there are no values to lose — so a fresh machine is unaffected.
+ *       ⛔ SCOPE OF THAT FAIL-CLOSED, stated because it is wider than "a secret
+ *       store": EVERY top-level `*.json` in ~/.pi/agent is scanned (so a store added
+ *       later is covered), which includes files that cannot hold secrets —
+ *       `settings.json`, `skill-reads.json`, `models-store.json`. So ONE malformed or
+ *       mid-write file there withholds EVERY tool result for the whole 30 s cache
+ *       window, not just results that could contain a secret. That is the deliberate
+ *       over-block side of the trade (an incomplete exact detector must not report
+ *       "no hit" as "no secret"), and the notice NAMES the store so the cause is
+ *       visible. It is over-blocking, never a leak. Narrowing the scanned set to
+ *       secret-bearing stores is the open question on #5109, and it reduces coverage,
+ *       so it is not done silently here;
+ *     - a store larger than 2 MB is SKIPPED (`statSync(p).size > 2_000_000`) without
+ *       being recorded as a degradation: too large to scan affordably, so its values
+ *       are simply not collected. `models-store.json` is already ~240 KB in this
+ *       fleet, so the cap is reachable as the provider catalogue grows;
+ *     - MIN_LEN (12) FLOORS EVERY COLLECTION SITE, so a configured credential SHORTER
+ *       THAN 12 CHARACTERS IS NOT REDACTED. The floor exists because redacting short
+ *       strings over-redacts ordinary tool output; it is the reason "a configured
+ *       secret is caught" is true only at or above 12 characters;
+ *     - this is the SECOND redactor at the `tool_result` boundary. `extensions/secret-echo-guard.ts`
+ *       is default-ON (`SECRET_ECHO_GUARD !== "0"`) and already redacts
+ *       `content`/`details` there, with a min-length floor, a hooks registry and
+ *       `.env` harvesting. This one adds EXACT-value matching from the stores/env on
+ *       top, and the two compose: pi chains patches, so a result the echo-guard has
+ *       already redacted is re-scanned (and, on a degraded store, replaced wholesale
+ *       by the WITHHELD notice — see the scope bullet above). Which guard owns the
+ *       boundary is deliberately left open on #5109 rather than decided by this file.
  *   The durable fix for the class is to redact at the point of PERSISTENCE (one
  *   choke point) rather than recognise values in flight — and, for this incident,
  *   ROTATION, which is what makes the 301 existing copies moot.
