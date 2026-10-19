@@ -4504,6 +4504,19 @@ MUTATIONS = [
      '    if lane_ok:\n        return True, "a lane started %s (the queue record is not the only evidence)" % (\n            _age_txt(lane_ok.get("age_s")))',
      '    if intent or lane_ok:\n        return True, "a dispatch landed %s (the queue record is not the only evidence)" % (\n            _age_txt((intent or lane_ok).get("age_s")))',
      "test_the_intent_line_is_not_reported_as_a_LANDED_dispatch"),
+    # ── cycle-43 defects ─────────────────────────────────────────────────────────────────
+    ("an unusable --o scope still kickstarts the labelled job",
+     '    scope_paths = [x for x in cfg.controller_paths() if x]',
+     '    scope_paths = []',
+     "test_a_SCOPE_that_cannot_hold_the_controller_forbids_a_respawn"),
+    ("a numeric flag is never bounded",
+     '    for knob in Cfg.NUMERIC_KNOBS:',
+     '    for knob in ():',
+     "test_a_NUMERIC_flag_out_of_range_is_a_USAGE_error_not_a_crash"),
+    ("a collector crash escapes with no verdicts",
+     '            facts = None\n            collect_error = "%s: %s" % (type(exc).__name__, exc)',
+     '            raise',
+     "test_a_COLLECTOR_CRASH_is_INCONCLUSIVE_not_a_crash_with_no_verdicts"),
     # ── cycle-42 defects ─────────────────────────────────────────────────────────────────
     ("a refused-dispatch FAIL claims the controller and queue it never read",
      '                 "%d dispatch attempt(s) were REFUSED in the window and NO lane was started, so no "\n                 "work is going out. (This check reads the dispatch log; whether the controller is "\n                 "alive is `controller_cycling`\'s verdict, and whether the pool is readable is "\n                 "`queue_readable`\'s.)" % len(refused))',
@@ -5788,6 +5801,96 @@ def test_an_INJECTED_fact_set_is_disclosed_in_the_JSON_too():
     assert payload is not None, (rc, (out or err)[-400:])
     assert payload.get("facts_injected") is True, payload.get("facts_injected")
     assert "injected" in (payload.get("facts_source") or ""), payload.get("facts_source")
+
+
+@test
+def test_a_SCOPE_that_cannot_hold_the_controller_forbids_a_respawn():
+    """The census is path-scoped, so `--o /tmp/typo` — or any cell whose `$O` is not the default,
+    armed without `--o` — REJECTS the running controller as "another cell's": `pids: []`,
+    `near_miss: False`, and `launchctl kickstart -k` fires at a LIVE controller mid-cycle. Measured
+    on the live box: the evidence block printed the live pid as "not this cell's controller" while
+    the trigger was `LAUNCHD_PID_UNRESOLVED`, a member of RESPAWN_TRIGGERS."""
+    m = load()
+
+    class M:
+        box = "local"
+        def __init__(self, exists):
+            self.exists = exists
+            self.calls = []
+        def sh(self, cmd, **kw):
+            self.calls.append(cmd)
+            return (0, "YES\n") if self.exists else (0, "NO\n")
+        def sh_argv(self, argv, **kw):
+            raise AssertionError("no command may run when the scope is unusable: %r" % (argv,))
+        def snapshot_controller(self):
+            return {"ok": True, "pids": [], "near_misses": []}
+        def log_stat(self):
+            return {"mtime": None, "exists": True, "age_s": 5.0}
+        def read_file(self, path):
+            raise OSError("absent")
+
+    cfg = m.cfg_from_dict({"o_dir": "/tmp/oc-scope-missing", "repo": "o/r"})
+    v = m.V("controller_cycling", m.FAIL, "LAUNCHD_PID_UNRESOLVED", "e")
+    dead = M(exists=False)
+    res = m.attempt_respawn(v, cfg, dead, dry_run=False, poll_deadline_s=0)
+    assert res["attempted"] is False, res
+    assert "scope does not contain" in res["detail"], res["detail"]
+    assert res.get("scope_unusable") is True, res
+    assert res["commands"] == [], res["commands"]
+    # …and a PREVIEW discloses the same refusal instead of advertising a kickstart
+    res2 = m.attempt_respawn(v, cfg, M(exists=False), dry_run=True)
+    assert "DRY-RUN" not in res2["detail"], res2["detail"]
+    assert "scope does not contain" in res2["detail"], res2["detail"]
+    # a scope that DOES hold the script is unaffected: the plan still runs (not exercised here — the
+    # stub raises — so the assertion is that the refusal is keyed on the scope, not on the box)
+    assert dead.calls, "the scope probe must actually have been read"
+
+
+@test
+def test_a_NUMERIC_flag_out_of_range_is_a_USAGE_error_not_a_crash():
+    """`--pr-window-min 1e300` raised `OverflowError: timestamp out of range` inside the collector —
+    a traceback, no verdicts and exit 1, which is the row that means "a check FAILed". `nan` raised
+    `ValueError` the same way. A numeric flag is a usage error like any other: exit 3."""
+    for bad in ("1e300", "nan", "-5", "0"):
+        rc, out, err = run_cli(["--live", "--pr-window-min", bad, "--no-notify", "--no-respawn",
+                                "--repo", "o/r"])
+        assert rc == 3, (bad, rc, err[-300:])
+        assert "pr_window_s" in err, (bad, err[-300:])
+    # the parse itself is bounded too, so no collector is reached with an impossible value
+    assert run_cli(["--live", "--window-min", "1e300", "--no-notify", "--no-respawn"])[0] == 3
+
+
+@test
+def test_a_COLLECTOR_CRASH_is_INCONCLUSIVE_not_a_crash_with_no_verdicts():
+    """An unexpected exception in the live collection escaped as a traceback with NO verdicts and
+    exit 1 — indistinguishable from "a check FAILed". It is now graded as eight INCONCLUSIVE
+    verdicts and exit 2."""
+    m = load()
+    cfg = m.cfg_from_dict({"repo": "o/r"})
+
+    def boom(*a, **k):
+        raise RuntimeError("simulated collector failure")
+    orig = m.collect_live
+    try:
+        m.collect_live = boom
+        doc = m.evaluate({"github": {"ok": False}}, cfg)     # purity sanity: predicates still evaluate
+        assert [v.name for v in doc] == list(m.CHECK_ORDER)
+    finally:
+        m.collect_live = orig
+    # the CLI path: a stub that makes the collector raise must yield exit 2 with verdicts on stdout
+    import subprocess
+    prog = (
+        "import importlib.util, sys\n"
+        "spec = importlib.util.spec_from_file_location('oc', %r)\n"
+        "mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)\n"
+        "def boom(*a, **k): raise RuntimeError('simulated collector failure')\n"
+        "mod.collect_live = boom\n"
+        "sys.exit(mod.main(['--live', '--repo', 'o/r', '--no-notify', '--no-respawn']))\n"
+        % m.__file__)
+    p = subprocess.run([sys.executable, "-c", prog], capture_output=True, text=True)
+    assert p.returncode == 2, (p.returncode, p.stderr[-500:])
+    assert "COLLECTOR_ERROR" in p.stdout, p.stdout[-500:]
+    assert "simulated collector failure" in p.stdout, p.stdout[-500:]
 
 
 @test

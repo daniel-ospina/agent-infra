@@ -116,6 +116,7 @@ import os
 import re
 import subprocess
 import sys
+import traceback
 import time
 
 # ── status vocabulary ────────────────────────────────────────────────────────────────────────────
@@ -231,6 +232,12 @@ class Cfg(object):
         "controller_name": None,
         "state_path": None,
     }
+
+    # ⛔ THE KNOBS A NUMERIC VALUE FLOWS INTO, AND THE BOUNDS THEY MUST SATISFY. A flag is a usage
+    # error like any other: `--pr-window-min 1e300` raised `OverflowError: timestamp out of range`
+    # inside the collector — a traceback, no verdicts, exit 1 (the code that means "a check FAILed").
+    NUMERIC_KNOBS = ("window_s", "pr_window_s", "queue_stale_s", "mem_floor_mb", "disk_floor_gb",
+                     "pool_threshold", "rest_probe_max", "respawn_timeout_s")
 
     FIELDS = (
         "window_s",
@@ -3097,6 +3104,28 @@ def attempt_respawn(v, cfg, machine, dry_run=False, plist=None, uid=None, poll_d
     if variant_of(v) not in RESPAWN_TRIGGERS:
         res["detail"] = "not attempted: the controller is not absent (%s)" % variant_of(v)
         return res
+    # ⛔ A SCOPE THAT DOES NOT HOLD THE CONTROLLER'S SCRIPT CANNOT ESTABLISH ABSENCE. The census is
+    # path-scoped, so `--o /tmp/typo` (or any cell whose `$O` is not the default, armed without
+    # `--o`) REJECTS the running controller as "another cell's" — `pids: []`, `near_miss: False` —
+    # and `launchctl kickstart -k` fires at a live controller mid-cycle. The scoped VERDICT is right
+    # (this cell's controller cannot be found under that scope); the ACTION is not, because nothing
+    # was established about the controller that actually runs. Measured on the live box: the evidence
+    # block printed the live pid as "not this cell's controller" while the trigger was
+    # LAUNCHD_PID_UNRESOLVED — a member of RESPAWN_TRIGGERS.
+    scope_paths = [x for x in cfg.controller_paths() if x]
+    if scope_paths:
+        usable = []
+        for cand in scope_paths:
+            rc_e, out_e = machine.sh("test -e %s && echo YES || echo NO" % _q(cand))
+            usable.append(rc_e == 0 and (out_e or "").strip().endswith("YES"))
+        if not any(usable):
+            res["attempted"] = False
+            res["detail"] = ("NOT ATTEMPTED: the scope does not contain the controller's script "
+                             "(%s) — nothing was established about the controller that IS running, "
+                             "so absence cannot be claimed and no job may be restarted"
+                             % ", ".join(scope_paths[:3]))
+            res["scope_unusable"] = True
+            return res
     if dry_run:
         res["attempted"] = False
         res["detail"] = "DRY-RUN: would run `%s`%s" % (
@@ -4505,6 +4534,26 @@ def main(argv=None):
 
     # ── live ────────────────────────────────────────────────────────────────────────────────
     cfg = cfg_from_args(a)
+    # ⛔ A NUMERIC FLAG IS A USAGE ERROR TOO. `--pr-window-min 1e300` raised
+    # `OverflowError: timestamp out of range` inside `_collect_graphql` — a traceback, NO verdicts and
+    # exit 1, which is the row that means "a check FAILed". `nan` raised `ValueError` the same way.
+    # Every knob is bounded here, before any collection, and reports as the usage error it is.
+    for knob in Cfg.NUMERIC_KNOBS:
+        val = getattr(cfg, knob, None)
+        if not _is_age(val):          # a number, and a bool is not one
+            print("outcome-canary: %s must be a number (got %r)" % (knob, val), file=sys.stderr)
+            return 3
+        if val != val or val in (float("inf"), float("-inf")):
+            print("outcome-canary: %s must be finite (got %r)" % (knob, val), file=sys.stderr)
+            return 3
+        if val < 0:
+            print("outcome-canary: %s must not be negative (got %r)" % (knob, val), file=sys.stderr)
+            return 3
+        if knob in ("window_s", "pr_window_s", "queue_stale_s") and not (0 < val <= 30 * 86400):
+            print("outcome-canary: %s must be between 1s and 30d (got %r)" % (knob, val),
+                  file=sys.stderr)
+            return 3
+
     machine = build_machine(cfg)
     if a.facts:
         # INJECTED FACTS through the LIVE path. The predicates are the same ones `--static` runs;
@@ -4518,10 +4567,29 @@ def main(argv=None):
             print("outcome-canary: cannot read --facts %s: %s" % (a.facts, exc), file=sys.stderr)
             return 3
     else:
-        facts = collect_live(cfg, machine=machine, now=now, skip=skip)
-    verdicts = evaluate(facts, cfg, only=only)
-    not_evaluated = [n for n in CHECK_ORDER if n not in set(v.name for v in verdicts)]
-    code = exit_code(verdicts, not_evaluated)
+        try:
+            facts = collect_live(cfg, machine=machine, now=now, skip=skip)
+        except Exception as exc:
+            # ⛔ AN UNEXPECTED COLLECTOR FAILURE IS NOT A VERDICT. It used to escape as a traceback
+            # with no verdicts and exit 1 — indistinguishable from "a check FAILed". The run now
+            # prints the failure AND reports every check as INCONCLUSIVE, so the exit code says
+            # "could not evaluate" rather than either green or red.
+            print("outcome-canary: the live collector raised %s: %s"
+                  % (type(exc).__name__, exc), file=sys.stderr)
+            traceback.print_exc()
+            facts = None
+            collect_error = "%s: %s" % (type(exc).__name__, exc)
+    if facts is None:
+        verdicts = [V(name, INCONCLUSIVE, "COLLECTOR_ERROR",
+                      "the live collection raised %s" % collect_error,
+                      "no fact was collected, so nothing about this check is established.")
+                    for name in CHECK_ORDER]
+        not_evaluated = []
+        code = 2
+    else:
+        verdicts = evaluate(facts, cfg, only=only)
+        not_evaluated = [n for n in CHECK_ORDER if n not in set(v.name for v in verdicts)]
+        code = exit_code(verdicts, not_evaluated)
 
     obs_iso = _iso(now)
     # ⛔ AN INJECTED FACT SET IS NOT A LIVE OBSERVATION. `--facts` replaced the whole fact dict, yet the

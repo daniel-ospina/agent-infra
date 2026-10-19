@@ -571,6 +571,20 @@ Six more (cycle 13), each a case where a datum the tool held was not the one it 
   `not_evaluated: []` instead of 2 with a "(the other 0 checks were not asserted)" note.
 - **`log.age_s` is an age, not a truthy number**: a bool is UNREAD there too, so the "alive but
   useless" arm cannot be skipped by it and the evidence cannot print it as "(1s ago)".
+- **A scope that cannot hold the controller's script forbids the ACTION.** The census is
+  path-scoped, so `--o /tmp/typo` — or any cell whose `$O` is not the default, armed without `--o` —
+  rejects the RUNNING controller as "another cell's" (`pids: []`, `near_miss: False`) and
+  `launchctl kickstart -k` fires at a live controller mid-cycle. Measured on the live box: the
+  evidence block printed the live pid while the trigger was `LAUNCHD_PID_UNRESOLVED`. The scoped
+  VERDICT is right; the action now refuses with `NOT ATTEMPTED: the scope does not contain the
+  controller's script …`, and a `--dry-run` preview discloses the same refusal instead of
+  advertising a kickstart.
+- **A numeric flag is bounded like every other usage error** (exit 3, before any collection):
+  `--pr-window-min 1e300` used to raise `OverflowError: timestamp out of range` inside the collector
+  — a traceback with no verdicts and **exit 1**, the row that means "a check FAILed".
+- **An unexpected collector failure is graded, not raised**: eight `INCONCLUSIVE/COLLECTOR_ERROR`
+  verdicts and exit 2, with the exception printed. A crash with no verdicts is neither green nor red
+  and reads as a FAIL to any scheduler.
 - **`_is_count` is the ONLY count guard.** `isinstance(True, int)` is true, and the same field was
   healed in one arm and re-broken in the next three times in one week: `backlog: true` FAILed in
   `work_dispatched`, then PASSed in its GREEN arm (`False == 0`), then certified a frozen pool as
