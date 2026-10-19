@@ -302,9 +302,214 @@ AGENT_DISK_REFUSED=77
 # re-run, merge-one.sh skips recording a verdict) would silently do the wrong thing. The flag is set
 # only after the gate passed and pi was actually launched, so it cannot be produced by a refusal.
 AGENT_STARTED=0
+
+# ── the wall-clock cap: how it is DERIVED, and what it must LEAVE BEHIND (agent-infra#2045) ─────────
+#
+# The cap used to be one global default, unrelated to the job, and its watchdog was a bare
+# `( sleep T; kill -TERM; sleep 15; kill -KILL )` subshell. Measured 2026-10-18 on eight background
+# lanes: three produced NOTHING, and one of them was working the whole time — 269,237 chars of
+# transcript, a log with 1,887 bytes of extension banners and ZERO model output, 7 modified files
+# still uncommitted in the worktree, branch still at origin/main, no `.rc`, no report file, and a
+# notifier that said `worker finished: commits=0 PR=none` — byte-identical to a lane that had
+# legitimately had nothing to do. The work survived only because a human noticed dirty files.
+#
+# ⛔ THREE PROPERTIES, AND EACH ONE IS A SEPARATE FAILURE (do not "simplify" one away):
+#   1. the cap is DERIVED FROM THE JOB, not a global default — see `agent_cap_resolve`;
+#   2. at the cap the worktree is SNAPSHOTTED and VERIFIED before the hard kill, so the work
+#      outlives the process — see `agent_cap_snapshot`;
+#   3. the cap is RECORDED durably, with the exit status, so a supervisor can tell `killed-at-cap`
+#      from `clean-no-work` — see `agent_cap_record` and `nonblocking-dispatch.sh --verdict`.
+#
+# ⛔ THE HARD KILL STILL LANDS. A bounded grace and a bounded snapshot sit BETWEEN the TERM and the
+# KILL, and nothing in either is allowed to be unbounded: if the checkpoint path wedges, the KILL
+# still happens (it is unconditional, on the line after the snapshot returns), and the snapshot's own
+# git/tar children are individually time-bounded by `_agent_bounded`. The failure the cap exists to
+# prevent — "a hung worker is never killed" — must not be resurrected by the fix for its opposite.
+#
+# ⛔ WHY THE CAP IS DECLARED AND NOT EXTENDED ON "PROGRESS" (the alternative the issue offered).
+# Every candidate progress signal was measured against THIS incident and each one misses it:
+#   * LOG GROWTH — the log was 1,887 bytes of banner and never grew, while the model worked;
+#   * WORKTREE MTIMES — the evidence is a lane 35 minutes into a verification run, which writes no
+#     tracked file (`selftest.sh` is read-only, `-p no:cacheprovider` disables the pytest cache, and
+#     `__pycache__` is gitignored, so `--exclude-standard` hides it);
+#   * THE CHILD'S CPU — `pi` is ~0 %CPU both while a model call is pending AND while its grandchild
+#     runs a test suite; the two are indistinguishable from the spawned pid;
+#   * THE SESSION TRANSCRIPT — the only signal that actually showed liveness, and it does not exist
+#     on this invocation: `--no-session` is exactly what removes it.
+# A rule built on those either fails to extend the lane that died, or extends a genuinely hung one —
+# i.e. it reintroduces the failure the cap exists to prevent. So the cap is DECLARED by the job
+# (`ESTIMATE:`/`CAP:` in the prompt file the dispatcher writes, or `$1`, or `LANE_TIMEOUT`), which is
+# auditable after the fact: the record says which number was used and where it came from.
+AGENT_CAPPED=0          # 1 when THIS run was ended by the cap (in-process callers read it)
+AGENT_CAP_SECONDS=""    # the cap actually applied
+AGENT_CAP_SOURCE=""     # explicit | prompt | default
+AGENT_CAP_SNAPSHOT=""   # the backup directory produced at the cap, if any
+AGENT_CAP_GRACE="${AGENT_CAP_GRACE:-15}"            # bounded TERM→snapshot window
+AGENT_CAP_SNAPSHOT_MAX="${AGENT_CAP_SNAPSHOT_MAX:-30}" # per-artifact bound, seconds
+AGENT_CAP_DEFAULT="${AGENT_CAP_DEFAULT:-3000}"        # only when the job declares nothing
+
+# The cap a job asks for. `ESTIMATE: 90m` / `CAP: 5400` (either spelling, leading `:` or `=`) in the
+# prompt file is the DECLARATION; `$1` is the dispatcher's explicit override and wins.
+agent_cap_from_prompt() { # <promptfile> → "<seconds>\t<unit-normalised>" or empty
+  local p="$1" line n u
+  [ -f "$p" ] || return 0
+  line="$(grep -E -i -m 1 '^[[:space:]]*(ESTIMATE|CAP)[[:space:]]*[:=][[:space:]]*[0-9]+[[:space:]]*[smh]?[[:space:]]*$' "$p" 2>/dev/null)"
+  [ -n "$line" ] || return 0
+  n="$(printf '%s' "$line" | sed -E 's/^[^:=]*[:=][[:space:]]*([0-9]+).*/\1/')"
+  u="$(printf '%s' "$line" | tr 'A-Z' 'a-z' | sed -E 's/.*[0-9][[:space:]]*([smh]?)[[:space:]]*$/\1/')"
+  is_num "$n" || return 0
+  # A bare number is SECONDS — the same unit `$1`/`LANE_TIMEOUT` already use, so a prompt that
+  # copies a known cap is never silently reinterpreted as minutes.
+  case "$u" in
+    m|mi|min|mins|minute|minutes) n=$(( n * 60 ));;
+    h|hr|hrs|hour|hours)         n=$(( n * 3600 ));;
+  esac
+  [ "$n" -gt 0 ] && printf '%s\t%s' "$n" "$u"
+}
+
+agent_cap_resolve() { # <explicit-or-empty> <promptfile> → "<seconds>\t<explicit|prompt|default>"
+  local explicit="${1:-}" prompt="${2:-}" declared n
+  if is_num "$explicit" && [ "$explicit" -gt 0 ]; then printf '%s\texplicit' "$explicit"; return 0; fi
+  declared="$(agent_cap_from_prompt "$prompt")"
+  n=""
+  [ -n "$declared" ] && read -r n _unit <<<"$declared"
+  if is_num "${n:-}" && [ "$n" -gt 0 ]; then printf '%s\tprompt' "$n"; return 0; fi
+  printf '%s\tdefault' "$AGENT_CAP_DEFAULT"
+}
+
+_agent_size() { local s; s="$(wc -c < "$1" 2>/dev/null | tr -d ' ')"; printf '%s' "${s:-0}"; }
+
+# macOS ships no `timeout`, and the same is true of the checkpoint path: a `git format-patch` on a
+# worktree with a huge dirty file, or a tar of a stray 4 GB artifact, must not be able to hold the
+# worker alive — that would BE the hang this file exists to bound. Bounded like the wall limit is.
+_agent_bounded() { # _agent_bounded <secs> <outfile> <cmd...> → 124 if the bound fired
+  local secs="$1" out="$2" p i=0; shift 2
+  ( "$@" ) > "$out" 2>/dev/null &
+  p=$!
+  while kill -0 "$p" 2>/dev/null && [ "$i" -lt "$secs" ]; do sleep 1; i=$((i+1)); done
+  if kill -0 "$p" 2>/dev/null; then kill -KILL "$p" 2>/dev/null; wait "$p" 2>/dev/null; return 124; fi
+  wait "$p" 2>/dev/null
+}
+
+# Snapshot the worktree at the cap. ⛔ `git format-patch` ALONE IS NOT ENOUGH, and the measured
+# incident proves it: that lane had made no commit at all, so format-patch would have produced a
+# 0-byte file while seven modified files sat in the worktree. So three artifacts, each verified:
+#   wip.diff       `git diff <base>` — the UNCOMMITTED work (the measured case)
+#   commits.patch  `git format-patch <base> --stdout` — work committed but never pushed
+#   untracked.tgz  a tarball of `git ls-files --others --exclude-standard` — a patch cannot carry
+#                  untracked files at all, which is why the tarball is a separate artifact
+# Each is byte-counted into MANIFEST, and the caller records the total. A genuinely idle lane snaps
+# an EMPTY set, and that is recorded as `preserved=none` rather than dressed up as a preserve.
+agent_cap_snapshot() { # <kind> <tag> <start-epoch> → "<dir>\t<note>"; the caller owns AGENT_CAP_SNAPSHOT
+  local kind="$1" tag="$2" start="$3" wt base dir listf wip patch tar total head br dirty
+  wt="${AGENT_CAP_SNAPSHOT_WT:-${DISK_GATE_PATH:-$PWD}}"
+  # ⛔ THE GLOBAL IS SET BY THE CALLER, NOT HERE: this function is invoked inside `$( … )`, i.e. a
+  # SUBSHELL, so an assignment made here is discarded — the first version of this code set it here and
+  # every record read `snapshot=-` while the backup sat on disk. The directory is RETURNED instead.
+  if ! git -C "$wt" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    printf -- '-\t%s' "snapshot=none:not-a-git-worktree:$wt bytes=0"; return 0
+  fi
+  dir="${O:-$HOME/orchestrator}/state/cap-backups/$kind-${tag:-lane}-$start"
+  mkdir -p "$dir" 2>/dev/null || { printf -- '-\t%s' "snapshot=none:cannot-create:$dir bytes=0"; return 0; }
+  # Resolve the base ONCE and record it: a lane in a scratch repo without `origin/main` must still
+  # snapshot (falling back to HEAD) instead of quietly producing an empty backup.
+  base=""
+  for r in origin/main main HEAD; do
+    git -C "$wt" rev-parse --verify --quiet "$r" >/dev/null 2>&1 && { base="$r"; break; }
+  done
+  [ -n "$base" ] || { printf -- '-\t%s' 'snapshot=none:no-base-ref bytes=0'; return 0; }
+  _agent_bounded "$AGENT_CAP_SNAPSHOT_MAX" "$dir/wip.diff"      git -C "$wt" diff "$base"
+  _agent_bounded "$AGENT_CAP_SNAPSHOT_MAX" "$dir/commits.patch" git -C "$wt" format-patch "$base" --stdout
+  listf="$dir/untracked.list"
+  git -C "$wt" ls-files --others --exclude-standard -z > "$listf" 2>/dev/null
+  : > "$dir/untracked.tgz"
+  if [ -s "$listf" ]; then
+    # Belt-and-braces excludes: these are gitignored in every repo that has them, but a worktree that
+    # is not (yet) ignoring `.venv` would otherwise tar gigabytes into a disk-pressured box.
+    _agent_bounded "$AGENT_CAP_SNAPSHOT_MAX" /dev/null tar czf "$dir/untracked.tgz" --null -T "$listf" \
+      --exclude='.venv' --exclude='node_modules' --exclude='__pycache__' \
+      --exclude='.pytest_cache' --exclude='.git'
+  fi
+  wip="$(_agent_size "$dir/wip.diff")"; patch="$(_agent_size "$dir/commits.patch")"; tar="$(_agent_size "$dir/untracked.tgz")"
+  total=$(( wip + patch + tar ))
+  head="$(git -C "$wt" rev-parse --short HEAD 2>/dev/null)"
+  br="$(git -C "$wt" branch --show-current 2>/dev/null)"
+  dirty="$(git -C "$wt" status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
+  {
+    printf 'kind=%s\ntag=%s\ncaptured=%s\nworktree=%s\nbase=%s\nhead=%s\nbranch=%s\ndirty=%s\n' \
+      "$kind" "$tag" "$(date '+%Y-%m-%d %H:%M:%S')" "$wt" "$base" "${head:-?}" "${br:-?}" "${dirty:-?}"
+    printf 'wip.diff=%s\ncommits.patch=%s\nuntracked.tgz=%s\ntotal_bytes=%s\n' \
+      "$wip" "$patch" "$tar" "$total"
+  } > "$dir/MANIFEST" 2>/dev/null || true
+  printf '%s\t%s' "$dir" "snapshot=$dir bytes=$total"
+}
+
+# ⛔ THE RECORD IS THE DELIVERABLE, NOT A LOG LINE. A log is truncated on the next run and lives on a
+# host nobody reads; the record is a file a supervisor can query for weeks. Two rows:
+#   phase=at-cap   written BEFORE the kill lands (snapshot verified, so the row never claims one)
+#   phase=settled  written after `wait`, carrying the exit status — 143/137 for a TERM/KILL
+# ⛔ APPEND-ONLY, and the reader takes the LAST row: an outcome is amended by appending, never by
+# rewriting, so a `settled` row can never erase the `at-cap` evidence that a cap fired at all.
+agent_cap_record_path() { printf '%s/state/cap-%s-%s.tsv' "${O:-$HOME/orchestrator}" "${1:-agent}" "${2:-}"; }
+agent_cap_record() { # <phase> <kind> <tag> <cap> <source> <elapsed> <snapshot> <note> [<rc>]
+  local phase="$1" kind="$2" tag="$3" cap="$4" src="$5" el="$6" snap="$7" note="$8" rc="${9:--}"
+  local od="${O:-$HOME/orchestrator}/state" rec
+  rec="$(agent_cap_record_path "$kind" "$tag")"
+  mkdir -p "$od" 2>/dev/null || true
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$(date +%s)" "$phase" "$kind" "${tag:--}" "$cap" "$src" "$el" "${snap:--}" "${note:--}" "$rc" \
+    >> "$rec" 2>/dev/null || true
+  # The same row into the fleet-wide append-only series, so "how many lanes did we lose and to what"
+  # is answerable across names and hosts without knowing any single run's tag.
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$(date +%s)" "$phase" "$kind" "${tag:--}" "$cap" "$src" "$el" "${snap:--}" "${note:--}" "$rc" \
+    >> "$od/caps.tsv" 2>/dev/null || true
+}
+
+# Wait for the worker, applying the cap. Returns 0 if it ended on its own, 1 if the cap fired (the
+# worker has then been TERM'd — grace — snapshotted — KILLed, in that order, and `wait` still has to
+# collect its status). ⛔ POLLING, NOT A WATCHDOG SUBSHELL: with the watcher in a subshell the parent
+# reaped `pi` and exited while the watcher was still snapshotting, so the evidence and the kill raced
+# the exit — and a wedged watcher kept the worker alive, which is the exact hang the cap must prevent.
+# Inline, every step is ordered by construction and there is no second process to race.
+agent_wait_with_cap() { # <pid> <cap-seconds> <log> <kind> <tag> <start-epoch>
+  local pid="$1" cap="$2" log="$3" kind="$4" tag="$5" start="$6" end snapnote snapdir
+  while :; do
+    kill -0 "$pid" 2>/dev/null || return 0
+    [ $(( $(date +%s) - start )) -lt "$cap" ] || break
+    sleep 1
+  done
+  # A worker that exited inside the last poll interval finished ON ITS OWN — recording that as
+  # `killed-at-cap` would be a false cap record, and a false cap record is how a supervisor learns to
+  # distrust the very signal this exists to create.
+  kill -0 "$pid" 2>/dev/null || return 0
+  AGENT_CAPPED=1; AGENT_CAP_SECONDS="$cap"
+  echo "[cap] CAPPED $kind ${tag:-<none>} at ${cap}s (source=${AGENT_CAP_SOURCE:-?}) — TERM, bounded grace ${AGENT_CAP_GRACE}s, snapshot, then KILL" >> "$log"
+  kill -TERM "$pid" 2>/dev/null
+  end=$(( $(date +%s) + AGENT_CAP_GRACE ))
+  while kill -0 "$pid" 2>/dev/null && [ "$(date +%s)" -lt "$end" ]; do sleep 1; done
+  # Snapshot BEFORE the hard kill: the record must describe the final state of the worktree, and the
+  # kill must land on a worktree whose contents are already durable elsewhere.
+  snapdir=""; snapnote="$(agent_cap_snapshot "$kind" "$tag" "$start")"
+  read -r snapdir snapnote <<<"$snapnote"
+  [ "$snapdir" = "-" ] && snapdir=""
+  AGENT_CAP_SNAPSHOT="$snapdir"
+  agent_cap_record at-cap "$kind" "$tag" "$cap" "${AGENT_CAP_SOURCE:-?}" "$(( $(date +%s) - start ))" "${snapdir:--}" "$snapnote"
+  echo "[cap] $snapnote" >> "$log"
+  kill -KILL "$pid" 2>/dev/null
+  return 1
+}
+
 run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
-  local t="$1" log="$2" prompt="$3" label="${4:-agent}" pid w rc l start elapsed
+  local t0="$1" t="" log="$2" prompt="$3" label="${4:-agent}" pid rc l start elapsed capsrc _unit
   AGENT_STARTED=0
+  AGENT_CAPPED=0; AGENT_CAP_SNAPSHOT=""
+  # The job declares its own cap; `$1` may be empty to mean "as the prompt asks" (see the ⛔ block
+  # above). Resolved BEFORE the gates so a refusal still records the number it would have used.
+  capsrc=""
+  read -r t capsrc <<<"$(agent_cap_resolve "$t0" "$prompt")"
+  AGENT_CAP_SOURCE="${capsrc:-default}"; AGENT_CAP_SECONDS="$t"
+  if ! is_num "$t" || [ "$t" -le 0 ]; then AGENT_CAP_SECONDS="$AGENT_CAP_DEFAULT"; AGENT_CAP_SOURCE=default; t="$AGENT_CAP_DEFAULT"; fi
   # ── the disk gate (#1765). Read FRESH immediately before the spawn, for the load gate's reason plus
   # one of its own: a lane can sit waiting for a claim for 90 minutes, and the filesystem it will
   # fill is not the one that was measured when it was dispatched.
@@ -365,14 +570,20 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   start="$(date +%s)"
   pi -p --provider deepseek --model deepseek-v4-flash --no-session "$(cat "$prompt")" >> "$log" 2>&1 &
   pid=$!
-  ( sleep "$t"; kill -TERM "$pid" 2>/dev/null; sleep 15; kill -KILL "$pid" 2>/dev/null ) >/dev/null 2>&1 &
-  w=$!
+  # The cap, and what it leaves behind (#2045). Ordered by construction: wait → TERM → bounded grace →
+  # verified snapshot → KILL. `wait` below then collects the real status, 143/137 included.
+  agent_wait_with_cap "$pid" "$t" "$log" "${KIND:-agent}" "${TAG:-}" "$start"
   wait "$pid" 2>/dev/null; rc=$?
-  kill "$w" 2>/dev/null
   # agent-infra#1709 item 3: wall_limit is the CAP, not the cost. elapsed is the measured
   # reviewer/fixer/lane wall-time — the load-bearing number for fleet capacity (it was unmeasured).
   elapsed=$(( $(date +%s) - start ))
-  echo "[timeout] agent pid=$pid wall_limit=${t}s elapsed=${elapsed}s rc=$rc" >> "$log"
+  echo "[timeout] agent pid=$pid wall_limit=${t}s elapsed=${elapsed}s rc=$rc cap_source=${AGENT_CAP_SOURCE:-?} capped=${AGENT_CAPPED}" >> "$log"
+  # ⛔ THE EXIT STATUS IS PART OF THE CAP RECORD, not only of the caller's `.rc` file: a caller that is
+  # itself killed between `wait` and its own write would otherwise leave the cap looking unresolved.
+  # Appended as a SECOND row (`phase=settled`), so the `at-cap` evidence can never be overwritten.
+  if [ "$AGENT_CAPPED" = "1" ]; then
+    agent_cap_record settled "${KIND:-agent}" "${TAG:-}" "$t" "${AGENT_CAP_SOURCE:-?}" "$elapsed" "${AGENT_CAP_SNAPSHOT:--}" "$( [ "$rc" -eq 137 ] && echo killed || echo exited )" "$rc"
+  fi
   # DURABLE time series (agent-infra#1709 item 3). The per-run log above is TRUNCATED whenever
   # the same PR is re-run (`> "$L.log"`), so a single log line erases its own history: measured,
   # three real reviewer samples (885s/963s/1142s) disappeared within minutes. #1709 needs a DAY

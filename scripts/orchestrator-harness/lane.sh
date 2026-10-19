@@ -72,6 +72,14 @@ run_agent "${LANE_TIMEOUT:-2400}" "$O/logs/lane-$N.log" "$O/logs/prompt-$N.txt" 
 # command's status, not the agent's (the defect §7.4 records for retired/do-merge.sh).
 rc=$?
 echo "[lane $N] exited $rc $(date)" >> "$O/logs/lane-$N.log"
+# ⛔ A LANE KILLED AT ITS CAP MUST NOT READ AS A LANE THAT FINISHED (agent-infra#2045). Before this,
+# the only trace of a capped lane was a log with no model output — indistinguishable from a slow one —
+# while 7 modified files sat uncommitted in the worktree. `run_agent` snapshots and records at the cap
+# (spawn-gate.sh); this line is the RUNNER's copy, so the operator reading the lane log sees the same
+# fact without having to know where the record lives. Silent when the cap did not fire.
+if [ "${AGENT_CAPPED:-0}" = "1" ]; then
+  echo "[lane $N] CAPPED at ${AGENT_CAP_SECONDS:-?}s (source=${AGENT_CAP_SOURCE:-?}) — this lane is FAILED, not finished: its work is in ${AGENT_CAP_SNAPSHOT:-<no snapshot>} and its record is $O/state/cap-lane-$N.tsv. Re-dispatch it; do not read commits=0 as "nothing to do"." >> "$O/logs/lane-$N.log"
+fi
 # A gate refusal reports AGENT_LOAD_REFUSED (75) or AGENT_DISK_REFUSED (77); AGENT_STARTED is
 # authoritative rather than the exit code, because `pi` shares the 0–255 status namespace and could
 # exit 75 itself (#1720).
