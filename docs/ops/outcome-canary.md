@@ -571,6 +571,18 @@ Six more (cycle 13), each a case where a datum the tool held was not the one it 
   `not_evaluated: []` instead of 2 with a "(the other 0 checks were not asserted)" note.
 - **`log.age_s` is an age, not a truthy number**: a bool is UNREAD there too, so the "alive but
   useless" arm cannot be skipped by it and the evidence cannot print it as "(1s ago)".
+- **An injected payload's `config` is part of the payload.** `run_static` honoured a fixture's
+  `config`; `--facts` dropped it and used the CLI's (or the plist's) instead — so the SAME file
+  graded `landers LANDER_MISSING` in `--static` and eight greens with exit 0 through `--facts`,
+  because the CLI's repo replaced the file's and `check_landers`' `repo_mismatch` went False,
+  crediting another repo's controller decisions as landers for this repo's PRs. The payload's config
+  is now applied (an EXPLICIT CLI flag still wins — that is a decision, not a default) and the
+  applied keys are disclosed as `signal.config_from_payload`.
+- **`_expect` is validated like every other fixture key.** It decides whether ANYTHING is asserted,
+  and it was accepted as any truthy value then `.items()`-ed: `"_expect": ["controller_cycling"]`
+  raised `AttributeError` out of `run_static` with no fixture rows and exit 1 — "a check FAILED"
+  about a fleet that was never evaluated. Exit 3, like a broken `config`. A null `_expect` stays the
+  documented `NO_EXPECT` mismatch (exit 1).
 - **A malformed `--facts` payload is a usage error, never a crash.** `--facts` accepts the wrapper
   form `{"facts": …, "observed_at": …}`, so `{"facts": null}` is a payload the CLI admits — and it
   reached the report with `collect_error` unassigned (only the collector's `except` set it), raising

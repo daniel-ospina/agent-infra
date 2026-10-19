@@ -4171,6 +4171,13 @@ def load_fixture(path):
         raise FixtureError("%s: %s" % (path, exc))
     if not isinstance(d, dict) or "facts" not in d:
         raise FixtureError("%s: a fixture must be an object with a `facts` key" % path)
+    # ⛔ THE KEY THAT DECIDES WHETHER ANYTHING IS ASSERTED IS VALIDATED TOO. `_expect` was accepted as
+    # any truthy value and then `.items()`-ed, so `"_expect": ["controller_cycling"]` (or a string)
+    # raised `AttributeError: 'list' object has no attribute 'items'` out of `run_static` — a traceback
+    # with NO fixture rows and exit 1, which CI reads as "a check FAILED" about a fleet that was never
+    # evaluated. Exactly the class the `config` guard above already closes, one key over.
+    if d.get("_expect") is not None and not isinstance(d["_expect"], dict):
+        raise FixtureError("%s: `_expect` must be an object mapping a check name to a status" % path)
     return d
 
 
@@ -4381,6 +4388,43 @@ def build_machine(cfg):
     m.tail_lines = 6000
     m.controller_paths = cfg.controller_paths()
     return m
+
+
+# ⛔ A PAYLOAD'S OWN `config` IS PART OF THE PAYLOAD. `--facts <fixture>` replayed a fixture through
+# the live signal path while `run_static` honoured the SAME key in the SAME file: the fixture pinned
+# `lander-from-another-repo` to FAIL in `--static` and to PASS (eight greens, exit 0) through
+# `--facts`, because the CLI's repo replaced the file's and `check_landers`' repo_mismatch went
+# False — decisions written by another repo's controller credited as landers for this one's PRs. So
+# the payload's config is applied, and an EXPLICIT CLI flag still wins (a caller overriding a knob is
+# making a decision; the file merely declares a default).
+_PINNED_BY_FLAG = (
+    ("repo", "repo"), ("label", "label"), ("window_min", "window_s"),
+    ("pr_window_min", "pr_window_s"), ("mem_floor_mb", "mem_floor_mb"),
+    ("disk_floor_gb", "disk_floor_gb"), ("pool_threshold", "pool_threshold"),
+    ("rest_probe_max", "rest_probe_max"), ("queue_stale_min", "queue_stale_s"),
+    ("controller_ws", "controller_ws"), ("controller_name", "controller_name"),
+    ("state_path", "state_path"),
+)
+
+
+def _payload_cfg(base_cfg, payload, args):
+    """Overlay the injected payload's `config` on the CLI config, CLI flags winning."""
+    if not isinstance(payload, dict) or not isinstance(payload.get("config"), dict):
+        return base_cfg, []
+    pinned = set(field for flag, field in _PINNED_BY_FLAG
+                 if getattr(args, flag, None) is not None)
+    base = base_cfg.as_json()
+    applied = []
+    for k in sorted(payload["config"]):
+        if k in pinned:
+            continue
+        base[k] = payload["config"][k]
+        applied.append(k)
+    try:
+        return cfg_from_dict(base), applied
+    except (ValueError, TypeError) as exc:
+        raise FixtureError("--facts %s: unreadable `config` (%s: %s)"
+                           % (args.facts, type(exc).__name__, exc))
 
 
 def cfg_from_args(a):
@@ -4606,7 +4650,7 @@ def main(argv=None):
                   file=sys.stderr)
             return 3
 
-    machine = build_machine(cfg)
+    reported_cfg_from = []
     # ⛔ ONE INITIALISATION, BEFORE EITHER BRANCH. `collect_error` was assigned only in the
     # collector's `except`, and the injected path reads it too — so `--facts <{"facts": null}>` (what
     # a generator or a truncated writer produces, and a shape the WRAPPER form explicitly permits)
@@ -4622,6 +4666,9 @@ def main(argv=None):
             with open(a.facts) as fh:
                 inj = json.load(fh)
             facts = inj.get("facts", inj)
+            cfg, reported_cfg = _payload_cfg(cfg, inj, a)
+            if reported_cfg:
+                reported_cfg_from = reported_cfg
         except Exception as exc:
             print("outcome-canary: cannot read --facts %s: %s" % (a.facts, exc), file=sys.stderr)
             return 3
@@ -4632,7 +4679,13 @@ def main(argv=None):
             print("outcome-canary: --facts %s carries no fact set (its `facts` value is null); "
                   "nothing was evaluated" % a.facts, file=sys.stderr)
             return 3
-    else:
+    # ⛔ BUILT UNCONDITIONALLY, FROM THE EFFECTIVE CFG (after any payload config) AND BEFORE the
+    # collection that uses it. It was created in `main` above the injection branch, and moving the
+    # config overlay meant the payload's `remote`/box identity had to be honoured — but building it
+    # only in the `else` left the SIGNAL path (`machine.remote`, `machine.local()`) with no object at
+    # all. One builder, one place, both branches.
+    machine = build_machine(cfg)
+    if not a.facts:
         try:
             facts = collect_live(cfg, machine=machine, now=now, skip=skip)
         except Exception as exc:
@@ -4675,7 +4728,10 @@ def main(argv=None):
 
     reported = {"respawn": None, "sent": [], "captured": [], "suppressed": [],
                 "not_delivered": [],
-                "facts": ("injected: %s" % a.facts) if _injected else "live collection"}
+                "facts": ("injected: %s" % a.facts) if _injected else "live collection",
+                # WHICH KNOBS CAME FROM THE PAYLOAD: the caller must be able to see that the file
+                # graded itself with its own repo/windows, not with the CLI's.
+                "config_from_payload": reported_cfg_from}
 
     # (a) respawn — ONLY when the controller is genuinely absent
     ctrl = [v for v in verdicts if v.name == "controller_cycling"]
@@ -4849,6 +4905,7 @@ def main(argv=None):
                               "respawn": reported["respawn"],
                               "sent": reported["sent"],
                               "captured": reported.get("captured") or [],
+                              "config_from_payload": reported.get("config_from_payload") or [],
                               "suppressed": reported["suppressed"],
                               "suppressed_ambiguous": reported.get("suppressed_ambiguous") or [],
                               "not_delivered": reported["not_delivered"],

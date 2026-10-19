@@ -4508,6 +4508,19 @@ MUTATIONS = [
      '    if lane_ok:\n        return True, "a lane started %s (the queue record is not the only evidence)" % (\n            _age_txt(lane_ok.get("age_s")))',
      '    if intent or lane_ok:\n        return True, "a dispatch landed %s (the queue record is not the only evidence)" % (\n            _age_txt((intent or lane_ok).get("age_s")))',
      "test_the_intent_line_is_not_reported_as_a_LANDED_dispatch"),
+    # ── cycle-46 defects ─────────────────────────────────────────────────────────────────
+    ("an injected payload's own config is discarded",
+     '            cfg, reported_cfg = _payload_cfg(cfg, inj, a)',
+     '            cfg, reported_cfg = cfg, []',
+     "test_a_payload_CONFIG_is_honoured_so_an_injected_fixture_grades_like_its_own_declaration"),
+    ("an explicit CLI flag loses to the payload's config",
+     '    pinned = set(field for flag, field in _PINNED_BY_FLAG',
+     '    pinned = set(field for flag, field in ()',
+     "test_a_payload_CONFIG_is_honoured_so_an_injected_fixture_grades_like_its_own_declaration"),
+    ("a non-dict _expect is never validated",
+     '    if d.get("_expect") is not None and not isinstance(d["_expect"], dict):',
+     '    if False:',
+     "test_a_non_dict_expect_is_a_USAGE_error_not_a_traceback"),
     # ── cycle-45 defects ─────────────────────────────────────────────────────────────────
     ("a null injected body is graded as a collector crash",
      '        if facts is None:\n            # A null body is a MALFORMED PAYLOAD',
@@ -5842,6 +5855,61 @@ def test_an_INJECTED_fact_set_is_disclosed_in_the_JSON_too():
     assert payload is not None, (rc, (out or err)[-400:])
     assert payload.get("facts_injected") is True, payload.get("facts_injected")
     assert "injected" in (payload.get("facts_source") or ""), payload.get("facts_source")
+
+
+@test
+def test_a_payload_CONFIG_is_honoured_so_an_injected_fixture_grades_like_its_own_declaration():
+    """`run_static` honoured the fixture's `config`; `--facts` dropped it. So the SAME file graded
+    `landers LANDER_MISSING` (exit 1) in `--static` and eight greens with exit 0 through `--facts`,
+    because the CLI's repo replaced the file's and `check_landers`' repo_mismatch went False —
+    decisions written by another repo's controller credited as landers for this repo's PRs. An
+    explicit CLI flag still wins: a caller overriding a knob is making a decision."""
+    fx_path = os.path.join(FIXTURES, "lander-from-another-repo.json")
+    names = ["--static", "--fixture", fx_path]
+    rc_s, out_s, err_s = run_cli(names)
+    # `--static` grades the fixture against its DECLARED `_expect`, which this file satisfies: the
+    # point of the comparison is the VERDICT, which must be the same one `--facts` reaches.
+    assert rc_s == 0 and "every fixture matched" in out_s, (rc_s, out_s[-400:], err_s[-400:])
+    rc_l, out_l, err_l = run_cli(["--live", "--facts", fx_path, "--dry-run", "--no-notify",
+                                  "--no-respawn", "--json"])
+    assert rc_l == 1, (rc_l, out_l[-600:], err_l[-400:])
+    j = json.loads(out_l)
+    got = [(v["check"], v["variant"]) for v in j["verdicts"] if v["status"] != "PASS"]
+    assert got == [("landers", "LANDER_MISSING")], got
+    assert "repo" in j["signal"]["config_from_payload"], j["signal"]["config_from_payload"]
+    # …and an EXPLICIT --repo wins over the payload's, which is a decision, not a silent fallback
+    rc_o, out_o, _ = run_cli(["--live", "--facts", fx_path, "--dry-run", "--no-notify",
+                              "--no-respawn", "--json", "--repo", "daniel-ospina/agent-infra"])
+    jo = json.loads(out_o)
+    assert "repo" not in jo["signal"]["config_from_payload"], jo["signal"]["config_from_payload"]
+    assert jo["config"]["repo"] == "daniel-ospina/agent-infra", jo["config"]["repo"]
+
+
+@test
+def test_a_non_dict_expect_is_a_USAGE_error_not_a_traceback():
+    """`_expect` decides whether ANYTHING is asserted, and it was accepted as any truthy value then
+    `.items()`-ed: `"_expect": ["controller_cycling"]` raised `AttributeError` out of `run_static`
+    with NO fixture rows and exit 1 — the code CI reads as "a check FAILed" about a fleet that was
+    never evaluated. Same class as the `config` guard beside it."""
+    tmp = tempfile.mkdtemp(prefix="oc-badexpect-")
+    try:
+        for bad in (["controller_cycling"], "controller_cycling", 3, [{"a": 1}]):
+            path = os.path.join(tmp, "f.json")
+            with open(path, "w") as fh:
+                json.dump({"name": "x", "facts": {}, "_expect": bad}, fh)
+            rc, out, err = run_cli(["--static", "--fixture", path])
+            assert rc == 3, (bad, rc, out[-300:], err[-300:])
+            assert "Traceback" not in err, (bad, err[-300:])
+            assert "_expect" in err, (bad, err[-300:])
+        # a NULL `_expect` stays the documented NO_EXPECT mismatch (exit 1), not a usage error
+        path = os.path.join(tmp, "f2.json")
+        with open(path, "w") as fh:
+            json.dump({"name": "x", "facts": {}, "_expect": None}, fh)
+        rc, out, err = run_cli(["--static", "--fixture", path])
+        assert rc == 1, (rc, out[-300:], err[-300:])
+        assert "NO_EXPECT" in out, out[-400:]
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 @test
