@@ -412,9 +412,12 @@ EOS
 printf 'scripts/one.sh\tdiscarded-status\t1\t#1743 — the reason that must SURVIVE a rewrite\n' > "$D/base.tsv"
 out="$(bash "$CHECK" --root "$D" --baseline "$D/base.tsv" --update-baseline 2>&1)"; rc=$?
 row="$(awk -F'\t' '$0 !~ /^#/ && NF == 4 && $3 == 1' "$D/base.tsv")"
-# ⛔ a here-string, never `… | grep -q`: a quiet grep exits at its FIRST match and the still-writing
-# producer takes SIGPIPE, which `pipefail` promotes to the pipeline's status — the #841 idiom this
-# repo's own guard refuses (it flagged this very line in CI).
+# ⛔ NO `… | grep -q` HERE, and the remedy has TWO spellings — pick by producer (#841/#864): a
+# quiet grep exits at its FIRST match, the still-writing producer takes SIGPIPE, and `pipefail`
+# promotes that to the pipeline's status, so a match that IS present can read as absent. A builtin
+# producer (`printf`/`echo`) inverts to a here-string; ANY other producer CAPTURES first and tests
+# in the shell — which is why the awk above is captured into `row` and tested with `[ -n "$row" ]`,
+# while the grep below reads a FILE. CI caught this line with the pipeline spelling.
 [ "$rc" -eq 0 ] && grep -q 'the reason that must SURVIVE a rewrite' "$D/base.tsv" && [ -n "$row" ]
 ck $? "D6 --update-baseline keeps an existing group's justification and its count"
 
