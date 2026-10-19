@@ -22,15 +22,34 @@ MP="$(ex mp_reason)"
 if [ "$(printf '%s' "$MP" | wc -l | tr -d ' ')" -lt 3 ]; then
   echo "❌ could not extract mp_reason from $ORCH — the rule moved or was reformatted"; exit 1
 fi
+# ⛔ mp_reason is no longer arithmetic-only: it validates its inputs with is_num(), the shipped
+# one-liner. Extract THAT from the same file (never re-implement it here, or the suite would grade
+# its own copy) and fail loudly if it moved — an undefined is_num makes every gate test read "no
+# gate", i.e. a suite that passes by testing nothing.
+IS_NUM_FN="$(grep -E '^is_num\(\) \{' "$ORCH")"
+[ -n "$IS_NUM_FN" ] || { echo "❌ could not extract is_num() from $ORCH — mp_reason's input validation moved"; exit 1; }
+eval "$IS_NUM_FN"
 eval "$MP"
+MP_REL="$(ex mp_release)"
+[ -n "$MP_REL" ] || { echo "❌ could not extract mp_release from $ORCH — the bound's release note moved"; exit 1; }
+eval "$MP_REL"
 echo "extracted $(printf '%s' "$MP" | wc -l | tr -d ' ') lines of mp_reason from the live script"
 
 MERGE_PRIORITY_AT=10
-ck() { # ck <label> <open_prs> <lanes> <workers> <expect: gate|open>
-  local got; got="$(mp_reason "$2" "$3" "$4")"
+MERGE_PRIORITY_MAX_AGE_MIN=180
+# A fixed clock and two land records, so the bound is exercised deterministically: the gate now needs
+# EVIDENCE that a drain is happening (a land inside the window) and YOUTH (an unowned PR inside it).
+MP_NOW=1800000000
+MP_LAND_RECENT=$(( MP_NOW - 300 ))          # a PR landed 5 minutes ago
+MP_LAND_STALE=$(( MP_NOW - 4 * 3600 ))      # the last land was 4 hours ago
+ck() { # ck <label> <unowned> <lanes> <workers> <expect: gate|open> [age] [land] [open] [blocked_since]
+  # `-` (not `:-`): an EXPLICIT empty argument is a CASE (an unreadable land record / age), and
+  # `:-` would silently substitute the healthy default — making the release cases below unprovable.
+  local got age="${6-5}" land="${7-$MP_LAND_RECENT}" open="${8-$2}" since="${9-}"
+  got="$(mp_reason "$2" "$3" "$4" "$age" "$land" "$open" "acme/widget" "$MP_NOW" "$since")"
   if [ "$5" = "gate" ] && [ -n "$got" ]; then echo "  ✅ $1  (gated)"; PASS=$((PASS+1))
   elif [ "$5" = "open" ] && [ -z "$got" ]; then echo "  ✅ $1  (dispatch allowed)"; PASS=$((PASS+1))
-  else echo "  ❌ $1 — expected $5, got [${got:-<empty>}] for (prs=$2 lanes=$3 workers=$4)"; FAIL=$((FAIL+1)); fi
+  else echo "  ❌ $1 — expected $5, got [${got:-<empty>}] for (prs=$2 lanes=$3 workers=$4 age=${6-5} land=${land:-<none>})"; FAIL=$((FAIL+1)); fi
 }
 
 echo
@@ -48,12 +67,43 @@ ck "exactly 10 PRs -> NOT over the threshold"             10 2 5  open
 ck "11 PRs, 0 lanes, 0 workers -> dispatch ok (nothing to drain with)" 11 0 0 open
 
 echo
+echo "=== THE BOUND: a stop nothing can clear is not a guard (agent-infra#2040) ==="
+# MEASURED 2026-10-18 on all three cloud cells: `merge-priority (52 unowned of 54 open PRs —
+# draining before opening more)` at `lanes=0` for hours, behind a 219-candidate pool. The gate could
+# never OPEN: `unowned` is not a number any unattended lane can move (every session authenticates as
+# the same GitHub user, so ownership is not visible from the PR author, and nothing hand-assigns
+# them). So the block now also requires PROGRESS (a land inside the window) and YOUTH (an unowned PR
+# inside it). Each case below is one half of that bound, and the release must SAY why it released.
+ck "over threshold + a land in the window + young unowned PRs -> DRAIN" 27 2 5 gate 5 "$MP_LAND_RECENT"
+ck "over threshold but NOTHING landed in the window -> RELEASE" 27 2 5 open 5 "$MP_LAND_STALE"
+ck "over threshold and NO land record at all -> RELEASE" 27 2 5 open 5 ""
+ck "over threshold but the unowned PRs are older than the bound -> RELEASE" 27 2 5 open 999 "$MP_LAND_RECENT"
+ck "over threshold but the unowned age is UNREADABLE -> RELEASE" 27 2 5 open "" "$MP_LAND_RECENT"
+ck "over threshold, a land in the window, but nothing in flight -> RELEASE" 27 0 0 open 5 "$MP_LAND_RECENT"
+ck "below the threshold the bound is irrelevant (still dispatch)" 20 2 5 open 5 "$MP_LAND_STALE"
+rel="$(mp_release 27 2 5 5 "$MP_LAND_STALE" 27 acme/widget "$MP_NOW")"
+case "$rel" in *"nothing landed in 180m"*) echo "  ✅ the release NAMES the stalled drain: $rel"; PASS=$((PASS+1)) ;;
+  *) echo "  ❌ the release did not name the stalled drain: ${rel:-<empty>}"; FAIL=$((FAIL+1)) ;; esac
+rel2="$(mp_release 27 2 5 999 "$MP_LAND_RECENT" 27 acme/widget "$MP_NOW")"
+case "$rel2" in *"youngest unowned PR is 999m old"*) echo "  ✅ the release names the AGE bound when that is the releasing condition"; PASS=$((PASS+1)) ;;
+  *) echo "  ❌ the age-bound release reason is missing: ${rel2:-<empty>}"; FAIL=$((FAIL+1)) ;; esac
+[ -z "$(mp_release 10 2 5 5 "$MP_LAND_STALE" 10 acme/widget "$MP_NOW")" ] \
+  && { echo "  ✅ below the threshold there is no release line (nothing was released)"; PASS=$((PASS+1)); } \
+  || { echo "  ❌ a below-threshold cycle printed a release line"; FAIL=$((FAIL+1)); }
+# The gate's own line must NAME the repo it counted and the two measurements that decided it, so a
+# wrong-surface read (the guard grading another repo's queue) is visible in the log instead of
+# invisible for hours — the 2026-10-18 defect.
+gated="$(mp_reason 27 2 5 5 "$MP_LAND_RECENT" 27 acme/widget "$MP_NOW")"
+case "$gated" in *acme/widget*"youngest unowned 5m"*"180m bound"*) echo "  ✅ the gate line NAMES the repo and both measurements: $gated"; PASS=$((PASS+1)) ;;
+  *) echo "  ❌ the gate line does not name the repo/measurements: ${gated:-<empty>}"; FAIL=$((FAIL+1)) ;; esac
+
+echo
 echo "=== regression proof: the OLD lanes-only form would have failed the first case ==="
 mp_reason_old() { if [ "${1:-0}" -gt "$MERGE_PRIORITY_AT" ] && [ "${2:-0}" -ge 1 ]; then echo gated; fi; }
 old="$(mp_reason_old 27 0 8)"
 if [ -z "$old" ]; then echo "  ✅ old form returned EMPTY for (27,0,8) — the exact defect being fixed"; PASS=$((PASS+1))
 else echo "  ❌ old form gated it — the fix would be a no-op"; FAIL=$((FAIL+1)); fi
-new="$(mp_reason 27 0 8)"
+new="$(mp_reason 27 0 8 5 "$MP_LAND_RECENT" 27 acme/widget "$MP_NOW")"
 [ -n "$new" ] && { echo "  ✅ new form gates it: $new"; PASS=$((PASS+1)); } || { echo "  ❌ new form still lets it through"; FAIL=$((FAIL+1)); }
 
 echo
@@ -1004,7 +1054,10 @@ echo "=== merge priority counts UNOWNED PRs, not the TOTAL open count (the fleet
 # The functions are EXTRACTED from the live controller, not re-implemented — the same drift guard
 # the mp_reason table above uses, so a rename/reformat fails here instead of silently skipping.
 INST="$HERE/install.sh"
-for _fn in fix_slots pr_owned unowned_pr_count claim_live; do
+# `unowned_scan` is the shared scan `unowned_pr_count` now reads its count from (#2040: one parser
+# for the count AND the age probe), so it must be extracted with it or the shipped function would
+# fail on an undefined helper — a false negative that reads as "the rule moved".
+for _fn in fix_slots pr_owned unowned_scan unowned_pr_count claim_live; do
   ex "$_fn" > "$TMP/$_fn.sh"
 done
 # wsess() and is_num() are ONE-LINERS, so an `ex` sed RANGE would run past their own end pattern
@@ -1013,15 +1066,15 @@ done
 grep -E '^wsess\(\) \{' "$ORCH" > "$TMP/wsess.sh"
 grep -E '^is_num\(\) \{' "$ORCH" > "$TMP/is_num.sh"
 _own_ok=1
-for _fn in wsess is_num fix_slots pr_owned unowned_pr_count claim_live; do
+for _fn in wsess is_num fix_slots pr_owned unowned_scan unowned_pr_count claim_live; do
   [ -s "$TMP/$_fn.sh" ] || { echo "  ❌ could not extract $_fn() from orch-loop.sh — the rule moved or was reformatted"; _own_ok=0; }
 done
-cat "$TMP/is_num.sh" "$TMP/wsess.sh" "$TMP/fix_slots.sh" "$TMP/pr_owned.sh" "$TMP/unowned_pr_count.sh" "$TMP/claim_live.sh" > "$TMP/ownfunctions.sh"
+cat "$TMP/is_num.sh" "$TMP/wsess.sh" "$TMP/fix_slots.sh" "$TMP/pr_owned.sh" "$TMP/unowned_scan.sh" "$TMP/unowned_pr_count.sh" "$TMP/claim_live.sh" > "$TMP/ownfunctions.sh"
 if [ "$_own_ok" = "1" ] && bash -n "$TMP/ownfunctions.sh" 2>/dev/null; then
   mkdir -p "$TMP/ownO/state"
   # Subshell helpers: the shipped functions are sourced, never copied, and `O` points at a fixture
   # state dir so nothing here can touch a real box.
-  _own() { ( O="$TMP/ownO"; . "$TMP/is_num.sh"; . "$TMP/wsess.sh"; . "$TMP/claim_live.sh"; . "$TMP/pr_owned.sh"; . "$TMP/unowned_pr_count.sh"; unowned_pr_count "$1" ); }
+  _own() { ( O="$TMP/ownO"; . "$TMP/is_num.sh"; . "$TMP/wsess.sh"; . "$TMP/claim_live.sh"; . "$TMP/pr_owned.sh"; . "$TMP/unowned_scan.sh"; . "$TMP/unowned_pr_count.sh"; unowned_pr_count "$1" ); }
   _owned() { ( O="$TMP/ownO"; . "$TMP/is_num.sh"; . "$TMP/wsess.sh"; . "$TMP/claim_live.sh"; . "$TMP/pr_owned.sh"; if pr_owned "$1" "${2:-}"; then printf 'owned'; else printf 'unowned'; fi ); }
 
   # (1) wsess() is an EXACT membership test over the once-per-cycle snapshot. A substring/prefix
@@ -1209,7 +1262,7 @@ if [ "$_own_ok" = "1" ] && bash -n "$TMP/ownfunctions.sh" 2>/dev/null; then
   else
     echo "  ✅ no fixer spawn site is left on the unraised MAX_FIX (absence pin)"; PASS=$((PASS+1))
   fi
-  wpin "the gate receives the UNOWNED count" "$ORCH" 'GATE_WHY="$(mp_reason "${UPN:-0}" "$LANES" "$WORKERS" "${OPEN_N:-0}")"'
+  wpin "the gate receives the UNOWNED count" "$ORCH" 'GATE_WHY="$(mp_reason "${UPN:-0}" "$LANES" "$WORKERS" "${YOUNG_AGE:-}" "${LAND_EPOCH:-}" "${OPEN_N:-0}" "${OR:-}" "" "${BLOCKED_SINCE:-}" "${RELEASED_UNTIL:-}")"'
   # ⛔ The REVERT, pinned as an ABSENCE: passing the total open count is the exact regression this
   # section exists for, and a presence-only wpin cannot see it.
   if grep -qF 'mp_reason "${OPEN_N:-0}"' "$ORCH"; then
@@ -1232,6 +1285,405 @@ if [ "$_own_ok" = "1" ] && bash -n "$TMP/ownfunctions.sh" 2>/dev/null; then
   fi
 else
   echo "  ❌ the ownership functions did not extract to syntactically valid shell"; FAIL=$((FAIL+1))
+fi
+
+echo
+echo "=== THE BOUND: bounded in EVIDENCE and in TIME, and never silent (agent-infra#2040) ==="
+# (i) The ultimate time bound. Conditions (a)-(c) alone do not bound the gate in the steady state:
+# one merge an hour plus one young unowned PR holds dispatch forever while calling it "draining".
+SINCE_STALE=$(( MP_NOW - 5 * 3600 ))
+ck "held longer than the window (blocked-since 5h) -> RELEASE even though the drain looks live" 27 2 5 open 5 "$MP_LAND_RECENT" 27 "$SINCE_STALE"
+ck "held well inside the window (blocked-since 5m) -> still DRAIN" 27 2 5 gate 5 "$MP_LAND_RECENT" 27 "$(( MP_NOW - 300 ))"
+# (i-b) The bound-driven release HOLDS THE GATE OPEN for the rest of its window. Without it the
+# released cycle clears the stamp and the next cycle re-arms it — a single dispatch pulse per window
+# instead of a window of dispatch, i.e. the stop returns as "almost nothing" (review round 3).
+ckr() { # ckr <label> <released_until> <expect>
+  local got
+  got="$(mp_reason 27 2 5 5 "$MP_LAND_RECENT" 27 "acme/widget" "$MP_NOW" "" "$2")"
+  if [ "$3" = gate ] && [ -n "$got" ]; then echo "  ok $1 (gated)"; PASS=$((PASS+1))
+  elif [ "$3" = open ] && [ -z "$got" ]; then echo "  ok $1 (dispatch allowed)"; PASS=$((PASS+1))
+  else echo "  FAIL $1 — expected $3, got [${got:-<empty>}]"; FAIL=$((FAIL+1)); fi
+}
+ckr "a window the TIME BOUND opened keeps dispatch open" "$(( MP_NOW + 60 ))" open
+ckr "…and the gate re-arms once that window expires"       "$(( MP_NOW - 1 ))"  gate
+ckr "an unreadable released-until cannot hold the gate open (empty)" "" gate
+ckr "a released-until BEYOND one window (clock step-back, copied state dir) is refused" "$(( MP_NOW + 999999999 ))" gate
+rel3="$(mp_release 27 2 5 5 "$MP_LAND_RECENT" 27 acme/widget "$MP_NOW" "$SINCE_STALE")"
+case "$rel3" in *"held for"*"without clearing"*) echo "  ok a block that outlived the window says so in the release line"; PASS=$((PASS+1)) ;;
+  *) echo "  FAIL the time-bound release reason is missing: ${rel3:-<empty>}"; FAIL=$((FAIL+1)) ;; esac
+# (ii) MERGE_PRIORITY_MAX_AGE_MIN=0 would make the gate INERT and SILENT (`[ age -lt 0 ]` is false),
+# so the shipped floor must coerce it. Drive the COERCION exactly as the loop runs it.
+_floor() { ( eval "$(grep -E '^is_num\(\) \{' "$ORCH")"; eval "$(grep -E '^is_limit\(\) \{' "$ORCH")"; eval "$1"; eval "$(grep -E '^is_limit "\$\{MERGE_PRIORITY_MAX_AGE_MIN:' "$ORCH")"; printf '%s' "$MERGE_PRIORITY_MAX_AGE_MIN" ); }
+eqv "a 0 MERGE_PRIORITY_MAX_AGE_MIN is coerced to the default (0 would make the gate inert, silently)" "180" "$(_floor 'MERGE_PRIORITY_MAX_AGE_MIN=0')"
+eqv "a valid MERGE_PRIORITY_MAX_AGE_MIN is honoured" "45" "$(_floor 'MERGE_PRIORITY_MAX_AGE_MIN=45')"
+_flr2() { ( eval "$(grep -E '^is_num\(\) \{' "$ORCH")"; eval "$(grep -E '^is_limit\(\) \{' "$ORCH")"; eval "$1"; eval "$(grep -E '^is_limit "\$\{FUNNEL_MAX_AGE_MIN:' "$ORCH")"; printf '%s' "$FUNNEL_MAX_AGE_MIN" ); }
+eqv "a 0 FUNNEL_MAX_AGE_MIN is coerced to the default (0 would print a fresh record as STALE)" "30" "$(_flr2 'FUNNEL_MAX_AGE_MIN=0')"
+eqv "a valid FUNNEL_MAX_AGE_MIN is honoured" "7" "$(_flr2 'FUNNEL_MAX_AGE_MIN=7')"
+
+# (iii) THE STAMP'S OWN LIFECYCLE — where findings 2 and 4 of review round 2 lived. The ck table
+# above passes `since` IN as an argument, so nothing exercised the write/repair/clear paths: making
+# `set` overwrite every cycle, or `mp_blocked_since` always return empty, kept every suite green.
+# ⛔ THE SHARED FIXTURE IS BUILT BEFORE ITS FIRST USE. It used to be created ~180 lines BELOW the
+# first `_mp`/`_rel`/`_bound` that sources it, so every one of those invocations printed
+# `pr_base.sh: No such file or directory` and passed only because `is_num` happened to be eval'd into
+# the test shell — noise that makes a genuinely missing dependency indistinguishable from the expected
+# kind (review round 7). `_fixture_ok` turns a missing dependency into a FAILURE, not a message.
+{ grep -E '^is_num\(\) \{' "$ORCH"; grep -E '^wsess\(\) \{' "$ORCH"; grep -E '^wsess_snapshot\(\) \{' "$ORCH"; ex file_mtime_epoch > "$TMP/pr_file_mtime_epoch.sh"; } > "$TMP/pr_base.sh"
+_fixture_ok=0
+grep -q 'is_num' "$TMP/pr_base.sh" && grep -q 'file_mtime_epoch' "$TMP/pr_file_mtime_epoch.sh" && _fixture_ok=1
+[ "$_fixture_ok" = "1" ] || { echo "  FAIL the shared fixture (pr_base.sh) did not build — every case below would test the fixture, not the code"; FAIL=$((FAIL+1)); }
+ex mp_block_marker > "$TMP/fn_mp_block_marker.sh"
+ex mp_blocked_since > "$TMP/fn_mp_blocked_since.sh"
+# the atomic writer and the state-dir resolver are DEPENDENCIES of both (the stamp is written through
+# _stamp_set, which is where the failure fallback lives) — a fixture that omits them tests the
+# fixture, not the code.
+ex _stamp_set        > "$TMP/fn_stamp_set.sh"
+ex mp_state_dir      > "$TMP/fn_state_dir.sh"
+if bash -n "$TMP/fn_mp_block_marker.sh" 2>/dev/null && bash -n "$TMP/fn_mp_blocked_since.sh" 2>/dev/null \
+   && bash -n "$TMP/fn_stamp_set.sh" 2>/dev/null && bash -n "$TMP/fn_state_dir.sh" 2>/dev/null; then
+  MO="$TMP/mpO"; rm -rf "$MO"; mkdir -p "$MO/state"
+  # ⛔ `is_num` TOO — the stamp functions depend on it, and without it `is_num` is unbound, every
+  # guard reads FALSE, and the marker silently degrades to a blind overwrite (exactly how this test
+  # first failed). A fixture that omits a dependency tests the fixture, not the code.
+  _mp() { ( O="$MO"; . "$TMP/pr_base.sh"; . "$TMP/fn_state_dir.sh"; . "$TMP/fn_stamp_set.sh"; . "$TMP/fn_mp_block_marker.sh"; . "$TMP/fn_mp_blocked_since.sh"; "$@" ); }
+  _mark() { cat "$MO/state/merge-priority-blocked-since" 2>/dev/null | tr -d '\n'; }
+  _mp mp_block_marker "$MO/state" set 1800000000
+  eqv "a first merge-priority cycle stamps the block" "1800000000" "$(_mark)"
+  _mp mp_block_marker "$MO/state" set 1800009999
+  eqv "a LATER cycle of the SAME block keeps the FIRST stamp (the bound measures one block, not the last cycle)" "1800000000" "$(_mark)"
+  eqv "…and the stamp is served back as an epoch" "1800000000" "$(_mp mp_blocked_since "$MO/state" 1800010000)"
+  # A stamp that cannot bound anything must not latch the bound OFF: an empty / non-numeric / future
+  # stamp is repaired by the next `set`, and is never SERVED (a future stamp makes now-since negative,
+  # so (d) silently never fires and the gate holds forever).
+  printf '' > "$MO/state/merge-priority-blocked-since"
+  eqv "an EMPTY stamp (a truncated write) is never served" "" "$(_mp mp_blocked_since "$MO/state" 1800010000)"
+  _mp mp_block_marker "$MO/state" set 1800010000
+  eqv "…and the next cycle REPAIRS it instead of latching the bound off" "1800010000" "$(_mark)"
+  printf 'garbage\n' > "$MO/state/merge-priority-blocked-since"
+  eqv "a NON-NUMERIC stamp is never served" "" "$(_mp mp_blocked_since "$MO/state" 1800010000)"
+  _mp mp_block_marker "$MO/state" set 1800015000
+  eqv "…and is repaired by the next cycle" "1800015000" "$(_mark)"
+  printf '1900000000\n' > "$MO/state/merge-priority-blocked-since"     # the future
+  eqv "a FUTURE stamp (clock step-back, copied state dir) is never served" "" "$(_mp mp_blocked_since "$MO/state" 1800015000)"
+  _mp mp_block_marker "$MO/state" set 1800016000
+  eqv "…and is repaired by the next cycle" "1800016000" "$(_mark)"
+  _mp mp_block_marker "$MO/state" clear
+  eqv "clearing the block removes the stamp (a released cycle re-arms a full window)" "" "$(_mark)"
+  eqv "…and reads back empty" "" "$(_mp mp_blocked_since "$MO/state" 1800016000)"
+  # The bound is ONLY armed by a merge-priority hold. A different gate must not leave a stamp whose
+  # age the merge-priority gate then inherits (that released on the FIRST merge-priority cycle).
+  # ⛔ THE CALLS, NOT JUST THE FUNCTIONS (review round 8, P1). Every function below is driven, but
+  # deleting the ARMING call (`mp_block_marker … set`) leaves clause (d) unreachable — the permanent
+  # stop this whole change exists to end — and replacing the WINDOW write with `if false` removes the
+  # sticky window; both stayed green across all four suites. Presence pins on the exact shipped lines:
+  [ "$(grep -cF 'command -v mp_block_marker >/dev/null 2>&1 && mp_block_marker "$O/state" set "$(date +%s)"' "$ORCH")" = "1" ] \
+    && { echo "  ok the HELD cycle actually ARMS the block stamp (the bound can start)"; PASS=$((PASS+1)); } \
+    || { echo "  FAIL nothing arms the block stamp — clause (d) is unreachable and the gate can hold forever"; FAIL=$((FAIL+1)); }
+  [ "$(grep -cF 'mp_released_marker "$O/state" set "$(( _now_r + _win ))"' "$ORCH")" = "1" ] \
+    && { echo "  ok a bound-driven release actually WRITES the window"; PASS=$((PASS+1)); } \
+    || { echo "  FAIL nothing writes the release window — the sticky window is gone"; FAIL=$((FAIL+1)); }
+  # …and the window write must sit INSIDE the bound-release branch, not merely somewhere in the file.
+  _bound_call_ln="$(grep -nF 'if command -v mp_bound_released' "$ORCH" | head -1 | cut -d: -f1)"
+  _win_call_ln="$(grep -nF 'mp_released_marker "$O/state" set' "$ORCH" | head -1 | cut -d: -f1)"
+  [ -n "$_bound_call_ln" ] && [ -n "$_win_call_ln" ] && [ "$_bound_call_ln" -lt "$_win_call_ln" ] && [ $(( _win_call_ln - _bound_call_ln )) -le 8 ] \
+    && { echo "  ok the window is written by the BOUND branch only (not by every release)"; PASS=$((PASS+1)); } \
+    || { echo "  FAIL the window write is not inside the mp_bound_released branch (lines ${_bound_call_ln:-?} / ${_win_call_ln:-?})"; FAIL=$((FAIL+1)); }
+  # ⛔ ARMED OFF A FLAG, NOT OFF THE REASON'S WORDING (review round 3, finding 4). Re-parsing the
+  # human-readable reason made the ultimate bound silently unreachable the day someone rewords it,
+  # with no test reddening — so the pin is on the flag the loop sets where it PRODUCES the reason.
+  [ "$(grep -cF 'case "$GATE_WHY" in merge-priority*) MP_HELD=1 ;; esac' "$ORCH")" = "1" ] \
+    && { echo "  ok merge priority is identified by a FLAG, not by parsing its message"; PASS=$((PASS+1)); } \
+    || { echo "  FAIL the loop does not set MP_HELD from the merge-priority gate — the arming rule is coupled to prose again"; FAIL=$((FAIL+1)); }
+  [ "$(grep -cF 'elif [ -n "${MP_HELD:-}" ]; then' "$ORCH")" = "1" ] \
+    && { echo "  ok the stamp is armed only on MP_HELD (a load/lane block cannot inherit it)"; PASS=$((PASS+1)); } \
+    || { echo "  FAIL the stamp is armed on something other than MP_HELD"; FAIL=$((FAIL+1)); }
+  # …and the release is never SILENT: the released cycle must print its reason (the half of the fix
+  # that an operator can actually see).
+  [ "$(grep -cF '[ -n "$RELEASE_NOTE" ] && echo "[dispatch] $RELEASE_NOTE" >> "$LOG"' "$ORCH")" = "1" ] \
+    && { echo "  ok a released cycle PRINTS its release reason (never silent)"; PASS=$((PASS+1)); } \
+    || { echo "  FAIL the release reason is not logged — a release would read like the gate never fired"; FAIL=$((FAIL+1)); }
+  # …and the derived OR must REACH the refresh child, which reads its listings from it.
+  [ "$(grep -cE '^export OR$' "$ORCH")" = "1" ] \
+    && { echo "  ok the derived OR is EXPORTED to the refresh child"; PASS=$((PASS+1)); } \
+    || { echo "  FAIL OR is not exported — the child re-derives its own default and the pool comes from another repo"; FAIL=$((FAIL+1)); }
+  # ── the released-until marker (the held-open window) ────────────────────────────────────────────
+  ex mp_released_until  > "$TMP/fn_mp_released_until.sh"
+  ex mp_released_marker > "$TMP/fn_mp_released_marker.sh"
+  _rel() { ( O="$MO"; MERGE_PRIORITY_MAX_AGE_MIN=180; . "$TMP/pr_base.sh"; . "$TMP/fn_state_dir.sh"; . "$TMP/fn_stamp_set.sh"; . "$TMP/fn_mp_block_marker.sh"; . "$TMP/fn_mp_released_until.sh"; . "$TMP/fn_mp_released_marker.sh"; "$@" ); }
+  _rel mp_released_marker "$MO/state" set 1800020000
+  eqv "a window inside one bound is served (the gate stays open)" "1800020000" "$(_rel mp_released_until "$MO/state" 1800019000)"
+  eqv "…and it EXPIRES on its own — nothing has to clear it"      ""           "$(_rel mp_released_until "$MO/state" 1800020001)"
+  _rel mp_released_marker "$MO/state" set 1900000000                # a clock step-back / copied state dir
+  eqv "a window AHEAD OF ONE BOUND is not served (it would disable the gate for the skew's size)" "" \
+      "$(_rel mp_released_until "$MO/state" 1800019000)"
+  _rel mp_released_marker "$MO/state" clear
+  eqv "clearing the window removes it" "" "$(_rel mp_released_until "$MO/state" 1800019000)"
+  # ⛔ THE MEMORY MUST OUTRANK AN EXPIRED FILE (review round 8, P2 — round 7's P1 was undiscriminated).
+  # Reachable sequence: a window is written while the dir is writable, the dir becomes unwritable, the
+  # next write fails and lives only in-process — and the EXPIRED file left behind is still numeric, so
+  # a "fallback only when the file yields nothing" rule served NOTHING and the box fell back to one
+  # pulse per bound.
+  eqv "an EXPIRED file does not shadow the live in-process window" "1800020000" \
+      "$( ( O="$MO"; MERGE_PRIORITY_MAX_AGE_MIN=180; . "$TMP/pr_base.sh"; . "$TMP/fn_state_dir.sh"; . "$TMP/fn_stamp_set.sh"; . "$TMP/fn_mp_block_marker.sh"; . "$TMP/fn_mp_released_until.sh"
+           printf '1700000000\n' > "$MO/state/merge-priority-released-until"     # expired file
+           MP_RELEASED_FALLBACK=1800020000                                        # the live window
+           mp_released_until "$MO/state" 1800019000 ) )"
+  # …and the one-window clamp still applies to the memory, so it cannot extend itself.
+  eqv "…but the in-process window is still clamped to one bound" "" \
+      "$( ( O="$MO"; MERGE_PRIORITY_MAX_AGE_MIN=180; . "$TMP/pr_base.sh"; . "$TMP/fn_state_dir.sh"; . "$TMP/fn_stamp_set.sh"; . "$TMP/fn_mp_block_marker.sh"; . "$TMP/fn_mp_released_until.sh"
+           printf '1700000000\n' > "$MO/state/merge-priority-released-until"
+           MP_RELEASED_FALLBACK=1900000000
+           mp_released_until "$MO/state" 1800019000 ) )"
+  # ── did the ULTIMATE BOUND release (and so earn the sticky window)? ────────────────────────────
+  # ⛔ DRIVEN, NOT GREPPED (review round 6). Only the call site's text was pinned, so deleting the
+  # `since` arm inside mp_bound_released — after which EVERY evidence-driven release (nothing in
+  # flight, no land in the window) also granted a 180m window with the gate entirely off at 200
+  # unowned PRs — kept all four suites green.
+  ex mp_bound_released > "$TMP/fn_mp_bound_released.sh"
+  _bound() { # _bound <unowned> <lanes> <workers> <age> <land> <now> <since>
+    ( MERGE_PRIORITY_AT=25; MERGE_PRIORITY_MAX_AGE_MIN=180; . "$TMP/pr_base.sh"; . "$TMP/fn_mp_bound_released.sh"
+      if mp_bound_released "$1" "$2" "$3" "$4" "$5" "$6" "$7"; then echo yes; else echo no; fi ); }
+  # A land ONE MINUTE ago and a block 5h old: the evidence holds (a)-(c), only the bound (d) fires.
+  eqv "the bound RELEASED when the block outlived the window and the evidence still holds" \
+      "yes" "$(_bound 27 2 5 5 1800020000 1800020060 $(( 1800020060 - 5*3600 )))"
+  eqv "…but NOT when the block is younger than the window" \
+      "no" "$(_bound 27 2 5 5 1800000000 1800020000 $(( 1800020000 - 300 )))"
+  eqv "…not when NOTHING is in flight (an evidence release earns no window)" \
+      "no" "$(_bound 27 0 0 5 1800000000 1800020000 $(( 1800020000 - 5*3600 )))"
+  eqv "…not when no land is inside the window" \
+      "no" "$(_bound 27 2 5 5 1700000000 1800020000 $(( 1800020000 - 5*3600 )))"
+  eqv "…not when the youngest unowned PR is older than the window" \
+      "no" "$(_bound 27 2 5 5000 1800000000 1800020000 $(( 1800020000 - 5*3600 )))"
+  eqv "…and not when there is no stamp at all (no bound has started)" \
+      "no" "$(_bound 27 2 5 5 1800000000 1800020000 "")"
+  # …and the window is NOT touched by the branch where a DIFFERENT gate holds: clearing it there
+  # shortened every window on a draining box (load/lanes blocks fire routinely).
+  # The OTHER-GATE arm only: from the `else` that follows the MP_HELD arm to its closing `fi`. (An
+  # awk range starting at the `elif` would swallow the MP_HELD arm too, and that arm legitimately
+  # clears the marker — it runs on a cycle where no window can be open.)
+  _else_block="$(awk '/elif \[ -n "\$\{MP_HELD:-\}" \]; then/{f=2} f==2&&/^  else$/{f=3;next} f==3{print} f==3&&/^  fi$/{exit}' "$ORCH")"
+  case "$_else_block" in
+    *mp_released_marker*) echo "  FAIL the other-gate branch clears the release window — a load/lane block would end it early"; FAIL=$((FAIL+1)) ;;
+    *) echo "  ok the other-gate branch does NOT clear the release window (absence pin)"; PASS=$((PASS+1)) ;;
+  esac
+
+  # The RELEASE LINE must name the window when the window is what released the gate — the earlier
+  # form fell through to "the unowned queue is not recent work" on a cycle where the same age was the
+  # HOLD condition (it printed 5m < 180m as a reason to release).
+  ex mp_release > "$TMP/fn_mp_release.sh"
+  _relr() { ( MERGE_PRIORITY_AT=10; MERGE_PRIORITY_MAX_AGE_MIN=180; . "$TMP/pr_base.sh"; . "$TMP/fn_mp_release.sh"; mp_release 27 2 5 5 1800000000 27 acme/widget 1800019000 "" 1800020000 ); }
+  case "$(_relr)" in
+    *"time bound"*) echo "  ok a held-open window NAMES the window as the release reason"; PASS=$((PASS+1)) ;;
+    *) echo "  FAIL a held-open window reported the wrong reason: $(_relr)"; FAIL=$((FAIL+1)) ;;
+  esac
+  # ── an UNWRITABLE state dir must not re-open the permanent stop (round 4, P0/P1) ──────────────
+  # Both directions are the same root cause — the file treated as the only memory: a fallback
+  # overwritten every cycle makes (d) unreachable; a stamp that cannot be removed is served forever.
+  if [ "$(id -u)" != "0" ]; then
+    UO="$TMP/ro"; rm -rf "$UO"; mkdir -p "$UO/state"
+    _ro() { ( O="$UO"; . "$TMP/pr_base.sh"; . "$TMP/fn_state_dir.sh"; . "$TMP/fn_stamp_set.sh"; . "$TMP/fn_mp_block_marker.sh"; . "$TMP/fn_mp_blocked_since.sh"; if [ $# = 1 ]; then eval "$1"; else "$@"; fi ); }
+    _ro mp_block_marker "$UO/state" set 1800000000
+    chmod 500 "$UO/state"
+    _ro mp_block_marker "$UO/state" set 1800010000
+    _ro mp_block_marker "$UO/state" set 1800020000
+    eqv "an UNWRITABLE state dir keeps the FIRST epoch, so the time bound still fires (a per-cycle overwrite made it unreachable)" \
+        "1800000000" "$(_ro mp_blocked_since "$UO/state" 1800020001)"
+    chmod 700 "$UO/state"
+    # …and a stamp that cannot be REMOVED is not served (a stale one would release the gate forever).
+    # ⛔ BOTH CALLS IN ONE PROCESS, deliberately: the invalidation is an IN-PROCESS fact (the daemon
+    # runs the loop in one shell), and splitting them across two subshells would test a fresh process
+    # that legitimately has nothing to remember — which is what made the first version of this case
+    # pass its own fixture rather than the code.
+    printf '1700000000\n' > "$UO/state/merge-priority-blocked-since"
+    chmod 500 "$UO/state"
+    eqv "a stamp that survives the clear is NOT served (a stale one would hold or release forever)" "" \
+        "$(_ro 'mp_block_marker "$O/state" clear; mp_blocked_since "$O/state" 1800020001')"
+    # (i) NO file at all + an unwritable dir: the memory IS the only bound. A per-cycle overwrite
+    #     here is exactly the round-5 P0 — the bound became unreachable and stayed unreachable.
+    RO2="$TMP/ro2"; rm -rf "$RO2"; mkdir -p "$RO2/state"; chmod 500 "$RO2/state"
+    _ro2() { ( O="$RO2"; . "$TMP/pr_base.sh"; . "$TMP/fn_state_dir.sh"; . "$TMP/fn_stamp_set.sh"; . "$TMP/fn_mp_block_marker.sh"; . "$TMP/fn_mp_blocked_since.sh"; if [ $# = 1 ]; then eval "$1"; else "$@"; fi ); }
+    eqv "an UNWRITABLE dir with NO stamp still bounds the block: the first cycle's epoch is remembered" \
+        "1800000000" "$(_ro2 'mp_block_marker "$O/state" set 1800000000; mp_block_marker "$O/state" set 1800030000; mp_blocked_since "$O/state" 1800030001')"
+    # (ii) and after a clear that could NOT remove the stamp, a LATER block must still be bounded —
+    #      the state that made the round-5 P0 permanent rather than transient.
+    chmod 700 "$RO2/state"
+    printf '1700000000\n' > "$RO2/state/merge-priority-blocked-since"
+    chmod 500 "$RO2/state"
+    # (iii) a FUTURE stamp file (clock step-back / copied state dir) must not shadow the memory
+    #       either — "not served" must not mean "return nothing" (review round 9).
+    chmod 700 "$RO2/state"; printf '1900000000\n' > "$RO2/state/merge-priority-blocked-since"; chmod 500 "$RO2/state"
+    eqv "a FUTURE stamp file does not shadow the in-process block start" \
+        "1800060000" "$(_ro2 'MP_SINCE_FALLBACK=1800060000; mp_blocked_since "$O/state" 1800070000')"
+    chmod 700 "$RO2/state"
+    eqv "after a failed clear, the NEXT block is still bounded (the memory is not left empty)" \
+        "1800040000" "$(_ro2 'mp_block_marker "$O/state" clear; mp_block_marker "$O/state" set 1800040000; mp_blocked_since "$O/state" 1800050000')"
+    chmod 700 "$RO2/state"
+    chmod 700 "$UO/state"
+  else
+    echo "  SKIP the unwritable-state-dir cases (running as root; chmod cannot deny)"
+  fi
+else
+  echo "  FAIL the stamp functions did not extract to syntactically valid shell"; FAIL=$((FAIL+1))
+fi
+
+echo
+echo "=== the repo surface: derived from the checkout, never a standing literal (P1 of the epilogue) ==="
+# The guard counted ANOTHER repo's PR queue for hours because `OR` was an independent literal. The
+# parse is the fix, so it is DRIVEN — every shape, including the ones that must be REFUSED.
+SLUG="$HERE/repo-slug.sh"
+if bash -n "$SLUG" 2>/dev/null; then
+  _slug() { ( . "$SLUG"; repo_slug_from_remote "$1" ); }
+  eqv "https origin -> owner/name"                    "acme/widget" "$(_slug https://github.com/acme/widget.git)"
+  eqv "https origin without .git -> owner/name"        "acme/widget" "$(_slug https://github.com/acme/widget)"
+  eqv "scp-style ssh origin -> owner/name"             "acme/widget" "$(_slug git@github.com:acme/widget.git)"
+  eqv "ssh:// origin with a user -> owner/name"        "acme/widget" "$(_slug ssh://git@github.com/acme/widget.git)"
+  eqv "a LOCAL PATH remote is REFUSED (empty)"         ""            "$(_slug /tmp/foo)"
+  eqv "a file:// remote is REFUSED (empty)"            ""            "$(_slug file:///srv/mirror.git)"
+  eqv "a remote with no owner is REFUSED (empty)"      ""            "$(_slug https://github.com/widget.git)"
+  eqv "an empty remote is REFUSED (empty)"             ""            "$(_slug '')"
+  eqv "an ssh:// origin with an explicit PORT -> owner/name" "acme/widget" "$(_slug ssh://git@github.com:22/acme/widget.git)"
+  eqv "an http origin on a self-hosted port -> owner/name"   "owner/name"  "$(_slug http://ghe.local:8080/owner/name.git)"
+  eqv "a deep path (…/owner/name/tree/main) is REFUSED"      ""           "$(_slug https://github.com/owner/name/tree/main)"
+  eqv "a QUERY string is REFUSED, never carried into gh --repo" ""        "$(_slug 'https://github.com/acme/widget?tab=1')"
+  eqv "a .git/ remote (slash AFTER .git) -> owner/name"      "acme/widget" "$(_slug https://github.com/acme/widget.git/)"
+  eqv "https with a user:token authority -> owner/name"       "acme/widget" "$(_slug https://user:tok@github.com/acme/widget.git)"
+  eqv "an explicit OR that is not owner/name is REFUSED"      ""            "$( ( . "$SLUG"; derive_or "$HERE/../.." garbage ) )"
+  # ⛔ AND THE RETURN CODE SAYS WHICH FAILURE IT IS (review round 8, P1). Conflated with "the origin
+  # cannot be parsed", an invalid pin fell back to the hardcoded literal — #2040 itself — so rc 2 is
+  # the whole difference between "refuse the operator's typo" and "grade a repo nobody named".
+  eqv "an invalid explicit OR returns rc=2 (a config error, not an underivable origin)" \
+      "rc=2" "$( ( . "$SLUG"; derive_or "$HERE/../.." garbage ) >/dev/null 2>&1; echo "rc=$?" )"
+  eqv "a valid explicit OR returns rc=0" \
+      "rc=0" "$( ( . "$SLUG"; derive_or "$HERE/../.." other/repo ) >/dev/null 2>&1; echo "rc=$?" )"
+  # …and an explicit OR still WINS over the checkout (a cell that grades another queue says so).
+  eqv "an explicit OR overrides the checkout"          "other/repo"  "$( ( . "$SLUG"; derive_or "$HERE/../.." other/repo ) )"
+else
+  echo "  FAIL repo-slug.sh does not parse"; FAIL=$((FAIL+1))
+fi
+
+echo
+echo "=== the PR listing feeds the age bound end-to-end (the jq is DRIVEN) ==="
+# ⛔ THE ROW FORMAT IS WHAT MAKES CLAUSE (c) ANSWERABLE (review round 8, P1). The gh stub in every
+# other suite emits PRE-BAKED `n:sha:epoch` rows, so reverting the listing's `--json` field list to
+# `number,headRefOid` (rows become `n:sha:-`, the age unmeasurable, the gate free to release forever)
+# left all four suites green. Drive the SHIPPED jq program against real JSON.
+_JQ_PROG="$(grep -o -- "--jq '[^']*'" "$ORCH" | grep 'createdAt\|fromdateiso8601' | head -1 | sed "s/^--jq '//; s/'$//")"
+if [ -n "$_JQ_PROG" ] && command -v jq >/dev/null 2>&1; then
+  eqv "the shipped --jq emits number:headOid:epoch for a normal row" "1 7:abc:1761307200" \
+      "$(printf '%s' '[{"number":7,"headRefOid":"abc","createdAt":"2025-10-24T12:00:00Z"}]' | jq -r "$_JQ_PROG")"
+  eqv "…emits '-' for a MISSING createdAt (unreadable age, never a fabricated epoch)" "1 7:abc:-" \
+      "$(printf '%s' '[{"number":7,"headRefOid":"abc"}]' | jq -r "$_JQ_PROG")"
+  eqv "…and ONE malformed createdAt degrades THAT row, not the whole listing (no failed read)" "2 7:abc:- 8:def:1761307200" \
+      "$(printf '%s' '[{"number":7,"headRefOid":"abc","createdAt":"2025-10-24T12:00:00.5Z"},{"number":8,"headRefOid":"def","createdAt":"2025-10-24T12:00:00Z"}]' | jq -r "$_JQ_PROG")"
+  case "$(grep -o -- '--json number,headRefOid[,a-zA-Z]*' "$ORCH" | head -1)" in
+    *createdAt*) echo "  ok the PR listing ASKS for createdAt in the same read (no second, drifting snapshot)"; PASS=$((PASS+1)) ;;
+    *) echo "  FAIL the PR listing does not request createdAt — the age bound is unanswerable"; FAIL=$((FAIL+1)) ;;
+  esac
+else
+  echo "  FAIL the shipped --jq (or jq itself) is unavailable — the age bound's input is unverifiable"; FAIL=$((FAIL+1))
+fi
+
+echo
+echo "=== the two evidence probes are DRIVEN, not described (they decide the gate) ==="
+# mp_recent_land and unowned_youngest_age_min each decide whether a drain is REAL, and neither was
+# executed by any suite — a wrong default dir, a wrong glob or a wrong token parse stayed green.
+ex unowned_pr_count > "$TMP/pr_unowned_pr_count.sh"
+ex pr_owned        > "$TMP/pr_pr_owned.sh"
+ex unowned_scan    > "$TMP/pr_unowned_scan.sh"
+ex mp_recent_land  > "$TMP/pr_mp_recent_land.sh"
+ex unowned_youngest_age_min > "$TMP/pr_unowned_youngest_age_min.sh"
+cat "$TMP/pr_base.sh" "$TMP/pr_file_mtime_epoch.sh" "$TMP/pr_unowned_pr_count.sh" "$TMP/pr_pr_owned.sh" \
+    "$TMP/pr_unowned_scan.sh" "$TMP/pr_mp_recent_land.sh" "$TMP/pr_unowned_youngest_age_min.sh" > "$TMP/pr_all.sh"
+if bash -n "$TMP/pr_all.sh" 2>/dev/null; then
+  PO="$TMP/probeO"; mkdir -p "$PO/state"
+  _probe() { ( O="$PO"; WSESS=""; . "$TMP/pr_all.sh"; "$@" ); }
+  # (1) a landed PR is evidence of progress; nothing else is.
+  eqv "no state/merged-*.done -> no land recorded" "" "$(_probe mp_recent_land)"
+  : > "$PO/state/merged-1.done"
+  [ -n "$(_probe mp_recent_land)" ] \
+    && { echo "  ok a state/merged-<PR>.done IS read as a land (dir default, glob, mtime)"; PASS=$((PASS+1)); } \
+    || { echo "  FAIL mp_recent_land did not see state/merged-1.done"; FAIL=$((FAIL+1)); }
+  # (2) the AGE probe: only UNOWNED rows age the gate, and the head field must be parsed correctly.
+  NOW_S="$MP_NOW"
+  printf '7:aaaaaaaaaaaaaaaaaaaa:%s 8:bbbbbbbbbbbbbbbbbbbb:%s\n' "$(( NOW_S - 600 ))" "$(( NOW_S - 7200 ))" > "$PO/state/last-open-prs"
+  eqv "the youngest UNOWNED PR's age is reported (10m)" "10" "$(_probe unowned_youngest_age_min 2 "$NOW_S")"
+  # (3) THE 3-FIELD ROW BUG: `needsfix-<pr>-<head>` must still match when the row carries a third
+  #     field. Parsed as `sha="<head>:<epoch>"` the marker never matches, so EVERY PR reads unowned
+  #     and the gate's input is inflated — measured in review.
+  : > "$PO/state/needsfix-8-bbbbbbbbbbbbbbbbbbbb"
+  eqv "a 3-FIELD row still matches its head-keyed findings marker (8 owned, 7 unowned)" "1" "$(_probe unowned_pr_count 2)"
+  rm -f "$PO/state/needsfix-8-bbbbbbbbbbbbbbbbbbbb"
+  eqv "…and with no marker both are unowned" "2" "$(_probe unowned_pr_count 2)"
+  # (4) an OWNED PR does not age the gate.
+  printf '7:aaaaaaaaaaaaaaaaaaaa:%s\n' "$(( NOW_S - 7200 ))" > "$PO/state/last-open-prs"
+  : > "$PO/state/needsfix-7-aaaaaaaaaaaaaaaaaaaa"
+  [ -z "$(_probe unowned_youngest_age_min 1 "$NOW_S")" ] \
+    && { echo "  ok an OWNED PR never ages the gate (nothing unowned left -> unmeasurable)"; PASS=$((PASS+1)); } \
+    || { echo "  FAIL an owned PR aged the gate"; FAIL=$((FAIL+1)); }
+  # ⛔ THIS CASE USED TO RE-RUN CASE (4)'s STATE. It asserted "2-field" while the row on disk was
+  # 3-field, so the older-format acceptance path in unowned_scan was NEVER exercised — deleting that
+  # arm kept the suite green. Write the row the label describes.
+  printf '9:cccccccccccccccccccc\n' > "$PO/state/last-open-prs"      # 2 fields: number:sha, no createdAt
+  eqv "a 2-FIELD (older-format) row has no age — unmeasurable, never zero" "" "$(_probe unowned_youngest_age_min 1 "$NOW_S")"
+  printf '%s\n' "9" > "$PO/state/last-open-prs"                       # 1 field: a bare number
+  eqv "a 1-FIELD row is also tolerated (no sha, no age) — never a crash, never a zero" "" "$(_probe unowned_youngest_age_min 1 "$NOW_S")"
+else
+  echo "  FAIL the probe functions did not extract to syntactically valid shell"; FAIL=$((FAIL+1))
+fi
+
+echo
+echo "=== the dispatch funnel: decomposes, bounds its record's age, and never fabricates ==="
+ex dispatch_funnel > "$TMP/fn_dispatch_funnel.sh"
+if bash -n "$TMP/fn_dispatch_funnel.sh" 2>/dev/null; then
+  FO="$TMP/funnelO"; mkdir -p "$FO/state"
+  _funnel() { ( O="$FO"; FUNNEL_MAX_AGE_MIN=30; . "$TMP/fn_dispatch_funnel.sh"; dispatch_funnel "$@" ); }
+  # (1) NO record: says UNRECORDED, never "backlog empty" and never a decomposition it lacks.
+  out="$(_funnel 0 "READ(223)(9m)" "" 1000000000)"
+  case "$out" in *UNRECORDED*) echo "  ok a missing funnel record reads UNRECORDED, not as an empty funnel"; PASS=$((PASS+1)) ;;
+    *) echo "  FAIL a missing record produced: $out"; FAIL=$((FAIL+1)) ;; esac
+  case "$out" in "[dispatch] [dispatch]"*) echo "  FAIL the line carries the [dispatch] prefix twice"; FAIL=$((FAIL+1)) ;;
+    "[dispatch] "*) echo "  ok exactly one [dispatch] prefix (the call sites no longer add their own)"; PASS=$((PASS+1)) ;;
+    *) echo "  FAIL the line is not prefixed [dispatch]: $out"; FAIL=$((FAIL+1)) ;; esac
+  # (2) a REAL record decomposes: listed -> per-reason counts -> dispatched, and names the held gate.
+  printf 'listed=223 judged=6 queued=0 collision=0 landed=0 unjudged=6 skipped_checked=0 skipped_dispatched=0 not_reached=217 limit=6 reconciled=1 at=%s\n' 1000000000 > "$FO/state/refresh-funnel"
+  printf '1\n2\n3\n' > "$FO/candidates.txt"
+  out="$(_funnel 2 "READ(223)(9m)" "load=9>=max_load=8" 1000000000)"
+  case "$out" in
+    "[dispatch] 223 candidates -> 0 queued, 0 peer-owned (claim), 0 already landed, 6 unjudged (pre-flight), 0 blacklisted (checked), 0 already dispatched, 217 not reached (limit) -> 2 dispatched | held: load=9>=max_load=8"*)
+      echo "  ok the funnel decomposes the pool and names the held gate"; PASS=$((PASS+1)) ;;
+    *) echo "  FAIL unexpected funnel line: $out"; FAIL=$((FAIL+1)) ;;
+  esac
+  # (3) an UNRECONCILED record is labelled, never rendered as a clean decomposition.
+  printf 'listed=223 judged=6 queued=1 collision=0 landed=0 unjudged=1 skipped_checked=0 skipped_dispatched=0 not_reached=217 limit=6 reconciled=0 at=%s\n' 1000000000 > "$FO/state/refresh-funnel"
+  case "$(_funnel 0 "READ(223)" "" 1000000000)" in *UNRECONCILED*) echo "  ok a record whose parts do not sum is labelled UNRECONCILED"; PASS=$((PASS+1)) ;;
+    *) echo "  FAIL an unreconciled record was rendered as clean"; FAIL=$((FAIL+1)) ;; esac
+  # (4) AGE-BOUNDED: an old record is REPLACED by its age, never presented as this cycle's numbers.
+  printf 'listed=223 judged=6 queued=0 collision=0 landed=0 unjudged=6 skipped_checked=0 skipped_dispatched=0 not_reached=217 limit=6 reconciled=1 at=%s\n' $(( 1000000000 - 3600 )) > "$FO/state/refresh-funnel"
+  out="$(_funnel 0 "READ(223)")"
+  case "$out" in *STALE*) echo "  ok a stale funnel record reads STALE(<age>), not as a fresh decomposition"; PASS=$((PASS+1)) ;;
+    *) echo "  FAIL a one-hour-old record printed as this cycle's: $out"; FAIL=$((FAIL+1)) ;; esac
+  # (5) A record with NO age field is not "fresh" either — unverifiable is STALE (review round 5).
+  printf 'listed=223 judged=6 queued=0 collision=0 landed=0 unjudged=6 skipped_checked=0 skipped_dispatched=0 not_reached=217 limit=6 reconciled=1\n' > "$FO/state/refresh-funnel"
+  out="$(_funnel 0 "READ(223)")"
+  case "$out" in *"STALE(age unknown"*) echo "  ok a record with no usable at= reads STALE(age unknown)"; PASS=$((PASS+1)) ;;
+    *) echo "  FAIL a record with no at= printed as this cycle's: $out"; FAIL=$((FAIL+1)) ;; esac
+  # (6) …and a FUTURE at= (a clock step-back) is unverifiable too, never "0m old".
+  printf 'listed=223 judged=6 queued=0 collision=0 landed=0 unjudged=6 skipped_checked=0 skipped_dispatched=0 not_reached=217 limit=6 reconciled=1 at=%s\n' 1000009999 > "$FO/state/refresh-funnel"
+  out="$(_funnel 0 "READ(223)" "" 1000000000)"
+  case "$out" in *"STALE(age unknown"*) echo "  ok a FUTURE at= is unverifiable (STALE), not a fresh 0m-old decomposition"; PASS=$((PASS+1)) ;;
+    *) echo "  FAIL a future at= was read as fresh: $out"; FAIL=$((FAIL+1)) ;; esac
+  # (7) ABSENT reconciled= is not "reconciled" — only a writer that recorded 1 has shown the sum.
+  printf 'listed=223 judged=6 queued=0 collision=0 landed=0 unjudged=6 skipped_checked=0 skipped_dispatched=0 not_reached=217 limit=6 at=%s\n' 1000000000 > "$FO/state/refresh-funnel"
+  out="$(_funnel 0 "READ(223)" "" 1000000000)"
+  case "$out" in *UNRECONCILED*) echo "  ok a record with no reconciled= field is UNRECONCILED (unverified, not clean)"; PASS=$((PASS+1)) ;;
+    *) echo "  FAIL a record with no reconciliation was rendered as clean: $out"; FAIL=$((FAIL+1)) ;; esac
+  # (8) an EXISTING but empty record is UNRECORDED(unreadable), not "no pass has recorded one yet".
+  : > "$FO/state/refresh-funnel"
+  out="$(_funnel 0 "READ(223)" "" 1000000000)"
+  case "$out" in *"exists but is unreadable"*) echo "  ok an empty record is reported as unreadable, not as 'no pass yet'"; PASS=$((PASS+1)) ;;
+    *) echo "  FAIL an empty record produced: $out"; FAIL=$((FAIL+1)) ;; esac
+else
+  echo "  FAIL dispatch_funnel did not extract to syntactically valid shell"; FAIL=$((FAIL+1))
 fi
 
 echo
