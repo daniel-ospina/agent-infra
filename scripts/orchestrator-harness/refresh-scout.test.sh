@@ -814,13 +814,28 @@ else
   bad "orch-loop: could not extract queue_state_token (or is_num) from the shipped loop"
 fi
 # The two lines a human actually reads beside `backlog=`: the per-cycle heartbeat line, and the
-# 'backlog empty' claim that used to read as "nothing to do" even when the pool was unreadable.
+# funnel line that replaced the dishonest 'backlog empty' claim.
 grep -q 'backlog=\$(wc -l.*queue=\$(queue_state_token)' "$LOOP" \
   && ok "orch-loop: the per-cycle heartbeat line carries the state beside the backlog" \
   || bad "orch-loop: the cycle line does not carry the pool state"
-grep -q '\[dispatch\] backlog empty queue=\$(queue_state_token)' "$LOOP" \
-  && ok "orch-loop: the 'backlog empty' claim carries the state, so blindness cannot read as stillness" \
-  || bad "orch-loop: 'backlog empty' is still printed without the state"
+# ⛔ THE INVARIANT MOVED WITH THE DEFECT (agent-infra#2040). `[dispatch] backlog empty` is GONE:
+# measured on all three cloud cells for hours, it printed `backlog empty queue=READ(223)` while 223
+# candidates had been read and every one was filtered away — a claim that was false every cycle.
+# The replacement must therefore satisfy TWO properties, and the second is the one that would have
+# caught #2040: the funnel line always carries the queue state, AND it decomposes the funnel (it
+# names where the candidates went) instead of asserting emptiness. An `==` on the funnel call alone
+# would pass on a line that printed a bare "0 dispatched".
+grep -q 'dispatch_funnel 0 "$(queue_state_token)"' "$LOOP" \
+  && ok "orch-loop: the no-dispatch line carries the queue state (through the funnel)" \
+  || bad "orch-loop: the no-dispatch line does not carry the queue state"
+# Anchored on the EMITTING form (`echo "[dispatch] backlog empty…`), not on the phrase: the phrase
+# still appears in the comments that record WHY it was removed, and a comment is not a claim.
+grep -q 'echo "\[dispatch\] backlog empty' "$LOOP" \
+  && bad "orch-loop: 'backlog empty' is STILL printed — that claim is what hid a 223-candidate / 0-dispatched funnel for hours" \
+  || ok "orch-loop: the false 'backlog empty' claim is gone (a filtered-to-zero funnel can no longer read as stillness)"
+grep -q '^dispatch_funnel() {' "$LOOP" && grep -q 'candidates -> ' "$LOOP" \
+  && ok "orch-loop: the dispatch funnel DECOMPOSES the pool (listed candidates -> per-reason counts -> dispatched)" \
+  || bad "orch-loop: the funnel line does not decompose the pool"
 
 # ── an unwritable state dir REFUSES, it is not absorbed ───────────────────────────────────────
 # `mkdir -p "$O"` was unchecked and every write below it was too, so a non-directory `$O` finished with
@@ -1776,11 +1791,40 @@ esac
 # read CLEAN before either claims). The shipped batch block is extracted VERBATIM and driven against
 # a real local origin with a real claims.sh, so the assertion is about the shipped code, not a
 # re-implementation.
-awk '/if \[ -z/ && /GATE_WHY/ {f=1} f{print} f&&/^    done < /{exit}' \
+# ⛔ ANCHORED ON THE BATCH BODY, NOT ON `if [ -z …GATE_WHY` (review round 7). That pattern also
+# matches the RELEASE branch above it, so the extraction began ~40 lines early: the fixture ran code
+# this section does not describe (and a `command not found` inside it is swallowed by the harness's
+# `2>/dev/null`, which would blame "nothing was batched"). The batch body starts at `: > "$O/.batch"`,
+# so the opening `if` is SYNTHESISED and the body is copied verbatim from there.
+awk '/^    : > "\$O\/\.batch"; K=0$/ { print "  if [ -z \"$GATE_WHY\" ]; then"; f=1 } f { print } f && /^    done < / { exit }' \
   "$LOOP" > "$T/dispatchblock.sh"
 printf '\nfi\n' >> "$T/dispatchblock.sh"
 if [ -s "$T/dispatchblock.sh" ] && grep -q 'claim_issue_acquire' "$T/dispatchblock.sh"; then
   ok "orch-loop: the dispatch block (with the issue claim) is extractable from the shipped loop"
+  # ⛔ THE ANCHOR MUST START AT THE DISPATCH BLOCK (review round 7). `if [ -z … && /GATE_WHY/` also
+  # matches the RELEASE branch above it, so the extraction silently began ~40 lines early and embedded
+  # a call (`mp_release`) this fixture does not define — swallowed by `2>/dev/null`, so a future
+  # unguarded call there would report "nothing was batched" and blame the wrong block.
+  # ⛔ AND THE SYNTHESISED `if` MUST MATCH THE SHIPPED GUARD (review round 8, P1). The fixture invents
+  # its opening line, so replacing the shipped entry condition with `if true; then` — dispatch past
+  # EVERY gate — stayed green. The line immediately above the anchor IS the shipped guard; assert it.
+  _anchor_ln="$(grep -n '^    : > "\$O/\.batch"; K=0$' "$LOOP" | head -1 | cut -d: -f1)"
+  _guard_line=""
+  [ -n "$_anchor_ln" ] && _guard_line="$(sed -n "$(( _anchor_ln - 1 ))p" "$LOOP")"
+  if [ "$_guard_line" = '  if [ -z "$GATE_WHY" ]; then' ]; then
+    echo "  ok orch-loop: the batch block is guarded by [ -z \"\$GATE_WHY\" ] exactly as the fixture assumes"
+    PASS=$((PASS+1))
+  else
+    echo "  FAIL the shipped guard above the batch body is not the one the fixture synthesises: '${_guard_line}'"
+    FAIL=$((FAIL+1))
+  fi
+  if grep -q 'mp_release\|mp_block_marker\|mp_released_marker' "$T/dispatchblock.sh"; then
+    echo "  FAIL the extracted dispatch block carries the release branch — the anchor is not the batch block"
+    FAIL=$((FAIL+1))
+  else
+    echo "  ok orch-loop: the extracted block is the BATCH block, not the release branch above it"
+    PASS=$((PASS+1))
+  fi
   # db <sandbox> — run the shipped block with $O/candidates.txt = 42 and $BATCH=1. The registry is
   # the SHIPPED claims.sh, sourced from $O with CLAIM_REPO set exactly as the loop's own cycle does
   # (sourcing it here is what makes `declare -f claim_issue_acquire` true, as it is in the daemon).
