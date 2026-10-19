@@ -296,7 +296,7 @@ render() {
     # A plist is XML (entities required); a unit is plain text (entities would be literal garbage).
     case "$tpl" in *.plist*) esc=sed_repl ;; *) esc=sed_repl_sed ;; esac
     sed -e "s|{{USER}}|$($esc "$(id -un)")|g" \
-        -e "s|{{HOME}}|$($esc "$HOME")|g" \
+        -e "s|{{HOME}}|$($esc "${HOME:-}")|g" \
         -e "s|{{PATH}}|$($esc "$PATH")|g" \
         -e "s|{{STATE_DIR}}|$($esc "$STATE_DIR")|g" \
         -e "s|{{REPOS}}|$($esc "$REPOS")|g" \
@@ -412,7 +412,7 @@ choose_systemd_target() {
         return 0
     fi
     if $SYSTEMCTL_USER show-environment >/dev/null 2>&1; then
-        SD_TARGET="user"; UNIT_DIR="$HOME/.config/systemd/user"; SC="$SYSTEMCTL_USER"
+        SD_TARGET="user"; UNIT_DIR="${HOME:-}/.config/systemd/user"; SC="$SYSTEMCTL_USER"
         return 0
     fi
     return 1
@@ -881,7 +881,11 @@ ld_status() {
     live_dir="$LD_DIR"; rec="$(recorded_dir)"
     [ -n "$rec" ] && LD_DIR="$rec"
     dest="$LD_DIR/$LABEL.plist"
-    [ -f "$dest" ] || { [ -n "$rec" ] && [ -f "$live_dir/$LABEL.plist" ] && dest="$live_dir/$LABEL.plist"; }
+    if [ ! -f "$dest" ]; then
+        for _cand in "$live_dir" "${HOME:-}/Library/LaunchAgents"; do
+            [ -n "$_cand" ] && [ -f "$_cand/$LABEL.plist" ] && { dest="$_cand/$LABEL.plist"; break; }
+        done
+    fi
     say "platform=darwin"
     say "scheduler=launchd"
     say "job=$LABEL"
@@ -960,8 +964,19 @@ ld_uninstall() {
     live_dir="$LD_DIR"; rec="$(recorded_dir)"
     [ -n "$rec" ] && LD_DIR="$rec"
     dest="$LD_DIR/$LABEL.plist"
+    # ⛔ THE DEFAULT DIR IS A CANDIDATE TOO (#2048 review, BLOCK). `DISK_REAPER_AGENTS_DIR` is a
+    # DOCUMENTED operator seam, so the sequence "setup.sh installed into ~/Library/LaunchAgents →
+    # operator re-installed with the seam → operator uninstalls with the seam still set" is a supported
+    # path — and with only (recorded, live) in the population the default dir's plist was neither
+    # removed nor read back: `uninstalled`, exit 0, plist survives, and launchd re-loads it (armed) at
+    # the next login. The systemd sibling already enumerates every reachable dir; this is the same rule.
+    default_dir="${HOME:-}/Library/LaunchAgents"
     plist_dirs=("$LD_DIR")
-    [ -n "$live_dir" ] && [ "$live_dir" != "$LD_DIR" ] && plist_dirs+=("$live_dir")
+    for _cand in "$live_dir" "$default_dir"; do
+        [ -n "$_cand" ] || continue
+        case " ${plist_dirs[*]} " in *" $_cand "*) continue ;; esac
+        plist_dirs+=("$_cand")
+    done
     $LC bootout "$LD_DOMAIN/$LABEL" >/dev/null 2>&1 || true
     for d in "${plist_dirs[@]}"; do rm -f "$d/$LABEL.plist"; done
     # READ IT BACK: a bootout that did not take, or a plist that survived the `rm`, leaves a job that
@@ -1127,8 +1142,8 @@ if [ "$PLATFORM" = darwin ] && [ "${ELDATO_ALLOW_TEST_HOME:-}" != "1" ]; then
         err "       Tests: put a launchctl shim on PATH and set ELDATO_ALLOW_TEST_HOME=1"
         exit 4
     fi
-    if [ "$(norm_path "$HOME")" != "$(norm_path "$real_home")" ]; then
-        err "refusing to manage launchd jobs: HOME=$HOME is not the real home ($real_home)."
+    if [ "$(norm_path "${HOME:-}")" != "$(norm_path "$real_home")" ]; then
+        err "refusing to manage launchd jobs: HOME=${HOME:-} is not the real home ($real_home)."
         err "       A temp-HOME run registers jobs against plist paths that vanish (#446)."
         err "       Tests: put a launchctl shim on PATH and set ELDATO_ALLOW_TEST_HOME=1"
         exit 3

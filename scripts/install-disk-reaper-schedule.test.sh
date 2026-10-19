@@ -730,14 +730,26 @@ assert_contains "$OUT" "INCOMPLETE" "T8g …and says so"
 rm -rf "$SYSDIR_G" "$T/sys-g2" "$T/units-keep" "$T/state-g" "$T/state-g2"
 
 # ── T8h: a root/container run has no HOME, and a truncated candidate list must never read as complete ──
-# `$HOME` inside a process substitution made `set -u` abort MID-LIST, which is indistinguishable from a
-# complete list — so the read-back that makes "uninstalled" a verified claim degraded silently.
+# `$HOME` inside a process substitution made `set -u` abort MID-LIST — indistinguishable from a complete
+# list, so the read-back that makes "uninstalled" a verified claim degraded silently. Measured shape:
+# `--uninstall` with HOME unset over an install whose manager STILL knows the unit must fail, not
+# certify. (A `--status`-only assertion was vacuous: that path never calls the candidate enumeration.)
+SYSDIR_H="$T/sys-h"; mkdir -p "$SYSDIR_H" "$T/units-h"
+HOME="$home_lin" DISK_REAPER="$PASSFILE" DISK_REAPER_REPOS="$REPO" DISK_REAPER_PLATFORM=linux \
+    DISK_REAPER_STATE_DIR="$T/state-h" SYSTEMD_SYSTEM_DIR="$SYSDIR_H" SUDO="" \
+    SYSTEMCTL="$T/bin/systemctl" SYSTEMCTL_CALLS="$T/systemctl.log" SYSTEMCTL_UNITS="$T/units-h" \
+    bash "$INST" --install >/dev/null 2>&1
+cp -f "$SYSDIR_H/eldato-disk-reaper.service" "$T/units-h/eldato-disk-reaper.service"
 OUT="$(env -u HOME DISK_REAPER="$PASSFILE" DISK_REAPER_REPOS="$REPO" DISK_REAPER_PLATFORM=linux \
-    DISK_REAPER_STATE_DIR="$T/state-nohome" SYSTEMD_SYSTEM_DIR="$T/sys-nohome" SUDO="" \
-    SYSTEMCTL="$T/bin/systemctl" SYSTEMCTL_CALLS="$T/systemctl.log" SYSTEMCTL_UNITS="$T/units" \
-    SYSTEMCTL_USER="$T/bin/systemctl-user" bash "$INST" --status 2>&1)"; RC=$?
-assert_absent "$OUT" "unbound variable" "T8h --status with HOME unset is not a bash error"
-assert_contains "$OUT" "platform=linux" "T8h …and still answers the question it was asked"
+    DISK_REAPER_STATE_DIR="$T/state-h" SYSTEMD_SYSTEM_DIR="$SYSDIR_H" SUDO="" \
+    SYSTEMCTL="$T/bin/systemctl" SYSTEMCTL_CALLS="$T/systemctl.log" SYSTEMCTL_UNITS="$T/units-h" \
+    bash "$INST" --uninstall 2>&1)"; RC=$?
+assert_absent "$OUT" "unbound variable" "T8h --uninstall with HOME unset is not a bash error"
+assert_eq "$RC" "1" "T8h …and a manager that still knows the unit still FAILS the uninstall (the list was not truncated)"
+assert_contains "$OUT" "still known to" "T8h …naming the manager, not a bare abort"
+[ -f "$T/state-h/disk-reaper.schedule" ] && ok "T8h …and the armed stamp survives that failure" \
+    || bad "T8h the stamp was destroyed by an aborted uninstall"
+rm -rf "$SYSDIR_H" "$T/units-h" "$T/state-h"
 
 # ── T8i: a recorded install survives a dead probe (#2048 review, P3) ──────────────────────────
 # The gate that says "no scheduler available" fired BEFORE dispatch, so a box whose sudo probe moved
@@ -755,6 +767,25 @@ OUT="$(HOME="$home_lin" DISK_REAPER="$PASSFILE" DISK_REAPER_REPOS="$REPO" DISK_R
 assert_contains "$OUT" "installed=yes" "T8i --status finds the recorded install even when the probe is dead"
 assert_eq "$RC" "0" "T8i …and exits 0 (the bring-up's contract), instead of 'no scheduler available'"
 rm -rf "$SYSDIR_I" "$T/state-i"
+
+# ── T8j: an uninstall with the seam set must still find a DEFAULT-dir plist (#2048 review, BLOCK) ──
+# `DISK_REAPER_AGENTS_DIR` is a documented operator seam, so "setup.sh installed into
+# ~/Library/LaunchAgents, an operator re-installed with the seam, then uninstalled with it still set"
+# is supported — and the default dir's plist used to survive with rc 0, for launchd to re-load (armed)
+# at the next login. The read-back now covers the default dir too.
+DEFHOME="$T/home-def"; mkfakehome "$DEFHOME" 2>/dev/null || mkdir -p "$DEFHOME/Library/LaunchAgents"
+HOME="$DEFHOME" DISK_REAPER="$PASSFILE" DISK_REAPER_REPOS="$REPO" DISK_REAPER_PLATFORM=darwin \
+    DISK_REAPER_STATE_DIR="$T/state-j" LAUNCHCTL="$T/bin/launchctl" LAUNCHD_DOMAIN="gui/999" \
+    DISK_REAPER_PYTHON="$T/bin/fakepython" ELDATO_ALLOW_TEST_HOME=1 bash "$INST" --install >/dev/null 2>&1
+DEF_PLIST="$DEFHOME/Library/LaunchAgents/com.eldato.disk-reaper.plist"
+assert_file "$DEF_PLIST" "T8j the default dir holds the installed plist"
+SEAM_DIR="$T/agents-j"; mkdir -p "$SEAM_DIR"
+HOME="$DEFHOME" DISK_REAPER="$PASSFILE" DISK_REAPER_REPOS="$REPO" DISK_REAPER_PLATFORM=darwin \
+    DISK_REAPER_STATE_DIR="$T/state-j" DISK_REAPER_AGENTS_DIR="$SEAM_DIR" LAUNCHCTL="$T/bin/launchctl" \
+    LAUNCHD_DOMAIN="gui/999" DISK_REAPER_PYTHON="$T/bin/fakepython" ELDATO_ALLOW_TEST_HOME=1 \
+    bash "$INST" --uninstall >/dev/null 2>&1
+assert_nofile "$DEF_PLIST" "T8j …and an uninstall through the seam removes it (read back, not assumed)"
+rm -rf "$DEFHOME" "$SEAM_DIR" "$T/state-j" "$T/launchctl.state"
 
 echo "── T11. both systemd targets, including the two arms no test could reach ──"
 # (a) the SYSTEM unit with `SUDO=""` — the "already root / container" arm. The system unit dir is a
