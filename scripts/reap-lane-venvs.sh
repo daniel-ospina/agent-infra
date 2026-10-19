@@ -124,6 +124,10 @@
 #   PS_BIN LSOF_BIN TMUX_BIN GIT_BIN RM_BIN DU_BIN DF_BIN
 #   REAP_VENV_DRY_RUN REAP_VENV_MIN_AGE_SECONDS REAP_VENV_FREE_FLOOR_MB REAP_VENV_NOW_EPOCH
 #   REAP_VENV_LOG
+#   ⛔ REAP_VENV_MIN_AGE_SECONDS is VALIDATED before use (#2158): a non-numeric value is refused with
+#   exit 2 and nothing removed, rather than making the age comparison error out and fall through to
+#   reaping every holder-free env regardless of age. (The sibling FREE FLOOR is validated the same way,
+#   at the point it is read — see `is_pos_int "$REAP_VENV_FREE_FLOOR_MB"`.)
 #   REAP_VENV_PS_TIMEOUT REAP_VENV_CWD_TIMEOUT REAP_VENV_TMUX_TIMEOUT REAP_VENV_GIT_TIMEOUT
 #   REAP_VENV_REMOVE_TIMEOUT REAP_VENV_ALLOW_DEGRADED_CWD REAP_VENV_PROC_ROOT
 #
@@ -755,6 +759,21 @@ parse_args() {
         APPLY=0; [ "$REAP_VENV_DRY" = "0" ] && APPLY=1
     else
         APPLY=0; [ "${REAP_VENV_DRY_RUN:-1}" = "0" ] && APPLY=1
+    fi
+    # ⛔ THE AGE FLOOR IS VALIDATED BEFORE IT IS EVER COMPARED (#2158). `--min-age` was checked at
+    # parse time and the ENV form was not, so `REAP_VENV_MIN_AGE_SECONDS=30m` (any typo) made the
+    # `[ "$age" -lt "$REAP_VENV_MIN_AGE_SECONDS" ]` test ERROR, take the else branch under
+    # `set -uo pipefail` (no `-e`), and fall straight through to reaping: the floor that covers the
+    # window between `git worktree add` and the first process binding to the new lane was silently
+    # DISABLED, in the direction that destroys a live lane's env. It failed OPEN.
+    # The fix is the check the free-disk floor already uses, applied to the final value (env or argv)
+    # so no path into this script can skip it. EXIT 2 — a misconfiguration the OPERATOR can fix —
+    # never 3: `disk-reaper.sh` maps a delegate's 3 to "a delegate refused" (a green unit), and a
+    # typo must not borrow that colour. Nothing is removed: this runs before any probe or sweep.
+    if ! is_pos_int "${REAP_VENV_MIN_AGE_SECONDS:-}"; then
+        echo "FAIL-CLOSED abort: REAP_VENV_MIN_AGE_SECONDS='${REAP_VENV_MIN_AGE_SECONDS:-}' is not a whole number of seconds (set it from the environment or --min-age; default 1800). Nothing removed (exit 2)." >&2
+        log "FAIL-CLOSED abort: invalid age floor '${REAP_VENV_MIN_AGE_SECONDS:-}'"
+        exit 2
     fi
     return 0
 }

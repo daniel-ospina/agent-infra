@@ -82,6 +82,17 @@ exactly that. It is registered there (axis `retention`, with the same shape as
 `REAP_WT_LOCK_STALE_SECONDS`) and the suite pins both halves: the declaration in this
 script and the registration that makes it auditable.
 
+**And the bound is VALIDATED before it is compared** (#2158). Only the `--min-age`
+argv form used to be checked; the environment form was compared raw, so any typo
+(`30m`) made `[ "$age" -lt "$REAP_VENV_MIN_AGE_SECONDS" ]` error, take the else
+branch under `set -uo pipefail` (no `-e`), and fall straight through to reaping — the
+floor silently DISABLED, in the direction that deletes a live lane's env. It failed
+open. The final value (env or argv) is now checked with the same `is_pos_int` the
+free-disk floor uses, and a non-numeric value is refused with **exit 2 and nothing
+removed**. Why `2` and not `3`: `disk-reaper.sh` maps a delegate's `3` to "a delegate
+refused" — the one non-zero code a scheduled unit accepts — and an operator's typo
+must not borrow that colour. `2` is a misconfiguration, and it stays red.
+
 ## Two entry points, and why both
 
 | path | who calls it | what it proves |
