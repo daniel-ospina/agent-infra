@@ -1104,6 +1104,15 @@ QUEUE_REST_TIMEOUT_S = 30                     # PER-PAGE ceiling, further clippe
                                               # page (`_queue_rest(deadline=…)`), so the fallback
                                               # cannot add a 5 x 30 s tail to a beat that is killed
                                               # at 90 s
+# ⛔ THE WHOLE QUEUE READ (primary + fallback) IS CAPPED AGAINST THE TICK, NOT JUST ITSELF (#2138
+# r3, A/P1). Anchoring the fallback to `now + TIMEOUT` was right for the slow-primary case and
+# WRONG for the slow-REFUSAL one: `_gh_retry` retries a 5xx three times, so a refusal can arrive
+# having spent 60-75 s of the beat's 90 s refresh bound, and a fresh 30 s socket push the tick past
+# `run_bounded 90 objective-refresh` (`heartbeat-loop.sh`) -- where a killed refresh writes NO line
+# at all, strictly worse than the refusal it replaces. Half the bound, measured from the START of
+# the read: the fallback gets whatever is left of it (still a full page in the ordinary case), and
+# a refusal that has already spent it gets NO socket and raises its own cause, so the line prints.
+QUEUE_READ_MAX_S = 45
 
 
 def _gh_hosts_path():
@@ -1162,7 +1171,7 @@ def _gh_token():
         return ""
 
 
-def _rest_get(url, token, timeout=QUEUE_REST_TIMEOUT_S):
+def _rest_get(url, token, timeout=QUEUE_REST_TIMEOUT_S, deadline=None):
     """One REST GET, behind ONE seam so the fallback is provable without a network.
 
     Returns the decoded body and RAISES on any failure; the caller treats every raise as "no
@@ -1178,6 +1187,14 @@ def _rest_get(url, token, timeout=QUEUE_REST_TIMEOUT_S):
     the caller's headers -- including `Authorization` -- for whatever host the 30x names, which
     would hand a full-scope token to a third party. `redirect_request` returning None turns a 30x
     into an `HTTPError`, i.e. into "no second source", which is the honest answer here.
+
+    ⛔ AND THE BODY IS READ IN CHUNKS AGAINST THE CLOCK, NOT IN ONE `read()` (#2138 r2, A).
+    `timeout=` reaches the socket as a PER-RECV timeout, so a peer that trickles bytes keeps
+    resetting it: a single `r.read()` against a byte-at-a-time server returned a complete page
+    after **14.9 s with `timeout=0.5`** (measured in review, 29.7x the timeout). So the body is
+    read 8 KiB at a time and the deadline is re-checked BEFORE each chunk: a trickling peer can
+    still overrun by at most one chunk, and the page's own budget holds for everything a real
+    server does. The limit is stated as one chunk, not claimed away.
     """
     import urllib.request
 
@@ -1192,7 +1209,17 @@ def _rest_get(url, token, timeout=QUEUE_REST_TIMEOUT_S):
         "User-Agent": "objective.py (agent-infra heartbeat)",
     })
     with urllib.request.build_opener(_NoRedirect).open(req, timeout=timeout) as r:
-        return json.loads(r.read().decode("utf-8"))
+        chunks = []
+        while True:
+            if deadline is not None and _monotonic() > deadline:
+                # Raise rather than return: the caller's single failure path already treats a
+                # raise as "no second source", and a partial body is not a page.
+                raise TimeoutError("response body overran the page budget while arriving")
+            chunk = r.read(8192)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return json.loads(b"".join(chunks).decode("utf-8"))
 
 
 def _rest_pr(p):
@@ -1244,11 +1271,14 @@ def _queue_rest(deadline=None):
     killed refresh writes NO line at all: the recovery would be strictly worse than the refusal
     it replaces.
 
-    ⛔ HONEST BOUND: a socket timeout bounds each BLOCKING OPERATION, not the request, so one
-    stalled connection can still overrun the budget by an operation -- which is why the budget is
-    also re-checked AFTER every page and a read that is past it is discarded. The claim this file
-    makes is therefore "bounded per page, re-checked between pages, at most one operation of
-    overrun", not "a hard wall-clock guarantee" that a socket timeout cannot deliver.
+    ⛔ HONEST BOUND, MEASURED RATHER THAN ASSUMED (#2138 r2, A). A socket timeout is a PER-RECV
+    timeout, so it does NOT bound a page: a peer trickling bytes resets it on every read (`_rest_get`
+    read a complete page in 14.9 s with `timeout=0.5`). The page is therefore bounded by the CHUNK
+    LOOP inside `_rest_get` -- which re-checks this budget before each 8 KiB chunk -- and by the
+    AFTER-THE-PAGE check below, which discards a page that arrived late. What the fallback can
+    still lose is at most ONE CHUNK of trickle, not "one operation", and the caller additionally
+    clips this budget against the whole tick (see `QUEUE_READ_MAX_S`), so the fallback is never
+    the reason a refresh misses its 90 s kill.
 
     PAGING: one page is 100. A deeper queue is read a page at a time; a SHORT page is the end. A
     FAILED page discards the whole read, and so does REACHING THE CAP WITH A FULL PAGE -- both are
@@ -1274,7 +1304,7 @@ def _queue_rest(deadline=None):
             body = _rest_get(
                 f"https://api.github.com/repos/{REPO}/pulls"
                 f"?state=open&per_page={QUEUE_REST_PAGE}&page={page}", token,
-                timeout=budget)
+                timeout=budget, deadline=_monotonic() + budget)
             if not isinstance(body, list):
                 GH_LAST_ERROR = (f"rest fallback returned {type(body).__name__}, not a list")
                 return None
@@ -1283,9 +1313,9 @@ def _queue_rest(deadline=None):
                 return None
             rows.extend(body)
             if deadline is not None and _monotonic() > deadline:
-                # The page ARRIVED, but past the budget: a stale answer is not a measurement. (The
-                # socket timeout below bounds each blocking operation, not the whole request -- see
-                # the honest-bound note above.)
+                # The page ARRIVED, but past the budget: a stale answer is not a measurement. (A
+                # socket timeout bounds each recv, not the page -- `_rest_get`'s chunk loop is the
+                # real per-page bound; this is the belt after it, see the honest-bound note above.)
                 GH_LAST_ERROR = "rest fallback: budget overrun during page %d" % page
                 return None
             if len(body) < QUEUE_REST_PAGE:
@@ -1383,7 +1413,9 @@ def queue():
     sample = None
     reads = 0
     resample_failed = 0
-    deadline = _monotonic() + QUEUE_BLIND_BUDGET_S     # measured from the FIRST read
+    read_start = _monotonic()
+    read_deadline = read_start + QUEUE_READ_MAX_S   # the cap the WHOLE read answers to (see above)
+    deadline = read_start + QUEUE_BLIND_BUDGET_S    # measured from the FIRST read
     for attempt in range(QUEUE_BLIND_ATTEMPTS):
         remaining = deadline - _monotonic()
         if attempt and remaining <= 0:
@@ -1421,13 +1453,16 @@ def queue():
                 # protection its docstring promises would be inert (review round 1, B and A).
                 _graphql_err = ((r.stdout or "") + (r.stderr or "")).strip()
                 _note_gh_failure(f"queue read failed: {_graphql_err}", surface, transport=True)
-                # ⛔ THE FALLBACK GETS ITS OWN START-ANCHORED BOUND (#2138 r2, B). Passing only the
-                # re-sample deadline made the recovery INERT in the case it exists for: `_gh_retry`
-                # retries a transient failure three times with backoff, so a slow primary read can
-                # spend the whole 20 s budget and then the fallback opens no socket at all. A
-                # single page's worth is always allowed, measured from NOW, and the page loop's own
-                # per-page clipping keeps the worst case bounded at one page.
-                prs = _queue_rest(deadline=max(deadline, _monotonic() + QUEUE_REST_TIMEOUT_S))
+                # ⛔ THE FALLBACK GETS ITS OWN START-ANCHORED BOUND (#2138 r2, B), CAPPED BY THE
+                # READ'S OWN TICK BUDGET (#2138 r3, A). Passing only the re-sample deadline made
+                # the recovery INERT in the case it exists for: `_gh_retry` retries a transient
+                # failure three times with backoff, so a slow primary read can spend the whole 20 s
+                # budget and then the fallback opens no socket at all. A single page's worth is
+                # always allowed, measured from NOW -- but never past `read_deadline`, so a refusal
+                # that already ate the tick's headroom gets no socket and raises its own cause
+                # instead of pushing the beat into `run_bounded`'s kill (where no line prints).
+                prs = _queue_rest(
+                    deadline=min(_monotonic() + QUEUE_REST_TIMEOUT_S, read_deadline))
                 if prs is None:
                     # Both sources refused: raise the FIRST cause (it is the actionable one --
                     # "rate limit" says wait) and append the second so the cause line names the

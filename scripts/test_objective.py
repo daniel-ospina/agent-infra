@@ -94,7 +94,7 @@ def install(monkeypatch, *, gql=None, rest=None, pr_list=None, ci_runs=None, ls_
     queue_reads = {"n": 0}
     sleeps = []
 
-    def fake_rest_get(url, token, timeout=None):
+    def fake_rest_get(url, token, timeout=None, deadline=None):
         if rest_prs is None:
             raise OSError("fixture: no second source")
         # A payload shorter than one page ENDS the paging loop, so it is returned once.
@@ -1207,7 +1207,7 @@ def test_the_rest_payload_is_mapped_to_the_gh_pr_list_shape(monkeypatch):
     rather than a silent reinterpretation of an empty list.
     """
     monkeypatch.setattr(objective, "_gh_token", lambda: "t")
-    monkeypatch.setattr(objective, "_rest_get", lambda url, token, timeout=None: [
+    monkeypatch.setattr(objective, "_rest_get", lambda url, token, timeout=None, deadline=None: [
         {"number": 7, "draft": True, "mergeable": False, "mergeable_state": "",
          "head": {"sha": "abc123", "ref": "lane-7"}, "files": [{"path": "x"}]},
         {"number": 8, "draft": False, "mergeable": True, "mergeable_state": "clean",
@@ -1273,13 +1273,13 @@ def test_a_deep_rest_queue_is_PAGED_and_never_truncated(monkeypatch):
                          "mergeable_state": "clean", "head": {"sha": "x"}}
                         for i in range(101, 106)]}
 
-    def fake_get(url, token, timeout=None):
+    def fake_get(url, token, timeout=None, deadline=None):
         return next((v for k, v in pages.items() if k in url), [])
 
     monkeypatch.setattr(objective, "_rest_get", fake_get)
     assert len(objective._queue_rest()) == 105
 
-    def fail_second_page(url, token, timeout=None):
+    def fail_second_page(url, token, timeout=None, deadline=None):
         if "&page=2" in url:
             raise OSError("connection reset")
         return pages["&page=1"]
@@ -1291,7 +1291,7 @@ def test_a_deep_rest_queue_is_PAGED_and_never_truncated(monkeypatch):
     # other exits are a SHORT page and the cap; falling out of the `for` with a full last page
     # used to return 500 rows as the measured depth — an under-count published as the queue, and
     # the direction term then reads a 505-deep backlog as "not growing".
-    monkeypatch.setattr(objective, "_rest_get", lambda url, token, timeout=None: [
+    monkeypatch.setattr(objective, "_rest_get", lambda url, token, timeout=None, deadline=None: [
         {"number": i, "draft": False, "mergeable": True, "mergeable_state": "clean",
          "head": {"sha": "x"}} for i in range(1, objective.QUEUE_REST_PAGE + 1)])
     assert objective._queue_rest() is None
@@ -1328,7 +1328,7 @@ def test_the_fallback_is_bounded_by_the_queue_reads_OWN_budget(monkeypatch):
     monkeypatch.setattr(objective, "_gh_token", lambda: "t")
     monkeypatch.setattr(
         objective, "_rest_get",
-        lambda url, token, timeout=None: (calls.append(timeout), [_rest_row(1, "clean")])[1])
+        lambda url, token, timeout=None, deadline=None: (calls.append(timeout), [_rest_row(1, "clean")])[1])
     ticks = iter([100.0, 101.0, 102.0, 103.0, 104.0])
     monkeypatch.setattr(objective, "_monotonic", lambda: next(ticks))
     assert objective._queue_rest(deadline=104.0) is not None
@@ -1600,3 +1600,90 @@ def test_the_standard_config_locations_are_resolved(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
     monkeypatch.setattr(objective, "GH_HOSTS", str(tmp_path / "never-used.yml"))
     assert objective._gh_token() == "gho_xdg"
+
+
+def test_a_refusal_that_ate_the_tick_gets_NO_socket_and_the_line_still_prints(monkeypatch):
+    """⛔ THE FALLBACK MUST NEVER BE THE REASON A REFRESH IS KILLED (#2138 r3, A/P1).
+
+    `_gh_retry` retries a 5xx three times with backoff, so a 504-flavoured refusal can arrive
+    having spent 60-75 s of the beat's 90 s bound (`run_bounded 90 objective-refresh`). Anchoring
+    the fallback to `now + 30 s` then pushed the tick past the kill — where a killed refresh writes
+    NO line at all, precisely the outcome the fallback's own docstring calls "strictly worse than
+    the refusal it replaces". The cap is anchored at the START of the read, so a refusal with no
+    headroom left opens no socket and raises its own cause: the line still prints, honestly blind.
+    """
+    clock = {"t": 500.0}
+    monkeypatch.setattr(objective, "_monotonic", lambda: clock["t"])
+    install(monkeypatch, pr_list=REST_REFUSED, rest_prs=[_rest_row(1, "blocked")])
+    opened = []
+    monkeypatch.setattr(objective, "_rest_get",
+                        lambda *a, **k: opened.append(a) or (_ for _ in ()).throw(OSError("no")))
+    real_retry = objective._gh_retry
+
+    def slow_refusal(argv, **kw):
+        clock["t"] += objective.QUEUE_READ_MAX_S + 30      # the retried refusal ate the tick
+        return real_retry(argv, **kw)
+
+    monkeypatch.setattr(objective, "_gh_retry", slow_refusal)
+    line = objective.build()
+    assert opened == [], opened                              # no socket was opened
+    assert "queue=UNREADABLE" in line, line                  # ...and the line still printed
+    assert "gh=RATE-LIMITED(queue)" in line, line
+
+
+def test_a_page_that_arrives_over_budget_is_discarded_and_stops_the_paging(monkeypatch):
+    """⛔ THE BETWEEN-PAGE CHECK IS WHAT MAKES THE BUDGET REAL (#2138 r3, A/P2).
+
+    It had no test: deleting it left all 74 green, i.e. "reassurance without a guard" — the same
+    defect this round fixed for the `--json` field list. Two-page fixture, clock pushed past the
+    deadline after page 1: the read must be None (never a truncated queue), the cause must name the
+    page, and page 2 must never be fetched.
+    """
+    clock = {"t": 100.0}
+    monkeypatch.setattr(objective, "_monotonic", lambda: clock["t"])
+    monkeypatch.setattr(objective, "_gh_token", lambda: "t")
+    urls = []
+    full_page = [{"number": i, "draft": False, "mergeable": True, "mergeable_state": "clean",
+                  "head": {"sha": "x"}} for i in range(1, objective.QUEUE_REST_PAGE + 1)]
+
+    def slow_page(url, token, timeout=None, deadline=None):
+        urls.append(url)
+        clock["t"] = 201.0                                   # this page arrived LATE
+        return full_page
+
+    monkeypatch.setattr(objective, "_rest_get", slow_page)
+    assert objective._queue_rest(deadline=200.0) is None
+    assert "budget overrun during page 1" in objective.GH_LAST_ERROR, objective.GH_LAST_ERROR
+    assert not any("&page=2" in u for u in urls), urls
+
+
+def test_the_body_is_read_against_the_clock_not_just_the_socket_timeout(monkeypatch):
+    """⛔ A SOCKET TIMEOUT IS PER-RECV, SO IT DOES NOT BOUND A PAGE (#2138 r3, A/P2).
+
+    Review measured it: a byte-at-a-time server returned a complete page in 14.9 s with
+    `timeout=0.5` (29.7x), because every `recv` reset the timeout. So the body is read in 8 KiB
+    chunks with a clock check before each one; a trickle that keeps the socket fed must raise
+    instead of assembling a page forever.
+    """
+    import urllib.request
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self, n):
+            clock["t"] += 5.0                                 # each chunk takes real time
+            return b" " * n
+
+    class _Opener:
+        def open(self, req, timeout=None):
+            return _Resp()
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(objective, "_monotonic", lambda: clock["t"])
+    monkeypatch.setattr(urllib.request, "build_opener", lambda *a, **k: _Opener())
+    with __import__("pytest").raises(TimeoutError):
+        objective._rest_get("https://api.github.com/x", "t", timeout=30, deadline=8.0)
