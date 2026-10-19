@@ -23,6 +23,15 @@ if [ -d "$O/gh-rest" ]; then PATH="$O/gh-rest:$PATH"; fi
 # failure the portable probe exists to prevent.
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$SELF/spawn-gate.sh" || { echo "[lane $N] FATAL: $SELF/spawn-gate.sh missing — refusing to start an ungated agent" >&2; exit 78; }
+# ── the lane's own `.venv` is reaped on the way out (agent-infra#1932) ──────────────────────────────
+# A venv is a build artifact that belongs to a RUNNING lane: `uv sync` writes it inside the worktree,
+# and nothing removed it, so 5 lanes held 7.3 GB (~4 lanes, not 6, on a 32 GB box). The EXIT trap is
+# the right place because at lane exit the lane is KNOWN to be done — no liveness has to be inferred —
+# and it covers EVERY exit path, including a TERM'd session (bash runs EXIT traps on SIGTERM: verified).
+# The reaper still re-probes for a live holder before deleting, so a worktree another lane is using,
+# or a `pi`/pytest child still running after the agent returned, keeps its env. Best-effort and loud:
+# `reap_lane_venv` never changes the lane's exit status, and logs every outcome to the lane log.
+trap 'reap_lane_venv "$PWD" "lane $N"' EXIT
 export AGENT_SKIP_REVIEW_GATE=1 ELDATO_SKIP_VGATE=1 AGENT_ALLOW_MAIN_EDITS=1 ELDATO_ALLOW_MAIN_EDITS=1
 export PI_MCP_SERVERS=none   # headless lanes use no MCP servers — saves ~25 processes/run
 export PI_SKIP_VERSION_CHECK=1 SKILL_ENFORCER_DISABLED=1 LOOP_ENFORCER_DISABLED=1 SLACK_BRIDGE_DISABLE=1 VISION_INTERCEPTOR_DISABLED=1

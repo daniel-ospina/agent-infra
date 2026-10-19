@@ -12,13 +12,42 @@
 #
 # Runs ON THE CELL (Linux). Usage:
 #   bash cloud-cell-supervisor.sh check|start|stop|status|logs|apply|prune
+#                                  |doctor|merge|reap|hygiene
 #
 #   apply   fetch agent-infra main and PIN this cell's harness to it (agent-infra#1745). This is the
 #           whole of "apply the proper harness"; `start` runs it before every launch, so it is
 #           normally not needed by hand — it exists for a cell you want to fix without starting.
-#   prune   reclaim the regenerable disk the lanes leave behind (.venv per worktree, caches) and
-#           report the review scratch that accumulates under /tmp. --scratch[=DAYS] also deletes
-#           scratch checkouts older than DAYS. A full disk is what breaks a cell FIRST.
+#   prune   reclaim the regenerable disk the lanes leave behind and report the review scratch that
+#           accumulates under /tmp. --scratch[=DAYS] also deletes scratch checkouts older than DAYS.
+#           A full disk is what breaks a cell FIRST.
+#           ⛔ A per-worktree `.venv` is NOT removed here any more (agent-infra#1932). This sweep used
+#           to `rm -rf` it at every worktree root, with no idea whether the lane using it was alive;
+#           the only guard on the unattended path was a tmux NAME regex (`^(lane|fix|merge)-`) that
+#           the sessions this fleet actually runs (`ai1932`, `merge-8708` — measured on cell-2) do not
+#           match, and a manual `prune` had no guard at all. A `.venv` belongs to a RUNNING lane, so
+#           its ONLY deleter is now scripts/reap-lane-venvs.sh, which requires positive evidence that
+#           no live holder remains (a tmux pane inside the worktree, a process cwd or argv inside it)
+#           and FAILS CLOSED when it cannot prove it. `prune` runs that reaper's GC.
+#
+# ── THE ROLES, AND WHY `status` HAD TO STOP LYING (agent-infra#1989) ─────────────────────────────
+# The supervisor used to launch exactly one thing (`orch-loop.sh`) and answer "is its tmux session
+# up?". A cell whose loop had died and a cell that was idle printed the SAME `controller: RUNNING /
+# lanes: 0`, and nothing recorded whether a repair pass, a merge attempt or a reap had ever run. So
+# `start` now also launches the cell doctor (`cloud-cell-doctor.sh loop`, tmux session
+# `$DOCTOR_SESSION`), and `status` reads the per-role last-pass records it writes. A started cell
+# whose roles never ran is NOT healthy, and `status` exits non-zero for it.
+#
+#   doctor  one pass: reap + keep the ONE dispatcher running (`start` when its session is gone; a
+#           stale-but-present controller is REPORTED, never killed — that is a P0 action)
+#   reap    one wedged-session pass, gated (namespace, log, two observations, human ancestry)
+#   merge   land PRs with a clean attestation at head, through `admin-merge.sh`, and record every
+#           refusal with its reason (never an override; never a blind retry at the same head)
+#   hygiene `uv cache prune`, worktree-root caches (only when no worker is live), stale worktrees
+#           via the shipped `pi-reap-worktrees.sh` (armed only under disk pressure by default)
+#
+# The verbs run ONE pass and are idempotent; `start` runs the loop that schedules them. Both write
+# the same `$O/state/roles/<role>.state` records, so "configured" and "ran a pass at HH:MM:SSZ" are
+# different lines in `status` rather than the same green tick.
 #
 # ── THE QUEUE TARGET IS THE CHECKOUT (agent-infra#1901) ──────────────────────────────────────────
 # `REPO` (a path) and `OR` (an owner/repo) used to be two independent facts that nothing compared, so
@@ -120,6 +149,17 @@ recorder_src()  { printf '%s\n' "$HARNESS/../record-review.sh"; }
 recorder_lib_path() { printf '%s\n' "$(dirname "$(recorder_path)")/lib/diff-normalize.py"; }
 recorder_lib_src()  { printf '%s\n' "$HARNESS/../lib/diff-normalize.py"; }
 SESSION="${SESSION:-orch}"
+# The doctor loop's tmux session (agent-infra#1989). A NAME of its own, never a prefix of `$SESSION`.
+# ⛔ Every tmux target that names the DOCTOR uses `=name` exact matching, for the reason orch-loop's
+# reaper documents (`-t merge-82` resolved to `merge-821` and killed an in-flight worker): a session
+# called `cell-doctor-old` must not be mistaken for this cell's doctor. The controller's targets
+# (`has-session -t "$SESSION"`, `kill-session -t "$SESSION"`) still use tmux's default prefix
+# matching — pre-existing, unchanged here, and noted so this comment does not overclaim.
+DOCTOR_SESSION="${DOCTOR_SESSION:-cell-doctor}"
+# This file's own path, resolved ONCE and handed to the doctor loop, so a restart from inside the
+# loop runs the SAME supervisor the operator started (not a `$PATH` guess).
+SUP_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && printf '%s/%s' "$PWD" "$(basename "${BASH_SOURCE[0]}")")"
+[ -n "$SUP_SELF" ] || SUP_SELF="${BASH_SOURCE[0]}"
 # OR (the queue's owner/repo) is interpolated into the session command string, so it must always be
 # DEFINED — the guard below reads it with `${!v}` under `set -u`, which errors on an unset name.
 # ⛔ It is deliberately NOT defaulted to a repo any more (agent-infra#1901). A default here is a
@@ -264,6 +304,8 @@ source_env_file
 # gh auth" and the cell started, and then every gh call in the session failed.
 export HOME="$CELL_HOME"
 LOCK="$O/.orch.lock"
+# Recomputed AFTER $ENV_FILE is sourced (it may repoint $O), exactly like $LOCK above.
+ROLES_DIR="$O/state/roles"
 
 # ── controller ownership (agent-infra#1761) ───────────────────────────────────────────────────────
 # ONE authority for "does a controller own this state dir?". The lock names the owner; a SCOPED
@@ -1140,7 +1182,10 @@ cmd_check() {
   # contract — a false "CELL CAN RUN A CONTROLLER" (repo-authority.sh, review round 4).
   say "ok: HOME, harness, tmux, gh auth, repo, state dir"
   local missing="" w
-  for w in orch-loop.sh claims.sh repo-authority.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh; do
+  # cloud-cell-doctor.sh is launched from $O by `start` (the doctor loop), so its absence is the same
+  # false "CELL CAN RUN A CONTROLLER" the rest of this list exists to prevent: the controller would
+  # run, `start` would report success, and the cell would never reap or land anything.
+  for w in orch-loop.sh claims.sh repo-authority.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do
     [ -f "$O/$w" ] || missing="$missing $w"
   done
   [ -z "$missing" ] || die "worker scripts missing from $O:$missing — run 'start' (it seeds $O) or: cp '$HARNESS'/*.sh '$O'/"
@@ -1290,18 +1335,107 @@ cmd_check() {
   say "CELL CAN RUN A CONTROLLER"
 }
 
+# Does the `cell-doctor` session belong to THIS state dir? Its command string embeds this cell's log
+# path (`tee -a '$O/logs/cell-doctor.log'`) and `O='$O'`, so the pane's start command is a per-cell
+# proof — the only one available, since a session name is machine-scoped.
+# 0 = the session is PROVABLY another cell's (its pane command names a different state dir).
+# 1 = ours, or unknown (no pane answer at all): the caller heals rather than refusing a session it
+#     cannot prove is foreign — refusing on "unknown" would make `start` unable to repair its own
+#     leftover on a box whose `list-panes` is unavailable.
+doctor_session_foreign() {
+  local cmd
+  cmd="$(tmux list-panes -t "=$DOCTOR_SESSION" -F '#{pane_start_command}' 2>/dev/null)" || return 1
+  [ -n "$cmd" ] || return 1
+  case "$cmd" in
+    *"O='$O'"*|*"$O/logs/"*) return 1 ;;
+  esac
+  case "$cmd" in
+    *"O='"*|*"/logs/cell-doctor.log"*) return 0 ;;
+  esac
+  return 1
+}
+
+# Is the recorded doctor loop process alive and STILL the same incarnation? (The doctor applies the
+# same test to its own record; the supervisor needs it to keep `start` idempotent when the tmux session
+# is gone but the loop is not.)
+sup_loop_alive() {
+  local lpid lident
+  lpid="$(cat "$ROLES_DIR/loop.pid" 2>/dev/null)"
+  lident="$(cat "$ROLES_DIR/loop.ident" 2>/dev/null)"
+  case "${lpid:-}" in ''|*[!0-9]*) return 1 ;; esac
+  kill -0 "$lpid" 2>/dev/null || return 1
+  [ -n "$lident" ] && [ "$lident" = "$lpid|$(sup_pid_ident "$lpid")" ] || return 1
+  return 0
+}
+
+# End the doctor-LOOP process, identity-fenced (agent-infra#1989). Used by `stop` AND by a start's
+# supersede teardown: `tmux kill-session` HUPs the pane's `sh -c` wrapper, but the loop is the far side
+# of a `bash loop | tee` pipeline and can survive as an orphan that keeps running reap/merge/hygiene —
+# so removing `loop.pid` without ending the process destroys the only handle a later `stop`/`status`
+# has on it.
+#   rc 0 — the loop is not running (ended, already gone, or a DIFFERENT incarnation abstained on)
+#   rc 1 — a live pid matching the recorded identity survived TERM and KILL
+#   rc 2 — CANNOT VERIFY: the pid is live but its identity cannot be read, so nothing here can say
+#          whether ending it is safe. Never a pass: both callers report "could not end the loop".
+end_loop_pid() { # [<pid> <ident>]
+  local lpid="${1:-}" lident="${2:-}" i
+  if [ -z "$lpid" ]; then
+    lpid="$(cat "$ROLES_DIR/loop.pid" 2>/dev/null)"
+    lident="$(cat "$ROLES_DIR/loop.ident" 2>/dev/null)"
+    case "${lpid:-}" in ''|*[!0-9]*) lpid="" ;; esac
+  fi
+  [ -n "$lpid" ] || return 0
+  kill -0 "$lpid" 2>/dev/null || return 0
+  # ⛔ THREE OUTCOMES, NOT TWO (#1989 review). A live pid whose identity does NOT match is a RECYCLED
+  # pid: abstain (never signal an innocent process) and report the loop gone — rc 0. But an identity
+  # that cannot be READ is not evidence of a recycled pid: folding it into "gone" let a loop that
+  # could not be verified survive a `stop` that returned success, and an unstopped doctor keeps
+  # landing PRs. rc 2 = cannot-verify; both callers treat any non-zero as "could not end the loop".
+  local lcur
+  lcur="$(sup_pid_ident "$lpid")"
+  [ -n "$lcur" ] || return 2
+  [ -n "$lident" ] && [ "$lident" = "$lpid|$lcur" ] || return 0
+  kill -TERM "$lpid" 2>/dev/null || true
+  for i in 1 2 3 4 5; do kill -0 "$lpid" 2>/dev/null || break; sleep 1; done
+  kill -0 "$lpid" 2>/dev/null && kill -KILL "$lpid" 2>/dev/null || true
+  sleep 1
+  kill -0 "$lpid" 2>/dev/null && return 1
+  return 0
+}
+
 # ── start: controller under tmux (the launchd substitution) ─────────────────────
 cmd_start() {
   # Refuse a bad SCOPE before anything starts or is written (validate_scope is also the first thing
   # cmd_check does below — this call is what keeps the refusal ahead of the $O seed).
   validate_scope
+  # The stop generation this start is acting under (see the note above `stop_generation`). A caller
+  # that LAUNCHED this start (the doctor's restart) passes the generation it observed, so a stop that
+  # lands between the launch and this snapshot is still visible: without it, `cmd_start` would read the
+  # POST-stop value as its baseline and never tear down — the window spans bash startup and the whole
+  # source, not one instruction.
+  local gen0; gen0="${STOP_GENERATION_AT_LAUNCH:-$(stop_generation)}"
+  case "$gen0" in ''|*[!0-9]*) gen0="$(stop_generation)" ;; esac
+  superseded() {
+    [ "$(stop_generation)" = "$gen0" ] && return 1
+    say "a STOP arrived while this start was running — aborting and leaving nothing running"
+    tmux has-session -t "=$DOCTOR_SESSION" 2>/dev/null && tmux kill-session -t "=$DOCTOR_SESSION" 2>/dev/null || true
+    tmux has-session -t "$SESSION" 2>/dev/null && tmux kill-session -t "$SESSION" 2>/dev/null || true
+    # The loop this start just created is the only kill handle there is: end the PROCESS first, then
+    # drop the record. (A `stop` racing us may already have read the record; either side ending it is
+    # enough, and the fence makes a double-kill safe.)
+    end_loop_pid || say "warn: the doctor loop survived the abort and could not be ended"
+    rm -f "$ROLES_DIR/.desired" "$ROLES_DIR/loop.pid" "$ROLES_DIR/loop.ident"
+    return 0
+  }
   # Every value below is interpolated into the session command string, so every one must be
   # metacharacter-free — refuse loudly here rather than let tmux's sh -c parse it. Empty values
   # are skipped (cmd_check reports an unresolvable HARNESS with its own message).
   # ⛔ Ahead of both the queue-target gate and the `has-session` return: this is the INJECTION guard,
   # and its refusal is the one that must win for a value that reaches a shell string.
   local v
-  for v in O REPO CELL_HOME ENV_FILE HARNESS OR HARNESS_REPO HARNESS_PIN_DIR HARNESS_PIN_FILE; do
+  # ⛔ SESSION is in this list because the DOCTOR's command string interpolates it (the controller's
+  # does not — it only ever reaches tmux as an argv), so before #1989 it was never in a shell string.
+  for v in O REPO CELL_HOME ENV_FILE HARNESS OR HARNESS_REPO HARNESS_PIN_DIR HARNESS_PIN_FILE HARNESS_REF SESSION SCOPE DOCTOR_SESSION SUP_SELF; do
     [ -n "${!v}" ] || continue
     safe_argv "${!v}" || die "\$$v must not contain a quote or shell metacharacter: ${!v}"
   done
@@ -1328,6 +1462,14 @@ cmd_start() {
       || die "cannot read the process table (ps) — refusing to answer 'already running' from an unreadable read"
     if [ -n "$down" ]; then
       say "already running (controller pid $(_pids_join "$down")) — use: status | logs | stop"
+      # agent-infra#1989: a live controller with no doctor is exactly the measured state (one loop on
+      # the box). `start` is the idempotent launch verb, so it heals that half too rather than
+      # answering "already running" about a cell that cannot reap or land.
+      start_doctor_loop
+      # ⛔ ...and that heal is fenced like every other path in this function: a `stop` that lands while
+      # `start_doctor_loop` runs must not be undone by the `.desired` marker / doctor session it just
+      # created.
+      superseded && return 1
       return 0
     fi
     # Nothing of ours holds it. Either this repo's loop has not written its lock yet (the seconds
@@ -1335,6 +1477,8 @@ cmd_start() {
     # repo sharing this cell's harness path (then it is not evidence about $OR at all).
     if [ -z "$seen0" ]; then
       say "already running (tmux session '$SESSION', no controller pid observed yet) — use: status | logs | stop"
+      start_doctor_loop
+      superseded && return 1
       return 0
     fi
     die "session '$SESSION' is held by a controller that is NOT provably this state dir's (pid $(_pids_join "$seen0"), no $LOCK owner, no $O/orch-loop.sh) — a session name is shared across repos, so it is not evidence that $OR is running; attach with: tmux attach -t $SESSION, or pin a distinct SESSION per repo in $ENV_FILE"
@@ -1350,6 +1494,11 @@ cmd_start() {
     || die "cannot read the process table (ps) — refusing to start on an unreadable read"
   if [ -n "$own" ]; then
     say "already running (controller pid $(_pids_join "$own")) — use: status | logs | stop"
+    # agent-infra#1989: heal the doctor half on THIS path too — it returns "already running" about a
+    # live controller exactly like the session branch above, and a cell with a controller but no
+    # doctor still cannot reap, land or prune. Fenced like every other path in this function.
+    start_doctor_loop
+    superseded && return 1
     return 0
   fi
   if [ -n "$live" ]; then
@@ -1364,8 +1513,10 @@ cmd_start() {
   # `start` is the one command that applies the proper harness: fetch, pin to $HARNESS_REF in a
   # detached worktree, seed, record. A cell therefore cannot be started on a stale or hand-copied
   # tree, and the operator's manual copy step is gone. A live session already returned at the guard
-  # above, so the cache prune below cannot pull a venv out from under a running lane — which is why
-  # it is safe to run unattended here and not on the explicit `prune` path.
+  # above, so the cache prune below cannot pull a cache out from under a running lane.
+  # agent-infra#1932: `cmd_prune` no longer touches a per-worktree `.venv` at all — that delete is now
+  # the reaper's, gated on positive proof that no lane is alive — so this unattended path is safe
+  # whatever the session names are.
   local mb; mb="$(free_mb "$CELL_HOME")"
   case "${mb:-}" in
     ''|*[!0-9]*) ;;
@@ -1373,9 +1524,13 @@ cmd_start() {
          # ⛔ The controller session is NOT the only thing running: orch-loop.sh spawns its workers
          # into their OWN detached sessions (`fix-<PR>`, `merge-<PR>`), and `stop` kills only the
          # controller — so after a `stop` a worker can still be mid-review. `cmd_prune --caches`
-         # deletes `.venv` at every worktree root, which makes the lane using it re-resolve its deps
-         # (the manual `prune` path warns about exactly this). Skip the unattended delete while any
-         # worker session is alive, and report the low-space state instead of acting.
+         # deletes `node_modules` and `__pycache__` at every worktree root, and a lane's dev server can
+         # be holding the first of those. Skip the unattended delete while any worker session is alive,
+         # and report the low-space state instead of acting.
+         # ⛔ THIS NAME MATCH IS NOT THE VENV GUARD (agent-infra#1932). It never was a sound one: it
+         # matches `lane-|fix-|merge-` and the sessions this fleet actually runs on a cell are `ai1932`
+         # and `merge-8708` (measured on cell-2, 2026-10-17), so it reads "no workers" for a box full of
+         # them. The `.venv` half of the sweep no longer depends on it; the remaining entries do.
          # ⛔ `grep -c`, NOT `grep -q`. An early exit down a pipe lets the producer take SIGPIPE, and
          # under `set -o pipefail` the pipeline then reports the producer's failure — so a MATCH read
          # as "no workers" and the unattended prune deleted a LIVE worker's .venv. `-c` consumes all
@@ -1495,13 +1650,128 @@ cmd_start() {
   sleep 3
   if tmux has-session -t "$SESSION" 2>/dev/null; then
     say "controller started (tmux '$SESSION'), state=$O"
+    superseded && return 1
   else
     die "controller exited immediately — read $O/logs/controller.log"
   fi
+  # The SECOND role. `start` is not successful unless the repair/merge loop is also up: a cell that
+  # dispatches but cannot land is the measured #1989 state, and a start that reported success over
+  # it would be the same false green this file refuses everywhere else.
+  start_doctor_loop
+  superseded && return 1
+  return 0
+}
+
+# ── a stop SUPERSEDES an in-flight start (agent-infra#1989) ────────────────────────────────────────
+# A `stop` that arrives while a `start` is running (notably the doctor's own `supervisor start`, which
+# can take CONTROLLER_START_TIMEOUT) must WIN: without this, the restart completes after the stop,
+# rewrites `.desired` and re-creates the controller and the doctor session — silently undoing the
+# operator's stop. Process-group signalling cannot be relied on here (the restart runs under `timeout`,
+# and killing its wrapper only orphans the real child), so the guarantee is a GENERATION COUNTER:
+# `stop` bumps it as its first action; `start` snapshots it on entry and refuses to leave anything
+# running if it moved. The restart pid is still recorded and killed as a fast path, best-effort.
+STOP_GEN_FILE_REL="state/roles/.stop-generation"
+stop_generation() {
+  local f="$O/$STOP_GEN_FILE_REL" v
+  v="$(cat "$f" 2>/dev/null)"
+  case "${v:-}" in ''|*[!0-9]*) printf '0\n' ;; *) printf '%s\n' "$v" ;; esac
+}
+bump_stop_generation() {
+  local f="$O/$STOP_GEN_FILE_REL" v
+  # ⛔ NOT swallowed: the stop-wins guarantee rests on THIS write. On a full or read-only state dir
+  # (the very condition the hygiene role exists to prevent) a silent no-op leaves the generation
+  # unchanged, so an in-flight `start` sees no movement and completes after the stop — undoing it with
+  # no signal at all. `cmd_stop` turns a non-zero return into a warning and a failed stop.
+  mkdir -p "$O/state/roles" 2>/dev/null || return 1
+  v="$(stop_generation)"
+  printf '%s\n' "$((v + 1))" > "$f" 2>/dev/null || return 1
+  return 0
+}
+
+# A process's identity, for the fenced backstop below. Deliberately LOCAL (the same rule as the
+# doctor's `pid_ident`): `stop` must be able to end an orphaned loop WITHOUT the doctor being present.
+# `/proc/<pid>/stat` field 22 is start time in clock ticks — one-second `lstart` cannot tell a pid
+# recycled inside the same second from its predecessor.
+sup_pid_ident() {
+  local st f22
+  st="$(cat "/proc/$1/stat" 2>/dev/null)"
+  if [ -n "$st" ]; then
+    f22="$(printf '%s' "$st" | sed 's/.*) //' | awk '{print $20}')"
+    case "$f22" in ''|*[!0-9]*) ;; *) printf 'proc:%s\n' "$f22"; return 0 ;; esac
+  fi
+  ps -p "$1" -o lstart= 2>/dev/null
 }
 
 cmd_stop() {
-  local live own p foreign
+  local rc=0 lpid lident rpid rident i
+  # FIRST: drop the desired-state marker, THEN bump the generation. Both orders matter:
+  #  * `.desired` gone before anything else means a pass that starts in the window below sees a
+  #    "not started" cell (the doctor supervises nothing and launches no restart), and a pass already
+  #    running sees the marker disappear (`cell_stopped_midpass`).
+  #  * the bump is what an in-flight `start` re-checks; a bump that could not be recorded means that
+  #    guarantee did NOT hold for this stop, so say so and fail the verb rather than report a stop
+  #    that an in-flight start can still undo.
+  # ⛔ Neither signal alone is sufficient: the generation is a counter, so a pass that snapshots it
+  # AFTER the bump sees "no change" — the marker is the non-snapshotable half.
+  # ⛔ A DOCTOR SESSION NAME IS MACHINE-SCOPED TOO (`cell-doctor` is the default for every cell on the
+  # box), so "a session with this name exists" is NOT evidence that it is this cell's — the #1856
+  # hazard, one layer out. Record the claim before the marker goes away: a started cell owns its
+  # doctor, and the loop's own identity record proves it directly.
+  rm -f "$ROLES_DIR/.desired" 2>/dev/null || { say "warn: could not remove $ROLES_DIR/.desired — an in-flight restart may re-arm this cell"; rc=1; }
+  bump_stop_generation || { say "warn: could not record the stop generation in $O/$STOP_GEN_FILE_REL — an in-flight start may still complete and undo this stop"; rc=1; }
+  # ORDER: the desired-state marker is dropped first (with the generation bump, above — the two stop
+  # signals), then the restart child, then the doctor loop, then its pid backstop, then the marker is
+  # removed again defensively, and only then the controller. If the marker outlived the loop, a
+  # surviving pass would restart the controller the operator just stopped; if the loop outlived the
+  # marker, its next pass reports "cell not started" and stops acting — harmless, but the session
+  # would linger. `stop` is a REQUEST the operator makes once, and the marker is what makes it stick.
+  # ⛔ KILLING THE SESSION IS NOT PROOF THE LOOP IS GONE. tmux HUPs the pane's `sh -c` wrapper, and
+  # the loop is the far side of a `bash … | tee` pipeline: the wrapper dies, the loop can survive as
+  # an orphan (its trap never fires) and keep LANDING PRs and pruning caches after an explicit
+  # `stop`. So the recorded pid is the backstop — read and fenced REGARDLESS of whether the session is
+  # still there (after a tmux server restart it is not, and that is exactly when an orphan is most
+  # likely). `stop` is only successful when that pid is actually gone.
+  lpid="$(cat "$ROLES_DIR/loop.pid" 2>/dev/null)"
+  lident="$(cat "$ROLES_DIR/loop.ident" 2>/dev/null)"
+  case "${lpid:-}" in ''|*[!0-9]*) lpid="" ;; esac
+  # A restart child (run_doctor's backgrounded `supervisor start`) is killed FIRST as a FAST PATH.
+  # ⛔ This is best-effort and NOT the guarantee: the restart runs under `timeout`, so the recorded pid
+  # is a wrapper, and killing it can orphan the real child. The guarantee is the generation bump
+  # above — `start` re-checks it before it finishes and tears down whatever it created.
+  if [ -f "$ROLES_DIR/restart.ident" ]; then
+    rident="$(cat "$ROLES_DIR/restart.ident" 2>/dev/null)"
+    rpid="${rident%%|*}"
+    case "${rpid:-}" in ''|*[!0-9]*) rpid="" ;; esac
+    if [ -n "$rpid" ] && kill -0 "$rpid" 2>/dev/null && [ "$rident" = "$rpid|$(sup_pid_ident "$rpid")" ]; then
+      kill -TERM "$rpid" 2>/dev/null || true
+      sleep 1
+      kill -0 "$rpid" 2>/dev/null && kill -KILL "$rpid" 2>/dev/null || true
+      say "stopped an in-flight controller restart (pid $rpid)"
+    fi
+    rm -f "$ROLES_DIR/restart.ident"
+  fi
+  if tmux has-session -t "=$DOCTOR_SESSION" 2>/dev/null; then
+    # ⛔ THE LIVE, IDENTITY-MATCHED LOOP RECORD IS THE ONLY PROOF (#1989 review b). This branch used
+    # to also accept `had_desired`, and `$ROLES_DIR/.desired` OUTLIVES a SIGKILLed doctor: the marker
+    # says this cell was started once, never that the session holding the machine-scoped name right
+    # now is ours. So a stale marker plus a peer repo's doctor turned `stop` into a kill of the peer's
+    # doctor. Ours-but-stale is the `else` arm below: reported, left alone, and healed by `start`.
+    if sup_loop_alive; then
+      tmux kill-session -t "=$DOCTOR_SESSION" || { say "warn: could not stop the doctor loop '$DOCTOR_SESSION'"; rc=1; }
+      say "doctor loop stopped (tmux '$DOCTOR_SESSION')"
+    else
+      # No loop record and this cell was never started: the session is somebody else's doctor. Leave
+      # it alone and say so — the same direction `stop` takes for a foreign CONTROLLER.
+      say "note: doctor session '$DOCTOR_SESSION' exists but is not provably this cell's (no loop record, cell not started) — left alone"
+    fi
+  fi
+  # ⛔ The "survived" verdict is FENCED too: a live pid whose recorded identity no longer matches is
+  # a RECYCLED pid, not our loop — warning about it (and returning rc=1) would tell the operator that
+  # a successful stop failed.
+  if ! end_loop_pid "$lpid" "$lident"; then
+    say "warn: the doctor loop (pid $lpid) survived the stop and could not be ended"; rc=1
+  fi
+  rm -f "$ROLES_DIR/.desired" "$ROLES_DIR/loop.pid"
   if ! tmux has-session -t "$SESSION" 2>/dev/null; then
     own="$(owned_controller_pids)" \
       || die "cannot read the process table (ps) — refusing to report 'stopped' from an unreadable read"
@@ -1526,6 +1796,9 @@ cmd_stop() {
         fi
       fi
       say "not running"
+      # A doctor-loop stop failure recorded above still fails the verb: "not running" is about the
+      # CONTROLLER, and this branch used to return 0 over it.
+      [ "$rc" -eq 0 ] || return 1
       return 0
     fi
     say "no tmux session '$SESSION', but a controller is live (pid $(_pids_join "$own")) — stopping it"
@@ -1578,8 +1851,9 @@ cmd_stop() {
   foreign="$(_pids_minus "$live" "$own")"
   [ -z "$foreign" ] || say "note: a controller for ANOTHER repo is still running from the shared harness path (pid $(_pids_join "$foreign")) — left alone"
   rm -f "$LOCK" && say "released lock $LOCK"
+  [ "$rc" -eq 0 ] || return 1
+  return 0
 }
-
 cmd_status() {
   local cpids own foreign
   cpids="$(seen_controller_pids)" \
@@ -1635,12 +1909,150 @@ cmd_status() {
     say "⛔ CACHE BOUND NOT ENFORCED — the package-cache reaper's last pass:"
     sed 's/^/    /' "$O/state/.cache-reap-blocked"
   fi
+  # agent-infra#2032: the scheduled DISK reaper. Its pass record is the only place that answers
+  # "did the last unattended run succeed, and how much did it free" — a failed or STALE pass is
+  # therefore a ⛔ line here, never an absence that reads like health. Disk exhaustion is the second
+  # reason cells stopped working: at ~97% a controller still beats and every dispatch is refused.
+  local _dr _drs _drc _dst _det cand
+  _dr=""
+  for cand in "${DISK_REAPER:-}" \
+              "${HOME:-}/.pi/agent/scripts/disk-reaper.sh" \
+              "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/disk-reaper.sh"; do
+    [ -n "$cand" ] && [ -f "$cand" ] && { _dr="$cand"; break; }
+  done
+  if [ -z "$_dr" ]; then
+    say "⛔ DISK REAPER NOT INSTALLED — no disk-reaper.sh found (\$DISK_REAPER, \$HOME/.pi/agent/scripts, beside this script); the uv caches, dead lane venvs and merged worktrees are unbounded"
+  else
+    _drs="$(bash "$_dr" --print-status 2>/dev/null)"; _drc=$?
+    _dst="$(printf '%s\n' "$_drs" | sed -n 's/^status=//p' | head -1)"
+    _det="$(printf '%s\n' "$_drs" | sed -n 's/^detail=//p' | head -1)"
+    if [ "$_drc" -eq 0 ]; then
+      say "disk reaper: last pass $(printf '%s\n' "$_drs" | sed -n 's/^iso=//p' | head -1) ($(printf '%s\n' "$_drs" | sed -n 's/^age_seconds=//p' | head -1)s ago) mode=$(printf '%s\n' "$_drs" | sed -n 's/^mode=//p' | head -1) freed $(printf '%s\n' "$_drs" | sed -n 's/^freed_mb=//p' | head -1)MB (uv=$(printf '%s\n' "$_drs" | sed -n 's/^freed_mb_uv=//p' | head -1)MB venv=$(printf '%s\n' "$_drs" | sed -n 's/^freed_mb_venv=//p' | head -1)MB worktree=$(printf '%s\n' "$_drs" | sed -n 's/^freed_mb_worktree=//p' | head -1)MB)"
+    elif [ "$_dst" = "never" ]; then
+      say "⛔ DISK REAPER HAS NEVER RUN — installed but no pass recorded ($_det); start it: sudo systemctl start eldato-disk-reaper.service"
+    else
+      say "⛔ DISK REAPER NOT HEALTHY — status=${_dst:-unknown} rc=$(printf '%s\n' "$_drs" | sed -n 's/^rc=//p' | head -1) last=$(printf '%s\n' "$_drs" | sed -n 's/^iso=//p' | head -1): ${_det:-no detail}"
+      say "    per class: uv=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_uv=//p' | head -1) venv=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_venv=//p' | head -1) worktree=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_worktree=//p' | head -1)"
+    fi
+  fi
   # the loop's own view of itself
   tail -3 "$O/logs/orch-loop.log" 2>/dev/null | sed 's/^/  /' || say "  (no orch-loop.log yet)"
   say "lanes: $(tmux ls 2>/dev/null | grep -c '^lane-')"
+  # agent-infra#1989: CONFIGURED vs RAN. Each role's own last-pass record is printed, and a started
+  # cell whose role never ran / went stale fails this verb — the issue's validation requirement, and
+  # the fix for the measured "a dead loop looks identical to an idle cell".
+  local d rl rrc=0
+  if d="$(doctor_path)"; then
+    rl="$(CELL_HOME="$CELL_HOME" O="$O" REPO="$REPO" OR="$OR" SESSION="$SESSION" bash "$d" status 2>&1)"
+    rrc=$?
+    printf '%s\n' "$rl" | sed 's/^/  /'
+  else
+    say "  roles: UNKNOWN — cloud-cell-doctor.sh not found (run: $0 apply)"
+    [ -f "$ROLES_DIR/.desired" ] && rrc=1
+  fi
+  return "$rrc"
 }
 
 cmd_logs() { tail -30 "$O/logs/orch-loop.log" 2>/dev/null || say "no log yet at $O/logs/orch-loop.log"; }
+
+# ── the cell doctor's roles (agent-infra#1989) ──────────────────────────────────────────────────
+# `cloud-cell-doctor.sh` owns the passes; this file owns the launch and the report. The seeded copy
+# in $O is preferred because $O is what the harness provenance record describes (cmd_check pins the
+# payload hash), and falling back to the copy beside this supervisor keeps `doctor`/`merge`/`reap`
+# usable on a cell that has not been started yet.
+doctor_path() {
+  local c
+  for c in "$O/cloud-cell-doctor.sh" "$(dirname "$SUP_SELF")/orchestrator-harness/cloud-cell-doctor.sh" \
+           "$(dirname "$SUP_SELF")/cloud-cell-doctor.sh"; do
+    [ -n "$c" ] && [ -f "$c" ] && { printf '%s\n' "$c"; return 0; }
+  done
+  return 1
+}
+
+# One role pass, in this cell's own environment. `doctor` and `merge` resolve the queue target first
+# (assert_queue_target) and pass the RESOLVED OR, so the doctor never re-derives a second one; `reap`
+# and `hygiene` do not need OR — they touch tmux sessions, $O and $REPO only.
+run_role() {
+  local role="$1" d; shift
+  d="$(doctor_path)" || die "cloud-cell-doctor.sh not found (looked in $O, then beside $SUP_SELF in orchestrator-harness/, then beside $SUP_SELF) — run '$0 start' (it seeds $O) or '$0 apply'"
+  # ⛔ THE SAME configuration the loop's command string carries, for the same reason: a role that
+  # restarts the controller (`doctor` -> run_doctor -> `$SUPERVISOR start`) must not re-derive the
+  # operator's values from defaults. Without SCOPE an ambient-only `SCOPE=own` pin comes back as
+  # `auto` (BROAD above 10 open PRs drains the shared queue — #5052), and without DOCTOR_SESSION the
+  # restart spawns a SECOND loop under the default name (two loops on one state dir, and a `stop` on
+  # the custom name cannot end the duplicate).
+  CELL_HOME="$CELL_HOME" O="$O" REPO="$REPO" OR="$OR" SESSION="$SESSION" \
+    SCOPE="$SCOPE" ENV_FILE="$ENV_FILE" DOCTOR_SESSION="$DOCTOR_SESSION" \
+    HARNESS_REPO="$HARNESS_REPO" HARNESS_REF="$HARNESS_REF" \
+    HARNESS_PIN_DIR="$HARNESS_PIN_DIR" HARNESS_PIN_FILE="$HARNESS_PIN_FILE" \
+    MIN_FREE_MB="$MIN_FREE_MB" DOCTOR_SUPERVISOR="$SUP_SELF" \
+    bash "$d" "$role" "$@"
+}
+
+# The loop `start` runs. Idempotent by tmux session name: a second `start` (or a restart driven from
+# inside the loop) finds it and returns, so the cell never grows two doctors. The desired-state
+# marker is what tells the doctor that the cell is SUPPOSED to be up — without it a `stop` would be
+# undone by the next pass, and an operator's stop would never stick.
+start_doctor_loop() {
+  local d
+  mkdir -p "$ROLES_DIR" "$O/logs" || die "cannot create $ROLES_DIR"
+  : > "$ROLES_DIR/.desired" || die "cannot record the desired running state at $ROLES_DIR/.desired"
+  d="$(doctor_path)" || die "cloud-cell-doctor.sh not found (looked in $O, then beside $SUP_SELF in orchestrator-harness/, then beside $SUP_SELF) — the cell cannot run its repair/merge roles"
+  if tmux has-session -t "=$DOCTOR_SESSION" 2>/dev/null; then
+    # ⛔ A DOCTOR SESSION NAME IS MACHINE-SCOPED (`cell-doctor` is the default for EVERY cell on a
+    # box), so "a session with this name exists" is not evidence that it is OURS — the same hazard the
+    # controller's shared `SESSION` branch resolves, one layer out. Blessing a foreign session would
+    # leave this cell with no doctor at all (its reap/merge/hygiene roles silently never run) while
+    # `start` printed "already running".
+    if sup_loop_alive; then
+      say "doctor loop already running (tmux '$DOCTOR_SESSION', pid $(cat "$ROLES_DIR/loop.pid" 2>/dev/null))"
+      return 0
+    fi
+    if doctor_session_foreign; then
+      die "doctor session '$DOCTOR_SESSION' belongs to another state dir — a session name is shared across cells, so it is not evidence that $OR has a doctor; pin a distinct DOCTOR_SESSION per cell in $ENV_FILE, or stop the cell that owns it"
+    fi
+    # Ours-but-stale (its loop record is gone) or unprovable: replacing it is the heal `start` exists
+    # for, and the alternative — reporting "already running" — would leave this cell with no doctor at
+    # all while printing success.
+    say "doctor session '$DOCTOR_SESSION' has no live loop record — replacing it with a fresh loop"
+    tmux kill-session -t "=$DOCTOR_SESSION" 2>/dev/null || true
+  fi
+  # ⛔ A LIVE LOOP RECORD COUNTS AS RUNNING even with no session. After a tmux server restart the
+  # session is gone while the loop survives as an orphan — the state `cmd_stop`'s own note calls the
+  # likeliest one. That orphan's next pass sees the controller session absent and calls
+  # `supervisor start`; a session-only idempotency check would create a SECOND loop, which overwrites
+  # `loop.pid` and hides the orphan from `stop`/`status` (and every later `start` adds another).
+  if sup_loop_alive; then
+    say "doctor loop already running (pid $(cat "$ROLES_DIR/loop.pid" 2>/dev/null) — no tmux session, likely a tmux server restart)"
+    return 0
+  fi
+  # ⛔ The command string interpolates only values cmd_start has already validated (see the note on
+  # the two exceptions below). The loop re-sources $ENV_FILE for the same reason the controller does:
+  # a tmux session is served
+  # from the SERVER's environment on a pre-existing server, so this shell's exports would be dropped.
+  # ⛔ CARRY THE OPERATOR'S CONFIGURATION, not the defaults: this loop RESTARTS the controller
+  # (`run_doctor` -> `$SUPERVISOR start`), so a value that is only ambient at the original `start`
+  # (SCOPE=own, a non-default ENV_FILE, a pinned HARNESS_REF/pin dir) would be re-derived from
+  # defaults on that restart — a cell pinned to OWN scope would come back as AUTO, which takes BROAD
+  # above 10 open PRs and drains the shared queue (the measured #5052 behaviour this pin exists to
+  # avoid), and a custom keys.env would silently drop the merge key. Same allow-list as the
+  # controller's command string. `safe_argv` covers every value EXCEPT two, which are safe by other
+  # means and are named here so this note is not an overclaim: MIN_FREE_MB is normalised to a base-10
+  # integer above, and `$d` (the doctor path) is derived from the guarded `$O`/`$SUP_SELF`.
+  tmux new-session -d -s "$DOCTOR_SESSION" -c "$HARNESS" \
+    "set -a; [ ! -f '$ENV_FILE' ] || . '$ENV_FILE'; set +a; HOME='$CELL_HOME' CELL_HOME='$CELL_HOME' O='$O' REPO='$REPO' OR='$OR' SESSION='$SESSION' SCOPE='$SCOPE' ENV_FILE='$ENV_FILE' DOCTOR_SESSION='$DOCTOR_SESSION' HARNESS_REPO='$HARNESS_REPO' HARNESS_REF='$HARNESS_REF' HARNESS_PIN_DIR='$HARNESS_PIN_DIR' HARNESS_PIN_FILE='$HARNESS_PIN_FILE' MIN_FREE_MB='$MIN_FREE_MB' DOCTOR_SUPERVISOR='$SUP_SELF' bash '$d' loop 2>&1 | tee -a '$O/logs/cell-doctor.log'"
+  sleep 2
+  if tmux has-session -t "=$DOCTOR_SESSION" 2>/dev/null; then
+    say "doctor loop started (tmux '$DOCTOR_SESSION')"
+  else
+    die "the doctor loop exited immediately — read $O/logs/cell-doctor.log"
+  fi
+}
+
+cmd_doctor()  { assert_queue_target; run_role doctor "$@"; }
+cmd_merge()   { assert_queue_target; run_role merge "$@"; }
+cmd_reap()    { run_role reap "$@"; }
+cmd_hygiene() { run_role hygiene "$@"; }
 
 # ── apply: put the PROPER harness on this cell (agent-infra#1745) ─────────────────────────────────
 # The owner's complaint was that "apply our harness to the cell" should be one simple job and had
@@ -1688,6 +2100,37 @@ cmd_apply() {
   say "  record: $STAMP"
 }
 
+# ── the lane-venv reaper this cell delegates to (agent-infra#1932) ────────────────────────────────
+# Resolved from the harness checkout (`$HARNESS/..` is the agent-infra `scripts/` dir), then the farm.
+# Returns non-zero when it cannot be found, and the CALLER KEEPS the venv in that case: a fallback to
+# `rm -rf` is exactly the defect this replaced, so there is deliberately no fallback.
+venv_reaper_path() {
+  local c
+  for c in "$HARNESS/../reap-lane-venvs.sh" "${HOME:-}/.pi/agent/scripts/reap-lane-venvs.sh" \
+           "${AGENT_INFRA_PATH:-}/scripts/reap-lane-venvs.sh"; do
+    [ -n "$c" ] && [ -f "$c" ] && { printf '%s\n' "$c"; return 0; }
+  done
+  return 1
+}
+
+# reclaim_lane_venvs <repo> — run the GC over that repo's worktrees. Prints the reaper's own report
+# (including the KEPT list and the evidence for each keep). Exit statuses are NOT propagated: a
+# fail-closed abort (3) leaves every env in place, which is the safe outcome for `prune`, and a
+# `prune` that died because one probe was unavailable would leave the rest of the reclaim undone.
+reclaim_lane_venvs() {
+  local repo="$1" reaper mb_before mb_after
+  [ -n "$repo" ] && [ -d "$repo" ] || return 0
+  mb_before="$(free_mb "$CELL_HOME")"
+  if ! reaper="$(venv_reaper_path)"; then
+    say "prune: warn: reap-lane-venvs.sh not found (harness \$HARNESS, ~/.pi/agent/scripts, \$AGENT_INFRA_PATH) — every worktree .venv is KEPT. A blind rm here would delete a live lane's env; that is what #1932 removed."
+    return 0
+  fi
+  bash "$reaper" --gc --repo "$repo" --apply || say "prune: warn: the lane-venv reaper exited $? — any env it could not prove dead was kept (it fails closed)"
+  mb_after="$(free_mb "$CELL_HOME")"
+  [ -n "$mb_before" ] && [ -n "$mb_after" ] && say "prune: lane venvs: free ${mb_before}MB → ${mb_after}MB"
+  return 0
+}
+
 # ── prune: reclaim the disk the lanes regenerate (agent-infra#1745) ───────────────────────────────
 # MEASURED 2026-10-15: the live cell's /dev/root was 30G/32G used with 111MB free, and the controller
 # log carried `No space left on device` from claims.sh and orch-loop.sh. The single largest consumer
@@ -1700,10 +2143,18 @@ rm_cache() {
 }
 
 # Regenerable caches at ONE worktree root. `--maxdepth 5` keeps the pycache sweep bounded.
+# ⛔ `.venv` IS DELIBERATELY ABSENT (agent-infra#1932). It is not an anonymous cache: it belongs to the
+# lane that ran `uv sync` in this worktree, and deleting a LIVE lane's env breaks it mid-test. Reclaiming
+# it therefore needs a liveness proof, which this function does not have and must not approximate —
+# `reclaim_lane_venvs()` above is the only caller of the only tool allowed to delete one. The remaining
+# entries are pure build/test cache with no owner. `node_modules` is arguably in the SAME class as
+# `.venv` once a lane's dev server holds it — but it is NOT on the measured 7.3 GB, and widening this
+# change to cover it would need its own liveness proof and its own review; it stays as it was, visibly,
+# rather than being silently folded in here.
 sweep_root_caches() {
   local root="$1"
   [ -d "$root" ] || return 0
-  rm_cache "$root/.venv"; rm_cache "$root/node_modules"; rm_cache "$root/.pytest_cache"
+  rm_cache "$root/node_modules"; rm_cache "$root/.pytest_cache"
   find "$root" -maxdepth 5 -type d -name __pycache__ -prune -exec rm -rf {} + 2>/dev/null || true
 }
 
@@ -1837,6 +2288,11 @@ cmd_prune() {
   for r in "$REPO" "$HARNESS_REPO"; do
     [ -n "$r" ] || continue
     git -C "$r" rev-parse --git-dir >/dev/null 2>&1 || continue
+    # (0b) LANE VENVS (agent-infra#1932). Delegated, per repo, and the ONLY thing in this verb that
+    # touches a `.venv`: the reaper needs the liveness proof this file cannot make, and it reports every
+    # removal AND every keep with the evidence that decided it. It runs before the anonymous caches so a
+    # fail-closed abort (unreadable probe) is visible in the same report.
+    reclaim_lane_venvs "$r"
     # (1) ⛔ NO bare `git worktree prune` — the call this repo forbids (#1141) and this very file
     # states the ban against ~500 lines above. It has no path filter and deregisters EVERY record
     # whose working directory is missing, unrelated siblings included; for a DETACHED worktree the
@@ -1884,12 +2340,16 @@ cmd_prune() {
 }
 
 case "${1:-status}" in
-  check)  cmd_check ;;
-  start)  cmd_start ;;
-  apply)  shift; cmd_apply "$@" ;;
-  prune)  shift; cmd_prune "$@" ;;
-  stop)   cmd_stop ;;
-  status) cmd_status ;;
-  logs)   cmd_logs ;;
-  *)      say "usage: $0 check|start|stop|status|logs|apply|prune"; exit 2 ;;
+  check)   cmd_check ;;
+  start)   cmd_start ;;
+  apply)   shift; cmd_apply "$@" ;;
+  prune)   shift; cmd_prune "$@" ;;
+  stop)    cmd_stop ;;
+  status)  cmd_status ;;
+  logs)    cmd_logs ;;
+  doctor)  shift; cmd_doctor "$@" ;;
+  merge)   shift; cmd_merge "$@" ;;
+  reap)    shift; cmd_reap "$@" ;;
+  hygiene) shift; cmd_hygiene "$@" ;;
+  *)       say "usage: $0 check|start|stop|status|logs|apply|prune|doctor|merge|reap|hygiene"; exit 2 ;;
 esac

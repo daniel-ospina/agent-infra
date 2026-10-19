@@ -157,8 +157,25 @@ die() { echo "gh-rest: $*" >&2; exit 1; }
 # became INCOMPLETE; the backlog stayed 0 and NO LANE WAS DISPATCHED — with capacity free
 # (lanes=0/20, 1.3 GB RAM). An adapter that answers what it cannot answer does not degrade the fleet,
 # it disables it, and the symptom ("no work") is indistinguishable from a genuinely empty queue.
+# ⛔ `stateReason` IS ON THE ISSUE ALLOW-LIST BECAUSE REST CARRIES IT. The pre-flight makes ONE
+# gh-backed issue read — `gh issue view … --json number,title,state,stateReason,assignees,url`
+# (collision_preflight.py) — and BOTH the `issue assignee/holder` surface and its `issue landed`
+# decision are computed from that ONE payload (a failed read marks the landed surface
+# `issue-metadata-unavailable` INCOMPLETE beside it). Leaving the field unmodelled sent that read to
+# GraphQL: an extra round trip on the scarce bucket, and on a refusal the tool recovers only through
+# its own REST fallback for the refusal TEXTS it classifies as budget exhaustion — any other refusal
+# (a permission 403, a body it does not recognise) leaves the surface INCOMPLETE, which is enough to
+# make EVERY candidate's verdict unusable and drain the backlog to 0 (#1736's abort, working
+# correctly on a broken transport). It is NOT a derivation: REST's issue object carries
+# `state_reason` and `gh --json stateReason` renders exactly that value — lower-case enum uppercased,
+# `null` -> "" (measured 2026-10-18 on gh 2.97.0 against daniel-ospina/tortoise: REST issue 8491
+# `state_reason: "completed"` / `--json stateReason: "COMPLETED"`; REST issue 9020 `state_reason:
+# null` / `--json stateReason: ""`).
+# `gh pr view --json stateReason` is NOT a valid field (gh rejects it client-side: "Unknown JSON
+# field: \"stateReason\"", rc=1), so it stays out of PR_FIELDS — the allow-list is per-kind, not
+# global, and REST must not invent a key gh would refuse.
 PR_FIELDS="number title body state url headRefName baseRefName headRefOid isDraft mergeable mergeStateStatus createdAt updatedAt author labels assignees"
-ISSUE_FIELDS="number title body state url createdAt updatedAt labels assignees"
+ISSUE_FIELDS="number title body state url createdAt updatedAt labels assignees stateReason"
 CHECK_FIELDS="name state workflow link status conclusion bucket event startedAt completedAt"
 # `comments` is servable for VIEW (fetched as an array) but NOT for LIST (REST returns a COUNT).
 fields_ok() { # <pr|prview|issue|issueview>
@@ -299,6 +316,7 @@ M={"number":lambda o:o.get("number"),"title":lambda o:o.get("title"),"body":lamb
    "author":lambda o:{"login":(o.get("user") or {}).get("login")},
    "labels":lambda o:[{"name":l.get("name")} for l in (o.get("labels") or [])],
    "assignees":lambda o:[{"login":a.get("login")} for a in (o.get("assignees") or [])],
+   "stateReason":lambda o:(o.get("state_reason") or "").upper(),
    "comments":lambda o:o.get("comments"),
    "reviewDecision":lambda o:None}
 d=json.load(sys.stdin)
