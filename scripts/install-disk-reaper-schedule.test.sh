@@ -129,7 +129,7 @@ cat >"$T/bin/launchctl" <<LC
 STATE="${T}/launchctl.state"
 printf '%s\n' "\$*" >>"${T}/launchctl.log"
 case "\${1:-}" in
-  bootstrap) mkdir -p "\$STATE"; exit 0 ;;
+  bootstrap) mkdir -p "\$STATE"; printf '%s\n' "\${3:-}" >"\${T}/launchctl.plist-path"; exit 0 ;;
   bootout)   [ -n "\${LAUNCHCTL_BOOTOUT_IGNORE:-}" ] && exit 0; rm -rf "\$STATE"; exit 0 ;;
   enable)    rm -f "\${T}/disabled.state"; exit 0 ;;
   print-disabled*)
@@ -140,6 +140,9 @@ case "\${1:-}" in
   disable*)  echo disabled >"\${T}/disabled.state"; exit 0 ;;
   print)     [ -d "\$STATE" ] || exit 1
              printf '\tstate = %s\n\truns = 2\n\tlast exit code = %s\n' "\${LAUNCHCTL_STATE:-not running}" "\${FAKE_LAST_EXIT:-0}"
+             # …and the job's OWN plist path, as real launchctl does (``path = /…/x.plist``). Without
+             # this line the installer's authoritative-location candidate is untestable.
+             [ -s "\${T}/launchctl.plist-path" ] && printf '\tpath = %s\n' "\$(cat "\${T}/launchctl.plist-path")"
              exit 0 ;;
 esac
 exit 0
@@ -816,6 +819,25 @@ HOME="$DEFHOME" DISK_REAPER="$PASSFILE" DISK_REAPER_REPOS="$REPO" DISK_REAPER_PL
     bash "$INST" --uninstall >/dev/null 2>&1
 assert_nofile "$DEF_PLIST" "T8j …and an uninstall through the seam removes it (read back, not assumed)"
 rm -rf "$DEFHOME" "$SEAM_DIR" "$T/state-j" "$T/launchctl.state"
+
+# ── T8l: when the stamp is invisible AND the seam is gone, launchd itself names the plist ──
+# Round 9 added the `launchctl print` `path = …` candidate for exactly this sequence; nothing pinned it,
+# so neutering it left the suite green while `--uninstall` certified a SURVIVING armed plist
+# (#2048 review, round 10). Two state dirs, one seam, no record visible to the uninstalling run.
+SEAM_L="$T/agents-l"; mkdir -p "$SEAM_L"
+DEFHOME="$T/home-l"; mkfakehome "$DEFHOME" 2>/dev/null || mkdir -p "$DEFHOME/Library/LaunchAgents"
+HOME="$DEFHOME" DISK_REAPER="$PASSFILE" DISK_REAPER_REPOS="$REPO" DISK_REAPER_PLATFORM=darwin \
+    DISK_REAPER_STATE_DIR="$T/state-l1" DISK_REAPER_AGENTS_DIR="$SEAM_L" LAUNCHCTL="$T/bin/launchctl" \
+    LAUNCHD_DOMAIN="gui/999" DISK_REAPER_PYTHON="$T/bin/fakepython" ELDATO_ALLOW_TEST_HOME=1 \
+    bash "$INST" --install >/dev/null 2>&1
+assert_file "$SEAM_L/com.eldato.disk-reaper.plist" "T8l the seam install put the plist in the seam dir"
+OUT="$(HOME="$DEFHOME" DISK_REAPER="$PASSFILE" DISK_REAPER_REPOS="$REPO" DISK_REAPER_PLATFORM=darwin \
+    DISK_REAPER_STATE_DIR="$T/state-l2" LAUNCHCTL="$T/bin/launchctl" LAUNCHD_DOMAIN="gui/999" \
+    DISK_REAPER_PYTHON="$T/bin/fakepython" ELDATO_ALLOW_TEST_HOME=1 bash "$INST" --uninstall 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T8l --uninstall from a DIFFERENT state dir and no seam succeeds"
+assert_nofile "$SEAM_L/com.eldato.disk-reaper.plist" \
+    "T8l …because launchd named the plist; without that candidate this survivor is certified as removed"
+rm -rf "$SEAM_L" "$T/state-l1" "$T/state-l2" "$T/launchctl.state" "$T/launchctl.plist-path" "$DEFHOME" 2>/dev/null
 
 echo "── T11. both systemd targets, including the two arms no test could reach ──"
 # (a) the SYSTEM unit with `SUDO=""` — the "already root / container" arm. The system unit dir is a

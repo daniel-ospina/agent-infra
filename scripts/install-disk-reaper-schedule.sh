@@ -979,7 +979,10 @@ ld_uninstall() {
     loaded_path=""
     loaded_path="$($LC print "$LD_DOMAIN/$LABEL" 2>/dev/null | sed -n 's/^[[:space:]]*path = //p' | head -1)"
     loaded_dir=""
-    [ -n "$loaded_path" ] && loaded_dir="$(dirname "$loaded_path")"
+    # ⛔ ONLY AN ABSOLUTE PATH MAY CONTRIBUTE A DIRECTORY. `launchctl submit -l <label> -- /bin/sleep 5`
+    # makes `print` report `path = (submitted by launchctl[98168])`; `dirname` of that is `.`, i.e. `rm`
+    # would reach into the invoker's CWD (#2048 review, NIT — measured deleting a decoy file there).
+    case "$loaded_path" in /*) loaded_dir="$(dirname "$loaded_path")" ;; esac
     plist_dirs=("$LD_DIR")
     for _cand in "$live_dir" "$default_dir" "$loaded_dir"; do
         [ -n "$_cand" ] || continue
@@ -1003,7 +1006,15 @@ ld_uninstall() {
     # adopted nothing and quietly re-installed REPORT-ONLY on a box the owner had armed (#2048 review,
     # P2). `sd_uninstall` was moved for exactly this; the launchd path was left behind.
     rm -f "$STAMP"
-    say "uninstalled $LABEL from ${plist_dirs[*]}"
+    # ⛔ SAY WHAT WAS ACTUALLY ESTABLISHED. When neither a record nor launchd could name the plist's
+    # directory (an unloaded job whose stamp this run cannot see), the population is a set of GUESSES:
+    # the job is gone and the stamp is gone, but a survivor outside those guesses was never looked at —
+    # so the claim names the directories checked instead of asserting a verified removal (#2048 review).
+    if [ -n "$rec" ] || [ -n "$loaded_path" ]; then
+        say "uninstalled $LABEL from ${plist_dirs[*]}"
+    else
+        say "uninstalled $LABEL — checked ${plist_dirs[*]} (no record and no loaded job named the location; nothing outside those directories was examined)"
+    fi
     return 0
 }
 
@@ -1014,8 +1025,13 @@ ld_uninstall() {
 # against?
 status_tail() {
     local sha stamp_sha drift pass_rc job_file repos_art
-    say "pass=$REAPER"
-    say "pass_exists=$([ -f "$REAPER" ] && echo yes || echo no)"
+    # ⛔ NAMED FOR WHAT IT IS (#2048 review, NIT): this is what THIS INVOCATION resolved, not what the
+    # scheduled job runs — `armed=`/`repos=`/`runner=` are read off the artifact, so an unqualified
+    # `pass_exists=yes` read as a statement about the job and was measured reporting `yes`/rc 0 after the
+    # artifact's own pass and launcher had both been deleted. `pass_target=` (below, from the artifact)
+    # is the job's answer; keep them distinguishable.
+    say "pass_resolved=$REAPER"
+    say "pass_resolved_exists=$([ -f "$REAPER" ] && echo yes || echo no)"
     # What the SCHEDULED job scans, read off the installed artifact — the same discipline as armed=.
     # Falls back to this invocation's resolution, named as such, so an uninstalled box still answers.
     case "$SCHEDULER" in
@@ -1097,9 +1113,10 @@ fi
 # cache paths (`cannot create the lock directory (/.pi/agent/state)`) while `--status` still reports the
 # box as scheduled — a false PASS on the one question the verb exists to answer. Refuse at INSTALL time
 # instead; `--status`/`--uninstall` stay usable without HOME because they must be able to clean up.
-if [ -z "${HOME:-}" ] && { [ "$MODE" = "--install" ] || [ "${PREVIEW:-0}" = "1" ]; }; then
+if [ -z "${HOME:-}" ] && [ "$MODE" = "--install" ]; then
     err "HOME is empty: the rendered job's Environment=HOME would be empty and every scheduled pass would fail closed."
-    err "       Set HOME (or provision a real home for this account) and re-run — --status/--uninstall still work without it."
+    err "       Set HOME (or provision a real home for this account) and re-run. --status works without HOME;"
+    err "       on launchd, export HOME to manage (uninstall) the job, whose directory is derived from it."
     exit 2
 fi
 
