@@ -38,7 +38,8 @@
    "open_pr_count": 0,
    "open_prs": [],
    "prs_created_in_window": 0,
-   "prs_merged_in_window": 0
+   "prs_merged_in_window": 0,
+   "merged_page_full": false
   },
   "headroom": {
    "disk": {

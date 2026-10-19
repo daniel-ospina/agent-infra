@@ -311,9 +311,13 @@ Four more, found by measuring the surface the tool actually reads rather than th
   one check, so `changes` (published by both `CI` and `Python CI`) and `ai-review-gate` (measured
   twice with differing conclusions on the same PR) were graded as one, and ranking on `id` always fell
   through to list position — which is not chronological (18 of 59 adjacent pairs have a later position
-  with an earlier `startedAt`). Grouping is now `(workflowName, name)`, ordering is the timestamp, and
-  **a group with an attempt still in flight is not green**: a queued attempt carries no timestamp at
-  all, so an ordering alone would rank it last and grade the stale green.
+  with an earlier `startedAt`). Grouping is now `(workflowName, name)` and ordering is the timestamp.
+  ⛔ **The NEWEST attempt per group decides — including the in-flight arm.** Asking "is ANY attempt in
+  this group in flight?" let a SUPERSEDED queued attempt outrank a newer concluded one (a re-run adds
+  a row, it does not clear one, so co-residence is the normal shape), which skipped a CLEAN, APPROVED,
+  unarmed PR as `:inflight` inside `PASS/NOTHING_GREEN`. The one case that still abstains is an attempt
+  whose ORDER cannot be established — a queued attempt with no timestamp AND no `id` — because list
+  position is not chronology and the previous attempt's verdict must not be published as the newest.
 - **"Graded or unprobed, never neither" is enforced in the predicate**, not only in the collectors.
   `pr.get("probed", True)` read an ABSENT key as probed, and a row the filters could not grade (no
   mergeability, no check surface) left BOTH lists — an unread PR disappearing from a PASS. An absent
@@ -359,9 +363,10 @@ Six more (cycle 13), each a case where a datum the tool held was not the one it 
   `False` — a positive claim that a PR's CI is red — so `landers` filed a CLEAN, APPROVED, UNARMED PR
   under the known-not-landable skips and returned `PASS / NOTHING_GREEN`, which is the silent expiry
   this check exists to catch. An unreadable entry now abstains exactly like an unreadable surface
-  (`PARTIAL_POPULATION`). An entry that PARSES but has not concluded is **not green** (in flight is
-  not a pass, so the PR is not landable yet) and is labelled `:inflight`, not `:red`: the verdict is
-  the same, the CLAIM is true. `rollup_state()` is that three-way read; `rollup_is_green()` is the
+  (`PARTIAL_POPULATION`). An entry that PARSES but has not concluded is **not green** when it is the NEWEST attempt of its
+  group (in flight is not a pass, so the PR is not landable yet) and is labelled `:inflight`, not
+  `:red`: the verdict is the same, the CLAIM is true. A superseded in-flight attempt beside a newer
+  concluded one does not make the check unknown — that is the false green fixed above. `rollup_state()` is that three-way read; `rollup_is_green()` is the
   boolean projection the collectors use.
 - **A missing `tail_ok` is a missing read.** `is False` caught a FAILED tail but let a payload that
   never reported one — the `--facts` injection mode, or any producer that loses the field — fall
@@ -514,6 +519,26 @@ Six more (cycle 13), each a case where a datum the tool held was not the one it 
 - **The machine-readable report carries the same disclosures as the text one**: static JSON publishes
   its `exit` and the `not_evaluated` checks, and `--facts` provenance is no longer computed and
   discarded.
+- **A coverage bit is a bit, not a hint.** `merged_page_full is None` fell back to `n >= 100` — the
+  count INSIDE the window, while truncation is a property of the ROWS the page returned, and a
+  truncated page normally has `n == 0`. So the fallback could not fire, and an absent or non-bool bit
+  read as a definite "the page is complete": `FAIL/NO_PR_MERGED` ("nothing merged") over a merge
+  population whose coverage was never established. Only `is False` establishes coverage; every
+  fixture now declares the bit.
+- **A failure refutes only a start it is not older than** — one helper, `_refutes_scoped`, shared by
+  `work_dispatched` and `_activity`. A bare SET of failed issue numbers refuted every later start of
+  that issue forever, so a normal retry (failure 240s ago, lane started 60s ago) read
+  "EVERY spawn failed" while `_activity` confirmed the lane on the same facts. One world, two verdicts,
+  and the FAIL is the one that pages.
+- **`local`/`localhost`/`.` are this box, defined ONCE** (`_is_local_box`): `cfg_from_args` stripped the
+  name and `Machine` did not, so `--box "local "` ran local PR checks against a remote probe surface
+  and told the operator their own machine was REMOTE.
+- **A suppressed notify is not "nothing to send"**: `--no-notify` records
+  `suppressed by --no-notify` in the report and in `signal.notify`, the way `--skip` and
+  `--no-respawn` already do.
+- **A CRASHED mutant is a failed mutation, not a catch.** The harness scored any non-zero exit as
+  "RED as required", and `evaluate` converts a raising predicate into `INCONCLUSIVE/PREDICATE_ERROR` —
+  so a mutant whose only effect was to raise was counted as evidence it never was.
 - **`_is_count` is the ONLY count guard.** `isinstance(True, int)` is true, and the same field was
   healed in one arm and re-broken in the next three times in one week: `backlog: true` FAILed in
   `work_dispatched`, then PASSed in its GREEN arm (`False == 0`), then certified a frozen pool as

@@ -1422,9 +1422,19 @@ def check_work_dispatched(f, c):
         # 3-issue batch (2 worktree failures + 1 started-then-killed) the check read
         # PASS/DISPATCHED, printing "3 issue(s) dispatched" off the batch INTENT count — the very
         # datum the comment above says must not be graded.
-        failed_issues = set(str(e.get("issue")) for e in all_failed if _is_this_batch(e))
-        live = [e for e in all_started if _is_this_batch(e)
-                and str(e.get("issue")) not in failed_issues]
+        # ⛔ A FAILURE REFUTES ONLY A START IT IS NOT OLDER THAN. `failed_issues` was an ORDER-BLIND
+        # set of issue numbers, so ANY `chain-N could NOT be started` inside the batch window
+        # disqualified every start for that issue however much newer: a normal retry (failure 240s
+        # ago, lane started 60s ago) produced FAIL/NO_LANE_STARTED — "EVERY spawn failed" — while
+        # `_activity`, reading the same facts, confirmed the lane 60s ago. One world graded two ways,
+        # and the FAIL is the one that pages. `_activity`'s own scoping helper is the rule; use it.
+        batch_fails = [e for e in all_failed if _is_this_batch(e)]
+
+        def _refuted(start):
+            return any(str(fe.get("issue")) == str(start.get("issue"))
+                       and _refutes_scoped(fe, start) for fe in batch_fails)
+
+        live = [e for e in all_started if _is_this_batch(e) and not _refuted(e)]
         started = newest_with_age(live, win)
         spawn_fail = newest_with_age([e for e in all_failed if _is_this_batch(e)], win)
         foreign = newest([e for e in all_started if not _is_this_batch(e)])
@@ -1564,6 +1574,26 @@ def check_work_dispatched(f, c):
 # ════════════════════════════════════════════════════════════════════════════════════════════════
 
 
+def _refutes_scoped(fail, start):
+    """Does `fail` refute THIS start? Only a failure for the same issue, no OLDER than the start.
+
+    ⛔ ONE RULE, TWO READERS. `_activity` had this scoping inline and `work_dispatched` substituted a
+    bare SET of issue numbers: any failure for an issue refuted every later start of it forever, so a
+    normal retry (failure 240s ago, start 60s ago) read "EVERY spawn failed" while `_activity`
+    confirmed the lane. An un-ageable start cannot outrank a failure (return True) — the conservative
+    direction, because the start is then not evidence either.
+    """
+    if str(fail.get("issue")) != str(start.get("issue")):
+        return False
+    fa = fail.get("age_s")
+    if not _is_age(fa):
+        return False
+    sa = start.get("age_s")
+    if not _is_age(sa):
+        return True
+    return fa <= sa + 2.0
+
+
 def _activity(f, window_s=None, cfg=None):
     """Did the fleet have work in hand? Used to decide whether 'no PR' is a FAILURE or an IDLE.
 
@@ -1607,15 +1637,7 @@ def _activity(f, window_s=None, cfg=None):
         the batch's age. An unscoped set of issue numbers refuted every LATER start of that issue
         forever, so a normal retry (failure 2h ago, start 60s ago) read as "no lane spawn was
         confirmed" while `work_dispatched` PASSed on the same facts."""
-        if str(fail.get("issue")) != str(start.get("issue")):
-            return False
-        fa = fail.get("age_s")
-        if not _is_age(fa):
-            return False
-        sa = start.get("age_s")
-        if not _is_age(sa):
-            return True          # an unageable start cannot outrank a failure for its issue
-        return fa <= sa + 2.0    # the failure came at or after the start line
+        return _refutes_scoped(fail, start)    # the failure came at or after the start line
     _fails = events.get("lane_failed") or []
     lane_ok = newest_with_age([e for e in (events.get("lane_started") or [])
                                if not any(_refutes(f, e) for f in _fails)], pr_win)
@@ -1803,18 +1825,26 @@ def check_pr_merged(f, c):
     if _is_count(n) and n > 0:
         return V("pr_merged", PASS, "MERGED", ev)
     busy, why = _activity(f, cfg=c)
-    _n_is_int = _is_count(n)
-    if (gh.get("merged_page_full") is True
-            or (gh.get("merged_page_full") is None and _n_is_int and n >= 100)) \
-            and not (_n_is_int and n > 0):
+    # ⛔ THE COVERAGE BIT IS A BIT, NOT A HINT. `merged_page_full is None` fell back to
+    # `n >= 100` — the count INSIDE the window, while truncation is a property of the ROWS the page
+    # returned, and a truncated page normally has `n == 0` (which is why the collector coerces an
+    # unprovable coverage to True). So the fallback could essentially never fire, and an ABSENT or
+    # non-bool bit was read as a definite "the page is complete": a `FAIL/NO_PR_MERGED` claiming
+    # "nothing merged" over a merge population whose coverage was never established — the polarity
+    # this file applies to every other bit. Only `is False` establishes coverage; anything else
+    # abstains, and the detail says which it was.
+    mpf = gh.get("merged_page_full")
+    if mpf is not False and not (_is_count(n) and n > 0):
         # A FULL, creation-ordered page cannot tell "nothing merged" from "merged PRs created before
         # the page cut". Abstaining is the honest answer; a FAIL here would be a false alarm, and a
         # PASS impossible.
         return V("pr_merged", INCONCLUSIVE, "MERGED_SURFACE_TRUNCATED",
-                 ev + "\nthe merged list hit its 100-row page bound (it is creation-ordered), so a "
-                 "merge older than the page cut cannot be seen",
-                 "the merge population is truncated, so 'nothing merged in the window' is not "
-                 "established. Not green.")
+                 ev + ("\nthe merged list hit its 100-row page bound (it is creation-ordered), so a "
+                       "merge older than the page cut cannot be seen" if mpf is True else
+                       "\nthe page's coverage of the window was NOT REPORTED (merged_page_full=%r), "
+                       "so a merge outside the page cannot be ruled out" % (mpf,)),
+                 "the merge population's coverage is unknown, so 'nothing merged in the window' is "
+                 "not established. Not green.")
     if busy is None:
         # ⛔ HOISTED ABOVE THE `open_n > 0` ARM. The two PR checks answer one question, so they must
         # answer it the same way: `pr_created` abstained ACTIVITY_UNKNOWN on the #1931 blind-pool
@@ -3199,6 +3229,18 @@ def _plist_path(label):
 # ════════════════════════════════════════════════════════════════════════════════════════════════
 
 
+def _is_local_box(name):
+    """Is this box name THIS machine? `local`, `localhost` and `.` are, whitespace and all.
+
+    ⛔ ONE DEFINITION, TWO CALLERS. `cfg_from_args` stripped the name and `Machine` did not, so
+    `--box "local "` read as remote: every probe went through `cmux cloud exec "local "` (rc 127,
+    the whole report INCONCLUSIVE) while the three PR checks read THIS box's repo — and the send and
+    respawn refusals then told the operator "box local  is REMOTE", a false statement about the
+    machine they are sitting at.
+    """
+    return (name or "local").strip().lower() in ("local", "localhost", ".")
+
+
 class Machine(object):
     """Command boundary. Local = a bash subshell; remote = `cmux cloud exec <box> -- sh -c …`.
 
@@ -3212,7 +3254,7 @@ class Machine(object):
 
     def __init__(self, box=None, timeout=120):
         self.box = box or "local"
-        self.remote = bool(box and box not in ("local", "localhost", "."))
+        self.remote = not _is_local_box(self.box)
         self.timeout = timeout
         self.log_path = None
         self.tail_lines = 6000
@@ -4213,7 +4255,7 @@ def cfg_from_args(a):
     }
     if a.repo:
         kw["repo"] = a.repo
-    elif a.box and a.box.strip() not in ("local", "localhost", "."):
+    elif a.box and not _is_local_box(a.box):
         # ⛔ THE BOX'S REPO IS NOT THIS MACHINE'S REPO. `_repo_from_plist` opens the LOCAL
         # ~/Library/LaunchAgents/<label>.plist, so a `--box` run graded a remote cell against the
         # repository of whichever cell this machine happens to run — "a healthy fleet for a repo
@@ -4432,6 +4474,11 @@ def main(argv=None):
     elif ctrl_v is not None and ctrl_v.variant in RESPAWN_TRIGGERS:
         reported["respawn"] = {"attempted": False, "took": False,
                                "detail": "suppressed by --no-respawn", "commands": []}
+    if a.no_notify:
+        # ⛔ A SUPPRESSED NOTIFY IS NOT "NOTHING NEEDED SENDING". `--skip` and `--no-respawn` both
+        # disclose what they suppressed; this flag left `signal.sent`/`suppressed` empty, so an
+        # operator asking "why did the controller never hear about this FAIL" got no answer.
+        reported["notify"] = "suppressed by --no-notify"
 
     # (b)+(c) notify — change-only, sanctioned path, never mid-turn
     state = None
@@ -4539,6 +4586,7 @@ def main(argv=None):
                               "state_error": reported.get("state_error"),
                               "state_repaired": reported.get("state_repaired"),
                               "state_persisted": reported.get("state_persisted"),
+                              "notify": reported.get("notify"),
                           }}, indent=1))
         return code
 

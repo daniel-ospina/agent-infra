@@ -4500,13 +4500,30 @@ MUTATIONS = [
      '    if lane_ok:\n        return True, "a lane started %s (the queue record is not the only evidence)" % (\n            _age_txt(lane_ok.get("age_s")))',
      '    if intent or lane_ok:\n        return True, "a dispatch landed %s (the queue record is not the only evidence)" % (\n            _age_txt((intent or lane_ok).get("age_s")))',
      "test_the_intent_line_is_not_reported_as_a_LANDED_dispatch"),
+    # ── cycle-40 defects ─────────────────────────────────────────────────────────────────
+    ("an unreported merge-coverage bit reads as a complete page",
+     '    if mpf is not False and not (_is_count(n) and n > 0):',
+     '    if mpf is not True and not (_is_count(n) and n > 0):',
+     "test_an_UNREPORTED_merge_coverage_bit_is_NOT_a_complete_page"),
+    ("a failure refutes a LATER start of the same issue (the set is order-blind)",
+     '            return any(str(fe.get("issue")) == str(start.get("issue"))\n                       and _refutes_scoped(fe, start) for fe in batch_fails)',
+     '            return any(str(fe.get("issue")) == str(start.get("issue")) for fe in batch_fails)',
+     "test_a_failure_does_not_refute_a_LATER_start_of_the_same_issue"),
+    ("a suppressed notify is reported as nothing to send",
+     '        reported["notify"] = "suppressed by --no-notify"',
+     '        reported["notify"] = None',
+     "test_a_suppressed_notify_is_DISCLOSED_not_silent"),
+    ("this box is defined twice, and the strip lives in only one",
+     'return (name or "local").strip().lower() in ("local", "localhost", ".")',
+     'return (name or "local") in ("local", "localhost", ".")',
+     "test_this_box_is_defined_ONCE"),
     # ── cycle-39 defects ─────────────────────────────────────────────────────────────────
     ("the static report's not_evaluated comes from the --only FLAG, not the verdicts",
      '                print(render(vs, hdr, not_evaluated=[n for n in CHECK_ORDER\n                                                     if n not in set(v.name for v in vs)]))',
      '                print(render(vs, hdr, not_evaluated=[n for n in CHECK_ORDER\n                                                     if n not in set(only or [])]))',
      "test_the_STATIC_report_is_honest_with_NO_only_flag_too"),
     ("--box local blanks this box's plist repo",
-     '    elif a.box and a.box.strip() not in ("local", "localhost", "."):',
+     '    elif a.box and not _is_local_box(a.box):',
      "    elif a.box:",
      "test_box_LOCAL_is_this_box_so_the_plist_repo_still_applies"),
     ("the static JSON hides its exit code and its unasserted checks",
@@ -4570,8 +4587,8 @@ MUTATIONS = [
      '        age = _raw_age',
      "test_a_BOOL_age_is_not_a_current_reading"),
     ("a refuted lane start is dropped by issue number alone, ignoring WHEN",
-     '        return fa <= sa + 2.0    # the failure came at or after the start line',
-     '        return True',
+     '    return fa <= sa + 2.0',
+     '    return True',
      "test_a_refutation_is_scoped_to_the_start_it_can_speak_about"),
     ("a hand-rolled count guard returns to the GREEN arm",
      '    if pool_kind == "EMPTY" and ((_is_count(backlog) and backlog == 0) or superseded_backlog) \\\n',
@@ -4963,7 +4980,7 @@ MUTATIONS = [
      "        if False:\n            return False",
      "test_a_dry_run_does_NOT_persist_the_default_notification_state"),
     ("a --box run grades a remote cell against THIS machine's repo plist",
-     '    elif a.box and a.box.strip() not in ("local", "localhost", "."):',
+     '    elif a.box and not _is_local_box(a.box):',
      "    elif False:",
      "test_a_box_run_does_not_grade_against_THIS_machines_repo"),
     ("an unparseable header is reported as a log that contains no header",
@@ -5126,7 +5143,7 @@ MUTATIONS = [
      '        _raw_age = 1.0',
      'test_the_GRADED_record_cannot_borrow_the_age_of_the_record_it_beat'),
     ('a start REFUTED by its own failure line is counted as a live lane',
-     '        live = [e for e in all_started if _is_this_batch(e)\n                and str(e.get("issue")) not in failed_issues]',
+     '        live = [e for e in all_started if _is_this_batch(e) and not _refuted(e)]',
      '        live = [e for e in all_started if _is_this_batch(e)]',
      'test_a_start_REFUTED_by_its_own_failure_line_is_not_a_live_lane'),
     ("the PASS prints the batch INTENT count as dispatched",
@@ -5228,12 +5245,11 @@ MUTATIONS = [
      "            print(\"outcome-canary: %s\" % exc, file=sys.stderr)\n            return 1",
      "test_a_bad_fixture_path_is_a_USAGE_error_not_the_FAIL_exit_code"),
     ("a truncated merged page reads as nothing merged",
-     "    if (gh.get(\"merged_page_full\") is True",
-     "    if (gh.get(\"merged_page_full\") is False",
+     '    if mpf is not False and not (_is_count(n) and n > 0):',
+     '    if mpf is not True and not (_is_count(n) and n > 0):',
      "test_a_TRUNCATED_merged_page_does_not_read_as_nothing_merged"),
     ("a lane spawn from ANOTHER batch vouches for this one",
-     "        live = [e for e in all_started if _is_this_batch(e)\n"
-     "                and str(e.get(\"issue\")) not in failed_issues]",
+     "        live = [e for e in all_started if _is_this_batch(e) and not _refuted(e)]",
      "        live = all_started",
      "test_a_lane_spawn_from_ANOTHER_batch_does_not_vouch_for_this_one"),
     ("a spawn that PRECEDES its batch line still counts",
@@ -5376,17 +5392,21 @@ def run_mutations():
                                 "--only", paired, "--quiet"],
                                capture_output=True, text=True, env=env, timeout=600)
             if p.returncode != 0:
-                ok += 1
                 # ⛔ A MUTANT THAT CRASHES IS NOT EVIDENCE THE PAIRED TEST DISCRIMINATES THE DEFECT.
                 # `evaluate` turns a crashing predicate into INCONCLUSIVE/PREDICATE_ERROR, so a test
                 # asserting "INCONCLUSIVE, but a different variant" goes red for the CRASH rather
-                # than for the defect. Reported distinctly so a weak mutation cannot hide.
+                # than for the defect — the mutant would be scored as caught while proving nothing.
+                # So a crash counts as a FAILURE of the mutation, not a catch: it is the mutation
+                # that is wrong, and the entry must be rewritten to mis-grade instead of raising.
                 crashed = "PREDICATE_ERROR" in (p.stdout or "") or "Traceback" in (p.stderr or "")
-                print("  %s %s — %s\n       (paired: %s)%s"
-                      % ("⚠️  RED (mutant CRASHED, not mis-graded)" if crashed else "✅ RED as required",
-                         "" if crashed else "", label, paired,
-                         "\n       the mutation must express the DEFECT, not make the code raise"
-                         if crashed else ""))
+                if crashed:
+                    bad += 1
+                    print("  ❌ MUTANT CRASHED (not evidence) — %s\n       (paired: %s)\n"
+                          "       the mutation must express the DEFECT, not make the code raise"
+                          % (label, paired))
+                    continue
+                ok += 1
+                print("  ✅ RED as required  — %s\n       (paired: %s)" % (label, paired))
             else:
                 bad += 1
                 print("  ❌ STILL GREEN — %s\n       %s did not catch it; the test is decoration"
@@ -5726,6 +5746,91 @@ def test_an_INJECTED_fact_set_is_disclosed_in_the_JSON_too():
     assert payload is not None, (rc, (out or err)[-400:])
     assert payload.get("facts_injected") is True, payload.get("facts_injected")
     assert "injected" in (payload.get("facts_source") or ""), payload.get("facts_source")
+
+
+@test
+def test_an_UNREPORTED_merge_coverage_bit_is_NOT_a_complete_page():
+    """`merged_page_full is None` fell back to `n >= 100` — the count INSIDE the window, while
+    truncation is a property of the ROWS returned, and a truncated page normally has `n == 0`. So the
+    fallback could not fire, and an absent/non-bool bit read as a definite "the page is complete":
+    `FAIL/NO_PR_MERGED` claiming nothing merged over a population whose coverage was never
+    established."""
+    m = load()
+    cfg = m.cfg_from_dict({})
+    base = {"ok": True, "prs_merged_in_window": 0, "open_pr_count": 12,
+            "prs_created_in_window": 1, "source": "graphql"}
+    for bit in (None, "true", "false", 0, 1):
+        gh = dict(base)
+        if bit is not None:
+            gh["merged_page_full"] = bit
+        v = m.check_pr_merged({"github": gh}, cfg)
+        assert (v.status, v.variant) == (m.INCONCLUSIVE, "MERGED_SURFACE_TRUNCATED"), (bit, v.status,
+                                                                                     v.variant)
+        # the evidence ECHOES the bit it could not use, so the operator sees what arrived
+        assert ("merged_page_full=%r" % (bit,)) in v.evidence, (bit, v.evidence)
+    # an ESTABLISHED complete page still FAILs, so the FAIL arm stays reachable
+    gh = dict(base, merged_page_full=False)
+    assert m.check_pr_merged({"github": gh}, cfg).variant == "NO_PR_MERGED"
+
+
+@test
+def test_a_failure_does_not_refute_a_LATER_start_of_the_same_issue():
+    """A bare SET of failed issue numbers refuted every later start of that issue forever, so a normal
+    retry (failure 240s ago, lane started 60s ago) read `FAIL/NO_LANE_STARTED` — "EVERY spawn failed" —
+    while `_activity`, on the same facts, confirmed the lane. One world graded two ways."""
+    m = load()
+    cfg = m.cfg_from_dict({})
+    d = fx("dispatch-previous-batch-spawn")
+    ev = d["facts"]["log_events"]
+    batch = ev["dispatch_ok"][-1]
+    # the batch line must be OLDER than both the failure and the start, or `_is_this_batch`'s own
+    # age bound (not the refutation rule) decides what is in scope
+    batch["age_s"] = 300
+    issue = batch["issues"][0]
+    ev["lane_started"] = [{"raw": "#%d: lane-%d (implement+PR)" % (issue, issue), "issue": issue,
+                           "lane": issue, "age_s": 60}]
+    ev["lane_failed"] = [{"raw": "#%d: chain-1 could NOT be started" % issue, "issue": issue,
+                          "age_s": 240}]
+    v = m.check_work_dispatched(d["facts"], cfg)
+    assert v.status == m.PASS, (v.status, v.variant, v.detail)
+    # ...and a failure AT or AFTER the start still refutes it
+    ev["lane_failed"][0]["age_s"] = 30
+    v2 = m.check_work_dispatched(d["facts"], cfg)
+    assert v2.status != m.PASS, (v2.status, v2.variant)
+    assert v2.variant == "NO_LANE_STARTED", v2.variant
+
+
+@test
+def test_a_suppressed_notify_is_DISCLOSED_not_silent():
+    """`--no-notify` skipped the whole block, so `signal.sent`/`suppressed` stayed empty and the report
+    was indistinguishable from "nothing needed sending" — the gap already closed for `--skip` and
+    `--no-respawn`."""
+    m = load()
+    d = tempfile.mkdtemp(prefix="oc-nonotify-")
+    path = os.path.join(d, "facts.json")
+    with open(path, "w") as fh:
+        json.dump({"facts": fx("dispatch-refused")["facts"]}, fh)
+    rc, out, err = run_cli(["--live", "--json", "--facts", path, "--repo", "o/r", "--no-notify",
+                            "--no-respawn", "--state", os.path.join(d, "s.json")])
+    doc = json.loads(out) if out.strip().startswith("{") else None
+    assert doc is not None, (rc, (out or err)[-400:])
+    assert doc["signal"].get("notify") == "suppressed by --no-notify", doc["signal"]
+
+
+@test
+def test_this_box_is_defined_ONCE():
+    """`cfg_from_args` stripped the box name and `Machine` did not, so `--box "local "` read as remote:
+    every probe went through `cmux cloud exec "local "` while the PR checks read THIS box's repo, and
+    the send/respawn refusals told the operator their own machine was REMOTE."""
+    m = load()
+    for name in ("local", "localhost", ".", " local ", "LOCAL", None):
+        assert m._is_local_box(name) is True, name
+    for name in ("other-box", "cell-2", "local2", "local-cell"):
+        assert m._is_local_box(name) is False, name
+    ap = m.build_parser()
+    a = ap.parse_args(["--live", "--box", " local ", "--repo", "o/r"])
+    assert m.cfg_from_args(a).repo == "o/r"
+    assert m.Machine(" local ").remote is False
 
 
 @test
@@ -6183,7 +6288,8 @@ def test_open_PRs_are_work_in_hand_even_with_NO_cycle_header():
     m = load()
     cfg = m.cfg_from_dict({"repo": "o/r"})
     facts = {"github": {"ok": True, "open_pr_count": 24, "open_prs": [],
-                        "prs_merged_in_window": 0, "prs_created_in_window": 0, "source": "rest"},
+                        "prs_merged_in_window": 0, "merged_page_full": False,
+                        "prs_created_in_window": 0, "source": "rest"},
              "log_events": {"headers": [], "dispatch_ok": [], "lane_started": [], "armed": [],
                             "railed": []}}
     for check, variant in ((m.check_pr_merged, "NO_PR_MERGED"),
@@ -6193,7 +6299,8 @@ def test_open_PRs_are_work_in_hand_even_with_NO_cycle_header():
     assert m.exit_code([m.check_pr_merged(facts, cfg)], ()) == 1
     # …and with no PRs open either, the same absent header establishes NOTHING (never "idle")
     blind = {"github": {"ok": True, "open_pr_count": 0, "open_prs": [],
-                        "prs_merged_in_window": 0, "prs_created_in_window": 0, "source": "rest"},
+                        "prs_merged_in_window": 0, "merged_page_full": False,
+                        "prs_created_in_window": 0, "source": "rest"},
              "log_events": {"headers": [], "dispatch_ok": [], "lane_started": []}}
     v2 = m.check_pr_merged(blind, cfg)
     assert (v2.status, v2.variant) == (m.INCONCLUSIVE, "ACTIVITY_UNKNOWN"), (v2.status, v2.variant)

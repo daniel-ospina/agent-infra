@@ -57,7 +57,8 @@
     }
    ],
    "prs_created_in_window": 3,
-   "prs_merged_in_window": 5
+   "prs_merged_in_window": 5,
+   "merged_page_full": false
   },
   "headroom": {
    "disk": {
