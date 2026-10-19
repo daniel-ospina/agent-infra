@@ -41,6 +41,9 @@ case " $* " in
           printf '%s\n' "$l"
         fi ;;
       *)  # set-but-empty MERGED_AT_STUB = "the API says this PR is not merged"
+        # MERGED_API_FAIL=1 = "the READ FAILED" (rate limit / DNS): exit non-zero, print nothing. The
+        # two are DIFFERENT facts and the loop must not collapse them.
+        if [ "${MERGED_API_FAIL:-0}" = 1 ]; then exit 1; fi
         [ -n "${MERGED_AT_STUB+x}" ] && printf '%s\n' "$MERGED_AT_STUB" ;;
     esac
     exit 0 ;;
@@ -236,6 +239,55 @@ OUT="$(PATH="$BIN:$PATH" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 MERGED_AT_STUB
       bash "$SCRIPT" 31 --watch --repo o/r --pr-tsv "$T/pr4.tsv" 2>&1)"; RC=$?
 ck "the SAME log line WITH a confirmed merged_at → MERGED exit 0 (the confirmation is what decides)" \
    $([ "$RC" = 0 ] && [ "$(verdict_of 31 | cut -d' ' -f1)" = MERGED ] && echo 0 || echo 1)
+
+# ── 11c-quater. the confirmation READ FAILED → WAITING_API, not BLOCKED (reviewer P2) ───────────
+# An unreadable API is not a fact about the PR: exit 11 (re-runnable), no PR comment, no fix round, and
+# the supervision chunk is REFUNDED (a chunk that established nothing must not spend budget).
+new_o "$T/junk-q.tsv"
+printf 'open||newhead1|clean\n' > "$T/pr-open.tsv"
+printf '%s deadbeef %s\n' 999996 "$OT/logs/lane-merge-31.log" > "$OT/state/lanemerge-31.chain"
+printf '[merge 31] MERGED via the rail (attempt 1)\n' > "$OT/logs/merge-31.log"
+printf '3\n' > "$OT/state/lanemerge-31.watch"
+printf '3\n' > "$OT/state/lanemerge-31.round"
+: > "$T/gh.log"   # this case's own log: an earlier case's BODY-BEGIN must not be counted as "a comment"
+OUT="$(PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 MERGED_API_FAIL=1 \
+      bash "$SCRIPT" 31 --watch --repo o/r --pr-tsv "$T/pr-open.tsv" 2>&1)"; RC=$?
+ck "a FAILED confirmation read is WAITING_API (exit 11), spends no chunk and no round, and posts no comment" \
+   $([ "$RC" = 11 ] && [ "$(verdict_of 31 | cut -d' ' -f1)" = WAITING_API ] \
+      && [ "$(cat "$OT/state/lanemerge-31.watch")" = 3 ] && [ "$(cat "$OT/state/lanemerge-31.round")" = 3 ] \
+      && ! grep -q BODY-BEGIN "$T/gh.log" 2>/dev/null && echo 0 || echo 1)
+
+# ── 11c-quinquies. the head-moved bound bounds THIS CHAIN, and the second pass is terminal ─────
+new_o "$T/junk-q2.tsv"
+printf 'open||newhead1|clean\n' > "$T/pr-open2.tsv"
+sleep 60 & CH_PID=$!
+printf '%s oldhead %s\n' "$CH_PID" "$OT/logs/lane-merge-40.log" > "$OT/state/lanemerge-40.chain"
+printf 'nothing here\n' > "$OT/logs/lane-merge-40.log"
+OUT="$(PATH="$BIN:$PATH" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
+      bash "$SCRIPT" 40 --watch --repo o/r --pr-tsv "$T/pr-open2.tsv" 2>&1)"; RC1=$?
+OUT2="$(PATH="$BIN:$PATH" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
+      bash "$SCRIPT" 40 --watch --repo o/r --pr-tsv "$T/pr-open2.tsv" 2>&1)"; RC2=$?
+kill "$CH_PID" 2>/dev/null || true
+ck "a head-moved chain: pass 1 re-runs (11), pass 2 is TERMINAL (14) and names the pid — not an endless re-arm" \
+   $([ "$RC1" = 11 ] && [ "$RC2" = 14 ] && [ "$(verdict_of 40 | cut -d' ' -f1)" = BLOCKED ] \
+      && grep -q 'still bound to head oldhead' "$OT/state/lanemerge-40.verdict" && echo 0 || echo 1)
+
+# ── 11c-sexies. a LIVE lock is adopted: the record gets the LIVE pid and KEEPS the recorded head ─
+new_o "$T/junk-q3.tsv"
+printf 'open||newhead1|clean\n' > "$T/pr-open3.tsv"
+sleep 60 & LIVEPID=$!
+printf '999999 oldhead %s\n' "$OT/logs/lane-merge-41.log" > "$OT/state/lanemerge-41.chain"
+printf '%s\n' "$LIVEPID" > "$OT/state/mergeclaim-41.lock"
+# ⛔ THE ADOPTION LIVES ON THE LAUNCH PATH (`launch_chain`), not in --watch — that is where a lane
+# decides whether to start a competitor. So drive the shipped entry point that reaches it, with a green
+# check fixture so it gets that far.
+OUT="$(PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" \
+      LANE_MERGE_WAIT=0 LANE_MERGE_POLL=0 \
+      bash "$SCRIPT" 41 --repo o/r --pr-tsv "$T/pr-open3.tsv" --checks-tsv "$T/checks-green.tsv" 2>&1)"; RC=$?
+kill "$LIVEPID" 2>/dev/null || true
+ck "a live merge lock is adopted: the record carries the LIVE pid and the RECORDED head (not the current one)" \
+   $([ "$RC" = 11 ] && [ "$(awk '{print $1}' "$OT/state/lanemerge-41.chain")" = "$LIVEPID" ] \
+      && [ "$(awk '{print $2}' "$OT/state/lanemerge-41.chain")" = oldhead ] && echo 0 || echo 1)
 
 # ── 11d. the handoff marker is HEAD-BOUND even from --watch ────────────────────────────────────
 new_o "$T/pr18.tsv"
