@@ -1312,13 +1312,21 @@ def _rest_refusal_text(e, deadline=None):
     path can never emit.
 
     ⛔ AND ONE EARLIER SENTENCE HERE WAS ITSELF FALSE, WHICH IS WHY IT IS SPELLED OUT (#2138 r10,
-    reviewer A/P3). It said "`urllib` raises before the body is readable". Measured against a real
-    403, `e.read()` returns GitHub's body perfectly well — only `str()` is the reason phrase.
-    Reading it is NOT free, though: the error path has no chunk loop, so a bounded read here is
-    one `read(ERR_BODY_BYTES)` under the socket's own timeout, and a large or slow error body is
-    the hazard the chunk loop exists to remove. So it IS read, but ONCE and CAPPED, and a failure
-    to read it is silent. The old wording turned a deliberate trade-off into an impossibility and
-    kept the best evidence on the floor.
+    and corrected AGAIN at r13 because the correction went stale). It said "`urllib` raises before
+    the body is readable". Measured against a real 403, `e.read()` returns GitHub's body perfectly
+    well — only `str()` is the reason phrase. Reading it is NOT free: an unbounded `read()` on the
+    error path is subject to the same per-recv timeout reset the 200 path documents, so
+    `_body_names_rate_limit` reads it in DEADLINE-CHECKED chunks — see that function for the bound
+    and for the one path it does not cover.
+
+    ⛔ AND THE r10 REPLACEMENT FOR THAT SENTENCE ALSO WENT STALE, WHICH IS THE POINT OF SAYING IT
+    (#2138 r13). It read "the error path has no chunk loop, so a bounded read here is one
+    `read(ERR_BODY_BYTES)` under the socket's own timeout … ONCE and CAPPED". All three clauses
+    are false of the code that replaced it: there IS a chunk loop, the read is
+    `_read(min(ERR_BODY_CHUNK, …))` with `ERR_BODY_CHUNK = 512` i.e. up to 8 calls, and it prefers
+    `read1()`, so the socket's own timeout is not what bounds it either. Left standing, this
+    paragraph was an invitation to "simplify" the loop back to a single `read()` — reinstating the
+    unbounded stall the loop exists to prevent.
 
     The KIND is therefore decided from evidence, strongest first:
       * a 429 is GitHub's rate-limit status;
@@ -1388,6 +1396,19 @@ def _body_names_rate_limit(e, deadline=None):
     4.63 s against a 0.5 s budget. The accurate phrasing for both is the one already used at
     `_queue_rest`: "a BODY costs at most one chunk past the budget". For a `Content-Length` body
     this path is TIGHTER than the 200 path, not equal to it.
+
+    ⛔ RESIDUAL — THE CHUNKED FRAMING PHASE IS INSIDE ONE `_read` AND OUTSIDE BOTH BOUNDS (#2138
+    r13, measured). For a CHUNKED body, `read1` reaches `_read_next_chunk_size()`, which is
+    `self.fp.readline(_MAXLINE + 1)` with `_MAXLINE = 65536`, and the last chunk is followed by
+    `_read_and_discard_trailer()`, which loops that readline with NO limit. Both run inside a
+    SINGLE `_read` call — the deadline is checked only BETWEEN calls, and framing bytes are never
+    appended to `raw`, so `ERR_BODY_BYTES` does not count them either. Measured: a 403 whose
+    chunk-extension trickled returned after 3.23 s against a 0.20 s deadline (1501 framing bytes
+    in that one call), and with `deadline=None` the trailer read alone took 3.82 s over 6001 bytes
+    — more than the cap. So "one chunk past the budget" is true of the BODY and not of the
+    FRAMING. GitHub's error bodies carry `Content-Length` (measured), which takes the non-chunked
+    path this paragraph does bound; closing the chunked case means not using urllib's chunk reader,
+    which is a change to how this function talks to the socket, not a budget tweak.
 
     ⛔ AND IT NEVER RAISES, WHICH MEANS THE WHOLE BODY IS INSIDE THE `try` (#2138 r11). With the
     comparison outside it, a non-bytes body raised `TypeError` out of `_rest_refusal_text` and out
