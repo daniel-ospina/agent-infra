@@ -303,7 +303,22 @@ DAEMON_PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 if [ -x "$HOME/.local/share/pi-node/current/bin/pi" ]; then
   command -v pi >/dev/null 2>&1 && add_dir "$HOME/.local/share/pi-node/current/bin"
 fi
-for bin in tmux gh uv pi jq; do
+# ── THE DAEMON MUST BE ABLE TO REACH cmux, OR THE PRE-FLIGHT CERTIFIES NOTHING ────────────
+# WHY cmux IS ON THIS LIST (measured 2026-10-18, the drained-backlog P0). The collision pre-flight's
+# `issue assignee/holder` surface reads lane liveness from the fleet board, and `fleet_state.py`
+# `live_sessions()` shells out to `cmux sessions list --json --all`. cmux ships INSIDE an app bundle
+# (`/Applications/cmux.app/Contents/Resources/bin/cmux`) — a directory on NO default PATH: an
+# interactive shell has it only because cmux's shim setup exports it from the LOGIN profile, which
+# launchd never reads. So the daemon could not execute cmux, `liveness_measured` was False, and the
+# board carried `orphans[kind=liveness-unmeasured]` — which the pre-flight refuses to read as a dead
+# owner (fail-closed, #8175), so EVERY candidate's verdict was INCOMPLETE and `refresh-candidates.sh`
+# aborted by design (#1736) on every cycle: `candidates.txt: 0` while 203 issues sat open. A probe
+# list without cmux reproduces that on every fresh install, which is why the fix belongs here and
+# not only in the consumer. `resolve_cmux()` in refresh-candidates.sh repairs an ALREADY-RUNNING
+# deployment (that script's own PATH) without waiting for a reinstall.
+# ⛔ APPEND ONLY — `add_dir` appends, and it must: that bundle directory also carries `open`,
+# `ghostty`, `grok` and `muse`, so PREPENDING it would shadow /usr/bin/open for every daemon child.
+for bin in tmux gh uv pi jq cmux; do
   # ⛔ Resolve the BINARY, not a shell function/alias. `command -v` reports an exported function
   # REGARDLESS of PATH (and a BARE name for it), so with a `gh`/`pi` function in the environment the
   # real binary's directory would never be found AND the name would be unusable. `type -P` searches
@@ -317,7 +332,7 @@ done
 # Resolve PAST a wrapper: add the first PATH entry holding a real executable of that name outside a
 # shim/.pi directory, so the shim can find it. Tested on the PHYSICAL path like add_dir(), so a
 # symlink TO a shim directory is recognised as a shim too.
-for bin in gh pi uv tmux jq; do
+for bin in gh pi uv tmux jq cmux; do
   p="$(type -P "$bin" 2>/dev/null)" || continue
   case "$p" in /*) ;; *) continue ;; esac
   _pd="$(cd "$(dirname "$p")" 2>/dev/null && pwd -P)" || continue
@@ -338,6 +353,16 @@ for bin in gh pi uv tmux jq; do
       IFS="$_oldifs" ;;
   esac
 done
+# ⛔ AND THE APP-BUNDLE DIRECTORY DIRECTLY. `type -P cmux` above answers only for THIS shell's PATH,
+# and the daemon's only chance to learn the directory is here. An install run from a NON-LOGIN shell
+# (an agent, a CI step, `bash install.sh` from launchd itself) has no cmux on PATH at all — cmux puts
+# itself on the LOGIN profile's PATH only — so a probe-only fix would reproduce the drained backlog
+# (#8175/#1736) on the very next box. Add the bundle path when it really holds an executable; the
+# `if` (not `&&`) keeps this block errexit-safe under `set -euo pipefail`.
+for _d in "${CMUX_BIN_DIR:-}" /Applications/cmux.app/Contents/Resources/bin \
+          "${HOME:-/nonexistent}/Applications/cmux.app/Contents/Resources/bin"; do
+  if [ -n "$_d" ] && [ -x "$_d/cmux" ]; then add_dir "$_d"; fi
+done
 ok "daemon PATH: $DAEMON_PATH"
 # ⛔ PROBE BY EXECUTION AND BY ABSOLUTE PATH. Resolving a name is not running it, and `command -v`
 # cannot answer the daemon's question: it reports an EXPORTED SHELL FUNCTION (which launchd never
@@ -347,7 +372,7 @@ ok "daemon PATH: $DAEMON_PATH"
 # the exclusion patterns (cmux's `cmux-cli-shims` is a real one) is caught here because its tool
 # exits 127. uv is optional (warned above): its failure WARNS, and is never fatal. Still BLIND to
 # trap (3) — TCC refuses the read only when LAUNCHD does it, not when an interactive shell does.
-for bin in tmux uv pi gh jq; do
+for bin in tmux uv pi gh jq cmux; do
   command -v "$bin" >/dev/null 2>&1 || continue     # not present in this shell at all
   # ⛔ `|| true`: install.sh runs under `set -euo pipefail`, and `type -P` returns non-zero for a
   # tool that is not on $DAEMON_PATH. Unguarded, that bare assignment aborts the script AT THIS
@@ -363,6 +388,15 @@ for bin in tmux uv pi gh jq; do
   if [ -n "$_p" ] && PATH="$DAEMON_PATH" "$_p" "$_vflag" >/dev/null 2>&1; then continue; fi
   if [ "$bin" = "uv" ]; then
     warn "daemon PATH cannot run uv — lane.sh will not sync worktrees: $DAEMON_PATH"
+  elif [ "$bin" = "cmux" ]; then
+    # ⛔ DIE, NOT WARN — the same disposition as tmux/gh/pi/jq, and for the same reason: reaching this
+    # branch means cmux IS installed and IS on the installing shell's PATH, yet the daemon cannot
+    # execute it. That is the shim/wrapper case this probe exists for, and the consequence is not a
+    # degraded fleet but a DEAD one — the pre-flight's holder surface reads the board's live-session
+    # store through `cmux sessions list`, so every candidate comes back INCOMPLETE and nothing is ever
+    # queued (#8175/#1736). A box with NO cmux never reaches here (`command -v` above skips it), and a
+    # box that has it needs it: certifying this install would be the false green one layer down.
+    die "daemon PATH cannot run cmux (it is installed, so the daemon needs it) — the collision pre-flight's holder surface would read every candidate as INCOMPLETE and NOTHING would be queued (#8175/#1736): $DAEMON_PATH"
   else
     die "daemon PATH cannot run $bin: $DAEMON_PATH"
   fi
