@@ -275,14 +275,44 @@ except Exception:
     print("")
 PYAGE
 }
-# R8-- the DO: tokens now NAME their PRs, so the old 150-char cut severed exactly the part
-# that makes them actionable (it is how `fix-ci=` was already being truncated). Raised to
-# cover the whole DO segment; the RES: line is separate and needs no cut.
-obj=$(sed -n '2p' "$STATE/objective.last" 2>/dev/null | cut -c1-400)
+# The per-class tokens NAME their PRs, so the old 150-char cut severed exactly the part that makes
+# them readable. #1872 lengthened the segment twice: the label is now
+# `QUEUE(state): ` (relabelled 2026-10-18: the old `; pr-doctor dispatches` parenthetical
+# claimed the token was a dispatch record, and it is the queue's SHAPE -- so the counts cannot
+# be mistaken for an instruction the
+# automatic dispatcher already owns) and `running` is named like every other class.
+#
+# ⛔ THIS IS A TRUNCATION POINT, NOT A WORST CASE, AND NO NUMBER BELONGS HERE. The width was raised
+# three times on this branch alone -- 400 -> 700 -> 820 -> 900, each value REPRODUCIBLE rather than
+# remembered (`git log -G'cut -c1-[0-9]+' --oneline -- scripts/cadence-nudge.sh` lists exactly the
+# commits that changed it) -- and every one was falsified by the next measurement, because the length
+# is a function of DIGITS x NAMED PRs x per-entry gate names x the overlay x the STUCK escalation: any
+# figure is a claim about the FLEET, not about the format, and it goes stale the first time the queue
+# grows. (An earlier version of this comment listed intermediate widths measured in a WORKING TREE
+# and never committed, so no reader could reproduce them; that is why the series above is cited with
+# the command that finds it rather than as bare figures.)
+# What is true, and does not go stale:
+#   * what a cut CAN sever: the tail of the queue segment and then the CI indicators;
+#   * what a cut CANNOT sever, because of where it is emitted (`objective.py`, pinned by
+#     `test_the_FAIL_CLOSED_caveat_precedes_the_counts_it_qualifies`): `queue_read=BLIND(...)` --
+#     the token that says the counts are NOT a clearance -- and `ASK-USER: surface=N: #...`, the
+#     owner's actionable list. Both precede the queue segment; neither may move back to the tail.
+# 900 is a CUT, not a guarantee, and this comment will not name the depth at which it starts to
+# bite -- the paragraph above says exactly why any such figure goes stale. What is true: the tail of
+# the queue segment (its last class's named PRs) and then the CI indicators ARE lost once the line
+# outgrows the cut, which is a known residual, not a promise.
+obj=$(sed -n '2p' "$STATE/objective.last" 2>/dev/null | cut -c1-900)
 
 # ── RES: the system-resource segment, on its OWN line (objective.last line 3) ──────────
-# Its own line because the objective line is ALREADY past the 150 chars it is read with, so
-# appending this would cut it off mid-token -- which is what truncates `fix-ci=` today.
+# Its own line for TWO reasons, and NEITHER of them is a length claim about the objective line
+# (#1872 review round 17: an earlier version of this comment said that line was "ALREADY past the
+# length it is read with", which a 4-PR fixture refutes -- it measures ~300 chars against a 900
+# cut). (1) Appending it would put the CURRENT resource numbers BEHIND everything the objective
+# segment can grow into, and the tail is what a cut reaches first -- so #1872 moved it OUT of that
+# line rather than arguing about widths. (2) Its own line can be refreshed EVERY BEAT without
+# re-deciding the verdict (see the cache paragraph below, which is the reason that actually bit).
+# (`fix-ci` is not rendered in the objective segment at all -- it appears as
+# `IN-PROGRESS: fixing <check>=<n>` -- so nothing here depends on it.)
 # It is NOT truncated: the line is short and every field is load-bearing.
 # ⛔ FRESH EVERY BEAT, NEVER FROM THE CACHE. Reading line 3 of `objective.last` inherited that
 # file's 900 s TTL: two beats 7m33s apart printed BYTE-IDENTICAL values, including `runq=79`
@@ -388,8 +418,10 @@ _cont="${wip:-}"
 # ⛔ BUT NET-GROWTH ALONE IS NOT THE FREEZE — IT IS THE SYMPTOM, AND IT INVERTS ONCE THE QUEUE IS DRAINED
 # (owner correction 2026-10-09, via #6792). The owner's predicate for INTAKE-FROZEN is `waiting >=
 # TARGET_PRS(10)`; the freeze is DERIVED, never decided, and a SATISFIED PRECONDITION IS NOT A LIVE
-# ⛔ THE DERIVED TRIGGER, AND THE ONLY ONE: `waiting >= TARGET_PRS` (objective.py:66 — "queue depth at
-# target: fewer than 10 non-draft PRs waiting to land"). Both the constant and `waiting` are read from
+# ⛔ THE DERIVED TRIGGER, AND THE ONLY ONE: `waiting >= TARGET_PRS` (the constant NAMED, not numbered —
+# it is `objective.py`'s `TARGET_PRS = 10  # queue depth at target: fewer than 10 non-draft PRs waiting
+# to land`; a line number here pointed at the wrong line within a day of being written). Both the
+# constant and `waiting` are read from
 # their owner, objective.py, so there is no second source of truth and no state file.
 #
 # THREE PROXIES REMOVED HERE, each caught asserting a freeze its own numbers denied:

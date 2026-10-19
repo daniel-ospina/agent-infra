@@ -38,6 +38,12 @@ import time
 import sys
 import urllib.error
 import urllib.request
+# ⛔ THE LAYER MUST NOT SLEEP INSIDE THIS PROCESS (#1988). This script is run by the heartbeat under
+# `run_bounded`, so it has a subprocess bound of its own (420 s) while the layer's first documented
+# backoff is 60 s: an in-call wait would outlive the caller and the box would report an unreadable
+# surface instead of the RATE-LIMITED verdict it can prove. NO_WAIT makes the layer record the limit
+# and return at once, so this process's own deferral takes over. Applies to CHILDREN only.
+os.environ.setdefault("GH_LIMIT_NO_WAIT", "1")
 
 JEV_URL = "https://jevtypesafeai.com/api/v1/decide"
 JEV_MODEL = "jev-1.13.0"          # pin: thresholds must not shift under us
@@ -472,7 +478,19 @@ def _find_gh():
     the first live heartbeat tick therefore logged "NOTE ask-owner scan produced
     nothing usable": the gate was dead while the tick still read as a green.
     Resolving the binary here means no caller has to know where it lives.
+
+    ⛔ AND PREFER THE HARNESS'S OWN gh LAYER (#1988) WHEN ONE IS DEPLOYED. This is the heaviest
+    READER on the shared GitHub account — up to 1000 open issues WITH ALL COMMENTS per repo, on every
+    heartbeat — so going straight at the real binary is what left it unserialised and un-backed-off
+    (one box's burst is another box's secondary limit; four boxes share the account). The layer's
+    path comes from `$O` — NEVER from PATH — so it does not depend on the caller's PATH at all, and
+    the pinned fallbacks below stay for the no-`$O` context.
     """
+    o = os.environ.get("O", "")
+    if o:
+        for c in (os.path.join(o, "gh-rest", "gh"), os.path.join(o, "gh-limit", "gh")):
+            if os.path.isfile(c) and os.access(c, os.X_OK):
+                return c
     found = shutil.which("gh")
     if found:
         return found
@@ -483,7 +501,28 @@ def _find_gh():
     return "gh"          # last resort: the caller sees FileNotFoundError and says so
 
 
+def _pinned_gh():
+    """The binary the layer should CALL, when that tool has one pinned (#1872).
+
+    ⛔ THE LAYER RESOLVES THE REAL gh BY WALKING PATH. Handing it nothing means this reader's
+    requests can land on a PATH entry that refuses at runtime (the 2026 incident: a shim answering
+    rc 126 while `os.access` still passed) — the exact regression the pin exists for. Only used when
+    we are going THROUGH the layer, so a direct call is unchanged."""
+    # ⛔ NOT `~/.pi/agent/shims/gh`. That is the path `objective.py` names as the #1872 incident:
+    # a symlink into ~/Documents that macOS TCC REFUSES under launchd (rc=126), which printed a
+    # plausible "nothing usable" for two straight beats while doing nothing. Pinning it here would
+    # hand the layer a binary that cannot run — the gate dead on every beat — so the list starts
+    # with `~/bin/gh`, exactly as the four telemetry tools' `_GH_CANDIDATES` do.
+    for cand in (os.path.expanduser("~/bin/gh"), "/opt/homebrew/bin/gh",
+                 "/usr/local/bin/gh", "/usr/bin/gh"):
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+    return None
+
+
 GH = _find_gh()
+_PIN = _pinned_gh() if GH.endswith(("/gh-rest/gh", "/gh-limit/gh")) else None
+GH_LAYER_ENV = {"GH_REST_REAL_GH": _PIN, "GH_LIMIT_REAL_GH": _PIN} if _PIN else {}
 
 
 # ⛔ A SUBPROCESS WITH NO TIMEOUT IS AN UNBOUNDED STEP (2026-10-12).
@@ -511,7 +550,8 @@ def sh(args, timeout=GH_TIMEOUT_S):
     if args and args[0] == "gh":
         args = [GH] + list(args[1:])
     try:
-        return subprocess.run(args, capture_output=True, text=True, timeout=timeout).stdout
+        return subprocess.run(args, capture_output=True, text=True, timeout=timeout,
+                              env={**os.environ, **GH_LAYER_ENV} if GH_LAYER_ENV else None).stdout
     except subprocess.TimeoutExpired:
         return ""
 
@@ -530,7 +570,8 @@ def sh_status(args, timeout=GH_TIMEOUT_S):
     if args and args[0] == "gh":
         args = [GH] + list(args[1:])
     try:
-        p = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        p = subprocess.run(args, capture_output=True, text=True, timeout=timeout,
+                           env={**os.environ, **GH_LAYER_ENV} if GH_LAYER_ENV else None)
     except subprocess.TimeoutExpired:
         return 124, "", f"TIMEOUT after {timeout}s: {' '.join(args[:6])}"
     return p.returncode, p.stdout, p.stderr
