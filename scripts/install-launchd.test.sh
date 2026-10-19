@@ -39,6 +39,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALLER="$SCRIPT_DIR/install-launchd.sh"
 REPO_TEMPLATES="$SCRIPT_DIR/../templates/launchd"
 
+# ⛔ HERMETICITY (review of PR #1949): NEVER inherit the caller's `TORTOISE_REPO`. On a swarm/cell host
+# that variable is exported, so the installer RESOLVES it and the two `{{TORTOISE_REPO}}`-gated
+# templates (`com.tortoise.branch-reaper`, `com.tortoise.worktree-reaper`) install instead of SKIPping
+# — which either inflates the fresh-install count below (10 → 8 measured) or, when that checkout has no
+# `.venv/bin/python`, makes the broken-target guard FAIL and abort section 1. Both are LOCAL FALSE REDS
+# on a green tree: the same suite is green in CI precisely because ubuntu runners export nothing.
+# Sections 13/14 set `TORTOISE_REPO` EXPLICITLY for their own fixture (a fake tortoise under $T), so
+# unsetting it here costs no coverage.
+unset TORTOISE_REPO
+
 PASS=0
 FAIL=0
 ok()  { PASS=$((PASS + 1)); echo "  ✅ $1"; }
@@ -379,6 +389,12 @@ assert_not_contains "$OUT" "skill-lint-oracle: installed + loaded" "retired orac
 [ ! -f "$ORACLE_RETIRED" ] && ok "no retired oracle plist left behind" || bad "no retired oracle plist left behind"
 BOOTSTRAP_COUNT1="$(grep -c 'launchctl bootstrap' "$LOG")"
 assert_eq "$BOOTSTRAP_COUNT1" "9" "fresh install bootstraps only active jobs (canary + tripwire + fleet + pi-session-reaper + balance-watch + pi-task-session-prune + pi-cache-reap + lane-liveness + ci-runner-gate)"
+# The count above is only meaningful if the {{TORTOISE_REPO}}-gated templates SKIPped for the RIGHT
+# reason. Naming the two jobs (not just the number) makes an ambient `TORTOISE_REPO` fail with the
+# cause instead of as an off-by-two, and it is the assertion that reddens on a swarm host if the
+# `unset TORTOISE_REPO` at the top of this file is ever removed (review of PR #1949).
+assert_not_contains "$OUT" "branch-reaper: installed" "the {{TORTOISE_REPO}}-gated branch-reaper is SKIPPED (ambient TORTOISE_REPO must not leak in)"
+assert_not_contains "$OUT" "worktree-reaper: installed" "the {{TORTOISE_REPO}}-gated worktree-reaper is SKIPPED (ambient TORTOISE_REPO must not leak in)"
 
 echo "── 2. Retirement: pre-seeded old plists get unloaded + removed ───"
 seed_retired "$HOME2"

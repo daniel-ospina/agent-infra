@@ -144,6 +144,22 @@ echo "no server running on /tmp/tmux-0/default" >&2; exit 1
 SHIM
 chmod +x "$T/bin/ps" "$T/bin/lsof" "$T/bin/tmux"
 
+# `df` / `du` shims — the CAPACITY line's two measured inputs, made deterministic. A real filesystem's
+# free-space reading is a property of the HOST, so a suite asserting a headroom number against it would
+# be asserting the box, not the code; and a real `du` makes the per-lane figure differ per run. The
+# reaper's own argv is honoured (df -Pk <path> → NR==2 $4; du -sk <path> → NR==1 $1).
+cat > "$T/bin/df" <<'SHIM'
+#!/usr/bin/env bash
+[ -n "${FAKE_DF_FAIL:-}" ] && { echo "df: cannot read" >&2; exit 1; }
+printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\nfakefs 100000000 0 %s 0%% /\n' "${FAKE_DF_FREE_KB:-10485760}"
+SHIM
+cat > "$T/bin/du" <<'SHIM'
+#!/usr/bin/env bash
+for a in "$@"; do last="$a"; done
+printf '%s\t%s\n' "${FAKE_DU_KB:-2097152}" "$last"
+SHIM
+chmod +x "$T/bin/df" "$T/bin/du"
+
 # run_shimmed <args…> — the reaper with the three shims and a throwaway log; prints stdout+stderr.
 # Extra `VAR=value` words before the flags become the environment of the ONE invocation (the shims).
 run_shimmed() {
@@ -443,6 +459,20 @@ if grep -qF 'name: "REAP_VENV_MIN_AGE_SECONDS"' "$REGISTRY"; then
 else
   bad "REAP_VENV_MIN_AGE_SECONDS is not in extensions/shared/heartbeat-progress-edges.ts"
 fi
+# Same rule for the free-disk FLOOR (review of PR #1949): it is a bound on how much of the box the
+# fleet may consume, and a bound only the reaper knows about is exactly what the audit exists to see.
+if grep -qF 'name: "REAP_VENV_FREE_FLOOR_MB"' "$REGISTRY"; then
+  ok "the stated free-disk floor is registered in the declared-surface registry (#1068)"
+else
+  bad "REAP_VENV_FREE_FLOOR_MB is not in extensions/shared/heartbeat-progress-edges.ts"
+fi
+# The lane-exit helper must not mis-describe a FLOOR breach as "the env may still be present": the
+# reaper reaped, and the box is short of space — different facts, and the wrong one buries the breach.
+if grep -qF 'REAP_VENV_FREE_FLOOR_MB (rc=5' "$GATE"; then
+  ok "spawn-gate.sh reports a floor breach (rc=5) as over-bound, not as a failed reap"
+else
+  bad "spawn-gate.sh would report rc=5 as '.venv may still be present' — a misleading message"
+fi
 
 echo "── G. the uv download cache is untouchable ──────────────────────────────────────────"
 assert_not_contains "$(cat "$REAPER")" ".cache/uv" "the reaper names no uv cache path"
@@ -450,6 +480,66 @@ assert_not_contains "$(cat "$REAPER")" "uv cache clean" "the reaper never cleans
 assert_eq "$(grep -cF '"$RM_BIN" -rf -- .venv' "$REAPER")" "1" "there is exactly ONE rm -rf, on the .venv basename"
 assert_eq "$(grep -cF 'rm -rf -- ' "$REAPER")" "1" "and no second rm -rf exists anywhere in the reaper"
 
+echo "── H. capacity: N measured, floor asserted, both printed (#1932 acceptance) ───────────"
+# The review of PR #1949 added the acceptance clause: "after a lane exits, its .venv is gone
+# automatically ... and a box can run N lanes without free disk falling below a stated floor — N
+# measured, floor asserted, both printed by the reaper". Section A proves the first half; this section
+# proves the second. Both inputs are PINNED (fake df/du) so the arithmetic is asserted rather than the
+# host: free = 10 GiB, floor = 2048 MB, one lane env = 2048 MB ⇒ 4 more lanes fit.
+RH="$(newrepo h)"
+W_H_LIVE1="$(mkwt "$RH" live1)"
+W_H_LIVE2="$(mkwt "$RH" live2)"
+W_H_DEAD="$(mkwt "$RH" dead)"
+printf '9501\t%s\n9502\t%s\n' "$(canon "$W_H_LIVE1")" "$(canon "$W_H_LIVE2")" > "$T/tmux-h.tsv"
+
+# run_cap <env…> — the reaper with the pinned df/du AND the liveness shims, so nothing reads the host.
+run_cap() {
+    local envs=()
+    while [ $# -gt 0 ]; do
+        case "$1" in *=*) envs+=("$1"); shift ;; *) break ;; esac
+    done
+    PS_BIN="$T/bin/ps" LSOF_BIN="$T/bin/lsof" TMUX_BIN="$T/bin/tmux" \
+    DF_BIN="$T/bin/df" DU_BIN="$T/bin/du" REAP_VENV_LOG="$T/reap-cap.log" \
+    env "${envs[@]}" bash "$REAPER" "$@" 2>&1
+}
+
+echo " H1 lanes_live is MEASURED from the live witnesses (2 live, 1 dead)"
+out="$(run_cap FAKE_TMUX_TABLE="$T/tmux-h.tsv" --gc --repo "$RH")"; rc=$?
+assert_contains "$out" "capacity: lanes_live=2 " "the live-lane count is measured, not assumed"
+assert_contains "$out" "lane_venv_max=2048MB" "the per-lane figure is the LARGEST env the pass saw"
+assert_contains "$out" "free_after=10240MB" "the free-space reading is printed"
+assert_contains "$out" "floor=2048MB floor_ok=yes" "the STATED floor and its verdict are printed"
+assert_contains "$out" "lanes_headroom=4" "4 more lane envs fit above the floor ((10240-2048)/2048)"
+assert_eq "$rc" "0" "a pass above the floor exits 0"
+
+echo " H2 BELOW the floor the pass is loud (floor_ok=no) and exits 5 — a dry run still reports it"
+out="$(run_cap FAKE_TMUX_TABLE="$T/tmux-h.tsv" FAKE_DF_FREE_KB=524288 --gc --repo "$RH")"; rc=$?
+assert_contains "$out" "free_after=512MB floor=2048MB floor_ok=no" "512MB is below the stated floor"
+assert_contains "$out" "lanes_headroom=0" "no lane headroom is reported when the floor is already breached"
+assert_contains "$out" "BELOW the stated floor" "the breach is named, not buried in a green summary"
+assert_eq "$rc" "5" "the exit code is 5 (over-bound at the disk-reaper entry point)"
+
+echo " H3 the floor is STATED, so it can be restated — and the headroom follows it"
+out="$(run_cap FAKE_TMUX_TABLE="$T/tmux-h.tsv" FAKE_DF_FREE_KB=524288 REAP_VENV_FREE_FLOOR_MB=0 --gc --repo "$RH")"; rc=$?
+assert_contains "$out" "floor=0MB floor_ok=yes" "floor 0 says 'no floor stated', not 'unknown'"
+assert_contains "$out" "lanes_headroom=0" "512MB still fits no 2GB lane env"
+assert_eq "$rc" "0" "a satisfied floor exits 0"
+
+echo " H4 a df that cannot answer is UNKNOWN, never 'enough' (and never a fabricated headroom)"
+out="$(run_cap FAKE_TMUX_TABLE="$T/tmux-h.tsv" FAKE_DF_FAIL=1 --gc --repo "$RH")"; rc=$?
+assert_contains "$out" "floor_ok=unknown" "an unreadable free-space probe is not claimed as satisfied"
+assert_contains "$out" "free space is UNKNOWN" "the line says why it cannot assert"
+assert_contains "$out" "lanes_headroom=?" "no headroom number is invented from a missing input"
+assert_eq "$rc" "0" "an unmeasurable floor does not fail the pass (nothing was mis-deleted)"
+
+echo " H5 a reaped pass still asserts the floor AND the removal is not undone by it"
+out="$(run_cap FAKE_TMUX_TABLE="$T/tmux-h.tsv" --gc --repo "$RH" --apply)"; rc=$?
+assert_contains "$out" "reaped=1" "the dead lane's env was reaped"
+assert_contains "$out" "capacity: lanes_live=2 " "the capacity line is printed on an ARMED pass too"
+assert_eq "$rc" "0" "and the pass still exits 0"
+absent "$W_H_DEAD/.venv" "the dead env is gone"
+exists "$W_H_LIVE1/.venv" "the live envs are untouched"
+exists "$W_H_LIVE2/.venv" "the live envs are untouched"
 echo
 echo "──────────────────────────────────────────────────────────────────────────────────────"
 if [ "$FAIL" -eq 0 ]; then

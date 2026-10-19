@@ -59,6 +59,29 @@
 #   * `df` delta across the pass: what the FILESYSTEM actually got back. This is the reclamation.
 # Both are printed. Nothing here claims the `du` figure was freed.
 #
+# CAPACITY, AND A STATED FLOOR (the acceptance test on #1932, from the review of PR #1949): "a box can
+# run N lanes without free disk falling below a stated floor — N measured, floor asserted, both printed
+# by the reaper". So every pass prints ONE capacity line:
+#   * `lanes_live=K`   MEASURED: how many lane worktrees this pass found a LIVE holder for. Every lane
+#                      on this box is one `uv sync` away from ~1.85 GB of real, non-shared disk
+#                      (measured: two lanes consumed 3.7 GB), so K is the term that says how many
+#                      venvs are about to arrive.
+#   * `lane_venv_max=M` MEASURED: the LARGEST lane env this pass saw. The headroom below uses the
+#                      worst case, never the mean — a byte budget built on the average env is the same
+#                      error as a `du` figure built on the assumption that hardlinked blocks are free.
+#   * `free_after=F`   MEASURED: filesystem free space after the pass.
+#   * `floor=L`        STATED: `REAP_VENV_FREE_FLOOR_MB` (default 2048 = one measured lane env, so the
+#                      box can always start another lane).
+#   * `floor_ok=`      ASSERTED: `yes` | `no` | `unknown`. `unknown` is NOT a pass — a `df` that cannot
+#                      answer must never read as "enough", so the line says so and names why.
+#   * `lanes_headroom=N` DERIVED: how many MORE lane envs fit before free space reaches the floor,
+#                      i.e. `(free_after - floor) / lane_venv_max`, floored at 0. `?` when either input
+#                      is unknown — never a fabricated number.
+# A pass that ends BELOW the floor exits 5 (the code `disk-reaper.sh` already reads as `over-bound`,
+# so the fleet-wide entry point reports it without a second vocabulary). Reclaiming is not the remedy
+# for a breach and the reaper does not pretend otherwise: it will not delete a live lane's env to get
+# back above the floor, so the line NAMES the breach rather than hiding it behind a green summary.
+#
 # ⛔ THE `uv` DOWNLOAD CACHE IS NEVER TOUCHED. A venv hardlinks into it; removing the cache does not
 # free the space it appears to (the links keep the blocks alive), and it forces every subsequent
 # `uv sync` to write a full copy instead of a shared one. That is the measured regression that created
@@ -85,13 +108,16 @@
 #   --min-age S     GC age floor in seconds (default 1800)
 #
 # Env seams (tests use them; operators rarely should):
+#   REAP_VENV_FREE_FLOOR_MB  stated free-disk floor for the capacity line (default 2048)
 #   PS_BIN LSOF_BIN TMUX_BIN GIT_BIN RM_BIN DU_BIN DF_BIN
-#   REAP_VENV_DRY_RUN REAP_VENV_MIN_AGE_SECONDS REAP_VENV_NOW_EPOCH REAP_VENV_LOG
+#   REAP_VENV_DRY_RUN REAP_VENV_MIN_AGE_SECONDS REAP_VENV_FREE_FLOOR_MB REAP_VENV_NOW_EPOCH
+#   REAP_VENV_LOG
 #   REAP_VENV_PS_TIMEOUT REAP_VENV_CWD_TIMEOUT REAP_VENV_TMUX_TIMEOUT REAP_VENV_GIT_TIMEOUT
 #   REAP_VENV_REMOVE_TIMEOUT REAP_VENV_ALLOW_DEGRADED_CWD REAP_VENV_PROC_ROOT
 #
 # Exit codes: 0 pass completed (removals or none), 2 usage, 3 fail-closed abort (nothing removed),
-#             4 pass completed but at least one removal FAILED.
+#             4 pass completed but at least one removal FAILED,
+#             5 pass completed but free space is BELOW REAP_VENV_FREE_FLOOR_MB (`over-bound`).
 
 set -uo pipefail
 
@@ -109,6 +135,9 @@ DF_BIN="${DF_BIN:-df}"
 
 REAP_VENV_DRY_RUN="${REAP_VENV_DRY_RUN:-1}"
 REAP_VENV_MIN_AGE_SECONDS="${REAP_VENV_MIN_AGE_SECONDS:-1800}"
+# The stated free-disk floor (MB) the capacity line asserts against. 2048 = one MEASURED lane env
+# (~1.85 GB of real, non-shared disk per lane), so "above the floor" means "one more lane still fits".
+REAP_VENV_FREE_FLOOR_MB="${REAP_VENV_FREE_FLOOR_MB:-2048}"
 REAP_VENV_PS_TIMEOUT="${REAP_VENV_PS_TIMEOUT:-25}"
 REAP_VENV_CWD_TIMEOUT="${REAP_VENV_CWD_TIMEOUT:-20}"
 REAP_VENV_TMUX_TIMEOUT="${REAP_VENV_TMUX_TIMEOUT:-15}"
@@ -147,6 +176,12 @@ RECHECK_KEPT=0
 FAILED=0
 DU_KB=0
 DF_BEFORE=""
+# Capacity inputs, all of them MEASURED (see CAPACITY in the header): the live-lane count, the largest
+# lane env seen, and the verdict of the stated free-disk floor. `?`/empty means "could not read", never
+# "zero" or "fine".
+LANES_LIVE=0
+LANE_VENV_KB_MAX=0
+CAPACITY_FLOOR_OK="unknown"
 ABORTED=0
 SELF_CWD_CANON=""
 MAIN_CANON=""
@@ -169,6 +204,10 @@ A venv is removed ONLY when no live holder can be found: no tmux pane inside the
 whose cwd is inside it, no process whose command line names it. The reaper's own ancestry is excluded.
 Fail-closed: an unreadable ps/tmux/cwd probe removes NOTHING (exit 3). The uv download cache is never
 touched — a venv hardlinks into it, and deleting it re-spends the space (see the header).
+
+Every pass prints a capacity line — lanes_live (measured), lane_venv_max (measured), free_after, the
+STATED floor REAP_VENV_FREE_FLOOR_MB (default 2048), the floor_ok verdict (yes|no|unknown) and
+lanes_headroom (how many more lane envs fit above the floor). Below the floor is exit 5 (over-bound).
 EOF
 }
 
@@ -711,6 +750,10 @@ report_row() {
     [ -n "$evidence" ] && printf '       evidence: %s\n' "$evidence"
     log "$(printf '%s\t%s\t%s\t%s\t%s' "$verdict" "$reason" "$evidence" "${kb:-}" "$path")"
     FOUND=$((FOUND + 1))
+    case "$reason" in live-*) LANES_LIVE=$((LANES_LIVE + 1)) ;; esac
+    # The per-lane figure the headroom below divides by: the LARGEST env this pass saw, so the answer
+    # is "how many lanes fit if they are all this expensive" rather than an average that under-budgets.
+    is_pos_int "${kb:-}" && [ "$kb" -gt "$LANE_VENV_KB_MAX" ] && LANE_VENV_KB_MAX="$kb"
     if [ "$verdict" = reap ]; then
         REAPABLE=$((REAPABLE + 1))
         is_pos_int "$kb" && DU_KB=$((DU_KB + kb))
@@ -789,6 +832,40 @@ run_exit() {
     return 0
 }
 
+# ── capacity: how many more lanes this box can take (the stated floor, asserted) ───────────
+# Called with the post-pass free reading so the capacity line and the reclamation line cannot disagree
+# about the same filesystem. Sets CAPACITY_FLOOR_OK for the exit code; prints every input it used, so a
+# reader can re-do the division rather than trust it (#1932 acceptance: "N measured, floor asserted,
+# both printed").
+report_capacity() { # report_capacity <free_kb_after>
+    local free_kb="${1:-}" floor="$REAP_VENV_FREE_FLOOR_MB" free_mb="" per_lane_mb="" headroom="?"
+    local floor_ok="unknown" why=""
+    if ! is_pos_int "$floor"; then
+        why="REAP_VENV_FREE_FLOOR_MB='$REAP_VENV_FREE_FLOOR_MB' is not a positive integer — asserting the default 2048MB instead"
+        floor=2048
+    fi
+    if is_pos_int "${free_kb:-}"; then
+        free_mb=$((free_kb / 1024))
+        if [ "$free_mb" -lt "$floor" ]; then floor_ok="no"; else floor_ok="yes"; fi
+    else
+        why="${why:+$why; }df cannot read free space on ${REPO:-${WORKTREE:-$PWD}} — free space is UNKNOWN, so the floor is NOT claimed satisfied"
+    fi
+    if [ "${LANE_VENV_KB_MAX:-0}" -gt 0 ]; then
+        per_lane_mb=$((LANE_VENV_KB_MAX / 1024))
+        [ "$per_lane_mb" -ge 1 ] || per_lane_mb=1
+        if is_pos_int "${free_mb:-}"; then
+            headroom=0
+            [ "$free_mb" -gt "$floor" ] && headroom=$(( (free_mb - floor) / per_lane_mb ))
+        fi
+    fi
+    say "[$SCRIPT_NAME] capacity: lanes_live=$LANES_LIVE lane_venv_max=${per_lane_mb:-?}MB free_after=${free_mb:-?}MB floor=${floor}MB floor_ok=$floor_ok lanes_headroom=$headroom"
+    [ -n "$why" ] && say "[$SCRIPT_NAME] capacity: $why"
+    log "$(printf 'capacity\tlanes_live=%s\tper_lane_mb=%s\tfree_after_mb=%s\tfloor_mb=%s\tfloor_ok=%s\tlanes_headroom=%s' \
+        "$LANES_LIVE" "${per_lane_mb:-}" "${free_mb:-}" "$floor" "$floor_ok" "$headroom")"
+    CAPACITY_FLOOR_OK="$floor_ok"
+    return 0
+}
+
 main() {
     local mode_label df_after freed_kb reclaimed_mb
     parse_args "$@"
@@ -827,9 +904,18 @@ main() {
     # The two numbers answer different questions — see the header. `du` is what the venvs occupy
     # (over-counting blocks shared with the uv cache); `df` is what the filesystem actually got back.
     say "[$SCRIPT_NAME] reclaimed_du=$((DU_KB / 1024))MB reclaimed_df=${reclaimed_mb}MB (du over-counts hardlinked uv-cache blocks; df is the real figure)"
+    report_capacity "${df_after:-}"
     [ "$APPLY" = 1 ] || say "[$SCRIPT_NAME] DRY-RUN — nothing was removed (pass --apply or REAP_VENV_DRY_RUN=0)"
 
+    # Severity order matches disk-reaper.sh's own (3 abort > 4 removal failed > 5 over-bound), so the
+    # fleet entry point's worst-code rule keeps the most severe verdict instead of this pass inventing
+    # a second ordering.
     [ "$FAILED" -gt 0 ] && exit 4
+    if [ "$CAPACITY_FLOOR_OK" = "no" ]; then
+        say "[$SCRIPT_NAME] ⛔ free space is BELOW the stated floor: a lane starting now can fill the disk. Refusing nothing — a live lane's env is never deleted to make room (exit 5)"
+        log "over-bound\tfree_below_floor_mb=$REAP_VENV_FREE_FLOOR_MB"
+        exit 5
+    fi
     exit 0
 }
 
