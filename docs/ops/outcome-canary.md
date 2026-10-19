@@ -490,6 +490,18 @@ Six more (cycle 13), each a case where a datum the tool held was not the one it 
 - **`--only` narrows the REPORT as well as the exit code.** Every static block printed "→ exit 0"
   while the process exited 2, and the only correction was a footnote — the summary line an operator
   quotes was the one that was wrong.
+- **A repair that covers one key is not a repair.** The notification state validates the shapes it
+  consumes one level deeper than "is this a dict?" — `notified` was checked and `ambiguous`, read and
+  written on every notify path, was not: `{"ambiguous": 3}` raised `TypeError` after the verdicts and
+  before the report (exit 1, no output), and `{"ambiguous": ["x"]}` survived that only to raise
+  `pop expected at most 1 argument` on the DELIVERED path, before `mark`/`save` — so a message that
+  landed was never marked and the next poll sent it again.
+- **`_age_txt` is the one place an age is printed, so the bool rule lives there.** The verdict
+  refused a boolean age while the evidence in the same block — the bytes that reach the controller's
+  inbox — formatted it as "1s ago".
+- **`--only`'s report names the checks it EXCLUDED**, not the ones it graded (`not_evaluated` is the
+  complement), and a refusal must print the error it read: `_controller_fingerprint` now carries the
+  `ps` failure text `attempt_respawn` prints, instead of "(no error recorded)".
 - **`_is_count` is the ONLY count guard.** `isinstance(True, int)` is true, and the same field was
   healed in one arm and re-broken in the next three times in one week: `backlog: true` FAILed in
   `work_dispatched`, then PASSed in its GREEN arm (`False == 0`), then certified a frozen pool as

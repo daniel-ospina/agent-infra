@@ -762,7 +762,10 @@ def _near_txt(ctrl):
 
 
 def _age_txt(age):
-    if age is None:
+    # ⛔ THE ONE PLACE EVERY AGE IS PRINTED, SO THE RULE LIVES HERE. `_age_txt(True)` formatted a
+    # boolean as "1s ago": the verdict refused the unread age and the EVIDENCE in the same block —
+    # the bytes `compose_message` puts in the controller's inbox — asserted a measured one second.
+    if not _is_age(age):
         return "age UNKNOWN"
     if age < 120:
         return "%.0fs ago" % age
@@ -814,7 +817,8 @@ def check_controller_cycling(f, c):
         log.get("mtime_iso") or "?",
         _age_txt(log_age),
     )
-    hb_txt = "heartbeat %s" % (_age_txt(hb.get("age_s")) if hb.get("age_s") is not None else "absent/unreadable")
+    hb_txt = "heartbeat %s" % (_age_txt(hb.get("age_s")) if _is_age(hb.get("age_s"))
+                              else "absent/unreadable")
 
     # ── ABSTAIN: the process table itself could not be read ──────────────────────────────
     # ⛔ ALLOW-LIST POLARITY, like every other read in this file: an ABSENT `ok` is a MISSING READ,
@@ -2662,10 +2666,19 @@ class State(object):
                 repaired = True
             box_rec = {}
             self.data["boxes"][box] = box_rec
-        if not isinstance(box_rec.get("notified"), dict):
-            if "notified" in box_rec:
-                repaired = True
-            box_rec["notified"] = {}
+        # ⛔ EVERY DICT THIS RECORD CONSUMES, NOT JUST THE ONE THAT WAS THOUGHT OF. `ambiguous` was
+        # read and written on every notify path with no shape check, so `{"ambiguous": 3}` in a
+        # hand-edited/merged/older-format state file raised `TypeError: argument of type 'int' is not
+        # iterable` in `is_ambiguous` — AFTER the verdicts and BEFORE the report, i.e. exit 1 with 0
+        # bytes of output. And `{"ambiguous": ["x"]}` survived `is_ambiguous` only to raise
+        # `pop expected at most 1 argument` on the DELIVERED path, which runs BEFORE `state.mark` and
+        # `save()` — so a message that did land was never marked, and the next poll sent the same
+        # brief again: the duplicated-brief failure the AMBIGUOUS default exists to prevent.
+        for key in ("notified", "ambiguous"):
+            if not isinstance(box_rec.get(key), dict):
+                if key in box_rec:
+                    repaired = True
+                box_rec[key] = {}
         self.repaired = repaired
 
     @property
@@ -3126,6 +3139,11 @@ def _controller_fingerprint(machine, cfg):
     near = _names_our_program(snap.get("near_misses") or [], paths=_paths,
                               names=() if _paths else ("orch-loop.sh",))
     return {"ok": snap.get("ok") is True,
+            # ⛔ THE ERROR IS CARRIED, NOT DISCARDED. `attempt_respawn` prints `before["error"]` as
+            # the reason it refused, and this dict never had the key — so the one channel that
+            # explains the refusal said "(no error recorded)" while the `ps` failure text it had
+            # just read was thrown away.
+            "error": snap.get("error"),
             "pids_ok": isinstance(snap.get("pids"), list),
             # ⛔ THE CENSUS IS SCOPED, SO ITS EMPTY `pids` DOES NOT PROVE ABSENCE. A row the scope
             # REJECTED while naming this cell's controller is a live controller the census could not
@@ -4294,7 +4312,11 @@ def main(argv=None):
                 # `render` exactly as the live path passes them. Without this every block printed
                 # "→ exit 0" while the process exited 2, and the only correction was a footnote: the
                 # line an operator quotes is the one that was wrong.
-                print(render(vs, hdr, not_evaluated=only))
+                # `only` lists what was GRADED; `not_evaluated` must list the COMPLEMENT. Passing
+                # `only` printed "NOT EVALUATED … NOT established: headroom" directly above
+                # "✅ PASS headroom", and never named the seven checks that were truly excluded.
+                print(render(vs, hdr, not_evaluated=[n for n in CHECK_ORDER
+                                                     if n not in set(only or [])]))
                 print()
             if skipped:
                 print("⚠️  %d expectation(s) NOT ASSERTED because --only %s excluded them:"

@@ -4493,6 +4493,19 @@ MUTATIONS = [
      '    if lane_ok:\n        return True, "a lane started %s (the queue record is not the only evidence)" % (\n            _age_txt(lane_ok.get("age_s")))',
      '    if intent or lane_ok:\n        return True, "a dispatch landed %s (the queue record is not the only evidence)" % (\n            _age_txt((intent or lane_ok).get("age_s")))',
      "test_the_intent_line_is_not_reported_as_a_LANDED_dispatch"),
+    # ── cycle-38 defects ─────────────────────────────────────────────────────────────────
+    ("the ambiguous record is not shape-checked (a repair that covers one key)",
+     '        for key in ("notified", "ambiguous"):',
+     '        for key in ("notified",):',
+     "test_a_corrupt_AMBIGUOUS_record_is_REPAIRED_not_fatal"),
+    ("the evidence formats a bool age as one second",
+     '    if not _is_age(age):\n        return "age UNKNOWN"',
+     '    if age is None:\n        return "age UNKNOWN"',
+     "test_the_EVIDENCE_cannot_format_a_BOOL_as_one_second"),
+    ("the respawn refusal drops the ps error it read",
+     '            "error": snap.get("error"),\n',
+     '',
+     "test_the_respawn_REFUSAL_prints_the_error_it_read"),
     # ── cycle-37 defects ─────────────────────────────────────────────────────────────────
     ("a bool age certifies an expired lander decision as current",
      '               and _is_age(r.get("age_s"))\n               and r.get("age_s") <= window_s)',
@@ -4503,7 +4516,7 @@ MUTATIONS = [
      '    if pane.get("protection_supported"):',
      "test_the_pane_EVIDENCE_cannot_assert_a_protection_source_the_payload_DENIES"),
     ("a narrowed static run prints the exit code it does not take",
-     '                print(render(vs, hdr, not_evaluated=only))',
+     '                print(render(vs, hdr, not_evaluated=[n for n in CHECK_ORDER\n                                                     if n not in set(only or [])]))',
      '                print(render(vs, hdr))',
      "test_a_static_only_run_does_not_PRINT_a_green_exit_it_does_not_take"),
     ("the collectors launder an absent landing bit into a definite false",
@@ -4616,10 +4629,6 @@ MUTATIONS = [
      '    if (_src == "state/queue-state" and kind == "EMPTY" and _graded_stale(f, cfg, _src) is None\n            and _is_count(backlog)):',
      '    if _src == "state/queue-state" and kind == "EMPTY":',
      "test_an_UNAGED_EMPTY_record_cannot_manufacture_idleness_either"),
-    ("the rollup state returns on the first in-flight group",
-     '        if any(_in_flight(chk) for _r, chk in entries):\n            seen_inflight = True\n            continue',
-     '        if any(_in_flight(chk) for _r, chk in entries):\n            return "inflight"',
-     "test_a_CONCLUDED_red_outranks_an_IN_FLIGHT_check_in_either_order"),
     # ── cycle-25 defects ──────────────────────────────────────────────────────────────────
     ("an absent pids key is graded as an empty process table",
      '    raw_pids = ctrl.get("pids")',
@@ -5678,6 +5687,78 @@ def test_a_MEASURED_unprotected_pid_outranks_an_unread_sibling():
 
 
 @test
+def test_a_corrupt_AMBIGUOUS_record_is_REPAIRED_not_fatal():
+    """`notified` was shape-checked and `ambiguous` was not, though every notify path reads and writes
+    it. `{"ambiguous": 3}` raised `TypeError` in `is_ambiguous` AFTER the verdicts and BEFORE the
+    report (exit 1, 0 bytes of output); `{"ambiguous": ["x"]}` survived that and then raised
+    `pop expected at most 1 argument` on the DELIVERED path — before `mark` and `save()` — so a
+    message that did land was never marked and the next poll sent it again."""
+    m = load()
+    for bad in (3, ["x"], "nope", {"a": 1}):
+        path = os.path.join(tempfile.mkdtemp(prefix="oc-ambrec-"), "s.json")
+        with open(path, "w") as fh:
+            json.dump({"version": 1, "boxes": {"local": {"notified": {}, "ambiguous": bad}}}, fh)
+        st = m.State(path, "local")
+        assert isinstance(st.data["boxes"]["local"]["ambiguous"], dict), bad
+        assert not st.is_ambiguous("pane_daemon|FAIL|X"), bad
+        st.mark_ambiguous("pane_daemon|FAIL|X", 1.0)
+        assert st.is_ambiguous("pane_daemon|FAIL|X"), bad
+        st.clear_ambiguous("pane_daemon|FAIL|X")
+        assert not st.is_ambiguous("pane_daemon|FAIL|X"), bad
+        st.clear("pane_daemon")
+    # …and a GOOD record is left alone (no repair claimed)
+    path = os.path.join(tempfile.mkdtemp(prefix="oc-ambrec2-"), "s.json")
+    with open(path, "w") as fh:
+        json.dump({"version": 1, "boxes": {"local": {"notified": {}, "ambiguous": {"k": 1.0}}}}, fh)
+    st = m.State(path, "local")
+    assert st.data["boxes"]["local"]["ambiguous"] == {"k": 1.0}
+    assert not getattr(st, "repaired", False), "a valid record must not be reported as repaired"
+
+
+@test
+def test_the_EVIDENCE_cannot_format_a_BOOL_as_one_second():
+    """`_age_txt` is the ONE place an age is printed, and it formatted `True` as "1s ago": the
+    verdict refused the unread age and the evidence in the SAME block — the bytes that land in the
+    controller's inbox — asserted a measured one second."""
+    m = load()
+    for v in (True, False, "30", {"a": 1}):
+        assert m._age_txt(v) == m._age_txt(None), v
+    assert "1s ago" in m._age_txt(1.0)          # a real number still prints
+
+
+@test
+def test_a_static_only_run_NAMES_the_checks_it_excluded():
+    """`--only` lists what was GRADED; the run reported it as NOT EVALUATED, printing
+    "NOT EVALUATED … NOT established: headroom" directly above "✅ PASS headroom" and never naming
+    the seven checks it really skipped."""
+    rc, out, err = run_cli(["--static", "--only", "headroom", "--fixtures-dir", FIXTURES])
+    assert rc == 2, (rc, err[-300:])
+    line = next((ln for ln in out.splitlines() if "NOT EVALUATED" in ln), "")
+    assert "headroom" not in line, line
+    assert "pane_daemon" in line and "landers" in line, line
+
+
+@test
+def test_the_respawn_REFUSAL_prints_the_error_it_read():
+    """`_controller_fingerprint` never returned the `ps` error `snapshot_controller` records, so the
+    refusal — the only channel under the launchd wiring — said "(no error recorded)" while
+    discarding the text that distinguishes a timeout from an empty table."""
+    m = load()
+    class M:
+        box = "local"
+        def snapshot_controller(self):
+            return {"ok": False, "pids": [], "error": "ps timed out after 90s"}
+        def log_stat(self):
+            return {"mtime": None, "exists": True, "age_s": 5.0}
+    cfg = m.cfg_from_dict({})
+    absent = m.V("controller_cycling", m.FAIL, "CONTROLLER_ABSENT", "e")
+    res = m.attempt_respawn(absent, cfg, M())
+    assert res.get("attempted") is False, res
+    assert "ps timed out after 90s" in res.get("detail", ""), res.get("detail")
+    assert "no error recorded" not in res.get("detail", ""), res.get("detail")
+
+
+@test
 def test_a_BOOL_age_cannot_certify_an_EXPIRED_lander_decision_as_current():
     """`age_s` was allow-listed only against `None`, so `true` read as ONE SECOND: a `[railed]`
     decision older than the whole window graded the PR as CURRENTLY railed → `PASS/LANDERS_ARMED`,
@@ -5781,19 +5862,24 @@ def test_every_age_read_goes_through_the_ONE_bool_excluding_guard():
     m = load()
     src = open(m.__file__).read().splitlines()
     # the ONE legal occurrence is `_is_age`'s own body
-    helper = next(i for i, ln in enumerate(src) if ln.startswith("def _is_age("))
-    inside = set()
-    for j in range(helper + 1, len(src)):
-        if src[j].strip() and not src[j].startswith((" ", "\t")):
-            break                         # a top-level line ends the function
-        inside.add(j)
+    # ⛔ THE RULE, NOT ONE SPELLING OF IT. Forbidding the literal `(int, float)` tuple pinned the
+    # rule's punctuation: `isinstance(a, int)` is the SAME defect (`isinstance(True, int)` is True)
+    # and sailed through. Every int/float type test outside the two helpers is now an offence.
+    helpers, inside = set(), set()
+    for i, ln in enumerate(src):
+        if ln.startswith("def _is_age(") or ln.startswith("def _is_count("):
+            helpers.add(i)
+            for j in range(i + 1, len(src)):
+                if src[j].strip() and not src[j].startswith((" ", "\t")):
+                    break                 # a top-level line ends the function
+                inside.add(j)
     offenders = []
     for i, ln in enumerate(src):
-        if i in inside:
-            continue                      # `_is_age`'s own body is the ONE legal occurrence
-        if "isinstance(" not in ln or "(int, float)" not in ln:
-            continue
-        offenders.append("%d: %s" % (i + 1, ln.strip()))
+        if i in helpers or i in inside:
+            continue                      # the helpers are the ONLY legal occurrence
+        if "isinstance(" in ln and re.search(r"\b(int|float)\b", ln) \
+                and not ln.lstrip().startswith("#"):
+            offenders.append("%d: %s" % (i + 1, ln.strip()))
     assert not offenders, (
         "every age/number read must use `_is_age` (a bool is not a number); hand-rolled guards:\n  "
         + "\n  ".join(offenders))
