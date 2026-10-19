@@ -843,24 +843,41 @@ heartbeat() { date +%s > "$O/heartbeat"; }
 # processes and the tmux server, losing every lane on it).
 #
 # A FAILED read prints `?`, never 0: `lanes=0/0` and "ps is broken" must not render identically (the
-# false-green class this loop refuses everywhere else). The dispatch gate then falls back to the OLD
-# tmux count — a conservative under-count of live work refuses work, and refusing costs a cycle while
-# over-dispatch costs the box.
+# false-green class this loop refuses everywhere else).
+#
+# ⛔ AN UNREADABLE CENSUS IS CANNOT-VERIFY, AND CANNOT-VERIFY DOES NOT ADD WORK (#2163 review, P2).
+# The earlier wording here had the polarity BACKWARDS: an UNDER-count of live lanes makes
+# `[ "$LANES" -ge "$MAX_LANES" ]` FALSE and **dispatches more** — the exact direction that fills the
+# box — so falling back to the tmux count silently is a fail-OPEN on the capacity gate. So:
+#   * the script is MISSING (a `$O` that predates it) → tmux fallback, named once in the log: a
+#     transition, not a measurement;
+#   * the script EXISTS and the census is `?`/unreadable → `LANES_UNKNOWN=1`, and the gate refuses to
+#     add work with that reason, on the same doctrine as an unreadable memory probe (memory gate:
+#     "a failed probe is UNKNOWN, not ample"). The tmux count is still shown in `[cap]` as a
+#     lower-bound hint, never used as a licence to dispatch.
+LANES_UNKNOWN=0
 LANE_REAP_SH=""
 for _c in "${O:-}/lane-reap.sh" "${_HERE_RS:-}/lane-reap.sh"; do
   [ -n "$_c" ] && [ -f "$_c" ] && { LANE_REAP_SH="$_c"; break; }
 done
 measure_lanes() {
   local out live total z
-  LANES=""; LANES_TOTAL="?"; ZOMBIES="?"
+  LANES=""; LANES_TOTAL="?"; ZOMBIES="?"; LANES_UNKNOWN=0
   if [ -n "$LANE_REAP_SH" ]; then
     out="$(bash "$LANE_REAP_SH" count 2>/dev/null)"
-    # lanes=<live>/<total> zombie=<n>   (one line, no other output)
+    # lanes=<live>/<total> zombie=<n>   (one line, no other output; live may be `?`)
     live="${out#lanes=}"; live="${live%%/*}"
     total="${out#*/}"; total="${total%% *}"
     z="${out##*zombie=}"
-    if is_num "${live:-}" && is_num "${total:-}" && is_num "${z:-}"; then
-      LANES="$live"; LANES_TOTAL="$total"; ZOMBIES="$z"
+    if is_num "${total:-}" && is_num "${z:-}"; then
+      LANES_TOTAL="$total"; ZOMBIES="$z"
+    fi
+    if is_num "${live:-}"; then
+      LANES="$live"
+    else
+      # Readable totals with an unreadable numerator, or no answer at all: either way this cycle
+      # does not know how many lanes are working, so it does not add work on the strength of it.
+      LANES_UNKNOWN=1
     fi
   fi
   if ! is_num "${LANES:-}"; then
@@ -3450,6 +3467,7 @@ PY
   # consulted, so a lanes-bound or swap-bound stall looked like a load stall.
   GATE_WHY="$(mp_reason "${UPN_WORK:-${UPN:-0}}" "$LANES" "$WORKERS" "${SEL_TOTAL:-${OPEN_N:-0}}")"
   if [ -n "$GATE_WHY" ]; then :
+  elif [ "${LANES_UNKNOWN:-0}" = "1" ]; then GATE_WHY="lanes_unknown (the lane census could not be read -> do not add work)"
   elif [ "$L" -ge "$MAX_LOAD" ]; then GATE_WHY="load=$L>=max_load=$MAX_LOAD"
   elif [ "$LANES" -ge "$MAX_LANES" ]; then GATE_WHY="lanes=$LANES>=max_lanes=$MAX_LANES"
   # ⛔ SWAP IS CUMULATIVE, RAM IS PRESENT (#1985). On macOS a 1 GB swap file stays roughly half

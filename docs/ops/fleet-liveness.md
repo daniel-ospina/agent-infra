@@ -877,10 +877,16 @@ lane-reap.sh reap [--dry-run]       report what WOULD be reaped (the default)
 lane-reap.sh reap --apply           signal the lanes that pass all three gates
 ```
 
-**live** = the tree exists AND its log advanced inside `LANE_REAP_LIVE_MIN` (30 min). **total** =
-every resident lane tree (a `fix-`/`merge-`/`chain-` wrapper is a WORKER and is counted by
-`workers=`, not by `lanes=`). `lanes=?/?` means the census could not be read and is never rendered as
-`0/0`. `--apply` is the operator's decision, like every other deletion tool in this tree.
+**live** = the tree exists AND its log advanced inside `LANE_REAP_LIVE_MIN` (45 min — above
+`lane.sh`'s 2400 s wall limit, so a long silent tool call is not read as death). **total** = every
+resident tree the census can ATTRIBUTE: a `pi` tree whose root or a direct child holds a
+fleet-namespace log open (a `fix-`/`merge-`/`chain-` wrapper is a WORKER and is counted by
+`workers=`, not by `lanes=`; `count` and `reap` share this population predicate, and `reap` alone
+adds the human-ancestor refusal — before the tree is counted). `lanes=?/?` means the census could
+not be read and is never rendered as `0/0`; a `?` live numerator with readable totals is the same
+abstention one lane at a time. An unreadable census makes the controller REFUSE to add work
+(`lanes_unknown`) — the gate is capacity, so an under-count must not dispatch more. `--apply` is the
+operator's decision, like every other deletion tool in this tree.
 
 ### 11.4 Boundaries, stated
 
@@ -891,6 +897,10 @@ every resident lane tree (a `fix-`/`merge-`/`chain-` wrapper is a WORKER and is 
 - A lane whose log was deleted and whose age is under 12 h is **reported, not reaped** — the
   conservative side of the trap above. On the measured box that is the 1 h 20 m cluster, which is
   why the reap population is old lanes.
+- A leaked lane whose stdout is a **pty or pipe** and whose log name is outside the fleet namespace
+  is outside the population entirely (no artefact to judge): it is invisible to both `lanes=` and the
+  reaper by the same rule that makes `no-log-evidence` a refusal. Terminating such a tree is the
+  operator's call, from the process table.
 - `lane-reap.sh` is **not** `lane-watchdog.py`: that one reaps a *frozen dispatched child* so a
   lane's tool call returns; this one reaps a *finished lane*. They share the identity fence and the
   ancestry vocabulary, not the population.
