@@ -118,6 +118,17 @@ IN_FLIGHT = {"queued", "in_progress", "waiting", "requested", "pending"}
 # read and an absent thing are different facts and must not share a word.
 GH_BLOCKED = None
 GH_BLOCKED_BY = []          # WHICH read claimed blindness; the report must name it
+# ⛔ THE BUCKET IS DERIVED FROM THE LIVE CLAIMS, NEVER LEFT OVER FROM A WITHDRAWN ONE (#2138 r2).
+# `GH_BLOCKED` used to be a single mutable word set by whichever read failed LAST, so a claim that
+# was later WITHDRAWN could survive as the kind of a DIFFERENT surface: main reading `HTTP 504`
+# (UNREADABLE) plus a queue refusal that REST then recovered (RATE-LIMITED, retracted) left
+# `GH_BLOCKED='RATE-LIMITED'` against main -- the line printed `gh=RATE-LIMITED(main)` and rewrote
+# the verdict to "wait for the limit" on a tick whose real story was "main's read 504'd; the queue
+# read FINE". That is the same misattribution class `_note_gh_failure`'s docstring already records
+# ("the token named the wrong subsystem"), one level down. One kind + text per surface, and the
+# bucket is recomputed on every note and every withdrawal.
+GH_CLAIM_KIND = {}
+GH_CLAIM_TEXT = {}
 
 # WHICH READS MAY DECLARE THE FLEET BLIND. The objective is defined over main's state and
 # over the queue, so if either of those cannot be read no verdict can be formed and those
@@ -133,6 +144,18 @@ BLINDING_SURFACES = ("main", "queue")
 TRANSPORT_MARKERS = ("rate limit", "http 5", "http 4", "timed out", "timeout",
                      "could not resolve", "connection", "network", "tls", "ssl",
                      "temporary failure", "gateway", "unable to access")
+
+
+def _recompute_gh_blocked():
+    """The bucket for the claims that are still LIVE (see GH_CLAIM_KIND).
+
+    RATE-LIMITED outranks UNREADABLE because it is the more actionable answer (wait vs debug),
+    which is the precedence the single-word version already had -- kept, not reinvented.
+    """
+    kinds = [GH_CLAIM_KIND.get(s, "UNREADABLE") for s in GH_BLOCKED_BY]
+    if not kinds:
+        return None
+    return "RATE-LIMITED" if "RATE-LIMITED" in kinds else "UNREADABLE"
 
 
 def _note_gh_failure(text, surface, transport=True):
@@ -158,9 +181,11 @@ def _note_gh_failure(text, surface, transport=True):
     if surface not in GH_BLOCKED_BY:
         GH_BLOCKED_BY.append(surface)
     if "rate limit" in low:
-        GH_BLOCKED = "RATE-LIMITED"
-    elif GH_BLOCKED is None:
-        GH_BLOCKED = "UNREADABLE"
+        GH_CLAIM_KIND[surface] = "RATE-LIMITED"
+    else:
+        GH_CLAIM_KIND.setdefault(surface, "UNREADABLE")
+    GH_CLAIM_TEXT[surface] = text or ""
+    GH_BLOCKED = _recompute_gh_blocked()
 
 
 GH_LAST_ERROR = ""
@@ -378,9 +403,10 @@ def main_health(sha):
     if cr is not None:
         # a GraphQL read means the fleet can SEE -- so main withdraws its own claim, and
         # only its own: a queue failure recorded later in this same tick must survive.
-        GH_BLOCKED_BY[:] = [s for s in GH_BLOCKED_BY if s != "main"]
-        if not GH_BLOCKED_BY:
-            GH_BLOCKED = None      # nobody else claims blindness, so the fleet can see
+        # ⛔ ONE IMPLEMENTATION, NOT A COPY (#2138 r2): the inline version removed the surface but
+        # not its KIND, so main recovering could leave `GH_BLOCKED` naming a bucket no live claim
+        # supported. `_withdraw_gh_failure()` recomputes it from the claims that remain.
+        _withdraw_gh_failure("main")
     else:
         cr = gh(f"repos/{REPO}/commits/{sha}/check-runs?per_page=100&filter=all", paginate=True)
     if cr is None:
@@ -1059,37 +1085,41 @@ QUEUE_BLIND_BUDGET_S = 20                     # WALL-CLOCK bound on re-sampling,
 # about. The two limits are separate buckets, so REST is a SECOND SOURCE -- never a retry of the
 # same refusal, and never a fallback to "empty" (an empty read is a FAILED read, #1872).
 #
-# ⛔ AND IT DOES NOT GO THROUGH `GH_BIN`, AND THAT IS A DELIBERATE DEPARTURE FROM #1959. The
-# `$O/gh-rest` adapter serves a GraphQL refusal over REST, and `_gh_layer()` prefers it — but it
+# ⛔ AND IT DOES NOT GO THROUGH `GH_BIN` -- NOT AS A DEPARTURE FROM #1959, BUT BECAUSE OF IT.
+# The `$O/gh-rest` adapter serves a GraphQL refusal over REST and `_gh_layer()` prefers it, but it
 # CANNOT serve THIS read: its `PR_FIELDS` allow-list has no `files`, and its own field rule says a
 # field it does not model "DELEGATES the whole call … Dropping one is not a slow answer, it is a
-# WRONG answer". So `gh pr list --json …,files` delegates straight back to real gh, i.e. to the
-# refused transport — measured 2026-10-19, the day of the fix. This fallback is the in-file
-# equivalent for the ONE read whose field set the adapter deliberately refuses to drop, and it
-# keeps `files` as UNKNOWN (`[]`) only WHERE THE PRIMARY READ ALREADY FAILED, never on the
-# ordinary path where the adapter's objection would apply.
+# WRONG answer". `gh pr list --json …,files` therefore delegates straight back to real gh -- to the
+# refused transport -- which is exactly what #1959 decided it should do. So this fallback is the
+# in-file equivalent for the ONE read whose field set the adapter deliberately refuses to drop,
+# and it keeps `files` UNKNOWN (`[]`) only WHERE THE PRIMARY READ ALREADY FAILED -- never on the
+# ordinary path, where the adapter's objection would apply.
 GH_HOSTS = os.path.expanduser("~/.config/gh/hosts.yml")
 QUEUE_REST_PAGE = 100                         # the list endpoint's maximum page
 QUEUE_REST_MAX_PAGES = 5                      # a bound on PAGES; reaching it with a FULL last page
                                               # is a FAILED read (a truncated queue is an under-count
                                               # published as the depth), never a 500-row answer
 QUEUE_REST_TIMEOUT_S = 30                     # PER-PAGE ceiling, further clipped to the queue read's
-                                              # own remaining budget so the fallback can never
-                                              # outlive the beat's 90 s refresh bound (see
-                                              # `_queue_rest(deadline=…)`)
+                                              # own remaining budget and re-checked after every
+                                              # page (`_queue_rest(deadline=…)`), so the fallback
+                                              # cannot add a 5 x 30 s tail to a beat that is killed
+                                              # at 90 s
 
 
 def _gh_hosts_path():
-    """Where gh keeps its config, resolved at CALL time (GH_CONFIG_DIR, then the default).
+    """Where gh keeps its config, resolved at CALL time (GH_CONFIG_DIR, XDG, then the default).
 
     Resolved per call rather than at import: `pr-doctor.py` imports this module, and a process
     that changes `HOME`/`GH_CONFIG_DIR` after import would otherwise read a path that no longer
-    exists and silently have no second source.
+    exists and silently have no second source. The order mirrors gh's own unix resolution.
     """
     cfg = os.environ.get("GH_CONFIG_DIR")
-    if not cfg:
-        return GH_HOSTS
-    return os.path.join(os.path.expanduser(cfg), "hosts.yml")
+    if cfg:
+        return os.path.join(os.path.expanduser(cfg), "hosts.yml")
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    if xdg:
+        return os.path.join(os.path.expanduser(xdg), "gh", "hosts.yml")
+    return GH_HOSTS
 
 
 def _gh_token():
@@ -1100,15 +1130,17 @@ def _gh_token():
     (`gh auth token`): that is another subprocess on the hot path of the read that exists BECAUSE
     the subprocess path is refused, and it would inherit the same shell/shim hazards (#1872).
 
-    ⛔ ONLY THE `github.com` BLOCK IS USED. This file's REPO is a github.com repo, so another
-    host's token in the same file (an enterprise or GitLab entry) is not a fallback — sending it
-    to api.github.com would present a foreign credential to the wrong service. No token ⇒ `""`,
-    and the caller makes no request at all.
+    ⛔ ONLY A `github.com` CREDENTIAL IS USED, FROM EITHER SOURCE. This file's REPO is a
+    github.com repo, so another host's token (an enterprise or GitLab entry in the same file, or
+    an `GH_TOKEN` scoped by `GH_HOST` to an enterprise host) is not a fallback — presenting it to
+    api.github.com would hand a foreign credential to the wrong service. No token ⇒ `""`, and the
+    caller makes no request at all.
     """
-    for var in ("GH_TOKEN", "GITHUB_TOKEN"):
-        tok = (os.environ.get(var) or "").strip()
-        if tok:
-            return tok
+    if (os.environ.get("GH_HOST") or "github.com").strip().lower() == "github.com":
+        for var in ("GH_TOKEN", "GITHUB_TOKEN"):
+            tok = (os.environ.get(var) or "").strip()
+            if tok:
+                return tok
     try:
         host = None
         with open(_gh_hosts_path()) as fh:
@@ -1168,8 +1200,10 @@ def _rest_pr(p):
 
     ⛔ `files: []` MEANS *UNKNOWN*, NEVER "EMPTY DIFF". The list endpoint carries no file list
     (that is one call per PR), so `touches_surface()` reads `[]` and answers False on a
-    REST-recovered pass: the `ASK-USER` overlay is BLIND for that pass, not clear. Recorded as a
-    residual on #2138 rather than closed here, because closing it changes this contract.
+    REST-recovered pass. The overlay is then NOT READ, and `build()` SAYS SO instead of omitting
+    the token -- `ASK-USER: surface=UNREAD(rest list carries no file list)` -- because a residual
+    that never reaches the printed line is a false absence (three reviewers, one shape). Closing it
+    needs one `/pulls/<n>/files` call per PR, which changes this `files: []` contract.
     ⛔ `mergeStateStatus` MAY BE EMPTY, and that is the known gap: REST's `mergeable_state` is
     often "" while GitHub computes mergeability, so the value is mapped to `None` (unread) and
     `_queue_read_is_blind()` is told the sample's SOURCE -- otherwise the fallback would
@@ -1191,9 +1225,11 @@ def _queue_rest(deadline=None):
     """The open PR list over REST, or None on ANY failure -- never an empty queue.
 
     ⛔ `[]` IS NEVER A FAILURE VALUE HERE. It is the honest answer for a repo with no open PRs,
-    which is why every failure returns None instead: the caller then raises exactly as it did
-    before, so `_note_gh_failure` records the transport failure, `queue=UNREADABLE` prints and
-    the RATE-LIMITED verdict still outranks the queue. A degraded read rendered as `waiting=0`
+    which is why every failure returns None instead. The CALLER records the failure BEFORE it
+    calls this (see `queue()`), so `queue=UNREADABLE` prints and the RATE-LIMITED verdict still
+    outranks the queue; when this returns None the caller raises and its `except` re-notes the
+    COMBINED cause (primary + this one). The surface is only ever added to `GH_BLOCKED_BY` once, so
+    the second note is a text update, not a second claim. A degraded read rendered as `waiting=0`
     would read AT-TARGET -- the one wrong answer this instrument can give.
 
     ⛔ A NON-LIST BODY IS A FAILURE, NOT ZERO PRs. A dict here is an error/notice body, and a
@@ -1207,6 +1243,12 @@ def _queue_rest(deadline=None):
     fallback could spend `MAX_PAGES x TIMEOUT_S` inside a loop the beat kills at 90 s, and a
     killed refresh writes NO line at all: the recovery would be strictly worse than the refusal
     it replaces.
+
+    ⛔ HONEST BOUND: a socket timeout bounds each BLOCKING OPERATION, not the request, so one
+    stalled connection can still overrun the budget by an operation -- which is why the budget is
+    also re-checked AFTER every page and a read that is past it is discarded. The claim this file
+    makes is therefore "bounded per page, re-checked between pages, at most one operation of
+    overrun", not "a hard wall-clock guarantee" that a socket timeout cannot deliver.
 
     PAGING: one page is 100. A deeper queue is read a page at a time; a SHORT page is the end. A
     FAILED page discards the whole read, and so does REACHING THE CAP WITH A FULL PAGE -- both are
@@ -1240,6 +1282,12 @@ def _queue_rest(deadline=None):
                 GH_LAST_ERROR = "rest fallback returned a non-object element in the PR list"
                 return None
             rows.extend(body)
+            if deadline is not None and _monotonic() > deadline:
+                # The page ARRIVED, but past the budget: a stale answer is not a measurement. (The
+                # socket timeout below bounds each blocking operation, not the whole request -- see
+                # the honest-bound note above.)
+                GH_LAST_ERROR = "rest fallback: budget overrun during page %d" % page
+                return None
             if len(body) < QUEUE_REST_PAGE:
                 break
         else:
@@ -1263,11 +1311,21 @@ def _withdraw_gh_failure(surface):
     Without this, a recovered read would still print `gh=RATE-LIMITED(queue)` AND rewrite the
     verdict to `GH-RATE-LIMITED` -- the fallback would succeed and the line would still say the
     fleet is blind.
+
+    ⛔ THE BUCKET AND THE CAUSE GO WITH THE CLAIM (#2138 r2, two reviewers). Removing the SURFACE
+    alone left its KIND behind, so a retracted RATE-LIMITED could be republished as the kind of
+    the surface that was still failing (measured shape: main `HTTP 504` + a queue refusal REST
+    recovered -> `gh=RATE-LIMITED(main)`, and the verdict rewritten to wait for a limit main
+    never hit). `GH_LAST_ERROR` is cleared only when it still IS this claim's text, so a fresh
+    unrelated error from another read is never erased.
     """
-    global GH_BLOCKED
+    global GH_BLOCKED, GH_LAST_ERROR
+    withdrawn_text = GH_CLAIM_TEXT.pop(surface, "")
+    GH_CLAIM_KIND.pop(surface, None)
     GH_BLOCKED_BY[:] = [s for s in GH_BLOCKED_BY if s != surface]
-    if not GH_BLOCKED_BY:
-        GH_BLOCKED = None
+    GH_BLOCKED = _recompute_gh_blocked()
+    if withdrawn_text and GH_LAST_ERROR == withdrawn_text:
+        GH_LAST_ERROR = GH_CLAIM_TEXT.get(GH_BLOCKED_BY[-1], "") if GH_BLOCKED_BY else ""
 
 
 def _mergeable_unknown(ms):
@@ -1351,9 +1409,10 @@ def queue():
                 # this branch -- in practice that is a REFUSAL (the secondary limit), which is
                 # what the incident and its tests are about; any other non-zero (e.g. a future
                 # argv/field error gh answers with rc=1) also lands here, so the second source
-                # would mask such a drift. Stated rather than hidden: the mapped field set is
-                # pinned by `test_the_rest_payload_is_mapped_to_the_gh_pr_list_shape`, so a drift
-                # shows up there rather than as a silent wrong answer.
+                # would mask such a drift. Stated rather than hidden, AND GUARDED:
+                # `test_the_graphql_field_list_matches_what_the_rest_mapping_provides` pins the
+                # argv's field list against `_rest_pr()`'s keys, so a drift on either side is red
+                # rather than a silently stale mapping behind a healthy-looking line.
                 #
                 # ⛔ RECORD THE CLAIM, THEN WITHDRAW IT. The failure is noted BEFORE the fallback
                 # is tried, so (a) a double refusal reports the same transport failure it always
@@ -1362,7 +1421,13 @@ def queue():
                 # protection its docstring promises would be inert (review round 1, B and A).
                 _graphql_err = ((r.stdout or "") + (r.stderr or "")).strip()
                 _note_gh_failure(f"queue read failed: {_graphql_err}", surface, transport=True)
-                prs = _queue_rest(deadline=deadline)
+                # ⛔ THE FALLBACK GETS ITS OWN START-ANCHORED BOUND (#2138 r2, B). Passing only the
+                # re-sample deadline made the recovery INERT in the case it exists for: `_gh_retry`
+                # retries a transient failure three times with backoff, so a slow primary read can
+                # spend the whole 20 s budget and then the fallback opens no socket at all. A
+                # single page's worth is always allowed, measured from NOW, and the page loop's own
+                # per-page clipping keeps the worst case bounded at one page.
+                prs = _queue_rest(deadline=max(deadline, _monotonic() + QUEUE_REST_TIMEOUT_S))
                 if prs is None:
                     # Both sources refused: raise the FIRST cause (it is the actionable one --
                     # "rate limit" says wait) and append the second so the cause line names the

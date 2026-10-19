@@ -144,12 +144,24 @@ def install(monkeypatch, *, gql=None, rest=None, pr_list=None, ci_runs=None, ls_
 
 @pytest.fixture(autouse=True)
 def _clean_flag():
-    """The flag is module state; each test starts from a clean tick."""
-    objective.GH_BLOCKED = None
-    objective.GH_BLOCKED_BY.clear()
+    """The flag is module state; each test starts from a clean tick.
+
+    ⛔ EVERY per-surface map is cleared too (#2138 r2): the bucket is now DERIVED from
+    `GH_BLOCKED_BY` + `GH_CLAIM_KIND`/`GH_CLAIM_TEXT`, so leaving a kind behind from a previous
+    test republishes it in the next one -- measured while landing this: a stale RATE-LIMITED kind
+    turned a 504-outage fixture's honest `gh=UNREADABLE(queue)` into `gh=RATE-LIMITED(queue)`.
+    """
+    for obj in (objective,):
+        obj.GH_BLOCKED = None
+        obj.GH_BLOCKED_BY.clear()
+        obj.GH_CLAIM_KIND.clear()
+        obj.GH_CLAIM_TEXT.clear()
     yield
-    objective.GH_BLOCKED = None
-    objective.GH_BLOCKED_BY.clear()
+    for obj in (objective,):
+        obj.GH_BLOCKED = None
+        obj.GH_BLOCKED_BY.clear()
+        obj.GH_CLAIM_KIND.clear()
+        obj.GH_CLAIM_TEXT.clear()
 
 
 @pytest.fixture(autouse=True)
@@ -1458,3 +1470,133 @@ def test_the_config_dir_is_resolved_at_CALL_time_not_at_import(tmp_path, monkeyp
     assert objective._gh_token() == ""
     assert objective._queue_rest() is None
     assert "absent" in objective.GH_LAST_ERROR, objective.GH_LAST_ERROR
+
+
+def test_a_recovered_queue_does_not_republish_its_bucket_against_another_surface(monkeypatch):
+    """⛔ A WITHDRAWN CLAIM MUST NOT COME BACK AS *ANOTHER* SURFACE'S KIND (#2138 r2, B and A).
+
+    Two reviewers reproduced this against the previous commit: main unreadable with `HTTP 504`
+    (UNREADABLE) plus a queue refusal that REST then recovered (RATE-LIMITED, retracted) left
+    `GH_BLOCKED='RATE-LIMITED'` — the line printed `gh=RATE-LIMITED(main)` and rewrote the verdict
+    to "wait for the limit" on a tick whose real story was "main's read 504'd; the queue read
+    fine". Exactly the misattribution `_note_gh_failure`'s own docstring records.
+    """
+    outage = _Result(1, "", "HTTP 504: Server Error")
+    install(monkeypatch, gql=outage, rest=outage, pr_list=REST_REFUSED,
+            rest_prs=[_rest_row(1, "blocked")])
+    line = objective.build()
+    assert "gh=UNREADABLE(main)" in line, line
+    assert "RATE-LIMITED" not in line, line
+    assert "VERDICT=UNKNOWN" in line, line
+
+
+def test_a_withdrawn_claim_takes_its_cause_with_it(monkeypatch):
+    """...and `GH_LAST_ERROR` must not outlive the claim it belongs to (#2138 r2, A).
+
+    A retracted claim's text surviving in the last-error channel is the file's own recorded
+    failure mode ("the cause this pass reports must belong to THIS read"). It is cleared ONLY when
+    it still IS that claim's text, so an unrelated fresh error is never erased.
+    """
+    objective._note_gh_failure("queue read failed: API rate limit exceeded", "queue")
+    assert objective.GH_LAST_ERROR.startswith("queue read failed"), objective.GH_LAST_ERROR
+    objective._withdraw_gh_failure("queue")
+    assert objective.GH_LAST_ERROR == "", objective.GH_LAST_ERROR
+    assert objective.GH_BLOCKED is None, objective.GH_BLOCKED
+
+    # An UNRELATED later error is not this claim's text, so the withdrawal leaves it alone.
+    objective._note_gh_failure("queue read failed: API rate limit exceeded", "queue")
+    objective.GH_LAST_ERROR = "unparseable gh api body: {"
+    objective._withdraw_gh_failure("queue")
+    assert objective.GH_LAST_ERROR == "unparseable gh api body: {", objective.GH_LAST_ERROR
+
+
+def test_a_SLOW_primary_read_still_leaves_the_fallback_one_page(monkeypatch):
+    """⛔ THE RECOVERY MUST NOT BE INERT WHEN THE PRIMARY READ IS SLOW (#2138 r2, B).
+
+    `_gh_retry` retries a transient failure three times with backoff, so a slow primary read can
+    spend the whole re-sample budget — and passing ONLY that deadline made `_queue_rest()` open no
+    socket at all, i.e. the fallback was dead exactly in the case it exists for (a slow transport,
+    not a fast refusal). The fallback now gets a start-anchored single-page bound as well.
+    """
+    clock = {"t": 0.0}
+    monkeypatch.setattr(objective, "_monotonic", lambda: clock["t"])
+    seen = []
+    real_rest = objective._queue_rest
+
+    def spy(deadline=None):
+        seen.append(deadline)
+        return real_rest(deadline=deadline)
+
+    monkeypatch.setattr(objective, "_queue_rest", spy)
+    install(monkeypatch, pr_list=REST_REFUSED, rest_prs=[_rest_row(1, "blocked")])
+    real_retry = objective._gh_retry
+
+    def slow_primary(argv, **kw):
+        clock["t"] += objective.QUEUE_BLIND_BUDGET_S + 5      # the primary read ate the budget
+        return real_retry(argv, **kw)
+
+    monkeypatch.setattr(objective, "_gh_retry", slow_primary)
+    line = objective.build()
+    assert "queue=UNREADABLE" not in line, line
+    assert "nondraft=1" in line, line
+    assert seen and seen[0] > objective.QUEUE_BLIND_BUDGET_S + 5, seen
+
+
+def test_the_graphql_field_list_matches_what_the_rest_mapping_provides(monkeypatch):
+    """⛔ A FIELD DRIFT IS THE ONE THING A SECOND SOURCE CAN HIDE (#2138 r2, A).
+
+    `queue()`'s argv asks gh for six JSON fields; a future gh that renames or drops one answers
+    rc!=0, the REST fallback then answers from `_rest_pr()`'s mapping, and the line looks healthy.
+    Nothing pinned that list, so the "the mapping test catches drift" sentence in `queue()` was
+    reassurance without a guard. This is the guard: the argv's field list and the mapping's keys are
+    the SAME set, so a change to either without the other is red.
+    """
+    seen = []
+    real = objective._gh_retry
+
+    def spy(argv, **kw):
+        seen.append(list(argv))
+        return real(argv, **kw)
+
+    monkeypatch.setattr(objective, "_gh_retry", spy)
+    install(monkeypatch, pr_list=_Result(0, "[]"))
+    objective.queue()
+    assert seen, "the queue read never ran"
+    fields = seen[0][seen[0].index("--json") + 1].split(",")
+    assert fields == ["number", "isDraft", "mergeable", "mergeStateStatus",
+                      "headRefOid", "files"], fields
+    assert set(fields) == set(objective._rest_pr({})), (fields, sorted(objective._rest_pr({})))
+
+
+def test_an_ENTERPRISE_GH_HOST_disables_the_ENV_token(monkeypatch, tmp_path):
+    """⛔ `GH_TOKEN` IS SCOPED BY `GH_HOST` (#2138 r2, B).
+
+    gh uses `GH_TOKEN`/`GITHUB_TOKEN` for the ACTIVE host and `GH_ENTERPRISE_TOKEN` for an
+    enterprise one. Ignoring `GH_HOST` would present an enterprise-scoped token to api.github.com --
+    the same foreign-credential harm the file rule forbids for the config path. The `github.com`
+    block of the config remains a legitimate credential in either case.
+    """
+    hosts = tmp_path / "hosts.yml"
+    hosts.write_text("github.com:\n    oauth_token: gho_file\n")
+    monkeypatch.setattr(objective, "GH_HOSTS", str(hosts))
+    for var in ("GH_CONFIG_DIR", "XDG_CONFIG_HOME", "GH_ENTERPRISE_TOKEN"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("GH_TOKEN", "ent-scoped")
+    monkeypatch.setenv("GH_HOST", "ent.example")
+    assert objective._gh_token() == "gho_file"          # the env token is NOT sent to GitHub
+
+    monkeypatch.delenv("GH_HOST")
+    assert objective._gh_token() == "ent-scoped"        # ...but it is honoured for github.com
+
+
+def test_the_standard_config_locations_are_resolved(tmp_path, monkeypatch):
+    """`XDG_CONFIG_HOME` is the middle leg of gh's own resolution order (#2138 r2, B)."""
+    xdg = tmp_path / "xdg"
+    (xdg / "gh").mkdir(parents=True)
+    (xdg / "gh" / "hosts.yml").write_text("github.com:\n    oauth_token: gho_xdg\n")
+    monkeypatch.delenv("GH_CONFIG_DIR", raising=False)
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+    monkeypatch.setattr(objective, "GH_HOSTS", str(tmp_path / "never-used.yml"))
+    assert objective._gh_token() == "gho_xdg"
