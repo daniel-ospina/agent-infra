@@ -678,6 +678,251 @@ function dequote(tok: string): string {
 }
 
 /**
+ * The words whose argument is a PROGRAM THE SHELL RUNS: `sh -c '<payload>'`,
+ * `eval '<payload>'`, `trap '<payload>' EXIT`, `xargs '<payload>'`. Quoted text
+ * under one of these is CODE, so a verb pair inside it is a real invocation.
+ *
+ * ⚠️ NON-SHELL INTERPRETERS ARE DELIBERATELY ABSENT — see `dataCharMask`.
+ */
+const SHELL_PAYLOAD_RUNNERS = new Set([
+  "sh", "bash", "zsh", "dash", "ksh", "ash", "mksh", "oksh", "source", ".",
+  "eval", "trap", "xargs", "exec", "command", "env", "sudo", "nohup", "nice",
+  "time", "coproc", "busybox",
+  // `ssh <host> '<command>'` runs its argument in a REMOTE SHELL — pinned by the
+  // #1776 boundary test, which spells the decoy that way.
+  "ssh",
+]);
+
+/**
+ * Commands that WRAP another program (`su`, `doas`, `timeout`, `setsid`,
+ * `stdbuf`, `watch`, `chroot`, `flock`, …) — a bullet's operand can be the
+ * program, so they participate in the SHELL-PAYLOAD decision, but only together
+ * with a `-c` introducer (`su -c '<payload>'`, `timeout 5 sh -c '<payload>'`).
+ *
+ * ⚠️ They are NOT in `SHELL_PAYLOAD_RUNNERS`, and the distinction is measured
+ * (cycle 2): a wrapper word alone made every quoted ARGUMENT of the wrapped
+ * command code — `timeout 30 gh issue list --search '<mention>'`,
+ * `flock /tmp/lock gh pr comment --body '<mention>'` each counted 1 and were
+ * refused, which is the #1485 false-positive class returning through a side
+ * door. Only `-c` turns a quoted region into a program.
+ */
+const SHELL_WRAPPER_WORDS = new Set([
+  "sudo", "doas", "su", "runuser", "pkexec", "timeout", "setsid", "stdbuf",
+  "watch", "chroot", "flock", "nice", "env", "nohup", "time", "command", "exec",
+]);
+
+/**
+ * Commands whose STDIN is a PROGRAM: a shell or an interpreter (`python3`, `node`,
+ * …), plus the executors that read a script from stdin (`make -f -`, `awk -f -`,
+ * `xargs`). Used by `dataCharMask` for `… | <runner>`, where the previous stage's
+ * quoted arguments are what the runner executes.
+ *
+ * Non-shell interpreters are ABSENT from `SHELL_PAYLOAD_RUNNERS` (their `-c`
+ * payload is another language, and treating it as shell is the false positive
+ * #1485 removes) but PRESENT here: a pipeline stage whose output is fed to an
+ * interpreter is a program, which is a different question from what language the
+ * text is written in.
+ */
+const STDIN_PROGRAM_RUNNERS = new Set([
+  ...SHELL_PAYLOAD_RUNNERS, "make", "awk", "sed", "xargs",
+]);
+const STDIN_PROGRAM_INTERPRETER_RE =
+  /(^|\/)(python[0-9.]*|node|deno|bun|ruby|perl|php|pwsh|powershell|lua|tclsh)$/;
+
+/**
+ * Flags whose VALUE is a program or a script: `osascript -e 'do shell script …'`,
+ * `perl -e`, `sed -e`, `pwsh -Command`. A quoted region opened by one of these is
+ * executable, whatever the command word is.
+ *
+ * ⚠️ `-c` is DELIBERATELY ABSENT. It is gh's `--comment`, sed's copy, and the
+ * shell's "run this"; the shells are already payload runners by COMMAND WORD, so
+ * the only thing adding `-c` here would buy is refusing an interpreter payload
+ * that merely quotes a command — the false positive #1485 removes. A `pr merge`
+ * pair inside `python3 -c "…"` is python source, not a shell invocation, and the
+ * argv-level gh shim is what enforces the merge it might launch (#984).
+ */
+const EXEC_PAYLOAD_FLAGS = new Set(["-e", "--eval", "--execute", "--command", "-Command"]);
+
+/**
+ * Which characters of the command are DATA — quoted text the shell hands to
+ * something that prints, stores or parses it, rather than runs?
+ *
+ * WHY THIS EXISTS (#1485). The scan tokens are split on whitespace and
+ * separators REGARDLESS of quote state (that is what lets `"gh" pr merge`,
+ * `sh -c '<payload>'` and `gh pr $'merge'` resolve), so the words of a quoted
+ * ARGUMENT are indistinguishable from the words of the command: a python
+ * payload's docstring line `gh pr merge 8754`, a `--jq` filter, a grep pattern
+ * and a PR body all read as invocations. Measured 2026-10-18 in a hub session:
+ * two read-only `gh run view` calls plus `grep -viE "^\s*$"` were refused with
+ * "more than one `gh pr merge`", and a read-only `gh api` whose payload quoted
+ * the rail was refused as an unevidenced admin merge.
+ *
+ * A quoted region is DATA unless one of these makes it code:
+ *   - it is the WHOLE first word of the simple command (`"gh" pr merge 1` — a
+ *     fully quoted command name is executable);
+ *   - its command word is a SHELL payload runner (`sh -c '<payload>'`, `eval`,
+ *     `trap`, `xargs`) — that text is a program;
+ *   - it sits in the gh VERB SLOT (the first words after `gh`, where
+ *     `gh pr "merge" 1` spells its own verb — quoting never makes an argv word
+ *     data);
+ *   - it contains a command SUBSTITUTION (`$(…)`, a backtick): bash runs that
+ *     even inside double quotes, so everything from the substitution onward
+ *     stays readable.
+ *
+ * ⚠️ DECLARED RESIDUAL — an interpreter payload (`python3 -c "…"`, `node -e "…"`)
+ * is DATA here, because a verb pair in another language's source is not a shell
+ * invocation: it can only merge a PR by handing an argv to `gh`, a runtime act
+ * this text scan cannot see in ANY framing. That case is decided by the
+ * argv-level gh shim (#984, `scripts/gh-shim/gh`), which resolves the argv of
+ * whatever process calls `gh`; adding interpreters here would refuse every lane
+ * command whose payload quotes a command in a docstring — the false positive
+ * this function exists to remove.
+ *
+ * Direction of error: every uncertainty leaves the region EXECUTABLE (the
+ * previous behaviour), so an unresolved shape can only add a refusal.
+ */
+function dataCharMask(scan: ScanTokens): boolean[] {
+  const data = new Array<boolean>(scan.joined.length).fill(false);
+  const { mask, starts, tokens, joined, gaps } = scan;
+  const tokenAt = (pos: number): number => {
+    for (let k = 0; k < starts.length; k++) {
+      if (starts[k] <= pos && pos < starts[k] + tokens[k].length) return k;
+    }
+    return -1;
+  };
+  /** First token of the simple command containing token `i`. */
+  const segStart = (i: number): number => {
+    let k = i;
+    while (k > 0 && !/[;&|(){!\n\r]/.test(gaps[k])) k--;
+    return k;
+  };
+  /** Last token of the simple command containing token `i`. */
+  const segEnd = (i: number): number => {
+    let k = i;
+    while (k + 1 < scan.tokens.length && !/[;&|(){!\n\r]/.test(gaps[k + 1])) k++;
+    return k;
+  };
+  /**
+   * Is token `i` inside a PROCESS SUBSTITUTION (`<(…)` / `>(…)`)? Its output is
+   * consumed by whatever the FD is attached to — `. <(echo "$S $P $M 9 $V")`
+   * SOURCES what echo prints — so the text inside is a program, and the #1776
+   * boundary test pins that shape as fail-closed.
+   */
+  const processSubDepth: number[] = new Array<number>(joined.length).fill(0);
+  {
+    let depth = 0;
+    for (let k = 0; k < joined.length; k++) {
+      if (!mask[k]) { processSubDepth[k] = depth; continue; }
+      if ((joined[k] === "<" || joined[k] === ">") && joined[k + 1] === "(") {
+        depth++;
+        processSubDepth[++k] = depth;
+        continue;
+      }
+      if (joined[k] === ")" && depth > 0) depth--;
+      processSubDepth[k] = depth;
+    }
+  }
+  const inProcessSub = (i: number): boolean => (processSubDepth[starts[i]] ?? 0) > 0;
+  /**
+   * Is this simple command's OUTPUT piped into a program runner (`echo "$S $P $M 999
+   * $V" | sh`, `… | python3`, `… | make -f -`)? Then its quoted arguments are a
+   * PROGRAM, not text: the runner executes whatever the previous stage prints.
+   * Missing this was a measured fail-open in the first cut of #1485 — the decoy
+   * `gh pr view 1; echo "$C $P $M 999 $V" | python3` read as a non-merge gh call
+   * and stood the gate down (pinned by the #1776 boundary test).
+   */
+  const pipedIntoRunner = (i: number): boolean => {
+    const end = segEnd(i);
+    if (end + 1 >= scan.tokens.length) return false;
+    const gap = gaps[end + 1] ?? "";
+    // A PIPE, not `||` (a fallback command does not consume the previous stage's
+    // output as a program).
+    if (!/(^|[^|])\|([^|]|$)/.test(gap)) return false;
+    const next = shellWord(scan.tokens[end + 1]);
+    return STDIN_PROGRAM_RUNNERS.has(next) || STDIN_PROGRAM_INTERPRETER_RE.test(next) ||
+      // #1485 review: a PATH-spelled shell (`| /bin/sh`, `| /usr/bin/bash`) is the
+      // same program as `| sh`, and `| /usr/bin/env sh` is one word away from it —
+      // measured bypass: `echo 'gh pr merge 999 --admin' | /bin/sh` read as data.
+      /(^|\/)(?:sh|bash|zsh|dash|ksh|ash|mksh|oksh)$/.test(next) ||
+      (/(^|\/)(?:env|exec|command|nohup|nice|timeout|setsid|stdbuf|su|doas)$/.test(next) &&
+        STDIN_PROGRAM_RUNNERS.has(shellWord(scan.tokens[end + 2] ?? "")));
+  };
+  let i = 0;
+  while (i < mask.length) {
+    if (mask[i]) { i++; continue; }
+    const s = i;
+    while (i < mask.length && !mask[i]) i++;
+    const e = i; // [s, e) is one quoted region
+    const ti = tokenAt(s);
+    if (ti === -1) continue;
+    const seg = segStart(ti);
+    const cmdWord = shellWord(tokens[seg]);
+    const isCommandName =
+      ti === seg &&
+      starts[ti] === s &&
+      starts[ti] + tokens[ti].length === e &&
+      !/^[A-Za-z_][A-Za-z0-9_]*\+?=/.test(tokens[ti]);
+    const isShellPayload = SHELL_PAYLOAD_RUNNERS.has(cmdWord) ||
+      /(^|\/)(?:sh|bash|zsh|dash|ksh|ash|mksh|oksh)$/.test(cmdWord);
+    // #1485 review (P0, reproduced): the runner need not be the simple command's
+    // FIRST word. `timeout 5 sh -c '<payload>'`, `env FOO=1 bash -c '<payload>'`,
+    // `su -c '<payload>'`, `stdbuf -oL sh -c '<payload>'` are all shells running
+    // the quoted text, and keying only on `tokens[seg]` read their payload as DATA
+    // - which made `countMergeVerbs` 0 for a real admin merge, stood the evidence
+    // gate down, and would have landed an unevidenced merge.
+    //
+    // The rule is deliberately NARROW: a shell payload is introduced by `-c`, and
+    // a shell word appears earlier in the same simple command. Scanning "any
+    // runner word anywhere earlier" instead was measured (cycle 2) to be a NEW
+    // false positive of exactly the class #1485 fixes - `timeout 30 gh issue list
+    // --search '<mention>'` and `flock /tmp/lock gh pr comment --body '<mention>'`
+    // had their `gh` ARGUMENTS read as programs, counted 1, and were refused. In
+    // those the region's introducer is `--search`/`-f`, not `-c`, so they stay
+    // DATA. A non-shell interpreter is still not a runner: its `-c` payload is
+    // another language's source (see the declared residual); `| python3` - a pipe
+    // whose STDIN is the program - is a different question, handled in
+    // `pipedIntoRunner`.
+    const payloadFlagAfterShell = shellWord(tokens[ti - 1] ?? "") === "-c" && (() => {
+      for (let k = seg; k < ti - 1; k++) {
+        const w = shellWord(tokens[k]);
+        if (!w) continue;
+        if (SHELL_PAYLOAD_RUNNERS.has(w) || SHELL_WRAPPER_WORDS.has(w)) return true;
+        if (/(^|\/)(?:sh|bash|zsh|dash|ksh|ash|mksh|oksh)$/.test(w)) return true;
+      }
+      return false;
+    })();
+    const isGhVerbSlot = /(^|\/)gh$/.test(cmdWord) && ti > seg && ti <= seg + 3;
+    const isExecPayload = EXEC_PAYLOAD_FLAGS.has(shellWord(tokens[ti - 1] ?? ""));
+    if (isCommandName || isShellPayload || payloadFlagAfterShell || isGhVerbSlot || isExecPayload || pipedIntoRunner(ti) || inProcessSub(ti)) {
+      continue; // executable
+    }
+    // DATA — but a command substitution inside it still runs. Only a
+    // DOUBLE-quoted region can carry one: `'…'` is literal all the way through, so
+    // a backtick or `$(` written inside single quotes is text (that is the whole
+    // point of quoting it, and treating it as a substitution refused commands
+    // that merely quote a rail in a sed/python/`-m` argument).
+    let from = e;
+    if (joined[s] === '"') {
+      for (let k = s; k + 1 < e; k++) {
+        if (joined[k] === "$" && joined[k + 1] === "(") { from = k; break; }
+        if (joined[k] === "`") { from = k; break; }
+      }
+    }
+    for (let k = s; k < from; k++) data[k] = true;
+  }
+  return data;
+}
+
+/** Is the whole of token `i` DATA (quoted text, not the command's own words)? */
+function isDataToken(scan: ScanTokens, data: boolean[], i: number): boolean {
+  const start = scan.starts[i];
+  const end = start + scan.tokens[i].length;
+  if (start === undefined || end > data.length) return false;
+  for (let k = start; k < end; k++) if (data[k] !== true) return false;
+  return true;
+}
+
+/**
  * Is the token at `i` in COMMAND position — where the shell RUNS a word rather than passing
  * it as an argument? True at the start of the command, after an unquoted separator (`;`, `&`,
  * `|`, `(`, `{`, or a NEWLINE — bash separates commands on both), after a command introducer
@@ -821,6 +1066,15 @@ const VALUE_POSITION_FLAGS = new Set([
 ]);
 
 /**
+ * A shell REDIRECTION OPERATOR with a resolvable target: `2>&1`, `>&2`, `<&-`,
+ * `>/dev/null`, `2>out.txt`, `&>>log`. The shell consumes it before argv exists,
+ * so it is not a word and cannot hide one. Enumerated by SHAPE, and anything
+ * whose target is not plain (`>"$OUT"`, `>$(mktemp)`) does not match — those
+ * keep the fail-closed reading.
+ */
+const REDIRECTION_TOKEN = /^(?:\d+)?(?:>>?|<<?)(?:&\d+-?|&-|&|\d+|[\w./~+=:@%-]+)?$|^&>>?(?:[\w./~+=:@%-]+)?$/;
+
+/**
  * Does the text POSITIVELY read a gh invocation whose subcommand is written out and is NOT
  * a merge? This predicate — and its POLARITY — is the deferral's gate (#1776): the text
  * layer hands the argv layer only a command it can READ as a non-merge gh call, so every
@@ -842,6 +1096,15 @@ const VALUE_POSITION_FLAGS = new Set([
  */
 export function readsNonMergeGhCall(command: string): boolean {
   const scan = scanTokens(command);
+  // #1485: quoted DATA is not this command's own words. A `$`-anchored regex in a
+  // grep pattern (`grep -viE "^\s*$"`), a jq filter, a PR body or an inline
+  // python payload were each read as a CONSTRUCT in an executable position, which
+  // blinded the positive read and handed a read-only command to the evidence gate
+  // (measured: two `gh run view` calls refused as "more than one `gh pr merge`").
+  // A token wholly inside a data region is skipped by BOTH loops below; the
+  // polarity is untouched — a construct OUTSIDE data still fails the read.
+  const data = dataCharMask(scan);
+  const isData = (i: number) => isDataToken(scan, data, i);
   // NO CONSTRUCT OUTSIDE A VALUE POSITION — the mechanism-level boundary, and the reason this
   // no longer grows a list. Seven review rounds each found a new way for a command to RUN
   // something the text cannot read: a construct in a verb position, a spliced or quoted
@@ -852,10 +1115,19 @@ export function readsNonMergeGhCall(command: string): boolean {
   // can be an executable word, a verb, a whole command string, or a program handed to a runner
   // the text never names — indistinguishable, so the read fails and this layer keeps the gate.
   for (let i = 0; i < scan.tokens.length; i++) {
+    if (isData(i)) continue;
     const tok = scan.tokens[i];
     const w = shellWord(tok);
     if (w !== "gh" && /(^|\/)gh$/.test(w)) return false; // `/tmp/x/gh`, `$P/g''h`
     if (!CONSTRUCT.test(tok)) continue;
+    // A REDIRECTION OPERATOR is resolved by the shell before argv exists: `2>&1`
+    // contains a `>` but blinds nothing, and reading it as a construct made every
+    // command that redirects stderr (or `/dev/null`) fail this positive read —
+    // measured: two read-only `gh run view … 2>&1 | tail -3` calls were handed to
+    // the evidence gate for a `>` that is not part of any word. A redirect whose
+    // target is itself unresolvable (`>$OUT`) does NOT match this shape and keeps
+    // the fail-closed reading.
+    if (REDIRECTION_TOKEN.test(tok)) continue;
     const prevWord = shellWord(scan.tokens[i - 1] ?? "");
     // `prevWord.includes("=")` covers the `--flag=value` spelling, where the VALUE's opening
     // word carries the `=` (`--title="admin $(x)"`). The TOKEN itself carrying `=` is NOT an
@@ -870,6 +1142,7 @@ export function readsNonMergeGhCall(command: string): boolean {
   }
   let seen = false;
   for (let i = 0; i < scan.tokens.length; i++) {
+    if (isData(i)) continue;
     if (shellWord(scan.tokens[i]) !== "gh") continue;
     seen = true;
     const group = scan.tokens[i + 1];
@@ -907,8 +1180,15 @@ export function readsNonMergeGhCall(command: string): boolean {
  */
 export function mergeVerbInText(command: string): boolean {
   const scan = scanTokens(command);
+  // #1485: a verb pair inside quoted DATA is a MENTION, not an invocation — a
+  // python payload's docstring line, a `--jq` filter, a PR body. `sh -c`/`eval`
+  // payloads and a fully-quoted command name stay readable (see `dataCharMask`),
+  // which is what keeps `sh -c 'gh pr merge 999 --admin'` a merge.
+  const data = dataCharMask(scan);
+  const isData = (i: number) => isDataToken(scan, data, i);
   const at = (i: number) => shellWord(scan.tokens[i]);
   for (let i = 1; i < scan.tokens.length; i++) {
+    if (isData(i) || isData(i - 1)) continue;
     if (at(i) === "merge" && at(i - 1) === "pr") return true;
   }
   // The construct class is `CONSTRUCT` above; the verb word may itself be spliced, and then
@@ -921,6 +1201,7 @@ export function mergeVerbInText(command: string): boolean {
   // spell.
   const afterIsConstruct = (word: string): boolean => {
     for (let i = 0; i < scan.tokens.length - 1; i++) {
+      if (isData(i) || isData(i + 1)) continue;
       if (at(i) !== word) continue;
       if (CONSTRUCT.test(scan.tokens[i + 1] ?? "")) return true;
     }
@@ -939,6 +1220,14 @@ export function mergeVerbInText(command: string): boolean {
   // here as well was measured as redundant — the suite does not distinguish it — so it is
   // not kept as an unverifiable second mechanism.
   const raw = withoutMandatedRailPath(command).trim().split(/\s+/);
+  // NOT data-aware, deliberately: this arm is the last-resort conserver for a
+  // construct in a verb position that the repo-flag stripper could have shuffled
+  // out of the token stream (`gh pr --repo=$(cat x) merge 999 $V` → `gh pr x)
+  // merge`), and it reads a WHITESPACE split with no offsets to test against the
+  // quote model. Making it guess would weaken the arm in the direction that costs
+  // the gate; leaving it conservative only keeps a MENTION of the form `gh pr $X
+  // merge` inside a payload gated, which is a declared residual of #1485 (the
+  // token arms above are what remove the false positives that were measured).
   const rawAfterIsConstruct = (word: string): boolean => {
     for (let i = 0; i < raw.length - 1; i++) {
       if (dequote(raw[i]) !== word) continue;
@@ -2218,33 +2507,83 @@ const GO_FALSE = new Set(["0", "f", "F", "FALSE", "false", "False"]);
  * `gh pr merge 111 --admin; gh pr merge 999 --admin` is judged against 111's
  * evidence and then merges 999 with `--admin` and no evidence at all. The caller
  * treats >1 as a fail-closed block rather than guessing which PR was meant.
+ *
+ * COUNTED FROM INVOCATIONS, NOT FROM TEXT (#1485). The pre-fix rule was
+ * "if the command contains any `$`/backtick/brace, count EVERY `gh` word", which
+ * is what closed the spliced-verb family — and what refused two read-only
+ * `gh run view` calls ("This command contains more than one `gh pr merge`")
+ * because a `grep -viE "^\s*$"` elsewhere supplied the construct. A word is now
+ * counted only when the verb it selects can be a MERGE:
+ *
+ *   1. the word reads `gh` (quote/ANSI-C splices resolved), or is construct-bearing
+ *      where the command word belongs — then
+ *   2. the next word reads `pr`, or is construct-bearing (a spliced `pr`), and
+ *   3. the word after that reads `merge`, or is construct-bearing (a spliced verb),
+ *      or is NOT a readable subcommand word at all (the residue left by the
+ *      repo-flag stripper: `gh pr x) merge 999`).
+ *
+ * A word in POSITION 2 that reads a real non-merge subcommand (`gh run view`,
+ * `gh api …`, `gh pr view/list/checks`) makes the invocation provably NOT a
+ * merge — the only reading this function is allowed to be precise about, because
+ * no `gh` subcommand other than `pr merge` can merge a PR. Everything unreadable
+ * still counts, so the fail-closed direction is unchanged.
+ *
+ * Tokens wholly inside a quoted DATA region are skipped (`dataCharMask`), so a
+ * mention in a jq filter, a grep pattern, a PR body or an interpreter payload is
+ * not an invocation; `sh -c`/`eval`/`trap` payloads and a fully-quoted command
+ * name stay readable, which is what keeps those real merges counted.
  */
 export function countMergeVerbs(command: string): number {
-  // This MUST use the same recognizer the gate uses (`isGhWordAt`), not a second
-  // regex. Cycle-2 review: a regex here counted 1 for
+  // This MUST use the same recognizer the gate uses (`isGhWordAt` … here, the
+  // same `shellWord`/`CONSTRUCT` reads), not a second regex. Cycle-2 review: a
+  // regex here counted 1 for
   // `gh pr merge 111 --admin; sh -c 'gh pr merge 999 --admin'` — the second verb
   // is wrapped, so it did not match — the `> 1` fail-closed guard was skipped and
   // 999 merged unevidenced. Two disagreeing predicates is the exact failure this
   // file keeps re-learning (VGATE round 9), so the count walks the same tokens.
   const scan = scanTokens(command);
-  // A construct-SPLICED verb (`gh pr $'merge' 999`, `gh p$'r' merge 999`) dequotes
-  // to a residue, so an exact `dequote(tok) === "merge"` test does not see it and
-  // the compound guard was skipped — the second PR merged unevidenced (cycle-3
-  // review P0). When the text carries any unresolvable construct, every
-  // command-position `gh` is counted CONSERVATIVELY: this count is only ever used
-  // as `> 1` on a command already known to be an admin merge, so an over-count
-  // costs a retry while an under-count is an unevidenced merge.
-  const unresolvable = hasUnresolvableConstruct(command);
+  const data = dataCharMask(scan);
+  const isData = (i: number) => isDataToken(scan, data, i);
+  const nextReadable = (i: number): number => {
+    let k = i;
+    while (k < scan.tokens.length && isData(k)) k++; // a data run is not an argv slot
+    return k;
+  };
   let n = 0;
   for (let i = 0; i < scan.tokens.length; i++) {
-    if (!isGhWordAt(scan, i)) continue;
-    if (unresolvable) {
-      n++;
-      continue;
-    }
-    if (dequote(scan.tokens[i + 1] ?? "") !== "pr") continue;
-    if (dequote(scan.tokens[i + 2] ?? "") !== "merge") continue;
+    if (isData(i)) continue;
+    const word = shellWord(scan.tokens[i]);
+    // 1. the gh word: readable as `gh`, or a construct where the command word
+    // belongs (`$G pr merge 999`, `$'gh' pr merge 999`).
+    if (word !== "gh" && !CONSTRUCT.test(scan.tokens[i])) continue;
+    const ai = nextReadable(i + 1);
+    const bi = nextReadable(ai + 1);
+    if (ai >= scan.tokens.length) continue;
+    const aTok = scan.tokens[ai];
+    const a = shellWord(aTok);
+    // 2. the group: `pr`, or a spliced one (`gh p$'r' merge`, `gh ${X}pr merge`).
+    if (a !== "pr" && !CONSTRUCT.test(aTok)) continue;
+    if (bi >= scan.tokens.length) continue;
+    const bTok = scan.tokens[bi];
+    const b = shellWord(bTok);
+    // 3. the verb: `merge`, a spliced one (`gh pr $'merge'`, `gh pr ${X}merge`),
+    // a residue that is no subcommand at all (`gh pr x) merge 999`, the repo-flag
+    // stripper's leftovers), or a readable word that is simply not a subcommand
+    // and is followed by `merge` (`gh pr x merge 999` — the same residue split by
+    // a `)`). A construct at the GROUP position already ends the window: the
+    // tokens of one brace expansion are not three invocations.
+    const nextAfterB = scan.tokens[nextReadable(bi + 1)];
+    const isMerge =
+      b === "merge" ||
+      CONSTRUCT.test(bTok) ||
+      (a === "pr" && (!SUBCOMMAND_WORD.test(b) || shellWord(nextAfterB ?? "") === "merge"));
+    if (!isMerge) continue;
     n++;
+    // One window per invocation: without this, the tokens of a splice
+    // (`gh ${X}pr merge` → `gh`, `$`, `X}pr`, `merge`) each open their own
+    // window and one merge is counted two or three times — an over-count that
+    // would refuse a SINGLE admin merge as "more than one".
+    i = bi;
   }
   return n;
 }
@@ -3054,10 +3393,15 @@ export default function (pi: ExtensionAPI) {
       if (isAdminMergeCommand(command) &&
           (hasLiteralAdminFlag(command) || mergeVerbInText(command) ||
            !readsNonMergeGhCall(command) || !ghShimWillEnforce(shimDir))) {
+        // #1485: count INVOCATIONS, not text. The count skips quoted data, so a
+        // mention in a jq filter / grep pattern / PR body / interpreter payload no
+        // longer inflates it (measured: two read-only `gh run view` calls plus
+        // `grep -viE "^\s*$"` were refused as "more than one `gh pr merge`").
+        const merges = countMergeVerbs(command);
         // P1 (fresh review): a compound command is judged against ONE PR, so
         // `gh pr merge 111 --admin; gh pr merge 999 --admin` would pass on 111
         // and then merge 999 unevidenced. Fail closed.
-        if (countMergeVerbs(command) > 1) {
+        if (merges > 1) {
           console.log("[review-enforcer] 🚫 Admin-merge evidence gate blocked (compound merge)");
           logGateEvent("merge_gate_block", { reason: "admin_merge_compound_command" });
           return {
@@ -3068,30 +3412,51 @@ export default function (pi: ExtensionAPI) {
               "evidenced. Run them as separate commands.",
           };
         }
-        const adminPr = extractMergePrNumber(command);
-        // #426 context resolution, reuse: --repo / GH_REPO / cd / fallback.
-        const adminCtx = resolveRepoContext(command, null);
-        const adminHead = adminPr !== null ? await getPrHeadSha(adminPr, adminCtx) : null;
-        const adminComments =
-          adminPr !== null && adminHead !== null ? getPrComments(adminPr, adminCtx) : null;
-        const adminOverride = _adminMergeOverride();
-        const adminResult = evaluateAdminMergeGate(
-          adminPr, adminHead, adminComments, adminOverride
-        );
-        if (adminResult.status === "block") {
-          console.log("[review-enforcer] 🚫 Admin-merge evidence gate blocked");
-          logGateEvent("merge_gate_block", {
+        // #1485: ZERO merge invocations, and the argv scan POSITIVELY read every
+        // `gh` in the command as a non-merge subcommand — there is no merge for an
+        // evidence gate to certify, so the candidate came from DATA (a payload, a
+        // jq filter, a PR body). Polarity is `readsNonMergeGhCall`'s: a command
+        // whose gh invocations this scan cannot read (a construct outside a data
+        // region, a `$P/g''h` path, an unresolvable verb) stays gated below.
+        //
+        // #1485 review (P0, reproduced): standing down is only sound while the
+        // argv layer is INSTALLED, because that is what still sees a merge this
+        // text scan mis-read as data (`timeout 5 sh -c '<payload>'`, a payload in
+        // a prefix the data model does not know). With the shim off — a supported
+        // state (`AGENT_GH_SHIM=0`) — nothing downstream would catch it, so the
+        // previous conservative refusal is kept instead of a stand-down. Same
+        // guard, same reason as the #1776 deferral above.
+        if (merges === 0 && readsNonMergeGhCall(command) && ghShimWillEnforce(shimDir)) {
+          console.log(
+            "[review-enforcer] ✅ Admin-merge evidence gate: no merge invocation (mention only) — allowed"
+          );
+          logGateEvent("merge_gate_pass", { reason: "admin_merge_no_invocation" });
+        } else {
+          const adminPr = extractMergePrNumber(command);
+          // #426 context resolution, reuse: --repo / GH_REPO / cd / fallback.
+          const adminCtx = resolveRepoContext(command, null);
+          const adminHead = adminPr !== null ? await getPrHeadSha(adminPr, adminCtx) : null;
+          const adminComments =
+            adminPr !== null && adminHead !== null ? getPrComments(adminPr, adminCtx) : null;
+          const adminOverride = _adminMergeOverride();
+          const adminResult = evaluateAdminMergeGate(
+            adminPr, adminHead, adminComments, adminOverride
+          );
+          if (adminResult.status === "block") {
+            console.log("[review-enforcer] 🚫 Admin-merge evidence gate blocked");
+            logGateEvent("merge_gate_block", {
+              pr: adminPr,
+              reason: "admin_merge_no_evidence",
+              command: auditCommand(command), // #1492: the refused command, not just the reason
+            });
+            return { block: true, reason: adminResult.reason };
+          }
+          console.log(adminResult.message);
+          logGateEvent("merge_gate_pass", {
             pr: adminPr,
-            reason: "admin_merge_no_evidence",
-            command: auditCommand(command), // #1492: the refused command, not just the reason
+            reason: adminOverride ? "admin_merge_override" : "admin_merge_evidence_ok",
           });
-          return { block: true, reason: adminResult.reason };
         }
-        console.log(adminResult.message);
-        logGateEvent("merge_gate_pass", {
-          pr: adminPr,
-          reason: adminOverride ? "admin_merge_override" : "admin_merge_evidence_ok",
-        });
       }
 
       // #138: merge registry gate runs FIRST for `gh pr merge` commands.

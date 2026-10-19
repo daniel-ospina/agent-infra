@@ -368,12 +368,30 @@ exec "$(command -v tmux)" -L "$SOCK" -f /dev/null "\$@"
 EOF
   chmod +x "$T/bin/tmux-real"
   "$T/bin/tmux-real" new-session -d -c "$W_TM" "sleep 300" >/dev/null 2>&1
-  sleep 1
+  # ⛔ POLL, never a fixed sleep. A `new-session` returns before the server has published its pane
+  # table, so a loaded host (the cell runs a controller beside this suite) makes the pane invisible
+  # to the reaper's probe: it then falls through to `live-cwd` (the pane's `sleep` IS a real holder),
+  # keeps the env for a DIFFERENT reason, and the assertion below fails on a healthy system.
+  # Measured on cell-3 while rebasing this suite (2 of 90 red, green on every re-run). The poll is
+  # bounded so a genuinely absent pane still fails the assertion rather than hanging the suite.
+  wait_for_pane() { # wait_for_pane <present|absent> <socket>
+    local want="$1" i
+    for i in $(seq 1 100); do
+      if [ "$want" = present ]; then
+        "$T/bin/tmux-real" list-panes -a >/dev/null 2>&1 && return 0
+      else
+        "$T/bin/tmux-real" list-panes -a >/dev/null 2>&1 || return 0
+      fi
+      sleep 0.1
+    done
+    return 1
+  }
+  wait_for_pane present || bad "the private tmux server never published a pane"
   out="$(PS_BIN=/bin/ps LSOF_BIN="$LSOF_REAL" TMUX_BIN="$T/bin/tmux-real" REAP_VENV_LOG="$T/reap-real.log" bash "$REAPER" --worktree "$W_TM" --apply 2>&1)"
   assert_contains "$out" "KEEP live-tmux-pane" "the real pane is the deciding witness"
   exists "$W_TM/.venv" "the env survives while the lane's pane lives"
   "$T/bin/tmux-real" kill-server >/dev/null 2>&1
-  sleep 1
+  wait_for_pane absent || bad "the private tmux server did not stop"
   out="$(PS_BIN=/bin/ps LSOF_BIN="$LSOF_REAL" TMUX_BIN="$T/bin/tmux-real" REAP_VENV_LOG="$T/reap-real.log" bash "$REAPER" --worktree "$W_TM" --apply 2>&1)"
   assert_contains "$out" "REAP lane-exited" "with the pane gone the lane reads dead"
   absent "$W_TM/.venv" "and the env is reclaimed"

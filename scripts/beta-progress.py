@@ -47,14 +47,55 @@ TTL = 1800  # was 3600; halved so the worst-case lag is 30m, at ~2x the API cost
 #      ("cannot find the real gh"), so the loop's telemetry silently zeroed while
 #      the same command worked in an interactive shell. These calls are READ-ONLY
 #      telemetry, not merges, so pin the real binary and drop the PATH dependency.
-_GH_CANDIDATES = ("/Users/danielospina/bin/gh", "/opt/homebrew/bin/gh", "/usr/local/bin/gh")
-GH = next((p for p in _GH_CANDIDATES if os.path.exists(p)), "gh")
+# ⛔ NO ABSOLUTE HOME PATH: `~/bin/gh` is the binary #1872 pinned, and expanduser builds the same
+# path without hard-coding another user's home in shipped code.
+_GH_CANDIDATES = (os.path.expanduser("~/bin/gh"), "/opt/homebrew/bin/gh", "/usr/local/bin/gh")
+
+
+# ⛔ ALSO PREFER THE HARNESS'S OWN gh LAYER (#1988) — derived from `$O`, never from PATH. These are
+# the highest-volume READS on the shared GitHub bucket; going through the layer is what stops them
+# bypassing its serialisation/backoff. ⛔ THE LAYER then resolves the real gh by WALKING PATH, so
+# "#1872 cannot come back" is false: the pin is passed THROUGH the layer below
+# (`GH_REST_REAL_GH`/`GH_LIMIT_REAL_GH`), so these readers keep calling the binary #1872 chose for
+# them and still get the layer.
+def _gh_bin():
+    o = os.environ.get("O", "")
+    if o:
+        # ⛔ ORDER: `gh-rest` FIRST, matching every shell call site (`orch-loop.sh`: "adapter last so
+        # `$O/gh-rest` wins where it exists"). The adapter is what serves a GraphQL refusal over REST
+        # (#1959); preferring the non-translating wrapper here made these readers fail exactly as they
+        # did before that fix while the same box's shell calls took the other transport.
+        for c in (os.path.join(o, "gh-rest", "gh"), os.path.join(o, "gh-limit", "gh")):
+            if os.path.isfile(c) and os.access(c, os.X_OK):
+                return c
+    # `isfile` + X_OK, never `exists`: a DIRECTORY at a candidate path would be selected and then
+    # raise from `subprocess.run` (or, worse, answer as "gh not found" — the same trap the fail-open
+    # walks had; found in review round 7).
+    return next((p for p in _GH_CANDIDATES
+                 if os.path.isfile(p) and os.access(p, os.X_OK)), "gh")
+
+
+GH = _gh_bin()
+# Hand the layer the binary #1872 pinned (empty when we are not going through a layer).
+_PIN = next((p for p in _GH_CANDIDATES
+             if os.path.isfile(p) and os.access(p, os.X_OK)), None)   # a DIRECTORY is not a pin
+GH_LAYER_ENV = ({"GH_REST_REAL_GH": _PIN, "GH_LIMIT_REAL_GH": _PIN}
+                if _PIN and GH.endswith(("/gh-rest/gh", "/gh-limit/gh")) else {})
+
+
+# ⛔ THE LAYER MUST NOT SLEEP INSIDE THIS PROCESS (#1988). The heartbeat bounds this refresh (90/120 s)
+# while the layer's first documented backoff is 60 s: an in-call wait outlives the caller, and the
+# caller is killed before the layer can say why — a rate-limited box then reports UNKNOWN/STALL
+# instead of the RATE-LIMITED verdict it can prove. NO_WAIT makes the layer record the limit and
+# return at once, so this process's own deferral takes over. Children only.
+os.environ.setdefault("GH_LIMIT_NO_WAIT", "1")
 
 
 def gh(*args):
     """Return parsed JSON, or None on ANY failure. None means UNKNOWN, never empty."""
     try:
-        r = subprocess.run([GH, *args], capture_output=True, text=True, timeout=120)
+        r = subprocess.run([GH, *args], capture_output=True, text=True, timeout=120,
+                           env={**os.environ, **GH_LAYER_ENV} if GH_LAYER_ENV else None)
     except Exception:
         return None
     if r.returncode != 0:
