@@ -275,7 +275,7 @@ python3 "$TORTOISE"/tools/collision_preflight.py "$ISSUE_NUMBER" --repo "$REPO_A
 |------|-----------|
 | Low (docs, config, 1-2 files) | Plain branch inside a worktree; in a hub, create the worktree first (#626). |
 | Medium (3+ files, shared infrastructure) | Worktree recommended. Plain branch OK for single-file. |
-| High (multi-system, migrations, auth) | Worktree required. Hub dirty → `bash scripts/checkout-hygiene/hub-worktree.sh salvage feat/issue-{N}-{slug}` (in-hub `git stash push` is M4-blocked); inside a worktree, stash your own changes. |
+| High (multi-system, migrations, auth) | Worktree required. Hub dirty → `bash scripts/checkout-hygiene/hub-worktree.sh salvage feat/issue-{N}-{slug}` (in-hub `git stash push` is M4-blocked); inside a worktree, **do not stash** — `refs/stash` is shared by every worktree of the repo (#1264) — make a WIP commit on your own branch instead. |
 
 **Never start on main/master regardless of risk.**
 
@@ -288,7 +288,7 @@ python3 "$TORTOISE"/tools/collision_preflight.py "$ISSUE_NUMBER" --repo "$REPO_A
 > only when you are ALREADY inside a worktree; in a hub, create an isolated worktree first
 > (using-git-worktrees skill; agent-infra: `bash scripts/checkout-hygiene/hub-worktree.sh feat/issue-<N>-<slug>`).
 1. Run `git status --porcelain` to check for uncommitted changes
-2. If the HUB is dirty (uncommitted changes on main): `git stash push` is BLOCKED there — the M4 hub-disorder gate sanctions only recovery verbs, and `stash` is not one. Use the dirty-hub salvage path instead: `bash scripts/checkout-hygiene/hub-worktree.sh salvage feat/issue-{N}-{slug}` (README #435). Inside a worktree there is no "changes on main" to stash.
+2. If the HUB is dirty (uncommitted changes on main): `git stash push` is BLOCKED there — the M4 hub-disorder gate sanctions only recovery verbs, and `stash` is not one. Use the dirty-hub salvage path instead: `bash scripts/checkout-hygiene/hub-worktree.sh salvage feat/issue-{N}-{slug}` (README #435). Inside a worktree there is no "changes on main" to stash — and a worktree stash is **not** lane-scoped either: `refs/stash` is shared by every worktree of the repo, so a bare `git stash pop` can take a peer lane's work (#1264 — see using-git-worktrees → "The stash register is SHARED by every worktree"). Use a WIP commit on your own branch.
 3. Create the branch INSIDE a worktree — invoke `using-git-worktrees` (agent-infra:
    `bash scripts/checkout-hygiene/hub-worktree.sh feat/issue-<N>-<slug>`). Do NOT run
    `git checkout -b` in a hub — it is BLOCKED (#626).
@@ -816,7 +816,7 @@ Do not leave `implementing` on issues where work is not actively progressing.
 ## Integration
 
 **Required workflow skills:**
-- **using-git-worktrees** — MANDATORY: always invoked in Step 0; NEVER `git stash` in the hub (the M4 dirty-hub gate blocks it — use the `#435` salvage path); stash only inside a worktree.
+- **using-git-worktrees** — MANDATORY: always invoked in Step 0; NEVER `git stash` in the hub (the M4 dirty-hub gate blocks it — use the `#435` salvage path), and never a bare `git stash pop|apply` in a linked worktree either (`refs/stash` is shared by every worktree of the repo — a peer lane's work can be taken and their ref dropped, #1264; use a WIP commit on your own branch).
 - **writing-plans** — Creates the plan this skill executes
 - **commit-workflow** — Complete development after all tasks (Step 6)
 ---
