@@ -6439,6 +6439,50 @@ test("#2148: NO message this extension prints spells the recorder as a bare or r
   ok(reasons[0].includes("clean [owner/repo] --evidence"), "the standard message still names the clean invocation");
 });
 
+test("#2148: every record command in the SOURCE carries the home path and, for clean, --evidence", () => {
+  // ⛔ A SIX-INPUT PIN DOES NOT COVER THE EMITTED SET (review of #2148, P2). Two branches
+  // (`clean-low` base-moved, `base_advanced`) printed a FRESH `clean` without `--evidence` while
+  // this file's runtime test was green, because those inputs were never supplied — and one of the
+  // six returned `failopen`, so its text was never inspected at all. The durable form is a SOURCE
+  // scan: every line that prints a record command must use the home-path constant, and any line
+  // that prints a `clean` invocation must carry `--evidence` (or name it for the dynamic verdict).
+  const src = fs.readFileSync(new URL("./index.ts", import.meta.url), "utf8").split("\n");
+  const recordLines = src
+    .map((line, i) => ({ line, i: i + 1 }))
+    .filter(({ line }) => line.includes("record-review.sh") || line.includes("${RECORD_SH}"))
+    .filter(({ line }) => {
+      const t = line.trim();
+      if (t.startsWith("//") || t.startsWith("*") || t.startsWith("/*")) return false;
+      // A TRAILING comment is not an emitted string: skip when the `//` precedes the token.
+      const tokenAt = Math.min(
+        ...["record-review.sh", "${RECORD_SH}"]
+          .map((tok) => line.indexOf(tok))
+          .filter((i) => i >= 0),
+      );
+      const commentAt = line.indexOf("//");
+      return commentAt === -1 || commentAt > tokenAt;
+    });
+  // Non-vacuity: the scan must actually see the record commands.
+  ok(recordLines.length >= 10, `the scan sees the record-command lines (found ${recordLines.length})`);
+  for (const { line, i } of recordLines) {
+    if (line.includes("resolvePath") || line.includes("RECORD_SH =")) continue;
+    ok(
+      line.includes("${RECORD_SH}") || line.includes("~/.pi/agent/scripts/record-review.sh"),
+      `index.ts:${i} names the recorder by the home path (not bare, not repo-relative)`,
+    );
+    // A `clean` invocation needs the evidence flag — unless the verdict is interpolated, in which
+    // case the SAME line must say the flag is needed for clean (the message cannot branch on it
+    // without re-literalising the verdict vocabulary, which the C7 pin forbids).
+    if (/clean \[owner\/repo\]/.test(line) && !/clean-micro|clean-low/.test(line)) {
+      ok(
+        line.includes("--evidence"),
+        `index.ts:${i} prints a clean invocation WITH --evidence (a fresh clean without it exits 3), ` +
+          `which for an interpolated verdict means naming it in the same sentence`,
+      );
+    }
+  }
+});
+
 // ── Summary ───────────────────────────────────────────
 // Run the async factory tests strictly sequentially (they mutate process.env).
 for (const run of pending) await run();

@@ -56,6 +56,16 @@ out="$(
 if declare -f reviewer_preflight_line >/dev/null && declare -f reviewer_brief_section >/dev/null; then rc=0; else rc=1; fi
 ck $rc "the helper exposes reviewer_preflight_line + reviewer_brief_section"
 
+# ONE predicate for "the record command is present, in the spelling that actually mints a record".
+# §A and §E both use it, so the non-vacuity control exercises the SAME pattern it claims to validate
+# (a §E that stripped a DIFFERENT, weaker token proved nothing — review of #2148, P2).
+record_cmd_present() {
+  case "$1" in
+    *"~/.pi/agent/scripts/record-review.sh <PR> <HEAD> clean [owner/repo] --evidence comment:"*) return 0;;
+    *) return 1;;
+  esac
+}
+
 echo
 echo "§A the disclosure line"
 LINE="$(reviewer_preflight_line self)"
@@ -66,8 +76,7 @@ case "$LINE" in
   *) rc=1;;
 esac; ck $rc "…and states the requirement in the one wording the pi side uses (drift-pinned)"
 case "$LINE" in *"task(prompt='[REVIEW]"*) rc=0;; *) rc=1;; esac; ck $rc "…naming the dispatch command"
-case "$LINE" in *"~/.pi/agent/scripts/record-review.sh <PR> <HEAD> clean [owner/repo] --evidence comment:"*) rc=0;; *) rc=1;; esac
-ck $rc "…naming the record command WITH --evidence (a fresh 'clean' without it is refused, tortoise#7391)"
+record_cmd_present "$LINE"; ck $? "…naming the record command WITH --evidence (a fresh 'clean' without it is refused, tortoise#7391)"
 # ⛔ THE PATH MUST BE THE HOME COPY (fresh review, P1). This line is printed inside a lane whose cwd
 # is a CONTENT repo, which has no `scripts/record-review.sh`; the production copy is farmed into
 # ~/.pi/agent/scripts (that is where merge-one.sh runs it from). A repo-relative path is correct ONLY
@@ -181,7 +190,7 @@ echo "§D the brief template a controller copies"
 [ -f "$TEMPLATE" ]; ck $? "templates/LANE-BRIEF.md exists"
 grep -q 'must dispatch a reviewer and record an attestation at the final head before the rail' "$TEMPLATE" 2>/dev/null
 ck $? "the template states the requirement verbatim"
-grep -qF 'scripts/record-review.sh <PR> <HEAD> clean [owner/repo] --evidence comment:' "$TEMPLATE" 2>/dev/null
+grep -qF '~/.pi/agent/scripts/record-review.sh <PR> <HEAD> clean [owner/repo] --evidence comment:' "$TEMPLATE" 2>/dev/null
 ck $? "…names the record command WITH --evidence (the invocation that actually mints a record)"
 grep -q 'scripts/admin-merge.sh <PR>' "$TEMPLATE" 2>/dev/null; ck $? "…names the rail command"
 grep -q '## Reviewer step' "$TEMPLATE" 2>/dev/null; ck $? "…and carries it as its own section, not a footnote"
@@ -190,9 +199,14 @@ echo
 echo "§E non-vacuity — the checks above can fail"
 # A disclosure with the commands STRIPPED must fail the §A assertions. Without this control, a
 # `case` that never matches (a typo'd pattern) would read as green forever.
-STRIPPED="$(printf '%s\n' "$LINE" | sed 's/scripts\/record-review.sh//')"
-case "$STRIPPED" in *"scripts/record-review.sh"*) rc=1;; *) rc=0;; esac
-ck $rc "the command assertion FIRES when the command is removed"
+STRIPPED="$(printf '%s\n' "$LINE" | sed 's#~/.pi/agent/scripts/record-review.sh##')"
+record_cmd_present "$STRIPPED"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "the command assertion FIRES when the script path is removed"
+# The flag is part of the invocation, so the control must strip the FLAG too — the defect that
+# actually shipped once was a command that named the script and omitted `--evidence`.
+NOFLAG="$(printf '%s\n' "$LINE" | sed 's# --evidence comment:<review-comment-id>##')"
+record_cmd_present "$NOFLAG"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "…and when --evidence is removed (the defect that shipped)"
 # ...and the "one line" assertion fires on a two-line disclosure.
 TWO_LINE="$(printf '%s\n%s' "$LINE" extra)"
 [ "$(printf '%s\n' "$TWO_LINE" | wc -l | tr -d ' ')" = "1" ]; rc=$?

@@ -3,8 +3,9 @@
 #
 # SOURCEABLE, no side effects. Two outputs, and they are the whole surface:
 #
-#   reviewer_preflight_line [self|harness]   → ONE line: what must happen, and the exact commands
-#   reviewer_brief_section [self|harness]    → the brief section that carries the step
+#   reviewer_preflight_line [self|harness|reviewer]  → ONE line: what must happen, and the commands
+#   reviewer_brief_section [self|harness]            → the brief section that carries the step
+#     (`reviewer` has no brief section by design: merge-one.sh composes that session's prompt)
 #
 # WHY (agent-infra#2148, measured 2026-10-19 on cell-2). Three lanes rebased, implemented, tested,
 # pushed and opened their PRs, and were then stopped by the review-enforcer:
@@ -17,7 +18,7 @@
 # code and in nothing the lane could read before it started, so every new brief author rediscovered
 # it by being blocked — a full lane-run of an 8-CPU box discarded at the last step.
 #
-# THE TWO ROLES, because "who dispatches the reviewer" is not the same in both harness paths:
+# THE THREE ROLES, because "who dispatches the reviewer" is not the same in every harness path:
 #   self     the lane lands its own PR through the rail (a controller-written brief, e.g. the
 #            one this repo's controllers hand to a cell lane). The LANE dispatches, fixes, records
 #            at the current head, then runs the rail.

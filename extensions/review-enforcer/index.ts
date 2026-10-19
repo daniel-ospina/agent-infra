@@ -18,7 +18,8 @@ import {
   parseCdChains,
   unquotedMask,
   type CdChainInfo,
-} from "../shared/git-command-parse.js";import * as fs from "fs";
+} from "../shared/git-command-parse.js";
+import * as fs from "fs";
 import * as os from "os";
 import { resolve as resolvePath, dirname } from "path";
 import { fileURLToPath } from "url";
@@ -2052,22 +2053,22 @@ export function evaluateMergeGate(
           "✅ Review enforcement (merge registry) gate is working correctly.",
           `❌ No review record found for PR #${pr} — the code-review gate has not recorded a clean review.`,
           "   → The parent session must record the review for the PR's tier:",
-          "   → Micro issue (complexity:micro): ~/.pi/agent/scripts/record-review.sh <PR> <head_sha> clean-micro [owner/repo]",
-          "   → Content-only diff (docs/ with a content extension, or a named root prose file — any tier): ~/.pi/agent/scripts/record-review.sh <PR> <head_sha> clean-low [owner/repo]",
+          `   → Micro issue (complexity:micro): ${RECORD_SH} <PR> <head_sha> clean-micro [owner/repo]`,
+          `   → Content-only diff (docs/ with a content extension, or a named root prose file — any tier): ${RECORD_SH} <PR> <head_sha> clean-low [owner/repo]`,
           // #2148 review: `--evidence` is part of the `clean` invocation — `record-review.sh` refuses a
           // FRESH clean without it (tortoise#7391, exit 3). A refusal that names a command which then
           // exits 3 hands the lane a second dead end at the moment it tries to land.
-          "   → Standard/complex issue: run the code-review skill, then ~/.pi/agent/scripts/record-review.sh <PR> <head_sha> clean [owner/repo] --evidence comment:<review-comment-id>",
+          `   → Standard/complex issue: run the code-review skill, then ${RECORD_SH} <PR> <head_sha> clean [owner/repo] --evidence comment:<review-comment-id>`,
           "   → The bypass flag does NOT unlock sub-agent merges (#285).",
         ]
       : [
           "✅ Review enforcement (merge registry) gate is working correctly.",
           `❌ No review record found for PR #${pr} — the code-review gate has not recorded a clean review.`,
           "   → Micro issue (complexity:micro): complete the micro flow (pre-flight + a review dispatch naming the diff), then",
-          "   →   ~/.pi/agent/scripts/record-review.sh <PR> <head_sha> clean-micro [owner/repo]",
-          "   → Content-only diff (docs/ with a content extension, or a named root prose file — any tier, no code paths): ~/.pi/agent/scripts/record-review.sh <PR> <head_sha> clean-low [owner/repo]",
+          `   →   ${RECORD_SH} <PR> <head_sha> clean-micro [owner/repo]`,
+          `   → Content-only diff (docs/ with a content extension, or a named root prose file — any tier, no code paths): ${RECORD_SH} <PR> <head_sha> clean-low [owner/repo]`,
           "   → Standard/complex issue: run the code-review skill (Step 10 records clean on convergence), post its verdict as a PR comment, then",
-          "   →   ~/.pi/agent/scripts/record-review.sh <PR> <head_sha> clean [owner/repo] --evidence comment:<review-comment-id>",
+          `   →   ${RECORD_SH} <PR> <head_sha> clean [owner/repo] --evidence comment:<review-comment-id>`,
           "   → Emergency: set AGENT_SKIP_REVIEW_GATE=1 (or ELDATO_SKIP_REVIEW_GATE=1) and restart to bypass all gates.",
         ];
     return {
@@ -2082,9 +2083,9 @@ export function evaluateMergeGate(
       status: "block",
       reason: [
         `❌ Review record for PR #${pr} has verdict "${record.verdict}" — only ${ACCEPTED_VERDICTS.map((v) => `"${v}"`).join(", ")} unlocks a merge.`,
-        "   → Micro issue (complexity:micro): re-record via the micro flow: ~/.pi/agent/scripts/record-review.sh <PR> <head_sha> clean-micro [owner/repo]",
-        "   → Content-only diff (docs/ with a content extension, or a named root prose file — any tier): ~/.pi/agent/scripts/record-review.sh <PR> <head_sha> clean-low [owner/repo]",
-        "   → Standard/complex issue with any code path: run the code-review skill, post its verdict as a PR comment, then ~/.pi/agent/scripts/record-review.sh <PR> <head_sha> clean [owner/repo] --evidence comment:<review-comment-id>",
+        `   → Micro issue (complexity:micro): re-record via the micro flow: ${RECORD_SH} <PR> <head_sha> clean-micro [owner/repo]`,
+        `   → Content-only diff (docs/ with a content extension, or a named root prose file — any tier): ${RECORD_SH} <PR> <head_sha> clean-low [owner/repo]`,
+        `   → Standard/complex issue with any code path: run the code-review skill, post its verdict as a PR comment, then ${RECORD_SH} <PR> <head_sha> clean [owner/repo] --evidence comment:<review-comment-id>`,
       ].join("\n"),
     };
   }
@@ -2109,7 +2110,8 @@ export function evaluateMergeGate(
           `❌ Could not verify head of PR #${pr} via gh (repo context: ${ctx.source}) — head verification is mandatory for sub-agent merges.`,
           "   → The sub-agent cannot complete the merge ceremony here.",
           "   → Return to the parent session: it records the review and runs the merge interactively.",
-          `   →   ~/.pi/agent/scripts/record-review.sh <PR> <head_sha> ${record.verdict} [owner/repo]`,
+          `   →   ${RECORD_SH} <PR> <head_sha> ${record.verdict} [owner/repo]` +
+          " (a clean verdict also needs --evidence comment:<review-comment-id>; clean-low/clean-micro do not)",
           "   → The #138 fail-open (merge without head verification) is interactive-only; sub-agent merges are fail-closed (#285).",
         ].join("\n"),
       };
@@ -2123,9 +2125,9 @@ export function evaluateMergeGate(
     const advice =
       ctx.source === "fallback" && !ctx.repo
         ? "The repo could not be resolved (no --repo/GH_REPO/cd, and the session cwd is not a GitHub worktree). If this PR is in " +
-          `another repo, re-record with repo info — ~/.pi/agent/scripts/record-review.sh <PR> <head_sha> ${record.verdict} owner/repo — ` +
+          `another repo, re-record with repo info — ${RECORD_SH} <PR> <head_sha> ${record.verdict} owner/repo — ` +
           "or pass --repo owner/repo to gh pr merge."
-        : `If this persists, re-record with repo info — ~/.pi/agent/scripts/record-review.sh <PR> <head_sha> ${record.verdict} owner/repo — ` +
+        : `If this persists, re-record with repo info — ${RECORD_SH} <PR> <head_sha> ${record.verdict} owner/repo — ` +
           "or pass --repo owner/repo to gh pr merge.";
     return {
       status: "failopen",
@@ -2189,8 +2191,8 @@ export function evaluateMergeGate(
     // The shape has to be re-derived, not carried forward.
     const reRecordAdvice =
       record.verdict === "clean-low"
-        ? "   → The branch moved — the certified diff no longer exists, so the shape must be re-derived: re-check whether the NEW head is still content-only, then re-record with the verdict named explicitly (~/.pi/agent/scripts/record-review.sh <PR> <head_sha> clean-low [owner/repo]); if it is no longer content-only, run the code-review skill and record clean (~/.pi/agent/scripts/record-review.sh <PR> <head_sha> clean [owner/repo] --evidence comment:<review-comment-id>)."
-        : `   → The branch moved — re-review the new head, post its verdict as a PR comment, and re-record at the same verdict: ~/.pi/agent/scripts/record-review.sh <PR> <head_sha> ${record.verdict} [owner/repo] (a clean verdict also needs --evidence comment:<review-comment-id>; clean-low/clean-micro do not)`;
+        ? `   → The branch moved — the certified diff no longer exists, so the shape must be re-derived: re-check whether the NEW head is still content-only, then re-record with the verdict named explicitly (${RECORD_SH} <PR> <head_sha> clean-low [owner/repo]); if it is no longer content-only, run the code-review skill and record clean (${RECORD_SH} <PR> <head_sha> clean [owner/repo] --evidence comment:<review-comment-id>).`
+        : `   → The branch moved — re-review the new head, post its verdict as a PR comment, and re-record at the same verdict: ${RECORD_SH} <PR> <head_sha> ${record.verdict} [owner/repo] (a clean verdict also needs --evidence comment:<review-comment-id>; clean-low/clean-micro do not)`;
     return {
       status: "block",
       reason: [
@@ -2248,9 +2250,9 @@ export function evaluateMergeGate(
           "   the merge base is the commit that identifies its content. One side could not be read",
           "   (a gh/API failure, an unreachable fork head, or a hand-minted record).",
           "   → Re-record once the base is readable, naming the verdict explicitly:",
-          "   →   ~/.pi/agent/scripts/record-review.sh <PR> <head_sha> clean-low [owner/repo]",
+          `   →   ${RECORD_SH} <PR> <head_sha> clean-low [owner/repo]`,
           "   → If the diff is no longer content-only, run the code-review skill and record clean:",
-          "   →   ~/.pi/agent/scripts/record-review.sh <PR> <head_sha> clean [owner/repo]",
+          `   →   ${RECORD_SH} <PR> <head_sha> clean [owner/repo] --evidence comment:<review-comment-id>`,
         ].join("\n"),
       };
     }
@@ -2265,9 +2267,9 @@ export function evaluateMergeGate(
           "   diff is no longer the diff that would merge — at the SAME head sha.",
           "   → Re-check whether the current diff is still content-only, then re-record with the",
           "     verdict named explicitly:",
-          "   →   ~/.pi/agent/scripts/record-review.sh <PR> <head_sha> clean-low [owner/repo]",
+          `   →   ${RECORD_SH} <PR> <head_sha> clean-low [owner/repo]`,
           "   → Otherwise run the code-review skill and record clean:",
-          "   →   ~/.pi/agent/scripts/record-review.sh <PR> <head_sha> clean [owner/repo]",
+          `   →   ${RECORD_SH} <PR> <head_sha> clean [owner/repo] --evidence comment:<review-comment-id>`,
         ].join("\n"),
       };
     }
@@ -3322,7 +3324,7 @@ export const MICRO_BLOCK_MESSAGE = [
   "   →   task(prompt='[REVIEW] docs-only change — verify claims/consistency against the docs diff; return NO ISSUES FOUND or list issues')",
   "   → Code sets satisfy the dispatch via VGATE: its [VGATE] verification dispatch counts as the required sub-agent dispatch. With VGATE disabled/bypassed, dispatch any lightweight task sub-agent — the gate counts any sub-agent dispatch (the `task` or `subagent` tool).",
   // #2148: micro's record command, so the refusal at the git op also names what the rail will read.
-  "   → Then record the attestation at the FINAL head (micro): ~/.pi/agent/scripts/record-review.sh <PR> <head_sha> clean-micro [owner/repo]",
+  `   → Then record the attestation at the FINAL head (micro): ${RECORD_SH} <PR> <head_sha> clean-micro [owner/repo]`,
   "   → Emergency: set AGENT_SKIP_REVIEW_GATE=1 (or ELDATO_SKIP_REVIEW_GATE=1) and restart to bypass all gates.",
 ].join("\n");
 
@@ -3426,9 +3428,19 @@ export default function (pi: ExtensionAPI) {
       // reviewer requirement BEFORE it does any work. Measured 2026-10-19: three lanes ran
       // their whole job and were refused at the finish line, having never been told. This
       // fires once per session, for EVERY non-sub-agent session — including a BYPASSED one,
-      // where it is not redundant but MORE important: the dispatch gate does not fire there,
-      // so the only thing that will refuse the lane is the merge gate, and no bypass flag
-      // unlocks that (#285).
+      // where it is not redundant but MORE important, and where the enforcer that refuses is NOT
+      // this one: with the flag set, `extensionEnabled` is false and the tool_call handler returns
+      // at the `if (!extensionEnabled)` line — BEFORE `isGitOp` and before the merge-registry gate
+      // at the bottom of the handler (review of #2148, P2: an earlier version of this comment said
+      // "the only thing that will refuse the lane is the merge gate", which is false for a
+      // non-sub-agent). What refuses a bypassed session is the RAIL: `admin-merge.sh` verifies the
+      // head-bound evidence itself, and the repo's required review check (`ai-review-gate`) never
+      // goes green without the signed record. #285's "the bypass does not unlock sub-agent merges"
+      // holds here for a different reason — a task sub-agent is forced to `extensionEnabled = true`
+      // a few lines above, so its merge IS gated locally.
+      //
+      // The emitted sentence ("the rail STILL refuses without an attestation") is about that
+      // outside enforcement and stays true; do not "simplify" it into a claim about this gate.
       //
       // Task sub-agents are excluded by design: review dispatch is parent-enforced (#825), the
       // parent session prints this line for the PR as a whole, and a child's console output is
