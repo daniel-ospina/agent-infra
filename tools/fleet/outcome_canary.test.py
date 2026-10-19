@@ -2238,11 +2238,17 @@ def test_the_GRAPHQL_collector_reads_the_CLOSED_page_AND_a_MERGE_ordered_page():
         check = m.check_pr_merged({"github": dict(gh, open_pr_count=2), "log_events": idle}, cfg)
         assert (check.status, check.variant) == (m.FAIL, "NO_PR_MERGED"), (check.status,
                                                                           check.variant)
-        # …and with NO header at all the same facts are an ABSTENTION, never "the fleet had nothing
-        # in hand" (a wedged controller writes no header, which is the opposite of evidence)
+        # …and with NO header at all `open_pr_count > 0` is STILL a measured FAIL: open PRs are work
+        # in hand "independent of the queue record", and an abstention may only speak about the datum
+        # it could not read. (An earlier revision hoisted the absent-header abstention above this arm
+        # and turned the wedged-controller FAIL into exit 2.)
         no_hdr = m.check_pr_merged({"github": dict(gh, open_pr_count=2)}, cfg)
-        assert (no_hdr.status, no_hdr.variant) == (m.INCONCLUSIVE, "ACTIVITY_UNKNOWN"), \
+        assert (no_hdr.status, no_hdr.variant) == (m.FAIL, "NO_PR_MERGED"), \
             (no_hdr.status, no_hdr.variant)
+        # …while NO header and NO open PRs establishes nothing, and must not read as "nothing in hand"
+        blind = m.check_pr_merged({"github": dict(gh, open_pr_count=0, open_prs=[])}, cfg)
+        assert (blind.status, blind.variant) == (m.INCONCLUSIVE, "ACTIVITY_UNKNOWN"), \
+            (blind.status, blind.variant)
         # (b) a merge inside the window is counted, and the search is bounded by the window's date
         merge_rows["rows"] = [{"number": 1, "mergedAt": inside, "createdAt": inside}]
         gh2 = m.collect_github("o/r", cfg, now=now)
@@ -4457,6 +4463,20 @@ MUTATIONS = [
      "                self.repaired = True\n        except FileNotFoundError:",
      "                pass\n        except FileNotFoundError:",
      "test_a_CORRUPT_per_box_state_record_is_REPAIRED_and_disclosed_not_crashed"),
+    ("the state disclosure reports the dry-run POLICY as the write outcome",
+     '        reported["state_persisted"] = bool(state.persist) and not reported.get("state_error")',
+     '        reported["state_persisted"] = bool(state.persist)',
+     "test_the_state_disclosure_says_what_was_WRITTEN_not_what_was_intended"),
+    ('a missing used_pct is printed as a measured percentage',
+     'else "used_pct not read"',
+     'else "-1.0% used"',
+     'test_a_MISSING_used_pct_is_not_printed_as_measured'),
+    ("the positive-evidence arms are asked after the absent-header abstention",
+     '    if isinstance(gh_open, int) and not isinstance(gh_open, bool) and gh_open > 0:\n'
+     '        return True, "%d open PR(s) — work in hand, independent of the queue record" % gh_open',
+     '    if False:\n'
+     '        return True, "%d open PR(s) — work in hand, independent of the queue record" % gh_open',
+     "test_open_PRs_are_work_in_hand_even_with_NO_cycle_header"),
     # ── cycle-28 defects ──────────────────────────────────────────────────────────────────
     ("CONTROLLER_ABSENT ignores a rejected controller row",
      "    if not pids and near_ours:",
@@ -5467,6 +5487,19 @@ def test_a_STRING_false_headroom_ok_does_not_manufacture_an_OOM():
 
 
 @test
+def test_a_MISSING_used_pct_is_not_printed_as_measured():
+    """`disk.get("used_pct") if ... is not None else -1` printed "-1.0% used" — a percentage nobody
+    measured, on the capacity line an operator reads to decide whether the disk is the problem."""
+    m = load()
+    cfg = m.cfg_from_dict({})
+    v = m.check_headroom({"headroom": {"disk": {"ok": True, "avail_bytes": 400 * (1 << 30),
+                                               "mount": "/"},
+                                       "mem": {"ok": True, "avail_mb": 9000, "source": "d"}}}, cfg)
+    assert "-1.0%" not in v.evidence, v.evidence
+    assert "used_pct not read" in v.evidence, v.evidence
+
+
+@test
 def test_a_frozen_refresh_with_no_header_is_NOT_a_measured_idle():
     """A wedged controller writes no cycle header. `_activity` returned `False` ("the fleet had
     nothing in hand") for that shape, so `pr_created`/`pr_merged` graded the failure to cycle as
@@ -5484,6 +5517,60 @@ def test_a_frozen_refresh_with_no_header_is_NOT_a_measured_idle():
     busy, why = m._activity(d["facts"], cfg=cfg)
     assert busy is None, (busy, why)
     assert "not established" in why, why
+
+
+@test
+def test_open_PRs_are_work_in_hand_even_with_NO_cycle_header():
+    """An abstention may only speak about the datum it could not read. The absent-header return was
+    placed ABOVE the positive-evidence arms, so `open_pr_count: 24` — a plain measured int, and the
+    datum `pr_merged`'s own rationale calls out — became unreachable exactly when the controller was
+    wedged (the shape that writes no header) and the FAIL mattered most. Exit 1 became 2."""
+    m = load()
+    cfg = m.cfg_from_dict({"repo": "o/r"})
+    facts = {"github": {"ok": True, "open_pr_count": 24, "open_prs": [],
+                        "prs_merged_in_window": 0, "prs_created_in_window": 0, "source": "rest"},
+             "log_events": {"headers": [], "dispatch_ok": [], "lane_started": [], "armed": [],
+                            "railed": []}}
+    for check, variant in ((m.check_pr_merged, "NO_PR_MERGED"),
+                           (m.check_pr_created, "NO_PR_CREATED")):
+        v = check(facts, cfg)
+        assert (v.status, v.variant) == (m.FAIL, variant), (v.status, v.variant)
+    assert m.exit_code([m.check_pr_merged(facts, cfg)], ()) == 1
+    # …and with no PRs open either, the same absent header establishes NOTHING (never "idle")
+    blind = {"github": {"ok": True, "open_pr_count": 0, "open_prs": [],
+                        "prs_merged_in_window": 0, "prs_created_in_window": 0, "source": "rest"},
+             "log_events": {"headers": [], "dispatch_ok": [], "lane_started": []}}
+    v2 = m.check_pr_merged(blind, cfg)
+    assert (v2.status, v2.variant) == (m.INCONCLUSIVE, "ACTIVITY_UNKNOWN"), (v2.status, v2.variant)
+
+
+@test
+def test_the_state_disclosure_says_what_was_WRITTEN_not_what_was_intended():
+    """"Persisted this run" read `state.persist` — the dry-run POLICY — so an unwritable path (the
+    likeliest moment this branch runs at all) printed "Persisted this run: yes" beside the run's own
+    "NOT PERSISTED" block. Two adjacent claims, one of them false."""
+    m = load()
+    tmp = tempfile.mkdtemp(prefix="oc-persist-")
+    try:
+        facts = os.path.join(tmp, "facts.json")
+        d = fx("dispatch-refused")
+        with open(facts, "w") as fh:
+            json.dump(d, fh)
+        cap = os.path.join(tmp, "cap")
+        # a corrupt record at a path that CANNOT be written (ENOTDIR): both halves in one run
+        blocker = os.path.join(tmp, "blocker")
+        with open(blocker, "w") as fh:
+            fh.write("not a directory\n")
+        state_path = os.path.join(blocker, "sub", "s.json")
+        rc, out, err = run_cli(["--live", "--facts", facts, "--capture-dir", cap,
+                                "--controller-ws", "00000000-0000-0000-0000-0000000000c1",
+                                "--dry-run", "--no-respawn", "--state", state_path])
+        assert "Traceback" not in err, err[-300:]
+        assert "NOTIFICATION STATE IGNORED" in out, out[-1200:]
+        assert "Persisted this run: no" in out, out[-1200:]
+        assert "Persisted this run: yes" not in out, out[-1200:]
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 @test

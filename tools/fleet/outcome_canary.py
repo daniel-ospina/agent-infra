@@ -1162,7 +1162,9 @@ def _queue_age(f):
     hdr = newest(events.get("headers"))
     tok_age = parse_queue_token(hdr.get("queue_token") or "").get("token_age_s") if hdr else None
     qs = f.get("queue_state") or {}
-    qs_age = qs.get("age_s") if qs.get("ok") else None
+    # ⛔ `is True`, like every other `ok` reader in this file: a string "false" is TRUTHY, so a record
+    # that FAILED to read supplied its `age_s` as an age attributed to the header ("read 27.8h ago").
+    qs_age = qs.get("age_s") if qs.get("ok") is True else None
     ages = [(a, "token") for a in [tok_age] if isinstance(a, (int, float))]
     ages += [(a, "state/queue-state") for a in [qs_age] if isinstance(a, (int, float))]
     if not ages:
@@ -1452,7 +1454,7 @@ def check_work_dispatched(f, c):
         # while `queue_readable` abstained on the very same record — one facts dict, two answers, and
         # the FAIL was the one that would have paged someone.
         return V("work_dispatched", INCONCLUSIVE, "STATE_FROZEN", _queue_frozen_txt(f, stale),
-                 ("the pool was read %s ago (limit %.0fs), so neither 'there was nothing to "
+                 ("the pool was read %s (limit %.0fs), so neither 'there was nothing to "
                   "dispatch' nor 'work existed and did not move' is established. Not green." % (
                       _age_txt(stale["age_s"]), stale["limit_s"]))
                  if stale["age_s"] is not None else
@@ -1535,12 +1537,30 @@ def _activity(f, window_s=None, cfg=None):
     events = f.get("log_events") or {}
     hdr = newest_with_age(events.get("headers"), window_s) if window_s is not None \
         else newest(events.get("headers"))
+    # ⛔ THE QUEUE RECORD IS NOT THE ONLY EVIDENCE OF WORK IN HAND, AND SAYING "NOTHING IN HAND" WHEN
+    # THE RUN ITSELF PROVES OTHERWISE IS A FALSE STATEMENT EVEN AT EXIT 2. Measured: `work_dispatched`
+    # PASS/DISPATCHED from a fresh `[dispatch] … -> 4601` + `#4601: lane-N` sat three lines above
+    # `pr_created`'s "the fleet had nothing in hand, so a PR was not expected". Open PRs and a fresh
+    # dispatch are the same positive evidence `pr_merged`'s `open_n > 0` arm already trusts.
+    #
+    # ⛔ AND THESE TWO ARMS ARE ASKED BEFORE THE HEADER IS, because they need no header at all. Ask
+    # the absent-header abstention first and they become unreachable exactly when the controller is
+    # wedged: a measured field (`open_pr_count`) would be thrown away in favour of "not established"
+    # on the one shape where the FAIL matters most. An abstention may only speak about the datum it
+    # could not read.
+    gh_open = (f.get("github") or {}).get("open_pr_count")
+    pr_win = cfg.pr_window_s if cfg is not None else 10800.0
+    fresh_dispatch = newest_with_age(events.get("dispatch_ok") or [], pr_win) or \
+        newest_with_age(events.get("lane_started") or [], pr_win)
+    if isinstance(gh_open, int) and not isinstance(gh_open, bool) and gh_open > 0:
+        return True, "%d open PR(s) — work in hand, independent of the queue record" % gh_open
+    if fresh_dispatch:
+        return True, "a dispatch landed %s (the queue record is not the only evidence)" % (
+            _age_txt(fresh_dispatch.get("age_s")))
+    # ⛔ AN ABSENT HEADER IS NOT AN EMPTY BACKLOG. `False` here means "the fleet had nothing in hand",
+    # so a wedged controller (which writes no header) was graded as a measured idle — the opposite of
+    # what a missing header shows. `work_dispatched` and `queue_readable` abstain on this shape.
     if not hdr:
-        # ⛔ AN ABSENT HEADER IS NOT AN EMPTY BACKLOG. `False` here means "the fleet had nothing in
-        # hand", so a wedged controller (no header written for hours) with `backlog=47` produced
-        # `FAIL/NO_PR_CREATED` — or, worse, a confident "no PR was created and the fleet HAD NOTHING
-        # IN HAND, so a PR was not expected". `work_dispatched` and `queue_readable` both abstain for
-        # this shape; the PR checks must too.
         return None, ("no cycle header inside the window, so how much work the fleet had in hand "
                       "is not established")
     backlog = hdr.get("backlog")
@@ -1559,20 +1579,6 @@ def _activity(f, window_s=None, cfg=None):
     # FAILs ("the fleet HAD WORK IN HAND") about a refresh that had already been superseded. The
     # graded record's own verdict wins: a current EMPTY says there is nothing to dispatch.
     backlog_src = "cycle header"
-    # ⛔ THE QUEUE RECORD IS NOT THE ONLY EVIDENCE OF WORK IN HAND, AND SAYING "NOTHING IN HAND" WHEN
-    # THE RUN ITSELF PROVES OTHERWISE IS A FALSE STATEMENT EVEN AT EXIT 2. Measured: `work_dispatched`
-    # PASS/DISPATCHED from a fresh `[dispatch] … -> 4601` + `#4601: lane-N` sat three lines above
-    # `pr_created`'s "the fleet had nothing in hand, so a PR was not expected". Open PRs and a fresh
-    # dispatch are the same positive evidence `pr_merged`'s `open_n > 0` arm already trusts.
-    gh_open = (f.get("github") or {}).get("open_pr_count")
-    pr_win = cfg.pr_window_s if cfg is not None else 10800.0
-    fresh_dispatch = newest_with_age(events.get("dispatch_ok") or [], pr_win) or \
-        newest_with_age(events.get("lane_started") or [], pr_win)
-    if isinstance(gh_open, int) and not isinstance(gh_open, bool) and gh_open > 0:
-        return True, "%d open PR(s) — work in hand, independent of the queue record" % gh_open
-    if fresh_dispatch:
-        return True, "a dispatch landed %s ago (the queue record is not the only evidence)" % (
-            _age_txt(fresh_dispatch.get("age_s")))
     # ⛔ AN UNAGED RECORD LOSES ITS CLAIM, NEVER ITS AUTHORITY. `_graded_stale` is what decides
     # currency; without this guard an `EMPTY` with no epoch re-granted "the fleet had nothing in hand"
     # while `queue_readable` and `work_dispatched` both said STATE_FROZEN about the same record.
@@ -1587,7 +1593,7 @@ def _activity(f, window_s=None, cfg=None):
     # same record in the same run. One world, graded two ways, and the FAIL is the one that pages.
     stale_busy = _graded_stale(f, cfg if cfg is not None else cfg_from_dict({}), _src)
     if stale_busy is not None:
-        return None, ("the graded pool record (%s: %s) was read %s ago (limit %ss, %s), which is "
+        return None, ("the graded pool record (%s: %s) was read %s (limit %ss, %s), which is "
                       "not CURRENT, so 'work was in hand' is not established (and neither is "
                       "'the fleet was idle')"
                       % (_src, kind, _age_txt(stale_busy.get("age_s")),
@@ -4320,7 +4326,10 @@ def main(argv=None):
             state.save()
         except Exception as exc:
             reported["state_error"] = "%s: %s" % (type(exc).__name__, exc)
-        reported["state_persisted"] = bool(state.persist)
+        # ⛔ AN OUTCOME, NOT AN INTENT. `state.persist` says whether the run was ALLOWED to write;
+        # the print says "Persisted this run", so a failed write (a full disk, an unwritable path —
+        # the likeliest moment for this branch at all) must not report yes.
+        reported["state_persisted"] = bool(state.persist) and not reported.get("state_error")
 
     if a.json:
         print(json.dumps({"mode": "live", "box": cfg.box, "repo": cfg.repo,
@@ -4344,8 +4353,10 @@ def main(argv=None):
     if reported.get("state_repaired"):
         # ⛔ SAY WHAT HAPPENED TO THE RECORD, NOT WHAT HAPPENED TO THE DISK. It was IGNORED and the run
         # continues on an empty one; whether anything was written is a separate fact
-        # (`state_persisted`), and on a `--dry-run` or an unwritable path nothing is. Telling an
-        # operator it "was replaced" when the file is untouched sends them looking at the wrong thing.
+        # (`state_persisted`), and on an unwritable path nothing is (a bare `--dry-run` also writes
+        # nothing, but `--dry-run --state P` DOES persist — so the flag is reported, never assumed).
+        # Telling an operator it "was replaced" when the file is untouched sends them looking at the
+        # wrong thing.
         print("\n\u26a0\ufe0f NOTIFICATION STATE IGNORED (%s) — its contents were not readable as a "
               "per-box record, so this run used an empty one and delivery de-duplication restarted "
               "empty (a re-broken check may speak again). Persisted this run: %s."
