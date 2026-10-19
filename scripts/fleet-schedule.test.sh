@@ -655,6 +655,57 @@ out="$(run "$ALLSKIP" --verify 2>&1)"; rc=$?
 [ "$rc" -eq 1 ] && ok "--verify also refuses a zero-live set" \
   || bad "--verify passed a set with no live job (rc=$rc): $out"
 
+# ── 12c. "the file exists" is not "it can run" ─────────────────────────────────────────────
+# `subprocess` raises OSError for a target that exists but has lost its +x bit (or whose shebang
+# interpreter is gone). That arm sets rc=127, and because the stamp was written whenever rc was not
+# None, the job was STAMPED — and --verify counts any stamp as live. Measured on the shipped
+# script: install rc=0, "SCHEDULE VERIFIED — 1 job(s) live", stamp {"rc": 127}. A cell reached
+# CELL READY with a job that had never once run. The execute bit is now part of the declaration
+# check, and an exec failure writes no stamp at all.
+case_ "12c. a target that exists but cannot execute is refused, never counted as a live run"
+NOEXEC_DIR="$FIX/noexec"; mkdir -p "$NOEXEC_DIR"; printf '# no retired labels\n' > "$NOEXEC_DIR/RETIRED"
+NOEXEC_TARGET="$T/not-executable.sh"
+printf '#!/bin/sh\necho hi\n' > "$NOEXEC_TARGET"
+chmod 644 "$NOEXEC_TARGET"
+cat > "$T/noexec.spec" <<PY
+PLIST = {
+    "Label": "com.test.noexec",
+    "ProgramArguments": ["$NOEXEC_TARGET"],
+    "StartInterval": 60,
+}
+PY
+mkplist "$NOEXEC_DIR" com.test.noexec "$T/noexec.spec"
+state_reset "$NOEXEC_DIR"
+out="$(run "$NOEXEC_DIR" --install 2>&1)"; rc=$?
+[ "$rc" -eq 1 ] && ok "--install refuses a target that exists but is not executable (rc=1)" \
+  || bad "a non-executable target was accepted (rc=$rc): $out"
+grep -q 'not executable' <<<"$out" && ok "the refusal names the missing execute bit" \
+  || bad "the refusal is not diagnosable: $out"
+grep -q 'SCHEDULE VERIFIED' <<<"$out" && bad "it certified a job that can never run: $out" \
+  || ok "nothing was certified over a non-executable job"
+[ ! -f "$FLEET_SCHEDULE_STATE/jobs/com.test.noexec.json" ] \
+  && ok "no stamp was written for the job that could not be executed" \
+  || bad "a stamp was written for a job that never executed"
+
+# ── 12d. a stamp carrying "rc": null is NOT evidence of a run ──────────────────────────────────
+# Stamps written by an earlier copy of this runtime (and by the exec-failure path above) carry
+# "rc": null. Not writing them any more does not remove the ones already on disk, so --verify must
+# also refuse to COUNT one: it certified such a job as live.
+case_ "12d. a pre-existing stamp with a null rc is not counted as a run"
+state_reset "$GOOD"
+mkdir -p "$FLEET_SCHEDULE_STATE/jobs"
+python3 - "$FLEET_SCHEDULE_STATE/jobs/com.test.hourly.json" <<'PYNULL'
+import json, sys, time
+now = time.time()
+json.dump({"label": "com.test.hourly", "started": now - 10, "finished": now - 9,
+           "rc": None, "duration": 1}, open(sys.argv[1], "w"))
+PYNULL
+out="$(run "$GOOD" --verify 2>&1)"
+grep -q 'com.test.hourly: declared and runnable here, but has NEVER RUN' <<<"$out" \
+  && ok "a null-rc stamp does NOT count as a run" \
+  || bad "a null-rc stamp was counted as a run: $out"
+
+
 # ── 13. a recycled pid must not fake a running loop (--start used to print one and exit 0) ────
 case_ "13. --start replaces a recycled pid in loop.pid instead of reporting it as the loop"
 state_reset "$GOOD"
@@ -707,10 +758,10 @@ rm -f "$FLEET_SCHEDULE_STATE/OFF"
 # nothing can re-stamp the tick and the staleness is deterministic, not a race.
 bash -c 'exec -a "fleet-schedule.py --loop" sleep 120' & fakepid=$!; echo "$fakepid" >> "$T/pids"
 printf '%s\n' "$fakepid" > "$FLEET_SCHEDULE_STATE/loop.pid"
-busy_marker() { # busy_marker <deadline-offset-seconds>
-  python3 - "$FLEET_SCHEDULE_STATE" "$1" <<'PY'
+busy_marker() { # busy_marker <deadline-offset> [<started-offset>] [<label>]
+  python3 - "$FLEET_SCHEDULE_STATE" "$1" "${2:--900}" "${3:-com.test.echo}" <<'PY'
 import json, os, sys, time
-state, offset = sys.argv[1], float(sys.argv[2])
+state, offset, started_offset, label = sys.argv[1], float(sys.argv[2]), float(sys.argv[3]), sys.argv[4]
 tick = os.path.join(state, "tick")
 old = time.time() - 100000
 if os.path.exists(tick):
@@ -721,24 +772,42 @@ else:
 os.makedirs(os.path.join(state, "busy"), exist_ok=True)
 now = time.time()
 json.dump(
-    {"label": "com.test.echo", "started": now - 900, "pid": os.getpid(),
+    {"label": label, "started": now + started_offset, "pid": os.getpid(),
      "deadline": now + offset},
-    open(os.path.join(state, "busy", "com.test.echo.json"), "w"),
+    open(os.path.join(state, "busy", label + ".json"), "w"),
 )
 PY
 }
-busy_marker +900
-out="$(run "$GOOD" --verify)"; rc=$?
+# The busy exemption's ceiling is the verifier's OWN budget, so the case states the budget it is
+# reasoning about instead of inheriting the suite's deliberately small one. A job that has been
+# running 900s is plausible only under a budget that allows it.
+run_v15() { # run_v15 <job-timeout-seconds>
+  TEMPLATES_DIR="$GOOD" FLEET_SCHEDULE_JOB_TIMEOUT="$1" python3 "$SCHED" --verify 2>&1
+}
+busy_marker +900 -900
+out="$(run_v15 1800)"; rc=$?
 [ "$rc" -eq 0 ] && ok "a stale tick WITH a live busy job passes --verify (a long job is not a wedge)" \
   || bad "a long-running job failed --verify as a stale loop (rc=$rc): $out"
 grep -q 'BUSY' <<<"$out" && ok "the verdict names the job that is running" \
   || bad "the busy job is not named in the verdict: $out"
-busy_marker -60
-out="$(run "$GOOD" --verify)"; rc=$?
+busy_marker -60 -900
+out="$(run_v15 1800)"; rc=$?
 [ "$rc" -eq 1 ] && ok "once the deadline EXPIRES the same tick fails --verify (the exemption is bounded)" \
   || bad "an expired busy marker still excused a stale tick (rc=$rc): $out"
 grep -q 'tick is .*old' <<<"$out" && ok "the expired case names the stale tick" \
   || bad "the expired case does not name the stale tick: $out"
+# ⛔ THE DEADLINE IS SELF-DECLARED, so it cannot outlive the budget THIS process enforces. The same
+# marker that excuses the tick under a 1800s budget claims a start 900s old — under the suite's 30s
+# budget that job would have been killed at 30s (rc=124), so the marker is stale evidence and must
+# be dropped. Without the clamp a marker written once with a generous timeout excuses a wedged tick
+# for as long as it says, and "the exemption ends with that deadline" is only true for markers
+# written under the current config.
+busy_marker +900 -900
+out="$(run_v15 30)"; rc=$?
+[ "$rc" -eq 1 ] && ok "a self-declared deadline is CLAMPED by the verifier's own job budget (rc=1)" \
+  || bad "a marker claiming a start beyond the job budget still excused a stale tick (rc=$rc): $out"
+grep -q 'BUSY' <<<"$out" && bad "the clamped marker was still treated as a live job: $out" \
+  || ok "the clamped marker is not reported as a running job"
 kill "$fakepid" 2>/dev/null
 
 # ── 16. an annual (multi-entry) calendar must keep a NEXT occurrence ───────────────────────

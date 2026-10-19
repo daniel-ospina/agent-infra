@@ -101,7 +101,7 @@ STATE = ""
 TICK = 0
 JOB_TIMEOUT = 0
 
-# The placeholder set — the SAME eight `scripts/install-launchd.sh` renders. A template that
+# The placeholder set — the SAME nine `scripts/install-launchd.sh` renders. A template that
 # carries any OTHER {{NAME}} is an error here, not an empty string: the launchd renderer would
 # substitute empty for a name it does not know too, so the two backends agree only because the
 # list is a contract, and this one refuses rather than guesses.
@@ -421,8 +421,23 @@ def load_jobs() -> list:
             #     exactly like an unresolved placeholder. SKIP, named, never silent.
             layer_root = values.get("HOME", "")
             layer_prefix = os.path.join(layer_root, ".pi", "agent") if layer_root else ""
-            for arg in job.argv:
-                if not arg.startswith("/") or os.path.exists(arg):
+            for idx, arg in enumerate(job.argv):
+                if not arg.startswith("/"):
+                    continue
+                if os.path.exists(arg):
+                    # ⛔ argv[0] IS THE PROGRAM THAT GETS EXECUTED, and "the file exists" is not
+                    # "it can run". A target that lost its +x bit (or whose shebang interpreter
+                    # is gone) fails EVERY run with rc=127 from subprocess, and before this check
+                    # that failure produced a stamp — which cmd_verify counts as live. Measured:
+                    # a plist aimed at a chmod 644 script certified "1 job(s) live" with a stamp
+                    # of {"rc": 127}, so a cell reached CELL READY with a job that had never once
+                    # run. Refused at declaration time instead, where the fix is obvious.
+                    if idx == 0 and not os.access(arg, os.X_OK):
+                        job.error = (
+                            "not executable: %s exists but cannot be executed — every run would "
+                            "fail with rc=127, so the job is refused rather than certified" % arg
+                        )
+                        break
                     continue
                 if layer_prefix and (arg == layer_prefix or arg.startswith(layer_prefix + os.sep)):
                     job.error = (
@@ -541,6 +556,14 @@ def busy_jobs(now):
             started = float(entry.get("started") or 0)
         except (OSError, ValueError, KeyError, TypeError):
             continue
+        # ⛔ THE DEADLINE IS SELF-DECLARED, so it is CLAMPED by the budget THIS verifier enforces.
+        # Otherwise a marker written once under a large FLEET_SCHEDULE_JOB_TIMEOUT (or left behind
+        # by a loop that later ran with one) would excuse a stale tick AND every overdue job for
+        # that whole window, and the doc's "the exemption ends with that deadline" would only hold
+        # for markers written under the current config. The clamp keeps the grace a job is owed at
+        # the ceiling this process would itself allow, plus the tick slack.
+        if started > 0:
+            deadline = min(deadline, started + JOB_TIMEOUT + 3 * TICK)
         if now <= deadline:
             live.append((entry.get("label") or name[: -len(".json")], started))
     return live
@@ -715,6 +738,7 @@ def run_job(job):
         del env["HOME"]
 
     rc = None
+    exec_failed = False
     try:
         with open(log_path, "a") as out:
             out.write(
@@ -748,7 +772,11 @@ def run_job(job):
             pass
         log("TIMEOUT %s exceeded %ds — killed (rc=124); raise FLEET_SCHEDULE_JOB_TIMEOUT if that is wrong" % (job.label, JOB_TIMEOUT))
     except OSError as exc:
+        # ⛔ THIS IS NOT A RUN. The runtime could not even spawn the job, so rc=127 here is OUR
+        # sentinel, not an exit status the job produced — and a stamp for it certified a job that
+        # has never run as live (see the finally block).
         rc = 127
+        exec_failed = True
         log("ERROR %s could not be executed (%s)" % (job.label, exc))
     finally:
         # ⛔ ONLY A REAL rc IS A RUN. The loop's SIGTERM handler raises SystemExit (so `--stop` and
@@ -758,13 +786,22 @@ def run_job(job):
         # interrupted run: the "a stamp with an rc" evidence claim, satisfied by a stamp with no
         # rc. Writing nothing is the truthful record — the previous stamp stands (a real run at an
         # earlier time), or the job is honestly still NEVER RUN.
-        if rc is not None:
+        if rc is not None and not exec_failed:
             write_stamp(job.label, started, rc, time.time() - started)
         clear_busy(job.label)
         try:
             os.unlink(lock)
         except OSError:
             pass
+    if exec_failed:
+        # Say plainly that the job did NOT run, so a log reader is not told "RAN rc=127". No stamp
+        # was written, so --verify keeps reporting this job as NEVER RUN until it can actually
+        # execute — which is the truth, and is what the fatal bring-up gate needs to see.
+        log(
+            "NOT-RUN %s rc=%s — could not be EXECUTED, so no stamp was written and --verify will "
+            "keep reporting it as never run" % (job.label, rc)
+        )
+        return rc
     log("RAN %s rc=%s in %.1fs (log %s)" % (job.label, rc, time.time() - started, log_path))
     return rc
 
@@ -889,13 +926,22 @@ def spawn_loop():
     # first tick. Polling only the command line returned as soon as the child existed — before
     # mark_tick() — so `--install` verified immediately afterwards and failed a HEALTHY install on
     # "the loop has never ticked" whenever any job was due in that first pass.
+    # ⛔ AND THE TICK MUST BE THIS INCARNATION'S: a tick merely PRESENT can be the one the PREVIOUS
+    # loop left, so the poll returned before the new loop had passed at all and a healthy install
+    # was refused with "the loop tick is Ns old" — the same false FAIL by a different route, and
+    # the one a loaded cell (where bring-up actually runs) hits when the child starts slowly.
     # ⛔ And a failed poll returns None, never `loop_pid()`: that fallback handed back whatever pid
     # the pidfile held (a recycled pid) and reported it as the loop that had just started.
+    spawned_at = time.time()
     for _ in range(50):
         time.sleep(0.2)
         pid = loop_pid()
-        if pid and pid_is_our_loop(pid) and tick_age() is not None:
-            return pid
+        if pid and pid_is_our_loop(pid):
+            age = tick_age()
+            # 1 s of slack: the tick is stamped with this process's clock, and a tick older than
+            # the spawn instant belongs to the incarnation that came before.
+            if age is not None and age <= (time.time() - spawned_at) + 1.0:
+                return pid
     return None
 
 
@@ -1012,7 +1058,11 @@ def cmd_verify():
             skipped.append((job.label, job.skip))
             continue
         stamp = read_stamp(job.label)
-        if not stamp:
+        # ⛔ A STAMP WITH NO rc IS NOT A RUN, and neither is one we could not execute. The stamp
+        # writer only records completed runs now, but stamps written by an older copy of this
+        # runtime (and by the exec-failure path, which wrote rc=127) are still on disk, and this
+        # arm is what decides whether they count as evidence.
+        if not stamp or stamp.get("rc") is None:
             failures.append(
                 "%s: declared and runnable here, but has NEVER RUN — 'scheduled' must be read from "
                 "a run, not from a file" % job.label

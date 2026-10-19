@@ -104,7 +104,10 @@ fourth state and no silent absence: this table is what makes "deployed" checkabl
 - a tick older than `max(3 × tick, 300 s)` while **no job is running** (the process exists but is
   not passing). A job that is running announces itself in `state/busy/<label>.json` with an
   expiring deadline, so a job the templates budget 1800 s for is reported `BUSY`, not `stale` —
-  and the exemption ends with that deadline, so a job killed at its ceiling cannot mask a wedge;
+  and the exemption ends with that deadline, so a job killed at its ceiling cannot mask a wedge.
+  That deadline is **self-declared**, so it is clamped to `started + JOB_TIMEOUT + 3 × tick`: a
+  marker written under a larger budget (or left by a loop that later ran with one) cannot excuse a
+  wedged tick for longer than the ceiling this verifier would itself have enforced;
 - a job that is declared and runnable here but has **never run**;
 - a job whose calendar can **never** come due again (no occurrence found within the search window
   — a `Month`/`Day` calendar searches 400 days, including the entries of a multi-entry
@@ -121,8 +124,12 @@ fourth state and no silent absence: this table is what makes "deployed" checkabl
 - a template with no schedule at all, an unknown placeholder, a `Label` that is not a safe file
   name (it names that job's stamp, lock and default log, so only letters, digits, `.`, `_` and `-`
   are accepted), a target **under `<home>/.pi/agent/`** that does not resolve (an incomplete
-  farm), or a label that is in `RETIRED` while its template still exists. A target missing
-  **anywhere else** — a tortoise checkout without its `.venv` — is a named `SKIP`, not a failure.
+  farm), an `argv[0]` that **exists but is not executable** (a target that lost its `+x` bit, or
+  whose shebang interpreter is gone, fails every run with `rc=127` and would otherwise be stamped
+  as a live job), or a label that is in `RETIRED` while its template still exists. Only `argv[0]`
+  is held to the execute bit — the remaining arguments are data, and a plist may legitimately point
+  one at a non-executable file. A target missing **anywhere else** — a tortoise checkout without
+  its `.venv` — is a named `SKIP`, not a failure.
   On macOS the whole gate is the delegate's: `install-launchd.sh --status` must exit **0** AND
   print no `NOT INSTALLED`/`DRIFTED`/`not loaded` line (`--verify` reads its exit status too, so
   a delegate failure with unfamiliar wording is not certified green).
@@ -132,9 +139,17 @@ absence, and refusing the whole layer over it would block a cell that runs every
 verdict line says both numbers — `SCHEDULE VERIFIED — N job(s) live on this machine …, M skipped
 for a named reason`. It is only printed when `N ≥ 1`.
 
-A stamp records a **completed** run: a job interrupted by `--stop` (the loop's `SIGTERM` handler
-raises `SystemExit` through `run_job`) writes no stamp, so an interrupted job keeps its previous
-real stamp — or stays honestly `NEVER RUN` — instead of certifying itself with an `rc` of `null`.
+A stamp records a **completed** run. Two shapes are therefore NOT evidence, and `--verify` refuses
+both rather than counting them:
+
+- a job interrupted by `--stop` (the loop's `SIGTERM` handler raises `SystemExit` through
+  `run_job`) writes **no** stamp, so it keeps its previous real stamp — or stays honestly
+  `NEVER RUN` — instead of certifying itself with an `rc` of `null`;
+- a job the runtime could not even **execute** (the spawn raised `OSError`, e.g. a target without
+  its execute bit) writes no stamp either and is logged as `NOT-RUN`, never `RAN rc=127`.
+
+A stamp already on disk whose `rc` is `null` — written by an older copy of this runtime, or by the
+old exec-failure path — is read back as `NEVER RUN` for the same reason.
 
 `--start` reads the declarations before it spawns. No declarations at all, a remembered
 `templates-dir` that no longer resolves, and a dir holding no `*.plist` all exit **3** (the code
