@@ -1536,7 +1536,13 @@ def _activity(f, window_s=None, cfg=None):
     hdr = newest_with_age(events.get("headers"), window_s) if window_s is not None \
         else newest(events.get("headers"))
     if not hdr:
-        return False, "no cycle header inside the window"
+        # ⛔ AN ABSENT HEADER IS NOT AN EMPTY BACKLOG. `False` here means "the fleet had nothing in
+        # hand", so a wedged controller (no header written for hours) with `backlog=47` produced
+        # `FAIL/NO_PR_CREATED` — or, worse, a confident "no PR was created and the fleet HAD NOTHING
+        # IN HAND, so a PR was not expected". `work_dispatched` and `queue_readable` both abstain for
+        # this shape; the PR checks must too.
+        return None, ("no cycle header inside the window, so how much work the fleet had in hand "
+                      "is not established")
     backlog = hdr.get("backlog")
     # ⛔ THE SAME AUTHORITATIVE TOKEN the queue checks grade. Reading the one-refresh-old header here
     # made four checks disagree about one world: measured, `queue_readable` FAILed
@@ -1909,15 +1915,21 @@ def check_headroom(f, c):
     # ⛔ `isinstance(True, int)` IS TRUE: a boolean `avail_bytes`/`avail_mb` was divided and
     # subtracted as a number and manufactured `FAIL/BELOW_FLOOR` ("0.0 GiB free", "1 MiB available")
     # — a fake OOM emergency on the check whose FAIL must mean one. Same polarity as the PR counts.
-    if disk.get("ok") and (not isinstance(disk.get("avail_bytes"), (int, float))
-                          or isinstance(disk.get("avail_bytes"), bool)):
+    # ⛔ `disk.get("ok")` IS TRUTHINESS, and the string "false" is truthy: a surface that said the
+    # read FAILED was graded as a successful one carrying `avail_bytes: 0` and manufactured
+    # `FAIL/BELOW_FLOOR` ("0.0 GiB free") — the fake OOM emergency these two arms exist to prevent,
+    # reached through the polarity shape they left. Every other reader in this file uses `is True`.
+    if disk.get("ok") is True and (not isinstance(disk.get("avail_bytes"), (int, float))
+                                   or isinstance(disk.get("avail_bytes"), bool)):
         lines.append("disk: READ ok but NO avail_bytes field (%r)" % (disk.get("avail_bytes"),))
         unknown.append("disk")
-    elif disk.get("ok"):
+    elif disk.get("ok") is True:
         gb = disk["avail_bytes"] / float(1 << 30)
-        lines.append("disk: %.1f GiB free (%.1f%% used) on %s — floor %.1f GiB"
-                     % (gb, disk.get("used_pct") if disk.get("used_pct") is not None else -1,
-                        disk.get("mount") or "/", c.disk_floor_gb))
+        # a MISSING `used_pct` is printed as not-measured, never as "-1.0% used"
+        used_txt = ("%.1f%% used" % disk["used_pct"]) if isinstance(disk.get("used_pct"), (int, float)) \
+            and not isinstance(disk.get("used_pct"), bool) else "used_pct not read"
+        lines.append("disk: %.1f GiB free (%s) on %s — floor %.1f GiB"
+                     % (gb, used_txt, disk.get("mount") or "/", c.disk_floor_gb))
         if gb < c.disk_floor_gb:
             bad.append("disk %.1f GiB < %.1f GiB" % (gb, c.disk_floor_gb))
     else:
@@ -1926,11 +1938,11 @@ def check_headroom(f, c):
 
     # ⛔ THE DISK ARM'S TWIN: `(avail_mb or 0)` manufactures "0 MiB available" out of a field that
     # was never read, i.e. an OOM emergency on the check whose FAIL must mean one.
-    if mem.get("ok") and (not isinstance(mem.get("avail_mb"), (int, float))
-                         or isinstance(mem.get("avail_mb"), bool)):
+    if mem.get("ok") is True and (not isinstance(mem.get("avail_mb"), (int, float))
+                                  or isinstance(mem.get("avail_mb"), bool)):
         lines.append("memory: READ ok but NO avail_mb field (%r)" % (mem.get("avail_mb"),))
         unknown.append("memory")
-    elif mem.get("ok"):
+    elif mem.get("ok") is True:
         mb = mem["avail_mb"]
         lines.append("memory: %.0f MiB available — floor %.0f MiB (source: %s)"
                      % (mb, c.mem_floor_mb, mem.get("source") or "?"))
@@ -2202,24 +2214,30 @@ def check_landers(f, c):
     candidates, unprobed, skipped, unprobed_reasons = [], [], [], []
     non_draft = 0
     for pr in prs:
-        # ⛔ A NON-BOOL `draft` IS AN UNREAD BIT, NOT A DRAFT. `if pr.get("draft")` reads the string
-        # "false" (or `"no"`, or `1`) as DRAFT-or-not by truthiness, so a collector regression or a
-        # hand-written facts file silently removed a live PR from the population — the same polarity
-        # defect `checks_green` and `auto_armed` below were fixed for.
-        draft = pr.get("draft", False)
-        if not isinstance(draft, bool):
-            unprobed.append(pr.get("number"))
-            unprobed_reasons.append("%s: the draft bit is %r, not a bool"
-                                    % (pr.get("number"), draft))
-            continue
-        if draft:
+        # ⛔ ONLY `True` IS A DRAFT, AND ABSENCE IS NOT `False`. `if pr.get("draft")` read the string
+        # "false" (or `"no"`, or `1`) as DRAFT-or-not by truthiness — silently removing a live PR
+        # from the population — while `.get("draft", False)` read a MISSING key as a definite
+        # non-draft, so a row that might be a draft produced `FAIL/LANDER_MISSING` ("this PR has no
+        # lander"). Both are the polarity defect `checks_green` and `auto_armed` below were fixed
+        # for, and every sibling field two lines below already abstains on absence.
+        draft = pr.get("draft")
+        if draft is True:
             # ⛔ COUNTED like every other known skip. A draft was dropped with no line at all, so the
             # population arithmetic did not reconcile (measured: `open PRs: 54`, `skipped: 25`,
             # `unprobed: 28` — one row unaccounted for) and `DRAFT` in KNOWN_NON_MERGEABLE was
             # unreachable, because this `continue` fired first.
             skipped.append("%s:DRAFT" % (pr.get("number"),))
             continue
+        # ⛔ THE DENOMINATOR IS "EVERY OPEN ROW THAT IS NOT A DEFINITE DRAFT", so it is incremented
+        # BEFORE the unread-bit abstention: that row is in `unprobed` too, and counting it only after
+        # the `continue` produced "2 of 1 non-draft open PR(s) could not be probed".
         non_draft += 1
+        if not isinstance(draft, bool):
+            unprobed.append(pr.get("number"))
+            unprobed_reasons.append("%s: the draft bit is %s, which is not a bool"
+                                    % (pr.get("number"),
+                                       "ABSENT" if "draft" not in pr else repr(draft)))
+            continue
         mss, green = pr.get("merge_state_status"), pr.get("checks_green")
         # ⛔ "GRADED OR UNPROBED, NEVER NEITHER" — enforced HERE, not only in the collectors.
         # `pr.get("probed", True)` read an ABSENT key as `True` (every fixture omitted it), and a row
@@ -2487,13 +2505,24 @@ class State(object):
         # untouched: a preview should still show what WOULD be sent.
         self.persist = bool(persist)
         self.data = {"version": STATE_VERSION, "boxes": {}}
+        self.repaired = False
         try:
             with open(path) as fh:
                 d = json.load(fh)
             if isinstance(d, dict) and isinstance(d.get("boxes"), dict):
                 self.data = d
-        except Exception:
+            else:
+                # ⛔ EVERY shape that discards a pre-existing record is DISCLOSED. Only the per-box
+                # case was flagged, so a file that parsed to `{"boxes": [1, 2]}` — or to anything
+                # that is not a map — silently restarted de-duplication from empty, and the next
+                # message repeated with no explanation.
+                self.repaired = True
+        except FileNotFoundError:
             pass
+        except (ValueError, OSError):
+            # an unparseable or unreadable state FILE is a discarded record too (the run continues on
+            # an empty one, which is the alternative to crashing after the verdicts)
+            self.repaired = True
         # ⛔ VALIDATE ONE LEVEL DEEPER. `isinstance(d.get("boxes"), dict)` checked only the outer
         # map, so a per-box value that is not a dict (a hand-edited file, an older format, a merged
         # state file, a `--state` pointed at the wrong path) raised `AttributeError: 'int' object has
@@ -2501,10 +2530,12 @@ class State(object):
         # of output, which a scheduler reads as "a check FAILed" and the JSON is lost. That is the
         # exact failure the `save()` guard exists for; the reader had none.
         self.data.setdefault("boxes", {})
-        repaired = False
+        repaired = self.repaired
         box_rec = self.data["boxes"].get(box)
         if not isinstance(box_rec, dict):
-            if box_rec is not None:
+            # `None` here is either an absent key (nothing was discarded) or a JSON `null` (a record
+            # was) — the two are not distinguishable from `.get`, so a present-but-null value counts.
+            if box in self.data["boxes"]:
                 repaired = True
             box_rec = {}
             self.data["boxes"][box] = box_rec
@@ -4311,11 +4342,15 @@ def main(argv=None):
 
     print(render(verdicts, header, not_evaluated))
     if reported.get("state_repaired"):
-        # An unreadable state record is REPAIRED and disclosed, never a crash and never silence: the
-        # dedup keys it should have carried are gone, so the next message may repeat.
-        print("\n\u26a0\ufe0f NOTIFICATION STATE REPAIRED (%s) — the record for this box was not a "
-              "map and was replaced; delivery de-duplication restarted empty."
-              % reported["state_repaired"])
+        # ⛔ SAY WHAT HAPPENED TO THE RECORD, NOT WHAT HAPPENED TO THE DISK. It was IGNORED and the run
+        # continues on an empty one; whether anything was written is a separate fact
+        # (`state_persisted`), and on a `--dry-run` or an unwritable path nothing is. Telling an
+        # operator it "was replaced" when the file is untouched sends them looking at the wrong thing.
+        print("\n\u26a0\ufe0f NOTIFICATION STATE IGNORED (%s) — its contents were not readable as a "
+              "per-box record, so this run used an empty one and delivery de-duplication restarted "
+              "empty (a re-broken check may speak again). Persisted this run: %s."
+              % (reported["state_repaired"],
+                 "yes" if reported.get("state_persisted") else "no"))
     if reported["respawn"]:
         rr = reported["respawn"]
         print("\nrespawn: %s" % (rr.get("detail") or "not attempted"))

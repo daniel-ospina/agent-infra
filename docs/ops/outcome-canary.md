@@ -453,15 +453,29 @@ Six more (cycle 13), each a case where a datum the tool held was not the one it 
   `READABLE_STALE` and `work_dispatched` said `STATE_FROZEN` about the same record in the same run.
   One world, graded two ways, and the FAIL was the one that paged someone. A non-current record is
   `INCONCLUSIVE/ACTIVITY_UNKNOWN` in both directions.
-- **Only `True` is armed, and only a `bool` is a draft bit.** `if pr.get("auto_armed")` read the
+- **Only `True` is armed, and only a `bool` is a draft bit — an ABSENT one is unread.** `if pr.get("auto_armed")` read the
   string `"false"` as ARMED and published `PASS/LANDERS_ARMED` for a PR whose own evidence line
   printed `armed=false` — in the one check whose purpose is catching a silent lander expiry — while
   `if pr.get("draft")` read `"false"` as a draft and silently removed a live PR from the population.
   The same allow-list polarity already required for `checks_green`: a non-bool is an unread bit.
-- **A corrupt notification state file is repaired and disclosed, never a crash.** Only the outer
+  `.get("draft", False)` was the last place a MISSING key became a measurement, so a row with no
+  `draft` bit at all was admitted as a definite non-draft and could `FAIL/LANDER_MISSING` a PR that
+  might be a draft.
+- **`headroom` allows-lists its `ok` too.** `if disk.get("ok")` is truthiness and `"false"` is
+  truthy, so a surface that said its read FAILED was graded as a successful one carrying
+  `avail_bytes: 0` and produced `FAIL/BELOW_FLOOR` — a fake OOM emergency on the check whose FAIL
+  must mean one. A missing `used_pct` now prints as `used_pct not read`, never as `-1.0% used`.
+- **No cycle header in the window is not an empty backlog.** `_activity` answered "the fleet had
+  nothing in hand" when no header was in the window — so a WEDGED controller (which writes none) was
+  graded as evidence that there was nothing to do. That shape is now `ACTIVITY_UNKNOWN`, as
+  `queue_readable`/`work_dispatched` already grade it.
+- **A corrupt notification state file is ignored and disclosed, never a crash.** Only the outer
   `boxes` map was validated, so a per-box value that was not a dict raised after the verdicts and
   before the report — exit 1 with no output, which a scheduler reads as "a check FAILed" while the
-  JSON is lost. The record is replaced, and the run says de-duplication restarted empty.
+  JSON is lost. EVERY discarded shape is disclosed — a per-box value that is not a map, a `boxes`
+  that is not a map, an unparseable file — and the run says de-duplication restarted empty and
+  whether anything was persisted this run (a `--dry-run` writes nothing, so "was replaced" would be a
+  claim about the disk that did not happen).
 - **A current `state/queue-state: EMPTY` supersedes the header's pair.** The header's `queue=` and
   `backlog=` are one refresh old; when the newer record says the pool is now empty, grading the
   header's pair anyway produced `queue_readable FAIL / EMPTY_WITH_LARGE_POOL` beside

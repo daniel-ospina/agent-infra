@@ -2228,9 +2228,21 @@ def test_the_GRAPHQL_collector_reads_the_CLOSED_page_AND_a_MERGE_ordered_page():
         assert gh["prs_merged_in_window"] == 0, gh
         # …and the closed page still supplies the created population
         assert gh["prs_created_in_window"] == 100, gh
-        check = m.check_pr_merged({"github": dict(gh, open_pr_count=2)}, cfg)
+        # ⛔ THE FAIL ARM NEEDS A MEASURED WORKLOAD, not just an empty merge page. A payload with NO
+        # cycle header at all says nothing about whether work was in hand, so it abstains
+        # (ACTIVITY_UNKNOWN) — the assertion this replaces was a FAIL manufactured from a missing
+        # read. Give the check the idle header such a box would have.
+        idle = {"headers": [{"raw": "=== h load=1 lanes=0 backlog=0 queue=EMPTY(2m) ===",
+                             "age_s": 120, "backlog": 0, "queue_token": "EMPTY(2m)"}],
+                "armed": [], "railed": []}
+        check = m.check_pr_merged({"github": dict(gh, open_pr_count=2), "log_events": idle}, cfg)
         assert (check.status, check.variant) == (m.FAIL, "NO_PR_MERGED"), (check.status,
                                                                           check.variant)
+        # …and with NO header at all the same facts are an ABSTENTION, never "the fleet had nothing
+        # in hand" (a wedged controller writes no header, which is the opposite of evidence)
+        no_hdr = m.check_pr_merged({"github": dict(gh, open_pr_count=2)}, cfg)
+        assert (no_hdr.status, no_hdr.variant) == (m.INCONCLUSIVE, "ACTIVITY_UNKNOWN"), \
+            (no_hdr.status, no_hdr.variant)
         # (b) a merge inside the window is counted, and the search is bounded by the window's date
         merge_rows["rows"] = [{"number": 1, "mergedAt": inside, "createdAt": inside}]
         gh2 = m.collect_github("o/r", cfg, now=now)
@@ -3237,12 +3249,16 @@ def test_a_STALE_header_cannot_manufacture_work_in_hand():
     d["facts"]["github"]["open_prs"] = []
     cfg = m.cfg_from_dict(d["config"])
     got = dict((v.name, v) for v in m.evaluate(d["facts"], cfg))
-    assert got["pr_created"].variant == "IDLE_NO_WORK", (got["pr_created"].status,
-                                                         got["pr_created"].variant)
-    assert got["pr_merged"].variant == "IDLE_NO_WORK", (got["pr_merged"].status,
-                                                        got["pr_merged"].variant)
+    # ⛔ NOT "IDLE_NO_WORK". A header older than the window is the SAME shape as no header: the
+    # fleet's workload is not established. Reading it as a measured idle turned "the refresh is
+    # frozen" into "there was nothing to do", which is the claim `queue_readable` refuses to make
+    # about the same record in the same run.
+    assert got["pr_created"].variant == "ACTIVITY_UNKNOWN", (got["pr_created"].status,
+                                                             got["pr_created"].variant)
+    assert got["pr_merged"].variant == "ACTIVITY_UNKNOWN", (got["pr_merged"].status,
+                                                            got["pr_merged"].variant)
     busy, why = m._activity(d["facts"], cfg.window_s)
-    assert busy is False and "inside the window" in why, (busy, why)
+    assert busy is None and "inside the window" in why, (busy, why)
     # …a FRESH header with a backlog still says busy, with the age of the header that carried it
     d2 = fx("healthy")
     d2["facts"]["github"]["open_pr_count"] = 0
@@ -4414,6 +4430,33 @@ MUTATIONS = [
      "        self.repaired = repaired",
      "        self.repaired = False",
      "test_a_CORRUPT_per_box_state_record_is_REPAIRED_and_disclosed_not_crashed"),
+    # ── cycle-31 defects ─────────────────────────────────────────────────────────────────
+    ("an ABSENT draft bit is read as a definite non-draft",
+     '        draft = pr.get("draft")',
+     '        draft = pr.get("draft", False)',
+     "test_a_NON_BOOL_draft_bit_is_UNREAD_not_a_draft"),
+    ("the PARTIAL_POPULATION denominator excludes the unread draft rows",
+     '        non_draft += 1',
+     '        non_draft += 1 if isinstance(draft, bool) else 0',
+     "test_a_NON_BOOL_draft_bit_is_UNREAD_not_a_draft"),
+    ("a headroom `ok` is graded by truthiness",
+     '    elif disk.get("ok") is True:',
+     '    elif disk.get("ok"):',
+     "test_a_STRING_false_headroom_ok_does_not_manufacture_an_OOM"),
+    ("a mem `ok` is graded by truthiness",
+     '    elif mem.get("ok") is True:',
+     '    elif mem.get("ok"):',
+     "test_a_STRING_false_headroom_ok_does_not_manufacture_an_OOM"),
+    ("a missing cycle header is read as a measured idle",
+     '        return None, ("no cycle header inside the window, so how much work the fleet had in '
+     'hand "\n                      "is not established")',
+     '        return False, ("no cycle header inside the window, so how much work the fleet had in '
+     'hand "\n                       "is not established")',
+     "test_a_frozen_refresh_with_no_header_is_NOT_a_measured_idle"),
+    ("a file that is not a per-box state map is discarded silently",
+     "                self.repaired = True\n        except FileNotFoundError:",
+     "                pass\n        except FileNotFoundError:",
+     "test_a_CORRUPT_per_box_state_record_is_REPAIRED_and_disclosed_not_crashed"),
     # ── cycle-28 defects ──────────────────────────────────────────────────────────────────
     ("CONTROLLER_ABSENT ignores a rejected controller row",
      "    if not pids and near_ours:",
@@ -4555,11 +4598,10 @@ MUTATIONS = [
      "    if not cycles and unparsed:",
      "    if False:",
      "test_an_UNPARSEABLE_header_is_NOT_a_mid_cycle_wedge"),
-    ("a bool headroom number is divided as a number",
-     "    if disk.get(\"ok\") and (not isinstance(disk.get(\"avail_bytes\"), (int, float))\n"
-     "                          or isinstance(disk.get(\"avail_bytes\"), bool)):",
-     "    if disk.get(\"ok\") and not isinstance(disk.get(\"avail_bytes\"), (int, float)):",
-     "test_a_BOOL_headroom_number_is_UNREAD_not_a_manufactured_OOM"),
+    ('a bool headroom number is divided as a number',
+     '    if disk.get("ok") is True and (not isinstance(disk.get("avail_bytes"), (int, float))\n                                   or isinstance(disk.get("avail_bytes"), bool)):',
+     '    if disk.get("ok") is True and not isinstance(disk.get("avail_bytes"), (int, float)):',
+     'test_a_BOOL_headroom_number_is_UNREAD_not_a_manufactured_OOM'),
     ("a stale pool record is read as evidence that work was in hand",
      '    stale_busy = _graded_stale(f, cfg if cfg is not None else cfg_from_dict({}), _src)',
      '    stale_busy = None',
@@ -4613,10 +4655,10 @@ MUTATIONS = [
      '        armed_bit = pr.get("auto_armed")',
      '        armed_bit = bool(pr.get("auto_armed")) or "x"',
      "test_auto_armed_is_ARMED_only_when_it_is_LITERALLY_True"),
-    ("a non-bool draft bit is graded by truthiness",
-     '        draft = pr.get("draft", False)\n        if not isinstance(draft, bool):',
-     '        draft = pr.get("draft", False)\n        if False:',
-     "test_a_NON_BOOL_draft_bit_is_UNREAD_not_a_draft"),
+    ('a non-bool draft bit is graded by truthiness',
+     '        draft = pr.get("draft")\n        if draft is True:',
+     '        if pr.get("draft"):',
+     'test_a_NON_BOOL_draft_bit_is_UNREAD_not_a_draft'),
     ("the report stops disclosing a verdict input",
      '            "window_s": self.window_s,',
      '',
@@ -4981,11 +5023,10 @@ MUTATIONS = [
      "            and (f.get(\"queue_state\") or {}).get(\"ok\") is True:",
      "            and (f.get(\"queue_state\") or {}).get(\"ok\") is not False:",
      "test_the_queue_checks_use_ALLOW_LIST_polarity_on_the_record"),
-    ("an ok MEMORY read with no number reads as 0 MiB",
-     "    if mem.get(\"ok\") and (not isinstance(mem.get(\"avail_mb\"), (int, float))\n"
-     "                         or isinstance(mem.get(\"avail_mb\"), bool)):",
-     "    if False:",
-     "test_an_ok_MEMORY_read_with_no_number_is_UNREAD_not_zero_mib"),
+    ('an ok MEMORY read with no number reads as 0 MiB',
+     '    if mem.get("ok") is True and (not isinstance(mem.get("avail_mb"), (int, float))\n                                  or isinstance(mem.get("avail_mb"), bool)):',
+     '    if False:',
+     'test_an_ok_MEMORY_read_with_no_number_is_UNREAD_not_zero_mib'),
     ("vm_stat sums the inactive/speculative fields without checking they were seen",
      "            \"if (!seen || ps == \\\"\\\" || free == \\\"\\\" || inact == \\\"\\\" || spec == "
      "\\\"\\\") \"",
@@ -5025,11 +5066,10 @@ MUTATIONS = [
      "    if not known:",
      "    if False:",
      "test_an_UNREAD_oom_protection_value_is_UNEVALUABLE_not_unprotected"),
-    ("an ok disk read with no number reads as 0 GiB",
-     "    if disk.get(\"ok\") and (not isinstance(disk.get(\"avail_bytes\"), (int, float))\n"
-     "                          or isinstance(disk.get(\"avail_bytes\"), bool)):",
-     "    if False:",
-     "test_an_ok_disk_read_with_no_number_is_UNREAD_not_zero_gib"),
+    ('an ok disk read with no number reads as 0 GiB',
+     '    if disk.get("ok") is True and (not isinstance(disk.get("avail_bytes"), (int, float))\n                                   or isinstance(disk.get("avail_bytes"), bool)):',
+     '    if False:',
+     'test_an_ok_disk_read_with_no_number_is_UNREAD_not_zero_gib'),
     ("an unaged queue record forfeits its authority",
      "        if qs_age is None or hdr_age is None or qs_age < hdr_age:",
      "        if qs_age is not None and (hdr_age is None or qs_age < hdr_age):",
@@ -5298,7 +5338,27 @@ def test_a_NON_BOOL_draft_bit_is_UNREAD_not_a_draft():
                             "repo": [{"repo": "o/r", "age_s": 5}]}}
     v = m.check_landers(facts, cfg)
     assert (v.status, v.variant) == (m.INCONCLUSIVE, "PARTIAL_POPULATION"), (v.status, v.variant)
+    # ⛔ AND AN ABSENT KEY IS NOT `False`. `.get("draft", False)` admitted a row with NO draft bit as
+    # a definite non-draft, so a PR that might be a draft produced FAIL/LANDER_MISSING ("this PR has
+    # no lander at all") — a FAIL about a bit nobody read.
+    absent = dict(row, auto_armed=False)
+    absent.pop("draft")
+    facts["github"]["open_prs"] = [absent]
+    v_abs = m.check_landers(facts, cfg)
+    assert (v_abs.status, v_abs.variant) == (m.INCONCLUSIVE, "PARTIAL_POPULATION"), (
+        v_abs.status, v_abs.variant)
+    # …and the numerator can never exceed the denominator: two unread draft bits beside one graded
+    # row is "2 of 3", not "2 of 1"
+    facts["github"]["open_prs"] = [dict(row, number=5, draft=False, auto_armed=True),
+                                   dict(row, number=6, draft="false"),
+                                   dict(row, number=7, draft="no")]
+    facts["github"]["open_pr_count"] = 3
+    v_num = m.check_landers(facts, cfg)
+    assert (v_num.status, v_num.variant) == (m.INCONCLUSIVE, "PARTIAL_POPULATION"), (
+        v_num.status, v_num.variant)
+    assert "2 of 3 non-draft" in v_num.detail, v_num.detail
     # a real draft is still counted and skipped, not graded
+    facts["github"]["open_pr_count"] = 1
     facts["github"]["open_prs"] = [dict(row, draft=True)]
     v2 = m.check_landers(facts, cfg)
     assert (v2.status, v2.variant) == (m.PASS, "NOTHING_GREEN"), (v2.status, v2.variant)
@@ -5355,6 +5415,16 @@ def test_a_CORRUPT_per_box_state_record_is_REPAIRED_and_disclosed_not_crashed():
         assert st.save() is True
         st3 = m.State(path, "local")
         assert st3.repaired is False, st3.data
+        # ⛔ EVERY DISCARDED RECORD IS DISCLOSED, not just the per-box shape. These three silently
+        # restarted de-duplication from empty while the run reported nothing.
+        for bad, label in (({"version": 1, "boxes": [1, 2]}, "boxes is a LIST"),
+                           ({"version": 1, "boxes": {"local": None}}, "the box record is NULL"),
+                           ("{not json", "the file does not parse")):
+            with open(path, "w") as fh:
+                fh.write(bad if isinstance(bad, str) else json.dumps(bad))
+            stx = m.State(path, "local")
+            assert stx.repaired is True, (label, stx.data)
+            assert isinstance(stx.notified, dict), (label, stx.data)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -5377,6 +5447,43 @@ def test_a_FROZEN_log_is_FAIL_SILENT_even_when_its_tail_was_not_read():
     fresh = dict(base, log={"exists": True, "path": "/tmp/l", "age_s": 30})
     v2 = m.check_controller_cycling(fresh, cfg)
     assert (v2.status, v2.variant) == (m.INCONCLUSIVE, "LOG_UNREADABLE"), (v2.status, v2.variant)
+
+
+@test
+def test_a_STRING_false_headroom_ok_does_not_manufacture_an_OOM():
+    """`if disk.get("ok")` is TRUTHINESS, and "false" is truthy, so a surface that said the read
+    FAILED was graded as a successful one carrying `avail_bytes: 0` and produced
+    `FAIL/BELOW_FLOOR` — a fake OOM emergency on the check whose FAIL must mean one."""
+    m = load()
+    cfg = m.cfg_from_dict({})
+    for key, floor in (("disk", "avail_bytes"), ("mem", "avail_mb")):
+        facts = {"headroom": {"disk": {"ok": True, "avail_bytes": 400 * (1 << 30), "used_pct": 10,
+                                       "mount": "/"},
+                              "mem": {"ok": True, "avail_mb": 9000, "source": "d"}}}
+        facts["headroom"][key] = {"ok": "false", floor: 0}
+        v = m.check_headroom(facts, cfg)
+        assert v.status != m.FAIL, (key, v.status, v.variant, v.detail)
+        assert "BELOW_FLOOR" != v.variant, (key, v.variant, v.detail)
+
+
+@test
+def test_a_frozen_refresh_with_no_header_is_NOT_a_measured_idle():
+    """A wedged controller writes no cycle header. `_activity` returned `False` ("the fleet had
+    nothing in hand") for that shape, so `pr_created`/`pr_merged` graded the failure to cycle as
+    evidence of an empty backlog — the opposite of what a missing header shows."""
+    m = load()
+    cfg = m.cfg_from_dict({})
+    d = fx("healthy")
+    d["facts"]["log_events"]["headers"] = []
+    d["facts"]["log_events"]["dispatch_ok"] = []
+    d["facts"]["log_events"]["lane_started"] = []
+    d["facts"]["github"]["prs_created_in_window"] = 0
+    d["facts"]["github"]["prs_merged_in_window"] = 0
+    d["facts"]["github"]["open_pr_count"] = 0
+    d["facts"]["github"]["open_prs"] = []
+    busy, why = m._activity(d["facts"], cfg=cfg)
+    assert busy is None, (busy, why)
+    assert "not established" in why, why
 
 
 @test
