@@ -321,7 +321,7 @@ PI_GATE_LEDGER_MAX_BYTES=5242880
 # only after the gate passed and pi was actually launched, so it cannot be produced by a refusal.
 AGENT_STARTED=0
 run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
-  local t="$1" log="$2" prompt="$3" label="${4:-agent}" pid w rc l start elapsed
+  local t="$1" log="$2" prompt="$3" label="${4:-agent}" pid w rc l start elapsed was_m jobctl
   AGENT_STARTED=0
   # ── the disk gate (#1765). Read FRESH immediately before the spawn, for the load gate's reason plus
   # one of its own: a lane can sit waiting for a claim for 90 minutes, and the filesystem it will
@@ -405,7 +405,7 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   # leaders only if both are started while `set -m` is ON.
   ( sleep "$t"; kill -TERM "$pid" 2>/dev/null; sleep 15; kill -KILL "$pid" 2>/dev/null ) >/dev/null 2>&1 &
   w=$!
-  set +m 2>/dev/null || true
+  [ "$was_m" = "1" ] || { [ "$jobctl" = "1" ] && set +m 2>/dev/null; }
   wait "$pid" 2>/dev/null; rc=$?
   # ⛔ KILL THE WATCHDOG'S WHOLE GROUP, not just its shell (#2163). `kill $w` ends the subshell but
   # leaves its `sleep "$t"` child (up to the lane's 40-minute wall limit) reparented to init — a
