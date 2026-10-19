@@ -691,6 +691,46 @@ for base in "${merge_gate_srcs[@]}"; do
 done
 echo "    scripts merge-gate farm: $merge_gate_copied copied (record-review.sh, #562)"
 
+# ── the pi spawn-point gate (#1884) ──────────────────────────────────────────
+# Installed as `pi` — not as a farmed script — because that is the whole point: `spawn-gate.sh` is
+# ALSO an executable whose invoked identity IS the gate (see "THE SPAWN POINT" in that file), and it
+# is installed under the name a caller actually types. $DEST/bin is FIRST on PATH on this fleet
+# (measured on the laptop and on a cmux cell, and install-launchd.sh keeps it in the runner-gate
+# plist PATH so the daemon and the tmux children it starts inherit it), so every `pi` invocation
+# resolves here: lane.sh, fix-one.sh, merge-one.sh, a hand-written tmux runner, an interactive
+# session. Before #1884 the gate was reachable only by callers that sourced it, and a runner that
+# did not was UNGATED AND SILENT — that is how a box reached load 258 against its own ceiling of 100.
+#
+# ONE COPY, from ONE source: the same file the harness callers source, so the ceiling a caller applies
+# and the ceiling the spawn point applies cannot drift. A real copy rather than a symlink for the
+# #427 reason (a symlink into the checkout EPERMs under launchd/TCC and dangles when a worktree is
+# reaped — a dangling `pi` on PATH breaks every lane on the box).
+SPAWN_GATE_SRC="$INFRA_ROOT/scripts/orchestrator-harness/spawn-gate.sh"
+if [ -f "$SPAWN_GATE_SRC" ]; then
+  mkdir -p "$DEST/bin"
+  if [ -e "$DEST/bin/pi" ] && ! cmp -s "$SPAWN_GATE_SRC" "$DEST/bin/pi"; then
+    # Someone else's `pi` in this directory would be silently REPLACED by the line below, and a
+    # different `pi` launcher is exactly the kind of local tooling an operator would not want
+    # clobbered unnoticed — so keep it, loudly.
+    cp -f "$DEST/bin/pi" "$DEST/bin/pi.bak-bootstrap" 2>/dev/null || true
+    echo "    backed up a pre-existing $DEST/bin/pi to pi.bak-bootstrap (it is not this repo's gate)"
+  fi
+  cp -f "$SPAWN_GATE_SRC" "$DEST/bin/pi"
+  chmod +x "$DEST/bin/pi" 2>/dev/null || true
+  echo "    pi spawn-point gate installed at $DEST/bin/pi (#1884)"
+  # A gate that is installed but NOT ahead of the real pi on PATH is a false install: it would report
+  # success here while every spawn resolved past it. Say so at install time, when it is cheap to fix.
+  case ":$PATH:" in
+    *"/.pi/agent/bin:"*) ;;
+    *) echo "    WARNING: $DEST/bin is not on this shell's PATH, so the spawn-point gate is NOT in front of \`pi\` here." >&2 ;;
+  esac
+else
+  echo "ERROR: $SPAWN_GATE_SRC is missing — the pi spawn-point gate (#1884) was NOT installed." >&2
+  echo "       Every \`pi\` a hand-written runner starts would then be ungated and silent, which is the" >&2
+  echo "       defect #1884 records. Re-clone agent-infra and re-run this script." >&2
+  exit 1
+fi
+
 # ── UNFARM leg (#1924) ────────────────────────────────────────────────────
 # Every farm above is COPY-ONLY: `cp -f` writes the names an array lists and does
 # nothing at all to a name it does not list. `[ -f "$f" ] || continue` therefore skips

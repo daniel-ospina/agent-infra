@@ -2026,6 +2026,53 @@ run_setup
 check_content_matches "$DEST/extensions" "run6"
 check_fix_markers "$DEST/extensions" "run6"
 
+# --- the pi spawn-point gate (#1884) --------------------------------------
+# setup.sh installs spawn-gate.sh AS `pi` in $DEST/bin — first on this fleet's PATH — because the
+# gate must sit where `pi` is born, not where a caller remembers to source it. Pinned BY ARTIFACT and
+# BY BEHAVIOUR (a byte comparison alone would pass on a copy that cannot run): the INSTALLED file is
+# driven as `pi`, with MAX_LOAD=0 as the deterministic refusal lever and a fake real pi behind it.
+# The defect this exists for: a hand-written runner that sourced nothing started lanes on a box at
+# load 258 against its own ceiling of 100, with no refusal, no log line and no count.
+echo "== the pi spawn-point gate (#1884)"
+GATE_SRC="$ROOT/scripts/orchestrator-harness/spawn-gate.sh"
+GATE_DST="$DEST/bin/pi"
+if [ -f "$GATE_DST" ] && cmp -s "$GATE_SRC" "$GATE_DST"; then
+  echo "ok: setup.sh installed the spawn-point gate byte-identical at \$DEST/bin/pi"
+else
+  fail "setup.sh did not install the spawn-point gate at $GATE_DST (missing or stale) — every \`pi\` a hand-written runner starts would be ungated and silent"
+fi
+if [ -x "$GATE_DST" ]; then
+  echo "ok: the installed gate is executable (PATH skips a non-executable entry, silently)"
+else
+  fail "$GATE_DST is not executable — PATH would resolve past the gate"
+fi
+mkdir -p "$TMP/gate-real"
+printf '#!/usr/bin/env bash\nprintf RAN > "%s"\n' "$TMP/gate-ran" > "$TMP/gate-real/pi"
+chmod +x "$TMP/gate-real/pi"
+rm -f "$TMP/gate-ran"
+HOME="$HOME_DIR" MAX_LOAD=0 PATH="$DEST/bin:$TMP/gate-real:$PATH" pi -p "gate probe" >/dev/null 2>&1 || true
+if [ ! -e "$TMP/gate-ran" ]; then
+  echo "ok: the installed gate REFUSED a spawn at MAX_LOAD=0 (the real pi never ran)"
+else
+  fail "the installed gate allowed a spawn at MAX_LOAD=0 — 'spawn nothing' is not enforced"
+fi
+HOME="$HOME_DIR" MAX_LOAD=999999999 PATH="$DEST/bin:$TMP/gate-real:$PATH" pi -p "gate probe" >/dev/null 2>&1 || true
+if [ -e "$TMP/gate-ran" ]; then
+  echo "ok: POSITIVE CONTROL — below the ceiling the installed gate EXECs the real pi"
+else
+  fail "the installed gate blocked a spawn below the ceiling: every refusal above would be vacuous"
+fi
+# A re-run must REFRESH a mutated copy: a stale gate is worse than a missing one (the missing one is
+# loud; the stale one certifies a ceiling it no longer applies).
+rm -f "$TMP/gate-ran"
+echo "# drift injected by the test" >> "$GATE_DST"
+run_setup
+if cmp -s "$GATE_SRC" "$GATE_DST"; then
+  echo "ok: a mutated spawn-point gate was REFRESHED by the re-run (the repo copy is the copy that runs)"
+else
+  fail "a cell-local mutation of the spawn-point gate survived the re-run"
+fi
+
 # --- done -----------------------------------------------------------------
 # #446: every setup.sh run happened under the temp HOME; the launchctl shim
 # must be SILENT (no call escaped to any launchctl) and the installer's

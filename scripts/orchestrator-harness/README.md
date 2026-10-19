@@ -611,6 +611,23 @@ by `./selftest.sh` rather than quoted here.
 secret into a world-readable plist, and launchd inherits no shell environment — so an env-only
 `AI_REVIEW_GATE_KEY` is reported as insufficient, not as "present". The box cannot merge without it.
 
+**The load gate is installed as `pi` itself (agent-infra#1884).** `spawn-gate.sh` is double-duty: the
+library `lane.sh`/`fix-one.sh` source, AND an executable that both installers copy to
+`$HOME/.pi/agent/bin/pi`, one of the first directories on PATH on every surface (and kept in the
+runner-gate plist PATH, so the daemon and the tmux children it starts inherit it). Every process that
+runs `pi` therefore resolves the GATE, not just the callers that remembered to source it: a
+hand-written `tmux new-session -d -s x "… pi -p …"` runner included. That path was the defect —
+nothing refused, logged or counted, and the box went to load 258 against its own `MAX_LOAD=100`. A
+refusal is loud (1-min load, ceiling, the item, and the calling process), counted in
+`~/.pi/agent/state/spawn-gate.tsv` (allowed runs too; bounded by a one-generation rotation at 5 MiB,
+because this is the highest-volume sink in the tree and a device that fills silently is #1765's
+defect), and exits 76, which `run_agent` translates to
+the callers' usual `AGENT_LOAD_REFUSED`/`AGENT_STARTED=0`. Its stated limits are in the file's header:
+the real binary by ABSOLUTE path or a `PATH` reset is not gated (deliberately — that is the
+operator's rescue route when the box is over its ceiling, and the refusal message prints it), a
+caller that exports its own `MAX_LOAD` sets its own ceiling, and a box where neither installer has
+run has no shim. `pi-bootstrap/cell-install.sh --verify` byte-compares the installed copy.
+
 ### Tuning (10-core / 32 GB box — the values that were actually used)
 
 | Var | Value | Why |
@@ -1766,6 +1783,20 @@ were deleted.
 - **The fixer's CI-log fetch (agent-infra#1703).** `fix-one.sh` reads the workflow run's
   `--log-failed | tail -80` rather than the failed *job's* log, so a multi-failed-job run can feed
   the fixer the wrong check's output. Raised as a P1 in the tortoise#8298 review and never applied.
+- **The capacity gate was SOURCE-ONLY (agent-infra#1884) — the spawn point now owns it.** The load
+  gate was a library a caller had to SOURCE, so the control was exactly as strong as the weakest
+  caller, and a caller that omitted it was not merely ungated but INVISIBLE: no refusal, no log line,
+  no count. Measured 2026-10-16: the orchestrator started three lanes from
+  `tmux new-session -d -s <name> "… pi -p …"`, no `lane.sh`, so `MAX_LOAD` was never read — on a box
+  at load 258 on 10 cores against its own ceiling of 100. **✔ FIXED** — `spawn-gate.sh` is also an
+  executable installed as `$HOME/.pi/agent/bin/pi` (first on PATH), so every `pi` resolves the gate; a
+  refusal names the reading/ceiling/item/caller, is counted in `~/.pi/agent/state/spawn-gate.tsv`,
+  and exits 76 (translated to the callers' 75). Named residuals: an invocation that bypasses PATH
+  (absolute path, `env -i`, a `PATH` reset) is not gated — that is the operator's documented rescue,
+  and `MAX_LOAD` stays the operator's own tunable — and the **`task`/sub-agent dispatch does not pass
+  through PATH at all** (`getPiInvocation` spawns `process.execPath` + the entry script so a truncated
+  PATH cannot cause ENOENT), so a `task` child is a SECOND spawn point this gate does not cover
+  (agent-infra#1920).
 - **The runner-label gate reports success on values it never read (agent-infra#1704).** In
   `ci_runner_gate.sh`, an unreadable queue count falls through to "healthy" (the integer test
   errors and the `||` chain reads that as false) and `set_labels()` reports success when the runner
