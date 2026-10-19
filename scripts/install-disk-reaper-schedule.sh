@@ -769,7 +769,7 @@ sd_uninstall() {
 # ── launchd backend ──────────────────────────────────────────────────────────────────────────
 LD_DIR=""; LC=""; LD_DOMAIN=""
 choose_launchd_target() {
-    LD_DIR="${DISK_REAPER_AGENTS_DIR:-${HOME:?HOME is required}/Library/LaunchAgents}"
+    LD_DIR="${DISK_REAPER_AGENTS_DIR:-${HOME:-}/Library/LaunchAgents}"
     LC="${LAUNCHCTL:-launchctl}"
     LD_DOMAIN="${LAUNCHD_DOMAIN:-gui/$(id -u)}"
     # `command -v` returns 1 for an absolute path in bash, so test executability for a path and PATH
@@ -882,9 +882,15 @@ ld_status() {
     [ -n "$rec" ] && LD_DIR="$rec"
     dest="$LD_DIR/$LABEL.plist"
     if [ ! -f "$dest" ]; then
+        # ⛔ ASK LAUNCHD FIRST — the same authoritative answer `ld_uninstall` uses (#2048 review). Guessing
+        # answered `installed=yes`, `enabled=enabled`, `armed=apply` (rc 0) while the LOADED plist — in a
+        # seam dir the stamp could not name — carried `--dry-run`: the one field an operator reads to know
+        # the Mac is DELETING was read off a plist that was not the loaded job.
+        _loaded="$($LC print "$LD_DOMAIN/$LABEL" 2>/dev/null | sed -n 's/^[[:space:]]*path = //p' | head -1)"
         for _cand in "$live_dir" "${HOME:-}/Library/LaunchAgents"; do
             [ -n "$_cand" ] && [ -f "$_cand/$LABEL.plist" ] && { dest="$_cand/$LABEL.plist"; break; }
         done
+        case "$_loaded" in /*) [ -f "$_loaded" ] && dest="$_loaded" ;; esac
     fi
     say "platform=darwin"
     say "scheduler=launchd"
@@ -1010,7 +1016,7 @@ ld_uninstall() {
     # directory (an unloaded job whose stamp this run cannot see), the population is a set of GUESSES:
     # the job is gone and the stamp is gone, but a survivor outside those guesses was never looked at —
     # so the claim names the directories checked instead of asserting a verified removal (#2048 review).
-    if [ -n "$rec" ] || [ -n "$loaded_path" ]; then
+    if [ -n "$rec" ] || [ -n "$loaded_dir" ]; then
         say "uninstalled $LABEL from ${plist_dirs[*]}"
     else
         say "uninstalled $LABEL — checked ${plist_dirs[*]} (no record and no loaded job named the location; nothing outside those directories was examined)"
@@ -1115,8 +1121,8 @@ fi
 # instead; `--status`/`--uninstall` stay usable without HOME because they must be able to clean up.
 if [ -z "${HOME:-}" ] && [ "$MODE" = "--install" ]; then
     err "HOME is empty: the rendered job's Environment=HOME would be empty and every scheduled pass would fail closed."
-    err "       Set HOME (or provision a real home for this account) and re-run. --status works without HOME;"
-    err "       on launchd, export HOME to manage (uninstall) the job, whose directory is derived from it."
+    err "       Set HOME (or provision a real home for this account) and re-run. Without HOME every verb needs"
+    err "       DISK_REAPER_STATE_DIR (and, on launchd, DISK_REAPER_AGENTS_DIR); --uninstall needs it to know the dir."
     exit 2
 fi
 
@@ -1129,10 +1135,25 @@ fi
 # `--dry-run` remains the reversal. Nothing here reads the environment: the stamp is state WE wrote,
 # and --uninstall deletes it, so the next install starts report-only again.
 if [ "${MODE_EXPLICIT:-0}" != 1 ]; then
-    case "$(stamp_field armed)" in
+    _stamp_armed="$(stamp_field armed)"
+    case "$_stamp_armed" in
         apply)   MODE_FLAG=--apply ;;
         dry-run) MODE_FLAG=--dry-run ;;
     esac
+    # ⛔ AN INSTALL THAT ADOPTS NOTHING MUST NOT LOOK LIKE A ROUTINE SYNC (#2048 review). When the record
+    # is not visible to THIS run (a different state dir — a sudo/root/sanitized-env invocation of the same
+    # verb) while an artifact is already installed, the no-flag install silently rewrote an ARMED job to
+    # report-only: the disk-fill direction #2048 exists to prevent, announced only by the routine
+    # `armed: dry-run` line every sync prints. Say the reversal out loud, in the direction that hurts.
+    if [ -z "$_stamp_armed" ]; then
+        _existing=""
+        case "$PLATFORM" in
+            darwin) [ -f "${DISK_REAPER_AGENTS_DIR:-${HOME:-}/Library/LaunchAgents}/$LABEL.plist" ] && _existing="launchd job" ;;
+            *)      for _d in "${SYSTEMD_SYSTEM_DIR:-/etc/systemd/system}" "${HOME:-}/.config/systemd/user" "${SYSTEMD_UNIT_DIR:-}"; do
+                        [ -n "$_d" ] && [ -f "$_d/eldato-disk-reaper.service" ] && { _existing="systemd unit"; break; }; done ;;
+        esac
+        [ -n "$_existing" ] && warn "no schedule record visible at $STAMP but a $_existing is installed — installing REPORT-ONLY (the owner's --apply is NOT adopted). If this box was armed, re-run with --apply."
+    fi
 fi
 
 if [ -z "$REAPER" ]; then

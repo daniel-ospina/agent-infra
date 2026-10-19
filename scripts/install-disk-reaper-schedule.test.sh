@@ -797,7 +797,7 @@ rm -rf "$SYSDIR_I" "$T/state-i"
 # ~/Library/LaunchAgents, an operator re-installed with the seam, then uninstalled with it still set"
 # is supported — and the default dir's plist used to survive with rc 0, for launchd to re-load (armed)
 # at the next login. The read-back now covers the default dir too.
-DEFHOME="$T/home-def"; mkfakehome "$DEFHOME" 2>/dev/null || mkdir -p "$DEFHOME/Library/LaunchAgents"
+DEFHOME="$T/home-def"; mkdir -p "$DEFHOME/Library/LaunchAgents"
 HOME="$DEFHOME" DISK_REAPER="$PASSFILE" DISK_REAPER_REPOS="$REPO" DISK_REAPER_PLATFORM=darwin \
     DISK_REAPER_STATE_DIR="$T/state-j" LAUNCHCTL="$T/bin/launchctl" LAUNCHD_DOMAIN="gui/999" \
     DISK_REAPER_PYTHON="$T/bin/fakepython" ELDATO_ALLOW_TEST_HOME=1 bash "$INST" --install >/dev/null 2>&1
@@ -825,7 +825,7 @@ rm -rf "$DEFHOME" "$SEAM_DIR" "$T/state-j" "$T/launchctl.state"
 # so neutering it left the suite green while `--uninstall` certified a SURVIVING armed plist
 # (#2048 review, round 10). Two state dirs, one seam, no record visible to the uninstalling run.
 SEAM_L="$T/agents-l"; mkdir -p "$SEAM_L"
-DEFHOME="$T/home-l"; mkfakehome "$DEFHOME" 2>/dev/null || mkdir -p "$DEFHOME/Library/LaunchAgents"
+DEFHOME="$T/home-l"; mkdir -p "$DEFHOME/Library/LaunchAgents"
 HOME="$DEFHOME" DISK_REAPER="$PASSFILE" DISK_REAPER_REPOS="$REPO" DISK_REAPER_PLATFORM=darwin \
     DISK_REAPER_STATE_DIR="$T/state-l1" DISK_REAPER_AGENTS_DIR="$SEAM_L" LAUNCHCTL="$T/bin/launchctl" \
     LAUNCHD_DOMAIN="gui/999" DISK_REAPER_PYTHON="$T/bin/fakepython" ELDATO_ALLOW_TEST_HOME=1 \
@@ -838,6 +838,24 @@ assert_eq "$RC" "0" "T8l --uninstall from a DIFFERENT state dir and no seam succ
 assert_nofile "$SEAM_L/com.eldato.disk-reaper.plist" \
     "T8l …because launchd named the plist; without that candidate this survivor is certified as removed"
 rm -rf "$SEAM_L" "$T/state-l1" "$T/state-l2" "$T/launchctl.state" "$T/launchctl.plist-path" "$DEFHOME" 2>/dev/null
+
+# ── T8m: a no-flag install that CANNOT SEE the record must say it is reverting to report-only ──
+# The stamp is the only place the arming lives, so an install running with a different state dir adopts
+# nothing — and it used to rewrite an armed job to report-only with no signal beyond the routine
+# `armed: dry-run` line every sync prints. That is the disk-fill direction #2048 exists to prevent.
+DEFHOME="$T/home-m"; mkdir -p "$DEFHOME/Library/LaunchAgents"
+HOME="$DEFHOME" DISK_REAPER="$PASSFILE" DISK_REAPER_REPOS="$REPO" DISK_REAPER_PLATFORM=darwin \
+    DISK_REAPER_STATE_DIR="$T/state-m1" LAUNCHCTL="$T/bin/launchctl" LAUNCHD_DOMAIN="gui/999" \
+    DISK_REAPER_PYTHON="$T/bin/fakepython" ELDATO_ALLOW_TEST_HOME=1 bash "$INST" --install --apply >/dev/null 2>&1
+OUT="$(HOME="$DEFHOME" DISK_REAPER="$PASSFILE" DISK_REAPER_REPOS="$REPO" DISK_REAPER_PLATFORM=darwin \
+    DISK_REAPER_STATE_DIR="$T/state-m2" LAUNCHCTL="$T/bin/launchctl" LAUNCHD_DOMAIN="gui/999" \
+    DISK_REAPER_PYTHON="$T/bin/fakepython" ELDATO_ALLOW_TEST_HOME=1 bash "$INST" --install 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T8m a no-flag install with an invisible record still succeeds"
+assert_contains "$OUT" "REPORT-ONLY" "T8m ...but NAMES the reversal instead of reverting an armed job silently"
+assert_contains "$OUT" "re-run with --apply" "T8m ...and says how to get the arming back"
+grep -q -- '--dry-run' "$DEFHOME/Library/LaunchAgents/com.eldato.disk-reaper.plist" 2>/dev/null \
+    && ok "T8m ...the artifact really is report-only now" || bad "T8m the artifact was not rewritten report-only"
+rm -rf "$T/state-m1" "$T/state-m2" "$DEFHOME" "$T/launchctl.state" "$T/launchctl.plist-path"
 
 echo "── T11. both systemd targets, including the two arms no test could reach ──"
 # (a) the SYSTEM unit with `SUDO=""` — the "already root / container" arm. The system unit dir is a

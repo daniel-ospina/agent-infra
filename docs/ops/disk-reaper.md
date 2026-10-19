@@ -248,7 +248,8 @@ platform=darwin|linux        scheduler=launchd|systemd     job=<label|unit>
 installed=yes|no             enabled=enabled|disabled      active=active|inactive
 armed=apply|dry-run          interval_seconds=3600         next_run=<...>|unknown
 armed_at=<iso8601>           armed_by=<user>@<host>
-last_exit=<n>|unknown        pass=</path/to/disk-reaper.sh>
+last_exit=<n>|unknown        pass_resolved=</path/to/disk-reaper.sh>
+--                            pass_resolved_exists=yes|no   (what THIS run resolved, not what the job runs)
 repos=<repo:repo>            runner=<binary> <launcher|pass>   pass_sha=<...>
 pass_drift=in-sync|CHANGED since install
 --- pass record ---
