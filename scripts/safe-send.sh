@@ -72,8 +72,22 @@ if [ -n "$PSCREEN" ]; then
 fi
 # Overridable so the rc -> state mapping can be PROVEN with a stub dispatcher instead of
 # by sending a real message into a real lane (which would cause the very sidetracking this
-# gate exists to prevent). Defaults to the real dispatcher.
-DISPATCH="${SAFE_SEND_DISPATCH:-/Users/danielospina/Documents/GitHub/tortoise/tools/cmux_dispatch.py}"
+# gate exists to prevent).
+# #8432: the default is resolved from THIS repo's own tree — the dispatcher ships with the harness in
+# agent-infra — falling back to the historical product-repo path only for a box that has not been
+# redeployed yet. It used to be a hardcoded /Users/<one-laptop>/… path, which is a dead path (and a
+# silently broken send gate) on every other box, including the Linux cells.
+_ss_here="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+DISPATCH="${SAFE_SEND_DISPATCH:-${CMUX_DISPATCH:-}}"
+if [ -z "$DISPATCH" ]; then
+  for _ss_cand in "$_ss_here/orchestrator-harness/tools/cmux_dispatch.py" \
+                  "$_ss_here/cmux_dispatch.py" \
+                  "${HOME:-/nonexistent}/Documents/GitHub/tortoise/tools/cmux_dispatch.py"; do
+    [ -f "$_ss_cand" ] && { DISPATCH="$_ss_cand"; break; }
+  done
+  # Nothing resolved: name the path we WOULD have used, so the failure below is diagnosable.
+  [ -n "$DISPATCH" ] || DISPATCH="$_ss_here/orchestrator-harness/tools/cmux_dispatch.py"
+fi
 
 if [ "$MODE" != "--force" ]; then
   # read-screen can fail or resolve to another pane; a FAILED read must not read as

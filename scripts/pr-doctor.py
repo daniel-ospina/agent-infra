@@ -91,6 +91,23 @@ SCRIPTS = os.path.join(HOME, ".pi", "agent", "scripts")
 REPO = "daniel-ospina/tortoise"
 REPO_DIR = os.path.join(HOME, "Documents", "GitHub", "tortoise")
 
+# #8432: the dispatcher used to be looked up in the PRODUCT repo (`REPO_DIR/tools/`), which is a
+# hard dependency on a product checkout — absent on the Linux cells, so a dispatch there died on a
+# missing file. The tool family ships with the harness in agent-infra now, so resolve from THIS
+# repo's own tree first and keep the product path only as a last-resort fallback for a box that has
+# not been redeployed yet.
+def cmux_dispatch_path() -> str:
+    override = os.environ.get("CMUX_DISPATCH")
+    if override:
+        return override
+    here = os.path.dirname(os.path.abspath(__file__))
+    for cand in (os.path.join(here, "orchestrator-harness", "tools", "cmux_dispatch.py"),
+                 os.path.join(here, "cmux_dispatch.py"),
+                 os.path.join(REPO_DIR, "tools", "cmux_dispatch.py")):
+        if os.path.exists(cand):
+            return cand
+    return os.path.join(here, "orchestrator-harness", "tools", "cmux_dispatch.py")
+
 
 # ⛔ USE THE REAL gh BINARY, NOT THE `gh` ON PATH. On this box `~/.pi/agent/shims/gh` is a
 # SYMLINK into ~/Documents (agent-infra/scripts/gh-shim/gh). macOS TCC protects ~/Documents
@@ -633,7 +650,7 @@ def dispatch(lane_ws: str, label: str, text: str, dry: bool) -> bool:
     # ~/tools/... and yields an empty result -- which is exactly the "FAIL (no output)"
     # this job logged on its first live dispatch.
     argv = ([py] if py != "uv" else ["uv", "run", "python"]) + [
-        os.path.join(REPO_DIR, "tools", "cmux_dispatch.py"),
+        cmux_dispatch_path(),
         "send", "--workspace", lane_ws, "--label", label, "--file", path]
     # ⛔ NOT cwd=REPO_DIR. A cwd under ~/Documents is TCC-protected and a launchd agent has no
     # Full Disk Access, so getcwd fails and the whole call dies with "Operation not permitted"

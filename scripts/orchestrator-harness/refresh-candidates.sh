@@ -14,6 +14,11 @@
 # alive and can only merge. `--check` answers the provisioning question up front, WITH THE REASON,
 # so a cell is never STARTED in that state (cloud-cell-supervisor.sh `check` calls it).
 set -u
+# This script's OWN directory (#8432) — the harness's tree, in a checkout and in the deployed `$O`
+# copy alike. Resolved from BASH_SOURCE, never from a guessed path, so the pre-flight tool below is
+# found beside the other shipped scripts. Falling back to `.` keeps `set -u` satisfied when the
+# script is piped into bash (no BASH_SOURCE), which is how some test harnesses drive it.
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)" || HERE="."
 OR="${OR:-daniel-ospina/tortoise}"
 REPO="${REPO:-/Users/danielospina/Documents/GitHub/tortoise}"
 SC="$REPO/.worktrees/dispatch-scout"
@@ -167,13 +172,27 @@ case "${1:-}" in
 esac
 
 # ── the collision pre-flight tool, resolved PER REPO (agent-infra#1736) ────────────────────────
-# The gate is a TORTOISE product: tortoise is the only repo that ships tools/collision_preflight.py
-# and it applies to ANY issue's repo through --repo. A repo that carries its own copy wins (it pins
-# the version that repo reviewed against); otherwise a tortoise checkout is used; otherwise there
-# is NOTHING to run, and "nothing to run" must be a loud refusal, never an empty backlog. The old
-# code hardcoded `$SC/tools/collision_preflight.py`, so a cell on agent-infra (no such file) ran a
-# tool that did not exist, emitted no VERDICT, and queued nothing — forever, and silently.
+# The gate applies to ANY issue's repo through --repo, so it is resolved per target. THREE tiers,
+# in this order, and the order is the #1736 decision, not an accident:
+#   1. the TARGET repo's own `tools/collision_preflight.py` — it pins the version that repo
+#      reviewed against, and that is what #1736 deliberately made win;
+#   2. THIS harness's own `tools/collision_preflight.py` — #8432. The tool family now ships WITH
+#      the harness, so a cell needs no product-repo checkout to be provisionable. Before this,
+#      tier 2 was a tortoise checkout, i.e. the shared tooling repo had a hard dependency on the
+#      product repo for its own gate;
+#   3. a `TORTOISE_REPO` checkout — TRANSITION ONLY (agent-infra#8432). It exists for a box that
+#      has this refresh script but not yet the `tools/` directory beside it (an operator who ran the
+#      drift warning's hand `cp *.sh` and skipped the subdir, or a deploy predating the tools move).
+#      `--check` NAMES the tier it resolved, so an operator can see they are on the fallback.
+#   4. otherwise there is NOTHING to run, and "nothing to run" must be a loud refusal, never an empty
+#      backlog. The old code hardcoded `$SC/tools/collision_preflight.py`, so a cell on agent-infra
+#      (no such file) ran a tool that did not exist, emitted no VERDICT, and queued nothing —
+#      forever, and silently.
 PREFLIGHT=""
+PREFLIGHT_TIER=""
+# The harness's OWN tree — `HERE` is this script's directory, both in a checkout and in the deployed
+# `$O` copy (install.sh ships `tools/` beside the scripts for exactly this reason).
+HARNESS_TOOL="$HERE/tools/collision_preflight.py"
 # The configured tortoise checkout. `TORTOISE_REPO` is the harness's established name for this
 # (check-port-drift.sh, install-launchd.sh, hub-state-check.sh); `TORTOISE` is accepted as an alias
 # so an operator's existing keys.env keeps working (agent-infra#1748 review).
@@ -198,16 +217,22 @@ find_tortoise() {   # print a tortoise checkout carrying the tool, or return 1
   return 1
 }
 
-resolve_preflight() {   # sets PREFLIGHT to the resolved tool path; returns 1 if none
+resolve_preflight() {   # sets PREFLIGHT/PREFLIGHT_TIER; returns 1 if none
   local repo_dir t
-  # The TARGET repo's own copy — the scout worktree when it exists, else the main checkout.
+  # Tier 1 — the TARGET repo's own copy (the scout worktree when it exists, else the main checkout).
   # `--check` must not create the worktree, so the main checkout is what it reads there.
   repo_dir="$REPO"; [ -d "$SC" ] && repo_dir="$SC"
   if [ -f "$repo_dir/tools/collision_preflight.py" ]; then
-    PREFLIGHT="$repo_dir/tools/collision_preflight.py"; return 0
+    PREFLIGHT="$repo_dir/tools/collision_preflight.py"; PREFLIGHT_TIER="repo"; return 0
   fi
+  # Tier 2 — the harness's OWN tree (#8432). Always present in a checkout, and present in a deploy
+  # that ran install.sh after the tools move, so no product-repo checkout is required.
+  if [ -f "$HARNESS_TOOL" ]; then
+    PREFLIGHT="$HARNESS_TOOL"; PREFLIGHT_TIER="harness"; return 0
+  fi
+  # Tier 3 — TRANSITION ONLY: a tortoise checkout, for a box carrying this script but not `tools/`.
   if t="$(find_tortoise)"; then
-    PREFLIGHT="$t/tools/collision_preflight.py"; return 0
+    PREFLIGHT="$t/tools/collision_preflight.py"; PREFLIGHT_TIER="tortoise-transition"; return 0
   fi
   return 1
 }
@@ -384,13 +409,23 @@ cmd_check() {
   [ -d "$REPO" ] || { echo "[refresh] check: FAIL repo not found at $REPO"; return "$EXIT_TRANSIENT"; }
   tool_dir="$REPO"; [ -d "$SC" ] && tool_dir="$SC"
   if ! resolve_preflight; then
-    echo "[refresh] check: no tools/collision_preflight.py in $tool_dir and no tortoise checkout resolved (TORTOISE_REPO='${TORTOISE_REPO:-}', TORTOISE='${TORTOISE:-}')"
+    echo "[refresh] check: no collision_preflight.py in $tool_dir/tools, nor in this harness's own $HERE/tools, nor in a tortoise checkout (TORTOISE_REPO='${TORTOISE_REPO:-}', TORTOISE='${TORTOISE:-}')"
     echo "[refresh] NOT PROVISIONABLE: this repo cannot be pre-flighted for dispatch, so a cell on it would MERGE ONLY (#1736)"
-    echo "[refresh]   fix: set TORTOISE_REPO=<a tortoise checkout> (e.g. in keys.env), or vendor tools/collision_preflight.py into the repo"
+    echo "[refresh]   fix: restore this harness's tools/ directory ($HERE/tools/collision_preflight.py) — re-run install.sh, or cp -R the source's tools/ into \$O/ (#8432)"
     return "$EXIT_NOT_PROVISIONABLE"
   fi
   echo "[refresh] check: repo=$REPO"
-  echo "[refresh] check: pre-flight tool=$PREFLIGHT"
+  echo "[refresh] check: pre-flight tool=$PREFLIGHT (tier=$PREFLIGHT_TIER)"
+  # #8432: a transition-tier resolution is legitimate but must never be silent — it is the one
+  # tier that still needs a product-repo checkout, and it is the symptom of a half-updated box.
+  # Separate `echo`s, NOT one string with `\n`: this script runs under bash, whose builtin `echo`
+  # does not interpret backslash escapes, so the note would reach the operator as one literal-`\n` line.
+  if [ "$PREFLIGHT_TIER" = "tortoise-transition" ]; then
+    echo "[refresh] NOTE: the pre-flight resolved from a TORTOISE checkout, not from this harness's own"
+    echo "[refresh]   $HARNESS_TOOL — this box has not been given the harness's tools/ directory yet."
+    echo "[refresh]   That works, but it keeps the gate dependent on a product repo (#8432). Fix: re-run"
+    echo "[refresh]   install.sh (it ships tools/ beside the scripts), or cp -R the source's tools/ into $O/."
+  fi
   # ⛔ jq IS A PREREQUISITE OF THE LISTING READ (#1962 review). The listings run on the REST bucket and
   # `rest_list` assembles and projects pages with jq; without it the helper REFUSES rather than answer
   # from a partial read, so every pass would report `queue=UNREADABLE` and the cell would be MERGE-ONLY
@@ -510,9 +545,9 @@ cd "$SC" || { echo "[refresh] ABORT: no scout worktree at $SC — cannot pre-fli
 # Resolve the tool BEFORE spending time on a venv: a repo with no tool can never dispatch, whatever
 # its environment, and the reason must be the one an operator sees.
 if ! resolve_preflight; then
-  echo "[refresh] NOT PROVISIONABLE: no tools/collision_preflight.py in $SC and no tortoise checkout resolved (TORTOISE_REPO='${TORTOISE_REPO:-}', TORTOISE='${TORTOISE:-}')"
+  echo "[refresh] NOT PROVISIONABLE: no collision_preflight.py in $SC/tools, nor in this harness's own $HERE/tools, nor in a tortoise checkout (TORTOISE_REPO='${TORTOISE_REPO:-}', TORTOISE='${TORTOISE:-}')"
   echo "[refresh]   this repo cannot be pre-flighted for dispatch — the cell would merge only (#1736)"
-  echo "[refresh]   fix: set TORTOISE_REPO=<a tortoise checkout> (e.g. in keys.env) or vendor tools/collision_preflight.py into the repo"
+  echo "[refresh]   fix: restore this harness's tools/ directory ($HERE/tools/collision_preflight.py) — re-run install.sh, or cp -R the source's tools/ into \$O/ (#8432)"
   exit "$EXIT_NOT_PROVISIONABLE"
 fi
 

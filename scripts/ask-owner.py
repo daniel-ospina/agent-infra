@@ -620,7 +620,10 @@ BOUNCE_TAIL = (
 
 
 REGISTRY = f"{HOME}/.pi/agent/state/lane-registry.tsv"
-CMUX_DISPATCH = f"{HOME}/Documents/GitHub/tortoise/tools/cmux_dispatch.py"
+# #8432: resolved from this repo's own tree, not the PRODUCT repo — see turn-end.py.
+CMUX_DISPATCH = os.environ.get("CMUX_DISPATCH") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "orchestrator-harness", "tools", "cmux_dispatch.py")
 
 
 def _iso(e):

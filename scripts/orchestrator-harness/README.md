@@ -285,7 +285,7 @@ own `pi` workers, which do not go through `task`.
 | **`AI_REVIEW_GATE_KEY`** | the merge authority — env var, or `~/.pi/agent/.ai-review-gate-key` | **this harness cannot merge a gate-mode repo without it.** Treat as a secret; never commit it |
 | the target repo's branch protection | the REQUIRED-check list and the merge authority are read from it at runtime (agent-infra#1764) | `gh api repos/$OR/branches/main/protection/required_status_checks`. `REQ=…` in the cell env / `keys.env` overrides the read. Unreadable → `FALLBACK_REQ` (non-empty, fail-closed). Requires admin read on the repo, else the fallback applies every cycle and nothing merges |
 | `REVIEW_GATE` (optional) | names the check that IS the merge authority — the repo's gate | defaults to `ai-review-gate`; set it only for a repo whose gate has another name. It is read from the environment, so an ambient/`keys.env` value takes effect: **an override that changes the merge authority away from what the repo's own declaration gives is logged** as `⚠️ … CHANGES the merge authority`, naming the consequence. On a rail repo a flip to `gate` authority means a RAW merge (no head-bound evidence), so treat that line as an error, not noise |
-| a collision pre-flight tool | `refresh-candidates.sh` refuses overlapping dispatches | resolved **per repo** (agent-infra#1736): the target repo's own `tools/collision_preflight.py`, else a tortoise checkout (`TORTOISE_REPO`, or its legacy `TORTOISE` alias). The tool requires **Python >= 3.12** and refuses an older interpreter with exit 3 and no verdict, so the selected interpreter (scout venv, or a bare `python3` when there is no `pyproject.toml`) is version-gated: `--check` and the refresh both refuse a too-old one (permanent `rc=3`) instead of queueing nothing in silence. `SCOUT_PY` pins the interpreter, like `SCOUT_UV` pins `uv`. Put `TORTOISE_REPO` in `keys.env` — the controller session re-sources it, while an ambient-only export does not reach a pre-existing tmux server |
+| a collision pre-flight tool | `refresh-candidates.sh` refuses overlapping dispatches | resolved **per repo** in three tiers (#8432 extends #1736): the TARGET repo's own `tools/collision_preflight.py` (that copy WINS — it is the version the repo reviewed against), else **this harness's own `tools/collision_preflight.py`** (shipped with the harness and deployed to `$O/tools/`, so no product-repo checkout is required), else a `TORTOISE_REPO` checkout — **transition only**, for a box carrying these scripts but not yet the `tools/` directory. `--check` prints `tier=repo|harness|tortoise-transition`, so a box silently running on the fallback is visible. The tool requires **Python >= 3.12** and refuses an older interpreter with exit 3 and no verdict, so the selected interpreter (scout venv, or a bare `python3` when there is no `pyproject.toml`) is version-gated: `--check` and the refresh both refuse a too-old one (permanent `rc=3`) instead of queueing nothing in silence. `SCOUT_PY` pins the interpreter, like `SCOUT_UV` pins `uv`. `TORTOISE_REPO` no longer has to exist for a cell to dispatch; put it in `keys.env` only if you are on the transitional tier |
 | `.worktrees/` gitignored in the target repo | worktrees are created under it | `git check-ignore .worktrees` |
 
 **`cloud-cell-supervisor.sh check` vouches only for what it actually probes, and refuses to certify
@@ -300,7 +300,9 @@ key; see the ⛔ measured note at the top of `cloud-cell-supervisor.sh`), it jus
 *signed* merge in a gate-mode repo. The `.worktrees/` gitignore is not probed at all, and
 `tools/collision_preflight.py` is not a dependency `check` refuses on by that name: the only by-name
 read in `cloud-cell-supervisor.sh` itself is `repo_vendors_tool()`, which uses it solely to decide
-whether an operator's `TORTOISE_REPO` is relevant. The refusal is indirect but real — the #1736
+whether an operator's `TORTOISE_REPO` is relevant (since #8432 it also counts the harness's own
+`tools/` and its `$O/tools/` deploy, so the ambient-`TORTOISE_REPO` warning no longer fires on a box
+that resolves tier 2). The refusal is indirect but real — the #1736
 dispatch-provisioning probe (`refresh-candidates.sh --check`, which `cmd_check` runs) reads that same
 literal path and refuses a repo that resolves no copy of it — so `check` does refuse that cell in
 effect.
@@ -1941,7 +1943,9 @@ cannot be read. The merge authority follows from that set: a repo requiring the 
 via `gh pr merge` after the gate goes green, and a repo that does not is merged through its own
 `scripts/admin-merge.sh` (agent-infra#1764).
 Two things that were on this list are now repo-aware: the collision pre-flight tool is resolved per
-repo (the target repo's own copy, else a `TORTOISE_REPO` checkout) and the scout venv step is skipped for
+repo — the target repo's own copy, else THIS harness's own `tools/` (shipped with the scripts and
+deployed to `$O/tools/`), else a `TORTOISE_REPO` checkout as a transition fallback, per
+agent-infra#8432 extending #1736 — and the scout venv step is skipped for
 a repo with no `pyproject.toml` — and a repo that can be provisioned is verified at `check` time —
 agent-infra#1736.
 

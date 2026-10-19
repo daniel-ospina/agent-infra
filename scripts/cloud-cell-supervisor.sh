@@ -676,13 +676,18 @@ validate_scope() {
   esac
 }
 
-# Does the TARGET repo carry its own pre-flight tool? When it does, the provisioning verdict does
-# not depend on a tortoise checkout at all, so an operator's TORTOISE_REPO is irrelevant and must not
-# draw the ambient-only warning below. Mirrors resolve_preflight() in refresh-candidates.sh (the
-# scout worktree wins when it exists, else the main checkout).
+# Does the provisioning verdict resolve WITHOUT a tortoise checkout? Two ways it can, and the harness
+# one is now the normal one (#8432): the pre-flight family ships WITH the harness and is deployed into
+# `$O/tools/`, so no product-repo checkout is needed at all. The repo's own vendored copy still counts
+# (and still outranks the harness's, per #1736). Mirrors resolve_preflight() in refresh-candidates.sh
+# (the scout worktree wins when it exists, else the main checkout) plus its new harness tier. When
+# this answers yes, an operator's TORTOISE_REPO is irrelevant and must not draw the ambient-only
+# warning below.
 repo_vendors_tool() {
   [ -f "$REPO/tools/collision_preflight.py" ] \
-    || [ -f "$REPO/.worktrees/dispatch-scout/tools/collision_preflight.py" ]
+    || [ -f "$REPO/.worktrees/dispatch-scout/tools/collision_preflight.py" ] \
+    || [ -f "$O/tools/collision_preflight.py" ] \
+    || { [ -n "$HARNESS" ] && [ -f "$HARNESS/tools/collision_preflight.py" ]; }
 }
 
 # ── harness provenance (agent-infra#1745) ────────────────────────────────────────────────────────
@@ -1244,7 +1249,8 @@ cmd_check() {
       say "      $ENV_FILE does not carry. The controller session re-sources $ENV_FILE and does not"
       say "      receive an ambient export on a pre-existing tmux server, so it would resolve no"
       say "      tortoise checkout, refuse with rc=3, and leave the cell MERGE-ONLY."
-      say "      Fix: put TORTOISE_REPO=<a tortoise checkout> in $ENV_FILE, or vendor tools/collision_preflight.py into the repo."
+      say "      Fix: restore the harness's tools/ directory (it ships with install.sh, #8432), or vendor"
+      say "      tools/collision_preflight.py into the repo, or put TORTOISE_REPO=<a tortoise checkout> in $ENV_FILE."
     fi
   fi
   # ⛔ THE RECORD STEP IS A HARD DEPENDENCY OF THE ONLY MERGE PATH (#1717). merge-one.sh mints the

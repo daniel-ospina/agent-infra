@@ -403,8 +403,11 @@ git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1 || die "not a git checkout: $
 git -C "$REPO" check-ignore -q .worktrees/ \
   && ok "$REPO/.worktrees is gitignored" \
   || die "$REPO/.worktrees is NOT gitignored — worktrees would be committed. Fix .gitignore first."
+# #8432: the pre-flight family ships WITH the harness now, so a repo copy is no longer what makes a
+# cell provisionable — this line is informational only (a repo that vendors its own copy still wins
+# over the harness's, per #1736, which the --check below reports as `tier=repo`).
 [ -f "$REPO/tools/collision_preflight.py" ] \
-  && ok "collision pre-flight present in the repo" \
+  && ok "collision pre-flight present in the repo (that copy outranks the harness's, #1736)" \
   || true
 # ── dispatch provisioning, judged ONCE here (agent-infra#1736) ───────────────────
 # The refresh step refills the dispatch backlog, and orch-loop.sh runs it in a BACKGROUNDED
@@ -420,7 +423,8 @@ else
   printf '%s\n' "$PV" >&2
   warn "this repo cannot be provisioned for dispatch — a cell on it could only MERGE;"
   warn "  refresh-candidates.sh would add nothing to the backlog (agent-infra#1736)."
-  warn "  Fix: set TORTOISE_REPO=<a tortoise checkout>, or vendor tools/collision_preflight.py into $REPO."
+  warn "  Fix: restore this harness's tools/ directory ($HERE/tools/collision_preflight.py) and re-run"
+  warn "       install.sh — it ships tools/ beside the scripts (#8432)."
 fi
 # The scout VENV is a uv-Python step: warn about it only for a repo that declares one.
 if [ -f "$REPO/pyproject.toml" ] && [ ! -x "$REPO/.worktrees/dispatch-scout/.venv/bin/python" ]; then
@@ -492,6 +496,41 @@ if [ -f "$HERE/gh-rest/gh" ]; then
     mv -f "$_tmp" "$O/gh-limit.py"   || { rm -f "$_tmp"; die "cannot install $O/gh-limit.py"; }
   else
     warn "gh-limit.py missing from the shipped set — gh calls will NOT be serialised or backed off (#1988)"
+  fi
+  # ── the pre-flight tool family (#8432) ──────────────────────────────────────
+  # WHY THIS IS DEPLOYED WITH THE HARNESS AND NOT RESOLVED FROM A REPO. Before #8432 the collision
+  # pre-flight resolved from the TARGET repo's own `tools/`, else a `TORTOISE_REPO` checkout — so the
+  # shared tooling repo needed the PRODUCT repo to be present for its own dispatch gate, and a box
+  # without that checkout was silently MERGE-ONLY (#1736). The family now ships here, beside the
+  # scripts, so `refresh-candidates.sh` resolves `$O/tools/` and a cell needs no product-repo
+  # checkout at all.
+  # ⚠️ NON-FATAL ON PURPOSE: a box that is already running may not have had this directory yet, and
+  # failing the install would turn a missing optimisation into an install that cannot complete. The
+  # ABSENCE is loud — `refresh-candidates.sh --check` names the tier it resolved and REFUSES with
+  # rc=3 when no copy resolves at all — but STALENESS of `$O/tools/` is NOT detected by anything:
+  # `DRIFTED` above names files explicitly, `write_provenance` below compares `*.sh`, and
+  # check-deployed-drift.sh enumerates `"${REL}/[^/]+\\.sh$"` — so none of them sees `tools/*.py`.
+  # (An earlier draft of this comment claimed "the drift gate below reports a half-shipped copy".
+  # Measured FALSE, and removed rather than kept: a claimed gate that does not exist is worse than a
+  # declared gap.) Only a re-run of install.sh refreshes a stale `$O/tools/`.
+  if [ -d "$HERE/tools" ]; then
+    mkdir -p "$O/tools" || die "cannot create $O/tools"
+    _toolfail=""
+    for _tf in "$HERE"/tools/*.py "$HERE"/tools/*.sh; do
+      [ -f "$_tf" ] || continue
+      _tb="$(basename "$_tf")"
+      # STAGE-THEN-RENAME, same reason as gh-limit.py: `collision_preflight.py` is EXECUTED by a
+      # live refresh loop, and a plain `cp` truncates before it writes — a pass landing in the window
+      # would run python on half a file and emit no VERDICT, which reads as "no work" downstream.
+      _tmp="$O/.seed-tool.$$.$_tb"
+      cp "$_tf" "$_tmp" && chmod +x "$_tmp" && mv -f "$_tmp" "$O/tools/$_tb" \
+        || { rm -f "$_tmp"; _toolfail="$_toolfail $_tb"; }
+    done
+    [ -z "$_toolfail" ] \
+      && ok "pre-flight tool family → $O/tools ($(ls "$O/tools" | wc -l | tr -d ' ') files)" \
+      || warn "could not install:$_toolfail — the refresh will fall back to a repo/TORTOISE_REPO tool (#8432)"
+  else
+    warn "tools/ missing from the shipped set — the refresh will fall back to a repo or TORTOISE_REPO copy (#8432)"
   fi
   # ⛔ Route the PATH entry through add_dir, NOT a bare assignment: add_dir applies the TCC guard
   # (a physical path under ~/Documents is EPERM for launchd) that no install-time probe can see.
@@ -660,7 +699,7 @@ done
 if [ -n "$DRIFTED" ]; then
   warn "the running copy at \$O differs from the shipped copy:$DRIFTED"
   warn "  the daemon executes \$O/<script> — sync them or the fixes here are not in effect:"
-  warn "  cp '$HERE'/*.sh '$O'/ && mkdir -p '$O/gh-rest' && cp '$HERE'/gh-rest/gh '$O/gh-rest/' && cp '$HERE'/gh-limit.py '$O/'";
+  warn "  cp '$HERE'/*.sh '$O'/ && mkdir -p '$O/gh-rest' '$O/tools' && cp '$HERE'/gh-rest/gh '$O/gh-rest/' && cp '$HERE'/gh-limit.py '$O/' && cp '$HERE'/tools/*.py '$HERE'/tools/*.sh '$O'/tools/";
 fi
 
 # ── harness provenance (agent-infra#1745) ────────────────────────────────────────

@@ -82,7 +82,12 @@ MARK_DIR = f"{STATE}/turn-end"
 KILL = f"{STATE}/HEARTBEAT-OFF"
 NUDGE_KILL = f"{STATE}/LANE-NUDGE-OFF"
 LOCK = f"{STATE}/turn-end.lock"
-CMUX_DISPATCH = (f"{HOME}/Documents/GitHub/tortoise/tools/cmux_dispatch.py")
+# #8432: the dispatcher ships WITH the harness in agent-infra now
+# (`scripts/orchestrator-harness/tools/cmux_dispatch.py`), so this no longer reaches into the PRODUCT
+# repo. A box without that checkout used to have a dead absolute path here.
+CMUX_DISPATCH = os.environ.get("CMUX_DISPATCH") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "orchestrator-harness", "tools", "cmux_dispatch.py")
 
 # A lane must have been quiet this long before we speak. Below it, a lane that has
 # simply paused between tool calls would be interrupted.

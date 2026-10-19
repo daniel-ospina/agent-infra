@@ -67,7 +67,10 @@ HOME = os.path.expanduser("~")
 STATE = f"{HOME}/.pi/agent/state"
 SCRIPTS = f"{HOME}/.pi/agent/scripts"
 REGISTRY = f"{STATE}/lane-registry.tsv"
-CMUX_DISPATCH = f"{HOME}/Documents/GitHub/tortoise/tools/cmux_dispatch.py"
+# #8432: resolved from this repo's own tree, not the PRODUCT repo — see turn-end.py.
+CMUX_DISPATCH = os.environ.get("CMUX_DISPATCH") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "orchestrator-harness", "tools", "cmux_dispatch.py")
 
 # SHARED with turn-end.py ON PURPOSE: one marker directory means one claim per
 # turn, so the two nudgers cannot both speak to the same end-of-turn.
@@ -794,7 +797,9 @@ You ended cleanly with nothing left in your lane. Do NOT idle — and do not inv
    were already CLOSED or MERGED — including one that was not a CI issue at all. A stale list
    is worse than none: it sends a lane to dead work AND it contradicts step 1, which is the
    authority. So there is no list here by design. If you want one, read it from the graph.
-3. COLLISION PRE-FLIGHT and it must exit 0: `python3 tools/collision_preflight.py <N> --repo .`
+3. COLLISION PRE-FLIGHT and it must exit 0: `python3 "${PREFLIGHT:-$HOME/orchestrator/tools/collision_preflight.py}" <N> --repo .`
+   (the tool ships WITH the orchestrator harness in agent-infra now — agent-infra#8432 — so it is
+   NOT at `tools/` in this repo; use the deployed harness path or `$PREFLIGHT` if it is set.)
    exit 1 = someone holds it, take the next; exit 2 = unverified, do NOT start on a guess.
 4. CLAIM IT: assignee plus a one-line claim comment. Then work it to a PR.
 5. NURTURE THE MAP: write back every finding as a point carrying its NUMBER, wired to the cause it

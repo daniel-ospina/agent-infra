@@ -30,27 +30,43 @@ Execute plan by dispatching fresh subagent per task, with two-stage review after
    It is FAIL-CLOSED: `0` CLEAN is the **only** outcome that authorizes dispatch · `1` COLLISION
    (a worktree/branch/PR/claim already covers #N) · `2` INCOMPLETE (a surface could not be queried
    — **NOT clean**) · `3` usage/internal error. **ANY non-zero exit stops the dispatch. There is no
-   "warn and proceed" and no graceful degradation.** The gate is provided by **tortoise** (the only
-   repo carrying `tools/collision_preflight.py`) and applies to *any* issue's repo through `--repo`.
+   "warn and proceed" and no graceful degradation.** The gate **ships with the orchestrator harness in
+   `agent-infra`** (`scripts/orchestrator-harness/tools/collision_preflight.py`, deployed to
+   `~/orchestrator/tools/`) since agent-infra#8432, and applies to *any* issue's repo through `--repo`.
+   Tortoise carried the only copy until then; the paired change removes it there — until that lands
+   do not rely on a tortoise checkout supplying one.
 
    ```bash
-   # 1. Resolve the tortoise checkout EXPLICITLY — unset, `"$TORTOISE"/tools/…` collapses to
-   #    `/tools/…` and PYTHON exits 2, which the exit codes above would report as INCOMPLETE
-   #    ("a surface could not be queried"): a misconfiguration wearing a real verdict's face.
-   #    $TORTOISE if set; else the cwd itself (when it IS tortoise), the tortoise sibling of the
-   #    cwd's MAIN checkout (so it still resolves from a linked worktree), then the GITHUB root.
-   if [ -z "${TORTOISE:-}" ]; then
+   # 1. Resolve the pre-flight tool. Since agent-infra#8432 it lives with the harness, NOT only in
+   #    tortoise. Order: $PREFLIGHT, then $AGENT_INFRA_PATH, then the DEPLOYED harness, then a
+   #    tortoise checkout as a transitional fallback. Unset, `"$X"/tools/…` collapses to `/tools/…`
+   #    and PYTHON exits 2, which the exit codes above would report as INCOMPLETE ("a surface could
+   #    not be queried"): a misconfiguration wearing a real verdict's face.
+   PREFLIGHT="${PREFLIGHT:-}"
+   if [ -z "$PREFLIGHT" ]; then
      TOPLEVEL="$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null)"
      COMMON="$(git -C "$PWD" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
-     for CAND in "$TOPLEVEL" "$(dirname "${COMMON%/.git}")/tortoise" "${HOME:-/nonexistent}/Documents/GitHub/tortoise"; do
-       if [ -n "$CAND" ] && [ -f "$CAND/tools/collision_preflight.py" ]; then
-         TORTOISE="$(cd "$CAND" && pwd -P)"; break
+     for CAND in \
+       "${AGENT_INFRA_PATH:+$AGENT_INFRA_PATH/scripts/orchestrator-harness}" \
+       "${HOME:-/nonexistent}/orchestrator" \
+       "${TORTOISE:-}" \
+       "$TOPLEVEL" \
+       "$(dirname "${COMMON%/.git}")/tortoise" \
+       "${HOME:-/nonexistent}/Documents/GitHub/tortoise" \
+     ; do
+       [ -n "$CAND" ] || continue
+       if [ -f "$CAND/tools/collision_preflight.py" ]; then
+         PREFLIGHT="$CAND/tools/collision_preflight.py"
+         # Keep $TORTOISE meaningful for the pre-#3978 checkout fallback, ONLY when the root really
+         # is a tortoise checkout — the harness's own tree is not one.
+         case "$CAND" in */orchestrator-harness|*/orchestrator) ;; *) TORTOISE="$CAND" ;; esac
+         break
        fi
      done
    fi
-   if [ ! -f "${TORTOISE:-}/tools/collision_preflight.py" ]; then
-     echo "❌ collision pre-flight: no tortoise checkout resolved (TORTOISE='${TORTOISE:-}') — #3061 pre-flight NOT run."
-     echo "   Record this in the dispatch log; do NOT silently skip. Set TORTOISE=<a tortoise worktree> and re-run."
+   if [ ! -f "${PREFLIGHT:-}" ]; then
+     echo "❌ collision pre-flight: no collision_preflight.py resolved (PREFLIGHT='${PREFLIGHT:-}', AGENT_INFRA_PATH='${AGENT_INFRA_PATH:-}') — #3061 pre-flight NOT run."
+     echo "   Record this in the dispatch log; do NOT silently skip. Set PREFLIGHT=<path to the tool> and re-run."
      exit 1   # do not dispatch
    fi
 
@@ -62,7 +78,7 @@ Execute plan by dispatching fresh subagent per task, with two-stage review after
    case "$REPO" in ''|*'<'*|*'>'*) echo "❌ REPO is unset or still the literal placeholder ('$REPO') — set it to the issue's repo owner/name; #3061 pre-flight NOT run."; exit 1 ;; esac
    #    The `owner/name` form needs tortoise #3978. Until it lands, tortoise main rejects a slug
    #    with exit 3 (`--repo not a directory`), so probe the usage and pass the form it accepts.
-   if python3 "$TORTOISE"/tools/collision_preflight.py --help 2>&1 | grep -q 'owner/name'; then
+   if python3 "$PREFLIGHT" --help 2>&1 | grep -q 'owner/name'; then
      REPO_ARG="$REPO"                             # slug form
    else
      #    Pre-#3978 only a PATH is accepted, and it must be a checkout of $REPO. Falling back to
@@ -77,7 +93,7 @@ Execute plan by dispatching fresh subagent per task, with two-stage review after
      done
      [ -n "$REPO_ARG" ] || { echo "❌ pre-#3978 tool: no local checkout of $REPO — '.' would check the WRONG repo (#4027). Set ISSUE_REPO_PATH=<a checkout of $REPO>; pre-flight NOT run."; exit 1; }
    fi
-   python3 "$TORTOISE"/tools/collision_preflight.py "$ISSUE_NUMBER" --repo "$REPO_ARG"
+   python3 "$PREFLIGHT" "$ISSUE_NUMBER" --repo "$REPO_ARG"
    ```
 
    A `VERDICT: INCOMPLETE` line on stdout is the tool's exit `2`. An argparse `usage:` line with **no**

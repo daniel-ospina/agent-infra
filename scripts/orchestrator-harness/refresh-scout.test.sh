@@ -116,10 +116,16 @@ rf() {
   local dir="$1" mode="$2"; shift 2
   local args=(6); [ "$mode" = check ] && args=(--check)
   local paths="${RF_PATH:-$dir/bin:$PATH}"
+  # #8432 — run a COPY of the shipped script from inside the case dir, so the script's OWN directory
+  # (`HERE`, the "harness tree") is the sandbox and not this checkout. Without the copy the new
+  # harness-own-tree tier always resolves against the real `scripts/orchestrator-harness/tools/`,
+  # which would mask every tier-precedence case below. The script is self-contained (its one
+  # `source` is `$O/claims.sh`, not a sibling), so a lone copy is functionally identical.
+  cp -f "$REFRESH" "$dir/refresh-candidates.sh" || return 1
   OUT="$(env -u TORTOISE_REPO -u TORTOISE -u SCOUT_UV -u GH_HOST -u CELL_HOME -u SCOUT_PY \
           -u SCOUT_UV_EXTRAS -u GH_CONFIG_DIR \
           HOME="$dir/home" PATH="$paths" REPO="$dir/repo" O="$dir/o" "$@" \
-          bash "$REFRESH" "${args[@]}" 2>&1)"
+          bash "$dir/refresh-candidates.sh" "${args[@]}" 2>&1)"
   RC=$?
 }
 # mk_tool <path> — a stand-in pre-flight tool that answers CLEAN. Records argv + cwd when
@@ -1191,6 +1197,46 @@ rf "$D" check TORTOISE="$D/tort"
 [ "$RC" -eq 0 ] && ok "TORTOISE: the legacy alias still resolves a checkout (rc=0)" \
                || bad "TORTOISE alias: rc=$RC — $OUT"
 
+# ── 2c) #8432 — the harness's OWN tree is a resolution tier, and it does NOT outrank the repo's ──
+# WHY THE ORDER IS PINNED. #1736 decided that a target repo carrying its own copy WINS, because that
+# copy is the version the repo reviewed against. #8432 added the harness's own `tools/` so a cell
+# needs no product-repo checkout — as a FALLBACK, not as an override. Swapping these two tiers would
+# silently ignore a repo's pinned copy and is exactly the kind of precedent inversion this suite
+# exists to catch, so both directions are driven executably rather than described in a comment.
+mk_case harness-tier
+mk_tool "$D/tools/collision_preflight.py"          # the harness's own tree; nothing else present
+rf "$D" check TORTOISE_REPO=
+[ "$RC" -eq 0 ] && ok "harness tier: the harness's own tools/ provisions dispatch with NO tortoise checkout (#8432)" \
+               || bad "harness tier: rc=$RC — output: $OUT"
+case "$OUT" in
+  *"/harness-tier/tools/collision_preflight.py (tier=harness)"*) ok "harness tier: the resolved tool IS the harness's own copy" ;;
+  *) bad "harness tier: did not resolve the harness's own copy — output: $OUT" ;;
+esac
+case "$OUT" in
+  *"tier=harness"*) ok "harness tier: --check NAMES the tier it resolved" ;;
+  *) bad "harness tier: tier not reported — output: $OUT" ;;
+esac
+mk_case harness-tier-loses-to-repo
+mk_tool "$D/tools/collision_preflight.py"          # harness copy ...
+# ... and the TARGET repo's own copy, which WINS. `resolve_preflight` reads tier 1 from $SC (the
+# scout worktree) whenever it exists, and mk_case creates one — so the pinned copy has to live there,
+# not at the main checkout, or this case would test a directory the resolver never reads.
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+rf "$D" check TORTOISE_REPO=
+case "$OUT" in
+  *"dispatch-scout/tools/collision_preflight.py (tier=repo)"*) ok "harness tier: the TARGET repo's own copy still wins — #1736 precedence is preserved" ;;
+  *) bad "harness tier: the repo's pinned copy was OVERRIDDEN — #1736 precedence inverted — output: $OUT" ;;
+esac
+mk_case harness-tier-beats-transition
+mk_tool "$D/tools/collision_preflight.py"          # harness copy ...
+mk_tool "$D/tort/tools/collision_preflight.py"     # ... outranks the transitional tortoise checkout
+rf "$D" check TORTOISE_REPO="$D/tort"
+case "$OUT" in
+  *"tier=harness"*) ok "harness tier: outranks the transitional TORTOISE_REPO fallback" ;;
+  *"tier=tortoise-transition"*) bad "harness tier: a tortoise checkout was preferred over the harness's own copy — output: $OUT" ;;
+  *) bad "harness tier: unexpected tier — output: $OUT" ;;
+esac
+
 # ── 3) NOTHING resolvable must be a LOUD refusal with the reason — never an empty backlog ───────
 # rc=3 is the PERMANENT code orch-loop.sh keys on; a transient failure would be 1. The reason must
 # be the missing tool, NOT the old, misleading "uv sync failed".
@@ -1303,11 +1349,14 @@ esac
   || bad "--check: mutated the tree — uv-args='$(cat "$D/uv-args" 2>/dev/null)'"
 
 # (b) not provisionable → rc 3, with the reason and the fix.
+# #8432: the named fix is no longer "set TORTOISE_REPO" — the harness ships its own tools/ now, so
+# the actionable repair is to restore that directory. The assertion follows the changed instruction;
+# it still requires BOTH halves (the reason AND the fix), never just an exit code.
 mk_case check-bad
 rf "$D" check TORTOISE_REPO=
 [ "$RC" -eq 3 ] && ok "--check: a non-provisionable repo is REFUSED (rc=3)" || bad "--check: rc=$RC — $OUT"
 case "$OUT" in
-  *"NOT PROVISIONABLE"*"set TORTOISE_REPO="*) ok "--check: the refusal carries the reason AND the fix" ;;
+  *"NOT PROVISIONABLE"*"fix:"*"tools/"*) ok "--check: the refusal carries the reason AND the fix" ;;
   *) bad "--check: refusal lacks reason/fix — output: $OUT" ;;
 esac
 # A repo whose pyproject is present but whose `uv` is missing must also refuse, and say so. `uv`

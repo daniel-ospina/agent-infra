@@ -224,6 +224,47 @@
 # was COMPLETE for every file; re-pinning now would assert these as reconciled and turn the guard
 # green over a source that has moved — the stale-flag false pass this file exists to prevent.
 #
+# ══ 2026-10-18 — agent-infra #8432: the tools are ported, the FORK FIXES ARE STILL NOT ══════════
+#
+# LANDED here (branch `fix/8432-receive-harness-tools`):
+#   merged-not-closed.sh  ported VERBATIM from tortoise main. It was the only copy, so the planned
+#                         removal of `tortoise/operations/orchestrator-harness/` would have deleted
+#                         it outright — the silent-loss case this file was built for.
+#   tools/                the pre-flight tool family (`collision_preflight.py`, `fleet_state.py`,
+#                         `cmux_dispatch.py`, `who_is_on.py`, `who-is-on.sh`) + its four regression
+#                         suites, moved in from `tortoise/tools/` and `tortoise/tests/` and now
+#                         resolved from THIS directory's own `tools/` (see resolve_preflight).
+#
+# ⛔ STILL NOT PORTED — and therefore the TORTOISE COPY MUST NOT BE DELETED YET. Measured: the
+# `tortoise/tests/test_orchestrator_harness.py` suite, retargeted at this tree, is 23-of-32 RED
+# (`python3 -m pytest scripts/orchestrator-harness/test_orchestrator_harness.py -q`). The reds are not
+# cosmetic — they are fixes this tree has never received, recorded as NOT YET PORTED above and still
+# absent here, with the class each one fails in so the count is checkable:
+#   merge-one.sh  #8612  `verdict_kind()` / `apply_verdict_marker()`. This tree still routes a
+#                        REAL `ISSUES` verdict and a verdict-LESS run through ONE `*)` arm that
+#                        writes `state/needsfix-<PR>-<head>` for both, so a pure stall authorises a
+#                        fixer and can PARK a PR "needs a human" off a review that never happened.
+#                        [VerdictMarkerContract 6 + VerdictDispatchContract 3 = 9 reds]
+#   merge-one.sh  #8589  the reviewer's own detached checkout.
+#   merge-one.sh  #8484  #8602  `reviewer_prompt()` ITSELF — the function is not defined in this tree
+#                        at all (grep: no harness `.sh` defines it), so the reviewer's walk bound, the
+#                        never-provision-tests rule and the verdict contract are absent from every
+#                        review this tree runs. [ReviewerPromptContract 3 reds]
+#   orch-loop.sh  #8469  `p0_merge_priority_override` + the `.prio` tier map.
+#                        [MergePriorityOverride 5 + RefreshPoolContract 5 = 10 reds; the pool class is
+#                        the `.prio` producer/consumer pair its own docstring attributes to #8469 —
+#                        not traced to a single commit]
+#   lane.sh       #8468  the brief's closure-linkage rule: the brief emitted here offers only
+#                        `Closes #N`, with no sanctioned `Refs #N` form for a partial PR.
+#                        [LaneBriefHeredoc 1 red]
+#   orch-loop.sh  #8521  source spawn-gate.sh; `can_spawn` at the four decision sites; stop
+#                        `rm -f needsfix-<PR>-<HEAD>` at DISPATCH (a refused fixer loses findings).
+#                        [NO red in this suite — no test references #8521; it is unported on the
+#                        drift record, not on the 23. Same for #8589, which nothing here exercises.]
+# Until those land, `tortoise/operations/orchestrator-harness/` is the only copy carrying them and
+# `check-port-drift.sh` correctly keeps reporting drift. That is why this file is NOT re-pinned by
+# #8432: the pin must keep failing until the fork's fixes are here, not until the fork is gone.
+#
 # pinned_ref=origin/main
 # pinned_tip=e20de606be10fc9fda96729b6cfd6277ac3ad1ec   (2026-10-13T20:17:21Z)
 # pinned_at=2026-10-13T20:24:13Z
