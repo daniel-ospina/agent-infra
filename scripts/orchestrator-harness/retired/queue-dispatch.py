@@ -14,14 +14,15 @@
 # ⛔ `idle_lanes()` roster, so a dispatch still needs an idle lane. Read the code, not this banner,
 # ⛔ for which half is live.
 # ⛔ `pr-doctor.py` is the beat's ONLY dispatch entry point (`scripts/heartbeat-loop.sh`); this file
-# ⛔ is wired to nothing and delivered by nothing (`pi-bootstrap/setup.sh` no longer farms it) --
-# ⛔ but a box keeps the copy it was already given (the farm has no delete leg; setup.sh:256), so the
-# ⛔ retirement reaches a BOX only by: stop the loop (kill file) -> atomically replace
-# ⛔ `~/.pi/agent/scripts/heartbeat-loop.sh` -> `rm -f ~/.pi/agent/scripts/queue-dispatch.py` ->
-# ⛔ `rm -f` the kill file -> start the loop. A plain `cp` over a running bash script applies nothing
-# ⛔ (the loop has already parsed it). The full recipe is step 4 of the retirement note in the REPO's
-# ⛔ `scripts/heartbeat-loop.sh` — not in the deployed copy, which predates it. The farm's missing
-# ⛔ unfarm leg is agent-infra#1924.
+# ⛔ is wired to nothing and delivered by nothing (`pi-bootstrap/setup.sh` no longer farms it). The
+# ⛔ retirement reaches a BOX through the farm's UNFARM leg, NOT by a human remembering to `rm`: the
+# ⛔ name is DECLARED in `pi-bootstrap/farm-retired.txt`, and `setup.sh` applies that list on the same
+# ⛔ sync that applies the copy legs (`lib/farm-retire.sh`, `farm_unfarm`) -- declared, never inferred
+# ⛔ from absence, and it cannot be forgotten from a hand-written chain. Ordering still matters: a
+# ⛔ plain `cp` over a RUNNING bash script applies nothing (the loop has already parsed it), so stop
+# ⛔ the loop (kill file) before the sync that replaces `~/.pi/agent/scripts/heartbeat-loop.sh` and
+# ⛔ removes this file, then start it again. The full recipe is step 4 of the retirement note in the
+# ⛔ REPO's `scripts/heartbeat-loop.sh` — not in the deployed copy, which predates it.
 # ⛔ `scripts/test_dispatch_wiring.py` is the gate that keeps a future dedup from re-inverting that
 # ⛔ (#1890 is the inversion being undone).
 # ⛔

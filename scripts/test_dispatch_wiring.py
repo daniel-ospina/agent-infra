@@ -99,11 +99,16 @@ _NON_DISPATCH_STEPS = frozenset({
 _ASSIGNMENT_RUNS = re.compile(r"\$\(|`")
 _DISPATCH_STEP = "pr-doctor.py"
 # The EXACT detached launch the beat must use: a subshell, `nohup`, the absolute interpreter, the
-# script path from `$SCRIPTS`, NO ARGUMENTS, NO ENV PREFIX (`MAX_FIX=0 ...`), and the line
-# continuation into the detached subshell. Pinned as a whole line on purpose — see
-# `test_the_beat_still_runs_the_surviving_dispatcher`.
+# script path from `$SCRIPTS`, and then NOTHING BUT REDIRECTIONS — no argument of any kind
+# (`--dry-run`, `--status`, `--max 0`) and no env prefix (`MAX_FIX=0 …`), because every one of
+# those makes the pass dispatch nothing and return success.
+# ⛔ GRADED ON THE LOGICAL (continuation-joined) COMMAND, NOT ON THE FIRST PHYSICAL LINE. Pinning
+# a prefix of a backslash-continued command pins a prefix of it: an argument on the next line is
+# the same argument to bash and was invisible here (measured 2026-10-19). `_logical_lines` is what
+# makes the pin mean what its comment says.
 _DISPATCH_LAUNCH = re.compile(
-    r'^\(\s*nohup\s+/usr/bin/python3\s+"\$SCRIPTS/pr-doctor\.py"\s*\\$')
+    r'^\(\s*nohup\s+/usr/bin/python3\s+"\$SCRIPTS/pr-doctor\.py"'
+    r'(?:\s+(?:[12]?>>?|&>>?)\s*\S+)*\s*$')
 # The ARM guard, pinned in its exact polarity: the kill file ABSENT is what makes the launch
 # reachable. `-f` is the inverted polarity, refused STRUCTURALLY — on the condition that encloses
 # the launch, read from `_enclosing_constructs` — never by matching this text anywhere in the file:
@@ -207,8 +212,67 @@ def _is_record(name: str) -> bool:
     return not name.startswith("docs/ops/")
 
 
+def _logical_lines(path: pathlib.Path) -> list[str]:
+    """Bash's COMMAND view: a backslash-continued command is ONE command, so an argument written
+    on the continuation line is that same command's argument.
+
+    ⛔ MEASURED 2026-10-19 (adversarial review, two independent reviewers): the launch pin used to
+    stop at the trailing backslash, so `--dry-run` written on the CONTINUATION line left the pin
+    matching. `scripts/pr-doctor.py` honours `--dry-run`/`--status`/`--max 0`, and with the
+    lane-table dispatcher retired it is the beat's ONLY dispatch entry point — so the fleet was
+    fed nothing on every pass while the gate that exists to prove "it is really reachable"
+    reported green. Presence of a pinned PREFIX is not the property; the whole COMMAND is.
+    """
+    out: list[str] = []
+    pending = None
+    for line in _executable_lines(path):
+        if pending is not None:
+            line = pending + " " + line
+        if line.endswith("\\"):
+            pending = line[:-1].rstrip()
+            continue
+        pending = None
+        out.append(line)
+    if pending is not None:
+        out.append(pending)
+    return out
+
+
+_HEREDOC = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][\w-]*)\1")
+
+
+def _heredoc_free_lines(path: pathlib.Path) -> list[str]:
+    """Every physical line, with HEREDOC BODIES REMOVED — one implementation, both views.
+
+    ⛔ A HEREDOC BODY IS NOT CODE (measured 2026-10-19, adversarial review). Wrapping the dispatch
+    in `: <<'UNUSED_PROSE' … UNUSED_PROSE` leaves every byte of the launch in place while bash
+    executes none of it, and no construct list can see it — "comment out the step with a heredoc"
+    is a normal way to disable a shell block. Stripping it HERE means both views agree: the
+    launch is absent from the code view (so its ABSENCE reds) instead of being present in one
+    view and absent from the other.
+
+    The `<<'WORD'` / `<<"WORD"` / `<<WORD` / `<<-` forms all terminate on a line consisting of the
+    word alone. A here-STRING (`<<<`) carries no body and is skipped.
+    """
+    out: list[str] = []
+    terminator = None
+    for line in path.read_text().splitlines():
+        if terminator is not None:
+            if line.strip() == terminator:
+                terminator = None
+            continue
+        out.append(line)
+        # A COMMENT is never a here-doc opener, however it is spelled.
+        if line.strip().startswith("#"):
+            continue
+        m = _HEREDOC.search(line)
+        if m and "<<<" not in line:
+            terminator = m.group(2)
+    return out
+
+
 def _executable_lines(path: pathlib.Path) -> list[str]:
-    """The lines bash would actually RUN: comments and blank lines removed.
+    """The lines bash would actually RUN: heredoc bodies, comments and blank lines removed.
 
     This is the distinction the whole file rests on. A grep for `queue-dispatch` over the raw
     text finds the retirement note (and the two historical `QUEUE-DISPATCH FAILED` measurements
@@ -216,14 +280,14 @@ def _executable_lines(path: pathlib.Path) -> list[str]:
     text-matching failure the repo has already paid for once (#1897: a hand-rolled guard "still
     matches every string a text-based wiring test greps for").
     """
-    return [s for s in (line.strip() for line in path.read_text().splitlines())
+    return [s for s in (line.strip() for line in _heredoc_free_lines(path))
             if s and not s.startswith("#")]
 
 
 def _executable_raw(path: pathlib.Path) -> list[str]:
     """Same set of lines as `_executable_lines`, but with INDENTATION INTACT — reachability is a
     property of nesting, and stripping the indent throws it away."""
-    return [line for line in path.read_text().splitlines()
+    return [line for line in _heredoc_free_lines(path)
             if line.strip() and not line.strip().startswith("#")]
 
 
@@ -309,12 +373,84 @@ def _enclosing_constructs(path: pathlib.Path, needle: str):
     return None
 
 
+_TRANSFER_WORD = re.compile(r"(?:exit|continue|break|return)\b")
+# A statement boundary: start of line, then any of `;`, `&&`, `||`, `|`, `&`, or an opening
+# brace/paren. `then`/`do`/`else` are separators too — `if …; then continue; fi` puts the transfer
+# after `then`, and `while :; do break; done` after `do`.
+_STMT_BOUNDARY = re.compile(r"(?:^|[;&|(){}\s]|\bthen\b|\bdo\b|\belse\b)\s*")
+
+
+def _leading_statement(s: str) -> str | None:
+    """The first command-position statement on `s` that is a control transfer, if any.
+
+    A transfer is only a transfer in COMMAND POSITION. `echo "continue"`, a flag named
+    `--continue`, and a message containing the word are not transfers, so matching the word
+    anywhere would red a legitimate beat — which is why the earlier revision matched only at the
+    start of the line. But that missed the ONE-LINE forms, which are exactly the shape that
+    silently ends the pass (`if [ -f "$STATE/x" ]; then continue; fi`, `[ … ] && exit 0`,
+    `{ … && continue; }`) — measured 2026-10-19: all four left the pinned transfer list, the
+    enclosing-construct list and the function list BYTE-IDENTICAL and 13/13 green.
+    So: walk the line's statements and test each one's COMMAND POSITION.
+    """
+    pos = 0
+    while pos <= len(s):
+        m = _TRANSFER_WORD.match(s, pos)
+        if m:
+            # Command position? Either the line start, or immediately after a boundary.
+            head = s[:pos]
+            if not head.strip() or _STMT_BOUNDARY.search(head) and not _word_prefixed(head):
+                end = _stmt_end(s, pos)
+                return s[pos:end].strip()
+        # Advance to the next boundary.
+        nxt = _STMT_BOUNDARY.match(s, pos)
+        pos = nxt.end() if nxt and nxt.end() > pos else pos + 1
+    return None
+
+
+def _word_prefixed(head: str) -> bool:
+    """True when the text just before a would-be transfer is a WORD, not a separator.
+
+    `not continue` / `x-continue` must not read as a transfer; `foo; continue` must."""
+    stripped = head.rstrip()
+    if not stripped:
+        return False
+    return stripped[-1] not in ";&|(){}then do else".replace(" ", "") and not stripped.endswith(
+        ("then", "do", "else"))
+
+
+def _stmt_end(s: str, pos: int) -> int:
+    """Index where the statement starting at `pos` ends — the next unquoted `;`, `&`, `|` or `}`."""
+    depth = 0
+    quote = None
+    i = pos
+    while i < len(s):
+        ch = s[i]
+        if quote:
+            if ch == quote:
+                quote = None
+        elif ch in "'\"":
+            quote = ch
+        elif ch == "(":
+            depth += 1
+        elif ch == ")" and depth:
+            depth -= 1
+        elif ch in ";&|}" and depth == 0:
+            # `&&`/`||` continue the same command list, but the transfer ends at the operator.
+            return i
+        i += 1
+    return len(s)
+
+
 def _early_transfers(path: pathlib.Path, needle: str):
     """Every control transfer between the pass header and `needle`, with its enclosing constructs.
 
     The construct stack is maintained exactly as `_enclosing_constructs` does, but a transfer is
     recorded WHEREVER it sits — including inside a construct that opens and closes before the
     launch, which is the shape that makes the enclosing-stack assertion blind to it.
+
+    Both the multi-line form (`continue` on its own line) and the ONE-LINE forms are recorded; see
+    `_leading_statement`. A one-liner's construct opens AND closes on its line, so it is
+    deliberately NOT pushed — the transfer is what makes it visible.
     """
     out = []
     stack: list[tuple[str, str]] = []
@@ -329,9 +465,9 @@ def _early_transfers(path: pathlib.Path, needle: str):
             continue
         if needle in s:
             return out
-        transfer = re.match(r"^(?:\{\s*)?((?:exit|continue|break|return)\b.*?)(?:;\s*\})?$", s)
+        transfer = _leading_statement(s)
         if transfer:
-            out.append((transfer.group(1), tuple(stack)))
+            out.append((transfer, tuple(stack)))
         if _CLOSER.match(s):
             if stack:
                 stack.pop()
@@ -600,7 +736,7 @@ def test_the_beat_still_runs_the_surviving_dispatcher():
     same silent green. Both were measured against an earlier revision, which is why the guard is
     pinned in its exact polarity and the enclosing-function check exists.
     """
-    lines = _executable_lines(_BEAT)
+    lines = _logical_lines(_BEAT)
     launches = [l for l in lines if _DISPATCH_STEP in l]
     assert launches, (
         "heartbeat-loop.sh no longer invokes %s. The lane-table dispatcher is retired, so if this "
@@ -608,10 +744,10 @@ def test_the_beat_still_runs_the_surviving_dispatcher():
         % _DISPATCH_STEP)
     assert any(_DISPATCH_LAUNCH.match(l) for l in launches), (
         "the beat's dispatch launch is not the pinned detached invocation. Got: %r\n"
-        "Expected exactly: ( nohup /usr/bin/python3 \"$SCRIPTS/pr-doctor.py\" \\\n"
+        "Expected exactly: ( nohup /usr/bin/python3 \"$SCRIPTS/pr-doctor.py\" ] redirects\n"
         "Arguments are a way to make the pass a no-op (`--dry-run`, `--status`, `--max 0`), and so "
-        "is an env prefix (`MAX_FIX=0 MAX_REVIEW=0`), so the line is pinned whole instead of "
-        "filtered by a list of bad flags. Change this pin WITH the launch, deliberately."
+        "is an env prefix (`MAX_FIX=0 MAX_REVIEW=0`). The match is against the LOGICAL line, so an "
+        "argument on a continuation line reds too. Change this pin WITH the launch, deliberately."
         % launches)
     # The DISARM guard, in the polarity that actually dispatches. `-f` here means the beat feeds
     # PRs only once an operator has switched pr-doctor OFF — i.e. it never dispatches, and every
@@ -801,6 +937,11 @@ def test_no_live_code_reads_the_retired_queue_files_under_any_name():
     scripts/lane-feed.py` + a beat invocation of `lane-feed.py` passed the name-only assertions).
     This one pins the BEHAVIOUR instead: nothing live opens the lane-table's queue files.
     """
+    scanned = _tracked_text_files()
+    assert len(scanned) >= 100, (
+        "the scan examined only %d files — an empty or broken scan must never read as clean, and "
+        "this is the ONLY rename-proof assertion in the file: a scan regression here is the one "
+        "that would let a copy of the retired dispatcher under a new name pass" % len(scanned))
     hits = _live_code_referencing(_QUEUE_TOKENS)
     assert hits == {}, (
         "live code still reads the retired lane-table queue files (a renamed dispatcher is still "
@@ -847,3 +988,143 @@ def test_the_note_that_retired_it_names_the_record():
     assert "#1874" in text and "#1890" in text, (
         "the retirement note must name both issues: #1874 (this issue) and #1890 (the inversion "
         "it finishes undoing)")
+
+
+# ---------------------------------------------------------------------------
+# The defeat matrix: every shape a review cycle MEASURED walking past the gate
+# ---------------------------------------------------------------------------
+# ⛔ A DEFEAT THAT IS NOT RE-TESTED IS A DEFEAT WAITING TO RETURN. Six review cycles each lost a
+# new spelling of the same silent green — a literal `if false`, a quoted literal, a one-liner, an
+# uncalled `function name {`, an env feature flag around the block, and finally a `--dry-run` on a
+# continuation line. Each was closed by widening a matcher, and a wider matcher is exactly the kind
+# of fix that a later edit quietly narrows again, because the ONLY thing standing between the two
+# is a comment. So every shape that has been measured is re-measured here against a MUTATED COPY of
+# the real beat: the assertion is not "the code looks right", it is "this mutation is REFUSED".
+#
+# The cases below were added by the 2026-10-19 adversarial review, which reproduced all four
+# against the shipped suite (13/13 green on a beat that dispatches nothing on every pass).
+
+def _beat_mutated(tmp_path, mutate):
+    """A copy of the REAL beat with `mutate(text)` applied, or None if the anchor is not found.
+
+    Copies, never edits: the gate is graded on the artifact that ships, and a fixture that pinned
+    a hand-written snippet would pass while `heartbeat-loop.sh` drifted away from it.
+    """
+    text = _BEAT.read_text()
+    mutated = mutate(text)
+    if mutated is None or mutated == text:
+        return None
+    dst = tmp_path / "heartbeat-loop.sh"
+    dst.write_text(mutated)
+    return dst
+
+
+# The only line the mutants are inserted before: the arm guard that makes the launch reachable.
+_GUARD = 'if [ ! -f "$STATE/PR-DOCTOR-OFF" ]; then'
+
+
+# ⛔ THE CONTINUATION-LINE ARGUMENT. `--dry-run` is a real flag (`pr-doctor.py` accepts it and then
+# dispatches nothing), and bash joins the continuation into the SAME command. A pin on the first
+# physical line matches anyway — so the gate reported "the pinned launch is present and reachable"
+# on a beat whose single dispatch entry point was a no-op.
+def _add_dry_run_on_continuation(text):
+    # Insert an argument on the line AFTER the launch's backslash continuation.
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if "/usr/bin/python3" in line and "pr-doctor.py" in line and line.rstrip().endswith("\\"):
+            lines.insert(i + 1, "            --dry-run \\")
+            return "\n".join(lines) + "\n"
+    return None
+
+
+def test_a_defeated_gate_the_continuation_line_argument_is_refused(tmp_path):
+    mutated = _beat_mutated(tmp_path, _add_dry_run_on_continuation)
+    assert mutated is not None, "anchor missing: the launch no longer backslash-continues"
+    launches = [l for l in _logical_lines(mutated) if _DISPATCH_STEP in l]
+    assert launches, "the mutation removed the launch; the fixture is wrong, not the gate"
+    assert not any(_DISPATCH_LAUNCH.match(l) for l in launches), (
+        "an argument on the launch's CONTINUATION line was graded as the pinned launch. bash joins "
+        "the continuation, so that argument is the command's argument — `--dry-run` there is the "
+        "beat's only dispatch entry point deciding nothing, on every pass, while this gate says "
+        "the launch is exactly right. Got: %r" % launches)
+
+
+# ⛔ THE ONE-LINE TRANSFER. `if …; then continue; fi` starts with `if` (so a line-leading transfer
+# matcher is blind) and closes on its own line (so `_enclosing_constructs` never sees it, and the
+# enclosing-construct assertion stays byte-identical). It makes the launch unreachable from the
+# second pass on while every pinned string survives.
+_ONE_LINE_TRANSFERS = [
+    ('if [ -n "$PR_DOCTOR_DISABLE" ]; then continue; fi', "a one-line if"),
+    ('[ -n "$PR_DOCTOR_DISABLE" ] && continue', "a && guard"),
+    ('[ -f "$STATE/PR-DOCTOR-BLOCK" ] && exit 0', "a && exit"),
+    ('{ [ -n "$PR_DOCTOR_DISABLE" ] && continue; }', "a brace group"),
+    ('while :; do break; done', "a one-line while"),
+    ('if true; then continue; fi', "a dead-branch one-line"),
+]
+
+
+def _insert_before_guard(stmt):
+    def _mutate(text):
+        if _GUARD not in text:
+            return None
+        return text.replace(_GUARD, "  " + stmt + "\n  " + _GUARD, 1)
+    return _mutate
+
+
+def test_a_defeated_gate_every_one_line_early_transfer_is_refused(tmp_path):
+    """A transfer in COMMAND POSITION anywhere on the line, not only at its start."""
+    survivors = []
+    for stmt, label in _ONE_LINE_TRANSFERS:
+        mutated = _beat_mutated(tmp_path, _insert_before_guard(stmt))
+        assert mutated is not None, "anchor missing: the arm guard line moved"
+        transfers = _early_transfers(mutated, _DISPATCH_STEP)
+        assert transfers is not None, "the launch vanished under mutation %r" % label
+        if transfers == _ALLOWED_EARLY_TRANSFERS:
+            survivors.append((label, stmt))
+    assert not survivors, (
+        "these shapes END the pass before the dispatch and left the pinned transfer list "
+        "BYTE-IDENTICAL, so this gate reported green on a beat that never dispatches: %r. "
+        "A transfer counts in command position, not only at the start of a line." % survivors)
+
+
+# ⛔ THE HEREDOC-DISABLED BLOCK. `: <<'WORD' … WORD` keeps every byte of the launch and runs none
+# of it. No construct list can see this, so the body must be removed before scanning — otherwise
+# the code view and the text view disagree and only the text view contains the launch.
+def _heredoc_wrap_the_launch(text):
+    # `<<'WORD'` (no `-`) requires the terminator at COLUMN 0 — an indented one is not a terminator
+    # to bash, and a fixture bash would reject proves nothing about a shape bash would run.
+    start = '    ( nohup /usr/bin/python3 "$SCRIPTS/pr-doctor.py" \\'
+    end = '          rmdir "$STATE/pr-doctor.lock" 2>/dev/null ) &'
+    if start not in text or end not in text:
+        return None
+    return text.replace(start, "    : <<'UNUSED_PROSE'\n" + start, 1).replace(
+        end, end + "\nUNUSED_PROSE", 1)
+
+
+def test_a_defeated_gate_a_heredoc_disabled_block_is_refused(tmp_path):
+    mutated = _beat_mutated(tmp_path, _heredoc_wrap_the_launch)
+    assert mutated is not None, "anchor missing: the launch's first or last line moved"
+    # The fixture must be a beat BASH WOULD ACCEPT — a mutant bash rejects proves nothing.
+    assert subprocess.run(["bash", "-n", str(mutated)]).returncode == 0, (
+        "the heredoc fixture is not valid bash, so it is not the shape it claims to test")
+    assert not [l for l in _executable_lines(mutated) if _DISPATCH_STEP in l], (
+        "the launch still counts as live CODE inside a `: <<'WORD' … WORD` block. bash runs none "
+        "of it, so the beat dispatches nothing while this file reports the launch present.")
+    # And the positive control must not survive on the RAW view either — one definition of "code".
+    assert not [l for l in _executable_raw(mutated) if _DISPATCH_STEP in l], (
+        "the indented view still sees the launch inside a heredoc; the two views must agree")
+
+
+# ⛔ THE CONTROL: the fixtures must not be vacuous. An unmutated copy must PASS every assertion the
+# mutated copies fail, or the matrix above proves only that the helpers dislike every input.
+def test_the_defeat_matrix_does_not_red_the_real_beat(tmp_path):
+    # Copy, not mutate: the control must be the beat EXACTLY as it ships.
+    baseline = tmp_path / "heartbeat-loop.sh"
+    baseline.write_text(_BEAT.read_text())
+    launches = [l for l in _logical_lines(baseline) if _DISPATCH_STEP in l]
+    assert any(_DISPATCH_LAUNCH.match(l) for l in launches), (
+        "the pinned launch does not match the UNMUTATED beat — the pin is wrong, not the mutants")
+    assert _early_transfers(baseline, _DISPATCH_STEP) == _ALLOWED_EARLY_TRANSFERS, (
+        "the unmutated beat does not produce the pinned transfer list")
+    assert [l for l in _executable_lines(baseline) if _DISPATCH_STEP in l], (
+        "the unmutated beat's launch is not seen as executable code")
