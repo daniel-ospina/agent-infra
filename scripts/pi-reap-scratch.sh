@@ -445,7 +445,13 @@ liveness_load() {
 # table would be thousands of forks. The result is loaded into a single string
 # and membership is a bash `case` test — also zero forks per candidate.
 held_blob() {
-    local root="$1"
+    local root="$1" rc
+    # A live-path list that cannot be read cannot answer "is this held" — and an
+    # empty answer must NOT read as "nothing holds it", or EVERY entry under
+    # every root classifies `reclaimable` and the armed path deletes all of them.
+    # Every other probe in this script propagates its failure; this was the one
+    # fail-open (#1161 review).
+    [ -r "$LIVE_PATHS" ] || return 1
     printf '\n'
     awk -v root="$1" '
         # Prefix built ONCE and normalised for the root case: `root "/"` on
@@ -459,7 +465,55 @@ held_blob() {
             sub(/\/.*$/, "", rest)
             if (rest != "") print rest
         }' "$LIVE_PATHS" 2>/dev/null
+    rc=$?
     printf '\n'
+    # `awk` failing mid-pass would otherwise yield a PARTIAL held set, which is
+    # an incomplete gate rather than an absent one — refuse it.
+    return "$rc"
+}
+
+# infra_protected <path> -> 0 (PROTECTED) when <path> must never be reclaimed,
+# however old and however unheld it looks.
+#
+# The DEFAULT root set is the TOP LEVEL of /tmp, and a fleet cell keeps its HOME,
+# its repos and its lane worktrees exactly there (HOME=/tmp/cell-home,
+# REPO=/tmp/cell-t3, .worktrees/* beside it, wt-* / ln*-* lane checkouts). Before
+# this gate the only obstacles were the system/advisory/self NAME prefixes plus
+# liveness and the mount table, so a default dry-run pass on this host classified
+# `/tmp/cell` and `/tmp/mergewt` as `reclaimable` — and `--apply` reaches
+# `rm -rf -- "$path"` on each. `/tmp/mergewt` is a git WORKTREE and `/tmp/cell` a
+# repo checkout with lane worktrees under it, i.e. uncommitted work. "Aged and no
+# live holder" is not a licence to delete a repository.
+#
+# Two independent, FORK-FREE tests (bash builtins only — the per-candidate cost
+# is why the rest of this pass is built the way it is):
+#   1. GIT SHAPE — `.git` is a DIRECTORY for a repo and a FILE for a linked
+#      worktree, so one `-e` covers both; a bare repo has no `.git`, so its
+#      skeleton is tested too. A CONTAINED repo counts as well (`<entry>/*/.git`):
+#      `/tmp/cell-try` holds four lane checkouts one level down and has no `.git`
+#      of its own, so a top-level-only test would have deleted all four.
+#      DECLARED BOUNDARY: detection reaches one level down. A repo nested two or
+#      more levels inside an otherwise-plain scratch dir is not detected — that is
+#      the residual, and the reason root scope is still worth keeping tight.
+#   2. ANCESTRY — the entry is, or is an ANCESTOR of, something the running
+#      session lives in ($HOME, the state dir, the agent-infra checkout, $PWD).
+#      Protecting an ancestor matters because `rm -rf` on it takes the
+#      descendant with it.
+infra_protected() {
+    local p="$1" a g
+    [ -e "$p/.git" ] && return 0
+    [ -f "$p/HEAD" ] && [ -d "$p/objects" ] && [ -d "$p/refs" ] && return 0
+    # ONE glob, no `nullglob` needed: with no match the pattern is left literal and
+    # `-e` is false, so the loop simply ends. Fork-free, like every other gate here.
+    for g in "$p"/*/.git; do
+        [ -e "$g" ] && return 0
+    done
+    for a in "${HOME:-}" "$STATE_DIR" "${AGENT_INFRA_PATH:-}" "${PWD:-}"; do
+        [ -n "$a" ] || continue
+        [ "$p" = "$a" ] && return 0
+        case "$a" in "$p"/*) return 0 ;; esac
+    done
+    return 1
 }
 
 # enumerate <outfile> <root> <floor-minutes>
@@ -489,6 +543,13 @@ enumerate() {
 classify_entry() {
     local base="$1" n
     CLASSIFY_VERDICT=reclaim; CLASSIFY_REASON=reclaimable
+    # Repos, worktrees and anything the session lives inside come FIRST: no name
+    # prefix, age, liveness or mount-table answer may override them (#1161
+    # review — the default /tmp root classified live lane checkouts as
+    # reclaimable).
+    if [ -n "${3:-}" ] && infra_protected "$3"; then
+        CLASSIFY_VERDICT=preserve; CLASSIFY_REASON=infra-protected; return 0
+    fi
     for n in $SYSTEM_OWNED_PREFIXES; do
         case "$base" in "$n"*) CLASSIFY_VERDICT=preserve; CLASSIFY_REASON=system-owned; return 0 ;; esac
     done
@@ -737,12 +798,31 @@ run() {
             DEGRADED=$((DEGRADED + 1))
             i=$((i + 1)); continue
         fi
-        held="$(held_blob "$root")"
+        if ! held="$(held_blob "$root")"; then
+            # The live-held set for this root could not be evaluated, so nothing
+            # under it is provably unheld. DEGRADED, never "nothing to reap here".
+            printf 'ENUMERATION DEGRADED %s — the live-held set could not be evaluated; this root contributed NOTHING and the pass is NOT clean\n' "$root"
+            log "ENUMERATION-DEGRADED $root reason=liveness-unavailable"
+            DEGRADED=$((DEGRADED + 1))
+            i=$((i + 1)); continue
+        fi
 
         # The enumerated set is loaded once into an indexed array (bash 3.2-safe;
         # no `mapfile`, no associative arrays). This is what makes the budget
         # O(1) to honour: on exhaustion the remaining entries are COUNTED, not
         # walked.
+        # An enumeration file that VANISHED (or became unreadable) between
+        # `enumerate` and this load makes the redirect fail, the loop body never
+        # run, `n` stay 0, and the pass print `enumerated=0 ... degraded_roots=0`
+        # with exit 0 — the #1095 false-green class this script exists to close,
+        # one layer in from the `find` exit status it already checks (#1161
+        # review; observed live from this PR's own suite).
+        if [ ! -r "$FIND_OUT" ]; then
+            printf 'ENUMERATION DEGRADED %s — the enumerated set vanished before it could be read; this root contributed NOTHING and the pass is NOT clean\n' "$root"
+            log "ENUMERATION-DEGRADED $root reason=output-vanished"
+            DEGRADED=$((DEGRADED + 1))
+            i=$((i + 1)); continue
+        fi
         local -a cand=(); local n=0 cp
         while IFS= read -r -d '' cp; do cand[$n]="$cp"; n=$((n + 1)); done <"$FIND_OUT"
         ENUMERATED=$((ENUMERATED + n))
@@ -770,7 +850,7 @@ run() {
             fi
             path="${cand[$j]}"
             base="${path%/}"; base="${base##*/}"
-            classify_entry "$base" "$held"
+            classify_entry "$base" "$held" "$path"
             if [ "$CLASSIFY_VERDICT" = "reclaim" ]; then
                 # Mount-point gate: membership in the mount table. `rm -rf` on a
                 # mount point would empty the mounted filesystem before failing
@@ -864,7 +944,15 @@ run() {
                 # (#1161 review). The classification path already used this exact
                 # form -- mirror it.
                 if [ -n "$root" ]; then
-                    hb="$(held_blob "$root")"
+                    if ! hb="$(held_blob "$root")"; then
+                        # The pre-removal re-probe could not answer "is this
+                        # held". Removing on an unanswered question is the exact
+                        # fail-open the re-probe exists to prevent, so the entry
+                        # stays.
+                        printf 'preserve %s\n          reason=liveness-unavailable (pre-removal re-probe could not evaluate live holders)\n' "$path"
+                        log "LATE-PRESERVE $path reason=liveness-unavailable"
+                        continue
+                    fi
                     case $'\n'"$hb"$'\n' in
                         *$'\n'"$base"$'\n'*)
                             printf 'preserve %s\n          reason=live-held-since-classification (pre-removal re-probe)\n' "$path"

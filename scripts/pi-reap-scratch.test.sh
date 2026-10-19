@@ -534,7 +534,46 @@ run_scratch s17b --apply --root "$ROOT" --min-age-min 1 --verbose
 assert_dir "$ROOT/pi-reap-scratch.selfjunk" "S17b a pi-reap-scratch.* entry is preserved"
 assert_contains "$RUN_OUT" "reason=self-scratch" "S17b ... with the reason named"
 assert_dir "$ROOT" "S17b the ROOT itself was never removed"
-assert_absent "$(rmcalls s17b)" "$ROOT -rf" "S17b the root is never passed to rm"
+# The needle must be the ACTUAL rm argv. The shim logs "$*" as `-rf -- <path>`,
+# so the old needle `"$ROOT -rf"` (argument order reversed) could never appear
+# even if the root WERE passed to rm — the assertion could not fail (#1161
+# review). Anchored on the path so a sibling like $ROOT/child cannot satisfy it.
+if grep -qE -- "-rf -- ${ROOT//\//\\/}\$" <<<"$(rmcalls s17b)"; then
+    bad "S17b the ROOT itself was passed to rm"
+else
+    ok "S17b the root is never passed to rm"
+fi
+
+# ── S24: the INFRA-PROTECTED gate (#1161 review) ────────────────────────
+# The DEFAULT root set is the top level of /tmp, and a fleet cell keeps its HOME,
+# its repos and its lane worktrees there. Before this gate a default dry-run on a
+# real host classified `/tmp/cell` (a repo checkout) and `/tmp/mergewt` (a git
+# worktree) as `reclaimable` — one armed pass from `rm -rf` of uncommitted work.
+# Age, liveness and the mount table all said "delete it": none of them is a
+# licence to delete a repository.
+echo "— S24: repos, worktrees and session infrastructure are NEVER reclaimed —"
+mkold cell
+mkdir -p "$ROOT/cell/.git"; touch -t "$OLD" "$ROOT/cell"
+mkold wt-lane
+printf 'gitdir: /elsewhere\n' >"$ROOT/wt-lane/.git"   # a linked worktree: .git is a FILE
+touch -t "$OLD" "$ROOT/wt-lane"
+mkold bare.git
+mkdir -p "$ROOT/bare.git/objects" "$ROOT/bare.git/refs"; : >"$ROOT/bare.git/HEAD"
+touch -t "$OLD" "$ROOT/bare.git"
+mkold plainjunk
+# A CONTAINED repo: /tmp/cell-try holds four lane checkouts one level down and
+# has no `.git` of its own — a top-level-only test deletes all four.
+mkold cell-try
+mkdir -p "$ROOT/cell-try/dirtest/.git" "$ROOT/cell-try/prhead/.git"
+touch -t "$OLD" "$ROOT/cell-try"
+lsof_table "$T/s24.lsof" "$ROOT/nothing"
+run_scratch s24 --apply --root "$ROOT" --min-age-min 1 --verbose
+assert_dir "$ROOT/cell" "S24 a git repo is preserved"
+assert_dir "$ROOT/wt-lane" "S24 a linked worktree (.git is a FILE) is preserved"
+assert_dir "$ROOT/bare.git" "S24 a bare repo is preserved"
+assert_dir "$ROOT/cell-try" "S24 an entry CONTAINING repos is preserved"
+assert_contains "$RUN_OUT" "reason=infra-protected" "S24 ... with the reason named"
+assert_nodir "$ROOT/plainjunk" "S24 ordinary scratch beside them is still reclaimed"
 
 echo ""
 echo "── scratch suite: $PASS passed, $FAIL failed ──"

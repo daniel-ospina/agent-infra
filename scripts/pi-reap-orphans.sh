@@ -813,6 +813,17 @@ run() {
 
     ps_normalize "$PS_A" >"$NORM_A"
     ps_normalize "$PS_B" >"$NORM_B"
+    # `ps_load` validates the RAW table; nothing validated the NORMALISED one, so
+    # a normalisation that failed (a stub/failing awk, a vanished temp file) left
+    # an empty or unshaped file that the candidate scan reads as "no orphaned
+    # processes" — an armed pass reporting `reapable=0` with exit 0 (#1161
+    # review). An empty table is a FAILED PROBE at this layer too: refuse.
+    if [ ! -s "$NORM_A" ] || [ ! -s "$NORM_B" ] || \
+       ! ps_table_shaped "$NORM_A" || ! ps_table_shaped "$NORM_B"; then
+        echo "FAIL-CLOSED abort: the normalised process table is empty or unshaped — no candidate set can be trusted (exit 3)" >&2
+        log "FAIL-CLOSED abort: normalised ps table unusable (exit 3)"
+        exit 3
+    fi
     SELF_PIDS=" $$ "
     local pid="$$" depth=0 ppid
     while [ "$pid" -gt 1 ] 2>/dev/null && [ "$depth" -lt 64 ]; do
