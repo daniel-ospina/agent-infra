@@ -6238,7 +6238,10 @@ testAsync("#2148: the merge gate still refuses without an attestation, and names
         (res.reason as string).includes("clean [owner/repo] --evidence comment:"),
         "…the invocation CARRIES --evidence (a fresh clean without it exits 3)",
       );
-      ok((res.reason as string).includes(`#${pr}`), "…for THIS PR, so the lane need not guess the number");
+      // The header names THIS PR. This does NOT claim the command interpolates it — the command's
+      // placeholders (`<PR>`, `<head_sha>`) are by design, and an earlier version of this assertion
+      // passed on the header alone while claiming otherwise (review of #2148, P2).
+      ok((res.reason as string).includes(`#${pr}`), "the refusal names the PR in its header");
       ok(tempAuditLines().some((l) => l.event === "merge_gate_block"), "the refusal is still audited");
       // The same requirement must also be on the dispatch-count block: a lane that satisfies the
       // dispatch gate and is then refused by the merge gate has wasted the trip the message exists
@@ -6396,6 +6399,44 @@ testAsync("#2148: merge-one.sh's REVIEWER is told what it owns — and NOT to pu
       if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
     }
   });
+});
+
+test("#2148: NO message this extension prints spells the recorder as a bare or repo-relative token", () => {
+  // ⛔ THE CLASS, NOT ONE SITE (review of #2148, P1). `~/.pi/agent/scripts` is NOT on PATH, so a bare
+  // `record-review.sh …` is `command not found` at the moment the lane tries to land; a repo-relative
+  // `scripts/record-review.sh` only exists in agent-infra's own checkout. The invariant is asserted
+  // over EVERY message a lane can be handed, so a new line (or a re-worded one) cannot reintroduce
+  // either spelling without a red test.
+  const BARE = /(^|\s)record-review\.sh/;
+  const reasons = [
+    BLOCK_MESSAGE,
+    MICRO_BLOCK_MESSAGE,
+    (evaluateMergeGate(138, null, "a".repeat(40), { source: "fallback" }) as any).reason,
+    (evaluateMergeGate(138, null, "a".repeat(40), { source: "fallback" }, true) as any).reason,
+    (evaluateMergeGate(138, { ...cleanRecord, verdict: "fail" }, "a".repeat(40), {
+      source: "record",
+      repo: "owner/repo",
+    }) as any).reason,
+    (evaluateMergeGate(138, cleanRecord, "b".repeat(40), { source: "record", repo: "owner/repo" }) as any)
+      .reason,
+  ] as string[];
+  for (const [i, reason] of reasons.entries()) {
+    ok(!BARE.test(reason), `message #${i} does not spell a bare record-review.sh: ${reason.slice(0, 90)}…`);
+    ok(
+      !/\sscripts\/record-review\.sh/.test(reason),
+      `message #${i} is not repo-relative (a content repo has no scripts/record-review.sh)`,
+    );
+    if (reason.includes("record-review.sh")) {
+      ok(
+        reason.includes("~/.pi/agent/scripts/record-review.sh"),
+        `message #${i} names the recorder by its home path`,
+      );
+    }
+  }
+  // Non-vacuity: the messages really DO carry record commands, so the assertions above are not
+  // passing on a message that names none.
+  ok(reasons[1].includes("clean-micro"), "the micro message still names its verdict");
+  ok(reasons[0].includes("clean [owner/repo] --evidence"), "the standard message still names the clean invocation");
 });
 
 // ── Summary ───────────────────────────────────────────

@@ -75,6 +75,8 @@ ck $rc "…naming the record command WITH --evidence (a fresh 'clean' without it
 case "$LINE" in *" scripts/record-review.sh"*) rc=1;; *) rc=0;; esac
 ck $rc "⛔ …and NOT a repo-relative path (a content repo has no scripts/record-review.sh)"
 case "$LINE" in *"scripts/admin-merge.sh <PR>"*) rc=0;; *) rc=1;; esac; ck $rc "…naming the rail command"
+case "$LINE" in *"no \`task\` tool"*) rc=0;; *) rc=1;; esac
+ck $rc "the self line names the condition that OVERRIDES it (a harness lane with no task tool, review P1)"
 case "$LINE" in *"AFTER the last push"*) rc=0;; *) rc=1;; esac
 ck $rc "…and WHEN to record (a stale record is refused, so 'record' alone is a trap)"
 case "$LINE" in *"post the reviewer's verdict as a PR comment"*) rc=0;; *) rc=1;; esac
@@ -85,6 +87,10 @@ echo "§B the three roles"
 HARNESS_LINE="$(reviewer_preflight_line harness)"
 case "$HARNESS_LINE" in *"HARNESS reviewer"*) rc=0;; *) rc=1;; esac; ck $rc "the harness role names WHO mints the attestation"
 case "$HARNESS_LINE" in *"do NOT merge"*) rc=0;; *) rc=1;; esac; ck $rc "the harness role keeps the lane out of the rail"
+case "$HARNESS_LINE" in *"merge-one.sh runs:"*) rc=0;; *) rc=1;; esac
+ck $rc "…and FRAMES the record/rail as merge-one.sh's work, not the lane's (review P2)"
+case "$HARNESS_LINE" in *"no \`task\` tool"*) rc=1;; *) rc=0;; esac
+ck $rc "…without the self line's hedge (this IS the marked harness audience)"
 case "$HARNESS_LINE" in *"~/.pi/agent/scripts/record-review.sh"*) rc=0;; *) rc=1;; esac; ck $rc "…and still names the record command"
 case "$HARNESS_LINE" in *"dispatch: task("*) rc=1;; *) rc=0;; esac
 ck $rc "⛔ the harness role does NOT instruct the lane to dispatch (its brief forbids it — the roles cannot collapse)"

@@ -132,6 +132,23 @@ function commandTrail(): string {
   );
 }
 
+/**
+ * The hedge every SELF line carries, because the role cannot always be known.
+ *
+ * ⛔ A FOURTH LAUNCHER DOES NOT MARK ITSELF (review of #2148, P1). `KIND` is exported by THIS repo's
+ * launchers, but the content-repo copy of the harness (`tortoise/operations/orchestrator-harness/
+ * lane.sh`, which the README says the fleet still runs) exports the bypass bundle and no `KIND` —
+ * while its brief says "you have NO \"task\" tool — do NOT dispatch. The PARENT runs the review
+ * gate." and "Do NOT merge." So that lane resolves to `self` and would be told to dispatch and to
+ * run the rail — the contradiction the role split removed for the marked launchers, one launcher
+ * over. The fix for the MARKER is a companion change in that repo (filed); until it lands, the line
+ * must be true for that lane too, so the self line names the condition under which it does NOT
+ * apply. Told the exception explicitly, a lane whose brief says "do not dispatch" is no longer
+ * reading two contradictory instructions.
+ */
+const NO_MARKER_HEDGE =
+  "If your brief says you have no `task` tool, that overrides this: do NOT dispatch and do NOT merge — the parent's reviewer mints the attestation.";
+
 /** The harness role's clause — the LANE does not dispatch, and does not merge. */
 const HARNESS_CLAUSE = "the HARNESS reviewer (merge-one.sh) mints it";
 
@@ -165,12 +182,13 @@ export function reviewerPreflightLine(
     return (
       `${REVIEWER_PREFLIGHT_TAG} #2148 preflight: ${REVIEWER_PREFLIGHT_REQUIREMENT} — ` +
       `${HARNESS_CLAUSE}: push your FINAL head, do NOT merge. ` +
-      `record: ${REVIEWER_PREFLIGHT_RECORD_CMD}; rail: ${REVIEWER_PREFLIGHT_RAIL_CMD}.${bypass}`
+      `For reference, merge-one.sh runs: record: ${REVIEWER_PREFLIGHT_RECORD_CMD}; ` +
+      `then rail: ${REVIEWER_PREFLIGHT_RAIL_CMD}.${bypass}`
     );
   }
   return (
     `${REVIEWER_PREFLIGHT_TAG} #2148 preflight: this lane ${REVIEWER_PREFLIGHT_REQUIREMENT} — ` +
-    `${commandTrail()}. ${HEAD_BINDING}.${bypass}`
+    `${commandTrail()}. ${HEAD_BINDING}. ${NO_MARKER_HEDGE}${bypass}`
   );
 }
 
@@ -196,13 +214,14 @@ export function reviewerFirstPushNotice(
     return (
       `${REVIEWER_PREFLIGHT_TAG} #2148 first push: no attestation can exist yet — ` +
       `${HARNESS_CLAUSE} at the head you just pushed, so push your FINAL head and do NOT merge. ` +
-      `record: ${REVIEWER_PREFLIGHT_RECORD_CMD}; rail: ${REVIEWER_PREFLIGHT_RAIL_CMD}.${bypass}`
+      `For reference, merge-one.sh runs: record: ${REVIEWER_PREFLIGHT_RECORD_CMD}; ` +
+      `then rail: ${REVIEWER_PREFLIGHT_RAIL_CMD}.${bypass}`
     );
   }
   return (
     `${REVIEWER_PREFLIGHT_TAG} #2148 first push: NO reviewer dispatch in this session yet, so the ` +
     `rail will refuse at the finish line. Do it NOW, while the context is live — ` +
-    `${commandTrail()}. ${HEAD_BINDING}.${bypass}`
+    `${commandTrail()}. ${HEAD_BINDING}. ${NO_MARKER_HEDGE}${bypass}`
   );
 }
 

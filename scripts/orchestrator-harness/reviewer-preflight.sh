@@ -51,6 +51,12 @@ REVIEWER_PREFLIGHT_RECORD_CMD='~/.pi/agent/scripts/record-review.sh <PR> <HEAD> 
 REVIEWER_PREFLIGHT_TAG='[gate]'
 REVIEWER_PREFLIGHT_BRIEF_TEMPLATE='templates/LANE-BRIEF.md'
 REVIEWER_HEAD_BINDING='a record bound to an older head is stale and the rail refuses it, so record AFTER the last push'
+# ⛔ THE SELF LINE'S HEDGE (review of #2148, P1). `KIND` is exported by THIS repo's launchers, but the
+# content-repo copy (tortoise/operations/orchestrator-harness/lane.sh) exports the bypass bundle and
+# no KIND, while its brief says "you have NO \"task\" tool — do NOT dispatch. The PARENT runs the
+# review gate" and "Do NOT merge." Told the exception explicitly, such a lane no longer reads two
+# contradictory instructions. Same wording as the TS `NO_MARKER_HEDGE` (drift-pinned).
+REVIEWER_NO_MARKER_HEDGE='If your brief says you have no `task` tool, that overrides this: do NOT dispatch and do NOT merge — the parent'"'"'s reviewer mints the attestation.'
 
 # reviewer_rail_cmd → the rail's path, assembled at runtime (see the header note).
 reviewer_rail_cmd() {
@@ -72,15 +78,15 @@ reviewer_preflight_line() {
   local role="${1:-self}"
   case "$role" in
     self)
-      printf '%s #2148 preflight: this lane %s — %s. %s.\n' \
+      printf '%s #2148 preflight: this lane %s — %s. %s. %s\n' \
         "$REVIEWER_PREFLIGHT_TAG" "$REVIEWER_PREFLIGHT_REQUIREMENT" \
-        "$(reviewer_command_trail)" "$REVIEWER_HEAD_BINDING"
+        "$(reviewer_command_trail)" "$REVIEWER_HEAD_BINDING" "$REVIEWER_NO_MARKER_HEDGE"
       ;;
     harness)
       # The harness reviewer mints the attestation (merge-one.sh), so the lane's duty is to keep
       # the head stable and never merge — both are stated, because either one done by accident
       # costs a second review.
-      printf '%s #2148 preflight: %s — the HARNESS reviewer (merge-one.sh) mints it: push your FINAL head, do NOT merge. record: %s; rail: %s.\n' \
+      printf '%s #2148 preflight: %s — the HARNESS reviewer (merge-one.sh) mints it: push your FINAL head, do NOT merge. For reference, merge-one.sh runs: record: %s; then rail: %s.\n' \
         "$REVIEWER_PREFLIGHT_TAG" "$REVIEWER_PREFLIGHT_REQUIREMENT" \
         "$REVIEWER_PREFLIGHT_RECORD_CMD" "$(reviewer_rail_cmd)"
       ;;

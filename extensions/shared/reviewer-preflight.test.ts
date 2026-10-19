@@ -89,6 +89,15 @@ ok(
 // ⛔ `--evidence comment:<id>` needs a referent. Without "post the verdict as a PR comment" the lane
 // must invent the artifact, and the missing one is discovered from an exit-3 refusal at record time
 // — the "found out at the finish line" shape this issue exists to end (fresh review, P2).
+// ⛔ THE SELF LINE MUST BE TRUE FOR A LANE THAT DOES NOT MARK ITSELF (review of #2148, P1). The
+// content-repo copy of the harness exports the bypass bundle and NO `KIND`, while its brief says
+// "you have NO \"task\" tool — do NOT dispatch" and "Do NOT merge" — so that lane resolves to
+// `self`. Told the exception explicitly, it no longer reads two contradictory instructions. This
+// substring cannot appear by accident, so the assertion cannot pass vacuously.
+ok(
+  line.includes("no `task` tool"),
+  "the self line names the condition that overrides it (a harness lane with no task tool)",
+);
 ok(
   line.includes("post the reviewer's verdict as a PR comment"),
   "it says the verdict must be POSTED as a PR comment (that comment is the --evidence artifact)",
@@ -125,6 +134,23 @@ ok(
 ok(harnessLine.includes("do NOT merge"), "the harness role keeps the lane out of the rail");
 ok(!harnessLine.includes("dispatch: task("), "⛔ the harness role does NOT tell the lane to dispatch — its brief forbids it");
 ok(harnessLine.includes(REVIEWER_PREFLIGHT_RECORD_CMD), "the harness role still names the record command");
+ok(
+  !harnessLine.includes("no `task` tool"),
+  "…and the harness line does NOT carry the self line's hedge (it IS the marked harness audience)",
+);
+// ⛔ FRAMED AS THE HARNESS'S TO RUN, not as the lane's (review of #2148, P2). The line is delivered
+// as a `steer` message at the lane's first push, i.e. at the one moment a bare `rail:` command is
+// most actionable — one clause after "do NOT merge". The reviewer role already framed the same
+// command as "for reference"; the harness role now does too. This substring does not exist in the
+// pre-fix text, so it cannot pass vacuously.
+ok(
+  harnessLine.includes("merge-one.sh runs:"),
+  "the harness role FRAMES the record/rail as merge-one.sh's work, not the lane's",
+);
+ok(
+  !/^[^.]*do NOT merge\. record: /.test(harnessLine.replace(/\s+/g, " ")),
+  "…and does not hand the lane a bare `record:`/`rail:` command to act on",
+);
 ok(
   !harnessLine.includes("this lane " + REVIEWER_PREFLIGHT_REQUIREMENT),
   "the harness role reframes the requirement (the subject is the PR, not the lane's own dispatch)",
