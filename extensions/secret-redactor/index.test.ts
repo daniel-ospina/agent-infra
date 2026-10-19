@@ -618,8 +618,116 @@ async function main(): Promise<void> {
     strictEqual(await run({ toolName: "x", content: [{ type: "text", text: "nothing to see" }] }), undefined);
   });
 
-  await test("non-array content is not ours to touch", async () => {
+  await test("non-array, non-string content is not ours to touch", async () => {
+    strictEqual(await run({ toolName: "x", content: 42 }), undefined);
+  });
+
+  // ⛔ review round 11: a BARE-STRING content was skipped outright, so
+  // `content: "key=<secret>"` reached the model with no patch and no notice. The
+  // sibling boundary converts to an ARRAY patch for exactly this reason (a bare-string
+  // patch breaks downstream image normalization; an array of one text part does not).
+  await test("a bare-string content carrying a secret IS redacted, as an array patch", async () => {
+    const out = await run({ toolName: "bash", content: `cfg=${CONFIG_SECRET} trailing` });
+    ok(out, "a string payload must not be skipped (it used to pass unredacted)");
+    ok(Array.isArray(out.content), "the patch must be an ARRAY of content parts, not a bare string");
+    ok(
+      !JSON.stringify(out.content).includes(CONFIG_SECRET),
+      "the secret must be gone from the patched string content",
+    );
+  });
+
+  await test("a clean bare-string content is left untouched", async () => {
     strictEqual(await run({ toolName: "x", content: "a plain string" }), undefined);
+  });
+
+  // ⛔ review round 11: the store dump is this extension's headline scenario, and it
+  // renders a value containing `"` or `\` JSON-ESCAPED. Only the literal form was
+  // registered, so the escaped text reached the model while the literal was redacted.
+  await test("a secret containing a quote/backslash is redacted from its ESCAPED form", async () => {
+    const raw = 'p@ss"word\\123456';
+    writeFileSync(join(AGENT, "escaped-store.json"), JSON.stringify({ password: raw }));
+    // The secret set is CACHED (CACHE_MS) and loaded at import, so the new store must be
+    // re-read — writing the fixture alone would test nothing (the first draft of this test
+    // "failed" for exactly that reason, not because the fix was missing).
+    refreshSecrets();
+    const dump = JSON.stringify({ password: raw });
+    const out = await run({ toolName: "bash", content: [{ type: "text", text: dump }] });
+    ok(out, "the escaped form of a configured secret must be redacted (it used to pass)");
+    ok(
+      !JSON.stringify(out.content).includes(JSON.stringify(raw).slice(1, -1)),
+      "the JSON-escaped encoding must not survive into the result",
+    );
+    // ONE secret in two encodings must still be ONE marker: a second `ordinal` advance
+    // would emit `escaped-store#1` AND `escaped-store#2`, and the warning would
+    // over-report the count.
+    const flat = JSON.stringify(out.content);
+    ok(
+      new Set(flat.match(/escaped-store#\d+/g) ?? []).size <= 1,
+      "the escaped variant must not mint a DISTINCT second label for the same secret",
+    );
+    ok(/1 secret pattern\(s\) REDACTED/.test(flat), "the count must be 1, not 2");
+  });
+
+  // ⛔ review round 11: `sk-`/`tt_` were unbounded and allowed `-`, so ordinary slugs
+  // were redacted — and on a read→write round trip the MARKER is what gets persisted.
+  // ⛔ review round 11, P0: a store larger than the scan cap hit a bare `continue`, so it
+  // was dropped with NO degradation entry — "no hit" was reported over an UNSCANNED store
+  // and its secrets passed through unredacted, while every sibling failure arm (EACCES,
+  // truncated JSON) withheld. The cap is reachable (models-store.json is ~240 KB).
+  await test("a store over the scan cap WITHHOLDS and names itself, it is not silently skipped", async () => {
+    const big = join(AGENT, "oversized-store.json");
+    writeFileSync(big, JSON.stringify({ apiKey: "oversizedsecretvalue0007", pad: "x".repeat(2_200_000) }));
+    refreshSecrets();
+    const out = await run({ toolName: "read", content: [{ type: "text", text: "hello" }] });
+    ok(out, "an unscannable store must not report 'no secret' over its own contents");
+    equal((out as { isError?: boolean }).isError, true, "the result is withheld as an error");
+    ok(JSON.stringify(out).includes("oversized-store"), "the degradation NAMES the store");
+    // Drop it and reload so the rest of the suite runs against a complete, scannable set.
+    rmSync(big, { force: true });
+    refreshSecrets();
+    strictEqual(await run({ toolName: "x", content: [{ type: "text", text: "clean again" }] }), undefined);
+  });
+
+  // ⛔ review round 11: `sk-`/`tt_` were unbounded and allowed `-`, so ordinary slugs
+  // were redacted — and on a read→write round trip the MARKER is what gets persisted.
+  // The first attempt at this fix (an alnum-only, bounded tail) was a FAIL-OPEN: it lost
+  // `sk-proj-`, `sk-or-v1-` and `sk-ant-`, the key families this fleet actually ships,
+  // and a `{20,64}` cap TRUNCATED a long key instead of replacing it. Both directions are
+  // pinned below: the slug stays out, every real family stays in, and the whole key goes.
+  await test("an ordinary `sk-`/`tt_` prefixed slug is NOT redacted", async () => {
+    strictEqual(
+      await run({ toolName: "x", content: [{ type: "text", text: "sk-learn-machine-learning-course-notes" }] }),
+      undefined,
+      "a hyphenated slug is not an OpenAI key",
+    );
+    strictEqual(
+      await run({ toolName: "x", content: [{ type: "text", text: "tt_2026_10_19_incident_review_notes" }] }),
+      undefined,
+      "a dated notes slug is not a tt_ key",
+    );
+  });
+
+  await test("every real `sk-` key FAMILY is still redacted (proj / or-v1 / ant / base62)", async () => {
+    for (const key of [
+      "sk-proj-" + "a1b2c3d4e5f6g7h8i9j0".repeat(2) + "-tail",
+      "sk-or-v1-" + "0123456789abcdef".repeat(4),
+      "sk-ant-api03-" + "Xy9z".repeat(12),
+      "sk-" + "A1b2C3d4E5f6".repeat(4),
+    ]) {
+      const out = await run({ toolName: "bash", content: [{ type: "text", text: `launch with ${key} now` }] });
+      ok(out, `${key.slice(0, 12)}… must be redacted (a rotated key has no other guard)`);
+      ok(!JSON.stringify(out.content).includes(key), "no fragment of the key may survive");
+    }
+  });
+
+  await test("a long key is redacted WHOLE, not truncated, by the pattern", async () => {
+    const longKey = "sk-" + "Z".repeat(200);
+    const out = await run({ toolName: "bash", content: [{ type: "text", text: `k=${longKey}` }] });
+    ok(out, "a >64-char key must still be redacted");
+    ok(
+      !JSON.stringify(out.content).includes("Z".repeat(20)),
+      "a bounded tail truncates the key and leaves the remainder behind — the whole value must go",
+    );
   });
 
   await test("a hyphenated word is not an `sk-` key (left-anchored patterns)", async () => {
@@ -628,6 +736,37 @@ async function main(): Promise<void> {
 
   await test("env REFERENCE templates are not collected as secrets", async () => {
     strictEqual(await run({ toolName: "x", content: [{ type: "text", text: "apiKey: $ZAI_API_KEY" }] }), undefined);
+  });
+
+  // ⛔ review round 11: an agent dir that EXISTS but cannot be ENUMERATED fell back to
+  // the four FALLBACK_STORES and reported "no hit" over every store it never named — the
+  // same silent-skip class the >2 MB arm closed. ENOTDIR is used rather than `chmod 000`
+  // so the pin holds when the suite runs as root. An ABSENT dir stays a pass-through:
+  // nothing exists to lose, and making it degrade would withhold every result on a fresh box.
+  await test("an agent dir that cannot be ENUMERATED degrades; an ABSENT one does not", async () => {
+    rmSync(AGENT, { recursive: true, force: true });
+    mkdirSync(AGENT, { recursive: true });
+    writeFileSync(join(AGENT, "plain.json"), "{}");
+    refreshSecrets();
+    strictEqual(
+      await run({ toolName: "x", content: [{ type: "text", text: "clean" }] }),
+      undefined,
+      "a readable agent dir is not a degradation",
+    );
+    rmSync(AGENT, { recursive: true, force: true });
+    writeFileSync(AGENT, "not a directory");
+    refreshSecrets();
+    const out = await run({ toolName: "read", content: [{ type: "text", text: "hi" }] });
+    ok(out, "an unenumerable agent dir must withhold — it used to fall back silently");
+    equal((out as { isError?: boolean }).isError, true, "the result is withheld as an error");
+    ok(JSON.stringify(out).includes("agent-dir-unreadable"), "the degradation is NAMED");
+    rmSync(AGENT, { force: true });
+    refreshSecrets();
+    strictEqual(
+      await run({ toolName: "x", content: [{ type: "text", text: "clean" }] }),
+      undefined,
+      "an ABSENT agent dir is not a degradation (a fresh box must not withhold everything)",
+    );
   });
 
   // ── cleanup + summary ──────────────────────────────────────────────────────

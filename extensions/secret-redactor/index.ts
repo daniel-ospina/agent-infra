@@ -61,10 +61,13 @@
  *       visible. It is over-blocking, never a leak. Narrowing the scanned set to
  *       secret-bearing stores is the open question on #5109, and it reduces coverage,
  *       so it is not done silently here;
- *     - a store larger than 2 MB is SKIPPED (`statSync(p).size > 2_000_000`) without
- *       being recorded as a degradation: too large to scan affordably, so its values
- *       are simply not collected. `models-store.json` is already ~240 KB in this
- *       fleet, so the cap is reachable as the provider catalogue grows;
+ *     - a store larger than 2 MB is NOT SCANNED, and it is therefore DEGRADED: it is
+ *       recorded like an EACCES store, so the pass WITHHOLDS every tool result and names
+ *       the store rather than reporting "no secret" over values it never read. The cap
+ *       is reachable (`models-store.json` is ~240 KB in this fleet and grows with the
+ *       provider catalogue), and the consequence is real: a large store that holds NO
+ *       secret still withholds for the 30 s cache window. That is the deliberate trade
+ *       — over-blocking, never a leak — and a bare `continue` here was a fail-open;
  *     - MIN_LEN (12) FLOORS EVERY COLLECTION SITE, so a configured credential SHORTER
  *       THAN 12 CHARACTERS IS NOT REDACTED. The floor exists because redacting short
  *       strings over-redacts ordinary tool output; it is the reason "a configured
@@ -186,10 +189,20 @@ const REFERENCE_RE = /^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?$/;
 
 /** Credential shapes that survive rotation. LEFT-ANCHORED. */
 const PATTERNS: Array<[string, RegExp]> = [
-  ["tt_api_key", /(?<![A-Za-z0-9_])tt_[A-Za-z0-9_-]{20,}/g],
+  ["tt_api_key", /(?<![A-Za-z0-9_])tt_[A-Za-z0-9]{20,}/g],
   ["github_pat", /(?<![A-Za-z0-9_])github_pat_[A-Za-z0-9_]{20,}/g],
   ["github_token", /(?<![A-Za-z0-9_])gh[pousr]_[A-Za-z0-9]{20,}/g],
-  ["openai_key", /(?<![A-Za-z0-9_-])sk-[A-Za-z0-9_-]{20,}/g],
+  // ⛔ TWO ALTERNATIVES, and the FIRST one is anchor-only. An alnum-only tail after a
+  // bounded cap is what keeps ordinary slugs out (`sk-learn-machine-learning-course-notes`:
+  // the run after `sk-` is `learn`, 5 chars), but it also dropped every HYPHEN-CARRYING key
+  // family this fleet actually ships — `sk-proj-…`, `sk-or-v1-…` (the OpenRouter provider in
+  // `extensions/custom-provider-openrouter/`), `sk-ant-…` — i.e. the fix for an
+  // over-redaction became a FAIL-OPEN on the post-rotation net (the exact-value detector
+  // only covers CONFIGURED keys, so a rotated key has no other guard). The second
+  // alternative names the real families explicitly. Both are UNBOUNDED at the tail: a
+  // `{20,64}` cap truncated a long key and left the remainder in the output, which is worse
+  // than not matching it at all.
+  ["openai_key", /(?<![A-Za-z0-9_-])sk-(?:[A-Za-z0-9]{20,}|(?:proj|svcacct|admin|ant|or)-[A-Za-z0-9_-]{20,})/g],
   ["slack_token", /(?<![A-Za-z0-9_])xox[baprs]-[A-Za-z0-9-]{10,}/g],
 ];
 
@@ -236,6 +249,18 @@ function collectFromJson(label: string, file: string, into: Secret[], degraded: 
         // itself scrubbed; the ordinal keeps two secrets from the same store distinct.
         ordinal += 1;
         into.push({ label: `${label}#${ordinal}`, value: node });
+        // ⛔ THE ESCAPED FORM IS A SEPARATE SECRET. A value containing `"` or `\` is
+        // registered literally, but the store dump that is this extension's headline
+        // scenario renders it JSON-ESCAPED — no literal match — so the escaped text
+        // reached the model while the literal was redacted (reproduced: a collected
+        // `p@ss"word\\123456` was not redacted from a `cat` of its own store).
+        // Registered under the same label (the ordinal is not advanced: it is ONE
+        // secret in two encodings, so two markers would misreport the count), and
+        // skipped when escaping is a no-op so the common value is not registered twice.
+        const escaped = JSON.stringify(node).slice(1, -1);
+        if (escaped !== node && escaped.length >= MIN_LEN) {
+          into.push({ label: `${label}#${ordinal}`, value: escaped });
+        }
       }
       return;
     }
@@ -284,7 +309,12 @@ function loadSecrets(): { secrets: Secret[]; degraded: string[] } {
   let names: string[] = [];
   try {
     names = readdirSync(AGENT_DIR).filter((fn) => fn.endsWith(".json"));
-  } catch {
+  } catch (err) {
+    // An ABSENT agent dir has no values to lose and is not a degradation. Anything else
+    // (EACCES, ENOTDIR, EIO) means stores may exist and were never enumerated — the
+    // SAME incomplete-scan case as an unreadable store, so it must degrade too, or the
+    // fallback list below silently reports "no secret" over every store it did not name.
+    if ((err as { code?: string }).code !== "ENOENT") degraded.push("agent-dir-unreadable");
     names = [];
   }
   if (names.length === 0) names = FALLBACK_STORES;
@@ -292,7 +322,17 @@ function loadSecrets(): { secrets: Secret[]; degraded: string[] } {
     const p = join(AGENT_DIR, fn);
     const label = fn.replace(/\.json$/, "");
     try {
-      if (statSync(p).size > 2_000_000) continue;
+      // A store too large to scan is the SAME incomplete-scan case as EACCES and a
+      // truncated JSON body, and it must not be the one silent arm: `continue` here
+      // reported "no hit" over a store whose values were never read, so a secret in a
+      // >2 MB store passed through UNREDACTED with no `degraded` entry — the exact
+      // fail-open this file's header forbids ("an incomplete exact detector must not
+      // report 'no hit' as 'no secret'"). The cap is reachable in practice
+      // (models-store.json alone is ~240 KB and grows with session history).
+      if (statSync(p).size > 2_000_000) {
+        degraded.push(label);
+        continue;
+      }
     } catch (err) {
       if ((err as { code?: string }).code !== "ENOENT") degraded.push(label);
       continue;
@@ -552,7 +592,13 @@ export default function (pi: ExtensionAPI): void {
 
   pi.on("tool_result", async (event) => {
     const content = (event as { content?: unknown }).content;
-    if (!Array.isArray(content)) return; // not ours to touch; a string here breaks downstream
+    // A BARE STRING is redacted, not skipped. `return` here let `content: "key=<secret>"`
+    // through untouched — no patch, no notice (reproduced). The sibling boundary handles
+    // the same shape the safe way (secret-echo-guard: a bare-string PATCH would crash
+    // `normalizeToolResultImages`, but an ARRAY patch is safe), so the string is routed
+    // through the same redactor and re-wrapped as one text part.
+    const asString = typeof content === "string";
+    if (!asString && !Array.isArray(content)) return; // not ours to touch
 
     if (degradedStores.length > 0) {
       // A store EXISTS but could not be read or parsed, so the exact detector is
@@ -576,7 +622,13 @@ export default function (pi: ExtensionAPI): void {
         ` The command tried to emit a configured credential; it was replaced with [REDACTED:…] before being shown or persisted.` +
         ` Read the value at its source and pass it directly to the consumer instead of printing it.`;
 
-      const parts = (redactedContent as Array<Record<string, unknown>>).slice();
+      // The string arm is re-wrapped: a bare-string `content` patch would break
+      // downstream image normalization, an ARRAY of one text part does not.
+      const parts = (
+        asString
+          ? [{ type: "text", text: redactedContent as unknown as string }]
+          : (redactedContent as Array<Record<string, unknown>>).slice()
+      ) as Array<Record<string, unknown>>;
       parts.push({ type: "text", text: warning });
       return { content: parts, details } as never;
     } catch {
