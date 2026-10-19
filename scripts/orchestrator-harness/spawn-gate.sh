@@ -735,7 +735,21 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   start="$(date +%s)"
   pi -p --provider deepseek --model deepseek-v4-flash --no-session "$(cat "$prompt")" >> "$log" 2>&1 &
   pid=$!
-  ( sleep "$t"; kill -TERM "$pid" 2>/dev/null; sleep 15; kill -KILL "$pid" 2>/dev/null ) >/dev/null 2>&1 &
+  # ⛔ THE WATCHDOG'S SLEEPS ARE BACKGROUNDED AND TERM-TRACKED, AND THAT IS NOT TIDINESS
+  # (agent-infra#2033, measured 2026-10-18). The old shape was a plain
+  # `( sleep "$t"; kill … ) &`: killing that subshell does NOT kill the `sleep` it is blocked in,
+  # so every lane left an ORPHANED `sleep 2400` behind — reparented to launchd, its CWD still the
+  # lane's worktree. Nothing noticed until the lane's new empty-worktree reap asked "is a live
+  # process holding this checkout?" (wt-lifecycle.sh's cwd witness) and the answer was, every time,
+  # "yes: pid N, cwd-inside-the-worktree" — i.e. the leftover of OUR OWN watchdog. The reap could
+  # therefore never fire in production, which is the exact inert-enforcer shape it exists to remove.
+  # Both sleeps are backgrounded and kept in `s` so the TERM trap takes the sleep down with the
+  # subshell; `wait "$w"` makes the teardown observable rather than racy.
+  ( trap 'kill "$s" 2>/dev/null; exit 0' TERM INT
+    sleep "$t" & s=$!; wait "$s" 2>/dev/null
+    kill -TERM "$pid" 2>/dev/null
+    sleep 15 & s=$!; wait "$s" 2>/dev/null
+    kill -KILL "$pid" 2>/dev/null ) >/dev/null 2>&1 &
   w=$!
   wait "$pid" 2>/dev/null; rc=$?
   kill "$w" 2>/dev/null

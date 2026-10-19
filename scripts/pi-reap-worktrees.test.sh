@@ -806,7 +806,10 @@ assert_nodir "$WT_GO" "A2 --apply removed the reclaimable worktree"
 assert_dir "$WT_KEEP" "A2 --apply left the too-recent worktree"
 assert_eq "$("$REAL_GIT" -C "$REPO" branch --list feat/a1-go | wc -l | tr -d ' ')" "1" \
     "A2 the branch ref SURVIVES (checkout-only removal)"
-assert_contains "$OUT" "REMOVED — branch/refs survive:" "A2 per-row removal states the refs survival mechanism"
+# The row must still NAME the survival mechanism (this fixture's branch is at main's tip, so it is
+# `merged`); the ref's survival is asserted on the line above. A LANE-owned branch is the one class
+# whose ref is also removed — pinned separately by L1/L3 below (#2033).
+assert_contains "$OUT" "REMOVED — checkout gone (refs=merged" "A2 per-row removal states the refs survival mechanism"
 assert_contains "$(footer $ENV)" "REMOVED=1" "A2 footer REMOVED=1"
 # idempotence — the log is rotated first, or the append-only log's EARLIER
 # REMOVED=0 line would satisfy this vacuously
