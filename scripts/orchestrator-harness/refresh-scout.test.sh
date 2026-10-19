@@ -1682,6 +1682,17 @@ case "$OUT" in
   *"held-by-live"*) ok "claim-withheld: the withheld line carries the held-by-live token" ;;
   *) bad "claim-withheld: the withheld line does not name held-by-live — output: $OUT" ;;
 esac
+# ⛔ THE SAME PASS MUST ALSO LEAVE THE LEDGER RECORD (merge of #1729 and #2094). The two halves come
+# from different upstream changes — #2094 counts a peer-held candidate as WITHHELD, #1729 records it
+# in `state/collided` so the NEXT pass walks past it at no network cost — and they met in ONE arm of
+# the verdict `case`. A resolution that keeps either side alone still passes both sides' own suites
+# (each asserts only its own half), so nothing but THIS assertion pins that one pass does both: the
+# issue is withheld from the backlog AND written to the ledger. On the pre-#1729 code `state/collided`
+# does not exist at all, so this fails there; on the pre-#2094 code the WITHHELD line above is absent.
+case "$(tr '\n' ' ' < "$D/o/state/collided" 2>/dev/null)" in
+  *" 42"*) ok "claim-withheld: the peer-held issue is ALSO written to the collision ledger (#1729 + #2094 in one arm)" ;;
+  *) bad "claim-withheld: the peer-held issue was NOT recorded in the collision ledger — [$(tr '\n' ' ' < "$D/o/state/collided" 2>/dev/null)] (the next pass would re-buy the same pre-flight)" ;;
+esac
 # ⛔ THE ORPHAN CASE IS DRIVEN BY THE REGISTRY'S OWN HOST RULE, not by a stub: the claim is stamped by
 # a host this box names DEAD, so the pre-flight returns CLEAN and the issue is QUEUED — with the reason
 # recorded. CLAIM_DEAD_HOSTS is passed through rf's env passthrough, exactly as an operator would
