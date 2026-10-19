@@ -75,6 +75,22 @@ fi
 # it exists would be a bare "command not found" on the operator's terminal. The degraded state is
 # named at the REFUSAL instead (see the merge role), which is the moment it costs something.
 
+# The PROCESS reaper (#2163), resolved ONCE. It is the lane-reap.sh shipped beside this file (or
+# seeded into $O, which is what a running cell executes). It is deliberately NOT a second
+# implementation of the gates below: `lane-reap.sh` owns the process population (a `pi` tree holding
+# a fleet log open, judged on zero CPU + no human + a stale artefact) and this role only SCHEDULES
+# it. A cell whose $O predates it says so in the pass line rather than silently skipping the class
+# the session pass cannot see.
+# `DOCTOR_LANE_REAP_BIN` is the tool seam (one per external tool, like DOCTOR_PS_BIN): the suite
+# stands a stub in front of the process pass so it can assert the DELEGATION without letting a
+# second reaper loose on the fixture's process table. Production leaves it unset.
+LANE_REAP_BIN="${DOCTOR_LANE_REAP_BIN:-}"
+if [ -z "$LANE_REAP_BIN" ]; then
+  for _lr in "${O%/}/lane-reap.sh" "$SELF_DIR/lane-reap.sh"; do
+    [ -n "$_lr" ] && [ -f "$_lr" ] && { LANE_REAP_BIN="$_lr"; break; }
+  done
+fi
+
 # The tool seams. Every external command a pass depends on is overridable so the suite can drive the
 # DECISIONS hermetically (and so the real tmux server is never touched by a test). They are not a
 # security boundary — a value here names the same tool the shipped path names.
@@ -855,6 +871,48 @@ run_reap() {
     state_write reap "$pass_rc" "seen=$seen reaped=$reaped would=$would skipped=$skipped unverifiable=$unverifiable failed=$failed — $result"
   fi
   log "[reap] seen=$seen reaped=$reaped would=$would skipped=$skipped unverifiable=$unverifiable failed=$failed"
+  # ── the census: lanes by EVIDENCE, and the box's zombies (#2163) ────────────────────────────────
+  # `lanes=<live>/<total>` is the reading a session count cannot produce: a leaked wrapper + pi whose
+  # pane died is invisible to `tmux ls`, and the string count (`ps | grep -c 'pi --model'`) counted
+  # wrappers (76 for 14 working lanes, measured 2026-10-19). `zombie=<n>` sits in the SAME pass line
+  # because a box full of corpses otherwise reads as busy. An unreadable census is `?`, never 0.
+  local census="lanes=?/? zombie=?" proc_result=""
+  if [ -n "$LANE_REAP_BIN" ]; then
+    # 60s, not the 15s per-read bound: `count` resolves each lane's log, which on a 76-lane box is a
+    # per-process lsof sweep. A census killed at 15s would print `?/?` on every busy box — an
+    # instrument that fails exactly when it matters.
+    census="$(bounded 60 bash "$LANE_REAP_BIN" count 2>/dev/null)"
+    case "$census" in lanes=*/' 'zombie=*) ;; *) census="lanes=?/? zombie=?" ;; esac
+    # ── the PROCESS pass: the population the session pass above cannot see ─────────────────────────
+    # Armed with the SAME dry/apply posture as this pass: `--dry-run` reports, the armed role acts.
+    # The reaper keeps its own gates and its own default (dry run); this call only decides whether
+    # the armed role is allowed to apply them.
+    # ⛔ Bounded by REAP_TIMEOUT, NOT READ_CALL_TIMEOUT: the reaper sleeps its own CPU SAMPLE WINDOW
+    # (default 30s), so the 15s per-read bound would kill the pass before it judged anything — an
+    # inert reaper that looks scheduled. REAP_TIMEOUT is the budget this role already gives its whole
+    # session pass.
+    if [ "$dry" = "--dry-run" ]; then
+      proc_result="$(LANE_REAP_LOG="$O/state/lane-reap.log" LANE_REAP_LOCK="$O/state/lane-reap" \
+        bounded "$REAP_TIMEOUT" bash "$LANE_REAP_BIN" reap 2>&1 | tail -1)"
+    else
+      proc_result="$(LANE_REAP_LOG="$O/state/lane-reap.log" LANE_REAP_LOCK="$O/state/lane-reap" \
+        bounded "$REAP_TIMEOUT" bash "$LANE_REAP_BIN" reap --apply 2>&1 | tail -1)"
+    fi
+    case "$proc_result" in
+      *"CANNOT-VERIFY"*) unverifiable=$((unverifiable + 1)); pass_rc=3 ;;
+    esac
+    log "[reap] proc: ${proc_result:-<no output>}"
+  else
+    log "[reap] WARN: lane-reap.sh NOT FOUND (looked in $O and beside this script) — the leaked lane processes were NOT judged; re-run 'start' to seed it"
+  fi
+  local proc_note=""
+  [ -n "$proc_result" ] && proc_note="; proc: $proc_result"
+  if [ "$dry" = "--dry-run" ]; then
+    state_write_rehearsal reap "$pass_rc" "$census seen=$seen reaped=$reaped would=$would skipped=$skipped unverifiable=$unverifiable failed=$failed — $result$proc_note"
+  else
+    state_write reap "$pass_rc" "$census seen=$seen reaped=$reaped would=$would skipped=$skipped unverifiable=$unverifiable failed=$failed — $result$proc_note"
+  fi
+  log "[reap] $census seen=$seen reaped=$reaped would=$would skipped=$skipped unverifiable=$unverifiable failed=$failed${proc_result:+; proc: $proc_result}"
   return "$pass_rc"
 }
 

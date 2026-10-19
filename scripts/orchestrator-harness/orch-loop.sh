@@ -826,6 +826,49 @@ EOF
 
 heartbeat() { date +%s > "$O/heartbeat"; }
 
+# ── LANES, BY EVIDENCE (#2163) ─────────────────────────────────────────────────────────────────
+# ⛔ THE OLD READING WAS `tmux ls | grep -c '^lane-'`, and it is wrong in both directions. It counts
+# SESSIONS: a leaked lane whose tmux pane died is invisible, while every wrapper and `pi` process the
+# box is actually carrying is uncounted. Measured 2026-10-19 on the Mac: `ps -eo command |
+# grep -c 'pi --model'` said **76 pi processes** for **14 working lanes**, and the cell boxes were
+# filled on the strength of a number that was wrong both ways. `lane-reap.sh count` answers the real
+# question — a lane is LIVE iff its process tree exists AND its log/turn advanced inside a bounded
+# window — and counts the box's zombies, so a box that LOOKS busy but is not says so:
+#
+#     [cap] … lanes=14/76 max_lanes=25 … zombie=52
+#
+# `LANES` (live) keeps the meaning the MAX_LANES gate has always applied. `LANES_TOTAL` is every
+# resident lane tree: `lanes=14/76` cannot hide 62 finished residents, and the pair is what makes the
+# leak visible instead of silently consuming the box (agent-infra#2159: cell-2 OOM-killed 37
+# processes and the tmux server, losing every lane on it).
+#
+# A FAILED read prints `?`, never 0: `lanes=0/0` and "ps is broken" must not render identically (the
+# false-green class this loop refuses everywhere else). The dispatch gate then falls back to the OLD
+# tmux count — a conservative under-count of live work refuses work, and refusing costs a cycle while
+# over-dispatch costs the box.
+LANE_REAP_SH=""
+for _c in "${O:-}/lane-reap.sh" "${_HERE_RS:-}/lane-reap.sh"; do
+  [ -n "$_c" ] && [ -f "$_c" ] && { LANE_REAP_SH="$_c"; break; }
+done
+measure_lanes() {
+  local out live total z
+  LANES=""; LANES_TOTAL="?"; ZOMBIES="?"
+  if [ -n "$LANE_REAP_SH" ]; then
+    out="$(bash "$LANE_REAP_SH" count 2>/dev/null)"
+    # lanes=<live>/<total> zombie=<n>   (one line, no other output)
+    live="${out#lanes=}"; live="${live%%/*}"
+    total="${out#*/}"; total="${total%% *}"
+    z="${out##*zombie=}"
+    if is_num "${live:-}" && is_num "${total:-}" && is_num "${z:-}"; then
+      LANES="$live"; LANES_TOTAL="$total"; ZOMBIES="$z"
+    fi
+  fi
+  if ! is_num "${LANES:-}"; then
+    LANES="$(tmux ls 2>/dev/null | grep -c '^lane-')"
+    is_num "${LANES:-}" || LANES=0
+  fi
+}
+
 # ── THE POOL'S READ STATE, BESIDE THE BACKLOG (agent-infra#1931) ───────────────────────────────
 # ⛔ `backlog=0` ALONE IS THE READING THAT LET A CELL IDLE ALL EVENING WHILE HEALTHY. A refresh whose
 # pool listing FAILED leaves candidates.txt empty, and an empty file is byte-identical to a fleet
@@ -3343,7 +3386,7 @@ keep=[x for x in cand if x not in done]
 open(sys.argv[1],"w").write("\n".join(keep)+("\n" if keep else ""))
 PY
   fi
-  L="$(load1)"; LANES="$(wt_count lane-)"
+  L="$(load1)"; measure_lanes
   # agent-infra#1709 item 4: WORKERS counts the non-lane agent sessions (reviewers + fixers)
   # live at this instant, so the dispatch block line below can distinguish "blocked while the box
   # was idle" (lanes=0 workers=0 -> raising the ceiling helps) from "blocked while busy" (it does
@@ -3398,7 +3441,10 @@ PY
   # `@${OR}` is part of this line on purpose: the repo the count came from is the datum whose absence
   # let a wrong-surface read run for hours. bare `$OR` is avoided for the same reason `${OR:-}` is used
   # below — selftest.sh extracts and drives parts of this file in a subshell with no OR.
-  echo "[cap] load=$L/$MAX_LOAD lanes=$LANES/$MAX_LANES mem_avail=${MEMAVAIL_MB}M/${MIN_MEM_FREE_MB}M swap_free=${SWFREE}M/${MIN_SWAP_FREE}M open=${OPEN_N:-?}@${OR:-?} unowned=${UPN:-?} last_land=${LAND_AGE:-?}m review_slots=${MR:-?} fix_slots=${MF:-?}" >> "$LOG"
+  # ⛔ `lanes=<live>/<total>` and `zombie=<n>` (#2163). The TOTAL is the field that makes a leak
+  # visible: `lanes=14/25` still reads "full" while `lanes=14/76` says the box is carrying 62 finished
+  # residents. `max_lanes=` keeps the ceiling the gate applies, so no reader has to infer it.
+  echo "[cap] load=$L/$MAX_LOAD lanes=$LANES/$LANES_TOTAL max_lanes=$MAX_LANES zombie=$ZOMBIES mem_avail=${MEMAVAIL_MB}M/${MIN_MEM_FREE_MB}M swap_free=${SWFREE}M/${MIN_SWAP_FREE}M open=${OPEN_N:-?}@${OR:-?} unowned=${UPN:-?} last_land=${LAND_AGE:-?}m review_slots=${MR:-?} fix_slots=${MF:-?}" >> "$LOG"
   # Four gates. swap_total=0 => swap uninitialised (fresh boot), NOT pressure — allow.
   # Name the binding gate: an earlier version logged "skipped (load=…)" while load was never
   # consulted, so a lanes-bound or swap-bound stall looked like a load stall.

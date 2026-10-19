@@ -128,7 +128,7 @@ without a human in the loop:
   reviewer AND fixer headroom rises (`MAX_REVIEW+2` / `MAX_FIX+2`) rather than the fleet idling.
   Counting TOTAL open PRs instead capped the fleet on a busy queue: a PR mid-review, mid-fix,
   mid-merge — or held by a claim on another box — read as congestion. Measured 2026-10-16, two live
-  cells logged `merge-priority (20 open PRs — draining)` at `lanes=1` of a configured 32 with
+  cells logged `merge-priority (20 open PRs — draining)` at `lanes=1` (live) of a configured `max_lanes=32` with
   59-86% CPU idle and 13.9 GB RAM free (agent-infra#1824; see the tuning table in §4).
   ⚠️ A cross-box claim is a **declared window**, not proof of life — `claims.sh` is explicit that a
   lease is *data, not liveness* (a REMOTE pid cannot be probed), so an abandoned claim reads as owned
@@ -769,7 +769,7 @@ run has no shim. `pi-bootstrap/cell-install.sh --verify` byte-compares the insta
 | Var | Value | Why |
 |---|---|---|
 | `MAX_LOAD` | `cores*10` (100 on a 10-core box; sanity ceiling) | dispatch stops above this 1-min load |
-| `MAX_LANES` | **derived**: `10#$_NCPU * 5 / 2` — 2.5× cores, floored (25 on a 10-core box, 10 on a 4-core box, 10 on an unprobeable host) | concurrent implementation lanes. **Capacity gates dispatch, not a lane count** (owner ruling, 2026-10-17, verbatim: *"dispatch should be gated on capacity, not on number of lanes. max lanes 8 is too low. that needs to be configured to 2.5x the number of CPUs"*). The shipped default was a flat `4`, and the box this was measured on had its plist **pinned** at `8`: `[cap] load=79/100 lanes=9/8 … [dispatch] skipped (lanes=9>=max_lanes=8)` — 21 points of load headroom and comfortable swap/memory, so dispatch was refused for a lane count while capacity was available. A **valid** pin (plist/`keys.env`) still wins and is never recomputed; an **invalid** one is refused by `install.sh` and repaired by the loop to the derived default; a derived value that fails `is_limit` falls back to `10`. ⚠️ The plist **pins** the number, so a box picks this default up only on a fresh `install.sh` render. ⚠️ `2.5 × cores` is ALSO `LOAD_SUSPEND_THRESHOLD`'s default (`docs/ops/load-policy.md` §2) — that is a 1-minute **load** threshold, this is a count of **lanes**; they are not one ceiling |
+| `MAX_LANES` | **derived**: `10#$_NCPU * 5 / 2` — 2.5× cores, floored (25 on a 10-core box, 10 on a 4-core box, 10 on an unprobeable host) | concurrent implementation lanes. **Capacity gates dispatch, not a lane count** (owner ruling, 2026-10-17, verbatim: *"dispatch should be gated on capacity, not on number of lanes. max lanes 8 is too low. that needs to be configured to 2.5x the number of CPUs"*). The shipped default was a flat `4`, and the box this was measured on had its plist **pinned** at `8`: `[cap] load=79/100 lanes=9/11 max_lanes=8 … [dispatch] skipped (lanes=9>=max_lanes=8)` — 21 points of load headroom and comfortable swap/memory, so dispatch was refused for a lane count while capacity was available. A **valid** pin (plist/`keys.env`) still wins and is never recomputed; an **invalid** one is refused by `install.sh` and repaired by the loop to the derived default; a derived value that fails `is_limit` falls back to `10`. ⚠️ The plist **pins** the number, so a box picks this default up only on a fresh `install.sh` render. ⚠️ `2.5 × cores` is ALSO `LOAD_SUSPEND_THRESHOLD`'s default (`docs/ops/load-policy.md` §2) — that is a 1-minute **load** threshold, this is a count of **lanes**; they are not one ceiling |
 | `MAX_REVIEW` | `4` | concurrent `merge-<PR>` reviewers |
 | `MERGE_PRIORITY_AT` | `25` | **no longer a gate — headroom only.** The gate is threshold-free (§7.2f): one workable un-owned PR is enough to stop the issue path, and there is no age-based release (a stalled drain gets `DRAIN STALLED`, never a licence to open work). This value now only selects the *drain posture* — from here the reviewer/fixer headroom rises to `MAX_REVIEW+2` / `MAX_FIX+2`, so a 25-PR backlog is drained by the capacity that actually clears it instead of being capped to a trickle. Kept as a name because operators and the `[cap]` line read it |
 | `MERGE_STALL_MIN` | `180` | **display only.** The age at which the `[dispatch] DRAIN STALLED — no PR merged in <age>m while <n> un-owned remain` diagnostic fires. It gates **nothing**: the issue path is closed by un-owned PRs, not by a land age, so a big or unreadable value can never open it. An unset or non-numeric value falls back to 180; a land marker stamped in the FUTURE prints `DRAIN STALL UNMEASURED` (neither a stall nor an all-clear) instead of a fresh `0m` |
@@ -1151,20 +1151,32 @@ also decides on a **single** mtime sample, with no CPU tolerance and no second o
 box with no controller, or a process that left no log, is outside it too. §6.5.1 states the requirement; do not read this paragraph as
 satisfying it.
 
+⛔ **The complement for the population that paragraph cannot see is `lane-reap.sh` (#2163).** A lane
+whose tmux session died with its pane — or whose wrapper outlived a finished turn — is invisible to
+`tmux ls`, and that was the measured shape: **76 `pi`-shaped processes for 14 working lanes**. The
+process reaper judges a `pi` process tree (the `pi` and its immediate shell wrapper) that holds a
+fleet-namespace log open as stdout/stderr, and reaps it only when ALL THREE hold: zero CPU delta over
+a sample window summed over the whole tree; no human terminal/ssh ancestor; and either the log is
+untouched past 2h or (the log resolved but is gone) the process has been up past 12h. It is **dry run
+by default**; arming is the operator's call, like every other deletion tool here. ⛔ Its hardest rule
+is the one a first dry run got wrong: **an unresolvable log is `no-log-evidence` and is NEVER read as
+staleness** — that reading flagged 69 lanes and would have killed one that was 7 minutes old. See
+§6.5.1b.
+
 ### Reading the logs
 
 `$O/logs/orch-loop.log` is the controller's decision log; every line is prefixed by a tag:
 
 ```text
 [scope] open=24 -> BROAD (auto)             ← or (pinned SCOPE=own) / (pinned SCOPE=broad)
-[cap] load=7/100 lanes=4/4 mem_avail=11761M/512M swap_free=588M/600M   ← every gate names its ceiling
+[cap] load=7/100 lanes=4/12 max_lanes=25 zombie=0 mem_avail=11761M/512M swap_free=588M/600M   ← every gate names its ceiling
 [dispatch] load=7 lanes=4 -> 4429 4489
 [refresh] queue=READ(7) — every priority tier was READ; 7 candidate(s) listed (agent-infra#1931)
 [refresh] +#4508 CLEAN -> backlog
 #8219 FAILED:ai-review-gate          ← per-PR verdict for the required checks
 #8192 fixer attempt 1                ← routed to a fixer, not a re-record
 ...
-[cap] load=104/100 lanes=4/4 mem_avail=11890M/512M swap_free=588M/600M
+[cap] load=104/100 lanes=4/12 max_lanes=25 zombie=8 mem_avail=11890M/512M swap_free=588M/600M
 [dispatch] skipped (load=104>=max_load=100)   ← and WHY, naming the binding gate
 ```
 
@@ -1262,6 +1274,34 @@ and was never reinstalled**: it survived only as
 days: **a fix that exists is not a fix.** So the live trackers are agent-infra#1244 (the lane-level
 rule exists only as prose), #1862/#1863 (restore the orphan reaper **and schedule it**), and #1927 (a
 scheduler the cells run).
+
+### 6.5.1b The leak a session count cannot see, and the reading that replaces it (#2163)
+
+`[cap]` used to print `lanes=<tmux lane sessions>/<MAX_LANES>`. Two failures were baked into that:
+a leaked lane whose tmux pane died was **uncounted**, and the obvious replacement —
+`ps -eo command | grep -c 'pi --model'` — counted the **wrapper bash**, not `pi`: measured
+2026-10-19, it said **76 pi processes for 14 working lanes** while the box carried ~60 finished
+residents. The pair is worse than a wrong number: a cell was filled on it and OOM-killed 37 processes
+plus its tmux server (agent-infra#2159).
+
+`[cap]` now carries the census, measured by `lane-reap.sh count`:
+
+```text
+lanes=<live>/<total> max_lanes=<ceiling> zombie=<n>
+```
+
+* **live** — the process tree exists AND its log/turn advanced inside `LANE_REAP_LIVE_MIN` (30 min).
+  This is the number `MAX_LANES` gates, so its meaning is unchanged.
+* **total** — every resident lane tree. `lanes=14/76` is the reading that makes 62 finished residents
+  visible; `lanes=14/25` could not.
+* **zombie** — the box's `Z`-state processes. A box full of corpses otherwise reads as busy.
+* **`lanes=?/?`** — the census could not be read. `?` is not `0`: "ps is broken" and "nothing is
+  running" must not render identically. The dispatch gate then falls back to the old tmux count
+  (a conservative under-count refuses work, which costs a cycle; over-dispatch costs the box).
+
+The `reap` pass in `cloud-cell-doctor.sh` runs the same tool in process mode (dry under `--dry-run`,
+armed otherwise) and puts `lanes=… zombie=…` in its own pass line, so a cell's `status` answers
+"what is this box actually carrying" without reading a process table by hand.
 
 ### 6.5.2 The instrument that decides must itself be bounded
 
@@ -2709,6 +2749,9 @@ algorithmic advantage. The claim worth evaluating is *utilisation*, not *efficie
 | `refresh-scout.test.sh` | the agent-infra#1736 contract — repo-aware scout provisioning, per-repo tool resolution, the permanent/transient refresh split — plus the agent-infra#1850 issue-claim pre-flight verdict table (CLEAN/COLLISION/INCOMPLETE/NOT PROVISIONABLE/unrecognised), the dispatch-side claim, and the fenced + generation-guarded release. Also the agent-infra#1729 pass budget: a blocked pool HEAD does not consume the window, the collision ledger defers (never drops) a held candidate, and ONLY a COLLISION is recorded — a DEGRADED answer never is. Not part of the loop |
 | `refresh-quota.test.sh` | the per-pass API **spend** contract (agent-infra#2022 / #1736 follow-up): the board cache is enabled under the TOOL's own seam (`COLLISION_PREFLIGHT_BOARD_CACHE`, not the legacy no-op name the tool treats as a caller-named-cache attack), so one pass rebuilds the board once instead of once per candidate; a pass that can only afford SOME of its window judges those completely, queues work and NAMES the stop; a pass that can afford none refuses TRANSIENTLY — after the `dispatched.txt` reaper has run — rather than reporting an empty backlog. Charges a modeled core budget from a stub `gh`, so it needs no network. A CI shard |
 | `check-port-drift.sh` | gates the tortoise-side removal: fails if the tortoise harness moved past the pinned sync point (`port-provenance.txt`). Not part of the loop |
+| `lane-reap.sh` | the EVIDENCE census (`count` → `lanes=<live>/<total> zombie=<n>`, §6.5.1b) and the conservative finished-lane process reaper (zero CPU over a sampled window + no human ancestor + a stale log, dry run by default). One population for both, so the `[cap]` number and the reaper cannot disagree. Called by `orch-loop.sh` and the doctor's `reap` role |
+| `lane-exec.sh` | the wrapper-free launcher (#2163): `exec pi …`, so a finished lane leaves NO process behind. The canonical replacement for an ad-hoc `bash -c '… nohup pi … &'`; the persistent-wrapper case is `lane.sh`, which `wait`s and exits on child exit |
+| `lane-reap.test.sh` | the #2163 contract, hermetic (fake `ps`/`kill`/`sleep`, fake `/proc`, pinned clock): a LIVE lane is never signalled, a FINISHED one always is (children first, TERM then KILL), an unresolvable log is REFUSED, a deleted log is judged by the 12h bound only, a human ancestor refuses, a working subtree is spared, the census counts by evidence, and an unreadable table is `?`/exit 3. A CI shard |
 | `cloud-cell-doctor.sh` | the cell's scheduled roles — `reap` / `doctor` / `merge` / `hygiene` / `status` (§6.5.7). Launched as tmux `cell-doctor` (`$DOCTOR_SESSION`) by `cloud-cell-supervisor.sh start`; `merge` EXECUTES `scripts/admin-merge.sh` and never re-implements it |
 | `cloud-cell-doctor.test.sh` | #1989: drives the shipped doctor and the supervisor's role verbs against stubbed tmux/ps/rail — a lane whose child is still writing is NOT reaped, an attached/human-tty lane is NOT touched, the rail is gated on a clean attestation at the head, a refusal is recorded and not retried at the same head, and `status` FAILS a started cell whose roles never ran. A CI shard |
 | `cloud-cell-doctor.hardening.test.sh` | #1989, the HARDENING half (a separate suite, not a fork of the one above): every read the doctor acts on must be classified, so an unreadable session list / client list / ancestry walk / pane read / log mtime / process table / open-PR read / review record is cannot-verify rather than an answer, while a benign non-answer (a fresh box with no server, a lane that ended between reads) is not; an action that did not take (a refused or unverifiable kill, cpu that went DOWN) is never a reap; the rail's rc classifier is a PREDICATE (`124..127`, any `128+N`); and a REHEARSAL IS NOT A VERDICT — `--dry-run` keeps the worse of (stored verdict, its own) and says in the record that it was a rehearsal, on every role. A CI shard |
@@ -2717,8 +2760,9 @@ algorithmic advantage. The claim worth evaluating is *utilisation*, not *efficie
 | `report.sh` | read-only operator summary: merges in a window, per-kind agent wall-time and cap-hit rate from `state/walltime.tsv`, live `refs/claims/*`, queue health, and the last dispatch decisions. Safe to run while the loop is working. Not part of the loop |
 
 **Manual utility:** `adopt-fix.sh` — run `fix-one.sh` against a specific PR by hand;
-`nonblocking-dispatch.sh` — launch a headless worker in the background and return immediately (§2).
-Neither is part of the loop.
+`nonblocking-dispatch.sh` — launch a headless worker in the background and return immediately (§2);
+`lane-exec.sh` — launch ONE lane with `exec pi` so no wrapper survives the turn (#2163, §6.5.1b).
+None is part of the loop.
 
 **Retired** (`retired/`, kept so nothing is lost): `auto-loop.sh`, `dispatch.sh`,
 `do-merge.sh`, `refix.sh`, `sweep.sh`, `watch-one.sh`. These are earlier iterations of the

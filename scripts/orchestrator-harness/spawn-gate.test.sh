@@ -113,16 +113,24 @@ scan_pi() { # scan_pi <pathspec...>  → space-separated repo-relative paths
     grep -qF -e '--no-session' "$ROOT/$p" 2>/dev/null || continue
     found="$found $p"
   done < <(git -C "$ROOT" ls-files --cached --others --exclude-standard "$@")
-  printf '%s' "${found# }"
+  # ⛔ SORTED, so the EQUALITY below is a SET equality. `git ls-files --cached --others` emits
+  # UNTRACKED files first and then the sorted index, so a brand-new invoker (this suite's own
+  # #2163 case: lane-exec.sh before it was committed) made the census disagree with a sorted
+  # EXPECTED list for a reason that has nothing to do with the population — a red that says
+  # "a launch path is ungated" when the truth is "the file is not staged yet". Sorting both sides
+  # keeps the assertion strict about MEMBERSHIP and indifferent to staging state.
+  [ -n "$found" ] || { printf ''; return 0; }
+  printf '%s\n' ${found# } | sort | tr '\n' ' ' | sed 's/[[:space:]]*$//'
 }
 # The censuses need a git work tree: `git ls-files` is the index-bounded primitive (per AGENTS.md
 # "Search"), and if it fails the set comes back empty and the EQUALITY below goes RED — fail-closed,
 # which is the right direction for a guard whose job is "no ungated launch path exists".
 ROOT="$(cd "$HERE/../.." && pwd)"
-# merge-one.sh is NOT ported here: it is owned by a concurrent lane (PR #1769/#1730). The assertion
-# is deliberately an EQUALITY, so the residual is asserted rather than left silent, and a THIRD
-# pi-invoker — or a regression in either of these two — fails it.
-EXPECTED_PI="merge-one.sh spawn-gate.sh"
+# merge-one.sh is NOT ported here: it is owned by a concurrent lane (PR #1769/#1730). lane-exec.sh is
+# the #2163 launcher, which carries no wrapper BY DESIGN (see its own assertion below). The assertion
+# is deliberately an EQUALITY, so each residual is asserted rather than left silent, and a NEW
+# pi-invoker — or a regression in these — fails it.
+EXPECTED_PI="lane-exec.sh merge-one.sh spawn-gate.sh"
 got_pi="$(scan_pi 'scripts/orchestrator-harness/*' | sed "s#scripts/orchestrator-harness/##g")"
 [ "$got_pi" = "$EXPECTED_PI" ]; rc=$?
 [ "$rc" -eq 0 ] || echo "      pi-invokers found: [${got_pi:-<none>}]"
@@ -133,11 +141,18 @@ ck "the pi-invokers in scripts/orchestrator-harness are exactly [$EXPECTED_PI]" 
 # a 120 s provider REACHABILITY probe rather than a lane dispatch (see the harness README §6), so it
 # is not routed through run_agent() here — but it is asserted BY NAME, so a new ungated invoker
 # anywhere under scripts/ fails this check instead of arriving unannounced.
-EXPECTED_PI_TREE="scripts/cloud-cell-bringup.sh scripts/orchestrator-harness/merge-one.sh scripts/orchestrator-harness/spawn-gate.sh"
+EXPECTED_PI_TREE="scripts/cloud-cell-bringup.sh scripts/orchestrator-harness/lane-exec.sh scripts/orchestrator-harness/merge-one.sh scripts/orchestrator-harness/spawn-gate.sh"
 got_tree="$(scan_pi 'scripts/*')"
 [ "$got_tree" = "$EXPECTED_PI_TREE" ]; rc=$?
 [ "$rc" -eq 0 ] || echo "      tree-wide pi-invokers found: [${got_tree:-<none>}]"
-ck "the tree-wide pi-invokers are exactly [${EXPECTED_PI_TREE}] (cloud-cell-bringup.sh declared)" $rc
+ck "the tree-wide pi-invokers are exactly [${EXPECTED_PI_TREE}] (cloud-cell-bringup.sh + lane-exec.sh declared)" $rc
+# ⛔ lane-exec.sh (#2163) is the SPAWN-POINT-GATED launcher: it `exec`s `pi`, so it has no wrapper to
+# route through run_agent() and no place to apply the DISK gate (which is per-worktree and therefore
+# a caller's business, the same named residual cloud-cell-bringup.sh carries). The LOAD gate reaches
+# it anyway, at the shim. What this pins is the half that made it worth writing: it must EXEC, never
+# background — a fork here would re-create the surviving wrapper the issue exists to remove.
+grep -qE '^[[:space:]]*exec pi ' "$HERE/lane-exec.sh" && rc=0 || rc=1
+ck "lane-exec.sh EXECs pi (no wrapper survives the turn)" $rc
 
 # ... and the ported callers must have no spawn logic of their own left behind.
 for f in lane.sh fix-one.sh; do

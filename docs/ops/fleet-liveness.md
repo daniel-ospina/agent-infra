@@ -825,3 +825,77 @@ Regression contract: `bash scripts/fleet-inventory.test.sh` (its header carries 
 recipe that proves each arm goes red when its predicate is neutered — including the read paths, the
 `stop`/`start` verb paths, and the exit-code contract). It is registered in
 `scripts/run-bash-shards.sh`, so both CI lanes run it.
+
+---
+
+## 11. A FINISHED lane is a distinct state — and it is reaped from EVIDENCE (#2163)
+
+§§1–10 decide whether a lane's **process incarnation** is alive. They deliberately do not answer the
+next question: *the incarnation is alive, the turn is over, so why is it still resident?* Measured
+2026-10-19 while orchestrating the fleet: the Mac carried ~76 `pi`-shaped processes; the truth was
+**14 working lanes and ~60 finished/blocked zombies**. The counting command
+(`ps -eo command | grep -c 'pi --model'`) counted the **wrapper bash**, not `pi` — a number wrong in
+both directions, and cells were filled on it (agent-infra#2159: cell-2 OOM-killed 37 processes and
+its tmux server).
+
+### 11.1 The state, in the vocabulary of §1
+
+A lane is **finished** when its turn ended and its process tree is still resident. That is not one of
+§1's five states: `dead` is "every incarnation gone", `running-quiet` is "a live holder with no open
+turn". A finished lane is `running-quiet` **that should not be running at all** — and the fix has two
+halves, because a reaper alone turns a leak into a nightly sweep:
+
+1. **The launch leaves nothing behind.** `lane-exec.sh` `exec`s `pi`, so the launcher's pid *is* the
+   agent and a completed turn leaves no wrapper. Where a wrapper must persist (`lane.sh`: teardown
+   trap, post-run status) it `wait`s and exits on child exit, and `spawn-gate.sh::run_agent` runs the
+   agent in its own process group and reaps the group after the turn — so a tool child cannot be
+   orphaned by a finished agent.
+2. **What already leaked is reaped from evidence.** `scripts/orchestrator-harness/lane-reap.sh`.
+
+### 11.2 The three gates (all required), and the one that is a rule about ABSENCE
+
+A lane is reaped only when ALL hold:
+
+| gate | reading | why it is the gate |
+|---|---|---|
+| 1. zero CPU | cumulative CPU summed over the **whole tree** (wrapper + `pi` + descendants), two samples a real window apart, tolerance stated (`LANE_REAP_CPU_TOL_CS`, 0.10 s) | a sub-0.1 s twitch is indistinguishable from a parked fork child, a human's prompt redraw, or a timer wake |
+| 2. no human | ancestry walked nearest-first; the FIRST recognised host application decides (`Terminal.app`/`iTerm`/`Warp`/`kitty`/`Alacritty`/`sshd` ⇒ human, never touched; `cmux.app` ⇒ fleet). `login`/`zsh` alone are NOT human — every cmux lane is `pi → -zsh → login → cmux.app`, so treating them as human makes the reaper inert. `ppid 1` proves nothing | the near-miss in #1244's own history: a correct-as-written rule pointed at a human's shell |
+| 3. staleness | the log the process **itself holds open** (stdout/stderr, read from the kernel — never a slug parsed out of a command line): untouched ≥ 2 h (`LANE_REAP_IDLE_MIN`), OR resolved-but-gone AND the process up ≥ 12 h (`LANE_REAP_NO_LOG_H`) | a lane's silence is not proof; a stale ARTEFACT is |
+
+**⛔ GATE 3 IS ALSO A RULE ABOUT ABSENCE: `no-log-evidence` IS A REFUSAL, NEVER STALENESS.** The first
+dry run flagged 69 lanes and would have killed one that was **7 minutes old**: the worktree slug was
+parsed from the shell command text, which contains escapes (`ciwatch\012[`), the slug matched no log,
+and "no log found" was read as "stale". The population and the log are therefore derived from the
+kernel (the process table, and the file descriptors the process holds) — and when no log can be
+resolved at all, the lane is *reported*, never reaped.
+
+### 11.3 Reading it
+
+```text
+lane-reap.sh count                  lanes=<live>/<total> zombie=<n>     # the `[cap]` census
+lane-reap.sh reap [--dry-run]       report what WOULD be reaped (the default)
+lane-reap.sh reap --apply           signal the lanes that pass all three gates
+```
+
+**live** = the tree exists AND its log advanced inside `LANE_REAP_LIVE_MIN` (30 min). **total** =
+every resident lane tree (a `fix-`/`merge-`/`chain-` wrapper is a WORKER and is counted by
+`workers=`, not by `lanes=`). `lanes=?/?` means the census could not be read and is never rendered as
+`0/0`. `--apply` is the operator's decision, like every other deletion tool in this tree.
+
+### 11.4 Boundaries, stated
+
+- The owner's own interactive `pi` **inside cmux** with stdout redirected to a lane-shaped log is not
+  separated from a fleet lane by ancestry alone (the residual #1207 and #1244 both name). The
+  zero-CPU window and the 2 h idle proof bound it, and the dry run names every candidate so a human
+  sees it before arming.
+- A lane whose log was deleted and whose age is under 12 h is **reported, not reaped** — the
+  conservative side of the trap above. On the measured box that is the 1 h 20 m cluster, which is
+  why the reap population is old lanes.
+- `lane-reap.sh` is **not** `lane-watchdog.py`: that one reaps a *frozen dispatched child* so a
+  lane's tool call returns; this one reaps a *finished lane*. They share the identity fence and the
+  ancestry vocabulary, not the population.
+
+Regression contract: `bash scripts/orchestrator-harness/lane-reap.test.sh` (hermetic: fake
+`ps`/`kill`/`sleep`, fake `/proc`, pinned clock). It pins LIVE-never-reaped and FINISHED-always-reaped
+in both directions (TERM then KILL), the `no-log-evidence` refusal, the deleted-log 12 h bound, the
+human refusal, the working-subtree skip, the evidence census, and the `?`/exit-3 unreadable read.
