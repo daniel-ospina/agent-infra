@@ -403,6 +403,14 @@ install_farms() {
     die "the declared farm set parsed to only $n file(s) (floor: $MIN_FARM_FILES) — setup.sh's shape changed and this parse would install a PARTIAL layer, then verify clean against its own truncated reading. Nothing was certified."
   fi
   say "scripts farm: $n file(s) installed (declared by pi-bootstrap/setup.sh)"
+  # Observability for the layer that decides whether a landing is evidence-bound (#984). `--verify`
+  # is the authority (`guard_gh_shim`), but an INSTALL log should say out loud whether the cell now
+  # carries an argv layer at all — install silence is how a cell ran degraded while looking green.
+  if [ -x "$DEST/scripts/gh-shim/gh" ]; then
+    say "argv-level gh shim: $DEST/scripts/gh-shim/gh (merge gate not degraded — #984)"
+  else
+    fail "the argv-level gh shim did not land at $DEST/scripts/gh-shim/gh — this cell's merge gate would run DEGRADED (#984)"
+  fi
 }
 
 # ── 1b. the UNFARM leg (#1924) ───────────────────────────────────────────────
@@ -742,6 +750,51 @@ guard_spawn_gate() {
     fail "pi spawn-point gate DIFFERS from the checkout: $dst (a stale or hand-edited copy — the ceiling it applies is not the one this install reviewed)"
   elif [ ! -x "$dst" ]; then
     fail "pi spawn-point gate is NOT EXECUTABLE: $dst — PATH would resolve past it to the real pi, silently"
+  fi
+}
+
+# ── the argv-level `gh` shim (#984) — the merge gate's SECOND layer ─────────────
+# The review-enforcer answers "will this command text make gh perform an admin merge?" from
+# STRING rules, and that class is not closable in a scanner: resolving `$VAR`/`$(…)` requires
+# EVALUATING a shell, which a gate cannot do without running the command it exists to refuse. So
+# the extension prepends `EXTENSION_DIR/../../scripts/gh-shim` to PATH on every bash call and
+# lets the shim decide from its OWN argv, where the shell has already finished (the scanner stays
+# as the fast first layer and produces the better messages; the shim is the layer that does not
+# share its ceiling).
+#
+# ⛔ THE TWO PLATFORMS DIFFER ONLY IN WHAT THAT EXPRESSION RESOLVES TO, and the difference is
+# invisible in code: on a laptop the extensions are kept as farm SYMLINKS into the checkout, so
+# `../..` IS the checkout and the shim is found without ever being installed; on a CELL they are
+# real COPIES, so `../..` is `$DEST` and the shim must exist at `$DEST/scripts/gh-shim/gh`.
+# Nothing farmed that directory, so every cell lane logged
+#   `#984 argv-level gh shim not found — only the string scanner is active`
+# and the merge gate ran DEGRADED — no argv inspection at all — while `--verify` printed LAYER
+# VERIFIED. The gate that must certify a landing could not do its job on the boxes doing the work.
+#
+# ⛔ RESOLVED THE WAY THE EXTENSION RESOLVES IT, not written as `$DEST/scripts/gh-shim`: the
+# WIRING is the claim. If the installer ever puts extensions somewhere else, this must fail LOUDLY
+# instead of certifying a shim the extension will never look at.
+# ⛔ `AGENT_GH_SHIM_DIR` IS HONOURED, because the extension honours it (it wins over the default
+# there); ignoring it here would false-block an operator who relocated the shim deliberately — and
+# the natural remedy for a false block is to weaken the gate.
+# ⛔ EXECUTE BIT: required on the SHIM (a PATH entry whose `gh` is not executable is SKIPPED by
+# bash, so the real gh runs and nothing enforces — the silent fail-open `isExecutableShim` exists
+# to catch), but NOT on the verifier: the shim invokes it as `bash "$VERIFY"`, so `-x` there
+# would be a false block. It must merely be PRESENT and non-empty — the shim fails CLOSED when it
+# cannot find it, which refuses every admin merge on the cell rather than certifying one.
+guard_gh_shim() {
+  local shim_dir="${AGENT_GH_SHIM_DIR:-}" norm
+  [ -n "$shim_dir" ] || shim_dir="$DEST/extensions/review-enforcer/../../scripts/gh-shim"
+  # Display only: print a resolved path when the directory exists, and the unnormalised form when
+  # it does not (the missing-shim message has to name the path the extension would have used).
+  if norm="$(CDPATH= cd -- "$shim_dir" 2>/dev/null && pwd)"; then shim_dir="$norm"; fi
+  local shim="$shim_dir/gh" verifier="$shim_dir/../verify-admin-merge-evidence.sh"
+  if [ ! -f "$shim" ]; then
+    fail "the argv-level gh SHIM is MISSING: $shim — the review-enforcer puts exactly that directory on PATH for every bash call and finds no \`gh\` in it, so this cell would run the merge gate DEGRADED (the string scanner only — the documented limit #984 exists to get past) while reporting itself ready. Re-run --install"
+  elif [ ! -x "$shim" ]; then
+    fail "the argv-level gh SHIM is NOT EXECUTABLE: $shim — bash SKIPS a non-executable PATH entry, so the real gh runs and the merge gate is DEGRADED with nothing on any stream (#984). Re-run --install"
+  elif [ ! -s "$verifier" ]; then
+    fail "the admin-merge EVIDENCE VERIFIER is missing or empty: $verifier — scripts/gh-shim/gh resolves it as its own ../verify-admin-merge-evidence.sh and fails CLOSED without it, so every admin merge on this cell would be refused (#984). Re-run --install"
   fi
 }
 
@@ -1138,6 +1191,7 @@ PY
 
   guard_tools_dir
   guard_spawn_gate
+  guard_gh_shim
 
   if [ "$FAILURES" -eq 0 ]; then
     say "LAYER VERIFIED — $DEST carries the farmed scripts, the guards, the skills and the config"

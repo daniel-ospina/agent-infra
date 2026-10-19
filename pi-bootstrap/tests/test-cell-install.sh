@@ -48,6 +48,13 @@
 #       just compared — while `--verify` refuses a stale, missing or non-executable copy. The
 #       defect: a hand-written runner that never sources spawn-gate.sh started lanes on a box at
 #       load 258 against its own ceiling of 100, and nothing refused, logged or counted.
+#   (l) the ARGV-LEVEL `gh` SHIM (#984) lands from the SAME farm declaration the laptop uses, is
+#       executable, sits on the path the review-enforcer actually resolves, CONSULTS the installed
+#       evidence verifier, refuses an unevidenced admin merge when DRIVEN, and is REFUSED BY NAME by
+#       `--verify` when absent, non-executable, or missing its verifier. The defect: on a cell the
+#       extensions are copies, so `EXTENSION_DIR/../../scripts/gh-shim` was a directory nothing
+#       farmed — every lane ran the merge gate DEGRADED (string scanner only) while the cell
+#       reported its layer verified.
 #
 # Hermetic: the repo is read ONLY, CELL_HOME is a temp dir, npm is stubbed (no network —
 # same shape as test-setup-no-nesting.sh). The stub answers for real deps, and it also
@@ -76,6 +83,11 @@ ok()   { echo "ok: $*"; }
 hdr()  { echo "== $*"; }
 
 # --- hermetic environment -------------------------------------------------
+# The argv-level `gh` shim (#984) is part of what this suite certifies, so its runtime switches
+# must not leak in from the operator's shell: `AGENT_GH_SHIM_DIR` would MOVE the shim the verifier
+# checks, `AGENT_GH_SHIM=0` would switch the layer off, and `AGENT_GH_REAL` would point the probe
+# below at the operator's gh. Section (l) sets its own values deliberately.
+unset AGENT_GH_SHIM_DIR AGENT_GH_SHIM AGENT_GH_REAL AGENT_GH_GATE_DIR AGENT_GH_GATE_INTERVAL_MS
 mkdir -p "$FAKEBIN" "$CELL_HOME"
 SPY="$TMP/npm-spy.log"
 cat > "$FAKEBIN/npm" <<EOF
@@ -429,6 +441,119 @@ run_install >/dev/null 2>&1
 cmp -s "$GATE_SRC" "$GATE_DST" && [ -x "$GATE_DST" ] \
   && ok "re-install restored the gate byte-identical and executable" \
   || fail "re-install did not restore the spawn-point gate"
+
+# ── (l) the argv-level gh SHIM (#984) — the merge gate must not be DEGRADED on a cell ──
+# MEASURED on a live cell, on every lane:
+#   `[review-enforcer] ⚠️  #984 argv-level gh shim not found — only the string scanner is
+#    active, so bash token splicing can still hide an admin merge.`
+# The extension resolves its shim as `EXTENSION_DIR/../../scripts/gh-shim`. On a laptop that is
+# THE CHECKOUT, because setup.sh keeps the extensions as farm symlinks into it — so the shim is
+# found without ever being installed. On a cell the extensions are real COPIES, so the same
+# expression is `~/.pi/agent/scripts/gh-shim`, which nothing farmed. The cell then ran the merge
+# gate in its DEGRADED mode — string scanner only, no argv inspection — while `--verify` certified
+# the layer. What is asserted here is artifact + WIRING + BEHAVIOUR + the refusal, in that order:
+# a file that exists but is not on the path the extension resolves is exactly the inert layer this
+# section exists to rule out.
+SHIM_DST="$DEST/scripts/gh-shim/gh"
+VERIFIER_DST="$DEST/scripts/verify-admin-merge-evidence.sh"
+if [ -f "$SHIM_DST" ] && cmp -s "$ROOT/scripts/gh-shim/gh" "$SHIM_DST"; then
+  ok "the argv-level gh shim is installed BYTE-IDENTICAL at scripts/gh-shim/gh (#984)"
+else
+  fail "the argv-level gh shim is missing or stale at $SHIM_DST — a cell lane's merge gate would run DEGRADED (string scanner only)"
+fi
+[ -x "$SHIM_DST" ] \
+  && ok "…and it is executable (bash SKIPS a non-executable PATH entry → the real gh runs, silently)" \
+  || fail "$SHIM_DST is not executable — PATH would resolve past it and the gate would be inert"
+if [ -s "$VERIFIER_DST" ] && cmp -s "$ROOT/scripts/verify-admin-merge-evidence.sh" "$VERIFIER_DST"; then
+  ok "the evidence verifier landed as the shim's own ../verify-admin-merge-evidence.sh sibling (#984)"
+else
+  fail "the evidence verifier is missing or stale at $VERIFIER_DST — the shim fails CLOSED without it, refusing every admin merge"
+fi
+# (1) THE WIRING — the directory the EXTENSION will put on PATH must be the directory holding the
+# shim. Derived from the extension's own location with `cd -P`, i.e. the same two-`..` walk
+# `resolveGhShimDir()` does; a hard-coded `$DEST/scripts` here would agree with the installer and
+# not with the extension.
+EXT_RESOLVED="$(CDPATH= cd -- "$DEST/extensions/review-enforcer/../.." 2>/dev/null && pwd -P)"
+if [ -n "$EXT_RESOLVED" ] && [ -f "$EXT_RESOLVED/scripts/gh-shim/gh" ] && [ "$EXT_RESOLVED/scripts/gh-shim/gh" -ef "$SHIM_DST" ]; then
+  ok "the shim sits on the exact path the review-enforcer resolves (\$EXTENSION_DIR/../../scripts/gh-shim)"
+else
+  fail "the review-enforcer resolves '$EXT_RESOLVED/scripts/gh-shim' and there is no shim there — the installed one is INERT"
+fi
+# (2) THE BEHAVIOUR — drive the INSTALLED shim, not the repo copy, through PATH (the same way the
+# extension injects it) and require that it (a) is what `gh` resolves to, (b) CONSULTS the installed
+# verifier on an admin merge, and (c) refuses one it cannot certify — while an ordinary gh call
+# passes through. Without this the assertions above only prove a file was copied.
+STUB="$TMP/shim-real"; mkdir -p "$STUB"
+CALLS="$TMP/shim-calls"; : > "$CALLS"
+printf '#!/usr/bin/env bash\nprintf %%s\\n "$*" >> "${SHIM_PROBE_CALLS:?}"\nexit 0\n' > "$STUB/gh"
+chmod +x "$STUB/gh"
+PATH_SHIM="$DEST/scripts/gh-shim:$PATH"
+resolved="$(PATH="$PATH_SHIM" command -v gh 2>/dev/null)"
+if [ "$resolved" = "$SHIM_DST" ]; then
+  ok "with the shim directory first on PATH, \`gh\` resolves to the INSTALLED shim"
+else
+  fail "PATH resolved \`gh\` to '${resolved:-<nothing>}' instead of $SHIM_DST — the injected PATH entry is inert"
+fi
+out="$(SHIM_PROBE_CALLS="$CALLS" AGENT_GH_REAL="$STUB/gh" AGENT_GH_GATE_DIR="$TMP/shim-gate" \
+       AGENT_GH_GATE_INTERVAL_MS=0 PATH="$PATH_SHIM" gh pr merge 424242 --admin 2>&1)"
+rc=$?
+if [ "$rc" -ne 0 ] && grep -q 'admin merge' <<<"$out"; then
+  ok "the INSTALLED shim REFUSES an unevidenced admin merge (rc=$rc) on this cell"
+else
+  fail "the installed shim ALLOWED an unevidenced admin merge (rc=$rc) — the argv layer is not enforcing: $(head -2 <<<"$out" | tr '\n' ' ')"
+fi
+grep -q 'pr view' "$CALLS" \
+  && ok "…and it reached the INSTALLED verifier (the sibling relation survives the copy, so the chain is whole)" \
+  || fail "the shim refused without ever calling the verifier — the sibling path is broken, so the refusal is not the gate working"
+out="$(SHIM_PROBE_CALLS="$CALLS" AGENT_GH_REAL="$STUB/gh" AGENT_GH_GATE_DIR="$TMP/shim-gate" \
+       AGENT_GH_GATE_INTERVAL_MS=0 PATH="$PATH_SHIM" gh pr view 424242 --json headRefOid 2>&1)"
+rc=$?
+if [ "$rc" -eq 0 ]; then
+  ok "POSITIVE CONTROL: an ordinary gh call passes through the installed shim untouched (it is a gate, not a wall)"
+else
+  fail "the installed shim blocked an ordinary \`gh pr view\` (rc=$rc) — every refusal above would then be vacuous"
+fi
+# (3) THE REFUSAL — the defect is a cell that reports itself READY with a degraded gate, so the
+# absence of the shim must FAIL BY NAME in `--verify` (and therefore in `--install`, which ends by
+# verifying). Simulated the way it actually happens: the artifact is gone, everything else is fine.
+rm -f "$SHIM_DST"
+run_verify
+rc=$?
+if [ "$rc" -eq 1 ] && grep -q 'argv-level gh SHIM is MISSING' "$LOG" && grep -q 'gh-shim/gh' "$LOG"; then
+  ok "--verify FAILS BY NAME when the shim is absent (rc=1, naming the shim) — the cell never certifies a degraded gate"
+else
+  fail "--verify rc=$rc did not refuse a cell whose argv-level gh shim is ABSENT (or did not name it)"
+fi
+run_install >/dev/null 2>&1
+if cmp -s "$ROOT/scripts/gh-shim/gh" "$SHIM_DST" && [ -x "$SHIM_DST" ]; then
+  ok "--install restores the shim (no manual copy, byte-identical, executable)"
+else
+  fail "--install did not restore the argv-level gh shim"
+fi
+run_verify
+[ $? -eq 0 ] && ok "--verify passes again once the shim is installed" \
+  || fail "--verify still failed after the shim was restored"
+# ... and a shim that is present but NOT EXECUTABLE is the silent variant: bash skips the PATH entry
+# and the real gh runs, so the gate is absent with nothing on any stream. It must be refused too.
+chmod -x "$SHIM_DST"
+run_verify
+rc=$?
+[ "$rc" -eq 1 ] && grep -q 'argv-level gh SHIM is NOT EXECUTABLE' "$LOG" \
+  && ok "--verify refuses a NON-EXECUTABLE shim (PATH would skip it and run the real gh)" \
+  || fail "--verify certified a non-executable shim (rc=$rc)"
+run_install >/dev/null 2>&1
+# ... and the verifier is the other half of the pair: the shim fails CLOSED without it, so a cell
+# missing it cannot land an evidenced admin merge at all.
+rm -f "$VERIFIER_DST"
+run_verify
+rc=$?
+[ "$rc" -eq 1 ] && grep -q 'admin-merge EVIDENCE VERIFIER' "$LOG" \
+  && ok "--verify names the missing EVIDENCE VERIFIER (the shim's other half, not just the shim)" \
+  || fail "--verify certified a cell whose evidence verifier is gone (rc=$rc)"
+run_install >/dev/null 2>&1
+run_verify
+[ $? -eq 0 ] && ok "--verify passes once the shim + verifier pair is complete" \
+  || fail "--verify still failed after the shim/verifier pair was restored"
 
 # `--verify` is pointed at LIVE cells, so the tools/ guard may REFUSE content but must not
 # tidy: an empty tools/ has to survive it (setup.sh removes it during INSTALL, not verify).

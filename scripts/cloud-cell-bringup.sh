@@ -444,6 +444,13 @@ check_operational_layer() {
     die "the operational layer FAILED to install from $root (rc=$rc) — a cell without it is unguarded (no review-enforcer/verification-gate/main-worktree-guard/search-guard/audit-logger, no skills) and its merge path dies rc=127. Fix the failure above, or install it by hand: CELL_HOME=$CELL_HOME INFRA_ROOT=$root bash $installer --install"
   fi
   ok "operational layer present and verified ($CELL_HOME/.pi/agent)"
+  # THE MERGE GATE'S SECOND LAYER, NAMED AT THE READY MOMENT (#2164). A cell reported CELL READY
+  # while every lane on it logged `#984 argv-level gh shim not found — only the string scanner is
+  # active`: two definitions of ready, and only one of them measured the merge gate. `--verify` is
+  # the AUTHORITY (it fails BY NAME when the shim is absent, non-executable, or missing its evidence
+  # verifier), so reaching this line already implies it; saying which path it is makes the datum an
+  # operator can read, instead of one they have to infer from a warning in a lane's log.
+  ok "argv-level gh shim present ($CELL_HOME/.pi/agent/scripts/gh-shim/gh) — merge gate NOT degraded (#984)"
   # A cell is Linux. Say which one, because the layer's own selection is surface-aware (no
   # cmux desktop app, no launchd) and a reviewer reading a cell log should see the surface.
   if [ -r /etc/os-release ]; then
