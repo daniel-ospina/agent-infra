@@ -638,8 +638,8 @@ for _c in "${O:-}/lane-reap.sh" "${_HERE_RS:-}/lane-reap.sh"; do
   [ -n "$_c" ] && [ -f "$_c" ] && { LANE_REAP_SH="$_c"; break; }
 done
 measure_lanes() {
-  local out live total z
-  LANES=""; LANES_TOTAL="?"; ZOMBIES="?"; LANES_UNKNOWN=0
+  local out live total z hint
+  LANES=""; LANES_TOTAL="?"; ZOMBIES="?"; LANES_UNKNOWN=0; LANES_DISPLAY="?"
   if [ -n "$LANE_REAP_SH" ]; then
     LANES_SOURCE="unknown"
     out="$(bash "$LANE_REAP_SH" count 2>/dev/null)"
@@ -651,27 +651,33 @@ measure_lanes() {
       LANES_TOTAL="$total"; ZOMBIES="$z"
     fi
     if is_num "${live:-}"; then
-      LANES="$live"; LANES_SOURCE="census"
+      LANES="$live"; LANES_DISPLAY="$live"; LANES_SOURCE="census"
     else
-      # Readable totals with an unreadable numerator, or no answer at all: either way this cycle
-      # does not know how many lanes are working, so it does not add work on the strength of it.
+      # ⛔ READABLE TOTALS WITH AN UNREADABLE NUMERATOR IS STILL AN ABSTENTION (#2163 review, P2).
+      # This cycle does not know how many lanes are working, so it does not add work — and it must
+      # not PRINT a fabricated 0 either: the internal `LANES` keeps a tmux lower bound because every
+      # other consumer (`mp_reason`, the log lines) takes a NUMBER, while `[cap]` prints `?` through
+      # LANES_DISPLAY. The earlier shape fell through to the tmux fallback here and printed
+      # `lanes=0/11 … lanes_src=unknown`, which reads as "no live lanes", the opposite of the truth.
       LANES_UNKNOWN=1
+      LANES="$(tmux ls 2>/dev/null | grep -c '^lane-')"
+      is_num "${LANES:-}" || LANES=0
     fi
-  fi
-  if ! is_num "${LANES:-}"; then
-    if [ -z "$LANE_REAP_SH" ]; then
-      # The transition case (a `$O` seeded before lane-reap.sh existed). NAMED ONCE, so a cell that
-      # silently lost the census is findable instead of reading like a census forever.
-      LANES_SOURCE="tmux"
-      if [ -n "${O:-}" ] && [ ! -f "$O/state/lane-census-fallback.flag" ]; then
-        mkdir -p "$O/state" 2>/dev/null || true
+  else
+    # The transition case (a `$O` seeded before lane-reap.sh existed). NAMED ONCE, so a cell that
+    # silently lost the census is findable instead of reading like a census forever.
+    LANES_SOURCE="tmux"
+    if [ -n "${O:-}" ] && [ ! -f "$O/state/lane-census-fallback.flag" ]; then
+      mkdir -p "$O/state" 2>/dev/null || true
+      if [ -n "${LOG:-}" ]; then
         printf '%s [cap] WARN lane-reap.sh NOT FOUND (looked in %s and %s) — lanes= is the OLD tmux session count until the cell is re-seeded; re-run start/apply\n' \
           "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${O:-?}" "${_HERE_RS:-?}" >> "$LOG" 2>/dev/null || true
-        : > "$O/state/lane-census-fallback.flag" 2>/dev/null || true
       fi
+      : > "$O/state/lane-census-fallback.flag" 2>/dev/null || true
     fi
     LANES="$(tmux ls 2>/dev/null | grep -c '^lane-')"
     is_num "${LANES:-}" || LANES=0
+    LANES_DISPLAY="$LANES"
   fi
 }
 
@@ -2137,7 +2143,7 @@ PY
   # ⛔ `lanes=<live>/<total>` and `zombie=<n>` (#2163). The TOTAL is the field that makes a leak
   # visible: `lanes=14/25` still reads "full" while `lanes=14/76` says the box is carrying 62 finished
   # residents. `max_lanes=` keeps the ceiling the gate applies, so no reader has to infer it.
-  echo "[cap] load=$L/$MAX_LOAD lanes=$LANES/$LANES_TOTAL max_lanes=$MAX_LANES zombie=$ZOMBIES lanes_src=${LANES_SOURCE:-unset} mem_avail=${MEMAVAIL_MB}M/${MIN_MEM_FREE_MB}M swap_free=${SWFREE}M/${MIN_SWAP_FREE}M open=${OPEN_N:-?}@${OR:-?} unowned=${UPN:-?} last_land=${LAND_AGE:-?}m review_slots=${MR:-?} fix_slots=${MF:-?}" >> "$LOG"
+  echo "[cap] load=$L/$MAX_LOAD lanes=${LANES_DISPLAY:-?}/$LANES_TOTAL max_lanes=$MAX_LANES zombie=$ZOMBIES lanes_src=${LANES_SOURCE:-unset} mem_avail=${MEMAVAIL_MB}M/${MIN_MEM_FREE_MB}M swap_free=${SWFREE}M/${MIN_SWAP_FREE}M open=${OPEN_N:-?}@${OR:-?} unowned=${UPN:-?} last_land=${LAND_AGE:-?}m review_slots=${MR:-?} fix_slots=${MF:-?}" >> "$LOG"
   # Four gates. swap_total=0 => swap uninitialised (fresh boot), NOT pressure — allow.
   # Name the binding gate: an earlier version logged "skipped (load=…)" while load was never
   # consulted, so a lanes-bound or swap-bound stall looked like a load stall.
