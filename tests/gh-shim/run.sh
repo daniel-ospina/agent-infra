@@ -791,10 +791,12 @@ grep -q 'waiting 60s' "$TMP/gate-60-err" \
   || fail "  …but a second attempt was issued before the wait elapsed"
 
 # (e) THE ACCEPTANCE: a burst of N lanes produces ONE refusal-and-wait, not N failures.
-#     Window: a rate-limit refusal for the first 1.2 s (wide enough that a loaded box still
-#     lands the first call inside it), then success. 5 lanes, cap 1. The refusal must be
-#     taken by exactly ONE lane; the shared cooldown (2 s here, longer than the window) is
-#     what holds the other four back, and they must all end at rc=0.
+#     ⛔ THE WINDOW IS ARMED BY THE FIRST REFUSAL, NOT BY THE TEST'S OWN START TIME. A fixed
+#     wall-clock window ("refuse for the first 1.2 s") made this arm FLAKY: on a loaded box no lane
+#     had even started inside 1.2 s, so nothing was refused and the arm failed with "0 refusal(s)"
+#     while the cooldown was working perfectly (measured 2 of 3 runs on a busy box). Here the fake
+#     keeps refusing until a refusal has been RECORDED, then for 1.2 s more — so the first lane is
+#     always refused, and any lane that does NOT wait out the cooldown refuses again and is counted.
 GDIR="$(gate_dir burst)"; GLIMIT="$TMP/gate-limit"; GREF="$TMP/gate-refusals"
 : > "$GLIMIT"; : > "$GREF"
 GREAL="$TMP/gate-real-burst"
@@ -809,7 +811,8 @@ sleep 0.05
 exit 0
 GHEOF
 chmod +x "$GREAL"
-( sleep 1.2; rm -f "$GLIMIT" ) &
+( _guard=0; while [ ! -s "$GREF" ] && [ "$_guard" -lt 600 ]; do sleep 0.05; _guard=$(( _guard + 1 )); done
+  sleep 1.2; rm -f "$GLIMIT" ) &
 window=$!
 gpids=""
 for _lane in 1 2 3 4 5; do
@@ -1195,6 +1198,40 @@ _ne=$(date +%s)
 [ $(( _ne - _ns )) -le 5 ] \
   && pass "a NO_WAIT caller is not slept out of a 15 s shared window (elapsed $(( _ne - _ns ))s)" \
   || fail "a NO_WAIT caller was slept out of a shared window ($(( _ne - _ns ))s) — STALL, not RATE-LIMITED"
+
+# (b3) A NO_WAIT CALLER STILL HOLDS ITS SLOT. Suppressing the WAIT must not suppress the CAP:
+#      releasing the slot before falling through let a burst of NO_WAIT callers run concurrently
+#      exactly during a window (measured: 3 children at MAX_INFLIGHT=1).
+GDIR="$(gate_dir nowaitslot)"
+GACTIVE2="$TMP/gate-nowait-active"; rm -rf "$GACTIVE2"; mkdir -p "$GACTIVE2"
+GREAL2="$TMP/gate-real-nowaitslot"; _obs="$TMP/gate-nowait-observed"; : > "$_obs"
+cat > "$GREAL2" <<'GHEOF'
+#!/usr/bin/env bash
+# Each child records how many children are ACTIVE the instant it starts. Deterministic — a sampler
+# that runs after `wait` reads 0 and would pass with the cap wide open (it did).
+: > "$GACTIVE2/$$"
+echo "$(ls "$GACTIVE2" | wc -l | tr -d ' ')" >> "$OBSERVED"
+sleep 0.5
+rm -f "$GACTIVE2/$$"
+exit 0
+GHEOF
+chmod +x "$GREAL2"
+_until=$(( $(date +%s) * 1000 + 3000 ))
+printf '%s\n' "$_until" > "$GDIR/cooldown.$_until.$$"
+for _l in 1 2 3; do
+  AGENT_GH_GATE_MAX_INFLIGHT=1 AGENT_GH_GATE_NO_WAIT=1 AGENT_GH_GATE_INTERVAL_MS=0 \
+    AGENT_GH_REAL="$GREAL2" AGENT_GH_GATE_DIR="$GDIR" GACTIVE2="$GACTIVE2" \
+    OBSERVED="$_obs" bash "$SHIM" api user >/dev/null 2>&1 &
+done
+wait
+_max=0
+while read -r _n; do
+  case "$_n" in ''|*[!0-9]*) continue ;; esac
+  [ "$_n" -gt "$_max" ] && _max="$_n"
+done < "$_obs"
+[ "$_max" -le 1 ] && [ "$_max" -ge 1 ] \
+  && pass "a NO_WAIT caller keeps its slot: max concurrency $_max at MAX_INFLIGHT=1 during a window" \
+  || fail "NO_WAIT concurrency cap wrong (saw max $_max children at MAX_INFLIGHT=1; expected exactly 1)"
 
 # (c) A DEGRADED GATE MUST STILL LEAVE A TRACE. The note says the call runs "UNGATED (announced)",
 #     and the buffered copy is discarded on success — so nothing was recorded anywhere, and the

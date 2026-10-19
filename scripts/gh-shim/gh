@@ -484,6 +484,9 @@ gate_note() {
     # directory: `>>` follows symlinks, so on a shared /tmp another user could pre-create
     # `/tmp/gh-gate-degraded.<uid>` as a symlink and choose the file we append to. Prefer the
     # user's own tree (the same base gate_init uses for the default gate dir).
+    # ⛔ NEVER CREATE THE DEGRADED TRACE'S DIRECTORY AHEAD OF NEED — but do not silently lose it
+    # either: `~/.pi/agent` is absent on a fresh clone, and the append then wrote nothing at all.
+    mkdir -p "${HOME:-${TMPDIR:-/tmp}}/.pi/agent" 2>/dev/null
     printf '%s gh-gate: %s\n' "$(date -u +%s 2>/dev/null)" "$*" 2>/dev/null \
       >> "${HOME:-${TMPDIR:-/tmp}}/.pi/agent/gh-gate-degraded.log"
   fi
@@ -506,8 +509,11 @@ flush_notes() {
 }
 
 cleanup_workdir() {
-  rm -f "$NOTEF" "$errf" 2>/dev/null
-  [ "${WORKDIR_OWNED:-0}" -eq 1 ] && rm -rf "$WORKDIR" 2>/dev/null
+  # ⛔ GUARDED FOR THE EXIT TRAP: `on_exit` may run after run_paced's locals are gone, and under
+  # `set -u` an unguarded "$errf" would abort the cleanup it exists to perform.
+  [ -n "${NOTEF:-}" ] && rm -f "$NOTEF" 2>/dev/null
+  [ -n "${errf:-}" ] && rm -f "$errf" 2>/dev/null
+  [ "${WORKDIR_OWNED:-0}" -eq 1 ] && [ -n "${WORKDIR:-}" ] && rm -rf "$WORKDIR" 2>/dev/null
   return 0
 }
 
@@ -534,6 +540,7 @@ on_exit() {
   local r=$?
   release_slot
   flush_notes "$r"
+  cleanup_workdir
   return 0
 }
 
@@ -843,8 +850,13 @@ run_paced() {
       # past the 60-420 s budgets the NO_WAIT contract exists for, so waiting it out re-created the
       # STALL this gate is supposed to prevent. Such a caller asks immediately and gets the refusal
       # back; the window is still honoured by every caller that did not declare a bound.
+      # The note is emitted ONLY when a window actually exists — saying "the account is in a
+      # shared rate-limit window" on every NO_WAIT call would put a false statement in events.log,
+      # which is the surface an operator debugs with.
       if no_wait_wanted; then
-        gate_note "the account is in a shared rate-limit window — this call is NOT waiting it out (caller set NO_WAIT); it may be refused"
+        if rem="$(cooldown_remaining_ms)"; then
+          gate_note "the account is in a shared rate-limit window ($(( (rem + 999) / 1000 ))s left) — this call is NOT waiting it out (caller set NO_WAIT); it may be refused"
+        fi
       else
         wait_for_cooldown
       fi
@@ -859,8 +871,10 @@ run_paced() {
         # Another lane may have been refused while we queued for the slot. Honour its
         # window BEFORE asking: that re-check is what makes a burst one refusal, not N.
         if rem="$(cooldown_remaining_ms)"; then
-          release_slot
-          no_wait_wanted || continue
+          # ⛔ KEEP THE SLOT. Releasing it here let a NO_WAIT caller run UNGATED during a window,
+          # so the concurrency cap was silently bypassed exactly when it mattered (measured: 3
+          # concurrent children at MAX_INFLIGHT=1). Only the WAIT is suppressed for such a caller.
+          no_wait_wanted || { release_slot; continue; }
         fi
       fi
       pace_tick
