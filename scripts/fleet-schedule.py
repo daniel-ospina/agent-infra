@@ -433,10 +433,26 @@ def load_jobs() -> list:
                     # of {"rc": 127}, so a cell reached CELL READY with a job that had never once
                     # run. Refused at declaration time instead, where the fix is obvious.
                     if idx == 0 and not os.access(arg, os.X_OK):
-                        job.error = (
-                            "not executable: %s exists but cannot be executed — every run would "
-                            "fail with rc=127, so the job is refused rather than certified" % arg
-                        )
+                        # ⛔ THE SAME LAYER/THIRD-PARTY SPLIT AS A MISSING TARGET, deliberately.
+                        # A per-machine absence must not block a cell (a tortoise checkout with no
+                        # .venv is a named SKIP, not a refusal), and "the .venv exists but its
+                        # python lost its mode bits" is the same class of fact: this machine
+                        # cannot run that job. Escalating it to job.error would refuse CELL READY
+                        # on every cell over one third-party directory — the opposite of the rule
+                        # that one optional job must not block a cell running every other one.
+                        # INSIDE the layer it stays fatal: that farm is ours to install, and a
+                        # half-installed farm must never be certified.
+                        if layer_prefix and (arg == layer_prefix or arg.startswith(layer_prefix + os.sep)):
+                            job.error = (
+                                "not executable: %s exists but cannot be executed — every run "
+                                "would fail with rc=127, so the job is refused rather than "
+                                "certified" % arg
+                            )
+                        else:
+                            job.skip = (
+                                "target not executable on this machine: %s exists but cannot be "
+                                "executed (every run would fail with rc=127)" % arg
+                            )
                         break
                     continue
                 if layer_prefix and (arg == layer_prefix or arg.startswith(layer_prefix + os.sep)):
@@ -562,8 +578,15 @@ def busy_jobs(now):
         # that whole window, and the doc's "the exemption ends with that deadline" would only hold
         # for markers written under the current config. The clamp keeps the grace a job is owed at
         # the ceiling this process would itself allow, plus the tick slack.
-        if started > 0:
-            deadline = min(deadline, started + JOB_TIMEOUT + 3 * TICK)
+        # ⛔ AN UNUSABLE START IS NOT AN EXEMPTION. The clamp below needs `started`; without it a
+        # marker naming only a far-future deadline would excuse the stale tick — and every job's
+        # OVERDUE arm — FOR EVER, which is the exemption this file's contract says is bounded.
+        # Our own writer always stamps `started` and a deadline derived from the budget, so a
+        # marker lacking it is foreign/corrupted/restored, and dropping it fails CLOSED: the tick
+        # then reads as stale (correctly) instead of as "a long job is running".
+        if started <= 0:
+            continue
+        deadline = min(deadline, started + JOB_TIMEOUT + 3 * TICK)
         if now <= deadline:
             live.append((entry.get("label") or name[: -len(".json")], started))
     return live
@@ -1066,6 +1089,20 @@ def cmd_verify():
             failures.append(
                 "%s: declared and runnable here, but has NEVER RUN — 'scheduled' must be read from "
                 "a run, not from a file" % job.label
+            )
+            continue
+        # ⛔ A STAMP FROM THE FUTURE IS NOT A LIVE JOB. due_at() is `last + interval`, so a
+        # `started` ahead of now makes the job permanently NOT due — is_due() stays False, nothing
+        # dispatches it — while this loop counted it as live because a stamp exists at all. A cell
+        # clock that stepped back (a resumed VM, an NTP correction of a fast RTC) or a state dir
+        # restored from a skewed box is enough, and if it is the only live job the zero-live guard
+        # is satisfied too: SCHEDULE VERIFIED over a job that will never run again.
+        if stamp["started"] > now + max(3 * TICK, 300):
+            failures.append(
+                "%s: its last-run stamp is IN THE FUTURE (%s from now) — the clock stepped back "
+                "or the state dir was restored from a skewed box, so the job reads as not-due for "
+                "ever while a stamp makes it look live; clear: rm -f %s"
+                % (job.label, human_secs(stamp["started"] - now), stamp_path(job.label))
             )
             continue
         ran += 1

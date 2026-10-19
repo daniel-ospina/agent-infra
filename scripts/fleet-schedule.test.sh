@@ -705,6 +705,54 @@ grep -q 'com.test.hourly: declared and runnable here, but has NEVER RUN' <<<"$ou
   && ok "a null-rc stamp does NOT count as a run" \
   || bad "a null-rc stamp was counted as a run: $out"
 
+# ── 12e. a stamp dated in the FUTURE is not a live job ────────────────────────────────────────
+# due_at() is `last + interval`, so a `started` ahead of now makes a job permanently NOT due —
+# nothing dispatches it — while --verify counted it live because a stamp exists at all. A cell
+# clock that stepped back (a resumed VM, an NTP correction of a fast RTC) is enough, and if it is
+# the only live job the zero-live guard is satisfied too.
+case_ "12e. a stamp dated in the future is refused, not counted as a live job"
+state_reset "$GOOD"
+mkdir -p "$FLEET_SCHEDULE_STATE/jobs"
+python3 - "$FLEET_SCHEDULE_STATE/jobs/com.test.hourly.json" <<'PYFUT'
+import json, sys, time
+now = time.time()
+json.dump({"label": "com.test.hourly", "started": now + 86400 * 365, "finished": now + 86400 * 365,
+           "rc": 0, "duration": 1}, open(sys.argv[1], "w"))
+PYFUT
+out="$(run "$GOOD" --verify 2>&1)"
+grep -q 'com.test.hourly: its last-run stamp is IN THE FUTURE' <<<"$out" \
+  && ok "a future-dated stamp FAILS --verify and names the cause" \
+  || bad "a stamp dated in the future was counted as a live job: $out"
+
+# ── 12f. a THIRD-PARTY target that cannot execute is a SKIP, not a fleet-wide refusal ────────
+# The missing-target arm already splits layer from third party: absent under <home>/.pi/agent is an
+# incomplete FARM (fatal), absent anywhere else is a named SKIP (a tortoise checkout without its
+# .venv must not block a cell). The execute-bit arm originally ignored that split, so a restored
+# venv that lost its mode bits refused CELL READY on every cell — the opposite of the rule the PR
+# states. Inside the layer it stays fatal; outside it is a SKIP.
+case_ "12f. a third-party argv[0] that exists but cannot execute is a named SKIP, not fatal"
+MIXED="$FIX/mixed"; mkdir -p "$MIXED"; printf '# no retired labels\n' > "$MIXED/RETIRED"
+TP_NOEXEC="$T/thirdparty-not-executable.sh"
+printf '#!/bin/sh\necho tp\n' > "$TP_NOEXEC"; chmod 644 "$TP_NOEXEC"
+cat > "$T/tp-noexec.spec" <<PY
+PLIST = {
+    "Label": "com.test.tp-noexec",
+    "ProgramArguments": ["$TP_NOEXEC"],
+    "StartInterval": 60,
+}
+PY
+mkplist "$MIXED" com.test.tp-noexec "$T/tp-noexec.spec"
+mkplist "$MIXED" com.test.echo     "$T/echo.spec"
+state_reset "$MIXED"
+out="$(run "$MIXED" --install 2>&1)"; rc=$?
+[ "$rc" -eq 0 ] && ok "--install still certifies the cell (the broken job is third-party)" \
+  || bad "a third-party non-executable target refused the whole cell (rc=$rc): $out"
+grep -q 'SKIP.*com.test.tp-noexec.*not executable' <<<"$out" \
+  && ok "it is NAMED as a SKIP with the reason" \
+  || bad "the third-party failure is not named as a skip: $out"
+grep -q 'com.test.echo .*rc=0' <<<"$out" && ok "the runnable job still ran" \
+  || bad "the runnable job did not run: $out"
+
 
 # ── 13. a recycled pid must not fake a running loop (--start used to print one and exit 0) ────
 case_ "13. --start replaces a recycled pid in loop.pid instead of reporting it as the loop"
@@ -808,6 +856,23 @@ out="$(run_v15 30)"; rc=$?
   || bad "a marker claiming a start beyond the job budget still excused a stale tick (rc=$rc): $out"
 grep -q 'BUSY' <<<"$out" && bad "the clamped marker was still treated as a live job: $out" \
   || ok "the clamped marker is not reported as a running job"
+# ⛔ AND A MARKER WITH NO USABLE START IS NOT AN EXEMPTION AT ALL. The clamp needs `started`; a
+# marker naming only a far-future deadline (foreign, corrupted, or hand-restored) would otherwise
+# excuse a stale tick — and every job's OVERDUE arm — FOR EVER, which is the unbounded exemption
+# this file's contract says cannot exist. Our own writer always stamps `started`, so dropping such
+# a marker fails CLOSED: the tick reads as stale, which is the truth.
+python3 - "$FLEET_SCHEDULE_STATE" <<'PYNOSTART'
+import json, os, sys, time
+state = sys.argv[1]
+os.makedirs(os.path.join(state, "busy"), exist_ok=True)
+json.dump({"label": "com.test.echo", "deadline": time.time() + 10 ** 9},
+          open(os.path.join(state, "busy", "com.test.echo.json"), "w"))
+PYNOSTART
+out="$(run_v15 1800)"; rc=$?
+[ "$rc" -eq 1 ] && ok "a busy marker with NO started is dropped, not treated as an endless exemption (rc=1)" \
+  || bad "a marker with no started excused the stale tick indefinitely (rc=$rc): $out"
+grep -q 'BUSY' <<<"$out" && bad "a startless marker was reported as a running job: $out" \
+  || ok "no startless marker is reported as a running job"
 kill "$fakepid" 2>/dev/null
 
 # ── 16. an annual (multi-entry) calendar must keep a NEXT occurrence ───────────────────────
