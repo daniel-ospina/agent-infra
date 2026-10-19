@@ -47,10 +47,15 @@ if [ ! -s "$WORK/block.sh" ]; then
   awk '/^  if \[ -f "\$STATE\/PR-DOCTOR-OFF" \]; then/,/^  rc=0$/' "$SRC" | sed '$d' > "$WORK/block.sh"
 fi
 # comments are stripped first: the invariant is about EXECUTED code, and a comment may say "nohup"
-if grep -v '^ *#' "$WORK/block.sh" | grep -qE 'nohup|pr-doctor\.lock|launched detached'; then
-  echo "FAIL: extracted the DISPATCH block, not the PR-DOCTOR report block" >&2
-  exit 1
-fi
+# CAPTURE-then-case, never `grep … | grep -q` — a quiet grep under `pipefail` can read SIGPIPE as a
+# non-match (#841/#864, checked by scripts/check-no-sigpipe-grep.sh).
+_uncommented="$(grep -v '^ *#' "$WORK/block.sh" || true)"
+case "$_uncommented" in
+  *nohup*|*pr-doctor.lock*|*'launched detached'*)
+    echo "FAIL: extracted the DISPATCH block, not the PR-DOCTOR report block" >&2
+    exit 1
+    ;;
+esac
 [ -s "$WORK/block.sh" ] || { echo "FAIL: cannot extract the PR-DOCTOR block from $SRC" >&2; exit 1; }
 
 run_block() {                       # run_block <record-json|-> [dry]
