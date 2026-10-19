@@ -1342,7 +1342,7 @@ def test_a_recovered_pass_is_published_as_a_degradation_not_a_plain_ok(monkeypat
     with open(pr.STATUS) as fh:
         payload = _json.load(fh)
     assert payload.get("rest_recovered") is True, payload
-    assert "recovered over REST" in payload.get("reason", ""), payload
+    assert payload.get("reason", "").startswith("REST-RECOVERED:"), payload
     assert payload.get("dispatched") == 1, payload
 
     # …and a HEALTHY pass must not carry the words, or the marker becomes noise an operator
@@ -1357,7 +1357,53 @@ def test_a_recovered_pass_is_published_as_a_degradation_not_a_plain_ok(monkeypat
                                       [_lane(1)])
     assert rc == 0, joined
     assert payload.get("rest_recovered") is False, payload
-    assert "recovered over REST" not in payload.get("reason", ""), payload
+    assert "REST-RECOVERED" not in payload.get("reason", ""), payload
+
+
+def test_the_recovery_marker_survives_the_readers_110_char_cut(monkeypatch):
+    """The marker must be READABLE, not merely WRITTEN (#2136 review rounds 7-8).
+
+    ⛔ A SUFFIX IS INVISIBLE ON EVERY PASS THAT MATTERS. `objective.pr_doctor_last_run()` slices
+    `reason` to 110 chars and `queue-dispatch.py` slices the same field at 110, so a 35-char suffix
+    disappears whenever the reason is longer than 75 chars — which is the NORMAL shape of a held
+    pass (a single-cause hold measures 82 chars, a two-cause one 102). The degradation would then be
+    missing from exactly the beat line it was added for, while a payload-only assertion stayed
+    green.
+
+    ⛔ SO THE REASON HAS TO ACTUALLY CROSS THE CUT, AND ROUND 8 FOUND IT DID NOT (P2): the first
+    version of this test passed a 100-char `why` to `classify`, whose value only reaches the
+    STUBBED `brief`, so the sidecar held `'REST-RECOVERED: ok'` (18 chars) and the `[:110]`
+    assertion was inert — the suffix mutation went red on the marker's SPELLING, not on a severed
+    tail. Driving `record_exit` directly is what makes the length real: it is the function that
+    assembles the field both readers slice, and the reader below is the REAL one.
+    """
+    long_reason = ("ok; 12 PR(s) HELD for an unusable changed-file list (6 read and failed, "
+                   "4 partial page (100+ files), 2 not attempted after two failures)")
+    assert len("REST-RECOVERED: " + long_reason) > 110, "the reason must cross the reader's cut"
+    monkeypatch.setattr(pr, "REST_RECOVERED", True)
+    assert pr.record_exit(0, long_reason) == 0
+    import json as _json3
+    with open(pr.STATUS) as fh:
+        reason = _json3.load(fh)["reason"]
+    assert len(reason) > 110, reason
+    assert reason.startswith("REST-RECOVERED:"), reason
+    assert "REST-RECOVERED" in reason[:110], reason
+    # THE READER THE WIRE EXISTS FOR, at its own cut. The fixture renames the sidecar, so give the
+    # reader its canonical filename in the same directory rather than re-typing its slicing rule (a
+    # copy of the rule would pass while the reader fails).
+    import os as _os
+    import shutil as _shutil
+    _sd = _os.path.dirname(pr.STATUS)
+    _shutil.copyfile(pr.STATUS, _os.path.join(_sd, "pr-doctor.status.json"))
+    beat = pr.CLASSIFIER.pr_doctor_last_run(_sd)
+    assert "REST-RECOVERED" in beat, beat
+
+    # …and a HEALTHY pass carries nothing: the marker must not become noise an operator learns to
+    # ignore (the false-premise hazard, in the other direction).
+    monkeypatch.setattr(pr, "REST_RECOVERED", False)
+    assert pr.record_exit(0, long_reason) == 0
+    _shutil.copyfile(pr.STATUS, _os.path.join(_sd, "pr-doctor.status.json"))
+    assert "REST-RECOVERED" not in pr.CLASSIFIER.pr_doctor_last_run(_sd)
 
 
 def test_rest_and_graphql_reads_of_one_pr_classify_the_same(monkeypatch):

@@ -332,14 +332,20 @@ def record_exit(rc: int, reason: str, **extra) -> int:
     record of what HAPPENED to the fleet, and a debug/dry invocation describes neither. `reason` is
     still logged, so the operator sees the refusal; it just does not become the fleet's record.
     """
-    # ⛔ A RECOVERED PASS SAYS SO IN THE FIELD THE BEAT PRINTS (agent-infra #2136 review round 6).
-    # `objective.pr_doctor_last_run()` renders `PR-DOCTOR(last run): ok rc=0 Nm ago — <reason>` from
-    # `rc` and `reason`, so a degradation recorded only in the payload is INVISIBLE where it is
-    # read, and one recorded only in the launchd log is invisible to every automated reader. Doing
-    # it here (not at each return) is what makes EVERY exit path inherit it, including the
-    # refusals: a pass that recovered and then refused must not read as a plain refusal either.
+    # ⛔ A RECOVERED PASS SAYS SO IN THE FIELD THE BEAT PRINTS, AND IT SAYS IT FIRST (agent-infra #2136
+    # review round 7). `objective.pr_doctor_last_run()` renders `PR-DOCTOR(last run): ok rc=0 Nm ago
+    # — <reason>` from `rc` and `reason`, so a degradation recorded only in the payload is INVISIBLE
+    # where it is read, and one recorded only in the launchd log is invisible to every automated
+    # reader. Doing it here (not at each return) is what makes EVERY exit path inherit it.
+    # ⛔ AND IT IS A PREFIX, NOT A SUFFIX, BECAUSE THE READERS CUT THE TAIL. Two of them slice the
+    # field -- `pr_doctor_last_run()` `[:110]`, `queue-dispatch.py` `[:110]` -- so a 35-char suffix
+    # vanishes on any `why` longer than 75 chars, which is the NORMAL shape of a held pass
+    # ("ok; 2 PR(s) HELD for an unusable changed-file list (...)" is 99 chars). That would leave the
+    # exact "unbroken run of ok" this wire exists to end, while the payload boolean made the test
+    # look green. Measured, and pinned by
+    # `test_the_recovery_marker_survives_the_readers_110_char_cut`.
     if REST_RECOVERED:
-        reason = "%s (open-PR read recovered over REST)" % reason
+        reason = "REST-RECOVERED: %s" % reason
     payload = {"rc": int(rc), "reason": reason, "at": ts(), "at_epoch": now(),
                "pid": os.getpid(), "repo": REPO, "rest_recovered": REST_RECOVERED}
     payload.update(extra)
@@ -694,8 +700,8 @@ def open_prs() -> list[dict]:
     # The raw client is kept because THIS FIX IS THE ONE LIVE ON EVERY BOX and the port must not
     # change its behaviour (AGENTS.md: a silently-switched backend is a red flag, not a fix), and
     # because it keeps the second source working on a box whose shim is absent or broken. The
-    # residual is real and is tracked, not denied: see #2136's residuals and the follow-up issue
-    # that routes these reads through the layer, which would also delete `_gh_token()`.
+    # residual is real and is tracked, not denied: see #2136's residuals and #2149, which routes
+    # these reads through the layer and would also delete `_gh_token()`.
     if rc != 0 or not parsed:
         rest = _open_prs_rest()
         if rest is not None:
