@@ -346,11 +346,35 @@ SHIMEOF
 chmod +x "$SHIM/git"
 out="$(REAL_GIT_BIN="$REAL_GIT_BIN" PATH="$SHIM:$PATH" bash "$HELPER" salvage feat/salvage-nolist "$REPO" 2>&1)" && rc=0 || rc=$?
 assert_eq "$rc" 1 "salvage REFUSES when \`git worktree list\` cannot answer (fails CLOSED)"
-assert_contains "$out" "could not list registered worktrees" "…and says so, by name"
+assert_contains "$out" "could not list REGISTERED WORKTREES" "…and says so, by name"
 [ -f "$REPO/nested-wt/nested-only.txt" ] && ok "the live worktree's uncommitted file SURVIVED" || bad "WORKTREE CONTENT DESTROYED on an unverifiable list"
 assert_contains "$(git -C "$REPO" status --porcelain)" "?? nested-wt/" "…and nothing was removed from the hub"
 git -C "$REPO" worktree remove --force "$REPO/nested-wt" 2>/dev/null || true
 git -C "$REPO" branch -q -D nested-wt-br2 2>/dev/null || true
+
+# ── 7e. #1919: a CONTAINER left in place must NOT be reported as clean ─────
+# salvage deliberately leaves a container (`deep/` holding a worktree) alone, so
+# the hub is NOT clean afterwards and the verdict must say so (#1919 review
+# cycle 2 P1). Reusing the container-aware predicate for the final cleanliness
+# test dropped it from the remaining set: salvage printed "back to main+CLEAN"
+# and exited 0 on a hub that `git status` and M4 both called dirty — a false PASS
+# of the recovery path.
+mkdir -p "$REPO/deep"
+git -C "$REPO" worktree add -q "$REPO/deep/inner-wt" -b deep-wt-br HEAD
+echo "deep-wip" > "$REPO/deep/inner-wt/precious-deep.txt"
+echo "genuine-two" > "$REPO/genuine-two.txt"
+out="$(bash "$HELPER" salvage feat/salvage-deep "$REPO" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "salvage does NOT certify a hub whose worktree CONTAINER remains"
+assert_contains "$out" "NOT yet fully clean" "…and says the hub is not clean"
+[ -f "$REPO/deep/inner-wt/precious-deep.txt" ] && ok "…and the nested worktree's file SURVIVED" || bad "DEEP WORKTREE DESTROYED by salvage"
+assert_contains "$(git -C "$REPO" status --porcelain)" "?? deep/" "…and the container is still there (reported, not removed)"
+wt_s3="$REPO/.worktrees/feat/salvage-deep"
+grep -q "genuine-two" "$wt_s3/genuine-two.txt" 2>/dev/null && ok "the genuine dirt beside it WAS captured" || bad "genuine dirt not captured"
+rm -rf "$REPO/deep"
+git -C "$REPO" worktree prune >/dev/null 2>&1 || true
+git -C "$REPO" branch -q -D deep-wt-br 2>/dev/null || true
+git -C "$REPO" worktree remove --force "$wt_s3" 2>/dev/null || true
+git -C "$REPO" branch -q -D feat/salvage-deep 2>/dev/null || true
 
 # ── 8. refresh (#1309): clean-but-stale hub → advance the hub to its upstream ─
 # The state with no SANCTIONED path: a CLEAN hub whose local main has DIVERGED

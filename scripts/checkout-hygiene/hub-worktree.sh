@@ -310,8 +310,16 @@ contains_registered_worktree() { # $1=hub-relative path  $2=registered_worktrees
 }
 
 # #1919 — the same rule for a porcelain LIST (salvage's final cleanliness test):
-# drop the `?? ` entries that are / contain a registered worktree, keep every
-# other line. stdin=porcelain, $1=registered_worktrees output.
+# drop the `?? ` entries that ARE a registered worktree, keep every other line.
+# stdin=porcelain, $1=registered_worktrees output.
+#
+# EXACT match only — deliberately NOT `contains_registered_worktree` (#1919
+# review cycle 2 P1). A CONTAINER (`?? deep/` holding a worktree, or an
+# un-gitignored `?? .worktrees/`) is left in place on purpose, so it IS still
+# dirt and must be REPORTED: reusing the container-aware predicate here dropped
+# it from `remaining_dirt`, and salvage then printed "✅ … back to main+CLEAN" and
+# exited 0 on a hub that `git status` and M4 both called dirty — a false PASS of
+# the recovery path, which is the defect this whole change exists to remove.
 filter_registered_worktree_lines() { # $1=registered_worktrees output ; stdin=porcelain
   local registered="$1" line rel
   while IFS= read -r line; do
@@ -320,11 +328,29 @@ filter_registered_worktree_lines() { # $1=registered_worktrees output ; stdin=po
       '?? '*)
         rel="${line#?? }"
         rel="${rel%\"}"; rel="${rel#\"}"; rel="${rel%/}"
-        if contains_registered_worktree "$rel" "$registered"; then continue; fi
+        if is_registered_worktree_exact "$rel" "$registered"; then continue; fi
         printf '%s\n' "$line" ;;
       *) printf '%s\n' "$line" ;;
     esac
   done
+}
+
+# #1919 — is this hub-relative path ITSELF a registered worktree (EXACT, no
+# container/prefix rule)? Used by the cleanliness verdict above, where a
+# container must keep counting as dirt.
+is_registered_worktree_exact() { # $1=hub-relative path  $2=registered_worktrees output
+  local rel="$1" registered="$2" cand rec par base
+  rel="${rel%/}"
+  [[ -z "$rel" || -z "$registered" ]] && return 1
+  par="${rel%/*}"; [[ "$par" == "$rel" ]] && par="."
+  base="${rel##*/}"
+  [[ -z "$base" ]] && return 1
+  cand="$( (cd "$MAIN_REPO" 2>/dev/null && cd "$par" 2>/dev/null && printf '%s/%s' "$(pwd -P)" "$base") )" || return 1
+  while IFS= read -r rec; do
+    [[ -z "$rec" ]] && continue
+    [[ "$rec" == "$cand" ]] && return 0
+  done <<<"$registered"
+  return 1
 }
 
 salvage() {

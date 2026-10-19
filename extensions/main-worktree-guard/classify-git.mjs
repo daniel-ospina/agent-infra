@@ -6288,8 +6288,16 @@ function _worktreeTargetArg(args, vars, execCwd) {
   // An UNRESOLVABLE variable is still not guessed — the static text is not the
   // path, so it stays unjudged rather than becoming a false block.
   if (target.includes("$")) {
-    target = _expandCdVars(target, { PWD: execCwd ?? process.cwd(), ...(vars || {}) });
-    if (target === null) return null;
+    const raw = target;
+    const expanded = _expandCdVars(target, { PWD: execCwd ?? process.cwd(), ...(vars || {}) });
+    // An UNRESOLVABLE variable is NOT "not judged": `target: null` carries the raw
+    // text so the caller judges the LITERAL directory prefix it can still name
+    // (`./wt-$SUFFIX` is relative in the caller's frame; `.worktrees/wt-$X` is the
+    // sanctioned layout). Silently skipping was the second fail-open of the same
+    // review (#1919 cycle 2 P1): `git worktree add ./wt-$UNSET` was ALLOWED and
+    // created `?? wt-/` inside the hub.
+    if (expanded === null) return { sub, target: null, raw };
+    target = expanded;
   }
   return { sub, target };
 }
@@ -6387,6 +6395,9 @@ export function nestedWorktreeTargetReason(verb, args, execCwd = process.cwd(), 
   if (verb !== "worktree") return null;
   const t = _worktreeTargetArg(args, vars, execCwd);
   if (!t) return null;
+  if (t.target === null) {
+    return _unjudgeableTargetReason(t.sub, t.raw, execCwd, "shell variable");
+  }
   const lexical = resolve(execCwd, t.target);
   // Judge the PHYSICAL path: a target spelled through a symlinked prefix must
   // not compare as "outside" while landing inside the checkout.
@@ -6442,20 +6453,48 @@ function _homeExpandedChain(chain) {
  * @param {string} sessionCwd
  * @returns {string|null}
  */
-function _unplaceableFrameReason(t, sessionCwd) {
-  const top = _checkoutTopLevel(_nearestExistingDir(sessionCwd));
-  if (!top) return null;
+function _unjudgeableTargetReason(sub, targetText, execCwd, why) {
+  const text = String(targetText ?? "");
+  const cut = text.search(/[$~]/);
+  const literal = cut === -1 ? text : text.slice(0, cut);
+  const dirText = literal.includes("/") ? literal.slice(0, literal.lastIndexOf("/")) : "";
+  const baseAbs = resolve(execCwd, dirText === "" ? "." : dirText);
+  const top = _checkoutTopLevel(_nearestExistingDir(baseAbs));
+  if (!top) return null; // the literal prefix is outside every checkout
+  const phys = _physicalPath(baseAbs) ?? baseAbs;
+  if (!(phys === top || phys.startsWith(top + "/"))) return null;
+  // Probe the IGNORE rule with a CHILD path: a dir-only pattern (`.worktrees/`)
+  // does not match the container itself, but does match anything inside it — so
+  // `.worktrees/wt-$X` keeps working while `./wt-$X` is refused.
+  const relDir = relative(top, phys);
+  const probe = relDir === "" ? join("_nested_wt_probe_", "x") : join(relDir, "x");
+  if (_gitIgnores(top, probe)) return null;
   return [
-    `⛔ Refused: this \`git worktree ${t.sub}\` has a RELATIVE target (${t.target}) whose`,
-    `   execution directory could not be resolved, and this session is inside a git`,
-    `   checkout (${top}).`,
-    `   A relative target created from an unknown directory can land INSIDE that`,
-    `   checkout, where git reports it as an untracked directory and the hub-state`,
-    `   gate (#1484) then refuses every git op that could move it out (#1919).`,
-    `   → Spell the directory (or the target) LITERALLY so it can be judged, and`,
-    `     put the worktree OUTSIDE the checkout or under a path it IGNORES.`,
+    `⛔ Refused: this \`git worktree ${sub}\` target cannot be resolved (${why}), and the`,
+    `   path it would be created under is INSIDE a git checkout (#1919).`,
+    `   Target:   ${text}`,
+    `   Checkout: ${top}`,
+    `   An unresolvable target can land inside the checkout, where git reports it`,
+    `   as an untracked directory and the hub-state gate (#1484) then refuses every`,
+    `   git op that could move it out again — the deadlock cannot repair itself.`,
+    `   → Spell the target literally so it can be judged, and put the worktree`,
+    `     OUTSIDE the checkout or under a path that checkout IGNORES.`,
     `   → AGENT_ALLOW_MAIN_EDITS=1 (session start) bypasses this gate, as it does M4.`,
   ].join("\n");
+}
+
+/** #1919 — the refusal for a `worktree add|move` whose execution frame could not
+ * be placed and whose target is RELATIVE. A thin wrapper over
+ * `_unjudgeableTargetReason`: a target under an IGNORED layout (the fleet's
+ * `.worktrees/<name>`, including `.worktrees/wt-$VAR`) still works, and a target
+ * whose literal prefix is outside every checkout is not refused (#1919 cycle 2
+ * P2 — the earlier blanket refusal was a class-4 false block).
+ * @param {{ sub: string, target: string }} t
+ * @param {string} sessionCwd
+ * @returns {string|null}
+ */
+function _unplaceableFrameReason(t, sessionCwd) {
+  return _unjudgeableTargetReason(t.sub, t.target, sessionCwd, "execution directory");
 }
 
 /** #1919 — check EVERY `worktree add|move` invocation in a shell command and
@@ -6495,10 +6534,21 @@ export function nestedWorktreeTargetViolation(command, sessionCwd = process.cwd(
       if (reason) return reason;
       continue;
     }
-    // UNPLACEABLE frame. An absolute or `~` target carries its own frame and is
-    // still judged; a RELATIVE one cannot be proven outside every checkout.
+    // UNPLACEABLE frame. An absolute target carries its own meaning and is still
+    // judged (a frame cannot change an absolute path); a RELATIVE one is judged
+    // through its literal prefix — see _unjudgeableTargetReason.
     const t = _worktreeTargetArg(inv.args, inv.vars, sessionCwd);
-    if (!t || isAbsolute(t.target)) continue;
+    if (!t) continue;
+    if (t.target === null) {
+      const reason = _unjudgeableTargetReason(t.sub, t.raw, sessionCwd, "shell variable");
+      if (reason) return reason;
+      continue;
+    }
+    if (isAbsolute(t.target)) {
+      const reason = nestedWorktreeTargetReason(inv.verb, inv.args, sessionCwd, inv.vars);
+      if (reason) return reason;
+      continue;
+    }
     const reason = _unplaceableFrameReason(t, sessionCwd);
     if (reason) return reason;
   }

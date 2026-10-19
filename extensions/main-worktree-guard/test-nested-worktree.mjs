@@ -160,12 +160,20 @@ try {
   expect("A8: `..`-relative out of the checkout is ALLOWED",
     nestedWorktreeTargetViolation("git worktree add ../outside-2 -b feat-out2", hub), null);
 
-  // A9: `worktree add|move` only — every other worktree form is untouched, and a
-  // target git will expand itself at run time is not judged (no false block).
+  // A9: `worktree add|move` only — every other worktree form is untouched.
   for (const cmd of ["git worktree list", "git worktree prune", "git status", "git log --oneline -1",
-    "echo \"git worktree add nested-wt\"", "git worktree add \"$WT\" -b feat-var"]) {
+    "echo \"git worktree add nested-wt\""]) {
     expect(`A9: not refused — \`${cmd}\``, nestedWorktreeTargetViolation(cmd, hub), null);
   }
+  // A9c (#1919 review cycle 2 P1): a target that is ONLY an unassigned variable
+  // is REFUSED, not silently waved through. Nothing proves it lands outside every
+  // checkout, and treating "cannot resolve" as "not judged" is what let
+  // `git worktree add ./wt-$UNSET` create the deadlock inside the hub. The
+  // sanctioned route never spells it this way (hub-worktree.sh resolves the path
+  // in the script, where this command-level gate does not look).
+  expectTrue("A9c: a bare `$VAR` target is REFUSED (cannot be proven outside)",
+    typeof nestedWorktreeTargetViolation('git worktree add "$WT" -b feat-var', hub) === "string",
+    String(nestedWorktreeTargetViolation('git worktree add "$WT" -b feat-var', hub)));
   // A9b: `move`'s target is the SECOND positional.
   expectTrue("A9b: `worktree move <wt> <inside-path>` is REFUSED",
     typeof nestedWorktreeTargetViolation("git worktree move nested-wt relocated-inside", hub) === "string");
@@ -247,6 +255,29 @@ try {
     typeof nestedWorktreeTargetViolation(`git worktree add ${linkPrefix}/sneaky -b s1`, hub) === "string",
     String(nestedWorktreeTargetViolation(`git worktree add ${linkPrefix}/sneaky -b s1`, hub)));
   rmSync(linkPrefix);
+
+  // A16 (#1919 review cycle 2 P1): an UNEXPANDABLE variable in the TARGET is
+  // judged by its literal prefix. `./wt-$UNSET` can land inside the hub and is
+  // REFUSED (it was ALLOWED and created `?? wt-/`, which is the issue's state),
+  // while the sanctioned IGNORED layout and an absolute outside path still pass.
+  expectTrue("A16: `git worktree add ./wt-$UNSET` is REFUSED",
+    typeof nestedWorktreeTargetViolation("git worktree add ./wt-$UNSET_1941 -b a1", hub) === "string",
+    String(nestedWorktreeTargetViolation("git worktree add ./wt-$UNSET_1941 -b a1", hub)));
+  expectTrue("A16: …`${UNSET}deep/inner` (the TWO-LEVEL deadlock) is REFUSED",
+    typeof nestedWorktreeTargetViolation("git worktree add ${UNSET_1941}deep/inner -b a2", hub) === "string",
+    String(nestedWorktreeTargetViolation("git worktree add ${UNSET_1941}deep/inner -b a2", hub)));
+  expect("A16: …while `.worktrees/wt-$UNSET` (IGNORED layout) is ALLOWED",
+    nestedWorktreeTargetViolation("git worktree add .worktrees/wt-$UNSET_1941 -b a3", hub), null);
+  expect("A16: …and an absolute target outside every checkout is ALLOWED",
+    nestedWorktreeTargetViolation(`git worktree add ${outside}/wt-$UNSET_1941 -b a4`, hub), null);
+
+  // A17 (#1919 review cycle 2 P2): an unplaceable frame must NOT blanket-refuse
+  // the sanctioned IGNORED layout — `cd $UNSET && git worktree add .worktrees/x`
+  // would really run in the hub, and `.worktrees/` is where the fleet puts them.
+  expect("A17: unplaceable frame + `.worktrees/<name>` is ALLOWED",
+    nestedWorktreeTargetViolation("cd $UNSET_1941 && git worktree add .worktrees/br9 -b br9", hub), null);
+  expect("A17: unplaceable frame + an absolute OUTSIDE target is ALLOWED",
+    nestedWorktreeTargetViolation(`cd $UNSET_1941 && git worktree add ${outside}/br10 -b br10`, hub), null);
 
   // ───────────────────────────────────────────────────────────────────────
   // Part B — real index.ts load + handler-driven gate
@@ -354,7 +385,7 @@ try {
       // is inside a checkout, so the target can land inside it.
       const r12 = await bash("cd $NOPE_UNSET_1941 && git worktree add v1 -b v1", hub);
       expectTrue("B12: `cd $UNASSIGNED && git worktree add <rel>` → BLOCKED", blocked(r12), JSON.stringify(r12?.reason?.slice(0, 90)));
-      expectTrue("B12: …naming the unplaceable frame", reasonOf(r12).includes("could not be resolved"), reasonOf(r12).slice(0, 120));
+      expectTrue("B12: …saying the frame could not be placed", reasonOf(r12).includes("cannot be resolved (execution directory)"), reasonOf(r12).slice(0, 120));
 
       // B13 (#1919 review P1): a shell-variable target the command ASSIGNS.
       const r13 = await bash('D=q7; git worktree add "$D/wt" -b q7', hub);
